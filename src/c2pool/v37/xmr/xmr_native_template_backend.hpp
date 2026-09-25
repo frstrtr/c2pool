@@ -203,11 +203,17 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     n.use_seeds   = cfg.native_use_seeds;
     // THE TRUST ROOT. Solo has no peer to ask for the genesis blob, so it
     // assembles the blob locally and feeds it to the same id-checking gate;
-    // otherwise an anchor path selects Anchor and its absence selects Genesis.
+    // otherwise an anchor path selects Anchor. THE PINNED SNAPSHOT: an
+    // output-set snapshot with no anchor path also selects Anchor, from the
+    // release's compiled-in pinned bundle for this network (anchor_path stays
+    // "" = embedded), and the node then holds the snapshot to that bundle's
+    // pinned size + sha256 (anchor/xmr_anchor_pinned.hpp). Neither selects
+    // Genesis, as before.
     n.boot        = cfg.native_solo
                         ? nrt::BootMode::LocalGenesis
-                        : (cfg.native_anchor_path.empty() ? nrt::BootMode::Genesis
-                                                          : nrt::BootMode::Anchor);
+                        : ((cfg.native_anchor_path.empty() && cfg.native_output_set_path.empty())
+                               ? nrt::BootMode::Genesis
+                               : nrt::BootMode::Anchor);
     n.anchor_path = cfg.native_anchor_path;
     n.output_set_path = cfg.native_output_set_path;   // format-2 O-backfill
 

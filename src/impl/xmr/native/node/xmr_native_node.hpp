@@ -99,6 +99,7 @@
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_output_set.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
+#include "impl/xmr/native/anchor/xmr_anchor_pinned.hpp"
 #include "impl/xmr/native/node/xmr_anchor_confirm.hpp"
 #include "impl/xmr/native/node/xmr_chain_boot.hpp"
 #include "impl/xmr/native/node/xmr_chain_snapshot_store.hpp"
@@ -457,6 +458,26 @@ public:
             // and this function does not return true.
             note_(std::string("[GATE-4] ") + anchor_boot_duty());
             note_(boot_.anchor_confirm().log_line());
+            // THE PINNED SNAPSHOT (no --native-anchor): the compiled-in bundle
+            // must be the one this release pins -- same file sha256, height and
+            // block id -- and the boot log names it and the snapshot it expects.
+            if (cfg_.anchor_path.empty()) {
+                const PinnedSnapshot* pin = pinned_snapshot(nets_.consensus);
+                const AnchorBundle* ab = boot_.anchor();
+                if (pin == nullptr || ab == nullptr) {
+                    why = std::string("no pinned snapshot is compiled in for network '")
+                        + to_string(nets_.consensus) + "'; pass --native-anchor";
+                    return false;
+                }
+                std::string pin_why;
+                if (!pinned_anchor_matches(*pin, *ab, pin_why)) {
+                    why = "pinned anchor refused: " + pin_why;
+                    return false;
+                }
+                const std::string line = pinned_boot_line(*pin);
+                note_(line);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
         }
 
         index_.set_clock([] { return unix_seconds_(); });
@@ -508,6 +529,28 @@ public:
                         why = "cannot open output-set snapshot '" + cfg_.output_set_path + "'";
                         return false;
                     }
+                }
+                // PINNED: against the compiled-in anchor the file must be the
+                // pinned snapshot byte for byte (size, then sha256), because the
+                // root check below binds the per-block leaves, not the rows.
+                const PinnedSnapshot* pin =
+                    cfg_.anchor_path.empty() ? pinned_snapshot(nets_.consensus) : nullptr;
+                if (pin != nullptr) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    std::string pin_why, got;
+                    const PinnedSetCheck pc =
+                        check_output_set_against_pin(cfg_.output_set_path, *pin, pin_why, &got);
+                    if (pc != PinnedSetCheck::Ok) {
+                        why = pin_why;
+                        return false;
+                    }
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - t0).count();
+                    const std::string line = "[pinned] output-set snapshot sha256 " + got
+                        + " matches the pin (" + std::to_string(pin->output_set_bytes)
+                        + " bytes, hashed in " + std::to_string(ms) + " ms)";
+                    note_(line);
+                    std::fprintf(stderr, "%s\n", line.c_str());
                 }
                 // Mapped read-only and served in place (no heap copy of the
                 // anchor snapshot); only post-anchor state lives in the heap.
