@@ -864,7 +864,6 @@ private:
     void expire_parked() {
         const auto now = std::chrono::steady_clock::now();
         const auto ttl = std::chrono::milliseconds(m_opts.parked_login_ttl_ms);
-        std::vector<std::uint64_t> expired;
         for (auto& [cid, c] : m_clients) {
             if (c.dead || !c.parked) continue;
             if (now - c.parked->since < ttl) continue;
@@ -873,15 +872,7 @@ private:
             send_line(cid, strat::StratumDialect::build_error(rid, "No job available"));
             log("client " + std::to_string(cid) + " parked login EXPIRED (no template within " +
                 std::to_string(m_opts.parked_login_ttl_ms) + " ms)");
-            expired.push_back(cid);
         }
-        // COLD-BOOT-2: close the expired session. Left open it was neither logged in
-        // nor parked, so no later template ever reached it: xmrig answered the error
-        // by waiting on the open socket forever. Closed, the miner reconnects (its
-        // retry pause) and parks again until a template exists. The serve loop now
-        // starts while the post-anchor gap is still being booked, so a login can
-        // outlive the ttl on every cold boot.
-        for (std::uint64_t cid : expired) close_client(cid, "parked login expired: closed so the miner reconnects");
     }
 
     // R-C rework-2: the SUSPEND edge, on the listener thread. Withdraw the job:
