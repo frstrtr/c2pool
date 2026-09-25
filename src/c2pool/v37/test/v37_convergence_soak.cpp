@@ -156,8 +156,12 @@ static std::string hex32(const bytes32& d) {
     for (auto b : d) { s += H[b >> 4]; s += H[b & 15]; }
     return s;
 }
+// The empty-fold anchor sha256d("V37Q") - what owed_digest() returns before any
+// block finalizes. Master moved the owed_digest domain tag V37O -> V37Q with the
+// finalized-only K_fair arming fix; this is the same constant
+// v37_convergence_apply_kat pins (CA-7d), so the two cannot drift apart.
 static const char* kEmptyAnchor =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 
 static const ChainId CH     = 7;
 static const u64     D_CONF = 3;
@@ -637,7 +641,7 @@ int main() {
     {
         settle::OwedLedger fresh(CH);
         check(hex32(fresh.owed_digest()) == kEmptyAnchor,
-              "SK-0b the empty-fold anchor sha256d(\"V37O\") is the shipped one");
+              "SK-0b the empty-fold anchor sha256d(\"V37Q\") is the shipped one");
     }
 
     Metrics M;
