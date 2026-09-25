@@ -89,6 +89,22 @@ struct CoinbaseBooking {
     ::v37::bytes32       lineage_seen_tag{};   // the foreign tag (lineage == Foreign)
 };
 
+// MM-PARSE-2: the lane-candidate test, a pure function of the coinbase bytes.
+// A 03 21 00 <root> tail alone does not make a coinbase a lane candidate: every
+// merge-mining pool ends its tx_extra the same way (mainnet: 01 pubkey | 02
+// 4-byte nonce | 03 21 00 root -- p2pool and others, several blocks a day).
+// A v37 lane coinbase also carries at least one V37 field in its 0x02 payload:
+// the V37P pool tag (every lane coinbase since POOL-LINEAGE; a malformed V37P
+// counts, the lineage gate then rejects it), the V37C credit cut, or the V37D
+// donation owed_in. None of them -> decided NOT a lane block.
+inline bool has_v37_lane_fields(const std::vector<unsigned char>& tx_extra) {
+    const auto f = credit::extra_nonce_field(tx_extra);
+    if (!f) return false;
+    return credit::parse_pool_tag_payload(*f) != credit::PoolTagParse::Absent ||
+           credit::parse_tail(*f).has_value() ||
+           fee::parse_donation_owed_payload(*f).has_value();
+}
+
 // candidates: newest first. keys: every identity this node can resolve via pay_of.
 template <class PayOf>
 inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blob,
@@ -150,6 +166,17 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
                         : std::string("not-lane: no pool_tag in the V37C tail (pre-lineage / older pool: an ordinary block for this pool)");
             return b;
         }
+    }
+    // MM-PARSE-2: the same tail with no V37 field in the 0x02 payload is a
+    // merge-mining pool's coinbase, decided "not-lane:" from the bytes for EVERY
+    // caller -- never "lane-root-unknown" (retried, HELD, then refused with an
+    // alarm + liability + a lineage vote), never matched against the ring. With
+    // a pool_tag the lineage gate above already rejected it (Untagged); this is
+    // the same decision for a caller without one (pre-lineage API, tools).
+    if (!has_v37_lane_fields(got.tx_extra)) {
+        b.why = "not-lane: 03 21 00 tail without any V37 field (V37P/V37C/V37D) in the 0x02 payload "
+                "(a merge-mining pool's coinbase: an ordinary Monero block)";
+        return b;
     }
     ::xmr::coin::Hash256 root; std::memcpy(root.data(), tag + 3, 32);
     b.onchain_root = root; b.has_onchain_root = true;   // R-C: fingerprint available even when no candidate matches
