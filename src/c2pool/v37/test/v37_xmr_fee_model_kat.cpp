@@ -289,6 +289,10 @@ struct Built {
         if (arm == Arm::ForeignSink) scfg.set_residual_sink_std(point_of(4), point_of(2));
         else { scfg.residual_sink = fee::donation_ref(); scfg.residual_sink_identity = fee::donation_identity(); }
         if (arm == Arm::FeeModel) scfg.fixed = {fee::donation_marker()};
+        // POOL-LINEAGE: every lane coinbase the daemon builds carries its V37P
+        // tag, so the no-fold arms (no V37D) still reach the donation rule
+        // instead of being decided not-lane for want of any V37 field (MM-PARSE-2).
+        { ::v37::bytes32 tag; tag.fill(0xA1); scfg.pool_tag = tag; }
         if (!src.poll(&why)) { why = "daemon arm did not parse the capture: " + why; return; }
         provider = std::make_unique<o2::XmrSettlementTemplateProvider>(src, ledger, scfg, 0);
         if (!provider->refresh()) { why = provider->last_error(); return; }

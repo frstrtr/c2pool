@@ -314,11 +314,16 @@ void suite_armed_vs_unarmed(std::string& unarmed_hex, std::string& armed_hex) {
         const auto bk_u = auth::decode_lane_coinbase(u.bytes.full_blob, LANE_CHAIN, cands, keys,
                                                      u.lane.scfg.residual_sink, u.lane.scfg.residual_sink_identity, u.lane.ledger.pay_of());
         CHECK(bk_a.ok && bk_a.is_lane, "coinbase authority decodes the ARMED block: %s", bk_a.ok ? "ok" : bk_a.why.c_str());
-        CHECK(bk_u.ok && bk_u.is_lane, "coinbase authority decodes the UNARMED block: %s", bk_u.ok ? "ok" : bk_u.why.c_str());
+        // MM-PARSE-2: the UNARMED fixture carries no V37 field at all (no V37C cut,
+        // no V37P tag, fee model OFF): 01 R | 02 nonce+pad | 03 21 00 root is the
+        // shape of every merge-mining pool's coinbase, so it is decided not-lane
+        // from the bytes. (Every lane coinbase the daemon builds carries V37P.)
+        CHECK(!bk_u.ok && !bk_u.is_lane && bk_u.why.rfind("not-lane:", 0) == 0,
+              "MM-PARSE-2: the UNARMED block (no V37 field) is decided not-lane: %s", bk_u.why.c_str());
         CHECK(bk_a.has_credit_cut && bk_a.credit_cut == want, "authority reads has_credit_cut + the committed cut off the armed block");
         CHECK(!bk_u.has_credit_cut, "authority reads NO credit cut off the unarmed block");
-        CHECK(bk_a.payout == bk_u.payout && bk_a.total == bk_u.total && bk_a.lane_commitment == bk_u.lane_commitment,
-              "payout map / total / lane_commitment identical armed vs unarmed (%zu payees, %llu piconero)",
+        CHECK(!bk_a.payout.empty() && bk_a.total == bk_u.total,
+              "armed block books %zu payees; coinbase total identical armed vs unarmed (%llu piconero)",
               bk_a.payout.size(), static_cast<unsigned long long>(bk_a.total));
         // R-C rework-2 (F-MONEY M2): an output mapping to NO known payee keeps the
         // block fail-closed for booking, but the decoder now reports the mapped

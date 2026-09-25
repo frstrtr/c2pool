@@ -580,6 +580,29 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_coinbase_extra_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_coinbase_extra_kat COMMAND v37_xmr_coinbase_extra_kat)
 
+    # v37_xmr_stranger_mm_tail_kat (MM-PARSE-2): a stranger's coinbase that
+    # ends in the same 03 21 00 <root> merge-mining tail as ours (mainnet
+    # block 3700900, p2pool shape: 01 R | 02 4-byte nonce | 03 21 00 root) is a
+    # DECIDED not-lane block for every caller of the coinbase authority, never
+    # lane-root-unknown (retried, HELD, then refused with alarm + liability +
+    # a lineage vote); a foreign pool tag stays POOL-LINEAGE's Foreign, our tag
+    # with an unknown root still waits, our block still books. Through
+    # FinalizeConnect as well. SAME HOLLOW-GREEN GUARD: in BOTH build.yml
+    # --target lists.
+    add_executable(v37_xmr_stranger_mm_tail_kat
+        v37_xmr_stranger_mm_tail_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_stranger_mm_tail_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stranger_mm_tail_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_stranger_mm_tail_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_stranger_mm_tail_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stranger_mm_tail_kat COMMAND v37_xmr_stranger_mm_tail_kat)
+
     # ------------------------------------------------------------------
     # POOL-LINEAGE -- the block-level pool id (operator ruling 2026-09-25).
     #
