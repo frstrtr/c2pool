@@ -711,7 +711,30 @@ private:
     struct Target {
         std::string host; u16 port = 0; PeerId pid = 0;
         Clock::time_point next_try; int backoff_s = 1;
+        // SMOKE-NOISE: links of this target that ended BEFORE a HELLO was
+        // accepted (refused at once by a partitioned peer, or a HELLO timeout
+        // on a silent one). `backoff_s` above only covers connect(2) failing;
+        // a connect that SUCCEEDS reset it to 1, so a refusing / silent peer
+        // was redialed (and, if silent, re-timed-out) every ~1 s forever.
+        u32  prehello_fails = 0;
+        bool hello_seen = false;       // the current link reached HELLO ok
+        bool hello_timed_out = false;  // the current link hit the HELLO timeout
     };
+    static constexpr int kRefusedBackoffCapS = 16;
+    static constexpr int kSilentBackoffCapS  = 60;
+    // SMOKE-NOISE redial delay after the current link of `t` went down.
+    //   HELLO ok on it     -> 1 s (the old behaviour; a healthy link that drops)
+    //   refused pre-HELLO  -> 1, 1, 2, 4, 8, 16, 16 ... s   (heal within 16 s)
+    //   HELLO timeout      -> counts twice, cap 60 s: 2, 8, 32, 60 ... s
+    //                         (a silent peer costs <= ~1 HELLO timeout / min)
+    static int prehello_delay_s(Target& t) {
+        if (t.hello_seen) { t.prehello_fails = 0; return 1; }
+        t.prehello_fails += t.hello_timed_out ? 2u : 1u;
+        const int cap = t.hello_timed_out ? kSilentBackoffCapS : kRefusedBackoffCapS;
+        if (t.prehello_fails <= 1) return 1;
+        const u32 sh = std::min<u32>(t.prehello_fails - 1, 6);
+        return std::min(cap, 1 << sh);
+    }
     struct Item {
         PeerId from = 0;
         FbReceipt r;
@@ -841,7 +864,11 @@ private:
         }
         {
             std::lock_guard<std::mutex> lk(m_tmtx);
-            for (auto& t : m_targets) if (t.pid == p) { t.pid = 0; t.next_try = Clock::now() + std::chrono::seconds(t.backoff_s); }
+            for (auto& t : m_targets) if (t.pid == p) {
+                t.pid = 0;
+                t.next_try = Clock::now() + std::chrono::seconds(prehello_delay_s(t));   // SMOKE-NOISE
+                t.hello_seen = false; t.hello_timed_out = false;
+            }
         }
     }
 
@@ -892,6 +919,10 @@ private:
         if (need_send && m_net.send_to(p, encode_hello(our_hello()))) m_st.hello_sent++;
         if (!first) return;
         m_st.hello_ok++;
+        {   // SMOKE-NOISE: a dial target whose link reached HELLO is healthy again
+            std::lock_guard<std::mutex> lk(m_tmtx);
+            for (auto& t : m_targets) if (t.pid == p) { t.hello_seen = true; t.prehello_fails = 0; }
+        }
         log("relay: peer " + std::to_string(p) + " HELLO ok (lane next_pos=" + std::to_string(h.lane_next_pos) +
             " listen=" + std::to_string(h.listen_port) + ")");
         reoffer_to(p);
@@ -1608,6 +1639,10 @@ private:
             }
             for (PeerId p : stale) {
                 m_st.hello_timeout++;
+                {   // SMOKE-NOISE: a silent dial target backs off harder than a refusing one
+                    std::lock_guard<std::mutex> lk(m_tmtx);
+                    for (auto& t : m_targets) if (t.pid == p) t.hello_timed_out = true;
+                }
                 if (m_net.has_peer(p)) { m_net.disconnect(p); continue; }
                 std::lock_guard<std::mutex> lk(m_pmtx);   // transport already dropped it: no down event will come
                 m_peers.erase(p);
@@ -1637,10 +1672,24 @@ private:
                     }
                     m_st.dials++;
                     const PeerId pid = m_net.add_peer_id(host, port);
+                    // the peer's HELLO may already have been accepted before t.pid is set
+                    const bool hello_now = pid && hello_ok(pid);
                     std::lock_guard<std::mutex> lk(m_tmtx);
                     auto& t = m_targets[i];
-                    if (pid) { t.pid = pid; t.backoff_s = 1; }
-                    else {
+                    if (pid) {
+                        t.backoff_s = 1;   // connect(2) worked: the dial-failure backoff restarts (unchanged)
+                        t.hello_seen = hello_now; t.hello_timed_out = false;
+                        if (m_net.has_peer(pid)) {
+                            t.pid = pid;
+                            if (hello_now) t.prehello_fails = 0;
+                        } else {
+                            // SMOKE-NOISE: the link already ended and its down event ran
+                            // before t.pid was set (it found no target), so the old code
+                            // redialed on the very next tick (250 ms). Back off here.
+                            t.next_try = Clock::now() + std::chrono::seconds(prehello_delay_s(t));
+                            t.hello_seen = false;
+                        }
+                    } else {
                         m_st.dial_fail++;
                         t.next_try = Clock::now() + std::chrono::seconds(t.backoff_s);
                         t.backoff_s = std::min(60, t.backoff_s * 2);
