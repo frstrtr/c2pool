@@ -246,6 +246,7 @@ struct RelayStats {
                      ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_req_dropped{0};
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
+    std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
 };
 
 class XmrRelayNode {
@@ -428,6 +429,7 @@ public:
             m_seen_bids.insert(b.bid);
         }
         const auto f = encode_block_won(b);
+        remember_won_frame(f);   // ENROL-REPL (DROPS only): re-offered to a peer that HELLOs later
         std::size_t n = 0;
         for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) ++n;
         m_st.block_won_tx++;
@@ -895,6 +897,7 @@ private:
         log("relay: peer " + std::to_string(p) + " HELLO ok (lane next_pos=" + std::to_string(h.lane_next_pos) +
             " listen=" + std::to_string(h.listen_port) + ")");
         reoffer_to(p);
+        reoffer_won_to(p);   // ENROL-REPL (DROPS only; a no-op at flip 0)
         if (h.lane_next_pos > 0) {
             Job j; j.kind = Job::Kind::Order; j.repair = false;
             j.p = h.lane_next_pos;
@@ -961,7 +964,29 @@ private:
         }
         if (!fresh) return;
         m_st.block_won_rx++;
+        remember_won_frame(f);   // ENROL-REPL (DROPS only)
         for (PeerId q : ready_peers()) if (q != p) m_net.send_to(q, f);   // forward once (dedup by bid)
+    }
+
+    // ★ ENROL-REPL (DROPS, gate ON only): under the flip every node books a lane
+    // block's DROPS credit from the winner's carried delta (FB_BLOCK_WON v0x02),
+    // so a node that was not connected when the frame flooded (a late join, a
+    // restart, a healed partition) must still receive it. The last
+    // kWonReofferMax frames are re-offered on every HELLO, exactly like recent
+    // receipts (reoffer_to). drops_floor_diff == 0 (flip 0): nothing is kept and
+    // nothing is re-sent -- master's relay, byte for byte.
+    static constexpr std::size_t kWonReofferMax = 64;
+    void remember_won_frame(const std::vector<u8>& f) {
+        if (m_o.drops_floor_diff == 0) return;
+        std::lock_guard<std::mutex> lk(m_bmtx);
+        m_won_raw.push_back(f);
+        while (m_won_raw.size() > kWonReofferMax) m_won_raw.pop_front();
+    }
+    void reoffer_won_to(PeerId p) {
+        if (m_o.drops_floor_diff == 0) return;
+        std::vector<std::vector<u8>> raws;
+        { std::lock_guard<std::mutex> lk(m_bmtx); raws.assign(m_won_raw.begin(), m_won_raw.end()); }
+        for (const auto& f : raws) if (m_net.send_to(p, f)) m_st.won_reoffered++;
     }
 
     // ── receipt context: serve (queue for the daemon's monerod) / receive ────
@@ -1737,6 +1762,7 @@ private:
     std::set<bytes32> m_seen_bids;
     std::map<bytes32, PeerId> m_bid_peer;
     std::vector<std::pair<BlockWon, PeerId>> m_won;
+    std::deque<std::vector<u8>> m_won_raw;   // ENROL-REPL: recent FB_BLOCK_WON frames (DROPS only)
 
     mutable std::mutex m_dmtx;         // pos -> lane digest (the spine probe)
     std::map<u64, bytes32> m_pos_digest;

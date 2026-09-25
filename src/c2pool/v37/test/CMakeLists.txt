@@ -373,6 +373,20 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_lane_suspend_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_lane_suspend_selfcheck PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_lane_suspend_selfcheck COMMAND v37_xmr_lane_suspend_selfcheck)
+    # v37_xmr_stratum_resume_kat (STRATUM-RESUME, cold-boot smoke D3): a login
+    # parked while there is no template / the lane is SUSPENDED is kept open and
+    # completed with a login result + job on the first template (notify, resume
+    # edge, or the idle-tick re-probe) -- never expired into "No job available",
+    # which leaves xmrig idle on an open connection for good. Fake template
+    # provider (unavailable -> available) + stub verifier over loopback: no
+    # RandomX, no monerod. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_stratum_resume_kat
+        v37_xmr_stratum_resume_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_resume_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_resume_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_resume_kat COMMAND v37_xmr_stratum_resume_kat)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
@@ -536,13 +550,14 @@ if (BUILD_TESTING)
     #                               readers are reaped, the accept loop backs
     #                               off on EMFILE and the relay heals after a
     #                               partition_for().
+    #   v37_xmr_drops_enrol_repl_kat ENROL-REPL: the carried DROPS delta (below).
     #   v37_xmr_relay_pool_id_kat   POOL-ID: the roundabout S1 lane_tag in
     #                               HELLO; another pool's node (geometry /
     #                               chain_id / consensus version) is refused
     #                               as TAG_MISMATCH in both directions and
     #                               nothing crosses; same pool unchanged.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
@@ -557,6 +572,18 @@ if (BUILD_TESTING)
         target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
         add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
     endforeach()
+    # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
+    # enrolment book is node-local, so a lane block books the WINNER's composed
+    # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book
+    # composition). Two nodes enrolled 8 tips apart book 50 wins through
+    # XmrFinalizeDriver with EQUAL owed_digest (RED on the base: each composes
+    # its own); the v0x02 codec (flip-0 decoder refuses it; malformed trailers
+    # refused); a mismatched / inconsistent carried delta books EMPTY on every
+    # node; source pins on the shell / node / relay. ALSO on BOTH build.yml
+    # --target lists.
+    target_compile_definitions(v37_xmr_drops_enrol_repl_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
+        V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
     # ------------------------------------------------------------------
     # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.
     #
