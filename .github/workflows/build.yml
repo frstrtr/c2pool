@@ -285,6 +285,7 @@ jobs:
                     v37_xmr_p2p_publish_retry_kat \
                     v37_xmr_mainnet_readiness_kat \
                     v37_xmr_pinned_snapshot_kat v37_xmr_cli_strict_kat \
+                    v37_xmr_run_a_node_check \
                     v37_xmr_d6d_native_seed_tip_kat \
                     xmr_native_anchor_gate4_kat \
                     xmr_native_snapshot_resume_kat \
@@ -773,6 +774,7 @@ jobs:
                     xmr_msr_boost_kat \
                     v37_xmr_mainnet_readiness_kat \
                     v37_xmr_pinned_snapshot_kat v37_xmr_cli_strict_kat \
+                    v37_xmr_run_a_node_check \
                     v37_xmr_d6d_native_seed_tip_kat \
                     xmr_native_anchor_gate4_kat \
                     xmr_native_snapshot_resume_kat \
