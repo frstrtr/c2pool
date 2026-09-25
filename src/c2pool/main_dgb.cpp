@@ -1885,19 +1885,22 @@ int run_node(const core::CoinParams& params, bool testnet,
             std::memcpy(donation_hash.data(), ds.data() + 2, 20);
             redistributor->set_donation_identity(donation_hash, /*P2SH=*/2);
         }
-        // "fee" identity: the node operator's payout address -> hash160, decoded
-        // via core::address_to_hash160 (mirrors main_ltc.cpp's set_operator_
-        // identity wiring; DGB has no MiningInterface bridge). Absent a
-        // --node-owner-address the operator identity stays null and a bare
-        // --redistribute fee remains the fail-safe empty-script no-op (never a
-        // burn output). CONSENSUS-SAFE: node-local pubkey_hash choice only.
-        if (dgb::set_operator_identity_from_address(*redistributor, node_owner_address)) {
+        // "fee" identity: the node operator's payout address -> hash160 + type,
+        // classified against DGB's OWN network acceptance (issue #1312: a DGB
+        // S-address is P2SH, a foreign-coin address is never armed; mirrors
+        // main_ltc.cpp's set_operator_identity wiring; DGB has no
+        // MiningInterface bridge). Absent a --node-owner-address the operator
+        // identity stays null and a bare --redistribute fee remains the
+        // fail-safe empty-script no-op (never a burn output). CONSENSUS-SAFE:
+        // node-local pubkey_hash choice only.
+        if (dgb::set_operator_identity_from_address(*redistributor, node_owner_address,
+                dgb::address_acceptance(testnet, regtest))) {
             std::cout << "[DGB] redistribute fee identity ARMED: operator payout \""
                       << node_owner_address << "\" -> hash160" << std::endl;
         } else if (!node_owner_address.empty()) {
             std::cout << "[DGB] WARNING: --node-owner-address \"" << node_owner_address
-                      << "\" did not decode to a hash160; fee arm stays null "
-                         "(empty script, no burn)" << std::endl;
+                      << "\" is not an own-network DGB P2PKH/P2SH address; fee arm "
+                         "stays null (empty script, no burn)" << std::endl;
         }
         auto& redist_tracker = p2p_node.tracker();
         work_source->set_fallback_payout_fn(
