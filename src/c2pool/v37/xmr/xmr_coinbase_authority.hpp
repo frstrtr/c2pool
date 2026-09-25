@@ -34,6 +34,7 @@
 #include "impl/xmr/template/xmr_block_assembly.hpp"         // parse_coinbase_prefix
 #include "xmr_credit_cut.hpp"                               // recon(A+B credit): the on-chain credit cut
 #include "xmr_fee_model.hpp"                                // fee model: donation marker rule (REFUSE-IF-ABSENT)
+#include "xmr_paynow.hpp"                                   // SAME-BLOCK PAY-NOW: the V37N base tail
 
 namespace c2pool::v37n::xmr::authority {
 
@@ -87,6 +88,9 @@ struct CoinbaseBooking {
     bool                 lineage_gated = false;
     credit::BlockLineage lineage = credit::BlockLineage::Untagged;
     ::v37::bytes32       lineage_seen_tag{};   // the foreign tag (lineage == Foreign)
+    // SAME-BLOCK PAY-NOW: the committed base B (0x02 tail "V37N"), if any.
+    // The booking nets the pay-now it implies (xmr_paynow.hpp net_booking).
+    std::optional<std::uint64_t> paynow_base;
 };
 
 // candidates: newest first. keys: every identity this node can resolve via pay_of.
@@ -168,6 +172,7 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     b.is_lane = true;
     if (const auto cc = credit::parse_from_tx_extra(got.tx_extra)) { b.has_credit_cut = true; b.credit_cut = *cc; }   // recon(A+B credit)
     b.donation_owed_in = fee::parse_donation_owed(got.tx_extra);   // fee model (used by the gate-ON booking only)
+    b.paynow_base = paynow::parse(got.tx_extra);                  // SAME-BLOCK PAY-NOW (absent => none)
 
     // --- r and R ---
     set_::CoinbaseInputs in;

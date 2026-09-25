@@ -622,6 +622,55 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_fee_model_kat COMMAND v37_xmr_fee_model_kat)
 
     # ------------------------------------------------------------------
+    # SAME-BLOCK PAY-NOW (operator ruling 09-25, xmr/xmr_paynow.hpp):
+    # a pool block pays the miners whose work it credits out of what the
+    # owed pass leaves (<= each one's own E_b), the donation output carries
+    # only its marker, and the block is booked NET of that pay-now. The X6
+    # split + allocation, the V37N commitment, the net-at-FOUND booking on a
+    # real OwedLedger (no negative EffectiveOwed, exact conservation, orphan
+    # nets nothing) and the settlement source end-to-end. Same link shape as
+    # the fee-model KAT (listed in BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_paynow_kat
+        v37_xmr_paynow_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_paynow_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_paynow_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_paynow_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_paynow_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_paynow_kat COMMAND v37_xmr_paynow_kat)
+
+    # ------------------------------------------------------------------
+    # SAME-BLOCK PAY-NOW on POOL-LINEAGE: one lane coinbase carries both the
+    # V37N pay-now base and the V37P pool tag in the canonical order
+    # V37N | V37D | V37P | V37C (V37C last); every field reads back (codec,
+    # the settlement source's tail, REAL assembled blocks, the widest
+    # 151-byte payload); the pool tag classifies BEFORE any pay-now booking:
+    # our block books net of its pay-now, another pool's / an untagged block
+    # with a V37N field is ordinary and never netted. Same link shape as the
+    # pool-lineage KAT (listed in BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_paynow_lineage_kat
+        v37_xmr_paynow_lineage_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_paynow_lineage_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_paynow_lineage_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_paynow_lineage_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_paynow_lineage_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_paynow_lineage_kat COMMAND v37_xmr_paynow_lineage_kat)
+
+    # ------------------------------------------------------------------
     # GAP-2 stage 1 -- the real c2pool-to-c2pool XMR receipt relay
     # (src/c2pool/v37/xmr/relay/, docs/xmr-lane/gap2-sharechain-relay-design.md).
     #

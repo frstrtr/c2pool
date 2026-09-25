@@ -202,10 +202,36 @@ inline KFairCoinbaseShape inspect_kfair_coinbase(const asm_::AssembledTemplate& 
     bool          have_prev = false;
     std::uint64_t prev_age  = 0;
     ::v37::bytes32 prev_identity{};
+    // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): new pay-now outputs follow every owed
+    // output, identity strictly ASC, and pay only payees the block's credit cut
+    // credits (the inputs' paynow_at set at this budget).
+    std::map<::v37::bytes32, std::uint64_t> paynow_eb;
+    if (ref.paynow_at)
+        for (const auto& e : ref.paynow_at(ref.budget())) paynow_eb[e.identity] = e.eb;
+    bool have_paynow = false;
+    ::v37::bytes32 prev_paynow{};
     for (std::size_t i = 0; i < outs.size(); ++i) {
         switch (outs[i].role) {
+            case set_::CoinbaseOutput::Role::PayNow: {
+                auto it = paynow_eb.find(outs[i].identity);
+                if (it == paynow_eb.end() || outs[i].amount > it->second) {
+                    s.why = "pay-now output " + std::to_string(i) + " pays a payee this block's cut does not credit, or more than its E_b";
+                    return s;
+                }
+                if (have_paynow && !(prev_paynow < outs[i].identity)) {
+                    s.why = "pay-now order broken at output " + std::to_string(i) + " (identity ASC)";
+                    return s;
+                }
+                have_paynow = true;
+                prev_paynow = outs[i].identity;
+                break;
+            }
             case set_::CoinbaseOutput::Role::Owed: {
                 ++s.n_owed;
+                if (have_paynow) {
+                    s.why = "owed output " + std::to_string(i) + " after a pay-now output";
+                    return s;
+                }
                 auto it = age_of.find(outs[i].identity);
                 if (it == age_of.end()) {
                     s.why = "owed output " + std::to_string(i) + " is not in the eligible owed set";
