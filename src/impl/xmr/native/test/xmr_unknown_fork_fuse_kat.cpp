@@ -9,10 +9,13 @@
 // src/impl/xmr/native/test/xmr_unknown_fork_fuse_kat.cpp
 //
 // FORK-FUSE: the native node must survive an unknown Monero hard fork safely.
-// At the first block of a fork this build does not implement (FCMP++/Carrot
-// v17 is the next one), the node must STOP LOUDLY -- trip the unknown-fork
-// fuse, withdraw templates and tx admission -- and must NOT score the honest,
-// upgraded peers that send it the new blocks and transactions.
+// When the network moves to a fork this build does not implement (FCMP++/Carrot
+// v17 is the next one), the node must STOP LOUDLY -- withdraw templates and tx
+// admission -- and must NOT score the honest, upgraded peers that send it the
+// new blocks and transactions. FORK-FUSE-2: and ONE forged above-version
+// header (its PoW cannot be checked here) must not be enough to stop it: that
+// is only a SUSPECT alarm; the trip needs >= 2 distinct peers AND a stalled
+// v16 tip, and clears when v16 extends the tip by 2 (section E).
 //
 // THE FAILURE THIS PINS. Before the fix a v17 block failed parse_block()
 // (TrailingBytes on the two tree fields, BadMinerTx on the Carrot output tag)
@@ -33,8 +36,8 @@
 // WHAT RUNS.
 //   A. The REAL ChainIndex on a from-genesis regtest chain with a recording
 //      fetcher: above-version blocks (v17-shaped, bump-only, a real mainnet
-//      v16 block bumped, unattached) are refused WITHOUT a penalty; the fuse
-//      trips once one attaches; templates stop; the tip does not move.
+//      v16 block bumped, unattached) are refused WITHOUT a penalty; one of
+//      them is a SUSPECT alarm only (templates continue); the tip does not move.
 //   B. The REAL RelayedTxPool: above-version txs refused as NotUnderstood,
 //      no drop offence, counted; malformed txs of a known format keep their
 //      exact pre-fix verdicts.
@@ -44,6 +47,14 @@
 //      stand-in on loopback that pushes the crafted block (2008) and the
 //      crafted txs (2002). The link must survive with fail_score 0; a v16
 //      garbage block is still banned at message 1.
+//
+//   E. FORK-FUSE-2 (the fuse must not be trippable by one forged header): a
+//      lone above-version block is only a SUSPECT alarm (templates continue);
+//      two peers forging headers while v16 blocks keep arriving never trip it;
+//      a real fork (>= 2 distinct peers AND a stalled v16 tip for the stall
+//      period, on an injected clock) trips it, and 2 v16 blocks clear it; the
+//      above-version id is held back from the want list, so the REAL
+//      SyncDriver asks for it once, not every refetch_reask_ms.
 //
 // Only interfaces that existed before the fix are needed for the behavioural
 // checks, so this file also builds against the pre-fix tree, where it FAILS
@@ -66,6 +77,7 @@
 #include "impl/xmr/native/chain/xmr_row_store.hpp"
 #include "impl/xmr/native/consensus/xmr_reward.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
+#include "impl/xmr/native/node/xmr_sync_driver.hpp"
 #include "impl/xmr/native/p2p/xmr_peer_pool.hpp"
 #include "impl/xmr/native/txpool/xmr_relayed_txpool.hpp"
 #include "impl/xmr/native/txpool/xmr_tx_decode.hpp"
@@ -273,7 +285,40 @@ struct Chain {
     BlockEntry next_v17() const {
         return make_v17_block(tip_id, tip_h + 1, GENESIS_TS + 120 * (tip_h + 1), base_at(tip_agc));
     }
+    // The bump-only forgery: a v16 body on our tip with the major version
+    // bumped. Its v16-rule id is computable (id_of_forged), so a lying peer can
+    // announce it in a chain entry.
+    BlockEntry forged_v17(std::uint32_t nonce) const {
+        return make_block(FUTURE, FUTURE, GENESIS_TS + 120 * (tip_h + 1), tip_id, nonce,
+                          tip_h + 1, base_at(tip_agc));
+    }
+    // One honest v16 block on the tip, from `p`.
+    bool extend_v16(const PeerRef* p, std::uint32_t nonce) {
+        const OfferResult r = idx->offer_block(p, next_v16(nonce), false);
+        if (r.outcome != OfferOutcome::Connected) return false;
+        tip_agc = accumulate_generated_coins(tip_agc, base_at(tip_agc));
+        tip_id  = r.id;
+        tip_h  += 1;
+        return true;
+    }
 };
+
+// The v16-rule id of a blob that still parses as v16 (base and fix alike).
+Hash id_of_forged(const BlockEntry& e) {
+    ParsedBlock pb;
+    if (parse_block(e.block_blob, pb) != BlockParseStatus::Ok) return Hash{};
+    return block_identity(e.block_blob.data(), pb).id;
+}
+
+// FORK-FUSE-2's poll. On the pre-fix tree there is none (the latch needs no
+// clock), so the behavioural checks below run there unchanged and fail.
+void uf_poll(Chain& ch, std::uint64_t now_ms) {
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+    (void)ch.idx->check_unknown_fork(now_ms);
+#else
+    (void)ch; (void)now_ms;
+#endif
+}
 
 PeerRef peer(std::uint64_t id) {
     PeerRef p;
@@ -314,20 +359,29 @@ void test_unknown_fork_block_index() {
         kat::checkf(ch.idx->tip() && ch.idx->tip()->height == ch.tip_h,
                     "A[%s]: the tip does not move", c.name);
         kat::checkf(ch.idx->alt_size() == 0, "A[%s]: nothing is parked", c.name);
-        kat::checkf(!ch.idx->template_inputs().has_value(),
-                    "A[%s]: templates are withdrawn after the fork block", c.name);
+        // FORK-FUSE-2: ONE above-version block is an unauthenticated claim
+        // (its PoW cannot be checked). It is a SUSPECT alarm; templates go on.
+        kat::checkf(ch.idx->template_inputs().has_value(),
+                    "A[%s]: templates CONTINUE after a lone above-version block (suspect only)",
+                    c.name);
 #if defined(C2POOL_XMR_UNKNOWN_FORK_FUSE)
         kat::checkf(r.eval == EvalStatus::UnknownFork, "A[%s]: eval is UnknownFork", c.name);
         kat::checkf(r.height == ch.tip_h + 1, "A[%s]: placed at tip+1", c.name);
-        const HfFuse f = ch.idx->hf_fuse();
-        kat::checkf(f.tripped() && f.first_version() == FUTURE && f.first_height() == ch.tip_h + 1,
-                    "A[%s]: fuse tripped at v%u h=%llu", c.name, f.first_version(),
-                    static_cast<unsigned long long>(f.first_height()));
-        kat::checkf(!f.allows(HfCapability::Template) && !f.allows(HfCapability::AdmitTx)
-                    && f.allows(HfCapability::Follow),
-                    "A[%s]: the fuse withdraws Template and AdmitTx only", c.name);
+        kat::checkf(!ch.idx->hf_fuse().tripped(),
+                    "A[%s]: the rolled-fork latch is NOT tripped by an above-version block", c.name);
         kat::checkf(ch.idx->unknown_fork_blocks() == 1 && ch.idx->unknown_fork_unattached() == 0,
                     "A[%s]: counted once, attached", c.name);
+#endif
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+        {
+            const UnknownForkWatch w = ch.idx->unknown_fork_watch();
+            kat::checkf(w.state() == UnknownForkState::Suspect && !w.tripped()
+                        && w.distinct_peers() == 1 && w.suspect_alarms() == 1,
+                        "A[%s]: watch is SUSPECT, 1 peer, 1 alarm (state=%s)", c.name,
+                        to_string(w.state()));
+        }
+#endif
+#if defined(C2POOL_XMR_UNKNOWN_FORK_FUSE)
 
         // A second push of the same block and a v18 one: counted, still no
         // penalty, the fuse records the higher version.
@@ -337,8 +391,14 @@ void test_unknown_fork_block_index() {
         (void)ch.idx->offer_block(&p, e18, false);
         kat::checkf(fetcher.penalties.empty(), "A[%s]: repeats are not penalised either", c.name);
         kat::checkf(ch.idx->unknown_fork_blocks() == 3, "A[%s]: 3 counted", c.name);
-        kat::checkf(ch.idx->hf_fuse().highest_version() == FUTURE + 1,
-                    "A[%s]: the fuse records the highest version seen", c.name);
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+        kat::checkf(ch.idx->unknown_fork_watch().highest_version() == FUTURE + 1
+                    && ch.idx->unknown_fork_watch().suspect_alarms() == 1,
+                    "A[%s]: the watch records the highest version seen, alarm once per peer",
+                    c.name);
+#endif
+        kat::checkf(ch.idx->template_inputs().has_value(),
+                    "A[%s]: templates still flow after repeats from the same peer", c.name);
 #endif
         // A v16 block is still followed normally after the trip (Follow is a
         // surviving capability): the chain we have is not discarded.
@@ -757,10 +817,14 @@ void test_live_levin() {
         kat::check(n.score() == 0, "D1: fail_score unchanged (0)");
         kat::check(t.bans == 0, "D1: no ban");
         kat::check(n.ch.idx->tip()->height == n.ch.tip_h, "D1: tip unchanged");
-        kat::check(tmpl_before && !n.ch.idx->template_inputs().has_value(),
-                   "D1: templates stop after the fork block");
+        kat::check(tmpl_before && n.ch.idx->template_inputs().has_value(),
+                   "D1: templates CONTINUE after one peer's above-version block (suspect only)");
 #if defined(C2POOL_XMR_UNKNOWN_FORK_FUSE)
-        kat::check(n.ch.idx->hf_fuse().tripped(), "D1: the fuse tripped");
+        kat::check(!n.ch.idx->hf_fuse().tripped(), "D1: the latch did not trip");
+#endif
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+        kat::check(n.ch.idx->unknown_fork_watch().state() == UnknownForkState::Suspect,
+                   "D1: the watch is SUSPECT");
 #endif
     }
     // D2. above-version txs, pushed as a 2002
@@ -800,6 +864,205 @@ void test_live_levin() {
     }
 }
 
+
+// =============================================================================
+// E. FORK-FUSE-2: suspect, quorum + stall trip, clear, bounded id set
+// =============================================================================
+constexpr std::uint64_t MIN_MS   = 60'000;
+constexpr std::uint64_t STALL_MS = 30 * MIN_MS;   // UNKNOWN_FORK_STALL_MS_DEFAULT
+
+bool tmpl(const Chain& ch) { return ch.idx->template_inputs().has_value(); }
+// The gate the node feeds the relay txpool from (NativeNode::publish_tx_gate_).
+bool admit(const Chain& ch) { return ch.idx->view().sync_state().synced; }
+
+// E1. One forging peer, no v16 progress for 2 h: SUSPECT only, never trips.
+void test_e1_single_peer_never_trips() {
+    Chain ch;
+    fakes::FakeFetcher fetcher;
+    ch.idx->set_fetcher(&fetcher);
+    const PeerRef p = peer(21);
+    std::uint64_t now = 1'000'000;
+    uf_poll(ch, now);
+    std::size_t tmpl_off = 0;
+    for (int k = 0; k < 2 * 60 * 12; ++k) {         // every 5 s for 2 h
+        (void)ch.idx->offer_block(&p, ch.forged_v17(static_cast<std::uint32_t>(k)), false);
+        now += 5'000;
+        uf_poll(ch, now);
+        if (!tmpl(ch)) ++tmpl_off;
+    }
+    std::printf("E1 one peer x %d forged headers over 2 h, no v16 block: tmpl_off_polls=%zu "
+                "penalties=%zu\n", 2 * 60 * 12, tmpl_off, fetcher.penalties.size());
+    kat::check(tmpl_off == 0, "E1: one peer never withdraws templates (even with a stalled tip)");
+    kat::check(admit(ch), "E1: tx admission stays open");
+    kat::check(fetcher.penalties.empty(), "E1: the peer is not penalised");
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+    const UnknownForkWatch w = ch.idx->unknown_fork_watch();
+    std::printf("E1: state=%s blocks=%llu alarms=%llu peers=%zu trips=%llu\n", to_string(w.state()),
+                static_cast<unsigned long long>(w.blocks()),
+                static_cast<unsigned long long>(w.suspect_alarms()), w.distinct_peers(),
+                static_cast<unsigned long long>(w.trips()));
+    kat::check(w.state() == UnknownForkState::Suspect && w.trips() == 0,
+               "E1: SUSPECT, 0 trips");
+    kat::check(w.blocks() == 2 * 60 * 12 && w.suspect_alarms() == 1,
+               "E1: every block counted, one alarm for the one peer");
+#endif
+}
+
+// E2. Two forging peers every 5 s for 3 h while honest v16 blocks arrive every
+// 120 s: never trips, templates and blocks continue, nobody penalised.
+void test_e2_two_peers_with_v16_progress() {
+    Chain ch;
+    fakes::FakeFetcher fetcher;
+    ch.idx->set_fetcher(&fetcher);
+    const PeerRef p1 = peer(31), p2 = peer(32), honest = peer(33);
+    std::uint64_t now = 1'000'000;
+    uf_poll(ch, now);
+    std::size_t tmpl_off = 0, v16 = 0, forged = 0;
+    const std::uint64_t h0 = ch.tip_h;
+    for (int k = 1; k <= 3 * 60 * 12; ++k) {         // 5 s steps, 3 h
+        (void)ch.idx->offer_block((k & 1) ? &p1 : &p2, ch.forged_v17(static_cast<std::uint32_t>(k)), false);
+        ++forged;
+        if (k % 24 == 0) {                            // every 120 s
+            if (ch.extend_v16(&honest, static_cast<std::uint32_t>(1000 + k))) ++v16;
+        }
+        now += 5'000;
+        uf_poll(ch, now);
+        if (!tmpl(ch)) ++tmpl_off;
+    }
+    std::printf("E2 two peers x %zu forged headers over 3 h, %zu v16 blocks: tip %llu->%llu "
+                "tmpl_off_polls=%zu penalties=%zu\n", forged, v16,
+                static_cast<unsigned long long>(h0), static_cast<unsigned long long>(ch.tip_h),
+                tmpl_off, fetcher.penalties.size());
+    kat::check(tmpl_off == 0, "E2: two forging peers never withdraw templates while v16 advances");
+    kat::check(v16 == 90 && ch.tip_h == h0 + 90, "E2: every honest v16 block connected");
+    kat::check(fetcher.penalties.empty(), "E2: nobody penalised");
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+    const UnknownForkWatch w = ch.idx->unknown_fork_watch();
+    std::printf("E2: state=%s blocks=%llu alarms=%llu trips=%llu\n", to_string(w.state()),
+                static_cast<unsigned long long>(w.blocks()),
+                static_cast<unsigned long long>(w.suspect_alarms()),
+                static_cast<unsigned long long>(w.trips()));
+    kat::check(w.trips() == 0 && w.blocks() == forged, "E2: 0 trips, every block counted");
+#endif
+}
+
+// E3. A real fork: two distinct peers send above-version blocks and no v16
+// block extends the tip. Trips at the stall period (+ one poll), withdraws
+// templates AND tx admission, then clears after 2 v16 blocks.
+void test_e3_quorum_stall_trip_and_clear() {
+    Chain ch;
+    fakes::FakeFetcher fetcher;
+    ch.idx->set_fetcher(&fetcher);
+    const PeerRef p1 = peer(41), p2 = peer(42), honest = peer(43);
+    const std::uint64_t t0 = 5'000'000;
+    uf_poll(ch, t0);
+    (void)ch.idx->offer_block(&p1, ch.next_v17(), false);
+    (void)ch.idx->offer_block(&p2, ch.forged_v17(77), false);
+    kat::check(tmpl(ch) && admit(ch), "E3: two peers alone (no stall yet) do not trip");
+    std::uint64_t trip_at = 0;
+    for (std::uint64_t t = t0; t <= t0 + STALL_MS + 5'000; t += 500) {   // 500 ms polls
+        uf_poll(ch, t);
+        if (!tmpl(ch)) { trip_at = t; break; }
+    }
+    std::printf("E3 quorum 2 + stall: trip after %llu ms (stall period %llu ms)\n",
+                static_cast<unsigned long long>(trip_at ? trip_at - t0 : 0),
+                static_cast<unsigned long long>(STALL_MS));
+    kat::check(trip_at == t0 + STALL_MS, "E3: trips exactly at the stall period (one 500 ms poll)");
+    kat::check(!tmpl(ch) && !admit(ch), "E3: templates and tx admission withdrawn on trip");
+    kat::check(fetcher.penalties.empty(), "E3: nobody penalised");
+    // Follow survives: one v16 block still connects, but one is not enough.
+    kat::check(ch.extend_v16(&honest, 501), "E3: a v16 block still connects while tripped");
+    uf_poll(ch, trip_at + 60'000);
+    kat::check(!tmpl(ch), "E3: one v16 block does not clear the trip");
+    kat::check(ch.extend_v16(&honest, 502), "E3: a second v16 block connects");
+    uf_poll(ch, trip_at + 120'000);
+    std::printf("E3 clear: templates=%d admit=%d after 2 v16 blocks\n", tmpl(ch) ? 1 : 0,
+                admit(ch) ? 1 : 0);
+    kat::check(tmpl(ch) && admit(ch), "E3: 2 v16 blocks clear the trip; templates resume");
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+    const UnknownForkWatch w = ch.idx->unknown_fork_watch();
+    kat::check(w.trips() == 1 && w.clears() == 1 && w.state() == UnknownForkState::Normal,
+               "E3: 1 trip, 1 clear, back to normal");
+    kat::check(!ch.idx->hf_fuse().tripped(), "E3: the rolled-fork latch untouched");
+
+    // Quorum is required: the same stall with ONE peer never trips; the same
+    // peer from two ports on MAINNET is one /16 group.
+    Chain c2;
+    uf_poll(c2, t0);
+    (void)c2.idx->offer_block(&p1, c2.next_v17(), false);
+    for (std::uint64_t t = t0; t <= t0 + 4 * STALL_MS; t += 60'000) uf_poll(c2, t);
+    kat::check(tmpl(c2), "E3: one peer + 2 h stall does not trip (quorum)");
+#endif
+}
+
+// E4. The bounded id set: a lying peer announces a forged above-version block
+// in a chain entry and serves it on every GET_OBJECTS. The REAL SyncDriver
+// asks for it once, not every refetch_reask_ms (15 s) for 10 minutes.
+void test_e4_no_rerequest() {
+    Chain ch;
+    fakes::FakeFetcher fetcher;
+    ch.idx->set_fetcher(&fetcher);
+    const PeerRef liar = peer(51);
+    PeerSyncData sd;
+    sd.current_height        = ch.tip_h + 1;      // level with us: no chain asks
+    sd.cumulative_difficulty = u128_of(ch.tip_h + 1, 0);
+    sd.top_id                = ch.tip_id;
+    sd.top_version           = IMPL;
+    fetcher.peer_table.push_back({liar, sd});
+
+    const BlockEntry forged = ch.forged_v17(4242);
+    const Hash       fid    = id_of_forged(forged);
+    // A real next-fork block (unparseable as v16) announced under some id.
+    const BlockEntry real17 = ch.next_v17();
+    Hash rid = tag_id(0xABCDEF);
+
+    const std::uint64_t t0 = 9'000'000;
+    uf_poll(ch, t0);
+    for (int leg = 0; leg < 2; ++leg) {
+        const Hash want = leg == 0 ? fid : rid;
+        const BlockEntry& serve = leg == 0 ? forged : real17;
+        ChainEntry e;
+        e.start_height = ch.tip_h;
+        e.total_height = ch.tip_h + 2;
+        e.ids = {ch.tip_id, want};
+        ch.idx->on_chain_entry(liar, std::move(e));
+        rt::SyncDriver drv(fetcher, *ch.idx, *ch.idx, tag_id(0), [] { return true; },
+                           [&] { return ch.idx->refetch_wanted(); });
+        fetcher.object_requests.clear();
+        std::size_t asks = 0;
+        const std::uint64_t base_t = t0 + static_cast<std::uint64_t>(leg) * 20 * MIN_MS;
+        for (std::uint64_t t = base_t; t < base_t + 10 * MIN_MS; t += 500) {
+            uf_poll(ch, t);
+            const std::size_t before = fetcher.object_requests.size();
+            drv.tick(t);
+            for (std::size_t i = before; i < fetcher.object_requests.size(); ++i)
+                for (const Hash& h : fetcher.object_requests[i].ids)
+                    if (h == want) {
+                        ++asks;
+                        std::vector<BlockEntry> blocks{serve};
+                        ch.idx->on_objects(liar, std::move(blocks), {}, ch.tip_h + 2);
+                    }
+        }
+        std::printf("E4[%s]: requests for the above-version id over 10 min = %zu "
+                    "(re-requests %zu) penalties=%zu templates=%d\n",
+                    leg == 0 ? "forged v16-body, id announced" : "v17-shaped, id by height",
+                    asks, asks ? asks - 1 : 0, fetcher.penalties.size(), tmpl(ch) ? 1 : 0);
+        kat::checkf(asks == 1, "E4[%d]: the above-version id is requested once (<= 1 per id), got %zu",
+                    leg, asks);
+        kat::check(fetcher.penalties.empty(), "E4: the liar is not penalised for it");
+        kat::check(tmpl(ch), "E4: one lying peer does not withdraw templates");
+    }
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+    kat::check(ch.idx->unknown_fork_id_known(fid) && ch.idx->unknown_fork_id_known(rid),
+               "E4: both ids are in the bounded set");
+    // Bounded: 300 distinct forged ids leave at most 256 behind.
+    for (int k = 0; k < 300; ++k)
+        (void)ch.idx->offer_block(&liar, ch.forged_v17(static_cast<std::uint32_t>(90000 + k)), false);
+    std::printf("E4: bounded set holds %zu ids after 300 more forgeries\n", ch.idx->unknown_fork_ids());
+    kat::check(ch.idx->unknown_fork_ids() <= 256, "E4: the id set is bounded (<= 256)");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -808,5 +1071,9 @@ int main() {
     test_v16_malformed_blocks_unchanged();
     test_tx_verdicts();
     test_live_levin();
+    test_e1_single_peer_never_trips();
+    test_e2_two_peers_with_v16_progress();
+    test_e3_quorum_stall_trip_and_clear();
+    test_e4_no_rerequest();
     return kat::report("xmr_native_unknown_fork_fuse_kat");
 }

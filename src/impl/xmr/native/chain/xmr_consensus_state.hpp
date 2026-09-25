@@ -460,16 +460,20 @@ public:
 
     // The fuse is per-state and never resets while the state lives; exposed for
     // the telemetry surface.
-    bool allows(HfCapability c) const noexcept { return fuse_.allows(c); }
-
-    // The chain has moved to a fork this build cannot even PARSE (the index
-    // saw a block above MAX_IMPLEMENTED_HF_VERSION attach to a block it holds).
-    // Such a block never reaches connect(), so the fuse is tripped here. Same
-    // latch, same capability withdrawal (no template, no tx admission). Returns
-    // true the first time the fuse trips.
-    bool trip_unknown_fork(std::uint64_t height, std::uint8_t version) noexcept {
-        return fuse_.trip(height, version);
+    bool allows(HfCapability c) const noexcept {
+        return fuse_.allows(c) && (!unknown_fork_tripped_ || hf_capability_survives_roll(c));
     }
+
+    // The chain has moved to a fork this build cannot even PARSE: the index's
+    // UnknownForkWatch saw above-version blocks from >= 2 distinct peers AND a
+    // stalled tip (FORK-FUSE-2). Such blocks never reach connect(), so the
+    // gate is set here. Same capability withdrawal as the latch (no template,
+    // no tx admission), but NOT a latch: an unauthenticated above-version
+    // header cannot be PoW-checked, so the watch clears the gate again when
+    // the v16 chain extends the tip by 2 blocks. The rolled-fork latch
+    // (fuse_) is untouched.
+    void set_unknown_fork_tripped(bool v) noexcept { unknown_fork_tripped_ = v; }
+    bool unknown_fork_tripped() const noexcept { return unknown_fork_tripped_; }
 
 private:
     void trim_rows_() {
@@ -487,6 +491,7 @@ private:
     std::uint64_t          verified_frontier_ = 0;
     std::uint64_t          epoch_seq_         = 0;
     HfFuse                 fuse_{};
+    bool                   unknown_fork_tripped_ = false;   // FORK-FUSE-2 gate, clearable
 };
 
 } // namespace c2pool::xmr::native

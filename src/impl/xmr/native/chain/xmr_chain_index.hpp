@@ -85,6 +85,10 @@
 #include "impl/xmr/native/contracts/fetcher.hpp"
 #include "impl/xmr/native/contracts/serving.hpp"
 
+// Feature marker: FORK-FUSE-2's UnknownForkWatch (check_unknown_fork(),
+// unknown_fork_watch(), the bounded above-version id set) exists.
+#define C2POOL_XMR_UNKNOWN_FORK_WATCH 1
+
 namespace c2pool::xmr::native {
 
 // --- wire limits mirrored from monerod ------------------------------------------
@@ -120,6 +124,12 @@ struct ChainIndexOptions {
     // refused our block; "nobody adopted it" is the evidence it does have.
     // 0 disables. Default: two target block times.
     std::uint64_t own_fork_bound_ms = 240'000;
+    // FORK-FUSE-2: how long the tip must go without a v16 extension, while
+    // >= 2 distinct peers send above-version blocks, before the unknown-fork
+    // trip withdraws templates and tx admission. See UnknownForkWatch for the
+    // choice of 30 min against the 120 s target. 0 = the default. A shorter
+    // value is a test-only knob (the daemon refuses it on mainnet).
+    std::uint64_t unknown_fork_stall_ms = UNKNOWN_FORK_STALL_MS_DEFAULT;
 };
 
 // --- what happened to an offered block ---------------------------------------------
@@ -215,6 +225,7 @@ public:
                     -> std::optional<Hash> { return seed_on_branch_(epoch_height, branch_tip); },
                 opts.level) {
         rows_.set_retention(opts_.row_retention);
+        uf_watch_ = UnknownForkWatch(opts_.unknown_fork_stall_ms);
         alt_.set_caps(opts_.alt_max_blocks, opts_.alt_max_bytes);
         view_.state().set_row_retention(opts_.row_retention);
         // One sink into the state view; it queues rather than dispatches, so no
@@ -729,6 +740,54 @@ public:
     std::uint64_t unknown_fork_blocks() const { std::lock_guard<std::mutex> lk(mu_); return unknown_fork_blocks_; }
     std::uint64_t unknown_fork_unattached() const { std::lock_guard<std::mutex> lk(mu_); return unknown_fork_unattached_; }
     HfFuse        hf_fuse() const { std::lock_guard<std::mutex> lk(mu_); return view_.state().fuse(); }
+    // FORK-FUSE-2: the watch (suspect / tripped, distinct peers, trips, clears),
+    // the bounded set of above-version block ids the want list no longer hands
+    // to the sync driver, and how many times it held one back.
+    UnknownForkWatch unknown_fork_watch() const { std::lock_guard<std::mutex> lk(mu_); return uf_watch_; }
+    std::size_t   unknown_fork_ids() const { std::lock_guard<std::mutex> lk(mu_); return uf_ids_.size(); }
+    std::uint64_t unknown_fork_refetch_held() const { std::lock_guard<std::mutex> lk(mu_); return uf_refetch_held_; }
+    bool          unknown_fork_id_known(const Hash& id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return uf_ids_.count(key_of_(id)) != 0;
+    }
+
+    // FORK-FUSE-2 poll: driven from the verify thread's periodic tick with a
+    // monotone millisecond clock (like check_own_fork). Trips the unknown-fork
+    // gate on quorum + stall, clears it on a 2-block v16 extension, and says so
+    // loudly either way. Returns the event.
+    UnknownForkWatch::Event check_unknown_fork(std::uint64_t now_ms) {
+        UnknownForkWatch::Event ev = UnknownForkWatch::Event::None;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            const std::uint64_t tip_h = rows_.empty() ? 0 : rows_.tip_height();
+            ev = uf_watch_.poll(now_ms, tip_h);
+            view_.state().set_unknown_fork_tripped(uf_watch_.tripped());
+            if (ev == UnknownForkWatch::Event::Tripped) {
+                std::fprintf(stderr,
+                    "[HF-FUSE] UNKNOWN FORK TRIPPED: %zu distinct peers sent blocks of major_version "
+                    "up to %u (above the %u this build implements) and the v16 tip %llu has not "
+                    "extended for %llu s. Templates and tx admission WITHDRAWN; no peer penalised. "
+                    "Roll the code forward (clears if v16 extends the tip by %llu).\n",
+                    uf_watch_.distinct_peers(), static_cast<unsigned>(uf_watch_.highest_version()),
+                    static_cast<unsigned>(MAX_IMPLEMENTED_HF_VERSION),
+                    static_cast<unsigned long long>(tip_h),
+                    static_cast<unsigned long long>(uf_watch_.stalled_ms() / 1000),
+                    static_cast<unsigned long long>(UNKNOWN_FORK_CLEAR_BLOCKS));
+                std::fflush(stderr);
+            } else if (ev == UnknownForkWatch::Event::Cleared) {
+                uf_ids_.clear();
+                uf_ids_order_.clear();
+                std::fprintf(stderr,
+                    "[HF-FUSE] UNKNOWN FORK CLEARED: the v16 chain extended the tip to %llu (trip at "
+                    "%llu). Templates and tx admission RESUMED.\n",
+                    static_cast<unsigned long long>(tip_h),
+                    static_cast<unsigned long long>(uf_watch_.trip_tip()));
+                std::fflush(stderr);
+            }
+        }
+        flush_events_();
+        return ev;
+    }
 
     // c2pool#1551: the same-height candidates this node HOLDS but has not
     // adopted. The settlement accounting above needs them to see a race at all
@@ -785,10 +844,12 @@ public:
         for (std::size_t k = 0; k < wanted_.size(); ++k) {
             if (wanted_heights_[k] > limit) break;
             if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
+            if (uf_id_held_locked_(wanted_[k])) continue;
             if (!have_body_locked_(wanted_[k])) out.push_back(wanted_[k]);
         }
         for (const Hash& id : refetch_)
-            if (!have_body_locked_(id) && !contains_hash_(out, id)) out.push_back(id);
+            if (!have_body_locked_(id) && !contains_hash_(out, id) && !uf_id_held_locked_(id))
+                out.push_back(id);
         return out;
     }
 
@@ -887,7 +948,8 @@ private:
         EvaluatedBlock ev;
         std::string    why;
         r.eval = evaluate_block(entry, ev, why);
-        if (r.eval == EvalStatus::UnknownFork) return unknown_fork_locked_(peer, ev, std::move(why));
+        if (r.eval == EvalStatus::UnknownFork)
+            return unknown_fork_locked_(peer, entry, ev, std::move(why));
         if (r.eval != EvalStatus::Ok) {
             r.outcome    = OfferOutcome::Rejected;
             r.peer_fault = true;
@@ -2233,7 +2295,7 @@ private:
     }
 
     // =====================================================================================
-    // a block from a fork above the implemented range (unknown-fork fuse)
+    // a block from a fork above the implemented range (unknown-fork watch)
     // =====================================================================================
     // evaluate_block() read the header first and stopped: the major_version is
     // above MAX_IMPLEMENTED_HF_VERSION, so the body, the id and the PoW all
@@ -2241,14 +2303,21 @@ private:
     // parked, and NEVER charged to the sender: an honest peer that upgraded is
     // exactly who sends it.
     //
-    // When it attaches to a block we hold (best chain or alt pool), it is
-    // evidence that the chain we follow is forking away from our rules: the
-    // fuse trips (the same latch connect() uses for a rolled version), which
-    // withdraws the template and tx-admission capabilities, and the node says
-    // so on stderr. A block whose parent we do not hold is only counted: it
-    // places nothing.
-    OfferResult unknown_fork_locked_(const PeerRef* peer, const EvaluatedBlock& ev,
-                                     std::string why) {
+    // FORK-FUSE-2. Its PoW cannot be checked, so one such block proves nothing:
+    // anyone can bump the version of a header on our tip. It is a SUSPECT
+    // alarm only (counted; loud once per distinct peer group per window;
+    // templates continue). When it attaches to a block we hold, or claims a
+    // height above our tip, it is EVIDENCE for the UnknownForkWatch, which
+    // trips only on >= 2 distinct peer groups AND a stalled v16 tip
+    // (check_unknown_fork). A block that neither attaches nor claims to be
+    // ahead is only counted.
+    //
+    // Its id goes into a small bounded set so the want list stops handing it
+    // to the sync driver: the v16-rule id when the blob still parses as v16
+    // (a bumped header on a v16 body), and the chain entry's wanted id at the
+    // same height (a real next-fork block, whose id we cannot recompute).
+    OfferResult unknown_fork_locked_(const PeerRef* peer, const BlockEntry& entry,
+                                     const EvaluatedBlock& ev, std::string why) {
         OfferResult r;
         r.outcome    = OfferOutcome::Rejected;
         r.eval       = EvalStatus::UnknownFork;
@@ -2261,30 +2330,98 @@ private:
         if (const RowRecord* mp = rows_.by_id(prev)) parent_h = mp->row.height;
         else if (const AltBlock* ap = alt_.find(prev); ap && ap->resolved) parent_h = ap->height;
 
+        const std::uint64_t tip_h = rows_.empty() ? 0 : rows_.tip_height();
+        const bool claims_ahead = !parent_h && ev.input.coinbase.height > tip_h;
+        r.height = parent_h ? *parent_h + 1 : ev.input.coinbase.height;
+
+        // The ids to hold back from the want list.
+        {
+            ParsedBlock pb;
+            if (parse_block(entry.block_blob, pb) == BlockParseStatus::Ok) {
+                r.id = block_identity(entry.block_blob.data(), pb).id;
+                uf_remember_id_locked_(r.id);
+            }
+            if (parent_h || claims_ahead)
+                for (std::size_t k = 0; k < wanted_.size(); ++k)
+                    if (wanted_heights_[k] == r.height && !rows_.contains(wanted_[k]))
+                        uf_remember_id_locked_(wanted_[k]);
+        }
+
         const std::string src = peer ? peer->addr : std::string("local");
-        if (!parent_h) {
-            ++unknown_fork_unattached_;
-            r.height = ev.input.coinbase.height;
-            r.why    = why + "; parent unknown, not placed";
+        if (!parent_h) ++unknown_fork_unattached_;
+        if (!parent_h && !claims_ahead) {
+            r.why = why + "; parent unknown, not placed";
             return r;
         }
-        r.height = *parent_h + 1;
         const std::uint8_t v = static_cast<std::uint8_t>(major);
-        const std::uint8_t before = view_.state().fuse().highest_version();
-        const bool first = view_.state().trip_unknown_fork(r.height, v);
-        if (first || v > before) {
+        if (uf_watch_.note_block(uf_peer_group_(peer), v)) {
             std::fprintf(stderr,
-                "[HF-FUSE] UNKNOWN FORK: block major_version %u at height %llu (prev %s) from %s "
-                "is above the highest fork this build implements (%u). The peer is NOT "
-                "penalised. Fuse TRIPPED: templates and tx admission withdrawn on this chain; "
-                "roll the code forward.\n",
+                "[HF-FUSE] SUSPECT: block major_version %u at height %llu (prev %s, %s) from %s "
+                "is above the highest fork this build implements (%u); its PoW cannot be checked. "
+                "NOT stored, NOT penalised, templates CONTINUE. Evidence this window: %zu/%zu "
+                "distinct peers, tip stalled %llu/%llu s.\n",
                 static_cast<unsigned>(v), static_cast<unsigned long long>(r.height),
-                hex_prefix_(prev).c_str(), src.c_str(),
-                static_cast<unsigned>(MAX_IMPLEMENTED_HF_VERSION));
+                hex_prefix_(prev).c_str(), parent_h ? "attached" : "claims ahead", src.c_str(),
+                static_cast<unsigned>(MAX_IMPLEMENTED_HF_VERSION), uf_watch_.distinct_peers(),
+                UNKNOWN_FORK_QUORUM_PEERS,
+                static_cast<unsigned long long>(uf_watch_.stalled_ms() / 1000),
+                static_cast<unsigned long long>(uf_watch_.stall_ms() / 1000));
             std::fflush(stderr);
         }
-        r.why = why + "; unknown-fork fuse tripped";
+        r.why = why + (uf_watch_.tripped() ? "; unknown-fork trip standing"
+                                           : "; unknown-fork suspect (not tripped)");
         return r;
+    }
+
+    // The distinctness key for the quorum: the /16 of an IPv4 peer on
+    // mainnet (one operator rarely spans two /16s); the address elsewhere, so a
+    // loopback regtest rig can field two distinct peers.
+    std::string uf_peer_group_(const PeerRef* peer) const {
+        if (!peer) return "local";
+        const std::string key = peer_key_(*peer);
+        if (opts_.net != XmrNet::Mainnet) return key;
+        const std::size_t colon = key.rfind(':');
+        const std::string host = (colon == std::string::npos || key.find(':') != colon)
+                                     ? key : key.substr(0, colon);
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        char tail = 0;
+        if (std::sscanf(host.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4
+            && a < 256 && b < 256 && c < 256 && d < 256)
+            return "/16:" + std::to_string(a) + "." + std::to_string(b);
+        return host;
+    }
+
+    // The bounded above-version id set: at most UF_ID_CAP ids, oldest out
+    // first; an id is held back from the want list for UF_ID_TTL_MS of poll
+    // time, then may be asked once more (a peer that answered an honest id
+    // with a bumped header delays that id by at most the TTL, never forever).
+    static constexpr std::size_t   UF_ID_CAP    = 256;
+    static constexpr std::uint64_t UF_ID_TTL_MS = 10ull * 60ull * 1000ull;
+
+    void uf_remember_id_locked_(const Hash& id) {
+        const std::string k = key_of_(id);
+        const auto it = uf_ids_.find(k);
+        if (it != uf_ids_.end()) return;          // keep the first sighting's clock
+        uf_ids_.emplace(k, uf_watch_.last_poll_ms());
+        uf_ids_order_.push_back(k);
+        while (uf_ids_order_.size() > UF_ID_CAP) {
+            uf_ids_.erase(uf_ids_order_.front());
+            uf_ids_order_.pop_front();
+        }
+    }
+
+    bool uf_id_held_locked_(const Hash& id) const {
+        if (uf_ids_.empty()) return false;
+        const auto it = uf_ids_.find(key_of_(id));
+        if (it == uf_ids_.end()) return false;
+        const std::uint64_t now = uf_watch_.last_poll_ms();
+        if (now >= it->second && now - it->second >= UF_ID_TTL_MS) return false;
+        ++uf_refetch_held_;
+        return true;
+    }
+
+    static std::string key_of_(const Hash& h) {
+        return std::string(reinterpret_cast<const char*>(h.data()), h.size());
     }
 
     static std::string hex_prefix_(const Hash& h) {
@@ -2797,6 +2934,10 @@ private:
     std::uint64_t chain_refusals_         = 0;
     std::uint64_t unknown_fork_blocks_     = 0;   // above-version blocks refused, never charged
     std::uint64_t unknown_fork_unattached_ = 0;   // ... of which the parent was unknown
+    UnknownForkWatch uf_watch_{};                          // FORK-FUSE-2: suspect / trip / clear
+    std::map<std::string, std::uint64_t> uf_ids_;          // above-version id -> first-seen poll ms
+    std::deque<std::string>              uf_ids_order_;    // FIFO for the UF_ID_CAP bound
+    mutable std::uint64_t                uf_refetch_held_ = 0;   // want-list ids held back
     bool          synced_             = false;
     bool          forced_synced_      = false;
     bool          synced_forced_ever_ = false;

@@ -68,10 +68,11 @@
 // and rolling the rules forward cannot follow it. So a block whose header
 // major_version is above MAX_IMPLEMENTED_HF_VERSION is read HEADER FIRST
 // (peek_block_header) and never body-parsed (EvalStatus::UnknownFork): the
-// index refuses it WITHOUT charging the peer, and when it attaches to a block
-// we hold it trips this same fuse through ConsensusState::trip_unknown_fork
-// (template and tx admission withdrawn, one loud "[HF-FUSE] UNKNOWN FORK" line
-// on stderr). The relay txpool likewise refuses a transaction whose format is
+// index refuses it WITHOUT charging the peer. It does NOT latch this fuse: such
+// a block's PoW cannot be checked, so one of them is only a SUSPECT alarm. The
+// UnknownForkWatch below trips (and clears) on evidence that the network moved
+// on: above-version blocks from >= 2 distinct peers AND a stalled v16 tip. The
+// relay txpool likewise refuses a transaction whose format is
 // above the implemented one (tx version > 2, rct type > 6) as NotUnderstood,
 // never as a drop offence. Blocks and transactions at or below the implemented
 // version are judged exactly as before. The rolled path in
@@ -88,6 +89,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "xmr_hf_table.hpp"
 
@@ -199,6 +201,146 @@ private:
     std::uint8_t  first_version_   = 0;
     std::uint8_t  highest_version_ = 0;
     std::uint64_t seen_            = 0;
+};
+
+// --- the unknown-fork watch (FORK-FUSE-2) --------------------------------------
+// A block above MAX_IMPLEMENTED_HF_VERSION cannot be PoW-checked here (the
+// vendored RandomX has no v2) and its id cannot be recomputed, so ONE such
+// block is an unauthenticated claim: anyone can bump the major version of a
+// header on our tip. Latching the fuse on it (FORK-FUSE, #1783) handed every
+// single peer a free "stop templates until restart" button. So:
+//
+//   SUSPECT. Every above-version block is counted and raises a loud alarm the
+//     first time each distinct peer group sends one in the current window. It
+//     is not stored, the peer is not penalised, and templates continue.
+//   TRIPPED. Only on evidence that the network really moved on: above-version
+//     blocks from >= quorum (2) distinct peer groups since the tip last
+//     extended AND no extension of the tip for stall_ms. Then templates and tx
+//     admission are withdrawn (the same capabilities the rolled-fork latch
+//     withdraws) and one loud line says so.
+//   CLEARED. When the v16 chain extends the tip again by >= clear_blocks (2)
+//     past the height it held at the trip, the trip clears, loudly, and the
+//     window starts over.
+//
+// THE PERIOD. Monero targets 120 s. Block arrivals are close to Poisson, so the
+// chance that an honest v16 chain produces no block for T is exp(-T/120 s):
+// 20 min = 4.5e-5 per block (about one natural gap a month at 720 blocks/day),
+// 30 min = 3.1e-7 per block (about one in 12 years). The default is 30 min.
+// Even a natural gap trips only when two distinct peer groups ALSO sent
+// above-version blocks in it, and a false trip clears itself two v16 blocks
+// later; a real fork trips 30 min after the last v16 block plus one poll.
+//
+// Time is whatever monotone millisecond clock the caller polls with, so a KAT
+// can drive it. The watch is pure state; the caller prints and gates.
+inline constexpr std::uint64_t UNKNOWN_FORK_STALL_MS_DEFAULT = 30ull * 60ull * 1000ull;
+inline constexpr std::size_t   UNKNOWN_FORK_QUORUM_PEERS     = 2;
+inline constexpr std::uint64_t UNKNOWN_FORK_CLEAR_BLOCKS     = 2;
+inline constexpr std::size_t   UNKNOWN_FORK_MAX_PEER_GROUPS  = 64;
+
+enum class UnknownForkState : std::uint8_t { Normal = 0, Suspect, Tripped };
+
+inline const char* to_string(UnknownForkState s) noexcept {
+    switch (s) {
+        case UnknownForkState::Normal:  return "normal";
+        case UnknownForkState::Suspect: return "suspect";
+        case UnknownForkState::Tripped: return "tripped";
+    }
+    return "?";
+}
+
+class UnknownForkWatch {
+public:
+    enum class Event : std::uint8_t { None = 0, Tripped, Cleared };
+
+    explicit UnknownForkWatch(std::uint64_t stall_ms = UNKNOWN_FORK_STALL_MS_DEFAULT) noexcept
+        : stall_ms_(stall_ms ? stall_ms : UNKNOWN_FORK_STALL_MS_DEFAULT) {}
+
+    // One above-version block from `peer_group` (the distinctness key the
+    // caller chose: the /16 on mainnet, the address elsewhere). Returns true
+    // when the group is NEW in this window, i.e. when the caller should raise
+    // the loud SUSPECT alarm (bounded: once per group per window).
+    bool note_block(const std::string& peer_group, std::uint8_t version) {
+        ++blocks_;
+        if (version > highest_version_) highest_version_ = version;
+        if (state_ == UnknownForkState::Normal) state_ = UnknownForkState::Suspect;
+        for (const std::string& g : groups_) if (g == peer_group) return false;
+        if (groups_.size() >= UNKNOWN_FORK_MAX_PEER_GROUPS) return false;
+        groups_.push_back(peer_group);
+        ++suspect_alarms_;
+        return true;
+    }
+
+    // The periodic poll with the current best-chain tip height.
+    Event poll(std::uint64_t now_ms, std::uint64_t tip_height) {
+        last_poll_ms_ = now_ms;
+        if (!primed_) {
+            primed_         = true;
+            last_tip_       = tip_height;
+            last_extend_ms_ = now_ms;
+            return Event::None;
+        }
+        if (tip_height > last_tip_) {
+            last_tip_       = tip_height;
+            last_extend_ms_ = now_ms;
+            if (state_ == UnknownForkState::Tripped) {
+                if (tip_height >= trip_tip_ + UNKNOWN_FORK_CLEAR_BLOCKS) {
+                    state_ = UnknownForkState::Normal;
+                    groups_.clear();
+                    ++clears_;
+                    return Event::Cleared;
+                }
+                return Event::None;
+            }
+            // The v16 chain moved: the evidence of this window is stale.
+            state_ = UnknownForkState::Normal;
+            groups_.clear();
+            return Event::None;
+        }
+        if (tip_height < last_tip_) last_tip_ = tip_height;   // a shorter reorg: no credit
+        if (state_ != UnknownForkState::Tripped && groups_.size() >= UNKNOWN_FORK_QUORUM_PEERS
+            && now_ms - last_extend_ms_ >= stall_ms_) {
+            state_    = UnknownForkState::Tripped;
+            trip_tip_ = last_tip_;
+            ++trips_;
+            return Event::Tripped;
+        }
+        return Event::None;
+    }
+
+    UnknownForkState state()        const noexcept { return state_; }
+    bool          tripped()         const noexcept { return state_ == UnknownForkState::Tripped; }
+    std::uint64_t blocks()          const noexcept { return blocks_; }
+    std::uint64_t suspect_alarms()  const noexcept { return suspect_alarms_; }
+    std::size_t   distinct_peers()  const noexcept { return groups_.size(); }
+    std::uint64_t trips()           const noexcept { return trips_; }
+    std::uint64_t clears()          const noexcept { return clears_; }
+    std::uint8_t  highest_version() const noexcept { return highest_version_; }
+    std::uint64_t stall_ms()        const noexcept { return stall_ms_; }
+    std::uint64_t trip_tip()        const noexcept { return trip_tip_; }
+    std::uint64_t last_poll_ms()    const noexcept { return last_poll_ms_; }
+    std::uint64_t stalled_ms()      const noexcept {
+        return primed_ && last_poll_ms_ >= last_extend_ms_ ? last_poll_ms_ - last_extend_ms_ : 0;
+    }
+
+    // The same gate HfFuse::allows() is: Follow and Serve survive a trip.
+    bool allows(HfCapability c) const noexcept {
+        return !tripped() || hf_capability_survives_roll(c);
+    }
+
+private:
+    std::uint64_t            stall_ms_;
+    UnknownForkState         state_           = UnknownForkState::Normal;
+    std::vector<std::string> groups_;          // distinct peer groups this window
+    std::uint64_t            blocks_          = 0;
+    std::uint64_t            suspect_alarms_  = 0;
+    std::uint64_t            trips_           = 0;
+    std::uint64_t            clears_          = 0;
+    std::uint8_t             highest_version_ = 0;
+    bool                     primed_          = false;
+    std::uint64_t            last_tip_        = 0;
+    std::uint64_t            last_extend_ms_  = 0;
+    std::uint64_t            last_poll_ms_    = 0;
+    std::uint64_t            trip_tip_        = 0;
 };
 
 // --- the policy ----------------------------------------------------------------
