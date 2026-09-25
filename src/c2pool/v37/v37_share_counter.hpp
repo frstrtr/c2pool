@@ -100,11 +100,15 @@ public:
     //       the correct EXPLICIT statement there, not a guess;
     //   (b) every interval this BOOK counted for an ENROLLED payee that the
     //       harvester has NO row for (shares but no raindrops): the row is
-    //       synthesised so the enrolled payee's interval is composed anyway
-    //       (J < K => Hhat == 0 => the whole share work comes back out). Without
-    //       (b) an enrolled payee could dodge a bad interval simply by not
-    //       relaying its raindrops, which is the per-interval choice the ex-ante
-    //       ruling exists to remove.
+    //       synthesised so the enrolled payee's interval is still DECLARED and
+    //       the release stays fail-closed. ★ DROPS-JK (ruled 09-25): such a row
+    //       has J = 0 < K, is NOT ESTIMABLE, and composes to a zero delta — the
+    //       payee keeps its ordinary share credit for that interval. (Before
+    //       the ruling it composed as Hhat == 0 and the whole share work came
+    //       back out; that removed real share credit on no evidence.) The
+    //       consequence is stated rather than hidden: withholding raindrops now
+    //       reduces an enrolled payee's interval to its ordinary S*T path, it
+    //       can no longer be used to remove that payee's share credit.
     // Intervals the book does not COVER are left undeclared on purpose: the
     // harvester withholds them, which is the fail-closed error.
     std::size_t declare_into(DropHarvester& h, u64 bury_before,

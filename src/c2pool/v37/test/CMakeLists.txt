@@ -1266,6 +1266,24 @@ if (BUILD_TESTING)
     target_link_libraries(v37_drops_step2_wiring_kat Threads::Threads)
     add_test(NAME v37_drops_step2_wiring_kat COMMAND v37_drops_step2_wiring_kat)
 
+    # ★ DROPS-JK (operator ruling 09-25) — v37_drops_jk_keep_share_credit_kat.
+    # An interval with J < K near-misses is NOT ESTIMABLE: it keeps its share
+    # credit and its DROPS delta is 0 (the reference apply_credit() answer),
+    # where the base composed it as Hhat := 0 and REPLACED the payee's real
+    # share credit away (net sub-threshold credit NEGATIVE for every enrolled
+    # payee on the XDW regtest verify). Pins, on the arity-1 (XMR / decoupled)
+    # and every arity-2 lane geometry: no delta for S > 0 / J < K (RED on the
+    # base), the composed credit equal to E_b for every J < K payee, J >= K
+    # composed exactly as from-spec, a J < K-only harvest leaving owed_digest
+    # unmoved, agreement with the reference on which rows compose, gate OFF
+    # unchanged, and 0 negative J < K compositions over a measured stream.
+    # Stdlib-only, <1 s. SAME HOLLOW-GREEN GUARD: ALSO on BOTH build.yml lists.
+    add_executable(v37_drops_jk_keep_share_credit_kat v37_drops_jk_keep_share_credit_kat.cpp)
+    target_compile_features(v37_drops_jk_keep_share_credit_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_drops_jk_keep_share_credit_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_drops_jk_keep_share_credit_kat Threads::Threads)
+    add_test(NAME v37_drops_jk_keep_share_credit_kat COMMAND v37_drops_jk_keep_share_credit_kat)
+
     # ★ DROPS on the XMR lane — v37_xmr_drops_wiring_kat. main_v37_xmr.cpp built
     # no DropsWiring and called none of XmrNode's T3 seams, so a flipped XMR node
     # was gate-ON and DORMANT. Pins the shell's wiring (X-SHELL: RED on the base),
