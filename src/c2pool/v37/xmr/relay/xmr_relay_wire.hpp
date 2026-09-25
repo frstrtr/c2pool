@@ -63,6 +63,7 @@
 
 #include <array>
 #include <cstddef>
+#include <map>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -78,6 +79,7 @@
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"   // ::xmr::coin::keccak256
 #include "../xmr_fee_model.hpp"                    // S4: the fee-model gate folded into lane_params_digest
 #include <c2pool/v37/roundabout/rb_lane_tag.hpp>   // POOL-ID: LaneTagContext / lane_tag (S1, read-only use)
+#include <c2pool/v37/v37_node_lane_activation.hpp> // ENROL-REPL: kActivateConsensusV1 (the FB_BLOCK_WON v0x02 gate)
 
 // Feature marker: this relay carries the POOL-ID lane_tag in HELLO.
 #define C2POOL_XMR_RELAY_POOL_ID 1
@@ -121,6 +123,16 @@ inline constexpr std::size_t kHelloBytes            = 1 + 1 + 4 + 1 + 4 + 32 + 8
 inline constexpr std::size_t kHelloPoolIdBytes      = 32 + 4 + 4;                    // lane_tag | version | authority
 inline constexpr std::size_t kHelloBytesPoolId      = kHelloBytes + kHelloPoolIdBytes;  // 142
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
+// ENROL-REPL: FB_BLOCK_WON v0x02 (flip-only) = the 127-byte v0x01 body + the
+// winner's composed DROPS delta: u16 n | n x (payee 32 | i64 delta) | enrollment_digest 32.
+inline constexpr u8          kFbBlockWonDropsVersion = 0x02;
+inline constexpr std::size_t kBlockWonDropsMaxRows   = 256;
+inline constexpr std::size_t kBlockWonDropsMinBytes  = kBlockWonBytes + 2 + 32;                        // 161 (empty delta)
+inline constexpr std::size_t kBlockWonDropsRowBytes  = 32 + 8;
+// v0x02 exists only to carry a DROPS delta, and a DROPS delta exists only under
+// the consensus flip: at flip 0 the live decoder accepts exactly v0x01 (127 B),
+// as master does, and nothing emits v0x02 (the w3 v0x03 rule, w3_relay.hpp).
+inline constexpr bool        kBlockWonDropsLive      = ::c2pool::v37n::kActivateConsensusV1;
 inline constexpr std::size_t kCtxMaxIds             = 8;                 // ids per FB_GETCTX
 inline constexpr std::size_t kCtxMaxBlob            = 512 * 1024;        // one Monero block blob (header | miner_tx | tx hashes)
 inline constexpr std::size_t kCtxHeader             = 1 + 1 + 4 + 32 + 4; // op ver chain id len
@@ -448,22 +460,49 @@ struct BlockWon {
     u64     reward = 0;
     bool    payout_emitted = false;
     bytes32 owed_digest_at_win{};
+    // ★ ENROL-REPL (DROPS, flip-only): the winner's COMPOSED sub-threshold delta
+    // and the digest of the enrolment book it composed under -- the XMR twin of
+    // the v0x03 carrier credit map (w3_relay.hpp CutDescriptor::drops). Every
+    // node books THIS map for the block instead of composing from its own
+    // (node-local) enrolment book. nullopt = a v0x01 frame (master's 127 bytes).
+    struct Drops {
+        std::map<bytes32, long long> delta;   // payee -> signed delta, no zero rows, <= kBlockWonDropsMaxRows
+        bytes32 enrollment_digest{};          // winner's EnrollmentBook::book_digest() at the composition
+        bool operator==(const Drops&) const = default;
+    };
+    std::optional<Drops> drops;
     bool operator==(const BlockWon&) const = default;
 };
 
+// A frame carrying `drops` is v0x02; the caller only sets it under the flip
+// (and never with more than kBlockWonDropsMaxRows rows: {} is returned then).
 inline std::vector<u8> encode_block_won(const BlockWon& b) {
-    std::vector<u8> f; f.reserve(kBlockWonBytes);
-    f.push_back(FB_BLOCK_WON); f.push_back(kFbVersion); le::put32(f, b.chain_id);
+    if (b.drops && b.drops->delta.size() > kBlockWonDropsMaxRows) return {};
+    std::vector<u8> f;
+    f.reserve(b.drops ? kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * b.drops->delta.size() : kBlockWonBytes);
+    f.push_back(FB_BLOCK_WON); f.push_back(b.drops ? kFbBlockWonDropsVersion : kFbVersion); le::put32(f, b.chain_id);
     le::putb(f, b.bid); le::put64(f, b.h_b); le::put64(f, b.cut_next_pos); le::putb(f, b.cut_spine_digest);
     le::put64(f, b.reward); f.push_back(b.payout_emitted ? 1 : 0); le::putb(f, b.owed_digest_at_win);
+    if (b.drops) {
+        le::put16(f, static_cast<u16>(b.drops->delta.size()));
+        for (const auto& [k, v] : b.drops->delta) { le::putb(f, k); le::put64(f, static_cast<u64>(v)); }
+        le::putb(f, b.drops->enrollment_digest);
+    }
     return f;
 }
 
-inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string* why = nullptr) {
+// `accept_drops` = accept the v0x02 (DROPS-carrying) form. Default: only under
+// the flip, so a flip-0 decoder is master's (127 bytes, v0x01, else malformed).
+// The v0x02 trailer is CANONICAL or refused: exact length, rows strictly
+// ascending by payee (no duplicate), no zero delta, at most kBlockWonDropsMaxRows.
+inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string* why = nullptr,
+                             bool accept_drops = kBlockWonDropsLive) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kBlockWonBytes) return bad("block_won: wrong length");
+    const bool v2 = accept_drops && f.size() >= 2 && f[1] == kFbBlockWonDropsVersion;
+    if (!v2 && f.size() != kBlockWonBytes) return bad("block_won: wrong length");
+    if (v2 && f.size() < kBlockWonDropsMinBytes) return bad("block_won: v0x02 short");
     if (f[0] != FB_BLOCK_WON) return bad("block_won: wrong opcode");
-    if (f[1] != kFbVersion) return bad("block_won: unknown version");
+    if (!v2 && f[1] != kFbVersion) return bad("block_won: unknown version");
     const u8* p = f.data() + 2;
     b.chain_id = le::get32(p); p += 4;
     b.bid = le::getb(p); p += 32;
@@ -473,7 +512,22 @@ inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string*
     b.reward = le::get64(p); p += 8;
     if (p[0] > 1) return bad("block_won: payout_emitted not 0/1");
     b.payout_emitted = p[0] != 0; p += 1;
-    b.owed_digest_at_win = le::getb(p);
+    b.owed_digest_at_win = le::getb(p); p += 32;
+    b.drops.reset();
+    if (!v2) return true;
+    const std::size_t n = le::get16(p); p += 2;
+    if (n > kBlockWonDropsMaxRows) return bad("block_won: v0x02 rows over the bound");
+    if (f.size() != kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * n) return bad("block_won: v0x02 wrong length");
+    BlockWon::Drops d;
+    for (std::size_t i = 0; i < n; ++i) {
+        const bytes32 k = le::getb(p); p += 32;
+        const long long v = static_cast<long long>(le::get64(p)); p += 8;
+        if (v == 0) return bad("block_won: v0x02 zero delta row");
+        if (!d.delta.empty() && !(d.delta.rbegin()->first < k)) return bad("block_won: v0x02 rows not strictly ascending");
+        d.delta.emplace_hint(d.delta.end(), k, v);
+    }
+    d.enrollment_digest = le::getb(p);
+    b.drops = std::move(d);
     return true;
 }
 

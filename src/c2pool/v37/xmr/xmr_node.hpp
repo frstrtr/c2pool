@@ -467,7 +467,22 @@ public:
         // default XMR node settles exactly as master does, and the seams below
         // are what an XMR shell calls once it has a DropsWiring to hand them.
         fb.params = m_cfg.lane_params;
-        {
+        // ★ ENROL-REPL: the WINNER's composed delta, carried with the win and
+        // verified by the shell's booking callback (xmr_drops_wiring.hpp (5)).
+        // Booked AS-IS instead of composing from THIS node's enrolment book,
+        // which is node-local (enrolled at this node's own tip). The local
+        // buried harvest is still consumed at the same frontier and discarded,
+        // so it can never be folded into a later block. Unset seam (flip 0, no
+        // DropsWiring) or nothing carried => the local composition below.
+        std::optional<Amounts> carried;
+        if (m_drops_carried) carried = m_drops_carried();
+        if (carried) {
+            if (m_drops_price) fb.drops.price = m_drops_price(); // one-shot, consumed either way (diagnostic only here)
+            fb.has_carried_drops = true;
+            fb.carried_drops = std::move(*carried);
+            (void)buried_harvest(monero_height);                 // advance + discard the local rows
+            ++m_drops_booked_carried;
+        } else {
             ::c2pool::v37n::settle::DropsCompose dctx;
             // ★ DROPS-R1: how work becomes coin AT THIS CUT. The XMR arm has no
             // in-node fold to read a price off (credit arrives ready-made from
@@ -478,6 +493,7 @@ public:
             dctx.enrollment = m_enroll;     // ★ R-SYBIL: null => nobody enrolled
             fb.drops = dctx;
             fb.harvested = buried_harvest(monero_height);
+            if (m_drops) ++m_drops_booked_local;
         }
         m_finalize->on_block_found(fb);
         log("win: FOUND block " + fb.bid.substr(0, 12) + "… at height " +
@@ -513,6 +529,20 @@ public:
     using DropsPriceFn = std::function<::c2pool::v37n::settle::WorkPrice()>;
     void set_drops_price_fn(DropsPriceFn f) { m_drops_price = std::move(f); }
 
+    // ★ ENROL-REPL: the carried delta for the win being booked (one-shot; see
+    // on_network_block_won). Wired by XmrDropsWiring::attach.
+    using DropsCarriedFn = std::function<std::optional<Amounts>()>;
+    void set_drops_carried_fn(DropsCarriedFn f) { m_drops_carried = std::move(f); }
+    std::uint64_t drops_booked_carried() const { return m_drops_booked_carried; }
+    std::uint64_t drops_booked_local() const { return m_drops_booked_local; }
+
+    // ★ ENROL-REPL: the WINNER's buried harvest, taken ONCE when it books its
+    // own win (the frontier won_height - D_conf, share-count declaration first),
+    // i.e. exactly the rows a local composition at that booking would consume.
+    std::vector<::c2pool::v37n::settle::HarvestedReceipt> take_buried_harvest(std::uint64_t won_height) {
+        return buried_harvest(won_height);
+    }
+
     // How many harvest rows the last FOUND folded (diagnostic; 0 when detached).
     std::size_t last_harvest_rows() const { return m_last_harvest_rows; }
 
@@ -522,7 +552,8 @@ public:
     // be >= that payee's effective_from). Only reachable with a harvester
     // attached, i.e. only under the flip.
     void log_drops_found(const FoundBlock& fb, std::uint64_t monero_height) {
-        const auto delta = ::c2pool::v37n::settle::subthreshold_credit(fb.params, fb.harvested, fb.drops);
+        const auto delta = fb.has_carried_drops ? fb.carried_drops
+                                                : ::c2pool::v37n::settle::subthreshold_credit(fb.params, fb.harvested, fb.drops);
         long long sum = 0;
         std::string rows;
         auto hex_of_key = [](const ::v37::bytes32& b) {
@@ -543,7 +574,11 @@ public:
         log("drops: FOUND h=" + std::to_string(monero_height) + " bid=" + fb.bid.substr(0, 12) +
             " harvest_rows=" + std::to_string(fb.harvested.size()) +
             " price=" + (fb.drops.price.valid ? "valid" : "INVALID") +
-            " delta_payees=" + std::to_string(delta.size()) + " delta_sum=" + std::to_string(sum) + rows);
+            " delta_payees=" + std::to_string(delta.size()) + " delta_sum=" + std::to_string(sum) + rows +
+            (m_drops_carried ? " src=" + std::string(fb.has_carried_drops ? "carried" : "local") +
+                               " booked_carried=" + std::to_string(m_drops_booked_carried) +
+                               " booked_local=" + std::to_string(m_drops_booked_local)
+                             : std::string()));
     }
 
     // ── accessors (for the smoke / a dashboard) ────────────────────────────
@@ -780,6 +815,8 @@ private:
     const ::c2pool::v37n::EnrollmentBook*  m_enroll = nullptr;
     PreHarvestFn                           m_pre_harvest{};
     DropsPriceFn                           m_drops_price{};
+    DropsCarriedFn                         m_drops_carried{};          // ENROL-REPL (unset at flip 0)
+    std::uint64_t                          m_drops_booked_carried = 0, m_drops_booked_local = 0;
     std::size_t                            m_last_harvest_rows = 0;
 
     XmrNodeConfig                          m_cfg;
