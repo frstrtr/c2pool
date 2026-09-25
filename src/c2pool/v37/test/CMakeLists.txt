@@ -1306,4 +1306,32 @@ if (BUILD_TESTING)
     # GUARD: v37_payout_carriage_kat is ALSO on BOTH build.yml --target lists.
     add_subdirectory(${CMAKE_SOURCE_DIR}/src/c2pool/v37/payout/carriage/test
                      ${CMAKE_CURRENT_BINARY_DIR}/payout_carriage)
+
+    # Build hygiene -- v37_xmr_boost_origin_kat
+    #   The top level force-includes core/boost_asio_compat.hpp (-> <boost/
+    #   version.hpp>) into EVERY C++ TU, including targets that link no Boost
+    #   (vendored randomx, xmr_node's monero_rpc.cpp, the POSIX-only KATs). This
+    #   KAT's main TU links NO Boost on purpose and must still see exactly the
+    #   Boost that the Boost::headers TUs (the OBJECT probe) and find_package
+    #   see: no host/system Boost mixed in, no "boost/version.hpp: No such file"
+    #   on a host without system Boost. SAME HOLLOW-GREEN GUARD: listed in BOTH
+    #   build.yml --target lists.
+    add_library(v37_xmr_boost_origin_probe OBJECT v37_xmr_boost_origin_probe.cpp)
+    target_compile_features(v37_xmr_boost_origin_probe PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_boost_origin_probe PRIVATE Boost::headers)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_boost_origin_probe PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (DEFINED Boost_VERSION_STRING AND NOT Boost_VERSION_STRING STREQUAL "")
+        set(_v37_boost_origin_expect "${Boost_VERSION_STRING}")
+    else()
+        set(_v37_boost_origin_expect "${Boost_VERSION}")
+    endif()
+    add_executable(v37_xmr_boost_origin_kat v37_xmr_boost_origin_kat.cpp
+                   $<TARGET_OBJECTS:v37_xmr_boost_origin_probe>)
+    target_compile_features(v37_xmr_boost_origin_kat PRIVATE cxx_std_20)
+    target_compile_definitions(v37_xmr_boost_origin_kat PRIVATE
+        C2POOL_EXPECT_BOOST_VERSION_STRING="${_v37_boost_origin_expect}")
+    add_test(NAME v37_xmr_boost_origin_kat COMMAND v37_xmr_boost_origin_kat)
 endif()
