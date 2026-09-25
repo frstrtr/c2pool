@@ -377,6 +377,18 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME v37_xmr_coldboot_evq_kat COMMAND v37_xmr_coldboot_evq_kat)
     set_tests_properties(v37_xmr_coldboot_evq_kat PROPERTIES TIMEOUT 900)
+
+    # v37_xmr_race_rebook_kat (RACE-DIVERGE): a depth-1 same-height flip-flop
+    # X -> Y -> X that completes inside ONE tick re-books X (the stale m_pending
+    # entry left by the Orphan event must not dedup the D2-0 re-delivery), so the
+    # node ends byte-identical (owed_digest) to one that followed X directly.
+    # Same monerod-STUB shape. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml
+    # --target lists.
+    add_executable(v37_xmr_race_rebook_kat v37_xmr_race_rebook_kat.cpp)
+    target_compile_features(v37_xmr_race_rebook_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_race_rebook_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_race_rebook_kat PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_race_rebook_kat COMMAND v37_xmr_race_rebook_kat)
     # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
     # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
     # (R4 gate kept, repair continues), never refused on a retry count; two nodes
