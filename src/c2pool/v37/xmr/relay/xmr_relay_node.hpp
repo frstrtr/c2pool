@@ -275,6 +275,7 @@ struct RelayStats {
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
+    std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
     // ★ RAIN-BACKFILL (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
     std::atomic<u64> drops_fetch_tx{0}, drops_ids_asked{0}, drops_fetchreq_rx{0}, drops_served{0}, drops_backfilled{0};
@@ -490,10 +491,10 @@ public:
     }
     std::string describe_drops() const {
         const auto& s = m_st;
-        char b[600];
+        char b[900];
         std::snprintf(b, sizeof b,
             "drops-backfill: store=%zu invreq tx=%llu rx=%llu inv tx=%llu rx=%llu | fetch tx=%llu ids_asked=%llu fetchreq_rx=%llu served=%llu "
-            "backfilled=%llu | sync calls=%llu pending=%llu complete=%llu set_aside=%llu",
+            "backfilled=%llu | sync calls=%llu pending=%llu complete=%llu set_aside=%llu | getwon asked=%llu served=%llu unknown=%llu solicited_rx=%llu won_reoffered=%llu",
             drops_store_size(),
             (unsigned long long)s.drops_invreq_tx.load(), (unsigned long long)s.drops_invreq_rx.load(),
             (unsigned long long)s.drops_inv_tx.load(), (unsigned long long)s.drops_inv_rx.load(),
@@ -501,7 +502,9 @@ public:
             (unsigned long long)s.drops_fetchreq_rx.load(), (unsigned long long)s.drops_served.load(),
             (unsigned long long)s.drops_backfilled.load(), (unsigned long long)s.drops_sync_calls.load(),
             (unsigned long long)s.drops_sync_pending.load(), (unsigned long long)s.drops_sync_complete.load(),
-            (unsigned long long)s.drops_peer_setaside.load());
+            (unsigned long long)s.drops_peer_setaside.load(),
+            (unsigned long long)s.won_asked.load(), (unsigned long long)s.won_served.load(), (unsigned long long)s.won_unknown.load(),
+            (unsigned long long)s.won_solicited_rx.load(), (unsigned long long)s.won_reoffered.load());
         return b;
     }
 
@@ -566,6 +569,29 @@ public:
         std::size_t n = 0;
         for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) ++n;
         m_st.block_won_tx++;
+        return n;
+    }
+    // ★ DROPS-RESTART (gate ON only): a frame this node already holds (its own
+    // journalled composition, or a peer's it booked) re-enters the re-offer ring
+    // and the serve map after a restart; it is not re-flooded here.
+    void adopt_won_frame(const std::vector<u8>& f) {
+        if (m_o.drops_floor_diff == 0) return;
+        BlockWon b; std::string why;
+        if (!decode_block_won(f, b, &why) || !b.drops) return;
+        { std::lock_guard<std::mutex> lk(m_bmtx); m_seen_bids.insert(b.bid); }
+        remember_won_frame(f);
+    }
+    // ★ DROPS-RESTART (gate ON only): ask every ready peer for the carried frame
+    // of `bid`. Any node that holds it answers (the winner need not be up); the
+    // answer is handed to the shell via drain_block_won() even if the bid was
+    // seen before. Returns the number of peers asked (0 at flip 0).
+    std::size_t want_block_won(const bytes32& bid) {
+        if (m_o.drops_floor_diff == 0) return 0;
+        { std::lock_guard<std::mutex> lk(m_bmtx); m_won_wanted.insert(bid); }
+        const auto f = encode_getwon(m_o.chain, bid);
+        std::size_t n = 0;
+        for (PeerId q : ready_peers()) if (m_net.send_to(q, f)) ++n;
+        if (n) m_st.won_asked++;
         return n;
     }
     std::vector<std::pair<BlockWon, PeerId>> drain_block_won() {
@@ -1093,6 +1119,7 @@ private:
         if (op == FB_CTX) { on_ctx(p, f); return; }
         if (m_o.drops_floor_diff && op == FB_GETDROPS) { on_getdrops(p, f); return; }   // ★ RAIN-BACKFILL (gate ON only)
         if (m_o.drops_floor_diff && op == FB_DROPINV) { on_dropinv(p, f); return; }
+        if (m_o.drops_floor_diff && op == FB_GETWON) { on_getwon(p, f); return; }     // ★ DROPS-RESTART (gate ON only)
         m_st.fb_unknown++;                                            // a future 0x45..0x4f: count, keep socket
     }
 
@@ -1217,7 +1244,20 @@ private:
                 if (m_won.size() > 256) m_won.erase(m_won.begin());
             }
         }
-        if (!fresh) return;
+        if (!fresh) {
+            // ★ DROPS-RESTART: a carried frame we ASKED for (FB_GETWON) is handed to
+            // the shell again even though its bid was seen (the first copy was lost
+            // or arrived before the shell could keep it). Never forwarded again.
+            bool solicited = false;
+            if (m_o.drops_floor_diff && b.drops) {
+                std::lock_guard<std::mutex> lk(m_bmtx);
+                solicited = m_won_wanted.erase(b.bid) != 0;
+                if (solicited) { m_won.emplace_back(b, p); if (m_won.size() > 256) m_won.erase(m_won.begin()); }
+            }
+            if (solicited) { m_st.won_solicited_rx++; remember_won_frame(f); }
+            return;
+        }
+        if (m_o.drops_floor_diff && b.drops) { std::lock_guard<std::mutex> lk(m_bmtx); m_won_wanted.erase(b.bid); }
         m_st.block_won_rx++;
         remember_won_frame(f);   // ENROL-REPL (DROPS only)
         for (PeerId q : ready_peers()) if (q != p) m_net.send_to(q, f);   // forward once (dedup by bid)
@@ -1236,6 +1276,29 @@ private:
         std::lock_guard<std::mutex> lk(m_bmtx);
         m_won_raw.push_back(f);
         while (m_won_raw.size() > kWonReofferMax) m_won_raw.pop_front();
+        // ★ DROPS-RESTART: every carried (v0x02) frame this node holds is servable
+        // by bid (FB_GETWON), bounded; the newest frame for a bid wins.
+        if (f.size() >= kBlockWonDropsMinBytes && f[1] == kFbBlockWonDropsVersion) {
+            BlockWon b; std::string why;
+            if (decode_block_won(f, b, &why)) {
+                if (!m_won_by_bid.count(b.bid)) m_won_serve_order.push_back(b.bid);
+                m_won_by_bid[b.bid] = f;
+                while (m_won_serve_order.size() > kWonServeMax) { m_won_by_bid.erase(m_won_serve_order.front()); m_won_serve_order.pop_front(); }
+            }
+        }
+    }
+    void on_getwon(PeerId p, const std::vector<u8>& f) {
+        u32 chain = 0; bytes32 bid{}; std::string why;
+        if (!decode_getwon(f, chain, bid, &why)) { m_st.malformed++; strike(p, why); return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        std::vector<u8> frame;
+        {
+            std::lock_guard<std::mutex> lk(m_bmtx);
+            auto it = m_won_by_bid.find(bid);
+            if (it == m_won_by_bid.end()) { m_st.won_unknown++; return; }
+            frame = it->second;
+        }
+        if (m_net.send_to(p, frame)) m_st.won_served++;
     }
     void reoffer_won_to(PeerId p) {
         if (m_o.drops_floor_diff == 0) return;
@@ -2154,6 +2217,10 @@ private:
     std::map<bytes32, PeerId> m_bid_peer;
     std::vector<std::pair<BlockWon, PeerId>> m_won;
     std::deque<std::vector<u8>> m_won_raw;   // ENROL-REPL: recent FB_BLOCK_WON frames (DROPS only)
+    static constexpr std::size_t kWonServeMax = 1024;
+    std::map<bytes32, std::vector<u8>> m_won_by_bid;   // ★ DROPS-RESTART: carried frames servable by bid (DROPS only)
+    std::deque<bytes32> m_won_serve_order;
+    std::set<bytes32> m_won_wanted;                    // ★ DROPS-RESTART: bids asked for with FB_GETWON
 
     mutable std::mutex m_dmtx;         // pos -> lane digest (the spine probe)
     std::map<u64, bytes32> m_pos_digest;

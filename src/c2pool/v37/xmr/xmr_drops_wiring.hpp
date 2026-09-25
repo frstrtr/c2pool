@@ -89,6 +89,8 @@
 #include <array>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <unistd.h>   // fsync (DROPS-RESTART journal)
 #include <functional>
 #include <map>
 #include <memory>
@@ -345,6 +347,41 @@ public:
         return out;
     }
 
+    // ★ DROPS-RESTART (defect 1): prev_lane(h) from the canonical chain, as a
+    // pure walk. Only a block whose BYTES were read and whose coinbase carries
+    // no 03-21-00 lane tag is a deterministic "not lane"; a block that carries
+    // the tag is a lane block whether or not its root matched this node's ring
+    // yet (the candidate match is node state: a restarted node's ring is short).
+    // A chain row that is not readable, or bytes that are not readable, is
+    // UNDECIDABLE now: nullopt (the booking HOLDs) and NOTHING is memoised.
+    // kNoPrevLane only after walking down to height 1 or past max_walk.
+    enum class LaneProbe { Lane, NotLane, Undecidable };
+    static LaneProbe probe_of(bool bytes_read, bool is_lane, bool has_lane_tag) {
+        if (!bytes_read) return LaneProbe::Undecidable;
+        return (is_lane || has_lane_tag) ? LaneProbe::Lane : LaneProbe::NotLane;
+    }
+    struct WalkStats { std::uint64_t decoded = 0, none = 0, undecided = 0, row_missing = 0; };
+    using RowFn = std::function<std::optional<std::string>(std::uint64_t height)>;
+    using ProbeFn = std::function<LaneProbe(const std::string& bid)>;
+    static std::optional<std::uint64_t> walk_prev_lane(std::uint64_t won_height, std::uint64_t max_walk,
+                                                       const RowFn& row, const ProbeFn& probe,
+                                                       std::map<std::string, bool>& memo, WalkStats* st = nullptr) {
+        for (std::uint64_t x = won_height; x-- > 1 && won_height - x <= max_walk;) {
+            const auto b = row(x);
+            if (!b) { if (st) { ++st->undecided; ++st->row_missing; } return std::nullopt; }   // HOLD, never "none below"
+            auto it = memo.find(*b);
+            if (it == memo.end()) {
+                const LaneProbe p = probe(*b);
+                if (p == LaneProbe::Undecidable) { if (st) ++st->undecided; return std::nullopt; }   // HOLD, not memoised
+                if (st) ++st->decoded;
+                it = memo.emplace(*b, p == LaneProbe::Lane).first;
+            }
+            if (it->second) return x;
+        }
+        if (st) ++st->none;
+        return kNoPrevLane;
+    }
+
     std::uint64_t observed() const { return m_observed; }
     std::uint64_t late() const { return m_late; }
     std::uint64_t withheld() const { return m_withheld; }
@@ -362,6 +399,134 @@ private:
     std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t> m_shares;            // (payee, interval) -> S
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> m_booked;       // diagnostic: h -> the range it composed
     std::uint64_t m_floor = 0, m_top = 0, m_observed = 0, m_late = 0, m_withheld = 0, m_undecided = 0, m_last_lo = 0, m_last_hi = 0;
+};
+
+// ── ★ DROPS-RESTART (defects 2 + 3): the carried-delta journal ─────────────
+// Append-only, fsync'd, one record per line, next to the settlement store:
+//   W <bid> <hex FB_BLOCK_WON v0x01>   our own win, written when the win is
+//                                      registered (before its delta exists)
+//   F <bid> <hex FB_BLOCK_WON v0x02>   a carried frame: our composition,
+//                                      written BEFORE it is sent or booked, or
+//                                      a peer's frame once it booked CARRIED
+//   B <bid> <n> [<payee hex> <delta>]  the delta this node BOOKED for bid,
+//                                      written BEFORE the node books it
+// After a restart the shell re-announces and serves every F frame, composes
+// every W without an F at its booking, and a boot / converge re-drive of a
+// pending FOUND books B (never a fresh local composition). The last record of
+// a kind for a bid wins. Only ever constructed under the flip.
+#define C2POOL_XMR_DROPS_RESTART 1
+class DropsCarryStore {
+public:
+    using Delta = std::map<bytes32, long long>;
+    explicit DropsCarryStore(std::string path) : m_path(std::move(path)) {}
+    struct Loaded { std::size_t own = 0, frames = 0, booked = 0, malformed = 0; };
+    Loaded load() {
+        Loaded l;
+        std::FILE* f = std::fopen(m_path.c_str(), "r");
+        if (!f) return l;
+        std::string line;
+        auto take = [&](const std::string& ln) {
+            std::vector<std::string> t;
+            std::size_t i = 0;
+            while (i < ln.size()) {
+                while (i < ln.size() && ln[i] == ' ') ++i;
+                std::size_t j = i;
+                while (j < ln.size() && ln[j] != ' ') ++j;
+                if (j > i) t.push_back(ln.substr(i, j - i));
+                i = j;
+            }
+            if (t.size() < 3 || t[1].size() != 64) { ++l.malformed; return; }
+            if (t[0] == "W" || t[0] == "F") {
+                std::vector<std::uint8_t> raw;
+                if (!unhex(t[2], raw)) { ++l.malformed; return; }
+                if (t[0] == "W") { m_own[t[1]] = std::move(raw); ++l.own; }
+                else             { m_frames[t[1]] = std::move(raw); ++l.frames; }
+                return;
+            }
+            if (t[0] == "B") {
+                std::size_t n = 0;
+                try { n = static_cast<std::size_t>(std::stoull(t[2])); } catch (...) { ++l.malformed; return; }
+                if (t.size() != 3 + 2 * n) { ++l.malformed; return; }
+                Delta d;
+                for (std::size_t k = 0; k < n; ++k) {
+                    std::vector<std::uint8_t> p;
+                    if (!unhex(t[3 + 2 * k], p) || p.size() != 32) { ++l.malformed; return; }
+                    bytes32 key{}; std::copy(p.begin(), p.end(), key.begin());
+                    try { d[key] = std::stoll(t[4 + 2 * k]); } catch (...) { ++l.malformed; return; }
+                }
+                m_booked[t[1]] = std::move(d);
+                ++l.booked;
+                return;
+            }
+            ++l.malformed;
+        };
+        int c;
+        while ((c = std::fgetc(f)) != EOF) {
+            if (c == '\n') { if (!line.empty()) take(line); line.clear(); }
+            else line.push_back(static_cast<char>(c));
+        }
+        if (!line.empty()) ++l.malformed;   // a torn last line (crash mid-append): ignored
+        std::fclose(f);
+        return l;
+    }
+    bool put_own(const std::string& bid, const std::vector<std::uint8_t>& frame) {
+        m_own[bid] = frame;
+        return append("W " + bid + " " + hex(frame));
+    }
+    bool put_frame(const std::string& bid, const std::vector<std::uint8_t>& frame) {
+        m_frames[bid] = frame;
+        return append("F " + bid + " " + hex(frame));
+    }
+    bool put_booked(const std::string& bid, const Delta& d) {
+        m_booked[bid] = d;
+        std::string s = "B " + bid + " " + std::to_string(d.size());
+        for (const auto& [k, v] : d) s += " " + hex(std::vector<std::uint8_t>(k.begin(), k.end())) + " " + std::to_string(v);
+        return append(s);
+    }
+    std::optional<Delta> booked(const std::string& bid) const {
+        auto it = m_booked.find(bid);
+        if (it == m_booked.end()) return std::nullopt;
+        return it->second;
+    }
+    bool has_frame(const std::string& bid) const { return m_frames.count(bid) != 0; }
+    const std::map<std::string, std::vector<std::uint8_t>>& own() const { return m_own; }
+    const std::map<std::string, std::vector<std::uint8_t>>& frames() const { return m_frames; }
+    std::size_t booked_size() const { return m_booked.size(); }
+    std::uint64_t write_failures() const { return m_write_fail; }
+    const std::string& path() const { return m_path; }
+
+private:
+    static std::string hex(const std::vector<std::uint8_t>& b) {
+        static const char* d = "0123456789abcdef";
+        std::string s; s.reserve(b.size() * 2);
+        for (std::uint8_t x : b) { s.push_back(d[x >> 4]); s.push_back(d[x & 15]); }
+        return s;
+    }
+    static bool unhex(const std::string& s, std::vector<std::uint8_t>& out) {
+        if (s.size() % 2) return false;
+        auto nib = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+        out.clear(); out.reserve(s.size() / 2);
+        for (std::size_t i = 0; i < s.size(); i += 2) {
+            const int a = nib(s[i]), b = nib(s[i + 1]);
+            if (a < 0 || b < 0) return false;
+            out.push_back(static_cast<std::uint8_t>(a * 16 + b));
+        }
+        return true;
+    }
+    bool append(const std::string& line) {
+        if (m_path.empty()) return true;   // in-memory (a KAT)
+        std::FILE* f = std::fopen(m_path.c_str(), "a");
+        if (!f) { ++m_write_fail; return false; }
+        const std::string l = line + "\n";
+        bool ok = std::fwrite(l.data(), 1, l.size(), f) == l.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        ok = (std::fclose(f) == 0) && ok;
+        if (!ok) ++m_write_fail;
+        return ok;
+    }
+    std::string m_path;
+    std::map<std::string, std::vector<std::uint8_t>> m_own, m_frames;
+    std::map<std::string, Delta> m_booked;
+    std::uint64_t m_write_fail = 0;
 };
 
 // ── THE XMR BUNDLE: one per lane, owned by the shell ────────────────────────

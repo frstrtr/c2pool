@@ -104,6 +104,7 @@ inline constexpr u8  FB_GETCTX    = 0x43;
 inline constexpr u8  FB_CTX       = 0x44;
 inline constexpr u8  FB_GETDROPS  = 0x45;   // ★ DROPS backfill (gate ON only; never sent with the flip at 0)
 inline constexpr u8  FB_DROPINV   = 0x46;   // ★ DROPS backfill: the raindrop ids a peer holds for [lo, hi)
+inline constexpr u8  FB_GETWON    = 0x47;   // ★ DROPS-RESTART (gate ON only): ask any peer for a carried FB_BLOCK_WON v0x02 by bid
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -569,6 +570,25 @@ inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string*
 // chain, never from the peer).
 //   GETCTX : u8 0x43 ; u8 ver ; u32 chain_id ; u8 n (1..8) ; n x id(32)
 //   CTX    : u8 0x44 ; u8 ver ; u32 chain_id ; id(32) ; u32 len (0 = unknown here, <= 512 KiB) ; len bytes
+// ── FB_GETWON (0x47, ★ DROPS-RESTART, gate ON only) ─────────────────────────
+// op | ver | chain u32 | bid 32 (38 B). The answer is the peer's held FB_BLOCK_WON
+// v0x02 frame for that bid, verbatim (the receiver books it only after binding
+// it to the block's on-chain commitment). Never sent with the flip at 0.
+inline constexpr std::size_t kGetWonBytes = 1 + 1 + 4 + 32;
+inline std::vector<u8> encode_getwon(u32 chain_id, const bytes32& bid) {
+    std::vector<u8> f; f.reserve(kGetWonBytes);
+    f.push_back(FB_GETWON); f.push_back(kFbVersion); le::put32(f, chain_id); le::putb(f, bid);
+    return f;
+}
+inline bool decode_getwon(const std::vector<u8>& f, u32& chain_id, bytes32& bid, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() != kGetWonBytes) return bad("getwon: wrong length");
+    if (f[0] != FB_GETWON) return bad("getwon: wrong opcode");
+    if (f[1] != kFbVersion) return bad("getwon: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    bid = le::getb(f.data() + 6);
+    return true;
+}
 inline std::vector<u8> encode_getctx(u32 chain_id, const std::vector<bytes32>& ids) {
     if (ids.empty() || ids.size() > kCtxMaxIds) return {};
     std::vector<u8> f; f.reserve(7 + 32 * ids.size());

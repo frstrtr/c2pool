@@ -1650,6 +1650,12 @@ static int run_live(const XmrNodeConfig& cfg) {
     // time, carrying the delta composed there (bid -> the frame without its delta).
     std::map<std::string, relay::BlockWon> own_won;
     std::uint64_t drops_carry_tx = 0, drops_carry_rx = 0, drops_carry_ok = 0, drops_carry_refused = 0, drops_carry_wait = 0;
+    // ★ DROPS-RESTART (flip 1 only): the carried-delta journal (own wins, carried
+    // frames, booked deltas) + the FB_GETWON ask throttle and counters.
+    std::unique_ptr<c2pool::v37n::xmr::drops::DropsCarryStore> drops_store;
+    c2pool::v37n::xmr::drops::DropsCarryStore::Loaded drops_store_loaded{};
+    std::map<std::string, std::chrono::steady_clock::time_point> drops_won_asked_at;
+    std::uint64_t drops_getwon_tx = 0, drops_predrops_hold = 0, drops_prev_row_missing = 0, drops_reloaded_own = 0, drops_reloaded_frames = 0;
     std::set<std::string> wire_seen;
     std::uint64_t wire_tx = 0, wire_rx = 0, wire_prefold = 0, wire_pending = 0, wire_hit = 0, wire_mismatch = 0, wire_diverged = 0;
     std::uint64_t cut_ok = 0, cut_pending = 0, cut_miss = 0, cut_mismatch = 0, cut_absent = 0, cut_fold_refused = 0;
@@ -1947,9 +1953,67 @@ static int run_live(const XmrNodeConfig& cfg) {
         for (std::size_t i = 0; i < 32; ++i) { o.push_back(hx[rp[i] >> 4]); o.push_back(hx[rp[i] & 15]); }
         return o;
     };
+    // ★ ENROL-REPL / DROPS-RESTART (gate ON only): THE carried-delta decision for a
+    // lane block, shared by the chain booking and the D2 scratch re-derivation, so
+    // no flip-1 booking path composes locally. false = HOLD (awaiting the carried
+    // frame; every relay peer is asked for it). Journals the booked delta (and a
+    // verified frame) BEFORE the node books it; hand_to_node hands it one-shot.
+    auto drops_take_carry = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
+                                std::string& why, bool hand_to_node) -> bool {
+        auto wit = wire_cache.find(bid);
+        if (wit == wire_cache.end() || !wit->second.drops) {
+            ++drops_carry_wait;
+            // ★ DROPS-RESTART: ask every relay peer (FB_GETWON; any holder serves it), throttled per bid
+            if (relay_node) {
+                const auto now = std::chrono::steady_clock::now();
+                auto [ait, fresh_ask] = drops_won_asked_at.try_emplace(bid, now);
+                if (fresh_ask || now - ait->second >= std::chrono::seconds(2)) {
+                    ait->second = now;
+                    if (const auto bb = c2pool::v37n::cut_bid_bytes(bid); bb && relay_node->want_block_won(*bb)) ++drops_getwon_tx;
+                }
+            }
+            // the relay-repair family: HELD past the retry bound, never refused on a timeout
+            why = "cut-pending: relay repair of P=" + std::to_string(bk.credit_cut.next_pos) +
+                  ": awaiting the winner's carried DROPS delta (FB_BLOCK_WON v0x02)";
+            return false;
+        }
+        const auto& d = wit->second.d;
+        const bool binds = d.cut_next_pos == bk.credit_cut.next_pos && d.cut_spine_digest == bk.credit_cut.spine_digest &&
+                           d.reward == bk.total && d.h_b == h && d.owed_digest_at_win == bk.lane_commitment &&
+                           c2pool::v37n::cut_bid_hex(d.bid) == bid;
+        const std::string rej = c2pool::v37n::xmr::drops::verify_carry(*wit->second.drops, binds);
+        long long csum = 0; for (const auto& [k, v] : wit->second.drops->delta) csum += v;
+        if (drops_store) {   // ★ DROPS-RESTART: journal BEFORE the node books it (a re-drive books exactly this)
+            if (rej.empty() && !drops_store->has_frame(bid)) {   // a verified carried frame: servable after a restart
+                relay::BlockWon kb;
+                kb.chain_id = cfg.lane_chain; kb.bid = d.bid; kb.h_b = d.h_b; kb.cut_next_pos = d.cut_next_pos;
+                kb.cut_spine_digest = d.cut_spine_digest; kb.reward = d.reward; kb.payout_emitted = d.payout_emitted;
+                kb.owed_digest_at_win = d.owed_digest_at_win;
+                kb.drops = relay::BlockWon::Drops{wit->second.drops->delta, wit->second.drops->enrollment_digest};
+                const auto kf = relay::encode_block_won(kb);
+                if (!kf.empty()) drops_store->put_frame(bid, kf);
+            }
+            drops_store->put_booked(bid, rej.empty() ? wit->second.drops->delta : std::map<::v37::bytes32, long long>{});
+        }
+        if (rej.empty()) { if (hand_to_node) drops->set_carried(wit->second.drops->delta); ++drops_carry_ok; }
+        else             { if (hand_to_node) drops->set_carried({}); ++drops_carry_refused; }
+        std::printf("drops-carry-book: h=%llu bid=%s… %s delta_payees=%zu delta_sum=%lld winner_digest=%s… our_digest=%s…%s\n",
+                    (unsigned long long)h, bid.substr(0, 12).c_str(), rej.empty() ? "CARRIED" : "REFUSED(books EMPTY)",
+                    wit->second.drops->delta.size(), csum, hex_of(wit->second.drops->enrollment_digest).substr(0, 12).c_str(),
+                    hex_of(drops->core().enrollment().book_digest()).substr(0, 12).c_str(), rej.empty() ? "" : (" -- " + rej).c_str());
+        return true;
+    };
     fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
         Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
         if (drops_live) { drops->clear_cut_price(); drops->clear_carried(); }   // ★ DROPS: never a neighbour's price / delta
+        if (drops && !drops_live) {
+            // ★ DROPS-RESTART (defect 3): under the flip no lane block is booked
+            // through the pre-DROPS path (price INVALID, empty local delta). HOLD
+            // in the relay-repair family (never refused) until DROPS is live.
+            ++drops_predrops_hold;
+            why = "cut-pending: relay repair of P=-: DROPS not live yet (flip 1: no pre-DROPS booking)";
+            return false;
+        }
         if (!cba_fx || !cba_scfg) {
             // option B not bound yet (boot window) -> TRANSIENT, never memoized not-lane;
             // option A never binds -> a stranger's block for this node.
@@ -1965,7 +2029,10 @@ static int run_live(const XmrNodeConfig& cfg) {
             ++cba_fetch_failed;   // R-C rework-3 (D6): a transport/JSON failure is a transient retry, NOT a refusal
             return false;
         }
-        if (drops_live) drops_lane_memo[bid] = bk.is_lane;   // ★ RAIN-BACKFILL-2 (decoded from the bytes: deterministic)
+        // ★ RAIN-BACKFILL-2 / DROPS-RESTART: memoise only what the BYTES decide (the
+        // 03-21-00 lane tag), never the ring-dependent root match (is_lane alone
+        // is false on a restarted node whose ring has not reached the root yet).
+        if (drops_live) drops_lane_memo[bid] = bk.is_lane || bk.has_onchain_root;
         out.total_pico = bk.total;
         if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
         // D2: the builder datum (0x02 extra-nonce) and, for a matched root, the
@@ -2171,6 +2238,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                 bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest};
                 // over the row bound: our own check refuses it (books EMPTY), so carry EMPTY to the peers too
                 if (carry.delta.size() > relay::kBlockWonDropsMaxRows) bw.drops->delta.clear();
+                // ★ DROPS-RESTART (defect 2): WRITE-AHEAD -- the composed frame is journalled
+                // before it leaves or is booked, so a restart re-announces THIS delta
+                // (never a second, different composition) and any holder can serve it.
+                if (drops_store) drops_store->put_frame(bid, relay::encode_block_won(bw));
                 const std::size_t n = relay_node->broadcast_block_won(bw);
                 ++wire_tx; ++drops_carry_tx;
                 WireCache& wc = wire_cache[bid];
@@ -2182,26 +2253,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                             hex_of(carry.enrollment_digest).substr(0, 12).c_str(), relay::encode_block_won(bw).size(), n);
                 own_won.erase(ow);
             }
-            auto wit = wire_cache.find(bid);
-            if (wit == wire_cache.end() || !wit->second.drops) {
-                ++drops_carry_wait;
-                // the relay-repair family: HELD past the retry bound, never refused on a timeout
-                why = "cut-pending: relay repair of P=" + std::to_string(bk.credit_cut.next_pos) +
-                      ": awaiting the winner's carried DROPS delta (FB_BLOCK_WON v0x02)";
-                return false;
-            }
-            const auto& d = wit->second.d;
-            const bool binds = d.cut_next_pos == bk.credit_cut.next_pos && d.cut_spine_digest == bk.credit_cut.spine_digest &&
-                               d.reward == bk.total && d.h_b == h && d.owed_digest_at_win == bk.lane_commitment &&
-                               c2pool::v37n::cut_bid_hex(d.bid) == bid;
-            const std::string rej = c2pool::v37n::xmr::drops::verify_carry(*wit->second.drops, binds);
-            long long csum = 0; for (const auto& [k, v] : wit->second.drops->delta) csum += v;
-            if (rej.empty()) { drops->set_carried(wit->second.drops->delta); ++drops_carry_ok; }
-            else             { drops->set_carried({}); ++drops_carry_refused; }
-            std::printf("drops-carry-book: h=%llu bid=%s… %s delta_payees=%zu delta_sum=%lld winner_digest=%s… our_digest=%s…%s\n",
-                        (unsigned long long)h, bid.substr(0, 12).c_str(), rej.empty() ? "CARRIED" : "REFUSED(books EMPTY)",
-                        wit->second.drops->delta.size(), csum, hex_of(wit->second.drops->enrollment_digest).substr(0, 12).c_str(),
-                        hex_of(drops->core().enrollment().book_digest()).substr(0, 12).c_str(), rej.empty() ? "" : (" -- " + rej).c_str());
+            if (!drops_take_carry(h, bid, bk, why, true)) return false;
         }
         if (!paynow_net(h, bid, bk, credit, payout, why)) { ++cba_refused; return false; }   // SAME-BLOCK PAY-NOW: book net
         if (drops_live && relay_node) {   // ★ RAIN-BACKFILL(-2): once per booking that proceeds
@@ -2276,6 +2328,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); return false; }
         if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
         if (!fold_at_cut(bk.total, bk.credit_cut, out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
+        // ★ DROPS-RESTART (defect 3): the scratch lineage books the winner's carried
+        // delta too (journalled; the adoption's re-drive books it by block id) --
+        // never the pre-DROPS local composition. Not carried yet => undecidable.
+        if (drops && !drops_take_carry(h, bid, bk, why, false)) return false;
         if (!paynow_net(h, bid, bk, out.credit, payout, why)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
         std::printf("converge-decode: h=%llu bid=%s… booked under the SCRATCH lineage (candidate #%zu) P=%llu credit{ %s} payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.digest_index,
@@ -2299,8 +2355,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             bw.chain_id = cfg.lane_chain; bw.bid = *c2pool::v37n::cut_bid_bytes(bid); bw.h_b = h;
             bw.cut_next_pos = bk.credit_cut.next_pos; bw.cut_spine_digest = bk.credit_cut.spine_digest;
             bw.reward = bk.total; bw.payout_emitted = true; bw.owed_digest_at_win = bk.lane_commitment;
-            if (drops_live) {   // ★ ENROL-REPL: sent at BOOKING, as v0x02 with the composed delta (book_from_chain_ex)
+            if (drops) {   // ★ ENROL-REPL: sent at BOOKING, as v0x02 with the composed delta (book_from_chain_ex)
                 own_won[bid] = bw;
+                if (drops_store) drops_store->put_own(bid, relay::encode_block_won(bw));   // ★ DROPS-RESTART: survives a restart
                 std::printf("ab-wire-tx: own win h=%llu bid=%s… -> FB_BLOCK_WON deferred to the booking (DROPS carriage, v0x02)\n",
                             (unsigned long long)h, bid.substr(0,12).c_str());
                 return;
@@ -2363,9 +2420,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         ++wire_rx;
         const std::string bid = c2pool::v37n::cut_bid_hex(d.bid);
         WireCache wc; wc.d = d;
-        if (drops_live && bw.drops) {   // ★ ENROL-REPL: the winner's carried delta (checked at booking)
+        if (drops && bw.drops) {   // ★ ENROL-REPL: the winner's carried delta (checked at booking); DROPS-RESTART: kept even before live
             wc.drops = c2pool::v37n::xmr::drops::DropsCarry{bw.drops->delta, bw.drops->enrollment_digest};
             ++drops_carry_rx;
+        } else if (auto old = wire_cache.find(bid); drops && old != wire_cache.end() && old->second.drops) {
+            wc.drops = old->second.drops;   // never lose a held carried delta to a frame without one
         }
         const bool known = cba_ring.contains(d.owed_digest_at_win);   // merge: rework-3 ReconRing (was a deque scan)
         if (!known) ++wire_diverged;
@@ -2444,6 +2503,18 @@ static int run_live(const XmrNodeConfig& cfg) {
                 static_cast<unsigned long long>(cfg.d_conf),
                 cfg.same_height_renotify,
                 fo.race_journal_path.empty() ? "off" : fo.race_journal_path.c_str());
+    // ★ DROPS-RESTART (flip 1 only; nothing is constructed at flip 0): the
+    // carried-delta journal is loaded BEFORE the sidecar re-drive, so a pending
+    // FOUND re-driven at boot books the delta this node booked before the restart.
+    if constexpr (::c2pool::v37n::kDropsWiringArmed) {
+        if (cfg.lane_params.subthreshold.enabled && relay_enabled()) {
+            std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
+            drops_store = std::make_unique<c2pool::v37n::xmr::drops::DropsCarryStore>(
+                cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".drops_carry");
+            drops_store_loaded = drops_store->load();
+            node.set_drops_booked_fn([&](const std::string& b) { return drops_store->booked(b); });
+        }
+    }
     {
         const auto boot = fc.reseed_after_bring_up();
         std::printf("finalize-connect: sidecar=%s reseeded=%zu reregistered=%zu stale=%zu "
@@ -2872,22 +2943,25 @@ static int run_live(const XmrNodeConfig& cfg) {
             // longer holds (or the walk bound) => none below; a block whose bytes
             // are not readable now => undecidable (the booking HOLDs).
             drops->set_prev_lane_fn([&](std::uint64_t won_height) -> std::optional<std::uint64_t> {
+                // ★ DROPS-RESTART (defect 1): a chain row or block bytes not readable now
+                // => UNDECIDABLE (HOLD, nothing memoised); lane-ness from the bytes alone.
+                using COH = c2pool::v37n::xmr::drops::ChainOrderedHarvest;
                 static constexpr std::uint64_t kWalk = 1024;
                 ++drops_prev_asked;
-                for (std::uint64_t x = won_height; x-- > 1 && won_height - x <= kWalk;) {
-                    const auto b = node.chain_bid_at(x);
-                    if (!b) break;
-                    auto it = drops_lane_memo.find(*b);
-                    if (it == drops_lane_memo.end()) {
-                        c2pool::v37n::xmr::authority::CoinbaseBooking pbk; std::string pwhy;
-                        if (!fetch_decode(*b, pbk, pwhy) && !pbk.is_lane && pbk.why.empty()) { ++drops_prev_undecided; return std::nullopt; }
-                        ++drops_prev_decoded;
-                        it = drops_lane_memo.emplace(*b, pbk.is_lane).first;
-                    }
-                    if (it->second) return x;
-                }
-                ++drops_prev_none;
-                return c2pool::v37n::xmr::drops::ChainOrderedHarvest::kNoPrevLane;
+                COH::WalkStats ws;
+                const auto r = COH::walk_prev_lane(won_height, kWalk,
+                    [&](std::uint64_t x) { return node.chain_bid_at(x); },
+                    [&](const std::string& b) -> COH::LaneProbe {
+                        if (!cba_fx || !cba_scfg) return COH::LaneProbe::Undecidable;
+                        std::vector<std::uint8_t> blob; std::string pwhy;
+                        if (!cba_src.fetch(b, blob, pwhy) || blob.empty()) return COH::LaneProbe::Undecidable;
+                        const auto pbk = decode_blob(blob);
+                        return COH::probe_of(true, pbk.is_lane, pbk.has_onchain_root);
+                    },
+                    drops_lane_memo, &ws);
+                drops_prev_decoded += ws.decoded; drops_prev_none += ws.none; drops_prev_undecided += ws.undecided;
+                drops_prev_row_missing += ws.row_missing;
+                return r;
             });
             drops_live = true;
             std::printf("DROPS: ★ ACTIVE (V37_ACTIVATE_CONSENSUS_V1, K=%u, lz=%u, share_diff=%llu, raindrop floor diff=%llu, "
@@ -3107,6 +3181,29 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ledger.learn_ref(a.r.payee);
             });
             std::string why;
+            if (drops_store && drops) {   // ★ DROPS-RESTART: re-announce + serve our journalled carried frames; resume own wins
+                for (const auto& [b, f] : drops_store->frames()) {
+                    relay::BlockWon kb; std::string kwhy;
+                    if (!relay::decode_block_won(f, kb, &kwhy) || !kb.drops) continue;
+                    WireCache wc;
+                    wc.d.bid = kb.bid; wc.d.h_b = kb.h_b; wc.d.cut_next_pos = kb.cut_next_pos; wc.d.cut_spine_digest = kb.cut_spine_digest;
+                    wc.d.reward = kb.reward; wc.d.payout_emitted = kb.payout_emitted; wc.d.owed_digest_at_win = kb.owed_digest_at_win;
+                    wc.drops = c2pool::v37n::xmr::drops::DropsCarry{kb.drops->delta, kb.drops->enrollment_digest};
+                    wire_cache[b] = wc;
+                    relay_node->adopt_won_frame(f);
+                    ++drops_reloaded_frames;
+                }
+                for (const auto& [b, f] : drops_store->own()) {
+                    if (drops_store->has_frame(b)) continue;
+                    relay::BlockWon kb; std::string kwhy;
+                    if (!relay::decode_block_won(f, kb, &kwhy)) continue;
+                    own_won[b] = kb;
+                    ++drops_reloaded_own;
+                }
+                std::printf("drops-store: journal %s reloaded own=%zu frames=%zu booked=%zu malformed=%zu -> re-offered frames=%llu own wins to compose=%llu\n",
+                            drops_store->path().c_str(), drops_store_loaded.own, drops_store_loaded.frames, drops_store_loaded.booked,
+                            drops_store_loaded.malformed, (unsigned long long)drops_reloaded_frames, (unsigned long long)drops_reloaded_own);
+            }
             if (!relay_node->start(why)) { std::printf("REFUSED: %s\n", why.c_str()); node.stop(); return 2; }
             if (g_relay_partition_s) {   // test-only knob, never on mainnet (the relay is refused there)
                 std::signal(SIGUSR1, on_sigusr1);
@@ -3503,6 +3600,14 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)drops_prev_decoded, (unsigned long long)drops_prev_none, (unsigned long long)drops_prev_undecided,
                             (unsigned long long)drops_hold_entered, (unsigned long long)drops_hold_resolved, drops_hold_since.size(),
                             drops_hold_max_ms, relay_node->describe_drops().c_str());
+                if (drops_store)   // ★ DROPS-RESTART
+                    std::printf("  drops-restart: journal own=%zu frames=%zu booked=%zu write_fail=%llu | reloaded own=%zu frames=%zu booked=%zu "
+                                "| redrive_booked=%llu predrops_hold=%llu getwon_tx=%llu prev_lane row_missing=%llu\n",
+                                drops_store->own().size(), drops_store->frames().size(), drops_store->booked_size(),
+                                (unsigned long long)drops_store->write_failures(), drops_store_loaded.own, drops_store_loaded.frames,
+                                drops_store_loaded.booked, (unsigned long long)node.drops_booked_redrive(),
+                                (unsigned long long)drops_predrops_hold, (unsigned long long)drops_getwon_tx,
+                                (unsigned long long)drops_prev_row_missing);
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());

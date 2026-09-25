@@ -582,6 +582,13 @@ public:
         // DropsWiring) or nothing carried => the local composition below.
         std::optional<Amounts> carried;
         if (m_drops_carried) carried = m_drops_carried();
+        // ★ DROPS-RESTART: no live one-shot (a boot / converge RE-DRIVE of a
+        // pending FOUND): book the delta this node journalled when it booked
+        // this block, never a fresh local composition from a restarted book.
+        if (!carried && m_drops_booked) {
+            carried = m_drops_booked(fb.bid);
+            if (carried) ++m_drops_booked_redrive;
+        }
         if (carried) {
             if (m_drops_price) fb.drops.price = m_drops_price(); // one-shot, consumed either way (diagnostic only here)
             fb.has_carried_drops = true;
@@ -646,6 +653,10 @@ public:
     using DropsCarriedFn = std::function<std::optional<Amounts>()>;
     void set_drops_carried_fn(DropsCarriedFn f) { m_drops_carried = std::move(f); }
     std::uint64_t drops_booked_carried() const { return m_drops_booked_carried; }
+    // ★ DROPS-RESTART: the journalled booked delta by block id (a re-drive).
+    using DropsBookedFn = std::function<std::optional<Amounts>(const std::string& bid)>;
+    void set_drops_booked_fn(DropsBookedFn f) { m_drops_booked = std::move(f); }
+    std::uint64_t drops_booked_redrive() const { return m_drops_booked_redrive; }
     std::uint64_t drops_booked_local() const { return m_drops_booked_local; }
 
     // ★ ENROL-REPL: the WINNER's buried harvest, taken ONCE when it books its
@@ -955,6 +966,8 @@ private:
     DropsPriceFn                           m_drops_price{};
     DropsCarriedFn                         m_drops_carried{};          // ENROL-REPL (unset at flip 0)
     std::uint64_t                          m_drops_booked_carried = 0, m_drops_booked_local = 0;
+    DropsBookedFn                          m_drops_booked{};           // DROPS-RESTART (unset at flip 0)
+    std::uint64_t                          m_drops_booked_redrive = 0;
     HarvestRangeFn                         m_harvest_range{};   // ★ RAIN-BACKFILL
     std::size_t                            m_last_harvest_rows = 0;
 
