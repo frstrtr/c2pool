@@ -1088,9 +1088,23 @@ if (BUILD_TESTING)
     #          queues stay inside theirs,
     #   (SK-E) no block is ever credited twice (sum finalW == sum registered
     #          credit over the blocks the node settled),
-    # and it MEASURES the liveness envelope — the largest lane prefix at which a
-    # repair actually completed, against the request budget the shipped serve
-    # options allow. The CTest registration below pins a SHORT deterministic
+    # and — since the H-1..H-4 gate fixes — it is a GATE, not only a measurement:
+    #   (SK-3a..d) on a LOSSY schedule the run must produce real cut-misses, a
+    #          repair must actually credit blocks that were refused on the first
+    #          pass, at least SOAK_MIN_REPAIR_PCT% (default 90) of the pairs some
+    #          candidate could have served WHOLE must be repaired, and the
+    #          candidate walk must be exercised. Stub RepairDriver::arm out and
+    #          this FAILS; the first cut of the soak stayed green. On a LOSSLESS
+    #          schedule the complementary property is asserted instead (every
+    #          peer win credited on the first pass), so a clean run cannot
+    #          false-fail it.
+    #   (SK-A1) never a SUFFIX repair: every credit a replay produced had a
+    #          candidate holding the winner's cut that still retained position 0.
+    #   (SK-7)  the owed_digest byte comparison is FATAL by default, and SK-7a
+    #          fails a run in which it was never sampled at all.
+    # It also MEASURES the liveness envelope — the largest lane prefix at which a
+    # repair completed, and the VIRTUAL seconds of serve budget the largest one
+    # consumed. The CTest registration below pins a SHORT deterministic
     # budget so CI stays fast; the same binary is the long soak with bigger
     # SOAK_ROUNDS / SOAK_SECONDS (see the banner in the .cpp for every knob).
     # Consumer tree only: no file under src/sharechain/v37 is touched,
