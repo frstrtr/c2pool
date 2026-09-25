@@ -39,7 +39,13 @@
 //               the GETORDER backfill too) are re-offered on reconnect: both
 //               sides close that bin with the SAME set -> equal lane digests,
 //               0 late (base: the peer's receipts are never delivered).
-// RED on the base (H2, H3, H4), GREEN on the fix.
+//   H5 CHAIN    after the H2 repair the lanes grow on (orders never re-converge)
+//               until the divergence is BELOW the peer's horizon; the next two
+//               cross-side cuts are repaired from the SHADOW (the last
+//               reconstructed winner-side order, xmr_repair_replay.hpp) as the
+//               prefix -- the fix keeps working past one horizon of growth.
+// The replay is the daemon's own RepairReplayer (relay_view), so the KAT runs
+// the code that books. RED on the base (H2..H5), GREEN on the fix.
 // ===========================================================================
 #include <atomic>
 #include <chrono>
@@ -50,6 +56,10 @@
 #include <c2pool/v37/xmr/relay/xmr_relay_node.hpp>
 #include <c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp>
 #include <c2pool/v37/v37_engine.hpp>
+#if __has_include(<c2pool/v37/xmr/relay/xmr_repair_replay.hpp>)
+#include <c2pool/v37/xmr/relay/xmr_repair_replay.hpp>
+#define KAT_HAVE_REPLAYER 1
+#endif
 
 using namespace gap2test;
 using namespace std::chrono_literals;
@@ -80,7 +90,13 @@ struct TNode {
     std::map<u64, bytes32> dig_at;                          // our lane digest after each push position
     std::vector<std::pair<::v37::ScriptRef, u64>> feed;     // our own lane pushes (main_v37_xmr's feed_log)
     u64 template_height = 0;
+#ifdef KAT_HAVE_REPLAYER
+    std::unique_ptr<RepairReplayer> rep;
+#endif
     TNode(std::string n, RelayOptions ro) : name(std::move(n)) {
+#ifdef KAT_HAVE_REPLAYER
+        rep = std::make_unique<RepairReplayer>(2 * (ro.vault.horizon_positions ? ro.vault.horizon_positions : 8640));
+#endif
         engine = std::make_unique<c2pool::v37n::V37Engine>(4096);
         engine->start();
         engine->submit_tracked(::v37::LaneRecord::add_lane(kChain, ::v37::LaneParams{})).get();
@@ -143,30 +159,41 @@ static Admitted own(const SynthBlock& sb, std::uint32_t nonce, const ::v37::Scri
     return a;
 }
 
-// The daemon's relay_view replay (main_v37_xmr.cpp): OUR first a0 pushes, then
-// the served ids [a0, P) from the verified cache; the view at (P, spine) or null.
-static bool replay_reaches(TNode& Y, u64 P, const bytes32& spine, u64 a0, const std::vector<bytes32>& ids) {
-    if (a0 > Y.feed.size()) return false;
-    c2pool::v37n::V37Engine scratch; scratch.start();
-    scratch.submit_tracked(::v37::LaneRecord::add_lane(kChain, ::v37::LaneParams{})).get();
-    for (u64 i = 0; i < a0; ++i) {
-        ::v37::PayoutDescriptor d; d.pay = Y.feed[i].first;
-        scratch.submit_tracked(::v37::LaneRecord::push(kChain, d, Y.feed[i].second, 0)).get();
-    }
-    bool ok = true;
+// The daemon's relay_view replay (main_v37_xmr.cpp): the served ids [a0, P)
+// from the verified cache after OUR first a0 pushes (or the shadow's) --
+// RepairReplayer on the fix; a plain own-prefix replay where it does not exist.
+// Returns 0 = no view, 1 = own/full, 2 = shadow.
+static int replay_reaches(TNode& Y, u64 P, const bytes32& spine, u64 a0, const std::vector<bytes32>& ids) {
+    std::vector<std::pair<::v37::ScriptRef, u64>> served;
     for (const auto& id : ids) {
         ::v37::ScriptRef ref;
-        if (!Y.relay->cached(id, &ref)) { ok = false; break; }
-        ::v37::PayoutDescriptor d; d.pay = ref;
-        scratch.submit_tracked(::v37::LaneRecord::push(kChain, d, kReceiptWeight, 0)).get();
+        if (!Y.relay->cached(id, &ref)) return 0;
+        served.emplace_back(ref, kReceiptWeight);
     }
+#ifdef KAT_HAVE_REPLAYER
+    RepairReplayer::Base used = RepairReplayer::kNone;
+    auto view = Y.rep->replay(kChain, ::v37::LaneParams{}, P, spine, a0, Y.feed, served, &used);
+    if (!view) return 0;
+    Y.relay->note_alt_digests(Y.rep->shadow_digests());
+    return used == RepairReplayer::kShadow ? 2 : 1;
+#else
+    if (a0 > Y.feed.size()) return 0;
+    c2pool::v37n::V37Engine scratch; scratch.start();
+    scratch.submit_tracked(::v37::LaneRecord::add_lane(kChain, ::v37::LaneParams{})).get();
+    auto push = [&](const std::pair<::v37::ScriptRef, u64>& p) {
+        ::v37::PayoutDescriptor d; d.pay = p.first;
+        scratch.submit_tracked(::v37::LaneRecord::push(kChain, d, p.second, 0)).get();
+    };
+    for (u64 i = 0; i < a0; ++i) push(Y.feed[i]);
+    for (const auto& p : served) push(p);
     bool mism = false;
-    auto view = ok ? scratch.settlement_view_by_cut(kChain, P, spine, &mism) : nullptr;
+    auto view = scratch.settlement_view_by_cut(kChain, P, spine, &mism);
     scratch.stop();
-    return view != nullptr;
+    return view ? 1 : 0;
+#endif
 }
 
-struct Outcome { int st = -1; u64 a0 = 0; bool replay_ok = false; bool deep = false; u64 deep_a0 = 0; std::string status; };
+struct Outcome { int st = -1; u64 a0 = 0; bool replay_ok = false; int base = 0; bool deep = false; u64 deep_a0 = 0; std::string status; };
 
 static Outcome run_repair(TNode& X, TNode& Y, u64 P, const bytes32& spine, std::chrono::milliseconds limit) {
     Outcome out;
@@ -182,11 +209,12 @@ static Outcome run_repair(TNode& X, TNode& Y, u64 P, const bytes32& spine, std::
     out.deep = deep_of(*Y.relay, P, spine, &out.deep_a0);
     if (ready) {
         out.a0 = repair_a0_of(*Y.relay, P, spine);
-        out.replay_ok = replay_reaches(Y, P, spine, out.a0, ids);
+        out.base = replay_reaches(Y, P, spine, out.a0, ids);
+        out.replay_ok = out.base != 0;
     }
     std::printf("   Y repair: %s a0=%llu ids=%zu replay=%s | %s | start=%llu order_ok=%llu spine_mis=%llu peer_fail=%llu ready=%llu rearm=%llu deep=%s\n",
                 out.st == 1 ? "READY" : out.st == 0 ? "EXHAUSTED" : "PENDING", (unsigned long long)out.a0, ids.size(),
-                ready ? (out.replay_ok ? "reproduces the spine" : "DOES NOT reproduce") : "-", out.status.c_str(),
+                ready ? (out.base == 2 ? "reproduces the spine (SHADOW prefix)" : out.replay_ok ? "reproduces the spine" : "DOES NOT reproduce") : "-", out.status.c_str(),
                 (unsigned long long)ys.repair_started.load(), (unsigned long long)ys.repair_order_ok.load(),
                 (unsigned long long)ys.repair_spine_mismatch.load(), (unsigned long long)ys.repair_peer_fail.load(),
                 (unsigned long long)ys.repair_ready.load(), (unsigned long long)rearm_of(ys), out.deep ? "YES" : "no");
@@ -253,6 +281,30 @@ int main() {
             C(o.replay_ok, "H2 OUR first a0 pushes + the served [a0,P) replay to X's spine: the cross-side block books");
             C(rearm_of(Y.relay->stats()) >= 1, "H2 the BELOW_HORIZON answer re-armed the repair (repair_horizon_rearm >= 1) instead of setting X aside");
             C(!o.deep, "H2 no DEEP-DIVERGENCE (the divergence is inside X's horizon)");
+            // ── H5: the lanes grow past one horizon beyond the divergence; the
+            // next cross-side cuts chain from the shadow ─────────────────────
+            u64 P_prev = P;
+            for (int link = 0; link < 2; ++link) {
+                const std::string t5 = "H5." + std::to_string(link + 1);
+                const SynthBlock bl = make_block(102 + link, prev[2 + link], seed + 10 + link, nullptr, 2, 17 + link);
+                const std::size_t c0 = X.relay->cache_size();
+                for (u32 k = 0; k < 6; ++k) X.relay->submit_own(own(bl, 5000 + 100 * link + k, pX));
+                C(wait_for([&] { return X.relay->cache_size() == c0 + 6 && Y.relay->cache_size() == c0 + 6; }, xy), t5 + " 6 more receipts flooded to both");
+                for (auto* n : xy) n->template_height = 103 + link;
+                const u64 want = P_prev + (link == 0 ? 2 : 0) + 6;
+                C(wait_for([&] { return X.next_pos() == want && Y.next_pos() == want; }, xy), t5 + " both push them (lane " + std::to_string(want) + ")");
+                const u64 P2 = X.next_pos();
+                const bytes32 spine2 = X.dig_at[P2];
+                const u64 low2 = X.relay->vault().lowest_position();
+                std::printf("   %s X cut P=%llu, X lowest_retained=%llu (divergence at %u is %s the horizon)\n", t5.c_str(),
+                            (unsigned long long)P2, (unsigned long long)low2, N0, low2 > N0 ? "BELOW" : "inside");
+                const Outcome o2 = run_repair(X, Y, P2, spine2, 12000ms);
+                C(low2 > N0, t5 + " the divergence (position 12) is below X's horizon (lowest_retained " + std::to_string(low2) + ")");
+                C(o2.st == 1 && o2.base == 2 && o2.a0 > N0,
+                  t5 + " READY from a0=" + std::to_string(o2.a0) + " and the replay reaches X's spine only from the SHADOW prefix (own order diverged below a0)");
+                C(!o2.deep, t5 + " no DEEP-DIVERGENCE: the probe accepted the shadow's digest at a0");
+                P_prev = P2;
+            }
         }
         X.relay->set_dialing(false); Y.relay->set_dialing(false);
     }
