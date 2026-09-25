@@ -62,6 +62,11 @@
 // ===========================================================================
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
 #include <atomic>
 #include <functional>
 #include <chrono>
@@ -133,6 +138,8 @@
 // -- it links nothing and touches nothing unless asked, so the flag can be
 // parsed, reported and refused identically in a build that has no librandomx.
 #include "impl/xmr/pow/xmr_msr_boost.hpp"
+// --version: the release's compiled-in pinned snapshot heights.
+#include "impl/xmr/native/anchor/xmr_anchor_pinned.hpp"
 
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
@@ -3773,15 +3780,118 @@ static int run_live(const XmrNodeConfig& cfg) {
                          "no --payout-address", provider, template_source, candidate);
 }
 
+// ---------------------------------------------------------------------------
+// CLI-STRICT. main()'s parse loop used to IGNORE a token it did not know and
+// fill a missing value from a default, and std::stoul/stoull took "12abc" as
+// 12 and "-1" as 2^64-1. So `c2pool-v37-xmr --version` (no such flag then)
+// started a live stagenet node, and a typo in any flag started a node on
+// defaults -- on a mainnet host, a running node with a config nobody asked for.
+//
+// Now every token must be a known flag, a value flag must be followed by its
+// value (a token starting with "--" is the NEXT flag, not a value), and every
+// number or enumerated value must parse WHOLE. A violation is a usage error:
+// ONE line on stderr naming the flag and pointing at --help, exit 2. The loop
+// runs to completion before anything is constructed, so a usage error opens no
+// file and no socket. --version / -V print the build identity and exit 0, just
+// as early.
+// ---------------------------------------------------------------------------
+namespace cli_strict {
+
+constexpr int kUsageExit = 2;
+
+struct UsageError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+inline std::uint64_t to_u64(const std::string& flag, const std::string& v,
+                            std::uint64_t max = std::numeric_limits<std::uint64_t>::max()) {
+    std::uint64_t out = 0;
+    const char* b = v.data();
+    const char* e = b + v.size();
+    // from_chars on an unsigned type takes no sign, no whitespace, no prefix.
+    const auto r = std::from_chars(b, e, out);
+    if (v.empty() || r.ec != std::errc{} || r.ptr != e || out > max)
+        throw UsageError(flag + " wants an integer in [0, " + std::to_string(max) +
+                         "], got '" + v + "'");
+    return out;
+}
+
+inline std::int64_t to_i64(const std::string& flag, const std::string& v) {
+    std::int64_t out = 0;
+    const char* b = v.data();
+    const char* e = b + v.size();
+    const auto r = std::from_chars(b, e, out);
+    if (v.empty() || r.ec != std::errc{} || r.ptr != e)
+        throw UsageError(flag + " wants an integer, got '" + v + "'");
+    return out;
+}
+
+inline double to_double(const std::string& flag, const std::string& v) {
+    double out = 0;
+    const char* b = v.data();
+    const char* e = b + v.size();
+    const auto r = std::from_chars(b, e, out);
+    if (v.empty() || r.ec != std::errc{} || r.ptr != e || !std::isfinite(out))
+        throw UsageError(flag + " wants a number, got '" + v + "'");
+    return out;
+}
+
+inline const std::string& one_of(const std::string& flag, const std::string& v,
+                                 std::initializer_list<const char*> ok) {
+    std::string list;
+    for (const char* o : ok) {
+        if (v == o) return v;
+        list += (list.empty() ? "" : "|") + std::string(o);
+    }
+    throw UsageError(flag + " takes " + list + ", got '" + v + "'");
+}
+
+// on|off with the spellings the loop always took (off/0/false, on/1/true).
+inline bool on_off(const std::string& flag, const std::string& v) {
+    one_of(flag, v, {"on", "off", "1", "0", "true", "false"});
+    return !(v == "off" || v == "0" || v == "false");
+}
+
+// --version / -V: who this binary is, what it defaults to, and which bootstrap
+// it pins. Nothing is opened or started.
+inline void print_version() {
+    namespace nat = ::c2pool::xmr::native;
+    const XmrNodeConfig defaults;
+    std::printf("c2pool-v37-xmr %s\n", C2POOL_VERSION);
+    std::printf("network default: %s\n", to_string(defaults.network));
+    std::printf("pinned snapshot: mainnet height %llu (block %s); stagenet height %llu (block %s); "
+                "testnet, regtest: none\n",
+                static_cast<unsigned long long>(nat::PINNED_SNAPSHOT_MAINNET.height),
+                nat::PINNED_SNAPSHOT_MAINNET.block_id,
+                static_cast<unsigned long long>(nat::PINNED_SNAPSHOT_STAGENET.height),
+                nat::PINNED_SNAPSHOT_STAGENET.block_id);
+}
+
+}  // namespace cli_strict
+
 int main(int argc, char** argv) {
     XmrNodeConfig cfg;
     bool mock_smoke = false;
+    namespace cs = cli_strict;
 
+    std::string a;   // the flag being parsed (named by a usage error)
+    try {
     for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&](const char* def) -> std::string {
-            return (i + 1 < argc) ? argv[++i] : def;
+        a = argv[i];
+        // A value flag takes the NEXT token as its value; there must be one and
+        // it must not be the next flag. An explicitly empty value ("") is still
+        // a value -- rigs pass `--payout-address "$ADDR"`.
+        auto value = [&]() -> std::string {
+            if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0)
+                throw cs::UsageError(a + " wants a value");
+            return argv[++i];
         };
+        auto u64 = [&](std::uint64_t max = std::numeric_limits<std::uint64_t>::max()) {
+            const std::string v = value();
+            return cs::to_u64(a, v, max);
+        };
+        auto u32 = [&]() { return static_cast<std::uint32_t>(u64(std::numeric_limits<std::uint32_t>::max())); };
+        auto u16 = [&]() { return static_cast<std::uint16_t>(u64(std::numeric_limits<std::uint16_t>::max())); };
         // The embedded node's flags first, from the ONE function that owns
         // them (xmr_node_config.hpp). Keeping them here as a dozen more `else
         // if` arms is how --seeds and the gate 4 window came to be parsed
@@ -3789,106 +3899,108 @@ int main(int argc, char** argv) {
         {
             std::string ferr;
             const int used = apply_native_node_flag(cfg, argc, argv, i, ferr);
-            if (used < 0) { std::printf("REFUSED: %s\n", ferr.c_str()); return 2; }
+            if (used < 0) throw cs::UsageError(ferr);
             if (used > 0) { i += used - 1; continue; }
         }
         if (a == "--mock-smoke" || a == "--selftest") mock_smoke = true;
-        else if (a == "--network")  cfg.network = parse_net(next("stagenet"));
-        else if (a == "--rpc-host") cfg.monerod.rpc_host = next("127.0.0.1");
-        else if (a == "--rpc-port") cfg.monerod.rpc_port =
-                     static_cast<std::uint16_t>(std::stoi(next("38081")));
-        else if (a == "--zmq-port") cfg.monerod.zmq_port =
-                     static_cast<std::uint16_t>(std::stoi(next("38083")));
-        else if (a == "--stratum-port") cfg.stratum_bind_port =
-                     static_cast<std::uint16_t>(std::stoi(next("3333")));
-        else if (a == "--stratum-bind-host") cfg.stratum_bind_host = next("127.0.0.1");
-        else if (a == "--payout-address") cfg.payout_address = next("");
-        else if (a == "--share-diff") cfg.stratum_share_diff = std::stoull(next("0"));
-        else if (a == "--template-reserve") cfg.template_reserve_size =
-                     static_cast<std::uint32_t>(std::stoul(next("0")));
-        else if (a == "--poll-ms") cfg.poll_ms = static_cast<std::uint32_t>(std::stoul(next("5000")));
-        else if (a == "--status-every") cfg.status_every_s =
-                     static_cast<std::uint32_t>(std::stoul(next("30")));
+        else if (a == "--version" || a == "-V") { cs::print_version(); return 0; }
+        else if (a == "--network") {
+            const std::string m = value();
+            cs::one_of(a, m, {"stagenet", "testnet", "mainnet", "regtest"});
+            cfg.network = parse_net(m);
+        }
+        else if (a == "--rpc-host") cfg.monerod.rpc_host = value();
+        else if (a == "--rpc-port") cfg.monerod.rpc_port = u16();
+        else if (a == "--zmq-port") cfg.monerod.zmq_port = u16();
+        else if (a == "--stratum-port") cfg.stratum_bind_port = u16();
+        else if (a == "--stratum-bind-host") cfg.stratum_bind_host = value();
+        else if (a == "--payout-address") cfg.payout_address = value();
+        else if (a == "--share-diff") cfg.stratum_share_diff = u64();
+        else if (a == "--template-reserve") cfg.template_reserve_size = u32();
+        else if (a == "--poll-ms") cfg.poll_ms = u32();
+        else if (a == "--status-every") cfg.status_every_s = u32();
         else if (a == "--no-found-sidecar") cfg.found_sidecar = false;
-        else if (a == "--payee-spend-hex") cfg.payee_spend_key_hex = next("");
-        else if (a == "--payee-view-hex")  cfg.payee_view_key_hex = next("");
+        else if (a == "--payee-spend-hex") cfg.payee_spend_key_hex = value();
+        else if (a == "--payee-view-hex")  cfg.payee_view_key_hex = value();
         else if (a == "--payee-subaddress") cfg.payee_subaddress = true;
         else if (a == "--coinbase") {
-            const std::string m = next("monerod");
+            const std::string m = value();
+            cs::one_of(a, m, {"monerod", "v37", "settlement", "v37-settlement"});
             cfg.coinbase = (m == "v37" || m == "settlement" || m == "v37-settlement")
                                ? CoinbaseMode::V37Settlement : CoinbaseMode::MonerodTemplate;
         }
-        else if (a == "--residual-sink-spend-hex") cfg.residual_sink_spend_hex = next("");
-        else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = next("");
+        else if (a == "--residual-sink-spend-hex") cfg.residual_sink_spend_hex = value();
+        else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = value();
         else if (a == "--residual-sink-subaddress") cfg.residual_sink_subaddress = true;
         // fee model (LaneParams::fee, S4): off (default, master-identical) | v1
         else if (a == "--fee-model") {
-            const std::string m = next("off");
+            const std::string m = value();
             if (m == "off" || m == "0") cfg.lane_params.fee = ::v37::FeeModelGate{};
             else if (m == "v1" || m == "1") cfg.lane_params.fee = ::v37::FeeModelGate::for_version(1);
-            else { std::printf("REFUSED: --fee-model takes off|v1, got \"%s\"\n", m.c_str()); return 2; }
+            else throw cs::UsageError("--fee-model takes off|v1, got '" + m + "'");
         }
         // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
-        else if (a == "--give-author-pct")    g_give_author_pct = std::stod(next("0"));
-        else if (a == "--node-owner-fee-pct") g_owner_fee_pct = std::stod(next("0"));
-        else if (a == "--node-owner-address") g_owner_address = next("");
-        else if (a == "--settle-h-min") cfg.settle_h_min = std::stoull(next("0"));
-        else if (a == "--settle-output-cap") cfg.settle_output_cap =
-                     static_cast<std::uint32_t>(std::stoul(next("0")));
-        else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
+        else if (a == "--give-author-pct")    g_give_author_pct = cs::to_double(a, value());
+        else if (a == "--node-owner-fee-pct") g_owner_fee_pct = cs::to_double(a, value());
+        else if (a == "--node-owner-address") g_owner_address = value();
+        else if (a == "--settle-h-min") cfg.settle_h_min = u64();
+        else if (a == "--settle-output-cap") cfg.settle_output_cap = u32();
+        else if (a == "--owed-demo-amount") cfg.owed_demo_amount = u64();
         // recon(A+B credit) knobs
-        else if (a == "--credit-feed")        g_credit_feed = next("");
-        else if (a == "--credit-feed-lag-ms") g_credit_feed_lag_ms = std::stoull(next("0"));
-        else if (a == "--wire-out")           g_wire_out = next("");
-        else if (a == "--wire-in")            g_wire_in = next("");
-        else if (a == "--credit-mutate")      g_credit_mutate = std::stoll(next("0"));
+        else if (a == "--credit-feed")        g_credit_feed = value();
+        else if (a == "--credit-feed-lag-ms") g_credit_feed_lag_ms = u64();
+        else if (a == "--wire-out")           g_wire_out = value();
+        else if (a == "--wire-in")            g_wire_in = value();
+        else if (a == "--credit-mutate")      g_credit_mutate = cs::to_i64(a, value());
         else if (a == "--no-book-deferral")        g_no_book_deferral = true;
         else if (a == "--cba-monerod-compare")     g_cba_monerod_compare = true;
         else if (a == "--cba-monerod-fallback")    g_cba_monerod_fallback = true;
-        else if (a == "--cba-refetch-bound")      g_cba_refetch_bound = std::stoull(next("120"));
+        else if (a == "--cba-refetch-bound")      g_cba_refetch_bound = u64();
         else if (a == "--relay-feed-monerod-compare") g_relay_feed_monerod_compare = true;
         // GAP-2 relay knobs
-        else if (a == "--relay-listen")             g_relay_listen = next("");
+        else if (a == "--relay-listen")             g_relay_listen = value();
         else if (a == "--pool-genesis") {           // POOL-LINEAGE
-            const std::string h = next("");
+            const std::string h = value();
             ::v37::bytes32 g{};
-            if (!c2pool::v37n::xmr::lineage::parse_genesis_hex(h, g)) {
-                std::printf("REFUSED: --pool-genesis wants 64 hex digits (the pool's 32-byte genesis id), got \"%s\"\n", h.c_str());
-                return 2;
-            }
+            if (!c2pool::v37n::xmr::lineage::parse_genesis_hex(h, g))
+                throw cs::UsageError("--pool-genesis wants 64 hex digits (the pool's 32-byte genesis id), got '" + h + "'");
             g_pool_genesis = g;
         }
-        else if (a == "--relay-peer")               g_relay_peers.push_back(next(""));
-        else if (a == "--drops-enrol")              g_drops_enrol.push_back(next(""));
-        else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = std::stoull(next("0"));
-        else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(std::stoull(next("8")));
-        else if (a == "--relay-index-horizon")      g_relay_horizon = std::stoull(next("64"));
-        else if (a == "--relay-rx-budget")          g_relay_rx_budget = next("1,20,16,256");
-        else if (a == "--relay-solicited-credits")  g_relay_solicited = static_cast<std::uint32_t>(std::stoul(next("256")));
-        else if (a == "--relay-backfill-positions") g_relay_backfill = std::stoull(next("2048"));
-        else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = static_cast<std::uint32_t>(std::stoul(next("60")));
-        else if (a == "--relay-order")              g_relay_order = next("canonical");
-        else if (a == "--relay-bin-lag")            g_relay_bin_lag = std::stoull(next("1"));
-        else if (a == "--relay-bin-grace-ms")       g_relay_grace_ms = static_cast<std::uint32_t>(std::stoul(next("4000")));
-        else if (a == "--relay-vault-entries")      g_relay_vault_entries = static_cast<std::size_t>(std::stoull(next("0")));
-        else if (a == "--relay-vault-bytes")        g_relay_vault_bytes = static_cast<std::size_t>(std::stoull(next("0")));
-        else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = std::stoull(next("0"));
+        else if (a == "--relay-peer")               g_relay_peers.push_back(value());
+        else if (a == "--drops-enrol")              g_drops_enrol.push_back(value());
+        else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
+        else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
+        else if (a == "--relay-index-horizon")      g_relay_horizon = u64();
+        else if (a == "--relay-rx-budget")          g_relay_rx_budget = value();
+        else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
+        else if (a == "--relay-backfill-positions") g_relay_backfill = u64();
+        else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = u32();
+        else if (a == "--relay-order")              g_relay_order = cs::one_of(a, value(), {"canonical", "arrival"});
+        else if (a == "--relay-bin-lag")            g_relay_bin_lag = u64();
+        else if (a == "--relay-bin-grace-ms")       g_relay_grace_ms = u32();
+        else if (a == "--relay-vault-entries")      g_relay_vault_entries = static_cast<std::size_t>(u64());
+        else if (a == "--relay-vault-bytes")        g_relay_vault_bytes = static_cast<std::size_t>(u64());
+        else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = u64();
         else if (a == "--no-relay-serve")           g_no_relay_serve = true;
-        else if (a == "--relay-test-partition-seconds") g_relay_partition_s = static_cast<std::uint32_t>(std::stoul(next("0")));
-        else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = static_cast<std::uint32_t>(std::stoul(next("0")));
-        else if (a == "--relay-bind")               g_relay_bind = next("none");
-        else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = std::stoull(next("0"));
-        else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = std::stoull(next("20"));
-        else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = std::stoull(next("2"));
-        else if (a == "--contested-suspend") { const std::string v = next("on"); g_contested_suspend = !(v == "off" || v == "0" || v == "false"); }
-        else if (a == "--minority-converge") { const std::string v = next("on"); g_minority_mode = (v == "off" || v == "0" || v == "false") ? 0 : v == "halt-only" ? 2 : 1; }
-        else if (a == "--minority-window")       g_minority_window = static_cast<std::size_t>(std::stoull(next("8")));
-        else if (a == "--minority-min-blocks")   g_minority_min_blocks = static_cast<std::size_t>(std::stoull(next("3")));
-        else if (a == "--converge-retry-bound")  g_converge_retry_bound = std::stoull(next("600"));
-        else if (a == "--converge-hold-ticks")   g_converge_hold_ticks = std::stoull(next("0"));
-        else if (a == "--recon-max-root-age")      g_recon_max_root_age = std::stoull(next("0"));
+        else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
+        else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = u32();
+        else if (a == "--relay-bind")               g_relay_bind = cs::one_of(a, value(), {"none", "rbind"});
+        else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = u64();
+        else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = u64();
+        else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = u64();
+        else if (a == "--contested-suspend") g_contested_suspend = cs::on_off(a, value());
+        else if (a == "--minority-converge") {
+            const std::string v = value();
+            cs::one_of(a, v, {"on", "off", "halt-only", "1", "0", "true", "false"});
+            g_minority_mode = (v == "off" || v == "0" || v == "false") ? 0 : v == "halt-only" ? 2 : 1;
+        }
+        else if (a == "--minority-window")       g_minority_window = static_cast<std::size_t>(u64());
+        else if (a == "--minority-min-blocks")   g_minority_min_blocks = static_cast<std::size_t>(u64());
+        else if (a == "--converge-retry-bound")  g_converge_retry_bound = u64();
+        else if (a == "--converge-hold-ticks")   g_converge_hold_ticks = u64();
+        else if (a == "--recon-max-root-age")      g_recon_max_root_age = u64();
         else if (a == "--xmr-template-source") {
-            const std::string m = next("monerod");
+            const std::string m = cs::one_of(a, value(), {"monerod", "native"});
             cfg.template_source = (m == "native") ? TemplateSourceMode::Native
                                                   : TemplateSourceMode::Monerod;
         }
@@ -3897,58 +4009,52 @@ int main(int argc, char** argv) {
         // DOES own -- --native-connect/-anchor/-seeds, the gate 4 window, the
         // snapshot path, etc. -- was handled at the top of the loop and never
         // reaches these arms.
-        else if (a == "--native-output-set") cfg.native_output_set_path = next("");
+        else if (a == "--native-output-set") cfg.native_output_set_path = value();
         // The fully self-contained (peerless, daemonless) run. See
         // solo_refusal() in xmr_node_config.hpp for what it refuses and why.
         else if (a == "--native-solo") cfg.native_solo = true;
-        else if (a == "--native-dos-solicited-credits") cfg.native_dos_solicited_credits =
-                     static_cast<std::uint32_t>(std::stoull(next("8")));  // #1680 lever
+        else if (a == "--native-dos-solicited-credits") cfg.native_dos_solicited_credits = u32();  // #1680 lever
         else if (a == "--no-good-citizen") cfg.no_good_citizen = true;
         // OPERATOR TX-INJECTION (2026-09-19 ruling).
         else if (a == "--native-inject") cfg.native_inject = true;
-        else if (a == "--native-inject-dir")  cfg.native_inject_dir = next("");
-        else if (a == "--native-inject-hex")  cfg.native_inject_hex = next("");
-        else if (a == "--native-inject-ttl-blocks") cfg.native_inject_ttl_blocks =
-                     static_cast<std::uint64_t>(std::stoull(next("720")));
+        else if (a == "--native-inject-dir")  cfg.native_inject_dir = value();
+        else if (a == "--native-inject-hex")  cfg.native_inject_hex = value();
+        else if (a == "--native-inject-ttl-blocks") cfg.native_inject_ttl_blocks = u64();
         // M3 (R-ARMORDER, switchable): daemon-first stays the default.
         else if (a == "--arm-order") {
-            const std::string m = next("daemon-first");
+            const std::string m = cs::one_of(a, value(), {"daemon-first", "p2p-first", "p2p", "daemonless"});
             cfg.arm_order = (m == "p2p-first" || m == "p2p" || m == "daemonless")
                                 ? ArmOrderMode::P2PFirst : ArmOrderMode::DaemonFirst;
         }
         else if (a == "--no-daemon-rpc") cfg.no_daemon_rpc = true;
-        else if (a == "--lane-chain") cfg.lane_chain =
-                     static_cast<::v37::ChainId>(std::stoul(next("0")));
-        else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
+        else if (a == "--lane-chain") cfg.lane_chain = static_cast<::v37::ChainId>(u32());
+        else if (a == "--d-conf") cfg.d_conf = u64();
         // c2pool#1551: the same-height double-block tiebreak. One flag drives
         // BOTH levers -- the fork choice's D-14 build-on rule and the
         // accounting's nomination -- because two flags could disagree.
         else if (a == "--same-height-tiebreak") {
-            const std::string m = next("prefer-own");
-            if (!parse_tie_break(m, cfg.same_height_tiebreak)) {
-                std::printf("REFUSED: --same-height-tiebreak takes prefer-own or first-seen, "
-                            "not \"%s\" (refusing rather than picking a side for you)\n", m.c_str());
-                return 2;
-            }
+            const std::string m = value();
+            if (!parse_tie_break(m, cfg.same_height_tiebreak))
+                throw cs::UsageError("--same-height-tiebreak takes prefer-own or first-seen, not '" + m +
+                                     "' (refusing rather than picking a side for you)");
         }
-        else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s =
-                     static_cast<std::uint32_t>(std::stoul(next("240")));
-        else if (a == "--same-height-renotify") cfg.same_height_renotify =
-                     static_cast<std::uint32_t>(std::stoul(next("3")));
-        else if (a == "--same-height-journal") cfg.same_height_journal = next("");
-        else if (a == "--data-dir") cfg.settle_db_path = next("");
+        else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s = u32();
+        else if (a == "--same-height-renotify") cfg.same_height_renotify = u32();
+        else if (a == "--same-height-journal") cfg.same_height_journal = value();
+        else if (a == "--data-dir") cfg.settle_db_path = value();
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
         else if (a == "--randomx-large-pages") cfg.randomx_large_pages = true;
         else if (a == "--mine") {
             cfg.mine_enabled = true;
             // The thread count is OPTIONAL and must not swallow the next flag.
+            // A token that starts with a digit IS the count, and must be one.
             if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
-                cfg.mine_threads = static_cast<unsigned>(std::stoul(next("0")));
+                cfg.mine_threads = u32();
         }
         else if (a == "--mine-threads") {
             cfg.mine_enabled = true;
-            cfg.mine_threads = static_cast<unsigned>(std::stoul(next("0")));
+            cfg.mine_threads = u32();
         }
         else if (a == "--mine-fast") { cfg.mine_enabled = true; cfg.mine_fast = true; }
         else if (a == "--mine-msr") cfg.mine_msr = true;
@@ -3958,6 +4064,8 @@ int main(int argc, char** argv) {
             std::printf(
                 "c2pool-v37-xmr (EXPERIMENTAL prototype; stagenet default)\n"
                 "  --mock-smoke                 network-free CI smoke (monerod stub), then exit\n"
+                "  --version, -V                print the version, the network default and the pinned\n"
+                "                               snapshot heights, then exit\n"
                 "  --network <stagenet|testnet|mainnet|regtest>   default stagenet\n"
                 "  --rpc-host <h>  --rpc-port <p>  --zmq-port <p>\n"
                 "  --lane-chain <id>  --d-conf <n>  --poll-ms <ms>  --status-every <s>\n"
@@ -4192,6 +4300,16 @@ int main(int argc, char** argv) {
                 "                               status tick; never on the find path, never decides).\n");
             return 0;
         }
+        else if (a.rfind("-", 0) == 0) throw cs::UsageError("unknown option '" + a + "'");
+        else throw cs::UsageError("unexpected argument '" + a + "'");
+    }
+    } catch (const cs::UsageError& e) {
+        std::fprintf(stderr, "c2pool-v37-xmr: %s (see c2pool-v37-xmr --help)\n", e.what());
+        return cs::kUsageExit;
+    } catch (const std::exception& e) {   // backstop: nothing a flag carries may abort the process
+        std::fprintf(stderr, "c2pool-v37-xmr: %s: bad value (%s) (see c2pool-v37-xmr --help)\n",
+                     a.c_str(), e.what());
+        return cs::kUsageExit;
     }
 
     // Default monerod ports follow the chosen network unless overridden. If the

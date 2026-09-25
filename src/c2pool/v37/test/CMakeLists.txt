@@ -1112,6 +1112,27 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME v37_xmr_pinned_snapshot_kat COMMAND v37_xmr_pinned_snapshot_kat)
 
+    # CLI-STRICT -- v37_xmr_cli_strict_kat
+    #   c2pool-v37-xmr used to IGNORE an unknown flag and fill a missing value
+    #   from a default, so `--version` (no such flag then) or any typo started a
+    #   live node on defaults. Runs the BUILT daemon (its path is the argument)
+    #   with a scratch HOME/cwd: every bad invocation (unknown flag, typo,
+    #   positional, missing value, malformed number/enum) exits 2 with one line
+    #   naming it and pointing at --help and creates nothing; --version/-V exit
+    #   0 in < 1 s with the version and both pinned snapshot heights; every
+    #   accepted flag (the parse loop, apply_native_node_flag, the repo rig/doc
+    #   invocations) still parses. Every row that a broken build could turn into
+    #   a live run is pinned to regtest on 127.0.0.1 port 1; no real network.
+    #   Listed in both build.yml --target lists.
+    if (TARGET c2pool-v37-xmr)
+        add_executable(v37_xmr_cli_strict_kat v37_xmr_cli_strict_kat.cpp)
+        target_compile_features(v37_xmr_cli_strict_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_cli_strict_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        add_dependencies(v37_xmr_cli_strict_kat c2pool-v37-xmr)
+        add_test(NAME v37_xmr_cli_strict_kat
+                 COMMAND v37_xmr_cli_strict_kat $<TARGET_FILE:c2pool-v37-xmr>)
+    endif()
+
     # D6d -- v37_xmr_d6d_native_seed_tip_kat
     #   Under --arm-order p2p-first the embedded native node is the tip, the
     #   RandomX seed (hash + height, 2048-block epochs, 64-block lag) and the

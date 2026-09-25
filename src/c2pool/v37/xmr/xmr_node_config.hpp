@@ -597,14 +597,22 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
 inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const* argv,
                                   int i, std::string& err) {
     const std::string a = argv[i];
-    const bool have_value = (i + 1 < argc);
+    // CLI-STRICT: a following token that is itself a long flag is not a value
+    // (`--native-connect --seeds` is a missing address, not an address "--seeds").
+    const bool have_value = (i + 1 < argc) &&
+                            std::string(argv[i + 1]).rfind("--", 0) != 0;
     const std::string v = have_value ? argv[i + 1] : std::string();
 
     // A value flag with nothing after it is an ERROR, not a silent default: an
     // operator who typed `--native-snapshot-path` last on the line meant a path.
+    // CLI-STRICT: the number is the WHOLE token in decimal digits -- std::stoull
+    // alone takes "12abc" as 12 and "-1" as 2^64-1.
     auto need = [&](std::uint64_t& out) -> int {
         if (!have_value) { err = a + " wants a value"; return -1; }
+        const bool digits = !v.empty() && v.size() <= 20 &&
+            v.find_first_not_of("0123456789") == std::string::npos;
         try {
+            if (!digits) throw std::invalid_argument(v);
             out = std::stoull(v);
         } catch (const std::exception&) {
             err = a + " wants a number, got '" + v + "'";
@@ -676,8 +684,13 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
         return used;
     }
     if (a == "--native-template-fallback") {
-        if (!have_value) { err = "--native-template-fallback wants on|off"; return -1; }
-        c.native_template_fallback = !(v == "off" || v == "0" || v == "false");
+        const bool off = (v == "off" || v == "0" || v == "false");
+        const bool on  = (v == "on"  || v == "1" || v == "true");
+        if (!have_value || !(on || off)) {
+            err = "--native-template-fallback wants on|off, got '" + v + "'";
+            return -1;
+        }
+        c.native_template_fallback = !off;
         return 2;
     }
     return 0;
