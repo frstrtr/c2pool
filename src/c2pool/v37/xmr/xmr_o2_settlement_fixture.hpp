@@ -165,6 +165,11 @@ struct XmrSettlementConfig {
     // recon(A+B credit): where the template reads the receipt-lane cut it commits
     // on-chain (P, spine_digest) — the node's engine snapshot. Unset => no tail.
     std::function<bool(std::uint64_t& next_pos, ::v37::bytes32& spine)> credit_cut_source;
+    // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): the projected lane payees at the
+    // committed cut (P, spine) -- settle::project of the SAME view fold_eb
+    // books at. Unset / false => no pay-now (master's residual behaviour).
+    std::function<bool(std::uint64_t next_pos, const ::v37::bytes32& spine,
+                       std::vector<::c2pool::v37n::settle::WeightedPayee>& out)> paynow_source;
 
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
@@ -319,6 +324,8 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
+    if (ctx.has_credit_cut && cfg.paynow_source)   // SAME-BLOCK PAY-NOW: E_b weights at that cut
+        ctx.has_paynow = cfg.paynow_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest, ctx.paynow_payees);
     if (why) why->clear();
     return ctx;
 }

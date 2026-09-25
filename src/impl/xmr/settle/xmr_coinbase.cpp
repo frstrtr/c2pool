@@ -117,6 +117,38 @@ std::uint64_t fold_identity_owed(const CoinbaseInputs& in) {
 }
 
 // ---------------------------------------------------------------------------
+// SAME-BLOCK PAY-NOW split (see the header). u128 products: pool, eb < 2^64.
+std::vector<std::uint64_t> paynow_split(std::uint64_t pool,
+                                        const std::vector<std::uint64_t>& eb) {
+    std::vector<std::uint64_t> out(eb.size(), 0);
+    unsigned __int128 sum = 0;
+    for (std::uint64_t e : eb) sum += e;
+    if (pool == 0 || sum == 0) return out;
+    if (static_cast<unsigned __int128>(pool) >= sum) {   // the pool covers every E_b: pay each in full
+        for (std::size_t i = 0; i < eb.size(); ++i) out[i] = eb[i];
+        return out;
+    }
+    std::vector<unsigned __int128> rem(eb.size(), 0);
+    std::uint64_t given = 0;
+    for (std::size_t i = 0; i < eb.size(); ++i) {
+        const unsigned __int128 num = static_cast<unsigned __int128>(pool) * eb[i];
+        out[i] = static_cast<std::uint64_t>(num / sum);   // <= eb[i] since pool < sum
+        rem[i] = num % sum;
+        given += out[i];
+    }
+    std::uint64_t left = pool - given;                    // < count of rem > 0
+    std::vector<std::size_t> order(eb.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](std::size_t a, std::size_t b) { return rem[a] > rem[b]; });
+    for (std::size_t j = 0; j < order.size() && left > 0; ++j) {
+        if (rem[order[j]] == 0) break;                    // +1 only where floor < exact => stays <= eb
+        ++out[order[j]]; --left;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err) {
     auto fail = [&](BuildError e) -> std::vector<CoinbaseOutput> {
@@ -193,6 +225,50 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         res.push_back(std::move(o));
         if (!merge) ++n_slots;
         remaining -= amt;
+    }
+
+    // ---- SAME-BLOCK PAY-NOW (operator ruling 09-25): what the oldest-first
+    // owed pass left above the folded donation minimum pays the payees whose
+    // work THIS block credits, pro rata to their E_b at this budget, each
+    // <= its own E_b (Rule L: never an advance beyond work already done). A
+    // payee that already has an owed output gets it merged there (one output
+    // per identity); the rest get new outputs after the owed outputs, identity
+    // ASC. The residual-sink identity's share stays in `remaining`, i.e. in the
+    // folded donation output / the sink output, where the receive side books
+    // it (xmr_paynow.hpp). Pay-now never exceeds the output cap: an entry that
+    // needs a slot the cap does not have fails the build closed (the provider
+    // then rebuilds without pay-now and without the V37N commitment).
+    if (in.paynow_at) {
+        const std::uint64_t pool = remaining > fold_min ? remaining - fold_min : 0;
+        if (pool > 0) {
+            const std::vector<PayNowEntry> ents = in.paynow_at(budget);
+            std::vector<std::uint64_t> eb;
+            eb.reserve(ents.size());
+            for (const auto& e : ents) eb.push_back(e.eb);
+            const std::vector<std::uint64_t> alloc = paynow_split(pool, eb);
+            for (std::size_t i = 0; i < ents.size(); ++i) {
+                if (alloc[i] == 0) continue;
+                const PayNowEntry& e = ents[i];
+                if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink)
+                    continue;                                   // stays in the residual (sink / donation output)
+                bool merged = false;
+                for (auto& o : res)
+                    if (o.role == CoinbaseOutput::Role::Owed && o.identity == e.identity && o.pay == e.pay) {
+                        o.amount += alloc[i]; merged = true; break;
+                    }
+                if (!merged) {
+                    if (n_slots >= cap_owed) return fail(BuildError::CapTooSmall);
+                    CoinbaseOutput o;
+                    o.pay = e.pay;
+                    o.identity = e.identity;
+                    o.amount = alloc[i];
+                    o.role = CoinbaseOutput::Role::PayNow;
+                    res.push_back(std::move(o));
+                    ++n_slots;
+                }
+                remaining -= alloc[i];
+            }
+        }
     }
 
     // ---- S2: the folded donation minimum, when the residual cannot cover it,

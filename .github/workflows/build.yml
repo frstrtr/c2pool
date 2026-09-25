@@ -279,6 +279,7 @@ jobs:
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \
                     v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
+                    v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     v37_xmr_p2p_publish_retry_kat \
@@ -765,6 +766,7 @@ jobs:
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \
                     v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
+                    v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     v37_xmr_p2p_publish_retry_kat \
