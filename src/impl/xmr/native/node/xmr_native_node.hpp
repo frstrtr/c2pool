@@ -805,7 +805,10 @@ public:
             [this] { return boot_.booted(); },
             [this] { return index_.refetch_wanted(); },
             [this] { return index_.bodies_wanted(); },   // #1680: stranded fluffy parks
-            dcfg);
+            dcfg,
+            // FORK-FUSE-3: a peer that sent an above-version block is backed
+            // off for chain requests and gets no want-list batch.
+            [this](const PeerRef& p) { return index_.unknown_fork_peer_flagged(p); });
 
         // --- threads ----------------------------------------------------------
         running_ = true;

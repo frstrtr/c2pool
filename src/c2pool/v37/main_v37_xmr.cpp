@@ -3584,6 +3584,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                         static_cast<unsigned long long>(ns.uf_held),
                         static_cast<unsigned long long>(ns.uf_not_understood),
                         ns.txpool_gate_open ? 1 : 0);
+            // FORK-FUSE-3: the sync driver's side of it. flagged = peers that
+            // sent an above-version block and no connecting v16 block since;
+            // they get no want-list batch and a chain request only on a
+            // back-off (to_flagged = those requests, backoff_skips = ticks one
+            // was passed over). chain_requests is the driver's total.
+            std::printf("  hf-fuse-sync: flagged_peers=%zu chain_requests=%llu to_flagged=%llu "
+                        "backoff_skips=%llu chain_timeouts=%llu refetch_requests=%llu\n",
+                        ns.driver.unproductive_peers,
+                        static_cast<unsigned long long>(ns.driver.chain_requests),
+                        static_cast<unsigned long long>(ns.driver.chain_requests_unproductive),
+                        static_cast<unsigned long long>(ns.driver.unproductive_backoff_skips),
+                        static_cast<unsigned long long>(ns.driver.chain_timeouts),
+                        static_cast<unsigned long long>(ns.driver.refetch_requests));
 
             // #1680 observability: the block-DoS bucket accounting for the
             // solicited fluffy missing-tx (2009) reply. dropped = frames the DoS

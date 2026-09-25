@@ -414,13 +414,15 @@ public:
             else if (const AltBlock* a = alt_.find(e.ids[0])) base = a->height;
             wanted_.clear();
             wanted_heights_.clear();
+            // FORK-FUSE-3: who announced this want list. Only ids THAT peer
+            // announced may be held back when it serves an above-version block.
+            wanted_src_ = peer_key_(p);
             for (std::size_t i = 1; i < e.ids.size(); ++i) {
                 if (rows_.contains(e.ids[i]) || alt_.contains(e.ids[i])) continue;
                 wanted_.push_back(e.ids[i]);
                 wanted_heights_.push_back(base + i);
                 if (wanted_.size() >= MAX_SPAN_IDS) break;
             }
-            (void)p;
         }
         flush_events_();
     }
@@ -764,6 +766,13 @@ public:
     UnknownForkWatch unknown_fork_watch() const { std::lock_guard<std::mutex> lk(mu_); return uf_watch_; }
     std::size_t   unknown_fork_ids() const { std::lock_guard<std::mutex> lk(mu_); return uf_ids_.size(); }
     std::uint64_t unknown_fork_refetch_held() const { std::lock_guard<std::mutex> lk(mu_); return uf_refetch_held_; }
+    // FORK-FUSE-3: has this peer sent an above-version block and not since
+    // served a v16 block that connected? The sync driver's back-off predicate.
+    bool          unknown_fork_peer_flagged(const PeerRef& p) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return uf_peers_flagged_.count(peer_key_(p)) != 0;
+    }
+    std::size_t   unknown_fork_peers_flagged() const { std::lock_guard<std::mutex> lk(mu_); return uf_peers_flagged_.size(); }
     bool          unknown_fork_id_known(const Hash& id) const {
         std::lock_guard<std::mutex> lk(mu_);
         return uf_ids_.count(key_of_(id)) != 0;
@@ -1078,7 +1087,19 @@ private:
     // =====================================================================================
     // offering a block
     // =====================================================================================
+    // FORK-FUSE-3: every offer goes through here so a peer that served an
+    // above-version block is unflagged the moment it serves a v16 block that
+    // connects (to the best chain or as a resolved alt candidate).
     OfferResult offer_locked_(const PeerRef* peer, BlockEntry entry, bool own_mined) {
+        OfferResult r = offer_eval_locked_(peer, std::move(entry), own_mined);
+        if (peer && r.eval == EvalStatus::Ok
+            && (r.outcome == OfferOutcome::Connected || r.outcome == OfferOutcome::Reorged
+                || r.outcome == OfferOutcome::StoredAsAlt))
+            uf_peers_flagged_.erase(peer_key_(*peer));
+        return r;
+    }
+
+    OfferResult offer_eval_locked_(const PeerRef* peer, BlockEntry entry, bool own_mined) {
         OfferResult r;
 
         EvaluatedBlock ev;
@@ -2544,10 +2565,25 @@ private:
                 r.id = block_identity(entry.block_blob.data(), pb).id;
                 uf_remember_id_locked_(r.id);
             }
-            if (parent_h || claims_ahead)
+            // FORK-FUSE-3: only an id THIS peer announced (its own chain
+            // entry is the current want list). An id another peer announced
+            // at the height this block claims is that peer's honest block, and
+            // holding it back let one lying push withhold it for the TTL.
+            if ((parent_h || claims_ahead) && peer && wanted_src_ == peer_key_(*peer))
                 for (std::size_t k = 0; k < wanted_.size(); ++k)
                     if (wanted_heights_[k] == r.height && !rows_.contains(wanted_[k]))
                         uf_remember_id_locked_(wanted_[k]);
+        }
+
+        // FORK-FUSE-3: the sync driver neither routes want-list batches to this
+        // peer nor asks it for its chain except on a back-off, until it serves
+        // a v16 block that connects (offer_locked_). Not a penalty: the link
+        // stays, and so does every other FORK-FUSE-2 property.
+        if (peer) {
+            if (uf_peers_flagged_.size() >= UF_FLAGGED_CAP
+                && !uf_peers_flagged_.count(peer_key_(*peer)))
+                uf_peers_flagged_.erase(uf_peers_flagged_.begin());
+            ++uf_peers_flagged_[peer_key_(*peer)];
         }
 
         const std::string src = peer ? peer->addr : std::string("local");
@@ -2600,6 +2636,7 @@ private:
     // with a bumped header delays that id by at most the TTL, never forever).
     static constexpr std::size_t   UF_ID_CAP    = 256;
     static constexpr std::uint64_t UF_ID_TTL_MS = 10ull * 60ull * 1000ull;
+    static constexpr std::size_t   UF_FLAGGED_CAP = 1024;   // FORK-FUSE-3: flagged-peer map bound
 
     void uf_remember_id_locked_(const Hash& id) {
         const std::string k = key_of_(id);
@@ -3067,6 +3104,7 @@ private:
         lt_undo_.clear();
         wanted_.clear();
         wanted_heights_.clear();
+        wanted_src_.clear();
         refetch_.clear();
         booking_wanted_.clear();
         queued_events_.clear();
@@ -3154,6 +3192,8 @@ private:
     std::map<std::string, std::uint64_t> uf_ids_;          // above-version id -> first-seen poll ms
     std::deque<std::string>              uf_ids_order_;    // FIFO for the UF_ID_CAP bound
     mutable std::uint64_t                uf_refetch_held_ = 0;   // want-list ids held back
+    std::string                          wanted_src_;            // FORK-FUSE-3: who announced wanted_
+    std::map<std::string, std::uint64_t> uf_peers_flagged_;      // FORK-FUSE-3: peer -> above-version blocks since its last connecting v16 block
     bool          synced_             = false;
     bool          forced_synced_      = false;
     bool          synced_forced_ever_ = false;

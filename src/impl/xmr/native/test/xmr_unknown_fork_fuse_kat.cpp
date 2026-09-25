@@ -1063,6 +1063,301 @@ void test_e4_no_rerequest() {
 #endif
 }
 
+
+// =============================================================================
+// F. FORK-FUSE-3: a lying above-version peer must not make the node lag
+// =============================================================================
+// The honest chain the F tests follow: v16 blocks the index does not have yet,
+// built on whatever the index holds at `from_h` / `from_id`.
+struct HonestChain {
+    std::vector<BlockEntry> blocks;   // [0] is at height from_h + 1
+    std::vector<Hash>       ids;
+    std::uint64_t           from_h = 0;
+    Hash                    from_id{};
+    std::uint64_t           agc    = 0;
+    std::uint32_t           nonce  = 0;
+    std::uint64_t tip_h() const { return from_h + blocks.size(); }
+    Hash          tip_id() const { return ids.empty() ? from_id : ids.back(); }
+    void mine() {
+        const std::uint64_t h = tip_h() + 1;
+        BlockEntry e = make_block(IMPL, IMPL, GENESIS_TS + 120 * h, tip_id(), 0x3000u + (++nonce), h,
+                                  base_at(agc));
+        agc = accumulate_generated_coins(agc, base_at(agc));
+        ids.push_back(id_of(e));
+        blocks.push_back(std::move(e));
+    }
+    const BlockEntry* find(const Hash& id) const {
+        for (std::size_t i = 0; i < ids.size(); ++i) if (ids[i] == id) return &blocks[i];
+        return nullptr;
+    }
+};
+
+std::uint64_t our_tip_h(const Chain& ch) {
+    const auto t = ch.idx->tip();
+    return t ? t->height : 0;
+}
+Hash our_tip_id(const Chain& ch) {
+    const auto t = ch.idx->tip();
+    return t ? t->id : Hash{};
+}
+
+std::unique_ptr<rt::SyncDriver> make_driver(fakes::FakeFetcher& fetcher, Chain& ch) {
+    return std::make_unique<rt::SyncDriver>(
+        fetcher, *ch.idx, *ch.idx, tag_id(0), [] { return true; },
+        [&ch] { return ch.idx->refetch_wanted(); }, rt::SyncDriver::RefetchFn{},
+        rt::SyncDriverConfig{}
+#if defined(C2POOL_XMR_SYNC_UNPRODUCTIVE_BACKOFF)
+        , [&ch](const PeerRef& p) { return ch.idx->unknown_fork_peer_flagged(p); }
+#endif
+    );
+}
+
+bool contains_id(const std::vector<Hash>& v, const Hash& h) {
+    for (const Hash& x : v) if (x == h) return true;
+    return false;
+}
+
+// F1. THE HELD-ID STALL (the FORK-FUSE-2 verify's probe E5 shape). An honest
+// peer's chain entry wants its block at tip+1; ONE lying peer pushes a
+// bogus-parent v17-shaped block that CLAIMS height tip+1. Before the fix the
+// honest wanted id at that height went into the held set and refetch_wanted()
+// withheld it for the 10 min TTL; after it the honest id is offered at once,
+// and ids the liar itself announced or served stay held.
+void test_f1_honest_id_not_held() {
+    Chain ch;
+    fakes::FakeFetcher fetcher;
+    ch.idx->set_fetcher(&fetcher);
+    const PeerRef honest = peer(61), liar = peer(62);
+    HonestChain hc;
+    hc.from_h = ch.tip_h; hc.from_id = ch.tip_id; hc.agc = ch.tip_agc;
+    hc.mine();                                   // the honest block at tip+1
+    const Hash hid = hc.ids[0];
+
+    const std::uint64_t t0 = 11'000'000;
+    uf_poll(ch, t0);
+    {
+        ChainEntry e;
+        e.start_height = ch.tip_h;
+        e.total_height = ch.tip_h + 2;
+        e.ids = {ch.tip_id, hid};
+        ch.idx->on_chain_entry(honest, std::move(e));
+    }
+    kat::check(contains_id(ch.idx->refetch_wanted(), hid), "F1: the honest id is wanted before the lie");
+    // The lie: a v17-shaped block on a parent nobody has, claiming tip+1.
+    (void)ch.idx->offer_block(&liar, make_v17_block(tag_id(0xBAD0BAD), ch.tip_h + 1,
+                                                    GENESIS_TS + 120 * (ch.tip_h + 1),
+                                                    base_at(ch.tip_agc)), false);
+    uf_poll(ch, t0 + 500);
+    const bool offered_now = contains_id(ch.idx->refetch_wanted(), hid);
+    // The REAL SyncDriver's first tick after the lie: is the honest id on the wire?
+    PeerSyncData hs;
+    hs.current_height        = ch.tip_h + 2;
+    hs.cumulative_difficulty = u128_of(ch.tip_h + 2, 0);
+    hs.top_id                = hid;
+    hs.top_version           = IMPL;
+    PeerSyncData ls          = hs;
+    ls.current_height        = ch.tip_h + 2;
+    ls.cumulative_difficulty = u128_of(1ull << 40, 0);
+    fetcher.peer_table = {{liar, ls}, {honest, hs}};
+    auto drv = make_driver(fetcher, ch);
+    drv->tick(t0 + 1'000);
+    std::size_t asks_first_tick = 0, asks_to_honest = 0;
+    for (const auto& r : fetcher.object_requests)
+        for (const Hash& h : r.ids)
+            if (h == hid) { ++asks_first_tick; if (r.peer.addr == honest.addr) ++asks_to_honest; }
+    // And over the next 10 minutes of 500 ms ticks with nobody answering.
+    std::size_t asks_10min = asks_first_tick;
+    for (std::uint64_t t = t0 + 1'500; t < t0 + 10 * MIN_MS; t += 500) {
+        uf_poll(ch, t);
+        const std::size_t before = fetcher.object_requests.size();
+        drv->tick(t);
+        for (std::size_t i = before; i < fetcher.object_requests.size(); ++i)
+            for (const Hash& h : fetcher.object_requests[i].ids) if (h == hid) ++asks_10min;
+    }
+    std::printf("F1 honest id at the height a bogus-parent v17 push claims: in refetch_wanted=%d "
+                "asked on the first tick=%zu (to the honest peer %zu) asked over 10 min=%zu penalties=%zu\n",
+                offered_now ? 1 : 0, asks_first_tick, asks_to_honest, asks_10min, fetcher.penalties.size());
+    kat::check(offered_now, "F1: the honest wanted id is NOT held back by the liar's claimed height");
+    kat::checkf(asks_first_tick >= 1, "F1: the honest id is asked for at once (first tick), got %zu",
+                asks_first_tick);
+    kat::check(fetcher.penalties.empty(), "F1: the liar is not penalised");
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+    kat::check(!ch.idx->unknown_fork_id_known(hid), "F1: the honest id is not in the held set");
+#endif
+
+    // The liar's OWN ids stay held: an id it announced in its chain entry at
+    // the height its v17 push claims (attached on our tip, and bogus-parent).
+    for (int leg = 0; leg < 2; ++leg) {
+        const Hash x = tag_id(0xF1F100 + static_cast<std::uint64_t>(leg));
+        ChainEntry e;
+        e.start_height = ch.tip_h;
+        e.total_height = ch.tip_h + 2;
+        e.ids = {ch.tip_id, x};
+        ch.idx->on_chain_entry(liar, std::move(e));
+        kat::check(contains_id(ch.idx->refetch_wanted(), x), "F1: the liar's announced id is wanted first");
+        const BlockEntry lie = leg == 0
+            ? ch.next_v17()
+            : make_v17_block(tag_id(0xBAD0BAD + 1), ch.tip_h + 1, GENESIS_TS + 120 * (ch.tip_h + 1),
+                             base_at(ch.tip_agc));
+        (void)ch.idx->offer_block(&liar, lie, false);
+        uf_poll(ch, t0 + 10 * MIN_MS + 1'000 + static_cast<std::uint64_t>(leg));
+        const bool held = !contains_id(ch.idx->refetch_wanted(), x);
+        std::printf("F1 liar's own announced id, %s v17 push at tip+1: held=%d\n",
+                    leg == 0 ? "attached" : "bogus-parent", held ? 1 : 0);
+        kat::checkf(held, "F1[%d]: the liar's own announced id stays held", leg);
+    }
+    // The honest block still connects.
+    const OfferResult r = ch.idx->offer_block(&honest, hc.blocks[0], false);
+    kat::check(r.outcome == OfferOutcome::Connected, "F1: the honest block connects");
+}
+
+// F2. THE STORM AND THE LAG. A lying peer advertises the heaviest chain (10
+// blocks ahead), answers every REQUEST_CHAIN with a chain whose top is an
+// above-version block, serves that block on GET_OBJECTS, answers `missed` for
+// every honest id, and pushes a v17-shaped header on our tip every 5 s. An
+// honest peer mines a block every 60 s; every other one reaches us only as the
+// child's push (its parent must be FETCHED), as when a fluffy push is missed.
+// Before the fix the driver asked the liar for its chain on (nearly) every
+// 500 ms tick and sent it every want-list batch, so the honest parent was
+// asked of the liar every 15 s and never of the honest peer: the node fell
+// behind for the whole run. After it the liar gets a chain request only on a
+// bounded exponential back-off, the honest peer serves the parent at once, and
+// the node stays within 2 blocks. Nobody is penalised; nothing trips.
+void test_f2_storm_and_lag() {
+    Chain ch;
+    fakes::FakeFetcher fetcher;
+    ch.idx->set_fetcher(&fetcher);
+    const PeerRef honest = peer(71), liar = peer(72);
+    HonestChain hc;
+    hc.from_h = ch.tip_h; hc.from_id = ch.tip_id; hc.agc = ch.tip_agc;
+
+    constexpr std::uint64_t RUN_MS = 20 * MIN_MS;
+    const std::uint64_t t0 = 13'000'000;
+    uf_poll(ch, t0);
+    auto drv = make_driver(fetcher, ch);
+    std::size_t chain_to_liar = 0, chain_to_honest = 0, objs_to_liar = 0, objs_to_honest = 0;
+    std::size_t max_lag = 0, lag_samples_over2 = 0, tmpl_off = 0;
+    std::size_t fc = 0, oc = 0;
+    std::uint64_t forged = 0;
+    for (std::uint64_t t = t0; t < t0 + RUN_MS; t += 500) {
+        const std::uint64_t k = (t - t0) / 500;
+        // The honest peer mines every 60 s; odd blocks are pushed, even ones
+        // reach us only as their child's parent.
+        if (k % 120 == 60) {
+            hc.mine();
+            if (hc.blocks.size() % 2 == 0)
+                (void)ch.idx->offer_block(&honest, hc.blocks.back(), false);   // child: parks, wants its parent
+        }
+        // The liar forges on our tip every 5 s (+ a bogus-parent claim ahead).
+        if (k % 10 == 3) {
+            const std::uint64_t h = our_tip_h(ch);
+            (void)ch.idx->offer_block(&liar, make_v17_block(our_tip_id(ch), h + 1, GENESIS_TS + 120 * (h + 1),
+                                                            base_at(0)), false);
+            ++forged;
+        }
+        const std::uint64_t ours = our_tip_h(ch);
+        PeerSyncData hs;
+        hs.current_height        = hc.tip_h() + 1;
+        hs.cumulative_difficulty = u128_of(hc.tip_h() + 1, 0);
+        hs.top_id                = hc.tip_id();
+        hs.top_version           = IMPL;
+        PeerSyncData ls          = hs;
+        ls.current_height        = ours + 11;
+        ls.cumulative_difficulty = u128_of(1ull << 40, 0);
+        ls.top_version           = FUTURE;
+        fetcher.peer_table = {{liar, ls}, {honest, hs}};
+
+        uf_poll(ch, t);
+        drv->tick(t);
+        if (!tmpl(ch)) ++tmpl_off;
+
+        // Answer what the driver put on the wire.
+        for (; fc < fetcher.chain_requests.size(); ++fc) {
+            const auto& rq = fetcher.chain_requests[fc];
+            const std::uint64_t h = our_tip_h(ch);
+            ChainEntry e;
+            if (rq.peer.addr == liar.addr) {
+                ++chain_to_liar;
+                e.start_height = h;
+                e.total_height = h + 11;
+                e.ids = {our_tip_id(ch), tag_id(0xF2000000ull + k)};
+                ch.idx->on_chain_entry(liar, std::move(e));
+            } else {
+                ++chain_to_honest;
+                e.start_height = h;
+                e.ids = {our_tip_id(ch)};
+                for (std::uint64_t j = h + 1; j <= hc.tip_h(); ++j) e.ids.push_back(hc.ids[j - hc.from_h - 1]);
+                e.total_height = h + e.ids.size();
+                ch.idx->on_chain_entry(honest, std::move(e));
+            }
+        }
+        for (; oc < fetcher.object_requests.size(); ++oc) {
+            const auto rq = fetcher.object_requests[oc];
+            std::vector<BlockEntry> blocks;
+            std::vector<Hash>       missed;
+            if (rq.peer.addr == liar.addr) {
+                ++objs_to_liar;
+                for (const Hash& id : rq.ids) {
+                    if (hc.find(id)) missed.push_back(id);
+                    else {
+                        const std::uint64_t h = our_tip_h(ch);
+                        blocks.push_back(make_v17_block(our_tip_id(ch), h + 1, GENESIS_TS + 120 * (h + 1), base_at(0)));
+                    }
+                }
+                ch.idx->on_objects(liar, std::move(blocks), std::move(missed), our_tip_h(ch) + 11);
+            } else {
+                ++objs_to_honest;
+                for (const Hash& id : rq.ids) {
+                    if (const BlockEntry* b = hc.find(id)) blocks.push_back(*b);
+                    else missed.push_back(id);
+                }
+                ch.idx->on_objects(honest, std::move(blocks), std::move(missed), hc.tip_h() + 1);
+            }
+        }
+        const std::uint64_t now_ours = our_tip_h(ch);
+        const std::size_t lag = hc.tip_h() > now_ours ? static_cast<std::size_t>(hc.tip_h() - now_ours) : 0;
+        if (lag > max_lag) max_lag = lag;
+        if (lag > 2) ++lag_samples_over2;
+    }
+    std::printf("F2 20 min, liar 10 ahead + %llu forged pushes, honest %zu blocks (half only by parent fetch): "
+                "our tip %llu vs honest %llu, max lag=%zu (samples > 2: %zu), REQUEST_CHAIN liar=%zu honest=%zu, "
+                "GET_OBJECTS liar=%zu honest=%zu, penalties=%zu tmpl_off=%zu\n",
+                static_cast<unsigned long long>(forged), hc.blocks.size(),
+                static_cast<unsigned long long>(our_tip_h(ch)), static_cast<unsigned long long>(hc.tip_h()),
+                max_lag, lag_samples_over2, chain_to_liar, chain_to_honest, objs_to_liar, objs_to_honest,
+                fetcher.penalties.size(), tmpl_off);
+    kat::checkf(max_lag <= 2, "F2: the node stays within 2 blocks of the honest chain (max lag %zu)", max_lag);
+    kat::check(our_tip_h(ch) == hc.tip_h(), "F2: every honest block connected by the end");
+    // Back-off 5 s doubling to 300 s: asks at 0, 5, 15, 35, 75, 155, 315, 615, 915 s (+ the
+    // honest-timeout fallbacks, none here) -- 9 in 20 min, bound 7 + ceil((1200-315)/300) = 10.
+    kat::checkf(chain_to_liar <= 10, "F2: REQUEST_CHAIN to the liar bounded (<= 10 in 20 min), got %zu",
+                chain_to_liar);
+    kat::check(fetcher.penalties.empty(), "F2: nobody penalised");
+    kat::check(tmpl_off == 0, "F2: templates never withdrawn (one liar, v16 advancing)");
+#if defined(C2POOL_XMR_UNKNOWN_FORK_WATCH)
+    const UnknownForkWatch w = ch.idx->unknown_fork_watch();
+    kat::check(w.trips() == 0, "F2: 0 trips");
+#endif
+#if defined(C2POOL_XMR_SYNC_UNPRODUCTIVE_BACKOFF)
+    const auto& ds = drv->stats();
+    std::printf("F2 driver: chain_requests=%llu to_flagged=%llu backoff_skips=%llu flagged_peers=%zu\n",
+                static_cast<unsigned long long>(ds.chain_requests),
+                static_cast<unsigned long long>(ds.chain_requests_unproductive),
+                static_cast<unsigned long long>(ds.unproductive_backoff_skips), ds.unproductive_peers);
+    // Every chain request to the liar but the very first (sent before its
+    // first above-version block flagged it) is a back-off ask.
+    kat::check(ds.chain_requests_unproductive + 1 == chain_to_liar,
+               "F2: the driver counts the liar's back-off chain requests");
+    kat::check(ch.idx->unknown_fork_peer_flagged(liar) && !ch.idx->unknown_fork_peer_flagged(honest),
+               "F2: the liar is flagged, the honest peer is not");
+    // The flag clears when that peer serves a v16 block that connects.
+    hc.mine();
+    const OfferResult r = ch.idx->offer_block(&liar, hc.blocks.back(), false);
+    kat::check(r.outcome == OfferOutcome::Connected && !ch.idx->unknown_fork_peer_flagged(liar),
+               "F2: a connecting v16 block from the liar clears its flag");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -1075,5 +1370,7 @@ int main() {
     test_e2_two_peers_with_v16_progress();
     test_e3_quorum_stall_trip_and_clear();
     test_e4_no_rerequest();
+    test_f1_honest_id_not_held();
+    test_f2_storm_and_lag();
     return kat::report("xmr_native_unknown_fork_fuse_kat");
 }
