@@ -174,17 +174,26 @@ static_assert(kFrozenVersionV2 == W3_WIRE_VERSION_V2,
               "S-1c: the v0x02 frozen wire version tag is 0x02");
 static_assert(kFrozenVersionV3 == W3_WIRE_VERSION_V3,
               "DROPS-R3: the v0x03 frozen wire version tag is 0x03");
-static_assert(kFrozenVersionV3 == W3_WIRE_VERSION,
-              "DROPS-R3: this build EMITS the current frozen version (0x03); a "
-              "wire change is a VISIBLE bump with new goldens, never a re-pack");
+static_assert(W3_WIRE_VERSION == (W3_WIRE_V3_LIVE ? kFrozenVersionV3 : kFrozenVersionV2),
+              "DROPS-R3: this build EMITS v0x03 under the consensus flip and v0x02 "
+              "(master, byte for byte) with the flip at 0; a wire change is a "
+              "VISIBLE bump with new goldens, never a re-pack");
 static_assert(kFrozenRMax == W3_R_MAX,
               "W3-B5: receipt_count bound is frozen at 4 (== W2_R_MAX)");
 
 // Version acceptance set (F-5). {0x01, 0x02, 0x03} for the DROPS-R3 upgrade
 // window: an older peer's frames are still decoded and accounted; a version
 // retires only when the operator says so, and its goldens stay green until then.
+// v0x03 joins the LIVE set only under the consensus flip (W3_WIRE_V3_LIVE);
+// with the flip at 0 the set is {0x01, 0x02}, exactly master's.
+#if V37_ACTIVATE_CONSENSUS_V1
 inline constexpr std::uint8_t kAcceptedVersions[] = { kFrozenVersion, kFrozenVersionV2,
                                                       kFrozenVersionV3 };
+#else
+inline constexpr std::uint8_t kAcceptedVersions[] = { kFrozenVersion, kFrozenVersionV2 };
+#endif
+static_assert((sizeof(kAcceptedVersions) == 3) == W3_WIRE_V3_LIVE,
+              "the live accept set carries v0x03 iff the build takes the flip");
 inline bool version_accepted(std::uint8_t v) {
     for (std::uint8_t a : kAcceptedVersions) if (a == v) return true;
     return false;
@@ -281,9 +290,13 @@ inline const char* layout_id_v3() { return "w3-carrier-wire/v0x03/frozen-2026-09
 // peer REJECTS every frame this build sends (REJECT_BAD_VERSION at its decode)
 // — the flag day is loud on purpose, so a mixed fleet cannot silently strip a
 // block-winner cut descriptor at a v0x01 hop.
+// v0x03 is live only under the consensus flip, so the flip-0 build reports
+// master's S-1c flag day byte for byte.
 inline const char* flag_day_id() {
-    return "w3-carrier-wire/flag-day/drops-r3-2026-09-12: emit=v0x03 "
-           "accept={v0x01,v0x02,v0x03}";
+    return W3_WIRE_V3_LIVE
+               ? "w3-carrier-wire/flag-day/drops-r3-2026-09-12: emit=v0x03 "
+                 "accept={v0x01,v0x02,v0x03}"
+               : "w3-carrier-wire/flag-day/s1c-2026-09-12: emit=v0x02 accept={v0x01,v0x02}";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -863,12 +876,17 @@ inline SelfCheck selfcheck() {
 
     // Global pins.
     chk(kFrozenVersion == 0x01, "v0x01 wire version tag frozen at 0x01");
-    chk(kFrozenVersionV2 == 0x02 && kFrozenVersionV3 == 0x03 && W3_WIRE_VERSION == 0x03,
-        "DROPS-R3: this build EMITS wire v0x03");
+    chk(kFrozenVersionV2 == 0x02 && kFrozenVersionV3 == 0x03 &&
+            W3_WIRE_VERSION == (W3_WIRE_V3_LIVE ? 0x03 : 0x02),
+        W3_WIRE_V3_LIVE ? "DROPS-R3: this build (flip taken) EMITS wire v0x03"
+                        : "DROPS-R3: flip at 0 -> this build EMITS wire v0x02 (master)");
     chk(kFrozenRMax == 4 && W3_R_MAX == 4, "R_MAX frozen at 4");
-    chk(version_accepted(0x01) && version_accepted(0x02) && version_accepted(0x03) &&
-        !version_accepted(0x00) && !version_accepted(0x04) && !version_accepted(0xff),
-        "accepted version set is exactly {0x01, 0x02, 0x03} (F-5 accept window)");
+    chk(version_accepted(0x01) && version_accepted(0x02) &&
+            version_accepted(0x03) == W3_WIRE_V3_LIVE &&
+            !version_accepted(0x00) && !version_accepted(0x04) && !version_accepted(0xff),
+        W3_WIRE_V3_LIVE
+            ? "accepted version set is exactly {0x01, 0x02, 0x03} (F-5 accept window)"
+            : "flip at 0: accepted version set is exactly {0x01, 0x02} (master)");
     chk(kTransportMaxFrame == (1u << 20), "transport ceiling frozen at 1 MiB");
     chk(std::string(layout_id()) == "w3-carrier-wire/v0x01/frozen-2026-09-07",
         "v0x01 layout id UNCHANGED by the S-1c bump");
@@ -943,7 +961,7 @@ inline SelfCheck selfcheck() {
         }
 
         // (3) decode(encode) round trip, lossless; (4) re-encode identity
-        DecodeResult dr = CarrierWire::decode(bytes);
+        DecodeResult dr = CarrierWire::decode_frozen(bytes);
         chk(dr.status == WireStatus::OK, who + ": decode OK");
         chk(dr.dropped.empty(), who + ": no receipt dropped");
         chk(carriers_equal(dr.carrier, c), who + ": decode(encode(c)) == c (all fields)");
@@ -953,7 +971,7 @@ inline SelfCheck selfcheck() {
         // (5) the GOLDEN itself decodes to the fixture (independent of encode)
         const std::vector<std::uint8_t> gold = from_hex(f.golden_hex);
         chk(!gold.empty(), who + ": golden hex well-formed");
-        DecodeResult dg = CarrierWire::decode(gold);
+        DecodeResult dg = CarrierWire::decode_frozen(gold);
         chk(dg.status == WireStatus::OK && carriers_equal(dg.carrier, c),
             who + ": decode(golden) == fixture");
 
@@ -965,37 +983,37 @@ inline SelfCheck selfcheck() {
         bool all_trunc = true;
         for (std::size_t n = 0; n < bytes.size(); ++n) {
             std::vector<std::uint8_t> pre(bytes.begin(), bytes.begin() + n);
-            if (CarrierWire::decode(pre).status != WireStatus::REJECT_TRUNCATED) { all_trunc = false; break; }
+            if (CarrierWire::decode_frozen(pre).status != WireStatus::REJECT_TRUNCATED) { all_trunc = false; break; }
         }
         chk(all_trunc, who + ": every strict prefix -> REJECT_TRUNCATED");
 
         // (8) one trailing byte -> REJECT_TRUNCATED (frame is exact-length)
         { auto t = bytes; t.push_back(0x00);
-          chk(CarrierWire::decode(t).status == WireStatus::REJECT_TRUNCATED, who + ": trailing byte rejected"); }
+          chk(CarrierWire::decode_frozen(t).status == WireStatus::REJECT_TRUNCATED, who + ": trailing byte rejected"); }
 
         // (9) version policy: 0x00 / 0x04 / 0xff -> REJECT_BAD_VERSION (0x02 and
         //     0x03 are ACCEPTED versions now, so neither is a rejection probe)
         for (std::uint8_t v : {std::uint8_t(0x00), std::uint8_t(0x04), std::uint8_t(0xff)}) {
             auto t = bytes; t[kOffVersion] = v;
-            chk(CarrierWire::decode(t).status == WireStatus::REJECT_BAD_VERSION,
+            chk(CarrierWire::decode_frozen(t).status == WireStatus::REJECT_BAD_VERSION,
                 who + ": version 0x" + to_hex({v}) + " rejected");
         }
 
         // (10) receipt_count = R_MAX+1 -> REJECT_RMAX (whole carrier)
         if (rc_off < bytes.size()) {
             auto t = bytes; t[rc_off] = static_cast<std::uint8_t>(kFrozenRMax + 1);
-            chk(CarrierWire::decode(t).status == WireStatus::REJECT_RMAX, who + ": R_MAX+1 rejected");
+            chk(CarrierWire::decode_frozen(t).status == WireStatus::REJECT_RMAX, who + ": R_MAX+1 rejected");
         }
 
         // (11) carrier identity flipped -> REJECT_CARRIER_UNBOUND (W3-MUST)
         { auto t = bytes; t[kOffCarrier + kOffIdentity] ^= 0x01;
-          chk(CarrierWire::decode(t).status == WireStatus::REJECT_CARRIER_UNBOUND,
+          chk(CarrierWire::decode_frozen(t).status == WireStatus::REJECT_CARRIER_UNBOUND,
               who + ": mis-bound carrier rejected"); }
 
         // (12) receipt[0] identity flipped -> OK, that receipt dropped, rest stand
         if (!c.receipts.empty()) {
             auto t = bytes; t[receipt_offset(c, 0) + kOffIdentity] ^= 0x01;
-            DecodeResult dd = CarrierWire::decode(t);
+            DecodeResult dd = CarrierWire::decode_frozen(t);
             chk(dd.status == WireStatus::OK && dd.dropped.size() == 1 &&
                 dd.carrier.receipts.size() == c.receipts.size() - 1,
                 who + ": mis-bound receipt dropped, carrier stands");
@@ -1008,11 +1026,11 @@ inline SelfCheck selfcheck() {
         if (v2) {
             const std::size_t t = cutdesc_offset(c);
             { auto b2 = bytes; b2[t + kOffWonBlock] = 0x02;
-              chk(CarrierWire::decode(b2).status == WireStatus::REJECT_BAD_CUT,
+              chk(CarrierWire::decode_frozen(b2).status == WireStatus::REJECT_BAD_CUT,
                   who + ": won_block = 2 -> REJECT_BAD_CUT"); }
             if (c.cut) {
                 auto b2 = bytes; b2[t + kOffCutPayoutEmit] = 0x7f;
-                chk(CarrierWire::decode(b2).status == WireStatus::REJECT_BAD_CUT,
+                chk(CarrierWire::decode_frozen(b2).status == WireStatus::REJECT_BAD_CUT,
                     who + ": payout_emitted = 0x7f -> REJECT_BAD_CUT");
             }
         }
@@ -1043,23 +1061,23 @@ inline SelfCheck selfcheck() {
                     h.drops->enrollment_digest,
                 "H: enrolment digest is the LAST 32 bytes of the frame");
         }
-        const DecodeResult dr = CarrierWire::decode(b);
+        const DecodeResult dr = CarrierWire::decode_frozen(b);
         chk(dr.status == WireStatus::OK && dr.carrier.drops.has_value() &&
                 *dr.carrier.drops == *h.drops,
             "H: the credit map decodes back EXACTLY, negative row included");
 
         // the refusals, one bit each
         auto b_bad = b;  b_bad[t] = 0x7f;
-        chk(CarrierWire::decode(b_bad).status == WireStatus::REJECT_BAD_DROPS,
+        chk(CarrierWire::decode_frozen(b_bad).status == WireStatus::REJECT_BAD_DROPS,
             "drops present byte outside {0,1} -> REJECT_BAD_DROPS");
         auto b_big = b;  b_big[t + 1] = 0xff; b_big[t + 2] = 0xff;
-        chk(CarrierWire::decode(b_big).status != WireStatus::OK,
+        chk(CarrierWire::decode_frozen(b_big).status != WireStatus::OK,
             "an entry count above the cap is never accepted");
         {   // payees out of order: swap entry 0 and entry 1's payees
             auto b_ord = b;
             for (std::size_t i = 0; i < kHashBytes; ++i)
                 std::swap(b_ord[t + 3 + i], b_ord[t + 3 + kDropsEntryBytes + i]);
-            chk(CarrierWire::decode(b_ord).status == WireStatus::REJECT_BAD_DROPS,
+            chk(CarrierWire::decode_frozen(b_ord).status == WireStatus::REJECT_BAD_DROPS,
                 "payees not strictly ascending -> REJECT_BAD_DROPS (no ambiguous fold)");
         }
         {   // a credit map with NO cut descriptor: refused at encode AND decode
@@ -1081,7 +1099,7 @@ inline SelfCheck selfcheck() {
                 map_bytes.assign(full.begin() + static_cast<long>(off), full.end());
             }
             raw.insert(raw.end(), map_bytes.begin(), map_bytes.end());
-            chk(CarrierWire::decode(raw).status == WireStatus::REJECT_BAD_DROPS,
+            chk(CarrierWire::decode_frozen(raw).status == WireStatus::REJECT_BAD_DROPS,
                 "a decoded credit map with no cut descriptor -> REJECT_BAD_DROPS");
         }
         // v0x02 cannot express a credit map, and says so instead of dropping it
@@ -1130,8 +1148,9 @@ inline SelfCheck selfcheck() {
             chk(v3b.back() == 0x00, who + ": drops trailer = 0");
         }
         // (iii) the default encode() emits the CURRENT version.
-        chk(CarrierWire::encode(fixture_a()) == CarrierWire::encode_version(fixture_a(), kFrozenVersionV3),
-            "encode() == encode_version(., 0x03)");
+        chk(CarrierWire::encode(fixture_a()) ==
+                CarrierWire::encode_version(fixture_a(), W3_WIRE_VERSION),
+            "encode() == encode_version(., W3_WIRE_VERSION)");
         // (iv) bid <-> hex is an exact round trip, and only 64 hex chars parse.
         const bytes32 bid = detail::pat(0x5a);
         chk(cut_bid_bytes(cut_bid_hex(bid)) == std::optional<bytes32>(bid),

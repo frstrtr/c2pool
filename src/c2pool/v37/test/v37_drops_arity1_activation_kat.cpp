@@ -1,7 +1,7 @@
 // v37_drops_arity1_activation_kat.cpp
 //
 // DROPS ACTIVATION AT ARITY 1 — the gate-ON owed_digest the DECOUPLED fleet
-// actually reproduces, minted and pinned BESIDE the arity-2 golden 984c7753…
+// actually reproduces, minted and pinned BESIDE the arity-2 golden 5e653e4b…
 // (which this KAT also re-derives and proves UNMOVED).
 //
 // ★ WHY A SECOND GOLDEN EXISTS AT ALL
@@ -17,19 +17,19 @@
 //   win_version stay 0. DROPS is ON; the V37.1 native ridge and the win law are
 //   OFF and remain their own, separately ruled flag day.
 //
-//   The already-pinned activation mint 984c7753… was composed over the
+//   The already-pinned activation mint 5e653e4b… was composed over the
 //   TWO-argument geometry for_version(1, LaneKind) with the ridge ACTIVE at
 //   position 4096. The ridge moves the lane's payout map, so it moves E_b, so it
 //   moves owed_digest: the arity-2 arms of v37_drops_activation_kat measure
-//   exactly that (its A0 ridge-OFF control lands on 9cfaf97d… while its A1
-//   ridge-ON control lands on 87c5249a…, same schedule, same harvest).
-//   Therefore 984c7753… is NOT the number a decoupled fleet converges on.
+//   exactly that (its A0 ridge-OFF control lands on 6cf1127c… while its A1
+//   ridge-ON control lands on 5d42f290…, same schedule, same harvest).
+//   Therefore 5e653e4b… is NOT the number a decoupled fleet converges on.
 //   v37_node_lane_activation.hpp says so in prose. This KAT supplies the number.
 //
-//   ★ THIS IS AN ADDITION, NOT A REPLACEMENT. 984c7753… keeps its job — it pins
+//   ★ THIS IS AN ADDITION, NOT A REPLACEMENT. 5e653e4b… keeps its job — it pins
 //   the CANON ACTIVATION SCHEDULE and the replace-not-add composition rule under
 //   the ridge — and cases A2-UNMOVED / A2-FOLD-UNMOVED below re-derive it and
-//   its all-lanes fold b03abb1f… from THIS file's own fixture copy. If either
+//   its all-lanes fold 1b853a05… from THIS file's own fixture copy. If either
 //   moved, this KAT fails. Neither golden may be edited without the other.
 //
 // WHAT IS MINTED HERE
@@ -43,35 +43,35 @@
 //   ★ THE FIXTURE COPY IS PINNED, NOT TRUSTED. This file is standalone and
 //   carries its own copy of the schedule, the harvest, the enrolment book and
 //   the from-spec credit rule. A copy that had drifted from the original could
-//   not reproduce 984c7753… / b03abb1f… on the arity-2 arms — which it does, in
+//   not reproduce 5e653e4b… / 1b853a05… on the arity-2 arms — which it does, in
 //   the same run, from the same helpers. That is what makes the arity-1 number
 //   below a mint of the SAME fixture and not of a lookalike.
 //
 //   ARMS (each driven on all four ratified lanes)
-//     B0  arity-1 geometry, drops OFF, harvest present -> 9cfaf97d… (control)
-//     B1  arity-1 geometry, drops ON,  harvest EMPTY   -> 9cfaf97d… (dormant)
+//     B0  arity-1 geometry, drops OFF, harvest present -> 6cf1127c… (control)
+//     B1  arity-1 geometry, drops ON,  harvest EMPTY   -> 6cf1127c… (dormant)
 //     B2  arity-1 geometry, drops ON,  harvest present -> ★ THE ARITY-1 GOLDEN
-//     B3  arity-1 geometry, drops ON,  K = 2           -> 9cfaf97d… (K >= 3)
-//     B4  arity-1 geometry, drops ON,  J < K harvest   -> 9cfaf97d… (no fallback)
-//     C0  arity-2 geometry, ridge OFF, drops OFF       -> 9cfaf97d…
-//     C1  arity-2 geometry, ridge ON,  drops OFF       -> 87c5249a…
-//     C2  arity-2 geometry, ridge ON,  drops ON        -> 984c7753… (UNMOVED)
+//     B3  arity-1 geometry, drops ON,  K = 2           -> 6cf1127c… (K >= 3)
+//     B4  arity-1 geometry, drops ON,  J < K harvest   -> 6cf1127c… (no fallback)
+//     C0  arity-2 geometry, ridge OFF, drops OFF       -> 6cf1127c…
+//     C1  arity-2 geometry, ridge ON,  drops OFF       -> 5d42f290…
+//     C2  arity-2 geometry, ridge ON,  drops ON        -> 5e653e4b… (UNMOVED)
 //
 //   ★ THE NUMBERS THIS FILE MINTS, for an operator to quote
 //     arity-1 gate-ON owed_digest (all four ratified lanes, identical)
-//       ae44add291dbe90aec581825a3e60ce8fd7bbc7194bc767e096da12669d8614f
+//       cd8f3dddf3f39aef786a82b54d1569c77eb567aaf65f4448f9d9557468d9ab67
 //     arity-1 all-lanes fold, sha256d("V37DROPS1" || BTC || LTC || DASH || DOGE)
-//       50b5d7d109a1ae5429f4be91c54fba62c031449e01509d1ce9295a0a79af8646
+//       64d357d5be6d83a7178318c13468eb99c7af88e2b82b25671a4b023fb8701965
 //     arity-1 gate-OFF anchor (same schedule, DROPS off)
-//       9cfaf97de7c58a7727ff5cc1203f445fc301559fb702938a3dd61ad32d6b338e
-//   and the numbers it proves UNMOVED: 984c7753… / b03abb1f… (arity 2),
-//   87c5249a… (V37.1 ridge), 9cfaf97d… (pre-V37.1), b4db1ded… (empty ledger).
+//       6cf1127ca68d6f0b5879fb2d896738fd3c54ccdf98772ff0206c95de4eaabf71
+//   and the numbers it proves UNMOVED: 5e653e4b… / 1b853a05… (arity 2),
+//   5d42f290… (V37.1 ridge), 6cf1127c… (pre-V37.1), 66078202… (empty ledger).
 //
-//   ★ THE GATE-OFF ANCHOR AT ARITY 1 IS 9cfaf97d…, NOT 87c5249a…. That is the
+//   ★ THE GATE-OFF ANCHOR AT ARITY 1 IS 6cf1127c…, NOT 5d42f290…. That is the
 //   whole content of the decoupling: with the ridge OFF the schedule's gate-OFF
 //   value is the pre-V37.1 control. B0/B1/B3/B4 are the anchors-unmoved proof at
 //   arity 1 and they are NON-VACUOUS — the identical harvest that leaves them at
-//   9cfaf97d… moves B2.
+//   6cf1127c… moves B2.
 //
 // THREE INDEPENDENT REPRODUCTIONS OF THE ARITY-1 GOLDEN, on every lane
 //   (1) THE ENGINE SEAM        OwedLedger::on_block_found_with_drops() /
@@ -158,7 +158,7 @@ using ::v37::u64;
 // four ratified lanes are literally the same parameter set. Case
 // ARITY1-LANE-INDEP says exactly that rather than dressing it up as a finding.
 static const char* GOLDEN_DROPS_ON_ARITY1 =
-    "ae44add291dbe90aec581825a3e60ce8fd7bbc7194bc767e096da12669d8614f";
+    "cd8f3dddf3f39aef786a82b54d1569c77eb567aaf65f4448f9d9557468d9ab67";
 // The fold of the four arity-1 gate-ON digests in ratified LaneKind order
 // (BTC, LTC, DASH, DOGE), under the SAME domain-separated construction the
 // arity-2 fold uses: sha256d("V37DROPS1" || d0..d3). The tag separates the FOLD
@@ -166,16 +166,16 @@ static const char* GOLDEN_DROPS_ON_ARITY1 =
 // digests go into it, and the two folds are different numbers because their
 // inputs are.
 static const char* GOLDEN_DROPS_ON_ARITY1_COMBINED =
-    "50b5d7d109a1ae5429f4be91c54fba62c031449e01509d1ce9295a0a79af8646";
+    "64d357d5be6d83a7178318c13468eb99c7af88e2b82b25671a4b023fb8701965";
 
 // ── the ARITY-2 golden, which this KAT proves UNMOVED ─────────────────────
 // src/c2pool/v37/test/v37_drops_activation_kat.cpp. Minted over
 // for_version(1, LaneKind) with the ridge ACTIVE at 4096. NOT the fleet value at
 // arity 1; it pins the canon activation schedule and the composition rule.
 static const char* GOLDEN_DROPS_ON_ARITY2 =
-    "984c7753ab352255933fb63da524b93eecc916b07cc77d94b454213922f719ce";
+    "5e653e4b2f547760cb8e41df83d1f8a33de69db114ce50bb49a33e6f152b695f";
 static const char* GOLDEN_DROPS_ON_ARITY2_COMBINED =
-    "b03abb1f5798ab199febc4977b4af31e624f5aab0d84e41e60310d344586bd19";
+    "1b853a05cd976da58b46b8b15a9518fca2772491d28e4c03a3e20959d1540793";
 // The two superseded DROPS mints, kept as NEGATIVE assertions on both arities.
 static const char* SUPERSEDED_RAW_UNENROLLED_GOLDEN =
     "d85dff58ce7734e5ff414be29f116fbc257ada5cd87ee3d95e2ffe40f554ff78";
@@ -187,14 +187,14 @@ static const char* SUPERSEDED_ADDITIVE_GOLDEN =
 // is the drops-OFF anchor; at arity 1 it is not reachable at all, because the
 // ridge is OFF.
 static const char* ANCHOR_RIDGE_ON =
-    "87c5249ac2057d0ac6707127c59cdc605acec4ba3c0d4b4b25e9b53692eb71ee";
+    "5d42f29090a1ec8cdda5d2289f8ee6002b0e59e554a7b93008a155e1342fb839";
 // The pre-V37.1 control over the identical schedule (ridge inactive). ★ THIS is
 // the gate-OFF anchor at ARITY 1.
 static const char* ANCHOR_RIDGE_OFF =
-    "9cfaf97de7c58a7727ff5cc1203f445fc301559fb702938a3dd61ad32d6b338e";
-// The empty-ledger anchor, sha256d("V37O").
+    "6cf1127ca68d6f0b5879fb2d896738fd3c54ccdf98772ff0206c95de4eaabf71";
+// The empty-ledger anchor, sha256d("V37Q").
 static const char* ANCHOR_OWED_EMPTY =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 
 // ── the pinned schedule (identical to the arity-2 DROPS mint) ─────────────
 static constexpr std::uint64_t SEED           = 0x5EED4096ull;
@@ -397,7 +397,7 @@ static LaneParams geom_arity1(LaneKind lane) {
         return LaneParams::for_version(SHIPPED_CONSENSUS_VERSION);
     }
 }
-// ARITY 2 — the geometry 984c7753… was minted over. `ridge` picks the ON arm
+// ARITY 2 — the geometry 5e653e4b… was minted over. `ridge` picks the ON arm
 // (positions at 4096) or the OFF control (both positions UINT64_MAX), exactly as
 // the arity-2 KAT's drive() does.
 static LaneParams geom_arity2(LaneKind lane, bool ridge) {
@@ -671,7 +671,7 @@ int main() {
         settle::OwedLedger e(7);
         std::printf("   empty owed_digest = %s\n", hex(e.owed_digest()).c_str());
         check(hex(e.owed_digest()) == ANCHOR_OWED_EMPTY,
-              "empty ledger owed_digest == sha256d(\"V37O\") == b4db1ded…");
+              "empty ledger owed_digest == sha256d(\"V37Q\") == 66078202…");
         check(e.ledger_seq() == 0, "a fresh ledger is at seq 0");
     }
 
@@ -695,7 +695,7 @@ int main() {
     }
 
     // ── ARITY1-ANCHORS: the gate-OFF anchors at arity 1 ──────────────────
-    std::printf("\n-- ARITY1-ANCHORS: at arity 1 the gate-OFF anchor is 9cfaf97d… --\n");
+    std::printf("\n-- ARITY1-ANCHORS: at arity 1 the gate-OFF anchor is 6cf1127c… --\n");
     std::printf("   B0 arity-1, drops OFF                 = %s\n", hex(b0[0].owed).c_str());
     std::printf("   B1 arity-1, drops ON, harvest EMPTY   = %s\n", hex(b1[0].owed).c_str());
     std::printf("   B3 arity-1, drops ON, K = 2           = %s\n", hex(b3[0].owed).c_str());
@@ -703,7 +703,7 @@ int main() {
     for (int i = 0; i < 4; ++i) {
         check(hex(b0[i].owed) == ANCHOR_RIDGE_OFF,
               "★ B0: the arity-1 geometry with DROPS OFF reproduces the pre-V37.1 "
-              "control 9cfaf97d… — the ridge really is inert at this arity");
+              "control 6cf1127c… — the ridge really is inert at this arity");
         check(hex(b1[i].owed) == ANCHOR_RIDGE_OFF,
               "B1 (DORMANT): the gate is ON but nothing is harvested, so the "
               "arity-1 anchor does not move");
@@ -716,7 +716,7 @@ int main() {
         check(b3[i].est_total[3] == 0, "B3 credits nothing at the seam (K guard)");
         check(b4[i].est_total[3] == 0, "B4 credits nothing at the seam (J < K)");
         check(hex(b0[i].owed) != ANCHOR_RIDGE_ON,
-              "★ and the arity-1 anchor is NOT the ridge anchor 87c5249a… — a "
+              "★ and the arity-1 anchor is NOT the ridge anchor 5d42f290… — a "
               "decoupled node lands on a different gate-OFF value than a coupled "
               "one, which is exactly why this second golden has to exist");
     }
@@ -775,7 +775,7 @@ int main() {
     }
 
     // ── A2-UNMOVED: the arity-2 golden is exactly where it was ───────────
-    std::printf("\n-- A2-UNMOVED: 984c7753… is NOT moved, replaced or re-minted --\n");
+    std::printf("\n-- A2-UNMOVED: 5e653e4b… is NOT moved, replaced or re-minted --\n");
     for (int i = 0; i < 4; ++i)
         std::printf("   %-4s arity2_gate_on_owed_digest = %s\n",
                     LN[i], hex(c2[i].owed).c_str());
@@ -783,21 +783,21 @@ int main() {
     std::printf("   arity-2 combined (BTC|LTC|DASH|DOGE) = %s\n", hex32(comb2).c_str());
     for (int i = 0; i < 4; ++i) {
         check(hex(c2[i].owed) == GOLDEN_DROPS_ON_ARITY2,
-              "★ the arity-2 gate-ON golden 984c7753… still reproduces, from THIS "
+              "★ the arity-2 gate-ON golden 5e653e4b… still reproduces, from THIS "
               "file's own copy of the schedule and harvest — which is also what "
               "proves the copy has not drifted");
         check(hex(c1[i].owed) == ANCHOR_RIDGE_ON,
-              "the V37.1 ridge anchor 87c5249a… is byte-identical (arity-2, "
+              "the V37.1 ridge anchor 5d42f290… is byte-identical (arity-2, "
               "drops OFF, harvest present)");
         check(hex(c0[i].owed) == ANCHOR_RIDGE_OFF,
-              "the pre-V37.1 control 9cfaf97d… is byte-identical (arity-2 "
+              "the pre-V37.1 control 6cf1127c… is byte-identical (arity-2 "
               "geometry, ridge OFF)");
         check(hex32(c2[i].shadow) == hex(c2[i].owed) && c2[i].spec_agrees &&
               hex32(c2[i].spec) == hex(c2[i].owed),
               "and the arity-2 value survives the same three-way reproduction");
     }
     check(hex32(comb2) == GOLDEN_DROPS_ON_ARITY2_COMBINED,
-          "★ the arity-2 all-lanes fold b03abb1f… is unmoved");
+          "★ the arity-2 all-lanes fold 1b853a05… is unmoved");
 
     // ── ARITY-COST: the two goldens are different, and by how much ───────
     std::printf("\n-- ARITY-COST: the decoupling has a number, not a caveat --\n");

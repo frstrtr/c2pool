@@ -1014,7 +1014,7 @@ if (BUILD_TESTING)
     # activation commit but carries NO add_executable at all, and the CI
     # drift-guard tools/ci/check_test_target_allowlist.py audits TARGETS against
     # the build.yml allowlist, not SOURCES — so it never saw the file, and the
-    # 87c5249a... ridge golden (the anchor every later consensus golden, the
+    # 5d42f290... ridge golden (the anchor every later consensus golden, the
     # DROPS mint below included, is built on top of) has been UNENFORCED in CI
     # since the flip. Registered here. It drives the pinned 9000-push activation
     # schedule through the REAL Lane and OwedLedger on all four ratified lanes and
@@ -1040,7 +1040,7 @@ if (BUILD_TESTING)
     # seam OwedLedger::on_block_found_with_estimator(). Pins:
     #   (a) the canon already declares the gate ON for every lane under the
     #       corrected sybil-neutral Hhat_comb;
-    #   (b) the gate-OFF anchors b4db1ded... / 9cfaf97d... / 87c5249a... are
+    #   (b) the gate-OFF anchors 66078202... / 6cf1127c... / 5d42f290... are
     #       byte-identical with the harvest PRESENT and the gate off, and stay
     #       there under the K >= 3 and J >= K refusals (non-vacuous: the SAME
     #       harvest moves the ON arm);
@@ -1134,27 +1134,27 @@ if (BUILD_TESTING)
     # is LaneParams::for_version(1) — the ONE-argument factory, which names no
     # parent LaneKind and therefore carries NO ridge and NO window dimensions
     # (mrr / nr / win positions all UINT64_MAX, nr_version and win_version 0).
-    # The activation mint 984c7753... above was composed over for_version(1,
+    # The activation mint 5e653e4b... above was composed over for_version(1,
     # LaneKind) with the ridge ACTIVE at 4096, and the ridge moves the lane's
-    # payout map, hence E_b, hence owed_digest. So 984c7753... is NOT the fleet
+    # payout map, hence E_b, hence owed_digest. So 5e653e4b... is NOT the fleet
     # value at arity 1. The header says that in prose; this KAT supplies the
     # number and pins it:
     #   arity-1 gate-ON owed_digest (identical on all four ratified lanes)
-    #     ae44add291dbe90aec581825a3e60ce8fd7bbc7194bc767e096da12669d8614f
+    #     cd8f3dddf3f39aef786a82b54d1569c77eb567aaf65f4448f9d9557468d9ab67
     #   arity-1 all-lanes fold, sha256d("V37DROPS1" || BTC || LTC || DASH || DOGE)
-    #     50b5d7d109a1ae5429f4be91c54fba62c031449e01509d1ce9295a0a79af8646
+    #     64d357d5be6d83a7178318c13468eb99c7af88e2b82b25671a4b023fb8701965
     #
-    # ★ ADD-ONLY. 984c7753... and its fold b03abb1f... are NOT moved, replaced or
+    # ★ ADD-ONLY. 5e653e4b... and its fold 1b853a05... are NOT moved, replaced or
     # re-minted: case A2-UNMOVED re-derives BOTH from this file's own copy of the
     # schedule and harvest (which is also what proves the copy has not drifted),
-    # and the gate-OFF anchors b4db1ded... / 9cfaf97d... / 87c5249a... are
+    # and the gate-OFF anchors 66078202... / 6cf1127c... / 5d42f290... are
     # asserted byte-identical. Neither golden may be edited without the other.
     #
     # ALSO PINS:
-    #   - the arity-1 gate-OFF anchor is 9cfaf97d... (the PRE-V37.1 control), not
-    #     87c5249a... — that difference IS the decoupling, and the arms are
+    #   - the arity-1 gate-OFF anchor is 6cf1127c... (the PRE-V37.1 control), not
+    #     5d42f290... — that difference IS the decoupling, and the arms are
     #     non-vacuous: the same harvest that leaves drops-OFF / harvest-EMPTY /
-    #     K = 2 / J < K at 9cfaf97d... moves the ON arm;
+    #     K = 2 / J < K at 6cf1127c... moves the ON arm;
     #   - W4 RATIFIES the arity-1 geometry, without which the flip would refuse
     #     every E_b fold and DROPS would be dormant for a second, quieter reason;
     #   - THREE independent reproductions of the arity-1 value on every lane: the

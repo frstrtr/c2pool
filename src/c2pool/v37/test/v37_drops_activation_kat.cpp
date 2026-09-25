@@ -63,12 +63,12 @@
 //   on which a sybil-split argument means anything.
 //
 //   ARMS (each driven on all four ratified lanes)
-//     A0  ridge OFF, drops OFF, harvest present -> 9cfaf97d… (pre-V37.1 control)
-//     A1  ridge ON,  drops OFF, harvest present -> 87c5249a… (V37.1 ANCHOR)
-//     A2  ridge ON,  drops ON,  harvest EMPTY   -> 87c5249a… (the gate is dormant)
+//     A0  ridge OFF, drops OFF, harvest present -> 6cf1127c… (pre-V37.1 control)
+//     A1  ridge ON,  drops OFF, harvest present -> 5d42f290… (V37.1 ANCHOR)
+//     A2  ridge ON,  drops ON,  harvest EMPTY   -> 5d42f290… (the gate is dormant)
 //     A3  ridge ON,  drops ON,  harvest present -> THE NEW GATE-ON GOLDEN
-//     A4  ridge ON,  drops ON with K = 2        -> 87c5249a… (the K >= 3 guard)
-//     A5  ridge ON,  drops ON, J < K harvest    -> 87c5249a… (J < K credits 0)
+//     A4  ridge ON,  drops ON with K = 2        -> 5d42f290… (the K >= 3 guard)
+//     A5  ridge ON,  drops ON, J < K harvest    -> 5d42f290… (J < K credits 0)
 //
 //   A1, A2, A4 and A5 are the gate-OFF-anchors-unmoved proof, and they are
 //   NON-VACUOUS: the identical harvest that leaves them at the anchor moves A3.
@@ -174,7 +174,7 @@ using ::v37::u64;
 // composition and double-counted a share-covered payee (DROPS-R2). A node that
 // carries the replace-not-add fix must NEVER reproduce that value.
 static const char* GOLDEN_DROPS_ON =
-    "984c7753ab352255933fb63da524b93eecc916b07cc77d94b454213922f719ce";
+    "5e653e4b2f547760cb8e41df83d1f8a33de69db114ce50bb49a33e6f152b695f";
 // The superseded value, kept ONLY as a negative assertion: the KAT proves the
 // corrected mint is not it.
 // ★ ALSO SUPERSEDED: d85dff58…, the replace-not-add mint. It was composed in
@@ -190,17 +190,17 @@ static const char* SUPERSEDED_ADDITIVE_GOLDEN =
 // (BTC, LTC, DASH, DOGE), domain-separated: sha256d("V37DROPS1" || d0..d3).
 // One number an operator can quote for "the activation, all lanes".
 static const char* GOLDEN_DROPS_ON_COMBINED =
-    "b03abb1f5798ab199febc4977b4af31e624f5aab0d84e41e60310d344586bd19";
+    "1b853a05cd976da58b46b8b15a9518fca2772491d28e4c03a3e20959d1540793";
 // ── the anchors that MUST NOT move ────────────────────────────────────────
 // V37.1 gate-ON ridge golden (src/c2pool/v37/test/v37_1_ridge_activation_test.cpp).
 static const char* ANCHOR_RIDGE_ON =
-    "87c5249ac2057d0ac6707127c59cdc605acec4ba3c0d4b4b25e9b53692eb71ee";
+    "5d42f29090a1ec8cdda5d2289f8ee6002b0e59e554a7b93008a155e1342fb839";
 // The pre-V37.1 control over the identical schedule (ridge inactive).
 static const char* ANCHOR_RIDGE_OFF =
-    "9cfaf97de7c58a7727ff5cc1203f445fc301559fb702938a3dd61ad32d6b338e";
-// The empty-ledger anchor, sha256d("V37O").
+    "6cf1127ca68d6f0b5879fb2d896738fd3c54ccdf98772ff0206c95de4eaabf71";
+// The empty-ledger anchor, sha256d("V37Q").
 static const char* ANCHOR_OWED_EMPTY =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 
 // ── the pinned schedule (identical to the V37.1 ridge activation KAT) ─────
 static constexpr std::uint64_t SEED           = 0x5EED4096ull;
@@ -629,7 +629,7 @@ int main() {
         settle::OwedLedger e(7);
         std::printf("   empty owed_digest        = %s\n", hex(e.owed_digest()).c_str());
         check(hex(e.owed_digest()) == ANCHOR_OWED_EMPTY,
-              "empty ledger owed_digest == sha256d(\"V37O\") == b4db1ded…");
+              "empty ledger owed_digest == sha256d(\"V37Q\") == 66078202…");
         check(e.ledger_seq() == 0, "a fresh ledger is at seq 0");
     }
 
@@ -657,9 +657,9 @@ int main() {
     std::printf("   A5 ridge ON,  drops ON, J < K          = %s\n", hex(a5[0].owed).c_str());
     for (int i = 0; i < 4; ++i) {
         check(hex(a0[i].owed) == ANCHOR_RIDGE_OFF,
-              "A0 reproduces the pre-V37.1 control 9cfaf97d… on this lane");
+              "A0 reproduces the pre-V37.1 control 6cf1127c… on this lane");
         check(hex(a1[i].owed) == ANCHOR_RIDGE_ON,
-              "A1 reproduces the V37.1 ridge anchor 87c5249a… on this lane — the "
+              "A1 reproduces the V37.1 ridge anchor 5d42f290… on this lane — the "
               "harvest is present and the OFF gate admits none of it");
         check(hex(a2[i].owed) == ANCHOR_RIDGE_ON,
               "A2 (DORMANT): the canon gate is ON but nothing is harvested");

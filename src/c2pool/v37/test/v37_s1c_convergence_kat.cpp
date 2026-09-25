@@ -500,11 +500,14 @@ int main() {
         const auto v2 = CarrierWire::encode_version(bare, 0x02);
         check(v2.size() == v1.size() + 1 && v2[0] == 0x02 && v2.back() == 0x00,
               "8a won_block = 0 costs exactly one byte over the frozen v0x01 frame");
-        // DROPS-R3: the build now EMITS v0x03, which is the v0x02 frame plus one
-        // more absent-trailer byte when there is no credit map to carry.
-        const auto v3 = CarrierWire::encode(bare);
+        // DROPS-R3: v0x03 is the v0x02 frame plus one more absent-trailer byte
+        // when there is no credit map to carry. The build EMITS it only under the
+        // consensus flip; with the flip at 0 it emits v0x02, as master does.
+        const auto v3 = CarrierWire::encode_version(bare, 0x03);
         check(v3.size() == v2.size() + 1 && v3[0] == 0x03 && v3.back() == 0x00,
               "8a2 an absent DROPS credit map costs exactly one more byte");
+        check(CarrierWire::encode(bare) == (::c2pool::v37n::W3_WIRE_V3_LIVE ? v3 : v2),
+              "8a3 the build emits v0x03 iff it takes the flip (flip at 0 -> v0x02, master)");
         Carrier withcut = bare;
         withcut.cut = descriptor_of_win(kWonBid, 1, EbCut{}, false, ::v37::bytes32{});
         const auto vc = CarrierWire::encode_version(withcut, 0x02);
@@ -629,12 +632,18 @@ int main() {
         for (const auto& [k, v] : won.cut.drops_delta) dc.credit.emplace_back(k, v);
         dc.enrollment_digest = won.cut.enrollment_digest;
 
-        // a REAL v0x03 frame, encode -> decode, not a struct copy
+        // a REAL v0x03 frame, encode -> decode, not a struct copy. This case is
+        // a FLIPPED fleet (gate-ON params), so it drives the frozen v0x03 codec
+        // explicitly; the live decoder of a flip-0 build refuses the frame.
         Carrier frame = wire_freeze::fixture_a();
         frame.cut   = cd;
         frame.drops = dc;
-        const std::vector<std::uint8_t> wire = CarrierWire::encode(frame);
-        const DecodeResult dr = CarrierWire::decode(wire);
+        const std::vector<std::uint8_t> wire =
+            CarrierWire::encode_version(frame, ::c2pool::v37n::W3_WIRE_VERSION_V3);
+        check(::c2pool::v37n::W3_WIRE_V3_LIVE ||
+                  CarrierWire::decode(wire).status == WireStatus::REJECT_BAD_VERSION,
+              "9g0 flip at 0: the live decoder refuses a v0x03 credit map (master)");
+        const DecodeResult dr = CarrierWire::decode_frozen(wire);
         check(dr.status == WireStatus::OK && dr.carrier.drops.has_value(),
               "9g the credit map rides a REAL v0x03 carrier frame");
         check(dr.carrier.drops.has_value() && *dr.carrier.drops == dc,

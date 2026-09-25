@@ -140,6 +140,7 @@
 #include "frame_vault.hpp"    // the unified bounded frame store (pos + hash indices)
 #include "w2_admission.hpp"   // ReceiptAdmitter, WorkEvent, W2_R_MAX, ...
 #include "w2_receipt.hpp"
+#include "v37_node_lane_activation.hpp"   // kActivateConsensusV1 (v0x03 rides the flip)
 
 namespace c2pool::v37n {
 
@@ -151,10 +152,22 @@ constexpr std::uint8_t W3_WIRE_VERSION_V1 = 0x01;   // frozen; bytes never move
 constexpr std::uint8_t W3_WIRE_VERSION_V2 = 0x02;   // frozen; v1 body + cut trailer
 constexpr std::uint8_t W3_WIRE_VERSION_V3 = 0x03;   // frozen; v2 frame + DROPS trailer
 
-// The version this build EMITS. Decode multi-accepts {V1, V2, V3} for the
-// upgrade window (F-5); an older peer rejects a newer frame outright at decode —
-// the flag day is LOUD, never a silently half-relayed descriptor.
-constexpr std::uint8_t W3_WIRE_VERSION = W3_WIRE_VERSION_V3;
+// DROPS-R3: v0x03 exists only to carry the composed DROPS credit map, and a
+// credit map exists only under the consensus flip. So v0x03 is LIVE (emitted,
+// and accepted by the live decoder) only when this build takes
+// V37_ACTIVATE_CONSENSUS_V1. With the flip at 0 (the shipped default) the node
+// emits v0x02 and its live decoder accepts exactly {V1, V2}, byte for byte what
+// master does: a v0x03 frame is REJECT_BAD_VERSION, so a peer's credit map can
+// never reach this node's ledger while the flip is 0. The v0x03 CODEC is
+// frozen either way (encode_version / decode_frozen, pinned by the freeze KAT).
+constexpr bool W3_WIRE_V3_LIVE = ::c2pool::v37n::kActivateConsensusV1;
+
+// The version this build EMITS. The live decoder multi-accepts {V1, V2} (and
+// V3 when W3_WIRE_V3_LIVE) for the upgrade window (F-5); an older peer rejects
+// a newer frame outright at decode — the flag day is LOUD, never a silently
+// half-relayed descriptor.
+constexpr std::uint8_t W3_WIRE_VERSION =
+    W3_WIRE_V3_LIVE ? W3_WIRE_VERSION_V3 : W3_WIRE_VERSION_V2;
 
 // ★★ DROPS-R3: the bound on the composed credit map a winner may carry. The map
 // is the ONE part of a DROPS settlement a receiver cannot recompute (a raindrop
@@ -360,14 +373,25 @@ public:
     //         on the carrier itself is fatal);
     //       * receipt mis-bound  => that receipt dropped, carrier STANDS
     //         (a mis-bound receipt is never a fork tool, and is never relayed on).
+    //
+    // decode() is the LIVE decoder: it accepts v0x03 only when W3_WIRE_V3_LIVE
+    // (the consensus flip). decode_frozen() is the codec seam over EVERY frozen
+    // layout {0x01, 0x02, 0x03}, what the byte freeze pins regardless of the flip.
     static DecodeResult decode(const std::vector<std::uint8_t>& b) {
+        return decode_at(b, W3_WIRE_V3_LIVE);
+    }
+    static DecodeResult decode_frozen(const std::vector<std::uint8_t>& b) {
+        return decode_at(b, /*accept_v3=*/true);
+    }
+    static DecodeResult decode_at(const std::vector<std::uint8_t>& b, bool accept_v3) {
         DecodeResult out;
         std::size_t p = 0;
         std::uint8_t ver = 0;
         if (!get_u8(b, p, ver)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
-        // F-5 multi-accept for the upgrade window: {0x01, 0x02, 0x03}.
+        // F-5 multi-accept for the upgrade window: {0x01, 0x02} (+ 0x03 when
+        // accept_v3; the live decoder passes W3_WIRE_V3_LIVE).
         if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2 &&
-            ver != W3_WIRE_VERSION_V3) {
+            !(accept_v3 && ver == W3_WIRE_VERSION_V3)) {
             out.status = WireStatus::REJECT_BAD_VERSION;
             return out;
         }

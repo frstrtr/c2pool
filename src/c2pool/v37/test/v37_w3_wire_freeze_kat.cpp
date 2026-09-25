@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -147,16 +148,47 @@ int main() {
     // (2) Version tag is the first byte; the v0x01 frame carries 0x01, and this
     //     build's DEFAULT encode() carries the current frozen version 0x02.
     CHECK(!bytes.empty() && bytes[0] == 0x01);
-    CHECK(W3_WIRE_VERSION == 0x03 && W3_WIRE_VERSION_V1 == 0x01 &&
-          W3_WIRE_VERSION_V2 == 0x02 && W3_WIRE_VERSION_V3 == 0x03);
+    CHECK(W3_WIRE_VERSION_V1 == 0x01 && W3_WIRE_VERSION_V2 == 0x02 &&
+          W3_WIRE_VERSION_V3 == 0x03);
     {
         const auto now = CarrierWire::encode(c);
         CHECK(!now.empty() && now[0] == W3_WIRE_VERSION);
-        // v0x03 with nothing to say == the v0x01 frame + version bump + 2 bytes
-        // (one absent cut descriptor, one absent DROPS credit map).
-        CHECK(now.size() == bytes.size() + 2 && now.back() == 0x00);
         const auto v2 = CarrierWire::encode_version(c, 0x02);
         CHECK(v2.size() == bytes.size() + 1 && v2.back() == 0x00);
+        // v0x03 with nothing to say == the v0x01 frame + version bump + 2 bytes
+        // (one absent cut descriptor, one absent DROPS credit map).
+        const auto v3 = CarrierWire::encode_version(c, 0x03);
+        CHECK(v3.size() == bytes.size() + 2 && v3.back() == 0x00);
+
+        // (2b) LIVE-V3-GATE. v0x03 rides the consensus flip. With the flip at 0
+        //      (the shipped default) this build must be master on the wire, byte
+        //      for byte: it EMITS v0x02, its live decoder REFUSES a v0x03 frame
+        //      (REJECT_BAD_VERSION, exactly as master's does), and the live
+        //      accept set is {0x01, 0x02}. So a flipped peer's DROPS credit map
+        //      can never reach a gate-OFF ledger. The v0x03 CODEC stays frozen
+        //      either way (decode_frozen). Under the flip, v0x03 is live.
+        const auto h3 = CarrierWire::encode_version(wire_freeze::fixture_h(), 0x03);
+        CHECK(!h3.empty());
+        CHECK(CarrierWire::decode_frozen(v3).status == WireStatus::OK);
+        CHECK(CarrierWire::decode_frozen(h3).status == WireStatus::OK);
+        if constexpr (!kActivateConsensusV1) {
+            CHECK(W3_WIRE_VERSION == 0x02);
+            CHECK(now == v2);
+            CHECK(CarrierWire::decode(v3).status == WireStatus::REJECT_BAD_VERSION);
+            CHECK(CarrierWire::decode(h3).status == WireStatus::REJECT_BAD_VERSION);
+            CHECK(!wire_freeze::version_accepted(0x03));
+            CHECK(std::size(wire_freeze::kAcceptedVersions) == 2);
+        } else {
+            CHECK(W3_WIRE_VERSION == 0x03);
+            CHECK(now == v3);
+            CHECK(CarrierWire::decode(v3).status == WireStatus::OK);
+            CHECK(CarrierWire::decode(h3).status == WireStatus::OK);
+            CHECK(wire_freeze::version_accepted(0x03));
+        }
+        std::printf("LIVE-V3-GATE: flip=%d emit=v0x%02x live-decode(v0x03)=%s\n",
+                    kActivateConsensusV1 ? 1 : 0, unsigned(W3_WIRE_VERSION),
+                    CarrierWire::decode(h3).status == WireStatus::OK ? "OK"
+                                                                      : "REJECT_BAD_VERSION");
     }
 
     // (3) Round trip: decode(encode(c)) reconstructs the carrier + receipt and

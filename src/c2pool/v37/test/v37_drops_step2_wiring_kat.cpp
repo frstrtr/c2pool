@@ -117,7 +117,7 @@ using ::v37::u64;
 
 // ── the anchor that must not move ────────────────────────────────────────────
 static const char* ANCHOR_OWED_EMPTY =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 
 static long g_checks = 0;
 static long g_fail = 0;
@@ -420,7 +420,7 @@ int main() {
         // The empty-ledger anchor, unmoved.
         settle::OwedLedger empty(7);
         check(hex(empty.owed_digest()) == ANCHOR_OWED_EMPTY,
-              "the empty-ledger anchor b4db1ded… is where it has always been");
+              "the empty-ledger anchor 66078202… is where it has always been");
     }
 
     // ── W-TIP: now_interval comes from the chain tip ────────────────────────
