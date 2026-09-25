@@ -112,6 +112,7 @@
 #include "xmr/relay/xmr_receipt_mint.hpp"      // share -> PoW-carrying receipt; the structural check
 #include "xmr/relay/xmr_relay_node.hpp"        // TCP relay: HELLO gate, verify worker (RandomX LAST), flood, backfill, repair
 #include "xmr/relay/xmr_receipt_ingest.hpp"    // admitted receipts -> the lane (ordering policy + durable log)
+#include "xmr/xmr_drops_wiring.hpp"            // ★ DROPS: the XMR shell's DropsWiring (flip-gated; DORMANT by default)
 #include "xmr/relay/xmr_relay_native_ctx.hpp"   // RC-CTX: receipt contexts from the native node + the own-template journal
 #include "xmr/relay/xmr_address.hpp"           // login address (base58) -> payee ref
 #include "xmr/relay/xmr_rbind_registry.hpp"    // SEAM-1: per-job rbind (payee + give-author) the template writes
@@ -192,6 +193,7 @@ static bool g_lane_suspended_now = false;                  // R-C rework-2: main
 // --relay-peer the daemon is byte-identical to the stand-in build.
 static std::string   g_relay_listen;                    // --relay-listen HOST:PORT
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
+static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
 static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
@@ -1395,7 +1397,20 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::vector<::v37::ScriptRef> feed_refs;   // XMR_STD refs of the seeded owed keys (the receipt descriptors)
     std::uint64_t feed_off = 0, feed_pushed = 0, feed_rejected = 0;
     std::deque<std::pair<std::chrono::steady_clock::time_point, std::string>> feed_lagq;
-    struct WireCache { c2pool::v37n::CutDescriptor d; bool prefolded = false; Amounts credit; };
+    struct WireCache { c2pool::v37n::CutDescriptor d; bool prefolded = false; Amounts credit;
+                       c2pool::v37n::settle::WorkPrice price{};   // ★ DROPS: the price at the prefolded cut (gate ON only)
+                     };
+    // ★ DROPS: the XMR shell's DropsWiring. nullptr in a default build (flip at 0)
+    // and whenever the lane geometry does not carry the gate: then nothing below
+    // is constructed, attached or priced, and every path is master's. Built and
+    // attached further down, once the native tip is known and before the relay
+    // listens or the stratum binds; declared HERE because the booking lambdas
+    // below capture it. `drops_live` = built AND attached (it needs the receipt
+    // relay: raindrops must be replicated, see xmr_drops_wiring.hpp (4)).
+    std::unique_ptr<c2pool::v37n::xmr::drops::XmrDropsWiring> drops;
+    bool drops_live = false;
+    c2pool::v37n::settle::WorkPrice drops_fold_price{};   // the price of the LAST successful fold_at_cut (gate ON only)
+    std::atomic<std::uint64_t> drops_mint_ok{0}, drops_mint_below_floor{0};
     std::map<std::string, WireCache> wire_cache;   // bid -> the v0x02 descriptor (+ its early fold)
     std::set<std::string> wire_seen;
     std::uint64_t wire_tx = 0, wire_rx = 0, wire_prefold = 0, wire_pending = 0, wire_hit = 0, wire_mismatch = 0, wire_diverged = 0;
@@ -1620,6 +1635,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         std::optional<settle::EbFold> f = settle::fold_eb(reward, *view, /*strict=*/true);
         if (!f) { ++cut_fold_refused; why = "fold_eb REFUSED at the on-chain cut (geometry not ratified)"; return false; }
+        // ★ DROPS-R1: the (reward, SUM weight) pair at THIS cut, through the SAME
+        // view and the SAME project() the fold just read. Gate OFF: not computed.
+        if (drops) drops_fold_price = settle::work_price_at(reward, *view);
         credit.clear();
         for (const auto& [k, v] : f->credit) credit[k] = static_cast<long long>(v);
         if (g_credit_mutate && !credit.empty()) credit.begin()->second += g_credit_mutate;   // the falsifier: a 1-piconero lie must show in owed_digest
@@ -1643,6 +1661,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     };
     fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
         Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
+        if (drops_live) drops->clear_cut_price();   // ★ DROPS: never a neighbour's price
         if (!cba_fx || !cba_scfg) {
             // option B not bound yet (boot window) -> TRANSIENT, never memoized not-lane;
             // option A never binds -> a stranger's block for this node.
@@ -1772,20 +1791,27 @@ static int run_live(const XmrNodeConfig& cfg) {
         // used only when it AGREES with the chain; on mismatch the chain wins; unreconstructable => fail-closed.
         if (!bk.has_credit_cut) { ++cut_absent; why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; ++cba_refused; return false; }
         const char* credit_src = "chain";
+        c2pool::v37n::settle::WorkPrice booking_price{};   // ★ DROPS: the price at the cut E_b comes from
         if (auto wit = wire_cache.find(bid); wit != wire_cache.end()) {
             const auto& d = wit->second.d;
             const bool agree = d.cut_next_pos == bk.credit_cut.next_pos && d.cut_spine_digest == bk.credit_cut.spine_digest &&
                                d.reward == bk.total && d.h_b == h && d.owed_digest_at_win == bk.lane_commitment;
             if (!agree) { ++wire_mismatch; std::printf("ab-RECONCILE: wire descriptor for %s… DISAGREES with the on-chain commitment (wire P=%llu chain P=%llu) -> the CHAIN is the authority\n", bid.substr(0,12).c_str(), (unsigned long long)d.cut_next_pos, (unsigned long long)bk.credit_cut.next_pos); }
-            else if (wit->second.prefolded) { credit = wit->second.credit; ++wire_hit; credit_src = "wire-prefold(agreed)"; }
+            else if (wit->second.prefolded) { credit = wit->second.credit; ++wire_hit; credit_src = "wire-prefold(agreed)"; booking_price = wit->second.price; }
         }
         if (credit_src[0] == 'c') {
             if (!fold_at_cut(bk.total, bk.credit_cut, credit, why, relay_hint(bid))) { if (why.rfind("cut-pending:", 0) != 0) ++cba_refused; return false; }
+            booking_price = drops_fold_price;
         } else {
             // belt-and-braces: the fast path must equal the authority fold whenever the authority is available NOW
             Amounts chk; std::string w2;
-            if (fold_at_cut(bk.total, bk.credit_cut, chk, w2, relay_hint(bid)) && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
+            const bool chk_ok = fold_at_cut(bk.total, bk.credit_cut, chk, w2, relay_hint(bid));
+            if (chk_ok) booking_price = drops_fold_price;
+            if (chk_ok && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
         }
+        // ★ DROPS: hand the node the price at THIS cut; XmrNode::on_network_block_won
+        // (called by FinalizeConnect right after this returns) takes it, one-shot.
+        if (drops_live) drops->set_cut_price(booking_price);
         ++cut_ok;
         ++cba_booked;
         last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " src=" + credit_src + " credit{ " + amounts_str(credit) + "}";
@@ -1857,7 +1883,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (!known) ++wire_diverged;
             c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = d.cut_next_pos; cc.spine_digest = d.cut_spine_digest;
             std::string why;
-            if (fold_at_cut(d.reward, cc, wc.credit, why)) { wc.prefolded = true; ++wire_prefold; } else ++wire_pending;
+            if (fold_at_cut(d.reward, cc, wc.credit, why)) { wc.prefolded = true; ++wire_prefold; if (drops) wc.price = drops_fold_price; } else ++wire_pending;
             wire_cache[bid] = wc;
             std::printf("ab-wire-rx: peer win h=%llu bid=%s… P=%llu reward=%llu owed_at_win %s | prefold=%s%s\n",
                         (unsigned long long)d.h_b, bid.substr(0,12).c_str(), (unsigned long long)d.cut_next_pos, (unsigned long long)d.reward,
@@ -1876,7 +1902,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!known) ++wire_diverged;
         c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = d.cut_next_pos; cc.spine_digest = d.cut_spine_digest;
         std::string why;
-        if (fold_at_cut(d.reward, cc, wc.credit, why, from_pid)) { wc.prefolded = true; ++wire_prefold; } else ++wire_pending;
+        if (fold_at_cut(d.reward, cc, wc.credit, why, from_pid)) { wc.prefolded = true; ++wire_prefold; if (drops) wc.price = drops_fold_price; } else ++wire_pending;
         wire_cache[bid] = wc;
         std::printf("ab-wire-rx: peer win h=%llu bid=%s… P=%llu reward=%llu owed_at_win %s | prefold=%s%s (relay peer %llu)\n",
                     (unsigned long long)d.h_b, bid.substr(0,12).c_str(), (unsigned long long)d.cut_next_pos, (unsigned long long)d.reward,
@@ -2138,11 +2164,33 @@ static int run_live(const XmrNodeConfig& cfg) {
         ::c2pool::xmr::native::tmpl::MonerodArmConfig daemon_arm_cfg;
         daemon_arm_cfg.backlog_refresh_s = cfg.no_good_citizen ? 0 : cfg.native_backlog_refresh_s;
 
+        // ★ DROPS (flip-gated): build the bundle HERE, before the template
+        // provider, because a live bundle changes ONE served number: the stratum
+        // job target drops from share_diff to the raindrop FLOOR, so a miner
+        // hands in its sub-threshold hashes (the raindrops) as well as its shares.
+        // The exact share_diff rule still decides share vs raindrop at the mint
+        // (relay_on_share), and every receipt still binds t_origin = share_diff.
+        // Gate OFF: nullptr, and the provider serves share_diff exactly as master.
+        {
+            const std::uint64_t drops_rw = c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params)
+                                               ? c2pool::v37n::xmr::fee::kFeeReceiptWeight : relay::kReceiptWeight;
+            drops = c2pool::v37n::xmr::drops::XmrDropsWiring::make(cfg.lane_params, cfg.stratum_share_diff, drops_rw);
+        }
+        if (drops && !relay_enabled()) {
+            // Raindrops are node-local observations; the XMR arm composes on EVERY
+            // node from its OWN harvest, so without the relay replicating them a
+            // composed delta would move this node's owed_digest alone. Refuse to
+            // attach rather than fork.
+            std::printf("DROPS: gate ON but NO receipt relay (--relay-listen/--relay-peer) -- raindrops cannot be "
+                        "replicated, so DROPS is NOT attached (dormant: every composition credits zero)\n");
+            drops.reset();
+        }
+        const std::uint64_t served_job_diff = drops ? drops->floor_diff() : cfg.stratum_share_diff;
         std::unique_ptr<o2::XmrSettlementTemplateProvider> provider_owner =
             native ? std::make_unique<o2::XmrSettlementTemplateProvider>(
-                         native->source(), ledger, scfg, cfg.stratum_share_diff, native->pump())
+                         native->source(), ledger, scfg, served_job_diff, native->pump())
                    : std::make_unique<o2::XmrSettlementTemplateProvider>(
-                         transport, ledger, scfg, cfg.stratum_share_diff, daemon_arm_cfg);
+                         transport, ledger, scfg, served_job_diff, daemon_arm_cfg);
         o2::XmrSettlementTemplateProvider& provider = *provider_owner;
 
         // ── the K_fair shape gate, on BOTH arms ─────────────────────────────
@@ -2294,6 +2342,92 @@ static int run_live(const XmrNodeConfig& cfg) {
             relay_native_src.id_at    = chain_src.id_at;
             relay_native_src.seed_for = chain_src.seed_for;
         }
+        // ══ ★ DROPS — THE XMR LIVE WIRING (flip-gated; DORMANT by default) ══
+        // The twin of main_v37_btc_dash.cpp's Step-2 block. XmrNode has carried
+        // the four T3 seams since the XMR arm landed and nothing here called
+        // them, so a flipped XMR node converged and credited nobody.
+        //
+        // ★★ THE CLOCK IS THE TIP. The TipBin is primed HERE from the tip this
+        // node verified itself (p2p-first: the native levin chain, READY by now;
+        // daemon-first: the adapter's ZMQ-fed index), and fed afterwards ONLY
+        // from the height watch (pump_tip). The burial frontier reaches the
+        // bundle only through pre_harvest -> declare_at_frontier and can never
+        // reach an enrolment. Enrolment happens HERE, before the relay listens
+        // and before the stratum binds, so the book is frozen for every reader.
+        //
+        // GATE OFF (the shipped default): make() (above, before the template
+        // provider) returned nullptr and this block constructs nothing, attaches
+        // nothing, and arms nothing.
+        if (drops) {
+            // THE FOUR NODE SEAMS. Enrolment and the share-count arm are NOT done
+            // here: at this point the native index may still be walking up from
+            // genesis (READY is not "at the tip" -- measured: tip 0 here, 120 a
+            // moment later), and enrolling against that would be the stale-now
+            // shape itself. drops_try_enrol() (below, from the height watch) does
+            // both once the native tip has caught up with the template served.
+            drops->attach(node);
+            drops_live = true;
+            std::printf("DROPS: ★ ACTIVE (V37_ACTIVATE_CONSENSUS_V1, K=%u, lz=%u, share_diff=%llu, raindrop floor diff=%llu, "
+                        "receipt weight=%llu, to enrol=%zu at the native tip): every lane block composes the sub-threshold "
+                        "REPLACE delta. CONSENSUS ACTIVATION -- a node without it will not agree on owed_digest.\n",
+                        (unsigned)cfg.lane_params.subthreshold.K, c2pool::v37n::xmr::drops::kXmrDropsLz,
+                        (unsigned long long)drops->share_diff(), (unsigned long long)drops->floor_diff(),
+                        (unsigned long long)drops->receipt_weight(), g_drops_enrol.size());
+            if (g_drops_enrol.empty())
+                std::printf("DROPS: gate ON but NOBODY is enrolled (--drops-enrol) -- every composition credits zero (fail-closed, opt-in)\n");
+        }
+        // ★ DROPS: enrol + arm, ONCE, at the NATIVE TIP -- the first time the tip
+        // clock (fed only from the height watch) has reached the bin of the
+        // template this node serves (template height == native tip + 1). Before
+        // that nothing is enrolled and the share-count book is unarmed, so every
+        // earlier interval stays UNKNOWN and is withheld (fail-closed).
+        bool drops_enrolled = false;
+        std::uint64_t drops_peer_height = 0;
+        // Under p2p-first "at the tip" is the native node's own claim checked
+        // against its peers: the tip clock (tip + 1, a chain HEIGHT) must have
+        // reached the best peer's advertised height. READY alone is not enough
+        // (measured: a force-synced regtest node served a template at h=1 while
+        // its index was still at 64 of 120).
+        auto drops_tip_synced = [&]() -> bool {
+            if (!p2p_first) return true;   // daemon-first: the ZMQ-fed index follows a synced monerod
+            if (!native || !native->node()) return false;
+            drops_peer_height = native->node()->status().driver.best_peer_height;
+            const auto nb = drops->now_interval();
+            return drops_peer_height > 0 && nb && *nb >= drops_peer_height;
+        };
+        auto drops_try_enrol = [&]() {
+            if (!drops_live || drops_enrolled) return;
+            const auto t = provider.current();
+            const auto now_bin = drops->now_interval();
+            if (!t.valid || !now_bin || *now_bin < t.height) return;
+            if (!drops_tip_synced()) return;
+            for (const auto& e : g_drops_enrol) {
+                ::v37::bytes32 payee{};
+                bool ok = false;
+                if (e.size() == 64) {
+                    std::vector<std::uint8_t> raw;
+                    if (sub::from_hex(e, raw) && raw.size() == 32) { std::memcpy(payee.data(), raw.data(), 32); ok = true; }
+                } else if (const auto da = relay::decode_address(e)) {
+                    const ::v37::ScriptRef ref = da->ref();
+                    if (::v37::xmr::xmr_ref_valid(ref)) { payee = ::v37::xmr::xmr_identity_key(ref); ok = true; }
+                }
+                if (!ok) { std::printf("DROPS: --drops-enrol %s is neither a 64-hex identity nor a valid XMR address -- NOT enrolled\n", e.c_str()); continue; }
+                const auto oc = drops->enroll_at_tip(payee);
+                std::printf("DROPS: enrol %s… %s at tip bin %llu (native tip %llu, best peer height %llu, served template h=%llu), effective from interval %llu\n",
+                            hex_of(payee).substr(0, 16).c_str(),
+                            oc == c2pool::v37n::EnrollOutcome::Enrolled ? "ENROLLED ex ante"
+                            : oc == c2pool::v37n::EnrollOutcome::AlreadyEnrolled ? "already enrolled (the FIRST commitment stands)"
+                            : "REFUSED (tip unknown)",
+                            (unsigned long long)*now_bin, (unsigned long long)(*now_bin - 1), (unsigned long long)drops_peer_height, (unsigned long long)t.height,
+                            (unsigned long long)(*now_bin + 1));
+            }
+            drops->arm_at_tip();
+            drops_enrolled = true;
+            std::printf("DROPS: share-count book armed at tip bin %llu; enrolled=%zu enrollment_digest=%s…\n",
+                        (unsigned long long)*now_bin, drops->core().stats().enrolled,
+                        hex_of(drops->core().enrollment().book_digest()).substr(0, 16).c_str());
+            std::fflush(stdout);
+        };
         if (relay_enabled()) {
             if (!serving) {
                 std::printf("REFUSED: the receipt relay needs a served template (--residual-sink-spend-hex/--residual-sink-view-hex)\n");
@@ -2320,6 +2454,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.chain = cfg.lane_chain;
             ro.share_diff = cfg.stratum_share_diff;
             ro.bind = bind;
+            ro.drops_floor_diff = drops_live ? drops->floor_diff() : 0;   // ★ DROPS: 0 = master's receiver
             ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind,
                                                             ro.network);   // S4: + FeeModelGate (+ this network's donation identity) iff ON
             ro.max_pushes_per_receipt = fee_on ? 2 : 1;   // fee model S3: (payee, donation) split
@@ -2426,6 +2561,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 },
                 [&](const relay::Admitted& a, std::uint64_t pos_first, std::uint32_t n_pushes, std::uint64_t next_after, const ::v37::bytes32& dig) {
                     relay_node->on_pushed(a.id, pos_first, n_pushes, a.raw, next_after, dig);
+                    if (drops_live) drops->on_share_pushed(::v37::xmr::xmr_identity_key(a.r.payee), a.bin);   // ★ DROPS: S
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
             const std::size_t reloaded = relay_ingest->reload([&](const relay::Admitted& a) {
@@ -2510,7 +2646,14 @@ static int run_live(const XmrNodeConfig& cfg) {
                     mint_last_err = w;
                 };
                 ::v37::bytes32 pow{}; std::memcpy(pow.data(), acc.pow_hash.data(), 32);
-                if (!relay::meets_share_diff(pow, share_diff)) { ++mint_below; return; }   // lax top-64 accept, exact rule refuses
+                // ★ DROPS (gate ON only): below share_diff but at/above the floor is a
+                // RAINDROP -- minted with the SAME binding and flooded, never pushed.
+                bool is_drop = false;
+                if (!relay::meets_share_diff(pow, share_diff)) {
+                    if (!drops_live) { ++mint_below; return; }   // lax top-64 accept, exact rule refuses
+                    if (!relay::meets_share_diff(pow, drops->floor_diff())) { ++mint_below; ++drops_mint_below_floor; return; }
+                    is_drop = true;
+                }
                 std::optional<::v37::ScriptRef> payee;
                 relay::SideDataV2 side;
                 if (bind == relay::BindMode::Rbind) {
@@ -2553,6 +2696,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 a.id = cr.id; a.raw = relay::encode_fb_receipt(fb);
                 if (a.raw.empty()) { fail("encode: receipt over the relay budget"); return; }
                 a.r = std::move(fb); a.bin = acc.height; a.own = true;
+                if (is_drop) { a.pow = pow; relay_node->submit_own_drop(std::move(a)); ++drops_mint_ok; return; }
                 relay_node->submit_own(std::move(a));
                 ++mint_ok;
             };
@@ -2620,6 +2764,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     // on any recent block -- including the blocks this node missed while it was
                     // down -- resolves to (bin, seed) on the verify thread without an RPC there.
                     const std::uint64_t best = node.adapter().index().best_height();
+                    if (drops_live && best) { drops->observe_native_tip(best); drops_try_enrol(); }   // ★ DROPS: daemon-first tip (ZMQ-fed index, no RPC)
                     if (best && best != relay_index_best) {
                         relay_index_best = best;
                         auto rpc_headers = [&](const std::string& body, bool range) {
@@ -2705,6 +2850,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (g_relay_partition_req.exchange(false) && g_relay_partition_s)
                     relay_node->partition_for(std::chrono::seconds(g_relay_partition_s));
                 for (auto& a : relay_node->drain_admitted()) relay_ingest->on_admitted(std::move(a));
+                if (drops_live)   // ★ DROPS: every replicated raindrop (own + peers') -> the harvester
+                    for (auto& a : relay_node->drain_drops())
+                        drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
                 relay_ingest->tick(provider.current().height);
                 for (const auto& [bw, pid] : relay_node->drain_block_won()) relay_on_cut(bw, pid);
             };
@@ -2742,6 +2890,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                     }
                     node.pump_mainchain_event(ev);
                 }
+                // ★ DROPS: THE EX-ANTE CLOCK, from the SAME native tip, in the same
+                // place -- never the burial frontier, never a monerod poll.
+                if (drops_live && tip_best) { drops->observe_native_tip(tip_best); drops_try_enrol(); }
                 // c2pool#1551: the candidates we HOLD but did not adopt. In the
                 // branch where our own block stays best the rival never becomes
                 // a mainchain event at all, so without this sweep the race book
@@ -2767,6 +2918,20 @@ static int run_live(const XmrNodeConfig& cfg) {
                 orc->on_serve(provider.current().epoch, served, provider.current().source_name);
         };
         hooks.status_extra = [&]() {
+            if (drops_live) {   // ★ DROPS (gate ON only)
+                const auto ds = drops->core().stats();
+                const auto& rs = relay_node->stats();
+                std::printf("  drops: tip_bin=%llu enrolled=%zu digest=%s… raindrops=%llu late=%llu withheld=%llu discarded=%llu open=%zu "
+                            "shares_seen=%llu declared=%llu priced=%llu unpriced=%llu last_rows=%zu | mint drops=%llu below_floor=%llu | "
+                            "relay drops own=%llu foreign=%llu dup=%llu\n",
+                            (unsigned long long)(drops->now_interval() ? *drops->now_interval() : 0), ds.enrolled,
+                            hex_of(drops->core().enrollment().book_digest()).substr(0, 12).c_str(),
+                            (unsigned long long)ds.harvested, (unsigned long long)ds.late, (unsigned long long)ds.withheld,
+                            (unsigned long long)ds.discarded, ds.open, (unsigned long long)ds.shares_seen, (unsigned long long)ds.declared,
+                            (unsigned long long)drops->priced(), (unsigned long long)drops->unpriced(), node.last_harvest_rows(),
+                            (unsigned long long)drops_mint_ok.load(), (unsigned long long)drops_mint_below_floor.load(),
+                            (unsigned long long)rs.drops_own.load(), (unsigned long long)rs.drops_foreign.load(), (unsigned long long)rs.drops_dup.load());
+            }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());
                 if (relay_native_ctx || relay_ctx_journal.written())
@@ -3168,6 +3333,7 @@ int main(int argc, char** argv) {
         // GAP-2 relay knobs
         else if (a == "--relay-listen")             g_relay_listen = next("");
         else if (a == "--relay-peer")               g_relay_peers.push_back(next(""));
+        else if (a == "--drops-enrol")              g_drops_enrol.push_back(next(""));
         else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(std::stoull(next("8")));
         else if (a == "--relay-index-horizon")      g_relay_horizon = std::stoull(next("64"));
         else if (a == "--relay-rx-budget")          g_relay_rx_budget = next("1,20,16,256");
@@ -3295,6 +3461,8 @@ int main(int argc, char** argv) {
                 " GAP-2 receipt relay (c2pool<->c2pool over TCP; OFF by default; --coinbase v37; mainnet only with rbind):\n"
                 "  --relay-listen HOST:PORT     bind the receipt relay\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
+                "  --drops-enrol ID|ADDR        DROPS (only in a V37_ACTIVATE_CONSENSUS_V1 build): enrol this payee (64-hex identity\n"
+                "                               key or XMR address) ex ante at the native TIP (repeatable); ignored when dormant\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
