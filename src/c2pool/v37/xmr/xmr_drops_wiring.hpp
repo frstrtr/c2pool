@@ -53,6 +53,18 @@
 //     (RandomX-verified by every receiver, flooded, deduped), and every node's
 //     harvester sees the same set; see XmrRelayNode::submit_own_drop.
 //
+// (5) THE ENROLMENT BOOK IS NODE-LOCAL (ENROL-REPL). Replicating the raindrops
+//     is not enough: the EnrollmentBook is decided at each node's OWN tip, so
+//     two nodes that enrolled the same payees at different tips (a late join, a
+//     restart, a partition) credit different intervals and compose different
+//     deltas for the same block -> owed_digest forks. The fix is the BTC/DASH
+//     rule (DROPS-R3, w3 v0x03): THE WINNER'S VIEW IS AUTHORITATIVE. The winner
+//     composes the delta ONCE, when it books its own win (compose_carry), and
+//     carries it with its enrolment-book digest on the relay (FB_BLOCK_WON v0x02); EVERY
+//     node -- the winner included -- books the CARRIED map for that block after
+//     the same deterministic check (verify_carry), and only advances (discards)
+//     its own buried harvest at the same frontier.
+//
 // GATE OFF (the shipped default): make() returns nullptr, the shell constructs
 // nothing, attaches nothing, and every path below is unreachable.
 // ===========================================================================
@@ -60,9 +72,12 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <c2pool/v37/v37_drops_wiring.hpp>   // DropsWiring, TipBin, EnrollOutcome, kDropsWiringArmed
 #include <c2pool/v37/w4_settlement.hpp>      // settle::WorkPrice, work_price_at
@@ -149,6 +164,45 @@ inline ::c2pool::v37n::settle::WorkPrice drops_price_at(std::uint64_t reward, co
     return rescale_price(::c2pool::v37n::settle::work_price_at(reward, v), receipt_weight);
 }
 
+// ── (5) ENROL-REPL: the carried delta ────────────────────────────────────────
+// Feature marker (the KAT switches on it: absent on the base tree).
+#define C2POOL_XMR_DROPS_CARRY 1
+
+// The winner's composed DROPS delta + the digest of the book it composed under,
+// as carried by FB_BLOCK_WON v0x02 (xmr_relay_wire.hpp BlockWon::Drops).
+struct DropsCarry {
+    std::map<bytes32, long long> delta;   // no zero rows
+    bytes32 enrollment_digest{};
+    bool operator==(const DropsCarry&) const = default;
+};
+inline constexpr std::size_t kDropsCarryMaxRows = 256;   // == relay::kBlockWonDropsMaxRows
+
+// The winner's composition, ONCE: the SAME pure function the finalize driver
+// composes with (subthreshold_credit), zero rows dropped, plus the book digest.
+inline DropsCarry compose_carry(const ::v37::LaneParams& p,
+                                const std::vector<::c2pool::v37n::settle::HarvestedReceipt>& harvest,
+                                const ::c2pool::v37n::settle::DropsCompose& ctx) {
+    DropsCarry c;
+    for (const auto& [k, v] : ::c2pool::v37n::settle::subthreshold_credit(p, harvest, ctx))
+        if (v != 0) c.delta.emplace(k, v);
+    c.enrollment_digest = ctx.enrollment_digest();
+    return c;
+}
+
+// What every node can check about a carried delta, deterministically, from the
+// frame and the chain alone ("" = book it). `binds` = the frame's (bid, h_b,
+// cut, reward, owed_digest_at_win) equal the ON-CHAIN commitment of the block
+// being booked. A refused delta books as EMPTY -- what a DROPS-dormant winner
+// credits -- on every node alike, the winner included, so a refusal never forks.
+inline std::string verify_carry(const DropsCarry& c, bool binds) {
+    if (!binds) return "the carrying frame does not bind to the on-chain commitment (bid/h/cut/reward/owed_digest)";
+    if (c.delta.size() > kDropsCarryMaxRows) return "more rows than the carriage bound";
+    for (const auto& [k, v] : c.delta) if (v == 0) return "a zero delta row (non-canonical)";
+    if (!c.delta.empty() && c.enrollment_digest == ::c2pool::v37n::empty_enrollment_digest())
+        return "a non-empty delta composed under an EMPTY enrolment book (nobody enrolled => no delta)";
+    return "";
+}
+
 // ── THE XMR BUNDLE: one per lane, owned by the shell ────────────────────────
 class XmrDropsWiring {
 public:
@@ -194,6 +248,8 @@ public:
         node.set_enrollment_book(&m_core.enrollment());
         node.set_pre_harvest(m_core.pre_harvest());
         node.set_drops_price_fn([this]() { return take_cut_price(); });
+        if constexpr (requires { node.set_drops_carried_fn({}); })
+            node.set_drops_carried_fn([this]() { return take_carried(); });   // ENROL-REPL
     }
     template <class Node>
     static void detach(Node& node) {
@@ -201,6 +257,26 @@ public:
         node.set_enrollment_book(nullptr);
         node.set_pre_harvest({});
         node.set_drops_price_fn({});
+        if constexpr (requires { node.set_drops_carried_fn({}); }) node.set_drops_carried_fn({});
+    }
+
+    // ── ENROL-REPL: the carried delta the NEXT on_network_block_won books ──
+    // Set by the shell's booking callback (the verified carried map, or {} for a
+    // refused one); taken one-shot by the node, like the cut price. nullopt =>
+    // the node composes locally (the pre-ENROL-REPL path; no carriage available).
+    void set_carried(const std::map<bytes32, long long>& delta) {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        m_carried = delta;
+    }
+    void clear_carried() {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        m_carried.reset();
+    }
+    std::optional<std::map<bytes32, long long>> take_carried() {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto c = std::move(m_carried);
+        m_carried.reset();
+        return c;
     }
 
     // ── the price at the cut the NEXT on_network_block_won settles ──────────
@@ -272,6 +348,7 @@ private:
     ::c2pool::v37n::RecordSink m_share_tee;
     mutable std::mutex m_pmtx;
     ::c2pool::v37n::settle::WorkPrice m_price{};
+    std::optional<std::map<bytes32, long long>> m_carried{};   // ENROL-REPL one-shot
     std::uint64_t m_priced = 0, m_unpriced = 0, m_refused_share = 0;
 };
 

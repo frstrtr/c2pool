@@ -201,6 +201,7 @@ static bool g_lane_suspended_now = false;                  // R-C rework-2: main
 static std::string   g_relay_listen;                    // --relay-listen HOST:PORT
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
+static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (enrol + arm only once the native tip >= H)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
 static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
@@ -1476,6 +1477,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::deque<std::pair<std::chrono::steady_clock::time_point, std::string>> feed_lagq;
     struct WireCache { c2pool::v37n::CutDescriptor d; bool prefolded = false; Amounts credit;
                        c2pool::v37n::settle::WorkPrice price{};   // ★ DROPS: the price at the prefolded cut (gate ON only)
+                       std::optional<c2pool::v37n::xmr::drops::DropsCarry> drops;   // ★ ENROL-REPL: the winner's carried delta (v0x02, gate ON only)
                      };
     // ★ DROPS: the XMR shell's DropsWiring. nullptr in a default build (flip at 0)
     // and whenever the lane geometry does not carry the gate: then nothing below
@@ -1489,6 +1491,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     c2pool::v37n::settle::WorkPrice drops_fold_price{};   // the price of the LAST successful fold_at_cut (gate ON only)
     std::atomic<std::uint64_t> drops_mint_ok{0}, drops_mint_below_floor{0};
     std::map<std::string, WireCache> wire_cache;   // bid -> the v0x02 descriptor (+ its early fold)
+    // ★ ENROL-REPL (gate ON only): our own wins whose FB_BLOCK_WON leaves at BOOKING
+    // time, carrying the delta composed there (bid -> the frame without its delta).
+    std::map<std::string, relay::BlockWon> own_won;
+    std::uint64_t drops_carry_tx = 0, drops_carry_rx = 0, drops_carry_ok = 0, drops_carry_refused = 0, drops_carry_wait = 0;
     std::set<std::string> wire_seen;
     std::uint64_t wire_tx = 0, wire_rx = 0, wire_prefold = 0, wire_pending = 0, wire_hit = 0, wire_mismatch = 0, wire_diverged = 0;
     std::uint64_t cut_ok = 0, cut_pending = 0, cut_miss = 0, cut_mismatch = 0, cut_absent = 0, cut_fold_refused = 0;
@@ -1745,7 +1751,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     };
     fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
         Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
-        if (drops_live) drops->clear_cut_price();   // ★ DROPS: never a neighbour's price
+        if (drops_live) { drops->clear_cut_price(); drops->clear_carried(); }   // ★ DROPS: never a neighbour's price / delta
         if (!cba_fx || !cba_scfg) {
             // option B not bound yet (boot window) -> TRANSIENT, never memoized not-lane;
             // option A never binds -> a stranger's block for this node.
@@ -1900,6 +1906,56 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (chk_ok) booking_price = drops_fold_price;
             if (chk_ok && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
         }
+        // ★ ENROL-REPL (gate ON only): the DROPS delta this block books is the
+        // WINNER's, carried on FB_BLOCK_WON v0x02 -- never a composition from
+        // this node's own enrolment book (node-local: enrolled at its own tip).
+        // Our own win: compose it HERE, ONCE (the same cut price and the same
+        // booking point the local composition used), carry it to every peer,
+        // and book it through the very check a peer applies.
+        if (drops_live) {
+            if (auto ow = own_won.find(bid); ow != own_won.end() && !(wire_cache.count(bid) && wire_cache[bid].drops)) {
+                c2pool::v37n::settle::DropsCompose dctx;
+                dctx.price = c2pool::v37n::xmr::drops::rescale_price(booking_price, drops->receipt_weight());
+                dctx.enrollment = &drops->core().enrollment();
+                std::vector<c2pool::v37n::settle::HarvestedReceipt> rows;
+                { auto lk = drops->core().win_lock(); rows = node.take_buried_harvest(h); }
+                const auto carry = c2pool::v37n::xmr::drops::compose_carry(cfg.lane_params, rows, dctx);
+                relay::BlockWon bw = ow->second;
+                bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest};
+                // over the row bound: our own check refuses it (books EMPTY), so carry EMPTY to the peers too
+                if (carry.delta.size() > relay::kBlockWonDropsMaxRows) bw.drops->delta.clear();
+                const std::size_t n = relay_node->broadcast_block_won(bw);
+                ++wire_tx; ++drops_carry_tx;
+                WireCache& wc = wire_cache[bid];
+                wc.d.bid = bw.bid; wc.d.h_b = bw.h_b; wc.d.cut_next_pos = bw.cut_next_pos; wc.d.cut_spine_digest = bw.cut_spine_digest;
+                wc.d.reward = bw.reward; wc.d.payout_emitted = bw.payout_emitted; wc.d.owed_digest_at_win = bw.owed_digest_at_win;
+                wc.drops = carry;
+                std::printf("drops-carry-tx: own win h=%llu bid=%s… composed rows=%zu delta_payees=%zu digest=%s… -> FB_BLOCK_WON v0x02 %zu B to %zu relay peer(s)\n",
+                            (unsigned long long)h, bid.substr(0, 12).c_str(), rows.size(), carry.delta.size(),
+                            hex_of(carry.enrollment_digest).substr(0, 12).c_str(), relay::encode_block_won(bw).size(), n);
+                own_won.erase(ow);
+            }
+            auto wit = wire_cache.find(bid);
+            if (wit == wire_cache.end() || !wit->second.drops) {
+                ++drops_carry_wait;
+                // the relay-repair family: HELD past the retry bound, never refused on a timeout
+                why = "cut-pending: relay repair of P=" + std::to_string(bk.credit_cut.next_pos) +
+                      ": awaiting the winner's carried DROPS delta (FB_BLOCK_WON v0x02)";
+                return false;
+            }
+            const auto& d = wit->second.d;
+            const bool binds = d.cut_next_pos == bk.credit_cut.next_pos && d.cut_spine_digest == bk.credit_cut.spine_digest &&
+                               d.reward == bk.total && d.h_b == h && d.owed_digest_at_win == bk.lane_commitment &&
+                               c2pool::v37n::cut_bid_hex(d.bid) == bid;
+            const std::string rej = c2pool::v37n::xmr::drops::verify_carry(*wit->second.drops, binds);
+            long long csum = 0; for (const auto& [k, v] : wit->second.drops->delta) csum += v;
+            if (rej.empty()) { drops->set_carried(wit->second.drops->delta); ++drops_carry_ok; }
+            else             { drops->set_carried({}); ++drops_carry_refused; }
+            std::printf("drops-carry-book: h=%llu bid=%s… %s delta_payees=%zu delta_sum=%lld winner_digest=%s… our_digest=%s…%s\n",
+                        (unsigned long long)h, bid.substr(0, 12).c_str(), rej.empty() ? "CARRIED" : "REFUSED(books EMPTY)",
+                        wit->second.drops->delta.size(), csum, hex_of(wit->second.drops->enrollment_digest).substr(0, 12).c_str(),
+                        hex_of(drops->core().enrollment().book_digest()).substr(0, 12).c_str(), rej.empty() ? "" : (" -- " + rej).c_str());
+        }
         // ★ DROPS: hand the node the price at THIS cut; XmrNode::on_network_block_won
         // (called by FinalizeConnect right after this returns) takes it, one-shot.
         if (drops_live) drops->set_cut_price(booking_price);
@@ -1985,6 +2041,12 @@ static int run_live(const XmrNodeConfig& cfg) {
             bw.chain_id = cfg.lane_chain; bw.bid = *c2pool::v37n::cut_bid_bytes(bid); bw.h_b = h;
             bw.cut_next_pos = bk.credit_cut.next_pos; bw.cut_spine_digest = bk.credit_cut.spine_digest;
             bw.reward = bk.total; bw.payout_emitted = true; bw.owed_digest_at_win = bk.lane_commitment;
+            if (drops_live) {   // ★ ENROL-REPL: sent at BOOKING, as v0x02 with the composed delta (book_from_chain_ex)
+                own_won[bid] = bw;
+                std::printf("ab-wire-tx: own win h=%llu bid=%s… -> FB_BLOCK_WON deferred to the booking (DROPS carriage, v0x02)\n",
+                            (unsigned long long)h, bid.substr(0,12).c_str());
+                return;
+            }
             const std::size_t n = relay_node->broadcast_block_won(bw);
             ++wire_tx;
             std::printf("ab-wire-tx: own win h=%llu bid=%s… -> FB_BLOCK_WON to %zu relay peer(s) P=%llu\n",
@@ -2043,6 +2105,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         ++wire_rx;
         const std::string bid = c2pool::v37n::cut_bid_hex(d.bid);
         WireCache wc; wc.d = d;
+        if (drops_live && bw.drops) {   // ★ ENROL-REPL: the winner's carried delta (checked at booking)
+            wc.drops = c2pool::v37n::xmr::drops::DropsCarry{bw.drops->delta, bw.drops->enrollment_digest};
+            ++drops_carry_rx;
+        }
         const bool known = cba_ring.contains(d.owed_digest_at_win);   // merge: rework-3 ReconRing (was a deque scan)
         if (!known) ++wire_diverged;
         c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = d.cut_next_pos; cc.spine_digest = d.cut_spine_digest;
@@ -2558,6 +2624,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             const auto now_bin = drops->now_interval();
             if (!t.valid || !now_bin || *now_bin < t.height) return;
             if (!drops_tip_synced()) return;
+            if (*now_bin - 1 < g_drops_enrol_min_tip) return;   // --drops-enrol-min-tip: a LATER ex-ante enrolment (a late join / restart)
             for (const auto& e : g_drops_enrol) {
                 ::v37::bytes32 payee{};
                 bool ok = false;
@@ -3096,14 +3163,18 @@ static int run_live(const XmrNodeConfig& cfg) {
                 const auto& rs = relay_node->stats();
                 std::printf("  drops: tip_bin=%llu enrolled=%zu digest=%s… raindrops=%llu late=%llu withheld=%llu discarded=%llu open=%zu "
                             "shares_seen=%llu declared=%llu priced=%llu unpriced=%llu last_rows=%zu | mint drops=%llu below_floor=%llu | "
-                            "relay drops own=%llu foreign=%llu dup=%llu\n",
+                            "relay drops own=%llu foreign=%llu dup=%llu | carry tx=%llu rx=%llu booked=%llu refused=%llu wait=%llu "
+                            "node_booked carried=%llu local=%llu\n",
                             (unsigned long long)(drops->now_interval() ? *drops->now_interval() : 0), ds.enrolled,
                             hex_of(drops->core().enrollment().book_digest()).substr(0, 12).c_str(),
                             (unsigned long long)ds.harvested, (unsigned long long)ds.late, (unsigned long long)ds.withheld,
                             (unsigned long long)ds.discarded, ds.open, (unsigned long long)ds.shares_seen, (unsigned long long)ds.declared,
                             (unsigned long long)drops->priced(), (unsigned long long)drops->unpriced(), node.last_harvest_rows(),
                             (unsigned long long)drops_mint_ok.load(), (unsigned long long)drops_mint_below_floor.load(),
-                            (unsigned long long)rs.drops_own.load(), (unsigned long long)rs.drops_foreign.load(), (unsigned long long)rs.drops_dup.load());
+                            (unsigned long long)rs.drops_own.load(), (unsigned long long)rs.drops_foreign.load(), (unsigned long long)rs.drops_dup.load(),
+                            (unsigned long long)drops_carry_tx, (unsigned long long)drops_carry_rx, (unsigned long long)drops_carry_ok,
+                            (unsigned long long)drops_carry_refused, (unsigned long long)drops_carry_wait,
+                            (unsigned long long)node.drops_booked_carried(), (unsigned long long)node.drops_booked_local());
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());
@@ -3507,6 +3578,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-listen")             g_relay_listen = next("");
         else if (a == "--relay-peer")               g_relay_peers.push_back(next(""));
         else if (a == "--drops-enrol")              g_drops_enrol.push_back(next(""));
+        else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = std::stoull(next("0"));
         else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(std::stoull(next("8")));
         else if (a == "--relay-index-horizon")      g_relay_horizon = std::stoull(next("64"));
         else if (a == "--relay-rx-budget")          g_relay_rx_budget = next("1,20,16,256");
@@ -3652,6 +3724,7 @@ int main(int argc, char** argv) {
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
                 "  --drops-enrol ID|ADDR        DROPS (only in a V37_ACTIVATE_CONSENSUS_V1 build): enrol this payee (64-hex identity\n"
                 "                               key or XMR address) ex ante at the native TIP (repeatable); ignored when dormant\n"
+                "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
