@@ -409,16 +409,15 @@ static std::map<bytes32, long long> spec_credit(
         // commit before the interval is not a DROPS participant at all — it
         // keeps its ordinary S*T path and contributes nothing here.
         if (!ctx.enrolled(hr.payee, hr.interval)) continue;
+        // ★ DROPS-JK (ruled 09-25): J < K is NOT ESTIMABLE. No delta, nothing
+        // replaced, the payee keeps its share credit — and the row does not
+        // consume its dedup key.
+        if (rc.near_miss_count() < g.K) continue;
         if (g.mode != 1 && rc.shares() > 0) continue; // EstimateOnly refuses covered
         seen[key] = true;
         sub::u320 e{}, w{};
         if (g.mode == 1) {                            // Combined (the canon rule)
-            // ★ ENROLLED: composed ALWAYS. J < K is no longer a refusal, it is
-            // Hhat == 0 — the enrolled payee's whole share work comes back out
-            // and nothing replaces it. That is the downside enrolment accepts,
-            // and it is what makes the ex-ante choice worth nothing.
-            if (rc.near_miss_count() >= g.K)
-                e = sub::estimate_combined(rc.shares(), g.K, rc.h_K());
+            e = sub::estimate_combined(rc.shares(), g.K, rc.h_K());
             // REPLACE: Hhat_comb covers the WHOLE interval, so the interval's
             // share-derived contribution W_shares = S*T comes back out. Written
             // from the spec's own definition of a share's work, not read off the
@@ -427,7 +426,7 @@ static std::map<bytes32, long long> spec_credit(
                 w = sub::divfloor(sub::coeff_times_2_256(rc.shares()),
                                   sub::promote(rc.target_hash()));
         } else {                                      // EstimateOnly
-            if (rc.near_miss_count() >= g.K) e = sub::estimate_hashes(g.K, rc.h_K());
+            e = sub::estimate_hashes(g.K, rc.h_K());
         }
         // ★ R1, written from the ruling text: BOTH sides go through the ORDINARY
         // share -> E_b conversion floor(reward * work / SUM weight) — which is

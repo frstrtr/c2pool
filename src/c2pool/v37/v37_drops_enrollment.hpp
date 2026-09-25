@@ -25,9 +25,11 @@
 // than the one it was made in. After that:
 //
 //   ENROLLED identity      the harvested interval is ALWAYS composed by
-//                          REPLACEMENT — credit Hhat_comb (which is 0 when
-//                          J < K) and remove W_shares — EVEN WHEN Hhat_comb is
-//                          SMALLER than W_shares. It takes the downside.
+//                          REPLACEMENT — credit Hhat_comb and remove W_shares —
+//                          EVEN WHEN Hhat_comb is SMALLER than W_shares. It
+//                          takes the downside. An interval with J < K is NOT
+//                          ESTIMABLE and is not composed at all (DROPS-JK,
+//                          ruled 09-25): its share credit is kept, delta 0.
 //   NON-ENROLLED identity  DROPS never applies at all. It keeps the ordinary
 //                          S*T path, in full, in every interval.
 //
