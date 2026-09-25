@@ -1427,6 +1427,12 @@ private:
     }
 
     void on_order(PeerId p, const CtrlOrder& o) {
+        // SupplyRequester now hands a NON-OK ORDER (BELOW_HORIZON, DISABLED,
+        // BAD_RANGE) to the order callback too, so RepairDriver can name the
+        // refusal, and reports it through on_fail right after. This relay
+        // treats a refused order as a failed ask of this peer, exactly as
+        // before: leave the job for on_fetch_fail and touch nothing here.
+        if (o.status != CtrlOrderStatus::OK) return;
         auto j = take_cur_job(p);
         if (!j || j->kind != Job::Kind::Order) return;
         if (!j->repair) {                       // BACKFILL: ask for every id we never saw

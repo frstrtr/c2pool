@@ -240,6 +240,14 @@ enum class CtrlOrderStatus : std::uint8_t {
     BELOW_HORIZON = 1,   // `a` predates what the server retains
     DISABLED      = 2,   // the server's vault is off
     BAD_RANGE     = 3,   // a > p, or the asker's bounds were nonsense
+    // ★ OVER THE PER-PEER BUDGET, SAID OUT LOUD. Not a refusal of the ASK —
+    // the server holds the answer and will serve it — a refusal of the TIMING.
+    // An asker that gets this backs off and re-sends the SAME request; an
+    // asker that does not understand it treats it as any other non-OK status
+    // and fails closed, which is exactly what it did before this existed.
+    // ADD-ONLY: the byte layout of CtrlOrder is unchanged, so a node built
+    // before this value still decodes the frame and still refuses.
+    THROTTLED     = 4,
 };
 
 struct CtrlGetOrder {
@@ -273,6 +281,9 @@ struct CtrlGetFrames {
 enum class CtrlFramesStatus : std::uint8_t {
     COMPLETE  = 0,   // cursor == the number of ids asked for: nothing is left
     TRUNCATED = 1,   // served through `cursor`; ask again from there
+    // ★ over the per-peer budget (see CtrlOrderStatus::THROTTLED). cursor is 0
+    // and NOTHING was served: the ask is intact and may be re-sent verbatim.
+    THROTTLED = 2,
 };
 
 struct CtrlFrames {
@@ -377,7 +388,7 @@ public:
               g64(b, p, m.lowest_retained) && g8(b, p, st) && g8(b, p, hs) &&
               g32b(b, p, m.spine_digest) && g32(b, p, n)))
             return false;
-        if (st > static_cast<std::uint8_t>(CtrlOrderStatus::BAD_RANGE)) return false;
+        if (st > static_cast<std::uint8_t>(CtrlOrderStatus::THROTTLED)) return false;
         if (hs > 1) return false;
         if (n > kCtrlMaxIdsPerOrder) return false;       // hard bound, before ANY alloc
         m.status = static_cast<CtrlOrderStatus>(st);
@@ -417,7 +428,7 @@ public:
         if (!(g32(b, p, m.chain) && g8(b, p, st) && g16(b, p, m.cursor) &&
               g16(b, p, nu)))
             return false;
-        if (st > static_cast<std::uint8_t>(CtrlFramesStatus::TRUNCATED)) return false;
+        if (st > static_cast<std::uint8_t>(CtrlFramesStatus::THROTTLED)) return false;
         if (nu > kCtrlMaxIdsPerFetch) return false;      // hard bound, before ANY alloc
         if (m.cursor > kCtrlMaxIdsPerFetch) return false;
         m.status = static_cast<CtrlFramesStatus>(st);
@@ -523,6 +534,17 @@ struct SupplyServeOptions {
     // continuation round and nothing else.
     std::size_t   max_reply_bytes    = kCtrlMaxReplyBytes;
     std::size_t   max_peer_slots     = 256;    // LRU-bounded peer table
+    // ★ ANSWER THE THROTTLE INSTEAD OF DROPPING IT (F-1).
+    // A silent drop is indistinguishable, from the asker's side, from a dead
+    // peer: its request slot sits until request_timeout expires it, and the
+    // repair that owned the slot is refused for a reason that never happened.
+    // With this on, an over-budget request is answered with a THROTTLED status
+    // and NOTHING else — no vault read, no ids, no frames — so the asker can
+    // back off and re-send. The refusal is cheap and cannot be an
+    // amplification lever: a THROTTLED FRAMES reply is 16 bytes against a
+    // GETFRAMES ask of up to 2 KiB, and a THROTTLED ORDER reply is 71 bytes
+    // against a 61-byte ask (1.16x, with no vault work behind it).
+    bool          reply_throttled    = true;
 };
 
 // The three serve-side bounds, each clamped to what the transport can carry.
@@ -549,6 +571,8 @@ struct SupplyServeStats {
     std::uint64_t frames_served   = 0;
     std::uint64_t bytes_served    = 0;
     std::uint64_t throttled       = 0;   // over the per-peer token bucket
+    std::uint64_t throttled_replied = 0; // ★ of those, answered with THROTTLED
+                                         //   (the rest are the legacy silent drop)
     std::uint64_t malformed       = 0;   // a control frame that did not decode
     std::uint64_t unknown_opcode  = 0;   // >= 0x80 but not one we implement
     std::uint64_t disabled_drop   = 0;
@@ -574,6 +598,24 @@ public:
     // either way (ruling A); Stage 2 replays to check it.
     using SpineFn = std::function<std::optional<bytes32>(std::uint32_t chain,
                                                          std::uint64_t pos)>;
+    // ★ THE CUT PROBE (optional, additive). "Did I PUBLISH a settlement view at
+    // exactly this (pos, spine)?" — the asker's OWN cut, checked against our
+    // ring. Bind to V37Engine::settlement_view_by_cut(...) != nullptr.
+    //
+    // It answers the only question a repair actually asks ("do you hold the
+    // prefix the winner named?"), which the position-keyed SpineFn cannot: a
+    // node whose lane has moved past `pos` has no snapshot AT pos and so
+    // asserts nothing, even when it published that very cut minutes ago.
+    // Positive-only by construction: a `true` means our committed digest at
+    // `pos` IS the asked one, so putting it in `spine_digest` keeps that field's
+    // meaning (the SERVER's own digest at p_served) exactly as it was. A
+    // `false` asserts nothing — the replay, not this probe, decides.
+    using CutProbeFn = std::function<bool(std::uint32_t chain, std::uint64_t pos,
+                                          const bytes32& spine)>;
+    // Injectable clock, for tests that compress time. Unbound => steady_clock.
+    // The token bucket refills in REAL seconds; a harness that drives hours of
+    // block production through in wall-seconds has to be able to say so.
+    using NowFn = std::function<Clock::time_point()>;
 
     SupplyService(FrameVault& vault, SendFn send)
         : m_vault(vault), m_send(std::move(send)) {}
@@ -591,6 +633,12 @@ public:
     void set_spine_probe(SpineFn f) {
         std::lock_guard<std::mutex> lk(m_mtx); m_spine = std::move(f);
     }
+    void set_cut_probe(CutProbeFn f) {
+        std::lock_guard<std::mutex> lk(m_mtx); m_cut = std::move(f);
+    }
+    void set_clock(NowFn f) {
+        std::lock_guard<std::mutex> lk(m_mtx); m_now = std::move(f);
+    }
     void forget_peer(PeerId id) {
         std::lock_guard<std::mutex> lk(m_mtx); m_peers.erase(id);
     }
@@ -607,6 +655,7 @@ public:
 
         SupplyServeOptions opt;
         SpineFn spine;
+        CutProbeFn cutp;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             ++m_stats.requests;
@@ -617,15 +666,69 @@ public:
                 if (op != CTRL_ORDER && op != CTRL_FRAMES) ++m_stats.unknown_opcode;
                 return;
             }
-            if (!take_token_locked(peer)) { ++m_stats.throttled; return; }
             opt = m_opt;
             spine = m_spine;
+            cutp = m_cut;
+        }
+
+        // ── DECODE FIRST, THEN SPEND THE TOKEN ──────────────────────────────
+        // A refusal has to name the request it refuses (request_id, chain), so
+        // the shape is read before the budget is consulted. That is bounded
+        // work over bytes already in hand — no vault read, no allocation past
+        // the hard id caps the decoder enforces — and a frame that does not
+        // decode is not a request at all: it is counted malformed and costs
+        // the asker nothing but also buys it nothing.
+        CtrlGetOrder qo;
+        CtrlGetFrames qf;
+        if (op == CTRL_GETORDER) {
+            if (!CtrlWire::decode(frame, qo)) { bump_malformed(); return; }
+        } else {
+            if (!CtrlWire::decode(frame, qf)) { bump_malformed(); return; }
+        }
+
+        bool have_token = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            have_token = take_token_locked(peer);
+            if (!have_token) ++m_stats.throttled;
+        }
+        if (!have_token) {
+            // ★ F-1: SAY SO. The old code returned here with no reply at all,
+            // which the asker could only discover as a 5 s timeout — and a
+            // repair that issues ceil(P/4096) + ceil(P/64) requests back to
+            // back runs out of burst part-way through and dies on that
+            // timeout, at a prefix set by the bucket rather than by anything
+            // about the data. An explicit THROTTLED is a fast, cheap, honest
+            // answer the asker can back off on and re-send.
+            if (!opt.reply_throttled) return;      // the legacy silent drop
+            std::vector<std::uint8_t> refusal;
+            if (op == CTRL_GETORDER) {
+                CtrlOrder r;
+                r.request_id = qo.request_id;
+                r.chain = qo.chain;
+                r.a = qo.a;
+                r.p_served = qo.a;                 // nothing served
+                r.status = CtrlOrderStatus::THROTTLED;
+                refusal = CtrlWire::encode(r);
+            } else {
+                CtrlFrames r;
+                r.request_id = qf.request_id;
+                r.chain = qf.chain;
+                r.status = CtrlFramesStatus::THROTTLED;
+                r.cursor = 0;                      // nothing consumed
+                refusal = CtrlWire::encode(r);
+            }
+            { std::lock_guard<std::mutex> lk(m_mtx); ++m_stats.throttled_replied; }
+            if (m_send && !m_send(peer, refusal)) {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                ++m_stats.send_failed;
+            }
+            return;
         }
 
         std::vector<std::uint8_t> reply;
         if (op == CTRL_GETORDER) {
-            CtrlGetOrder q;
-            if (!CtrlWire::decode(frame, q)) { bump_malformed(); return; }
+            const CtrlGetOrder& q = qo;
             const std::size_t cap = clamped_ids_per_order(opt);
             const std::size_t want =
                 std::min<std::size_t>(q.max_ids ? q.max_ids : cap, cap);
@@ -638,10 +741,20 @@ public:
             r.lowest_retained = vo.lowest_retained;
             r.status = map_status(vo.status);
             r.ids = vo.ids;
-            if (r.status == CtrlOrderStatus::OK && spine) {
-                if (auto d = spine(q.chain, vo.p_served)) {
+            if (r.status == CtrlOrderStatus::OK) {
+                // ★ The CUT probe first: it answers at ANY retained prefix, and
+                // it answers the asker's own question. Only when the whole ask
+                // was served ([a, p) complete at p) does it address the cut the
+                // asker named; a truncated leg falls back to the position probe.
+                if (cutp && vo.p_served == q.p &&
+                    cutp(q.chain, vo.p_served, q.cut_spine_digest)) {
                     r.have_spine = true;
-                    r.spine_digest = *d;
+                    r.spine_digest = q.cut_spine_digest;
+                } else if (spine) {
+                    if (auto d = spine(q.chain, vo.p_served)) {
+                        r.have_spine = true;
+                        r.spine_digest = *d;
+                    }
                 }
             }
             reply = CtrlWire::encode(r);
@@ -649,8 +762,7 @@ public:
             ++m_stats.order_served;
             m_stats.order_ids += r.ids.size();
         } else {
-            CtrlGetFrames q;
-            if (!CtrlWire::decode(frame, q)) { bump_malformed(); return; }
+            const CtrlGetFrames& q = qf;
             // ★ THE CEILING, ENFORCED WHERE THE BYTES ARE CHOSEN. Both bounds
             // are the CLAMPED ones, so however the options are set the reply is
             // built to fit under kMaxCarrierFrame.
@@ -726,7 +838,7 @@ private:
     // Per-peer token bucket + LRU-bounded peer table. Peer churn cannot grow
     // memory, and one peer's budget is entirely its own.
     bool take_token_locked(PeerId peer) {
-        const Clock::time_point now = Clock::now();
+        const Clock::time_point now = m_now ? m_now() : Clock::now();
         auto it = m_peers.find(peer);
         if (it == m_peers.end()) {
             evict_lru_locked();
@@ -760,6 +872,8 @@ private:
     FrameVault&              m_vault;
     SendFn                   m_send;
     SpineFn                  m_spine;
+    CutProbeFn               m_cut;
+    NowFn                    m_now;
     mutable std::mutex       m_mtx;
     SupplyServeOptions       m_opt{};
     SupplyServeStats         m_stats{};
@@ -784,12 +898,27 @@ enum class SupplyFailure : std::uint8_t {
                       //   transport ceiling: it can never be delivered here.
                       //   DISTINCT from MISSING_ID, and never a stall.
     CONTINUATION_LIMIT,// a truncated fetch needed more rounds than allowed
+    THROTTLED,        // ★ the server kept saying "over budget" and we ran out of
+                      //   re-sends. Fail-closed, exactly like any other refusal.
 };
 
 struct SupplyFetchOptions {
     std::chrono::milliseconds request_timeout{5000};
     std::uint16_t             max_ids_per_fetch = kCtrlMaxIdsPerFetch;
     std::size_t               max_peer_slots    = 256;
+    // ── ★ THE BACKOFF (F-1, asker's half) ───────────────────────────────────
+    // A THROTTLED answer says the server holds the data and will serve it, just
+    // not now. Re-send the SAME request after a backoff that doubles from
+    // `throttle_backoff` and is capped at `throttle_backoff_max`, at most
+    // `max_throttle_retries` times; after that the fetch fails closed with
+    // SupplyFailure::THROTTLED. Bounded in BOTH directions: a fetch can consume
+    // at most max_throttle_retries extra round trips per request, and a server
+    // that throttles forever produces a refusal rather than a hang. The default
+    // schedule (250 ms doubling to 2 s, 8 times) spans ~9 s, which is more than
+    // the 4 s a shipped bucket (burst 8, 2/s) needs to refill completely.
+    std::chrono::milliseconds throttle_backoff{250};
+    std::chrono::milliseconds throttle_backoff_max{2000};
+    std::uint32_t             max_throttle_retries = 8;
     // How many follow-up GETFRAMES one fetch may issue when the server answers
     // TRUNCATED. Every round consumes at least one requested id and a fetch
     // asks at most kCtrlMaxIdsPerFetch ids, so the default can never bind in
@@ -818,6 +947,9 @@ struct SupplyFetchStats {
     std::uint64_t fetches_completed = 0;  // ★ asks driven through to the last id
     std::uint64_t unservable_id     = 0;  // ★ ids the server named un-servable
     std::uint64_t continuation_limit = 0; // ★ a fetch stopped by max_continuations
+    std::uint64_t throttled_replies  = 0; // ★ answers that said "over budget"
+    std::uint64_t throttle_retries   = 0; // ★ re-sends those cost us
+    std::uint64_t throttle_exhausted = 0; // ★ fetches that ran out of re-sends
 };
 
 // A frame that PASSED verification: the bytes, and the decoded carrier, with
@@ -842,6 +974,11 @@ public:
     // the same answer, so a caller learns exactly which ids to obtain another
     // way instead of waiting for bytes that will never come.
     using UnservableFn = std::function<void(PeerId, const std::vector<bytes32>&)>;
+    // Injectable clock (see SupplyService::NowFn). tick() still takes an
+    // explicit `now` so a harness can drive the deadline edge directly; when it
+    // does, it must drive the SERVE side's clock with the same value or the two
+    // halves disagree about how much time the token bucket has had to refill.
+    using NowFn = std::function<Clock::time_point()>;
 
     explicit SupplyRequester(SendFn send) : m_send(std::move(send)) {}
 
@@ -870,6 +1007,7 @@ public:
     void set_id_of_frame(IdOfFrameFn f) {
         std::lock_guard<std::mutex> lk(m_mtx); m_id_of_frame = std::move(f);
     }
+    void set_clock(NowFn f) { std::lock_guard<std::mutex> lk(m_mtx); m_now = std::move(f); }
 
     bool busy(PeerId p) const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -904,7 +1042,12 @@ public:
             Outstanding o;
             o.request_id = q.request_id;
             o.expect = CTRL_ORDER;
-            o.deadline = Clock::now() + m_opt.request_timeout;
+            o.deadline = now_locked() + m_opt.request_timeout;
+            o.chain = chain;
+            o.a = a;
+            o.p = p;
+            o.spine = my_spine_at_p;
+            o.max_ids = q.max_ids;
             m_out.emplace(peer, std::move(o));
             ++m_stats.orders_requested;
         }
@@ -947,11 +1090,30 @@ public:
         if (op == CTRL_ORDER) {
             CtrlOrder r;
             if (!CtrlWire::decode(frame, r)) { fail(peer, SupplyFailure::MALFORMED, true); return; }
-            if (!claim(peer, CTRL_ORDER, r.request_id)) {
+            Outstanding o;
+            if (!claim(peer, CTRL_ORDER, r.request_id, o)) {
                 fail(peer, SupplyFailure::UNSOLICITED, false);
                 return;
             }
+            // ★ F-1: "over budget" is not a refusal of the ASK. Re-send it,
+            // after a backoff, a bounded number of times.
+            if (r.status == CtrlOrderStatus::THROTTLED) {
+                schedule_retry(peer, std::move(o));
+                return;
+            }
             if (r.status != CtrlOrderStatus::OK) {
+                // ★ F-4: the STATUS reaches the caller. Every non-OK ORDER used
+                // to become an opaque SERVER_REFUSED with the order callback
+                // never invoked, which made RepairDriver::on_order's
+                // BELOW_HORIZON branch dead code and left `order_failed` at
+                // zero while the vault horizon was refusing hundreds of
+                // repairs. The answer IS an answer: hand it over, with its
+                // status and its lowest_retained intact, and report the failure
+                // afterwards so a caller that only watches failures still sees
+                // one.
+                OrderFn ocb;
+                { std::lock_guard<std::mutex> lk(m_mtx); ocb = m_on_order; }
+                if (ocb) ocb(peer, r);
                 fail(peer, SupplyFailure::SERVER_REFUSED, false);
                 return;
             }
@@ -970,6 +1132,16 @@ public:
         Outstanding o;
         if (!claim_frames(peer, r.request_id, o)) {
             fail(peer, SupplyFailure::UNSOLICITED, false);
+            return;
+        }
+        if (r.status == CtrlFramesStatus::THROTTLED) {
+            // Nothing was served and nothing was consumed: ids[from, to) is
+            // still exactly the ask. Re-send it verbatim after the backoff.
+            if (r.cursor != 0 || !r.frames.empty() || !r.unservable.empty()) {
+                fail(peer, SupplyFailure::MALFORMED, false);
+                return;
+            }
+            schedule_retry(peer, std::move(o));
             return;
         }
 
@@ -1130,11 +1302,38 @@ public:
     // send-side idle tick (carrier_send.hpp) or any daemon timer. Returns the
     // number expired. A timed-out request FAILS — it never silently hangs, and
     // the peer is never dropped for it.
-    std::size_t tick(Clock::time_point now = Clock::now()) {
+    std::size_t tick(Clock::time_point now = Clock::time_point{}) {
         std::vector<PeerId> late;
+        std::vector<std::pair<PeerId, std::vector<std::uint8_t>>> resend;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
+            if (now == Clock::time_point{}) now = now_locked();
+            // ── the re-sends first: a slot waiting on a backoff is NOT late ──
+            for (auto& [peer, o] : m_out) {
+                if (!o.awaiting_retry || now < o.retry_at) continue;
+                o.awaiting_retry = false;
+                o.request_id = ++m_next_rid;
+                o.deadline = now + m_opt.request_timeout;
+                if (o.expect == CTRL_ORDER) {
+                    CtrlGetOrder q;
+                    q.request_id = o.request_id;
+                    q.chain = o.chain;
+                    q.a = o.a;
+                    q.p = o.p;
+                    q.cut_spine_digest = o.spine;
+                    q.max_ids = o.max_ids;
+                    resend.emplace_back(peer, CtrlWire::encode(q));
+                } else {
+                    CtrlGetFrames q;
+                    q.request_id = o.request_id;
+                    q.chain = o.chain;
+                    q.ids.assign(o.ids.begin() + static_cast<std::ptrdiff_t>(o.from),
+                                 o.ids.begin() + static_cast<std::ptrdiff_t>(o.to));
+                    resend.emplace_back(peer, CtrlWire::encode(q));
+                }
+            }
             for (auto it = m_out.begin(); it != m_out.end(); ) {
+                if (it->second.awaiting_retry) { ++it; continue; }
                 if (now >= it->second.deadline) {
                     late.push_back(it->first);
                     it = m_out.erase(it);
@@ -1144,6 +1343,9 @@ public:
                 }
             }
         }
+        // The re-sends go out with NO lock held, exactly as every other send
+        // does. dispatch() drops the slot itself if the send fails.
+        for (const auto& [p, f] : resend) (void)dispatch(p, f);
         FailFn cb;
         { std::lock_guard<std::mutex> lk(m_mtx); cb = m_on_fail; }
         if (cb) for (PeerId p : late) cb(p, SupplyFailure::TIMEOUT);
@@ -1164,6 +1366,15 @@ private:
         std::size_t          from = 0;
         std::size_t          to = 0;
         std::uint32_t        rounds = 0;   // continuations spent on this fetch
+        // ── GETORDER only: everything needed to RE-SEND the same ask ────────
+        std::uint64_t        a = 0;
+        std::uint64_t        p = 0;
+        bytes32              spine{};
+        std::uint32_t        max_ids = kCtrlMaxIdsPerOrder;
+        // ── the backoff state (both shapes) ─────────────────────────────────
+        bool                 awaiting_retry = false;  // nothing is on the wire
+        Clock::time_point    retry_at{};
+        std::uint32_t        retries = 0;             // re-sends already spent
     };
 
     // Arm (or re-arm) the one outstanding GETFRAMES slot for `peer` over
@@ -1177,7 +1388,8 @@ private:
         o.to = end;
         o.request_id = ++m_next_rid;
         o.expect = CTRL_FRAMES;
-        o.deadline = Clock::now() + m_opt.request_timeout;
+        o.awaiting_retry = false;
+        o.deadline = now_locked() + m_opt.request_timeout;
         q.request_id = o.request_id;
         q.chain = o.chain;
         q.ids.assign(o.ids.begin() + static_cast<std::ptrdiff_t>(o.from),
@@ -1198,13 +1410,51 @@ private:
     // Consume the outstanding slot iff it matches (opcode, request_id). One
     // outstanding request per peer means an answer can only ever satisfy the
     // question actually asked.
-    bool claim(PeerId peer, std::uint8_t op, std::uint32_t rid) {
+    bool claim(PeerId peer, std::uint8_t op, std::uint32_t rid, Outstanding& out) {
         std::lock_guard<std::mutex> lk(m_mtx);
         auto it = m_out.find(peer);
         if (it == m_out.end()) return false;
         if (it->second.expect != op || it->second.request_id != rid) return false;
+        out = std::move(it->second);
         m_out.erase(it);
         return true;
+    }
+
+    Clock::time_point now_locked() const {   // caller holds m_mtx
+        return m_now ? m_now() : Clock::now();
+    }
+
+    // ── ★ THE BOUNDED RE-SEND ───────────────────────────────────────────────
+    // Put the SAME request back in the peer's one slot, marked as not-yet-sent,
+    // with a deadline that cannot fire before the backoff has elapsed. tick()
+    // — the cadence the daemon already drives from carrier_send's idle hook —
+    // is what puts it back on the wire. Nothing sleeps, nothing spins, and a
+    // server that throttles forever produces exactly max_throttle_retries extra
+    // round trips and then a THROTTLED failure.
+    void schedule_retry(PeerId peer, Outstanding o) {
+        FailFn cb;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            ++m_stats.throttled_replies;
+            if (o.retries >= m_opt.max_throttle_retries) {
+                ++m_stats.throttle_exhausted;
+                cb = m_on_fail;
+            } else {
+                std::chrono::milliseconds back = m_opt.throttle_backoff;
+                for (std::uint32_t i = 0; i < o.retries && back < m_opt.throttle_backoff_max; ++i)
+                    back *= 2;
+                if (back > m_opt.throttle_backoff_max) back = m_opt.throttle_backoff_max;
+                const Clock::time_point now = now_locked();
+                o.retries += 1;
+                o.awaiting_retry = true;
+                o.retry_at = now + back;
+                o.deadline = o.retry_at + m_opt.request_timeout;
+                ++m_stats.throttle_retries;
+                m_out.insert_or_assign(peer, std::move(o));
+                return;
+            }
+        }
+        if (cb) cb(peer, SupplyFailure::THROTTLED);
     }
     // Same, but hands back the whole fetch state so the answer can be checked
     // against the chunk it belongs to and, if truncated, continued.
@@ -1251,6 +1501,7 @@ private:
     }
 
     SendFn                        m_send;
+    NowFn                         m_now;
     mutable std::mutex            m_mtx;
     SupplyFetchOptions            m_opt{};
     SupplyFetchStats              m_stats{};

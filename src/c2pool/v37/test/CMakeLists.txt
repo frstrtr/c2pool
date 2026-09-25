@@ -1207,6 +1207,57 @@ if (BUILD_TESTING)
     target_link_libraries(v37_convergence_apply_kat Threads::Threads)
     add_test(NAME v37_convergence_apply_kat COMMAND v37_convergence_apply_kat)
 
+    # ── Track A2 / the SUSTAINED-LOAD SOAK over the merged closer ───────
+    # v37_convergence_soak drives the SAME rig the apply KAT assembles — one
+    # XbtcNode + BlockEventDriver + CarrierIngest + CarrierRelay + FrameVault +
+    # SupplyService/SupplyRequester + RepairDriver per node — but under a long
+    # RANDOMISED multi-miner schedule instead of eleven fixed scenarios: shares
+    # dropped and reordered per node, peers flapping, block win after block win,
+    # for thousands of settling blocks. It asserts CONTINUOUSLY that
+    #   (SK-A) no peer win is ever folded at a prefix that is not the winner's
+    #          and a refused win moves owed_digest by zero bytes,
+    #   (SK-B) any two nodes holding the same settled-block set hold the same
+    #          owed_digest BYTE-EQUAL,
+    #   (SK-C) no RepairDriver job, peer binding or queued cut survives a
+    #          quiescence checkpoint (no zombie),
+    #   (SK-D) the frame vault stays inside its caps and the deferred / held
+    #          queues stay inside theirs,
+    #   (SK-E) no block is ever credited twice (sum finalW == sum registered
+    #          credit over the blocks the node settled),
+    # and — since the H-1..H-4 gate fixes — it is a GATE, not only a measurement:
+    #   (SK-3a..d) on a LOSSY schedule the run must produce real cut-misses, a
+    #          repair must actually credit blocks that were refused on the first
+    #          pass, at least SOAK_MIN_REPAIR_PCT% (default 90) of the pairs some
+    #          candidate could have served WHOLE must be repaired, and the
+    #          candidate walk must be exercised. Stub RepairDriver::arm out and
+    #          this FAILS; the first cut of the soak stayed green. On a LOSSLESS
+    #          schedule the complementary property is asserted instead (every
+    #          peer win credited on the first pass), so a clean run cannot
+    #          false-fail it.
+    #   (SK-A1) never a SUFFIX repair: every credit a replay produced had a
+    #          candidate holding the winner's cut that still retained position 0.
+    #   (SK-7)  the owed_digest byte comparison is FATAL by default, and SK-7a
+    #          fails a run in which it was never sampled at all.
+    # It also MEASURES the liveness envelope — the largest lane prefix at which a
+    # repair completed, and the VIRTUAL seconds of serve budget the largest one
+    # consumed. The CTest registration below pins a SHORT deterministic
+    # budget so CI stays fast; the same binary is the long soak with bigger
+    # SOAK_ROUNDS / SOAK_SECONDS (see the banner in the .cpp for every knob).
+    # Consumer tree only: no file under src/sharechain/v37 is touched,
+    # settle::fold_eb and OwedLedger::owed_digest() are read and never changed,
+    # and every option it sets (SupplyServeOptions, FrameVaultOptions) is one
+    # the daemon already exposes. stdlib + Threads. SAME HOLLOW-GREEN GUARD as
+    # its siblings: ALSO listed on BOTH build.yml --target lists so CI compiles
+    # AND runs it instead of registering a NOT_BUILT CTest sentinel.
+    add_executable(v37_convergence_soak v37_convergence_soak.cpp)
+    target_compile_features(v37_convergence_soak PRIVATE cxx_std_20)
+    target_include_directories(v37_convergence_soak PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_convergence_soak Threads::Threads)
+    add_test(NAME v37_convergence_soak COMMAND v37_convergence_soak)
+    set_tests_properties(v37_convergence_soak PROPERTIES
+        TIMEOUT 300
+        ENVIRONMENT "SOAK_SEED=20260918;SOAK_ROUNDS=600;SOAK_SECONDS=60;SOAK_PROGRESS=0")
+
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)
     target_compile_features(v37_owed_event_mmr_kat PRIVATE cxx_std_20)
     target_include_directories(v37_owed_event_mmr_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
