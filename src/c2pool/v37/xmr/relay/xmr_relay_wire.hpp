@@ -19,6 +19,7 @@
 //     0x01..0x3f   Family-A CarrierWire versions (0x01/0x02 live) -> counted, ignored
 //     0x40..0x4f   ★ Family-B relay (this file; claimed range, KAT-pinned)
 //         0x40 FB_HELLO      the pool/consensus-id gate, first frame both ways
+//                            (+ the POOL-ID extension: the roundabout S1 lane_tag)
 //         0x41 FB_RECEIPTS   1..8 PoW-carrying receipts (flood / re-offer)
 //         0x42 FB_BLOCK_WON  the block-winner cut descriptor (fast path A)
 //         0x43 FB_GETCTX     repair: ask for the Monero block a receipt was mined on
@@ -76,6 +77,10 @@
 #include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"   // ::xmr::coin::keccak256
 #include "../xmr_fee_model.hpp"                    // S4: the fee-model gate folded into lane_params_digest
+#include <c2pool/v37/roundabout/rb_lane_tag.hpp>   // POOL-ID: LaneTagContext / lane_tag (S1, read-only use)
+
+// Feature marker: this relay carries the POOL-ID lane_tag in HELLO.
+#define C2POOL_XMR_RELAY_POOL_ID 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -113,6 +118,8 @@ inline constexpr std::size_t kFbReceiptMaxBytes     = 2 + kFbReceiptBudget + kSi
 inline constexpr std::size_t kFbReceiptsHeader      = 1 + 1 + 4 + 1;
 inline constexpr std::size_t kFbMaxFrame            = kFbReceiptsHeader + kFbMaxReceiptsPerFrame * kFbReceiptMaxBytes;
 inline constexpr std::size_t kHelloBytes            = 1 + 1 + 4 + 1 + 4 + 32 + 8 + 8 + 2 + 8 + 32 + 1;   // 102
+inline constexpr std::size_t kHelloPoolIdBytes      = 32 + 4 + 4;                    // lane_tag | version | authority
+inline constexpr std::size_t kHelloBytesPoolId      = kHelloBytes + kHelloPoolIdBytes;  // 142
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
 inline constexpr std::size_t kCtxMaxIds             = 8;                 // ids per FB_GETCTX
 inline constexpr std::size_t kCtxMaxBlob            = 512 * 1024;        // one Monero block blob (header | miner_tx | tx hashes)
@@ -296,6 +303,45 @@ inline bool decode_receipts_frame(const std::vector<u8>& f, ReceiptsFrame& out, 
     return true;
 }
 
+// ── POOL-ID: the roundabout S1 lane_tag in HELLO ────────────────────────────
+// chain_id alone cannot tell two pools apart (every XMR node config defaults
+// lane_chain 0), so HELLO also carries the node's roundabout lane_tag
+// (rb_lane_tag.hpp, S1) for the single-roundabout case -- map_epoch 0,
+// rb_index 0, stripe 0 -- computed from the node's OWN chain_id, LaneParams
+// geometry, V37.x consensus version and authority 0. A receiver compares it
+// with its own and refuses a different one EXPLICITLY (TAG_MISMATCH, naming
+// both tags and the first differing field), so two nodes of different pools
+// never exchange a receipt, a context or a lane block. This is the p2pool
+// PREFIX analogue on the wire; it is NOT the receipt PoW preimage (the tagged
+// preimage stays gated OFF for the v37.1 roundabout activation).
+//
+// Wire: an EXTENSION appended after the 102-byte HELLO -- u8[32] lane_tag |
+// u32 version | u32 authority (40 B, HELLO 142 B). A HELLO without it (102 B)
+// still decodes (pool = none): two tagless ends compare exactly as before, and
+// a tagged node refuses a tagless peer explicitly (a pre-POOL-ID build) -- the
+// pre-POOL-ID end refuses the 142-byte HELLO itself ("hello: wrong length").
+struct PoolId {
+    bytes32 lane_tag{};
+    u32     version = 0;              // V37.x consensus version folded into the tag
+    u32     authority = 0;            // reserved 0 (rb_lane_tag.hpp)
+    bool operator==(const PoolId&) const = default;
+};
+
+// The node's own pool id: lane_tag(LaneTagContext::of(chain, p, version,
+// authority), map_epoch 0, rb_index 0, stripe 0).
+inline PoolId pool_id_of(u32 chain_id, const ::v37::LaneParams& p,
+                         u32 version = ::v37::SHIPPED_CONSENSUS_VERSION, u32 authority = 0) {
+    const auto ctx = ::c2pool::v37n::rb::LaneTagContext::of(chain_id, p, version, authority);
+    return PoolId{::c2pool::v37n::rb::lane_tag(ctx, 0, 0, 0), version, authority};
+}
+
+inline std::string hex32(const bytes32& h) {
+    static const char* d = "0123456789abcdef";
+    std::string s; s.reserve(64);
+    for (u8 b : h) { s.push_back(d[b >> 4]); s.push_back(d[b & 15]); }
+    return s;
+}
+
 // ── FB_HELLO (0x40) ─────────────────────────────────────────────────────────
 struct Hello {
     u8      network = 0;              // 0 mainnet 1 testnet 2 stagenet 3 regtest
@@ -307,21 +353,23 @@ struct Hello {
     u64     lane_next_pos = 0;        // our lane tip (diagnostic + backfill hint)
     bytes32 lane_digest{};            // LaneSnapshot digest at that tip (diagnostic)
     BindMode bind = BindMode::None;
+    std::optional<PoolId> pool;       // POOL-ID extension (none = a 102-byte HELLO)
     bool operator==(const Hello&) const = default;
 };
 
 inline std::vector<u8> encode_hello(const Hello& h) {
-    std::vector<u8> f; f.reserve(kHelloBytes);
+    std::vector<u8> f; f.reserve(kHelloBytesPoolId);
     f.push_back(FB_HELLO); f.push_back(kFbVersion); le::put32(f, kFbMagic);
     f.push_back(h.network); le::put32(f, h.chain_id); le::putb(f, h.lane_params_digest);
     le::put64(f, h.share_diff); le::put64(f, h.node_nonce); le::put16(f, h.listen_port);
     le::put64(f, h.lane_next_pos); le::putb(f, h.lane_digest); f.push_back(static_cast<u8>(h.bind));
+    if (h.pool) { le::putb(f, h.pool->lane_tag); le::put32(f, h.pool->version); le::put32(f, h.pool->authority); }
     return f;
 }
 
 inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kHelloBytes) return bad("hello: wrong length");
+    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId) return bad("hello: wrong length");
     if (f[0] != FB_HELLO) return bad("hello: wrong opcode");
     if (f[1] != kFbVersion) return bad("hello: unknown version");
     if (le::get32(f.data() + 2) != kFbMagic) return bad("hello: bad magic (not a c2pool XMR relay)");
@@ -335,8 +383,42 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
     h.lane_next_pos = le::get64(p); p += 8;
     h.lane_digest = le::getb(p); p += 32;
     if (p[0] > static_cast<u8>(BindMode::Rbind)) return bad("hello: unknown bind mode");
-    h.bind = static_cast<BindMode>(p[0]);
+    h.bind = static_cast<BindMode>(p[0]); p += 1;
+    h.pool.reset();
+    if (f.size() == kHelloBytesPoolId) {
+        PoolId id;
+        id.lane_tag = le::getb(p); p += 32;
+        id.version = le::get32(p); p += 4;
+        id.authority = le::get32(p);
+        h.pool = id;
+    }
     return true;
+}
+
+// POOL-ID: "" = same pool; else the explicit TAG_MISMATCH reason, naming both
+// tags and the first differing field it can identify. chain_id / version /
+// authority ride the HELLO in the clear, so a tag difference with all three
+// equal is the LaneParams GEOMETRY (the only other tag input).
+inline constexpr char kTagMismatch[] = "TAG_MISMATCH";
+inline bool is_tag_mismatch(const std::string& why) { return why.rfind(kTagMismatch, 0) == 0; }
+
+inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
+    if (!ours.pool && !theirs.pool) return "";            // two tagless ends: the pre-POOL-ID comparison
+    const std::string ot = ours.pool ? hex32(ours.pool->lane_tag) : std::string("none");
+    const std::string tt = theirs.pool ? hex32(theirs.pool->lane_tag) : std::string("none");
+    auto out = [&](const std::string& field, const std::string& detail) {
+        return std::string(kTagMismatch) + " field=" + field + " ours=" + ot + " theirs=" + tt + " (" + detail + ")";
+    };
+    if (!theirs.pool) return out("lane_tag", "peer HELLO carries no lane_tag: a pre-POOL-ID build");
+    if (!ours.pool)   return out("lane_tag", "we carry no lane_tag, the peer does");
+    if (theirs.pool->lane_tag == ours.pool->lane_tag) return "";
+    if (theirs.chain_id != ours.chain_id)
+        return out("chain_id", "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id));
+    if (theirs.pool->version != ours.pool->version)
+        return out("version", "consensus version " + std::to_string(theirs.pool->version) + " != ours " + std::to_string(ours.pool->version));
+    if (theirs.pool->authority != ours.pool->authority)
+        return out("authority", "authority " + std::to_string(theirs.pool->authority) + " != ours " + std::to_string(ours.pool->authority));
+    return out("geometry", "LaneParams geometry differs (window/c0/rollup/half_life/level_caps/k_floor)");
 }
 
 // Why a peer's HELLO does not match ours ("" = compatible). The fields are the
@@ -345,6 +427,7 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
 // "mismatched-LaneParams nodes must reject explicitly" gap).
 inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
+    if (auto t = pool_id_mismatch(ours, theirs); !t.empty()) return t;   // POOL-ID (subsumes chain_id when tagged)
     if (theirs.chain_id != ours.chain_id) return "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id);
     if (theirs.share_diff != ours.share_diff)
         return "share_diff " + std::to_string(theirs.share_diff) + " != ours " + std::to_string(ours.share_diff) + " (R-1 pin)";
