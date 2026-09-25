@@ -82,6 +82,11 @@ struct CoinbaseBooking {
     // fee model: the donation owed_in commitment (0x02 tail "V37D"), if any.
     // Read by decode_lane_coinbase_fee only; gate OFF coinbases carry none.
     std::optional<std::uint64_t> donation_owed_in;
+    // POOL-LINEAGE: how the V37C tail's pool tag classified this block (set
+    // only when the caller passes its pool_tag; Own = a lane block of ours).
+    bool                 lineage_gated = false;
+    credit::BlockLineage lineage = credit::BlockLineage::Untagged;
+    ::v37::bytes32       lineage_seen_tag{};   // the foreign tag (lineage == Foreign)
 };
 
 // candidates: newest first. keys: every identity this node can resolve via pay_of.
@@ -92,7 +97,8 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
                                                 const std::vector<::v37::bytes32>& keys,
                                                 const ::v37::ScriptRef& sink_ref,
                                                 const ::v37::bytes32& sink_identity,
-                                                PayOf&& pay_of) {
+                                                PayOf&& pay_of,
+                                                const ::v37::bytes32* pool_tag = nullptr) {
     namespace cons = ::c2pool::xmr::native;
     namespace set_ = ::v37::xmr::settle;
     CoinbaseBooking b;
@@ -123,6 +129,28 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     if (got.tx_extra.size() < 35) { b.why = "not-lane: tx_extra too short for 03 tag"; return b; }
     const unsigned char* tag = got.tx_extra.data() + got.tx_extra.size() - 35;
     if (tag[0] != 0x03 || tag[1] != 0x21 || tag[2] != 0x00) { b.why = "not-lane: no 03 21 00 tail"; return b; }
+    // POOL-LINEAGE (operator ruling 2026-09-25): only a block whose V37C tail
+    // carries OUR pool_tag is a lane block. Another pool's block, an untagged
+    // (pre-lineage) tail or a malformed V37P field is an ORDINARY Monero block
+    // for this pool: "not-lane:" -- never matched against the candidate ring,
+    // so never booked as a lane cut, never refused, never held, never a
+    // lane-root question (no root fingerprint either). nullptr = the
+    // pre-lineage behaviour (KATs, tools).
+    if (pool_tag) {
+        b.lineage_gated = true;
+        b.lineage = credit::classify_lineage(got.tx_extra, *pool_tag, &b.lineage_seen_tag);
+        if (b.lineage != credit::BlockLineage::Own) {
+            static const char* d = "0123456789abcdef";
+            std::string th;
+            for (int i = 0; i < 6; ++i) { th += d[b.lineage_seen_tag[i] >> 4]; th += d[b.lineage_seen_tag[i] & 15]; }
+            b.why = b.lineage == credit::BlockLineage::Foreign
+                        ? "not-lane: foreign pool_tag " + th + "... (another pool's block: an ordinary Monero block for this pool)"
+                    : b.lineage == credit::BlockLineage::Malformed
+                        ? std::string("not-lane: malformed V37P pool-tag field (strict reject: an ordinary block for this pool)")
+                        : std::string("not-lane: no pool_tag in the V37C tail (pre-lineage / older pool: an ordinary block for this pool)");
+            return b;
+        }
+    }
     ::xmr::coin::Hash256 root; std::memcpy(root.data(), tag + 3, 32);
     b.onchain_root = root; b.has_onchain_root = true;   // R-C: fingerprint available even when no candidate matches
     if (const auto en = credit::extra_nonce_field(got.tx_extra); en && en->size() >= 4) {   // D2: the builder datum
@@ -210,11 +238,12 @@ inline CoinbaseBooking decode_lane_coinbase_fee(const std::vector<std::uint8_t>&
                                                 const std::vector<::v37::bytes32>& keys,
                                                 PayOf&& pay_of,
                                                 ::c2pool::v37n::xmr::fee::DonationNet net =
-                                                    ::c2pool::v37n::xmr::fee::DonationNet::Mainnet) {
+                                                    ::c2pool::v37n::xmr::fee::DonationNet::Mainnet,
+                                                const ::v37::bytes32* pool_tag = nullptr) {
     namespace fee = ::c2pool::v37n::xmr::fee;
     const ::v37::bytes32 D = fee::donation_identity(net);
     CoinbaseBooking b = decode_lane_coinbase(blob, chain_id, candidates, keys, fee::donation_ref(net),
-                                             D, std::forward<PayOf>(pay_of));
+                                             D, std::forward<PayOf>(pay_of), pool_tag);
     if (!b.ok) return b;
     std::string w;
     if (!fee::apply_donation_rule(b.out_identity, b.out_amount, D, b.donation_owed_in,

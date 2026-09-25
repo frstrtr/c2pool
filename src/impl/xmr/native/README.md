@@ -234,7 +234,10 @@ that: how a bundle is spelled on disk, how it is loaded, and how it is minted.
 | `xmr_anchor_load.hpp` | `load_anchor()` — the four gates: source, form, meaning, and the boot duty it cannot discharge |
 | `xmr_anchor_generate.hpp` | `generate_anchor()` — the minting rules behind an abstract read-only `MoneroDaemonRpc` port |
 | `xmr_anchor_embedded.hpp` | the release-pinned bundles compiled into the binary, one per network |
-| `xmr_chain_anchor_stagenet.inc` | the stagenet bundle itself, minted from a synced monerod |
+| `xmr_anchor_pinned.hpp` | the PINNED snapshot per network: anchor .inc sha256 + output-set sha256/size the node enforces when booted without `--native-anchor` (docs/xmr-lane/PINNED-SNAPSHOTS.md) |
+| `xmr_chain_anchor_stagenet_f2.inc` | the pinned stagenet bundle (format 2, H_a 2213803), minted from a synced monerod |
+| `xmr_chain_anchor_mainnet_f2.inc` | the pinned mainnet bundle (format 2, H_a 3765865), minted from the operator's synced monerod |
+| `xmr_chain_anchor_stagenet.inc` | the earlier format-1 stagenet bundle (H_a 2204000), kept for the codec KAT |
 
 **R-ANCHOR** is a release-pinned self-generated bundle: we mint it, we review
 it, we freeze it into the release — the same class of artefact as monerod's own

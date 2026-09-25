@@ -377,8 +377,9 @@ inline ::v37::ScriptRef choose_payee(const ::v37::ScriptRef& miner,
 // Written by the settlement source whenever the residual folds into the
 // donation output (fee model ON only; gate OFF has no fold, so no tail and
 // master's bytes). Layout of the 0x02 payload under the gate:
-//     [ nonce 4 | rbind? | pad | "V37D" u64le | "V37C" P spine ]
-// (the credit-cut tail stays LAST, so credit::parse_tail is unchanged).
+//     [ nonce 4 | rbind? | pad | "V37D" u64le | "V37P" v pool_tag? | "V37C" P spine ]
+// (the credit-cut tail stays LAST, so credit::parse_tail is unchanged; the
+// POOL-LINEAGE field sits between V37D and V37C, xmr_credit_cut.hpp).
 // Constant size, so the miner_tx weight invariance holds.
 // ---------------------------------------------------------------------------
 inline constexpr unsigned char kDonationOwedMagic[4] = {'V', '3', '7', 'D'};
@@ -393,9 +394,11 @@ inline std::vector<std::uint8_t> encode_donation_owed_tail(std::uint64_t owed_in
 // credit-cut tail when one is present, else the last 12 bytes. nullopt when
 // the magic is not there.
 inline std::optional<std::uint64_t> parse_donation_owed_payload(const std::vector<std::uint8_t>& p) {
-    std::size_t end = p.size();
-    if (end >= credit::kTailBytes && std::memcmp(p.data() + end - credit::kTailBytes, credit::kMagic, 4) == 0)
-        end -= credit::kTailBytes;
+    std::size_t end = credit::end_before_credit_tail(p);
+    // POOL-LINEAGE: a lineage-tagged payload carries the V37P field between
+    // V37D and V37C; skip it (a malformed field leaves `end` where it is, so the
+    // V37D magic check below fails closed).
+    if (credit::parse_pool_tag_payload(p) == credit::PoolTagParse::Present) end -= credit::kPoolTagFieldBytes;
     if (end < kDonationOwedTailBytes) return std::nullopt;
     const std::uint8_t* t = p.data() + end - kDonationOwedTailBytes;
     if (std::memcmp(t, kDonationOwedMagic, 4) != 0) return std::nullopt;

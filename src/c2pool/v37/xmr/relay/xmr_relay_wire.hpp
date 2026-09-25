@@ -122,6 +122,8 @@ inline constexpr std::size_t kFbMaxFrame            = kFbReceiptsHeader + kFbMax
 inline constexpr std::size_t kHelloBytes            = 1 + 1 + 4 + 1 + 4 + 32 + 8 + 8 + 2 + 8 + 32 + 1;   // 102
 inline constexpr std::size_t kHelloPoolIdBytes      = 32 + 4 + 4;                    // lane_tag | version | authority
 inline constexpr std::size_t kHelloBytesPoolId      = kHelloBytes + kHelloPoolIdBytes;  // 142
+inline constexpr std::size_t kHelloPoolGenesisBytes = 32;                            // POOL-LINEAGE: pool_genesis_id
+inline constexpr std::size_t kHelloBytesPoolGenesis = kHelloBytesPoolId + kHelloPoolGenesisBytes;  // 174
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
 // ENROL-REPL: FB_BLOCK_WON v0x02 (flip-only) = the 127-byte v0x01 body + the
 // winner's composed DROPS delta: u16 n | n x (payee 32 | i64 delta) | enrollment_digest 32.
@@ -332,10 +334,17 @@ inline bool decode_receipts_frame(const std::vector<u8>& f, ReceiptsFrame& out, 
 // still decodes (pool = none): two tagless ends compare exactly as before, and
 // a tagged node refuses a tagless peer explicitly (a pre-POOL-ID build) -- the
 // pre-POOL-ID end refuses the 142-byte HELLO itself ("hello: wrong length").
+//
+// POOL-LINEAGE (operator ruling 2026-09-25): the pool's 32-byte genesis id
+// rides right after it (u8[32], HELLO 174 B). The block-level pool_tag every
+// lane coinbase commits is sha256d('V37PT' || lane_tag || genesis)
+// (xmr_pool_tag.hpp), so two nodes with the same lane_tag but a different
+// genesis build DIFFERENT pools: refused as TAG_MISMATCH field=pool_genesis.
 struct PoolId {
     bytes32 lane_tag{};
     u32     version = 0;              // V37.x consensus version folded into the tag
     u32     authority = 0;            // reserved 0 (rb_lane_tag.hpp)
+    std::optional<bytes32> genesis;   // POOL-LINEAGE: pool_genesis_id (none = a 142-byte HELLO)
     bool operator==(const PoolId&) const = default;
 };
 
@@ -370,18 +379,20 @@ struct Hello {
 };
 
 inline std::vector<u8> encode_hello(const Hello& h) {
-    std::vector<u8> f; f.reserve(kHelloBytesPoolId);
+    std::vector<u8> f; f.reserve(kHelloBytesPoolGenesis);
     f.push_back(FB_HELLO); f.push_back(kFbVersion); le::put32(f, kFbMagic);
     f.push_back(h.network); le::put32(f, h.chain_id); le::putb(f, h.lane_params_digest);
     le::put64(f, h.share_diff); le::put64(f, h.node_nonce); le::put16(f, h.listen_port);
     le::put64(f, h.lane_next_pos); le::putb(f, h.lane_digest); f.push_back(static_cast<u8>(h.bind));
     if (h.pool) { le::putb(f, h.pool->lane_tag); le::put32(f, h.pool->version); le::put32(f, h.pool->authority); }
+    if (h.pool && h.pool->genesis) le::putb(f, *h.pool->genesis);   // POOL-LINEAGE
     return f;
 }
 
 inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId) return bad("hello: wrong length");
+    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId && f.size() != kHelloBytesPoolGenesis)
+        return bad("hello: wrong length");
     if (f[0] != FB_HELLO) return bad("hello: wrong opcode");
     if (f[1] != kFbVersion) return bad("hello: unknown version");
     if (le::get32(f.data() + 2) != kFbMagic) return bad("hello: bad magic (not a c2pool XMR relay)");
@@ -397,11 +408,12 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
     if (p[0] > static_cast<u8>(BindMode::Rbind)) return bad("hello: unknown bind mode");
     h.bind = static_cast<BindMode>(p[0]); p += 1;
     h.pool.reset();
-    if (f.size() == kHelloBytesPoolId) {
+    if (f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis) {
         PoolId id;
         id.lane_tag = le::getb(p); p += 32;
         id.version = le::get32(p); p += 4;
-        id.authority = le::get32(p);
+        id.authority = le::get32(p); p += 4;
+        if (f.size() == kHelloBytesPoolGenesis) id.genesis = le::getb(p);   // POOL-LINEAGE
         h.pool = id;
     }
     return true;
@@ -423,7 +435,14 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
     };
     if (!theirs.pool) return out("lane_tag", "peer HELLO carries no lane_tag: a pre-POOL-ID build");
     if (!ours.pool)   return out("lane_tag", "we carry no lane_tag, the peer does");
-    if (theirs.pool->lane_tag == ours.pool->lane_tag) return "";
+    if (theirs.pool->lane_tag == ours.pool->lane_tag) {
+        // POOL-LINEAGE: same roundabout, but a different pool genesis = another pool.
+        if (theirs.pool->genesis == ours.pool->genesis) return "";
+        const std::string og = ours.pool->genesis ? hex32(*ours.pool->genesis) : std::string("none");
+        const std::string tg = theirs.pool->genesis ? hex32(*theirs.pool->genesis) : std::string("none");
+        return out("pool_genesis", "pool genesis " + tg + " != ours " + og +
+                   (theirs.pool->genesis ? "" : ": peer HELLO carries no genesis, a pre-lineage build"));
+    }
     if (theirs.chain_id != ours.chain_id)
         return out("chain_id", "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id));
     if (theirs.pool->version != ours.pool->version)
