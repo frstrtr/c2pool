@@ -184,19 +184,24 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
 // (give-author credit settled, an owed deduction); the rest stays coverage.
 // Only a FeeModelGate-ON node calls this; gate OFF books with
 // decode_lane_coinbase() against its configured sink, exactly as master.
+// `net` selects the donation identity (DON-NET); the daemon passes its
+// --network, the default is mainnet.
 // ---------------------------------------------------------------------------
 template <class PayOf>
 inline CoinbaseBooking decode_lane_coinbase_fee(const std::vector<std::uint8_t>& blob,
                                                 std::uint32_t chain_id,
                                                 const std::vector<::v37::bytes32>& candidates,
                                                 const std::vector<::v37::bytes32>& keys,
-                                                PayOf&& pay_of) {
+                                                PayOf&& pay_of,
+                                                ::c2pool::v37n::xmr::fee::DonationNet net =
+                                                    ::c2pool::v37n::xmr::fee::DonationNet::Mainnet) {
     namespace fee = ::c2pool::v37n::xmr::fee;
-    CoinbaseBooking b = decode_lane_coinbase(blob, chain_id, candidates, keys, fee::donation_ref(),
-                                             fee::donation_identity(), std::forward<PayOf>(pay_of));
+    const ::v37::bytes32 D = fee::donation_identity(net);
+    CoinbaseBooking b = decode_lane_coinbase(blob, chain_id, candidates, keys, fee::donation_ref(net),
+                                             D, std::forward<PayOf>(pay_of));
     if (!b.ok) return b;
     std::string w;
-    if (!fee::apply_donation_rule(b.out_identity, b.out_amount, fee::donation_identity(), b.donation_owed_in,
+    if (!fee::apply_donation_rule(b.out_identity, b.out_amount, D, b.donation_owed_in,
                                   b.payout, b.sink_total, &w)) {
         b.ok = false;
         b.why = "donation-refused: " + w + " (the lane coinbase must carry the mandatory donation output)";

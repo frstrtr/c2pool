@@ -459,7 +459,11 @@ inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std
 // digests differ would fold different lanes from identical receipts; they now
 // refuse each other at HELLO instead. The field order is pinned by a golden in
 // xmr_relay_wire_kat -- a LaneParams field added later must be appended here.
-inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, BindMode bind) {
+// `network` is the HELLO network byte (0 mainnet, 1 testnet, 2 stagenet,
+// 3 regtest == fee::DonationNet); it is read ONLY under the fee gate, to pick
+// the donation identity folded below (DON-NET), so a gate-OFF digest does not
+// depend on it and the mainnet gate-ON digest is unchanged.
+inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, BindMode bind, u8 network = 0) {
     std::vector<u8> b(kLaneParamsDomain, kLaneParamsDomain + sizeof(kLaneParamsDomain) - 1);
     le::put64(b, p.window); le::put64(b, p.c0); le::put64(b, p.rollup);
     le::put32(b, static_cast<u32>(p.level_caps.size()));
@@ -499,13 +503,15 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
     // does not move) while a gate-ON node differs from BOTH a gate-OFF node
     // and a master node -> a mixed fleet refuses at HELLO, never diverges.
     // Folds the version, the per-receipt weight rule and the compiled-in
-    // donation identity (a node with another donation address refuses too).
+    // donation identity of this network (a node with another donation
+    // address refuses too).
     if (p.fee.enabled) {
         static constexpr char kFeeTag[] = "FEE1";
         b.insert(b.end(), kFeeTag, kFeeTag + 4);
         le::put32(b, p.fee.version);
         le::put64(b, ::c2pool::v37n::xmr::fee::kFeeReceiptWeight);
-        le::putb(b, ::c2pool::v37n::xmr::fee::donation_identity());
+        le::putb(b, ::c2pool::v37n::xmr::fee::donation_identity(
+                        static_cast<::c2pool::v37n::xmr::fee::DonationNet>(network)));
     }
     return keccak_bytes(b);
 }

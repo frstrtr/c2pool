@@ -222,6 +222,13 @@ static MoneroNetwork parse_net(const std::string& s) {
     if (s == "regtest")  return MoneroNetwork::Regtest;
     return MoneroNetwork::Stagenet;
 }
+// DON-NET: the fee model's donation identity follows --network (xmr_fee_model.hpp
+// donation_info); the value is also the relay HELLO network byte.
+static c2pool::v37n::xmr::fee::DonationNet donation_net_of(MoneroNetwork n) {
+    using DN = c2pool::v37n::xmr::fee::DonationNet;
+    return n == MoneroNetwork::Mainnet ? DN::Mainnet : n == MoneroNetwork::Testnet ? DN::Testnet
+         : n == MoneroNetwork::Stagenet ? DN::Stagenet : DN::Regtest;
+}
 
 static int run_mock_smoke() {
     std::filesystem::path tmp =
@@ -1447,7 +1454,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         // without the one mandatory donation output (owed + 1 + residual) is REFUSED here (every node,
         // own wins included). OFF: master's booking against the configured residual sink.
         if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))
-            return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of());
+            return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of(),
+                                                                          donation_net_of(cfg.network));
         return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
                             cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
     };
@@ -1562,7 +1570,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             ::v37::ScriptRef payee; std::uint16_t give_author = 0;
             if (!relay_node->cached(id, &payee, &give_author)) { ++cut_pending; why = "cut-pending: a repaired receipt left the verified cache (retry)"; return nullptr; }
             // fee model S3: the SAME split the live ingest applies, by the receipt's OWN PoW-committed u16.
-            for (const auto& pr : c2pool::v37n::xmr::fee::receipt_lane_pushes(payee, give_author, fee_on, relay::kReceiptWeight))
+            for (const auto& pr : c2pool::v37n::xmr::fee::receipt_lane_pushes(payee, give_author, fee_on, relay::kReceiptWeight,
+                                                                                  donation_net_of(cfg.network)))
                 pushes.push_back(pr);
         }
         c2pool::v37n::V37Engine scratch;
@@ -1991,6 +2000,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // redirect them. OFF (default): master's per-node residual sink, byte-identical.
         namespace fee = ::c2pool::v37n::xmr::fee;
         const bool fee_on = fee::fee_model_on(cfg.lane_params);
+        const fee::DonationNet don_net = donation_net_of(cfg.network);   // DON-NET: the donation identity of --network
         o2::XmrSettlementConfig scfg;
         scfg.chain_id   = cfg.lane_chain;
         scfg.h_min      = cfg.settle_h_min;
@@ -2003,9 +2013,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                 node.stop();
                 return 2;
             }
-            scfg.residual_sink          = fee::donation_ref();
-            scfg.residual_sink_identity = fee::donation_identity();
-            scfg.fixed                  = {fee::donation_marker()};
+            scfg.residual_sink          = fee::donation_ref(don_net);
+            scfg.residual_sink_identity = fee::donation_identity(don_net);
+            scfg.fixed                  = {fee::donation_marker(don_net)};
             if (!::v37::xmr::xmr_ref_valid(scfg.residual_sink)) {
                 std::printf("REFUSED: the compiled-in donation address does not torsion-check as an XMR "
                             "payout ref (ed25519 point-check backend missing?)\n");
@@ -2050,11 +2060,12 @@ static int run_live(const XmrNodeConfig& cfg) {
             return 2;
         }
         if (fee_on)
-            std::printf("fee-model: v%u ON | donation=%s… (identity %s…) ONE mandatory output = max(%llu, residual) "
+            std::printf("fee-model: v%u ON | donation[%s]=%s… (identity %s…) ONE mandatory output = max(%llu, residual) "
                         "(residual folds in, S1; dust from the LARGEST payee, S2) | give-author %.4f%% (u16=%u, PoW-bound "
                         "in this node's receipts, S3) | node-owner fee %.4f%% -> %s (rolled at job issue) | finder bonus: NONE\n",
-                        cfg.lane_params.fee.version, std::string(fee::kDonationAddress).substr(0, 12).c_str(),
-                        hex_of(fee::donation_identity()).substr(0, 12).c_str(),
+                        cfg.lane_params.fee.version, fee::to_string(don_net),
+                        std::string(fee::donation_address(don_net)).substr(0, 12).c_str(),
+                        hex_of(fee::donation_identity(don_net)).substr(0, 12).c_str(),
                         static_cast<unsigned long long>(fee::kDonationDustPico), g_give_author_pct, (unsigned)my_give_author,
                         g_owner_fee_pct, g_owner_address.empty() ? "-" : g_owner_address.substr(0, 12).c_str());
 
@@ -2079,7 +2090,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
         if (cba_payee_ref) ledger.learn_ref(*cba_payee_ref);
-        if (fee_on) ledger.learn_ref(fee::donation_ref());   // fee model: give-author credit is paid as an ordinary owed output to the donation
+        if (fee_on) ledger.learn_ref(fee::donation_ref(don_net));   // fee model: give-author credit is paid as an ordinary owed output to the donation
         if (owner_ref) ledger.learn_ref(*owner_ref);          // fee model: owner-fee receipts pay the owner
         std::printf("cba: coinbase-authority booking ARMED (lane_chain=%u, payee %s, sink identity %s…)\n", cfg.lane_chain,
                     cba_payee ? "learned" : "none", hex_of(scfg.residual_sink_identity).substr(0, 12).c_str());
@@ -2167,7 +2178,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 // canonical coinbase (already byte-matched against the parsed block above) must
                 // end in the ONE donation output (>= 1 piconero, the residual folded in, S1).
                 if (fee_on) {
-                const fee::MarkerLocation dm = fee::inspect_donation_marker(t.outputs(), fee::donation_identity());
+                const fee::MarkerLocation dm = fee::inspect_donation_marker(t.outputs(), don_net);
                 if (!dm.ok) {
                     ++shape_refused;
                     last_shape += " | " + dm.why;
@@ -2185,7 +2196,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     }
                     const auto od = ::xmr::coin::keccak256(pv.data(), pv.size());
                     std::uint64_t don_total = 0, sum = 0;
-                    for (const auto& o : t.outputs()) { sum += o.amount; if (o.identity == fee::donation_identity()) don_total += o.amount; }
+                    for (const auto& o : t.outputs()) { sum += o.amount; if (o.identity == fee::donation_identity(don_net)) don_total += o.amount; }
                     // the full input state the outputs are a function of: height, parent, the
                     // owed_digest (finalized partition) AND the pending-netted EffectiveOwed map
                     // (a pending payout moves the owed set without moving owed_digest).
@@ -2309,7 +2320,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.chain = cfg.lane_chain;
             ro.share_diff = cfg.stratum_share_diff;
             ro.bind = bind;
-            ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind);   // S4: + FeeModelGate iff ON
+            ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind,
+                                                            ro.network);   // S4: + FeeModelGate (+ this network's donation identity) iff ON
             ro.max_pushes_per_receipt = fee_on ? 2 : 1;   // fee model S3: (payee, donation) split
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
@@ -2398,6 +2410,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::printf("relay: receipt contexts from the native node (best-chain rows + retained bodies; FB_GETCTX served natively)\n");
             }
             io.fee_model = fee_on;   // fee model S3: push split by the receipt's own PoW-committed give_author
+            io.network = static_cast<std::uint8_t>(don_net);   // DON-NET: the donation payee of this network
             relay_ingest = std::make_unique<relay::XmrReceiptIngest>(
                 io,
                 [&](const ::v37::ScriptRef& payee, std::uint64_t w, std::uint64_t& next_after, ::v37::bytes32& dig) -> bool {
