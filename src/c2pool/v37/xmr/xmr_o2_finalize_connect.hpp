@@ -538,6 +538,7 @@ public:
         std::uint64_t relay_repair_stall_timeout = 0;
         std::uint64_t relay_repair_held = 0, relay_repair_held_resolved = 0, relay_repair_held_now = 0;
         std::uint64_t late_booked_post_finalize = 0;
+        std::uint64_t stale_pending_rebooked = 0;   // RACE-DIVERGE: stale m_pending entries retired at a one-tick re-delivery
         // R5: lane blocks whose 03 root matched no candidate digest, kept in the
         // retry set (never memoized) and re-decoded as the candidate ring advances;
         // `lane_root_unknown_resolved` = later booked; `lane_root_unknown_terminal`
@@ -884,6 +885,21 @@ public:
         if (bid.size() != 64 || h == 0) return;
         //  fix 2: dedup on CURRENT ledger state, not on "ever seen" -- an orphaned block that
         // becomes canonical again (branch flip-flop) must be re-booked.
+        // RACE-DIVERGE: m_pending mirrors the ledger only as of the last tick's reconcile(); an
+        // Orphan event removes the bid from the LEDGER at once. A depth-1 flip-flop X -> Y -> X
+        // (X re-established under its successor) that completes before the next tick re-delivers X
+        // (D2-0) while its stale m_pending entry is still there: deduping on it skipped the re-book,
+        // reconcile() then disposed X ORPHANED and this node finalized WITHOUT a canonical lane block
+        // every other node credited (owed_digest fork at a reorg shallower than D_conf). Retire the
+        // stale entry exactly as reconcile() would, then book X again.
+        if (auto st = m_pending.find(bid);
+            st != m_pending.end() && !m_node.ledger().is_pending(bid) && !m_node.ledger().is_settled(bid)) {
+            ++m_stats.orphaned; ++m_stats.stale_pending_rebooked;
+            say("ORPHANED " + short_bid(bid) + " h=" + std::to_string(st->second.height) +
+                " left the pending set (pre-SETTLED removal, O3.5) -- retired at its re-delivery: canonical AGAIN "
+                "before the tick reconciled it (one-tick flip-flop)");
+            m_pending.erase(st); (void)sidecar_flush();
+        }
         if (m_pending.count(bid) || m_unrecoverable.count(bid)) return;
         if (m_node.ledger().is_settled(bid) || m_node.ledger().is_pending(bid)) return;
         if (m_chain_seen.count(bid)) return;   //  fix 3b: memo of NON-booked outcomes only (not-lane / late / refused)
