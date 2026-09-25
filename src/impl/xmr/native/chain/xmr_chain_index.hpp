@@ -104,7 +104,14 @@ struct ChainIndexOptions {
     std::uint64_t entry_cache_bytes = 64ull * 1024 * 1024;
     std::uint64_t burial_depth    = 60;                    // Monero D_conf
     std::uint64_t snapshot_depth  = 64;                    // how far below the tip a snapshot is taken
-    TieBreak      tie             = TieBreak::PreferOwn;   // D-14
+    // COLD-BOOT-2: the catch-up download window above the CONSUMER's booked
+    // frontier (set_consumer_frontier). A chain-entry download is handed out
+    // only up to frontier + window, so the settlement books the post-anchor gap
+    // in bounded batches while it downloads and no unbooked row or body leaves
+    // the row retention / entry cache first. 0 = off (the index downloads as
+    // far as its fetch window allows, the pre-COLD-BOOT-2 shape).
+    std::uint64_t consumer_window = 0;
+    TieBreak      tie            = TieBreak::PreferOwn;   // D-14
     VerificationLevel level        = VerificationLevel::L4PrunedAuthenticated;
     // Fail-closed: a block whose PoW we could not check does not join the best
     // chain. Replays of recorded history (parity, KATs) turn it off explicitly
@@ -773,7 +780,9 @@ public:
         // An entry id that has since connected is done with, whether or not
         // its body is still cached (the entry cache is smaller than a 2048-id
         // entry); one below the retained rows can no longer be used at all.
-        const std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        // COLD-BOOT-2: never download past the consumer's booked frontier + window.
+        if (const std::uint64_t ceil = consumer_ceiling_locked_(); ceil != 0 && ceil < limit) limit = ceil;
         for (std::size_t k = 0; k < wanted_.size(); ++k) {
             if (wanted_heights_[k] > limit) break;
             if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
@@ -864,6 +873,37 @@ public:
         std::size_t n = 0;
         for (const Hash& id : booking_wanted_) if (!have_body_locked_(id)) ++n;
         return BookingRefetchStats{booking_refetch_asked_, booking_bodies_restored_, n};
+    }
+
+    // ---- COLD-BOOT-2: the consumer (settlement) paces the catch-up download --------------
+    // A node booting from an old anchor used to download the WHOLE post-anchor
+    // gap before the settlement consumed any of it: rows older than the row
+    // retention were trimmed (the canonical test then had nothing to answer
+    // with) and bodies older than the entry cache evicted, before they were
+    // booked. With options.consumer_window > 0 the consumer reports the height
+    // up to which it has booked (its finalize cursor) and the chain-entry
+    // download is handed out only up to that frontier + window; the ceiling
+    // moves as the settlement books, so the gap is downloaded and booked in
+    // bounded batches, in chain order. Until the first report the frontier is
+    // the anchor (a fresh boot books from there). Pushed tip blocks and the
+    // re-ask lists (refetch_, bodies_wanted) are not paced: only the bulk
+    // download. Pure pacing: which blocks connect, and in what order, is
+    // unchanged.
+    void set_consumer_frontier(std::uint64_t h) {
+        std::lock_guard<std::mutex> lk(mu_);
+        consumer_frontier_ = h;
+        consumer_frontier_set_ = true;
+    }
+    std::uint64_t consumer_ceiling() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return consumer_ceiling_locked_();
+    }
+    // True while the download is paused at the ceiling (the tip reached it and
+    // the index is not yet synced): the consumer must book before more arrives.
+    bool consumer_held() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const std::uint64_t ceil = consumer_ceiling_locked_();
+        return ceil != 0 && !synced_ && !rows_.empty() && rows_.tip_height() >= ceil;
     }
 
     // The state view, for consumers that need the consensus numbers themselves
@@ -2210,14 +2250,49 @@ private:
         while ((opts_.entry_cache && entry_order_.size() > opts_.entry_cache)
                || (opts_.entry_cache_bytes && entry_bytes_ > opts_.entry_cache_bytes)) {
             if (entry_order_.empty()) break;
-            const Key victim = entry_order_.front();
-            entry_order_.pop_front();
+            // COLD-BOOT-2 (D4a): the oldest-INSERTED body is the victim, EXCEPT the
+            // bodies of the best chain's top snapshot_depth + 1 blocks. The snapshot
+            // (save_snapshot_locked_) re-carries exactly those and refuses when one
+            // is missing, and a reorg disconnects them. Pure FIFO let a burst of
+            // older bodies (the cold-boot booking refetch re-caching the post-anchor
+            // gap) push every tip-side body out: the node then wrote no snapshot at
+            // all until snapshot_depth new blocks had connected (stagenet: hours).
+            // Bounded: at most snapshot_depth + 1 bodies are ever skipped, and only
+            // when that is at most a quarter of the cache (tip_pin_depth_locked_).
+            auto vit = entry_order_.begin();
+            while (vit != entry_order_.end() && tip_pinned_locked_(*vit)) ++vit;
+            if (vit == entry_order_.end()) break;   // only pinned bodies left: keep them
+            const Key victim = *vit;
+            entry_order_.erase(vit);
             const auto v = entries_.find(victim);
             if (v != entries_.end()) {
                 entry_bytes_ -= v->second.bytes;
                 entries_.erase(v);
             }
         }
+    }
+
+    // COLD-BOOT-2: a best-chain body within the top snapshot_depth + 1 heights.
+    // The pin never takes more than a quarter of the cache (shipped: 65 of 1024);
+    // a cache too small for that keeps the plain FIFO order.
+    std::uint64_t tip_pin_depth_locked_() const {
+        const std::uint64_t pin = opts_.snapshot_depth + 1;
+        return (opts_.entry_cache == 0 || opts_.entry_cache >= 4 * pin) ? pin : 0;
+    }
+    bool tip_pinned_locked_(const Key& k) const {
+        const std::uint64_t pin = tip_pin_depth_locked_();
+        if (pin == 0 || rows_.empty() || k.size() != sizeof(Hash)) return false;
+        Hash id{};
+        std::copy(k.begin(), k.end(), reinterpret_cast<char*>(id.data()));
+        const auto h = rows_.height_of(id);
+        return h && *h + pin > rows_.tip_height();
+    }
+
+    // COLD-BOOT-2: frontier + window, or 0 when pacing is off.
+    std::uint64_t consumer_ceiling_locked_() const {
+        if (opts_.consumer_window == 0) return 0;
+        const std::uint64_t base = consumer_frontier_set_ ? consumer_frontier_ : view_.anchor_height();
+        return base + opts_.consumer_window;
     }
 
     std::size_t missing_tx_count_(const Hash& id) const {
@@ -2779,6 +2854,8 @@ private:
     std::vector<Hash> booking_wanted_;            // COLD-BOOT: bodies the booking asked back (bounded)
     std::uint64_t     booking_refetch_asked_   = 0;
     std::uint64_t     booking_bodies_restored_ = 0;
+    std::uint64_t     consumer_frontier_       = 0;       // COLD-BOOT-2: the consumer's booked frontier
+    bool              consumer_frontier_set_   = false;   // COLD-BOOT-2: false = the anchor until the first report
 
     std::vector<node::MainchainEvent> queued_events_;
     std::vector<BlockTxEvent>         queued_tx_events_;

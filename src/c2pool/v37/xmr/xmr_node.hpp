@@ -35,6 +35,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -124,6 +125,14 @@ public:
     using RowLookupFn = std::function<std::optional<std::string>(std::uint64_t height)>;
     void set_native_row_lookup(RowLookupFn fn) { m_native_row = std::move(fn); }
 
+    // COLD-BOOT-2: the native index's best height (p2p-first). Lets the tri-state
+    // canonical test tell a row TRIMMED below the retention (height <= tip, no
+    // row: Unknown -- hold, never a drop) from a height above the tip (No), and
+    // lets the native gap re-drive reach the resumed tip without waiting for the
+    // next block. Unset = the highest height a pumped event carried.
+    using NativeTipFn = std::function<std::uint64_t()>;
+    void set_native_tip_lookup(NativeTipFn fn) { m_native_tip = std::move(fn); }
+
     // The block id (lowercase hex) the best chain carries at `height`, or nullopt
     // (above the tip / outside the retention window / header fetch failed).
     std::optional<std::string> chain_bid_at(std::uint64_t height) {
@@ -140,6 +149,13 @@ public:
         return std::nullopt;
     }
     std::uint64_t reorg_redelivered() const noexcept { return m_reorg_redelivered; }
+    bool native_scan_armed() const noexcept { return m_native_scan; }   // COLD-BOOT-2
+
+    // COLD-BOOT-2: the native index's best height (0 = unknown).
+    std::uint64_t native_tip_height() const {
+        const std::uint64_t t = m_native_tip ? m_native_tip() : 0;
+        return t ? t : m_tip_height;
+    }
 
     // Feed ONE mainchain event from the native index. Same body the adapter's
     // event sink runs, called from the consumer's main loop instead of from a
@@ -207,7 +223,29 @@ public:
             }
             return (b && hex_of(b->id) == bid_hex) ? Carry::Yes : Carry::No;
         }
-        return (m_native_presence && m_native_presence(height, bid_hex)) ? Carry::Yes : Carry::No;
+        if (m_native_presence && m_native_presence(height, bid_hex)) return Carry::Yes;
+        // COLD-BOOT-2 (D2): a height at/below the native tip with NO row is a row
+        // the index TRIMMED (older than its 2048-row retention), not evidence the
+        // block left the chain. Answering No there made drain_bookings DROP a
+        // retried/deferred block silently (and the maturity walk ORPHAN a booked
+        // one). Unknown HOLDS: the gate keeps holding, the walk stays below it,
+        // loudly. A DIFFERENT block at the height, or a height above the tip, is
+        // still a positive No.
+        if (m_native_row && !m_native_row(height)) {
+            const std::uint64_t tip = native_tip_height();
+            if (tip != 0 && height <= tip) {
+                ++m_carry_unknown; ++m_gap.native_unknown;
+                if (m_native_unknown_logged.insert(height).second) {
+                    if (m_native_unknown_logged.size() > 4096) m_native_unknown_logged.erase(m_native_unknown_logged.begin());
+                    log("carry ALARM: native row h=" + std::to_string(height) + " (block " + bid_hex.substr(0, 12) +
+                        "…) is at/below the native tip " + std::to_string(tip) + " but no longer retained by the chain index"
+                        " -> UNKNOWN: the block is HELD (never dropped, never orphaned); it was not booked before the row"
+                        " left the retention window -- operator's eyes (credit divergence risk if it is a lane block)");
+                }
+                return Carry::Unknown;
+            }
+        }
+        return Carry::No;
     }
     std::uint64_t carry_unknown_answers() const { return m_carry_unknown; }
 
@@ -243,7 +281,8 @@ public:
     std::uint64_t scan_height() const noexcept { return m_scan_h; }
     struct GapStats {
         std::uint64_t redriven_heights = 0, redrive_calls = 0, fetch_failed = 0,
-                      truncated = 0, truncated_heights = 0, gate_holds = 0;
+                      truncated = 0, truncated_heights = 0, gate_holds = 0,
+                      native_unknown = 0;   // COLD-BOOT-2: trimmed-row Unknown answers (held, never dropped)
     };
     const GapStats& gap_stats() const noexcept { return m_gap; }
 
@@ -251,6 +290,14 @@ public:
     // Returns the number of heights delivered. Advances settlement afterwards so
     // the held walk resumes (the consumer's booking gate governs from here).
     std::size_t redrive_gap_to_tip() {
+        if (m_native_scan) {   // COLD-BOOT-2 (D4b): p2p-first, from the native index's rows
+            if (!m_cba_extend_observer || m_scan_h == 0) return 0;
+            const std::uint64_t best = native_tip_height();
+            if (best <= m_scan_h) return 0;
+            const std::size_t n = redrive_range(m_scan_h + 1, best);
+            if (n && m_finalize && m_hw.hw_height) (void)readvance_settlement();
+            return n;
+        }
         if (!m_gap_redrive || !m_adapter || !m_cba_extend_observer) return 0;
         const std::uint64_t best = m_adapter->index().best_height();
         if (m_adapter->index().empty() || best == 0) return 0;
@@ -278,6 +325,14 @@ public:
     bool seed_fresh_cursor(std::uint64_t h) {
         if (!m_finalize) return false;
         const bool ok = m_finalize->seed_boot_cursor(h);
+        // COLD-BOOT-2 (D4b): p2p-first -- the walk may not step onto a height whose
+        // h + D_conf has not been delivered through the booking observer in THIS
+        // process (the scan starts at the anchor: nothing at/below it is bookable).
+        if (ok && !m_adapter && m_native_row) {
+            m_native_scan = true; m_scan_h = h + m_cfg.d_conf;
+            log("cold-boot: native scan gate armed at " + std::to_string(m_scan_h) +
+                " (the finalize walk steps only onto heights whose booking window was delivered in this process)");
+        }
         log(std::string("cold-boot: finalize cursor ") + (ok ? "SEEDED at " + std::to_string(h) + " (fresh store, anchor boot)"
                                                             : "not seeded (resumed store: cursor " +
                                                               std::to_string(m_finalize->cursor_height()) + ")"));
@@ -379,6 +434,19 @@ public:
         if (m_scan_h)
             log("gap-redrive: armed; scan starts at the recovered finalize cursor " + std::to_string(m_scan_h) +
                 " (every canonical height above it is re-driven through the booking observer before FINALIZE)");
+        // COLD-BOOT-2 (D4b): the same for a RESUMED p2p-first store. Before this the
+        // first tick re-advanced the walk to the persisted high-water - D_conf with
+        // an empty in-memory deferred/retry set (both die with the process), so the
+        // cursor JUMPED over every height the previous process had not booked yet
+        // and each of them came back late_unbooked. The scan starts at the recovered
+        // cursor: heights above it are delivered again (the resumed chain's rows,
+        // redrive_gap_to_tip, or the re-walk's events) before the walk steps there.
+        if (!daemon_tip && m_recovered.recovered && m_recovered.finalize_cursor_height && m_native_row) {
+            m_native_scan = true;
+            m_scan_h = m_recovered.finalize_cursor_height;
+            log("gap-redrive (native): armed; scan starts at the recovered finalize cursor " + std::to_string(m_scan_h) +
+                " -- the walk resumes from there, never from the high-water (" + std::to_string(m_hw.hw_height) + ")");
+        }
 
         if (daemon_tip) {
             m_adapter->set_event_sink(
@@ -633,7 +701,7 @@ private:
     // F2 node-side gate: never step onto h while a height <= h + D_conf has not
     // been driven through the booking observer yet (scan below it).
     bool gap_gate(std::uint64_t h) {
-        if (!m_gap_redrive || m_scan_h == 0) return true;
+        if ((!m_gap_redrive && !m_native_scan) || m_scan_h == 0) return true;
         if (h + m_cfg.d_conf <= m_scan_h) return true;
         ++m_gap.gate_holds;
         return false;
@@ -643,10 +711,12 @@ private:
     // Stops at the first header-fetch failure (scan stays below it). Returns the
     // number of heights delivered; m_scan_h advances to the last delivered one.
     std::size_t redrive_range(std::uint64_t lo, std::uint64_t hi) {
-        if (lo > hi || !m_adapter) return 0;
+        if (lo > hi || (!m_adapter && !m_native_scan)) return 0;
         ++m_gap.redrive_calls;
         const std::uint64_t cap = m_cfg.index_retain_recent ? static_cast<std::uint64_t>(m_cfg.index_retain_recent) : 720;
-        if (hi - lo + 1 > cap) {
+        // COLD-BOOT-2: the native re-drive is never truncated -- a row the index no
+        // longer holds stops it (the walk holds there, loudly) instead.
+        if (m_adapter && hi - lo + 1 > cap) {
             const std::uint64_t skip = (hi - lo + 1) - cap;
             ++m_gap.truncated; m_gap.truncated_heights += skip;
             log("gap-redrive ALARM: gap [" + std::to_string(lo) + ", " + std::to_string(hi) + "] is " +
@@ -658,15 +728,28 @@ private:
         }
         std::size_t n = 0;
         for (std::uint64_t h = lo; h <= hi; ++h) {
-            bool fetch_failed = false;
-            auto row = m_adapter->ensure_row(h, fetch_failed);
-            if (!row || is_zero_id(row->id)) {
-                ++m_gap.fetch_failed;
-                log("gap-redrive: header h=" + std::to_string(h) + (fetch_failed ? " fetch FAILED" : " absent") +
-                    " -> re-drive stops at " + std::to_string(h - 1) + " (retried next event/tick; the finalize walk holds)");
-                break;
+            std::string bid;
+            if (m_adapter) {
+                bool fetch_failed = false;
+                auto row = m_adapter->ensure_row(h, fetch_failed);
+                if (!row || is_zero_id(row->id)) {
+                    ++m_gap.fetch_failed;
+                    log("gap-redrive: header h=" + std::to_string(h) + (fetch_failed ? " fetch FAILED" : " absent") +
+                        " -> re-drive stops at " + std::to_string(h - 1) + " (retried next event/tick; the finalize walk holds)");
+                    break;
+                }
+                bid = hex_of(row->id);
+            } else {
+                const auto nb = m_native_row ? m_native_row(h) : std::nullopt;
+                if (!nb || nb->size() != 64) {
+                    ++m_gap.fetch_failed;
+                    if (m_gap.fetch_failed == 1 || m_gap.fetch_failed % 100 == 0)
+                        log("gap-redrive ALARM (native): row h=" + std::to_string(h) + " is not held by the native index"
+                            " -> re-drive stops at " + std::to_string(h - 1) + " (the finalize walk HOLDS there; never skipped)");
+                    break;
+                }
+                bid = *nb;
             }
-            const std::string bid = hex_of(row->id);
             if (m_cba_extend_observer) m_cba_extend_observer(h, bid);
             if (m_chain_observer) m_chain_observer(h, bid);
             m_scan_h = h; ++n; ++m_gap.redriven_heights;
@@ -705,7 +788,7 @@ private:
         // chain order is preserved), and track the scan height. Before the
         // consumer's observer is installed (bring_up's initial_sync) nothing is
         // delivered and the scan does not move: redrive_gap_to_tip() covers it.
-        if (m_gap_redrive && m_adapter && m_cba_extend_observer && ev.kind != K::Orphan) {
+        if (((m_gap_redrive && m_adapter) || m_native_scan) && m_cba_extend_observer && ev.kind != K::Orphan) {
             const std::uint64_t H = ev.block.height;
             if (m_scan_h != 0 && H > m_scan_h + 1) (void)redrive_range(m_scan_h + 1, H - 1);
         }
@@ -732,7 +815,13 @@ private:
             m_cba_extend_observer(ev.block.height, hex_of(ev.block.id));   //  book BEFORE the race book + BEFORE advance
             // scan moves only across a CONTIGUOUS delivery: a gap whose re-drive
             // stopped on a fetch failure keeps the scan (and so the gate) below it.
-            if (m_gap_redrive && (m_scan_h == 0 || ev.block.height <= m_scan_h + 1)) m_scan_h = ev.block.height;
+            if (m_native_scan) {
+                // COLD-BOOT-2: native -- an Extend at/below the scan is re-walk history
+                // (already delivered): the scan never moves DOWN on it; a Reorg re-sets it.
+                if (ev.block.height <= m_scan_h + 1 && (ev.kind == c2pool::xmr::node::MainchainEventKind::Reorg ||
+                                                        ev.block.height > m_scan_h))
+                    m_scan_h = ev.block.height;
+            } else if (m_gap_redrive && (m_scan_h == 0 || ev.block.height <= m_scan_h + 1)) m_scan_h = ev.block.height;
         }
         if (m_chain_observer) {
             if (ev.kind == K::Orphan) m_chain_observer(ev.block.height, hex_of(ev.orphaned_id));
@@ -828,6 +917,9 @@ private:
     // R-C rework-2
     XmrFinalizeDriver::BookingGateFn       m_consumer_gate;          // FinalizeConnect's R4/R6 gate
     bool                                   m_gap_redrive = false;    // F2 re-drive armed (daemon-first)
+    bool                                   m_native_scan = false;    // COLD-BOOT-2: the same scan gate, p2p-first
+    NativeTipFn                            m_native_tip;             // COLD-BOOT-2: the native index's best height
+    std::set<std::uint64_t>                m_native_unknown_logged;  // COLD-BOOT-2: trimmed-row alarms (once per height)
     std::uint64_t                          m_scan_h = 0;             // F2: highest height delivered to the extend observer (0 = unset)
     GapStats                               m_gap;
     std::uint64_t                          m_carry_unknown = 0;      // tri-state: Unknown answers given

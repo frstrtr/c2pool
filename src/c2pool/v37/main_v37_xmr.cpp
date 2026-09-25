@@ -408,6 +408,10 @@ struct ServeHooks {
     // good-citizen path.
     std::function<void()> inject_pump;
     std::function<void()> cba_tick;   //  per-loop digest ring + log
+    // COLD-BOOT-2: true while the settlement is booking a catch-up gap (the
+    // native download is paced by it): the loop then polls fast instead of
+    // every poll_ms, so the paced download is not throttled by the idle cadence.
+    std::function<bool()> catching_up;
     // GAP-2: every accepted share (stratum listener thread, or the main thread
     // for --mine hits), AFTER the publish sink saw it. Unset = no relay.
     std::function<void(const strat::AcceptedShare&)> on_share;
@@ -1108,7 +1112,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             last_status = std::chrono::steady_clock::now();
         }
         std::fflush(stdout);
-        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+        const bool fast = hooks.catching_up && hooks.catching_up();   // COLD-BOOT-2
+        std::this_thread::sleep_for(std::chrono::milliseconds(fast ? std::min<std::uint32_t>(poll_ms, 200) : poll_ms));
     }
 
     fc.set_isolation_hook({});   // R-C rework-2: the hook captures loop-scope state; detach before teardown
@@ -1226,6 +1231,10 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
             std::fprintf(stderr, "  node: %s\n", l.c_str());
         return nullptr;
     }
+    if (!why.empty())   // COLD-BOOT-2: start_and_wait proceeded with the catch-up paused at the settlement ceiling
+        std::printf("  native: %s -- proceeding: the serve loop books the post-anchor gap as it downloads "
+                    "(bounded batches, chain order); miners are parked until the arm is ready\n", why.c_str());
+    else
     std::printf("  native: template arm READY, fallback %s\n",
                 native->config().fallback
                     ? "ON (the daemon arm may serve if the native one loses a window)"
@@ -1358,6 +1367,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         node.set_native_chain_presence(chain_src.is_canonical);
         node.set_native_row_lookup(chain_src.bid_at);   // D2-0: reorg-in blocks below a Reorg tip reach the booking observer
+        // COLD-BOOT-2: the native tip (trimmed-row Unknown vs above-tip No; the native gap re-drive's reach)
+        node.set_native_tip_lookup([&chain_src]() -> std::uint64_t {
+            const auto t = chain_src.tip_block ? chain_src.tip_block() : std::nullopt;
+            return t ? t->first : 0;
+        });
     }
     // R-C rework-2 (F2): daemon-first re-drives every chain gap (downtime / a ZMQ
     // gap wider than the reconcile walk) through the booking path.
@@ -2500,6 +2514,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // Tip-feed bookkeeping, main-thread-owned: what the native chain told
         // us, and what we did with it.
         std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
+        std::size_t   pumped_last = 0;   // COLD-BOOT-2: events drained on the last pump (catch-up fast poll)
 
         // ── GAP-2: the real sharechain relay (replaces --credit-feed / --wire-*) ──
         std::function<void(const strat::AcceptedShare&)> relay_on_share;
@@ -3069,13 +3084,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return 2;
             }
             hooks.p2p_relay = native->node()->block_relay();
+            hooks.catching_up = [&]() { return pumped_last > 0 || (chain_src.catchup_held && chain_src.catchup_held()); };   // COLD-BOOT-2
 
             // THE TIP, from the chain we verified ourselves. Drained here, on
             // the main thread, at exactly the point in the loop where
             // pump_poll() used to issue get_miner_data -- one substitution, in
             // one place, so the RPC that is gone is gone by construction.
             hooks.pump_tip = [&]() {
-                for (const auto& ev : chain_src.drain()) {
+                // COLD-BOOT-2: the settlement's booked frontier paces the catch-up
+                // download (the index hands out at most frontier + window above it).
+                if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
+                const auto evs = chain_src.drain();
+                pumped_last = evs.size();
+                for (const auto& ev : evs) {
                     using K = node::MainchainEventKind;
                     if (ev.kind == K::Orphan) ++tip_orphans;
                     else {
@@ -3084,6 +3105,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     }
                     node.pump_mainchain_event(ev);
                 }
+                if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
                 // ★ DROPS: THE EX-ANTE CLOCK, from the SAME native tip, in the same
                 // place -- never the burial frontier, never a monerod poll.
                 if (drops_live && tip_best) { drops->observe_native_tip(tip_best); drops_try_enrol(); }
@@ -3188,6 +3210,20 @@ static int run_live(const XmrNodeConfig& cfg) {
                     std::printf("  cba-refetch: requested=%llu restored_booked=%llu exhausted=%llu | index asked=%llu restored=%llu outstanding=%zu\n",
                                 (unsigned long long)cs.refetch_requested, (unsigned long long)cs.refetch_restored,
                                 (unsigned long long)cs.refetch_exhausted, (unsigned long long)ia, (unsigned long long)ir, io);
+                }
+                if (p2p_first && native && native->node()) {   // COLD-BOOT-2: pacing, snapshot, restart evidence
+                    auto* nn = native->node();
+                    const auto ss = nn->snapshot_stats();
+                    const auto t = nn->index().tip();
+                    std::printf("  cold-boot-2: cursor=%llu owed_digest=%s scan=%llu native_tip=%llu catchup_ceiling=%llu held=%d | snapshot ok=%llu FAILED=%llu%s%s | "
+                                "native_unknown=%llu replayed_below_boot_cursor=%llu late_unbooked=%llu\n",
+                                (unsigned long long)node.finalize_driver().cursor_height(),
+                                hex_of(node.ledger().owed_digest()).substr(0, 16).c_str(), (unsigned long long)node.scan_height(),
+                                (unsigned long long)(t ? t->height : 0), (unsigned long long)nn->index().consumer_ceiling(),
+                                nn->index().consumer_held() ? 1 : 0, (unsigned long long)ss.ok, (unsigned long long)ss.failed,
+                                ss.failed ? " last=" : "", ss.failed ? ss.last_failure.c_str() : "",
+                                (unsigned long long)node.gap_stats().native_unknown,
+                                (unsigned long long)fc.stats().replayed_below_boot_cursor, (unsigned long long)fc.stats().late_unbooked);
                 }
             }
             if (!last_shape.empty())
@@ -3784,6 +3820,10 @@ int main(int argc, char** argv) {
                 "                               boot. Default: no persistence.\n"
                 "  --native-snapshot-every <s>  periodic save cadence (default 300; 0 = only on a\n"
                 "                               clean stop)\n"
+                "  --native-catchup-window <n>  p2p-first anchor boot: download the catch-up gap at most <n>\n"
+                "                               heights above the settlement's finalize cursor, so the gap is\n"
+                "                               booked as it downloads (default 256; 0 = off: the whole gap is\n"
+                "                               downloaded first and rows past the 2048 retention are lost)\n"
                 "  --native-force-synced        set the publication gate on a private chain (OR-C2-8)\n"
                 "  --native-solo                FULLY SELF-CONTAINED (regtest only): no peers, no\n"
                 "                               daemon, no anchor. The chain starts at the locally\n"

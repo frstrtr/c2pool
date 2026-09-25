@@ -330,6 +330,21 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_coldboot_refetch_kat PRIVATE xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_coldboot_refetch_kat COMMAND v37_xmr_coldboot_refetch_kat)
     set_tests_properties(v37_xmr_coldboot_refetch_kat PROPERTIES TIMEOUT 600)
+    # v37_xmr_coldboot_gap_kat (COLD-BOOT-2): a post-anchor gap LONGER than the
+    # row retention (3000 blocks vs the shipped 2048 rows / 1024 bodies) is
+    # booked AS it downloads (the settlement's finalize cursor paces the
+    # index's download), every block in chain order, identical to an
+    # uninterrupted reference; a row the index trimmed before booking HOLDS
+    # (Unknown), never a silent drop; a refetch burst keeps the tip-side bodies
+    # the snapshot needs; a restart resumes from the recovered cursor (re-walk
+    # and snapshot-resume shapes), never jumps it. Builds on the pre-fix tree and
+    # FAILS there. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_coldboot_gap_kat v37_xmr_coldboot_gap_kat.cpp)
+    target_compile_features(v37_xmr_coldboot_gap_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_coldboot_gap_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_coldboot_gap_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_coldboot_gap_kat COMMAND v37_xmr_coldboot_gap_kat)
+    set_tests_properties(v37_xmr_coldboot_gap_kat PROPERTIES TIMEOUT 900)
     # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
     # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
     # (R4 gate kept, repair continues), never refused on a retry count; two nodes

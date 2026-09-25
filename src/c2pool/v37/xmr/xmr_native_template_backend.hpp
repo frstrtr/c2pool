@@ -104,6 +104,7 @@ struct NativeTemplateConfig {
     // its own.
     std::string              snapshot_path;
     std::uint64_t            snapshot_every_s = 300;
+    std::uint64_t            consumer_window = 0;   // COLD-BOOT-2 (NativeNodeConfig::consumer_window)
 
     // The PARITY / SUBMIT daemon. Not the template path; see the banner.
     std::string              monerod_rpc_host;
@@ -222,6 +223,8 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
 
     n.snapshot_path    = cfg.native_snapshot_path;
     n.snapshot_every_s = cfg.native_snapshot_every_s;
+    // COLD-BOOT-2: the settlement paces the catch-up download (p2p-first anchor boot only).
+    n.consumer_window  = (p2p_first && !cfg.native_solo && !cfg.native_anchor_path.empty()) ? cfg.native_catchup_window : 0;
 
     // The daemon endpoint is the C6 PARITY judge, and under daemon-first also
     // the submit arm. Under p2p-first it is the parity judge and nothing else:
@@ -298,6 +301,7 @@ public:
         nc.anchor_confirm       = cfg_.anchor_confirm;
         nc.snapshot_path        = cfg_.snapshot_path;
         nc.snapshot_every_s     = cfg_.snapshot_every_s;
+        nc.consumer_window      = cfg_.consumer_window;   // COLD-BOOT-2
         nc.allow_unverified_pow = cfg_.allow_unverified_pow;
         nc.monerod_rpc_host     = cfg_.monerod_rpc_host;
         nc.monerod_rpc_port     = cfg_.monerod_rpc_port;
@@ -352,6 +356,16 @@ public:
             const native::MinerDataReadiness r =
                 want ? want->readiness() : native::MinerDataReadiness{};
             if (r.ok()) { why.clear(); return true; }
+            // COLD-BOOT-2: the catch-up download is paused at the settlement's
+            // ceiling (anchor + window before the settlement exists): the index
+            // cannot sync until the settlement books, and the settlement books
+            // from the serve loop. Proceed; the arm becomes ready as the gap is
+            // booked (the serve loop parks miners until the first template).
+            if (node_ && node_->index().consumer_held()) {
+                why = "catch-up held at the settlement ceiling h=" + std::to_string(node_->index().consumer_ceiling()) +
+                      " (tip " + std::to_string(node_->index().sync_state().header_frontier) + "; " + r.why + ")";
+                return true;
+            }
             if (progress && r.why != last) { progress(r.why); last = r.why; }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }

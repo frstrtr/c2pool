@@ -225,6 +225,9 @@ struct NativeNodeConfig {
     // Periodic save cadence in seconds. 0 = only on a clean stop, which loses
     // the session's progress to a kill -9; 300 is the shipped compromise.
     std::uint64_t            snapshot_every_s = 300;
+    // COLD-BOOT-2: ChainIndexOptions::consumer_window (the catch-up download is
+    // paced by the settlement's booked frontier). 0 = off.
+    std::uint64_t            consumer_window = 0;
 
     // A build without librandomx cannot check proof of work: the gate answers
     // Skipped, and the index connects blocks it never verified. That is a
@@ -1242,6 +1245,13 @@ public:
     // How many events the feed has produced since start, whether or not anyone
     // drained them. A tip driver that produced nothing and a consumer that
     // dropped everything look identical without this.
+    // COLD-BOOT-2 (D4a): snapshot saves written / failed since start (+ the last failure).
+    struct SnapshotStats { std::uint64_t ok = 0, failed = 0; std::string last_failure; };
+    SnapshotStats snapshot_stats() const {
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        return SnapshotStats{snap_ok_, snap_failed_, snap_last_fail_};
+    }
+
     std::uint64_t mainchain_events_seen() const {
         std::lock_guard<std::mutex> lk(rec_mu_);
         return chain_events_seen_;
@@ -1260,6 +1270,7 @@ private:
         o.net = nets_.consensus;
         o.tie = cfg_.fork_tie;          // D-14, driven by --same-height-tiebreak
         o.own_fork_bound_ms = cfg_.own_fork_bound_ms;
+        o.consumer_window = cfg_.consumer_window;   // COLD-BOOT-2
         return o;
     }
 
@@ -1731,16 +1742,16 @@ private:
             return;
         }
         if (!index_.save_snapshot(image, why)) {
-            note_(std::string("[snapshot] not written (") + occasion + "): " + why);
+            snap_log_(false, std::string("[snapshot] not written (") + occasion + "): " + why);
             return;
         }
         const std::vector<std::uint8_t> file =
             encode_snapshot_envelope(snapshot_key_(), image);
         if (!write_snapshot_file(cfg_.snapshot_path, file, why)) {
-            note_(std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
             return;
         }
-        note_(std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
+        snap_log_(true, std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
             + cfg_.snapshot_path + " (" + occasion + ")");
     }
 
@@ -1767,11 +1778,11 @@ private:
         bool ok = false;
         std::uint64_t idx_h = 0, set_h = 0;
         verify_loop_.call([&] {
-            if (!index_.save_snapshot(image, why)) return;
             const auto t = index_.tip();
             if (!t) { why = "the index has no tip"; return; }
             idx_h = t->height;
             set_h = outputs_.tip_height();
+            if (!index_.save_snapshot(image, why)) return;
             if (t->height != set_h || t->id != outputs_.tip_id()) {
                 why = "output-set overlay tip does not match the index tip";
                 return;
@@ -1779,7 +1790,7 @@ private:
             ok = outputs_.serialize_overlay(ovl, why);
         });
         if (!ok) {
-            note_(std::string("[snapshot] not written (") + occasion + "): " + why
+            snap_log_(false, std::string("[snapshot] not written (") + occasion + "): " + why
                 + " (index tip " + std::to_string(idx_h) + ", output-set tip "
                 + std::to_string(set_h) + ")");
             return;
@@ -1790,16 +1801,16 @@ private:
         ofile.insert(ofile.end(), bind.begin(), bind.end());
         ofile.insert(ofile.end(), ovl.begin(), ovl.end());
         if (!write_snapshot_file(overlay_path_(), ofile, why)) {
-            note_(std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
             return;
         }
         const std::vector<std::uint8_t> file =
             encode_snapshot_envelope(snapshot_key_(), image);
         if (!write_snapshot_file(cfg_.snapshot_path, file, why)) {
-            note_(std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
             return;
         }
-        note_(std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
+        snap_log_(true, std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
             + cfg_.snapshot_path + " + " + std::to_string(ofile.size())
             + " bytes output-set overlay (" + std::to_string(outputs_.overlay_block_count())
             + " post-anchor blocks, tip " + std::to_string(set_h) + ") (" + occasion + ")");
@@ -1899,6 +1910,21 @@ private:
         if (log_.size() > 4096) log_.erase(log_.begin());
     }
 
+    // COLD-BOOT-2 (D4a): a snapshot save is reported where the operator reads,
+    // not only into log_ (which the pool daemon drains only at boot, so every
+    // save -- and every FAILED save -- after start-up was silent). A failure is
+    // an ALARM line on stderr and is counted (snapshot_stats()).
+    void snap_log_(bool ok, const std::string& line) {
+        note_(line);
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            if (ok) ++snap_ok_; else { ++snap_failed_; snap_last_fail_ = line; }
+        }
+        if (ok) std::fprintf(stderr, "[native] %s\n", line.c_str());
+        else    std::fprintf(stderr, "[native] ALARM snapshot save FAILED: %s\n", line.c_str());
+        std::fflush(stderr);
+    }
+
     // --- state --------------------------------------------------------------
     NativeNodeConfig cfg_;
     NetPair          nets_;
@@ -1977,6 +2003,8 @@ private:
     // are all written from the verify thread and read from the consumer's.
     std::vector<node::MainchainEvent> chain_events_;
     std::uint64_t                     chain_events_seen_ = 0;
+    std::uint64_t                     snap_ok_ = 0, snap_failed_ = 0;   // COLD-BOOT-2: snapshot saves (rec_mu_)
+    std::string                       snap_last_fail_;
 };
 
 } // namespace c2pool::xmr::native::rt

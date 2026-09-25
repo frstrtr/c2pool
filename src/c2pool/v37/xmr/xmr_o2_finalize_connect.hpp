@@ -553,6 +553,12 @@ public:
         // transient outcome counts: the point is the order). Normal on a node that is
         // catching up or whose R4 gate is held; late_unbooked MUST still be 0.
         std::uint64_t booking_deferred = 0, booked_after_deferral = 0;
+        // COLD-BOOT-2 (D4b): chain blocks re-delivered at/below the finalize
+        // cursor this (p2p-first) process RESUMED at -- the re-walk from the
+        // anchor after a restart replays history the previous process already
+        // booked or decided before its cursor stepped there. Skipped quietly (not
+        // late: the cursor was never moved over them in this process).
+        std::uint64_t replayed_below_boot_cursor = 0;
         // R6 DIVERGENCE CAP -> R-C rework-2. `diverged` is 1 WHILE the node is
         // ISOLATED by the lineage vote (non-terminal; it drops back to 0 when the
         // vote flips). `divergence_ticks` / `divergence_lag_max` feed HELD-LAG.
@@ -629,6 +635,9 @@ public:
         // own F2 gap gate (never step onto h while h + D_conf is unscanned).
         m_node.set_booking_gate(
             [this](std::uint64_t h) { return booking_gate(h); });
+        // COLD-BOOT-2 (D4b): the cursor this process resumed at (p2p-first scan gate armed).
+        if (m_node.native_scan_armed() && m_node.recovered().recovered)
+            m_boot_cursor = m_node.finalize_driver().cursor_height();
         // R6 evidence: the AUTHORITATIVE pending set at every FINALIZE(h), printed
         // synchronously from inside the driver's walk (not reconstructed from log
         // order). Two converged nodes print identical cba-finalize: lines.
@@ -889,6 +898,15 @@ public:
         if (m_chain_seen.count(bid)) return;   //  fix 3b: memo of NON-booked outcomes only (not-lane / late / refused)
         if (m_chain_booked_once.count(bid)) say("cba: chain block " + short_bid(bid) + " h=" + std::to_string(h) + " is canonical AGAIN after an orphan -> re-booking");
         const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
+        // COLD-BOOT-2 (D4b): re-walk history at/below the RESUMED cursor (every
+        // height there was booked or decided before the previous process stepped
+        // its cursor onto it -- the scan gate guarantees that ordering). Not late.
+        if (h <= m_boot_cursor) {
+            if (m_stats.replayed_below_boot_cursor++ == 0)
+                say("cba: re-walk after restart: chain blocks at/below the resumed finalize cursor " + std::to_string(m_boot_cursor) +
+                    " were booked/decided by the previous process -> skipped (booking resumes at " + std::to_string(m_boot_cursor + 1) + ")");
+            return;
+        }
         // R6 (TWO-SIDED chain-ordered booking): a chain block ABOVE cursor + 1 +
         // D_conf is not booked yet. The synced node books h exactly when its
         // cursor stands at h - 1 - D_conf (book(h) precedes advance(h), which
@@ -2599,6 +2617,7 @@ private:
     std::function<void(bool, const std::string&)> m_iso_hook;
     std::function<void(bool, const std::string&)> m_contested_hook;   // rework-3: CONTESTED -> lane suspend
     std::uint64_t                     m_tick = 0;
+    std::uint64_t                     m_boot_cursor = 0;   // COLD-BOOT-2: resumed finalize cursor (0 = fresh / daemon-first)
     std::uint64_t                     m_cba_chain_booked = 0;
     std::map<std::string, PendingRec> m_unrecoverable;  // kept in the sidecar so the boot warning repeats
     Stats         m_stats;
