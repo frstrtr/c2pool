@@ -663,8 +663,18 @@ if (BUILD_TESTING)
     #                               chain_id / consensus version) is refused
     #                               as TAG_MISMATCH in both directions and
     #                               nothing crosses; same pool unchanged.
+    #   v37_xmr_relay_noise_kat     SMOKE-NOISE: a dial target whose links end
+    #                               before HELLO (refused by a partitioned
+    #                               peer / silent peer) backs off instead of
+    #                               being redialed + re-timed-out every ~1 s;
+    #                               the compared lane-set digest is order-free
+    #                               and equal after a partition heal and after
+    #                               a durable-log restart (the lane digest is
+    #                               node-local order by design).
     # ------------------------------------------------------------------
     foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat)
+
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_relay_noise_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp

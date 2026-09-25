@@ -2917,6 +2917,14 @@ static int run_live(const XmrNodeConfig& cfg) {
                     if (drops_live) drops->on_share_pushed(::v37::xmr::xmr_identity_key(a.r.payee), a.bin);   // ★ DROPS: S
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
+            // SMOKE-NOISE: a reloaded receipt's origin bin = its prev_id's height (lane-set digest only)
+            relay_ingest->set_bin_of([&](const relay::FbReceipt& r) -> std::optional<std::uint64_t> {
+                ::v37::xmr::verify::ParsedBlob pb;
+                if (!::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb)) return std::nullopt;
+                const auto c = relay_chain.lookup(pb.prev_id);
+                if (!c) return std::nullopt;
+                return c->height;
+            });
             const std::size_t reloaded = relay_ingest->reload([&](const relay::Admitted& a) {
                 relay_node->note_reloaded(a);
                 ledger.learn_ref(a.r.payee);
@@ -3330,6 +3338,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)relay_own_replay, (unsigned long long)relay_cut_repaired, (unsigned long long)relay_repair_rejected,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
+                {   // SMOKE-NOISE: the value nodes compare (order-free, xmr_receipt_ingest.hpp);
+                    // the ab-credit lane digest below is this node's push order (node-local by design)
+                    const std::uint64_t th = provider.current().height;
+                    const std::uint64_t through = th > g_relay_bin_lag + 1 ? th - g_relay_bin_lag - 1 : 0;
+                    const auto ls = relay_ingest->lane_set(through);
+                    std::printf("  relay-lane-set: through_bin=%llu n=%llu digest=%s… unbinned=%llu (compare THIS across nodes; lane digest = node-local order)\n",
+                                (unsigned long long)ls.through, (unsigned long long)ls.n,
+                                hex_of(ls.digest).substr(0, 16).c_str(), (unsigned long long)ls.unbinned);
+                }
                 if (relay_native_src) {   // D6b
                     const auto& fs = relay_native_feed.stats();
                     std::printf("  relay-feed: src=native tips=%llu reorg_tips=%llu headers=%llu seed_miss=%llu row_miss=%llu | "

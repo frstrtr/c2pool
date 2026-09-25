@@ -41,9 +41,33 @@
 // (this node's historical lane) without re-hashing -- we verified each record
 // before we wrote it -- which rebuilds the lane byte-identically across a
 // restart; a torn tail record is truncated away.
+//
+// COMPARED DIGEST = THE LANE SET, NOT THE LANE DIGEST (SMOKE-NOISE). The lane
+// digest (engine snapshot, "ab-credit: lane next_pos=.. digest=..") is a hash
+// chain over THIS node's push order. Two honest nodes' orders differ by design
+// (Ruling A) whenever a receipt arrives after its bin closed here -- every
+// receipt a restart or a relay partition kept from us is such a LATE receipt,
+// pushed at the tail -- and an append-only chain never re-converges once two
+// orders differ. So "lane digests differ across nodes" is expected after any
+// restart / partition, carries no settlement meaning (the winner's cut + the
+// repair replay are the authority; owed_digest / FINALIZED are what settle),
+// and hid real divergence under noise. The value nodes COMPARE is lane_set():
+// an ORDER-FREE commitment to WHICH receipts this node's lane holds, per origin
+// bin, through a bin every honest node has closed (the daemon asks for
+// template height - L - 1; lane_set() lowers it below any bin this node still
+// holds back, and reports the effective value):
+//     lane_set(B) = keccak("v37xmr-laneset-v1" | B | n | SUM keccak("v37xmr-laneset-id" | id))
+// over every pushed receipt with origin bin <= B (SUM = 256-bit addition, so
+// arrival order, lane position and the late/on-time split do not enter). Two
+// nodes holding the same receipts through B print the same value, and they do
+// once the relay backfill has delivered what the partition / restart withheld.
+// A receipt reloaded from the durable log carries no bin: bin_of() resolves it
+// from its prev_id (the ChainView); until then it is counted in `unbinned`.
+// Monitoring only: nothing in consensus, the lane or the wire reads it.
 // ===========================================================================
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -52,8 +76,13 @@
 #include <iterator>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
+
+// Feature marker for the SMOKE-NOISE KAT (compares lane_set() when present).
+#define C2POOL_XMR_LANE_SET_DIGEST 1
 
 #include "xmr_relay_node.hpp"
 #include "../xmr_fee_model.hpp"     // receipt_lane_pushes (fee model S3)
@@ -85,6 +114,39 @@ public:
 
     XmrReceiptIngest(Options o, PushFn push, AfterFn after)
         : m_o(std::move(o)), m_push(std::move(push)), m_after(std::move(after)) {}
+
+    // ── SMOKE-NOISE: the compared, order-free lane-set digest (see header) ──
+    struct LaneSet { u64 through = 0; u64 n = 0; u64 unbinned = 0; bytes32 digest{}; };
+    // Origin bin of a receipt that carries none (a durable-log reload): its
+    // prev_id's height in the ChainView. nullopt = not resolvable yet.
+    using BinOfFn = std::function<std::optional<u64>(const FbReceipt&)>;
+    void set_bin_of(BinOfFn f) { m_bin_of = std::move(f); }
+    LaneSet lane_set(u64 through) {
+        if (m_bin_of && !m_unbinned.empty()) {   // late resolution of reloaded receipts
+            std::vector<std::pair<bytes32, FbReceipt>> keep;
+            for (auto& [id, r] : m_unbinned) {
+                const auto b = m_bin_of(r);
+                if (b && *b) set_add(*b, id); else keep.emplace_back(id, std::move(r));
+            }
+            m_unbinned.swap(keep);
+        }
+        // Never cover a bin whose receipts this node still holds back (canonical
+        // order: not closed yet, e.g. the tip jumped several blocks inside the
+        // grace window): the effective `through` is the last fully pushed bin.
+        if (!m_bins.empty() && m_bins.begin()->first <= through) through = m_bins.begin()->first - 1;
+        LaneSet out; out.through = through; out.unbinned = m_unbinned.size();
+        std::array<u64, 4> acc = m_set_old.acc;
+        out.n = m_set_old.n;
+        for (const auto& [b, e] : m_set_bins) {
+            if (b > through) break;
+            out.n += e.n; add256(acc, e.acc);
+        }
+        std::vector<u8> m(kSetTag, kSetTag + sizeof(kSetTag) - 1);
+        le::put64(m, through); le::put64(m, out.n);
+        for (u64 w : acc) le::put64(m, w);
+        out.digest = keccak_bytes(m);
+        return out;
+    }
 
     // Replay the durable log (boot). on_loaded(Admitted) runs BEFORE the push so
     // the caller can re-seed the relay's dedup set. Returns records re-pushed.
@@ -172,14 +234,57 @@ private:
             o.flush();
             ++m_st.durable_writes;
         }
+        set_note(a);
         if (m_after) m_after(a, next_after - n, n, next_after, dig);
         return true;
+    }
+
+    // ── SMOKE-NOISE lane-set bookkeeping (monitoring only) ──────────────────
+    static constexpr char kSetTag[] = "v37xmr-laneset-v1";
+    static constexpr char kSetIdTag[] = "v37xmr-laneset-id";
+    static constexpr std::size_t kSetBinsMax = 16384;   // older bins fold into m_set_old
+    struct SetAcc { u64 n = 0; std::array<u64, 4> acc{}; };
+    static void add256(std::array<u64, 4>& a, const std::array<u64, 4>& b) {
+        u64 carry = 0;
+        for (int i = 0; i < 4; ++i) {
+            const u64 s = a[i] + b[i];
+            const u64 c1 = s < a[i] ? 1 : 0;
+            const u64 t = s + carry;
+            const u64 c2 = t < s ? 1 : 0;
+            a[i] = t; carry = c1 | c2;
+        }
+    }
+    void set_add(u64 bin, const bytes32& id) {
+        std::vector<u8> m(kSetIdTag, kSetIdTag + sizeof(kSetIdTag) - 1);
+        m.insert(m.end(), id.begin(), id.end());
+        const bytes32 h = keccak_bytes(m);
+        std::array<u64, 4> v{};
+        for (int i = 0; i < 4; ++i) v[i] = le::get64(h.data() + 8 * i);
+        SetAcc& e = (!m_set_bins.empty() && bin < m_set_bins.begin()->first && m_set_bins.size() >= kSetBinsMax)
+                        ? m_set_old : m_set_bins[bin];
+        e.n += 1; add256(e.acc, v);
+        while (m_set_bins.size() > kSetBinsMax) {
+            auto it = m_set_bins.begin();
+            m_set_old.n += it->second.n; add256(m_set_old.acc, it->second.acc);
+            m_set_bins.erase(it);
+        }
+    }
+    void set_note(const Admitted& a) {
+        std::optional<u64> bin;
+        if (a.bin) bin = a.bin;
+        else if (m_bin_of) bin = m_bin_of(a.r);
+        if (bin && *bin) set_add(*bin, a.id);
+        else m_unbinned.emplace_back(a.id, a.r);
     }
 
     Options m_o;
     PushFn  m_push;
     AfterFn m_after;
     Stats   m_st;
+    BinOfFn m_bin_of;
+    std::map<u64, SetAcc> m_set_bins;                     // origin bin -> order-free accumulator
+    SetAcc  m_set_old;                                    // bins folded out of m_set_bins
+    std::vector<std::pair<bytes32, FbReceipt>> m_unbinned;   // reloaded, bin not resolved yet
     std::map<u64, std::map<bytes32, Admitted>> m_bins;   // origin bin -> (receipt_id -> receipt), id-sorted
     std::map<u64, Clock::time_point> m_tip_seen;          // template height -> first seen
     u64  m_closed_through = 0;
