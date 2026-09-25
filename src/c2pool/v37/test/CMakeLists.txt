@@ -932,6 +932,36 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME v37_xmr_mainnet_readiness_kat COMMAND v37_xmr_mainnet_readiness_kat)
 
+    # PINNED SNAPSHOT -- v37_xmr_pinned_snapshot_kat
+    #   The release's bootstrap is a PINNED snapshot (operator ruling 09-24):
+    #   the compiled-in format-2 anchors (stagenet H_a 2213803, mainnet H_a
+    #   3765865) and the output-set snapshots they commit to, both pinned by
+    #   sha256 in anchor/xmr_anchor_pinned.hpp and listed in
+    #   docs/xmr-lane/PINNED-SNAPSHOTS.md. Pins: both bundles load from the
+    #   binary with the documented height/id/roots and hash (file and
+    #   compiled-in bytes) to the documented sha256; the doc lists every value;
+    #   an output set with no --native-anchor selects the pinned anchor; a
+    #   truncated or byte-flipped snapshot refuses naming the expected sha256
+    #   and height. Reads the repo (C2POOL_SOURCE_DIR); no sockets, no daemon.
+    #   Listed in both build.yml --target lists.
+    add_executable(v37_xmr_pinned_snapshot_kat v37_xmr_pinned_snapshot_kat.cpp)
+    target_compile_features(v37_xmr_pinned_snapshot_kat PRIVATE cxx_std_20)
+    target_compile_definitions(v37_xmr_pinned_snapshot_kat PRIVATE
+        C2POOL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(v37_xmr_pinned_snapshot_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_pinned_snapshot_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    if (TARGET Boost::headers)
+        target_link_libraries(v37_xmr_pinned_snapshot_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(v37_xmr_pinned_snapshot_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(v37_xmr_pinned_snapshot_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME v37_xmr_pinned_snapshot_kat COMMAND v37_xmr_pinned_snapshot_kat)
+
     # D6d -- v37_xmr_d6d_native_seed_tip_kat
     #   Under --arm-order p2p-first the embedded native node is the tip, the
     #   RandomX seed (hash + height, 2048-block epochs, 64-block lag) and the
