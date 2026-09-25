@@ -1091,6 +1091,26 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME v37_xmr_pinned_snapshot_kat COMMAND v37_xmr_pinned_snapshot_kat)
 
+    # RUN-A-NODE -- v37_xmr_run_a_node_check
+    #   Doc-lint KAT for the operator guide docs/xmr-lane/RUN-A-NODE.md:
+    #   scripts/xmr-run-a-node-check.sh runs every command block the guide
+    #   marks <!-- check --> in a scratch HOME (the build blocks are skipped
+    #   here: XMR_RUNNODE_SKIP_BUILD=1, the checkout plus this build tree stand
+    #   in for ~/c2pool), checks every flag the guide gives c2pool-v37-xmr (and
+    #   xmr_anchor_gen.py) against its --help, every repo path it names, and
+    #   every sha256/id it quotes against PINNED-SNAPSHOTS.md. RED without the
+    #   guide. The custom target only orders the build after c2pool-v37-xmr, so
+    #   the test never runs against a missing binary. Listed in both build.yml
+    #   --target lists.
+    if (TARGET c2pool-v37-xmr)
+        add_custom_target(v37_xmr_run_a_node_check)
+        add_dependencies(v37_xmr_run_a_node_check c2pool-v37-xmr)
+        add_test(NAME v37_xmr_run_a_node_check
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/xmr-run-a-node-check.sh)
+        set_tests_properties(v37_xmr_run_a_node_check PROPERTIES
+            ENVIRONMENT "XMR_RUNNODE_SKIP_BUILD=1;C2POOL_BUILD_DIR=${CMAKE_BINARY_DIR}")
+    endif()
+
     # D6d -- v37_xmr_d6d_native_seed_tip_kat
     #   Under --arm-order p2p-first the embedded native node is the tip, the
     #   RandomX seed (hash + height, 2048-block epochs, 64-block lag) and the
