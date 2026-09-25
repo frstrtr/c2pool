@@ -101,6 +101,11 @@ struct NativeChainSource {
     // The id is the hash of the blob, so a hit is byte-identical to get_block.
     std::function<bool(const std::string& bid_hex, std::vector<std::uint8_t>& blob)> block_blob;
 
+    // COLD-BOOT: ask the native node to fetch the body of `bid_hex` again over
+    // levin (and the next missing best-chain bodies above it), for a booking
+    // whose body was evicted before it was booked. Returns the ids newly asked.
+    std::function<std::size_t(const std::string& bid_hex)> want_body;
+
     // D6b: the receipt relay's chain-view feed (relay/xmr_relay_chain_feed.hpp)
     // -- the headers and tip the daemon arm fetches from monerod
     // (get_block_headers_range / get_block_header_by_height). Context blobs
@@ -192,6 +197,12 @@ inline NativeChainSource native_chain_source(NativeTemplateBackend& backend) {
         if (!e || e->block_blob.empty()) return false;
         blob = e->block_blob;
         return true;
+    };
+
+    src.want_body = [n](const std::string& bid_hex) -> std::size_t {
+        ::c2pool::xmr::node::Hash id{};
+        if (!block_id_of_hex(bid_hex, id)) return 0;
+        return n->index().want_body_for_booking(id);
     };
 
     src.tip_block = [n]() -> std::optional<std::pair<std::uint64_t, ::c2pool::xmr::node::Hash>> {

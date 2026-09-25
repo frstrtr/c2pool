@@ -317,6 +317,19 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_cba_native_booking_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_cba_native_booking_kat PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_cba_native_booking_kat COMMAND v37_xmr_cba_native_booking_kat)
+    # v37_xmr_coldboot_refetch_kat (COLD-BOOT): a fresh boot from an anchor far
+    # behind the tip evicts the oldest post-anchor bodies before they are booked;
+    # the booking asks them back (native index re-ask-by-id, bounded) and books
+    # byte-identical to a node that never evicted (REAL ChainIndex, 3000 blocks,
+    # cache 64, p2p-first FinalizeConnect), plus the fresh-store boot cursor
+    # seed. Builds on the pre-fix tree and FAILS there. SAME HOLLOW-GREEN GUARD:
+    # listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_coldboot_refetch_kat v37_xmr_coldboot_refetch_kat.cpp)
+    target_compile_features(v37_xmr_coldboot_refetch_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_coldboot_refetch_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_coldboot_refetch_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_coldboot_refetch_kat COMMAND v37_xmr_coldboot_refetch_kat)
+    set_tests_properties(v37_xmr_coldboot_refetch_kat PROPERTIES TIMEOUT 600)
     # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
     # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
     # (R4 gate kept, repair continues), never refused on a retry count; two nodes

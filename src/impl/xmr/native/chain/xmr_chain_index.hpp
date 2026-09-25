@@ -810,7 +810,60 @@ public:
         alt_.for_each([&out](const AltBlock& b) {
             if (b.bodies_missing && b.resolved) out.push_back(b.id);
         });
+        // COLD-BOOT: best-chain bodies the settlement booking asked back
+        // (want_body_for_booking). Same re-ask-by-id path (GET_OBJECTS, any
+        // peer, the driver's grace + re-ask timer); these are ids OUR OWN best
+        // chain connected, so asking for them is not the abuse surface the
+        // RESOLVED-only rule above guards.
+        for (const Hash& id : booking_wanted_)
+            if (!have_body_locked_(id) && !contains_hash_(out, id)) out.push_back(id);
         return out;
+    }
+
+    // ---- COLD-BOOT: body re-read for the settlement booking ----------------------------
+    // The coinbase-authority booking decodes EVERY best-chain block from its
+    // body (main: fetch_decode -> CbaBlockSource -> block_blob_of). A node that
+    // boots from an anchor older than the entry cache downloads the whole gap
+    // before its first booking, so the oldest bodies are evicted before they are
+    // booked -- and nothing ever fetched them again (the booking HELD forever,
+    // the cursor stuck, the lane suspended on lag). This is the safety net: the
+    // booking asks for the body back, the sync driver re-asks the network for
+    // it by id (bodies_wanted), and offer_block() re-caches it when it arrives.
+    // The cache keeps its bounds; the restored body is simply the newest entry,
+    // so it survives until the booking reads it. `ahead` also asks for the next
+    // best-chain bodies above it that are missing (chain-ordered booking will
+    // want them next), so a gap is refetched in batches, not one per round trip.
+    // The bytes are authenticated by the id itself (the id is recomputed from
+    // the blob in evaluate_block), so a restored body is byte-identical to the
+    // one that connected. Bounded: at most kBookingWantedMax ids outstanding.
+    static constexpr std::size_t kBookingWantedMax = 256;
+    std::size_t want_body_for_booking(const Hash& id, std::size_t ahead = 64) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (have_body_locked_(id)) return 0;
+        std::size_t added = 0;
+        auto want = [&](const Hash& h) {
+            if (have_body_locked_(h) || contains_hash_(booking_wanted_, h)) return;
+            booking_wanted_.push_back(h);
+            ++added;
+            while (booking_wanted_.size() > kBookingWantedMax) booking_wanted_.erase(booking_wanted_.begin());
+        };
+        want(id);
+        if (const auto h = rows_.height_of(id)) {
+            for (std::size_t k = 1; k < ahead; ++k) {
+                const RowRecord* r = rows_.by_height(*h + k);
+                if (!r) break;
+                want(r->row.id);
+            }
+        }
+        booking_refetch_asked_ += added;
+        return added;
+    }
+    struct BookingRefetchStats { std::uint64_t asked = 0, restored = 0; std::size_t outstanding = 0; };
+    BookingRefetchStats booking_refetch_stats() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::size_t n = 0;
+        for (const Hash& id : booking_wanted_) if (!have_body_locked_(id)) ++n;
+        return BookingRefetchStats{booking_refetch_asked_, booking_bodies_restored_, n};
     }
 
     // The state view, for consumers that need the consensus numbers themselves
@@ -889,6 +942,19 @@ private:
         }
 
         r.id = ev.input.identity.id;
+
+        // COLD-BOOT: a body the settlement booking asked back
+        // (want_body_for_booking). The id was recomputed from these bytes, so
+        // they are the block that connected; re-cache them (bounded cache,
+        // newest entry) whatever becomes of the offer below -- it is normally a
+        // Duplicate of a best-chain row, or below the retained rows.
+        if (ev.input.bodies_complete && contains_hash_(booking_wanted_, r.id)) {
+            erase_hash_(booking_wanted_, r.id);
+            if (entries_.find(key_(r.id)) == entries_.end()) {
+                cache_entry_locked_(r.id, entry, ev.input.parsed.tx_hashes);
+                ++booking_bodies_restored_;
+            }
+        }
 
         if (rows_.contains(r.id)) {
             r.outcome = OfferOutcome::Duplicate;
@@ -2655,6 +2721,7 @@ private:
         wanted_.clear();
         wanted_heights_.clear();
         refetch_.clear();
+        booking_wanted_.clear();
         queued_events_.clear();
         queued_tx_events_.clear();
         mined_stack_.clear();
@@ -2709,6 +2776,9 @@ private:
     std::vector<Hash> wanted_;
     std::vector<std::uint64_t> wanted_heights_;   // parallel to wanted_
     std::vector<Hash> refetch_;
+    std::vector<Hash> booking_wanted_;            // COLD-BOOT: bodies the booking asked back (bounded)
+    std::uint64_t     booking_refetch_asked_   = 0;
+    std::uint64_t     booking_bodies_restored_ = 0;
 
     std::vector<node::MainchainEvent> queued_events_;
     std::vector<BlockTxEvent>         queued_tx_events_;

@@ -345,6 +345,19 @@ public:
     std::uint64_t cursor_height() const { return m_cursor_h; }
     std::uint64_t event_seq()     const { return m_seq; }
 
+    // COLD-BOOT: seed the cursor of a FRESH store (cursor 0, no event, no
+    // high-water) at boot -- the anchor boot passes H_a - D_conf, the value the
+    // first walk would reach anyway (no found block can exist at or below the
+    // anchor on a fresh store), so the post-anchor blocks are booked as they are
+    // pumped instead of DEFERRED behind a cursor at 0. A resumed store (any
+    // cursor, event or high-water) is never touched: returns false.
+    bool seed_boot_cursor(std::uint64_t h) {
+        if (m_cursor_h != 0 || m_seq != 0 || m_hw.hw_height != 0 || !m_found.empty() || h == 0) return false;
+        m_cursor_h = h;
+        persist_cursor();
+        return true;
+    }
+
     // D2 (minority converges to majority): the event log was REWRITTEN to the
     // re-derived lineage and the ledger replayed from it (XmrNode::relineage).
     // Forget every found block this driver tracked (the consumer re-drives the

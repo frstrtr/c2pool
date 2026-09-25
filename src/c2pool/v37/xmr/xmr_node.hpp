@@ -272,6 +272,18 @@ public:
         return fresh;
     }
 
+    // COLD-BOOT: seed a FRESH store's finalize cursor (see
+    // XmrFinalizeDriver::seed_boot_cursor). Call after bring_up(), before the
+    // first mainchain event is pumped. false = resumed store / not brought up.
+    bool seed_fresh_cursor(std::uint64_t h) {
+        if (!m_finalize) return false;
+        const bool ok = m_finalize->seed_boot_cursor(h);
+        log(std::string("cold-boot: finalize cursor ") + (ok ? "SEEDED at " + std::to_string(h) + " (fresh store, anchor boot)"
+                                                            : "not seeded (resumed store: cursor " +
+                                                              std::to_string(m_finalize->cursor_height()) + ")"));
+        return ok;
+    }
+
     // The consumer's booking gate (FinalizeConnect R4/R6). The node composes it
     // with its own gap gate; install through here, not on the driver directly.
     void set_booking_gate(XmrFinalizeDriver::BookingGateFn g) { m_consumer_gate = std::move(g); }

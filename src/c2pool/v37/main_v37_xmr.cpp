@@ -172,6 +172,7 @@ static long long     g_credit_mutate = 0;      // --credit-mutate N: +N piconero
 static bool          g_no_book_deferral = false;         // --no-book-deferral: A/B escape hatch (reintroduces the lagging-receiver fork)
 // D6a (xmr/xmr_cba_block_source.hpp): p2p-first books from the native index; monerod is opt-in only.
 static bool          g_cba_monerod_compare = false;      // --cba-monerod-compare: compare-only oracle (counts, never decides)
+static std::uint64_t g_cba_refetch_bound = 120;          // --cba-refetch-bound: COLD-BOOT body refetch requests per block (0 = off)
 static bool          g_cba_monerod_fallback = false;     // --cba-monerod-fallback: a native miss asks monerod instead of HOLDING
 static bool          g_relay_feed_monerod_compare = false;   // --relay-feed-monerod-compare: D6b compare-only oracle (counts, never decides)
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
@@ -1368,6 +1369,20 @@ static int run_live(const XmrNodeConfig& cfg) {
         return 1;
     }
     for (const auto& line : node.construction_log()) std::printf("  %s\n", line.c_str());
+    // COLD-BOOT (1): a FRESH settlement store booting from an anchor starts its
+    // finalize cursor at H_a - D_conf (the value its first walk reaches anyway),
+    // BEFORE the first post-anchor block is pumped, so every post-anchor block is
+    // booked as it is pumped instead of DEFERRED behind a cursor at 0. A resumed
+    // store (#1767 restart, any cursor/event) is left exactly as recovered.
+    if (p2p_first && native && native->node()) {
+        const std::uint64_t ha = native->node()->index().anchor_height();
+        if (ha > cfg.d_conf) {
+            const bool seeded = node.seed_fresh_cursor(ha - cfg.d_conf);
+            std::printf("cold-boot: anchor H_a=%llu -> finalize cursor %s\n", static_cast<unsigned long long>(ha),
+                        seeded ? ("SEEDED at " + std::to_string(ha - cfg.d_conf) + " (fresh store)").c_str()
+                               : ("kept at " + std::to_string(node.finalize_driver().cursor_height()) + " (resumed store)").c_str());
+        }
+    }
 
     // ── wire 4: finalize connect (main thread) — BEFORE the listener and BEFORE
     //    the first pump_poll, so a pending FOUND from the sidecar is re-driven
@@ -1576,6 +1591,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         },
         o2::CbaBlockSourceOptions{g_cba_monerod_compare, g_cba_monerod_fallback},
         [](const std::string& line) { std::printf("%s\n", line.c_str()); std::fflush(stdout); });
+    // COLD-BOOT (2): the safety net. A body the index connected but evicted before
+    // it was booked is fetched again over levin (bounded), never read from monerod.
+    if (cba_src.native_mode() && chain_src.want_body && g_cba_refetch_bound)
+        cba_src.set_refetch([&chain_src](const std::string& bid) { (void)chain_src.want_body(bid); }, g_cba_refetch_bound);
+    std::printf("cba: booking body refetch (levin) %s\n",
+                cba_src.refetch_armed() ? ("ARMED, bound " + std::to_string(g_cba_refetch_bound) + " requests/block").c_str() : "off");
     std::printf("cba: booking block source = %s (monerod compare oracle %s, monerod fallback %s)\n",
                 cba_src.native_mode() ? "NATIVE chain index (no get_block)" : "monerod get_block",
                 g_cba_monerod_compare ? "ON" : "off", g_cba_monerod_fallback ? "ON" : "off");
@@ -3158,6 +3179,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cs.rpc_calls, (unsigned long long)cs.rpc_failed,
                             (unsigned long long)cs.compare_equal, (unsigned long long)cs.compare_mismatch, (unsigned long long)cs.compare_unavailable,
                             (unsigned long long)cs.fallback_used);
+                if (cba_src.refetch_armed()) {   // COLD-BOOT: evicted-body refetch (levin)
+                    std::uint64_t ia = 0, ir = 0; std::size_t io = 0;
+                    if (p2p_first && native && native->node()) {
+                        const auto bs = native->node()->index().booking_refetch_stats();
+                        ia = bs.asked; ir = bs.restored; io = bs.outstanding;
+                    }
+                    std::printf("  cba-refetch: requested=%llu restored_booked=%llu exhausted=%llu | index asked=%llu restored=%llu outstanding=%zu\n",
+                                (unsigned long long)cs.refetch_requested, (unsigned long long)cs.refetch_restored,
+                                (unsigned long long)cs.refetch_exhausted, (unsigned long long)ia, (unsigned long long)ir, io);
+                }
             }
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
@@ -3502,6 +3533,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-book-deferral")        g_no_book_deferral = true;
         else if (a == "--cba-monerod-compare")     g_cba_monerod_compare = true;
         else if (a == "--cba-monerod-fallback")    g_cba_monerod_fallback = true;
+        else if (a == "--cba-refetch-bound")      g_cba_refetch_bound = std::stoull(next("120"));
         else if (a == "--relay-feed-monerod-compare") g_relay_feed_monerod_compare = true;
         // GAP-2 relay knobs
         else if (a == "--relay-listen")             g_relay_listen = next("");
@@ -3634,6 +3666,9 @@ int main(int argc, char** argv) {
                 "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
                 "  --cba-monerod-compare        p2p-first: ALSO fetch each booked block from monerod and\n"
                 "                               count equal/mismatch (compare-only oracle; never decides)\n"
+                "  --cba-refetch-bound <n>      p2p-first: a booking whose body the native index evicted asks the\n"
+                "                               node to refetch it over levin, up to <n> requests per block\n"
+                "                               (default 120; 0 = off: the block HOLDS as before)\n"
                 "  --cba-monerod-fallback       p2p-first: a block the native index no longer holds is read\n"
                 "                               from monerod instead of HELD (explicit opt-in; default HOLD)\n"
                 "  --relay-feed-monerod-compare p2p-first: ALSO fetch the relay chain-view window from monerod\n"
