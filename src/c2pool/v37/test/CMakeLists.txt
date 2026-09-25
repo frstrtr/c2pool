@@ -516,8 +516,13 @@ if (BUILD_TESTING)
     #                               readers are reaped, the accept loop backs
     #                               off on EMFILE and the relay heals after a
     #                               partition_for().
+    #   v37_xmr_relay_pool_id_kat   POOL-ID: the roundabout S1 lane_tag in
+    #                               HELLO; another pool's node (geometry /
+    #                               chain_id / consensus version) is refused
+    #                               as TAG_MISMATCH in both directions and
+    #                               nothing crosses; same pool unchanged.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp

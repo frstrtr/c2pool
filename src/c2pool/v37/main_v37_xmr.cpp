@@ -2323,6 +2323,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind,
                                                             ro.network);   // S4: + FeeModelGate (+ this network's donation identity) iff ON
             ro.max_pushes_per_receipt = fee_on ? 2 : 1;   // fee model S3: (payee, donation) split
+            // POOL-ID: the roundabout S1 lane_tag of THIS node's pool (own chain_id,
+            // LaneParams geometry, shipped consensus version, authority 0;
+            // map_epoch/rb_index/stripe 0), carried in HELLO; a peer of another
+            // pool is refused at HELLO as TAG_MISMATCH.
+            ro.pool_id = relay::pool_id_of(cfg.lane_chain, cfg.lane_params);
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -2448,6 +2453,11 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)g_relay_horizon, g_relay_rx_budget.c_str(), io.durable_path.c_str(), reloaded,
                             s ? (unsigned long long)s->next_pos : 0ULL, s ? hex_of(s->digest).substr(0, 12).c_str() : "-",
                             rxp->describe().c_str());
+                std::printf("relay: POOL-ID lane_tag=%s chain_id=%u version=%u authority=%u geometry=%s (HELLO %zu B)\n",
+                            relay::hex32(ro.pool_id->lane_tag).c_str(), static_cast<unsigned>(cfg.lane_chain),
+                            ro.pool_id->version, ro.pool_id->authority,
+                            relay::hex32(::c2pool::v37n::rb::geometry_digest(cfg.lane_params)).c_str(),
+                            relay::kHelloBytesPoolId);
                 if (bind == relay::BindMode::None)
                     std::printf("relay: NOTE bind=none -- receipts are PoW-verified (opening -> tree_root -> RandomX >= share_diff) "
                                 "but the payee/give-author are NOT PoW-bound (run --relay-bind rbind: SEAM-1 writes rbind into the coinbase 0x02 region)\n");
