@@ -190,6 +190,9 @@ struct RelayOptions {
     u64         share_diff = 0;
     bytes32     lane_params_digest{};
     BindMode    bind = BindMode::None;
+    // POOL-ID: this node's roundabout lane_tag (pool_id_of()), sent in HELLO and
+    // compared with every peer's. nullopt = a tagless (pre-POOL-ID) HELLO.
+    std::optional<PoolId> pool_id;
     bool        listen = false;                   // false = dial-only
     std::string listen_host = "127.0.0.1";
     u16         listen_port = 0;                  // 0 = an ephemeral port (tests), read back via listen_port()
@@ -228,6 +231,7 @@ struct RelayOptions {
 
 struct RelayStats {
     std::atomic<u64> hello_sent{0}, hello_ok{0}, hello_rejected{0}, hello_timeout{0}, pre_hello_dropped{0};
+    std::atomic<u64> hello_tag_mismatch{0};       // POOL-ID: HELLOs refused as TAG_MISMATCH (also in hello_rejected)
     std::atomic<u64> fa_ignored{0}, fb_unknown{0}, malformed{0}, wrong_chain{0};
     std::atomic<u64> rx_receipts{0}, dup{0}, queue_dropped{0}, unresolved_dropped{0}, expired{0};
     std::atomic<u64> structural{0}, rx_deferred{0}, rx_evals{0}, rx_valid{0}, rx_invalid{0}, rx_unavailable{0}, bans{0};
@@ -464,7 +468,7 @@ public:
         Hello h;
         h.network = m_o.network; h.chain_id = m_o.chain; h.lane_params_digest = m_o.lane_params_digest;
         h.share_diff = m_o.share_diff; h.node_nonce = m_nonce; h.listen_port = m_net.listen_port();
-        h.bind = m_o.bind;
+        h.bind = m_o.bind; h.pool = m_o.pool_id;
         if (m_tip) { const auto t = m_tip(); h.lane_next_pos = t.first; h.lane_digest = t.second; }
         return h;
     }
@@ -648,7 +652,7 @@ public:
             "won tx=%llu rx=%llu | repair start=%llu order_ok=%llu spine_mis=%llu peer_fail=%llu ids=%llu ready=%llu rejected=%llu open=%zu | "
             "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu | "
             "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
-            "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu",
+            "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu",
             m_net.n_peers(), ready_peers().size(),
             (unsigned long long)s.hello_ok.load(), (unsigned long long)s.hello_rejected.load(), (unsigned long long)s.hello_timeout.load(),
             (unsigned long long)s.rx_receipts.load(), (unsigned long long)s.dup.load(), (unsigned long long)s.structural.load(),
@@ -671,7 +675,8 @@ public:
             (unsigned long long)s.ctx_unknown_rx.load(), (unsigned long long)s.ctx_gave_up.load(),
             (unsigned long long)s.ctx_served.load(), (unsigned long long)s.ctx_unknown_tx.load(),
             (unsigned long long)s.repair_refetch.load(), (unsigned long long)s.repair_evicted.load(),
-            (unsigned long long)s.upgraded_solicited.load(), (unsigned long long)s.unresolved_solicited_dropped.load());
+            (unsigned long long)s.upgraded_solicited.load(), (unsigned long long)s.unresolved_solicited_dropped.load(),
+            (unsigned long long)s.hello_tag_mismatch.load());
         return b;
     }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
@@ -864,6 +869,7 @@ private:
         const std::string mis = hello_mismatch(our_hello(), h);
         if (!mis.empty()) {
             m_st.hello_rejected++;
+            if (is_tag_mismatch(mis)) m_st.hello_tag_mismatch++;   // POOL-ID: another pool's node
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
                 m_last_reject = "hello: " + mis;
