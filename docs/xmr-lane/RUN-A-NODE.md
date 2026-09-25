@@ -34,7 +34,7 @@ Commands marked `<!-- check -->` in the source of this file are run by
 <!-- check build -->
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential g++-13 git python3-venv libsecp256k1-dev curl openssl rsync
+sudo apt-get install -y --no-upgrade build-essential g++-13 git python3-venv libsecp256k1-dev curl openssl rsync
 ```
 
 If `apt-get` says `Could not get lock /var/lib/dpkg/lock-frontend ... held by
@@ -61,12 +61,14 @@ conan profile detect --force
 
 Get the source and pick the ref to build. `REF` is a release tag. **No
 release tag for the XMR node exists yet (not yet).** Until one does, use
-`master` or the commit your pool operator names. The ref must include the
-pinned snapshot boot (`docs/xmr-lane/PINNED-SNAPSHOTS.md` exists in it).
+the commit your pool operator names, and set it before the block below
+(`REF=<that commit>`). `master` does not work yet: it does not have the
+pinned snapshot boot. The ref must include it
+(`docs/xmr-lane/PINNED-SNAPSHOTS.md` exists in it).
 
 <!-- check build -->
 ```sh
-REF=master   # replace with the release tag or commit your pool runs
+: "${REF:?set REF first, e.g. REF=1a2b3c4 (the release tag or commit your pool operator names)}"
 git clone --filter=blob:none https://github.com/frstrtr/c2pool.git ~/c2pool
 cd ~/c2pool
 git checkout "$REF"
