@@ -63,7 +63,7 @@ while True:
                         eager_due = time.time() + eager_delay
                         log("eager armed h=%d" % jh)
             except socket.timeout:
-                pass
+                pass  # no stratum message within the poll window; keep looping
             if job and rpcid and eager_due is not None and time.time() >= eager_due:
                 eager_due = None
                 submit("(EAGER)")
