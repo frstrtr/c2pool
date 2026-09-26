@@ -50,11 +50,15 @@ struct MinerDataReadiness {
     bool weight_window     = false;  // short + long-term weight windows available
     bool coins_known       = false;  // already_generated_coins carried forward
     bool hf_known          = false;  // major/minor version resolved and not fenced
+    // TXPOOL-RESUME: the source's tx pool is warm (a (re)started native node
+    // finished its first complement back-fill round, or its bounded timeout
+    // ran out). True by default: only a source wired to a warm gate withholds.
+    bool pool_warm         = true;
     std::string why;                 // first missing input, for the log line
 
     bool ok() const noexcept {
         return tip_known && seed_reach && difficulty_window
-            && weight_window && coins_known && hf_known;
+            && weight_window && coins_known && hf_known && pool_warm;
     }
 };
 
