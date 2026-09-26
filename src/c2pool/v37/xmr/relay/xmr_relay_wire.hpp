@@ -25,6 +25,9 @@
 //         0x43 FB_GETCTX     repair: ask for the Monero block a receipt was mined on
 //         0x44 FB_CTX        the answer: that block's full blob (or "unknown here")
 //       (a pre-0x43 node counts 0x43/0x44 as fb_unknown and KEEPS the socket)
+//         0x45 FB_PING       RELAY-LIVENESS keepalive probe (u64 nonce; no consensus bytes)
+//         0x46 FB_PONG       its echo (same nonce)
+//       (a pre-0x45 node counts 0x45/0x46 as fb_unknown and KEEPS the socket)
 //     0x80..0x83   carrier_supply.hpp GETORDER/ORDER/GETFRAMES/FRAMES (reused)
 //
 // Every integer is little-endian, every decoder is TOTAL and BOUNDED (a bad
@@ -100,6 +103,8 @@ inline constexpr u8  FB_RECEIPTS  = 0x41;
 inline constexpr u8  FB_BLOCK_WON = 0x42;
 inline constexpr u8  FB_GETCTX    = 0x43;
 inline constexpr u8  FB_CTX       = 0x44;
+inline constexpr u8  FB_PING      = 0x45;   // RELAY-LIVENESS
+inline constexpr u8  FB_PONG      = 0x46;   // RELAY-LIVENESS
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -605,6 +610,36 @@ inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std
     if (len > kCtxMaxBlob) return bad("ctx: blob over 512 KiB");
     if (f.size() != kCtxHeader + len) return bad("ctx: wrong length");
     blob.assign(f.begin() + static_cast<std::ptrdiff_t>(kCtxHeader), f.end());
+    return true;
+}
+
+// ── FB_PING (0x45) / FB_PONG (0x46): RELAY-LIVENESS keepalive ────────────────
+// Capstone attempt 2: a WAN relay link went silent in BOTH directions for
+// ~3.5 min while TCP kept both sessions up (conns=2 ready=2), so each side
+// closed lane bins without the other side's receipts. A ready peer is now
+// probed with PING every keepalive interval; any frame it sends (a PONG, a
+// receipt, a supply answer) proves the link alive. A link whose peer ANSWERED
+// a PING on it and then stays silent past the silence timeout is dropped and
+// redialed (xmr_relay_node.hpp, RELAY-LIVENESS). The frame carries only a
+// sender nonce: nothing here enters a lane, a digest or a coinbase.
+//   PING : u8 0x45 ; u8 ver ; u64 nonce      (10 B)
+//   PONG : u8 0x46 ; u8 ver ; u64 nonce      (10 B, the PING nonce echoed)
+// A pre-0x45 peer counts both as fb_unknown and keeps the socket; it never
+// answers, so the silence timeout is never enforced against it.
+inline constexpr std::size_t kPingBytes = 1 + 1 + 8;
+inline std::vector<u8> encode_ping(u8 op, u64 nonce) {
+    if (op != FB_PING && op != FB_PONG) return {};
+    std::vector<u8> f; f.reserve(kPingBytes);
+    f.push_back(op); f.push_back(kFbVersion); le::put64(f, nonce);
+    return f;
+}
+inline bool decode_ping(const std::vector<u8>& f, u8& op, u64& nonce, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() != kPingBytes) return bad("ping: wrong length");
+    if (f[0] != FB_PING && f[0] != FB_PONG) return bad("ping: wrong opcode");
+    if (f[1] != kFbVersion) return bad("ping: unknown version");
+    op = f[0];
+    nonce = le::get64(f.data() + 2);
     return true;
 }
 
