@@ -108,6 +108,8 @@
 #include <sharechain/v37/v37_descriptor_xmr.hpp>    // xmr_ref_valid, is_xmr_kind, xmr_precarrot_ok
 #include <sharechain/v37/v37_hash.hpp>              // bytes32
 #include <c2pool/v37/xmr/xmr_credit_cut.hpp>         // recon(A+B credit): the on-chain credit cut tail
+#include <c2pool/v37/xmr/xmr_fee_model.hpp>          // fee model: the donation owed_in tail (V37D)
+#include <c2pool/v37/xmr/xmr_paynow.hpp>             // SAME-BLOCK PAY-NOW: the V37N base tail
 
 #include "impl/xmr/coin/xmr_crypto_types.hpp"       // Bytes32, PublicKey, SecretKey, Hash256
 #include "impl/xmr/settle/xmr_coinbase.hpp"         // X6: CoinbaseInputs, build_coinbase, allocate_exact_sum, ...
@@ -191,7 +193,7 @@ struct XmrCoinbaseContext {
     // --- lane parameters (consensus once tapped; explicit flags until then) ---
     ::v37::ScriptRef      residual_sink;              // mandated absorber, XMR ref (REQUIRED, torsion-checked)
     ::v37::bytes32        residual_sink_identity{};   // its ledger identity_key (payout-map key)
-    std::vector<x6::FixedOutput> fixed;               // mandated dev/donation/finder outputs (optional)
+    std::vector<x6::FixedOutput> fixed;               // mandated fixed outputs: empty, or the ONE donation output (fee model ON; NO finder output)
     std::uint64_t         h_min = 0;                  // piconero floor per owed output (dust = 0 on XMR)
     std::uint32_t         output_cap = 0;             // TOTAL outputs cap C (weight_aware_output_cap(...))
 
@@ -199,6 +201,18 @@ struct XmrCoinbaseContext {
     // winner folds E_b at. Carried as the 0x02 tail (xmr_credit_cut.hpp).
     bool                  has_credit_cut = false;
     credit::CreditCut     credit_cut;
+    // POOL-LINEAGE: the pool_tag this pool commits in the V37C tail (the V37P
+    // field, xmr_credit_cut.hpp). Unset => no field (master's bytes).
+    bool                  has_pool_tag = false;
+    ::v37::bytes32        pool_tag{};
+
+    // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): the projected lane payees AT the
+    // credit cut above (settle::project of the view fold_eb reads there), so
+    // E_b at any budget is settle::split_reward(budget, paynow_payees) --
+    // byte-for-byte the credit every node books at finalization. Empty /
+    // has_paynow == false => no pay-now (master's residual behaviour).
+    bool                  has_paynow = false;
+    std::vector<::c2pool::v37n::settle::WeightedPayee> paynow_payees;
 
     std::uint64_t budget() const { return base_reward + fees; }
 };
@@ -246,7 +260,12 @@ public:
             if (!::v37::xmr::xmr_ref_valid(f.pay))
                 return refuse("refused: a fixed output is not a valid XMR ref");
         }
-        if (ctx.output_cap < ctx.fixed.size() + 1)
+        // fee model S1: when the last fixed output pays the sink it absorbs the
+        // residual itself (x6::residual_folds_into_fixed) -- no sink slot.
+        const bool sink_folds = !ctx.fixed.empty() && ctx.fixed.back().pay == ctx.residual_sink &&
+                                ctx.fixed.back().identity == ctx.residual_sink_identity;
+        const std::size_t sink_slots = sink_folds ? 0 : 1;
+        if (ctx.output_cap < ctx.fixed.size() + sink_slots)
             return refuse(std::string("refused: ") + x6::to_string(x6::BuildError::CapTooSmall));
         if (reward_hint == 0)
             return refuse(std::string("refused: ") + x6::to_string(x6::BuildError::ZeroBudget));
@@ -294,12 +313,16 @@ public:
         };
 
         const unsigned cap_owed = static_cast<unsigned>(
-            std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - 1,
+            std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - sink_slots,
                                   std::numeric_limits<unsigned>::max()));
 
         if (source == KFairSource::W4Propose) {
             // W4 canon picks the set over budget - Σfixed with C = cap - fixed - sink.
-            const std::uint64_t owed_budget = reward_hint - fixed_sum;
+            // fee model S2: a folded donation output's minimum is NOT reserved
+            // here -- X6 sources it from the residual, else from the LARGEST
+            // owed output (allocate_exact_sum), so W4 proposes over it too.
+            const std::uint64_t owed_budget =
+                reward_hint - fixed_sum + (sink_folds ? ctx.fixed.back().amount : 0);
             auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
                                                   : std::numeric_limits<std::uint64_t>::max();
@@ -335,8 +358,62 @@ public:
         }
         s->m_unpayable = unpayable;
 
+        // ---- SAME-BLOCK PAY-NOW (operator ruling 09-25, xmr_paynow.hpp) ----
+        // Armed only on the default W4Propose source with a committed credit
+        // cut and every cut payee resolvable to a payable XMR ref (the receive
+        // side maps outputs through the same learned refs). The base B = Σ owed
+        // takes + Σ fixed is reward-independent, so the V37N tail is fixed for
+        // the snapshot's life like V37D.
+        if (ctx.has_paynow && ctx.has_credit_cut && source == KFairSource::W4Propose &&
+            !ctx.paynow_payees.empty()) {
+            struct PayNowSet {
+                std::vector<::c2pool::v37n::settle::WeightedPayee> wp;
+                std::map<::v37::bytes32, ::v37::ScriptRef> ref;
+            };
+            auto pv = std::make_shared<PayNowSet>();
+            pv->wp = ctx.paynow_payees;
+            bool payable = true;
+            for (const auto& w : pv->wp) {
+                if (pv->ref.count(w.key)) continue;
+                const ::v37::ScriptRef r = pay_of(w.key);
+                if (!::v37::xmr::xmr_ref_valid(r)) { payable = false; break; }
+                pv->ref[w.key] = r;
+            }
+            if (payable) {
+                std::uint64_t base = fixed_sum;
+                for (const auto& e : in.owed) base += e.owed;
+                std::shared_ptr<const PayNowSet> cpv = pv;
+                in.paynow_at = [cpv](std::uint64_t budget) {
+                    const std::vector<std::uint64_t> amt = ::c2pool::v37n::settle::split_reward(budget, cpv->wp);
+                    std::map<::v37::bytes32, std::uint64_t> agg;   // == fold_eb's credit map (key ASC)
+                    for (std::size_t i = 0; i < cpv->wp.size(); ++i)
+                        if (amt[i] > 0) agg[cpv->wp[i].key] += amt[i];
+                    std::vector<x6::PayNowEntry> out;
+                    out.reserve(agg.size());
+                    for (const auto& [k, v] : agg) {
+                        x6::PayNowEntry e;
+                        e.pay = cpv->ref.at(k);
+                        e.identity = k;
+                        e.eb = v;
+                        out.push_back(std::move(e));
+                    }
+                    return out;
+                };
+                in.paynow_n = pv->ref.size();
+                s->m_paynow_on = true;
+                s->m_paynow_base = base;
+            }
+        }
+
         // ---- run X6 once at reward_hint: fixes r, R, keys, view tags, MM leaf, ORDER ----
         s->m_built = x6::build_coinbase(s->inputs_at(reward_hint, {}));
+        if (!s->m_built.ok && s->m_paynow_on && s->m_built.error == x6::BuildError::CapTooSmall) {
+            // pay-now needs output slots the cap does not have: this snapshot
+            // serves master's residual shape and commits no V37N base.
+            in.paynow_at = nullptr; in.paynow_n = 0;
+            s->m_paynow_on = false; s->m_paynow_base = 0;
+            s->m_built = x6::build_coinbase(s->inputs_at(reward_hint, {}));
+        }
         if (!s->m_built.ok)
             return refuse(std::string("refused: X6 build_coinbase: ") + s->m_built.detail);
 
@@ -413,8 +490,32 @@ public:
     [[nodiscard]] std::uint64_t merkle_tree_data() const override { return 0; }
 
     // recon(A+B credit): the credit cut as the 0x02 tail (empty when the ctx has none).
+    // fee model: when the residual folds into the donation output (gate ON
+    // only), the donation owed_in commitment "V37D" u64le goes first, so the
+    // receive side splits the ONE donation output without the ledger
+    // (xmr_fee_model.hpp). owed_in is reward-independent (the snapshot's
+    // input set), so the tail is fixed for the snapshot's life.
     [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
-        return m_ctx.has_credit_cut ? credit::encode_tail(m_ctx.credit_cut) : std::vector<std::uint8_t>{};
+        std::vector<std::uint8_t> t;
+        // Canonical 0x02 tail order (PAY-NOW on POOL-LINEAGE):
+        //     [ nonce | rbind? | pad | "V37N" B? | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine? ]
+        // V37C stays LAST (parse_tail unchanged), V37P sits right before it
+        // (parse_pool_tag), V37D before V37P, V37N first; every reader strips
+        // the fields after its own from the end (xmr_paynow.hpp parse_payload).
+        if (m_paynow_on) t = paynow::encode_tail(m_paynow_base);   // SAME-BLOCK PAY-NOW base (V37N), first
+        if (x6::residual_folds_into_fixed(m_inputs)) {
+            const std::vector<std::uint8_t> d = fee::encode_donation_owed_tail(x6::fold_identity_owed(m_inputs));
+            t.insert(t.end(), d.begin(), d.end());
+        }
+        if (m_ctx.has_pool_tag) {   // POOL-LINEAGE: V37P just before the credit cut
+            const std::vector<std::uint8_t> f = credit::encode_pool_tag_field(m_ctx.pool_tag);
+            t.insert(t.end(), f.begin(), f.end());
+        }
+        if (m_ctx.has_credit_cut) {
+            const std::vector<std::uint8_t> c = credit::encode_tail(m_ctx.credit_cut);
+            t.insert(t.end(), c.begin(), c.end());
+        }
+        return t;
     }
 
     // =====================================================================
@@ -434,6 +535,9 @@ public:
     const ::v37::bytes32&     owed_digest()  const { return m_owed_digest; }
     // Ledger keys with EffectiveOwed > 0 that were CARRIED as unpayable.
     std::size_t               carried_unpayable() const { return m_unpayable; }
+    // SAME-BLOCK PAY-NOW: armed for this snapshot, and its committed base B.
+    bool                      paynow_on()   const { return m_paynow_on; }
+    std::uint64_t             paynow_base() const { return m_paynow_base; }
 
     // The full X6 result at reward_hint (empty extra_nonce => no 0x02 tag; use
     // build_at() for the template-equal tx_extra).
@@ -530,6 +634,8 @@ private:
     std::uint64_t        m_ledger_seq = 0;
     ::v37::bytes32       m_owed_digest{};
     std::size_t          m_unpayable = 0;
+    bool                 m_paynow_on = false;
+    std::uint64_t        m_paynow_base = 0;
 
     x6::CoinbaseInputs   m_inputs;     // fixed part; reward + extra_nonce applied per query
     x6::BuiltCoinbase    m_built;      // X6 at reward_hint: r, R, keys, view tags, mm_root, order

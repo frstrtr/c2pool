@@ -293,6 +293,9 @@ static std::uint32_t skeleton_random32() {
 
 bool XmrStratumServer::make_job(XmrStratumSession& s, std::uint32_t extra_nonce,
                                 JobNotify& out) {
+    // SEAM-1: bind this job's extra_nonce (payee + give-author) before its
+    // blob is built -- the template writes the binding into the coinbase.
+    if (m_job_binder) m_job_binder(extra_nonce, s.login().address);
     TemplateJob tj;
     if (!m_templates.get_job(extra_nonce, tj)) return false;
 

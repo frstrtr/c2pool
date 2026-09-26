@@ -87,6 +87,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "impl/xmr/native/contracts/chain_index.hpp"
 #include "impl/xmr/native/contracts/outputs.hpp"
 #include "impl/xmr/native/contracts/txpool.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
@@ -239,6 +240,11 @@ struct TxpoolStats {
     std::uint64_t rejected_key_image_spent = 0;
     std::uint64_t unresolved_ring          = 0;
     std::uint64_t rejected_member_locked   = 0;
+    // Refused because the chain already mined it / spent one of its key images.
+    std::uint64_t rejected_already_mined   = 0;
+    // Refused as NOT UNDERSTOOD: a format above the implemented fork (tx
+    // version > 2, or rct type > 6). Never a drop offence.
+    std::uint64_t rejected_not_understood  = 0;
 
     // Entries a snapshot LEFT OUT because their ring was unresolved and the
     // select policy is Exclude (the default). This distinguishes "the block was
@@ -246,6 +252,14 @@ struct TxpoolStats {
     // pooled tx had an unverifiable ring" -- the sensor the SPV-mining critique
     // is closed against: on a covered node it stays 0 while blocks fill.
     std::uint64_t excluded_unresolved      = 0;
+
+    // TXPOOL-RESUME: relays refused by the fail-closed sync gate (also in
+    // `rejected`), and how often the pool's chain context (tip_height_) was
+    // seated from the index rather than from a connected block -- the
+    // snapshot-resume case, where no block connects until the next one is
+    // found and every ring member used to look unspendable against height 0.
+    std::uint64_t rejected_not_synced      = 0;
+    std::uint64_t tip_seated               = 0;
 };
 
 // --- the pool ----------------------------------------------------------------
@@ -270,6 +284,7 @@ public:
     std::vector<node::TxBacklogEntry> selectable_backlog(const TxpoolSelectPolicy&) const override;
     TxpoolSelectPolicy policy() const override;
     std::uint64_t      backlog_version() const override;
+    std::vector<Hash>  key_images_of(const Hash& id) const override;
 
     // --- ITxSource (C3 -> C2) ----------------------------------------------
     bool get_tx(const Hash& id, std::vector<std::uint8_t>& full_blob) override;
@@ -288,11 +303,38 @@ public:
     // never trust them for validity -- they are re-decoded and re-verified.
     void on_block_connected(const BlockTxEvent& ev);
     void on_block_disconnected(const BlockTxEvent& ev);
+    // on_block_disconnected in its two halves, so a caller can apply the cheap
+    // tip bookkeeping synchronously (in chain order) and post the re-admission
+    // (a full decode + verify per body) to the pool thread. The mined oracle
+    // (set_mined_oracle) keeps a late re-admit from putting back a tx the NEW
+    // branch mined.
+    void note_block_disconnected(const BlockTxEvent& ev);
+    void readmit_disconnected(const BlockTxEvent& ev);
+
+    // The chain index's mined oracle (IChainView::probe_mined against the
+    // current tip): consulted at admission, so a transaction already in the
+    // best chain -- or spending a key image the chain already spent -- is
+    // refused as AlreadyMined whatever path it arrives by (a reorg re-admit
+    // racing the new branch's connect, a peer relaying a mined tx late).
+    // Borrowed; nullptr disables. Must never call back into the pool.
+    void set_mined_oracle(const IChainView* chain);
 
     // Fail-closed relay gate: no transaction is admitted before C2 says the
     // index is at the tip, mirroring monerod's is_synchronized() gate.
     void set_synced(bool synced);
     bool synced() const;
+
+    // TXPOOL-RESUME: seat the chain context (the tip the next block extends)
+    // from the index when no block event has delivered it yet. A snapshot
+    // resume installs the index at its saved tip WITHOUT connecting a block,
+    // so on_block_connected never ran and tip_height_ stayed 0: every relayed
+    // transaction was then judged against block 1 and refused RingMemberLocked
+    // (each ring member "younger than 10 blocks" against height 1) until the
+    // next block connected -- a coinbase-only template for a whole block after
+    // every restart. A no-op once a block event has set the tip, so a late or
+    // stale seat can never walk the context back. Returns whether it seated.
+    bool seat_tip(std::uint64_t tip_height);
+    bool tip_known() const;
 
     // Wire the two chain-derived views the INPUT-consensus step needs: the ring
     // member source (resolve absolute offsets -> (dest, mask)) and the on-chain
@@ -351,10 +393,13 @@ private:
     // Input-consensus wiring (borrowed; null until set_input_consensus_sources).
     const IRingMemberSource*  ring_src_   = nullptr;
     const ISpentKeyImageView* spent_view_ = nullptr;
+    const IChainView*         mined_oracle_ = nullptr;
     // The height of the last connected block, i.e. the tip. A transaction is
     // judged against the block we would mine next, tip_height_ + 1, for the
     // spendable-age and unlock-time rules. Set in on_block_connected.
     std::uint64_t             tip_height_ = 0;
+    // Set by the first block event or by seat_tip(); see seat_tip().
+    bool                      tip_known_  = false;
 };
 
 } // namespace c2pool::xmr::native

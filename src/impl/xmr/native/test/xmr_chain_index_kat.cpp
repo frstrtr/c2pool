@@ -46,6 +46,9 @@
 //   J. MIRROR         -- the long-term weight mirror equals the consensus
 //                        state's own window at every height (what makes a
 //                        snapshot below the tip exact).
+//   K. NEAR-TIP       -- a bodiless push resolved when its parent connects is
+//                        listed for a bodies fetch and is not peeled by a failed
+//                        switch; a held parent keeps its children's edges.
 //
 // The blocks are built here, byte by byte, in monerod's block format: that is
 // what lets the test drive REAL stagenet header values (timestamps, versions,
@@ -371,17 +374,33 @@ static void test_wire_validation() {
     idx.on_chain_entry(p, entry_with({fake_id(777), fake_id(778)}, 10, 1000, {}));
     checkf(idx.chain_entries_refused() == 5, "wire: unknown splice point was not refused");
 
-    // 6. A well-formed entry is accepted, and what we do not have becomes a
-    //    fetch request -- chunked to monerod's 100-id request cap by the fetcher.
+    // 6. A well-formed entry is accepted, and what we do not have becomes the
+    //    want list the sync driver fetches from (refetch_wanted()). The index
+    //    itself puts nothing on the wire: a whole entry sent as one span was
+    //    the mainnet catch-up livelock (nothing connects until all ~21 chunks
+    //    of a 2048-id span are in, and a peer drop loses all of it).
     std::vector<Hash> ids{known};
     for (std::uint64_t i = 0; i < 250; ++i) ids.push_back(fake_id(1000 + i));
     idx.on_chain_entry(p, entry_with(ids, G::TEST_FIRST - 1, G::TEST_FIRST + 400, {}));
     checkf(idx.chain_entries_accepted() == 1, "wire: a well-formed chain entry was refused");
     checkf(idx.refetch_wanted().size() == 250,
            "wire: expected 250 wanted ids, got %zu", idx.refetch_wanted().size());
-    checkf(fetcher.chunking_ok(), "wire: an objects request broke the 100-id cap");
-    checkf(fetcher.object_requests.size() == 3,
-           "wire: 250 ids should chunk into 3 requests, got %zu", fetcher.object_requests.size());
+    checkf(fetcher.object_requests.empty(),
+           "wire: the index put %zu objects requests on the wire itself",
+           fetcher.object_requests.size());
+    checkf(idx.sync_state().chain_entries == 1, "wire: SyncState does not count the entry");
+
+    // 7. THE FETCH WINDOW: of a 2000-id entry only the part within half the alt
+    //    pool above our tip is handed out, in order -- fetching further ahead
+    //    than the pool can hold only feeds its eviction.
+    std::vector<Hash> big{known};
+    for (std::uint64_t i = 0; i < 2000; ++i) big.push_back(fake_id(5000 + i));
+    idx.on_chain_entry(p, entry_with(big, G::TEST_FIRST - 1, G::TEST_FIRST + 4000, {}));
+    const std::vector<Hash> win = idx.refetch_wanted();
+    checkf(win.size() == o.alt_max_blocks / 2,
+           "wire: a 2000-id entry hands out %zu ids, expected the %zu-id window",
+           win.size(), o.alt_max_blocks / 2);
+    checkf(!win.empty() && win.front() == big[1], "wire: the window does not start at the tip");
 }
 
 // =============================================================================
@@ -1240,7 +1259,120 @@ static void test_hints_are_ignored() {
 }
 
 // =============================================================================
+// K. near-tip stall (mainnet format-2 dry run, h=3768570): the unit-level pins.
+//    The end-to-end reproduction (format-2 anchor boot, output set seeded, gap
+//    wider than the row window, real bodies) is xmr_neartip_stall_kat.
+// =============================================================================
+// Like make_block, but the block COMMITS to `ntx` transaction ids while the
+// entry carries no bodies: exactly what a NOTIFY_NEW_FLUFFY_BLOCK push looks
+// like to the index (evaluate_block reports bodies_complete == false).
+static BlockEntry make_bodiless_block(std::uint8_t major, std::uint8_t minor,
+                                      std::uint64_t timestamp, const Hash& prev,
+                                      std::uint32_t nonce, std::uint64_t height,
+                                      std::uint64_t reward, std::uint8_t salt,
+                                      std::size_t ntx) {
+    BlockEntry e = make_block(major, minor, timestamp, prev, nonce, height, reward, salt);
+    e.block_blob.pop_back();                 // make_block ends with the n_tx varint 0
+    put_varint(e.block_blob, ntx);
+    for (std::size_t t = 0; t < ntx; ++t)
+        for (int i = 0; i < 32; ++i)
+            e.block_blob.push_back(static_cast<std::uint8_t>(0x80 + i + 7 * t + salt));
+    return e;
+}
+
+static bool has_id(const std::vector<Hash>& v, const Hash& id) {
+    for (const Hash& x : v) if (x == id) return true;
+    return false;
+}
+
+// K1. A bodiless push parked before its parent connects is resolved when the
+// parent lands. It must then be listed by bodies_wanted() (on master it was
+// not, and nothing else re-asks for it), a further push onto it must be kept
+// rather than peeled off by a failed switch, and nobody is charged for bytes
+// WE do not have.
+static void test_k1_bodiless_park_after_parent_connects() {
+    Fixture f(6);
+    const PeerRef pr = peer(9);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = f.idx->view().state().expected_base_reward();
+
+    BlockEntry A = f.sibling(tip, h, /*salt=*/1, reward);
+    const Hash a_id = id_of(A);
+    const G::GoldenHeader& hb = header_at(h + 1);
+    BlockEntry B = make_bodiless_block(hb.major_version, hb.minor_version, hb.timestamp,
+                                       a_id, 77, h + 1, reward, /*salt=*/2, /*ntx=*/1);
+    const Hash b_id = id_of(B);
+    const G::GoldenHeader& hc = header_at(h + 2);
+    BlockEntry C = make_bodiless_block(hc.major_version, hc.minor_version, hc.timestamp,
+                                       b_id, 78, h + 2, reward, /*salt=*/3, /*ntx=*/1);
+    const Hash c_id = id_of(C);
+
+    OfferResult r = f.idx->offer_block(&pr, B, false);
+    checkf(r.outcome == OfferOutcome::ParkedOrphan, "k1: push B was %s", to_string(r.outcome));
+    checkf(!has_id(f.idx->bodies_wanted(), b_id),
+           "k1: an orphan whose parent is unknown is not listed (no fetches for unverified pushes)");
+    r = f.idx->offer_block(&pr, C, false);
+    checkf(r.outcome == OfferOutcome::ParkedOrphan, "k1: push C was %s", to_string(r.outcome));
+
+    r = f.idx->offer_block(&pr, A, false);
+    checkf(r.outcome == OfferOutcome::Connected, "k1: parent was %s (%s)",
+           to_string(r.outcome), r.why.c_str());
+    checkf(f.idx->tip()->height == h, "k1: tip is %llu, expected %llu",
+           (unsigned long long)f.idx->tip()->height, (unsigned long long)h);
+    const std::vector<Hash> bw = f.idx->bodies_wanted();
+    checkf(has_id(bw, b_id), "k1: bodies_wanted() omits the resolved bodiless park B");
+    checkf(has_id(bw, c_id), "k1: bodies_wanted() omits the resolved bodiless park C");
+    checkf(f.idx->have_block(b_id) && f.idx->have_block(c_id),
+           "k1: after the parent connected B held=%d C held=%d (expected 1/1)",
+           f.idx->have_block(b_id) ? 1 : 0, f.idx->have_block(c_id) ? 1 : 0);
+
+    // C is pushed again: kept, not peeled; the tip does not move through a
+    // bodiless branch; and the pusher is not charged.
+    r = f.idx->offer_block(&pr, C, false);
+    checkf(f.idx->have_block(b_id) && f.idx->have_block(c_id),
+           "k1: a re-push peeled the bodiless branch (B=%d C=%d)",
+           f.idx->have_block(b_id) ? 1 : 0, f.idx->have_block(c_id) ? 1 : 0);
+    checkf(f.idx->tip()->height == h, "k1: tip moved to %llu through a bodiless branch",
+           (unsigned long long)f.idx->tip()->height);
+    checkf(f.fetcher.penalties.empty(), "k1: %zu peer penalties for our missing bodies",
+           f.fetcher.penalties.size());
+}
+
+// K2. A parent that sat in the pool before it connected (held: the verifier
+// was down) must not take its parked children's edges with it when it leaves
+// the pool on connect: the child is drained onto the new tip.
+static void test_k2_held_parent_keeps_children_edges() {
+    Fixture f(6);
+    const PeerRef pr = peer(9);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = f.idx->view().state().expected_base_reward();
+
+    BlockEntry A = f.sibling(tip, h, /*salt=*/1, reward);
+    const Hash a_id = id_of(A);
+    BlockEntry B = f.sibling(a_id, h + 1, /*salt=*/2, reward);
+    const Hash b_id = id_of(B);
+
+    OfferResult r = f.idx->offer_block(&pr, B, false);
+    checkf(r.outcome == OfferOutcome::ParkedOrphan, "k2: B was %s", to_string(r.outcome));
+    f.mv.set_down(true);
+    r = f.idx->offer_block(&pr, A, false);
+    checkf(r.outcome == OfferOutcome::StoredAsAlt, "k2: held parent was %s (%s)",
+           to_string(r.outcome), r.why.c_str());
+    f.mv.set_down(false);
+    r = f.idx->offer_block(&pr, A, false);
+    checkf(r.outcome == OfferOutcome::Connected, "k2: parent retry was %s (%s)",
+           to_string(r.outcome), r.why.c_str());
+    checkf(f.idx->tip()->height == h + 1 && f.idx->tip()->id == b_id,
+           "k2: tip is %llu, expected %llu: the parked child was not drained",
+           (unsigned long long)f.idx->tip()->height, (unsigned long long)(h + 1));
+}
+
+// =============================================================================
 int main() {
+    test_k1_bodiless_park_after_parent_connects();
+    test_k2_held_parent_keeps_children_edges();
     test_wire_validation();
     test_row_store();
     test_pow_gate();

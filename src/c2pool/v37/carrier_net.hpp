@@ -80,6 +80,7 @@
 // daemon runs it on its own threads, independent of its Boost.Asio ioc.
 
 #include <arpa/inet.h>
+#include <cerrno>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -93,6 +94,7 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -156,6 +158,13 @@ public:
     CarrierPeerNode& operator=(const CarrierPeerNode&) = delete;
 
     void set_inbound(InboundFn f) { m_inbound = std::move(f); }
+    // GAP-2 (the Family-B receipt relay, xmr/relay/): the same inbound path,
+    // TAGGED with the connection the frame arrived on, so a handler can keep
+    // per-peer state (HELLO gate, DoS budget, flood-except-source). When bound
+    // it takes precedence over set_inbound; unbound, the reader loop is
+    // byte-for-byte the pre-GAP-2 one.
+    using InboundFromFn = std::function<void(PeerId, const std::vector<std::uint8_t>&)>;
+    void set_inbound_from(InboundFromFn f) { m_inbound_from = std::move(f); }
     void set_on_peer_connect(PeerConnectFn f) { m_on_connect = std::move(f); }
     void set_control(ControlFn f) { m_control = std::move(f); }
     void set_on_peer_event(PeerEventFn f) { m_on_peer_event = std::move(f); }
@@ -194,32 +203,38 @@ public:
             m_oversize_refused.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        int fd = -1;
+        std::shared_ptr<Conn> c;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            auto it = m_id_fd.find(id);
-            if (it == m_id_fd.end()) return false;
-            fd = it->second;
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return false;
+            c = it->second;
         }
         std::uint8_t lenbuf[4];
         const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
         for (int i = 0; i < 4; ++i) lenbuf[i] = static_cast<std::uint8_t>(len >> (8 * i));
-        std::shared_ptr<std::mutex> wl = write_lock(fd);
         {
-            std::lock_guard<std::mutex> wlk(*wl);
-            if (send_all(fd, lenbuf, 4) && (len == 0 || send_all(fd, frame.data(), len)))
+            std::lock_guard<std::mutex> wlk(c->wmtx);
+            if (c->closed) return false;                  // gone while we looked it up
+            if (send_all(c->fd, lenbuf, 4) && (len == 0 || send_all(c->fd, frame.data(), len)))
                 return true;
         }
-        drop_peer(fd, /*hard=*/true);
+        drop_conn(c, /*hard=*/true);
         return false;
+    }
+
+    // Is this connection still live (not yet dropped)?
+    bool has_peer(PeerId id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_conns.count(id) != 0;
     }
 
     // The id of the connection a fd belongs to (test/diagnostic helper).
     std::vector<PeerId> peer_ids() const {
         std::lock_guard<std::mutex> lk(m_mtx);
         std::vector<PeerId> v;
-        v.reserve(m_id_fd.size());
-        for (const auto& [id, fd] : m_id_fd) { (void)fd; v.push_back(id); }
+        v.reserve(m_conns.size());
+        for (const auto& [id, c] : m_conns) { (void)c; v.push_back(id); }
         return v;
     }
 
@@ -249,6 +264,37 @@ public:
 
     std::uint16_t listen_port() const { return m_listen_port; }
 
+    // GAP-2: dial and return the new connection's PeerId (0 = the dial failed).
+    // Same semantics as add_peer(); the id lets a caller keep per-target state
+    // (the relay's redial-with-backoff). PeerEventFn(id, true) has already fired
+    // by the time this returns.
+    PeerId add_peer_id(const std::string& host, std::uint16_t port) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { ::close(fd); return 0; }
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { ::close(fd); return 0; }
+        return add_established(fd);
+    }
+
+    // GAP-2: drop ONE connection on purpose (a protocol refusal: HELLO
+    // mismatch, a ban, over the peer cap). The reader unwinds and
+    // PeerEventFn(id, false) fires. Not counted as a slow-peer drop. No-op for an
+    // id that is already gone. Must not be called with a lock held that the
+    // PeerEventFn handler takes (it may fire synchronously from here).
+    void disconnect(PeerId id) {
+        std::shared_ptr<Conn> c;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return;
+            c = it->second;
+        }
+        drop_conn(c, /*hard=*/true, /*slow=*/false);
+    }
+
     // Dial a peer (the --peer path). Returns true if the connection was
     // established and added as a full duplex peer. Safe to call before or after
     // listen(); a failed dial is a no-op the caller may retry.
@@ -271,7 +317,7 @@ public:
     // dropped for want of a peer).
     //
     // ★ PER-DESCRIPTOR WRITE LOCKS (head-of-line fix). Each connection has its
-    // OWN write mutex (m_write_locks, keyed by fd), held across [length prefix +
+    // OWN write mutex (Conn::wmtx), held across [length prefix +
     // body] so two writers can never interleave a frame on ONE socket, while a
     // peer that has stopped reading — and therefore holds its own lock for the
     // whole of a large blocking write — no longer blocks writes to any OTHER
@@ -292,42 +338,47 @@ public:
         const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
         for (int i = 0; i < 4; ++i) lenbuf[i] = static_cast<std::uint8_t>(len >> (8 * i));
 
-        std::vector<int> targets;
-        { std::lock_guard<std::mutex> lk(m_mtx); targets = m_peers; }
+        std::vector<std::shared_ptr<Conn>> targets;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            targets.reserve(m_conns.size());
+            for (const auto& [id, c] : m_conns) { (void)id; targets.push_back(c); }
+        }
 
         std::size_t reached = 0;
-        std::vector<int> dead;
-        std::vector<std::pair<int, std::shared_ptr<std::mutex>>> deferred;
+        std::vector<std::shared_ptr<Conn>> dead;
+        std::vector<std::shared_ptr<Conn>> deferred;
         deferred.reserve(targets.size());
 
         // pass 1 — every peer whose write lock is free right now.
-        for (int fd : targets) {
-            std::shared_ptr<std::mutex> wl = write_lock(fd);
-            std::unique_lock<std::mutex> wlk(*wl, std::try_to_lock);
-            if (!wlk.owns_lock()) { deferred.emplace_back(fd, std::move(wl)); continue; }
-            if (send_all(fd, lenbuf, 4) && (len == 0 || send_all(fd, frame.data(), len)))
+        for (auto& c : targets) {
+            std::unique_lock<std::mutex> wlk(c->wmtx, std::try_to_lock);
+            if (!wlk.owns_lock()) { deferred.push_back(c); continue; }
+            if (c->closed) continue;                      // reader already closed it
+            if (send_all(c->fd, lenbuf, 4) && (len == 0 || send_all(c->fd, frame.data(), len)))
                 ++reached;
             else
-                dead.push_back(fd);
+                dead.push_back(c);
         }
         // pass 2 — the peers that were busy; blocking, one connection at a time.
-        for (auto& [fd, wl] : deferred) {
-            std::lock_guard<std::mutex> wlk(*wl);
-            if (send_all(fd, lenbuf, 4) && (len == 0 || send_all(fd, frame.data(), len)))
+        for (auto& c : deferred) {
+            std::lock_guard<std::mutex> wlk(c->wmtx);
+            if (c->closed) continue;
+            if (send_all(c->fd, lenbuf, 4) && (len == 0 || send_all(c->fd, frame.data(), len)))
                 ++reached;
             else
-                dead.push_back(fd);
+                dead.push_back(c);
         }
         // HARD drop: with SO_SNDTIMEO armed, a failed send_all may be a TIMEOUT
         // that left a partial frame on the stream. A desynced connection must
         // not be left live — the peer would decode a truncated body.
-        for (int fd : dead) drop_peer(fd, /*hard=*/true);
+        for (auto& c : dead) drop_conn(c, /*hard=*/true);
         return reached;
     }
 
     std::size_t n_peers() const override {
         std::lock_guard<std::mutex> lk(m_mtx);
-        return m_peers.size();
+        return m_conns.size();
     }
 
     void stop() {
@@ -336,38 +387,107 @@ public:
         // Do NOT write m_listen_fd here — accept_loop() is still reading it; the
         // -1 is stamped only after the join below (no concurrent reader then).
         const int lfd = m_listen_fd;
-        if (lfd >= 0) { ::shutdown(lfd, SHUT_RDWR); ::close(lfd); }
-        std::vector<int> peers;
-        { std::lock_guard<std::mutex> lk(m_mtx); peers = m_peers; }
-        for (int fd : peers) ::shutdown(fd, SHUT_RDWR);
+        if (lfd >= 0) ::shutdown(lfd, SHUT_RDWR);
         if (m_accept_thread.joinable()) m_accept_thread.join();
+        // Closed only after the join: accept_loop() reads the descriptor until
+        // it returns, and a closed number could be reused by a concurrent open.
+        if (lfd >= 0) ::close(lfd);
         m_listen_fd = -1;                       // safe: accept_loop has joined
-        for (auto& t : m_readers) if (t.joinable()) t.join();
-        m_readers.clear();
+        // m_running is false, so add_established() admits nothing after this
+        // snapshot (it checks under m_mtx). Every reader closes its OWN
+        // descriptor as it unwinds (reader_loop); shutting each live socket
+        // down and joining every reader therefore releases every fd.
+        std::list<Reader> readers;
+        std::vector<std::shared_ptr<Conn>> conns;
         { std::lock_guard<std::mutex> lk(m_mtx);
-          for (int fd : m_peers) ::close(fd);
-          m_peers.clear();
-          m_fd_id.clear();
-          m_id_fd.clear(); }
-        // A blocked writer may still hold a shared_ptr to one of these; the
-        // map drops its own reference and the mutex dies with the last holder.
-        { std::lock_guard<std::mutex> lk(m_wl_mtx); m_write_locks.clear(); }
+          readers.swap(m_readers);
+          for (const auto& [id, c] : m_conns) { (void)id; conns.push_back(c); } }
+        for (auto& c : conns) shutdown_conn(*c);
+        for (auto& r : readers) if (r.t.joinable()) r.t.join();
+        { std::lock_guard<std::mutex> lk(m_mtx); m_conns.clear(); }
     }
 
+    // ── diagnostics (RELAY-FD) ──────────────────────────────────────────────
+    // accept() failures on resource exhaustion (EMFILE / ENFILE / ENOBUFS /
+    // ENOMEM): each one is a backed-off retry, never a spin.
+    std::uint64_t accept_exhausted() const { return m_accept_exhausted.load(); }
+    // Reader threads spawned and not yet joined (bounded by live connections
+    // plus the ones that unwound since the last connect).
+    std::size_t reader_threads() const { std::lock_guard<std::mutex> lk(m_mtx); return m_readers.size(); }
+    // Rate-limited transport diagnostics (the accept loop's exhaustion notice).
+    using LogFn = std::function<void(const std::string&)>;
+    void set_log(LogFn f) { m_log = std::move(f); }
+
 private:
+    // ONE connection. Every path that writes to, shuts down or closes the
+    // socket goes through this object, so a descriptor number the kernel
+    // reuses for a later connection can never be reached through a stale one.
+    //   wmtx : the per-connection WRITE lock (held across [length + body], so
+    //          frames never interleave and a slow peer blocks only itself)
+    //   fmtx : descriptor lifetime (shutdown vs close), never held across I/O
+    //   closed: set by the reader under BOTH locks when it closes the fd
+    struct Conn {
+        int fd = -1;
+        PeerId pid = 0;
+        std::mutex wmtx;
+        std::mutex fmtx;
+        bool closed = false;
+    };
+    struct Reader {
+        std::thread t;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
     void accept_loop() {
         // m_listen_fd is set in listen() BEFORE this thread is created (a
         // happens-before), so a single read into a local is race-free; stop()
         // never rewrites it until after this thread joins.
+        //
+        // ★ RELAY-FD: accept() on an exhausted descriptor table (EMFILE/ENFILE,
+        // or ENOBUFS/ENOMEM) fails IMMEDIATELY and leaves the pending connection
+        // in the backlog, so the old bare `continue` spun one core at 100% and
+        // never let anything else free a descriptor. Back off instead (50 ms
+        // doubling to 1 s, woken early by stop()), log at most once per 5 s with
+        // the count suppressed in between, and resume the moment a descriptor
+        // is free: the queued connection is then accepted normally.
         const int lfd = m_listen_fd;
+        int backoff_ms = 0;
+        auto last_log = std::chrono::steady_clock::time_point{};
+        std::uint64_t suppressed = 0;
         while (m_running.load()) {
             int cfd = ::accept(lfd, nullptr, nullptr);
-            if (cfd < 0) { if (!m_running.load()) break; continue; }
-            add_established(cfd);
+            if (cfd >= 0) {
+                if (backoff_ms && m_log)
+                    m_log("carrier-net: accept recovered (descriptors available again)");
+                backoff_ms = 0; suppressed = 0;
+                add_established(cfd);
+                continue;
+            }
+            const int e = errno;
+            if (!m_running.load()) break;
+            if (e == EINTR || e == ECONNABORTED) continue;
+            if (e == EMFILE || e == ENFILE || e == ENOBUFS || e == ENOMEM) {
+                m_accept_exhausted.fetch_add(1, std::memory_order_relaxed);
+                backoff_ms = backoff_ms ? std::min(1000, backoff_ms * 2) : 50;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_log >= std::chrono::seconds(5)) {
+                    if (m_log)
+                        m_log(std::string("carrier-net: accept failed: ") + std::strerror(e) +
+                              " -- backing off " + std::to_string(backoff_ms) + " ms (" +
+                              std::to_string(suppressed) + " more since last notice)");
+                    last_log = now; suppressed = 0;
+                } else {
+                    ++suppressed;
+                }
+            } else {
+                backoff_ms = 100;                        // any other error: never spin either
+            }
+            for (int slept = 0; slept < backoff_ms && m_running.load(); slept += 25)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
     }
 
-    void add_established(int fd) {
+    PeerId add_established(int fd) {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         // ★ BOUND THE WRITE (c2pool#1655 Defect-B). Without this a peer that
@@ -383,18 +503,29 @@ private:
         }
         bool established = false;
         PeerId pid = 0;
+        std::list<Reader> finished;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (!m_running.load()) { ::close(fd); return; }   // stopping: never orphan a reader
+            if (!m_running.load()) { ::close(fd); return 0; }   // stopping: never orphan a reader
+            // RELAY-FD: reap readers that already unwound, so a connection churn
+            // (a partitioned peer redialed every second) does not accumulate one
+            // unjoined thread -- and its stack -- per connection until stop().
+            for (auto it = m_readers.begin(); it != m_readers.end();) {
+                auto nx = std::next(it);
+                if (it->done->load() && it->t.get_id() != std::this_thread::get_id())
+                    finished.splice(finished.end(), m_readers, it);
+                it = nx;
+            }
             pid = ++m_next_peer_id;
-            m_peers.push_back(fd);
-            m_fd_id[fd] = pid;
-            m_id_fd[pid] = fd;
-            m_readers.emplace_back([this, fd, pid] { reader_loop(fd, pid); });
+            auto c = std::make_shared<Conn>();
+            c->fd = fd; c->pid = pid;
+            m_conns[pid] = c;
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            m_readers.push_back(Reader{std::thread([this, c, done] { reader_loop(c); done->store(true); }), done});
             established = true;
         }
+        for (auto& r : finished) if (r.t.joinable()) r.t.join();   // already returned: no wait
         if (established) {
-            (void)write_lock(fd);               // fresh lock for a fresh connection
             // OUTSIDE m_mtx on purpose: the callback arms the relay's re-offer
             // sweep, and the relay's own broadcast path takes m_mtx — firing it
             // under the lock would invert the order (relay -> transport).
@@ -403,9 +534,12 @@ private:
             PeerEventFn ev = m_on_peer_event;
             if (ev) ev(pid, true);
         }
+        return established ? pid : 0;
     }
 
-    void reader_loop(int fd, PeerId pid) {
+    void reader_loop(const std::shared_ptr<Conn>& c) {
+        const int fd = c->fd;
+        const PeerId pid = c->pid;
         for (;;) {
             std::uint8_t lenbuf[4];
             if (!recv_all(fd, lenbuf, 4)) break;
@@ -430,56 +564,53 @@ private:
             // own mutex (w3_relay.hpp THREADING), so the handler needs no lock
             // of its own. A slow admit (the live index's bounded Unknown retry,
             // carrier_index.hpp) stalls only this peer's reader.
-            if (m_inbound) m_inbound(frame);
+            if (m_inbound_from) m_inbound_from(pid, frame);
+            else if (m_inbound) m_inbound(frame);
         }
-        drop_peer(fd);
+        drop_conn(c);
+        shutdown_conn(*c);   // wake any writer still blocked on this socket
+        // ★ RELAY-FD: the reader OWNS the descriptor's close. Before this the fd
+        // of a dropped connection was closed only by stop() -- and not even
+        // there once the drop had removed it from the peer set -- so every
+        // refused, timed-out, banned or partition-dropped connection leaked one
+        // descriptor for the life of the process (fds=1024/1024 after the
+        // SIGUSR1 partition). The close happens under the connection's write
+        // lock with `closed` set, so no writer that still holds this Conn can
+        // ever write into a later connection that reuses the number.
+        std::lock_guard<std::mutex> wlk(c->wmtx);
+        std::lock_guard<std::mutex> flk(c->fmtx);
+        c->closed = true;
+        ::close(fd);
     }
 
     // `hard` => the stream is unusable (a timed-out write left half a frame on
     // it), so shut the socket down: the peer's reader thread unwinds instead of
     // sitting in recv() on a connection nobody will ever write to again.
-    void drop_peer(int fd, bool hard = false) {
-        PeerId pid = 0;
+    // Remove ONE connection from the peer set (idempotent: the first caller
+    // fires PeerEventFn(id, false), later ones are no-ops). `hard` => the stream
+    // is unusable (a timed-out write left half a frame on it, or a protocol
+    // refusal), so shut the socket down: its reader unwinds out of recv() and
+    // closes the descriptor (reader_loop). The descriptor is never closed here:
+    // only the reader, which is the last user of the number, closes it.
+    void drop_conn(const std::shared_ptr<Conn>& c, bool hard = false, bool slow = true) {
         bool had = false;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            for (auto it = m_peers.begin(); it != m_peers.end(); ++it)
-                if (*it == fd) { m_peers.erase(it); had = true; break; }
-            auto fit = m_fd_id.find(fd);
-            if (fit != m_fd_id.end()) {
-                pid = fit->second;
-                m_id_fd.erase(pid);
-                m_fd_id.erase(fit);
-            }
-            // The fd is closed by stop() (join order) or here once fully removed;
-            // closing once is enough — mark by removing from the set above.
+            auto it = m_conns.find(c->pid);
+            if (it != m_conns.end() && it->second == c) { m_conns.erase(it); had = true; }
         }
         if (hard) {
-            if (had) m_slow_drops.fetch_add(1);
-            ::shutdown(fd, SHUT_RDWR);
+            if (had && slow) m_slow_drops.fetch_add(1);
+            shutdown_conn(*c);
         }
-        if (pid) { PeerEventFn ev = m_on_peer_event; if (ev) ev(pid, false); }
-        // Drop the map's reference to this connection's write lock so the table
-        // stays bounded by the LIVE peer count. A writer blocked on the socket
-        // right now still holds its own shared_ptr, so the mutex it is waiting
-        // on stays alive until it returns. The fd itself is not closed before
-        // stop() (unchanged behaviour), so it cannot be handed to a new
-        // connection while an old lock object is still in flight.
-        std::lock_guard<std::mutex> lk(m_wl_mtx);
-        m_write_locks.erase(fd);
+        if (had) { PeerEventFn ev = m_on_peer_event; if (ev) ev(c->pid, false); }
     }
 
-    // One write lock PER DESCRIPTOR: held across a frame's length prefix AND
-    // body, so two writers never interleave on one socket, and a peer that
-    // stopped reading blocks only its own connection. Created on connect,
-    // dropped on disconnect, created on demand if a broadcast races a connect.
-    std::shared_ptr<std::mutex> write_lock(int fd) {
-        std::lock_guard<std::mutex> lk(m_wl_mtx);
-        auto it = m_write_locks.find(fd);
-        if (it != m_write_locks.end()) return it->second;
-        auto m = std::make_shared<std::mutex>();
-        m_write_locks.emplace(fd, m);
-        return m;
+    // shutdown(2) a live connection's socket; a no-op once its reader closed the
+    // descriptor (the number may belong to someone else by then).
+    static void shutdown_conn(Conn& c) {
+        std::lock_guard<std::mutex> flk(c.fmtx);
+        if (!c.closed) ::shutdown(c.fd, SHUT_RDWR);
     }
 
     static bool send_all(int fd, const void* buf, std::size_t n) {
@@ -504,6 +635,7 @@ private:
     }
 
     InboundFn                 m_inbound;
+    InboundFromFn             m_inbound_from;   // GAP-2: pid-tagged inbound (precedence when bound)
     PeerConnectFn             m_on_connect;
     ControlFn                 m_control;        // frame[0] >= 0x80 (repair channel)
     PeerEventFn               m_on_peer_event;  // (PeerId, connected)
@@ -511,6 +643,8 @@ private:
     std::atomic<std::uint64_t> m_ctrl_ignored{0};
     std::atomic<std::uint64_t> m_slow_drops{0};
     std::atomic<std::uint64_t> m_oversize_refused{0};
+    std::atomic<std::uint64_t> m_accept_exhausted{0};
+    LogFn                     m_log;            // rate-limited diagnostics (RELAY-FD)
     // SO_SNDTIMEO, ms. 10 s by default: long enough that no healthy peer ever
     // trips it, short enough that a peer which stopped reading cannot pin one
     // of our threads indefinitely. 0 => block forever (pre-Stage-1 behaviour).
@@ -523,17 +657,13 @@ private:
     // must start true or stop() would early-return and orphan them.
     std::atomic<bool>         m_running{true};
     std::thread               m_accept_thread;
-    std::vector<std::thread>  m_readers;
-    mutable std::mutex        m_mtx;          // guards m_peers / m_readers
-    mutable std::mutex        m_wl_mtx;       // guards m_write_locks ONLY
-    std::map<int, std::shared_ptr<std::mutex>> m_write_locks;   // fd -> its write lock
-    std::vector<int>          m_peers;
+    std::list<Reader>         m_readers;      // reaped on connect once `done`
+    mutable std::mutex        m_mtx;          // guards m_conns / m_readers / m_next_peer_id
     // ★ peer identity. Ids are never reused, so per-peer state keyed on a
     // PeerId dies with the connection — the flap-safety property the repair
-    // channel depends on. Both maps are guarded by m_mtx.
+    // channel depends on. Ordered by id = connection order (the broadcast order).
     PeerId                    m_next_peer_id = 0;
-    std::map<int, PeerId>     m_fd_id;
-    std::map<PeerId, int>     m_id_fd;
+    std::map<PeerId, std::shared_ptr<Conn>> m_conns;
 };
 
 } // namespace c2pool::v37n

@@ -99,12 +99,14 @@
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_output_set.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
+#include "impl/xmr/native/anchor/xmr_anchor_pinned.hpp"
 #include "impl/xmr/native/node/xmr_anchor_confirm.hpp"
 #include "impl/xmr/native/node/xmr_chain_boot.hpp"
 #include "impl/xmr/native/node/xmr_chain_snapshot_store.hpp"
 #include "impl/xmr/native/node/xmr_genesis_blob.hpp"
 #include "impl/xmr/native/node/xmr_monerod_http.hpp"
 #include "impl/xmr/native/node/xmr_sync_driver.hpp"
+#include "impl/xmr/native/node/xmr_tx_relay_gate.hpp"
 #include "impl/xmr/native/node/xmr_worker_loops.hpp"
 #include "impl/xmr/native/p2p/chain_seeds.hpp"
 #include "impl/xmr/native/p2p/xmr_peer_pool.hpp"
@@ -225,6 +227,18 @@ struct NativeNodeConfig {
     // Periodic save cadence in seconds. 0 = only on a clean stop, which loses
     // the session's progress to a kill -9; 300 is the shipped compromise.
     std::uint64_t            snapshot_every_s = 300;
+    // COLD-BOOT-2: ChainIndexOptions::consumer_window (the catch-up download is
+    // paced by the settlement's booked frontier). 0 = off.
+    std::uint64_t            consumer_window = 0;
+    // COLD-BOOT-3: the mainchain-event queue the pool daemon drains
+    // (drain_mainchain_events). `chain_event_cap` is its hard bound; with
+    // `chain_event_backpressure` (set by a consumer that drains it: the p2p-first
+    // pool daemon) the bulk download waits while the queue holds cap / 2 or more
+    // undrained events, so a catch-up burst cannot reach the cap. If it is
+    // reached anyway (pushes, reorgs), the overflow is an ALARM, counted, and the
+    // dropped heights are re-driven from the index's rows on the next drain.
+    std::size_t              chain_event_cap = 8192;
+    bool                     chain_event_backpressure = false;
 
     // A build without librandomx cannot check proof of work: the gate answers
     // Skipped, and the index connects blocks it never verified. That is a
@@ -299,6 +313,14 @@ struct NativeNodeConfig {
     // settlement accounting reads, so the two can never disagree.
     TieBreak                 fork_tie = TieBreak::PreferOwn;
 
+    // The own-fork liveness guard (ChainIndexOptions::own_fork_bound_ms): how
+    // long an own-mined tip may go unadopted by every peer before the node
+    // abandons it and follows the peers' chain. 0 disables.
+    std::uint64_t            own_fork_bound_ms = 240'000;
+    // FORK-FUSE-2: the unknown-fork watch's stall period
+    // (ChainIndexOptions::unknown_fork_stall_ms). 0 = the 30 min default.
+    std::uint64_t            unknown_fork_stall_ms = 0;
+
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
     // SyncDriverConfig::probe_only.
@@ -313,6 +335,10 @@ struct NativeNodeConfig {
     bool                     probe_only = false;
 
     std::uint64_t            driver_tick_ms = 500;
+    // TXPOOL-RESUME: after the relay gate opens, templates wait until the tx
+    // pool is warm -- the first txpool-complement (2010) answer was admitted --
+    // or this many ms passed, whichever comes first. 0 = no warm gate.
+    std::uint64_t            txpool_warm_timeout_ms = 30'000;
     std::size_t              verify_queue   = 4096;
     std::size_t              txpool_queue   = 2048;
 
@@ -374,6 +400,13 @@ struct NodeStatus {
     // holds nothing because the gate is shut and a pool that holds nothing
     // because the chain is quiet are the same picture without this flag.
     bool                         txpool_gate_open = false;
+    // TXPOOL-RESUME: the pool's chain context, the warm latch and the back-fill.
+    bool                         txpool_tip_known  = false;
+    bool                         txpool_warm       = false;
+    std::string                  txpool_warm_why;          // "complement" / "timeout" / ""
+    std::uint64_t                txpool_warm_after_ms = 0; // gate open -> warm
+    std::uint64_t                complement_rounds = 0;    // answers admitted
+    std::uint64_t                complement_txs    = 0;    // txs in those answers
     std::uint64_t                rpc_calls = 0;
     // Failed round trips on that same transport. A parity arm that is silently
     // failing every call still reports rpc_calls climbing, so the count alone
@@ -389,6 +422,32 @@ struct NodeStatus {
     std::size_t                  citizen_pool_n = 0;
     std::size_t                  citizen_chosen_n = 0;
     std::uint64_t                good_citizen_violations = 0;
+    // Template dup-tx hygiene: selectable txs the template left out because
+    // the chain it extends already mined them (the race, caught); own blocks
+    // the index refused as invalid (a tx already mined / key image spent /
+    // duplicate); own forks the liveness guard abandoned; txs the pool refused
+    // at admission because the chain already carries them.
+    std::uint64_t                tmpl_dropped_mined = 0;
+    std::uint64_t                own_invalid_refused = 0;
+    std::uint64_t                own_forks_abandoned = 0;
+    std::uint64_t                pool_already_mined = 0;
+    // FORK-FUSE-2: the unknown-fork watch. state = normal / suspect / tripped;
+    // blocks = above-version blocks refused (never charged); peers = distinct
+    // peer groups that sent one since the tip last extended; alarms = SUSPECT
+    // alarms raised; trips / clears; ids = above-version ids held back from the
+    // want list, held = how often the want list held one back; not_understood
+    // = relayed txs of a format above the implemented one.
+    UnknownForkState             uf_state = UnknownForkState::Normal;
+    std::uint64_t                uf_blocks = 0;
+    std::size_t                  uf_peers = 0;
+    std::uint64_t                uf_alarms = 0;
+    std::uint64_t                uf_trips = 0;
+    std::uint64_t                uf_clears = 0;
+    std::uint64_t                uf_stalled_s = 0;
+    std::uint64_t                uf_stall_s = 0;
+    std::size_t                  uf_ids = 0;
+    std::uint64_t                uf_held = 0;
+    std::uint64_t                uf_not_understood = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -443,6 +502,26 @@ public:
             // and this function does not return true.
             note_(std::string("[GATE-4] ") + anchor_boot_duty());
             note_(boot_.anchor_confirm().log_line());
+            // THE PINNED SNAPSHOT (no --native-anchor): the compiled-in bundle
+            // must be the one this release pins -- same file sha256, height and
+            // block id -- and the boot log names it and the snapshot it expects.
+            if (cfg_.anchor_path.empty()) {
+                const PinnedSnapshot* pin = pinned_snapshot(nets_.consensus);
+                const AnchorBundle* ab = boot_.anchor();
+                if (pin == nullptr || ab == nullptr) {
+                    why = std::string("no pinned snapshot is compiled in for network '")
+                        + to_string(nets_.consensus) + "'; pass --native-anchor";
+                    return false;
+                }
+                std::string pin_why;
+                if (!pinned_anchor_matches(*pin, *ab, pin_why)) {
+                    why = "pinned anchor refused: " + pin_why;
+                    return false;
+                }
+                const std::string line = pinned_boot_line(*pin);
+                note_(line);
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
         }
 
         index_.set_clock([] { return unix_seconds_(); });
@@ -453,6 +532,11 @@ public:
         // after releasing its own lock), which is what makes the native
         // observation the oracle takes later safe to read.
         index_.subscribe([this](const node::MainchainEvent& ev) { on_mainchain_(ev); });
+        // COLD-BOOT-3: backpressure from the consumer's event queue onto the bulk
+        // download (never onto the verify thread: nothing blocks, the index just
+        // hands out no more chain-entry blocks until the queue drains).
+        if (cfg_.chain_event_backpressure)
+            index_.set_download_hold([this] { return chain_events_backpressured(); });
 
         // The txpool's INPUT-consensus step resolves rings and rejects on-chain
         // double-spends against `outputs_`. Wire it before the block stream can
@@ -488,15 +572,39 @@ public:
                           "format-2 anchor (nothing to verify the snapshot against)";
                     return false;
                 }
-                std::ifstream f(cfg_.output_set_path, std::ios::binary);
-                if (!f) {
-                    why = "cannot open output-set snapshot '" + cfg_.output_set_path + "'";
-                    return false;
+                {
+                    std::ifstream f(cfg_.output_set_path, std::ios::binary);
+                    if (!f) {
+                        why = "cannot open output-set snapshot '" + cfg_.output_set_path + "'";
+                        return false;
+                    }
                 }
-                const std::string blob((std::istreambuf_iterator<char>(f)),
-                                       std::istreambuf_iterator<char>());
+                // PINNED: against the compiled-in anchor the file must be the
+                // pinned snapshot byte for byte (size, then sha256), because the
+                // root check below binds the per-block leaves, not the rows.
+                const PinnedSnapshot* pin =
+                    cfg_.anchor_path.empty() ? pinned_snapshot(nets_.consensus) : nullptr;
+                if (pin != nullptr) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    std::string pin_why, got;
+                    const PinnedSetCheck pc =
+                        check_output_set_against_pin(cfg_.output_set_path, *pin, pin_why, &got);
+                    if (pc != PinnedSetCheck::Ok) {
+                        why = pin_why;
+                        return false;
+                    }
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - t0).count();
+                    const std::string line = "[pinned] output-set snapshot sha256 " + got
+                        + " matches the pin (" + std::to_string(pin->output_set_bytes)
+                        + " bytes, hashed in " + std::to_string(ms) + " ms)";
+                    note_(line);
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+                // Mapped read-only and served in place (no heap copy of the
+                // anchor snapshot); only post-anchor state lives in the heap.
                 std::string seed_why;
-                if (!outputs_.seed_from_snapshot(blob, *ab, seed_why)) {
+                if (!outputs_.seed_from_snapshot_file(cfg_.output_set_path, *ab, seed_why)) {
                     why = "output-set snapshot rejected: " + seed_why;
                     return false;
                 }
@@ -534,24 +642,54 @@ public:
         }
 
         txpool_.set_input_consensus_sources(&outputs_, &outputs_);
+        // The chain's mined oracle: no path (a reorg re-admit racing the new
+        // branch, a late relay) can put a tx the best chain already carries
+        // back into the pool.
+        txpool_.set_mined_oracle(&index_);
 
         index_.subscribe_txs([this](const BlockTxEvent& ev) {
-            // C2 -> C3: drop mined ids, evict key-image conflicts, re-admit on a
-            // rollback. Posted to the pool thread for the same reason the relay
-            // path is: it re-decodes bodies.
-            pool_loop_.post([this, ev] {
-                // Feed the output set FIRST: the spent-key-image set must reflect
-                // this block before the pool judges (or re-admits) anything
-                // against it. on_block_connected also carries the block's RCT
-                // outputs when the producer captured them (below-anchor history
-                // excepted); with none captured it still advances key images.
-                if (ev.kind == BlockTxEvent::Kind::Connected) {
-                    outputs_.on_block_connected(ev);
-                    txpool_.on_block_connected(ev);
-                } else {
-                    outputs_.on_block_disconnected(ev);
-                    txpool_.on_block_disconnected(ev);
+            // C2 -> C3, SYNCHRONOUSLY, on the thread that moved the tip and
+            // before the index returns to it. Evicting mined ids / spent key
+            // images on the pool thread LATER let the template refresh race
+            // it: a template built on the new tip in that window still carried
+            // a tx the new tip had mined, and a share on it was a block every
+            // monerod refused ("transaction already in blockchain") -- the
+            // publish-arm verify, 8b2efacf at h=513. The template path also
+            // filters against the chain itself (NativeMinerDataSource), so this
+            // is the pool keeping itself honest, not the only guard.
+            //
+            // The output set is fed FIRST: the spent-key-image set must reflect
+            // this block before the pool judges (or re-admits) anything against
+            // it. on_block_connected also carries the block's RCT outputs when
+            // the producer captured them (below-anchor history excepted); with
+            // none captured it still advances key images. Both are set updates
+            // under their own mutexes, and flush_events_ holds no index lock.
+            if (ev.kind == BlockTxEvent::Kind::Connected) {
+                outputs_.on_block_connected(ev);
+                txpool_.on_block_connected(ev);
+            } else {
+                outputs_.on_block_disconnected(ev);
+                txpool_.note_block_disconnected(ev);
+            }
+            // TXPOOL-RESUME-2: the output set now holds the index tip, so rings
+            // judged from here on resolve against the whole chain: the relay
+            // gate may open (and the back-fill be asked) right now, on the
+            // block that closed the sync. See xmr_tx_relay_gate.hpp.
+            if (ev.kind == BlockTxEvent::Kind::Connected) {
+                const auto t = index_.view().tip();
+                if (t && t->id == ev.block_id) {
+                    {
+                        std::lock_guard<std::mutex> lk(gate_mu_);
+                        gate_latch_.note_outset_at_tip();
+                    }
+                    publish_tx_gate_();
                 }
+            }
+            // Only the re-admission of a rolled-back block's bodies (a full
+            // decode + verify each) and the inject upkeep go to the pool thread.
+            pool_loop_.post([this, ev] {
+                if (ev.kind == BlockTxEvent::Kind::Disconnected)
+                    txpool_.readmit_disconnected(ev);
                 // OPERATOR INJECT upkeep on a connected block: an inject that was
                 // mined leaves C3 (so it would silently stop being offered), but
                 // its ledger entry and pin must go too. Forget the mined ids,
@@ -569,6 +707,8 @@ public:
         // source (nullptr keeps the served template byte-identical to the plain
         // good-citizen path). Wired ONCE here, before any template is served.
         native_src_.set_operator_injects(cfg_.operator_inject ? &op_injects_ : nullptr);
+        // TXPOOL-RESUME: no template until the pool is warm (see update_pool_warm_).
+        native_src_.set_warm_gate(cfg_.txpool_warm_timeout_ms ? &pool_warm_ : nullptr);
 
         verify_loop_.start();
         pool_loop_.start();
@@ -693,7 +833,10 @@ public:
             [this] { return boot_.booted(); },
             [this] { return index_.refetch_wanted(); },
             [this] { return index_.bodies_wanted(); },   // #1680: stranded fluffy parks
-            dcfg);
+            dcfg,
+            // FORK-FUSE-3: a peer that sent an above-version block is backed
+            // off for chain requests and gets no want-list batch.
+            [this](const PeerRef& p) { return index_.unknown_fork_peer_flagged(p); });
 
         // --- threads ----------------------------------------------------------
         running_ = true;
@@ -800,6 +943,15 @@ public:
         s.boot         = boot_.stats();
         s.txpool       = txpool_.stats();
         s.txpool_gate_open = tx_gate_.load();
+        s.txpool_tip_known  = txpool_.tip_known();
+        s.txpool_warm       = pool_warm_.load();
+        s.complement_rounds = tx_sink_.complement_rounds();
+        s.complement_txs    = tx_sink_.complement_txs();
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            s.txpool_warm_why      = warm_why_;
+            s.txpool_warm_after_ms = warm_after_ms_;
+        }
         s.rpc_calls    = rpc_ ? rpc_->calls() : 0;
         s.rpc_failures = rpc_ ? rpc_->failures() : 0;
         if (witness_) s.randomx = witness_->witness();
@@ -813,6 +965,24 @@ public:
         s.citizen_pool_n          = native_src_.last_pool_n();
         s.citizen_chosen_n        = native_src_.last_chosen_n();
         s.good_citizen_violations = native_src_.good_citizen_violations();
+        s.tmpl_dropped_mined      = native_src_.dropped_mined();
+        s.own_invalid_refused     = index_.own_blocks_refused_invalid();
+        s.own_forks_abandoned     = index_.own_forks_abandoned();
+        s.pool_already_mined      = s.txpool.rejected_already_mined;
+        {
+            const UnknownForkWatch w = index_.unknown_fork_watch();
+            s.uf_state          = w.state();
+            s.uf_blocks         = index_.unknown_fork_blocks();
+            s.uf_peers          = w.distinct_peers();
+            s.uf_alarms         = w.suspect_alarms();
+            s.uf_trips          = w.trips();
+            s.uf_clears         = w.clears();
+            s.uf_stalled_s      = w.stalled_ms() / 1000;
+            s.uf_stall_s        = w.stall_ms() / 1000;
+            s.uf_ids            = index_.unknown_fork_ids();
+            s.uf_held           = index_.unknown_fork_refetch_held();
+            s.uf_not_understood = s.txpool.rejected_not_understood;
+        }
         return s;
     }
 
@@ -1197,18 +1367,92 @@ public:
     // The C5 relay's PREFER-OWN submit_to_own_index feeds this same queue for
     // our OWN found block: we do not wait to hear our block back from a peer.
     std::vector<node::MainchainEvent> drain_mainchain_events() {
-        std::lock_guard<std::mutex> lk(rec_mu_);
         std::vector<node::MainchainEvent> out;
-        out.swap(chain_events_);
-        return out;
+        std::uint64_t lo = 0, hi = 0;
+        bool redrive = false;
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            out.swap(chain_events_);
+            chain_events_n_.store(0, std::memory_order_relaxed);
+            if (ev_overflow_pending_) {
+                redrive = true; lo = ev_overflow_lo_; hi = ev_overflow_hi_;
+                ev_overflow_pending_ = false; ev_overflow_lo_ = ev_overflow_hi_ = 0;
+            }
+        }
+        if (!redrive) return out;
+        // COLD-BOOT-3: the queue overflowed since the last drain. The dropped
+        // events' heights are re-driven from the index's CURRENT best chain (the
+        // index lock only; rec_mu_ is not held), as Extend events ahead of the
+        // retained ones, in ascending height. A height the index no longer
+        // retains cannot be re-driven: it is counted and alarmed (the consumer's
+        // tri-state canonical test then HOLDS it as Unknown -- never a drop).
+        std::vector<node::MainchainEvent> re;
+        std::uint64_t lost = 0;
+        for (std::uint64_t h = lo; h <= hi; ++h) {
+            const auto b = index_.by_height(h);
+            if (!b) { ++lost; continue; }
+            node::MainchainEvent ev;
+            ev.kind  = node::MainchainEventKind::Extend;
+            ev.block = *b;
+            re.push_back(ev);
+        }
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            ev_redriven_ += re.size();
+            ev_unrecoverable_ += lost;
+        }
+        std::fprintf(stderr, "[native] ALARM chain-event queue overflow: heights [%llu, %llu] re-driven from the index "
+                             "(%zu events, %llu no longer retained -> HELD by the consumer as Unknown)\n",
+                     (unsigned long long)lo, (unsigned long long)hi, re.size(), (unsigned long long)lost);
+        std::fflush(stderr);
+        re.insert(re.end(), std::make_move_iterator(out.begin()), std::make_move_iterator(out.end()));
+        return re;
+    }
+
+    // COLD-BOOT-3: the event queue's overflow evidence. `dropped` events left the
+    // queue at the hard cap (each one ALARMED, never silent); `redriven` of their
+    // heights were delivered again from the index, `unrecoverable` were not.
+    struct ChainEventQueueStats {
+        std::uint64_t dropped = 0, redriven = 0, unrecoverable = 0, backpressure_engaged = 0;
+        std::size_t   high_water = 0;
+    };
+    ChainEventQueueStats chain_event_queue_stats() const {
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        return ChainEventQueueStats{ev_dropped_, ev_redriven_, ev_unrecoverable_, ev_bp_engaged_, ev_high_water_};
+    }
+    // True while the queue holds cap / 2 or more undrained events.
+    bool chain_events_backpressured() const noexcept {
+        const std::size_t cap = cfg_.chain_event_cap ? cfg_.chain_event_cap : 8192;
+        return chain_events_n_.load(std::memory_order_relaxed) >= cap / 2;
     }
 
     // How many events the feed has produced since start, whether or not anyone
     // drained them. A tip driver that produced nothing and a consumer that
     // dropped everything look identical without this.
+    // COLD-BOOT-2 (D4a): snapshot saves written / failed since start (+ the last failure).
+    struct SnapshotStats { std::uint64_t ok = 0, failed = 0; std::string last_failure; };
+    SnapshotStats snapshot_stats() const {
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        return SnapshotStats{snap_ok_, snap_failed_, snap_last_fail_};
+    }
+
     std::uint64_t mainchain_events_seen() const {
         std::lock_guard<std::mutex> lk(rec_mu_);
         return chain_events_seen_;
+    }
+
+    // COLD-BOOT-3: what this process booted from, for the operator's cold-boot
+    // line. `boot_anchor_height` is the anchor bundle gate 4 confirmed (0 on a
+    // genesis boot) -- NOT index().anchor_height(), which after a snapshot
+    // resume is the snapshot's base row. `resumed` is set when a snapshot was
+    // installed; `base` / `tip` are the resumed index's base row and tip.
+    struct BootOrigin { std::uint64_t boot_anchor_height = 0; bool resumed = false; std::uint64_t base = 0, tip = 0; };
+    BootOrigin boot_origin() const {
+        BootOrigin o;
+        o.boot_anchor_height = cfg_.boot == BootMode::Anchor ? snapshot_key_().anchor_height : 0;
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        o.resumed = resumed_; o.base = resumed_base_; o.tip = resumed_tip_;
+        return o;
     }
 
     // C5, for the consumer that actually found a block. Null before start().
@@ -1223,6 +1467,9 @@ private:
         ChainIndexOptions o;
         o.net = nets_.consensus;
         o.tie = cfg_.fork_tie;          // D-14, driven by --same-height-tiebreak
+        o.own_fork_bound_ms = cfg_.own_fork_bound_ms;
+        o.consumer_window = cfg_.consumer_window;   // COLD-BOOT-2
+        if (cfg_.unknown_fork_stall_ms) o.unknown_fork_stall_ms = cfg_.unknown_fork_stall_ms;
         return o;
     }
 
@@ -1316,7 +1563,40 @@ private:
             const std::uint64_t now = now_ms_();
             verify_loop_.post([this, now] {
                                   if (driver_) driver_->tick(now);
+                                  // Own-fork liveness guard: an own-mined
+                                  // tip no peer adopts past the bound is
+                                  // abandoned (ChainIndex::check_own_fork).
+                                  {
+                                      std::string ofw;
+                                      if (index_.check_own_fork(now, &ofw)) {
+                                          const std::string line =
+                                              "[own-fork] LIVENESS GUARD: " + ofw
+                                              + " -- following the peers' chain";
+                                          note_(line);
+                                          std::fprintf(stderr, "%s\n", line.c_str());
+                                      }
+                                  }
+                                  // FORK-FUSE-2: the unknown-fork watch
+                                  // trips on quorum + stall and clears on a
+                                  // 2-block v16 extension; it prints its own
+                                  // loud line. The tx gate below follows it.
+                                  {
+                                      const auto ufe = index_.check_unknown_fork(now);
+                                      if (ufe == UnknownForkWatch::Event::Tripped)
+                                          note_("[HF-FUSE] unknown-fork TRIPPED: templates and tx admission withdrawn");
+                                      else if (ufe == UnknownForkWatch::Event::Cleared)
+                                          note_("[HF-FUSE] unknown-fork CLEARED: templates and tx admission resumed");
+                                  }
+                                  // TXPOOL-RESUME-2: a tick runs on the
+                                  // verify thread between flushes, so every
+                                  // block the index connected has been fed to
+                                  // the output set by now.
+                                  {
+                                      std::lock_guard<std::mutex> lk(gate_mu_);
+                                      gate_latch_.note_outset_at_tip();
+                                  }
                                   publish_tx_gate_();
+                                  update_pool_warm_(now);
                                   // GOOD-CITIZEN: feed the wall clock (unix
                                   // seconds) to the miner-data source so the
                                   // backlog-refresh rate limit is actually
@@ -1420,13 +1700,94 @@ private:
     // Published from the verify thread (which owns the sync state) onto the
     // pool thread (which owns the gate), only on a CHANGE, so the steady state
     // costs one atomic compare per driver tick.
+    //
+    // TXPOOL-RESUME. The gate's predicate is the TEMPLATE predicate: the view's
+    // sync_state().synced is `synced && allows(Template)`, exactly what
+    // template_inputs() demands before any template is served, so the node
+    // never serves a template on a pool that is refusing admissions for sync.
+    // What the gate did NOT carry was the pool's chain context: a snapshot
+    // resume installs the index at its saved tip without connecting a block,
+    // so the pool's tip stayed 0 and every relayed tx was refused
+    // RingMemberLocked (members "younger than 10 blocks" against height 1)
+    // until the next block connected -- the dry-run-2 restart finding (0 tx in
+    // every template for a whole block while the network pool held ~200). The
+    // tip is therefore seated HERE, on the verify thread that owns the index,
+    // synchronously and before the gate opens; seat_tip() is a no-op once any
+    // block event has set it. Opening the gate also arms the complement
+    // back-fill (2010): the backlog the network relayed before this process
+    // listened is never pushed again.
+    //
+    // TXPOOL-RESUME-2: the gate OPENS only once the output set has been fed up
+    // to the index tip (TxRelayGateLatch): opened on the first MainchainEvent of
+    // the catch-up batch, it admitted the fresh-boot back-fill against an output
+    // set ~180 blocks short, leaving 76 of 77 rings unresolved. Every opening
+    // (boot, and each regain after a sync loss) starts a new complement round.
     void publish_tx_gate_() {
         const bool synced = index_.view().sync_state().synced;
-        bool expected = !synced;
-        if (!tx_gate_.compare_exchange_strong(expected, synced)) return;
-        pool_loop_.post([this, synced] { txpool_.set_synced(synced); });
-        note_(std::string("[txpool] relay gate ") + (synced ? "OPEN" : "CLOSED")
-              + " (index synced=" + (synced ? "1" : "0") + ")");
+        TxRelayGateLatch::Step st;
+        std::uint64_t held_before = 0, opens = 0;
+        {
+            std::lock_guard<std::mutex> lk(gate_mu_);
+            st = gate_latch_.evaluate(synced);
+            held_before = gate_latch_.held_before_last_open();
+            opens = gate_latch_.opens();
+        }
+        if (!st.changed) return;
+        tx_gate_.store(st.open);
+        std::string seated;
+        if (st.open) {
+            if (const auto t = index_.view().tip())
+                if (txpool_.seat_tip(t->height))
+                    seated = ", pool tip seated at " + std::to_string(t->height);
+        }
+        pool_loop_.post([this, open = st.open] { txpool_.set_synced(open); });
+        if (st.open) {
+            // Admission is posted to the same pool loop AFTER set_synced, so
+            // the back-fill answer can never race ahead of the open gate.
+            if (gate_open_ms_ == 0) gate_open_ms_ = now_ms_();
+            if (pool_ && st.arm_complement) pool_->arm_txpool_complement();
+        }
+        std::string line = std::string("[txpool] relay gate ") + (st.open ? "OPEN" : "CLOSED")
+              + " (index synced=" + (synced ? "1" : "0") + seated;
+        if (st.open)
+            line += ", output set at the index tip (frontier " + std::to_string(outputs_.frontier())
+                  + ", held " + std::to_string(held_before) + " evaluation(s) for it), complement round "
+                  + std::to_string(opens);
+        line += ")";
+        note_(line);
+        std::fprintf(stderr, "[native] %s\n", line.c_str());
+    }
+
+    // TXPOOL-RESUME (verify thread): the warm latch the template readiness
+    // rule reads. Warm once the relay gate is open AND either the first
+    // complement answer has been admitted or txpool_warm_timeout_ms passed
+    // since the gate opened (bounded: a peer that never answers costs at most
+    // the timeout). Latched for the life of the process.
+    void update_pool_warm_(std::uint64_t /*tick_now*/) {
+        if (pool_warm_.load(std::memory_order_relaxed) || !tx_gate_.load() || gate_open_ms_ == 0) return;
+        // TXPOOL-RESUME-2: read the clock HERE. The tick's `now` was taken when
+        // the tick was armed, before this task queued behind a flush on the
+        // verify thread, so it could predate gate_open_ms_ and every delay
+        // read "WARM after 0 ms" however long the answer took.
+        const std::uint64_t now = now_ms_();
+        const std::uint64_t rounds = tx_sink_.complement_rounds();
+        const std::uint64_t waited = now > gate_open_ms_ ? now - gate_open_ms_ : 0;
+        const bool timed_out = waited >= cfg_.txpool_warm_timeout_ms;
+        if (rounds == 0 && !timed_out) return;
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            warm_why_      = rounds ? "complement" : "timeout";
+            warm_after_ms_ = waited;
+        }
+        pool_warm_.store(true, std::memory_order_release);
+        const std::string line = "[txpool] WARM after " + std::to_string(waited) + " ms ("
+            + (rounds ? "complement answer admitted: " + std::to_string(tx_sink_.complement_txs()) + " tx"
+                      : std::string("timeout, no complement answer"))
+            + ", pool=" + std::to_string(txpool_.size())
+            + ", unresolved=" + std::to_string(txpool_.stats().unresolved_ring)
+            + ", output-set frontier=" + std::to_string(outputs_.frontier()) + "); templates may now be served";
+        note_(line);
+        std::fprintf(stderr, "[native] %s\n", line.c_str());
     }
 
     void on_mainchain_(const node::MainchainEvent& ev) {
@@ -1439,10 +1800,29 @@ private:
             std::lock_guard<std::mutex> lk(rec_mu_);
             ++chain_events_seen_;
             chain_events_.push_back(ev);
+            const std::size_t cap = cfg_.chain_event_cap ? cfg_.chain_event_cap : 8192;
+            if (chain_events_.size() == cap / 2) ++ev_bp_engaged_;
             // Bounded like tips_. A consumer that stopped draining is a bug, and
             // dropping the OLDEST is the right failure: the newest events are
             // the ones a finalize cursor still needs.
-            if (chain_events_.size() > 8192) chain_events_.erase(chain_events_.begin());
+            // COLD-BOOT-3: but never SILENTLY. Each drop is counted and alarmed,
+            // and its height is re-driven from the index on the next drain.
+            if (chain_events_.size() > cap) {
+                const node::MainchainEvent& old = chain_events_.front();
+                const std::uint64_t h = old.block.height;
+                if (!ev_overflow_pending_) { ev_overflow_pending_ = true; ev_overflow_lo_ = ev_overflow_hi_ = h; }
+                else { if (h < ev_overflow_lo_) ev_overflow_lo_ = h; if (h > ev_overflow_hi_) ev_overflow_hi_ = h; }
+                if (ev_dropped_++ % 1024 == 0) {
+                    std::fprintf(stderr, "[native] ALARM chain-event queue full (%zu undrained): the oldest event (h=%llu) "
+                                         "leaves the queue -- dropped so far %llu; its height is re-driven from the index "
+                                         "on the next drain\n",
+                                 chain_events_.size(), (unsigned long long)h, (unsigned long long)ev_dropped_);
+                    std::fflush(stderr);
+                }
+                chain_events_.erase(chain_events_.begin());
+            }
+            if (chain_events_.size() > ev_high_water_) ev_high_water_ = chain_events_.size();
+            chain_events_n_.store(chain_events_.size(), std::memory_order_relaxed);
         }
         if (ev.kind == node::MainchainEventKind::Orphan) return;
         TipRecord r;
@@ -1474,8 +1854,15 @@ private:
             if (tips_.size() > 8192) tips_.erase(tips_.begin());
         }
         if (oracle_) oracle_->on_tip(ev, "native");
-        // The gate is published here as well as on the driver tick so that it
-        // opens on the block that closed the sync, not up to a tick later.
+        // TXPOOL-RESUME-2: this flush delivers its BlockTxEvents -- the output
+        // set's feed -- only AFTER every MainchainEvent, so the gate may not
+        // open on this event; it opens from the tx sink once the index tip's
+        // outputs are in (xmr_tx_relay_gate.hpp). A gate already open stays
+        // open; a sync loss still closes it here.
+        {
+            std::lock_guard<std::mutex> lk(gate_mu_);
+            gate_latch_.note_chain_events_pending();
+        }
         publish_tx_gate_();
     }
 
@@ -1595,20 +1982,24 @@ private:
         return k;
     }
 
+    // The post-anchor output-set overlay lives NEXT TO the chain snapshot, in
+    // its own file: the anchor snapshot (--output-set) is a read-only, pinned
+    // input and is never written, and the index envelope keeps its format.
+    std::string overlay_path_() const { return cfg_.snapshot_path + ".outset"; }
+
     void load_snapshot_() {
         std::vector<std::uint8_t> file;
         std::string why;
-        // The v1 snapshot image restores the chain INDEX but not outputs_ (the
-        // global output-set / spent-key-image view). When an output-set was
-        // seeded (--native-output-set), that set is numbered from the anchor's
-        // base and CANNOT be re-seated to a resumed (higher) tip, so resume and
-        // an output-set backfill are mutually exclusive: keep the freshly seeded
-        // set and boot from the confirmed anchor rather than run a mis-numbered
-        // one. (A future snapshot v2 that persists outputs_ lifts this.)
+        // When an output-set was seeded (--native-output-set), that set is
+        // numbered from the anchor's base and cannot be re-seated to a resumed
+        // (higher) tip. The chain image alone therefore cannot resume it: the
+        // post-anchor OVERLAY (outputs, key images, per-block leaves and undo
+        // frames the chain added since the anchor) is persisted beside it and
+        // replayed onto the seeded snapshot, bound to the same image and
+        // verified against its recorded roots. Anything that does not match
+        // falls back to the from-anchor re-walk, exactly as before.
         if (outputs_.output_count() > 0) {
-            note_("[snapshot] resume skipped: an output-set was seeded "
-                  "(--native-output-set) and pins outputs_ to the anchor base; "
-                  "booting from the confirmed anchor");
+            load_snapshot_with_output_set_();
             return;
         }
         if (!read_snapshot_file(cfg_.snapshot_path, file, why)) {
@@ -1661,6 +2052,7 @@ private:
             outputs_.disable_resolution();
         });
         const SyncState st = index_.sync_state();
+        note_resumed_(st.header_frontier);   // COLD-BOOT-3
         note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
             + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
             + " bytes); no re-IBD from the anchor -- ring resolution disabled "
@@ -1672,24 +2064,199 @@ private:
     void save_snapshot_(const char* occasion) {
         std::vector<std::uint8_t> image;
         std::string why;
+        if (outputs_.has_anchor_snapshot()) {
+            save_snapshot_with_output_set_(occasion);
+            return;
+        }
         if (!index_.save_snapshot(image, why)) {
-            note_(std::string("[snapshot] not written (") + occasion + "): " + why);
+            snap_log_(false, std::string("[snapshot] not written (") + occasion + "): " + why);
             return;
         }
         const std::vector<std::uint8_t> file =
             encode_snapshot_envelope(snapshot_key_(), image);
         if (!write_snapshot_file(cfg_.snapshot_path, file, why)) {
-            note_(std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
             return;
         }
-        note_(std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
+        snap_log_(true, std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
             + cfg_.snapshot_path + " (" + occasion + ")");
+    }
+
+    // sha256 of the decoded chain image: what the overlay file is bound to.
+    static Hash image_digest_(const std::vector<std::uint8_t>& image) {
+        anchor_hash::Sha256 h;
+        h.update(image.data(), image.size());
+        const std::array<std::uint8_t, 32> d = h.finish();
+        Hash out{};
+        std::copy(d.begin(), d.end(), out.begin());
+        return out;
+    }
+
+    // The output-set flavour of save_snapshot_(). The chain image and the
+    // overlay are captured TOGETHER on the verify thread -- the thread that
+    // connects blocks and feeds outputs_ synchronously -- so both describe the
+    // same tip; the save is refused (the previous pair kept) if they do not.
+    // The overlay file is written FIRST and carries sha256(image): a crash
+    // between the two writes leaves an overlay bound to an image that is not
+    // on disk, which the load refuses (re-walk), never a mismatched pair.
+    void save_snapshot_with_output_set_(const char* occasion) {
+        std::vector<std::uint8_t> image, ovl;
+        std::string why;
+        bool ok = false;
+        std::uint64_t idx_h = 0, set_h = 0;
+        verify_loop_.call([&] {
+            const auto t = index_.tip();
+            if (!t) { why = "the index has no tip"; return; }
+            idx_h = t->height;
+            set_h = outputs_.tip_height();
+            if (!index_.save_snapshot(image, why)) return;
+            if (t->height != set_h || t->id != outputs_.tip_id()) {
+                why = "output-set overlay tip does not match the index tip";
+                return;
+            }
+            ok = outputs_.serialize_overlay(ovl, why);
+        });
+        if (!ok) {
+            snap_log_(false, std::string("[snapshot] not written (") + occasion + "): " + why
+                + " (index tip " + std::to_string(idx_h) + ", output-set tip "
+                + std::to_string(set_h) + ")");
+            return;
+        }
+        const Hash bind = image_digest_(image);
+        std::vector<std::uint8_t> ofile;
+        ofile.reserve(ovl.size() + 32);
+        ofile.insert(ofile.end(), bind.begin(), bind.end());
+        ofile.insert(ofile.end(), ovl.begin(), ovl.end());
+        if (!write_snapshot_file(overlay_path_(), ofile, why)) {
+            snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            return;
+        }
+        const std::vector<std::uint8_t> file =
+            encode_snapshot_envelope(snapshot_key_(), image);
+        if (!write_snapshot_file(cfg_.snapshot_path, file, why)) {
+            snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
+            return;
+        }
+        snap_log_(true, std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
+            + cfg_.snapshot_path + " + " + std::to_string(ofile.size())
+            + " bytes output-set overlay (" + std::to_string(outputs_.overlay_block_count())
+            + " post-anchor blocks, tip " + std::to_string(set_h) + ") (" + occasion + ")");
+    }
+
+    // The output-set flavour of load_snapshot_(). Fail-closed at every step:
+    // any refusal leaves outputs_ at the bare anchor snapshot and the index at
+    // the confirmed anchor, and the node re-walks from the anchor as before.
+    void load_snapshot_with_output_set_() {
+        const std::string fallback = "; booting from the confirmed anchor (re-walk)";
+        std::vector<std::uint8_t> file, image;
+        std::string why;
+        if (!read_snapshot_file(cfg_.snapshot_path, file, why)) {
+            note_("[snapshot] no resume (" + why + ")" + fallback);
+            return;
+        }
+        if (!decode_snapshot_envelope(file, snapshot_key_(), image, why)) {
+            note_("[snapshot] REFUSED: " + why + fallback);
+            return;
+        }
+        std::vector<std::uint8_t> ofile;
+        {
+            std::ifstream f(overlay_path_(), std::ios::binary);
+            if (!f) {
+                note_("[snapshot] resume REFUSED: no output-set overlay at " + overlay_path_()
+                    + " (an output-set was seeded; the chain image alone cannot resume it)"
+                    + fallback);
+                return;
+            }
+            ofile.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        if (ofile.size() < 32) {
+            note_("[snapshot] resume REFUSED: output-set overlay is truncated" + fallback);
+            return;
+        }
+        const Hash bind = image_digest_(image);
+        if (!std::equal(bind.begin(), bind.end(), ofile.begin())) {
+            note_("[snapshot] resume REFUSED: output-set overlay is bound to a different chain "
+                  "image (a stale or foreign overlay)" + fallback);
+            return;
+        }
+        const std::vector<std::uint8_t> ovl(ofile.begin() + 32, ofile.end());
+        bool ok = false;
+        std::string load_why;
+        verify_loop_.call([&] { ok = outputs_.load_overlay(ovl, load_why); });
+        if (!ok) {
+            note_("[snapshot] resume REFUSED: output-set overlay does not verify: " + load_why
+                + fallback);
+            return;
+        }
+        // Then the chain image, through the boot, on the verify thread (see the
+        // plain load_snapshot_() path for why both) -- and, in the SAME hop so
+        // no block can connect in between, the tip check and the re-seat of the
+        // index's output counter. The index image does not carry that counter
+        // (seed_direct restarts it from 0 plus the replayed tail); without the
+        // re-seat the next block's first_output_index would not be the set's
+        // frontier and the set would refuse every new block with outputs.
+        bool tip_ok = false;
+        std::uint64_t idx_h = 0, set_h = 0;
+        verify_loop_.call([&] {
+            ok = boot_.resume_from_snapshot(image, load_why);
+            if (!ok) { outputs_.drop_overlay(); return; }
+            const auto t = index_.tip();
+            idx_h  = t ? t->height : 0;
+            set_h  = outputs_.tip_height();
+            tip_ok = t && t->height == set_h && t->id == outputs_.tip_id();
+            if (tip_ok) index_.reseat_rct_output_count(outputs_.frontier());
+            else        outputs_.disable_resolution();
+        });
+        if (!ok) {
+            note_("[snapshot] REFUSED: " + load_why + fallback);
+            return;
+        }
+        // The pair was captured at one tip and bound by digest, so the resumed
+        // index tip must be the overlay's. If it somehow is not, the index can
+        // no longer be un-resumed: ring resolution was disabled above (every
+        // ring RingUnresolved) rather than resolve against a set at another
+        // height.
+        if (!tip_ok) {
+            note_("[snapshot] ALARM: resumed index tip " + std::to_string(idx_h)
+                + " != output-set overlay tip " + std::to_string(set_h)
+                + "; ring resolution DISABLED (fail-closed)");
+            return;
+        }
+        const SyncState st = index_.sync_state();
+        note_resumed_(st.header_frontier);   // COLD-BOOT-3
+        note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
+            + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
+            + " bytes) + output-set overlay (" + std::to_string(outputs_.overlay_block_count())
+            + " post-anchor blocks, frontier " + std::to_string(outputs_.frontier())
+            + ", spent " + std::to_string(outputs_.spent_count())
+            + "); no re-walk from the anchor -- ring resolution intact");
     }
 
     void note_(const std::string& line) {
         std::lock_guard<std::mutex> lk(rec_mu_);
         log_.push_back(line);
         if (log_.size() > 4096) log_.erase(log_.begin());
+    }
+
+    void note_resumed_(std::uint64_t tip) {
+        const std::uint64_t base = index_.anchor_height();   // the resumed view's base row
+        std::lock_guard<std::mutex> lk(rec_mu_);
+        resumed_ = true; resumed_base_ = base; resumed_tip_ = tip;
+    }
+
+    // COLD-BOOT-2 (D4a): a snapshot save is reported where the operator reads,
+    // not only into log_ (which the pool daemon drains only at boot, so every
+    // save -- and every FAILED save -- after start-up was silent). A failure is
+    // an ALARM line on stderr and is counted (snapshot_stats()).
+    void snap_log_(bool ok, const std::string& line) {
+        note_(line);
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            if (ok) ++snap_ok_; else { ++snap_failed_; snap_last_fail_ = line; }
+        }
+        if (ok) std::fprintf(stderr, "[native] %s\n", line.c_str());
+        else    std::fprintf(stderr, "[native] ALARM snapshot save FAILED: %s\n", line.c_str());
+        std::fflush(stderr);
     }
 
     // --- state --------------------------------------------------------------
@@ -1761,6 +2328,16 @@ private:
     std::atomic<std::uint64_t>            snap_next_ms_{0};
     // The last value published to C3's relay gate; see publish_tx_gate_().
     std::atomic<bool>                     tx_gate_{false};
+    // TXPOOL-RESUME-2: the gate decision (output set at the index tip; one
+    // complement round per opening). Verify thread; the mutex is belt and braces.
+    std::mutex                            gate_mu_;
+    TxRelayGateLatch                      gate_latch_;
+    // TXPOOL-RESUME: the warm latch (read by the native miner-data source),
+    // when the gate first opened (verify thread only), and why it warmed.
+    std::atomic<bool>                     pool_warm_{false};
+    std::uint64_t                         gate_open_ms_ = 0;
+    std::string                           warm_why_;        // rec_mu_
+    std::uint64_t                         warm_after_ms_ = 0;   // rec_mu_
     std::chrono::steady_clock::time_point epoch_ = std::chrono::steady_clock::now();
 
     mutable std::mutex        rec_mu_;
@@ -1770,6 +2347,17 @@ private:
     // are all written from the verify thread and read from the consumer's.
     std::vector<node::MainchainEvent> chain_events_;
     std::uint64_t                     chain_events_seen_ = 0;
+    std::uint64_t                     snap_ok_ = 0, snap_failed_ = 0;   // COLD-BOOT-2: snapshot saves (rec_mu_)
+    // COLD-BOOT-3: event-queue overflow / backpressure evidence (rec_mu_; the
+    // atomic mirrors the queue size for the index's download hold).
+    std::atomic<std::size_t>          chain_events_n_{0};
+    bool                              resumed_ = false;                 // COLD-BOOT-3: boot origin (rec_mu_)
+    std::uint64_t                     resumed_base_ = 0, resumed_tip_ = 0;
+    std::uint64_t                     ev_dropped_ = 0, ev_redriven_ = 0, ev_unrecoverable_ = 0, ev_bp_engaged_ = 0;
+    std::size_t                       ev_high_water_ = 0;
+    bool                              ev_overflow_pending_ = false;
+    std::uint64_t                     ev_overflow_lo_ = 0, ev_overflow_hi_ = 0;
+    std::string                       snap_last_fail_;
 };
 
 } // namespace c2pool::xmr::native::rt
