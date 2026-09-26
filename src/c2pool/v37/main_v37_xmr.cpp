@@ -234,6 +234,11 @@ static std::size_t   g_relay_vault_entries = 0, g_relay_vault_bytes = 0;   // --
 static std::uint64_t g_relay_vault_horizon = 0;         // --relay-vault-horizon (0 = default 8640)
 static bool          g_no_relay_serve = false;          // --no-relay-serve
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
+// --test-crash-after-publish N (regtest rig only): the process exits (137, no cleanup) right after its
+// N-th found block was PUBLISHED and before its FOUND event reaches finalize-connect -- the window in
+// which an own win's registration (and its DROPS carried delta) used to live only in memory.
+static std::uint32_t g_test_crash_after_publish = 0;
+static std::uint32_t g_test_published = 0;
 static std::string   g_relay_bind = "none";             // --relay-bind none|rbind (rbind needs SEAM-1 in the template)
 static bool relay_enabled() { return !g_relay_listen.empty() || !g_relay_peers.empty(); }
 // POOL-LINEAGE: the pool genesis id (--pool-genesis, else the per-network
@@ -726,6 +731,13 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         sub::FoundBlockEvent s;
         while (submit_q.pop(s)) {
             std::printf("  [submit] %s\n", sub::describe(s).c_str());
+            if (g_test_crash_after_publish && ++g_test_published >= g_test_crash_after_publish) {   // test-only fault knob
+                std::printf("TEST knob: CRASH after publish #%u h=%llu bid=%s (before the FOUND callback; exit 137 in 1.5 s)\n",
+                            g_test_published, static_cast<unsigned long long>(s.height), hex_of(s.block_id).c_str());
+                std::fflush(stdout);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500));   // the relay / levin threads flush the publish
+                std::_Exit(137);
+            }
             o2::FoundBlockEvent e;
             e.height          = s.height;
             e.block_id_hex    = hex_of(s.block_id);
@@ -1346,6 +1358,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     if (const std::string r = c2pool::v37n::xmr::TestSuspendKnob::refusal(cfg.network == MoneroNetwork::Mainnet, g_test_suspend_s);
         !r.empty()) {
         std::printf("REFUSED: %s\n", r.c_str());
+        return 2;
+    }
+    if (g_test_crash_after_publish && cfg.network != MoneroNetwork::Regtest) {   // FAULT-KNOB (TEST-ONLY): regtest rig only
+        std::printf("REFUSED: --test-crash-after-publish is a regtest-only fault knob (network=%s)\n", to_string(cfg.network));
         return 2;
     }
     // REGTEST-ONLY rig knobs (the receipt-feed carrier stand-in, the v0x02
@@ -4207,6 +4223,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = u64();
         else if (a == "--no-relay-serve")           g_no_relay_serve = true;
         else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
+        else if (a == "--test-crash-after-publish")     g_test_crash_after_publish = u32();
         else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = u32();
         else if (a == "--relay-bind")               g_relay_bind = cs::one_of(a, value(), {"none", "rbind"});
         else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = u64();
@@ -4314,6 +4331,8 @@ int main(int argc, char** argv) {
                 "  --minority-min-blocks <n>    D2 no decision on fewer decided lane blocks (default 3)\n"
                 "  --converge-retry-bound <n>   D2 undecidable re-derivation attempts before DIVERGED (600)\n"
                 "  --converge-hold-ticks <n>    TEST knob: CONVERGING holds n ticks before the first attempt\n"
+                "  --test-crash-after-publish <N>   TEST-ONLY fault knob, regtest only (default 0 = off): exit 137 right\n"
+                "                                   after the N-th found block is published, before its FOUND callback\n"
                 "  --test-suspend-lane-seconds <S>  TEST-ONLY fault knob (default 0 = off, no handler): SIGUSR2\n"
                 "                               forces a lane suspension (cause=test) for S s, then releases\n"
                 "                               it (same suspend/resume path as lag/held); refused on mainnet\n"
