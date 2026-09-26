@@ -249,23 +249,40 @@ inline std::string verify_carry(const DropsCarry& c, bool binds) {
 // books the lane derivation either way (a refusal can never fork a booking).
 // Flip 0: nothing below is constructed or called.
 #define C2POOL_XMR_DROPS_LANE_ENROL 1
+// ★ DROPS-ENROL-TIDY (flip 1): the lane-position log is bounded (folded below
+// the oldest reachable cut), the tip-based book / node-local share book are
+// retired (lane-only), and an enrol-set mismatch is refused at HELLO by name.
+#define C2POOL_XMR_DROPS_ENROL_TIDY 1
 
 // One receipt of the lane prefix: its payee identity and origin bin.
 struct LaneShare {
     bytes32 payee{};
     std::uint64_t bin = 0;
 };
+using ShareCounts = std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t>;
 // The receipts of the lane prefix [0, P), as a multiset (order-free: the
 // winner's order and a repaired order of the same prefix carry the same set).
+// ★ DROPS-ENROL-TIDY: [0, base_P) may arrive FOLDED (our own pruned lane log,
+// XmrDropsWiring::prune_lane_log): base_first = each payee's lowest origin bin
+// among the folded receipts (all the enrolment reads of them), base_counts =
+// their S(payee, iv) for iv at or above the harvest retention floor (all a
+// reachable composition reads of them), base_n = how many were folded. A
+// repaired (winner-side) prefix carries no base: every receipt is in `shares`.
 struct LanePrefix {
     std::uint64_t P = 0;
     std::vector<LaneShare> shares;
+    std::uint64_t base_P = 0;
+    std::size_t base_n = 0;
+    std::map<bytes32, std::uint64_t> base_first;
+    ShareCounts base_counts;
+    std::size_t receipts() const { return base_n + shares.size(); }
 };
-using ShareCounts = std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t>;
 
 // S(payee, iv) for iv in [lo, hi), from the prefix alone.
 inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std::uint64_t hi) {
     ShareCounts s;
+    for (const auto& [k, n] : lp.base_counts)
+        if (k.second >= lo && k.second < hi) s[k] += n;
     for (const auto& x : lp.shares)
         if (x.bin >= lo && x.bin < hi) ++s[std::make_pair(x.payee, x.bin)];
     return s;
@@ -273,6 +290,11 @@ inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std
 // The enrolment book of the prefix: a pure function of (the enrol set, [0, P)).
 inline ::c2pool::v37n::EnrollmentBook lane_enrollment(const LanePrefix& lp, const std::set<bytes32>& enrol_set) {
     std::map<bytes32, std::uint64_t> first;
+    for (const auto& [payee, bin] : lp.base_first) {
+        if (!enrol_set.count(payee)) continue;
+        auto [it, fresh] = first.try_emplace(payee, bin);
+        if (!fresh && bin < it->second) it->second = bin;
+    }
     for (const auto& x : lp.shares) {
         if (!enrol_set.count(x.payee)) continue;
         auto [it, fresh] = first.try_emplace(x.payee, x.bin);
@@ -471,6 +493,26 @@ public:
         m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
         for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
         return out;
+    }
+
+    // ★ DROPS-ENROL-TIDY: take() without the rows -- the same range, range log
+    // and bounded-retention bookkeeping, and nothing read from the node-local
+    // share book or an enrolment book. At flip 1 every booking books the lane
+    // composition (handed to the node as its carried delta), so the rows take()
+    // derives would be discarded anyway; the lane-only wiring advances with this.
+    void advance(std::uint64_t won_height, std::optional<std::uint64_t> prev_lane) {
+        const auto rg = range_with(won_height, prev_lane);
+        if (!rg) { ++m_undecided; return; }
+        const auto [lo, hi] = *rg;
+        m_last_lo = lo; m_last_hi = hi;
+        m_booked[won_height] = *rg;
+        while (m_booked.size() > kBookedKept) m_booked.erase(m_booked.begin());
+        if (won_height >= m_top) {
+            m_top = won_height;
+            if (lo > kReorgMargin) m_floor = std::max(m_floor, lo - kReorgMargin);
+        }
+        m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
+        for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
     }
 
     // ★ DROPS-RESTART (defect 1): prev_lane(h) from the canonical chain, as a
@@ -780,9 +822,21 @@ public:
     ChainOrderedHarvest::Rows take_chain_ordered(std::uint64_t won_height) {
         const auto pl = prev_lane(won_height);
         std::lock_guard<std::mutex> lk(m_hmtx);
+        if (m_lane_only) { m_coh.advance(won_height, pl); return {}; }   // ★ DROPS-ENROL-TIDY
         const auto& book = m_core.shares();
         return m_coh.take(won_height, pl, [&book](std::uint64_t iv) { return book.covers(iv); }, &m_core.enrollment());
     }
+    // ★ DROPS-ENROL-TIDY (flip 1): the composition is the lane derivation only.
+    // The tip-based EnrollmentBook and the node-local share book are no longer
+    // fed by the shell (no enroll_at_tip / arm_at_tip / on_share_pushed), the
+    // node is handed NO enrolment book, and the harvest seam only advances the
+    // retained set's range bookkeeping (every row it used to derive was
+    // discarded by the carried-delta booking). The one remaining reader of that
+    // seam is XmrNode's LOCAL-composition fallback (no carried delta AND no
+    // journalled booking), which the lane booking never reaches; with no book
+    // it composes nothing (fail-closed), never a node-local credit.
+    void set_lane_only(bool on = true) { std::lock_guard<std::mutex> lk(m_hmtx); m_lane_only = on; }
+    bool lane_only() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_only; }
     // diagnostic: (rows, inputs digest) of [lo, hi) as the retained set stands now (pure)
     std::pair<std::size_t, std::uint64_t> peek_rows(std::uint64_t lo, std::uint64_t hi) const {
         std::lock_guard<std::mutex> lk(m_hmtx);
@@ -811,11 +865,94 @@ public:
     void on_share_lane(const bytes32& payee, std::uint64_t bin, std::uint64_t pos_first, std::uint32_t n,
                        const bytes32& prev_id) {
         std::lock_guard<std::mutex> lk(m_hmtx);
+        if (pos_first < m_lane_base_P) {   // ★ DROPS-ENROL-TIDY: a rewrite below the folded base
+            m_lane_base_stale = true;      // the fold no longer describes [0, base_P): own prefixes refuse (repair)
+            ++m_lane_below_base;
+            return;
+        }
         m_lane_pos[pos_first] = LanePos{payee, bin, prev_id};
+        m_lane_pos_max = std::max(m_lane_pos_max, m_lane_pos.size());
         if (pos_first == m_lane_contig) m_lane_contig = pos_first + (n ? n : 1);
         else if (pos_first > m_lane_contig) ++m_lane_gaps;   // our own log no longer covers [0, P) past here
     }
     using BinOfFn = std::function<std::optional<std::uint64_t>(const bytes32& prev_id)>;
+
+    // ── ★ DROPS-ENROL-TIDY: THE LANE-LOG BOUND ─────────────────────────────
+    // INVARIANT. m_lane_pos is read ONLY by own_prefix(P), and only for a P the
+    // shell has matched to our own lane (relay digest_at(P) -- retained for
+    // P >= lane_next - H - 1, H = the relay vault horizon -- or the engine's
+    // settlement ring at P). The relay-repair answer never reads it (it is the
+    // winner-side order out of the relay vault + verified cache) and
+    // verify_carry reads only the digest compose_lane derives from a prefix.
+    // The lane blocks still bookable are the ones above the finalize cursor (a
+    // block at or below it is final and never re-booked), and a future block's
+    // cut is only readable here while it is inside H. So with
+    //     reach = min(the cut of every lane block not yet final, and of the
+    //                 newest final one;  lane_next - H - 1)
+    //     Q     = reach - kLanePosMargin            (lane_prune_point)
+    // no own_prefix(P) that can still be asked has P < Q, and the entries at
+    // positions < Q are FOLDED (not dropped): what [0, Q) contributes to any
+    // prefix with P >= Q is (a) each payee's lowest origin bin (enrolment) and
+    // (b) S(payee, iv) for iv >= the harvest retention floor (a composition
+    // settles [lo, hi) with lo >= that floor: below it the raindrops are
+    // already released, ChainOrderedHarvest::kReorgMargin). own_prefix(P) for
+    // P >= base_P therefore returns the SAME counts, book and digest as before
+    // the fold; for P < base_P it answers nullopt ("below the folded base"),
+    // which the shell treats like any other underivable own prefix (the relay
+    // repair), never a different composition. The log then holds at most the
+    // entries at positions in [Q, lane_next): <= H + 1 + kLanePosMargin + the
+    // span the oldest unfinalized cut trails the lane by, and the fold holds
+    // one bin per payee plus the counts of the retained interval window.
+    static constexpr std::uint64_t kLanePosMargin = 16;   // positions kept below the oldest reachable cut
+    static std::uint64_t lane_prune_point(std::optional<std::uint64_t> oldest_open_cut, std::uint64_t lane_next,
+                                          std::uint64_t horizon) {
+        const std::uint64_t h_floor = lane_next > horizon + 1 ? lane_next - horizon - 1 : 0;
+        const std::uint64_t reach = oldest_open_cut ? std::min(*oldest_open_cut, h_floor) : 0;   // no cut known yet: keep all
+        return reach > kLanePosMargin ? reach - kLanePosMargin : 0;
+    }
+    // Fold the entries at positions < Q (and < our contiguous coverage) into the
+    // base. Stops at the first entry whose origin bin is not resolvable yet (a
+    // reloaded receipt): nothing unresolvable is ever folded. Returns how many
+    // entries were folded.
+    std::size_t prune_lane_log(std::uint64_t Q, const BinOfFn& bin_of) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        if (m_lane_base_stale) return 0;
+        const std::uint64_t lim = std::min(Q, m_lane_contig);
+        std::size_t n = 0;
+        auto it = m_lane_pos.begin();
+        for (; it != m_lane_pos.end() && it->first < lim; ++it) {
+            LanePos& e = it->second;
+            if (e.bin == 0) {
+                const auto b = bin_of ? bin_of(e.prev_id) : std::nullopt;
+                if (!b || *b == 0) break;
+                e.bin = *b;
+            }
+            auto [fi, fresh] = m_lane_base_first.try_emplace(e.payee, e.bin);
+            if (!fresh && e.bin < fi->second) fi->second = e.bin;
+            ++m_lane_base_counts[std::make_pair(e.payee, e.bin)];
+            ++m_lane_base_n;
+            ++n;
+        }
+        m_lane_base_P = it == m_lane_pos.end() ? std::max(m_lane_base_P, lim) : std::max(m_lane_base_P, it->first);
+        m_lane_pos.erase(m_lane_pos.begin(), it);
+        const std::uint64_t fl = m_coh.floor();   // counts below the harvest retention floor are unreadable
+        for (auto ci = m_lane_base_counts.begin(); ci != m_lane_base_counts.end();)
+            ci = ci->first.second < fl ? m_lane_base_counts.erase(ci) : std::next(ci);
+        m_lane_pruned += n;
+        return n;
+    }
+    struct LaneLogStats { std::size_t entries = 0, max_entries = 0, base_payees = 0, base_counts = 0, base_n = 0;
+                          std::uint64_t base_P = 0, pruned = 0, below_base = 0; bool stale = false; };
+    LaneLogStats lane_log_stats() const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        LaneLogStats s;
+        s.entries = m_lane_pos.size(); s.max_entries = m_lane_pos_max; s.base_payees = m_lane_base_first.size();
+        s.base_counts = m_lane_base_counts.size(); s.base_n = m_lane_base_n; s.base_P = m_lane_base_P;
+        s.pruned = m_lane_pruned; s.below_base = m_lane_below_base; s.stale = m_lane_base_stale;
+        return s;
+    }
+    bool lane_log_has(std::uint64_t pos) const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_pos.count(pos) != 0; }
+
     // Our OWN lane order's prefix [0, P) (the caller has checked that our digest
     // at P is the on-chain spine). nullopt = our log does not cover [0, P) or a
     // receipt's bin is not resolvable yet (`why`; the booking HOLDs).
@@ -825,7 +962,14 @@ public:
             if (why) *why = "our lane log covers [0," + std::to_string(m_lane_contig) + ") < P=" + std::to_string(P);
             return std::nullopt;
         }
+        if (m_lane_base_P > 0 && (P < m_lane_base_P || m_lane_base_stale)) {   // ★ DROPS-ENROL-TIDY
+            if (why) *why = m_lane_base_stale ? "our lane log was rewritten below its folded base (relay repair)"
+                                              : "P=" + std::to_string(P) + " is below our folded lane-log base " + std::to_string(m_lane_base_P);
+            return std::nullopt;
+        }
         LanePrefix lp; lp.P = P;
+        lp.base_P = m_lane_base_P; lp.base_n = m_lane_base_n;
+        lp.base_first = m_lane_base_first; lp.base_counts = m_lane_base_counts;
         for (auto it = m_lane_pos.begin(); it != m_lane_pos.end() && it->first < P; ++it) {
             LanePos& e = it->second;
             if (e.bin == 0) {
@@ -858,7 +1002,7 @@ public:
         c.digest = c.book.book_digest();
         c.rows = m_coh.rows_lane(lo, hi, S, c.book);
         c.inputs = m_coh.lane_inputs_digest(lo, hi, S);
-        c.prefix_shares = lp.shares.size();
+        c.prefix_shares = lp.receipts();   // ★ DROPS-ENROL-TIDY: folded + listed (== shares.size() unfolded)
         return c;
     }
     std::uint64_t lane_contig() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_contig; }
@@ -982,6 +1126,14 @@ private:
     std::map<std::uint64_t, LanePos> m_lane_pos;
     std::uint64_t m_lane_contig = 0, m_lane_gaps = 0;
     std::set<bytes32> m_enrol_set;
+    // ★ DROPS-ENROL-TIDY (under m_hmtx): the folded base [0, m_lane_base_P) of
+    // m_lane_pos (prune_lane_log) and the lane-only switch (set_lane_only).
+    std::uint64_t m_lane_base_P = 0, m_lane_pruned = 0, m_lane_below_base = 0;
+    std::size_t m_lane_base_n = 0, m_lane_pos_max = 0;
+    std::map<bytes32, std::uint64_t> m_lane_base_first;
+    ShareCounts m_lane_base_counts;
+    bool m_lane_base_stale = false;
+    bool m_lane_only = false;
 };
 
 }  // namespace c2pool::v37n::xmr::drops

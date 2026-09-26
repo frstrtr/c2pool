@@ -259,6 +259,9 @@ struct RelayOptions {
     // POOL-ID: this node's roundabout lane_tag (pool_id_of()), sent in HELLO and
     // compared with every peer's. nullopt = a tagless (pre-POOL-ID) HELLO.
     std::optional<PoolId> pool_id;
+    // ★ DROPS-ENROL-TIDY (flip 1 only): the --drops-enrol set digest, sent in
+    // HELLO (with a pool genesis) so a mismatch is refused by name. nullopt at flip 0.
+    std::optional<bytes32> enrol_set_digest;
     bool        listen = false;                   // false = dial-only
     std::string listen_host = "127.0.0.1";
     u16         listen_port = 0;                  // 0 = an ephemeral port (tests), read back via listen_port()
@@ -722,7 +725,7 @@ public:
         Hello h;
         h.network = m_o.network; h.chain_id = m_o.chain; h.lane_params_digest = m_o.lane_params_digest;
         h.share_diff = m_o.share_diff; h.node_nonce = m_nonce; h.listen_port = m_net.listen_port();
-        h.bind = m_o.bind; h.pool = m_o.pool_id;
+        h.bind = m_o.bind; h.pool = m_o.pool_id; h.enrol_set = m_o.enrol_set_digest;
         if (m_tip) { const auto t = m_tip(); h.lane_next_pos = t.first; h.lane_digest = t.second; }
         return h;
     }

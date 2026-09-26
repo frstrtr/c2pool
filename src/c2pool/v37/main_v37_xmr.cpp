@@ -222,7 +222,7 @@ static std::string   g_relay_listen;                    // --relay-listen HOST:P
 static std::optional<::v37::bytes32> g_pool_genesis;    // POOL-LINEAGE: --pool-genesis <hex64> (unset = the network default)
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
-static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (enrol + arm only once the native tip >= H)
+static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
 static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
@@ -1707,6 +1707,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::pair<std::uint64_t, std::uint64_t> rg{0, 0};
     };
     std::uint64_t drops_lane_composed = 0, drops_lane_nowin = 0, drops_lane_hold = 0, drops_lane_own_prefix = 0, drops_lane_repaired_prefix = 0;
+    // ★ DROPS-ENROL-TIDY: the on-chain credit cut of every lane block this node
+    // composed, by height (the not-yet-final ones + the newest final one are the
+    // cuts a booking can still ask our own lane log for).
+    std::map<std::uint64_t, std::uint64_t> drops_cut_at_h;
     std::set<std::string> wire_seen;
     std::uint64_t wire_tx = 0, wire_rx = 0, wire_prefold = 0, wire_pending = 0, wire_hit = 0, wire_mismatch = 0, wire_diverged = 0;
     std::uint64_t cut_ok = 0, cut_pending = 0, cut_miss = 0, cut_mismatch = 0, cut_absent = 0, cut_fold_refused = 0;
@@ -2130,6 +2134,21 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!c) return std::nullopt;
         return c->height;
     };
+    // ★ DROPS-ENROL-TIDY: fold our own lane log below the oldest cut a booking can
+    // still ask it for (XmrDropsWiring "THE LANE-LOG BOUND"): the cuts of the lane
+    // blocks above the finalize cursor + the newest final one, and the relay's
+    // digest_at retention (the vault horizon). After every lane composition and
+    // at every status tick.
+    auto drops_prune_lane_log = [&]() {
+        if (!drops_live) return;
+        const std::uint64_t cur = node.finalize_driver().cursor_height();
+        auto fin = drops_cut_at_h.upper_bound(cur);   // first not-yet-final lane block
+        if (fin != drops_cut_at_h.begin()) drops_cut_at_h.erase(drops_cut_at_h.begin(), std::prev(fin));   // keep the newest final
+        std::optional<std::uint64_t> oldest;
+        for (const auto& [hh, P] : drops_cut_at_h) { (void)hh; oldest = oldest ? std::min(*oldest, P) : P; }
+        const std::uint64_t H = g_relay_vault_horizon ? g_relay_vault_horizon : 8640;   // == the relay's digest_at retention
+        drops->prune_lane_log(c2pool::v37n::xmr::drops::XmrDropsWiring::lane_prune_point(oldest, drops->lane_contig(), H), drops_bin_of);
+    };
     auto drops_lane_prefix = [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::uint64_t hint, std::string& why)
             -> std::optional<c2pool::v37n::xmr::drops::LanePrefix> {
         const std::uint64_t P = cc.next_pos;
@@ -2173,6 +2192,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         const auto lp = drops_lane_prefix(bk.credit_cut, relay_hint(bid), why);
         if (!lp) { ++drops_lane_hold; return false; }
         out.rg = *rgo;
+        drops_cut_at_h[h] = bk.credit_cut.next_pos;   // ★ DROPS-ENROL-TIDY: the reachable-cut set (lane-log bound)
         out.lc = drops->compose_lane(rgo->first, rgo->second, *lp);
         c2pool::v37n::settle::DropsCompose dctx;
         dctx.price = c2pool::v37n::xmr::drops::rescale_price(price, drops->receipt_weight());
@@ -2180,6 +2200,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         out.carry = c2pool::v37n::xmr::drops::compose_carry(cfg.lane_params, out.lc.rows, dctx);
         if (out.carry.delta.size() > relay::kBlockWonDropsMaxRows) out.carry.delta.clear();
         ++drops_lane_composed;
+        drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
         return true;
     };
     // ★ ENROL-REPL / DROPS-RESTART / DROPS-ENROL-LANE (gate ON only): THE booked
@@ -3214,14 +3235,16 @@ static int run_live(const XmrNodeConfig& cfg) {
         // provider) returned nullptr and this block constructs nothing, attaches
         // nothing, and arms nothing.
         if (drops) {
-            // THE FOUR NODE SEAMS. Enrolment and the share-count arm are NOT done
-            // here: at this point the native index may still be walking up from
-            // genesis (READY is not "at the tip" -- measured: tip 0 here, 120 a
-            // moment later), and enrolling against that would be the stale-now
-            // shape itself. drops_try_enrol() (below, from the height watch) does
-            // both once the native tip has caught up with the template served.
+            // THE FOUR NODE SEAMS. ★ DROPS-ENROL-TIDY: nothing is enrolled at a tip
+            // and no share-count book is armed (both are lane-derived; see below).
             drops->attach(node);
             drops->attach_chain_order(node, cfg.d_conf);   // ★ RAIN-BACKFILL: harvest consumption follows the chain
+            // ★ DROPS-ENROL-TIDY: the composition is the lane derivation only. The
+            // node gets NO enrolment book (its local-composition fallback, never
+            // reached by the lane booking, composes nothing) and the harvest seam
+            // only advances the retained set's range bookkeeping.
+            node.set_enrollment_book(nullptr);
+            drops->set_lane_only();
             // ★ RAIN-BACKFILL-2: prev_lane(h) from the CANONICAL chain: walk down
             // from h-1 over the best chain's block ids; the first whose coinbase
             // is a lane block is the predecessor. A height the native index no
@@ -3253,10 +3276,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                 for (const auto& e : g_drops_enrol) {
                     std::vector<std::uint8_t> raw;
                     if (e.size() == 64 && sub::from_hex(e, raw) && raw.size() == 32) { ::v37::bytes32 k{}; std::memcpy(k.data(), raw.data(), 32); es.insert(k); }
-                    else if (const auto da = relay::decode_address(e)) {
-                        const ::v37::ScriptRef ref = da->ref();
-                        if (::v37::xmr::xmr_ref_valid(ref)) es.insert(::v37::xmr::xmr_identity_key(ref));
-                    }
+                    else if (const auto da = relay::decode_address(e); da && ::v37::xmr::xmr_ref_valid(da->ref()))
+                        es.insert(::v37::xmr::xmr_identity_key(da->ref()));
+                    else
+                        std::printf("DROPS: --drops-enrol %s is neither a 64-hex identity nor a valid XMR address -- NOT in the enrol set\n", e.c_str());
                 }
                 std::printf("DROPS: enrol set = %zu identit%s (digest %s…): each enrols at its FIRST share on the lane prefix [0,P), effective from that bin + 1\n",
                             es.size(), es.size() == 1 ? "y" : "ies", hex_of(c2pool::v37n::xmr::drops::enrol_set_digest(es)).substr(0, 12).c_str());
@@ -3272,59 +3295,13 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (g_drops_enrol.empty())
                 std::printf("DROPS: gate ON but NOBODY is enrolled (--drops-enrol) -- every composition credits zero (fail-closed, opt-in)\n");
         }
-        // ★ DROPS: enrol + arm, ONCE, at the NATIVE TIP -- the first time the tip
-        // clock (fed only from the height watch) has reached the bin of the
-        // template this node serves (template height == native tip + 1). Before
-        // that nothing is enrolled and the share-count book is unarmed, so every
-        // earlier interval stays UNKNOWN and is withheld (fail-closed).
-        bool drops_enrolled = false;
-        std::uint64_t drops_peer_height = 0;
-        // Under p2p-first "at the tip" is the native node's own claim checked
-        // against its peers: the tip clock (tip + 1, a chain HEIGHT) must have
-        // reached the best peer's advertised height. READY alone is not enough
-        // (measured: a force-synced regtest node served a template at h=1 while
-        // its index was still at 64 of 120).
-        auto drops_tip_synced = [&]() -> bool {
-            if (!p2p_first) return true;   // daemon-first: the ZMQ-fed index follows a synced monerod
-            if (!native || !native->node()) return false;
-            drops_peer_height = native->node()->status().driver.best_peer_height;
-            const auto nb = drops->now_interval();
-            return drops_peer_height > 0 && nb && *nb >= drops_peer_height;
-        };
-        auto drops_try_enrol = [&]() {
-            if (!drops_live || drops_enrolled) return;
-            const auto t = provider.current();
-            const auto now_bin = drops->now_interval();
-            if (!t.valid || !now_bin || *now_bin < t.height) return;
-            if (!drops_tip_synced()) return;
-            if (*now_bin - 1 < g_drops_enrol_min_tip) return;   // --drops-enrol-min-tip: a LATER ex-ante enrolment (a late join / restart)
-            for (const auto& e : g_drops_enrol) {
-                ::v37::bytes32 payee{};
-                bool ok = false;
-                if (e.size() == 64) {
-                    std::vector<std::uint8_t> raw;
-                    if (sub::from_hex(e, raw) && raw.size() == 32) { std::memcpy(payee.data(), raw.data(), 32); ok = true; }
-                } else if (const auto da = relay::decode_address(e)) {
-                    const ::v37::ScriptRef ref = da->ref();
-                    if (::v37::xmr::xmr_ref_valid(ref)) { payee = ::v37::xmr::xmr_identity_key(ref); ok = true; }
-                }
-                if (!ok) { std::printf("DROPS: --drops-enrol %s is neither a 64-hex identity nor a valid XMR address -- NOT enrolled\n", e.c_str()); continue; }
-                const auto oc = drops->enroll_at_tip(payee);
-                std::printf("DROPS: enrol %s… %s at tip bin %llu (native tip %llu, best peer height %llu, served template h=%llu), effective from interval %llu\n",
-                            hex_of(payee).substr(0, 16).c_str(),
-                            oc == c2pool::v37n::EnrollOutcome::Enrolled ? "ENROLLED ex ante"
-                            : oc == c2pool::v37n::EnrollOutcome::AlreadyEnrolled ? "already enrolled (the FIRST commitment stands)"
-                            : "REFUSED (tip unknown)",
-                            (unsigned long long)*now_bin, (unsigned long long)(*now_bin - 1), (unsigned long long)drops_peer_height, (unsigned long long)t.height,
-                            (unsigned long long)(*now_bin + 1));
-            }
-            drops->arm_at_tip();
-            drops_enrolled = true;
-            std::printf("DROPS: share-count book armed at tip bin %llu; enrolled=%zu enrollment_digest=%s…\n",
-                        (unsigned long long)*now_bin, drops->core().stats().enrolled,
-                        hex_of(drops->core().enrollment().book_digest()).substr(0, 16).c_str());
-            std::fflush(stdout);
-        };
+        // ★ DROPS-ENROL-TIDY (flip 1): NO enrolment at the native tip and NO
+        // share-count arm any more. Enrolment is a pure function of the lane
+        // prefix (DROPS-ENROL-LANE: the pool enrol set above, each identity at its
+        // first share on [0, P)) and S is counted from the same prefix, so the
+        // tip-based EnrollmentBook and the node-local share book had no reader in
+        // any booking (drops->set_lane_only() above). --drops-enrol-min-tip is
+        // accepted and has no effect.
         if (relay_enabled()) {
             if (!serving) {
                 std::printf("REFUSED: the receipt relay needs a served template (--residual-sink-spend-hex/--residual-sink-view-hex)\n");
@@ -3363,6 +3340,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             // pool is refused at HELLO as TAG_MISMATCH.
             ro.pool_id = relay::pool_id_of(cfg.lane_chain, cfg.lane_params);
             ro.pool_id->genesis = pool_genesis_of(cfg);   // POOL-LINEAGE: another genesis = TAG_MISMATCH field=pool_genesis
+            // ★ DROPS-ENROL-TIDY (flip 1): the enrol-set digest rides HELLO next to the
+            // genesis, so a peer with another --drops-enrol list is refused by name
+            // (ENROL_SET_MISMATCH, both digests) instead of a generic digest refusal.
+            if (drops_live && !drops->enrol_set().empty())
+                ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_set_digest(drops->enrol_set());
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -3468,7 +3450,6 @@ static int run_live(const XmrNodeConfig& cfg) {
                 },
                 [&](const relay::Admitted& a, std::uint64_t pos_first, std::uint32_t n_pushes, std::uint64_t next_after, const ::v37::bytes32& dig) {
                     relay_node->on_pushed(a.id, pos_first, n_pushes, a.raw, next_after, dig);
-                    if (drops_live) drops->on_share_pushed(::v37::xmr::xmr_identity_key(a.r.payee), a.bin);   // ★ DROPS: S
                     if (drops_live) {   // ★ DROPS-ENROL-LANE: our own lane order, position -> (payee, bin)
                         ::v37::bytes32 prev_id{};
                         if (a.bin == 0) {   // a durable-log reload carries no bin: resolved from prev_id at composition
@@ -3719,7 +3700,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     // on any recent block -- including the blocks this node missed while it was
                     // down -- resolves to (bin, seed) on the verify thread without an RPC there.
                     const std::uint64_t best = node.adapter().index().best_height();
-                    if (drops_live && best) { drops->observe_native_tip(best); drops_try_enrol(); }   // ★ DROPS: daemon-first tip (ZMQ-fed index, no RPC)
+                    if (drops_live && best) drops->observe_native_tip(best);   // ★ DROPS: daemon-first tip (ZMQ-fed index, no RPC)
                     if (best && best != relay_index_best) {
                         relay_index_best = best;
                         auto rpc_headers = [&](const std::string& body, bool range) {
@@ -3870,7 +3851,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
                 // ★ DROPS: THE EX-ANTE CLOCK, from the SAME native tip, in the same
                 // place -- never the burial frontier, never a monerod poll.
-                if (drops_live && tip_best) { drops->observe_native_tip(tip_best); drops_try_enrol(); }
+                if (drops_live && tip_best) drops->observe_native_tip(tip_best);
                 // c2pool#1551: the candidates we HOLD but did not adopt. In the
                 // branch where our own block stays best the rival never becomes
                 // a mainchain event at all, so without this sweep the race book
@@ -3897,6 +3878,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         };
         hooks.status_extra = [&]() {
             if (drops_live) {   // ★ DROPS (gate ON only)
+                // ★ DROPS-ENROL-TIDY: `enrolled=`, `digest=` and `shares_seen=` below
+                // are the ONLY remaining readers of the retired tip EnrollmentBook /
+                // node-local share book (DropsCore, kept for the pre-lane KATs). At
+                // lane-only they read 0 / the empty-book digest; the lane enrol set is
+                // printed at startup and the lane counts on the `drops-lane:` line.
                 const auto ds = drops->core().stats();
                 const auto& rs = relay_node->stats();
                 std::printf("  drops: tip_bin=%llu enrolled=%zu digest=%s… raindrops=%llu late=%llu withheld=%llu discarded=%llu open=%zu "
@@ -3934,12 +3920,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)drops_prev_row_missing, drops_store->published_size(),
                                 (unsigned long long)drops_prepub_journalled.load(), drops_store_loaded.published,
                                 (unsigned long long)drops_prepub_resumed);
+                drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
+                const auto ll = drops->lane_log_stats();
                 std::printf("  drops-lane: composed=%llu without_winner_frame=%llu hold=%llu prefix own=%llu repaired=%llu | carried agrees=%llu refused=%llu "
-                            "| own lane log contiguous_to=%llu gaps=%llu\n",
+                            "| own lane log contiguous_to=%llu gaps=%llu | lane-log entries=%zu max=%zu base_P=%llu folded=%zu base_payees=%zu base_counts=%zu below_base=%llu%s\n",
                             (unsigned long long)drops_lane_composed, (unsigned long long)drops_lane_nowin, (unsigned long long)drops_lane_hold,
                             (unsigned long long)drops_lane_own_prefix, (unsigned long long)drops_lane_repaired_prefix,
                             (unsigned long long)drops_carry_ok, (unsigned long long)drops_carry_refused,
-                            (unsigned long long)drops->lane_contig(), (unsigned long long)drops->lane_gaps());
+                            (unsigned long long)drops->lane_contig(), (unsigned long long)drops->lane_gaps(),
+                            ll.entries, ll.max_entries, (unsigned long long)ll.base_P, ll.base_n, ll.base_payees, ll.base_counts,
+                            (unsigned long long)ll.below_base, ll.stale ? " STALE" : "");
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());

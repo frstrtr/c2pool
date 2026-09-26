@@ -134,6 +134,11 @@ inline constexpr std::size_t kHelloPoolIdBytes      = 32 + 4 + 4;               
 inline constexpr std::size_t kHelloBytesPoolId      = kHelloBytes + kHelloPoolIdBytes;  // 142
 inline constexpr std::size_t kHelloPoolGenesisBytes = 32;                            // POOL-LINEAGE: pool_genesis_id
 inline constexpr std::size_t kHelloBytesPoolGenesis = kHelloBytesPoolId + kHelloPoolGenesisBytes;  // 174
+// ★ DROPS-ENROL-TIDY (flip 1 only): + the pool's --drops-enrol set digest, sent
+// only by a node with DROPS live and a non-empty enrol set AND a pool genesis
+// (so the 174-byte frame keeps its meaning); never at flip 0.
+inline constexpr std::size_t kHelloEnrolSetBytes    = 32;
+inline constexpr std::size_t kHelloBytesEnrolSet    = kHelloBytesPoolGenesis + kHelloEnrolSetBytes;  // 206
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
 // ENROL-REPL: FB_BLOCK_WON v0x02 (flip-only) = the 127-byte v0x01 body + the
 // winner's composed DROPS delta: u16 n | n x (payee 32 | i64 delta) | enrollment_digest 32.
@@ -145,6 +150,10 @@ inline constexpr std::size_t kBlockWonDropsRowBytes  = 32 + 8;
 // the consensus flip: at flip 0 the live decoder accepts exactly v0x01 (127 B),
 // as master does, and nothing emits v0x02 (the w3 v0x03 rule, w3_relay.hpp).
 inline constexpr bool        kBlockWonDropsLive      = ::c2pool::v37n::kActivateConsensusV1;
+// ★ DROPS-ENROL-TIDY: the 206-byte HELLO (enrol-set trailer) exists only under
+// the flip too: at flip 0 it is never emitted and the decoder refuses it as
+// "wrong length", exactly as master.
+inline constexpr bool        kHelloEnrolSetLive      = ::c2pool::v37n::kActivateConsensusV1;
 inline constexpr std::size_t kCtxMaxIds             = 8;                 // ids per FB_GETCTX
 inline constexpr std::size_t kCtxMaxBlob            = 512 * 1024;        // one Monero block blob (header | miner_tx | tx hashes)
 inline constexpr std::size_t kCtxHeader             = 1 + 1 + 4 + 32 + 4; // op ver chain id len
@@ -385,6 +394,7 @@ struct Hello {
     bytes32 lane_digest{};            // LaneSnapshot digest at that tip (diagnostic)
     BindMode bind = BindMode::None;
     std::optional<PoolId> pool;       // POOL-ID extension (none = a 102-byte HELLO)
+    std::optional<bytes32> enrol_set; // ★ DROPS-ENROL-TIDY: enrol_set_digest (flip 1, needs pool->genesis; none = <= 174 B)
     bool operator==(const Hello&) const = default;
 };
 
@@ -396,12 +406,14 @@ inline std::vector<u8> encode_hello(const Hello& h) {
     le::put64(f, h.lane_next_pos); le::putb(f, h.lane_digest); f.push_back(static_cast<u8>(h.bind));
     if (h.pool) { le::putb(f, h.pool->lane_tag); le::put32(f, h.pool->version); le::put32(f, h.pool->authority); }
     if (h.pool && h.pool->genesis) le::putb(f, *h.pool->genesis);   // POOL-LINEAGE
+    if (kHelloEnrolSetLive && h.pool && h.pool->genesis && h.enrol_set) le::putb(f, *h.enrol_set);   // ★ DROPS-ENROL-TIDY (flip 1)
     return f;
 }
 
 inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId && f.size() != kHelloBytesPoolGenesis)
+    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId && f.size() != kHelloBytesPoolGenesis &&
+        !(kHelloEnrolSetLive && f.size() == kHelloBytesEnrolSet))   // flip 0: exactly master's three frames
         return bad("hello: wrong length");
     if (f[0] != FB_HELLO) return bad("hello: wrong opcode");
     if (f[1] != kFbVersion) return bad("hello: unknown version");
@@ -418,12 +430,14 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
     if (p[0] > static_cast<u8>(BindMode::Rbind)) return bad("hello: unknown bind mode");
     h.bind = static_cast<BindMode>(p[0]); p += 1;
     h.pool.reset();
-    if (f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis) {
+    h.enrol_set.reset();
+    if (f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis || f.size() == kHelloBytesEnrolSet) {
         PoolId id;
         id.lane_tag = le::getb(p); p += 32;
         id.version = le::get32(p); p += 4;
         id.authority = le::get32(p); p += 4;
-        if (f.size() == kHelloBytesPoolGenesis) id.genesis = le::getb(p);   // POOL-LINEAGE
+        if (f.size() >= kHelloBytesPoolGenesis) { id.genesis = le::getb(p); p += 32; }   // POOL-LINEAGE
+        if (f.size() == kHelloBytesEnrolSet) h.enrol_set = le::getb(p);                  // ★ DROPS-ENROL-TIDY
         h.pool = id;
     }
     return true;
@@ -466,6 +480,7 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
 // ones that decide whether two nodes can fold the same lane: a mismatch is an
 // EXPLICIT refusal with a reason, never a silent divergence (the memory-recorded
 // "mismatched-LaneParams nodes must reject explicitly" gap).
+inline constexpr char kEnrolSetMismatch[] = "ENROL_SET_MISMATCH";
 inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
     if (auto t = pool_id_mismatch(ours, theirs); !t.empty()) return t;   // POOL-ID (subsumes chain_id when tagged)
@@ -473,7 +488,16 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.share_diff != ours.share_diff)
         return "share_diff " + std::to_string(theirs.share_diff) + " != ours " + std::to_string(ours.share_diff) + " (R-1 pin)";
     if (theirs.bind != ours.bind) return std::string("bind mode ") + to_string(theirs.bind) + " != ours " + to_string(ours.bind);
-    if (theirs.lane_params_digest != ours.lane_params_digest) return "lane_params_digest differs (different LaneParams geometry/gates)";
+    if (theirs.lane_params_digest != ours.lane_params_digest) {
+        // ★ DROPS-ENROL-TIDY (flip 1): the enrol set is mixed into the digest, so
+        // name it when the two HELLOs carry different enrol-set digests.
+        if (theirs.enrol_set != ours.enrol_set)
+            return std::string(kEnrolSetMismatch) + " enrol-set digest differs: ours=" +
+                   (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +
+                   (theirs.enrol_set ? hex32(*theirs.enrol_set).substr(0, 12) : std::string("none")) +
+                   " (every node of a pool must run the identical --drops-enrol list)";
+        return "lane_params_digest differs (different LaneParams geometry/gates)";
+    }
     if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";
     return "";
 }
