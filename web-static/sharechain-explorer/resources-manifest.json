@@ -1,6 +1,6 @@
 {
   "version": "0.1.0-alpha",
-  "generated": "2026-08-28T19:52:28.612Z",
+  "generated": "2026-09-23T17:58:03.678Z",
   "files": [
     "pplns-view.js",
     "sharechain-explorer.js",
@@ -14,17 +14,17 @@
   "integrity": {
     "pplns-view.js": "sha384-/cHI3U+QO74fSFbk0Es5ETWJMR1ZoT9gzRCGJNB1bPlprrz+o6AzuKRYTkRxdgtp",
     "pplns-view.js.map": "sha384-J4jHvn3U6ZFjUtKDE5Y8h+AMx52ASTFtlaaS4qYsg3t8N00LlONyNWaagbofgda9",
-    "sharechain-explorer.js": "sha384-4/4UlrLNDDQngdBi1dAVTYFrj4+pCBXbJQ8Jo4ez21PYDchNht63QGM+ujGCfXxb",
-    "sharechain-explorer.js.map": "sha384-0CK5AYxbgPg3BZjBsbO7bffEODchyQJie4+CM0N+op6GnVAQ7NiVcrkOMcKHhbq2",
-    "shared-core.js": "sha384-shFs3b7dkb/ooHhtaqwIZwSuYwFwk9VonRrrBg8nUSyS7Sqfbc1PDX5+ufap/Wvz",
-    "shared-core.js.map": "sha384-A1CSDMTBmnHbS8vHRdtNIHb8kZN2GTgdWz/aTce3xNY6eAmWiTW0yN8hCpign5gM"
+    "sharechain-explorer.js": "sha384-bjllT051XhqwtU/75fYLN7Xw/yD1Y/iD1BI1SrmB9L3l4mhxTUc2yy/M0fPbhovD",
+    "sharechain-explorer.js.map": "sha384-Y1VcQZ/Sn9NcNRkEzrRuzFETXxTqKGZe8+Xr09rbK6DvgV8WqCfKDnggub/SkYFF",
+    "shared-core.js": "sha384-bQhsCI1I+6menLbNk6UIC6875ztObUOF0m1O1RLOZnXZ7wGpi1rZLh7SeTjSUduQ",
+    "shared-core.js.map": "sha384-Is42DDUoNc4PZgZ+22y4Vc3ZaUTPlrajPilYRqYrdwlqfwVjZPCXwNY6G7PMbmPc"
   },
   "sizes": {
     "pplns-view.js": 32954,
     "pplns-view.js.map": 128604,
     "sharechain-explorer.js": 59644,
-    "sharechain-explorer.js.map": 284763,
-    "shared-core.js": 25691,
-    "shared-core.js.map": 113695
+    "sharechain-explorer.js.map": 285474,
+    "shared-core.js": 25689,
+    "shared-core.js.map": 114305
   }
 }

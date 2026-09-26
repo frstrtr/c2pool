@@ -37,6 +37,7 @@ export {
   type TipEvent,
   type NegotiateResult,
   type StreamSubscription,
+  type WireBlockMarkers,
 } from './transport/types.js';
 export {
   createHttpTransport,
