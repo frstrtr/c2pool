@@ -725,6 +725,9 @@ inline bool decode_dropinv(const std::vector<u8>& f, u32& chain_id, u64& lo, u64
     if (f.size() != kDropsInvHeader + 32 * n) return bad("dropinv: wrong length");
     ids.clear();
     for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + kDropsInvHeader + 32 * i));
+    return true;
+}
+
 // ── FB_PING (0x48) / FB_PONG (0x49): RELAY-LIVENESS keepalive ────────────────
 // Capstone attempt 2: a WAN relay link went silent in BOTH directions for
 // ~3.5 min while TCP kept both sessions up (conns=2 ready=2), so each side
