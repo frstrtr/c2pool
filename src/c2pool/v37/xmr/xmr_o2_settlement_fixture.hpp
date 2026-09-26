@@ -170,6 +170,10 @@ struct XmrSettlementConfig {
     // books at. Unset / false => no pay-now (master's residual behaviour).
     std::function<bool(std::uint64_t next_pos, const ::v37::bytes32& spine,
                        std::vector<::c2pool::v37n::settle::WeightedPayee>& out)> paynow_source;
+    // EMPTY-CUT FINDER (operator ruling 09-26): the payee this node's templates
+    // pay when paynow_source finds the view at the cut but no payee in it (the
+    // node's own payee). Unset => an empty cut keeps master's residual shape.
+    std::optional<::v37::ScriptRef> ecut_finder;
 
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
@@ -326,6 +330,7 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
     if (ctx.has_credit_cut && cfg.paynow_source)   // SAME-BLOCK PAY-NOW: E_b weights at that cut
         ctx.has_paynow = cfg.paynow_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest, ctx.paynow_payees);
+    if (ctx.has_paynow && ctx.paynow_payees.empty()) ctx.ecut_finder = cfg.ecut_finder;   // EMPTY-CUT FINDER
     if (why) why->clear();
     return ctx;
 }

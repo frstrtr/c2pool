@@ -91,6 +91,11 @@ struct CoinbaseBooking {
     // SAME-BLOCK PAY-NOW: the committed base B (0x02 tail "V37N"), if any.
     // The booking nets the pay-now it implies (xmr_paynow.hpp net_booking).
     std::optional<std::uint64_t> paynow_base;
+    // EMPTY-CUT FINDER (operator ruling 09-26): the committed finder payee
+    // (0x02 field "V37F", right before V37N), if any; the booking credits it
+    // the pool when the fold at the cut is empty (xmr_paynow.hpp).
+    std::optional<::v37::ScriptRef> ecut_finder;
+    bool                            ecut_finder_malformed = false;
 };
 
 // MM-PARSE-2: the lane-candidate test, a pure function of the coinbase bytes.
@@ -206,6 +211,8 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     if (const auto cc = credit::parse_from_tx_extra(got.tx_extra)) { b.has_credit_cut = true; b.credit_cut = *cc; }   // recon(A+B credit)
     b.donation_owed_in = fee::parse_donation_owed(got.tx_extra);   // fee model (used by the gate-ON booking only)
     b.paynow_base = paynow::parse(got.tx_extra);                  // SAME-BLOCK PAY-NOW (absent => none)
+    b.ecut_finder = paynow::parse_finder(got.tx_extra);           // EMPTY-CUT FINDER (absent => none)
+    b.ecut_finder_malformed = paynow::finder_malformed(got.tx_extra);
 
     // --- r and R ---
     set_::CoinbaseInputs in;
@@ -223,6 +230,10 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     // --- map every output to a payee identity (fail-closed) ---
     std::vector<std::pair<::v37::bytes32, ::v37::ScriptRef>> refs;
     refs.emplace_back(sink_identity, sink_ref);
+    // EMPTY-CUT FINDER: the block itself names its finder's payee, so its
+    // output maps without any learned ref (identity = xmr_identity_key).
+    if (b.ecut_finder && ::v37::xmr::xmr_ref_valid(*b.ecut_finder))
+        refs.emplace_back(::v37::xmr::xmr_identity_key(*b.ecut_finder), *b.ecut_finder);
     for (const auto& k : keys) {
         ::v37::ScriptRef ref = pay_of(k);
         if (::v37::xmr::is_xmr_kind(ref.kind)) refs.emplace_back(k, ref);
