@@ -83,11 +83,31 @@
 
 // Feature marker for the SMOKE-NOISE KAT (compares lane_set() when present).
 #define C2POOL_XMR_LANE_SET_DIGEST 1
+// RELAY-BINCLOCK: bins close against bin_close_height() (the chain, not only
+// the served template).
+#define C2POOL_XMR_INGEST_CHAIN_CLOCK 1
 
 #include "xmr_relay_node.hpp"
 #include "../xmr_fee_model.hpp"     // receipt_lane_pushes (fee model S3)
 
 namespace c2pool::v37n::xmr::relay {
+
+// RELAY-BINCLOCK (capstone attempt 2, defect 5): the height the canonical
+// ingest closes bins against (tick) and the lane-set `through` is derived
+// from. It was the SERVED TEMPLATE height alone -- and a SUSPENDED lane
+// (cause=lag/held, e.g. right after a restart into a hold) serves no new
+// template, so the template height froze while the chain moved on: node A's
+// bins stopped closing after its restart (through_bin stuck at 2215685,
+// bins_closed=1, pending bins growing to 61+) and B's did too once its
+// backlog below its own frozen template was drained. The bin clock now also
+// follows the chain this node follows: the height of the block being built on
+// its tip (chain high-water + 1), whichever is higher. A suspended node keeps
+// closing its peers' receipts in the same bins as they do. Local scheduling
+// only: no consensus value, lane rule or wire byte reads it.
+inline u64 bin_close_height(u64 template_height, u64 chain_hw) {
+    const u64 next = chain_hw ? chain_hw + 1 : 0;
+    return template_height > next ? template_height : next;
+}
 
 class XmrReceiptIngest {
 public:

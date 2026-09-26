@@ -228,6 +228,8 @@ static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
 static std::uint64_t g_relay_backfill = 2048;           // --relay-backfill-positions N
 static std::uint32_t g_relay_reoffer_s = 60;            // --relay-reoffer-seconds S
+static std::uint32_t g_relay_keepalive_ms = 5000;       // --relay-keepalive-ms MS (0 = off; RELAY-LIVENESS)
+static std::uint32_t g_relay_silence_ms = 25000;        // --relay-silence-timeout-ms MS (0 = never drop)
 static std::string   g_relay_order = "canonical";       // --relay-order canonical|arrival (OQ-1)
 static std::uint64_t g_relay_bin_lag = 1;               // --relay-bin-lag L
 static std::uint32_t g_relay_grace_ms = 4000;           // --relay-bin-grace-ms MS
@@ -3165,6 +3167,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.solicited_credits = g_relay_solicited;
             ro.backfill_positions = g_relay_backfill;
             ro.reoffer_seconds = g_relay_reoffer_s;
+            ro.keepalive_ms = g_relay_keepalive_ms;          // RELAY-LIVENESS
+            ro.silence_timeout_ms = g_relay_silence_ms;
             ro.serve = !g_no_relay_serve;
             if (g_relay_vault_entries) ro.vault.max_entries = g_relay_vault_entries;
             if (g_relay_vault_bytes)   ro.vault.max_bytes = g_relay_vault_bytes;
@@ -3301,6 +3305,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)g_relay_horizon, g_relay_rx_budget.c_str(), io.durable_path.c_str(), reloaded,
                             s ? (unsigned long long)s->next_pos : 0ULL, s ? hex_of(s->digest).substr(0, 12).c_str() : "-",
                             rxp->describe().c_str());
+                std::printf("relay: RELAY-LIVENESS keepalive=%u ms silence-timeout=%u ms (FB_PING/FB_PONG 0x48/0x49; a silent link is dropped + redialed)\n",
+                            g_relay_keepalive_ms, g_relay_silence_ms);
                 std::printf("relay: POOL-ID lane_tag=%s chain_id=%u version=%u authority=%u geometry=%s (HELLO %zu B)\n",
                             relay::hex32(ro.pool_id->lane_tag).c_str(), static_cast<unsigned>(cfg.lane_chain),
                             ro.pool_id->version, ro.pool_id->authority,
@@ -3577,7 +3583,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (drops_live)   // ★ DROPS: every replicated raindrop (own + peers') -> the harvester
                     for (auto& a : relay_node->drain_drops())
                         drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
-                relay_ingest->tick(provider.current().height);
+                // RELAY-BINCLOCK: the chain clock too (a suspended lane serves no new template)
+                relay_ingest->tick(relay::bin_close_height(provider.current().height, node.hw().hw_height));
                 for (const auto& [bw, pid] : relay_node->drain_block_won()) relay_on_cut(bw, pid);
             };
         }
@@ -3727,7 +3734,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
                 {   // SMOKE-NOISE: the value nodes compare (order-free, xmr_receipt_ingest.hpp);
                     // the ab-credit lane digest below is this node's push order (node-local by design)
-                    const std::uint64_t th = provider.current().height;
+                    const std::uint64_t th = relay::bin_close_height(provider.current().height, node.hw().hw_height);   // RELAY-BINCLOCK
                     const std::uint64_t through = th > g_relay_bin_lag + 1 ? th - g_relay_bin_lag - 1 : 0;
                     const auto ls = relay_ingest->lane_set(through);
                     std::printf("  relay-lane-set: through_bin=%llu n=%llu digest=%s… unbinned=%llu (compare THIS across nodes; lane digest = node-local order)\n",
@@ -4294,6 +4301,8 @@ int main(int argc, char** argv) {
         else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
         else if (a == "--relay-backfill-positions") g_relay_backfill = u64();
         else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = u32();
+        else if (a == "--relay-keepalive-ms")       g_relay_keepalive_ms = u32();
+        else if (a == "--relay-silence-timeout-ms") g_relay_silence_ms = u32();
         else if (a == "--relay-order")              g_relay_order = cs::one_of(a, value(), {"canonical", "arrival"});
         else if (a == "--relay-bin-lag")            g_relay_bin_lag = u64();
         else if (a == "--relay-bin-grace-ms")       g_relay_grace_ms = u32();
@@ -4450,6 +4459,8 @@ int main(int argc, char** argv) {
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
+                "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
+                "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
                 "  --relay-vault-entries N --relay-vault-bytes N --relay-vault-horizon N  --no-relay-serve\n"
                 "  --relay-bind none|rbind      rbind = write + require the SEAM-1 payee/give-author\n"

@@ -110,6 +110,20 @@
 // (repair_deep_divergence()) instead of a silent "none serves" -- still
 // undecided (never a refusal on a timeout; the caller holds and alarms).
 //
+// RELAY-LIVENESS (capstone attempt 2): a WAN relay link went silent in BOTH
+// directions for ~3.5 min while TCP kept both sessions established (conns=2
+// ready=2): nothing read, nothing refused, no down event -- so both sides kept
+// closing lane bins without the other side's receipts. Every ready link is now
+// probed with FB_PING each keepalive_ms; any frame the peer sends refreshes the
+// link's last-receive clock. A link whose peer has answered on it (it speaks
+// keepalive) and then sends nothing for silence_timeout_ms is DROPPED with a
+// loud "LINK SILENT" line; the dial target redials it at once (the down event
+// path), and the reconnect's HELLO re-offer + GETORDER backfill deliver what the
+// stall withheld. A peer that never answers a PING (a pre-0x48 build) is never
+// timed out. keepalive_ms = 0 turns all of it off (no PING sent, none answered:
+// the pre-liveness wire byte for byte). A maintenance gap (the process itself
+// was stopped) re-arms every link's clock instead of blaming the peers.
+//
 // BACKFILL on (re)connect: the sender RE-OFFERS its last --relay-reoffer-seconds
 // of admitted receipts PLUS every admitted receipt its lane has not pushed yet
 // (the canonical ingest holds an OPEN bin's receipts unpushed, so neither the
@@ -156,6 +170,9 @@
 #define C2POOL_XMR_RELAY_UP_GATE 1
 // ★ RAIN-BACKFILL feature marker (drops_sync / drops_held / FB_GETDROPS + FB_DROPINV)
 #define C2POOL_XMR_RAIN_BACKFILL 1
+// RELAY-LIVENESS: FB_PING/FB_PONG keepalive + silence timeout
+// (RelayOptions::keepalive_ms / silence_timeout_ms, RelayStats::silent_drops).
+#define C2POOL_XMR_RELAY_LIVENESS 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -283,6 +300,11 @@ struct RelayOptions {
     u32         drops_inv_retry_ms = 2000;                   // re-ask an unanswered inventory after this
     u32         drops_fetch_retry_ms = 2000;                 // re-ask still-missing ids after this
     u32         drops_fetch_max_asks = 8;                    // asks of one peer for its missing ids before it is set aside
+    // RELAY-LIVENESS: PING every ready link this often (0 = keepalive OFF: no
+    // PING sent or answered, no silence timeout); drop + redial a link whose
+    // keepalive-speaking peer sent nothing for silence_timeout_ms (0 = never).
+    u32         keepalive_ms = 5000;
+    u32         silence_timeout_ms = 25000;
 };
 
 struct RelayStats {
@@ -314,6 +336,10 @@ struct RelayStats {
     // below their horizon); receipts re-offered on HELLO because still unpushed.
     std::atomic<u64> repair_horizon_rearm{0}, repair_prefix_ok{0}, repair_prefix_unknown{0}, repair_deep{0};
     std::atomic<u64> reoffer_unpushed{0};
+    // RELAY-LIVENESS: keepalive frames, links dropped as SILENT, peers that
+    // never answered a PING (pre-0x48 builds: silence not enforced), and
+    // maintenance gaps that re-armed every link's clock.
+    std::atomic<u64> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
 };
 
 // ★ RAIN-BACKFILL: the composition's view of one interval range.
@@ -373,6 +399,7 @@ public:
 
         m_net.set_inbound_from([this](PeerId p, const std::vector<u8>& f) { on_frame(p, f); });
         m_net.set_control([this](PeerId p, const std::vector<u8>& f) {
+            note_rx(p);   // RELAY-LIVENESS: a supply frame proves the link alive too
             if (!hello_ok(p)) { m_st.pre_hello_dropped++; return; }
             m_serve->on_control(p, f);
             m_fetch->on_control(p, f);
@@ -911,7 +938,8 @@ public:
             "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu | "
             "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
             "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu | "
-            "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu",
+            "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
+            "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu",
             m_net.n_peers(), ready_peers().size(),
             (unsigned long long)s.hello_ok.load(), (unsigned long long)s.hello_rejected.load(), (unsigned long long)s.hello_timeout.load(),
             (unsigned long long)s.rx_receipts.load(), (unsigned long long)s.dup.load(), (unsigned long long)s.structural.load(),
@@ -938,7 +966,12 @@ public:
             (unsigned long long)s.hello_tag_mismatch.load(),
             (unsigned long long)s.repair_horizon_rearm.load(), (unsigned long long)s.repair_prefix_ok.load(),
             (unsigned long long)s.repair_prefix_unknown.load(), (unsigned long long)s.repair_deep.load(),
-            (unsigned long long)s.reoffer_unpushed.load());
+            (unsigned long long)s.reoffer_unpushed.load(),
+            m_o.keepalive_ms, m_o.silence_timeout_ms,
+            (unsigned long long)s.ping_tx.load(), (unsigned long long)s.ping_rx.load(),
+            (unsigned long long)s.pong_tx.load(), (unsigned long long)s.pong_rx.load(),
+            (unsigned long long)s.silent_drops.load(), (unsigned long long)s.ka_legacy.load(),
+            (unsigned long long)s.ka_rearm.load());
         return b;
     }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
@@ -973,7 +1006,14 @@ private:
         bool hello_sent = false;
         Clock::time_point connected = Clock::now();
         Hello remote{};
+        // RELAY-LIVENESS
+        Clock::time_point last_rx = Clock::now();   // any frame from this link
+        Clock::time_point last_ping{};              // our last PING on it (epoch = ping at once)
+        bool ka = false;                            // the peer answered / sent a PING on THIS link
+        u32  unanswered = 0;                        // PINGs sent while !ka
+        bool legacy_noted = false;
     };
+    static constexpr u32 kLegacyProbes = 3;         // unanswered PINGs before a peer counts as pre-0x48
     struct Target {
         std::string host; u16 port = 0; PeerId pid = 0;
         Clock::time_point next_try; int backoff_s = 1;
@@ -1234,6 +1274,7 @@ private:
     }
 
     void on_frame(PeerId p, const std::vector<u8>& f) {
+        note_rx(p);   // RELAY-LIVENESS: any frame proves the link alive
         if (f.empty()) { m_st.malformed++; return; }
         const u8 op = f[0];
         if (op == FB_HELLO) { on_hello(p, f); return; }
@@ -1246,7 +1287,90 @@ private:
         if (m_o.drops_floor_diff && op == FB_GETDROPS) { on_getdrops(p, f); return; }   // ★ RAIN-BACKFILL (gate ON only)
         if (m_o.drops_floor_diff && op == FB_DROPINV) { on_dropinv(p, f); return; }
         if (m_o.drops_floor_diff && op == FB_GETWON) { on_getwon(p, f); return; }     // ★ DROPS-RESTART (gate ON only)
-        m_st.fb_unknown++;                                            // a future 0x45..0x4f: count, keep socket
+        if ((op == FB_PING || op == FB_PONG) && m_o.keepalive_ms) { on_ping(p, f); return; }
+        m_st.fb_unknown++;                                            // a future 0x4a..0x4f: count, keep socket
+    }
+
+    // ── RELAY-LIVENESS ──────────────────────────────────────────────────────
+    void note_rx(PeerId p) {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto it = m_peers.find(p);
+        if (it != m_peers.end()) it->second.last_rx = Clock::now();
+    }
+    void on_ping(PeerId p, const std::vector<u8>& f) {
+        u8 op = 0; u64 nonce = 0; std::string why;
+        if (!decode_ping(f, op, nonce, &why)) { m_st.malformed++; return; }
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it != m_peers.end()) { it->second.ka = true; it->second.unanswered = 0; }
+        }
+        if (op == FB_PONG) { m_st.pong_rx++; return; }
+        m_st.ping_rx++;
+        if (m_net.send_to(p, encode_ping(FB_PONG, nonce))) m_st.pong_tx++;
+    }
+    static std::string peer_label(PeerId p, const PeerSt& s, const std::map<PeerId, std::string>& dialed) {
+        const std::string l = "peer " + std::to_string(p);
+        auto it = dialed.find(p);
+        if (it != dialed.end()) return l + " (" + it->second + ")";
+        return l + " (inbound, listen=" + std::to_string(s.remote.listen_port) + ")";
+    }
+    // Maintenance thread, every tick: PING due links, drop SILENT ones.
+    void drive_liveness() {
+        if (!m_o.keepalive_ms) return;
+        const auto now = Clock::now();
+        // A maintenance gap far over the 250 ms tick = THIS process was not
+        // running (SIGSTOP, a suspended VM): the peers' frames wait unread in
+        // our socket buffers, so re-arm every clock instead of dropping them.
+        const auto gap = now - m_live_tick;
+        m_live_tick = now;
+        const bool rearm = gap > std::chrono::milliseconds(std::max<u32>(2000, m_o.keepalive_ms));
+        std::vector<PeerId> ping, silent;
+        std::vector<std::string> msgs;
+        std::map<PeerId, std::string> dialed;   // labels only; never m_tmtx under m_pmtx
+        {
+            std::lock_guard<std::mutex> lk(m_tmtx);
+            for (const auto& t : m_targets) if (t.pid) dialed[t.pid] = t.host + ":" + std::to_string(t.port);
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            if (rearm && !m_peers.empty()) {
+                m_st.ka_rearm++;
+                msgs.push_back("relay: liveness: maintenance paused " +
+                               std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(gap).count()) +
+                               " ms (this process was stopped?) -- every link's silence clock re-armed");
+                for (auto& [p, s] : m_peers) { (void)p; s.last_rx = now; }
+            }
+            for (auto& [p, s] : m_peers) {
+                if (!s.hello_ok) continue;
+                const auto quiet = std::chrono::duration_cast<std::chrono::milliseconds>(now - s.last_rx).count();
+                if (s.ka && m_o.silence_timeout_ms && quiet > static_cast<long long>(m_o.silence_timeout_ms)) {
+                    silent.push_back(p);
+                    msgs.push_back("relay: LINK SILENT -- " + peer_label(p, s, dialed) + " sent NOTHING for " +
+                                   std::to_string(quiet) + " ms (silence timeout " + std::to_string(m_o.silence_timeout_ms) +
+                                   " ms, keepalive " + std::to_string(m_o.keepalive_ms) +
+                                   " ms) while the TCP session is still up: DROPPING the link and redialing (RELAY-LIVENESS)");
+                    continue;
+                }
+                if (!s.ka && s.unanswered >= kLegacyProbes) {
+                    if (!s.legacy_noted) {
+                        s.legacy_noted = true;
+                        m_st.ka_legacy++;
+                        msgs.push_back("relay: liveness: " + peer_label(p, s, dialed) + " answered none of " +
+                                       std::to_string(kLegacyProbes) + " PINGs (a pre-keepalive build?): its silence is NOT timed out");
+                    }
+                    continue;
+                }
+                if (now - s.last_ping >= std::chrono::milliseconds(m_o.keepalive_ms)) {
+                    s.last_ping = now;
+                    if (!s.ka) ++s.unanswered;
+                    ping.push_back(p);
+                }
+            }
+        }
+        for (const auto& m : msgs) log(m);
+        for (PeerId p : silent) { m_st.silent_drops++; m_net.disconnect(p); }
+        for (PeerId p : ping) if (m_net.send_to(p, encode_ping(FB_PING, ++m_ping_nonce))) m_st.ping_tx++;
     }
 
     void on_hello(PeerId p, const std::vector<u8>& f) {
@@ -2364,6 +2488,7 @@ private:
             drive_repairs();
             if (m_o.drops_floor_diff) drops_maint();   // ★ RAIN-BACKFILL
             drive_ctx();
+            drive_liveness();   // RELAY-LIVENESS
         }
     }
 
@@ -2418,6 +2543,8 @@ private:
     std::set<PeerId> m_up_done;        // UP-GATE: links whose up event has been handled (m_pmtx)
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
+    Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
+    u64 m_ping_nonce = 0;                           // RELAY-LIVENESS (maintenance thread only)
 
     std::mutex m_tmtx;                 // dial targets + deferred drops
     std::vector<Target> m_targets;
