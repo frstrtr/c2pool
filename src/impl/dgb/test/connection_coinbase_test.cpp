@@ -327,8 +327,15 @@ TEST(LastTxoutNonceSsot, DrawsAreDistinct) {
 // block loss -- exactly what #902 exists to stop).
 TEST(CoinbaseScriptSig, Bip34HeightPushMinimallyEncoded) {
     using dgb::coin::bip34_height_push;
-    // 1 byte: height 1 -> push 1 byte 0x01.
-    EXPECT_EQ(tohex(bip34_height_push(1)), "0101");
+    // Heights 0..16 are small-int opcodes, exactly as Core `CScript() << h`
+    // emits them: 0 -> OP_0, 1..16 -> OP_1..OP_16 (0x51..0x60). A 1-byte data
+    // push (the pre-fix "0101" for height 1) is bad-cb-height on regtest.
+    EXPECT_EQ(tohex(bip34_height_push(0)), "00");
+    EXPECT_EQ(tohex(bip34_height_push(1)), "51");
+    EXPECT_EQ(tohex(bip34_height_push(16)), "60");
+    // 17 is the first height that needs a data push: push 1 byte 0x11.
+    EXPECT_EQ(tohex(bip34_height_push(17)), "0111");
+    EXPECT_EQ(tohex(bip34_height_push(0x7f)), "017f");
     // Sign-bit safety: 0x80 has the high bit set, so it needs a zero pad ->
     // push 2 bytes 80 00 (NOT a bare 1-byte 0x80, which parses as negative).
     EXPECT_EQ(tohex(bip34_height_push(0x80)), "028000");
@@ -342,8 +349,10 @@ TEST(CoinbaseScriptSig, FullScriptSigPinsHeightAndTag) {
     // "/c2pool-dgb/" = 12 bytes -> push opcode 0x0c, then the ASCII tag.
     const std::string kTagHex = "0c2f6332706f6f6c2d6467622f";  // 0x0c || "/c2pool-dgb/"
 
-    // height 1: 01 01 || <tag>
-    EXPECT_EQ(tohex(build_coinbase_scriptsig(1)), "0101" + kTagHex);
+    // height 1: OP_1 || <tag>  (2-byte floor still met: 1 + 13 bytes)
+    EXPECT_EQ(tohex(build_coinbase_scriptsig(1)), "51" + kTagHex);
+    // height 17: 01 11 || <tag>
+    EXPECT_EQ(tohex(build_coinbase_scriptsig(17)), "0111" + kTagHex);
     // height 21,000,000: 04 40 6f 40 01 || <tag>
     EXPECT_EQ(tohex(build_coinbase_scriptsig(21000000)), "04406f4001" + kTagHex);
 
