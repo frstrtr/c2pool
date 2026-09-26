@@ -530,6 +530,21 @@ if (BUILD_TESTING)
         target_compile_definitions(v37_xmr_rx_seed_switch_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
         target_link_libraries(v37_xmr_rx_seed_switch_kat PRIVATE xmr_coin randomx Threads::Threads)
         add_test(NAME v37_xmr_rx_seed_switch_kat COMMAND v37_xmr_rx_seed_switch_kat)
+        # v37_xmr_rx_seed_race_kat (#1814 review): the verifier driven from TWO
+        # threads (listener hook + main-thread pump) over 7 epochs -- every hash
+        # == a single-threaded reference -- and a reorged announced next seed
+        # (the stale helper build is discarded, never waited for, never
+        # installed). Build the same TU with -fsanitize=thread for the TSan leg.
+        add_executable(v37_xmr_rx_seed_race_kat
+            v37_xmr_rx_seed_race_kat.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+        target_compile_features(v37_xmr_rx_seed_race_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_rx_seed_race_kat PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(v37_xmr_rx_seed_race_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
+        target_link_libraries(v37_xmr_rx_seed_race_kat PRIVATE xmr_coin randomx Threads::Threads)
+        add_test(NAME v37_xmr_rx_seed_race_kat COMMAND v37_xmr_rx_seed_race_kat)
 
         # v37_xmr_next_seed_kat (NEXT-SEED ANNOUNCE, operator ruling 09-26): the
         # native chain index -> settlement provider -> stratum job serves

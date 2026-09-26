@@ -155,6 +155,7 @@ struct RandomXStats {
     std::uint64_t memo_hits       = 0;  // network verify reused the submit's hash
     std::uint64_t next_async      = 0;  // announced next seeds keyed on the helper thread
     std::uint64_t next_adopted    = 0;  // ...and installed by the listener (no Argon2d there)
+    std::uint64_t next_discarded  = 0;  // NEXT-REORG: stale next builds dropped, never installed
 };
 
 // ---------------------------------------------------------------------------
@@ -191,8 +192,8 @@ public:
     // portable interpreter (identical hashes; pattern of randomx_verify_kat
     // suite C). Returns ready(). Call once, before the listener starts
     // serving (from the listener thread, or from main BEFORE the listener
-    // thread is spawned — the object has no thread affinity, only a
-    // no-concurrent-use rule).
+    // thread is spawned — the object has no thread affinity; after init every
+    // entry point may be called from any thread (SEED-RACE, #1814 review)).
     // -----------------------------------------------------------------------
     bool init(const RandomXPolicy& policy) {
         m_policy = policy;
@@ -236,7 +237,8 @@ public:
     //                ensure_seeds(). Call it first thing when the listener
     //                wakes for "template changed", before broadcast_job().
     //                Returns true iff a pair was applied.
-    // ensure_seeds — LISTENER thread. prefetch_epoch(current, next): Argon2d
+    // ensure_seeds — ANY thread (serialised on m_seed_mu: the listener hook and
+    //                the main-thread pump both call it). prefetch_epoch(current, next): Argon2d
     //                inits only the caches not already keyed (seconds on an
     //                epoch change, no-op otherwise). Returns residency of
     //                `current`.
@@ -263,28 +265,44 @@ public:
         return true;
     }
 
+    // SEED-RACE (#1814 review): ensure_seeds runs on the listener (template
+    // hook) AND on the main thread (pump_miner) on the same verifier. It is
+    // serialised on m_seed_mu (the next-build state is guarded by it); m_vm and
+    // the memo are guarded by m_vm_mu, held only for a hash, a residency read or
+    // an adoption swap -- never across an Argon2d build or the wait for one, so
+    // the listener keeps hashing the resident epochs while a cache is keyed.
     bool ensure_seeds(const Seed32& current, const std::optional<Seed32>& next) {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (!ready()) return false;
+        std::lock_guard<std::mutex> sk(m_seed_mu);
         if (m_policy.async_next_seed) {
+            reap_discarded_();
+            // NEXT-REORG: the helper builds an announced next that is neither the
+            // current seed nor the next this template announces (the next seed
+            // block was reorged). Discard it -- never wait for the rest of that
+            // build, never install the orphan seed's cache.
+            if (m_next_building && m_next_seed != current && next && *next != m_next_seed) discard_next_();
             adopt_next_(current, /*wait=*/false);                 // a finished helper build: install it
-            if (!m_vm.seed_resident(current) && m_next_building && m_next_seed == current)
-                adopt_next_(current, /*wait=*/true);              // switch beat the helper: wait, never key twice
-            if (!m_vm.seed_resident(current)) {
-                if (!m_vm.prefetch_epoch(current, std::nullopt)) return false;   // null cache
+            if (!resident_(current) && m_next_building && m_next_seed == current)
+                adopt_next_(current, /*wait=*/true);              // switch beat the helper: wait (m_vm_mu free), never key twice
+            if (!resident_(current)) {
+                if (!key_off_vm_(current, nullptr)) return false;  // null cache / OOM
                 m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
             }
-            if (next && *next != current && !m_vm.seed_resident(*next)
+            if (next && *next != current && !resident_(*next)
                 && !(m_next_building && m_next_seed == *next))
                 start_next_(current, *next);
-            return m_vm.seed_resident(current);
+            return resident_(current);
         }
-        const bool cur_res  = m_vm.seed_resident(current);
-        const bool next_res = !next || m_vm.seed_resident(*next);
+        // the pre-helper policy: both seeds keyed before returning (the caller
+        // blocks for the Argon2d init), each built off m_vm_mu and swapped in
+        const bool cur_res  = resident_(current);
+        const bool next_res = !next || resident_(*next);
         if (cur_res && next_res) return true;                    // nothing to do
-        if (!m_vm.prefetch_epoch(current, next)) return false;    // null cache (init not done)
+        if (!cur_res && !key_off_vm_(current, next ? &*next : nullptr)) return false;
+        if (!next_res && *next != current) (void)key_off_vm_(*next, &current);
         m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
-        return m_vm.seed_resident(current);
+        return resident_(current);
 #else
         (void)current; (void)next;
         return false;
@@ -296,7 +314,7 @@ public:
 
     bool seed_resident(const Seed32& seed) const noexcept {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
-        return ready() && m_vm.seed_resident(seed);
+        return ready() && resident_(seed);
 #else
         (void)seed;
         return false;
@@ -323,15 +341,20 @@ public:
             m_stat_unavailable.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        if (!m_vm.seed_resident(seed_hash)) {
-            if (!m_policy.lazy_prefetch_on_miss ||
-                !m_vm.prefetch_epoch(seed_hash, std::nullopt) ||
-                !m_vm.seed_resident(seed_hash)) {
+        if (!resident_(seed_hash)) {
+            // lazy: keyed off m_vm_mu (under m_seed_mu, like ensure_seeds), then swapped in
+            bool keyed = false;
+            if (m_policy.lazy_prefetch_on_miss) {
+                std::lock_guard<std::mutex> sk(m_seed_mu);
+                keyed = resident_(seed_hash) || key_off_vm_(seed_hash, nullptr);
+            }
+            if (!keyed || !resident_(seed_hash)) {
                 m_stat_seed_misses.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
         }
+        std::lock_guard<std::mutex> vk(m_vm_mu);   // SEED-RACE: the VM, its bound cache and the memo
         if (!m_vm.hash(blob, blob_size, seed_hash, out_hash.data())) {
             m_stat_seed_misses.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -377,6 +400,7 @@ public:
         if (!blob || blob_size == 0 || diff.is_zero()) { count_reject(); return NetworkVerdict::Malformed; }
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (!ready()) { count_reject(); return NetworkVerdict::VerifyUnavailable; }
+        std::lock_guard<std::mutex> vk(m_vm_mu);   // SEED-RACE: the VM, its bound cache and the memo
         if (!m_vm.seed_resident(seed)) { count_reject(); return NetworkVerdict::SeedNotResident; }
         if (recall(blob, blob_size, seed, out_hash)) {
             m_stat_memo_hits.fetch_add(1, std::memory_order_relaxed);
@@ -426,6 +450,7 @@ public:
         s.memo_hits       = m_stat_memo_hits.load(std::memory_order_relaxed);
         s.next_async      = m_stat_next_async.load(std::memory_order_relaxed);
         s.next_adopted    = m_stat_next_adopted.load(std::memory_order_relaxed);
+        s.next_discarded  = m_stat_next_discarded.load(std::memory_order_relaxed);
         return s;
     }
 
@@ -448,6 +473,7 @@ public:
         o += " memo_hits=";   o += std::to_string(s.memo_hits);
         o += " next_async=";  o += std::to_string(s.next_async);
         o += " next_adopted="; o += std::to_string(s.next_adopted);
+        o += " next_discarded="; o += std::to_string(s.next_discarded);
         return o;
     }
 
@@ -456,23 +482,49 @@ private:
     void count_reject() noexcept { m_stat_network_rejects.fetch_add(1, std::memory_order_relaxed); }
 
 #if defined(V37_XMR_O2_WITH_RANDOMX)
-    // NEXT-SEED helper (policy.async_next_seed). One build in flight at most.
-    // The helper touches ONLY its own CacheSlot (allocated with the verifier's
-    // slot flags, keyed through CacheSlot::rekey under the process-wide
-    // randomx_init_mutex); the LightVerifier stays single-threaded, and the
-    // finished cache is installed by adopt() on the caller's (listener) thread.
+    // SEED-RACE: residency under m_vm_mu (any thread).
+    bool resident_(const Seed32& seed) const {
+        std::lock_guard<std::mutex> vk(m_vm_mu);
+        return m_vm.seed_resident(seed);
+    }
+    // Key `seed` into a cache built OFF m_vm_mu (the seconds-long Argon2d init
+    // runs while the listener keeps hashing), then swap it in under m_vm_mu:
+    // the slot not holding `keep` (unkeyed first, else least recently used) --
+    // the victim LightVerifier::prefetch_epoch would re-key in place. m_seed_mu
+    // held by the caller. false: no VM / OOM.
+    bool key_off_vm_(const Seed32& seed, const Seed32* keep) {
+        randomx_flags f;
+        {
+            std::lock_guard<std::mutex> vk(m_vm_mu);
+            if (m_vm.seed_resident(seed)) return true;
+            f = m_vm.slot_cache_flags();
+        }
+        ::c2pool::xmr::CacheSlot s(f);
+        if (!s.ok() || !s.rekey(seed)) return false;
+        std::lock_guard<std::mutex> vk(m_vm_mu);
+        (void)m_vm.adopt(std::move(s), keep);
+        return m_vm.seed_resident(seed);
+    }
+
+    // NEXT-SEED helper (policy.async_next_seed). One live build at most (plus
+    // discarded ones still finishing). The helper touches ONLY its own
+    // CacheSlot (allocated with the verifier's slot flags, keyed through
+    // CacheSlot::rekey under the process-wide randomx_init_mutex); the finished
+    // cache is installed by adopt() under m_vm_mu. m_seed_mu held throughout.
     void start_next_(const Seed32& current, const Seed32& next) {
-        if (m_next_building) adopt_next_(current, /*wait=*/true);   // a different next: finish the old one first
-        if (m_vm.seed_resident(next)) return;
-        const randomx_flags f = m_vm.slot_cache_flags();
+        // NEXT-REORG: a build of a DIFFERENT next is stale -- discarded, not waited for
+        if (m_next_building && m_next_seed != next) discard_next_();
+        if (m_next_building || resident_(next)) return;
+        randomx_flags f;
+        { std::lock_guard<std::mutex> vk(m_vm_mu); f = m_vm.slot_cache_flags(); }
         try {
             m_next_build = std::async(std::launch::async, [f, next] {
                 ::c2pool::xmr::CacheSlot s(f);
                 if (s.ok()) s.rekey(next);                 // the seconds-long Argon2d init, off the listener
                 return s;
             });
-        } catch (...) {                                    // no thread: the old synchronous path
-            if (m_vm.prefetch_epoch(current, next)) m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {                                    // no thread: key it here (still off m_vm_mu)
+            if (key_off_vm_(next, &current)) m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         m_next_seed     = next;
@@ -480,17 +532,38 @@ private:
         m_stat_next_async.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Install a finished helper build (wait=true blocks until it finishes).
-    // `current` is kept resident unless the built seed IS current (the switch
-    // arrived first), in which case the least recently used slot is replaced.
+    // Install a finished helper build (wait=true blocks until it finishes --
+    // with m_vm_mu free). `current` is kept resident unless the built seed IS
+    // current (the switch arrived first): then the LRU slot is replaced.
     void adopt_next_(const Seed32& current, bool wait) {
         if (!m_next_building) return;
         if (!wait && m_next_build.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
         ::c2pool::xmr::CacheSlot built = m_next_build.get();
         m_next_building = false;
         const bool keep_cur = !(built.keyed() && built.key() == current);
+        std::lock_guard<std::mutex> vk(m_vm_mu);
         if (m_vm.adopt(std::move(built), keep_cur ? &current : nullptr))
             m_stat_next_adopted.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // NEXT-REORG: drop the in-flight build without waiting. Its thread cannot
+    // be interrupted mid-Argon2d, so the future is parked (a std::async future
+    // joins in its destructor) and reaped once ready; its cache is freed, never
+    // adopted. At most one parked build: a second reorg waits for the oldest.
+    void discard_next_() {
+        if (!m_next_building) return;
+        m_next_discarded.push_back(std::move(m_next_build));
+        m_next_building = false;
+        m_stat_next_discarded.fetch_add(1, std::memory_order_relaxed);
+        if (m_next_discarded.size() > 1) {
+            m_next_discarded.front().wait();
+            m_next_discarded.erase(m_next_discarded.begin());
+        }
+    }
+    void reap_discarded_() {
+        for (auto it = m_next_discarded.begin(); it != m_next_discarded.end();)
+            if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) it = m_next_discarded.erase(it);
+            else ++it;
     }
 #endif
 
@@ -515,13 +588,17 @@ private:
     std::atomic<std::uint8_t>  m_mode{static_cast<std::uint8_t>(Mode::CompiledOut)};
 
 #if defined(V37_XMR_O2_WITH_RANDOMX)
-    ::c2pool::xmr::LightVerifier m_vm;           // listener thread only
-    // next-seed helper build (listener thread owns the future; destroyed first,
-    // so a still-running helper is joined before m_vm goes away)
+    ::c2pool::xmr::LightVerifier m_vm;           // guarded by m_vm_mu
+    // next-seed helper build (guarded by m_seed_mu; destroyed first, so a
+    // still-running helper is joined before m_vm goes away)
     std::future<::c2pool::xmr::CacheSlot> m_next_build;
     Seed32                                m_next_seed{};
     bool                                  m_next_building = false;
+    std::vector<std::future<::c2pool::xmr::CacheSlot>> m_next_discarded;   // NEXT-REORG: stale builds finishing
 #endif
+    // SEED-RACE (#1814 review): lock order m_seed_mu -> m_vm_mu, never the reverse.
+    mutable std::mutex m_vm_mu;     // m_vm + the memo: a hash, a residency read, an adoption swap (short)
+    std::mutex         m_seed_mu;   // ensure_seeds + the next-build state; held across builds / waits
 
     // seed mailbox (main thread -> listener thread)
     std::mutex             m_mail_mu;
@@ -545,6 +622,7 @@ private:
     std::atomic<std::uint64_t> m_stat_memo_hits{0};
     std::atomic<std::uint64_t> m_stat_next_async{0};
     std::atomic<std::uint64_t> m_stat_next_adopted{0};
+    std::atomic<std::uint64_t> m_stat_next_discarded{0};
 };
 
 } // namespace c2pool::v37n::xmr::o2
