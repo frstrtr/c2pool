@@ -3,6 +3,7 @@
 #include "web_server.hpp"
 #include "stratum_server.hpp"
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
+#include <cctype>      // std::tolower — /found_block/<hash> case-folding
 #include <memory>
 #include "address_utils.hpp"
 #include "coin_registry.hpp"
@@ -2577,10 +2578,9 @@ std::string MiningInterface::block_explorer_prefix() const
     }
 }
 
-nlohmann::json MiningInterface::rest_recent_blocks()
+nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) const
 {
     static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
-    nlohmann::json arr = nlohmann::json::array();
 
     // actual_hash_difficulty: how far below target the WINNING hash landed,
     // = diff1 / block_hash (the p2pool-dash formula, web.py:1754). It is the
@@ -2618,6 +2618,126 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             return nlohmann::json(nullptr);
         return nlohmann::json(explorer_prefix + hash_hex);
     };
+    // Node-role honesty (#942): a block with no local share_hash AND no
+    // miner address is one this node did NOT find -- it was learned from a
+    // peer over P2P relay. A relay node therefore has no local timing for
+    // it, so luck_method must not fabricate a computed-luck label
+    // ("first_block" wrongly implied a luck computation was attempted), and
+    // the timing-derived fields are honest-absent (null) rather than a
+    // real-looking 0.
+    //
+    // NAMING (2026-08-07): this predicate asks "do we hold a local record
+    // of the block", NOT "did we find it" — a sharechain peer's block
+    // satisfies it, because the gossiped share carries both fields. The
+    // two questions were conflated under one name; authorship now has its
+    // own field (b.authorship, emitted as found_by) set at the call site
+    // that knows. The wire key `found_locally` keeps its existing meaning
+    // and its existing consumers; read `found_by` for authorship.
+    const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+    std::string method;
+    if (!have_local_record)                    method = "relayed";
+    else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
+    else if (b.time_to_find > 0)               method = "netdiff_unavailable";
+    else                                       method = "first_block";
+    // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
+    // two distinct rows. A genuine first block has no earlier same-chain row,
+    // so time_to_find is 0 and no luck can exist. A row with time_to_find>0
+    // but no luck HAS a predecessor — its luck was uncomputable only because
+    // network_difficulty was never captured at find time. Labelling the
+    // second case "first_block" made the UI tooltip claim it was the pool's
+    // first block, which is false for any row after the first. The netdiff
+    // repair paths normally fill that difficulty and this row becomes
+    // "simple_avg"; the label survives only for a row whose header is still
+    // unavailable (never synced), where it correctly reads "unavailable".
+    // #942 second slice, extended to EVERY unmeasured field (hotel,
+    // 2026-08-05): the primary's rows for our own blocks rendered
+    // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
+    // were data. A zero that was never measured is emitted as null — the
+    // same honesty rule the timing fields already follow — so the UI
+    // renders '-' instead of a fabricated measurement. A luck of 0 on a
+    // found_locally row means "not computed" (first block, or recorded
+    // with no difficulty), never "0% lucky": also null.
+    auto num_or_null = [](double v) {
+        return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
+    };
+    // A luck value exists only on a row we hold locally that actually
+    // computed one (time_to_find>0 && luck>0). Those rows feed both the
+    // per-row luck_approximate flag and rest_recent_blocks' pool aggregate.
+    const bool luck_present = have_local_record && b.luck > 0.0
+                              && b.time_to_find > 0.0;
+    // block_reward: the raw-duff subsidy expressed in whole coins, kept
+    // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
+    // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
+    nlohmann::json block_reward = b.subsidy != 0
+        ? nlohmann::json(static_cast<double>(b.subsidy) / 1e8)
+        : nlohmann::json(nullptr);
+    auto str_or_null = [](const std::string& s) {
+        return s.empty() ? nlohmann::json(nullptr) : nlohmann::json(s);
+    };
+    // Sample-count provenance. c2pool derives luck from ONE difficulty and
+    // ONE hashrate reading captured at find time, so the "average used" is
+    // that single value and the sample count is 1 when present, 0 when the
+    // input was never measured (honest-null, #942).
+    return {
+        {"ts", b.ts},
+        {"hash", b.hash},
+        {"number", b.height},
+        {"height", b.height},
+        {"status", status_str[static_cast<int>(b.status)]},
+        {"verified", b.status == BlockStatus::confirmed},
+        {"checks", b.check_count},
+        {"chain", b.chain},
+        {"confirmations", b.confirmations},
+        {"miner", b.miner},
+        {"share", b.share_hash},
+        {"found_locally", have_local_record},
+        // Authorship, set at the call site that knows. "unknown" is a real
+        // answer -- a coin lane that has not labelled its sites -- and the
+        // UI must render it as unknown rather than folding it into either
+        // claim.
+        {"found_by", b.authorship == BlockAuthorship::this_node
+                         ? "this_node"
+                         : b.authorship == BlockAuthorship::sharechain_peer
+                               ? "sharechain_peer" : "unknown"},
+        {"network_difficulty", num_or_null(b.network_difficulty)},
+        {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
+        {"share_difficulty", num_or_null(b.share_difficulty)},
+        {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
+        {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
+                                   : nlohmann::json(nullptr)},
+        {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
+        {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
+        {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
+        {"luck_method", method},
+        // #57 oracle-parity residual fields (all DISPLAY-ONLY, honest-null):
+        {"block_reward", block_reward},
+        {"explorer_url", explorer_url(b.hash)},
+        {"from_history", b.from_history},
+        // The luck value is a single-sample approximation whenever it
+        // exists; null (not false) when no luck was computed, so the UI
+        // renders '-' rather than claiming a precise measurement.
+        {"luck_approximate", luck_present ? nlohmann::json(true)
+                                          : nlohmann::json(nullptr)},
+        {"avg_hashrate_used", num_or_null(b.pool_hashrate)},
+        {"hashrate_samples_used", b.pool_hashrate > 0.0 ? 1 : 0},
+        {"avg_difficulty_used", num_or_null(b.network_difficulty)},
+        {"diff_samples_used", b.network_difficulty > 0.0 ? 1 : 0},
+        // #946 explorer fields. Missing = null, never "" or 0 (restored
+        // pre-#946 records included).
+        {"parent_hash", str_or_null(b.parent_hash)},
+        {"parent_height", b.parent_height && *b.parent_height > 0
+                              ? nlohmann::json(*b.parent_height)
+                              : nlohmann::json(nullptr)},
+        {"coinbase_txid", str_or_null(b.coinbase_txid)},
+        {"tx_count", b.tx_count ? nlohmann::json(*b.tx_count)
+                                : nlohmann::json(nullptr)}
+    };
+}
+
+nlohmann::json MiningInterface::rest_recent_blocks()
+{
+    nlohmann::json arr = nlohmann::json::array();
+
     // Pool luck aggregate, accumulated over the rows as we build them. c2pool
     // derives each block's luck from ONE network-difficulty and ONE pool-
     // hashrate reading sampled at find time -- it does not interval-average
@@ -2628,109 +2748,11 @@ nlohmann::json MiningInterface::rest_recent_blocks()
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
-        // Node-role honesty (#942): a block with no local share_hash AND no
-        // miner address is one this node did NOT find -- it was learned from a
-        // peer over P2P relay. A relay node therefore has no local timing for
-        // it, so luck_method must not fabricate a computed-luck label
-        // ("first_block" wrongly implied a luck computation was attempted), and
-        // the timing-derived fields are honest-absent (null) rather than a
-        // real-looking 0.
-        //
-        // NAMING (2026-08-07): this predicate asks "do we hold a local record
-        // of the block", NOT "did we find it" — a sharechain peer's block
-        // satisfies it, because the gossiped share carries both fields. The
-        // two questions were conflated under one name; authorship now has its
-        // own field (b.authorship, emitted as found_by) set at the call site
-        // that knows. The wire key `found_locally` keeps its existing meaning
-        // and its existing consumers; read `found_by` for authorship.
-        const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
-        std::string method;
-        if (!have_local_record)                    method = "relayed";
-        else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
-        else if (b.time_to_find > 0)               method = "netdiff_unavailable";
-        else                                       method = "first_block";
-        // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
-        // two distinct rows. A genuine first block has no earlier same-chain row,
-        // so time_to_find is 0 and no luck can exist. A row with time_to_find>0
-        // but no luck HAS a predecessor — its luck was uncomputable only because
-        // network_difficulty was never captured at find time. Labelling the
-        // second case "first_block" made the UI tooltip claim it was the pool's
-        // first block, which is false for any row after the first. The netdiff
-        // repair paths normally fill that difficulty and this row becomes
-        // "simple_avg"; the label survives only for a row whose header is still
-        // unavailable (never synced), where it correctly reads "unavailable".
-        // #942 second slice, extended to EVERY unmeasured field (hotel,
-        // 2026-08-05): the primary's rows for our own blocks rendered
-        // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
-        // were data. A zero that was never measured is emitted as null — the
-        // same honesty rule the timing fields already follow — so the UI
-        // renders '-' instead of a fabricated measurement. A luck of 0 on a
-        // found_locally row means "not computed" (first block, or recorded
-        // with no difficulty), never "0% lucky": also null.
-        auto num_or_null = [](double v) {
-            return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
-        };
-        // A luck value exists only on a row we hold locally that actually
-        // computed one (time_to_find>0 && luck>0). Those rows feed both the
-        // per-row luck_approximate flag and the first-row pool aggregate below.
-        const bool luck_present = have_local_record && b.luck > 0.0
-                                  && b.time_to_find > 0.0;
-        if (luck_present) { luck_sum += b.luck; ++luck_count; }
-        // block_reward: the raw-duff subsidy expressed in whole coins, kept
-        // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
-        // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
-        nlohmann::json block_reward = b.subsidy != 0
-            ? nlohmann::json(static_cast<double>(b.subsidy) / 1e8)
-            : nlohmann::json(nullptr);
-        // Sample-count provenance. c2pool derives luck from ONE difficulty and
-        // ONE hashrate reading captured at find time, so the "average used" is
-        // that single value and the sample count is 1 when present, 0 when the
-        // input was never measured (honest-null, #942).
-        arr.push_back({
-            {"ts", b.ts},
-            {"hash", b.hash},
-            {"number", b.height},
-            {"height", b.height},
-            {"status", status_str[static_cast<int>(b.status)]},
-            {"verified", b.status == BlockStatus::confirmed},
-            {"checks", b.check_count},
-            {"chain", b.chain},
-            {"confirmations", b.confirmations},
-            {"miner", b.miner},
-            {"share", b.share_hash},
-            {"found_locally", have_local_record},
-            // Authorship, set at the call site that knows. "unknown" is a real
-            // answer -- a coin lane that has not labelled its sites -- and the
-            // UI must render it as unknown rather than folding it into either
-            // claim.
-            {"found_by", b.authorship == BlockAuthorship::this_node
-                             ? "this_node"
-                             : b.authorship == BlockAuthorship::sharechain_peer
-                                   ? "sharechain_peer" : "unknown"},
-            {"network_difficulty", num_or_null(b.network_difficulty)},
-            {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
-            {"share_difficulty", num_or_null(b.share_difficulty)},
-            {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
-            {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
-                                       : nlohmann::json(nullptr)},
-            {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
-            {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
-            {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
-            {"luck_method", method},
-            // #57 oracle-parity residual fields (all DISPLAY-ONLY, honest-null):
-            {"block_reward", block_reward},
-            {"explorer_url", explorer_url(b.hash)},
-            {"from_history", b.from_history},
-            // The luck value is a single-sample approximation whenever it
-            // exists; null (not false) when no luck was computed, so the UI
-            // renders '-' rather than claiming a precise measurement.
-            {"luck_approximate", luck_present ? nlohmann::json(true)
-                                              : nlohmann::json(nullptr)},
-            {"avg_hashrate_used", num_or_null(b.pool_hashrate)},
-            {"hashrate_samples_used", b.pool_hashrate > 0.0 ? 1 : 0},
-            {"avg_difficulty_used", num_or_null(b.network_difficulty)},
-            {"diff_samples_used", b.network_difficulty > 0.0 ? 1 : 0}
-        });
+        auto row = found_block_row_locked(b);
+        // luck_approximate is true exactly on the rows that computed a luck,
+        // so those rows feed the first-row pool aggregate below.
+        if (row["luck_approximate"].is_boolean()) { luck_sum += b.luck; ++luck_count; }
+        arr.push_back(std::move(row));
     }
 
     // First-row pool luck aggregate (#57), mirroring the oracle shape: the
@@ -2755,6 +2777,19 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             "interval-averaged between blocks).";
     }
     return arr;
+}
+
+nlohmann::json MiningInterface::rest_found_block(const std::string& hash)
+{
+    // Stored hashes are uint256::GetHex() (lowercase); accept any case.
+    std::string want = hash;
+    for (auto& c : want)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    for (const auto& b : m_found_blocks)
+        if (b.hash == want)
+            return found_block_row_locked(b);
+    return nlohmann::json(nullptr);
 }
 
 nlohmann::json MiningInterface::rest_checkpoint()
