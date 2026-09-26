@@ -108,6 +108,10 @@
 #include "xmr_relay_wire.hpp"
 #include "xmr_receipt_mint.hpp"
 
+// UP-GATE: a remote HELLO read before our own up event ran for that link waits
+// for it (on_hello), and XmrRelayNode::set_test_up_delay_ms() exists.
+#define C2POOL_XMR_RELAY_UP_GATE 1
+
 namespace c2pool::v37n::xmr::relay {
 
 using PeerId = ::c2pool::v37n::CarrierPeerNode::PeerId;
@@ -688,6 +692,10 @@ public:
     void drop_peer(PeerId p) { m_net.disconnect(p); }
     // Test hook: stop redialing (and drop) every dial target.
     void set_dialing(bool on) { m_dialing = on; }
+    // Test hook (UP-GATE KAT): hold every connection-up event of this node for
+    // `ms` before it is handled (0 = off), so a remote HELLO reaches this
+    // node's reader BEFORE its own HELLO goes out -- deterministically.
+    void set_test_up_delay_ms(u32 ms) { m_test_up_delay_ms = ms; }
     // Rig hook (SIGUSR1 in the daemon): a NETWORK PARTITION of `secs` seconds --
     // every relay connection is dropped, inbound connections are refused and
     // nothing is dialed until it ends; then the node redials and backfills.
@@ -713,7 +721,30 @@ private:
     struct Target {
         std::string host; u16 port = 0; PeerId pid = 0;
         Clock::time_point next_try; int backoff_s = 1;
+        // SMOKE-NOISE: links of this target that ended BEFORE a HELLO was
+        // accepted (refused at once by a partitioned peer, or a HELLO timeout
+        // on a silent one). `backoff_s` above only covers connect(2) failing;
+        // a connect that SUCCEEDS reset it to 1, so a refusing / silent peer
+        // was redialed (and, if silent, re-timed-out) every ~1 s forever.
+        u32  prehello_fails = 0;
+        bool hello_seen = false;       // the current link reached HELLO ok
+        bool hello_timed_out = false;  // the current link hit the HELLO timeout
     };
+    static constexpr int kRefusedBackoffCapS = 16;
+    static constexpr int kSilentBackoffCapS  = 60;
+    // SMOKE-NOISE redial delay after the current link of `t` went down.
+    //   HELLO ok on it     -> 1 s (the old behaviour; a healthy link that drops)
+    //   refused pre-HELLO  -> 1, 1, 2, 4, 8, 16, 16 ... s   (heal within 16 s)
+    //   HELLO timeout      -> counts twice, cap 60 s: 2, 8, 32, 60 ... s
+    //                         (a silent peer costs <= ~1 HELLO timeout / min)
+    static int prehello_delay_s(Target& t) {
+        if (t.hello_seen) { t.prehello_fails = 0; return 1; }
+        t.prehello_fails += t.hello_timed_out ? 2u : 1u;
+        const int cap = t.hello_timed_out ? kSilentBackoffCapS : kRefusedBackoffCapS;
+        if (t.prehello_fails <= 1) return 1;
+        const u32 sh = std::min<u32>(t.prehello_fails - 1, 6);
+        return std::min(cap, 1 << sh);
+    }
     struct Item {
         PeerId from = 0;
         FbReceipt r;
@@ -784,8 +815,65 @@ private:
 
     // ── transport callbacks ─────────────────────────────────────────────────
     void on_peer_event(PeerId p, bool up) {
-        if (up && m_partitioned.load()) { m_net.disconnect(p); return; }   // rig partition: refuse
         if (up) {
+            if (const u32 d = m_test_up_delay_ms.load()) std::this_thread::sleep_for(std::chrono::milliseconds(d));
+            on_peer_up(p);
+            open_up_gate(p);   // UP-GATE: whatever path the up event took, a waiting HELLO may go on
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            m_peers.erase(p);
+            m_up_done.erase(p);
+        }
+        on_peer_down(p);
+    }
+
+    // -- UP-GATE ---------------------------------------------------------------
+    // The transport starts a connection's reader thread BEFORE it fires the up
+    // event (carrier_net add_established), so the remote HELLO can be read and
+    // handled before on_peer_up() registered the peer and sent OUR HELLO:
+    //   same pool  -> on_hello found no peer entry and DROPPED the HELLO; the
+    //                 link sat until the HELLO timeout and was redialed (a
+    //                 second HELLO completed for the same neighbour)
+    //   other pool -> we refused and dropped the link before our HELLO went
+    //                 out: the remote never saw our tag and logged no
+    //                 TAG_MISMATCH for that dial ("refused in BOTH directions"
+    //                 held only when the up event won the race)
+    // on_hello therefore waits, on the reader thread (bounded), until the up
+    // event is done with the link or the link is gone. The reader handles its
+    // frames in order, so nothing that follows the HELLO overtakes it.
+    static constexpr int kUpGateWaitMs = 2000;
+    void open_up_gate(PeerId p) {
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            m_up_done.insert(p);
+        }
+        m_up_cv.notify_all();
+        // The link already ended (its down event may have run BEFORE this up
+        // event): nothing would erase the mark later. A reader still waiting
+        // on this link sees it gone within one wait slice.
+        if (!m_net.has_peer(p)) {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            m_up_done.erase(p);
+        }
+    }
+    void wait_up_gate(PeerId p) {
+        const auto dl = Clock::now() + std::chrono::milliseconds(kUpGateWaitMs);
+        std::unique_lock<std::mutex> lk(m_pmtx);
+        while (!m_up_done.count(p) && Clock::now() < dl) {
+            m_up_cv.wait_for(lk, std::chrono::milliseconds(20));
+            if (m_up_done.count(p)) break;
+            lk.unlock();
+            const bool gone = !m_net.has_peer(p);   // the transport lock is never taken under m_pmtx
+            lk.lock();
+            if (gone) break;
+        }
+    }
+
+    void on_peer_up(PeerId p) {
+        if (m_partitioned.load()) { m_net.disconnect(p); return; }   // rig partition: refuse
+        {
             bool over = false;
             {
                 std::lock_guard<std::mutex> lk(m_pmtx);
@@ -814,12 +902,10 @@ private:
                 auto it = m_peers.find(p);
                 if (it != m_peers.end()) it->second.hello_sent = true;
             }
-            return;
         }
-        {
-            std::lock_guard<std::mutex> lk(m_pmtx);
-            m_peers.erase(p);
-        }
+    }
+
+    void on_peer_down(PeerId p) {
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_dos.forget(static_cast<::c2pool::xmr::u32>(p));
@@ -843,7 +929,11 @@ private:
         }
         {
             std::lock_guard<std::mutex> lk(m_tmtx);
-            for (auto& t : m_targets) if (t.pid == p) { t.pid = 0; t.next_try = Clock::now() + std::chrono::seconds(t.backoff_s); }
+            for (auto& t : m_targets) if (t.pid == p) {
+                t.pid = 0;
+                t.next_try = Clock::now() + std::chrono::seconds(prehello_delay_s(t));   // SMOKE-NOISE
+                t.hello_seen = false; t.hello_timed_out = false;
+            }
         }
     }
 
@@ -861,6 +951,7 @@ private:
     }
 
     void on_hello(PeerId p, const std::vector<u8>& f) {
+        wait_up_gate(p);   // UP-GATE: our own HELLO goes out (and the peer is registered) first
         Hello h; std::string why;
         if (!decode_hello(f, h, &why)) {
             m_st.hello_rejected++;
@@ -894,6 +985,10 @@ private:
         if (need_send && m_net.send_to(p, encode_hello(our_hello()))) m_st.hello_sent++;
         if (!first) return;
         m_st.hello_ok++;
+        {   // SMOKE-NOISE: a dial target whose link reached HELLO is healthy again
+            std::lock_guard<std::mutex> lk(m_tmtx);
+            for (auto& t : m_targets) if (t.pid == p) { t.hello_seen = true; t.prehello_fails = 0; }
+        }
         log("relay: peer " + std::to_string(p) + " HELLO ok (lane next_pos=" + std::to_string(h.lane_next_pos) +
             " listen=" + std::to_string(h.listen_port) + ")");
         reoffer_to(p);
@@ -1427,6 +1522,12 @@ private:
     }
 
     void on_order(PeerId p, const CtrlOrder& o) {
+        // SupplyRequester now hands a NON-OK ORDER (BELOW_HORIZON, DISABLED,
+        // BAD_RANGE) to the order callback too, so RepairDriver can name the
+        // refusal, and reports it through on_fail right after. This relay
+        // treats a refused order as a failed ask of this peer, exactly as
+        // before: leave the job for on_fetch_fail and touch nothing here.
+        if (o.status != CtrlOrderStatus::OK) return;
         auto j = take_cur_job(p);
         if (!j || j->kind != Job::Kind::Order) return;
         if (!j->repair) {                       // BACKFILL: ask for every id we never saw
@@ -1633,6 +1734,10 @@ private:
             }
             for (PeerId p : stale) {
                 m_st.hello_timeout++;
+                {   // SMOKE-NOISE: a silent dial target backs off harder than a refusing one
+                    std::lock_guard<std::mutex> lk(m_tmtx);
+                    for (auto& t : m_targets) if (t.pid == p) t.hello_timed_out = true;
+                }
                 if (m_net.has_peer(p)) { m_net.disconnect(p); continue; }
                 std::lock_guard<std::mutex> lk(m_pmtx);   // transport already dropped it: no down event will come
                 m_peers.erase(p);
@@ -1662,10 +1767,24 @@ private:
                     }
                     m_st.dials++;
                     const PeerId pid = m_net.add_peer_id(host, port);
+                    // the peer's HELLO may already have been accepted before t.pid is set
+                    const bool hello_now = pid && hello_ok(pid);
                     std::lock_guard<std::mutex> lk(m_tmtx);
                     auto& t = m_targets[i];
-                    if (pid) { t.pid = pid; t.backoff_s = 1; }
-                    else {
+                    if (pid) {
+                        t.backoff_s = 1;   // connect(2) worked: the dial-failure backoff restarts (unchanged)
+                        t.hello_seen = hello_now; t.hello_timed_out = false;
+                        if (m_net.has_peer(pid)) {
+                            t.pid = pid;
+                            if (hello_now) t.prehello_fails = 0;
+                        } else {
+                            // SMOKE-NOISE: the link already ended and its down event ran
+                            // before t.pid was set (it found no target), so the old code
+                            // redialed on the very next tick (250 ms). Back off here.
+                            t.next_try = Clock::now() + std::chrono::seconds(prehello_delay_s(t));
+                            t.hello_seen = false;
+                        }
+                    } else {
                         m_st.dial_fail++;
                         t.next_try = Clock::now() + std::chrono::seconds(t.backoff_s);
                         t.backoff_s = std::min(60, t.backoff_s * 2);
@@ -1743,6 +1862,9 @@ private:
 
     mutable std::mutex m_pmtx;         // peers
     std::map<PeerId, PeerSt> m_peers;
+    std::set<PeerId> m_up_done;        // UP-GATE: links whose up event has been handled (m_pmtx)
+    std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
+    std::atomic<u32> m_test_up_delay_ms{0};
 
     std::mutex m_tmtx;                 // dial targets + deferred drops
     std::vector<Target> m_targets;

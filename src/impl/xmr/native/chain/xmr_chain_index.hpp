@@ -104,7 +104,34 @@ struct ChainIndexOptions {
     std::uint64_t entry_cache_bytes = 64ull * 1024 * 1024;
     std::uint64_t burial_depth    = 60;                    // Monero D_conf
     std::uint64_t snapshot_depth  = 64;                    // how far below the tip a snapshot is taken
-    TieBreak      tie             = TieBreak::PreferOwn;   // D-14
+    // COLD-BOOT-2: the catch-up download window above the CONSUMER's booked
+    // frontier (set_consumer_frontier). A chain-entry download is handed out
+    // only up to frontier + window, so the settlement books the post-anchor gap
+    // in bounded batches while it downloads and no unbooked row or body leaves
+    // the row retention / entry cache first. 0 = off (the index downloads as
+    // far as its fetch window allows, the pre-COLD-BOOT-2 shape).
+    std::uint64_t consumer_window = 0;
+    // COLD-BOOT-3: the pacing ceiling is a CATCH-UP device, never a standing
+    // limit. It is lifted for the rest of the process (loudly) the first time
+    // the index is synced, or when the
+    // consumer's frontier has not moved for this many consecutive reports while
+    // the download is held at the ceiling (a HELD cursor: an undecidable block,
+    // a relay repair no peer can serve). Lifted, the index follows the chain as
+    // before COLD-BOOT-2; a block whose row then leaves the retention unbooked
+    // is HELD by the consumer's tri-state canonical test (Unknown), never
+    // dropped. 0 = no stall bound (the synced latch still applies). COLD-BOOT-4:
+    // a snapshot resume is NOT a latch: it stays paced until its cursor catches up.
+    std::uint64_t consumer_stall_reports = 1200;
+    // COLD-BOOT-4: the BOOKING TAIL. The ids of best-chain rows the row
+    // retention trims while they are still ABOVE the consumer's booked frontier,
+    // so a held or lagging finalize cursor can always be re-driven from its own
+    // height -- in this process and, carried by the snapshot, after a restart
+    // (canonical_id_at). Rows that deep are past max_reorg_depth: the index can
+    // never disconnect them. Bounded: past this many ids the OLDEST is dropped
+    // loudly (booking_tail_stats().dropped; the walk then HOLDS at that height,
+    // Unknown, never skipped). 0 = no tail (the pre-COLD-BOOT-4 shape).
+    std::uint64_t booking_tail_max = 65536;
+    TieBreak      tie            = TieBreak::PreferOwn;   // D-14
     VerificationLevel level        = VerificationLevel::L4PrunedAuthenticated;
     // Fail-closed: a block whose PoW we could not check does not join the best
     // chain. Replays of recorded history (parity, KATs) turn it off explicitly
@@ -214,6 +241,7 @@ public:
                     -> std::optional<Hash> { return seed_on_branch_(epoch_height, branch_tip); },
                 opts.level) {
         rows_.set_retention(opts_.row_retention);
+        rows_.set_trim_observer([this](const RowRecord& r) { keep_trimmed_locked_(r); });   // COLD-BOOT-4
         alt_.set_caps(opts_.alt_max_blocks, opts_.alt_max_bytes);
         view_.state().set_row_retention(opts_.row_retention);
         // One sink into the state view; it queues rather than dispatches, so no
@@ -773,7 +801,13 @@ public:
         // An entry id that has since connected is done with, whether or not
         // its body is still cached (the entry cache is smaller than a 2048-id
         // entry); one below the retained rows can no longer be used at all.
-        const std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        // COLD-BOOT-2: never download past the consumer's booked frontier + window.
+        if (const std::uint64_t ceil = consumer_ceiling_locked_(); ceil != 0 && ceil < limit) limit = ceil;
+        // COLD-BOOT-3: the consumer's mainchain-event queue is full enough that
+        // more bulk download would overflow it -- hand out nothing above the tip
+        // until it drains (backpressure without blocking the verify thread).
+        if (download_hold_ && download_hold_()) limit = rows_.tip_height();
         for (std::size_t k = 0; k < wanted_.size(); ++k) {
             if (wanted_heights_[k] > limit) break;
             if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
@@ -810,7 +844,138 @@ public:
         alt_.for_each([&out](const AltBlock& b) {
             if (b.bodies_missing && b.resolved) out.push_back(b.id);
         });
+        // COLD-BOOT: best-chain bodies the settlement booking asked back
+        // (want_body_for_booking). Same re-ask-by-id path (GET_OBJECTS, any
+        // peer, the driver's grace + re-ask timer); these are ids OUR OWN best
+        // chain connected, so asking for them is not the abuse surface the
+        // RESOLVED-only rule above guards.
+        for (const Hash& id : booking_wanted_)
+            if (!have_body_locked_(id) && !contains_hash_(out, id)) out.push_back(id);
         return out;
+    }
+
+    // ---- COLD-BOOT: body re-read for the settlement booking ----------------------------
+    // The coinbase-authority booking decodes EVERY best-chain block from its
+    // body (main: fetch_decode -> CbaBlockSource -> block_blob_of). A node that
+    // boots from an anchor older than the entry cache downloads the whole gap
+    // before its first booking, so the oldest bodies are evicted before they are
+    // booked -- and nothing ever fetched them again (the booking HELD forever,
+    // the cursor stuck, the lane suspended on lag). This is the safety net: the
+    // booking asks for the body back, the sync driver re-asks the network for
+    // it by id (bodies_wanted), and offer_block() re-caches it when it arrives.
+    // The cache keeps its bounds; the restored body is simply the newest entry,
+    // so it survives until the booking reads it. `ahead` also asks for the next
+    // best-chain bodies above it that are missing (chain-ordered booking will
+    // want them next), so a gap is refetched in batches, not one per round trip.
+    // The bytes are authenticated by the id itself (the id is recomputed from
+    // the blob in evaluate_block), so a restored body is byte-identical to the
+    // one that connected. Bounded: at most kBookingWantedMax ids outstanding.
+    static constexpr std::size_t kBookingWantedMax = 256;
+    std::size_t want_body_for_booking(const Hash& id, std::size_t ahead = 64) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (have_body_locked_(id)) return 0;
+        std::size_t added = 0;
+        auto want = [&](const Hash& h) {
+            if (have_body_locked_(h) || contains_hash_(booking_wanted_, h)) return;
+            booking_wanted_.push_back(h);
+            ++added;
+            while (booking_wanted_.size() > kBookingWantedMax) booking_wanted_.erase(booking_wanted_.begin());
+        };
+        want(id);
+        std::optional<std::uint64_t> h = rows_.height_of(id);
+        if (!h)   // COLD-BOOT-4: a booking-tail id (trimmed row, not booked yet)
+            for (const auto& kv : booking_tail_) if (kv.second == id) { h = kv.first; break; }
+        if (h) {
+            for (std::size_t k = 1; k < ahead; ++k) {
+                const auto nid = id_at_locked_(*h + k);
+                if (!nid) break;
+                want(*nid);
+            }
+        }
+        booking_refetch_asked_ += added;
+        return added;
+    }
+    struct BookingRefetchStats { std::uint64_t asked = 0, restored = 0; std::size_t outstanding = 0; };
+    BookingRefetchStats booking_refetch_stats() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::size_t n = 0;
+        for (const Hash& id : booking_wanted_) if (!have_body_locked_(id)) ++n;
+        return BookingRefetchStats{booking_refetch_asked_, booking_bodies_restored_, n};
+    }
+
+    // ---- COLD-BOOT-2: the consumer (settlement) paces the catch-up download --------------
+    // A node booting from an old anchor used to download the WHOLE post-anchor
+    // gap before the settlement consumed any of it: rows older than the row
+    // retention were trimmed (the canonical test then had nothing to answer
+    // with) and bodies older than the entry cache evicted, before they were
+    // booked. With options.consumer_window > 0 the consumer reports the height
+    // up to which it has booked (its finalize cursor) and the chain-entry
+    // download is handed out only up to that frontier + window; the ceiling
+    // moves as the settlement books, so the gap is downloaded and booked in
+    // bounded batches, in chain order. Until the first report the frontier is
+    // the anchor (a fresh boot books from there). Pushed tip blocks and the
+    // re-ask lists (refetch_, bodies_wanted) are not paced: only the bulk
+    // download. Pure pacing: which blocks connect, and in what order, is
+    // unchanged.
+    void set_consumer_frontier(std::uint64_t h) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const bool first = !consumer_frontier_set_;
+        // COLD-BOOT-3 (stall latch): a frontier that does not move while the
+        // download is held at the ceiling is a HELD cursor, not a slow booking.
+        if (!first && h == consumer_frontier_ && consumer_held_locked_()) ++consumer_stall_n_;
+        else consumer_stall_n_ = 0;
+        consumer_frontier_ = h;
+        consumer_frontier_set_ = true;
+        prune_booking_tail_locked_();   // COLD-BOOT-4: booked heights leave the tail
+        if (pacing_lifted_ || opts_.consumer_window == 0) return;
+        // COLD-BOOT-4: no resume latch. A snapshot resume whose cursor lags its
+        // tip by more than the window used to lift the pacing for the whole
+        // process at the first report, so the resumed node downloaded the rest
+        // of the gap unpaced while the cursor was still booking its own
+        // snapshot's rows. It now stays paced (nothing above frontier + window
+        // is downloaded) until the cursor catches up; the synced latch lifts it
+        // then, and a HELD cursor is still released by the stall latch below.
+        (void)first;
+        if (opts_.consumer_stall_reports && consumer_stall_n_ >= opts_.consumer_stall_reports)
+            lift_pacing_locked_("the consumer frontier is HELD at " + std::to_string(h) + " (" + std::to_string(consumer_stall_n_) +
+                                " reports without progress while the download waited at the ceiling " +
+                                std::to_string(h + opts_.consumer_window) + ")");
+    }
+    // COLD-BOOT-3: the catch-up pacing was lifted for the rest of this process
+    // (why; empty = still pacing, or pacing off). Once lifted it never re-arms.
+    bool consumer_pacing_lifted() const { std::lock_guard<std::mutex> lk(mu_); return pacing_lifted_; }
+    // COLD-BOOT-4: the best-chain id at `h` from the retained rows, or from the
+    // booking tail below them (a trimmed row the consumer has not booked yet).
+    std::optional<Hash> canonical_id_at(std::uint64_t h) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return id_at_locked_(h);
+    }
+    struct BookingTailStats { std::size_t kept = 0; std::uint64_t dropped = 0, lowest = 0; };
+    BookingTailStats booking_tail_stats() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        BookingTailStats s;
+        s.kept = booking_tail_.size();
+        s.dropped = booking_tail_dropped_;
+        s.lowest = booking_tail_.empty() ? 0 : booking_tail_.begin()->first;
+        return s;
+    }
+    std::string consumer_pacing_lifted_why() const { std::lock_guard<std::mutex> lk(mu_); return pacing_lifted_why_; }
+    // COLD-BOOT-3: the consumer's event queue asks the bulk download to wait
+    // (refetch_wanted hands out nothing above the tip while this answers true).
+    // Called under the index lock: it must not take the index lock itself.
+    void set_download_hold(std::function<bool()> fn) {
+        std::lock_guard<std::mutex> lk(mu_);
+        download_hold_ = std::move(fn);
+    }
+    std::uint64_t consumer_ceiling() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return consumer_ceiling_locked_();
+    }
+    // True while the download is paused at the ceiling (the tip reached it and
+    // the index is not yet synced): the consumer must book before more arrives.
+    bool consumer_held() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return consumer_held_locked_();
     }
 
     // The state view, for consumers that need the consensus numbers themselves
@@ -889,6 +1054,19 @@ private:
         }
 
         r.id = ev.input.identity.id;
+
+        // COLD-BOOT: a body the settlement booking asked back
+        // (want_body_for_booking). The id was recomputed from these bytes, so
+        // they are the block that connected; re-cache them (bounded cache,
+        // newest entry) whatever becomes of the offer below -- it is normally a
+        // Duplicate of a best-chain row, or below the retained rows.
+        if (ev.input.bodies_complete && contains_hash_(booking_wanted_, r.id)) {
+            erase_hash_(booking_wanted_, r.id);
+            if (entries_.find(key_(r.id)) == entries_.end()) {
+                cache_entry_locked_(r.id, entry, ev.input.parsed.tx_hashes);
+                ++booking_bodies_restored_;
+            }
+        }
 
         if (rows_.contains(r.id)) {
             r.outcome = OfferOutcome::Duplicate;
@@ -2114,7 +2292,11 @@ private:
     }
 
     void update_synced_locked_() {
-        if (forced_synced_) { synced_ = true; view_.set_synced(true); return; }
+        if (forced_synced_) {
+            synced_ = true; view_.set_synced(true);
+            if (opts_.consumer_window && !pacing_lifted_) lift_pacing_locked_("synced (forced)");
+            return;
+        }
         const std::uint64_t cohort = cohort_height_locked_();
         const std::uint64_t frontier = view_.verified_frontier();
         // OR-C2-8: publish only when the verified frontier has reached the
@@ -2122,6 +2304,10 @@ private:
         // and claiming it would be the fail-open answer.
         synced_ = cohort > 0 && frontier + 1 >= cohort;
         view_.set_synced(synced_);
+        // COLD-BOOT-3 (synced latch): the catch-up is over for this process; a
+        // later missed-push gap is followed at full speed, never re-paced.
+        if (synced_ && opts_.consumer_window && !pacing_lifted_)
+            lift_pacing_locked_("synced at " + std::to_string(frontier) + " (the initial catch-up is over)");
         view_.set_cohort_height(cohort);
     }
 
@@ -2144,14 +2330,85 @@ private:
         while ((opts_.entry_cache && entry_order_.size() > opts_.entry_cache)
                || (opts_.entry_cache_bytes && entry_bytes_ > opts_.entry_cache_bytes)) {
             if (entry_order_.empty()) break;
-            const Key victim = entry_order_.front();
-            entry_order_.pop_front();
+            // COLD-BOOT-2 (D4a): the oldest-INSERTED body is the victim, EXCEPT the
+            // bodies of the best chain's top snapshot_depth + 1 blocks. The snapshot
+            // (save_snapshot_locked_) re-carries exactly those and refuses when one
+            // is missing, and a reorg disconnects them. Pure FIFO let a burst of
+            // older bodies (the cold-boot booking refetch re-caching the post-anchor
+            // gap) push every tip-side body out: the node then wrote no snapshot at
+            // all until snapshot_depth new blocks had connected (stagenet: hours).
+            // Bounded: at most snapshot_depth + 1 bodies are ever skipped, and only
+            // when that is at most a quarter of the cache (tip_pin_depth_locked_).
+            auto vit = entry_order_.begin();
+            while (vit != entry_order_.end() && tip_pinned_locked_(*vit)) ++vit;
+            if (vit == entry_order_.end()) break;   // only pinned bodies left: keep them
+            const Key victim = *vit;
+            entry_order_.erase(vit);
             const auto v = entries_.find(victim);
             if (v != entries_.end()) {
                 entry_bytes_ -= v->second.bytes;
                 entries_.erase(v);
             }
         }
+    }
+
+    // COLD-BOOT-2: a best-chain body within the top snapshot_depth + 1 heights.
+    // The pin never takes more than a quarter of the cache (shipped: 65 of 1024);
+    // a cache too small for that keeps the plain FIFO order.
+    std::uint64_t tip_pin_depth_locked_() const {
+        const std::uint64_t pin = opts_.snapshot_depth + 1;
+        return (opts_.entry_cache == 0 || opts_.entry_cache >= 4 * pin) ? pin : 0;
+    }
+    bool tip_pinned_locked_(const Key& k) const {
+        const std::uint64_t pin = tip_pin_depth_locked_();
+        if (pin == 0 || rows_.empty() || k.size() != sizeof(Hash)) return false;
+        Hash id{};
+        std::copy(k.begin(), k.end(), reinterpret_cast<char*>(id.data()));
+        const auto h = rows_.height_of(id);
+        return h && *h + pin > rows_.tip_height();
+    }
+
+    bool consumer_held_locked_() const {
+        const std::uint64_t ceil = consumer_ceiling_locked_();
+        return ceil != 0 && !synced_ && !rows_.empty() && rows_.tip_height() >= ceil;
+    }
+    // COLD-BOOT-4: the booking tail (see ChainIndexOptions::booking_tail_max).
+    std::optional<Hash> id_at_locked_(std::uint64_t h) const {
+        if (const RowRecord* r = rows_.by_height(h)) return r->row.id;
+        const auto it = booking_tail_.find(h);
+        if (it != booking_tail_.end()) return it->second;
+        return std::nullopt;
+    }
+    void keep_trimmed_locked_(const RowRecord& r) {
+        if (opts_.booking_tail_max == 0) return;
+        // A resume keeps every row it trims (the first report prunes the booked
+        // ones); a running process keeps the rows above the booked frontier.
+        if (!tail_loading_ && !(consumer_frontier_set_ && r.row.height > consumer_frontier_)) return;
+        booking_tail_[r.row.height] = r.row.id;
+        bound_booking_tail_locked_();
+    }
+    void bound_booking_tail_locked_() {
+        while (booking_tail_.size() > opts_.booking_tail_max) {
+            booking_tail_.erase(booking_tail_.begin());
+            ++booking_tail_dropped_;
+        }
+    }
+    void prune_booking_tail_locked_() {
+        while (!booking_tail_.empty() && booking_tail_.begin()->first <= consumer_frontier_)
+            booking_tail_.erase(booking_tail_.begin());
+    }
+    void lift_pacing_locked_(const std::string& why) {
+        if (pacing_lifted_) return;
+        pacing_lifted_ = true;
+        pacing_lifted_why_ = why;
+    }
+
+    // COLD-BOOT-2: frontier + window, or 0 when pacing is off.
+    // COLD-BOOT-3: and 0 once the pacing was lifted for this process.
+    std::uint64_t consumer_ceiling_locked_() const {
+        if (opts_.consumer_window == 0 || pacing_lifted_) return 0;
+        const std::uint64_t base = consumer_frontier_set_ ? consumer_frontier_ : view_.anchor_height();
+        return base + opts_.consumer_window;
     }
 
     std::size_t missing_tx_count_(const Hash& id) const {
@@ -2321,6 +2578,7 @@ private:
 
     static constexpr std::uint64_t SNAPSHOT_MAGIC   = 0x3143584449433243ull;  // "C2CIDXC1"
     static constexpr std::uint64_t SNAPSHOT_VERSION = 1;
+    static constexpr std::uint64_t SNAPSHOT_TAIL_MAGIC = 0x344C494154424332ull;  // "2CBTAIL4": COLD-BOOT-4 trailer
 
     static void put_row_(std::vector<std::uint8_t>& o, const RowRecord& r) {
         put_u64_(o, r.row.height);
@@ -2504,6 +2762,15 @@ private:
             }
         }
 
+        // COLD-BOOT-4: the booking tail, as an optional trailer (absent when
+        // empty, so such a snapshot is byte-identical to the pre-COLD-BOOT-4
+        // format; an older build reading one stops before it).
+        if (!booking_tail_.empty()) {
+            put_u64_(body, SNAPSHOT_TAIL_MAGIC);
+            put_u64_(body, booking_tail_.size());
+            for (const auto& kv : booking_tail_) { put_u64_(body, kv.first); put_hash_(body, kv.second); }
+        }
+
         anchor_hash::Sha256 h;
         h.update(body.data(), body.size());
         const std::array<std::uint8_t, 32> digest = h.finish();
@@ -2603,10 +2870,27 @@ private:
             }
             above.push_back(std::move(a));
         }
+        // COLD-BOOT-4: the optional booking-tail trailer.
+        std::vector<std::pair<std::uint64_t, Hash>> tail;
+        if (!r.bad && r.n - r.off >= 16) {
+            if (r.u64() != SNAPSHOT_TAIL_MAGIC) { why = "snapshot trailer is not a booking tail"; return false; }
+            const std::uint64_t nt = r.u64();
+            if (nt > (std::uint64_t{1} << 22)) { why = "snapshot booking tail is oversized"; return false; }
+            for (std::uint64_t i = 0; i < nt && !r.bad; ++i) {
+                const std::uint64_t th = r.u64();
+                tail.push_back({th, r.hash()});
+            }
+        }
         if (r.bad) { why = "snapshot is truncated"; return false; }
 
         // --- install ------------------------------------------------------------------
         reset_locked_();
+        // COLD-BOOT-4: the tail comes back, and every row the install / replay
+        // trims joins it (no frontier is known yet; the first report prunes).
+        booking_tail_.clear();
+        for (const auto& t : tail) booking_tail_[t.first] = t.second;
+        bound_booking_tail_locked_();
+        struct LoadingFlag { bool& f; explicit LoadingFlag(bool& x) : f(x) { f = true; } ~LoadingFlag() { f = false; } } loading(tail_loading_);
         view_.seed_direct(base.row, dwin, st, lt, ts, seeds);
         std::vector<RowRecord> all = below;
         all.push_back(base);
@@ -2634,6 +2918,8 @@ private:
             push_long_mirror_(co.row.long_term_weight);
             cache_entry_locked_(co.row.id, a.entry, ev.input.parsed.tx_hashes);
         }
+        // COLD-BOOT-3: where this process resumed (the resume latch of the pacing).
+        resumed_tip_ = rows_.tip_height();
         // A resume is not a re-verification: the events it would raise describe a
         // chain the consumers already saw before the restart.
         queued_events_.clear();
@@ -2655,6 +2941,7 @@ private:
         wanted_.clear();
         wanted_heights_.clear();
         refetch_.clear();
+        booking_wanted_.clear();
         queued_events_.clear();
         queued_tx_events_.clear();
         mined_stack_.clear();
@@ -2709,6 +2996,19 @@ private:
     std::vector<Hash> wanted_;
     std::vector<std::uint64_t> wanted_heights_;   // parallel to wanted_
     std::vector<Hash> refetch_;
+    std::vector<Hash> booking_wanted_;            // COLD-BOOT: bodies the booking asked back (bounded)
+    std::uint64_t     booking_refetch_asked_   = 0;
+    std::uint64_t     booking_bodies_restored_ = 0;
+    std::uint64_t     consumer_frontier_       = 0;       // COLD-BOOT-2: the consumer's booked frontier
+    bool              consumer_frontier_set_   = false;   // COLD-BOOT-2: false = the anchor until the first report
+    std::uint64_t     consumer_stall_n_        = 0;       // COLD-BOOT-3: reports held at the ceiling without progress
+    std::uint64_t     resumed_tip_             = 0;       // COLD-BOOT-3: tip a snapshot resume installed (0 = none)
+    std::map<std::uint64_t, Hash> booking_tail_;          // COLD-BOOT-4: trimmed, not-yet-booked best-chain ids
+    std::uint64_t     booking_tail_dropped_    = 0;       // COLD-BOOT-4: dropped past booking_tail_max (LOUD)
+    bool              tail_loading_            = false;   // COLD-BOOT-4: a snapshot install is trimming
+    bool              pacing_lifted_           = false;   // COLD-BOOT-3: latched for the process
+    std::string       pacing_lifted_why_;
+    std::function<bool()> download_hold_;                 // COLD-BOOT-3: event-queue backpressure
 
     std::vector<node::MainchainEvent> queued_events_;
     std::vector<BlockTxEvent>         queued_tx_events_;

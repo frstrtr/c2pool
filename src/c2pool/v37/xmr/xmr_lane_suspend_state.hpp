@@ -18,6 +18,9 @@
 //              (>= 1/3 of the recent frontier lane blocks refused) -- suspend
 //              template production instead of building on a possibly split
 //              ledger; auto-resumes when the vote returns to CONVERGED.
+//   test       FAULT-KNOB (TEST-ONLY, xmr_test_suspend_knob.hpp): `test_forced`
+//              is raised only by --test-suspend-lane-seconds + SIGUSR2 on a
+//              non-mainnet rig; it is never set otherwise.
 //
 // D5 (rework-2 verify): HELD-LAG never registered as cause=held. The old code
 // attributed a suspension to ONE cause, only on the lane's suspend edge; a
@@ -40,7 +43,8 @@ struct LaneSuspendState {
     // the majority. Operator ruling D-1 = C: both are ALARMS, never suspension
     // causes -- they live in `alarms` (edges counted and named), never in
     // `causes`, so D2 can never withdraw the stratum job or halt the lane.
-    enum Cause : unsigned { kLag = 1u, kIsolated = 2u, kHeld = 4u, kContested = 8u, kConverging = 16u, kDiverged = 32u };
+    enum Cause : unsigned { kLag = 1u, kIsolated = 2u, kHeld = 4u, kContested = 8u, kConverging = 16u, kDiverged = 32u,
+                           kTest = 64u };   // kTest: FAULT-KNOB only (test_forced)
     static constexpr unsigned kAlarmOnly = kConverging | kDiverged;
 
     struct Edge {
@@ -58,6 +62,8 @@ struct LaneSuspendState {
     unsigned      alarms = 0;            // D2 alarm-only bits (kConverging | kDiverged)
     std::uint64_t n_lag = 0, n_isolated = 0, n_held = 0, n_contested = 0, n_resume = 0, n_suspend = 0;
     std::uint64_t n_converging = 0, n_diverged = 0;
+    bool          test_forced = false;   // FAULT-KNOB (TEST-ONLY): forces cause kTest; false unless the knob fired
+    std::uint64_t n_test = 0;
 
     explicit LaneSuspendState(std::uint64_t d = 1) : d_conf(d ? d : 1) {}
 
@@ -76,6 +82,7 @@ struct LaneSuspendState {
         if (isolated)    now |= kIsolated;
         if (held)        now |= kHeld;
         if (contested)   now |= kContested;
+        if (test_forced) now |= kTest;
         unsigned al = 0;
         if (converging)  al |= kConverging;
         if (diverged)    al |= kDiverged;
@@ -91,6 +98,7 @@ struct LaneSuspendState {
         if (e.added & kIsolated)  ++n_isolated;
         if (e.added & kHeld)      ++n_held;
         if (e.added & kContested) ++n_contested;
+        if (e.added & kTest)      ++n_test;
         if (e.alarm_added & kConverging) ++n_converging;
         if (e.alarm_added & kDiverged)  ++n_diverged;
         if (e.suspend_edge) ++n_suspend;
@@ -107,6 +115,7 @@ struct LaneSuspendState {
         if (c & kIsolated)  add("isolated");
         if (c & kHeld)      add("held");
         if (c & kContested) add("contested");
+        if (c & kTest)      add("test");
         if (c & kConverging) add("converging");
         if (c & kDiverged)  add("diverged");
         return s.empty() ? "-" : s;

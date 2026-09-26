@@ -538,6 +538,7 @@ public:
         std::uint64_t relay_repair_stall_timeout = 0;
         std::uint64_t relay_repair_held = 0, relay_repair_held_resolved = 0, relay_repair_held_now = 0;
         std::uint64_t late_booked_post_finalize = 0;
+        std::uint64_t stale_pending_rebooked = 0;   // RACE-DIVERGE: stale m_pending entries retired at a one-tick re-delivery
         // R5: lane blocks whose 03 root matched no candidate digest, kept in the
         // retry set (never memoized) and re-decoded as the candidate ring advances;
         // `lane_root_unknown_resolved` = later booked; `lane_root_unknown_terminal`
@@ -553,6 +554,12 @@ public:
         // transient outcome counts: the point is the order). Normal on a node that is
         // catching up or whose R4 gate is held; late_unbooked MUST still be 0.
         std::uint64_t booking_deferred = 0, booked_after_deferral = 0;
+        // COLD-BOOT-2 (D4b): chain blocks re-delivered at/below the finalize
+        // cursor this (p2p-first) process RESUMED at -- the re-walk from the
+        // anchor after a restart replays history the previous process already
+        // booked or decided before its cursor stepped there. Skipped quietly (not
+        // late: the cursor was never moved over them in this process).
+        std::uint64_t replayed_below_boot_cursor = 0;
         // R6 DIVERGENCE CAP -> R-C rework-2. `diverged` is 1 WHILE the node is
         // ISOLATED by the lineage vote (non-terminal; it drops back to 0 when the
         // vote flips). `divergence_ticks` / `divergence_lag_max` feed HELD-LAG.
@@ -629,6 +636,9 @@ public:
         // own F2 gap gate (never step onto h while h + D_conf is unscanned).
         m_node.set_booking_gate(
             [this](std::uint64_t h) { return booking_gate(h); });
+        // COLD-BOOT-2 (D4b): the cursor this process resumed at (p2p-first scan gate armed).
+        if (m_node.native_scan_armed() && m_node.recovered().recovered)
+            m_boot_cursor = m_node.finalize_driver().cursor_height();
         // R6 evidence: the AUTHORITATIVE pending set at every FINALIZE(h), printed
         // synchronously from inside the driver's walk (not reconstructed from log
         // order). Two converged nodes print identical cba-finalize: lines.
@@ -884,11 +894,35 @@ public:
         if (bid.size() != 64 || h == 0) return;
         //  fix 2: dedup on CURRENT ledger state, not on "ever seen" -- an orphaned block that
         // becomes canonical again (branch flip-flop) must be re-booked.
+        // RACE-DIVERGE: m_pending mirrors the ledger only as of the last tick's reconcile(); an
+        // Orphan event removes the bid from the LEDGER at once. A depth-1 flip-flop X -> Y -> X
+        // (X re-established under its successor) that completes before the next tick re-delivers X
+        // (D2-0) while its stale m_pending entry is still there: deduping on it skipped the re-book,
+        // reconcile() then disposed X ORPHANED and this node finalized WITHOUT a canonical lane block
+        // every other node credited (owed_digest fork at a reorg shallower than D_conf). Retire the
+        // stale entry exactly as reconcile() would, then book X again.
+        if (auto st = m_pending.find(bid);
+            st != m_pending.end() && !m_node.ledger().is_pending(bid) && !m_node.ledger().is_settled(bid)) {
+            ++m_stats.orphaned; ++m_stats.stale_pending_rebooked;
+            say("ORPHANED " + short_bid(bid) + " h=" + std::to_string(st->second.height) +
+                " left the pending set (pre-SETTLED removal, O3.5) -- retired at its re-delivery: canonical AGAIN "
+                "before the tick reconciled it (one-tick flip-flop)");
+            m_pending.erase(st); (void)sidecar_flush();
+        }
         if (m_pending.count(bid) || m_unrecoverable.count(bid)) return;
         if (m_node.ledger().is_settled(bid) || m_node.ledger().is_pending(bid)) return;
         if (m_chain_seen.count(bid)) return;   //  fix 3b: memo of NON-booked outcomes only (not-lane / late / refused)
         if (m_chain_booked_once.count(bid)) say("cba: chain block " + short_bid(bid) + " h=" + std::to_string(h) + " is canonical AGAIN after an orphan -> re-booking");
         const std::uint64_t cursor = m_node.finalize_driver().cursor_height();
+        // COLD-BOOT-2 (D4b): re-walk history at/below the RESUMED cursor (every
+        // height there was booked or decided before the previous process stepped
+        // its cursor onto it -- the scan gate guarantees that ordering). Not late.
+        if (h <= m_boot_cursor) {
+            if (m_stats.replayed_below_boot_cursor++ == 0)
+                say("cba: re-walk after restart: chain blocks at/below the resumed finalize cursor " + std::to_string(m_boot_cursor) +
+                    " were booked/decided by the previous process -> skipped (booking resumes at " + std::to_string(m_boot_cursor + 1) + ")");
+            return;
+        }
         // R6 (TWO-SIDED chain-ordered booking): a chain block ABOVE cursor + 1 +
         // D_conf is not booked yet. The synced node books h exactly when its
         // cursor stands at h - 1 - D_conf (book(h) precedes advance(h), which
@@ -2605,6 +2639,7 @@ private:
     std::function<void(bool, const std::string&)> m_iso_hook;
     std::function<void(bool, const std::string&)> m_contested_hook;   // rework-3: CONTESTED -> lane suspend
     std::uint64_t                     m_tick = 0;
+    std::uint64_t                     m_boot_cursor = 0;   // COLD-BOOT-2: resumed finalize cursor (0 = fresh / daemon-first)
     std::uint64_t                     m_cba_chain_booked = 0;
     std::map<std::string, PendingRec> m_unrecoverable;  // kept in the sidecar so the boot warning repeats
     Stats         m_stats;

@@ -17,7 +17,15 @@
 //   P2  live geometry mismatch (3 loopback nodes, C runs another k_floor on the
 //       same chain_id): C gets 0 ready relay peers, A/B keep each other; every
 //       attempt is refused in BOTH directions as TAG_MISMATCH field=geometry
-//       naming both tags; the tag_mismatch counter moves on A, B and C
+//       naming both tags (per dial: >= 1 line at A/B AND >= 1 line at X, read
+//       with a bounded poll, lines before dials, so a dial still in flight is
+//       waited for and never credited by a later one); the tag_mismatch
+//       counter moves on A, B and C
+//   P2c/P2d UP-GATE: the same with X's (P2c) or A's (P2d) connection-up event
+//       held 150 ms, so the remote HELLO deterministically reaches the reader
+//       before that node's own HELLO goes out. Pre-UP-GATE, X refused before
+//       its HELLO left (A/B logged nothing for the dial) and A dropped B's
+//       early HELLO (A<->B only came up after a HELLO timeout + redial)
 //   P3  live consensus-version mismatch (same LaneParams, version 2): refused
 //       as TAG_MISMATCH field=version -- the lane_params_digest alone does NOT
 //       see this one (the base admits the peer)
@@ -111,6 +119,15 @@ struct TNode {
             });
     }
     ~TNode() { relay->stop(); engine->stop(); }
+    // UP-GATE KAT: hold this node's connection-up events (0 = off)
+    bool up_delay(u32 ms) {
+#ifdef C2POOL_XMR_RELAY_UP_GATE
+        relay->set_test_up_delay_ms(ms);
+        return true;
+#else
+        return ms == 0;
+#endif
+    }
     bool start() { std::string why; return relay->start(why); }
     void note_bin(const bytes32& prev, u64 height) { chain.note(prev, height, bytes32{}); chain.set_tip(height); }
     void pump() {
@@ -161,39 +178,58 @@ static std::string tag_hex(const Cfg& c) {
 }
 
 // One live mismatch scenario: A listens, B dials A, X (the other pool) dials
-// A and B. Returns after checking the refusal on every side.
-static void mismatch_case(Checker& C, const char* tagp, const Cfg& same, const Cfg& other, const char* field) {
+// A and B. Returns after checking the refusal on every side. `a_up_ms` /
+// `x_up_ms` hold A's / X's connection-up events (UP-GATE).
+static void mismatch_case(Checker& C, const char* tagp, const Cfg& same, const Cfg& other, const char* field,
+                          u32 a_up_ms = 0, u32 x_up_ms = 0) {
     const std::string P = tagp;
     TNode A("A", same, true, {});
+    if (a_up_ms) C(A.up_delay(a_up_ms), P + " A holds its up events " + std::to_string(a_up_ms) + " ms (test hook present)");
     C(A.start(), P + " A starts");
     TNode B("B", same, true, {A.relay->listen_port()});
     C(B.start(), P + " B starts, dials A");
     TNode X("X", other, false, {A.relay->listen_port(), B.relay->listen_port()});
+    if (x_up_ms) C(X.up_delay(x_up_ms), P + " X holds its up events " + std::to_string(x_up_ms) + " ms (test hook present)");
     C(X.start(), P + " X (other pool, same network) starts, dials A and B");
     std::vector<TNode*> all{&A, &B, &X};
     C(wait_for([&] { return A.relay->ready_peers().size() == 1 && B.relay->ready_peers().size() == 1; }, all),
       P + " A<->B (same pool) HELLO ok");
     // let X make several dial attempts (redial backoff 1 s, 2 s, ...)
     wait_for([&] { return A.relay->stats().hello_rejected.load() >= 2 && B.relay->stats().hello_rejected.load() >= 2; }, all, 6000ms);
-    std::this_thread::sleep_for(300ms);
+    // Every X dial must end in a TAG_MISMATCH line at the dialed node (A or B)
+    // AND one at X. X keeps redialing, so the dial counted last may still be in
+    // flight (its HELLOs not yet handled) when first read: poll (bounded) until
+    // the lines cover the dials. The lines are read BEFORE the dial counter and
+    // one dial makes at most one line on A|B and one at X, so "lines >= dials"
+    // is never met by a later dial's line standing in for a missing one.
+    const std::string ta = tag_hex(same), tx = tag_hex(other);
+    const std::string tl = "TAG_MISMATCH field=" + std::string(field);
+    std::size_t la = 0, lb = 0, lx = 0, attempts = 0;
+    const bool settled = wait_for([&] {
+        la = A.count_logs(tl, "ours=" + ta, "theirs=" + tx);
+        lb = B.count_logs(tl, "ours=" + ta, "theirs=" + tx);
+        lx = X.count_logs(tl, "ours=" + tx, "theirs=" + ta);
+        attempts = static_cast<std::size_t>(X.relay->stats().dials.load());
+        return attempts >= 2 && la + lb >= attempts && lx >= attempts;
+    }, all, 10000ms);
     const std::size_t xr = X.relay->ready_peers().size();
-    std::printf("    ready peers: A=%zu B=%zu X=%zu | hello_rejected A=%llu B=%llu X=%llu | dials X=%llu\n",
+    std::printf("    ready peers: A=%zu B=%zu X=%zu | hello_rejected A=%llu B=%llu X=%llu | dials X=%llu | hello_ok A=%llu B=%llu X=%llu | hello_timeout A=%llu B=%llu\n",
                 A.relay->ready_peers().size(), B.relay->ready_peers().size(), xr,
                 (unsigned long long)A.relay->stats().hello_rejected.load(), (unsigned long long)B.relay->stats().hello_rejected.load(),
-                (unsigned long long)X.relay->stats().hello_rejected.load(), (unsigned long long)X.relay->stats().dials.load());
+                (unsigned long long)X.relay->stats().hello_rejected.load(), (unsigned long long)X.relay->stats().dials.load(),
+                (unsigned long long)A.relay->stats().hello_ok.load(), (unsigned long long)B.relay->stats().hello_ok.load(),
+                (unsigned long long)X.relay->stats().hello_ok.load(),
+                (unsigned long long)A.relay->stats().hello_timeout.load(), (unsigned long long)B.relay->stats().hello_timeout.load());
     C(xr == 0, P + " the other-pool node X has 0 ready relay peers (" + std::to_string(xr) + ")");
     C(A.relay->ready_peers().size() == 1 && B.relay->ready_peers().size() == 1, P + " A and B keep exactly each other");
-    const std::string ta = tag_hex(same), tx = tag_hex(other);
-    const std::size_t la = A.count_logs("TAG_MISMATCH field=" + std::string(field), "ours=" + ta, "theirs=" + tx);
-    const std::size_t lx = X.count_logs("TAG_MISMATCH field=" + std::string(field), "ours=" + tx, "theirs=" + ta);
-    const std::size_t attempts = static_cast<std::size_t>(X.relay->stats().dials.load());
-    std::printf("    TAG_MISMATCH log lines: A=%zu B=%zu X=%zu (X dial attempts %zu); last reject at A: %s\n",
-                la, B.count_logs("TAG_MISMATCH field=" + std::string(field)), lx, attempts, A.relay->last_reject().c_str());
-    C(la >= 1 && B.count_logs("TAG_MISMATCH field=" + std::string(field), "ours=" + ta, "theirs=" + tx) >= 1,
-      P + " A and B log an explicit TAG_MISMATCH field=" + field + " naming both tags");
+    std::printf("    TAG_MISMATCH log lines: A=%zu B=%zu X=%zu (X dial attempts %zu, settled=%d); last reject at A: %s\n",
+                la, lb, lx, attempts, settled ? 1 : 0, A.relay->last_reject().c_str());
+    C(la >= 1 && lb >= 1, P + " A and B log an explicit TAG_MISMATCH field=" + field + " naming both tags");
     C(lx >= 1, P + " X refuses too (both directions), naming both tags");
-    C(la + B.count_logs("TAG_MISMATCH") >= attempts, P + " >= 1 TAG_MISMATCH line per X dial attempt (" +
-                                                          std::to_string(la + B.count_logs("TAG_MISMATCH")) + " for " + std::to_string(attempts) + ")");
+    C(la + lb >= attempts, P + " >= 1 TAG_MISMATCH line per X dial attempt (" +
+                               std::to_string(la + lb) + " for " + std::to_string(attempts) + ")");
+    C(lx >= attempts, P + " X logs >= 1 TAG_MISMATCH naming both tags per own dial attempt (" +
+                          std::to_string(lx) + " for " + std::to_string(attempts) + ")");
     const long long ca = A.tag_mismatch_counter(), cb = B.tag_mismatch_counter(), cx = X.tag_mismatch_counter();
     std::printf("    tag_mismatch counter: A=%lld B=%lld X=%lld\n", ca, cb, cx);
     C(ca > 0 && cb > 0 && cx > 0, P + " the status-surface tag_mismatch counter moved on A, B and X");
@@ -278,6 +314,20 @@ int main() {
         Cfg other = same; other.lp = hl;
         mismatch_case(C, "P2b", same, other, "geometry");
     }
+#ifdef C2POOL_XMR_RELAY_UP_GATE
+    {
+        std::printf("-- P2c UP-GATE: X's up events held 150 ms (A's/B's HELLO reaches X's reader first)\n");
+        Cfg other = same; other.lp = kf;
+        mismatch_case(C, "P2c", same, other, "geometry", 0, 150);
+    }
+    {
+        std::printf("-- P2d UP-GATE: A's up events held 150 ms (B's and X's HELLO reach A's reader first)\n");
+        Cfg other = same; other.lp = kf;
+        mismatch_case(C, "P2d", same, other, "geometry", 150, 0);
+    }
+#else
+    C(false, "P2c/P2d the relay UP-GATE (a HELLO read before our up event waits for it) (absent in this build)");
+#endif
     {
         std::printf("-- P3 consensus-version mismatch (X: version 2, identical LaneParams)\n");
         Cfg other = same; other.version = 2;

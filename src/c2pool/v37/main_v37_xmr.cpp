@@ -62,6 +62,11 @@
 // ===========================================================================
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
 #include <atomic>
 #include <functional>
 #include <chrono>
@@ -90,7 +95,9 @@
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
 #include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
+#include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
+#include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
 #include "impl/xmr/node/minijson.hpp"
@@ -106,6 +113,8 @@
 #include "xmr/xmr_p2p_block_publisher.hpp"        // M3: found block -> levin 2008 (no submit_block)
 #include "xmr/xmr_recon_ring.hpp"                 // R-C rework-3 (D7): the RECON ring + root-age bound
 #include "xmr/xmr_lane_suspend_state.hpp"         // R-C rework-3 (D5 + contested): the lane-suspend causes
+#include "xmr/xmr_test_suspend_knob.hpp"          // FAULT-KNOB (TEST-ONLY): SIGUSR2 forces a lane suspension
+#include "xmr/xmr_lane_resume_fresh.hpp"         // RESUME-FRESH: the resume edge refreshes the template before the gate opens
 // GAP-2: the real c2pool-to-c2pool receipt relay (docs/xmr-lane/gap2-sharechain-relay-design.md).
 // OFF unless --relay-listen / --relay-peer is given; off = this daemon byte-identical to before.
 #include "xmr/relay/xmr_relay_wire.hpp"        // FB_HELLO / FB_RECEIPTS / FB_BLOCK_WON, side_data_v2, lane_params_digest
@@ -129,6 +138,8 @@
 // -- it links nothing and touches nothing unless asked, so the flag can be
 // parsed, reported and refused identically in a build that has no librandomx.
 #include "impl/xmr/pow/xmr_msr_boost.hpp"
+// --version: the release's compiled-in pinned snapshot heights.
+#include "impl/xmr/native/anchor/xmr_anchor_pinned.hpp"
 
 using namespace c2pool::v37n::xmr;
 namespace strat = ::v37::xmr::stratum;
@@ -161,6 +172,11 @@ namespace node  = ::c2pool::xmr::node;
 static std::atomic<bool> g_stop{false};
 static std::atomic<bool> g_relay_partition_req{false};   // GAP-2 rig: SIGUSR1 -> relay partition
 static void on_sigusr1(int) { g_relay_partition_req.store(true); }
+// FAULT-KNOB (TEST-ONLY, xmr/xmr_test_suspend_knob.hpp): --test-suspend-lane-seconds S
+// arms SIGUSR2 -> force the lane-suspend state for S s. 0 (default) = OFF: no handler.
+static std::uint32_t g_test_suspend_s = 0;
+static std::atomic<bool> g_test_suspend_req{false};
+static void on_sigusr2(int) { g_test_suspend_req.store(true); }
 static void on_sigint(int) { g_stop.store(true); }
 
 // recon(A+B credit) knobs (regtest-only; parsed in main). See xmr/xmr_credit_cut.hpp.
@@ -172,6 +188,7 @@ static long long     g_credit_mutate = 0;      // --credit-mutate N: +N piconero
 static bool          g_no_book_deferral = false;         // --no-book-deferral: A/B escape hatch (reintroduces the lagging-receiver fork)
 // D6a (xmr/xmr_cba_block_source.hpp): p2p-first books from the native index; monerod is opt-in only.
 static bool          g_cba_monerod_compare = false;      // --cba-monerod-compare: compare-only oracle (counts, never decides)
+static std::uint64_t g_cba_refetch_bound = 120;          // --cba-refetch-bound: COLD-BOOT body refetch requests per block (0 = off)
 static bool          g_cba_monerod_fallback = false;     // --cba-monerod-fallback: a native miss asks monerod instead of HOLDING
 static bool          g_relay_feed_monerod_compare = false;   // --relay-feed-monerod-compare: D6b compare-only oracle (counts, never decides)
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
@@ -199,6 +216,7 @@ static bool g_lane_suspended_now = false;                  // R-C rework-2: main
 // GAP-2 relay knobs (design §6). All default OFF: with neither --relay-listen nor
 // --relay-peer the daemon is byte-identical to the stand-in build.
 static std::string   g_relay_listen;                    // --relay-listen HOST:PORT
+static std::optional<::v37::bytes32> g_pool_genesis;    // POOL-LINEAGE: --pool-genesis <hex64> (unset = the network default)
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (enrol + arm only once the native tip >= H)
@@ -217,6 +235,18 @@ static bool          g_no_relay_serve = false;          // --no-relay-serve
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 static std::string   g_relay_bind = "none";             // --relay-bind none|rbind (rbind needs SEAM-1 in the template)
 static bool relay_enabled() { return !g_relay_listen.empty() || !g_relay_peers.empty(); }
+// POOL-LINEAGE: the pool genesis id (--pool-genesis, else the per-network
+// default) and the block-level pool_tag every lane coinbase commits.
+static std::uint8_t lineage_network_byte(MoneroNetwork n) {
+    return n == MoneroNetwork::Mainnet ? 0 : n == MoneroNetwork::Testnet ? 1 : n == MoneroNetwork::Stagenet ? 2 : 3;
+}
+static ::v37::bytes32 pool_genesis_of(const XmrNodeConfig& cfg) {
+    return g_pool_genesis ? *g_pool_genesis
+                          : c2pool::v37n::xmr::lineage::default_pool_genesis(lineage_network_byte(cfg.network));
+}
+static ::v37::bytes32 pool_tag_of(const XmrNodeConfig& cfg) {
+    return c2pool::v37n::xmr::lineage::pool_tag_for(cfg.lane_chain, cfg.lane_params, pool_genesis_of(cfg));
+}
 static bool split_hostport(const std::string& s, std::string& host, std::uint16_t& port) {
     const auto c = s.rfind(':');
     if (c == std::string::npos || c == 0 || c + 1 >= s.size()) return false;
@@ -408,6 +438,10 @@ struct ServeHooks {
     // good-citizen path.
     std::function<void()> inject_pump;
     std::function<void()> cba_tick;   //  per-loop digest ring + log
+    // COLD-BOOT-2: true while the settlement is booking a catch-up gap (the
+    // native download is paced by it): the loop then polls fast instead of
+    // every poll_ms, so the paced download is not throttled by the idle cadence.
+    std::function<bool()> catching_up;
     // GAP-2: every accepted share (stratum listener thread, or the main thread
     // for --mine hits), AFTER the publish sink saw it. Unset = no relay.
     std::function<void(const strat::AcceptedShare&)> on_share;
@@ -751,6 +785,16 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     static_cast<unsigned long long>(fs.orphaned),
                     static_cast<unsigned long long>(fs.refused),
                     fc.pending().size());
+        // SAME-BLOCK PAY-NOW audit line: the finalized partition and EffectiveOwed per
+        // key, so a run can reconcile paid on-chain == credited - outstanding owed.
+        {
+            const auto& L = node.ledger();
+            std::string fw, eo; long long eo_min = 0;
+            for (const auto& [k, v] : L.finalW()) fw += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            for (const auto& [k, v] : L.effective_owed_all()) { eo += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " "; if (v < eo_min) eo_min = v; }
+            std::printf("  ledger: seq=%llu owed_digest=%s eo_min=%lld finalW{ %s} eo{ %s}\n",
+                        static_cast<unsigned long long>(L.ledger_seq()), hex_of(L.owed_digest()).c_str(), eo_min, fw.c_str(), eo.c_str());
+        }
         // c2pool#1551. r7=0 is the claim that matters: it counts settlements the
         // same-height gate did not authorise, which is the only shape an
         // orphan-credit or a double-credit can take.
@@ -961,6 +1005,27 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         }
 #endif
     };
+    // RESUME-FRESH (xmr/xmr_lane_resume_fresh.hpp): the template is not refreshed while the
+    // lane is suspended, so on the resume edge the cached one still sits on the tip the
+    // suspension started at, and the listener serves parked logins the moment its gate
+    // opens. Rebuild it on the current tip FIRST (invalidate: a fresh assembly, the ledger
+    // may have moved too); the loop below reports it as the new template. A failed build
+    // HOLDS the gate closed and is retried every pass: no stale job is handed out.
+    bool resume_held_logged = false;
+    auto resume_refresh = [&]() -> bool {
+        if constexpr (requires { provider.invalidate(); }) provider.invalidate();
+        if (!provider.refresh()) {
+            if (!resume_held_logged)
+                std::printf("cba-ALARM: lane RESUME HELD: the template rebuild on the current tip failed (%s) -- the stratum "
+                            "gate stays closed until it succeeds (retried every pass; no stale job is handed out)\n",
+                            provider.last_error().c_str());
+            resume_held_logged = true;
+            return false;
+        }
+        if (resume_held_logged) std::printf("cba: lane RESUME no longer held: template rebuilt on the current tip\n");
+        resume_held_logged = false;
+        return true;
+    };
     auto apply_suspension = [&]() -> bool {
         if (!serving) return false;
         const std::uint64_t hw_now = node.hw().hw_height;
@@ -970,8 +1035,10 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         const bool contested = fc.options().contested_suspends && fc.contested();
         const auto e = lane_state.update(lag, fc.isolated(), fc.held_lag(), contested, fc.converging(), fc.diverged_halt());
         const bool lane_suspend = lane_state.suspended();
-        listener.set_lane_suspended(lane_suspend);   // edge-triggered inside (disconnect + park), gated (D4)
-        g_lane_suspended_now = lane_suspend;
+        // edge-triggered inside (disconnect + park), gated (D4); RESUME-FRESH: the resume edge
+        // opens the gate only after the template was rebuilt on the current tip.
+        const bool gate_closed = c2pool::v37n::xmr::apply_lane_gate(listener, lane_suspend, resume_refresh);
+        g_lane_suspended_now = gate_closed;
         using LS = c2pool::v37n::xmr::LaneSuspendState;
         auto cause_text = [](unsigned c) -> std::string {
             std::string t;
@@ -979,6 +1046,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             if (c & LS::kContested) t += " CONTESTED (>= 1/3 of the recent frontier lane blocks refused; operator opt-in --contested-suspend on);";
             if (c & LS::kHeld)      t += " HELD-LAG (an undecided lane block holds the cursor);";
             if (c & LS::kLag)       t += " LAG (finalize cursor behind the buried frontier);";
+            if (c & LS::kTest)      t += " TEST (FAULT-KNOB --test-suspend-lane-seconds, forced by SIGUSR2);";
             return t;
         };
         // D2 under ruling D-1 = C: CONVERGING / DIVERGED are ALARMS -- named and
@@ -1021,7 +1089,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                         LS::names(e.cleared).c_str(), LS::names(e.causes).c_str());
             std::fflush(stdout);
         }
-        return lane_suspend;
+        return gate_closed;
     };
     fc.set_isolation_hook([&](bool on, const std::string&) {
         if (!on || !serving) return;
@@ -1048,6 +1116,24 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     // D2: an own win published while the publisher had no relay peer (parked)
     // is ISOLATION-MARKED -- the first candidate refuse set of a re-derivation.
     if (publisher) fc.set_isolated_probe([p = publisher.get()](const std::string& bid) { return p->was_parked(bid); });
+    // FAULT-KNOB (TEST-ONLY): OFF unless --test-suspend-lane-seconds S > 0 (run_live
+    // refuses it on mainnet). Armed, SIGUSR2 raises the `test` cause for S s; the
+    // suspend and resume edges then go through apply_suspension() like any other cause.
+    c2pool::v37n::xmr::TestSuspendKnob test_knob(serving ? g_test_suspend_s : 0);
+    const auto knob_t0 = std::chrono::steady_clock::now();
+    auto knob_now_ms = [&]() {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - knob_t0).count());
+    };
+    if (test_knob.armed()) {
+        std::signal(SIGUSR2, on_sigusr2);
+        std::printf("lane: TEST knob ARMED: SIGUSR2 forces a lane suspension (cause=test) for %u s (--test-suspend-lane-seconds; "
+                    "test-only, refused on mainnet)\n", test_knob.seconds);
+        std::fflush(stdout);
+    } else if (g_test_suspend_s) {
+        std::printf("lane: TEST knob NOT armed: --test-suspend-lane-seconds needs a serving pool (%s)\n", not_served_reason);
+        std::fflush(stdout);
+    }
     std::uint64_t seen_relineage = fc.relineage_seq();
     while (!g_stop.load()) {
         pump_miner();       // --mine: hits first, so a find is bridged the same pass
@@ -1055,6 +1141,20 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         if (publisher) publisher->tick();   // parked (reached-nobody) blocks: bounded re-announce
         bridge_found();
         fc.tick();
+        if (test_knob.armed()) {   // FAULT-KNOB: never runs unless --test-suspend-lane-seconds S > 0
+            const std::uint64_t now_ms = knob_now_ms();
+            const auto ks = test_knob.step(g_test_suspend_req.exchange(false), now_ms, lane_state);
+            if (ks.fired)
+                std::printf("lane: TEST knob FIRED (SIGUSR2): forcing lane suspension cause=test for %u s (fire #%llu)\n",
+                            test_knob.seconds, static_cast<unsigned long long>(test_knob.n_fired));
+            if (ks.ignored)
+                std::printf("lane: TEST knob SIGUSR2 IGNORED: already forcing (%llu ms left; a fire never extends)\n",
+                            static_cast<unsigned long long>(test_knob.remaining_ms(now_ms)));
+            if (ks.released)
+                std::printf("lane: TEST knob RELEASED after %u s: cause=test cleared (release #%llu)\n",
+                            test_knob.seconds, static_cast<unsigned long long>(test_knob.n_released));
+            if (ks.fired || ks.ignored || ks.released) std::fflush(stdout);
+        }
         const bool lane_suspend = apply_suspension();   // right after the tick that may have decided it
         if (hooks.cba_tick) hooks.cba_tick();   // 
         // M3: THE cut. daemon-first keeps the monerod poll + seed backfill;
@@ -1108,7 +1208,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             last_status = std::chrono::steady_clock::now();
         }
         std::fflush(stdout);
-        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+        const bool fast = hooks.catching_up && hooks.catching_up();   // COLD-BOOT-2
+        std::this_thread::sleep_for(std::chrono::milliseconds(fast ? std::min<std::uint32_t>(poll_ms, 200) : poll_ms));
     }
 
     fc.set_isolation_hook({});   // R-C rework-2: the hook captures loop-scope state; detach before teardown
@@ -1226,6 +1327,10 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
             std::fprintf(stderr, "  node: %s\n", l.c_str());
         return nullptr;
     }
+    if (!why.empty())   // COLD-BOOT-2: start_and_wait proceeded with the catch-up paused at the settlement ceiling
+        std::printf("  native: %s -- proceeding: the serve loop books the post-anchor gap as it downloads "
+                    "(bounded batches, chain order); miners are parked until the arm is ready\n", why.c_str());
+    else
     std::printf("  native: template arm READY, fallback %s\n",
                 native->config().fallback
                     ? "ON (the daemon arm may serve if the native one loses a window)"
@@ -1236,6 +1341,12 @@ static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const Xmr
 }
 
 static int run_live(const XmrNodeConfig& cfg) {
+    // FAULT-KNOB (TEST-ONLY): refused outright on mainnet, before anything starts.
+    if (const std::string r = c2pool::v37n::xmr::TestSuspendKnob::refusal(cfg.network == MoneroNetwork::Mainnet, g_test_suspend_s);
+        !r.empty()) {
+        std::printf("REFUSED: %s\n", r.c_str());
+        return 2;
+    }
     // REGTEST-ONLY rig knobs (the receipt-feed carrier stand-in, the v0x02
     // fast-path file relay, and the amount-sensitivity falsifier) are fenced OFF
     // on mainnet: they simulate the not-yet-landed S-1 carrier relay and must
@@ -1358,6 +1469,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         node.set_native_chain_presence(chain_src.is_canonical);
         node.set_native_row_lookup(chain_src.bid_at);   // D2-0: reorg-in blocks below a Reorg tip reach the booking observer
+        // COLD-BOOT-2: the native tip (trimmed-row Unknown vs above-tip No; the native gap re-drive's reach)
+        node.set_native_tip_lookup([&chain_src]() -> std::uint64_t {
+            const auto t = chain_src.tip_block ? chain_src.tip_block() : std::nullopt;
+            return t ? t->first : 0;
+        });
     }
     // R-C rework-2 (F2): daemon-first re-drives every chain gap (downtime / a ZMQ
     // gap wider than the reconcile walk) through the booking path.
@@ -1369,6 +1485,33 @@ static int run_live(const XmrNodeConfig& cfg) {
         return 1;
     }
     for (const auto& line : node.construction_log()) std::printf("  %s\n", line.c_str());
+    // COLD-BOOT (1): a FRESH settlement store booting from an anchor starts its
+    // finalize cursor at H_a - D_conf (the value its first walk reaches anyway),
+    // BEFORE the first post-anchor block is pumped, so every post-anchor block is
+    // booked as it is pumped instead of DEFERRED behind a cursor at 0. A resumed
+    // store (#1767 restart, any cursor/event) is left exactly as recovered.
+    if (p2p_first && native && native->node()) {
+        // The index's anchor row: the f2 anchor on a fresh boot, the snapshot's
+        // base row after a snapshot resume (the seed basis either way: nothing at
+        // or below it is bookable in this process).
+        const std::uint64_t ha = native->node()->index().anchor_height();
+        const auto bo = native->node()->boot_origin();   // COLD-BOOT-3: print the two separately
+        const std::string origin = bo.resumed
+            ? "f2 anchor H_a=" + std::to_string(bo.boot_anchor_height) + ", snapshot resume base=" + std::to_string(bo.base) +
+              " tip=" + std::to_string(bo.tip)
+            : "f2 anchor H_a=" + std::to_string(bo.boot_anchor_height) + " (no snapshot resume)";
+        if (ha > cfg.d_conf) {
+            const bool seeded = node.seed_fresh_cursor(ha - cfg.d_conf);
+            std::printf("cold-boot: %s; index base %llu -> finalize cursor %s\n", origin.c_str(), static_cast<unsigned long long>(ha),
+                        seeded ? ("SEEDED at " + std::to_string(ha - cfg.d_conf) + " (fresh store)").c_str()
+                               : ("kept at " + std::to_string(node.finalize_driver().cursor_height()) + " (resumed store)").c_str());
+            // COLD-BOOT-4: a resumed cursor in the pre-anchor span re-drives from the f2 anchor.
+            if (!seeded && node.floor_resumed_scan(bo.boot_anchor_height))
+                std::printf("cold-boot-4: resumed cursor %llu is in the pre-anchor span of the f2 anchor %llu -> native scan starts at the anchor\n",
+                            static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
+                            static_cast<unsigned long long>(bo.boot_anchor_height));
+        }
+    }
 
     // ── wire 4: finalize connect (main thread) — BEFORE the listener and BEFORE
     //    the first pump_poll, so a pending FOUND from the sidecar is re-driven
@@ -1445,6 +1588,8 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t recompute_captured = 0, recompute_unavailable = 0, recompute_ok = 0, recompute_mismatch = 0;
     std::optional<::v37::ScriptRef> cba_payee_ref;
     std::uint64_t cba_fetches = 0, cba_booked = 0, cba_not_lane = 0, cba_refused = 0;
+    std::uint64_t cba_lineage_other[4] = {0, 0, 0, 0};   // POOL-LINEAGE: not-lane by class (own unused / foreign / untagged / malformed)
+    std::set<std::string> cba_lineage_seen;              // POOL-LINEAGE: bids logged once
     std::uint64_t cba_fetch_failed = 0;   // R-C rework-3 (D6): get_block transport/JSON failures -- transient, NOT refusals
     std::uint64_t cba_stale_root = 0;     // R-C rework-3 (D7): matched a historical root older than the age bound -> refused
 
@@ -1557,11 +1702,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         // fee model ON (S1/S4): the residual sink IS the donation address, and a lane coinbase
         // without the one mandatory donation output (owed + 1 + residual) is REFUSED here (every node,
         // own wins included). OFF: master's booking against the configured residual sink.
+        // POOL-LINEAGE: only a block carrying OUR pool_tag is a lane block; any
+        // other is "not-lane:" (an ordinary Monero block for this pool).
+        const ::v37::bytes32* ptag = cba_scfg->pool_tag ? &*cba_scfg->pool_tag : nullptr;
         if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))
             return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of(),
-                                                                          donation_net_of(cfg.network));
+                                                                          donation_net_of(cfg.network), ptag);
         return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
-                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of());
+                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of(), ptag);
     };
     // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
     // D6a: WHERE the blob comes from. p2p-first + native templates: the native chain
@@ -1582,6 +1730,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         },
         o2::CbaBlockSourceOptions{g_cba_monerod_compare, g_cba_monerod_fallback},
         [](const std::string& line) { std::printf("%s\n", line.c_str()); std::fflush(stdout); });
+    // COLD-BOOT (2): the safety net. A body the index connected but evicted before
+    // it was booked is fetched again over levin (bounded), never read from monerod.
+    if (cba_src.native_mode() && chain_src.want_body && g_cba_refetch_bound)
+        cba_src.set_refetch([&chain_src](const std::string& bid) { (void)chain_src.want_body(bid); }, g_cba_refetch_bound);
+    std::printf("cba: booking body refetch (levin) %s\n",
+                cba_src.refetch_armed() ? ("ARMED, bound " + std::to_string(g_cba_refetch_bound) + " requests/block").c_str() : "off");
     std::printf("cba: booking block source = %s (monerod compare oracle %s, monerod fallback %s)\n",
                 cba_src.native_mode() ? "NATIVE chain index (no get_block)" : "monerod get_block",
                 g_cba_monerod_compare ? "ON" : "off", g_cba_monerod_fallback ? "ON" : "off");
@@ -1701,6 +1855,40 @@ static int run_live(const XmrNodeConfig& cfg) {
                     (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), ids.size());
         std::fflush(stdout);
         return rv;
+    };
+    // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): book the block NET of what its coinbase
+    // already paid each payee out of THIS block's E_b. A pure function of the on-chain
+    // bytes (V37N base, outputs) and the fold at the on-chain cut: every node nets the
+    // same amounts. A coinbase that under-pays its own commitment is REFUSED.
+    std::uint64_t paynow_booked = 0, paynow_refused = 0;
+    unsigned long long paynow_netted_total = 0;
+    auto paynow_net = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
+                          Amounts& credit, Amounts& payout, std::string& why) -> bool {
+        namespace fee = ::c2pool::v37n::xmr::fee;
+        const bool fee_on = fee::fee_model_on(cfg.lane_params);
+        const ::v37::bytes32 sink_id = fee_on ? fee::donation_identity(donation_net_of(cfg.network)) : cba_scfg->residual_sink_identity;
+        const Amounts gross_credit = credit, gross_payout = payout;
+        const auto r = c2pool::v37n::xmr::paynow::net_booking(bk.paynow_base, bk.total, credit, payout, bk.sink_total, sink_id,
+                                                              fee_on ? static_cast<long long>(fee::kDonationDustPico) : 0);
+        if (!r.ok) {
+            ++paynow_refused; why = r.why;
+            std::printf("paynow-ALARM refused: h=%llu bid=%s… %s\n", static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), r.why.c_str());
+            std::fflush(stdout);
+            return false;
+        }
+        if (bk.paynow_base) {
+            ++paynow_booked; paynow_netted_total += static_cast<unsigned long long>(r.netted);
+            std::string al, gc, gp;
+            for (const auto& [k, v] : r.alloc) al += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            for (const auto& [k, v] : gross_credit) gc += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            for (const auto& [k, v] : gross_payout) gp += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " ";
+            std::printf("paynow-book: h=%llu bid=%s… total=%llu base=%llu pool=%llu netted=%lld sink_total=%lld alloc{ %s} gross_credit{ %s} gross_payout{ %s}\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), static_cast<unsigned long long>(bk.total),
+                        static_cast<unsigned long long>(*bk.paynow_base), static_cast<unsigned long long>(r.pool),
+                        r.netted, bk.sink_total, al.c_str(), gc.c_str(), gp.c_str());
+            std::fflush(stdout);
+        }
+        return true;
     };
     // (B) THE AUTHORITY: fold E_b at the ON-CHAIN cut, read back from OUR OWN ring. Never at a neighbouring prefix.
     auto fold_at_cut = [&](std::uint64_t reward, const c2pool::v37n::xmr::credit::CreditCut& cc, Amounts& credit, std::string& why,
@@ -1850,7 +2038,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                 // matched root but fail-closed on an output (unmapped payee): the
                 // mapped part is liability per payee, the unmapped sum unattributed.
                 if (bk.payout_partial) { payout = bk.payout; out.payout_decoded = true; out.unattributed_pico = bk.unmapped_total; }
-            } else ++cba_not_lane;
+            } else {
+                ++cba_not_lane;
+                if (bk.lineage_gated && bk.lineage != c2pool::v37n::xmr::credit::BlockLineage::Own) {   // POOL-LINEAGE
+                    ++cba_lineage_other[static_cast<std::size_t>(bk.lineage)];
+                    if (cba_lineage_seen.insert(bid).second)
+                        std::printf("cba: lineage h=%llu bid=%s… %s -> ordinary block (not booked, not held)\n",
+                                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(),
+                                    c2pool::v37n::xmr::credit::to_string(bk.lineage));
+                }
+            }
             return false;
         }
         // from here the payout side is fully decoded (proven coinbase authority, deterministic r)
@@ -1956,6 +2153,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                         wit->second.drops->delta.size(), csum, hex_of(wit->second.drops->enrollment_digest).substr(0, 12).c_str(),
                         hex_of(drops->core().enrollment().book_digest()).substr(0, 12).c_str(), rej.empty() ? "" : (" -- " + rej).c_str());
         }
+        if (!paynow_net(h, bid, bk, credit, payout, why)) { ++cba_refused; return false; }   // SAME-BLOCK PAY-NOW: book net
         // ★ DROPS: hand the node the price at THIS cut; XmrNode::on_network_block_won
         // (called by FinalizeConnect right after this returns) takes it, one-shot.
         if (drops_live) drops->set_cut_price(booking_price);
@@ -2019,6 +2217,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); return false; }
         if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
         if (!fold_at_cut(bk.total, bk.credit_cut, out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
+        if (!paynow_net(h, bid, bk, out.credit, payout, why)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
         std::printf("converge-decode: h=%llu bid=%s… booked under the SCRATCH lineage (candidate #%zu) P=%llu credit{ %s} payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.digest_index,
                     static_cast<unsigned long long>(bk.credit_cut.next_pos), amounts_str(out.credit).c_str(), amounts_str(payout).c_str());
@@ -2335,6 +2534,23 @@ static int run_live(const XmrNodeConfig& cfg) {
         // recon(A+B credit): the template commits THIS node's receipt-lane cut (P, spine) on-chain (0x02 tail)
         scfg.credit_cut_source = [&](std::uint64_t& P, ::v37::bytes32& dg) -> bool {
             auto s = node.engine().snapshot(cfg.lane_chain); if (!s) return false; P = s->next_pos; dg = s->digest; return true; };
+        // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
+        // and only blocks carrying it are booked as lane blocks here.
+        scfg.pool_tag = pool_tag_of(cfg);
+        std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
+                    hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
+                    hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
+        // SAME-BLOCK PAY-NOW (operator ruling 09-25, fee model ON and OFF): the projected
+        // payees of the SAME view fold_at_cut folds E_b at, so the builder pays exactly the
+        // E_b split every node books. No view at the cut / unratified geometry => no pay-now.
+        scfg.paynow_source = [&](std::uint64_t P, const ::v37::bytes32& dg, std::vector<settle::WeightedPayee>& out) -> bool {
+            bool mism = false;
+            auto view = node.engine().settlement_view_by_cut(cfg.lane_chain, P, dg, &mism);
+            if (!view || !settle::assert_ratified_geometry(*view, /*strict=*/true)) return false;
+            std::size_t unresolved = 0;
+            out = settle::project(*view, &unresolved);
+            return !out.empty();
+        };
         std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
@@ -2545,6 +2761,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // Tip-feed bookkeeping, main-thread-owned: what the native chain told
         // us, and what we did with it.
         std::uint64_t tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, tip_best = 0;
+        std::size_t   pumped_last = 0;   // COLD-BOOT-2: events drained on the last pump (catch-up fast poll)
 
         // ── GAP-2: the real sharechain relay (replaces --credit-feed / --wire-*) ──
         std::function<void(const strat::AcceptedShare&)> relay_on_share;
@@ -2687,6 +2904,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             // map_epoch/rb_index/stripe 0), carried in HELLO; a peer of another
             // pool is refused at HELLO as TAG_MISMATCH.
             ro.pool_id = relay::pool_id_of(cfg.lane_chain, cfg.lane_params);
+            ro.pool_id->genesis = pool_genesis_of(cfg);   // POOL-LINEAGE: another genesis = TAG_MISMATCH field=pool_genesis
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -2793,6 +3011,14 @@ static int run_live(const XmrNodeConfig& cfg) {
                     if (drops_live) drops->on_share_pushed(::v37::xmr::xmr_identity_key(a.r.payee), a.bin);   // ★ DROPS: S
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
+            // SMOKE-NOISE: a reloaded receipt's origin bin = its prev_id's height (lane-set digest only)
+            relay_ingest->set_bin_of([&](const relay::FbReceipt& r) -> std::optional<std::uint64_t> {
+                ::v37::xmr::verify::ParsedBlob pb;
+                if (!::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb)) return std::nullopt;
+                const auto c = relay_chain.lookup(pb.prev_id);
+                if (!c) return std::nullopt;
+                return c->height;
+            });
             const std::size_t reloaded = relay_ingest->reload([&](const relay::Admitted& a) {
                 relay_node->note_reloaded(a);
                 ledger.learn_ref(a.r.payee);
@@ -2817,7 +3043,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                             relay::hex32(ro.pool_id->lane_tag).c_str(), static_cast<unsigned>(cfg.lane_chain),
                             ro.pool_id->version, ro.pool_id->authority,
                             relay::hex32(::c2pool::v37n::rb::geometry_digest(cfg.lane_params)).c_str(),
-                            relay::kHelloBytesPoolId);
+                            relay::encode_hello(relay_node->our_hello()).size());
+                std::printf("relay: POOL-LINEAGE pool_genesis=%s in HELLO (+%zu B)\n",
+                            relay::hex32(*ro.pool_id->genesis).c_str(), relay::kHelloPoolGenesisBytes);
                 if (bind == relay::BindMode::None)
                     std::printf("relay: NOTE bind=none -- receipts are PoW-verified (opening -> tree_root -> RandomX >= share_diff) "
                                 "but the payee/give-author are NOT PoW-bound (run --relay-bind rbind: SEAM-1 writes rbind into the coinbase 0x02 region)\n");
@@ -3115,13 +3343,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return 2;
             }
             hooks.p2p_relay = native->node()->block_relay();
+            hooks.catching_up = [&]() { return pumped_last > 0 || (chain_src.catchup_held && chain_src.catchup_held()); };   // COLD-BOOT-2
 
             // THE TIP, from the chain we verified ourselves. Drained here, on
             // the main thread, at exactly the point in the loop where
             // pump_poll() used to issue get_miner_data -- one substitution, in
             // one place, so the RPC that is gone is gone by construction.
             hooks.pump_tip = [&]() {
-                for (const auto& ev : chain_src.drain()) {
+                // COLD-BOOT-2: the settlement's booked frontier paces the catch-up
+                // download (the index hands out at most frontier + window above it).
+                if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
+                const auto evs = chain_src.drain();
+                pumped_last = evs.size();
+                for (const auto& ev : evs) {
                     using K = node::MainchainEventKind;
                     if (ev.kind == K::Orphan) ++tip_orphans;
                     else {
@@ -3130,6 +3364,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     }
                     node.pump_mainchain_event(ev);
                 }
+                if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
                 // ★ DROPS: THE EX-ANTE CLOCK, from the SAME native tip, in the same
                 // place -- never the burial frontier, never a monerod poll.
                 if (drops_live && tip_best) { drops->observe_native_tip(tip_best); drops_try_enrol(); }
@@ -3197,6 +3432,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)relay_own_replay, (unsigned long long)relay_cut_repaired, (unsigned long long)relay_repair_rejected,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
+                {   // SMOKE-NOISE: the value nodes compare (order-free, xmr_receipt_ingest.hpp);
+                    // the ab-credit lane digest below is this node's push order (node-local by design)
+                    const std::uint64_t th = provider.current().height;
+                    const std::uint64_t through = th > g_relay_bin_lag + 1 ? th - g_relay_bin_lag - 1 : 0;
+                    const auto ls = relay_ingest->lane_set(through);
+                    std::printf("  relay-lane-set: through_bin=%llu n=%llu digest=%s… unbinned=%llu (compare THIS across nodes; lane digest = node-local order)\n",
+                                (unsigned long long)ls.through, (unsigned long long)ls.n,
+                                hex_of(ls.digest).substr(0, 16).c_str(), (unsigned long long)ls.unbinned);
+                }
                 if (relay_native_src) {   // D6b
                     const auto& fs = relay_native_feed.stats();
                     std::printf("  relay-feed: src=native tips=%llu reorg_tips=%llu headers=%llu seed_miss=%llu row_miss=%llu | "
@@ -3217,11 +3461,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cut_ok, (unsigned long long)cut_pending, (unsigned long long)cut_miss, (unsigned long long)cut_repaired, (unsigned long long)cut_mismatch, (unsigned long long)cut_absent, (unsigned long long)cut_fold_refused,
                             (unsigned long long)wire_tx, (unsigned long long)wire_rx, (unsigned long long)wire_prefold, (unsigned long long)wire_pending, (unsigned long long)wire_hit, (unsigned long long)wire_mismatch, (unsigned long long)wire_diverged,
                             last_credit_line.c_str());
-                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu\n",
+                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu | lineage foreign=%llu untagged=%llu malformed=%llu\n",
                             (unsigned long long)cba_fetches, (unsigned long long)cba_booked, (unsigned long long)cba_not_lane, (unsigned long long)cba_refused,
                             (unsigned long long)cba_fetch_failed, (unsigned long long)cba_stale_root,
                             cba_lane_root_unknown, cba_ring.size(), (unsigned long long)cba_max_root_age,
-                            (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch);
+                            (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch,
+                            (unsigned long long)cba_lineage_other[1], (unsigned long long)cba_lineage_other[2], (unsigned long long)cba_lineage_other[3]);
                 const auto& cs = cba_src.stats();
                 std::printf("  cba-src: %s native_hits=%llu native_hold=%llu holding=%zu get_block_rpc=%llu rpc_failed=%llu | compare equal=%llu MISMATCH=%llu unavailable=%llu | fallback_used=%llu\n",
                             cba_src.native_mode() ? "native" : "monerod",
@@ -3229,6 +3474,40 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cs.rpc_calls, (unsigned long long)cs.rpc_failed,
                             (unsigned long long)cs.compare_equal, (unsigned long long)cs.compare_mismatch, (unsigned long long)cs.compare_unavailable,
                             (unsigned long long)cs.fallback_used);
+                if (cba_src.refetch_armed()) {   // COLD-BOOT: evicted-body refetch (levin)
+                    std::uint64_t ia = 0, ir = 0; std::size_t io = 0;
+                    if (p2p_first && native && native->node()) {
+                        const auto bs = native->node()->index().booking_refetch_stats();
+                        ia = bs.asked; ir = bs.restored; io = bs.outstanding;
+                    }
+                    std::printf("  cba-refetch: requested=%llu restored_booked=%llu exhausted=%llu | index asked=%llu restored=%llu outstanding=%zu\n",
+                                (unsigned long long)cs.refetch_requested, (unsigned long long)cs.refetch_restored,
+                                (unsigned long long)cs.refetch_exhausted, (unsigned long long)ia, (unsigned long long)ir, io);
+                }
+                if (p2p_first && native && native->node()) {   // COLD-BOOT-2: pacing, snapshot, restart evidence
+                    auto* nn = native->node();
+                    const auto ss = nn->snapshot_stats();
+                    const auto t = nn->index().tip();
+                    const auto qs = nn->chain_event_queue_stats();   // COLD-BOOT-3
+                    const std::string lifted = nn->index().consumer_pacing_lifted_why();
+                    std::printf("  cold-boot-3: pacing %s | event queue dropped=%llu redriven=%llu unrecoverable=%llu high_water=%zu backpressure_engaged=%llu\n",
+                                lifted.empty() ? (nn->index().consumer_ceiling() ? "ACTIVE" : "off") : ("LIFTED (" + lifted + ")").c_str(),
+                                (unsigned long long)qs.dropped, (unsigned long long)qs.redriven, (unsigned long long)qs.unrecoverable,
+                                qs.high_water, (unsigned long long)qs.backpressure_engaged);
+                    const auto bt = nn->index().booking_tail_stats();   // COLD-BOOT-4
+                    std::printf("  cold-boot-4: booking tail kept=%zu lowest=%llu dropped=%llu%s\n", bt.kept, (unsigned long long)bt.lowest,
+                                (unsigned long long)bt.dropped,
+                                bt.dropped ? " | ALARM booking tail overflowed: the dropped heights are held (Unknown), never skipped" : "");
+                    std::printf("  cold-boot-2: cursor=%llu owed_digest=%s scan=%llu native_tip=%llu catchup_ceiling=%llu held=%d | snapshot ok=%llu FAILED=%llu%s%s | "
+                                "native_unknown=%llu replayed_below_boot_cursor=%llu late_unbooked=%llu\n",
+                                (unsigned long long)node.finalize_driver().cursor_height(),
+                                hex_of(node.ledger().owed_digest()).substr(0, 16).c_str(), (unsigned long long)node.scan_height(),
+                                (unsigned long long)(t ? t->height : 0), (unsigned long long)nn->index().consumer_ceiling(),
+                                nn->index().consumer_held() ? 1 : 0, (unsigned long long)ss.ok, (unsigned long long)ss.failed,
+                                ss.failed ? " last=" : "", ss.failed ? ss.last_failure.c_str() : "",
+                                (unsigned long long)node.gap_stats().native_unknown,
+                                (unsigned long long)fc.stats().replayed_below_boot_cursor, (unsigned long long)fc.stats().late_unbooked);
+                }
             }
             if (!last_shape.empty())
                 std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
@@ -3501,15 +3780,118 @@ static int run_live(const XmrNodeConfig& cfg) {
                          "no --payout-address", provider, template_source, candidate);
 }
 
+// ---------------------------------------------------------------------------
+// CLI-STRICT. main()'s parse loop used to IGNORE a token it did not know and
+// fill a missing value from a default, and std::stoul/stoull took "12abc" as
+// 12 and "-1" as 2^64-1. So `c2pool-v37-xmr --version` (no such flag then)
+// started a live stagenet node, and a typo in any flag started a node on
+// defaults -- on a mainnet host, a running node with a config nobody asked for.
+//
+// Now every token must be a known flag, a value flag must be followed by its
+// value (a token starting with "--" is the NEXT flag, not a value), and every
+// number or enumerated value must parse WHOLE. A violation is a usage error:
+// ONE line on stderr naming the flag and pointing at --help, exit 2. The loop
+// runs to completion before anything is constructed, so a usage error opens no
+// file and no socket. --version / -V print the build identity and exit 0, just
+// as early.
+// ---------------------------------------------------------------------------
+namespace cli_strict {
+
+constexpr int kUsageExit = 2;
+
+struct UsageError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+inline std::uint64_t to_u64(const std::string& flag, const std::string& v,
+                            std::uint64_t max = std::numeric_limits<std::uint64_t>::max()) {
+    std::uint64_t out = 0;
+    const char* b = v.data();
+    const char* e = b + v.size();
+    // from_chars on an unsigned type takes no sign, no whitespace, no prefix.
+    const auto r = std::from_chars(b, e, out);
+    if (v.empty() || r.ec != std::errc{} || r.ptr != e || out > max)
+        throw UsageError(flag + " wants an integer in [0, " + std::to_string(max) +
+                         "], got '" + v + "'");
+    return out;
+}
+
+inline std::int64_t to_i64(const std::string& flag, const std::string& v) {
+    std::int64_t out = 0;
+    const char* b = v.data();
+    const char* e = b + v.size();
+    const auto r = std::from_chars(b, e, out);
+    if (v.empty() || r.ec != std::errc{} || r.ptr != e)
+        throw UsageError(flag + " wants an integer, got '" + v + "'");
+    return out;
+}
+
+inline double to_double(const std::string& flag, const std::string& v) {
+    double out = 0;
+    const char* b = v.data();
+    const char* e = b + v.size();
+    const auto r = std::from_chars(b, e, out);
+    if (v.empty() || r.ec != std::errc{} || r.ptr != e || !std::isfinite(out))
+        throw UsageError(flag + " wants a number, got '" + v + "'");
+    return out;
+}
+
+inline const std::string& one_of(const std::string& flag, const std::string& v,
+                                 std::initializer_list<const char*> ok) {
+    std::string list;
+    for (const char* o : ok) {
+        if (v == o) return v;
+        list += (list.empty() ? "" : "|") + std::string(o);
+    }
+    throw UsageError(flag + " takes " + list + ", got '" + v + "'");
+}
+
+// on|off with the spellings the loop always took (off/0/false, on/1/true).
+inline bool on_off(const std::string& flag, const std::string& v) {
+    one_of(flag, v, {"on", "off", "1", "0", "true", "false"});
+    return !(v == "off" || v == "0" || v == "false");
+}
+
+// --version / -V: who this binary is, what it defaults to, and which bootstrap
+// it pins. Nothing is opened or started.
+inline void print_version() {
+    namespace nat = ::c2pool::xmr::native;
+    const XmrNodeConfig defaults;
+    std::printf("c2pool-v37-xmr %s\n", C2POOL_VERSION);
+    std::printf("network default: %s\n", to_string(defaults.network));
+    std::printf("pinned snapshot: mainnet height %llu (block %s); stagenet height %llu (block %s); "
+                "testnet, regtest: none\n",
+                static_cast<unsigned long long>(nat::PINNED_SNAPSHOT_MAINNET.height),
+                nat::PINNED_SNAPSHOT_MAINNET.block_id,
+                static_cast<unsigned long long>(nat::PINNED_SNAPSHOT_STAGENET.height),
+                nat::PINNED_SNAPSHOT_STAGENET.block_id);
+}
+
+}  // namespace cli_strict
+
 int main(int argc, char** argv) {
     XmrNodeConfig cfg;
     bool mock_smoke = false;
+    namespace cs = cli_strict;
 
+    std::string a;   // the flag being parsed (named by a usage error)
+    try {
     for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&](const char* def) -> std::string {
-            return (i + 1 < argc) ? argv[++i] : def;
+        a = argv[i];
+        // A value flag takes the NEXT token as its value; there must be one and
+        // it must not be the next flag. An explicitly empty value ("") is still
+        // a value -- rigs pass `--payout-address "$ADDR"`.
+        auto value = [&]() -> std::string {
+            if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0)
+                throw cs::UsageError(a + " wants a value");
+            return argv[++i];
         };
+        auto u64 = [&](std::uint64_t max = std::numeric_limits<std::uint64_t>::max()) {
+            const std::string v = value();
+            return cs::to_u64(a, v, max);
+        };
+        auto u32 = [&]() { return static_cast<std::uint32_t>(u64(std::numeric_limits<std::uint32_t>::max())); };
+        auto u16 = [&]() { return static_cast<std::uint16_t>(u64(std::numeric_limits<std::uint16_t>::max())); };
         // The embedded node's flags first, from the ONE function that owns
         // them (xmr_node_config.hpp). Keeping them here as a dozen more `else
         // if` arms is how --seeds and the gate 4 window came to be parsed
@@ -3517,95 +3899,108 @@ int main(int argc, char** argv) {
         {
             std::string ferr;
             const int used = apply_native_node_flag(cfg, argc, argv, i, ferr);
-            if (used < 0) { std::printf("REFUSED: %s\n", ferr.c_str()); return 2; }
+            if (used < 0) throw cs::UsageError(ferr);
             if (used > 0) { i += used - 1; continue; }
         }
         if (a == "--mock-smoke" || a == "--selftest") mock_smoke = true;
-        else if (a == "--network")  cfg.network = parse_net(next("stagenet"));
-        else if (a == "--rpc-host") cfg.monerod.rpc_host = next("127.0.0.1");
-        else if (a == "--rpc-port") cfg.monerod.rpc_port =
-                     static_cast<std::uint16_t>(std::stoi(next("38081")));
-        else if (a == "--zmq-port") cfg.monerod.zmq_port =
-                     static_cast<std::uint16_t>(std::stoi(next("38083")));
-        else if (a == "--stratum-port") cfg.stratum_bind_port =
-                     static_cast<std::uint16_t>(std::stoi(next("3333")));
-        else if (a == "--stratum-bind-host") cfg.stratum_bind_host = next("127.0.0.1");
-        else if (a == "--payout-address") cfg.payout_address = next("");
-        else if (a == "--share-diff") cfg.stratum_share_diff = std::stoull(next("0"));
-        else if (a == "--template-reserve") cfg.template_reserve_size =
-                     static_cast<std::uint32_t>(std::stoul(next("0")));
-        else if (a == "--poll-ms") cfg.poll_ms = static_cast<std::uint32_t>(std::stoul(next("5000")));
-        else if (a == "--status-every") cfg.status_every_s =
-                     static_cast<std::uint32_t>(std::stoul(next("30")));
+        else if (a == "--version" || a == "-V") { cs::print_version(); return 0; }
+        else if (a == "--network") {
+            const std::string m = value();
+            cs::one_of(a, m, {"stagenet", "testnet", "mainnet", "regtest"});
+            cfg.network = parse_net(m);
+        }
+        else if (a == "--rpc-host") cfg.monerod.rpc_host = value();
+        else if (a == "--rpc-port") cfg.monerod.rpc_port = u16();
+        else if (a == "--zmq-port") cfg.monerod.zmq_port = u16();
+        else if (a == "--stratum-port") cfg.stratum_bind_port = u16();
+        else if (a == "--stratum-bind-host") cfg.stratum_bind_host = value();
+        else if (a == "--payout-address") cfg.payout_address = value();
+        else if (a == "--share-diff") cfg.stratum_share_diff = u64();
+        else if (a == "--template-reserve") cfg.template_reserve_size = u32();
+        else if (a == "--poll-ms") cfg.poll_ms = u32();
+        else if (a == "--status-every") cfg.status_every_s = u32();
         else if (a == "--no-found-sidecar") cfg.found_sidecar = false;
-        else if (a == "--payee-spend-hex") cfg.payee_spend_key_hex = next("");
-        else if (a == "--payee-view-hex")  cfg.payee_view_key_hex = next("");
+        else if (a == "--payee-spend-hex") cfg.payee_spend_key_hex = value();
+        else if (a == "--payee-view-hex")  cfg.payee_view_key_hex = value();
         else if (a == "--payee-subaddress") cfg.payee_subaddress = true;
         else if (a == "--coinbase") {
-            const std::string m = next("monerod");
+            const std::string m = value();
+            cs::one_of(a, m, {"monerod", "v37", "settlement", "v37-settlement"});
             cfg.coinbase = (m == "v37" || m == "settlement" || m == "v37-settlement")
                                ? CoinbaseMode::V37Settlement : CoinbaseMode::MonerodTemplate;
         }
-        else if (a == "--residual-sink-spend-hex") cfg.residual_sink_spend_hex = next("");
-        else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = next("");
+        else if (a == "--residual-sink-spend-hex") cfg.residual_sink_spend_hex = value();
+        else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = value();
         else if (a == "--residual-sink-subaddress") cfg.residual_sink_subaddress = true;
         // fee model (LaneParams::fee, S4): off (default, master-identical) | v1
         else if (a == "--fee-model") {
-            const std::string m = next("off");
+            const std::string m = value();
             if (m == "off" || m == "0") cfg.lane_params.fee = ::v37::FeeModelGate{};
             else if (m == "v1" || m == "1") cfg.lane_params.fee = ::v37::FeeModelGate::for_version(1);
-            else { std::printf("REFUSED: --fee-model takes off|v1, got \"%s\"\n", m.c_str()); return 2; }
+            else throw cs::UsageError("--fee-model takes off|v1, got '" + m + "'");
         }
         // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
-        else if (a == "--give-author-pct")    g_give_author_pct = std::stod(next("0"));
-        else if (a == "--node-owner-fee-pct") g_owner_fee_pct = std::stod(next("0"));
-        else if (a == "--node-owner-address") g_owner_address = next("");
-        else if (a == "--settle-h-min") cfg.settle_h_min = std::stoull(next("0"));
-        else if (a == "--settle-output-cap") cfg.settle_output_cap =
-                     static_cast<std::uint32_t>(std::stoul(next("0")));
-        else if (a == "--owed-demo-amount") cfg.owed_demo_amount = std::stoull(next("0"));
+        else if (a == "--give-author-pct")    g_give_author_pct = cs::to_double(a, value());
+        else if (a == "--node-owner-fee-pct") g_owner_fee_pct = cs::to_double(a, value());
+        else if (a == "--node-owner-address") g_owner_address = value();
+        else if (a == "--settle-h-min") cfg.settle_h_min = u64();
+        else if (a == "--settle-output-cap") cfg.settle_output_cap = u32();
+        else if (a == "--owed-demo-amount") cfg.owed_demo_amount = u64();
         // recon(A+B credit) knobs
-        else if (a == "--credit-feed")        g_credit_feed = next("");
-        else if (a == "--credit-feed-lag-ms") g_credit_feed_lag_ms = std::stoull(next("0"));
-        else if (a == "--wire-out")           g_wire_out = next("");
-        else if (a == "--wire-in")            g_wire_in = next("");
-        else if (a == "--credit-mutate")      g_credit_mutate = std::stoll(next("0"));
+        else if (a == "--credit-feed")        g_credit_feed = value();
+        else if (a == "--credit-feed-lag-ms") g_credit_feed_lag_ms = u64();
+        else if (a == "--wire-out")           g_wire_out = value();
+        else if (a == "--wire-in")            g_wire_in = value();
+        else if (a == "--credit-mutate")      g_credit_mutate = cs::to_i64(a, value());
         else if (a == "--no-book-deferral")        g_no_book_deferral = true;
         else if (a == "--cba-monerod-compare")     g_cba_monerod_compare = true;
         else if (a == "--cba-monerod-fallback")    g_cba_monerod_fallback = true;
+        else if (a == "--cba-refetch-bound")      g_cba_refetch_bound = u64();
         else if (a == "--relay-feed-monerod-compare") g_relay_feed_monerod_compare = true;
         // GAP-2 relay knobs
-        else if (a == "--relay-listen")             g_relay_listen = next("");
-        else if (a == "--relay-peer")               g_relay_peers.push_back(next(""));
-        else if (a == "--drops-enrol")              g_drops_enrol.push_back(next(""));
-        else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = std::stoull(next("0"));
-        else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(std::stoull(next("8")));
-        else if (a == "--relay-index-horizon")      g_relay_horizon = std::stoull(next("64"));
-        else if (a == "--relay-rx-budget")          g_relay_rx_budget = next("1,20,16,256");
-        else if (a == "--relay-solicited-credits")  g_relay_solicited = static_cast<std::uint32_t>(std::stoul(next("256")));
-        else if (a == "--relay-backfill-positions") g_relay_backfill = std::stoull(next("2048"));
-        else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = static_cast<std::uint32_t>(std::stoul(next("60")));
-        else if (a == "--relay-order")              g_relay_order = next("canonical");
-        else if (a == "--relay-bin-lag")            g_relay_bin_lag = std::stoull(next("1"));
-        else if (a == "--relay-bin-grace-ms")       g_relay_grace_ms = static_cast<std::uint32_t>(std::stoul(next("4000")));
-        else if (a == "--relay-vault-entries")      g_relay_vault_entries = static_cast<std::size_t>(std::stoull(next("0")));
-        else if (a == "--relay-vault-bytes")        g_relay_vault_bytes = static_cast<std::size_t>(std::stoull(next("0")));
-        else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = std::stoull(next("0"));
+        else if (a == "--relay-listen")             g_relay_listen = value();
+        else if (a == "--pool-genesis") {           // POOL-LINEAGE
+            const std::string h = value();
+            ::v37::bytes32 g{};
+            if (!c2pool::v37n::xmr::lineage::parse_genesis_hex(h, g))
+                throw cs::UsageError("--pool-genesis wants 64 hex digits (the pool's 32-byte genesis id), got '" + h + "'");
+            g_pool_genesis = g;
+        }
+        else if (a == "--relay-peer")               g_relay_peers.push_back(value());
+        else if (a == "--drops-enrol")              g_drops_enrol.push_back(value());
+        else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
+        else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
+        else if (a == "--relay-index-horizon")      g_relay_horizon = u64();
+        else if (a == "--relay-rx-budget")          g_relay_rx_budget = value();
+        else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
+        else if (a == "--relay-backfill-positions") g_relay_backfill = u64();
+        else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = u32();
+        else if (a == "--relay-order")              g_relay_order = cs::one_of(a, value(), {"canonical", "arrival"});
+        else if (a == "--relay-bin-lag")            g_relay_bin_lag = u64();
+        else if (a == "--relay-bin-grace-ms")       g_relay_grace_ms = u32();
+        else if (a == "--relay-vault-entries")      g_relay_vault_entries = static_cast<std::size_t>(u64());
+        else if (a == "--relay-vault-bytes")        g_relay_vault_bytes = static_cast<std::size_t>(u64());
+        else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = u64();
         else if (a == "--no-relay-serve")           g_no_relay_serve = true;
-        else if (a == "--relay-test-partition-seconds") g_relay_partition_s = static_cast<std::uint32_t>(std::stoul(next("0")));
-        else if (a == "--relay-bind")               g_relay_bind = next("none");
-        else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = std::stoull(next("0"));
-        else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = std::stoull(next("20"));
-        else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = std::stoull(next("2"));
-        else if (a == "--contested-suspend") { const std::string v = next("on"); g_contested_suspend = !(v == "off" || v == "0" || v == "false"); }
-        else if (a == "--minority-converge") { const std::string v = next("on"); g_minority_mode = (v == "off" || v == "0" || v == "false") ? 0 : v == "halt-only" ? 2 : 1; }
-        else if (a == "--minority-window")       g_minority_window = static_cast<std::size_t>(std::stoull(next("8")));
-        else if (a == "--minority-min-blocks")   g_minority_min_blocks = static_cast<std::size_t>(std::stoull(next("3")));
-        else if (a == "--converge-retry-bound")  g_converge_retry_bound = std::stoull(next("600"));
-        else if (a == "--converge-hold-ticks")   g_converge_hold_ticks = std::stoull(next("0"));
-        else if (a == "--recon-max-root-age")      g_recon_max_root_age = std::stoull(next("0"));
+        else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
+        else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = u32();
+        else if (a == "--relay-bind")               g_relay_bind = cs::one_of(a, value(), {"none", "rbind"});
+        else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = u64();
+        else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = u64();
+        else if (a == "--divergence-cap-terminal") g_divergence_cap_terminal = u64();
+        else if (a == "--contested-suspend") g_contested_suspend = cs::on_off(a, value());
+        else if (a == "--minority-converge") {
+            const std::string v = value();
+            cs::one_of(a, v, {"on", "off", "halt-only", "1", "0", "true", "false"});
+            g_minority_mode = (v == "off" || v == "0" || v == "false") ? 0 : v == "halt-only" ? 2 : 1;
+        }
+        else if (a == "--minority-window")       g_minority_window = static_cast<std::size_t>(u64());
+        else if (a == "--minority-min-blocks")   g_minority_min_blocks = static_cast<std::size_t>(u64());
+        else if (a == "--converge-retry-bound")  g_converge_retry_bound = u64();
+        else if (a == "--converge-hold-ticks")   g_converge_hold_ticks = u64();
+        else if (a == "--recon-max-root-age")      g_recon_max_root_age = u64();
         else if (a == "--xmr-template-source") {
-            const std::string m = next("monerod");
+            const std::string m = cs::one_of(a, value(), {"monerod", "native"});
             cfg.template_source = (m == "native") ? TemplateSourceMode::Native
                                                   : TemplateSourceMode::Monerod;
         }
@@ -3614,58 +4009,52 @@ int main(int argc, char** argv) {
         // DOES own -- --native-connect/-anchor/-seeds, the gate 4 window, the
         // snapshot path, etc. -- was handled at the top of the loop and never
         // reaches these arms.
-        else if (a == "--native-output-set") cfg.native_output_set_path = next("");
+        else if (a == "--native-output-set") cfg.native_output_set_path = value();
         // The fully self-contained (peerless, daemonless) run. See
         // solo_refusal() in xmr_node_config.hpp for what it refuses and why.
         else if (a == "--native-solo") cfg.native_solo = true;
-        else if (a == "--native-dos-solicited-credits") cfg.native_dos_solicited_credits =
-                     static_cast<std::uint32_t>(std::stoull(next("8")));  // #1680 lever
+        else if (a == "--native-dos-solicited-credits") cfg.native_dos_solicited_credits = u32();  // #1680 lever
         else if (a == "--no-good-citizen") cfg.no_good_citizen = true;
         // OPERATOR TX-INJECTION (2026-09-19 ruling).
         else if (a == "--native-inject") cfg.native_inject = true;
-        else if (a == "--native-inject-dir")  cfg.native_inject_dir = next("");
-        else if (a == "--native-inject-hex")  cfg.native_inject_hex = next("");
-        else if (a == "--native-inject-ttl-blocks") cfg.native_inject_ttl_blocks =
-                     static_cast<std::uint64_t>(std::stoull(next("720")));
+        else if (a == "--native-inject-dir")  cfg.native_inject_dir = value();
+        else if (a == "--native-inject-hex")  cfg.native_inject_hex = value();
+        else if (a == "--native-inject-ttl-blocks") cfg.native_inject_ttl_blocks = u64();
         // M3 (R-ARMORDER, switchable): daemon-first stays the default.
         else if (a == "--arm-order") {
-            const std::string m = next("daemon-first");
+            const std::string m = cs::one_of(a, value(), {"daemon-first", "p2p-first", "p2p", "daemonless"});
             cfg.arm_order = (m == "p2p-first" || m == "p2p" || m == "daemonless")
                                 ? ArmOrderMode::P2PFirst : ArmOrderMode::DaemonFirst;
         }
         else if (a == "--no-daemon-rpc") cfg.no_daemon_rpc = true;
-        else if (a == "--lane-chain") cfg.lane_chain =
-                     static_cast<::v37::ChainId>(std::stoul(next("0")));
-        else if (a == "--d-conf") cfg.d_conf = std::stoull(next("60"));
+        else if (a == "--lane-chain") cfg.lane_chain = static_cast<::v37::ChainId>(u32());
+        else if (a == "--d-conf") cfg.d_conf = u64();
         // c2pool#1551: the same-height double-block tiebreak. One flag drives
         // BOTH levers -- the fork choice's D-14 build-on rule and the
         // accounting's nomination -- because two flags could disagree.
         else if (a == "--same-height-tiebreak") {
-            const std::string m = next("prefer-own");
-            if (!parse_tie_break(m, cfg.same_height_tiebreak)) {
-                std::printf("REFUSED: --same-height-tiebreak takes prefer-own or first-seen, "
-                            "not \"%s\" (refusing rather than picking a side for you)\n", m.c_str());
-                return 2;
-            }
+            const std::string m = value();
+            if (!parse_tie_break(m, cfg.same_height_tiebreak))
+                throw cs::UsageError("--same-height-tiebreak takes prefer-own or first-seen, not '" + m +
+                                     "' (refusing rather than picking a side for you)");
         }
-        else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s =
-                     static_cast<std::uint32_t>(std::stoul(next("240")));
-        else if (a == "--same-height-renotify") cfg.same_height_renotify =
-                     static_cast<std::uint32_t>(std::stoul(next("3")));
-        else if (a == "--same-height-journal") cfg.same_height_journal = next("");
-        else if (a == "--data-dir") cfg.settle_db_path = next("");
+        else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s = u32();
+        else if (a == "--same-height-renotify") cfg.same_height_renotify = u32();
+        else if (a == "--same-height-journal") cfg.same_height_journal = value();
+        else if (a == "--data-dir") cfg.settle_db_path = value();
         else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
         else if (a == "--randomx") cfg.randomx_enabled = true;
         else if (a == "--randomx-large-pages") cfg.randomx_large_pages = true;
         else if (a == "--mine") {
             cfg.mine_enabled = true;
             // The thread count is OPTIONAL and must not swallow the next flag.
+            // A token that starts with a digit IS the count, and must be one.
             if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
-                cfg.mine_threads = static_cast<unsigned>(std::stoul(next("0")));
+                cfg.mine_threads = u32();
         }
         else if (a == "--mine-threads") {
             cfg.mine_enabled = true;
-            cfg.mine_threads = static_cast<unsigned>(std::stoul(next("0")));
+            cfg.mine_threads = u32();
         }
         else if (a == "--mine-fast") { cfg.mine_enabled = true; cfg.mine_fast = true; }
         else if (a == "--mine-msr") cfg.mine_msr = true;
@@ -3675,6 +4064,8 @@ int main(int argc, char** argv) {
             std::printf(
                 "c2pool-v37-xmr (EXPERIMENTAL prototype; stagenet default)\n"
                 "  --mock-smoke                 network-free CI smoke (monerod stub), then exit\n"
+                "  --version, -V                print the version, the network default and the pinned\n"
+                "                               snapshot heights, then exit\n"
                 "  --network <stagenet|testnet|mainnet|regtest>   default stagenet\n"
                 "  --rpc-host <h>  --rpc-port <p>  --zmq-port <p>\n"
                 "  --lane-chain <id>  --d-conf <n>  --poll-ms <ms>  --status-every <s>\n"
@@ -3699,6 +4090,9 @@ int main(int argc, char** argv) {
                 "  --minority-min-blocks <n>    D2 no decision on fewer decided lane blocks (default 3)\n"
                 "  --converge-retry-bound <n>   D2 undecidable re-derivation attempts before DIVERGED (600)\n"
                 "  --converge-hold-ticks <n>    TEST knob: CONVERGING holds n ticks before the first attempt\n"
+                "  --test-suspend-lane-seconds <S>  TEST-ONLY fault knob (default 0 = off, no handler): SIGUSR2\n"
+                "                               forces a lane suspension (cause=test) for S s, then releases\n"
+                "                               it (same suspend/resume path as lag/held); refused on mainnet\n"
                 "  --recon-max-root-age <n>     R-C rework-3 (D7): never credit a matched historical root\n"
                 "                               older than n heights from the block's builder cut\n"
                 "                               (default 4*D_conf; 0 = unbounded, the rework-2 behaviour)\n"
@@ -3706,6 +4100,9 @@ int main(int argc, char** argv) {
                 "                               (pre-R6; a lagging receiver then FORKS owed_digest)\n"
                 "  --cba-monerod-compare        p2p-first: ALSO fetch each booked block from monerod and\n"
                 "                               count equal/mismatch (compare-only oracle; never decides)\n"
+                "  --cba-refetch-bound <n>      p2p-first: a booking whose body the native index evicted asks the\n"
+                "                               node to refetch it over levin, up to <n> requests per block\n"
+                "                               (default 120; 0 = off: the block HOLDS as before)\n"
                 "  --cba-monerod-fallback       p2p-first: a block the native index no longer holds is read\n"
                 "                               from monerod instead of HELD (explicit opt-in; default HOLD)\n"
                 "  --relay-feed-monerod-compare p2p-first: ALSO fetch the relay chain-view window from monerod\n"
@@ -3721,6 +4118,10 @@ int main(int argc, char** argv) {
                 "  --data-dir <path>            override the settlement store dir\n"
                 " GAP-2 receipt relay (c2pool<->c2pool over TCP; OFF by default; --coinbase v37; mainnet only with rbind):\n"
                 "  --relay-listen HOST:PORT     bind the receipt relay\n"
+                "  --pool-genesis <hex64>       POOL-LINEAGE: this pool's 32-byte genesis id (default: the fixed per-network\n"
+                "                               id = the ONE default pool); every node of a pool runs the same id, a new pool\n"
+                "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT'||lane_tag||id)\n"
+                "                               is committed in every lane coinbase; blocks without OUR tag are ordinary blocks\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
                 "  --drops-enrol ID|ADDR        DROPS (only in a V37_ACTIVATE_CONSENSUS_V1 build): enrol this payee (64-hex identity\n"
                 "                               key or XMR address) ex ante at the native TIP (repeatable); ignored when dormant\n"
@@ -3803,7 +4204,12 @@ int main(int argc, char** argv) {
                 "  --native-p2p-bind <ip>       source address for the node's outbound dials\n"
                 "  --native-anchor <path>       trust-anchor bundle (cold start above genesis)\n"
                 "  --native-output-set <path>   format-2 output-set snapshot: seed the historical\n"
-                "                               set so pre-anchor (below-base) rings resolve\n"
+                "                               set so pre-anchor (below-base) rings resolve.\n"
+                "                               WITHOUT --native-anchor the node boots from this\n"
+                "                               release's compiled-in PINNED anchor (mainnet,\n"
+                "                               stagenet) and refuses a snapshot whose size or\n"
+                "                               sha256 is not the pinned one\n"
+                "                               (docs/xmr-lane/PINNED-SNAPSHOTS.md)\n"
                 "  --anchor-confirm-peers <n>   GATE 4: distinct peers to ask before the anchor is\n"
                 "                               refused by exhaustion (default 4, minimum 1)\n"
                 "  --anchor-confirm-peer-ms <ms>  GATE 4: one peer's turn (default 12000)\n"
@@ -3822,6 +4228,10 @@ int main(int argc, char** argv) {
                 "                               boot. Default: no persistence.\n"
                 "  --native-snapshot-every <s>  periodic save cadence (default 300; 0 = only on a\n"
                 "                               clean stop)\n"
+                "  --native-catchup-window <n>  p2p-first anchor boot: download the catch-up gap at most <n>\n"
+                "                               heights above the settlement's finalize cursor, so the gap is\n"
+                "                               booked as it downloads (default 256; 0 = off: the whole gap is\n"
+                "                               downloaded first and rows past the 2048 retention are lost)\n"
                 "  --native-force-synced        set the publication gate on a private chain (OR-C2-8)\n"
                 "  --native-solo                FULLY SELF-CONTAINED (regtest only): no peers, no\n"
                 "                               daemon, no anchor. The chain starts at the locally\n"
@@ -3890,6 +4300,16 @@ int main(int argc, char** argv) {
                 "                               status tick; never on the find path, never decides).\n");
             return 0;
         }
+        else if (a.rfind("-", 0) == 0) throw cs::UsageError("unknown option '" + a + "'");
+        else throw cs::UsageError("unexpected argument '" + a + "'");
+    }
+    } catch (const cs::UsageError& e) {
+        std::fprintf(stderr, "c2pool-v37-xmr: %s (see c2pool-v37-xmr --help)\n", e.what());
+        return cs::kUsageExit;
+    } catch (const std::exception& e) {   // backstop: nothing a flag carries may abort the process
+        std::fprintf(stderr, "c2pool-v37-xmr: %s: bad value (%s) (see c2pool-v37-xmr --help)\n",
+                     a.c_str(), e.what());
+        return cs::kUsageExit;
     }
 
     // Default monerod ports follow the chosen network unless overridden. If the

@@ -28,6 +28,13 @@
 //       frame and a Family-A 0x02 frame (counted), (b) charged a structural
 //       strike -- and NO RandomX evaluation -- for a tampered receipt, (c)
 //       BANNED and disconnected after one confirmed invalid PoW
+//   M7  refused ORDER: a peer whose frame vault has evicted lane position 0
+//       answers GETORDER [0,P) with BELOW_HORIZON. The relay repair sets that
+//       peer aside (repair_peer_fail) and reports Exhausted; it never takes
+//       the empty refused order for progress and never re-asks the same peer
+//       (exactly ONE GETORDER reaches it). SupplyRequester hands a non-OK
+//       ORDER to the order callback as well as to on_fail; the relay must act
+//       on the failure only.
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -280,6 +287,46 @@ int main() {
           "M6 invalid PoW (RandomX below share_diff, confirmed by re-hash): BANNED + disconnected");
         C(s.rx_invalid.load() >= 1 && !B.relay->known(inv.id), "M6 the invalid receipt was never admitted");
         evil.stop();
+    }
+
+    // ── M7 a refused (BELOW_HORIZON) ORDER sets the serving peer aside ──────
+    {
+        RelayOptions xo = opts(true, {});
+        xo.vault.horizon_positions = 2;           // X keeps only its newest positions
+        TNode X("X", xo, XmrReceiptIngest::Order::Canonical);
+        C(X.relay->start(why), "M7 X starts (vault horizon 2 positions) " + why);
+        TNode Y("Y", opts(false, {X.relay->listen_port()}), XmrReceiptIngest::Order::Canonical);
+        C(Y.relay->start(why), "M7 Y starts, dials X " + why);
+        std::vector<TNode*> xy{&X, &Y};
+        C(wait_for([&] { return X.relay->ready_peers().size() == 1 && Y.relay->ready_peers().size() == 1; }, xy),
+          "M7 X-Y up");
+        for (auto* n : xy) { for (int i = 0; i < 4; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
+        const SynthBlock blkX = make_block(100, prev[0], 5, nullptr, 2, 14);
+        for (std::uint32_t k = 0; k < 6; ++k) X.relay->submit_own(own(blkX, 50 + k, pA));
+        for (auto* n : xy) n->template_height = 101;
+        C(wait_for([&] { return X.next_pos() == 6 && Y.next_pos() == 6; }, xy), "M7 X and Y both push 6 receipts");
+        const u64 PX = X.next_pos();
+        bytes32 spineX = X.digest(); spineX[1] ^= 0x33;   // a cut Y does not hold: Y must repair it from X
+        const auto& ys = Y.relay->stats();
+        const u64 fail0 = ys.repair_peer_fail.load();
+        const u64 ord0 = Y.relay->requester()->stats().orders_requested;
+        XmrRelayNode::RepairState st = XmrRelayNode::RepairState::Pending;
+        const bool exhausted = wait_for([&] {
+            st = Y.relay->repair_poll(PX, spineX, 0, nullptr);
+            return st == XmrRelayNode::RepairState::Exhausted; }, xy, 8000ms);
+        const u64 fails = ys.repair_peer_fail.load() - fail0;
+        const u64 orders = Y.relay->requester()->stats().orders_requested - ord0;
+        std::this_thread::sleep_for(300ms);
+        for (int i = 0; i < 10; ++i) { (void)Y.relay->repair_poll(PX, spineX, 0, nullptr); X.pump(); Y.pump(); std::this_thread::sleep_for(20ms); }
+        const u64 orders_after = Y.relay->requester()->stats().orders_requested - ord0;
+        C(exhausted, "M7 the repair against a peer below its horizon ends Exhausted (every ready peer tried)");
+        C(fails >= 1 && ys.repair_ready.load() == 0,
+          "M7 the BELOW_HORIZON answer set X aside (repair_peer_fail +" + std::to_string(fails) + "), never Ready");
+        C(orders == 1 && orders_after == 1,
+          "M7 X was asked for the order exactly once (" + std::to_string(orders) + ", then " +
+          std::to_string(orders_after) + " after more polls): the empty refused order is not taken for progress "
+          "and re-asked");
+        X.relay->set_dialing(false); Y.relay->set_dialing(false);
     }
 
     for (auto* n : all) n->dump_logs();

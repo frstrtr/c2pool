@@ -378,7 +378,8 @@ struct SubthresholdParams {
     bool enabled = false;                       // ★ DEFAULT OFF (RDWR-OQ2)
     std::uint32_t K = 4;                         // digest-committed; K>=3 guard
     CreditMode mode = CreditMode::EstimateOnly;
-    // J < K (fewer than K near-misses) => 0 credit (no fallback inflation).
+    // J < K (fewer than K near-misses) => not estimable: no delta and the share
+    // credit is kept (DROPS-JK). No fallback inflation, no share removal.
 };
 
 // The dedup key for interval-straddle protection: estimate-dedup is per
@@ -396,7 +397,7 @@ struct DedupKey {
 // ── the shared arithmetic core of the credit rule ─────────────────────────
 // The two quantities a harvested interval contributes, both as HASH COUNTS and
 // both out of the SAME ReceiptCollector in the SAME call:
-//   est      Hhat — the estimate of the interval's work. ZERO when J < K.
+//   est      Hhat — the estimate of the interval's work (J >= K only).
 //   covered  W_shares = S*T — the work the payee's in-interval shares already
 //            earned, which the E_b row has already paid for.
 // The composition is always est - covered, in whatever unit the caller
@@ -411,10 +412,25 @@ struct DedupKey {
 //                          S*T path untouched; DROPS simply does not apply to
 //                          it. This is not "credited zero" — nothing is
 //                          replaced and nothing is removed.
-//   enrolled == true   ->  ALWAYS credited: including when J < K (est == 0, so
-//                          the interval's whole share work comes back out), and
+//   enrolled == true   ->  credited whenever the interval is ESTIMABLE (J >= K),
 //                          including when est < covered (a NEGATIVE delta). The
-//                          enrolled payee takes the downside.
+//                          enrolled payee takes the downside of the estimate.
+//
+// ★★ DROPS-JK (operator ruling 09-25): J < K IS NOT ESTIMABLE, NOT "Hhat == 0".
+// With fewer than K near-misses there is no h_(K), so there is no estimate of
+// the interval's work at all. The interval is therefore NOT credited: no delta,
+// nothing replaced, and the payee's real share credit S*T stays in E_b exactly
+// as the ordinary share path paid it. Treating such an interval as zero
+// estimated work and still REPLACING would remove real, already-earned share
+// credit on no evidence — which is what drove the gate-ON net sub-threshold
+// credit NEGATIVE for every enrolled payee on the XDW regtest verify. This is
+// the answer the reference apply_credit() below has always given (J < K => no
+// delta), and it is enforced here, in the shared core, so the shipped seam and
+// the reference cannot drift on it again. Like the other early-outs above the
+// dedup mark, a not-estimable interval does not consume its dedup key.
+// Stated, not hidden: the composition is now conditional on J >= K, so the
+// zero-expectation statement below holds for the estimable intervals and is no
+// longer an exact identity over ALL of an enrolled payee's intervals.
 // Because the choice is made before the draw and cannot be revisited, its
 // expected value is the unconditional one — E[Hhat_comb - W_shares] == 0 by the
 // exact unbiasedness of Hhat — flat in the number of identities. The SELECTIVE
@@ -424,7 +440,7 @@ struct DedupKey {
 // through.
 struct IntervalWork {
     bool credited = false;   // this interval contributes a delta at all
-    u320 est{};              // Hhat      (0 when J < K)
+    u320 est{};              // Hhat      (credited only when J >= K)
     u320 covered{};          // W_shares = S*T
 };
 
@@ -437,6 +453,9 @@ inline IntervalWork interval_work(const SubthresholdParams& p, const DedupKey& k
     if (!k_guard_ok(p.K)) return w;               // K >= 3 guard
     if (already_seen.count(key)) return w;        // straddle dedup, per (payee,seq)
     if (!enrolled) return w;                      // ★ R-SYBIL: DROPS never applies
+    if (!rc.has_K()) return w;                    // ★ DROPS-JK: J < K => not
+                                                  //   estimable: no delta, the
+                                                  //   share credit is kept
     if (p.mode == CreditMode::EstimateOnly) {
         // EstimateOnly refuses a COVERED interval outright: there is nothing to
         // replace and no second estimate to credit beside the shares. The canon
@@ -445,12 +464,12 @@ inline IntervalWork interval_work(const SubthresholdParams& p, const DedupKey& k
         if (rc.shares() > 0) return w;
         already_seen[key] = true;
         w.credited = true;
-        if (rc.has_K()) w.est = estimate_hashes(p.K, rc.h_K());
+        w.est = estimate_hashes(p.K, rc.h_K());
         return w;
     }
     already_seen[key] = true;                     // Combined (sybil-neutral)
     w.credited = true;
-    if (rc.has_K()) w.est = estimate_combined(rc.shares(), p.K, rc.h_K());
+    w.est = estimate_combined(rc.shares(), p.K, rc.h_K());
     w.covered = share_covered_work(rc.shares(), rc.target_hash());
     return w;
 }

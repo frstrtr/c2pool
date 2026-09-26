@@ -752,9 +752,9 @@ int main() {
         check(delta.count(ID_A) == 1 && delta.at(ID_A) > 0,
               "★ A (drop-only, enrolled) is CREDITED: the participation case DROPS "
               "exists for, and the whole point of the wiring");
-        check(delta.count(ID_C) == 1 && delta.at(ID_C) < 0,
-              "★ C (enrolled, J < K) is composed NEGATIVE: Hhat is 0 and its whole "
-              "share work comes back out — the downside enrolment accepts");
+        check(delta.count(ID_C) == 0,
+              "★ C (enrolled, J < K) contributes NO delta: the interval is not "
+              "estimable, so its share credit is KEPT (DROPS-JK, ruled 09-25)");
         check(delta.count(ID_D) == 0,
               "★ D is NOT ENROLLED and contributes NOTHING — not a zero row, "
               "nothing: it keeps its ordinary S*T path, untouched");

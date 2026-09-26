@@ -705,6 +705,18 @@ int main(int argc, char** argv) {
                     if (s && s->next_pos == pos) return s->digest;
                     return std::nullopt;
                 });
+            // ★ THE CUT PROBE (F-2's cheap half). The snapshot probe above can
+            // only speak about the lane's CURRENT tip, so a node that published
+            // the asked cut minutes ago asserts nothing about it and the asker
+            // has to fetch the whole prefix to find out. This answers at any
+            // RETAINED prefix: "yes, I published exactly (pos, your spine)".
+            // Positive-only — a false asserts nothing — and read-only against
+            // the engine's own ring.
+            supply_serve->set_cut_probe(
+                [&](std::uint32_t, std::uint64_t pos, const ::v37::bytes32& spine) {
+                    return node.engine().settlement_view_by_cut(cfg.lane_chain, pos, spine)
+                           != nullptr;
+                });
 
             // The w6 §5 slow path over our OWN retained order: the same reader +
             // driver the repair uses, bound here to the LIVE vault so the local
@@ -911,20 +923,40 @@ int main(int argc, char** argv) {
                             // S3 re-drive above credits this very block, and if
                             // it does not, the refusal stands exactly as it is.
                             //
-                            // ANY connected peer can serve the prefix (it is the
-                            // sharechain's order, not one node's opinion), so we
-                            // ask the first that accepts the request.
+                            // ── ★ F-2: ASK THE PEER THAT HOLDS THE CUT ───────
+                            // "ANY connected peer can serve the prefix (it is
+                            // the sharechain's order, not one node's opinion)"
+                            // is not true under ruling A: the ordered prefix is
+                            // NODE-LOCAL, so a peer that dropped the same share
+                            // holds a different order, serves it honestly, and
+                            // the replay lands on a different digest. Arming at
+                            // the first peer that merely ACCEPTS decided the
+                            // repair by transport order and refused almost all
+                            // of them.
+                            //
+                            // The winner's PEER ID is not derivable here — the
+                            // v0x02 descriptor carries no winner identity, and
+                            // the carrier inbound seam is not peer-attributed —
+                            // so we hand the driver the whole connected set as
+                            // an ORDERED CANDIDATE LIST. It asks them in turn
+                            // and moves on the moment one shows it cannot serve
+                            // this cut (a different lane digest asserted at P, a
+                            // refusal below its horizon, or a replay that lands
+                            // elsewhere), which selects the winner — or anyone
+                            // whose lane agrees with the winner at P — without
+                            // having to name it. Bounded: each candidate is
+                            // tried at most once.
                             bool armed = false;
                             if (repair_driver) {
-                                for (const auto pid : carrier_net->peer_ids()) {
-                                    if (repair_driver->arm(pid, w.bid, w.cut_next_pos,
-                                                           w.cut_spine_digest)) {
-                                        armed = true;
-                                        repair_armed.fetch_add(1, std::memory_order_relaxed);
-                                        LOG_INFO << "[v37-dash] S-1c REPAIR armed for " << w.bid
-                                                 << " at P=" << w.cut_next_pos << " via peer " << pid;
-                                        break;
-                                    }
+                                const auto cands = carrier_net->peer_ids();
+                                if (!cands.empty() &&
+                                    repair_driver->arm_candidates(cands, w.bid, w.cut_next_pos,
+                                                                  w.cut_spine_digest)) {
+                                    armed = true;
+                                    repair_armed.fetch_add(1, std::memory_order_relaxed);
+                                    LOG_INFO << "[v37-dash] S-1c REPAIR armed for " << w.bid
+                                             << " at P=" << w.cut_next_pos << " over "
+                                             << cands.size() << " candidate peer(s)";
                                 }
                             }
                             if (!armed) {
@@ -1285,11 +1317,15 @@ int main(int argc, char** argv) {
                 LOG_INFO << "[v37-dash] supply stop: serve{order=" << sv.order_served
                          << " order_ids=" << sv.order_ids << " frames=" << sv.frames_served
                          << " bytes=" << sv.bytes_served << " throttled=" << sv.throttled
+                         << " throttled_replied=" << sv.throttled_replied
                          << " truncated=" << sv.frames_truncated
                          << " unservable=" << sv.frames_unservable << "}"
                          << " fetch{orders=" << fs.orders_ok << " frames=" << fs.frames_verified
                          << " hash_mismatch=" << fs.hash_mismatch << " missing=" << fs.missing_id
-                         << " timeouts=" << fs.timeouts << "}";
+                         << " timeouts=" << fs.timeouts
+                         << " throttled=" << fs.throttled_replies
+                         << " retries=" << fs.throttle_retries
+                         << " retry_exhausted=" << fs.throttle_exhausted << "}";
                 // ★ THE CONVERGENCE LINE an operator reads: how many peer-block
                 // cuts this node could not fold at, how many a REPLAY repaired,
                 // and how many stayed refused (each of those is one block whose
@@ -1303,8 +1339,15 @@ int main(int argc, char** argv) {
                          << " redrives=" << rp.redriven
                          << " frames_fetched=" << rp.frames_fetched
                          << " order_failed=" << rp.order_failed
+                         // ★ F-4: of those, the ones the serving vault's
+                         // retention window refused. This was structurally 0.
+                         << " (below_horizon=" << rp.order_below_horizon << ")"
                          << " fetch_failed=" << rp.fetch_failed
                          << " unservable=" << rp.unservable
+                         // ★ F-2: how the candidate walk actually went.
+                         << " | candidates{retried=" << rp.peer_retried
+                         << " spine_refused=" << rp.spine_refused
+                         << " exhausted=" << rp.candidates_out << "}"
                          // ── the one-serving-peer QUEUE, as an operator reads it ──
                          // deferred/resumed are the ordinary 2-node traffic; a
                          // non-zero deferred_drop or a non-empty queue_depth at

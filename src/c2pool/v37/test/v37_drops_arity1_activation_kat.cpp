@@ -359,19 +359,21 @@ static std::map<bytes32, long long> spec_credit(
         // R-SYBIL: an identity that did NOT commit before the interval is not a
         // DROPS participant at all — it keeps its ordinary S*T path.
         if (!ctx.enrolled(hr.payee, hr.interval)) continue;
+        // DROPS-JK (ruled 09-25): J < K is NOT ESTIMABLE — no delta, the share
+        // credit is kept, and the dedup key is not consumed.
+        if (rc.near_miss_count() < g.K) continue;
         if (g.mode != 1 && rc.shares() > 0) continue; // EstimateOnly refuses covered
         seen[key] = true;
         sub::u320 e{}, w{};
         if (g.mode == 1) {                            // Combined (the canon rule)
-            if (rc.near_miss_count() >= g.K)
-                e = sub::estimate_combined(rc.shares(), g.K, rc.h_K());
+            e = sub::estimate_combined(rc.shares(), g.K, rc.h_K());
             // REPLACE: Hhat_comb covers the WHOLE interval, so the interval's
             // share-derived contribution W_shares = S*T comes back out.
             if (rc.shares() > 0)
                 w = sub::divfloor(sub::coeff_times_2_256(rc.shares()),
                                   sub::promote(rc.target_hash()));
         } else {                                      // EstimateOnly
-            if (rc.near_miss_count() >= g.K) e = sub::estimate_hashes(g.K, rc.h_K());
+            e = sub::estimate_hashes(g.K, rc.h_K());
         }
         // R1: BOTH sides go through the ORDINARY share -> E_b conversion and are
         // then subtracted. Converting each side separately (not the difference)
