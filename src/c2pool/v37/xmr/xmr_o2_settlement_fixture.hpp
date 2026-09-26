@@ -396,7 +396,13 @@ public:
     explicit XmrOwedFixture(::v37::ChainId chain) : m_ledger(chain) {}
     //  wrap the NODE's live OwedLedger (FOUND/FINALIZE/ORPHAN land there).
     explicit XmrOwedFixture(OwedLedger& ext) : m_ledger(ext.chain()), m_ext(&ext) {}
-    void learn_ref(const ::v37::ScriptRef& pay) { m_paymap[::v37::xmr::xmr_identity_key(pay)] = pay; }
+    // true = the resolver did not hold this ref yet (REJOIN-PAYEE counts what a cut taught it)
+    bool learn_ref(const ::v37::ScriptRef& pay) {
+        auto& slot = m_paymap[::v37::xmr::xmr_identity_key(pay)];
+        const bool fresh = !(slot == pay);
+        slot = pay;
+        return fresh;
+    }
     std::vector<::v37::bytes32> keys() const { std::vector<::v37::bytes32> v; for (const auto& [k, r] : m_paymap) { (void)r; v.push_back(k); } return v; }
 
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key

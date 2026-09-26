@@ -750,6 +750,33 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_paynow_lineage_kat COMMAND v37_xmr_paynow_lineage_kat)
 
     # ------------------------------------------------------------------
+    # REJOIN-PAYEE (xmr/xmr_cut_payees.hpp): a node that joined late or was
+    # restarted after a downtime resolves a pay-now lane block's outputs
+    # against the payees of the block's OWN on-chain credit cut before the
+    # fail-closed refusal ("output N maps to no known payee" -> NODE-LOCAL
+    # liability; flip 0: the owed ledger left the others' and the finalize
+    # cursor was HELD for good). A cut not readable yet = UNDECIDED
+    # (cut-pending), a genuine stranger output stays refused. REAL assembled
+    # blocks, same link shape as the pay-now lineage KAT (listed in BOTH
+    # build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_rejoin_payee_kat
+        v37_xmr_rejoin_payee_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_rejoin_payee_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_rejoin_payee_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_rejoin_payee_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_rejoin_payee_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_rejoin_payee_kat COMMAND v37_xmr_rejoin_payee_kat)
+
+    # ------------------------------------------------------------------
     # GAP-2 stage 1 -- the real c2pool-to-c2pool XMR receipt relay
     # (src/c2pool/v37/xmr/relay/, docs/xmr-lane/gap2-sharechain-relay-design.md).
     #

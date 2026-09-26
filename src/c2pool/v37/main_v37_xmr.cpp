@@ -94,6 +94,7 @@
 #include "xmr/xmr_stratum_listener.hpp"      // O-2 wire 1: POSIX stratum listener (ITransport)
 #include "xmr/xmr_o2_finalize_connect.hpp"   // O-2 wire 4: FOUND -> on_network_block_won -> F1
 #include "xmr/xmr_coinbase_authority.hpp"  //  coinbase-authority booking
+#include "xmr/xmr_cut_payees.hpp"          // REJOIN-PAYEE: resolve outputs against the payees of the block's own cut
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
 #include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
@@ -1891,26 +1892,90 @@ static int run_live(const XmrNodeConfig& cfg) {
         return true;
     };
     // (B) THE AUTHORITY: fold E_b at the ON-CHAIN cut, read back from OUR OWN ring. Never at a neighbouring prefix.
-    auto fold_at_cut = [&](std::uint64_t reward, const c2pool::v37n::xmr::credit::CreditCut& cc, Amounts& credit, std::string& why,
-                           std::uint64_t relay_hint_pid = 0) -> bool {
+    // REJOIN-PAYEE: every payee a view at an on-chain cut projects is taught to the
+    // payee resolver (cba_fx), so an output paying it -- this block's pay-now, or a
+    // later K_fair take of the credit booked here -- maps on THIS node too, however
+    // the view was obtained (live ring, own replay, relay repair). Before, only a
+    // receipt this node pushed itself (live ingest / reload) taught the ref.
+    std::uint64_t cut_payee_learned = 0, cut_payee_resolved = 0, cut_payee_pending = 0, cut_payee_unresolved = 0;
+    auto learn_view_payees = [&](const c2pool::v37n::SettlementView& v) -> std::size_t {
+        std::size_t n = 0;
+        if (cba_fx)
+            for (const auto& p : settle::project(v))
+                if (::v37::xmr::is_xmr_kind(p.pay.kind) && cba_fx->learn_ref(p.pay)) ++n;
+        cut_payee_learned += n;
+        return n;
+    };
+    // The view at an on-chain credit cut (P, spine): the live ring, else the GAP-2
+    // relay (own replay / winner-order repair), else R3 replay-to-prefix. null + why:
+    // "cut-pending: ..." = not available yet (retry / HOLD); anything else = decided.
+    auto view_at_cut = [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::string& why, std::uint64_t relay_hint_pid = 0)
+            -> std::shared_ptr<const c2pool::v37n::SettlementView> {
         bool mism = false;
         auto view = node.engine().settlement_view_by_cut(cfg.lane_chain, cc.next_pos, cc.spine_digest, &mism);
         if (!view && relay_node) {   // GAP-2 SEAM-5: node-local order -> own replay or winner-order repair
             view = relay_view(cc.next_pos, cc.spine_digest, relay_hint_pid, why);
-            if (!view) return false;
+            if (!view) return nullptr;
         }
         if (!view) {
             auto tip = node.engine().snapshot(cfg.lane_chain);
             const std::uint64_t tp = tip ? tip->next_pos : 0;
-            if (mism) { ++cut_mismatch; why = "credit-cut MISMATCH: we published P=" + std::to_string(cc.next_pos) + " with a DIFFERENT lane digest (fail-closed: different records in the same prefix)"; return false; }
-            if (tp < cc.next_pos) { ++cut_pending; why = "cut-pending: our lane tip " + std::to_string(tp) + " < P=" + std::to_string(cc.next_pos) + " (receiver behind the winner's cut; retry)"; return false; }
+            if (mism) { ++cut_mismatch; why = "credit-cut MISMATCH: we published P=" + std::to_string(cc.next_pos) + " with a DIFFERENT lane digest (fail-closed: different records in the same prefix)"; return nullptr; }
+            if (tp < cc.next_pos) { ++cut_pending; why = "cut-pending: our lane tip " + std::to_string(tp) + " < P=" + std::to_string(cc.next_pos) + " (receiver behind the winner's cut; retry)"; return nullptr; }
             // R3: the live ring evicted this prefix (P-age > ring, or coalesced
             // through it). Reconstruct it by replay-to-prefix instead of failing
             // terminally — this is the fix that stops the reorg fork.
             ++cut_miss;
             view = replay_view(cc.next_pos, cc.spine_digest, why);
-            if (!view) return false;   // replay_view set why: cut-pending (retry) or cut-mismatch (fail-closed)
+            if (!view) return nullptr;   // replay_view set why: cut-pending (retry) or cut-mismatch (fail-closed)
         }
+        return view;
+    };
+    // REJOIN-PAYEE: decode a block's coinbase; an output mapping to no payee known
+    // HERE is resolved against the payees of the view at the block's OWN on-chain
+    // credit cut (xmr_cut_payees.hpp) before the fail-closed refusal: a view not
+    // available yet makes the block UNDECIDED (cut-pending: retried, then HELD like
+    // every relay repair), never refused on this node's join/restart timing.
+    auto decode_resolving = [&](const std::vector<std::uint8_t>& blob, const std::string& bid, std::string& pending_why,
+                                std::vector<std::uint64_t>* superseded_out = nullptr,
+                                const std::vector<::v37::bytes32>* cands_override = nullptr)
+            -> c2pool::v37n::xmr::authority::CoinbaseBooking {
+        namespace auth = c2pool::v37n::xmr::authority;
+        auth::CutPayeeResult r;
+        auto bk = auth::decode_resolving_cut_payees(
+            [&] { return decode_blob(blob, superseded_out, cands_override); },
+            [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::vector<settle::WeightedPayee>& out, std::string& w) -> int {
+                auto v = view_at_cut(cc, w, relay_hint(bid));
+                if (!v) return w.rfind("cut-pending:", 0) == 0 ? 0 : -1;
+                out = settle::project(*v);
+                return 1;
+            },
+            [&](const ::v37::ScriptRef& ref) {
+                const bool fresh = cba_fx && cba_fx->learn_ref(ref);
+                if (fresh) ++cut_payee_learned;
+                return fresh; }, &r);
+        pending_why.clear();
+        if (r.status == auth::CutPayeeStatus::NotNeeded) return bk;
+        if (r.status == auth::CutPayeeStatus::Pending) {
+            ++cut_payee_pending;
+            pending_why = r.why + " [payee resolution: " + bk.why + " -- the payees of the block's own credit cut P=" +
+                          std::to_string(bk.credit_cut.next_pos) + " are not readable here yet]";
+        } else if (bk.ok) {
+            ++cut_payee_resolved;
+        } else {
+            ++cut_payee_unresolved;
+        }
+        std::printf("cba-payee-resolve: bid=%s… P=%llu status=%s projected=%zu learned=%zu -> %s%s%s\n", bid.substr(0, 12).c_str(),
+                    static_cast<unsigned long long>(bk.credit_cut.next_pos), auth::to_string(r.status), r.projected, r.learned,
+                    bk.ok ? "decoded" : "unresolved", r.why.empty() ? "" : " | ", r.why.substr(0, 160).c_str());
+        std::fflush(stdout);
+        return bk;
+    };
+    auto fold_at_cut = [&](std::uint64_t reward, const c2pool::v37n::xmr::credit::CreditCut& cc, Amounts& credit, std::string& why,
+                           std::uint64_t relay_hint_pid = 0) -> bool {
+        auto view = view_at_cut(cc, why, relay_hint_pid);
+        if (!view) return false;
+        learn_view_payees(*view);   // REJOIN-PAYEE: a later K_fair take of this credit maps here too
         std::optional<settle::EbFold> f = settle::fold_eb(reward, *view, /*strict=*/true);
         if (!f) { ++cut_fold_refused; why = "fold_eb REFUSED at the on-chain cut (geometry not ratified)"; return false; }
         // ★ DROPS-R1: the (reward, SUM weight) pair at THIS cut, through the SAME
@@ -1951,9 +2016,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         c2pool::v37n::xmr::authority::CoinbaseBooking bk;
         std::vector<std::uint8_t> chain_blob;
         std::vector<std::uint64_t> cand_superseded;
-        if (!fetch_decode(bid, bk, why, &chain_blob, &cand_superseded) && !bk.is_lane && bk.why.empty()) {
+        if (!cba_src.fetch(bid, chain_blob, why)) {
             ++cba_fetch_failed;   // R-C rework-3 (D6): a transport/JSON failure is a transient retry, NOT a refusal
             return false;
+        }
+        {
+            std::string pend;
+            bk = decode_resolving(chain_blob, bid, pend, &cand_superseded);
+            if (!pend.empty()) { why = pend; return false; }   // REJOIN-PAYEE: undecided, never a refusal
+            if (!bk.ok) why = bk.why;
         }
         out.total_pico = bk.total;
         if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
@@ -2186,7 +2257,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         if (!q.cands || !q.superseded) { why = "cut-pending: no scratch ring (internal)"; return false; }
         c2pool::v37n::xmr::authority::CoinbaseBooking bk;
-        if (!fetch_decode(bid, bk, why, nullptr, nullptr, q.cands) && !bk.is_lane && bk.why.empty()) return false;   // transport: undecidable
+        std::vector<std::uint8_t> sblob;
+        if (!cba_src.fetch(bid, sblob, why)) return false;   // transport: undecidable
+        {
+            std::string pend;
+            bk = decode_resolving(sblob, bid, pend, nullptr, q.cands);
+            if (!pend.empty()) { why = pend; return false; }   // REJOIN-PAYEE: cut-pending -> undecidable
+            if (!bk.ok) why = bk.why;
+        }
         out.total_pico = bk.total;
         if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
         out.has_extra_nonce = bk.has_extra_nonce; out.extra_nonce = bk.extra_nonce;
@@ -3467,6 +3545,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                             cba_lane_root_unknown, cba_ring.size(), (unsigned long long)cba_max_root_age,
                             (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch,
                             (unsigned long long)cba_lineage_other[1], (unsigned long long)cba_lineage_other[2], (unsigned long long)cba_lineage_other[3]);
+                std::printf("  cba-payee: learned=%llu resolved=%llu pending=%llu unresolved=%llu (REJOIN-PAYEE: outputs resolved against the payees of the block's own credit cut)\n",
+                            (unsigned long long)cut_payee_learned, (unsigned long long)cut_payee_resolved,
+                            (unsigned long long)cut_payee_pending, (unsigned long long)cut_payee_unresolved);
                 const auto& cs = cba_src.stats();
                 std::printf("  cba-src: %s native_hits=%llu native_hold=%llu holding=%zu get_block_rpc=%llu rpc_failed=%llu | compare equal=%llu MISMATCH=%llu unavailable=%llu | fallback_used=%llu\n",
                             cba_src.native_mode() ? "native" : "monerod",
