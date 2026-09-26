@@ -515,6 +515,21 @@ if (BUILD_TESTING)
         target_compile_definitions(v37_xmr_o2_randomx_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
         target_link_libraries(v37_xmr_o2_randomx_kat PRIVATE xmr_coin randomx Threads::Threads)
         add_test(NAME v37_xmr_o2_randomx_kat COMMAND v37_xmr_o2_randomx_kat)
+        # v37_xmr_rx_seed_switch_kat (RX-SEED-SWITCH): the light verifier and the
+        # stratum share check across an UN-ANNOUNCED RandomX seed switch (no
+        # next_seed_hash, the native template path): every hash equals a fresh
+        # cache + fresh VM reference, the previous epoch stays resident for
+        # in-flight jobs. Real RandomX (JIT + interpreter), same leg as above.
+        add_executable(v37_xmr_rx_seed_switch_kat
+            v37_xmr_rx_seed_switch_kat.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+        target_compile_features(v37_xmr_rx_seed_switch_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_rx_seed_switch_kat PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(v37_xmr_rx_seed_switch_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
+        target_link_libraries(v37_xmr_rx_seed_switch_kat PRIVATE xmr_coin randomx Threads::Threads)
+        add_test(NAME v37_xmr_rx_seed_switch_kat COMMAND v37_xmr_rx_seed_switch_kat)
     endif()
 
     # ------------------------------------------------------------------
