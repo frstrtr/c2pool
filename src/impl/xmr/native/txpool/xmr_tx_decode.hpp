@@ -80,4 +80,79 @@ inline TxDecodeStatus decode_relayed_tx(const std::vector<std::uint8_t>& blob, D
     return decode_relayed_tx(blob.data(), blob.size(), out);
 }
 
+// ---------------------------------------------------------------------------
+// UNKNOWN-FORK TRANSACTION (not understood, not invalid).
+//
+// Asked ONLY about a blob that decode_relayed_tx() already refused. True when
+// the transaction declares a format above what this build implements, so the
+// refusal says nothing about the sender's honesty:
+//
+//   * a transaction version above CURRENT_TRANSACTION_VERSION (2); or
+//   * a well-formed version-2 prefix whose rct type is above
+//     RCTTypeBulletproofPlus (6). FCMP++ is type 7 (fcmp++-stage rctTypes.h).
+//     To reach the rct type of a real FCMP++ transaction, the prefix walk also
+//     accepts the output tag the same fork defines, txout_to_carrot_v1 (0x01:
+//     key[32], view_tag[3], encrypted_janus_anchor[16]), and an input with an
+//     empty ring (an FCMP++ input keeps its key image and drops key_offsets).
+//
+// Everything else stays what decode_relayed_tx() said it was: a tx version 0,
+// a truncated prefix, an unknown input or output tag, or a Carrot output in a
+// transaction of a KNOWN rct type is malformed, exactly as before.
+// ---------------------------------------------------------------------------
+inline constexpr std::uint64_t TX_MAX_IMPLEMENTED_VERSION = 2;      // CURRENT_TRANSACTION_VERSION
+inline constexpr std::uint8_t  TX_OUT_TO_CARROT_V1        = 0x01;   // v17 (fcmp++-stage cryptonote_basic.h)
+inline constexpr std::size_t   TX_OUT_CARROT_V1_BYTES     = 32 + 3 + 16;
+
+inline bool tx_format_above_implemented(const std::uint8_t* data, std::size_t size) {
+    if (!data || !size) return false;
+    BlobReader r(data, size);
+    std::uint64_t version = 0;
+    if (!r.read_varint(version)) return false;
+    if (version > TX_MAX_IMPLEMENTED_VERSION) return true;
+    if (version != 2) return false;            // 0 is malformed; 1 has no rct type
+    std::uint64_t unlock = 0;
+    if (!r.read_varint(unlock)) return false;
+
+    std::uint64_t n_in = 0;
+    if (!r.read_count(n_in, TX_MAX_INPUTS) || n_in == 0) return false;
+    for (std::uint64_t i = 0; i < n_in; ++i) {
+        std::uint8_t tag = 0;
+        if (!r.read_byte(tag) || tag != TX_IN_TO_KEY) return false;
+        std::uint64_t amount = 0, n_off = 0;
+        if (!r.read_varint(amount)) return false;
+        if (!r.read_count(n_off, TX_MAX_RING)) return false;
+        for (std::uint64_t k = 0; k < n_off; ++k) {
+            std::uint64_t off = 0;
+            if (!r.read_varint(off)) return false;
+        }
+        if (!r.skip(32)) return false;         // key image
+    }
+
+    std::uint64_t n_out = 0;
+    if (!r.read_count(n_out, TX_MAX_OUTPUTS) || n_out == 0) return false;
+    for (std::uint64_t i = 0; i < n_out; ++i) {
+        std::uint64_t amount = 0;
+        std::uint8_t  tag    = 0;
+        if (!r.read_varint(amount) || !r.read_byte(tag)) return false;
+        std::size_t body = 0;
+        if (tag == TX_OUT_TO_KEY)             body = 32;
+        else if (tag == TX_OUT_TO_TAGGED_KEY) body = 33;
+        else if (tag == TX_OUT_TO_CARROT_V1)  body = TX_OUT_CARROT_V1_BYTES;
+        else return false;
+        if (!r.skip(body)) return false;
+    }
+
+    std::uint64_t extra_len = 0;
+    if (!r.read_count(extra_len, TX_MAX_EXTRA_BYTES)) return false;
+    if (!r.skip(static_cast<std::size_t>(extra_len))) return false;
+
+    std::uint8_t rct_type = 0;
+    if (!r.read_byte(rct_type)) return false;
+    return rct_type > RCT_TYPE_BULLETPROOF_PLUS;
+}
+
+inline bool tx_format_above_implemented(const std::vector<std::uint8_t>& blob) {
+    return tx_format_above_implemented(blob.data(), blob.size());
+}
+
 } // namespace c2pool::xmr::native
