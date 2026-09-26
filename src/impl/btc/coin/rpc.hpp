@@ -4,6 +4,7 @@
 #include "block.hpp"
 #include "rpc_data.hpp"
 #include "node_interface.hpp"
+#include "submit_flood_gate.hpp"
 
 #include <chrono>
 #include <iostream>
@@ -61,8 +62,18 @@ private:
     std::chrono::milliseconds m_io_timeout{std::chrono::seconds(RPC_IO_TIMEOUT_SECONDS)};
     void apply_socket_timeouts();
 
+    // P0-SUBMIT-CSMAIN (submit_flood_gate.hpp): Send() must not re-send a
+    // delivered submitblock, and both won-block callers share one delivery.
+    // m_non_idempotent is set by call_submitblock() for the duration of Send();
+    // m_last_send records how far the last Send() got.
+    enum class SendOutcome { NotDelivered, Delivered, Answered };
+    bool m_non_idempotent = false;
+    SendOutcome m_last_send = SendOutcome::NotDelivered;
+    SubmitDedupe m_submit_dedupe;
+
     std::string Send(const std::string &request) override;
     nlohmann::json CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params = {});
+    nlohmann::json call_submitblock(const std::string& block_hex);
 
 public:
     NodeRPC(io::io_context* context, btc::interfaces::Node* coin, bool testnet);

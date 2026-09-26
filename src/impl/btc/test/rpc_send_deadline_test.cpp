@@ -209,10 +209,19 @@ TEST(BtcRpcSendDeadline, SilentDaemonSubmitblockReturnsWithinDeadline)
 
     // Recovery: the timed-out connection was dropped, so the late reply can
     // never be read as this call's answer; the call reconnects and succeeds.
-    auto again = timed_call(client, submit, unblock);
+    // A DIFFERENT block: the first one was delivered, so submit_flood_gate.hpp
+    // dedupes a re-submit of it instead of sending it again.
+    const auto submit_next = [](btc::coin::NodeRPC& rpc) { return rpc.submit_block_hex(std::string(160, '1'), true); };
+    auto again = timed_call(client, submit_next, unblock);
     ASSERT_TRUE(again.has_value());
     EXPECT_TRUE(again->result);
     EXPECT_EQ(daemon.requests(), 2);
+
+    // The delivered first block is never re-sent, even after the reconnect.
+    auto dup = timed_call(client, submit, unblock);
+    ASSERT_TRUE(dup.has_value());
+    EXPECT_TRUE(dup->result) << "delivered-unknown counts as reached";
+    EXPECT_EQ(daemon.requests(), 2) << "a delivered submitblock was re-sent";
 }
 
 // Same bound for a read-only call: the deadline lives in Send(), so every RPC
