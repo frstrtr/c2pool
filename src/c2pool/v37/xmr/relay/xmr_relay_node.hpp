@@ -279,6 +279,23 @@ struct RelayOptions {
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
     u32         repair_state_timeout_ms = 20000;
+    // REPAIR-PAGE: ids per GETORDER page of a relay repair. Pre-fix every page
+    // asked kCtrlMaxIdsPerOrder (4096 ids x 40 B = ~160 KiB) under the fixed
+    // 5 s request timeout; on a slow winner->loser link (~64 kbit/s) that page
+    // takes ~20 s, every answer came late, the repair never completed and the
+    // re-asks piled up on the winner's socket until SO_SNDTIMEO dropped it.
+    // A repair now asks repair_order_page_ids (~10 KiB) of a peer it has no
+    // measure of, and grows the page, up to repair_order_page_max_ids, from
+    // any ORDER answer of that peer (the HELLO backfill included) that came
+    // back within a quarter of the request timeout: to what that round trip
+    // fits in the quarter (x16 at most per answer). A fast link is at the cap
+    // before the repair starts (the base page count, inside the server's
+    // token burst); a slow one stays small. A page that times out halves it
+    // (floor 16).
+    // 0 = kCtrlMaxIdsPerOrder. No wire change: the server already clamps and
+    // paginates (p_served), and the order is re-asked from the cursor.
+    u32         repair_order_page_ids = 256;
+    u32         repair_order_page_max_ids = kCtrlMaxIdsPerOrder;
     // Lane positions one receipt may span (fee model S3: 2 = (payee, donation)
     // split; 1 = the gate-OFF / master rule). Bounds the repair density check.
     u32         max_pushes_per_receipt = 1;
@@ -339,6 +356,9 @@ struct RelayStats {
     // below their horizon); receipts re-offered on HELLO because still unpushed.
     std::atomic<u64> repair_horizon_rearm{0}, repair_prefix_ok{0}, repair_prefix_unknown{0}, repair_deep{0};
     std::atomic<u64> reoffer_unpushed{0};
+    // REPAIR-PAGE: repair GETORDER pages asked, the largest page asked (ids),
+    // pages that timed out (the page was halved) and pages that grew it.
+    std::atomic<u64> repair_order_pages{0}, repair_order_page_max{0}, repair_page_timeouts{0}, repair_page_grown{0};
     // RELAY-LIVENESS: keepalive frames, links dropped as SILENT, peers that
     // never answered a PING (pre-0x48 builds: silence not enforced), and
     // maintenance gaps that re-armed every link's clock.
@@ -440,6 +460,7 @@ public:
     const RelayStats& stats() const { return m_st; }
     ::c2pool::v37n::FrameVault& vault() { return m_vault; }
     SupplyRequester* requester() { return m_fetch.get(); }
+    SupplyService* supplier() { return m_serve.get(); }
 
     // ── own receipts (any thread; the minter already ran check_structural) ──
     void submit_own(Admitted a) {
@@ -941,7 +962,11 @@ public:
 
     std::string describe() const {
         const auto& s = m_st;
-        char b[2400];
+        // ORDER serving / asking (the "served=" above is ctx_served): late = an
+        // answer that arrived after its request timed out (claim() drops it).
+        const SupplyServeStats sv = m_serve ? m_serve->stats() : SupplyServeStats{};
+        const SupplyFetchStats fs = m_fetch ? m_fetch->stats() : SupplyFetchStats{};
+        char b[2800];
         std::snprintf(b, sizeof b,
             "relay: conns=%zu ready=%zu hello ok=%llu rej=%llu tmo=%llu | rx recv=%llu dup=%llu struct=%llu "
             "rx_evals=%llu valid=%llu invalid=%llu deferred=%llu unavail=%llu bans=%llu unresolved=%llu expired=%llu qdrop=%llu | "
@@ -951,7 +976,9 @@ public:
             "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
             "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu | "
             "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
-            "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu",
+            "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu | "
+            "order serve=%llu ids=%llu throttled=%llu | order ask=%llu ok=%llu timeouts=%llu late=%llu | "
+            "repair-page pages=%llu max=%llu timeouts=%llu grown=%llu",
             m_net.n_peers(), ready_peers().size(),
             (unsigned long long)s.hello_ok.load(), (unsigned long long)s.hello_rejected.load(), (unsigned long long)s.hello_timeout.load(),
             (unsigned long long)s.rx_receipts.load(), (unsigned long long)s.dup.load(), (unsigned long long)s.structural.load(),
@@ -983,7 +1010,12 @@ public:
             (unsigned long long)s.ping_tx.load(), (unsigned long long)s.ping_rx.load(),
             (unsigned long long)s.pong_tx.load(), (unsigned long long)s.pong_rx.load(),
             (unsigned long long)s.silent_drops.load(), (unsigned long long)s.ka_legacy.load(),
-            (unsigned long long)s.ka_rearm.load());
+            (unsigned long long)s.ka_rearm.load(),
+            (unsigned long long)sv.order_served, (unsigned long long)sv.order_ids, (unsigned long long)sv.throttled,
+            (unsigned long long)fs.orders_requested, (unsigned long long)fs.orders_ok, (unsigned long long)fs.timeouts,
+            (unsigned long long)fs.unsolicited,
+            (unsigned long long)s.repair_order_pages.load(), (unsigned long long)s.repair_order_page_max.load(),
+            (unsigned long long)s.repair_page_timeouts.load(), (unsigned long long)s.repair_page_grown.load());
         return b;
     }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
@@ -1071,6 +1103,8 @@ private:
         bytes32 spine{};
         std::vector<bytes32> ids;
         bool probe = false;   // REPAIR-HORIZON: the zero-length prefix probe GETORDER [a0, a0)
+        u32 max_ids = 0;      // REPAIR-PAGE: ids this page asked (0 = the default kCtrlMaxIdsPerOrder)
+        Clock::time_point issued{};   // REPAIR-PAGE: when an ORDER ask went out (its round trip)
     };
     struct Repair {
         enum class St { Idle, Ordering, Fetching, Ready } st = St::Idle;
@@ -1258,6 +1292,7 @@ private:
             std::lock_guard<std::mutex> lk(m_jmtx);
             m_jobs.erase(p);
             m_cur_job.erase(p);
+            m_rpage.erase(p);
         }
         if (m_fetch) m_fetch->forget_peer(p);
         if (m_serve) m_serve->forget_peer(p);
@@ -1617,6 +1652,13 @@ private:
     // Link verified block proofs to our chain: a proof whose parent we know at
     // exactly its height becomes a ChainView entry (bin = height + 1, seed from
     // OUR chain), which may in turn resolve a child proof waiting on it.
+    // The status line's "last unresolved" names a Monero context prev_id; once
+    // that context resolves the line is stale -- clear it (cosmetic).
+    void clear_unresolved_for(const bytes32& id) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!m_last_unresolved.empty() && m_last_unresolved.find("prev_id " + hex_short(id)) != std::string::npos)
+            m_last_unresolved.clear();
+    }
     void resolve_ctx_chain(bytes32 id) {
         for (int guard = 0; guard < 64; ++guard) {
             CtxWant w;
@@ -1662,6 +1704,7 @@ private:
             }
             m_chain.note(id, bin, seed);
             m_st.ctx_resolved++;
+            clear_unresolved_for(id);
             log("relay: receipt context RESOLVED: block " + hex_short(id) + " h=" + std::to_string(w.proof.height) +
                 " (parent " + hex_short(w.proof.parent) + " known here) via " +
                 (w.proof_from ? "peer " + std::to_string(w.proof_from) : std::string("own monerod")) +
@@ -1687,6 +1730,7 @@ private:
         std::map<PeerId, std::vector<bytes32>> ask;
         std::vector<bytes32> retry_proofs;
         std::vector<std::string> gave_up;
+        std::vector<bytes32> resolved_now;
         {
             std::lock_guard<std::mutex> lk(m_cmtx);
             for (auto it = m_ctx_want.begin(); it != m_ctx_want.end();) {
@@ -1700,6 +1744,7 @@ private:
                 if (w.have_proof) { retry_proofs.push_back(it->first); ++it; continue; }
                 if (m_chain.lookup(it->first)) {   // RC-CTX: resolved meanwhile by the ChainView's feeder (native index / journal)
                     m_st.ctx_resolved++;
+                    resolved_now.push_back(it->first);
                     it = m_ctx_want.erase(it);
                     continue;
                 }
@@ -1730,6 +1775,7 @@ private:
             const auto f = encode_getctx(m_o.chain, ids);
             if (!f.empty() && m_net.send_to(p, f)) m_st.ctx_asked += ids.size();
         }
+        for (const auto& id : resolved_now) clear_unresolved_for(id);
         for (const auto& id : retry_proofs) resolve_ctx_chain(id);
     }
 
@@ -2097,15 +2143,23 @@ private:
             std::lock_guard<std::mutex> lk(m_jmtx);
             for (auto& [p, q] : m_jobs) {
                 if (q.empty() || m_cur_job.count(p) || (m_fetch && m_fetch->busy(p))) continue;
-                issue.emplace_back(p, q.front());
-                m_cur_job[p] = q.front();
+                Job j = q.front();
                 q.pop_front();
+                if (j.kind == Job::Kind::Order && !j.probe) j.issued = Clock::now();   // REPAIR-PAGE: its round trip sizes the repair page
+                if (j.kind == Job::Kind::Order && j.repair && !j.probe) {   // REPAIR-PAGE
+                    j.max_ids = repair_page_locked(p);
+                    m_st.repair_order_pages++;
+                    if (j.max_ids > m_st.repair_order_page_max.load()) m_st.repair_order_page_max = j.max_ids;
+                }
+                issue.emplace_back(p, j);
+                m_cur_job[p] = std::move(j);
             }
         }
         for (auto& [p, j] : issue) {
             bool ok = false;
             if (j.kind == Job::Kind::Order)
-                ok = m_fetch->request_order(p, m_o.chain, j.a, j.p, j.spine);
+                ok = j.max_ids ? m_fetch->request_order(p, m_o.chain, j.a, j.p, j.spine, j.max_ids)
+                               : m_fetch->request_order(p, m_o.chain, j.a, j.p, j.spine);
             else
                 ok = m_fetch->request_frames(p, m_o.chain, j.ids);
             if (!ok) {
@@ -2121,6 +2175,47 @@ private:
         Job j = std::move(it->second);
         m_cur_job.erase(it);
         return j;
+    }
+
+    // REPAIR-PAGE: the page this peer's next repair GETORDER asks (m_jmtx held).
+    u32 repair_page_max_locked() const {
+        const u32 cap = m_o.repair_order_page_max_ids ? m_o.repair_order_page_max_ids : kCtrlMaxIdsPerOrder;
+        return std::min<u32>(cap, kCtrlMaxIdsPerOrder);
+    }
+    u32 repair_page_locked(PeerId p) const {
+        const u32 cap = repair_page_max_locked();
+        auto it = m_rpage.find(p);
+        const u32 first = m_o.repair_order_page_ids ? m_o.repair_order_page_ids : kCtrlMaxIdsPerOrder;
+        return std::max<u32>(1, std::min<u32>(it != m_rpage.end() ? it->second : first, cap));
+    }
+    // An ORDER answer (a FULL repair page, or a backfill answer at least one
+    // page long) that came back within a quarter of the request timeout grows
+    // this peer's repair page to what that round trip fits in the quarter (x16
+    // at most): a fast link reaches the cap, a slow one stays where its answers
+    // arrive with a 4x margin to the timeout. A page that timed out halves
+    // (floor 16). Never above the cap.
+    void repair_page_answered(PeerId p, const Job& j, std::size_t n_ids) {
+        if (j.issued == Clock::time_point{} || n_ids == 0 || (j.max_ids && n_ids < j.max_ids)) return;
+        const auto rt = m_fetch ? m_fetch->options().request_timeout : std::chrono::milliseconds(5000);
+        const auto budget = std::chrono::duration_cast<std::chrono::microseconds>(rt) / 4;
+        const auto took = std::max<std::chrono::microseconds>(
+            std::chrono::microseconds(1), std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - j.issued));
+        if (took > budget) return;
+        const u64 fit = static_cast<u64>(n_ids) * static_cast<u64>(budget.count()) / static_cast<u64>(took.count());
+        std::lock_guard<std::mutex> lk(m_jmtx);
+        const u32 cap = repair_page_max_locked();
+        const u32 cur = repair_page_locked(p);
+        if (n_ids < cur) return;   // a shorter answer says nothing about a page of cur ids
+        const u32 next = static_cast<u32>(std::min<u64>({fit, static_cast<u64>(cur) * 16, static_cast<u64>(cap)}));
+        if (next <= cur) return;
+        m_rpage[p] = next;
+        m_st.repair_page_grown++;
+    }
+    void repair_page_timed_out(PeerId p, const Job& j) {
+        if (!j.max_ids) return;
+        std::lock_guard<std::mutex> lk(m_jmtx);
+        m_rpage[p] = std::max<u32>(std::min<u32>(16, j.max_ids), j.max_ids / 2);
+        m_st.repair_page_timeouts++;
     }
 
     void on_order(PeerId p, const CtrlOrder& o) {
@@ -2161,6 +2256,7 @@ private:
         auto j = take_cur_job(p);
         if (!j || j->kind != Job::Kind::Order) return;
         if (!j->repair) {                       // BACKFILL: ask for every id we never saw
+            repair_page_answered(p, *j, o.ids.size());   // REPAIR-PAGE: its round trip measures this peer's link
             std::vector<bytes32> want;
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
@@ -2238,7 +2334,12 @@ private:
                                             : (o.p_served >= prev + 1 && o.p_served <= prev + mp));
             if (!dense) { m_st.repair_peer_fail++; r.tried.insert(p); r.reset(); return; }
             for (const auto& e : o.ids) r.ids.push_back(e.id);
+            // REPAIR-PAGE: a page that ADVANCES the cursor is progress: restart
+            // the Ordering clock, so a repair of many small pages is bounded per
+            // page by repair_state_timeout_ms, not in total.
+            if (o.p_served > r.cursor) r.since = Clock::now();
             r.cursor = o.p_served;
+            repair_page_answered(p, *j, o.ids.size());
             if (r.cursor < r.P) {
                 Job n = *j; n.a = r.cursor; queue_job(p, std::move(n));
                 pump_jobs();
@@ -2281,8 +2382,9 @@ private:
         pump_jobs();
     }
 
-    void on_fetch_fail(PeerId p, SupplyFailure) {
+    void on_fetch_fail(PeerId p, SupplyFailure why) {
         auto j = take_cur_job(p);
+        if (j && j->repair && j->kind == Job::Kind::Order && why == SupplyFailure::TIMEOUT) repair_page_timed_out(p, *j);
         if (j && j->repair) {
             m_st.repair_peer_fail++;
             std::lock_guard<std::mutex> lk(m_rmtx);
@@ -2568,6 +2670,7 @@ private:
     std::mutex m_jmtx;                 // supply jobs
     std::map<PeerId, std::deque<Job>> m_jobs;
     std::map<PeerId, Job> m_cur_job;
+    std::map<PeerId, u32> m_rpage;     // REPAIR-PAGE: the repair order page size per peer (m_jmtx)
 
     mutable std::mutex m_rmtx;         // repairs
     std::map<std::pair<u64, bytes32>, Repair> m_repairs;
