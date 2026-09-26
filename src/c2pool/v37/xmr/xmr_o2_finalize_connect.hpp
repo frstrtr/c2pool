@@ -1205,6 +1205,8 @@ public:
     bool        held_lag()     const { return m_held_lag; }
     VoteState   vote_state()   const { return m_vote; }
     const std::map<std::string, std::uint64_t>& held() const { return m_held; }
+    // CUT-FLOOR: chain blocks still retried (undecided: cut-pending, fetch, root-unknown, HELD), bid -> height.
+    const std::map<std::string, std::uint64_t>& retrying() const { return m_retry; }
     const std::vector<LiabilityRec>& liability() const { return m_liability; }
     const std::map<::v37::bytes32, long long>& liability_by_payee() const { return m_liability_by_payee; }
 
@@ -1401,7 +1403,8 @@ private:
                (why.find("relay repair of P=") != std::string::npos ||
                 why.find("repaired receipt") != std::string::npos ||
                 why.find("repaired order") != std::string::npos ||
-                why.find("drops backfill of intervals") != std::string::npos);   // ★ RAIN-BACKFILL: undecided, never refused
+                why.find("drops backfill of intervals") != std::string::npos ||  // ★ RAIN-BACKFILL: undecided, never refused
+                why.find("CUT-FLOOR wait") != std::string::npos);                // CUT-FLOOR: a lower block undecided, never refused
     }
     void note_relay_held_resolved(const std::string& bid, const char* how) {
         if (!m_relay_held.erase(bid)) return;

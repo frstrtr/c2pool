@@ -259,7 +259,11 @@ int main() {
         const auto bk = sh.find("fo.book_from_chain_ex = [&]");
         const auto dec = sh.find("drops_store->own_to_compose(bid)");
         const auto cmp = sh.find("relay_node->broadcast_block_won(bw);", dec == std::string::npos ? 0 : dec);
+#if defined(C2POOL_XMR_DROPS_LANE_ENROL)
+        const auto tk = sh.find("if (!drops_take_carry(h, bid, bk, why, true, drops_lane)) return false;");   // DROPS-ENROL-LANE
+#else
         const auto tk = sh.find("if (!drops_take_carry(h, bid, bk, why, true)) return false;");
+#endif
         C(bk != std::string::npos && dec != std::string::npos && cmp != std::string::npos && tk != std::string::npos &&
           bk < dec && dec < cmp && cmp < tk,
           "WA4 ★ the booking composes a P-only own win (once) before the carried-delta decision");

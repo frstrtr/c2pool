@@ -123,6 +123,12 @@ inline constexpr std::size_t POOL_TAG_FIELD_BYTES = 37;      // 4 magic + 1 vers
 // consumer tree c2pool/v37/xmr/xmr_paynow.hpp paynow::kPayNowTailBytes == 12,
 // static_asserted in v37_xmr_paynow_kat). Present only when pay-now is armed.
 inline constexpr std::size_t PAYNOW_TAIL_BYTES = 12;  // 4 magic + 8 u64 base
+// EMPTY-CUT FINDER (operator ruling 09-26): in an empty-cut block the
+// committed finder payee rides right before V37N ("V37F" || u8 kind ||
+// payee[64], consumer tree xmr_paynow.hpp paynow::kFinderFieldBytes == 69,
+// static_asserted in v37_xmr_empty_cut_finder_kat). The widest payload is
+// then 14 + 32 + 69 + 12 + 12 + 37 + 44 = 220 B (<= 255, two-byte varint).
+inline constexpr std::size_t FINDER_FIELD_BYTES = 69;  // 4 magic + 1 kind + 64 payee
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -829,7 +835,7 @@ private:
             return false;
         }
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + FINDER_FIELD_BYTES + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; empty-cut finder: +69 V37F
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }

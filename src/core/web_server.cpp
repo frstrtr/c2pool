@@ -2,6 +2,7 @@
 #include <core/host_port.hpp>
 #include "web_server.hpp"
 #include "stratum_server.hpp"
+#include <cctype>     // rewrite_payout_scheme_label: identifier-character test
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
 #include <memory>
 #include "address_utils.hpp"
@@ -9952,6 +9953,32 @@ WebServer::WebServer(net::io_context& ioc, const std::string& address, uint16_t 
 WebServer::~WebServer()
 {
     stop();
+}
+
+std::size_t rewrite_payout_scheme_label(std::string& text, const std::string& label,
+                                        const std::string& ident)
+{
+    static const std::string kWord = "PPLNS";
+    auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    };
+    std::string out;
+    out.reserve(text.size());
+    std::size_t n = 0, pos = 0;
+    for (;;) {
+        const std::size_t hit = text.find(kWord, pos);
+        if (hit == std::string::npos) break;
+        const bool glued = (hit > 0 && is_ident(text[hit - 1])) ||
+                           (hit + kWord.size() < text.size() && is_ident(text[hit + kWord.size()]));
+        out.append(text, pos, hit - pos);
+        out += glued ? ident : label;
+        pos = hit + kWord.size();
+        ++n;
+    }
+    if (n == 0) return 0;
+    out.append(text, pos, std::string::npos);
+    text.swap(out);
+    return n;
 }
 
 bool WebServer::start()

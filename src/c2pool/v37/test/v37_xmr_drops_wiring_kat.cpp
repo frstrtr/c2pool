@@ -154,18 +154,32 @@ int main() {
         }
         check(feeds >= 2 && feeds == tip_feeds,
               "★ every observe_native_tip() call is fed a TIP (tip_best / best), never a burial frontier");
+#ifdef C2POOL_XMR_DROPS_ENROL_TIDY
+        // DROPS-ENROL-TIDY: enrolment + S are lane-derived; the tip book is retired.
+        check(src.find("drops_try_enrol") == std::string::npos && src.find("drops->enroll_at_tip(") == std::string::npos &&
+              src.find("drops->arm_at_tip(") == std::string::npos &&
+              src.find("node.set_enrollment_book(nullptr);") != std::string::npos && src.find("drops->set_lane_only();") != std::string::npos,
+              "★ no enrolment / arm at the native tip any more: the node gets NO tip book and the wiring is lane-only "
+              "(enrolment is a pure function of the lane prefix)");
+#else
         check(src.find("drops->observe_native_tip(tip_best); drops_try_enrol();") != std::string::npos &&
               src.find("if (!t.valid || !now_bin || *now_bin < t.height) return;") != std::string::npos &&
               src.find("if (!drops_tip_synced()) return;") != std::string::npos &&
               src.find("return drops_peer_height > 0 && nb && *nb >= drops_peer_height;") != std::string::npos,
               "★ enrolment + arm wait until the NATIVE tip clock has reached the served template's bin AND the "
               "best peer's height (READY is not at-the-tip: no enrolment against a half-synced index)");
+#endif
         check(src.find("set_pre_harvest(") == std::string::npos,
               "the frontier reaches the bundle ONLY through attach()'s pre_harvest (no hand-rolled hook)");
         check(src.find("drops->on_raindrop(") != std::string::npos && src.find("drain_drops()") != std::string::npos,
               "replicated raindrops (own + peers') are drained into the harvester");
+#ifdef C2POOL_XMR_DROPS_ENROL_TIDY
+        check(src.find("drops->on_share_pushed(") == std::string::npos && src.find("drops->on_share_lane(") != std::string::npos,
+              "every pushed share enters the lane-position log only (S is counted from the lane prefix; no node-local share book)");
+#else
         check(src.find("drops->on_share_pushed(") != std::string::npos,
               "every pushed share is teed into the share counter (S is never UNKNOWN)");
+#endif
         check(src.find("drops->set_cut_price(booking_price)") != std::string::npos,
               "the booking callback hands the node the WorkPrice at THIS cut");
         check(src.find("ro.drops_floor_diff = drops_live ? drops->floor_diff() : 0") != std::string::npos,

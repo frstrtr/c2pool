@@ -170,6 +170,10 @@ struct XmrSettlementConfig {
     // books at. Unset / false => no pay-now (master's residual behaviour).
     std::function<bool(std::uint64_t next_pos, const ::v37::bytes32& spine,
                        std::vector<::c2pool::v37n::settle::WeightedPayee>& out)> paynow_source;
+    // EMPTY-CUT FINDER (operator ruling 09-26): the payee this node's templates
+    // pay when paynow_source finds the view at the cut but no payee in it (the
+    // node's own payee). Unset => an empty cut keeps master's residual shape.
+    std::optional<::v37::ScriptRef> ecut_finder;
 
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
@@ -326,6 +330,7 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
     if (ctx.has_credit_cut && cfg.paynow_source)   // SAME-BLOCK PAY-NOW: E_b weights at that cut
         ctx.has_paynow = cfg.paynow_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest, ctx.paynow_payees);
+    if (ctx.has_paynow && ctx.paynow_payees.empty()) ctx.ecut_finder = cfg.ecut_finder;   // EMPTY-CUT FINDER
     if (why) why->clear();
     return ctx;
 }
@@ -396,7 +401,13 @@ public:
     explicit XmrOwedFixture(::v37::ChainId chain) : m_ledger(chain) {}
     //  wrap the NODE's live OwedLedger (FOUND/FINALIZE/ORPHAN land there).
     explicit XmrOwedFixture(OwedLedger& ext) : m_ledger(ext.chain()), m_ext(&ext) {}
-    void learn_ref(const ::v37::ScriptRef& pay) { m_paymap[::v37::xmr::xmr_identity_key(pay)] = pay; }
+    // true = the resolver did not hold this ref yet (REJOIN-PAYEE counts what a cut taught it)
+    bool learn_ref(const ::v37::ScriptRef& pay) {
+        auto& slot = m_paymap[::v37::xmr::xmr_identity_key(pay)];
+        const bool fresh = !(slot == pay);
+        slot = pay;
+        return fresh;
+    }
     std::vector<::v37::bytes32> keys() const { std::vector<::v37::bytes32> v; for (const auto& [k, r] : m_paymap) { (void)r; v.push_back(k); } return v; }
 
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key

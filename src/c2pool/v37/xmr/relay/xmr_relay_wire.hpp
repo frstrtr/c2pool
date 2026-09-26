@@ -27,6 +27,9 @@
 //         0x45 FB_GETDROPS   ★ DROPS (gate ON only): raindrop inventory / fetch for [lo, hi)
 //         0x46 FB_DROPINV    ★ DROPS (gate ON only): the raindrop ids a peer holds for [lo, hi)
 //       (a pre-0x43 node counts 0x43/0x44 as fb_unknown and KEEPS the socket)
+//         0x48 FB_PING       RELAY-LIVENESS keepalive probe (u64 nonce; no consensus bytes)
+//         0x49 FB_PONG       its echo (same nonce)
+//       (a pre-0x48 node counts 0x48/0x49 as fb_unknown and KEEPS the socket)
 //     0x80..0x83   carrier_supply.hpp GETORDER/ORDER/GETFRAMES/FRAMES (reused)
 //
 // Every integer is little-endian, every decoder is TOTAL and BOUNDED (a bad
@@ -105,6 +108,8 @@ inline constexpr u8  FB_CTX       = 0x44;
 inline constexpr u8  FB_GETDROPS  = 0x45;   // ★ DROPS backfill (gate ON only; never sent with the flip at 0)
 inline constexpr u8  FB_DROPINV   = 0x46;   // ★ DROPS backfill: the raindrop ids a peer holds for [lo, hi)
 inline constexpr u8  FB_GETWON    = 0x47;   // ★ DROPS-RESTART (gate ON only): ask any peer for a carried FB_BLOCK_WON v0x02 by bid
+inline constexpr u8  FB_PING      = 0x48;   // RELAY-LIVENESS
+inline constexpr u8  FB_PONG      = 0x49;   // RELAY-LIVENESS
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -129,6 +134,11 @@ inline constexpr std::size_t kHelloPoolIdBytes      = 32 + 4 + 4;               
 inline constexpr std::size_t kHelloBytesPoolId      = kHelloBytes + kHelloPoolIdBytes;  // 142
 inline constexpr std::size_t kHelloPoolGenesisBytes = 32;                            // POOL-LINEAGE: pool_genesis_id
 inline constexpr std::size_t kHelloBytesPoolGenesis = kHelloBytesPoolId + kHelloPoolGenesisBytes;  // 174
+// ★ DROPS-ENROL-TIDY (flip 1 only): + the pool's --drops-enrol set digest, sent
+// only by a node with DROPS live and a non-empty enrol set AND a pool genesis
+// (so the 174-byte frame keeps its meaning); never at flip 0.
+inline constexpr std::size_t kHelloEnrolSetBytes    = 32;
+inline constexpr std::size_t kHelloBytesEnrolSet    = kHelloBytesPoolGenesis + kHelloEnrolSetBytes;  // 206
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
 // ENROL-REPL: FB_BLOCK_WON v0x02 (flip-only) = the 127-byte v0x01 body + the
 // winner's composed DROPS delta: u16 n | n x (payee 32 | i64 delta) | enrollment_digest 32.
@@ -140,6 +150,10 @@ inline constexpr std::size_t kBlockWonDropsRowBytes  = 32 + 8;
 // the consensus flip: at flip 0 the live decoder accepts exactly v0x01 (127 B),
 // as master does, and nothing emits v0x02 (the w3 v0x03 rule, w3_relay.hpp).
 inline constexpr bool        kBlockWonDropsLive      = ::c2pool::v37n::kActivateConsensusV1;
+// ★ DROPS-ENROL-TIDY: the 206-byte HELLO (enrol-set trailer) exists only under
+// the flip too: at flip 0 it is never emitted and the decoder refuses it as
+// "wrong length", exactly as master.
+inline constexpr bool        kHelloEnrolSetLive      = ::c2pool::v37n::kActivateConsensusV1;
 inline constexpr std::size_t kCtxMaxIds             = 8;                 // ids per FB_GETCTX
 inline constexpr std::size_t kCtxMaxBlob            = 512 * 1024;        // one Monero block blob (header | miner_tx | tx hashes)
 inline constexpr std::size_t kCtxHeader             = 1 + 1 + 4 + 32 + 4; // op ver chain id len
@@ -361,6 +375,24 @@ inline PoolId pool_id_of(u32 chain_id, const ::v37::LaneParams& p,
     return PoolId{::c2pool::v37n::rb::lane_tag(ctx, 0, 0, 0), version, authority};
 }
 
+// FLAG DAY (#1803 review): the XMR pool-rules version a node's HELLO pool id
+// is built with. V37F (EMPTY-CUT FINDER) changed the flip-0 coinbase bytes of
+// empty-cut blocks and CUT-FLOOR refuses a regressing credit cut, but neither
+// moved SHIPPED_CONSENSUS_VERSION, so a pre-#1803 node (e.g. RC4 5db1f675)
+// joined the pool, refused its first block and stalled. The HELLO pool id now
+// folds this version in (it moves the HELLO lane_tag ONLY: the block-level
+// pool_tag, the LaneParams and every coinbase byte stay on
+// SHIPPED_CONSENSUS_VERSION), so such a node is refused AT HELLO as
+// TAG_MISMATCH field=version with an explicit reason. Bump it with every
+// change of the lane-block validity rules that is not a consensus version.
+//   1 = SHIPPED_CONSENSUS_VERSION (V37.1, pre-#1803)
+//   2 = + #1803 EMPTY-CUT FINDER (V37F) + CUT-FLOOR
+inline constexpr u32 kXmrPoolRulesVersion = 2;
+#define C2POOL_XMR_POOL_RULES_VERSION 1   // feature probe for KATs built on both trees
+inline PoolId node_pool_id(u32 chain_id, const ::v37::LaneParams& p) {
+    return pool_id_of(chain_id, p, kXmrPoolRulesVersion);
+}
+
 inline std::string hex32(const bytes32& h) {
     static const char* d = "0123456789abcdef";
     std::string s; s.reserve(64);
@@ -380,6 +412,7 @@ struct Hello {
     bytes32 lane_digest{};            // LaneSnapshot digest at that tip (diagnostic)
     BindMode bind = BindMode::None;
     std::optional<PoolId> pool;       // POOL-ID extension (none = a 102-byte HELLO)
+    std::optional<bytes32> enrol_set; // ★ DROPS-ENROL-TIDY: enrol_set_digest (flip 1, needs pool->genesis; none = <= 174 B)
     bool operator==(const Hello&) const = default;
 };
 
@@ -391,12 +424,14 @@ inline std::vector<u8> encode_hello(const Hello& h) {
     le::put64(f, h.lane_next_pos); le::putb(f, h.lane_digest); f.push_back(static_cast<u8>(h.bind));
     if (h.pool) { le::putb(f, h.pool->lane_tag); le::put32(f, h.pool->version); le::put32(f, h.pool->authority); }
     if (h.pool && h.pool->genesis) le::putb(f, *h.pool->genesis);   // POOL-LINEAGE
+    if (kHelloEnrolSetLive && h.pool && h.pool->genesis && h.enrol_set) le::putb(f, *h.enrol_set);   // ★ DROPS-ENROL-TIDY (flip 1)
     return f;
 }
 
 inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId && f.size() != kHelloBytesPoolGenesis)
+    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId && f.size() != kHelloBytesPoolGenesis &&
+        !(kHelloEnrolSetLive && f.size() == kHelloBytesEnrolSet))   // flip 0: exactly master's three frames
         return bad("hello: wrong length");
     if (f[0] != FB_HELLO) return bad("hello: wrong opcode");
     if (f[1] != kFbVersion) return bad("hello: unknown version");
@@ -413,12 +448,14 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
     if (p[0] > static_cast<u8>(BindMode::Rbind)) return bad("hello: unknown bind mode");
     h.bind = static_cast<BindMode>(p[0]); p += 1;
     h.pool.reset();
-    if (f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis) {
+    h.enrol_set.reset();
+    if (f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis || f.size() == kHelloBytesEnrolSet) {
         PoolId id;
         id.lane_tag = le::getb(p); p += 32;
         id.version = le::get32(p); p += 4;
         id.authority = le::get32(p); p += 4;
-        if (f.size() == kHelloBytesPoolGenesis) id.genesis = le::getb(p);   // POOL-LINEAGE
+        if (f.size() >= kHelloBytesPoolGenesis) { id.genesis = le::getb(p); p += 32; }   // POOL-LINEAGE
+        if (f.size() == kHelloBytesEnrolSet) h.enrol_set = le::getb(p);                  // ★ DROPS-ENROL-TIDY
         h.pool = id;
     }
     return true;
@@ -451,7 +488,11 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.chain_id != ours.chain_id)
         return out("chain_id", "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id));
     if (theirs.pool->version != ours.pool->version)
-        return out("version", "consensus version " + std::to_string(theirs.pool->version) + " != ours " + std::to_string(ours.pool->version));
+        return out("version", "consensus version " + std::to_string(theirs.pool->version) + " != ours " + std::to_string(ours.pool->version) +
+                   (theirs.pool->version < ours.pool->version && ours.pool->version == kXmrPoolRulesVersion
+                        ? ": the peer runs older pool rules (pre-#1803: no V37F empty-cut finder / cut floor) and would stall on "
+                          "this pool's blocks -- upgrade it"
+                        : ""));
     if (theirs.pool->authority != ours.pool->authority)
         return out("authority", "authority " + std::to_string(theirs.pool->authority) + " != ours " + std::to_string(ours.pool->authority));
     return out("geometry", "LaneParams geometry differs (window/c0/rollup/half_life/level_caps/k_floor)");
@@ -461,6 +502,7 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
 // ones that decide whether two nodes can fold the same lane: a mismatch is an
 // EXPLICIT refusal with a reason, never a silent divergence (the memory-recorded
 // "mismatched-LaneParams nodes must reject explicitly" gap).
+inline constexpr char kEnrolSetMismatch[] = "ENROL_SET_MISMATCH";
 inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
     if (auto t = pool_id_mismatch(ours, theirs); !t.empty()) return t;   // POOL-ID (subsumes chain_id when tagged)
@@ -468,7 +510,16 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.share_diff != ours.share_diff)
         return "share_diff " + std::to_string(theirs.share_diff) + " != ours " + std::to_string(ours.share_diff) + " (R-1 pin)";
     if (theirs.bind != ours.bind) return std::string("bind mode ") + to_string(theirs.bind) + " != ours " + to_string(ours.bind);
-    if (theirs.lane_params_digest != ours.lane_params_digest) return "lane_params_digest differs (different LaneParams geometry/gates)";
+    if (theirs.lane_params_digest != ours.lane_params_digest) {
+        // ★ DROPS-ENROL-TIDY (flip 1): the enrol set is mixed into the digest, so
+        // name it when the two HELLOs carry different enrol-set digests.
+        if (theirs.enrol_set != ours.enrol_set)
+            return std::string(kEnrolSetMismatch) + " enrol-set digest differs: ours=" +
+                   (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +
+                   (theirs.enrol_set ? hex32(*theirs.enrol_set).substr(0, 12) : std::string("none")) +
+                   " (every node of a pool must run the identical --drops-enrol list)";
+        return "lane_params_digest differs (different LaneParams geometry/gates)";
+    }
     if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";
     return "";
 }
@@ -696,6 +747,36 @@ inline bool decode_dropinv(const std::vector<u8>& f, u32& chain_id, u64& lo, u64
     if (f.size() != kDropsInvHeader + 32 * n) return bad("dropinv: wrong length");
     ids.clear();
     for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + kDropsInvHeader + 32 * i));
+    return true;
+}
+
+// ── FB_PING (0x48) / FB_PONG (0x49): RELAY-LIVENESS keepalive ────────────────
+// Capstone attempt 2: a WAN relay link went silent in BOTH directions for
+// ~3.5 min while TCP kept both sessions up (conns=2 ready=2), so each side
+// closed lane bins without the other side's receipts. A ready peer is now
+// probed with PING every keepalive interval; any frame it sends (a PONG, a
+// receipt, a supply answer) proves the link alive. A link whose peer ANSWERED
+// a PING on it and then stays silent past the silence timeout is dropped and
+// redialed (xmr_relay_node.hpp, RELAY-LIVENESS). The frame carries only a
+// sender nonce: nothing here enters a lane, a digest or a coinbase.
+//   PING : u8 0x48 ; u8 ver ; u64 nonce      (10 B)
+//   PONG : u8 0x49 ; u8 ver ; u64 nonce      (10 B, the PING nonce echoed)
+// A pre-0x48 peer counts both as fb_unknown and keeps the socket; it never
+// answers, so the silence timeout is never enforced against it.
+inline constexpr std::size_t kPingBytes = 1 + 1 + 8;
+inline std::vector<u8> encode_ping(u8 op, u64 nonce) {
+    if (op != FB_PING && op != FB_PONG) return {};
+    std::vector<u8> f; f.reserve(kPingBytes);
+    f.push_back(op); f.push_back(kFbVersion); le::put64(f, nonce);
+    return f;
+}
+inline bool decode_ping(const std::vector<u8>& f, u8& op, u64& nonce, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() != kPingBytes) return bad("ping: wrong length");
+    if (f[0] != FB_PING && f[0] != FB_PONG) return bad("ping: wrong opcode");
+    if (f[1] != kFbVersion) return bad("ping: unknown version");
+    op = f[0];
+    nonce = le::get64(f.data() + 2);
     return true;
 }
 

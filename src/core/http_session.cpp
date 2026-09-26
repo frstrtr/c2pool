@@ -350,7 +350,12 @@ void HttpSession::process_request()
             }
 
             nlohmann::json rest_result;
-            if (target == "/local_rate")
+            // Per-coin REST override (unset on every coin but c2pool-v37-xmr):
+            // the coin answers the path itself, or returns nullopt to fall through.
+            std::optional<nlohmann::json> rest_override = mining_interface_->call_rest_override(target);
+            if (rest_override)
+                rest_result = std::move(*rest_override);
+            else if (target == "/local_rate")
                 rest_result = mining_interface_->rest_local_rate();
             else if (target == "/global_rate")
                 rest_result = mining_interface_->rest_global_rate();
@@ -1073,6 +1078,13 @@ void HttpSession::process_request()
                                 contents.insert(pos, tag);
                             }
                         }
+
+                        // Per-coin payout-scheme label (empty on every coin but
+                        // c2pool-v37-xmr, whose scheme is WRS / PPR, never PPLNS).
+                        const auto& scheme_label = mining_interface_->get_payout_scheme_label();
+                        if (!scheme_label.empty() &&
+                            (ext == ".html" || ext == ".htm" || ext == ".js" || ext == ".mjs"))
+                            core::rewrite_payout_scheme_label(contents, scheme_label);
 
                         // Explorer nav link injection removed — each HTML page has
                         // client-side JS that checks currency_info.explorer_enabled

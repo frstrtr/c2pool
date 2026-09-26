@@ -57,6 +57,7 @@
 #include <string>
 #include <vector>
 
+#include <sharechain/v37/v37_descriptor_xmr.hpp>   // xmr_identity_key / xmr_ref_valid (EMPTY-CUT FINDER)
 #include <sharechain/v37/v37_hash.hpp>
 #include "impl/xmr/settle/xmr_coinbase.hpp"   // x6::paynow_split
 #include "xmr_credit_cut.hpp"                 // extra_nonce_field, kMagic/kTailBytes (V37C)
@@ -78,15 +79,22 @@ inline std::vector<std::uint8_t> encode_tail(std::uint64_t base) {
 // The base B from a 0x02 payload: strip the V37C tail, then the POOL-LINEAGE
 // V37P field, then the V37D tail (each only if present), then read "V37N"
 // u64le at the end. nullopt = no pay-now. Canonical order of a lane payload:
-//     [ nonce | rbind? | pad | "V37N" B | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine ]
+//     [ nonce | rbind? | pad | "V37F" finder? | "V37N" B | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine ]
+// (V37F: the EMPTY-CUT FINDER field below, only in an empty-cut block.)
 // A malformed V37P field (unknown version) is NOT skipped, so the V37N magic
 // check fails closed (the lineage gate has already made such a block ordinary).
-inline std::optional<std::uint64_t> parse_payload(const std::vector<std::uint8_t>& p) {
+// The payload offset right after the V37N field (== where V37D / V37P / V37C
+// begin), after stripping those three from the end exactly like the readers do.
+inline std::size_t end_before_donation_tail(const std::vector<std::uint8_t>& p) {
     std::size_t end = credit::end_before_credit_tail(p);
     if (credit::parse_pool_tag_payload(p) == credit::PoolTagParse::Present) end -= credit::kPoolTagFieldBytes;
     if (end >= fee::kDonationOwedTailBytes &&
         std::memcmp(p.data() + end - fee::kDonationOwedTailBytes, fee::kDonationOwedMagic, 4) == 0)
         end -= fee::kDonationOwedTailBytes;
+    return end;
+}
+inline std::optional<std::uint64_t> parse_payload(const std::vector<std::uint8_t>& p) {
+    const std::size_t end = end_before_donation_tail(p);
     if (end < kPayNowTailBytes) return std::nullopt;
     const std::uint8_t* t = p.data() + end - kPayNowTailBytes;
     if (std::memcmp(t, kPayNowMagic, 4) != 0) return std::nullopt;
@@ -119,6 +127,113 @@ inline std::map<::v37::bytes32, long long> allocation(std::uint64_t total, std::
     for (std::size_t i = 0; i < keys.size(); ++i)
         if (a[i] > 0) out[keys[i]] = static_cast<long long>(a[i]);
     return out;
+}
+
+// ===========================================================================
+// EMPTY-CUT FINDER (operator ruling 09-26). THE GAP IT CLOSES: a block whose
+// on-chain credit cut is EMPTY (a brand-new pool's first 1-3 blocks: nobody's
+// work is at the cut yet) credits nobody, so pay-now had no payee and the
+// whole reward went to the donation output / residual sink.
+//
+// THE RULE. In an empty cut the finder's own share counts as the work: the
+// block pays its FINDER the pool P = total - B (B = the V37N base: sum of owed
+// takes + sum of fixed), i.e. reward - 1 with the fee model ON (the donation
+// keeps its 1-piconero marker) and the whole reward with the fee model OFF
+// (nothing is left for the residual sink, which then emits no output), minus
+// any owed takes the block also pays.
+//
+// THE FINDER IS WHAT THE BLOCK COMMITS. The coinbase outputs are one set per
+// template (the per-worker bytes live only in the 0x02 region), so the finder
+// is the payee the template was built for: the building node's own payee
+// (the same payee its FOUND records carry). The builder commits it in full as
+// the 0x02 field
+//     "V37F" || u8 kind || payee[64]            (69 bytes, right before V37N)
+// so every node derives finder_identity = xmr_identity_key(payee) from the
+// block bytes alone: no ledger, no relay, no learned ref.
+//
+// THE RECEIVE SIDE (a pure function of the block + the fold at its cut):
+//   V37F absent             -> nothing (every non-empty-cut block, unchanged).
+//   V37F present, and
+//     malformed (kind)      -> REFUSED
+//     V37N absent           -> not a finder block (V37F is read only before a
+//                              V37N field); its finder output is unmapped ->
+//                              fail-closed like any unknown payee
+//     payee not a valid XMR -> REFUSED
+//     the fold is NON-empty -> REFUSED (a finder claim on a cut that credits
+//                              work would take the pool from those miners)
+//     else                  -> credit := { finder_identity : P } (P > 0); the
+//                              ordinary pay-now booking (net_booking) then
+//                              requires the coinbase to pay the finder >= P
+//                              and books the block NET: the finder's credit
+//                              and payout both drop by P, so FINALIZE never
+//                              pays it twice.
+// A coinbase that pays anyone but the committed finder is unmapped (fail-
+// closed) or under-pays the finder (net_booking refuses it).
+// ===========================================================================
+#define C2POOL_V37_XMR_ECUT_FINDER 1   // feature probe for KATs built on both trees
+inline constexpr unsigned char kFinderMagic[4] = {'V', '3', '7', 'F'};
+inline constexpr std::size_t   kFinderFieldBytes = 4 + 1 + 64;   // 69
+
+// Empty when `payee` is not an XMR-kind 64-byte ref (the builder then arms nothing).
+inline std::vector<std::uint8_t> encode_finder_field(const ::v37::ScriptRef& payee) {
+    if (!::v37::xmr::is_xmr_kind(payee.kind) || payee.payload.size() != 64) return {};
+    std::vector<std::uint8_t> f(kFinderMagic, kFinderMagic + 4);
+    f.push_back(static_cast<std::uint8_t>(payee.kind));
+    f.insert(f.end(), payee.payload.begin(), payee.payload.end());
+    return f;
+}
+
+// Where the V37F field would start (nullopt: no V37N field, or no room).
+inline std::optional<std::size_t> finder_field_pos(const std::vector<std::uint8_t>& p) {
+    if (!parse_payload(p)) return std::nullopt;
+    const std::size_t end = end_before_donation_tail(p) - kPayNowTailBytes;
+    if (end < kFinderFieldBytes) return std::nullopt;
+    if (std::memcmp(p.data() + end - kFinderFieldBytes, kFinderMagic, 4) != 0) return std::nullopt;
+    return end - kFinderFieldBytes;
+}
+// True iff the V37F magic sits right before V37N, whatever its kind byte.
+inline bool finder_magic_present(const std::vector<std::uint8_t>& p) { return finder_field_pos(p).has_value(); }
+// The committed finder payee; nullopt when absent or its kind is not XMR.
+inline std::optional<::v37::ScriptRef> parse_finder_payload(const std::vector<std::uint8_t>& p) {
+    const auto pos = finder_field_pos(p);
+    if (!pos) return std::nullopt;
+    const std::uint8_t* f = p.data() + *pos;
+    ::v37::ScriptRef r;
+    r.kind = static_cast<::v37::ScriptKind>(f[4]);
+    if (!::v37::xmr::is_xmr_kind(r.kind)) return std::nullopt;
+    r.payload.assign(f + 5, f + kFinderFieldBytes);
+    return r;
+}
+inline std::optional<::v37::ScriptRef> parse_finder(const std::vector<unsigned char>& tx_extra) {
+    const auto nf = credit::extra_nonce_field(tx_extra);
+    if (!nf) return std::nullopt;
+    return parse_finder_payload(*nf);
+}
+inline bool finder_malformed(const std::vector<unsigned char>& tx_extra) {
+    const auto nf = credit::extra_nonce_field(tx_extra);
+    return nf && finder_magic_present(*nf) && !parse_finder_payload(*nf);
+}
+
+// Receive side: turn the EMPTY fold at the cut into the finder's credit. A
+// no-op (true) when the block commits no finder. On a refusal `credit` is
+// left untouched and *why says why.
+inline bool apply_empty_cut_finder(const std::optional<::v37::ScriptRef>& finder, bool malformed,
+                                   const std::optional<std::uint64_t>& base, std::uint64_t total,
+                                   std::map<::v37::bytes32, long long>& credit, std::string* why = nullptr,
+                                   ::v37::bytes32* finder_id = nullptr) {
+    auto no = [&](const std::string& w) { if (why) *why = "ecut-finder-refused: " + w; return false; };
+    if (malformed) return no("the V37F field is malformed (its payee kind is not XMR)");
+    if (!finder) return true;
+    if (!base) return no("V37F without a V37N base (the finder pool is undefined)");
+    if (!::v37::xmr::xmr_ref_valid(*finder)) return no("the committed finder payee is not a valid XMR ref");
+    for (const auto& kv : credit)
+        if (kv.second > 0) return no("V37F on a NON-empty credit cut (the cut credits work; the finder rule is for an empty cut only)");
+    const ::v37::bytes32 id = ::v37::xmr::xmr_identity_key(*finder);
+    if (finder_id) *finder_id = id;
+    credit.clear();
+    const std::uint64_t pool = total > *base ? total - *base : 0;
+    if (pool > 0) credit[id] = static_cast<long long>(pool);
+    return true;
 }
 
 struct NetResult {
@@ -174,5 +289,91 @@ inline NetResult net_booking(const std::optional<std::uint64_t>& base, std::uint
     }
     return r;
 }
+
+// ===========================================================================
+// CUT-FLOOR (#1803 review, economic HIGH). apply_empty_cut_finder checks only
+// that the fold at the block's OWN committed cut is empty; nothing tied that
+// cut to recency, so a modified builder could commit P = 0 (reproducible, an
+// empty credit) plus V37F and take the reward minus the fixed outputs. The
+// rule: a lane block's committed credit cut P (V37C) must not regress below
+// the P committed by the previous lane block of the same pool lineage (V37P)
+// booked in chain order. A regressing cut is a DECIDED refusal (the R-C
+// refuse path: ledger-neutral, node-local liability, identical on every
+// node). The empty-cut finder rule then pays only where the cut is
+// legitimately empty: P == 0 for the lineage's first lane block (nothing
+// booked below it), or a cut at/above the floor that credits nobody.
+//
+// Determinism: the floor is the max P over the lane blocks BOOKED at heights
+// below h. It only grows as lower blocks book, so a refusal read against it
+// is final; a pass is final once every lane block below h is decided, so the
+// caller keeps h UNDECIDED (held, never refused) while a lower lane block is
+// still retried / held. Honest blocks: a builder commits its lane tip, which
+// does not regress below a block buried under it, so flip 0 stays
+// byte-identical and books identically for every honest block.
+// ===========================================================================
+#define C2POOL_V37_XMR_CUT_FLOOR 1   // feature probe for KATs built on both trees
+
+class LaneCutFloor {
+public:
+    struct Entry { std::uint64_t P = 0; std::string bid; };
+    // The highest committed P among the lane blocks booked below height h
+    // (its height in *at_h). nullopt: nothing booked below h.
+    std::optional<std::uint64_t> floor_below(std::uint64_t h, std::uint64_t* at_h = nullptr) const {
+        std::optional<std::uint64_t> best;
+        for (auto it = m_booked.begin(); it != m_booked.end() && it->first < h; ++it)
+            if (!best || it->second.P >= *best) { best = it->second.P; if (at_h) *at_h = it->first; }
+        return best;
+    }
+    // true = the cut does not regress; false (+ *why) = REFUSED, decided.
+    bool check(std::uint64_t h, std::uint64_t P, std::string* why = nullptr) const {
+        std::uint64_t fh = 0;
+        const auto f = floor_below(h, &fh);
+        if (!f || P >= *f) return true;
+        if (why)
+            *why = "cut-floor-refused: the committed credit cut P=" + std::to_string(P) + " regresses below P=" +
+                   std::to_string(*f) + " committed by the lane block booked at h=" + std::to_string(fh) +
+                   " (a lane block's cut must not regress below the previous lane block of its lineage)";
+        return false;
+    }
+    // A booked lane block. false = already recorded (the same bid and P).
+    bool note_booked(std::uint64_t h, std::uint64_t P, const std::string& bid) {
+        auto it = m_booked.find(h);
+        if (it != m_booked.end() && it->second.bid == bid && it->second.P == P) return false;
+        m_booked[h] = Entry{P, bid};
+        return true;
+    }
+    // The chain's block at height h is `bid`: an entry of ANOTHER block at h
+    // was reorged out and bounds nothing any more. true = one was dropped.
+    bool on_block_at(std::uint64_t h, const std::string& bid) {
+        auto it = m_booked.find(h);
+        if (it == m_booked.end() || it->second.bid == bid) return false;
+        m_booked.erase(it);
+        return true;
+    }
+    std::size_t size() const { return m_booked.size(); }
+    // Persistence: one "h P bid" line per booked lane block, appended; on load
+    // the last line of a height wins and a line that does not parse is skipped.
+    static std::string line_of(std::uint64_t h, std::uint64_t P, const std::string& bid) {
+        return std::to_string(h) + " " + std::to_string(P) + " " + bid + "\n";
+    }
+    bool load_line(const std::string& ln) {
+        std::uint64_t v[2] = {0, 0};
+        std::size_t i = 0;
+        for (auto& x : v) {
+            const std::size_t b = i;
+            while (i < ln.size() && ln[i] >= '0' && ln[i] <= '9' && i - b < 19) x = x * 10 + static_cast<std::uint64_t>(ln[i++] - '0');
+            if (i == b || i >= ln.size() || ln[i] != ' ') return false;
+            ++i;
+        }
+        std::string bid = ln.substr(i);
+        while (!bid.empty() && (bid.back() == '\n' || bid.back() == '\r')) bid.pop_back();
+        if (bid.empty() || bid.find(' ') != std::string::npos) return false;
+        m_booked[v[0]] = Entry{v[1], bid};
+        return true;
+    }
+
+private:
+    std::map<std::uint64_t, Entry> m_booked;   // height -> the booked lane block's committed P
+};
 
 } // namespace c2pool::v37n::xmr::paynow

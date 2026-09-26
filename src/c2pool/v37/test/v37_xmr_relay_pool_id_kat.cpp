@@ -35,6 +35,11 @@
 //       lane digests; a raw peer that sends a mismatched HELLO and then
 //       RECEIPTS + BLOCK_WON + GETCTX in the same burst gets NONE of them
 //       admitted (0 receipts, 0 lane blocks, 0 contexts served)
+//   P7  FLAG DAY (#1803 review): this build's HELLO pool id (node_pool_id)
+//       folds kXmrPoolRulesVersion, so a pre-#1803 node (pool id at
+//       SHIPPED_CONSENSUS_VERSION, e.g. RC4 5db1f675) is refused AT HELLO as
+//       TAG_MISMATCH field=version (wire + live 3-node case). RED on 272cac0d
+//       (the pre-#1803 node is admitted, then stalls on the pool's blocks).
 //   P6  same pool: tagged A/B produce the SAME lane digest for the same
 //       receipts as a tagless (master-wire) pair
 //
@@ -437,5 +442,31 @@ int main() {
           "P6 tagless digest == tagged digest (" + hex(A.digest()).substr(0, 16) + "): the tag changes no lane byte");
     }
 
+    // ── P7 FLAG DAY (#1803 review): a pre-#1803 node is refused AT HELLO ─────
+    {
+        std::printf("-- P7 FLAG DAY: this build's node_pool_id vs a pre-#1803 node (pool id at SHIPPED_CONSENSUS_VERSION)\n");
+#ifdef C2POOL_XMR_POOL_RULES_VERSION
+        const u32 ours_v = kXmrPoolRulesVersion;
+        C(node_pool_id(kChain, base) == pool_id_of(kChain, base, ours_v) && ours_v > ::v37::SHIPPED_CONSENSUS_VERSION,
+          "P7 the node's HELLO pool id (node_pool_id, what main_v37_xmr sends) folds kXmrPoolRulesVersion=" + std::to_string(ours_v) +
+          " > SHIPPED_CONSENSUS_VERSION=" + std::to_string(::v37::SHIPPED_CONSENSUS_VERSION));
+#else
+        const u32 ours_v = ::v37::SHIPPED_CONSENSUS_VERSION;   // the base main: pool_id_of(chain, params)
+        C(false, "P7 the node's HELLO pool id folds an XMR pool-rules version above SHIPPED_CONSENSUS_VERSION (absent in this build)");
+#endif
+        const bytes32 g = b32_of(0x5A);
+        Hello now_h; now_h.network = 3; now_h.chain_id = kChain; now_h.share_diff = kShareDiff; now_h.node_nonce = 71;
+        now_h.pool = pool_id_of(kChain, base, ours_v); now_h.pool->genesis = g;
+        Hello pre_h = now_h; pre_h.node_nonce = 72; pre_h.pool = pool_id_of(kChain, base); pre_h.pool->genesis = g;
+        Hello now2 = now_h; now2.node_nonce = 73;
+        const std::string r = hello_mismatch(now_h, pre_h), r2 = hello_mismatch(pre_h, now_h);
+        std::printf("    ours v%u vs pre-#1803 v%u: \"%s\"\n", ours_v, ::v37::SHIPPED_CONSENSUS_VERSION, r.c_str());
+        C(is_tag_mismatch(r) && r.find("field=version") != std::string::npos && is_tag_mismatch(r2),
+          "P7 a pre-#1803 HELLO is refused at HELLO, both directions, as TAG_MISMATCH field=version");
+        C(hello_mismatch(now_h, now2).empty(), "P7 two nodes of this build stay compatible");
+        Cfg now_c; now_c.version = ours_v;
+        Cfg pre_c;   // version = SHIPPED_CONSENSUS_VERSION: the RC4 5db1f675 HELLO
+        mismatch_case(C, "P7", now_c, pre_c, "version");
+    }
     return C.done("v37_xmr_relay_pool_id_kat");
 }
