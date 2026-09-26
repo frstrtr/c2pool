@@ -1522,12 +1522,16 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
 
     // Forward the txs the peer needs BEFORE the shares (p2pool remember_tx
     // protocol) — a share referencing unknown txs makes the receiving oracle
-    // node drop the connection.
+    // node drop the connection. A tx already in this peer's STANDING set is
+    // left out, as canonical leaves out mining_txs (p2p.py:377): the peer
+    // holds it already, a second remember disconnects us (p2p.py:474-477) and
+    // the closing forget_tx would erase the seed (#950).
     std::set<uint256> needed_txs;
     for (auto& share : shares) {
         share.invoke([&](auto* obj) {
             for (const auto& th : obj->m_new_transaction_hashes) {
-                if (!peer->m_remote_txs.count(th) && !peer->m_remembered_txs.count(th))
+                if (!peer->m_remote_txs.count(th) && !peer->m_remembered_txs.count(th)
+                    && !peer->m_standing_remembered.count(th))
                     needed_txs.insert(th);
             }
         });
@@ -1726,6 +1730,7 @@ void NodeImpl::send_standing_remember(const peer_ptr& peer)
     if (!peer)
         return;
     std::vector<coin::MutableTransaction> full_txs;
+    std::vector<uint256> seeded;
     {
         // try_to_lock, never block: mirrors advertise_known_txs — if the compute
         // thread is mid-cycle we skip; the next inbound handshake reseeds.
@@ -1736,11 +1741,14 @@ void NodeImpl::send_standing_remember(const peer_ptr& peer)
             m_known_txs, MAX_REMEMBERED_TXS_SIZE, &remembered_tx_size);
         full_txs.reserve(chosen.size());
         for (const auto& h : chosen)
-            if (auto it = m_known_txs.find(h); it != m_known_txs.end())
+            if (auto it = m_known_txs.find(h); it != m_known_txs.end()) {
                 full_txs.emplace_back(it->second);
+                seeded.push_back(h);
+            }
     }
     if (full_txs.empty())
         return;
+    peer->m_standing_remembered.insert(seeded.begin(), seeded.end());
     // Canonical p2p.py:269 sends tx_hashes=[] (all as bodies): at handshake we do
     // not yet know the peer's remote_tx_hashes.
     peer->write(dash::message_remember_tx::make_raw({}, full_txs));
