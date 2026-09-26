@@ -199,6 +199,12 @@ void bad_rows() {
         {{"--test-unknwon-fork-stall-s", "5"}, "--test-unknwon-fork-stall-s", "a typo of --test-unknown-fork-stall-s"},
         {{"--test-unknown-fork-stall-s"},      "--test-unknown-fork-stall-s", "the fuse stall knob with no value (last)"},
         {{"--test-unknown-fork-stall-s", "12abc"}, "--test-unknown-fork-stall-s", "the fuse stall knob with junk"},
+        // XMR-WEB: the dashboard flags, parsed by the strict helpers.
+        {{"--web-port", "70000"},              "--web-port",            "a web port above 65535"},
+        {{"--web-port", "80x"},                "--web-port",            "a web port with junk"},
+        {{"--web-port"},                       "--web-port",            "the web port with no value (last)"},
+        {{"--web-host"},                       "--web-host",            "the web host with no value (last)"},
+        {{"--web-prot", "63600"},              "--web-prot",            "a typo of --web-port"},
     };
     for (const Bad& b : rows) {
         const auto args = safe(b.tail);

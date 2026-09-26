@@ -898,6 +898,36 @@ target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 # include path, not a new runtime dependency.
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_template xmr_node xmr_coin
                                              xmr_native_txpool Threads::Threads)
+# XMR-WEB (--web-port, OFF by default): the read-only provider behind the shared
+# core::WebServer dashboard (the same web server + web-static UI every coin
+# binary serves). A STATIC archive that links core PRIVATE, so the daemon TU
+# never sees core's include paths (src/btclibs/compat/cpuid.h would shadow the
+# toolchain <cpuid.h> xmr_msr_boost.hpp needs) and only the core objects the
+# web layer references are pulled in. The OBJECT-lib SCC is named directly, the
+# exact set core_test links for the web_server_* KATs (#22/#39).
+add_library(xmr_web_dashboard STATIC v37/xmr/xmr_web_dashboard.cpp)
+target_compile_features(xmr_web_dashboard PRIVATE cxx_std_20)
+target_include_directories(xmr_web_dashboard PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The release daemon stays static apart from glibc. web_server.cpp references
+# secp256k1 (the transition-message signature check, ltc/share_messages.hpp),
+# and core carries the SHARED ${SECP256K1_LIBRARIES}. Name the static archive
+# that sits next to it FIRST, so those references resolve from libsecp256k1.a
+# and the linker's --as-needed drops the .so (no libsecp256k1.so DT_NEEDED).
+# No sibling archive (or a non-.so secp256k1, e.g. a Conan target) = unchanged.
+set(XMR_WEB_SECP256K1_STATIC "")
+if (SECP256K1_LIBRARIES MATCHES "\\.so(\\.[0-9]+)*$")
+    get_filename_component(_xmr_web_secp_dir "${SECP256K1_LIBRARIES}" DIRECTORY)
+    find_library(XMR_WEB_SECP256K1_ARCHIVE NAMES libsecp256k1.a
+                 HINTS "${_xmr_web_secp_dir}" NO_DEFAULT_PATH)
+    if (XMR_WEB_SECP256K1_ARCHIVE)
+        set(XMR_WEB_SECP256K1_STATIC "${XMR_WEB_SECP256K1_ARCHIVE}")
+        message(STATUS "c2pool-v37-xmr web layer: static secp256k1 ${XMR_WEB_SECP256K1_ARCHIVE}")
+    endif()
+endif()
+target_link_libraries(xmr_web_dashboard PRIVATE ${XMR_WEB_SECP256K1_STATIC}
+                                                core c2pool_merged_mining c2pool_payout
+                                                c2pool_hashrate ltc_coin)
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_web_dashboard)
 # Reproducible release (docs/xmr-lane/REPRODUCIBLE-BUILD.md): the daemon links
 # only static archives, Boost headers and system libs, so the build RUNPATH CMake
 # derives from the Conan link dirs (<CONAN_HOME>/p/boost.../p/lib, which holds no

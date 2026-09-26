@@ -359,6 +359,9 @@ struct RelayStats {
     // REPAIR-PAGE: repair GETORDER pages asked, the largest page asked (ids),
     // pages that timed out (the page was halved) and pages that grew it.
     std::atomic<u64> repair_order_pages{0}, repair_order_page_max{0}, repair_page_timeouts{0}, repair_page_grown{0};
+    // REPAIR-PAGE liveness (#1808 review): non-final pages too thin to refresh
+    // the Ordering clock, and serving peers set aside by the total Ordering cap.
+    std::atomic<u64> repair_order_thin{0}, repair_order_capped{0};
     // RELAY-LIVENESS: keepalive frames, links dropped as SILENT, peers that
     // never answered a PING (pre-0x48 builds: silence not enforced), and
     // maintenance gaps that re-armed every link's clock.
@@ -1125,6 +1128,10 @@ private:
         PeerId rearm = 0, prefer = 0;
         std::map<PeerId, u64> deep;
         Clock::time_point since = Clock::now();
+        // REPAIR-PAGE liveness (#1808 review): when Ordering from `cur` began and
+        // the first page it asked (0 = no page answered yet); they size the cap.
+        Clock::time_point ordering_started = Clock::now();
+        u64 ordering_page = 0;
         // Fetching: progress + refetch bookkeeping
         Clock::time_point last_progress = Clock::now(), last_fetch = Clock::now(), polled = Clock::now();
         std::size_t cached_seen = 0;
@@ -1132,7 +1139,7 @@ private:
         u32 refetches = 0;
         void reset() {
             st = St::Idle; ids.clear(); cursor = 0; cur = 0; served_by = 0; since = Clock::now();
-            a0 = 0; probing = false; has_a0_digest = false;
+            a0 = 0; probing = false; has_a0_digest = false; ordering_page = 0;
             cached_seen = 0; fetch_tried.clear(); refetches = 0;
         }
     };
@@ -2177,6 +2184,19 @@ private:
         return j;
     }
 
+    // REPAIR-PAGE liveness (#1808 review). A non-final page refreshes the
+    // Ordering clock only when it carries >= min(ids asked, positions
+    // remaining) / 2 ids; one peer's whole Ordering is capped at
+    // timeout x (1 + ceil((P - a0) / first page asked)).
+public:
+    static bool repair_page_refreshes(u64 n_ids, u64 asked, u64 remaining, bool final_page) {
+        return final_page || n_ids >= std::min<u64>(asked, remaining) / 2;
+    }
+    static std::chrono::milliseconds repair_order_cap(std::chrono::milliseconds timeout, u64 remaining0, u64 first_page) {
+        const u64 pg = first_page ? first_page : 1;
+        return timeout * static_cast<long long>(1 + (remaining0 + pg - 1) / pg);
+    }
+private:
     // REPAIR-PAGE: the page this peer's next repair GETORDER asks (m_jmtx held).
     u32 repair_page_max_locked() const {
         const u32 cap = m_o.repair_order_page_max_ids ? m_o.repair_order_page_max_ids : kCtrlMaxIdsPerOrder;
@@ -2336,8 +2356,22 @@ private:
             for (const auto& e : o.ids) r.ids.push_back(e.id);
             // REPAIR-PAGE: a page that ADVANCES the cursor is progress: restart
             // the Ordering clock, so a repair of many small pages is bounded per
-            // page by repair_state_timeout_ms, not in total.
-            if (o.p_served > r.cursor) r.since = Clock::now();
+            // page by repair_state_timeout_ms. #1808 review: only a SUBSTANTIAL
+            // page is progress -- the final page, or one carrying at least
+            // min(ids asked, positions remaining) / 2 ids. A peer answering 1 id
+            // per page inside the request timeout no longer holds the repair for
+            // (P - a0) x timeout; and the whole Ordering is capped per peer
+            // (drive_repairs: timeout x (1 + ceil((P - a0) / first page))).
+            {
+                const u64 asked = j->max_ids ? j->max_ids : kCtrlMaxIdsPerOrder;
+                if (!r.ordering_page) r.ordering_page = asked;
+                const u64 remaining = r.P > r.cursor ? r.P - r.cursor : 0;
+                const bool final_page = o.p_served >= r.P;
+                if (o.p_served > r.cursor && repair_page_refreshes(o.ids.size(), asked, remaining, final_page))
+                    r.since = Clock::now();
+                else if (!final_page)
+                    m_st.repair_order_thin++;
+            }
             r.cursor = o.p_served;
             repair_page_answered(p, *j, o.ids.size());
             if (r.cursor < r.P) {
@@ -2409,6 +2443,7 @@ private:
     void drive_repairs() {
         const auto ready = ready_peers();
         std::vector<std::pair<PeerId, Job>> issue;
+        std::vector<std::string> notes;   // logged after the repair lock is released
         {
             std::lock_guard<std::mutex> lk(m_rmtx);
             const auto now = Clock::now();
@@ -2417,6 +2452,23 @@ private:
                 if (r.st == Repair::St::Ordering && now - r.since > timeout) {
                     if (r.cur) r.tried.insert(r.cur);
                     r.reset();
+                }
+                // REPAIR-PAGE liveness (#1808 review): the TOTAL Ordering of one
+                // peer is capped at timeout x (1 + ceil((P - a0) / first page));
+                // past it the peer is set aside however it paces its pages.
+                if (r.st == Repair::St::Ordering && r.ordering_page) {
+                    const u64 rem0 = r.P > r.a0 ? r.P - r.a0 : 0;
+                    const auto cap = repair_order_cap(timeout, rem0, r.ordering_page);
+                    if (now - r.ordering_started > cap) {
+                        m_st.repair_order_capped++;
+                        notes.push_back("relay: REPAIR-PAGE cap: repair of P=" + std::to_string(r.P) + " set peer " + std::to_string(r.cur) +
+                                        " aside after " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - r.ordering_started).count()) +
+                                        " ms ordering (cap " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(cap).count()) + " ms = " +
+                                        std::to_string(m_o.repair_state_timeout_ms) + " ms x (1 + ceil(" + std::to_string(rem0) + " / " +
+                                        std::to_string(r.ordering_page) + ")), cursor " + std::to_string(r.cursor) + "/" + std::to_string(r.P) + ")");
+                        if (r.cur) r.tried.insert(r.cur);
+                        r.reset();
+                    }
                 }
                 if (r.st == Repair::St::Fetching) {
                     // The order is known; only frames are missing. Pre-fix this
@@ -2482,11 +2534,13 @@ private:
                 // order); a0 > 0 asks the zero-length prefix probe [a0, a0) first.
                 const u64 a0 = r.a0_of.count(pick) ? r.a0_of[pick] : 0;
                 r.st = Repair::St::Ordering; r.cur = pick; r.a0 = a0; r.cursor = a0; r.probing = a0 > 0; r.ids.clear(); r.since = Clock::now();
+                r.ordering_started = r.since; r.ordering_page = 0;   // REPAIR-PAGE liveness: the per-peer cap starts here
                 Job j; j.kind = Job::Kind::Order; j.repair = true; j.key = k; j.a = a0; j.p = r.P; j.spine = r.spine;
                 if (a0) { j.probe = true; j.p = a0; if (const auto d = digest_at(a0)) j.spine = *d; }
                 issue.emplace_back(pick, std::move(j));
             }
         }
+        for (const auto& n : notes) log(n);
         for (auto& [p, j] : issue) queue_job(p, std::move(j));
         if (!issue.empty()) pump_jobs();
     }

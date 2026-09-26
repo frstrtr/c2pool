@@ -755,6 +755,35 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_fee_model_kat COMMAND v37_xmr_fee_model_kat)
 
     # ------------------------------------------------------------------
+    # XMR-WEB (xmr/xmr_web_dashboard.hpp): c2pool-v37-xmr serves the SAME
+    # web dashboard every coin binary serves (core::WebServer + web-static/).
+    #
+    #   v37_xmr_web_dashboard_kat
+    #     Starts the read-only provider on a fixture XmrWebState and fetches
+    #     every endpoint over real loopback HTTP (/local_stats /global_stats
+    #     /current_payouts /current_merged_payouts /recent_blocks /v37_status
+    #     /xmr/payouts /web/currency_info /node_info), checking each field
+    #     against the fixture; GET / is the dashboard HTML with NO "PPLNS"
+    #     (WRS / PPR), and a stock LITECOIN WebServer still serves the file
+    #     byte-for-byte. Not stdlib-only: it links the core web server, the
+    #     same OBJECT-lib set core_test names for the web_server_* KATs.
+    #     Listed in BOTH build.yml --target lists (the #769 Not-Run trap).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_web_dashboard_kat
+        v37_xmr_web_dashboard_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr/xmr_web_dashboard.cpp)
+    target_compile_features(v37_xmr_web_dashboard_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_web_dashboard_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_web_dashboard_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO
+        C2POOL_WEB_STATIC="${CMAKE_SOURCE_DIR}/web-static")
+    target_link_libraries(v37_xmr_web_dashboard_kat PRIVATE core c2pool_merged_mining c2pool_payout
+                          c2pool_hashrate ltc_coin xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_web_dashboard_kat COMMAND v37_xmr_web_dashboard_kat)
+
+    # ------------------------------------------------------------------
     # SAME-BLOCK PAY-NOW (operator ruling 09-25, xmr/xmr_paynow.hpp):
     # a pool block pays the miners whose work it credits out of what the
     # owed pass leaves (<= each one's own E_b), the donation output carries

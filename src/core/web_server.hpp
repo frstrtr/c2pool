@@ -1277,6 +1277,8 @@ private:
     bool m_testnet;  // Store testnet flag
     Blockchain m_blockchain;  // Store blockchain type
     std::string m_coin_label; // Raw configured coin string; fallback label for chains absent from the Blockchain enum
+    std::function<std::optional<nlohmann::json>(const std::string&)> m_rest_override_fn;   // per-coin REST override (unset = built-in routes)
+    std::string m_payout_scheme_label;       // per-coin scheme label (empty = serve static UI verbatim)
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     BlockchainAddressValidator m_address_validator;  // New address validator
     std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management
@@ -1757,6 +1759,24 @@ public:
     // dashboard labels every node truthfully instead of going blank. Web-layer
     // only -- never feeds consensus/address-validation.
     void set_coin_label(const std::string& sym) { m_coin_label = sym; }
+
+    // Per-coin REST override (c2pool-v37-xmr). A coin whose stats live OUTSIDE
+    // this class -- the v37 XMR node: its own stratum, its own owed ledger, its
+    // own chain view -- answers the p2pool-compatible GET endpoints itself.
+    // Consulted FIRST for every GET path; std::nullopt = "not mine", fall
+    // through to the built-in route. Unset (every other coin) = no change.
+    using rest_override_fn_t = std::function<std::optional<nlohmann::json>(const std::string& path)>;
+    void set_rest_override_fn(rest_override_fn_t fn) { m_rest_override_fn = std::move(fn); }
+    std::optional<nlohmann::json> call_rest_override(const std::string& path) const {
+        if (!m_rest_override_fn) return std::nullopt;
+        return m_rest_override_fn(path);
+    }
+    // Per-coin payout-scheme display name. Empty (default, every coin but
+    // XMR) = the static UI is served byte-for-byte. Non-empty = every served
+    // .html/.htm/.js/.mjs has the literal PPLNS rewritten by
+    // rewrite_payout_scheme_label() below (the v37 XMR scheme is WRS / PPR).
+    void set_payout_scheme_label(const std::string& label) { m_payout_scheme_label = label; }
+    const std::string& get_payout_scheme_label() const { return m_payout_scheme_label; }
     const std::string& get_pool_version() const { return m_pool_version; }
 
     /// Auto-detect public IP and version from external services.
@@ -2183,5 +2203,15 @@ private:
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp
+
+/// Per-coin payout-scheme relabel of one served static text asset (used only
+/// when MiningInterface::get_payout_scheme_label() is non-empty). Every literal
+/// "PPLNS" becomes `label` where it stands as a word (visible text, titles,
+/// string literals, comments) and `ident` where it is glued to an identifier
+/// character [A-Za-z0-9_$] (loadMainPPLNS -> loadMainWRS), so the rewrite is
+/// the same everywhere it is applied and the served JS keeps linking.
+/// Returns the number of replacements.
+std::size_t rewrite_payout_scheme_label(std::string& text, const std::string& label,
+                                        const std::string& ident = "WRS");
 
 } // namespace core

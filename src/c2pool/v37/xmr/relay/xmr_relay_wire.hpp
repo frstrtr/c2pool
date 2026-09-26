@@ -375,6 +375,24 @@ inline PoolId pool_id_of(u32 chain_id, const ::v37::LaneParams& p,
     return PoolId{::c2pool::v37n::rb::lane_tag(ctx, 0, 0, 0), version, authority};
 }
 
+// FLAG DAY (#1803 review): the XMR pool-rules version a node's HELLO pool id
+// is built with. V37F (EMPTY-CUT FINDER) changed the flip-0 coinbase bytes of
+// empty-cut blocks and CUT-FLOOR refuses a regressing credit cut, but neither
+// moved SHIPPED_CONSENSUS_VERSION, so a pre-#1803 node (e.g. RC4 5db1f675)
+// joined the pool, refused its first block and stalled. The HELLO pool id now
+// folds this version in (it moves the HELLO lane_tag ONLY: the block-level
+// pool_tag, the LaneParams and every coinbase byte stay on
+// SHIPPED_CONSENSUS_VERSION), so such a node is refused AT HELLO as
+// TAG_MISMATCH field=version with an explicit reason. Bump it with every
+// change of the lane-block validity rules that is not a consensus version.
+//   1 = SHIPPED_CONSENSUS_VERSION (V37.1, pre-#1803)
+//   2 = + #1803 EMPTY-CUT FINDER (V37F) + CUT-FLOOR
+inline constexpr u32 kXmrPoolRulesVersion = 2;
+#define C2POOL_XMR_POOL_RULES_VERSION 1   // feature probe for KATs built on both trees
+inline PoolId node_pool_id(u32 chain_id, const ::v37::LaneParams& p) {
+    return pool_id_of(chain_id, p, kXmrPoolRulesVersion);
+}
+
 inline std::string hex32(const bytes32& h) {
     static const char* d = "0123456789abcdef";
     std::string s; s.reserve(64);
@@ -470,7 +488,11 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.chain_id != ours.chain_id)
         return out("chain_id", "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id));
     if (theirs.pool->version != ours.pool->version)
-        return out("version", "consensus version " + std::to_string(theirs.pool->version) + " != ours " + std::to_string(ours.pool->version));
+        return out("version", "consensus version " + std::to_string(theirs.pool->version) + " != ours " + std::to_string(ours.pool->version) +
+                   (theirs.pool->version < ours.pool->version && ours.pool->version == kXmrPoolRulesVersion
+                        ? ": the peer runs older pool rules (pre-#1803: no V37F empty-cut finder / cut floor) and would stall on "
+                          "this pool's blocks -- upgrade it"
+                        : ""));
     if (theirs.pool->authority != ours.pool->authority)
         return out("authority", "authority " + std::to_string(theirs.pool->authority) + " != ours " + std::to_string(ours.pool->authority));
     return out("geometry", "LaneParams geometry differs (window/c0/rollup/half_life/level_caps/k_floor)");
