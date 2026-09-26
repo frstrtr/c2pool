@@ -194,6 +194,61 @@ inline BlockParseStatus parse_block(const std::vector<std::uint8_t>& blob, Parse
 }
 
 // ---------------------------------------------------------------------------
+// HEADER-FIRST VERSION PEEK (unknown-fork fuse).
+//
+// Reads ONLY the block header and, when the bytes are there, the height in the
+// coinbase's txin_gen: the part of a block that no Monero fork so far has
+// changed. It judges nothing. It exists so that a caller can learn a block's
+// major_version BEFORE parse_block() applies the body rules of the versions
+// this build implements. A block from a fork above that range fails
+// parse_block() for reasons that say nothing about the sender's honesty
+// (FCMP++/Carrot v17 appends two tree fields after tx_hashes and changes the
+// coinbase output type), and the caller uses this peek to tell "not
+// understood" from "invalid".
+//
+// Returns false when the header itself does not read (truncated, or a
+// major/minor that cannot be a uint8). The caller then falls through to
+// parse_block(), which reports exactly the failure it always did.
+// `height_known` is false when the coinbase prefix does not read as a single
+// txin_gen input.
+// ---------------------------------------------------------------------------
+struct BlockHeaderPeek {
+    BlockHeaderFields header{};
+    std::size_t       header_size     = 0;
+    bool              height_known    = false;
+    std::uint64_t     coinbase_height = 0;
+};
+
+inline bool peek_block_header(const std::uint8_t* data, std::size_t size,
+                              BlockHeaderPeek& out) {
+    out = BlockHeaderPeek{};
+    if (!data || !size) return false;
+    BlobReader r(data, size);
+    if (!r.read_varint(out.header.major_version)) return false;
+    if (!r.read_varint(out.header.minor_version)) return false;
+    if (!r.read_varint(out.header.timestamp))     return false;
+    if (!r.read_bytes(out.header.prev_id.data(), 32)) return false;
+    if (!r.read_u32_le(out.header.nonce))         return false;
+    if (out.header.major_version == 0 || out.header.major_version > 0xff) return false;
+    if (out.header.minor_version > 0xff) return false;
+    out.header_size = r.offset();
+
+    // miner_tx prefix: version, unlock_time, one input, txin_gen, height.
+    std::uint64_t ver = 0, unlock = 0, n_in = 0, height = 0;
+    std::uint8_t  tag = 0;
+    if (r.read_varint(ver) && r.read_varint(unlock) && r.read_varint(n_in) && n_in == 1
+        && r.read_byte(tag) && tag == TX_IN_GEN && r.read_varint(height)) {
+        out.height_known    = true;
+        out.coinbase_height = height;
+    }
+    return true;
+}
+
+inline bool peek_block_header(const std::vector<std::uint8_t>& blob, BlockHeaderPeek& out) {
+    return peek_block_header(blob.data(), blob.size(), out);
+}
+
+// ---------------------------------------------------------------------------
 // COINBASE FIELDS the weight parser deliberately discards.
 //
 // consensus/xmr_tx_weight.hpp reads the coinbase's structure to SIZE it, and
