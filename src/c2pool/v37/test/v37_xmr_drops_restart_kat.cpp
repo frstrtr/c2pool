@@ -297,14 +297,22 @@ int main() {
         C(nd.find("carried = m_drops_booked(fb.bid);") != std::string::npos,
           "R3 ★ XmrNode re-drives a pending FOUND with the journalled booked delta (never a fresh local composition)");
         const auto jb = sh.find("drops_store->put_booked(bid,");
+#if defined(C2POOL_XMR_DROPS_LANE_ENROL)
+        const auto sc = sh.find("drops->set_carried(lane.carry.delta)");   // DROPS-ENROL-LANE: the lane composition is booked
+#else
         const auto sc = sh.find("drops->set_carried(wit->second.drops->delta)");
+#endif
         C(jb != std::string::npos && sc != std::string::npos && jb < sc, "R3 the booked delta is journalled BEFORE the node books it");
         const auto jf = sh.find("if (drops_store) drops_store->put_frame(bid, relay::encode_block_won(bw));");
         const auto bc = sh.find("relay_node->broadcast_block_won(bw);", jf == std::string::npos ? 0 : jf);
         C(jf != std::string::npos && bc != std::string::npos && jf < bc, "R2 the winner's composed frame is journalled BEFORE it is broadcast (write-ahead)");
         C(sh.find("if (drops && bw.drops) {") != std::string::npos, "R3 a carried delta received before DROPS is live is kept (not dropped)");
         const auto scr = sh.find("fo.book_scratch = [&]");
+#if defined(C2POOL_XMR_DROPS_LANE_ENROL)
+        const auto scc = sh.find("if (!drops_take_carry(h, bid, bk, why, false, lane)) return false;");   // DROPS-ENROL-LANE
+#else
         const auto scc = sh.find("if (drops && !drops_take_carry(h, bid, bk, why, false)) return false;");
+#endif
         const auto cdp = sh.find("converge-decode: h=%llu");
         C(scr != std::string::npos && scc != std::string::npos && cdp != std::string::npos && scr < scc && scc < cdp,
           "R3 ★ the D2 scratch re-derivation (minority converge) books the carried delta too, never a pre-DROPS local composition");

@@ -818,7 +818,7 @@ if (BUILD_TESTING)
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_drops_enrol_lane_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
@@ -865,6 +865,16 @@ if (BUILD_TESTING)
     # untorn; source pins (gate order, flip-1-only hook, booking order). RED on
     # the base, GREEN on the fix. ALSO on BOTH build.yml --target lists.
     target_compile_definitions(v37_xmr_drops_writeahead_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
+    # DROPS-ENROL-LANE (DROPS defect 4, flip 1): v37_xmr_drops_enrol_lane_kat --
+    # the share counts and the enrolment book are derived from the replicated
+    # lane prefix [0, P) at the block's on-chain credit cut, so a late / restarted
+    # node composes the winner's rows, digest and delta, a node that never
+    # enrolled locally composes a dead winner's delta, and a carried trailer
+    # whose enrollment_digest differs from the lane derivation is refused; the
+    # enrol set rides HELLO only under DROPS; source pins. RED on the base,
+    # GREEN on the fix. ALSO on BOTH build.yml --target lists.
+    target_compile_definitions(v37_xmr_drops_enrol_lane_kat PRIVATE
         V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # ------------------------------------------------------------------
     # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.
