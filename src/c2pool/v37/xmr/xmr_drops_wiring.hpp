@@ -87,6 +87,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <string>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -410,16 +412,23 @@ private:
 //                                      a peer's frame once it booked CARRIED
 //   B <bid> <n> [<payee hex> <delta>]  the delta this node BOOKED for bid,
 //                                      written BEFORE the node books it
+//   P <bid> <h>                        our own block, written in the exact
+//                                      network gate BEFORE it is published
+//                                      (WRITE-AHEAD: a crash between the
+//                                      publish and the FOUND callback, where
+//                                      W is written, cannot lose the win)
 // After a restart the shell re-announces and serves every F frame, composes
 // every W without an F at its booking, and a boot / converge re-drive of a
-// pending FOUND books B (never a fresh local composition). The last record of
+// pending FOUND books B (never a fresh local composition); a P without a W is
+// our own win all the same and is composed at its booking. The last record of
 // a kind for a bid wins. Only ever constructed under the flip.
 #define C2POOL_XMR_DROPS_RESTART 1
+#define C2POOL_XMR_DROPS_WRITEAHEAD 1
 class DropsCarryStore {
 public:
     using Delta = std::map<bytes32, long long>;
     explicit DropsCarryStore(std::string path) : m_path(std::move(path)) {}
-    struct Loaded { std::size_t own = 0, frames = 0, booked = 0, malformed = 0; };
+    struct Loaded { std::size_t own = 0, frames = 0, booked = 0, malformed = 0, published = 0; };
     Loaded load() {
         Loaded l;
         std::FILE* f = std::fopen(m_path.c_str(), "r");
@@ -436,6 +445,14 @@ public:
                 i = j;
             }
             if (t.size() < 3 || t[1].size() != 64) { ++l.malformed; return; }
+            if (t[0] == "P") {   // WRITE-AHEAD: our own block, journalled before it was published
+                std::uint64_t h = 0;
+                try { h = static_cast<std::uint64_t>(std::stoull(t[2])); } catch (...) { ++l.malformed; return; }
+                if (t.size() != 3) { ++l.malformed; return; }
+                { std::lock_guard<std::mutex> lk(m_pub_mu); m_pub[t[1]] = h; }
+                ++l.published;
+                return;
+            }
             if (t[0] == "W" || t[0] == "F") {
                 std::vector<std::uint8_t> raw;
                 if (!unhex(t[2], raw)) { ++l.malformed; return; }
@@ -483,6 +500,28 @@ public:
         for (const auto& [k, v] : d) s += " " + hex(std::vector<std::uint8_t>(k.begin(), k.end())) + " " + std::to_string(v);
         return append(s);
     }
+    // WRITE-AHEAD: our own block (monerod/levin block id, 64 hex) at height h,
+    // journalled BEFORE it is published. Called on the stratum listener thread
+    // (the exact network gate) as well as the main thread: locked.
+    bool put_published(const std::string& bid, std::uint64_t h) {
+        { std::lock_guard<std::mutex> lk(m_pub_mu); m_pub[bid] = h; }
+        return append("P " + bid + " " + std::to_string(h));
+    }
+    bool published(const std::string& bid) const {
+        std::lock_guard<std::mutex> lk(m_pub_mu);
+        return m_pub.count(bid) != 0;
+    }
+    std::size_t published_size() const {
+        std::lock_guard<std::mutex> lk(m_pub_mu);
+        return m_pub.size();
+    }
+    // THE decision the booking takes for a lane block: is it OUR win whose carried
+    // delta is still to be composed (registered W, or published P), with no
+    // composed frame (F) yet? A P alone (crash between the publish and the FOUND
+    // callback) answers yes: the win survives, so the delta is still carried.
+    bool own_to_compose(const std::string& bid) const {
+        return (m_own.count(bid) != 0 || published(bid)) && m_frames.count(bid) == 0;
+    }
     std::optional<Delta> booked(const std::string& bid) const {
         auto it = m_booked.find(bid);
         if (it == m_booked.end()) return std::nullopt;
@@ -492,7 +531,7 @@ public:
     const std::map<std::string, std::vector<std::uint8_t>>& own() const { return m_own; }
     const std::map<std::string, std::vector<std::uint8_t>>& frames() const { return m_frames; }
     std::size_t booked_size() const { return m_booked.size(); }
-    std::uint64_t write_failures() const { return m_write_fail; }
+    std::uint64_t write_failures() const { return m_write_fail.load(); }
     const std::string& path() const { return m_path; }
 
 private:
@@ -515,6 +554,7 @@ private:
     }
     bool append(const std::string& line) {
         if (m_path.empty()) return true;   // in-memory (a KAT)
+        std::lock_guard<std::mutex> lk(m_io_mu);   // the gate (listener thread) appends P concurrently
         std::FILE* f = std::fopen(m_path.c_str(), "a");
         if (!f) { ++m_write_fail; return false; }
         const std::string l = line + "\n";
@@ -526,7 +566,10 @@ private:
     std::string m_path;
     std::map<std::string, std::vector<std::uint8_t>> m_own, m_frames;
     std::map<std::string, Delta> m_booked;
-    std::uint64_t m_write_fail = 0;
+    mutable std::mutex m_pub_mu;
+    std::map<std::string, std::uint64_t> m_pub;   // WRITE-AHEAD: bid -> h, our own published blocks
+    std::mutex m_io_mu;
+    std::atomic<std::uint64_t> m_write_fail{0};
 };
 
 // ── THE XMR BUNDLE: one per lane, owned by the shell ────────────────────────

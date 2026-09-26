@@ -367,8 +367,13 @@ public:
         }
         m_accepted.fetch_add(1, std::memory_order_relaxed);
         set_last("exact network gate: Accept pow=" + sub::to_hex(pow.data(), pow.size()));
+        // ★ DROPS WRITE-AHEAD (flip 1; unset at flip 0): our own block is journalled
+        // BEFORE it is published, so a crash between the publish and the FOUND
+        // callback cannot lose the win whose carried delta every node waits for.
+        if (m_pre_publish) m_pre_publish(tj.blob, tj.height);
         m_inner.submit_network_block(template_id, nonce, extra_nonce);
     }
+    void set_pre_publish(std::function<void(const std::vector<std::uint8_t>&, std::uint64_t)> f) { m_pre_publish = std::move(f); }
 
     std::uint64_t calls()    const { return m_calls.load(std::memory_order_relaxed); }
     std::uint64_t accepted() const { return m_accepted.load(std::memory_order_relaxed); }
@@ -390,6 +395,7 @@ private:
     strat::ITemplateSource&             m_source;
     strat::IShareSink&                  m_inner;
     std::function<void(const strat::AcceptedShare&)> m_on_share;   // GAP-2 (listener or main thread)
+    std::function<void(const std::vector<std::uint8_t>&, std::uint64_t)> m_pre_publish;   // DROPS WRITE-AHEAD (listener or main thread)
     std::atomic<std::uint64_t> m_calls{0}, m_accepted{0}, m_rejected{0}, m_refused{0}, m_stale{0};
     mutable std::mutex m_mtx;
     std::string        m_last;
@@ -419,6 +425,10 @@ struct ServeHooks {
     std::function<void(bool /*refreshed*/, bool /*new_template*/)> after_refresh;
     // Called from the status cadence, after the standard status line.
     std::function<void()> status_extra;
+    // ★ DROPS WRITE-AHEAD: called in the exact network gate with the hashing blob
+    // (nonce set) and height of a block that is ABOUT to be published, before it
+    // is. Unset (flip 0 / no journal) = nothing is called.
+    std::function<void(const std::vector<std::uint8_t>&, std::uint64_t)> pre_publish;
 
     // M3: THE TIP DRIVER, as one call per loop pass.
     //
@@ -514,6 +524,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     : static_cast<strat::IShareSink&>(live_sink);
     GatedShareSinkT<Provider, Snapshot> sink(rx, provider, template_source, publish_sink);
     if (hooks.on_share) sink.set_on_share(hooks.on_share);   // GAP-2
+    if (hooks.pre_publish) sink.set_pre_publish(hooks.pre_publish);   // DROPS WRITE-AHEAD
 
     o2::StratumListenerOptions lo;
     lo.bind_host = cfg.stratum_bind_host;
@@ -1672,6 +1683,8 @@ static int run_live(const XmrNodeConfig& cfg) {
     c2pool::v37n::xmr::drops::DropsCarryStore::Loaded drops_store_loaded{};
     std::map<std::string, std::chrono::steady_clock::time_point> drops_won_asked_at;
     std::uint64_t drops_getwon_tx = 0, drops_predrops_hold = 0, drops_prev_row_missing = 0, drops_reloaded_own = 0, drops_reloaded_frames = 0;
+    std::atomic<std::uint64_t> drops_prepub_journalled{0};   // WRITE-AHEAD: P records (listener thread)
+    std::uint64_t drops_prepub_resumed = 0;                  // WRITE-AHEAD: own wins known only from P, composed at booking
     std::set<std::string> wire_seen;
     std::uint64_t wire_tx = 0, wire_rx = 0, wire_prefold = 0, wire_pending = 0, wire_hit = 0, wire_mismatch = 0, wire_diverged = 0;
     std::uint64_t cut_ok = 0, cut_pending = 0, cut_miss = 0, cut_mismatch = 0, cut_absent = 0, cut_fold_refused = 0;
@@ -2243,6 +2256,23 @@ static int run_live(const XmrNodeConfig& cfg) {
         // booking point the local composition used), carry it to every peer,
         // and book it through the very check a peer applies.
         if (drops_live) {
+            // ★ DROPS WRITE-AHEAD: our own block journalled BEFORE it was published (P)
+            // whose win was never registered (a crash between the publish and the FOUND
+            // callback): it is our win all the same. Its frame is the one the FOUND
+            // callback would have built (this booking's decode of the same block), and
+            // the delta is composed below exactly once, as for a registered win.
+            if (drops_store && !own_won.count(bid) && !(wire_cache.count(bid) && wire_cache[bid].drops) &&
+                drops_store->own().count(bid) == 0 && drops_store->own_to_compose(bid)) {
+                relay::BlockWon bw;
+                bw.chain_id = cfg.lane_chain; bw.bid = *c2pool::v37n::cut_bid_bytes(bid); bw.h_b = h;
+                bw.cut_next_pos = bk.credit_cut.next_pos; bw.cut_spine_digest = bk.credit_cut.spine_digest;
+                bw.reward = bk.total; bw.payout_emitted = true; bw.owed_digest_at_win = bk.lane_commitment;
+                own_won[bid] = bw;
+                drops_store->put_own(bid, relay::encode_block_won(bw));
+                ++drops_prepub_resumed;
+                std::printf("drops-store: own win h=%llu bid=%s… known only from its pre-publish record (P; never registered) -> composed at this booking\n",
+                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str());
+            }
             if (auto ow = own_won.find(bid); ow != own_won.end() && !(wire_cache.count(bid) && wire_cache[bid].drops)) {
                 c2pool::v37n::settle::DropsCompose dctx;
                 dctx.price = c2pool::v37n::xmr::drops::rescale_price(booking_price, drops->receipt_weight());
@@ -2372,6 +2402,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             bw.cut_next_pos = bk.credit_cut.next_pos; bw.cut_spine_digest = bk.credit_cut.spine_digest;
             bw.reward = bk.total; bw.payout_emitted = true; bw.owed_digest_at_win = bk.lane_commitment;
             if (drops) {   // ★ ENROL-REPL: sent at BOOKING, as v0x02 with the composed delta (book_from_chain_ex)
+                if (wire_cache.count(bid) && wire_cache[bid].drops) {   // WRITE-AHEAD: already composed + carried at its booking
+                    std::printf("ab-wire-tx: own win h=%llu bid=%s… already carried (composed at its booking)\n",
+                                (unsigned long long)h, bid.substr(0,12).c_str());
+                    return;
+                }
                 own_won[bid] = bw;
                 if (drops_store) drops_store->put_own(bid, relay::encode_block_won(bw));   // ★ DROPS-RESTART: survives a restart
                 std::printf("ab-wire-tx: own win h=%llu bid=%s… -> FB_BLOCK_WON deferred to the booking (DROPS carriage, v0x02)\n",
@@ -3519,6 +3554,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         ServeHooks hooks;
         hooks.cba_tick = [&]() { cba_ring_push(); feed_pump(); wire_pump(); if (relay_tick) relay_tick(); };   // recon(A+B credit): + receipt feed + v0x02 fast path (+ GAP-2 relay)
         hooks.on_share = relay_on_share;
+        if (drops_store)   // ★ DROPS WRITE-AHEAD (flip 1 only: the journal exists only under the flip)
+            hooks.pre_publish = [&](const std::vector<std::uint8_t>& hashing_blob, std::uint64_t h) {
+                const std::string b = hex_of(sub::block_id_of_hashing_blob(hashing_blob));
+                const bool ok = drops_store->put_published(b, h);
+                drops_prepub_journalled.fetch_add(1, std::memory_order_relaxed);
+                std::printf("drops-store: own block h=%llu bid=%s… journalled BEFORE publish (P)%s\n",
+                            static_cast<unsigned long long>(h), b.substr(0, 12).c_str(), ok ? "" : " -- WRITE FAILED");
+                std::fflush(stdout);
+            };
         hooks.job_binder = job_binder;   // SEAM-1 (unset unless --relay-bind rbind)
         if (relay_node) {
             // GAP-2: disjoint per-node miner search spaces (see XmrStratumServer::seed_extra_nonce).
@@ -3618,12 +3662,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                             drops_hold_max_ms, relay_node->describe_drops().c_str());
                 if (drops_store)   // ★ DROPS-RESTART
                     std::printf("  drops-restart: journal own=%zu frames=%zu booked=%zu write_fail=%llu | reloaded own=%zu frames=%zu booked=%zu "
-                                "| redrive_booked=%llu predrops_hold=%llu getwon_tx=%llu prev_lane row_missing=%llu\n",
+                                "| redrive_booked=%llu predrops_hold=%llu getwon_tx=%llu prev_lane row_missing=%llu | write-ahead published=%zu "
+                                "journalled=%llu reloaded=%zu resumed=%llu\n",
                                 drops_store->own().size(), drops_store->frames().size(), drops_store->booked_size(),
                                 (unsigned long long)drops_store->write_failures(), drops_store_loaded.own, drops_store_loaded.frames,
                                 drops_store_loaded.booked, (unsigned long long)node.drops_booked_redrive(),
                                 (unsigned long long)drops_predrops_hold, (unsigned long long)drops_getwon_tx,
-                                (unsigned long long)drops_prev_row_missing);
+                                (unsigned long long)drops_prev_row_missing, drops_store->published_size(),
+                                (unsigned long long)drops_prepub_journalled.load(), drops_store_loaded.published,
+                                (unsigned long long)drops_prepub_resumed);
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());
