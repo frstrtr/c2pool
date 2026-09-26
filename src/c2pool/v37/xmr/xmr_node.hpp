@@ -582,6 +582,13 @@ public:
         // DropsWiring) or nothing carried => the local composition below.
         std::optional<Amounts> carried;
         if (m_drops_carried) carried = m_drops_carried();
+        // ★ DROPS-RESTART: no live one-shot (a boot / converge RE-DRIVE of a
+        // pending FOUND): book the delta this node journalled when it booked
+        // this block, never a fresh local composition from a restarted book.
+        if (!carried && m_drops_booked) {
+            carried = m_drops_booked(fb.bid);
+            if (carried) ++m_drops_booked_redrive;
+        }
         if (carried) {
             if (m_drops_price) fb.drops.price = m_drops_price(); // one-shot, consumed either way (diagnostic only here)
             fb.has_carried_drops = true;
@@ -631,6 +638,12 @@ public:
     using PreHarvestFn = std::function<void(std::uint64_t bury_before)>;
     void set_pre_harvest(PreHarvestFn f) { m_pre_harvest = std::move(f); }
 
+    // ★ RAIN-BACKFILL: the retained, chain-ordered harvest (XmrDropsWiring::
+    // attach_chain_order). Set => buried_harvest() composes from it instead of
+    // the destructive take_buried(). Never set with the flip at 0.
+    using HarvestRangeFn = std::function<std::vector<::c2pool::v37n::settle::HarvestedReceipt>(std::uint64_t won_height)>;
+    void set_harvest_range_fn(HarvestRangeFn f) { m_harvest_range = std::move(f); }
+
     // ★ DROPS-R1: the (reward, SUM weight) pair at the cut this win settles.
     using DropsPriceFn = std::function<::c2pool::v37n::settle::WorkPrice()>;
     void set_drops_price_fn(DropsPriceFn f) { m_drops_price = std::move(f); }
@@ -640,6 +653,10 @@ public:
     using DropsCarriedFn = std::function<std::optional<Amounts>()>;
     void set_drops_carried_fn(DropsCarriedFn f) { m_drops_carried = std::move(f); }
     std::uint64_t drops_booked_carried() const { return m_drops_booked_carried; }
+    // ★ DROPS-RESTART: the journalled booked delta by block id (a re-drive).
+    using DropsBookedFn = std::function<std::optional<Amounts>(const std::string& bid)>;
+    void set_drops_booked_fn(DropsBookedFn f) { m_drops_booked = std::move(f); }
+    std::uint64_t drops_booked_redrive() const { return m_drops_booked_redrive; }
     std::uint64_t drops_booked_local() const { return m_drops_booked_local; }
 
     // ★ ENROL-REPL: the WINNER's buried harvest, taken ONCE when it books its
@@ -735,6 +752,11 @@ private:
     std::vector<::c2pool::v37n::settle::HarvestedReceipt> buried_harvest(
         std::uint64_t won_height) {
         if (!m_drops) { m_last_harvest_rows = 0; return {}; }
+        if (m_harvest_range) {   // ★ RAIN-BACKFILL: consumption follows the chain, not the booking order
+            auto rows = m_harvest_range(won_height);
+            m_last_harvest_rows = rows.size();
+            return rows;
+        }
         const std::uint64_t frontier =
             won_height > m_cfg.d_conf ? won_height - m_cfg.d_conf : 0;
         if (m_pre_harvest) m_pre_harvest(frontier);   // ★ declare S before release
@@ -944,6 +966,9 @@ private:
     DropsPriceFn                           m_drops_price{};
     DropsCarriedFn                         m_drops_carried{};          // ENROL-REPL (unset at flip 0)
     std::uint64_t                          m_drops_booked_carried = 0, m_drops_booked_local = 0;
+    DropsBookedFn                          m_drops_booked{};           // DROPS-RESTART (unset at flip 0)
+    std::uint64_t                          m_drops_booked_redrive = 0;
+    HarvestRangeFn                         m_harvest_range{};   // ★ RAIN-BACKFILL
     std::size_t                            m_last_harvest_rows = 0;
 
     XmrNodeConfig                          m_cfg;

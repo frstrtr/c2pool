@@ -799,8 +799,26 @@ if (BUILD_TESTING)
     #                               and equal after a partition heal and after
     #                               a durable-log restart (the lane digest is
     #                               node-local order by design).
+    #   v37_xmr_drops_backfill_kat  ★ RAIN-BACKFILL (DROPS defect 3): a
+    #                               late joiner / partitioned node backfills
+    #                               the raindrops it missed (FB_GETDROPS /
+    #                               FB_DROPINV), a partitioned node HOLDs, the
+    #                               flip-0 relay sends no new frame, and the
+    #                               harvest of a canonical block is the same
+    #                               after a 1-deep reorg (chain-ordered
+    #                               consumption). RED on the base. ALSO on
+    #                               BOTH build.yml --target lists.
+    #   v37_xmr_drops_harvest_order_kat  ★ RAIN-BACKFILL-2: the harvest range
+    #                               of a lane block is a pure function of the
+    #                               canonical chain ([frontier(prev canonical
+    #                               lane block), frontier(h))): canonical blocks
+    #                               booked OUT of order (h+1 before h) and
+    #                               replaced siblings compose exactly the
+    #                               in-order rows, every interval harvested once.
+    #                               RED on the base. ALSO on BOTH build.yml
+    #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat)
         add_executable(${_gap2_kat}
             ${_gap2_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
@@ -827,6 +845,27 @@ if (BUILD_TESTING)
     target_compile_definitions(v37_xmr_drops_enrol_repl_kat PRIVATE
         V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
         V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
+    # DROPS-RESTART (flip-1 multinode robustness): v37_xmr_drops_restart_kat --
+    # the prev_lane walk HOLDs (never decides) on an unreadable row / unreadable
+    # bytes and takes a tagged block as a lane block even before this node's
+    # ring matched its root; the carried-delta journal (own win, composed frame
+    # written before it is sent, booked deltas) survives a restart byte-exact;
+    # a NON-winner serves a lost carried frame on FB_GETWON with the winner
+    # down; source pins: no pre-DROPS booking at flip 1, the boot re-drive books
+    # the journal. RED on c3fd4b55, GREEN on the fix. ALSO on BOTH build.yml
+    # --target lists.
+    target_compile_definitions(v37_xmr_drops_restart_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
+        V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
+    # DROPS WRITE-AHEAD: v37_xmr_drops_writeahead_kat -- the exact network gate
+    # journals our own block (P) BEFORE it is published, so a winner that dies
+    # between the publish and the FOUND callback still composes + carries its
+    # delta after the restart (the base stalls: nobody holds the frame); the
+    # gate's listener-thread appends interleave with the main thread's
+    # untorn; source pins (gate order, flip-1-only hook, booking order). RED on
+    # the base, GREEN on the fix. ALSO on BOTH build.yml --target lists.
+    target_compile_definitions(v37_xmr_drops_writeahead_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # ------------------------------------------------------------------
     # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.
     #
