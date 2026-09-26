@@ -375,6 +375,72 @@ void test_solicited_fluffy_reply_is_not_a_push() {
     }
 }
 
+// -----------------------------------------------------------------------
+// D3a: a push of a block the index HAS (connected, or a valid alt candidate)
+// hands its block token back -- and ONLY a token a push actually spent.
+// -----------------------------------------------------------------------
+void test_known_block_refund() {
+    // 1) Honest relay at a fast cadence: every push is refunded once the index
+    //    takes it, so the bucket never drains however many blocks arrive.
+    {
+        DosConfig nr = tiny();
+        nr.block_refill = 0;   // frozen: only refunds can put tokens back
+        PeerDosGuard g(nr);
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 50; ++i) {
+            kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Accept,
+                       "a push of a block the index then takes as valid is admitted");
+            kat::check(g.refund_block_token(0), "... and its token comes back");
+        }
+        kat::check(g.blocks_level(0) == nr.block_capacity, "50 refunded pushes leave the bucket full");
+        kat::check(g.block_refunds() == 50, "... 50 refunds counted");
+        kat::check(g.score() == 0, "... and no fault point");
+    }
+
+    // 2) Refunds never outnumber charges, and never lift the bucket past its
+    //    capacity: a verdict with no outstanding charge returns nothing.
+    {
+        PeerDosGuard g(tiny());
+        kat::check(!g.refund_block_token(0), "no push, no refund");
+        kat::check(g.blocks_level(0) == 3, "the bucket is not lifted past its capacity");
+        DosFault f = DosFault::None;
+        g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);
+        kat::check(g.refund_block_token(0), "one push, one refund");
+        kat::check(!g.refund_block_token(0), "... and never two");
+    }
+
+    // 3) A 2008 admitted on a solicited-reply credit spent no block token, so a
+    //    verdict on it refunds the PUSH it answers, not a token out of thin air.
+    {
+        DosConfig nr = tiny();
+        nr.block_refill = 0;
+        PeerDosGuard g(nr);
+        DosFault f = DosFault::None;
+        g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);   // the bodiless push: 1 token
+        g.note_fluffy_solicited(0);                              // we asked for its bodies
+        g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);   // the reply: a credit
+        kat::check(g.solicited_credits_used() == 1, "the reply spent the credit");
+        kat::check(g.refund_block_token(0), "the block connects: the push's token comes back");
+        kat::check(!g.refund_block_token(0), "... once, not once per frame");
+        kat::check(g.blocks_level(0) == 3, "the bucket is back to full, not above it");
+    }
+
+    // 4) A dropped push spent nothing and is refunded nothing; pushes the index
+    //    could not take as valid keep their charge -- the flood control is intact.
+    {
+        DosConfig nr = tiny();
+        nr.block_refill = 0;
+        PeerDosGuard g(nr);
+        DosFault f = DosFault::None;
+        for (int i = 0; i < 3; ++i) g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f);
+        kat::check(g.on_frame(levin::CMD_NEW_FLUFFY_BLOCK, 100, 1, 0, f) == DosAction::Drop,
+                   "unrefunded pushes (unknown blocks) still drain the bucket");
+        kat::check(f == DosFault::BucketExhausted, "... and the overflow is still scored");
+        int refunds = 0;
+        while (g.refund_block_token(0)) ++refunds;
+        kat::check(refunds == 3, "only the three admitted pushes are refundable, not the dropped one");
+    }
+}
 
 } // namespace
 
@@ -384,6 +450,7 @@ int main() {
     test_byte_bucket();
     test_block_bucket();
     test_solicited_fluffy_reply_is_not_a_push();
+    test_known_block_refund();
     test_tx_bucket_counts_transactions();
     test_serving_bucket();
     test_sustained_exhaustion_disconnects();

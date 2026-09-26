@@ -40,6 +40,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -272,6 +273,22 @@ public:
     void broadcast_job(XmrStratumSession& s);
 
     std::uint32_t get_next_extra_nonce() { return m_extraNonce.fetch_add(1); }
+    // GAP-2: start the per-server extra_nonce counter at a node-chosen base
+    // (call before serving). Two pool nodes whose coinbases are otherwise
+    // byte-identical (same tip, same owed ledger, same second) would hand their
+    // miners IDENTICAL blobs from a counter that starts at 0 on both -- the
+    // miners then duplicate work and the same receipt id is minted twice with
+    // different payees. A per-node base keeps every node's search space
+    // disjoint. Not consensus: the 4 extra_nonce bytes are the pool's choice.
+    void seed_extra_nonce(std::uint32_t base) { m_extraNonce.store(base); }
+    // SEAM-1 (GAP-2 rbind): called with (extra_nonce, the session's login
+    // address) right BEFORE the template source is asked for that
+    // extra_nonce's job blob, so the per-job binding the coinbase 0x02 region
+    // commits to (payee + give-author) exists when the blob is built. Every
+    // job gets a fresh extra_nonce, so the binding is per job. Unset => the
+    // server is byte-identical to before. Call before serving.
+    using JobBinder = std::function<void(std::uint32_t extra_nonce, const std::string& address)>;
+    void set_job_binder(JobBinder f) { m_job_binder = std::move(f); }
 
 private:
     // Fill a JobNotify from a TemplateJob + a session's job bookkeeping.
@@ -282,6 +299,7 @@ private:
     IShareSink& m_sink;
     ITransport& m_transport;
     std::atomic<std::uint32_t> m_extraNonce{0};
+    JobBinder m_job_binder;   // SEAM-1 (unset = none)
 };
 
 } // namespace stratum

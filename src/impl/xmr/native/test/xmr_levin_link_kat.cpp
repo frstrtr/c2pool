@@ -791,6 +791,69 @@ void test_peer_timeout_counts_inbound_only() {
                 "peer timeout: closed as PeerUnresponsive (%s)", to_string(r.obs.reason));
 }
 
+// NON_RESPONSIVE_PEER_KICK_TIME, wired. kick_due() was unit-tested on the pure
+// ExpectResponse but on_tick() never asked it, so a peer that took a 2003 and
+// never answered held the request (and, in the pool, the span) until the
+// 240 s IDLE_PEER_KICK_TIME. Scaled down: a 150 ms kick on a link whose idle
+// drop, peer timeout and TIMED_SYNC beat are all parked far away.
+void test_nonresponsive_request_kick() {
+    kat::check(LinkConfig{}.request_kick_ms == NON_RESPONSIVE_PEER_KICK_MS,
+               "request kick: the default is monerod's NON_RESPONSIVE_PEER_KICK_TIME");
+
+    RequestGetObjects rq;
+    rq.blocks.push_back(native::Hash{});
+    rq.prune = true;
+    std::vector<std::uint8_t> qbody;
+    MessageError qerr = MessageError::None;
+    encode_request_get_objects(rq, qbody, qerr);
+
+    {
+        Rig r;
+        LinkConfig cfg = quiet_config();
+        cfg.request_kick_ms = 150;
+        r.build(cfg, /*install_frame_sink=*/true);
+        r.wait_frames(1);
+        r.peer.write(handshake_reply(NETWORK_ID_STAGENET, PEER_PEER_ID, 0));
+        r.pump(80);
+        kat::check(r.link->handshaked(), "request kick: handshake landed");
+        kat::check(r.link->send_notify_answered_request(CMD_REQUEST_GET_OBJECTS, qbody),
+                   "request kick: a 2003 is armed");
+        r.pump(60);
+        kat::check(!r.obs.closed, "request kick: nothing happens inside the deadline");
+        r.pump(400);                                // the peer never answers
+        kat::check(r.obs.closed, "request kick: an unanswered 2003 closes the link");
+        kat::checkf(r.obs.reason == LinkClose::PeerUnresponsive,
+                    "request kick: closed as PeerUnresponsive (%s)", to_string(r.obs.reason));
+        kat::checkf(r.obs.why.find("NON_RESPONSIVE_PEER_KICK_TIME") != std::string::npos,
+                    "request kick: the reason names the rule (%s)", r.obs.why.c_str());
+        kat::check(r.link->request_kicked(), "request kick: the link reports it was kicked");
+    }
+
+    // Control: the same deadline, but the peer answers inside it.
+    {
+        Rig r;
+        LinkConfig cfg = quiet_config();
+        cfg.request_kick_ms = 150;
+        r.build(cfg, /*install_frame_sink=*/true);
+        r.wait_frames(1);
+        r.peer.write(handshake_reply(NETWORK_ID_STAGENET, PEER_PEER_ID, 0));
+        r.pump(80);
+        kat::check(r.link->send_notify_answered_request(CMD_REQUEST_GET_OBJECTS, qbody),
+                   "request kick control: a 2003 is armed");
+        r.pump(40);
+        ResponseGetObjects ans;
+        ans.current_blockchain_height = 10;
+        std::vector<std::uint8_t> abody;
+        MessageError aerr = MessageError::None;
+        encode_response_get_objects(ans, abody, aerr);
+        r.peer.write(make_notify(CMD_RESPONSE_GET_OBJECTS, abody));
+        r.pump(400);
+        kat::check(!r.obs.closed, "request kick control: an answered 2003 keeps the link open");
+        kat::check(!r.link->request_kicked() && !r.link->expect().armed(),
+                   "request kick control: latch disarmed, no kick recorded");
+    }
+}
+
 // =============================================================================
 // 7. The invokes we answer.
 // =============================================================================
@@ -1177,6 +1240,7 @@ int main(int argc, char** argv) {
     test_handshake_refusals();
     test_handshake_timeout();
     test_peer_timeout_counts_inbound_only();
+    test_nonresponsive_request_kick();
     test_we_answer_inbound_invokes();
     test_invoke_queue_pure();
     test_expect_response_pure();

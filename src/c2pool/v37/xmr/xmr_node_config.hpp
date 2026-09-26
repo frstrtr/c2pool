@@ -30,6 +30,7 @@
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
 #include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
+#include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
 
 namespace c2pool::v37n::xmr {
 
@@ -68,7 +69,10 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //     mandated fixed outputs ++ exact-sum residual sink), assembled from
 //     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
 //     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
-//     without a valid sink the daemon refuses to serve.
+//     without a valid sink the daemon refuses to serve. Under --fee-model v1
+//     (LaneParams::fee) the ONE mandated fixed output is the protocol donation
+//     output (owed + 1 + residual) and the residual sink IS the donation address
+//     (xmr_fee_model.hpp, compiled-in -- no per-node knob).
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
 // M2: which miner-data source the option-B assembler is fed from.
@@ -155,9 +159,13 @@ struct XmrNodeConfig {
     // is issued for exactly this chain at start (single-node, single lane).
     ::v37::ChainId  lane_chain = 0;
 
-    // The digest-committed lane geometry. Defaults to the OQ-5 ratified default
-    // (LaneParams{}), the only geometry W4's geometry_is_ratified() admits.
-    ::v37::LaneParams lane_params{};
+    // The digest-committed lane geometry. ★ T1 seam, XMR arm: XMR has NO
+    // ratified LaneKind row (nr_ladder.hpp declares BTC/LTC/DASH/DOGE only), so
+    // it takes node_lane_params_no_kind() — the OQ-5 ratified default
+    // (LaneParams{}) today, and, if the build takes the V37.1 activation, the
+    // consensus version WITHOUT ridge dimensions. An XMR ridge row is a canon
+    // edit (ND-R6) with non-derivable constants: an operator ruling, not a port.
+    ::v37::LaneParams lane_params = ::c2pool::v37n::node_lane_params_no_kind();
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) Monero block must be buried on
@@ -184,6 +192,14 @@ struct XmrNodeConfig {
     //   --same-height-renotify <n>   (0 disables the bounded re-announce)
     SameHeightTieBreak same_height_tiebreak = SameHeightTieBreak::PreferOwn;
     std::uint32_t      same_height_renotify = 3;
+    //   --own-fork-bound-s <n>  the native index's own-fork liveness guard: an
+    //   own-mined tip that no peer adopts for this long is abandoned and the
+    //   node follows the peers' chain (0 disables). Default 2 x target.
+    std::uint32_t      own_fork_bound_s = 240;
+    //   --test-unknown-fork-stall-s <n>  TEST-ONLY: shorten the unknown-fork
+    //   watch's stall period (FORK-FUSE-2; default 30 min) so a regtest rig can
+    //   watch a trip and a clear. REFUSED on mainnet. 0 = the default.
+    std::uint32_t      test_unknown_fork_stall_s = 0;
     // Per-height verdict journal. "" = race.log next to settle.img; "off" =
     // none. Two nodes that watched the same race must agree on every height
     // either of them credited, and a journal is what turns that claim into a
@@ -247,14 +263,31 @@ struct XmrNodeConfig {
     // the coinbase bytes (it may stay empty; the serve port opens when the
     // residual sink is set, mirroring option A's payout_address gate).
     CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
-    // The mandated residual sink (REQUIRED for v37 mode): the raw public spend
-    // (B) + view (A) keys, 64 hex each, of the XMR wallet the exact-sum residual
-    // is paid to. Torsion-checked at build; the daemon REFUSES v37 mode without
-    // a valid sink. --residual-sink-subaddress builds an XMR_SUB (D_i, A_main).
+    // The mandated residual sink (REQUIRED for v37 mode with the fee model OFF):
+    // the raw public spend (B) + view (A) keys, 64 hex each, of the XMR wallet
+    // the exact-sum residual is paid to. Torsion-checked at build; the daemon
+    // REFUSES v37 mode without a valid sink. --residual-sink-subaddress builds
+    // an XMR_SUB (D_i, A_main). With --fee-model v1 (LaneParams::fee) the sink
+    // IS the protocol donation address (xmr_fee_model.hpp) and these are refused.
     std::string     residual_sink_spend_hex;
     std::string     residual_sink_view_hex;
     bool            residual_sink_subaddress = false;
     // The v37 lane parameters (consensus once multi-node; explicit here).
+    //
+    // STEP-0 k_floor hotfix — why the XMR floor is NOT moved into LaneParams
+    // (unlike Family A, where btc_node.hpp's coinbase_budget() now reads the
+    // digest-committed LaneParams::k_floor): the XMR lane settles under
+    // COINBASE AUTHORITY (xmr_coinbase_authority.hpp, RECON ruling "read from
+    // block"). Every node books the winner's ON-CHAIN coinbase — payout =
+    // CoinbaseBooking::payout decoded from the block — and never deducts a
+    // locally rebuilt coinbase, so a node running a different settle_h_min
+    // (or settle_output_cap) mines a different but VALID coinbase that every
+    // peer books identically; the K_fair recompute is a cross-check alarm only.
+    // A differing floor therefore cannot fork owed_digest here. The XMR lane
+    // keeps LaneParams::k_floor = 0 (Monero has no dust rule; the lane digest,
+    // the lane tag and the relay HELLO lane_params_digest stay byte-identical).
+    // If XMR ever settles by rebuild instead of by reading the block, this
+    // floor must move into LaneParams exactly as Family A's did.
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
@@ -323,6 +356,13 @@ struct XmrNodeConfig {
     std::string     native_snapshot_path;
     // Seconds between periodic saves. 0 = only on a clean stop.
     std::uint64_t   native_snapshot_every_s = 300;
+    // COLD-BOOT-2: the native node downloads the catch-up gap at most this many
+    // heights above the settlement's booked frontier (its finalize cursor), so
+    // the gap is booked while it downloads, in bounded chain-ordered batches,
+    // and no unbooked block leaves the index's row retention (2048) or body
+    // cache (1024) first. p2p-first anchor boots only. 0 = off (pre-fix shape:
+    // the whole gap is downloaded before the settlement books any of it).
+    std::uint64_t   native_catchup_window = 256;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture; OFF is what makes "the template path made no daemon
     // call" falsifiable rather than merely asserted.
@@ -386,6 +426,17 @@ struct XmrNodeConfig {
     // one line). The C6 parity oracle then has no judge and scores its samples
     // VOID, which is the honest cost and is exactly why this is not the default.
     bool            no_daemon_rpc = false;
+    // D6d: --native-parity-monerod. Under p2p-first the embedded node is the
+    // tip, the RandomX seed (hash + height, switching at every 2048-block epoch
+    // with the 64-block lag) and the difficulty/height source, all read off its
+    // own chain index -- so by DEFAULT it is handed no monerod endpoint at all,
+    // and the C6 parity judge's status-cadence round trips (get_miner_data for
+    // the shadow arm, get_info + get_last_block_header for the tip) are gone.
+    // This flag opts the judge back in as a COMPARE-ONLY oracle: it is read on
+    // the status cadence, never on the find path, and never decides anything.
+    // Daemon-first is unaffected (the daemon is its parity judge and submit arm
+    // either way); --no-daemon-rpc still wins over it.
+    bool            native_parity_monerod = false;
 
     // --- the SOLO (fully self-contained, peerless) configuration ------------
     //
@@ -550,14 +601,22 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
 inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const* argv,
                                   int i, std::string& err) {
     const std::string a = argv[i];
-    const bool have_value = (i + 1 < argc);
+    // CLI-STRICT: a following token that is itself a long flag is not a value
+    // (`--native-connect --seeds` is a missing address, not an address "--seeds").
+    const bool have_value = (i + 1 < argc) &&
+                            std::string(argv[i + 1]).rfind("--", 0) != 0;
     const std::string v = have_value ? argv[i + 1] : std::string();
 
     // A value flag with nothing after it is an ERROR, not a silent default: an
     // operator who typed `--native-snapshot-path` last on the line meant a path.
+    // CLI-STRICT: the number is the WHOLE token in decimal digits -- std::stoull
+    // alone takes "12abc" as 12 and "-1" as 2^64-1.
     auto need = [&](std::uint64_t& out) -> int {
         if (!have_value) { err = a + " wants a value"; return -1; }
+        const bool digits = !v.empty() && v.size() <= 20 &&
+            v.find_first_not_of("0123456789") == std::string::npos;
         try {
+            if (!digits) throw std::invalid_argument(v);
             out = std::stoull(v);
         } catch (const std::exception&) {
             err = a + " wants a number, got '" + v + "'";
@@ -584,12 +643,14 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
     if (a == "--native-force-synced")          { c.native_force_synced = true; return 1; }
     if (a == "--native-allow-unverified-pow")  { c.native_allow_unverified_pow = true; return 1; }
     if (a == "--native-seeds" || a == "--seeds") { c.native_use_seeds = true; return 1; }
+    if (a == "--native-parity-monerod")        { c.native_parity_monerod = true; return 1; }   // D6d
     if (a == "--native-snapshot-path") {
         if (!have_value || v.empty()) { err = "--native-snapshot-path wants <file>"; return -1; }
         c.native_snapshot_path = v;
         return 2;
     }
     if (a == "--native-snapshot-every")  return need(c.native_snapshot_every_s);
+    if (a == "--native-catchup-window")  return need(c.native_catchup_window);   // COLD-BOOT-2
     if (a == "--native-backlog-refresh" || a == "--backlog-refresh")
         return need(c.native_backlog_refresh_s);
     if (a == "--anchor-confirm-peers") {
@@ -627,8 +688,13 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
         return used;
     }
     if (a == "--native-template-fallback") {
-        if (!have_value) { err = "--native-template-fallback wants on|off"; return -1; }
-        c.native_template_fallback = !(v == "off" || v == "0" || v == "false");
+        const bool off = (v == "off" || v == "0" || v == "false");
+        const bool on  = (v == "on"  || v == "1" || v == "true");
+        if (!have_value || !(on || off)) {
+            err = "--native-template-fallback wants on|off, got '" + v + "'";
+            return -1;
+        }
+        c.native_template_fallback = !off;
         return 2;
     }
     return 0;

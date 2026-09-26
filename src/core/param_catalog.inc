@@ -251,9 +251,10 @@ C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE|C_DGB, LIT
 C2P_PARAM("coin_p2p.address", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "coind P2P address")
   C2P_ALIAS("coin_p2p.address", BIN_LTC, "--coind-p2p-address", VALUE)
 
-C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
+C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC|C_DGB, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--coind-p2p-port", VALUE)
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--bitcoind-p2p-port", VALUE)
+  C2P_ALIAS("coin_p2p.port", BIN_DGB, "--coind-p2p-port", VALUE)
 
 C2P_PARAM("daemon_rpc.endpoint", DaemonRpc, HOSTPORT, RESTART, C_DASH|C_BTC|C_DGB, LIT, "", HOSTPORT_V, "coin daemon RPC endpoint (empty=daemonless)")
   C2P_ALIAS("daemon_rpc.endpoint", BIN_DASH, "--coin-rpc", VALUE)

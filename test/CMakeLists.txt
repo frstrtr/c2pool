@@ -18,7 +18,10 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
-    gtest_discover_tests(test_dgb_subsidy DISCOVERY_MODE PRE_TEST)
+    # DISCOVERY_TIMEOUT 60 on every gtest_discover_tests() in this file: PRE_TEST
+    # discovery runs at ctest startup, where the 5s default expired under VM905
+    # oversubscription and failed the ASAN leg before any test ran (#898).
+    gtest_discover_tests(test_dgb_subsidy DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)
 
     # DGB embedded-path coinbasevalue SSOT (forward-only #82 wiring TODO):
     # embedded_coinbase_value.hpp routes CoinParams::subsidy_func(height)+fees
@@ -33,7 +36,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
-    gtest_discover_tests(test_dgb_coinbase_value DISCOVERY_MODE PRE_TEST)
+    gtest_discover_tests(test_dgb_coinbase_value DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)
 
     add_executable(test_coin_broadcaster test_coin_broadcaster.cpp)
     target_link_libraries(test_coin_broadcaster PRIVATE
@@ -70,7 +73,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_utxo PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_discover_tests(test_utxo DISCOVERY_MODE PRE_TEST)  # defer discovery to ctest runtime; fixes -j(nproc) build-time discovery race vs v37_test (PR #84)
+    gtest_discover_tests(test_utxo DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)  # defer discovery to ctest runtime; fixes -j(nproc) build-time discovery race vs v37_test (PR #84)
 
     add_executable(test_redistribute_address test_redistribute_address.cpp)
     target_link_libraries(test_redistribute_address PRIVATE
@@ -848,7 +851,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_bls_verify PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_discover_tests(test_dash_bls_verify DISCOVERY_MODE PRE_TEST)
+    gtest_discover_tests(test_dash_bls_verify DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)
 
     # E1 Phase-L member-set selection: deterministic ComputeQuorumMembers over
     # the SML AS OF the WORK block (base - 8, per v23.1.7 GetAllQuorumMembers —
@@ -869,7 +872,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_quorum_members PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_discover_tests(test_dash_quorum_members DISCOVERY_MODE PRE_TEST)
+    gtest_discover_tests(test_dash_quorum_members DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)
 
     # E1 Phase-L member-set SOURCING PLUMBING (quorum_member_source.hpp): the
     # #814 re-review findings — R1 send-once-per-work-block dedup + strict
@@ -909,7 +912,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_govvote_bls PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)
-    gtest_discover_tests(test_dash_govvote_bls DISCOVERY_MODE PRE_TEST)
+    gtest_discover_tests(test_dash_govvote_bls DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)
 
     endif()  # C2POOL_DASH_BLS: the BLS-crypto KATs need the dashbls backend (built in the linux-dash-bls job); skipped in the default OFF build
 
@@ -1703,7 +1706,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_coinbase_muldiv PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_discover_tests(test_dash_coinbase_muldiv DISCOVERY_MODE PRE_TEST)
+    gtest_discover_tests(test_dash_coinbase_muldiv DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60)
 
     add_executable(test_dash_cb_payee test_dash_cb_payee.cpp)
     target_link_libraries(test_dash_cb_payee PRIVATE

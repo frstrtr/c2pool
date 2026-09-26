@@ -87,12 +87,12 @@ using ::v37::u64;
 // GATE-ON golden: the owed_digest after blk_cut is finalized, with the ridge
 // active from position 4096. This is the V37.1 activation regression value.
 static const char* GOLDEN_OWED_ON =
-    "87c5249ac2057d0ac6707127c59cdc605acec4ba3c0d4b4b25e9b53692eb71ee";
+    "5d42f29090a1ec8cdda5d2289f8ee6002b0e59e554a7b93008a155e1342fb839";
 // GATE-OFF control over the identical schedule with the ridge inactive. It is
 // the value today's shipped consensus produces, and it is what makes the
 // gate-ON golden non-vacuous rather than a restatement of the status quo.
 static const char* GOLDEN_OWED_OFF =
-    "9cfaf97de7c58a7727ff5cc1203f445fc301559fb702938a3dd61ad32d6b338e";
+    "6cf1127ca68d6f0b5879fb2d896738fd3c54ccdf98772ff0206c95de4eaabf71";
 // The empty-ledger anchor, sha256d("V37Q").
 static const char* GOLDEN_OWED_EMPTY =
     "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
@@ -255,7 +255,7 @@ static Run drive(LaneKind lk, bool flip, u64 cov_override = 0, bool strict = tru
             if (!f) { o.refused = true; return o; }
             settle::OwedLedger::Amounts credit;
             for (const auto& [k, val] : f->credit) credit[k] = (long long)val;
-            ledger.on_block_found_with_estimator(BLOCK_ID[nb], credit, {}, p, {});
+            ledger.on_block_found_estimator_raw_PRE_RULING(BLOCK_ID[nb], credit, {}, p, {});
             ledger.on_block_finalized(BLOCK_ID[nb], (BLOCK_AT[nb] - 1) / SHARES_PER_BIN);
             o.credit[nb] = credit;
             o.source[nb] = f->source;

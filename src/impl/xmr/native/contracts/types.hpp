@@ -277,6 +277,7 @@ struct SyncState {
     std::uint64_t alt_rows = 0;
     std::uint64_t orphans = 0;
     std::uint64_t reorgs  = 0;
+    std::uint64_t chain_entries = 0;  // RESPONSE_CHAIN_ENTRYs accepted: answers to the driver's asks
 
     std::uint64_t pow_verified = 0;
     std::uint64_t pow_failed   = 0;

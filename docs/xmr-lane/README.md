@@ -33,6 +33,7 @@ Bitcoin-family lane and Monero pins FCMP++/CARROT timing. See the scoping note
 | X7 | [`x7-w3-wire.md`](x7-w3-wire.md) | W3 carrier/receipt wire type + RandomX DoS budget |
 | X0 | `src/impl/xmr/test/X0-PROVENANCE.md` | feasibility KATs (hashing-blob / block-id / tx-hash triple, Keccak-midstate opening) on real mainnet blocks |
 | X9 | [`finality-boundary.md`](finality-boundary.md) | settlement finality boundary (reorg depth >= D_conf, mainnet D_conf=60) + chain-ordered booking both sides (R4/R6) + the divergence cap (loud, bounded halt) |
+| D2 | [`d2-minority-converge.md`](d2-minority-converge.md) | minority converges to majority (operator ruling D2 = A): run detector (M unmatched from >= 2 builders), deterministic refold of the settled prefix, verified lineage switch, DIVERGED halt; D2-0 reorg-in booking gap |
 
 ## Open questions carried (route to operator / integrator)
 

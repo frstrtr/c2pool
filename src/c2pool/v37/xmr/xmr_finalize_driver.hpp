@@ -54,6 +54,19 @@ struct FoundBlock {
     Amounts       credit;       // per-key entitlement E_b at b's burial-gated prefix
     Amounts       payout;       // the coinbase outputs broadcast in b (K_fair)
     bool          canonical = true;
+    // ── ★ DROPS T3 (XMR arm) ─────────────────────────────────────────────
+    // Same shape as the BTC-family driver: the lane's gate plus the BURIED
+    // sub-threshold harvest this cut settles. Both default INERT. The XMR lane
+    // can only carry the NO-LaneKind gate (no ratified ridge row — see
+    // v37_node_lane_activation.hpp); that is a fact about the RIDGE, not about
+    // DROPS, whose gate is lane-independent.
+    ::v37::LaneParams                     params{};
+    std::vector<settle::HarvestedReceipt> harvested{};
+    // ★ DROPS-R1 + R-SYBIL: how work becomes coin at this cut, and who is
+    // enrolled. ★ DROPS-R3: the composed delta map to fold as-is.
+    settle::DropsCompose                  drops{};
+    bool                                  has_carried_drops = false;
+    Amounts                               carried_drops{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -103,6 +116,61 @@ public:
     using FinalizeStepFn = std::function<void(const std::string& bid, std::uint64_t h, std::uint64_t bin_height)>;
     void set_finalize_observer(FinalizeStepFn f) { m_on_finalize = std::move(f); }
 
+    // R-C rework-2 (O3.5 false-orphan fix): the TRI-STATE canonical probe. The
+    // bool CanonicalFn has no third value, so a header-fetch failure used to be
+    // answered "not carried" and the block ORPHANED at maturity (a false orphan
+    // of a perfectly canonical block -> owed_digest fork). When this probe is
+    // installed it REPLACES the bool test in the maturity walk: Yes -> finalize,
+    // No -> orphan, Unknown -> HOLD the walk at h-1 (nothing at h is mutated;
+    // the next advance retries). Unset => the bool CanonicalFn, as before.
+    enum class Carry : int { No = 0, Yes = 1, Unknown = 2 };
+    using CarryFn = std::function<Carry(std::uint64_t height, const std::string& bid)>;
+    void set_carry_probe(CarryFn f) { m_carry = std::move(f); }
+    std::uint64_t carry_unknown_holds() const { return m_carry_unknown; }
+
+    // R-C rework-2 (F1 restart-liveness root cause): a SETTLED seed (demo /
+    // fixture owed) routed THROUGH the write-ahead event log, exactly like a
+    // chain block: FOUND(bid, credit, {}) then FINALIZE(bid, bin_height), each
+    // durable before the ledger mutation and each firing the ledger-event
+    // observer (the RECON candidate ring). A seed that bypasses the log (the old
+    // XmrOwedFixture::seed_owed) is invisible to RecoveryDriver, so the replayed
+    // boot_digest_history() of a restarted node never contains the states it
+    // lived through -> a peer block committing a pre-restart state is refused.
+    // Idempotent: a bid the ledger already knows (a resumed store that replayed
+    // this very seed) is a no-op and returns false.
+    bool seed_settled(const std::string& bid, const Amounts& credit, std::uint64_t bin_height) {
+        if (m_ledger.is_settled(bid) || m_ledger.is_pending(bid)) return false;
+        SettleEvent fe;
+        fe.kind = SettleEvKind::Found; fe.bid = bid; fe.credit = credit;
+        write_event(fe);
+        m_ledger.on_block_found(bid, credit, /*payout=*/{});
+        ledger_event();
+        SettleEvent fz;
+        fz.kind = SettleEvKind::Finalize; fz.bid = bid; fz.bin_height = bin_height;
+        write_event(fz);
+        m_last_since = since_of_bin(bin_height);   // R-C rework-3 (D7): the same formula the boot replay uses
+        m_ledger.on_block_finalized(bid, bin_height);
+        ledger_event();
+        persist_hw();
+        return true;
+    }
+
+    // R-C rework-3 (D7, the RECON root-age bound): the coin height at which the
+    // CURRENT owed_digest state became current. Post R-A the digest is D(c), a
+    // function of the settled prefix, so it only changes at a FINALIZE (or a
+    // seed): FINALIZE of the block mined at h (bin_height = h + D_conf) makes
+    // D(h) current at height h. Updated right BEFORE the ledger mutation, so the
+    // ledger-event observer (the candidate ring) reads the height of the state it
+    // is sampling. The boot replay derives the SAME value from the Finalize
+    // event's recorded bin_height (XmrNode::boot_digest_since), so a restarted
+    // node's ring carries identical (digest, since) pairs. ORPHAN/FOUND never
+    // move it (they do not change D(c)).
+    std::uint64_t digest_since() const { return m_last_since; }
+    void set_digest_since(std::uint64_t h) { m_last_since = h; }   // boot: the replayed value
+    std::uint64_t since_of_bin(std::uint64_t bin_height) const {
+        return bin_height >= m_d_conf ? bin_height - m_d_conf : 0;
+    }
+
     XmrFinalizeDriver(OwedLedger& ledger, SettleHW& hw, ISettleStore& store,
                       ::v37::ChainId chain, std::uint64_t d_conf,
                       std::uint64_t recovered_cursor_height,
@@ -114,16 +182,28 @@ public:
     // Register a settlement-carrying block we just found. Write-ahead the FOUND
     // event (durable BEFORE the block is announced, W6 §5.2), enter the merged
     // ledger's pending set, and remember it for maturity. Idempotent per bid.
+    //
+    // ★ DROPS T3 — COMPOSE ONCE, HERE, AND PERSIST THE COMPOSED MAP (same rule
+    // as the BTC-family driver): the FOUND event carries the COMPOSED credit, so
+    // a restart replays it verbatim and no replay path re-derives the estimate
+    // against a harvest the node no longer holds.
     void on_block_found(const FoundBlock& b) {
+        // DROPS T3: the composed credit. Gate OFF (default) => byte for byte
+        // b.credit (compose_credit_* return the base map when the delta is empty).
+        const Amounts credit =
+            b.has_carried_drops
+                ? settle::compose_credit_from_delta(b.credit, b.carried_drops)
+                : settle::compose_credit_replace(b.params, b.credit, b.harvested,
+                                                 b.drops);
         //  fix 2: a record left non-canonical by an ORPHAN may be re-FOUND when the block
         // becomes canonical again (branch flip-flop). The OwedLedger already admits it (the
         // pre-SETTLED orphan was a pure pending removal); only this per-bid idempotency stood in the way.
         if (auto it = m_found.find(b.bid); it != m_found.end()) {
             if (it->second.canonical || m_ledger.is_settled(b.bid) || m_ledger.is_pending(b.bid)) return;
             SettleEvent ev;
-            ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = b.credit; ev.payout = b.payout;
+            ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = credit; ev.payout = b.payout;
             write_event(ev);
-            m_ledger.on_block_found(b.bid, b.credit, b.payout);
+            m_ledger.on_block_found(b.bid, credit, b.payout);
             ledger_event();   // R5
             it->second.credit = b.credit; it->second.payout = b.payout; it->second.canonical = true;
             return;   // m_by_height already lists it
@@ -131,10 +211,10 @@ public:
         SettleEvent ev;
         ev.kind = SettleEvKind::Found;
         ev.bid = b.bid;
-        ev.credit = b.credit;
+        ev.credit = credit;
         ev.payout = b.payout;
         write_event(ev);
-        m_ledger.on_block_found(b.bid, b.credit, b.payout);
+        m_ledger.on_block_found(b.bid, credit, b.payout);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
         ledger_event();   // R5
@@ -211,12 +291,27 @@ public:
             bool touched = false;                            // a found block was disposed at h
 
             auto bit = m_by_height.find(h);
+            // R-C rework-2: tri-state pre-pass. If ANY live found block at h has an
+            // UNKNOWN carry answer (header fetch failed), hold the walk at h-1
+            // BEFORE mutating anything at h -- never a false orphan.
+            if (bit != m_by_height.end() && m_carry) {
+                bool unknown = false;
+                for (const std::string& bid : bit->second) {
+                    auto fit = m_found.find(bid);
+                    if (fit == m_found.end() || !fit->second.canonical) continue;
+                    if (!m_ledger.is_pending(bid)) continue;
+                    if (m_carry(h, bid) == Carry::Unknown) { unknown = true; break; }
+                }
+                if (unknown) { ++m_carry_unknown; ++m_stalled; break; }
+            }
             if (bit != m_by_height.end()) {
                 for (const std::string& bid : bit->second) {
                     auto fit = m_found.find(bid);
                     if (fit == m_found.end()) continue;
                     if (!fit->second.canonical) continue;             // already orphaned
-                    if (m_is_canonical && !m_is_canonical(h, bid)) {  // orphaned at maturity
+                    const bool carried = m_carry ? (m_carry(h, bid) == Carry::Yes)
+                                                 : (!m_is_canonical || m_is_canonical(h, bid));
+                    if (!carried) {                                   // orphaned at maturity
                         on_block_orphaned(bid);
                         touched = true;
                         continue;
@@ -232,6 +327,7 @@ public:
                     ev.bin_height = bin_height;
                     write_event(ev);
                     if (m_on_finalize) m_on_finalize(bid, h, bin_height);   // R6 evidence: the pending set read here
+                    m_last_since = since_of_bin(bin_height);                  // R-C rework-3 (D7): == h
                     m_ledger.on_block_finalized(bid, bin_height);
                     ledger_event();   // R5
                     steps.push_back(FinalizeStep{bid, h, bin_height});
@@ -248,6 +344,33 @@ public:
 
     std::uint64_t cursor_height() const { return m_cursor_h; }
     std::uint64_t event_seq()     const { return m_seq; }
+
+    // COLD-BOOT: seed the cursor of a FRESH store (cursor 0, no event, no
+    // high-water) at boot -- the anchor boot passes H_a - D_conf, the value the
+    // first walk would reach anyway (no found block can exist at or below the
+    // anchor on a fresh store), so the post-anchor blocks are booked as they are
+    // pumped instead of DEFERRED behind a cursor at 0. A resumed store (any
+    // cursor, event or high-water) is never touched: returns false.
+    bool seed_boot_cursor(std::uint64_t h) {
+        if (m_cursor_h != 0 || m_seq != 0 || m_hw.hw_height != 0 || !m_found.empty() || h == 0) return false;
+        m_cursor_h = h;
+        persist_cursor();
+        return true;
+    }
+
+    // D2 (minority converges to majority): the event log was REWRITTEN to the
+    // re-derived lineage and the ledger replayed from it (XmrNode::relineage).
+    // Forget every found block this driver tracked (the consumer re-drives the
+    // new pending set through on_block_found, as the boot sidecar re-drive
+    // does), continue the write-ahead sequence after the rewritten log and the
+    // since-height of its last FINALIZE. The cursor, the high-water and every
+    // installed observer / gate / probe are unchanged.
+    void rebase(std::uint64_t event_seq, std::uint64_t digest_since) {
+        m_found.clear();
+        m_by_height.clear();
+        m_seq = event_seq;
+        m_last_since = digest_since;
+    }
 
 private:
     void write_event(const SettleEvent& ev) {
@@ -282,6 +405,9 @@ private:
     std::uint64_t  m_stalled = 0;                // R4: times the gate held the cursor
     LedgerEventFn  m_on_ledger_event;            // R5: per-ledger-event observer (candidate ring)
     FinalizeStepFn m_on_finalize;                // R6: pre-FINALIZE observer (pending-set evidence)
+    CarryFn        m_carry;                      // R-C rework-2: tri-state canonical probe (Unknown -> hold)
+    std::uint64_t  m_carry_unknown = 0;          // R-C rework-2: walks held on an Unknown carry answer
+    std::uint64_t  m_last_since = 0;             // R-C rework-3 (D7): coin height the current digest became current
 
     std::map<std::string, FoundBlock>              m_found;      // bid -> block
     std::map<std::uint64_t, std::vector<std::string>> m_by_height; // mined height -> bids

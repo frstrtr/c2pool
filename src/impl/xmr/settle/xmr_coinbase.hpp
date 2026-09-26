@@ -72,6 +72,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -149,6 +150,26 @@ struct FixedOutput {
 
 // Everything W5 needs, all consensus-derived so the coinbase is a pure function
 // of these bytes. budget := base_reward + fees (the exact-sum target).
+// SAME-BLOCK PAY-NOW (operator ruling 09-25). One payee whose work THIS block
+// credits at its on-chain credit cut, with its E_b at the block's exact-sum
+// budget (the same fold_eb split every node books at finalization). The
+// provider hands X6 the list per budget (paynow_at), sorted by identity ASC,
+// eb > 0 only -- exactly the key order of the fold's credit map.
+struct PayNowEntry {
+    ::v37::ScriptRef pay;                 // payout target (XMR kind)
+    ::v37::bytes32   identity{};          // ledger identity_key (== fold_eb key)
+    std::uint64_t    eb = 0;              // E_b at this block's budget, piconero
+};
+
+// The pay-now split: `pool` over the entries in proportion to eb, exact-sum
+// (Σ result == min(pool, Σ eb)), each result <= its own eb. floor(pool*eb/Σeb)
+// per entry, then the leftover (< n) one piconero each by LARGEST remainder,
+// ties by entry order (identity ASC). A pure function of (pool, eb vector):
+// the receive side re-derives it from the on-chain cut and the committed
+// V37N base (see c2pool/v37/xmr/xmr_paynow.hpp).
+std::vector<std::uint64_t> paynow_split(std::uint64_t pool,
+                                        const std::vector<std::uint64_t>& eb);
+
 struct CoinbaseInputs {
     // --- FENCE key ---
     std::uint8_t   monero_major_version = 0;
@@ -173,6 +194,17 @@ struct CoinbaseInputs {
     std::uint64_t  h_min = 0;             // min owed to emit an output (piconero); dust=0
     std::uint32_t  output_cap = 0;        // weight-aware cap C (TOTAL outputs)
 
+    // --- SAME-BLOCK PAY-NOW (empty => off; master behaviour) ---
+    // When set, whatever the owed pass leaves above the folded donation
+    // minimum (or, with a separate sink, the whole residual) pays the entries
+    // paynow_at(budget()) returns via paynow_split, each merged into its owed
+    // output when it has one, else a new output after the owed outputs
+    // (identity ASC). The residual-sink identity's share stays in the
+    // residual (it lands in the sink / folded donation output). paynow_n is an
+    // upper bound on the entry count (the assembler's weight reserve).
+    std::function<std::vector<PayNowEntry>(std::uint64_t budget)> paynow_at;
+    std::size_t    paynow_n = 0;
+
     // --- tx_extra ---
     std::vector<unsigned char> extra_nonce; // 0x02 padded per-worker extranonce
 
@@ -182,11 +214,18 @@ struct CoinbaseInputs {
 // One resolved coinbase output. `identity` records whose owed this settles
 // (or the sink/fixed identity) for auditing the CONS-2 delta.
 struct CoinbaseOutput {
-    enum class Role : std::uint8_t { Owed = 0, Fixed = 1, Sink = 2 };
+    // PayNow: a SAME-BLOCK PAY-NOW output for a payee with no owed output in
+    // this coinbase (a payee that has one gets its pay-now merged there, Owed).
+    enum class Role : std::uint8_t { Owed = 0, Fixed = 1, Sink = 2, PayNow = 3 };
     ::v37::ScriptRef pay;
     ::v37::bytes32   identity{};
     std::uint64_t    amount = 0;     // piconero
     Role             role = Role::Owed;
+    // Only on the folded (last) fixed output when the residual folds into it
+    // (residual_folds_into_fixed): the part of `amount` that settles OWED to
+    // its identity (a ledger deduction); amount - owed_part is the minimum +
+    // residual (coverage). 0 everywhere else. See allocate_exact_sum.
+    std::uint64_t    owed_part = 0;
     // filled by the crypto pass:
     PublicKey        one_time_key{}; // P_i
     ViewTag          view_tag{};     // vt_i
@@ -197,7 +236,7 @@ enum class BuildError : std::uint8_t {
     CarrotFence,        // major_version > W5_PRECARROT_MAX_MAJOR_VERSION
     ZeroBudget,         // base_reward + fees == 0 (impossible on XMR tail emission)
     FixedExceedsBudget, // Sum(fixed) > budget
-    CapTooSmall,        // output_cap < fixed.size() + 1 (no room for the sink)
+    CapTooSmall,        // output_cap < fixed.size() + 1 (no room for the sink; + 0 when it folds, S1)
     BadSinkDescriptor,  // residual_sink is not a valid XMR ref
     BadPayeeDescriptor, // an owed/fixed pay is not a valid XMR ref
     DerivationFailed,   // r*G or an ECDH derivation failed (bad point)
@@ -243,7 +282,29 @@ struct ReceivedCoinbase {
 //
 // Canonical output order (consensus):
 //     [ K_fair owed outputs ]  ++  [ fixed outputs ]  ++  [ residual sink? ]
-// The sink is present iff the residual is > 0. Invariant on success:
+// The sink is present iff the residual is > 0 -- EXCEPT when the LAST fixed
+// output IS the residual sink (same ref + identity: residual_folds_into_fixed(), the fee model's
+// single donation output, rulings S1/S2): then there is never a separate sink
+// output and no sink slot is reserved; that last fixed output pays
+// max(declared amount, residual), i.e. it absorbs the whole residual, and its
+// declared amount is a MINIMUM taken from the residual first and, only when
+// the owed pass exhausted the budget, from the LARGEST owed output (ties: the
+// earliest in K_fair order; the shortfall stays owed).
+//
+// MERGE (one output per fold identity, operator ruling 09-23): when the fold
+// identity is ALSO in the owed set (the donation holding give-author credit),
+// it is paid in the K_fair pass at its own age position exactly like any other
+// payee (budget, h_min, the S2 dust candidates), but it takes NO output slot
+// of its own: its payout is added into the folded output, which is then
+//     amount    = owed_paid + minimum + residual        (ONE output, last)
+//     owed_part = min(owed_in, amount - minimum)
+// where owed_in is fold_identity_owed(in). owed_part is the K_fair payout
+// plus, when the pass left residual, the rest of owed_in out of that residual
+// (the output pays the fold identity either way; this books what it
+// receives against what it is owed first). The rule depends only on owed_in
+// and the on-chain amount, so a receiver that knows owed_in (committed in the
+// coinbase by the fee model) re-derives owed_part without the ledger.
+// Invariant on success:
 //     Sum(result.amount) == in.budget()      (exact-sum, no burn)
 // and every result.amount > 0, and result.size() >= 1, and result.size() <=
 // in.output_cap.
@@ -253,6 +314,17 @@ struct ReceivedCoinbase {
 // ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err = nullptr);
+
+// S1: true iff the last fixed output IS the residual sink -- it pays
+// `residual_sink` (ScriptRef equality) under `residual_sink_identity` -- i.e.
+// the residual folds into it and no separate sink output / slot exists.
+// Callers that pre-check the output cap must use the same slot rule.
+bool residual_folds_into_fixed(const CoinbaseInputs& in);
+
+// The owed the input set holds for the fold identity (sum over owed entries
+// with that identity and ref; 0 when the residual does not fold or the
+// identity holds no owed). This is the owed_in of the MERGE rule above.
+std::uint64_t fold_identity_owed(const CoinbaseInputs& in);
 
 // ---------------------------------------------------------------------------
 // Deterministic tx secret key r = H_s(domain || major || chain_id ||

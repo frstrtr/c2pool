@@ -642,7 +642,8 @@ static void test_load_anchor() {
     check(why.find("cannot open") != std::string::npos, "and says so plainly");
 
     // The embedded path, including the networks this build does not carry.
-    check(!load_anchor("", XmrNet::Mainnet, none, why),
+    // (Mainnet and stagenet both carry a pinned bundle now; regtest never does.)
+    check(!load_anchor("", XmrNet::Regtest, none, why),
           "an empty path on a network with no embedded bundle is refused");
     check(why.find("no embedded anchor bundle") != std::string::npos,
           "and says the build carries none");
@@ -809,15 +810,20 @@ static void test_generate_anchor() {
 }
 
 // ---------------------------------------------------------------------------
-// 6) THE REAL BUNDLE: the stagenet anchor this build embeds
+// 6) THE REAL FORMAT-1 BUNDLE: the earlier stagenet anchor, still compiled in
+//    (ANCHOR_EMBEDDED_STAGENET_F1). The pinned format-2 bundles the node boots
+//    from are checked by v37_xmr_pinned_snapshot_kat.
 // ---------------------------------------------------------------------------
 static void test_embedded_stagenet() {
     AnchorBundle b;
     std::string why;
-    const AnchorLoadResult r = load_anchor_detailed("", XmrNet::Stagenet, b);
-    checkf(r.ok, "the embedded stagenet anchor loads: %s", r.why.c_str());
+    const std::string f1_path = "xmr_anchor_kat_embedded_f1.inc";
+    check(write_file(f1_path, ANCHOR_EMBEDDED_STAGENET_F1), "the KAT can write the format-1 bundle");
+    const AnchorLoadResult r = load_anchor_detailed(f1_path, XmrNet::Stagenet, b);
+    std::remove(f1_path.c_str());
+    checkf(r.ok, "the embedded format-1 stagenet anchor loads: %s", r.why.c_str());
     if (!r.ok) return;
-    check(r.source == "embedded", "and it came from the binary, not from a path");
+    check(!b.has_output_set(), "and it is a format-1 bundle (no committed output set)");
 
     // The pins a reviewer checks against a block explorer.
     check(b.network == "stagenet", "the embedded bundle is the stagenet one");
@@ -863,7 +869,7 @@ static void test_embedded_stagenet() {
     // A real bundle is also a real refusal on the wrong network.
     AnchorBundle none;
     check(!load_anchor("", XmrNet::Testnet, none, why),
-          "the stagenet bundle is not offered to a testnet node");
+          "no embedded bundle is offered to a testnet node");
 }
 
 // ---------------------------------------------------------------------------
