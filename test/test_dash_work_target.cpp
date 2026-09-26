@@ -214,3 +214,56 @@ TEST(DashWorkTarget, ModulateUnconstrainedIsMax)
     WorkTargetInputs in;  // all defaults: no hashrate, no gate
     EXPECT_EQ(modulate_desired_share_target(in).GetHex(), MAX_TARGET_HEX);
 }
+
+// #865 — miner-supplied share target (oracle "ADDR/<difficulty>"). work.py:312
+// runs the whole modulation only `if desired_share_target is None`, so a
+// supplied target is returned AS-IS. The discriminating case is a supplied
+// target EASIER than Cap 1: a min() implementation would return Cap 1's
+// 0000..eb08.. (ModulateCap1OnlyPath); the oracle returns the supplied one.
+namespace {
+constexpr const char* DIFF1_TARGET_HEX =   // difficulty_to_target(1.0)
+    "00000000ffff0000000000000000000000000000000000000000000000000000";
+}
+
+TEST(DashWorkTarget, MinerTargetOverridesCap1EvenWhenEasier)
+{
+    WorkTargetInputs in;
+    in.local_hash_rate = 1e9;
+    in.share_period    = dash::SharechainConfig::SHARE_PERIOD;
+    in.dust_gate       = false;
+    uint256 supplied;
+    supplied.SetHex(DIFF1_TARGET_HEX);
+    in.miner_share_target = supplied;
+    EXPECT_EQ(modulate_desired_share_target(in).GetHex(), DIFF1_TARGET_HEX);
+
+    // Same inputs, no supplied target -> Cap 1 binds (unchanged behaviour).
+    in.miner_share_target.reset();
+    EXPECT_EQ(modulate_desired_share_target(in).GetHex(),
+        "0000000000eb08174d325a04e29e57c52c14f6dcfc48f79979535e202dcecf3d");
+}
+
+// Cap 2 is inside the same oracle `if`, so an armed dust cap is skipped too.
+// 1 kH/s: Cap 1 is ~2**236 (inert); the dust cap (block 0x1b00ffff -> ~2**48
+// attempts, x SPREAD 10 x DUST 1e5 / subsidy 5e8 -> ~2**256/5.6e11 ~ 2**217) is
+// HARDER than difficulty 1 (~2**224), so without the override the result is
+// strictly below the supplied target.
+TEST(DashWorkTarget, MinerTargetSkipsArmedDustCap)
+{
+    WorkTargetInputs in;
+    in.local_hash_rate          = 1e3;
+    in.share_period             = dash::SharechainConfig::SHARE_PERIOD;
+    in.spread                   = dash::SharechainConfig::SPREAD;
+    in.dust_threshold           = dash::SharechainConfig::DUST_THRESHOLD;
+    in.dust_gate                = true;
+    in.pool_attempts_per_second = 1e15;
+    in.subsidy                  = 500000000ULL;
+    in.block_bits               = 0x1b00ffffu;
+    uint256 supplied;
+    supplied.SetHex(DIFF1_TARGET_HEX);
+
+    const uint256 capped = modulate_desired_share_target(in);
+    EXPECT_LT(capped, supplied);   // the dust cap binds without an override
+
+    in.miner_share_target = supplied;
+    EXPECT_EQ(modulate_desired_share_target(in).GetHex(), DIFF1_TARGET_HEX);
+}
