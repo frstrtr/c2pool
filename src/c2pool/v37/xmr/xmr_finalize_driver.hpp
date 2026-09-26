@@ -358,6 +358,23 @@ public:
         return true;
     }
 
+    // LANE-EPOCH BOOTSTRAP: a node whose ledger holds NO settled row and NO
+    // pending block (a fresh store, or one that only booked/finalized blocks
+    // committing the EMPTY ledger -- the epoch's first blocks) may jump its
+    // cursor to a verified checkpoint's C (>= the current cursor). Everything
+    // at or below C is the checkpoint's; the rows are seeded right after.
+    bool bootstrap_fresh() const {
+        if (m_ledger.pending_count() != 0) return false;
+        for (const auto& [k, w] : m_ledger.finalW()) if (w != 0) return false;
+        return true;
+    }
+    bool bootstrap_cursor(std::uint64_t c) {
+        if (!bootstrap_fresh() || c < m_cursor_h) return false;
+        m_cursor_h = c;
+        persist_cursor();
+        return true;
+    }
+
     // D2 (minority converges to majority): the event log was REWRITTEN to the
     // re-derived lineage and the ledger replayed from it (XmrNode::relineage).
     // Forget every found block this driver tracked (the consumer re-drives the

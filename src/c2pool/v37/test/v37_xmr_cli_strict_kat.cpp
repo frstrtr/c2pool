@@ -192,6 +192,9 @@ void bad_rows() {
         {{"--native-snapshot-every", "12abc"}, "--native-snapshot-every", "a native-node number with junk"},
         {{"--native-template-fallback", "of"}, "--native-template-fallback", "a native-node on/off typo"},
         {{"--mine", "4x"},                     "--mine",                "a thread count with junk"},
+        {{"--epoch-gate", "v2"},               "--epoch-gate",          "an unknown lane-epoch gate"},
+        {{"--network", "mainnet", "--epoch-gate", "v1", "--epoch-n", "40"}, "--epoch-n", "a lane-epoch N override on mainnet"},
+        {{"--epoch-n", "40"},                  "--epoch-n",             "a lane-epoch N without --epoch-gate v1"},
     };
     for (const Bad& b : rows) {
         const auto args = safe(b.tail);
@@ -297,6 +300,8 @@ void compat_rows() {
         {"--data-dir", "settle"}, {"--i-understand-mainnet"}, {"--randomx"}, {"--randomx-large-pages"},
         {"--mine"}, {"--mine", "2"}, {"--mine-threads", "2"}, {"--mine-fast"}, {"--mine-msr"},
         {"--mine-no-huge-pages"}, {"--mine-no-affinity"},
+        {"--epoch-gate", "off"},
+        {"--network", "regtest", "--epoch-gate", "v1", "--epoch-n", "40", "--epoch-open-grace", "0", "--epoch-origin", "1"},
         // apply_native_node_flag()
         {"--native-connect", "127.0.0.1:7323"}, {"--native-p2p-bind", "127.0.0.1"}, {"--native-anchor", "a.inc"},
         {"--native-force-synced"}, {"--native-allow-unverified-pow"}, {"--native-seeds"}, {"--seeds"},

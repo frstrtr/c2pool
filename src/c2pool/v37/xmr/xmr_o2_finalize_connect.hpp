@@ -544,6 +544,8 @@ public:
         // `lane_root_unknown_resolved` = later booked; `lane_root_unknown_terminal`
         // = exhausted the retry bound still unknown (LOUD; a real other-lane block
         // or a ring that never reached the winner's state).
+        std::uint64_t bootstrap_released = 0;   // LANE-EPOCH: lane blocks <= C covered by an adopted checkpoint
+        std::uint64_t epoch_decided = 0;   // LANE-EPOCH: "epoch-" outcomes (stale/invalid-opener/sibling/unknown/closed/dead): not booked, never held
         std::uint64_t lane_root_unknown_retries = 0, lane_root_unknown_resolved = 0,
                       lane_root_unknown_terminal = 0;
         // R6 (TWO-SIDED chain-ordered booking): chain blocks that arrived at a
@@ -983,6 +985,21 @@ public:
             // on-chain payout recorded as NODE-LOCAL LIABILITY (rework-3 (b)), and
             // one OBSERVATION for the lineage vote -- never by itself a halt.
             if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, bk); return; }
+            // LANE-EPOCH (xmr_lane_epoch.hpp): the epoch rule DECIDED this Own block
+            // (a closed / dead lineage, a stale epoch, an invalid opener, an epoch
+            // this build cannot read). A pure function of chain data: never retried,
+            // never HELD, NOT a lineage-vote observation; its on-chain payout is
+            // node-local liability and the finalize cursor moves on.
+            if (why.rfind("epoch-", 0) == 0) {
+                m_chain_seen[bid] = true; m_first_cursor.erase(bid); m_retry.erase(bid); m_root_unknown_bids.erase(bid);
+                if (m_held.erase(bid)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); }
+                note_relay_held_resolved(bid, "decided by the lane-epoch rule");
+                ++m_stats.epoch_decided;
+                say("cba: EPOCH-DECIDED chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + ": " + why +
+                    " -- not booked, not held, not a lineage-vote observation; payout -> node-local LIABILITY");
+                refuse_money(h, bid, bk, why);
+                return;
+            }
             const bool root_unknown = (why.rfind("lane-root-unknown:", 0) == 0);   // R5
             // D6a: "native-hold:" = the native chain index does not hold the block body
             // (p2p-first booking reads it there, not from monerod) -- a transient fetch
@@ -1240,6 +1257,28 @@ public:
     // re-seed the RECON candidate ring from boot_digest_history(), forget its
     // root-unknown alarm memo, force a template rebuild).
     void set_relineage_hook(std::function<void()> f) { m_relineage_hook = std::move(f); }
+    // LANE-EPOCH BOOTSTRAP: a verified checkpoint at cursor C was adopted (the
+    // node's ledger IS the structure's settled state through C). Every chain
+    // lane block at or below C this node was retrying / holding / deferring is
+    // covered by it: released (never booked here, never a liability, not a
+    // vote observation). Blocks above C stay and book in chain order.
+    std::size_t bootstrap_release_through(std::uint64_t c) {
+        std::set<std::string> bids;
+        for (const auto& [b, h] : m_retry)    if (h <= c) bids.insert(b);
+        for (const auto& [b, h] : m_deferred) if (h <= c) bids.insert(b);
+        for (const auto& [b, h] : m_held)     if (h <= c) bids.insert(b);
+        for (const auto& b : bids) {
+            m_retry.erase(b); m_retry_n.erase(b); m_deferred.erase(b);
+            m_root_unknown_bids.erase(b); m_first_cursor.erase(b);
+            if (m_held.erase(b)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); }
+            note_relay_held_resolved(b, "covered by the adopted bootstrap checkpoint");
+            m_chain_seen[b] = true;
+        }
+        m_stats.bootstrap_released += bids.size();
+        say("cba: BOOTSTRAP checkpoint adopted at C=" + std::to_string(c) + ": released " + std::to_string(bids.size()) +
+            " chain lane block(s) at/below C (covered by the checkpoint); held_now=" + std::to_string(m_held.size()));
+        return bids.size();
+    }
     std::uint64_t relineage_seq() const { return m_relineage_seq; }
     // This node's own builder keys (builder_key of the GAP-2 extra-nonce base and
     // of the in-process miner's slot): a lane block carrying one is OWN.

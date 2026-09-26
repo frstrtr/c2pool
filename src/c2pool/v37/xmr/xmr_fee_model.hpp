@@ -394,11 +394,11 @@ inline std::vector<std::uint8_t> encode_donation_owed_tail(std::uint64_t owed_in
 // credit-cut tail when one is present, else the last 12 bytes. nullopt when
 // the magic is not there.
 inline std::optional<std::uint64_t> parse_donation_owed_payload(const std::vector<std::uint8_t>& p) {
-    std::size_t end = credit::end_before_credit_tail(p);
     // POOL-LINEAGE: a lineage-tagged payload carries the V37P field between
     // V37D and V37C; skip it (a malformed field leaves `end` where it is, so the
-    // V37D magic check below fails closed).
-    if (credit::parse_pool_tag_payload(p) == credit::PoolTagParse::Present) end -= credit::kPoolTagFieldBytes;
+    // V37D magic check below fails closed). LANE-EPOCH: likewise a well-formed
+    // V37E field right before V37P (absent under the gate OFF: same offset).
+    std::size_t end = credit::end_before_lineage_fields(p);
     if (end < kDonationOwedTailBytes) return std::nullopt;
     const std::uint8_t* t = p.data() + end - kDonationOwedTailBytes;
     if (std::memcmp(t, kDonationOwedMagic, 4) != 0) return std::nullopt;

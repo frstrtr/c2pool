@@ -1134,6 +1134,9 @@ public:
     }
     std::size_t pending_count() const { return m_pending.size(); }
     const Amounts& finalW() const { return m_finalW; }
+    // LANE-EPOCH bootstrap (checkpoint export): the K_fair age clock of a key
+    // (0 = unarmed). Read-only diagnostics accessor over fe_at; never consensus.
+    u64 first_eligible_of(const bytes32& k) const { return fe_at(k); }
 
     // ─────────────────────────────────────────────────────────────────────
     // ★ THE OWED-EVENT MMR — the append-only authenticated record of this

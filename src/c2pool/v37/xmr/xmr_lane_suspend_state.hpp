@@ -44,7 +44,8 @@ struct LaneSuspendState {
     // causes -- they live in `alarms` (edges counted and named), never in
     // `causes`, so D2 can never withdraw the stratum job or halt the lane.
     enum Cause : unsigned { kLag = 1u, kIsolated = 2u, kHeld = 4u, kContested = 8u, kConverging = 16u, kDiverged = 32u,
-                           kTest = 64u };   // kTest: FAULT-KNOB only (test_forced)
+                           kTest = 64u,     // kTest: FAULT-KNOB only (test_forced)
+                           kEpoch = 128u }; // LANE-EPOCH: the epoch view forbids building (wait for bootstrap / N, or fuse)
     static constexpr unsigned kAlarmOnly = kConverging | kDiverged;
 
     struct Edge {
@@ -64,6 +65,8 @@ struct LaneSuspendState {
     std::uint64_t n_converging = 0, n_diverged = 0;
     bool          test_forced = false;   // FAULT-KNOB (TEST-ONLY): forces cause kTest; false unless the knob fired
     std::uint64_t n_test = 0;
+    bool          epoch_forced = false;  // LANE-EPOCH (xmr_lane_epoch.hpp plan Wait/Fuse); false unless the gate is ON
+    std::uint64_t n_epoch = 0;
 
     explicit LaneSuspendState(std::uint64_t d = 1) : d_conf(d ? d : 1) {}
 
@@ -83,6 +86,7 @@ struct LaneSuspendState {
         if (held)        now |= kHeld;
         if (contested)   now |= kContested;
         if (test_forced) now |= kTest;
+        if (epoch_forced) now |= kEpoch;
         unsigned al = 0;
         if (converging)  al |= kConverging;
         if (diverged)    al |= kDiverged;
@@ -99,6 +103,7 @@ struct LaneSuspendState {
         if (e.added & kHeld)      ++n_held;
         if (e.added & kContested) ++n_contested;
         if (e.added & kTest)      ++n_test;
+        if (e.added & kEpoch)     ++n_epoch;
         if (e.alarm_added & kConverging) ++n_converging;
         if (e.alarm_added & kDiverged)  ++n_diverged;
         if (e.suspend_edge) ++n_suspend;
@@ -116,6 +121,7 @@ struct LaneSuspendState {
         if (c & kHeld)      add("held");
         if (c & kContested) add("contested");
         if (c & kTest)      add("test");
+        if (c & kEpoch)     add("epoch");
         if (c & kConverging) add("converging");
         if (c & kDiverged)  add("diverged");
         return s.empty() ? "-" : s;

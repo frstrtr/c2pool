@@ -88,6 +88,10 @@ struct CoinbaseBooking {
     bool                 lineage_gated = false;
     credit::BlockLineage lineage = credit::BlockLineage::Untagged;
     ::v37::bytes32       lineage_seen_tag{};   // the foreign tag (lineage == Foreign)
+    // LANE-EPOCH: the V37E field of an Own block (read right after the lineage
+    // gate, before the root match, so a root-unknown block still reports it).
+    credit::EpochParse   epoch_parse = credit::EpochParse::Absent;
+    credit::EpochField   epoch{};
     // SAME-BLOCK PAY-NOW: the committed base B (0x02 tail "V37N"), if any.
     // The booking nets the pay-now it implies (xmr_paynow.hpp net_booking).
     std::optional<std::uint64_t> paynow_base;
@@ -170,6 +174,7 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
                         : std::string("not-lane: no pool_tag in the V37C tail (pre-lineage / older pool: an ordinary block for this pool)");
             return b;
         }
+        b.epoch_parse = credit::parse_epoch(got.tx_extra, &b.epoch);   // LANE-EPOCH (read-only; the rule is the caller's)
     }
     // MM-PARSE-2: the same tail with no V37 field in the 0x02 payload is a
     // merge-mining pool's coinbase, decided "not-lane:" from the bytes for EVERY

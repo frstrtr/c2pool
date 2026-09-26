@@ -81,6 +81,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -174,6 +175,13 @@ struct XmrSettlementConfig {
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
     std::optional<::v37::bytes32> pool_tag;
+
+    // LANE-EPOCH (xmr_lane_epoch.hpp): the lineage the template commits (V37E),
+    // asked per template height. Returns 0 = no field (gate OFF: master's
+    // bytes), 1 = commit `field` (`opener` = this block OPENS a new lane epoch:
+    // it is built over the EMPTY ledger, E1), -1 = do not build (why set: the
+    // node cannot extend the structure's current lineage yet). Unset => 0.
+    std::function<int(std::uint64_t height, credit::EpochField& field, bool& opener, std::string& why)> epoch_source;
 
     // ---- sink constructors (payout-target bytes, never address strings) ----
     // Set the sink from raw 32-byte key material; also fills residual_sink_identity.
@@ -324,6 +332,12 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
+    if (cfg.epoch_source && ctx.has_pool_tag) {   // LANE-EPOCH: V37E (gate ON only; the opener split is in build_settlement_source)
+        bool opener = false; std::string ew;
+        const int r = cfg.epoch_source(parent.height, ctx.epoch, opener, ew);
+        if (r < 0) return no("lane-epoch: " + ew);
+        ctx.has_epoch = (r > 0);
+    }
     if (ctx.has_credit_cut && cfg.paynow_source)   // SAME-BLOCK PAY-NOW: E_b weights at that cut
         ctx.has_paynow = cfg.paynow_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest, ctx.paynow_payees);
     if (why) why->clear();
@@ -353,10 +367,26 @@ build_settlement_source(const XmrSettlementConfig& cfg,
                         std::uint64_t reward_hint,
                         std::string* why,
                         const AgeOfFn& age_of = {}) {
-    std::optional<XmrCoinbaseContext> ctx = make_xmr_coinbase_context(cfg, parent, ledger, why);
+    // LANE-EPOCH (E1): an OPENER commits the EMPTY ledger (root = sha256d('V37Q'),
+    // no owed outputs) whatever this node's own ledger holds -- every node,
+    // holder or fresh, books the new epoch from empty. The empty ledger is a
+    // per-chain immutable object (never mutated; stable address).
+    const OwedLedger* use = &ledger;
+    if (cfg.epoch_source && cfg.pool_tag) {
+        credit::EpochField f; bool opener = false; std::string ew;
+        if (cfg.epoch_source(parent.height, f, opener, ew) > 0 && opener) {
+            static std::mutex mtx;
+            static std::map<::v37::ChainId, std::unique_ptr<OwedLedger>> empties;
+            std::lock_guard<std::mutex> lk(mtx);
+            auto& e = empties[ledger.chain()];
+            if (!e) e = std::make_unique<OwedLedger>(ledger.chain());
+            use = e.get();
+        }
+    }
+    std::optional<XmrCoinbaseContext> ctx = make_xmr_coinbase_context(cfg, parent, *use, why);
     if (!ctx) return nullptr;
     const std::uint64_t hint = reward_hint != 0 ? reward_hint : parent.budget();
-    return XmrOwedSettlementSource::build(ledger, pay_of, *ctx, hint, why, cfg.kfair, age_of);
+    return XmrOwedSettlementSource::build(*use, pay_of, *ctx, hint, why, cfg.kfair, age_of);
 }
 
 // ---------------------------------------------------------------------------

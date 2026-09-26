@@ -151,6 +151,104 @@ inline PoolTagParse parse_pool_tag(const std::vector<unsigned char>& tx_extra, :
 }
 
 // ---------------------------------------------------------------------------
+// LANE-EPOCH (operator direction 09-26: ONE structure per coin; a dead lineage
+// continues as a NEW LANE EPOCH inside the same pool_tag, xmr_lane_epoch.hpp).
+// Every lane block of a structure whose EpochGate is ON commits the lineage it
+// belongs to as
+//
+//     "V37E" | u8 fver (= 1) | u32le epoch_seq | u32le epoch_version | b32 parent_digest   (45 B)
+//
+// placed IMMEDIATELY BEFORE the V37P field, so a gate-ON 0x02 payload reads
+//
+//     [ nonce 4 | rbind? | pad | "V37N" B? | "V37D" owed_in? | "V37E" ... | "V37P" v pool_tag | "V37C" P spine? ]
+//
+// END-anchored like the rest of the tail, constant size. It is meaningful ONLY
+// behind a well-formed V37P field (a block of no pool / of another pool never
+// carries an epoch for us). STRICT: the V37E magic with fver != 1 is MALFORMED.
+// Gate OFF => no field, master's bytes (every reader below sees Absent).
+// ---------------------------------------------------------------------------
+inline constexpr unsigned char kEpochMagic[4]     = {'V', '3', '7', 'E'};
+inline constexpr std::uint8_t  kEpochFieldVersion = 1;
+inline constexpr std::size_t   kEpochFieldBytes   = 4 + 1 + 4 + 4 + 32;   // 45
+
+struct EpochField {
+    std::uint32_t  seq = 0;        // 0 = the implicit lineage (no field / first epoch)
+    std::uint32_t  version = 0;    // the epoch rule version the lineage runs under
+    ::v37::bytes32 parent{};       // names the closed lineage (0^32 for seq 0)
+    bool operator==(const EpochField&) const = default;
+};
+
+inline std::vector<std::uint8_t> encode_epoch_field(const EpochField& e) {
+    std::vector<std::uint8_t> t;
+    t.reserve(kEpochFieldBytes);
+    t.insert(t.end(), kEpochMagic, kEpochMagic + 4);
+    t.push_back(kEpochFieldVersion);
+    for (int i = 0; i < 4; ++i) t.push_back(static_cast<std::uint8_t>(e.seq >> (8 * i)));
+    for (int i = 0; i < 4; ++i) t.push_back(static_cast<std::uint8_t>(e.version >> (8 * i)));
+    t.insert(t.end(), e.parent.begin(), e.parent.end());
+    return t;
+}
+
+enum class EpochParse : std::uint8_t {
+    Absent    = 0,   // no V37E field (gate OFF, or no well-formed V37P before which it could sit)
+    Present   = 1,   // a version-1 field; EpochField filled
+    Malformed = 2,   // the V37E magic with an unknown field version (strict reject)
+};
+
+inline const char* to_string(EpochParse e) {
+    switch (e) {
+        case EpochParse::Absent:    return "absent";
+        case EpochParse::Present:   return "present";
+        case EpochParse::Malformed: return "malformed";
+    }
+    return "?";
+}
+
+// End offset of the part of a 0x02 payload BEFORE the V37P field (the V37E
+// field, when present, ends here). nullopt when the payload carries no
+// well-formed V37P field.
+inline std::optional<std::size_t> end_before_pool_tag_field(const std::vector<std::uint8_t>& p) {
+    if (parse_pool_tag_payload(p) != PoolTagParse::Present) return std::nullopt;
+    return end_before_credit_tail(p) - kPoolTagFieldBytes;
+}
+
+inline EpochParse parse_epoch_payload(const std::vector<std::uint8_t>& p, EpochField* out = nullptr) {
+    const auto e = end_before_pool_tag_field(p);
+    if (!e || *e < kEpochFieldBytes) return EpochParse::Absent;
+    const std::uint8_t* f = p.data() + *e - kEpochFieldBytes;
+    if (std::memcmp(f, kEpochMagic, 4) != 0) return EpochParse::Absent;
+    if (f[4] != kEpochFieldVersion) return EpochParse::Malformed;
+    if (out) {
+        out->seq = 0; out->version = 0;
+        for (int i = 0; i < 4; ++i) out->seq     |= static_cast<std::uint32_t>(f[5 + i]) << (8 * i);
+        for (int i = 0; i < 4; ++i) out->version |= static_cast<std::uint32_t>(f[9 + i]) << (8 * i);
+        std::memcpy(out->parent.data(), f + 13, 32);
+    }
+    return EpochParse::Present;
+}
+
+inline EpochParse parse_epoch(const std::vector<unsigned char>& tx_extra, EpochField* out = nullptr) {
+    const auto f = extra_nonce_field(tx_extra);
+    if (!f) return EpochParse::Absent;
+    return parse_epoch_payload(*f, out);
+}
+
+// The end offset every reader of a field placed BEFORE the lineage fields
+// (V37D, V37N) starts from: the payload minus the V37C tail, the V37P field and
+// a well-formed V37E field (each only if present). A MALFORMED V37E is not
+// skipped, so those readers' magic checks fail closed (the epoch rule has
+// already made such a block unbookable). Gate OFF => no V37E => exactly the
+// pre-epoch offset.
+inline std::size_t end_before_lineage_fields(const std::vector<std::uint8_t>& p) {
+    std::size_t end = end_before_credit_tail(p);
+    if (parse_pool_tag_payload(p) == PoolTagParse::Present) {
+        end -= kPoolTagFieldBytes;
+        if (parse_epoch_payload(p) == EpochParse::Present) end -= kEpochFieldBytes;
+    }
+    return end;
+}
+
+// ---------------------------------------------------------------------------
 // POOL-LINEAGE: chain-block classification by the V37C tail's pool tag
 // (xmr_pool_tag.hpp derives the tag).
 // ---------------------------------------------------------------------------

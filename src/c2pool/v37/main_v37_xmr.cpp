@@ -98,6 +98,8 @@
 #include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
 #include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
+#include "xmr/xmr_lane_epoch_chain.hpp"
+#include "xmr/xmr_lane_epoch_ckpt.hpp"      // LANE-EPOCH bootstrap: checkpoint codec + verify + adopt     // LANE-EPOCH: V37E rule, EpochView, chain facts (dead lineage -> new epoch)
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
 #include "impl/xmr/node/minijson.hpp"
@@ -211,6 +213,12 @@ static std::size_t   g_minority_window = 8;              // --minority-window W 
 static std::size_t   g_minority_min_blocks = 3;          // --minority-min-blocks (no decision on fewer)
 static std::uint64_t g_converge_retry_bound = 600;       // --converge-retry-bound
 static std::uint64_t g_converge_hold_ticks = 0;          // --converge-hold-ticks (TEST knob)
+// LANE-EPOCH (xmr/xmr_lane_epoch.hpp): --epoch-gate v1 (default off = master-identical),
+// --epoch-n N (non-mainnet only; default per network), --epoch-open-grace G (node policy).
+static std::uint32_t g_epoch_gate = 0;
+static std::uint64_t g_epoch_n = 0;
+static std::uint64_t g_epoch_open_grace = 0;
+static std::uint64_t g_epoch_origin = 0;                   // --epoch-origin H (the fold origin; regtest default 1)
 static std::uint64_t g_recon_max_root_age = ~std::uint64_t{0};   // --recon-max-root-age N (default kReconMaxRootAgeDconf*D_conf; 0 = unbounded)
 static bool g_lane_suspended_now = false;                  // R-C rework-2: main-thread view of the lane-suspend state (pump_miner reads it)
 // GAP-2 relay knobs (design §6). All default OFF: with neither --relay-listen nor
@@ -413,6 +421,9 @@ struct ServeHooks {
     std::function<void(bool /*refreshed*/, bool /*new_template*/)> after_refresh;
     // Called from the status cadence, after the standard status line.
     std::function<void()> status_extra;
+    // LANE-EPOCH: true while the epoch view forbids building (plan wait / fuse);
+    // a lane-suspend cause. Unset (gate OFF) = never.
+    std::function<bool()> epoch_forbids_build;
 
     // M3: THE TIP DRIVER, as one call per loop pass.
     //
@@ -1033,6 +1044,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         const std::uint64_t frontier = hw_now >= cfg.d_conf ? hw_now - cfg.d_conf : 0;
         const std::uint64_t lag = frontier > cursor ? frontier - cursor : 0;
         const bool contested = fc.options().contested_suspends && fc.contested();
+        if (hooks.epoch_forbids_build) lane_state.epoch_forced = hooks.epoch_forbids_build();   // LANE-EPOCH (unset: gate OFF)
         const auto e = lane_state.update(lag, fc.isolated(), fc.held_lag(), contested, fc.converging(), fc.diverged_halt());
         const bool lane_suspend = lane_state.suspended();
         // edge-triggered inside (disconnect + park), gated (D4); RESUME-FRESH: the resume edge
@@ -1047,6 +1059,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             if (c & LS::kHeld)      t += " HELD-LAG (an undecided lane block holds the cursor);";
             if (c & LS::kLag)       t += " LAG (finalize cursor behind the buried frontier);";
             if (c & LS::kTest)      t += " TEST (FAULT-KNOB --test-suspend-lane-seconds, forced by SIGUSR2);";
+            if (c & LS::kEpoch)     t += " EPOCH (the lane-epoch view forbids building: wait for bootstrap / N silent heights, or an unreadable epoch);";
             return t;
         };
         // D2 under ruling D-1 = C: CONVERGING / DIVERGED are ALARMS -- named and
@@ -1418,6 +1431,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                     "(the fee model is OFF: this node is master-identical)\n");
         return 2;
     }
+    // LANE-EPOCH: the rule reads the canonical chain through the native index
+    // (p2p-first) and shapes the v37 settlement coinbase.
+    if (cfg.lane_params.epoch.enabled) {
+        if (cfg.coinbase != CoinbaseMode::V37Settlement || cfg.arm_order != ArmOrderMode::P2PFirst ||
+            cfg.template_source != TemplateSourceMode::Native) {
+            std::printf("REFUSED: --epoch-gate v1 needs --coinbase v37 --arm-order p2p-first --xmr-template-source native "
+                        "(the epoch rule reads the canonical chain from the native index)\n");
+            return 2;
+        }
+    }
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -1573,6 +1596,29 @@ static int run_live(const XmrNodeConfig& cfg) {
     // R-C rework-3 (D7): this node's owed_digest history (newest at back) WITH the
     // coin height each state became current at -- the root-age bound needs it.
     c2pool::v37n::xmr::recon::ReconRing cba_ring(4096);
+    // LANE-EPOCH (xmr/xmr_lane_epoch.hpp): the derived epoch view (every canonical
+    // height the native index serves, from a lookback below the boot cursor), the
+    // builder's plan for the next height, and the counters. Gate OFF: nothing
+    // below is consulted (epoch_on == false everywhere).
+    namespace ep = c2pool::v37n::xmr::epoch;
+    const bool epoch_on = cfg.lane_params.epoch.enabled;
+    ep::EpochView epoch_view(cfg.lane_params.epoch.n_dead ? cfg.lane_params.epoch.n_dead : 1, ep::empty_root(cfg.lane_chain));
+    std::mutex epoch_mtx;                                 // guards epoch_plan (the template builder reads it)
+    ep::EpochView::Plan epoch_plan; bool epoch_plan_set = false;
+    std::set<std::string> epoch_closed_openers;           // openers whose close ran in this process (bid hex)
+    std::map<std::string, std::string> epoch_logged;      // bid -> verdict already logged
+    std::map<::v37::bytes32, ::v37::bytes32> epoch_root_memo;   // owed_digest -> its 0x03 mm root
+    std::string epoch_class_last;
+    o2::FinalizeConnect* epoch_fc = nullptr;   // set once FinalizeConnect exists (status only)
+    struct { std::uint64_t same = 0, opened = 0, stale = 0, invalid = 0, sibling = 0, unknown = 0, closed = 0, dead = 0,
+             view_hold = 0, close_rows = 0, scan_fail = 0; } epoch_ct;
+    // LANE-EPOCH BOOTSTRAP: the recent settled states this node can serve (one
+    // per ledger event, gate ON only), the ask/serve counters, the adopt latch.
+    namespace eck = c2pool::v37n::xmr::epoch::ckpt;
+    std::deque<eck::Checkpoint> epoch_snaps;
+    struct { std::uint64_t asked = 0, answers = 0, served = 0, served_none = 0, refused = 0, adopted = 0; } ckpt_ct;
+    bool ckpt_adopted = false, ckpt_in_adopt = false;
+    std::chrono::steady_clock::time_point ckpt_last_ask{};
     const std::uint64_t cba_max_root_age = g_recon_max_root_age == ~std::uint64_t{0}
         ? c2pool::v37n::xmr::recon::default_max_root_age(cfg.d_conf) : g_recon_max_root_age;
     std::optional<::v37::bytes32>  cba_payee;
@@ -1594,8 +1640,20 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t cba_stale_root = 0;     // R-C rework-3 (D7): matched a historical root older than the age bound -> refused
 
     auto cba_ring_push = [&]() {
+        if (ckpt_in_adopt) return;   // LANE-EPOCH bootstrap: the adoption's intermediate seed states are not ledger states
         const ::v37::bytes32 d = node.ledger().owed_digest();
         if (cba_ring.push(d, node.finalize_driver().digest_since())) {
+            if (epoch_on && cba_fx) {   // LANE-EPOCH bootstrap: remember this settled state (served only once witnessed on chain)
+                const ep::State es = epoch_view.state_before(epoch_view.complete_to() + 1);
+                std::vector<eck::Hist> hist;
+                const auto& en = cba_ring.entries();
+                const std::size_t keep = static_cast<std::size_t>(4 * cfg.d_conf + 1);
+                for (std::size_t i = en.size() > keep ? en.size() - keep : 0; i < en.size(); ++i) hist.push_back({en[i].digest, en[i].since});
+                epoch_snaps.push_back(eck::snapshot(node.ledger(), cba_fx->pay_of(),
+                                                    c2pool::v37n::xmr::credit::EpochField{es.cur_seq, es.cur_version, es.cur_parent},
+                                                    node.finalize_driver().digest_since(), std::move(hist)));
+                while (epoch_snaps.size() > 16) epoch_snaps.pop_front();
+            }
             std::printf("cba-digest: cursor=%llu hw=%llu ledger_seq=%llu owed_digest=%s\n",
                         static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
                         static_cast<unsigned long long>(node.hw().hw_height),
@@ -1937,7 +1995,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         for (std::size_t i = 0; i < 32; ++i) { o.push_back(hx[rp[i] >> 4]); o.push_back(hx[rp[i] & 15]); }
         return o;
     };
-    fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
+    auto book_core = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
         Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
         if (drops_live) { drops->clear_cut_price(); drops->clear_carried(); }   // ★ DROPS: never a neighbour's price / delta
         if (!cba_fx || !cba_scfg) {
@@ -2169,6 +2227,201 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::fflush(stdout);
         return true;
     };
+    // LANE-EPOCH: at a valid OPENER every node closes its ledger (E1). A holder's
+    // rows are recorded (<data-dir>/epoch-closed.tsv) and zeroed THROUGH the
+    // event log (one synthetic FOUND credit = -row + FINALIZE), so a restart
+    // replays the same empty state; a fresh node has nothing to close. Either
+    // way the ledger is the EMPTY state before the opener is decoded.
+    auto epoch_close = [&](std::uint64_t h, const std::string& bid, const ::v37::bytes32& bidb, const ep::Decision& d) {
+        if (!epoch_closed_openers.insert(bid).second) return;
+        const ::v37::bytes32 dg0 = node.ledger().owed_digest();
+        if (node.ledger().pending_count() != 0)
+            std::printf("epoch-ALARM: opener h=%llu finds %zu pending block(s) of the closed epoch (N >= 4*D_conf should make this 0)\n",
+                        static_cast<unsigned long long>(h), node.ledger().pending_count());
+        const auto closed = ep::close_ledger(node, d.f.seq, bidb, h, cfg.d_conf);
+        const std::size_t rows = closed.size();
+        if (rows) {
+            if (FILE* f = std::fopen((cfg.resolved_settle_db_path() + "/epoch-closed.tsv").c_str(), "a")) {
+                std::fprintf(f, "closed seq=%u opener_h=%llu opener=%s digest=%s rows=%zu\n", d.f.seq ? d.f.seq - 1 : 0,
+                             static_cast<unsigned long long>(h), bid.c_str(), hex_of(dg0).c_str(), rows);
+                for (const auto& [k, w] : closed) std::fprintf(f, "row %s %lld\n", hex_of(k).c_str(), w);
+                std::fclose(f);
+            }
+            epoch_ct.close_rows += rows;
+        }
+        cba_ring_push();
+        std::printf("epoch: OPENER h=%llu bid=%s seq=%u ver=%u parent=%s -> epoch %u closed: rows=%zu digest=%s recorded; ledger now %s (empty=%d)\n",
+                    static_cast<unsigned long long>(h), bid.c_str(), d.f.seq, d.f.version, hex_of(d.f.parent).substr(0, 16).c_str(),
+                    d.f.seq ? d.f.seq - 1 : 0, rows, hex_of(dg0).substr(0, 16).c_str(), hex_of(node.ledger().owed_digest()).substr(0, 16).c_str(),
+                    node.ledger().owed_digest() == ep::empty_owed_digest() ? 1 : 0);
+        std::fflush(stdout);
+    };
+    fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
+        if (!epoch_on || !cba_scfg || !cba_scfg->pool_tag) return book_core(h, bid, out);
+        const auto bb = c2pool::v37n::cut_bid_bytes(bid);
+        if (!bb) return book_core(h, bid, out);
+        const ep::ChainFact* fcx = epoch_view.at(h);
+        if (!fcx || !(fcx->bid == *bb)) {
+            std::vector<std::uint8_t> blob; std::string fw;
+            if (!cba_src.fetch(bid, blob, fw)) return book_core(h, bid, out);   // transport: the core reports + retries it
+            const auto f = ep::fact_of_blob(h, *bb, blob, *cba_scfg->pool_tag);
+            if (!f) return book_core(h, bid, out);
+            (void)epoch_view.put(*f);
+            fcx = epoch_view.at(h);
+            if (!fcx) return book_core(h, bid, out);
+        }
+        if (!fcx->own) return book_core(h, bid, out);   // an ordinary block for this structure: not-lane, as today
+        if (epoch_view.complete_to() + 1 < h) {          // the fold below h is not complete yet: wait for the scan
+            ++epoch_ct.view_hold;
+            out.why = "native-hold: lane-epoch view complete to " + std::to_string(epoch_view.complete_to()) + " < " + std::to_string(h - 1);
+            return false;
+        }
+        const ep::Decision d = epoch_view.decide(h);
+        auto logv = [&](const char* v, const std::string& why) {
+            auto& l = epoch_logged[bid];
+            if (l == v) return;
+            l = v;
+            std::printf("epoch: h=%llu bid=%s verdict=%s seq=%u ver=%u%s%s\n", static_cast<unsigned long long>(h), bid.c_str(), v,
+                        d.f.seq, d.f.version, why.empty() ? "" : " -- ", why.c_str());
+            std::fflush(stdout);
+        };
+        switch (d.v) {
+            case ep::Verdict::Stale: case ep::Verdict::InvalidOpener: case ep::Verdict::Sibling: case ep::Verdict::Unknown: {
+                if (d.v == ep::Verdict::Stale) ++epoch_ct.stale; else if (d.v == ep::Verdict::InvalidOpener) ++epoch_ct.invalid;
+                else if (d.v == ep::Verdict::Sibling) ++epoch_ct.sibling; else ++epoch_ct.unknown;
+                if (d.fuse) std::printf("epoch-ALARM fuse: h=%llu bid=%s %s -- this node cannot read the structure's current epoch; lane building suspended\n",
+                                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), d.why.c_str());
+                logv(ep::to_string(d.v), d.why);
+                c2pool::v37n::xmr::authority::CoinbaseBooking bk; std::string w;
+                (void)fetch_decode(bid, bk, w);
+                out.total_pico = bk.total;
+                if (bk.has_onchain_root) out.onchain_root_hex = root_hex32(bk.onchain_root);
+                out.why = *ep::decided_why(d);
+                return false;
+            }
+            case ep::Verdict::Opener:
+                logv("opener", "");
+                epoch_close(h, bid, *bb, d);
+                break;
+            default:
+                break;
+        }
+        const bool ok = book_core(h, bid, out);
+        if (ok) {
+            if (d.v == ep::Verdict::SameEpoch) { ++epoch_ct.same; logv("same-epoch", ""); }
+            else if (d.v == ep::Verdict::Opener) ++epoch_ct.opened;
+            return true;
+        }
+        // A SAME-EPOCH block this node cannot book whose lineage is CLOSED (a valid
+        // opener above it) or DEAD (N silent heights at the view's frontier): never
+        // HELD, never a vote observation -- the structure continues by the opener.
+        if (const auto dw = ep::undecided_to_decided(epoch_view, d, out.why)) {
+            if (dw->rfind("epoch-closed:", 0) == 0) { ++epoch_ct.closed; logv("closed-below-opener", out.why.substr(0, 80)); }
+            else                                    { ++epoch_ct.dead;   logv("dead-unresolvable", out.why.substr(0, 80)); }
+            out.why = *dw;
+        }
+        return false;
+    };
+    // LANE-EPOCH: the per-tick scan (canonical heights -> facts) and the
+    // builder's plan for the next height. Runs BEFORE the tick's chain events
+    // are drained, so a booking attempt finds the view complete below it.
+    std::uint64_t epoch_scan_fail_logged = 0;
+    auto epoch_root_held = [&](const ::v37::bytes32& root) -> bool {
+        auto rootof = [&](const ::v37::bytes32& d) {
+            auto it = epoch_root_memo.find(d);
+            if (it == epoch_root_memo.end()) it = epoch_root_memo.emplace(d, ep::mm_root_of(cfg.lane_chain, d)).first;
+            return it->second;
+        };
+        if (rootof(node.ledger().owed_digest()) == root) return true;
+        for (const auto& e : cba_ring.entries()) if (rootof(e.digest) == root) return true;
+        return false;
+    };
+    auto epoch_tick = [&]() {
+        if (!epoch_on || !chain_src.bid_at || !chain_src.tip_block || !cba_scfg || !cba_scfg->pool_tag) return;
+        const auto t = chain_src.tip_block();
+        if (!t) return;
+        const std::uint64_t tip = t->first, N = cfg.lane_params.epoch.n_dead;
+        if (!epoch_view.origin_set()) {
+            // The fold origin is CONSENSUS (EpochGate::origin_h, folded into the
+            // HELLO): never a node-local lookback, so a holder and a fresh node
+            // fold the same blocks and reach the same verdicts (M3).
+            const std::uint64_t cur = node.finalize_driver().cursor_height();
+            epoch_view.set_origin(cfg.lane_params.epoch.origin_h ? cfg.lane_params.epoch.origin_h : 1);
+            std::printf("epoch: gate v%u ON, N=%llu grace=%llu | view origin h=%llu (consensus; cursor %llu, tip %llu) | empty root %s\n",
+                        cfg.lane_params.epoch.version, static_cast<unsigned long long>(N), static_cast<unsigned long long>(g_epoch_open_grace),
+                        static_cast<unsigned long long>(epoch_view.origin()), static_cast<unsigned long long>(cur),
+                        static_cast<unsigned long long>(tip), hex_of(epoch_view.rule().empty_root).substr(0, 16).c_str());
+        }
+        epoch_view.truncate_above(tip);
+        const std::uint64_t ct0 = epoch_view.complete_to();
+        std::uint64_t lo = epoch_view.origin();
+        if (ct0 + 1 > lo + 2 * cfg.d_conf) lo = ct0 + 1 - 2 * cfg.d_conf;   // re-check a reorg window below the complete frontier
+        int budget = 400;
+        for (std::uint64_t h = lo; h <= tip; ++h) {
+            const auto b = chain_src.bid_at(h);
+            if (!b) break;
+            const auto bb = c2pool::v37n::cut_bid_bytes(*b);
+            if (!bb) break;
+            if (const ep::ChainFact* f = epoch_view.at(h); f && f->bid == *bb) continue;
+            if (budget-- <= 0) break;
+            std::vector<std::uint8_t> blob; std::string why;
+            if (!cba_src.fetch(*b, blob, why)) {
+                ++epoch_ct.scan_fail;
+                if (epoch_scan_fail_logged != h) { epoch_scan_fail_logged = h; std::printf("epoch: scan waits at h=%llu (%s)\n", static_cast<unsigned long long>(h), why.c_str()); }
+                break;
+            }
+            const auto f = ep::fact_of_blob(h, *bb, blob, *cba_scfg->pool_tag);
+            if (!f) break;
+            (void)epoch_view.put(*f);
+        }
+        const std::uint64_t next_h = tip + 1;
+        const ep::State s = epoch_view.state_before(next_h);
+        bool holds = !s.has_last || epoch_root_held(s.last_root);
+        if (s.opened && !epoch_closed_openers.count(hex_of(s.opener_bid))) holds = false;   // the opener is not booked here yet
+        ep::EpochView::Plan p = epoch_view.plan(next_h, holds);
+        if (p.mode == ep::EpochView::Plan::Mode::Open && g_epoch_open_grace && s.has_last && next_h < s.last_h + N + g_epoch_open_grace) {
+            p.mode = ep::EpochView::Plan::Mode::Wait;
+            p.why = "open grace: an opener is built from h=" + std::to_string(s.last_h + N + g_epoch_open_grace) + " (policy)";
+        }
+        {
+            std::lock_guard<std::mutex> lk(epoch_mtx);
+            const bool changed = !epoch_plan_set || epoch_plan.mode != p.mode || !(epoch_plan.f == p.f);
+            epoch_plan = p; epoch_plan_set = true;
+            if (changed)
+                std::printf("epoch: plan %s for h=%llu seq=%u ver=%u parent=%s%s%s\n", ep::EpochView::to_string(p.mode),
+                            static_cast<unsigned long long>(next_h), p.f.seq, p.f.version, hex_of(p.f.parent).substr(0, 16).c_str(),
+                            p.why.empty() ? "" : " -- ", p.why.c_str());
+        }
+        const std::string cls = epoch_view.classification();
+        if (cls != epoch_class_last) {
+            epoch_class_last = cls;
+            std::printf("epoch-class: cur_seq=%u open_h=%llu opener=%s | %s\n", s.cur_seq, static_cast<unsigned long long>(s.open_h),
+                        s.opened ? hex_of(s.opener_bid).c_str() : "-", cls.c_str());
+        }
+        if (tip > 4 * N + 8 * cfg.d_conf) epoch_view.prune(tip - 4 * N - 8 * cfg.d_conf);
+        std::fflush(stdout);
+    };
+    auto epoch_status = [&]() {   // LANE-EPOCH: one status line (gate ON only)
+        {
+            const std::uint64_t ct = epoch_view.complete_to();
+            const ep::State es = epoch_view.state_before(ct + 1);
+            std::string pm; std::uint64_t pn = 0;
+            { std::lock_guard<std::mutex> lk(epoch_mtx); pm = epoch_plan_set ? ep::EpochView::to_string(epoch_plan.mode) : "unset"; pn = epoch_plan.next_h; }
+            std::printf("  epoch: seq=%u ver=%u opened=%d open_h=%llu opener=%s last_lane_h=%llu view=[%llu..%llu] plan=%s(h=%llu) | "
+                        "same=%llu opened=%llu stale=%llu invalid=%llu sibling=%llu unknown=%llu closed=%llu dead=%llu view_hold=%llu "
+                        "close_rows=%llu scan_fail=%llu epoch_decided=%llu\n",
+                        es.cur_seq, es.cur_version, es.opened ? 1 : 0, static_cast<unsigned long long>(es.open_h),
+                        es.opened ? hex_of(es.opener_bid).c_str() : "-", static_cast<unsigned long long>(es.last_h),
+                        static_cast<unsigned long long>(epoch_view.origin()), static_cast<unsigned long long>(ct), pm.c_str(),
+                        static_cast<unsigned long long>(pn),
+                        static_cast<unsigned long long>(epoch_ct.same), static_cast<unsigned long long>(epoch_ct.opened),
+                        static_cast<unsigned long long>(epoch_ct.stale), static_cast<unsigned long long>(epoch_ct.invalid),
+                        static_cast<unsigned long long>(epoch_ct.sibling), static_cast<unsigned long long>(epoch_ct.unknown),
+                        static_cast<unsigned long long>(epoch_ct.closed), static_cast<unsigned long long>(epoch_ct.dead),
+                        static_cast<unsigned long long>(epoch_ct.view_hold), static_cast<unsigned long long>(epoch_ct.close_rows),
+                        static_cast<unsigned long long>(epoch_ct.scan_fail), static_cast<unsigned long long>(epoch_fc ? epoch_fc->stats().epoch_decided : 0));
+        }
+    };
     // D2 (minority converges to majority): the re-derivation's decoder. The
     // SAME authority as book_from_chain_ex (coinbase decode, D7 root age, the
     // on-chain credit cut folded at ITS prefix), but the 0x03 root is matched
@@ -2362,6 +2615,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
     };
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
+    epoch_fc = &fc;   // LANE-EPOCH status
     // R5: the candidate ring is fed PER LEDGER EVENT (every FOUND/ORPHAN/FINALIZE the driver
     // applies), not per tick: a tick that applies several seqs at once (book h47 + finalize
     // h44) skipped the intermediate owed_digest, and a peer block committed to exactly that
@@ -2379,6 +2633,91 @@ static int run_live(const XmrNodeConfig& cfg) {
                     hex_of(node.ledger().owed_digest()).c_str());
         std::fflush(stdout);
     });
+    // LANE-EPOCH BOOTSTRAP (xmr_lane_epoch_ckpt.hpp). SERVE: answer a peer's
+    // GETCKPT with our newest settled state of that epoch that the chain has
+    // WITNESSED (an Own lane block committing its root). ASK: a FRESH node (no
+    // settlement event) that meets an ALIVE epoch whose last root it does not
+    // hold asks every peer, verifies each answer against its OWN chain (V1-V5)
+    // and adopts the first that passes; a liar is refused and dropped. No
+    // answer = today's HELD (+ this line), until the epoch rule's N bound.
+    auto epoch_boot_tick = [&]() {
+        if (!epoch_on || !relay_node) return;
+        auto witnessed = [&](const ::v37::bytes32& d, std::uint64_t above) {
+            const ::v37::bytes32 root = ep::mm_root_of(cfg.lane_chain, d);
+            const std::uint64_t ct = epoch_view.complete_to();
+            for (std::uint64_t h = above + 1; h <= ct; ++h) {
+                const ep::ChainFact* f = epoch_view.at(h);
+                if (f && f->own && f->has_root && f->root == root) return true;
+            }
+            return false;
+        };
+        for (const auto& [pid, seq] : relay_node->drain_ckpt_requests()) {
+            const eck::Checkpoint* best = nullptr;
+            for (auto it = epoch_snaps.rbegin(); it != epoch_snaps.rend(); ++it)
+                if (it->ep.seq == seq && witnessed(it->owed_digest, it->cursor)) { best = &*it; break; }
+            if (!best) { (void)relay_node->send_ckpt(pid, {}); ++ckpt_ct.served_none; continue; }
+            eck::Checkpoint c = *best;
+            const ::v37::bytes32 empty = ep::empty_owed_digest();
+            std::vector<eck::Hist> hk;
+            for (const auto& h : c.hist) if (h.since <= c.cursor && (h.digest == empty || witnessed(h.digest, h.since))) hk.push_back(h);
+            c.hist = std::move(hk);
+            (void)relay_node->send_ckpt(pid, eck::encode(c)); ++ckpt_ct.served;
+            std::printf("epoch-bootstrap: SERVED checkpoint seq=%u C=%llu rows=%zu hist=%zu owed_digest=%s to peer %llu\n",
+                        c.ep.seq, static_cast<unsigned long long>(c.cursor), c.rows.size(), c.hist.size(),
+                        hex_of(c.owed_digest).c_str(), static_cast<unsigned long long>(pid));
+        }
+        if (ckpt_adopted || !node.finalize_driver().bootstrap_fresh()) { (void)relay_node->drain_ckpt_answers(); return; }
+        const std::uint64_t ct = epoch_view.complete_to();
+        const ep::State s = epoch_view.state_before(ct + 1);
+        const bool need = s.has_last && !ep::dead_at(epoch_view.rule(), s, ct + 1) && !epoch_root_held(s.last_root);
+        if (!need) { (void)relay_node->drain_ckpt_answers(); return; }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - ckpt_last_ask > std::chrono::seconds(5)) {
+            ckpt_last_ask = now;
+            const std::size_t n = relay_node->ask_ckpt(s.cur_seq);
+            ckpt_ct.asked += n;
+            std::printf("epoch-bootstrap: epoch %u is ALIVE (last lane block h=%llu) and this fresh node does not hold its root -> "
+                        "asked %zu peer(s) for a checkpoint%s\n", s.cur_seq, static_cast<unsigned long long>(s.last_h), n,
+                        n ? "" : " (no ready peer: HELD until a peer serves or the epoch is dead for N heights)");
+        }
+        for (auto& [pid, bytes] : relay_node->drain_ckpt_answers()) {
+            ++ckpt_ct.answers;
+            if (bytes.empty()) continue;
+            eck::Checkpoint c; std::string why; eck::Verified v;
+            if (!eck::decode(bytes, c, &why)) { v.r = eck::Refusal::Codec; v.why = why; }
+            else v = eck::verify(c, cfg.lane_chain, [&](std::uint64_t h) { return epoch_view.at(h); }, ct,
+                                 [&](std::uint64_t h) { return epoch_view.state_before(h); }, node.finalize_driver().cursor_height());
+            if (!v.ok()) {
+                ++ckpt_ct.refused;
+                std::printf("epoch-bootstrap ALARM: REFUSED checkpoint from peer %llu: %s (%s) -> peer dropped\n",
+                            static_cast<unsigned long long>(pid), eck::to_string(v.r), v.why.c_str());
+                relay_node->drop_peer(pid);
+                continue;
+            }
+            ckpt_in_adopt = true;
+            const bool ok = eck::adopt(node, c, &why);
+            ckpt_in_adopt = false;
+            if (!ok) { std::printf("epoch-bootstrap ALARM: verified checkpoint NOT adopted: %s\n", why.c_str()); continue; }
+            if (cba_fx) for (const auto& r : c.rows) cba_fx->learn_ref(r.ref);
+            std::vector<::v37::bytes32> ds; std::vector<std::uint64_t> ss;
+            for (const auto& h : c.hist) { ds.push_back(h.digest); ss.push_back(h.since); }
+            if (ds.empty() || ds.back() != c.owed_digest) { ds.push_back(c.owed_digest); ss.push_back(c.cursor); }
+            cba_ring = c2pool::v37n::xmr::recon::ReconRing(4096);
+            cba_ring.seed(ds, ss);
+            cba_root_unknown_seen.clear();
+            const std::size_t rel = fc.bootstrap_release_through(c.cursor);
+            ckpt_adopted = true; ++ckpt_ct.adopted;
+            std::printf("epoch-bootstrap: ADOPTED checkpoint from peer %llu: seq=%u C=%llu rows=%zu hist=%zu witness_h=%llu released=%zu\n",
+                        static_cast<unsigned long long>(pid), c.ep.seq, static_cast<unsigned long long>(c.cursor), c.rows.size(),
+                        c.hist.size(), static_cast<unsigned long long>(v.witness_h), rel);
+            std::printf("cba-digest: cursor=%llu hw=%llu ledger_seq=%llu owed_digest=%s\n",
+                        static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
+                        static_cast<unsigned long long>(node.hw().hw_height),
+                        static_cast<unsigned long long>(node.ledger().ledger_seq()), hex_of(node.ledger().owed_digest()).c_str());
+            std::fflush(stdout);
+            break;
+        }
+    };
     std::printf("same-height policy: tiebreak=%s D_conf=%llu renotify<=%u journal=%s "
                 "| credit requires burial: YES  orphan-credit: NEVER  double-credit: BLOCKED\n",
                 to_string(cfg.same_height_tiebreak),
@@ -2537,6 +2876,20 @@ static int run_live(const XmrNodeConfig& cfg) {
         // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
         // and only blocks carrying it are booked as lane blocks here.
         scfg.pool_tag = pool_tag_of(cfg);
+        if (epoch_on)   // LANE-EPOCH: the V37E field (and the opener's empty ledger) from the per-tick plan
+            scfg.epoch_source = [&](std::uint64_t height, c2pool::v37n::xmr::credit::EpochField& f, bool& opener, std::string& why) -> int {
+                std::lock_guard<std::mutex> lk(epoch_mtx);
+                if (!epoch_plan_set) { why = "the epoch plan is not computed yet"; return -1; }
+                if (epoch_plan.next_h != height) {
+                    why = "the epoch plan is for h=" + std::to_string(epoch_plan.next_h) + ", template h=" + std::to_string(height);
+                    return -1;
+                }
+                switch (epoch_plan.mode) {
+                    case ep::EpochView::Plan::Mode::Continue: f = epoch_plan.f; opener = false; return 1;
+                    case ep::EpochView::Plan::Mode::Open:     f = epoch_plan.f; opener = true;  return 1;
+                    default: why = std::string(ep::EpochView::to_string(epoch_plan.mode)) + ": " + epoch_plan.why; return -1;
+                }
+            };
         std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
                     hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
                     hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
@@ -3353,6 +3706,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                 // COLD-BOOT-2: the settlement's booked frontier paces the catch-up
                 // download (the index hands out at most frontier + window above it).
                 if (chain_src.set_booking_frontier) chain_src.set_booking_frontier(node.finalize_driver().cursor_height());
+                epoch_tick();   // LANE-EPOCH: scan + plan before this tick's bookings (no-op, gate OFF)
+                epoch_boot_tick();   // LANE-EPOCH bootstrap: serve / ask / verify / adopt a checkpoint (no-op, gate OFF)
                 const auto evs = chain_src.drain();
                 pumped_last = evs.size();
                 for (const auto& ev : evs) {
@@ -3392,7 +3747,19 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (provider.last_miner_data(served))
                 orc->on_serve(provider.current().epoch, served, provider.current().source_name);
         };
+        if (epoch_on)   // LANE-EPOCH: plan wait/fuse (or not computed yet) suspends lane building
+            hooks.epoch_forbids_build = [&]() -> bool {
+                std::lock_guard<std::mutex> lk(epoch_mtx);
+                return !epoch_plan_set || epoch_plan.mode == ep::EpochView::Plan::Mode::Wait ||
+                       epoch_plan.mode == ep::EpochView::Plan::Mode::Fuse;
+            };
         hooks.status_extra = [&]() {
+            if (epoch_on) epoch_status();   // LANE-EPOCH
+            if (epoch_on) std::printf("  epoch-bootstrap: asked=%llu answers=%llu served=%llu served_none=%llu refused=%llu adopted=%llu snaps=%zu\n",
+                                      static_cast<unsigned long long>(ckpt_ct.asked), static_cast<unsigned long long>(ckpt_ct.answers),
+                                      static_cast<unsigned long long>(ckpt_ct.served), static_cast<unsigned long long>(ckpt_ct.served_none),
+                                      static_cast<unsigned long long>(ckpt_ct.refused), static_cast<unsigned long long>(ckpt_ct.adopted),
+                                      epoch_snaps.size());
             if (drops_live) {   // ★ DROPS (gate ON only)
                 const auto ds = drops->core().stats();
                 const auto& rs = relay_node->stats();
@@ -3959,6 +4326,15 @@ int main(int argc, char** argv) {
         else if (a == "--residual-sink-view-hex")  cfg.residual_sink_view_hex = value();
         else if (a == "--residual-sink-subaddress") cfg.residual_sink_subaddress = true;
         // fee model (LaneParams::fee, S4): off (default, master-identical) | v1
+        else if (a == "--epoch-gate") {   // LANE-EPOCH
+            const std::string m = value();
+            if (m == "off" || m == "0") g_epoch_gate = 0;
+            else if (m == "v1" || m == "1") g_epoch_gate = 1;
+            else throw cs::UsageError("--epoch-gate takes off|v1, got '" + m + "'");
+        }
+        else if (a == "--epoch-n")            g_epoch_n = u64();
+        else if (a == "--epoch-open-grace")   g_epoch_open_grace = u64();
+        else if (a == "--epoch-origin")       g_epoch_origin = u64();
         else if (a == "--fee-model") {
             const std::string m = value();
             if (m == "off" || m == "0") cfg.lane_params.fee = ::v37::FeeModelGate{};
@@ -4195,6 +4571,17 @@ int main(int argc, char** argv) {
                 "                               REQUIRED for v37 mode with the fee model OFF: the XMR\n"
                 "                               wallet the exact-sum residual is paid to\n"
                 "  --residual-sink-subaddress   the sink keys are a subaddress (D_i, A_main)\n"
+                "  --epoch-gate <off|v1>        LANE-EPOCH (LaneParams::epoch; default off = master-identical).\n"
+                "                               v1: every lane coinbase commits its lineage (V37E); a lineage\n"
+                "                               with no lane block for N heights is continued by a new lane\n"
+                "                               epoch inside the same structure (chain-data rule, never HELD).\n"
+                "                               Needs --coinbase v37 --arm-order p2p-first (native templates).\n"
+                "  --epoch-n <heights>          N (non-mainnet only; default mainnet 2160, stagenet/testnet 720,\n"
+                "                               regtest 40; floor 4*D_conf). Consensus: folded into the HELLO.\n"
+                "  --epoch-open-grace <heights> node policy: build an opener only G heights after N (default 0)\n"
+                "  --epoch-origin <height>      the coin height the epoch fold starts at (consensus: every node\n"
+                "                               folds the same blocks; regtest default 1, REQUIRED on\n"
+                "                               testnet/stagenet; mainnet has no compiled activation yet)\n"
                 "  --fee-model <off|v1>         the v36 fee model (LaneParams::fee; default off =\n"
                 "                               master-identical). v1: ONE mandatory donation output\n"
                 "                               = max(1 pico, residual) (compiled-in address, the\n"
@@ -4347,6 +4734,35 @@ int main(int argc, char** argv) {
         cfg.monerod.zmq_port = e.zmq_port;
     }
 
+    // LANE-EPOCH: compose LaneParams::epoch. N is consensus: mainnet takes the
+    // compiled network default, an override there is refused (CLI-STRICT exit 2).
+    if (g_epoch_n != 0 && cfg.network == MoneroNetwork::Mainnet) {
+        std::fprintf(stderr, "c2pool-v37-xmr: --epoch-n is a consensus constant on mainnet (compiled default %llu); an override is non-mainnet only (see c2pool-v37-xmr --help)\n",
+                     static_cast<unsigned long long>(c2pool::v37n::xmr::epoch::default_n_dead(0)));
+        return cs::kUsageExit;
+    }
+    if ((g_epoch_n != 0 || g_epoch_open_grace != 0 || g_epoch_origin != 0) && g_epoch_gate == 0) {
+        std::fprintf(stderr, "c2pool-v37-xmr: --epoch-n / --epoch-open-grace / --epoch-origin need --epoch-gate v1 (see c2pool-v37-xmr --help)\n");
+        return cs::kUsageExit;
+    }
+    if (g_epoch_gate && cfg.network == MoneroNetwork::Mainnet) {
+        std::fprintf(stderr, "c2pool-v37-xmr: --epoch-gate v1 has no compiled mainnet activation height (the mainnet flip is a later, separate change; see c2pool-v37-xmr --help)\n");
+        return cs::kUsageExit;
+    }
+    if (g_epoch_gate && g_epoch_origin == 0 && cfg.network != MoneroNetwork::Regtest) {
+        std::fprintf(stderr, "c2pool-v37-xmr: --epoch-gate v1 off regtest needs --epoch-origin <height> (the consensus fold origin; see c2pool-v37-xmr --help)\n");
+        return cs::kUsageExit;
+    }
+    if (g_epoch_gate) {
+        const std::uint64_t n = g_epoch_n ? g_epoch_n
+                              : c2pool::v37n::xmr::epoch::default_n_dead(static_cast<std::uint8_t>(donation_net_of(cfg.network)));
+        if (n < c2pool::v37n::xmr::epoch::min_n_dead(cfg.d_conf)) {
+            std::fprintf(stderr, "c2pool-v37-xmr: --epoch-n %llu is below the floor 4*D_conf = %llu (see c2pool-v37-xmr --help)\n",
+                         static_cast<unsigned long long>(n), static_cast<unsigned long long>(c2pool::v37n::xmr::epoch::min_n_dead(cfg.d_conf)));
+            return cs::kUsageExit;
+        }
+        cfg.lane_params.epoch = ::v37::EpochGate::for_version(g_epoch_gate, n, g_epoch_origin ? g_epoch_origin : 1);
+    }
     if (mock_smoke) return run_mock_smoke();
     return run_live(cfg);
 }

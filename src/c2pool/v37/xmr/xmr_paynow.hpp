@@ -82,8 +82,7 @@ inline std::vector<std::uint8_t> encode_tail(std::uint64_t base) {
 // A malformed V37P field (unknown version) is NOT skipped, so the V37N magic
 // check fails closed (the lineage gate has already made such a block ordinary).
 inline std::optional<std::uint64_t> parse_payload(const std::vector<std::uint8_t>& p) {
-    std::size_t end = credit::end_before_credit_tail(p);
-    if (credit::parse_pool_tag_payload(p) == credit::PoolTagParse::Present) end -= credit::kPoolTagFieldBytes;
+    std::size_t end = credit::end_before_lineage_fields(p);   // V37C, V37P and (LANE-EPOCH) V37E, each if present
     if (end >= fee::kDonationOwedTailBytes &&
         std::memcmp(p.data() + end - fee::kDonationOwedTailBytes, fee::kDonationOwedMagic, 4) == 0)
         end -= fee::kDonationOwedTailBytes;

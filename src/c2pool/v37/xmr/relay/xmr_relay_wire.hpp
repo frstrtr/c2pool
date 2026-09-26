@@ -100,6 +100,8 @@ inline constexpr u8  FB_RECEIPTS  = 0x41;
 inline constexpr u8  FB_BLOCK_WON = 0x42;
 inline constexpr u8  FB_GETCTX    = 0x43;
 inline constexpr u8  FB_CTX       = 0x44;
+inline constexpr u8  FB_GETCKPT   = 0x45;   // LANE-EPOCH bootstrap: ask a settlement checkpoint (u32 epoch seq)
+inline constexpr u8  FB_CKPT      = 0x46;   // LANE-EPOCH bootstrap: the checkpoint bytes (xmr_lane_epoch_ckpt.hpp), empty = none
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -608,6 +610,34 @@ inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std
     return true;
 }
 
+// ── LANE-EPOCH BOOTSTRAP (FB_GETCKPT / FB_CKPT) ─────────────────────────────
+// Opaque frames: op | ver | u32 chain | u32 len | payload. GETCKPT's payload is
+// the u32 epoch seq; CKPT's is the 'V37CK' checkpoint (verified by the asker,
+// never trusted). A master peer counts both as fb_unknown and keeps the socket.
+inline constexpr std::size_t kCkptMax    = 4 * 1024 * 1024;
+inline constexpr std::size_t kCkptHeader = 1 + 1 + 4 + 4;
+inline std::vector<u8> encode_ckpt_frame(u8 op, u32 chain_id, const std::vector<u8>& payload) {
+    if (payload.size() > kCkptMax || (op != FB_GETCKPT && op != FB_CKPT)) return {};
+    std::vector<u8> f; f.reserve(kCkptHeader + payload.size());
+    f.push_back(op); f.push_back(kFbVersion); le::put32(f, chain_id);
+    le::put32(f, static_cast<u32>(payload.size()));
+    f.insert(f.end(), payload.begin(), payload.end());
+    return f;
+}
+inline bool decode_ckpt_frame(const std::vector<u8>& f, u8& op, u32& chain_id, std::vector<u8>& payload, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() < kCkptHeader) return bad("ckpt: short");
+    op = f[0];
+    if (op != FB_GETCKPT && op != FB_CKPT) return bad("ckpt: wrong opcode");
+    if (f[1] != kFbVersion) return bad("ckpt: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    const std::size_t len = le::get32(f.data() + 6);
+    if (len > kCkptMax) return bad("ckpt: over 4 MiB");
+    if (f.size() != kCkptHeader + len) return bad("ckpt: wrong length");
+    payload.assign(f.begin() + static_cast<std::ptrdiff_t>(kCkptHeader), f.end());
+    return true;
+}
+
 // ── SEAM-4: the lane-parameter digest HELLO carries ─────────────────────────
 // A canonical serialization of every LaneParams field that decides the lane
 // digest or the fold (geometry + the four ADD-ONLY gates), the R-1 share
@@ -668,6 +698,17 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
         le::put64(b, ::c2pool::v37n::xmr::fee::kFeeReceiptWeight);
         le::putb(b, ::c2pool::v37n::xmr::fee::donation_identity(
                         static_cast<::c2pool::v37n::xmr::fee::DonationNet>(network)));
+    }
+    // LANE-EPOCH: the EpochGate is folded ONLY when it is ON (the FEE1
+    // precedent): gate OFF keeps the pinned golden and HELLO compatibility with
+    // master peers, gate ON refuses a gate-OFF / differently-parameterised peer
+    // at HELLO (version and the dead-lineage bound N are both consensus).
+    if (p.epoch.enabled) {
+        static constexpr char kEpochTag[] = "EPC1";
+        b.insert(b.end(), kEpochTag, kEpochTag + 4);
+        le::put32(b, p.epoch.version);
+        le::put64(b, p.epoch.n_dead);
+        le::put64(b, p.epoch.origin_h);
     }
     return keccak_bytes(b);
 }
