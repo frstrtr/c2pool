@@ -683,6 +683,26 @@ void HttpSession::process_request()
                 send_response(std::move(response));
                 return;
             }
+            else if (target.substr(0, 13) == "/found_block/") {
+                // #946: one found-block row (the /recent_blocks shape) by
+                // full block hash; an unknown hash is a 404, not an empty row.
+                std::string hash = url_decode(target.substr(13));
+                if (!is_valid_hex_hash(hash)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = mining_interface_->rest_found_block(hash);
+                if (rest_result.is_null()) {
+                    response.result(http::status::not_found);
+                    response.body() = R"({"error":"unknown found block"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+            }
             else if (target.substr(0, 11) == "/web/share/") {
                 std::string hash = url_decode(target.substr(11));
                 if (!is_valid_hex_hash(hash)) {

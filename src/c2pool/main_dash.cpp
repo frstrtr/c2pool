@@ -1470,6 +1470,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         rec.pool_hashrate = blk.pool_hashrate;
                         rec.share_hash = blk.share_hash;
                         rec.authorship = static_cast<uint8_t>(blk.authorship);
+                        // #946: explorer fields (fblk v3).
+                        rec.coinbase_txid = blk.coinbase_txid;
+                        rec.tx_count = blk.tx_count;
                         return fblk_store->store(rec);
                     },
                     [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
@@ -1493,6 +1496,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             blk.pool_hashrate = rec.pool_hashrate;
                             blk.share_hash = rec.share_hash;
                             blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
+                            // #946: v1/v2 records leave these unknown (null).
+                            blk.coinbase_txid = rec.coinbase_txid;
+                            blk.tx_count = rec.tx_count;
                             result.push_back(std::move(blk));
                         }
                         return result;

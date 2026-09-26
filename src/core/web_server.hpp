@@ -156,6 +156,9 @@ public:
     nlohmann::json rest_users();
     nlohmann::json rest_fee();
     nlohmann::json rest_recent_blocks();
+    // GET /found_block/<hash> (#946): one row in the /recent_blocks shape, or
+    // JSON null when the hash is not a recorded found block (route answers 404).
+    nlohmann::json rest_found_block(const std::string& hash);
     // Coin-generic block-explorer URL prefix (block deep link, DASH first-class).
     // Honors an operator custom explorer, else the per-coin default; empty when
     // the coin is unknown so callers emit null rather than a wrong-coin link.
@@ -920,6 +923,15 @@ public:
         // and the log states it in words. Unlabelled stays `unknown`, which
         // the log reports as unknown rather than guessing.
         BlockAuthorship authorship{BlockAuthorship::unknown};
+        // Explorer fields (#946). Empty string / nullopt = not known, emitted
+        // as JSON null — never "" or 0. parent_* are set on merged (DOGE) rows
+        // only: the LTC block the aux solve rode, and the LTC height it was
+        // mined at. tx_count stays unset on peer-found rows until the full
+        // block is seen (v34+ shares carry no tx list).
+        std::string             parent_hash;
+        std::optional<uint64_t> parent_height;
+        std::string             coinbase_txid;
+        std::optional<uint32_t> tx_count;
         // Provenance for the dashboard (#57 oracle parity). true when this row
         // was restored from persistent storage at startup rather than recorded
         // live this session. DISPLAY-ONLY, never persisted (a restored row is
@@ -1173,6 +1185,10 @@ private:
     /// CALLER MUST HOLD m_blocks_mutex. Coin-generic; run at load and again
     /// after backfill_block_fields fills a previously-missing network_difficulty.
     void recompute_found_block_luck_locked();
+    /// One /recent_blocks row. Shared by rest_recent_blocks and
+    /// rest_found_block so the two can never drift apart.
+    /// CALLER MUST HOLD m_blocks_mutex.
+    nlohmann::json found_block_row_locked(const FoundBlock& b) const;
 public:
 
     /// Merged block persistence — opaque store pointer, cast in .cpp.
