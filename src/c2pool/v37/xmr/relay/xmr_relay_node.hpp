@@ -636,6 +636,15 @@ public:
         if (give_author) *give_author = it->second.give_author;
         return true;
     }
+    // ★ DROPS-ENROL-LANE (flip 1): a repaired prefix's receipt -> (payee, origin
+    // bin, exact bytes); bin 0 = a reloaded receipt (the caller resolves it).
+    bool cached_share(const bytes32& id, ::v37::ScriptRef& payee, u64& bin, std::vector<u8>& raw) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto it = m_cache.find(id);
+        if (it == m_cache.end()) return false;
+        payee = it->second.payee; bin = it->second.bin; raw = it->second.raw;
+        return true;
+    }
     bool known(const bytes32& id) const {
         std::lock_guard<std::mutex> lk(m_mtx);
         return m_cache.count(id) != 0;

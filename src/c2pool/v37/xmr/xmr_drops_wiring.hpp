@@ -227,6 +227,88 @@ inline std::string verify_carry(const DropsCarry& c, bool binds) {
         return "a non-empty delta composed under an EMPTY enrolment book (nobody enrolled => no delta)";
     return "";
 }
+
+// ── (7) ★ DROPS-ENROL-LANE: the composition is a pure function of the LANE ──
+// Defect 4 (flip 1): the share counts S (covers(iv) only after THIS node armed)
+// and the EnrollmentBook (effective from THIS node's tip) were node-local, so a
+// late-joining or restarted winner composed fewer rows than the other nodes and
+// only the winner could compose the carried delta (a dead winner stalled every
+// node). OPERATOR RULING 09-26: both inputs are derived from the REPLICATED lane
+// prefix [0, P) up to the block's ON-CHAIN credit cut P:
+//   S(payee, iv)  = the receipts of payee with origin bin iv among [0, P)
+//   enrolment     = for each payee of the pool's enrol set (HELLO-checked, so
+//                   every peer holds the same set), its FIRST share on the
+//                   prefix is its enrolment record on the lane: committed at the
+//                   lowest bin b of its receipts in [0, P), effective from b + 1
+//                   (strictly later: the ex-ante rule, EnrollmentBook::commit)
+// Every node that holds the prefix (its own order when its digest at P is the
+// on-chain spine, else the winner-side order the relay repair fetched) derives
+// the same rows, the same book and the same delta, so ANY node composes it. A
+// carried v0x02 trailer is a witness only: verify_carry() refuses one whose
+// enrollment_digest (or delta) differs from the lane derivation, and the node
+// books the lane derivation either way (a refusal can never fork a booking).
+// Flip 0: nothing below is constructed or called.
+#define C2POOL_XMR_DROPS_LANE_ENROL 1
+
+// One receipt of the lane prefix: its payee identity and origin bin.
+struct LaneShare {
+    bytes32 payee{};
+    std::uint64_t bin = 0;
+};
+// The receipts of the lane prefix [0, P), as a multiset (order-free: the
+// winner's order and a repaired order of the same prefix carry the same set).
+struct LanePrefix {
+    std::uint64_t P = 0;
+    std::vector<LaneShare> shares;
+};
+using ShareCounts = std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t>;
+
+// S(payee, iv) for iv in [lo, hi), from the prefix alone.
+inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std::uint64_t hi) {
+    ShareCounts s;
+    for (const auto& x : lp.shares)
+        if (x.bin >= lo && x.bin < hi) ++s[std::make_pair(x.payee, x.bin)];
+    return s;
+}
+// The enrolment book of the prefix: a pure function of (the enrol set, [0, P)).
+inline ::c2pool::v37n::EnrollmentBook lane_enrollment(const LanePrefix& lp, const std::set<bytes32>& enrol_set) {
+    std::map<bytes32, std::uint64_t> first;
+    for (const auto& x : lp.shares) {
+        if (!enrol_set.count(x.payee)) continue;
+        auto [it, fresh] = first.try_emplace(x.payee, x.bin);
+        if (!fresh && x.bin < it->second) it->second = x.bin;
+    }
+    ::c2pool::v37n::EnrollmentBook b;
+    for (const auto& [payee, bin] : first) (void)b.commit(payee, bin, bin + 1);
+    return b;
+}
+// The pool's enrol set, as it is mixed into the relay HELLO lane_params_digest
+// (flip 1 with a non-empty set only): a peer holding another set is refused at
+// HELLO instead of deriving a different book.
+inline bytes32 enrol_set_digest(const std::set<bytes32>& s) {
+    std::vector<std::uint8_t> b;
+    const char* dom = "V37ENROLSET1";
+    for (const char* p = dom; *p; ++p) b.push_back(static_cast<std::uint8_t>(*p));
+    ::c2pool::v37n::enroll_detail::put_le32(b, static_cast<std::uint32_t>(s.size()));
+    for (const auto& k : s) b.insert(b.end(), k.begin(), k.end());
+    return ::v37::sha256d(b);
+}
+inline bytes32 hello_digest_with_enrol(const bytes32& lane_params_digest, const std::set<bytes32>& s) {
+    if (s.empty()) return lane_params_digest;
+    std::vector<std::uint8_t> b(lane_params_digest.begin(), lane_params_digest.end());
+    const auto e = enrol_set_digest(s);
+    b.insert(b.end(), e.begin(), e.end());
+    return ::v37::sha256d(b);
+}
+// The carried trailer against the lane derivation (`lane_digest` = the book
+// digest derived from [0, P)). "" = the witness agrees.
+inline std::string verify_carry(const DropsCarry& c, bool binds, const bytes32& lane_digest) {
+    std::string r = verify_carry(c, binds);
+    if (!r.empty()) return r;
+    if (c.enrollment_digest != lane_digest)
+        return "the carried enrollment_digest differs from the book derived from the lane prefix [0,P)";
+    return "";
+}
 // ── (6) RAIN-BACKFILL: the retained, chain-ordered harvest ───────────────────
 // Feature marker (the harvest-order KAT switches on it: absent on the base).
 #define C2POOL_XMR_HARVEST_CHAIN_PURE 1
@@ -308,6 +390,48 @@ public:
         }
         return out;
     }
+    // ★ DROPS-ENROL-LANE: the rows over [lo, hi) with S taken from the lane
+    // prefix (`S`, complete for [lo, hi) by construction: nothing withheld) and
+    // share-only rows for the payees `book` (the lane-derived book) enrols. Pure.
+    Rows rows_lane(std::uint64_t lo, std::uint64_t hi, const ShareCounts& S,
+                   const ::c2pool::v37n::EnrollmentBook& book) const {
+        std::map<std::pair<bytes32, std::uint64_t>, std::vector<bytes32>> keys;
+        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it)
+            for (const auto& [payee, h] : it->second) keys[std::make_pair(payee, it->first)].push_back(h);
+        for (const auto& [k, n] : S) {
+            (void)n;
+            if (k.second < lo || k.second >= hi || keys.count(k)) continue;
+            if (!book.enrolled(k.first, k.second)) continue;   // share-only rows: enrolled payees
+            keys[k];
+        }
+        Rows out;
+        for (auto& [k, hashes] : keys) {
+            ::c2pool::v37::subthreshold::ReceiptCollector rc(m_K, ::c2pool::v37n::drops_detail::h_t_of_lz(m_lz));
+            std::sort(hashes.begin(), hashes.end());
+            for (const auto& h : hashes) rc.observe(::c2pool::v37n::drops_detail::u256_of(h));
+            auto si = S.find(k);
+            rc.set_shares(si == S.end() ? 0 : si->second);
+            out.push_back(::c2pool::v37n::settle::HarvestedReceipt{k.first, k.second, rc});
+        }
+        return out;
+    }
+    // the inputs digest of [lo, hi) with S from the lane prefix (diagnostic)
+    std::uint64_t lane_inputs_digest(std::uint64_t lo, std::uint64_t hi, const ShareCounts& S) const {
+        std::uint64_t x = 1469598103934665603ULL;
+        auto mix = [&x](const unsigned char* p, std::size_t n) { for (std::size_t i = 0; i < n; ++i) { x ^= p[i]; x *= 1099511628211ULL; } };
+        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it) {
+            mix(reinterpret_cast<const unsigned char*>(&it->first), sizeof(it->first));
+            for (const auto& [payee, h] : it->second) { mix(payee.data(), payee.size()); mix(h.data(), h.size()); }
+        }
+        for (const auto& [k, s] : S) {
+            if (k.second < lo || k.second >= hi) continue;
+            mix(k.first.data(), k.first.size());
+            mix(reinterpret_cast<const unsigned char*>(&k.second), sizeof(k.second));
+            mix(reinterpret_cast<const unsigned char*>(&s), sizeof(s));
+        }
+        return x;
+    }
+
     // A short digest of the retained inputs of [lo, hi) (payee, interval, hashes,
     // S): what the rig compares across nodes per canonical block. Diagnostic.
     std::uint64_t inputs_digest(std::uint64_t lo, std::uint64_t hi) const {
@@ -677,6 +801,69 @@ public:
         return c;
     }
 
+    // ── ★ DROPS-ENROL-LANE (7): the lane prefix + the composition from it ───
+    // The pool's enrol set (identities; the same on every node: HELLO-checked).
+    void set_enrol_set(std::set<bytes32> s) { std::lock_guard<std::mutex> lk(m_hmtx); m_enrol_set = std::move(s); }
+    std::set<bytes32> enrol_set() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_enrol_set; }
+    // A receipt the lane just pushed at positions [pos_first, pos_first + n):
+    // ONE share of `payee` at origin bin `bin` (0 = not known yet: a durable-log
+    // reload; resolved from `prev_id` when a prefix is derived).
+    void on_share_lane(const bytes32& payee, std::uint64_t bin, std::uint64_t pos_first, std::uint32_t n,
+                       const bytes32& prev_id) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        m_lane_pos[pos_first] = LanePos{payee, bin, prev_id};
+        if (pos_first == m_lane_contig) m_lane_contig = pos_first + (n ? n : 1);
+        else if (pos_first > m_lane_contig) ++m_lane_gaps;   // our own log no longer covers [0, P) past here
+    }
+    using BinOfFn = std::function<std::optional<std::uint64_t>(const bytes32& prev_id)>;
+    // Our OWN lane order's prefix [0, P) (the caller has checked that our digest
+    // at P is the on-chain spine). nullopt = our log does not cover [0, P) or a
+    // receipt's bin is not resolvable yet (`why`; the booking HOLDs).
+    std::optional<LanePrefix> own_prefix(std::uint64_t P, const BinOfFn& bin_of, std::string* why) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        if (P > m_lane_contig) {
+            if (why) *why = "our lane log covers [0," + std::to_string(m_lane_contig) + ") < P=" + std::to_string(P);
+            return std::nullopt;
+        }
+        LanePrefix lp; lp.P = P;
+        for (auto it = m_lane_pos.begin(); it != m_lane_pos.end() && it->first < P; ++it) {
+            LanePos& e = it->second;
+            if (e.bin == 0) {
+                const auto b = bin_of ? bin_of(e.prev_id) : std::nullopt;
+                if (!b || *b == 0) {
+                    if (why) *why = "the origin bin of the receipt at lane position " + std::to_string(it->first) + " is not resolvable yet";
+                    return std::nullopt;
+                }
+                e.bin = *b;
+            }
+            lp.shares.push_back(LaneShare{e.payee, e.bin});
+        }
+        return lp;
+    }
+    // THE composition inputs of a lane block whose harvest settles [lo, hi):
+    // rows, the lane-derived book (its digest) -- a pure function of the
+    // retained raindrops over [lo, hi) and the prefix.
+    struct LaneCompose {
+        ChainOrderedHarvest::Rows rows;
+        ::c2pool::v37n::EnrollmentBook book;
+        bytes32 digest{};
+        std::uint64_t inputs = 0;
+        std::size_t prefix_shares = 0;
+    };
+    LaneCompose compose_lane(std::uint64_t lo, std::uint64_t hi, const LanePrefix& lp) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        LaneCompose c;
+        const ShareCounts S = lane_share_counts(lp, lo, hi);
+        c.book = lane_enrollment(lp, m_enrol_set);
+        c.digest = c.book.book_digest();
+        c.rows = m_coh.rows_lane(lo, hi, S, c.book);
+        c.inputs = m_coh.lane_inputs_digest(lo, hi, S);
+        c.prefix_shares = lp.shares.size();
+        return c;
+    }
+    std::uint64_t lane_contig() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_contig; }
+    std::uint64_t lane_gaps() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_gaps; }
+
     template <class Node>
     static void detach(Node& node) {
         node.set_drop_harvester(nullptr);
@@ -788,6 +975,13 @@ private:
     bool m_chain_order = false;
     ChainOrderedHarvest m_coh;
     ChainOrderedHarvest::PrevLaneFn m_prev_lane{};   // ★ RAIN-BACKFILL-2
+    // ★ DROPS-ENROL-LANE (under m_hmtx): our own lane order, one entry per
+    // receipt (its first position), and how far it covers [0, P) contiguously.
+    // Only ever filled under the flip (the wiring does not exist at flip 0).
+    struct LanePos { bytes32 payee{}; std::uint64_t bin = 0; bytes32 prev_id{}; };
+    std::map<std::uint64_t, LanePos> m_lane_pos;
+    std::uint64_t m_lane_contig = 0, m_lane_gaps = 0;
+    std::set<bytes32> m_enrol_set;
 };
 
 }  // namespace c2pool::v37n::xmr::drops

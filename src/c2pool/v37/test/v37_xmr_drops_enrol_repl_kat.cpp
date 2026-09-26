@@ -286,6 +286,20 @@ int main() {
         const std::string nd = slurp(std::string(V37_XMR_SRC_DIR) + "/xmr_node.hpp");
         const std::string rn = slurp(std::string(V37_XMR_SRC_DIR) + "/relay/xmr_relay_node.hpp");
         check(!sh.empty() && !nd.empty() && !rn.empty(), "sources readable");
+#if defined(C2POOL_XMR_DROPS_LANE_ENROL)
+        // DROPS-ENROL-LANE (defect 4) superseded the wait on the winner: every node
+        // composes the lane block from the lane prefix; the carried delta is its witness.
+        check(sh.find("drops->set_carried(lane.carry.delta)") != std::string::npos,
+              "★ the booking callback books the LANE composition (every node derives the same; never a node-local book)");
+        check(sh.find("verify_carry(*wit->second.drops, binds, lane.carry.enrollment_digest)") != std::string::npos,
+              "... the carried trailer is checked against the lane-derived digest");
+        check(sh.find("awaiting the winner's carried DROPS delta") == std::string::npos &&
+              sh.find("cut-pending: relay repair of P=") != std::string::npos,
+              "no wait on the winner's delta; an underivable lane prefix is HELD as a relay repair (never a timeout refusal)");
+        check(sh.find("compose_carry(cfg.lane_params, out.lc.rows, dctx)") != std::string::npos &&
+              sh.find("bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest}") != std::string::npos,
+              "the own win carries its lane composition (FB_BLOCK_WON v0x02)");
+#else
         check(sh.find("drops->set_carried(wit->second.drops->delta)") != std::string::npos,
               "★ the booking callback books the WINNER's carried delta (never this node's own book)");
         check(sh.find("verify_carry(*wit->second.drops, binds)") != std::string::npos, "... after the deterministic check");
@@ -295,6 +309,7 @@ int main() {
         check(sh.find("compose_carry(cfg.lane_params, rows, dctx)") != std::string::npos &&
               sh.find("bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest}") != std::string::npos,
               "the own win composes ONCE at booking and carries it (FB_BLOCK_WON v0x02)");
+#endif
         check(sh.find("wc.drops = c2pool::v37n::xmr::drops::DropsCarry{bw.drops->delta") != std::string::npos,
               "a received v0x02 trailer is kept for the booking");
         check(nd.find("fb.has_carried_drops = true;") != std::string::npos && nd.find("m_drops_carried()") != std::string::npos,
