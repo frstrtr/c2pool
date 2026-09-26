@@ -252,6 +252,14 @@ struct TxpoolStats {
     // pooled tx had an unverifiable ring" -- the sensor the SPV-mining critique
     // is closed against: on a covered node it stays 0 while blocks fill.
     std::uint64_t excluded_unresolved      = 0;
+
+    // TXPOOL-RESUME: relays refused by the fail-closed sync gate (also in
+    // `rejected`), and how often the pool's chain context (tip_height_) was
+    // seated from the index rather than from a connected block -- the
+    // snapshot-resume case, where no block connects until the next one is
+    // found and every ring member used to look unspendable against height 0.
+    std::uint64_t rejected_not_synced      = 0;
+    std::uint64_t tip_seated               = 0;
 };
 
 // --- the pool ----------------------------------------------------------------
@@ -316,6 +324,18 @@ public:
     void set_synced(bool synced);
     bool synced() const;
 
+    // TXPOOL-RESUME: seat the chain context (the tip the next block extends)
+    // from the index when no block event has delivered it yet. A snapshot
+    // resume installs the index at its saved tip WITHOUT connecting a block,
+    // so on_block_connected never ran and tip_height_ stayed 0: every relayed
+    // transaction was then judged against block 1 and refused RingMemberLocked
+    // (each ring member "younger than 10 blocks" against height 1) until the
+    // next block connected -- a coinbase-only template for a whole block after
+    // every restart. A no-op once a block event has set the tip, so a late or
+    // stale seat can never walk the context back. Returns whether it seated.
+    bool seat_tip(std::uint64_t tip_height);
+    bool tip_known() const;
+
     // Wire the two chain-derived views the INPUT-consensus step needs: the ring
     // member source (resolve absolute offsets -> (dest, mask)) and the on-chain
     // spent-key-image view (the GLOBAL double-spend oracle). Both are typically
@@ -378,6 +398,8 @@ private:
     // judged against the block we would mine next, tip_height_ + 1, for the
     // spendable-age and unlock-time rules. Set in on_block_connected.
     std::uint64_t             tip_height_ = 0;
+    // Set by the first block event or by seat_tip(); see seat_tip().
+    bool                      tip_known_  = false;
 };
 
 } // namespace c2pool::xmr::native

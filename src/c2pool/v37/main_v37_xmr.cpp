@@ -3575,6 +3575,32 @@ static int run_live(const XmrNodeConfig& cfg) {
                         (native && !cfg.no_good_citizen) ? "on" : "off",
                         ns.citizen_pool_n, ns.citizen_chosen_n,
                         static_cast<unsigned long long>(ns.good_citizen_violations));
+            // TXPOOL-RESUME: the relay gate, the pool and why it refused. An
+            // empty pool behind an open gate is told apart from an empty pool
+            // behind a shut one, and a pool refusing every relay says why.
+            std::printf("  txpool: gate=%d tip_known=%d warm=%d(%s %llums) complement req=%llu ans=%llu "
+                        "admitted_rounds=%llu txs=%llu | count=%llu accepted=%llu dup=%llu rejected=%llu "
+                        "not_synced=%llu member_locked=%llu unresolved=%llu ki_spent=%llu already_mined=%llu "
+                        "tip_seated=%llu\n",
+                        ns.txpool_gate_open ? 1 : 0,
+                        ns.txpool_tip_known ? 1 : 0,
+                        ns.txpool_warm ? 1 : 0,
+                        ns.txpool_warm_why.empty() ? "-" : ns.txpool_warm_why.c_str(),
+                        static_cast<unsigned long long>(ns.txpool_warm_after_ms),
+                        static_cast<unsigned long long>(ns.pool.complement_requests_out),
+                        static_cast<unsigned long long>(ns.pool.complement_answers_in),
+                        static_cast<unsigned long long>(ns.complement_rounds),
+                        static_cast<unsigned long long>(ns.complement_txs),
+                        static_cast<unsigned long long>(ns.txpool.count),
+                        static_cast<unsigned long long>(ns.txpool.accepted),
+                        static_cast<unsigned long long>(ns.txpool.duplicates),
+                        static_cast<unsigned long long>(ns.txpool.rejected),
+                        static_cast<unsigned long long>(ns.txpool.rejected_not_synced),
+                        static_cast<unsigned long long>(ns.txpool.rejected_member_locked),
+                        static_cast<unsigned long long>(ns.txpool.unresolved_ring),
+                        static_cast<unsigned long long>(ns.txpool.rejected_key_image_spent),
+                        static_cast<unsigned long long>(ns.txpool.rejected_already_mined),
+                        static_cast<unsigned long long>(ns.txpool.tip_seated));
             // Template dup-tx hygiene: mined txs kept out of templates (the
             // connect/refresh race, caught), own blocks refused as invalid,
             // own forks abandoned by the liveness guard, relays refused as

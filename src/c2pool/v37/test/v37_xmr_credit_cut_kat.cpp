@@ -38,12 +38,14 @@
 // touched; the OwedLedger fold and owed_digest() are read, never changed.
 // ---------------------------------------------------------------------------
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "impl/xmr/coin/xmr_derivation.hpp"
@@ -232,6 +234,44 @@ void suite_format() {
 }
 
 // ---------------------------------------------------------------------------
+// Header timestamp masking. The header is major(1) | minor(1) | varint(ts) |
+// prev_id(32) | nonce(4); ts is max(wall clock, median_timestamp + 1) and the
+// monerod arm serves median_timestamp = 0 (get_miner_data does not return it),
+// so two templates built back to back straddle a second boundary whenever the
+// clock ticks between them (seen under ASan: #1772, run 36130772519). The
+// armed-vs-unarmed promise is about everything EXCEPT that wall-clock field.
+// ---------------------------------------------------------------------------
+struct HeaderTs {
+    bool          ok = false;
+    std::uint64_t ts = 0;
+    std::size_t   begin = 0, end = 0;   // [begin, end) = the timestamp varint
+};
+HeaderTs header_timestamp(const std::vector<std::uint8_t>& blob, std::size_t header_size) {
+    HeaderTs h;
+    h.begin = 2;
+    std::size_t i = h.begin;
+    for (int shift = 0; i < header_size && shift < 64; shift += 7, ++i) {
+        h.ts |= static_cast<std::uint64_t>(blob[i] & 0x7F) << shift;
+        if (!(blob[i] & 0x80)) { h.end = i + 1; h.ok = true; break; }
+    }
+    return h;
+}
+// Byte-identical headers modulo the timestamp varint (which must be well-formed
+// and the same LENGTH, so every later byte stays at the same offset).
+bool headers_equal_masking_ts(const std::vector<std::uint8_t>& x, std::size_t nx,
+                              const std::vector<std::uint8_t>& y, std::size_t ny) {
+    if (nx != ny || nx < 2 || x.size() < nx || y.size() < ny) return false;
+    const HeaderTs hx = header_timestamp(x, nx), hy = header_timestamp(y, ny);
+    if (!hx.ok || !hy.ok || hx.end != hy.end) return false;
+    return std::memcmp(x.data(), y.data(), hx.begin) == 0 &&
+           std::memcmp(x.data() + hx.end, y.data() + hy.end, nx - hx.end) == 0;
+}
+std::uint64_t wall_seconds() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// ---------------------------------------------------------------------------
 // Suite B -- armed vs unarmed template from the same fixture.
 // ---------------------------------------------------------------------------
 struct Parsed {
@@ -254,7 +294,9 @@ Parsed parse(const asm_::BlockBytes& b) {
 
 void suite_armed_vs_unarmed(std::string& unarmed_hex, std::string& armed_hex) {
     std::printf("== B. ARMED vs UNARMED template (same fixture, monerod arm over the C4 capture) ==\n");
+    const std::uint64_t t_before = wall_seconds();
     Built u(false), a(true);
+    const std::uint64_t t_after = wall_seconds();
     if (!CHECK_RET(u.ok, "unarmed template builds + materializes: %s", u.ok ? "ok" : u.why.c_str())) return;
     if (!CHECK_RET(a.ok, "armed template builds + materializes: %s", a.ok ? "ok" : a.why.c_str())) return;
     CHECK(u.snap.height == G4::MD_HEIGHT && a.snap.height == G4::MD_HEIGHT, "both at the capture's height %llu",
@@ -297,8 +339,16 @@ void suite_armed_vs_unarmed(std::string& unarmed_hex, std::string& armed_hex) {
           std::memcmp(pa.got.tx_extra.data() + pa.got.tx_extra.size() - 35, pu.got.tx_extra.data() + pu.got.tx_extra.size() - 35, 35) == 0,
           "the 0x03 21 00 root (35-byte tail of tx_extra) byte-identical: lane commitment / owed_digest untouched");
     CHECK(a.bytes.merkle_root == u.bytes.merkle_root, "MM commitment root identical");
-    CHECK(std::memcmp(a.bytes.full_blob.data(), u.bytes.full_blob.data(), a.bytes.miner_tx_offset) == 0,
-          "block header byte-identical (%zu B)", a.bytes.miner_tx_offset);
+    CHECK(headers_equal_masking_ts(a.bytes.full_blob, a.bytes.miner_tx_offset, u.bytes.full_blob, u.bytes.miner_tx_offset),
+          "block header byte-identical except the wall-clock timestamp varint (%zu B)", a.bytes.miner_tx_offset);
+    {
+        const HeaderTs hu = header_timestamp(u.bytes.full_blob, u.bytes.miner_tx_offset);
+        const HeaderTs ha = header_timestamp(a.bytes.full_blob, a.bytes.miner_tx_offset);
+        CHECK(hu.ok && ha.ok && hu.ts >= t_before && ha.ts >= hu.ts && ha.ts <= t_after,
+              "the masked timestamps are the build-time wall clock: %llu <= u %llu <= a %llu <= %llu",
+              static_cast<unsigned long long>(t_before), static_cast<unsigned long long>(hu.ts),
+              static_cast<unsigned long long>(ha.ts), static_cast<unsigned long long>(t_after));
+    }
     CHECK(u.lane.ledger.ledger().owed_digest() == a.lane.ledger.ledger().owed_digest(), "owed_digest identical on both fixtures");
 
     // --- the cut reads back through both decoders -------------------------------
@@ -425,6 +475,50 @@ void suite_golden(const std::string& unarmed_hex, const std::string& armed_hex) 
     CHECK(derived, "ARMED golden == UNARMED golden + (0x02 len += 44) + 44-byte tail spliced after the padded nonce");
 }
 
+// ---------------------------------------------------------------------------
+// Suite D -- regression: the header compare survives a second boundary.
+// Builds unarmed, waits for the wall clock to tick past its header timestamp,
+// then builds armed: the raw headers now MUST differ (the #1772 ASan red,
+// reproduced every run) and the masked compare MUST still hold. Plus the
+// mask's own controls: it hides only the timestamp varint.
+// ---------------------------------------------------------------------------
+void suite_second_boundary() {
+    std::printf("== D. regression: header compare across a forced second boundary ==\n");
+    Built u(false);
+    if (!CHECK_RET(u.ok, "unarmed template builds + materializes: %s", u.ok ? "ok" : u.why.c_str())) return;
+    const std::size_t n = u.bytes.miner_tx_offset;
+    const HeaderTs hu = header_timestamp(u.bytes.full_blob, n);
+    if (!CHECK_RET(hu.ok && hu.end + 32 + 4 == n, "unarmed header parses: ts %llu, varint [%zu,%zu), %zu B",
+                   static_cast<unsigned long long>(hu.ts), hu.begin, hu.end, n)) return;
+
+    for (int i = 0; i < 300 && wall_seconds() <= hu.ts; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Built a(true);
+    if (!CHECK_RET(a.ok, "armed template builds + materializes after the tick: %s", a.ok ? "ok" : a.why.c_str())) return;
+    const HeaderTs ha = header_timestamp(a.bytes.full_blob, a.bytes.miner_tx_offset);
+    CHECK(ha.ok && ha.ts > hu.ts, "the armed build landed in a LATER second (%llu > %llu)",
+          static_cast<unsigned long long>(ha.ts), static_cast<unsigned long long>(hu.ts));
+    CHECK(a.bytes.miner_tx_offset == n && std::memcmp(a.bytes.full_blob.data(), u.bytes.full_blob.data(), n) != 0,
+          "raw header memcmp differs across the boundary (the pre-fix check would go red here)");
+    CHECK(headers_equal_masking_ts(a.bytes.full_blob, a.bytes.miner_tx_offset, u.bytes.full_blob, n),
+          "masked header compare holds across the boundary");
+
+    // The mask hides ONLY the timestamp: every other header byte still bites.
+    const std::vector<std::uint8_t> hdr(u.bytes.full_blob.begin(), u.bytes.full_blob.begin() + static_cast<std::ptrdiff_t>(n));
+    std::vector<std::uint8_t> t = hdr; t[hu.begin] ^= 0x01;                 // low ts bits, continuation bit kept
+    CHECK(headers_equal_masking_ts(t, n, hdr, n), "control: a ts-only change is masked");
+    std::vector<std::uint8_t> v = hdr; v[0] ^= 0x01;
+    CHECK(!headers_equal_masking_ts(v, n, hdr, n), "control: major_version change is caught");
+    std::vector<std::uint8_t> m = hdr; m[1] ^= 0x01;
+    CHECK(!headers_equal_masking_ts(m, n, hdr, n), "control: minor_version change is caught");
+    std::vector<std::uint8_t> p = hdr; p[hu.end] ^= 0x01;
+    CHECK(!headers_equal_masking_ts(p, n, hdr, n), "control: prev_id first byte change is caught");
+    std::vector<std::uint8_t> q = hdr; q[n - 1] ^= 0x01;
+    CHECK(!headers_equal_masking_ts(q, n, hdr, n), "control: nonce last byte change is caught");
+    std::vector<std::uint8_t> w = hdr; w.insert(w.begin() + static_cast<std::ptrdiff_t>(hu.end - 1), 0x80);   // one byte longer varint
+    CHECK(!headers_equal_masking_ts(w, n + 1, hdr, n), "control: a different header length is caught");
+}
+
 } // namespace
 
 int main() {
@@ -433,6 +527,7 @@ int main() {
     std::string uh, ah;
     suite_armed_vs_unarmed(uh, ah);
     suite_golden(uh, ah);
+    suite_second_boundary();
     std::printf("=== %d/%d checks passed ===\n", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;
 }

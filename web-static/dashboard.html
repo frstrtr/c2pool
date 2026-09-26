@@ -2189,29 +2189,24 @@
                     <h2>📡 <span id="parent_chain_peers_title">Parent Chain</span> Peers</h2>
                     <div style="display: flex; gap: 10px; align-items: center;">
                         <span class="badge" id="broadcaster_peers_count">0</span>
-                        <span class="badge" id="broadcaster_status_badge" style="background: var(--success);">✓ Healthy</span>
+                        <span class="badge" id="broadcaster_status_badge" style="background: var(--text-muted);">…</span>
                     </div>
                 </div>
-                <div class="stats-grid broadcaster-stats" style="margin-bottom: 15px; grid-template-columns: repeat(4, 1fr);">
+                <!-- #1142 item 1: the "Success / Connect Rate" card was a literal '100%'
+                     and "Broadcasts / Success / Failed" showed a found-block count
+                     (hardcoded 0 on the non-merged path). /broadcaster_status has no
+                     broadcast success/failure counter, so both cards are removed
+                     rather than left structurally unable to go red. -->
+                <div class="stats-grid broadcaster-stats" style="margin-bottom: 15px; grid-template-columns: repeat(2, 1fr);">
                     <div class="stat-card" style="padding: 12px;">
                         <div class="stat-label">Connections</div>
                         <div class="stat-value" id="broadcaster_connections" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Active / Target</div>
+                        <div class="stat-sublabel">Connected</div>
                     </div>
                     <div class="stat-card" style="padding: 12px;">
-                        <div class="stat-label">Database</div>
+                        <div class="stat-label">Known Peers</div>
                         <div class="stat-value" id="broadcaster_database_size" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Total Peers</div>
-                    </div>
-                    <div class="stat-card" style="padding: 12px;">
-                        <div class="stat-label">Success</div>
-                        <div class="stat-value" id="broadcaster_success_rate" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Connect Rate</div>
-                    </div>
-                    <div class="stat-card" style="padding: 12px;">
-                        <div class="stat-label">Broadcasts</div>
-                        <div class="stat-value" id="broadcaster_broadcasts" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Success / Failed</div>
+                        <div class="stat-sublabel">Connected + idle</div>
                     </div>
                 </div>
                 <div class="table-scroll">
@@ -5061,8 +5056,6 @@
                         .text('Not Available');
                     d3.select('#broadcaster_connections').text('N/A');
                     d3.select('#broadcaster_database_size').text('N/A');
-                    d3.select('#broadcaster_success_rate').text('N/A');
-                    d3.select('#broadcaster_broadcasts').text('N/A');
                     d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
                     var tr = d3.select('#broadcaster_peers_tbody').append('tr');
                     tr.append('td')
@@ -5083,8 +5076,6 @@
                 d3.select('#broadcaster_peers_count').text(connectedPeers.length);
                 d3.select('#broadcaster_connections').text(connectedPeers.length);
                 d3.select('#broadcaster_database_size').text(peers.length);
-                d3.select('#broadcaster_success_rate').text('100%');
-                d3.select('#broadcaster_broadcasts').text(data.total_blocks_found || 0);
 
                 // Peers table
                 d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();

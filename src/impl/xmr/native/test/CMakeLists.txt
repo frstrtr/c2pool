@@ -979,6 +979,37 @@ if (BUILD_TESTING)
     add_test(NAME xmr_native_template_dup_tx_kat COMMAND xmr_native_template_dup_tx_kat)
     set_tests_properties(xmr_native_template_dup_tx_kat PROPERTIES TIMEOUT 300)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #   xmr_native_txpool_resume_kat -- TXPOOL-RESUME (mainnet dry run 2): a
+    #   resumed node admits relays as soon as its relay gate opens (the pool's
+    #   tip is seated from the index; the gate is the template predicate), a
+    #   fresh pool is back-filled from a peer's txpool complement (2010 -> 2002,
+    #   admitted fluffed, on a solicited DoS credit), and no template is served
+    #   before the pool is warm -- after which the selection is unchanged. Real
+    #   mainnet txs with their real rings; no sockets, no RandomX. RED on
+    #   269eb722.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml (the #1539 lesson).
+    add_executable(xmr_native_txpool_resume_kat xmr_txpool_resume_kat.cpp)
+    target_include_directories(xmr_native_txpool_resume_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_txpool_resume_kat PRIVATE xmr_native_txpool)
+    target_compile_features(xmr_native_txpool_resume_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_txpool_resume_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_txpool_resume_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_txpool_resume_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_txpool_resume_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_txpool_resume_kat COMMAND xmr_native_txpool_resume_kat)
+    set_tests_properties(xmr_native_txpool_resume_kat PROPERTIES TIMEOUT 300)
+
     add_executable(xmr_native_m4_ptpl_backlog_gate_kat xmr_m4_ptpl_backlog_gate_kat.cpp)
     target_include_directories(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src

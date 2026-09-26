@@ -106,6 +106,7 @@
 #include "impl/xmr/native/node/xmr_genesis_blob.hpp"
 #include "impl/xmr/native/node/xmr_monerod_http.hpp"
 #include "impl/xmr/native/node/xmr_sync_driver.hpp"
+#include "impl/xmr/native/node/xmr_tx_relay_gate.hpp"
 #include "impl/xmr/native/node/xmr_worker_loops.hpp"
 #include "impl/xmr/native/p2p/chain_seeds.hpp"
 #include "impl/xmr/native/p2p/xmr_peer_pool.hpp"
@@ -334,6 +335,10 @@ struct NativeNodeConfig {
     bool                     probe_only = false;
 
     std::uint64_t            driver_tick_ms = 500;
+    // TXPOOL-RESUME: after the relay gate opens, templates wait until the tx
+    // pool is warm -- the first txpool-complement (2010) answer was admitted --
+    // or this many ms passed, whichever comes first. 0 = no warm gate.
+    std::uint64_t            txpool_warm_timeout_ms = 30'000;
     std::size_t              verify_queue   = 4096;
     std::size_t              txpool_queue   = 2048;
 
@@ -395,6 +400,13 @@ struct NodeStatus {
     // holds nothing because the gate is shut and a pool that holds nothing
     // because the chain is quiet are the same picture without this flag.
     bool                         txpool_gate_open = false;
+    // TXPOOL-RESUME: the pool's chain context, the warm latch and the back-fill.
+    bool                         txpool_tip_known  = false;
+    bool                         txpool_warm       = false;
+    std::string                  txpool_warm_why;          // "complement" / "timeout" / ""
+    std::uint64_t                txpool_warm_after_ms = 0; // gate open -> warm
+    std::uint64_t                complement_rounds = 0;    // answers admitted
+    std::uint64_t                complement_txs    = 0;    // txs in those answers
     std::uint64_t                rpc_calls = 0;
     // Failed round trips on that same transport. A parity arm that is silently
     // failing every call still reports rpc_calls climbing, so the count alone
@@ -659,6 +671,20 @@ public:
                 outputs_.on_block_disconnected(ev);
                 txpool_.note_block_disconnected(ev);
             }
+            // TXPOOL-RESUME-2: the output set now holds the index tip, so rings
+            // judged from here on resolve against the whole chain: the relay
+            // gate may open (and the back-fill be asked) right now, on the
+            // block that closed the sync. See xmr_tx_relay_gate.hpp.
+            if (ev.kind == BlockTxEvent::Kind::Connected) {
+                const auto t = index_.view().tip();
+                if (t && t->id == ev.block_id) {
+                    {
+                        std::lock_guard<std::mutex> lk(gate_mu_);
+                        gate_latch_.note_outset_at_tip();
+                    }
+                    publish_tx_gate_();
+                }
+            }
             // Only the re-admission of a rolled-back block's bodies (a full
             // decode + verify each) and the inject upkeep go to the pool thread.
             pool_loop_.post([this, ev] {
@@ -681,6 +707,8 @@ public:
         // source (nullptr keeps the served template byte-identical to the plain
         // good-citizen path). Wired ONCE here, before any template is served.
         native_src_.set_operator_injects(cfg_.operator_inject ? &op_injects_ : nullptr);
+        // TXPOOL-RESUME: no template until the pool is warm (see update_pool_warm_).
+        native_src_.set_warm_gate(cfg_.txpool_warm_timeout_ms ? &pool_warm_ : nullptr);
 
         verify_loop_.start();
         pool_loop_.start();
@@ -915,6 +943,15 @@ public:
         s.boot         = boot_.stats();
         s.txpool       = txpool_.stats();
         s.txpool_gate_open = tx_gate_.load();
+        s.txpool_tip_known  = txpool_.tip_known();
+        s.txpool_warm       = pool_warm_.load();
+        s.complement_rounds = tx_sink_.complement_rounds();
+        s.complement_txs    = tx_sink_.complement_txs();
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            s.txpool_warm_why      = warm_why_;
+            s.txpool_warm_after_ms = warm_after_ms_;
+        }
         s.rpc_calls    = rpc_ ? rpc_->calls() : 0;
         s.rpc_failures = rpc_ ? rpc_->failures() : 0;
         if (witness_) s.randomx = witness_->witness();
@@ -1550,7 +1587,16 @@ private:
                                       else if (ufe == UnknownForkWatch::Event::Cleared)
                                           note_("[HF-FUSE] unknown-fork CLEARED: templates and tx admission resumed");
                                   }
+                                  // TXPOOL-RESUME-2: a tick runs on the
+                                  // verify thread between flushes, so every
+                                  // block the index connected has been fed to
+                                  // the output set by now.
+                                  {
+                                      std::lock_guard<std::mutex> lk(gate_mu_);
+                                      gate_latch_.note_outset_at_tip();
+                                  }
                                   publish_tx_gate_();
+                                  update_pool_warm_(now);
                                   // GOOD-CITIZEN: feed the wall clock (unix
                                   // seconds) to the miner-data source so the
                                   // backlog-refresh rate limit is actually
@@ -1654,13 +1700,94 @@ private:
     // Published from the verify thread (which owns the sync state) onto the
     // pool thread (which owns the gate), only on a CHANGE, so the steady state
     // costs one atomic compare per driver tick.
+    //
+    // TXPOOL-RESUME. The gate's predicate is the TEMPLATE predicate: the view's
+    // sync_state().synced is `synced && allows(Template)`, exactly what
+    // template_inputs() demands before any template is served, so the node
+    // never serves a template on a pool that is refusing admissions for sync.
+    // What the gate did NOT carry was the pool's chain context: a snapshot
+    // resume installs the index at its saved tip without connecting a block,
+    // so the pool's tip stayed 0 and every relayed tx was refused
+    // RingMemberLocked (members "younger than 10 blocks" against height 1)
+    // until the next block connected -- the dry-run-2 restart finding (0 tx in
+    // every template for a whole block while the network pool held ~200). The
+    // tip is therefore seated HERE, on the verify thread that owns the index,
+    // synchronously and before the gate opens; seat_tip() is a no-op once any
+    // block event has set it. Opening the gate also arms the complement
+    // back-fill (2010): the backlog the network relayed before this process
+    // listened is never pushed again.
+    //
+    // TXPOOL-RESUME-2: the gate OPENS only once the output set has been fed up
+    // to the index tip (TxRelayGateLatch): opened on the first MainchainEvent of
+    // the catch-up batch, it admitted the fresh-boot back-fill against an output
+    // set ~180 blocks short, leaving 76 of 77 rings unresolved. Every opening
+    // (boot, and each regain after a sync loss) starts a new complement round.
     void publish_tx_gate_() {
         const bool synced = index_.view().sync_state().synced;
-        bool expected = !synced;
-        if (!tx_gate_.compare_exchange_strong(expected, synced)) return;
-        pool_loop_.post([this, synced] { txpool_.set_synced(synced); });
-        note_(std::string("[txpool] relay gate ") + (synced ? "OPEN" : "CLOSED")
-              + " (index synced=" + (synced ? "1" : "0") + ")");
+        TxRelayGateLatch::Step st;
+        std::uint64_t held_before = 0, opens = 0;
+        {
+            std::lock_guard<std::mutex> lk(gate_mu_);
+            st = gate_latch_.evaluate(synced);
+            held_before = gate_latch_.held_before_last_open();
+            opens = gate_latch_.opens();
+        }
+        if (!st.changed) return;
+        tx_gate_.store(st.open);
+        std::string seated;
+        if (st.open) {
+            if (const auto t = index_.view().tip())
+                if (txpool_.seat_tip(t->height))
+                    seated = ", pool tip seated at " + std::to_string(t->height);
+        }
+        pool_loop_.post([this, open = st.open] { txpool_.set_synced(open); });
+        if (st.open) {
+            // Admission is posted to the same pool loop AFTER set_synced, so
+            // the back-fill answer can never race ahead of the open gate.
+            if (gate_open_ms_ == 0) gate_open_ms_ = now_ms_();
+            if (pool_ && st.arm_complement) pool_->arm_txpool_complement();
+        }
+        std::string line = std::string("[txpool] relay gate ") + (st.open ? "OPEN" : "CLOSED")
+              + " (index synced=" + (synced ? "1" : "0") + seated;
+        if (st.open)
+            line += ", output set at the index tip (frontier " + std::to_string(outputs_.frontier())
+                  + ", held " + std::to_string(held_before) + " evaluation(s) for it), complement round "
+                  + std::to_string(opens);
+        line += ")";
+        note_(line);
+        std::fprintf(stderr, "[native] %s\n", line.c_str());
+    }
+
+    // TXPOOL-RESUME (verify thread): the warm latch the template readiness
+    // rule reads. Warm once the relay gate is open AND either the first
+    // complement answer has been admitted or txpool_warm_timeout_ms passed
+    // since the gate opened (bounded: a peer that never answers costs at most
+    // the timeout). Latched for the life of the process.
+    void update_pool_warm_(std::uint64_t /*tick_now*/) {
+        if (pool_warm_.load(std::memory_order_relaxed) || !tx_gate_.load() || gate_open_ms_ == 0) return;
+        // TXPOOL-RESUME-2: read the clock HERE. The tick's `now` was taken when
+        // the tick was armed, before this task queued behind a flush on the
+        // verify thread, so it could predate gate_open_ms_ and every delay
+        // read "WARM after 0 ms" however long the answer took.
+        const std::uint64_t now = now_ms_();
+        const std::uint64_t rounds = tx_sink_.complement_rounds();
+        const std::uint64_t waited = now > gate_open_ms_ ? now - gate_open_ms_ : 0;
+        const bool timed_out = waited >= cfg_.txpool_warm_timeout_ms;
+        if (rounds == 0 && !timed_out) return;
+        {
+            std::lock_guard<std::mutex> lk(rec_mu_);
+            warm_why_      = rounds ? "complement" : "timeout";
+            warm_after_ms_ = waited;
+        }
+        pool_warm_.store(true, std::memory_order_release);
+        const std::string line = "[txpool] WARM after " + std::to_string(waited) + " ms ("
+            + (rounds ? "complement answer admitted: " + std::to_string(tx_sink_.complement_txs()) + " tx"
+                      : std::string("timeout, no complement answer"))
+            + ", pool=" + std::to_string(txpool_.size())
+            + ", unresolved=" + std::to_string(txpool_.stats().unresolved_ring)
+            + ", output-set frontier=" + std::to_string(outputs_.frontier()) + "); templates may now be served";
+        note_(line);
+        std::fprintf(stderr, "[native] %s\n", line.c_str());
     }
 
     void on_mainchain_(const node::MainchainEvent& ev) {
@@ -1727,8 +1854,15 @@ private:
             if (tips_.size() > 8192) tips_.erase(tips_.begin());
         }
         if (oracle_) oracle_->on_tip(ev, "native");
-        // The gate is published here as well as on the driver tick so that it
-        // opens on the block that closed the sync, not up to a tick later.
+        // TXPOOL-RESUME-2: this flush delivers its BlockTxEvents -- the output
+        // set's feed -- only AFTER every MainchainEvent, so the gate may not
+        // open on this event; it opens from the tx sink once the index tip's
+        // outputs are in (xmr_tx_relay_gate.hpp). A gate already open stays
+        // open; a sync loss still closes it here.
+        {
+            std::lock_guard<std::mutex> lk(gate_mu_);
+            gate_latch_.note_chain_events_pending();
+        }
         publish_tx_gate_();
     }
 
@@ -2194,6 +2328,16 @@ private:
     std::atomic<std::uint64_t>            snap_next_ms_{0};
     // The last value published to C3's relay gate; see publish_tx_gate_().
     std::atomic<bool>                     tx_gate_{false};
+    // TXPOOL-RESUME-2: the gate decision (output set at the index tip; one
+    // complement round per opening). Verify thread; the mutex is belt and braces.
+    std::mutex                            gate_mu_;
+    TxRelayGateLatch                      gate_latch_;
+    // TXPOOL-RESUME: the warm latch (read by the native miner-data source),
+    // when the gate first opened (verify thread only), and why it warmed.
+    std::atomic<bool>                     pool_warm_{false};
+    std::uint64_t                         gate_open_ms_ = 0;
+    std::string                           warm_why_;        // rec_mu_
+    std::uint64_t                         warm_after_ms_ = 0;   // rec_mu_
     std::chrono::steady_clock::time_point epoch_ = std::chrono::steady_clock::now();
 
     mutable std::mutex        rec_mu_;
