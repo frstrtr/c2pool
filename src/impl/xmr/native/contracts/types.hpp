@@ -189,6 +189,7 @@ struct TemplateInputs {
         m.height        = height;
         m.prev_id       = prev_id;
         m.seed_hash     = seed_hash;
+        m.next_seed_hash = next_seed_hash;   // announce the next RandomX seed (lag window only)
         m.difficulty    = difficulty;
         m.median_weight = median_weight;
         m.already_generated_coins = already_generated_coins;
