@@ -44,8 +44,16 @@
 //               cross-side cuts are repaired from the SHADOW (the last
 //               reconstructed winner-side order, xmr_repair_replay.hpp) as the
 //               prefix -- the fix keeps working past one horizon of growth.
+//   H6 PAGE     (REPAIR-PAGE, capstone attempt 3) the repair asks the order in
+//               pages of <= repair_order_page_ids ids (here 4, growth capped
+//               at 4), the server serves one ORDER per page, and a page that
+//               advances the cursor restarts the Ordering clock: a 16-page
+//               order that outlasts repair_state_timeout_ms (2.5 s, the
+//               server's token bucket paces it) still completes. Base: one
+//               4096-id page (the ~160 KiB answer that never arrives in time
+//               on a 64 kbit/s link), RED.
 // The replay is the daemon's own RepairReplayer (relay_view), so the KAT runs
-// the code that books. RED on the base (H2..H5), GREEN on the fix.
+// the code that books. RED on the base (H2..H6), GREEN on the fix.
 // ===========================================================================
 #include <atomic>
 #include <chrono>
@@ -76,6 +84,20 @@ template <class N> static bool deep_of(N& n, u64 P, const bytes32& s, u64* a0) {
 }
 template <class S> static u64 rearm_of(const S& s) {
     if constexpr (requires { s.repair_horizon_rearm; }) return s.repair_horizon_rearm.load(); else return 0;
+}
+template <class O> static bool set_repair_page(O& o, u32 first, u32 max) {
+    if constexpr (requires { o.repair_order_page_ids; o.repair_order_page_max_ids; }) {
+        o.repair_order_page_ids = first; o.repair_order_page_max_ids = max; return true;
+    } else { (void)first; (void)max; return false; }
+}
+template <class S> static u64 repair_pages_of(const S& s) {
+    if constexpr (requires { s.repair_order_pages; }) return s.repair_order_pages.load(); else return 0;
+}
+template <class S> static u64 repair_page_max_of(const S& s) {
+    if constexpr (requires { s.repair_order_page_max; }) return s.repair_order_page_max.load(); else return ~u64{0};
+}
+template <class N> static u64 orders_served_of(N& n) {
+    if constexpr (requires { n.supplier(); }) return n.supplier() ? n.supplier()->stats().order_served : 0; else return 0;
 }
 template <class S> static u64 reoffer_unpushed_of(const S& s) {
     if constexpr (requires { s.reoffer_unpushed; }) return s.reoffer_unpushed.load(); else return 0;
@@ -396,6 +418,59 @@ int main() {
         C(closed && same && lateX == 0 && lateY == 0,
           "H4 both close bin 101 with the SAME 5 receipts: equal lane digests, 0 late (base: X's receipts never reach Y)");
         C(ro >= 5, "H4 reoffer_unpushed counted the " + std::to_string(ro) + " unpushed receipts re-offered (>= 5)");
+        X.relay->set_dialing(false); Y.relay->set_dialing(false);
+    }
+    // ── H6: REPAIR-PAGE -- small pages, and a page that advances the cursor
+    //        refreshes the Ordering clock ──────────────────────────────────
+    {
+        std::printf("-- H6: 60 common + stall 3 vs 2; Y repairs X's cut in pages of 4 ids, repair_state_timeout 2.5 s\n");
+        const u32 N0 = 60;
+        TNode X("X", opts(true, {}, 8640));
+        C(X.relay->start(why), "H6 X starts " + why);
+        RelayOptions yo = opts(false, {X.relay->listen_port()}, 8640);
+        const bool has_opt = set_repair_page(yo, 4, 4);
+        yo.repair_state_timeout_ms = 2500;
+        TNode Y("Y", yo);
+        C(Y.relay->start(why), "H6 Y starts " + why);
+        std::vector<TNode*> xy{&X, &Y};
+        C(wait_for([&] { return X.relay->ready_peers().size() == 1 && Y.relay->ready_peers().size() == 1; }, xy), "H6 X-Y up");
+        std::vector<bytes32> prev(8);
+        for (int i = 0; i < 8; ++i) prev[i] = b32_of(static_cast<u8>(150 + i));
+        const ::v37::ScriptRef pX = payee_of("X"), pY = payee_of("Y");
+        for (auto* n : xy) { for (int i = 0; i < 8; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
+        const SynthBlock b100 = make_block(100, prev[0], 150, nullptr, 2, 14);
+        for (u32 k = 0; k < N0; ++k) { const Admitted a = own(b100, 1000 + k, pX); X.relay->submit_own(a); Y.relay->submit_own(a); }
+        C(wait_for([&] { return X.relay->cache_size() == N0 && Y.relay->cache_size() == N0; }, xy), "H6 bin 100 on both");
+        for (auto* n : xy) n->template_height = 101;
+        C(wait_for([&] { return X.next_pos() == N0 && Y.next_pos() == N0; }, xy), "H6 bin 100 closed on both (60 pushes)");
+        Y.relay->set_dialing(false);
+        C(wait_for([&] { return Y.relay->ready_peers().empty() && X.relay->ready_peers().empty(); }, xy, 8000ms), "H6 relay stall");
+        const SynthBlock b101x = make_block(101, prev[1], 151, nullptr, 2, 15);
+        const SynthBlock b101y = make_block(101, prev[1], 152, nullptr, 2, 16);
+        for (u32 k = 0; k < 3; ++k) X.relay->submit_own(own(b101x, 2000 + k, pX));
+        for (u32 k = 0; k < 2; ++k) Y.relay->submit_own(own(b101y, 3000 + k, pY));
+        for (auto* n : xy) n->template_height = 102;
+        C(wait_for([&] { return X.next_pos() == N0 + 3 && Y.next_pos() == N0 + 2; }, xy), "H6 both close bin 101 without the other's receipts");
+        const u64 P = X.next_pos();
+        const bytes32 spineX = X.dig_at[P];
+        Y.relay->set_dialing(true);
+        C(wait_for([&] { return X.next_pos() == N0 + 5 && Y.next_pos() == N0 + 5; }, xy, 20000ms), "H6 heal (late tails)");
+        const u64 pages0 = repair_pages_of(Y.relay->stats()), served0 = orders_served_of(*X.relay);
+        const auto t0 = std::chrono::steady_clock::now();
+        const Outcome o = run_repair(X, Y, P, spineX, 25000ms);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        const u64 pages = repair_pages_of(Y.relay->stats()) - pages0, served = orders_served_of(*X.relay) - served0;
+        const u64 pmax = repair_page_max_of(Y.relay->stats());
+        std::printf("   H6: repair_order_page_ids option %s | Y repair pages=%llu largest page=%llu ids | X ORDER answers=%llu | ordering+fetch wall=%lld ms\n",
+                    has_opt ? "present" : "ABSENT", (unsigned long long)pages, (unsigned long long)pmax, (unsigned long long)served, (long long)ms);
+        C(has_opt, "H6 RelayOptions has repair_order_page_ids / repair_order_page_max_ids");
+        C(o.st == 1 && o.replay_ok, "H6 the paged repair is READY and its replay reproduces X's spine");
+        C(pages >= (P + 3) / 4 && pmax <= 4,
+          "H6 every repair GETORDER page asked <= repair_order_page_ids=4 ids (" + std::to_string(pages) + " pages for " + std::to_string(P) + " ids)");
+        C(served >= (P + 3) / 4, "H6 X answered the order in " + std::to_string(served) + " ORDER replies (base: 1 page of up to 4096 ids)");
+        C(o.st == 1 && ms > 2500,
+          "H6 the " + std::to_string(pages) + "-page order took " + std::to_string(ms) +
+          " ms > repair_state_timeout_ms 2500 and still completed: a page that advances the cursor refreshes the Ordering clock");
         X.relay->set_dialing(false); Y.relay->set_dialing(false);
     }
     return C.done("v37_xmr_relay_repair_horizon_kat");
