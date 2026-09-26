@@ -22,6 +22,13 @@
 #       explicit files (capstone: one log per host); --coinbases FILE = dump_coinbases.py output (optional)
 import argparse, collections, json, os, re, sys
 
+
+def _read_lines(path):
+    """Yield the lines of a text file and always close it."""
+    with open(path, errors="replace") as fh:
+        yield from fh
+
+
 ap = argparse.ArgumentParser()
 ap.add_argument("logdir", nargs="?")
 ap.add_argument("--node", action="append", default=[])
@@ -82,7 +89,7 @@ class NodeLog:
         s.minority = None; s.tipfeed = None; s.rcvote = None
         s.dconf = None; s.stale_rebooked = 0; s.rootref = {}
         tip = 0; last_reorg = None
-        for ln, line in enumerate(open(path, errors="replace"), 1):
+        for ln, line in enumerate(_read_lines(path), 1):
             if "D_conf=" in line and s.dconf is None:
                 m = RX["dconf"].search(line)
                 if m: s.dconf = int(m.group(1))
@@ -139,7 +146,7 @@ D = a.d_conf or next((L[n].dconf for n in N if L[n].dconf), None) or 10
 mon = {}
 for n, p in mons.items():
     depths, alts, cover = [], 0, collections.defaultdict(int)
-    for line in open(p, errors="replace"):
+    for line in _read_lines(p):
         m = MON_REORG.search(line)   # "REORGANIZE on height: <split> of <old top>": blocks split..top disconnected
         if m:
             x, y = int(m.group(1)), int(m.group(2)); d = y - x + 1; depths.append(d)
@@ -150,7 +157,7 @@ for n, p in mons.items():
 # canonical chain (optional): dump_coinbases.py output "h bid reward outs nout extra blob"
 canon = {}
 if a.coinbases and os.path.exists(a.coinbases):
-    for l in open(a.coinbases):
+    for l in _read_lines(a.coinbases):
         f = l.split()
         if len(f) >= 2 and f[0].isdigit(): canon[int(f[0])] = f[1][:12]
 found_bids = {}
@@ -248,5 +255,7 @@ report["summary"] = {"found": len(found_bids), "lane_canonical": lane_canon, "or
                      "monerod_max_depth": {n: mon[n]["max_depth"] for n in mon},
                      "stale_pending_rebooked": {n: L[n].stale_rebooked for n in N}}
 print("SUMMARY " + json.dumps(report["summary"], sort_keys=True))
-if a.json: json.dump(report, open(a.json, "w"), indent=1, default=str)
+if a.json:
+    with open(a.json, "w") as _fh:
+        json.dump(report, _fh, indent=1, default=str)
 sys.exit(2 if (nb or fb) else 0)

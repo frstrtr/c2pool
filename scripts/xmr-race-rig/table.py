@@ -6,7 +6,8 @@ print(f"{'run':<16} {'found':>5} {'lane':>5} {'orph':>5} {'maxdepth A/B/C (nativ
 for d in sys.argv[1:]:
     p = os.path.join(d, "classify.json")
     if not os.path.exists(p): print(f"{os.path.basename(d):<16} (no classify.json)"); continue
-    s = json.load(open(p))["summary"]
+    with open(p) as fh:
+        s = json.load(fh)["summary"]
     md = "/".join(str(s["max_depth"].get(n, "-")) for n in "ABC")
     rb = "/".join(str(s["stale_pending_rebooked"].get(n, "-")) for n in "ABC")
     print(f"{os.path.basename(d):<16} {s['found']:>5} {str(s['lane_canonical']):>5} {str(s['orphans']):>5} {md:>24} {s['shared_cursors']:>7} "
