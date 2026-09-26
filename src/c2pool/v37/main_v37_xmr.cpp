@@ -1957,6 +1957,49 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::fflush(stdout);
         return rv;
     };
+    // CUT-FLOOR (xmr_paynow.hpp, #1803 review): a lane block's committed credit cut
+    // must not regress below the cut of the lane blocks booked below it (chain
+    // order). Persisted next to the pending-FOUND sidecar, so a restarted node
+    // keeps the floor it booked; fc_ptr (set once FinalizeConnect exists) says
+    // whether a lower block is still undecided.
+    c2pool::v37n::xmr::paynow::LaneCutFloor cut_floor;
+    std::uint64_t cut_floor_refused = 0, cut_floor_waits = 0;
+    o2::FinalizeConnect* fc_ptr = nullptr;
+    const std::string cut_floor_path = fo.sidecar_path.empty() ? std::string() : fo.sidecar_path + ".cutfloor";
+    if (!cut_floor_path.empty()) {
+        std::ifstream in(cut_floor_path);
+        std::size_t bad = 0;
+        for (std::string ln; std::getline(in, ln);) if (!ln.empty() && !cut_floor.load_line(ln)) ++bad;
+        std::printf("cut-floor: %zu booked lane cut(s) restored from %s%s\n", cut_floor.size(), cut_floor_path.c_str(),
+                    bad ? (" (" + std::to_string(bad) + " malformed line(s) skipped)").c_str() : "");
+    }
+    // true = h may proceed. false + why: "cut-floor-refused: ..." (DECIDED, the R-C
+    // refuse path) or "cut-pending: ... CUT-FLOOR ..." (a lower lane block is still
+    // undecided: HELD like a relay repair, never refused). wait_lower=false for the
+    // D2 scratch re-derivation (it books its range in chain order itself).
+    auto cut_floor_gate = [&](std::uint64_t h, const std::string& bid, std::uint64_t P, std::string& why, bool wait_lower) -> bool {
+        if (!cut_floor.check(h, P, &why)) {
+            ++cut_floor_refused;
+            std::printf("cba-ALARM cut_floor_refused: h=%llu bid=%s… %s -- REFUSED (decided on every node; ledger-neutral)\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), why.c_str());
+            std::fflush(stdout);
+            return false;
+        }
+        if (wait_lower && fc_ptr)
+            for (const auto& [b, hh] : fc_ptr->retrying())
+                if (hh < h && b != bid) {
+                    ++cut_floor_waits;
+                    why = "cut-pending: CUT-FLOOR wait: the lower chain block " + b.substr(0, 12) + " h=" + std::to_string(hh) +
+                          " is undecided (its committed cut may raise the floor under P=" + std::to_string(P) + ")";
+                    return false;
+                }
+        return true;
+    };
+    auto cut_floor_note = [&](std::uint64_t h, const std::string& bid, std::uint64_t P) {
+        if (!cut_floor.note_booked(h, P, bid) || cut_floor_path.empty()) return;
+        std::ofstream out(cut_floor_path, std::ios::app);
+        out << c2pool::v37n::xmr::paynow::LaneCutFloor::line_of(h, P, bid);
+    };
     // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): book the block NET of what its coinbase
     // already paid each payee out of THIS block's E_b. A pure function of the on-chain
     // bytes (V37N base, outputs) and the fold at the on-chain cut: every node nets the
@@ -2249,6 +2292,9 @@ static int run_live(const XmrNodeConfig& cfg) {
     };
     fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
         Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
+        if (cut_floor.on_block_at(h, bid))   // CUT-FLOOR: a reorged-out lane block no longer bounds the cut
+            std::printf("cut-floor: the booked lane cut at h=%llu was reorged out (the chain now carries %s…)\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str());
         if (drops_live) { drops->clear_cut_price(); drops->clear_carried(); }   // ★ DROPS: never a neighbour's price / delta
         if (drops && !drops_live) {
             // ★ DROPS-RESTART (defect 3): under the flip no lane block is booked
@@ -2412,6 +2458,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // recon(A+B credit): the CREDIT side. AUTHORITY = the on-chain credit cut (B); FAST PATH = the v0x02 descriptor (A),
         // used only when it AGREES with the chain; on mismatch the chain wins; unreconstructable => fail-closed.
         if (!bk.has_credit_cut) { ++cut_absent; why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; ++cba_refused; return false; }
+        if (!cut_floor_gate(h, bid, bk.credit_cut.next_pos, why, true)) { if (why.rfind("cut-pending:", 0) != 0) ++cba_refused; return false; }   // CUT-FLOOR
         const char* credit_src = "chain";
         c2pool::v37n::settle::WorkPrice booking_price{};   // ★ DROPS: the price at the cut E_b comes from
         if (auto wit = wire_cache.find(bid); wit != wire_cache.end()) {
@@ -2538,6 +2585,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (drops_live) drops->set_cut_price(booking_price);
         ++cut_ok;
         ++cba_booked;
+        cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: this booked cut bounds every lane block above it
         last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " src=" + credit_src + " credit{ " + amounts_str(credit) + "}";
         std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
@@ -2602,6 +2650,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         payout = bk.payout; out.payout_decoded = true;
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); return false; }
         if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
+        if (!cut_floor_gate(h, bid, bk.credit_cut.next_pos, why, false)) return false;   // CUT-FLOOR: the same decided refusal
         if (!fold_at_cut(bk.total, bk.credit_cut, out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
         // ★ DROPS-RESTART (defect 3): the scratch lineage books the winner's carried
         // delta too (journalled; the adoption's re-drive books it by block id) --
@@ -2626,6 +2675,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
         }
         if (!paynow_net(h, bid, bk, out.credit, payout, why)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
+        cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: the adopted lineage's booked cut
         std::printf("converge-decode: h=%llu bid=%s… booked under the SCRATCH lineage (candidate #%zu) P=%llu credit{ %s} payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.digest_index,
                     static_cast<unsigned long long>(bk.credit_cut.next_pos), amounts_str(out.credit).c_str(), amounts_str(payout).c_str());
@@ -2778,6 +2828,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
     };
     o2::FinalizeConnect fc(node, cfg, found_q, fo);
+    fc_ptr = &fc;   // CUT-FLOOR: the booking gate reads which lower chain blocks are still undecided
     // R5: the candidate ring is fed PER LEDGER EVENT (every FOUND/ORPHAN/FINALIZE the driver
     // applies), not per tick: a tick that applies several seqs at once (book h47 + finalize
     // h44) skipped the intermediate owed_digest, and a peer block committed to exactly that
@@ -3338,7 +3389,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             // LaneParams geometry, shipped consensus version, authority 0;
             // map_epoch/rb_index/stripe 0), carried in HELLO; a peer of another
             // pool is refused at HELLO as TAG_MISMATCH.
-            ro.pool_id = relay::pool_id_of(cfg.lane_chain, cfg.lane_params);
+            // FLAG DAY (#1803): built with the XMR pool-rules version (kXmrPoolRulesVersion),
+            // so a pre-#1803 node is refused here as TAG_MISMATCH field=version.
+            ro.pool_id = relay::node_pool_id(cfg.lane_chain, cfg.lane_params);
             ro.pool_id->genesis = pool_genesis_of(cfg);   // POOL-LINEAGE: another genesis = TAG_MISMATCH field=pool_genesis
             // ★ DROPS-ENROL-TIDY (flip 1): the enrol-set digest rides HELLO next to the
             // genesis, so a peer with another --drops-enrol list is refused by name

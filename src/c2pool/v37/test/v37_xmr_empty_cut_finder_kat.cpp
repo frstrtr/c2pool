@@ -39,6 +39,12 @@
 //       minted on the base tree (fee ON and OFF).
 //   E6  the widest payload rbind + V37F + V37N + V37D + V37P + V37C = 220 B
 //       assembles and every field parses back.
+//   E7  CUT-FLOOR (#1803 review): three nodes book one lineage in chain order;
+//       the FIRST lane block (P=0, empty, V37F) pays its finder, a later block
+//       committing P below the previous lane block's P (P=0 + V37F: the
+//       reproducible empty-cut theft) is REFUSED on every node, a restarted
+//       node included; a refused block never lowers the floor; a reorg drops
+//       the orphan's cut. RED on 272cac0d (no floor: the theft books).
 //
 // RED on the base (PAY-NOW #1787 without this rule): the BASE branch builds
 // the same empty-cut blocks and the "finder is paid" checks FAIL with the
@@ -538,6 +544,106 @@ void suite_widest() {
     const auto shp = o2::inspect_kfair_coinbase(*t, a.settle.lane_commitment, 5);
     CHECK(shp.kfair_order, "the K_fair coinbase shape gate ACCEPTS the finder output: %s", shp.why.empty() ? "ok" : shp.why.c_str());
 }
+
+// ---------------------------------------------------------------------------
+// E7 CUT-FLOOR (#1803 review): three nodes book one lineage in chain order
+// the way main_v37_xmr does (floor gate -> empty-cut finder -> net booking);
+// node C restarts mid-chain from its persisted floor lines.
+struct FloorNode {
+#ifdef C2POOL_V37_XMR_CUT_FLOOR
+    pn::LaneCutFloor floor;
+#endif
+    std::string lines;   // what the node persisted
+};
+struct LaneBlk { std::uint64_t h; std::string bid; std::uint64_t P; bool finder; ::v37::ScriptRef who; bool work; };
+// true = booked (the finder credit written to *finder_credit); false + why = refused
+bool book_on(FloorNode& n, const LaneBlk& b, std::string& why, long long* finder_credit) {
+    const ::v37::bytes32 D = fee::donation_identity(kNet);
+    const std::uint64_t B = 1, pool = kReward - B;
+#ifdef C2POOL_V37_XMR_CUT_FLOOR
+    n.floor.on_block_at(b.h, b.bid);
+    if (!n.floor.check(b.h, b.P, &why)) return false;
+#endif
+    Amounts fold;   // the fold at the committed cut: EMPTY at P=0, work at the honest cuts
+    if (b.work) fold[id_of(ref_of(31))] = 7;
+    Amounts payout;
+    if (b.finder) payout[id_of(b.who)] = static_cast<long long>(pool);
+    const std::optional<::v37::ScriptRef> fnd = b.finder ? std::optional<::v37::ScriptRef>(b.who) : std::nullopt;
+    const std::optional<std::uint64_t> base = b.finder ? std::optional<std::uint64_t>(B) : std::nullopt;
+    if (!pn::apply_empty_cut_finder(fnd, false, base, kReward, fold, &why)) return false;
+    if (finder_credit) *finder_credit = fold.count(id_of(b.who)) ? fold.at(id_of(b.who)) : 0;
+    const auto r = pn::net_booking(base, kReward, fold, payout, b.finder ? 1 : 0, D, 1);
+    if (!r.ok) { why = r.why; return false; }
+#ifdef C2POOL_V37_XMR_CUT_FLOOR
+    if (n.floor.note_booked(b.h, b.P, b.bid)) n.lines += pn::LaneCutFloor::line_of(b.h, b.P, b.bid);
+#endif
+    return true;
+}
+void suite_cut_floor() {
+    std::printf("== E7. CUT-FLOOR: a lane block's cut never regresses below the previous lane block's ==\n");
+    const ::v37::ScriptRef F = finder_ref(), X = forger_ref();
+    const std::vector<LaneBlk> chain = {
+        {100, "b100", 0, true, F, false},    // the lineage's FIRST lane block: P = 0, empty cut, finder
+        {101, "b101", 40, false, F, true},   // honest: P = 40, the cut credits work
+        {102, "x102", 0, true, X, false},    // EXPLOIT: P = 0 (empty, reproducible) + V37F(forger)
+        {103, "x103", 0, true, X, false},    // again, right after its own refused block
+        {104, "x104", 39, true, X, false},   // one position below the floor
+        {105, "b105", 40, false, F, true},   // honest, equal to the floor
+        {106, "b106", 41, false, F, true},   // honest, above it
+    };
+    const std::vector<bool> want = {true, true, false, false, false, true, true};
+    FloorNode A, B, C;
+    std::vector<std::vector<bool>> got(3);
+    long long first_credit = -1, stolen = 0;
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        if (chain[i].h == 104) {   // node C restarts: a fresh floor from what it persisted
+            FloorNode C2; C2.lines = C.lines;
+#ifdef C2POOL_V37_XMR_CUT_FLOOR
+            std::size_t n = 0, pos = 0;
+            while (pos < C.lines.size()) { const auto e = C.lines.find('\n', pos); if (C2.floor.load_line(C.lines.substr(pos, e - pos))) ++n; pos = e + 1; }
+            CHECK(n == C.floor.size() && C2.floor.floor_below(104) == C.floor.floor_below(104),
+                  "node C restarts: %zu persisted floor line(s) restore floor %llu", n, (unsigned long long)C2.floor.floor_below(104).value_or(0));
+#endif
+            C = std::move(C2);
+        }
+        FloorNode* nodes[3] = {&A, &B, &C};
+        std::string w[3];
+        for (int k = 0; k < 3; ++k) {
+            long long fc = 0;
+            got[k].push_back(book_on(*nodes[k], chain[i], w[k], &fc));
+            if (k == 0 && chain[i].h == 100 && got[k].back()) first_credit = fc;
+            if (k == 0 && chain[i].bid[0] == 'x' && got[k].back()) stolen += fc;
+        }
+        std::printf("    h=%llu %s P=%llu%s -> A:%s B:%s C:%s %s\n", (unsigned long long)chain[i].h, chain[i].bid.c_str(),
+                    (unsigned long long)chain[i].P, chain[i].finder ? " V37F" : "", got[0].back() ? "BOOKED" : "REFUSED",
+                    got[1].back() ? "BOOKED" : "REFUSED", got[2].back() ? "BOOKED" : "REFUSED", w[0].c_str());
+    }
+    CHECK(got[0][0] && got[1][0] && got[2][0] && first_credit == static_cast<long long>(kReward - 1),
+          "an honest FIRST lane block with P=0 still pays its finder on every node (credit %lld = reward - 1)", first_credit);
+    CHECK(!got[0][2] && !got[1][2] && !got[2][2], "a lane block committing P=0 below the previous lane block's P=40 is REFUSED on every node");
+    CHECK(!got[0][3] && !got[1][3] && !got[2][3], "a second P=0 right after the refused one is REFUSED too (a refused block never lowers the floor)");
+    CHECK(!got[0][4] && !got[1][4] && !got[2][4], "P=39 below the floor 40 is REFUSED on every node, a restarted node included");
+    CHECK(stolen == 0, "the regressing finder claims credited %lld piconero to the forger (want 0)", stolen);
+    CHECK(got[0] == want && got[1] == want && got[2] == want, "every node takes the same decision on every block (honest P=40 / 41 at or above the floor BOOK)");
+#ifdef C2POOL_V37_XMR_CUT_FLOOR
+    {   // a reorg replaces h=106 by a block committing P=40: the orphan's P=41 no longer bounds it
+        std::string w;
+        const bool ok = book_on(A, LaneBlk{106, "b106r", 40, false, F, true}, w, nullptr);
+        CHECK(ok && A.floor.floor_below(107) == std::optional<std::uint64_t>(40),
+              "a reorg at h=106 drops the orphan's cut (41): the replacement at P=40 BOOKS, floor above it = 40 (%s)", w.c_str());
+    }
+    {   // the REAL empty-cut block: its committed P read from its own bytes
+        Built b(true, false, Cut::Empty, F);
+        const auto bk = b.ok ? decode(b, b.bytes.full_blob, true) : auth::CoinbaseBooking{};
+        pn::LaneCutFloor first, later;
+        later.note_booked(200, bk.credit_cut.next_pos + 1, "prev");
+        std::string w1, w2;
+        CHECK(bk.ok && bk.has_credit_cut && first.check(201, bk.credit_cut.next_pos, &w1) && !later.check(201, bk.credit_cut.next_pos, &w2),
+              "real empty-cut block (P=%llu from its V37C): books as the lineage's first, REFUSED over a booked P+1: %s",
+              (unsigned long long)bk.credit_cut.next_pos, w2.c_str());
+    }
+#endif
+}
 #else
 // ---------------------------------------------------------------------------
 void suite_base() {
@@ -581,6 +687,7 @@ int main() {
     suite_blocks();
     suite_nonempty_unchanged();
     suite_widest();
+    suite_cut_floor();
 #else
     suite_base();
     suite_nonempty_unchanged();

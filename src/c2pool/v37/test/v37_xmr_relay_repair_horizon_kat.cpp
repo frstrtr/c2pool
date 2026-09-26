@@ -52,6 +52,14 @@
 //               server's token bucket paces it) still completes. Base: one
 //               4096-id page (the ~160 KiB answer that never arrives in time
 //               on a 64 kbit/s link), RED.
+//   H6b THIN    (#1808 review) the same server answering 1 id per page (inside
+//               the request timeout) against 4 asked: a non-final page with
+//               < min(asked, remaining)/2 ids does not refresh the Ordering
+//               clock, so the peer is set aside after ~repair_state_timeout
+//               instead of holding the repair for (P - a0) x the page time;
+//               back on full pages the repair completes. H6c: the refresh rule
+//               and the per-peer cap timeout x (1 + ceil((P - a0)/page)).
+//               RED on 272cac0d (every 1-id page refreshed the clock).
 // The replay is the daemon's own RepairReplayer (relay_view), so the KAT runs
 // the code that books. RED on the base (H2..H6), GREEN on the fix.
 // ===========================================================================
@@ -98,6 +106,25 @@ template <class S> static u64 repair_page_max_of(const S& s) {
 }
 template <class N> static u64 orders_served_of(N& n) {
     if constexpr (requires { n.supplier(); }) return n.supplier() ? n.supplier()->stats().order_served : 0; else return 0;
+}
+template <class S> static u64 repair_thin_of(const S& s) {
+    if constexpr (requires { s.repair_order_thin; }) return s.repair_order_thin.load(); else return 0;
+}
+template <class N> static constexpr bool repair_rules_present() {
+    return requires { N::repair_page_refreshes(u64{}, u64{}, u64{}, bool{}); N::repair_order_cap(std::chrono::milliseconds{}, u64{}, u64{}); };
+}
+template <class RN> static void check_repair_rules(Checker& C) {
+    if constexpr (repair_rules_present<RN>()) {
+        C(!RN::repair_page_refreshes(1, 4, 60, false) && RN::repair_page_refreshes(2, 4, 60, false) &&
+          RN::repair_page_refreshes(1, 4, 1, true) && RN::repair_page_refreshes(4096, 4096, 8640, false) &&
+          !RN::repair_page_refreshes(2047, 4096, 8640, false) && RN::repair_page_refreshes(1, 256, 3, false),
+          "H6c a non-final page refreshes only with >= min(asked, remaining)/2 ids; the final page always");
+        C(RN::repair_order_cap(std::chrono::milliseconds(20000), 8640, 256) == std::chrono::milliseconds(20000 * 35) &&
+          RN::repair_order_cap(std::chrono::milliseconds(2500), 64, 4) == std::chrono::milliseconds(2500 * 17),
+          "H6c the per-peer Ordering cap = timeout x (1 + ceil((P - a0) / page)): 20 s + 20 s x 34 = 700 s at 8640 / 256 ids");
+    } else {
+        (void)C;
+    }
 }
 template <class S> static u64 reoffer_unpushed_of(const S& s) {
     if constexpr (requires { s.reoffer_unpushed; }) return s.reoffer_unpushed.load(); else return 0;
@@ -471,6 +498,53 @@ int main() {
         C(o.st == 1 && ms > 2500,
           "H6 the " + std::to_string(pages) + "-page order took " + std::to_string(ms) +
           " ms > repair_state_timeout_ms 2500 and still completed: a page that advances the cursor refreshes the Ordering clock");
+
+        // ── H6b (#1808 review): a THIN server -- 1 id per page (inside the
+        //    request timeout) against Y's 4-id pages -- must not hold the
+        //    repair: pre-fix every such page refreshed the Ordering clock, so it
+        //    held the repair for (P - a0) x the page time. A cut Y has not
+        //    repaired yet: X's digest at P+1.
+        {
+            const u64 P2 = P + 1;
+            const bytes32 sp2 = X.dig_at[P2];
+            auto so = X.relay->supplier()->options();
+            const auto so0 = so;
+            so.max_ids_per_order = 1;
+            X.relay->supplier()->set_options(so);
+            const u64 thin0 = repair_thin_of(Y.relay->stats());
+            std::vector<bytes32> ids2;
+            long long streak = 0, longest = 0;
+            bool ordering = false, ready2 = false;
+            auto t_on = std::chrono::steady_clock::now();
+            const auto t1 = std::chrono::steady_clock::now();
+            std::string last;
+            wait_for([&] {
+                ready2 = Y.relay->repair_poll(P2, sp2, 0, &ids2) == XmrRelayNode::RepairState::Ready;
+                const std::string stt = Y.relay->repair_status(P2, sp2);
+                const bool ord = stt.rfind("ordering from peer", 0) == 0;
+                const auto now = std::chrono::steady_clock::now();
+                if (ord && !ordering) t_on = now;
+                if (ord) { streak = std::chrono::duration_cast<std::chrono::milliseconds>(now - t_on).count(); longest = std::max(longest, streak); last = stt; }
+                ordering = ord;
+                return ready2;
+            }, xy, 12000ms);
+            const long long wall = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t1).count();
+            const u64 thin = repair_thin_of(Y.relay->stats()) - thin0;
+            std::printf("   H6b thin server (1 id/page vs 4 asked): longest continuous Ordering of X %lld ms in a %lld ms window, "
+                        "thin pages %llu, ready=%d | last: %s\n", longest, wall, (unsigned long long)thin, ready2 ? 1 : 0, last.c_str());
+            C(!ready2 && longest > 0 && longest <= 2500 + 1500,
+              "H6b a 1-id-per-page server does NOT keep the repair alive: X is set aside after " + std::to_string(longest) +
+              " ms of thin pages (<= repair_state_timeout 2500 ms + slack; base: every 1-id page refreshed the clock, " +
+              "(P - a0) x page time ~ " + std::to_string(P2 / 2) + " s)");
+            C(thin > 0, "H6b the thin pages are counted (repair_order_thin=" + std::to_string(thin) + ")");
+            // the same server back on full pages: the repair of that cut completes
+            X.relay->supplier()->set_options(so0);
+            const bool done = wait_for([&] { return Y.relay->repair_poll(P2, sp2, 0, &ids2) == XmrRelayNode::RepairState::Ready; }, xy, 25000ms);
+            C(done, "H6b with full pages again the repair of P=" + std::to_string(P2) + " completes");
+        }
+        // the cap and the refresh rule, as the relay computes them
+        C(repair_rules_present<XmrRelayNode>(), "H6c XmrRelayNode::repair_page_refreshes / repair_order_cap present");
+        check_repair_rules<XmrRelayNode>(C);
         X.relay->set_dialing(false); Y.relay->set_dialing(false);
     }
     return C.done("v37_xmr_relay_repair_horizon_kat");

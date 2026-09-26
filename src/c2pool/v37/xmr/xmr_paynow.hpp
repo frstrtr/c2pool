@@ -290,4 +290,90 @@ inline NetResult net_booking(const std::optional<std::uint64_t>& base, std::uint
     return r;
 }
 
+// ===========================================================================
+// CUT-FLOOR (#1803 review, economic HIGH). apply_empty_cut_finder checks only
+// that the fold at the block's OWN committed cut is empty; nothing tied that
+// cut to recency, so a modified builder could commit P = 0 (reproducible, an
+// empty credit) plus V37F and take the reward minus the fixed outputs. The
+// rule: a lane block's committed credit cut P (V37C) must not regress below
+// the P committed by the previous lane block of the same pool lineage (V37P)
+// booked in chain order. A regressing cut is a DECIDED refusal (the R-C
+// refuse path: ledger-neutral, node-local liability, identical on every
+// node). The empty-cut finder rule then pays only where the cut is
+// legitimately empty: P == 0 for the lineage's first lane block (nothing
+// booked below it), or a cut at/above the floor that credits nobody.
+//
+// Determinism: the floor is the max P over the lane blocks BOOKED at heights
+// below h. It only grows as lower blocks book, so a refusal read against it
+// is final; a pass is final once every lane block below h is decided, so the
+// caller keeps h UNDECIDED (held, never refused) while a lower lane block is
+// still retried / held. Honest blocks: a builder commits its lane tip, which
+// does not regress below a block buried under it, so flip 0 stays
+// byte-identical and books identically for every honest block.
+// ===========================================================================
+#define C2POOL_V37_XMR_CUT_FLOOR 1   // feature probe for KATs built on both trees
+
+class LaneCutFloor {
+public:
+    struct Entry { std::uint64_t P = 0; std::string bid; };
+    // The highest committed P among the lane blocks booked below height h
+    // (its height in *at_h). nullopt: nothing booked below h.
+    std::optional<std::uint64_t> floor_below(std::uint64_t h, std::uint64_t* at_h = nullptr) const {
+        std::optional<std::uint64_t> best;
+        for (auto it = m_booked.begin(); it != m_booked.end() && it->first < h; ++it)
+            if (!best || it->second.P >= *best) { best = it->second.P; if (at_h) *at_h = it->first; }
+        return best;
+    }
+    // true = the cut does not regress; false (+ *why) = REFUSED, decided.
+    bool check(std::uint64_t h, std::uint64_t P, std::string* why = nullptr) const {
+        std::uint64_t fh = 0;
+        const auto f = floor_below(h, &fh);
+        if (!f || P >= *f) return true;
+        if (why)
+            *why = "cut-floor-refused: the committed credit cut P=" + std::to_string(P) + " regresses below P=" +
+                   std::to_string(*f) + " committed by the lane block booked at h=" + std::to_string(fh) +
+                   " (a lane block's cut must not regress below the previous lane block of its lineage)";
+        return false;
+    }
+    // A booked lane block. false = already recorded (the same bid and P).
+    bool note_booked(std::uint64_t h, std::uint64_t P, const std::string& bid) {
+        auto it = m_booked.find(h);
+        if (it != m_booked.end() && it->second.bid == bid && it->second.P == P) return false;
+        m_booked[h] = Entry{P, bid};
+        return true;
+    }
+    // The chain's block at height h is `bid`: an entry of ANOTHER block at h
+    // was reorged out and bounds nothing any more. true = one was dropped.
+    bool on_block_at(std::uint64_t h, const std::string& bid) {
+        auto it = m_booked.find(h);
+        if (it == m_booked.end() || it->second.bid == bid) return false;
+        m_booked.erase(it);
+        return true;
+    }
+    std::size_t size() const { return m_booked.size(); }
+    // Persistence: one "h P bid" line per booked lane block, appended; on load
+    // the last line of a height wins and a line that does not parse is skipped.
+    static std::string line_of(std::uint64_t h, std::uint64_t P, const std::string& bid) {
+        return std::to_string(h) + " " + std::to_string(P) + " " + bid + "\n";
+    }
+    bool load_line(const std::string& ln) {
+        std::uint64_t v[2] = {0, 0};
+        std::size_t i = 0;
+        for (auto& x : v) {
+            const std::size_t b = i;
+            while (i < ln.size() && ln[i] >= '0' && ln[i] <= '9' && i - b < 19) x = x * 10 + static_cast<std::uint64_t>(ln[i++] - '0');
+            if (i == b || i >= ln.size() || ln[i] != ' ') return false;
+            ++i;
+        }
+        std::string bid = ln.substr(i);
+        while (!bid.empty() && (bid.back() == '\n' || bid.back() == '\r')) bid.pop_back();
+        if (bid.empty() || bid.find(' ') != std::string::npos) return false;
+        m_booked[v[0]] = Entry{v[1], bid};
+        return true;
+    }
+
+private:
+    std::map<std::uint64_t, Entry> m_booked;   // height -> the booked lane block's committed P
+};
+
 } // namespace c2pool::v37n::xmr::paynow
