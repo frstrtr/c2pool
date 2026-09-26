@@ -86,8 +86,36 @@
 // fetches what is missing and answers complete only when this node holds every
 // raindrop every ready peer holds there (the composition HOLDs until then).
 //
+// REPAIR HORIZON (REPAIR-HORIZON, capstone 09-26): a peer's frame vault keeps
+// only the last horizon_positions (8640) lane positions and answers a GETORDER
+// whose start predates that with BELOW_HORIZON. The repair used to ask [0, P)
+// only and set such a peer aside, so once the lane was longer than the horizon
+// EVERY peer refused and the repair was Exhausted forever (the non-winner side
+// HELD every cross-side block). Now a BELOW_HORIZON answer raises the repair's
+// start for THAT peer to its lowest_retained a0 (never lowered, never past P)
+// and re-asks it instead of setting it aside: first a zero-length PREFIX PROBE
+// GETORDER [a0, a0) whose spine answer is the peer's digest at a0, compared
+// with ours -- equal (or unknown) -> GETORDER [a0, P) and the caller replays
+// its OWN order over [0, a0) followed by the served [a0, P) (repair_a0()); the
+// digest gate at P decides exactly as before. The caller may instead replay
+// the last winner-side order it reconstructed (the SHADOW,
+// xmr_repair_replay.hpp) as that prefix and registers its digests
+// (note_alt_digests) so the probe accepts them too: lane orders never
+// re-converge after a divergence, so the shadow CHAINS the winner-side order
+// from repair to repair past the horizon. A peer whose digest at a0 DIFFERS
+// from ours and the shadow's (or whose [a0, P) replay reaches the spine from
+// neither) proves
+// the divergence lies below its horizon: that peer is set aside as DEEP and,
+// when every ready peer is, the repair reports a loud DEEP-DIVERGENCE status
+// (repair_deep_divergence()) instead of a silent "none serves" -- still
+// undecided (never a refusal on a timeout; the caller holds and alarms).
+//
 // BACKFILL on (re)connect: the sender RE-OFFERS its last --relay-reoffer-seconds
-// of admitted receipts; the receiver asks GETORDER over the peer's last
+// of admitted receipts PLUS every admitted receipt its lane has not pushed yet
+// (the canonical ingest holds an OPEN bin's receipts unpushed, so neither the
+// 60 s window nor the receiver's GETORDER backfill reached a bin that stayed
+// open across a relay stall -- they arrived only as 'late' after a later
+// reconnect); the receiver asks GETORDER over the peer's last
 // --relay-backfill-positions lane positions and GETFRAMES for every id it has
 // never seen (verified exactly like a flood, under the separate solicited
 // RandomX credit).
@@ -280,6 +308,12 @@ struct RelayStats {
     std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
     std::atomic<u64> drops_fetch_tx{0}, drops_ids_asked{0}, drops_fetchreq_rx{0}, drops_served{0}, drops_backfilled{0};
     std::atomic<u64> drops_sync_calls{0}, drops_sync_pending{0}, drops_sync_complete{0}, drops_peer_setaside{0};
+    // REPAIR-HORIZON: BELOW_HORIZON answers that raised a repair's start and
+    // re-asked (instead of setting the peer aside); prefix probes whose digest
+    // at a0 matched ours / was unknown there; peers proven DEEP (divergence
+    // below their horizon); receipts re-offered on HELLO because still unpushed.
+    std::atomic<u64> repair_horizon_rearm{0}, repair_prefix_ok{0}, repair_prefix_unknown{0}, repair_deep{0};
+    std::atomic<u64> reoffer_unpushed{0};
 };
 
 // ★ RAIN-BACKFILL: the composition's view of one interval range.
@@ -384,6 +418,7 @@ public:
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_cache.count(a.id)) { m_st.dup++; return; }
             cache_put_locked(a);
+            unpushed_note_locked(a.id);
             m_inflight.erase(a.id);
         }
         m_st.admitted_own++;
@@ -527,11 +562,33 @@ public:
     void on_pushed(const bytes32& id, u64 pos_first, u32 n_pushes, const std::vector<u8>& raw,
                    u64 next_after, const bytes32& digest_after) {
         (void)m_vault.insert(m_o.chain, id, pos_first, n_pushes, raw);
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_unpushed.erase(id);   // REPAIR-HORIZON: in the lane now -> the GETORDER backfill covers it
+        }
         std::lock_guard<std::mutex> lk(m_dmtx);
         m_pos_digest[next_after] = digest_after;
         const u64 horizon = m_o.vault.horizon_positions ? m_o.vault.horizon_positions : 8640;
         while (!m_pos_digest.empty() && m_pos_digest.begin()->first + horizon + 1 < next_after)
             m_pos_digest.erase(m_pos_digest.begin());
+    }
+    // REPAIR-HORIZON: the digests of the last winner-side order this node
+    // reconstructed (RepairReplayer's SHADOW, xmr_repair_replay.hpp) -- a
+    // prefix probe also accepts a peer whose digest at a0 equals one of these,
+    // so the winner-side order chains from repair to repair past the horizon.
+    void note_alt_digests(const std::multimap<u64, bytes32>& d) {
+        std::lock_guard<std::mutex> lk(m_dmtx);
+        m_alt_digest = d;
+    }
+    bool alt_digest_is(u64 pos, const bytes32& d) const {
+        std::lock_guard<std::mutex> lk(m_dmtx);
+        auto [b, e] = m_alt_digest.equal_range(pos);
+        for (auto it = b; it != e; ++it) if (it->second == d) return true;
+        return false;
+    }
+    bool alt_digest_known(u64 pos) const {
+        std::lock_guard<std::mutex> lk(m_dmtx);
+        return m_alt_digest.count(pos) != 0;
     }
     // Our recorded lane digest at position `pos` (the spine probe's answer).
     std::optional<bytes32> digest_at(u64 pos) const {
@@ -636,8 +693,9 @@ public:
 
     // ── REPAIR: the winner-side order over [0, P) whose digest at P is `spine`
     // Pending = in flight (the caller answers cut-pending and retries);
-    // Ready = `ids` (P of them, in the serving peer's lane order) are all in the
-    // verified cache; Exhausted = every connected peer was asked and none could
+    // Ready = `ids` (the positions [repair_a0(), P), in the serving peer's lane
+    // order; repair_a0() == 0 unless a peer's vault horizon forced a suffix) are
+    // all in the verified cache; Exhausted = every connected peer was asked and none could
     // serve it (the caller keeps retrying; a new peer or a new tip may fix it).
     RepairState repair_poll(u64 P, const bytes32& spine, PeerId hint, std::vector<bytes32>* ids) {
         std::unique_lock<std::mutex> lk(m_rmtx);
@@ -684,11 +742,40 @@ public:
         auto it = m_repairs.find(std::make_pair(P, spine));
         if (it == m_repairs.end()) return;
         Repair& r = it->second;
-        if (r.served_by) r.tried.insert(r.served_by);
+        if (r.served_by) {
+            r.tried.insert(r.served_by);
+            // REPAIR-HORIZON: a suffix order [a0, P) the peer asserted reaches the
+            // spine, replayed after OUR [0, a0), did not: our prefix differs.
+            if (r.a0) { r.deep[r.served_by] = r.a0; m_st.repair_deep++; }
+        }
         r.reset();
         m_st.repair_rejected++;
     }
     std::size_t repairs_open() const { std::lock_guard<std::mutex> lk(m_rmtx); return m_repairs.size(); }
+    // REPAIR-HORIZON: the first lane position the Ready order covers. 0 = the
+    // whole order [0, P) (ids = P positions); a0 > 0 = the serving peer's vault
+    // horizon: ids cover [a0, P) and the caller replays its OWN first a0 lane
+    // pushes before them (the peer's digest at a0 matched ours, or was unknown;
+    // the digest gate at P decides either way).
+    u64 repair_a0(u64 P, const bytes32& spine, std::optional<bytes32>* peer_digest_at_a0 = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_rmtx);
+        auto it = m_repairs.find(std::make_pair(P, spine));
+        if (it == m_repairs.end() || it->second.st == Repair::St::Idle) return 0;
+        if (peer_digest_at_a0 && it->second.has_a0_digest) *peer_digest_at_a0 = it->second.a0_digest;
+        return it->second.a0;
+    }
+    // REPAIR-HORIZON: every ready peer was tried and at least one of them
+    // proved (prefix probe or a failed [a0, P) replay) that our order diverges
+    // from the winner's BELOW its vault horizon -- no connected peer can serve
+    // the repair. `a0` = the lowest such horizon. Undecided (the caller HOLDS
+    // and alarms); a peer with a longer vault, or a new peer, may still serve.
+    bool repair_deep_divergence(u64 P, const bytes32& spine, u64* a0 = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_rmtx);
+        auto it = m_repairs.find(std::make_pair(P, spine));
+        if (it == m_repairs.end() || it->second.deep.empty() || !(it->second.st == Repair::St::Idle && it->second.exhausted)) return false;
+        if (a0) { u64 lo = ~0ull; for (const auto& [p, v] : it->second.deep) { (void)p; lo = std::min(lo, v); } *a0 = lo; }
+        return true;
+    }
 
     // What a repair is waiting on, in words (the caller's cut-pending reason, so
     // a stall that reaches the booking retry bound names its stuck stage).
@@ -705,9 +792,18 @@ public:
                 case Repair::St::Idle:
                     s = r.exhausted ? "idle: every ready peer tried (" + std::to_string(r.tried.size()) + "), none serves an order reaching this spine"
                                     : "idle: waiting for a ready peer";
+                    if (!r.deep.empty()) {   // REPAIR-HORIZON: the loud, named outcome
+                        s += "; DEEP-DIVERGENCE: our lane order differs from the winner's BELOW the vault horizon of " +
+                             std::to_string(r.deep.size()) + " peer(s) (";
+                        bool first = true;
+                        for (const auto& [p, a] : r.deep) { s += (first ? "" : ", ") + std::string("peer ") + std::to_string(p) + " a0=" + std::to_string(a); first = false; }
+                        s += ") -- no connected peer retains the divergent positions";
+                    }
                     break;
                 case Repair::St::Ordering:
-                    s = "ordering from peer " + std::to_string(r.cur) + " (" + std::to_string(r.cursor) + "/" + std::to_string(P) + " ids, " + age(r.since) + ")";
+                    s = std::string(r.probing ? "probing the prefix digest at a0=" + std::to_string(r.a0) + " of peer " : "ordering from peer ") +
+                        std::to_string(r.cur) + " (" + std::to_string(r.cursor) + "/" + std::to_string(P) + " ids" +
+                        (r.a0 ? ", from a0=" + std::to_string(r.a0) : std::string()) + ", " + age(r.since) + ")";
                     break;
                 case Repair::St::Ready: s = "ready"; break;
                 case Repair::St::Fetching: {
@@ -718,7 +814,8 @@ public:
                         ++missing;
                         if (m_inflight.count(id)) ++verifying; else idle_ids.push_back(id);
                     }
-                    s = "fetching: " + std::to_string(missing) + "/" + std::to_string(r.ids.size()) + " receipts missing (" +
+                    s = "fetching: " + std::to_string(missing) + "/" + std::to_string(r.ids.size()) + " receipts missing" +
+                        (r.a0 ? " of [" + std::to_string(r.a0) + "," + std::to_string(P) + ")" : std::string()) + " (" +
                         std::to_string(verifying) + " in verify, " + std::to_string(idle_ids.size()) + " to re-ask; order from peer " +
                         std::to_string(r.served_by) + ", refetches=" + std::to_string(r.refetches) + ", last progress " + age(r.last_progress) + " ago)";
                     break;
@@ -805,7 +902,7 @@ public:
 
     std::string describe() const {
         const auto& s = m_st;
-        char b[2000];
+        char b[2400];
         std::snprintf(b, sizeof b,
             "relay: conns=%zu ready=%zu hello ok=%llu rej=%llu tmo=%llu | rx recv=%llu dup=%llu struct=%llu "
             "rx_evals=%llu valid=%llu invalid=%llu deferred=%llu unavail=%llu bans=%llu unresolved=%llu expired=%llu qdrop=%llu | "
@@ -813,7 +910,8 @@ public:
             "won tx=%llu rx=%llu | repair start=%llu order_ok=%llu spine_mis=%llu peer_fail=%llu ids=%llu ready=%llu rejected=%llu open=%zu | "
             "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu | "
             "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
-            "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu",
+            "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu | "
+            "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu",
             m_net.n_peers(), ready_peers().size(),
             (unsigned long long)s.hello_ok.load(), (unsigned long long)s.hello_rejected.load(), (unsigned long long)s.hello_timeout.load(),
             (unsigned long long)s.rx_receipts.load(), (unsigned long long)s.dup.load(), (unsigned long long)s.structural.load(),
@@ -837,7 +935,10 @@ public:
             (unsigned long long)s.ctx_served.load(), (unsigned long long)s.ctx_unknown_tx.load(),
             (unsigned long long)s.repair_refetch.load(), (unsigned long long)s.repair_evicted.load(),
             (unsigned long long)s.upgraded_solicited.load(), (unsigned long long)s.unresolved_solicited_dropped.load(),
-            (unsigned long long)s.hello_tag_mismatch.load());
+            (unsigned long long)s.hello_tag_mismatch.load(),
+            (unsigned long long)s.repair_horizon_rearm.load(), (unsigned long long)s.repair_prefix_ok.load(),
+            (unsigned long long)s.repair_prefix_unknown.load(), (unsigned long long)s.repair_deep.load(),
+            (unsigned long long)s.reoffer_unpushed.load());
         return b;
     }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
@@ -917,6 +1018,7 @@ private:
         u64 a = 0, p = 0;
         bytes32 spine{};
         std::vector<bytes32> ids;
+        bool probe = false;   // REPAIR-HORIZON: the zero-length prefix probe GETORDER [a0, a0)
     };
     struct Repair {
         enum class St { Idle, Ordering, Fetching, Ready } st = St::Idle;
@@ -926,6 +1028,16 @@ private:
         std::vector<bytes32> ids;
         u64 cursor = 0;
         bool exhausted = false;
+        // REPAIR-HORIZON: per-peer start (that peer's vault lowest_retained, 0 =
+        // the whole order), the start of the order in flight / served, whether
+        // the in-flight ask is the prefix probe, the peer whose BELOW_HORIZON
+        // answer re-armed the repair (not set aside), and the peers proven DEEP.
+        std::map<PeerId, u64> a0_of;
+        u64 a0 = 0;
+        bool probing = false;
+        bytes32 a0_digest{}; bool has_a0_digest = false;   // the serving peer's digest at a0 (probe answer)
+        PeerId rearm = 0, prefer = 0;
+        std::map<PeerId, u64> deep;
         Clock::time_point since = Clock::now();
         // Fetching: progress + refetch bookkeeping
         Clock::time_point last_progress = Clock::now(), last_fetch = Clock::now(), polled = Clock::now();
@@ -934,6 +1046,7 @@ private:
         u32 refetches = 0;
         void reset() {
             st = St::Idle; ids.clear(); cursor = 0; cur = 0; served_by = 0; since = Clock::now();
+            a0 = 0; probing = false; has_a0_digest = false;
             cached_seen = 0; fetch_tried.clear(); refetches = 0;
         }
     };
@@ -967,6 +1080,19 @@ private:
         return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
     }
     void log(const std::string& s) { if (m_log) m_log(s); }
+
+    // REPAIR-HORIZON (open bin): admitted receipts not yet pushed into our lane
+    // (bounded FIFO; on_pushed erases). Guarded by m_mtx.
+    static constexpr std::size_t kUnpushedMax = 8192;
+    void unpushed_note_locked(const bytes32& id) {
+        if (!m_unpushed.insert(id).second) return;
+        m_unpushed_order.push_back(id);
+        while (m_unpushed_order.size() > kUnpushedMax ||
+               (!m_unpushed_order.empty() && !m_unpushed.count(m_unpushed_order.front()))) {
+            m_unpushed.erase(m_unpushed_order.front());
+            m_unpushed_order.pop_front();
+        }
+    }
 
     void cache_put_locked(const Admitted& a) {
         CacheEntry e; e.payee = a.r.payee; e.raw = a.raw; e.bin = a.bin; e.give_author = a.r.side.give_author;
@@ -1193,10 +1319,25 @@ private:
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             const auto horizon = std::chrono::seconds(m_o.reoffer_seconds);
+            std::unordered_set<bytes32, Bytes32Hash> sent;
             for (const auto& [t, id] : m_recent) {
                 if (Clock::now() - t > horizon) continue;
                 auto it = m_cache.find(id);
-                if (it != m_cache.end()) raws.push_back(it->second.raw);
+                if (it != m_cache.end() && sent.insert(id).second) raws.push_back(it->second.raw);
+            }
+            // REPAIR-HORIZON (open bin): every admitted receipt our lane has not
+            // pushed yet -- an OPEN bin's receipts, however old -- is invisible to
+            // the peer's GETORDER backfill (it covers pushed positions only) and,
+            // past reoffer_seconds, to the window above: re-offer it too, so a bin
+            // that stayed open across a relay stall closes with the same set on
+            // both sides instead of recovering the missing receipts only 'late'.
+            for (const auto& id : m_unpushed_order) {
+                if (!m_unpushed.count(id) || sent.count(id)) continue;
+                auto it = m_cache.find(id);
+                if (it == m_cache.end()) continue;
+                sent.insert(id);
+                raws.push_back(it->second.raw);
+                m_st.reoffer_unpushed++;
             }
         }
         for (std::size_t i = 0; i < raws.size(); i += kFbMaxReceiptsPerFrame) {
@@ -1669,6 +1810,7 @@ private:
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_cache.count(a.id)) { m_inflight.erase(a.id); m_st.dup++; return; }
             cache_put_locked(a);
+            unpushed_note_locked(a.id);
             m_inflight.erase(a.id);
         }
         if (it.solicited) m_st.admitted_solicited++; else m_st.admitted_foreign++;
@@ -1851,6 +1993,34 @@ private:
         // refusal, and reports it through on_fail right after. This relay
         // treats a refused order as a failed ask of this peer, exactly as
         // before: leave the job for on_fetch_fail and touch nothing here.
+        //
+        // REPAIR-HORIZON: except BELOW_HORIZON on a repair ask. The peer said
+        // where its vault starts (lowest_retained); if that is past what we
+        // asked and short of P, raise this peer's repair start to it and mark
+        // the repair RE-ARMED, so on_fetch_fail (which follows) re-asks this
+        // peer from there instead of setting it aside. No progress (the same
+        // or a lower start, or one at/after P) keeps the old set-aside rule.
+        if (o.status == CtrlOrderStatus::BELOW_HORIZON) {
+            std::optional<Job> cj;
+            {
+                std::lock_guard<std::mutex> jl(m_jmtx);
+                auto it = m_cur_job.find(p);
+                if (it != m_cur_job.end()) cj = it->second;
+            }
+            if (cj && cj->repair && cj->kind == Job::Kind::Order) {
+                std::lock_guard<std::mutex> lk(m_rmtx);
+                auto it = m_repairs.find(cj->key);
+                if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p) {
+                    Repair& r = it->second;
+                    const u64 was = r.a0_of.count(p) ? r.a0_of[p] : 0;
+                    if (o.lowest_retained > was && o.lowest_retained > cj->a && o.lowest_retained < r.P) {
+                        r.a0_of[p] = o.lowest_retained;
+                        r.rearm = p;
+                        m_st.repair_horizon_rearm++;
+                    }
+                }
+            }
+        }
         if (o.status != CtrlOrderStatus::OK) return;
         auto j = take_cur_job(p);
         if (!j || j->kind != Job::Kind::Order) return;
@@ -1874,6 +2044,41 @@ private:
             return;
         }
         // REPAIR
+        if (j->probe) {   // REPAIR-HORIZON: the peer's digest at a0 vs ours
+            const auto ours = digest_at(j->a);
+            const bool alt_known = alt_digest_known(j->a);   // the shadows (reconstructed winner-side orders)
+            const bool alt_eq = o.have_spine && alt_digest_is(j->a, o.spine_digest);
+            bool go = false; std::string alarm;
+            {
+                std::lock_guard<std::mutex> lk(m_rmtx);
+                auto it = m_repairs.find(j->key);
+                if (it == m_repairs.end()) return;
+                Repair& r = it->second;
+                if (r.st != Repair::St::Ordering || r.cur != p || !r.probing || r.a0 != j->a) return;
+                r.probing = false;
+                if (o.p_served == j->a && o.have_spine && (ours || alt_known) && !(ours && o.spine_digest == *ours) && !alt_eq) {
+                    const bool fresh = r.deep.emplace(p, j->a).second;   // log a peer's DEEP once per repair
+                    r.deep[p] = j->a;
+                    m_st.repair_deep++;
+                    r.tried.insert(p); r.reset();
+                    if (fresh) alarm = "relay: REPAIR-HORIZON repair of P=" + std::to_string(r.P) + ": peer " + std::to_string(p) +
+                            " retains only positions >= " + std::to_string(j->a) + " and its lane digest there DIFFERS from ours -- "
+                            "our order diverges from the winner's below that peer's vault horizon (peer set aside as DEEP)";
+                } else {
+                    if (o.have_spine && (ours || alt_known)) m_st.repair_prefix_ok++; else m_st.repair_prefix_unknown++;
+                    if (o.p_served == j->a && o.have_spine) { r.a0_digest = o.spine_digest; r.has_a0_digest = true; }
+                    r.since = Clock::now();
+                    go = true;
+                }
+            }
+            if (!alarm.empty()) log(alarm);
+            if (go) {
+                Job n = *j; n.probe = false; n.p = j->key.first; n.spine = j->key.second;   // the suffix order [a0, P)
+                queue_job(p, std::move(n));
+            }
+            pump_jobs();
+            return;
+        }
         std::vector<bytes32> need;
         {
             std::lock_guard<std::mutex> lk(m_rmtx);
@@ -1952,7 +2157,12 @@ private:
                     // a frames fetch failed (unservable / timeout): keep the order,
                     // re-ask the missing frames of ANOTHER peer now
                     r.fetch_tried.insert(p); r.last_fetch = Clock::time_point{};
-                } else if (r.st != Repair::St::Ready) { r.tried.insert(p); r.reset(); }
+                } else if (r.st != Repair::St::Ready) {
+                    // REPAIR-HORIZON: a BELOW_HORIZON answer that raised this peer's
+                    // start re-arms the repair (re-ask it first) instead of setting it aside
+                    if (r.rearm == p) { r.rearm = 0; r.prefer = p; } else r.tried.insert(p);
+                    r.reset();
+                }
             }
         }
         pump_jobs();
@@ -2018,7 +2228,10 @@ private:
                 }
                 if (r.st != Repair::St::Idle) continue;
                 PeerId pick = 0;
-                if (r.hint && !r.tried.count(r.hint) &&
+                if (r.prefer && !r.tried.count(r.prefer) &&
+                    std::find(ready.begin(), ready.end(), r.prefer) != ready.end()) pick = r.prefer;   // REPAIR-HORIZON re-ask
+                r.prefer = 0;
+                if (!pick && r.hint && !r.tried.count(r.hint) &&
                     std::find(ready.begin(), ready.end(), r.hint) != ready.end()) pick = r.hint;
                 for (PeerId p : ready) if (!pick && !r.tried.count(p)) pick = p;
                 if (!pick) {
@@ -2027,8 +2240,12 @@ private:
                     continue;
                 }
                 r.exhausted = false;
-                r.st = Repair::St::Ordering; r.cur = pick; r.cursor = 0; r.ids.clear(); r.since = Clock::now();
-                Job j; j.kind = Job::Kind::Order; j.repair = true; j.key = k; j.a = 0; j.p = r.P; j.spine = r.spine;
+                // REPAIR-HORIZON: from this peer's known vault start a0 (0 = the whole
+                // order); a0 > 0 asks the zero-length prefix probe [a0, a0) first.
+                const u64 a0 = r.a0_of.count(pick) ? r.a0_of[pick] : 0;
+                r.st = Repair::St::Ordering; r.cur = pick; r.a0 = a0; r.cursor = a0; r.probing = a0 > 0; r.ids.clear(); r.since = Clock::now();
+                Job j; j.kind = Job::Kind::Order; j.repair = true; j.key = k; j.a = a0; j.p = r.P; j.spine = r.spine;
+                if (a0) { j.probe = true; j.p = a0; if (const auto d = digest_at(a0)) j.spine = *d; }
                 issue.emplace_back(pick, std::move(j));
             }
         }
@@ -2136,7 +2353,9 @@ private:
                         std::lock_guard<std::mutex> lk(m_rmtx);
                         auto it = m_repairs.find(j->key);
                         if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p) {
-                            it->second.tried.insert(p); it->second.reset();
+                            Repair& r = it->second;   // REPAIR-HORIZON: a re-armed peer is re-asked, not set aside
+                            if (r.rearm == p) { r.rearm = 0; r.prefer = p; } else r.tried.insert(p);
+                            r.reset();
                         }
                     }
                 }
@@ -2168,6 +2387,8 @@ private:
     std::deque<bytes32> m_cache_order;
     std::unordered_set<bytes32, Bytes32Hash> m_inflight;
     std::deque<std::pair<Clock::time_point, bytes32>> m_recent;
+    std::unordered_set<bytes32, Bytes32Hash> m_unpushed;   // REPAIR-HORIZON: admitted, not yet in our lane
+    std::deque<bytes32> m_unpushed_order;
     std::deque<Item> m_q;
     std::deque<Item> m_parked;
     double m_solicited = 0;
@@ -2224,6 +2445,7 @@ private:
 
     mutable std::mutex m_dmtx;         // pos -> lane digest (the spine probe)
     std::map<u64, bytes32> m_pos_digest;
+    std::multimap<u64, bytes32> m_alt_digest;   // REPAIR-HORIZON: the shadows' digests (note_alt_digests)
 
     ::c2pool::v37n::FrameVault m_vault;
 

@@ -121,6 +121,7 @@
 #include "xmr/relay/xmr_relay_wire.hpp"        // FB_HELLO / FB_RECEIPTS / FB_BLOCK_WON, side_data_v2, lane_params_digest
 #include "xmr/relay/xmr_receipt_mint.hpp"      // share -> PoW-carrying receipt; the structural check
 #include "xmr/relay/xmr_relay_node.hpp"        // TCP relay: HELLO gate, verify worker (RandomX LAST), flood, backfill, repair
+#include "xmr/relay/xmr_repair_replay.hpp"     // REPAIR-HORIZON: the repair scratch replay + the shadow winner-side order
 #include "xmr/relay/xmr_receipt_ingest.hpp"    // admitted receipts -> the lane (ordering policy + durable log)
 #include "xmr/xmr_drops_wiring.hpp"            // ★ DROPS: the XMR shell's DropsWiring (flip-gated; DORMANT by default)
 #include "xmr/relay/xmr_relay_native_ctx.hpp"   // RC-CTX: receipt contexts from the native node + the own-template journal
@@ -1703,6 +1704,9 @@ static int run_live(const XmrNodeConfig& cfg) {
     // Declaration order = teardown order in reverse: everything the relay's
     // threads touch (chain view, log queue, verifier) outlives relay_node.
     std::uint64_t relay_cut_repaired = 0, relay_repair_rejected = 0, relay_own_replay = 0;
+    std::uint64_t relay_repair_suffix = 0, relay_repair_shadow = 0, relay_repair_deep_alarms = 0;   // REPAIR-HORIZON
+    relay::RepairReplayer relay_replayer{2 * (g_relay_vault_horizon ? g_relay_vault_horizon : 8640)};   // REPAIR-HORIZON shadow
+    std::set<std::string> relay_deep_alarmed;                                // REPAIR-HORIZON: one alarm per (P, spine)
     std::mutex    relay_log_mtx;
     std::vector<std::string> relay_log_q;
     std::atomic<std::uint64_t> mint_ok{0}, mint_fail{0}, mint_below{0}, mint_nopayee{0};
@@ -1843,7 +1847,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     // (2) the relay REPAIR: the winner-side order over [0, P) from a peer whose
     // digest at P equals `spine` (SupplyService spine probe), every receipt in
     // it admitted here (RandomX-verified), replayed through a SCRATCH engine
-    // and accepted ONLY if the digest at P equals `spine`. Same gate, same
+    // and accepted ONLY if the digest at P equals `spine`. REPAIR-HORIZON: when
+    // the serving peer's vault no longer retains [0, a0) the served order covers
+    // [a0, P) only (repair_a0()) and the scratch replay is OUR first a0 pushes
+    // (feed_log) followed by it -- the same digest gate at P decides. Same gate, same
     // fold_eb call downstream; a repair in flight answers cut-pending (the
     // FinalizeConnect retry bound), never a fold at a neighbouring prefix.
     auto relay_view = [&](std::uint64_t P, const ::v37::bytes32& spine, std::uint64_t hint, std::string& why)
@@ -1865,10 +1872,32 @@ static int run_live(const XmrNodeConfig& cfg) {
                   (st == relay::XmrRelayNode::RepairState::Exhausted ? " (no connected peer serves that order yet; retry)"
                                                                      : " in flight (fetching the winner-side order + missing receipts)") +
                   " [" + relay_node->repair_status(P, spine) + "]";
+            // REPAIR-HORIZON: a divergence below every ready peer's vault horizon is
+            // named LOUDLY (once per cut) -- still undecided: the block HOLDS (RC-HOLD)
+            std::uint64_t deep_a0 = 0;
+            if (st == relay::XmrRelayNode::RepairState::Exhausted && relay_node->repair_deep_divergence(P, spine, &deep_a0) &&
+                relay_deep_alarmed.insert(key).second) {
+                ++relay_repair_deep_alarms;
+                std::printf("relay-ALARM REPAIR-HORIZON DEEP-DIVERGENCE: the winner's cut P=%llu spine=%s… cannot be repaired from any "
+                            "connected peer: our lane order differs from the winner's BELOW every serving peer's vault horizon "
+                            "(lowest a0=%llu; our replay log %zu pushes). The block HOLDS; only a peer retaining the divergent "
+                            "positions (longer --relay-vault-horizon) can serve it. [%s]\n",
+                            (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), (unsigned long long)deep_a0, feed_log.size(),
+                            relay_node->repair_status(P, spine).c_str());
+                std::fflush(stdout);
+            }
             return nullptr;
         }
-        std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;
-        pushes.reserve(ids.size());
+        std::optional<::v37::bytes32> peer_a0_digest;
+        const std::uint64_t a0 = relay_node->repair_a0(P, spine, &peer_a0_digest);   // REPAIR-HORIZON: 0 = the whole order
+        if (a0 > feed_log.size()) {
+            ++cut_pending;
+            why = "cut-pending: relay repair of P=" + std::to_string(P) + " served [" + std::to_string(a0) + ",P) but our replay log has only " +
+                  std::to_string(feed_log.size()) + " pushes (retry)";
+            return nullptr;
+        }
+        std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;   // the served [a0, P)
+        pushes.reserve(ids.size() * 2);
         const bool fee_on = c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params);
         for (const auto& id : ids) {
             ::v37::ScriptRef payee; std::uint16_t give_author = 0;
@@ -1878,16 +1907,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                                                                                   donation_net_of(cfg.network)))
                 pushes.push_back(pr);
         }
-        c2pool::v37n::V37Engine scratch;
-        scratch.start();
-        scratch.submit_tracked(::v37::LaneRecord::add_lane(cfg.lane_chain, cfg.lane_params)).get();
-        for (const auto& [ref, w] : pushes) {
-            ::v37::PayoutDescriptor d; d.pay = ref;
-            scratch.submit_tracked(::v37::LaneRecord::push(cfg.lane_chain, d, w, 0)).get();
-        }
-        bool mism = false;
-        auto rv = scratch.settlement_view_by_cut(cfg.lane_chain, P, spine, &mism);
-        scratch.stop();
+        // REPAIR-HORIZON: [0, a0) from OUR order, else from the shadow (the last
+        // winner-side order reconstructed here); the digest gate at P decides.
+        relay::RepairReplayer::Base base_used = relay::RepairReplayer::kNone;
+        auto rv = relay_replayer.replay(cfg.lane_chain, cfg.lane_params, P, spine, a0, feed_log, pushes, &base_used,
+                                        peer_a0_digest, a0 ? relay_node->digest_at(a0) : std::nullopt);
+        if (rv) relay_node->note_alt_digests(relay_replayer.shadow_digests());
         if (!rv) {
             relay_node->repair_reject(P, spine);
             ++relay_repair_rejected; ++cut_pending;
@@ -1896,8 +1921,14 @@ static int run_live(const XmrNodeConfig& cfg) {
             return nullptr;
         }
         replay_cache[key] = rv; ++cut_repaired; ++relay_cut_repaired;
-        std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, every one admitted here: RandomX-verified, or our own)\n",
-                    (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), ids.size());
+        if (a0) ++relay_repair_suffix;
+        if (base_used == relay::RepairReplayer::kShadow) ++relay_repair_shadow;
+        std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, every one admitted here: RandomX-verified, or our own)%s\n",
+                    (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), ids.size(),
+                    a0 ? (" -- SUFFIX [" + std::to_string(a0) + "," + std::to_string(P) + ") after the first " + std::to_string(a0) +
+                          (base_used == relay::RepairReplayer::kShadow ? " pushes of the SHADOW (the last reconstructed winner-side order)"
+                                                                       : " pushes of our own order") +
+                          " (the serving peer's vault horizon)").c_str() : "");
         std::fflush(stdout);
         return rv;
     };
@@ -3682,7 +3713,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 { std::lock_guard<std::mutex> lk(mint_mtx); le = mint_last_err; }
                 const std::string lr = relay_node->last_reject();
                 std::printf("  relay-ingest: order=%s pushed=%llu late=%llu bins_closed=%llu pending=%zu(bins=%zu) reloaded=%llu durable=%llu | "
-                            "mint ok=%llu fail=%llu below=%llu nopayee=%llu | rbind jobs=%llu owner-fee=%llu unbound=%llu | cut via relay: own-replay=%llu repaired=%llu repair-rejected=%llu | chain_view=%zu tip=%llu%s%s%s%s\n",
+                            "mint ok=%llu fail=%llu below=%llu nopayee=%llu | rbind jobs=%llu owner-fee=%llu unbound=%llu | cut via relay: own-replay=%llu repaired=%llu repair-rejected=%llu suffix=%llu shadow=%llu deep-alarms=%llu | chain_view=%zu tip=%llu%s%s%s%s\n",
                             relay_ingest->options().order == relay::XmrReceiptIngest::Order::Canonical ? "canonical" : "arrival",
                             (unsigned long long)is.pushed, (unsigned long long)is.late, (unsigned long long)is.bins_closed,
                             relay_ingest->pending_receipts(), relay_ingest->pending_bins(),
@@ -3691,6 +3722,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)mint_below.load(), (unsigned long long)mint_nopayee.load(),
                             (unsigned long long)bind_jobs.load(), (unsigned long long)bind_owner.load(), (unsigned long long)bind_nopayee.load(),
                             (unsigned long long)relay_own_replay, (unsigned long long)relay_cut_repaired, (unsigned long long)relay_repair_rejected,
+                            (unsigned long long)relay_repair_suffix, (unsigned long long)relay_repair_shadow, (unsigned long long)relay_repair_deep_alarms,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
                 {   // SMOKE-NOISE: the value nodes compare (order-free, xmr_receipt_ingest.hpp);
