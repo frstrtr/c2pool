@@ -530,6 +530,30 @@ if (BUILD_TESTING)
         target_compile_definitions(v37_xmr_rx_seed_switch_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
         target_link_libraries(v37_xmr_rx_seed_switch_kat PRIVATE xmr_coin randomx Threads::Threads)
         add_test(NAME v37_xmr_rx_seed_switch_kat COMMAND v37_xmr_rx_seed_switch_kat)
+
+        # v37_xmr_next_seed_kat (NEXT-SEED ANNOUNCE, operator ruling 09-26): the
+        # native chain index -> settlement provider -> stratum job serves
+        # next_seed_hash for exactly the 64 heights before a RandomX seed switch
+        # (monerod get_block_template rule), and the daemon verifier fed those
+        # jobs keys the next epoch before the switch (no cache init at the
+        # switch job; hashes == fresh reference). Real RandomX, same leg.
+        add_executable(v37_xmr_next_seed_kat
+            v37_xmr_next_seed_kat.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_compile_features(v37_xmr_next_seed_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_next_seed_kat PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(v37_xmr_next_seed_kat PRIVATE
+            V37_XMR_O2_WITH_RANDOMX V37_XMR_HAVE_MONERO_CRYPTO)
+        target_link_libraries(v37_xmr_next_seed_kat PRIVATE
+            xmr_template xmr_node xmr_coin randomx Threads::Threads)
+        add_test(NAME v37_xmr_next_seed_kat COMMAND v37_xmr_next_seed_kat)
     endif()
 
     # ------------------------------------------------------------------

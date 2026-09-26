@@ -101,6 +101,7 @@
 #include <utility>
 #include <vector>
 
+#include "impl/xmr/coin/xmr_seedheight.hpp"                 // rx_seedheights (next_seed_hash rule)
 #include "impl/xmr/native/contracts/miner_data.hpp"          // IMinerDataSource / MinerDataEpoch (C4 seam)
 #include "impl/xmr/native/template/xmr_monerod_miner_data.hpp" // MonerodMinerDataSource (the daemon arm)
 #include "impl/xmr/node/monero_rpc.hpp"             // MoneroDaemonRpc::body_get_miner_data / parse_miner_data
@@ -134,6 +135,9 @@ struct SettlementSnapshot {
     std::size_t                              nonce_offset = 0;
     node::Hash                               prev_id{};
     std::array<std::uint8_t, strat::HASH_SIZE> seed_hash{};
+    // The NEXT RandomX seed, announced to miners and to the verifier ahead of
+    // the switch (monerod get_block_template rule; see next_seed_for()).
+    std::optional<std::array<std::uint8_t, strat::HASH_SIZE>> next_seed_hash;
     std::size_t                              n_outputs = 0;
     std::size_t                              n_tx = 0;
     bool                                     valid = false;
@@ -385,7 +389,7 @@ public:
                                        ? std::max(target_from_diff(m_share_diff), out.mainchain_target)
                                        : out.mainchain_target;
         out.seed_hash            = snap.seed_hash;
-        out.next_seed_hash       = std::nullopt;
+        out.next_seed_hash       = snap.next_seed_hash;   // announced ahead of a seed switch, else absent
         out.monero_major_version = snap.major_version;
         return !out.blob.empty();
     }
@@ -441,6 +445,25 @@ private:
             m_order.pop_front();
             if (old != snap.template_id) m_ring.erase(old);
         }
+    }
+
+    // NEXT-SEED ANNOUNCE (operator ruling 09-26). monerod get_block_template:
+    //   rx_seedheights(height, &seed, &next);  next_seed_hash = id(next)
+    //   published only when next != seed.
+    // The id at `next` comes from the source: the native chain index resolves
+    // it (TemplateInputs::next_seed_hash, the seed block is already in the
+    // chain); monerod's get_miner_data carries none, so the daemon arm stays
+    // absent. The height rule is re-applied here so a source can never announce
+    // outside the 64-block lag window, nor announce the current seed again.
+    static std::optional<std::array<std::uint8_t, strat::HASH_SIZE>>
+    next_seed_for(const node::MinerData& md) {
+        std::uint64_t seed_h = 0, next_h = 0;
+        ::xmr::coin::rx_seedheights(md.height, seed_h, next_h);
+        if (next_h == seed_h || !md.next_seed_hash || node::is_zero(*md.next_seed_hash)
+            || *md.next_seed_hash == md.seed_hash) return std::nullopt;
+        std::array<std::uint8_t, strat::HASH_SIZE> out{};
+        std::memcpy(out.data(), md.next_seed_hash->data(), strat::HASH_SIZE);
+        return out;
     }
 
     // Turn one MinerData into a v37 settlement AssembledTemplate.
@@ -510,6 +533,7 @@ private:
         snap.nonce_offset     = probe.nonce_offset;
         std::memcpy(snap.prev_id.data(), snap.tpl->prev_id().data(), 32);
         std::memcpy(snap.seed_hash.data(), md.seed_hash.data(), strat::HASH_SIZE);
+        snap.next_seed_hash   = next_seed_for(md);
         snap.n_outputs        = snap.tpl->outputs().size();
         snap.n_tx             = snap.tpl->n_tx();
         snap.valid            = true;

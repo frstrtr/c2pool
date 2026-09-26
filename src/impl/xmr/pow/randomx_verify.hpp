@@ -367,6 +367,28 @@ public:
         return cur_.holds(s) || next_.holds(s);
     }
 
+    // The flags a slot of THIS verifier is allocated with, so a cache built
+    // elsewhere (adopt() below) is interchangeable with the resident ones.
+    randomx_flags slot_cache_flags() const noexcept { return cache_flags(opts_); }
+
+    // Install a cache that was allocated with slot_cache_flags() and keyed OFF
+    // this thread (e.g. the announced next epoch, Argon2d-initialised by a
+    // helper while this verifier keeps hashing). It replaces the slot that does
+    // NOT hold `keep` (unkeyed first, else least recently used). The VM is
+    // re-bound before the replaced cache is released, so it never points at a
+    // freed cache. Cheap: no Argon2d here. false (and `built` untouched) when
+    // there is no VM, `built` is not keyed, or its seed is already resident.
+    bool adopt(CacheSlot&& built, const SeedHash* keep) {
+        if (!vm_ || !built.ok() || !built.keyed() || seed_resident(built.key())) return false;
+        CacheSlot* victim = pick_victim(keep && seed_resident(*keep) ? keep : nullptr, built.key());
+        if (!victim) return false;
+        const bool was_bound = (bound_ == victim->raw());
+        CacheSlot released = std::move(*victim);   // alive until the VM is re-bound
+        *victim = std::move(built);
+        if (was_bound) { bound_keyed_ = false; bind_(victim); }
+        return true;
+    }
+
 private:
     CacheSlot* slot_for(const SeedHash& s) noexcept {
         if (cur_.holds(s))  return &cur_;

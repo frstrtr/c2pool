@@ -60,6 +60,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -97,6 +98,13 @@ struct RandomXPolicy {
     // new-template hook is preferable to a rejected share (it then costs
     // ~1-2 s once per epoch, on the listener thread, inside that submit).
     bool lazy_prefetch_on_miss = false;
+    // NEXT-SEED PREFETCH. A template that announces next_seed_hash (the 64
+    // heights before a switch) gets that epoch's cache Argon2d-initialised on a
+    // HELPER thread; the listener adopts the finished cache (a pointer swap) on
+    // a later template, so neither the announcement nor the switch stalls a job
+    // push. false = the pre-09-26 behaviour (both seeds keyed synchronously on
+    // the listener thread inside the template hook).
+    bool async_next_seed = true;
 
     template <class Cfg>
     static RandomXPolicy from_config(const Cfg& c) {
@@ -145,6 +153,8 @@ struct RandomXStats {
     std::uint64_t network_accepts = 0;  // verify_network_block() -> Accept
     std::uint64_t network_rejects = 0;  // verify_network_block() -> anything else
     std::uint64_t memo_hits       = 0;  // network verify reused the submit's hash
+    std::uint64_t next_async      = 0;  // announced next seeds keyed on the helper thread
+    std::uint64_t next_adopted    = 0;  // ...and installed by the listener (no Argon2d there)
 };
 
 // ---------------------------------------------------------------------------
@@ -256,6 +266,19 @@ public:
     bool ensure_seeds(const Seed32& current, const std::optional<Seed32>& next) {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (!ready()) return false;
+        if (m_policy.async_next_seed) {
+            adopt_next_(current, /*wait=*/false);                 // a finished helper build: install it
+            if (!m_vm.seed_resident(current) && m_next_building && m_next_seed == current)
+                adopt_next_(current, /*wait=*/true);              // switch beat the helper: wait, never key twice
+            if (!m_vm.seed_resident(current)) {
+                if (!m_vm.prefetch_epoch(current, std::nullopt)) return false;   // null cache
+                m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (next && *next != current && !m_vm.seed_resident(*next)
+                && !(m_next_building && m_next_seed == *next))
+                start_next_(current, *next);
+            return m_vm.seed_resident(current);
+        }
         const bool cur_res  = m_vm.seed_resident(current);
         const bool next_res = !next || m_vm.seed_resident(*next);
         if (cur_res && next_res) return true;                    // nothing to do
@@ -401,6 +424,8 @@ public:
         s.network_accepts = m_stat_network_accepts.load(std::memory_order_relaxed);
         s.network_rejects = m_stat_network_rejects.load(std::memory_order_relaxed);
         s.memo_hits       = m_stat_memo_hits.load(std::memory_order_relaxed);
+        s.next_async      = m_stat_next_async.load(std::memory_order_relaxed);
+        s.next_adopted    = m_stat_next_adopted.load(std::memory_order_relaxed);
         return s;
     }
 
@@ -421,12 +446,53 @@ public:
         o += " net_accept=";  o += std::to_string(s.network_accepts);
         o += " net_reject=";  o += std::to_string(s.network_rejects);
         o += " memo_hits=";   o += std::to_string(s.memo_hits);
+        o += " next_async=";  o += std::to_string(s.next_async);
+        o += " next_adopted="; o += std::to_string(s.next_adopted);
         return o;
     }
 
 private:
     void set_mode(Mode m) noexcept { m_mode.store(static_cast<std::uint8_t>(m), std::memory_order_release); }
     void count_reject() noexcept { m_stat_network_rejects.fetch_add(1, std::memory_order_relaxed); }
+
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+    // NEXT-SEED helper (policy.async_next_seed). One build in flight at most.
+    // The helper touches ONLY its own CacheSlot (allocated with the verifier's
+    // slot flags, keyed through CacheSlot::rekey under the process-wide
+    // randomx_init_mutex); the LightVerifier stays single-threaded, and the
+    // finished cache is installed by adopt() on the caller's (listener) thread.
+    void start_next_(const Seed32& current, const Seed32& next) {
+        if (m_next_building) adopt_next_(current, /*wait=*/true);   // a different next: finish the old one first
+        if (m_vm.seed_resident(next)) return;
+        const randomx_flags f = m_vm.slot_cache_flags();
+        try {
+            m_next_build = std::async(std::launch::async, [f, next] {
+                ::c2pool::xmr::CacheSlot s(f);
+                if (s.ok()) s.rekey(next);                 // the seconds-long Argon2d init, off the listener
+                return s;
+            });
+        } catch (...) {                                    // no thread: the old synchronous path
+            if (m_vm.prefetch_epoch(current, next)) m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        m_next_seed     = next;
+        m_next_building = true;
+        m_stat_next_async.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Install a finished helper build (wait=true blocks until it finishes).
+    // `current` is kept resident unless the built seed IS current (the switch
+    // arrived first), in which case the least recently used slot is replaced.
+    void adopt_next_(const Seed32& current, bool wait) {
+        if (!m_next_building) return;
+        if (!wait && m_next_build.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        ::c2pool::xmr::CacheSlot built = m_next_build.get();
+        m_next_building = false;
+        const bool keep_cur = !(built.keyed() && built.key() == current);
+        if (m_vm.adopt(std::move(built), keep_cur ? &current : nullptr))
+            m_stat_next_adopted.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
 
     // Single-entry memo of the last hash computed: handle_submit calls
     // randomx_hash() and then, on the same thread, the sink calls
@@ -450,6 +516,11 @@ private:
 
 #if defined(V37_XMR_O2_WITH_RANDOMX)
     ::c2pool::xmr::LightVerifier m_vm;           // listener thread only
+    // next-seed helper build (listener thread owns the future; destroyed first,
+    // so a still-running helper is joined before m_vm goes away)
+    std::future<::c2pool::xmr::CacheSlot> m_next_build;
+    Seed32                                m_next_seed{};
+    bool                                  m_next_building = false;
 #endif
 
     // seed mailbox (main thread -> listener thread)
@@ -472,6 +543,8 @@ private:
     std::atomic<std::uint64_t> m_stat_network_accepts{0};
     std::atomic<std::uint64_t> m_stat_network_rejects{0};
     std::atomic<std::uint64_t> m_stat_memo_hits{0};
+    std::atomic<std::uint64_t> m_stat_next_async{0};
+    std::atomic<std::uint64_t> m_stat_next_adopted{0};
 };
 
 } // namespace c2pool::v37n::xmr::o2
