@@ -287,7 +287,9 @@ int main() {
         C(!sh.empty() && !nd.empty(), "R3 sources readable");
         const auto bk = sh.find("fo.book_from_chain_ex = [&]");
         const auto hold = sh.find("DROPS not live yet (flip 1: no pre-DROPS booking)");
-        const auto fetch = sh.find("fetch_decode(bid, bk, why, &chain_blob, &cand_superseded)");
+        auto fetch = sh.find("fetch_decode(bid, bk, why, &chain_blob, &cand_superseded)");
+        if (fetch == std::string::npos)   // REJOIN-PAYEE (#1804): the arm reads the bytes with cba_src.fetch, then decode_resolving
+            fetch = sh.find("cba_src.fetch(bid, chain_blob, why)");
         C(bk != std::string::npos && hold != std::string::npos && fetch != std::string::npos && bk < hold && hold < fetch,
           "R3 ★ book_from_chain_ex HOLDs (relay-repair family) while DROPS is not live, before anything is decoded or booked");
         const auto seam = sh.find("node.set_drops_booked_fn(");
