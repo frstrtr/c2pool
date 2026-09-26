@@ -38,6 +38,19 @@
 namespace dgb
 {
 
+// Version-switch weight gate, exactly as the DGB oracle writes it
+// (p2pool-dgb-scrypt data.py:505, same line in p2pool-merged-v36 data.py):
+//   if counts.get(self.VERSION, 0) < sum(counts.itervalues())*60//100: raise
+// The threshold is FLOOR(total*60/100). Cross-multiplying (new*100 < total*60)
+// is NOT equivalent: when 60*total is not a multiple of 100 it rejects
+// new == floor(0.6*total), which the oracle accepts -- a share-validity split
+// at every version switch. Returns true when the switch must be REJECTED.
+inline bool version_switch_underweight(const uint288& new_ver_weight,
+                                       const uint288& total_weight)
+{
+    return new_ver_weight < (total_weight * uint32_t(60)) / uint288(100);
+}
+
 // P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
 // Used for witness commitment: SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE)
 static const unsigned char P2POOL_WITNESS_NONCE[32] = {
@@ -1628,7 +1641,7 @@ bool share_check(const ShareT& share,
                             new_ver_weight = new_ver_weight + w;
                     }
                     // Canonical: counts.get(self.VERSION,0) < sum(counts)*60//100
-                    if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
+                    if (version_switch_underweight(new_ver_weight, total_weight))
                         throw std::invalid_argument("switch without enough hash power upgraded");
                 }
                 else if (parent_version == share_ver + 1)

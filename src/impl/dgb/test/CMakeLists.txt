@@ -16,7 +16,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # REAL dgb::Legacy / dgb::Actual addrme handlers over a REAL loopback socket.
     # Needs NodeImpl + protocol_legacy.cpp from the `dgb` lib already on this
     # target. Same folding rule (the #769 trap).
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp)
+    #
+    # version_switch_floor_test.cpp: the version-switch 60% gate must use the
+    # oracle FLOOR threshold (sum*60//100), not the cross-multiplied real 60%,
+    # which rejected new == floor(0.6*total) when 60*total is not a multiple of
+    # 100. Pure-helper boundary KAT. Same folding rule.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp version_switch_floor_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
