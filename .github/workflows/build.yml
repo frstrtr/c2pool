@@ -963,6 +963,7 @@ jobs:
                     bch_cashaddr_kat_test \
                     bch_share_tx_refs_kat_test \
                     bch_share_remove_owns_data_test \
+                    bch_bip34_height_push_kat_test \
                     bch_restart_reorg_supersede_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \
@@ -1147,6 +1148,7 @@ jobs:
                     bch_cashaddr_kat_test \
                     bch_share_tx_refs_kat_test \
                     bch_share_remove_owns_data_test \
+                    bch_bip34_height_push_kat_test \
                     bch_restart_reorg_supersede_test \
                     bch_block_connector_test bch_block_ordering_test \
                     bch_utxo_connect_test bch_reorg_connect_test bch_reorg_rerequest_test \

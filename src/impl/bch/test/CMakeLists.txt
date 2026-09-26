@@ -59,6 +59,16 @@ if(BUILD_TESTING)
         BCH_SHARE_TRACKER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../share_tracker.hpp")
     add_test(NAME bch_share_remove_owns_data_test COMMAND bch_share_remove_owns_data_test)
 
+    # BIP34 height-push KAT: build_bip34_height_push == BCHN `CScript() << h`
+    # (OP_0 / OP_1..OP_16 / minimal push) for 0,1,16,17,0x7f,0x80,21M + the
+    # validator's OP_n acceptance and non-canonical rejection. Reads
+    # work_source.cpp to pin that stratum calls the one consensus encoder.
+    add_executable(bch_bip34_height_push_kat_test bip34_height_push_kat_test.cpp)
+    target_include_directories(bch_bip34_height_push_kat_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(bch_bip34_height_push_kat_test PRIVATE
+        BCH_WORK_SOURCE_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../stratum/work_source.cpp")
+    add_test(NAME bch_bip34_height_push_kat_test COMMAND bch_bip34_height_push_kat_test)
+
     # Restart-reorg SupersedeHint behavioral KAT (BCH-lane mirror of the
     # dash/btc/dgb/ltc KATs): drives the REAL bch::ShareTracker accounting —
     # warm full-CL incumbent vs higher-work sub-CL challenger -> the hint
