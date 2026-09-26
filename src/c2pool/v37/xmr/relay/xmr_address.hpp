@@ -28,6 +28,7 @@
 // ===========================================================================
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -118,6 +119,41 @@ inline std::optional<DecodedAddress> decode_address(const std::string& addr) {
     std::memcpy(d.spend.data(), b.data() + pos, 32);
     std::memcpy(d.view.data(), b.data() + pos + 32, 32);
     return d;
+}
+
+// XMR-WEB: the inverse of decode_address, for DISPLAY only (the dashboard
+// names a ledger payee by the address its ScriptRef was learned from). Builds
+// varint(prefix) || spend || view || keccak256(...)[0..4) in Monero base58.
+inline std::string encode_address(std::uint64_t prefix, const std::uint8_t* spend32, const std::uint8_t* view32) {
+    std::vector<std::uint8_t> b;
+    for (std::uint64_t v = prefix;;) {
+        const std::uint8_t c = static_cast<std::uint8_t>(v & 0x7f);
+        v >>= 7;
+        if (v) { b.push_back(c | 0x80); } else { b.push_back(c); break; }
+    }
+    b.insert(b.end(), spend32, spend32 + 32);
+    b.insert(b.end(), view32, view32 + 32);
+    const auto h = ::xmr::coin::keccak256(b.data(), b.size());
+    b.insert(b.end(), h.data(), h.data() + 4);
+    std::string out;
+    for (std::size_t off = 0; off < b.size(); off += b58::kFullBlock) {
+        const int n = static_cast<int>(std::min<std::size_t>(b58::kFullBlock, b.size() - off));
+        std::uint64_t v = 0;
+        for (int i = 0; i < n; ++i) v = (v << 8) | b[off + i];
+        std::string blk(static_cast<std::size_t>(b58::kEncodedBlockSizes[n]), b58::kAlphabet[0]);
+        for (int i = static_cast<int>(blk.size()) - 1; i >= 0 && v; --i) { blk[i] = b58::kAlphabet[v % 58]; v /= 58; }
+        out += blk;
+    }
+    return out;
+}
+
+// A payout ScriptRef (XMR_STD / XMR_SUB, 64-byte payload) as its address under
+// the given network prefixes; "" for any other ref (e.g. the RAW sentinel).
+inline std::string address_of(const ::v37::ScriptRef& r, std::uint64_t std_prefix, std::uint64_t sub_prefix) {
+    if (r.payload.size() != 64) return {};
+    if (r.kind == ::v37::xmr::XMR_STD) return encode_address(std_prefix, r.payload.data(), r.payload.data() + 32);
+    if (r.kind == ::v37::xmr::XMR_SUB) return encode_address(sub_prefix, r.payload.data(), r.payload.data() + 32);
+    return {};
 }
 
 } // namespace c2pool::v37n::xmr::relay

@@ -100,6 +100,7 @@
 #include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
 #include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
+#include "xmr/xmr_web_dashboard.hpp"        // XMR-WEB: the c2pool web dashboard (--web-port; OFF by default)
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
 #include "impl/xmr/node/minijson.hpp"
@@ -152,6 +153,7 @@ namespace settle = ::c2pool::v37n::settle;   // recon(A+B credit): fold_eb at th
 namespace mine = ::c2pool::xmr::miner;
 #endif
 namespace node  = ::c2pool::xmr::node;
+namespace xweb  = ::c2pool::v37n::xmr::web;
 
 #if __has_include(<c2pool_build_version.h>)
 #include <c2pool_build_version.h>
@@ -244,6 +246,15 @@ static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partitio
 static std::uint32_t g_test_crash_after_publish = 0;
 static std::uint32_t g_test_published = 0;
 static std::string   g_relay_bind = "none";             // --relay-bind none|rbind (rbind needs SEAM-1 in the template)
+// XMR-WEB: the web dashboard (core::WebServer + web-static/, the one every coin
+// binary serves). OFF unless --web-port: off = no socket, no thread, no call.
+static std::uint16_t g_web_port = 0;                    // --web-port P (0 = off, the default)
+static std::string   g_web_host = "127.0.0.1";          // --web-host IP
+static std::string   g_web_dir  = "web-static";         // --dashboard-dir DIR
+static xweb::XmrWebDashboard* g_web = nullptr;          // set by main() only when --web-port is given
+static std::function<void(xweb::XmrWebState&)> g_web_extra;               // run_live: the relay's view
+static std::function<std::string(const ::v37::bytes32&)> g_web_name;      // run_live: ledger key -> address
+static std::atomic<std::uint64_t> g_web_net_diff{0};    // the template difficulty (share weight when --share-diff 0)
 static bool relay_enabled() { return !g_relay_listen.empty() || !g_relay_peers.empty(); }
 // POOL-LINEAGE: the pool genesis id (--pool-genesis, else the per-network
 // default) and the block-level pool_tag every lane coinbase commits.
@@ -527,7 +538,16 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         p2p_publish ? static_cast<strat::IShareSink&>(*publisher)
                     : static_cast<strat::IShareSink&>(live_sink);
     GatedShareSinkT<Provider, Snapshot> sink(rx, provider, template_source, publish_sink);
-    if (hooks.on_share) sink.set_on_share(hooks.on_share);   // GAP-2
+    if (g_web) {   // XMR-WEB: the dashboard also counts each accepted share (the GAP-2 mint runs first, unchanged)
+        auto mint = hooks.on_share;
+        const std::uint64_t sd = cfg.stratum_share_diff;
+        sink.set_on_share([mint, sd](const strat::AcceptedShare& s) {
+            if (mint) mint(s);
+            const std::uint64_t nd = g_web_net_diff.load(std::memory_order_relaxed);
+            const std::uint64_t w = (sd && (!nd || sd < nd)) ? sd : nd;   // the job target is capped at the network's
+            if (g_web) g_web->on_share(static_cast<double>(w), s.address, s.worker);
+        });
+    } else if (hooks.on_share) sink.set_on_share(hooks.on_share);   // GAP-2
     if (hooks.pre_publish) sink.set_pre_publish(hooks.pre_publish);   // DROPS WRITE-AHEAD
 
     o2::StratumListenerOptions lo;
@@ -742,6 +762,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                     "fallback every %u ms)\n",
                     to_string(cfg.arm_order), poll_ms);
 
+    std::map<std::string, std::uint64_t> web_own_reward;   // XMR-WEB: this node's own finds (bid -> template reward)
     auto bridge_found = [&]() {
         sub::FoundBlockEvent s;
         while (submit_q.pop(s)) {
@@ -764,6 +785,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             e.extra_nonce     = s.extra_nonce;
             e.worker          = s.worker;
             e.address         = s.address;
+            if (g_web) web_own_reward[e.block_id_hex] = e.reward_piconero;
             found_q.push(std::move(e));
         }
     };
@@ -1006,6 +1028,61 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     };
 
     auto last_status = std::chrono::steady_clock::now();
+    // XMR-WEB: publish this node's view to the dashboard, once a second, from the
+    // main thread (READ-ONLY: the same counters the status line prints; no RPC,
+    // no ledger/consensus write). Never runs unless --web-port was given.
+    std::map<std::string, xweb::XmrWebBlock> web_blocks;   // bid -> row: every FOUND the ledger booked
+    auto last_web = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    auto web_tick = [&]() {
+        const auto ls = listener.stats();
+        const auto fs = fc.stats();
+        const Snapshot t = provider.current();
+        g_web_net_diff.store(t.difficulty, std::memory_order_relaxed);
+        auto name = [](const ::v37::bytes32& k) {
+            std::string a = g_web_name ? g_web_name(k) : std::string();
+            return a.empty() ? "key:" + hex_of(k).substr(0, 16) : a;
+        };
+        const std::uint64_t now_unix = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto& pend = fc.pending();
+        for (const auto& [bid, rec] : pend) {
+            xweb::XmrWebBlock& b = web_blocks[bid];
+            if (b.id_hex.empty()) {
+                b.id_hex = bid; b.height = rec.height;
+                b.time = rec.found_unix_s ? rec.found_unix_s : now_unix;
+                b.booked_pico = rec.reward;
+                for (const auto& [k, v] : rec.payout)
+                    if (v > 0) b.payouts.emplace_back(name(k), static_cast<std::uint64_t>(v));
+            }
+            b.status = "pending";
+            const auto own = web_own_reward.find(bid);
+            b.own = own != web_own_reward.end();
+            if (b.own) { b.coinbase_known = true; b.coinbase_total_pico = own->second; }
+        }
+        for (auto& [bid, b] : web_blocks)
+            if (b.status == "pending" && !pend.count(bid))
+                b.status = node.ledger().is_settled(bid) ? "main" : "orphan";
+        xweb::XmrWebState w;
+        w.version = C2POOL_VERSION; w.network = to_string(cfg.network); w.coinbase_mode = to_string(cfg.coinbase);
+        w.stratum_host = cfg.stratum_bind_host; w.stratum_port = listener.bound_port();
+        w.chain_height = node.best_height(); w.network_difficulty = t.difficulty; w.template_height = t.height;
+        w.share_difficulty = cfg.stratum_share_diff;
+        w.d_conf = cfg.d_conf; w.finalize_cursor = node.finalize_driver().cursor_height(); w.hw = node.hw().hw_height;
+        w.ledger_seq = node.ledger().ledger_seq(); w.owed_digest_hex = hex_of(node.ledger().owed_digest());
+        w.fee_model = cfg.lane_params.fee.enabled ? "v" + std::to_string(cfg.lane_params.fee.version) : "off";
+        w.give_author_pct = g_give_author_pct; w.owner_fee_pct = g_owner_fee_pct; w.owner_address = g_owner_address;
+        w.donation_address = c2pool::v37n::xmr::fee::donation_address(donation_net_of(cfg.network));
+        w.payout_address = cfg.payout_address;
+        w.stratum_connections = ls.connections; w.stratum_active = ls.active;
+        w.stratum_shares = ls.accepted_shares; w.stratum_rejected = ls.rejected_submits;
+        w.found_registered = fs.registered; w.found_settled = fs.settled; w.found_orphaned = fs.orphaned;
+        w.lane_suspended = listener.lane_suspended();
+        for (const auto& [k, v] : node.ledger().effective_owed_all()) w.owed.push_back({name(k), v});
+        for (const auto& [bid, b] : web_blocks) { (void)bid; w.blocks.push_back(b); }
+        std::sort(w.blocks.begin(), w.blocks.end(), [](const xweb::XmrWebBlock& x, const xweb::XmrWebBlock& y) {
+            return x.height != y.height ? x.height > y.height : x.id_hex < y.id_hex; });
+        if (g_web_extra) g_web_extra(w);
+        g_web->publish(std::move(w));
+    };
     std::string last_template_err;
     // R-C rework-2/3: THE LANE-SUSPEND STATE, one place, four causes, per-cause counters
     // (xmr/xmr_lane_suspend_state.hpp).
@@ -1234,6 +1311,10 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             status();
             if (hooks.status_extra) hooks.status_extra();
             last_status = std::chrono::steady_clock::now();
+        }
+        if (g_web && std::chrono::steady_clock::now() - last_web >= std::chrono::seconds(1)) {
+            web_tick();   // XMR-WEB
+            last_web = std::chrono::steady_clock::now();
         }
         std::fflush(stdout);
         const bool fast = hooks.catching_up && hooks.catching_up();   // COLD-BOOT-2
@@ -2916,6 +2997,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                     "\"Couldn't check PoW\"; network-block promotion is refused (fail-closed)\n",
                     o2::O2RandomXVerifier::to_string(rx.mode()));
 
+    // XMR-WEB: name a ledger payee by the address its ScriptRef was learned from
+    // (the option-B fixture's pay_of, else this node's own payee). Display only.
+    if (g_web) g_web_name = [&](const ::v37::bytes32& k) -> std::string {
+        namespace fee = ::c2pool::v37n::xmr::fee;
+        std::optional<::v37::ScriptRef> r;
+        if (cba_fx) r = cba_fx->pay_of()(k);
+        if ((!r || r->payload.empty()) && payee_key && cba_payee_ref && k == *payee_key) r = cba_payee_ref;
+        if (!r) return {};
+        const bool tn = cfg.network == MoneroNetwork::Testnet, sn = cfg.network == MoneroNetwork::Stagenet;
+        return relay::address_of(*r, tn ? fee::kPrefixTestnetStd : sn ? fee::kPrefixStagenetStd : fee::kPrefixMainnetStd,
+                                 tn ? fee::kPrefixTestnetSub : sn ? fee::kPrefixStagenetSub : fee::kPrefixMainnetSub);
+    };
+
     // ── the template + wire 3 (live submit) + wire 1 (listener) ─────────────
     // Branch on the coinbase mode. Option A (monerod template) is byte-identical
     // to PR #1534; option B (v37 settlement coinbase) drives the SAME listener /
@@ -4377,9 +4471,17 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
         }
 
+        if (g_web) g_web_extra = [&](xweb::XmrWebState& w) {   // XMR-WEB (read-only)
+            w.relay_enabled = static_cast<bool>(relay_node);
+            if (!relay_node) return;
+            w.relay_ready = relay_node->ready_peers().size();
+            w.relay_conns = relay_node->n_connections();
+            w.relay_foreign_receipts = relay_node->stats().admitted_foreign.load(std::memory_order_relaxed);
+        };
         const int rc = serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
                                      "no --residual-sink-spend-hex/--residual-sink-view-hex",
                                      provider, template_source, candidate, std::move(hooks));
+        g_web_extra = {};
         if (relay_node) relay_node->stop();   // GAP-2: quiesce the relay threads before the option-B locals go
         if (native) native->stop();
         return rc;
@@ -4618,6 +4720,9 @@ int main(int argc, char** argv) {
         else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
         else if (a == "--test-crash-after-publish")     g_test_crash_after_publish = u32();
         else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = u32();
+        else if (a == "--web-port")      g_web_port = u16();      // XMR-WEB: 0 = off (the default)
+        else if (a == "--web-host")      g_web_host = value();
+        else if (a == "--dashboard-dir") g_web_dir = value();
         else if (a == "--relay-bind")               g_relay_bind = cs::one_of(a, value(), {"none", "rbind"});
         else if (a == "--divergence-cap-heights")  g_divergence_cap_heights = u64();
         else if (a == "--divergence-cap-ticks")    g_divergence_cap_ticks = u64();
@@ -4799,6 +4904,10 @@ int main(int argc, char** argv) {
                 "  --payout-address <addr>      get_block_template wallet address (network-prefixed)\n"
                 "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
                 "  --share-diff <n>             share (lane) difficulty; 0 = network (solo)\n"
+                "  --web-port <p>               the web dashboard (p2pool-compatible JSON + web-static UI);\n"
+                "                               0 = off (the default: no web socket is opened)\n"
+                "  --web-host <ip>              dashboard bind address (default 127.0.0.1)\n"
+                "  --dashboard-dir <dir>        dashboard static UI root (default web-static)\n"
                 "  --template-reserve <n>       get_block_template reserve_size (default 0)\n"
                 "  --payee-spend-hex <64hex> --payee-view-hex <64hex> [--payee-subaddress]\n"
                 "                               payout address keys -> amount-honest FOUND records\n"
@@ -4961,5 +5070,27 @@ int main(int argc, char** argv) {
     }
 
     if (mock_smoke) return run_mock_smoke();
-    return run_live(cfg);
+    std::unique_ptr<xweb::XmrWebDashboard> web;
+    if (g_web_port) {   // XMR-WEB: nothing below runs without --web-port
+        web = std::make_unique<xweb::XmrWebDashboard>(g_web_host, g_web_port, g_web_dir,
+                                                      cfg.network != MoneroNetwork::Mainnet);
+        xweb::XmrWebState w0;
+        w0.version = C2POOL_VERSION; w0.network = to_string(cfg.network); w0.coinbase_mode = to_string(cfg.coinbase);
+        w0.stratum_host = cfg.stratum_bind_host; w0.stratum_port = cfg.stratum_bind_port;
+        w0.share_difficulty = cfg.stratum_share_diff; w0.d_conf = cfg.d_conf; w0.payout_address = cfg.payout_address;
+        web->publish(std::move(w0));
+        if (web->start()) {
+            g_web = web.get();
+            std::printf("web: dashboard LIVE on http://%s:%u (dashboard-dir=%s, payout scheme %s)\n",
+                        g_web_host.c_str(), static_cast<unsigned>(web->bound_port()), g_web_dir.c_str(), xweb::kPayoutScheme);
+        } else {
+            std::printf("web: dashboard FAILED to bind %s:%u -- dashboard disabled (mining unaffected)\n",
+                        g_web_host.c_str(), static_cast<unsigned>(g_web_port));
+            web.reset();
+        }
+    }
+    const int rc = run_live(cfg);
+    g_web = nullptr; g_web_extra = {}; g_web_name = {};
+    web.reset();
+    return rc;
 }
