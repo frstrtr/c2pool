@@ -182,6 +182,20 @@ public:
     // Ids we already hold, for the txpool complement exchange (2010).
     // At most MAX_TXPOOL_COMPLEMENT_IDS entries.
     virtual std::vector<Hash> complement_request_ids() const = 0;
+
+    // TXPOOL-RESUME: the 2002 that answers OUR NOTIFY_GET_TXPOOL_COMPLEMENT
+    // (2010). monerod's tx_memory_pool::get_complement returns only the txs its
+    // pool relays publicly (relay_method fluff or block), so the batch is
+    // admitted as FLUFFED -- through exactly the same validation as any relayed
+    // transaction. Called once per answer, EMPTY batches included, so a sink
+    // can tell that a back-fill round finished even when there was nothing to
+    // fill. Default: plain fluffed admission.
+    virtual std::vector<TxRelayVerdict> on_complement(
+            const PeerRef&                         from,
+            std::vector<std::vector<std::uint8_t>> blobs) {
+        if (blobs.empty()) return {};
+        return on_relayed(from, std::move(blobs), /*dandelionpp_fluff=*/true);
+    }
 };
 
 // ---------------------------------------------------------------------------
