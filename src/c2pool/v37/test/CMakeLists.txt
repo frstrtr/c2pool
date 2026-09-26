@@ -768,7 +768,16 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
     target_compile_features(v37_xmr_empty_cut_finder_kat PRIVATE cxx_std_20)
     target_include_directories(v37_xmr_empty_cut_finder_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_empty_cut_finder_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_empty_cut_finder_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_empty_cut_finder_kat COMMAND v37_xmr_empty_cut_finder_kat)
 
+    # ------------------------------------------------------------------
     # REJOIN-PAYEE (xmr/xmr_cut_payees.hpp): a node that joined late or was
     # restarted after a downtime resolves a pay-now lane block's outputs
     # against the payees of the block's OWN on-chain credit cut before the
@@ -791,10 +800,6 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-    target_compile_definitions(v37_xmr_empty_cut_finder_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-    target_link_libraries(v37_xmr_empty_cut_finder_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
-    add_test(NAME v37_xmr_empty_cut_finder_kat COMMAND v37_xmr_empty_cut_finder_kat)
-
     target_compile_definitions(v37_xmr_rejoin_payee_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
     target_link_libraries(v37_xmr_rejoin_payee_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_rejoin_payee_kat COMMAND v37_xmr_rejoin_payee_kat)
