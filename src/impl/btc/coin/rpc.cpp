@@ -267,7 +267,10 @@ std::string NodeRPC::Send(const std::string &request)
 	const auto deadline = std::chrono::steady_clock::now() + m_io_timeout;
 
 	// Retry once after synchronous reconnect on write/read failure, but never
-	// after a timeout (below).
+	// after a timeout (below). A non-idempotent call (submitblock) is re-sent
+	// only if it was never delivered -- see submit_flood_gate.hpp
+	// (P0-SUBMIT-CSMAIN).
+	m_last_send = SendOutcome::NotDelivered;
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
 		m_http_request.body() = request;
@@ -281,7 +284,8 @@ std::string NodeRPC::Send(const std::string &request)
 			// Out of time mid-write: part of the request is on the wire and the
 			// budget is spent. Drop the socket; the next call reconnects.
 			const bool timed_out = ec == io::error::timed_out;
-			const bool retry = attempt == 0 && !timed_out;
+			const bool retry = attempt == 0 && !timed_out
+			                   && rpc_may_resend(RpcFailure::Write, m_non_idempotent);
 			LOG_WARNING << "CoindRPC write failed: " << ec.message()
 			            << (retry ? " — reconnecting..." : timed_out ? " — dropping connection" : "");
 			if (retry) {
@@ -292,6 +296,7 @@ std::string NodeRPC::Send(const std::string &request)
 				m_stream.close();
 			return {};
 		}
+		m_last_send = SendOutcome::Delivered;
 
 		beast::flat_buffer buffer;
 		boost::beast::http::response<boost::beast::http::dynamic_body> response;
@@ -302,31 +307,39 @@ std::string NodeRPC::Send(const std::string &request)
 			// Out of time waiting for the answer: the daemon HAS the request and
 			// is still on it (submitblock queued behind cs_main). A re-send would
 			// queue a second copy behind the first and double the stall, so give
-			// up on this call. Drop the socket so the late reply is never read as
-			// the answer to the NEXT call (every request carries the same id);
-			// the next Send() fails its write on the closed stream and reconnects.
+			// up on this call. A delivered non-idempotent call is never re-sent
+			// either, timeout or not. Whenever we give up, drop the socket so the
+			// late reply is never read as the answer to the NEXT call (every
+			// request carries the same id); the next Send() fails its write on
+			// the closed stream and reconnects.
 			const bool timed_out = ec == io::error::timed_out;
-			const bool retry = attempt == 0 && !timed_out;
+			const bool retry = attempt == 0 && !timed_out
+			                   && rpc_may_resend(RpcFailure::Read, m_non_idempotent);
 			LOG_WARNING << "CoindRPC read failed: " << ec.message()
 			            << (retry ? " — reconnecting..."
-			                      : timed_out ? " — request delivered, not re-sending; dropping connection" : "");
+			                      : " — request delivered, not re-sending; dropping connection");
 			if (retry) {
 				sync_reconnect();
 				continue;
 			}
-			if (timed_out)
-				m_stream.close();
+			m_stream.close();
 			return {};
 		}
 
 		auto body = boost::beast::buffers_to_string(response.body().data());
+		// 503 "Work queue depth exceeded": bitcoind refused the call unrun.
+		if (response.result() == http::status::service_unavailable)
+			m_last_send = SendOutcome::NotDelivered;
+		else if (!body.empty())
+			m_last_send = SendOutcome::Answered;
 		if (body.empty()) {
 			static int _empty_count = 0;
 			if (_empty_count++ < 5)
 				LOG_WARNING << "CoindRPC empty response: HTTP " << response.result_int()
 				            << " content-length=" << response[http::field::content_length]
 				            << " connection=" << response[http::field::connection];
-			if (attempt == 0 && response.result_int() != 200) {
+			if (attempt == 0 && response.result_int() != 200
+			    && rpc_may_resend(RpcFailure::EmptyNon200, m_non_idempotent)) {
 				sync_reconnect();
 				continue;
 			}
@@ -339,6 +352,18 @@ std::string NodeRPC::Send(const std::string &request)
 nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
 {
 	return m_client.CallMethod<nlohmann::json>(ID, method, params);
+}
+
+nlohmann::json NodeRPC::call_submitblock(const std::string& block_hex)
+{
+	// Mark the call non-idempotent for the duration of Send() so a delivered
+	// submitblock is never re-sent (submit_flood_gate.hpp).
+	struct Scope {
+		bool& flag;
+		explicit Scope(bool& f) : flag(f) { flag = true; }
+		~Scope() { flag = false; }
+	} scope(m_non_idempotent);
+	return m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
 }
 
 bool NodeRPC::check()
@@ -530,7 +555,7 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 	// BTC: segwit + taproot are required forks; full-block packing always
 	// includes witness data. No MWEB tail to append.
 	PackStream packed_block = pack<btc::coin::BlockType>(block);
-	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {HexStr(packed_block.get_span())});
+	auto result = call_submitblock(HexStr(packed_block.get_span()));
 	bool success = result.is_null();
 
 	auto block_header = pack<btc::coin::BlockHeaderType>(block); // cast to header?
@@ -544,11 +569,37 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
 {
 	(void)ignore_failure;
-	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
+	// P0-SUBMIT-CSMAIN (b): the stratum connect path and the won-block dispatch
+	// both submit the same block. Collapse them onto ONE delivered submitblock
+	// and replay its verdict instead of queueing another copy behind cs_main.
+	const auto key = SubmitDedupe::key_of(block_hex);
+	if (auto prior = m_submit_dedupe.lookup(key))
+	{
+		LOG_INFO << "submit_block_hex: block already delivered, skipping resubmit (prior verdict "
+		         << SubmitDedupe::name(*prior) << ")";
+		return SubmitDedupe::reached(*prior);
+	}
+	nlohmann::json result;
+	try
+	{
+		result = call_submitblock(block_hex);
+	}
+	catch (...)
+	{
+		// Answered = the daemon replied with an RPC error (a reject). Delivered
+		// = the reply was lost (read timeout); bitcoind still holds the block.
+		if (m_last_send == SendOutcome::Answered)
+			m_submit_dedupe.record(key, SubmitDedupe::Verdict::Rejected);
+		else if (m_last_send == SendOutcome::Delivered)
+			m_submit_dedupe.record(key, SubmitDedupe::Verdict::DeliveredUnknown);
+		throw;
+	}
 	// Dual-path contract: a "duplicate"/"inconclusive"/already-have result means
 	// the block already reached the network (our P2P relay, or a peer won the
 	// race) — that is SUCCESS, not failure. See core::coin::submitblock_result_accepted.
 	const bool success = core::coin::submitblock_result_accepted(result);
+	m_submit_dedupe.record(key, success ? SubmitDedupe::Verdict::Accepted
+	                                    : SubmitDedupe::Verdict::Rejected);
 	if (success)
 		LOG_INFO << "submit_block_hex accepted"
 		         << (result.is_null() ? std::string{} : " (" + result.dump() + ")");
