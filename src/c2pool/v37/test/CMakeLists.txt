@@ -672,6 +672,70 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_pool_lineage_kat COMMAND v37_xmr_pool_lineage_kat)
 
     # ------------------------------------------------------------------
+    # LANE-EPOCH -- one structure per coin: a dead lineage opens a NEW lane
+    # epoch inside the same structure by a rule that is a pure function of
+    # chain data; a fresh node joining a live epoch bootstraps a verified
+    # checkpoint from peers. Gate-OFF (flip-0) blocks are byte-identical.
+    #
+    #   v37_xmr_epoch_field_kat    V37E codec, gate/HELLO fold, flip-0 fence,
+    #                              real assembled blocks
+    #   v37_xmr_epoch_rule_kat     the deterministic rule (false start, too
+    #                              early, wrong parent, holder==fresh, both-live
+    #                              partition opens nothing, two openers)
+    #   v37_xmr_epoch_connect_kat  through XmrNode + FinalizeConnect: base HELD
+    #                              vs fix epoch opened; holder converges
+    #   v37_xmr_epoch_ckpt_kat     BOOTSTRAP checkpoint codec + verification +
+    #                              adoption (a lying peer is refused)
+    #     Listed in BOTH build.yml --target lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_epoch_field_kat
+        v37_xmr_epoch_field_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_epoch_field_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_epoch_field_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/c2pool/v37/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_epoch_field_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_epoch_field_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_epoch_field_kat COMMAND v37_xmr_epoch_field_kat)
+
+    add_executable(v37_xmr_epoch_rule_kat v37_xmr_epoch_rule_kat.cpp)
+    target_compile_features(v37_xmr_epoch_rule_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_epoch_rule_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_epoch_rule_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_epoch_rule_kat COMMAND v37_xmr_epoch_rule_kat)
+
+    foreach(_ek v37_xmr_epoch_connect_kat v37_xmr_epoch_ckpt_kat)
+        add_executable(${_ek} ${_ek}.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_compile_features(${_ek} PRIVATE cxx_std_20)
+        target_include_directories(${_ek} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+        target_compile_definitions(${_ek} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        target_link_libraries(${_ek} PRIVATE xmr_template xmr_node xmr_native_txpool xmr_coin Threads::Threads)
+        if (TARGET Boost::headers)
+            target_link_libraries(${_ek} PRIVATE Boost::headers)
+        elseif (TARGET Boost::boost)
+            target_link_libraries(${_ek} PRIVATE Boost::boost)
+        elseif (DEFINED Boost_INCLUDE_DIRS)
+            target_include_directories(${_ek} PRIVATE ${Boost_INCLUDE_DIRS})
+        endif()
+        add_test(NAME ${_ek} COMMAND ${_ek})
+        set_tests_properties(${_ek} PROPERTIES TIMEOUT 900)
+    endforeach()
+
+    # ------------------------------------------------------------------
     # The v36 fee model on the XMR lane (xmr/xmr_fee_model.hpp).
     #
     #   v37_xmr_fee_model_kat

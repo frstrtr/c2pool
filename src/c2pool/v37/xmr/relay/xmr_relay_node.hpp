@@ -586,6 +586,35 @@ public:
         return s;
     }
 
+    // ── LANE-EPOCH BOOTSTRAP (FB_GETCKPT / FB_CKPT) ─────────────────────────
+    // Main thread. The ASKING side broadcasts a GETCKPT to every ready peer and
+    // later drains the answers (verified by the caller; a liar is drop_peer'ed).
+    // The SERVING side drains the requests and answers from its own finalized
+    // snapshots only. Bounded queues; never consensus.
+    std::size_t ask_ckpt(u32 seq) {
+        std::vector<u8> pl; le::put32(pl, seq);
+        const auto f = encode_ckpt_frame(FB_GETCKPT, m_o.chain, pl);
+        std::size_t n = 0;
+        for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) ++n;
+        return n;
+    }
+    std::vector<std::pair<PeerId, u32>> drain_ckpt_requests() {
+        std::lock_guard<std::mutex> lk(m_cmtx);
+        std::vector<std::pair<PeerId, u32>> out(m_ckpt_req.begin(), m_ckpt_req.end());
+        m_ckpt_req.clear();
+        return out;
+    }
+    bool send_ckpt(PeerId p, const std::vector<u8>& ck) {
+        const auto f = encode_ckpt_frame(FB_CKPT, m_o.chain, ck);
+        return !f.empty() && m_net.send_to(p, f);
+    }
+    std::vector<std::pair<PeerId, std::vector<u8>>> drain_ckpt_answers() {
+        std::lock_guard<std::mutex> lk(m_cmtx);
+        std::vector<std::pair<PeerId, std::vector<u8>>> out(m_ckpt_ans.begin(), m_ckpt_ans.end());
+        m_ckpt_ans.clear();
+        return out;
+    }
+
     // ── receipt CONTEXT (FB_GETCTX / FB_CTX) ──────────────────────────────────
     // Main thread, the SERVING side: GETCTX requests peers sent us. The daemon
     // answers each id with send_ctx() (the block blob from its native node's
@@ -947,6 +976,7 @@ private:
         if (op == FB_BLOCK_WON) { on_block_won(p, f); return; }
         if (op == FB_GETCTX) { on_getctx(p, f); return; }
         if (op == FB_CTX) { on_ctx(p, f); return; }
+        if (op == FB_GETCKPT || op == FB_CKPT) { on_ckpt(p, f); return; }   // LANE-EPOCH bootstrap
         m_st.fb_unknown++;                                            // a future 0x45..0x4f: count, keep socket
     }
 
@@ -1094,6 +1124,20 @@ private:
         for (const auto& [q, v] : m_ctx_serve) { (void)v; if (q == p) ++from_p; }
         if (from_p >= 4 || m_ctx_serve.size() >= 64) { m_st.ctx_req_dropped++; return; }   // bounded, per peer and total
         m_ctx_serve.emplace_back(p, std::move(ids));
+    }
+    void on_ckpt(PeerId p, const std::vector<u8>& f) {
+        u8 op = 0; u32 chain = 0; std::vector<u8> pl; std::string why;
+        if (!decode_ckpt_frame(f, op, chain, pl, &why)) { m_st.malformed++; strike(p, why); return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        std::lock_guard<std::mutex> lk(m_cmtx);
+        if (op == FB_GETCKPT) {
+            if (pl.size() != 4 || m_ckpt_req.size() >= 16) return;
+            for (const auto& [q, s] : m_ckpt_req) if (q == p) return;   // one outstanding request per peer
+            m_ckpt_req.emplace_back(p, le::get32(pl.data()));
+        } else {
+            if (m_ckpt_ans.size() >= 8) return;
+            m_ckpt_ans.emplace_back(p, std::move(pl));
+        }
     }
     void on_ctx(PeerId p, const std::vector<u8>& f) {
         u32 chain = 0; bytes32 id{}; std::vector<u8> blob; std::string why;
@@ -1853,6 +1897,8 @@ private:
     mutable std::mutex m_cmtx;         // receipt-context wants + serve requests
     std::map<bytes32, CtxWant> m_ctx_want;
     std::deque<std::pair<PeerId, std::vector<bytes32>>> m_ctx_serve;
+    std::deque<std::pair<PeerId, u32>> m_ckpt_req;                     // LANE-EPOCH: GETCKPT to serve
+    std::deque<std::pair<PeerId, std::vector<u8>>> m_ckpt_ans;         // LANE-EPOCH: CKPT answers to verify
 
     std::mutex m_amtx;               // admitted queue
     std::vector<Admitted> m_admitted;

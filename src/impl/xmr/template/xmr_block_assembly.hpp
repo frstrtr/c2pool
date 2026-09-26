@@ -123,6 +123,11 @@ inline constexpr std::size_t POOL_TAG_FIELD_BYTES = 37;      // 4 magic + 1 vers
 // consumer tree c2pool/v37/xmr/xmr_paynow.hpp paynow::kPayNowTailBytes == 12,
 // static_asserted in v37_xmr_paynow_kat). Present only when pay-now is armed.
 inline constexpr std::size_t PAYNOW_TAIL_BYTES = 12;  // 4 magic + 8 u64 base
+// LANE-EPOCH: the lineage field ("V37E" | u8 fver | u32 seq | u32 version |
+// b32 parent, consumer tree xmr_credit_cut.hpp credit::kEpochFieldBytes;
+// static_asserted in v37_xmr_epoch_field_kat), just before V37P. Present only
+// under the EpochGate (gate OFF: never emitted, this bound only widens parse).
+inline constexpr std::size_t EPOCH_FIELD_BYTES = 45;  // 4 magic + 1 fver + 4 seq + 4 version + 32 parent
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -829,7 +834,7 @@ private:
             return false;
         }
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + EPOCH_FIELD_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; LANE-EPOCH: +45 V37E
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }

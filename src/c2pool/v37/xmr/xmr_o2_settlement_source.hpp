@@ -205,6 +205,10 @@ struct XmrCoinbaseContext {
     // field, xmr_credit_cut.hpp). Unset => no field (master's bytes).
     bool                  has_pool_tag = false;
     ::v37::bytes32        pool_tag{};
+    // LANE-EPOCH: the lineage this block belongs to (the V37E field right
+    // before V37P, xmr_credit_cut.hpp). Unset => no field (master's bytes).
+    bool                  has_epoch = false;
+    credit::EpochField    epoch{};
 
     // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): the projected lane payees AT the
     // credit cut above (settle::project of the view fold_eb reads there), so
@@ -498,7 +502,7 @@ public:
     [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
         std::vector<std::uint8_t> t;
         // Canonical 0x02 tail order (PAY-NOW on POOL-LINEAGE):
-        //     [ nonce | rbind? | pad | "V37N" B? | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine? ]
+        //     [ nonce | rbind? | pad | "V37N" B? | "V37D" owed_in? | "V37E" epoch? | "V37P" v pool_tag? | "V37C" P spine? ]
         // V37C stays LAST (parse_tail unchanged), V37P sits right before it
         // (parse_pool_tag), V37D before V37P, V37N first; every reader strips
         // the fields after its own from the end (xmr_paynow.hpp parse_payload).
@@ -506,6 +510,10 @@ public:
         if (x6::residual_folds_into_fixed(m_inputs)) {
             const std::vector<std::uint8_t> d = fee::encode_donation_owed_tail(x6::fold_identity_owed(m_inputs));
             t.insert(t.end(), d.begin(), d.end());
+        }
+        if (m_ctx.has_pool_tag && m_ctx.has_epoch) {   // LANE-EPOCH: V37E just before V37P (gate ON only)
+            const std::vector<std::uint8_t> e = credit::encode_epoch_field(m_ctx.epoch);
+            t.insert(t.end(), e.begin(), e.end());
         }
         if (m_ctx.has_pool_tag) {   // POOL-LINEAGE: V37P just before the credit cut
             const std::vector<std::uint8_t> f = credit::encode_pool_tag_field(m_ctx.pool_tag);

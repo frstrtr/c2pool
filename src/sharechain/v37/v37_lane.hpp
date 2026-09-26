@@ -399,6 +399,33 @@ struct FeeModelGate {
     }
 };
 
+// Lane-epoch gate (LANE-EPOCH, operator direction 09-26: ONE structure per
+// coin; consumer: src/c2pool/v37/xmr/xmr_lane_epoch.hpp). ADD-ONLY and, like
+// the gates above, NOT part of the digested lane geometry nor of lane_tag /
+// pool_tag (the structure's identity is unchanged by the flip). What it changes
+// is WHAT the consumer builds and books: every lane coinbase carries the V37E
+// lineage field, and a lineage whose history is unreachable is continued by a
+// deterministic, chain-data-only NEW LANE EPOCH instead of being HELD forever.
+// enabled == false (the default) => master-identical coinbase and booking.
+// Folded into the XMR relay's lane_params_digest when ON, so a mixed fleet
+// refuses EXPLICITLY at HELLO -- never a silent divergence.
+struct EpochGate {
+    bool enabled = false;          // ★ DEFAULT OFF (flip = consensus change)
+    std::uint32_t version = 0;     // 0 = off; 1 = V37E v1 + the E1 dead-lineage opener rule
+    std::uint64_t n_dead = 0;      // N: heights without a lane block of the current epoch before an opener is valid
+    // The coin height the epoch fold starts at (the gate's activation height).
+    // CONSENSUS: every node folds the SAME canonical blocks from here, so a node
+    // that holds the old history and a fresh node reach the same verdicts (a
+    // fold that started at a node-local lookback would not).
+    std::uint64_t origin_h = 0;
+
+    static EpochGate for_version(std::uint32_t v, std::uint64_t n_dead, std::uint64_t origin_h = 1) {
+        EpochGate g{};             // unknown version => OFF (fail-safe)
+        if (v == 1 && n_dead > 0 && origin_h > 0) { g.enabled = true; g.version = 1; g.n_dead = n_dead; g.origin_h = origin_h; }
+        return g;
+    }
+};
+
 // ── K_FLOOR: the coinbase no-dust floor coefficient (STEP-0 hotfix) ────────
 // W5 (src/c2pool/v37/w5_coinbase.hpp) emits an owed balance as a coinbase
 // output only when it clears h_min(kind) = k_floor * output_size(kind); below
@@ -462,6 +489,9 @@ struct LaneParams {
     // above). h_min(kind) = k_floor * output_size(kind). DIGEST-COMMITTED when
     // non-zero ("KFL1" in the V37H header leaf); 0 = no floor, digest-neutral.
     u64 k_floor = K_FLOOR_NONE;
+    // ADD-ONLY, digest-neutral by construction (see EpochGate): the lane-epoch
+    // rule on the XMR lane, default OFF => master-identical.
+    EpochGate epoch{};
 
     u64 epoch_len() const { return c0; }
     std::size_t levels() const { return 1 + level_caps.size(); }
