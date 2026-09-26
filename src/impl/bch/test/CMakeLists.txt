@@ -274,6 +274,13 @@ if(BUILD_TESTING)
     # standalone target would need a build.yml entry this repo's CI token cannot
     # add, which CTest would then report as a silently-passing NOT_BUILT sentinel.
     target_sources(bch_embedded_block_broadcast_test PRIVATE broadcast_gate_test.cpp)
+    # #1716 Legacy addrme self-probe KAT (legacy_addrme_self_probe_test.cpp) rides
+    # the same EXISTING allowlisted target: it drives the real bch::Legacy /
+    # bch::Actual addrme handlers, which this target already compiles
+    # (node.cpp + protocol_legacy.cpp + protocol_actual.cpp). Invoked from main()
+    # via run_legacy_addrme_self_probe_checks(); no new executable, no build.yml
+    # change, no "Not Run" (#769) or NOT_BUILT (#143) trap.
+    target_sources(bch_embedded_block_broadcast_test PRIVATE legacy_addrme_self_probe_test.cpp)
 
     # #1437 topology KAT (child-without-parent + intra-template double-spend)
     # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,
