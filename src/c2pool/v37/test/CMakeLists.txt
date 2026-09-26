@@ -750,6 +750,34 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_paynow_lineage_kat COMMAND v37_xmr_paynow_lineage_kat)
 
     # ------------------------------------------------------------------
+    # EMPTY-CUT FINDER (operator ruling 09-26, xmr/xmr_paynow.hpp): a block
+    # whose on-chain credit cut is EMPTY pays its finder -- the payee the
+    # block commits as the 0x02 field V37F (right before V37N) -- the pay-now
+    # pool (reward - 1 fee model ON, reward OFF); the receive side credits the
+    # finder from the block bytes alone and books it net. Codec, the source
+    # (fee ON/OFF), the receive rule on a real OwedLedger, REAL assembled
+    # blocks (canonical check from the on-chain V37F, a forged finder refused),
+    # a cut WITH work byte-identical to the base golden, the widest 220-byte
+    # payload. Same link shape as the pay-now lineage KAT (listed in BOTH
+    # build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_empty_cut_finder_kat
+        v37_xmr_empty_cut_finder_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_empty_cut_finder_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_empty_cut_finder_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_empty_cut_finder_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_empty_cut_finder_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_empty_cut_finder_kat COMMAND v37_xmr_empty_cut_finder_kat)
+
+    # ------------------------------------------------------------------
     # GAP-2 stage 1 -- the real c2pool-to-c2pool XMR receipt relay
     # (src/c2pool/v37/xmr/relay/, docs/xmr-lane/gap2-sharechain-relay-design.md).
     #

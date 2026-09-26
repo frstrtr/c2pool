@@ -1939,12 +1939,34 @@ static int run_live(const XmrNodeConfig& cfg) {
     // bytes (V37N base, outputs) and the fold at the on-chain cut: every node nets the
     // same amounts. A coinbase that under-pays its own commitment is REFUSED.
     std::uint64_t paynow_booked = 0, paynow_refused = 0;
+    std::uint64_t ecut_booked = 0, ecut_refused = 0;   // EMPTY-CUT FINDER
     unsigned long long paynow_netted_total = 0;
     auto paynow_net = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
                           Amounts& credit, Amounts& payout, std::string& why) -> bool {
         namespace fee = ::c2pool::v37n::xmr::fee;
         const bool fee_on = fee::fee_model_on(cfg.lane_params);
         const ::v37::bytes32 sink_id = fee_on ? fee::donation_identity(donation_net_of(cfg.network)) : cba_scfg->residual_sink_identity;
+        // EMPTY-CUT FINDER (operator ruling 09-26): a block committing a finder
+        // (V37F) credits it the pool when the fold at its cut is EMPTY; the same
+        // net booking below then requires the coinbase to pay it and nets it.
+        {
+            std::string ew; ::v37::bytes32 fid{};
+            if (!c2pool::v37n::xmr::paynow::apply_empty_cut_finder(bk.ecut_finder, bk.ecut_finder_malformed, bk.paynow_base,
+                                                                   bk.total, credit, &ew, &fid)) {
+                ++paynow_refused; ++ecut_refused; why = ew;
+                std::printf("paynow-ALARM refused: h=%llu bid=%s… %s\n", static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), ew.c_str());
+                std::fflush(stdout);
+                return false;
+            }
+            if (bk.ecut_finder) {
+                ++ecut_booked;
+                const auto it = credit.find(fid);
+                std::printf("ecut-finder: h=%llu bid=%s… finder=%s credit=%lld (empty cut: the finder's share is the work)\n",
+                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(fid).substr(0, 8).c_str(),
+                            it == credit.end() ? 0LL : it->second);
+                std::fflush(stdout);
+            }
+        }
         const Amounts gross_credit = credit, gross_payout = payout;
         const auto r = c2pool::v37n::xmr::paynow::net_booking(bk.paynow_base, bk.total, credit, payout, bk.sink_total, sink_id,
                                                               fee_on ? static_cast<long long>(fee::kDonationDustPico) : 0);
@@ -2763,8 +2785,16 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (!view || !settle::assert_ratified_geometry(*view, /*strict=*/true)) return false;
             std::size_t unresolved = 0;
             out = settle::project(*view, &unresolved);
-            return !out.empty();
+            // EMPTY-CUT FINDER: true with an EMPTY `out` = the view at the cut
+            // exists but credits nobody (the fixture then arms ecut_finder).
+            return true;
         };
+        // EMPTY-CUT FINDER (operator ruling 09-26, xmr_paynow.hpp): an empty cut
+        // pays this template's finder -- the node's own payee, committed as V37F.
+        if (cba_payee_ref && ::v37::xmr::xmr_ref_valid(*cba_payee_ref)) scfg.ecut_finder = *cba_payee_ref;
+        std::printf("ecut: EMPTY-CUT FINDER %s (an empty credit cut pays the finder = this node's payee %s…, committed as V37F)\n",
+                    scfg.ecut_finder ? "ARMED" : "OFF (no --payee-spend-hex/--payee-view-hex)",
+                    scfg.ecut_finder ? hex_of(::v37::xmr::xmr_identity_key(*scfg.ecut_finder)).substr(0, 8).c_str() : "-");
         std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);

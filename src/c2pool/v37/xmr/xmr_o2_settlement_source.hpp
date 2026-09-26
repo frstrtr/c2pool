@@ -99,6 +99,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -213,6 +214,11 @@ struct XmrCoinbaseContext {
     // has_paynow == false => no pay-now (master's residual behaviour).
     bool                  has_paynow = false;
     std::vector<::c2pool::v37n::settle::WeightedPayee> paynow_payees;
+    // EMPTY-CUT FINDER (operator ruling 09-26, xmr_paynow.hpp): when the view
+    // at the cut exists (has_paynow) but credits NOBODY (paynow_payees empty),
+    // the block pays this payee -- the template's finder -- the pay-now pool
+    // and commits it as the 0x02 field V37F. Unset => master's residual shape.
+    std::optional<::v37::ScriptRef> ecut_finder;
 
     std::uint64_t budget() const { return base_reward + fees; }
 };
@@ -405,6 +411,34 @@ public:
             }
         }
 
+        // ---- EMPTY-CUT FINDER (operator ruling 09-26, xmr_paynow.hpp) ----
+        // The view at the committed cut exists but credits nobody: the finder's
+        // own share counts as the work. The pay-now pool (what the owed pass
+        // leaves above the folded donation minimum; the whole residual with a
+        // separate sink) pays the committed finder: ONE pay-now entry whose
+        // E_b is the whole budget, so paynow_split gives it the pool exactly.
+        // Same base B as pay-now; the finder payee rides as V37F. Any other
+        // snapshot (a cut with work, no view, no finder) is byte-unchanged.
+        if (!s->m_paynow_on && ctx.has_paynow && ctx.has_credit_cut && source == KFairSource::W4Propose &&
+            ctx.paynow_payees.empty() && ctx.ecut_finder && ::v37::xmr::xmr_ref_valid(*ctx.ecut_finder) &&
+            !paynow::encode_finder_field(*ctx.ecut_finder).empty()) {
+            std::uint64_t base = fixed_sum;
+            for (const auto& e : in.owed) base += e.owed;
+            const ::v37::ScriptRef fr = *ctx.ecut_finder;
+            const ::v37::bytes32   fid = ::v37::xmr::xmr_identity_key(fr);
+            in.paynow_at = [fr, fid](std::uint64_t budget) {
+                x6::PayNowEntry e;
+                e.pay = fr;
+                e.identity = fid;
+                e.eb = budget;
+                return std::vector<x6::PayNowEntry>{e};
+            };
+            in.paynow_n = 1;
+            s->m_paynow_on = true;
+            s->m_paynow_base = base;
+            s->m_ecut_finder = fr;
+        }
+
         // ---- run X6 once at reward_hint: fixes r, R, keys, view tags, MM leaf, ORDER ----
         s->m_built = x6::build_coinbase(s->inputs_at(reward_hint, {}));
         if (!s->m_built.ok && s->m_paynow_on && s->m_built.error == x6::BuildError::CapTooSmall) {
@@ -412,6 +446,7 @@ public:
             // serves master's residual shape and commits no V37N base.
             in.paynow_at = nullptr; in.paynow_n = 0;
             s->m_paynow_on = false; s->m_paynow_base = 0;
+            s->m_ecut_finder.reset();   // EMPTY-CUT FINDER rides pay-now: dropped with it
             s->m_built = x6::build_coinbase(s->inputs_at(reward_hint, {}));
         }
         if (!s->m_built.ok)
@@ -498,11 +533,15 @@ public:
     [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
         std::vector<std::uint8_t> t;
         // Canonical 0x02 tail order (PAY-NOW on POOL-LINEAGE):
-        //     [ nonce | rbind? | pad | "V37N" B? | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine? ]
+        //     [ nonce | rbind? | pad | "V37F" finder? | "V37N" B? | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine? ]
         // V37C stays LAST (parse_tail unchanged), V37P sits right before it
         // (parse_pool_tag), V37D before V37P, V37N first; every reader strips
         // the fields after its own from the end (xmr_paynow.hpp parse_payload).
-        if (m_paynow_on) t = paynow::encode_tail(m_paynow_base);   // SAME-BLOCK PAY-NOW base (V37N), first
+        if (m_ecut_finder) t = paynow::encode_finder_field(*m_ecut_finder);   // EMPTY-CUT FINDER (V37F), before V37N
+        if (m_paynow_on) {                                                     // SAME-BLOCK PAY-NOW base (V37N)
+            const std::vector<std::uint8_t> n = paynow::encode_tail(m_paynow_base);
+            t.insert(t.end(), n.begin(), n.end());
+        }
         if (x6::residual_folds_into_fixed(m_inputs)) {
             const std::vector<std::uint8_t> d = fee::encode_donation_owed_tail(x6::fold_identity_owed(m_inputs));
             t.insert(t.end(), d.begin(), d.end());
@@ -538,6 +577,8 @@ public:
     // SAME-BLOCK PAY-NOW: armed for this snapshot, and its committed base B.
     bool                      paynow_on()   const { return m_paynow_on; }
     std::uint64_t             paynow_base() const { return m_paynow_base; }
+    // EMPTY-CUT FINDER: the committed finder payee (armed only in an empty cut).
+    const std::optional<::v37::ScriptRef>& ecut_finder() const { return m_ecut_finder; }
 
     // The full X6 result at reward_hint (empty extra_nonce => no 0x02 tag; use
     // build_at() for the template-equal tx_extra).
@@ -636,6 +677,7 @@ private:
     std::size_t          m_unpayable = 0;
     bool                 m_paynow_on = false;
     std::uint64_t        m_paynow_base = 0;
+    std::optional<::v37::ScriptRef> m_ecut_finder;   // EMPTY-CUT FINDER (V37F)
 
     x6::CoinbaseInputs   m_inputs;     // fixed part; reward + extra_nonce applied per query
     x6::BuiltCoinbase    m_built;      // X6 at reward_hint: r, R, keys, view tags, mm_root, order
