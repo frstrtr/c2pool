@@ -295,6 +295,10 @@ Every node of one pool must use the same `--pool-genesis`, `--fee-model`,
 in its HELLO and refuses a peer from another pool. The `relay:` status line counts
 those refusals as `tag_mismatch=`.
 
+With DROPS (sub-threshold credit, test builds only for now) every node of one
+pool must also use the identical `--drops-enrol` list: a node with another list
+is refused at HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… theirs=…`.
+
 Optional fee flags (fee model `v1` only): `--node-owner-fee-pct <p>` with
 `--node-owner-address <addr>` gives the node owner a share of jobs, and
 `--give-author-pct <p>` donates a share to the author. Both default to 0.
