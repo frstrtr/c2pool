@@ -52,7 +52,9 @@ namespace dash
 // oracle-conformant identity. The ONE sanctioned identity seam is
 // SharechainConfig::set_network_id, driven by the explicit --network-id/--prefix
 // flags (or their money-acked settings-file keys sharechain.network_id /
-// sharechain.prefix) in main_dash.cpp; make_coin_params() reads its result. The YAML file-load half lands when DASH gains its config_pool.cpp
+// sharechain.prefix) in main_dash.cpp; make_coin_params() reads its result.
+// The per-network share profile (SharechainConfig::share_profile(), keyed on
+// that same identity) is likewise unreachable from pool.yaml. The YAML file-load half lands when DASH gains its config_pool.cpp
 // Fileconfig (mirrors dgb/btc); this header carries no file IO.
 struct PoolOverrides
 {
@@ -126,6 +128,11 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
     // backward-compatible (legacy 1700-floor peers accept any >=1700) and is
     // REQUIRED for ratchet coherence: once two nodes ratchet their floor to 3600
     // they must each advertise >=3600 or they would reject each other.
+    // Both profiles: advertised_protocol_version equals SharechainConfig::
+    // share_profile().advertised_protocol_version (3600), and the cold floor
+    // stays 1700. The private/isolated chain's 3600 ratchet seed
+    // (share_profile().ratchet_floor_protocol_version) goes to the node's
+    // runtime accept floor in the flip slice, never into this CoinParams field.
     p.minimum_protocol_version    = SharechainConfig::MINIMUM_PROTOCOL_VERSION;
     p.advertised_protocol_version = SharechainConfig::ADVERTISED_PROTOCOL_VERSION;
     p.block_max_size           = 0;  // DASH: no segwit weight accounting
@@ -155,13 +162,25 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
     // unified cross-coin COMBINED_DONATION_SCRIPT P2SH (Bucket-2, byte-identical
     // to btc/bch/dgb/ltc). Activation height/version is gated by the G2 ratchet;
     // current_share_version stays 16 so no live share changes shape here.
-    p.donation_script_func = [](int64_t share_version) -> std::vector<unsigned char> {
+    //
+    // Private/isolated DASH v36 sharechain (--network-id, SharechainConfig::
+    // share_profile().v36_donation_p2pkh): v36 shares pay the P2PKH
+    // DONATION_SCRIPT, NOT the COMBINED P2SH. The flag is SNAPSHOTTED here at
+    // construction, the same model as the identifier copy above; on the public
+    // profile it is false and the selector is exactly the version-keyed rule.
+    // Inert today: nothing mints or verifies a v36 DASH share yet.
+    const bool v36_p2pkh = SharechainConfig::share_profile().v36_donation_p2pkh;
+    p.donation_script_func = [v36_p2pkh](int64_t share_version) -> std::vector<unsigned char> {
         if (core::version_gate::is_v36_active(static_cast<uint64_t>(share_version)))
-            return COMBINED_DONATION_SCRIPT;
+            return v36_p2pkh ? DONATION_SCRIPT : COMBINED_DONATION_SCRIPT;
         return DONATION_SCRIPT;
     };
 
-    p.current_share_version = 16;  // DASH older-than-v35 baseline (m_desired_version{16})
+    // DASH older-than-v35 baseline (m_desired_version{16}) on BOTH profiles.
+    // The flip slice sets this to SharechainConfig::share_profile().
+    // target_share_version (36 on the private/isolated chain); until then the
+    // isolated chain mints and verifies v16 exactly like the public one.
+    p.current_share_version = 16;
     p.is_testnet            = testnet;
 
     // ----- pool.yaml runtime overrides (tunable, non-consensus only) -----
