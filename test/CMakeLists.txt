@@ -286,7 +286,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # SharechainConfig statics, and test_dash_conformance /
     # test_dash_share_hash_link pin goldens on the DEFAULT identity in-process.
     # Registered in build.yml's --target allowlist (both lines) so CI builds it.
-    add_executable(test_dash_network_id_override test_dash_network_id_override.cpp)
+    # The future-timestamp bound KATs (#1825, private/isolated v36 profile only)
+    # are linked in here too: the profile is keyed on the same global identity.
+    add_executable(test_dash_network_id_override test_dash_network_id_override.cpp
+        test_dash_v36_future_timestamp.cpp test_dash_v36_future_timestamp_bound.cpp)
     target_link_libraries(test_dash_network_id_override PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

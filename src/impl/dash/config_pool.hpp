@@ -203,8 +203,12 @@ struct SharechainConfig
     ///   maintainer_only_authority      -> share_messages.hpp authority_pubkeys()
     ///                                     for decrypt/validate of message_data
     ///                                     [v36 ref-stream slice].
-    ///   future_timestamp_bound         -> share_init_verify(DashV36Share)
-    ///                                     now+600 bound [future-timestamp slice].
+    ///   future_timestamp_bound         -> share_check.hpp
+    ///                                     future_timestamp_bound_active() /
+    ///                                     check_share_timestamp_bound: now+600
+    ///                                     bound, first statement of
+    ///                                     share_init_verify (wired; the v36
+    ///                                     share verifier reuses it).
     ///   emergency_decay                -> v36 time-decay retarget on the producer
     ///                                     side [flip slice].
     struct ShareProfile
