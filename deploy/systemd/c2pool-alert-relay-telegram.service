@@ -1,0 +1,18 @@
+[Unit]
+Description=c2pool D-MINER.7 alert-relay Telegram sidecar (delivers p2p-relayed miner alerts)
+Documentation=https://github.com/frstrtr/c2pool/blob/master/docs/design/d-miner-7-p2p-alert-relay.md
+After=network-online.target
+
+[Service]
+Type=simple
+# 0600 file holding C2POOL_ALERT_SCRIPTS, C2POOL_ALERT_STATE_DIR, TELEGRAM_BOT_TOKEN,
+# TELEGRAM_CHAT_ID (see c2pool-alert-relay.env.example). The token never goes on
+# the command line (it would show up in ps / journald).
+EnvironmentFile=%h/.config/c2pool/alert-relay.env
+ExecStart=/usr/bin/env python3 ${C2POOL_ALERT_SCRIPTS}/alert_relay_telegram.py --state-dir ${C2POOL_ALERT_STATE_DIR} --chat-id ${TELEGRAM_CHAT_ID}
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
