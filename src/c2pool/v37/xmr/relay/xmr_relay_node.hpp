@@ -165,6 +165,7 @@
 #include "xmr_relay_wire.hpp"
 #include "xmr_relay_peerbook.hpp"   // RELAY-DISCOVERY
 #include "xmr_receipt_mint.hpp"
+#include "xmr_durable_order.hpp"   // REPAIR-CHAIN (F2-S)
 
 // UP-GATE: a remote HELLO read before our own up event ran for that link waits
 // for it (on_hello), and XmrRelayNode::set_test_up_delay_ms() exists.
@@ -303,6 +304,18 @@ struct RelayOptions {
     // Lane positions one receipt may span (fee model S3: 2 = (payee, donation)
     // split; 1 = the gate-OFF / master rule). Bounds the repair density check.
     u32         max_pushes_per_receipt = 1;
+    // REPAIR-CHAIN (capstone attempt 4): serve GETORDER below the vault horizon
+    // from this node's DURABLE lane order (xmr_durable_order.hpp sidecars at
+    // deep_order_path + ".order"/".digest", frames read back from
+    // receipts_log_path), and, as a requester, WALK a peer whose digest at a0
+    // differs DOWN (q = a0 - step x 2^k, aligned to step, down to 0 = the whole
+    // order) to the highest position where our own / a shadow's digest equals
+    // the peer's, then ask [q, P). false (the struct default) = RC5 byte for
+    // byte: vault-only serving, a differing peer is set aside as DEEP at once.
+    bool        deep_order = false;
+    std::string deep_order_path;                 // "" = no durable order (serving side off)
+    std::string receipts_log_path;               // the ingest's durable log (deep frames)
+    u64         deep_probe_step = 64;            // G: positions (and shadow checkpoint spacing)
     // repair context + refetch (see REPAIR CONTEXT above)
     u32         solicited_unresolved_patience_ms = 120000;   // a solicited receipt waits this long for its context
     u32         ctx_retry_ms = 2000;                         // re-ask an unanswered GETCTX (next peer) after this
@@ -383,6 +396,12 @@ struct RelayStats {
     // at a0 matched ours / was unknown there; peers proven DEEP (divergence
     // below their horizon); receipts re-offered on HELLO because still unpushed.
     std::atomic<u64> repair_horizon_rearm{0}, repair_prefix_ok{0}, repair_prefix_unknown{0}, repair_deep{0};
+    // REPAIR-CHAIN: walk probes asked, walks that found an equal point (q > 0)
+    // or fell back to the whole order (q = 0), repairs made Ready through a
+    // walk, and walks ended by an RC5 peer (BELOW_HORIZON on a walk probe) or
+    // by a lineage that fails the gate (-> DEEP, loud, as before).
+    std::atomic<u64> repair_deep_probe{0}, repair_deep_equal{0}, repair_deep_full{0}, repair_deep_ready{0};
+    std::atomic<u64> repair_deep_rc5{0}, repair_deep_lineage{0};
     std::atomic<u64> reoffer_unpushed{0};
     // REPAIR-PAGE: repair GETORDER pages asked, the largest page asked (ids),
     // pages that timed out (the page was halved) and pages that grew it.
@@ -429,6 +448,44 @@ public:
                       static_cast<u64>(Clock::now().time_since_epoch().count());
         } while (m_nonce == 0);
         m_solicited = static_cast<double>(m_o.solicited_credits);
+        // REPAIR-CHAIN (F2-S): open (truncate) the durable-order sidecars BEFORE
+        // the boot reload re-pushes the receipts log through on_pushed, which
+        // rebuilds them; then the vault serves below its horizon from them.
+        if (m_o.deep_order && !m_o.deep_order_path.empty()) {
+            std::string why;
+            if (m_dorder.open(m_o.deep_order_path, m_o.receipts_log_path, &why)) {
+                m_dorder.set_verify([](const std::vector<u8>& f, const bytes32& id) {
+                    FbReceipt r; return decode_fb_receipt(f, r) && receipt_id(r) == id;
+                });
+                ::c2pool::v37n::FrameVaultDeep d;
+                d.order = [this](std::uint32_t chain, std::uint64_t a, std::uint64_t p, std::size_t max_ids,
+                                 ::c2pool::v37n::VaultOrder& out) -> bool {
+                    if (chain != m_o.chain) return false;
+                    out.ids.clear();
+                    if (a == p) {   // a walk probe below our horizon: its answer is our digest at a (spine probe)
+                        if (a > m_dorder.next_pos()) return false;
+                        note_deep_walker(t_serving_peer);
+                        out.p_served = a; return true;
+                    }
+                    // [0, P) is what EVERY repair asks first (RC5): it stays BELOW_HORIZON
+                    // (the requester re-arms to our horizon and asks a suffix, O(horizon)
+                    // ids) unless this peer is walking (probed below our horizon lately),
+                    // i.e. its walk reached q = 0 and it needs our whole order. One
+                    // walk = one whole order: the mark is consumed here (later pages
+                    // start at a > 0).
+                    if (a == 0 && !take_deep_walker(t_serving_peer)) return false;
+                    std::vector<std::pair<u64, bytes32>> ids; u64 ps = a;
+                    if (!m_dorder.order_page(a, p, max_ids, ids, ps)) return false;
+                    for (const auto& [pos, id] : ids) out.ids.push_back(::c2pool::v37n::VaultOrderId{pos, id});
+                    out.p_served = ps;
+                    return true;
+                };
+                d.frame = [this](const bytes32& id, std::vector<std::uint8_t>& f) { return m_dorder.frame(id, f); };
+                m_vault.set_deep(std::move(d));
+            } else if (m_log) {
+                m_log("relay: REPAIR-CHAIN durable order DISABLED (" + why + "): vault-only serving (RC5)");
+            }
+        }
     }
     ~XmrRelayNode() { stop(); }
     XmrRelayNode(const XmrRelayNode&) = delete;
@@ -445,10 +502,7 @@ public:
         }
         m_serve->set_spine_probe([this](std::uint32_t chain, std::uint64_t pos) -> std::optional<bytes32> {
             if (chain != m_o.chain) return std::nullopt;
-            std::lock_guard<std::mutex> lk(m_dmtx);
-            auto it = m_pos_digest.find(pos);
-            if (it == m_pos_digest.end()) return std::nullopt;
-            return it->second;
+            return digest_at_deep(pos);   // REPAIR-CHAIN: below one horizon from the durable order (off = memory only)
         });
         m_fetch->set_id_of_frame([](const std::vector<u8>& b) -> std::optional<bytes32> {
             FbReceipt r;
@@ -464,7 +518,9 @@ public:
         m_net.set_control([this](PeerId p, const std::vector<u8>& f) {
             note_rx(p);   // RELAY-LIVENESS: a supply frame proves the link alive too
             if (!hello_ok(p)) { m_st.pre_hello_dropped++; return; }
+            t_serving_peer = p;   // REPAIR-CHAIN: the deep source knows who asks (reader thread, synchronous)
             m_serve->on_control(p, f);
+            t_serving_peer = 0;
             m_fetch->on_control(p, f);
         });
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
@@ -684,6 +740,7 @@ public:
     void on_pushed(const bytes32& id, u64 pos_first, u32 n_pushes, const std::vector<u8>& raw,
                    u64 next_after, const bytes32& digest_after) {
         (void)m_vault.insert(m_o.chain, id, pos_first, n_pushes, raw);
+        m_dorder.append(pos_first, n_pushes, id, raw.size(), next_after, digest_after);   // REPAIR-CHAIN (no-op when closed)
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_unpushed.erase(id);   // REPAIR-HORIZON: in the lane now -> the GETORDER backfill covers it
@@ -712,13 +769,41 @@ public:
         std::lock_guard<std::mutex> lk(m_dmtx);
         return m_alt_digest.count(pos) != 0;
     }
-    // Our recorded lane digest at position `pos` (the spine probe's answer).
+    // Our recorded lane digest at position `pos` (the last horizon, in memory).
     std::optional<bytes32> digest_at(u64 pos) const {
         std::lock_guard<std::mutex> lk(m_dmtx);
         auto it = m_pos_digest.find(pos);
         if (it == m_pos_digest.end()) return std::nullopt;
         return it->second;
     }
+    // REPAIR-CHAIN: the same, falling back to the durable order below the
+    // in-memory horizon (the spine probe's answer; deep_order off = digest_at).
+    std::optional<bytes32> digest_at_deep(u64 pos) const {
+        if (auto d = digest_at(pos)) return d;
+        if (!m_o.deep_order || !m_dorder.is_open()) return std::nullopt;
+        return m_dorder.digest_at(pos);
+    }
+    // REPAIR-CHAIN: peers that probed below our vault horizon in the last 30 s
+    // (a down-walk): only they are served [0, P) from the durable order.
+    void note_deep_walker(PeerId p) {
+        if (!p) return;
+        std::lock_guard<std::mutex> lk(m_walker_mtx);
+        m_deep_walkers[p] = Clock::now();
+        if (m_deep_walkers.size() > 256) m_deep_walkers.erase(m_deep_walkers.begin());
+    }
+    bool take_deep_walker(PeerId p) {
+        if (!p) return false;
+        std::lock_guard<std::mutex> lk(m_walker_mtx);
+        auto it = m_deep_walkers.find(p);
+        if (it == m_deep_walkers.end()) return false;
+        const bool fresh = Clock::now() - it->second < std::chrono::seconds(30);
+        m_deep_walkers.erase(it);
+        return fresh;
+    }
+    // REPAIR-CHAIN: the durable order's serving counters (deep pages / frames).
+    DurableLaneOrder::Stats durable_order_stats() const { return m_dorder.stats(); }
+    u64 durable_order_bytes() const { return m_dorder.disk_bytes(); }
+    bool durable_order_open() const { return m_dorder.is_open(); }
 
     // ── verified cache lookup (main thread, for a repair replay) ────────────
     // `give_author` = the u16 the receipt carries in its PoW-committed
@@ -858,7 +943,10 @@ public:
                 std::lock_guard<std::mutex> ck(m_mtx);
                 for (const auto& id : r.ids) if (!m_cache.count(id)) ++missing;
             }
-            if (!missing) { r.st = Repair::St::Ready; m_st.repair_ready++; }
+            if (!missing) {
+                r.st = Repair::St::Ready; m_st.repair_ready++;
+                if (r.walk_from.count(r.served_by)) m_st.repair_deep_ready++;   // REPAIR-CHAIN: Ready through a down-walk
+            }
         }
         if (r.st == Repair::St::Ready) { if (ids) *ids = r.ids; return RepairState::Ready; }
         const bool exhausted = (r.st == Repair::St::Idle && r.exhausted);
@@ -877,7 +965,8 @@ public:
             r.tried.insert(r.served_by);
             // REPAIR-HORIZON: a suffix order [a0, P) the peer asserted reaches the
             // spine, replayed after OUR [0, a0), did not: our prefix differs.
-            if (r.a0) { r.deep[r.served_by] = r.a0; m_st.repair_deep++; }
+            if (r.walk_from.count(r.served_by)) walk_failed_locked(r, r.served_by, /*rc5=*/false);   // REPAIR-CHAIN
+            else if (r.a0) { r.deep[r.served_by] = r.a0; m_st.repair_deep++; }
         }
         r.reset();
         m_st.repair_rejected++;
@@ -932,7 +1021,9 @@ public:
                     }
                     break;
                 case Repair::St::Ordering:
-                    s = std::string(r.probing ? "probing the prefix digest at a0=" + std::to_string(r.a0) + " of peer " : "ordering from peer ") +
+                    s = std::string(r.walk_from.count(r.cur) ? "REPAIR-CHAIN deep walk (step " + std::to_string(r.walk_k.count(r.cur) ? r.walk_k.at(r.cur) : 0) +
+                                                               " below a0=" + std::to_string(r.walk_from.at(r.cur)) + "): " : std::string()) +
+                        std::string(r.probing ? "probing the prefix digest at a0=" + std::to_string(r.a0) + " of peer " : "ordering from peer ") +
                         std::to_string(r.cur) + " (" + std::to_string(r.cursor) + "/" + std::to_string(P) + " ids" +
                         (r.a0 ? ", from a0=" + std::to_string(r.a0) : std::string()) + ", " + age(r.since) + ")";
                     break;
@@ -1253,6 +1344,16 @@ private:
         bytes32 a0_digest{}; bool has_a0_digest = false;   // the serving peer's digest at a0 (probe answer)
         PeerId rearm = 0, prefer = 0;
         std::map<PeerId, u64> deep;
+        // REPAIR-CHAIN (F2-R): the DOWN-WALK of a peer whose digest at a0
+        // differed -- the a0 it started from and the step count (this attempt),
+        // the peers whose walk ended in a lineage that cannot reach the spine or
+        // at an RC5 peer (never re-walked for this repair: DEEP as RC5 does), and
+        // the equal point a finished walk found (a re-ask probes there first).
+        std::map<PeerId, u64> walk_from;
+        std::map<PeerId, u32> walk_k;
+        std::set<PeerId> walk_checked;   // the peer's digest at P was probed == spine (its lineage reaches the cut)
+        std::set<PeerId> walk_failed;
+        std::map<PeerId, u64> walk_ok;
         Clock::time_point since = Clock::now();
         // REPAIR-PAGE liveness (#1808 review): when Ordering from `cur` began and
         // the first page it asked (0 = no page answered yet); they size the cap.
@@ -1267,6 +1368,7 @@ private:
             st = St::Idle; ids.clear(); cursor = 0; cur = 0; served_by = 0; since = Clock::now();
             a0 = 0; probing = false; has_a0_digest = false; ordering_page = 0;
             cached_seen = 0; fetch_tried.clear(); refetches = 0;
+            walk_from.clear(); walk_k.clear(); walk_checked.clear();
         }
     };
     struct CtxWant {
@@ -2375,6 +2477,46 @@ private:
         m_st.repair_page_timeouts++;
     }
 
+    // REPAIR-CHAIN (F2-R): the next ask of peer p's down-walk (m_rmtx held):
+    // q_k = a0 - G x 2^k aligned down to G (G = deep_probe_step), a zero-length
+    // probe [q, q); at q = 0 the whole order [0, P) instead (the winner's order
+    // itself -- always sufficient when this peer's lineage IS the winner's).
+    Job walk_step_locked(Repair& r, PeerId p, const Job& j) {
+        const u64 G = std::max<u64>(1, m_o.deep_probe_step);
+        const u64 from = r.walk_from[p];
+        const u32 k = r.walk_k[p]++;
+        const u64 back = k >= 40 ? from : std::min<u64>(from, G << k);
+        u64 q = from - back;
+        q -= q % G;
+        if (q == 0 && k == 0 && from > 1) q = from - 1;   // probe below the peer's horizon once before [0, P)
+        Job n = j;
+        n.max_ids = 0; n.ids.clear();
+        r.since = Clock::now();
+        r.has_a0_digest = false;
+        if (q == 0) {
+            m_st.repair_deep_full++;
+            n.probe = false; n.a = 0; n.p = r.P; n.spine = r.spine;
+            r.a0 = 0; r.cursor = 0; r.probing = false;
+            return n;
+        }
+        m_st.repair_deep_probe++;
+        n.probe = true; n.a = n.p = q; n.spine = bytes32{};
+        if (const auto d = digest_at_deep(q)) n.spine = *d;
+        r.a0 = q; r.cursor = q; r.probing = true;
+        return n;
+    }
+    // REPAIR-CHAIN: a walked peer whose order cannot reach the spine (or an RC5
+    // peer that refuses the walk) -> DEEP exactly as RC5 names it (m_rmtx held).
+    void walk_failed_locked(Repair& r, PeerId p, bool rc5) {
+        auto wf = r.walk_from.find(p);
+        if (wf == r.walk_from.end()) return;
+        r.deep[p] = wf->second;
+        r.walk_failed.insert(p);
+        r.walk_ok.erase(p);
+        m_st.repair_deep++;
+        if (rc5) m_st.repair_deep_rc5++; else m_st.repair_deep_lineage++;
+    }
+
     void on_order(PeerId p, const CtrlOrder& o) {
         // SupplyRequester now hands a NON-OK ORDER (BELOW_HORIZON, DISABLED,
         // BAD_RANGE) to the order callback too, so RepairDriver can name the
@@ -2398,7 +2540,13 @@ private:
             if (cj && cj->repair && cj->kind == Job::Kind::Order) {
                 std::lock_guard<std::mutex> lk(m_rmtx);
                 auto it = m_repairs.find(cj->key);
-                if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p) {
+                if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p &&
+                    it->second.walk_from.count(p)) {
+                    // REPAIR-CHAIN: a walk PROBE refused = an RC5 peer (no durable order):
+                    // DEEP as RC5 names it. A refused whole-order step (its walker mark
+                    // was taken by another repair of ours) is only set aside: re-walked.
+                    if (cj->probe) walk_failed_locked(it->second, p, /*rc5=*/true);
+                } else if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p) {
                     Repair& r = it->second;
                     const u64 was = r.a0_of.count(p) ? r.a0_of[p] : 0;
                     if (o.lowest_retained > was && o.lowest_retained > cj->a && o.lowest_retained < r.P) {
@@ -2434,10 +2582,11 @@ private:
         }
         // REPAIR
         if (j->probe) {   // REPAIR-HORIZON: the peer's digest at a0 vs ours
-            const auto ours = digest_at(j->a);
+            const auto ours = m_o.deep_order ? digest_at_deep(j->a) : digest_at(j->a);   // REPAIR-CHAIN: any position
             const bool alt_known = alt_digest_known(j->a);   // the shadows (reconstructed winner-side orders)
             const bool alt_eq = o.have_spine && alt_digest_is(j->a, o.spine_digest);
             bool go = false; std::string alarm;
+            std::optional<Job> walk;   // REPAIR-CHAIN: the next step of a down-walk
             {
                 std::lock_guard<std::mutex> lk(m_rmtx);
                 auto it = m_repairs.find(j->key);
@@ -2445,7 +2594,53 @@ private:
                 Repair& r = it->second;
                 if (r.st != Repair::St::Ordering || r.cur != p || !r.probing || r.a0 != j->a) return;
                 r.probing = false;
-                if (o.p_served == j->a && o.have_spine && (ours || alt_known) && !(ours && o.spine_digest == *ours) && !alt_eq) {
+                const bool differs = o.p_served == j->a && o.have_spine && (ours || alt_known) &&
+                                     !(ours && o.spine_digest == *ours) && !alt_eq;
+                const bool equal = o.p_served == j->a && o.have_spine && ((ours && o.spine_digest == *ours) || alt_eq);
+                if (r.walk_from.count(p) && !r.walk_checked.count(p)) {
+                    // REPAIR-CHAIN: the walk's first probe is [P, P): a peer whose own
+                    // digest at P is not the winner's spine cannot serve this cut from
+                    // ANY start -- name it DEEP now instead of walking its whole order
+                    if (o.p_served == j->a && o.have_spine && o.spine_digest == r.spine) {
+                        r.walk_checked.insert(p);
+                        walk = walk_step_locked(r, p, *j);
+                    } else if (!o.have_spine || o.p_served != j->a) {
+                        r.tried.insert(p); r.reset();   // the peer does not know P yet (lagging): retry later, not DEEP
+                    } else {
+                        walk_failed_locked(r, p, /*rc5=*/false);
+                        r.tried.insert(p); r.reset();
+                        alarm = "relay: REPAIR-CHAIN repair of P=" + std::to_string(r.P) + ": peer " + std::to_string(p) +
+                                "'s lane digest at P is not the winner's spine -- its lineage cannot serve this cut (peer set aside as DEEP)";
+                    }
+                } else if (r.walk_from.count(p) && !equal) {
+                    // REPAIR-CHAIN (F2-R): no equal state at this step (differs, or
+                    // unknown on either side): step further down
+                    walk = walk_step_locked(r, p, *j);
+                } else if (r.walk_from.count(p)) {
+                    m_st.repair_deep_equal++;
+                    r.walk_ok[p] = j->a;
+                    r.a0_digest = o.spine_digest; r.has_a0_digest = true;
+                    r.since = Clock::now();
+                    go = true;
+                } else if (differs && m_o.deep_order && !r.walk_failed.count(p)) {
+                    // REPAIR-CHAIN (F2-R): instead of setting the peer aside as DEEP,
+                    // walk down to where our own / a shadow's state equals the peer's
+                    r.walk_from[p] = j->a;
+                    r.walk_k[p] = 0;
+                    if (auto wo = r.walk_ok.find(p); wo != r.walk_ok.end() && wo->second < j->a) {
+                        r.walk_checked.insert(p);   // a previous walk of this peer passed the [P, P) check
+                        Job n = *j; n.a = n.p = wo->second; n.probe = true;   // the equal point a previous walk found
+                        if (const auto d = digest_at_deep(n.a)) n.spine = *d;
+                        r.a0 = r.cursor = n.a; r.probing = true; r.since = Clock::now();
+                        m_st.repair_deep_probe++;
+                        walk = std::move(n);
+                    } else {   // first: the peer's digest at P ([P, P), inside its vault)
+                        Job n = *j; n.a = n.p = r.P; n.probe = true; n.spine = r.spine; n.max_ids = 0;
+                        r.a0 = r.cursor = r.P; r.probing = true; r.since = Clock::now();
+                        m_st.repair_deep_probe++;
+                        walk = std::move(n);
+                    }
+                } else if (differs) {
                     const bool fresh = r.deep.emplace(p, j->a).second;   // log a peer's DEEP once per repair
                     r.deep[p] = j->a;
                     m_st.repair_deep++;
@@ -2461,6 +2656,7 @@ private:
                 }
             }
             if (!alarm.empty()) log(alarm);
+            if (walk) queue_job(p, std::move(*walk));
             if (go) {
                 Job n = *j; n.probe = false; n.p = j->key.first; n.spine = j->key.second;   // the suffix order [a0, P)
                 queue_job(p, std::move(n));
@@ -2518,6 +2714,7 @@ private:
             }
             if (!o.have_spine || o.spine_digest != r.spine) {
                 // this peer's order does not reach the winner's digest at P
+                if (o.have_spine) walk_failed_locked(r, p, /*rc5=*/false);   // REPAIR-CHAIN: a walked lineage -> DEEP (loud)
                 m_st.repair_spine_mismatch++; r.tried.insert(p); r.reset(); return;
             }
             m_st.repair_order_ok++;
@@ -3168,6 +3365,10 @@ private:
     std::multimap<u64, bytes32> m_alt_digest;   // REPAIR-HORIZON: the shadows' digests (note_alt_digests)
 
     ::c2pool::v37n::FrameVault m_vault;
+    mutable DurableLaneOrder m_dorder;   // REPAIR-CHAIN (F2-S); declared after m_vault, destroyed before it
+    mutable std::mutex m_walker_mtx;
+    std::map<PeerId, Clock::time_point> m_deep_walkers;   // REPAIR-CHAIN: peers walking below our horizon
+    static inline thread_local PeerId t_serving_peer = 0;
 
     // RELAY-DISCOVERY
     PeerBook m_book;                   // own lock

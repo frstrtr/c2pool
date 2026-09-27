@@ -101,7 +101,7 @@ TEST(RelayBlockHonesty, LocallyFoundBlockKeepsRealTiming) {
     // 2026-08-05 revision: this block is the FIRST in its ledger, so no
     // time_to_find exists and no luck was ever computed. The original
     // assertion pinned that fabricated 0.0 as "a genuine measured number" —
-    // and the hotel's luck-trend chart faithfully drew those zeros as a
+    // and the production node's luck-trend chart faithfully drew those zeros as a
     // catastrophe. An uncomputed luck is honest-absent null on found blocks
     // too; luck_method=first_block is the label that says why.
     EXPECT_TRUE(blk["luck"].is_null())

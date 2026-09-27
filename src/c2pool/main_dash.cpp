@@ -56,7 +56,7 @@
 
 #include <core/coin_params.hpp>
 #include <core/coinbase_builder.hpp>       // c2pool::MAX_OPERATOR_TEXT_SOLO (--coinbase-text budget SSOT)
-#include <core/core_util.hpp>              // raise_nofile_limit (hotel interim fix #4)
+#include <core/core_util.hpp>              // raise_nofile_limit (interim hardening fix #4)
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>             // NetService (dashd RPC endpoint)
 
@@ -326,7 +326,7 @@ std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE 
 // seed is disabled; the DAEMONLESS E2d checkpoint bridge STAYS ARMED so the
 // payee/MN axis still bootstraps without dashd (compiled trust anchor + P2P
 // getmnlistd anchor SML, DIP-4 self-checked against our own PoW header chain,
-// per-block merkleRootMNList forward fold — fail-closed). This is the hotel
+// per-block merkleRootMNList forward fold — fail-closed). This is the production node
 // cut-rehearsal posture: serve daemonless, keep the RPC observe-only for the
 // shadow-compare and the reward-safe fallback arm.
 //   Provenance guarantee UNCHANGED: with this flag the payee source can only
@@ -378,7 +378,7 @@ bool        g_embedded_mined_commitment_index = false; // --embedded-mined-commi
 // [BLOCK-LEDGER] — our own block accounting, from PERSISTENT state
 // ───────────────────────────────────────────────────────────────────────────
 //
-// 2026-08-05, hotel: block h=2516911 was WON by the pool and ACCEPTED by the
+// 2026-08-05, production node: block h=2516911 was WON by the pool and ACCEPTED by the
 // chain (our exact PPLNS payout structure), and NEITHER node's log showed a
 // "BLOCK FOUND" line for it — the primary's log had been rotated that morning
 // and the reserve had restarted mid-evening. Counting our own blocks by
@@ -688,7 +688,7 @@ void print_banner(const char* argv0)
         << "        --embedded-no-dashd-mn-seed cuts the PAYEE axis off from a\n"
         << "        configured dashd (no `protx list` seed) while KEEPING the\n"
         << "        daemonless E2d checkpoint bridge ARMED and the RPC observe-\n"
-        << "        only for --embedded-shadow-compare: the hotel cut-rehearsal\n"
+        << "        only for --embedded-shadow-compare: the production cut-rehearsal\n"
         << "        that serves DAEMONLESS instead of dashd-seeded. Add\n"
         << "        --embedded-fold-only-proof to also leave the bridge unarmed\n"
         << "        (strict replay-fold-only measurement, the old semantics).\n"
@@ -1199,7 +1199,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     dash::interfaces::Node coin_state;
     std::unique_ptr<dash::coin::NodeRPC> rpc;
-    // DASHD-CUT arm authority (hotel-reserve thrash fix). The dashd-fallback
+    // DASHD-CUT arm authority (reserve node thrash fix). The dashd-fallback
     // CoindRPC is constructed ONLY when the operator EXPLICITLY named a coin RPC
     // -- via --coin-rpc / --coin-daemon (endpoint), --coin-rpc-auth (creds path),
     // or a dashd-only one-shot on this path (--submit-block) -- AND creds
@@ -2334,7 +2334,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             p2p_node.tracker().m_on_share_difficulty =
                 [ws, testnet](double diff, const std::string& miner,
                               const uint256& share_hash) {
-                    // ── ENCODE THE MINER (hotel primary, 2026-08-05) ──────
+                    // ── ENCODE THE MINER (primary node, 2026-08-05) ──────
                     // The tracker reports the share's committed payout as a
                     // RAW hash160 hex, and the best_share card rendered it
                     // verbatim ("cfc7a034…3b8d") while the reserve — whose
@@ -2496,7 +2496,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // arm could not be taken from any documented invocation. resolve_embedded_
     // arm() closes that with a ONE-WAY implication: the embedded opt-in implies
     // its own feed. The converse is deliberately absent — a transport flag NEVER
-    // moves the arm (the hotel incident where --coin-p2p-connect activated an
+    // moves the arm (the production incident where --coin-p2p-connect activated an
     // unguarded embedded arm on a live production node). Pinned by
     // test_dash_stratum_work_source's DashRunArmResolution suite.
     const dash::coin::ArmResolution run_arm =
@@ -2519,7 +2519,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // coin-state feed — an explicit --coin-p2p-connect / --coin-p2p-discover,
     // or the --embedded-mainnet opt-in that implies one (#738). With NONE of
     // those on argv, coin_p2p stays null, the run path is unchanged and the
-    // mining-hotel prod posture (NodeCoinState unpopulated -> dashd-RPC
+    // production posture (NodeCoinState unpopulated -> dashd-RPC
     // fallback) is untouched. Arming the feed alone still does NOT move the
     // arm: without --embedded-mainnet, work_source keeps serving the dashd
     // fallback no matter what this block populates. The coin-network wire MAGIC (dashd pchMessageStart: mainnet
@@ -3217,7 +3217,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // vs dashd's GBT -- guard untouched) returned an empty selection forever.
     //
     // Default (flag absent): NOTHING here is constructed or subscribed -- the
-    // dashd-RPC fallback path (mining-hotel prod) is byte-unchanged. With the
+    // dashd-RPC fallback path (production) is byte-unchanged. With the
     // flag: the lane opens its LevelDB, arms the mempool's fee machinery, and
     // subscribes the coin-state block_connected seam (leg 3, the same event
     // block_connect_ingest.hpp routes to CoinStateMaintainer). The LIVE block
@@ -3456,7 +3456,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // duplicate/inconclusive/already-have as success (so an ARM A accept is
     // never re-reported as failure); what ignore_failure=true additionally
     // suppressed was the ONLY record of a REAL dashd rejection reason. On the
-    // hotel mainnet orphans (h2508929/h2509044) the bad-cb-payee verdict was
+    // production mainnet orphans (h2508929/h2509044) the bad-cb-payee verdict was
     // swallowed and the log showed just "no-ack", masking a consensus-invalid
     // block as a mere broadcast hiccup. A won-block rejection reason is
     // reward-critical diagnosis: log it loudly.
@@ -4025,7 +4025,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // freezes the CURRENT wd's tx set around it yields a merkle-
                 // consistent but consensus-INVALID block: the coinbase underpays
                 // the MN payee by the fee delta's share and dashd rejects it
-                // with bad-cb-payee (hotel mainnet h2508929: paid the exact
+                // with bad-cb-payee (production mainnet h2508929: paid the exact
                 // GBT@fees=1074 amount vs expected GBT@fees=1301 amount;
                 // h2509044: paid GBT@fees=85791 vs expected GBT@fees=88051 --
                 // both found blocks lost). desired_tx_hashes equality pins the
@@ -4709,7 +4709,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // E2d: the daemonless MN-set bridge. Constructed for the whole embedded
     // arm so the tip-changed driver below can pump it unconditionally, but
     // only ARMED on the no-RPC path (an available `protx list` is strictly
-    // better than a pinned anchor, so the hotel/RPC posture is unchanged).
+    // better than a pinned anchor, so the production/RPC posture is unchanged).
     // Declared AFTER maintainer and BEFORE coin_feed_subs so teardown order is
     // subscriptions -> lane -> maintainer -> header_chain.
     std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
@@ -7641,7 +7641,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         } else {
             // ── E2d (#738): DAEMONLESS MN-SET SEED (checkpoint bridge) ───────
             // Reached when there is NO dashd RPC, OR when --embedded-no-dashd-mn-seed
-            // is set WITHOUT --embedded-fold-only-proof (the hotel cut-rehearsal:
+            // is set WITHOUT --embedded-fold-only-proof (the production cut-rehearsal:
             // RPC present but observe-only, payee axis seeded daemonlessly). Either
             // way the `protx list` dashd seed is NOT used here. The set comes from a
             // RELEASE-PINNED CHECKPOINT compiled into this binary, replayed
@@ -10294,7 +10294,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // WHY: DASH wired NONE of set_block_verify_fn / schedule_block_
         // verification (LTC wires both, main_ltc.cpp:2105/3013/4258/6315), so a
         // DASH found block sat "pending" on the dashboard forever and orphans
-        // (e.g. hotel 2508008) were found by humans, not the board. This arms
+        // (e.g. production block 2508008) were found by humans, not the board. This arms
         // the poller: verify_found_block fires the verdict fn at +30/+150/… s
         // and flips the row to confirmed/orphaned.
         //
@@ -10429,7 +10429,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     //     template (#1038/#1039); this is the standing-state complement, so the
     //     question is answerable without provoking a decline.
     //   • [BLOCK-LEDGER] — block h=2516911 was won and accepted by the chain,
-    //     and NEITHER hotel node's log showed it: the primary's log had been
+    //     and NEITHER production node's log showed it: the primary's log had been
     //     rotated that morning and the reserve had restarted. Counting our own
     //     blocks by grepping a rotated, restart-truncated log produced two
     //     wrong answers in ten minutes. This line is sourced from the found-
@@ -10675,7 +10675,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     //     m_blockcount_cache_at (impl/dash/coin/rpc.hpp:110-111). Adding a race
     //     on the money path in order to detect a freeze is the wrong trade.
     //   * a SECOND dashd connection was already an open question in the plan
-    //     (hotel auth / connection limits) and is not something to answer by
+    //     (private-host auth / connection limits) and is not something to answer by
     //     assumption on a production node.
     // So the independent reference is the PEER-ADVERTISED height —
     // HeaderChain::peer_tip_height(), a relaxed atomic that already existed and
@@ -11077,7 +11077,7 @@ int run_mine_block(bool testnet, const std::string& rpc_endpoint,
 
 int main(int argc, char** argv)
 {
-    // Mining-hotel interim fix #4: raise RLIMIT_NOFILE to 65536 at startup
+    // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup
     // (one fd per stratum/miner session + RPC + sharechain P2P; distro-default
     // 1024 starves the accept loop). Report the effective soft limit.
     {
@@ -11685,7 +11685,7 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--web-host") == 0 && i + 1 < argc)
             web_host = argv[++i];
-        // Miner-facing host override for the dashboard Stratum URL. Both hotel
+        // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
         // external-mapped host here. Aliases match how the flag is referenced.

@@ -247,6 +247,12 @@ static std::uint32_t g_relay_grace_ms = 4000;           // --relay-bin-grace-ms 
 static std::size_t   g_relay_vault_entries = 0, g_relay_vault_bytes = 0;   // --relay-vault-entries/-bytes (0 = default)
 static std::uint64_t g_relay_vault_horizon = 0;         // --relay-vault-horizon (0 = default 8640)
 static bool          g_no_relay_serve = false;          // --no-relay-serve
+// REPAIR-CHAIN (capstone attempt 4): serve/ask relay repair orders below the vault
+// horizon from the durable lane order, and keep the repair shadows across restarts.
+static bool          g_relay_deep_order = true;         // --relay-deep-order on|off (off = RC5)
+static bool          g_relay_shadow_persist = true;     // --relay-shadow-persist on|off (off = RC5)
+static std::uint64_t g_relay_deep_probe_step = 64;      // --relay-deep-probe-step N
+static std::uint64_t g_relay_shadow_persist_bytes = 256ull << 20;   // --relay-shadow-persist-bytes N
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 // --test-crash-after-publish N (regtest rig only): the process exits (137, no cleanup) right after its
 // N-th found block was PUBLISHED and before its FOUND event reaches finalize-connect -- the window in
@@ -2026,7 +2032,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // winner-side order reconstructed here); the digest gate at P decides.
         relay::RepairReplayer::Base base_used = relay::RepairReplayer::kNone;
         auto rv = relay_replayer.replay(cfg.lane_chain, cfg.lane_params, P, spine, a0, feed_log, pushes, &base_used,
-                                        peer_a0_digest, a0 ? relay_node->digest_at(a0) : std::nullopt);
+                                        peer_a0_digest, a0 ? relay_node->digest_at_deep(a0) : std::nullopt);   // REPAIR-CHAIN: any position
         if (rv) relay_node->note_alt_digests(relay_replayer.shadow_digests());
         if (!rv) {
             relay_node->repair_reject(P, spine);
@@ -3612,6 +3618,15 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (g_relay_vault_entries) ro.vault.max_entries = g_relay_vault_entries;
             if (g_relay_vault_bytes)   ro.vault.max_bytes = g_relay_vault_bytes;
             if (g_relay_vault_horizon) ro.vault.horizon_positions = g_relay_vault_horizon;
+            // REPAIR-CHAIN (F2): the durable lane order next to the receipts log (derived
+            // sidecars, truncated + rebuilt by the boot reload below)
+            ro.deep_order = g_relay_deep_order;
+            ro.deep_probe_step = g_relay_deep_probe_step ? g_relay_deep_probe_step : 64;
+            if (g_relay_deep_order) {
+                std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
+                ro.deep_order_path = cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain);
+                ro.receipts_log_path = ro.deep_order_path + ".receipts";   // == io.durable_path below
+            }
             o2::O2RandomXVerifier* rxp = relay_rx.get();
             relay_node = std::make_unique<relay::XmrRelayNode>(
                 ro, relay_chain,
@@ -3713,6 +3728,24 @@ static int run_live(const XmrNodeConfig& cfg) {
                 relay_node->note_reloaded(a);
                 ledger.learn_ref(a.r.payee);
             });
+            // REPAIR-CHAIN (F1 + F2): shadow checkpoints for the down-walk, and the
+            // shadows of the last run restored BEFORE the relay starts (the probe
+            // accepts their digests from the first repair on).
+            if (g_relay_deep_order) relay_replayer.set_checkpoint_step(ro.deep_probe_step);
+            if (g_relay_shadow_persist) {
+                relay_replayer.enable_persist(cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".shadow",
+                                              cfg.lane_chain, ro.lane_params_digest, g_relay_shadow_persist_bytes);
+                const std::size_t nsh = relay_replayer.load();
+                if (nsh) relay_node->note_alt_digests(relay_replayer.shadow_digests());
+                const auto& ps = relay_replayer.persist_stats();
+                std::printf("relay: REPAIR-CHAIN shadows %s restored=%zu%s%s\n", relay_replayer.persist_path().c_str(), nsh,
+                            ps.load_bad ? " -- LOUD: " : "", ps.load_bad ? ps.last_error.c_str() : "");
+            }
+            std::printf("relay: REPAIR-CHAIN deep-order=%s (%s: %llu positions rebuilt from the receipts log) shadow-persist=%s probe-step=%llu\n",
+                        g_relay_deep_order ? (relay_node->durable_order_open() ? "on" : "DISABLED (sidecar error: vault-only, RC5)") : "off",
+                        ro.deep_order_path.empty() ? "-" : (ro.deep_order_path + ".order/.digest").c_str(),
+                        (unsigned long long)relay_node->durable_order_stats().positions, g_relay_shadow_persist ? "on" : "off",
+                        (unsigned long long)ro.deep_probe_step);
             std::string why;
             if (drops_store && drops) {   // ★ DROPS-RESTART: re-announce + serve our journalled carried frames; resume own wins
                 for (const auto& [b, f] : drops_store->frames()) {
@@ -4214,6 +4247,19 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)relay_repair_suffix, (unsigned long long)relay_repair_shadow, (unsigned long long)relay_repair_deep_alarms,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
+                {   // REPAIR-CHAIN: the down-walk (requester) and the durable order (server)
+                    const auto& rcs = relay_node->stats();
+                    const auto ds = relay_node->durable_order_stats();
+                    std::printf("  relay-repair-chain: walk probes=%llu equal=%llu full=%llu ready=%llu deep(rc5-peer=%llu lineage=%llu) | "
+                                "shadows=%zu persisted=%llu (%llu B) | durable order positions=%llu served pages=%llu ids=%llu frames=%llu miss=%llu\n",
+                                (unsigned long long)rcs.repair_deep_probe.load(), (unsigned long long)rcs.repair_deep_equal.load(),
+                                (unsigned long long)rcs.repair_deep_full.load(), (unsigned long long)rcs.repair_deep_ready.load(),
+                                (unsigned long long)rcs.repair_deep_rc5.load(), (unsigned long long)rcs.repair_deep_lineage.load(),
+                                relay_replayer.shadows(), (unsigned long long)relay_replayer.persist_stats().writes,
+                                (unsigned long long)relay_replayer.persist_stats().bytes, (unsigned long long)ds.positions,
+                                (unsigned long long)ds.pages, (unsigned long long)ds.ids, (unsigned long long)ds.frames,
+                                (unsigned long long)ds.frame_miss);
+                }
                 {   // SMOKE-NOISE: the value nodes compare (order-free, xmr_receipt_ingest.hpp);
                     // the ab-credit lane digest below is this node's push order (node-local by design)
                     const std::uint64_t th = relay::bin_close_height(provider.current().height, node.hw().hw_height);   // RELAY-BINCLOCK
@@ -4837,6 +4883,10 @@ int main(int argc, char** argv) {
         else if (a == "--relay-vault-bytes")        g_relay_vault_bytes = static_cast<std::size_t>(u64());
         else if (a == "--relay-vault-horizon")      g_relay_vault_horizon = u64();
         else if (a == "--no-relay-serve")           g_no_relay_serve = true;
+        else if (a == "--relay-deep-order")         g_relay_deep_order = cs::one_of(a, value(), {"on", "off"}) == "on";
+        else if (a == "--relay-shadow-persist")     g_relay_shadow_persist = cs::one_of(a, value(), {"on", "off"}) == "on";
+        else if (a == "--relay-deep-probe-step")    g_relay_deep_probe_step = u64();
+        else if (a == "--relay-shadow-persist-bytes") g_relay_shadow_persist_bytes = u64();
         else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
         else if (a == "--test-crash-after-publish")     g_test_crash_after_publish = u32();
         else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = u32();
@@ -5001,6 +5051,11 @@ int main(int argc, char** argv) {
                 "  --relay-max-outbound N       dialed relay links kept up, --relay-peer + learned (default 8)\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
                 "  --relay-vault-entries N --relay-vault-bytes N --relay-vault-horizon N  --no-relay-serve\n"
+                "  --relay-deep-order on|off    serve + ask repair orders below the vault horizon from the\n"
+                "                               durable lane order (lane<N>.order/.digest; default on; off = RC5)\n"
+                "  --relay-shadow-persist on|off keep the repair shadows across restarts (lane<N>.shadow; default on)\n"
+                "  --relay-deep-probe-step N    down-walk step / shadow checkpoint spacing (default 64)\n"
+                "  --relay-shadow-persist-bytes N  shadow file cap; above it only the newest shadow (default 256 MiB)\n"
                 "  --relay-bind none|rbind      rbind = write + require the SEAM-1 payee/give-author\n"
                 "                               binding (coinbase 0x02 [extra_nonce|rbind]); mainnet\n"
                 "                               and --fee-model v1 relays need it\n"

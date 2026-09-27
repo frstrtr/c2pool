@@ -6,7 +6,7 @@
 /// and the never-a-reject conjunct measurable PROGRAM-LEVEL over a standing
 /// soak instead of only within a single process.
 ///
-/// THE DEFECT THIS CLOSES (measured on hotel-primary, 2026-08-23): the
+/// THE DEFECT THIS CLOSES (measured on the primary node, 2026-08-23): the
 /// [EMBED-GATE-ROLLUP] denominator `observed=` equalled wall-clock since the
 /// LAST restart — 7211 s at the 06:00 tick for a 04:00 restart — because
 /// ServeGateJournal is deliberately pure policy (no I/O, no clock of its own)

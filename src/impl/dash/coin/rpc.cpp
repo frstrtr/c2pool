@@ -148,7 +148,7 @@ void NodeRPC::bump_sync_backoff()
 
 void NodeRPC::sync_reconnect()
 {
-    // DASHD-CUT thrash fix (hotel-reserve 2026-08-15). Two changes vs the old
+    // DASHD-CUT thrash fix (reserve node 2026-08-15). Two changes vs the old
     // "fire observer FIRST, then blindly re-attempt" body:
     //
     //  (1) BACKOFF (no hot spin): a dead dashd returns "Connection refused"

@@ -658,7 +658,7 @@ def decode_scriptsig(raw_hex):
         result["components"].append({"type": "pool_tag", "value": "UNKNOWN", "offset": 0})
 
     # NB: c2pool does NOT write a state_root into the coinbase scriptSig.
-    # Verified against the real hotel DASH won-block 2507753 (integrator
+    # Verified against the real production DASH won-block 2507753 (integrator
     # 2026-07-25): the scriptSig carries only a BARE ascii "c2pool" tag (no
     # slashes) and NO state_root. Detecting on a slashed "/c2pool/" tag or on a
     # scriptSig state_root both fail on real chain data. The on-chain state
