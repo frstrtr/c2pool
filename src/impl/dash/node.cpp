@@ -1074,7 +1074,9 @@ void NodeImpl::start_outbound_connections()
 // One outbound dial-maintenance pass (btc/ltc node.cpp:1289-1327 port). Runs
 // on the IO thread: once from start_outbound_connections() and then on every
 // 30 s m_connect_timer tick. An address stays in m_pending_outbound from the
-// dial until connected(), error() or close_connection() clears it. A member
+// dial until the dial resolves: connected() on success, error() /
+// close_connection() once a socket existed, connect_failed() when it never did
+// (#1835: without that last one a refused dial was never retried). A member
 // (not a lambda) so the dial pass can be driven directly by a KAT.
 void NodeImpl::try_connect_peers()
 {
