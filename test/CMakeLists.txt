@@ -288,8 +288,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # Registered in build.yml's --target allowlist (both lines) so CI builds it.
     # The future-timestamp bound KATs (#1825, private/isolated v36 profile only)
     # are linked in here too: the profile is keyed on the same global identity.
+    # So are the v36 ref-stream / share_init_verify(DashV36Share) /
+    # message_data KATs (test_dash_v36_ref_stream_verify.cpp): the message
+    # authority set is selected by the same profile.
     add_executable(test_dash_network_id_override test_dash_network_id_override.cpp
-        test_dash_v36_future_timestamp.cpp test_dash_v36_future_timestamp_bound.cpp)
+        test_dash_v36_future_timestamp.cpp test_dash_v36_future_timestamp_bound.cpp
+        test_dash_v36_ref_stream_verify.cpp)
     target_link_libraries(test_dash_network_id_override PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
