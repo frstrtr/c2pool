@@ -1308,10 +1308,10 @@ TEST(NodeInfoRuntimeEndpoint, ExternalIpAndP2pPortSurfaced) {
     EXPECT_EQ(before.value("external_ip", std::string{}), "0.0.0.0");
     EXPECT_EQ(before.value("p2p_port", -1), 0);
 
-    mi.set_external_ip("158.220.92.171");
+    mi.set_external_ip("203.0.113.10");
     mi.set_p2p_port(9337);
     auto after = mi.rest_node_info();
-    EXPECT_EQ(after.value("external_ip", std::string{}), "158.220.92.171");
+    EXPECT_EQ(after.value("external_ip", std::string{}), "203.0.113.10");
     EXPECT_EQ(after.value("p2p_port", -1), 9337);
 }
 

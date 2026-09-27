@@ -253,7 +253,7 @@ int main() {
         AddrEntry z = a4; z.port = 0;
         C(encode_addr(7, {z}).empty(), "W8 port 0 not encodable");
         auto is_pub = [](const char* h) { AddrEntry e; return addr_entry_of(h, 1, 0, e) && addr_routable(e); };
-        C(is_pub("109.123.238.32") && is_pub("158.220.92.171") && is_pub("2001:4860::1"), "W8 public addresses are routable");
+        C(is_pub("1.1.1.1") && is_pub("8.8.8.8") && is_pub("2001:4860::1"), "W8 public addresses are routable");
         C(!is_pub("127.0.0.1") && !is_pub("10.1.2.3") && !is_pub("192.168.86.114") && !is_pub("172.20.0.1") &&
           !is_pub("100.64.0.1") && !is_pub("169.254.1.1") && !is_pub("0.0.0.0") && !is_pub("224.0.0.1") &&
           !is_pub("::1") && !is_pub("fd00::1") && !is_pub("fe80::1") && !is_pub("::ffff:192.168.1.1"),

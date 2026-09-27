@@ -932,7 +932,7 @@ TEST(WebHonestyRegression, PatronSendmanySelfLabelsAsStubNeverFabricatesPayouts)
 // ── Stratum-URL external_ip override (DASH NAT/port-mapped nodes) ──────────
 // The dashboard Stratum-URL card renders nodeInfo.external_ip
 // (dashboard.html:2889-2892). When a node NATs out through a shared gateway
-// (both production DASH nodes: LAN 192.168.1.x, one public 31.172.65.125), the
+// (both production DASH nodes: LAN 192.168.1.x, one shared public address), the
 // auto-detected OUTBOUND IP is NOT the address miners dial -- they reach the
 // external-mapped hosts. c2pool-dash exposes
 // --external-ip (alias --stratum-advertise / --public-host) which feeds
@@ -951,7 +951,7 @@ TEST(WebHonestyRegression, NodeInfoExternalIpUnsetIsHonestlyUnspecified) {
 TEST(WebHonestyRegression, NodeInfoExternalIpServesOperatorAdvertisedHost) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
     // Operator advertises the real miner-facing external-mapped host (primary
-    // production node), NOT the auto-detected 31.172.65.125 NAT gateway.
+    // production node), NOT the auto-detected shared NAT gateway address.
     mi.set_external_ip("203.0.113.10");
     json ni = mi.rest_node_info();
     EXPECT_EQ(ni.value("external_ip", std::string{}), "203.0.113.10")

@@ -650,7 +650,7 @@ inline constexpr const char* const kEnglish[] = {
     "hope",
     "hornet",
     "hospital",
-    "ho" "tel",  // adjacent literals: same word
+    "hotel",
     "hounded",
     "hover",
     "howls",
