@@ -367,6 +367,25 @@ public:
         return cur_.holds(s) || next_.holds(s);
     }
 
+    // DROPS-VERIFY-SCALE: read-only views for EXTRA light VMs bound to this
+    // verifier's resident caches (O2RandomXVerifier's per-worker VMs). A
+    // randomx_cache is read-only after randomx_init_cache, so any number of VMs
+    // may hash on it concurrently; the CALLER guarantees no slot is replaced
+    // (adopt / prefetch_epoch) while such a VM hashes, and re-binds every extra
+    // VM after a replacement (the cache it was bound to may have been freed).
+    randomx_cache* resident_cache(const SeedHash& s) const noexcept {
+        if (cur_.holds(s))  return cur_.raw();
+        if (next_.holds(s)) return next_.raw();
+        return nullptr;
+    }
+    // The VM flags this verifier's own VM was created with (JIT, or the
+    // interpreter fallback), so an extra VM hashes exactly like it.
+    randomx_flags light_vm_flags() const noexcept { return vm_flags(opts_); }
+    bool has_vm() const noexcept { return vm_ != nullptr; }
+    // An allocated cache (keyed or not) to CREATE an extra VM on: a light VM
+    // must be created with a cache; the caller re-binds it before hashing.
+    randomx_cache* any_cache() const noexcept { return cur_.ok() ? cur_.raw() : next_.raw(); }
+
     // The flags a slot of THIS verifier is allocated with, so a cache built
     // elsewhere (adopt() below) is interchangeable with the resident ones.
     randomx_flags slot_cache_flags() const noexcept { return cache_flags(opts_); }
