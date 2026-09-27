@@ -80,6 +80,10 @@ Then go on with [The pinned snapshot](#4-the-pinned-snapshot).
 
 ## 3. Or build from source
 
+For the full, tested walk-through on a fresh Ubuntu 24.04 (pinned Conan,
+commit check, tests, hash comparison, packaging your own binary) see
+[BUILD-FROM-SOURCE.md](BUILD-FROM-SOURCE.md). The short version follows.
+
 ### 3.1 Install packages (admin, once)
 
 <!-- check build -->
