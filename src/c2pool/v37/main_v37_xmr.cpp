@@ -204,7 +204,8 @@ static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-ter
 // node-local JOB policy under the gate: they decide only what THIS node's jobs
 // commit to (the payee + the give-author u16 in the PoW-bound receipt), never
 // how any receipt is folded. The donation output itself has NO knob.
-static double        g_give_author_pct = 0.0;            // --give-author-pct P: the u16 this node's receipts carry (default 0)
+static double        g_give_author_pct = 0.1;            // --give-author-pct P: the u16 this node's receipts carry (default 0.1 with --fee-model v1; 0 opts out)
+static bool          g_give_author_set = false;          // --give-author-pct given explicitly (the fee-model-OFF refusal reads only an explicit value)
 static double        g_owner_fee_pct = 0.0;              // --node-owner-fee-pct P: probability (%) a job commits to the owner
 static std::string   g_owner_address;                    // --node-owner-address ADDR: the owner's standard address
 // R-C rework-3 ruled defaults (docs/xmr-lane/r-c-rework-3.md).
@@ -1526,11 +1527,12 @@ static int run_live(const XmrNodeConfig& cfg) {
     } else if (cfg.lane_params.fee.enabled) {
         std::printf("REFUSED: unknown fee-model version %u\n", cfg.lane_params.fee.version);
         return 2;
-    } else if (g_give_author_pct != 0.0 || g_owner_fee_pct != 0.0 || !g_owner_address.empty()) {
+    } else if ((g_give_author_set && g_give_author_pct != 0.0) || g_owner_fee_pct != 0.0 || !g_owner_address.empty()) {
         std::printf("REFUSED: --give-author-pct / --node-owner-fee-pct / --node-owner-address need --fee-model v1 "
                     "(the fee model is OFF: this node is master-identical)\n");
         return 2;
     }
+    if (!cfg.lane_params.fee.enabled) g_give_author_pct = 0.0;   // the 0.1 default is a fee-model-v1 default only
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -4697,7 +4699,7 @@ int main(int argc, char** argv) {
             else throw cs::UsageError("--fee-model takes off|v1, got '" + m + "'");
         }
         // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
-        else if (a == "--give-author-pct")    g_give_author_pct = cs::to_double(a, value());
+        else if (a == "--give-author-pct")    { g_give_author_pct = cs::to_double(a, value()); g_give_author_set = true; }
         else if (a == "--node-owner-fee-pct") g_owner_fee_pct = cs::to_double(a, value());
         else if (a == "--node-owner-address") g_owner_address = value();
         else if (a == "--settle-h-min") cfg.settle_h_min = u64();
@@ -4949,7 +4951,8 @@ int main(int argc, char** argv) {
                 "                               by their PoW-bound give-author u16. Every peer must\n"
                 "                               agree (folded into the relay HELLO digest)\n"
                 "  --give-author-pct <p>        (v1) give-author %% carried as a u16 in the receipts\n"
-                "                               THIS node's jobs bind (default 0; folded everywhere)\n"
+                "                               THIS node's jobs bind (default 0.1; 0 opts out; folded\n"
+                "                               everywhere)\n"
                 "  --node-owner-fee-pct <p>     (v1) probability %% that a job commits to the node\n"
                 "                               owner instead of the miner (default 0; job issue)\n"
                 "  --node-owner-address <addr>  (v1) the node owner's standard address\n"
