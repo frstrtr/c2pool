@@ -956,7 +956,7 @@ if (BUILD_TESTING)
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat)
 
     #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
     #                               relay repair of a lane longer than every
@@ -997,6 +997,23 @@ if (BUILD_TESTING)
         target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
         add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
     endforeach()
+    #   v37_xmr_relay_discovery_kat RELAY-DISCOVERY: FB_GETADDR/FB_ADDR (0x4c/0x4d)
+    #                               peer exchange; five nodes knowing only node 0
+    #                               mesh to >= 3 links each; another pool's node
+    #                               is refused + never good; a restart with node 0
+    #                               down reconnects from the persisted book; ADDR
+    #                               flood / GETADDR burst limits; discovery OFF =
+    #                               fb_unknown. ALSO on BOTH build.yml --target lists.
+    #   v37_xmr_relay_peerstore_kat the persisted book on core::AddrStore
+    #                               (xmr_relay_peerstore): round-trip, a smaller
+    #                               set over a larger one, corrupt / absent file.
+    if (TARGET xmr_relay_peerstore)
+        add_executable(v37_xmr_relay_peerstore_kat v37_xmr_relay_peerstore_kat.cpp)
+        target_compile_features(v37_xmr_relay_peerstore_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_relay_peerstore_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(v37_xmr_relay_peerstore_kat PRIVATE xmr_relay_peerstore)
+        add_test(NAME v37_xmr_relay_peerstore_kat COMMAND v37_xmr_relay_peerstore_kat)
+    endif()
     # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
     # enrolment book is node-local, so a lane block books the WINNER's composed
     # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book

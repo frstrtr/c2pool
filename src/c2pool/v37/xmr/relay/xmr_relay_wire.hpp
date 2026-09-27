@@ -30,6 +30,10 @@
 //         0x48 FB_PING       RELAY-LIVENESS keepalive probe (u64 nonce; no consensus bytes)
 //         0x49 FB_PONG       its echo (same nonce)
 //       (a pre-0x48 node counts 0x48/0x49 as fb_unknown and KEEPS the socket)
+//         0x4a/0x4b      RESERVED (LANE-EPOCH)
+//         0x4c FB_GETADDR    RELAY-DISCOVERY: ask for relay addresses of this pool
+//         0x4d FB_ADDR       the answer: <= 256 x (family, ip, port, last_seen)
+//       (a pre-0x4c node counts 0x4c/0x4d as fb_unknown and KEEPS the socket)
 //     0x80..0x83   carrier_supply.hpp GETORDER/ORDER/GETFRAMES/FRAMES (reused)
 //
 // Every integer is little-endian, every decoder is TOTAL and BOUNDED (a bad
@@ -65,6 +69,10 @@
 // src/sharechain/v37 beyond the descriptor / lane-param TYPES it reads.
 // ===========================================================================
 #pragma once
+
+#include <arpa/inet.h>   // RELAY-DISCOVERY: inet_pton / inet_ntop (POSIX, as carrier_net.hpp)
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include <array>
 #include <cstddef>
@@ -110,6 +118,9 @@ inline constexpr u8  FB_DROPINV   = 0x46;   // ★ DROPS backfill: the raindrop 
 inline constexpr u8  FB_GETWON    = 0x47;   // ★ DROPS-RESTART (gate ON only): ask any peer for a carried FB_BLOCK_WON v0x02 by bid
 inline constexpr u8  FB_PING      = 0x48;   // RELAY-LIVENESS
 inline constexpr u8  FB_PONG      = 0x49;   // RELAY-LIVENESS
+// 0x4a / 0x4b are RESERVED for LANE-EPOCH: never reuse them here.
+inline constexpr u8  FB_GETADDR   = 0x4c;   // RELAY-DISCOVERY: ask a peer for relay addresses of this pool
+inline constexpr u8  FB_ADDR      = 0x4d;   // RELAY-DISCOVERY: the answer (bounded sample of known-good peers)
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -777,6 +788,126 @@ inline bool decode_ping(const std::vector<u8>& f, u8& op, u64& nonce, std::strin
     if (f[1] != kFbVersion) return bad("ping: unknown version");
     op = f[0];
     nonce = le::get64(f.data() + 2);
+    return true;
+}
+
+// ── FB_GETADDR (0x4c) / FB_ADDR (0x4d): RELAY-DISCOVERY ─────────────────────
+// Peer discovery for the relay (mirrors v36 getaddrs/addrs): after HELLO ok a
+// node asks a peer for relay addresses; the peer answers with a random sample
+// of the peers it has itself completed a HELLO with (same pool id + network:
+// a HELLO-gated link never carries another pool's frames). Nothing here enters
+// a lane, a digest or a coinbase.
+//   GETADDR : u8 0x4c ; u8 ver ; u32 chain_id ; u16 want (1..256)          (8 B)
+//   ADDR    : u8 0x4d ; u8 ver ; u32 chain_id ; u16 n (0..256) ; n x entry
+//   entry   : u8 family (4|6) ; ip 16 B (IPv4 = 4 B + 12 zero B) ; u16 port (!= 0) ; u64 last_seen (unix s)
+inline constexpr std::size_t kAddrMaxEntries  = 256;
+inline constexpr std::size_t kGetAddrBytes    = 1 + 1 + 4 + 2;
+inline constexpr std::size_t kAddrHeader      = 1 + 1 + 4 + 2;
+inline constexpr std::size_t kAddrEntryBytes  = 1 + 16 + 2 + 8;
+inline constexpr std::size_t kAddrMaxFrame    = kAddrHeader + kAddrMaxEntries * kAddrEntryBytes;
+inline constexpr u8          kAddrFamV4 = 4, kAddrFamV6 = 6;
+
+struct AddrEntry {
+    u8 family = kAddrFamV4;
+    std::array<u8, 16> ip{};
+    u16 port = 0;
+    u64 last_seen = 0;
+    bool operator==(const AddrEntry&) const = default;
+};
+
+// "a.b.c.d" / IPv6 literal -> entry. false on anything else (no DNS here).
+inline bool addr_entry_of(const std::string& host, u16 port, u64 last_seen, AddrEntry& e) {
+    e = AddrEntry{}; e.port = port; e.last_seen = last_seen;
+    in_addr a4{};
+    if (::inet_pton(AF_INET, host.c_str(), &a4) == 1) { e.family = kAddrFamV4; std::memcpy(e.ip.data(), &a4, 4); return port != 0; }
+    in6_addr a6{};
+    if (::inet_pton(AF_INET6, host.c_str(), &a6) == 1) { e.family = kAddrFamV6; std::memcpy(e.ip.data(), &a6, 16); return port != 0; }
+    return false;
+}
+inline std::string addr_host(const AddrEntry& e) {
+    char b[INET6_ADDRSTRLEN] = {0};
+    if (e.family == kAddrFamV4) ::inet_ntop(AF_INET, e.ip.data(), b, sizeof b);
+    else ::inet_ntop(AF_INET6, e.ip.data(), b, sizeof b);
+    return b;
+}
+// Publicly routable? false for unspecified, loopback, RFC1918, CGNAT, link-local,
+// multicast / reserved (v4) and ::, ::1, fc00::/7, fe80::/10, ff00::/8, v4-mapped
+// private (v6). A private address is never handed to a public peer.
+inline bool addr_routable(const AddrEntry& e) {
+    const u8* p = e.ip.data();
+    auto v4 = [](const u8* q) {
+        if (q[0] == 0 || q[0] == 10 || q[0] == 127 || q[0] >= 224) return false;
+        if (q[0] == 169 && q[1] == 254) return false;
+        if (q[0] == 172 && (q[1] & 0xf0) == 16) return false;
+        if (q[0] == 192 && q[1] == 168) return false;
+        if (q[0] == 100 && (q[1] & 0xc0) == 64) return false;
+        return true;
+    };
+    if (e.family == kAddrFamV4) return v4(p);
+    static const u8 mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (std::memcmp(p, mapped, 12) == 0) return v4(p + 12);
+    bool zero15 = true;
+    for (int i = 0; i < 15; ++i) zero15 = zero15 && p[i] == 0;
+    if (zero15 && (p[15] == 0 || p[15] == 1)) return false;          // :: and ::1
+    if ((p[0] & 0xfe) == 0xfc) return false;                          // fc00::/7
+    if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80) return false;          // fe80::/10
+    if (p[0] == 0xff) return false;                                   // multicast
+    return true;
+}
+
+inline std::vector<u8> encode_getaddr(u32 chain_id, u16 want) {
+    if (want == 0 || want > kAddrMaxEntries) return {};
+    std::vector<u8> f; f.reserve(kGetAddrBytes);
+    f.push_back(FB_GETADDR); f.push_back(kFbVersion); le::put32(f, chain_id); le::put16(f, want);
+    return f;
+}
+inline bool decode_getaddr(const std::vector<u8>& f, u32& chain_id, u16& want, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() != kGetAddrBytes) return bad("getaddr: wrong length");
+    if (f[0] != FB_GETADDR) return bad("getaddr: wrong opcode");
+    if (f[1] != kFbVersion) return bad("getaddr: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    want = le::get16(f.data() + 6);
+    if (want == 0 || want > kAddrMaxEntries) return bad("getaddr: want out of range");
+    return true;
+}
+inline std::vector<u8> encode_addr(u32 chain_id, const std::vector<AddrEntry>& v) {
+    if (v.size() > kAddrMaxEntries) return {};
+    std::vector<u8> f; f.reserve(kAddrHeader + v.size() * kAddrEntryBytes);
+    f.push_back(FB_ADDR); f.push_back(kFbVersion); le::put32(f, chain_id); le::put16(f, static_cast<u16>(v.size()));
+    for (const auto& e : v) {
+        if ((e.family != kAddrFamV4 && e.family != kAddrFamV6) || e.port == 0) return {};
+        f.push_back(e.family);
+        if (e.family == kAddrFamV4) { f.insert(f.end(), e.ip.begin(), e.ip.begin() + 4); f.insert(f.end(), 12, 0); }
+        else f.insert(f.end(), e.ip.begin(), e.ip.end());
+        le::put16(f, e.port); le::put64(f, e.last_seen);
+    }
+    return f;
+}
+inline bool decode_addr(const std::vector<u8>& f, u32& chain_id, std::vector<AddrEntry>& out, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    out.clear();
+    if (f.size() < kAddrHeader || f.size() > kAddrMaxFrame) return bad("addr: wrong length");
+    if (f[0] != FB_ADDR) return bad("addr: wrong opcode");
+    if (f[1] != kFbVersion) return bad("addr: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    const std::size_t n = le::get16(f.data() + 6);
+    if (n > kAddrMaxEntries) return bad("addr: too many entries");
+    if (f.size() != kAddrHeader + n * kAddrEntryBytes) return bad("addr: length != n entries");
+    out.reserve(n);
+    const u8* p = f.data() + kAddrHeader;
+    for (std::size_t i = 0; i < n; ++i, p += kAddrEntryBytes) {
+        AddrEntry e;
+        e.family = p[0];
+        if (e.family != kAddrFamV4 && e.family != kAddrFamV6) { out.clear(); return bad("addr: unknown family"); }
+        std::memcpy(e.ip.data(), p + 1, 16);
+        if (e.family == kAddrFamV4)
+            for (int k = 4; k < 16; ++k) if (e.ip[k] != 0) { out.clear(); return bad("addr: ipv4 padding not zero"); }
+        e.port = le::get16(p + 17);
+        if (e.port == 0) { out.clear(); return bad("addr: port 0"); }
+        e.last_seen = le::get64(p + 19);
+        out.push_back(e);
+    }
     return true;
 }
 

@@ -928,6 +928,15 @@ target_link_libraries(xmr_web_dashboard PRIVATE ${XMR_WEB_SECP256K1_STATIC}
                                                 core c2pool_merged_mining c2pool_payout
                                                 c2pool_hashrate ltc_coin)
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_web_dashboard)
+# RELAY-DISCOVERY: the relay's persistent peer book on core::AddrStore
+# (v37/xmr/relay/xmr_relay_peerstore.hpp). Same pattern as xmr_web_dashboard:
+# a STATIC archive linking core PRIVATE, behind a core-free header, so the
+# daemon TU never sees core's include paths.
+add_library(xmr_relay_peerstore STATIC v37/xmr/relay/xmr_relay_peerstore.cpp)
+target_compile_features(xmr_relay_peerstore PRIVATE cxx_std_20)
+target_include_directories(xmr_relay_peerstore PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(xmr_relay_peerstore PRIVATE core)
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_relay_peerstore)
 # Reproducible release (docs/xmr-lane/REPRODUCIBLE-BUILD.md): the daemon links
 # only static archives, Boost headers and system libs, so the build RUNPATH CMake
 # derives from the Conan link dirs (<CONAN_HOME>/p/boost.../p/lib, which holds no
