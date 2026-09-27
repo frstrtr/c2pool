@@ -20,10 +20,13 @@
 //        split (payee 65535-d, donation d), conserving, both signs, folded base
 //        included, donation row never re-split, zero rows dropped.
 //   DD4  the shell applies DD3 under the fee model and records the u16 (source).
+//   DD5  DROPS-AUTO-ENROL: auto (default) enrols every payee at its first lane
+//        share; list / none unchanged / nobody; HELLO names a mode mismatch.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -127,6 +130,45 @@ int main() {
     dx::split_give_author(zz, lp, DON);
     check(zz.empty(), "DD3 zero rows are dropped (canonical carriage)");
 
+    std::printf("-- DD5 DROPS-AUTO-ENROL: auto (default) / list / none, and HELLO names a mode mismatch\n");
+    {
+        using rl::EnrolMode;
+        dx::LanePrefix ep;
+        ep.shares = {{P, 12, 0}, {Q, 10, 0}, {P, 11, 0}, {R, 14, 0}};
+        ep.base_first[key(5)] = 3;   // a folded payee (first share at bin 3)
+        const auto a = dx::lane_enrollment(ep, {}, EnrolMode::Auto);
+        const auto* ap = a.find(P); const auto* aq = a.find(Q); const auto* ar = a.find(R); const auto* a5 = a.find(key(5));
+        check(ap && aq && ar && a5 && ap->effective_from == 12 && aq->effective_from == 11 && ar->effective_from == 15 &&
+              a5->effective_from == 4,
+              "DD5 auto: EVERY payee of the prefix (folded base included) enrols at its first share, effective bin+1");
+        const auto l = dx::lane_enrollment(ep, {P}, EnrolMode::List);
+        check(l.find(P) && !l.find(Q) && !l.find(R) && l.book_digest() == dx::lane_enrollment(ep, {P}).book_digest(),
+              "DD5 list: only the listed payee, byte-identical to the pre-auto rule");
+        check(dx::lane_enrollment(ep, {P, Q}, EnrolMode::None).book_digest() == ::c2pool::v37n::empty_enrollment_digest() &&
+              dx::lane_enrollment(ep, {}).book_digest() == ::c2pool::v37n::empty_enrollment_digest(),
+              "DD5 none: nobody (and the pre-auto empty list is still the empty book)");
+        check(dx::enrol_mode_digest(EnrolMode::List, {P, Q}) == dx::enrol_set_digest({P, Q}) &&
+              dx::hello_digest_with_enrol(key(40), EnrolMode::List, {P, Q}) == dx::hello_digest_with_enrol(key(40), {P, Q}),
+              "DD5 list mode HELLO digests are byte-identical to the list-only builds");
+        auto hm = [&](EnrolMode m, std::set<bytes32> s, std::uint64_t nonce) {
+            rl::Hello h = hello_of(cfg.lane_params, rl::kXmrPoolRulesVersion, nonce);
+            h.lane_params_digest = dx::hello_digest_with_enrol(h.lane_params_digest, m, s);
+            h.enrol_set = dx::enrol_mode_digest(m, s);
+            return h;
+        };
+        const auto au1 = hm(EnrolMode::Auto, {}, 11), au2 = hm(EnrolMode::Auto, {}, 12);
+        const auto li = hm(EnrolMode::List, {P, Q}, 13), no = hm(EnrolMode::None, {}, 14);
+        const std::string m1 = rl::hello_mismatch(au1, li), m2 = rl::hello_mismatch(au1, no), m3 = rl::hello_mismatch(li, no);
+        std::printf("    auto vs list: \"%s\"\n", m1.c_str());
+        check(rl::hello_mismatch(au1, au2).empty(), "DD5 two auto nodes stay HELLO-compatible");
+        check(m1.rfind(rl::kEnrolSetMismatch, 0) == 0 && m1.find("ours=auto") != std::string::npos && m1.find("theirs=list") != std::string::npos,
+              "DD5 auto vs list: refused ENROL_SET_MISMATCH naming both modes");
+        check(m2.rfind(rl::kEnrolSetMismatch, 0) == 0 && m2.find("ours=auto") != std::string::npos && m2.find("theirs=none") != std::string::npos,
+              "DD5 auto vs none: refused by name");
+        check(m3.rfind(rl::kEnrolSetMismatch, 0) == 0 && m3.find("ours=list") != std::string::npos && m3.find("theirs=none") != std::string::npos,
+              "DD5 list vs none: refused by name");
+    }
+
     std::printf("-- DD4 the shell wires it (source)\n");
 #ifdef V37_XMR_SHELL_SRC
     const std::string src = slurp(V37_XMR_SHELL_SRC);
@@ -136,6 +178,10 @@ int main() {
     check(src.find("a.r.side.give_author);   // ★ d5") != std::string::npos &&
           src.find("(void)relay_node->cached(id, nullptr, &give);") != std::string::npos,
           "DD4 own and repaired lane prefixes carry the receipt's give-author u16");
+    check(src.find("g_drops_enrol.empty() ? relay::EnrolMode::Auto : relay::EnrolMode::List") != std::string::npos &&
+          src.find("drops->set_enrol_mode(emode);") != std::string::npos &&
+          src.find("enrol_mode_digest(drops->enrol_mode(), drops->enrol_set())") != std::string::npos,
+          "DD4 the shell defaults to AUTO (no --drops-enrol), sets the mode and carries the mode digest in HELLO");
 #else
     check(false, "DD4 V37_XMR_SHELL_SRC defined");
 #endif

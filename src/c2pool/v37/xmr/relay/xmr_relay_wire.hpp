@@ -78,6 +78,7 @@
 #include <sharechain/v37/v37_hash.hpp>             // ::v37::bytes32
 #include <sharechain/v37/v37_descriptor_xmr.hpp>   // ScriptRef, XMR_STD/XMR_SUB, xmr_identity_key
 #include <sharechain/v37/v37_lane.hpp>             // ::v37::LaneParams (read-only, for the HELLO digest)
+#include <c2pool/v37/xmr/xmr_enrol_mode.hpp>       // DROPS-AUTO-ENROL: EnrolMode, enrol_mode_tag
 
 #include "impl/xmr/receipt/xmr_receipt.hpp"        // ::v37::xmr::MoneroReceipt
 #include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
@@ -524,6 +525,12 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
 // EXPLICIT refusal with a reason, never a silent divergence (the memory-recorded
 // "mismatched-LaneParams nodes must reject explicitly" gap).
 inline constexpr char kEnrolSetMismatch[] = "ENROL_SET_MISMATCH";
+inline std::string enrol_mode_label(const std::optional<bytes32>& d) {
+    if (!d) return "not carried (an auto-enrol-less build with an empty list)";
+    if (*d == enrol_mode_tag(EnrolMode::Auto)) return "auto (every payee)";
+    if (*d == enrol_mode_tag(EnrolMode::None)) return "none (--drops-enrol none)";
+    return "list (--drops-enrol ID...)";
+}
 inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
     if (auto t = pool_id_mismatch(ours, theirs); !t.empty()) return t;   // POOL-ID (subsumes chain_id when tagged)
@@ -538,7 +545,8 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
             return std::string(kEnrolSetMismatch) + " enrol-set digest differs: ours=" +
                    (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +
                    (theirs.enrol_set ? hex32(*theirs.enrol_set).substr(0, 12) : std::string("none")) +
-                   " (every node of a pool must run the identical --drops-enrol list)";
+                   " mode ours=" + enrol_mode_label(ours.enrol_set) + " theirs=" + enrol_mode_label(theirs.enrol_set) +
+                   " (every node of a pool must run the identical --drops-enrol list / mode)";
         return "lane_params_digest differs (different LaneParams geometry/gates: DROPS subthreshold / fee model / share weight)";
     }
     if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";

@@ -106,6 +106,7 @@
 
 #include <c2pool/v37/v37_drops_wiring.hpp>   // DropsWiring, TipBin, EnrollOutcome, kDropsWiringArmed
 #include <c2pool/v37/w4_settlement.hpp>      // settle::WorkPrice, work_price_at
+#include <c2pool/v37/xmr/xmr_enrol_mode.hpp>   // EnrolMode, enrol_mode_tag (DROPS-AUTO-ENROL)
 
 namespace c2pool::v37n::xmr::drops {
 
@@ -326,15 +327,21 @@ inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std
     return s;
 }
 // The enrolment book of the prefix: a pure function of (the enrol set, [0, P)).
-inline ::c2pool::v37n::EnrollmentBook lane_enrollment(const LanePrefix& lp, const std::set<bytes32>& enrol_set) {
+// ★ DROPS-AUTO-ENROL: Auto enrols EVERY payee of the prefix at its first share
+// (same rule, no set filter), None enrols nobody, List filters by the set.
+using ::c2pool::v37n::xmr::relay::EnrolMode;
+inline ::c2pool::v37n::EnrollmentBook lane_enrollment(const LanePrefix& lp, const std::set<bytes32>& enrol_set,
+                                                      EnrolMode mode = EnrolMode::List) {
     std::map<bytes32, std::uint64_t> first;
+    if (mode == EnrolMode::None) return ::c2pool::v37n::EnrollmentBook{};
+    const auto in = [&](const bytes32& p) { return mode == EnrolMode::Auto || enrol_set.count(p) != 0; };
     for (const auto& [payee, bin] : lp.base_first) {
-        if (!enrol_set.count(payee)) continue;
+        if (!in(payee)) continue;
         auto [it, fresh] = first.try_emplace(payee, bin);
         if (!fresh && bin < it->second) it->second = bin;
     }
     for (const auto& x : lp.shares) {
-        if (!enrol_set.count(x.payee)) continue;
+        if (!in(x.payee)) continue;
         auto [it, fresh] = first.try_emplace(x.payee, x.bin);
         if (!fresh && x.bin < it->second) it->second = x.bin;
     }
@@ -351,6 +358,16 @@ inline bytes32 enrol_set_digest(const std::set<bytes32>& s) {
     for (const char* p = dom; *p; ++p) b.push_back(static_cast<std::uint8_t>(*p));
     ::c2pool::v37n::enroll_detail::put_le32(b, static_cast<std::uint32_t>(s.size()));
     for (const auto& k : s) b.insert(b.end(), k.begin(), k.end());
+    return ::v37::sha256d(b);
+}
+// ★ DROPS-AUTO-ENROL: the mode-encoding enrol digest HELLO carries.
+inline bytes32 enrol_mode_digest(EnrolMode m, const std::set<bytes32>& s) {
+    return m == EnrolMode::List ? enrol_set_digest(s) : ::c2pool::v37n::xmr::relay::enrol_mode_tag(m);
+}
+inline bytes32 hello_digest_with_enrol(const bytes32& lane_params_digest, EnrolMode m, const std::set<bytes32>& s) {
+    std::vector<std::uint8_t> b(lane_params_digest.begin(), lane_params_digest.end());
+    const auto e = enrol_mode_digest(m, s);
+    b.insert(b.end(), e.begin(), e.end());
     return ::v37::sha256d(b);
 }
 inline bytes32 hello_digest_with_enrol(const bytes32& lane_params_digest, const std::set<bytes32>& s) {
@@ -896,6 +913,8 @@ public:
     // ── ★ DROPS-ENROL-LANE (7): the lane prefix + the composition from it ───
     // The pool's enrol set (identities; the same on every node: HELLO-checked).
     void set_enrol_set(std::set<bytes32> s) { std::lock_guard<std::mutex> lk(m_hmtx); m_enrol_set = std::move(s); }
+    void set_enrol_mode(EnrolMode m) { std::lock_guard<std::mutex> lk(m_hmtx); m_enrol_mode = m; }   // ★ DROPS-AUTO-ENROL
+    EnrolMode enrol_mode() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_enrol_mode; }
     std::set<bytes32> enrol_set() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_enrol_set; }
     // A receipt the lane just pushed at positions [pos_first, pos_first + n):
     // ONE share of `payee` at origin bin `bin` (0 = not known yet: a durable-log
@@ -1038,7 +1057,7 @@ public:
         std::lock_guard<std::mutex> lk(m_hmtx);
         LaneCompose c;
         const ShareCounts S = lane_share_counts(lp, lo, hi);
-        c.book = lane_enrollment(lp, m_enrol_set);
+        c.book = lane_enrollment(lp, m_enrol_set, m_enrol_mode);
         c.digest = c.book.book_digest();
         c.rows = m_coh.rows_lane(lo, hi, S, c.book);
         c.inputs = m_coh.lane_inputs_digest(lo, hi, S);
@@ -1166,6 +1185,7 @@ private:
     std::map<std::uint64_t, LanePos> m_lane_pos;
     std::uint64_t m_lane_contig = 0, m_lane_gaps = 0;
     std::set<bytes32> m_enrol_set;
+    EnrolMode m_enrol_mode = EnrolMode::List;   // ★ DROPS-AUTO-ENROL (the shell sets it; List = the pre-auto rule)
     // ★ DROPS-ENROL-TIDY (under m_hmtx): the folded base [0, m_lane_base_P) of
     // m_lane_pos (prune_lane_log) and the lane-only switch (set_lane_only).
     std::uint64_t m_lane_base_P = 0, m_lane_pruned = 0, m_lane_below_base = 0;

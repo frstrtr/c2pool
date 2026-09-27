@@ -303,9 +303,8 @@ int main() {
           "ET3 ★ the refusal names the enrol set and prints BOTH short enrol-set digests (base: generic lane_params_digest refusal)");
         C(m.find("--drops-enrol") != std::string::npos, "ET3 ... and says every node of a pool must use the identical --drops-enrol list");
         const std::string sh = slurp(V37_XMR_SHELL_SRC);
-        C(sh.find("if (drops_live && !drops->enrol_set().empty())") != std::string::npos &&
-          sh.find("ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_set_digest(drops->enrol_set());") != std::string::npos,
-          "ET3 the shell sends the enrol-set digest only when DROPS is live with a non-empty set (flip 0: master's HELLO)");
+        C(sh.find("if (drops_live)\n                ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_mode_digest(drops->enrol_mode(), drops->enrol_set());") != std::string::npos,
+          "ET3 the shell sends the (mode-encoding) enrol digest only when DROPS is live (flip 0: master's HELLO; DROPS-AUTO-ENROL)");
     }
     return C.done("v37_xmr_drops_enrol_tidy_kat");
 }
