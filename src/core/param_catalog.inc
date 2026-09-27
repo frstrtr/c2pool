@@ -205,14 +205,16 @@ C2P_PARAM("sharechain.p2p_max_peers", Sharechain, INT64, RESTART, C_LTC, LIT, "3
 C2P_PARAM("sharechain.ban_duration", Sharechain, INT64, LIVE, C_LTC, LIT, "300", NONE, "ban duration seconds")
   C2P_ALIAS("sharechain.ban_duration", BIN_LTC, "--ban-duration", VALUE)
 
-C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC, LIT, "", HEX_EVEN, "private sharechain identifier (forks chain)")
+C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain identifier (forks chain)")
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--network-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--chain-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_BTC, "--network-id", VALUE)
+  C2P_ALIAS("sharechain.network_id", BIN_DASH, "--network-id", VALUE)
 
-C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC, LIT, "", HEX_EVEN, "private sharechain prefix")
+C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain prefix")
   C2P_ALIAS("sharechain.prefix", BIN_LTC, "--prefix", VALUE)
   C2P_ALIAS("sharechain.prefix", BIN_BTC, "--prefix", VALUE)
+  C2P_ALIAS("sharechain.prefix", BIN_DASH, "--prefix", VALUE)
 
 C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT, "", HOSTPORT_V, "explicit coin-network dial")
   C2P_ALIAS("coin_p2p.connect", BIN_DASH, "--coin-p2p-connect", VALUE)
