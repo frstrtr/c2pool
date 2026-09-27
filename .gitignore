@@ -248,3 +248,6 @@ external/**/depends/**/docs/
 # Release artifact staging area (built binaries, not source)
 release-staging/
 /.c2pool-bch-regtest/
+
+# xmr node release package output (scripts/xmr-node/build-release.sh)
+/dist/

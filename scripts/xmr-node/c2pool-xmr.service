@@ -1,0 +1,32 @@
+# c2pool-xmr.service - one c2pool-v37-xmr pool node.
+# install.sh fills in @PREFIX@, @DATA@ and @USER@ and installs it as a user
+# unit (~/.config/systemd/user, with --user) or a system unit (as root).
+[Unit]
+Description=c2pool-v37-xmr Monero pool node (daemonless, WRS / PPR)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+@USERLINE@
+WorkingDirectory=@DATA@
+Environment=C2POOL_XMR_DATA=@DATA@
+Environment=C2POOL_XMR_WORKDIR=@DATA@
+ExecStart=@PREFIX@/bin/run-node.sh @DATA@/node.env
+# SIGINT is the node's clean stop: it saves the chain index on the way out.
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=30
+# If the machine runs short of memory, the node is the first to go, not
+# other services. memguard.sh (started by run-node.sh) stops it cleanly
+# before that when MemAvailable < 1 GB.
+OOMScoreAdjust=1000
+# Hint: the node peaks near 1.2 GB RSS on stagenet plus the page cache of
+# the memory-mapped output set. Raise this for mainnet or with --mine.
+MemoryMax=4G
+Nice=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=@WANTEDBY@
