@@ -122,8 +122,12 @@
 // OFF unless --relay-listen / --relay-peer is given; off = this daemon byte-identical to before.
 #include "xmr/relay/xmr_relay_wire.hpp"        // FB_HELLO / FB_RECEIPTS / FB_BLOCK_WON, side_data_v2, lane_params_digest
 #include "xmr/relay/xmr_receipt_mint.hpp"      // share -> PoW-carrying receipt; the structural check
+#include "xmr/relay/xmr_relay_peerstore.hpp"   // RELAY-DISCOVERY: persistent peer book (core::AddrStore)
 #include "xmr/relay/xmr_relay_node.hpp"        // TCP relay: HELLO gate, verify worker (RandomX LAST), flood, backfill, repair
 #include "xmr/relay/xmr_repair_replay.hpp"     // REPAIR-HORIZON: the repair scratch replay + the shadow winner-side order
+#include "xmr/relay/xmr_relay_bootstrap.hpp"   // RELAY-BOOTSTRAP: the built-in per-network relay bootstrap list
+#include <ifaddrs.h>                           // RELAY-BOOTSTRAP: this machine's addresses (self-skip)
+#include <netdb.h>
 #include "xmr/relay/xmr_receipt_ingest.hpp"    // admitted receipts -> the lane (ordering policy + durable log)
 #include "xmr/xmr_drops_wiring.hpp"            // ★ DROPS: the XMR shell's DropsWiring (flip-gated; DORMANT by default)
 #include "xmr/relay/xmr_relay_native_ctx.hpp"   // RC-CTX: receipt contexts from the native node + the own-template journal
@@ -204,7 +208,8 @@ static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-ter
 // node-local JOB policy under the gate: they decide only what THIS node's jobs
 // commit to (the payee + the give-author u16 in the PoW-bound receipt), never
 // how any receipt is folded. The donation output itself has NO knob.
-static double        g_give_author_pct = 0.0;            // --give-author-pct P: the u16 this node's receipts carry (default 0)
+static double        g_give_author_pct = 0.1;            // --give-author-pct P: the u16 this node's receipts carry (default 0.1 with --fee-model v1; 0 opts out)
+static bool          g_give_author_set = false;          // --give-author-pct given explicitly (the fee-model-OFF refusal reads only an explicit value)
 static double        g_owner_fee_pct = 0.0;              // --node-owner-fee-pct P: probability (%) a job commits to the owner
 static std::string   g_owner_address;                    // --node-owner-address ADDR: the owner's standard address
 // R-C rework-3 ruled defaults (docs/xmr-lane/r-c-rework-3.md).
@@ -223,9 +228,12 @@ static bool g_lane_suspended_now = false;                  // R-C rework-2: main
 static std::string   g_relay_listen;                    // --relay-listen HOST:PORT
 static std::optional<::v37::bytes32> g_pool_genesis;    // POOL-LINEAGE: --pool-genesis <hex64> (unset = the network default)
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
+static bool          g_no_relay_bootstrap = false;     // --no-relay-bootstrap (RELAY-BOOTSTRAP: drop the built-in list)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
+static bool          g_relay_discovery = true;          // --relay-discovery on|off (FB_GETADDR/FB_ADDR + persistent peer book)
+static std::size_t   g_relay_max_outbound = 8;          // --relay-max-outbound N (dialed links kept up; peers + learned)
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
 static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
@@ -1526,11 +1534,12 @@ static int run_live(const XmrNodeConfig& cfg) {
     } else if (cfg.lane_params.fee.enabled) {
         std::printf("REFUSED: unknown fee-model version %u\n", cfg.lane_params.fee.version);
         return 2;
-    } else if (g_give_author_pct != 0.0 || g_owner_fee_pct != 0.0 || !g_owner_address.empty()) {
+    } else if ((g_give_author_set && g_give_author_pct != 0.0) || g_owner_fee_pct != 0.0 || !g_owner_address.empty()) {
         std::printf("REFUSED: --give-author-pct / --node-owner-fee-pct / --node-owner-address need --fee-model v1 "
                     "(the fee model is OFF: this node is master-identical)\n");
         return 2;
     }
+    if (!cfg.lane_params.fee.enabled) g_give_author_pct = 0.0;   // the 0.1 default is a fee-model-v1 default only
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -2295,13 +2304,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         for (const auto& id : ids) {
             ::v37::ScriptRef payee; std::uint64_t bin = 0; std::vector<std::uint8_t> raw;
             if (!relay_node->cached_share(id, payee, bin, raw)) { why = "cut-pending: a repaired receipt left the verified cache (drops lane prefix; retry)"; return std::nullopt; }
+            std::uint16_t give = 0;   // ★ d5: the receipt's give-author u16
+            (void)relay_node->cached(id, nullptr, &give);
             if (bin == 0) {
                 relay::FbReceipt r; ::v37::xmr::verify::ParsedBlob pb;
                 if (relay::decode_fb_receipt(raw, r) && ::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb))
                     if (const auto b = drops_bin_of(pb.prev_id)) bin = *b;
                 if (bin == 0) { why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (drops lane prefix; retry)"; return std::nullopt; }
             }
-            lp.shares.push_back(c2pool::v37n::xmr::drops::LaneShare{::v37::xmr::xmr_identity_key(payee), bin});
+            lp.shares.push_back(c2pool::v37n::xmr::drops::LaneShare{::v37::xmr::xmr_identity_key(payee), bin, give});
         }
         ++drops_lane_repaired_prefix;
         return lp;
@@ -2322,6 +2333,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         dctx.price = c2pool::v37n::xmr::drops::rescale_price(price, drops->receipt_weight());
         dctx.enrollment = &out.lc.book;
         out.carry = c2pool::v37n::xmr::drops::compose_carry(cfg.lane_params, out.lc.rows, dctx);
+        if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))   // ★ d5: split by give-author, like the receipts
+            c2pool::v37n::xmr::drops::split_give_author(out.carry.delta, *lp,
+                c2pool::v37n::xmr::fee::donation_identity(donation_net_of(cfg.network)));
         if (out.carry.delta.size() > relay::kBlockWonDropsMaxRows) out.carry.delta.clear();
         ++drops_lane_composed;
         drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
@@ -3126,12 +3140,17 @@ static int run_live(const XmrNodeConfig& cfg) {
             // exists but credits nobody (the fixture then arms ecut_finder).
             return true;
         };
-        // EMPTY-CUT FINDER (operator ruling 09-26, xmr_paynow.hpp): an empty cut
-        // pays this template's finder -- the node's own payee, committed as V37F.
-        if (cba_payee_ref && ::v37::xmr::xmr_ref_valid(*cba_payee_ref)) scfg.ecut_finder = *cba_payee_ref;
-        std::printf("ecut: EMPTY-CUT FINDER %s (an empty credit cut pays the finder = this node's payee %s…, committed as V37F)\n",
-                    scfg.ecut_finder ? "ARMED" : "OFF (no --payee-spend-hex/--payee-view-hex)",
-                    scfg.ecut_finder ? hex_of(::v37::xmr::xmr_identity_key(*scfg.ecut_finder)).substr(0, 8).c_str() : "-");
+        // EMPTY-CUT FINDER (operator rulings 09-26 / 09-27, xmr_paynow.hpp): an empty
+        // cut pays the finder of the WINNING JOB, committed as V37F -- the job's
+        // stratum login (a valid standard address of this network), the node owner
+        // on an owner-fee job, else the compiled-in donation. The node's own
+        // --payout-address is never the finder. The default template (a job with
+        // no binding) pays the donation: fee model ON its residual already does
+        // (no V37F), OFF it is committed as V37F. Per-job variants: the provider.
+        if (!fee_on) scfg.ecut_finder = fee::donation_ref(don_net);
+        std::printf("ecut: EMPTY-CUT FINDER per job (login | owner on an owner-fee job | donation %s…); default job pays the donation%s\n",
+                    hex_of(fee::donation_identity(don_net)).substr(0, 8).c_str(),
+                    fee_on ? " via the residual (no V37F)" : " as V37F");
         std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
@@ -3417,8 +3436,18 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return r;
             });
             {   // ★ DROPS-ENROL-LANE: the pool's enrol set (identities); enrolment itself is derived from the lane prefix
+                // ★ DROPS-AUTO-ENROL (operator ruling 09-27): no list = AUTO (every payee at its first
+                // share on the lane), a list = LIST (unchanged), "--drops-enrol none" = NONE.
+                const bool enrol_none = std::find(g_drops_enrol.begin(), g_drops_enrol.end(), "none") != g_drops_enrol.end();
+                if (enrol_none && g_drops_enrol.size() != 1) {
+                    std::printf("REFUSED: --drops-enrol none cannot be combined with an enrol list\n");
+                    node.stop(); return 2;
+                }
+                const auto emode = enrol_none ? relay::EnrolMode::None
+                                 : g_drops_enrol.empty() ? relay::EnrolMode::Auto : relay::EnrolMode::List;
+                drops->set_enrol_mode(emode);
                 std::set<::v37::bytes32> es;
-                for (const auto& e : g_drops_enrol) {
+                for (const auto& e : (enrol_none ? std::vector<std::string>{} : g_drops_enrol)) {
                     std::vector<std::uint8_t> raw;
                     if (e.size() == 64 && sub::from_hex(e, raw) && raw.size() == 32) { ::v37::bytes32 k{}; std::memcpy(k.data(), raw.data(), 32); es.insert(k); }
                     else if (const auto da = relay::decode_address(e); da && ::v37::xmr::xmr_ref_valid(da->ref()))
@@ -3426,8 +3455,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                     else
                         std::printf("DROPS: --drops-enrol %s is neither a 64-hex identity nor a valid XMR address -- NOT in the enrol set\n", e.c_str());
                 }
-                std::printf("DROPS: enrol set = %zu identit%s (digest %s…): each enrols at its FIRST share on the lane prefix [0,P), effective from that bin + 1\n",
-                            es.size(), es.size() == 1 ? "y" : "ies", hex_of(c2pool::v37n::xmr::drops::enrol_set_digest(es)).substr(0, 12).c_str());
+                std::printf("DROPS: enrol mode = %s, enrol set = %zu identit%s (HELLO enrol digest %s…): %s\n",
+                            relay::to_string(emode), es.size(), es.size() == 1 ? "y" : "ies",
+                            hex_of(c2pool::v37n::xmr::drops::enrol_mode_digest(emode, es)).substr(0, 12).c_str(),
+                            emode == relay::EnrolMode::None ? "NOBODY enrols (--drops-enrol none): every composition credits zero"
+                            : emode == relay::EnrolMode::Auto ? "EVERY payee enrols at its FIRST share on the lane prefix [0,P), effective from that bin + 1"
+                            : "each listed payee enrols at its FIRST share on the lane prefix [0,P), effective from that bin + 1");
                 drops->set_enrol_set(std::move(es));
             }
             drops_live = true;
@@ -3437,8 +3470,6 @@ static int run_live(const XmrNodeConfig& cfg) {
                         (unsigned)cfg.lane_params.subthreshold.K, c2pool::v37n::xmr::drops::kXmrDropsLz,
                         (unsigned long long)drops->share_diff(), (unsigned long long)drops->floor_diff(),
                         (unsigned long long)drops->receipt_weight(), g_drops_enrol.size());
-            if (g_drops_enrol.empty())
-                std::printf("DROPS: gate ON but NOBODY is enrolled (--drops-enrol) -- every composition credits zero (fail-closed, opt-in)\n");
         }
         // ★ DROPS-ENROL-TIDY (flip 1): NO enrolment at the native tip and NO
         // share-count arm any more. Enrolment is a pure function of the lane
@@ -3477,7 +3508,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind,
                                                             ro.network);   // S4: + FeeModelGate (+ this network's donation identity) iff ON
             if (drops_live)   // ★ DROPS-ENROL-LANE (flip 1): the enrol set is pool consensus -- another set = HELLO mismatch
-                ro.lane_params_digest = c2pool::v37n::xmr::drops::hello_digest_with_enrol(ro.lane_params_digest, drops->enrol_set());
+                ro.lane_params_digest = c2pool::v37n::xmr::drops::hello_digest_with_enrol(ro.lane_params_digest, drops->enrol_mode(),
+                                                                                         drops->enrol_set());   // ★ DROPS-AUTO-ENROL: mode folded
             ro.max_pushes_per_receipt = fee_on ? 2 : 1;   // fee model S3: (payee, donation) split
             // POOL-ID: the roundabout S1 lane_tag of THIS node's pool (own chain_id,
             // LaneParams geometry, shipped consensus version, authority 0;
@@ -3490,8 +3522,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             // ★ DROPS-ENROL-TIDY (flip 1): the enrol-set digest rides HELLO next to the
             // genesis, so a peer with another --drops-enrol list is refused by name
             // (ENROL_SET_MISMATCH, both digests) instead of a generic digest refusal.
-            if (drops_live && !drops->enrol_set().empty())
-                ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_set_digest(drops->enrol_set());
+            // ★ DROPS-AUTO-ENROL: carried in EVERY mode (auto / list / none are all pool consensus).
+            if (drops_live)
+                ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_mode_digest(drops->enrol_mode(), drops->enrol_set());
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -3502,7 +3535,67 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (!split_hostport(pr, h, pt)) { std::printf("REFUSED: --relay-peer wants HOST:PORT, got \"%s\"\n", pr.c_str()); node.stop(); return 2; }
                 ro.peers.emplace_back(h, pt);
             }
+            {   // RELAY-BOOTSTRAP: this network's built-in relay peers, in addition to --relay-peer.
+                std::vector<std::string> local_ips;
+                ifaddrs* ifs = nullptr;
+                if (::getifaddrs(&ifs) == 0) {
+                    for (ifaddrs* i = ifs; i != nullptr; i = i->ifa_next) {
+                        if (i->ifa_addr == nullptr) continue;
+                        const int fam = i->ifa_addr->sa_family;
+                        if (fam != AF_INET && fam != AF_INET6) continue;
+                        char buf[NI_MAXHOST];
+                        const socklen_t len = fam == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
+                        if (::getnameinfo(i->ifa_addr, len, buf, sizeof buf, nullptr, 0, NI_NUMERICHOST) == 0)
+                            local_ips.emplace_back(buf);
+                    }
+                    ::freeifaddrs(ifs);
+                }
+                ro.self_hosts = local_ips;   // NODE-NONCE: our addresses + the listen port = never dialed / handed out
+                const auto bp = relay::resolve_bootstrap(ro.network, g_no_relay_bootstrap, g_relay_peers,
+                                                         g_relay_listen, local_ips);
+                auto joined = [](const std::vector<std::string>& v) {
+                    std::string o; for (const auto& x : v) { if (!o.empty()) o += ','; o += x; } return o.empty() ? std::string("-") : o;
+                };
+                std::printf("relay: bootstrap %s: dial=%s self_skipped=%s already_peer=%s (--relay-peer %zu)\n",
+                            g_no_relay_bootstrap ? "OFF (--no-relay-bootstrap)"
+                            : relay::default_bootstrap_hosts(ro.network).empty() ? "none for this network" : "ON",
+                            joined(bp.use).c_str(), joined(bp.self).c_str(), joined(bp.dup).c_str(), g_relay_peers.size());
+                // RC7 integration (#1819 x #1820): with discovery ON the bootstrap nodes are
+                // SEEDS -- book candidates dialed by discovery, GOOD once their HELLO is ok,
+                // then handed out in FB_ADDR like any good peer. With discovery OFF there is
+                // no book, so they stay permanent dial targets (the #1819 behaviour).
+                // --no-relay-bootstrap left bp.use empty: no seed at all.
+                const std::size_t routed = relay::route_bootstrap(bp.use, g_relay_discovery, ro.seeds, ro.peers);
+                if (routed)
+                    std::printf("relay: bootstrap %zu node(s) -> %s\n", routed,
+                                g_relay_discovery ? "discovery seeds (candidates; good after HELLO)"
+                                                  : "permanent dial targets (--relay-discovery off)");
+            }
             ro.max_peers = g_relay_max_peers;
+            // RELAY-DISCOVERY: peer exchange + a persistent book per pool id + network
+            // in the data dir. Relay-only: no coinbase / digest byte depends on it.
+            std::string relay_book_path;
+            ro.discovery = g_relay_discovery;
+            ro.max_outbound = g_relay_max_outbound;
+            if (ro.discovery) {
+                std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
+                const std::string tag = hex_of(ro.pool_id->lane_tag).substr(0, 8) + hex_of(pool_genesis_of(cfg)).substr(0, 8);
+                relay_book_path = cfg.resolved_settle_db_path() + "/" + relay::peerstore_file_name(ro.network, tag);
+                std::string why_load;
+                if (!relay::peerstore_load(relay_book_path, ro.book_load, &why_load))
+                    std::printf("relay-disc: peer book %s unreadable (%s) -- starting empty\n", relay_book_path.c_str(), why_load.c_str());
+                ro.book_save = [relay_book_path](const std::vector<relay::PeerRecord>& v) {
+                    std::string w;
+                    if (!relay::peerstore_save(relay_book_path, v, &w))
+                        std::printf("relay-disc: peer book save FAILED %s (%s)\n", relay_book_path.c_str(), w.c_str());
+                };
+                std::size_t good = 0;
+                for (const auto& r : ro.book_load) good += r.good ? 1 : 0;
+                std::printf("relay-disc: discovery ON (FB_GETADDR/FB_ADDR 0x4c/0x4d) max-outbound=%zu book=%s loaded=%zu good=%zu\n",
+                            ro.max_outbound, relay_book_path.c_str(), ro.book_load.size(), good);
+            } else {
+                std::printf("relay-disc: discovery OFF (--relay-discovery off): only --relay-peer is dialed, nothing persisted\n");
+            }
             ro.index_horizon = g_relay_horizon;
             {
                 double v[4] = {1, 20, 16, 256}; int k = 0; std::stringstream ss(g_relay_rx_budget); std::string tok;
@@ -3603,7 +3696,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                             ::v37::xmr::verify::ParsedBlob pb;
                             if (::v37::xmr::verify::parse_hashing_blob(a.r.receipt.hashing_blob, pb)) prev_id = pb.prev_id;
                         }
-                        drops->on_share_lane(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, pos_first, n_pushes, prev_id);
+                        drops->on_share_lane(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, pos_first, n_pushes, prev_id,
+                                             a.r.side.give_author);   // ★ d5
                     }
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
@@ -3955,6 +4049,25 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::fflush(stdout);
             };
         hooks.job_binder = job_binder;   // SEAM-1 (unset unless --relay-bind rbind)
+        {   // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27): bind every job's finder
+            // right after its rbind (the owner-fee roll is the rbind's), before its blob.
+            auto rb = job_binder;
+            auto logged = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
+            hooks.job_binder = [&provider, &rbind_reg, rb, logged, don_net, owner_ref](std::uint32_t en, const std::string& address) {
+                if (rb) rb(en, address);
+                bool owner_hit = false;
+                if (rbind_reg) if (const auto jb = rbind_reg->get(en)) owner_hit = jb->owner_substituted;
+                const auto fc = c2pool::v37n::xmr::paynow::choose_ecut_finder(address, don_net, owner_hit, owner_ref);
+                provider.bind_finder(en, fc.payee);
+                std::lock_guard<std::mutex> lk(logged->first);
+                if (logged->second.size() < 4096 && logged->second.insert(std::string(to_string(fc.from)) + "|" + address).second) {
+                    std::printf("ecut-finder: job login %s -> finder = %s %s…%s%s\n", address.empty() ? "-" : address.substr(0, 12).c_str(),
+                                to_string(fc.from), hex_of(::v37::xmr::xmr_identity_key(fc.payee)).substr(0, 8).c_str(),
+                                fc.why.empty() ? "" : " -- ", fc.why.c_str());
+                    std::fflush(stdout);
+                }
+            };
+        }
         if (relay_node) {
             // GAP-2: disjoint per-node miner search spaces (see XmrStratumServer::seed_extra_nonce).
             std::random_device rd;
@@ -4080,6 +4193,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());
+                std::printf("  %s\n", relay_node->disc_describe().c_str());   // RELAY-DISCOVERY
                 if (relay_native_ctx || relay_ctx_journal.written())
                     std::printf("  %s | ctx-journal size=%zu written=%llu\n", relay_ctx_feeder.describe().c_str(),
                                 relay_ctx_journal.size(), (unsigned long long)relay_ctx_journal.written());
@@ -4592,6 +4706,9 @@ inline void print_version() {
     const XmrNodeConfig defaults;
     std::printf("c2pool-v37-xmr %s\n", C2POOL_VERSION);
     std::printf("network default: %s\n", to_string(defaults.network));
+    std::printf("raindrops (DROPS): %s (pool rules v%u)\n",   // XMR-DROPS-DEFAULT
+                defaults.lane_params.subthreshold.enabled ? "ON by default" : "OFF (a V37_XMR_DROPS_DEFAULT=OFF build)",
+                (unsigned)relay::kXmrPoolRulesVersion);
     std::printf("pinned snapshot: mainnet height %llu (block %s); stagenet height %llu (block %s); "
                 "testnet, regtest: none\n",
                 static_cast<unsigned long long>(nat::PINNED_SNAPSHOT_MAINNET.height),
@@ -4673,7 +4790,7 @@ int main(int argc, char** argv) {
             else throw cs::UsageError("--fee-model takes off|v1, got '" + m + "'");
         }
         // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
-        else if (a == "--give-author-pct")    g_give_author_pct = cs::to_double(a, value());
+        else if (a == "--give-author-pct")    { g_give_author_pct = cs::to_double(a, value()); g_give_author_set = true; }
         else if (a == "--node-owner-fee-pct") g_owner_fee_pct = cs::to_double(a, value());
         else if (a == "--node-owner-address") g_owner_address = value();
         else if (a == "--settle-h-min") cfg.settle_h_min = u64();
@@ -4700,9 +4817,12 @@ int main(int argc, char** argv) {
             g_pool_genesis = g;
         }
         else if (a == "--relay-peer")               g_relay_peers.push_back(value());
+        else if (a == "--no-relay-bootstrap")       g_no_relay_bootstrap = true;
         else if (a == "--drops-enrol")              g_drops_enrol.push_back(value());
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
         else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
+        else if (a == "--relay-discovery")          g_relay_discovery = cs::one_of(a, value(), {"on", "off"}) == "on";
+        else if (a == "--relay-max-outbound")       g_relay_max_outbound = static_cast<std::size_t>(u64());
         else if (a == "--relay-index-horizon")      g_relay_horizon = u64();
         else if (a == "--relay-rx-budget")          g_relay_rx_budget = value();
         else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
@@ -4865,13 +4985,20 @@ int main(int argc, char** argv) {
                 "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT'||lane_tag||id)\n"
                 "                               is committed in every lane coinbase; blocks without OUR tag are ordinary blocks\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
-                "  --drops-enrol ID|ADDR        DROPS (only in a V37_ACTIVATE_CONSENSUS_V1 build): enrol this payee (64-hex identity\n"
-                "                               key or XMR address) ex ante at the native TIP (repeatable); ignored when dormant\n"
+                "  --no-relay-bootstrap         do not also dial the built-in bootstrap relay peers (mainnet:\n"
+                "                               the public pool nodes, docs/xmr-lane/BOOTSTRAP-NODES.md;\n"
+                "                               stagenet/testnet/regtest: none). Used only when the relay is on.\n"
+                "  --drops-enrol ID|ADDR|none   DROPS (raindrops; ON by default in this XMR build, needs the relay). Default (no\n"
+                "                               flag): AUTO -- every payee enrols at its first share on the lane. ID|ADDR (repeatable):\n"
+                "                               only the listed payees. none: nobody (credits zero). Every node of a pool must run the\n"
+                "                               same mode and list -- HELLO refuses ENROL_SET_MISMATCH by name\n"
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
                 "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
                 "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
+                "  --relay-discovery on|off     relay peer discovery (FB_GETADDR/FB_ADDR) + persistent peer book (default on)\n"
+                "  --relay-max-outbound N       dialed relay links kept up, --relay-peer + learned (default 8)\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
                 "  --relay-vault-entries N --relay-vault-bytes N --relay-vault-horizon N  --no-relay-serve\n"
                 "  --relay-bind none|rbind      rbind = write + require the SEAM-1 payee/give-author\n"
@@ -4925,7 +5052,8 @@ int main(int argc, char** argv) {
                 "                               by their PoW-bound give-author u16. Every peer must\n"
                 "                               agree (folded into the relay HELLO digest)\n"
                 "  --give-author-pct <p>        (v1) give-author %% carried as a u16 in the receipts\n"
-                "                               THIS node's jobs bind (default 0; folded everywhere)\n"
+                "                               THIS node's jobs bind (default 0.1; 0 opts out; folded\n"
+                "                               everywhere)\n"
                 "  --node-owner-fee-pct <p>     (v1) probability %% that a job commits to the node\n"
                 "                               owner instead of the miner (default 0; job issue)\n"
                 "  --node-owner-address <addr>  (v1) the node owner's standard address\n"

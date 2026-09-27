@@ -291,6 +291,52 @@ inline NetResult net_booking(const std::optional<std::uint64_t>& base, std::uint
 }
 
 // ===========================================================================
+// WHO IS THE EMPTY-CUT FINDER (operator ruling 09-27). The builder side only:
+// the receive side (apply_empty_cut_finder) accepts and books ANY valid V37F
+// payee, unchanged. A job's finder is decided when the job is issued:
+//   (3) the job's owner-fee roll hit (its rbind payee is the node owner)
+//       -> the node OWNER fee address;
+//   (1) else the job's stratum login is a valid STANDARD address of this
+//       network -> that login;
+//   (2) else (invalid, subaddress, integrated, another network, no login)
+//       -> the compiled-in DONATION address, with the reason.
+// The node's own --payout-address is never an empty-cut finder.
+// ===========================================================================
+#define C2POOL_V37_XMR_ECUT_FINDER_LOGIN 1   // feature probe for KATs built on both trees
+enum class FinderFrom : std::uint8_t { Login = 1, Owner = 2, Donation = 3 };
+inline const char* to_string(FinderFrom f) {
+    return f == FinderFrom::Login ? "login" : f == FinderFrom::Owner ? "owner" : "donation";
+}
+struct FinderChoice {
+    ::v37::ScriptRef payee;
+    FinderFrom       from = FinderFrom::Donation;
+    std::string      why;   // non-empty when the login was not taken
+};
+inline std::uint64_t std_prefix_of(fee::DonationNet n) {
+    return n == fee::DonationNet::Testnet ? fee::kPrefixTestnetStd
+         : n == fee::DonationNet::Stagenet ? fee::kPrefixStagenetStd : fee::kPrefixMainnetStd;   // regtest = mainnet bytes
+}
+inline FinderChoice choose_ecut_finder(const std::string& login_address, fee::DonationNet net, bool owner_hit,
+                                       const std::optional<::v37::ScriptRef>& owner) {
+    FinderChoice c;
+    if (owner_hit && owner && ::v37::xmr::xmr_ref_valid(*owner)) {
+        c.payee = *owner; c.from = FinderFrom::Owner; c.why = "the job's owner-fee roll hit";
+        return c;
+    }
+    c.payee = fee::donation_ref(net);
+    c.from = FinderFrom::Donation;
+    if (login_address.empty()) { c.why = "no stratum login (in-process miner)"; return c; }
+    const fee::DecodedAddress d = fee::decode_xmr_address(login_address);
+    if (!d.ok) { c.why = "login is not a standard address: " + d.why; return c; }
+    if (d.subaddress) { c.why = "login is a subaddress (a coinbase finder pays a main address only)"; return c; }
+    if (d.prefix != std_prefix_of(net)) { c.why = "login is an address of another network (prefix " + std::to_string(d.prefix) + ")"; return c; }
+    const ::v37::ScriptRef r = d.ref();
+    if (!::v37::xmr::xmr_ref_valid(r)) { c.why = "login keys fail the ed25519/torsion check"; return c; }
+    c.payee = r; c.from = FinderFrom::Login; c.why.clear();
+    return c;
+}
+
+// ===========================================================================
 // CUT-FLOOR (#1803 review, economic HIGH). apply_empty_cut_finder checks only
 // that the fold at the block's OWN committed cut is empty; nothing tied that
 // cut to recency, so a modified builder could commit P = 0 (reproducible, an

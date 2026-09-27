@@ -45,6 +45,10 @@
 //       reproducible empty-cut theft) is REFUSED on every node, a restarted
 //       node included; a refused block never lowers the floor; a reorg drops
 //       the orphan's cut. RED on 272cac0d (no floor: the theft books).
+//   E8  PER-JOB FINDER (rulings 09-27): the empty-cut block a job's share
+//       submits pays that job's login L; owner-fee job -> owner; subaddress /
+//       integrated / invalid login -> donation; never the node payout; a work
+//       cut is byte-unchanged. RED on 9d6d3648 (finder = the node payout).
 //
 // RED on the base (PAY-NOW #1787 without this rule): the BASE branch builds
 // the same empty-cut blocks and the "finder is paid" checks FAIL with the
@@ -59,6 +63,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "impl/xmr/coin/xmr_derivation.hpp"
@@ -73,6 +78,7 @@
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_o2_settlement_provider.hpp"
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
+#include "c2pool/v37/xmr/relay/xmr_address.hpp"
 #include "c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp"
 #ifdef C2POOL_V37_XMR_ECUT_FINDER
 #define ECUT_FIX 1
@@ -676,6 +682,146 @@ void suite_base() {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// E8 PER-JOB FINDER (operator rulings 09-27): an empty-cut block pays the
+// WINNING JOB's finder -- its stratum login L when L is a valid standard
+// address of the network, the node OWNER on an owner-fee job, else the
+// DONATION (subaddress / integrated / invalid / other network / no login).
+// The node's own payout (finder_ref() here) is never an empty-cut finder.
+// RED on 9d6d3648: the finder is the building node's payee for every job.
+std::string addr_body(std::uint64_t prefix, const std::vector<std::uint8_t>& body) {
+    namespace b58 = c2pool::v37n::xmr::relay::b58;
+    std::vector<std::uint8_t> b;
+    for (std::uint64_t v = prefix;;) { const std::uint8_t c = v & 0x7f; v >>= 7; if (v) b.push_back(c | 0x80); else { b.push_back(c); break; } }
+    b.insert(b.end(), body.begin(), body.end());
+    const auto h = ::xmr::coin::keccak256(b.data(), b.size());
+    b.insert(b.end(), h.data(), h.data() + 4);
+    std::string out;
+    for (std::size_t off = 0; off < b.size(); off += b58::kFullBlock) {
+        const int n = static_cast<int>(std::min<std::size_t>(b58::kFullBlock, b.size() - off));
+        std::uint64_t v = 0;
+        for (int i = 0; i < n; ++i) v = (v << 8) | b[off + i];
+        std::string blk(static_cast<std::size_t>(b58::kEncodedBlockSizes[n]), b58::kAlphabet[0]);
+        for (int i = static_cast<int>(blk.size()) - 1; i >= 0 && v; --i) { blk[i] = b58::kAlphabet[v % 58]; v /= 58; }
+        out += blk;
+    }
+    return out;
+}
+std::string addr_of(const ::v37::ScriptRef& r, std::uint64_t prefix, bool integrated = false) {
+    std::vector<std::uint8_t> body(r.payload.begin(), r.payload.end());
+    if (integrated) for (int i = 0; i < 8; ++i) body.push_back(static_cast<std::uint8_t>(0x11 * (i + 1)));
+    return addr_body(prefix, body);
+}
+const ::v37::ScriptRef& login_ref() { static const ::v37::ScriptRef r = ref_of(41); return r; }   // worker L
+const ::v37::ScriptRef& owner_r()   { static const ::v37::ScriptRef r = ref_of(43); return r; }   // node owner O
+
+// One job of a real empty-cut block: bind (or not) its finder, then decode the
+// block the job's share would submit.
+struct JobBlock { bool ok = false; std::string why; std::optional<::v37::ScriptRef> v37f; auth::CoinbaseBooking bk; std::vector<std::uint8_t> mtx; };
+JobBlock job_block(Built& b, std::uint32_t en, bool fee_on) {
+    JobBlock j;
+    c2pool::v37n::xmr::submit::BlockCandidate c;
+    if (!b.provider->candidate_by_id(b.snap.template_id, en, c, &j.why)) return j;
+    asm_::BlockBytes bb; if (!b.snap.tpl->materialize(en, bb, &j.why)) return j;   // the header (miner_tx offset) is the same for every job
+    x6::ReceivedCoinbase got; std::uint64_t h = 0; std::size_t used = 0;   // the miner_tx length is the job's own (V37F or not)
+    if (!asm_::parse_coinbase_prefix(c.full_blob.data() + bb.miner_tx_offset, c.full_blob.size() - bb.miner_tx_offset, got, &h, &used)) {
+        j.why = "coinbase parse"; return j;
+    }
+    j.v37f = pn::parse_finder(got.tx_extra);
+    j.bk = decode(b, c.full_blob, fee_on);
+    j.mtx.assign(c.full_blob.begin() + static_cast<std::ptrdiff_t>(bb.miner_tx_offset),
+                 c.full_blob.begin() + static_cast<std::ptrdiff_t>(bb.miner_tx_offset + bb.miner_tx_size + c.full_blob.size() - bb.full_blob.size()));
+    o2::SettlementStratumTemplateSource ts(*b.provider);
+    ::v37::xmr::stratum::TemplateJob tj;
+    j.ok = ts.rebuild_blob(b.snap.template_id, en, tj) && tj.blob == c.hashing_blob;   // served blob == submitted block's
+    if (!j.ok) j.why = "served job blob != the candidate's hashing blob";
+    return j;
+}
+#ifdef C2POOL_V37_XMR_ECUT_FINDER_LOGIN
+void suite_login() {
+    std::printf("== E8. PER-JOB FINDER: login / owner-fee job -> owner / sub|integrated|invalid -> donation ==\n");
+    const ::v37::ScriptRef L = login_ref(), O = owner_r(), D = fee::donation_ref(kNet), NODE = finder_ref();
+    const std::uint64_t P = fee::kPrefixMainnetStd;   // regtest addresses use the mainnet bytes
+    struct Case { const char* what; std::string login; bool owner_hit; std::optional<::v37::ScriptRef> owner; pn::FinderFrom want_from; ::v37::ScriptRef want; };
+    const std::vector<Case> cases = {
+        {"valid standard login L", addr_of(L, P), false, O, pn::FinderFrom::Login, L},
+        {"subaddress login", addr_of(L, fee::kPrefixMainnetSub), false, O, pn::FinderFrom::Donation, D},
+        {"integrated login", addr_of(L, fee::kPrefixMainnetInt, true), false, O, pn::FinderFrom::Donation, D},
+        {"garbage login", "not-an-address", false, O, pn::FinderFrom::Donation, D},
+        {"testnet login on a regtest node", addr_of(L, fee::kPrefixTestnetStd), false, O, pn::FinderFrom::Donation, D},
+        {"no login (in-process miner)", "", false, O, pn::FinderFrom::Donation, D},
+        {"owner-fee job (roll hit)", addr_of(L, P), true, O, pn::FinderFrom::Owner, O},
+        {"owner-fee hit without an owner", addr_of(L, P), true, std::nullopt, pn::FinderFrom::Login, L},
+    };
+    for (const auto& c : cases) {
+        const auto fc = pn::choose_ecut_finder(c.login, kNet, c.owner_hit, c.owner);
+        CHECK(fc.from == c.want_from && fc.payee == c.want && !(fc.payee == NODE) &&
+                  (c.want_from != pn::FinderFrom::Donation || !fc.why.empty()),
+              "%-32s -> %s%s%s", c.what, pn::to_string(fc.from), fc.why.empty() ? "" : " (logged: ", fc.why.empty() ? "" : (fc.why + ")").c_str());
+    }
+    for (int f = 0; f < 2; ++f) {
+        const bool fee_on = f == 0;
+        const char* tag = fee_on ? "fee ON" : "fee OFF";
+        // main's default job: fee ON = no V37F (the residual pays the donation), OFF = V37F(donation)
+        Built b(fee_on, false, Cut::Empty, fee_on ? std::nullopt : std::optional<::v37::ScriptRef>(D));
+        CHECK(b.ok, "%s: fresh-pool empty-cut template builds: %s", tag, b.ok ? "ok" : b.why.c_str());
+        if (!b.ok) continue;
+        const std::uint64_t B = fee_on ? fee::kDonationDustPico : 0;
+        b.provider->bind_finder(11, pn::choose_ecut_finder(addr_of(L, P), kNet, false, O).payee);
+        b.provider->bind_finder(12, pn::choose_ecut_finder(addr_of(L, fee::kPrefixMainnetSub), kNet, false, O).payee);
+        b.provider->bind_finder(13, pn::choose_ecut_finder(addr_of(L, P), kNet, true, O).payee);
+        b.provider->bind_finder(15, pn::choose_ecut_finder(addr_of(ref_of(44), P), kNet, false, O).payee);   // worker M
+        for (const auto& [en, who, name] : std::vector<std::tuple<std::uint32_t, ::v37::ScriptRef, const char*>>{
+                 {11, L, "login L"}, {13, O, "owner-fee job -> owner"}, {15, ref_of(44), "login M"}}) {
+            JobBlock j = job_block(b, en, fee_on);
+            const ::v37::bytes32 W = id_of(who);
+            CHECK(j.ok && j.v37f == std::optional<::v37::ScriptRef>(who) && j.bk.ok && j.bk.ecut_finder &&
+                      pm_get(j.bk.payout, W) == j.bk.total - B && pm_get(j.bk.payout, id_of(NODE)) == 0,
+                  "%s job en=%u (%s): V37F = it, its output key derives for it and carries %llu = total %llu - %llu; node payout 0 (%s)",
+                  tag, en, name, (unsigned long long)pm_get(j.bk.payout, W), (unsigned long long)j.bk.total, (unsigned long long)B,
+                  j.ok ? (j.bk.ok ? "ok" : j.bk.why.c_str()) : j.why.c_str());
+            Amounts cr; std::string w;
+            CHECK(j.bk.ok && pn::apply_empty_cut_finder(j.bk.ecut_finder, j.bk.ecut_finder_malformed, j.bk.paynow_base, j.bk.total, cr, &w) &&
+                      cr.size() == 1 && cr.count(W) && cr.at(W) == static_cast<long long>(j.bk.total - B),
+                  "%s job en=%u: the receive rule books credit {%s : %lld} %s", tag, en, name, cr.count(W) ? cr.at(W) : 0LL, w.c_str());
+        }
+        for (const std::uint32_t en : {12u, 14u}) {   // subaddress login -> donation; unbound job -> the default (donation)
+            JobBlock j = job_block(b, en, fee_on);
+            const ::v37::bytes32 Did = fee::donation_identity(kNet);
+            const bool ok = fee_on ? (j.ok && !j.v37f && j.bk.ok && pm_get(j.bk.payout, Did) + j.bk.sink_total >= static_cast<long long>(j.bk.total))
+                                   : (j.ok && j.v37f == std::optional<::v37::ScriptRef>(D) && j.bk.ok && pm_get(j.bk.payout, Did) == j.bk.total);
+            CHECK(ok && pm_get(j.bk.payout, id_of(NODE)) == 0 && pm_get(j.bk.payout, id_of(L)) == 0,
+                  "%s job en=%u (%s): the DONATION takes the reward (%s), not L, not the node payout (%s)", tag, en,
+                  en == 12 ? "subaddress login" : "unbound job", fee_on ? "residual, no V37F" : "V37F = donation",
+                  j.ok ? (j.bk.ok ? "ok" : j.bk.why.c_str()) : j.why.c_str());
+        }
+        CHECK(b.provider->finder_variants() == 3, "%s: 3 finder variants built (L, O, M), each once (%llu)", tag,
+              (unsigned long long)b.provider->finder_variants());
+    }
+    for (int f = 0; f < 2; ++f) {   // a cut WITH work: a bound login changes no byte
+        const bool fee_on = f == 1;
+        Built w(fee_on, true, Cut::Work, fee_on ? std::nullopt : std::optional<::v37::ScriptRef>(D));
+        if (!w.ok) { CHECK(false, "work-cut block builds: %s", w.why.c_str()); continue; }
+        w.provider->bind_finder(0, L);
+        const JobBlock j = job_block(w, 0, fee_on);
+        CHECK(j.ok && !j.v37f && blob_digest(j.mtx) == (fee_on ? kGoldenWorkFeeOn : kGoldenWorkFeeOff) && w.provider->finder_variants() == 0,
+              "fee %s: NON-empty cut with login L bound: no V37F, miner_tx == the base golden, no variant", fee_on ? "ON" : "OFF");
+    }
+}
+#else
+void suite_login_base() {
+    std::printf("== E8 (BASE). PER-JOB FINDER absent: every job's finder is the node payout ==\n");
+    Built b(false, false, Cut::Empty, finder_ref());   // 9d6d3648 main: ecut_finder = the node's --payout-address
+    if (!b.ok) { CHECK(false, "empty-cut block builds: %s", b.why.c_str()); return; }
+    const JobBlock j = job_block(b, 11, false);        // the job of worker L (login cannot reach the builder here)
+    CHECK(j.ok && j.v37f == std::optional<::v37::ScriptRef>(login_ref()),
+          "empty-cut block for a share from login L pays L -- got V37F = %s", j.v37f == std::optional<::v37::ScriptRef>(finder_ref()) ? "the NODE payout" : "other");
+    CHECK(j.bk.ok && pm_get(j.bk.payout, id_of(finder_ref())) == 0, "the node payout is never the empty-cut finder -- it got %llu",
+          (unsigned long long)pm_get(j.bk.payout, id_of(finder_ref())));
+    CHECK(false, "subaddress login -> donation, owner-fee job -> owner: no per-job finder choice on this tree");
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -688,7 +834,13 @@ int main() {
     suite_nonempty_unchanged();
     suite_widest();
     suite_cut_floor();
+#endif
+#ifdef C2POOL_V37_XMR_ECUT_FINDER_LOGIN
+    suite_login();
 #else
+    suite_login_base();
+#endif
+#if !ECUT_FIX
     suite_base();
     suite_nonempty_unchanged();
 #endif

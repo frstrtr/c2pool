@@ -249,6 +249,9 @@ external/**/depends/**/docs/
 release-staging/
 /.c2pool-bch-regtest/
 
+# xmr node release package output (scripts/xmr-node/build-release.sh)
+/dist/
+
 # BIP-110 Stratum-v1 test miners — tracked source: GPU (CUDA/CuPy) + CPU
 # reference miners that drive real pool-diff shares into a BIP-110 node to
 # exercise the M3 sharechain / PPLNS / multi-miner convergence.

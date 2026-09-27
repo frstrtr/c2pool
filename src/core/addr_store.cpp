@@ -6,10 +6,19 @@ namespace core
 
 void AddrStore::save() const
 {
-    std::fstream file(m_path);
-    file << to_json();
-
-    file.close();
+    // Write a sibling temp file and rename it over the store: the old
+    // std::fstream(m_path) opened in/out WITHOUT truncation, so a smaller set
+    // left the tail of the previous JSON behind (an unparsable file on the
+    // next start), and a crash mid-write lost the whole store.
+    const auto tmp = m_path.string() + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::out | std::ios::trunc);
+        file << to_json();
+        if (!file.good()) { LOG_WARNING << "Addrs [" << m_path << "] save failed"; return; }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, m_path, ec);
+    if (ec) { LOG_WARNING << "Addrs [" << m_path << "] save failed: " << ec.message(); return; }
     LOG_DEBUG_OTHER << "Addrs [" << m_path << "] saved in file!";
 }
 
@@ -48,7 +57,7 @@ void AddrStore::add(const NetService& addr, AddrValue value)
 
 void AddrStore::remove(const NetService& addr)
 {
-    if (check(addr)) 
+    if (!check(addr))
         return;
     
     m_data.erase(addr);
@@ -58,6 +67,14 @@ void AddrStore::remove(const NetService& addr)
 void AddrStore::update(const NetService& addr, AddrValue new_value)
 {
     m_data[addr] = new_value;
+    save();
+}
+
+void AddrStore::replace_all(const std::vector<AddrStorePair>& v)
+{
+    m_data.clear();
+    for (const auto& p : v)
+        m_data[p.addr] = p.value;
     save();
 }
 

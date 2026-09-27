@@ -956,7 +956,7 @@ if (BUILD_TESTING)
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat)
 
     #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
     #                               relay repair of a lane longer than every
@@ -968,6 +968,14 @@ if (BUILD_TESTING)
     #                               every horizon is named DEEP-DIVERGENCE; an
     #                               open bin is re-offered on reconnect. ALSO
     #                               on BOTH build.yml --target lists.
+    #   v37_xmr_drops_default_kat   XMR-DROPS-DEFAULT (operator ruling 09-27):
+    #                               the XMR build arms raindrops by default
+    #                               (default lane = for_version(1), bundle
+    #                               built), HELLOs pool rules v3 and refuses a
+    #                               raindrops-OFF node BY NAME both directions;
+    #                               d5: the composed delta splits by give-author
+    #                               like the receipts (conserving). ALSO on
+    #                               BOTH build.yml --target lists.
     #   v37_xmr_relay_liveness_kat  RELAY-LIVENESS + RELAY-BINCLOCK (capstone
     #                               attempt 2): FB_PING/FB_PONG keepalive; a
     #                               link silent both ways with TCP still up
@@ -997,6 +1005,26 @@ if (BUILD_TESTING)
         target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
         add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
     endforeach()
+    #   v37_xmr_relay_node_nonce_kat NODE-NONCE: HELLO nonce codec + bounds, the
+    #                               Family-B opcode map, bootstrap -> seeds, self-
+    #                               connection (SELF in the book), one link per pair.
+    #   v37_xmr_relay_discovery_kat RELAY-DISCOVERY: FB_GETADDR/FB_ADDR (0x4c/0x4d)
+    #                               peer exchange; five nodes knowing only node 0
+    #                               mesh to >= 3 links each; another pool's node
+    #                               is refused + never good; a restart with node 0
+    #                               down reconnects from the persisted book; ADDR
+    #                               flood / GETADDR burst limits; discovery OFF =
+    #                               fb_unknown. ALSO on BOTH build.yml --target lists.
+    #   v37_xmr_relay_peerstore_kat the persisted book on core::AddrStore
+    #                               (xmr_relay_peerstore): round-trip, a smaller
+    #                               set over a larger one, corrupt / absent file.
+    if (TARGET xmr_relay_peerstore)
+        add_executable(v37_xmr_relay_peerstore_kat v37_xmr_relay_peerstore_kat.cpp)
+        target_compile_features(v37_xmr_relay_peerstore_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_relay_peerstore_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(v37_xmr_relay_peerstore_kat PRIVATE xmr_relay_peerstore)
+        add_test(NAME v37_xmr_relay_peerstore_kat COMMAND v37_xmr_relay_peerstore_kat)
+    endif()
     # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
     # enrolment book is node-local, so a lane block books the WINNER's composed
     # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book
@@ -1953,4 +1981,23 @@ if (BUILD_TESTING)
     target_compile_definitions(v37_xmr_boost_origin_kat PRIVATE
         C2POOL_EXPECT_BOOST_VERSION_STRING="${_v37_boost_origin_expect}")
     add_test(NAME v37_xmr_boost_origin_kat COMMAND v37_xmr_boost_origin_kat)
+endif()
+
+# v37_xmr_drops_default_kat DD4 reads the XMR shell source.
+if (TARGET v37_xmr_drops_default_kat)
+    target_compile_definitions(v37_xmr_drops_default_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
+endif()
+
+# XMR-DROPS-DEFAULT: every XMR KAT in this directory is built the way the XMR
+# node is (raindrops armed; c2pool_xmr_drops_default in src/c2pool). The non-XMR
+# KATs keep the flip at 0 (v37_drops_activation_kat pins exactly that).
+if (COMMAND c2pool_xmr_drops_default)
+    get_property(_v37_xmr_dd_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_t IN LISTS _v37_xmr_dd_targets)
+        get_target_property(_tt ${_t} TYPE)
+        if (_t MATCHES "xmr" AND (_tt STREQUAL "EXECUTABLE" OR _tt STREQUAL "OBJECT_LIBRARY"))
+            c2pool_xmr_drops_default(${_t})
+        endif()
+    endforeach()
 endif()

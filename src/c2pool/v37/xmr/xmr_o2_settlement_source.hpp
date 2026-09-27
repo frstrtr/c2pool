@@ -419,24 +419,19 @@ public:
         // E_b is the whole budget, so paynow_split gives it the pool exactly.
         // Same base B as pay-now; the finder payee rides as V37F. Any other
         // snapshot (a cut with work, no view, no finder) is byte-unchanged.
+        // PER-JOB FINDER (operator ruling 09-27): an empty cut is ELIGIBLE whether
+        // or not this node's own template arms a finder; with_finder() then
+        // re-arms the SAME snapshot for the winning job's payee (the stratum
+        // login, the owner on an owner-fee job, else the donation).
         if (!s->m_paynow_on && ctx.has_paynow && ctx.has_credit_cut && source == KFairSource::W4Propose &&
-            ctx.paynow_payees.empty() && ctx.ecut_finder && ::v37::xmr::xmr_ref_valid(*ctx.ecut_finder) &&
-            !paynow::encode_finder_field(*ctx.ecut_finder).empty()) {
+            ctx.paynow_payees.empty()) {
             std::uint64_t base = fixed_sum;
             for (const auto& e : in.owed) base += e.owed;
-            const ::v37::ScriptRef fr = *ctx.ecut_finder;
-            const ::v37::bytes32   fid = ::v37::xmr::xmr_identity_key(fr);
-            in.paynow_at = [fr, fid](std::uint64_t budget) {
-                x6::PayNowEntry e;
-                e.pay = fr;
-                e.identity = fid;
-                e.eb = budget;
-                return std::vector<x6::PayNowEntry>{e};
-            };
-            in.paynow_n = 1;
-            s->m_paynow_on = true;
-            s->m_paynow_base = base;
-            s->m_ecut_finder = fr;
+            s->m_ecut_eligible = true;
+            s->m_ecut_base = base;
+            if (ctx.ecut_finder && ::v37::xmr::xmr_ref_valid(*ctx.ecut_finder) &&
+                !paynow::encode_finder_field(*ctx.ecut_finder).empty())
+                s->arm_finder(*ctx.ecut_finder);
         }
 
         // ---- run X6 once at reward_hint: fixes r, R, keys, view tags, MM leaf, ORDER ----
@@ -452,19 +447,37 @@ public:
         if (!s->m_built.ok)
             return refuse(std::string("refused: X6 build_coinbase: ") + s->m_built.detail);
 
-        s->m_payees.reserve(s->m_built.outputs.size());
-        for (const auto& o : s->m_built.outputs) {
-            ::c2pool::xmr::XmrPayee p;
-            std::memcpy(p.spend_public_key.h, o.pay.payload.data(),      32);   // B (or D_i)
-            std::memcpy(p.view_public_key.h,  o.pay.payload.data() + 32, 32);   // A
-            s->m_payees.push_back(p);
-        }
-        s->m_r    = tpl_hash_from(s->m_built.r);
-        s->m_R    = tpl_hash_from(s->m_built.R);
-        s->m_leaf = tpl_hash_from(s->m_built.mm_root);   // == mm_commitment_root(chain_id, lane_commitment)
+        s->finish_built();
         if (why) why->clear();
         return s;
     }
+
+    // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27). The SAME snapshot (same
+    // owed set, same base B, same cut) re-armed for another finder payee: only
+    // the finder pay-now entry and the V37F field change. Pure: no ledger read,
+    // so a stratum thread may call it. nullptr (the caller keeps this snapshot)
+    // when the cut is not an eligible empty cut, the payee is not a valid XMR
+    // ref, the payee is the residual sink itself (the residual already pays it),
+    // or X6 refuses (e.g. no output slot for the finder).
+    std::unique_ptr<XmrOwedSettlementSource> with_finder(const ::v37::ScriptRef& fr, std::string* why = nullptr) const {
+        auto no = [&](const char* w) -> std::unique_ptr<XmrOwedSettlementSource> { if (why) *why = w; return nullptr; };
+        if (!m_ecut_eligible) return no("not an empty-cut snapshot");
+        if (!::v37::xmr::xmr_ref_valid(fr) || paynow::encode_finder_field(fr).empty()) return no("finder is not a valid XMR ref");
+        if (::v37::xmr::xmr_identity_key(fr) == m_ctx.residual_sink_identity) return no("finder is the residual sink");
+        std::unique_ptr<XmrOwedSettlementSource> s(new XmrOwedSettlementSource());
+        s->m_ctx = m_ctx;  s->m_ctx.ecut_finder = fr;
+        s->m_source = m_source;  s->m_reward_hint = m_reward_hint;
+        s->m_ledger_seq = m_ledger_seq;  s->m_owed_digest = m_owed_digest;  s->m_unpayable = m_unpayable;
+        s->m_inputs = m_inputs;  s->m_inputs.paynow_at = nullptr;  s->m_inputs.paynow_n = 0;
+        s->m_ecut_eligible = true;  s->m_ecut_base = m_ecut_base;
+        s->arm_finder(fr);
+        s->m_built = x6::build_coinbase(s->inputs_at(m_reward_hint, {}));
+        if (!s->m_built.ok) return no("X6 refused the finder variant");
+        s->finish_built();
+        if (why) why->clear();
+        return s;
+    }
+    bool ecut_eligible() const { return m_ecut_eligible; }
 
     // Non-copyable / non-movable on purpose: the template keeps a raw pointer.
     XmrOwedSettlementSource(const XmrOwedSettlementSource&) = delete;
@@ -656,6 +669,36 @@ public:
 private:
     XmrOwedSettlementSource() = default;
 
+    // EMPTY-CUT FINDER: ONE pay-now entry whose E_b is the whole budget, so
+    // paynow_split gives the finder the pool exactly; base = m_ecut_base.
+    void arm_finder(const ::v37::ScriptRef& fr) {
+        const ::v37::bytes32 fid = ::v37::xmr::xmr_identity_key(fr);
+        m_inputs.paynow_at = [fr, fid](std::uint64_t budget) {
+            x6::PayNowEntry e;
+            e.pay = fr;
+            e.identity = fid;
+            e.eb = budget;
+            return std::vector<x6::PayNowEntry>{e};
+        };
+        m_inputs.paynow_n = 1;
+        m_paynow_on = true;
+        m_paynow_base = m_ecut_base;
+        m_ecut_finder = fr;
+    }
+    void finish_built() {
+        m_payees.clear();
+        m_payees.reserve(m_built.outputs.size());
+        for (const auto& o : m_built.outputs) {
+            ::c2pool::xmr::XmrPayee p;
+            std::memcpy(p.spend_public_key.h, o.pay.payload.data(),      32);   // B (or D_i)
+            std::memcpy(p.view_public_key.h,  o.pay.payload.data() + 32, 32);   // A
+            m_payees.push_back(p);
+        }
+        m_r    = tpl_hash_from(m_built.r);
+        m_R    = tpl_hash_from(m_built.R);
+        m_leaf = tpl_hash_from(m_built.mm_root);   // == mm_commitment_root(chain_id, lane_commitment)
+    }
+
     // Same count, same payee (pay + identity + role) at every index as the
     // snapshot's canonical order. Amounts are allowed to differ (that is the
     // whole point of re-splitting); nothing else is.
@@ -678,6 +721,8 @@ private:
     bool                 m_paynow_on = false;
     std::uint64_t        m_paynow_base = 0;
     std::optional<::v37::ScriptRef> m_ecut_finder;   // EMPTY-CUT FINDER (V37F)
+    bool                 m_ecut_eligible = false;   // the cut is empty (with_finder may arm)
+    std::uint64_t        m_ecut_base = 0;           // its pay-now base B
 
     x6::CoinbaseInputs   m_inputs;     // fixed part; reward + extra_nonce applied per query
     x6::BuiltCoinbase    m_built;      // X6 at reward_hint: r, R, keys, view tags, mm_root, order
