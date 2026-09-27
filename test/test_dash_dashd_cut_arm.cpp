@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// DASHD-CUT arm-authority + reconnect-thrash KAT (hotel-reserve 2026-08-15).
+// DASHD-CUT arm-authority + reconnect-thrash KAT (reserve node 2026-08-15).
 //
 // Reproduces the naked-cut thrash RED on the pre-fix behaviour and proves it
 // GREEN on the fix. Three seams, all exercised against the real production code
@@ -49,7 +49,7 @@ using dash::coin::resolve_dashd_arm;
 // THE root fix. Cut mode = neither --coin-rpc nor --coin-rpc-auth given. Even
 // with a fully-armed stray dash.conf (creds_armed = true), the dashd-fallback
 // arm must stay OFF. Pre-fix, `if (conf.armed())` alone armed it here — the
-// hotel-reserve cosmetic-removal bug.
+// reserve-node cosmetic-removal bug.
 TEST(DashdCutArm, CutModeDisarmsDespiteStrayCreds)
 {
     const DashdArmDecision d = resolve_dashd_arm(/*coin_rpc_requested=*/false,

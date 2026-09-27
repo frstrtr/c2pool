@@ -415,7 +415,7 @@ TEST(DashShadowCompare, TxSetCoverageIsMeasuredAgainstDashd) {
 // ours_only is INFORMATIONAL. It is still measured and still printed — as a
 // COVERAGE STATISTIC — and it no longer tells the operator not to arm the serve
 // flag. `ours_only == 0` was unreachable (two independently-connected mempools
-// never coincide: MEASURED non-zero in 8.8% of 6056 hotel samples, mean 65.3,
+// never coincide: MEASURED non-zero in 8.8% of 6056 production samples, mean 65.3,
 // max 287) AND blind to the case that costs money (a strict SUBSET of dashd's
 // set can still contain a transaction dashd would refuse). The serve flag is
 // now gated on transaction VALIDITY — mempool_validity_gate.hpp.

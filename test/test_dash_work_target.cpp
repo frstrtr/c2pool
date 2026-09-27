@@ -87,7 +87,7 @@ TEST(DashWorkTarget, Cap1NoHashrateNoOp)
 }
 
 // ── Cap 1 at the LIVE production operating point ────────────────────────────
-// Measured on the hotel DASH node: local_hash_rate ~= 43 TH/s, SHARE_PERIOD 20.
+// Measured on the production DASH node: local_hash_rate ~= 43 TH/s, SHARE_PERIOD 20.
 //   avg    = int(43e12 * 20 / 0.0167)     = 51497005988023952
 //   target = 2**256 // avg - 1
 // Derive (python3): "%064x" % (2**256//51497005988023952 - 1)

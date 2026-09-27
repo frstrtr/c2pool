@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /// ServeGateJournal per-cause time KAT.
 ///
-/// THE DEFECT THIS PINS (measured at h=2518004, hotel, 2026-08-07): a
+/// THE DEFECT THIS PINS (measured at h=2518004, production node, 2026-08-07): a
 /// cause-change line attributes the WHOLE episode's duration to the cause it
 /// names. A 512 s qc-plan-underivable episode that flips to
 /// emit-bestcl-null-committed for its last ~1 s emits
@@ -396,7 +396,7 @@ TEST(DashServeGateJournal, RollupJsonShapePinsTheWebField) {
 
 // ── NULL-ARM DKG-FLOOR COVERAGE: cross-restart cumulative accounting ─────────
 //
-// THE DEFECT THIS PINS (hotel-primary, 2026-08-23): the [EMBED-GATE-ROLLUP]
+// THE DEFECT THIS PINS (primary node, 2026-08-23): the [EMBED-GATE-ROLLUP]
 // denominator `observed=` equals wall clock since the LAST restart (7211 s at
 // the 06:00 tick for a 04:00 restart), because ServeGateJournal is pure policy
 // and every counter resets with the process. So the dashd-cut gate that

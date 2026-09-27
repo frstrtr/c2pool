@@ -4,7 +4,7 @@
 // dash::coin::SmlResyncWatchdog — re-ask for the tip mnlistdiff when the one we
 // asked for never came back.
 //
-// ── THE GAP THIS CLOSES (measured, hotel node 109.161.52.148, 2026-08-06) ────
+// ── THE GAP THIS CLOSES (measured, production node, 2026-08-06) ────
 //
 // The SML advances on exactly one trigger: a tip change fires
 // `send_getmnlistd(sml_base, new_tip)` (main_dash.cpp) and the reply moves

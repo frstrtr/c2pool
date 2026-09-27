@@ -641,7 +641,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_rpc_conf PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_rpc_conf "" AUTO)
 
-    # DASHD-CUT arm-authority + reconnect-thrash KAT (hotel-reserve 2026-08-15).
+    # DASHD-CUT arm-authority + reconnect-thrash KAT (reserve node 2026-08-15).
     # SEAM 1 resolve_dashd_arm() (pure, cut-mode disarm), SEAM 2 sync-reconnect
     # backoff (no ~30/s hot spin against a dead dashd), SEAM 3 cache-invalidation
     # decoupled from reconnect FAILURE. Links the real dash_rpc lib (coin/rpc.cpp)
@@ -1051,7 +1051,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_embedded_shadow_compare.cpp
         test_dash_mn_confirm_rollover.cpp
         test_dash_collateral_spend_filter.cpp
-        # test_dash_root_memo.cpp: D2 of the 2026-08-07/08 hotel freeze —
+        # test_dash_root_memo.cpp: D2 of the 2026-08-07/08 production freeze —
         # NodeCoinState-level memo of the projected-SML root + quorum root
         # (epoch-invalidated). Pins: warm emit_ok does no hashing (T1),
         # any SML/quorum mutation invalidates (T2 — the stale-root/lost-
@@ -1096,7 +1096,7 @@ if (BUILD_TESTING AND GTest_FOUND)
 
     # DASH underfill guard: port of the LTC/DOGE "near-empty template on a
     # non-empty mempool" template-builder guard to the DASH embedded GBT path
-    # (embedded_gbt.hpp), for the mining-hotel deployment. Predicate KATs at
+    # (embedded_gbt.hpp), for the production deployment. Predicate KATs at
     # the pinned 50 kB floor/slack + build_embedded_workdata wiring via the
     # SAFE-ADDITIVE underfill_tripped seam (log-only guard; masternode
     # burn/payee projection asserted unchanged). Same link set as the
@@ -1807,23 +1807,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_stratum_extensions PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_stratum_extensions "" AUTO)
 
-    # Mining-hotel interim fix KATs: strict per-node miner cap (refused
+    # Interim hardening fix KATs: strict per-node miner cap (refused
     # connections + counter), FIFO+TTL job eviction under a 600-notify stale
     # storm, and the flat-RSS shared-payload pointer-identity scaffold.
     # Loopback-only (synthetic IWorkSource, ephemeral test port) — no daemon /
     # RPC / sharechain. DASH byte-parity note: the notify/coinbase/share BYTE
     # checks live in the dash lane against the frstrtr/p2pool-dash oracle
     # (share version 16→36), not here.
-    add_executable(test_stratum_hotel_interim test_stratum_hotel_interim.cpp)
-    target_link_libraries(test_stratum_hotel_interim PRIVATE
+    add_executable(test_stratum_interim_hardening test_stratum_interim_hardening.cpp)
+    target_link_libraries(test_stratum_interim_hardening PRIVATE
         GTest::gtest_main GTest::gtest
         c2pool_hashrate
         core ltc
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
-    target_link_libraries(test_stratum_hotel_interim PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
-    gtest_add_tests(test_stratum_hotel_interim "" AUTO)
+    target_link_libraries(test_stratum_interim_hardening PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_stratum_interim_hardening "" AUTO)
 
     add_executable(test_multiaddress_pplns test_multiaddress_pplns.cpp)
     target_link_libraries(test_multiaddress_pplns PRIVATE

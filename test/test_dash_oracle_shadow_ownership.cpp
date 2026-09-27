@@ -1,7 +1,7 @@
 // D-DASH.ORACLE-OWNERSHIP — source-structural guard pinning WHICH THREAD is
 // allowed to read NodeCoinState from the --embedded-oracle-shadow lane.
 //
-// THE DEFECT THIS PINS (hotel primary c2pool-dash, SIGABRT 2026-08-05
+// THE DEFECT THIS PINS (primary node c2pool-dash, SIGABRT 2026-08-05
 // 21:52:38 MSK, glibc "malloc(): unaligned tcache chunk detected" +
 // "double free or corruption (!prev)", 25 min after deploying cdd908ce):
 //
