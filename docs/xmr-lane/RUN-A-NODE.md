@@ -5,6 +5,11 @@ This guide takes you from a clean Linux account to a running
 It covers stagenet today. Mainnet uses the same steps and is marked
 "later" where it differs.
 
+There are two ways to get the node: install the release package
+(section 2, no compiler needed), or build it from source (section 3). The
+pool pays miners by WRS / PPR (Work Receipt Settlement, pay per receipt):
+every pool block pays the miners whose shares the pool has booked.
+
 "Daemonless" means the node needs no monerod. It talks to the Monero
 network over levin (the Monero P2P protocol), keeps its own verified chain
 index, builds block templates itself and sends found blocks over levin. It
@@ -19,17 +24,63 @@ Commands marked `<!-- check -->` in the source of this file are run by
 
 ## 1. What you need
 
-- Linux x86_64. Tested on Ubuntu 26.04 (glibc 2.43). Ubuntu 24.04 uses the
-  same package names.
-- 4 CPU threads or more, 8 GB RAM for the build (4 GB is enough to run the
-  node), 20 GB free disk for stagenet. Measured numbers are in
-  [Resources](#resources).
-- A shell account. You need `sudo` only for step 2.
+- Linux x86_64. Tested on Ubuntu 24.04 (glibc 2.39) and Ubuntu 26.04
+  (glibc 2.43). The release package needs the glibc named in its
+  `GLIBC_FLOOR` file or newer, and libstdc++ from GCC 13 or newer
+  (`BUILDINFO.txt` names both). Ubuntu 22.04 is too old.
+- 4 CPU threads or more, 4 GB RAM to run the node (8 GB to build it), 20 GB
+  free disk for stagenet. Measured numbers are in [Resources](#resources).
+- A shell account. You need `sudo` only for a system-wide install or to
+  install build packages.
 - For stagenet: a stagenet payout address (`5...`), and from your pool's
   operator the pool genesis id and one or more relay peers
   (see [Join a pool](#6-join-a-pool)).
+- The payout address must be a MAIN (standard) address: `4...` on mainnet,
+  `5...` on stagenet. Subaddresses and integrated addresses are not
+  supported as payees. The node refuses a subaddress for
+  `--node-owner-address` at start. It does not yet check
+  `--payout-address` or a miner's stratum login, so check those yourself.
 
-## 2. Install packages (admin, once)
+## 2. Install the release package
+
+The package is `c2pool-xmr-<version>-linux-x86_64.tar.gz`, with a
+`.sha256` file next to it. It holds the stripped binary (RandomX on,
+libgcc linked in; it uses the system's libstdc++, which must come from
+GCC 13 or newer, as on Ubuntu 24.04), the dashboard files, these docs, the
+systemd unit and `install.sh`. It is built by
+`scripts/xmr-node/build-release.sh`.
+
+```sh
+sha256sum -c c2pool-xmr-<version>-linux-x86_64.tar.gz.sha256
+tar xzf c2pool-xmr-<version>-linux-x86_64.tar.gz
+cd c2pool-xmr-<version>-linux-x86_64
+./install.sh --user
+```
+
+As a normal user (install.sh --user) it installs into `~/.local/c2pool-xmr`
+with data in `~/.c2pool-xmr`. Change these with the install.sh options
+--prefix DIR and --data DIR. Run as root without --user and it installs into
+`/opt/c2pool-xmr`, keeps data in `/var/lib/c2pool-xmr` and creates the
+system user `c2pool-xmr`. Add --systemd to also install the unit
+(a user unit or a system unit). The unit is written but not enabled or
+started.
+
+`install.sh` checks the package against `SHA256SUMS`, the glibc version,
+RAM and free disk. It writes `node.env` into the data directory only if
+there is none yet, and it never starts, stops or changes any other service.
+
+Check the installed binary:
+
+```sh
+~/.local/c2pool-xmr/bin/c2pool-v37-xmr --version
+```
+
+It prints the build, the default network and the pinned snapshot heights.
+Then go on with [The pinned snapshot](#4-the-pinned-snapshot).
+
+## 3. Or build from source
+
+### 3.1 Install packages (admin, once)
 
 <!-- check build -->
 ```sh
@@ -47,7 +98,7 @@ exits and run the command again.
 - Boost is **not** needed from the system. Conan builds the pinned Boost
   (see [doc/build-unix.md](../../doc/build-unix.md)).
 
-## 3. Build from a tag
+### 3.2 Build from a tag
 
 Install Conan and CMake into a private venv (no system CMake needed):
 
@@ -61,10 +112,14 @@ conan profile detect --force
 
 Get the source and pick the ref to build. `REF` is a release tag. **No
 release tag for the XMR node exists yet (not yet).** Until one does, use
-the commit your pool operator names, and set it before the block below
-(`REF=<that commit>`). `master` does not work yet: it does not have the
-pinned snapshot boot. The ref must include it
-(`docs/xmr-lane/PINNED-SNAPSHOTS.md` exists in it).
+the commit your pool operator names, or `master`, and set it before the
+block below (`REF=<that commit>` or `REF=master`). `master` has the pinned
+snapshot boot (c2pool #1777). Every node of one pool should run the same
+commit.
+
+To build the release package yourself instead, run
+`scripts/xmr-node/build-release.sh` in the checkout after the venv and
+packages above. It writes the tarball to `dist/`.
 
 <!-- check build -->
 ```sh
@@ -151,7 +206,22 @@ every boot, so a wrong file cannot start it.
 | Mint it with your own monerod and the repo tool | available today |
 | Copy it from someone who already has it | available today |
 
-**Mint it yourself.** You need your own synced, unrestricted monerod (no
+**Download it.** When a release carries the file, or your pool operator
+publishes a download URL, fetch it straight into the data directory and
+check it before the first start (`~/.c2pool-xmr` is the package's default
+data directory; the source build below uses `~/xmr-stagenet`):
+
+```sh
+cd ~/.c2pool-xmr
+curl -L -C - -o xmr_stagenet_output_set.bin "<URL from your pool operator or the release>"
+echo "186b23c3b43cbc61e6132a9b4927e4eeb3666f153d2f2c5f9d52814d670dcb7d  xmr_stagenet_output_set.bin" | sha256sum -c -
+```
+
+`sha256sum` must print `OK`. `-C -` resumes a broken download. The file is
+1.1 GiB, so the check takes a few seconds.
+
+**Mint it yourself.** The mint tool is in the source tree
+(`tools/xmr-anchor-gen/`), not in the package. You need your own synced, unrestricted monerod (no
 `--restricted-rpc`) past H_a. The tool is read-only. The stagenet mint took
 about 36 minutes and 1.5 GB RAM.
 
@@ -243,6 +313,48 @@ the network's seed nodes. On a slow link also add
 
 ## 6. Join a pool
 
+### 6.1 With the package
+
+All launch flags live in `node.env` in the data directory, one flag per
+line, each with a comment. Replace every `<placeholder>`: the pool id
+(`--pool-genesis`), the two public relay nodes (`--relay-peer`), your
+relay port, and your MAIN payout address. `--give-author-pct 0.1` gives
+0.1% of this node's jobs to the author; set it to 0 to opt out.
+`--node-owner-fee-pct` with `--node-owner-address` is optional: it makes a
+job pay the node owner instead of the miner with that probability; it is
+never a fixed output. `--mine` stays commented out. Relative paths in
+`node.env` are under the data directory.
+
+Start it by hand:
+
+```sh
+cd ~/.c2pool-xmr
+nohup ~/.local/c2pool-xmr/bin/run-node.sh ~/.c2pool-xmr/node.env > node.log 2>&1 &
+```
+
+or with the unit (after ./install.sh --user --systemd):
+
+```sh
+systemctl --user daemon-reload
+systemctl --user start c2pool-xmr
+journalctl --user -u c2pool-xmr -f
+```
+
+For a user unit that keeps running after you log out, an admin runs
+`loginctl enable-linger <user>` once.
+
+`run-node.sh` also starts `memguard.sh`. It watches `MemAvailable` and
+stops the node cleanly (SIGINT) when it falls below `MEMGUARD_MIN_MB`
+(1024 MB by default, set in `node.env`), so the node gives way before the
+machine runs out of memory. The unit sets `OOMScoreAdjust=1000` for the
+same reason and a `MemoryMax=4G` hint. Raise that for mainnet.
+
+The dashboard is at `http://127.0.0.1:8080/` (the `--web-host` and
+`--web-port` lines). To see it from another machine, forward the port
+over ssh rather than binding it to `0.0.0.0`.
+
+### 6.2 By hand (source build)
+
 Start the node. Run it under `nohup`, `tmux` or a service manager so it
 keeps running when you log out:
 
@@ -254,9 +366,10 @@ nohup ~/c2pool/build/src/c2pool/c2pool-v37-xmr --network stagenet \
   --native-output-set ~/xmr-stagenet/xmr_stagenet_output_set.bin \
   --native-snapshot-path ~/xmr-stagenet/data/native.snap \
   --data-dir ~/xmr-stagenet/data \
-  --randomx --d-conf 10 --fee-model v1 --relay-bind rbind \
+  --randomx --d-conf 60 --fee-model v1 --relay-bind rbind \
   --pool-genesis "$POOL_GENESIS" --relay-listen "$RELAY_LISTEN" --relay-peer "$RELAY_PEER" \
-  --payout-address "$ADDR" --share-diff 10000 \
+  --payout-address "$ADDR" --share-diff 10000 --give-author-pct 0.1 \
+  --web-port 8080 --web-host 127.0.0.1 --dashboard-dir ~/c2pool/web-static \
   --stratum-bind-host "$STRATUM_BIND" --stratum-port "$STRATUM_PORT" \
   --status-every 30 > ~/xmr-stagenet/node.log 2>&1 &
 echo "node pid $!"
@@ -276,7 +389,7 @@ What the flags do:
 | `--native-snapshot-path <file>` | save the chain index here so a restart resumes (see [Restart](#9-restart-and-resume)) |
 | `--data-dir <dir>` | the settlement store |
 | `--randomx` | verify RandomX proof of work |
-| `--d-conf 10` | settlement finality depth in blocks. Use the pool's value. |
+| `--d-conf 60` | settlement finality depth in blocks. Use the pool's value. |
 | `--fee-model v1` | the pool fee model: one donation output in every pool block. Use the pool's value. |
 | `--relay-bind rbind` | bind each share to its payee in the proof of work. Required with `--fee-model v1` and on mainnet. |
 | `--pool-genesis <hex64>` | the pool's id. Nodes with a different id refuse each other. |
@@ -285,6 +398,9 @@ What the flags do:
 | `--payout-address <addr>` | this node's own payout address. The stratum port is served only when it is set. |
 | `--share-diff <n>` | share difficulty for miners. Use the pool's value. 0 means network difficulty (solo). |
 | `--stratum-bind-host <ip>`, `--stratum-port <p>` | where miners connect (default `127.0.0.1:3333`) |
+| `--give-author-pct <p>` | percent of this node's jobs given to the author (0.1 in the package's `node.env`; 0 opts out; the binary's own default is 0) |
+| `--web-port <p>`, `--web-host <ip>` | the dashboard (`http://<web-host>:<web-port>/`). Off unless `--web-port` is set. |
+| `--dashboard-dir <dir>` | the dashboard files (`web-static/`). `run-node.sh` sets it for the package. |
 | `--status-every <s>` | seconds between status blocks in the log |
 
 When the relay link is up, the `relay:` status line shows `conns=1 ready=1
@@ -300,13 +416,18 @@ pool must also use the identical `--drops-enrol` list: a node with another list
 is refused at HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… theirs=…`.
 
 Optional fee flags (fee model `v1` only): `--node-owner-fee-pct <p>` with
-`--node-owner-address <addr>` gives the node owner a share of jobs, and
-`--give-author-pct <p>` donates a share to the author. Both default to 0.
+`--node-owner-address <addr>` makes a job pay the node owner instead of the
+miner with probability p percent. It is decided per job, never a fixed
+output, and the owner address must be a MAIN address.
+`--give-author-pct <p>` donates p percent to the author.
 
 ## 7. Point a miner at it
 
-Each miner logs in with its **own** payout address. That address is bound
-into the shares it finds and is paid in the pool's blocks.
+Each miner logs in with its **own** payout address, a MAIN address (`4...`
+on mainnet, `5...` on stagenet). That address is bound into the shares it
+finds and is paid in the pool's blocks. Do not use a subaddress or an
+integrated address. Point the miner at the node's `--stratum-port` (3333 in
+`node.env`) on the address in `--stratum-bind-host`.
 
 ```sh
 xmrig -o <node-ip>:3333 -u <your-XMR-address> -p <worker-name> -a rx/0 -k
@@ -350,6 +471,8 @@ The lines to watch:
 | `relay: conns= ready= hello ok= rej=` | relay links to other pool nodes. `ready` should equal your peer count. |
 | `native: ... verified_frontier=... peers=` | levin peers and the highest RandomX-verified block |
 | `wire RPC to monerod: TOTAL=0` | monerod RPC calls made. It stays 0 in this setup. |
+| `run-node: <binary> <flags>` | printed once by `run-node.sh`: the exact command it started (package installs) |
+| `memguard[<pid>]: watching, stop threshold ...` | memguard is running. `sending SIGINT (clean stop)` means the machine ran low on memory and memguard stopped the node. |
 
 Alarms start with `cba-ALARM` and are counted in the `r6:` line
 (`alarms=`) and the `minority:` line (`state=`, `alarms=`). One
@@ -405,16 +528,16 @@ the output set. Mainnet node numbers are not measured yet.
 
 ## Known limits
 
-- **Merge-mined coinbases.** Some blocks carry a merge-mining tag in the
-  coinbase that the settlement parser does not accept yet. The log then
-  shows `miner_tx prefix does not parse`. A fix is pending.
 - **FCMP++ / Carrot is not supported.** The coming Monero hard fork changes
   the coinbase and the block header. This node does not follow it yet and
   will not follow the chain past the fork.
 - **Block withholding.** A miner can submit shares and keep a found block to
   itself. The pool cannot detect this. The same is true of every pool.
 - **Prototype.** The binary prints `EXPERIMENTAL prototype`. No release tag
-  exists yet, and the output-set download is not published yet.
+  exists yet, and the output-set download is not published yet. Blocks with
+  a merge-mining tag in the coinbase are handled since c2pool #1786.
+- **Payee addresses.** Only MAIN (standard) addresses are supported as
+  payees. `--payout-address` and miner logins are not checked for this yet.
 - **Mainnet** is refused unless you pass `--i-understand-mainnet`.
 
 ## Mainnet (later)
