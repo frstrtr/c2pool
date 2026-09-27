@@ -122,6 +122,7 @@
 // OFF unless --relay-listen / --relay-peer is given; off = this daemon byte-identical to before.
 #include "xmr/relay/xmr_relay_wire.hpp"        // FB_HELLO / FB_RECEIPTS / FB_BLOCK_WON, side_data_v2, lane_params_digest
 #include "xmr/relay/xmr_receipt_mint.hpp"      // share -> PoW-carrying receipt; the structural check
+#include "xmr/relay/xmr_relay_peerstore.hpp"   // RELAY-DISCOVERY: persistent peer book (core::AddrStore)
 #include "xmr/relay/xmr_relay_node.hpp"        // TCP relay: HELLO gate, verify worker (RandomX LAST), flood, backfill, repair
 #include "xmr/relay/xmr_repair_replay.hpp"     // REPAIR-HORIZON: the repair scratch replay + the shadow winner-side order
 #include "xmr/relay/xmr_relay_bootstrap.hpp"   // RELAY-BOOTSTRAP: the built-in per-network relay bootstrap list
@@ -231,6 +232,8 @@ static bool          g_no_relay_bootstrap = false;     // --no-relay-bootstrap (
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
+static bool          g_relay_discovery = true;          // --relay-discovery on|off (FB_GETADDR/FB_ADDR + persistent peer book)
+static std::size_t   g_relay_max_outbound = 8;          // --relay-max-outbound N (dialed links kept up; peers + learned)
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
 static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
@@ -3562,6 +3565,30 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
             }
             ro.max_peers = g_relay_max_peers;
+            // RELAY-DISCOVERY: peer exchange + a persistent book per pool id + network
+            // in the data dir. Relay-only: no coinbase / digest byte depends on it.
+            std::string relay_book_path;
+            ro.discovery = g_relay_discovery;
+            ro.max_outbound = g_relay_max_outbound;
+            if (ro.discovery) {
+                std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
+                const std::string tag = hex_of(ro.pool_id->lane_tag).substr(0, 8) + hex_of(pool_genesis_of(cfg)).substr(0, 8);
+                relay_book_path = cfg.resolved_settle_db_path() + "/" + relay::peerstore_file_name(ro.network, tag);
+                std::string why_load;
+                if (!relay::peerstore_load(relay_book_path, ro.book_load, &why_load))
+                    std::printf("relay-disc: peer book %s unreadable (%s) -- starting empty\n", relay_book_path.c_str(), why_load.c_str());
+                ro.book_save = [relay_book_path](const std::vector<relay::PeerRecord>& v) {
+                    std::string w;
+                    if (!relay::peerstore_save(relay_book_path, v, &w))
+                        std::printf("relay-disc: peer book save FAILED %s (%s)\n", relay_book_path.c_str(), w.c_str());
+                };
+                std::size_t good = 0;
+                for (const auto& r : ro.book_load) good += r.good ? 1 : 0;
+                std::printf("relay-disc: discovery ON (FB_GETADDR/FB_ADDR 0x4c/0x4d) max-outbound=%zu book=%s loaded=%zu good=%zu\n",
+                            ro.max_outbound, relay_book_path.c_str(), ro.book_load.size(), good);
+            } else {
+                std::printf("relay-disc: discovery OFF (--relay-discovery off): only --relay-peer is dialed, nothing persisted\n");
+            }
             ro.index_horizon = g_relay_horizon;
             {
                 double v[4] = {1, 20, 16, 256}; int k = 0; std::stringstream ss(g_relay_rx_budget); std::string tok;
@@ -4159,6 +4186,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());
+                std::printf("  %s\n", relay_node->disc_describe().c_str());   // RELAY-DISCOVERY
                 if (relay_native_ctx || relay_ctx_journal.written())
                     std::printf("  %s | ctx-journal size=%zu written=%llu\n", relay_ctx_feeder.describe().c_str(),
                                 relay_ctx_journal.size(), (unsigned long long)relay_ctx_journal.written());
@@ -4786,6 +4814,8 @@ int main(int argc, char** argv) {
         else if (a == "--drops-enrol")              g_drops_enrol.push_back(value());
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
         else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
+        else if (a == "--relay-discovery")          g_relay_discovery = cs::one_of(a, value(), {"on", "off"}) == "on";
+        else if (a == "--relay-max-outbound")       g_relay_max_outbound = static_cast<std::size_t>(u64());
         else if (a == "--relay-index-horizon")      g_relay_horizon = u64();
         else if (a == "--relay-rx-budget")          g_relay_rx_budget = value();
         else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
@@ -4960,6 +4990,8 @@ int main(int argc, char** argv) {
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
                 "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
                 "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
+                "  --relay-discovery on|off     relay peer discovery (FB_GETADDR/FB_ADDR) + persistent peer book (default on)\n"
+                "  --relay-max-outbound N       dialed relay links kept up, --relay-peer + learned (default 8)\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
                 "  --relay-vault-entries N --relay-vault-bytes N --relay-vault-horizon N  --no-relay-serve\n"
                 "  --relay-bind none|rbind      rbind = write + require the SEAM-1 payee/give-author\n"

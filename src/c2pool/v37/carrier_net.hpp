@@ -264,6 +264,32 @@ public:
 
     std::uint16_t listen_port() const { return m_listen_port; }
 
+    // RELAY-DISCOVERY: bound connect(2) of add_peer_id (Linux honours
+    // SO_SNDTIMEO on connect). 0 = block as the kernel decides (the default,
+    // unchanged). A relay dialing LEARNED addresses sets it, so one
+    // unreachable address cannot pin its maintenance thread for minutes.
+    void set_connect_timeout(std::chrono::milliseconds t) { m_connect_timeout_ms.store(static_cast<long>(t.count())); }
+
+    // RELAY-DISCOVERY: the remote IPv4 address of a live connection ("" = gone
+    // / unknown). An inbound peer's advertised relay address is this + the
+    // listen port it announced in HELLO.
+    std::string remote_ip(PeerId id) const {
+        std::shared_ptr<Conn> c;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return {};
+            c = it->second;
+        }
+        std::lock_guard<std::mutex> fl(c->fmtx);
+        if (c->closed) return {};
+        sockaddr_in a{}; socklen_t alen = sizeof(a);
+        if (::getpeername(c->fd, reinterpret_cast<sockaddr*>(&a), &alen) != 0 || a.sin_family != AF_INET) return {};
+        char b[INET_ADDRSTRLEN] = {0};
+        if (!::inet_ntop(AF_INET, &a.sin_addr, b, sizeof b)) return {};
+        return b;
+    }
+
     // GAP-2: dial and return the new connection's PeerId (0 = the dial failed).
     // Same semantics as add_peer(); the id lets a caller keep per-target state
     // (the relay's redial-with-backoff). PeerEventFn(id, true) has already fired
@@ -275,7 +301,18 @@ public:
         a.sin_family = AF_INET;
         a.sin_port = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { ::close(fd); return 0; }
+        const long ctmo = m_connect_timeout_ms.load();
+        if (ctmo > 0) {
+            timeval tv{};
+            tv.tv_sec = static_cast<time_t>(ctmo / 1000);
+            tv.tv_usec = static_cast<suseconds_t>((ctmo % 1000) * 1000);
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
         if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { ::close(fd); return 0; }
+        if (ctmo > 0) {   // add_established re-applies the send timeout; clear the connect one first
+            timeval zero{};
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
+        }
         return add_established(fd);
     }
 
@@ -649,6 +686,7 @@ private:
     // trips it, short enough that a peer which stopped reading cannot pin one
     // of our threads indefinitely. 0 => block forever (pre-Stage-1 behaviour).
     std::atomic<long>         m_send_timeout_ms{10000};
+    std::atomic<long>         m_connect_timeout_ms{0};   // RELAY-DISCOVERY (0 = unbounded, unchanged)
     int                       m_listen_fd = -1;
     std::uint16_t             m_listen_port = 0;
     // The node is "running" for its whole lifetime (construction -> stop()),
