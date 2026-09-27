@@ -20,14 +20,20 @@ your pool's operator and pass it with `--relay-peer`.
 - The list is used only when the relay is on (`--relay-listen` or
   `--relay-peer`). The node dials the built-in peers in addition to every
   `--relay-peer`.
+- With peer discovery on (`--relay-discovery on`, the default) the built-in
+  peers are discovery seeds: they enter the peer book as candidates, become
+  good peers once their HELLO is accepted, and are then handed out to other
+  nodes like any good peer. With `--relay-discovery off` they are dialled
+  like `--relay-peer` values.
 - `--no-relay-bootstrap` turns the built-in list off. Then the node dials
   only its `--relay-peer` values.
 - A node does not dial itself: a built-in entry whose port is the
   `--relay-listen` port, on the listen host or on one of the machine's own
   addresses, is skipped. An entry that is also a `--relay-peer` is dialled
   once.
-- An unreachable peer is redialled with the relay's normal backoff
-  (1 to 60 seconds). It never stops the node.
+- An unreachable peer is redialled with backoff and never stops the node
+  (as a seed: the peer book backoff, 5 s doubling, dropped after 8 failures
+  in a row and seeded again at the next start; with discovery off: 1 to 60 s).
 - At start the node logs one line with the peers it uses:
   `relay: bootstrap ON: dial=... self_skipped=... already_peer=...`.
 

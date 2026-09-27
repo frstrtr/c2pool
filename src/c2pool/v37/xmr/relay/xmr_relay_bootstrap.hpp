@@ -22,12 +22,15 @@
 // host or one of this machine's addresses) is skipped. An unreachable default
 // is redialled with the relay's normal 1..60 s backoff, never fatal. With the
 // relay OFF nothing is dialled (the daemon stays byte-identical to before).
-// No wire change: the list only feeds RelayOptions::peers.
+// No wire change: with --relay-discovery on (the default) the list feeds
+// RelayOptions::seeds (book candidates, good after HELLO, handed out in
+// FB_ADDR); with --relay-discovery off it feeds RelayOptions::peers.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace c2pool::v37n::xmr::relay {
@@ -94,6 +97,23 @@ inline BootstrapPick resolve_bootstrap(std::uint8_t network, bool no_bootstrap,
         (is_self ? p.self : p.use).push_back(d);
     }
     return p;
+}
+
+// RC7 integration (#1819 x #1820): where the picked defaults go. Discovery ON:
+// RelayOptions::seeds (book candidates, dialed by discovery, GOOD after an
+// accepted HELLO, then handed out in FB_ADDR). Discovery OFF (no book): the
+// permanent dial targets RelayOptions::peers. Returns how many were routed.
+inline std::size_t route_bootstrap(const std::vector<std::string>& use, bool discovery,
+                                   std::vector<std::pair<std::string, std::uint16_t>>& seeds,
+                                   std::vector<std::pair<std::string, std::uint16_t>>& peers) {
+    std::size_t n = 0;
+    for (const auto& d : use) {
+        std::string h; std::uint16_t pt = 0;
+        if (!bootstrap_split(d, h, pt)) continue;
+        (discovery ? seeds : peers).emplace_back(h, pt);
+        ++n;
+    }
+    return n;
 }
 
 }  // namespace c2pool::v37n::xmr::relay

@@ -3559,10 +3559,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                             g_no_relay_bootstrap ? "OFF (--no-relay-bootstrap)"
                             : relay::default_bootstrap_hosts(ro.network).empty() ? "none for this network" : "ON",
                             joined(bp.use).c_str(), joined(bp.self).c_str(), joined(bp.dup).c_str(), g_relay_peers.size());
-                for (const auto& d : bp.use) {
-                    std::string h; std::uint16_t pt = 0;
-                    if (relay::bootstrap_split(d, h, pt)) ro.peers.emplace_back(h, pt);
-                }
+                // RC7 integration (#1819 x #1820): with discovery ON the bootstrap nodes are
+                // SEEDS -- book candidates dialed by discovery, GOOD once their HELLO is ok,
+                // then handed out in FB_ADDR like any good peer. With discovery OFF there is
+                // no book, so they stay permanent dial targets (the #1819 behaviour).
+                // --no-relay-bootstrap left bp.use empty: no seed at all.
+                const std::size_t routed = relay::route_bootstrap(bp.use, g_relay_discovery, ro.seeds, ro.peers);
+                if (routed)
+                    std::printf("relay: bootstrap %zu node(s) -> %s\n", routed,
+                                g_relay_discovery ? "discovery seeds (candidates; good after HELLO)"
+                                                  : "permanent dial targets (--relay-discovery off)");
             }
             ro.max_peers = g_relay_max_peers;
             // RELAY-DISCOVERY: peer exchange + a persistent book per pool id + network
