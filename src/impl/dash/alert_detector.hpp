@@ -29,9 +29,11 @@
 //   refused events stay pending (they fire when the window frees up if the
 //   condition still holds) -- nothing is silently lost.
 //
-// Persistence (restore()/persist()): known workers with their last-seen time
-// and whether an OFFLINE is outstanding, so a restart neither forgets a rig
-// that never reconnects nor re-pages one already reported.
+// Persistence (restore()/persist()): known workers with their last-seen time,
+// whether an OFFLINE is outstanding and, for a worker that was down, when its
+// outage began, so a restart neither forgets a rig that never reconnects nor
+// re-pages one already reported, and a later BACK_ONLINE reports the REAL
+// outage length (not "since the node restarted").
 //
 // No money / consensus state: reads a worker key, a session id and a counter.
 
@@ -94,6 +96,10 @@ public:
         bool offline_alerted{false};
         int64_t last_offline_alert{0};
         std::string down_cause;
+        // When the outage began as far as anyone observed (reported in the
+        // alert texts). down_since drives the OFFLINE timer and is reset to
+        // the detector start on restore; outage_since survives the restart.
+        int64_t outage_since{0};
     };
 
     AlertDetector(DetectorConfig cfg, int64_t start_ts)
@@ -103,6 +109,9 @@ public:
     int64_t grace_until() const { return m_grace_until; }
     const std::map<std::string, State>& workers() const { return m_workers; }
     uint64_t suppressed_by_cap() const { return m_suppressed; }
+    // Bumped whenever persisted state changes (new worker, up/down, alert
+    // emitted, worker forgotten) -- NOT on the per-tick last_seen refresh.
+    uint64_t generation() const { return m_gen; }
 
     // Restore persisted known workers. They start DOWN at the detector start
     // (node downtime is not counted against them).
@@ -118,10 +127,16 @@ public:
             s.last_offline_alert = it.value().value("last_offline_alert", int64_t{0});
             if (m_start - s.last_seen > m_cfg.known_expiry) continue;
             s.up = false;
-            s.down_since = m_start;
+            s.down_since = m_start;   // node downtime never shortens the OFFLINE timer
+            // A worker persisted as down keeps its outage start; one that was up
+            // was last observed at last_seen, so its outage began no earlier.
+            const int64_t persisted_outage = it.value().value("outage_since", int64_t{0});
+            s.outage_since = persisted_outage > 0 ? persisted_outage : (s.last_seen > 0 ? s.last_seen : m_start);
+            if (s.outage_since > m_start) s.outage_since = m_start;
             s.down_cause = "not reconnected since node restart";
             m_workers.emplace(it.key(), std::move(s));
         }
+        ++m_gen;
     }
 
     nlohmann::json persist() const
@@ -130,7 +145,8 @@ public:
         for (const auto& [k, s] : m_workers)
             j[k] = {{"last_seen", s.last_seen},
                     {"offline_alerted", s.offline_alerted},
-                    {"last_offline_alert", s.last_offline_alert}};
+                    {"last_offline_alert", s.last_offline_alert},
+                    {"outage_since", s.up ? int64_t{0} : s.outage_since}};
         return j;
     }
 
@@ -154,6 +170,7 @@ public:
             if (it == m_workers.end()) {
                 if (m_workers.size() >= m_cfg.max_workers) continue;   // bounded
                 it = m_workers.emplace(key, State{}).first;
+                ++m_gen;
             }
             State& st = it->second;
             bool evidence = false;
@@ -183,12 +200,15 @@ public:
             if (is_up && !st.up) {
                 st.up = true;
                 st.up_since = now;
+                ++m_gen;
             } else if (!is_up && st.up) {
                 st.up = false;
                 st.down_since = now;
+                st.outage_since = now;
                 st.down_cause = st.present
                     ? "connected but no accepted shares for " + fmt_duration(now - st.last_evidence)
                     : "disconnected";
+                ++m_gen;
             }
 
             if (!st.up && !st.offline_alerted && now >= m_grace_until &&
@@ -199,28 +219,31 @@ public:
                 ev.kind = Kind::Offline;
                 ev.worker = key;
                 ev.ts = now;
-                ev.detail = st.down_cause + "; down " + fmt_duration(now - st.down_since);
+                ev.detail = st.down_cause + "; down " + fmt_duration(now - outage_start(st));
                 out.push_back(std::move(ev));
                 st.offline_alerted = true;
                 st.last_offline_alert = now;
+                ++m_gen;
             } else if (st.up && st.offline_alerted && now - st.up_since >= m_cfg.online_after) {
                 if (!admit_rate(key, now, out)) continue;
                 DetectorEvent ev;
                 ev.kind = Kind::BackOnline;
                 ev.worker = key;
                 ev.ts = now;
-                ev.detail = "back online after " + fmt_duration(st.up_since - st.down_since) +
+                ev.detail = "back online after " + fmt_duration(st.up_since - outage_start(st)) +
                             " down; up " + fmt_duration(now - st.up_since);
                 out.push_back(std::move(ev));
                 st.offline_alerted = false;
+                ++m_gen;
             }
         }
 
         // 4) forget long-absent workers (bounded memory)
         for (auto it = m_workers.begin(); it != m_workers.end(); ) {
-            if (!it->second.present && now - it->second.last_seen > m_cfg.known_expiry)
+            if (!it->second.present && now - it->second.last_seen > m_cfg.known_expiry) {
                 it = m_workers.erase(it);
-            else
+                ++m_gen;
+            } else
                 ++it;
         }
         return out;
@@ -241,6 +264,11 @@ public:
     }
 
 private:
+    static int64_t outage_start(const State& st)
+    {
+        return st.outage_since > 0 && st.outage_since < st.down_since ? st.outage_since : st.down_since;
+    }
+
     void prune_rate(int64_t now)
     {
         while (!m_rate.empty() && m_rate.front() + 3600 <= now) m_rate.pop_front();
@@ -277,6 +305,7 @@ private:
     bool m_digest_sent{false};
     std::set<std::string> m_held;   // workers held by the cap in this episode
     uint64_t m_suppressed{0};
+    uint64_t m_gen{0};
 };
 
 } // namespace dash::alert

@@ -19,6 +19,12 @@ which the node polls and turns into a signed "delivered" ack back to the
 origin. Anything else (network error, 5xx, 429, ok:false) is retried with
 exponential backoff (5 s -> 5 min; 429 honours retry_after) and never marked.
 
+A row whose event is older than --max-age (default 6 h, the origin's own
+give-up age) is NOT sent -- a page saying "rig OFFLINE at <two days ago>" helps
+nobody. It is logged once and recorded in <state-dir>/expired.jsonl (never in
+delivered.jsonl, so the node never acks it as delivered; the origin reports it
+as expired_at_relay).
+
 Secrets: the bot token comes from $TELEGRAM_BOT_TOKEN or --token-file (0600).
 It is never logged: every log line passes through a redactor, and request
 URLs are never logged.
@@ -93,10 +99,13 @@ def format_text(row):
 class Sidecar:
     def __init__(self, state_dir, token, chat_ids, api_base="https://api.telegram.org",
                  max_per_min=20, backoff_min=5.0, backoff_max=300.0, timeout=15.0,
-                 clock=time.monotonic):
+                 clock=time.monotonic, max_age=6 * 3600, wall=time.time):
         self.state_dir = state_dir
         self.outbox = os.path.join(state_dir, "outbox.jsonl")
         self.delivered_path = os.path.join(state_dir, "delivered.jsonl")
+        self.expired_path = os.path.join(state_dir, "expired.jsonl")
+        self.max_age = max_age       # seconds; <= 0 disables the age cut
+        self.wall = wall             # wall clock (event_ts is unix time)
         self.token = token
         self.chat_ids = list(chat_ids)
         self.api_base = api_base.rstrip("/")
@@ -106,6 +115,7 @@ class Sidecar:
         self.timeout = timeout
         self.clock = clock
         self.delivered = set()
+        self.expired = set()
         self.outbox_offset = 0
         self.pending = {}            # id -> row
         self.order = []              # ids in arrival order
@@ -113,21 +123,25 @@ class Sidecar:
         self.next_try = {}           # id -> clock time
         self.backoff = {}            # id -> current backoff seconds
         self.sent_window = deque()   # clock times of sendMessage calls
-        self.stats = {"sent": 0, "delivered": 0, "failed": 0, "rate_limited": 0}
-        self._load_delivered()
+        self.stats = {"sent": 0, "delivered": 0, "failed": 0, "rate_limited": 0, "expired": 0}
+        self.delivered = self._load_ids(self.delivered_path)
+        self.expired = self._load_ids(self.expired_path)
 
-    def _load_delivered(self):
+    @staticmethod
+    def _load_ids(path):
+        ids = set()
         try:
-            with open(self.delivered_path, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8") as fh:
                 for line in fh:
                     try:
                         obj = json.loads(line)
                     except ValueError:
                         continue
                     if isinstance(obj, dict) and isinstance(obj.get("id"), str):
-                        self.delivered.add(obj["id"])
+                        ids.add(obj["id"])
         except FileNotFoundError:
             pass
+        return ids
 
     def read_outbox(self):
         try:
@@ -148,21 +162,49 @@ class Sidecar:
                 LOG.warning("skipping unparsable outbox line")
                 continue
             rid = row.get("id") if isinstance(row, dict) else None
-            if not isinstance(rid, str) or rid in self.delivered or rid in self.pending:
+            if not isinstance(rid, str) or rid in self.delivered or rid in self.expired or rid in self.pending:
                 continue
             self.pending[rid] = row
             self.order.append(rid)
         self.outbox_offset += consumed
 
-    def _mark_delivered(self, rid):
-        line = json.dumps({"id": rid, "ts": int(time.time())}) + "\n"
-        fd = os.open(self.delivered_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    @staticmethod
+    def _append(path, obj):
+        line = json.dumps(obj) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.write(fd, line.encode("utf-8"))
             os.fsync(fd)
         finally:
             os.close(fd)
+
+    def _mark_delivered(self, rid):
+        self._append(self.delivered_path, {"id": rid, "ts": int(time.time())})
         self.delivered.add(rid)
+
+    def _event_age(self, row):
+        ts = row.get("event_ts") or row.get("sent_ts") or 0
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            return None
+        return self.wall() - ts if ts > 0 else None
+
+    def _expire(self, rid, row, age):
+        self._append(self.expired_path, {"id": rid, "event_ts": row.get("event_ts"), "ts": int(self.wall())})
+        self.expired.add(rid)
+        self.stats["expired"] += 1
+        LOG.warning("not sending %s (%s %s): event is %.0fs old (> --max-age %ds); recorded in expired.jsonl",
+                    rid[:16] + rid[rid.rfind(":"):], row.get("kind"), row.get("worker", ""), age, self.max_age)
+        self._forget(rid)
+
+    def _forget(self, rid):
+        self.pending.pop(rid, None)
+        if rid in self.order:
+            self.order.remove(rid)
+        self.done_chats.pop(rid, None)
+        self.next_try.pop(rid, None)
+        self.backoff.pop(rid, None)
 
     def _throttled(self, now):
         while self.sent_window and self.sent_window[0] + 60.0 <= now:
@@ -211,6 +253,10 @@ class Sidecar:
             if self.next_try.get(rid, 0) > now:
                 continue
             row = self.pending[rid]
+            age = self._event_age(row)
+            if self.max_age > 0 and age is not None and age > self.max_age:
+                self._expire(rid, row, age)
+                continue
             text = format_text(row)
             done = self.done_chats.setdefault(rid, set())
             failed = False
@@ -241,11 +287,7 @@ class Sidecar:
                 self._mark_delivered(rid)
                 self.stats["delivered"] += 1
                 LOG.info("delivered %s (%s %s)", rid[:16] + rid[rid.rfind(":"):], row.get("kind"), row.get("worker", ""))
-                del self.pending[rid]
-                self.order.remove(rid)
-                self.done_chats.pop(rid, None)
-                self.next_try.pop(rid, None)
-                self.backoff.pop(rid, None)
+                self._forget(rid)
 
 
 def read_token(args):
@@ -311,7 +353,8 @@ def selftest():
 
     with tempfile.TemporaryDirectory() as d:
         clock = [1000.0]
-        sc = Sidecar(d, token, ["42"], api_base=base, backoff_min=5, clock=lambda: clock[0])
+        wall = lambda: 1790000000 + 600 + (clock[0] - 1000.0)   # rows below are ~10 min old
+        sc = Sidecar(d, token, ["42"], api_base=base, backoff_min=5, clock=lambda: clock[0], wall=wall)
         row = {"id": "02ab:1", "kind": "offline", "label": "hotel", "worker": "XaddrABC.rig1",
                "detail": "disconnected; down 5m", "event_ts": 1790000000}
         with open(os.path.join(d, "outbox.jsonl"), "w") as fh:
@@ -367,16 +410,51 @@ def selftest():
         check(len(_FakeTelegram.calls) == 6, "exactly 6 HTTP calls in total")
 
         # (d) restart: a fresh sidecar re-reads delivered.jsonl and sends nothing
-        sc2 = Sidecar(d, token, ["42"], api_base=base, clock=lambda: clock[0])
+        sc2 = Sidecar(d, token, ["42"], api_base=base, clock=lambda: clock[0], wall=wall)
         sc2.step()
         check(len(_FakeTelegram.calls) == 6, "restart does not resend delivered rows")
 
         # (e) network error -> retried, not marked
-        sc3 = Sidecar(d, token, ["42"], api_base="http://127.0.0.1:1", clock=lambda: clock[0])
+        sc3 = Sidecar(d, token, ["42"], api_base="http://127.0.0.1:1", clock=lambda: clock[0], wall=wall)
         with open(os.path.join(d, "outbox.jsonl"), "a") as fh:
             fh.write(json.dumps(dict(row, id="02ab:4")) + "\n")
         sc3.step()
         check("02ab:4" not in sc3.delivered, "connection refused -> not marked")
+
+        # (f) a row older than --max-age is never sent, recorded as expired, not delivered
+        sc4 = Sidecar(d, token, ["42"], api_base=base, clock=lambda: clock[0], wall=wall)
+        sc4.read_outbox()
+        sc4.pending.clear(); sc4.order.clear()        # only the new row below matters here
+        old = dict(row, id="02ab:5", event_ts=int(wall()) - 7 * 3600)
+        with open(os.path.join(d, "outbox.jsonl"), "a") as fh:
+            fh.write(json.dumps(old) + "\n")
+        n0 = len(_FakeTelegram.calls)
+        sc4.step()
+        check(len(_FakeTelegram.calls) == n0, "stale row (7 h > 6 h) -> no sendMessage")
+        with open(os.path.join(d, "expired.jsonl")) as fh:
+            ex = [json.loads(l)["id"] for l in fh if l.strip()]
+        with open(os.path.join(d, "delivered.jsonl")) as fh:
+            dl = [json.loads(l)["id"] for l in fh if l.strip()]
+        check(ex == ["02ab:5"] and "02ab:5" not in dl, "stale row -> expired.jsonl, never delivered.jsonl")
+        sc5 = Sidecar(d, token, ["42"], api_base=base, clock=lambda: clock[0], wall=wall)
+        sc5.read_outbox()
+        check("02ab:5" not in sc5.pending, "restart does not pick an expired row up again")
+
+        # (g) a row that ages out while it is being retried is dropped, not paged late
+        sc6 = Sidecar(d, token, ["42"], api_base=base, backoff_min=5, clock=lambda: clock[0], wall=wall,
+                      max_age=100)
+        sc6.read_outbox()
+        sc6.pending.clear(); sc6.order.clear()
+        fresh = dict(row, id="02ab:6", event_ts=int(wall()) - 50)
+        with open(os.path.join(d, "outbox.jsonl"), "a") as fh:
+            fh.write(json.dumps(fresh) + "\n")
+        _FakeTelegram.script = [(500, {"ok": False, "description": "boom"})]
+        n0 = len(_FakeTelegram.calls)
+        sc6.step()
+        check(len(_FakeTelegram.calls) == n0 + 1 and "02ab:6" not in sc6.delivered, "fresh row tried, failed")
+        clock[0] += 60                                  # now 110 s old, past max_age=100
+        sc6.step()
+        check(len(_FakeTelegram.calls) == n0 + 1 and "02ab:6" in sc6.expired, "aged out during retry -> expired, no late page")
 
     srv.shutdown()
     logs = log_buf.getvalue()
@@ -397,6 +475,8 @@ def main():
                     help="Bot API base URL (override for a local fake endpoint in tests)")
     ap.add_argument("--poll", type=float, default=5.0, help="seconds between outbox polls")
     ap.add_argument("--max-per-min", type=int, default=20)
+    ap.add_argument("--max-age", type=int, default=6 * 3600,
+                    help="never send an alert whose event is older than this many seconds (0 = no limit)")
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -421,7 +501,7 @@ def main():
         LOG.error("no chat id: pass --chat-id or --chat-id-file")
         return 2
     sc = Sidecar(args.state_dir, token, chats, api_base=args.telegram_api_base,
-                 max_per_min=args.max_per_min)
+                 max_per_min=args.max_per_min, max_age=args.max_age)
     LOG.info("alert-relay telegram sidecar: state=%s chats=%d api=%s", args.state_dir, len(chats),
              args.telegram_api_base)
     while True:

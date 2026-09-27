@@ -15,6 +15,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -196,6 +198,7 @@ ServiceConfig origin_cfg(const fs::path& dir, const Bytes& relay_pub)
     c.relays = {relay_pub};
     c.retry_every = 60;
     c.retry_max = 60;
+    c.inline_io = true;
     return c;
 }
 
@@ -205,6 +208,7 @@ ServiceConfig relay_cfg(const fs::path& dir, const std::vector<Bytes>& accept)
     c.telegram = true;
     c.state_dir = dir.string();
     c.accept = accept;
+    c.inline_io = true;
     return c;
 }
 
@@ -213,6 +217,7 @@ ServiceConfig fwd_cfg(const fs::path& dir)
     ServiceConfig c;
     c.forward = true;
     c.state_dir = dir.string();
+    c.inline_io = true;
     return c;
 }
 
@@ -1020,4 +1025,414 @@ TEST(DashAlertRelay, StatusSnapshotCarriesNoSecret)
     std::ifstream state(od / "state.json");
     std::string state_s((std::istreambuf_iterator<char>(state)), std::istreambuf_iterator<char>());
     EXPECT_EQ(state_s.find(to_hex(okey.seckey.data(), 32)), std::string::npos);
+}
+
+// ── (11) hardening: bounded memory, IO off the event thread, re-probe ──────
+namespace {
+// Fresh valid secp256k1 keys (0x30..0xEF filled; all below the group order).
+KeyPair junk_key(int i) { return key_from_byte(static_cast<unsigned char>(0x30 + (i % 0xC0))); }
+
+Transport capture_transport(std::vector<AckFrame>& acks, std::vector<AlertFrame>* alerts = nullptr)
+{
+    Transport t;
+    t.send_ack = [&acks](uint64_t, const AckFrame& a) { acks.push_back(a); return true; };
+    t.broadcast_ack = [&acks](uint64_t, const AckFrame& a) { acks.push_back(a); return std::size_t{1}; };
+    t.broadcast_alert = [alerts](uint64_t, const AlertFrame& f) {
+        if (alerts) alerts->push_back(f);
+        return std::size_t{1};
+    };
+    return t;
+}
+
+// Holds the writer thread before every job until release() (or destruction).
+struct DiskGate {
+    std::promise<void> p;
+    std::shared_future<void> f{p.get_future().share()};
+    bool released{false};
+    void install(FileWriter& w) { auto fut = f; w.set_before_job_hook([fut] { fut.wait(); }); }
+    void release() { if (!released) { released = true; p.set_value(); } }
+    ~DiskGate() { release(); }
+};
+} // namespace
+
+TEST(DashAlertRelay, RefusedLogThrottleIsGlobalNotPerKey)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto rd = fresh_dir("r");
+    AlertRelayService svc(relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    std::string err;
+    ASSERT_TRUE(svc.init(err));
+    std::vector<AckFrame> acks;
+    svc.set_transport(capture_transport(acks));
+    // 150 distinct self-signed origins, each on its own peer link.
+    std::map<uint64_t, PeerAlertGuard> guards;
+    for (int i = 0; i < 150; ++i) {
+        auto k = junk_key(i);
+        auto f = *build_alert(k, rkey.pubkey, sample_body(), T0, 9000 + i);
+        EXPECT_EQ(svc.on_alert(f, 100 + i, guards[100 + i], T0 + i % 10), Verdict::RefusedNotAllowed);
+    }
+    EXPECT_EQ(svc.counters().refused_allowlist, 150u);
+    EXPECT_EQ(svc.counters().refused_log_suppressed, 149u) << "one warning, the rest counted -- no per-key table";
+    auto k = junk_key(7);
+    auto f = *build_alert(k, rkey.pubkey, sample_body(), T0 + 3600, 99999);
+    PeerAlertGuard g;
+    EXPECT_EQ(svc.on_alert(f, 7, g, T0 + 3600), Verdict::RefusedNotAllowed);
+    EXPECT_EQ(svc.counters().refused_log_suppressed, 0u) << "next hour: warns again and resets";
+    EXPECT_FALSE(fs::exists(rd / "outbox.jsonl"));
+}
+
+TEST(DashAlertRelay, SeenEraseLeavesNoGhostSlot)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    NodeAlertSeen seen;
+    auto f = *build_alert(okey, rkey.pubkey, sample_body(), T0, 0);
+    f.nonce = 1;
+    seen.insert(f, 1, T0);
+    ASSERT_TRUE(seen.erase(okey.pubkey, 1));
+    EXPECT_FALSE(seen.erase(okey.pubkey, 1));
+    EXPECT_EQ(seen.order.size(), 0u);
+    SeenEntry& again = seen.insert(f, 2, T0 + 1);   // the origin retransmits the same nonce
+    EXPECT_EQ(again.from_peer, 2u);
+    EXPECT_EQ(seen.order.size(), seen.entries.size());
+    // Fill to the cap: with a ghost slot the live id would be evicted early.
+    for (uint64_t i = 0; i < NodeAlertSeen::kMaxEntries - 1; ++i) {
+        f.nonce = 100 + i;
+        seen.insert(f, 1, T0);
+    }
+    EXPECT_EQ(seen.size(), NodeAlertSeen::kMaxEntries);
+    EXPECT_EQ(seen.evicted, 0u);
+    ASSERT_NE(seen.find(okey.pubkey, 1), nullptr) << "re-inserted id survives until it is the oldest";
+    f.nonce = 999999;
+    SeenEntry& last = seen.insert(f, 3, T0);
+    EXPECT_EQ(last.from_peer, 3u);
+    EXPECT_EQ(seen.find(okey.pubkey, 1), nullptr) << "now it is the oldest and goes first";
+    EXPECT_EQ(seen.order.size(), seen.entries.size());
+}
+
+TEST(DashAlertRelay, OutboxWriteFailureDefersWithoutGhostAndRecovers)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto rd = fresh_dir("r");
+    fs::create_directories(rd / "outbox.jsonl");   // a directory: every append fails
+    AlertRelayService svc(relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    std::string err;
+    ASSERT_TRUE(svc.init(err));
+    std::vector<AckFrame> acks;
+    svc.set_transport(capture_transport(acks));
+    PeerAlertGuard g;
+    auto f = *build_alert(okey, rkey.pubkey, sample_body(), T0, 42);
+    EXPECT_EQ(svc.on_alert(f, 5, g, T0), Verdict::Deferred);
+    EXPECT_EQ(svc.seen().size(), 0u);
+    EXPECT_EQ(svc.seen().order.size(), 0u) << "no ghost FIFO slot";
+    EXPECT_TRUE(acks.empty()) << "never ack what is not on disk";
+    EXPECT_EQ(svc.on_alert(f, 5, g, T0 + 60), Verdict::Deferred) << "the retransmit is processed afresh";
+    EXPECT_EQ(svc.seen().order.size(), svc.seen().entries.size());
+    EXPECT_EQ(svc.counters().outbox_errors, 2u);
+    fs::remove_all(rd / "outbox.jsonl");
+    EXPECT_EQ(svc.on_alert(f, 5, g, T0 + 120), Verdict::Queued);
+    ASSERT_EQ(acks.size(), 1u);
+    EXPECT_EQ(acks[0].status, static_cast<uint8_t>(AckStatus::Queued));
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u);
+}
+
+TEST(DashAlertRelay, IdleTicksWriteNothingAndOneEventIsOneWrite)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto fd = fresh_dir("f"), rd = fresh_dir("r"), od = fresh_dir("o");
+    AlertRelayService fwd(fwd_cfg(fd), std::nullopt, T0);
+    AlertRelayService rel(relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    auto ocfg = origin_cfg(od, rkey.pubkey);
+    ocfg.det.startup_grace = 0;
+    AlertRelayService org(ocfg, okey, T0);
+    std::string err;
+    ASSERT_TRUE(fwd.init(err));
+    ASSERT_TRUE(rel.init(err));
+    ASSERT_TRUE(org.init(err));
+    std::vector<AckFrame> acks;
+    fwd.set_transport(capture_transport(acks));
+    rel.set_transport(capture_transport(acks));
+    org.set_transport(capture_transport(acks));
+    const uint64_t f0 = fwd.io().submitted(), r0 = rel.io().submitted(), o0 = org.io().submitted();
+    for (int64_t t = T0 + 5; t <= T0 + 3600; t += 5) {
+        fwd.on_tick({}, t);
+        rel.on_tick({}, t);
+        org.on_tick({}, t);
+    }
+    EXPECT_EQ(fwd.io().submitted(), f0) << "an idle forwarder never touches the disk";
+    EXPECT_EQ(rel.io().submitted(), r0) << "an idle relay never touches the disk";
+    EXPECT_EQ(org.io().submitted(), o0) << "an origin with no workers never touches the disk";
+
+    // A steady worker: one save for its appearance, then a slow last_seen refresh.
+    const uint64_t o1 = org.io().submitted();
+    for (int64_t t = T0 + 3605; t <= T0 + 7200; t += 5)
+        org.on_tick(one("A.rig1", "s1", static_cast<uint64_t>(t - T0)), t);   // submitting shares
+    EXPECT_TRUE(org.pending().empty()) << "a healthy worker raises no event";
+    EXPECT_LE(org.io().submitted() - o1, 3600 / AlertRelayService::kRefreshSaveSec + 2);
+
+    // One event = one state write (no per-nonce write).
+    const uint64_t o2 = org.io().submitted();
+    org.enqueue_event(offline_event("W.rig9", T0 + 7200), T0 + 7200);
+    EXPECT_EQ(org.io().submitted() - o2, 1u);
+    // One accepted alert on the relay = one job (outbox row + state together).
+    PeerAlertGuard g;
+    const uint64_t r1 = rel.io().submitted();
+    auto f = *build_alert(okey, rkey.pubkey, sample_body(), T0 + 7200, 5);
+    EXPECT_EQ(rel.on_alert(f, 5, g, T0 + 7200), Verdict::Queued);
+    EXPECT_EQ(rel.io().submitted() - r1, 1u);
+}
+
+TEST(DashAlertRelay, ThreadedWriterNeverBlocksTheIoThread)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto rd = fresh_dir("r"), od = fresh_dir("o");
+    auto rcfg = relay_cfg(rd, {okey.pubkey});
+    rcfg.inline_io = false;
+    auto ocfg = origin_cfg(od, rkey.pubkey);
+    ocfg.inline_io = false;
+    AlertRelayService rel(rcfg, rkey, T0);
+    AlertRelayService org(ocfg, okey, T0);
+    std::string err;
+    ASSERT_TRUE(rel.init(err)) << err;
+    ASSERT_TRUE(org.init(err)) << err;
+    std::vector<AckFrame> acks;
+    std::vector<AlertFrame> sent;
+    rel.set_transport(capture_transport(acks));
+    org.set_transport(capture_transport(acks, &sent));
+    DiskGate rgate, ogate;
+    rgate.install(rel.io());
+    ogate.install(org.io());
+
+    // With the disk stalled, both event paths still return promptly.
+    PeerAlertGuard g;
+    auto f = *build_alert(okey, rkey.pubkey, sample_body(), T0, 7);
+    auto fut = std::async(std::launch::async, [&] {
+        const Verdict v = rel.on_alert(f, 5, g, T0);
+        org.enqueue_event(offline_event("W.rig1", T0), T0);
+        // three retransmits (60/120/180 s), each dirtying the origin state
+        for (int64_t t = T0 + 5; t <= T0 + 180; t += 5) { rel.on_tick({}, t); org.on_tick({}, t); }
+        return v;
+    });
+    if (fut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        rgate.release();
+        ogate.release();
+        FAIL() << "a handler or tick waited for the disk";
+    }
+    EXPECT_EQ(fut.get(), Verdict::Queued);
+    EXPECT_EQ(sent.size(), 4u) << "the origin frame (and its retransmits) left without waiting for the disk";
+    EXPECT_TRUE(acks.empty()) << "no queued ack before the outbox row is on disk";
+    EXPECT_FALSE(fs::exists(rd / "outbox.jsonl"));
+    EXPECT_GE(rel.io().backlog(), 1u);
+
+    rgate.release();
+    ogate.release();
+    rel.io().flush();
+    org.io().flush();
+    rel.drain_io();
+    ASSERT_EQ(acks.size(), 1u);
+    EXPECT_EQ(acks[0].status, static_cast<uint8_t>(AckStatus::Queued));
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u);
+    EXPECT_GE(org.io().coalesced(), 1u) << "state saves queued behind a stalled disk were coalesced";
+    // The persisted origin state is the LATEST snapshot (pending event present).
+    std::ifstream st(od / "state.json");
+    auto j = nlohmann::json::parse(st);
+    EXPECT_EQ(j["pending"].size(), 1u);
+    EXPECT_GT(j["nonce_reserved"].get<uint64_t>(), org.next_nonce());
+}
+
+TEST(DashAlertRelay, QueuedEventReprobeRecoversALostDeliveredAck)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    Mesh m;
+    m.add(1, origin_cfg(od, rkey.pubkey), okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    int lost = 0;
+    m.drop = [&](const Mesh::Msg& msg) {
+        if (std::holds_alternative<AckFrame>(msg.frame) &&
+            std::get<AckFrame>(msg.frame).status == static_cast<uint8_t>(AckStatus::Delivered) && lost == 0) {
+            ++lost;
+            return true;
+        }
+        return false;
+    };
+    m.nodes[1].svc->enqueue_event(offline_event("W.rig1", T0), T0);
+    m.pump(T0);
+    auto& o = *m.nodes[1].svc;
+    ASSERT_TRUE(o.pending().begin()->second.queued_at_relay);
+    auto row = nlohmann::json::parse(read_lines(rd / "outbox.jsonl").at(0));
+    std::ofstream(rd / "delivered.jsonl", std::ios::app) << nlohmann::json{{"id", row["id"]}}.dump() << "\n";
+    for (int64_t t = T0 + 5; t <= T0 + 1300 && !o.pending().empty(); t += 5) {
+        for (auto& [id, n] : m.nodes) n.svc->on_tick({}, t);
+        m.pump(t);
+    }
+    EXPECT_EQ(lost, 1) << "the first delivered ack was lost";
+    EXPECT_TRUE(o.pending().empty()) << "the re-probe recovered it (forwarder held only the queued ack)";
+    EXPECT_EQ(o.counters().delivered, 1u);
+    EXPECT_GE(o.counters().reprobes, 1u);
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u) << "a re-probe never pages twice";
+}
+
+TEST(DashAlertRelay, ReprobeAfterRelayRestartAndOutsideTheWindow)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    std::vector<AckFrame> oacks;
+    AlertFrame frame;
+    {
+        // Queue at the relay, sidecar delivers, the delivered ack is lost.
+        Mesh m;
+        m.add(1, origin_cfg(od, rkey.pubkey), okey, T0);
+        m.add(2, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+        m.link(1, 2);
+        m.nodes[1].svc->enqueue_event(offline_event("W.rig1", T0), T0);
+        frame = m.nodes[1].svc->pending().begin()->second.frame;
+        m.pump(T0);
+        auto row = nlohmann::json::parse(read_lines(rd / "outbox.jsonl").at(0));
+        std::ofstream(rd / "delivered.jsonl", std::ios::app) << nlohmann::json{{"id", row["id"]}}.dump() << "\n";
+        m.drop = [](const Mesh::Msg&) { return true; };
+        m.nodes[2].svc->on_tick({}, T0 + 5);
+        m.pump(T0 + 5);
+    }
+    // Relay restarts (empty seen set); the re-probe arrives 1200 s after the
+    // frame was signed -- outside the +/-900 s window.
+    AlertRelayService rel(relay_cfg(rd, {okey.pubkey}), rkey, T0 + 1200);
+    std::string err;
+    ASSERT_TRUE(rel.init(err));
+    std::vector<AckFrame> acks;
+    rel.set_transport(capture_transport(acks));
+    PeerAlertGuard g;
+    EXPECT_EQ(rel.on_alert(frame, 1, g, T0 + 1200), Verdict::Duplicate);
+    ASSERT_EQ(acks.size(), 1u);
+    EXPECT_EQ(acks[0].status, static_cast<uint8_t>(AckStatus::Delivered))
+        << "an accepted id is answered with its status whatever its age";
+    EXPECT_EQ(rel.counters().rejected_stale, 0u);
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u);
+}
+
+TEST(DashAlertRelay, QueuedEventExpiresOrIsLostWithALedgerRow)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    {
+        // (a) queued, the sidecar never delivers -> expired_at_relay at max age.
+        auto od = fresh_dir("o"), rd = fresh_dir("r");
+        Mesh m;
+        auto ocfg = origin_cfg(od, rkey.pubkey);
+        ocfg.max_event_age = 3600;
+        m.add(1, ocfg, okey, T0);
+        m.add(2, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+        m.link(1, 2);
+        m.nodes[1].svc->enqueue_event(offline_event("W.rig1", T0), T0);
+        m.pump(T0);
+        auto& o = *m.nodes[1].svc;
+        for (int64_t t = T0 + 5; t <= T0 + 3700; t += 5) {
+            for (auto& [id, n] : m.nodes) n.svc->on_tick({}, t);
+            m.pump(t);
+        }
+        EXPECT_TRUE(o.pending().empty());
+        EXPECT_EQ(o.counters().expired_at_relay, 1u);
+        EXPECT_GE(o.counters().reprobes, 5u);
+        auto ledger = read_lines(od / "ledger.jsonl");
+        ASSERT_EQ(ledger.size(), 2u);
+        EXPECT_NE(ledger[0].find("queued_at_relay"), std::string::npos);
+        EXPECT_NE(ledger[1].find("expired_at_relay"), std::string::npos);
+        EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u) << "re-probes never re-append";
+    }
+    {
+        // (b) queued, then the relay loses its state; the re-probe is outside
+        // the window -> the relay answers refused-invalid -> lost_at_relay.
+        auto od = fresh_dir("o"), rd = fresh_dir("r"), rd2 = fresh_dir("r2");
+        Mesh m;
+        m.add(1, origin_cfg(od, rkey.pubkey), okey, T0);
+        m.add(2, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+        m.link(1, 2);
+        m.nodes[1].svc->enqueue_event(offline_event("W.rig1", T0), T0);
+        m.pump(T0);
+        auto& o = *m.nodes[1].svc;
+        ASSERT_TRUE(o.pending().begin()->second.queued_at_relay);
+        m.links.clear();                                      // relay unreachable ...
+        for (int64_t t = T0 + 5; t <= T0 + 1000; t += 5) o.on_tick({}, t);
+        m.q.clear();
+        m.add(2, relay_cfg(rd2, {okey.pubkey}), rkey, T0 + 1000);   // ... and back with NO state
+        m.link(1, 2);
+        for (int64_t t = T0 + 1005; t <= T0 + 1700 && !o.pending().empty(); t += 5) {
+            for (auto& [id, n] : m.nodes) n.svc->on_tick({}, t);
+            m.pump(t);
+        }
+        EXPECT_TRUE(o.pending().empty());
+        EXPECT_EQ(o.counters().lost_at_relay, 1u);
+        EXPECT_EQ(o.counters().refused, 0u) << "not reported as a refusal";
+        auto ledger = read_lines(od / "ledger.jsonl");
+        ASSERT_EQ(ledger.size(), 2u);
+        EXPECT_NE(ledger[1].find("lost_at_relay"), std::string::npos);
+    }
+}
+
+TEST(DashAlertRelay, JunkFromFreshKeysCannotStarveAnAllowlistedOrigin)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto rd = fresh_dir("r");
+    AlertRelayService rel(relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    std::string err;
+    ASSERT_TRUE(rel.init(err));
+    std::vector<AckFrame> acks;
+    rel.set_transport(capture_transport(acks));
+    PeerAlertGuard g;   // ONE link (a forwarder next to the relay relays everything valid)
+    for (std::size_t i = 0; i < PeerAlertGuard::kMaxAlertsPerWindow; ++i) {
+        auto f = *build_alert(junk_key(static_cast<int>(i)), rkey.pubkey, sample_body(), T0, 7000 + i);
+        EXPECT_EQ(rel.on_alert(f, 4, g, T0), Verdict::RefusedNotAllowed);
+    }
+    auto more = *build_alert(junk_key(99), rkey.pubkey, sample_body(), T0, 8000);
+    EXPECT_EQ(rel.on_alert(more, 4, g, T0 + 1), Verdict::RateLimited) << "the shared window is full";
+    auto genuine = *build_alert(okey, rkey.pubkey, sample_body(), T0, 1);
+    EXPECT_EQ(rel.on_alert(genuine, 4, g, T0 + 2), Verdict::Queued) << "the allowlisted origin has its own budget";
+
+    // Origin side: junk acks cannot starve the ack from the configured relay.
+    auto od = fresh_dir("o");
+    AlertRelayService org(origin_cfg(od, rkey.pubkey), okey, T0);
+    ASSERT_TRUE(org.init(err));
+    org.set_transport(capture_transport(acks));
+    org.enqueue_event(offline_event("W.rig1", T0), T0);
+    const uint64_t nonce = org.pending().begin()->second.frame.nonce;
+    PeerAlertGuard og;
+    for (std::size_t i = 0; i < PeerAlertGuard::kMaxAcksPerWindow + 5; ++i) {
+        auto k = junk_key(static_cast<int>(i));
+        org.on_ack(*build_ack(k, k.pubkey, i, AckStatus::Queued), 4, og, T0);
+    }
+    EXPECT_EQ(org.on_ack(*build_ack(rkey, okey.pubkey, nonce, AckStatus::Delivered), 4, og, T0 + 1),
+              Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().empty());
+}
+
+TEST(DashAlertDetector, RestoredWorkerReportsTheRealOutage)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    d.tick(one("A.rig1", "s1", 0), T0);
+    d.tick({}, T0 + 100);                                  // A drops at T0+100
+    ASSERT_EQ(d.tick({}, T0 + 400).size(), 1u);            // OFFLINE
+    d.tick(one("B.rig2", "s2", 0), T0 + 500);              // B up when the node stops
+    auto snap = d.persist();
+    EXPECT_EQ(snap["A.rig1"]["outage_since"], T0 + 100);
+    EXPECT_EQ(snap["B.rig2"]["outage_since"], 0);
+
+    AlertDetector d2(c, T0 + 10000);                       // node restarts much later
+    d2.restore(snap);
+    const uint64_t g0 = d2.generation();
+    d2.tick(one("A.rig1", "x", 0), T0 + 10100);
+    auto ev = d2.tick(one("A.rig1", "x", 1), T0 + 10160);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::BackOnline);
+    EXPECT_NE(ev[0].detail.find("back online after " + fmt_duration(10000)), std::string::npos)
+        << ev[0].detail << " -- must count from the real drop, not from the restart";
+    EXPECT_GT(d2.generation(), g0);
+    // B never reconnects: OFFLINE fires on the restart timer, text counts from last_seen.
+    std::vector<DetectorEvent> ev2;
+    for (int64_t t = T0 + 10165; t <= T0 + 10400 && ev2.empty(); t += 5) ev2 = d2.tick(one("A.rig1", "x", 1), t);
+    ASSERT_EQ(ev2.size(), 1u);
+    EXPECT_EQ(ev2[0].worker, "B.rig2");
+    EXPECT_NE(ev2[0].detail.find("down " + fmt_duration(10300 - 500)), std::string::npos) << ev2[0].detail;
 }

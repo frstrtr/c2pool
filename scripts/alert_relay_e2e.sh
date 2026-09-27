@@ -92,7 +92,10 @@ peers_ge() { [ "$(peers_of "$1")" -ge "$2" ] 2>/dev/null; }
 tg_ge() { local n="$1"; shift; [ "$(tg_count "$@")" -ge "$n" ]; }
 st_ge() {   # st_ge PORT PYPATH N
   local v; v=$(status "$1" | jget "$2" 2>/dev/null); [ -n "$v" ] && [ "$v" -ge "$3" ] 2>/dev/null; }
-has_status() { status "$1" | grep -q pubkey; }
+# The relay status JSON is the only reply carrying a top-level "role" object;
+# an unrouted path on the web server (feature and master alike) answers with a
+# generic getmininginfo-style JSON that also contains the substring "pubkey".
+has_status() { status "$1" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d.get("role"), dict) and "pubkey" in d else 1)' 2>/dev/null; }
 
 rm -rf "$W"; mkdir -p "$W/A" "$W/B" "$W/C"
 echo "dummy-token-never-valid" >"$W/dummy.token"; chmod 600 "$W/dummy.token"

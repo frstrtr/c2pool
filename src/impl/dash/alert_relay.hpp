@@ -546,13 +546,26 @@ inline const char* ack_shape_error(const AckFrame& a)
 // Sliding 60 s windows, separately for alerts and acks. Every inbound frame is
 // charged (duplicates included) so a peer cannot make us do unbounded lookups;
 // signature checks only run on first-see frames that passed the window.
+//
+// TRUSTED windows: a frame that CLAIMS a key this node already trusts (on a
+// relay: an allowlisted origin; on an origin: an ack for itself from a
+// configured relay) is charged to its own, larger window. Junk minted under
+// fresh keys -- which any peer can sign, and which forwarders legitimately pass
+// on because its signature is valid -- therefore cannot exhaust the budget a
+// genuine alert arriving over the same link needs. A peer that forges the
+// trusted key only burns the trusted window of ITS OWN link (windows are per
+// peer, and a forwarder drops a forged signature before forwarding).
 struct PeerAlertGuard {
-    static constexpr std::size_t kMaxAlertsPerWindow = 30;
-    static constexpr std::size_t kMaxAcksPerWindow   = 30;
-    static constexpr int64_t     kWindowSeconds      = 60;
+    static constexpr std::size_t kMaxAlertsPerWindow        = 30;
+    static constexpr std::size_t kMaxAcksPerWindow          = 30;
+    static constexpr std::size_t kMaxTrustedAlertsPerWindow = 120;
+    static constexpr std::size_t kMaxTrustedAcksPerWindow   = 120;
+    static constexpr int64_t     kWindowSeconds             = 60;
 
     std::deque<int64_t> alert_window;
     std::deque<int64_t> ack_window;
+    std::deque<int64_t> trusted_alert_window;
+    std::deque<int64_t> trusted_ack_window;
 
     static bool admit(std::deque<int64_t>& w, std::size_t cap, int64_t now)
     {
@@ -563,6 +576,8 @@ struct PeerAlertGuard {
     }
     bool admit_alert(int64_t now) { return admit(alert_window, kMaxAlertsPerWindow, now); }
     bool admit_ack(int64_t now) { return admit(ack_window, kMaxAcksPerWindow, now); }
+    bool admit_trusted_alert(int64_t now) { return admit(trusted_alert_window, kMaxTrustedAlertsPerWindow, now); }
+    bool admit_trusted_ack(int64_t now) { return admit(trusted_ack_window, kMaxTrustedAcksPerWindow, now); }
 };
 
 // ── Node-level seen set (IO-thread-confined) ────────────────────────────────
@@ -595,6 +610,9 @@ struct NodeAlertSeen {
         return it == entries.end() ? nullptr : &it->second;
     }
 
+    // INVARIANT: `order` holds each key of `entries` exactly once (so
+    // order.size() == entries.size()). Every removal goes through erase() or
+    // the eviction below, which keep both in step.
     SeenEntry& insert(const AlertFrame& f, uint64_t from, int64_t now)
     {
         AlertId id{f.origin_pubkey, f.nonce};
@@ -604,9 +622,10 @@ struct NodeAlertSeen {
             it->second.frame = f;
             it->second.from_peer = from;
             it->second.first_seen = now;
-            // FIFO eviction of the OLDEST ids. The fresh id sits at the back of
-            // `order`, so it is never the one erased and `it` stays valid
-            // (std::map::erase invalidates only the erased element).
+            // FIFO eviction of the OLDEST ids. By the invariant the fresh id
+            // occurs once in `order`, at the back, so it is never the one
+            // erased and `it` stays valid (std::map::erase invalidates only
+            // the erased element).
             while (order.size() > kMaxEntries) {
                 entries.erase(order.front());
                 order.pop_front();
@@ -614,6 +633,19 @@ struct NodeAlertSeen {
             }
         }
         return it->second;
+    }
+
+    // Remove one id from BOTH the map and the FIFO. (Erasing only from the
+    // map would leave a ghost slot in `order`; a re-insert of the same id
+    // would then own two slots and the ghost, on reaching the front, would
+    // evict the live entry -- possibly the one insert() just returned.)
+    bool erase(const Bytes& origin, uint64_t nonce)
+    {
+        AlertId id{origin, nonce};
+        if (entries.erase(id) == 0) return false;
+        for (auto it = order.begin(); it != order.end(); ++it)
+            if (*it == id) { order.erase(it); break; }
+        return true;
     }
 
     std::size_t size() const { return entries.size(); }

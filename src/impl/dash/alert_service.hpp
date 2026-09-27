@@ -34,14 +34,25 @@
 //   * "delivered" on the origin means the relay's sidecar got ok:true from
 //     Telegram and the relay signed that; "queued_at_relay" means only that the
 //     relay durably holds it. Nothing is ever reported delivered on a guess.
+//   * A queued_at_relay event is re-probed with the SAME frame every
+//     kQueuedReprobeSec: the relay (and a forwarder holding only the queued
+//     ack) answers a known id with its CURRENT status, so a lost "delivered"
+//     ack is recovered. Still unconfirmed at max_event_age -> ledger
+//     "expired_at_relay"; the relay no longer knowing the id -> "lost_at_relay".
+//     Neither is ever silent.
 //
 // THREADING: every method except status_json() runs on the node IO thread
 // (peer handlers + the tick timer), same confinement as m_known_txs /
 // m_inject_seen. status_json() reads a snapshot published under a mutex.
+// File writes (state, outbox, ledger; each fsync'd) never run on the IO
+// thread: they are queued to a FileWriter worker (alert_io.hpp) and their
+// results are drained back on the IO thread at the top of every handler and
+// tick. A "queued" ack is sent only after the outbox row is on disk.
 //
 // No money / consensus state is reachable from here.
 
 #include "alert_detector.hpp"
+#include "alert_io.hpp"
 #include "alert_relay.hpp"
 
 #include <core/log.hpp>
@@ -61,9 +72,6 @@
 #include <string>
 #include <vector>
 
-#include <fcntl.h>
-#include <unistd.h>
-
 namespace dash::alert {
 
 struct ServiceConfig {
@@ -81,6 +89,7 @@ struct ServiceConfig {
     uint8_t hops{kDefaultHops};
     bool    test_on_start{false};
     int64_t test_delay{30};
+    bool    inline_io{false};          // KATs: run file jobs on the caller's thread
     DetectorConfig det;
 };
 
@@ -124,10 +133,21 @@ class AlertRelayService {
 public:
     static constexpr int64_t     kReforwardSec   = 20;
     static constexpr std::size_t kMaxPending     = 1000;
-    static constexpr int64_t     kAcceptedKeepSec = 2 * 3600;       // final statuses
+    // Final statuses are kept past the origin's default max_event_age (6 h), so
+    // a re-probe of a queued event is still answered "delivered" hours later.
+    static constexpr int64_t     kAcceptedKeepSec = 8 * 3600;
     static constexpr int64_t     kQueuedKeepSec   = 7 * 86400;      // awaiting sidecar
     static constexpr std::size_t kMaxAccepted    = 20000;
     static constexpr uintmax_t   kMaxOutboxBytes = 16u * 1024u * 1024u;
+    static constexpr int64_t     kQueuedReprobeSec = 600;           // origin: re-ask a queued event
+    static constexpr int64_t     kRefreshSaveSec   = 300;           // origin: refresh worker last_seen
+    static constexpr int64_t     kRefusedLogSec    = 3600;          // one "not allowlisted" warning per hour
+    // Nonces are reserved in blocks: the persisted reservation (not every
+    // issued nonce) is what a restart resumes above, so issuing a nonce needs
+    // no disk write. The next block is reserved when half of the current one
+    // is used, long before it can run out.
+    static constexpr uint64_t    kNonceBlock       = 65536;
+    static constexpr uint8_t     kStatusWriting    = 0;             // accepted, outbox write in flight
 
     struct Counters {
         uint64_t alert_in{0}, alert_out{0}, ack_in{0}, ack_out{0};
@@ -138,6 +158,8 @@ public:
         uint64_t events{0}, delivered{0}, queued_at_relay{0}, refused{0};
         uint64_t undelivered{0}, dropped{0}, reissued{0}, retransmits{0};
         uint64_t ack_forwarded{0}, ack_dropped{0};
+        uint64_t reprobes{0}, expired_at_relay{0}, lost_at_relay{0}, io_errors{0};
+        uint64_t refused_log_suppressed{0};
     };
 
     struct PendingEvent {
@@ -157,7 +179,8 @@ public:
 
     AlertRelayService(ServiceConfig cfg, std::optional<KeyPair> keys, int64_t start_ts)
         : m_cfg(std::move(cfg)), m_keys(std::move(keys)), m_start(start_ts),
-          m_detector(m_cfg.det, start_ts)
+          m_detector(m_cfg.det, start_ts),
+          m_io(std::make_unique<FileWriter>(m_cfg.inline_io))
     {
         if (m_keys) m_key_id = key_id(m_keys->pubkey);
         for (const auto& a : m_cfg.accept) m_accept.insert(a);
@@ -165,7 +188,9 @@ public:
     }
 
     // Load persisted state; create the state dir. Returns false (with err) only
-    // on a fatal problem (unwritable state dir).
+    // on a fatal problem (unwritable state dir). Runs once at startup and
+    // WAITS for its own state write (the only blocking write, before any peer
+    // or miner is served).
     bool init(std::string& err)
     {
         std::error_code ec;
@@ -175,7 +200,8 @@ public:
         if (f) {
             auto j = nlohmann::json::parse(f, nullptr, /*allow_exceptions=*/false);
             if (j.is_object()) {
-                uint64_t persisted = j.value("next_nonce", uint64_t{0});
+                const uint64_t persisted = std::max(j.value("next_nonce", uint64_t{0}),
+                                                    j.value("nonce_reserved", uint64_t{0}));
                 if (persisted > m_next_nonce) m_next_nonce = persisted;
                 m_delivered_offset = j.value("delivered_offset", uint64_t{0});
                 if (j.contains("accepted") && j["accepted"].is_object())
@@ -189,7 +215,24 @@ public:
                 LOG_WARNING << "[alert-relay] state file " << state_path() << " unreadable; starting fresh";
             }
         }
-        return save_state(err);
+        f.close();
+        {
+            std::error_code sec;
+            const bool exists = std::filesystem::is_regular_file(outbox_path(), sec);
+            m_outbox_bytes = exists ? static_cast<uintmax_t>(std::filesystem::file_size(outbox_path(), sec)) : 0;
+            if (sec) m_outbox_bytes = 0;
+        }
+        m_nonce_reserved = m_next_nonce + kNonceBlock;
+        bool ok = false;
+        const uint64_t reserved = m_nonce_reserved;
+        save_state_async([this, &ok, reserved](const FileJobResult& r) {
+            ok = r.ok;
+            if (r.ok) m_nonce_durable = std::max(m_nonce_durable, reserved);
+        });
+        m_io->flush();
+        drain_io();
+        if (!ok) { err = "cannot persist " + state_path(); return false; }
+        return true;
     }
 
     void set_transport(Transport t) { m_tx = std::move(t); }
@@ -200,6 +243,28 @@ public:
     const AlertDetector& detector() const { return m_detector; }
     const NodeAlertSeen& seen() const { return m_seen; }
     const std::optional<KeyPair>& keys() const { return m_keys; }
+    FileWriter& io() { return *m_io; }
+    uint64_t next_nonce() const { return m_next_nonce; }
+    uint64_t nonce_durable() const { return m_nonce_durable; }
+
+    // IO thread: apply finished file jobs (acks that waited for the disk,
+    // failures). Called at the top of every handler and tick; KATs call it
+    // after io().flush().
+    void drain_io()
+    {
+        for (auto& r : m_io->take_results()) {
+            if (!r.ok) {
+                ++m_c.io_errors;
+                LOG_WARNING << "[alert-relay] cannot persist " << r.failed_path;
+            }
+            if (!r.tag) continue;
+            auto it = m_io_done.find(r.tag);
+            if (it == m_io_done.end()) continue;
+            auto fn = std::move(it->second);
+            m_io_done.erase(it);
+            fn(r);
+        }
+    }
     bool can_forward() const { return m_cfg.forward || m_cfg.origin || m_cfg.telegram; }
 
     std::string outbox_path() const { return m_cfg.state_dir + "/outbox.jsonl"; }
@@ -210,8 +275,15 @@ public:
     // ── inbound: alert ─────────────────────────────────────────────────────
     Verdict on_alert(const AlertFrame& f, uint64_t from, PeerAlertGuard& guard, int64_t now)
     {
+        drain_io();
         ++m_c.alert_in;
-        if (!guard.admit_alert(now)) { ++m_c.rate_limited; return Verdict::RateLimited; }
+        // A frame claiming an allowlisted origin is charged to the peer's
+        // trusted window (see PeerAlertGuard), everything else to the shared one.
+        const bool trusted = m_cfg.telegram && allowlisted(f.origin_pubkey);
+        if (!(trusted ? guard.admit_trusted_alert(now) : guard.admit_alert(now))) {
+            ++m_c.rate_limited;
+            return Verdict::RateLimited;
+        }
         if (const char* why = alert_shape_error(f)) {
             ++m_c.rejected_shape;
             LOG_DEBUG_POOL << "[alert-relay] dropping malformed alert (" << why << ")";
@@ -221,10 +293,15 @@ public:
 
         if (SeenEntry* e = m_seen.find(f.origin_pubkey, f.nonce)) {
             ++m_c.duplicates;
+            // Only a FINAL cached ack ends the frame's journey here. A cached
+            // "queued" ack is answered AND the frame is passed on (throttled):
+            // it may be the origin re-probing for the "delivered" ack.
+            const bool final_ack = e->ack && e->ack->status != static_cast<uint8_t>(AckStatus::Queued);
             if (e->ack) {
                 // Repair a lost ack: answer the retransmitting sender directly.
                 if (m_tx.send_ack && m_tx.send_ack(from, *e->ack)) ++m_c.ack_out;
-            } else {
+            }
+            if (!final_ack) {
                 e->from_peer = from;   // newest live path for the eventual ack
                 if (!e->for_me && can_forward() && e->frame.hops_left > 0 &&
                     now - e->last_forward >= kReforwardSec) {
@@ -238,15 +315,30 @@ public:
         const bool for_me = m_keys && m_cfg.telegram && f.to_key_id == m_key_id;
         const int64_t skew = now - static_cast<int64_t>(f.timestamp);
         if (skew > kReplayWindowSec || skew < -kReplayWindowSec) {
-            ++m_c.rejected_stale;
             if (for_me && verify_alert_sig(f)) {
+                // An id this relay already accepted is answered with its current
+                // status whatever its age: that is a re-probe, not a replay (it
+                // can never be appended twice).
+                auto acc = m_accepted.find(alert_id_string(f.origin_pubkey, f.nonce));
+                if (acc != m_accepted.end()) {
+                    ++m_c.duplicates;
+                    if (acc->second.status != kStatusWriting) {
+                        if (auto a = build_ack(*m_keys, f.origin_pubkey, f.nonce,
+                                               static_cast<AckStatus>(acc->second.status)))
+                            send_or_broadcast_ack(from, *a);
+                    }
+                    return Verdict::Duplicate;
+                }
+                ++m_c.rejected_stale;
                 // Tell the origin its clock / queue is off (diagnostic, final).
                 if (auto a = build_ack(*m_keys, f.origin_pubkey, f.nonce, AckStatus::RefusedInvalid))
                     send_or_broadcast_ack(from, *a);
                 LOG_WARNING << "[alert-relay] alert from " << short_hex(f.origin_pubkey)
                             << " outside the +/-" << kReplayWindowSec << "s window (skew "
                             << skew << "s) -- check the origin clock";
+                return Verdict::RejectedStale;
             }
+            ++m_c.rejected_stale;
             return Verdict::RejectedStale;
         }
         if (!verify_alert_sig(f)) {
@@ -270,8 +362,15 @@ public:
     // ── inbound: ack ───────────────────────────────────────────────────────
     Verdict on_ack(const AckFrame& a, uint64_t from, PeerAlertGuard& guard, int64_t now)
     {
+        drain_io();
         ++m_c.ack_in;
-        if (!guard.admit_ack(now)) { ++m_c.rate_limited; return Verdict::RateLimited; }
+        // An ack for THIS origin from a configured relay has its own window.
+        const bool trusted = m_cfg.origin && m_keys && a.origin_pubkey == m_keys->pubkey &&
+                             relay_configured(a.relay_pubkey);
+        if (!(trusted ? guard.admit_trusted_ack(now) : guard.admit_ack(now))) {
+            ++m_c.rate_limited;
+            return Verdict::RateLimited;
+        }
         if (ack_shape_error(a)) { ++m_c.rejected_shape; return Verdict::RejectedShape; }
 
         if (m_keys && a.origin_pubkey == m_keys->pubkey) return consume_ack(a, now);
@@ -293,9 +392,11 @@ public:
     // ── periodic (IO thread) ───────────────────────────────────────────────
     void on_tick(const std::vector<WorkerSample>& samples, int64_t now)
     {
+        drain_io();
         if (m_cfg.origin) {
-            for (auto& ev : m_detector.tick(samples, now)) {
-                enqueue_event(ev, now);
+            for (auto& ev : m_detector.tick(samples, now)) enqueue_event(ev, now);
+            if (m_detector.generation() != m_detector_gen) {
+                m_detector_gen = m_detector.generation();
                 m_state_dirty = true;
             }
             if (m_cfg.test_on_start && !m_test_sent && now >= m_start + m_cfg.test_delay) {
@@ -310,9 +411,13 @@ public:
         }
         if (m_cfg.telegram) poll_delivered(now);
         prune_accepted(now);
-        if (m_state_dirty || now - m_last_save >= 60) {
-            std::string err;
-            if (!save_state(err)) LOG_WARNING << "[alert-relay] " << err;
+        // Save only what changed. The one exception is a slow refresh of the
+        // known workers' last_seen on an origin that tracks any (bounded, and
+        // off the IO thread like every other write).
+        const bool refresh = m_cfg.origin && !m_detector.workers().empty() &&
+                             now - m_last_save >= kRefreshSaveSec;
+        if (m_state_dirty || refresh) {
+            save_state_async();
             m_last_save = now;
         }
         publish_status(now);
@@ -346,8 +451,10 @@ public:
             auto it = m_pending.emplace(p.event_id, std::move(p)).first;
             transmit(it->second, now);
         }
-        std::string err;   // durable before the next tick: a crash cannot lose the event
-        if (!save_state(err)) LOG_WARNING << "[alert-relay] " << err;
+        // ONE state write per event (queued to the writer; durable within
+        // milliseconds, never on the IO thread).
+        save_state_async();
+        m_last_save = now;
     }
 
     // Web thread: last snapshot published by the IO thread.
@@ -373,16 +480,21 @@ public:
         s["outbox"] = {{"pending", m_pending.size()}, {"awaiting_ack", awaiting}, {"queued_at_relay", queued},
                        {"delivered", m_c.delivered}, {"undelivered", m_c.undelivered},
                        {"refused", m_c.refused}, {"dropped", m_c.dropped},
-                       {"retransmits", m_c.retransmits}, {"reissued", m_c.reissued}, {"events", m_c.events}};
+                       {"expired_at_relay", m_c.expired_at_relay}, {"lost_at_relay", m_c.lost_at_relay},
+                       {"retransmits", m_c.retransmits}, {"reprobes", m_c.reprobes},
+                       {"reissued", m_c.reissued}, {"events", m_c.events}};
         std::size_t pending_sidecar = 0;
-        for (const auto& [id, a] : m_accepted) if (a.status == static_cast<uint8_t>(AckStatus::Queued)) ++pending_sidecar;
+        for (const auto& [id, a] : m_accepted)
+            if (a.status == static_cast<uint8_t>(AckStatus::Queued) || a.status == kStatusWriting) ++pending_sidecar;
         s["relay"] = {{"accepted", m_c.queued_outbox}, {"refused_allowlist", m_c.refused_allowlist},
                       {"refused_invalid", m_c.refused_invalid}, {"refused_sig", m_c.rejected_sig},
                       {"rejected_stale", m_c.rejected_stale}, {"rejected_shape", m_c.rejected_shape},
                       {"duplicates", m_c.duplicates}, {"forwarded", m_c.forwarded},
                       {"rate_limited", m_c.rate_limited}, {"pending_sidecar", pending_sidecar},
                       {"delivered_telegram", m_c.delivered_telegram}, {"outbox_errors", m_c.outbox_errors},
-                      {"seen", m_seen.size()}};
+                      {"outbox_bytes", m_outbox_bytes}, {"seen", m_seen.size()}};
+        s["io"] = {{"backlog", m_io->backlog()}, {"jobs", m_io->done()}, {"coalesced", m_io->coalesced()},
+                   {"errors", m_c.io_errors}};
         s["p2p"] = {{"alert_in", m_c.alert_in}, {"alert_out", m_c.alert_out},
                     {"ack_in", m_c.ack_in}, {"ack_out", m_c.ack_out},
                     {"ack_forwarded", m_c.ack_forwarded}, {"ack_dropped", m_c.ack_dropped}};
@@ -391,14 +503,32 @@ public:
         m_status = std::move(s);
     }
 
-    bool save_state(std::string& err)
+    // Queue a full state snapshot to the writer (coalesced with a not yet
+    // started save). `done` (optional) runs on the IO thread via drain_io().
+    void save_state_async(std::function<void(const FileJobResult&)> done = {})
+    {
+        std::vector<FileOp> ops;
+        ops.push_back(FileOp{FileOp::Type::Replace, state_path(), state_snapshot()});
+        submit_io(std::move(ops), std::move(done));
+    }
+
+private:
+    // Serialize the persisted state. Clears the dirty flag: the caller queues
+    // the snapshot. An entry whose outbox write is in flight is written as
+    // "queued": every job queued after that write runs after it (FIFO), and a
+    // failed write re-dirties the state.
+    std::string state_snapshot()
     {
         nlohmann::json j;
         j["version"] = 1;
         j["next_nonce"] = m_next_nonce;
+        j["nonce_reserved"] = m_nonce_reserved;
         j["delivered_offset"] = m_delivered_offset;
         nlohmann::json acc = nlohmann::json::object();
-        for (const auto& [id, a] : m_accepted) acc[id] = {{"status", a.status}, {"received", a.received}};
+        for (const auto& [id, a] : m_accepted) {
+            const uint8_t st = a.status == kStatusWriting ? static_cast<uint8_t>(AckStatus::Queued) : a.status;
+            acc[id] = {{"status", st}, {"received", a.received}};
+        }
         j["accepted"] = acc;
         if (m_cfg.origin) {
             j["workers"] = m_detector.persist();
@@ -406,12 +536,26 @@ public:
             for (const auto& [id, p] : m_pending) pend.push_back(pending_json(p));
             j["pending"] = pend;
         }
-        if (!atomic_write(state_path(), j.dump(), err)) return false;
         m_state_dirty = false;
-        return true;
+        return j.dump();
     }
 
-private:
+    void submit_io(std::vector<FileOp> ops, std::function<void(const FileJobResult&)> done = {})
+    {
+        uint64_t tag = 0;
+        if (done) {
+            tag = m_next_tag++;
+            m_io_done.emplace(tag, std::move(done));
+        }
+        m_io->submit(tag, std::move(ops));
+    }
+
+    bool relay_configured(const Bytes& relay_pub) const
+    {
+        for (const auto& r : m_cfg.relays) if (r == relay_pub) return true;
+        return false;
+    }
+
     static std::string short_hex(const Bytes& b) { return to_hex(b).substr(0, 16); }
 
     // Origin pending events survive a restart: the exact signed frame is kept
@@ -477,29 +621,6 @@ private:
         return cached == static_cast<uint8_t>(AckStatus::Queued) && incoming != cached;
     }
 
-    static bool atomic_write(const std::string& path, const std::string& data, std::string& err)
-    {
-        const std::string tmp = path + ".tmp";
-        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0) { err = "cannot write " + tmp; return false; }
-        bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
-        ok = (::fsync(fd) == 0) && ok;
-        ::close(fd);
-        if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) { err = "cannot persist " + path; return false; }
-        return true;
-    }
-
-    static bool append_line(const std::string& path, const std::string& line)
-    {
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (fd < 0) return false;
-        const std::string l = line + "\n";
-        bool ok = ::write(fd, l.data(), l.size()) == static_cast<ssize_t>(l.size());
-        ok = (::fsync(fd) == 0) && ok;
-        ::close(fd);
-        return ok;
-    }
-
     void forward(const AlertFrame& f, uint64_t from)
     {
         AlertFrame out = f;
@@ -517,9 +638,27 @@ private:
 
     bool allowlisted(const Bytes& origin) const { return m_accept.count(origin) != 0; }
 
+    void log_refused(const Bytes& origin, int64_t now)
+    {
+        // ONE global throttle (not a per-key map: keys are free to mint, so a
+        // per-key table would grow without bound on a public relay).
+        if (m_last_refused_log != 0 && now - m_last_refused_log < kRefusedLogSec) {
+            ++m_c.refused_log_suppressed;
+            LOG_DEBUG_POOL << "[alert-relay] refusing alert from non-allowlisted origin " << short_hex(origin);
+            return;
+        }
+        LOG_WARNING << "[alert-relay] refusing alert from non-allowlisted origin " << to_hex(origin)
+                    << " (add it with --alert-relay-accept)";
+        if (m_c.refused_log_suppressed)
+            LOG_WARNING << "[alert-relay] " << m_c.refused_log_suppressed
+                        << " more non-allowlisted alert(s) were refused since the previous warning";
+        m_c.refused_log_suppressed = 0;
+        m_last_refused_log = now;
+    }
+
     Verdict deliver_local(SeenEntry& e, uint64_t from, int64_t now)
     {
-        const AlertFrame& f = e.frame;
+        const AlertFrame f = e.frame;   // copy: a drained completion may erase `e`
         const std::string id = alert_id_string(f.origin_pubkey, f.nonce);
         auto ack_with = [&](AckStatus st) {
             if (auto a = build_ack(*m_keys, f.origin_pubkey, f.nonce, st)) {
@@ -529,19 +668,16 @@ private:
         };
 
         if (auto it = m_accepted.find(id); it != m_accepted.end()) {
-            // Already accepted before a restart: re-ack, never re-append.
+            // Already accepted (before a restart, or a re-probe): re-ack with
+            // the CURRENT status, never re-append. An in-flight write acks on
+            // completion.
             ++m_c.duplicates;
-            ack_with(static_cast<AckStatus>(it->second.status));
+            if (it->second.status != kStatusWriting) ack_with(static_cast<AckStatus>(it->second.status));
             return Verdict::Duplicate;
         }
         if (!allowlisted(f.origin_pubkey)) {
             ++m_c.refused_allowlist;
-            auto& last = m_refused_log[f.origin_pubkey];
-            if (last == 0 || now - last >= 3600) {
-                last = now;
-                LOG_WARNING << "[alert-relay] refusing alert from non-allowlisted origin "
-                            << to_hex(f.origin_pubkey) << " (add it with --alert-relay-accept)";
-            }
+            log_refused(f.origin_pubkey, now);
             ack_with(AckStatus::RefusedNotAllowed);
             return Verdict::RefusedNotAllowed;
         }
@@ -551,30 +687,68 @@ private:
             ack_with(AckStatus::RefusedInvalid);
             return Verdict::RefusedInvalid;
         }
-        std::error_code ec;
-        const auto sz = std::filesystem::exists(outbox_path(), ec) ? std::filesystem::file_size(outbox_path(), ec) : 0;
         nlohmann::json row = {
             {"id", id}, {"origin", to_hex(f.origin_pubkey)}, {"nonce", f.nonce},
             {"kind", kind_name(body->kind)}, {"label", body->label}, {"worker", body->worker},
             {"detail", body->detail}, {"event_ts", body->event_ts}, {"sent_ts", f.timestamp},
             {"received_ts", now}};
-        if (sz > kMaxOutboxBytes || !append_line(outbox_path(), row.dump())) {
-            // Disk trouble: do NOT ack -- forget the frame so the origin's next
+        std::string line = row.dump();
+        const uintmax_t row_bytes = line.size() + 1;
+        if (m_outbox_bytes + row_bytes > kMaxOutboxBytes) {
+            // Full: do NOT ack -- forget the frame so the origin's next
             // retransmit is processed afresh instead of as a duplicate.
             ++m_c.outbox_errors;
-            LOG_ERROR << "[alert-relay] cannot append to " << outbox_path() << " (size " << sz << ")";
-            m_seen.entries.erase(AlertId{f.origin_pubkey, f.nonce});
+            LOG_ERROR << "[alert-relay] outbox " << outbox_path() << " is full (" << m_outbox_bytes
+                      << " bytes); not accepting alert " << short_hex(f.origin_pubkey) << ":" << f.nonce;
+            m_seen.erase(f.origin_pubkey, f.nonce);
             return Verdict::Deferred;
         }
-        m_accepted[id] = Accepted{static_cast<uint8_t>(AckStatus::Queued), now};
-        std::string err;
-        if (!save_state(err)) LOG_WARNING << "[alert-relay] " << err;
+        // Accept: the outbox row, THEN the state that records the id, as ONE
+        // writer job (the state write is skipped if the append fails). The
+        // "queued" ack goes out only once the row is on disk.
+        m_outbox_bytes += row_bytes;
+        m_accepted[id] = Accepted{kStatusWriting, now};
+        std::vector<FileOp> ops;
+        ops.push_back(FileOp{FileOp::Type::Append, outbox_path(), std::move(line)});
+        ops.push_back(FileOp{FileOp::Type::Replace, state_path(), state_snapshot()});
+        submit_io(std::move(ops),
+                  [this, origin = f.origin_pubkey, nonce = f.nonce, id, row_bytes,
+                   kind = body->kind, label = body->label](const FileJobResult& r) {
+                      on_outbox_written(r, origin, nonce, id, row_bytes, kind, label);
+                  });
+        drain_io();   // inline writer: completes here; threaded: on a later handler / tick
+        return m_accepted.count(id) ? Verdict::Queued : Verdict::Deferred;
+    }
+
+    void on_outbox_written(const FileJobResult& r, const Bytes& origin, uint64_t nonce, const std::string& id,
+                           uintmax_t row_bytes, uint8_t kind, const std::string& label)
+    {
+        auto it = m_accepted.find(id);
+        if (it == m_accepted.end()) return;
+        if (!r.ok && r.failed_path == outbox_path()) {
+            // Disk trouble: no ack; forget the id everywhere (map AND FIFO) so
+            // the origin's next retransmit of the same nonce is processed afresh.
+            ++m_c.outbox_errors;
+            m_outbox_bytes = m_outbox_bytes >= row_bytes ? m_outbox_bytes - row_bytes : 0;
+            LOG_ERROR << "[alert-relay] cannot append to " << outbox_path();
+            m_accepted.erase(it);
+            m_seen.erase(origin, nonce);
+            return;
+        }
+        if (!r.ok) m_state_dirty = true;   // row is durable; the state save is retried
         ++m_c.queued_outbox;
-        LOG_INFO << "[alert-relay] queued alert " << kind_name(body->kind) << " from "
-                 << (body->label.empty() ? short_hex(f.origin_pubkey) : body->label)
-                 << " for the Telegram sidecar (id " << short_hex(f.origin_pubkey) << ":" << f.nonce << ")";
-        ack_with(AckStatus::Queued);
-        return Verdict::Queued;
+        LOG_INFO << "[alert-relay] queued alert " << kind_name(kind) << " from "
+                 << (label.empty() ? short_hex(origin) : label)
+                 << " for the Telegram sidecar (id " << short_hex(origin) << ":" << nonce << ")";
+        // The sidecar may already have reported it (mark_delivered accepts an
+        // in-flight id): never downgrade "delivered" to "queued".
+        if (it->second.status != kStatusWriting) return;
+        it->second.status = static_cast<uint8_t>(AckStatus::Queued);
+        if (auto a = build_ack(*m_keys, origin, nonce, AckStatus::Queued)) {
+            uint64_t to = 0;
+            if (SeenEntry* e = m_seen.find(origin, nonce)) { e->ack = *a; to = e->from_peer; }
+            send_or_broadcast_ack(to, *a);
+        }
     }
 
     Verdict consume_ack(const AckFrame& a, int64_t now)
@@ -602,6 +776,17 @@ private:
             }
             break;
         default:
+            if (p.queued_at_relay) {
+                // The relay durably queued it earlier and now no longer knows
+                // the id (state lost / pruned): report that, not a refusal.
+                ++m_c.lost_at_relay;
+                LOG_WARNING << "[alert-relay] event " << p.event_id << " (" << kind_name(p.kind) << " "
+                            << p.worker << ") was queued at relay " << short_hex(p.relay_pub)
+                            << " but the relay no longer knows it (" << ack_status_name(a.status)
+                            << "); delivery unconfirmed";
+                finalize(pit, "lost_at_relay", now);
+                break;
+            }
             ++m_c.refused;
             finalize(pit, ack_status_name(a.status), now);
             break;
@@ -618,10 +803,24 @@ private:
         b.worker = p.worker;
         b.detail = p.detail;
         const uint64_t nonce = m_next_nonce++;
-        // Persist the counter BEFORE the frame leaves: a crash can skip a nonce
-        // but can never reuse one.
-        std::string err;
-        if (!save_state(err)) LOG_WARNING << "[alert-relay] " << err;
+        // A crash can skip nonces but never reuse one: a restart resumes above
+        // the persisted reservation. Reserve the next block early (async)...
+        if (m_next_nonce + kNonceBlock / 2 > m_nonce_reserved) {
+            m_nonce_reserved = m_next_nonce + kNonceBlock;
+            const uint64_t reserved = m_nonce_reserved;
+            save_state_async([this, reserved](const FileJobResult& r) {
+                if (r.ok) m_nonce_durable = std::max(m_nonce_durable, reserved);
+            });
+        }
+        // ...and only if the durable reservation were ever overtaken (a disk
+        // that stalls for half a block of events) wait for it.
+        if (nonce >= m_nonce_durable) {
+            m_io->flush();
+            drain_io();
+            if (nonce >= m_nonce_durable)
+                LOG_WARNING << "[alert-relay] nonce reservation is not on disk (" << state_path()
+                            << " unwritable?); sending anyway";
+        }
         auto f = build_alert(*m_keys, p.relay_pub, b, static_cast<uint32_t>(now), nonce, m_cfg.hops);
         if (!f) {
             LOG_ERROR << "[alert-relay] could not build alert for relay " << short_hex(p.relay_pub);
@@ -651,7 +850,20 @@ private:
         for (auto it = m_pending.begin(); it != m_pending.end(); ) {
             PendingEvent& p = it->second;
             if (p.queued_at_relay) {
-                if (now - p.event_ts > m_cfg.max_event_age) { it = forget(it); continue; }
+                if (now - p.event_ts > m_cfg.max_event_age) {
+                    ++m_c.expired_at_relay;
+                    LOG_WARNING << "[alert-relay] event " << p.event_id << " (" << kind_name(p.kind) << " "
+                                << p.worker << ") queued at relay " << short_hex(p.relay_pub)
+                                << " but no delivery confirmation within " << m_cfg.max_event_age << "s";
+                    it = finalize(it, "expired_at_relay", now);
+                    continue;
+                }
+                // Re-probe with the SAME frame: the relay answers a known id with
+                // its current status, so a lost "delivered" ack is recovered.
+                if (now - p.last_sent >= kQueuedReprobeSec) {
+                    ++m_c.reprobes;
+                    transmit(p, now);
+                }
                 ++it;
                 continue;
             }
@@ -679,8 +891,9 @@ private:
                               {"event_ts", p.event_ts}, {"relay", to_hex(key_id(p.relay_pub))},
                               {"first_sent", p.first_sent}, {"attempts", p.attempts},
                               {"status", status}, {"ts", now}};
-        if (!append_line(ledger_path(), row.dump()))
-            LOG_WARNING << "[alert-relay] cannot append to " << ledger_path();
+        std::vector<FileOp> ops;
+        ops.push_back(FileOp{FileOp::Type::Append, ledger_path(), row.dump()});
+        submit_io(std::move(ops));   // a failure is logged by drain_io()
     }
 
     std::map<uint64_t, PendingEvent>::iterator forget(std::map<uint64_t, PendingEvent>::iterator it)
@@ -730,7 +943,11 @@ private:
     void mark_delivered(const std::string& id, int64_t now)
     {
         auto it = m_accepted.find(id);
-        if (it == m_accepted.end() || it->second.status != static_cast<uint8_t>(AckStatus::Queued)) return;
+        // An id whose outbox write has not been drained yet is on disk already
+        // (the sidecar read it), so it counts as queued here.
+        if (it == m_accepted.end() ||
+            (it->second.status != static_cast<uint8_t>(AckStatus::Queued) && it->second.status != kStatusWriting))
+            return;
         it->second.status = static_cast<uint8_t>(AckStatus::Delivered);
         it->second.received = now;   // restart the keep window from delivery
         ++m_c.delivered_telegram;
@@ -751,7 +968,8 @@ private:
     void prune_accepted(int64_t now)
     {
         for (auto it = m_accepted.begin(); it != m_accepted.end(); ) {
-            const bool queued = it->second.status == static_cast<uint8_t>(AckStatus::Queued);
+            const bool queued = it->second.status == static_cast<uint8_t>(AckStatus::Queued) ||
+                                it->second.status == kStatusWriting;
             if (now - it->second.received > (queued ? kQueuedKeepSec : kAcceptedKeepSec)) {
                 it = m_accepted.erase(it);
                 m_state_dirty = true;
@@ -783,14 +1001,24 @@ private:
     std::map<uint64_t, PendingEvent> m_pending;       // event_id -> event (origin)
     std::map<uint64_t, uint64_t> m_nonce_to_event;    // any issued nonce -> event_id
     std::map<std::string, Accepted> m_accepted;       // relay: id -> status
-    std::map<Bytes, int64_t> m_refused_log;           // throttle "not allowlisted" logs
+    int64_t m_last_refused_log{0};                    // global "not allowlisted" log throttle
     uint64_t m_delivered_offset{0};
+    uintmax_t m_outbox_bytes{0};
+    uint64_t m_nonce_reserved{0};                     // highest reservation queued to disk
+    uint64_t m_nonce_durable{0};                      // highest reservation confirmed on disk
+    uint64_t m_detector_gen{0};
     bool m_state_dirty{false};
     int64_t m_last_save{0};
     bool m_test_sent{false};
 
     mutable std::mutex m_status_mutex;
     nlohmann::json m_status = nlohmann::json::object();
+
+    // Declared LAST: destroyed FIRST, so the worker finishes the queued writes
+    // and joins while everything above is still alive.
+    uint64_t m_next_tag{1};
+    std::map<uint64_t, std::function<void(const FileJobResult&)>> m_io_done;
+    std::unique_ptr<FileWriter> m_io;
 };
 
 } // namespace dash::alert
