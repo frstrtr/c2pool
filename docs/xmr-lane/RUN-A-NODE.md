@@ -282,6 +282,7 @@ What the flags do:
 | `--pool-genesis <hex64>` | the pool's id. Nodes with a different id refuse each other. |
 | `--relay-listen <host:port>` | accept relay connections from other pool nodes |
 | `--relay-peer <host:port>` | dial a pool node. Repeat it for more peers. |
+| `--no-relay-bootstrap` | do not also dial the built-in bootstrap nodes (mainnet only; see [BOOTSTRAP-NODES.md](BOOTSTRAP-NODES.md)) |
 | `--payout-address <addr>` | this node's own payout address. The stratum port is served only when it is set. |
 | `--share-diff <n>` | share difficulty for miners. Use the pool's value. 0 means network difficulty (solo). |
 | `--stratum-bind-host <ip>`, `--stratum-port <p>` | where miners connect (default `127.0.0.1:3333`) |
@@ -428,3 +429,6 @@ The steps are the same, with these changes:
   (H_a `3765865`). Mint it with `--net mainnet --height 3765865` and your
   monerod RPC on port 18081. The levin port is 18080.
 - `--relay-bind rbind` is required for the relay on mainnet.
+- On mainnet the relay also dials the pool's public bootstrap nodes, listed in
+  [BOOTSTRAP-NODES.md](BOOTSTRAP-NODES.md), so `--relay-peer` is optional.
+  `--no-relay-bootstrap` turns that off.
