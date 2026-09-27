@@ -301,7 +301,8 @@ is refused at HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… 
 
 Optional fee flags (fee model `v1` only): `--node-owner-fee-pct <p>` with
 `--node-owner-address <addr>` gives the node owner a share of jobs, and
-`--give-author-pct <p>` donates a share to the author. Both default to 0.
+`--give-author-pct <p>` donates a share to the author. The owner fee defaults to 0;
+`--give-author-pct` defaults to 0.1 (`--give-author-pct 0` opts out).
 
 ## 7. Point a miner at it
 

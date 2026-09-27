@@ -204,7 +204,8 @@ static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-ter
 // node-local JOB policy under the gate: they decide only what THIS node's jobs
 // commit to (the payee + the give-author u16 in the PoW-bound receipt), never
 // how any receipt is folded. The donation output itself has NO knob.
-static double        g_give_author_pct = 0.0;            // --give-author-pct P: the u16 this node's receipts carry (default 0)
+static double        g_give_author_pct = 0.1;            // --give-author-pct P: the u16 this node's receipts carry (default 0.1 with --fee-model v1; 0 opts out)
+static bool          g_give_author_set = false;          // --give-author-pct given explicitly (the fee-model-OFF refusal reads only an explicit value)
 static double        g_owner_fee_pct = 0.0;              // --node-owner-fee-pct P: probability (%) a job commits to the owner
 static std::string   g_owner_address;                    // --node-owner-address ADDR: the owner's standard address
 // R-C rework-3 ruled defaults (docs/xmr-lane/r-c-rework-3.md).
@@ -1526,11 +1527,12 @@ static int run_live(const XmrNodeConfig& cfg) {
     } else if (cfg.lane_params.fee.enabled) {
         std::printf("REFUSED: unknown fee-model version %u\n", cfg.lane_params.fee.version);
         return 2;
-    } else if (g_give_author_pct != 0.0 || g_owner_fee_pct != 0.0 || !g_owner_address.empty()) {
+    } else if ((g_give_author_set && g_give_author_pct != 0.0) || g_owner_fee_pct != 0.0 || !g_owner_address.empty()) {
         std::printf("REFUSED: --give-author-pct / --node-owner-fee-pct / --node-owner-address need --fee-model v1 "
                     "(the fee model is OFF: this node is master-identical)\n");
         return 2;
     }
+    if (!cfg.lane_params.fee.enabled) g_give_author_pct = 0.0;   // the 0.1 default is a fee-model-v1 default only
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -3126,12 +3128,17 @@ static int run_live(const XmrNodeConfig& cfg) {
             // exists but credits nobody (the fixture then arms ecut_finder).
             return true;
         };
-        // EMPTY-CUT FINDER (operator ruling 09-26, xmr_paynow.hpp): an empty cut
-        // pays this template's finder -- the node's own payee, committed as V37F.
-        if (cba_payee_ref && ::v37::xmr::xmr_ref_valid(*cba_payee_ref)) scfg.ecut_finder = *cba_payee_ref;
-        std::printf("ecut: EMPTY-CUT FINDER %s (an empty credit cut pays the finder = this node's payee %s…, committed as V37F)\n",
-                    scfg.ecut_finder ? "ARMED" : "OFF (no --payee-spend-hex/--payee-view-hex)",
-                    scfg.ecut_finder ? hex_of(::v37::xmr::xmr_identity_key(*scfg.ecut_finder)).substr(0, 8).c_str() : "-");
+        // EMPTY-CUT FINDER (operator rulings 09-26 / 09-27, xmr_paynow.hpp): an empty
+        // cut pays the finder of the WINNING JOB, committed as V37F -- the job's
+        // stratum login (a valid standard address of this network), the node owner
+        // on an owner-fee job, else the compiled-in donation. The node's own
+        // --payout-address is never the finder. The default template (a job with
+        // no binding) pays the donation: fee model ON its residual already does
+        // (no V37F), OFF it is committed as V37F. Per-job variants: the provider.
+        if (!fee_on) scfg.ecut_finder = fee::donation_ref(don_net);
+        std::printf("ecut: EMPTY-CUT FINDER per job (login | owner on an owner-fee job | donation %s…); default job pays the donation%s\n",
+                    hex_of(fee::donation_identity(don_net)).substr(0, 8).c_str(),
+                    fee_on ? " via the residual (no V37F)" : " as V37F");
         std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
@@ -3955,6 +3962,25 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::fflush(stdout);
             };
         hooks.job_binder = job_binder;   // SEAM-1 (unset unless --relay-bind rbind)
+        {   // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27): bind every job's finder
+            // right after its rbind (the owner-fee roll is the rbind's), before its blob.
+            auto rb = job_binder;
+            auto logged = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
+            hooks.job_binder = [&provider, &rbind_reg, rb, logged, don_net, owner_ref](std::uint32_t en, const std::string& address) {
+                if (rb) rb(en, address);
+                bool owner_hit = false;
+                if (rbind_reg) if (const auto jb = rbind_reg->get(en)) owner_hit = jb->owner_substituted;
+                const auto fc = c2pool::v37n::xmr::paynow::choose_ecut_finder(address, don_net, owner_hit, owner_ref);
+                provider.bind_finder(en, fc.payee);
+                std::lock_guard<std::mutex> lk(logged->first);
+                if (logged->second.size() < 4096 && logged->second.insert(std::string(to_string(fc.from)) + "|" + address).second) {
+                    std::printf("ecut-finder: job login %s -> finder = %s %s…%s%s\n", address.empty() ? "-" : address.substr(0, 12).c_str(),
+                                to_string(fc.from), hex_of(::v37::xmr::xmr_identity_key(fc.payee)).substr(0, 8).c_str(),
+                                fc.why.empty() ? "" : " -- ", fc.why.c_str());
+                    std::fflush(stdout);
+                }
+            };
+        }
         if (relay_node) {
             // GAP-2: disjoint per-node miner search spaces (see XmrStratumServer::seed_extra_nonce).
             std::random_device rd;
@@ -4673,7 +4699,7 @@ int main(int argc, char** argv) {
             else throw cs::UsageError("--fee-model takes off|v1, got '" + m + "'");
         }
         // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
-        else if (a == "--give-author-pct")    g_give_author_pct = cs::to_double(a, value());
+        else if (a == "--give-author-pct")    { g_give_author_pct = cs::to_double(a, value()); g_give_author_set = true; }
         else if (a == "--node-owner-fee-pct") g_owner_fee_pct = cs::to_double(a, value());
         else if (a == "--node-owner-address") g_owner_address = value();
         else if (a == "--settle-h-min") cfg.settle_h_min = u64();
@@ -4925,7 +4951,8 @@ int main(int argc, char** argv) {
                 "                               by their PoW-bound give-author u16. Every peer must\n"
                 "                               agree (folded into the relay HELLO digest)\n"
                 "  --give-author-pct <p>        (v1) give-author %% carried as a u16 in the receipts\n"
-                "                               THIS node's jobs bind (default 0; folded everywhere)\n"
+                "                               THIS node's jobs bind (default 0.1; 0 opts out; folded\n"
+                "                               everywhere)\n"
                 "  --node-owner-fee-pct <p>     (v1) probability %% that a job commits to the node\n"
                 "                               owner instead of the miner (default 0; job issue)\n"
                 "  --node-owner-address <addr>  (v1) the node owner's standard address\n"
