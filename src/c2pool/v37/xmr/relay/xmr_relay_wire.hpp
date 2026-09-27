@@ -387,7 +387,31 @@ inline PoolId pool_id_of(u32 chain_id, const ::v37::LaneParams& p,
 // change of the lane-block validity rules that is not a consensus version.
 //   1 = SHIPPED_CONSENSUS_VERSION (V37.1, pre-#1803)
 //   2 = + #1803 EMPTY-CUT FINDER (V37F) + CUT-FLOOR
-inline constexpr u32 kXmrPoolRulesVersion = 2;
+//   3 = + XMR-DROPS-DEFAULT (operator ruling 09-27): raindrops (DROPS) ARMED
+//       in the XMR node by default (the XMR targets build with the V37.1
+//       activation, src/c2pool/CMakeLists.txt c2pool_xmr_drops_default). The
+//       DROPS gate itself rides lane_params_digest, but that refusal is
+//       generic; this version names it: a raindrops-OFF node (any build before
+//       this one, or -DV37_XMR_DROPS_DEFAULT=OFF) is refused AT HELLO as
+//       TAG_MISMATCH field=version with the DROPS reason, both directions.
+inline constexpr u32 kXmrPoolRulesVersionDropsOff = 2;
+inline constexpr u32 kXmrPoolRulesVersionDropsOn  = 3;
+inline constexpr u32 kXmrPoolRulesVersion =
+    ::c2pool::v37n::kActivateConsensusV1 ? kXmrPoolRulesVersionDropsOn : kXmrPoolRulesVersionDropsOff;
+#define C2POOL_XMR_DROPS_DEFAULT_RULES 1   // feature probe: the v3 (DROPS default) pool rules exist
+// The explicit reason for a pool-rules version pair ("" = no special text).
+inline std::string pool_rules_reason(u32 ours, u32 theirs) {
+    if (ours == kXmrPoolRulesVersionDropsOn && theirs == kXmrPoolRulesVersionDropsOff)
+        return ": the peer runs raindrops (DROPS) OFF -- an XMR build before XMR-DROPS-DEFAULT; raindrops are pool "
+               "consensus (owed_digest), every node of a pool must run the same DROPS-default build -- upgrade it";
+    if (ours == kXmrPoolRulesVersionDropsOff && theirs == kXmrPoolRulesVersionDropsOn)
+        return ": the peer runs raindrops (DROPS) ON (the XMR-DROPS-DEFAULT build) and this node runs them OFF -- "
+               "every node of a pool must run the same build";
+    if (theirs < ours && ours >= 2 && theirs < 2)
+        return ": the peer runs older pool rules (pre-#1803: no V37F empty-cut finder / cut floor) and would stall on "
+               "this pool's blocks -- upgrade it";
+    return "";
+}
 #define C2POOL_XMR_POOL_RULES_VERSION 1   // feature probe for KATs built on both trees
 inline PoolId node_pool_id(u32 chain_id, const ::v37::LaneParams& p) {
     return pool_id_of(chain_id, p, kXmrPoolRulesVersion);
@@ -489,10 +513,7 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
         return out("chain_id", "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id));
     if (theirs.pool->version != ours.pool->version)
         return out("version", "consensus version " + std::to_string(theirs.pool->version) + " != ours " + std::to_string(ours.pool->version) +
-                   (theirs.pool->version < ours.pool->version && ours.pool->version == kXmrPoolRulesVersion
-                        ? ": the peer runs older pool rules (pre-#1803: no V37F empty-cut finder / cut floor) and would stall on "
-                          "this pool's blocks -- upgrade it"
-                        : ""));
+                   pool_rules_reason(ours.pool->version, theirs.pool->version));
     if (theirs.pool->authority != ours.pool->authority)
         return out("authority", "authority " + std::to_string(theirs.pool->authority) + " != ours " + std::to_string(ours.pool->authority));
     return out("geometry", "LaneParams geometry differs (window/c0/rollup/half_life/level_caps/k_floor)");
@@ -518,7 +539,7 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
                    (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +
                    (theirs.enrol_set ? hex32(*theirs.enrol_set).substr(0, 12) : std::string("none")) +
                    " (every node of a pool must run the identical --drops-enrol list)";
-        return "lane_params_digest differs (different LaneParams geometry/gates)";
+        return "lane_params_digest differs (different LaneParams geometry/gates: DROPS subthreshold / fee model / share weight)";
     }
     if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";
     return "";
