@@ -18,8 +18,11 @@
 //   mark_good()      HELLO ok on a link dialed to that address
 //   mark_failed()    dial failed / link ended before HELLO -> backoff, and
 //                    dropped after max_fails
-//   mark_bad()       refused at HELLO (another pool, self): erased and never
+//   mark_bad()       refused at HELLO (another pool): erased and never
 //                    re-learned (bounded memory of such addresses)
+//   mark_self()      NODE-NONCE: this node's own address (a HELLO carried our
+//                    node nonce, or it is our listen address): erased, never
+//                    learned / good / dialed / handed out again (bounded)
 //   sample_good()    the FB_ADDR answer: a random sample of good entries
 //   dial_candidates() good first (freshest), then candidates, honouring backoff
 //   expire()         drops stale candidates / stale good entries
@@ -67,6 +70,7 @@ public:
         std::uint64_t backoff_base_s = 5;             // retry after base * 2^(fails-1), capped
         std::uint64_t backoff_cap_s = 3600;
         std::size_t   bad_memory = 1024;              // refused addresses remembered (never re-learned)
+        std::size_t   self_memory = 64;               // NODE-NONCE: own addresses remembered (never dialed)
     };
     PeerBook() = default;
     explicit PeerBook(Limits l) : m_l(l) {}
@@ -92,7 +96,7 @@ public:
         if (host.empty() || port == 0) return false;
         const std::string k = peer_key(host, port);
         std::lock_guard<std::mutex> lk(m_mtx);
-        if (m_bad.count(k)) return false;
+        if (m_bad.count(k) || m_self.count(k)) return false;
         seen = std::min(seen, now);
         auto it = m_e.find(k);
         if (it != m_e.end()) {
@@ -105,6 +109,7 @@ public:
     void mark_good(const std::string& host, std::uint16_t port, std::uint64_t now) {
         const std::string k = peer_key(host, port);
         std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_self.count(k)) return;   // NODE-NONCE: our own address is never good
         m_bad.erase(k);
         auto it = m_e.find(k);
         if (it == m_e.end()) {
@@ -134,6 +139,24 @@ public:
             while (m_bad_order.size() > m_l.bad_memory) { m_bad.erase(m_bad_order.front()); m_bad_order.pop_front(); }
         }
     }
+    // NODE-NONCE: this node's own address. Sticky (mark_good cannot undo it),
+    // bounded (self_memory, oldest forgotten first), not persisted: the daemon
+    // re-marks its listen addresses at start and a HELLO nonce re-detects the rest.
+    void mark_self(const std::string& host, std::uint16_t port) {
+        if (host.empty() || port == 0) return;
+        const std::string k = peer_key(host, port);
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_e.erase(k)) m_dirty = true;
+        m_bad.erase(k);
+        if (m_self.insert(k).second) {
+            m_self_order.push_back(k);
+            while (m_self_order.size() > m_l.self_memory) { m_self.erase(m_self_order.front()); m_self_order.pop_front(); }
+        }
+    }
+    bool is_self(const std::string& host, std::uint16_t port) const {
+        std::lock_guard<std::mutex> lk(m_mtx); return m_self.count(peer_key(host, port)) != 0;
+    }
+    std::size_t self_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_self.size(); }
     bool is_bad(const std::string& host, std::uint16_t port) const {
         std::lock_guard<std::mutex> lk(m_mtx); return m_bad.count(peer_key(host, port)) != 0;
     }
@@ -200,7 +223,7 @@ private:
     // insert under the cap: evict the stalest non-good entry, else refuse
     // (a full book of good peers is never displaced by an unverified one).
     bool put_locked(const std::string& k, const Ent& e) {
-        if (m_bad.count(k)) return false;
+        if (m_bad.count(k) || m_self.count(k)) return false;
         if (!m_e.count(k) && m_e.size() >= m_l.max_entries) {
             auto victim = m_e.end();
             for (auto it = m_e.begin(); it != m_e.end(); ++it)
@@ -217,7 +240,26 @@ private:
     std::map<std::string, Ent> m_e;
     std::set<std::string> m_bad;
     std::deque<std::string> m_bad_order;
+    std::set<std::string> m_self;              // NODE-NONCE
+    std::deque<std::string> m_self_order;
     bool m_dirty = false;
 };
+
+// NODE-NONCE: which of two HELLO-ok links to the SAME node (equal peer node
+// nonce) to close. Both ends evaluate it on their own view and close the SAME
+// socket: a link's DIALER nonce is known to both ends (ours if we dialed it,
+// the peer's HELLO nonce if it dialed us).
+//   different dialers  -> keep the link dialed by the LOWER nonce (both ends agree)
+//   same dialer, us    -> we close the newer link `p` (only the dialer decides)
+//   same dialer, peer  -> Defer: keep both, the peer closes one (no race where
+//                         each end closes a different one and both links die)
+// No penalty either way: no DoS strike, no book failure, no ban.
+enum class DupPick { DropNew, DropOld, Defer };
+inline DupPick dup_link_rule(std::uint64_t ours, std::uint64_t theirs, bool new_outbound, bool old_outbound) {
+    const std::uint64_t dn = new_outbound ? ours : theirs;
+    const std::uint64_t d0 = old_outbound ? ours : theirs;
+    if (dn != d0) return dn > d0 ? DupPick::DropNew : DupPick::DropOld;
+    return dn == ours ? DupPick::DropNew : DupPick::Defer;
+}
 
 } // namespace c2pool::v37n::xmr::relay

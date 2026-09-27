@@ -3550,6 +3550,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     }
                     ::freeifaddrs(ifs);
                 }
+                ro.self_hosts = local_ips;   // NODE-NONCE: our addresses + the listen port = never dialed / handed out
                 const auto bp = relay::resolve_bootstrap(ro.network, g_no_relay_bootstrap, g_relay_peers,
                                                          g_relay_listen, local_ips);
                 auto joined = [](const std::vector<std::string>& v) {

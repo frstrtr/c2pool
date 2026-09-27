@@ -175,6 +175,9 @@
 // (RelayOptions::keepalive_ms / silence_timeout_ms, RelayStats::silent_drops).
 #define C2POOL_XMR_RELAY_LIVENESS 1
 
+// Feature marker: NODE-NONCE (self-connection = SELF in the book, one link per node).
+#define C2POOL_XMR_RELAY_NODE_NONCE 1
+
 namespace c2pool::v37n::xmr::relay {
 
 using PeerId = ::c2pool::v37n::CarrierPeerNode::PeerId;
@@ -335,6 +338,10 @@ struct RelayOptions {
     // The SEED seam: addresses dialed as CANDIDATES at start (the built-in
     // bootstrap list feeds this; --relay-peer stays a permanent dial target).
     std::vector<std::pair<std::string, u16>> seeds;
+    // NODE-NONCE: this machine's addresses (numeric; the daemon gathers them).
+    // With the listen port they are OUR relay address: never dialed, never
+    // learned, never handed out (the listen host itself always counts).
+    std::vector<std::string> self_hosts;
     std::vector<PeerRecord> book_load;            // persisted book (core::AddrStore) loaded at start
     std::function<void(const std::vector<PeerRecord>&)> book_save;   // persist hook (dirty book, every book_save_ms + stop)
     PeerBook::Limits book_limits{};
@@ -391,6 +398,9 @@ struct RelayStats {
     std::atomic<u64> getaddr_tx{0}, getaddr_rx{0}, getaddr_throttled{0}, addr_tx{0}, addr_rx{0}, addr_unsolicited{0};
     std::atomic<u64> addr_learned{0}, addr_ignored{0}, disc_dialed{0}, disc_dial_ok{0}, disc_dup_dropped{0};
     std::atomic<u64> disc_bad{0}, disc_self{0}, disc_saves{0}, disc_expired{0};
+    // NODE-NONCE: HELLOs refused as our own nonce (both ends of a self-dial count),
+    // dials / learns skipped as our own address, same-dialer duplicates left to the peer.
+    std::atomic<u64> self_conn{0}, self_skipped{0}, dup_deferred{0};
 };
 
 // ★ RAIN-BACKFILL: the composition's view of one interval range.
@@ -413,9 +423,11 @@ public:
     XmrRelayNode(RelayOptions o, ChainView& chain, RxFn rx, LaneTipFn tip, LogFn log)
         : m_o(std::move(o)), m_chain(chain), m_rx(std::move(rx)), m_tip(std::move(tip)),
           m_log(std::move(log)), m_dos(m_o.dos), m_vault(m_o.vault) {
-        std::random_device rd;
-        m_nonce = (static_cast<u64>(rd()) << 32) ^ rd() ^
-                  static_cast<u64>(Clock::now().time_since_epoch().count());
+        std::random_device rd;   // NODE-NONCE: a random 64-bit per-process nonce, never 0
+        do {
+            m_nonce = ((static_cast<u64>(rd()) << 32) | rd()) ^
+                      static_cast<u64>(Clock::now().time_since_epoch().count());
+        } while (m_nonce == 0);
         m_solicited = static_cast<double>(m_o.solicited_credits);
     }
     ~XmrRelayNode() { stop(); }
@@ -464,13 +476,31 @@ public:
                 return false;
             }
         }
+        if (m_o.listen) {   // NODE-NONCE: our own relay addresses (listen host + this machine's)
+            const u16 lp = m_net.listen_port();
+            const bool wild = m_o.listen_host.empty() || m_o.listen_host == "0.0.0.0";
+            if (!wild) m_self_keys.insert(peer_key(m_o.listen_host, lp));
+            if (wild || m_o.listen_host == "127.0.0.1") m_self_keys.insert(peer_key("127.0.0.1", lp));
+            if (wild) for (const auto& h : m_o.self_hosts) m_self_keys.insert(peer_key(h, lp));
+        }
         {
             std::lock_guard<std::mutex> lk(m_tmtx);
-            for (const auto& [h, pt] : m_o.peers) m_targets.push_back(Target{h, pt, 0, Clock::now(), 1});
+            for (const auto& [h, pt] : m_o.peers) {
+                if (m_self_keys.count(peer_key(h, pt))) {   // NODE-NONCE: --relay-peer = this node
+                    m_st.self_skipped++;
+                    log("relay: --relay-peer " + peer_key(h, pt) + " is THIS node (our listen address) -> never dialed");
+                    continue;
+                }
+                m_targets.push_back(Target{h, pt, 0, Clock::now(), 1});
+            }
         }
         if (m_o.discovery) {   // RELAY-DISCOVERY: seed = stored book + seed list (+ --relay-peer, marked good on HELLO)
             m_book.set_limits(m_o.book_limits);
             const u64 now = wall_s();
+            for (const auto& k : m_self_keys) {   // NODE-NONCE: never learned / good / handed out
+                const auto c = k.rfind(':');
+                m_book.mark_self(k.substr(0, c), static_cast<u16>(std::stoul(k.substr(c + 1))));
+            }
             m_book.load(m_o.book_load, now);
             for (const auto& [h, pt] : m_o.seeds) m_book.learn(h, pt, now, now);
             m_book.take_dirty();
@@ -496,6 +526,7 @@ public:
 
     u16 listen_port() const { return m_net.listen_port(); }
     u64 node_nonce() const { return m_nonce; }
+    const std::set<std::string>& self_keys() const { return m_self_keys; }   // NODE-NONCE (fixed after start)
     const RelayOptions& options() const { return m_o; }
     const RelayStats& stats() const { return m_st; }
     ::c2pool::v37n::FrameVault& vault() { return m_vault; }
@@ -1109,13 +1140,16 @@ public:
         std::snprintf(b, sizeof b,
             "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu | dialed=%llu dial_ok=%llu learned=%llu | "
             "getaddr tx=%llu rx=%llu throttled=%llu | addr tx=%llu rx=%llu unsolicited=%llu ignored=%llu | "
-            "dup_dropped=%llu refused=%llu self=%llu saves=%llu expired=%llu | peers=[",
+            "dup_dropped=%llu refused=%llu self=%llu saves=%llu expired=%llu | "
+            "nonce=%016llx self_conn=%llu self_skipped=%llu self_book=%zu dup_deferred=%llu | peers=[",
             m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in,
             (unsigned long long)s.disc_dialed.load(), (unsigned long long)s.disc_dial_ok.load(), (unsigned long long)s.addr_learned.load(),
             (unsigned long long)s.getaddr_tx.load(), (unsigned long long)s.getaddr_rx.load(), (unsigned long long)s.getaddr_throttled.load(),
             (unsigned long long)s.addr_tx.load(), (unsigned long long)s.addr_rx.load(), (unsigned long long)s.addr_unsolicited.load(),
             (unsigned long long)s.addr_ignored.load(), (unsigned long long)s.disc_dup_dropped.load(), (unsigned long long)s.disc_bad.load(),
-            (unsigned long long)s.disc_self.load(), (unsigned long long)s.disc_saves.load(), (unsigned long long)s.disc_expired.load());
+            (unsigned long long)s.disc_self.load(), (unsigned long long)s.disc_saves.load(), (unsigned long long)s.disc_expired.load(),
+            (unsigned long long)m_nonce, (unsigned long long)s.self_conn.load(), (unsigned long long)s.self_skipped.load(),
+            m_book.self_size(), (unsigned long long)s.dup_deferred.load());
         return std::string(b) + links + "]";
     }
     // Persist now (the daemon's shutdown path; the maintenance thread saves a dirty book on its own).
@@ -1163,6 +1197,7 @@ private:
         bool hello_timed_out = false;  // the current link hit the HELLO timeout
         bool learned = false;          // RELAY-DISCOVERY: from the book (one link, then retired)
         bool used = false;             // RELAY-DISCOVERY: a learned target was dialed once
+        bool self = false;             // NODE-NONCE: its HELLO carried OUR nonce -> never dialed again
     };
     static constexpr int kRefusedBackoffCapS = 16;
     static constexpr int kSilentBackoffCapS  = 60;
@@ -1544,7 +1579,8 @@ private:
                 m_last_reject = "hello: " + mis;
             }
             log("relay: peer " + std::to_string(p) + " HELLO REFUSED: " + mis + " -> drop");
-            if (m_o.discovery) disc_refused(p, mis);   // RELAY-DISCOVERY: never good, never re-learned
+            if (h.node_nonce == m_nonce) on_self_hello(p, h);   // NODE-NONCE: a self-connection
+            if (m_o.discovery) disc_refused(p, mis, h);   // RELAY-DISCOVERY: never good, never re-learned
             m_net.disconnect(p);
             return;
         }
@@ -2680,17 +2716,55 @@ private:
         if (m_net.send_to(p, f)) m_st.getaddr_tx++;
     }
     // A HELLO refused on a link WE dialed: that address is never good and never re-learned.
-    void disc_refused(PeerId p, const std::string& mis) {
+    void disc_refused(PeerId p, const std::string& mis, const Hello& hr) {
         std::string h; u16 port = 0;
+        const bool self = hr.node_nonce == m_nonce;
         {
             std::lock_guard<std::mutex> lk(m_pmtx);
             auto it = m_peers.find(p);
-            if (it == m_peers.end() || it->second.out_host.empty()) return;
+            if (it == m_peers.end()) return;
             h = it->second.out_host; port = it->second.out_port;
         }
-        if (mis.find("self-connection") != std::string::npos) m_st.disc_self++; else m_st.disc_bad++;
+        if (h.empty()) {
+            // NODE-NONCE: the accepting end of a self-dial: our announced address
+            // (socket ip : HELLO listen port) is ours -- never learned or handed out.
+            if (self && hr.listen_port) m_book.mark_self(m_net.remote_ip(p), hr.listen_port);
+            return;
+        }
+        if (self) {
+            m_st.disc_self++;
+            m_book.mark_self(h, port);   // NODE-NONCE: never dialed, learned or handed out again
+            log("relay-disc: " + peer_key(h, port) + " is THIS node (HELLO node nonce equal) -> marked self");
+            return;
+        }
+        m_st.disc_bad++;
         m_book.mark_bad(h, port);
         log("relay-disc: " + peer_key(h, port) + " refused at HELLO -> never good, not re-learned (" + mis + ")");
+    }
+    // NODE-NONCE: a HELLO carrying OUR node nonce = this node talking to
+    // itself. The link is closed by the caller; the dial target behind it is
+    // retired for good (every mode, discovery ON or OFF).
+    void on_self_hello(PeerId p, const Hello&) {
+        m_st.self_conn++;
+        std::lock_guard<std::mutex> lk(m_tmtx);
+        for (auto& t : m_targets) if (t.pid == p && !t.self) {
+            t.self = true;
+            if (t.learned) t.used = true;
+            log("relay: dial target " + peer_key(t.host, t.port) + " is THIS node (HELLO node nonce equal) -> never dialed again");
+        }
+    }
+    // NODE-NONCE: every address known to belong to a node we hold a HELLO-ok
+    // link to (under that address or another one): dialing it again could only
+    // make a duplicate link. A restarted node has a new nonce, so its old
+    // addresses are dialable again at once.
+    static constexpr std::size_t kAddrNonceMax = 4096;
+    std::set<std::string> linked_node_keys() const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        std::set<u64> live;
+        for (const auto& [p, s] : m_peers) { (void)p; if (s.hello_ok) live.insert(s.remote.node_nonce); }
+        std::set<std::string> v;
+        for (const auto& [k, n] : m_addr_nonce) if (live.count(n)) v.insert(k);
+        return v;
     }
     // HELLO ok: a dialed address becomes GOOD, so does an inbound peer's
     // announced address (it proved the pool id on this socket); a second link to the same node is dropped
@@ -2733,16 +2807,27 @@ private:
             auto it = m_peers.find(p);
             if (it == m_peers.end()) return false;
             it->second.addr_key = key; it->second.remote_ip = rip;
+            if (!key.empty()) {   // NODE-NONCE: this address is that node (bounded, refreshed on every HELLO)
+                if (m_addr_nonce.size() >= kAddrNonceMax && !m_addr_nonce.count(key)) m_addr_nonce.erase(m_addr_nonce.begin());
+                m_addr_nonce[key] = h.node_nonce;
+            }
         }
         if (dup) {
-            const u64 dialer_p = out_host.empty() ? h.node_nonce : m_nonce;
-            const u64 dialer_q = dup_out ? m_nonce : h.node_nonce;
-            const bool drop_p = dialer_p == dialer_q || dialer_p > dialer_q;
-            m_st.disc_dup_dropped++;
-            log("relay-disc: duplicate link to node " + std::to_string(h.node_nonce & 0xffff) + " -> dropping peer " +
-                std::to_string(drop_p ? p : dup) + " (keep the link dialed by the lower node nonce)");
-            m_net.disconnect(drop_p ? p : dup);
-            if (drop_p) return false;
+            // NODE-NONCE: one link per node, the same one on both ends (dup_link_rule).
+            const DupPick pick = dup_link_rule(m_nonce, h.node_nonce, !out_host.empty(), dup_out);
+            if (pick == DupPick::Defer) {
+                m_st.dup_deferred++;
+                log("relay-disc: duplicate link to node " + std::to_string(h.node_nonce & 0xffff) +
+                    " dialed twice by the peer -> the peer closes one");
+            } else {
+                const bool drop_p = pick == DupPick::DropNew;
+                const PeerId gone = drop_p ? p : dup;
+                m_st.disc_dup_dropped++;
+                log("relay-disc: duplicate link to node " + std::to_string(h.node_nonce & 0xffff) + " -> dropping peer " +
+                    std::to_string(gone) + " (keep the link dialed by the lower node nonce; no penalty)");
+                m_net.disconnect(gone);
+                if (drop_p) return false;
+            }
         }
         send_getaddr(p);
         return true;
@@ -2802,6 +2887,7 @@ private:
         for (std::size_t i = 0; i < take; ++i) {
             const AddrEntry& e = v[i];
             if (!dialable_v4(e) || (src_public && !addr_routable(e))) { m_st.addr_ignored++; continue; }
+            if (m_book.is_self(addr_host(e), e.port)) { m_st.self_skipped++; continue; }   // NODE-NONCE: our own address
             if (m_book.learn(addr_host(e), e.port, e.last_seen, now)) ++learned;
         }
         m_st.addr_ignored += v.size() - take;
@@ -2839,6 +2925,7 @@ private:
                 if (s.hello_ok && nowc - s.getaddr_tx >= std::chrono::milliseconds(m_o.addr_reask_ms)) reask.push_back(p);
         }
         std::set<std::string> skip = linked_keys();
+        for (const auto& k : linked_node_keys()) skip.insert(k);   // NODE-NONCE: aliases of linked nodes
         {
             std::lock_guard<std::mutex> lk(m_tmtx);
             for (const auto& t : m_targets) {
@@ -2906,13 +2993,16 @@ private:
                 const auto live = m_net.peer_ids();
                 // RELAY-DISCOVERY: an address already linked (e.g. the peer dialed US) is not dialed again
                 const std::set<std::string> linked = m_o.discovery ? linked_keys() : std::set<std::string>{};
+                // NODE-NONCE: an address whose node (by HELLO nonce) is linked under ANOTHER address
+                const std::set<std::string> aliased = m_o.discovery ? linked_node_keys() : std::set<std::string>{};
                 {
                     std::lock_guard<std::mutex> lk(m_tmtx);
                     for (std::size_t i = 0; i < m_targets.size(); ++i) {
                         auto& t = m_targets[i];
                         if (t.pid && std::find(live.begin(), live.end(), t.pid) == live.end()) t.pid = 0;
+                        if (t.self) continue;   // NODE-NONCE: this node itself, never dialed again
                         if (!t.pid && Clock::now() >= t.next_try) {
-                            if (linked.count(peer_key(t.host, t.port))) { t.next_try = Clock::now() + std::chrono::seconds(5); if (t.learned) t.used = true; continue; }
+                            if (linked.count(peer_key(t.host, t.port)) || aliased.count(peer_key(t.host, t.port))) { t.next_try = Clock::now() + std::chrono::seconds(5); if (t.learned) t.used = true; continue; }
                             due.push_back(i);
                         }
                     }
@@ -2999,6 +3089,8 @@ private:
     LaneTipFn    m_tip;
     LogFn        m_log;
     u64          m_nonce = 0;
+    std::set<std::string> m_self_keys;   // NODE-NONCE: our relay addresses (set in start())
+    std::map<std::string, u64> m_addr_nonce;   // NODE-NONCE: relay address -> node nonce (under m_pmtx)
     RelayStats   m_st;
 
     ::c2pool::v37n::CarrierPeerNode m_net;

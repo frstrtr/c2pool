@@ -442,7 +442,9 @@ struct Hello {
     u32     chain_id = 0;
     bytes32 lane_params_digest{};
     u64     share_diff = 0;
-    u64     node_nonce = 0;           // per process; self-connect detection
+    u64     node_nonce = 0;           // NODE-NONCE: random 64-bit per process (never 0), fixed at byte 51 of
+                                      // every HELLO v1 length: equal = a self-connection (closed, address SELF);
+                                      // a second HELLO-ok link with the same nonce = a duplicate (one is closed)
     u16     listen_port = 0;          // 0 = dial-only
     u64     lane_next_pos = 0;        // our lane tip (diagnostic + backfill hint)
     bytes32 lane_digest{};            // LaneSnapshot digest at that tip (diagnostic)
