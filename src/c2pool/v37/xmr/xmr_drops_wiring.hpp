@@ -106,6 +106,7 @@
 
 #include <c2pool/v37/v37_drops_wiring.hpp>   // DropsWiring, TipBin, EnrollOutcome, kDropsWiringArmed
 #include <c2pool/v37/w4_settlement.hpp>      // settle::WorkPrice, work_price_at
+#include <c2pool/v37/xmr/xmr_enrol_mode.hpp>   // EnrolMode, enrol_mode_tag (DROPS-AUTO-ENROL)
 
 namespace c2pool::v37n::xmr::drops {
 
@@ -258,6 +259,7 @@ inline std::string verify_carry(const DropsCarry& c, bool binds) {
 struct LaneShare {
     bytes32 payee{};
     std::uint64_t bin = 0;
+    std::uint16_t give = 0;   // ★ d5: the receipt's give-author u16 (side_data_v2; folded only under the fee model)
 };
 using ShareCounts = std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t>;
 // The receipts of the lane prefix [0, P), as a multiset (order-free: the
@@ -275,8 +277,45 @@ struct LanePrefix {
     std::size_t base_n = 0;
     std::map<bytes32, std::uint64_t> base_first;
     ShareCounts base_counts;
+    // ★ d5: per payee, (SUM give-author u16, receipts) over the folded base
+    // (one row per payee, never pruned -- like base_first).
+    std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> base_give;
     std::size_t receipts() const { return base_n + shares.size(); }
 };
+
+// ★ XMR-DROPS-DEFAULT d5 (fee model ON). The REPLACE delta is in WHOLE-receipt
+// units: one estimated share prices as kFeeReceiptWeight (65535) of lane weight,
+// i.e. the payee's 65535 - d AND the donation's d (v36: miner att*(65535-d),
+// donation att*d). It was booked to the payee alone, so the payee carried the
+// donation's slice of every replaced share and kept the donation's slice of
+// every estimated one. Split each payee's delta the way its receipts split:
+// d = the payee's mean give-author u16 over its receipts on the lane prefix
+// [0, P) -- a pure function of the replicated prefix (own order or repaired,
+// the same multiset), so every node derives the same rows:
+//     don = trunc(v * SUM d / (n * 65535)),  payee v - don,  donation += don
+// The row sum is unchanged (conserving); zero rows are dropped (canonical).
+// Fee model OFF (d is never folded) => the caller does not call it.
+inline void split_give_author(std::map<bytes32, long long>& delta, const LanePrefix& lp, const bytes32& donation) {
+    std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> g;   // payee -> (SUM d, n)
+    for (const auto& [k, v] : lp.base_give) { g[k].first += v.first; g[k].second += v.second; }
+    for (const auto& x : lp.shares) { auto& e = g[x.payee]; e.first += x.give; e.second += 1; }
+    std::map<bytes32, long long> out;
+    long long don_total = 0;
+    for (const auto& [k, v] : delta) {
+        if (k == donation) { out[k] += v; continue; }   // the donation row is never re-split
+        long long don = 0;
+        if (const auto it = g.find(k); it != g.end() && it->second.second && it->second.first) {
+            const __int128 num = static_cast<__int128>(v) * static_cast<__int128>(it->second.first);
+            const __int128 den = static_cast<__int128>(it->second.second) * 65535;
+            don = static_cast<long long>(num / den);   // truncation toward zero, both signs
+        }
+        out[k] += v - don;
+        don_total += don;
+    }
+    if (don_total) out[donation] += don_total;
+    delta.clear();
+    for (const auto& [k, v] : out) if (v != 0) delta.emplace(k, v);
+}
 
 // S(payee, iv) for iv in [lo, hi), from the prefix alone.
 inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std::uint64_t hi) {
@@ -288,15 +327,21 @@ inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std
     return s;
 }
 // The enrolment book of the prefix: a pure function of (the enrol set, [0, P)).
-inline ::c2pool::v37n::EnrollmentBook lane_enrollment(const LanePrefix& lp, const std::set<bytes32>& enrol_set) {
+// ★ DROPS-AUTO-ENROL: Auto enrols EVERY payee of the prefix at its first share
+// (same rule, no set filter), None enrols nobody, List filters by the set.
+using ::c2pool::v37n::xmr::relay::EnrolMode;
+inline ::c2pool::v37n::EnrollmentBook lane_enrollment(const LanePrefix& lp, const std::set<bytes32>& enrol_set,
+                                                      EnrolMode mode = EnrolMode::List) {
     std::map<bytes32, std::uint64_t> first;
+    if (mode == EnrolMode::None) return ::c2pool::v37n::EnrollmentBook{};
+    const auto in = [&](const bytes32& p) { return mode == EnrolMode::Auto || enrol_set.count(p) != 0; };
     for (const auto& [payee, bin] : lp.base_first) {
-        if (!enrol_set.count(payee)) continue;
+        if (!in(payee)) continue;
         auto [it, fresh] = first.try_emplace(payee, bin);
         if (!fresh && bin < it->second) it->second = bin;
     }
     for (const auto& x : lp.shares) {
-        if (!enrol_set.count(x.payee)) continue;
+        if (!in(x.payee)) continue;
         auto [it, fresh] = first.try_emplace(x.payee, x.bin);
         if (!fresh && x.bin < it->second) it->second = x.bin;
     }
@@ -313,6 +358,16 @@ inline bytes32 enrol_set_digest(const std::set<bytes32>& s) {
     for (const char* p = dom; *p; ++p) b.push_back(static_cast<std::uint8_t>(*p));
     ::c2pool::v37n::enroll_detail::put_le32(b, static_cast<std::uint32_t>(s.size()));
     for (const auto& k : s) b.insert(b.end(), k.begin(), k.end());
+    return ::v37::sha256d(b);
+}
+// ★ DROPS-AUTO-ENROL: the mode-encoding enrol digest HELLO carries.
+inline bytes32 enrol_mode_digest(EnrolMode m, const std::set<bytes32>& s) {
+    return m == EnrolMode::List ? enrol_set_digest(s) : ::c2pool::v37n::xmr::relay::enrol_mode_tag(m);
+}
+inline bytes32 hello_digest_with_enrol(const bytes32& lane_params_digest, EnrolMode m, const std::set<bytes32>& s) {
+    std::vector<std::uint8_t> b(lane_params_digest.begin(), lane_params_digest.end());
+    const auto e = enrol_mode_digest(m, s);
+    b.insert(b.end(), e.begin(), e.end());
     return ::v37::sha256d(b);
 }
 inline bytes32 hello_digest_with_enrol(const bytes32& lane_params_digest, const std::set<bytes32>& s) {
@@ -858,19 +913,21 @@ public:
     // ── ★ DROPS-ENROL-LANE (7): the lane prefix + the composition from it ───
     // The pool's enrol set (identities; the same on every node: HELLO-checked).
     void set_enrol_set(std::set<bytes32> s) { std::lock_guard<std::mutex> lk(m_hmtx); m_enrol_set = std::move(s); }
+    void set_enrol_mode(EnrolMode m) { std::lock_guard<std::mutex> lk(m_hmtx); m_enrol_mode = m; }   // ★ DROPS-AUTO-ENROL
+    EnrolMode enrol_mode() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_enrol_mode; }
     std::set<bytes32> enrol_set() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_enrol_set; }
     // A receipt the lane just pushed at positions [pos_first, pos_first + n):
     // ONE share of `payee` at origin bin `bin` (0 = not known yet: a durable-log
     // reload; resolved from `prev_id` when a prefix is derived).
     void on_share_lane(const bytes32& payee, std::uint64_t bin, std::uint64_t pos_first, std::uint32_t n,
-                       const bytes32& prev_id) {
+                       const bytes32& prev_id, std::uint16_t give = 0) {
         std::lock_guard<std::mutex> lk(m_hmtx);
         if (pos_first < m_lane_base_P) {   // ★ DROPS-ENROL-TIDY: a rewrite below the folded base
             m_lane_base_stale = true;      // the fold no longer describes [0, base_P): own prefixes refuse (repair)
             ++m_lane_below_base;
             return;
         }
-        m_lane_pos[pos_first] = LanePos{payee, bin, prev_id};
+        m_lane_pos[pos_first] = LanePos{payee, bin, prev_id, give};
         m_lane_pos_max = std::max(m_lane_pos_max, m_lane_pos.size());
         if (pos_first == m_lane_contig) m_lane_contig = pos_first + (n ? n : 1);
         else if (pos_first > m_lane_contig) ++m_lane_gaps;   // our own log no longer covers [0, P) past here
@@ -930,6 +987,7 @@ public:
             auto [fi, fresh] = m_lane_base_first.try_emplace(e.payee, e.bin);
             if (!fresh && e.bin < fi->second) fi->second = e.bin;
             ++m_lane_base_counts[std::make_pair(e.payee, e.bin)];
+            { auto& gv = m_lane_base_give[e.payee]; gv.first += e.give; gv.second += 1; }   // ★ d5
             ++m_lane_base_n;
             ++n;
         }
@@ -970,6 +1028,7 @@ public:
         LanePrefix lp; lp.P = P;
         lp.base_P = m_lane_base_P; lp.base_n = m_lane_base_n;
         lp.base_first = m_lane_base_first; lp.base_counts = m_lane_base_counts;
+        lp.base_give = m_lane_base_give;   // ★ d5
         for (auto it = m_lane_pos.begin(); it != m_lane_pos.end() && it->first < P; ++it) {
             LanePos& e = it->second;
             if (e.bin == 0) {
@@ -980,7 +1039,7 @@ public:
                 }
                 e.bin = *b;
             }
-            lp.shares.push_back(LaneShare{e.payee, e.bin});
+            lp.shares.push_back(LaneShare{e.payee, e.bin, e.give});
         }
         return lp;
     }
@@ -998,7 +1057,7 @@ public:
         std::lock_guard<std::mutex> lk(m_hmtx);
         LaneCompose c;
         const ShareCounts S = lane_share_counts(lp, lo, hi);
-        c.book = lane_enrollment(lp, m_enrol_set);
+        c.book = lane_enrollment(lp, m_enrol_set, m_enrol_mode);
         c.digest = c.book.book_digest();
         c.rows = m_coh.rows_lane(lo, hi, S, c.book);
         c.inputs = m_coh.lane_inputs_digest(lo, hi, S);
@@ -1122,15 +1181,17 @@ private:
     // ★ DROPS-ENROL-LANE (under m_hmtx): our own lane order, one entry per
     // receipt (its first position), and how far it covers [0, P) contiguously.
     // Only ever filled under the flip (the wiring does not exist at flip 0).
-    struct LanePos { bytes32 payee{}; std::uint64_t bin = 0; bytes32 prev_id{}; };
+    struct LanePos { bytes32 payee{}; std::uint64_t bin = 0; bytes32 prev_id{}; std::uint16_t give = 0; };
     std::map<std::uint64_t, LanePos> m_lane_pos;
     std::uint64_t m_lane_contig = 0, m_lane_gaps = 0;
     std::set<bytes32> m_enrol_set;
+    EnrolMode m_enrol_mode = EnrolMode::List;   // ★ DROPS-AUTO-ENROL (the shell sets it; List = the pre-auto rule)
     // ★ DROPS-ENROL-TIDY (under m_hmtx): the folded base [0, m_lane_base_P) of
     // m_lane_pos (prune_lane_log) and the lane-only switch (set_lane_only).
     std::uint64_t m_lane_base_P = 0, m_lane_pruned = 0, m_lane_below_base = 0;
     std::size_t m_lane_base_n = 0, m_lane_pos_max = 0;
     std::map<bytes32, std::uint64_t> m_lane_base_first;
+    std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> m_lane_base_give;   // ★ d5 (SUM give, n) per payee
     ShareCounts m_lane_base_counts;
     bool m_lane_base_stale = false;
     bool m_lane_only = false;
