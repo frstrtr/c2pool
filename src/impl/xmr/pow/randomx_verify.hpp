@@ -385,6 +385,16 @@ public:
     // An allocated cache (keyed or not) to CREATE an extra VM on: a light VM
     // must be created with a cache; the caller re-binds it before hashing.
     randomx_cache* any_cache() const noexcept { return cur_.ok() ? cur_.raw() : next_.raw(); }
+    // DROPS-VERIFY-SCALE D1: the extra VMs never hash through bind_(), so they
+    // never move mru_; the owner reports the cache they used last (under its
+    // exclusive lock, before an adopt) so pick_victim keeps THAT slot instead
+    // of evicting the current epoch. A pointer that is not a resident cache
+    // (null, or one already replaced) is ignored.
+    void touch_cache(const randomx_cache* c) noexcept {
+        if (!c) return;
+        if (cur_.ok() && cur_.keyed() && cur_.raw() == c)        mru_ = &cur_;
+        else if (next_.ok() && next_.keyed() && next_.raw() == c) mru_ = &next_;
+    }
 
     // The flags a slot of THIS verifier is allocated with, so a cache built
     // elsewhere (adopt() below) is interchangeable with the resident ones.

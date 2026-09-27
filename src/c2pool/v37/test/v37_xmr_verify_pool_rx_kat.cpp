@@ -18,6 +18,14 @@
 //      RX_POOL_SECS (default 3) s each; aggregate hash/s, speedup and the RSS
 //      cost per extra worker VM are printed. Gating only as "N workers are
 //      faster than 1" (CI runners are small); the >= 3x verdict is printed.
+//   D  lazy seed residency (D1): the daemon keys the relay verifier LAZILY
+//      (no ensure_seeds). Walk 4 epochs E0..E3 through the WORKER path, then
+//      alternate E2 (previous epoch, inside the horizon) / E3 (current):
+//      0 re-keys, E2 + E3 resident, every hash == the reference. Worker hashes
+//      never move LightVerifier's own MRU, so before the fix the 4th lazily
+//      keyed seed evicted the current epoch and every alternating item re-keyed
+//      Argon2d (~0.8 s each). Leg 2: the same with the last miss taken by the
+//      listener lazy path (randomx_hash) after the workers hashed E2.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -204,6 +212,49 @@ void suite_throughput() {
     CHECK(per_vm < 16.0, "an extra worker VM costs %.2f MiB RSS (< 16 MiB: no cache duplicated)", per_vm);
 }
 
+void lazy_leg(bool last_on_listener) {
+    constexpr int kEpochs = 4, kAlt = 8;
+    std::map<int, o2::Hash32> ref;
+    bool ref_ok = true;
+    for (int e = 0; e < kEpochs; ++e) { o2::Hash32 h{}; ref_ok = ref_hash(seed_of(e), blob_of(e, 0), h) && ref_ok; ref[e] = h; }
+    o2::RandomXPolicy p = policy(true);
+    p.lazy_prefetch_on_miss = true;   // the daemon's relay verifier: keyed only on a miss
+    o2::O2RandomXVerifier v;
+    const bool up = v.init(p);
+    const std::size_t nw = up ? v.add_workers(2) : 0;
+    CHECK(ref_ok && up && nw == 2, "lazy verifier up, no ensure_seeds, %zu worker VMs (%s)", nw,
+          o2::O2RandomXVerifier::to_string(v.mode()));
+    int mism = 0, fails = 0;
+    auto hash = [&](int e, bool listener) {
+        const auto b = blob_of(e, 0);
+        o2::Hash32 h{};
+        const bool ok = listener ? v.randomx_hash(b.data(), b.size(), 0, seed_of(e), h)
+                                 : v.randomx_hash_on(0, b.data(), b.size(), seed_of(e), h);
+        if (!ok) ++fails; else if (h != ref[e]) ++mism;
+    };
+    for (int e = 0; e < kEpochs; ++e) hash(e, last_on_listener && e == kEpochs - 1);
+    const auto walk = v.stats().prefetches;
+    const bool e2 = v.seed_resident(seed_of(2)), e3 = v.seed_resident(seed_of(3)), e1 = v.seed_resident(seed_of(1));
+    CHECK(walk == kEpochs && e2 && e3 && !e1, "walk E0..E3: %llu lazy keys; resident E3=%d E2=%d E1=%d (0 = evicted)",
+          (unsigned long long)walk, e3, e2, e1);
+    const auto t0 = Clock::now();
+    for (int i = 0; i < kAlt; ++i) hash(i % 2 ? 3 : 2, false);
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count() / kAlt;
+    const auto rekeys = v.stats().prefetches - walk;
+    std::printf("    %d alternating E2/E3 worker items: %llu re-keys, %.1f ms/item\n", kAlt, (unsigned long long)rekeys, ms);
+    CHECK(rekeys == 0 && v.seed_resident(seed_of(2)) && v.seed_resident(seed_of(3)),
+          "alternating E2/E3: 0 re-keys (got %llu), E2 + E3 still resident", (unsigned long long)rekeys);
+    CHECK(fails == 0 && mism == 0, "every hash == the reference of its seed (fails=%d mismatches=%d)", fails, mism);
+}
+
+void suite_lazy() {
+    std::printf("== D. lazy keying: the workers' MRU seed stays resident (D1) ==\n");
+    std::printf("  leg 1: every miss on the worker path\n");
+    lazy_leg(false);
+    std::printf("  leg 2: the 4th seed keyed by the listener lazy path\n");
+    lazy_leg(true);
+}
+
 }  // namespace
 
 int main() {
@@ -211,6 +262,7 @@ int main() {
     suite_identity();
     suite_switch();
     suite_throughput();
+    suite_lazy();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

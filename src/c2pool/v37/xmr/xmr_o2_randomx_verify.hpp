@@ -499,6 +499,8 @@ public:
             x.bound = c; x.key = seed_hash; x.keyed = true;
             m_stat_worker_binds.fetch_add(1, std::memory_order_relaxed);
         }
+        // D1: the workers' MRU cache, so a lazy slot swap keeps it (key_off_vm_)
+        if (m_worker_mru.load(std::memory_order_relaxed) != c) m_worker_mru.store(c, std::memory_order_relaxed);
         randomx_calculate_hash(x.vm, blob, blob_size, out_hash.data());
         m_stat_hashes.fetch_add(1, std::memory_order_relaxed);
         m_stat_worker_hashes.fetch_add(1, std::memory_order_relaxed);
@@ -641,6 +643,11 @@ private:
     // the slot not holding `keep` (unkeyed first, else least recently used) --
     // the victim LightVerifier::prefetch_epoch would re-key in place. m_seed_mu
     // held by the caller. false: no VM / OOM.
+    // DROPS-VERIFY-SCALE D1: with no explicit `keep` (the lazy-miss paths of
+    // randomx_hash and randomx_hash_on) the victim is chosen by recency, and
+    // worker hashes never move LightVerifier's own MRU: the cache the workers
+    // hashed on last is reported under the exclusive lock first, so the third
+    // lazily keyed seed evicts the stale epoch, not the current one.
     bool key_off_vm_(const Seed32& seed, const Seed32* keep) {
         randomx_flags f;
         {
@@ -651,6 +658,7 @@ private:
         ::c2pool::xmr::CacheSlot s(f);
         if (!s.ok() || !s.rekey(seed)) return false;
         std::unique_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+        if (!keep) m_vm.touch_cache(m_worker_mru.load(std::memory_order_relaxed));
         if (m_vm.adopt(std::move(s), keep)) unbind_workers_locked_();   // a replaced cache may be freed
         return m_vm.seed_resident(seed);
     }
@@ -766,6 +774,9 @@ private:
         ~WorkerVm() { if (vm) randomx_destroy_vm(vm); }
     };
     std::vector<std::unique_ptr<WorkerVm>> m_workers;   // size fixed by add_workers; binds under m_vm_mu
+    // D1: the cache a worker hashed on last (written under m_vm_mu SHARED, read
+    // under it EXCLUSIVE; compared, never dereferenced -- may name a freed cache)
+    std::atomic<const randomx_cache*> m_worker_mru{nullptr};
 #endif
     // SEED-RACE (#1814 review): lock order m_seed_mu -> m_vm_mu, never the reverse.
     // DROPS-VERIFY-SCALE: a (writer-preferring) shared mutex. EXCLUSIVE for the listener VM + memo
