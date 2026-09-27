@@ -16,11 +16,23 @@
 // Nothing here posts into the io_context, so the writer has no lifetime
 // coupling with it; the destructor finishes the queued jobs and joins.
 //
-// Coalescing: a job that is a single Replace of path P replaces the data of
-// the LAST queued (not yet started) job when that one is also a single
-// Replace of P (at most one of the two carrying a completion tag). The later
-// snapshot supersedes the earlier one and FIFO order against every other job
-// is preserved, so a burst of state saves costs one fsync.
+// Coalescing: a job that is a single Replace of path P is folded into the
+// LAST queued (not yet started) job when that job's TRAILING op is a Replace
+// of P (at most one of the two carrying a completion tag): the newer snapshot
+// takes the trailing op's place. That covers a lone state save as well as the
+// state save that ends an "append the outbox row, then the state" job. The
+// later snapshot supersedes the earlier one, it is written no earlier than it
+// would have been, and FIFO order against every other job is preserved, so a
+// burst of state saves costs one fsync. (A folded snapshot is skipped with the
+// job when an earlier op of that job fails; the owner re-dirties its state on
+// such a failure, so the snapshot is rewritten on the next save.)
+//
+// Bounded queue: a job submitted as `deferrable` is refused (submit() returns
+// false, deferred() counts it) while max_jobs jobs are already queued. The
+// service submits the jobs that inbound traffic can create at will (accepting
+// an alert) as deferrable and answers "not now" (no ack; the origin
+// retransmits); its own bounded work (state saves -- which coalesce -- and
+// ledger rows, at most one per event) is never refused.
 //
 // inline mode (KATs): submit() executes the job immediately on the caller's
 // thread; results are still collected with take_results().
@@ -55,7 +67,10 @@ struct FileJobResult {
 
 class FileWriter {
 public:
-    explicit FileWriter(bool inline_mode) : m_inline(inline_mode)
+    static constexpr std::size_t kDefaultMaxJobs = 256;
+
+    explicit FileWriter(bool inline_mode, std::size_t max_jobs = kDefaultMaxJobs)
+        : m_inline(inline_mode), m_max_jobs(max_jobs ? max_jobs : 1)
     {
         if (!m_inline) m_thread = std::thread([this] { run(); });
     }
@@ -76,31 +91,40 @@ public:
     bool inline_mode() const { return m_inline; }
 
     // tag 0 = fire and forget (a failure is still reported, tag 0).
-    void submit(uint64_t tag, std::vector<FileOp> ops)
+    // Returns false only for a `deferrable` job refused by the queue cap (the
+    // job is dropped, nothing ran); every other job is accepted.
+    bool submit(uint64_t tag, std::vector<FileOp> ops, bool deferrable = false)
     {
-        if (ops.empty()) return;
+        if (ops.empty()) return true;
         if (m_inline) {
             ++m_submitted;
             FileJobResult r = execute(tag, ops);
             std::lock_guard<std::mutex> lk(m_mu);
             ++m_done;
             if (tag || !r.ok) m_results.push_back(std::move(r));
-            return;
+            return true;
         }
         std::lock_guard<std::mutex> lk(m_mu);
-        ++m_submitted;
         if (ops.size() == 1 && ops[0].type == FileOp::Type::Replace && !m_queue.empty()) {
             Job& last = m_queue.back();
-            if (last.ops.size() == 1 && last.ops[0].type == FileOp::Type::Replace &&
-                last.ops[0].path == ops[0].path && (last.tag == 0 || tag == 0)) {
-                last.ops[0].data = std::move(ops[0].data);
+            FileOp& trailing = last.ops.back();
+            if (trailing.type == FileOp::Type::Replace && trailing.path == ops[0].path &&
+                (last.tag == 0 || tag == 0)) {
+                trailing.data = std::move(ops[0].data);
                 if (tag) last.tag = tag;
+                ++m_submitted;
                 ++m_coalesced;
-                return;
+                return true;
             }
         }
+        if (deferrable && m_queue.size() >= m_max_jobs) {
+            ++m_deferred;
+            return false;
+        }
+        ++m_submitted;
         m_queue.push_back(Job{tag, std::move(ops)});
         m_cv.notify_one();
+        return true;
     }
 
     std::vector<FileJobResult> take_results()
@@ -131,6 +155,9 @@ public:
     uint64_t submitted() const { std::lock_guard<std::mutex> lk(m_mu); return m_submitted; }
     uint64_t done() const { std::lock_guard<std::mutex> lk(m_mu); return m_done; }
     uint64_t coalesced() const { std::lock_guard<std::mutex> lk(m_mu); return m_coalesced; }
+    uint64_t deferred() const { std::lock_guard<std::mutex> lk(m_mu); return m_deferred; }
+    std::size_t queued() const { std::lock_guard<std::mutex> lk(m_mu); return m_queue.size(); }
+    std::size_t max_jobs() const { return m_max_jobs; }
     std::size_t backlog() const { std::lock_guard<std::mutex> lk(m_mu); return m_queue.size() + (m_busy ? 1 : 0); }
 
     static bool atomic_write(const std::string& path, const std::string& data)
@@ -199,6 +226,7 @@ private:
     }
 
     const bool m_inline;
+    const std::size_t m_max_jobs;
     mutable std::mutex m_mu;
     std::condition_variable m_cv, m_idle_cv;
     std::deque<Job> m_queue;
@@ -206,7 +234,7 @@ private:
     std::function<void()> m_before_job;
     bool m_busy{false};
     bool m_stop{false};
-    uint64_t m_submitted{0}, m_done{0}, m_coalesced{0};
+    uint64_t m_submitted{0}, m_done{0}, m_coalesced{0}, m_deferred{0};
     std::thread m_thread;   // last: started after every member above exists
 };
 

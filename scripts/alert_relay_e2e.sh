@@ -129,6 +129,7 @@ pass "1 key exchange: A=$APUB B=$BPUB (key files 0600, stable)"
 
 ADDR=$(python3 "$HERE/alert_relay_stratum_sim.py" --testnet-address 1)
 BSTATE="$W/B/$SUB/alert_relay"
+GROUP=-1001234567890   # the designated alert group (a fake supergroup id; the endpoint is fake too)
 start_B() {
   start B "$W/B.log.$1" "$BIN" "${COMMON[@]}" --data-dir "$W/B" --listen 127.0.0.1:19802 \
     --web-port 19082 --alert-relay-telegram --alert-relay-accept "$APUB"
@@ -136,11 +137,11 @@ start_B() {
 start_A() {
   start A "$W/A.log.$1" "$BIN" "${COMMON[@]}" --data-dir "$W/A" --listen 127.0.0.1:19801 \
     --connect 127.0.0.1:19802 --stratum 127.0.0.1:19901 --web-port 19081 \
-    --alert-relay-origin --alert-relay-to "$BPUB" --alert-relay-label e2e-hotel "${FAST[@]}"
+    --alert-relay-origin --alert-relay-to "$BPUB" --alert-relay-label e2e-origin "${FAST[@]}"
 }
 start_sidecar() {
   start SC "$W/sidecar.log.$1" python3 "$HERE/alert_relay_telegram.py" --state-dir "$BSTATE" \
-    --token-file "$W/dummy.token" --chat-id 1 --telegram-api-base http://127.0.0.1:19999 --poll 1 -v
+    --token-file "$W/dummy.token" --chat-id "$GROUP" --telegram-api-base http://127.0.0.1:19999 --poll 1 -v
 }
 miner() {   # miner NAME USER HOLD
   start "$1" "$W/$1.log" python3 "$HERE/alert_relay_stratum_sim.py" --port 19901 --user "$2" --hold "$3"
@@ -161,9 +162,15 @@ wait_for 90 "Telegram OFFLINE for rig1" tg_ge 1 rig1 OFFLINE
 LAT=$((SECONDS - T_DISC))
 sleep 15
 [ "$(tg_count rig1 OFFLINE)" = "1" ] || fail "expected exactly 1 OFFLINE POST, got $(tg_count rig1 OFFLINE)"
-[ "$(tg_count e2e-hotel)" -ge 1 ] || fail "label missing from the text"
+[ "$(tg_count e2e-origin)" -ge 1 ] || fail "label missing from the text"
+python3 - "$W/tg.jsonl" "$GROUP" <<'PY' || fail "a POST did not carry the designated group id as a JSON integer"
+import json, sys
+want = int(sys.argv[2])
+rows = [json.loads(l)["body"] for l in open(sys.argv[1]) if l.strip()]
+sys.exit(0 if rows and all(type(b.get("chat_id")) is int and b["chat_id"] == want for b in rows) else 1)
+PY
 wait_for 20 "A sees delivered=1" st_ge 19081 '["outbox"]["delivered"]' 1
-pass "2 offline: exactly 1 Telegram POST for rig1 OFFLINE (~${LAT}s after disconnect), origin ledger delivered"
+pass "2 offline: exactly 1 Telegram POST for rig1 OFFLINE (~${LAT}s after disconnect) to group $GROUP, origin ledger delivered"
 grep -m1 "OFFLINE" "$W/tg.jsonl" | python3 -c 'import json,sys; print("   text:", json.loads(sys.stdin.read())["body"]["text"])'
 
 # ── 3. back online -> exactly one ───────────────────────────────────────────
@@ -230,7 +237,7 @@ if [ -n "$MASTER_BIN" ]; then
   sleep 5
   start A "$W/A.log.old" "$BIN" "${COMMON[@]}" --data-dir "$W/A" --listen 127.0.0.1:19801 \
     --connect 127.0.0.1:19803 --stratum 127.0.0.1:19901 --web-port 19081 \
-    --alert-relay-origin --alert-relay-to "$BPUB" --alert-relay-label e2e-hotel "${FAST[@]}" --alert-relay-test
+    --alert-relay-origin --alert-relay-to "$BPUB" --alert-relay-label e2e-origin "${FAST[@]}" --alert-relay-test
   wait_for 90 "A<->C (master) peering" peers_ge 19083 1
   wait_for 90 "master C logs the unknown alert command" grep -q "Failed to parse message 'alert'" "$W/C.log"
   sleep 45   # >= 8 retransmits at 5 s

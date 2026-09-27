@@ -1,6 +1,7 @@
 # D-MINER.7 — miner-offline alerts relayed over the sharechain p2p (c2pool-dash)
 
-Status: implemented, default OFF. Lane: DASH only (the hotel deployment target).
+Status: implemented, default OFF. Lane: DASH only (the first deployment target is a
+private deployment behind restrictive egress).
 
 ## Why
 
@@ -85,11 +86,18 @@ var origin_pubkey(33) | var to_key_id(8) | var body(sealed, ≤ 400) | var signa
 
 `alertack`: `u32 version | var origin_pubkey(33) | u64 nonce | u8 status |
 var relay_pubkey(33) | var signature` — status 1 delivered (Telegram ok:true),
-2 refused (origin not allowlisted), 3 refused (stale timestamp / undecryptable),
-4 queued at the relay (sidecar has not delivered yet).
+2 refused (origin not allowlisted), 3 refused (stale timestamp / undecryptable /
+malformed body), 4 queued at the relay (sidecar has not delivered yet), 5 expired
+at the relay (the sidecar will not page it: too old).
 
 Body plaintext: `kind(1: offline, 2: back_online, 3: digest, 4: test) |
-event_ts u32 | label | worker | detail` (length-prefixed, clipped to 32/64/128).
+event_ts u32 | label | worker | detail` (length-prefixed, clipped to 32/64/128
+bytes). The strings are UTF-8: the origin replaces malformed bytes with `?` and
+clips on a code-point boundary (Cyrillic worker names and labels are common),
+and the relay refuses a body whose strings are not well-formed UTF-8
+(status 3; such a frame is never cached in the seen set). Every JSON dump on
+the node (outbox row, state, ledger, status) also uses nlohmann's `replace`
+error handler as a backstop, so a malformed byte can never throw on a hot path.
 
 ## Security model
 
@@ -154,6 +162,19 @@ event_ts u32 | label | worker | detail` (length-prefixed, clipped to 32/64/128).
   If an event is still unconfirmed at the maximum age, the ledger records
   `expired_at_relay`. If the relay no longer knows the id (lost or pruned
   state), it records `lost_at_relay`. Neither case is silent.
+- A forwarder also passes on a validly signed frame that is outside the replay
+  window (hops permitting), exactly like a fresh one: it may be a re-probe, which
+  outlives the window, and only the relay can judge it (an accepted id is
+  answered at any age; an unknown one is refused, never paged). The frame enters
+  the forwarder's seen set, so the relay's answer is routed back and repeats are
+  throttled to one re-forward per 20 s. The frame is charged to the sender's
+  per-peer window as usual. This is what recovers a lost "delivered" ack across
+  a forwarder that restarted, and so lost its seen set, between two re-probes.
+- A final refusal (status 2, 3 or 5) ends an event only when its nonce is the one
+  the origin is currently sending. A late refusal of a superseded nonce (for
+  example, the first frame reached the relay stale while its re-issue is still in
+  flight) is counted in `outbox.stale_refusal` and ignored. "delivered" and
+  "queued" are honoured for any nonce of the event.
 - The origin ledger (`ledger.jsonl`) records every final state: `delivered`
   (relay-signed "Telegram said ok"), `queued_at_relay` (relay holds it, sidecar not
   done), `expired_at_relay`, `lost_at_relay`, `refused_*`, `undelivered`,
@@ -185,6 +206,19 @@ across threads and no posts into the io_context.
   asynchronously when half of the current one is used.
 - The only blocking write is the startup `init()`, before any peer or miner is
   served.
+- The writer queue is bounded (256 jobs). Accepting an alert is the only job
+  that inbound traffic can create at will. When the queue is full (the disk
+  stalled under a burst), the relay answers "not now": it sends no ack, forgets
+  the id, counts it in `relay.deferred_io` / `io.deferred`, and the origin's
+  retransmit is processed afresh later. The node's own bounded work (state
+  saves, which coalesce, and at most one ledger row per event) is never
+  refused. A state save folds into the queued job whose trailing op writes the
+  same file, including the state write that ends an "append the outbox row,
+  then the state" job.
+- The 5 s tick is wrapped (`run_tick`): an exception from sampling or from the
+  tick is logged, counted in `tick.errors` (with `tick.last_error`) and the
+  timer re-arms. `core::Timer` does not re-arm after a throwing handler, so an
+  unguarded throw would stop the alert timer without a trace.
 
 ## Relay side: node ↔ Telegram sidecar
 
@@ -198,15 +232,60 @@ Retries: 5 s → 5 min exponential backoff, 429 `retry_after` honoured, 20
 messages/min throttle. The sidecar does not send a row whose event is older
 than `--max-age` (default 6 h, the origin's own limit), because a page saying
 "OFFLINE at <two days ago>" helps nobody. It logs the row once and records it
-in `<state>/expired.jsonl`. It never writes that row to `delivered.jsonl`, so the
-node never acks it as delivered, and the origin reports `expired_at_relay`.
+in `<state>/expired.jsonl`. It never writes that row to `delivered.jsonl`. The
+node polls `expired.jsonl` as well and answers the origin at once with a signed
+status-5 ("expired") ack, so the origin records `expired_at_relay` immediately
+instead of re-probing until its own maximum age. The relay keeps that status
+and answers later re-probes with it.
 
 The handoff is file-based rather than an HTTP endpoint: it is loopback by
 construction (filesystem permissions), durable across restarts of either
 process, and needs no new write route on a web server that is public on the
 bootstrap node.
 
-Example message: `[c2pool] hotel: worker XaddrABC.rig1 OFFLINE (disconnected; down 5m) at 2026-09-27 12:00:00 UTC`
+Example message: `[c2pool] farm-1: worker XaddrABC.rig1 OFFLINE (disconnected; down 5m) at 2026-09-27 12:00:00 UTC`
+
+## Telegram group
+
+Alerts go to ONE designated Telegram group (or channel). The destination is
+configuration only: `--chat-id <id>` or `--chat-id-file <file>` on the sidecar
+(`TELEGRAM_CHAT_ID` in the systemd env file). Nothing is hard-coded, there is no
+default, and the sidecar refuses to start without an id. Group ids are
+negative: a supergroup looks like `-1001234567890`, a basic group like
+`-987654321`. A public channel can be given as `@channelname`. A positive id is
+a private chat with one user and is refused unless `--allow-direct-chat` is
+passed explicitly. Numeric ids are sent to the Bot API as JSON integers,
+exactly as configured, and `@channelname` as a string. Both are forms that
+`sendMessage` accepts for `chat_id`.
+
+Setting it up:
+
+1. Create the bot: in Telegram, talk to `@BotFather`, send `/newbot`, and keep
+   the token it prints. Put it only in the 0600 env file or a 0600
+   `--token-file`, never on a command line.
+2. Create the alert group (or pick an existing one) and add the bot as a member:
+   group → Add members → search the bot's `@username`. Posting needs no admin
+   rights. In a channel the bot must be an administrator with "Post messages".
+3. Get the group id. In the group, send `/start@<bot_username>` (a command
+   addressed to the bot reaches it even with privacy mode on). Then, on a
+   trusted machine:
+
+       read -rs TOKEN   # paste the token; it stays out of the shell history
+       curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" | python3 -m json.tool | grep -A3 '"chat"'
+
+   The `"id"` under `"chat"`, with `"type": "group"` or `"supergroup"`, is the
+   group id, a negative number. Take the `-100...` form when the type is
+   `supergroup`. If `getUpdates` returns nothing, send the command again, and
+   make sure no webhook is set for the bot (`getWebhookInfo`).
+4. Configure it: set `TELEGRAM_CHAT_ID=-100...` in
+   `~/.config/c2pool/alert-relay.env` (or put the id in a file for
+   `--chat-id-file`; `#` comments are allowed) and restart the sidecar. The
+   startup log line reads `chats=1`. A `--alert-relay-test` alert from the
+   origin should then show up in the group.
+5. If a basic group is later upgraded to a supergroup, its id changes. Telegram
+   then answers `sendMessage` with `migrate_to_chat_id`. The sidecar logs the
+   new id as an error and keeps retrying, but never switches destination on its
+   own. Update the configuration and restart it.
 
 ## Status
 
@@ -215,23 +294,27 @@ roles, this node's pubkey, relay key ids, detector state (origin), outbox
 counters (pending / awaiting_ack / queued_at_relay / delivered / undelivered /
 refused / dropped / expired_at_relay / lost_at_relay / retransmits / reprobes /
 reissued), relay counters (accepted / refused / duplicates / forwarded /
-pending_sidecar / delivered_telegram / outbox_bytes), writer counters (backlog /
-jobs / coalesced / errors) and p2p counters.
+pending_sidecar / delivered_telegram / expired_sidecar / deferred_io /
+stale_forwarded / outbox_bytes), writer counters (backlog / jobs / coalesced /
+deferred / max_jobs / errors), tick counters (errors / last_error), and p2p
+counters. The origin's outbox block also carries `stale_refusal`.
 
 ## Runbook
 
 1. On the relay (bootstrap) node: `c2pool-dash <usual flags> --alert-relay-show-key`
-   prints its alert pubkey `R`. On the hotel node: same command prints `H`.
+   prints its alert pubkey `R`. On the origin node (the one behind restrictive
+   egress): same command prints `H`.
 2. Relay: add `--alert-relay-telegram --alert-relay-accept H` and restart. Install
    the sidecar: copy `deploy/systemd/c2pool-alert-relay.env.example` to
-   `~/.config/c2pool/alert-relay.env` (chmod 600), fill in the token and chat id,
+   `~/.config/c2pool/alert-relay.env` (chmod 600), fill in the token and the
+   designated group id (see "Telegram group"),
    copy `c2pool-alert-relay-telegram.service` to `~/.config/systemd/user/`,
    `systemctl --user enable --now c2pool-alert-relay-telegram`.
-3. Hotel: add `--alert-relay-origin --alert-relay-to R --alert-relay-label hotel`
+3. Origin: add `--alert-relay-origin --alert-relay-to R --alert-relay-label farm-1`
    (optionally `--alert-relay-test` once) and restart. It must already peer with the
    relay (directly or through at most two forwarders).
 4. Verify: `curl -s 127.0.0.1:<web>/api/alert-relay/status` on both; the test alert
-   shows `outbox.delivered: 1` on the hotel node and one Telegram message.
+   shows `outbox.delivered: 1` on the origin node and one message in the group.
 
 ## Tests
 
@@ -248,10 +331,22 @@ jobs / coalesced / errors) and p2p counters.
   idle ticks write nothing, a stalled disk never blocks a handler or tick,
   re-probe recovering a lost delivered ack (through a forwarder, and after a
   relay restart outside the window), `expired_at_relay` / `lost_at_relay`, and
-  junk from fresh keys unable to starve an allowlisted origin.
+  junk from fresh keys unable to starve an allowlisted origin. Also: a late
+  refusal of a superseded nonce leaving the event pending; UTF-8 clip / sanitize
+  / validate, a Cyrillic worker name longer than the clip and a Cyrillic label
+  delivered exactly once, malformed miner-supplied bytes never breaking a dump,
+  an invalid-UTF-8 body refused without entering the seen set; a throwing tick
+  caught and counted while later ticks run (including a real `core::Timer`,
+  which stops re-arming on an unguarded throw); a stale re-probe crossing a
+  restarted forwarder to recover a lost delivered ack; the writer queue cap and
+  trailing-Replace coalescing, and the relay deferring alerts when the queue is
+  full; the sidecar's `expired.jsonl` acked "expired" at once.
 - `scripts/alert_relay_telegram.py --selftest`: fake in-process Bot API (200,
   429 retry_after, 500, ok:false, connection refused, restart, token redaction,
-  `--max-age` for new rows and for rows that age out while being retried).
+  `--max-age` for new rows and for rows that age out while being retried, the
+  `expired.jsonl` contract the node reads, and the destination group: a negative
+  `-100...` id is carried unchanged as a JSON integer, and the CLI refuses to
+  start with no id or with a private-chat id).
 - `scripts/alert_relay_e2e.sh`: two nodes + fake Telegram + stratum simulator on
   loopback with a private network id, plus a master-built peer and a flag-off
   parity phase.
@@ -260,10 +355,10 @@ jobs / coalesced / errors) and p2p counters.
 
 - On master, a dash node never re-dials a `--connect`/`--addnode` peer whose
   dial was refused: `dash::NodeImpl` has no `connect_failed()` override, so the
-  address stays in `m_pending_outbound`. For the hotel, a contabo outage at
-  reconnect time cuts the sharechain link, and alert delivery with it, until a
-  restart. That fix changes behaviour with every alert flag off, so it needs its
-  own PR, and it blocks the hotel deployment.
+  address stays in `m_pending_outbound`. For an origin behind restrictive
+  egress, a relay outage at reconnect time cuts the sharechain link, and alert
+  delivery with it, until a restart. That fix changes behaviour with every alert
+  flag off, so it needs its own PR, and it blocks the first deployment.
 - `scripts/miner_notify_engine.py` `v36relay` channel → hand off to the origin
   node (keeping its RAISE-on-failure contract).
 - Other lanes (LTC/BTC/DGB/BCH) once the dash lane has soaked.

@@ -4866,18 +4866,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                            " ever be observed on this node";
         alert_relay->publish_status(core::timestamp());
         alert_relay_timer = std::make_unique<core::Timer>(&ioc, true);
+        // run_tick() catches anything the sampling or the tick throws (logged,
+        // counted in the status "tick.errors"): core::Timer does not re-arm
+        // after a throwing handler, and a dead alert timer would be silent.
         alert_relay_timer->start(5, [ar = alert_relay, wsrc = work_source]() {
-            std::vector<dash::alert::WorkerSample> samples;
-            if (ar->config().origin) {
-                for (const auto& [sid, w] : wsrc->get_stratum_workers()) {
-                    dash::alert::WorkerSample smp;
-                    smp.key = w.worker_name.empty() ? w.username : w.username + "." + w.worker_name;
-                    smp.session = sid;
-                    smp.accepted = w.accepted;
-                    samples.push_back(std::move(smp));
+            ar->run_tick([&ar, &wsrc]() {
+                std::vector<dash::alert::WorkerSample> samples;
+                if (ar->config().origin) {
+                    for (const auto& [sid, w] : wsrc->get_stratum_workers()) {
+                        dash::alert::WorkerSample smp;
+                        smp.key = w.worker_name.empty() ? w.username : w.username + "." + w.worker_name;
+                        smp.session = sid;
+                        smp.accepted = w.accepted;
+                        samples.push_back(std::move(smp));
+                    }
                 }
-            }
-            ar->on_tick(samples, static_cast<int64_t>(core::timestamp()));
+                return samples;
+            }, static_cast<int64_t>(core::timestamp()));
         });
     }
 

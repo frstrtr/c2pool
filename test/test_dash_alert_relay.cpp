@@ -12,6 +12,8 @@
 #include <impl/dash/alert_wire.hpp>
 #include <impl/dash/messages.hpp>
 
+#include <core/timer.hpp>
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -28,6 +30,8 @@
 #include <string>
 #include <variant>
 #include <vector>
+
+#include <thread>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -71,7 +75,7 @@ AlertBody sample_body(Kind k = Kind::Offline)
     AlertBody b;
     b.kind = static_cast<uint8_t>(k);
     b.event_ts = 1'790'000'000u;
-    b.label = "hotel";
+    b.label = "farm-1";
     b.worker = "XdashAddress123.rig1";
     b.detail = "disconnected; down 5m";
     return b;
@@ -194,7 +198,7 @@ ServiceConfig origin_cfg(const fs::path& dir, const Bytes& relay_pub)
     ServiceConfig c;
     c.origin = true;
     c.state_dir = dir.string();
-    c.label = "hotel";
+    c.label = "farm-1";
     c.relays = {relay_pub};
     c.retry_every = 60;
     c.retry_max = 60;
@@ -575,7 +579,7 @@ TEST(DashAlertRelay, EndToEndQueuedThenDeliveredAcrossAForwarder)
     auto row = nlohmann::json::parse(rows[0]);
     EXPECT_EQ(row["worker"], "XaddrABC.rig1");
     EXPECT_EQ(row["kind"], "offline");
-    EXPECT_EQ(row["label"], "hotel");
+    EXPECT_EQ(row["label"], "farm-1");
 
     // queued_at_relay => no retransmits
     for (int64_t t = T0 + 5; t <= T0 + 300; t += 5) {
@@ -1435,4 +1439,521 @@ TEST(DashAlertDetector, RestoredWorkerReportsTheRealOutage)
     ASSERT_EQ(ev2.size(), 1u);
     EXPECT_EQ(ev2[0].worker, "B.rig2");
     EXPECT_NE(ev2[0].detail.find("down " + fmt_duration(10300 - 500)), std::string::npos) << ev2[0].detail;
+}
+
+// ── (12) re-verify fixes ────────────────────────────────────────────────────
+namespace {
+// Blocks the writer thread once it has picked up a job; reports when it did.
+struct EnteredGate {
+    std::promise<void> go;
+    std::shared_future<void> go_f{go.get_future().share()};
+    std::atomic<int> entered{0};
+    bool released{false};
+    void install(FileWriter& w)
+    {
+        auto f = go_f;
+        w.set_before_job_hook([this, f] { ++entered; f.wait(); });
+    }
+    bool wait_entered(int n)
+    {
+        for (int i = 0; i < 5000 && entered.load() < n; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return entered.load() >= n;
+    }
+    void release() { if (!released) { released = true; go.set_value(); } }
+    ~EnteredGate() { release(); }
+};
+
+std::string repeat_str(const std::string& s, int n)
+{
+    std::string out;
+    for (int i = 0; i < n; ++i) out += s;
+    return out;
+}
+} // namespace
+
+// Fix 1: a final refusal for a SUPERSEDED nonce must not end the event.
+// (Before: pending=0, refused=1 after the late refusal of the first nonce.)
+TEST(DashAlertRelay, LateRefusalOfASupersededNonceDoesNotEndTheEvent)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o");
+    AlertRelayService org(origin_cfg(od, rkey.pubkey), okey, T0);
+    std::string err;
+    ASSERT_TRUE(org.init(err));
+    std::vector<AckFrame> acks;
+    org.set_transport(capture_transport(acks));
+    org.enqueue_event(offline_event("W.rig1", T0), T0);
+    const uint64_t n1 = org.pending().begin()->second.frame.nonce;
+    for (int64_t t = T0 + 5; t <= T0 + 600; t += 5) org.on_tick({}, t);   // re-issue at reissue_after
+    ASSERT_EQ(org.pending().size(), 1u);
+    const uint64_t n2 = org.pending().begin()->second.frame.nonce;
+    ASSERT_NE(n1, n2) << "the event was re-issued under a fresh nonce";
+    EXPECT_EQ(org.counters().reissued, 1u);
+
+    PeerAlertGuard g;
+    // The first frame reached the relay stale -> a late RefusedInvalid for n1.
+    EXPECT_EQ(org.on_ack(*build_ack(rkey, okey.pubkey, n1, AckStatus::RefusedInvalid), 4, g, T0 + 610),
+              Verdict::AckDropped);
+    EXPECT_EQ(org.on_ack(*build_ack(rkey, okey.pubkey, n1, AckStatus::RefusedNotAllowed), 4, g, T0 + 611),
+              Verdict::AckDropped);
+    EXPECT_EQ(org.on_ack(*build_ack(rkey, okey.pubkey, n1, AckStatus::Expired), 4, g, T0 + 612),
+              Verdict::AckDropped);
+    EXPECT_EQ(org.pending().size(), 1u) << "PENDING_AFTER_OLD_NONCE_REFUSAL must stay 1";
+    EXPECT_EQ(org.counters().refused, 0u);
+    EXPECT_EQ(org.counters().stale_refusal, 3u);
+    EXPECT_FALSE(fs::exists(od / "ledger.jsonl")) << "no final ledger row for a superseded refusal";
+
+    // "queued" and "delivered" are honoured for ANY nonce of the event.
+    EXPECT_EQ(org.on_ack(*build_ack(rkey, okey.pubkey, n1, AckStatus::Queued), 4, g, T0 + 613),
+              Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().begin()->second.queued_at_relay);
+    EXPECT_EQ(org.on_ack(*build_ack(rkey, okey.pubkey, n1, AckStatus::Delivered), 4, g, T0 + 614),
+              Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().empty());
+    EXPECT_EQ(org.counters().delivered, 1u);
+
+    // A refusal of the CURRENT nonce is still final.
+    org.enqueue_event(offline_event("W.rig2", T0 + 700), T0 + 700);
+    const uint64_t cur = org.pending().begin()->second.frame.nonce;
+    EXPECT_EQ(org.on_ack(*build_ack(rkey, okey.pubkey, cur, AckStatus::RefusedInvalid), 4, g, T0 + 701),
+              Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().empty());
+    EXPECT_EQ(org.counters().refused, 1u);
+    org.publish_status(T0 + 702);
+    EXPECT_EQ(org.status_json()["outbox"]["stale_refusal"], 3u);
+}
+
+// Fix 2: UTF-8 -- clip on a code-point boundary, reject malformed bodies.
+TEST(DashAlertRelay, Utf8ClipSanitizeAndValidate)
+{
+    const std::string zh = "\xd0\xb6";   // U+0436, 2 bytes
+    const std::string w = "X" + repeat_str(zh, 40);   // 81 bytes: byte 64 is a continuation byte
+    ASSERT_EQ(w.size(), 81u);
+    EXPECT_EQ((static_cast<unsigned char>(w[64]) & 0xC0), 0x80) << "a naive 64-byte cut would split a code point";
+    const std::string c = clip_utf8(w, kMaxWorker);
+    EXPECT_EQ(c, "X" + repeat_str(zh, 31));
+    EXPECT_TRUE(is_valid_utf8(c));
+    EXPECT_TRUE(is_valid_utf8(w));
+    EXPECT_FALSE(is_valid_utf8("a\xd0"));            // truncated
+    EXPECT_FALSE(is_valid_utf8("\xc3\x28"));         // bad continuation
+    EXPECT_FALSE(is_valid_utf8("\xc0\xaf"));         // overlong
+    EXPECT_FALSE(is_valid_utf8("\xed\xa0\x80"));     // surrogate
+    EXPECT_FALSE(is_valid_utf8("\xf4\x90\x80\x80")); // > U+10FFFF
+    EXPECT_TRUE(is_valid_utf8("\xf0\x9f\x98\x80"));  // 4-byte emoji
+    EXPECT_EQ(sanitize_utf8("A.\xff\xferig\xd0"), "A.??rig?");
+    // A malformed name is sanitized BEFORE the clip, so the body is always valid.
+    AlertBody b = sample_body();
+    b.worker = std::string(70, '\xff');
+    auto dec = decode_body(encode_body(b));
+    ASSERT_TRUE(dec);
+    EXPECT_EQ(dec->worker, std::string(kMaxWorker, '?'));
+}
+
+TEST(DashAlertRelay, CyrillicWorkerAndLabelRoundTripDeliveredExactlyOnce)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    const std::string zh = "\xd0\xb6", yo = "\xd1\x91";
+    const std::string worker = "X" + repeat_str(zh, 40);        // 81 bytes > kMaxWorker
+    const std::string label = "A" + repeat_str(yo, 20);         // 41 bytes > kMaxLabel, odd-aligned
+    Mesh m;
+    auto ocfg = origin_cfg(od, rkey.pubkey);
+    ocfg.label = label;
+    m.add(1, ocfg, okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    auto& o = *m.nodes[1].svc;
+    o.enqueue_event(offline_event(worker, T0), T0);
+    m.pump(T0);
+    ASSERT_EQ(o.pending().size(), 1u);
+    EXPECT_TRUE(o.pending().begin()->second.queued_at_relay);
+    auto rows = read_lines(rd / "outbox.jsonl");
+    ASSERT_EQ(rows.size(), 1u);
+    auto row = nlohmann::json::parse(rows[0]);
+    EXPECT_EQ(row["worker"], "X" + repeat_str(zh, 31)) << "clipped on a code-point boundary";
+    EXPECT_EQ(row["label"], "A" + repeat_str(yo, 15));
+    // A short Cyrillic label round-trips unchanged.
+    AlertBody sb = sample_body();
+    sb.label = "\xd0\xa4\xd0\xb5\xd1\x80\xd0\xbc\xd0\xb0-1";   // "Ferma-1" in Cyrillic
+    sb.worker = "\xd1\x80\xd0\xb8\xd0\xb3.1";
+    auto dec = decode_body(encode_body(sb));
+    ASSERT_TRUE(dec);
+    EXPECT_EQ(*dec, sb);
+
+    std::ofstream(rd / "delivered.jsonl", std::ios::app) << nlohmann::json{{"id", row["id"]}}.dump() << "\n";
+    for (int64_t t = T0 + 5; t <= T0 + 30; t += 5) {
+        for (auto& [id, n] : m.nodes) n.svc->on_tick({}, t);
+        m.pump(t);
+    }
+    EXPECT_TRUE(o.pending().empty());
+    EXPECT_EQ(o.counters().delivered, 1u);
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u) << "exactly once";
+    EXPECT_EQ(m.nodes[3].svc->counters().delivered_telegram, 1u);
+    auto ledger = read_lines(od / "ledger.jsonl");
+    ASSERT_EQ(ledger.size(), 2u);
+    EXPECT_EQ(nlohmann::json::parse(ledger[1])["worker"], worker) << "the origin ledger keeps the full name";
+    // Both state files are valid JSON.
+    for (const auto& d : {od, rd}) {
+        std::ifstream st(d / "state.json");
+        EXPECT_TRUE(nlohmann::json::parse(st, nullptr, false).is_object());
+    }
+}
+
+TEST(DashAlertRelay, MalformedUtf8FromMinersNeverBreaksADump)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o");
+    auto ocfg = origin_cfg(od, rkey.pubkey);
+    ocfg.det.startup_grace = 0;
+    ocfg.label = "L\xff";
+    AlertRelayService org(ocfg, okey, T0);
+    std::string err;
+    ASSERT_TRUE(org.init(err));
+    std::vector<AckFrame> acks;
+    std::vector<AlertFrame> sent;
+    org.set_transport(capture_transport(acks, &sent));
+    const std::string bad = "A.\xff\xfe" "rig";
+    for (int64_t t = T0; t <= T0 + 400; t += 5)
+        org.run_tick([&] { return t < T0 + 50 ? one(bad, "s1", 0) : std::vector<WorkerSample>{}; }, t);
+    EXPECT_EQ(org.counters().tick_errors, 0u) << "no dump threw";
+    auto s = org.status_json();
+    EXPECT_TRUE(s["detector"]["workers"].contains("A.??rig"));
+    EXPECT_NO_THROW((void)s.dump());
+    ASSERT_EQ(org.pending().size(), 1u);
+    EXPECT_EQ(org.pending().begin()->second.worker, "A.??rig");
+    // An event raised with a raw malformed name (not via the detector) is
+    // still persisted: the state dump replaces instead of throwing.
+    EXPECT_NO_THROW(org.enqueue_event(offline_event("B.\xc3", T0 + 400), T0 + 400));
+    std::ifstream st(od / "state.json");
+    auto j = nlohmann::json::parse(st, nullptr, false);
+    ASSERT_TRUE(j.is_object());
+    EXPECT_EQ(j["pending"].size(), 2u);
+    EXPECT_FALSE(sent.empty());
+}
+
+TEST(DashAlertRelay, InvalidUtf8BodyIsRefusedAndNeverEntersTheSeenSet)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto rd = fresh_dir("r");
+    AlertRelayService rel(relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    std::string err;
+    ASSERT_TRUE(rel.init(err));
+    std::vector<AckFrame> acks;
+    rel.set_transport(capture_transport(acks));
+    // A non-conforming origin: well-formed layout, malformed UTF-8 in the label.
+    Bytes pt = {1, 0, 0, 0, 0};
+    const std::string lbl = "ok\xd0";   // truncated 2-byte sequence
+    pt.push_back(static_cast<unsigned char>(lbl.size()));
+    pt.insert(pt.end(), lbl.begin(), lbl.end());
+    pt.push_back(0);
+    pt.push_back(0);
+    EXPECT_FALSE(decode_body(pt));
+    auto f = build_alert_plaintext(okey, rkey.pubkey, pt, T0, 77);
+    ASSERT_TRUE(f);
+    PeerAlertGuard g;
+    EXPECT_EQ(rel.on_alert(*f, 5, g, T0), Verdict::RefusedInvalid);
+    EXPECT_EQ(rel.seen().size(), 0u);
+    EXPECT_EQ(rel.seen().order.size(), 0u);
+    EXPECT_EQ(rel.seen().find(okey.pubkey, 77), nullptr);
+    ASSERT_EQ(acks.size(), 1u);
+    EXPECT_EQ(acks[0].status, static_cast<uint8_t>(AckStatus::RefusedInvalid));
+    EXPECT_EQ(rel.counters().refused_invalid, 1u);
+    EXPECT_FALSE(fs::exists(rd / "outbox.jsonl"));
+    // The retransmit is judged afresh (and refused again), never from a cache.
+    EXPECT_EQ(rel.on_alert(*f, 5, g, T0 + 60), Verdict::RefusedInvalid);
+    EXPECT_EQ(rel.seen().size(), 0u);
+}
+
+// Fix 3: a throwing tick is caught, counted, and later ticks still run.
+TEST(DashAlertRelay, ThrowingTickIsCaughtAndLaterTicksRun)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o");
+    AlertRelayService org(origin_cfg(od, rkey.pubkey), okey, T0);
+    std::string err;
+    ASSERT_TRUE(org.init(err));
+    bool transport_throws = false;
+    std::size_t sends = 0;
+    Transport t;
+    t.broadcast_alert = [&](uint64_t, const AlertFrame&) -> std::size_t {
+        if (transport_throws) throw std::runtime_error("transport boom");
+        ++sends;
+        return 1;
+    };
+    t.broadcast_ack = [](uint64_t, const AckFrame&) { return std::size_t{1}; };
+    org.set_transport(t);
+    org.enqueue_event(offline_event("W.rig1", T0), T0);
+    ASSERT_EQ(sends, 1u);
+
+    // (a) the sampler throws
+    org.run_tick([]() -> std::vector<WorkerSample> { throw std::runtime_error("sampler boom"); }, T0 + 5);
+    EXPECT_EQ(org.counters().tick_errors, 1u);
+    // (b) the tick itself throws (retransmit at +60 s through a throwing transport)
+    transport_throws = true;
+    org.run_tick({}, T0 + 60);
+    EXPECT_EQ(org.counters().tick_errors, 2u);
+    auto s = org.status_json();
+    EXPECT_EQ(s["tick"]["errors"], 2u);
+    EXPECT_NE(s["tick"]["last_error"].get<std::string>().find("transport boom"), std::string::npos);
+    // (c) later ticks run normally: the retransmit goes out, status is fresh.
+    transport_throws = false;
+    for (int64_t now = T0 + 65; now <= T0 + 200; now += 5) org.run_tick({}, now);
+    EXPECT_EQ(org.counters().tick_errors, 2u);
+    EXPECT_GE(sends, 3u) << "retransmits resumed after the throwing ticks";
+    EXPECT_EQ(org.status_json()["now"], T0 + 200);
+
+    // (d) the node's repeating core::Timer: a throwing handler escapes
+    // io_context::run() and the timer is NOT re-armed (why the guard exists)...
+    {
+        boost::asio::io_context ioc;
+        core::Timer timer(&ioc, true);
+        int calls = 0;
+        timer.start(1, [&] { ++calls; throw std::runtime_error("unguarded"); });
+        EXPECT_THROW(ioc.run(), std::runtime_error);
+        ioc.restart();
+        ioc.run_for(std::chrono::milliseconds(1500));
+        EXPECT_EQ(calls, 1) << "an unguarded throw stops the repeating timer";
+    }
+    // ...while the node's handler shape (run_tick around the sampler) keeps it
+    // ticking through repeated throws.
+    {
+        boost::asio::io_context ioc;
+        core::Timer timer(&ioc, true);
+        int calls = 0;
+        const uint64_t e0 = org.counters().tick_errors;
+        timer.start(1, [&] {
+            org.run_tick([&]() -> std::vector<WorkerSample> {
+                ++calls;
+                throw std::runtime_error("sampler boom");
+            }, T0 + 300 + calls);
+            if (calls >= 3) ioc.stop();
+        });
+        ioc.run_for(std::chrono::seconds(10));
+        EXPECT_EQ(calls, 3) << "the guarded timer re-armed after every throw";
+        EXPECT_EQ(org.counters().tick_errors, e0 + 3);
+    }
+}
+
+// Fix 4: a stale but validly signed re-probe crosses a forwarder whose seen set
+// was emptied by a restart, so a lost "delivered" ack is recovered multi-hop.
+TEST(DashAlertRelay, StaleReprobeCrossesARestartedForwarder)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    Mesh m;
+    m.add(1, origin_cfg(od, rkey.pubkey), okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    int64_t cur = T0;
+    int lost = 0;
+    m.drop = [&](const Mesh::Msg& msg) {
+        const bool delivered = std::holds_alternative<AckFrame>(msg.frame) &&
+                               std::get<AckFrame>(msg.frame).status == static_cast<uint8_t>(AckStatus::Delivered);
+        if (delivered && cur < T0 + 1000) { ++lost; return true; }
+        return false;
+    };
+    auto& o = *m.nodes[1].svc;
+    o.enqueue_event(offline_event("W.rig1", T0), T0);
+    const AlertFrame frame = o.pending().begin()->second.frame;
+    m.pump(T0);
+    ASSERT_TRUE(o.pending().begin()->second.queued_at_relay);
+    auto row = nlohmann::json::parse(read_lines(rd / "outbox.jsonl").at(0));
+    std::ofstream(rd / "delivered.jsonl", std::ios::app) << nlohmann::json{{"id", row["id"]}}.dump() << "\n";
+    for (cur = T0 + 5; cur < T0 + 1000; cur += 5) {
+        for (auto& [id, n] : m.nodes) n.svc->on_tick({}, cur);
+        m.pump(cur);
+    }
+    ASSERT_GE(lost, 2) << "the delivered ack and the answer to the first re-probe were both lost";
+    ASSERT_EQ(o.pending().size(), 1u);
+
+    // The forwarder restarts: empty seen set. The next re-probe (T0+1200) is
+    // outside the +/-900 s window.
+    m.add(2, fwd_cfg(fresh_dir("f2")), std::nullopt, cur);
+    for (; cur <= T0 + 1400 && !o.pending().empty(); cur += 5) {
+        for (auto& [id, n] : m.nodes) n.svc->on_tick({}, cur);
+        m.pump(cur);
+    }
+    EXPECT_GT(cur - static_cast<int64_t>(frame.timestamp), kReplayWindowSec);
+    EXPECT_TRUE(o.pending().empty()) << "the stale re-probe crossed the restarted forwarder";
+    EXPECT_EQ(o.counters().delivered, 1u);
+    auto& f2 = *m.nodes[2].svc;
+    EXPECT_EQ(f2.counters().stale_forwarded, 1u);
+    EXPECT_EQ(f2.counters().rejected_stale, 0u);
+    EXPECT_EQ(f2.counters().ack_forwarded, 1u) << "the relay's cached delivered ack came back through it";
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u) << "a stale re-probe never pages";
+
+    // A repeat of the stale frame is throttled like any duplicate.
+    PeerAlertGuard g;
+    AlertFrame again = frame;
+    again.hops_left = 1;
+    EXPECT_EQ(f2.on_alert(again, 1, g, cur), Verdict::Duplicate);
+    // A stale frame with a bad signature is still rejected, never forwarded.
+    AlertRelayService f3(fwd_cfg(fresh_dir("f3")), std::nullopt, cur);
+    std::string e3;
+    ASSERT_TRUE(f3.init(e3));
+    std::vector<AckFrame> acks;
+    std::vector<AlertFrame> fwded;
+    f3.set_transport(capture_transport(acks, &fwded));
+    AlertFrame forged = frame;
+    forged.body.back() ^= 1;
+    PeerAlertGuard g3;
+    EXPECT_EQ(f3.on_alert(forged, 1, g3, cur), Verdict::RejectedStale);
+    EXPECT_TRUE(fwded.empty());
+    AlertFrame spent = frame;
+    spent.hops_left = 0;
+    EXPECT_EQ(f3.on_alert(spent, 1, g3, cur), Verdict::RejectedStale) << "hops exhausted";
+    EXPECT_EQ(f3.seen().size(), 0u);
+}
+
+// Fix 5: bounded writer queue + trailing-Replace coalescing.
+TEST(DashAlertRelay, WriterQueueCapAndTrailingReplaceCoalescing)
+{
+    auto dir = fresh_dir("w");
+    const std::string st = (dir / "state.json").string(), log = (dir / "rows.jsonl").string();
+    FileWriter w(false, 3);
+    EnteredGate gate;
+    gate.install(w);
+    EXPECT_TRUE(w.submit(0, {FileOp{FileOp::Type::Append, log, "r0"}}, true));
+    ASSERT_TRUE(gate.wait_entered(1)) << "the worker holds job 0";
+    EXPECT_TRUE(w.submit(0, {FileOp{FileOp::Type::Append, log, "r1"}}, true));
+    EXPECT_TRUE(w.submit(0, {FileOp{FileOp::Type::Append, log, "r2"}}, true));
+    // [append r3, replace state "s1"] (tagged, like an accepted alert)
+    EXPECT_TRUE(w.submit(7, {FileOp{FileOp::Type::Append, log, "r3"}, FileOp{FileOp::Type::Replace, st, "s1"}}, true));
+    EXPECT_EQ(w.queued(), 3u);
+    EXPECT_FALSE(w.submit(0, {FileOp{FileOp::Type::Append, log, "r4"}}, true)) << "cap reached: deferred";
+    EXPECT_EQ(w.deferred(), 1u);
+    // An untagged state save folds into the trailing Replace of the last job.
+    EXPECT_TRUE(w.submit(0, {FileOp{FileOp::Type::Replace, st, "s2"}}, true));
+    EXPECT_EQ(w.coalesced(), 1u);
+    EXPECT_EQ(w.queued(), 3u);
+    // Two tagged jobs never fold; a non-deferrable job is accepted above the cap.
+    EXPECT_TRUE(w.submit(8, {FileOp{FileOp::Type::Replace, st, "s3"}}));
+    EXPECT_EQ(w.queued(), 4u);
+    EXPECT_EQ(w.coalesced(), 1u);
+    // ...and a later untagged save folds into that one.
+    EXPECT_TRUE(w.submit(0, {FileOp{FileOp::Type::Replace, st, "s4"}}, true));
+    EXPECT_EQ(w.coalesced(), 2u);
+    gate.release();
+    w.flush();
+    std::ifstream sf(st);
+    std::string content((std::istreambuf_iterator<char>(sf)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(content, "s4") << "the newest snapshot is on disk";
+    EXPECT_EQ(read_lines(log), (std::vector<std::string>{"r0", "r1", "r2", "r3"}));
+    auto res = w.take_results();
+    ASSERT_EQ(res.size(), 2u);
+    EXPECT_EQ(res[0].tag, 7u);
+    EXPECT_EQ(res[1].tag, 8u);
+    EXPECT_TRUE(res[0].ok && res[1].ok);
+}
+
+TEST(DashAlertRelay, RelayDefersAlertsWhenTheWriterQueueIsFull)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto rd = fresh_dir("r");
+    auto rcfg = relay_cfg(rd, {okey.pubkey});
+    rcfg.inline_io = false;
+    rcfg.io_max_jobs = 4;
+    AlertRelayService rel(rcfg, rkey, T0);
+    std::string err;
+    ASSERT_TRUE(rel.init(err)) << err;
+    std::vector<AckFrame> acks;
+    rel.set_transport(capture_transport(acks));
+    EnteredGate gate;
+    gate.install(rel.io());
+    PeerAlertGuard g;
+    std::vector<AlertFrame> frames;
+    for (uint64_t i = 0; i < 7; ++i) frames.push_back(*build_alert(okey, rkey.pubkey, sample_body(), T0, 100 + i));
+    EXPECT_EQ(rel.on_alert(frames[0], 5, g, T0), Verdict::Queued);
+    ASSERT_TRUE(gate.wait_entered(1));
+    std::vector<Verdict> v;
+    for (std::size_t i = 1; i < frames.size(); ++i) v.push_back(rel.on_alert(frames[i], 5, g, T0));
+    EXPECT_EQ(v, (std::vector<Verdict>{Verdict::Queued, Verdict::Queued, Verdict::Queued, Verdict::Queued,
+                                       Verdict::Deferred, Verdict::Deferred}));
+    EXPECT_EQ(rel.counters().io_deferred, 2u);
+    EXPECT_EQ(rel.io().queued(), 4u);
+    EXPECT_EQ(rel.seen().find(okey.pubkey, 105), nullptr) << "a deferred id is forgotten";
+    EXPECT_EQ(rel.seen().find(okey.pubkey, 106), nullptr);
+    EXPECT_TRUE(acks.empty());
+    rel.publish_status(T0);
+    EXPECT_EQ(rel.status_json()["io"]["deferred"], 2u);
+    gate.release();
+    rel.io().flush();
+    rel.drain_io();
+    EXPECT_EQ(acks.size(), 5u);
+    // The origin's retransmits of the deferred ids are processed afresh.
+    EXPECT_EQ(rel.on_alert(frames[5], 5, g, T0 + 60), Verdict::Queued);
+    EXPECT_EQ(rel.on_alert(frames[6], 5, g, T0 + 60), Verdict::Queued);
+    rel.io().flush();
+    rel.drain_io();
+    EXPECT_EQ(acks.size(), 7u);
+    auto rows = read_lines(rd / "outbox.jsonl");
+    EXPECT_EQ(rows.size(), 7u);
+    std::set<std::string> ids;
+    for (const auto& r : rows) ids.insert(nlohmann::json::parse(r)["id"].get<std::string>());
+    EXPECT_EQ(ids.size(), 7u) << "no duplicate outbox row";
+    std::ifstream st(rd / "state.json");
+    auto j = nlohmann::json::parse(st);
+    EXPECT_EQ(j["accepted"].size(), 7u) << "the latest state (all ids) is on disk";
+}
+
+// Fix 6: the sidecar's expired.jsonl is fed back: the relay acks "expired" at
+// once and the origin records expired_at_relay without waiting out max age.
+TEST(DashAlertRelay, SidecarExpiredRowIsAckedExpiredPromptly)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    Mesh m;
+    m.add(1, origin_cfg(od, rkey.pubkey), okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    auto& o = *m.nodes[1].svc;
+    o.enqueue_event(offline_event("W.rig1", T0), T0);
+    const AlertFrame frame = o.pending().begin()->second.frame;
+    m.pump(T0);
+    ASSERT_TRUE(o.pending().begin()->second.queued_at_relay);
+    auto row = nlohmann::json::parse(read_lines(rd / "outbox.jsonl").at(0));
+    // Exactly the row shape the sidecar writes.
+    std::ofstream(rd / "expired.jsonl", std::ios::app)
+        << nlohmann::json{{"id", row["id"]}, {"event_ts", T0 - 7 * 3600}, {"ts", T0 + 5}}.dump() << "\n";
+    for (int64_t t = T0 + 5; t <= T0 + 10; t += 5) {
+        for (auto& [id, n] : m.nodes) n.svc->on_tick({}, t);
+        m.pump(t);
+    }
+    EXPECT_TRUE(o.pending().empty()) << "finalized within one tick, not after max_event_age";
+    EXPECT_EQ(o.counters().expired_at_relay, 1u);
+    EXPECT_EQ(o.counters().refused, 0u);
+    EXPECT_EQ(o.counters().lost_at_relay, 0u);
+    auto ledger = read_lines(od / "ledger.jsonl");
+    ASSERT_EQ(ledger.size(), 2u);
+    EXPECT_EQ(nlohmann::json::parse(ledger[1])["status"], "expired_at_relay");
+    auto& r = *m.nodes[3].svc;
+    EXPECT_EQ(r.counters().expired_sidecar, 1u);
+    EXPECT_EQ(r.counters().delivered_telegram, 0u);
+    r.publish_status(T0 + 10);
+    EXPECT_EQ(r.status_json()["relay"]["pending_sidecar"], 0u);
+
+    // Persisted: a restarted relay answers a re-probe "expired" and does not
+    // re-read (re-ack) the expired file.
+    std::vector<AckFrame> acks;
+    {
+        AlertRelayService rel(relay_cfg(rd, {okey.pubkey}), rkey, T0 + 20);
+        std::string err;
+        ASSERT_TRUE(rel.init(err));
+        rel.set_transport(capture_transport(acks));
+        rel.on_tick({}, T0 + 25);
+        EXPECT_TRUE(acks.empty()) << "expired_offset persisted: no second ack from the file";
+        PeerAlertGuard g;
+        EXPECT_EQ(rel.on_alert(frame, 9, g, T0 + 30), Verdict::Duplicate);
+        ASSERT_EQ(acks.size(), 1u);
+        EXPECT_EQ(acks[0].status, static_cast<uint8_t>(AckStatus::Expired));
+    }
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u);
+    EXPECT_EQ(ack_shape_error(acks[0]), nullptr) << "status 5 is a valid wire status";
+    EXPECT_EQ(wire_ack(acks[0]), acks[0]);
 }

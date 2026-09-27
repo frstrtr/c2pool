@@ -99,7 +99,18 @@ enum class AckStatus : uint8_t {
     RefusedNotAllowed = 2,   // origin pubkey not on the relay allowlist
     RefusedInvalid    = 3,   // stale timestamp / undecryptable body
     Queued            = 4,   // accepted into the relay outbox, sidecar not done yet
+    Expired           = 5,   // the sidecar dropped it as too old to page (expired.jsonl); final
 };
+
+// Final "not delivered" statuses. The origin honours one only for the nonce it
+// is currently sending: a late refusal of a superseded (re-issued) nonce must
+// not end an event whose current frame is still in flight.
+inline bool is_final_refusal(uint8_t s)
+{
+    return s == static_cast<uint8_t>(AckStatus::RefusedNotAllowed) ||
+           s == static_cast<uint8_t>(AckStatus::RefusedInvalid) ||
+           s == static_cast<uint8_t>(AckStatus::Expired);
+}
 
 inline const char* ack_status_name(uint8_t s)
 {
@@ -108,6 +119,7 @@ inline const char* ack_status_name(uint8_t s)
     case 2: return "refused_not_allowlisted";
     case 3: return "refused_invalid";
     case 4: return "queued_at_relay";
+    case 5: return "expired_at_relay";
     }
     return "unknown";
 }
@@ -370,10 +382,80 @@ struct AlertBody {
     bool operator==(const AlertBody&) const = default;
 };
 
-inline std::string clip(const std::string& s, std::size_t n) { return s.size() > n ? s.substr(0, n) : s; }
+// ── UTF-8 ───────────────────────────────────────────────────────────────────
+// Labels and worker names are operator / miner supplied and often non-ASCII
+// (Cyrillic worker names are common). Every string that reaches a JSON dump
+// (outbox row, state, ledger, status) or the wire body must be well-formed
+// UTF-8: nlohmann::json::dump() throws type_error.316 on a malformed sequence.
+
+// Length of the well-formed UTF-8 sequence starting at s[i] (RFC 3629: no
+// overlongs, no surrogates, <= U+10FFFF), or 0 when it is malformed/truncated.
+inline std::size_t utf8_seq_len(const std::string& s, std::size_t i)
+{
+    const auto c = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
+    const std::size_t n = s.size();
+    const unsigned char b0 = c(i);
+    if (b0 < 0x80) return 1;
+    auto cont = [&](std::size_t k) { return k < n && (c(k) & 0xC0) == 0x80; };
+    if (b0 >= 0xC2 && b0 <= 0xDF) return cont(i + 1) ? 2 : 0;
+    if (b0 >= 0xE0 && b0 <= 0xEF) {
+        if (!cont(i + 1) || !cont(i + 2)) return 0;
+        const unsigned char b1 = c(i + 1);
+        if (b0 == 0xE0 && b1 < 0xA0) return 0;   // overlong
+        if (b0 == 0xED && b1 > 0x9F) return 0;   // UTF-16 surrogate
+        return 3;
+    }
+    if (b0 >= 0xF0 && b0 <= 0xF4) {
+        if (!cont(i + 1) || !cont(i + 2) || !cont(i + 3)) return 0;
+        const unsigned char b1 = c(i + 1);
+        if (b0 == 0xF0 && b1 < 0x90) return 0;   // overlong
+        if (b0 == 0xF4 && b1 > 0x8F) return 0;   // > U+10FFFF
+        return 4;
+    }
+    return 0;
+}
+
+inline bool is_valid_utf8(const std::string& s)
+{
+    for (std::size_t i = 0; i < s.size(); ) {
+        const std::size_t l = utf8_seq_len(s, i);
+        if (l == 0) return false;
+        i += l;
+    }
+    return true;
+}
+
+// Replace every malformed byte with '?' (one byte for one byte, so a clip
+// applied afterwards sees the same length budget).
+inline std::string sanitize_utf8(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ) {
+        const std::size_t l = utf8_seq_len(s, i);
+        if (l == 0) { out.push_back('?'); ++i; continue; }
+        out.append(s, i, l);
+        i += l;
+    }
+    return out;
+}
+
+// Clip to at most n BYTES without splitting a code point. Input must be
+// well-formed UTF-8 (sanitize first); the result then is too.
+inline std::string clip_utf8(const std::string& s, std::size_t n)
+{
+    if (s.size() <= n) return s;
+    std::size_t cut = n;
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+    return s.substr(0, cut);
+}
+
+inline std::string clip(const std::string& s, std::size_t n) { return clip_utf8(sanitize_utf8(s), n); }
 
 inline Bytes encode_body(const AlertBody& b)
 {
+    // Sanitized, then clipped on a code-point boundary: what goes on the wire
+    // always passes decode_body()'s UTF-8 check.
     const std::string label = clip(b.label, kMaxLabel);
     const std::string worker = clip(b.worker, kMaxWorker);
     const std::string detail = clip(b.detail, kMaxDetail);
@@ -409,6 +491,9 @@ inline std::optional<AlertBody> decode_body(const Bytes& in)
     };
     if (!get(b.label, kMaxLabel) || !get(b.worker, kMaxWorker) || !get(b.detail, kMaxDetail)) return std::nullopt;
     if (p != in.size()) return std::nullopt;
+    // A conforming origin never sends malformed UTF-8 (encode_body sanitizes);
+    // such a body is refused (RefusedInvalid), never written to the outbox.
+    if (!is_valid_utf8(b.label) || !is_valid_utf8(b.worker) || !is_valid_utf8(b.detail)) return std::nullopt;
     return b;
 }
 
@@ -469,15 +554,16 @@ inline bool verify_ack_sig(const AckFrame& a)
                               a.signature.data(), a.signature.size());
 }
 
-// Build + seal + sign one alert from `origin` for `relay_pub`.
-inline std::optional<AlertFrame> build_alert(const KeyPair& origin, const Bytes& relay_pub,
-                                             const AlertBody& body, uint32_t ts, uint64_t nonce,
-                                             uint8_t hops = kDefaultHops,
-                                             const unsigned char* seal_nonce16 = nullptr)
+// Seal + sign an already-encoded body plaintext (build_alert's core; KATs use
+// it directly to put a non-conforming plaintext on the wire).
+inline std::optional<AlertFrame> build_alert_plaintext(const KeyPair& origin, const Bytes& relay_pub,
+                                                       const Bytes& plaintext, uint32_t ts, uint64_t nonce,
+                                                       uint8_t hops = kDefaultHops,
+                                                       const unsigned char* seal_nonce16 = nullptr)
 {
     auto shared = ecdh_shared(origin.seckey.data(), relay_pub);
     if (!shared) return std::nullopt;
-    auto sealed = seal_body(*shared, encode_body(body), seal_nonce16);
+    auto sealed = seal_body(*shared, plaintext, seal_nonce16);
     if (!sealed || sealed->size() > kMaxBodyBytes) return std::nullopt;
     AlertFrame f;
     f.version = kWireVersion;
@@ -491,6 +577,15 @@ inline std::optional<AlertFrame> build_alert(const KeyPair& origin, const Bytes&
     f.signature = dash::ecdsa_sign(h.data(), origin.seckey.data());
     if (f.signature.empty()) return std::nullopt;
     return f;
+}
+
+// Build + seal + sign one alert from `origin` for `relay_pub`.
+inline std::optional<AlertFrame> build_alert(const KeyPair& origin, const Bytes& relay_pub,
+                                             const AlertBody& body, uint32_t ts, uint64_t nonce,
+                                             uint8_t hops = kDefaultHops,
+                                             const unsigned char* seal_nonce16 = nullptr)
+{
+    return build_alert_plaintext(origin, relay_pub, encode_body(body), ts, nonce, hops, seal_nonce16);
 }
 
 inline std::optional<AckFrame> build_ack(const KeyPair& relay, const Bytes& origin_pub,
@@ -537,7 +632,7 @@ inline const char* ack_shape_error(const AckFrame& a)
     if (a.origin_pubkey.size() != kPubkeyLen) return "bad-origin-pubkey";
     if (a.relay_pubkey.size() != kPubkeyLen || (a.relay_pubkey[0] != 0x02 && a.relay_pubkey[0] != 0x03))
         return "bad-relay-pubkey";
-    if (a.status < 1 || a.status > 4) return "bad-status";
+    if (a.status < 1 || a.status > 5) return "bad-status";
     if (a.signature.size() < kMinSigBytes || a.signature.size() > kMaxSigBytes) return "bad-signature-size";
     return nullptr;
 }
@@ -605,6 +700,11 @@ struct NodeAlertSeen {
     uint64_t evicted{0};
 
     SeenEntry* find(const Bytes& origin, uint64_t nonce)
+    {
+        auto it = entries.find(AlertId{origin, nonce});
+        return it == entries.end() ? nullptr : &it->second;
+    }
+    const SeenEntry* find(const Bytes& origin, uint64_t nonce) const
     {
         auto it = entries.find(AlertId{origin, nonce});
         return it == entries.end() ? nullptr : &it->second;

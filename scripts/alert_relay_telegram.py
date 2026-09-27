@@ -4,7 +4,7 @@
 
 Runs next to a c2pool-dash node started with --alert-relay-telegram. The node
 appends every alert it accepts (signed + sealed by an allowlisted origin node,
-e.g. a DPI-bound hotel node, carried over the sharechain p2p) to
+e.g. a node behind restrictive egress, carried over the sharechain p2p) to
 
     <state-dir>/outbox.jsonl      (one JSON object per line, 0600)
 
@@ -22,8 +22,18 @@ exponential backoff (5 s -> 5 min; 429 honours retry_after) and never marked.
 A row whose event is older than --max-age (default 6 h, the origin's own
 give-up age) is NOT sent -- a page saying "rig OFFLINE at <two days ago>" helps
 nobody. It is logged once and recorded in <state-dir>/expired.jsonl (never in
-delivered.jsonl, so the node never acks it as delivered; the origin reports it
-as expired_at_relay).
+delivered.jsonl). The node polls expired.jsonl too and at once answers the
+origin with a signed "expired" ack, so the origin records expired_at_relay
+without waiting out its own max age.
+
+Destination: alerts go to ONE designated Telegram GROUP (or channel), given
+explicitly with --chat-id / --chat-id-file. There is no default, and the
+sidecar refuses to start without one. Group ids are negative (supergroups
+-100xxxxxxxxxx, basic groups -xxxxxxxxx); a positive id is a private chat
+with one user and is refused unless --allow-direct-chat is given. Numeric ids
+are sent as JSON integers, @channelname as a string (both are what the Bot API
+accepts for chat_id). How to add the bot to a group and read the group id:
+docs/design/d-miner-7-p2p-alert-relay.md, "Telegram group".
 
 Secrets: the bot token comes from $TELEGRAM_BOT_TOKEN or --token-file (0600).
 It is never logged: every log line passes through a redactor, and request
@@ -34,6 +44,7 @@ stdlib only. `--selftest` runs an in-process fake Telegram server (no network).
 
 import argparse
 import http.server
+import re
 import io
 import json
 import logging
@@ -82,6 +93,43 @@ class Redactor(logging.Filter):
         return True
 
 
+_CHAT_NUM = re.compile(r"^-?[1-9][0-9]{0,15}$")
+_CHAT_NAME = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{3,31}$")
+
+
+def parse_chat_id(raw, allow_direct=False):
+    """Validate one configured chat id. Returns (value, error).
+
+    value is an int for a numeric id (sent as a JSON integer, unchanged) or the
+    '@name' string for a public channel/supergroup username. A positive numeric
+    id is a private chat with a single user: refused unless allow_direct.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None, "empty chat id"
+    if _CHAT_NAME.match(text):
+        return text, None
+    if not _CHAT_NUM.match(text):
+        return None, "chat id %r is neither a numeric id (e.g. -1001234567890) nor @channelname" % text
+    value = int(text)
+    if value > 0 and not allow_direct:
+        return None, ("chat id %s is a private chat with one user, not a group; alerts go to a designated "
+                      "group (negative id, e.g. -100...) -- pass --allow-direct-chat to override" % text)
+    return value, None
+
+
+def resolve_chat_ids(raw_ids, allow_direct=False):
+    """Validate every configured id; returns (ids, errors). Duplicates dropped."""
+    ids, errors = [], []
+    for raw in raw_ids:
+        value, err = parse_chat_id(raw, allow_direct)
+        if err:
+            errors.append(err)
+        elif value not in ids:
+            ids.append(value)
+    return ids, errors
+
+
 def format_text(row):
     label = (row.get("label") or "").strip() or "c2pool"
     kind = row.get("kind", "")
@@ -108,6 +156,8 @@ class Sidecar:
         self.wall = wall             # wall clock (event_ts is unix time)
         self.token = token
         self.chat_ids = list(chat_ids)
+        if not self.chat_ids:
+            raise ValueError("no Telegram chat id configured (alerts need a designated group)")
         self.api_base = api_base.rstrip("/")
         self.max_per_min = max_per_min
         self.backoff_min = backoff_min
@@ -234,6 +284,12 @@ class Sidecar:
             obj = {}
         if status == 200 and obj.get("ok") is True:
             return True, None, "ok"
+        migrate = (obj.get("parameters") or {}).get("migrate_to_chat_id") if isinstance(obj, dict) else None
+        if migrate is not None:
+            # A basic group upgraded to a supergroup gets a new -100... id. The
+            # destination is configuration only: tell the operator, never switch.
+            LOG.error("chat %s was upgraded to a supergroup: set --chat-id %s (not switching automatically)",
+                      chat_id, migrate)
         retry_after = None
         if status == 429:
             retry_after = (obj.get("parameters") or {}).get("retry_after")
@@ -302,7 +358,7 @@ def read_token(args):
 
 
 def read_chat_ids(args):
-    ids = list(args.chat_id or [])
+    ids = [c for c in (args.chat_id or [])]
     if args.chat_id_file:
         with open(args.chat_id_file, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -319,8 +375,9 @@ class _FakeTelegram(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 - http.server API
         n = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(n) or b"{}")
-        type(self).calls.append({"path": self.path, "body": body})
+        raw = self.rfile.read(n) or b"{}"
+        body = json.loads(raw)
+        type(self).calls.append({"path": self.path, "body": body, "raw": raw.decode("utf-8")})
         status, obj = (type(self).script.pop(0) if type(self).script else (200, {"ok": True, "result": {}}))
         data = json.dumps(obj).encode()
         self.send_response(status)
@@ -354,8 +411,9 @@ def selftest():
     with tempfile.TemporaryDirectory() as d:
         clock = [1000.0]
         wall = lambda: 1790000000 + 600 + (clock[0] - 1000.0)   # rows below are ~10 min old
-        sc = Sidecar(d, token, ["42"], api_base=base, backoff_min=5, clock=lambda: clock[0], wall=wall)
-        row = {"id": "02ab:1", "kind": "offline", "label": "hotel", "worker": "XaddrABC.rig1",
+        group = -1001234567890                  # a supergroup id, as Telegram reports it
+        sc = Sidecar(d, token, [group], api_base=base, backoff_min=5, clock=lambda: clock[0], wall=wall)
+        row = {"id": "02ab:1", "kind": "offline", "label": "farm-1", "worker": "XaddrABC.rig1",
                "detail": "disconnected; down 5m", "event_ts": 1790000000}
         with open(os.path.join(d, "outbox.jsonl"), "w") as fh:
             fh.write(json.dumps(row) + "\n")
@@ -368,7 +426,9 @@ def selftest():
         check(call["path"] == "/bot%s/sendMessage" % token, "Bot API path shape")
         check("rig1" in call["body"]["text"] and "OFFLINE" in call["body"]["text"], "text carries worker + OFFLINE")
         check("parse_mode" not in call["body"], "plain text, no parse_mode")
-        check(call["body"]["chat_id"] == "42", "chat id forwarded")
+        check(call["body"]["chat_id"] == group and isinstance(call["body"]["chat_id"], int),
+              "negative group id forwarded as a JSON integer")
+        check('"chat_id": -1001234567890' in call["raw"], "request body carries the group id unchanged")
         sc.step()
         check(len(_FakeTelegram.calls) == 1, "no second send after delivery")
         with open(os.path.join(d, "delivered.jsonl")) as fh:
@@ -410,19 +470,19 @@ def selftest():
         check(len(_FakeTelegram.calls) == 6, "exactly 6 HTTP calls in total")
 
         # (d) restart: a fresh sidecar re-reads delivered.jsonl and sends nothing
-        sc2 = Sidecar(d, token, ["42"], api_base=base, clock=lambda: clock[0], wall=wall)
+        sc2 = Sidecar(d, token, [group], api_base=base, clock=lambda: clock[0], wall=wall)
         sc2.step()
         check(len(_FakeTelegram.calls) == 6, "restart does not resend delivered rows")
 
         # (e) network error -> retried, not marked
-        sc3 = Sidecar(d, token, ["42"], api_base="http://127.0.0.1:1", clock=lambda: clock[0], wall=wall)
+        sc3 = Sidecar(d, token, [group], api_base="http://127.0.0.1:1", clock=lambda: clock[0], wall=wall)
         with open(os.path.join(d, "outbox.jsonl"), "a") as fh:
             fh.write(json.dumps(dict(row, id="02ab:4")) + "\n")
         sc3.step()
         check("02ab:4" not in sc3.delivered, "connection refused -> not marked")
 
         # (f) a row older than --max-age is never sent, recorded as expired, not delivered
-        sc4 = Sidecar(d, token, ["42"], api_base=base, clock=lambda: clock[0], wall=wall)
+        sc4 = Sidecar(d, token, [group], api_base=base, clock=lambda: clock[0], wall=wall)
         sc4.read_outbox()
         sc4.pending.clear(); sc4.order.clear()        # only the new row below matters here
         old = dict(row, id="02ab:5", event_ts=int(wall()) - 7 * 3600)
@@ -436,12 +496,12 @@ def selftest():
         with open(os.path.join(d, "delivered.jsonl")) as fh:
             dl = [json.loads(l)["id"] for l in fh if l.strip()]
         check(ex == ["02ab:5"] and "02ab:5" not in dl, "stale row -> expired.jsonl, never delivered.jsonl")
-        sc5 = Sidecar(d, token, ["42"], api_base=base, clock=lambda: clock[0], wall=wall)
+        sc5 = Sidecar(d, token, [group], api_base=base, clock=lambda: clock[0], wall=wall)
         sc5.read_outbox()
         check("02ab:5" not in sc5.pending, "restart does not pick an expired row up again")
 
         # (g) a row that ages out while it is being retried is dropped, not paged late
-        sc6 = Sidecar(d, token, ["42"], api_base=base, backoff_min=5, clock=lambda: clock[0], wall=wall,
+        sc6 = Sidecar(d, token, [group], api_base=base, backoff_min=5, clock=lambda: clock[0], wall=wall,
                       max_age=100)
         sc6.read_outbox()
         sc6.pending.clear(); sc6.order.clear()
@@ -456,6 +516,52 @@ def selftest():
         sc6.step()
         check(len(_FakeTelegram.calls) == n0 + 1 and "02ab:6" in sc6.expired, "aged out during retry -> expired, no late page")
 
+        # (h) the node-facing contract of expired.jsonl: one {"id": ...} per line,
+        # newline-terminated (the node polls it and acks "expired" at once)
+        with open(os.path.join(d, "expired.jsonl"), "rb") as fh:
+            raw = fh.read()
+        rows = [json.loads(l) for l in raw.split(b"\n") if l.strip()]
+        check(raw.endswith(b"\n") and all(isinstance(r.get("id"), str) for r in rows) and len(rows) == 2,
+              "expired.jsonl rows are complete lines with a string id (read back by the node)")
+
+    # (i) destination = one designated group, configuration only
+    check(parse_chat_id("-1001234567890") == (-1001234567890, None), "supergroup id accepted as an integer")
+    check(parse_chat_id("-987654321") == (-987654321, None), "basic group id accepted")
+    check(parse_chat_id("@c2pool_alerts") == ("@c2pool_alerts", None), "@channelname accepted as a string")
+    check(parse_chat_id("42")[1] is not None, "positive (private chat) id refused by default")
+    check(parse_chat_id("42", allow_direct=True) == (42, None), "--allow-direct-chat permits a private chat")
+    check(all(parse_chat_id(x)[1] for x in ("", "  ", "-100abc", "1e9", "--5", "-0", "0")),
+          "malformed ids refused")
+    try:
+        Sidecar(tempfile.gettempdir(), token, [], api_base=base)
+        check(False, "Sidecar without a chat id refuses to construct")
+    except ValueError:
+        check(True, "Sidecar without a chat id refuses to construct")
+    with tempfile.TemporaryDirectory() as d2:
+        old_env = os.environ.get("TELEGRAM_BOT_TOKEN")
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
+        try:
+            check(main(["--state-dir", d2, "--once"]) == 2, "CLI refuses to start without --chat-id")
+            check(main(["--state-dir", d2, "--once", "--chat-id", "42"]) == 2,
+                  "CLI refuses a private-chat id without --allow-direct-chat")
+            with open(os.path.join(d2, "outbox.jsonl"), "w") as fh:
+                fh.write(json.dumps(dict(id="02ab:9", kind="test", label="farm-1", worker="",
+                                         detail="alert relay test", event_ts=int(time.time()))) + "\n")
+            cid = os.path.join(d2, "chat.id")
+            with open(cid, "w") as fh:
+                fh.write("# designated alert group\n-1001234567890\n")
+            n0 = len(_FakeTelegram.calls)
+            _FakeTelegram.script = []
+            rc = main(["--state-dir", d2, "--once", "--chat-id-file", cid, "--telegram-api-base", base])
+            sent = _FakeTelegram.calls[n0:]
+            check(rc == 0 and len(sent) == 1 and '"chat_id": -1001234567890' in sent[0]["raw"],
+                  "CLI --chat-id-file: one POST to the group id, unchanged")
+        finally:
+            if old_env is None:
+                os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            else:
+                os.environ["TELEGRAM_BOT_TOKEN"] = old_env
+
     srv.shutdown()
     logs = log_buf.getvalue()
     check(token not in logs and "SELFTEST-SECRET" not in logs, "token never appears in log output")
@@ -465,12 +571,15 @@ def selftest():
     return 0 if fails == 0 else 1
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--state-dir", help="the node's alert_relay state dir (holds outbox.jsonl)")
     ap.add_argument("--token-file", help="file holding the bot token (else $TELEGRAM_BOT_TOKEN)")
-    ap.add_argument("--chat-id", action="append", help="Telegram chat id (repeatable)")
-    ap.add_argument("--chat-id-file", help="file with one chat id per line")
+    ap.add_argument("--chat-id", action="append",
+                    help="the designated Telegram GROUP id, e.g. -1001234567890 (or @channelname); required")
+    ap.add_argument("--chat-id-file", help="file with the group id (one id per line, # comments)")
+    ap.add_argument("--allow-direct-chat", action="store_true",
+                    help="also accept a positive (private one-user chat) id; off by default")
     ap.add_argument("--telegram-api-base", default="https://api.telegram.org",
                     help="Bot API base URL (override for a local fake endpoint in tests)")
     ap.add_argument("--poll", type=float, default=5.0, help="seconds between outbox polls")
@@ -480,7 +589,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.selftest:
         return selftest()
@@ -496,9 +605,18 @@ def main():
     if not token:
         LOG.error("no bot token: set TELEGRAM_BOT_TOKEN or --token-file")
         return 2
-    chats = read_chat_ids(args)
-    if not chats:
-        LOG.error("no chat id: pass --chat-id or --chat-id-file")
+    try:
+        raw_chats = read_chat_ids(args)
+    except OSError as e:
+        LOG.error("cannot read --chat-id-file: %s", e)
+        return 2
+    chats, errors = resolve_chat_ids(raw_chats, args.allow_direct_chat)
+    for err in errors:
+        LOG.error("%s", err)
+    if errors or not chats:
+        if not raw_chats:
+            LOG.error("no chat id: alerts go to a designated Telegram group -- pass --chat-id -100... "
+                      "or --chat-id-file (see docs/design/d-miner-7-p2p-alert-relay.md, 'Telegram group')")
         return 2
     sc = Sidecar(args.state_dir, token, chats, api_base=args.telegram_api_base,
                  max_per_min=args.max_per_min, max_age=args.max_age)
