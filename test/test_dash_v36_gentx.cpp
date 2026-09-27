@@ -466,7 +466,9 @@ TEST(DashV36DecayedWeights, TrackerWindowQueriesThePrimedCacheKey) {
 
     const auto primed = tracker.get_v36_decayed_cumulative_weights(
         s2, static_cast<int32_t>(SharechainConfig::chain_length()), dash::v36_pplns::unlimited_weight());
-    EXPECT_EQ(tracker.v36_pplns_window(s2).weights, dash::v36_pplns_window(tracker.chain, s2).weights);
+    // (No tracker.v36_pplns_window call before the change: it would refill the
+    // single-entry cache under whatever key it uses and mask a key mismatch.)
+    EXPECT_EQ(primed.weights, dash::v36_pplns_window(tracker.chain, s2).weights);
 
     tracker.chain.get_share(s1).invoke([](auto* obj) { obj->m_donation = 0x4000; });
     const auto via_tracker = tracker.v36_pplns_window(s2);
