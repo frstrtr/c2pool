@@ -167,6 +167,86 @@ struct SharechainConfig
 
     static bool has_custom_network_id() { return !override_identifier_hex.empty(); }
 
+    // ---- Private/isolated DASH v36 sharechain profile ---------------------
+    // A custom --network-id selects the private/isolated DASH v36 sharechain
+    // profile: a sharechain that no p2pool-dash node can join (the identifier
+    // is committed in every ref_hash), so it is free to start at share v36 from
+    // genesis. The public network (no flag, or any all-'0' spelling, see
+    // is_public_network_id) is NEVER isolated_v36 and stays the v16,
+    // p2pool-dash compatible chain.
+    //
+    // The profile is DERIVED from override_identifier_hex (no state of its own),
+    // so set_network_id / reset_network_id drive it and it can never disagree
+    // with has_custom_network_id().
+    static bool isolated_v36() { return has_custom_network_id(); }
+
+    /// Per-network share parameters. DEFINED here as the single source of
+    /// truth; each field is consumed by a later slice, so on its own this
+    /// struct flips NO minting / validation / handshake behaviour. Consumers:
+    ///   target_share_version           -> params.hpp current_share_version and
+    ///                                     the mint path desired_version
+    ///                                     (mint_runloop.hpp, share_producer_bind.hpp)
+    ///                                     [flip slice; until then BOTH profiles
+    ///                                     mint and verify v16]
+    ///   ratchet_floor_protocol_version -> node.hpp runtime accept-floor seed
+    ///                                     (m_runtime_min_protocol_version)
+    ///                                     [flip slice]. NOT CoinParams::
+    ///                                     minimum_protocol_version, which stays
+    ///                                     the cold 1700 floor on both profiles.
+    ///   advertised_protocol_version    -> equals CoinParams::advertised_protocol_version
+    ///                                     on both profiles (pinned by KAT).
+    ///   v36_donation_p2pkh             -> params.hpp donation_script_func: on the
+    ///                                     isolated chain a v36 share pays the
+    ///                                     P2PKH DONATION_SCRIPT, not the COMBINED
+    ///                                     P2SH (wired in this slice; inert because
+    ///                                     nothing mints or verifies v36 yet).
+    ///   maintainer_only_authority      -> share_messages.hpp authority_pubkeys()
+    ///                                     for decrypt/validate of message_data
+    ///                                     [v36 ref-stream slice].
+    ///   future_timestamp_bound         -> share_init_verify(DashV36Share)
+    ///                                     now+600 bound [future-timestamp slice].
+    ///   emergency_decay                -> v36 time-decay retarget on the producer
+    ///                                     side [flip slice].
+    struct ShareProfile
+    {
+        uint32_t target_share_version;
+        uint32_t ratchet_floor_protocol_version;
+        uint32_t advertised_protocol_version;
+        bool     v36_donation_p2pkh;
+        bool     maintainer_only_authority;
+        bool     future_timestamp_bound;
+        bool     emergency_decay;
+    };
+
+    static constexpr ShareProfile PUBLIC_PROFILE{
+        /*target_share_version=*/16,
+        /*ratchet_floor_protocol_version=*/MINIMUM_PROTOCOL_VERSION,
+        /*advertised_protocol_version=*/ADVERTISED_PROTOCOL_VERSION,
+        /*v36_donation_p2pkh=*/false,
+        /*maintainer_only_authority=*/false,
+        /*future_timestamp_bound=*/false,
+        /*emergency_decay=*/false,
+    };
+    static constexpr ShareProfile ISOLATED_V36_PROFILE{
+        /*target_share_version=*/36,
+        /*ratchet_floor_protocol_version=*/NEW_MINIMUM_PROTOCOL_VERSION,
+        /*advertised_protocol_version=*/ADVERTISED_PROTOCOL_VERSION,
+        /*v36_donation_p2pkh=*/true,
+        /*maintainer_only_authority=*/true,
+        /*future_timestamp_bound=*/true,
+        /*emergency_decay=*/true,
+    };
+
+    /// The active per-network share profile. Read LIVE from the process-global
+    /// identity, so it is only coherent under the same ordering contract as the
+    /// identifier: main() sets the identity ONCE before any dispatch. A consumer
+    /// that snapshots it (make_coin_params) and one that reads it live agree
+    /// only under that ordering.
+    static const ShareProfile& share_profile()
+    {
+        return isolated_v36() ? ISOLATED_V36_PROFILE : PUBLIC_PROFILE;
+    }
+
     static const std::string& identifier_hex()
     {
         if (!override_identifier_hex.empty())

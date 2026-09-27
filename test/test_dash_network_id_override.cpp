@@ -17,7 +17,13 @@
 //       legacy "dash"/"dash_testnet" with no flag and "<legacy>_<id>" with one,
 //       and a share persisted through the production SharechainStorage under
 //       identity A is invisible to a node configured with identity B (or with
-//       no flag), while A still finds it after switching back.
+//       no flag), while A still finds it after switching back;
+//   (f) the private/isolated DASH v36 sharechain profile: keyed on the custom
+//       network id, exposes the v36 targets (share version 36, ratchet seed
+//       3600, P2PKH v36 donation, maintainer-only message authority, future-
+//       timestamp bound, emergency decay) while NOTHING consumes them yet:
+//       current_share_version stays 16 on both profiles, and every no-flag
+//       CoinParams field is pinned byte-identical to master.
 //
 // OWN EXECUTABLE ON PURPOSE: the override lives in process-global statics.
 // test_dash_share_hash_link / test_dash_conformance hold goldens on the DEFAULT
@@ -35,8 +41,10 @@
 #include <impl/dash/share_chain.hpp>
 #include <impl/dash/share_check.hpp>
 #include <impl/dash/share_producer.hpp>
+#include <impl/dash/share_messages.hpp>  // authority_pubkeys, hash160
 
 #include <core/coin_params.hpp>
+#include <core/version_gate.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
@@ -47,6 +55,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -184,6 +193,100 @@ std::vector<unsigned char> ref_stream_bytes(const core::CoinParams& params,
         reinterpret_cast<const unsigned char*>(s.data()) + s.size());
 }
 
+// ── (f) goldens: independent literal transcriptions ────────────────────────
+// DASH P2PKH DONATION_SCRIPT (oracle p2pool-dash data.py; share_check.hpp).
+constexpr const char* P2PKH_DONATION_HEX =
+    "76a914" "20cb5c22b1e4d5947e5c112c7696b51ad9af3c61" "88ac";
+// Unified cross-coin v36 COMBINED P2SH (test_dash_donation_combined.cpp).
+constexpr const char* COMBINED_DONATION_HEX =
+    "a914" "8c6272621d89e8fa526dd86acff60c7136be8e85" "87";
+// hash160 of the maintainer authority key == the P2PKH payee above.
+constexpr const char* MAINTAINER_HASH160_HEX = "20cb5c22b1e4d5947e5c112c7696b51ad9af3c61";
+
+// DASH mainnet genesis header -> X11 (main_dash.cpp selftest check_coin_params).
+std::string x11_genesis_hex(const core::CoinParams& p) {
+    unsigned char hdr[80];
+    const uint32_t version = 1, time = 1390095618u, bits = 0x1e0ffff0u, nonce = 28917698u;
+    uint256 prev;  prev.SetHex("0000000000000000000000000000000000000000000000000000000000000000");
+    uint256 merk;  merk.SetHex("e0028eb9648db56b1ac77cf090b99048a8007e2bb64b68f092c03c7f56a662c7");
+    size_t off = 0;
+    std::memcpy(hdr + off, &version, 4);     off += 4;
+    std::memcpy(hdr + off, prev.data(), 32); off += 32;
+    std::memcpy(hdr + off, merk.data(), 32); off += 32;
+    std::memcpy(hdr + off, &time, 4);        off += 4;
+    std::memcpy(hdr + off, &bits, 4);        off += 4;
+    std::memcpy(hdr + off, &nonce, 4);
+    return p.pow_func(std::span<const unsigned char>(hdr, 80)).GetHex();
+}
+
+// Every CoinParams field make_coin_params() fills, pinned to master's values.
+// `isolated` relaxes ONLY what the private/isolated profile is allowed to move
+// in this slice: the identifier/prefix slots (network id override) and the
+// v36+ donation arm (P2PKH instead of COMBINED). Everything else, including
+// current_share_version and both protocol-version fields, must match master
+// on BOTH profiles.
+void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, bool isolated) {
+    SCOPED_TRACE(std::string(testnet ? "testnet" : "mainnet") + (isolated ? " isolated" : " public"));
+    EXPECT_EQ(p.symbol, "DASH");
+    EXPECT_EQ(p.block_period, 150u);
+    EXPECT_EQ(p.address_version,      testnet ? 140 : 76);
+    EXPECT_EQ(p.address_p2sh_version, testnet ? 19 : 16);
+    EXPECT_EQ(p.address_p2sh_version2, 0);
+    EXPECT_EQ(p.bech32_hrp, "");
+    EXPECT_EQ(p.dust_threshold, 100000u);
+    EXPECT_TRUE(p.softforks_required.empty());
+    EXPECT_EQ(p.segwit_activation_version, 0u);
+    EXPECT_EQ(p.p2p_port,    testnet ? 18999 : 8999);
+    EXPECT_EQ(p.worker_port, testnet ? 17903 : 7903);
+    EXPECT_EQ(p.share_period, 20u);
+    EXPECT_EQ(p.chain_length, 4320u);
+    EXPECT_EQ(p.real_chain_length, 4320u);
+    EXPECT_EQ(p.target_lookbehind, 100u);
+    EXPECT_EQ(p.spread, 10u);
+    EXPECT_EQ(p.minimum_protocol_version, 1700u);
+    EXPECT_EQ(p.advertised_protocol_version, 3600u);
+    EXPECT_EQ(p.block_max_size, 0u);
+    EXPECT_EQ(p.block_max_weight, 0u);
+    EXPECT_EQ(p.max_target.GetHex(), testnet
+        ? "00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        : "00000000ffff0000000000000000000000000000000000000000000000000000");
+    if (!isolated) {
+        EXPECT_EQ(p.identifier_hex,         MAIN_ID);
+        EXPECT_EQ(p.prefix_hex,             MAIN_PFX);
+        EXPECT_EQ(p.testnet_identifier_hex, TEST_ID);
+        EXPECT_EQ(p.testnet_prefix_hex,     TEST_PFX);
+    }
+    EXPECT_TRUE(p.bootstrap_addrs.empty());
+    ASSERT_TRUE(static_cast<bool>(p.donation_script_func));
+    for (int64_t v : {0, 1, 15, 16, 17, 35})
+        EXPECT_EQ(hex_of_bytes(p.donation_script_func(v)), P2PKH_DONATION_HEX) << "v=" << v;
+    for (int64_t v : {36, 37, 3600})
+        EXPECT_EQ(hex_of_bytes(p.donation_script_func(v)),
+                  isolated ? P2PKH_DONATION_HEX : COMBINED_DONATION_HEX) << "v=" << v;
+    EXPECT_EQ(p.current_share_version, 16u);
+    EXPECT_EQ(p.is_testnet, testnet);
+    // Vardiff: make_coin_params leaves the CoinParams defaults.
+    EXPECT_DOUBLE_EQ(p.vardiff.target_share_rate, 3.0);
+    EXPECT_EQ(p.vardiff.shares_trigger, 12u);
+    EXPECT_DOUBLE_EQ(p.vardiff.timeout_mult, 10.0);
+    EXPECT_EQ(p.vardiff.quickup_shares, 0u);
+    EXPECT_DOUBLE_EQ(p.vardiff.quickup_divisor, 3.0);
+    EXPECT_DOUBLE_EQ(p.vardiff.min_adjust, 0.1);
+    EXPECT_DOUBLE_EQ(p.vardiff.max_adjust, 10.0);
+    EXPECT_FALSE(p.vardiff.use_full_window);
+    // Subsidy: 5 DASH, -1/14 per 210240 blocks, keyed on (height + 1).
+    ASSERT_TRUE(static_cast<bool>(p.subsidy_func));
+    EXPECT_EQ(p.subsidy_func(0),      500000000u);
+    EXPECT_EQ(p.subsidy_func(210238), 500000000u);
+    EXPECT_EQ(p.subsidy_func(210239), 464285715u);
+    EXPECT_EQ(p.subsidy_func(210240), 464285715u);
+    // X11 work AND block identity (genesis hash).
+    ASSERT_TRUE(static_cast<bool>(p.pow_func));
+    ASSERT_TRUE(static_cast<bool>(p.block_hash_func));
+    EXPECT_EQ(x11_genesis_hex(p),
+              "00000ffd590b1485b3caadc19b22e6379c733355108f107a430458cdf3407ab6");
+}
+
 } // namespace
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -249,6 +352,9 @@ TEST(DashNetworkIdOverride, OverrideChangesPrefixAndRefHashStream) {
     const auto pm = dash::make_coin_params(false);
     EXPECT_EQ(pm.active_identifier_hex(), "0d3a5c0920263617");
     EXPECT_EQ(pm.active_prefix_hex(),     "00000badc0ffee11");
+    // The private/isolated chain still runs v16 until the flip slice: the
+    // share built and self-verified below is a v16 DashShare.
+    EXPECT_EQ(pm.current_share_version, 16u);
 
     // Ref stream: ONLY the 8 identifier bytes moved; share_info tail identical.
     const auto info = fixture_f1_info();
@@ -477,4 +583,174 @@ TEST(DashNetworkIdOverride, PersistedShareDoesNotCrossIdentities) {
 
     core::filesystem::set_data_dir({});
     fs::remove_all(root, ec);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (f) Private/isolated DASH v36 sharechain profile.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Byte-identity PROOF for the public path: every make_coin_params field on the
+// no-flag path equals master's literal value. Green on the base revision by
+// design (it pins master); it fails if this slice (or any later one) moves a
+// public CoinParams field.
+TEST(DashNetworkIdOverride, NoFlagCoinParamsByteIdenticalToMaster) {
+    IdentityGuard g;
+    ASSERT_FALSE(SharechainConfig::has_custom_network_id());
+    expect_coin_params_master_fields(dash::make_coin_params(false), false, false);
+    expect_coin_params_master_fields(dash::make_coin_params(true),  true,  false);
+
+    // pool.yaml overrides stay the only tunables, and only the three fields.
+    dash::PoolOverrides o;
+    o.p2p_port = 1234; o.worker_port = 5678; o.bootstrap_addrs = std::vector<std::string>{"a:1"};
+    const auto po = dash::make_coin_params(false, o);
+    EXPECT_EQ(po.p2p_port, 1234);
+    EXPECT_EQ(po.worker_port, 5678);
+    ASSERT_EQ(po.bootstrap_addrs.size(), 1u);
+    EXPECT_EQ(po.current_share_version, 16u);
+    EXPECT_EQ(hex_of_bytes(po.donation_script_func(36)), COMBINED_DONATION_HEX);
+
+    // F1 ref stream / ref hash on the no-flag path (unchanged golden).
+    const auto pm = dash::make_coin_params(false);
+    const auto info = fixture_f1_info();
+    EXPECT_EQ(hex_of_bytes(ref_stream_bytes(pm, info)), F1_REF_STREAM_HEX);
+    EXPECT_EQ(hex_of(dash::producer::compute_ref_hash(pm, info)), F1_REF_HASH_HEX);
+}
+
+TEST(DashNetworkIdOverride, IsolatedProfileIsKeyedOnCustomNetworkId) {
+    IdentityGuard g;
+    EXPECT_FALSE(SharechainConfig::isolated_v36());
+
+    // Every spelling of the public network is NEVER isolated.
+    for (const char* v : {"", "0", "00", "000", "0000", "00000000",
+                          "0000000000000000", "00000000000000000"}) {
+        SCOPED_TRACE(std::string("id=\"") + v + "\"");
+        SharechainConfig::set_network_id(v, "");
+        EXPECT_FALSE(SharechainConfig::isolated_v36());
+        SharechainConfig::set_network_id(v, "0badc0ffee11");
+        EXPECT_FALSE(SharechainConfig::isolated_v36());
+    }
+
+    for (bool testnet : {false, true}) {
+        SCOPED_TRACE(testnet ? "testnet" : "mainnet");
+        SharechainConfig::reset_network_id();
+        SharechainConfig::is_testnet = testnet;
+        EXPECT_FALSE(SharechainConfig::isolated_v36());
+        SharechainConfig::set_network_id("abcd");
+        EXPECT_TRUE(SharechainConfig::isolated_v36());
+        EXPECT_EQ(SharechainConfig::isolated_v36(), SharechainConfig::has_custom_network_id());
+        SharechainConfig::reset_network_id();
+        EXPECT_FALSE(SharechainConfig::isolated_v36());
+    }
+}
+
+TEST(DashNetworkIdOverride, PublicProfileIsTheV16Baseline) {
+    IdentityGuard g;
+    const auto& prof = SharechainConfig::share_profile();
+    EXPECT_EQ(&prof, &SharechainConfig::PUBLIC_PROFILE);
+    EXPECT_EQ(prof.target_share_version, 16u);
+    EXPECT_EQ(prof.ratchet_floor_protocol_version, 1700u);
+    EXPECT_EQ(prof.advertised_protocol_version, 3600u);
+    EXPECT_FALSE(prof.v36_donation_p2pkh);
+    EXPECT_FALSE(prof.maintainer_only_authority);
+    EXPECT_FALSE(prof.future_timestamp_bound);
+    EXPECT_FALSE(prof.emergency_decay);
+
+    // The public profile agrees with what the public CoinParams already carry.
+    for (bool testnet : {false, true}) {
+        const auto p = dash::make_coin_params(testnet);
+        EXPECT_EQ(p.current_share_version,       prof.target_share_version);
+        EXPECT_EQ(p.minimum_protocol_version,    prof.ratchet_floor_protocol_version);
+        EXPECT_EQ(p.advertised_protocol_version, prof.advertised_protocol_version);
+    }
+}
+
+TEST(DashNetworkIdOverride, IsolatedProfileExposesV36Targets) {
+    IdentityGuard g;
+    SharechainConfig::set_network_id("d3a5c0920263617", "0badc0ffee11");
+    const auto& prof = SharechainConfig::share_profile();
+    EXPECT_EQ(&prof, &SharechainConfig::ISOLATED_V36_PROFILE);
+    EXPECT_EQ(prof.target_share_version, 36u);
+    EXPECT_EQ(prof.ratchet_floor_protocol_version, 3600u);
+    EXPECT_EQ(prof.advertised_protocol_version, 3600u);
+    EXPECT_TRUE(prof.v36_donation_p2pkh);
+    EXPECT_TRUE(prof.maintainer_only_authority);
+    EXPECT_TRUE(prof.future_timestamp_bound);
+    EXPECT_TRUE(prof.emergency_decay);
+
+    for (bool testnet : {false, true}) {
+        const auto p = dash::make_coin_params(testnet);
+        // FLIP TRIPWIRE (intentionally inverted by the flip slice): the target
+        // is declared 36 but NOT consumed yet, so the isolated chain still
+        // mints and verifies v16 shares.
+        EXPECT_EQ(p.current_share_version, 16u);
+        // The cold floor stays 1700 (the 3600 seed goes to the node runtime,
+        // not into CoinParams); the advert is 3600 on both profiles.
+        EXPECT_EQ(p.minimum_protocol_version, 1700u);
+        EXPECT_EQ(p.advertised_protocol_version, prof.advertised_protocol_version);
+        // Identity behaviour unchanged by the profile.
+        EXPECT_EQ(p.active_identifier_hex(), "0d3a5c0920263617");
+        EXPECT_EQ(p.active_prefix_hex(),     "00000badc0ffee11");
+        // Every other field is master's (identifier slots + v36 donation arm
+        // are the only profile-dependent ones).
+        expect_coin_params_master_fields(p, testnet, /*isolated=*/true);
+    }
+
+    SharechainConfig::reset_network_id();
+    EXPECT_EQ(&SharechainConfig::share_profile(), &SharechainConfig::PUBLIC_PROFILE);
+}
+
+TEST(DashNetworkIdOverride, IsolatedV36DonationIsP2PKHPublicIsCombined) {
+    IdentityGuard g;
+    ASSERT_TRUE(core::version_gate::is_v36_active(36u));
+    ASSERT_FALSE(core::version_gate::is_v36_active(35u));
+
+    SharechainConfig::set_network_id("abcd");
+    const auto iso_main = dash::make_coin_params(false);
+    const auto iso_test = dash::make_coin_params(true);
+    for (const auto* p : {&iso_main, &iso_test}) {
+        EXPECT_EQ(p->donation_script_func(36), dash::DONATION_SCRIPT);
+        EXPECT_EQ(p->donation_script_func(16), dash::DONATION_SCRIPT);
+        EXPECT_NE(p->donation_script_func(36), dash::COMBINED_DONATION_SCRIPT);
+    }
+
+    SharechainConfig::reset_network_id();
+    const auto pub = dash::make_coin_params(false);
+    EXPECT_EQ(pub.donation_script_func(36), dash::COMBINED_DONATION_SCRIPT);
+    EXPECT_EQ(pub.donation_script_func(16), dash::DONATION_SCRIPT);
+
+    // Snapshot semantics (same contract as the copied identifier): params built
+    // under the flag keep the P2PKH v36 arm after the identity is cleared.
+    EXPECT_EQ(iso_main.donation_script_func(36), dash::DONATION_SCRIPT);
+    EXPECT_EQ(iso_main.active_identifier_hex(), "000000000000abcd");
+}
+
+TEST(DashNetworkIdOverride, IsolatedAuthoritySetIsMaintainerOnlyAndPaysTheDonationScript) {
+    IdentityGuard g;
+    const auto iso = dash::authority_pubkeys(true);
+    ASSERT_EQ(iso.size(), 1u);
+    EXPECT_EQ(iso[0], &dash::DONATION_PUBKEY_MAINTAINER());
+
+    const auto pub = dash::authority_pubkeys(false);
+    ASSERT_EQ(pub.size(), 2u);
+    EXPECT_EQ(pub.data(), dash::DONATION_AUTHORITY_PUBKEYS().data());
+    EXPECT_EQ(pub[0], &dash::DONATION_PUBKEY_FORRESTV());
+    EXPECT_EQ(pub[1], &dash::DONATION_PUBKEY_MAINTAINER());
+
+    // The selector follows the profile flag.
+    EXPECT_EQ(dash::authority_pubkeys(SharechainConfig::share_profile().maintainer_only_authority).size(), 2u);
+    SharechainConfig::set_network_id("abcd");
+    EXPECT_EQ(dash::authority_pubkeys(SharechainConfig::share_profile().maintainer_only_authority).size(), 1u);
+
+    // Coherence: the sole isolated authority key IS the P2PKH donation payee.
+    const auto& mk = dash::DONATION_PUBKEY_MAINTAINER();
+    const auto mh = dash::hash160(mk.data(), mk.size());
+    const std::vector<unsigned char> mhv(mh.begin(), mh.end());
+    EXPECT_EQ(hex_of_bytes(mhv), MAINTAINER_HASH160_HEX);
+    ASSERT_EQ(dash::DONATION_SCRIPT.size(), 25u);
+    const std::vector<unsigned char> payee(dash::DONATION_SCRIPT.begin() + 3,
+                                           dash::DONATION_SCRIPT.begin() + 23);
+    EXPECT_EQ(mhv, payee);
+    const auto& fk = dash::DONATION_PUBKEY_FORRESTV();
+    const auto fh = dash::hash160(fk.data(), fk.size());
+    EXPECT_NE(std::vector<unsigned char>(fh.begin(), fh.end()), payee);
 }

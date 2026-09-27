@@ -24,6 +24,7 @@
 #include <cstring>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,30 @@ inline const std::array<const AuthorityPubkey*, 2>& DONATION_AUTHORITY_PUBKEYS()
         &DONATION_PUBKEY_MAINTAINER(),
     };
     return keys;
+}
+
+// Authority set of the private/isolated DASH v36 sharechain (--network-id):
+// the maintainer key ONLY. hash160(DONATION_PUBKEY_MAINTAINER) is the 20-byte
+// payee inside the DASH P2PKH DONATION_SCRIPT (share_check.hpp), which is also
+// the v36 donation payee on that chain, so the sole message authority is the
+// donation payee. The public chain keeps the 2-key COMBINED set above.
+inline const std::array<const AuthorityPubkey*, 1>& ISOLATED_AUTHORITY_PUBKEYS()
+{
+    static const std::array<const AuthorityPubkey*, 1> keys = {
+        &DONATION_PUBKEY_MAINTAINER(),
+    };
+    return keys;
+}
+
+// Authority-set selector keyed on SharechainConfig::ShareProfile::
+// maintainer_only_authority (taken as a bool so this header keeps its include
+// graph). Not yet consumed: decrypt_message_data / validate_message_data below
+// still iterate DONATION_AUTHORITY_PUBKEYS() directly on both profiles.
+inline std::span<const AuthorityPubkey* const> authority_pubkeys(bool maintainer_only)
+{
+    if (maintainer_only)
+        return std::span<const AuthorityPubkey* const>(ISOLATED_AUTHORITY_PUBKEYS());
+    return std::span<const AuthorityPubkey* const>(DONATION_AUTHORITY_PUBKEYS());
 }
 
 // ============================================================================

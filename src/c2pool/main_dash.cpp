@@ -1268,9 +1268,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // so persisted shares and their is_verified flags can never cross
     // identities. No flag: "dash" / "dash_testnet", byte-identical to master.
     const std::string net_subdir = dash::SharechainConfig::data_subdir(testnet);
-    if (dash::SharechainConfig::has_custom_network_id())
+    if (dash::SharechainConfig::has_custom_network_id()) {
         std::cout << "[run] custom network-id: per-network state is identity-scoped under "
                   << (core::filesystem::config_path() / net_subdir).string() << "\n";
+        const auto& prof = dash::SharechainConfig::share_profile();
+        std::cout << "[run] private/isolated DASH sharechain profile: target share version "
+                  << prof.target_share_version
+                  << " (dormant: minting stays v16 until the flip), ratchet seed "
+                  << prof.ratchet_floor_protocol_version << "\n";
+    }
     std::error_code mkdir_ec;
     std::filesystem::create_directories(
         core::filesystem::config_path() / net_subdir, mkdir_ec);  // best effort
