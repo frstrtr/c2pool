@@ -20,7 +20,7 @@
 //
 // SECOND PROBLEM (the FLAT PLATEAU, dash.voidbind.com 2026-08-27): on a zero-
 // local-mint relay the verified best-share election can be seeded ONCE (during
-// the initial hotel-sharechain backfill/verify) and then FREEZE -- peer-verified
+// the initial production-sharechain backfill/verify) and then FREEZE -- peer-verified
 // shares update the verified set but never re-elect the head. Because that frozen
 // head is STILL CONTAINED in the raw chain window, the "present AND in chain"
 // guard kept trusting it verbatim, so the estimator recomputed the SAME value off

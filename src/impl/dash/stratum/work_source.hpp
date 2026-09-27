@@ -565,7 +565,7 @@ public:
     /// Seconds since the cached template was sourced, -1 when none / unknown.
     /// Display only (the dashboard's block_value_age_sec): a template that is
     /// an hour old renders exactly like a live one without this, which is how
-    /// the hotel primary (0 local miners, nothing refreshing the cache)
+    /// the primary node (0 local miners, nothing refreshing the cache)
     /// presented a stale block_value as current on 2026-08-05.
     int64_t peek_template_age_sec() const;
 
@@ -676,7 +676,7 @@ private:
     /// (node_coin_state.hpp `&m_mnstates` / `&m_sml`) which the template
     /// assembly then dereferences, so reading it from the rpc_pool thread while
     /// the coin-P2P maintainer mutates it on the io thread is the 2026-08-05
-    /// hotel heap-corruption shape -- on the SERVE path this time. Everything
+    /// production heap-corruption shape -- on the SERVE path this time. Everything
     /// downstream of this call runs off a copy.
     ///
     /// The select_work() fallback arm is bound to a NO-OP here on purpose: the

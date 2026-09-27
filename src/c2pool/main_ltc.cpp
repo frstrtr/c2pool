@@ -599,7 +599,7 @@ int main(int argc, char* argv[]) {
     // Initialize logging
     core::log::Logger::init();
 
-    // Mining-hotel interim fix #4: raise RLIMIT_NOFILE to 65536 at startup.
+    // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup.
     // One fd per stratum session + HTTP + RPC + P2P + LevelDB — distro-default
     // 1024 starves the accept loop under miner churn. Log the effective limit.
     {

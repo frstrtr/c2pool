@@ -14,7 +14,7 @@ namespace core
 uint32_t timestamp();
 
 // Raise the process RLIMIT_NOFILE soft limit to `target` (default 65536),
-// clamped to the hard limit. Mining-hotel interim fix #4: a capped node
+// clamped to the hard limit. Interim hardening fix #4: a capped node
 // still holds one fd per stratum session + HTTP + RPC + P2P + LevelDB —
 // distro defaults (1024) starve the accept loop under miner churn.
 //

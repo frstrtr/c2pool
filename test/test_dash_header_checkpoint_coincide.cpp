@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /// DASH daemonless COLD-CUT first-embedded-template latency KAT.
 ///
-/// THE INCIDENT (2026-08-16, hotel-reserve). The first --coin-rpc-removed
+/// THE INCIDENT (2026-08-16, reserve-node). The first --coin-rpc-removed
 /// binary header-synced for >14 min without ever acquiring a tip: the status
 /// line held "[DASH] Waiting for block template (header sync in progress)",
 /// the embedded arm reported have_tip=0 / populated=0 / arm=would-decline, and

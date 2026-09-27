@@ -45,7 +45,7 @@ struct StratumConfig {
     // 2^16 (65536) for scrypt nets (LTC/DOGE), 1 for SHA256d nets (bitcoin).
     // Default preserves the scrypt convention; SHA256d work sources override to 1.0.
     double set_difficulty_multiplier = 65536.0;
-    // STRICT per-node miner cap (mining-hotel interim fix): maximum number of
+    // STRICT per-node miner cap (interim hardening fix): maximum number of
     // concurrent stratum TCP sessions this node accepts. When the cap is hit
     // the excess socket is closed cleanly, a WARN is logged, the
     // refused_connections counter increments, and the accept loop keeps
@@ -89,7 +89,7 @@ struct StratumConfig {
     // Default false: every other coin negotiates version-rolling as before.
     bool disable_version_rolling{false};
 
-    // ── Live-session hygiene (mining-hotel ZOMBIE-SESSION LEAK fix) ──────────
+    // ── Live-session hygiene (production ZOMBIE-SESSION LEAK fix) ──────────
     // A NAT-dropped miner's TCP connection is frequently never FIN/RST'd, so
     // StratumSession::is_connected() (socket_.is_open()) stays true FOREVER and
     // the session is never reaped -- every failed rig retry then mints an

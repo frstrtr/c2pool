@@ -101,7 +101,7 @@ enum class UtxoImmaturePolicy { ServeEmptyTxSet, Refuse };
 
 /// The DISCRIMINATING tail of a block-hash display hex, for log/diagnostic use.
 ///
-/// WHY THIS EXISTS (measured, hotel node 109.161.52.148, 2026-08-06). Every
+/// WHY THIS EXISTS (measured, production node, 2026-08-06). Every
 /// `dmn-stale` refusal in a 5h33m window printed
 ///
 ///     cause=dmn-stale value=000000000000 threshold=000000000000
@@ -144,7 +144,7 @@ public:
     // Mutable accessors for the maintainer (the reception / think slices seed
     // these from mnlistdiff + relayed mempool txs).
     //
-    // D2 (2026-08-07/08 hotel freeze, remaining half of the class): handing
+    // D2 (2026-08-07/08 production freeze, remaining half of the class): handing
     // out a MUTABLE reference to any input of the two committed-root
     // computations bumps the root-memo epoch — the caller MAY mutate, and a
     // memoized root that survives a mutation is a WRONG BLOCK
@@ -223,7 +223,7 @@ public:
     /// DIAGNOSTIC-ONLY — nothing in the viability decision reads it. It exists
     /// because the `dmn-stale` refusal below compares two BLOCK HASHES, and a
     /// hash can only ever say "different", never "how far behind". Every long
-    /// dmn-stale episode measured on the hotel node (2026-08-06: 5 episodes,
+    /// dmn-stale episode measured on the production node (2026-08-06: 5 episodes,
     /// 586 s of the 592 s total) was closed by the NEXT BLOCK arriving rather
     /// than by the SML catching up at the same tip — a distinction the hash
     /// alone cannot express, and the height makes obvious at a glance.
@@ -1240,7 +1240,7 @@ public:
     /// Number of times embedded_template_emit_ok() has been evaluated on this
     /// state (counted at the top of the gate, before any early return). Test
     /// seam: pins that submit-path tip reads never evaluate the serve gate
-    /// (the 2026-08-07/08 hotel freeze amplifier).
+    /// (the 2026-08-07/08 production freeze amplifier).
     uint64_t emit_ok_call_count() const { return m_emit_ok_calls; }
 
     /// BLOCKER-3 pre-emit HARD GATE. Before the embedded arm's template is
@@ -1266,7 +1266,7 @@ public:
         // Call counter FIRST, before any early return: the regression gate in
         // test_dash_submit_gate_scaling.cpp pins that a submit-path tip READ
         // (get_current_gbt_prevhash) never evaluates this gate -- the
-        // 2026-08-07/08 hotel freeze was this method's SML CalcMerkleRoot
+        // 2026-08-07/08 production freeze was this method's SML CalcMerkleRoot
         // running per share submit on the io thread.
         ++m_emit_ok_calls;
         auto reject = [why](const char* c, std::string v, std::string t) -> bool {
@@ -1475,7 +1475,7 @@ public:
         // registration height — at most ~nMasternodeMinimumConfirmations
         // blocks per unknown registration).
         //
-        // D2 (2026-08-07/08 hotel freeze, remaining half of the class): the
+        // D2 (2026-08-07/08 production freeze, remaining half of the class): the
         // projection returns a FRESH ~450 KB copy of the SML by value and its
         // root was re-hashed (~2000 x SHA256d) on EVERY evaluation — ~3 per
         // session per notify on the single io thread even after D1 removed
@@ -2122,7 +2122,7 @@ private:
         return SuperblockDisposition{true, std::move(*sched)};
     }
 
-    // D2 root memo (2026-08-07/08 hotel freeze, remaining half of the class).
+    // D2 root memo (2026-08-07/08 production freeze, remaining half of the class).
     // The epoch is bumped by every non-const accessor / setter whose target
     // feeds either committed root (sml()/qmgr()/mnstates()/set_tip()/
     // set_mn_min_confirmations()); the cached roots are valid only while
@@ -2157,7 +2157,7 @@ private:
     int64_t  m_sml_current_height{-1};        // DIAGNOSTIC ONLY, -1 = never reported; see set_sml_current_height
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     // How many times embedded_template_emit_ok() was EVALUATED (incremented at
-    // its top, before any early return). Test seam for the 2026-08-07/08 hotel
+    // its top, before any early return). Test seam for the 2026-08-07/08 production
     // freeze regression gate: the serve gate re-derives the full SML merkle
     // root, so the count of evaluations per submit-path tip read must be ZERO
     // (test_dash_submit_gate_scaling.cpp). mutable because the gate is const.

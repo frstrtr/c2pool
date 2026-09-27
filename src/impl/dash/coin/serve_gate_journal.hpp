@@ -81,7 +81,7 @@ public:
         /// serving) or not yet measurable.
         ///
         /// WHY THIS FIELD EXISTS — the COUNT of decline lines is the wrong
-        /// metric and it actively misleads. Measured on the hotel node over
+        /// metric and it actively misleads. Measured on the production node over
         /// 5h33m (2026-08-06): 109 `dmn-stale` episodes vs 3
         /// `qc-plan-underivable`, so BY COUNT dmn-stale looks like 97% of the
         /// problem. BY TIME ACTUALLY SPENT ON THE FALLBACK ARM, 104 of those
@@ -102,7 +102,7 @@ public:
         /// (measured from the FIRST decline, surviving cause changes, see
         /// above), which means a cause-change line attributes the WHOLE
         /// episode's duration to the cause it happens to name. Measured at
-        /// h=2518004 (hotel, 2026-08-07): a cause-change line naming
+        /// h=2518004 (production node, 2026-08-07): a cause-change line naming
         /// emit-bestcl-null-committed carried dur=512s, of which that cause
         /// owned 0.89 s — the 512 s belonged to the PRECEDING
         /// qc-plan-underivable segment. Every per-cause TIME histogram built

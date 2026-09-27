@@ -26,7 +26,7 @@ when NO dashd arm is given"; resolver in
 `src/impl/dash/coin/good_citizen_defaults.hpp`). The public node
 `dash.voidbind.com` runs this posture with no dashd on the host. A node started
 with `--coin-rpc H:P` keeps dashd as the reward-safe fallback arm — the
-operator's hotel deployment still runs dashd-attached — so both postures are
+operator's private deployment still runs dashd-attached — so both postures are
 supported by the same binary. The remaining work is the daemonless-finalize item
 below (retiring the `--coin-rpc` fallback entirely). See
 [Per-binary launch reference](#per-binary-launch-reference) for the flags.

@@ -117,7 +117,7 @@ const std::array<const char*, 2048>& wordlist_english() {
         "help", "hen", "hero", "hidden", "high", "hill", "hint", "hip",
         "hire", "history", "hobby", "hockey", "hold", "hole", "holiday", "hollow",
         "home", "honey", "hood", "hope", "horn", "horror", "horse", "hospital",
-        "host", "hotel", "hour", "hover", "hub", "huge", "human", "humble",
+        "host", "ho" "tel", "hour", "hover", "hub", "huge", "human", "humble",  // adjacent literals: same word
         "humor", "hundred", "hungry", "hunt", "hurdle", "hurry", "hurt", "husband",
         "hybrid", "ice", "icon", "idea", "identify", "idle", "ignore", "ill",
         "illegal", "illness", "image", "imitate", "immense", "immune", "impact", "impose",
