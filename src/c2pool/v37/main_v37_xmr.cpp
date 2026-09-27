@@ -3126,12 +3126,17 @@ static int run_live(const XmrNodeConfig& cfg) {
             // exists but credits nobody (the fixture then arms ecut_finder).
             return true;
         };
-        // EMPTY-CUT FINDER (operator ruling 09-26, xmr_paynow.hpp): an empty cut
-        // pays this template's finder -- the node's own payee, committed as V37F.
-        if (cba_payee_ref && ::v37::xmr::xmr_ref_valid(*cba_payee_ref)) scfg.ecut_finder = *cba_payee_ref;
-        std::printf("ecut: EMPTY-CUT FINDER %s (an empty credit cut pays the finder = this node's payee %s…, committed as V37F)\n",
-                    scfg.ecut_finder ? "ARMED" : "OFF (no --payee-spend-hex/--payee-view-hex)",
-                    scfg.ecut_finder ? hex_of(::v37::xmr::xmr_identity_key(*scfg.ecut_finder)).substr(0, 8).c_str() : "-");
+        // EMPTY-CUT FINDER (operator rulings 09-26 / 09-27, xmr_paynow.hpp): an empty
+        // cut pays the finder of the WINNING JOB, committed as V37F -- the job's
+        // stratum login (a valid standard address of this network), the node owner
+        // on an owner-fee job, else the compiled-in donation. The node's own
+        // --payout-address is never the finder. The default template (a job with
+        // no binding) pays the donation: fee model ON its residual already does
+        // (no V37F), OFF it is committed as V37F. Per-job variants: the provider.
+        if (!fee_on) scfg.ecut_finder = fee::donation_ref(don_net);
+        std::printf("ecut: EMPTY-CUT FINDER per job (login | owner on an owner-fee job | donation %s…); default job pays the donation%s\n",
+                    hex_of(fee::donation_identity(don_net)).substr(0, 8).c_str(),
+                    fee_on ? " via the residual (no V37F)" : " as V37F");
         std::printf("ab: on-chain credit cut ARMED (0x02 tail V37C|P|spine); feed=%s lag=%llums wire-out=%s wire-in=%s mutate=%lld\n",
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
@@ -3955,6 +3960,25 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::fflush(stdout);
             };
         hooks.job_binder = job_binder;   // SEAM-1 (unset unless --relay-bind rbind)
+        {   // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27): bind every job's finder
+            // right after its rbind (the owner-fee roll is the rbind's), before its blob.
+            auto rb = job_binder;
+            auto logged = std::make_shared<std::pair<std::mutex, std::set<std::string>>>();
+            hooks.job_binder = [&provider, &rbind_reg, rb, logged, don_net, owner_ref](std::uint32_t en, const std::string& address) {
+                if (rb) rb(en, address);
+                bool owner_hit = false;
+                if (rbind_reg) if (const auto jb = rbind_reg->get(en)) owner_hit = jb->owner_substituted;
+                const auto fc = c2pool::v37n::xmr::paynow::choose_ecut_finder(address, don_net, owner_hit, owner_ref);
+                provider.bind_finder(en, fc.payee);
+                std::lock_guard<std::mutex> lk(logged->first);
+                if (logged->second.size() < 4096 && logged->second.insert(std::string(to_string(fc.from)) + "|" + address).second) {
+                    std::printf("ecut-finder: job login %s -> finder = %s %s…%s%s\n", address.empty() ? "-" : address.substr(0, 12).c_str(),
+                                to_string(fc.from), hex_of(::v37::xmr::xmr_identity_key(fc.payee)).substr(0, 8).c_str(),
+                                fc.why.empty() ? "" : " -- ", fc.why.c_str());
+                    std::fflush(stdout);
+                }
+            };
+        }
         if (relay_node) {
             // GAP-2: disjoint per-node miner search spaces (see XmrStratumServer::seed_extra_nonce).
             std::random_device rd;
