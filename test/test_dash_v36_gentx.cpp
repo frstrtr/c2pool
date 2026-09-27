@@ -548,6 +548,35 @@ TEST(DashV36Gentx, ThreeMinerWindowWithMasternodePayments) {
     EXPECT_EQ(hexs(gc.bytes), hexs(mirror_tx(info.coinbase, want, {})));
 }
 
+TEST(DashV36Gentx, PaymentsConsumeSubsidyDonationOutputAtZero) {
+    IdentityGuard guard;
+    auto params = iso_params();
+    Scene sn;
+    auto info = info_for(sn.s2, 4);
+    // Emitted payments sum exactly to the subsidy: worker_payout == 0.
+    info.packed_payments = {raw_payment(p2pkh(0xd1), 300000000), raw_payment(p2pkh(0xd2), 200000000)};
+    auto built = dash::producer::build_share_v36(sn.sc.chain, params, info, min_header(), NONCE64, false);
+
+    V36ChainView view{sn.sc.chain};
+    dash::coin::GentxCoinbase gc;
+    ASSERT_EQ(dash::generate_share_transaction(built.share, view, params, &gc), built.gentx_hash);
+    // worker_payout = 0 -> no miner output (amount 0 is dropped), no 1-sat floor
+    // (worker_payout == 0), and the donation output is STILL emitted at value 0.
+    const std::vector<Out> want = {{300000000, p2pkh(0xd1)},
+                                   {200000000, p2pkh(0xd2)},
+                                   {0, donation()},
+                                   {0, op_return(built.ref_hash, NONCE64)}};
+    EXPECT_EQ(parse_tx(gc.bytes).outs, want);
+    EXPECT_EQ(sum_values(want), SUBSIDY);
+    EXPECT_EQ(hexs(gc.bytes), hexs(mirror_tx(info.coinbase, want, {})));
+    EXPECT_EQ(sha256d(gc.bytes), built.gentx_hash);
+
+    // Producer == verifier: the produced share passes the commitment check.
+    EXPECT_EQ(dash::share_init_verify(built.share, params, false), built.share.m_hash);
+    EXPECT_EQ(dash::g_last_gentx_hash, built.gentx_hash);
+    EXPECT_NO_THROW(dash::verify_payout_commitment(built.share, view, params, dash::g_last_gentx_hash));
+}
+
 TEST(DashV36Gentx, SuperblockPayeesDeductedEmittedOnly) {
     IdentityGuard guard;
     auto params = iso_params();
