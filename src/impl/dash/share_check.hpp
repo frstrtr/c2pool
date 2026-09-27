@@ -9,6 +9,11 @@
 // v36 share verification (DashV36Share; private/isolated v36 sharechain only,
 // dormant until the live ShareType admits wire-type 36) — see the
 // "DASH v36 share verification" section below share_init_verify(DashShare).
+// v36 generation transaction (DashV36Share; same scope, same dormancy): see the
+// "DASH v36 generation transaction" section at the end of this file. v36 formula:
+//   window  = decayed PPLNS from the PARENT over CHAIN_LENGTH shares (pplns_v36.hpp)
+//   amounts = worker_payout * weight / total_weight (full weight, NO finder fee),
+//             remainder to params.donation_script_func(36), donation >= 1 sat.
 //
 // PPLNS formula (v16, pre-V36 linear weights):
 //   weight_per_share = target_to_average_attempts(share.target) * (65535 - donation_field)
@@ -30,6 +35,7 @@
 #include "coin/gentx_coinbase.hpp"   // dash::coin::GentxCoinbase (won-block reconstruct SSOT hand-off)
 #include "config_pool.hpp"            // dash::SharechainConfig::share_profile() (future-timestamp gate)
 #include "share_messages.hpp"         // v36 message_data validation (authority_pubkeys, validate_message_data)
+#include "pplns_v36.hpp"              // v36 PPLNS window + amounts rule (CumulativeWeights, compute_v36_amounts)
 
 #include <core/coin_params.hpp>
 #include <core/donation.hpp>          // cross-coin COMBINED_DONATION_SCRIPT SSOT (Bucket-2)
@@ -47,6 +53,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -1296,4 +1303,219 @@ inline uint256 verify_share(const DashShare& share, ChainT& chain,
     verify_version_transition(share, chain, chain_length);    // Phase 2 (wired gate)
     return hash;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASH v36 generation transaction (DashV36Share, wire-type 36)
+//
+// Private/isolated DASH v36 sharechain only (custom --network-id). DORMANT like
+// the v36 share verifier above: the live ShareType is still {DashShare}, so no
+// accept / mint path instantiates anything here until the variant is widened.
+// Every v16 function above is byte-unchanged; the v36 arm is new overloads.
+//
+// ONE coinbase assembler, build_v36_gentx, is used by the verifier
+// (generate_share_transaction(DashV36Share) below) and by the producer
+// (share_producer.hpp build_share_v36 / build_gentx_v36), so a node's own v36
+// share always passes its own payout-commitment check. The payout math inside
+// it is compute_v36_amounts (pplns_v36.hpp) over payout::v36_worker_amount
+// (payout_muldiv.hpp) — the same helper the stratum coinbase builder's v36 arm
+// uses.
+//
+// v36 coinbase (no external oracle mints a DASH v36 share; the rules are the
+// LTC / p2pool-v36 port with the DASH masternode layer kept from v16):
+//   worker_payout = subsidy - Σ(EMITTED payments)       (amount > 0, decodable payee;
+//                                                        the oracle / producer rule)
+//   weights       = v36_pplns_window(parent)             (decayed, CHAIN_LENGTH, no cap)
+//   amounts       = compute_v36_amounts(weights, worker_payout, donation_script)
+//   donation_script = params.donation_script_func(36)    (P2PKH DONATION_SCRIPT on the
+//                                                        private/isolated profile)
+//   outputs       = [miners, script-byte order, amount > 0] [payments, template order]
+//                   [donation, always, >= 1 sat when worker_payout > 0]
+//                   [OP_RETURN 0x6a 0x28 ref_hash || LE64(last_txout_nonce), value 0]
+//   tx layout     = the v16 dash tx_type layout (version/type int16 pair {3,5} +
+//                   VarStr(extra_payload) iff coinbase_payload is non-empty).
+// Daemonless coinbase-only: a v36 share carries no tx refs; the gentx depends
+// only on the share's own fields and the sharechain.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The v36 coinbase bytes, the hash_link prefix cut and the txid.
+struct V36Gentx
+{
+    std::vector<unsigned char> bytes;   // full serialized coinbase tx
+    size_t prefix_len{0};               // hash_link prefix cut (bytes before ref_hash || nonce || locktime)
+    uint256 txid;                       // sha256d(bytes)
+};
+
+// payments_tx for a v36 coinbase: template order, amount > 0 and a payee that
+// decodes to a non-empty script (decode_payee_script returns empty for an empty
+// payee, an old-protocol "script:" form and an invalid address). Returns the
+// emitted outputs and their total — ONLY emitted payments reduce the worker
+// payout (the v16 producer / compute_dash_payouts rule; the v16 verifier's
+// subtract-all rule is not carried into v36).
+inline std::pair<std::vector<std::pair<std::vector<unsigned char>, uint64_t>>, uint64_t>
+v36_payments_tx(const std::vector<PackedPayment>& packed_payments, const core::CoinParams& params)
+{
+    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> out;
+    uint64_t emitted = 0;
+    for (const auto& pay : packed_payments)
+    {
+        if (pay.m_amount == 0)
+            continue;
+        auto script = decode_payee_script(pay.m_payee, params.address_version,
+                                          params.address_p2sh_version);
+        if (script.empty())
+            continue;
+        if (emitted > std::numeric_limits<uint64_t>::max() - pay.m_amount)
+            throw std::invalid_argument("v36 gentx: payment total overflows");
+        emitted += pay.m_amount;
+        out.emplace_back(std::move(script), pay.m_amount);
+    }
+    return {std::move(out), emitted};
+}
+
+// THE v36 coinbase assembler (verifier AND producer). `coinbase_payload` is the
+// RAW inner DIP4 CbTx payload (empty -> plain version-1 tx).
+inline V36Gentx build_v36_gentx(const std::vector<unsigned char>& coinbase_script_sig,
+                                const std::vector<unsigned char>& coinbase_payload,
+                                uint64_t subsidy,
+                                const std::vector<PackedPayment>& packed_payments,
+                                const CumulativeWeights& w,
+                                const uint256& ref_hash,
+                                uint64_t last_txout_nonce,
+                                const core::CoinParams& params)
+{
+    using Script = std::vector<unsigned char>;
+
+    auto [payments_tx, emitted_payments] = v36_payments_tx(packed_payments, params);
+    const uint64_t worker_payout = (subsidy > emitted_payments) ? (subsidy - emitted_payments) : 0;
+
+    const Script donation_script = params.donation_script_func(36);
+    const V36Amounts a = compute_v36_amounts(w.weights, w.total_weight, worker_payout,
+                                             donation_script);
+    {
+        uint64_t check = a.donation_amount;
+        for (const auto& [s, v] : a.amounts)
+            check += v;
+        if (check != worker_payout)
+            throw std::runtime_error("build_v36_gentx: amounts do not sum to worker_payout");
+    }
+
+    V36Gentx out;
+    auto& b = out.bytes;
+    auto put_le = [&](uint64_t v, int n) {
+        for (int i = 0; i < n; ++i)
+            b.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xff));
+    };
+    auto put_varint = [&](uint64_t v) {
+        PackStream ps;
+        ::Serialize(ps, VarInt(v));
+        const auto* p = reinterpret_cast<const unsigned char*>(ps.data());
+        b.insert(b.end(), p, p + ps.size());
+    };
+    auto put_varstr = [&](const Script& s) {
+        put_varint(s.size());
+        b.insert(b.end(), s.begin(), s.end());
+    };
+    auto put_txout = [&](uint64_t value, const Script& script) {
+        put_le(value, 8);
+        put_varstr(script);
+    };
+
+    const bool has_cbtx = !coinbase_payload.empty();
+    put_le(has_cbtx ? 3u : 1u, 2);                       // version int16
+    put_le(has_cbtx ? 5u : 0u, 2);                       // type int16 (5 = CbTx)
+
+    put_varint(1);                                       // one coinbase input
+    for (int i = 0; i < 32; ++i) b.push_back(0x00);      //   prev hash 0
+    put_le(0xffffffffu, 4);                              //   prev index 2^32-1
+    put_varstr(coinbase_script_sig);                     //   scriptSig
+    put_le(0xffffffffu, 4);                              //   sequence
+
+    put_varint(a.amounts.size() + payments_tx.size() + 1 /*donation*/ + 1 /*OP_RETURN*/);
+    for (const auto& [script, amount] : a.amounts)       // script-byte order, amount > 0
+        put_txout(amount, script);
+    for (const auto& [script, amount] : payments_tx)     // template order
+        put_txout(amount, script);
+    put_txout(a.donation_amount, donation_script);       // always; last before OP_RETURN
+    {
+        Script op_ret;
+        op_ret.reserve(2 + 32 + 8);
+        op_ret.push_back(0x6a);
+        op_ret.push_back(0x28);
+        op_ret.insert(op_ret.end(), ref_hash.data(), ref_hash.data() + 32);
+        for (int i = 0; i < 8; ++i)
+            op_ret.push_back(static_cast<unsigned char>((last_txout_nonce >> (8 * i)) & 0xff));
+        put_txout(0, op_ret);
+    }
+
+    put_le(0, 4);                                        // lock_time
+
+    size_t payload_varstr_size = 0;
+    if (has_cbtx)
+    {
+        const size_t before = b.size();
+        put_varstr(coinbase_payload);                    // extra_payload VarStr
+        payload_varstr_size = b.size() - before;
+    }
+
+    // prefix = bytes[: -(payload VarStr) - 32 ref_hash - 8 nonce - 4 locktime]
+    out.prefix_len = b.size() - payload_varstr_size - 44;
+    out.txid = Hash(std::span<const unsigned char>(b.data(), b.size()));
+    return out;
+}
+
+// The v36 window for `prev_hash`, through the tracker's cached form when the
+// tracker provides one (the live ShareTracker, whose cache think() primes from
+// the ring buffer under the same key), otherwise the free rule over
+// tracker.chain. Both evaluate v36_pplns_window.
+template <typename TrackerT>
+inline CumulativeWeights v36_window_for(TrackerT& tracker, const uint256& prev_hash)
+{
+    if constexpr (requires { tracker.v36_pplns_window(prev_hash); })
+        return tracker.v36_pplns_window(prev_hash);
+    else
+        return v36_pplns_window(tracker.chain, prev_hash);
+}
+
+// ── generate_share_transaction (Dash v36) ────────────────────────────────────
+// The expected coinbase of a v36 share, from the sharechain and the share's own
+// fields; returns its txid. out_gentx (optional) receives the bytes + txid for
+// the won-block reconstructor, as on v16.
+template <typename TrackerT>
+uint256 generate_share_transaction(const DashV36Share& share, TrackerT& tracker,
+                                   const core::CoinParams& params,
+                                   dash::coin::GentxCoinbase* out_gentx = nullptr)
+{
+    const CumulativeWeights w = v36_window_for(tracker, share.m_prev_hash);
+    const uint256 ref_hash = compute_v36_ref_hash(params, share);
+    const V36Gentx g = build_v36_gentx(share.m_coinbase.m_data, share.m_coinbase_payload.m_data,
+                                       share.m_subsidy, share.m_packed_payments, w, ref_hash,
+                                       share.m_last_txout_nonce, params);
+    if (out_gentx)
+    {
+        out_gentx->bytes = g.bytes;
+        out_gentx->txid = g.txid;
+    }
+    return g.txid;
+}
+
+// ── verify_payout_commitment (Dash v36) ──────────────────────────────────────
+// Same gate, same message as the v16 overload: the txid the share's hash_link
+// committed to (share_init_verify's g_last_gentx_hash) must equal the expected
+// v36 coinbase. No-op while the parent is not in the chain.
+template <typename TrackerT>
+inline void verify_payout_commitment(const DashV36Share& share, TrackerT& tracker,
+                                     const core::CoinParams& params,
+                                     const uint256& gentx_hash)
+{
+    if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash))
+        return;  // genesis / parent not yet in chain -- no PPLNS window to bind
+
+    uint256 expected_gentx = generate_share_transaction(share, tracker, params);
+    if (expected_gentx != gentx_hash)
+        throw std::invalid_argument(
+            "GENTX-MISMATCH: coinbase does not commit to the expected PPLNS payout"
+            " (expected " + expected_gentx.ToString().substr(0, 16) +
+            " committed " + gentx_hash.ToString().substr(0, 16) + ")");
+}
+
 } // namespace dash

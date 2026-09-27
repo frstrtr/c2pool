@@ -485,6 +485,10 @@ struct ProspectiveShareInfo
 
     // job context (NOT serialized into the ref preimage)
     std::vector<uint256> other_transaction_hashes;
+
+    // v36 only (build_share_v36): the share's message_data blob. Never read by
+    // the v16 serializers (serialize_share_info / build_share).
+    std::vector<unsigned char> message_data;
 };
 
 // Full prospective assembly at job time — the producer half of the oracle's
@@ -828,9 +832,12 @@ inline LinkT prefix_to_hash_link(const std::vector<unsigned char>& prefix,
 // — kept local so this consensus header does not pull the coinbase builder's
 // transaction/GBT-JSON dependency tree; equality between the two walks is
 // drift-fenced by the MerkleLinkMatchesCoinbaseBuilder KAT.
-inline MerkleLink calculate_merkle_link_index0(const std::vector<uint256>& other_tx_hashes)
+// LinkT: MerkleLink (v16, the default — every existing caller) or
+// v36::MerkleLink (same members, v36 share).
+template <typename LinkT = MerkleLink>
+inline LinkT calculate_merkle_link_index0(const std::vector<uint256>& other_tx_hashes)
 {
-    MerkleLink link;
+    LinkT link;
     link.m_index = 0;
     if (other_tx_hashes.empty())
         return link;
@@ -995,6 +1002,132 @@ inline BuiltShare build_share(ChainT& chain,
     // (2) Full in-tree verifier pass (ref_hash recompute, merkle, header
     //     reconstruction, share-target validity, X11 — and the PoW check when
     //     the caller submits a real solve).
+    s.m_hash = share_init_verify(s, params, check_pow);
+
+    return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v36 producer arm (private/isolated DASH v36 sharechain; DORMANT until the
+// mint path selects v36 — nothing below is called by build_mint_share /
+// build_producer_job, which still mint v16). The v16 producer above is
+// byte-unchanged.
+//
+// The v36 coinbase is built by the verifier's ONE assembler
+// (share_check.hpp build_v36_gentx) over the ONE window rule
+// (pplns_v36.hpp v36_pplns_window), so a share built here always passes
+// generate_share_transaction(DashV36Share) / verify_payout_commitment on any
+// node holding the same chain. No block-finder fee in v36; the miner's own
+// work is paid by the shares that follow it.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// v36 gentx for a prospective share. Same prefix_len / nonce-slot contract as
+// the v16 build_gentx: the OP_RETURN ref_hash occupies [prefix_len, +32) and
+// the 8-byte last_txout_nonce [prefix_len + 32, +8).
+inline V36Gentx build_gentx_v36(const ProspectiveShareInfo& info,
+                                const dash::CumulativeWeights& w,
+                                const uint256& ref_hash,
+                                uint64_t last_txout_nonce,
+                                const core::CoinParams& params)
+{
+    return build_v36_gentx(info.coinbase, info.coinbase_payload, info.subsidy,
+                           info.packed_payments, w, ref_hash, last_txout_nonce, params);
+}
+
+struct BuiltV36Share
+{
+    DashV36Share share;   // fully populated, m_hash set to the X11 share hash
+    uint256 gentx_hash;   // sha256d of the produced coinbase
+    uint256 ref_hash;     // PPLNS OP_RETURN commitment
+};
+
+// Build a DashV36Share from a prospective share_info + the solved header, with
+// the same MANDATORY self-verify as build_share: the hash_link fold must
+// reproduce the gentx txid and the share must pass share_init_verify
+// (DashV36Share). v36 carries no tx refs (daemonless coinbase-only);
+// info.new_transaction_hashes / transaction_hash_refs are not committed.
+template <typename ChainT>
+inline BuiltV36Share build_share_v36(ChainT& chain,
+                                     const core::CoinParams& params,
+                                     const ProspectiveShareInfo& info,
+                                     const bitcoin_family::coin::SmallBlockHeaderType& min_header,
+                                     uint64_t last_txout_nonce,
+                                     bool check_pow = true)
+{
+    BuiltV36Share out;
+    DashV36Share& s = out.share;
+
+    s.m_min_header = min_header;
+
+    // share_data (standardized v36)
+    s.m_prev_hash       = info.prev_hash;
+    s.m_coinbase        = BaseScript(info.coinbase);
+    s.m_nonce           = info.nonce;
+    s.m_pubkey_hash     = info.pubkey_hash;
+    s.m_pubkey_type     = 0;                       // DASH: always P2PKH
+    s.m_subsidy         = info.subsidy;
+    s.m_donation        = info.donation;
+    s.m_stale_info      = info.stale_info;
+    s.m_desired_version = info.desired_version;
+    // merged_addresses / merged_coinbase_info / merged_payout_hash: empty (no AuxPoW child)
+
+    // share_info (standardized v36)
+    s.m_far_share_hash = info.far_share_hash;
+    s.m_max_bits       = info.max_bits;
+    s.m_bits           = info.bits;
+    s.m_timestamp      = info.timestamp;
+    s.m_absheight      = info.absheight;
+    s.m_abswork        = info.abswork;
+    s.m_message_data   = BaseScript(info.message_data);
+
+    // DASH suffix
+    s.m_coinbase_payload = BaseScript(info.coinbase_payload);
+    s.m_payment_amount   = info.payment_amount;
+    s.m_packed_payments  = info.packed_payments;
+
+    s.m_ref_merkle_link  = v36::MerkleLink{};      // empty (data.py:285)
+    s.m_last_txout_nonce = last_txout_nonce;
+
+    // ref_hash over the populated share (the verifier's one v36 ref builder),
+    // then the coinbase over the v36 window from the parent.
+    out.ref_hash = compute_ref_hash(params, s);
+    const dash::CumulativeWeights w = v36_pplns_window(chain, info.prev_hash);
+    const V36Gentx gentx = build_gentx_v36(info, w, out.ref_hash, last_txout_nonce, params);
+    out.gentx_hash = gentx.txid;
+
+    const std::vector<unsigned char> const_ending =
+        compute_gentx_before_refhash(params.donation_script_func(36));
+    {
+        std::vector<unsigned char> prefix(
+            gentx.bytes.begin(), gentx.bytes.begin() + gentx.prefix_len);
+        s.m_hash_link = prefix_to_hash_link<v36::V36HashLinkType>(prefix, const_ending);
+    }
+    s.m_merkle_link = calculate_merkle_link_index0<v36::MerkleLink>(info.other_transaction_hashes);
+
+    // Outer payload: the VarStr-PACKED raw payload, or empty (same framing as v16).
+    if (!info.coinbase_payload.empty())
+    {
+        PackStream ps;
+        BaseScript raw; raw.m_data = info.coinbase_payload;
+        ps << raw;
+        s.m_coinbase_payload_outer.m_data.assign(
+            reinterpret_cast<const unsigned char*>(ps.data()),
+            reinterpret_cast<const unsigned char*>(ps.data()) + ps.size());
+    }
+
+    // ── MANDATORY self-verify ──
+    // (1) hash_link fold == produced gentx txid.
+    {
+        const uint256 folded = check_hash_link(
+            s.m_hash_link,
+            v36_hash_link_data(out.ref_hash, last_txout_nonce, s.m_coinbase_payload_outer),
+            const_ending);
+        if (folded != gentx.txid)
+            throw std::runtime_error(
+                "build_share_v36: hash_link fold does not reproduce gentx txid");
+    }
+    // (2) Full v36 verifier pass (timestamp bound, ref_hash, hash_link, merkle,
+    //     X11, message_data).
     s.m_hash = share_init_verify(s, params, check_pow);
 
     return out;

@@ -170,12 +170,8 @@ struct TrackerThinkResult
     std::vector<uint256> top5_heads;
 };
 
-struct CumulativeWeights
-{
-    std::map<std::vector<unsigned char>, uint288> weights;
-    uint288 total_weight;
-    uint288 total_donation_weight;
-};
+// CumulativeWeights: defined in pplns_v36.hpp (included via share_check.hpp),
+// shared with the v36 generation transaction.
 
 // ── Dense PPLNS Ring Buffer ──────────────────────────────────────────────
 // Stores PPLNS-relevant data for each share in the sliding window as a
@@ -2034,67 +2030,10 @@ public:
             && m_decayed_cache_desired == desired_weight)
             return m_decayed_cache_result;
 
-        static constexpr uint64_t DECAY_PRECISION = 40;
-        static constexpr uint64_t DECAY_SCALE = uint64_t(1) << DECAY_PRECISION;
-        static constexpr uint64_t LN2_MICRO = 693147;
-
-        uint32_t half_life = std::max(SharechainConfig::chain_length() / 4, uint32_t(1));
-        uint64_t decay_per = DECAY_SCALE - (DECAY_SCALE * LN2_MICRO) / (uint64_t(1000000) * half_life);
-
-        CumulativeWeights result;
-        int32_t share_count = 0;
-        uint64_t decay_fp = DECAY_SCALE; // starts at 1.0
-
-        // Single-pass walk matching p2pool's while loop in
-        // get_decayed_cumulative_weights. No pre-collection needed.
-        //
-        // TODO(ltc-doge): pin exact intra-walk yield boundary + optional
-        // zero-divisor guard (degenerate target_ratio==0). This inner decay
-        // iteration is the candidate finest-grained yield point for the V36
-        // livelock lock-yield mechanism; the cooperative budget is currently
-        // enforced at the COARSE per-scored-head boundary in think() Phase 3
-        // (THINK_WALK_YIELD_BUDGET). Once PIE core symbolization pins the true
-        // hot site, move/refine the budget check here. The zero-divisor guard
-        // referenced is the `!this_total.IsNull()` proration guard just below
-        // (remaining / this_total) — confirm it covers the degenerate case.
-        auto cur = start;
-        while (!cur.IsNull() && chain.contains(cur) && share_count < max_shares)
-        {
-            chain.get_share(cur).invoke([&](auto* obj) {
-                auto att = chain::target_to_average_attempts(
-                    chain::bits_to_target(obj->m_bits));
-                uint32_t don = obj->m_donation;
-
-                uint288 decayed_att = (att * uint288(decay_fp)) >> DECAY_PRECISION;
-
-                auto addr_w = decayed_att * static_cast<uint32_t>(65535 - don);
-                auto don_w  = decayed_att * don;
-                auto this_total = addr_w + don_w; // = decayed_att * 65535
-
-                if (result.total_weight + this_total > desired_weight) {
-                    auto remaining = desired_weight - result.total_weight;
-                    if (!this_total.IsNull()) {
-                        addr_w = addr_w * remaining / this_total;
-                        don_w  = don_w * remaining / this_total;
-                    }
-                    this_total = remaining;
-                }
-
-                auto script = get_share_script(obj);
-                result.weights[script] += addr_w;
-                result.total_weight += this_total;
-                result.total_donation_weight += don_w;
-            });
-
-            ++share_count;
-            if (result.total_weight >= desired_weight)
-                break;
-
-            decay_fp = mul128_shift(decay_fp, decay_per, DECAY_PRECISION);
-
-            auto* idx = chain.get_index(cur);
-            cur = idx ? idx->tail : uint256();
-        }
+        // The walk itself lives in pplns_v36.hpp (shared with the v36
+        // generation transaction); this method adds only the result cache.
+        CumulativeWeights result =
+            dash::v36_decayed_cumulative_weights(chain, start, max_shares, desired_weight);
 
         // Cache result (single-entry, invalidated on chain change)
         m_decayed_cache_start = start;
@@ -2104,6 +2043,23 @@ public:
         m_decayed_cache_valid = true;
 
         return result;
+    }
+
+    // -- v36 PPLNS window for a share whose parent is prev_hash --
+    // The v36 window rule (pplns_v36.hpp v36_pplns_window: parent start,
+    // CHAIN_LENGTH shares, no weight cap, depth guard) evaluated through the
+    // result cache above, under the SAME key prime_pplns_cache() writes
+    // (prev_hash, CHAIN_LENGTH, unlimited) — so a verification that follows a
+    // think() Phase-2 prime reuses the ring-buffer weights. Consumed by
+    // generate_share_transaction(DashV36Share) (share_check.hpp).
+    CumulativeWeights v36_pplns_window(const uint256& prev_hash)
+    {
+        if (prev_hash.IsNull() || !chain.contains(prev_hash))
+            return {};
+        const auto chain_len = static_cast<int32_t>(SharechainConfig::chain_length());
+        dash::check_v36_pplns_window_depth(chain, prev_hash, chain_len);
+        return get_v36_decayed_cumulative_weights(prev_hash, chain_len,
+                                                  v36_pplns::unlimited_weight());
     }
 
     // -- Diagnostic: per-share V36 PPLNS walk dump --
