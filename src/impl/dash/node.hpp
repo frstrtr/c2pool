@@ -1203,6 +1203,13 @@ public:
     /// node.cpp:1289-1327 port).
     void start_outbound_connections();
 
+    /// One outbound dial-maintenance pass: dial get_good_peers() candidates
+    /// that are not connected, not already being dialed and not banned, until
+    /// the outbound target is met. IO thread. Called once by
+    /// start_outbound_connections() and then on every 30 s m_connect_timer
+    /// tick. Body in node.cpp.
+    void try_connect_peers();
+
     // ── have_tx / losing_tx advertisement (SEND side) ─────────────────────
     // c2pool was RECEIVE-ONLY for the p2pool tx-pool advertisement: the
     // protocol handlers ingest a peer's have_tx/losing_tx into
