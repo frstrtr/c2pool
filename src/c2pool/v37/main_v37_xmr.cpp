@@ -124,6 +124,9 @@
 #include "xmr/relay/xmr_receipt_mint.hpp"      // share -> PoW-carrying receipt; the structural check
 #include "xmr/relay/xmr_relay_node.hpp"        // TCP relay: HELLO gate, verify worker (RandomX LAST), flood, backfill, repair
 #include "xmr/relay/xmr_repair_replay.hpp"     // REPAIR-HORIZON: the repair scratch replay + the shadow winner-side order
+#include "xmr/relay/xmr_relay_bootstrap.hpp"   // RELAY-BOOTSTRAP: the built-in per-network relay bootstrap list
+#include <ifaddrs.h>                           // RELAY-BOOTSTRAP: this machine's addresses (self-skip)
+#include <netdb.h>
 #include "xmr/relay/xmr_receipt_ingest.hpp"    // admitted receipts -> the lane (ordering policy + durable log)
 #include "xmr/xmr_drops_wiring.hpp"            // ★ DROPS: the XMR shell's DropsWiring (flip-gated; DORMANT by default)
 #include "xmr/relay/xmr_relay_native_ctx.hpp"   // RC-CTX: receipt contexts from the native node + the own-template journal
@@ -224,6 +227,7 @@ static bool g_lane_suspended_now = false;                  // R-C rework-2: main
 static std::string   g_relay_listen;                    // --relay-listen HOST:PORT
 static std::optional<::v37::bytes32> g_pool_genesis;    // POOL-LINEAGE: --pool-genesis <hex64> (unset = the network default)
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
+static bool          g_no_relay_bootstrap = false;     // --no-relay-bootstrap (RELAY-BOOTSTRAP: drop the built-in list)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
@@ -3528,6 +3532,35 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (!split_hostport(pr, h, pt)) { std::printf("REFUSED: --relay-peer wants HOST:PORT, got \"%s\"\n", pr.c_str()); node.stop(); return 2; }
                 ro.peers.emplace_back(h, pt);
             }
+            {   // RELAY-BOOTSTRAP: this network's built-in relay peers, in addition to --relay-peer.
+                std::vector<std::string> local_ips;
+                ifaddrs* ifs = nullptr;
+                if (::getifaddrs(&ifs) == 0) {
+                    for (ifaddrs* i = ifs; i != nullptr; i = i->ifa_next) {
+                        if (i->ifa_addr == nullptr) continue;
+                        const int fam = i->ifa_addr->sa_family;
+                        if (fam != AF_INET && fam != AF_INET6) continue;
+                        char buf[NI_MAXHOST];
+                        const socklen_t len = fam == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
+                        if (::getnameinfo(i->ifa_addr, len, buf, sizeof buf, nullptr, 0, NI_NUMERICHOST) == 0)
+                            local_ips.emplace_back(buf);
+                    }
+                    ::freeifaddrs(ifs);
+                }
+                const auto bp = relay::resolve_bootstrap(ro.network, g_no_relay_bootstrap, g_relay_peers,
+                                                         g_relay_listen, local_ips);
+                auto joined = [](const std::vector<std::string>& v) {
+                    std::string o; for (const auto& x : v) { if (!o.empty()) o += ','; o += x; } return o.empty() ? std::string("-") : o;
+                };
+                std::printf("relay: bootstrap %s: dial=%s self_skipped=%s already_peer=%s (--relay-peer %zu)\n",
+                            g_no_relay_bootstrap ? "OFF (--no-relay-bootstrap)"
+                            : relay::default_bootstrap_hosts(ro.network).empty() ? "none for this network" : "ON",
+                            joined(bp.use).c_str(), joined(bp.self).c_str(), joined(bp.dup).c_str(), g_relay_peers.size());
+                for (const auto& d : bp.use) {
+                    std::string h; std::uint16_t pt = 0;
+                    if (relay::bootstrap_split(d, h, pt)) ro.peers.emplace_back(h, pt);
+                }
+            }
             ro.max_peers = g_relay_max_peers;
             ro.index_horizon = g_relay_horizon;
             {
@@ -4749,6 +4782,7 @@ int main(int argc, char** argv) {
             g_pool_genesis = g;
         }
         else if (a == "--relay-peer")               g_relay_peers.push_back(value());
+        else if (a == "--no-relay-bootstrap")       g_no_relay_bootstrap = true;
         else if (a == "--drops-enrol")              g_drops_enrol.push_back(value());
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
         else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
@@ -4914,6 +4948,9 @@ int main(int argc, char** argv) {
                 "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT'||lane_tag||id)\n"
                 "                               is committed in every lane coinbase; blocks without OUR tag are ordinary blocks\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
+                "  --no-relay-bootstrap         do not also dial the built-in bootstrap relay peers (mainnet:\n"
+                "                               the public pool nodes, docs/xmr-lane/BOOTSTRAP-NODES.md;\n"
+                "                               stagenet/testnet/regtest: none). Used only when the relay is on.\n"
                 "  --drops-enrol ID|ADDR|none   DROPS (raindrops; ON by default in this XMR build, needs the relay). Default (no\n"
                 "                               flag): AUTO -- every payee enrols at its first share on the lane. ID|ADDR (repeatable):\n"
                 "                               only the listed payees. none: nobody (credits zero). Every node of a pool must run the\n"

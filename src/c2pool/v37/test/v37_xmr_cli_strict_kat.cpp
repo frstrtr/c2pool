@@ -27,6 +27,12 @@
 //   F  FORK-FUSE-2's test-only --test-unknown-fork-stall-s is parsed by the
 //      strict helpers (C and B rows) and is still REFUSED on mainnet: exit 2
 //      naming the flag, before any file is created.
+//   R  RELAY-BOOTSTRAP: the built-in relay bootstrap list is exactly the two
+//      public mainnet pool nodes and empty on stagenet/testnet/regtest;
+//      --no-relay-bootstrap empties it; a default already given as
+//      --relay-peer is not dialled twice; the node itself (the --relay-listen
+//      port on the listen host or on one of its own addresses) is skipped;
+//      --help lists --no-relay-bootstrap and the flag parses (a C row).
 //
 // NETWORK SAFETY. Every invocation that a broken build could turn into a live
 // run carries `--network regtest --rpc-host 127.0.0.1 --rpc-port 1 --zmq-port 1`
@@ -51,6 +57,7 @@
 #include <vector>
 
 #include "impl/xmr/native/anchor/xmr_anchor_pinned.hpp"
+#include "c2pool/v37/xmr/relay/xmr_relay_bootstrap.hpp"
 
 namespace fs = std::filesystem;
 
@@ -291,6 +298,7 @@ void compat_rows() {
         {"--no-book-deferral"}, {"--cba-monerod-compare"}, {"--cba-monerod-fallback"}, {"--cba-refetch-bound", "120"},
         {"--relay-feed-monerod-compare"},
         {"--relay-listen", "127.0.0.1:7320"}, {"--pool-genesis", H64}, {"--relay-peer", "127.0.0.1:7322"},
+        {"--no-relay-bootstrap"},
         {"--drops-enrol", H64}, {"--drops-enrol", "none"}, {"--drops-enrol-min-tip", "0"},
         {"--relay-max-peers", "8"}, {"--relay-index-horizon", "64"}, {"--relay-rx-budget", "1,20,16,256"},
         {"--relay-solicited-credits", "256"}, {"--relay-backfill-positions", "2048"}, {"--relay-reoffer-seconds", "60"},
@@ -385,6 +393,40 @@ void fuse_rows() {
     check(r.files == 0, tag + ": created " + std::to_string(r.files) + " file(s)");
 }
 
+// ---------------------------------------------------------------------------
+// R -- RELAY-BOOTSTRAP: the built-in list and its resolution (pure), + --help.
+// ---------------------------------------------------------------------------
+void bootstrap_rows() {
+    namespace rl = c2pool::v37n::xmr::relay;
+    using V = std::vector<std::string>;
+    const std::string A = "109.123.238.32:59321", B = "158.220.92.171:59321";
+    const auto& m = rl::default_bootstrap_hosts(0);
+    check(m == V{A, B}, "R: mainnet default list is not exactly {" + A + ", " + B + "}");
+    for (std::uint8_t n : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{3}})
+        check(rl::default_bootstrap_hosts(n).empty(), "R: network " + std::to_string(n) + " ships defaults");
+    check(rl::kBootstrapRelayPort == 59321, "R: bootstrap relay port is not 59321");
+    const V none, ips = {"127.0.0.1", "10.0.0.5", "::1"};
+    auto p = rl::resolve_bootstrap(0, false, none, "", ips);
+    check(p.use == m && p.self.empty() && p.dup.empty(), "R: mainnet, no --relay-peer: does not dial both defaults");
+    p = rl::resolve_bootstrap(3, false, none, "0.0.0.0:59321", ips);
+    check(p.use.empty() && p.self.empty() && p.dup.empty(), "R: regtest dials a default");
+    p = rl::resolve_bootstrap(0, true, {"1.2.3.4:5"}, "0.0.0.0:59321", ips);
+    check(p.use.empty() && p.self.empty() && p.dup.empty(), "R: --no-relay-bootstrap does not empty the list");
+    p = rl::resolve_bootstrap(0, false, {B}, "", ips);
+    check(p.use == V{A} && p.dup == V{B}, "R: a default given as --relay-peer is dialled twice");
+    p = rl::resolve_bootstrap(0, false, none, "109.123.238.32:59321", ips);        // self = the listen host
+    check(p.use == V{B} && p.self == V{A}, "R: self (listen host) not skipped");
+    const V ips_b = {"127.0.0.1", "158.220.92.171"};
+    p = rl::resolve_bootstrap(0, false, none, "0.0.0.0:59321", ips_b);             // self = a local address
+    check(p.use == V{A} && p.self == V{B}, "R: self (local address, wildcard listen) not skipped");
+    p = rl::resolve_bootstrap(0, false, none, "0.0.0.0:60700", ips_b);             // same IP, another port: kept
+    check(p.use == m && p.self.empty(), "R: a local address on another relay port was skipped as self");
+    p = rl::resolve_bootstrap(0, false, none, "", ips_b);                           // dial-only: never self
+    check(p.use == m && p.self.empty(), "R: a dial-only node skipped a default as self");
+    const Run h = run(safe({"--help"}), 5000);
+    check(h.out.find("--no-relay-bootstrap") != std::string::npos, "R: --help does not list --no-relay-bootstrap");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -401,6 +443,7 @@ int main(int argc, char** argv) {
     const bool knows_version = help_rows();
     version_rows();
     bad_rows();
+    bootstrap_rows();
     if (knows_version) { compat_rows(); fuse_rows(); }
     else std::printf("C/F rows SKIPPED: this binary does not list --version, so a flag row could start it live\n");
 
