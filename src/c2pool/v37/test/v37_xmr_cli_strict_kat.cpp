@@ -243,6 +243,12 @@ void version_rows() {
         check(r.out.find("network default: stagenet") != std::string::npos, tag + ": no network default");
         check(r.out.find("mainnet height " + mh) != std::string::npos, tag + ": no pinned mainnet height " + mh);
         check(r.out.find("stagenet height " + sh) != std::string::npos, tag + ": no pinned stagenet height " + sh);
+#ifdef V37_XMR_DROPS_DEFAULT   // XMR-DROPS-DEFAULT: the build identity names the raindrops state
+        check(r.out.find("raindrops (DROPS): ON by default (pool rules v3)") != std::string::npos,
+              tag + ": no 'raindrops (DROPS): ON by default (pool rules v3)' line");
+#else
+        check(r.out.find("raindrops (DROPS): OFF") != std::string::npos, tag + ": no 'raindrops (DROPS): OFF' line");
+#endif
         check(r.files == 0, tag + ": created " + std::to_string(r.files) + " file(s)");
     }
 }
@@ -285,7 +291,7 @@ void compat_rows() {
         {"--no-book-deferral"}, {"--cba-monerod-compare"}, {"--cba-monerod-fallback"}, {"--cba-refetch-bound", "120"},
         {"--relay-feed-monerod-compare"},
         {"--relay-listen", "127.0.0.1:7320"}, {"--pool-genesis", H64}, {"--relay-peer", "127.0.0.1:7322"},
-        {"--drops-enrol", H64}, {"--drops-enrol-min-tip", "0"},
+        {"--drops-enrol", H64}, {"--drops-enrol", "none"}, {"--drops-enrol-min-tip", "0"},
         {"--relay-max-peers", "8"}, {"--relay-index-horizon", "64"}, {"--relay-rx-budget", "1,20,16,256"},
         {"--relay-solicited-credits", "256"}, {"--relay-backfill-positions", "2048"}, {"--relay-reoffer-seconds", "60"},
         {"--relay-order", "canonical"}, {"--relay-order", "arrival"}, {"--relay-bin-lag", "1"},

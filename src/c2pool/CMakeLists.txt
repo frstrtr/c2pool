@@ -118,6 +118,24 @@ function(c2pool_wire_version _tgt)
     add_dependencies(${_tgt} c2pool_version_header)
     target_include_directories(${_tgt} PRIVATE ${C2POOL_VERSION_HEADER_DIR})
 endfunction()
+# XMR-DROPS-DEFAULT (operator ruling 09-27: "raindrops should be default"):
+# the Monero node -- c2pool-v37-xmr and the XMR KATs that compile its headers --
+# is built with the V37.1 consensus activation (V37_ACTIVATE_CONSENSUS_V1=1 at
+# kActivationArity 1 => DROPS ON, native ridge OFF), so raindrops are armed by
+# default. The define is PRIVATE to those targets ONLY: every other coin's
+# binary (c2pool-v37, the BTC/LTC/DASH/DGB/BCH/DOGE mains) and every non-XMR KAT
+# keeps the flip at 0, byte-identical to master. Only the main_v37_*.cpp TUs
+# include the flip-dependent headers (no shared library object does), so the
+# scoped define cannot split an inline definition across a link (no ODR split).
+# The XMR HELLO pool-rules version moves 2 -> 3 with it (xmr_relay_wire.hpp), so
+# a DROPS-off XMR node is refused at HELLO as TAG_MISMATCH field=version.
+# OFF = the previous XMR build (raindrops off), for A/B tests only.
+option(V37_XMR_DROPS_DEFAULT "XMR node: raindrops (DROPS) armed by default" ON)
+function(c2pool_xmr_drops_default _tgt)
+    if (V37_XMR_DROPS_DEFAULT)
+        target_compile_definitions(${_tgt} PRIVATE V37_ACTIVATE_CONSENSUS_V1=1 V37_XMR_DROPS_DEFAULT=1)
+    endif()
+endfunction()
 
 # Main C2Pool Enhanced Application (refactored with mining_shares/p2p_shares separation)
 add_executable(c2pool main_ltc.cpp)
@@ -885,6 +903,7 @@ target_include_directories(c2pool-v37-xmr PRIVATE
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+c2pool_xmr_drops_default(c2pool-v37-xmr)   # XMR-DROPS-DEFAULT: raindrops ON (see the helper)
 target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 # xmr_template carries the p2pool block-template port + the authored primitive
 # seam bodies (xmr_coin_primitives.cpp). Link it EXACTLY ONCE and NEVER define

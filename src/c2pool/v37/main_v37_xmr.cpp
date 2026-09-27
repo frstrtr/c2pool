@@ -2297,13 +2297,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         for (const auto& id : ids) {
             ::v37::ScriptRef payee; std::uint64_t bin = 0; std::vector<std::uint8_t> raw;
             if (!relay_node->cached_share(id, payee, bin, raw)) { why = "cut-pending: a repaired receipt left the verified cache (drops lane prefix; retry)"; return std::nullopt; }
+            std::uint16_t give = 0;   // ★ d5: the receipt's give-author u16
+            (void)relay_node->cached(id, nullptr, &give);
             if (bin == 0) {
                 relay::FbReceipt r; ::v37::xmr::verify::ParsedBlob pb;
                 if (relay::decode_fb_receipt(raw, r) && ::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb))
                     if (const auto b = drops_bin_of(pb.prev_id)) bin = *b;
                 if (bin == 0) { why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (drops lane prefix; retry)"; return std::nullopt; }
             }
-            lp.shares.push_back(c2pool::v37n::xmr::drops::LaneShare{::v37::xmr::xmr_identity_key(payee), bin});
+            lp.shares.push_back(c2pool::v37n::xmr::drops::LaneShare{::v37::xmr::xmr_identity_key(payee), bin, give});
         }
         ++drops_lane_repaired_prefix;
         return lp;
@@ -2324,6 +2326,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         dctx.price = c2pool::v37n::xmr::drops::rescale_price(price, drops->receipt_weight());
         dctx.enrollment = &out.lc.book;
         out.carry = c2pool::v37n::xmr::drops::compose_carry(cfg.lane_params, out.lc.rows, dctx);
+        if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))   // ★ d5: split by give-author, like the receipts
+            c2pool::v37n::xmr::drops::split_give_author(out.carry.delta, *lp,
+                c2pool::v37n::xmr::fee::donation_identity(donation_net_of(cfg.network)));
         if (out.carry.delta.size() > relay::kBlockWonDropsMaxRows) out.carry.delta.clear();
         ++drops_lane_composed;
         drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
@@ -3424,8 +3429,18 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return r;
             });
             {   // ★ DROPS-ENROL-LANE: the pool's enrol set (identities); enrolment itself is derived from the lane prefix
+                // ★ DROPS-AUTO-ENROL (operator ruling 09-27): no list = AUTO (every payee at its first
+                // share on the lane), a list = LIST (unchanged), "--drops-enrol none" = NONE.
+                const bool enrol_none = std::find(g_drops_enrol.begin(), g_drops_enrol.end(), "none") != g_drops_enrol.end();
+                if (enrol_none && g_drops_enrol.size() != 1) {
+                    std::printf("REFUSED: --drops-enrol none cannot be combined with an enrol list\n");
+                    node.stop(); return 2;
+                }
+                const auto emode = enrol_none ? relay::EnrolMode::None
+                                 : g_drops_enrol.empty() ? relay::EnrolMode::Auto : relay::EnrolMode::List;
+                drops->set_enrol_mode(emode);
                 std::set<::v37::bytes32> es;
-                for (const auto& e : g_drops_enrol) {
+                for (const auto& e : (enrol_none ? std::vector<std::string>{} : g_drops_enrol)) {
                     std::vector<std::uint8_t> raw;
                     if (e.size() == 64 && sub::from_hex(e, raw) && raw.size() == 32) { ::v37::bytes32 k{}; std::memcpy(k.data(), raw.data(), 32); es.insert(k); }
                     else if (const auto da = relay::decode_address(e); da && ::v37::xmr::xmr_ref_valid(da->ref()))
@@ -3433,8 +3448,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                     else
                         std::printf("DROPS: --drops-enrol %s is neither a 64-hex identity nor a valid XMR address -- NOT in the enrol set\n", e.c_str());
                 }
-                std::printf("DROPS: enrol set = %zu identit%s (digest %s…): each enrols at its FIRST share on the lane prefix [0,P), effective from that bin + 1\n",
-                            es.size(), es.size() == 1 ? "y" : "ies", hex_of(c2pool::v37n::xmr::drops::enrol_set_digest(es)).substr(0, 12).c_str());
+                std::printf("DROPS: enrol mode = %s, enrol set = %zu identit%s (HELLO enrol digest %s…): %s\n",
+                            relay::to_string(emode), es.size(), es.size() == 1 ? "y" : "ies",
+                            hex_of(c2pool::v37n::xmr::drops::enrol_mode_digest(emode, es)).substr(0, 12).c_str(),
+                            emode == relay::EnrolMode::None ? "NOBODY enrols (--drops-enrol none): every composition credits zero"
+                            : emode == relay::EnrolMode::Auto ? "EVERY payee enrols at its FIRST share on the lane prefix [0,P), effective from that bin + 1"
+                            : "each listed payee enrols at its FIRST share on the lane prefix [0,P), effective from that bin + 1");
                 drops->set_enrol_set(std::move(es));
             }
             drops_live = true;
@@ -3444,8 +3463,6 @@ static int run_live(const XmrNodeConfig& cfg) {
                         (unsigned)cfg.lane_params.subthreshold.K, c2pool::v37n::xmr::drops::kXmrDropsLz,
                         (unsigned long long)drops->share_diff(), (unsigned long long)drops->floor_diff(),
                         (unsigned long long)drops->receipt_weight(), g_drops_enrol.size());
-            if (g_drops_enrol.empty())
-                std::printf("DROPS: gate ON but NOBODY is enrolled (--drops-enrol) -- every composition credits zero (fail-closed, opt-in)\n");
         }
         // ★ DROPS-ENROL-TIDY (flip 1): NO enrolment at the native tip and NO
         // share-count arm any more. Enrolment is a pure function of the lane
@@ -3484,7 +3501,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind,
                                                             ro.network);   // S4: + FeeModelGate (+ this network's donation identity) iff ON
             if (drops_live)   // ★ DROPS-ENROL-LANE (flip 1): the enrol set is pool consensus -- another set = HELLO mismatch
-                ro.lane_params_digest = c2pool::v37n::xmr::drops::hello_digest_with_enrol(ro.lane_params_digest, drops->enrol_set());
+                ro.lane_params_digest = c2pool::v37n::xmr::drops::hello_digest_with_enrol(ro.lane_params_digest, drops->enrol_mode(),
+                                                                                         drops->enrol_set());   // ★ DROPS-AUTO-ENROL: mode folded
             ro.max_pushes_per_receipt = fee_on ? 2 : 1;   // fee model S3: (payee, donation) split
             // POOL-ID: the roundabout S1 lane_tag of THIS node's pool (own chain_id,
             // LaneParams geometry, shipped consensus version, authority 0;
@@ -3497,8 +3515,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             // ★ DROPS-ENROL-TIDY (flip 1): the enrol-set digest rides HELLO next to the
             // genesis, so a peer with another --drops-enrol list is refused by name
             // (ENROL_SET_MISMATCH, both digests) instead of a generic digest refusal.
-            if (drops_live && !drops->enrol_set().empty())
-                ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_set_digest(drops->enrol_set());
+            // ★ DROPS-AUTO-ENROL: carried in EVERY mode (auto / list / none are all pool consensus).
+            if (drops_live)
+                ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_mode_digest(drops->enrol_mode(), drops->enrol_set());
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -3610,7 +3629,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                             ::v37::xmr::verify::ParsedBlob pb;
                             if (::v37::xmr::verify::parse_hashing_blob(a.r.receipt.hashing_blob, pb)) prev_id = pb.prev_id;
                         }
-                        drops->on_share_lane(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, pos_first, n_pushes, prev_id);
+                        drops->on_share_lane(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, pos_first, n_pushes, prev_id,
+                                             a.r.side.give_author);   // ★ d5
                     }
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
@@ -4618,6 +4638,9 @@ inline void print_version() {
     const XmrNodeConfig defaults;
     std::printf("c2pool-v37-xmr %s\n", C2POOL_VERSION);
     std::printf("network default: %s\n", to_string(defaults.network));
+    std::printf("raindrops (DROPS): %s (pool rules v%u)\n",   // XMR-DROPS-DEFAULT
+                defaults.lane_params.subthreshold.enabled ? "ON by default" : "OFF (a V37_XMR_DROPS_DEFAULT=OFF build)",
+                (unsigned)relay::kXmrPoolRulesVersion);
     std::printf("pinned snapshot: mainnet height %llu (block %s); stagenet height %llu (block %s); "
                 "testnet, regtest: none\n",
                 static_cast<unsigned long long>(nat::PINNED_SNAPSHOT_MAINNET.height),
@@ -4891,8 +4914,10 @@ int main(int argc, char** argv) {
                 "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT'||lane_tag||id)\n"
                 "                               is committed in every lane coinbase; blocks without OUR tag are ordinary blocks\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
-                "  --drops-enrol ID|ADDR        DROPS (only in a V37_ACTIVATE_CONSENSUS_V1 build): enrol this payee (64-hex identity\n"
-                "                               key or XMR address) ex ante at the native TIP (repeatable); ignored when dormant\n"
+                "  --drops-enrol ID|ADDR|none   DROPS (raindrops; ON by default in this XMR build, needs the relay). Default (no\n"
+                "                               flag): AUTO -- every payee enrols at its first share on the lane. ID|ADDR (repeatable):\n"
+                "                               only the listed payees. none: nobody (credits zero). Every node of a pool must run the\n"
+                "                               same mode and list -- HELLO refuses ENROL_SET_MISMATCH by name\n"
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
