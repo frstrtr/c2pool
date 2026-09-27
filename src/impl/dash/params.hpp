@@ -46,10 +46,13 @@ namespace dash
 // overridden by an operator pool.yaml. Consensus-critical fields (share version,
 // max_target, donation script, X11 pow/block identity) and the network ISOLATION
 // PRIMITIVES (prefix/identifier) are deliberately ABSENT from this struct and are
-// therefore NEVER overridable: they stay pinned to the dash::SharechainConfig SSOT
-// regardless of any override file, so a mis-edited pool.yaml can retune
-// ports/peers but can NEVER fork the sharechain off its oracle-conformant
-// identity. The YAML file-load half lands when DASH gains its config_pool.cpp
+// therefore NEVER overridable through pool.yaml: they stay pinned to the
+// dash::SharechainConfig SSOT regardless of any override file, so a mis-edited
+// pool.yaml can retune ports/peers but can NEVER fork the sharechain off its
+// oracle-conformant identity. The ONE sanctioned identity seam is
+// SharechainConfig::set_network_id, driven by the explicit --network-id/--prefix
+// flags (or their money-acked settings-file keys sharechain.network_id /
+// sharechain.prefix) in main_dash.cpp; make_coin_params() reads its result. The YAML file-load half lands when DASH gains its config_pool.cpp
 // Fileconfig (mirrors dgb/btc); this header carries no file IO.
 struct PoolOverrides
 {
@@ -131,10 +134,20 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
     p.max_target = SharechainConfig::max_target();
 
     // Network identification — DASH oracle (isolation primitives, never unified).
-    p.identifier_hex         = SharechainConfig::IDENTIFIER_HEX;
-    p.prefix_hex             = SharechainConfig::PREFIX_HEX;
-    p.testnet_identifier_hex = SharechainConfig::TESTNET_IDENTIFIER_HEX;
-    p.testnet_prefix_hex     = SharechainConfig::TESTNET_PREFIX_HEX;
+    // A private sharechain override (SharechainConfig::set_network_id, from
+    // --network-id/--prefix) fills BOTH the mainnet and the testnet slot, so
+    // active_identifier_hex()/active_prefix_hex() return the override whichever
+    // network p.is_testnet selects -- the same answer SharechainConfig's own
+    // identifier_hex()/prefix_hex() give. With no override the four oracle
+    // constants are copied exactly as before (default identity byte-identical).
+    {
+        const std::string& oid = SharechainConfig::override_identifier_hex;
+        const std::string& opx = SharechainConfig::override_prefix_hex;
+        p.identifier_hex         = oid.empty() ? SharechainConfig::IDENTIFIER_HEX         : oid;
+        p.testnet_identifier_hex = oid.empty() ? SharechainConfig::TESTNET_IDENTIFIER_HEX : oid;
+        p.prefix_hex             = opx.empty() ? SharechainConfig::PREFIX_HEX             : opx;
+        p.testnet_prefix_hex     = opx.empty() ? SharechainConfig::TESTNET_PREFIX_HEX     : opx;
+    }
 
     // Donation script (consensus-critical) — version-keyed (operator FLAG6
     // 2026-06-17, 3-bucket rule). Pre-v36 shares use the DASH-specific P2PKH

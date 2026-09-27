@@ -101,8 +101,69 @@ struct SharechainConfig
     static inline const std::string TESTNET_IDENTIFIER_HEX = "b6deb1e543fe2427";
     static inline const std::string TESTNET_PREFIX_HEX     = "198b644f6821e3b3";
 
-    static const std::string& identifier_hex() { return is_testnet ? TESTNET_IDENTIFIER_HEX : IDENTIFIER_HEX; }
-    static const std::string& prefix_hex()     { return is_testnet ? TESTNET_PREFIX_HEX     : PREFIX_HEX; }
+    // ---- Private sharechain override (--network-id / --prefix) -----------
+    // Port of btc::PoolConfig::set_network_id (btc/config_pool.hpp). Set ONCE in
+    // main_dash.cpp main(), after argv + settings-file resolution and BEFORE any
+    // run/mine/selftest dispatch, so every consumer sees one identity:
+    //   * p2p framing  : main_dash.cpp run_node -> config.pool()->m_prefix = prefix_hex()
+    //   * ref_hash     : make_coin_params() copies the override into BOTH the
+    //                    mainnet and testnet CoinParams slots, so
+    //                    CoinParams::active_identifier_hex() (share_check.hpp
+    //                    share_init_verify + gentx ref recompute,
+    //                    share_producer.hpp compute_ref_hash) returns it on
+    //                    either network.
+    // Empty (the default) = the public live identity above, byte-identical to a
+    // build without this seam. constant-initialized (no dynamic init), like BTC.
+    static inline std::string override_identifier_hex;   // empty = public network
+    static inline std::string override_prefix_hex;       // empty = compiled network default
+
+    /// Set a private sharechain identity. IDENTIFIER and PREFIX are TWO
+    /// INDEPENDENT per-network constants (p2pool model): PREFIX is NEVER derived
+    /// from IDENTIFIER. A bare network id keeps the compiled prefix of the
+    /// selected network (mainnet 3b3e1286f446b891 / testnet 198b644f6821e3b3).
+    /// "", "0" and "00000000" select the public network (no override), matching
+    /// BTC. Inputs are normalized to exactly 16 hex chars (left-padded with '0').
+    /// Callers MUST validate with validate_network_id_args() first: this
+    /// function does not hex-check (BTC parity) and a non-hex identifier would
+    /// reach the share ref stream.
+    static void set_network_id(const std::string& network_id_hex,
+                               const std::string& prefix_hex_override = "")
+    {
+        if (network_id_hex.empty() || network_id_hex == "0" || network_id_hex == "00000000")
+            return;  // public network, use defaults
+
+        auto to8 = [](std::string h) {
+            while (h.size() < 16) h = "0" + h;
+            if (h.size() > 16) h = h.substr(0, 16);
+            return h;
+        };
+
+        override_identifier_hex = to8(network_id_hex);
+        if (!prefix_hex_override.empty())
+            override_prefix_hex = to8(prefix_hex_override);
+    }
+
+    /// Clear any override (tests only: production sets the identity once).
+    static void reset_network_id()
+    {
+        override_identifier_hex.clear();
+        override_prefix_hex.clear();
+    }
+
+    static bool has_custom_network_id() { return !override_identifier_hex.empty(); }
+
+    static const std::string& identifier_hex()
+    {
+        if (!override_identifier_hex.empty())
+            return override_identifier_hex;
+        return is_testnet ? TESTNET_IDENTIFIER_HEX : IDENTIFIER_HEX;
+    }
+    static const std::string& prefix_hex()
+    {
+        if (!override_prefix_hex.empty())
+            return override_prefix_hex;
+        return is_testnet ? TESTNET_PREFIX_HEX : PREFIX_HEX;
+    }
 
     // ---- COINBASEEXT: the canonical p2pool coinbase marker ------------------
     // SOURCE OF TRUTH: oracle networks/dash.py:11 / dash_testnet.py:11 —
@@ -276,5 +337,83 @@ struct SharechainConfig
 
     static uint256 sane_target_max() { return max_target(); }
 };
+
+// ---------------------------------------------------------------------------
+// --network-id / --prefix argument validation (pure, testable seam)
+//
+// Runs in main() on the MERGED value (argv overlaid by the settings file: the
+// file loader does not hex-validate). Stricter than BTC on purpose:
+//   * each value must be 1..16 hex chars (<= 8 bytes), even length, [0-9a-fA-F];
+//     BTC's to8 silently truncates a longer value, which on an identity that is
+//     committed into every share's ref_hash would be a silent fork.
+//   * --prefix without --network-id is an ERROR (BTC only warns): a prefix on
+//     the public identity can only isolate the node from the live fleet.
+// "0" / "00000000" are the BTC spellings of "public network" and are accepted
+// as a no-op. On success both values are lower-cased in place so logs and the
+// sharechain_identity marker file are canonical.
+// ---------------------------------------------------------------------------
+inline bool validate_network_id_args(std::string& network_id_hex,
+                                     std::string& prefix_hex,
+                                     std::string& err)
+{
+    auto is_public = [](const std::string& v) {
+        return v.empty() || v == "0" || v == "00000000";
+    };
+    auto check_hex = [&err](std::string& v, const char* flag) -> bool {
+        if (v.empty() || v.size() > 16 || (v.size() % 2) != 0) {
+            err = std::string(flag) + " must be 2..16 hex characters (1..8 bytes, even length), got \""
+                + v + "\"";
+            return false;
+        }
+        for (char& c : v) {
+            const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) {
+                err = std::string(flag) + " is not hex: \"" + v + "\"";
+                return false;
+            }
+            if (c >= 'A' && c <= 'F') c = static_cast<char>(c - 'A' + 'a');
+        }
+        return true;
+    };
+
+    if (is_public(network_id_hex)) {
+        if (!prefix_hex.empty()) {
+            err = "--prefix requires --network-id (a prefix on the public identity would only isolate this node from the live sharechain)";
+            return false;
+        }
+        return true;  // public network, no override
+    }
+    if (!check_hex(network_id_hex, "--network-id")) return false;
+    if (!prefix_hex.empty() && !check_hex(prefix_hex, "--prefix")) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Sharechain bootstrap-source selection (pure, testable seam)
+//
+// Mirror of btc::select_sharechain_bootstrap_mode (btc/config_pool.hpp). DASH
+// ships NO compiled public sharechain seed list today (peers come only from
+// --addnode/--connect), so PublicDefault dials nothing; the resolver exists so
+// a custom --network-id can never start dialing public seeds if a default list
+// is ever added, and so the identity-change addrs.json reset has one owner.
+// DASH has no separate regtest identity (--regtest maps onto testnet), so the
+// regtest arm is kept for signature parity and passed false by main_dash.
+// ---------------------------------------------------------------------------
+enum class SharechainBootstrapMode {
+    ExplicitPeers,        // --addnode/--connect given: dial ONLY those
+    RegtestIsolated,      // (unused on DASH; BTC parity)
+    CustomNetSuppressed,  // custom --network-id, no explicit peers: 0 public seeds
+    PublicDefault,        // public net, no explicit peers: compiled defaults (none today)
+};
+
+// Precedence: explicit peers > regtest > custom-network-id > public default.
+inline SharechainBootstrapMode select_sharechain_bootstrap_mode(
+    bool has_explicit_peers, bool regtest, bool has_custom_network_id)
+{
+    if (has_explicit_peers)    return SharechainBootstrapMode::ExplicitPeers;
+    if (regtest)               return SharechainBootstrapMode::RegtestIsolated;
+    if (has_custom_network_id) return SharechainBootstrapMode::CustomNetSuppressed;
+    return SharechainBootstrapMode::PublicDefault;
+}
 
 } // namespace dash

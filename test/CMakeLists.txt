@@ -281,6 +281,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_conformance PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
     gtest_add_tests(test_dash_conformance "" AUTO)
 
+    # DASH private-sharechain identity override KAT (--network-id / --prefix).
+    # OWN executable on purpose: the override lives in process-global
+    # SharechainConfig statics, and test_dash_conformance /
+    # test_dash_share_hash_link pin goldens on the DEFAULT identity in-process.
+    # Registered in build.yml's --target allowlist (both lines) so CI builds it.
+    add_executable(test_dash_network_id_override test_dash_network_id_override.cpp)
+    target_link_libraries(test_dash_network_id_override PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_network_id_override PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    gtest_add_tests(test_dash_network_id_override "" AUTO)
+
     # DASH share-v16 BYTE-PARITY KAT (T1c gate): round-trips REAL captured
     # p2pool-dash oracle-gate wire bytes (test/data/dash_oracle_corpus.hpp)
     # through the production load_share/DashFormatter path and demands byte
