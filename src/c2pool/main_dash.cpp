@@ -585,12 +585,16 @@ void print_banner(const char* argv0)
         << "        ref_hash, so nodes with different values reject each other's\n"
         << "        shares. Default = the live p2pool-dash identity (7242ef345e1bed6b,\n"
         << "        testnet b6deb1e543fe2427). A custom id never dials public\n"
-        << "        sharechain seeds and resets an addrs.json inherited from a\n"
-        << "        different identity once; seed private peers with --addnode.\n"
+        << "        sharechain seeds and keeps ALL per-network state (sharechain\n"
+        << "        LevelDB, addrs.json, ...) in its own <data-dir>/dash_<id>\n"
+        << "        (dash_testnet_<id>) subdir; seed private peers with --addnode.\n"
+        << "        Empty or all-zero ids (0, 00, 0000000000000000) = public.\n"
         << "        --prefix HEX sets the private sharechain PREFIX (hex, 1..8 bytes),\n"
         << "        an INDEPENDENT constant (never derived from the identifier). It\n"
         << "        requires --network-id; with --network-id alone the compiled\n"
-        << "        network prefix is kept (3b3e1286f446b891, testnet 198b644f6821e3b3).\n"
+        << "        network prefix is kept (3b3e1286f446b891, testnet 198b644f6821e3b3)\n"
+        << "        and the node still handshakes with public peers whose shares then\n"
+        << "        fail verification (startup WARNING): use --prefix for a private net.\n"
         << "        Settings-file keys: [dash.sharechain] network_id / prefix\n"
         << "        (money-class: need gate.money_ack_hash). CLI wins over the file.\n"
         << "        --coin-p2p-discover arms the DASH-isolated peer manager: seed\n"
@@ -1257,7 +1261,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     // Bucket-1 ISOLATION PRIMITIVE: DASH keeps its own net subdir + PREFIX,
     // per-coin AND per-pool-instance, in v36 and v37 — never standardised.
-    const std::string net_subdir = testnet ? "dash_testnet" : "dash";
+    // A custom --network-id scopes the subdir by identity ("dash_<id>" /
+    // "dash_testnet_<id>", SharechainConfig::data_subdir): EVERY consumer below
+    // (sharechain LevelDB, addrs.json, pool/coin config, graph_db,
+    // found_blocks_db, coin-side caches) builds its path from this one value,
+    // so persisted shares and their is_verified flags can never cross
+    // identities. No flag: "dash" / "dash_testnet", byte-identical to master.
+    const std::string net_subdir = dash::SharechainConfig::data_subdir(testnet);
+    if (dash::SharechainConfig::has_custom_network_id())
+        std::cout << "[run] custom network-id: per-network state is identity-scoped under "
+                  << (core::filesystem::config_path() / net_subdir).string() << "\n";
     std::error_code mkdir_ec;
     std::filesystem::create_directories(
         core::filesystem::config_path() / net_subdir, mkdir_ec);  // best effort
@@ -1280,34 +1293,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         /*has_explicit_peers=*/!peer.addnodes.empty() || !peer.connects.empty(),
         /*regtest=*/false,  // --regtest maps onto the testnet identity on DASH
         has_custom_network_id);
-    if (has_custom_network_id) {
-        // ONE-TIME addrs.json reset keyed on an identity marker (main_btc.cpp
-        // parity). The addr store (pool/node.hpp m_addrs, loaded by the
-        // dash::Node ctor below) persists learned peers under the net subdir;
-        // after a switch from the public chain (or another private id) those
-        // peers can never handshake (prefix mismatch at read_prefix) and would
-        // be redialed forever. Unlike BTC this also runs when explicit peers are
-        // given: the stale book is dialed alongside them either way. Keyed
-        // strictly on the marker so a private node keeps its learned peers
-        // across restarts. The public (no-flag) path never touches the store.
-        const auto net_dir = core::filesystem::config_path() / net_subdir;
-        const std::string identity = dash::SharechainConfig::identifier_hex() + " "
-                                   + dash::SharechainConfig::prefix_hex();
-        const auto marker_path = net_dir / "sharechain_identity";
-        std::string saved_identity;
-        {
-            std::ifstream mf(marker_path);
-            if (mf) std::getline(mf, saved_identity);
-        }
-        if (saved_identity != identity) {
-            std::error_code rm_ec;
-            std::filesystem::remove(net_dir / "addrs.json", rm_ec);  // best effort
-            std::ofstream mf(marker_path, std::ios::trunc);
-            if (mf) mf << identity << "\n";
-            std::cout << "[run] custom network-id: sharechain identity "
-                      << (saved_identity.empty() ? "unmarked" : "changed")
-                      << " -> addrs.json reset once\n";
-        }
+    if (has_custom_network_id && dash::SharechainConfig::override_prefix_hex.empty()) {
+        // --network-id without --prefix keeps the PUBLIC frame prefix, so this
+        // node still completes the p2p handshake with public p2pool-dash peers
+        // (the prefix is all read_prefix checks) while every share either side
+        // sends fails ref_hash verification: wasted bandwidth, a noisy log and
+        // peers that ban/drop each other. A private net wants its own prefix.
+        LOG_WARNING << "[run] custom --network-id " << dash::SharechainConfig::identifier_hex()
+                    << " WITHOUT --prefix: keeping the public sharechain prefix "
+                    << dash::SharechainConfig::prefix_hex()
+                    << ". This node will still handshake with public p2pool-dash peers, but"
+                       " every share exchanged with them fails verification (different"
+                       " identifier). For a private sharechain also pass --prefix HEX.";
     }
     switch (bootstrap_mode) {
     case dash::SharechainBootstrapMode::ExplicitPeers:
@@ -11744,6 +11741,21 @@ int main(int argc, char** argv)
         }
         int rc_code = cs::wire_settings(path, c2pool::catalog::C_DASH, tracker, rc);
         if (rc_code != 0) return rc_code;
+        // Private sharechain identity (money-class rows: reaching here means the
+        // money-ack gate passed). Overlaid and VALIDATED on the merged (file +
+        // CLI) value BEFORE the --dump-resolved-config early exit, so a bad
+        // --network-id / --prefix (or settings-file value) errors on the dump
+        // lane exactly as on --run. Values are lower-cased in place; the
+        // override itself is applied once, below, before the run dispatch.
+        if (rc.file_set("sharechain.network_id")) network_id_hex = rc.get_string("sharechain.network_id").value_or(network_id_hex);
+        if (rc.file_set("sharechain.prefix"))     prefix_hex_cli = rc.get_string("sharechain.prefix").value_or(prefix_hex_cli);
+        {
+            std::string nid_err;
+            if (!dash::validate_network_id_args(network_id_hex, prefix_hex_cli, nid_err)) {
+                std::cerr << "error: " << nid_err << "\n";
+                return 1;
+            }
+        }
         if (want_dump_config) { cs::dump_resolved(rc); return 0; }
         // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
         // for the read-only control-plane endpoints (GET /api/config[/schema],
@@ -11767,10 +11779,6 @@ int main(int argc, char** argv)
         if (rc.file_set("money.node_owner_fee_pct")) node_owner_fee     = rc.get_double("money.node_owner_fee_pct").value_or(node_owner_fee);
         if (rc.file_set("money.give_author_pct"))    dev_donation       = rc.get_double("money.give_author_pct").value_or(dev_donation);
         if (rc.file_set("money.node_owner_address")) node_owner_address = rc.get_string("money.node_owner_address").value_or(node_owner_address);
-        // Private sharechain identity (money-class rows: reaching here means the
-        // money-ack gate passed). Validated on the MERGED value below.
-        if (rc.file_set("sharechain.network_id")) network_id_hex = rc.get_string("sharechain.network_id").value_or(network_id_hex);
-        if (rc.file_set("sharechain.prefix"))     prefix_hex_cli = rc.get_string("sharechain.prefix").value_or(prefix_hex_cli);
         // #157 Slice 3: control-plane apply token file. A settings-file value is
         // honored (CLI wins) exactly like the overlays above; because the row is
         // money-class it already passed the money-ack gate to reach here.
@@ -11883,15 +11891,11 @@ int main(int argc, char** argv)
     // share_check.hpp and share_producer.hpp) and the startup log. All three
     // read dash::SharechainConfig, so it is set exactly once, here, BEFORE the
     // --mine-block / --run / --selftest dispatch below. Never move this after
-    // run_node: the frame prefix would stay public while ref_hash moved.
-    {
-        std::string err;
-        if (!dash::validate_network_id_args(network_id_hex, prefix_hex_cli, err)) {
-            std::cerr << "error: " << err << "\n";
-            return 1;
-        }
-        dash::SharechainConfig::set_network_id(network_id_hex, prefix_hex_cli);
-    }
+    // run_node: the frame prefix would stay public while ref_hash moved (and
+    // run_node's identity-scoped data subdir would stay the public one).
+    // Both values were validated (and lower-cased) on the merged file+CLI value
+    // in the settings block above, before the --dump-resolved-config exit.
+    dash::SharechainConfig::set_network_id(network_id_hex, prefix_hex_cli);
 
     // ── --coinbase-text: resolve ONCE, here, before any coinbase is built ────
     // DASH has no merged mining and writes no THE state-root/metadata tail, so

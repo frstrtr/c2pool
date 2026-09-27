@@ -12,7 +12,12 @@
 //       both networks, and a share minted under it verifies under it but not
 //       under the public identity;
 //   (c) invalid input is rejected before it can reach the ref stream;
-//   (d) sharechain bootstrap-mode precedence (btc parity).
+//   (d) sharechain bootstrap-mode precedence (btc parity);
+//   (e) per-network on-disk state is identity-scoped: the data subdir is the
+//       legacy "dash"/"dash_testnet" with no flag and "<legacy>_<id>" with one,
+//       and a share persisted through the production SharechainStorage under
+//       identity A is invisible to a node configured with identity B (or with
+//       no flag), while A still finds it after switching back.
 //
 // OWN EXECUTABLE ON PURPOSE: the override lives in process-global statics.
 // test_dash_share_hash_link / test_dash_conformance hold goldens on the DEFAULT
@@ -37,8 +42,13 @@
 #include <core/pack_types.hpp>
 #include <core/uint256.hpp>
 #include <btclibs/util/strencodings.h>  // ParseHexBytes, HexStr
+#include <c2pool/storage/sharechain_storage.hpp>
+#include <core/filesystem.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -301,15 +311,36 @@ TEST(DashNetworkIdOverride, BareNetworkIdKeepsCompiledPrefix) {
 // ═════════════════════════════════════════════════════════════════════════════
 TEST(DashNetworkIdOverride, PublicSpellingsAreNoOp) {
     IdentityGuard g;
-    for (const char* v : {"", "0", "00000000"}) {
+    // Empty or ANY all-'0' spelling (any length, odd or even) is the public
+    // network: an all-zero id left-pads to the same 16 zeros, so none of these
+    // may become a private identity.
+    for (const char* v : {"", "0", "00", "000", "0000", "00000000",
+                          "0000000000000000", "00000000000000000"}) {
+        SCOPED_TRACE(std::string("id=\"") + v + "\"");
+        EXPECT_TRUE(SharechainConfig::is_public_network_id(v));
         SharechainConfig::set_network_id(v, "");
-        EXPECT_TRUE(SharechainConfig::override_identifier_hex.empty()) << v;
-        EXPECT_TRUE(SharechainConfig::override_prefix_hex.empty()) << v;
-        EXPECT_EQ(SharechainConfig::identifier_hex(), MAIN_ID) << v;
+        EXPECT_TRUE(SharechainConfig::override_identifier_hex.empty());
+        EXPECT_TRUE(SharechainConfig::override_prefix_hex.empty());
+        EXPECT_FALSE(SharechainConfig::has_custom_network_id());
+        EXPECT_EQ(SharechainConfig::identifier_hex(), MAIN_ID);
+        EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
 
+        // A prefix passed alongside a public spelling is ignored by
+        // set_network_id (public = no override at all) ...
+        SharechainConfig::set_network_id(v, "0badc0ffee11");
+        EXPECT_TRUE(SharechainConfig::override_prefix_hex.empty());
+        EXPECT_EQ(SharechainConfig::prefix_hex(), MAIN_PFX);
+
+        // ... and validation accepts the bare spelling but rejects it with a
+        // prefix (a prefix on the public identity only isolates the node).
         std::string id = v, pfx, err;
-        EXPECT_TRUE(dash::validate_network_id_args(id, pfx, err)) << v << " " << err;
+        EXPECT_TRUE(dash::validate_network_id_args(id, pfx, err)) << err;
+        std::string id2 = v, pfx2 = "0badc0ffee11", err2;
+        EXPECT_FALSE(dash::validate_network_id_args(id2, pfx2, err2));
     }
+    // Not public: a single non-zero nibble anywhere.
+    for (const char* v : {"01", "10", "0000000000000001", "1000000000000000"})
+        EXPECT_FALSE(SharechainConfig::is_public_network_id(v)) << v;
 }
 
 TEST(DashNetworkIdOverride, InvalidInputRejected) {
@@ -330,7 +361,7 @@ TEST(DashNetworkIdOverride, InvalidInputRejected) {
     EXPECT_TRUE(ok("0123456789abcdef", ""));       // exactly 8 bytes
     EXPECT_TRUE(ok("abcd", "0badc0ffee11"));
 
-    // Accepted values are lower-cased in place (canonical log / marker).
+    // Accepted values are lower-cased in place (canonical log / data subdir).
     std::string id = "ABCD", pfx = "0BADC0FFEE11", err;
     ASSERT_TRUE(dash::validate_network_id_args(id, pfx, err)) << err;
     EXPECT_EQ(id, "abcd");
@@ -351,4 +382,99 @@ TEST(DashNetworkIdOverride, BootstrapModePrecedence) {
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(true,  false, false), M::ExplicitPeers);
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false, true),  M::CustomNetSuppressed);
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false, false), M::PublicDefault);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (e) Identity-scoped persistence. load_persisted_shares() (node.cpp) trusts
+//     the stored hashes AND their is_verified flags, so a store written under
+//     one identity must never be opened under another.
+// ═════════════════════════════════════════════════════════════════════════════
+TEST(DashNetworkIdOverride, DataSubdirIsIdentityScoped) {
+    IdentityGuard g;
+    // No flag: legacy subdirs, byte-identical to master's literal.
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
+    EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet");
+
+    SharechainConfig::set_network_id("abcd", "");
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_000000000000abcd");
+    EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet_000000000000abcd");
+
+    // Keyed on the identifier only: the ref_hash commits the identifier, not
+    // the prefix, so a prefix change keeps the (still valid) store.
+    SharechainConfig::reset_network_id();
+    SharechainConfig::set_network_id("abcd", "0badc0ffee11");
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_000000000000abcd");
+
+    SharechainConfig::reset_network_id();
+    SharechainConfig::set_network_id("0123456789abcdef", "");
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_0123456789abcdef");
+
+    SharechainConfig::reset_network_id();
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
+}
+
+TEST(DashNetworkIdOverride, PersistedShareDoesNotCrossIdentities) {
+    namespace fs = std::filesystem;
+    IdentityGuard g;
+
+    // Private, per-test data dir (the process-wide --data-dir seam).
+    const fs::path root = fs::temp_directory_path()
+        / ("c2pool_dash_netid_kat_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root);
+    core::filesystem::set_data_dir(root);
+
+    uint256 h;
+    h.SetHex("00000000000000000000000000000000000000000000000000000000c0ffee01");
+    const std::vector<uint8_t> payload = {0x10, 0, 0, 0, 0, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef};
+
+    auto open_as = [](const std::string& id) {
+        SharechainConfig::reset_network_id();
+        SharechainConfig::set_network_id(id, "");
+        const std::string sub = SharechainConfig::data_subdir(false);
+        fs::create_directories(core::filesystem::config_path() / sub);
+        return std::make_unique<c2pool::storage::SharechainStorage>(sub);
+    };
+
+    // Identity A persists one share.
+    {
+        auto a = open_as("aaaa");
+        ASSERT_TRUE(a->is_available());
+        ASSERT_TRUE(a->store_share(h, payload, uint256::ZERO, /*height=*/1,
+                                   /*timestamp=*/1700000000, uint256::ONE, uint256::ONE));
+        EXPECT_TRUE(a->has_share(h));
+    }
+    EXPECT_TRUE(fs::exists(root / "dash_000000000000aaaa" / "sharechain_leveldb"));
+
+    // Identity B: a different store, the share is invisible to the loader's scan.
+    {
+        auto b = open_as("bbbb");
+        ASSERT_TRUE(b->is_available());
+        EXPECT_FALSE(b->has_share(h));
+        EXPECT_TRUE(b->get_shares_by_height_range(0, UINT64_MAX).empty());
+    }
+    EXPECT_TRUE(fs::exists(root / "dash_000000000000bbbb" / "sharechain_leveldb"));
+
+    // No flag (public identity): the legacy store, also blind to A's share.
+    {
+        auto pub = open_as("");
+        ASSERT_TRUE(pub->is_available());
+        EXPECT_FALSE(pub->has_share(h));
+        EXPECT_TRUE(pub->get_shares_by_height_range(0, UINT64_MAX).empty());
+    }
+    EXPECT_TRUE(fs::exists(root / "dash" / "sharechain_leveldb"));
+
+    // Reversible: switching back to A finds its own state untouched.
+    {
+        auto a2 = open_as("aaaa");
+        ASSERT_TRUE(a2->is_available());
+        EXPECT_TRUE(a2->has_share(h));
+        const auto all = a2->get_shares_by_height_range(0, UINT64_MAX);
+        ASSERT_EQ(all.size(), 1u);
+        EXPECT_EQ(all[0], h);
+    }
+
+    core::filesystem::set_data_dir({});
+    fs::remove_all(root, ec);
 }

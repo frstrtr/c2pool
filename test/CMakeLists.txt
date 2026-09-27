@@ -293,7 +293,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
-    target_link_libraries(test_dash_network_id_override PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs
+    target_link_libraries(test_dash_network_id_override PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining c2pool_storage)  # OBJECT-lib SCC direct-naming (#22/#39): core stratum/web_server TUs; c2pool_storage = identity-scoped persistence KAT
     gtest_add_tests(test_dash_network_id_override "" AUTO)
 
     # DASH share-v16 BYTE-PARITY KAT (T1c gate): round-trips REAL captured

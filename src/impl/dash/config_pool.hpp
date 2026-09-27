@@ -117,19 +117,34 @@ struct SharechainConfig
     static inline std::string override_identifier_hex;   // empty = public network
     static inline std::string override_prefix_hex;       // empty = compiled network default
 
+    /// True for every spelling of "the public network": the empty string or
+    /// any run of '0' characters of any length ("0", "00", "00000000",
+    /// "0000000000000000", ...). An all-zero identifier left-pads to the same
+    /// 16 zeros whatever its length, so all of these must mean one thing; BTC
+    /// only special-cases "0" and "00000000", which would let "0000000000000000"
+    /// silently become a private id. Shared by set_network_id() and
+    /// validate_network_id_args() so the two can never disagree.
+    static bool is_public_network_id(const std::string& network_id_hex)
+    {
+        for (char c : network_id_hex)
+            if (c != '0') return false;
+        return true;  // empty, or all '0'
+    }
+
     /// Set a private sharechain identity. IDENTIFIER and PREFIX are TWO
     /// INDEPENDENT per-network constants (p2pool model): PREFIX is NEVER derived
     /// from IDENTIFIER. A bare network id keeps the compiled prefix of the
     /// selected network (mainnet 3b3e1286f446b891 / testnet 198b644f6821e3b3).
-    /// "", "0" and "00000000" select the public network (no override), matching
-    /// BTC. Inputs are normalized to exactly 16 hex chars (left-padded with '0').
+    /// An empty or all-'0' id (is_public_network_id) selects the public network
+    /// (no override). Inputs are normalized to exactly 16 hex chars (left-padded
+    /// with '0').
     /// Callers MUST validate with validate_network_id_args() first: this
     /// function does not hex-check (BTC parity) and a non-hex identifier would
     /// reach the share ref stream.
     static void set_network_id(const std::string& network_id_hex,
                                const std::string& prefix_hex_override = "")
     {
-        if (network_id_hex.empty() || network_id_hex == "0" || network_id_hex == "00000000")
+        if (is_public_network_id(network_id_hex))
             return;  // public network, use defaults
 
         auto to8 = [](std::string h) {
@@ -163,6 +178,25 @@ struct SharechainConfig
         if (!override_prefix_hex.empty())
             return override_prefix_hex;
         return is_testnet ? TESTNET_PREFIX_HEX : PREFIX_HEX;
+    }
+
+    /// Per-network data-dir subdirectory (under core::filesystem::config_path()).
+    /// EVERY piece of per-network on-disk state is rooted here: the sharechain
+    /// LevelDB (<subdir>/sharechain_leveldb, trusted on load including its
+    /// is_verified flags), addrs.json, pool/coin config files, graph_db,
+    /// found_blocks_db and the coin-side caches. A custom --network-id appends
+    /// "_<identifier>" so a private identity can never load shares, verified
+    /// flags or learned peers persisted under a different identity (and
+    /// switching back finds its own state untouched). The public (no-flag) path
+    /// returns the legacy "dash" / "dash_testnet", byte-identical to master.
+    /// Keyed on the identifier only: the ref_hash commits the identifier, not
+    /// the prefix, so persisted shares are valid across a prefix change.
+    static std::string data_subdir(bool testnet)
+    {
+        std::string d = testnet ? "dash_testnet" : "dash";
+        if (has_custom_network_id())
+            d += "_" + override_identifier_hex;
+        return d;
     }
 
     // ---- COINBASEEXT: the canonical p2pool coinbase marker ------------------
@@ -348,17 +382,16 @@ struct SharechainConfig
 //     committed into every share's ref_hash would be a silent fork.
 //   * --prefix without --network-id is an ERROR (BTC only warns): a prefix on
 //     the public identity can only isolate the node from the live fleet.
-// "0" / "00000000" are the BTC spellings of "public network" and are accepted
-// as a no-op. On success both values are lower-cased in place so logs and the
-// sharechain_identity marker file are canonical.
+// An empty or all-'0' id of any length ("0", "00", "00000000",
+// "0000000000000000", ...) means "public network" and is accepted as a no-op
+// (SharechainConfig::is_public_network_id). On success both values are
+// lower-cased in place so logs and the identity-scoped data subdir are
+// canonical.
 // ---------------------------------------------------------------------------
 inline bool validate_network_id_args(std::string& network_id_hex,
                                      std::string& prefix_hex,
                                      std::string& err)
 {
-    auto is_public = [](const std::string& v) {
-        return v.empty() || v == "0" || v == "00000000";
-    };
     auto check_hex = [&err](std::string& v, const char* flag) -> bool {
         if (v.empty() || v.size() > 16 || (v.size() % 2) != 0) {
             err = std::string(flag) + " must be 2..16 hex characters (1..8 bytes, even length), got \""
@@ -376,7 +409,7 @@ inline bool validate_network_id_args(std::string& network_id_hex,
         return true;
     };
 
-    if (is_public(network_id_hex)) {
+    if (SharechainConfig::is_public_network_id(network_id_hex)) {
         if (!prefix_hex.empty()) {
             err = "--prefix requires --network-id (a prefix on the public identity would only isolate this node from the live sharechain)";
             return false;
@@ -395,7 +428,9 @@ inline bool validate_network_id_args(std::string& network_id_hex,
 // ships NO compiled public sharechain seed list today (peers come only from
 // --addnode/--connect), so PublicDefault dials nothing; the resolver exists so
 // a custom --network-id can never start dialing public seeds if a default list
-// is ever added, and so the identity-change addrs.json reset has one owner.
+// is ever added. (A learned-peer book from another identity cannot leak in:
+// addrs.json lives under SharechainConfig::data_subdir(), which is
+// identity-scoped.)
 // DASH has no separate regtest identity (--regtest maps onto testnet), so the
 // regtest arm is kept for signature parity and passed false by main_dash.
 // ---------------------------------------------------------------------------
