@@ -1274,7 +1274,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         const auto& prof = dash::SharechainConfig::share_profile();
         std::cout << "[run] private/isolated DASH sharechain profile: target share version "
                   << prof.target_share_version
-                  << " (dormant: minting stays v16 until the flip), ratchet seed "
+                  << " (accepts v36 shares; minting stays v16 until the flip), ratchet seed "
                   << prof.ratchet_floor_protocol_version << "\n";
     }
     std::error_code mkdir_ec;
@@ -1874,7 +1874,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 //    counts, per-miner tally, and V36 propagation depth ──────────
                 std::map<int, int> desired_counts;   // m_desired_version → count
                 std::map<std::string, int> miner_counts;
-                int format_v16 = 0;
+                std::map<int, int> format_by_version;  // share TYPE (wire) version -> count
+                int format_total = 0;
                 int deepest_v36_pos = 0;
                 int v36_contiguous_from_tip = 0;
                 bool contiguous = true;
@@ -1902,7 +1903,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         data.share.invoke([&](auto* s) {
                             int dv = static_cast<int>(s->m_desired_version);
                             desired_counts[dv] += 1;
-                            format_v16 += 1;  // DashShare is wire-format v16
+                            // Wire type: DashShare=16 (public + pre-flip private
+                            // chain), DashV36Share=36 (private/isolated v36 chain).
+                            format_by_version[static_cast<int>(
+                                std::remove_pointer_t<decltype(s)>::version)] += 1;
+                            format_total += 1;
                             miner_counts[s->m_pubkey_hash.GetHex()] += 1;
                             // i == 0 is the best share (get_chain walks tip-first).
                             if (i == 0 && s->m_max_bits != 0)
@@ -1926,7 +1931,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // total_shares == the active-chain window actually tallied (matches
                 // main_ltc.cpp, where total_shares is the windowed skiplist count), so
                 // the gauge's version percentages divide by the same denominator.
-                out["total_shares"] = format_v16;
+                out["total_shares"] = format_total;
 
                 // Only publish when we actually measured one; an absent key makes
                 // /global_stats emit min_difficulty:null, which is the honest
@@ -1934,11 +1939,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // whole payload as None below 10 shares).
                 if (best_min_difficulty > 0.0)
                     out["min_difficulty"] = best_min_difficulty;
-                if (format_v16 > 0 && difficulty_sum > 0.0)
-                    out["average_difficulty"] = difficulty_sum / format_v16;
+                if (format_total > 0 && difficulty_sum > 0.0)
+                    out["average_difficulty"] = difficulty_sum / format_total;
 
+                // Public network: only DashShare exists, so this is exactly
+                // {"16": N} (or {} on an empty chain), as before.
                 nlohmann::json sbv = nlohmann::json::object();
-                if (format_v16 > 0) sbv["16"] = format_v16;
+                for (auto& [ver, cnt] : format_by_version)
+                    if (cnt > 0) sbv[std::to_string(ver)] = cnt;
                 out["shares_by_version"] = sbv;
 
                 nlohmann::json sbdv = nlohmann::json::object();
@@ -3500,11 +3508,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 std::optional<dash::coin::ReconstructedWonBlock> result;
                 won_tracker.chain.get_share(sh).invoke([&](auto* obj) {
                     if (!obj) return;
-                    using ShareT = std::decay_t<decltype(*obj)>;
-                    if constexpr (std::is_same_v<ShareT, dash::DashShare>) {
-                        result = dash::coin::reconstruct_won_block(
-                            sh, *obj, won_tracker, won_params, /*known_txs=*/{});
-                    }
+                    // Both live share types (v36 = private/isolated v36 sharechain;
+                    // its block is coinbase-only by construction).
+                    result = dash::coin::reconstruct_won_block(
+                        sh, *obj, won_tracker, won_params, /*known_txs=*/{});
                 });
                 return result;
             };

@@ -64,7 +64,30 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
             [i, data, remaining, this, addr]()
             {
                 auto& share = data->m_items[i];
-                if (share.hash().IsNull())
+
+                // The one wire type this chain admits (public: v16; private/
+                // isolated v36 sharechain: the type it mints). A share of the
+                // other type is dropped here: hash forced null, phase 2 frees it.
+                bool admitted = true;
+                try
+                {
+                    share.ACTION({
+                        check_share_type_admitted(share_t::version, m_tracker.m_coin_params);
+                    });
+                }
+                catch (const std::exception& e)
+                {
+                    admitted = false;
+                    share.ACTION({ obj->m_hash.SetNull(); });
+                    static std::atomic<uint64_t> s_rejected{0};
+                    const uint64_t n_rej = ++s_rejected;
+                    if (n_rej <= 3 || n_rej % 100 == 0)
+                        LOG_WARNING << "[Pool] share from " << addr.to_string()
+                                    << " rejected: " << e.what()
+                                    << " (rejected_total=" << n_rej << ")";
+                }
+
+                if (admitted && share.hash().IsNull())
                 {
                     try
                     {
@@ -364,6 +387,18 @@ void NodeImpl::load_persisted_shares()
             chain::RawShare rshare(ver, PackStream(
                 std::vector<unsigned char>(data.begin() + 8, data.end())));
             auto share = dash::load_share(rshare, NetService{"database", 0});
+            // A row of a type this chain does not admit (e.g. v16 rows in an
+            // identity-scoped private/isolated DB written before the chain
+            // switched to v36) is skipped, never inserted.
+            try {
+                check_share_type_admitted(share.version(), m_tracker.m_coin_params);
+            } catch (const std::exception& e) {
+                share.destroy();
+                ++skipped;
+                LOG_WARNING << "[Pool] skipped persisted share "
+                            << hash.GetHex().substr(0, 16) << ": " << e.what();
+                continue;
+            }
             // m_hash is not serialized — restore from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
             if (m_chain->contains(share.hash())) {
@@ -477,12 +512,14 @@ void NodeImpl::apply_min_protocol_ratchet()
         return;
 
     // DASH DIVERGENCE FROM dgb (flagged for integrator): dgb keys the ratchet on the
-    // best share's static TYPE version (35 -> 36 after the format switch). DASH has
-    // NO v36 share TYPE — DashShare is permanently wire-type 16 — so "the best share
-    // is v36" is expressed by its m_desired_version VOTE reaching 36, and that vote is
-    // what the work-weighted tally is keyed by. Using the static type here would check
-    // weights[16] (always ~100% pre-crossing) and FALSELY lift the floor; using the
-    // vote checks weights[36], which is ~0 until the crossing actually happens.
+    // best share's static TYPE version (35 -> 36 after the format switch). On the
+    // public network DASH has no v36 share TYPE — DashShare is permanently wire-type
+    // 16 (the v36 type, DashV36Share, exists only on the private/isolated v36
+    // sharechain) — so "the best share is v36" is expressed by its m_desired_version
+    // VOTE reaching 36, and that vote is what the work-weighted tally is keyed by.
+    // Using the static type here would check weights[16] (always ~100% pre-crossing)
+    // and FALSELY lift the floor; using the vote checks weights[36], which is ~0
+    // until the crossing actually happens.
     int64_t best_desired = 0;
     uint256 prev_hash;
     m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {

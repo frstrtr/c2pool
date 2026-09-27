@@ -538,6 +538,11 @@ public:
             auto t0 = std::chrono::steady_clock::now();
             auto& share_var = chain.get_share(share_hash);
             share_var.ACTION({
+                // Phase 0: the one wire type this chain admits (public: v16;
+                // private/isolated v36 sharechain: the type it mints). A share of
+                // the other type is never verified, stored or built on.
+                dash::check_share_type_admitted(share_t::version, m_coin_params);
+
                 // Phase 1: structural + X11 PoW, hash_link, merkle, target.
                 // Caches g_last_gentx_hash (the coinbase txid this share's
                 // hash_link committed to) for the Phase-3 payout gate below.

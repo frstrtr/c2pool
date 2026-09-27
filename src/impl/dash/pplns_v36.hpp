@@ -3,9 +3,9 @@
 
 // ============================================================================
 // pplns_v36.hpp — the shared v36 PPLNS pieces for the private/isolated DASH
-// v36 sharechain (custom --network-id). DORMANT until the live ShareType admits
-// wire-type 36: nothing on the public v16 path calls into the v36 window or the
-// v36 amounts rule.
+// v36 sharechain (custom --network-id). Reached only for a v36 share, which
+// only that profile loads: nothing on the public v16 path calls into the v36
+// window or the v36 amounts rule.
 //
 // ONE place for each consensus rule, so the v36 verifier (share_check.hpp
 // generate_share_transaction(DashV36Share)), the v36 producer (share_producer.hpp
