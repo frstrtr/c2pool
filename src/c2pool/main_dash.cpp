@@ -510,6 +510,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
+        << "           [--net dash-v36]  (the DASH v36 network)\n"
         << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
@@ -641,6 +642,14 @@ void print_banner(const char* argv0)
         << "        fail verification (startup WARNING): use --prefix for a private net.\n"
         << "        Settings-file keys: [dash.sharechain] network_id / prefix\n"
         << "        (money-class: need gate.money_ack_hash). CLI wins over the file.\n"
+        << "        --net dash-v36 joins the DASH v36 network: a p2pool v36 sharechain\n"
+        << "        for DASH that mints and accepts share v36 only (identifier\n"
+        << "        ac2785363c0180b8, prefix 8d8516bac9edd280, protocol 3601; state in\n"
+        << "        <data-dir>/dash_ac2785363c0180b8_v36). It FORKS from the default\n"
+        << "        v16 sharechain. Mainnet only; cannot be combined with --network-id,\n"
+        << "        --prefix or --testnet. No built-in seeds yet: pass --addnode\n"
+        << "        HOST:PORT. Settings-file key: [dash.sharechain] network = \"v36\"\n"
+        << "        (money-class). Without --net the node stays on the v16 sharechain.\n"
         << "        --coin-p2p-discover arms the DASH-isolated peer manager: seed\n"
         << "        (dnsseed.dash.org + fixed) bootstrap, source-scored + group-diverse\n"
         << "        (Sybil-capped) peer selection, anchors, and a self-healing dial\n"
@@ -805,7 +814,7 @@ int check_coin_params()
         want(main.current_share_version == 16, "share_version == 16 (older-than-v35 baseline)");
     else
         want(main.current_share_version == 36,
-             "share_version == 36 (private/isolated DASH v36 sharechain)");
+             "share_version == 36 (DASH v36 network profile)");
     want(main.address_version == 76,       "mainnet pubkey addr version == 76 (X...)");
     want(static_cast<bool>(main.pow_func), "pow_func wired");
 
@@ -1324,10 +1333,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // identities. No flag: "dash" / "dash_testnet", byte-identical to master.
     const std::string net_subdir = dash::SharechainConfig::data_subdir(testnet);
     if (dash::SharechainConfig::has_custom_network_id()) {
-        std::cout << "[run] custom network-id: per-network state is identity-scoped under "
-                  << (core::filesystem::config_path() / net_subdir).string() << "\n";
+        if (dash::SharechainConfig::is_named_v36_network())
+            std::cout << "[run] DASH v36 network (--net " << dash::SharechainConfig::V36_NETWORK_NAME
+                      << "): id=" << dash::SharechainConfig::identifier_hex()
+                      << " prefix=" << dash::SharechainConfig::prefix_hex()
+                      << ", per-network state under "
+                      << (core::filesystem::config_path() / net_subdir).string() << "\n";
+        else
+            std::cout << "[run] custom network-id: per-network state is identity-scoped under "
+                      << (core::filesystem::config_path() / net_subdir).string() << "\n";
         const auto& prof = dash::SharechainConfig::share_profile();
-        std::cout << "[run] private/isolated DASH sharechain profile: mints share v"
+        std::cout << "[run] DASH v36 network profile: mints share v"
                   << prof.target_share_version
                   << " (admits v" << prof.target_share_version << " only), ratchet seed "
                   << prof.ratchet_floor_protocol_version
@@ -1358,7 +1374,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     const auto bootstrap_mode = dash::select_sharechain_bootstrap_mode(
         /*has_explicit_peers=*/!peer.addnodes.empty() || !peer.connects.empty(),
         /*regtest=*/false,  // --regtest maps onto the testnet identity on DASH
-        has_custom_network_id);
+        has_custom_network_id,
+        /*named_v36_network=*/dash::SharechainConfig::is_named_v36_network());
     if (has_custom_network_id && dash::SharechainConfig::override_prefix_hex.empty()) {
         // --network-id without --prefix keeps the PUBLIC frame prefix, so this
         // node still completes the p2p handshake with public p2pool-dash peers
@@ -1384,6 +1401,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         break;
     case dash::SharechainBootstrapMode::PublicDefault:
         break;  // DASH ships no compiled sharechain seeds: nothing to add
+    case dash::SharechainBootstrapMode::V36NetworkSeeds: {
+        // --net dash-v36 with no --addnode/--connect: the network's own built-in
+        // seeds (never the public ones). Empty until the operator approves the
+        // first entries (dash::v36_network_seed_hosts TODO).
+        const auto seeds = dash::v36_network_seed_hosts();
+        std::size_t added = 0;
+        for (const auto& hp : seeds) {
+            NetService ns;
+            if (parse_hostport(hp, ns)) {  // entries are HOST:PORT
+                config.pool()->m_bootstrap_addrs.push_back(ns);
+                ++added;
+            }
+        }
+        if (added == 0)
+            std::cout << "[run] DASH v36 network: no built-in seeds yet; supply --addnode HOST:PORT"
+                         " to reach a peer of this network\n";
+        else
+            std::cout << "[run] DASH v36 network: " << added << " built-in seed(s)\n";
+        break;
+    }
     }
 
     // shared_ptr-owned + set_lifetime so the sharechain node's core::Server(accept)
@@ -1441,7 +1478,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
                   << " prefix=" << dash::SharechainConfig::prefix_hex()
                   << " identifier=" << dash::SharechainConfig::identifier_hex()
-                  << (has_custom_network_id ? " (custom --network-id)" : "") << "\n";
+                  << (dash::SharechainConfig::is_named_v36_network() ? " (DASH v36 network)"
+                      : has_custom_network_id ? " (custom --network-id)" : "") << "\n";
     } else {
         // Symmetry with the LISTENING branch above: the --connect leg frames
         // every outbound packet with this same prefix (pool/node.hpp:88
@@ -1453,7 +1491,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
                   << " prefix=" << dash::SharechainConfig::prefix_hex()
                   << " identifier=" << dash::SharechainConfig::identifier_hex()
-                  << (has_custom_network_id ? " (custom --network-id)" : "") << "\n";
+                  << (dash::SharechainConfig::is_named_v36_network() ? " (DASH v36 network)"
+                      : has_custom_network_id ? " (custom --network-id)" : "") << "\n";
     }
     // #754 download/outbound slice: ACTIVE outbound dialing from the addr
     // store (--addnode/--connect seeds registered by the NodeImpl ctor) plus
@@ -11610,6 +11649,8 @@ int main(int argc, char** argv)
     std::string settings_path;                 // --settings PATH (M0b; empty => default probe)
     std::string network_id_hex;                // --network-id: private sharechain IDENTIFIER (empty = public net)
     std::string prefix_hex_cli;                // --prefix: private sharechain PREFIX (needs --network-id)
+    std::string net_name;                      // --net NAME: named sharechain network ("dash-v36"; empty = none)
+    dash::SharechainConfig::NamedNetwork named_network = dash::SharechainConfig::NamedNetwork::None;
     bool want_dump_config = false;             // --dump-resolved-config (M0b)
     bool want_ack_money   = false;             // --ack-money-settings (M0b)
     // Optional encrypted authority message_data blob for local v36 shares +
@@ -11682,6 +11723,12 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--prefix") == 0) {
             if (i + 1 >= argc) { std::cerr << "error: --prefix requires a HEX argument\n"; return 1; }
             prefix_hex_cli = argv[++i];
+        }
+        // Named sharechain network (--net dash-v36 = the DASH v36 network).
+        // Validated with the identity flags after the settings overlay below.
+        else if (std::strcmp(argv[i], "--net") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') { std::cerr << "error: --net requires a NAME argument (dash-v36)\n"; return 1; }
+            net_name = argv[++i];
         }
         else if (std::strcmp(argv[i], "--coin-p2p-connect") == 0 && i + 1 < argc)
             coin_p2p_raw.emplace_back(argv[++i]);
@@ -12071,9 +12118,13 @@ int main(int argc, char** argv)
         // override itself is applied once, below, before the run dispatch.
         if (rc.file_set("sharechain.network_id")) network_id_hex = rc.get_string("sharechain.network_id").value_or(network_id_hex);
         if (rc.file_set("sharechain.prefix"))     prefix_hex_cli = rc.get_string("sharechain.prefix").value_or(prefix_hex_cli);
+        if (rc.file_set("sharechain.network"))    net_name       = rc.get_string("sharechain.network").value_or(net_name);
         {
             std::string nid_err;
-            if (!dash::validate_network_id_args(network_id_hex, prefix_hex_cli, nid_err)) {
+            // --net first: it rejects --net combined with --network-id /
+            // --prefix (from either surface) before either is applied.
+            if (!dash::validate_sharechain_identity_args(net_name, network_id_hex, prefix_hex_cli,
+                                                         testnet, named_network, nid_err)) {
                 std::cerr << "error: " << nid_err << "\n";
                 return 1;
             }
@@ -12217,7 +12268,7 @@ int main(int argc, char** argv)
     // run_node's identity-scoped data subdir would stay the public one).
     // Both values were validated (and lower-cased) on the merged file+CLI value
     // in the settings block above, before the --dump-resolved-config exit.
-    dash::SharechainConfig::set_network_id(network_id_hex, prefix_hex_cli);
+    dash::apply_sharechain_identity(named_network, network_id_hex, prefix_hex_cli);
 
     // D-MINER.7 key exchange helper: create-or-load the alert key (same default
     // path run_node uses, identity-scoped by --testnet / --network-id), print
