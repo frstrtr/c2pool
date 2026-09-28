@@ -168,6 +168,22 @@ struct Rig {
         return c;
     }
 
+    // The REAL handle_version on an attached connection: "" = admitted, else
+    // the exception text. Runs the connection's socket context meanwhile.
+    std::string version(Conn& c, uint32_t proto, uint64_t nonce)
+    {
+        IoThread io(c.pair.ioc_node);
+        std::string result;
+        try {
+            auto t = node->handle_version(make_version(proto, nonce), c.peer);
+            result = t.has_value() ? "" : "<no peer type>";
+        } catch (const std::exception& e) {
+            result = e.what();
+        }
+        io.stop(c.pair.ioc_node);
+        return result;
+    }
+
     void send(Conn& c, std::unique_ptr<RawMessage> m)
     {
         ASSERT_TRUE(c.peer) << "sending on a refused connection";
@@ -381,8 +397,12 @@ TEST(DashPeerMisbehaviour, BannedIpInboundReconnectRefusedUntilExpiry)
     rig.node->set_clock(clk.fn());
 #endif
     rig.node->set_ban_duration(2);
+    const uint32_t proto = SharechainConfig::share_profile().advertised_protocol_version;
+    const uint64_t nonce = 0x1829'0001;
     Conn& c1 = rig.attach();
     ASSERT_TRUE(c1.peer);
+    // c1 completes the handshake, so its nonce is in the node's peer table.
+    ASSERT_EQ(rig.version(c1, proto, nonce), "");
     for (uint32_t i = 0; i < 5; ++i)
         rig.send_shares(c1, {raw(36, wire_of(pow_miss(sh[0].share, i)))});
     rig.settle_pow(5);
@@ -401,7 +421,12 @@ TEST(DashPeerMisbehaviour, BannedIpInboundReconnectRefusedUntilExpiry)
     std::this_thread::sleep_for(std::chrono::milliseconds(2300));
     EXPECT_FALSE(rig.node->is_banned(c2.addr));
     Conn& c3 = rig.attach();
-    EXPECT_TRUE(c3.peer) << "accepted again once the ban expired";
+    ASSERT_TRUE(c3.peer) << "accepted again once the ban expired";
+    EXPECT_TRUE(rig.connected(c3));
+    // The same node (same nonce) handshakes again: the ban dropped c1's nonce
+    // entry, so this is not refused as a duplicate connection.
+    EXPECT_EQ(rig.version(c3, proto, nonce), "")
+        << "a reconnect after the ban expired must not be refused as a duplicate";
     EXPECT_TRUE(rig.connected(c3));
 }
 
