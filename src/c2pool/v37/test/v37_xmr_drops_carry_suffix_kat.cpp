@@ -423,6 +423,15 @@ int main() {
         if (lpo) { const auto o = r3.compose(b3.h, *lpo, DON);
             std::printf("  own [0,a0) instead (a shadow cut, the shell HOLDs this): receipts=%zu digest %s the winner's, delta %s\n",
                         o.receipts, o.digest == ref3.digest ? "==" : "!=", o.delta == ref3.delta ? "==" : "!="); }
+        {   // a record folded below a0 (the bounded record) composes the same; folded past a0 it HOLDs
+            dx::PrefixRecord f1 = rec1, f2 = rec1;
+            const std::size_t nf = r3.w->fold_record(f1, a02 - 6 * kPushes);
+            const auto lpf = r3.w->merged_prefix(b3.P, a02, sv2, bin_of_pid, &pw, &f1);
+            const bool same = lpf && r3.compose(b3.h, *lpf, DON).delta == ref3.delta && r3.compose(b3.h, *lpf, DON).digest == ref3.digest;
+            (void)r3.w->fold_record(f2, a02 + 2 * kPushes);
+            C(nf > 0 && same && !r3.w->merged_prefix(b3.P, a02, sv2, bin_of_pid, &pw, &f2) && pw.retry,
+              "CS4b a record folded below a0 composes the winner's book + delta; folded past a0 it HOLDs");
+        }
         dx::PrefixRecord shortrec = rec1; shortrec.list.resize(shortrec.list.size() / 2);
         C(!r3.w->merged_prefix(b3.P, a02, sv2, bin_of_pid, &pw, &shortrec) && pw.retry, "CS4b a record that does not reach a0 HOLDs");
     }
@@ -457,11 +466,12 @@ int main() {
         const auto end = sh.find("auto drops_compose_lane = [&]");
         C(dp != std::string::npos && ra != std::string::npos && mp != std::string::npos && dp < ra && ra < mp && mp < end,
           "CS8 ★ the repaired DROPS prefix = merged_prefix(P, repair_a0, served) (never the served ids alone)");
-        C(sh.find("rb->second.base == static_cast<int>(relay::RepairReplayer::kOwn)") != std::string::npos &&
+        C(sh.find("rbi->second.base == static_cast<int>(relay::RepairReplayer::kOwn)") != std::string::npos &&
           sh.find("replay_base[key] = ReplayBase{static_cast<int>(base_used), a0,") != std::string::npos,
           "CS8 ★ our [0,a0) is used only when the settlement replay reached the spine from OUR order (else HOLD)");
-        C(sh.find("shadow_rec = &ri->second; own_base = true;") != std::string::npos && sh.find("drops_records[pkey] = std::move(rec);") != std::string::npos,
-          "CS8 ★ a SHADOW base takes [0,a0) from that shadow's DROPS record (every merged prefix is recorded)");
+        C(sh.find("shadow_rec = &ri->second; own_base = true;") != std::string::npos && sh.find("drops_store_record(pkey, std::move(rec));") != std::string::npos &&
+          sh.find("if (drops_on_replay) drops_on_replay(key, P, a0, replay_base[key], ids);") != std::string::npos,
+          "CS8 ★ a SHADOW base takes [0,a0) from that shadow's DROPS record (recorded when the relay replay verifies the order)");
         C(sh.find("drops-ALARM carry-mismatch:") != std::string::npos && sh.find("drops-ALARM prefix-positions:") != std::string::npos,
           "CS8 a carried mismatch and a partial prefix are ALARMs");
         C(sh.find("drops->set_carried(lane.carry.delta)") != std::string::npos &&

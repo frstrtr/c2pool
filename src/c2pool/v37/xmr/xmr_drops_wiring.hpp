@@ -1174,6 +1174,31 @@ public:
         }
         return lp;
     }
+    // ★ DROPS-CARRY-SUFFIX: fold a record's entries below Q into its base (the
+    // own-log fold rule: first bin per payee, S above the harvest retention
+    // floor, give sums), bounding a record like the lane log. A later repair
+    // takes [0, a0) from a record only for a0 >= its base_end (else HOLD).
+    std::size_t fold_record(PrefixRecord& r, std::uint64_t Q) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        std::size_t n = 0;
+        auto it = r.list.begin();
+        for (; it != r.list.end() && it->first + (it->second.n ? it->second.n : 1) <= Q; ++it) {
+            const ServedShare& x = it->second;
+            auto [fi, fresh] = r.fold.base_first.try_emplace(x.payee, x.bin);
+            if (!fresh && x.bin < fi->second) fi->second = x.bin;
+            ++r.fold.base_counts[std::make_pair(x.payee, x.bin)];
+            { auto& gv = r.fold.base_give[x.payee]; gv.first += x.give; gv.second += 1; }
+            ++r.fold.base_n;
+            r.base_end = it->first + (x.n ? x.n : 1);
+            ++n;
+        }
+        r.list.erase(r.list.begin(), it);
+        r.fold.base_P = r.base_end;
+        const std::uint64_t fl = m_coh.floor();
+        for (auto ci = r.fold.base_counts.begin(); ci != r.fold.base_counts.end();)
+            ci = ci->first.second < fl ? r.fold.base_counts.erase(ci) : std::next(ci);
+        return n;
+    }
     // THE composition inputs of a lane block whose harvest settles [lo, hi):
     // rows, the lane-derived book (its digest) -- a pure function of the
     // retained raindrops over [lo, hi) and the prefix.
