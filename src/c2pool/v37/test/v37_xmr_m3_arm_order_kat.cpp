@@ -35,6 +35,9 @@
 //      would be orphaned by a predicate that cannot answer
 //   E  the publisher: a found block goes out as a levin 2008 through C5, and a
 //      relay that reached NOBODY pushes NO FOUND event
+//   F  mainnet ledger knobs (mainnet_ledger_knob_refusal): --d-conf other than
+//      60, a non-zero --settle-h-min, --recon-max-root-age and
+//      --no-book-deferral are refused on mainnet, kept on the test networks
 //
 // No sockets, no RandomX, no live daemon: builds and runs on BOTH build.yml
 // legs (the Linux x86_64 leg and the ASan+UBSan one), which is also why it is
@@ -481,6 +484,35 @@ static void suite_e() {
           blind_pub.last_error());
 }
 
+
+// ===========================================================================
+// F  mainnet_ledger_knob_refusal(): the settings that reach the replicated
+//    owed ledger are pinned on mainnet and stay knobs on the test networks.
+static void suite_f() {
+    std::printf("-- F: mainnet ledger knobs --\n");
+    XmrNodeConfig c;
+    c.network = MoneroNetwork::Mainnet;
+    LedgerKnobs k;
+    check(c.d_conf == kMainnetDConf && mainnet_ledger_knob_refusal(c, k).empty(),
+          "F1 mainnet with the defaults (D_conf 60, h_min 0, no ledger knobs) is accepted");
+    c.d_conf = 61;
+    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F2 mainnet --d-conf 61 is REFUSED",
+          mainnet_ledger_knob_refusal(c, k));
+    c.d_conf = kMainnetDConf; c.settle_h_min = 1;
+    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F3 mainnet --settle-h-min 1 is REFUSED");
+    c.settle_h_min = 0; k.recon_max_root_age_set = true;
+    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F4 mainnet --recon-max-root-age is REFUSED");
+    k.recon_max_root_age_set = false; k.no_book_deferral = true;
+    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F5 mainnet --no-book-deferral is REFUSED");
+    for (MoneroNetwork n : {MoneroNetwork::Testnet, MoneroNetwork::Stagenet, MoneroNetwork::Regtest}) {
+        XmrNodeConfig t;
+        t.network = n; t.d_conf = 5; t.settle_h_min = 7;
+        LedgerKnobs all; all.recon_max_root_age_set = true; all.no_book_deferral = true;
+        check(mainnet_ledger_knob_refusal(t, all).empty(),
+              "F6 test network: every ledger knob stays available to rigs");
+    }
+}
+
 // ===========================================================================
 int main() {
     std::printf("== v37_xmr_m3_arm_order_kat: R-ARMORDER pinned on both settings ==\n");
@@ -496,6 +528,7 @@ int main() {
     suite_c(root);
     suite_d(root);
     suite_e();
+    suite_f();
 
     std::filesystem::remove_all(root);
 

@@ -1587,6 +1587,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::printf("REFUSED: %s\n", refusal.c_str());
         return 2;
     }
+    {
+        c2pool::v37n::xmr::LedgerKnobs k;
+        k.recon_max_root_age_set = g_recon_max_root_age != ~std::uint64_t{0};
+        k.no_book_deferral       = g_no_book_deferral;
+        if (const std::string refusal = mainnet_ledger_knob_refusal(cfg, k); !refusal.empty()) {
+            std::printf("REFUSED: %s\n", refusal.c_str());
+            return 2;
+        }
+    }
 
     // The native node comes up FIRST in p2p-first: it is the chain XmrNode's
     // finalize driver will be bound to, and that binding happens in bring_up().
