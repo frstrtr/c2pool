@@ -151,7 +151,7 @@ DASHWorkSource::DASHWorkSource(const coin::NodeCoinState& coin_state,
     // Derived directly from a smoothed hashrate, so it cannot oscillate. DASH-only;
     // other coins keep the legacy ratio path (use_hashrate_vardiff=false).
     config_.use_hashrate_vardiff = true;
-    // ── Zombie-session leak fix (mining-hotel): OPT DASH IN to the live-session
+    // ── Zombie-session leak fix (production): OPT DASH IN to the live-session
     // hygiene knobs (default-off in StratumConfig so other coins are unchanged).
     // A NAT-dropped rig's TCP session is never FIN/RST'd, so socket_.is_open()
     // stays true forever and the session is never reaped -- every failed retry
@@ -255,7 +255,7 @@ std::string DASHWorkSource::get_current_gbt_prevhash() const
     // peek_template(). Empty on a set-gap (cache null) -- a truthful absence,
     // never a fabricated tip id.
     //
-    // 2026-08-07/08 hotel freeze fix (0 of 26 rigs, twice): this getter's only
+    // 2026-08-07/08 production freeze fix (0 of 26 rigs, twice): this getter's only
     // production caller is StratumSession::handle_submit's DOA statistics
     // compare (stratum_server.cpp), which runs PER SHARE SUBMIT on the single
     // io thread. Routing it through cached_work() ran the serve-time embedded
@@ -881,8 +881,8 @@ std::string served_pins_field(const coin::DashWorkData& w,
 // background rpc_pool thread whenever refresh_executor_ is wired. NodeCoinState
 // has ZERO mutexes and select_work() hands RAW POINTERS into its live containers
 // (`&m_mnstates`, `&m_sml`) which build_embedded_workdata() then dereferences
-// for the WHOLE template assembly — the identical shape that took the hotel
-// primary down with glibc heap corruption on 2026-08-05 (PR #1135), except this
+// for the WHOLE template assembly — the identical shape that took the production
+// primary node down with glibc heap corruption on 2026-08-05 (PR #1135), except this
 // one is on the path that serves miners.
 //
 // It did not fire only because of ARM EXCLUSIVITY: the executor is installed
@@ -1181,7 +1181,7 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                 // UNCONDITIONAL (not behind --embedded-null-arm): it protects EVERY
                 // embedded template, and it is byte-neutral whenever the roots already
                 // match — which they do for every non-null template today, so current
-                // hotel behaviour is unchanged. The sel.source==Embedded guard skips
+                // production behaviour is unchanged. The sel.source==Embedded guard skips
                 // this when the creditPool branch above already swapped (and MOVED
                 // dref), so dref is never double-served.
                 // Record the last quorum root the two arms AGREED on -- the
@@ -1321,7 +1321,7 @@ void DASHWorkSource::resource_template_now(CoinStateArm arm) const
                 // template unconditionally; m_mempool_tx_count>0 is the natural
                 // applicability precondition of a tx-selection guard, a body
                 // that actually carries mempool txs. Byte-neutral today: with
-                // the flag OFF the branch is skipped, so hotel behaviour is
+                // the flag OFF the branch is skipped, so production behaviour is
                 // bit-identical. Deliberately NOT gated on emb_ok && dref_ok:
                 // the tx-merkle axis is a body/header axis independent of the
                 // CbTx, so requiring cbtx-parse-success would create a silent
@@ -2701,7 +2701,7 @@ nlohmann::json DASHWorkSource::mining_submit(
                     << " pow_hash=" << pow_hash.GetHex().substr(0, 16)
                     << " job=" << job_id;
         // ── THE SAME FACTS THE LEDGER TRACKS, AT FIND TIME ────────────────
-        // 2026-08-05: block h=2516911 was won and accepted and neither hotel
+        // 2026-08-05: block h=2516911 was won and accepted and neither production
         // node's log could prove it — and separately, the h=2516595 incident
         // turned on the MASTERNODE PAYOUT OUTPUT COUNT (1 = no operator split,
         // 2 = split), which was invisible without pulling the raw transaction.

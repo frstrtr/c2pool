@@ -61,7 +61,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # it is FOLDED into the EXISTING allowlisted core_test target -- never a
     # new add_executable (the #769 "Not Run" trap) -- and one KAT covers all
     # coin lanes because they all consume this single shared DB.
-    # web_server_dashboard_data_test.cpp: the 2026-08-05 hotel-dashboard DATA
+    # web_server_dashboard_data_test.cpp: the 2026-08-05 production-dashboard DATA
     # honesty KATs (luck/netdiff-at-find, junk-row enrichment, block-value
     # split vs the accepted coinbase, fee units, last_block, best-share
     # persistence). Same fold-into-core_test reasoning as every TU here.

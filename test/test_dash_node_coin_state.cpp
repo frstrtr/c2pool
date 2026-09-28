@@ -976,7 +976,7 @@ TEST(DashServeGateNamesRefusal, PayeeFreshIsViable) {        // negative twin
 // A REALISTIC DASH mainnet block hash. raw256() above is NOT one: its bytes are
 // base+i, so its display hex has no leading zeros and any rendering of it looks
 // discriminating. A real block hash carries the DIFFICULTY PADDING — at mainnet
-// difficulty the display hex opens with ~14 zero nibbles (measured on the hotel
+// difficulty the display hex opens with ~14 zero nibbles (measured on the production
 // node 2026-08-06: 000000000000000e, 000000000000001c, 0000000000000018).
 // Zeroing the top 7 bytes reproduces exactly that shape.
 //
@@ -1036,7 +1036,7 @@ TEST(DashServeGateNamesRefusal, DmnStaleDistinguishesTwoMainnetPowHashes) {
     EXPECT_NE(d.value, d.threshold)
         << "dmn-stale refuses BECAUSE the SML hash differs from the tip hash, "
            "so a report whose value EQUALS its threshold cannot be read at all. "
-           "Measured on the hotel node 2026-08-06: 114 of 114 refusals printed "
+           "Measured on the production node 2026-08-06: 114 of 114 refusals printed "
            "value=000000000000 threshold=000000000000, because both sides were "
            "GetHex().substr(0, 12) of a PROOF-OF-WORK hash and those nibbles "
            "are the difficulty padding. Report the discriminating TAIL.";

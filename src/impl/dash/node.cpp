@@ -275,7 +275,7 @@ NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents,
     parents = std::min(parents, (uint64_t)1000 / hashes.size());
 
     // DPI-latch mitigation (DASH lane only). A stateful ISP-side per-flow DPI
-    // blackhole (TSPU-class CGN on the hotel uplink) silently drops ALL packets
+    // blackhole (TSPU-class CGN on the private host uplink) silently drops ALL packets
     // both directions once a single outbound-initiated TCP flow to the foreign
     // hoster accumulates ~13-16 KB of payload that does not classify as a known
     // protocol. c2pool's binary p2p sharereply is emitted as ONE async_write,

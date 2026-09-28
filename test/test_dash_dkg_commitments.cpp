@@ -1613,7 +1613,7 @@ TEST(DashLlmqTypeReconciler, UndatableStaleEntryAgesOutAndTheAlarmClears)
 
 TEST(DashLlmqTypeReconciler, RestartCannotResurrectAnUndatedEntryAlarm)
 {
-    // MODE 3 — the shape MEASURED on the hotel reserve node (issue #1164).
+    // MODE 3 — the shape MEASURED on the reserve node (issue #1164).
     // The reconciler is in-memory: a restart empties first-seen dating, so a
     // never-mined entry that mnlistdiff keeps delivering was re-dated fresh
     // by every NEW process and rang MINED-BUT-NOT-REQUIRED for a whole
