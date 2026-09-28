@@ -38,9 +38,22 @@
 //   admit         : verified cache (the dedup set), recent ring (re-offer),
 //                   FLOOD to every HELLO'd peer except the source, and the
 //                   ADMITTED queue the daemon's main thread drains into the lane.
-// The verify worker owns the ONLY call into RandomX (the injected RxFn): one
-// LightVerifier on one thread, so a receipt flood can never sit in front of a
-// miner's submit on the stratum listener thread.
+// The verify workers own the ONLY calls into RandomX (the injected RxFn), on the
+// relay's OWN verifier, so a receipt flood can never sit in front of a miner's
+// submit on the stratum listener thread.
+//
+// DROPS-VERIFY-SCALE (capstone attempt 5 false start): with raindrops ON every
+// node RandomX-verifies every raindrop of the pool (64x the receipt load); one
+// verify thread capped a node at one core, the FIFO dropped items and receipts
+// verified after their bin closed went 'late' in arrival order (node-local lane
+// orders diverged). RelayOptions::verify_threads = N workers now run the SAME
+// process() on items popped from the one queue; the daemon's RxFn hashes on the
+// worker's own light VM (verify_worker() -> O2RandomXVerifier::randomx_hash_on)
+// over the SHARED seed caches (+~2.2 MiB per worker, no new 256 MiB cache).
+// Every admission predicate is a pure function of (bytes, seed, share_diff,
+// floor, chain), and the on-time lane order is (bin, id)-sorted by the ingest,
+// so N changes only WHEN an item is verified, never what is accepted.
+// verify_threads = 1 (the library default) is the pre-fix pipeline.
 //
 // ORDER IS NODE-LOCAL (Ruling A). This class never decides lane order; the
 // daemon's ingest (xmr_receipt_ingest.hpp) does, and the winner's on-chain cut
@@ -178,6 +191,9 @@
 
 // Feature marker: NODE-NONCE (self-connection = SELF in the book, one link per node).
 #define C2POOL_XMR_RELAY_NODE_NONCE 1
+// DROPS-VERIFY-SCALE: RelayOptions::verify_threads workers, XmrRelayNode::verify_worker(),
+// RelayStats::verify_threads / rx_unavail_parked (an rx-unavailable item is parked once).
+#define C2POOL_XMR_RELAY_VERIFY_POOL 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -281,6 +297,13 @@ struct RelayOptions {
     ::c2pool::v37n::FrameVaultOptions vault{};
     u32         hello_timeout_ms = 10000;
     std::size_t verify_queue_max = 4096;
+    // DROPS-VERIFY-SCALE: verify worker threads (each runs process(); the RxFn
+    // may read verify_worker() to hash on its own VM). 1 = the pre-fix single
+    // worker (the library default, every KAT byte-identical); the daemon passes
+    // --relay-verify-threads (auto = clamp(cores/2, 2, 8) minus --mine threads).
+    // Clamped to [1, kMaxVerifyThreads] at start(): up to N DoS tokens may be
+    // outstanding per peer, inside the per-peer burst (20).
+    std::size_t verify_threads = 1;
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
     u32         repair_state_timeout_ms = 20000;
@@ -374,6 +397,10 @@ struct RelayStats {
     std::atomic<u64> fa_ignored{0}, fb_unknown{0}, malformed{0}, wrong_chain{0};
     std::atomic<u64> rx_receipts{0}, dup{0}, queue_dropped{0}, unresolved_dropped{0}, expired{0};
     std::atomic<u64> structural{0}, rx_deferred{0}, rx_evals{0}, rx_valid{0}, rx_invalid{0}, rx_unavailable{0}, bans{0};
+    // DROPS-VERIFY-SCALE: verify workers running; items whose RandomX engine was
+    // unavailable (seed being keyed during a switch) PARKED once for a retry
+    // instead of forgotten (rx_unavailable counts only the ones finally dropped).
+    std::atomic<u64> verify_threads{0}, rx_unavail_parked{0};
     std::atomic<u64> admitted_own{0}, admitted_foreign{0}, admitted_solicited{0};
     std::atomic<u64> flood_frames{0}, reoffer_frames{0};
     std::atomic<u64> backfill_orders{0}, backfill_ids_asked{0};
@@ -566,7 +593,12 @@ public:
                 " relay-peers=" + std::to_string(m_o.peers.size()) + " max-outbound=" + std::to_string(m_o.max_outbound));
         }
         m_running = true;
-        m_verify_thread = std::thread([this] { verify_loop(); });
+        {   // DROPS-VERIFY-SCALE: N verify workers, each with its own index (verify_worker())
+            const std::size_t n = std::clamp<std::size_t>(m_o.verify_threads, 1, kMaxVerifyThreads);
+            m_st.verify_threads = n;
+            for (std::size_t i = 0; i < n; ++i)
+                m_verify_threads.emplace_back([this, i] { t_verify_worker = static_cast<int>(i); verify_loop(); });
+        }
         m_maint_thread  = std::thread([this] { maint_loop(); });
         return true;
     }
@@ -574,11 +606,17 @@ public:
     void stop() {
         if (!m_running.exchange(false)) return;
         m_qcv.notify_all();
-        if (m_verify_thread.joinable()) m_verify_thread.join();
+        for (auto& t : m_verify_threads) if (t.joinable()) t.join();
+        m_verify_threads.clear();
         if (m_maint_thread.joinable()) m_maint_thread.join();
         m_net.stop();
         if (m_o.discovery) save_book(true);   // RELAY-DISCOVERY: the book survives the restart
     }
+
+    // DROPS-VERIFY-SCALE: the calling verify worker's index in [0, verify_threads)
+    // (-1 on any other thread). The daemon's RxFn hashes on that worker's VM.
+    static constexpr std::size_t kMaxVerifyThreads = 16;
+    static int verify_worker() noexcept { return t_verify_worker; }
 
     u16 listen_port() const { return m_net.listen_port(); }
     u64 node_nonce() const { return m_nonce; }
@@ -1128,7 +1166,7 @@ public:
         // answer that arrived after its request timed out (claim() drops it).
         const SupplyServeStats sv = m_serve ? m_serve->stats() : SupplyServeStats{};
         const SupplyFetchStats fs = m_fetch ? m_fetch->stats() : SupplyFetchStats{};
-        char b[2800];
+        char b[3072];
         std::snprintf(b, sizeof b,
             "relay: conns=%zu ready=%zu hello ok=%llu rej=%llu tmo=%llu | rx recv=%llu dup=%llu struct=%llu "
             "rx_evals=%llu valid=%llu invalid=%llu deferred=%llu unavail=%llu bans=%llu unresolved=%llu expired=%llu qdrop=%llu | "
@@ -1140,7 +1178,7 @@ public:
             "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
             "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu | "
             "order serve=%llu ids=%llu throttled=%llu | order ask=%llu ok=%llu timeouts=%llu late=%llu | "
-            "repair-page pages=%llu max=%llu timeouts=%llu grown=%llu",
+            "repair-page pages=%llu max=%llu timeouts=%llu grown=%llu | verify threads=%llu q=%zu parked=%zu unavail_parked=%llu",
             m_net.n_peers(), ready_peers().size(),
             (unsigned long long)s.hello_ok.load(), (unsigned long long)s.hello_rejected.load(), (unsigned long long)s.hello_timeout.load(),
             (unsigned long long)s.rx_receipts.load(), (unsigned long long)s.dup.load(), (unsigned long long)s.structural.load(),
@@ -1177,9 +1215,14 @@ public:
             (unsigned long long)fs.orders_requested, (unsigned long long)fs.orders_ok, (unsigned long long)fs.timeouts,
             (unsigned long long)fs.unsolicited,
             (unsigned long long)s.repair_order_pages.load(), (unsigned long long)s.repair_order_page_max.load(),
-            (unsigned long long)s.repair_page_timeouts.load(), (unsigned long long)s.repair_page_grown.load());
+            (unsigned long long)s.repair_page_timeouts.load(), (unsigned long long)s.repair_page_grown.load(),
+            (unsigned long long)s.verify_threads.load(), verify_queue_size(), verify_parked_size(),
+            (unsigned long long)s.rx_unavail_parked.load());
         return b;
     }
+    // DROPS-VERIFY-SCALE: verify queue depth (items waiting for a worker) and parked items.
+    std::size_t verify_queue_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_q.size(); }
+    std::size_t verify_parked_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_parked.size(); }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
     std::string last_unresolved() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_unresolved; }
 
@@ -1311,6 +1354,7 @@ private:
         std::vector<u8> raw;
         bytes32 id{};
         bool solicited = false;
+        bool rx_retried = false;   // DROPS-VERIFY-SCALE: parked once already on rx-unavailable
         Clock::time_point enq = Clock::now();
         Clock::time_point not_before = Clock::now();
     };
@@ -2161,10 +2205,21 @@ private:
         bytes32 pow{};
         m_st.rx_evals++;
         if (!m_rx || !m_rx(it.r.receipt.hashing_blob.bytes, ctx->seed, pow)) {
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());   // our fault: give the token back
+            }
+            // DROPS-VERIFY-SCALE: the engine refuses while a switch keys the new
+            // seed's cache (async_next_seed): park ONCE and retry instead of
+            // silently forgetting the item (it was lost on this node only).
+            if (m_rx && !it.rx_retried) {
+                it.rx_retried = true;
+                m_st.rx_unavail_parked++;
+                park(std::move(it), std::chrono::milliseconds(500));
+                return;
+            }
             m_st.rx_unavailable++;
-            std::lock_guard<std::mutex> lk(m_mtx);
-            if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());   // our fault: give the token back
-            m_inflight.erase(it.id);
+            forget_inflight(it.id);
             return;
         }
         if (meets_share_diff(pow, m_o.share_diff)) {
@@ -3369,6 +3424,7 @@ private:
     mutable std::mutex m_walker_mtx;
     std::map<PeerId, Clock::time_point> m_deep_walkers;   // REPAIR-CHAIN: peers walking below our horizon
     static inline thread_local PeerId t_serving_peer = 0;
+    static inline thread_local int t_verify_worker = -1;   // DROPS-VERIFY-SCALE
 
     // RELAY-DISCOVERY
     PeerBook m_book;                   // own lock
@@ -3378,7 +3434,8 @@ private:
     Clock::time_point m_disc_tick{}, m_disc_slow = Clock::now(), m_disc_saved = Clock::now();   // maintenance thread only
 
     std::atomic<bool> m_running{false};
-    std::thread m_verify_thread, m_maint_thread;
+    std::vector<std::thread> m_verify_threads;   // DROPS-VERIFY-SCALE: verify_threads workers
+    std::thread m_maint_thread;
 };
 
 } // namespace c2pool::v37n::xmr::relay

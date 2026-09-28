@@ -236,6 +236,7 @@ static bool          g_relay_discovery = true;          // --relay-discovery on|
 static std::size_t   g_relay_max_outbound = 8;          // --relay-max-outbound N (dialed links kept up; peers + learned)
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
 static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
+static std::uint32_t g_relay_verify_threads = 0;       // --relay-verify-threads N (0 = auto; DROPS-VERIFY-SCALE)
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
 static std::uint64_t g_relay_backfill = 2048;           // --relay-backfill-positions N
 static std::uint32_t g_relay_reoffer_s = 60;            // --relay-reoffer-seconds S
@@ -3628,12 +3629,44 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ro.receipts_log_path = ro.deep_order_path + ".receipts";   // == io.durable_path below
             }
             o2::O2RandomXVerifier* rxp = relay_rx.get();
+            // DROPS-VERIFY-SCALE: N verify workers, each hashing on its OWN light VM
+            // over the relay verifier's SHARED seed caches (+~2.2 MiB RSS per worker,
+            // no new 256 MiB cache). Auto = clamp(cores/2, 2, 8) of the cores the
+            // in-process miner leaves, capped by MemAvailable / 64 MiB.
+            {
+                const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
+                std::size_t want = g_relay_verify_threads;
+                const bool autoN = (want == 0);
+                if (autoN) {
+                    unsigned mine = 0;
+                    if (cfg.mine_enabled) mine = cfg.mine_threads ? cfg.mine_threads : std::max(1u, hc / 2);
+                    const unsigned left = hc > mine ? hc - mine : 1;
+                    want = std::clamp<std::size_t>(left / 2, left >= 2 ? 2 : 1, 8);
+                    unsigned long long avail_kb = 0;   // memory guard for tiny VPS (never below 1 worker)
+                    if (std::FILE* mf = std::fopen("/proc/meminfo", "r")) {
+                        char line[256];
+                        while (std::fgets(line, sizeof line, mf))
+                            if (std::sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) break;
+                        std::fclose(mf);
+                    }
+                    if (avail_kb) want = std::max<std::size_t>(1, std::min<std::size_t>(want, avail_kb / 1024 / 64));
+                }
+                want = std::clamp<std::size_t>(want, 1, relay::XmrRelayNode::kMaxVerifyThreads);
+                const std::size_t got = rxp->add_workers(want);
+                ro.verify_threads = std::max<std::size_t>(1, got);
+                std::printf("relay: verify threads=%zu (%s%s) worker VMs=%zu vm_rss~=%.1f MiB (shared seed caches, no extra 256 MiB)\n",
+                            ro.verify_threads, autoN ? "auto" : "--relay-verify-threads",
+                            got < want ? ", fewer VMs than wanted" : "", got, 2.2 * static_cast<double>(got));
+            }
             relay_node = std::make_unique<relay::XmrRelayNode>(
                 ro, relay_chain,
                 [rxp](const std::vector<std::uint8_t>& blob, const ::v37::bytes32& seed, ::v37::bytes32& pow) -> bool {
                     o2::Seed32 s{}; std::memcpy(s.data(), seed.data(), 32);
                     o2::Hash32 h{};
-                    if (!rxp->randomx_hash(blob.data(), blob.size(), 0, s, h)) return false;
+                    const int w = relay::XmrRelayNode::verify_worker();   // DROPS-VERIFY-SCALE: this worker's VM
+                    const bool ok = w >= 0 ? rxp->randomx_hash_on(static_cast<std::size_t>(w), blob.data(), blob.size(), s, h)
+                                           : rxp->randomx_hash(blob.data(), blob.size(), 0, s, h);
+                    if (!ok) return false;
                     std::memcpy(pow.data(), h.data(), 32);
                     return true;
                 },
@@ -4871,6 +4904,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-max-outbound")       g_relay_max_outbound = static_cast<std::size_t>(u64());
         else if (a == "--relay-index-horizon")      g_relay_horizon = u64();
         else if (a == "--relay-rx-budget")          g_relay_rx_budget = value();
+        else if (a == "--relay-verify-threads")     g_relay_verify_threads = u32();
         else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
         else if (a == "--relay-backfill-positions") g_relay_backfill = u64();
         else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = u32();
@@ -5044,6 +5078,9 @@ int main(int argc, char** argv) {
                 "                               same mode and list -- HELLO refuses ENROL_SET_MISMATCH by name\n"
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
+                "  --relay-verify-threads N     RandomX verify workers for peer receipts + raindrops (default 0 =\n"
+                "                               auto: clamp(cores/2, 2, 8) minus --mine threads; ~2.2 MiB each,\n"
+                "                               the seed caches are shared). 1 = the pre-fix single worker\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
                 "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
                 "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
