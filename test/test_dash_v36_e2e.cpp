@@ -24,9 +24,11 @@
 //      no-stall job, identically on both nodes and exactly per the rule; the
 //      eased share passes the other node's peer checks and both nodes' next
 //      job on top of it is identical.
-//   5. A v16 peer (protocol 1700 = p2pool-dash, and 3599) is refused at the
-//      REAL handle_version with the floor text and is not banned; 3600 from
-//      the same address is admitted; a v16 share wire is dropped at receive.
+//   5. A peer below the isolated protocol floor (3601) -- 1700 = p2pool-dash,
+//      3599, and 3600 = a c2pool-dash build without v36 isolated support -- is
+//      refused at the REAL handle_version with the floor text plus "peer build
+//      lacks v36 isolated support -- upgrade" and is not banned; 3601 from the
+//      same address is admitted; a v16 share wire is dropped at receive.
 //   6. The version frame the rig's python peer stand-in sends
 //      (scripts/dash_v36_peer_standin.py --self-test) is byte-identical to
 //      core::Packet::from_message(message_version::make_raw(...)).
@@ -535,23 +537,34 @@ TEST(DashV36E2E, EmergencyStallEasesJobIdenticallyOnBothNodes)
 TEST(DashV36E2E, V16PeerRefusedAtHandshakeAndNotBanned)
 {
     IdentityGuard guard;
-    const std::string refused = "peer protocol below min-protocol floor";
+    const std::string floor_text = "peer protocol below min-protocol floor";
+    const std::string upgrade_text = "peer build lacks v36 isolated support \u2014 upgrade";
     const auto f = fresh_iso();
     {
         PeerSockets sockets;   // outlives the node (declared first)
         dash::NodeImpl node;   // its ratchet seed is read from the live profile
-        ASSERT_EQ(node.runtime_min_protocol_version(), 3600u);
-        NetService a1700, a3599, a3600;
-        EXPECT_EQ(handshake_on(node, sockets.next(), sockets.stub, 1700, 0x5eed'0000'0000'1700ull, &a1700),
-                  refused) << "a p2pool-dash (1700) peer is refused";
-        EXPECT_EQ(handshake_on(node, sockets.next(), sockets.stub, 3599, 0x5eed'0000'0000'3599ull, &a3599),
-                  refused);
+        ASSERT_EQ(node.runtime_min_protocol_version(), 3601u);
+        NetService a1700, a3599, a3600, a3601;
+        const auto r1700 = handshake_on(node, sockets.next(), sockets.stub, 1700, 0x5eed'0000'0000'1700ull, &a1700);
+        const auto r3599 = handshake_on(node, sockets.next(), sockets.stub, 3599, 0x5eed'0000'0000'3599ull, &a3599);
+        const auto r3600 = handshake_on(node, sockets.next(), sockets.stub, 3600, 0x5eed'0000'0000'3600ull, &a3600);
+        for (const auto* r : {&r1700, &r3599, &r3600}) {
+            EXPECT_TRUE(has_substr(*r, floor_text));
+            EXPECT_TRUE(has_substr(*r, upgrade_text));
+            // Distinct from the generic (public / operator-knob) refusal text.
+            EXPECT_NE(*r, floor_text);
+        }
+        EXPECT_TRUE(has_substr(r1700, "peer advertises protocol 1700")) << "a p2pool-dash (1700) peer is refused";
+        EXPECT_TRUE(has_substr(r3600, "peer advertises protocol 3600"))
+            << "a c2pool-dash build without v36 isolated support (3600) is refused";
         EXPECT_FALSE(node.is_banned(a1700)) << "refused, not banned";
         EXPECT_FALSE(node.is_banned(a3599));
-        EXPECT_EQ(handshake_on(node, sockets.next(), sockets.stub, 3600, 0x5eed'0000'0000'3600ull, &a3600),
-                  "") << "the same loopback address is admitted at 3600";
-        EXPECT_EQ(a1700.address(), a3600.address());
         EXPECT_FALSE(node.is_banned(a3600));
+        EXPECT_EQ(handshake_on(node, sockets.next(), sockets.stub, 3601, 0x5eed'0000'0000'3601ull, &a3601),
+                  "") << "the same loopback address is admitted at 3601";
+        EXPECT_EQ(a1700.address(), a3601.address());
+        EXPECT_EQ(a3600.address(), a3601.address());
+        EXPECT_FALSE(node.is_banned(a3601));
     }
 
     // A v16 share wire (what a v16 chain would relay) is dropped at receive.
