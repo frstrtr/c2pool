@@ -147,6 +147,7 @@
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
 #include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
+#include <impl/dash/stale_report.hpp>          // dash::mint::LocalStaleLedger — own orphan/DOA report in minted shares (stale_info)
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
 #include <c2pool/storage/found_block_store.hpp>  // FoundBlockStore/Record + LevelDBStore + MergedBlockStore (persistence, main_ltc parity)
 #include <c2pool/storage/the_checkpoint.hpp>   // TheCheckpointStore — #159 (G9) DASH parity wiring (inert until merged mining)
@@ -1472,6 +1473,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // this frame. Nothing consensus-visible reads this — see
     // local_mint_ledger.hpp.
     auto mint_ledger = std::make_shared<dash::mint::LocalMintLedger>();
+    // Own orphan/DOA accounting for the stale_info byte of minted shares
+    // (p2pool-dash work.py:57-58, :149-161, :345-349, :520-522). Unlike the
+    // gauge above this IS consensus-visible (the byte is committed in the
+    // share's ref_hash); it never affects a share's validity. See
+    // stale_report.hpp.
+    auto stale_ledger = std::make_shared<dash::mint::LocalStaleLedger>();
 
     // ── DASH web dashboard standup (the EXISTING c2pool dashboard) ────────
     // This is main_ltc.cpp's WebServer wiring, reused verbatim where the DASH
@@ -1920,7 +1927,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // tally + work-weighted sampling mirror what apply_min_protocol_ratchet
             // keys on (version_negotiation::get_desired_version_weights), so the
             // dashboard shows the SAME numbers the ratchet decides on.
-            mi->set_sharechain_stats_fn([node_ptr, mint_ledger]() -> nlohmann::json {
+            mi->set_sharechain_stats_fn([node_ptr, mint_ledger, stale_ledger]() -> nlohmann::json {
                 // Last-good cache (mirrors main_ltc.cpp's stats_fn): think() holds the
                 // tracker lock frequently during normal operation, and returning a
                 // 4-field snapshot then would make the transition gauge (which reads
@@ -1941,11 +1948,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
                 // ── Local-mint orphan/sibling gauge (display only) ─────────────
                 // snap.orphan_shares/dead_shares are the sharechain-wide StaleInfo
-                // tally, and every share WE mint is stamped StaleInfo::none — so a
-                // locally minted share that is verified and then loses the head
-                // race shows up in NEITHER. These fields answer the question those
-                // cannot: of the shares this node minted, how many are still on the
-                // best chain? Consensus-invisible (no StaleInfo stamping change).
+                // tally; this node's own orphan/DOA events reach it only through
+                // the stale_info byte of its NEXT share (stale_report.hpp), i.e.
+                // one share late and only once that share is on the chain. These
+                // fields answer the direct question: of the shares this node
+                // minted, how many are still on the best chain? Display only.
                 {
                     const auto lm = mint_ledger->stats();
                     out["local_minted_shares"]   = lm.minted;
@@ -1954,6 +1961,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     out["local_pending_shares"]  = lm.pending;
                     out["local_gone_shares"]     = lm.gone;
                     out["local_orphan_rate"]     = lm.orphan_rate;
+                    out["local_doa_shares"]      = stale_ledger->my_doa_shares();
                 }
 
                 // Protocol-floor gauge inputs (v16→v36 crossing). The live accept-floor
@@ -1990,6 +1998,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         cached["local_pending_shares"]  = out["local_pending_shares"];
                         cached["local_gone_shares"]     = out["local_gone_shares"];
                         cached["local_orphan_rate"]     = out["local_orphan_rate"];
+                        cached["local_doa_shares"]      = out["local_doa_shares"];
                         return cached;
                     }
                     out["chain_height"] = snap.chain_count;
@@ -4234,7 +4243,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // work_source unwinds, so every use is null-guarded. It supplies the
             // per-address hashrate the 1.67% pool-share cap modulates on.
             [node_ptr, mint_params, mint_registry, job_cache, fee_policy,
-             mint_embed_blob, &stratum_server](
+             mint_embed_blob, &stratum_server, stale_ledger,
+             ws_weak = std::weak_ptr<dash::stratum::DASHWorkSource>(work_source)](
                 const uint256& prev_share_hash,
                 const std::vector<unsigned char>& payout_script,
                 const dash::coin::DashWorkData& wd)
@@ -4267,6 +4277,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         && e.build.frozen.payment_amount == wd.m_payment_amount
                         && e.build.frozen.desired_tx_hashes == wd.m_tx_hashes
                         && now - e.at < std::chrono::seconds(30)) {
+                        // Re-served job = a new get_work for the DOA grace
+                        // (work.py:389 lp_count is taken per get_work).
+                        if (auto ws = ws_weak.lock())
+                            e.build.frozen.work_generation_at_job = ws->get_work_generation();
                         mint_registry->put(e.build.job.ref_hash, e.build.frozen);
                         return e.build.job;
                     }
@@ -4404,15 +4418,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         local_hash_rate = it->second;
                 }
 
+                // Own orphan/DOA report, decided at job time against the tip
+                // this job builds on (work.py:338 previous_share_hash =
+                // best_share_var.value; :345-349).
+                const dash::StaleInfo stale_info = dash::mint::next_stale_info(
+                    stale_ledger->tally(guard->chain, prev_share_hash));
                 auto built = dash::mint::build_producer_job(
                     guard->chain, mint_params, prev_share_hash,
                     identity->payout_script, wd,
                     static_cast<uint32_t>(std::time(nullptr)), share_nonce,
                     identity->donation_u16,
                     /*coinbase_text=*/dash::SharechainConfig::coinbase_text(mint_params.is_testnet),
-                    local_hash_rate, mint_embed_blob);
+                    local_hash_rate, mint_embed_blob, stale_info);
                 if (!built)
                     return std::nullopt;
+                if (auto ws = ws_weak.lock())
+                    built->frozen.work_generation_at_job = ws->get_work_generation();
+                if (stale_info != dash::StaleInfo::none) {
+                    static int stale_log = 0;
+                    if (stale_log++ % 20 == 0)
+                        LOG_INFO << "[MINT-STALE] job announces "
+                                 << (stale_info == dash::StaleInfo::orphan ? "orphan" : "doa")
+                                 << " (own shares=" << stale_ledger->my_shares()
+                                 << " doa=" << stale_ledger->my_doa_shares() << ")";
+                }
 
                 {
                     // Observability for the consensus-visible target choice:
@@ -4448,7 +4477,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // commitment, deterministic producer rebuild (X11 identity gate +
         // pow<=target ban-safety gate inside), tracker insert + broadcast.
         work_source->set_mint_share_fn(
-            [node_ptr, mint_params, mint_registry, mint_ledger](
+            [node_ptr, mint_params, mint_registry, mint_ledger, stale_ledger,
+             ws_weak = std::weak_ptr<dash::stratum::DASHWorkSource>(work_source)](
                 const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256
             {
                 if (in.ref_hash.IsNull()) {
@@ -4516,6 +4546,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 }
 
                 dash::ShareType share = built->to_share_type();
+                // work.py:479-480: dead on arrival when more than 3 work
+                // events happened since the job was served. Read before the
+                // insert: add_local_share can post a think() that bumps the
+                // work generation, which must not count against this solve.
+                bool on_time = true;
+                if (auto ws = ws_weak.lock())
+                    on_time = dash::mint::solve_on_time(frozen->work_generation_at_job,
+                                                        ws->get_work_generation());
                 // #889: same urgency for the tracker WRITE. add_local_share
                 // still returns ZERO if the bounded wait expires — the decline
                 // is preserved, it is just no longer silent (LOG_ERROR + a
@@ -4530,7 +4568,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 }
                 LOG_INFO << "[MINT] share " << minted.GetHex().substr(0, 16)
                          << " minted onto the sharechain (prev="
-                         << in.prev_share_hash.GetHex().substr(0, 16) << ")";
+                         << in.prev_share_hash.GetHex().substr(0, 16) << ")"
+                         << (on_time ? "" : " DEAD ON ARRIVAL");
+                // work.py:520-522: remember every own share (and the DOA ones)
+                // for the stale_info byte of the next jobs.
+                stale_ledger->record_mint(minted, !on_time, frozen->stale_info);
                 // Display-only: remember what we minted so the best-share-changed
                 // leg below can tell us later whether it stayed on the best chain
                 // (see local_mint_ledger.hpp). Never gates the mint.
@@ -4588,7 +4630,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             core::WebServer* web = web_server.get();   // may be null (dashboard off)
             p2p_node.set_on_best_share_changed(
                 [ws = work_source.get(), web, &stratum_server, node_ptr,
-                 mint_ledger]() {
+                 mint_ledger, stale_ledger]() {
                     dash::stratum::fire_share_tip_refresh(
                         ws, stratum_server.get(), web);
 
@@ -4596,7 +4638,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     // the new best chain. Runs AFTER the notify (miners first)
                     // and on a try-lock read guard, so a busy tracker simply
                     // defers the verdict to the next tip change.
-                    if (mint_ledger->pending_count() > 0) {
+                    if (mint_ledger->pending_count() > 0 ||
+                        stale_ledger->pending_count() > 0) {
                         auto guard = node_ptr->read_tracker();
                         if (guard) {
                             const uint256 best = node_ptr->snapshot_best_share();
@@ -4607,6 +4650,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                         chain, best, h,
                                         dash::mint::LocalMintLedger::kSettleDepth);
                                 });
+                            // Fold final stale verdicts (stale_report.hpp).
+                            stale_ledger->settle(chain, best);
                         }
                     }
                 });
@@ -5046,6 +5091,25 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             / net_subdir / "dash_headers").string();
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
         header_chain->init();
+
+        // Naughty seed (DASH v36 network only; naughty_seed.hpp): the share
+        // tracker needs the height of a share's parent block to know the block
+        // reward it may pay (the p2pool block_abs_height_func). Our own SPV
+        // header store is the source (daemonless). The public v16 network has
+        // no seed (p2pool-dash has none): nothing is wired there. An unknown
+        // parent block leaves the share unseeded, as in the oracle.
+        if (dash::naughty_seed_active()) {
+            auto* hc = header_chain.get();
+            p2p_node.set_block_abs_height_fn(
+                [hc](const uint256& block_hash) -> std::optional<uint32_t> {
+                    auto e = hc->get_header(block_hash);
+                    if (!e) return std::nullopt;
+                    return e->height;
+                });
+            // The store restore ran before this hook existed.
+            p2p_node.reseed_naughty();
+            std::cout << "[run] naughty seed ARMED (DASH v36 network: excessive block reward)\n";
+        }
 
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED
         // AND NEVER CALLED on the DASH path (bch 13 callers, ltc 12, nmc 12,
@@ -11179,6 +11243,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // the in-flight tail against still-live state. Any post-back to the stopped
     // ioc simply never executes. Idempotent with the ~NodeImpl belt below.
     p2p_node.join_compute_pools();
+    // The naughty-seed height source borrows header_chain, which unwinds
+    // before p2p_node: drop it now that no verify can run.
+    p2p_node.set_block_abs_height_fn({});
 
     // Tear the acceptor + sessions down while the work source and node_coin_state
     // it references are still alive -- explicit reset keeps destruction order safe

@@ -25,6 +25,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 #include "share_check.hpp"
 #include "emergency_decay.hpp"      // emergency_decay_clamp_ref (v36 time-decay rule, one copy)
+#include "naughty_seed.hpp"         // naughty seed rule (DASH v36 network) + generation clamp
 #include "config_pool.hpp"
 
 #include <core/log.hpp>           // LOG_INFO (PPLNS payout diagnostics)
@@ -44,6 +45,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <map>
 #include <optional>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 namespace dash
@@ -650,22 +652,8 @@ public:
             m_on_merged_block_check(share_hash, g_last_pow_hash);
         }
 
-        // Naughty propagation: if parent is naughty, increment (up to 6 generations)
-        // Python data.py:1432-1438 — ancestor punishment for invalid block shares
-        {
-            uint256 prev_hash;
-            share_var.invoke([&](auto* obj) { prev_hash = obj->m_prev_hash; });
-            if (!prev_hash.IsNull() && chain.contains(prev_hash)) {
-                auto* parent_idx = chain.get_index(prev_hash);
-                if (parent_idx && parent_idx->naughty > 0) {
-                    auto* my_idx = chain.get_index(share_hash);
-                    if (my_idx) {
-                        my_idx->naughty = parent_idx->naughty + 1;
-                        if (my_idx->naughty > 6) my_idx->naughty = 0; // reset after 6 generations
-                    }
-                }
-            }
-        }
+        // Naughty seed (DASH v36 network) + propagation from the parent.
+        mark_naughty(share_hash);
 
         // Block weight/size check: Python data.py:1508-1511 checks gentx + txs
         // against BLOCK_MAX_WEIGHT/SIZE, but only when other_txs is available.
@@ -676,6 +664,82 @@ public:
         // generate_share_transaction comparison.
 
         return true;
+    }
+
+    // -- Naughty: seed + propagation (naughty_seed.hpp) --
+    //
+    // The oracle's block_abs_height_func: block hash -> height of that block,
+    // nullopt when unknown. Empty (the default) = the seed is inert, as in the
+    // oracle when block_abs_height_func is None.
+    std::function<std::optional<uint32_t>(const uint256& block_hash)> m_block_abs_height_fn;
+    void set_block_abs_height_fn(std::function<std::optional<uint32_t>(const uint256&)> fn)
+    {
+        m_block_abs_height_fn = std::move(fn);
+    }
+
+    // Seed (DASH v36 network only: naughty = 1 when the share's block would
+    // pay more than the block reward), then the oracle's parent propagation,
+    // which overrides the seed when the parent is naughty: naughty = 1 +
+    // parent, 0 past 6 generations (data.py check(): the reward check runs
+    // first, the naughty-ancestor block after it). Runs for every share that
+    // becomes verified (attempt_verify) and for the verified shares restored
+    // from the store (reseed_naughty), parent before child.
+    void mark_naughty(const uint256& share_hash)
+    {
+        if (!chain.contains(share_hash))
+            return;
+        auto* my_idx = chain.get_index(share_hash);
+        if (!my_idx)
+            return;
+        uint256 prev_hash;
+        auto& share_var = chain.get_share(share_hash);
+        share_var.invoke([&](auto* obj) { prev_hash = obj->m_prev_hash; });
+
+        if (naughty_seed_active() && m_block_abs_height_fn) {
+            uint256 prev_block;
+            uint64_t subsidy = 0;
+            share_var.invoke([&](auto* obj) {
+                prev_block = obj->m_min_header.m_previous_block;
+                subsidy = obj->m_subsidy;
+            });
+            if (const auto h = m_block_abs_height_fn(prev_block)) {
+                const auto max = max_coinbase_value(*h + 1, m_coin_params.is_testnet);
+                my_idx->naughty = excessive_reward(subsidy, max) ? 1 : 0;
+                if (my_idx->naughty)
+                    LOG_WARNING << "naughty share " << share_hash.ToString().substr(0, 16)
+                                << ": excessive block reward (subsidy=" << subsidy
+                                << " max=" << *max << " height=" << (*h + 1) << ")";
+            }
+        }
+
+        if (!prev_hash.IsNull() && chain.contains(prev_hash)) {
+            auto* parent_idx = chain.get_index(prev_hash);
+            if (parent_idx && parent_idx->naughty > 0)
+                my_idx->naughty = naughty_child_generation(parent_idx->naughty);
+        }
+    }
+
+    // Re-run mark_naughty over every verified share, parent before child
+    // (ascending height). For the store restore, which adds verified shares
+    // without attempt_verify, and for a height source wired after the
+    // restore. Caller holds the exclusive tracker lock (or is single-threaded).
+    void reseed_naughty()
+    {
+        std::vector<std::pair<int32_t, uint256>> order;
+        std::unordered_set<uint256, ShareHasher> seen;
+        for (const auto& [head, tail] : verified.get_heads()) {
+            uint256 h = head;
+            while (!h.IsNull() && verified.contains(h) && seen.insert(h).second) {
+                order.emplace_back(chain.get_acc_height(h), h);
+                uint256 prev;
+                chain.get_share(h).invoke([&](auto* obj) { prev = obj->m_prev_hash; });
+                h = prev;
+            }
+        }
+        std::sort(order.begin(), order.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [height, h] : order)
+            mark_naughty(h);
     }
 
     // -- Score a chain from share_hash to CHAIN_LENGTH*15/16 ancestor --

@@ -48,6 +48,7 @@
 #include <impl/dash/dashboard_pplns.hpp>
 #include <impl/dash/messages.hpp>
 #include <impl/dash/pplns_v36.hpp>
+#include <impl/dash/stale_report.hpp>
 
 #include <core/message.hpp>
 #include <core/packet.hpp>
@@ -190,7 +191,8 @@ struct TwoNodes {
     // `check_jobs`: first build the job for the same inputs on BOTH nodes and
     // require them identical.
     Minted mint(int minter, const uint256& prev, const uint160& miner, uint32_t desired_ts,
-                uint32_t share_nonce, bool check_jobs = true, bool relay_now = true)
+                uint32_t share_nonce, bool check_jobs = true, bool relay_now = true,
+                dash::StaleInfo stale_info = dash::StaleInfo::none)
     {
         LiveNode& m = node(minter);
         LiveNode& o = node(1 - minter);
@@ -202,7 +204,8 @@ struct TwoNodes {
         SolvedJob j;
         std::optional<dash::stratum::MintedShare> ms;
         EXPECT_TRUE(m.settled([&](dash::ShareTracker& t) {
-            j = solve_job(t.chain, p, prev, miner, wd, share_nonce, desired_ts, {}, max_nonce, threads);
+            j = solve_job(t.chain, p, prev, miner, wd, share_nonce, desired_ts, {}, max_nonce, threads,
+                          stale_info);
             if (j.solved)
                 ms = mint_from_inputs_any(t.chain, p, j.in, j.build.frozen);
         }));
@@ -709,4 +712,73 @@ TEST(DashV36E2E, SeedStoreForLoopbackRig)
     std::ofstream(fs::path(dir) / "manifest.json") << manifest.dump(2) << "\n";
     std::cout << "[seed] " << count << " v36 shares into " << (fs::path(dir) / sub).string()
               << " tip=" << manifest["tip"].get<std::string>() << "\n";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. Own orphan report (#1826): a node whose share lost the head race
+//    announces it (stale_info = orphan, wire 253) in its next share, both
+//    nodes count it, and the node's following job announces nothing.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(DashV36E2E, OrphanedNodeAnnounces253InItsNextShareOnBothNodes)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_e2e_orphan");
+    const auto f = fresh_iso();
+    TwoNodes rig(f.p, SharechainConfig::data_subdir(false));
+    const int minter_of[6] = {0, 1, 0, 1, 0, 1};
+    const auto six = grow_six(rig);
+    ASSERT_EQ(six.size(), 6u);
+    const uint256 P = six.back().hash;
+
+    // Node A's own ledger: the rig mints test-side, exactly as the main_dash
+    // mint hook records (record_mint after add_local_share).
+    dash::mint::LocalStaleLedger ledger_a;
+    for (int k = 0; k < 6; ++k)
+        if (minter_of[k] == 0)
+            ledger_a.record_mint(six[k].hash, false, dash::StaleInfo::none);
+
+    const uint32_t t0 = rig.wd.m_curtime + 200;
+    const auto a1 = rig.mint(0, P, MINER_A, t0, 91);            // A's share on P ...
+    ASSERT_FALSE(a1.hash.IsNull());
+    ledger_a.record_mint(a1.hash, false, dash::StaleInfo::none);
+    const auto b1 = rig.mint(1, P, MINER_B, t0 + 1, 92);        // ... loses to B's longer branch
+    const auto b2 = rig.mint(1, b1.hash, MINER_B, t0 + 20, 93);
+    ASSERT_FALSE(b2.hash.IsNull());
+    ASSERT_TRUE(rig.a->wait_best(b2.hash));
+    ASSERT_TRUE(rig.b->wait_best(b2.hash));
+
+    // A's next job: the oracle rule says orphan.
+    dash::StaleInfo next = dash::StaleInfo::none;
+    ASSERT_TRUE(rig.a->settled([&](dash::ShareTracker& t) {
+        next = dash::mint::next_stale_info(ledger_a.tally(t.chain, b2.hash));
+    }));
+    ASSERT_EQ(next, dash::StaleInfo::orphan) << "a1 is off the best chain and unannounced";
+
+    const auto s3 = rig.mint(0, b2.hash, MINER_A, t0 + 40, 94, /*check_jobs=*/false,
+                             /*relay_now=*/true, next);
+    ASSERT_FALSE(s3.hash.IsNull());
+    EXPECT_EQ(s3.share.m_stale_info, dash::StaleInfo::orphan);
+    EXPECT_EQ(static_cast<uint8_t>(s3.share.m_stale_info), 253);
+    ledger_a.record_mint(s3.hash, false, s3.share.m_stale_info);
+
+    for (auto* n : {rig.a.get(), rig.b.get()}) {
+        EXPECT_TRUE(n->wait_best(s3.hash));
+        EXPECT_TRUE(n->settled([&](dash::ShareTracker& t) {
+            ASSERT_TRUE(t.verified.contains(s3.hash)) << "the announcing share is a valid share";
+            t.chain.get_share(s3.hash).invoke([&](auto* obj) {
+                EXPECT_EQ(static_cast<uint8_t>(obj->m_stale_info), 253) << "wire byte as received";
+            });
+            const auto c = t.get_stale_counts(s3.hash, 3);
+            EXPECT_EQ(c.orphan_count, 1u);
+            EXPECT_EQ(c.doa_count, 0u);
+        }));
+    }
+
+    // The orphan is now announced by an on-chain share: the following job
+    // reports nothing.
+    ASSERT_TRUE(rig.a->settled([&](dash::ShareTracker& t) {
+        EXPECT_EQ(dash::mint::next_stale_info(ledger_a.tally(t.chain, s3.hash)),
+                  dash::StaleInfo::none);
+    }));
 }

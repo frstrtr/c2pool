@@ -135,7 +135,8 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     uint16_t donation,
     const std::string& coinbase_text,
     double local_hash_rate = 0.0,
-    const std::vector<unsigned char>& message_data = {})
+    const std::vector<unsigned char>& message_data = {},
+    dash::StaleInfo stale_info = dash::StaleInfo::none)
 {
     const bool v36 = core::version_gate::is_v36_active(params.current_share_version);
     if (v36 && !wd.m_tx_hashes.empty()) {
@@ -183,7 +184,10 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     pin.pubkey_hash        = *pubkey_hash;
     pin.subsidy            = wd.m_coinbase_value;
     pin.donation           = donation;
-    pin.stale_info         = dash::StaleInfo::none;
+    // The node's own orphan/DOA report (stale_report.hpp next_stale_info),
+    // decided at job time and committed in this job's ref_hash, as the
+    // oracle's get_work does (p2pool-dash work.py:345-349). Default none.
+    pin.stale_info         = stale_info;
     pin.desired_version    = params.current_share_version;   // 16 public; 36 isolated
     pin.payment_amount     = wd.m_payment_amount;
     for (const auto& p : wd.m_packed_payments) {
@@ -281,7 +285,7 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     out.frozen.desired_timestamp  = desired_timestamp;
     out.frozen.desired_target     = pin.desired_target;
     out.frozen.last_txout_nonce   = 0;                   // filled at mint from en1||en2
-    out.frozen.stale_info         = dash::StaleInfo::none;
+    out.frozen.stale_info         = stale_info;         // the rebuild reuses the committed byte
     // Freeze the job's share identity: the mint-time rebuild MUST use the
     // exact identity this gentx committed to (see FrozenMintJob note) — with
     // --fee substitution the submit-time username script differs from it.

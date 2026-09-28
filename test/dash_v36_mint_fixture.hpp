@@ -80,11 +80,13 @@ SolvedJob solve_job(ChainT& chain, const core::CoinParams& p, const uint256& pre
                     const uint160& miner, const dash::coin::DashWorkData& wd,
                     uint32_t share_nonce, uint32_t desired_ts,
                     const Bytes& message_data = {},
-                    uint32_t max_nonce = 4000000, unsigned threads = 1) {
+                    uint32_t max_nonce = 4000000, unsigned threads = 1,
+                    dash::StaleInfo stale_info = dash::StaleInfo::none) {
     SolvedJob out;
     const auto payout_script = dash::pubkey_hash_to_script2(miner);
     auto b = build_producer_job(chain, p, prev, payout_script, wd, desired_ts,
-                                share_nonce, /*donation=*/0, "c2pool", 0.0, message_data);
+                                share_nonce, /*donation=*/0, "c2pool", 0.0, message_data,
+                                stale_info);
     if (!b) return out;
     out.built = true;
     out.build = *b;

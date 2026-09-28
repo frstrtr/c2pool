@@ -606,6 +606,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # round-trip through the version-36 ShareVariants dispatch, merged-fields-
     # inert convention, and v16 backward-compat. Same allowlisted target (proven
     # pattern), no build.yml change (avoids the #769 new-target/allowlist trap).
+    # test_dash_stale_report.cpp (#1826): the node's own orphan/DOA report in
+    # minted shares (stale_info) vs the p2pool-dash work.py rule, and the local
+    # ledger over a best chain. test_dash_naughty_seed.cpp (#1827): the naughty
+    # seed rule of the DASH v36 network (max coinbase value table, generation
+    # clamp, profile gate). Both pure; same allowlisted target.
     add_executable(test_dash_share_hash_link
         test_dash_share_hash_link.cpp
         test_dash_share_producer.cpp
@@ -613,7 +618,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_mint_runloop.cpp
         test_dash_share_download.cpp
         test_dash_v36_share.cpp
-        test_dash_known_txs_retention.cpp)
+        test_dash_known_txs_retention.cpp
+        test_dash_stale_report.cpp
+        test_dash_naughty_seed.cpp)
     target_link_libraries(test_dash_share_hash_link PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

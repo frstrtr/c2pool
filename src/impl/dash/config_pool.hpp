@@ -211,6 +211,13 @@ struct SharechainConfig
     ///   emergency_decay                -> v36 time-decay retarget on the producer
     ///                                     side (share_producer.hpp
     ///                                     compute_share_target).
+    ///   naughty_seed                   -> naughty_seed.hpp naughty_seed_active():
+    ///                                     share_tracker.hpp mark_naughty seeds
+    ///                                     naughty = 1 on a share whose block
+    ///                                     would pay more than the block reward
+    ///                                     (the p2pool excessive-reward rule).
+    ///                                     The public v16 network has no seed
+    ///                                     (p2pool-dash has none).
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -220,6 +227,7 @@ struct SharechainConfig
         bool     maintainer_only_authority;
         bool     future_timestamp_bound;
         bool     emergency_decay;
+        bool     naughty_seed;
     };
 
     static constexpr ShareProfile PUBLIC_PROFILE{
@@ -230,6 +238,7 @@ struct SharechainConfig
         /*maintainer_only_authority=*/false,
         /*future_timestamp_bound=*/false,
         /*emergency_decay=*/false,
+        /*naughty_seed=*/false,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
         /*target_share_version=*/36,
@@ -239,6 +248,7 @@ struct SharechainConfig
         /*maintainer_only_authority=*/true,
         /*future_timestamp_bound=*/true,
         /*emergency_decay=*/true,
+        /*naughty_seed=*/true,
     };
 
     /// The active per-network share profile. Read LIVE from the process-global

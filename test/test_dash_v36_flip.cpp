@@ -889,3 +889,295 @@ TEST(DashV36Flip, V36ProducerJobDeclinesTemplateWithTransactions)
         EXPECT_EQ(b->frozen.desired_tx_hashes, wd.m_tx_hashes);
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// L. Own orphan/DOA report: the stale_info byte a producer job is built with
+//    is committed in its ref_hash and carried by the minted share (#1826),
+//    on both share types.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+template <typename Share>
+void expect_minted_share_carries(const core::CoinParams& p, const Share& share,
+                                 uint64_t wire_type, dash::StaleInfo want)
+{
+    EXPECT_EQ(share.m_stale_info, want);
+    // The wire round-trip keeps the byte (the oracle EnumType: 253 / 254).
+    auto loaded = load(wire_type, wire_of(share));
+    loaded.invoke([&](auto* obj) { EXPECT_EQ(static_cast<uint8_t>(obj->m_stale_info),
+                                             static_cast<uint8_t>(want)); });
+    loaded.destroy();
+    // The peer verifier accepts it: check() recomputes the ref from the byte.
+    EXPECT_NO_THROW((void)dash::share_init_verify(share, p, true));
+    // It lands in the tracker's stale counts.
+    dash::ShareTracker t;
+    t.m_coin_params = p;
+    dash::ShareType st;
+    st = new Share(share);
+    t.add(st);
+    const auto counts = t.get_stale_counts(share.m_hash, 1);
+    EXPECT_EQ(counts.orphan_count, want == dash::StaleInfo::orphan ? 1u : 0u);
+    EXPECT_EQ(counts.doa_count, want == dash::StaleInfo::doa ? 1u : 0u);
+}
+
+template <typename Built>
+void producer_job_freezes_stale_info(const core::CoinParams& p, uint64_t wire_type)
+{
+    const auto wd = make_wd();
+    const uint160 miner = h160(0x5e);
+    for (auto stale : {dash::StaleInfo::orphan, dash::StaleInfo::doa}) {
+        SCOPED_TRACE(stale == dash::StaleInfo::orphan ? "orphan" : "doa");
+        dash::ShareChain chain;
+        const auto j0 = solve_job(chain, p, uint256(), miner, wd, 7, wd.m_curtime);
+        const auto j1 = solve_job(chain, p, uint256(), miner, wd, 7, wd.m_curtime, {},
+                                  4000000, 1, stale);
+        ASSERT_TRUE(j0.solved);
+        ASSERT_TRUE(j1.solved);
+        EXPECT_EQ(j0.build.frozen.stale_info, dash::StaleInfo::none) << "default: none";
+        EXPECT_EQ(j1.build.frozen.stale_info, stale) << "frozen for the mint-time rebuild";
+        EXPECT_NE(j1.build.job.ref_hash, j0.build.job.ref_hash) << "committed in the ref_hash";
+
+        const auto m = mint_from_inputs_any(chain, p, j1.in, j1.build.frozen);
+        ASSERT_TRUE(m.has_value()) << "the X11 identity gate holds with the frozen byte";
+        ASSERT_TRUE(std::holds_alternative<Built>(m->built));
+        expect_minted_share_carries(p, std::get<Built>(m->built).share, wire_type, stale);
+
+        const auto m0 = mint_from_inputs_any(chain, p, j0.in, j0.build.frozen);
+        ASSERT_TRUE(m0.has_value());
+        expect_minted_share_carries(p, std::get<Built>(m0->built).share, wire_type,
+                                    dash::StaleInfo::none);
+    }
+}
+
+} // namespace
+
+TEST(DashV36Flip, ProducerJobFreezesStaleInfoIntoRefAndMintV16)
+{
+    IdentityGuard guard;
+    const auto p = public_params();
+    ASSERT_EQ(p.current_share_version, 16u);
+    producer_job_freezes_stale_info<BuiltShare>(p, 16);
+}
+
+TEST(DashV36Flip, ProducerJobFreezesStaleInfoIntoRefAndMintV36)
+{
+    IdentityGuard guard;
+    const auto p = iso_prod_params();
+    ASSERT_EQ(p.current_share_version, 36u);
+    producer_job_freezes_stale_info<BuiltV36Share>(p, 36);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// M. Naughty (#1827): on the DASH v36 network a share whose block would pay
+//    more than the block reward is naughty = 1, its descendants inherit
+//    1 + parent up to 6 generations, a head built on it loses best-head
+//    selection, and all of it survives a restart. The public v16 network never
+//    seeds it (p2pool-dash has no naughty rule).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// The height the stub source reports for every parent block (post-V20
+// mainnet), and the most a coinbase-only block above it may pay.
+constexpr uint32_t STUB_PARENT_HEIGHT = 2'600'000;
+std::optional<uint32_t> stub_height(const uint256&) { return STUB_PARENT_HEIGHT; }
+uint64_t honest_max()
+{
+    return dash::max_coinbase_value(STUB_PARENT_HEIGHT + 1, false).value();
+}
+
+// Mint one share on `n` through the node's mint hook (the run-loop path:
+// producer job, real X11 solve, mint_from_inputs_any, add_local_share) with
+// the given block subsidy, and wait until the node has verified it.
+uint256 mint_on(LiveNode& n, const core::CoinParams& p, const uint256& prev,
+                const uint160& miner, uint64_t subsidy, uint32_t k)
+{
+    auto wd = make_wd();
+    wd.m_coinbase_value = subsidy;
+    SolvedJob j;
+    std::optional<dash::stratum::MintedShare> ms;
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) {
+        j = solve_job(t.chain, p, prev, miner, wd, 100 + k, wd.m_curtime + 20u * k);
+        if (j.solved)
+            ms = mint_from_inputs_any(t.chain, p, j.in, j.build.frozen);
+    }));
+    if (!ms) {
+        ADD_FAILURE() << "mint failed (built=" << j.built << " solved=" << j.solved << ")";
+        return uint256();
+    }
+    const uint256 h = ms->hash();
+    auto st = ms->to_share_type();
+    if (n.node->add_local_share(st).IsNull()) {
+        st.destroy();
+        ADD_FAILURE() << "add_local_share declined";
+        return uint256();
+    }
+    EXPECT_TRUE(n.pump_until([&](dash::ShareTracker& t) { return t.verified.contains(h); }))
+        << "the node verifies its own share";
+    return h;
+}
+
+int32_t naughty_of(LiveNode& n, const uint256& h)
+{
+    int32_t v = -1;
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) {
+        if (t.chain.contains(h)) v = t.chain.get_index(h)->naughty;
+    }));
+    return v;
+}
+
+// Post one think() cycle on the node's io_context and wait for `h` to be
+// the elected best share.
+bool rethink_until_best(LiveNode& n, const uint256& h)
+{
+    boost::asio::post(n.ioc, [&n] { n.node->run_think(); });
+    return n.wait_best(h);
+}
+
+// Honest chain g, p1..p5 (heights 1..6): deep enough that the head score
+// (work of the 5th ancestor) separates heads by their length.
+std::vector<uint256> honest_base(LiveNode& n, const core::CoinParams& p, uint32_t& k)
+{
+    std::vector<uint256> out;
+    uint256 prev;
+    for (int i = 0; i < 6; ++i) {
+        prev = mint_on(n, p, prev, h160(static_cast<uint8_t>(0x30 + i)), honest_max(), k++);
+        out.push_back(prev);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(DashV36Flip, ExcessiveRewardShareIsSeededNaughtyAndDescendantsInherit)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_naughty_seed");
+    const auto p = iso_prod_params();
+    LiveNode n(p, SharechainConfig::data_subdir(false));
+    n.node->set_block_abs_height_fn(stub_height);
+    uint32_t k = 0;
+
+    const uint256 g = mint_on(n, p, uint256(), h160(0x41), honest_max(), k++);
+    ASSERT_FALSE(g.IsNull());
+    EXPECT_EQ(naughty_of(n, g), 0) << "paying exactly the block reward is honest";
+
+    const uint256 x = mint_on(n, p, g, h160(0x42), honest_max() + 1, k++);
+    ASSERT_FALSE(x.IsNull()) << "a naughty share still verifies (it is not an invalid share)";
+    EXPECT_EQ(naughty_of(n, x), 1) << "excessive block reward";
+
+    uint256 prev = x;
+    for (int gen = 2; gen <= 7; ++gen) {
+        prev = mint_on(n, p, prev, h160(0x43), honest_max(), k++);
+        EXPECT_EQ(naughty_of(n, prev), gen <= 6 ? gen : 0) << "generation " << gen;
+    }
+
+    // An under-paying share is honest.
+    const uint256 u = mint_on(n, p, prev, h160(0x44), honest_max() - 1000, k++);
+    EXPECT_EQ(naughty_of(n, u), 0);
+}
+
+TEST(DashV36Flip, HeadOnNaughtyShareLosesBestHeadSelection)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_naughty_head");
+    const auto p = iso_prod_params();
+
+    // (a) the naughty branch is LONGER: think() walks back past it and takes
+    //     the best non-naughty descendant of the common parent.
+    {
+        SCOPED_TRACE("naughty branch longer");
+        LiveNode n(p, SharechainConfig::data_subdir(false) + "_a");
+        n.node->set_block_abs_height_fn(stub_height);
+        uint32_t k = 0;
+        const auto base = honest_base(n, p, k);
+        const uint256 P = base.back();
+        const uint256 n1 = mint_on(n, p, P, h160(0x51), honest_max() + 1, k++);
+        const uint256 n2 = mint_on(n, p, n1, h160(0x52), honest_max(), k++);
+        const uint256 n3 = mint_on(n, p, n2, h160(0x53), honest_max(), k++);
+        const uint256 h1 = mint_on(n, p, P, h160(0x54), honest_max(), k++);
+        EXPECT_EQ(naughty_of(n, n1), 1);
+        EXPECT_EQ(naughty_of(n, n3), 3);
+        EXPECT_EQ(naughty_of(n, h1), 0);
+        EXPECT_TRUE(rethink_until_best(n, h1))
+            << "best=" << n.best().GetHex().substr(0, 16) << " n3=" << n3.GetHex().substr(0, 16);
+    }
+    // (b) equal length, the naughty head seen FIRST: one share of work is
+    //     deducted from it and the honest head wins.
+    {
+        SCOPED_TRACE("equal length, naughty seen first");
+        LiveNode n(p, SharechainConfig::data_subdir(false) + "_b");
+        n.node->set_block_abs_height_fn(stub_height);
+        uint32_t k = 0;
+        const auto base = honest_base(n, p, k);
+        const uint256 P = base.back();
+        const uint256 n1 = mint_on(n, p, P, h160(0x61), honest_max() + 1, k++);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // time_seen is in seconds
+        const uint256 h1 = mint_on(n, p, P, h160(0x62), honest_max(), k++);
+        EXPECT_EQ(naughty_of(n, n1), 1);
+        EXPECT_TRUE(rethink_until_best(n, h1))
+            << "best=" << n.best().GetHex().substr(0, 16) << " n1=" << n1.GetHex().substr(0, 16);
+    }
+}
+
+TEST(DashV36Flip, NaughtySurvivesStoreReload)
+{
+    // A linear chain whose tail is naughty: think() walks back past the
+    // naughty shares, so the elected best is the last honest share P. (The
+    // store keeps one share per height, so the chain is linear: a sibling
+    // branch would not be restored.)
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_naughty_reload");
+    const auto p = iso_prod_params();
+    const std::string sub = SharechainConfig::data_subdir(false);
+    uint256 P, n1, n2, n3;
+    {
+        LiveNode n(p, sub);
+        n.node->set_block_abs_height_fn(stub_height);
+        uint32_t k = 0;
+        P = honest_base(n, p, k).back();
+        n1 = mint_on(n, p, P, h160(0x71), honest_max() + 1, k++);
+        n2 = mint_on(n, p, n1, h160(0x72), honest_max(), k++);
+        n3 = mint_on(n, p, n2, h160(0x73), honest_max(), k++);
+        EXPECT_EQ(naughty_of(n, n3), 3);
+        ASSERT_TRUE(rethink_until_best(n, P)) << "punished before the restart";
+    }
+    // Restart on the same store; the height source is wired after the restore
+    // (the main_dash order) and the node re-seeds the restored shares.
+    LiveNode n(p, sub);
+    ASSERT_TRUE(n.settled([&](dash::ShareTracker& t) {
+        for (const auto& h : {P, n1, n2, n3})
+            EXPECT_TRUE(t.verified.contains(h)) << "restored as verified";
+    }));
+    n.node->set_block_abs_height_fn(stub_height);
+    n.node->reseed_naughty();
+    EXPECT_EQ(naughty_of(n, P), 0);
+    EXPECT_EQ(naughty_of(n, n1), 1);
+    EXPECT_EQ(naughty_of(n, n2), 2);
+    EXPECT_EQ(naughty_of(n, n3), 3);
+    EXPECT_TRUE(rethink_until_best(n, P))
+        << "best=" << n.best().GetHex().substr(0, 16) << " n3=" << n3.GetHex().substr(0, 16);
+}
+
+TEST(DashV36Flip, PublicV16NeverSeedsNaughty)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v16_naughty_public");
+    const auto p = public_params();
+    ASSERT_EQ(p.current_share_version, 16u);
+    ASSERT_FALSE(dash::naughty_seed_active());
+    LiveNode n(p, SharechainConfig::data_subdir(false));
+    n.node->set_block_abs_height_fn(stub_height);   // even with a height source
+    uint32_t k = 0;
+    const uint256 g = mint_on(n, p, uint256(), h160(0x81), honest_max(), k++);
+    const uint256 x = mint_on(n, p, g, h160(0x82), honest_max() + 1, k++);
+    const uint256 c = mint_on(n, p, x, h160(0x83), honest_max(), k++);
+    ASSERT_FALSE(c.IsNull());
+    EXPECT_EQ(naughty_of(n, x), 0) << "p2pool-dash has no naughty seed";
+    EXPECT_EQ(naughty_of(n, c), 0);
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) {
+        EXPECT_EQ(t.chain.get_share(x).version(), 16);
+    }));
+    EXPECT_TRUE(rethink_until_best(n, c)) << "the head on it is elected as before";
+}

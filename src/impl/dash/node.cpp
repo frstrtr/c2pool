@@ -436,6 +436,10 @@ void NodeImpl::load_persisted_shares()
             } catch (...) {}
         }
     }
+    // The restored verified shares skip attempt_verify, so re-run the naughty
+    // seed + propagation over them here (parent before child); without it a
+    // punished head would silently lose its punishment on every restart.
+    m_tracker.reseed_naughty();
 
     LOG_INFO << "[Pool] Loaded " << loaded << " persisted DASH shares from LevelDB"
              << " (db_total=" << total_in_db << " window=" << keep
@@ -465,6 +469,12 @@ void NodeImpl::load_persisted_shares()
     if (!m_best_share_hash.IsNull())
         LOG_INFO << "[Pool] Seeded best share from persisted chain: "
                  << m_best_share_hash.GetHex().substr(0, 16);
+}
+
+void NodeImpl::reseed_naughty()
+{
+    std::unique_lock lock(m_tracker_mutex);
+    m_tracker.reseed_naughty();
 }
 
 void NodeImpl::flush_verified_to_leveldb()
