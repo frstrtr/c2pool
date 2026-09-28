@@ -972,7 +972,7 @@ if (BUILD_TESTING)
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat v37_xmr_drops_default_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_drops_carry_suffix_kat v37_xmr_verify_pool_kat)
 
     #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
     #                               relay repair of a lane longer than every
@@ -1131,6 +1131,15 @@ if (BUILD_TESTING)
     # the winner's own block; source pins. RED on the base, GREEN on the fix.
     # ALSO on BOTH build.yml --target lists.
     target_compile_definitions(v37_xmr_drops_carry_suffix_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
+    # DROPS-SET-PIN (verify of 2da7c254, flip 1): v37_xmr_drops_set_kat -- the
+    # raindrop SET of a lane block is the winner's pinned id list (FB_BLOCK_WON
+    # v0x03): a receiver holding an extra raindrop, fewer raindrops, or restarted
+    # composes exactly the winner's delta (never adds, never drops; HOLD while a
+    # member is missing, fetched by id over loopback); an invalid set is refused
+    # alike on every node; flip-0 wire unchanged; source pins. RED on the base,
+    # GREEN on the fix. ALSO on BOTH build.yml --target lists.
+    target_compile_definitions(v37_xmr_drops_set_kat PRIVATE
         V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # ------------------------------------------------------------------
     # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.

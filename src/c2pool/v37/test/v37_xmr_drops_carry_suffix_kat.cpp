@@ -728,7 +728,7 @@ int main() {
         C(sh.find("drops-ALARM carry-mismatch:") != std::string::npos && sh.find("drops-ALARM prefix-positions:") != std::string::npos,
           "CS8 a carried mismatch and a partial prefix are ALARMs");
         C(sh.find("drops->set_carried(lane.carry.delta)") != std::string::npos &&
-          sh.find("if (!drops_compose_lane(h, bid, bk, booking_price, why, drops_lane)) return false;") != std::string::npos,
+          sh.find("if (!drops_compose_lane(h, bid, bk, booking_price, why, drops_lane,") != std::string::npos,   // + DROPS-SET-PIN's pinned set
           "CS8 every node, the winner included, books its own lane composition (the trailer is a witness)");
         C(sh.find("lp->positions < bk.credit_cut.next_pos") != std::string::npos, "CS8 the determinism guard runs before every compose");
         C(sh.find("drops_bin_journal.lookup(prev_id)") != std::string::npos && sh.find("drops_bin_journal.note(pb.prev_id, a.bin);") != std::string::npos &&

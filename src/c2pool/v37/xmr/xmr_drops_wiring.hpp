@@ -661,6 +661,42 @@ public:
         if (interval < m_floor) { ++m_late; return; }
         if (m_drops[interval].insert(std::make_pair(payee, nhash)).second) ++m_observed;
     }
+    // ★ DROPS-SET-PIN: the same, keyed by the raindrop's receipt id too, so a
+    // composition can name (pin) exactly the raindrops it used and another node
+    // can compose from exactly that set. `valid` = false: a raindrop this
+    // harvester refused (e.g. its hash is a share): a set naming it is refused.
+    struct DropRec { std::uint64_t interval = 0; bytes32 payee{}; bytes32 nhash{}; bool valid = true; };
+    void observe_drop_id(const bytes32& id, const bytes32& payee, std::uint64_t interval, const bytes32& nhash, bool valid = true) {
+        if (interval < m_floor) { ++m_late; return; }
+        m_drop_ids[id] = DropRec{interval, payee, nhash, valid};
+        if (valid) observe_drop(payee, interval, nhash);
+    }
+    // the ids of every (valid) raindrop held over [lo, hi), ascending
+    std::vector<bytes32> ids_over(std::uint64_t lo, std::uint64_t hi) const {
+        std::vector<bytes32> v;
+        for (const auto& [id, r] : m_drop_ids) if (r.valid && r.interval >= lo && r.interval < hi) v.push_back(id);
+        return v;   // std::map order == bytes32 operator< (the wire order)
+    }
+    // The members of a pinned set: the raindrop map over exactly `ids` (each
+    // must be held, valid and inside [lo, hi)). `missing` = ids not held here
+    // (the caller fetches them and HOLDs); `refused` = the first member that
+    // makes the set invalid for [lo, hi) (deterministic on every node).
+    using DropMap = std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>>;
+    DropMap members_of(const std::vector<bytes32>& ids, std::uint64_t lo, std::uint64_t hi,
+                       std::vector<bytes32>& missing, std::string& refused) const {
+        DropMap dm;
+        for (const auto& id : ids) {
+            auto it = m_drop_ids.find(id);
+            if (it == m_drop_ids.end()) { missing.push_back(id); continue; }
+            const DropRec& r = it->second;
+            if (refused.empty() && !r.valid) refused = "a pinned raindrop is not a raindrop (refused by the harvester)";
+            else if (refused.empty() && (r.interval < lo || r.interval >= hi))
+                refused = "a pinned raindrop's bin " + std::to_string(r.interval) + " is outside the block's range [" +
+                          std::to_string(lo) + "," + std::to_string(hi) + ")";
+            if (r.valid) dm[r.interval].insert(std::make_pair(r.payee, r.nhash));
+        }
+        return dm;
+    }
     void observe_share(const bytes32& payee, std::uint64_t interval) {
         if (interval < m_floor) return;
         ++m_shares[std::make_pair(payee, interval)];
@@ -709,8 +745,14 @@ public:
     // share-only rows for the payees `book` (the lane-derived book) enrols. Pure.
     Rows rows_lane(std::uint64_t lo, std::uint64_t hi, const ShareCounts& S,
                    const ::c2pool::v37n::EnrollmentBook& book) const {
+        return rows_lane_of(m_drops, lo, hi, S, book);
+    }
+    // ★ DROPS-SET-PIN: the same rows over a given raindrop map (a pinned set)
+    Rows rows_lane_of(const std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>>& drops,
+                      std::uint64_t lo, std::uint64_t hi, const ShareCounts& S,
+                      const ::c2pool::v37n::EnrollmentBook& book) const {
         std::map<std::pair<bytes32, std::uint64_t>, std::vector<bytes32>> keys;
-        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it)
+        for (auto it = drops.lower_bound(lo); it != drops.end() && it->first < hi; ++it)
             for (const auto& [payee, h] : it->second) keys[std::make_pair(payee, it->first)].push_back(h);
         for (const auto& [k, n] : S) {
             (void)n;
@@ -731,9 +773,13 @@ public:
     }
     // the inputs digest of [lo, hi) with S from the lane prefix (diagnostic)
     std::uint64_t lane_inputs_digest(std::uint64_t lo, std::uint64_t hi, const ShareCounts& S) const {
+        return lane_inputs_digest_of(m_drops, lo, hi, S);
+    }
+    std::uint64_t lane_inputs_digest_of(const std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>>& drops,
+                                        std::uint64_t lo, std::uint64_t hi, const ShareCounts& S) const {
         std::uint64_t x = 1469598103934665603ULL;
         auto mix = [&x](const unsigned char* p, std::size_t n) { for (std::size_t i = 0; i < n; ++i) { x ^= p[i]; x *= 1099511628211ULL; } };
-        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it) {
+        for (auto it = drops.lower_bound(lo); it != drops.end() && it->first < hi; ++it) {
             mix(reinterpret_cast<const unsigned char*>(&it->first), sizeof(it->first));
             for (const auto& [payee, h] : it->second) { mix(payee.data(), payee.size()); mix(h.data(), h.size()); }
         }
@@ -783,6 +829,7 @@ public:
             if (lo > kReorgMargin) m_floor = std::max(m_floor, lo - kReorgMargin);
         }
         m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
+        for (auto it = m_drop_ids.begin(); it != m_drop_ids.end();) it = it->second.interval < m_floor ? m_drop_ids.erase(it) : std::next(it);
         for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
         return out;
     }
@@ -804,6 +851,7 @@ public:
             if (lo > kReorgMargin) m_floor = std::max(m_floor, lo - kReorgMargin);
         }
         m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
+        for (auto it = m_drop_ids.begin(); it != m_drop_ids.end();) it = it->second.interval < m_floor ? m_drop_ids.erase(it) : std::next(it);
         for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
     }
 
@@ -856,6 +904,7 @@ private:
     unsigned m_lz;
     std::uint64_t m_d_conf;
     std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>> m_drops;          // interval -> {(payee, N)}
+    std::map<bytes32, DropRec> m_drop_ids;                                          // ★ DROPS-SET-PIN: receipt id -> raindrop
     std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t> m_shares;            // (payee, interval) -> S
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> m_booked;       // diagnostic: h -> the range it composed
     std::uint64_t m_floor = 0, m_top = 0, m_observed = 0, m_late = 0, m_withheld = 0, m_undecided = 0, m_last_lo = 0, m_last_hi = 0;
@@ -1461,6 +1510,48 @@ public:
         c.prefix_shares = lp.receipts();   // ★ DROPS-ENROL-TIDY: folded + listed (== shares.size() unfolded)
         return c;
     }
+    // ★ DROPS-SET-PIN: THE raindrop set of a lane block is the winner's pinned
+    // id list (FB_BLOCK_WON v0x03), never what a node happens to hold when it
+    // composes. The winner pins every raindrop it holds over [lo, hi) (at most
+    // `cap`, the smallest ids: deterministic); every node -- the winner too --
+    // composes through compose_lane_pinned from exactly that list.
+    std::vector<bytes32> pinned_ids(std::uint64_t lo, std::uint64_t hi, std::size_t cap, bool* capped = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        auto v = m_coh.ids_over(lo, hi);
+        if (capped) *capped = v.size() > cap;
+        if (v.size() > cap) v.resize(cap);
+        return v;
+    }
+    struct PinnedCompose {
+        LaneCompose lc;
+        std::vector<bytes32> missing;   // members not held here: fetch + HOLD (never composed partially)
+        std::string refused;            // "" or why the set is invalid for [lo, hi): the carriage books EMPTY
+        bool ok() const { return missing.empty() && refused.empty(); }
+    };
+    PinnedCompose compose_lane_pinned(std::uint64_t lo, std::uint64_t hi, const LanePrefix& lp,
+                                      const std::vector<bytes32>& ids) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        PinnedCompose pc;
+        const auto dm = m_coh.members_of(ids, lo, hi, pc.missing, pc.refused);
+        const ShareCounts S = lane_share_counts(lp, lo, hi);
+        pc.lc.book = lane_enrollment(lp, m_enrol_set, m_enrol_mode);
+        pc.lc.digest = pc.lc.book.book_digest();
+        pc.lc.prefix_shares = lp.receipts();
+        if (!pc.ok()) return pc;   // no rows: the caller HOLDs (missing) or books EMPTY (refused)
+        pc.lc.rows = m_coh.rows_lane_of(dm, lo, hi, S, pc.lc.book);
+        pc.lc.inputs = m_coh.lane_inputs_digest_of(dm, lo, hi, S);
+        return pc;
+    }
+    // the set digest of a pinned list (journal / log; the v37.1 on-chain commitment)
+    static bytes32 set_digest(std::uint64_t h, const bytes32& bid, const std::vector<bytes32>& ids) {
+        std::vector<std::uint8_t> b = {'V', '3', '7', 'D', 'R', 'O', 'P', 'S', 'E', 'T', '1'};
+        for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(h >> (8 * i)));
+        b.insert(b.end(), bid.begin(), bid.end());
+        const std::uint32_t n = static_cast<std::uint32_t>(ids.size());
+        for (int i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>(n >> (8 * i)));
+        for (const auto& id : ids) b.insert(b.end(), id.begin(), id.end());
+        return ::v37::sha256d(b);
+    }
     std::uint64_t lane_contig() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_contig; }
     // ★ DROPS-CARRY-LIVE: the positions our folded lane-log base covers ([0, base_end))
     std::uint64_t lane_base_end() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_base_end; }
@@ -1519,9 +1610,23 @@ public:
     // floor but not share_diff. Returns false (and harvests nothing) for a hash
     // that is actually a share or is below the floor: never both, never twice.
     bool on_raindrop(const bytes32& payee_identity, std::uint64_t bin, const bytes32& pow_le) {
+        // no receipt id (a KAT / pre-SET-PIN caller): a synthetic one, a pure function of the raindrop
+        std::vector<std::uint8_t> b = {'V', '3', '7', 'D', 'R', 'O', 'P', 'I', 'D'};
+        b.insert(b.end(), payee_identity.begin(), payee_identity.end());
+        for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(bin >> (8 * i)));
+        b.insert(b.end(), pow_le.begin(), pow_le.end());
+        return on_raindrop_id(::v37::sha256d(b), payee_identity, bin, pow_le);
+    }
+    // ★ DROPS-SET-PIN: the relay's admitted raindrop, with its receipt id
+    bool on_raindrop_id(const bytes32& id, const bytes32& payee_identity, std::uint64_t bin, const bytes32& pow_le) {
         const bytes32 n = normalized_hash(pow_le, m_share_diff);
         const unsigned lz = ::c2pool::v37n::leading_zero_bits(n);
-        if (lz >= kXmrDropsLz) { ++m_refused_share; return false; }   // a SHARE: the lane path owns it
+        if (lz >= kXmrDropsLz) {   // a SHARE: the lane path owns it
+            ++m_refused_share;
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            if (m_chain_order) m_coh.observe_drop_id(id, payee_identity, bin, n, false);   // a set naming it is refused
+            return false;
+        }
         ::c2pool::v37n::HarvestedDrop d;
         d.payee = payee_identity;
         d.interval = bin;
@@ -1530,7 +1635,7 @@ public:
         d.own_lz = lz;
         {
             std::lock_guard<std::mutex> lk(m_hmtx);
-            if (m_chain_order) { m_coh.observe_drop(payee_identity, bin, n); return true; }   // ★ RAIN-BACKFILL
+            if (m_chain_order) { m_coh.observe_drop_id(id, payee_identity, bin, n); return true; }   // ★ RAIN-BACKFILL + SET-PIN
         }
         m_drop_sink(d);
         return true;

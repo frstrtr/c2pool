@@ -418,6 +418,7 @@ struct RelayStats {
     std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
     std::atomic<u64> drops_fetch_tx{0}, drops_ids_asked{0}, drops_fetchreq_rx{0}, drops_served{0}, drops_backfilled{0};
     std::atomic<u64> drops_sync_calls{0}, drops_sync_pending{0}, drops_sync_complete{0}, drops_peer_setaside{0};
+    std::atomic<u64> drops_pin_fetch_ids{0};   // ★ DROPS-SET-PIN: set members asked for by id
     // REPAIR-HORIZON: BELOW_HORIZON answers that raised a repair's start and
     // re-asked (instead of setting the peer aside); prefix probes whose digest
     // at a0 matched ours / was unknown there; peers proven DEEP (divergence
@@ -730,6 +731,58 @@ public:
         } else m_st.drops_sync_complete++;
         return out;
     }
+    // ── ★ DROPS-SET-PIN: fetch the named raindrops (a carried set's members this
+    // node's harvest does not hold). Main thread. Asks `hint` (the peer the
+    // frame came from: the winner holds every member by construction) first,
+    // then every ready peer after drops_fetch_retry_ms; an id is re-asked no
+    // more often than that. An id seen here (dedup set) but asked for anyway is
+    // forgotten first, so the served copy is admitted (the caller's harvest
+    // lacks it). Answers are admitted through admit_drop (PoW + ctx verified).
+    // Returns the number of fetch frames sent. Gate OFF: nothing.
+    // [lo, hi) = the block's range (FB_GETDROPS carries a non-empty range; a
+    // by-id fetch is served by id whatever it says).
+    std::size_t drops_fetch_ids(const std::vector<bytes32>& ids, PeerId hint, u64 lo, u64 hi) {
+        if (!m_o.drops_floor_diff || ids.empty()) return 0;
+        if (hi <= lo) hi = lo + 1;
+        if (hi - lo > kDropsMaxSpan) lo = hi - kDropsMaxSpan;
+        const auto now = Clock::now();
+        const auto retry = std::chrono::milliseconds(m_o.drops_fetch_retry_ms);
+        std::vector<bytes32> first, again;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            for (const auto& id : ids) {
+                auto it = m_pin_asked.find(id);
+                if (it == m_pin_asked.end()) { m_pin_asked.emplace(id, std::make_pair(now, 1u)); first.push_back(id); continue; }
+                if (now - it->second.first < retry) continue;
+                it->second.first = now; ++it->second.second;
+                again.push_back(id);
+            }
+            for (const auto& id : ids) m_drop_want[id] = now;   // the answer is SOLICITED (a deferred ctx is waited for)
+        }
+        if (first.empty() && again.empty()) return 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);   // forget the dedup entry: the caller does not hold its bytes
+            for (const auto* v : {&first, &again})
+                for (const auto& id : *v) m_drop_seen.erase(id);
+        }
+        const auto peers = ready_peers();
+        const bool hint_ready = hint && std::find(peers.begin(), peers.end(), hint) != peers.end();
+        std::size_t sent = 0;
+        auto ask = [&](PeerId p, const std::vector<bytes32>& v) {
+            const u64 before = m_st.drops_fetch_tx.load();
+            send_drop_fetch(p, lo, hi, v);
+            sent += m_st.drops_fetch_tx.load() - before;
+        };
+        if (!first.empty()) {
+            if (hint_ready) ask(hint, first);
+            else for (PeerId p : peers) ask(p, first);
+        }
+        if (!again.empty()) for (PeerId p : peers) ask(p, again);
+        m_st.drops_pin_fetch_ids += first.size() + again.size();
+        return sent;
+    }
+    // the ids a set fetch asked for that were then admitted (diagnostic)
+    std::size_t drops_pin_asked() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_pin_asked.size(); }
     std::size_t drops_store_size() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_store_id.size(); }
     // The raindrop ids this node holds (servable) for [lo, hi), sorted (diagnostic / KAT).
     std::vector<bytes32> drops_held(u64 lo, u64 hi) const {
@@ -1885,7 +1938,7 @@ private:
         while (m_won_raw.size() > kWonReofferMax) m_won_raw.pop_front();
         // ★ DROPS-RESTART: every carried (v0x02) frame this node holds is servable
         // by bid (FB_GETWON), bounded; the newest frame for a bid wins.
-        if (f.size() >= kBlockWonDropsMinBytes && f[1] == kFbBlockWonDropsVersion) {
+        if (f.size() >= kBlockWonDropsMinBytes && (f[1] == kFbBlockWonDropsVersion || f[1] == kFbBlockWonSetVersion)) {
             BlockWon b; std::string why;
             if (decode_block_won(f, b, &why)) {
                 if (!m_won_by_bid.count(b.bid)) m_won_serve_order.push_back(b.bid);
@@ -2427,6 +2480,8 @@ private:
             it = (now - it->second.touched > std::chrono::minutes(10)) ? m_drop_inv.erase(it) : std::next(it);
         for (auto it = m_drop_want.begin(); it != m_drop_want.end();)
             it = (now - it->second > std::chrono::minutes(10)) ? m_drop_want.erase(it) : std::next(it);
+        for (auto it = m_pin_asked.begin(); it != m_pin_asked.end();)   // ★ DROPS-SET-PIN
+            it = (now - it->second.first > std::chrono::minutes(10)) ? m_pin_asked.erase(it) : std::next(it);
     }
 
     void flood(const std::vector<u8>& raw, PeerId except) {
@@ -3385,6 +3440,7 @@ private:
     std::unordered_map<bytes32, u64, Bytes32Hash> m_drop_store_id;          // id -> bin
     std::map<InvKey, PeerInv> m_drop_inv;
     std::unordered_map<bytes32, Clock::time_point, Bytes32Hash> m_drop_want; // fetched ids in flight (solicited)
+    std::unordered_map<bytes32, std::pair<Clock::time_point, u32>, Bytes32Hash> m_pin_asked;   // ★ DROPS-SET-PIN: id -> (last ask, asks)
     std::atomic<bool> m_drop_had_peer{false};
 
     mutable std::mutex m_pmtx;         // peers

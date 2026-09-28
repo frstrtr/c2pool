@@ -1762,6 +1762,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     struct WireCache { c2pool::v37n::CutDescriptor d; bool prefolded = false; Amounts credit;
                        c2pool::v37n::settle::WorkPrice price{};   // ★ DROPS: the price at the prefolded cut (gate ON only)
                        std::optional<c2pool::v37n::xmr::drops::DropsCarry> drops;   // ★ ENROL-REPL: the winner's carried delta (v0x02, gate ON only)
+                       std::optional<std::vector<decltype(relay::BlockWon::bid)>> drops_set;   // ★ DROPS-SET-PIN: the winner's raindrop set (v0x03)
                      };
     // ★ DROPS: the XMR shell's DropsWiring. nullptr in a default build (flip at 0)
     // and whenever the lane geometry does not carry the gate: then nothing below
@@ -1804,7 +1805,13 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::pair<std::uint64_t, std::uint64_t> rg{0, 0};
         const char* src = "own";                  // ★ DROPS-CARRY-SUFFIX: own | full | suffix
         std::uint64_t a0 = 0, positions = 0;      // the served start, the prefix positions (== P)
+        std::vector<decltype(relay::BlockWon::bid)> set;   // ★ DROPS-SET-PIN: the raindrop set composed from (pinned)
+        std::string set_refused;                            // "" or why the pinned set is invalid (EMPTY delta)
     };
+    // ★ DROPS-SET-PIN counters (flip 1 only)
+    std::uint64_t drops_set_pinned = 0, drops_set_capped = 0, drops_set_composed = 0, drops_set_hold_frame = 0,
+                  drops_set_hold_members = 0, drops_set_fetch_frames = 0, drops_set_refused = 0, drops_set_getwon = 0;
+    std::map<std::string, std::chrono::steady_clock::time_point> drops_set_getwon_at;   // FB_GETWON throttle per bid
     // ★ DROPS-CARRY-SUFFIX: prefixes merged from our [0,a0) + a served suffix,
     // suffix repairs HELD (our [0,a0) not the verified base), prefix-invariant
     // ALARMs (positions != P) and carried-witness mismatches on this node.
@@ -2505,8 +2512,14 @@ static int run_live(const XmrNodeConfig& cfg) {
     // THE composition of a lane block, on EVERY node: rows over range_for(h)
     // with S and the book from the lane prefix at P, priced at the cut. Over the
     // carriage row bound it composes EMPTY (every node alike).
+    // ★ DROPS-SET-PIN: the raindrops are EXACTLY `pin` (the winner's carried set)
+    // on a receiver; pin == nullptr = THIS node is the winner: it pins every
+    // raindrop it holds over the range (capped, smallest ids) and composes
+    // through the same pinned route. A member not held here is fetched by id and
+    // the booking HOLDs; a set invalid for the range books the EMPTY delta.
     auto drops_compose_lane = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
-                                  const c2pool::v37n::settle::WorkPrice& price, std::string& why, DropsLaneOut& out) -> bool {
+                                  const c2pool::v37n::settle::WorkPrice& price, std::string& why, DropsLaneOut& out,
+                                  const std::vector<decltype(relay::BlockWon::bid)>* pin) -> bool {
         const auto rgo = drops->range_for(h);
         if (!rgo) { ++drops_lane_hold; why = "cut-pending: drops range below h=" + std::to_string(h) + " undecidable (canonical predecessor not readable yet)"; return false; }
         const auto lp = drops_lane_prefix(bk.credit_cut, relay_hint(bid), why);
@@ -2518,10 +2531,36 @@ static int run_live(const XmrNodeConfig& cfg) {
             why = "cut-pending: drops lane prefix covers " + std::to_string(lp->positions) + " positions < P=" + std::to_string(bk.credit_cut.next_pos);
             return false;
         }
+        std::vector<decltype(relay::BlockWon::bid)> ids;
+        if (pin) ids = *pin;
+        else {
+            bool capped = false;
+            ids = drops->pinned_ids(rgo->first, rgo->second, relay::kBlockWonSetMaxIds, &capped);
+            if (capped) ++drops_set_capped;
+        }
+        auto pc = drops->compose_lane_pinned(rgo->first, rgo->second, *lp, ids);
+        if (!pc.missing.empty()) {   // HOLD (retry-bounded like a relay repair), never a partial set
+            ++drops_lane_hold; ++drops_set_hold_members;
+            if (relay_node) drops_set_fetch_frames += relay_node->drops_fetch_ids(pc.missing, relay_hint(bid), rgo->first, rgo->second);
+            why = "cut-pending: drops set of h=" + std::to_string(h) + " has " + std::to_string(pc.missing.size()) + "/" +
+                  std::to_string(ids.size()) + " pinned raindrop(s) not held (fetching by id)";
+            return false;
+        }
         out.src = drops_prefix_src; out.a0 = drops_prefix_a0; out.positions = lp->positions;
         out.rg = *rgo;
         drops_cut_at_h[h] = bk.credit_cut.next_pos;   // ★ DROPS-ENROL-TIDY: the reachable-cut set (lane-log bound)
-        out.lc = drops->compose_lane(rgo->first, rgo->second, *lp);
+        out.lc = std::move(pc.lc);
+        out.set = std::move(ids);
+        out.set_refused = pc.refused;
+        ++drops_set_composed;
+        if (!out.set_refused.empty()) {   // deterministic on every node: the same frame, the same chain
+            ++drops_set_refused;
+            out.lc.rows.clear();
+            std::printf("drops-ALARM set-refused: h=%llu bid=%s… n_ids=%zu range=[%llu,%llu) -- %s -> the carriage books the EMPTY delta\n",
+                        (unsigned long long)h, bid.substr(0, 12).c_str(), out.set.size(), (unsigned long long)rgo->first,
+                        (unsigned long long)rgo->second, out.set_refused.c_str());
+            std::fflush(stdout);
+        }
         c2pool::v37n::settle::DropsCompose dctx;
         dctx.price = c2pool::v37n::xmr::drops::rescale_price(price, drops->receipt_weight());
         dctx.enrollment = &out.lc.book;
@@ -2572,7 +2611,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 kb.chain_id = cfg.lane_chain; kb.bid = d.bid; kb.h_b = d.h_b; kb.cut_next_pos = d.cut_next_pos;
                 kb.cut_spine_digest = d.cut_spine_digest; kb.reward = d.reward; kb.payout_emitted = d.payout_emitted;
                 kb.owed_digest_at_win = d.owed_digest_at_win;
-                kb.drops = relay::BlockWon::Drops{wit->second.drops->delta, wit->second.drops->enrollment_digest};
+                kb.drops = relay::BlockWon::Drops{wit->second.drops->delta, wit->second.drops->enrollment_digest, wit->second.drops_set};
                 const auto kf = relay::encode_block_won(kb);
                 if (!kf.empty()) drops_store->put_frame(bid, kf);
             }
@@ -2786,6 +2825,13 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::pair<std::uint64_t, std::uint64_t> drops_rg{0, 0};
         long long drops_held_ms = 0;
         DropsLaneOut drops_lane;   // ★ DROPS-ENROL-LANE
+        // ★ DROPS-SET-PIN: the raindrop set of a lane block is the WINNER's. Its
+        // own block (registered, or journalled pre-publish) and no carried set
+        // yet: the winner route (range backfill, then pin what it holds). Any
+        // other node composes from the carried set only: HOLD without it.
+        const bool drops_have_set = drops_live && wire_cache.count(bid) && wire_cache[bid].drops && wire_cache[bid].drops_set;
+        const bool drops_winner_route = drops_live && !drops_have_set &&
+                                        (own_won.count(bid) || (drops_store && drops_store->own_to_compose(bid)));
         if (drops_live && relay_node) {
             // ★ RAIN-BACKFILL-2: the range is a pure function of the CANONICAL
             // chain (the lane block it carries nearest below h), never of this
@@ -2800,7 +2846,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             const auto rg = *rgo;
             drops_rg = rg;
-            if (rg.second > rg.first) {
+            if (drops_winner_route && rg.second > rg.first) {   // ★ DROPS-SET-PIN: the winner's completeness effort only
                 const auto ds = relay_node->drops_sync(rg.first, rg.second);
                 if (!ds.complete) {
                     if (!drops_hold_since.count(bid)) { drops_hold_since[bid] = std::chrono::steady_clock::now(); ++drops_hold_entered; }
@@ -2810,7 +2856,23 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
             }
             for (auto& a : relay_node->drain_drops())
-                drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
+                drops->on_raindrop_id(a.id, ::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
+            if (!drops_winner_route && !drops_have_set) {   // ★ DROPS-SET-PIN: never a node-local set
+                if (!drops_hold_since.count(bid)) { drops_hold_since[bid] = std::chrono::steady_clock::now(); ++drops_hold_entered; }
+                ++drops_set_hold_frame;
+                std::size_t asked = 0;
+                const auto now = std::chrono::steady_clock::now();
+                auto& at = drops_set_getwon_at[bid];
+                if (at == std::chrono::steady_clock::time_point{} || now - at >= std::chrono::seconds(2)) {
+                    at = now;
+                    if (const auto bb = c2pool::v37n::cut_bid_bytes(bid)) asked = relay_node->want_block_won(*bb);
+                    if (asked) { ++drops_set_getwon; ++drops_getwon_tx; }
+                }
+                why = "cut-pending: drops set of h=" + std::to_string(h) + " not carried yet (the winner's FB_BLOCK_WON v0x03; FB_GETWON asked of " +
+                      std::to_string(asked) + " peer(s))";
+                return false;
+            }
+            drops_set_getwon_at.erase(bid);
             if (auto hit = drops_hold_since.find(bid); hit != drops_hold_since.end()) {
                 drops_held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hit->second).count();
                 drops_hold_since.erase(hit); ++drops_hold_resolved;
@@ -2844,12 +2906,14 @@ static int run_live(const XmrNodeConfig& cfg) {
             // ★ DROPS-ENROL-LANE: EVERY node composes this block's delta from the
             // lane prefix at its on-chain cut (rows, S and the book); HOLD until
             // the prefix is derivable here. The winner still carries it (v0x02).
-            if (!drops_compose_lane(h, bid, bk, booking_price, why, drops_lane)) return false;
-            if (auto ow = own_won.find(bid); ow != own_won.end() && !(wire_cache.count(bid) && wire_cache[bid].drops)) {
+            if (!drops_compose_lane(h, bid, bk, booking_price, why, drops_lane,
+                                    drops_have_set ? &*wire_cache[bid].drops_set : nullptr)) return false;
+            if (auto ow = own_won.find(bid); ow != own_won.end() && !drops_have_set) {
                 const auto& carry = drops_lane.carry;   // already EMPTY over the row bound (every node alike)
                 const auto& rows = drops_lane.lc.rows;
                 relay::BlockWon bw = ow->second;
-                bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest};
+                bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest, drops_lane.set};   // ★ DROPS-SET-PIN: v0x03
+                ++drops_set_pinned;
                 // ★ DROPS-RESTART (defect 2): WRITE-AHEAD -- the composed frame is journalled
                 // before it leaves or is booked, so a restart re-announces THIS delta
                 // (never a second, different composition) and any holder can serve it.
@@ -2860,9 +2924,13 @@ static int run_live(const XmrNodeConfig& cfg) {
                 wc.d.bid = bw.bid; wc.d.h_b = bw.h_b; wc.d.cut_next_pos = bw.cut_next_pos; wc.d.cut_spine_digest = bw.cut_spine_digest;
                 wc.d.reward = bw.reward; wc.d.payout_emitted = bw.payout_emitted; wc.d.owed_digest_at_win = bw.owed_digest_at_win;
                 wc.drops = carry;
-                std::printf("drops-carry-tx: own win h=%llu bid=%s… composed rows=%zu delta_payees=%zu digest=%s… prefix_positions=%llu src=%s -> FB_BLOCK_WON v0x02 %zu B to %zu relay peer(s)\n",
+                wc.drops_set = drops_lane.set;
+                std::printf("drops-carry-tx: own win h=%llu bid=%s… composed rows=%zu delta_payees=%zu digest=%s… prefix_positions=%llu src=%s "
+                            "set n_ids=%zu set_digest=%s… -> FB_BLOCK_WON v0x03 %zu B to %zu relay peer(s)\n",
                             (unsigned long long)h, bid.substr(0, 12).c_str(), rows.size(), carry.delta.size(),
-                            hex_of(carry.enrollment_digest).substr(0, 12).c_str(), (unsigned long long)drops_lane.positions, drops_lane.src, relay::encode_block_won(bw).size(), n);
+                            hex_of(carry.enrollment_digest).substr(0, 12).c_str(), (unsigned long long)drops_lane.positions, drops_lane.src,
+                            drops_lane.set.size(), hex_of(c2pool::v37n::xmr::drops::XmrDropsWiring::set_digest(h, bw.bid, drops_lane.set)).substr(0, 12).c_str(),
+                            relay::encode_block_won(bw).size(), n);
                 own_won.erase(ow);
             }
             if (!drops_take_carry(h, bid, bk, why, true, drops_lane)) return false;
@@ -2957,19 +3025,27 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (drops) {   // ★ DROPS-ENROL-LANE: the lane composition (a journalled booking is re-driven by block id)
             if (!(drops_store && drops_store->booked(bid))) {
                 if (!drops_live) { why = "cut-pending: relay repair of P=-: DROPS not live yet (flip 1: no pre-DROPS booking)"; return false; }
+                const bool have_set = wire_cache.count(bid) && wire_cache[bid].drops && wire_cache[bid].drops_set;   // ★ DROPS-SET-PIN
+                const bool winner_route = !have_set && (own_won.count(bid) || (drops_store && drops_store->own_to_compose(bid)));
+                if (!have_set && !winner_route) {
+                    ++drops_set_hold_frame;
+                    if (relay_node) if (const auto bb = c2pool::v37n::cut_bid_bytes(bid)) relay_node->want_block_won(*bb);
+                    why = "cut-pending: drops set of h=" + std::to_string(h) + " not carried yet (scratch lineage)";
+                    return false;
+                }
                 if (relay_node) {
                     const auto rgo = drops->range_for(h);
                     if (!rgo) { why = "cut-pending: drops range below h=" + std::to_string(h) + " undecidable"; return false; }
-                    if (rgo->second > rgo->first) {
+                    if (winner_route && rgo->second > rgo->first) {
                         const auto ds = relay_node->drops_sync(rgo->first, rgo->second);
                         if (!ds.complete) { why = "cut-pending: drops backfill of intervals [" + std::to_string(rgo->first) + "," +
                                                   std::to_string(rgo->second) + ") incomplete (" + ds.why + ")"; return false; }
                     }
                     for (auto& a : relay_node->drain_drops())
-                        drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
+                        drops->on_raindrop_id(a.id, ::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
                 }
                 DropsLaneOut lane;
-                if (!drops_compose_lane(h, bid, bk, drops_fold_price, why, lane)) return false;
+                if (!drops_compose_lane(h, bid, bk, drops_fold_price, why, lane, have_set ? &*wire_cache[bid].drops_set : nullptr)) return false;
                 if (!drops_take_carry(h, bid, bk, why, false, lane)) return false;
             }
         }
@@ -3067,11 +3143,17 @@ static int run_live(const XmrNodeConfig& cfg) {
         ++wire_rx;
         const std::string bid = c2pool::v37n::cut_bid_hex(d.bid);
         WireCache wc; wc.d = d;
-        if (drops && bw.drops) {   // ★ ENROL-REPL: the winner's carried delta (checked at booking); DROPS-RESTART: kept even before live
+        auto old = wire_cache.find(bid);
+        if (drops && old != wire_cache.end() && old->second.drops_set && !(bw.drops && bw.drops->set)) {
+            wc.drops = old->second.drops;   // ★ DROPS-SET-PIN: never lose a held pinned set to a frame without one
+            wc.drops_set = old->second.drops_set;
+        } else if (drops && bw.drops) {   // ★ ENROL-REPL: the winner's carried delta (checked at booking); DROPS-RESTART: kept even before live
             wc.drops = c2pool::v37n::xmr::drops::DropsCarry{bw.drops->delta, bw.drops->enrollment_digest};
+            wc.drops_set = bw.drops->set;   // ★ DROPS-SET-PIN (v0x03; none on a v0x02 frame)
             ++drops_carry_rx;
-        } else if (auto old = wire_cache.find(bid); drops && old != wire_cache.end() && old->second.drops) {
+        } else if (drops && old != wire_cache.end() && old->second.drops) {
             wc.drops = old->second.drops;   // never lose a held carried delta to a frame without one
+            wc.drops_set = old->second.drops_set;
         }
         const bool known = cba_ring.contains(d.owed_digest_at_win);   // merge: rework-3 ReconRing (was a deque scan)
         if (!known) ++wire_diverged;
@@ -4011,6 +4093,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     wc.d.bid = kb.bid; wc.d.h_b = kb.h_b; wc.d.cut_next_pos = kb.cut_next_pos; wc.d.cut_spine_digest = kb.cut_spine_digest;
                     wc.d.reward = kb.reward; wc.d.payout_emitted = kb.payout_emitted; wc.d.owed_digest_at_win = kb.owed_digest_at_win;
                     wc.drops = c2pool::v37n::xmr::drops::DropsCarry{kb.drops->delta, kb.drops->enrollment_digest};
+                    wc.drops_set = kb.drops->set;   // ★ DROPS-SET-PIN
                     wire_cache[b] = wc;
                     relay_node->adopt_won_frame(f);
                     ++drops_reloaded_frames;
@@ -4318,7 +4401,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 for (auto& a : relay_node->drain_admitted()) relay_ingest->on_admitted(std::move(a));
                 if (drops_live)   // ★ DROPS: every replicated raindrop (own + peers') -> the harvester
                     for (auto& a : relay_node->drain_drops())
-                        drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
+                        drops->on_raindrop_id(a.id, ::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
                 // RELAY-BINCLOCK: the chain clock too (a suspended lane serves no new template)
                 relay_ingest->tick(relay::bin_close_height(provider.current().height, node.hw().hw_height));
                 for (const auto& [bw, pid] : relay_node->drain_block_won()) relay_on_cut(bw, pid);
@@ -4469,6 +4552,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)drops_prev_row_missing, drops_store->published_size(),
                                 (unsigned long long)drops_prepub_journalled.load(), drops_store_loaded.published,
                                 (unsigned long long)drops_prepub_resumed);
+                std::printf("  drops-set: pinned=%llu capped=%llu composed=%llu hold_frame=%llu hold_members=%llu fetch_frames=%llu "
+                            "fetch_ids=%llu refused=%llu getwon=%llu\n",
+                            (unsigned long long)drops_set_pinned, (unsigned long long)drops_set_capped, (unsigned long long)drops_set_composed,
+                            (unsigned long long)drops_set_hold_frame, (unsigned long long)drops_set_hold_members,
+                            (unsigned long long)drops_set_fetch_frames, (unsigned long long)relay_node->stats().drops_pin_fetch_ids.load(),
+                            (unsigned long long)drops_set_refused, (unsigned long long)drops_set_getwon);
                 drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
                 const auto ll = drops->lane_log_stats();
                 std::printf("  drops-lane: composed=%llu without_winner_frame=%llu hold=%llu prefix own=%llu repaired=%llu suffix=%llu shadow=%llu record=%llu hold_a0=%llu records=%llu/%zu miss=%llu "
