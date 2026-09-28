@@ -41,6 +41,8 @@
 
 #include <functional>
 #include <optional>
+#include <span>
+#include <variant>
 #include <vector>
 
 #include <core/pack_types.hpp>                     // PackStream
@@ -100,7 +102,10 @@ struct FrozenMintJob
     std::vector<unsigned char> coinbase_payload;     // RAW DIP4 CbTx extra payload ('' -> none)
     uint32_t share_nonce{0};                         // share_data['nonce']
     uint16_t donation{0};                            // share_data['donation'] (--give-author)
-    uint64_t desired_version{16};                    // pre-v36 baseline
+    // Default = the pre-v36 baseline for callers that fill the struct by hand;
+    // mint_runloop.hpp build_producer_job always writes
+    // params.current_share_version (36 on the private/isolated v36 chain).
+    uint64_t desired_version{16};
     uint64_t payment_amount{0};                      // GBT masternode/superblock total
     std::vector<dash::PackedPayment> packed_payments;  // GBT payment list (template order)
     std::vector<uint256> desired_tx_hashes;          // GBT tx set (template order)
@@ -116,6 +121,10 @@ struct FrozenMintJob
     // the same one or the X11 identity gate would decline every
     // fee-substituted solve. Empty -> identity from the submit's username.
     std::vector<unsigned char> payout_script_override;
+    // v36 only: the message_data the job committed (its ref_hash — the registry
+    // key — covers it), frozen so the mint-time rebuild uses the exact bytes
+    // the served coinbase committed, never a live re-read. Empty on v16.
+    std::vector<unsigned char> message_data;
 };
 
 // -- build_mint_share --------------------------------------------------------
@@ -170,6 +179,112 @@ build_mint_share(ChainT& chain,
         return std::nullopt;
 
     return built;
+}
+
+// -- MintedShare / build_mint_share_any --------------------------------------
+// The mint-time rebuild for EITHER share type the chain mints: v16 DashShare
+// (public network) or v36 DashV36Share (private/isolated DASH v36 sharechain),
+// selected by params.current_share_version — the same knob that sets the
+// admitted type (share_check.hpp check_share_type_admitted), so a node always
+// mints the type it admits.
+struct MintedShare
+{
+    std::variant<dash::producer::BuiltShare, dash::producer::BuiltV36Share> built;
+
+    template <typename F>
+    decltype(auto) share_visit(F&& f) const
+    {
+        return std::visit([&](const auto& b) -> decltype(auto) { return f(b.share); }, built);
+    }
+    bool is_v36() const { return std::holds_alternative<dash::producer::BuiltV36Share>(built); }
+    uint256  hash() const { return share_visit([](const auto& s) { return s.m_hash; }); }
+    uint32_t bits() const { return share_visit([](const auto& s) { return s.m_bits; }); }
+    uint64_t last_txout_nonce() const
+    {
+        return share_visit([](const auto& s) { return s.m_last_txout_nonce; });
+    }
+    uint256 ref_hash() const
+    {
+        return std::visit([](const auto& b) { return b.ref_hash; }, built);
+    }
+    // A heap copy in the live share variant (the tracker owns it after
+    // add_local_share; the caller deletes it on a declined insert).
+    dash::ShareType to_share_type() const
+    {
+        dash::ShareType st;
+        std::visit([&](const auto& b) {
+            using S = std::decay_t<decltype(b.share)>;
+            st = new S(b.share);
+        }, built);
+        return st;
+    }
+};
+
+// Same header parse, identity resolution and X11 identity gate as
+// build_mint_share; the rebuild is build_share_v36 (with the frozen
+// message_data) when params.current_share_version is v36, else build_share.
+// `message_authority` is the key set the v36 self-verify checks message_data
+// against (production: active_message_authority()).
+template <typename ChainT>
+inline std::optional<MintedShare>
+build_mint_share_any(ChainT& chain,
+                     const core::CoinParams& params,
+                     const DASHWorkSource::MintShareInputs& in,
+                     const FrozenMintJob& job,
+                     std::span<const AuthorityPubkey* const> message_authority)
+{
+    if (!core::version_gate::is_v36_active(params.current_share_version)) {
+        auto v16 = build_mint_share(chain, params, in, job);
+        if (!v16)
+            return std::nullopt;
+        return MintedShare{std::move(*v16)};
+    }
+
+    auto min_header = parse_min_header_80(in.header_bytes);
+    if (!min_header)
+        return std::nullopt;
+
+    const std::vector<unsigned char>& identity_script =
+        job.payout_script_override.empty() ? in.payout_script
+                                           : job.payout_script_override;
+    auto pubkey_hash = pubkey_hash_from_p2pkh(identity_script);
+    if (!pubkey_hash)
+        return std::nullopt;
+
+    dash::producer::ProducerJobInputs pin;
+    pin.prev_share_hash    = in.prev_share_hash;
+    pin.coinbase_scriptSig = job.coinbase_scriptSig;
+    pin.coinbase_payload   = job.coinbase_payload;
+    pin.share_nonce        = job.share_nonce;
+    pin.pubkey_hash        = *pubkey_hash;
+    pin.subsidy            = in.subsidy;
+    pin.donation           = job.donation;
+    pin.stale_info         = job.stale_info;
+    pin.desired_version    = job.desired_version;
+    pin.payment_amount     = job.payment_amount;
+    pin.packed_payments    = job.packed_payments;
+    pin.desired_tx_hashes  = job.desired_tx_hashes;
+    pin.desired_timestamp  = job.desired_timestamp;
+    pin.desired_target     = job.desired_target;
+    pin.message_data       = job.message_data;
+
+    auto info = dash::producer::generate_prospective_share_info(chain, params, pin);
+    auto built = dash::producer::build_share_v36(
+        chain, params, info, *min_header, job.last_txout_nonce, /*check_pow=*/false,
+        message_authority);
+    if (built.share.m_hash != in.pow_hash)
+        return std::nullopt;
+    return MintedShare{std::move(built)};
+}
+
+template <typename ChainT>
+inline std::optional<MintedShare>
+build_mint_share_any(ChainT& chain,
+                     const core::CoinParams& params,
+                     const DASHWorkSource::MintShareInputs& in,
+                     const FrozenMintJob& job)
+{
+    return build_mint_share_any(chain, params, in, job, active_message_authority());
 }
 
 // -- make_producer_mint_fn ---------------------------------------------------

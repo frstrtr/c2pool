@@ -14,16 +14,18 @@
 //   (c) invalid input is rejected before it can reach the ref stream;
 //   (d) sharechain bootstrap-mode precedence (btc parity);
 //   (e) per-network on-disk state is identity-scoped: the data subdir is the
-//       legacy "dash"/"dash_testnet" with no flag and "<legacy>_<id>" with one,
+//       legacy "dash"/"dash_testnet" with no flag and "<legacy>_<id>_v36" with
+//       one (keyed on the identity AND the share version it mints),
 //       and a share persisted through the production SharechainStorage under
 //       identity A is invisible to a node configured with identity B (or with
 //       no flag), while A still finds it after switching back;
 //   (f) the private/isolated DASH v36 sharechain profile: keyed on the custom
 //       network id, exposes the v36 targets (share version 36, ratchet seed
 //       3600, P2PKH v36 donation, maintainer-only message authority, future-
-//       timestamp bound, emergency decay) while the share version is NOT
-//       consumed yet: current_share_version stays 16 on both profiles, and
-//       every no-flag CoinParams field is pinned byte-identical to master.
+//       timestamp bound, emergency decay); the isolated CoinParams carry
+//       current_share_version 36 (the chain mints and admits v36), the public
+//       ones 16, and every no-flag CoinParams field is pinned byte-identical
+//       to master.
 //       (The future-timestamp bound IS consumed, by share_init_verify; its
 //       KATs live in test_dash_v36_future_timestamp*.cpp, linked into this
 //       same executable for the same process-global-identity reason.)
@@ -223,11 +225,11 @@ std::string x11_genesis_hex(const core::CoinParams& p) {
 }
 
 // Every CoinParams field make_coin_params() fills, pinned to master's values.
-// `isolated` relaxes ONLY what the private/isolated profile is allowed to move
-// in this slice: the identifier/prefix slots (network id override) and the
-// v36+ donation arm (P2PKH instead of COMBINED). Everything else, including
-// current_share_version and both protocol-version fields, must match master
-// on BOTH profiles.
+// `isolated` relaxes ONLY what the private/isolated profile is allowed to move:
+// the identifier/prefix slots (network id override), the v36+ donation arm
+// (P2PKH instead of COMBINED) and current_share_version (36: the isolated
+// chain mints and admits v36). Everything else, including both
+// protocol-version fields, must match master on BOTH profiles.
 void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, bool isolated) {
     SCOPED_TRACE(std::string(testnet ? "testnet" : "mainnet") + (isolated ? " isolated" : " public"));
     EXPECT_EQ(p.symbol, "DASH");
@@ -266,7 +268,7 @@ void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, b
     for (int64_t v : {36, 37, 3600})
         EXPECT_EQ(hex_of_bytes(p.donation_script_func(v)),
                   isolated ? P2PKH_DONATION_HEX : COMBINED_DONATION_HEX) << "v=" << v;
-    EXPECT_EQ(p.current_share_version, 16u);
+    EXPECT_EQ(p.current_share_version, isolated ? 36u : 16u);
     EXPECT_EQ(p.is_testnet, testnet);
     // Vardiff: make_coin_params leaves the CoinParams defaults.
     EXPECT_DOUBLE_EQ(p.vardiff.target_share_rate, 3.0);
@@ -355,9 +357,10 @@ TEST(DashNetworkIdOverride, OverrideChangesPrefixAndRefHashStream) {
     const auto pm = dash::make_coin_params(false);
     EXPECT_EQ(pm.active_identifier_hex(), "0d3a5c0920263617");
     EXPECT_EQ(pm.active_prefix_hex(),     "00000badc0ffee11");
-    // The private/isolated chain still runs v16 until the flip slice: the
-    // share built and self-verified below is a v16 DashShare.
-    EXPECT_EQ(pm.current_share_version, 16u);
+    // The private/isolated chain mints and admits v36; the v16 DashShare
+    // built below exercises the identifier move in the (unchanged) v16 ref
+    // stream, which a peer on either identity would compute.
+    EXPECT_EQ(pm.current_share_version, 36u);
 
     // Ref stream: ONLY the 8 identifier bytes moved; share_info tail identical.
     const auto info = fixture_f1_info();
@@ -505,21 +508,46 @@ TEST(DashNetworkIdOverride, DataSubdirIsIdentityScoped) {
     EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet");
 
     SharechainConfig::set_network_id("abcd", "");
-    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_000000000000abcd");
-    EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet_000000000000abcd");
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_000000000000abcd_v36");
+    EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet_000000000000abcd_v36");
 
-    // Keyed on the identifier only: the ref_hash commits the identifier, not
-    // the prefix, so a prefix change keeps the (still valid) store.
+    // Keyed on the identifier, not the prefix: the ref_hash commits the
+    // identifier, not the prefix, so a prefix change keeps the (still valid) store.
     SharechainConfig::reset_network_id();
     SharechainConfig::set_network_id("abcd", "0badc0ffee11");
-    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_000000000000abcd");
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_000000000000abcd_v36");
 
     SharechainConfig::reset_network_id();
     SharechainConfig::set_network_id("0123456789abcdef", "");
-    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_0123456789abcdef");
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_0123456789abcdef_v36");
 
     SharechainConfig::reset_network_id();
     EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
+}
+
+// The version key: a custom identity's store is also keyed on the share
+// version its chain mints ("_v36"), so the pre-v36 store of the same identity
+// ("dash_<id>", what a build before the v36 flip wrote v16 rows into) is a
+// DIFFERENT directory and is never opened by the v36 chain. The public
+// (no-flag) subdirs carry no version key and are master's literals.
+TEST(DashNetworkIdOverride, DataSubdirIsKeyedOnIdentityAndShareVersion) {
+    IdentityGuard g;
+    ASSERT_EQ(SharechainConfig::share_profile().target_share_version, 16u);
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
+    EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet");
+
+    SharechainConfig::set_network_id("abcd", "");
+    ASSERT_EQ(SharechainConfig::share_profile().target_share_version, 36u);
+    const std::string pre_flip_mainnet = "dash_000000000000abcd";
+    const std::string pre_flip_testnet = "dash_testnet_000000000000abcd";
+    EXPECT_EQ(SharechainConfig::data_subdir(false), pre_flip_mainnet + "_v36");
+    EXPECT_EQ(SharechainConfig::data_subdir(true),  pre_flip_testnet + "_v36");
+    EXPECT_NE(SharechainConfig::data_subdir(false), pre_flip_mainnet);
+    EXPECT_NE(SharechainConfig::data_subdir(true),  pre_flip_testnet);
+
+    SharechainConfig::reset_network_id();
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
+    EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet");
 }
 
 TEST(DashNetworkIdOverride, PersistedShareDoesNotCrossIdentities) {
@@ -554,7 +582,7 @@ TEST(DashNetworkIdOverride, PersistedShareDoesNotCrossIdentities) {
                                    /*timestamp=*/1700000000, uint256::ONE, uint256::ONE));
         EXPECT_TRUE(a->has_share(h));
     }
-    EXPECT_TRUE(fs::exists(root / "dash_000000000000aaaa" / "sharechain_leveldb"));
+    EXPECT_TRUE(fs::exists(root / "dash_000000000000aaaa_v36" / "sharechain_leveldb"));
 
     // Identity B: a different store, the share is invisible to the loader's scan.
     {
@@ -563,7 +591,7 @@ TEST(DashNetworkIdOverride, PersistedShareDoesNotCrossIdentities) {
         EXPECT_FALSE(b->has_share(h));
         EXPECT_TRUE(b->get_shares_by_height_range(0, UINT64_MAX).empty());
     }
-    EXPECT_TRUE(fs::exists(root / "dash_000000000000bbbb" / "sharechain_leveldb"));
+    EXPECT_TRUE(fs::exists(root / "dash_000000000000bbbb_v36" / "sharechain_leveldb"));
 
     // No flag (public identity): the legacy store, also blind to A's share.
     {
@@ -682,10 +710,11 @@ TEST(DashNetworkIdOverride, IsolatedProfileExposesV36Targets) {
 
     for (bool testnet : {false, true}) {
         const auto p = dash::make_coin_params(testnet);
-        // FLIP TRIPWIRE (intentionally inverted by the flip slice): the target
-        // is declared 36 but NOT consumed yet, so the isolated chain still
-        // mints and verifies v16 shares.
-        EXPECT_EQ(p.current_share_version, 16u);
+        // The flip: the isolated chain mints and admits the profile's target
+        // share version, v36 (the public profile keeps 16,
+        // PublicProfileIsTheV16Baseline).
+        EXPECT_EQ(p.current_share_version, 36u);
+        EXPECT_EQ(p.current_share_version, prof.target_share_version);
         // The cold floor stays 1700 (the 3600 seed goes to the node runtime,
         // not into CoinParams); the advert is 3600 on both profiles.
         EXPECT_EQ(p.minimum_protocol_version, 1700u);

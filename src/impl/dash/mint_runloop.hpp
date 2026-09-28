@@ -24,8 +24,10 @@
 //       (pplns_weights_for — ORACLE window: grandparent start, data.py:181).
 //
 // ORACLE: github.com/frstrtr/p2pool-dash (pre-v35 v16 lineage, min-proto 1700).
-// Everything minted here is the LEGACY v16 DashShare the live network speaks —
-// the v36 crossing is a SEPARATE later step and is deliberately absent.
+// The public network mints the LEGACY v16 DashShare the live network speaks.
+// The private/isolated DASH v36 sharechain (custom --network-id; CoinParams::
+// current_share_version == 36) mints DashV36Share through the v36 arm of the
+// same functions (build_producer_job, mint_from_inputs_any), coinbase-only.
 //
 // Header-only, fenced to src/impl/dash/. Nothing in src/core is touched; the
 // dashd-RPC fallback path is untouched.
@@ -43,12 +45,16 @@
 #include <core/target_utils.hpp>
 #include <core/uint256.hpp>
 
+#include <core/log.hpp>
+#include <core/version_gate.hpp>
+
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -128,8 +134,25 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     uint32_t share_nonce,
     uint16_t donation,
     const std::string& coinbase_text,
-    double local_hash_rate = 0.0)
+    double local_hash_rate = 0.0,
+    const std::vector<unsigned char>& message_data = {})
 {
+    const bool v36 = core::version_gate::is_v36_active(params.current_share_version);
+    if (v36 && !wd.m_tx_hashes.empty()) {
+        // The private/isolated v36 chain is coinbase-only (daemonless): a v36
+        // share commits no tx refs and its won block is rebuilt as [gentx]
+        // alone (coin/reconstruct_won_block.hpp), so a template carrying txs
+        // could never be reconstructed. Decline the producer job; the
+        // non-producer coinbase still serves work.
+        static int v36_tx_log = 0;
+        if (v36_tx_log++ % 50 == 0)
+            LOG_WARNING << "[MINT] v36 producer job declined: the work template carries "
+                        << wd.m_tx_hashes.size()
+                        << " transaction(s); the private/isolated DASH v36 sharechain "
+                           "mints coinbase-only shares";
+        return std::nullopt;
+    }
+
     // Miner identity: DASH sharechain payouts are P2PKH-keyed (share_data
     // pubkey_hash). Non-P2PKH -> no producer job (the caller's non-producer
     // coinbase path still serves work; it just cannot mint).
@@ -161,7 +184,7 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     pin.subsidy            = wd.m_coinbase_value;
     pin.donation           = donation;
     pin.stale_info         = dash::StaleInfo::none;
-    pin.desired_version    = 16;                     // LEGACY v16 — the live lineage
+    pin.desired_version    = params.current_share_version;   // 16 public; 36 isolated
     pin.payment_amount     = wd.m_payment_amount;
     for (const auto& p : wd.m_packed_payments) {
         dash::PackedPayment pp;
@@ -172,48 +195,76 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     pin.desired_tx_hashes  = wd.m_tx_hashes;
     pin.desired_timestamp  = desired_timestamp;
     pin.desired_target     = desired_share_target(params, local_hash_rate);
+    if (v36)
+        pin.message_data   = message_data;           // v16 has no message_data field
 
     auto info = dash::producer::generate_prospective_share_info(chain, params, pin);
 
-    // Cumulative PPLNS weights — the EXACT interior of producer::build_share
-    // (oracle window: start at the grandparent, max(0, min(height, RCL)-1)
-    // shares, capped at 65535*SPREAD*ata(block_target); data.py:181-184).
-    // build_mint_share re-runs this identically at mint time.
-    dash::producer::CumulativeWeights weights;
-    if (!info.prev_hash.IsNull() && chain.contains(info.prev_hash))
-    {
-        uint256 grandparent;
-        chain.get_share(info.prev_hash).invoke([&](auto* obj) {
-            grandparent = obj->m_prev_hash;
-        });
-        const int32_t height = chain.get_acc_height(info.prev_hash);
-        const int32_t max_shares = std::max<int32_t>(
-            0, std::min<int32_t>(height, static_cast<int32_t>(params.real_chain_length)) - 1);
-        const uint256 block_target = chain::bits_to_target(wd.m_bits);
-        const uint288 desired_weight =
-            chain::target_to_average_attempts(block_target) * params.spread * 65535u;
-        weights = dash::producer::get_cumulative_weights(
-            chain, grandparent, max_shares, desired_weight);
+    // Gentx bytes, split point and ref_hash for the share type this chain mints.
+    std::vector<unsigned char> gentx_bytes;
+    size_t prefix_len = 0;
+    uint256 ref_hash;
+    if (v36) {
+        // v36 arm: the ref_hash over the populated share fields (the verifier's
+        // one v36 ref builder), then the coinbase over the v36 window from the
+        // parent — exactly what build_share_v36 reproduces at mint time.
+        DashV36Share carrier;
+        dash::producer::populate_v36_share(carrier, info, /*last_txout_nonce=*/0);
+        ref_hash = dash::producer::compute_ref_hash(params, carrier);
+        dash::CumulativeWeights w;
+        try {
+            w = dash::v36_pplns_window(chain, info.prev_hash);
+        } catch (const std::exception&) {
+            return std::nullopt;   // unrooted short chain: fail-closed until it roots
+        }
+        auto gentx = dash::producer::build_gentx_v36(info, w, ref_hash,
+                                                     /*last_txout_nonce=*/0, params);
+        gentx_bytes = std::move(gentx.bytes);
+        prefix_len  = gentx.prefix_len;
+    } else {
+        // Cumulative PPLNS weights — the EXACT interior of producer::build_share
+        // (oracle window: start at the grandparent, max(0, min(height, RCL)-1)
+        // shares, capped at 65535*SPREAD*ata(block_target); data.py:181-184).
+        // build_mint_share re-runs this identically at mint time.
+        dash::producer::CumulativeWeights weights;
+        if (!info.prev_hash.IsNull() && chain.contains(info.prev_hash))
+        {
+            uint256 grandparent;
+            chain.get_share(info.prev_hash).invoke([&](auto* obj) {
+                grandparent = obj->m_prev_hash;
+            });
+            const int32_t height = chain.get_acc_height(info.prev_hash);
+            const int32_t max_shares = std::max<int32_t>(
+                0, std::min<int32_t>(height, static_cast<int32_t>(params.real_chain_length)) - 1);
+            const uint256 block_target = chain::bits_to_target(wd.m_bits);
+            const uint288 desired_weight =
+                chain::target_to_average_attempts(block_target) * params.spread * 65535u;
+            weights = dash::producer::get_cumulative_weights(
+                chain, grandparent, max_shares, desired_weight);
+        }
+
+        ref_hash = dash::producer::compute_ref_hash(params, info);
+        dash::producer::GentxResult gentx =
+            dash::producer::build_gentx(info, weights, ref_hash, /*last_txout_nonce=*/0, params);
+        gentx_bytes = std::move(gentx.bytes);
+        prefix_len  = gentx.prefix_len;
     }
 
-    const uint256 ref_hash = dash::producer::compute_ref_hash(params, info);
-    dash::producer::GentxResult gentx =
-        dash::producer::build_gentx(info, weights, ref_hash, /*last_txout_nonce=*/0, params);
-
     // nonce64 slot: the OP_RETURN tail is [0x6a 0x28 ref(32) nonce(8)] followed
-    // by locktime(4) + optional payload VarStr; build_gentx's prefix_len cuts
-    // exactly before the ref_hash, so the nonce slot is prefix_len + 32.
-    const size_t nonce_off = gentx.prefix_len + 32;
-    if (nonce_off + 8 > gentx.bytes.size())
+    // by locktime(4) + optional payload VarStr; build_gentx's (and
+    // build_gentx_v36's, same contract) prefix_len cuts exactly before the
+    // ref_hash, so the nonce slot is prefix_len + 32.
+    const size_t nonce_off = prefix_len + 32;
+    if (nonce_off + 8 > gentx_bytes.size())
         return std::nullopt;                             // producer invariant broke
-    if (std::memcmp(gentx.bytes.data() + gentx.prefix_len, ref_hash.data(), 32) != 0)
+    if (std::memcmp(gentx_bytes.data() + prefix_len, ref_hash.data(), 32) != 0)
         return std::nullopt;                             // ref not where expected
     for (size_t i = 0; i < 8; ++i)
-        if (gentx.bytes[nonce_off + i] != 0x00)
+        if (gentx_bytes[nonce_off + i] != 0x00)
             return std::nullopt;                         // slot must be zeroed
 
     ProducerJobBuild out;
-    out.job.gentx_bytes    = std::move(gentx.bytes);
+    out.job.gentx_bytes    = std::move(gentx_bytes);
     out.job.nonce64_offset = nonce_off;
     out.job.ref_hash       = ref_hash;
     out.job.share_bits     = info.bits;
@@ -223,7 +274,7 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     out.frozen.coinbase_payload   = pin.coinbase_payload;
     out.frozen.share_nonce        = share_nonce;
     out.frozen.donation           = donation;
-    out.frozen.desired_version    = 16;
+    out.frozen.desired_version    = params.current_share_version;
     out.frozen.payment_amount     = pin.payment_amount;
     out.frozen.packed_payments    = pin.packed_payments;
     out.frozen.desired_tx_hashes  = pin.desired_tx_hashes;
@@ -235,7 +286,46 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     // exact identity this gentx committed to (see FrozenMintJob note) — with
     // --fee substitution the submit-time username script differs from it.
     out.frozen.payout_script_override = payout_script;
+    out.frozen.message_data       = pin.message_data;    // committed in ref_hash (v36)
     return out;
+}
+
+// ── select_embed_blob ────────────────────────────────────────────────────────
+//
+// The operator message blob (--message-blob-hex) goes into the message_data of
+// locally minted shares ONLY where the chain's share type carries the field
+// (v36: the private/isolated DASH v36 sharechain) AND the blob validates
+// against THAT chain's message authority (share_check.hpp
+// active_message_authority(): the maintainer key alone on the isolated chain).
+// The startup check in main_dash.cpp validates against the public 2-key set,
+// which a blob keyed to the other authority key passes; embedding such a blob
+// would make every minted share fail its own v36 verifier (message_data is
+// validated in share_init_verify), i.e. the node would orphan its own shares.
+// Here it is not embedded: the result is empty (and `why` says why), shares
+// mint with empty message_data. On the public profile the result is always
+// empty (v16 has no message_data field).
+inline std::vector<unsigned char> select_embed_blob(
+    const std::vector<unsigned char>& blob,
+    const SharechainConfig::ShareProfile& prof,
+    std::span<const AuthorityPubkey* const> keys,
+    std::string* why = nullptr)
+{
+    auto reject = [&](std::string reason) {
+        if (why) *why = std::move(reason);
+        return std::vector<unsigned char>{};
+    };
+    if (blob.empty())
+        return reject("no operator message blob");
+    if (!core::version_gate::is_v36_active(prof.target_share_version))
+        return reject("this sharechain mints v" + std::to_string(prof.target_share_version) +
+                      " shares, which carry no message_data");
+    if (blob.size() > MAX_MESSAGE_DATA_WIRE_BYTES)
+        return reject("blob exceeds MAX_TOTAL_MESSAGE_BYTES");
+    const std::string err = validate_message_data(blob, keys);
+    if (!err.empty())
+        return reject("blob does not validate against this sharechain's message authority: " + err);
+    if (why) why->clear();
+    return blob;
 }
 
 // ── Node-owner fee + dev fee + redistribute (README flag port) ───────────────
@@ -521,6 +611,32 @@ inline std::optional<dash::producer::BuiltShare> mint_from_inputs(
     return built;
 }
 
+// ── mint_from_inputs_any ─────────────────────────────────────────────────────
+//
+// mint_from_inputs for the share type this chain mints (params.
+// current_share_version: v16 public, v36 private/isolated): the same X11
+// identity gate (build_mint_share_any) and the same pow<=committed-target
+// ban-safety guard. `message_authority` defaults to the production set.
+template <typename ChainT>
+inline std::optional<dash::stratum::MintedShare> mint_from_inputs_any(
+    ChainT& chain,
+    const core::CoinParams& params,
+    const dash::stratum::DASHWorkSource::MintShareInputs& in,
+    dash::stratum::FrozenMintJob job,
+    std::span<const AuthorityPubkey* const> message_authority = active_message_authority())
+{
+    job.last_txout_nonce = in.last_txout_nonce;
+    auto built = dash::stratum::build_mint_share_any(chain, params, in, job, message_authority);
+    if (!built)
+        return std::nullopt;
+
+    const uint256 share_target = chain::bits_to_target(built->bits());
+    if (share_target.IsNull() || built->hash() > share_target)
+        return std::nullopt;
+
+    return built;
+}
+
 // ── elect_best_share ─────────────────────────────────────────────────────────
 //
 // Best-share election policy — the btc::NodeImpl::best_share_hash() body
@@ -599,6 +715,12 @@ inline uint256 elect_best_share(TrackerT& tracker,
 // producer commitment, so a solve on it can never look up a frozen job and
 // the mint declines — fail-closed by construction (payouts stay correct; only
 // the sharechain credit needs the producer path).
+//
+// v36 (the private/isolated DASH v36 sharechain, params.current_share_version
+// 36): the v36 window from the parent (pplns_v36.hpp v36_pplns_window, the
+// rule the v36 stratum coinbase arm and every v36 share commit to), normalized
+// the same way; an unrooted short chain (the window's depth guard throws)
+// yields nullopt, like an empty window.
 template <typename ChainT>
 inline std::optional<dash::stratum::DASHWorkSource::PplnsWeights>
 pplns_weights_for(ChainT& chain,
@@ -609,19 +731,31 @@ pplns_weights_for(ChainT& chain,
     if (prev_share_hash.IsNull() || !chain.contains(prev_share_hash) || block_bits == 0)
         return std::nullopt;
 
-    uint256 grandparent;
-    chain.get_share(prev_share_hash).invoke([&](auto* obj) {
-        grandparent = obj->m_prev_hash;
-    });
-    const int32_t height = chain.get_acc_height(prev_share_hash);
-    const int32_t max_shares = std::max<int32_t>(
-        0, std::min<int32_t>(height, static_cast<int32_t>(params.real_chain_length)) - 1);
-    const uint256 block_target = chain::bits_to_target(block_bits);
-    const uint288 desired_weight =
-        chain::target_to_average_attempts(block_target) * params.spread * 65535u;
+    dash::producer::CumulativeWeights w;
+    if (core::version_gate::is_v36_active(params.current_share_version)) {
+        dash::CumulativeWeights v;
+        try {
+            v = dash::v36_pplns_window(chain, prev_share_hash);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+        w.weights      = std::move(v.weights);
+        w.total_weight = v.total_weight;
+    } else {
+        uint256 grandparent;
+        chain.get_share(prev_share_hash).invoke([&](auto* obj) {
+            grandparent = obj->m_prev_hash;
+        });
+        const int32_t height = chain.get_acc_height(prev_share_hash);
+        const int32_t max_shares = std::max<int32_t>(
+            0, std::min<int32_t>(height, static_cast<int32_t>(params.real_chain_length)) - 1);
+        const uint256 block_target = chain::bits_to_target(block_bits);
+        const uint288 desired_weight =
+            chain::target_to_average_attempts(block_target) * params.spread * 65535u;
 
-    auto w = dash::producer::get_cumulative_weights(
-        chain, grandparent, max_shares, desired_weight);
+        w = dash::producer::get_cumulative_weights(
+            chain, grandparent, max_shares, desired_weight);
+    }
     if (w.total_weight.IsNull())
         return std::nullopt;
 

@@ -369,58 +369,12 @@ void NodeImpl::load_persisted_shares()
     const size_t keep = static_cast<size_t>(SharechainConfig::chain_length()) * 2 + 10;
     const size_t total_in_db = all_hashes.size();
 
-    // The window counts only rows this chain can load: rows of a type it does
-    // not admit (check_share_type_admitted, e.g. v16 rows in an identity-scoped
-    // private/isolated DB written before the chain switched to v36) take no
-    // window slot. The v36 genesis restarts absheight at 1, so such rows sort
-    // ABOVE the whole v36 chain by height; counting them would push every v36
-    // row out of the window. Scanned newest-first; the rows that count are
-    // kept for the load loop below (read once). A DB holding one type only
-    // (the public network) selects exactly the newest `keep` rows, as before.
-    struct ScannedRow {
-        bool cached = false;   // false: a row of another type, re-read below
-        bool ok = false;
-        std::vector<uint8_t> data;
-        core::ShareMetadata meta;
-    };
-    std::vector<ScannedRow> scanned;   // scanned[k] = row all_hashes[total_in_db - 1 - k]
-    size_t skip = 0;
-    if (total_in_db > keep) {
-        size_t counted = 0;
-        size_t i = total_in_db;
-        while (i > 0 && counted < keep) {
-            --i;
-            ScannedRow r;
-            r.ok = m_storage->load_share(all_hashes[i], r.data, r.meta) && r.data.size() >= 8;
-            bool admitted = true;
-            if (r.ok) {
-                uint64_t ver;
-                std::memcpy(&ver, r.data.data(), 8);
-                try { check_share_type_admitted(static_cast<int64_t>(ver), m_tracker.m_coin_params); }
-                catch (const std::exception&) { admitted = false; }
-            }
-            if (admitted) {
-                r.cached = true;
-                ++counted;
-            } else {
-                r.data.clear();
-                r.data.shrink_to_fit();
-            }
-            scanned.push_back(std::move(r));
-        }
-        skip = i;
-    }
-    auto fetch_row = [&](size_t i, std::vector<uint8_t>& data, core::ShareMetadata& meta) -> bool {
-        if (!scanned.empty()) {
-            auto& r = scanned[total_in_db - 1 - i];
-            if (r.cached) {
-                data = std::move(r.data);
-                meta = r.meta;
-                return r.ok;
-            }
-        }
-        return m_storage->load_share(all_hashes[i], data, meta);
-    };
+    // One store holds one share type: a private/isolated identity's subdir is
+    // keyed on the share version it mints (SharechainConfig::data_subdir,
+    // "dash_<id>_v36"), so the newest `keep` rows are all rows of the type the
+    // chain speaks — the window of master, unchanged. The per-row type check
+    // below stays as a cheap invariant.
+    size_t skip = (total_in_db > keep) ? (total_in_db - keep) : 0;
 
     int loaded = 0, skipped = 0;
     std::vector<uint256> verified_hashes;
@@ -429,7 +383,7 @@ void NodeImpl::load_persisted_shares()
         const auto& hash = all_hashes[i];
         std::vector<uint8_t> data;
         core::ShareMetadata meta;
-        if (!fetch_row(i, data, meta) || data.size() < 8) {
+        if (!m_storage->load_share(hash, data, meta) || data.size() < 8) {
             ++skipped;
             continue;
         }
@@ -439,8 +393,9 @@ void NodeImpl::load_persisted_shares()
             chain::RawShare rshare(ver, PackStream(
                 std::vector<unsigned char>(data.begin() + 8, data.end())));
             auto share = dash::load_share(rshare, NetService{"database", 0});
-            // A row of a type this chain does not admit (it took no window
-            // slot above) is skipped, never inserted.
+            // A row of a type this chain does not admit is skipped, never
+            // inserted (invariant; the version-keyed subdir already keeps
+            // other-type rows out of this store).
             try {
                 check_share_type_admitted(share.version(), m_tracker.m_coin_params);
             } catch (const std::exception& e) {
@@ -557,7 +512,10 @@ void NodeImpl::apply_min_protocol_ratchet()
     const uint32_t target  = SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION;  // 3600
     const uint32_t current =
         m_runtime_min_protocol_version.load(std::memory_order_relaxed);
-    if (current >= target)                    // already ratcheted -> latched, no-op
+    // Already ratcheted -> latched, no-op. On the private/isolated DASH v36
+    // sharechain the floor is SEEDED at 3600 (node.hpp, share_profile()
+    // .ratchet_floor_protocol_version), so this returns on the first call there.
+    if (current >= target)
         return;
     if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))
         return;

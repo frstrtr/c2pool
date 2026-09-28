@@ -436,7 +436,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # receive -> tracker verify -> LevelDB persist -> reload of v36 shares).
     # FOLDED in for the same reason; needs exactly this link set (a real
     # ctx-bound dash::NodeImpl + ShareTracker + c2pool_storage).
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp)
+    # test_dash_v36_flip.cpp: the private/isolated DASH v36 sharechain MINTS
+    # v36 (current_share_version 36, v36 producer job + mint, ratchet seed 3600,
+    # emergency decay retarget, operator blob embed, version-keyed data subdir,
+    # web label, payout view). Same harness (test/dash_v36_live_fixture.hpp) and
+    # link set as the live-variant KATs; folded in for the same reason.
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

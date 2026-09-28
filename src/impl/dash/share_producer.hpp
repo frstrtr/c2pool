@@ -24,10 +24,12 @@
 //
 // DELIBERATE divergences from EXISTING in-tree code (all oracle-conform, see
 // the per-function notes; these are the review hotspots):
-//   1. Retarget: ShareTracker::compute_share_target carries a v36 emergency
-//      time-decay (share_tracker.hpp "Step 3") that does NOT exist in the
-//      p2pool-dash oracle. The mint path must not use it — compute_share_target
-//      below is the oracle formula only (data.py:137-145).
+//   1. Retarget: the v36 emergency time-decay (share_tracker.hpp "Step 3")
+//      does NOT exist in the p2pool-dash oracle. On the public network the
+//      mint path is the oracle formula only (data.py:137-145). The private/
+//      isolated DASH v36 sharechain enables it (SharechainConfig::
+//      share_profile().emergency_decay) through emergency_decay_clamp_ref,
+//      the ONE copy of the rule (the tracker's Step 3 calls it too).
 //   2. PPLNS weights window: the oracle starts the cumulative-weights walk at
 //      previous_share.previous_share_hash (data.py:181), i.e. the GRANDPARENT
 //      of the share being built. share_check.hpp::generate_share_transaction
@@ -42,6 +44,7 @@
 #include "share.hpp"
 #include "share_types.hpp"
 #include "share_chain.hpp"   // dash::ShareHasher (tx-ref dedup map)
+#include "emergency_decay.hpp" // emergency_decay_clamp_ref (v36 time-decay rule)
 #include "share_check.hpp"   // DONATION_SCRIPT, decode_payee_script, pubkey_hash_to_script2,
                              // check_merkle_link, check_hash_link, compute_gentx_before_refhash,
                              // share_init_verify
@@ -110,8 +113,9 @@ inline void append_stream(std::vector<unsigned char>& out, PackStream& s)
 //   bits     = FloatingInteger.from_target_upper_bound(clip(desired_target,
 //                                          (pre_target3//30, pre_target3)))
 //
-// NO emergency time-decay: the oracle has none (that step is a p2pool-v36-ism
-// present in ShareTracker::compute_share_target and MUST NOT be used to mint).
+// Public network: NO emergency time-decay — the oracle has none. The private/
+// isolated DASH v36 sharechain applies it (emergency_decay_clamp_ref below):
+// the ±10% band is taken around the eased reference instead of prev.max_target.
 // chain::target_to_bits_upper_bound is mantissa-TRUNCATING, matching the
 // oracle's FloatingInteger.from_target_upper_bound (dash/data.py:44-50) —
 // pinned by the DashShareProducerRetarget KATs.
@@ -122,15 +126,24 @@ struct ShareTarget
     uint32_t bits{0};
 };
 
+// v36 emergency time-decay reference: emergency_decay_clamp_ref
+// (emergency_decay.hpp, shared with ShareTracker::compute_share_target).
+
 // Pure core over explicit inputs. have_lookbehind == (height(prev) >=
 // TARGET_LOOKBEHIND); aps is the already-floored integer attempts/second on
-// the min_work basis (integer=True).
+// the min_work basis (integer=True). emergency_decay (private/isolated v36
+// chain only) takes the ±10% band around emergency_decay_clamp_ref(...) of
+// (prev_timestamp, desired_timestamp); with the defaults (false) the
+// arithmetic is exactly the oracle's.
 inline ShareTarget compute_share_target_pure(bool have_lookbehind,
                                              const uint288& aps,
                                              const uint256& prev_max_target,
                                              const uint256& desired_target,
                                              uint32_t share_period,
-                                             const uint256& max_target)
+                                             const uint256& max_target,
+                                             uint32_t prev_timestamp = 0,
+                                             uint32_t desired_timestamp = 0,
+                                             bool emergency_decay = false)
 {
     uint256 pre_target3;
 
@@ -161,10 +174,15 @@ inline ShareTarget compute_share_target_pure(bool have_lookbehind,
         }
 
         // pre_target2 = clip(pre_target, prev.max_target*9//10, *11//10)
+        // (v36 emergency decay: around the eased reference instead).
+        const uint256 clamp_ref = emergency_decay
+            ? emergency_decay_clamp_ref(prev_max_target, prev_timestamp,
+                                        desired_timestamp, share_period, max_target)
+            : prev_max_target;
         uint288 lo, hi;
         {
             uint288 pm;
-            pm.SetHex(prev_max_target.GetHex());
+            pm.SetHex(clamp_ref.GetHex());
             lo = pm * 9;  lo = lo / 10;
             hi = pm * 11; hi = hi / 10;
         }
@@ -225,10 +243,16 @@ inline uint288 pool_attempts_per_second(ChainT& chain, const uint256& prev_hash,
 }
 
 // Chain wrapper: resolve height / aps / prev max_target off the live chain.
+// desired_timestamp is the JOB's wall-clock time (not the share timestamp
+// clipped to prev+2*SHARE_PERIOD-1, which could never pass the decay
+// threshold); it only matters where the per-network profile enables the v36
+// emergency decay (SharechainConfig::share_profile().emergency_decay, read
+// live — the private/isolated DASH v36 sharechain). Public: unused.
 template <typename ChainT>
 inline ShareTarget compute_share_target(ChainT& chain, const uint256& prev_hash,
                                         const uint256& desired_target,
-                                        const core::CoinParams& params)
+                                        const core::CoinParams& params,
+                                        uint32_t desired_timestamp = 0)
 {
     const uint256 max_target = params.max_target;
 
@@ -249,13 +273,16 @@ inline ShareTarget compute_share_target(ChainT& chain, const uint256& prev_hash,
         chain, prev_hash, static_cast<int32_t>(params.target_lookbehind));
 
     uint256 prev_max_target;
+    uint32_t prev_timestamp = 0;
     chain.get_share(prev_hash).invoke([&](auto* obj) {
         prev_max_target = chain::bits_to_target(obj->m_max_bits);
+        prev_timestamp  = obj->m_timestamp;
     });
 
     return compute_share_target_pure(true, aps, prev_max_target, desired_target,
                                      static_cast<uint32_t>(params.share_period),
-                                     max_target);
+                                     max_target, prev_timestamp, desired_timestamp,
+                                     SharechainConfig::share_profile().emergency_decay);
 }
 
 // ── 1b. Timestamp clip (data.py:238-241) ─────────────────────────────────────
@@ -449,12 +476,17 @@ struct ProducerJobInputs
     uint64_t subsidy{0};                           // GBT coinbasevalue (all fees known)
     uint16_t donation{0};                          // share_data['donation'] (per-miner --give-author)
     StaleInfo stale_info{StaleInfo::none};
+    // Default = the pre-v36 baseline for hand-filled inputs (KATs); the mint
+    // path (mint_runloop.hpp build_producer_job) writes params.current_share_version.
     uint64_t desired_version{16};
     uint64_t payment_amount{0};                    // GBT masternode/superblock total
     std::vector<PackedPayment> packed_payments;    // GBT payment list (template order)
     std::vector<uint256> desired_tx_hashes;        // GBT tx set (template order)
     uint32_t desired_timestamp{0};
     uint256  desired_target;                       // vardiff target (pre-clip)
+    // v36 only: the share's message_data blob (copied to
+    // ProspectiveShareInfo::message_data; never read by the v16 serializers).
+    std::vector<unsigned char> message_data;
 };
 
 // The assembled share_info + the job tx set the merkle_link derives from.
@@ -469,7 +501,7 @@ struct ProspectiveShareInfo
     uint64_t subsidy{0};
     uint16_t donation{0};
     StaleInfo stale_info{StaleInfo::none};
-    uint64_t desired_version{16};
+    uint64_t desired_version{16};                  // copied from ProducerJobInputs
     uint64_t payment_amount{0};
     std::vector<PackedPayment> packed_payments;
 
@@ -510,10 +542,13 @@ inline ProspectiveShareInfo generate_prospective_share_info(
     info.desired_version  = in.desired_version;
     info.payment_amount   = in.payment_amount;
     info.packed_payments  = in.packed_payments;
+    info.message_data     = in.message_data;
 
-    // Retarget (oracle formula — see compute_share_target notes).
+    // Retarget (oracle formula — see compute_share_target notes; the v36
+    // emergency decay reads the job's desired_timestamp where it is enabled).
     const ShareTarget st =
-        compute_share_target(chain, in.prev_share_hash, in.desired_target, params);
+        compute_share_target(chain, in.prev_share_hash, in.desired_target, params,
+                             in.desired_timestamp);
     info.max_bits = st.max_bits;
     info.bits     = st.bits;
 
@@ -620,12 +655,11 @@ inline uint256 compute_ref_hash(const core::CoinParams& params,
     return check_merkle_link(Hash(sp), ref_merkle_link);
 }
 
-// v36 get_ref_hash (private/isolated DASH v36 sharechain; dormant until the
-// v36 producer lands). The carrier is the DashV36Share being minted; its
-// m_ref_merkle_link is empty by construction (data.py:285). Delegates to the
-// verifier's ONE v36 ref-stream builder (share_check.hpp
-// compute_v36_ref_hash / serialize_v36_ref_share_info), so producer and
-// verifier commit to the same bytes by construction.
+// v36 get_ref_hash (private/isolated DASH v36 sharechain). The carrier is the
+// DashV36Share being minted; its m_ref_merkle_link is empty by construction
+// (data.py:285). Delegates to the verifier's ONE v36 ref-stream builder
+// (share_check.hpp compute_v36_ref_hash / serialize_v36_ref_share_info), so
+// producer and verifier commit to the same bytes by construction.
 inline uint256 compute_ref_hash(const core::CoinParams& params, const DashV36Share& carrier)
 {
     return compute_v36_ref_hash(params, carrier);
@@ -1008,10 +1042,10 @@ inline BuiltShare build_share(ChainT& chain,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v36 producer arm (private/isolated DASH v36 sharechain; DORMANT until the
-// mint path selects v36 — nothing below is called by build_mint_share /
-// build_producer_job, which still mint v16). The v16 producer above is
-// byte-unchanged.
+// v36 producer arm (private/isolated DASH v36 sharechain). The mint path
+// selects it when CoinParams::current_share_version is v36 (mint_runloop.hpp
+// build_producer_job, share_producer_bind.hpp build_mint_share_any). The v16
+// producer above is byte-unchanged.
 //
 // The v36 coinbase is built by the verifier's ONE assembler
 // (share_check.hpp build_v36_gentx) over the ONE window rule
@@ -1041,24 +1075,15 @@ struct BuiltV36Share
     uint256 ref_hash;     // PPLNS OP_RETURN commitment
 };
 
-// Build a DashV36Share from a prospective share_info + the solved header, with
-// the same MANDATORY self-verify as build_share: the hash_link fold must
-// reproduce the gentx txid and the share must pass share_init_verify
-// (DashV36Share). v36 carries no tx refs (daemonless coinbase-only);
-// info.new_transaction_hashes / transaction_hash_refs are not committed.
-template <typename ChainT>
-inline BuiltV36Share build_share_v36(ChainT& chain,
-                                     const core::CoinParams& params,
-                                     const ProspectiveShareInfo& info,
-                                     const bitcoin_family::coin::SmallBlockHeaderType& min_header,
-                                     uint64_t last_txout_nonce,
-                                     bool check_pow = true)
+// Populate every field of a DashV36Share the v36 ref stream commits
+// (share_data + share_info + message_data + the DASH suffix) from a
+// prospective share_info, with an EMPTY ref_merkle_link (data.py:285) and the
+// given last_txout_nonce. The header, hash_link, merkle_link and outer payload
+// are NOT touched. Shared by build_share_v36 and the job-time ref_hash pass
+// (mint_runloop.hpp build_producer_job), so both commit the same bytes.
+inline void populate_v36_share(DashV36Share& s, const ProspectiveShareInfo& info,
+                               uint64_t last_txout_nonce)
 {
-    BuiltV36Share out;
-    DashV36Share& s = out.share;
-
-    s.m_min_header = min_header;
-
     // share_data (standardized v36)
     s.m_prev_hash       = info.prev_hash;
     s.m_coinbase        = BaseScript(info.coinbase);
@@ -1087,6 +1112,29 @@ inline BuiltV36Share build_share_v36(ChainT& chain,
 
     s.m_ref_merkle_link  = v36::MerkleLink{};      // empty (data.py:285)
     s.m_last_txout_nonce = last_txout_nonce;
+}
+
+// Build a DashV36Share from a prospective share_info + the solved header, with
+// the same MANDATORY self-verify as build_share: the hash_link fold must
+// reproduce the gentx txid and the share must pass share_init_verify
+// (DashV36Share) against `message_authority` (production: the overload below,
+// active_message_authority()). v36 carries no tx refs (daemonless
+// coinbase-only); info.new_transaction_hashes / transaction_hash_refs are not
+// committed.
+template <typename ChainT>
+inline BuiltV36Share build_share_v36(ChainT& chain,
+                                     const core::CoinParams& params,
+                                     const ProspectiveShareInfo& info,
+                                     const bitcoin_family::coin::SmallBlockHeaderType& min_header,
+                                     uint64_t last_txout_nonce,
+                                     bool check_pow,
+                                     std::span<const AuthorityPubkey* const> message_authority)
+{
+    BuiltV36Share out;
+    DashV36Share& s = out.share;
+
+    s.m_min_header = min_header;
+    populate_v36_share(s, info, last_txout_nonce);
 
     // ref_hash over the populated share (the verifier's one v36 ref builder),
     // then the coinbase over the v36 window from the parent.
@@ -1128,9 +1176,21 @@ inline BuiltV36Share build_share_v36(ChainT& chain,
     }
     // (2) Full v36 verifier pass (timestamp bound, ref_hash, hash_link, merkle,
     //     X11, message_data).
-    s.m_hash = share_init_verify(s, params, check_pow);
+    s.m_hash = share_init_verify(s, params, check_pow, message_authority);
 
     return out;
+}
+
+template <typename ChainT>
+inline BuiltV36Share build_share_v36(ChainT& chain,
+                                     const core::CoinParams& params,
+                                     const ProspectiveShareInfo& info,
+                                     const bitcoin_family::coin::SmallBlockHeaderType& min_header,
+                                     uint64_t last_txout_nonce,
+                                     bool check_pow = true)
+{
+    return build_share_v36(chain, params, info, min_header, last_txout_nonce, check_pow,
+                           active_message_authority());
 }
 
 } // namespace dash::producer
