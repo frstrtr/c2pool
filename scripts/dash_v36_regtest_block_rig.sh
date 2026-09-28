@@ -22,9 +22,12 @@
 #   1  three mempool txs (P2SH+nulldata, P2SH, P2PKH) -> the found block carries
 #      them: ntx == 4, all three txids present, merkleroot == header, d1 and d2
 #      best block == it; A: BLOCK FOUND txs=3 + share minted with the block
-#      hash; B: the share is in its sharechain, verified, V=36, and B's tracker
-#      arm refused to rebuild the block (not the finder), never submitted it
-#   2  two fresh mempool txs -> a second block carrying them (ntx == 3)
+#      hash; B: the share is in its sharechain, verified, V=36. This first
+#      share is the sharechain genesis (prev = 0), so both tracker arms log
+#      "parent not in-chain" and only the finder's stratum arm submits it
+#   2  two fresh mempool txs -> a second block carrying them (ntx == 3); A's
+#      tracker arm (the finder) rebuilds the full block from its frozen job,
+#      B's refuses (no template bodies) and never rebuilds it
 #   3  empty mempool -> a coinbase-only block (ntx == 1) still mints
 #   4  the v36 network without --coin-rpc: stratum is NOT started
 # Every command and the block hashes are printed for the evidence record.
