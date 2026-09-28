@@ -4752,6 +4752,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)drops_prev_decoded, (unsigned long long)drops_prev_none, (unsigned long long)drops_prev_undecided,
                             (unsigned long long)drops_hold_entered, (unsigned long long)drops_hold_resolved, drops_hold_since.size(),
                             drops_hold_max_ms, relay_node->describe_drops().c_str());
+                std::printf("  %s\n", relay_node->describe_sendq().c_str());   // RELAY-SEND-QUEUE
                 if (drops_store)   // ★ DROPS-RESTART
                     std::printf("  drops-restart: journal own=%zu frames=%zu booked=%zu write_fail=%llu | reloaded own=%zu frames=%zu booked=%zu "
                                 "| redrive_booked=%llu predrops_hold=%llu getwon_tx=%llu prev_lane row_missing=%llu | write-ahead published=%zu "

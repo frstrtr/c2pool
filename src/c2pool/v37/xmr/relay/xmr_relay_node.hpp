@@ -382,6 +382,12 @@ struct RelayOptions {
     // keepalive-speaking peer sent nothing for silence_timeout_ms (0 = never).
     u32         keepalive_ms = 5000;
     u32         silence_timeout_ms = 25000;
+    // RELAY-SEND-QUEUE: every send is queued per connection and written by that
+    // connection's own writer thread (carrier_net.hpp), so no reader, verify
+    // worker, maintenance tick or stratum path ever blocks on a peer's socket.
+    // A peer whose queue would exceed this many bytes is dropped (not the node
+    // stalled). 0 = the legacy synchronous send path.
+    std::size_t send_queue_bytes = 16u << 20;
     // RELAY-DISCOVERY (FB_GETADDR/FB_ADDR 0x4c/0x4d). OFF here (the library
     // default keeps every pre-discovery KAT byte-identical: 0x4c/0x4d are then
     // fb_unknown, nothing is asked or dialed beyond `peers`); the daemon turns
@@ -430,6 +436,8 @@ struct RelayStats {
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
+    std::atomic<u64> won_reoffer_skipped{0};   // RELAY-SEND-QUEUE: not re-offered, the peer node provably holds it
+    std::atomic<u64> won_held_confirmed{0};    // RELAY-SEND-QUEUE: re-offered frames a later PONG proved read
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
     // ★ RAIN-BACKFILL (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
@@ -575,6 +583,7 @@ public:
         });
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
         m_net.set_log([this](const std::string& s) { log("relay: " + s); });
+        m_net.set_send_queue(m_o.send_queue_bytes);   // RELAY-SEND-QUEUE (0 = synchronous, legacy)
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -859,6 +868,18 @@ public:
         std::sort(v.begin(), v.end());
         return v;
     }
+    // RELAY-SEND-QUEUE diagnostics (one line; the smoke greps it).
+    std::string describe_sendq() const {
+        char b[400];
+        std::snprintf(b, sizeof b,
+            "relay-sendq: bound=%zu hwm=%zu full_drops=%llu slow_drops=%llu frames=%llu max_wait_ms=%llu | won reoffered=%llu skipped=%llu confirmed=%llu",
+            m_net.send_queue_limit(), m_net.queued_bytes_hwm(),
+            (unsigned long long)m_net.peers_dropped_queue_full(), (unsigned long long)m_net.peers_dropped_slow(),
+            (unsigned long long)m_net.async_frames_written(), (unsigned long long)m_net.async_max_wait_ms(),
+            (unsigned long long)m_st.won_reoffered.load(), (unsigned long long)m_st.won_reoffer_skipped.load(),
+            (unsigned long long)m_st.won_held_confirmed.load());
+        return b;
+    }
     std::string describe_drops() const {
         const auto& s = m_st;
         char b[900];
@@ -1002,7 +1023,7 @@ public:
         const auto f = encode_block_won(b);
         remember_won_frame(f);   // ENROL-REPL (DROPS only): re-offered to a peer that HELLOs later
         std::size_t n = 0;
-        for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) ++n;
+        for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) { ++n; if (m_o.drops_floor_diff) note_won_sent(p, b.bid); }
         m_st.block_won_tx++;
         return n;
     }
@@ -1703,6 +1724,7 @@ private:
         }
         if (m_fetch) m_fetch->forget_peer(p);
         if (m_serve) m_serve->forget_peer(p);
+        { std::lock_guard<std::mutex> lk(m_bmtx); m_won_offer.erase(p); }   // RELAY-SEND-QUEUE
         if (m_o.drops_floor_diff) {   // ★ RAIN-BACKFILL: a dropped peer's inventories say nothing any more
             std::lock_guard<std::mutex> lk(m_dsmtx);
             for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();) it = (it->first.p == p) ? m_drop_inv.erase(it) : std::next(it);
@@ -1763,7 +1785,7 @@ private:
             auto it = m_peers.find(p);
             if (it != m_peers.end()) { it->second.ka = true; it->second.unanswered = 0; }
         }
-        if (op == FB_PONG) { m_st.pong_rx++; return; }
+        if (op == FB_PONG) { m_st.pong_rx++; on_pong_won(p, nonce); return; }
         m_st.ping_rx++;
         if (m_net.send_to(p, encode_ping(FB_PONG, nonce))) m_st.pong_tx++;
     }
@@ -1961,8 +1983,10 @@ private:
         if (!decode_block_won(f, b, &why)) { m_st.malformed++; return; }
         if (b.chain_id != m_o.chain) { m_st.wrong_chain++; return; }
         bool fresh = false;
+        const u64 from_node = m_o.drops_floor_diff ? peer_node_nonce(p) : 0;   // RELAY-SEND-QUEUE
         {
             std::lock_guard<std::mutex> lk(m_bmtx);
+            note_won_held(from_node, b.bid);   // that node holds this bid: never re-offer it back
             fresh = m_seen_bids.insert(b.bid).second;
             if (fresh) {
                 m_bid_peer[b.bid] = p;
@@ -1986,7 +2010,8 @@ private:
         if (m_o.drops_floor_diff && b.drops) { std::lock_guard<std::mutex> lk(m_bmtx); m_won_wanted.erase(b.bid); }
         m_st.block_won_rx++;
         remember_won_frame(f);   // ENROL-REPL (DROPS only)
-        for (PeerId q : ready_peers()) if (q != p) m_net.send_to(q, f);   // forward once (dedup by bid)
+        for (PeerId q : ready_peers())   // forward once (dedup by bid)
+            if (q != p && m_net.send_to(q, f) && m_o.drops_floor_diff) note_won_sent(q, b.bid);   // RELAY-SEND-QUEUE
     }
 
     // ★ ENROL-REPL (DROPS, gate ON only): under the flip every node books a lane
@@ -2026,11 +2051,107 @@ private:
         }
         if (m_net.send_to(p, frame)) m_st.won_served++;
     }
+    // ★ RELAY-SEND-QUEUE: the HELLO re-offer used to push EVERY kept frame (up to
+    // 64 x ~512 KiB v0x03) synchronously from the reader thread, on both ends at
+    // once -> the send-send deadlock of capstone attempt 6. Now it only builds a
+    // per-peer TODO of the bids that peer's NODE is not known to hold, and
+    // pump_won_offer() hands them to the transport's queue one frame at a time,
+    // while that peer's queued bytes are under kWonPageBytes (the maintenance
+    // tick keeps topping it up). "Known to hold" (m_won_held, by HELLO
+    // node_nonce, so it survives the redial of the same process) is PROOF only:
+    // that node sent us the frame, or a PONG for a PING queued AFTER our copy
+    // came back (TCP order + its sequential reader). Nothing on the wire changes.
+    static constexpr std::size_t kWonPageBytes = 1u << 20;
+    static bool won_frame_bid(const std::vector<u8>& f, bytes32& bid) {
+        if (f.size() < 6 + 32 || f[0] != FB_BLOCK_WON) return false;
+        std::copy(f.begin() + 6, f.begin() + 6 + 32, bid.begin());
+        return true;
+    }
+    u64 peer_node_nonce(PeerId p) const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto it = m_peers.find(p);
+        return (it != m_peers.end() && it->second.hello_ok) ? it->second.remote.node_nonce : 0;
+    }
+    void note_won_held(u64 nn, const bytes32& bid) {   // m_bmtx held by the caller
+        if (!nn) return;
+        auto& h = m_won_held[nn];
+        if (h.size() >= 4 * kWonServeMax) h.clear();   // bound: forgetting only costs a re-offer
+        h.insert(bid);
+        if (m_won_held.size() > 256) { auto v = m_won_held.begin(); if (v->first == nn) ++v; m_won_held.erase(v); }
+    }
     void reoffer_won_to(PeerId p) {
         if (m_o.drops_floor_diff == 0) return;
-        std::vector<std::vector<u8>> raws;
-        { std::lock_guard<std::mutex> lk(m_bmtx); raws.assign(m_won_raw.begin(), m_won_raw.end()); }
-        for (const auto& f : raws) if (m_net.send_to(p, f)) m_st.won_reoffered++;
+        const u64 nn = peer_node_nonce(p);
+        std::vector<std::pair<std::vector<u8>, std::optional<bytes32>>> now;   // not servable by bid (v0x01): small, sent at once
+        {
+            std::lock_guard<std::mutex> lk(m_bmtx);
+            auto& o = m_won_offer[p];
+            o.todo.clear();
+            auto hit = nn ? m_won_held.find(nn) : m_won_held.end();
+            std::set<bytes32> queued;
+            for (const auto& f : m_won_raw) {
+                bytes32 bid{};
+                if (!won_frame_bid(f, bid)) { now.emplace_back(f, std::nullopt); continue; }
+                if (hit != m_won_held.end() && hit->second.count(bid)) { m_st.won_reoffer_skipped++; continue; }
+                if (!m_won_by_bid.count(bid)) { now.emplace_back(f, bid); continue; }
+                if (queued.insert(bid).second) o.todo.push_back(bid);
+            }
+        }
+        for (const auto& [f, bid] : now) {
+            if (!m_net.send_to(p, f)) continue;
+            m_st.won_reoffered++;
+            if (bid) note_won_sent(p, *bid);
+        }
+        pump_won_offer(p);
+    }
+    void pump_won_offer(PeerId p) {
+        for (;;) {
+            if (m_net.send_queue_limit() && m_net.queued_bytes(p) >= kWonPageBytes) return;
+            std::vector<u8> f;
+            bytes32 bid{};
+            {
+                std::lock_guard<std::mutex> lk(m_bmtx);
+                auto it = m_won_offer.find(p);
+                if (it == m_won_offer.end() || it->second.todo.empty()) return;
+                bid = it->second.todo.front();
+                it->second.todo.pop_front();
+                auto w = m_won_by_bid.find(bid);
+                if (w == m_won_by_bid.end()) continue;   // evicted since: nothing to offer
+                f = w->second;
+            }
+            if (!m_net.send_to(p, f)) return;   // gone (or dropped): its down event clears the TODO
+            m_st.won_reoffered++;
+            note_won_sent(p, bid);
+        }
+    }
+    void note_won_sent(PeerId p, const bytes32& bid) {
+        const u64 at = m_ping_nonce.load();   // read AFTER the enqueue: a PING numbered > at is queued behind it
+        std::lock_guard<std::mutex> lk(m_bmtx);
+        auto it = m_won_offer.find(p);
+        if (it != m_won_offer.end() && it->second.unconfirmed.size() < 4 * kWonReofferMax)
+            it->second.unconfirmed.emplace_back(at, bid);
+    }
+    void on_pong_won(PeerId p, u64 nonce) {
+        if (m_o.drops_floor_diff == 0) return;
+        const u64 nn = peer_node_nonce(p);
+        if (!nn) return;
+        std::lock_guard<std::mutex> lk(m_bmtx);
+        auto it = m_won_offer.find(p);
+        if (it == m_won_offer.end()) return;
+        auto& u = it->second.unconfirmed;
+        for (auto e = u.begin(); e != u.end();) {
+            if (nonce > e->first) { note_won_held(nn, e->second); m_st.won_held_confirmed++; e = u.erase(e); }
+            else ++e;
+        }
+    }
+    void pump_won_offers() {   // maintenance tick
+        if (m_o.drops_floor_diff == 0) return;
+        std::vector<PeerId> ps;
+        {
+            std::lock_guard<std::mutex> lk(m_bmtx);
+            for (const auto& [p, o] : m_won_offer) if (!o.todo.empty()) ps.push_back(p);
+        }
+        for (PeerId p : ps) pump_won_offer(p);
     }
 
     // ── receipt context: serve (queue for the daemon's monerod) / receive ────
@@ -3570,6 +3691,7 @@ private:
             if (m_o.drops_floor_diff) drops_maint();   // ★ RAIN-BACKFILL
             drive_ctx();
             drive_liveness();   // RELAY-LIVENESS
+            pump_won_offers();  // RELAY-SEND-QUEUE: page the won re-offer into each peer's queue
             if (m_o.discovery) disc_tick();   // RELAY-DISCOVERY
         }
     }
@@ -3632,7 +3754,7 @@ private:
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
     Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
-    u64 m_ping_nonce = 0;                           // RELAY-LIVENESS (maintenance thread only)
+    std::atomic<u64> m_ping_nonce{0};               // RELAY-LIVENESS (bumped by maintenance only; read by the won re-offer)
 
     std::mutex m_tmtx;                 // dial targets + deferred drops
     std::vector<Target> m_targets;
@@ -3657,6 +3779,11 @@ private:
     static constexpr std::size_t kWonServeMax = 1024;
     std::map<bytes32, std::vector<u8>> m_won_by_bid;   // ★ DROPS-RESTART: carried frames servable by bid (DROPS only)
     std::deque<bytes32> m_won_serve_order;
+    // RELAY-SEND-QUEUE (guarded by m_bmtx): per-link paged won re-offer, and the
+    // bids each remote NODE (HELLO node_nonce) provably holds.
+    struct WonOffer { std::deque<bytes32> todo; std::vector<std::pair<u64, bytes32>> unconfirmed; };
+    std::map<PeerId, WonOffer> m_won_offer;
+    std::map<u64, std::set<bytes32>> m_won_held;
     std::set<bytes32> m_won_wanted;                    // ★ DROPS-RESTART: bids asked for with FB_GETWON
 
     mutable std::mutex m_dmtx;         // pos -> lane digest (the spine probe)

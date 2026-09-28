@@ -70,6 +70,29 @@
 // half-written frame on a live socket would feed a truncated body into the
 // peer's decoder.
 //
+// ── ★ RELAY-SEND-QUEUE: the opt-in asynchronous send path ──────────────────
+// Everything above still holds for the SYNCHRONOUS path (the default, used by
+// the btc-dash carrier and every pre-existing KAT unchanged). It has one hole
+// the XMR relay fell into (capstone attempt 6): a send issued FROM A READER
+// THREAD blocks that reader, and when BOTH ends of a link do it at once (the
+// FB_BLOCK_WON re-offer on HELLO, 512 KiB frames) neither side reads, both
+// sends fill the peer's receive buffer, both time out, the link is hard-dropped
+// and redialed, and every other thread that wanted the same connection's write
+// lock (verify flood, maintenance PING, the stratum share path) waited on it.
+// set_send_queue(max_bytes > 0) switches the node to:
+//   * send_to()/broadcast() only ENQUEUE [len + frame] on the connection's own
+//     bounded queue and return at once (true = queued); they never touch the
+//     socket, so no caller -- a reader thread included -- ever blocks on a peer;
+//   * one WRITER thread per connection drains that queue in order (per-
+//     connection frame order is kept exactly), in send(2) calls of at most
+//     kSendChunk bytes, still bounded by SO_SNDTIMEO (a timed-out write is still
+//     a HARD drop of that one connection);
+//   * a connection whose queued bytes would exceed max_bytes is dropped HARD
+//     and counted (peers_dropped_queue_full): the slow peer pays, not the node.
+// The writer's lifetime is owned by the connection's reader: the reader joins
+// it before it closes the descriptor, so stop() joining the readers joins
+// every writer too.
+//
 // DUPLEX: every established connection — whether we accepted it or dialed it —
 // is a full peer: it is added to the broadcast set AND gets a reader thread, so
 // carriers flow both directions over one socket (node A's win reaches node B,
@@ -88,11 +111,14 @@
 
 #include <sys/time.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <functional>
 #include <list>
 #include <map>
@@ -111,6 +137,12 @@ namespace c2pool::v37n {
 // is a share + <= R_MAX receipts; even generous per-event bounds keep this far
 // under 64 KiB. Sized well above that so a legitimate frame is never clipped.
 constexpr std::uint32_t kMaxCarrierFrame = 1u << 20;   // 1 MiB hard ceiling
+
+// RELAY-SEND-QUEUE: the largest single send(2) the writer thread issues. A
+// frame is still written whole and contiguous on its connection; this only
+// bounds how long one syscall can hold the socket.
+constexpr std::size_t kSendChunk = 64u * 1024u;
+#define C2POOL_XMR_RELAY_SEND_QUEUE 1
 
 // ── the first-byte namespace split (see the header note) ────────────────────
 // frame[0] < kCtrlOpcodeBase  => a CarrierWire body  (0x01..0x7f are versions)
@@ -190,6 +222,35 @@ public:
     // here instead of as a mysterious disconnect.
     std::uint64_t sends_refused_oversize() const { return m_oversize_refused.load(); }
 
+    // ── ★ RELAY-SEND-QUEUE (see the header note) ────────────────────────────
+    // max_bytes > 0: asynchronous per-connection send queues of at most
+    // max_bytes queued bytes each (length prefixes included), drained by one
+    // writer thread per connection. 0 (the default): the synchronous path,
+    // byte-for-byte the pre-queue behaviour. Applies to connections established
+    // AFTER the call; set it before listen()/dialing.
+    void set_send_queue(std::size_t max_bytes) { m_sendq_max.store(max_bytes); }
+    std::size_t send_queue_limit() const { return m_sendq_max.load(); }
+    // Peers dropped because their queue would have exceeded the bound.
+    std::uint64_t peers_dropped_queue_full() const { return m_q_full_drops.load(); }
+    // Bytes queued and not yet fully written, per connection (0 = gone / sync).
+    std::size_t queued_bytes(PeerId id) const {
+        std::shared_ptr<Conn> c;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return 0;
+            c = it->second;
+        }
+        std::lock_guard<std::mutex> ql(c->qmtx);
+        return c->qbytes;
+    }
+    // High-water mark of any one connection's queued bytes since start.
+    std::size_t queued_bytes_hwm() const { return m_q_hwm.load(); }
+    // Frames written by writer threads / sum of their bytes (diagnostics).
+    std::uint64_t async_frames_written() const { return m_q_frames.load(); }
+    // Longest a queued frame waited between enqueue and its last byte written.
+    std::uint64_t async_max_wait_ms() const { return m_q_max_wait_ms.load(); }
+
     // ── ★ targeted send (the repair channel's reply path) ───────────────────
     // Write ONE frame to ONE connection. Returns false if the peer is gone, the
     // frame is over the ceiling, or the write failed/timed out (in which case
@@ -210,6 +271,7 @@ public:
             if (it == m_conns.end()) return false;
             c = it->second;
         }
+        if (c->async) return enqueue(c, frame);            // RELAY-SEND-QUEUE: never blocks
         std::uint8_t lenbuf[4];
         const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
         for (int i = 0; i < 4; ++i) lenbuf[i] = static_cast<std::uint8_t>(len >> (8 * i));
@@ -389,6 +451,7 @@ public:
 
         // pass 1 — every peer whose write lock is free right now.
         for (auto& c : targets) {
+            if (c->async) { if (enqueue(c, frame)) ++reached; continue; }   // RELAY-SEND-QUEUE
             std::unique_lock<std::mutex> wlk(c->wmtx, std::try_to_lock);
             if (!wlk.owns_lock()) { deferred.push_back(c); continue; }
             if (c->closed) continue;                      // reader already closed it
@@ -469,6 +532,16 @@ private:
         std::mutex wmtx;
         std::mutex fmtx;
         bool closed = false;
+        // RELAY-SEND-QUEUE (async == true only). qmtx guards q/qbytes/qstop and is
+        // never held across I/O or any callback.
+        struct Item { std::vector<std::uint8_t> buf; std::chrono::steady_clock::time_point at; };
+        bool async = false;
+        std::mutex qmtx;
+        std::condition_variable qcv;
+        std::deque<Item> q;
+        std::size_t qbytes = 0;   // queued + in-flight bytes (released once written)
+        bool qstop = false;
+        std::thread writer;       // joined by this connection's reader before close
     };
     struct Reader {
         std::thread t;
@@ -556,6 +629,10 @@ private:
             pid = ++m_next_peer_id;
             auto c = std::make_shared<Conn>();
             c->fd = fd; c->pid = pid;
+            if (m_sendq_max.load() > 0) {   // RELAY-SEND-QUEUE: writer first, so the reader can always join it
+                c->async = true;
+                c->writer = std::thread([this, c] { writer_loop(c); });
+            }
             m_conns[pid] = c;
             auto done = std::make_shared<std::atomic<bool>>(false);
             m_readers.push_back(Reader{std::thread([this, c, done] { reader_loop(c); done->store(true); }), done});
@@ -606,6 +683,11 @@ private:
         }
         drop_conn(c);
         shutdown_conn(*c);   // wake any writer still blocked on this socket
+        if (c->async) {      // RELAY-SEND-QUEUE: stop + join this connection's writer before the close
+            { std::lock_guard<std::mutex> ql(c->qmtx); c->qstop = true; }
+            c->qcv.notify_all();
+            if (c->writer.joinable()) c->writer.join();
+        }
         // ★ RELAY-FD: the reader OWNS the descriptor's close. Before this the fd
         // of a dropped connection was closed only by stop() -- and not even
         // there once the drop had removed it from the peer set -- so every
@@ -650,6 +732,87 @@ private:
         if (!c.closed) ::shutdown(c.fd, SHUT_RDWR);
     }
 
+    // ── RELAY-SEND-QUEUE ────────────────────────────────────────────────────
+    // Queue [len + frame] on c; never blocks on the socket. Over the byte bound
+    // the connection is dropped HARD (counted) and false is returned.
+    bool enqueue(const std::shared_ptr<Conn>& c, const std::vector<std::uint8_t>& frame) {
+        Conn::Item it;
+        const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
+        it.buf.resize(frame.size() + 4);
+        for (int i = 0; i < 4; ++i) it.buf[i] = static_cast<std::uint8_t>(len >> (8 * i));
+        if (len) std::memcpy(it.buf.data() + 4, frame.data(), len);
+        it.at = std::chrono::steady_clock::now();
+        const std::size_t need = it.buf.size();
+        const std::size_t cap = m_sendq_max.load();
+        bool full = false;
+        std::size_t now_bytes = 0;
+        {
+            std::lock_guard<std::mutex> ql(c->qmtx);
+            if (c->qstop) return false;
+            if (c->qbytes + need > cap) {
+                full = true;
+                c->qstop = true;   // the writer stops at once; nothing more is written on this stream
+                now_bytes = c->qbytes;
+            } else {
+                c->q.push_back(std::move(it));
+                c->qbytes += need;
+                now_bytes = c->qbytes;
+            }
+        }
+        if (full) {
+            c->qcv.notify_all();
+            m_q_full_drops.fetch_add(1, std::memory_order_relaxed);
+            if (m_log)
+                m_log("carrier-net: peer " + std::to_string(c->pid) + " send queue full (" + std::to_string(now_bytes) +
+                      " B queued + " + std::to_string(need) + " B > bound " + std::to_string(cap) +
+                      " B) -> dropping that peer (RELAY-SEND-QUEUE)");
+            drop_conn(c, /*hard=*/true, /*slow=*/false);
+            return false;
+        }
+        std::size_t hwm = m_q_hwm.load(std::memory_order_relaxed);
+        while (now_bytes > hwm && !m_q_hwm.compare_exchange_weak(hwm, now_bytes, std::memory_order_relaxed)) {}
+        c->qcv.notify_one();
+        return true;
+    }
+
+    // One writer per async connection: drains its queue in order, <= kSendChunk
+    // bytes per send(2), SO_SNDTIMEO still bounding each call. A failed/timed-out
+    // write leaves the stream desynced -> HARD drop (the reader then unwinds and
+    // joins us). Exits on qstop (set by the reader, or by a queue overflow).
+    void writer_loop(const std::shared_ptr<Conn>& c) {
+        for (;;) {
+            Conn::Item it;
+            {
+                std::unique_lock<std::mutex> ql(c->qmtx);
+                c->qcv.wait(ql, [&] { return c->qstop || !c->q.empty(); });
+                if (c->qstop) return;
+                it = std::move(c->q.front());
+                c->q.pop_front();
+            }
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> wlk(c->wmtx);
+                if (c->closed) return;
+                ok = send_chunked(c->fd, it.buf.data(), it.buf.size());
+            }
+            { std::lock_guard<std::mutex> ql(c->qmtx); c->qbytes -= it.buf.size(); }
+            if (!ok) { drop_conn(c, /*hard=*/true); return; }
+            m_q_frames.fetch_add(1, std::memory_order_relaxed);
+            const auto w = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - it.at).count());
+            std::uint64_t mw = m_q_max_wait_ms.load(std::memory_order_relaxed);
+            while (w > mw && !m_q_max_wait_ms.compare_exchange_weak(mw, w, std::memory_order_relaxed)) {}
+        }
+    }
+    static bool send_chunked(int fd, const std::uint8_t* p, std::size_t n) {
+        for (std::size_t off = 0; off < n;) {
+            const std::size_t k = std::min(kSendChunk, n - off);
+            if (!send_all(fd, p + off, k)) return false;
+            off += k;
+        }
+        return true;
+    }
+
     static bool send_all(int fd, const void* buf, std::size_t n) {
         const std::uint8_t* p = static_cast<const std::uint8_t*>(buf);
         std::size_t off = 0;
@@ -681,6 +844,12 @@ private:
     std::atomic<std::uint64_t> m_slow_drops{0};
     std::atomic<std::uint64_t> m_oversize_refused{0};
     std::atomic<std::uint64_t> m_accept_exhausted{0};
+    // RELAY-SEND-QUEUE: 0 = synchronous sends (default); > 0 = per-connection byte bound.
+    std::atomic<std::size_t>   m_sendq_max{0};
+    std::atomic<std::uint64_t> m_q_full_drops{0};
+    std::atomic<std::size_t>   m_q_hwm{0};
+    std::atomic<std::uint64_t> m_q_frames{0};
+    std::atomic<std::uint64_t> m_q_max_wait_ms{0};
     LogFn                     m_log;            // rate-limited diagnostics (RELAY-FD)
     // SO_SNDTIMEO, ms. 10 s by default: long enough that no healthy peer ever
     // trips it, short enough that a peer which stopped reading cannot pin one
