@@ -82,6 +82,9 @@ struct SharechainConfig
     //     auto_ratchet.hpp (current >= target -> latched), min_protocol_gate.hpp
     //     (peer >= knob, composed by max), main_dash.cpp live share version
     //     (floor >= 3600 -> 36), p2pool-dash p2p.py (peer < 1700 -> refused).
+    //     "v36 isolated support" is keyed on this bare number: any later change
+    //     to the isolated v36 share/ref/gentx wire format MUST bump it (3602, ...),
+    //     or builds with the older format pass the handshake again.
     static constexpr uint32_t ISOLATED_V36_PROTOCOL_VERSION = 3601;  // private/isolated v36 advert AND accept floor
 
     // ---- testnet (networks/dash_testnet.py) ----

@@ -1331,7 +1331,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << prof.target_share_version
                   << " (admits v" << prof.target_share_version << " only), ratchet seed "
                   << prof.ratchet_floor_protocol_version
-                  << " (peers below it refused; --min-protocol cannot lower it), advertises protocol "
+                  << " (peers below it refused; the operator min-protocol knob, not yet a CLI flag, cannot lower it), advertises protocol "
                   << prof.advertised_protocol_version
                   << " (peer builds below it lack v36 isolated support: refused at the handshake,"
                      " not banned; every node of this chain must run a build with it), emergency decay "
