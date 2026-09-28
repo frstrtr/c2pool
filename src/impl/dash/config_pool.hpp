@@ -85,7 +85,11 @@ struct SharechainConfig
     //     "v36 isolated support" is keyed on this bare number: any later change
     //     to the isolated v36 share/ref/gentx wire format MUST bump it (3602, ...),
     //     or builds with the older format pass the handshake again.
-    static constexpr uint32_t ISOLATED_V36_PROTOCOL_VERSION = 3601;  // private/isolated v36 advert AND accept floor
+    // BUMP RULE (docs/dash-v36-network.md): ANY change to the DASH v36 share,
+    // ref-stream or gentx wire format MUST bump this number (3601 -> 3602 -> ...)
+    // in the same PR, together with a KAT, or older builds pass the handshake
+    // again and then fail on every share they are sent.
+    static constexpr uint32_t ISOLATED_V36_PROTOCOL_VERSION = 3601;  // DASH v36 network advert AND accept floor
 
     // ---- testnet (networks/dash_testnet.py) ----
     static constexpr uint16_t TESTNET_P2P_PORT          = 18999;
