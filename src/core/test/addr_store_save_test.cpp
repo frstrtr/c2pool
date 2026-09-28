@@ -30,6 +30,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <unistd.h>
 
@@ -209,4 +210,33 @@ TEST_F(AddrStoreSaveTest, LegacyWrappedEmptyBookLoadsEmpty)
     { std::ofstream f(path); f << "[[]]"; }
     core::AddrStore s(kCoin);
     EXPECT_EQ(s.len(), 0u);
+}
+
+// replace_all() (the v37 XMR relay peer book, xmr_relay_peerstore.cpp) swaps the
+// whole set and saves once through the same temp-file + rename path. Shrinking
+// 3 -> 1 must leave a parseable file that reloads to exactly the new set.
+TEST_F(AddrStoreSaveTest, ReplaceAllRoundTripsOnReload)
+{
+    {
+        core::AddrStore s(kCoin);
+        for (int i = 1; i <= 3; ++i)
+            s.add(peer(i), {1, kTs, kTs});
+
+        std::vector<core::AddrStorePair> next(1);
+        next[0].addr = peer(5);
+        next[0].value = {0, 0, 0};
+        s.replace_all(next);
+        EXPECT_EQ(s.len(), 1u);
+        EXPECT_TRUE(parses(path)) << "replace_all left an unparsable file: " << read_file(path);
+    }
+
+    core::AddrStore reloaded(kCoin);
+    EXPECT_EQ(reloaded.len(), 1u) << read_file(path);
+    EXPECT_TRUE(reloaded.check(peer(5)));
+    EXPECT_FALSE(reloaded.check(peer(1))) << "replace_all kept an entry of the old set";
+    EXPECT_EQ(reloaded.get(peer(5)).m_last_seen, 0u);
+
+    int entries = 0;
+    for (const auto& e : fs::directory_iterator(root / kCoin)) { (void)e; ++entries; }
+    EXPECT_EQ(entries, 1) << "temp file left behind";
 }

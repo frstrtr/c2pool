@@ -92,6 +92,14 @@ void AddrStore::update(const NetService& addr, AddrValue new_value)
     save();
 }
 
+void AddrStore::replace_all(const std::vector<AddrStorePair>& v)
+{
+    m_data.clear();
+    for (const auto& p : v)
+        m_data[p.addr] = p.value;
+    save();
+}
+
 void AddrStore::load(const std::vector<NetService>& addrs)
 {
     for (const NetService& addr : addrs)
