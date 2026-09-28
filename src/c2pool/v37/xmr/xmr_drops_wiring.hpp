@@ -1707,4 +1707,42 @@ private:
     bool m_lane_only = false;
 };
 
+// ★ DROPS-HARDEN (d3): which carried raindrop set a node keeps for a bid when
+// more than one set-carrying FB_BLOCK_WON reaches it. FB_BLOCK_WON is not
+// authenticated (the full fix is the v37.1 on-chain set digest, DESIGN Option
+// B), so the relay rule is: the FIRST set held for a bid stands -- a later
+// frame never overwrites it -- with one exception: a held set that came from a
+// peer other than the one that announced the block first (the relay's first
+// sender of that bid) yields ONCE to a different set from that announcer, while
+// the block is not booked. Our own win never adopts a foreign set (we compose
+// and pin it). Every differing later set is an equivocation (counted, logged
+// with both set digests by the caller).
+#define C2POOL_XMR_DROPS_SET_FIRST_WINS 1
+enum class SetFrameVerdict {
+    Adopt,               // nothing held: keep the incoming set
+    Same,                // the incoming set equals the held one
+    KeepFirst,           // equivocation: the held set stands
+    AnnouncerReplaces,   // equivocation: the block's first announcer's set replaces a non-announcer's (once)
+    OwnWin,              // our own block: a foreign set is never adopted
+};
+inline SetFrameVerdict set_frame_verdict(const std::vector<bytes32>* held, std::uint64_t held_from, bool held_locked,
+                                         const std::vector<bytes32>& incoming, std::uint64_t from, std::uint64_t announcer,
+                                         bool own_win) {
+    if (!held) return own_win ? SetFrameVerdict::OwnWin : SetFrameVerdict::Adopt;
+    if (*held == incoming) return SetFrameVerdict::Same;
+    if (!own_win && !held_locked && announcer != 0 && from == announcer && held_from != announcer)
+        return SetFrameVerdict::AnnouncerReplaces;
+    return SetFrameVerdict::KeepFirst;
+}
+inline const char* set_frame_verdict_name(SetFrameVerdict v) {
+    switch (v) {
+        case SetFrameVerdict::Adopt: return "adopt";
+        case SetFrameVerdict::Same: return "same";
+        case SetFrameVerdict::KeepFirst: return "kept-first";
+        case SetFrameVerdict::AnnouncerReplaces: return "announcer-replaces";
+        case SetFrameVerdict::OwnWin: return "own-win";
+    }
+    return "?";
+}
+
 }  // namespace c2pool::v37n::xmr::drops

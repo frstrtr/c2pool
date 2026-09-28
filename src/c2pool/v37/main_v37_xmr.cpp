@@ -230,6 +230,8 @@ static std::optional<::v37::bytes32> g_pool_genesis;    // POOL-LINEAGE: --pool-
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
 static bool          g_no_relay_bootstrap = false;     // --no-relay-bootstrap (RELAY-BOOTSTRAP: drop the built-in list)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
+static std::uint64_t g_drops_retain_bins = 0;           // ★ DROPS-HARDEN: --drops-retain-bins N (0 = the relay default 512)
+static bool g_drops_store_persist = true;              // ★ DROPS-HARDEN: --drops-store-persist on|off (lane<N>.drops)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
 static bool          g_relay_discovery = true;          // --relay-discovery on|off (FB_GETADDR/FB_ADDR + persistent peer book)
@@ -1763,6 +1765,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                        c2pool::v37n::settle::WorkPrice price{};   // ★ DROPS: the price at the prefolded cut (gate ON only)
                        std::optional<c2pool::v37n::xmr::drops::DropsCarry> drops;   // ★ ENROL-REPL: the winner's carried delta (v0x02, gate ON only)
                        std::optional<std::vector<decltype(relay::BlockWon::bid)>> drops_set;   // ★ DROPS-SET-PIN: the winner's raindrop set (v0x03)
+                       std::uint64_t drops_from = 0;   // ★ DROPS-HARDEN (d3): the relay peer the held set came from (0 = ours / journal)
+                       bool drops_locked = false;      // ★ DROPS-HARDEN (d3): the held set is final (ours, journalled, or the announcer's)
                      };
     // ★ DROPS: the XMR shell's DropsWiring. nullptr in a default build (flip at 0)
     // and whenever the lane geometry does not carry the gate: then nothing below
@@ -1785,6 +1789,11 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::map<std::string, bool> drops_lane_memo;
     std::uint64_t drops_prev_asked = 0, drops_prev_decoded = 0, drops_prev_none = 0, drops_prev_undecided = 0;
     std::map<std::string, WireCache> wire_cache;   // bid -> the v0x02 descriptor (+ its early fold)
+    // ★ DROPS-HARDEN (d2): wire_cache is pruned (settled / orphaned bids, a byte cap); (d3) set equivocations
+    static constexpr std::size_t kWireCacheMaxBytes = std::size_t{64} << 20;
+    std::uint64_t wire_cache_evicted = 0, wire_cache_evicted_cap = 0, drops_set_equivocation = 0, drops_set_foreign_own = 0;
+    std::size_t wire_cache_bytes_now = 0, wire_cache_bytes_max = 0;
+    std::chrono::steady_clock::time_point wire_cache_pruned_at{};
     // ★ ENROL-REPL (gate ON only): our own wins whose FB_BLOCK_WON leaves at BOOKING
     // time, carrying the delta composed there (bid -> the frame without its delta).
     std::map<std::string, relay::BlockWon> own_won;
@@ -2556,6 +2565,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                   std::to_string(ids.size()) + " pinned raindrop(s) not held (fetching by id)";
             return false;
         }
+        if (relay_node && !ids.empty()) relay_node->drops_pin_forget(ids);   // ★ DROPS-HARDEN (d1): the set is complete here
         out.src = drops_prefix_src; out.a0 = drops_prefix_a0; out.positions = lp->positions;
         out.rg = *rgo;
         drops_cut_at_h[h] = bk.credit_cut.next_pos;   // ★ DROPS-ENROL-TIDY: the reachable-cut set (lane-log bound)
@@ -2935,6 +2945,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 wc.d.reward = bw.reward; wc.d.payout_emitted = bw.payout_emitted; wc.d.owed_digest_at_win = bw.owed_digest_at_win;
                 wc.drops = carry;
                 wc.drops_set = drops_lane.set;
+                wc.drops_from = 0; wc.drops_locked = true;   // ★ DROPS-HARDEN (d3): our own pin is final
                 std::printf("drops-carry-tx: own win h=%llu bid=%s… composed rows=%zu delta_payees=%zu digest=%s… prefix_positions=%llu src=%s "
                             "set n_ids=%zu set_digest=%s… -> FB_BLOCK_WON v0x03 %zu B to %zu relay peer(s)\n",
                             (unsigned long long)h, bid.substr(0, 12).c_str(), rows.size(), carry.delta.size(),
@@ -3199,6 +3210,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             wc.d.reward = bw.reward; wc.d.payout_emitted = bw.payout_emitted; wc.d.owed_digest_at_win = bw.owed_digest_at_win;
             wc.drops = lane.carry;
             wc.drops_set = lane.set;
+            wc.drops_from = 0; wc.drops_locked = true;   // ★ DROPS-HARDEN (d3): our own pin is final
             std::printf("drops-carry-tx: own win h=%llu bid=%s… EARLY (pump %u) composed rows=%zu delta_payees=%zu digest=%s… src=%s "
                         "set n_ids=%zu set_digest=%s… -> FB_BLOCK_WON v0x03 %zu B to %zu relay peer(s)\n",
                         (unsigned long long)e.h, bid.substr(0, 12).c_str(), e.tries, lane.lc.rows.size(), lane.carry.delta.size(),
@@ -3247,9 +3259,40 @@ static int run_live(const XmrNodeConfig& cfg) {
         const std::string bid = c2pool::v37n::cut_bid_hex(d.bid);
         WireCache wc; wc.d = d;
         auto old = wire_cache.find(bid);
-        if (drops && old != wire_cache.end() && old->second.drops_set && !(bw.drops && bw.drops->set)) {
+        if (drops && bw.drops && bw.drops->set) {   // ★ DROPS-HARDEN (d3): the FIRST set held for a bid stands
+            const bool held = old != wire_cache.end() && old->second.drops_set.has_value();
+            const bool own = own_won.count(bid) || drops_early.count(bid);
+            const bool locked = held && (old->second.drops_locked || (drops_store && drops_store->booked(bid)));
+            const auto v = c2pool::v37n::xmr::drops::set_frame_verdict(held ? &*old->second.drops_set : nullptr,
+                                                                          held ? old->second.drops_from : 0, locked, *bw.drops->set,
+                                                                          from_pid, relay_hint(bid), own);
+            using SV = c2pool::v37n::xmr::drops::SetFrameVerdict;
+            if (v == SV::Adopt || v == SV::AnnouncerReplaces) {
+                wc.drops = c2pool::v37n::xmr::drops::DropsCarry{bw.drops->delta, bw.drops->enrollment_digest};
+                wc.drops_set = bw.drops->set;
+                wc.drops_from = from_pid;
+                wc.drops_locked = v == SV::AnnouncerReplaces;
+                ++drops_carry_rx;
+            } else if (held) {
+                wc.drops = old->second.drops; wc.drops_set = old->second.drops_set;
+                wc.drops_from = old->second.drops_from; wc.drops_locked = old->second.drops_locked;
+            }
+            if (v == SV::OwnWin) ++drops_set_foreign_own;
+            if (v == SV::KeepFirst || v == SV::AnnouncerReplaces) {
+                ++drops_set_equivocation;
+                std::printf("drops-ALARM set-equivocation: h=%llu bid=%s… held set n_ids=%zu digest=%s… (relay peer %llu) vs incoming n_ids=%zu "
+                            "digest=%s… (relay peer %llu, announcer %llu) -> %s (FB_BLOCK_WON is unauthenticated; the full fix is the v37.1 on-chain set digest)\n",
+                            (unsigned long long)d.h_b, bid.substr(0, 12).c_str(), old->second.drops_set->size(),
+                            hex_of(c2pool::v37n::xmr::drops::XmrDropsWiring::set_digest(d.h_b, d.bid, *old->second.drops_set)).substr(0, 12).c_str(),
+                            (unsigned long long)old->second.drops_from, bw.drops->set->size(),
+                            hex_of(c2pool::v37n::xmr::drops::XmrDropsWiring::set_digest(d.h_b, d.bid, *bw.drops->set)).substr(0, 12).c_str(),
+                            (unsigned long long)from_pid, (unsigned long long)relay_hint(bid), c2pool::v37n::xmr::drops::set_frame_verdict_name(v));
+                std::fflush(stdout);
+            }
+        } else if (drops && old != wire_cache.end() && old->second.drops_set && !(bw.drops && bw.drops->set)) {
             wc.drops = old->second.drops;   // ★ DROPS-SET-PIN: never lose a held pinned set to a frame without one
             wc.drops_set = old->second.drops_set;
+            wc.drops_from = old->second.drops_from; wc.drops_locked = old->second.drops_locked;
         } else if (drops && bw.drops) {   // ★ ENROL-REPL: the winner's carried delta (checked at booking); DROPS-RESTART: kept even before live
             wc.drops = c2pool::v37n::xmr::drops::DropsCarry{bw.drops->delta, bw.drops->enrollment_digest};
             wc.drops_set = bw.drops->set;   // ★ DROPS-SET-PIN (v0x03; none on a v0x02 frame)
@@ -3268,6 +3311,48 @@ static int run_live(const XmrNodeConfig& cfg) {
                     (unsigned long long)d.h_b, bid.substr(0,12).c_str(), (unsigned long long)d.cut_next_pos, (unsigned long long)d.reward,
                     known ? "KNOWN-to-our-ledger-history" : "UNKNOWN(diverged-or-not-yet)", wc.prefolded ? "yes" : "no",
                     wc.prefolded ? "" : (" (" + why + ")").c_str(), (unsigned long long)from_pid);
+    };
+    // ★ DROPS-HARDEN (d2): prune wire_cache (main loop, at most once a second).
+    // A bid whose height the finalize cursor passed by D_conf is booked or
+    // orphaned (settled either way): evicted. Above kWireCacheMaxBytes the
+    // highest heights go first (never our own wins); an evicted pending set is
+    // re-fetched on demand (FB_GETWON at the booking HOLD). The ask state of
+    // an evicted set's members is dropped with it (d1).
+    auto wire_cache_prune = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - wire_cache_pruned_at < std::chrono::seconds(1)) return;
+        wire_cache_pruned_at = now;
+        auto bytes_of = [](const WireCache& w) {
+            std::size_t b = 256 + w.credit.size() * 64;
+            if (w.drops) b += 64 + w.drops->delta.size() * 48;
+            if (w.drops_set) b += w.drops_set->size() * 32;
+            return b;
+        };
+        auto forget = [&](std::map<std::string, WireCache>::iterator it) {
+            if (relay_node && it->second.drops_set) relay_node->drops_pin_forget(*it->second.drops_set);
+            drops_set_getwon_at.erase(it->first);
+            return wire_cache.erase(it);
+        };
+        const std::uint64_t cur = node.finalize_driver().cursor_height();
+        std::size_t total = 0;
+        for (auto it = wire_cache.begin(); it != wire_cache.end();) {
+            if (it->second.d.h_b + cfg.d_conf < cur) { ++wire_cache_evicted; it = forget(it); continue; }
+            total += bytes_of(it->second); ++it;
+        }
+        if (total > kWireCacheMaxBytes) {
+            std::vector<std::pair<std::uint64_t, std::string>> byh;
+            for (const auto& [b, w] : wire_cache)
+                if (!own_won.count(b) && !drops_early.count(b)) byh.emplace_back(w.d.h_b, b);
+            std::sort(byh.rbegin(), byh.rend());
+            for (const auto& [h, b] : byh) {
+                if (total <= kWireCacheMaxBytes) break;
+                auto it = wire_cache.find(b);
+                total -= bytes_of(it->second);
+                forget(it); ++wire_cache_evicted_cap;
+            }
+        }
+        wire_cache_bytes_now = total;
+        if (total > wire_cache_bytes_max) wire_cache_bytes_max = total;
     };
     // THE RECEIPT FEED (the carrier-relay stand-in): a shared append-only file "idx weight" per line; every node
     // pushes the SAME records in the SAME order (submit_tracked+get: one record per burst => every prefix published).
@@ -3894,6 +3979,11 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.share_diff = cfg.stratum_share_diff;
             ro.bind = bind;
             ro.drops_floor_diff = drops_live ? drops->floor_diff() : 0;   // ★ DROPS: 0 = master's receiver
+            if (drops_live && g_drops_retain_bins) ro.drops_retain_bins = g_drops_retain_bins;   // ★ DROPS-HARDEN
+            if (drops_live && g_drops_store_persist) {   // ★ DROPS-HARDEN (d4): <settle_db>/lane<N>.drops, next to lane<N>.shadow
+                std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
+                ro.drops_persist_path = cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".drops";
+            }
             ro.lane_params_digest = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind,
                                                             ro.network);   // S4: + FeeModelGate (+ this network's donation identity) iff ON
             if (drops_live)   // ★ DROPS-ENROL-LANE (flip 1): the enrol set is pool consensus -- another set = HELLO mismatch
@@ -4197,6 +4287,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     wc.d.reward = kb.reward; wc.d.payout_emitted = kb.payout_emitted; wc.d.owed_digest_at_win = kb.owed_digest_at_win;
                     wc.drops = c2pool::v37n::xmr::drops::DropsCarry{kb.drops->delta, kb.drops->enrollment_digest};
                     wc.drops_set = kb.drops->set;   // ★ DROPS-SET-PIN
+                    wc.drops_locked = true;          // ★ DROPS-HARDEN (d3): journalled (ours, or booked verified) = final
                     wire_cache[b] = wc;
                     relay_node->adopt_won_frame(f);
                     ++drops_reloaded_frames;
@@ -4220,6 +4311,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::printf("drops-store: journal %s reloaded own=%zu frames=%zu booked=%zu malformed=%zu -> re-offered frames=%llu own wins to compose=%llu\n",
                             drops_store->path().c_str(), drops_store_loaded.own, drops_store_loaded.frames, drops_store_loaded.booked,
                             drops_store_loaded.malformed, (unsigned long long)drops_reloaded_frames, (unsigned long long)drops_reloaded_own);
+            }
+            if (drops_live && !relay_node->options().drops_persist_path.empty()) {   // ★ DROPS-HARDEN (d4)
+                std::string dw;
+                const std::size_t nd = relay_node->drops_load(&dw);
+                std::printf("drops-store: raindrop store %s restored=%zu retain_bins=%llu%s%s\n", relay_node->options().drops_persist_path.c_str(),
+                            nd, (unsigned long long)relay_node->options().drops_retain_bins, dw.empty() ? "" : " -- ", dw.c_str());
             }
             if (!relay_node->start(why)) { std::printf("REFUSED: %s\n", why.c_str()); node.stop(); return 2; }
             if (g_relay_partition_s) {   // test-only knob, never on mainnet (the relay is refused there)
@@ -4518,6 +4615,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 // RELAY-BINCLOCK: the chain clock too (a suspended lane serves no new template)
                 relay_ingest->tick(relay::bin_close_height(provider.current().height, node.hw().hw_height));
                 for (const auto& [bw, pid] : relay_node->drain_block_won()) relay_on_cut(bw, pid);
+                wire_cache_prune();   // ★ DROPS-HARDEN (d2)
             };
         }
 
@@ -4665,6 +4763,20 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)drops_prev_row_missing, drops_store->published_size(),
                                 (unsigned long long)drops_prepub_journalled.load(), drops_store_loaded.published,
                                 (unsigned long long)drops_prepub_resumed);
+                {   // ★ DROPS-HARDEN: bounded asks, set equivocation, wire_cache bytes, the persisted store
+                    const auto& rs = relay_node->stats();
+                    std::printf("  drops-harden: pin_asked=%zu pin_capped=%llu pin_slow_asks=%llu pin_pruned=%llu pin_local=%llu ids_asked=%llu fetch_tx=%llu "
+                                "| set_equivocation=%llu foreign_own=%llu | wire_cache n=%zu bytes=%zu max=%zu evicted=%llu cap_evicted=%llu "
+                                "| store=%zu persist writes=%llu fail=%llu loaded=%llu\n",
+                                relay_node->drops_pin_asked(), (unsigned long long)rs.drops_pin_capped.load(),
+                                (unsigned long long)rs.drops_pin_slow_asks.load(), (unsigned long long)rs.drops_pin_pruned.load(),
+                                (unsigned long long)rs.drops_pin_local.load(), (unsigned long long)rs.drops_ids_asked.load(),
+                                (unsigned long long)rs.drops_fetch_tx.load(), (unsigned long long)drops_set_equivocation,
+                                (unsigned long long)drops_set_foreign_own, wire_cache.size(), wire_cache_bytes_now, wire_cache_bytes_max,
+                                (unsigned long long)wire_cache_evicted, (unsigned long long)wire_cache_evicted_cap, relay_node->drops_store_size(),
+                                (unsigned long long)rs.drops_persist_writes.load(), (unsigned long long)rs.drops_persist_fail.load(),
+                                (unsigned long long)rs.drops_persist_loaded.load());
+                }
                 std::printf("  drops-set: pinned=%llu capped=%llu composed=%llu hold_frame=%llu hold_members=%llu fetch_frames=%llu "
                             "fetch_ids=%llu refused=%llu getwon=%llu early=%llu early_gaveup=%llu\n",
                             (unsigned long long)drops_set_pinned, (unsigned long long)drops_set_capped, (unsigned long long)drops_set_composed,
@@ -5335,6 +5447,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-relay-bootstrap")       g_no_relay_bootstrap = true;
         else if (a == "--drops-enrol")              g_drops_enrol.push_back(value());
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
+        else if (a == "--drops-retain-bins")        g_drops_retain_bins = u64();
+        else if (a == "--drops-store-persist")      g_drops_store_persist = cs::one_of(a, value(), {"on", "off"}) == "on";
         else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
         else if (a == "--relay-discovery")          g_relay_discovery = cs::one_of(a, value(), {"on", "off"}) == "on";
         else if (a == "--relay-max-outbound")       g_relay_max_outbound = static_cast<std::size_t>(u64());
@@ -5513,6 +5627,8 @@ int main(int argc, char** argv) {
                 "                               only the listed payees. none: nobody (credits zero). Every node of a pool must run the\n"
                 "                               same mode and list -- HELLO refuses ENROL_SET_MISMATCH by name\n"
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
+                "  --drops-retain-bins N        DROPS: raindrop intervals below the tip kept servable (default 512)\n"
+                "  --drops-store-persist on|off DROPS: keep the servable raindrop store across restarts (lane<N>.drops; default on)\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-verify-threads N     RandomX verify workers for peer receipts + raindrops (default 0 =\n"
                 "                               auto: clamp(cores/2, 2, 8) minus --mine threads; ~2.2 MiB each,\n"

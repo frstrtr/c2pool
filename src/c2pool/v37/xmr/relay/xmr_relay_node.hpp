@@ -170,7 +170,11 @@
 #include <utility>
 #include <vector>
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <c2pool/v37/carrier_net.hpp>
+#include <sharechain/v37/v37_hash.hpp>   // DROPS-HARDEN: the persisted store trailer (sha256d)
 #include <c2pool/v37/carrier_supply.hpp>
 #include <c2pool/v37/frame_vault.hpp>
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
@@ -194,6 +198,10 @@
 // DROPS-VERIFY-SCALE: RelayOptions::verify_threads workers, XmrRelayNode::verify_worker(),
 // RelayStats::verify_threads / rx_unavail_parked (an rx-unavailable item is parked once).
 #define C2POOL_XMR_RELAY_VERIFY_POOL 1
+// DROPS-HARDEN: drops_fetch_ids bounded per id (drops_fetch_max_asks, then
+// drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
+// (drops_persist_path, drops_persist(), drops_load()).
+#define C2POOL_XMR_DROPS_HARDEN 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -360,6 +368,15 @@ struct RelayOptions {
     u32         drops_inv_retry_ms = 2000;                   // re-ask an unanswered inventory after this
     u32         drops_fetch_retry_ms = 2000;                 // re-ask still-missing ids after this
     u32         drops_fetch_max_asks = 8;                    // asks of one peer for its missing ids before it is set aside
+    // ★ DROPS-HARDEN (d1): a pinned id still missing after drops_fetch_max_asks
+    // asks is re-asked no more often than this (never forever at the fast rate)
+    u32         drops_fetch_slow_ms = 60000;
+    // ★ DROPS-HARDEN (d4): the servable raindrop store survives a restart
+    // (<settle_db>/lane<N>.drops: versioned, sha256d trailer, tmp + fsync +
+    // rename, bounded by drops_retain_bins / drops_store_max). "" = in-memory
+    // only (the library default: every pre-harden KAT unchanged).
+    std::string drops_persist_path;
+    u32         drops_persist_ms = 2000;                     // snapshot a changed store at most this often
     // RELAY-LIVENESS: PING every ready link this often (0 = keepalive OFF: no
     // PING sent or answered, no silence timeout); drop + redial a link whose
     // keepalive-speaking peer sent nothing for silence_timeout_ms (0 = never).
@@ -419,6 +436,11 @@ struct RelayStats {
     std::atomic<u64> drops_fetch_tx{0}, drops_ids_asked{0}, drops_fetchreq_rx{0}, drops_served{0}, drops_backfilled{0};
     std::atomic<u64> drops_sync_calls{0}, drops_sync_pending{0}, drops_sync_complete{0}, drops_peer_setaside{0};
     std::atomic<u64> drops_pin_fetch_ids{0};   // ★ DROPS-SET-PIN: set members asked for by id
+    // ★ DROPS-HARDEN: pinned ids past drops_fetch_max_asks (slow re-ask), pruned
+    // ask entries; the persisted store (snapshots written / failed, entries loaded)
+    std::atomic<u64> drops_pin_capped{0}, drops_pin_slow_asks{0}, drops_pin_pruned{0};
+    std::atomic<u64> drops_pin_local{0};   // members handed to the harvest from this node's own store
+    std::atomic<u64> drops_persist_writes{0}, drops_persist_fail{0}, drops_persist_loaded{0};
     // REPAIR-HORIZON: BELOW_HORIZON answers that raised a repair's start and
     // re-asked (instead of setting the peer aside); prefix probes whose digest
     // at a0 matched ours / was unknown there; peers proven DEEP (divergence
@@ -612,6 +634,7 @@ public:
         if (m_maint_thread.joinable()) m_maint_thread.join();
         m_net.stop();
         if (m_o.discovery) save_book(true);   // RELAY-DISCOVERY: the book survives the restart
+        drops_persist();                      // ★ DROPS-HARDEN (d4): the raindrop store too
     }
 
     // DROPS-VERIFY-SCALE: the calling verify worker's index in [0, verify_threads)
@@ -652,7 +675,7 @@ public:
         a.own = true; a.drop = true;
         if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
         m_st.drops_own++;
-        drop_store_put(a.id, a.bin, a.raw);   // ★ RAIN-BACKFILL: servable
+        drop_store_put(a.id, a.bin, a.raw, a.pow);   // ★ RAIN-BACKFILL: servable
         flood(a.raw, 0);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
@@ -748,16 +771,50 @@ public:
         const auto now = Clock::now();
         const auto retry = std::chrono::milliseconds(m_o.drops_fetch_retry_ms);
         std::vector<bytes32> first, again;
+        std::vector<Admitted> local;
         {
             std::lock_guard<std::mutex> lk(m_dsmtx);
+            // ★ DROPS-HARDEN (d1): at most drops_fetch_max_asks fast asks per id
+            // (each reaching every ready peer at most once), then one slow
+            // re-ask per drops_fetch_slow_ms -- an unservable set never keeps
+            // the fast rate forever. An entry leaves m_pin_asked when its id is
+            // admitted (admit_drop) or the caller forgets it (drops_pin_forget).
+            const auto slow = std::chrono::milliseconds(m_o.drops_fetch_slow_ms);
             for (const auto& id : ids) {
                 auto it = m_pin_asked.find(id);
                 if (it == m_pin_asked.end()) { m_pin_asked.emplace(id, std::make_pair(now, 1u)); first.push_back(id); continue; }
-                if (now - it->second.first < retry) continue;
+                const bool capped = it->second.second >= m_o.drops_fetch_max_asks;
+                if (now - it->second.first < (capped ? slow : retry)) continue;
+                if (capped) m_st.drops_pin_slow_asks++;
+                else if (it->second.second + 1 == m_o.drops_fetch_max_asks) m_st.drops_pin_capped++;
                 it->second.first = now; ++it->second.second;
                 again.push_back(id);
             }
             for (const auto& id : ids) m_drop_want[id] = now;   // the answer is SOLICITED (a deferred ctx is waited for)
+            // ★ DROPS-HARDEN (d4): a member this node's STORE holds (e.g. reloaded
+            // from lane<N>.drops after a restart) but its harvest lacks is handed
+            // to the harvest from the store (verified when first admitted), never
+            // asked of a peer -- a restarted winner serves its own members.
+            for (auto* v : {&first, &again}) {
+                std::vector<bytes32> rest;
+                for (const auto& id : *v) {
+                    const auto bi = m_drop_store_id.find(id);
+                    const auto pi = m_drop_pow.find(id);
+                    const auto si = bi == m_drop_store_id.end() ? m_drop_store.end() : m_drop_store.find(bi->second);
+                    Admitted a;
+                    if (pi == m_drop_pow.end() || si == m_drop_store.end() || !si->second.count(id) ||
+                        !decode_fb_receipt(si->second.at(id), a.r)) { rest.push_back(id); continue; }
+                    a.id = id; a.raw = si->second.at(id); a.bin = bi->second; a.drop = true; a.pow = pi->second;
+                    local.push_back(std::move(a));
+                    m_pin_asked.erase(id);
+                }
+                v->swap(rest);
+            }
+        }
+        if (!local.empty()) {
+            m_st.drops_pin_local += local.size();
+            std::lock_guard<std::mutex> lk(m_amtx);
+            for (auto& a : local) m_drops.push_back(std::move(a));
         }
         if (first.empty() && again.empty()) return 0;
         {
@@ -781,8 +838,17 @@ public:
         m_st.drops_pin_fetch_ids += first.size() + again.size();
         return sent;
     }
-    // the ids a set fetch asked for that were then admitted (diagnostic)
+    // the ids a set fetch asked for that are not admitted yet (diagnostic)
     std::size_t drops_pin_asked() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_pin_asked.size(); }
+    // ★ DROPS-HARDEN (d1): the caller no longer wants these ids (the set is
+    // complete, or its block left the pending set): drop their ask state.
+    std::size_t drops_pin_forget(const std::vector<bytes32>& ids) {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        std::size_t n = 0;
+        for (const auto& id : ids) n += m_pin_asked.erase(id);
+        m_st.drops_pin_pruned += n;
+        return n;
+    }
     std::size_t drops_store_size() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_store_id.size(); }
     // The raindrop ids this node holds (servable) for [lo, hi), sorted (diagnostic / KAT).
     std::vector<bytes32> drops_held(u64 lo, u64 hi) const {
@@ -2377,25 +2443,29 @@ private:
         a.drop = true; a.pow = pow;
         m_st.drops_foreign++;
         if (it.solicited && drop_unwant(a.id)) m_st.drops_backfilled++;   // ★ RAIN-BACKFILL
-        drop_store_put(a.id, bin, a.raw);
+        drop_store_put(a.id, bin, a.raw, a.pow);
         flood(a.raw, it.from);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
     }
 
     // ── ★ RAIN-BACKFILL: the servable raindrop store + the two frames ────────
-    void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw) {
+    void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw, const bytes32& pow) {
         std::lock_guard<std::mutex> lk(m_dsmtx);
+        if (m_pin_asked.erase(id)) m_st.drops_pin_pruned++;   // ★ DROPS-HARDEN (d1): an asked id arrived
         if (!m_drop_store_id.emplace(id, bin).second) return;
         m_drop_store[bin].emplace(id, raw);
+        m_drop_pow[id] = pow;   // ★ DROPS-HARDEN (d4): persisted with the bytes
+        m_drop_dirty = true;
         // bounded: intervals older than the retain window, then the oldest interval
         const u64 tip = m_chain.tip();
         const u64 keep_from = tip > m_o.drops_retain_bins ? tip - m_o.drops_retain_bins : 0;
         while (!m_drop_store.empty() &&
                (m_drop_store.begin()->first < keep_from || m_drop_store_id.size() > m_o.drops_store_max)) {
             if (m_drop_store.begin()->first == bin && m_drop_store.size() == 1) break;   // never evict the one just stored
-            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); }
+            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); m_drop_pow.erase(x); }
             m_drop_store.erase(m_drop_store.begin());
+            m_drop_dirty = true;
         }
     }
     // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
@@ -2473,7 +2543,117 @@ private:
         }
         if (!miss.empty()) send_drop_fetch(p, lo, hi, miss);   // fetch at once (drops_sync re-asks)
     }
+    // ── ★ DROPS-HARDEN (d4): the persisted raindrop store ───────────────────
+    // <settle_db>/lane<N>.drops = "V37DRP1\0" | chain u32 | lane_params_digest 32
+    // | n u32 | n x (id 32 | bin u64 | pow 32 | len u32 | raw) | sha256d(all before) 32.
+    // Written from the maint thread when the store changed (at most every
+    // drops_persist_ms) and at stop(): tmp + fsync + rename. The store is bounded
+    // by drops_retain_bins / drops_store_max, so is the file.
+    static constexpr u8 kDropsFileMagic[8] = {'V', '3', '7', 'D', 'R', 'P', '1', 0};
+    static constexpr std::size_t kDropsFileMaxRaw = 65536;
+    static void dput(std::vector<u8>& b, u64 v, int n) { for (int i = 0; i < n; ++i) b.push_back(static_cast<u8>(v >> (8 * i))); }
+public:
+    bool drops_persist() {
+        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return false;
+        std::vector<u8> b;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            if (!m_drop_dirty) return false;
+            b.insert(b.end(), kDropsFileMagic, kDropsFileMagic + 8);
+            dput(b, m_o.chain, 4); b.insert(b.end(), m_o.lane_params_digest.begin(), m_o.lane_params_digest.end());
+            dput(b, m_drop_store_id.size(), 4);
+            for (const auto& [bin, m] : m_drop_store)
+                for (const auto& [id, raw] : m) {
+                    const auto pi = m_drop_pow.find(id);
+                    b.insert(b.end(), id.begin(), id.end()); dput(b, bin, 8);
+                    const bytes32 pw = pi == m_drop_pow.end() ? bytes32{} : pi->second;
+                    b.insert(b.end(), pw.begin(), pw.end());
+                    dput(b, raw.size(), 4); b.insert(b.end(), raw.begin(), raw.end());
+                }
+            m_drop_dirty = false;
+            m_drop_persisted_at = Clock::now();
+        }
+        const bytes32 h = ::v37::sha256d(b);
+        b.insert(b.end(), h.begin(), h.end());
+        const std::string tmp = m_o.drops_persist_path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        bool ok = f && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        if (f) ok = (std::fclose(f) == 0) && ok;
+        ok = ok && std::rename(tmp.c_str(), m_o.drops_persist_path.c_str()) == 0;
+        if (!ok) {
+            m_st.drops_persist_fail++;
+            { std::lock_guard<std::mutex> lk(m_dsmtx); m_drop_dirty = true; }
+            log("relay: drops store persist FAILED " + m_o.drops_persist_path + ": " + std::strerror(errno));
+            return false;
+        }
+        m_st.drops_persist_writes++;
+        return true;
+    }
+    // Boot (before start()): restore the store from drops_persist_path. The
+    // restored raindrops are servable at once, count as seen, and are queued for
+    // drain_drops() so the harvest holds exactly what the store holds (as before
+    // the restart). Any mismatch (magic, chain, lane, bounds, trailer) = the file
+    // is ignored (an empty store, as before DROPS-HARDEN); *why says so.
+    std::size_t drops_load(std::string* why = nullptr) {
+        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return 0;
+        std::FILE* f = std::fopen(m_o.drops_persist_path.c_str(), "rb");
+        if (!f) { if (why) *why = "absent"; return 0; }
+        std::vector<u8> b;
+        u8 buf[65536];
+        for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) b.insert(b.end(), buf, buf + n);
+        std::fclose(f);
+        auto bad = [&](const char* w) { if (why) *why = std::string(w) + " (" + m_o.drops_persist_path + " ignored: empty store)"; return std::size_t{0}; };
+        if (b.size() < 8 + 4 + 32 + 4 + 32 || std::memcmp(b.data(), kDropsFileMagic, 8) != 0) return bad("bad magic/size");
+        const std::size_t body = b.size() - 32;
+        if (::v37::sha256d(b.data(), body) != *reinterpret_cast<const bytes32*>(b.data() + body)) return bad("trailer hash mismatch (torn/corrupt)");
+        std::size_t o = 8;
+        auto get = [&](std::size_t n, u64& v) { if (o + n > body) return false; v = 0; for (std::size_t i = n; i-- > 0;) v = (v << 8) | b[o + i]; o += n; return true; };
+        auto get32 = [&](bytes32& x) { if (o + 32 > body) return false; std::memcpy(x.data(), b.data() + o, 32); o += 32; return true; };
+        u64 chain = 0, n = 0; bytes32 tag{};
+        if (!get(4, chain) || !get32(tag) || !get(4, n)) return bad("truncated header");
+        if (chain != m_o.chain || tag != m_o.lane_params_digest) return bad("another lane (chain / lane_params_digest differ)");
+        if (n > m_o.drops_store_max) return bad("more raindrops than drops_store_max");
+        struct E { bytes32 id; u64 bin; bytes32 pow; std::vector<u8> raw; };
+        std::vector<E> v; v.reserve(static_cast<std::size_t>(n));
+        for (u64 k = 0; k < n; ++k) {
+            E e; u64 len = 0;
+            if (!get32(e.id) || !get(8, e.bin) || !get32(e.pow) || !get(4, len) || len > kDropsFileMaxRaw || o + len > body) return bad("bad raindrop record");
+            e.raw.assign(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + len)); o += len;
+            FbReceipt r;
+            if (!decode_fb_receipt(e.raw, r) || receipt_id(r) != e.id) return bad("a record whose bytes are not its id");
+            v.push_back(std::move(e));
+        }
+        if (o != body) return bad("trailing bytes");
+        std::size_t loaded = 0;
+        for (auto& e : v) {
+            if (!drop_note_new(e.id)) continue;
+            {
+                std::lock_guard<std::mutex> lk(m_dsmtx);
+                if (!m_drop_store_id.emplace(e.id, e.bin).second) continue;
+                m_drop_store[e.bin].emplace(e.id, e.raw);
+                m_drop_pow[e.id] = e.pow;
+            }
+            Admitted a;
+            decode_fb_receipt(e.raw, a.r);
+            a.id = e.id; a.raw = std::move(e.raw); a.bin = e.bin; a.drop = true; a.pow = e.pow;
+            std::lock_guard<std::mutex> lk(m_amtx);
+            m_drops.push_back(std::move(a));
+            ++loaded;
+        }
+        m_st.drops_persist_loaded += loaded;
+        if (why) why->clear();
+        return loaded;
+    }
+private:
     void drops_maint() {
+        if (!m_o.drops_persist_path.empty()) {   // ★ DROPS-HARDEN (d4)
+            bool due = false;
+            {
+                std::lock_guard<std::mutex> lk(m_dsmtx);
+                due = m_drop_dirty && Clock::now() - m_drop_persisted_at >= std::chrono::milliseconds(m_o.drops_persist_ms);
+            }
+            if (due) drops_persist();
+        }
         std::lock_guard<std::mutex> lk(m_dsmtx);
         const auto now = Clock::now();
         for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();)
@@ -3438,6 +3618,9 @@ private:
     mutable std::mutex m_dsmtx;
     std::map<u64, std::map<bytes32, std::vector<u8>>> m_drop_store;        // bin -> id -> raw (servable)
     std::unordered_map<bytes32, u64, Bytes32Hash> m_drop_store_id;          // id -> bin
+    std::unordered_map<bytes32, bytes32, Bytes32Hash> m_drop_pow;           // ★ DROPS-HARDEN: id -> verified RandomX hash
+    bool m_drop_dirty = false;                                               // ★ DROPS-HARDEN: store changed since the last snapshot
+    Clock::time_point m_drop_persisted_at{};
     std::map<InvKey, PeerInv> m_drop_inv;
     std::unordered_map<bytes32, Clock::time_point, Bytes32Hash> m_drop_want; // fetched ids in flight (solicited)
     std::unordered_map<bytes32, std::pair<Clock::time_point, u32>, Bytes32Hash> m_pin_asked;   // ★ DROPS-SET-PIN: id -> (last ask, asks)
