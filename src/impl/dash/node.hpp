@@ -744,6 +744,37 @@ public:
         publish_peer_info_snapshot();
     }
 
+    // ── Socket-less dial failure (#1835) ────────────────────────────────
+    // core::Factory::Client reports a dial that never produced a socket
+    // (ECONNREFUSED / ETIMEDOUT / resolve error) here instead of through
+    // error() or close_connection(), which both need a socket. Without this
+    // override the address stayed in m_pending_outbound for the rest of the
+    // process and try_connect_peers() skipped it on every later pass, so a
+    // --connect/--addnode peer that was down at the first dial was never
+    // dialed again. Clearing the mark makes the next 30 s pass redial it.
+    //
+    // IO thread, same discipline as error(): the Factory calls this from its
+    // async resolve/connect handler, and only through a strong ref it holds
+    // for the dial (the UAF fix in factory.hpp), so this node is live for the
+    // whole call. Touch only this node's own IO-owned sets; defer nothing.
+    //
+    // m_outbound_addrs is cleared only when no connection to the address is
+    // live: a failed dial says nothing about a session that is already up.
+    // The display snapshot is refreshed only if that changed the outbound
+    // set; a failed dial never adds to m_peers, so nothing else it shows
+    // moves. INLINE for the same vtable reason as connected()/error().
+    void connect_failed(const NetService& addr) override
+    {
+        const bool was_pending = m_pending_outbound.erase(addr) > 0;
+        const bool was_outbound =
+            !m_connections.contains(addr) && m_outbound_addrs.erase(addr) > 0;
+        if (was_outbound)
+            publish_peer_info_snapshot();
+        if (was_pending)
+            LOG_INFO << "[Pool] Outbound dial to " << addr.to_string()
+                     << " failed; will retry on the next maintenance pass";
+    }
+
     void cancel_peer_share_requests(const NetService& service)
     {
         std::vector<uint256> to_cancel;
@@ -1313,6 +1344,13 @@ public:
     /// from the run loop after listen(). Body in node.cpp (ltc
     /// node.cpp:1289-1327 port).
     void start_outbound_connections();
+
+    /// One outbound dial-maintenance pass: dial get_good_peers() candidates
+    /// that are not connected, not already being dialed and not banned, until
+    /// the outbound target is met. IO thread. Called once by
+    /// start_outbound_connections() and then on every 30 s m_connect_timer
+    /// tick. Body in node.cpp.
+    void try_connect_peers();
 
     // ── have_tx / losing_tx advertisement (SEND side) ─────────────────────
     // c2pool was RECEIVE-ONLY for the p2pool tx-pool advertisement: the
