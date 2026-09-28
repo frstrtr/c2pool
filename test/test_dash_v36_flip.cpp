@@ -33,6 +33,10 @@
 //      nullopt), not the v16 grandparent walk.
 //   J. The v36 mint declines a solve above its committed target and a solve
 //      whose header does not X11-hash to the submitted pow_hash.
+//   K. A v36 producer job is declined when the work template carries
+//      transactions (a v36 share commits no tx refs, so the won block could
+//      not be rebuilt); the same template on public still builds with the
+//      template tx set committed.
 //
 // Folded into test_dash_node (needs dash::NodeImpl + c2pool_storage + the dash
 // OBJECT lib). The profile is keyed on the process-global SharechainConfig
@@ -1050,5 +1054,43 @@ TEST(DashV36Flip, V36MintDeclinesSolveAboveTargetAndBrokenX11Identity)
         auto in = j.in;
         in.header_bytes.resize(79);
         EXPECT_FALSE(mint_from_inputs_any(chain, p, in, j.build.frozen).has_value());
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// K. The v36 producer job declines a template that carries transactions
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(DashV36Flip, V36ProducerJobDeclinesTemplateWithTransactions)
+{
+    IdentityGuard guard;
+    const auto script = dash::pubkey_hash_to_script2(h160(0x72));
+    auto wd = make_wd();
+    wd.m_tx_hashes = {tag_hash(1)};
+
+    // Isolated (v36): a v36 share commits no tx refs and its won block is
+    // rebuilt as [gentx] alone, so a job over a tx-carrying template would lose
+    // the block. build_producer_job declines it.
+    {
+        const auto p = iso_prod_params();
+        ASSERT_EQ(p.current_share_version, 36u);
+        dash::ShareChain chain;
+        EXPECT_FALSE(build_producer_job(chain, p, uint256(), script, wd, wd.m_curtime,
+                                        7, 0, "c2pool").has_value());
+        // control: the same template without txs builds on isolated.
+        auto cb_only = wd;
+        cb_only.m_tx_hashes.clear();
+        EXPECT_TRUE(build_producer_job(chain, p, uint256(), script, cb_only, cb_only.m_curtime,
+                                       7, 0, "c2pool").has_value());
+    }
+    // Public (v16): the same template still builds and commits the tx set.
+    {
+        const auto p = public_params();
+        ASSERT_EQ(p.current_share_version, 16u);
+        dash::ShareChain chain;
+        const auto b = build_producer_job(chain, p, uint256(), script, wd, wd.m_curtime,
+                                          7, 0, "c2pool");
+        ASSERT_TRUE(b.has_value());
+        EXPECT_EQ(b->frozen.desired_tx_hashes, wd.m_tx_hashes);
     }
 }
