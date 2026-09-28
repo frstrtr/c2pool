@@ -115,6 +115,26 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
     }
 }
 
+bool NodeImpl::precheck_raw_shares(std::vector<chain::RawShare>& shares,
+                                   precheck::Kind kind, const NetService& addr)
+{
+    const auto r = precheck::precheck_raw_shares(shares, kind, SharechainConfig::share_profile());
+    if (r.message_dropped)
+        m_precheck_dropped_messages.fetch_add(1, std::memory_order_relaxed);
+    if (r.shares_dropped)
+    {
+        m_precheck_dropped_shares.fetch_add(r.shares_dropped, std::memory_order_relaxed);
+        static std::atomic<uint64_t> s_dropped{0};
+        const uint64_t n = ++s_dropped;
+        if (n <= 3 || n % 100 == 0)
+            LOG_WARNING << "[Pool] " << precheck::kind_name(kind) << " from " << addr.to_string()
+                        << ": dropped " << r.shares_dropped
+                        << (r.message_dropped ? " shares (whole message): " : " shares: ")
+                        << r.reason << " (drop_events_total=" << n << ")";
+    }
+    return !r.message_dropped;
+}
+
 void NodeImpl::add_verified_shares(HandleSharesData& data, NetService addr)
 {
     // io_context thread. Non-blocking tracker lock (architectural rule,
