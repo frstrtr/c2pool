@@ -991,11 +991,18 @@ TEST(DashV36Network, NoNetKeepsPublicAndCustomIdPaths) {
     }
 }
 
-TEST(DashV36Network, SeedListIsEmptyUntilOperatorApproval) {
+TEST(DashV36Network, SeedListIsTheApprovedPublicNodes) {
     IdentityGuard g;
-    // Mechanism present, list empty (TODO: operator approval). A seed added in a
-    // follow-up must update this line in the same PR.
-    EXPECT_TRUE(dash::v36_network_seed_hosts().empty());
+    // The operator-approved seeds, pinned: a change to the list must update
+    // this line in the same PR.
+    const std::vector<std::string> expected{"158.220.92.171:8999", "109.123.238.32:8999"};
+    EXPECT_EQ(dash::v36_network_seed_hosts(), expected);
+    for (const auto& hp : dash::v36_network_seed_hosts()) {
+        const auto colon = hp.rfind(':');
+        ASSERT_NE(colon, std::string::npos) << hp;
+        EXPECT_EQ(hp.substr(colon + 1), std::to_string(SharechainConfig::P2P_PORT))
+            << hp << ": seeds listen on the sharechain port";
+    }
     ASSERT_TRUE(resolve_identity("dash-v36", "", "", false));
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(/*explicit=*/false, /*regtest=*/false,
                   SharechainConfig::has_custom_network_id(),

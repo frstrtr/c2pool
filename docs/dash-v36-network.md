@@ -43,4 +43,4 @@ Rules:
 - `--net dash-v36` cannot be combined with `--network-id` or `--prefix` (from either the CLI or the settings file). The node exits with an error that names the conflicting flag.
 - `--net dash-v36` is a mainnet network and cannot be combined with `--testnet` / `--regtest`. A test network uses `--testnet --network-id HEX --prefix HEX`, which runs the same v36 profile under its own identity.
 - Without `--net` (and without `--network-id`) the node stays on the default v16 sharechain, `7242ef345e1bed6b` / `3b3e1286f446b891`, unchanged.
-- Built-in seeds: when `--net dash-v36` is set and no `--addnode` / `--connect` is given, the node dials only the network's own seed list (`dash::v36_network_seed_hosts`). The list is empty until the operator approves its first entries, so pass `--addnode HOST:PORT` for now.
+- Built-in seeds: when `--net dash-v36` is set and no `--addnode` / `--connect` is given, the node dials only the network's own seed list (`dash::v36_network_seed_hosts`). The operator-approved seeds are `158.220.92.171:8999` (dash.voidbind.com) and `109.123.238.32:8999`, on the sharechain port. An explicit `--addnode` / `--connect` replaces the list.

@@ -707,14 +707,17 @@ inline void apply_sharechain_identity(SharechainConfig::NamedNetwork named,
 // ---------------------------------------------------------------------------
 // Built-in sharechain seeds of the DASH v36 network. Dialed ONLY when --net
 // dash-v36 is set and no --addnode/--connect is given
-// (SharechainBootstrapMode::V36NetworkSeeds).
-// TODO(operator approval): the list is EMPTY until the operator approves the
-// first entries (candidate: dash.voidbind.com:8999, once a v36 node is deployed
-// there). Until then a node of this network needs --addnode HOST:PORT.
+// (SharechainBootstrapMode::V36NetworkSeeds). Operator-approved public nodes
+// of the network, HOST:PORT on the sharechain port (SharechainConfig::P2P_PORT);
+// IP literals, so dialing needs no DNS. An explicit --addnode/--connect
+// replaces the whole list.
 // ---------------------------------------------------------------------------
 inline std::vector<std::string> v36_network_seed_hosts()
 {
-    return {};
+    return {
+        "158.220.92.171:8999",   // dash.voidbind.com
+        "109.123.238.32:8999",   // Singapore
+    };
 }
 
 // ---------------------------------------------------------------------------
