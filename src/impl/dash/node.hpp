@@ -884,7 +884,7 @@ public:
                 why += ": peer build lacks v36 isolated support — upgrade (peer advertises protocol "
                      + std::to_string(msg->m_version) + " \""
                      + printable_subversion(msg->m_subversion)
-                     + "\", the private/isolated v36 sharechain requires >= "
+                     + "\", the DASH v36 network requires >= "
                      + std::to_string(effective_floor) + ")";
             }
             throw std::runtime_error(why);
