@@ -606,6 +606,73 @@ TEST(DashV36LiveVariant, PersistedRowsOfAnotherTypeAreSkippedOnReload)
     }
 }
 
+// The reload window (2*CHAIN_LENGTH+10 newest rows by height) counts only rows
+// of the type the chain speaks. A v36 genesis restarts absheight at 1, so a
+// long pre-flip v16 history in the same identity-scoped DB sorts above the
+// whole v36 chain; if those rows took window slots, a restart would reload
+// nothing of the v36 chain. A single-type DB keeps exactly the old window.
+TEST(DashV36LiveVariant, ReloadWindowCountsOnlyRowsOfTheTypeTheChainSpeaks)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_live_window");
+    const auto p16 = iso_params(16);
+    dash::ShareChain scratch16;
+    const auto s16 = mine_v16(scratch16, p16, info(uint256(), 1, 0xaa, 16)).share;
+    const auto p36 = iso_params(36);
+    dash::ShareChain scratch36;
+    const auto g36 = mine_v36(scratch36, p36, info(uint256(), 1, 0xbb, 36)).share;
+    const std::string sub = SharechainConfig::data_subdir(false);
+    const size_t keep = static_cast<size_t>(SharechainConfig::chain_length()) * 2 + 10;
+    const size_t n16 = keep + 1;   // one more v16 row than the whole window
+
+    auto row_of = [](uint64_t ver, const Bytes& wire) {
+        std::vector<uint8_t> r(8, 0);
+        std::memcpy(r.data(), &ver, 8);
+        r.insert(r.end(), wire.begin(), wire.end());
+        return r;
+    };
+    auto v16_key = [](size_t k) {
+        Bytes b(32, 0x16);
+        for (int j = 0; j < 8; ++j) b[j] = static_cast<uint8_t>(k >> (8 * j));
+        return uint256(b);
+    };
+
+    {   // v36 genesis at height 1; v16 rows at heights 2..n16+1 (all above it)
+        c2pool::storage::SharechainStorage st(sub);
+        ASSERT_TRUE(st.is_available());
+        std::vector<c2pool::storage::SharechainStorage::ShareBatchEntry> rows;
+        rows.push_back({g36.m_hash, row_of(36, wire_of(g36)), g36.m_prev_hash, 1,
+                        g36.m_timestamp, uint256::ZERO, chain::bits_to_target(g36.m_bits)});
+        const auto w16 = row_of(16, wire_of(s16));
+        for (size_t k = 0; k < n16; ++k)
+            rows.push_back({v16_key(k), w16, s16.m_prev_hash, 2 + k,
+                            s16.m_timestamp, uint256::ZERO, chain::bits_to_target(s16.m_bits)});
+        ASSERT_TRUE(st.store_shares_batch(rows));
+        ASSERT_EQ(st.get_shares_by_height_range(0, UINT64_MAX).size(), n16 + 1);
+    }
+    {   // speaking v36: the v16 rows take no slot, the v36 genesis is reloaded
+        LiveNode n(p36, sub);
+        auto& t = n.quiesce();
+        EXPECT_TRUE(t.chain.contains(g36.m_hash))
+            << "the v36 chain must survive a restart under a longer v16 history";
+        EXPECT_EQ(t.chain.size(), 1u);
+        EXPECT_TRUE(n.node->stored(v16_key(0))) << "an other-type row is not pruned by the v36 reload";
+        EXPECT_TRUE(n.node->stored(g36.m_hash));
+    }
+    {   // speaking v16: the old window exactly — the newest `keep` v16 rows;
+        // the two oldest rows (the v36 genesis, the first v16 row) are pruned
+        LiveNode n(p16, sub);
+        auto& t = n.quiesce();
+        EXPECT_EQ(t.chain.size(), keep);
+        EXPECT_FALSE(t.chain.contains(g36.m_hash));
+        EXPECT_FALSE(t.chain.contains(v16_key(0)));
+        EXPECT_TRUE(t.chain.contains(v16_key(1)));
+        EXPECT_TRUE(t.chain.contains(v16_key(n16 - 1)));
+        EXPECT_FALSE(n.node->stored(g36.m_hash));
+        EXPECT_FALSE(n.node->stored(v16_key(0)));
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // E. One sharechain, one share type; the v36 chain needs no vote
 // ═════════════════════════════════════════════════════════════════════════════

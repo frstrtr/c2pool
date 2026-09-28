@@ -368,7 +368,59 @@ void NodeImpl::load_persisted_shares()
     // Only the newest window is loaded (LevelDB accumulates forever).
     const size_t keep = static_cast<size_t>(SharechainConfig::chain_length()) * 2 + 10;
     const size_t total_in_db = all_hashes.size();
-    size_t skip = (total_in_db > keep) ? (total_in_db - keep) : 0;
+
+    // The window counts only rows this chain can load: rows of a type it does
+    // not admit (check_share_type_admitted, e.g. v16 rows in an identity-scoped
+    // private/isolated DB written before the chain switched to v36) take no
+    // window slot. The v36 genesis restarts absheight at 1, so such rows sort
+    // ABOVE the whole v36 chain by height; counting them would push every v36
+    // row out of the window. Scanned newest-first; the rows that count are
+    // kept for the load loop below (read once). A DB holding one type only
+    // (the public network) selects exactly the newest `keep` rows, as before.
+    struct ScannedRow {
+        bool cached = false;   // false: a row of another type, re-read below
+        bool ok = false;
+        std::vector<uint8_t> data;
+        core::ShareMetadata meta;
+    };
+    std::vector<ScannedRow> scanned;   // scanned[k] = row all_hashes[total_in_db - 1 - k]
+    size_t skip = 0;
+    if (total_in_db > keep) {
+        size_t counted = 0;
+        size_t i = total_in_db;
+        while (i > 0 && counted < keep) {
+            --i;
+            ScannedRow r;
+            r.ok = m_storage->load_share(all_hashes[i], r.data, r.meta) && r.data.size() >= 8;
+            bool admitted = true;
+            if (r.ok) {
+                uint64_t ver;
+                std::memcpy(&ver, r.data.data(), 8);
+                try { check_share_type_admitted(static_cast<int64_t>(ver), m_tracker.m_coin_params); }
+                catch (const std::exception&) { admitted = false; }
+            }
+            if (admitted) {
+                r.cached = true;
+                ++counted;
+            } else {
+                r.data.clear();
+                r.data.shrink_to_fit();
+            }
+            scanned.push_back(std::move(r));
+        }
+        skip = i;
+    }
+    auto fetch_row = [&](size_t i, std::vector<uint8_t>& data, core::ShareMetadata& meta) -> bool {
+        if (!scanned.empty()) {
+            auto& r = scanned[total_in_db - 1 - i];
+            if (r.cached) {
+                data = std::move(r.data);
+                meta = r.meta;
+                return r.ok;
+            }
+        }
+        return m_storage->load_share(all_hashes[i], data, meta);
+    };
 
     int loaded = 0, skipped = 0;
     std::vector<uint256> verified_hashes;
@@ -377,7 +429,7 @@ void NodeImpl::load_persisted_shares()
         const auto& hash = all_hashes[i];
         std::vector<uint8_t> data;
         core::ShareMetadata meta;
-        if (!m_storage->load_share(hash, data, meta) || data.size() < 8) {
+        if (!fetch_row(i, data, meta) || data.size() < 8) {
             ++skipped;
             continue;
         }
@@ -387,9 +439,8 @@ void NodeImpl::load_persisted_shares()
             chain::RawShare rshare(ver, PackStream(
                 std::vector<unsigned char>(data.begin() + 8, data.end())));
             auto share = dash::load_share(rshare, NetService{"database", 0});
-            // A row of a type this chain does not admit (e.g. v16 rows in an
-            // identity-scoped private/isolated DB written before the chain
-            // switched to v36) is skipped, never inserted.
+            // A row of a type this chain does not admit (it took no window
+            // slot above) is skipped, never inserted.
             try {
                 check_share_type_admitted(share.version(), m_tracker.m_coin_params);
             } catch (const std::exception& e) {
