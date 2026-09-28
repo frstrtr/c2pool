@@ -1111,35 +1111,41 @@ void NodeImpl::start_outbound_connections()
         return;
     }
 
-    // btc/ltc node.cpp:1289-1327 port.
-    auto try_connect_peers = [this]()
-    {
-        const size_t outbound = m_outbound_addrs.size();
-        if (outbound >= m_target_outbound_peers || m_connections.size() >= m_max_peers)
-            return;
-
-        size_t needed = m_target_outbound_peers - outbound;
-        // Ask for a few extra in case some are already connected.
-        for (auto& ap : get_good_peers(needed + 4))
-        {
-            if (needed == 0)
-                break;
-            // Skip if already connected, already dialing, or banned.
-            if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr)
-                || is_banned(ap.addr))
-                continue;
-            LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
-            m_pending_outbound.insert(ap.addr);
-            core::Client::connect(ap.addr);
-            --needed;
-        }
-    };
-
     try_connect_peers();  // initial burst (--addnode/--connect seeds)
 
     // Periodic maintenance — top up outbound peers every 30 seconds.
     m_connect_timer = std::make_unique<core::Timer>(m_context, true);
-    m_connect_timer->start(30, try_connect_peers);
+    m_connect_timer->start(30, [this]() { try_connect_peers(); });
+}
+
+// One outbound dial-maintenance pass (btc/ltc node.cpp:1289-1327 port). Runs
+// on the IO thread: once from start_outbound_connections() and then on every
+// 30 s m_connect_timer tick. An address stays in m_pending_outbound from the
+// dial until the dial resolves: connected() on success, error() /
+// close_connection() once a socket existed, connect_failed() when it never did
+// (#1835: without that last one a refused dial was never retried). A member
+// (not a lambda) so the dial pass can be driven directly by a KAT.
+void NodeImpl::try_connect_peers()
+{
+    const size_t outbound = m_outbound_addrs.size();
+    if (outbound >= m_target_outbound_peers || m_connections.size() >= m_max_peers)
+        return;
+
+    size_t needed = m_target_outbound_peers - outbound;
+    // Ask for a few extra in case some are already connected.
+    for (auto& ap : get_good_peers(needed + 4))
+    {
+        if (needed == 0)
+            break;
+        // Skip if already connected, already dialing, or banned.
+        if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr)
+            || is_banned(ap.addr))
+            continue;
+        LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
+        m_pending_outbound.insert(ap.addr);
+        core::Client::connect(ap.addr);
+        --needed;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
