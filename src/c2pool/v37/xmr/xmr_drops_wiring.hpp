@@ -92,6 +92,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <cstring>   // memcpy/memcmp (DROPS-CARRY-LIVE record file)
 #include <unistd.h>   // fsync (DROPS-RESTART journal)
 #include <functional>
 #include <map>
@@ -322,6 +324,201 @@ struct PrefixRecord {
     std::uint64_t base_end = 0;
     std::vector<std::pair<std::uint64_t, ServedShare>> list;   // (first position, receipt) over [base_end, P)
 };
+
+// ★ DROPS-CARRY-LIVE (2): the records survive a restart, next to the relay
+// shadows they mirror (<settle_db>/lane<N>.shadow.drops): a replay from a
+// RELOADED shadow (xmr_repair_replay.hpp load()) still finds its DROPS record.
+// File: "V37DRPR1" | chain u32 | tag(32) | count u32 | per record (MRU last):
+// key (u16 len + bytes) | P u64 | base_end u64 | base_P u64 | base_n u64 |
+// base_first (u32 n + (payee, bin u64)) | base_counts (u32 n + (payee, bin,
+// count u64)) | base_give (u32 n + (payee, sum u64, n u64)) | list (u32 n +
+// (pos u64, payee, bin u64, give u16, n u32)) | sha256d(all before). Written
+// tmp + fsync + rename; a torn / foreign / bad-hash file = zero records.
+struct PrefixRecordFile {
+    static constexpr std::uint8_t kMagic[8] = {'V', '3', '7', 'D', 'R', 'P', 'R', '1'};
+    static void put(std::vector<std::uint8_t>& b, std::uint64_t v, int n) {
+        for (int i = 0; i < n; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+    }
+    static void put32b(std::vector<std::uint8_t>& b, const bytes32& x) { b.insert(b.end(), x.begin(), x.end()); }
+    static std::vector<std::uint8_t> encode(std::uint32_t chain, const bytes32& tag,
+                                            const std::vector<std::pair<std::string, const PrefixRecord*>>& recs) {
+        std::vector<std::uint8_t> b(kMagic, kMagic + 8);
+        put(b, chain, 4); put32b(b, tag); put(b, recs.size(), 4);
+        for (const auto& [key, r] : recs) {
+            put(b, key.size(), 2); b.insert(b.end(), key.begin(), key.end());
+            put(b, r->P, 8); put(b, r->base_end, 8); put(b, r->fold.base_P, 8); put(b, r->fold.base_n, 8);
+            put(b, r->fold.base_first.size(), 4);
+            for (const auto& [p, bin] : r->fold.base_first) { put32b(b, p); put(b, bin, 8); }
+            put(b, r->fold.base_counts.size(), 4);
+            for (const auto& [k, c] : r->fold.base_counts) { put32b(b, k.first); put(b, k.second, 8); put(b, c, 8); }
+            put(b, r->fold.base_give.size(), 4);
+            for (const auto& [p, g] : r->fold.base_give) { put32b(b, p); put(b, g.first, 8); put(b, g.second, 8); }
+            put(b, r->list.size(), 4);
+            for (const auto& [pos, x] : r->list) { put(b, pos, 8); put32b(b, x.payee); put(b, x.bin, 8); put(b, x.give, 2); put(b, x.n, 4); }
+        }
+        const bytes32 h = ::v37::sha256d(b);
+        b.insert(b.end(), h.begin(), h.end());
+        return b;
+    }
+    // nullopt + why = the whole file is ignored (zero records); records in file order (MRU last)
+    static std::optional<std::vector<std::pair<std::string, PrefixRecord>>> decode(const std::vector<std::uint8_t>& b, std::uint32_t chain,
+                                                                                  const bytes32& tag, std::string* why) {
+        const auto bad = [&](const char* w) -> std::optional<std::vector<std::pair<std::string, PrefixRecord>>> { if (why) *why = w; return std::nullopt; };
+        if (b.size() < 8 + 4 + 32 + 4 + 32 || std::memcmp(b.data(), kMagic, 8) != 0) return bad("bad magic/size");
+        const std::size_t body = b.size() - 32;
+        if (::v37::sha256d(std::vector<std::uint8_t>(b.begin(), b.begin() + static_cast<std::ptrdiff_t>(body))) !=
+            [&] { bytes32 h{}; std::memcpy(h.data(), b.data() + body, 32); return h; }()) return bad("hash trailer mismatch (torn or edited)");
+        std::size_t o = 8; bool ok = true;
+        const auto get = [&](int n) -> std::uint64_t {
+            if (!ok || o + static_cast<std::size_t>(n) > body) { ok = false; return 0; }
+            std::uint64_t v = 0; for (int i = n - 1; i >= 0; --i) v = (v << 8) | b[o + static_cast<std::size_t>(i)];
+            o += static_cast<std::size_t>(n); return v;
+        };
+        const auto get32b = [&]() -> bytes32 {
+            bytes32 x{}; if (!ok || o + 32 > body) { ok = false; return x; }
+            std::memcpy(x.data(), b.data() + o, 32); o += 32; return x;
+        };
+        if (get(4) != chain) return bad("another lane chain");
+        if (get32b() != tag) return bad("another lane geometry (lane_params_digest)");
+        const std::uint64_t count = get(4);
+        std::vector<std::pair<std::string, PrefixRecord>> out;
+        for (std::uint64_t i = 0; ok && i < count; ++i) {
+            const std::uint64_t kl = get(2);
+            if (!ok || o + kl > body) return bad("truncated key");
+            std::string key(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + kl)); o += kl;
+            PrefixRecord r;
+            r.P = get(8); r.base_end = get(8); r.fold.base_P = get(8); r.fold.base_n = static_cast<std::size_t>(get(8));
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) { const bytes32 p = get32b(); r.fold.base_first[p] = get(8); }
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) {
+                const bytes32 p = get32b(); const std::uint64_t bin = get(8); r.fold.base_counts[std::make_pair(p, bin)] = get(8);
+            }
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) {
+                const bytes32 p = get32b(); const std::uint64_t s = get(8); r.fold.base_give[p] = {s, get(8)};
+            }
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) {
+                const std::uint64_t pos = get(8); ServedShare x; x.payee = get32b(); x.bin = get(8);
+                x.give = static_cast<std::uint16_t>(get(2)); x.n = static_cast<std::uint32_t>(get(4));
+                r.list.emplace_back(pos, x);
+            }
+            out.emplace_back(std::move(key), std::move(r));
+        }
+        if (!ok || o != body) return bad("malformed record body");
+        return out;
+    }
+    static bool write(const std::string& path, const std::vector<std::uint8_t>& b, std::string* why) {
+        const std::string tmp = path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        bool ok = f && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        if (f) ok = (std::fclose(f) == 0) && ok;
+        ok = ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+        if (!ok && why) *why = "cannot write " + path;
+        return ok;
+    }
+};
+// ★ DROPS-CARRY-LIVE (3): the origin bin of every receipt this node pushed,
+// across a restart. A durable-log reload carries no bin (the receipts log
+// holds the raw frames only) and the relay ChainView knows only the headers
+// seen since boot (its last 128 + the templates issued), so after a restart
+// the older receipts of a repaired prefix (and our own lane log) never
+// resolved: 'origin bin of a repaired receipt is not resolvable yet' on every
+// tick, composed=0. This journal is written at push time (a bin the verifier
+// resolved) next to the receipts log and reloaded at boot, before the reload
+// of the receipts log; drops_bin_of falls back to it. Record: prev_id(32) |
+// bin u64 LE | fnv1a64 of those 40 bytes. Append-only; a torn tail is dropped
+// at load; bounded (compacted, tmp + fsync + rename, to the newest kKeep).
+#define C2POOL_XMR_DROPS_CARRY_LIVE 1
+class LaneBinJournal {
+public:
+    static constexpr std::size_t kRec = 48;
+    static constexpr std::size_t kKeep = 65536;
+
+    explicit LaneBinJournal(std::string path = {}) : m_path(std::move(path)) {}
+    const std::string& path() const noexcept { return m_path; }
+    std::size_t load() {
+        m_map.clear(); m_order.clear(); m_bad = 0;
+        if (m_path.empty()) return 0;
+        std::FILE* f = std::fopen(m_path.c_str(), "rb");
+        if (!f) return 0;
+        std::uint8_t r[kRec];
+        while (std::fread(r, 1, kRec, f) == kRec) {
+            bytes32 prev{}; std::uint64_t bin = 0;
+            if (!decode(r, prev, bin)) { ++m_bad; break; }
+            remember(prev, bin);
+        }
+        std::fclose(f);
+        compact();
+        return m_map.size();
+    }
+    // One pushed receipt's (prev_id, bin); only a new or changed pair is written.
+    bool note(const bytes32& prev, std::uint64_t bin) {
+        if (m_path.empty() || bin == 0) return false;
+        if (const auto it = m_map.find(prev); it != m_map.end() && it->second == bin) return false;
+        std::uint8_t r[kRec]; encode(prev, bin, r);
+        std::FILE* f = std::fopen(m_path.c_str(), "ab");
+        if (!f) return false;
+        const bool ok = std::fwrite(r, 1, kRec, f) == kRec;
+        std::fclose(f);
+        if (!ok) return false;
+        remember(prev, bin);
+        ++m_written;
+        if (++m_file_recs > 2 * kKeep) compact();
+        return true;
+    }
+    std::optional<std::uint64_t> lookup(const bytes32& prev) const {
+        const auto it = m_map.find(prev);
+        if (it == m_map.end()) return std::nullopt;
+        return it->second;
+    }
+    std::size_t size() const noexcept { return m_map.size(); }
+    std::uint64_t written() const noexcept { return m_written; }
+    std::uint64_t bad_tail() const noexcept { return m_bad; }
+
+private:
+    static std::uint64_t fnv(const std::uint8_t* p, std::size_t n) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (std::size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+        return h;
+    }
+    static void encode(const bytes32& prev, std::uint64_t bin, std::uint8_t* r) {
+        std::memcpy(r, prev.data(), 32);
+        for (int i = 0; i < 8; ++i) r[32 + i] = static_cast<std::uint8_t>(bin >> (8 * i));
+        const std::uint64_t c = fnv(r, 40);
+        for (int i = 0; i < 8; ++i) r[40 + i] = static_cast<std::uint8_t>(c >> (8 * i));
+    }
+    static bool decode(const std::uint8_t* r, bytes32& prev, std::uint64_t& bin) {
+        std::uint64_t c = 0;
+        for (int i = 0; i < 8; ++i) c |= static_cast<std::uint64_t>(r[40 + i]) << (8 * i);
+        if (c != fnv(r, 40)) return false;
+        std::memcpy(prev.data(), r, 32);
+        bin = 0;
+        for (int i = 0; i < 8; ++i) bin |= static_cast<std::uint64_t>(r[32 + i]) << (8 * i);
+        return bin != 0;
+    }
+    void remember(const bytes32& prev, std::uint64_t bin) {
+        auto [it, fresh] = m_map.insert_or_assign(prev, bin);
+        (void)it;
+        if (fresh) m_order.push_back(prev);
+        while (m_order.size() > kKeep) { m_map.erase(m_order.front()); m_order.pop_front(); }
+    }
+    void compact() {
+        const std::string tmp = m_path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) return;
+        bool ok = true;
+        std::uint8_t r[kRec];
+        for (const auto& prev : m_order) { encode(prev, m_map.at(prev), r); ok = ok && std::fwrite(r, 1, kRec, f) == kRec; }
+        ok = ok && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        ok = (std::fclose(f) == 0) && ok;
+        if (ok) ok = std::rename(tmp.c_str(), m_path.c_str()) == 0;
+        if (!ok) std::remove(tmp.c_str());
+        else m_file_recs = m_order.size();
+    }
+    std::string m_path;
+    std::map<bytes32, std::uint64_t> m_map;
+    std::deque<bytes32> m_order;
+    std::uint64_t m_written = 0, m_bad = 0, m_file_recs = 0;
+};
+
 
 // ★ XMR-DROPS-DEFAULT d5 (fee model ON). The REPLACE delta is in WHOLE-receipt
 // units: one estimated share prices as kFeeReceiptWeight (65535) of lane weight,
@@ -1174,6 +1371,37 @@ public:
         }
         return lp;
     }
+    // ★ DROPS-CARRY-LIVE (1): our fold F = lane_base_end() passed the served
+    // start a0 (a peer's vault horizon; with small or mixed --relay-vault-horizon
+    // it can sit anywhere below P), so our [0, a0) is no longer separable from the
+    // fold. [0, a0) is verified (the caller's own-base check); if OUR order over
+    // [a0, F) IS the served order's first receipts -- the same receipt ids at the
+    // same positions (`own_ids` = our durable lane order over [a0, F): pos_first,
+    // id) -- then our [0, F) is the winner's [0, F) exactly and the prefix is our
+    // fold [0, F) + the served receipts from F on (merged_prefix(P, F, tail)).
+    // Returns how many served receipts lie in [a0, F) (the tail starts there);
+    // nullopt + why = the orders differ below F or a receipt straddles F (HOLD).
+    static std::optional<std::size_t> own_base_through(std::uint64_t a0, std::uint64_t F, const std::vector<ServedShare>& served,
+                                                       const std::vector<bytes32>& served_ids,
+                                                       const std::vector<std::pair<std::uint64_t, bytes32>>& own_ids,
+                                                       std::string* why) {
+        const auto no = [&](std::string t) -> std::optional<std::size_t> { if (why) *why = std::move(t); return std::nullopt; };
+        if (served.size() != served_ids.size()) return no("served ids and receipts differ in length");
+        if (F <= a0) return std::size_t{0};
+        std::uint64_t pos = a0; std::size_t k = 0;
+        for (const auto& [opos, oid] : own_ids) {
+            if (pos >= F) break;
+            if (opos != pos) return no("our durable order does not tile [a0,F) at position " + std::to_string(opos));
+            if (k >= served.size()) return no("the served order ends inside our fold [a0,F)");
+            if (served_ids[k] != oid)
+                return no("our order differs from the served order at position " + std::to_string(pos) +
+                          " below our fold end F=" + std::to_string(F));
+            pos += served[k].n ? served[k].n : 1; ++k;
+        }
+        if (pos != F)
+            return no("our durable order covers [" + std::to_string(a0) + "," + std::to_string(pos) + ") != [a0,F=" + std::to_string(F) + ")");
+        return k;
+    }
     // ★ DROPS-CARRY-SUFFIX: fold a record's entries below Q into its base (the
     // own-log fold rule: first bin per payee, S above the harvest retention
     // floor, give sums), bounding a record like the lane log. A later repair
@@ -1221,6 +1449,8 @@ public:
         return c;
     }
     std::uint64_t lane_contig() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_contig; }
+    // ★ DROPS-CARRY-LIVE: the positions our folded lane-log base covers ([0, base_end))
+    std::uint64_t lane_base_end() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_base_end; }
     std::uint64_t lane_gaps() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_gaps; }
 
     template <class Node>

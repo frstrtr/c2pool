@@ -53,6 +53,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "xmr_relay_test_util.hpp"
@@ -456,13 +457,231 @@ int main() {
     C(false, "CS5 the base composes from a served list of any length (no positions invariant)");
 #endif
 
+
+#if defined(C2POOL_XMR_DROPS_CARRY_SUFFIX)
+    std::printf("CS9 (verify sweep): every a0, every fold point, the record route folded anywhere\n");
+    {
+        std::uint64_t bad = 0, n = 0;
+        for (const auto& b : blocks) {
+            const auto ref = nW.compose_own(b.h, b.P, DON);
+            for (int i = 1; i < 3; ++i)
+                for (std::uint64_t a0 = 0; a0 <= b.P && a0 <= dv * kPushes; a0 += kPushes) {
+                    const auto o = nodes[i]->compose_repaired(b.h, b.P, a0, slice(W, a0, b.P), DON);
+                    ++n;
+                    if (!o.ok || o.digest != ref.digest || o.delta != ref.delta || o.positions != b.P) { if (++bad < 4) std::printf("  a0 sweep h=%llu %s a0=%llu -> %s\n", (unsigned long long)b.h, names[i], (unsigned long long)a0, o.ok ? "DIFFERENT" : o.why.c_str()); }
+                }
+        }
+        std::printf("  a0 sweep: %llu compositions, %llu bad\n", (unsigned long long)n, (unsigned long long)bad);
+        C(n > 100 && bad == 0, "CS9 every a0 on every block composes the winner's book + delta");
+        std::uint64_t bad2 = 0, n2 = 0, holds = 0;
+        const auto& b = blocks[2];
+        const auto ref = nW.compose_own(b.h, b.P, DON);
+        for (std::uint64_t Q = 0; Q <= dv * kPushes; Q += 3 * kPushes) {
+            NodeH y; y.feed(R1, s); (void)y.w->prune_lane_log(Q, bin_of_pid);
+            for (std::uint64_t a0 = Q; a0 <= dv * kPushes; a0 += 7 * kPushes) {
+                const auto o = y.compose_repaired(b.h, b.P, a0, slice(W, a0, b.P), DON);
+                ++n2;
+                if (!o.ok) { ++holds; if (holds < 3) std::printf("  fold sweep HOLD Q=%llu a0=%llu: %s\n", (unsigned long long)Q, (unsigned long long)a0, o.why.c_str()); }
+                else if (o.digest != ref.digest || o.delta != ref.delta) { if (++bad2 < 4) std::printf("  fold sweep Q=%llu a0=%llu -> DIFFERENT\n", (unsigned long long)Q, (unsigned long long)a0); }
+            }
+        }
+        std::printf("  fold sweep: %llu compositions, %llu different, %llu holds\n", (unsigned long long)n2, (unsigned long long)bad2, (unsigned long long)holds);
+        C(n2 > 50 && bad2 == 0 && holds == 0, "CS9 a fold at any Q <= a0 composes the winner's book + delta (never a hold, never different)");
+        std::uint64_t bad3 = 0, n3 = 0, holds3 = 0;
+        {
+            const std::size_t dv3 = static_cast<std::size_t>(pos_of_bin(110) / kPushes);
+            const std::vector<Rcpt> R3 = diverged(W, dv3, 3);
+            NodeH r3; r3.feed(R3, s);
+            const std::uint64_t P1 = pos_of_bin(118), a01 = pos_of_bin(108);
+            std::vector<dx::ServedShare> sv1;
+            for (const auto& r : slice(W, a01, P1)) sv1.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+            dx::PrefixWhy pw; dx::PrefixRecord rec1;
+            (void)r3.w->merged_prefix(P1, a01, sv1, bin_of_pid, &pw, nullptr, &rec1);
+            for (std::uint64_t Q = 0; Q <= P1; Q += 4 * kPushes) {
+                dx::PrefixRecord f = rec1; (void)r3.w->fold_record(f, Q);
+                for (std::uint64_t a0 = std::max<std::uint64_t>(Q, a01); a0 <= P1; a0 += 5 * kPushes) {
+                    std::vector<dx::ServedShare> sv2;
+                    for (const auto& r : slice(W, a0, b.P)) sv2.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+                    const auto lp = r3.w->merged_prefix(b.P, a0, sv2, bin_of_pid, &pw, &f);
+                    ++n3;
+                    if (!lp) { ++holds3; if (holds3 < 3) std::printf("  record sweep HOLD Q=%llu a0=%llu: %s\n", (unsigned long long)Q, (unsigned long long)a0, pw.text.c_str()); continue; }
+                    const auto o = r3.compose(b.h, *lp, DON);
+                    if (o.digest != ref.digest || o.delta != ref.delta) { if (++bad3 < 4) std::printf("  record sweep Q=%llu a0=%llu -> DIFFERENT\n", (unsigned long long)Q, (unsigned long long)a0); }
+                }
+            }
+        }
+        std::printf("  record sweep: %llu compositions, %llu different, %llu holds\n", (unsigned long long)n3, (unsigned long long)bad3, (unsigned long long)holds3);
+        C(n3 > 30 && bad3 == 0 && holds3 == 0, "CS9 a record folded at any Q <= a0 composes the winner's book + delta");
+        {
+            std::vector<dx::ServedShare> svw;
+            for (const auto& r : slice(W, 0, b.P)) svw.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+            dx::PrefixWhy pw; dx::PrefixRecord recw;
+            (void)nW.w->merged_prefix(b.P, 0, svw, bin_of_pid, &pw, nullptr, &recw);
+            const auto lpr = nW.w->merged_prefix(b.P, b.P, {}, bin_of_pid, &pw, &recw, nullptr);
+            C(lpr && lpr->positions == b.P && nW.compose(b.h, *lpr, DON).delta == ref.delta && nW.compose(b.h, *lpr, DON).digest == ref.digest,
+              "CS9 the shell record route (merged_prefix(P, P, {}, record)) composes the same as own_prefix");
+        }
+    }
+#endif
+
+#if defined(C2POOL_XMR_DROPS_CARRY_LIVE)
+    // ── DROPS-CARRY-LIVE ─────────────────────────────────────────────────────
+    // receipt identity for the durable-order check: (content, occurrence #) --
+    // two orders with the same receipt sequence carry the same ids
+    const auto ids_of = [](const std::vector<Rcpt>& o, std::uint64_t a, std::uint64_t b) {
+        std::map<std::tuple<bytes32, std::uint64_t, std::uint16_t>, std::uint64_t> seen;
+        std::vector<std::pair<std::uint64_t, bytes32>> out;
+        for (std::size_t i = 0; i < o.size(); ++i) {
+            const auto k = std::make_tuple(o[i].payee, o[i].bin, o[i].give);
+            const std::uint64_t occ = seen[k]++;
+            const std::uint64_t pos = i * kPushes;
+            if (pos < a || pos >= b) continue;
+            bytes32 id = o[i].payee; std::memcpy(id.data(), &o[i].bin, 8); std::memcpy(id.data() + 8, &occ, 8);
+            std::memcpy(id.data() + 16, &o[i].give, 2); id[31] ^= 0x5A;
+            out.emplace_back(pos, id);
+        }
+        return out;
+    };
+    // the shell's drops_merge (main_v37_xmr.cpp): merged_prefix, and when our
+    // fold F passed a0, the own base extended to F by receipt identity
+    const auto merge_live = [&](NodeH& x, const std::vector<Rcpt>& own, std::uint64_t P, std::uint64_t a0,
+                                std::string& why) -> std::optional<dx::LanePrefix> {
+        std::vector<dx::ServedShare> sv; std::vector<bytes32> sid;
+        for (const auto& r : slice(W, a0, P)) sv.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+        for (const auto& [p, id] : ids_of(W, a0, P)) { (void)p; sid.push_back(id); }
+        dx::PrefixWhy pw; dx::PrefixRecord rec;
+        auto lp = x.w->merged_prefix(P, a0, sv, bin_of_pid, &pw, nullptr, &rec);
+        const std::uint64_t F = x.w->lane_base_end();
+        if (!lp && a0 > 0 && F > a0 && F < P) {
+            std::string w;
+            if (const auto k = dx::XmrDropsWiring::own_base_through(a0, F, sv, sid, ids_of(own, a0, F), &w)) {
+                const std::vector<dx::ServedShare> tail(sv.begin() + static_cast<std::ptrdiff_t>(*k), sv.end());
+                lp = x.w->merged_prefix(P, F, tail, bin_of_pid, &pw, nullptr, &rec);
+            } else pw.text += " [" + w + "]";
+        }
+        if (!lp) why = pw.text;
+        return lp;
+    };
+#endif
+    std::printf("CS10 (DROPS-CARRY-LIVE 1): our fold F passed a0 -- every a0 x fold point, orders equal below F\n");
+    {
+        const auto& b = blocks[2];
+        const auto ref = nW.compose_own(b.h, b.P, DON);
+        std::uint64_t n = 0, holds = 0, diff = 0, n_div = 0, diff_div = 0, holds_div = 0;
+        const std::uint64_t D = dv * kPushes;   // R1 == W below D
+        for (std::uint64_t Q = 4 * kPushes; Q <= D + 24 * kPushes; Q += 5 * kPushes) {
+            NodeH y; y.feed(R1, s); (void)y.w->prune_lane_log(Q, bin_of_pid);
+            for (std::uint64_t a0 = kPushes; a0 < std::min<std::uint64_t>(Q, D); a0 += 3 * kPushes) {
+                std::string why;
+#if defined(C2POOL_XMR_DROPS_CARRY_LIVE)
+                const auto lp = merge_live(y, R1, b.P, a0, why);
+#else
+                std::vector<dx::ServedShare> sv;
+                for (const auto& r : slice(W, a0, b.P)) sv.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+                dx::PrefixWhy pw;
+                const auto lp = y.w->merged_prefix(b.P, a0, sv, bin_of_pid, &pw);
+                if (!lp) why = pw.text;
+#endif
+                const bool below = y.w->lane_log_stats().base_P <= D;   // the fold holds only receipts both orders share
+                (below ? n : n_div) += 1;
+                if (!lp) {
+                    (below ? holds : holds_div) += 1;
+                    if (below && holds < 3) std::printf("  HOLD F=%llu a0=%llu: %s\n", (unsigned long long)y.w->lane_log_stats().base_P, (unsigned long long)a0, why.c_str());
+                    continue;
+                }
+                const auto o = y.compose(b.h, *lp, DON);
+                if (o.digest != ref.digest || o.delta != ref.delta || o.positions != b.P) (below ? diff : diff_div) += 1;
+            }
+        }
+        std::printf("  fold past a0, orders equal below F: %llu compositions, %llu holds, %llu different | fold into our diverged "
+                    "order: %llu, %llu holds, %llu different\n", (unsigned long long)n, (unsigned long long)holds, (unsigned long long)diff,
+                    (unsigned long long)n_div, (unsigned long long)holds_div, (unsigned long long)diff_div);
+        C(n > 40 && holds == 0 && diff == 0, "CS10 ★ a fold past a0 over the shared order composes the winner's book + delta (0 HOLD, the fix3all stall)");
+        C(diff_div == 0, "CS10 ★ a fold into our DIVERGED order never composes a different book (HOLD only)");
+    }
+
+    std::printf("CS11 (DROPS-CARRY-LIVE 2): the DROPS records survive a restart (lane<N>.shadow.drops)\n");
+    {
+#if defined(C2POOL_XMR_DROPS_CARRY_LIVE)
+        const auto& b = blocks[2];
+        const auto ref = nW.compose_own(b.h, b.P, DON);
+        const std::size_t dv3 = static_cast<std::size_t>(pos_of_bin(110) / kPushes);
+        const std::vector<Rcpt> R3 = diverged(W, dv3, 3);
+        NodeH r3; r3.feed(R3, s);
+        const std::uint64_t P1 = pos_of_bin(118), a01 = pos_of_bin(108), a02 = pos_of_bin(116);
+        std::vector<dx::ServedShare> sv1, sv2;
+        for (const auto& r : slice(W, a01, P1)) sv1.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+        for (const auto& r : slice(W, a02, b.P)) sv2.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+        dx::PrefixWhy pw; dx::PrefixRecord rec1;
+        const bool made = r3.w->merged_prefix(P1, a01, sv1, bin_of_pid, &pw, nullptr, &rec1).has_value();
+        (void)r3.w->fold_record(rec1, a01 + 4 * kPushes);   // a folded record round-trips too
+        const std::string path = "/tmp/v37_drops_carry_live_kat." + std::to_string(::getpid()) + ".shadow.drops";
+        const bytes32 tag = b32_of(0x3C);
+        const std::vector<std::pair<std::string, const dx::PrefixRecord*>> v = {{"P1:spine", &rec1}};
+        std::string why;
+        const bool wrote = dx::PrefixRecordFile::write(path, dx::PrefixRecordFile::encode(7, tag, v), &why);
+        std::vector<std::uint8_t> bytes;
+        { std::ifstream in(path, std::ios::binary); bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()); }
+        const auto back = dx::PrefixRecordFile::decode(bytes, 7, tag, &why);
+        C(made && wrote && back && back->size() == 1 && (*back)[0].first == "P1:spine", "CS11 a record is written (tmp+fsync+rename) and reloads");
+        C(back && dx::PrefixRecordFile::encode(7, tag, {{(*back)[0].first, &(*back)[0].second}}) == dx::PrefixRecordFile::encode(7, tag, v),
+          "CS11 the reloaded record is byte-identical to the one written");
+        NodeH after; after.feed(R3, s);   // the restarted node: same own order, no in-memory records
+        const auto lp = back ? after.w->merged_prefix(b.P, a02, sv2, bin_of_pid, &pw, &(*back)[0].second) : std::nullopt;
+        const auto o = lp ? after.compose(b.h, *lp, DON) : NodeH::Out{};
+        C(lp && o.digest == ref.digest && o.delta == ref.delta && o.positions == b.P,
+          "CS11 ★ a replay from a RELOADED shadow composes from its reloaded record: the winner's book + delta (no HOLD)");
+        std::vector<std::uint8_t> torn(bytes.begin(), bytes.end() - 1), flip(bytes);
+        flip[flip.size() / 2] ^= 1;
+        C(!dx::PrefixRecordFile::decode(torn, 7, tag, &why) && !dx::PrefixRecordFile::decode(flip, 7, tag, &why) &&
+          !dx::PrefixRecordFile::decode(bytes, 8, tag, &why) && !dx::PrefixRecordFile::decode(bytes, 7, b32_of(0x3D), &why),
+          "CS11 a torn / edited / other-chain / other-geometry file = zero records");
+        std::remove(path.c_str());
+#else
+        C(false, "CS11 ★ the base keeps DROPS records in memory only: a replay from a reloaded shadow HOLDs forever");
+#endif
+    }
+    std::printf("CS12 (DROPS-CARRY-LIVE 3): origin bins of receipts pushed before a restart\n");
+    {
+        const auto& b = blocks[0];
+        const auto ref = nW.compose_own(b.h, b.P, DON);
+        NodeH x;   // the restarted node: the receipts log reload carries no bin (bin 0 + prev_id)
+        std::uint64_t pos = 0;
+        for (const auto& r : W) { x.w->on_share_lane(r.payee, 0, pos, kPushes, pid_of(r.bin), r.give); pos += kPushes; }
+        for (const auto& [r, pow] : s.drops) (void)x.w->on_raindrop(r.payee, r.bin, pow);
+        const auto relay_view = [](const bytes32&) -> std::optional<std::uint64_t> { return std::nullopt; };   // headers since boot only
+        std::string why;
+        const bool held = !x.w->own_prefix(b.P, relay_view, &why) && why.find("not resolvable") != std::string::npos;
+        C(held, "CS12 a restarted node whose header view lacks the older prev_ids cannot resolve their origin bin (the fix2rst stall)");
+#if defined(C2POOL_XMR_DROPS_CARRY_LIVE)
+        const std::string path = "/tmp/v37_drops_carry_live_kat." + std::to_string(::getpid()) + ".receipts.bins";
+        std::remove(path.c_str());
+        { dx::LaneBinJournal j(path); for (const auto& r : W) (void)j.note(pid_of(r.bin), r.bin); }   // written at push time, before the restart
+        dx::LaneBinJournal j2(path);
+        const std::size_t nb = j2.load();
+        const auto with_journal = [&](const bytes32& pid) -> std::optional<std::uint64_t> {
+            if (const auto c = relay_view(pid)) return c;
+            return j2.lookup(pid);
+        };
+        const auto lp = x.w->own_prefix(b.P, with_journal, &why);
+        const auto o = lp ? x.compose(b.h, *lp, DON) : NodeH::Out{};
+        C(nb > 0 && lp && o.digest == ref.digest && o.delta == ref.delta,
+          "CS12 ★ with the journal reloaded the restarted node resolves every origin bin and composes the winner's book + delta");
+        { std::ofstream t(path, std::ios::binary | std::ios::app); t.write("torn", 4); }
+        dx::LaneBinJournal j3(path);
+        C(j3.load() == nb && j3.bad_tail() == 0 && j3.lookup(pid_of(W.front().bin)) == W.front().bin, "CS12 a torn tail is dropped at load");
+        std::remove(path.c_str());
+#else
+        C(false, "CS12 ★ the base has no durable origin-bin source: a restarted DROPS node HOLDs every repaired prefix");
+#endif
+    }
     std::printf("CS8: source pins (main_v37_xmr.cpp)\n");
     {
         const std::string sh = slurp(V37_XMR_SHELL_SRC);
         C(!sh.empty(), "CS8 shell source readable");
         const auto dp = sh.find("auto drops_lane_prefix = [&]");
         const auto ra = sh.find("relay_node->repair_a0(P, cc.spine_digest, &peer_a0)", dp == std::string::npos ? 0 : dp);
-        const auto mp = sh.find("drops->merged_prefix(P, a0, served, drops_bin_of, &pw, shadow_rec, &rec)", dp == std::string::npos ? 0 : dp);
+        const auto mp = sh.find("drops_merge(P, a0, served, ids, shadow_rec, rec, pw)", dp == std::string::npos ? 0 : dp);
         const auto end = sh.find("auto drops_compose_lane = [&]");
         C(dp != std::string::npos && ra != std::string::npos && mp != std::string::npos && dp < ra && ra < mp && mp < end,
           "CS8 ★ the repaired DROPS prefix = merged_prefix(P, repair_a0, served) (never the served ids alone)");
@@ -478,6 +697,14 @@ int main() {
           sh.find("if (!drops_compose_lane(h, bid, bk, booking_price, why, drops_lane)) return false;") != std::string::npos,
           "CS8 every node, the winner included, books its own lane composition (the trailer is a witness)");
         C(sh.find("lp->positions < bk.credit_cut.next_pos") != std::string::npos, "CS8 the determinism guard runs before every compose");
+        C(sh.find("drops_bin_journal.lookup(prev_id)") != std::string::npos && sh.find("drops_bin_journal.note(pb.prev_id, a.bin);") != std::string::npos &&
+          sh.find("drops_bin_journal.load();") != std::string::npos,
+          "CS8 ★ (LIVE 3) drops_bin_of falls back to the origin-bin journal written at push time and reloaded at boot");
+        C(sh.find("PrefixRecordFile::write(drops_records_path") != std::string::npos && sh.find("PrefixRecordFile::decode(b, cfg.lane_chain, drops_records_tag, &w)") != std::string::npos,
+          "CS8 ★ (LIVE 2) every stored DROPS record is persisted next to the shadows and reloaded at boot");
+        C(sh.find("XmrDropsWiring::own_base_through(a0, F, served, ids, own, &w)") != std::string::npos &&
+          sh.find("if (drops_merge(P, a0, served, ids, base, rec, pw)) drops_store_record(key, std::move(rec));") != std::string::npos,
+          "CS8 ★ (LIVE 1) a fold past a0 extends the verified own base by receipt identity (lane prefix + replay record)");
     }
     return C.done("v37_xmr_drops_carry_suffix_kat");
 }

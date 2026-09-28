@@ -1844,6 +1844,12 @@ static int run_live(const XmrNodeConfig& cfg) {
     // replay just verified, receipt by receipt, the moment it becomes a shadow
     // (a later suffix repair may take [0, a0) from it before its own block books)
     std::function<void(const std::string&, std::uint64_t, std::uint64_t, const ReplayBase&, const std::vector<::v37::bytes32>&)> drops_on_replay;
+    // ★ DROPS-CARRY-LIVE (2): the records survive a restart (<settle_db>/lane<N>.shadow.drops,
+    // next to the relay shadows they mirror); (3) the origin bin of every receipt this node
+    // pushed survives it too (<receipts log>.bins) -- drops_bin_of falls back to it.
+    std::string drops_records_path; ::v37::bytes32 drops_records_tag{};
+    std::uint64_t drops_records_loaded = 0, drops_records_persist_fail = 0, drops_lane_fold_ext = 0, drops_bin_journal_hits = 0;
+    c2pool::v37n::xmr::drops::LaneBinJournal drops_bin_journal;
     // GAP-2 relay state. Constructed in the option-B branch when --relay-* is
     // given; null = the relay is off and every path below is the stand-in one.
     // Declaration order = teardown order in reverse: everything the relay's
@@ -2300,7 +2306,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     // derivable now (HOLD, the relay-repair family; never refused).
     auto drops_bin_of = [&](const ::v37::bytes32& prev_id) -> std::optional<std::uint64_t> {
         const auto c = relay_chain.lookup(prev_id);
-        if (!c) return std::nullopt;
+        if (!c) {   // ★ DROPS-CARRY-LIVE (3): a header this boot has not seen -- the bin we journalled at push time
+            if (const auto b = drops_bin_journal.lookup(prev_id)) { ++drops_bin_journal_hits; return b; }
+            return std::nullopt;
+        }
         return c->height;
     };
     // ★ DROPS-ENROL-TIDY: fold our own lane log below the oldest cut a booking can
@@ -2357,6 +2366,38 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         drops_records[key] = std::move(rec);
         ++drops_records_made;
+        if (!drops_records_path.empty()) {   // ★ DROPS-CARRY-LIVE (2): tmp + fsync + rename, MRU last
+            std::vector<std::pair<std::string, const c2pool::v37n::xmr::drops::PrefixRecord*>> v;
+            for (const auto& k : drops_record_lru)
+                if (const auto it = drops_records.find(k); it != drops_records.end()) v.emplace_back(k, &it->second);
+            std::string w;
+            if (!c2pool::v37n::xmr::drops::PrefixRecordFile::write(drops_records_path, c2pool::v37n::xmr::drops::PrefixRecordFile::encode(cfg.lane_chain, drops_records_tag, v), &w))
+                ++drops_records_persist_fail;
+        }
+    };
+    // ★ DROPS-CARRY-LIVE (1): merged_prefix, and when our fold F passed a0 (the
+    // served start), the verified own base extended to F by receipt identity:
+    // our durable order over [a0, F) == the served order's first receipts (same
+    // ids at the same positions) -> our fold [0, F) + the served tail [F, P).
+    // Anything else HOLDs exactly as before; never a composition from a suffix.
+    auto drops_merge = [&](std::uint64_t P, std::uint64_t a0, const std::vector<c2pool::v37n::xmr::drops::ServedShare>& served,
+                           const std::vector<::v37::bytes32>& ids, const c2pool::v37n::xmr::drops::PrefixRecord* base,
+                           c2pool::v37n::xmr::drops::PrefixRecord& rec, c2pool::v37n::xmr::drops::PrefixWhy& pw)
+            -> std::optional<c2pool::v37n::xmr::drops::LanePrefix> {
+        auto lp = drops->merged_prefix(P, a0, served, drops_bin_of, &pw, base, &rec);
+        if (lp || base || a0 == 0 || !relay_node) return lp;
+        const std::uint64_t F = drops->lane_base_end();
+        if (F <= a0 || F >= P) return lp;   // not the fold-past-a0 case
+        std::vector<std::pair<std::uint64_t, ::v37::bytes32>> own;
+        if (!relay_node->own_order_ids(a0, F, own)) { pw.text += " [our durable order over [a0,F) is not readable]"; return lp; }
+        std::string w;
+        const auto k = c2pool::v37n::xmr::drops::XmrDropsWiring::own_base_through(a0, F, served, ids, own, &w);
+        if (!k) { pw.text += " [" + w + "]"; return lp; }
+        const std::vector<c2pool::v37n::xmr::drops::ServedShare> tail(served.begin() + static_cast<std::ptrdiff_t>(*k), served.end());
+        c2pool::v37n::xmr::drops::PrefixWhy pw2;
+        auto lp2 = drops->merged_prefix(P, F, tail, drops_bin_of, &pw2, nullptr, &rec);
+        if (lp2) ++drops_lane_fold_ext; else pw = pw2;
+        return lp2;
     };
     auto drops_lane_prefix = [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::uint64_t hint, std::string& why)
             -> std::optional<c2pool::v37n::xmr::drops::LanePrefix> {
@@ -2421,7 +2462,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::vector<c2pool::v37n::xmr::drops::ServedShare> served;
         if (!drops_served_of(ids, served, why)) return std::nullopt;
         c2pool::v37n::xmr::drops::PrefixRecord rec;
-        auto lp = drops->merged_prefix(P, a0, served, drops_bin_of, &pw, shadow_rec, &rec);
+        auto lp = drops_merge(P, a0, served, ids, shadow_rec, rec, pw);   // ★ DROPS-CARRY-LIVE (1)
         if (!lp) {
             if (!pw.retry && drops_prefix_alarmed.insert(pkey).second) {
                 ++drops_prefix_alarms;
@@ -2456,7 +2497,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!drops_served_of(ids, served, w)) { ++drops_record_miss; return; }
         c2pool::v37n::xmr::drops::PrefixWhy pw;
         c2pool::v37n::xmr::drops::PrefixRecord rec;
-        if (drops->merged_prefix(P, a0, served, drops_bin_of, &pw, base, &rec)) drops_store_record(key, std::move(rec));
+        if (drops_merge(P, a0, served, ids, base, rec, pw)) drops_store_record(key, std::move(rec));   // ★ DROPS-CARRY-LIVE (1)
         else ++drops_record_miss;
     };
     // THE composition of a lane block, on EVERY node: rows over range_for(h)
@@ -3845,6 +3886,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                 // RC-CTX (3): the contexts of the templates this node issued survive a restart
                 relay_ctx_journal = relay::CtxJournal(cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".ctx");
                 const std::size_t nctx = relay_ctx_journal.load(relay_chain);
+                if (drops_live) {   // ★ DROPS-CARRY-LIVE (3): origin bins of the receipts we pushed before this boot
+                    drops_bin_journal = c2pool::v37n::xmr::drops::LaneBinJournal(io.durable_path + ".bins");
+                    const std::size_t nb = drops_bin_journal.load();
+                    std::printf("drops: origin-bin journal %s reloaded=%zu%s\n", drops_bin_journal.path().c_str(), nb,
+                                drops_bin_journal.bad_tail() ? " (a torn tail record was dropped)" : "");
+                }
                 std::printf("relay: receipt-context journal %s reloaded=%zu%s\n", relay_ctx_journal.path().c_str(), nctx,
                             relay_ctx_journal.bad_tail() ? " (a torn tail record was dropped)" : "");
             }
@@ -3897,6 +3944,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                         if (a.bin == 0) {   // a durable-log reload carries no bin: resolved from prev_id at composition
                             ::v37::xmr::verify::ParsedBlob pb;
                             if (::v37::xmr::verify::parse_hashing_blob(a.r.receipt.hashing_blob, pb)) prev_id = pb.prev_id;
+                        } else if (::v37::xmr::verify::ParsedBlob pb; ::v37::xmr::verify::parse_hashing_blob(a.r.receipt.hashing_blob, pb)) {
+                            drops_bin_journal.note(pb.prev_id, a.bin);   // ★ DROPS-CARRY-LIVE (3)
                         }
                         drops->on_share_lane(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, pos_first, n_pushes, prev_id,
                                              a.r.side.give_author);   // ★ d5
@@ -3927,6 +3976,24 @@ static int run_live(const XmrNodeConfig& cfg) {
                 const auto& ps = relay_replayer.persist_stats();
                 std::printf("relay: REPAIR-CHAIN shadows %s restored=%zu%s%s\n", relay_replayer.persist_path().c_str(), nsh,
                             ps.load_bad ? " -- LOUD: " : "", ps.load_bad ? ps.last_error.c_str() : "");
+                if (drops_live) {   // ★ DROPS-CARRY-LIVE (2): the DROPS records of those shadows
+                    drops_records_path = relay_replayer.persist_path() + ".drops";
+                    drops_records_tag = ro.lane_params_digest;
+                    std::string w = "absent";
+                    std::ifstream in(drops_records_path, std::ios::binary);
+                    if (in) {
+                        const std::vector<std::uint8_t> b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                        if (auto recs = c2pool::v37n::xmr::drops::PrefixRecordFile::decode(b, cfg.lane_chain, drops_records_tag, &w)) {
+                            w.clear();
+                            for (auto& [k, r] : *recs) {
+                                if (!drops_records.count(k)) drops_record_lru.push_back(k);
+                                drops_records[k] = std::move(r); ++drops_records_loaded;
+                            }
+                        }
+                    }
+                    std::printf("drops: DROPS-CARRY-LIVE records %s restored=%llu%s%s\n", drops_records_path.c_str(),
+                                (unsigned long long)drops_records_loaded, w.empty() ? "" : " -- ", w.c_str());
+                }
             }
             std::printf("relay: REPAIR-CHAIN deep-order=%s (%s: %llu positions rebuilt from the receipts log) shadow-persist=%s probe-step=%llu\n",
                         g_relay_deep_order ? (relay_node->durable_order_open() ? "on" : "DISABLED (sidecar error: vault-only, RC5)") : "off",
@@ -4416,6 +4483,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)drops->lane_contig(), (unsigned long long)drops->lane_gaps(),
                             ll.entries, ll.max_entries, (unsigned long long)ll.base_P, ll.base_n, ll.base_payees, ll.base_counts,
                             (unsigned long long)ll.below_base, ll.stale ? " STALE" : "");
+                std::printf("  drops-live: fold_ext=%llu records_loaded=%llu records_persist_fail=%llu bin_journal=%zu written=%llu hits=%llu\n",
+                            (unsigned long long)drops_lane_fold_ext, (unsigned long long)drops_records_loaded,
+                            (unsigned long long)drops_records_persist_fail, drops_bin_journal.size(),
+                            (unsigned long long)drops_bin_journal.written(), (unsigned long long)drops_bin_journal_hits);
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());

@@ -838,6 +838,11 @@ public:
         m_deep_walkers.erase(it);
         return fresh;
     }
+    // ★ DROPS-CARRY-LIVE: our own lane order over [a, p) from the durable order
+    // (pos_first, id); false = deep order off / not readable there.
+    bool own_order_ids(u64 a, u64 p, std::vector<std::pair<u64, bytes32>>& ids) const {
+        return m_dorder.ids_between(a, p, ids);
+    }
     // REPAIR-CHAIN: the durable order's serving counters (deep pages / frames).
     DurableLaneOrder::Stats durable_order_stats() const { return m_dorder.stats(); }
     u64 durable_order_bytes() const { return m_dorder.disk_bytes(); }
