@@ -2356,8 +2356,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     };
     // keep a verified order's record (bounded LRU, folded below 2 x the vault horizon from its end)
     auto drops_store_record = [&](const std::string& key, c2pool::v37n::xmr::drops::PrefixRecord&& rec) {
-        const std::uint64_t H2 = 2 * (g_relay_vault_horizon ? g_relay_vault_horizon : 8640);
-        if (rec.P > H2) (void)drops->fold_record(rec, rec.P - H2);
+        // ★ DROPS-CARRY-LIVE (1b): never below the bound a default-horizon peer's a0 needs
+        const std::uint64_t Q = c2pool::v37n::xmr::drops::XmrDropsWiring::record_fold_point(
+            rec.P, g_relay_vault_horizon ? g_relay_vault_horizon : 8640);
+        if (Q) (void)drops->fold_record(rec, Q);
         if (!drops_records.count(key)) {
             drops_record_lru.push_back(key);
             while (drops_record_lru.size() > 4 * relay::RepairReplayer::kMaxShadows) {

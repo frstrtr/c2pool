@@ -1402,6 +1402,19 @@ public:
             return no("our durable order covers [" + std::to_string(a0) + "," + std::to_string(pos) + ") != [a0,F=" + std::to_string(F) + ")");
         return k;
     }
+    // ★ DROPS-CARRY-LIVE (1b): where a stored record may be folded. A later
+    // repair takes [0, a0) from a record only for a0 >= its fold end, and a0 is
+    // the SERVING peer's vault horizon, not ours: with mixed
+    // --relay-vault-horizon fleets a record folded 2 x OUR horizon below its
+    // end HELD for ever against a peer with a larger one (live: "the shadow
+    // record covers [327,359) which does not reach a0=322 from its fold",
+    // ours 16, the peer's 64). A record keeps at least 2 x the default vault
+    // horizon (the bound a default-horizon node already keeps), else 2 x ours.
+    static constexpr std::uint64_t kRecordKeepFloor = 2 * 8640;
+    static std::uint64_t record_fold_point(std::uint64_t P, std::uint64_t our_horizon) {
+        const std::uint64_t keep = std::max<std::uint64_t>(2 * our_horizon, kRecordKeepFloor);
+        return P > keep ? P - keep : 0;
+    }
     // ★ DROPS-CARRY-SUFFIX: fold a record's entries below Q into its base (the
     // own-log fold rule: first bin per payee, S above the harvest retention
     // floor, give sums), bounding a record like the lane log. A later repair

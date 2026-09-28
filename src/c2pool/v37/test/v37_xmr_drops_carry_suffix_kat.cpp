@@ -641,6 +641,40 @@ int main() {
         C(false, "CS11 ★ the base keeps DROPS records in memory only: a replay from a reloaded shadow HOLDs forever");
 #endif
     }
+    std::printf("CS11b (DROPS-CARRY-LIVE 1b): a record is never folded past a larger-horizon peer's a0\n");
+    {
+#if defined(C2POOL_XMR_DROPS_CARRY_LIVE)
+        // live M3: ours 16, the serving peer's 64 -> a0 = P - 64 + lag; the record of P must reach it
+        bool ok = true;
+        for (std::uint64_t ours : {16ull, 64ull, 8640ull})
+            for (std::uint64_t peer : {16ull, 64ull, 1000ull, 8640ull, 17280ull})
+                for (std::uint64_t P : {359ull, 5000ull, 40000ull}) {
+                    const std::uint64_t a0 = P > peer ? P - peer : 0;
+                    if (dx::XmrDropsWiring::record_fold_point(P, ours) > a0) ok = false;
+                }
+        C(ok, "CS11b ★ record_fold_point(P, ours) <= P - peer_horizon for every peer horizon <= 2 x the default (mixed fleets)");
+        // and the record folded there still composes the winner's book + delta from that a0
+        const auto& b = blocks[2];
+        const auto ref = nW.compose_own(b.h, b.P, DON);
+        const std::size_t dv3 = static_cast<std::size_t>(pos_of_bin(110) / kPushes);
+        NodeH r3; r3.feed(diverged(W, dv3, 3), s);
+        const std::uint64_t P1 = pos_of_bin(118), a01 = pos_of_bin(108);
+        std::vector<dx::ServedShare> sv1;
+        for (const auto& r : slice(W, a01, P1)) sv1.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+        dx::PrefixWhy pw; dx::PrefixRecord rec;
+        (void)r3.w->merged_prefix(P1, a01, sv1, bin_of_pid, &pw, nullptr, &rec);
+        const std::uint64_t Q = dx::XmrDropsWiring::record_fold_point(rec.P, 16);
+        if (Q) (void)r3.w->fold_record(rec, Q);
+        const std::uint64_t a0 = P1 - 20 * kPushes;   // a larger-horizon peer (64) serves from P1 - 40 < P1 - 2 x ours (16)
+        std::vector<dx::ServedShare> sv2;
+        for (const auto& r : slice(W, a0, b.P)) sv2.push_back(dx::ServedShare{r.payee, r.bin, r.give, kPushes});
+        const auto lp = r3.w->merged_prefix(b.P, a0, sv2, bin_of_pid, &pw, &rec);
+        const auto o = lp ? r3.compose(b.h, *lp, DON) : NodeH::Out{};
+        C(lp && o.digest == ref.digest && o.delta == ref.delta, "CS11b ★ the stored record composes from a larger-horizon peer a0 below P - 2 x ours (no HOLD)");
+#else
+        C(false, "CS11b ★ the base folds a record 2 x OUR horizon below its end: a larger-horizon peer's a0 HOLDs for ever");
+#endif
+    }
     std::printf("CS12 (DROPS-CARRY-LIVE 3): origin bins of receipts pushed before a restart\n");
     {
         const auto& b = blocks[0];
@@ -705,6 +739,8 @@ int main() {
         C(sh.find("XmrDropsWiring::own_base_through(a0, F, served, ids, own, &w)") != std::string::npos &&
           sh.find("if (drops_merge(P, a0, served, ids, base, rec, pw)) drops_store_record(key, std::move(rec));") != std::string::npos,
           "CS8 ★ (LIVE 1) a fold past a0 extends the verified own base by receipt identity (lane prefix + replay record)");
+        C(sh.find("XmrDropsWiring::record_fold_point(") != std::string::npos && sh.find("if (rec.P > H2) (void)drops->fold_record(rec, rec.P - H2);") == std::string::npos,
+          "CS8 ★ (LIVE 1b) a stored record folds at record_fold_point (never 2 x our horizon alone)");
     }
     return C.done("v37_xmr_drops_carry_suffix_kat");
 }
