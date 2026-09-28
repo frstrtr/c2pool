@@ -320,7 +320,9 @@ inline std::vector<unsigned char> select_embed_blob(
         return reject("this sharechain mints v" + std::to_string(prof.target_share_version) +
                       " shares, which carry no message_data");
     if (blob.size() > MAX_MESSAGE_DATA_WIRE_BYTES)
-        return reject("blob exceeds MAX_TOTAL_MESSAGE_BYTES");
+        return reject("blob exceeds MAX_MESSAGE_DATA_WIRE_BYTES ("
+                      + std::to_string(blob.size()) + " > "
+                      + std::to_string(MAX_MESSAGE_DATA_WIRE_BYTES) + ")");
     const std::string err = validate_message_data(blob, keys);
     if (!err.empty())
         return reject("blob does not validate against this sharechain's message authority: " + err);

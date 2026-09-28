@@ -3911,15 +3911,19 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (!operator_message_blob_hex.empty() &&
             dash::SharechainConfig::share_profile().target_share_version >= 36)
         {
-            std::vector<unsigned char> raw;
-            if (operator_message_blob_hex.size() % 2 == 0) {
+            std::string why;
+            if (!IsHex(operator_message_blob_hex)) {
+                // Odd length or a non-hex character: say so, rather than the
+                // "no operator message blob" an empty parse would report.
+                why = "--message-blob-hex is not valid hex (odd length or a non-hex character)";
+            } else {
+                std::vector<unsigned char> raw;
                 try { raw = ParseHex(operator_message_blob_hex); }
                 catch (const std::exception&) { raw.clear(); }
+                mint_embed_blob = dash::mint::select_embed_blob(
+                    raw, dash::SharechainConfig::share_profile(),
+                    dash::active_message_authority(), &why);
             }
-            std::string why;
-            mint_embed_blob = dash::mint::select_embed_blob(
-                raw, dash::SharechainConfig::share_profile(),
-                dash::active_message_authority(), &why);
             if (!mint_embed_blob.empty())
                 LOG_INFO << "[MINT] operator message blob (" << mint_embed_blob.size()
                          << " bytes) is embedded into the message_data of minted v36 shares";

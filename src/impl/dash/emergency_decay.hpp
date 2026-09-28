@@ -41,6 +41,21 @@ namespace dash
 // on, i.e. a stall of about 3 hours would make the reference HARDER instead of
 // easier. Deliberate deviation from that copy; KAT DashShareProducerRetarget.
 // EmergencyDecayShiftSaturatesNotWraps.
+//
+// Timestamps (deliberate, same as the ltc port, main_ltc.cpp passes the job's
+// wall-clock time): `desired_timestamp` is the job's WALL-CLOCK time, while
+// `prev_timestamp` is the parent's COMMITTED timestamp, which the share rules
+// clip to (its parent's timestamp + 2*SHARE_PERIOD - 1). After a long stall the
+// committed timestamps therefore lag wall clock by roughly the stall length,
+// and since each share advances the committed time by at most
+// 2*SHARE_PERIOD - 1 seconds, the lag closes slowly. So the easing
+// does not stop at the first share after the stall: the next several shares
+// still see time_since > SHARE_PERIOD*20 and keep easing, until the committed
+// timestamps catch up; after that the ordinary retarget walks the target back
+// (the band moves it by at most 10% per share). This is intended: the chain
+// recovers from a stall quickly and settles back gradually. It does not skew
+// payouts, because PPLNS weight is target_to_average_attempts of each share's
+// own bits: an easier share carries proportionally less weight.
 inline uint256 emergency_decay_clamp_ref(const uint256& prev_max_target,
                                          uint32_t prev_timestamp,
                                          uint32_t desired_timestamp,

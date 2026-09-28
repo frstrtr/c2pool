@@ -28,6 +28,11 @@
 //      chain (data subdir keyed on the share version).
 //   H. Web label DashV36Share for DASH type 36; the per-share payout view sums
 //      v36 shares.
+//   I. The fallback-coinbase / dashboard PPLNS seam (pplns_weights_for) walks
+//      the v36 window from the parent on isolated (unrooted short chain ->
+//      nullopt), not the v16 grandparent walk.
+//   J. The v36 mint declines a solve above its committed target and a solve
+//      whose header does not X11-hash to the submitted pow_hash.
 //
 // Folded into test_dash_node (needs dash::NodeImpl + c2pool_storage + the dash
 // OBJECT lib). The profile is keyed on the process-global SharechainConfig
@@ -298,9 +303,12 @@ std::string handshake(uint32_t proto, uint64_t nonce) {
 // ── synthetic chains for the retarget / payout-view KATs ────────────────────
 // `n` back-linked DashV36Shares: fixed bits == max_bits, timestamps t0 + i*spacing,
 // absheight 1..n, abswork accumulated, pubkey_hash cycling over `miners`.
+// `root_prev` is the first share's m_prev_hash: null = a rooted chain (reaches
+// genesis), non-null = an unrooted one (its parent is not in the chain).
 uint256 build_v36_chain(dash::ShareChain& chain, int n, uint32_t bits, uint32_t t0,
-                        uint32_t spacing, int miners = 1) {
-    uint256 prev;
+                        uint32_t spacing, int miners = 1,
+                        const uint256& root_prev = uint256()) {
+    uint256 prev = root_prev;
     uint128 abswork;
     for (int i = 0; i < n; ++i) {
         auto* s = new dash::DashV36Share();
@@ -756,6 +764,21 @@ TEST(DashV36Flip, MisKeyedBlobIsNotEmbeddedAndTheShareStillVerifies)
     ASSERT_TRUE(jr.solved);
     EXPECT_THROW((void)mint_from_inputs_any(chain, p, jr.in, jr.build.frozen), std::invalid_argument);
 
+    // Over the v36 wire cap (49-byte envelope + 512): refused with the cap
+    // named, before any decryption is attempted; at the cap it reaches the
+    // authority check instead.
+    why.clear();
+    EXPECT_TRUE(select_embed_blob(Bytes(dash::MAX_MESSAGE_DATA_WIRE_BYTES + 1, 0x01),
+                                  SharechainConfig::ISOLATED_V36_PROFILE,
+                                  KeySpan(chain_set), &why).empty());
+    EXPECT_EQ(why, "blob exceeds MAX_MESSAGE_DATA_WIRE_BYTES (562 > 561)");
+    why.clear();
+    EXPECT_TRUE(select_embed_blob(Bytes(dash::MAX_MESSAGE_DATA_WIRE_BYTES, 0x01),
+                                  SharechainConfig::ISOLATED_V36_PROFILE,
+                                  KeySpan(chain_set), &why).empty());
+    EXPECT_NE(why.find("does not validate against this sharechain's message authority"),
+              std::string::npos) << why;
+
     // Public profile: never embedded, even a blob valid for its key set.
     const dash::AuthorityPubkey* aset[] = {&key_a.pk};
     why.clear();
@@ -859,4 +882,173 @@ TEST(DashV36Flip, PerSharePayoutViewSumsDashV36Shares)
     }
     EXPECT_EQ(miners, 5u);
     EXPECT_EQ(sum, SUBSIDY);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// I. PPLNS seam for the fallback coinbase / dashboard / redistribution
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// pplns_weights_for feeds the non-producer stratum coinbase (what a found block
+// pays when no producer job exists), the dashboard payout view and the --fee
+// redistribution candidates. On the isolated chain it must be the v36 window
+// (start at the PARENT, decayed, v36_pplns_window) normalised into uint64, not
+// the v16 grandparent walk; an unrooted chain shorter than CHAIN_LENGTH (the
+// v36 window's depth guard throws) yields nullopt.
+
+namespace {
+// The seam's normalisation: uniform right shift until the grand total fits in
+// 63 bits; entries that shift to 0 are dropped.
+std::map<Bytes, uint64_t> normalised(const std::map<Bytes, uint288>& w, const uint288& total,
+                                     uint64_t* total_out) {
+    uint288 limit;
+    limit.SetHex("7fffffffffffffff");
+    unsigned shift = 0;
+    for (uint288 t = total; t > limit; t = t >> 1) ++shift;
+    *total_out = (total >> shift).GetLow64();
+    std::map<Bytes, uint64_t> out;
+    for (const auto& [script, weight] : w) {
+        const uint64_t v = (weight >> shift).GetLow64();
+        if (v > 0) out[script] = v;
+    }
+    return out;
+}
+} // namespace
+
+TEST(DashV36Flip, PplnsWeightsForWalksTheV36WindowFromTheParent)
+{
+    IdentityGuard guard;
+    const auto p = iso_prod_params();
+    ASSERT_EQ(p.current_share_version, 36u);
+    constexpr uint32_t BITS = 0x1d00ffffu, BLOCK_BITS = 0x1b00ffffu;
+
+    // Rooted 3-share chain, one miner per share: s0 (0x10), s1 (0x11), s2 (0x12).
+    dash::ShareChain chain;
+    const uint256 tip = build_v36_chain(chain, 3, BITS, PAST_TS, 20, /*miners=*/3);
+    const Bytes script0 = dash::pubkey_hash_to_script2(h160(0x10));
+    const Bytes script1 = dash::pubkey_hash_to_script2(h160(0x11));
+    const Bytes script2 = dash::pubkey_hash_to_script2(h160(0x12));
+
+    const auto w = dash::mint::pplns_weights_for(chain, p, tip, BLOCK_BITS);
+    ASSERT_TRUE(w.has_value());
+    EXPECT_TRUE(w->ref_hash.IsNull()) << "fallback path: no producer commitment";
+
+    // == the normalised v36 window from the parent (tip at depth 0).
+    const auto v36 = dash::v36_pplns_window(chain, tip);
+    uint64_t v36_total = 0;
+    const auto v36_norm = normalised(v36.weights, v36.total_weight, &v36_total);
+    EXPECT_EQ(w->total_weight, v36_total);
+    EXPECT_EQ(w->weights, v36_norm);
+    ASSERT_EQ(w->weights.size(), 3u);
+    EXPECT_EQ(w->weights.count(script2), 1u) << "the parent's own miner is in the v36 window";
+    EXPECT_GT(w->weights.at(script2), w->weights.at(script1)) << "depth decay";
+    EXPECT_GT(w->weights.at(script1), w->weights.at(script0)) << "depth decay";
+
+    // != the v16 walk (starts at the grandparent s1, so s2's miner is absent).
+    uint256 grandparent;
+    chain.get_share(tip).invoke([&](auto* obj) { grandparent = obj->m_prev_hash; });
+    const uint288 desired = chain::target_to_average_attempts(chain::bits_to_target(BLOCK_BITS))
+                            * p.spread * 65535u;
+    const auto v16 = dash::producer::get_cumulative_weights(chain, grandparent, 2, desired);
+    EXPECT_EQ(v16.weights.count(script2), 0u);
+    uint64_t v16_total = 0;
+    const auto v16_norm = normalised(v16.weights, v16.total_weight, &v16_total);
+    EXPECT_NE(w->weights, v16_norm);
+
+    // Unrooted and shorter than CHAIN_LENGTH: the v36 depth guard throws, the
+    // seam yields nullopt (the v16 walk would have returned weights).
+    ASSERT_GT(SharechainConfig::chain_length(), 3u);
+    dash::ShareChain unrooted;
+    const uint256 utip = build_v36_chain(unrooted, 3, BITS, PAST_TS, 20, 3, tag_hash(0x99));
+    EXPECT_THROW((void)dash::v36_pplns_window(unrooted, utip), std::invalid_argument);
+    EXPECT_FALSE(dash::mint::pplns_weights_for(unrooted, p, utip, BLOCK_BITS).has_value());
+
+    // Unknown prev / zero block bits: nullopt, as before.
+    EXPECT_FALSE(dash::mint::pplns_weights_for(chain, p, tag_hash(0x98), BLOCK_BITS).has_value());
+    EXPECT_FALSE(dash::mint::pplns_weights_for(chain, p, tip, 0).has_value());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// J. v36 mint ban-safety declines (the v16 DeclinesSolveBelowCommittedTarget twin)
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+// Header bytes with the nonce (bytes 76..79, little-endian) replaced.
+Bytes with_nonce(Bytes header, uint32_t nonce) {
+    for (int i = 0; i < 4; ++i) header.at(76 + i) = static_cast<uint8_t>(nonce >> (8 * i));
+    return header;
+}
+uint256 x11(const Bytes& b) { return dash::crypto::hash_x11(b.data(), b.size()); }
+uint32_t nonce_of(const Bytes& header) {
+    uint32_t n = 0;
+    for (int i = 3; i >= 0; --i) n = (n << 8) | header.at(76 + i);
+    return n;
+}
+} // namespace
+
+TEST(DashV36Flip, V36MintDeclinesSolveAboveTargetAndBrokenX11Identity)
+{
+    IdentityGuard guard;
+    const auto p = iso_prod_params();
+    const auto wd = make_wd();
+    dash::ShareChain chain;
+    const auto j = solve_job(chain, p, uint256(), h160(0x71), wd, 11, wd.m_curtime);
+    ASSERT_TRUE(j.built);
+    ASSERT_TRUE(j.solved);
+    const uint256 target = chain::bits_to_target(j.build.job.share_bits);
+    ASSERT_EQ(j.in.header_bytes.size(), 80u);
+    const uint32_t solved_nonce = nonce_of(j.in.header_bytes);
+    ASSERT_EQ(x11(j.in.header_bytes), j.in.pow_hash);
+
+    // Positive control: the untouched solve mints v36.
+    {
+        const auto m = mint_from_inputs_any(chain, p, j.in, j.build.frozen);
+        ASSERT_TRUE(m.has_value());
+        EXPECT_TRUE(m->is_v36());
+    }
+
+    // A second nonce that also meets the target, and one that does not.
+    std::optional<uint32_t> other_ok, above;
+    for (uint32_t n = solved_nonce + 1; n < solved_nonce + 4000000 && (!other_ok || !above); ++n) {
+        const uint256 h = x11(with_nonce(j.in.header_bytes, n));
+        if (h <= target) { if (!other_ok) other_ok = n; }
+        else if (!above) above = n;
+    }
+    ASSERT_TRUE(other_ok.has_value());
+    ASSERT_TRUE(above.has_value());
+
+    // (a) Above the committed target, identity intact (pow_hash == X11(header)):
+    //     declined by the pow <= committed-target guard.
+    {
+        auto in = j.in;
+        in.header_bytes = with_nonce(j.in.header_bytes, *above);
+        in.pow_hash = x11(in.header_bytes);
+        ASSERT_GT(in.pow_hash, target);
+        EXPECT_FALSE(mint_from_inputs_any(chain, p, in, j.build.frozen).has_value());
+    }
+    // (b) Header tampered to another VALID nonce, pow_hash left at the original:
+    //     the rebuilt share's X11 hash != pow_hash -> declined by the identity gate.
+    {
+        auto in = j.in;
+        in.header_bytes = with_nonce(j.in.header_bytes, *other_ok);
+        ASSERT_LE(x11(in.header_bytes), target);
+        EXPECT_FALSE(mint_from_inputs_any(chain, p, in, j.build.frozen).has_value());
+        // control: with the matching pow_hash the same header mints.
+        in.pow_hash = x11(in.header_bytes);
+        const auto m = mint_from_inputs_any(chain, p, in, j.build.frozen);
+        ASSERT_TRUE(m.has_value());
+        EXPECT_EQ(v36_of(*m).share.m_hash, in.pow_hash);
+    }
+    // (c) pow_hash tampered (a valid-looking hash under the target), header intact.
+    {
+        auto in = j.in;
+        in.pow_hash = x11(with_nonce(j.in.header_bytes, *other_ok));
+        ASSERT_NE(in.pow_hash, j.in.pow_hash);
+        EXPECT_FALSE(mint_from_inputs_any(chain, p, in, j.build.frozen).has_value());
+    }
+    // (d) A truncated header does not parse.
+    {
+        auto in = j.in;
+        in.header_bytes.resize(79);
+        EXPECT_FALSE(mint_from_inputs_any(chain, p, in, j.build.frozen).has_value());
+    }
 }
