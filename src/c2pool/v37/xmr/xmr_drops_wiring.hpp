@@ -218,8 +218,9 @@ inline DropsCarry compose_carry(const ::v37::LaneParams& p,
 // What every node can check about a carried delta, deterministically, from the
 // frame and the chain alone ("" = book it). `binds` = the frame's (bid, h_b,
 // cut, reward, owed_digest_at_win) equal the ON-CHAIN commitment of the block
-// being booked. A refused delta books as EMPTY -- what a DROPS-dormant winner
-// credits -- on every node alike, the winner included, so a refusal never forks.
+// being booked. ★ DROPS-CARRY-SUFFIX: what a node BOOKS never depends on this
+// check -- every node, the winner included, books its own lane composition
+// (DROPS-ENROL-LANE); a refusal is a witness mismatch (counted + ALARMed).
 inline std::string verify_carry(const DropsCarry& c, bool binds) {
     if (!binds) return "the carrying frame does not bind to the on-chain commitment (bid/h/cut/reward/owed_digest)";
     if (c.delta.size() > kDropsCarryMaxRows) return "more rows than the carriage bound";
@@ -280,7 +281,46 @@ struct LanePrefix {
     // ★ d5: per payee, (SUM give-author u16, receipts) over the folded base
     // (one row per payee, never pruned -- like base_first).
     std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> base_give;
+    // ★ DROPS-CARRY-SUFFIX: the lane positions the prefix covers (folded base +
+    // every listed receipt's pushes). Diagnostic on the own order; on a merged
+    // (repaired) prefix it is THE invariant: == P, else the prefix is partial.
+    std::uint64_t positions = 0;
     std::size_t receipts() const { return base_n + shares.size(); }
+};
+
+// ── (7b) ★ DROPS-CARRY-SUFFIX (capstone attempt 5, flip 1) ──────────────────
+// THE DEFECT. A receiver whose own order differs from the winner's at P takes
+// the relay repair; when the serving peer's vault no longer retains [0, a0)
+// (REPAIR-HORIZON) the served order covers only the SUFFIX [a0, P). The
+// settlement replay prepends OUR first a0 pushes (the digest gate at P
+// decides), but the DROPS prefix builder composed from the suffix alone,
+// labelled [0, P): every payee's first bin moved later and S shrank, so the
+// receivers booked a different enrolment book + delta than the winner and
+// the owed ledger split (h=2217148: 1080 receipts vs the winner's 2180).
+// THE FIX. The DROPS prefix is the receipt multiset the spine verified, WHOLE:
+// OUR lane log over [0, a0) (the same base the settlement replay used) + the
+// served [a0, P) (XmrDropsWiring::merged_prefix). Every receipt carries its
+// lane pushes, so the covered positions must equal P or the prefix HOLDs
+// (never composed from a part). A carried trailer stays a witness; a
+// mismatch on an honest node is an ALARM, never a different booking rule.
+#define C2POOL_XMR_DROPS_CARRY_SUFFIX 1
+struct ServedShare {   // one served (repaired) receipt of [a0, P), in the serving peer's order
+    bytes32 payee{};
+    std::uint64_t bin = 0;
+    std::uint16_t give = 0;
+    std::uint32_t n = 1;   // its lane pushes (fee model: payee + donation)
+};
+// Why a prefix HOLDs. retry=false = an invariant broke (the caller ALARMs).
+struct PrefixWhy { std::string text; bool retry = true; };
+// A reconstructed winner-side order, receipt by receipt: the DROPS mirror of
+// a relay repair SHADOW (xmr_repair_replay.hpp). When the settlement replay
+// reaches a later spine from a shadow's [0, a0) instead of our own order,
+// the DROPS prefix takes [0, a0) from the record of that shadow.
+struct PrefixRecord {
+    std::uint64_t P = 0;
+    LanePrefix fold;                 // the folded base [0, base_end) (no shares)
+    std::uint64_t base_end = 0;
+    std::vector<std::pair<std::uint64_t, ServedShare>> list;   // (first position, receipt) over [base_end, P)
 };
 
 // ★ XMR-DROPS-DEFAULT d5 (fee model ON). The REPLACE delta is in WHOLE-receipt
@@ -927,7 +967,7 @@ public:
             ++m_lane_below_base;
             return;
         }
-        m_lane_pos[pos_first] = LanePos{payee, bin, prev_id, give};
+        m_lane_pos[pos_first] = LanePos{payee, bin, prev_id, give, n ? n : 1};
         m_lane_pos_max = std::max(m_lane_pos_max, m_lane_pos.size());
         if (pos_first == m_lane_contig) m_lane_contig = pos_first + (n ? n : 1);
         else if (pos_first > m_lane_contig) ++m_lane_gaps;   // our own log no longer covers [0, P) past here
@@ -989,6 +1029,7 @@ public:
             ++m_lane_base_counts[std::make_pair(e.payee, e.bin)];
             { auto& gv = m_lane_base_give[e.payee]; gv.first += e.give; gv.second += 1; }   // ★ d5
             ++m_lane_base_n;
+            m_lane_base_end = std::max(m_lane_base_end, it->first + e.n);   // ★ DROPS-CARRY-SUFFIX
             ++n;
         }
         m_lane_base_P = it == m_lane_pos.end() ? std::max(m_lane_base_P, lim) : std::max(m_lane_base_P, it->first);
@@ -1040,6 +1081,96 @@ public:
                 e.bin = *b;
             }
             lp.shares.push_back(LaneShare{e.payee, e.bin, e.give});
+            lp.positions = std::max(lp.positions, it->first + e.n);   // ★ DROPS-CARRY-SUFFIX (diagnostic)
+        }
+        lp.positions = std::max(lp.positions, m_lane_base_end);
+        return lp;
+    }
+    // ★ DROPS-CARRY-SUFFIX: the prefix [0, P) of a REPAIRED cut. `served` = the
+    // receipts the relay repair fetched for [a0, P) (repair_a0(); 0 = the whole
+    // order), `a0` > 0 = the caller verified that OUR order over [0, a0) is the
+    // winner's (the settlement replay reached the spine from our own first a0
+    // pushes, or the serving peer's digest at a0 equals ours). The prefix is
+    // our log over [0, a0) -- the folded base + every entry below a0, which
+    // must tile [0, a0) exactly -- followed by `served`. INVARIANT: the covered
+    // positions reach P (the last receipt may straddle P, the own_prefix rule)
+    // and no receipt starts at or past P. nullopt + why = HOLD (retry=false:
+    // the served list itself is not [a0, P) -- the caller ALARMs); never a
+    // partial prefix. Pure: every node that verified the same spine builds the
+    // same multiset, so the same S, book and delta as the winner's own_prefix.
+    std::optional<LanePrefix> merged_prefix(std::uint64_t P, std::uint64_t a0, const std::vector<ServedShare>& served,
+                                            const BinOfFn& bin_of, PrefixWhy* why, const PrefixRecord* base = nullptr,
+                                            PrefixRecord* out = nullptr) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        const auto hold = [&](std::string t, bool retry) -> std::optional<LanePrefix> {
+            if (why) { why->text = std::move(t); why->retry = retry; }
+            return std::nullopt;
+        };
+        if (a0 > P) return hold("the served order starts at a0=" + std::to_string(a0) + " past P=" + std::to_string(P), false);
+        LanePrefix lp; lp.P = P;
+        PrefixRecord rec; rec.P = P;
+        std::uint64_t pos = 0;
+        const auto take = [&](std::uint64_t at, const ServedShare& x) {
+            lp.shares.push_back(LaneShare{x.payee, x.bin, x.give});
+            if (out) rec.list.emplace_back(at, x);
+        };
+        if (a0 > 0 && base) {   // [0, a0) from a reconstructed winner-side order (the relay's SHADOW base)
+            if (base->base_end > a0 || base->P < a0)
+                return hold("the shadow record covers [" + std::to_string(base->base_end) + "," + std::to_string(base->P) +
+                            ") which does not reach a0=" + std::to_string(a0) + " from its fold", true);
+            lp.base_P = base->fold.base_P; lp.base_n = base->fold.base_n; lp.base_first = base->fold.base_first;
+            lp.base_counts = base->fold.base_counts; lp.base_give = base->fold.base_give;
+            pos = base->base_end;
+            for (const auto& [at, x] : base->list) {
+                if (at >= a0) break;
+                if (at != pos) return hold("the shadow record does not tile [0,a0) at position " + std::to_string(at), true);
+                take(at, x); pos += x.n ? x.n : 1;
+            }
+            if (pos != a0) return hold("a receipt of the shadow record straddles a0=" + std::to_string(a0), true);
+        } else if (a0 > 0) {    // [0, a0) from OUR lane log
+            if (m_lane_contig < a0)
+                return hold("our lane log covers [0," + std::to_string(m_lane_contig) + ") < a0=" + std::to_string(a0), true);
+            if (m_lane_base_stale) return hold("our lane log was rewritten below its folded base", true);
+            if (m_lane_base_end > a0)
+                return hold("our folded lane-log base covers [0," + std::to_string(m_lane_base_end) + ") past a0=" + std::to_string(a0) +
+                            " (only [0,a0) of our order is verified)", true);
+            lp.base_P = m_lane_base_P; lp.base_n = m_lane_base_n;
+            lp.base_first = m_lane_base_first; lp.base_counts = m_lane_base_counts;
+            lp.base_give = m_lane_base_give;
+            pos = m_lane_base_end;
+            for (auto it = m_lane_pos.lower_bound(m_lane_base_P); it != m_lane_pos.end() && it->first < a0; ++it) {
+                if (it->first != pos)
+                    return hold("our lane log does not tile [0,a0): position " + std::to_string(it->first) + " != " + std::to_string(pos), true);
+                LanePos& e = it->second;
+                if (e.bin == 0) {
+                    const auto bb = bin_of ? bin_of(e.prev_id) : std::nullopt;
+                    if (!bb || *bb == 0)
+                        return hold("the origin bin of the receipt at lane position " + std::to_string(it->first) + " is not resolvable yet", true);
+                    e.bin = *bb;
+                }
+                take(it->first, ServedShare{e.payee, e.bin, e.give, e.n});
+                pos += e.n;
+            }
+            if (pos != a0)
+                return hold("our lane log covers [0," + std::to_string(pos) + ") at the served start a0=" + std::to_string(a0) +
+                            " (a receipt straddles a0)", true);
+        }
+        const std::uint64_t fold_end = a0 > 0 ? (base ? base->base_end : m_lane_base_end) : 0;
+        for (const auto& x : served) {
+            if (pos >= P) return hold("the served order lists a receipt at position " + std::to_string(pos) + " >= P", false);
+            if (x.bin == 0) return hold("a served receipt carries no origin bin", true);
+            take(pos, x);
+            pos += x.n ? x.n : 1;
+        }
+        lp.positions = pos;
+        if (pos < P)
+            return hold("prefix positions " + std::to_string(pos) + " != P=" + std::to_string(P) + " (a0=" + std::to_string(a0) +
+                        ", served " + std::to_string(served.size()) + " receipts): not the whole [0,P)", false);
+        if (out) {   // the receipt-by-receipt order this prefix IS (the DROPS mirror of the relay's new shadow)
+            rec.fold.base_P = lp.base_P; rec.fold.base_n = lp.base_n; rec.fold.base_first = lp.base_first;
+            rec.fold.base_counts = lp.base_counts; rec.fold.base_give = lp.base_give;
+            rec.base_end = fold_end;
+            *out = std::move(rec);
         }
         return lp;
     }
@@ -1181,7 +1312,8 @@ private:
     // ★ DROPS-ENROL-LANE (under m_hmtx): our own lane order, one entry per
     // receipt (its first position), and how far it covers [0, P) contiguously.
     // Only ever filled under the flip (the wiring does not exist at flip 0).
-    struct LanePos { bytes32 payee{}; std::uint64_t bin = 0; bytes32 prev_id{}; std::uint16_t give = 0; };
+    struct LanePos { bytes32 payee{}; std::uint64_t bin = 0; bytes32 prev_id{}; std::uint16_t give = 0;
+                     std::uint32_t n = 1; };   // ★ DROPS-CARRY-SUFFIX: its lane pushes
     std::map<std::uint64_t, LanePos> m_lane_pos;
     std::uint64_t m_lane_contig = 0, m_lane_gaps = 0;
     std::set<bytes32> m_enrol_set;
@@ -1194,6 +1326,7 @@ private:
     std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> m_lane_base_give;   // ★ d5 (SUM give, n) per payee
     ShareCounts m_lane_base_counts;
     bool m_lane_base_stale = false;
+    std::uint64_t m_lane_base_end = 0;   // ★ DROPS-CARRY-SUFFIX: the positions the fold covers ([0, base_end))
     bool m_lane_only = false;
 };
 

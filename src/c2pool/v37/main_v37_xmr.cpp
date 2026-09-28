@@ -1802,7 +1802,16 @@ static int run_live(const XmrNodeConfig& cfg) {
         c2pool::v37n::xmr::drops::XmrDropsWiring::LaneCompose lc;
         c2pool::v37n::xmr::drops::DropsCarry carry;
         std::pair<std::uint64_t, std::uint64_t> rg{0, 0};
+        const char* src = "own";                  // ★ DROPS-CARRY-SUFFIX: own | full | suffix
+        std::uint64_t a0 = 0, positions = 0;      // the served start, the prefix positions (== P)
     };
+    // ★ DROPS-CARRY-SUFFIX: prefixes merged from our [0,a0) + a served suffix,
+    // suffix repairs HELD (our [0,a0) not the verified base), prefix-invariant
+    // ALARMs (positions != P) and carried-witness mismatches on this node.
+    std::uint64_t drops_lane_shadow_prefix = 0;
+    std::uint64_t drops_lane_suffix_prefix = 0, drops_lane_hold_a0 = 0, drops_prefix_alarms = 0, drops_carry_mismatch_alarms = 0;
+    std::set<std::string> drops_prefix_alarmed;
+    const char* drops_prefix_src = "own"; std::uint64_t drops_prefix_a0 = 0;
     std::uint64_t drops_lane_composed = 0, drops_lane_nowin = 0, drops_lane_hold = 0, drops_lane_own_prefix = 0, drops_lane_repaired_prefix = 0;
     // ★ DROPS-ENROL-TIDY: the on-chain credit cut of every lane block this node
     // composed, by height (the not-yet-final ones + the newest final one are the
@@ -1821,6 +1830,16 @@ static int run_live(const XmrNodeConfig& cfg) {
     // written durably to <data-dir>/lane<chain>.pushes and reloaded at boot.
     std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> feed_log;
     std::map<std::string, std::shared_ptr<const c2pool::v37n::SettlementView>> replay_cache;   // "P:spinehex" -> verified view (whole booking window)
+    // ★ DROPS-CARRY-SUFFIX: which [0, a0) the relay replay reached the spine from
+    // ("P:spinehex" -> (RepairReplayer::Base, a0)); the DROPS prefix of a suffix
+    // repair may use OUR lane log over [0, a0) only when it was our own order.
+    struct ReplayBase { int base = 0; std::uint64_t a0 = 0; std::string shadow_key; };   // shadow_key = "L:digesthex" of the shadow used
+    std::map<std::string, ReplayBase> replay_base;
+    // ★ DROPS-CARRY-SUFFIX: the DROPS mirror of the relay's shadows -- every
+    // merged (repaired) prefix, receipt by receipt, keyed "P:spinehex" (the
+    // end of the winner-side order it is); bounded like the shadows.
+    std::map<std::string, c2pool::v37n::xmr::drops::PrefixRecord> drops_records;
+    std::deque<std::string> drops_record_lru;
     // GAP-2 relay state. Constructed in the option-B branch when --relay-* is
     // given; null = the relay is off and every path below is the stand-in one.
     // Declaration order = teardown order in reverse: everything the relay's
@@ -2032,8 +2051,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         // REPAIR-HORIZON: [0, a0) from OUR order, else from the shadow (the last
         // winner-side order reconstructed here); the digest gate at P decides.
         relay::RepairReplayer::Base base_used = relay::RepairReplayer::kNone;
+        std::pair<std::uint64_t, ::v37::bytes32> shadow_end{0, {}};   // ★ DROPS-CARRY-SUFFIX
         auto rv = relay_replayer.replay(cfg.lane_chain, cfg.lane_params, P, spine, a0, feed_log, pushes, &base_used,
-                                        peer_a0_digest, a0 ? relay_node->digest_at_deep(a0) : std::nullopt);   // REPAIR-CHAIN: any position
+                                        peer_a0_digest, a0 ? relay_node->digest_at_deep(a0) : std::nullopt,   // REPAIR-CHAIN: any position
+                                        &shadow_end);
         if (rv) relay_node->note_alt_digests(relay_replayer.shadow_digests());
         if (!rv) {
             relay_node->repair_reject(P, spine);
@@ -2043,6 +2064,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             return nullptr;
         }
         replay_cache[key] = rv; ++cut_repaired; ++relay_cut_repaired;
+        replay_base[key] = ReplayBase{static_cast<int>(base_used), a0,   // ★ DROPS-CARRY-SUFFIX
+                                      base_used == relay::RepairReplayer::kShadow
+                                          ? std::to_string(shadow_end.first) + ":" + hex_of(shadow_end.second) : std::string()};
         if (a0) ++relay_repair_suffix;
         if (base_used == relay::RepairReplayer::kShadow) ++relay_repair_shadow;
         std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, every one admitted here: RandomX-verified, or our own)%s\n",
@@ -2286,7 +2310,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (fin != drops_cut_at_h.begin()) drops_cut_at_h.erase(drops_cut_at_h.begin(), std::prev(fin));   // keep the newest final
         std::optional<std::uint64_t> oldest;
         for (const auto& [hh, P] : drops_cut_at_h) { (void)hh; oldest = oldest ? std::min(*oldest, P) : P; }
-        const std::uint64_t H = g_relay_vault_horizon ? g_relay_vault_horizon : 8640;   // == the relay's digest_at retention
+        // ★ DROPS-CARRY-SUFFIX: TWICE the relay's digest_at retention. A suffix
+        // repair's a0 is a PEER's vault horizon (its lane may trail ours), and
+        // merged_prefix needs our unfolded log from a0: a fold past a0 HOLDs.
+        const std::uint64_t H = 2 * (g_relay_vault_horizon ? g_relay_vault_horizon : 8640);
         drops->prune_lane_log(c2pool::v37n::xmr::drops::XmrDropsWiring::lane_prune_point(oldest, drops->lane_contig(), H), drops_bin_of);
     };
     auto drops_lane_prefix = [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::uint64_t hint, std::string& why)
@@ -2297,7 +2324,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!own) { bool mism = false; own = node.engine().settlement_view_by_cut(cfg.lane_chain, P, cc.spine_digest, &mism) != nullptr; }
         std::string owhy;
         if (own) {
-            if (auto lp = drops->own_prefix(P, drops_bin_of, &owhy)) { ++drops_lane_own_prefix; return lp; }
+            if (auto lp = drops->own_prefix(P, drops_bin_of, &owhy)) {
+                ++drops_lane_own_prefix; drops_prefix_src = "own"; drops_prefix_a0 = 0;
+                return lp;
+            }
         }
         if (!relay_node) { why = "cut-pending: drops lane prefix [0," + std::to_string(P) + ") not derivable (" + owhy + ")"; return std::nullopt; }
         std::vector<::v37::bytes32> ids;
@@ -2307,7 +2337,41 @@ static int run_live(const XmrNodeConfig& cfg) {
                   (owhy.empty() ? std::string() : " (own order: " + owhy + ")");
             return std::nullopt;
         }
-        c2pool::v37n::xmr::drops::LanePrefix lp; lp.P = P;
+        // ★ DROPS-CARRY-SUFFIX: `ids` cover [a0, P) only (repair_a0() > 0: the
+        // serving peer's vault horizon). The prefix is then OUR lane log over
+        // [0, a0) + the served suffix -- the SAME base the settlement replay
+        // prepended -- and only when that base is the one the spine verified:
+        // the serving peer's digest at a0 equals ours, or the replay of this cut
+        // reached the spine from our own first a0 pushes. A shadow base (or a
+        // replay not done yet) HOLDs: never a composition from a suffix.
+        std::optional<::v37::bytes32> peer_a0;
+        const std::uint64_t a0 = relay_node->repair_a0(P, cc.spine_digest, &peer_a0);
+        const std::string pkey = std::to_string(P) + ":" + hex_of(cc.spine_digest);
+        const c2pool::v37n::xmr::drops::PrefixRecord* shadow_rec = nullptr;
+        if (a0 > 0) {
+            bool own_base = false;
+            if (peer_a0) if (const auto ours = relay_node->digest_at_deep(a0); ours && *ours == *peer_a0) own_base = true;
+            if (!own_base) {
+                const auto rb = replay_base.find(pkey);
+                own_base = rb != replay_base.end() && rb->second.a0 == a0 &&
+                           rb->second.base == static_cast<int>(relay::RepairReplayer::kOwn);
+                if (!own_base && rb != replay_base.end() && rb->second.a0 == a0 &&
+                    rb->second.base == static_cast<int>(relay::RepairReplayer::kShadow))
+                    if (const auto ri = drops_records.find(rb->second.shadow_key); ri != drops_records.end()) {
+                        shadow_rec = &ri->second; own_base = true;   // [0, a0) = that shadow's DROPS record
+                    }
+            }
+            if (!own_base) {
+                ++drops_lane_hold_a0;
+                why = "cut-pending: drops lane prefix of P=" + std::to_string(P) + ": the served order is the SUFFIX [" + std::to_string(a0) +
+                      "," + std::to_string(P) + ") and our [0," + std::to_string(a0) + ") is not the order the spine verified "
+                      "(shadow base, or the settlement replay is pending) -- HOLD, never composed from a suffix";
+                return std::nullopt;
+            }
+        }
+        const bool fee_on = c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params);
+        std::vector<c2pool::v37n::xmr::drops::ServedShare> served;
+        served.reserve(ids.size());
         for (const auto& id : ids) {
             ::v37::ScriptRef payee; std::uint64_t bin = 0; std::vector<std::uint8_t> raw;
             if (!relay_node->cached_share(id, payee, bin, raw)) { why = "cut-pending: a repaired receipt left the verified cache (drops lane prefix; retry)"; return std::nullopt; }
@@ -2319,9 +2383,36 @@ static int run_live(const XmrNodeConfig& cfg) {
                     if (const auto b = drops_bin_of(pb.prev_id)) bin = *b;
                 if (bin == 0) { why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (drops lane prefix; retry)"; return std::nullopt; }
             }
-            lp.shares.push_back(c2pool::v37n::xmr::drops::LaneShare{::v37::xmr::xmr_identity_key(payee), bin, give});
+            // its lane pushes: the SAME split the live ingest and the settlement replay apply
+            const auto n = c2pool::v37n::xmr::fee::receipt_lane_pushes(payee, give, fee_on, relay::kReceiptWeight,
+                                                                       donation_net_of(cfg.network)).size();
+            served.push_back(c2pool::v37n::xmr::drops::ServedShare{::v37::xmr::xmr_identity_key(payee), bin, give,
+                                                                   static_cast<std::uint32_t>(n)});
+        }
+        c2pool::v37n::xmr::drops::PrefixWhy pw;
+        c2pool::v37n::xmr::drops::PrefixRecord rec;
+        auto lp = drops->merged_prefix(P, a0, served, drops_bin_of, &pw, shadow_rec, &rec);
+        if (!lp) {
+            if (!pw.retry && drops_prefix_alarmed.insert(pkey).second) {
+                ++drops_prefix_alarms;
+                std::printf("drops-ALARM prefix-positions: P=%llu spine=%s… a0=%llu served=%zu -- %s (HOLD: a DROPS prefix is composed only from the whole [0,P))\n",
+                            (unsigned long long)P, hex_of(cc.spine_digest).substr(0, 12).c_str(), (unsigned long long)a0, served.size(), pw.text.c_str());
+                std::fflush(stdout);
+            }
+            why = "cut-pending: drops lane prefix of P=" + std::to_string(P) + " not derivable yet: " + pw.text;
+            return std::nullopt;
         }
         ++drops_lane_repaired_prefix;
+        if (a0) ++drops_lane_suffix_prefix;
+        if (shadow_rec) ++drops_lane_shadow_prefix;
+        drops_prefix_src = shadow_rec ? "shadow" : a0 ? "suffix" : "full"; drops_prefix_a0 = a0;
+        if (!drops_records.count(pkey)) {   // the mirror of the shadow this order became (bounded, LRU)
+            drops_record_lru.push_back(pkey);
+            while (drops_record_lru.size() > 2 * relay::RepairReplayer::kMaxShadows + 4) {
+                drops_records.erase(drops_record_lru.front()); drops_record_lru.pop_front();
+            }
+        }
+        drops_records[pkey] = std::move(rec);
         return lp;
     };
     // THE composition of a lane block, on EVERY node: rows over range_for(h)
@@ -2333,6 +2424,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!rgo) { ++drops_lane_hold; why = "cut-pending: drops range below h=" + std::to_string(h) + " undecidable (canonical predecessor not readable yet)"; return false; }
         const auto lp = drops_lane_prefix(bk.credit_cut, relay_hint(bid), why);
         if (!lp) { ++drops_lane_hold; return false; }
+        // ★ DROPS-CARRY-SUFFIX (R5): the determinism guard -- a prefix is composed
+        // only when it covers exactly the cut [0, P), on every node alike
+        if (lp->P != bk.credit_cut.next_pos || lp->positions < bk.credit_cut.next_pos) {
+            ++drops_lane_hold;
+            why = "cut-pending: drops lane prefix covers " + std::to_string(lp->positions) + " positions < P=" + std::to_string(bk.credit_cut.next_pos);
+            return false;
+        }
+        out.src = drops_prefix_src; out.a0 = drops_prefix_a0; out.positions = lp->positions;
         out.rg = *rgo;
         drops_cut_at_h[h] = bk.credit_cut.next_pos;   // ★ DROPS-ENROL-TIDY: the reachable-cut set (lane-log bound)
         out.lc = drops->compose_lane(rgo->first, rgo->second, *lp);
@@ -2368,6 +2467,16 @@ static int run_live(const XmrNodeConfig& cfg) {
             rej = c2pool::v37n::xmr::drops::verify_carry(*wit->second.drops, binds, lane.carry.enrollment_digest);
             if (rej.empty() && wit->second.drops->delta != lane.carry.delta) rej = "the carried delta differs from the lane composition";
             if (rej.empty()) ++drops_carry_ok; else ++drops_carry_refused;
+            if (!rej.empty()) {   // ★ DROPS-CARRY-SUFFIX (R3): an honest mismatch is an ALARM; the booking is unchanged
+                ++drops_carry_mismatch_alarms;
+                std::printf("drops-ALARM carry-mismatch: h=%llu bid=%s… P=%llu a0=%llu src=%s prefix_positions=%llu prefix_receipts=%zu "
+                            "lane_digest=%s… winner_digest=%s… -- %s (booked: this node's lane composition, the winner's rule too)\n",
+                            (unsigned long long)h, bid.substr(0, 12).c_str(), (unsigned long long)bk.credit_cut.next_pos,
+                            (unsigned long long)lane.a0, lane.src, (unsigned long long)lane.positions, lane.lc.prefix_shares,
+                            hex_of(lane.carry.enrollment_digest).substr(0, 12).c_str(),
+                            hex_of(wit->second.drops->enrollment_digest).substr(0, 12).c_str(), rej.c_str());
+                std::fflush(stdout);
+            }
         } else ++drops_lane_nowin;
         if (drops_store) {   // ★ DROPS-RESTART: journal BEFORE the node books it (a re-drive books exactly this)
             if (have && rej.empty() && !drops_store->has_frame(bid)) {   // a verified carried frame: servable after a restart
@@ -2384,10 +2493,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         if (hand_to_node) drops->set_carried(lane.carry.delta);
         long long csum = 0; for (const auto& [k, v] : lane.carry.delta) csum += v;
-        std::printf("drops-carry-book: h=%llu bid=%s… LANE delta_payees=%zu delta_sum=%lld lane_digest=%s… P=%llu prefix_shares=%zu | carried %s%s\n",
+        std::printf("drops-carry-book: h=%llu bid=%s… LANE delta_payees=%zu delta_sum=%lld lane_digest=%s… P=%llu prefix_shares=%zu "
+                    "prefix_positions=%llu src=%s a0=%llu | carried %s%s\n",
                     (unsigned long long)h, bid.substr(0, 12).c_str(), lane.carry.delta.size(), csum,
                     hex_of(lane.carry.enrollment_digest).substr(0, 12).c_str(), (unsigned long long)bk.credit_cut.next_pos,
-                    lane.lc.prefix_shares,
+                    lane.lc.prefix_shares, (unsigned long long)lane.positions, lane.src, (unsigned long long)lane.a0,
                     !have ? "none (composed from the lane prefix without the winner's frame)" : rej.empty() ? "AGREES" : "REFUSED",
                     rej.empty() ? "" : (" -- " + rej + " (winner_digest=" + hex_of(wit->second.drops->enrollment_digest).substr(0, 12) + "…)").c_str());
         return true;
@@ -2663,9 +2773,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                 wc.d.bid = bw.bid; wc.d.h_b = bw.h_b; wc.d.cut_next_pos = bw.cut_next_pos; wc.d.cut_spine_digest = bw.cut_spine_digest;
                 wc.d.reward = bw.reward; wc.d.payout_emitted = bw.payout_emitted; wc.d.owed_digest_at_win = bw.owed_digest_at_win;
                 wc.drops = carry;
-                std::printf("drops-carry-tx: own win h=%llu bid=%s… composed rows=%zu delta_payees=%zu digest=%s… -> FB_BLOCK_WON v0x02 %zu B to %zu relay peer(s)\n",
+                std::printf("drops-carry-tx: own win h=%llu bid=%s… composed rows=%zu delta_payees=%zu digest=%s… prefix_positions=%llu src=%s -> FB_BLOCK_WON v0x02 %zu B to %zu relay peer(s)\n",
                             (unsigned long long)h, bid.substr(0, 12).c_str(), rows.size(), carry.delta.size(),
-                            hex_of(carry.enrollment_digest).substr(0, 12).c_str(), relay::encode_block_won(bw).size(), n);
+                            hex_of(carry.enrollment_digest).substr(0, 12).c_str(), (unsigned long long)drops_lane.positions, drops_lane.src, relay::encode_block_won(bw).size(), n);
                 own_won.erase(ow);
             }
             if (!drops_take_carry(h, bid, bk, why, true, drops_lane)) return false;
@@ -4248,11 +4358,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)drops_prepub_resumed);
                 drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
                 const auto ll = drops->lane_log_stats();
-                std::printf("  drops-lane: composed=%llu without_winner_frame=%llu hold=%llu prefix own=%llu repaired=%llu | carried agrees=%llu refused=%llu "
+                std::printf("  drops-lane: composed=%llu without_winner_frame=%llu hold=%llu prefix own=%llu repaired=%llu suffix=%llu shadow=%llu hold_a0=%llu "
+                            "prefix_alarms=%llu | carried agrees=%llu refused=%llu mismatch_alarms=%llu "
                             "| own lane log contiguous_to=%llu gaps=%llu | lane-log entries=%zu max=%zu base_P=%llu folded=%zu base_payees=%zu base_counts=%zu below_base=%llu%s\n",
                             (unsigned long long)drops_lane_composed, (unsigned long long)drops_lane_nowin, (unsigned long long)drops_lane_hold,
                             (unsigned long long)drops_lane_own_prefix, (unsigned long long)drops_lane_repaired_prefix,
+                            (unsigned long long)drops_lane_suffix_prefix, (unsigned long long)drops_lane_shadow_prefix,
+                            (unsigned long long)drops_lane_hold_a0,
+                            (unsigned long long)drops_prefix_alarms,
                             (unsigned long long)drops_carry_ok, (unsigned long long)drops_carry_refused,
+                            (unsigned long long)drops_carry_mismatch_alarms,
                             (unsigned long long)drops->lane_contig(), (unsigned long long)drops->lane_gaps(),
                             ll.entries, ll.max_entries, (unsigned long long)ll.base_P, ll.base_n, ll.base_payees, ll.base_counts,
                             (unsigned long long)ll.below_base, ll.stale ? " STALE" : "");

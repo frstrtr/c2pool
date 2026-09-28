@@ -1122,6 +1122,16 @@ if (BUILD_TESTING)
     # --target lists.
     target_compile_definitions(v37_xmr_drops_enrol_tidy_kat PRIVATE
         V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
+    # DROPS-CARRY-SUFFIX (capstone attempt 5, flip 1): v37_xmr_drops_carry_suffix_kat
+    # -- a receiver whose relay repair served only the SUFFIX [a0, P) (the
+    # serving peer's vault horizon) composes the DROPS prefix from OUR lane log
+    # over [0, a0) + the served suffix (merged_prefix, positions == P or HOLD),
+    # so three nodes book the winner's book + delta and one owed ledger (no
+    # carried REFUSED, no lane_root_refused); never-a-clawback + one rule for
+    # the winner's own block; source pins. RED on the base, GREEN on the fix.
+    # ALSO on BOTH build.yml --target lists.
+    target_compile_definitions(v37_xmr_drops_carry_suffix_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # ------------------------------------------------------------------
     # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.
     #
