@@ -21,9 +21,12 @@
 //   (f) the private/isolated DASH v36 sharechain profile: keyed on the custom
 //       network id, exposes the v36 targets (share version 36, ratchet seed
 //       3600, P2PKH v36 donation, maintainer-only message authority, future-
-//       timestamp bound, emergency decay) while NOTHING consumes them yet:
-//       current_share_version stays 16 on both profiles, and every no-flag
-//       CoinParams field is pinned byte-identical to master.
+//       timestamp bound, emergency decay) while the share version is NOT
+//       consumed yet: current_share_version stays 16 on both profiles, and
+//       every no-flag CoinParams field is pinned byte-identical to master.
+//       (The future-timestamp bound IS consumed, by share_init_verify; its
+//       KATs live in test_dash_v36_future_timestamp*.cpp, linked into this
+//       same executable for the same process-global-identity reason.)
 //
 // OWN EXECUTABLE ON PURPOSE: the override lives in process-global statics.
 // test_dash_share_hash_link / test_dash_conformance hold goldens on the DEFAULT

@@ -4,6 +4,8 @@
 // Dash share v16 verification: hash_link, merkle, X11 PoW.
 // Simplified from LTC share_check.hpp — no segwit, no merged mining.
 // Reference: ref/p2pool-dash/p2pool/data.py Share.__init__() + check()
+// Future-timestamp bound (private/isolated v36 profile only; public v16 has
+// none, oracle parity) — see check_share_timestamp_bound.
 //
 // PPLNS formula (v16, pre-V36 linear weights):
 //   weight_per_share = target_to_average_attempts(share.target) * (65535 - donation_field)
@@ -23,6 +25,7 @@
 #include "share_types.hpp"
 #include "version_negotiation.hpp"   // dash::version_negotiation:: accept-path version gate
 #include "coin/gentx_coinbase.hpp"   // dash::coin::GentxCoinbase (won-block reconstruct SSOT hand-off)
+#include "config_pool.hpp"            // dash::SharechainConfig::share_profile() (future-timestamp gate)
 
 #include <core/coin_params.hpp>
 #include <core/donation.hpp>          // cross-coin COMBINED_DONATION_SCRIPT SSOT (Bucket-2)
@@ -37,6 +40,8 @@
 #include <btclibs/crypto/sha256.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -192,6 +197,47 @@ inline void check_share_target_valid(const uint256& target, const core::CoinPara
         throw std::invalid_argument("share target invalid");
 }
 
+// ── Future-timestamp bound (private/isolated v36 sharechain only) ────────────
+// Port of the LTC rule (ltc/share_check.hpp share_check step 1; oracle
+// p2pool-merged-v36 data.py Share.check()): a share whose timestamp is more
+// than 600 s ahead of the local clock is rejected. The public v16 network has
+// NO such rule — the p2pool-dash oracle (data.py check()) does not carry it —
+// so it is gated on SharechainConfig::share_profile().future_timestamp_bound,
+// which is true only on the private/isolated v36 profile (custom --network-id).
+//
+// A pure function of (timestamp, now) with no chain context, so it is the first
+// statement of share_init_verify: the earliest point every DASH share passes
+// (node receive, tracker verify / persisted re-verify, admit_share, producer
+// self-check). Typed over uint32_t rather than a share type so the v36 share
+// verifier reuses it unchanged. `now` is injectable for deterministic tests.
+inline constexpr uint32_t SHARE_TIMESTAMP_FUTURE_BOUND_SECS = 600;
+
+// The local clock in the same units/width as a share timestamp (LTC expression).
+inline uint32_t share_clock_now()
+{
+    return static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// Throws the LTC error text when `enabled` and share_timestamp > now + 600.
+// The sum is taken in 64 bits so a `now` near UINT32_MAX cannot wrap and turn
+// the bound into a reject-everything rule (LTC adds in uint32).
+inline void check_share_timestamp_bound(uint32_t share_timestamp, uint32_t now, bool enabled)
+{
+    if (!enabled)
+        return;
+    if (static_cast<uint64_t>(share_timestamp) >
+        static_cast<uint64_t>(now) + SHARE_TIMESTAMP_FUTURE_BOUND_SECS)
+        throw std::invalid_argument("share timestamp is too far in the future");
+}
+
+// The one place the per-network profile is read for this rule.
+inline bool future_timestamp_bound_active()
+{
+    return SharechainConfig::share_profile().future_timestamp_bound;
+}
+
 // Per-verify scratch globals (btc::share_check parity — additive, dash-fenced).
 // share_init_verify caches the share header X11 hash and whether it also met the
 // block target, so attempt_verify / the tracker can fire block callbacks without
@@ -212,6 +258,11 @@ inline uint256 share_init_verify(const DashShare& share,
                                  const core::CoinParams& params,
                                  bool check_pow = true)
 {
+    // Future-timestamp bound: no-op on the public v16 network; now+600 on the
+    // private/isolated v36 profile. First, before any hashing (cheapest reject).
+    check_share_timestamp_bound(share.m_timestamp, share_clock_now(),
+                                future_timestamp_bound_active());
+
     if (share.m_coinbase.m_data.size() < 2 || share.m_coinbase.m_data.size() > 100)
         throw std::invalid_argument("bad coinbase size");
 
