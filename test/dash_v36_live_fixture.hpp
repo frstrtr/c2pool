@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // Shared harness for the private/isolated DASH v36 sharechain node KATs
-// (test_dash_v36_live_variant.cpp, test_dash_v36_flip.cpp; both folded into
-// test_dash_node): identity / data-dir guards, easy-PoW params, a real X11
-// grind over the v16 and v36 producers, wire helpers and a ctx-bound
-// dash::NodeImpl over an identity-scoped LevelDB (LiveNode). Everything is in
-// an anonymous namespace: each including TU gets its own copy.
+// (test_dash_v36_live_variant.cpp, test_dash_v36_flip.cpp,
+// test_dash_v36_e2e.cpp; all folded into test_dash_node): identity / data-dir
+// guards, a fresh random isolated identity, easy-PoW params, a real X11 grind
+// over the v16 and v36 producers, wire helpers, a ctx-bound dash::NodeImpl
+// over an identity-scoped LevelDB (LiveNode) and a node-to-node share relay.
+// Everything is in an anonymous namespace: each including TU gets its own
+// copy.
 
 #include <gtest/gtest.h>
 
@@ -42,6 +44,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -225,6 +228,7 @@ struct ProbeNode : dash::NodeImpl {
     void hold_think_slot(bool hold) { m_think_running.store(hold); if (!hold) m_rethink_pending.store(false); }
     bool think_slot_held() const { return m_think_running.load(); }
     bool stored(const uint256& h) { return m_storage && m_storage->has_share(h); }
+    bool banned(const NetService& a) const { return is_banned(a); }
 };
 
 // A real ctx-bound dash::NodeImpl over an identity-scoped LevelDB: the node
@@ -237,6 +241,20 @@ struct LiveNode {
 
     LiveNode(const core::CoinParams& p, const std::string& sub)
         : cfg("dash-v36-live-kat")
+    {
+        start(p, sub);
+    }
+
+    // Same, with the process-global network flag set first (the testnet share
+    // floor / chain constants the node reads through SharechainConfig).
+    LiveNode(const core::CoinParams& p, const std::string& sub, bool testnet)
+        : cfg("dash-v36-live-kat")
+    {
+        SharechainConfig::is_testnet = testnet;
+        start(p, sub);
+    }
+
+    void start(const core::CoinParams& p, const std::string& sub)
     {
         node = std::make_unique<ProbeNode>(&ioc, &cfg);
         node->tracker().m_coin_params = p;   // before init_storage, as main_dash does
@@ -285,6 +303,89 @@ struct LiveNode {
         node->join_compute_pools();
         return node->tracker();
     }
+
+    uint256 best() { return node->best_share_hash(); }
+
+    // Pump until the node's elected best share is `h`.
+    bool wait_best(const uint256& h)
+    {
+        for (int i = 0; i < 400; ++i) {
+            if (node->best_share_hash() == h)
+                return true;
+            ioc.restart();
+            ioc.run_for(std::chrono::milliseconds(20));
+        }
+        return node->best_share_hash() == h;
+    }
+
+    // Pump until no think() cycle is running (nothing else is queued once the
+    // last receive / local add has been processed), then run `fn` under the
+    // node's own read guard. Returns false when the guard never came free.
+    template <typename F>
+    bool settled(F&& fn)
+    {
+        for (int i = 0; i < 400; ++i) {
+            ioc.restart();
+            ioc.run_for(std::chrono::milliseconds(10));
+            if (node->think_slot_held())
+                continue;
+            auto g = node->read_tracker();
+            if (!g)
+                continue;
+            fn(*g);
+            return true;
+        }
+        return false;
+    }
 };
+
+// A fresh private/isolated identity (16 hex id + 16 hex prefix) from
+// std::random_device, never one of the compiled public / testnet identities,
+// the reserved future v36 self-identity, or an all-'0' (public) spelling.
+struct IsoIdentity { std::string id, prefix; };
+
+IsoIdentity fresh_iso_identity()
+{
+    static const char* const RESERVED[] = {
+        "7242ef345e1bed6b", "3b3e1286f446b891",   // public p2pool-dash fleet
+        "b6deb1e543fe2427", "198b644f6821e3b3",   // public testnet
+        "ac2785363c0180b8", "8d8516bac9edd280",   // reserved v36 self-identity
+    };
+    std::random_device rd;
+    auto hex16 = [&rd] {
+        static const char* d = "0123456789abcdef";
+        std::string h;
+        for (int i = 0; i < 16; ++i) h.push_back(d[rd() & 0xf]);
+        return h;
+    };
+    auto ok = [&](const std::string& h) {
+        if (SharechainConfig::is_public_network_id(h)) return false;
+        for (const char* r : RESERVED) if (h == r) return false;
+        return true;
+    };
+    for (;;) {
+        IsoIdentity i{hex16(), hex16()};
+        if (ok(i.id) && ok(i.prefix) && i.id != i.prefix)
+            return i;
+    }
+}
+
+// Relay one share from `from`'s tracker to `to` as a peer would: the share's
+// wire bytes -> load_share -> processing_shares.
+bool relay(LiveNode& from, LiveNode& to, const uint256& h)
+{
+    Bytes wire;
+    uint64_t type = 0;
+    const bool ok = from.settled([&](dash::ShareTracker& t) {
+        if (!t.chain.contains(h)) return;
+        auto& v = t.chain.get_share(h);
+        type = static_cast<uint64_t>(v.version());
+        wire = wire_of_variant(v);
+    });
+    if (!ok || wire.empty())
+        return false;
+    to.receive({{type, wire}});
+    return true;
+}
 
 } // namespace
