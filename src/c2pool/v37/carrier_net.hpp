@@ -391,8 +391,25 @@ public:
             if (it == m_conns.end()) return;
             c = it->second;
         }
+        // RELAY-SEND-QUEUE: a refusal must not discard what we already queued
+        // on this link (above all our own HELLO, so the refused side still learns
+        // our tag and logs its TAG_MISMATCH, as with the old blocking send). Let
+        // the writer drain the queue first, bounded so a stuck peer cannot hold
+        // the caller (the reader thread) for long.
+        if (c->async) {
+            const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDisconnectFlushMs);
+            for (;;) {
+                {
+                    std::lock_guard<std::mutex> ql(c->qmtx);
+                    if (c->qbytes == 0 || c->qstop) break;
+                }
+                if (std::chrono::steady_clock::now() >= dl) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
         drop_conn(c, /*hard=*/true, /*slow=*/false);
     }
+    static constexpr int kDisconnectFlushMs = 500;
 
     // Dial a peer (the --peer path). Returns true if the connection was
     // established and added as a full duplex peer. Safe to call before or after
