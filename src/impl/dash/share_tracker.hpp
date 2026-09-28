@@ -677,15 +677,21 @@ public:
         m_block_abs_height_fn = std::move(fn);
     }
 
-    // Seed (DASH v36 network only: naughty = 1 when the share's block would
-    // pay more than the block reward plus the fee allowance, naughty_seed.hpp;
-    // every input is committed share content, so every node marks a share the
-    // same way), then the oracle's parent propagation,
-    // which overrides the seed when the parent is naughty: naughty = 1 +
-    // parent, 0 past 6 generations (data.py check(): the reward check runs
-    // first, the naughty-ancestor block after it). Runs for every share that
-    // becomes verified (attempt_verify) and for the verified shares restored
-    // from the store (reseed_naughty), parent before child.
+    // The excessive-reward test (naughty_seed.hpp: the share's block would pay
+    // more than the block reward plus the fee allowance; every input is
+    // committed share content, so every node judges a share the same way).
+    // On the DASH v36 network it is REPORTED ONLY (p2pool v35 parity): a
+    // warning and m_excessive_reward_warnings, naughty untouched. The seed
+    // (naughty = 1) is gated by naughty_seed_active(), false on both networks.
+    // Then the oracle's parent propagation, which overrides the seed when the
+    // parent is naughty: naughty = 1 + parent, 0 past 6 generations (data.py
+    // check(): the reward check runs first, the naughty-ancestor block after
+    // it). Runs for every share that becomes verified (attempt_verify) and for
+    // the verified shares restored from the store (reseed_naughty), parent
+    // before child, so a restored share is counted again.
+    std::atomic<uint64_t> m_excessive_reward_warnings{0};   // read by the web thread
+    uint64_t excessive_reward_warnings() const { return m_excessive_reward_warnings.load(std::memory_order_relaxed); }
+
     void mark_naughty(const uint256& share_hash)
     {
         if (!chain.contains(share_hash))
@@ -697,7 +703,8 @@ public:
         auto& share_var = chain.get_share(share_hash);
         share_var.invoke([&](auto* obj) { prev_hash = obj->m_prev_hash; });
 
-        if (naughty_seed_active() && m_block_abs_height_fn) {
+        const bool seed = naughty_seed_active();
+        if ((seed || excessive_reward_warning_active()) && m_block_abs_height_fn) {
             uint256 prev_block;
             uint64_t subsidy = 0;
             size_t branch_len = 0;
@@ -708,9 +715,14 @@ public:
             });
             if (const auto h = m_block_abs_height_fn(prev_block)) {
                 const auto max = max_coinbase_value(*h + 1, m_coin_params.is_testnet, branch_len);
-                my_idx->naughty = excessive_reward(subsidy, max) ? 1 : 0;
-                if (my_idx->naughty)
-                    LOG_WARNING << "naughty share " << share_hash.ToString().substr(0, 16)
+                const bool excessive = excessive_reward(subsidy, max);
+                if (seed)
+                    my_idx->naughty = excessive ? 1 : 0;
+                else if (excessive)
+                    m_excessive_reward_warnings.fetch_add(1, std::memory_order_relaxed);
+                if (excessive)
+                    LOG_WARNING << (seed ? "naughty share " : "excessive-reward share (report only, not naughty) ")
+                                << share_hash.ToString().substr(0, 16)
                                 << ": excessive block reward (subsidy=" << subsidy
                                 << " max=" << *max << " height=" << (*h + 1)
                                 << " txs_committed=" << (commits_only_the_coinbase(branch_len) ? "1" : ">1")

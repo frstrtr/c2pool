@@ -1946,6 +1946,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 out["verified_count"] = snap.verified_count;
                 out["orphan_shares"]  = snap.orphan_shares;
                 out["dead_shares"]    = snap.dead_shares;
+                // Excessive-reward reports (DASH v36 network, report only; an
+                // atomic counter, safe to read off the IO thread).
+                if (dash::excessive_reward_warning_active())
+                    out["excessive_reward_shares"] = node_ptr->tracker().excessive_reward_warnings();
 
                 // ── Local-mint orphan/sibling gauge (display only) ─────────────
                 // snap.orphan_shares/dead_shares are the sharechain-wide StaleInfo
@@ -5130,13 +5134,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         header_chain = std::make_unique<dash::coin::HeaderChain>(dash_params, hdr_db);
         header_chain->init();
 
-        // Naughty seed (DASH v36 network only; naughty_seed.hpp): the share
-        // tracker needs the height of a share's parent block to know the block
-        // reward it may pay (the p2pool block_abs_height_func). Our own SPV
-        // header store is the source (daemonless). The public v16 network has
-        // no seed (p2pool-dash has none): nothing is wired there. An unknown
-        // parent block leaves the share unseeded, as in the oracle.
-        if (dash::naughty_seed_active()) {
+        // Excessive-reward test (DASH v36 network: report only; naughty_seed.hpp):
+        // the share tracker needs the height of a share's parent block to know
+        // the block reward it may pay (the p2pool block_abs_height_func). Our
+        // own SPV header store is the source (daemonless). The public v16
+        // network has no such test (p2pool-dash has none): nothing is wired
+        // there. An unknown parent block leaves the share unjudged.
+        if (dash::naughty_seed_active() || dash::excessive_reward_warning_active()) {
             auto* hc = header_chain.get();
             p2p_node.set_block_abs_height_fn(
                 [hc](const uint256& block_hash) -> std::optional<uint32_t> {
@@ -5146,7 +5150,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 });
             // The store restore ran before this hook existed.
             p2p_node.reseed_naughty();
-            std::cout << "[run] naughty seed ARMED (DASH v36 network: excessive block reward)\n";
+            std::cout << (dash::naughty_seed_active()
+                              ? "[run] naughty seed ARMED (excessive block reward)\n"
+                              : "[run] excessive-reward check ARMED (DASH v36 network: report only, never naughty)\n");
         }
 
         // CROSS-LANE ASYMMETRY CLOSED: HeaderChain::is_synced() was DEFINED

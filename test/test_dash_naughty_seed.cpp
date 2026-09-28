@@ -75,7 +75,7 @@ TEST(DashNaughtySeed, ChildGenerationClampsAtSix)
     EXPECT_EQ(dash::naughty_child_generation(6), 0) << "7th generation is forgiven";
 }
 
-TEST(DashNaughtySeed, ProfileGateOnlyOnTheV36Network)
+TEST(DashNaughtySeed, ProfileGateSeedOffWarningOnlyOnTheV36Network)
 {
     IdentityReset guard;
     EXPECT_FALSE(dash::naughty_seed_active()) << "public v16: p2pool-dash has no naughty seed";
@@ -83,11 +83,16 @@ TEST(DashNaughtySeed, ProfileGateOnlyOnTheV36Network)
     EXPECT_EQ(SharechainConfig::PUBLIC_PROFILE.naughty_fee_allowance_x_reward, 0u);
     EXPECT_EQ(SharechainConfig::ISOLATED_V36_PROFILE.naughty_fee_allowance_x_reward, 1u)
         << "one block reward of fees on the DASH v36 network";
+    EXPECT_FALSE(dash::excessive_reward_warning_active());
+    EXPECT_FALSE(SharechainConfig::PUBLIC_PROFILE.excessive_reward_warning);
     SharechainConfig::set_network_id("d3a5c0920263617", "0badc0ffee11");
-    EXPECT_TRUE(dash::naughty_seed_active()) << "the DASH v36 network seeds it";
-    EXPECT_TRUE(SharechainConfig::ISOLATED_V36_PROFILE.naughty_seed);
+    EXPECT_FALSE(dash::naughty_seed_active()) << "the DASH v36 network: p2pool v35 parity, no seed";
+    EXPECT_FALSE(SharechainConfig::ISOLATED_V36_PROFILE.naughty_seed);
+    EXPECT_TRUE(dash::excessive_reward_warning_active()) << "reported only";
+    EXPECT_TRUE(SharechainConfig::ISOLATED_V36_PROFILE.excessive_reward_warning);
     SharechainConfig::reset_network_id();
     EXPECT_FALSE(dash::naughty_seed_active());
+    EXPECT_FALSE(dash::excessive_reward_warning_active());
 }
 
 // ── The template's transaction fees (DASH v36 network) ──────────────────────

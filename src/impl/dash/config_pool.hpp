@@ -215,18 +215,24 @@ struct SharechainConfig
     ///                                     share_tracker.hpp mark_naughty seeds
     ///                                     naughty = 1 on a share whose block
     ///                                     would pay more than the block reward
-    ///                                     (the p2pool excessive-reward rule).
-    ///                                     The public v16 network has no seed
-    ///                                     (p2pool-dash has none).
+    ///                                     (the pre-v34 p2pool excessive-reward
+    ///                                     rule). False on BOTH networks: the
+    ///                                     v35+ p2pool lineage gates the rule
+    ///                                     off (VERSION < 34) and the DASH v36
+    ///                                     network follows it.
+    ///   excessive_reward_warning       -> naughty_seed.hpp
+    ///                                     excessive_reward_warning_active(): the
+    ///                                     same test, reported only (a log line
+    ///                                     and a counter); it never touches
+    ///                                     naughty or head selection. On for the
+    ///                                     DASH v36 network, off on public v16.
     ///   naughty_fee_allowance_x_reward -> naughty_seed.hpp fee_allowance(): the
-    ///                                     fees (in block rewards) the seed
+    ///                                     fees (in block rewards) the test
     ///                                     accepts for a share whose coinbase
     ///                                     merkle_link commits transactions
     ///                                     (a peer cannot compute them). 0 for
-    ///                                     a coinbase-only share. A network-wide
-    ///                                     head-selection parameter: every node
-    ///                                     must run the same value. Unused
-    ///                                     where naughty_seed is false.
+    ///                                     a coinbase-only share. Unused where
+    ///                                     both flags above are false.
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -237,6 +243,7 @@ struct SharechainConfig
         bool     future_timestamp_bound;
         bool     emergency_decay;
         bool     naughty_seed;
+        bool     excessive_reward_warning;
         uint32_t naughty_fee_allowance_x_reward;
     };
 
@@ -249,6 +256,7 @@ struct SharechainConfig
         /*future_timestamp_bound=*/false,
         /*emergency_decay=*/false,
         /*naughty_seed=*/false,
+        /*excessive_reward_warning=*/false,
         /*naughty_fee_allowance_x_reward=*/0,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
@@ -259,7 +267,8 @@ struct SharechainConfig
         /*maintainer_only_authority=*/true,
         /*future_timestamp_bound=*/true,
         /*emergency_decay=*/true,
-        /*naughty_seed=*/true,
+        /*naughty_seed=*/false,   // p2pool v35+ parity: no excessive-reward seed
+        /*excessive_reward_warning=*/true,
         /*naughty_fee_allowance_x_reward=*/1,
     };
 

@@ -35,11 +35,12 @@
 //      v36 chain at the PRODUCTION testnet share floor into a --data-dir that a
 //      real c2pool-dash process then loads, and writes a manifest of what the
 //      two real processes must agree on.
-//   8. Naughty is decided from committed share content only: two nodes whose
-//      own templates differ (one carries transactions and fees, one is
-//      coinbase-only) mark the same four shares identically, and the node
-//      whose own template has no fees does not punish an honest high-fee
-//      share (NaughtyIsIdenticalOnNodesWithDifferentTemplates).
+//   8. The excessive-reward report is decided from committed share content
+//      only: two nodes whose own templates differ (one carries transactions
+//      and fees, one is coinbase-only) report the same shares, the node whose
+//      own template has no fees does not report an honest high-fee share, and
+//      no share is naughty (p2pool v35 parity)
+//      (ExcessiveRewardReportIsIdenticalOnNodesWithDifferentTemplates).
 //
 // Folded into test_dash_node (needs dash::NodeImpl + c2pool_storage + the dash
 // OBJECT lib). The profile is keyed on the process-global SharechainConfig
@@ -793,13 +794,21 @@ TEST(DashV36E2E, OrphanedNodeAnnounces253InItsNextShareOnBothNodes)
 // 8. Naughty is identical on nodes with different templates: the seed reads
 //    only committed share content (subsidy, coinbase merkle_link length, the
 //    parent block's height), never the verifying node's own template or
-//    mempool, so the two nodes elect the same heads.
+//    mempool, so the two nodes report the same shares. Report only (p2pool v35
+//    parity): no share is naughty on either node.
 // ═════════════════════════════════════════════════════════════════════════════
 
 namespace {
 
 constexpr uint32_t NAUGHTY_PARENT_HEIGHT = 2'600'000;   // post-V20 on either network
 std::optional<uint32_t> naughty_stub_height(const uint256&) { return NAUGHTY_PARENT_HEIGHT; }
+
+uint64_t warnings_on(LiveNode& n)
+{
+    uint64_t v = 0;
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) { v = t.excessive_reward_warnings(); }));
+    return v;
+}
 
 int32_t naughty_on(LiveNode& n, const uint256& h)
 {
@@ -812,12 +821,13 @@ int32_t naughty_on(LiveNode& n, const uint256& h)
 
 } // namespace
 
-TEST(DashV36E2E, NaughtyIsIdenticalOnNodesWithDifferentTemplates)
+TEST(DashV36E2E, ExcessiveRewardReportIsIdenticalOnNodesWithDifferentTemplates)
 {
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_v36_e2e_naughty_fees");
     const auto f = fresh_iso();
-    ASSERT_TRUE(dash::naughty_seed_active());
+    ASSERT_FALSE(dash::naughty_seed_active());
+    ASSERT_TRUE(dash::excessive_reward_warning_active());
     TwoNodes rig(f.p, SharechainConfig::data_subdir(false));
     rig.a->node->set_block_abs_height_fn(naughty_stub_height);
     rig.b->node->set_block_abs_height_fn(naughty_stub_height);
@@ -845,17 +855,19 @@ TEST(DashV36E2E, NaughtyIsIdenticalOnNodesWithDifferentTemplates)
     const auto s_ok = rig.mint(1, s_hi.hash, MINER_B, t0 + 60, 64);
     ASSERT_FALSE(s_ok.hash.IsNull());
 
-    const std::pair<const Minted*, int32_t> expect[] = {
-        {&s_hi, 0}, {&s_bad, 1}, {&s_cb, 1}, {&s_ok, 0}};
+    const Minted* all[] = {&s_hi, &s_bad, &s_cb, &s_ok};
     const char* name[] = {"s_hi", "s_bad", "s_cb", "s_ok"};
     for (size_t i = 0; i < 4; ++i) {
         SCOPED_TRACE(name[i]);
-        const int32_t na = naughty_on(*rig.a, expect[i].first->hash);
-        const int32_t nb = naughty_on(*rig.b, expect[i].first->hash);
-        EXPECT_EQ(na, nb) << "both nodes mark the share the same way";
-        EXPECT_EQ(na, expect[i].second);
-        EXPECT_EQ(nb, expect[i].second);
+        EXPECT_EQ(naughty_on(*rig.a, all[i]->hash), 0) << "report only: never naughty";
+        EXPECT_EQ(naughty_on(*rig.b, all[i]->hash), 0) << "report only: never naughty";
     }
-    EXPECT_EQ(naughty_on(*rig.b, s_hi.hash), 0)
-        << "a node whose own template has no fees does not punish an honest high-fee share";
+    // s_bad (above reward + allowance) and s_cb (one duff over a coinbase-only
+    // reward) are reported; the honest high-fee s_hi is not, even on node B
+    // whose own template has no fees.
+    const uint64_t wa = warnings_on(*rig.a);
+    const uint64_t wb = warnings_on(*rig.b);
+    EXPECT_EQ(wa, wb) << "both nodes report the same shares";
+    EXPECT_EQ(wa, 2u);
+    EXPECT_EQ(wb, 2u);
 }

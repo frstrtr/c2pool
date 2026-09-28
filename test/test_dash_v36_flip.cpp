@@ -1045,6 +1045,13 @@ uint256 mint_on(LiveNode& n, const core::CoinParams& p, const uint256& prev,
     return h;
 }
 
+uint64_t warnings_of(LiveNode& n)
+{
+    uint64_t v = 0;
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) { v = t.excessive_reward_warnings(); }));
+    return v;
+}
+
 int32_t naughty_of(LiveNode& n, const uint256& h)
 {
     int32_t v = -1;
@@ -1077,46 +1084,53 @@ std::vector<uint256> honest_base(LiveNode& n, const core::CoinParams& p, uint32_
 
 } // namespace
 
-TEST(DashV36Flip, ExcessiveRewardShareIsSeededNaughtyAndDescendantsInherit)
+TEST(DashV36Flip, ExcessiveRewardShareIsReportedNotNaughty)
 {
+    // p2pool v35 parity: the excessive-reward test is reported only (a warning
+    // and a counter); no share is seeded naughty and nothing is inherited.
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_v36_naughty_seed");
     const auto p = iso_prod_params();
+    ASSERT_FALSE(dash::naughty_seed_active());
+    ASSERT_TRUE(dash::excessive_reward_warning_active());
     LiveNode n(p, SharechainConfig::data_subdir(false));
     n.node->set_block_abs_height_fn(stub_height);
     uint32_t k = 0;
 
     // Coinbase-only template (merkle_link empty): the fees are exactly 0, so
-    // the exact rule applies (no fee allowance).
+    // the exact bound applies (no fee allowance).
     const uint256 g = mint_on(n, p, uint256(), h160(0x41), honest_max(), k++);
     ASSERT_FALSE(g.IsNull());
-    EXPECT_EQ(naughty_of(n, g), 0) << "paying exactly the block reward is honest";
+    EXPECT_EQ(naughty_of(n, g), 0);
+    EXPECT_EQ(warnings_of(n), 0u) << "paying exactly the block reward is honest";
 
     const uint256 x = mint_on(n, p, g, h160(0x42), honest_max() + 1, k++);
-    ASSERT_FALSE(x.IsNull()) << "a naughty share still verifies (it is not an invalid share)";
-    EXPECT_EQ(naughty_of(n, x), 1) << "excessive block reward";
+    ASSERT_FALSE(x.IsNull()) << "an over-paying share still verifies";
+    EXPECT_EQ(naughty_of(n, x), 0) << "report only: never naughty";
+    EXPECT_EQ(warnings_of(n), 1u) << "excessive block reward is reported";
 
     uint256 prev = x;
     for (int gen = 2; gen <= 7; ++gen) {
         prev = mint_on(n, p, prev, h160(0x43), honest_max(), k++);
-        EXPECT_EQ(naughty_of(n, prev), gen <= 6 ? gen : 0) << "generation " << gen;
+        EXPECT_EQ(naughty_of(n, prev), 0) << "generation " << gen << ": nothing inherited";
     }
+    EXPECT_EQ(warnings_of(n), 1u) << "honest descendants are not reported";
 
     // An under-paying share is honest.
     const uint256 u = mint_on(n, p, prev, h160(0x44), honest_max() - 1000, k++);
     EXPECT_EQ(naughty_of(n, u), 0);
+    EXPECT_EQ(warnings_of(n), 1u);
 }
 
 // The template's transaction fees (operator KATs 1-3 at node level). Three
 // template transactions: the share's coinbase merkle_link has 2 entries, so
-// the rule allows reward + one block reward of fees. The chain is linear on
-// honest parents so each share's naughty is its own seed.
+// the test allows reward + one block reward of fees.
 uint64_t honest_max_with_txs()
 {
     return 2 * honest_max();   // reward + fee allowance (one reward)
 }
 
-TEST(DashV36Flip, TemplateFeesInCoinbaseAreNotNaughty)
+TEST(DashV36Flip, TemplateFeesInCoinbaseAreNotReported)
 {
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_v36_naughty_fees_honest");
@@ -1133,14 +1147,15 @@ TEST(DashV36Flip, TemplateFeesInCoinbaseAreNotNaughty)
             EXPECT_EQ(obj->m_merkle_link.m_branch.size(), 2u) << "the share commits 3 transactions";
         });
     }));
-    EXPECT_EQ(naughty_of(n, g), 0) << "reward + the template's fees is an honest coinbase";
+    EXPECT_EQ(warnings_of(n), 0u) << "reward + the template's fees is an honest coinbase";
 
     // A share with a much larger fee total, still within one block reward.
     const uint256 c = mint_on(n, p, g, h160(0x46), honest_max() + honest_max() / 2, k++, wdt);
     EXPECT_EQ(naughty_of(n, c), 0);
+    EXPECT_EQ(warnings_of(n), 0u);
 }
 
-TEST(DashV36Flip, InflatedCoinbaseAboveFeeAllowanceIsNaughty)
+TEST(DashV36Flip, InflatedCoinbaseAboveFeeAllowanceIsReportedNotNaughty)
 {
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_v36_naughty_fees_inflated");
@@ -1152,15 +1167,16 @@ TEST(DashV36Flip, InflatedCoinbaseAboveFeeAllowanceIsNaughty)
 
     const uint256 g = mint_on(n, p, uint256(), h160(0x47), honest_max(), k++, wdt);
     ASSERT_FALSE(g.IsNull());
-    EXPECT_EQ(naughty_of(n, g), 0);
+    EXPECT_EQ(warnings_of(n), 0u);
     const uint256 x = mint_on(n, p, g, h160(0x48), honest_max_with_txs() + 1, k++, wdt);
-    ASSERT_FALSE(x.IsNull()) << "a naughty share still verifies";
-    EXPECT_EQ(naughty_of(n, x), 1) << "more than reward + any plausible fees";
+    ASSERT_FALSE(x.IsNull()) << "an over-paying share still verifies";
+    EXPECT_EQ(warnings_of(n), 1u) << "more than reward + any plausible fees";
+    EXPECT_EQ(naughty_of(n, x), 0) << "report only";
     const uint256 c = mint_on(n, p, x, h160(0x49), honest_max(), k++, wdt);
-    EXPECT_EQ(naughty_of(n, c), 2) << "the child inherits 1 + parent";
+    EXPECT_EQ(naughty_of(n, c), 0) << "nothing inherited";
 }
 
-TEST(DashV36Flip, CoinbaseAtRewardPlusAllowanceIsNotNaughty)
+TEST(DashV36Flip, CoinbaseAtRewardPlusAllowanceIsNotReported)
 {
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_v36_naughty_fees_boundary");
@@ -1172,60 +1188,40 @@ TEST(DashV36Flip, CoinbaseAtRewardPlusAllowanceIsNotNaughty)
 
     const uint256 g = mint_on(n, p, uint256(), h160(0x4a), honest_max_with_txs(), k++, wdt);
     ASSERT_FALSE(g.IsNull());
-    EXPECT_EQ(naughty_of(n, g), 0) << "exactly reward + fee allowance (strictly greater rule)";
+    EXPECT_EQ(warnings_of(n), 0u) << "exactly reward + fee allowance (strictly greater rule)";
     const uint256 x = mint_on(n, p, g, h160(0x4b), honest_max_with_txs() + 1, k++, wdt);
-    EXPECT_EQ(naughty_of(n, x), 1) << "one duff above the boundary";
+    ASSERT_FALSE(x.IsNull());
+    EXPECT_EQ(warnings_of(n), 1u) << "one duff above the boundary";
 }
 
-TEST(DashV36Flip, HeadOnNaughtyShareLosesBestHeadSelection)
+TEST(DashV36Flip, OverPayingShareDoesNotChangeBestHeadSelection)
 {
+    // p2pool v35 parity: an over-paying share is not punished in head
+    // selection, so the longer branch on it wins as any other would.
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_v36_naughty_head");
     const auto p = iso_prod_params();
-
-    // (a) the naughty branch is LONGER: think() walks back past it and takes
-    //     the best non-naughty descendant of the common parent.
-    {
-        SCOPED_TRACE("naughty branch longer");
-        LiveNode n(p, SharechainConfig::data_subdir(false) + "_a");
-        n.node->set_block_abs_height_fn(stub_height);
-        uint32_t k = 0;
-        const auto base = honest_base(n, p, k);
-        const uint256 P = base.back();
-        const uint256 n1 = mint_on(n, p, P, h160(0x51), honest_max() + 1, k++);
-        const uint256 n2 = mint_on(n, p, n1, h160(0x52), honest_max(), k++);
-        const uint256 n3 = mint_on(n, p, n2, h160(0x53), honest_max(), k++);
-        const uint256 h1 = mint_on(n, p, P, h160(0x54), honest_max(), k++);
-        EXPECT_EQ(naughty_of(n, n1), 1);
-        EXPECT_EQ(naughty_of(n, n3), 3);
-        EXPECT_EQ(naughty_of(n, h1), 0);
-        EXPECT_TRUE(rethink_until_best(n, h1))
-            << "best=" << n.best().GetHex().substr(0, 16) << " n3=" << n3.GetHex().substr(0, 16);
-    }
-    // (b) equal length, the naughty head seen FIRST: one share of work is
-    //     deducted from it and the honest head wins.
-    {
-        SCOPED_TRACE("equal length, naughty seen first");
-        LiveNode n(p, SharechainConfig::data_subdir(false) + "_b");
-        n.node->set_block_abs_height_fn(stub_height);
-        uint32_t k = 0;
-        const auto base = honest_base(n, p, k);
-        const uint256 P = base.back();
-        const uint256 n1 = mint_on(n, p, P, h160(0x61), honest_max() + 1, k++);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // time_seen is in seconds
-        const uint256 h1 = mint_on(n, p, P, h160(0x62), honest_max(), k++);
-        EXPECT_EQ(naughty_of(n, n1), 1);
-        EXPECT_TRUE(rethink_until_best(n, h1))
-            << "best=" << n.best().GetHex().substr(0, 16) << " n1=" << n1.GetHex().substr(0, 16);
-    }
+    LiveNode n(p, SharechainConfig::data_subdir(false) + "_a");
+    n.node->set_block_abs_height_fn(stub_height);
+    uint32_t k = 0;
+    const auto base = honest_base(n, p, k);
+    const uint256 P = base.back();
+    const uint256 n1 = mint_on(n, p, P, h160(0x51), honest_max() + 1, k++);
+    const uint256 n2 = mint_on(n, p, n1, h160(0x52), honest_max(), k++);
+    const uint256 n3 = mint_on(n, p, n2, h160(0x53), honest_max(), k++);
+    const uint256 h1 = mint_on(n, p, P, h160(0x54), honest_max(), k++);
+    ASSERT_FALSE(h1.IsNull());
+    EXPECT_EQ(naughty_of(n, n1), 0);
+    EXPECT_EQ(naughty_of(n, n3), 0);
+    EXPECT_EQ(warnings_of(n), 1u) << "n1 is reported";
+    EXPECT_TRUE(rethink_until_best(n, n3))
+        << "best=" << n.best().GetHex().substr(0, 16) << " h1=" << h1.GetHex().substr(0, 16);
 }
 
-TEST(DashV36Flip, NaughtySurvivesStoreReload)
+TEST(DashV36Flip, StoreReloadSeedsNoNaughty)
 {
-    // A linear chain whose tail is naughty: think() walks back past the
-    // naughty shares, so the elected best is the last honest share P. (The
-    // store keeps one share per height, so the chain is linear: a sibling
-    // branch would not be restored.)
+    // After a restart the restored shares are re-judged (reseed_naughty): still
+    // report only, so no restored share is naughty and the head is unchanged.
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_v36_naughty_reload");
     const auto p = iso_prod_params();
@@ -1239,11 +1235,8 @@ TEST(DashV36Flip, NaughtySurvivesStoreReload)
         n1 = mint_on(n, p, P, h160(0x71), honest_max() + 1, k++);
         n2 = mint_on(n, p, n1, h160(0x72), honest_max(), k++);
         n3 = mint_on(n, p, n2, h160(0x73), honest_max(), k++);
-        EXPECT_EQ(naughty_of(n, n3), 3);
-        ASSERT_TRUE(rethink_until_best(n, P)) << "punished before the restart";
+        ASSERT_TRUE(rethink_until_best(n, n3)) << "not punished before the restart";
     }
-    // Restart on the same store; the height source is wired after the restore
-    // (the main_dash order) and the node re-seeds the restored shares.
     LiveNode n(p, sub);
     ASSERT_TRUE(n.settled([&](dash::ShareTracker& t) {
         for (const auto& h : {P, n1, n2, n3})
@@ -1251,11 +1244,10 @@ TEST(DashV36Flip, NaughtySurvivesStoreReload)
     }));
     n.node->set_block_abs_height_fn(stub_height);
     n.node->reseed_naughty();
-    EXPECT_EQ(naughty_of(n, P), 0);
-    EXPECT_EQ(naughty_of(n, n1), 1);
-    EXPECT_EQ(naughty_of(n, n2), 2);
-    EXPECT_EQ(naughty_of(n, n3), 3);
-    EXPECT_TRUE(rethink_until_best(n, P))
+    for (const auto& h : {P, n1, n2, n3})
+        EXPECT_EQ(naughty_of(n, h), 0);
+    EXPECT_GE(warnings_of(n), 1u) << "the over-paying share is reported again";
+    EXPECT_TRUE(rethink_until_best(n, n3))
         << "best=" << n.best().GetHex().substr(0, 16) << " n3=" << n3.GetHex().substr(0, 16);
 }
 
@@ -1274,6 +1266,8 @@ TEST(DashV36Flip, PublicV16NeverSeedsNaughty)
     const uint256 c = mint_on(n, p, x, h160(0x83), honest_max(), k++);
     ASSERT_FALSE(c.IsNull());
     EXPECT_EQ(naughty_of(n, x), 0) << "p2pool-dash has no naughty seed";
+    EXPECT_FALSE(dash::excessive_reward_warning_active());
+    EXPECT_EQ(warnings_of(n), 0u) << "no excessive-reward test on public v16";
     EXPECT_EQ(naughty_of(n, c), 0);
     EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) {
         EXPECT_EQ(t.chain.get_share(x).version(), 16);

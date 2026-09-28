@@ -2,34 +2,43 @@
 #pragma once
 
 // ============================================================================
-// naughty_seed.hpp — the rule that marks a share "naughty" (its block would be
-// invalid), for the DASH v36 network.
+// naughty_seed.hpp — the excessive-block-reward test (a share whose block
+// would pay more than dashd allows) and the naughty machinery it can drive.
 //
-// ORIGIN: this seed is a c2pool design decision for the DASH v36 network
-// (operator, 2026-09-28). It revives the pre-v34 p2pool rule from
-// share.check(); in the v35+ p2pool lineage that rule is gated
-// `if self.VERSION < 34` and is dead code, so no v35/v36 p2pool share is ever
-// seeded naughty, and no other c2pool lane seeds it either (the DGB lane only
-// has the propagation helper). What is kept from the p2pool lineage:
+// STATUS on the DASH v36 network (operator, 2026-09-28): p2pool v35 parity.
+// The test is REPORTED ONLY: a log line and a counter
+// (ShareTracker::excessive_reward_warnings()); it never seeds naughty and never
+// changes head selection. In the v35+ p2pool lineage the pre-v34 seed from
+// share.check() is gated `if self.VERSION < 34` and is dead code, so no
+// v35/v36 p2pool share is ever seeded naughty, and neither is any c2pool
+// share. Why the seed buys nothing a network needs:
+//   * a share's subsidy pays only that share's own generation transaction;
+//     PPLNS weights come from work, not from earlier shares' subsidies, so an
+//     over-paying share inflates nobody else's payout;
+//   * an over-paying share that does not solve a block harms no one; one that
+//     does is rejected by dashd ("bad-cb-amount"), and the seed cannot bring
+//     that block back;
+//   * doing it on purpose is block withholding, which a miner can do anyway,
+//     undetectably, by not submitting its block solutions;
+//   * the seed drives head selection, so any disagreement about it between
+//     nodes or builds (fees, heights, rule versions) splits the sharechain.
+// What the warning keeps: a build that pays itself too much shows up on every
+// node at once.
+//
+// The naughty machinery (naughty_seed_active(), the generation clamp, the
+// think() Phase 4/5 walk-back) is kept, gated off on both networks by
+// ShareProfile::naughty_seed = false, as it is in p2pool:
 //   * naughty starts at 0 (data.py Share.__init__);
-//   * the seed is the excessive-block-reward rule: when the height of the
-//     share's parent block is known, a share whose share_data subsidy
-//     exceeds base_subsidy(height) + fees of its transactions is
-//     naughty = 1 (below: how the fees are bounded when a peer cannot know
-//     them). Under-payment is a valid (if wasteful) block and is not
-//     punished; an unknown height leaves the share unseeded;
-//   * then a naughty parent overrides it: naughty = 1 + parent.naughty,
-//     reset to 0 past 6 generations;
+//   * a seeded share would get naughty = 1, a child of a naughty parent
+//     1 + parent.naughty, reset to 0 past 6 generations;
 //   * best-head selection deducts one share of work from a naughty head,
-//     sorts on -naughty, walks back past naughty shares and picks the best
-//     non-naughty descendant (share_tracker.hpp think() Phase 4/5).
+//     sorts on -naughty and walks back past naughty shares
+//     (share_tracker.hpp think() Phase 4/5).
 //
-// Where it applies:
-//   * the public v16 network: NEVER. p2pool-dash has no naughty field and no
-//     seed at all (data.py should_punish_reason: block solution and oversized
-//     blocks only), so a seed there would elect heads p2pool-dash peers do
-//     not. SharechainConfig::share_profile().naughty_seed is false.
-//   * the DASH v36 network: seeded, by the rule below.
+// Where the warning applies:
+//   * the public v16 network: never (p2pool-dash has no such test; its
+//     should_punish_reason is block solution and oversized blocks only).
+//   * the DASH v36 network: on, by the rule below.
 //
 // The dashd rule. A block is valid only if its coinbase pays no more than the
 // block reward plus the fees of its transactions, plus the superblock budget
@@ -62,7 +71,7 @@
 // 4/5), so two honest nodes with different mempools would mark different
 // shares naughty and elect different heads.
 //
-// The rule, from committed share content only (its subsidy, its merkle_link
+// The test, from committed share content only (its subsidy, its merkle_link
 // branch length L, the height of its committed parent block) and the network
 // profile, so every node marks every share the same way:
 //
@@ -74,29 +83,26 @@
 //   fee_allowance(h, L>0) = reward(h) * naughty_fee_allowance_x_reward
 //                                    (ShareProfile; 1 on the DASH v36 network):
 //                                    the most fees the rule treats as plausible;
-//   naughty = 1  iff  subsidy > max(h, L)          (strictly greater)
+//   excessive  iff  subsidy > max(h, L)            (strictly greater)
 //
-// It fails open: a share is naughty only when no plausible fee total explains
-// its coinbase. What the seed can and cannot do on a network whose blocks carry
+// It fails open: a share is reported only when no plausible fee total explains
+// its coinbase. What the test can and cannot do on a network whose blocks carry
 // transactions: it catches accidental over-payment (a build that pays itself
 // more than reward + one reward of fees, or any over-payment on a coinbase-only
 // block). It cannot stop a hostile node: that node can mine invalid-block
 // shares in ways no peer can see (an invalid transaction in its own template),
 // so a generous allowance loses nothing real. An honest block whose fees exceed
-// one block reward is marked naughty on every node alike (deterministic); the
-// cost is that share's head losing one share of work and a walk-back to the
-// last honest ancestor. The allowance is a network-wide head-selection
-// parameter: every node on the network must run the same value, so it is fixed
-// in the profile and changes only with a network-wide upgrade. Setting it to 0
-// keeps the exact rule for coinbase-only shares and exempts every share that
-// commits transactions (never naughty).
+// one block reward is reported on every node alike (deterministic), and
+// nothing else happens to it. Were the seed ever switched on, the allowance
+// would become a network-wide head-selection parameter that every node must
+// run with the same value.
 //
 // At a superblock height the full budget is allowed whether or not a
 // superblock was triggered (dashd holds a non-triggered one to the reward):
 // the rule cannot see governance, so it takes the bound the schedule can never
 // exceed.
 //
-// A share that fails check() is not naughty: it is not verified at all (and
+// A share that fails check() is not reported here: it is not verified at all (and
 // the peer that sent it is dealt with by the receive path).
 //
 // Header-only, fenced to src/impl/dash/. KAT: test_dash_naughty_seed.cpp,
@@ -116,6 +122,13 @@ namespace dash {
 inline bool naughty_seed_active()
 {
     return SharechainConfig::share_profile().naughty_seed;
+}
+
+/// The report-only form of the same test (DASH v36 network): a log line and a
+/// counter, never naughty.
+inline bool excessive_reward_warning_active()
+{
+    return SharechainConfig::share_profile().excessive_reward_warning;
 }
 
 /// True when a share's coinbase merkle_link branch is empty: the block header
