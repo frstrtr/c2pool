@@ -121,7 +121,7 @@ struct DecoratedData
 // ── Restart-reorg supersede hint ─────────────────────────────────────────
 // Computed by NodeImpl before each think() cycle (compute_supersede_hint()).
 // C++ analog of the LTC restart-reorg fix ported to DASH (live money on the
-// hotel sharechain).
+// production sharechain).
 //
 // The defect: a node that loads its persisted, fully-verified sharechain then
 // peers with a higher-work network STICKS on the old head. TailScore compares
@@ -622,7 +622,7 @@ public:
         }
 
         // Report share difficulty for best-share dashboard tracking.
-        // The SHARE HASH rides along (display fix, 2026-08-05): the hotel's
+        // The SHARE HASH rides along (display fix, 2026-08-05): the production node's
         // best_share card showed hash="" because this hook never carried the
         // identity of the very share it was reporting — the dashboard had a
         // record difficulty with no way to say WHICH share set it. The miner

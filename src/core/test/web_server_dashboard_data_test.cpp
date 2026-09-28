@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Dashboard DATA honesty KATs — every case pins a defect measured on the two
-// hotel DASH dashboards on 2026-08-05 (primary :8080 / reserve :8081, both on
+// production DASH dashboards on 2026-08-05 (primary :8080 / reserve :8081, both on
 // the same build):
 //
 //   * rows for OUR OWN accepted blocks h=2516911/2516914 rendered as junk on
@@ -116,7 +116,7 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
 
     // Subsidy fallback: the caller passed 0 on the node's own chain, so the
     // template's coinbasevalue must have been recorded instead (row 2516914
-    // showed subsidy=0 on the hotel because the WebServer-held template is
+    // showed subsidy=0 on the production node because the WebServer-held template is
     // empty on the embedded arm).
     EXPECT_EQ(blk["subsidy"].get<uint64_t>(), 177109977u);
 
@@ -128,7 +128,7 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
 // The FIRST block of a ledger has no predecessor, hence no time_to_find and
 // no luck MEASUREMENT. That must surface as null ("not computed"), never as
 // a numeric 0 the chart will draw — 0% luck is a catastrophe claim, and the
-// hotel chart made exactly that claim out of unmeasured rows.
+// production chart made exactly that claim out of unmeasured rows.
 TEST(DashboardData, UncomputedLuckIsNullNeverZero)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
@@ -317,7 +317,7 @@ TEST(DashboardData, GlobalStatsLastBlockReadsTheFoundBlockLedger)
                           1.0, 1.0, 1.0, 1);
     auto gs = mi.rest_global_stats();
     EXPECT_EQ(gs["last_block"].get<uint64_t>(), 2516911u)
-        << "both hotel nodes showed last_block=0 with 100+ rows on disk";
+        << "both production nodes showed last_block=0 with 100+ rows on disk";
     EXPECT_EQ(gs["last_block_ts"].get<uint64_t>(), 1785955172u);
     // And the miners-count scope is stated, so 5-vs-33-rigs cannot again be
     // read as a bug: 5 counts pool-wide payout addresses, rigs are local
@@ -356,7 +356,7 @@ TEST(DashboardData, AllTimeBestShareSurvivesARestart)
     auto stats = mi2.rest_local_stats();
     const auto& best = stats["best_share"];
     EXPECT_NEAR(best["all_time"]["difficulty"].get<double>(), 268585.98, 1e-6)
-        << "the hotel primary showed all_time == session after 36 min of"
+        << "the primary node showed all_time == session after 36 min of"
            " uptime: 'all time' reset on every restart";
     EXPECT_EQ(best["all_time"]["miner"].get<std::string>(),
               "XudUrCvNXLRwyJqnpdEvZC8Hd6DRAW81TV");
@@ -399,7 +399,7 @@ TEST(DashboardData, PersistedBestShareNeverLowersALiveRecord)
 // 7. The node-fee amount is readable WITHOUT knowing which coin this is
 // ═══════════════════════════════════════════════════════════════════════════
 
-// THE INCIDENT (live, 2026-08-06, DASH node 109.161.52.148:8081): the Node Fee
+// THE INCIDENT (live, 2026-08-06, DASH node, reserve instance): the Node Fee
 // card showed "- DASH" — no amount. /local_stats on that node carried
 //     node_fee_dash = 0.004240003478694174
 //     node_fee_ltc  = ABSENT
@@ -1308,10 +1308,10 @@ TEST(NodeInfoRuntimeEndpoint, ExternalIpAndP2pPortSurfaced) {
     EXPECT_EQ(before.value("external_ip", std::string{}), "0.0.0.0");
     EXPECT_EQ(before.value("p2p_port", -1), 0);
 
-    mi.set_external_ip("158.220.92.171");
+    mi.set_external_ip("203.0.113.10");
     mi.set_p2p_port(9337);
     auto after = mi.rest_node_info();
-    EXPECT_EQ(after.value("external_ip", std::string{}), "158.220.92.171");
+    EXPECT_EQ(after.value("external_ip", std::string{}), "203.0.113.10");
     EXPECT_EQ(after.value("p2p_port", -1), 9337);
 }
 

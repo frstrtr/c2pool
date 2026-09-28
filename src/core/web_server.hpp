@@ -762,7 +762,7 @@ public:
         uint64_t height = 0;                  // template height
         // TOTAL of every coinbase output that does NOT go to miners, in
         // template order: masternode payee + operator split + superblock +
-        // the DIP-0027 platform OP_RETURN burn. Measured on the hotel
+        // the DIP-0027 platform OP_RETURN burn. Measured on the production node
         // (2026-08-05, DASH mainnet h=2516911): payment_amount_sat carried
         // only the MN payee (0.8298), so the dashboard's "miner" share read
         // 53% of the block when the ACCEPTED coinbase paid miners 25% -- the
@@ -1884,7 +1884,7 @@ private:
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
     // ── ALL-TIME best-share persistence ─────────────────────────────────
-    // Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+    // Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
     // best_share showed all_time == session == round — the "all-time" leg
     // reset on every restart because it lived only in memory, so the card
     // was quietly lying about what "all time" means. Persisted as a small
@@ -2102,7 +2102,7 @@ class WebServer
     bool solo_mode_;
     std::string solo_address_;
 
-    // Debounce state for trigger_work_refresh_debounced() (hotel interim fix
+    // Debounce state for trigger_work_refresh_debounced() (interim hardening fix
     // #3). Leading-edge-immediate + ~300 ms trailing-coalesce; the trailing
     // refresh is event-gated on a REAL work change (sharechain tip moved since
     // the last executed refresh). All state is touched only from the main

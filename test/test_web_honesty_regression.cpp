@@ -530,8 +530,8 @@ TEST(WebHonestyRegression, VersionSignalingEmptyUntilRealCrossingState) {
 // the sampling window, which is the "propagating" phase). On an 8640-share LTC
 // window that is ~86 shares; on DASH's 4320 it is ~43.
 
-// (a) DASH ACCEPTANCE CASE -- verbatim from the live hotel prod node
-//     (109.161.57.3:8080/version_signaling): share format 16 across the whole
+// (a) DASH ACCEPTANCE CASE -- verbatim from the live production node
+//     (/version_signaling): share format 16 across the whole
 //     4320-share window, 100% of shares desiring 16, ZERO v36 votes, accept-floor
 //     still cold at 1700. Nothing higher is signalled, so the banner, the
 //     authority message and the progress bar are ALL hidden. Before the gate fix
@@ -932,9 +932,9 @@ TEST(WebHonestyRegression, PatronSendmanySelfLabelsAsStubNeverFabricatesPayouts)
 // ── Stratum-URL external_ip override (DASH NAT/port-mapped nodes) ──────────
 // The dashboard Stratum-URL card renders nodeInfo.external_ip
 // (dashboard.html:2889-2892). When a node NATs out through a shared gateway
-// (both hotel DASH nodes: LAN 192.168.1.x, one public 31.172.65.125), the
+// (both production DASH nodes: LAN 192.168.1.x, one shared public address), the
 // auto-detected OUTBOUND IP is NOT the address miners dial -- they reach the
-// external-mapped hosts (109.161.57.3 / 109.161.52.148). c2pool-dash exposes
+// external-mapped hosts. c2pool-dash exposes
 // --external-ip (alias --stratum-advertise / --public-host) which feeds
 // set_external_ip(); rest_node_info() must then SERVE that operator-supplied
 // host verbatim so the Stratum URL is truthful. Unset must stay honest-absent
@@ -951,10 +951,10 @@ TEST(WebHonestyRegression, NodeInfoExternalIpUnsetIsHonestlyUnspecified) {
 TEST(WebHonestyRegression, NodeInfoExternalIpServesOperatorAdvertisedHost) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr, Blockchain::DASH);
     // Operator advertises the real miner-facing external-mapped host (primary
-    // hotel node), NOT the auto-detected 31.172.65.125 NAT gateway.
-    mi.set_external_ip("109.161.57.3");
+    // production node), NOT the auto-detected shared NAT gateway address.
+    mi.set_external_ip("203.0.113.10");
     json ni = mi.rest_node_info();
-    EXPECT_EQ(ni.value("external_ip", std::string{}), "109.161.57.3")
+    EXPECT_EQ(ni.value("external_ip", std::string{}), "203.0.113.10")
         << "served external_ip must be the operator-advertised miner-facing "
            "host so the dashboard Stratum URL is not the wrong NAT IP";
 }
@@ -1323,7 +1323,7 @@ TEST(DashboardMergedGating, MergedExplorerRoutedThroughCurrencyInfo) {
 // ─────────────────────────────────────────────────────────────────────────
 // #922 — BEST-SHARE "round" must RESET at a block-found boundary.
 //
-// Operator-reported + reproduced on the live hotel: GET /best_share returned
+// Operator-reported + reproduced on the live production node: GET /best_share returned
 // round.hash == all_time.hash and round.difficulty == all_time.difficulty for
 // a share attached to a block found hours (and hundreds of shares) earlier —
 // both rows 932.28% of target. The all_time/round SPLIT already existed in the
@@ -1511,7 +1511,7 @@ TEST(DashboardCrossingCard, ReadsOnlyEmittedNestedFields) {
 // set) and NOT an absent-source 0.
 TEST(ShareDifficultyTrend, GraphSourcesRealVardiffFromSharechainStats) {
     MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
-    mi.set_pool_hashrate_fn([] { return 1.5e12; });   // ~1.5 TH/s per hotel
+    mi.set_pool_hashrate_fn([] { return 1.5e12; });   // ~1.5 TH/s per production node
     mi.set_sharechain_stats_fn([] {
         return json{{"total_shares", 4096}, {"orphan_shares", 0},
                     {"dead_shares", 0}, {"min_difficulty", 2048.0}};
@@ -1542,7 +1542,7 @@ TEST(ShareDifficultyTrend, GraphFallsBackToRecordedShareDifficulty) {
                     {"dead_shares", 0}};
     });
     // A real accepted share at difficulty 4096 (vardiff top of the 2048<->4096
-    // retarget band the hotel node was running).
+    // retarget band the production node was running).
     mi.record_share_difficulty(4096.0, "miner1", "deadbeef");
 
     mi.update_stat_log();
@@ -1664,7 +1664,7 @@ TEST(DashboardBestShare, RecordGatesOnHasBestNotAverage) {
 // the legacy keys byte-for-byte and adds explicit gross / net / fee fields such
 // that the reconciliation identity holds on a fee'd node. These pin it.
 //
-// Live hotel primary (DASH, --fee 1) numbers, re-derived per the issue:
+// Live primary node (DASH, --fee 1) numbers, re-derived per the issue:
 //     block_value           1.77033183
 //     block_value_payments   1.32774887   (75%: masternode + treasury)
 //     miner GROSS 25%        0.44258296

@@ -5,7 +5,7 @@ mining site. Applies to v0.2.3 on Ubuntu-class Linux x86_64.
 
 > **Current `master` (post-v0.2.4) note.** This guide describes the
 > **dashd-attached** posture (`--coin-rpc` + `--coin-rpc-auth`), which is still
-> supported and is what the operator's own hotel deployment runs. On current
+> supported and is what the operator's own private deployment runs. On current
 > `master` a bare `c2pool-dash --run` with **no `--coin-rpc`** is the
 > **daemonless** posture: every embedded serving lever defaults ON and no dashd
 > is needed on the host (`src/c2pool/main_dash.cpp` banner: "ALL embedded
