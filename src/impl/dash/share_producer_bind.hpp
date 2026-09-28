@@ -40,8 +40,10 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -130,6 +132,12 @@ struct FrozenMintJob
     // key — covers it), frozen so the mint-time rebuild uses the exact bytes
     // the served coinbase committed, never a live re-read. Empty on v16.
     std::vector<unsigned char> message_data;
+    // v36 only: the template's tx bodies (hex, template order, parallel to
+    // desired_tx_hashes) the job's coinbase merkle_link commits to. The finder
+    // assembles the won block from them (coin/reconstruct_won_block.hpp); the
+    // mint-time rebuild does not read them. Null on v16 and on coinbase-only
+    // jobs.
+    std::shared_ptr<const std::vector<std::string>> tx_data_hex;
 };
 
 // -- build_mint_share --------------------------------------------------------

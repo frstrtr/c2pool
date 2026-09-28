@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 // Mint + handshake harness for the private/isolated DASH v36 sharechain node
-// KATs (test_dash_v36_flip.cpp, test_dash_v36_e2e.cpp; both folded into
-// test_dash_node), on top of dash_v36_live_fixture.hpp: production isolated
-// params with easy PoW, a coinbase-only work template, the miner +
-// mining_submit side of one producer job (solve_job: a REAL X11 nonce search
-// against the job's committed share target), coinbase output parsing, and the
-// loopback version-handshake harness that drives the REAL
+// KATs (test_dash_v36_flip.cpp, test_dash_v36_e2e.cpp,
+// test_dash_v36_template_txs.cpp, test_dash_v36_finder_block.cpp; all folded
+// into test_dash_node), on top of dash_v36_live_fixture.hpp: production DASH v36
+// network params with easy PoW, a coinbase-only work template (make_wd) and one
+// carrying transactions (make_wd_with_txs), the miner + mining_submit side of one producer job
+// (solve_job: the stratum merkle branches folded into the header root, a REAL
+// X11 nonce search against the job's committed share target), coinbase output
+// parsing, and the loopback version-handshake harness that drives the REAL
 // NodeImpl::handle_version. Everything is in an anonymous namespace: each
 // including TU gets its own copy.
 
@@ -17,6 +19,7 @@
 #include <impl/dash/mint_runloop.hpp>
 #include <impl/bitcoin_family/coin/base_block.hpp>
 
+#include <btclibs/util/strencodings.h>
 #include <core/socket.hpp>
 
 #include <boost/asio.hpp>
@@ -63,9 +66,62 @@ uint256 sha256d_bytes(const Bytes& b) {
     return dash::coinbase::sha256d(std::span<const unsigned char>(b.data(), b.size()));
 }
 
+// make_wd() plus `n` transactions: deterministic, well-formed version-1 DASH
+// transactions (one input spending a pseudo outpoint, one P2PKH output; nothing
+// validates them against a UTXO set), m_tx_hashes[i] = sha256d(body i) and
+// m_tx_data_hex[i] = hex(body i), in template order -- the shape the dashd
+// getblocktemplate parse produces.
+Bytes pseudo_tx(size_t i, uint8_t salt) {
+    Bytes b;
+    auto le = [&](uint64_t v, int n) { for (int k = 0; k < n; ++k) b.push_back(uint8_t(v >> (8 * k))); };
+    le(1, 2); le(0, 2);                                  // version 1, type 0
+    b.push_back(1);                                      // vin count
+    for (int k = 0; k < 32; ++k) b.push_back(uint8_t(salt + 17 * i + k));   // prevout hash
+    le(static_cast<uint32_t>(i), 4);                     // prevout index
+    b.push_back(1); b.push_back(uint8_t(0x51 + (i % 16)));   // scriptSig: one opcode
+    le(0xffffffffu, 4);                                  // sequence
+    b.push_back(1);                                      // vout count
+    le(100000 + 1000 * i, 8);                            // value
+    b.push_back(25); b.push_back(0x76); b.push_back(0xa9); b.push_back(0x14);
+    for (int k = 0; k < 20; ++k) b.push_back(uint8_t(salt ^ (i + k)));
+    b.push_back(0x88); b.push_back(0xac);
+    le(0, 4);                                            // locktime
+    return b;
+}
+
+dash::coin::DashWorkData make_wd_with_txs(size_t n, uint8_t salt = 0x5e) {
+    auto wd = make_wd();
+    for (size_t i = 0; i < n; ++i) {
+        const Bytes body = pseudo_tx(i, salt);
+        wd.m_tx_hashes.push_back(sha256d_bytes(body));
+        wd.m_tx_data_hex.push_back(HexStr(body));
+    }
+    return wd;
+}
+
+// The stratum merkle branches of a template (coinbase placeholder at index 0)
+// and the miner's fold of a coinbase txid through them -- what mining_submit
+// and every stratum miner compute, independent of the producer's merkle_link.
+std::vector<uint256> stratum_branches(const dash::coin::DashWorkData& wd) {
+    std::vector<uint256> leaves{uint256()};
+    leaves.insert(leaves.end(), wd.m_tx_hashes.begin(), wd.m_tx_hashes.end());
+    return dash::coinbase::merkle_branches_raw(leaves);
+}
+uint256 fold_branches(uint256 h, const std::vector<uint256>& branches) {
+    for (const auto& b : branches) {
+        Bytes buf(64);
+        std::memcpy(buf.data(), h.data(), 32);
+        std::memcpy(buf.data() + 32, b.data(), 32);
+        h = sha256d_bytes(buf);
+    }
+    return h;
+}
+
 // The miner + mining_submit side of one producer job (the test_dash_mint_runloop
 // solve_job idiom): coinb1/coinb2 split around the nonce64 slot, coinbase
-// reassembly with en1||en2, coinbase-only merkle root, a REAL X11 nonce search
+// reassembly with en1||en2, the header merkle root folded from the coinbase
+// txid through the template's stratum merkle branches (identity for a
+// coinbase-only template), a REAL X11 nonce search
 // against the job's committed share target, MintShareInputs as mining_submit
 // fills them (ref_hash recovered from the coinb1 tail).
 struct SolvedJob {
@@ -105,7 +161,8 @@ SolvedJob solve_job(ChainT& chain, const core::CoinParams& p, const uint256& pre
     bitcoin_family::coin::BlockHeaderType hdr;
     hdr.m_version        = wd.m_version;
     hdr.m_previous_block = wd.m_previous_block;
-    hdr.m_merkle_root    = sha256d_bytes(coinbase);   // coinbase-only template
+    const std::vector<uint256> branches = stratum_branches(wd);
+    hdr.m_merkle_root    = fold_branches(sha256d_bytes(coinbase), branches);
     hdr.m_timestamp      = wd.m_curtime;
     hdr.m_bits           = wd.m_bits;
     Bytes header_bytes;
@@ -158,6 +215,7 @@ SolvedJob solve_job(ChainT& chain, const core::CoinParams& p, const uint256& pre
     out.in.coinbase_bytes  = coinbase;
     out.in.subsidy         = wd.m_coinbase_value;
     out.in.prev_share_hash = prev;
+    out.in.merkle_branches = branches;
     out.in.payout_script   = payout_script;
     out.in.pow_hash        = pow;
     std::memcpy(out.in.ref_hash.begin(), coinb1.data() + coinb1.size() - 32, 32);
