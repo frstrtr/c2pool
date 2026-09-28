@@ -446,6 +446,11 @@ int main() {
           "DS9 every admitted raindrop enters the harvest with its receipt id");
         C(src.find("carry.enrollment_digest, drops_lane.set}") != std::string::npos,
           "DS9 the winner carries the set it composed from (FB_BLOCK_WON v0x03)");
+        C(src.find("if (drops_live) drops_early[bid] = DropsEarly{h, bk, 0, true};") != std::string::npos &&
+          src.find("drops_early[b] = DropsEarly{ph, {}, 0, false};") != std::string::npos &&
+          src.find("drops_early_pump();") != std::string::npos &&
+          src.find("drops_compose_lane(e.h, bid, e.bk, price, why, lane, nullptr)") != std::string::npos,
+          "DS9 liveness: the winner composes + carries its set right after FOUND (the same winner route), not at its own booking");
     }
 
     // ── DS6 LEDGER ──────────────────────────────────────────────────────────

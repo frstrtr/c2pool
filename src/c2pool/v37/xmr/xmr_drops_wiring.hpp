@@ -1022,6 +1022,10 @@ public:
         std::lock_guard<std::mutex> lk(m_pub_mu);
         return m_pub.size();
     }
+    std::map<std::string, std::uint64_t> published_copy() const {   // ★ DROPS-SET-PIN: bid -> h
+        std::lock_guard<std::mutex> lk(m_pub_mu);
+        return m_pub;
+    }
     // THE decision the booking takes for a lane block: is it OUR win whose carried
     // delta is still to be composed (registered W, or published P), with no
     // composed frame (F) yet? A P alone (crash between the publish and the FOUND

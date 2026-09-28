@@ -1812,6 +1812,16 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t drops_set_pinned = 0, drops_set_capped = 0, drops_set_composed = 0, drops_set_hold_frame = 0,
                   drops_set_hold_members = 0, drops_set_fetch_frames = 0, drops_set_refused = 0, drops_set_getwon = 0;
     std::map<std::string, std::chrono::steady_clock::time_point> drops_set_getwon_at;   // FB_GETWON throttle per bid
+    // ★ DROPS-SET-PIN (liveness): our own win is composed, pinned and carried as
+    // soon as its range is backfilled after FOUND -- D_conf blocks before any
+    // node books it -- so no receiver waits on the winner's own booking. Until
+    // then (or after kDropsEarlyTries) the booking-time composition stands.
+    struct DropsEarly { std::uint64_t h = 0; c2pool::v37n::xmr::authority::CoinbaseBooking bk; unsigned tries = 0; bool have_bk = true; };
+    std::map<std::string, DropsEarly> drops_early;
+    static constexpr unsigned kDropsEarlyTries = 600;
+    std::uint64_t drops_set_early = 0, drops_set_early_gaveup = 0;
+    std::size_t drops_early_pub_n = 0;                  // P records scanned (the WRITE-AHEAD journal of our published blocks)
+    std::set<std::string> drops_early_pub_done;
     // ★ DROPS-CARRY-SUFFIX: prefixes merged from our [0,a0) + a served suffix,
     // suffix repairs HELD (our [0,a0) not the verified base), prefix-invariant
     // ALARMs (positions != P) and carried-witness mismatches on this node.
@@ -3068,7 +3078,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         if (relay_node && cba_fx) {   // GAP-2: the fast path over the relay (FB_BLOCK_WON), not a directory drop
             c2pool::v37n::xmr::authority::CoinbaseBooking bk; std::string why;
-            if (!fetch_decode(bid, bk, why) || !bk.has_credit_cut) { std::printf("ab-wire-tx: own win %s… not encodable (%s)\n", bid.substr(0,12).c_str(), why.c_str()); return; }
+            if (!fetch_decode(bid, bk, why) || !bk.has_credit_cut) {
+                std::printf("ab-wire-tx: own win %s… not encodable (%s)\n", bid.substr(0,12).c_str(), why.c_str());
+                return;   // ★ DROPS-SET-PIN: the P record (the true block id) queues it for drops_early_pump
+            }
             relay::BlockWon bw;
             bw.chain_id = cfg.lane_chain; bw.bid = *c2pool::v37n::cut_bid_bytes(bid); bw.h_b = h;
             bw.cut_next_pos = bk.credit_cut.next_pos; bw.cut_spine_digest = bk.credit_cut.spine_digest;
@@ -3081,6 +3094,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
                 own_won[bid] = bw;
                 if (drops_store) drops_store->put_own(bid, relay::encode_block_won(bw));   // ★ DROPS-RESTART: survives a restart
+                if (drops_live) drops_early[bid] = DropsEarly{h, bk, 0, true};   // ★ DROPS-SET-PIN: carried early (drops_early_pump)
                 std::printf("ab-wire-tx: own win h=%llu bid=%s… -> FB_BLOCK_WON deferred to the booking (DROPS carriage, v0x02)\n",
                             (unsigned long long)h, bid.substr(0,12).c_str());
                 return;
@@ -3105,6 +3119,95 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::filesystem::rename(g_wire_out + "/" + bid + ".v2.tmp", g_wire_out + "/" + bid + ".v2", ec);
         ++wire_tx;
         std::printf("ab-wire-tx: own win h=%llu bid=%s… -> v0x02 frame %zu bytes (trailer 122) P=%llu\n", (unsigned long long)h, bid.substr(0,12).c_str(), frame.size(), (unsigned long long)d.cut_next_pos);
+    };
+    // ★ DROPS-SET-PIN (liveness): compose + pin + carry our own win right after
+    // FOUND (main loop, every relay pump) once its range is backfilled here --
+    // the same drops_compose_lane the booking runs (winner route), priced at the
+    // same on-chain cut (a pure function of reward + cut). The frame is
+    // write-ahead journalled like the booking-time one; the booking then takes
+    // the receiver route with our own set. Not composable within
+    // kDropsEarlyTries pumps: the booking-time composition stands (unchanged).
+    auto drops_early_pump = [&]() {
+        if (!drops_live || !relay_node) return;
+        // our published blocks, by their TRUE block id (the P record the listener
+        // journals at the network gate; the FOUND id can be a local estimate)
+        if (drops_store && drops_store->published_size() != drops_early_pub_n) {
+            const auto pub = drops_store->published_copy();
+            drops_early_pub_n = pub.size();
+            std::uint64_t top = 0;
+            for (const auto& [b, ph] : pub) top = std::max(top, ph);
+            for (const auto& [b, ph] : pub) {
+                if (!drops_early_pub_done.insert(b).second) continue;
+                if (ph + 64 < top || drops_early.count(b) || !drops_store->own_to_compose(b)) continue;
+                drops_early[b] = DropsEarly{ph, {}, 0, false};
+            }
+        }
+        if (drops_early.empty()) return;
+        for (auto it = drops_early.begin(); it != drops_early.end();) {
+            const std::string bid = it->first;
+            DropsEarly& e = it->second;
+            if ((wire_cache.count(bid) && wire_cache[bid].drops_set) || (e.have_bk && !own_won.count(bid)) ||
+                (drops_store && drops_store->booked(bid))) {
+                it = drops_early.erase(it); continue;
+            }
+            if (++e.tries > kDropsEarlyTries) {
+                ++drops_set_early_gaveup;
+                std::printf("drops-set: own win h=%llu bid=%s… not composable early (%u pumps) -> composed at its booking\n",
+                            (unsigned long long)e.h, bid.substr(0, 12).c_str(), kDropsEarlyTries);
+                it = drops_early.erase(it); continue;
+            }
+            if (!e.have_bk) {   // a P record: decode the block (the FOUND callback's frame), every 10th pump
+                // only while it is the canonical block at its height: an orphan (a lost
+                // same-height race) is dropped here, never decoded (no refetch storm);
+                // a later reorg onto it is composed at its booking, as before
+                const auto canon = node.chain_bid_at(e.h);
+                if (canon && *canon != bid) { it = drops_early.erase(it); continue; }
+                std::string dwhy;
+                if (!canon || e.tries % 10 != 1 || !fetch_decode(bid, e.bk, dwhy) || !e.bk.has_credit_cut) { ++it; continue; }
+                e.have_bk = true;
+                if (!own_won.count(bid)) {
+                    relay::BlockWon ob;
+                    ob.chain_id = cfg.lane_chain; ob.bid = *c2pool::v37n::cut_bid_bytes(bid); ob.h_b = e.h;
+                    ob.cut_next_pos = e.bk.credit_cut.next_pos; ob.cut_spine_digest = e.bk.credit_cut.spine_digest;
+                    ob.reward = e.bk.total; ob.payout_emitted = true; ob.owed_digest_at_win = e.bk.lane_commitment;
+                    own_won[bid] = ob;
+                    if (drops_store) drops_store->put_own(bid, relay::encode_block_won(ob));
+                }
+            }
+            const auto rgo = drops->range_for(e.h);
+            if (!rgo) { ++it; continue; }
+            if (rgo->second > rgo->first && !relay_node->drops_sync(rgo->first, rgo->second).complete) { ++it; continue; }
+            for (auto& a : relay_node->drain_drops())
+                drops->on_raindrop_id(a.id, ::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
+            Amounts credit; std::string why;
+            const auto saved_price = drops_fold_price;
+            const bool folded = fold_at_cut(e.bk.total, e.bk.credit_cut, credit, why);
+            const auto price = drops_fold_price;
+            drops_fold_price = saved_price;
+            if (!folded) { ++it; continue; }
+            DropsLaneOut lane;
+            if (!drops_compose_lane(e.h, bid, e.bk, price, why, lane, nullptr)) { ++it; continue; }
+            relay::BlockWon bw = own_won[bid];
+            bw.drops = relay::BlockWon::Drops{lane.carry.delta, lane.carry.enrollment_digest, lane.set};
+            const auto f = relay::encode_block_won(bw);
+            if (f.empty()) { ++it; continue; }
+            if (drops_store) drops_store->put_frame(bid, f);   // WRITE-AHEAD, as at the booking
+            const std::size_t n = relay_node->broadcast_block_won(bw);
+            ++wire_tx; ++drops_carry_tx; ++drops_set_pinned; ++drops_set_early;
+            WireCache& wc = wire_cache[bid];
+            wc.d.bid = bw.bid; wc.d.h_b = bw.h_b; wc.d.cut_next_pos = bw.cut_next_pos; wc.d.cut_spine_digest = bw.cut_spine_digest;
+            wc.d.reward = bw.reward; wc.d.payout_emitted = bw.payout_emitted; wc.d.owed_digest_at_win = bw.owed_digest_at_win;
+            wc.drops = lane.carry;
+            wc.drops_set = lane.set;
+            std::printf("drops-carry-tx: own win h=%llu bid=%s… EARLY (pump %u) composed rows=%zu delta_payees=%zu digest=%s… src=%s "
+                        "set n_ids=%zu set_digest=%s… -> FB_BLOCK_WON v0x03 %zu B to %zu relay peer(s)\n",
+                        (unsigned long long)e.h, bid.substr(0, 12).c_str(), e.tries, lane.lc.rows.size(), lane.carry.delta.size(),
+                        hex_of(lane.carry.enrollment_digest).substr(0, 12).c_str(), lane.src, lane.set.size(),
+                        hex_of(c2pool::v37n::xmr::drops::XmrDropsWiring::set_digest(e.h, bw.bid, lane.set)).substr(0, 12).c_str(), f.size(), n);
+            std::fflush(stdout);
+            own_won.erase(bid);
+            it = drops_early.erase(it);
+        }
     };
     // (A) THE FAST PATH, receive side: decode the peer's v0x02 frame, VERIFY, and PRE-FOLD E_b at the carried cut NOW
     // (while P is fresh in our ring). Nothing enters the ledger from the wire: the chain path consumes the pre-fold
@@ -4104,6 +4207,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                     if (!relay::decode_block_won(f, kb, &kwhy)) continue;
                     own_won[b] = kb;
                     ++drops_reloaded_own;
+                    if (drops_live) drops_early[b] = DropsEarly{kb.h_b, {}, 0, false};   // ★ DROPS-SET-PIN: carried early after a restart
+                }
+                if (drops_live) {   // ★ DROPS-SET-PIN: our published (P) wins with no frame yet, newest 64
+                    std::vector<std::pair<std::uint64_t, std::string>> pub;
+                    for (const auto& [b, ph] : drops_store->published_copy())
+                        if (drops_store->own_to_compose(b) && !drops_early.count(b)) pub.emplace_back(ph, b);
+                    std::sort(pub.rbegin(), pub.rend());
+                    if (pub.size() > 64) pub.resize(64);
+                    for (const auto& [ph, b] : pub) drops_early[b] = DropsEarly{ph, {}, 0, false};
                 }
                 std::printf("drops-store: journal %s reloaded own=%zu frames=%zu booked=%zu malformed=%zu -> re-offered frames=%llu own wins to compose=%llu\n",
                             drops_store->path().c_str(), drops_store_loaded.own, drops_store_loaded.frames, drops_store_loaded.booked,
@@ -4402,6 +4514,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (drops_live)   // ★ DROPS: every replicated raindrop (own + peers') -> the harvester
                     for (auto& a : relay_node->drain_drops())
                         drops->on_raindrop_id(a.id, ::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow);
+                drops_early_pump();   // ★ DROPS-SET-PIN: our own wins, carried early
                 // RELAY-BINCLOCK: the chain clock too (a suspended lane serves no new template)
                 relay_ingest->tick(relay::bin_close_height(provider.current().height, node.hw().hw_height));
                 for (const auto& [bw, pid] : relay_node->drain_block_won()) relay_on_cut(bw, pid);
@@ -4553,11 +4666,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)drops_prepub_journalled.load(), drops_store_loaded.published,
                                 (unsigned long long)drops_prepub_resumed);
                 std::printf("  drops-set: pinned=%llu capped=%llu composed=%llu hold_frame=%llu hold_members=%llu fetch_frames=%llu "
-                            "fetch_ids=%llu refused=%llu getwon=%llu\n",
+                            "fetch_ids=%llu refused=%llu getwon=%llu early=%llu early_gaveup=%llu\n",
                             (unsigned long long)drops_set_pinned, (unsigned long long)drops_set_capped, (unsigned long long)drops_set_composed,
                             (unsigned long long)drops_set_hold_frame, (unsigned long long)drops_set_hold_members,
                             (unsigned long long)drops_set_fetch_frames, (unsigned long long)relay_node->stats().drops_pin_fetch_ids.load(),
-                            (unsigned long long)drops_set_refused, (unsigned long long)drops_set_getwon);
+                            (unsigned long long)drops_set_refused, (unsigned long long)drops_set_getwon,
+                            (unsigned long long)drops_set_early, (unsigned long long)drops_set_early_gaveup);
                 drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
                 const auto ll = drops->lane_log_stats();
                 std::printf("  drops-lane: composed=%llu without_winner_frame=%llu hold=%llu prefix own=%llu repaired=%llu suffix=%llu shadow=%llu record=%llu hold_a0=%llu records=%llu/%zu miss=%llu "
