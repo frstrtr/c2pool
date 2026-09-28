@@ -993,10 +993,12 @@ TEST(DashV36Flip, ProducerJobFreezesStaleInfoIntoRefAndMintV36)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // M. Naughty (#1827): on the DASH v36 network a share whose block would pay
-//    more than the block reward is naughty = 1, its descendants inherit
-//    1 + parent up to 6 generations, a head built on it loses best-head
-//    selection, and all of it survives a restart. The public v16 network never
-//    seeds it (p2pool-dash has no naughty rule).
+//    more than the block reward plus the fee allowance (0 for a coinbase-only
+//    share, one block reward when its merkle_link commits transactions) is
+//    naughty = 1, its descendants inherit 1 + parent up to 6 generations, a
+//    head built on it loses best-head selection, and all of it survives a
+//    restart. The public v16 network never seeds it (p2pool-dash has no
+//    naughty rule).
 // ═════════════════════════════════════════════════════════════════════════════
 
 namespace {
@@ -1011,12 +1013,14 @@ uint64_t honest_max()
 }
 
 // Mint one share on `n` through the node's mint hook (the run-loop path:
-// producer job, real X11 solve, mint_from_inputs_any, add_local_share) with
-// the given block subsidy, and wait until the node has verified it.
+// producer job, real X11 solve, mint_from_inputs_any, add_local_share) over
+// the template `base` (coinbase-only by default) with the given block subsidy,
+// and wait until the node has verified it.
 uint256 mint_on(LiveNode& n, const core::CoinParams& p, const uint256& prev,
-                const uint160& miner, uint64_t subsidy, uint32_t k)
+                const uint160& miner, uint64_t subsidy, uint32_t k,
+                const dash::coin::DashWorkData& base = make_wd())
 {
-    auto wd = make_wd();
+    auto wd = base;
     wd.m_coinbase_value = subsidy;
     SolvedJob j;
     std::optional<dash::stratum::MintedShare> ms;
@@ -1082,6 +1086,8 @@ TEST(DashV36Flip, ExcessiveRewardShareIsSeededNaughtyAndDescendantsInherit)
     n.node->set_block_abs_height_fn(stub_height);
     uint32_t k = 0;
 
+    // Coinbase-only template (merkle_link empty): the fees are exactly 0, so
+    // the exact rule applies (no fee allowance).
     const uint256 g = mint_on(n, p, uint256(), h160(0x41), honest_max(), k++);
     ASSERT_FALSE(g.IsNull());
     EXPECT_EQ(naughty_of(n, g), 0) << "paying exactly the block reward is honest";
@@ -1099,6 +1105,76 @@ TEST(DashV36Flip, ExcessiveRewardShareIsSeededNaughtyAndDescendantsInherit)
     // An under-paying share is honest.
     const uint256 u = mint_on(n, p, prev, h160(0x44), honest_max() - 1000, k++);
     EXPECT_EQ(naughty_of(n, u), 0);
+}
+
+// The template's transaction fees (operator KATs 1-3 at node level). Three
+// template transactions: the share's coinbase merkle_link has 2 entries, so
+// the rule allows reward + one block reward of fees. The chain is linear on
+// honest parents so each share's naughty is its own seed.
+uint64_t honest_max_with_txs()
+{
+    return 2 * honest_max();   // reward + fee allowance (one reward)
+}
+
+TEST(DashV36Flip, TemplateFeesInCoinbaseAreNotNaughty)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_naughty_fees_honest");
+    const auto p = iso_prod_params();
+    LiveNode n(p, SharechainConfig::data_subdir(false));
+    n.node->set_block_abs_height_fn(stub_height);
+    const auto wdt = make_wd_with_txs(3);
+    uint32_t k = 0;
+
+    const uint256 g = mint_on(n, p, uint256(), h160(0x45), honest_max() + 5'000'000, k++, wdt);
+    ASSERT_FALSE(g.IsNull());
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) {
+        t.chain.get_share(g).invoke([&](auto* obj) {
+            EXPECT_EQ(obj->m_merkle_link.m_branch.size(), 2u) << "the share commits 3 transactions";
+        });
+    }));
+    EXPECT_EQ(naughty_of(n, g), 0) << "reward + the template's fees is an honest coinbase";
+
+    // A share with a much larger fee total, still within one block reward.
+    const uint256 c = mint_on(n, p, g, h160(0x46), honest_max() + honest_max() / 2, k++, wdt);
+    EXPECT_EQ(naughty_of(n, c), 0);
+}
+
+TEST(DashV36Flip, InflatedCoinbaseAboveFeeAllowanceIsNaughty)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_naughty_fees_inflated");
+    const auto p = iso_prod_params();
+    LiveNode n(p, SharechainConfig::data_subdir(false));
+    n.node->set_block_abs_height_fn(stub_height);
+    const auto wdt = make_wd_with_txs(3);
+    uint32_t k = 0;
+
+    const uint256 g = mint_on(n, p, uint256(), h160(0x47), honest_max(), k++, wdt);
+    ASSERT_FALSE(g.IsNull());
+    EXPECT_EQ(naughty_of(n, g), 0);
+    const uint256 x = mint_on(n, p, g, h160(0x48), honest_max_with_txs() + 1, k++, wdt);
+    ASSERT_FALSE(x.IsNull()) << "a naughty share still verifies";
+    EXPECT_EQ(naughty_of(n, x), 1) << "more than reward + any plausible fees";
+    const uint256 c = mint_on(n, p, x, h160(0x49), honest_max(), k++, wdt);
+    EXPECT_EQ(naughty_of(n, c), 2) << "the child inherits 1 + parent";
+}
+
+TEST(DashV36Flip, CoinbaseAtRewardPlusAllowanceIsNotNaughty)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_naughty_fees_boundary");
+    const auto p = iso_prod_params();
+    LiveNode n(p, SharechainConfig::data_subdir(false));
+    n.node->set_block_abs_height_fn(stub_height);
+    const auto wdt = make_wd_with_txs(3);
+    uint32_t k = 0;
+
+    const uint256 g = mint_on(n, p, uint256(), h160(0x4a), honest_max_with_txs(), k++, wdt);
+    ASSERT_FALSE(g.IsNull());
+    EXPECT_EQ(naughty_of(n, g), 0) << "exactly reward + fee allowance (strictly greater rule)";
+    const uint256 x = mint_on(n, p, g, h160(0x4b), honest_max_with_txs() + 1, k++, wdt);
+    EXPECT_EQ(naughty_of(n, x), 1) << "one duff above the boundary";
 }
 
 TEST(DashV36Flip, HeadOnNaughtyShareLosesBestHeadSelection)

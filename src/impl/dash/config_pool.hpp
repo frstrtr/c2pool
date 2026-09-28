@@ -218,6 +218,15 @@ struct SharechainConfig
     ///                                     (the p2pool excessive-reward rule).
     ///                                     The public v16 network has no seed
     ///                                     (p2pool-dash has none).
+    ///   naughty_fee_allowance_x_reward -> naughty_seed.hpp fee_allowance(): the
+    ///                                     fees (in block rewards) the seed
+    ///                                     accepts for a share whose coinbase
+    ///                                     merkle_link commits transactions
+    ///                                     (a peer cannot compute them). 0 for
+    ///                                     a coinbase-only share. A network-wide
+    ///                                     head-selection parameter: every node
+    ///                                     must run the same value. Unused
+    ///                                     where naughty_seed is false.
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -228,6 +237,7 @@ struct SharechainConfig
         bool     future_timestamp_bound;
         bool     emergency_decay;
         bool     naughty_seed;
+        uint32_t naughty_fee_allowance_x_reward;
     };
 
     static constexpr ShareProfile PUBLIC_PROFILE{
@@ -239,6 +249,7 @@ struct SharechainConfig
         /*future_timestamp_bound=*/false,
         /*emergency_decay=*/false,
         /*naughty_seed=*/false,
+        /*naughty_fee_allowance_x_reward=*/0,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
         /*target_share_version=*/36,
@@ -249,6 +260,7 @@ struct SharechainConfig
         /*future_timestamp_bound=*/true,
         /*emergency_decay=*/true,
         /*naughty_seed=*/true,
+        /*naughty_fee_allowance_x_reward=*/1,
     };
 
     /// The active per-network share profile. Read LIVE from the process-global

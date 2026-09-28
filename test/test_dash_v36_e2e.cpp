@@ -35,6 +35,11 @@
 //      v36 chain at the PRODUCTION testnet share floor into a --data-dir that a
 //      real c2pool-dash process then loads, and writes a manifest of what the
 //      two real processes must agree on.
+//   8. Naughty is decided from committed share content only: two nodes whose
+//      own templates differ (one carries transactions and fees, one is
+//      coinbase-only) mark the same four shares identically, and the node
+//      whose own template has no fees does not punish an honest high-fee
+//      share (NaughtyIsIdenticalOnNodesWithDifferentTemplates).
 //
 // Folded into test_dash_node (needs dash::NodeImpl + c2pool_storage + the dash
 // OBJECT lib). The profile is keyed on the process-global SharechainConfig
@@ -47,6 +52,7 @@
 
 #include <impl/dash/dashboard_pplns.hpp>
 #include <impl/dash/messages.hpp>
+#include <impl/dash/naughty_seed.hpp>
 #include <impl/dash/pplns_v36.hpp>
 #include <impl/dash/stale_report.hpp>
 
@@ -781,4 +787,75 @@ TEST(DashV36E2E, OrphanedNodeAnnounces253InItsNextShareOnBothNodes)
         EXPECT_EQ(dash::mint::next_stale_info(ledger_a.tally(t.chain, s3.hash)),
                   dash::StaleInfo::none);
     }));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. Naughty is identical on nodes with different templates: the seed reads
+//    only committed share content (subsidy, coinbase merkle_link length, the
+//    parent block's height), never the verifying node's own template or
+//    mempool, so the two nodes elect the same heads.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr uint32_t NAUGHTY_PARENT_HEIGHT = 2'600'000;   // post-V20 on either network
+std::optional<uint32_t> naughty_stub_height(const uint256&) { return NAUGHTY_PARENT_HEIGHT; }
+
+int32_t naughty_on(LiveNode& n, const uint256& h)
+{
+    int32_t v = -1;
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) {
+        if (t.chain.contains(h)) v = t.chain.get_index(h)->naughty;
+    }));
+    return v;
+}
+
+} // namespace
+
+TEST(DashV36E2E, NaughtyIsIdenticalOnNodesWithDifferentTemplates)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_e2e_naughty_fees");
+    const auto f = fresh_iso();
+    ASSERT_TRUE(dash::naughty_seed_active());
+    TwoNodes rig(f.p, SharechainConfig::data_subdir(false));
+    rig.a->node->set_block_abs_height_fn(naughty_stub_height);
+    rig.b->node->set_block_abs_height_fn(naughty_stub_height);
+    const uint64_t reward =
+        dash::max_coinbase_value(NAUGHTY_PARENT_HEIGHT + 1, f.p.is_testnet).value();
+    const uint32_t t0 = rig.wd.m_curtime;
+
+    // Node A's template: three transactions and their fees.
+    rig.wd = make_wd_with_txs(3);
+    rig.wd.m_coinbase_value = reward + reward * 9 / 10;         // high fees, honest
+    const auto s_hi = rig.mint(0, uint256(), MINER_A, t0, 61);
+    ASSERT_FALSE(s_hi.hash.IsNull());
+    ASSERT_EQ(s_hi.share.m_merkle_link.m_branch.size(), 2u);
+    rig.wd.m_coinbase_value = 2 * reward + 1;                   // above reward + allowance
+    const auto s_bad = rig.mint(0, s_hi.hash, MINER_A, t0 + 20, 62);
+    ASSERT_FALSE(s_bad.hash.IsNull());
+
+    // Node B's template: coinbase-only, no fees at all.
+    rig.wd = make_wd();
+    rig.wd.m_coinbase_value = reward + 1;                       // no fees to explain the extra duff
+    const auto s_cb = rig.mint(1, s_hi.hash, MINER_B, t0 + 40, 63);
+    ASSERT_FALSE(s_cb.hash.IsNull());
+    ASSERT_TRUE(s_cb.share.m_merkle_link.m_branch.empty());
+    rig.wd.m_coinbase_value = reward;
+    const auto s_ok = rig.mint(1, s_hi.hash, MINER_B, t0 + 60, 64);
+    ASSERT_FALSE(s_ok.hash.IsNull());
+
+    const std::pair<const Minted*, int32_t> expect[] = {
+        {&s_hi, 0}, {&s_bad, 1}, {&s_cb, 1}, {&s_ok, 0}};
+    const char* name[] = {"s_hi", "s_bad", "s_cb", "s_ok"};
+    for (size_t i = 0; i < 4; ++i) {
+        SCOPED_TRACE(name[i]);
+        const int32_t na = naughty_on(*rig.a, expect[i].first->hash);
+        const int32_t nb = naughty_on(*rig.b, expect[i].first->hash);
+        EXPECT_EQ(na, nb) << "both nodes mark the share the same way";
+        EXPECT_EQ(na, expect[i].second);
+        EXPECT_EQ(nb, expect[i].second);
+    }
+    EXPECT_EQ(naughty_on(*rig.b, s_hi.hash), 0)
+        << "a node whose own template has no fees does not punish an honest high-fee share";
 }
