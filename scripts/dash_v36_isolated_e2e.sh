@@ -37,15 +37,19 @@
 #   5 stall:   the manifest's stall share (minted after a 700 s gap: emergency
 #              decay) carries an easier max_bits than the no-stall job, and
 #              both real nodes verified it
-#   6 v16 peer: a p2pool-dash style peer advertising protocol 1700 is refused
-#              at the handshake (EOF, "peer protocol below min-protocol floor"),
-#              one advertising 3600 is admitted; nobody is banned, the real
-#              pair stays peered
+#   6 old peers: stand-in peers advertising protocol 1700 (p2pool-dash) and
+#              3600 (a c2pool-dash build without v36 isolated support) are
+#              refused at the handshake (EOF, "peer protocol below min-protocol
+#              floor: peer build lacks v36 isolated support -- upgrade"), one
+#              advertising 3601 (this build) is admitted; nobody is banned, the
+#              real pair stays peered
 #   7 master:  (MASTER_BIN only) a master-built c2pool-dash with the SAME
-#              identity advertises 3600 and is admitted, but cannot parse a
-#              type-36 share ("version unsupported"): it stays chainless and
-#              neither side bans; a master node on the PUBLIC testnet identity
-#              cannot even frame a message ("prefix doesn't match")
+#              identity advertises 3600 and is refused at the handshake by the
+#              seed node ("peer build lacks v36 isolated support"): it never
+#              receives a share ('version unsupported' x0), stays chainless,
+#              neither side bans and both stay up; a master node on the PUBLIC
+#              testnet identity cannot even frame a message ("prefix doesn't
+#              match")
 #   8 loopback: 0 non-loopback coin-p2p connections
 # Runtime ~5-10 min (two seedings at 2^20 X11 per share); not in CI.
 set -u
@@ -94,6 +98,7 @@ get() { curl -s --max-time 5 "http://127.0.0.1:$1$2"; }
 jget() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval('d'+sys.argv[1]))" "$1"; }
 peers_of() { local v; v=$(get "$1" /local_stats | jget '["peers"]["incoming"]+d["peers"]["outgoing"]' 2>/dev/null); echo "${v:-0}"; }
 peers_ge() { [ "$(peers_of "$1")" -ge "$2" ] 2>/dev/null; }
+peers_zero() { [ "$(peers_of "$1")" = 0 ]; }
 # /sharechain/window reduced to what both nodes must agree on, one line per share.
 window() {
   get "$1" /sharechain/window | python3 -c '
@@ -227,34 +232,49 @@ PY
     echo "E2E SKIP: 5 stall (COUNT < 104)"
   fi
 
-  # ── 6. v16 / p2pool-dash peer at the handshake ───────────────────────────
+  # ── 6. old peers (p2pool-dash 1700, build without v36 isolated support 3600) at the handshake
+  # grep the ASCII part of the refusal only (the full line carries an em dash).
+  local REFUSE="peer build lacks v36 isolated support"
   local before; before=$(count "disconnected: peer protocol below min-protocol floor" "$SL")
-  local R1700 R3600
+  local ubefore; ubefore=$(count "$REFUSE" "$SL")
+  local R1700 R3600 R3601
   R1700=$(python3 "$HERE/dash_v36_peer_standin.py" --port "${P2P[$SEED]}" --prefix "$PREFIX" --proto 1700 --hold 5)
   R3600=$(python3 "$HERE/dash_v36_peer_standin.py" --port "${P2P[$SEED]}" --prefix "$PREFIX" --proto 3600 --hold 5)
+  R3601=$(python3 "$HERE/dash_v36_peer_standin.py" --port "${P2P[$SEED]}" --prefix "$PREFIX" --proto 3601 --hold 5)
   case "$R1700" in "EOF after"*) ;; *) fail "1700 peer not refused: $R1700" ;; esac
-  case "$R3600" in "still open"*) ;; *) fail "3600 peer not admitted: $R3600" ;; esac
-  wait_for 10 "seed log records the floor refusal" \
-    sh -c "[ \$(grep -c 'disconnected: peer protocol below min-protocol floor' '$SL') -gt $before ]"
+  case "$R3600" in "EOF after"*) ;; *) fail "3600 peer (build without v36 isolated support) not refused: $R3600" ;; esac
+  case "$R3601" in "still open"*) ;; *) fail "3601 peer not admitted: $R3601" ;; esac
+  wait_for 10 "seed log records both floor refusals" \
+    sh -c "[ \$(grep -c 'disconnected: peer protocol below min-protocol floor' '$SL') -ge $((before + 2)) ]"
+  wait_for 10 "seed log names the missing v36 isolated support twice" \
+    sh -c "[ \$(grep -c '$REFUSE' '$SL') -ge $((ubefore + 2)) ]"
   [ "$(count "banning peer" "$SL")" = 0 ] || fail "seed node banned a peer"
   peers_ge "${WEB[$SEED]}" 1 || fail "the real pair lost its peering"
   alive "$SEED" && alive "$FOLLOW" || fail "a node died"
-  pass "6 v16 peer: proto 1700 -> '$R1700'; proto 3600 -> '$R3600'; seed node: 0 bans, real pair still peered"
-  grep -m1 "disconnected: peer protocol below min-protocol floor" "$SL" | sed 's/^/   /'
+  pass "6 old peers: proto 1700 -> '$R1700'; proto 3600 -> '$R3600'; proto 3601 -> '$R3601'; seed node: 0 bans, real pair still peered"
+  grep "$REFUSE" "$SL" | tail -2 | sed 's/^/   /'
 
   # ── 7. master-built node ──────────────────────────────────────────────────
   if [ -n "$MASTER_BIN" ]; then
+    local mbefore; mbefore=$(count "$REFUSE" "$SL")
     start M "$D/M.log" "$MASTER_BIN" "${COMMON[@]}" --data-dir "$D/M" --listen 127.0.0.1:19813 \
       --web-port 19093 --stratum 127.0.0.1:19923 --connect "127.0.0.1:${P2P[$SEED]}"
-    wait_for 90 "master node peers with the seed node" peers_ge 19093 1
-    wait_for 90 "master node fails to parse a type-36 share" grep -q "version unsupported" "$D/M.log"
+    wait_for 90 "seed node refuses the master build at the handshake" \
+      sh -c "[ \$(grep -c '$REFUSE' '$SL') -gt $mbefore ]"
     sleep 20
+    local MR; MR=$(( $(count "$REFUSE" "$SL") - mbefore ))
+    [ "$(count "version unsupported" "$D/M.log")" = 0 ] \
+      || { grep -m3 "version unsupported" "$D/M.log"; fail "master node was sent type-36 shares"; }
     local MT; MT=$(get 19093 /sharechain/window | jget '["total"]' 2>/dev/null)
     [ "${MT:-0}" = 0 ] || fail "master node holds $MT shares of the v36 chain"
     [ "$(count "banning peer" "$D/M.log")$(count "banning peer" "$SL")" = "00" ] || fail "ban on master interop"
     alive M && alive "$SEED" || fail "a node died on master interop"
-    pass "7a master (same identity): admitted at 3600, 'version unsupported' x$(count "version unsupported" "$D/M.log"), 0 shares held, 0 bans"
-    grep -m1 "version unsupported" "$D/M.log" | sed 's/^/   /'
+    # Not a single sample: the master build redials, and on each connect the two
+    # version messages cross (it may register the seed for a moment before EOF).
+    wait_for 15 "master node is not left peered after the refusal" peers_zero 19093
+    peers_ge "${WEB[$SEED]}" 1 || fail "the real pair lost its peering"
+    pass "7a master (same identity): refused at handshake ('$REFUSE') x$MR, 'version unsupported' x0, 0 shares, 0 bans, master unpeered"
+    grep "$REFUSE" "$SL" | tail -1 | sed 's/^/   /'
     stop M
     local pbefore; pbefore=$(count "prefix doesn't match" "$SL")
     start P "$D/P.log" "$MASTER_BIN" --run --testnet --web-host 127.0.0.1 --coin-p2p-connect 127.0.0.1:1 \
