@@ -2119,7 +2119,10 @@ private:
                 if (w == m_won_by_bid.end()) continue;   // evicted since: nothing to offer
                 f = w->second;
             }
-            if (!m_net.send_to(p, f)) return;   // gone (or dropped): its down event clears the TODO
+            if (!m_net.send_to(p, f)) {   // gone (or dropped): never leave a TODO behind a link that ended
+                if (!m_net.has_peer(p)) { std::lock_guard<std::mutex> lk(m_bmtx); m_won_offer.erase(p); }
+                return;
+            }
             m_st.won_reoffered++;
             note_won_sent(p, bid);
         }
