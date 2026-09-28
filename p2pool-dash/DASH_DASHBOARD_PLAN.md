@@ -5,7 +5,7 @@ Owner: dashboard-steward. Charter: a dashboard must never lie about prod health
 it is visible without anyone asking.
 
 ## Live context
-- Hotel DASH node LIVE on PPLNS, real tenant watching (109.161.57.3:8080).
+- Production DASH node LIVE on PPLNS, with real users watching.
 - Gauge truth caveat: build on #877 (pool_hash_rate / min_difficulty un-fudge)
   and cross-check any new card against an oracle node, not our own JSON.
 

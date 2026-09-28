@@ -500,7 +500,7 @@ TEST(DashBlockWinningMint, AcquirePrimitiveContract)
 // code did not: a non-empty pool yields a non-empty seed (vs the empty standing
 // set that caused txpool==0), and the seed never overshoots the peer cap (vs an
 // unbounded seed that trips p2p.py:488). Selector+cap KAT on real types, NOT a
-// live-socket capture — the wire proof is the hotel #879 remember_tx-out / peer
+// live-socket capture — the wire proof is the production #879 remember_tx-out / peer
 // remembered_txs_size read after merge.
 namespace {
 std::size_t as_bytes(int b) { return static_cast<std::size_t>(b); }

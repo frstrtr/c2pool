@@ -253,7 +253,7 @@ struct CSimplifiedMNListEntry
     }
 };
 
-// TEST SEAM (D2 root-memo regression gates, the 2026-08-07/08 hotel freeze
+// TEST SEAM (D2 root-memo regression gates, the 2026-08-07/08 production freeze
 // class): process-wide count of FULL SML merkle-root computations. The memo
 // tests count the actual hashing work — not calls to some wrapper a future
 // refactor could bypass — so a memo defeated by hashing a fresh per-call

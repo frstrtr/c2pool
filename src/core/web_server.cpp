@@ -2660,7 +2660,7 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         // repair paths normally fill that difficulty and this row becomes
         // "simple_avg"; the label survives only for a row whose header is still
         // unavailable (never synced), where it correctly reads "unavailable".
-        // #942 second slice, extended to EVERY unmeasured field (hotel,
+        // #942 second slice, extended to EVERY unmeasured field (production node,
         // 2026-08-05): the primary's rows for our own blocks rendered
         // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
         // were data. A zero that was never measured is emitted as null — the
@@ -3083,7 +3083,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["network_hashrate"] = net_hashrate;
     result["shares_in_chain"] = total_shares;
     result["unique_miners"] = unique_miners;
-    // WHAT unique_miners COUNTS, stated so the card can label it (hotel,
+    // WHAT unique_miners COUNTS, stated so the card can label it (production node,
     // 2026-08-05: the operator read 5 against ~33 connected rigs and called
     // it wrong — it was counting something else). It is the number of
     // DISTINCT PAYOUT ADDRESSES holding shares in the sharechain window,
@@ -3101,7 +3101,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["uptime_seconds"] = rest_uptime();
     result["status"] = "operational";
     // last_block: was a hardcoded 0 since the field's introduction — never
-    // set on any chain (both hotel nodes showed 0 with 100+ ledger rows).
+    // set on any chain (both production nodes showed 0 with 100+ ledger rows).
     // Sourced from the found-block ledger (persistent, so a restart does not
     // zero it): the newest row for THIS node's primary chain.
     {
@@ -3692,7 +3692,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
 
-    // ── MEASUREMENT FALLBACKS (hotel, 2026-08-05) ────────────────────────
+    // ── MEASUREMENT FALLBACKS (production node, 2026-08-05) ────────────────────────
     // Both record paths passed mi->get_network_difficulty(), which reads a
     // cache that is only refreshed when somebody polls /local_stats — so a
     // block found before the first dashboard hit was recorded with
@@ -3731,7 +3731,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         }
     }
 
-    // Runtime dedup — with ENRICHMENT. Measured (hotel primary): rows for
+    // Runtime dedup — with ENRICHMENT. Measured (primary node): rows for
     // OUR OWN blocks h=2516911/2516914 sat as miner="" share="" subsidy=0
     // junk forever, because they were persisted by an older binary before
     // attribution existed, restored at startup, and the plain early-return
@@ -4537,7 +4537,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     double burn_amount = 0.0;
     if (block_value == 0.0 && coin_work.valid) {
         block_value    = static_cast<double>(coin_work.coinbase_value_sat) / 1e8;
-        // MEASURED WRONG SPLIT (hotel, 2026-08-05, DASH mainnet). The
+        // MEASURED WRONG SPLIT (production node, 2026-08-05, DASH mainnet). The
         // dashboard said miner_gross=0.9404 (53% of the block) while the
         // ACCEPTED coinbase of our own h=2516911 paid miners 0.4428 (25%):
         // payment_amount_sat carries only the projected MN payee — it rides
@@ -4555,7 +4555,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["block_value"] = block_value;
     // WHICH template the number describes, and how old it is. block_value
     // renders identically whether the template is live or was last sourced
-    // an hour ago (hotel primary: 0 local miners => nothing refreshes it) —
+    // an hour ago (primary node: 0 local miners => nothing refreshes it) —
     // the height + age let the dashboard say so instead of presenting a
     // stale number as current.
     if (coin_work.valid) {
@@ -4852,7 +4852,7 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     result["donation_proportion"] = m_pool_fee_percent / 100.0;
     result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
-    // UNITS, stated (hotel, 2026-08-05: the operator could not tell from the
+    // UNITS, stated (production node, 2026-08-05: the operator could not tell from the
     // payload whether fee=1.0 meant 1% or a proportion of 1.0 = 100%, because
     // the sibling donation_proportion IS a proportion where 1.0 would mean
     // 100%). `fee` and /fee stay p2pool-compat percent; these two name their
@@ -5928,7 +5928,7 @@ nlohmann::json MiningInterface::rest_luck_stats()
         // luck==0 is "never computed" (relay-learned row, or recorded with
         // no network difficulty), not "0% lucky". The chart previously drew
         // those as 0-value points, which is exactly the wrong-luck-trend the
-        // hotel dashboards showed on 2026-08-05: emit null so the trend
+        // production dashboards showed on 2026-08-05: emit null so the trend
         // SKIPS them instead of plotting a fabricated catastrophe.
         blocks.push_back({{"ts", b.ts}, {"hash", b.hash},
                           {"luck", b.luck > 0.0 ? nlohmann::json(b.luck)
@@ -8344,7 +8344,7 @@ void MiningInterface::update_stat_log()
     // workers the local registry is empty, but the pool still has miners — the
     // distinct sharechain payout addresses. Use the SAME count /global_stats
     // reports as unique_miners (shares_by_miner.size()) so the graph matches the
-    // live card. Only when the local registry is genuinely empty; a hotel node
+    // live card. Only when the local registry is genuinely empty; a production node
     // with local rigs keeps its byte-identical local count. connected_miners /
     // worker_count / local_hash_rate stay local-scoped (0 is the truth there).
     if (entry.miner_count == 0 && m_sharechain_stats_fn) {
@@ -9098,7 +9098,7 @@ void MiningInterface::load_stat_log()
 }
 
 // ── ALL-TIME best share: survives restarts ──────────────────────────────
-// Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+// Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
 // best_share reported all_time == session == round because the all-time leg
 // lived only in memory — every restart re-founded "all time", and the card
 // silently redefined the word. Only the all-time leg is persisted: session
@@ -10176,7 +10176,7 @@ void WebServer::execute_debounced_work_refresh()
 
 void WebServer::trigger_work_refresh_debounced()
 {
-    // ── Notify debounce (hotel interim fix #3) ──
+    // ── Notify debounce (interim hardening fix #3) ──
     // Share-arrival storms used to fan out into one full refresh_work() +
     // notify_all() per share (the old body here was a no-op stub that called
     // refresh immediately). Semantics now:

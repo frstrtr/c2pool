@@ -14,7 +14,7 @@
 /// exists, populated() stays false forever on a cold start and get_work()
 /// routes to the dashd-RPC fallback arm.
 ///
-/// THE SEED: when a coin-RPC is configured (the mining-hotel posture — dashd
+/// THE SEED: when a coin-RPC is configured (the production posture — dashd
 /// present), fetch the full REGISTERED deterministic-MN set ONCE at startup
 /// via `protx list registered true` and convert it here into the exact
 /// vector<pair<proTxHash, MNState>> the maintainer's resync leg takes. That

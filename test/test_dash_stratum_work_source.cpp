@@ -1272,7 +1272,7 @@ TEST(DashStratumWorkSource, ReconnectInvalidatesOnlyWhenTipChanged)
     EXPECT_EQ(notify_count, 2);                            // fail-safe invalidate fired
 }
 
-// ── io-thread-decouple KAT (mining-hotel stratum-stall fix, v0.2.3.8) ────────
+// ── io-thread-decouple KAT (production stratum-stall fix, v0.2.3.8) ────────
 // The stall fix: the stratum io_context thread must NEVER block on the dashd
 // fallback getblocktemplate. cached_work() re-sources through a background
 // executor (the dedicated rpc_pool in main_dash.cpp) as a SINGLE-FLIGHT job and
@@ -2045,7 +2045,7 @@ TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnQuorumRootMismatch)
 // Byte-neutral proof: when the embedded merkleRootQuorums (and merkleRootMNList
 // and creditPool) already MATCH dashd's, the unconditional xcheck adds NO swap and
 // the served bytes ARE the embedded template's, unchanged. This is why extending
-// the xcheck changes nothing on today's non-null hotel templates (whose roots
+// the xcheck changes nothing on today's non-null production templates (whose roots
 // match dashd byte-for-byte).
 TEST(DashStratumC1MainnetGate, GbtXcheckQuorumRootMatchServesEmbeddedUnchanged)
 {
@@ -2703,7 +2703,7 @@ TEST(DashStratumCoinP2pTipInvalidate, BumpAloneServesStaleUnderRefreshExecutor)
 // the embedded opt-in imply its own feed.
 //
 // ★ The converse must NEVER hold. A transport flag moving the arm is the exact
-// shape of the live-hotel incident (--coin-p2p-connect activating an unguarded
+// shape of the live-production incident (--coin-p2p-connect activating an unguarded
 // embedded arm on a production node, real money). The two REWARD-SAFETY pins
 // below are load-bearing: a default `--run` and `--coin-p2p-connect` alone must
 // BOTH still resolve dashd-fallback.
@@ -2769,7 +2769,7 @@ TEST(DashRunArmResolution, DefaultRunResolvesDashdFallback)
     EXPECT_EQ(served_arm_for(argv_bare()), dash::coin::WorkSource::DashdFallback);
 }
 
-// ── REWARD-SAFETY PIN 2: the hotel incident. A transport flag alone must NOT
+// ── REWARD-SAFETY PIN 2: the production incident. A transport flag alone must NOT
 // flip the arm — on its own it brings up the coin-network connection and
 // NOTHING else. This is the pin that would have caught that incident. ─────────
 TEST(DashRunArmResolution, CoinP2pConnectAloneStillResolvesDashdFallback)
@@ -2893,7 +2893,7 @@ using dash::coin::ServeGateJournal;
 using Trig = dash::coin::ServeGateJournal::Trigger;
 
 // ── Episode DURATION: the metric that actually ranks the causes ─────────────
-// Measured on the hotel node over 5h33m (2026-08-06): 109 `dmn-stale` episodes
+// Measured on the production node over 5h33m (2026-08-06): 109 `dmn-stale` episodes
 // vs 3 `qc-plan-underivable`. BY COUNT dmn-stale is 97% of the problem. BY TIME
 // OFF THE EMBEDDED ARM, 104 of those 109 lasted under a second (~54 ms each,
 // 5.6 s in total — the ordinary tip-change -> getmnlistd round trip) while the
