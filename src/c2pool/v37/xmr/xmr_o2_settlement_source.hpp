@@ -382,32 +382,44 @@ public:
             for (const auto& w : pv->wp) {
                 if (pv->ref.count(w.key)) continue;
                 const ::v37::ScriptRef r = pay_of(w.key);
-                if (!::v37::xmr::xmr_ref_valid(r)) { payable = false; break; }
+                if (!::v37::xmr::xmr_ref_valid(r)) { payable = false; continue; }
                 pv->ref[w.key] = r;
             }
+            // E_b is split over the WHOLE cut (every payee, payable or not), so
+            // each entry's eb is exactly what FINALIZE credits it; an
+            // unpayable payee is only left out of the entries.
+            std::shared_ptr<const PayNowSet> cpv = pv;
+            in.paynow_at = [cpv](std::uint64_t budget) {
+                const std::vector<std::uint64_t> amt = ::c2pool::v37n::settle::split_reward(budget, cpv->wp);
+                std::map<::v37::bytes32, std::uint64_t> agg;   // == fold_eb's credit map (key ASC)
+                for (std::size_t i = 0; i < cpv->wp.size(); ++i)
+                    if (amt[i] > 0) agg[cpv->wp[i].key] += amt[i];
+                std::vector<x6::PayNowEntry> out;
+                out.reserve(agg.size());
+                for (const auto& [k, v] : agg) {
+                    const auto r = cpv->ref.find(k);
+                    if (r == cpv->ref.end()) continue;          // unpayable: keeps its E_b as owed
+                    x6::PayNowEntry e;
+                    e.pay = r->second;
+                    e.identity = k;
+                    e.eb = v;
+                    out.push_back(std::move(e));
+                }
+                return out;
+            };
+            in.paynow_n = pv->ref.size();
             if (payable) {
                 std::uint64_t base = fixed_sum;
                 for (const auto& e : in.owed) base += e.owed;
-                std::shared_ptr<const PayNowSet> cpv = pv;
-                in.paynow_at = [cpv](std::uint64_t budget) {
-                    const std::vector<std::uint64_t> amt = ::c2pool::v37n::settle::split_reward(budget, cpv->wp);
-                    std::map<::v37::bytes32, std::uint64_t> agg;   // == fold_eb's credit map (key ASC)
-                    for (std::size_t i = 0; i < cpv->wp.size(); ++i)
-                        if (amt[i] > 0) agg[cpv->wp[i].key] += amt[i];
-                    std::vector<x6::PayNowEntry> out;
-                    out.reserve(agg.size());
-                    for (const auto& [k, v] : agg) {
-                        x6::PayNowEntry e;
-                        e.pay = cpv->ref.at(k);
-                        e.identity = k;
-                        e.eb = v;
-                        out.push_back(std::move(e));
-                    }
-                    return out;
-                };
-                in.paynow_n = pv->ref.size();
                 s->m_paynow_on = true;
                 s->m_paynow_base = base;
+            } else {
+                // A cut payee has no payable ref: the receiver's V37N split is
+                // over the whole cut, so no base can be committed. Pay the
+                // payable ones in FILL mode instead of leaving the pool to the
+                // residual.
+                in.paynow_fill = true;
+                s->m_paynow_fill = true;
             }
         }
 
@@ -438,9 +450,11 @@ public:
         s->m_built = x6::build_coinbase(s->inputs_at(reward_hint, {}));
         if (!s->m_built.ok && s->m_paynow_on && s->m_built.error == x6::BuildError::CapTooSmall) {
             // pay-now needs output slots the cap does not have: this snapshot
-            // serves master's residual shape and commits no V37N base.
-            in.paynow_at = nullptr; in.paynow_n = 0;
-            s->m_paynow_on = false; s->m_paynow_base = 0;
+            // commits no V37N base and pays in FILL mode (largest E_b first,
+            // as many as the free slots hold) instead of leaving the pool to
+            // the residual sink while the cut is credited E_b in full.
+            in.paynow_fill = true;
+            s->m_paynow_on = false; s->m_paynow_base = 0; s->m_paynow_fill = true;
             s->m_ecut_finder.reset();   // EMPTY-CUT FINDER rides pay-now: dropped with it
             s->m_built = x6::build_coinbase(s->inputs_at(reward_hint, {}));
         }
@@ -589,6 +603,9 @@ public:
     std::size_t               carried_unpayable() const { return m_unpayable; }
     // SAME-BLOCK PAY-NOW: armed for this snapshot, and its committed base B.
     bool                      paynow_on()   const { return m_paynow_on; }
+    // PAY-NOW FILL: pay-now served without a V37N base (cap too small or an
+    // unpayable cut payee; see x6::CoinbaseInputs::paynow_fill).
+    bool                      paynow_fill() const { return m_paynow_fill; }
     std::uint64_t             paynow_base() const { return m_paynow_base; }
     // EMPTY-CUT FINDER: the committed finder payee (armed only in an empty cut).
     const std::optional<::v37::ScriptRef>& ecut_finder() const { return m_ecut_finder; }
@@ -681,6 +698,8 @@ private:
             return std::vector<x6::PayNowEntry>{e};
         };
         m_inputs.paynow_n = 1;
+        m_inputs.paynow_fill = false;
+        m_paynow_fill = false;
         m_paynow_on = true;
         m_paynow_base = m_ecut_base;
         m_ecut_finder = fr;
@@ -719,6 +738,7 @@ private:
     ::v37::bytes32       m_owed_digest{};
     std::size_t          m_unpayable = 0;
     bool                 m_paynow_on = false;
+    bool                 m_paynow_fill = false;
     std::uint64_t        m_paynow_base = 0;
     std::optional<::v37::ScriptRef> m_ecut_finder;   // EMPTY-CUT FINDER (V37F)
     bool                 m_ecut_eligible = false;   // the cut is empty (with_finder may arm)

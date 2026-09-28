@@ -266,7 +266,7 @@ void suite_alloc() {
         CHECK(nD == 1 && outs.back().identity == D && amount_to(outs, D) == 1 + alD && outs.back().owed_part == 0,
               "(e) donation E_b share %llu merges into the ONE donation output (1 + share), owed_part 0 (coverage)", (unsigned long long)alD);
     }
-    // (f) cap: pay-now needs 3 new slots, the cap leaves 1 -> fail closed (the provider then drops pay-now)
+    // (f) cap: pay-now needs 3 new slots, the cap leaves 1 -> fail closed (the provider then rebuilds in FILL mode, P6)
     {
         auto in = fee_on_inputs(kReward); arm_paynow(in, ps); in.output_cap = 2;
         x6::BuildError err{};
@@ -496,6 +496,125 @@ void suite_base() {
     CHECK(false, "net-at-FOUND pay-now booking (xmr_paynow.hpp) is absent");
 }
 #endif
+#if PAYNOW_FIX
+// ---------------------------------------------------------------------------
+// P6 -- PAY-NOW FILL. When the full pay-now does not fit the output cap, or a
+// cut payee has no payable ref, the builder used to drop pay-now and leave the
+// whole pool to the residual sink while the cut was still credited E_b in
+// full at FINALIZE (the ledger then owed cash it had already sent to the
+// sink). FILL pays the largest E_b first into the free slots, each <= its E_b,
+// commits no V37N base, and the receiver books the outputs as plain payouts.
+void suite_fill() {
+    std::printf("== P6. pay-now FILL (cap too small / unpayable payee) ==\n");
+    namespace pn = c2pool::v37n::xmr::paynow;
+    const auto ps = three_payees();
+    const ::v37::bytes32 D = fee::donation_identity(kNet);
+    const auto eb = eb_at(kReward, ps);
+    std::size_t big = 0, small = 0;
+    for (std::size_t i = 1; i < ps.size(); ++i) {
+        if (eb.at(ps[i].id) > eb.at(ps[big].id)) big = i;
+        if (eb.at(ps[i].id) < eb.at(ps[small].id)) small = i;
+    }
+    // (a) cap leaves ONE slot for three payees: the largest E_b gets it, in full
+    auto in = fee_on_inputs(kReward); arm_paynow(in, ps); in.output_cap = 2; in.paynow_fill = true;
+    x6::BuildError err{};
+    const auto outs = x6::allocate_exact_sum(in, &err);
+    bool capped = true; for (const auto& p : ps) if (amount_to(outs, p.id) > eb.at(p.id)) capped = false;
+    CHECK(err == x6::BuildError::None && outs.size() <= 2 && sum_of(outs) == kReward,
+          "(a) FILL never fails on the cap: %zu outputs <= cap 2, exact-sum", outs.size());
+    CHECK(amount_to(outs, ps[big].id) == eb.at(ps[big].id) && capped &&
+          amount_to(outs, D) == kReward - eb.at(ps[big].id),
+          "(a) the one free slot pays the largest E_b in full (%llu); donation keeps the rest; every share <= its E_b",
+          (unsigned long long)eb.at(ps[big].id));
+    // (b) no free slot, but a payee with an owed output still gets its E_b merged there
+    {
+        auto in2 = fee_on_inputs(kReward); arm_paynow(in2, ps); in2.output_cap = 2; in2.paynow_fill = true;
+        x6::OwedEntry o; o.pay = ps[small].ref; o.identity = ps[small].id; o.owed = 1000; o.first_eligible = 0;
+        in2.owed = {o};
+        const auto o2s = x6::allocate_exact_sum(in2, &err);
+        CHECK(err == x6::BuildError::None && o2s.size() == 2 &&
+              amount_to(o2s, ps[small].id) == 1000 + eb.at(ps[small].id) && amount_to(o2s, ps[big].id) == 0,
+              "(b) cap full after the owed pass: the owed payee gets its E_b merged (1000 + %llu), no new slot is taken",
+              (unsigned long long)eb.at(ps[small].id));
+    }
+    // (c) receive side: no V37N -> plain booking; FINALIZE settles every key at E_b - paid >= 0,
+    //     and what the ledger still owes equals exactly the cash not yet paid to miners
+    {
+        Amounts credit; for (const auto& [k, v] : eb) credit[k] = static_cast<long long>(v);
+        Amounts payout; std::uint64_t to_miners = 0;
+        for (const auto& o : outs) if (o.identity != D) { payout[o.identity] += static_cast<long long>(o.amount); to_miners += o.amount; }
+        const Amounts c0 = credit, p0 = payout;
+        const auto r = pn::net_booking(std::nullopt, kReward, credit, payout, 0, D, 1);
+        CHECK(r.ok && credit == c0 && payout == p0, "(c) no V37N tail: net_booking is a no-op, the outputs book as payouts");
+        st::OwedLedger L(7);
+        L.on_block_found("f1", credit, payout);
+        L.on_block_finalized("f1", 2);
+        long long sum = 0, mn = 0;
+        for (const auto& [k, v] : L.finalW()) { sum += v; if (v < mn) mn = v; }
+        CHECK(mn == 0 && sum == static_cast<long long>(kReward - to_miners),
+              "(c) FINALIZE: no key negative; outstanding owed %lld == reward - paid to miners (%llu)",
+              sum, (unsigned long long)(kReward - to_miners));
+        CHECK(to_miners == eb.at(ps[big].id),
+              "(c) versus the old drop (0 paid to miners, the whole reward left owed): FILL settled %llu now",
+              (unsigned long long)to_miners);
+    }
+    // (d) + (e) the settlement source picks FILL on its own
+    st::OwedLedger L(7);
+    std::map<::v37::bytes32, ::v37::ScriptRef> refs;
+    for (const auto& p : ps) refs[p.id] = p.ref;
+    refs[D] = fee::donation_ref(kNet);
+    o2::PayOfFn pay_of = [refs](const ::v37::bytes32& k) {
+        auto it = refs.find(k); if (it != refs.end()) return it->second;
+        ::v37::ScriptRef r; r.kind = ::v37::ScriptKind::RAW; return r; };
+    o2::XmrCoinbaseContext ctx;
+    ctx.monero_major_version = 16; ctx.height = 1234; ctx.base_reward = kReward; ctx.fees = 0; ctx.chain_id = 7;
+    ctx.lane_commitment = L.owed_digest();
+    ctx.residual_sink = fee::donation_ref(kNet); ctx.residual_sink_identity = D;
+    ctx.fixed = {fee::donation_marker(kNet)}; ctx.h_min = 0; ctx.output_cap = 2;
+    ctx.has_credit_cut = true; ctx.credit_cut.next_pos = 99;
+    ctx.has_paynow = true;
+    for (const auto& p : ps) { st::WeightedPayee w; w.key = p.id; w.weight = ::v37::U256(p.w); w.pay = p.ref; ctx.paynow_payees.push_back(w); }
+    std::string why;
+    {
+        auto src = o2::XmrOwedSettlementSource::build(L, pay_of, ctx, kReward, &why);
+        CHECK(src != nullptr, "(d) cap 2: source builds: %s", why.empty() ? "ok" : why.c_str());
+        if (src) {
+            CHECK(!src->paynow_on() && src->paynow_fill() && !pn::parse_payload(src->extra_nonce_tail()),
+                  "(d) cap too small: FILL, no V37N base committed");
+            bool ok = true;
+            for (std::uint64_t R : std::vector<std::uint64_t>{kReward, kReward + 777777ull}) {
+                const auto pm = src->payout_map_at(R);
+                const auto e = eb_at(R, ps);
+                const long long got = pm.count(ps[big].id) ? pm.at(ps[big].id) : 0;
+                if (!src->shape_matches_at(R) || got != static_cast<long long>(e.at(ps[big].id))) ok = false;
+            }
+            CHECK(ok, "(d) the largest E_b payee is paid its E_b in full at both rewards; shape stable");
+        }
+    }
+    {
+        // a fourth cut payee whose ref is unknown: no V37N possible (the receiver
+        // splits over the whole cut), the three payable ones are paid in FILL
+        o2::XmrCoinbaseContext c4 = ctx; c4.output_cap = 64;
+        const auto U = ref_of(66);
+        st::WeightedPayee w; w.key = id_of(U); w.weight = ::v37::U256(4); w.pay = U; c4.paynow_payees.push_back(w);
+        std::sort(c4.paynow_payees.begin(), c4.paynow_payees.end(),
+                  [](const st::WeightedPayee& a, const st::WeightedPayee& b) { return a.key < b.key; });
+        auto src = o2::XmrOwedSettlementSource::build(L, pay_of, c4, kReward, &why);
+        CHECK(src && !src->paynow_on() && src->paynow_fill(), "(e) an unpayable cut payee: FILL instead of dropping pay-now");
+        if (src) {
+            std::vector<Payee> all = ps; all.push_back({U, id_of(U), 4});
+            std::sort(all.begin(), all.end(), [](const Payee& a, const Payee& b) { return a.id < b.id; });
+            const auto e = eb_at(kReward, all);
+            const auto pm = src->payout_map_at(kReward);
+            bool ok = true;
+            for (const auto& p : ps) if (!pm.count(p.id) || pm.at(p.id) != static_cast<long long>(e.at(p.id))) ok = false;
+            CHECK(ok && !pm.count(id_of(U)),
+                  "(e) each payable payee is paid exactly its E_b over the whole cut; the unpayable one keeps its %llu owed",
+                  (unsigned long long)e.at(id_of(U)));
+        }
+    }
+}
+#endif
 
 }  // namespace
 
@@ -507,6 +626,7 @@ int main() {
     suite_booking();
     suite_source();
     suite_assembled();
+    suite_fill();
 #else
     suite_base();
 #endif

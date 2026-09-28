@@ -204,6 +204,16 @@ struct CoinbaseInputs {
     // upper bound on the entry count (the assembler's weight reserve).
     std::function<std::vector<PayNowEntry>(std::uint64_t budget)> paynow_at;
     std::size_t    paynow_n = 0;
+    // PAY-NOW FILL (no V37N commitment): used when the full pay-now does not
+    // fit the output cap or a cut payee is unpayable. Instead of leaving the
+    // pool to the residual, pay the entries LARGEST E_b first (ties identity
+    // ASC), each min(E_b, what is left), merged into its owed output when it
+    // has one, else a new output while a slot is free; entries without a slot
+    // are skipped and keep their whole E_b as owed. Never fails on the cap.
+    // Receivers book these outputs as ordinary payouts (no tail => no net
+    // booking): FINALIZE then credits E_b gross, so each paid key settles at
+    // E_b - paid >= 0 (Rule L: nothing above the payee's own E_b).
+    bool           paynow_fill = false;
 
     // --- tx_extra ---
     std::vector<unsigned char> extra_nonce; // 0x02 padded per-worker extranonce

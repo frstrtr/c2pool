@@ -237,8 +237,54 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
     // folded donation output / the sink output, where the receive side books
     // it (xmr_paynow.hpp). Pay-now never exceeds the output cap: an entry that
     // needs a slot the cap does not have fails the build closed (the provider
-    // then rebuilds without pay-now and without the V37N commitment).
-    if (in.paynow_at) {
+    // then rebuilds in PAY-NOW FILL mode, below, without the V37N commitment).
+    if (in.paynow_at && in.paynow_fill) {
+        std::uint64_t pool = remaining > fold_min ? remaining - fold_min : 0;
+        if (pool > 0) {
+            const std::vector<PayNowEntry> ents = in.paynow_at(budget);
+            std::vector<std::size_t> order(ents.size());
+            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                if (ents[a].eb != ents[b].eb) return ents[a].eb > ents[b].eb;
+                return std::memcmp(ents[a].identity.data(), ents[b].identity.data(),
+                                   ents[a].identity.size()) < 0;
+            });
+            const std::size_t first_new = res.size();
+            for (std::size_t j = 0; j < order.size() && pool > 0; ++j) {
+                const PayNowEntry& e = ents[order[j]];
+                if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink)
+                    continue;                                   // stays in the residual (sink / donation output)
+                const std::uint64_t amt = std::min(e.eb, pool);
+                if (amt == 0) continue;
+                bool paid = false;
+                for (std::size_t i = 0; i < first_new; ++i) {
+                    auto& o = res[i];
+                    if (o.role == CoinbaseOutput::Role::Owed && o.identity == e.identity && o.pay == e.pay) {
+                        o.amount += amt; paid = true; break;
+                    }
+                }
+                if (!paid && n_slots < cap_owed) {
+                    CoinbaseOutput o;
+                    o.pay = e.pay;
+                    o.identity = e.identity;
+                    o.amount = amt;
+                    o.role = CoinbaseOutput::Role::PayNow;
+                    res.push_back(std::move(o));
+                    ++n_slots;
+                    paid = true;
+                }
+                if (!paid) continue;                            // no slot: keeps its whole E_b as owed
+                pool -= amt;
+                remaining -= amt;
+            }
+            // Same canonical position as the full pay-now: new outputs after
+            // the owed outputs, identity ASC.
+            std::sort(res.begin() + static_cast<std::ptrdiff_t>(first_new), res.end(),
+                      [](const CoinbaseOutput& a, const CoinbaseOutput& b) {
+                          return std::memcmp(a.identity.data(), b.identity.data(), a.identity.size()) < 0;
+                      });
+        }
+    } else if (in.paynow_at) {
         const std::uint64_t pool = remaining > fold_min ? remaining - fold_min : 0;
         if (pool > 0) {
             const std::vector<PayNowEntry> ents = in.paynow_at(budget);
