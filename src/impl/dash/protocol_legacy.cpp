@@ -15,10 +15,20 @@ void Legacy::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
     try 
     {
         result = m_handler.parse(rmsg);
+    } catch (const std::out_of_range& ec)
+    {
+        // Unknown command: dropped, never charged (p2pool-dash skips it,
+        // util/p2protocol.py:49-53).
+        LOG_WARNING << "Failed to parse message '" << rmsg->m_command << "' from "
+                    << peer->addr().to_string() << ": " << ec.what();
+        return;
     } catch (const std::exception& ec)
     {
         LOG_WARNING << "Failed to parse message '" << rmsg->m_command << "' from "
                     << peer->addr().to_string() << ": " << ec.what();
+        // #1829: a known command whose payload does not parse. Graded on the
+        // DASH v36 network only (note_misbehaviour filters by network).
+        note_misbehaviour(peer->addr(), misbehaviour::Offence::parse_failure);
         return;
     }
 
@@ -129,6 +139,9 @@ void Legacy::HANDLER(shares)
             {
                 LOG_WARNING << "Failed to load share (type=" << wrappedshare.type
                             << ") from " << peer->addr().to_string() << ": " << e.what();
+                // #1829: DASH v36 network only; on the public network this
+                // (e.g. a share of a type it does not know) is only logged.
+                note_misbehaviour(peer->addr(), misbehaviour::Offence::parse_failure);
                 continue;
             }
 
@@ -253,6 +266,7 @@ void Legacy::HANDLER(sharereply)
             {
                 LOG_WARNING << "Failed to deserialize share (type=" << rshare.type
                             << ") from " << peer->addr().to_string() << ": " << e.what();
+                note_misbehaviour(peer->addr(), misbehaviour::Offence::parse_failure);   // #1829, v36 only
                 continue;
             }
         }

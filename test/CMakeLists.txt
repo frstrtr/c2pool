@@ -453,7 +453,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the REAL Legacy / Actual handle_message of a dash::Node with a counting
     # X11 (dropped before X11 is measured). Same harness and link set; folded
     # in for the same reason.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_share_precheck.cpp)
+    # test_dash_peer_misbehaviour.cpp (#1829): the graded misbehaviour score
+    # and IP ban for sharechain peers, driven through the REAL connected() +
+    # Legacy / Actual handle_message of a dash::Node over loopback sockets
+    # (disconnect, inbound refusal, decay, per-offence weights, public-network
+    # oracle parity, whitelist). Same harness and link set; folded in for the
+    # same reason.
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_share_precheck.cpp test_dash_peer_misbehaviour.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

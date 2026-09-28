@@ -21,6 +21,7 @@
 #include "share_chain.hpp"
 #include "share_tracker.hpp"
 #include "share_precheck.hpp"        // #1828 per-message caps on incoming shares
+#include "peer_misbehaviour.hpp"     // #1829 graded misbehaviour score + IP ban
 #include "peer.hpp"
 #include "min_protocol_gate.hpp"
 #include "tracker_acquire.hpp"       // #889: bounded acquisition — BLOCK-WINNING mint path only
@@ -45,6 +46,7 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -395,6 +397,12 @@ protected:
     std::atomic<uint64_t> m_precheck_dropped_messages{0};
     std::atomic<uint64_t> m_precheck_dropped_shares{0};
 
+    // #1829: offences charged per kind (after the network filter and the
+    // whitelist exemption) and IP bans issued by the scorer. IO thread
+    // writes, anyone reads; diagnostic gauges, relaxed.
+    std::array<std::atomic<uint64_t>, misbehaviour::OFFENCE_COUNT> m_misbehaviour_notes{};
+    std::atomic<uint64_t> m_misbehaviour_bans{0};
+
     // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
     // Runtime P2P accept-floor, seeded from the per-network share profile
     // (SharechainConfig::share_profile().ratchet_floor_protocol_version):
@@ -516,6 +524,19 @@ protected:
     // populated from the config bootstrap list in the ctor).
     std::set<std::string> m_whitelist_ips;
     std::set<NetService> m_whitelist_hosts;
+
+    // #1829 graded misbehaviour score (peer_misbehaviour.hpp), keyed by source
+    // IP so a redial from a new port keeps its score. IO thread only, like
+    // m_ban_list. Crossing the threshold writes m_ip_ban_list (the IP-only ban
+    // that connected() and the dialer already honour) and closes every
+    // connection from that IP. Not persisted; pruned each think cycle.
+    misbehaviour::PeerMisbehaviourScorer<std::string> m_misbehaviour;
+    // Monotonic seconds for the score decay. A seam for the decay KATs; the
+    // ban expiry itself stays on steady_clock like every other ban.
+    std::function<double()> m_misbehaviour_now = [] {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
 
 public:
     // DISPLAY-ONLY read of the live P2P accept-floor (v36 ratchet output). Read
@@ -977,10 +998,25 @@ public:
     /// numbers from the live SharechainConfig::share_profile()) applied to an
     /// incoming 'shares' / 'sharereply' before any share is parsed or hashed.
     /// Erases oversize items in place; returns false when the whole message
-    /// is dropped. Counts, logs (rate-limited); no ban, no disconnect.
+    /// is dropped. Counts, logs (rate-limited) and, on the DASH v36 network,
+    /// charges the sender one precheck_drop offence (#1829).
     /// IO thread. Body in node.cpp.
     bool precheck_raw_shares(std::vector<chain::RawShare>& shares,
                              precheck::Kind kind, const NetService& addr);
+
+    /// #1829: charge one offence to the peer at `addr` (peer_misbehaviour.hpp).
+    /// No-op for a whitelisted peer, for a db-load pseudo-peer (port 0) and for
+    /// an offence the active network does not grade. When the decayed score of
+    /// the peer's IP reaches the threshold: IP ban for m_ban_duration, and
+    /// every connection from that IP is closed. IO thread. Body in node.cpp.
+    void note_misbehaviour(const NetService& addr, misbehaviour::Offence offence);
+
+    /// #1829: drop decayed scorer entries (run_think IO phase). Body in node.cpp.
+    void prune_misbehaviour();
+
+    /// #1829: close every connection (and pending dial) whose address is `ip`.
+    /// Body in node.cpp.
+    void disconnect_ip(const std::string& ip);
 
     std::vector<dash::ShareType> handle_get_share(std::vector<uint256> hashes,
         uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
@@ -1121,6 +1157,19 @@ public:
     }
     uint64_t precheck_dropped_shares() const {
         return m_precheck_dropped_shares.load(std::memory_order_relaxed);
+    }
+
+    /// #1829 observability: the decayed misbehaviour score of `addr`'s IP,
+    /// offences charged of one kind, and IP bans issued by the scorer.
+    /// The score read is IO-thread only (the scorer map is not locked).
+    double misbehaviour_score(const NetService& addr) const {
+        return m_misbehaviour.score(addr.address(), m_misbehaviour_now());
+    }
+    uint64_t misbehaviour_notes(misbehaviour::Offence o) const {
+        return m_misbehaviour_notes[static_cast<std::size_t>(o)].load(std::memory_order_relaxed);
+    }
+    uint64_t misbehaviour_bans() const {
+        return m_misbehaviour_bans.load(std::memory_order_relaxed);
     }
 
     /// Register the current template's txs in m_known_txs so send_shares can
