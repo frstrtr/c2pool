@@ -545,6 +545,22 @@ if (BUILD_TESTING)
         target_compile_definitions(v37_xmr_rx_seed_race_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
         target_link_libraries(v37_xmr_rx_seed_race_kat PRIVATE xmr_coin randomx Threads::Threads)
         add_test(NAME v37_xmr_rx_seed_race_kat COMMAND v37_xmr_rx_seed_race_kat)
+        # v37_xmr_verify_pool_rx_kat (DROPS-VERIFY-SCALE): the relay verifier's
+        # per-worker light VMs on the SHARED seed caches (O2RandomXVerifier::
+        # add_workers / randomx_hash_on): 8 workers hash == the single-VM
+        # reference byte for byte, across seed switches under load, and the
+        # aggregate throughput of N workers vs 1 is printed (M1). Real RandomX,
+        # same leg as above.
+        add_executable(v37_xmr_verify_pool_rx_kat
+            v37_xmr_verify_pool_rx_kat.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+        target_compile_features(v37_xmr_verify_pool_rx_kat PRIVATE cxx_std_20)
+        target_include_directories(v37_xmr_verify_pool_rx_kat PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(v37_xmr_verify_pool_rx_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
+        target_link_libraries(v37_xmr_verify_pool_rx_kat PRIVATE xmr_coin randomx Threads::Threads)
+        add_test(NAME v37_xmr_verify_pool_rx_kat COMMAND v37_xmr_verify_pool_rx_kat)
 
         # v37_xmr_next_seed_kat (NEXT-SEED ANNOUNCE, operator ruling 09-26): the
         # native chain index -> settlement provider -> stratum job serves
@@ -956,7 +972,7 @@ if (BUILD_TESTING)
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat v37_xmr_drops_default_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat)
 
     #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
     #                               relay repair of a lane longer than every
@@ -1013,6 +1029,26 @@ if (BUILD_TESTING)
         target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
         add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
     endforeach()
+    # v37_xmr_verify_pool_kat: with RandomX built, it also links librandomx so
+    # its VP_LIVE=1 measurement mode pays the REAL light hash per verify (the
+    # KAT itself, run by ctest, uses the sleeping fake only).
+    if (TARGET randomx AND TARGET v37_xmr_verify_pool_kat)
+        target_sources(v37_xmr_verify_pool_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+        target_include_directories(v37_xmr_verify_pool_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
+        target_compile_definitions(v37_xmr_verify_pool_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
+        target_link_libraries(v37_xmr_verify_pool_kat PRIVATE randomx)
+    endif()
+    #   v37_xmr_verify_pool_kat     DROPS-VERIFY-SCALE (capstone attempt 5 false
+    #                               start): RelayOptions::verify_threads workers;
+    #                               a 3-node loopback triangle with a sleeping
+    #                               fake RandomX: one worker at ~2x capacity
+    #                               drops + goes late, 4 workers do neither; N=1
+    #                               vs N=8 identical receipt/raindrop sets + lane
+    #                               digest; stop() with a full queue; an
+    #                               rx-unavailable item parked once. RED on the
+    #                               base. TSan: build this TU with
+    #                               -fsanitize=thread -DV37_VERIFY_POOL_TSAN.
+    #                               ALSO on BOTH build.yml --target lists.
     #   v37_xmr_relay_node_nonce_kat NODE-NONCE: HELLO nonce codec + bounds, the
     #                               Family-B opcode map, bootstrap -> seeds, self-
     #                               connection (SELF in the book), one link per pair.

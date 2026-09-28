@@ -340,4 +340,17 @@ void Legacy::HANDLER(tx_inject)
     handle_peer_tx_inject(*msg, peer);
 }
 
+// D-MINER.7: miner-offline alert relay (non-consensus). The whole policy lives
+// in NodeImpl::handle_peer_alert / handle_peer_alertack (inert when no
+// --alert-relay-* role is armed), so the Legacy/Actual bodies stay identical.
+void Legacy::HANDLER(alert)
+{
+    handle_peer_alert(*msg, peer);
+}
+
+void Legacy::HANDLER(alertack)
+{
+    handle_peer_alertack(*msg, peer);
+}
+
 } // namespace dash

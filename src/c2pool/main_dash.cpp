@@ -92,6 +92,7 @@
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
 #include <impl/dash/coin/block_json.hpp>         // dash::coin::block_to_explorer_json — /api/explorer getblock body decode
+#include <impl/dash/alert_service.hpp>            // D-MINER.7 miner-offline alert relay over the sharechain p2p (non-consensus)
 #include <impl/dash/coin/bestblock_diag.hpp>     // #1046 bestblock out=0 diagnostic classifier (RpcNotString/BadHexLen/Ok)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
@@ -168,6 +169,7 @@
 
 #include <cstdint>
 #include <cctype>       // std::tolower (--replay-utxo-expect normalize)
+#include <cerrno>       // errno (strict --alert-relay-* integer parse)
 #include <cstdlib>      // std::getenv
 #include <utility>      // std::as_const (qc-plan lambda: read-only qmgr access)
 #include <cstring>
@@ -349,6 +351,39 @@ bool        g_fold_only_proof = false;        // --embedded-fold-only-proof
 // bad read fails to a clean zero and never wedges the node.
 std::string g_serve_gate_state_file;           // --serve-gate-state-file
 
+// ── D-MINER.7: miner-offline alert relay over the sharechain p2p ───────────
+// NON-CONSENSUS, DEFAULT OFF. A DPI-bound node (--alert-relay-origin) watches
+// its own stratum worker registry and relays small signed + sealed alerts over
+// its existing sharechain peer sockets to a Telegram-capable node
+// (--alert-relay-telegram), which hands them to scripts/alert_relay_telegram.py.
+// With none of these flags given, run_node never constructs the service: no
+// alert/alertack is ever sent and inbound ones are ignored (wire byte-identical
+// to master). Policy: src/impl/dash/alert_service.hpp.
+struct AlertRelayCli {
+    bool origin = false, telegram = false, forward = false, test = false;
+    bool show_key = false;   // --alert-relay-show-key: print this node's alert pubkey and exit
+    std::string key_file, label, accept_file;
+    std::vector<std::string> to, accept;
+    int64_t offline_after = 300, online_after = 60, min_interval = 600;
+    int64_t startup_grace = 600, stall_after = 900, retry_every = 60, retry_max = 60;
+    bool any() const { return origin || telegram || forward; }
+};
+AlertRelayCli g_alert_relay;
+
+// Strict non-negative integer parse for the --alert-relay-* numeric knobs.
+static bool parse_alert_relay_int(const char* flag, const char* s, int64_t& out)
+{
+    char* end = nullptr;
+    errno = 0;
+    long long v = std::strtoll(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 0 || v > 30LL * 86400) {
+        std::cerr << "error: " << flag << " expects an integer in [0, 2592000], got '" << s << "'\n";
+        return false;
+    }
+    out = static_cast<int64_t>(v);
+    return true;
+}
+
 // ── PR-2 FORWARD: mined-commitment index arming flags ─────────────────────
 // Arms dashd's mined-commitment store (mined_commitment_index.hpp). BOTH
 // halves of CQuorumBlockProcessor are ported and merged in #1309: the
@@ -495,6 +530,15 @@ void print_banner(const char* argv0)
         << "           [--embedded-fold-checkscripts]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
         << "           [--control-plane-token-file FILE]\n"
+        << "           [--alert-relay-origin --alert-relay-to PUBHEX... [--alert-relay-label STR]]\n"
+        << "           [--alert-relay-telegram --alert-relay-accept PUBHEX... | --alert-relay-accept-file FILE]\n"
+        << "           [--alert-relay-forward] [--alert-relay-key-file FILE] [--alert-relay-test]\n"
+        << "           [--alert-relay-show-key]  (print this node's alert pubkey, creating the key if needed, and exit)\n"
+        << "           [--alert-relay-offline-after S] [--alert-relay-online-after S] [--alert-relay-min-interval S]\n"
+        << "           [--alert-relay-startup-grace S] [--alert-relay-stall-after S]\n"
+        << "           [--alert-relay-retry-every S] [--alert-relay-retry-max N]\n"
+        << "             (miner-offline alerts relayed over the sharechain p2p to a Telegram-capable\n"
+        << "              node; non-consensus, all OFF by default -- docs/design/d-miner-7-p2p-alert-relay.md)\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -1453,6 +1497,123 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // constructed + subscribed to the tip event later in the coin_p2p block, once
     // node_coin_state exists. OBSERVE-only: stats_json() touches no serving state.
     std::shared_ptr<dash::coin::EmbeddedOracleShadow> oracle_shadow;
+
+    // ── D-MINER.7: miner-offline alert relay (non-consensus, default OFF) ──
+    // Constructed ONLY when an --alert-relay-* role is given. It is attached to
+    // the sharechain node here (before the loop runs, so no peer event can race
+    // the install) and ticked by a timer armed below, once the stratum worker
+    // registry (DASHWorkSource) exists. Null ⇒ the alert/alertack handlers stay
+    // inert and nothing is ever sent.
+    std::shared_ptr<dash::alert::AlertRelayService> alert_relay;
+    if (g_alert_relay.any()) {
+        namespace da = dash::alert;
+        const std::string ar_dir =
+            (core::filesystem::config_path() / net_subdir / "alert_relay").string();
+        auto parse_pub = [](const std::string& hex, const char* flag, da::Bytes& out) -> bool {
+            auto raw = da::from_hex(hex);
+            if (!raw || !da::is_valid_pubkey(*raw)) {
+                std::cerr << "error: " << flag << " expects a 33-byte compressed secp256k1 pubkey"
+                             " in hex (66 chars), got '" << hex << "'\n";
+                return false;
+            }
+            out = std::move(*raw);
+            return true;
+        };
+        da::ServiceConfig ac;
+        ac.origin = g_alert_relay.origin;
+        ac.telegram = g_alert_relay.telegram;
+        ac.forward = g_alert_relay.forward;
+        ac.state_dir = ar_dir;
+        ac.label = g_alert_relay.label;
+        ac.retry_every = std::max<int64_t>(5, g_alert_relay.retry_every);
+        ac.retry_max = static_cast<int>(std::max<int64_t>(1, g_alert_relay.retry_max));
+        ac.test_on_start = g_alert_relay.test;
+        ac.det.offline_after = g_alert_relay.offline_after;
+        ac.det.online_after = g_alert_relay.online_after;
+        ac.det.min_interval = g_alert_relay.min_interval;
+        ac.det.startup_grace = g_alert_relay.startup_grace;
+        ac.det.stall_after = g_alert_relay.stall_after;
+        for (const auto& h : g_alert_relay.to) {
+            da::Bytes pub;
+            if (!parse_pub(h, "--alert-relay-to", pub)) return 1;
+            ac.relays.push_back(std::move(pub));
+        }
+        std::vector<std::string> accept_hex = g_alert_relay.accept;
+        if (!g_alert_relay.accept_file.empty()) {
+            std::ifstream af(g_alert_relay.accept_file);
+            if (!af) {
+                std::cerr << "error: cannot read --alert-relay-accept-file "
+                          << g_alert_relay.accept_file << "\n";
+                return 1;
+            }
+            std::string line;
+            while (std::getline(af, line)) {
+                auto hash = line.find('#');
+                if (hash != std::string::npos) line.resize(hash);
+                line.erase(0, line.find_first_not_of(" \t\r"));
+                line.erase(line.find_last_not_of(" \t\r") + 1);
+                if (!line.empty()) accept_hex.push_back(line);
+            }
+        }
+        for (const auto& h : accept_hex) {
+            da::Bytes pub;
+            if (!parse_pub(h, "--alert-relay-accept", pub)) return 1;
+            ac.accept.push_back(std::move(pub));
+        }
+        if (ac.origin && ac.relays.empty()) {
+            std::cerr << "error: --alert-relay-origin needs at least one --alert-relay-to PUBHEX"
+                         " (the relay node's alert pubkey, printed at its startup)\n";
+            return 1;
+        }
+        std::optional<da::KeyPair> ar_keys;
+        if (ac.origin || ac.telegram) {
+            std::error_code ec;
+            std::filesystem::create_directories(ar_dir, ec);
+            const std::string key_path = g_alert_relay.key_file.empty()
+                ? ar_dir + "/alert.key" : g_alert_relay.key_file;
+            bool created = false;
+            std::string kerr, kwarn;
+            ar_keys = da::load_or_create_key_file(key_path, created, kerr, kwarn);
+            if (!ar_keys) {
+                std::cerr << "error: " << kerr << "\n";
+                return 1;
+            }
+            if (!kwarn.empty()) LOG_WARNING << "[alert-relay] " << kwarn;
+            std::cout << "[alert-relay] " << (created ? "created" : "loaded") << " alert key "
+                      << key_path << "\n";
+        }
+        alert_relay = std::make_shared<da::AlertRelayService>(ac, ar_keys, core::timestamp());
+        std::string ierr;
+        if (!alert_relay->init(ierr)) {
+            std::cerr << "error: " << ierr << "\n";
+            return 1;
+        }
+        alert_relay->set_transport(p2p_node.make_alert_transport());
+        p2p_node.set_alert_relay(alert_relay);
+        std::cout << "[alert-relay] ARMED (non-consensus): origin=" << ac.origin
+                  << " telegram=" << ac.telegram << " forward=" << alert_relay->can_forward()
+                  << " state=" << ar_dir << "\n";
+        if (ar_keys)
+            std::cout << "[alert-relay] this node's alert pubkey: " << da::to_hex(ar_keys->pubkey)
+                      << "  (give it to the other side: --alert-relay-to on origins /"
+                         " --alert-relay-accept on the relay)\n";
+        if (ac.origin) {
+            std::cout << "[alert-relay] origin: " << ac.relays.size() << " relay(s); offline-after="
+                      << ac.det.offline_after << "s online-after=" << ac.det.online_after
+                      << "s min-interval=" << ac.det.min_interval << "s grace="
+                      << ac.det.startup_grace << "s stall-after=" << ac.det.stall_after
+                      << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max << "\n";
+        }
+        if (ac.telegram) {
+            std::cout << "[alert-relay] relay: " << ac.accept.size()
+                      << " allowlisted origin(s); outbox " << alert_relay->outbox_path()
+                      << " (Telegram sidecar: scripts/alert_relay_telegram.py --state-dir "
+                      << ar_dir << ")\n";
+            if (ac.accept.empty())
+                LOG_WARNING << "[alert-relay] --alert-relay-telegram with an EMPTY allowlist: every"
+                               " alert addressed to this node will be refused";
+        }
+    }
 
     std::unique_ptr<core::WebServer> web_server;
     auto enhanced_node = std::make_shared<dash::EnhancedDashNode>(testnet);
@@ -2475,6 +2636,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // 3. User data dir: ~/.c2pool/transition_messages/
             auto data_dir = core::filesystem::config_path();
             mi->load_transition_blobs((data_dir / "transition_messages").string());
+        }
+
+        // D-MINER.7: read-only alert-relay status (no secrets: pubkeys, counters,
+        // detector state). Installed BEFORE web_server->start() so the web
+        // thread never races the std::function write; the lambda only reads
+        // the snapshot the IO thread publishes under the service's mutex.
+        if (alert_relay) {
+            mi->set_rest_override_fn(
+                [ar = alert_relay](const std::string& path) -> std::optional<nlohmann::json> {
+                    if (path == "/api/alert-relay/status") return ar->status_json();
+                    return std::nullopt;
+                });
         }
 
         // Auto-detect the public IP for the "connect to this pool" panel.
@@ -4743,6 +4916,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     };
     think_timer->expires_after(std::chrono::seconds(15));
     think_timer->async_wait(*think_tick);
+
+    // ── D-MINER.7: alert-relay tick (IO thread, every 5 s) ─────────────────
+    // Samples the SAME per-session stratum registry /local_stats reads
+    // (DASHWorkSource::get_stratum_workers, copied under its lock), keyed
+    // "ADDRESS.worker", then drives detector + retransmits + sidecar polling.
+    // Absent unless an --alert-relay-* role is armed.
+    std::unique_ptr<core::Timer> alert_relay_timer;
+    if (alert_relay) {
+        if (alert_relay->config().origin && stratum_port == 0)
+            LOG_WARNING << "[alert-relay] --alert-relay-origin without --stratum: no workers can"
+                           " ever be observed on this node";
+        alert_relay->publish_status(core::timestamp());
+        alert_relay_timer = std::make_unique<core::Timer>(&ioc, true);
+        // run_tick() catches anything the sampling or the tick throws (logged,
+        // counted in the status "tick.errors"): core::Timer does not re-arm
+        // after a throwing handler, and a dead alert timer would be silent.
+        alert_relay_timer->start(5, [ar = alert_relay, wsrc = work_source]() {
+            ar->run_tick([&ar, &wsrc]() {
+                std::vector<dash::alert::WorkerSample> samples;
+                if (ar->config().origin) {
+                    for (const auto& [sid, w] : wsrc->get_stratum_workers()) {
+                        dash::alert::WorkerSample smp;
+                        smp.key = w.worker_name.empty() ? w.username : w.username + "." + w.worker_name;
+                        smp.session = sid;
+                        smp.accepted = w.accepted;
+                        samples.push_back(std::move(smp));
+                    }
+                }
+                return samples;
+            }, static_cast<int64_t>(core::timestamp()));
+        });
+    }
 
     // ── E2a: wire the LIVE coin-P2P feed into the maintainer -> populate ──
     // GUARANTEE: this whole block is gated on `coin_p2p` (i.e. --coin-p2p-connect
@@ -11598,6 +11803,55 @@ int main(int argc, char** argv)
             embedded_tx_inject_hex_path = argv[++i];   // #157 local M1 submit file
         else if (std::strcmp(argv[i], "--control-plane-token-file") == 0 && i + 1 < argc)
             control_token_file_path = argv[++i];       // #157 Slice 3: control-plane apply token file (DORMANT arming seam)
+        // D-MINER.7 miner-offline alert relay (non-consensus, default OFF).
+        else if (std::strcmp(argv[i], "--alert-relay-origin") == 0)
+            g_alert_relay.origin = true;
+        else if (std::strcmp(argv[i], "--alert-relay-telegram") == 0)
+            g_alert_relay.telegram = true;
+        else if (std::strcmp(argv[i], "--alert-relay-forward") == 0)
+            g_alert_relay.forward = true;
+        else if (std::strcmp(argv[i], "--alert-relay-test") == 0)
+            g_alert_relay.test = true;
+        else if (std::strcmp(argv[i], "--alert-relay-show-key") == 0)
+            g_alert_relay.show_key = true;
+        else if (std::strcmp(argv[i], "--alert-relay-key-file") == 0 && i + 1 < argc)
+            g_alert_relay.key_file = argv[++i];
+        else if (std::strcmp(argv[i], "--alert-relay-to") == 0 && i + 1 < argc)
+            g_alert_relay.to.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--alert-relay-accept") == 0 && i + 1 < argc)
+            g_alert_relay.accept.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--alert-relay-accept-file") == 0 && i + 1 < argc)
+            g_alert_relay.accept_file = argv[++i];
+        else if (std::strcmp(argv[i], "--alert-relay-label") == 0 && i + 1 < argc)
+            g_alert_relay.label = argv[++i];
+        else if (std::strcmp(argv[i], "--alert-relay-offline-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.offline_after)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-online-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.online_after)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-min-interval") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.min_interval)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-startup-grace") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.startup_grace)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-stall-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.stall_after)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-retry-every") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_every)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-retry-max") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_max)) return 1;
+            ++i;
+        }
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
@@ -11959,6 +12213,26 @@ int main(int argc, char** argv)
     // Both values were validated (and lower-cased) on the merged file+CLI value
     // in the settings block above, before the --dump-resolved-config exit.
     dash::SharechainConfig::set_network_id(network_id_hex, prefix_hex_cli);
+
+    // D-MINER.7 key exchange helper: create-or-load the alert key (same default
+    // path run_node uses, identity-scoped by --testnet / --network-id), print
+    // the PUBLIC key and exit. The secret is never printed.
+    if (g_alert_relay.show_key) {
+        const std::string ar_dir = (core::filesystem::config_path()
+            / dash::SharechainConfig::data_subdir(testnet) / "alert_relay").string();
+        std::error_code ec;
+        std::filesystem::create_directories(ar_dir, ec);
+        const std::string key_path = g_alert_relay.key_file.empty()
+            ? ar_dir + "/alert.key" : g_alert_relay.key_file;
+        bool created = false;
+        std::string kerr, kwarn;
+        auto kp = dash::alert::load_or_create_key_file(key_path, created, kerr, kwarn);
+        if (!kp) { std::cerr << "error: " << kerr << "\n"; return 1; }
+        if (!kwarn.empty()) std::cerr << "warning: " << kwarn << "\n";
+        std::cerr << "[alert-relay] " << (created ? "created " : "loaded ") << key_path << "\n";
+        std::cout << dash::alert::to_hex(kp->pubkey) << "\n";
+        return 0;
+    }
 
     // ── --coinbase-text: resolve ONCE, here, before any coinbase is built ────
     // DASH has no merged mining and writes no THE state-root/metadata tail, so
