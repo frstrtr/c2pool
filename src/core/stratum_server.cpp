@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <algorithm>
 #include "stratum_server.hpp"
 #include "web_server.hpp"       // MiningInterface
 #include "address_utils.hpp"    // address utilities
@@ -210,7 +211,15 @@ void StratumServer::accept_connections()
 
 void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket socket)
 {
-    if (!ec) {
+    if (!ec && !accepting_.load()) {
+        // ── Drain mode (#866 action 2): refuse every new connection so miners
+        // dropped by a ramp-down step cannot reconnect here. Counted apart from
+        // the cap refusals so the two causes stay distinguishable.
+        refused_draining_.fetch_add(1);
+        boost::system::error_code ignore;
+        socket.shutdown(tcp::socket::shutdown_both, ignore);
+        socket.close(ignore);
+    } else if (!ec) {
         // ── STRICT per-node miner cap (hotel interim fix #5) ──
         // Admission control BEFORE register_session: if the node already holds
         // max_stratum_connections live sessions, close the new socket cleanly,
@@ -277,6 +286,32 @@ size_t StratumServer::get_session_count() const
 {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     return sessions_.size();
+}
+
+size_t StratumServer::drop_sessions(size_t n)
+{
+    if (n == 0) return 0;
+    std::vector<std::shared_ptr<StratumSession>> live;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        for (const auto& s : sessions_)
+            if (s->is_connected()) live.push_back(s);
+    }
+    // Unauthorized sessions (handshake never finished) go first, then the
+    // lowest-hashrate rigs, so each drain step sheds the least pool hashrate.
+    std::sort(live.begin(), live.end(), [](const auto& a, const auto& b) {
+        if (a->is_authorized() != b->is_authorized()) return !a->is_authorized();
+        return a->get_hashrate() < b->get_hashrate();
+    });
+    const size_t k = std::min(n, live.size());
+    // Closed outside sessions_mutex_: the disconnect path re-takes it via
+    // unregister_session.
+    for (size_t i = 0; i < k; ++i)
+        live[i]->drop_stale("drain ramp-down");
+    if (k)
+        LOG_INFO << "[Stratum] drain closed " << k << " of " << live.size()
+                 << " live session(s)";
+    return k;
 }
 
 std::pair<size_t, size_t> StratumServer::get_job_payload_stats() const
