@@ -33,10 +33,11 @@
 //      nullopt), not the v16 grandparent walk.
 //   J. The v36 mint declines a solve above its committed target and a solve
 //      whose header does not X11-hash to the submitted pow_hash.
-//   K. A v36 producer job is declined when the work template carries
-//      transactions (a v36 share commits no tx refs, so the won block could
-//      not be rebuilt); the same template on public still builds with the
-//      template tx set committed.
+//   K. A v36 producer job is BUILT over a work template that carries
+//      transactions: it freezes the template's tx hashes and bodies (the
+//      finder assembles the won block from them); a template whose bodies do
+//      not match its hash list is declined; the same template on public still
+//      builds with the tx set committed and freezes no bodies.
 //
 // Folded into test_dash_node (needs dash::NodeImpl + c2pool_storage + the dash
 // OBJECT lib). The profile is keyed on the process-global SharechainConfig
@@ -288,6 +289,22 @@ TEST(DashV36Flip, PublicNodeStillMintsV16ByteIdentical)
     EXPECT_EQ(jb->job.gentx_bytes, j.build.job.gentx_bytes);
     EXPECT_EQ(jb->job.ref_hash, j.build.job.ref_hash);
     EXPECT_TRUE(jb->frozen.message_data.empty());
+
+    // A tx-carrying template on the public path: the v16 share commits the tx
+    // set exactly as before, and the dispatching mint is byte-identical to
+    // mint_from_inputs.
+    const auto wdt = make_wd_with_txs(3);
+    const auto jt = solve_job(chain, p, uint256(), h160(0x22), wdt, 9, wdt.m_curtime);
+    ASSERT_TRUE(jt.solved);
+    const auto t16 = mint_from_inputs(chain, p, jt.in, jt.build.frozen);
+    const auto tany = mint_from_inputs_any(chain, p, jt.in, jt.build.frozen);
+    ASSERT_TRUE(t16.has_value());
+    ASSERT_TRUE(tany.has_value());
+    const auto& bt = std::get<BuiltShare>(tany->built);
+    EXPECT_EQ(wire_of(bt.share), wire_of(t16->share));
+    EXPECT_EQ(bt.share.m_new_transaction_hashes, wdt.m_tx_hashes)
+        << "the v16 share still commits the template tx set as new tx hashes";
+    EXPECT_EQ(bt.share.m_merkle_link.m_branch.size(), 2u);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -853,30 +870,36 @@ TEST(DashV36Flip, V36MintDeclinesSolveAboveTargetAndBrokenX11Identity)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// K. The v36 producer job declines a template that carries transactions
+// K. The v36 producer job builds over a template that carries transactions
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST(DashV36Flip, V36ProducerJobDeclinesTemplateWithTransactions)
+TEST(DashV36Flip, V36ProducerJobBuildsOverTemplateWithTransactions)
 {
     IdentityGuard guard;
     const auto script = dash::pubkey_hash_to_script2(h160(0x72));
-    auto wd = make_wd();
-    wd.m_tx_hashes = {tag_hash(1)};
+    const auto wd = make_wd_with_txs(3);
+    ASSERT_EQ(wd.m_tx_hashes.size(), 3u);
 
-    // Isolated (v36): a v36 share commits no tx refs and its won block is
-    // rebuilt as [gentx] alone, so a job over a tx-carrying template would lose
-    // the block. build_producer_job declines it.
+    // The DASH v36 network: the job commits the template's txs through the
+    // coinbase merkle_link (the frozen tx hash list, template order). The frozen
+    // bodies and the body/hash mismatch decline are pinned in
+    // test_dash_v36_template_txs.cpp.
     {
         const auto p = iso_prod_params();
         ASSERT_EQ(p.current_share_version, 36u);
         dash::ShareChain chain;
-        EXPECT_FALSE(build_producer_job(chain, p, uint256(), script, wd, wd.m_curtime,
-                                        7, 0, "c2pool").has_value());
-        // control: the same template without txs builds on isolated.
-        auto cb_only = wd;
-        cb_only.m_tx_hashes.clear();
-        EXPECT_TRUE(build_producer_job(chain, p, uint256(), script, cb_only, cb_only.m_curtime,
-                                       7, 0, "c2pool").has_value());
+        const auto b = build_producer_job(chain, p, uint256(), script, wd, wd.m_curtime,
+                                          7, 0, "c2pool");
+        ASSERT_TRUE(b.has_value()) << "a v36 job over a tx-carrying template must build";
+        EXPECT_EQ(b->frozen.desired_version, 36u);
+        EXPECT_EQ(b->frozen.desired_tx_hashes, wd.m_tx_hashes);
+
+        // control: a coinbase-only template still builds.
+        const auto cb_only = make_wd();
+        const auto c = build_producer_job(chain, p, uint256(), script, cb_only,
+                                          cb_only.m_curtime, 7, 0, "c2pool");
+        ASSERT_TRUE(c.has_value());
+        EXPECT_TRUE(c->frozen.desired_tx_hashes.empty());
     }
     // Public (v16): the same template still builds and commits the tx set.
     {

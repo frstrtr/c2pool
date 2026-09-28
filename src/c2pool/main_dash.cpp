@@ -145,6 +145,7 @@
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
+#include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: dashd templates only)
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
 #include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
@@ -3681,23 +3682,39 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // txs fails loud (broadcast NOTHING, telemetry still recorded) rather than
     // emit an incomplete block -- reward-safe, and it fills in with mempool
     // tx-selection later with no change here.
+    //
+    // The DASH v36 network: a v36 share commits the template's txs through its
+    // coinbase merkle_link and carries no tx refs, so only the finder can
+    // rebuild the full block -- from the producer job it froze (mint_registry,
+    // keyed by the share's ref_hash; FrozenMintJob::tx_data_hex). Every other
+    // node refuses a tx-committing v36 won block (the finder's stratum arm
+    // already submitted it). The registry is created here so the reconstructor
+    // and the mint wiring below share the one instance.
+    auto mint_registry = std::make_shared<dash::mint::FrozenJobRegistry>();
     {
         auto& won_tracker = p2p_node.tracker();
         const core::CoinParams won_params = mint_params;
         core::MiningInterface* won_mi =
             web_server ? web_server->get_mining_interface() : nullptr;
 
+        // v36 finder bodies: the template this node froze for the share's ref.
+        dash::coin::FinderBodiesLookup won_finder =
+            [mint_registry](const uint256& ref) -> std::optional<dash::coin::FinderTemplateBodies> {
+                auto job = mint_registry->get(ref);
+                if (!job || !job->tx_data_hex) return std::nullopt;
+                return dash::coin::FinderTemplateBodies{job->desired_tx_hashes, job->tx_data_hex};
+            };
         dash::coin::WonBlockReconstructor won_reconstruct =
-            [&won_tracker, won_params](const uint256& sh)
+            [&won_tracker, won_params, won_finder](const uint256& sh)
                 -> std::optional<dash::coin::ReconstructedWonBlock> {
                 if (!won_tracker.chain.contains(sh)) return std::nullopt;
                 std::optional<dash::coin::ReconstructedWonBlock> result;
                 won_tracker.chain.get_share(sh).invoke([&](auto* obj) {
                     if (!obj) return;
-                    // Both live share types (v36 = private/isolated v36 sharechain;
-                    // its block is coinbase-only by construction).
+                    // Both live share types (v36 = the DASH v36 network; a
+                    // tx-committing v36 block is rebuilt from won_finder only).
                     result = dash::coin::reconstruct_won_block(
-                        sh, *obj, won_tracker, won_params, /*known_txs=*/{});
+                        sh, *obj, won_tracker, won_params, /*known_txs=*/{}, won_finder);
                 });
                 return result;
             };
@@ -3909,6 +3926,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
     // SML+quorum freshness + superblock viability gates keep it fail-safe.
     work_source->set_embedded_mainnet(embedded_mainnet);
+    // The DASH v36 network (custom --network-id) takes its mining work from
+    // dashd getblocktemplate only: its shares commit the template's txs and the
+    // finder assembles the block from the bodies dashd served. Without a dashd
+    // RPC arm there is no mining work at all -- stratum is not started (the node
+    // still relays the sharechain). Public profile: unchanged.
+    const dash::coin::V36WorkPolicy v36_work_policy = dash::coin::resolve_v36_work_policy(
+        dash::SharechainConfig::share_profile().target_share_version >= 36,
+        static_cast<bool>(rpc));
+    work_source->set_dashd_templates_only(v36_work_policy.dashd_templates_only);
+    if (v36_work_policy.dashd_templates_only) {
+        if (v36_work_policy.serve_stratum)
+            std::cout << "[run] the DASH v36 network takes mining work from dashd "
+                         "getblocktemplate only (embedded template arm not served)\n";
+        else
+            std::cout << "[run] the DASH v36 network takes mining work from dashd "
+                         "getblocktemplate only: --coin-rpc/--coin-daemon (with creds) "
+                         "is REQUIRED; stratum NOT started (sharechain relay only)\n";
+    }
     // #961 cross-lane (B4): publish DASH's REGISTRY-SOURCED own-coin payout-address
     // acceptance into the StratumConfig the core StratumServer reads, so the SAME
     // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
@@ -4067,7 +4102,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // node's IO-thread invariants (try_to_lock tracker access) hold.
     {
         dash::Node* node_ptr = &p2p_node;
-        auto mint_registry = std::make_shared<dash::mint::FrozenJobRegistry>();
+        // mint_registry: created above, shared with the won-block reconstructor.
 
         // ── Operator message blob -> minted v36 shares' message_data ──────
         // Private/isolated DASH v36 sharechain only: the --message-blob-hex
@@ -4652,7 +4687,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // sees it once live. Display/telemetry only; never drives coinbase.
     dash::coin::CoinStateMaintainer* coinwork_maintainer = nullptr;
 
-    if (stratum_port != 0) {
+    if (stratum_port != 0 && v36_work_policy.serve_stratum) {
         stratum_server = std::make_unique<core::StratumServer>(
             ioc, stratum_host, stratum_port, work_source);
         if (stratum_server->start()) {
@@ -4851,6 +4886,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << stratum_port << " -- stratum disabled\n";
             stratum_server.reset();
         }
+    } else if (stratum_port != 0) {
+        std::cout << "[run] stratum disabled: the DASH v36 network requires a dashd "
+                     "RPC arm (--coin-rpc) for mining work\n";
     } else {
         std::cout << "[run] stratum disabled (no --stratum flag)\n";
     }

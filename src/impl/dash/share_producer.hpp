@@ -1118,9 +1118,10 @@ inline void populate_v36_share(DashV36Share& s, const ProspectiveShareInfo& info
 // the same MANDATORY self-verify as build_share: the hash_link fold must
 // reproduce the gentx txid and the share must pass share_init_verify
 // (DashV36Share) against `message_authority` (production: the overload below,
-// active_message_authority()). v36 carries no tx refs (daemonless
-// coinbase-only); info.new_transaction_hashes / transaction_hash_refs are not
-// committed.
+// active_message_authority()). v36 carries no tx refs: the template's tx set
+// (info.other_transaction_hashes, template order) is committed through the
+// coinbase merkle_link only; info.new_transaction_hashes / transaction_hash_refs
+// are not committed.
 template <typename ChainT>
 inline BuiltV36Share build_share_v36(ChainT& chain,
                                      const core::CoinParams& params,
