@@ -1,7 +1,7 @@
 # XMR lane: the spend-cost floor and paying dust
 
-Status: **§2, §3, §6 and §6a implemented** (the daemon turns them on from the
-lane's genesis); §5 (dust decay) is next. Operator discussion 2026-09-29,
+Status: **implemented** (§2, §3, §5, §6, §6a; the daemon turns them on from
+the lane's genesis). Operator discussion 2026-09-29,
 revised the same day. This record keeps the decisions and their
 derivations so the implementation, review and paper can cite one source. It
 builds on the every-node coinbase recompute (`coinbase-recompute.md`): every
@@ -132,13 +132,29 @@ and on the HTTP status.
 
 ## 5. Abandoned dust
 
-Balances below `c` that belong to a payee with no work in the window
-**decay to zero** by the same natural decay as the work weights (MRR). There is
-no donation: the write-off only reduces the pool's liability, because the
-cash behind it already paid older debts. A returning miner stops the decay.
-Each write-off is a visible owed-event leaf, never a silent change.
-Horizon and half-life: to be fixed at implementation (proposed: start after
-one window of inactivity, half-life = the lane half-life).
+Implemented (`OwedLedgerRules::decay_horizon`, `decay_half_life`; the daemon
+sets them to the lane's `window` = 8640 and `half_life` = 2160 bins).
+
+* **Only a gone miner.** A balance below the floor decays only after its key
+  is **passed by**: a lane block credits other keys but not it. While a miner
+  works, every lane block credits it, DROPS near-miss credit included, so an
+  active miner, however small, is never decayed. A pool that finds no block
+  decays nobody.
+* **Grace, then halving.** From the bin it was passed by, the balance is kept
+  for one more lane window to come back. Then it halves at the FINALIZE that
+  enters each lane half-life, down to 0, and the row is removed. A new credit
+  clears the state.
+* **Never a donation.** The write-off only lowers the pool's liability: the
+  cash behind that balance already paid older debts. Each FINALIZE that
+  writes off carries the amounts in its owed-event leaf (the `settled` map
+  of the FINALIZE leaf), and `decayed_total()` counts them.
+* **Negative rows and balances at or above the floor never decay.**
+* **Committed.** The decay state (the bin a key was passed by, the halvings
+  applied) is part of `owed_digest` (tag `V37K`), so every node decays alike.
+* Pinned by `v37_xmr_spend_floor_kat` F10 and rehearsal M10. In M10, 20 tiny
+  miners leave: over 99% of their dust is written off, by the same amount on
+  every node. The 20 that stay lose nothing: credited − paid equals balance,
+  exactly.
 
 ## 6. Seniority from the threshold
 

@@ -66,7 +66,7 @@ paid by the owed pass (`OwedLedgerRules::arm_floor`, `v37_xmr_spend_floor_kat` F
 
 | # | finding | XMR lane now |
 |---|---|---|
-| 03 | identity spam, O(N) walk | A key needs a full share to exist (receipts self-carry under the carrier identity), and paid rows are pruned. With the floor, a sub-floor balance has no age and the owed walk skips it: that skip is the remaining O(sub-floor keys) cost, about 1 µs per key. Dust decay (`payout-threshold.md` §5, next) removes abandoned sub-floor rows. |
+| 03 | identity spam, O(N) walk | **Closed on XMR.** A key needs a full share (or DROPS near-miss work) to exist, and paid rows are pruned. A sub-floor balance has no age and the owed walk skips it. Once a lane block passes its key by, the balance decays after one lane window, halving each half-life down to 0, and the row is removed (`payout-threshold.md` §5). An active miner is never decayed. |
 | 04 | no per-payee cap | **Closed (ruled 2026-09-29): rotation on payment**, no cap constant. A key paid in part walks after every other key while the paying block is pending, and its age restarts at FINALIZE (`OwedLedgerRules::rotate_on_payment`, `v37_xmr_spend_floor_kat` F8). Also closes audit O-1. |
 | 05a | pre-settle orphan costs seniority | Refuted since #1704; pinned by #1876. |
 | 05b | post-settle orphan | By design. The finality boundary is D_conf = 60 (coinbase maturity) and is pinned on mainnet. |

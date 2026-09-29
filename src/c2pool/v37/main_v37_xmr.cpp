@@ -5518,6 +5518,10 @@ int main(int argc, char** argv) {
     if (cfg.coinbase == CoinbaseMode::V37Settlement) {   // payout-threshold.md §6, §6a: from the lane's genesis
         cfg.ledger_arm_floor = static_cast<long long>(::v37::xmr::settle::spend_floor(::v37::xmr::settle::kTailSubsidy));
         cfg.ledger_rotate_on_payment = true;
+        // dust decay (§5): abandoned sub-floor balances decay after one lane
+        // window without credit, halving every lane half-life
+        cfg.ledger_decay_horizon = cfg.lane_params.window;
+        cfg.ledger_decay_half_life = cfg.lane_params.half_life;
     }
     const int rc = run_live(cfg);
     g_web = nullptr; g_web_extra = {}; g_web_name = {};
