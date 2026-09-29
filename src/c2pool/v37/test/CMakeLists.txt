@@ -846,6 +846,27 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_coinbase_recompute_kat COMMAND v37_xmr_coinbase_recompute_kat)
 
     # ------------------------------------------------------------------
+    # MAINNET REHEARSAL (isolated): the mainnet settlement configuration
+    # (fee model v1, the mainnet donation identity, the R6 booking pipeline)
+    # run in-process on three nodes with rotating builders -- honest run
+    # (every block canonical, one digest, exact conservation), a lagging
+    # builder, an over-paying builder, an out-of-band payee ref. No daemon,
+    # no network, no RandomX. Same link shape as the recompute KAT.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_mainnet_rehearsal_kat
+        v37_xmr_mainnet_rehearsal_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_mainnet_rehearsal_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_mainnet_rehearsal_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_mainnet_rehearsal_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_mainnet_rehearsal_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_mainnet_rehearsal_kat COMMAND v37_xmr_mainnet_rehearsal_kat)
+
+    # ------------------------------------------------------------------
     # SAME-BLOCK PAY-NOW on POOL-LINEAGE: one lane coinbase carries both the
     # V37N pay-now base and the V37P pool tag in the canonical order
     # V37N | V37D | V37P | V37C (V37C last); every field reads back (codec,
