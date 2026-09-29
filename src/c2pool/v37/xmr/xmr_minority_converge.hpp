@@ -159,9 +159,13 @@ struct DecodeResult {
 // candidates() produces them. root_only: the refold already holds this block's
 // booked maps (it was booked in the log being re-derived) -- the decoder only
 // has to say whether its 0x03 root matches the scratch ring (age-bounded).
+// ledger: the scratch ledger at this block's booking point (before its FOUND),
+// the state the every-node coinbase recompute (xmr_coinbase_recompute.hpp)
+// rebuilds the block's canonical coinbase from.
 using DecodeFn = std::function<DecodeResult(std::uint64_t h, const std::string& bid,
                                             const std::vector<::v37::bytes32>& cands,
-                                            const std::vector<std::uint64_t>& superseded, bool root_only)>;
+                                            const std::vector<std::uint64_t>& superseded, bool root_only,
+                                            const OwedLedger& ledger)>;
 
 struct RefoldInput {
     ::v37::ChainId chain = 0;
@@ -249,7 +253,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
         }
         std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
         ring.candidates(L.owed_digest(), cands, sup);
-        DecodeResult r = decode(h, bid, cands, sup, had_old);
+        DecodeResult r = decode(h, bid, cands, sup, had_old, L);
         ++out.decoded;
         switch (r.outcome) {
             case DecodeOutcome::Booked: {
