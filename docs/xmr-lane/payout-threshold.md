@@ -62,8 +62,13 @@ into one transaction for pool members is a later stage (§7).
   included, is paid its exact E_b in this block. No balance, no advance.
   Rehearsal M7b: a fresh pool with 40 dust miners, 24 blocks, every balance
   is 0 except the 1-piconero donation marker.
-* **Order when the block has no room for everyone:** payees with E_b ≥ c
-  first, then the dust, each tier largest E_b first (ties: identity ASC).
+* **Order when the block has no room for everyone: oldest first**, the K_fair
+  rule. A payee with a waiting balance goes by its `first_eligible`, ascending.
+  A payee with none is the youngest. Equal ages go by
+  `sha256d("V37T" ‖ prev_id ‖ identity)`, the salted tie that nobody can grind.
+  The size of E_b never decides. A payee whose cash was redistributed has no
+  balance, so it is the youngest again next block, and the salted tie rotates
+  who waits.
 * **Short pool** (the owed pass paid old debts first): every admitted payee
   gets the same fraction of its E_b. Dust is admitted while the smallest
   admitted payee ≥ c still gets at least `c`.

@@ -399,6 +399,8 @@ public:
             struct PayNowSet {
                 std::vector<::c2pool::v37n::settle::WeightedPayee> wp;
                 std::map<::v37::bytes32, ::v37::ScriptRef> ref;
+                std::map<::v37::bytes32, std::uint64_t> age;   // SPEND-COST FLOOR: first_eligible
+                std::map<::v37::bytes32, ::v37::bytes32> tie;  // sha256d("V37T" || prev_id || key)
             };
             auto pv = std::make_shared<PayNowSet>();
             pv->wp = ctx.paynow_payees;
@@ -413,6 +415,13 @@ public:
                                                ? w.pay : pay_of(w.key);
                 if (!::v37::xmr::xmr_ref_valid(r)) { payable = false; break; }
                 pv->ref[w.key] = r;
+                if (ctx.spend_floor) {   // oldest first when not everyone fits (x6::PayNowEntry::age / tie)
+                    pv->age[w.key] = ledger.first_eligible_of(w.key);
+                    std::uint8_t pre[4 + 32 + 32] = {'V', '3', '7', 'T'};
+                    std::memcpy(pre + 4, ctx.prev_id.data(), 32);
+                    std::memcpy(pre + 36, w.key.data(), 32);
+                    pv->tie[w.key] = ::v37::sha256d(pre, sizeof(pre));
+                }
             }
             if (payable) {
                 std::uint64_t base = fixed_sum;
@@ -430,6 +439,8 @@ public:
                         e.pay = cpv->ref.at(k);
                         e.identity = k;
                         e.eb = v;
+                        if (auto a = cpv->age.find(k); a != cpv->age.end()) e.age = a->second;
+                        if (auto t = cpv->tie.find(k); t != cpv->tie.end()) e.tie = t->second;
                         out.push_back(std::move(e));
                     }
                     return out;

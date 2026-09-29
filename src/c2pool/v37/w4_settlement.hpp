@@ -920,6 +920,9 @@ public:
     explicit OwedLedger(::v37::ChainId chain, OwedLedgerRules rules = {}) : m_chain(chain), m_rules(rules) {}
 
     const OwedLedgerRules& rules() const { return m_rules; }
+    // The K_fair age of `k` (its first_eligible; 0 = none). Finalized-only, so
+    // it is the same on every node at a booking point.
+    u64 first_eligible_of(const bytes32& k) const { return fe_at(k); }
 
     ::v37::ChainId chain() const { return m_chain; }
     u64 ledger_seq() const { return m_seq; }
