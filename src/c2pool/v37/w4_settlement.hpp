@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <set>
@@ -1121,11 +1122,11 @@ public:
             prop.outs.push_back(ProposedOut{k, pay, amt});
             return true;
         };
+        std::uint8_t pre[4 + 32 + 32] = {'V', '3', '7', 'T'};   // one buffer: no allocation per key
+        std::memcpy(pre + 4, salt.data(), 32);
         auto salted = [&](const bytes32& k) {
-            std::vector<std::uint8_t> b = {'V', '3', '7', 'T'};
-            b.insert(b.end(), salt.begin(), salt.end());
-            b.insert(b.end(), k.begin(), k.end());
-            return ::v37::sha256d(b);
+            std::memcpy(pre + 36, k.data(), 32);
+            return ::v37::sha256d(pre, sizeof(pre));
         };
         std::vector<std::pair<bytes32, bytes32>> cohort;   // (salted, key)
         u64 cohort_fe = 0;
