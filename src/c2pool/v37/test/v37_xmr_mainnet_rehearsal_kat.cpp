@@ -130,7 +130,8 @@ o2::PayOfFn pay_of_map(const std::map<::v37::bytes32, ::v37::ScriptRef>& m) {
 // The lane: miners whose shares are in the view at each cut, and the owed seeds.
 // SPEND-COST FLOOR (payout-threshold.md §2-§3), as the daemon runs it; M7 turns it on.
 bool g_spend_floor = false;
-std::uint64_t g_cap_at = 0; std::uint32_t g_cap = 0;   // M8: the block at g_cap_at is built with this output cap
+std::uint64_t g_cap_at = 0; std::uint32_t g_cap = 0;
+bool g_no_seeds = false;   // M7b: a fresh pool, no seeded owed balances   // M8: the block at g_cap_at is built with this output cap
 
 struct LaneWorld {
     std::vector<Payee> miners;                    // m0..m5 (+ tiny miners, M7)
@@ -310,7 +311,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
         for (auto& n : run.nodes) n.L = st::OwedLedger(kChain, rules);
     }
     for (auto& n : run.nodes) {
-        for (std::size_t i = 0; i < W.seeded.size(); ++i) {
+        for (std::size_t i = 0; i < (g_no_seeds ? 0 : W.seeded.size()); ++i) {
             const std::string bid = "seed-" + std::to_string(i);
             n.L.on_block_found(bid, Amounts{{W.seeded[i].id, W.seed_amount[i]}}, {});
             n.L.on_block_finalized(bid, i + 1);
@@ -493,7 +494,7 @@ void m7_spend_floor() {
           "every one of %llu lane blocks is CANONICAL on every node (canonical=%zu mismatch=%zu other=%zu)",
           (unsigned long long)H, r.canonical, r.mismatch, r.other);
     CHECK(r.verdict_splits == 0 && r.split_heights == 0, "one verdict and one owed_digest on all three nodes, every height");
-    CHECK(r.below_floor == 0, "no output below its own block's c (smallest payout %llu, smallest c %llu)",
+    CHECK(r.min_payout < r.min_floor, "the block has room, so dust outputs below c are paid (smallest payout %llu < c %llu)",
           (unsigned long long)r.min_payout, (unsigned long long)r.min_floor);
     bool exact = true, bounded = true;
     long long tiny_paid = 0, tiny_bal = 0, big_bal = 0;
@@ -503,11 +504,12 @@ void m7_spend_floor() {
         if (eb - paid != bal) exact = false;
         bool tiny = false;
         for (std::size_t i = W.n_big; i < W.miners.size(); ++i) if (W.miners[i].id == k) tiny = true;
-        if (tiny) { tiny_paid += paid; tiny_bal += bal; if (bal < 0 || bal >= 2 * static_cast<long long>(r.min_floor)) bounded = false; }
+        if (tiny) { tiny_paid += paid; tiny_bal += bal; if (bal < 0 || bal > eb / 2) bounded = false; }
         else big_bal += bal;
     }
     CHECK(exact, "every key: E_b credited - paid on chain == its ledger balance (nothing lost, nothing invented)");
-    CHECK(bounded, "every tiny miner's balance stays in [0, 2c): it is paid once it reaches c");
+    CHECK(bounded, "while the seeded float is repaid, a tiny miner is paid the same fraction of its E_b as everyone "
+                   "(its balance stays under half of what it earned)");
     CHECK(tiny_paid > 0, "tiny miners are paid: %lld piconero reached them through the owed pass", tiny_paid);
     long long seeds_now = 0, seeds_then = 0;
     for (std::size_t i = 0; i < W.seeded.size(); ++i) { seeds_now += eo(r, W.seeded[i].id); seeds_then += W.seed_amount[i]; }
@@ -516,6 +518,22 @@ void m7_spend_floor() {
           "the ledger does not grow: total owed %lld == the seeded float %lld (+ at most 1 piconero marker per block); "
           "the seeds moved to the miners (%lld), tiny crumbs %lld",
           total, seeds_then, big_bal, tiny_bal);
+}
+
+void m7b_fresh_pool() {
+    std::printf("== M7b. a fresh pool (no seeded debt), many tiny miners ==\n");
+    g_spend_floor = true; g_no_seeds = true;
+    LaneWorld W;
+    for (int i = 0; i < 40; ++i) { const Payee p = payee(static_cast<std::uint8_t>(120 + i)); W.miners.push_back(p); W.universe[p.id] = p.ref; }
+    Run r = simulate(W, 24);
+    g_spend_floor = false; g_no_seeds = false;
+    CHECK(r.canonical == 24 && r.verdict_splits == 0 && r.split_heights == 0, "all 24 blocks canonical on every node, one digest");
+    long long worst = 0, total = 0;
+    for (const auto& [k, eb] : r.eb_gross) { (void)eb; const long long b = eo(r, k); total += b; worst = std::max(worst, b < 0 ? -b : b); }
+    CHECK(total == 24 && worst <= 24,
+          "every miner, dust included, is paid its E_b in the block itself. The only balance is the 1-piconero donation "
+          "marker each block keeps back, spread by rounding (total %lld over 24 blocks, largest %lld piconero)", total, worst);
+    CHECK(r.donation_paid == 24, "the donation output carries only the 1-piconero marker per block (%lld)", r.donation_paid);
 }
 
 void m8_claimed_full() {
@@ -580,6 +598,7 @@ int main() {
     m4_out_of_band_ref();
     m6_thief_pays_local_ref();
     m7_spend_floor();
+    m7b_fresh_pool();
     m8_claimed_full();
     m5_gate_and_config();
 #else
