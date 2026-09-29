@@ -410,6 +410,26 @@ public:
     }
     std::vector<::v37::bytes32> keys() const { std::vector<::v37::bytes32> v; for (const auto& [k, r] : m_paymap) { (void)r; v.push_back(k); } return v; }
 
+    // BOOKED REFS (every node recomputes the lane coinbase,
+    // xmr_coinbase_recompute.hpp). learn_ref() takes refs from anywhere: relay
+    // arrival order, this node's own payee, a restart's reload. That is right
+    // for mapping outputs, but the OWED PASS decides who is paid and in what
+    // order, and every node rebuilds it at the block's booking point. So the
+    // owed pass resolves only the refs every node holds at that point: those
+    // taught by BOOKED lane blocks (the view at each booked cut, the refs its
+    // outputs paid), the seeds and the compiled-in donation. A key known only
+    // locally is carried, identically on every node, until a booked block
+    // teaches its ref. learn_booked_ref() also learns the ref for mapping.
+    // true = new.
+    bool learn_booked_ref(const ::v37::ScriptRef& pay) {
+        learn_ref(pay);
+        auto& slot = m_booked[::v37::xmr::xmr_identity_key(pay)];
+        const bool fresh = !(slot == pay);
+        slot = pay;
+        return fresh;
+    }
+    std::size_t booked_refs() const { return m_booked.size(); }
+
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key
     // is the canon identity_key(pay); the resolver learns pay for that key.
     // bin_height auto-increments so each seed arms at a distinct (older-first)
@@ -417,6 +437,7 @@ public:
     ::v37::bytes32 seed_owed(const ::v37::ScriptRef& pay, std::uint64_t amount) {
         ::v37::bytes32 key = ::v37::xmr::xmr_identity_key(pay);
         m_paymap[key] = pay;
+        m_booked[key] = pay;   // a seed is lane config: every node holds it
         const std::string bid = "fixture-seed-" + std::to_string(m_next_bid++);
         OwedLedger::Amounts credit; credit[key] = static_cast<long long>(amount);
         const std::uint64_t age = m_next_age++;
@@ -459,6 +480,16 @@ public:
         };
     }
 
+    // The owed-pass resolver: booked refs only (see learn_booked_ref).
+    PayOfFn pay_of_booked() const {
+        return [this](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+            auto it = m_booked.find(k);
+            if (it != m_booked.end()) return it->second;
+            ::v37::ScriptRef raw; raw.kind = ::v37::ScriptKind::RAW; raw.payload.clear();
+            return raw;
+        };
+    }
+
     const OwedLedger& ledger() const { return m_ext ? *m_ext : m_ledger; }
     OwedLedger&       ledger()       { return m_ext ? *m_ext : m_ledger; }
     std::size_t       seeded() const { return m_paymap.size(); }
@@ -467,6 +498,7 @@ private:
     OwedLedger                            m_ledger;
     OwedLedger*                           m_ext = nullptr;   // 
     std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
+    std::map<::v37::bytes32, ::v37::ScriptRef> m_booked;   // BOOKED REFS: the owed pass's resolver
     std::uint64_t                         m_next_bid = 0;
     std::uint64_t                         m_next_age = 1;   // 0 reserved / unarmed
     SeedSink                              m_seed_sink;       // R-C rework-2 (F1)

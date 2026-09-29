@@ -37,6 +37,9 @@
 //       debited, credit dropped, one owed_digest, the double pay carried as
 //       a debt.
 //   R12 ruling 1: --coinbase v37 on mainnet refuses without --fee-model v1.
+//   R13 booked refs: a payee ref one node learned out of band never changes
+//       the verdict (the fork hazard of the full resolver, shown).
+//   R14 pay-now refs come from the view at the cut, not the resolver.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -239,7 +242,7 @@ struct Verified {
 // The receiver: decode under coinbase authority (candidates = the receiver's
 // ring, newest first), then recompute from ITS ledger.
 Verified receive(const Block& b, const st::OwedLedger& R, const Lane& lane, const std::vector<Payee>& cut_payees,
-                 std::vector<::v37::bytes32> ring = {}, bool has_view = true) {
+                 std::vector<::v37::bytes32> ring = {}, bool has_view = true, const Lane* booked = nullptr) {
     Verified v;
     ring.insert(ring.begin(), R.owed_digest());
     std::vector<::v37::bytes32> keys = lane.keys();
@@ -252,7 +255,7 @@ Verified receive(const Block& b, const st::OwedLedger& R, const Lane& lane, cons
     li.fixed = {fee::donation_marker(kNet)};
     li.pool_tag = the_tag();
     rc::CutInputs ci; ci.has_view = has_view; ci.payees = weighted(cut_payees);
-    v.r = rc::verify_lane_coinbase(b.blob, v.bk, R, lane.pay_of(), li, ci);
+    v.r = rc::verify_lane_coinbase(b.blob, v.bk, R, (booked ? *booked : lane).pay_of(), li, ci);
     return v;
 }
 
@@ -479,6 +482,44 @@ void r12_fee_model_mandatory() {
     XmrNodeConfig a; a.network = MoneroNetwork::Mainnet; a.coinbase = CoinbaseMode::MonerodTemplate;
     CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(a).empty(), "option A (monerod template) is not the settlement coinbase");
 }
+
+// R13: BOOKED REFS. The owed pass resolves only the refs every node holds at
+// the booking point. A node that learned K3's ref out of band (its own relay
+// arrival, its own payee) must not call a block whose builder carried K3 a
+// mismatch -- with the full resolver it would, and book it debit-only while
+// the builder booked it canonical: a ledger fork.
+void r13_booked_refs() {
+    std::printf("== R13. booked refs: out-of-band payee knowledge never changes the verdict ==\n");
+    World w;
+    seed(w.L, w.K3.id, 15000000000ll, 9);   // K3 is the OLDEST owed key
+    Lane booked = w.lane;                    // what every node's bookings taught: not K3
+    booked.refs.erase(w.K3.id);
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block b = build_block(w.L, booked, o);   // the builder carries K3 (no booked ref)
+    if (!b.ok) { CHECK(false, "builds: %s", b.why.c_str()); return; }
+    const auto full = receive(b, w.L, w.lane, w.cut);             // a receiver that knows K3 locally
+    const auto bkd  = receive(b, w.L, w.lane, w.cut, {}, true, &booked);
+    CHECK(full.bk.ok && !full.bk.payout.count(w.K3.id), "the block carries K3 (its builder holds no booked ref for it)");
+    CHECK(full.r.verdict == rc::Verdict::Mismatch, "with the FULL resolver the receiver would call it a mismatch (the fork hazard): %s",
+          full.r.why.c_str());
+    CHECK(bkd.r.canonical(), "with the BOOKED resolver it is canonical on every node: %s %s", verdict(bkd), bkd.r.why.c_str());
+}
+
+// R14: pay-now takes each payee's ref from the view at the cut, so a builder
+// whose resolver has not learned a cut payee still pays it (every node reads
+// the same view).
+void r14_paynow_refs_from_view() {
+    std::printf("== R14. pay-now refs come from the view at the cut ==\n");
+    World w;
+    Lane bare = w.lane;
+    for (const auto& p : w.cut) bare.refs.erase(p.id);   // the builder's resolver knows no cut payee
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block b = build_block(w.L, bare, o);
+    if (!b.ok) { CHECK(false, "builds: %s", b.why.c_str()); return; }
+    const auto v = receive(b, w.L, w.lane, w.cut, {}, true, &bare);
+    CHECK(v.bk.ok && v.bk.paynow_base.has_value(), "pay-now is armed (V37N committed) without the resolver knowing the cut payees");
+    CHECK(v.r.canonical(), "and the block is canonical: %s %s", verdict(v), v.r.why.c_str());
+}
 #else
 void suite_base() {
     std::printf("== BASE: no recompute on this tree ==\n");
@@ -503,6 +544,8 @@ int main() {
     r10_stale_state();
     r11_debit_only_booking();
     r12_fee_model_mandatory();
+    r13_booked_refs();
+    r14_paynow_refs_from_view();
 #else
     suite_base();
 #endif

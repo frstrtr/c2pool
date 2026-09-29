@@ -2397,6 +2397,34 @@ static int run_live(const XmrNodeConfig& cfg) {
                     rej.empty() ? "" : (" -- " + rej + " (winner_digest=" + hex_of(wit->second.drops->enrollment_digest).substr(0, 12) + "…)").c_str());
         return true;
     };
+    // BOOKED REFS (xmr_o2_settlement_fixture.hpp learn_booked_ref): the owed
+    // pass -- this node's templates AND the recompute of every lane block --
+    // resolves only the payee refs every node holds at the same booking point:
+    // those taught by BOOKED lane blocks (the view at the block's cut, the refs
+    // its outputs paid, its empty-cut finder), the seeds and the donation.
+    // Learned once a booking SUCCEEDS (never on an attempt that is then held,
+    // so a retried block is recomputed from the same set), and persisted in
+    // <sidecar>.refs so a restart keeps them (bookings below the resumed
+    // cursor are not re-folded).
+    const std::string booked_refs_path = fo.sidecar_path.empty() ? std::string() : fo.sidecar_path + ".refs";
+    std::uint64_t booked_refs_learned = 0;
+    auto note_booked_ref = [&](const ::v37::ScriptRef& ref) {
+        if (!cba_fx || !::v37::xmr::xmr_ref_valid(ref) || !cba_fx->learn_booked_ref(ref)) return;
+        ++booked_refs_learned;
+        if (booked_refs_path.empty()) return;
+        std::ofstream out(booked_refs_path, std::ios::app);
+        out << static_cast<unsigned>(ref.kind) << " " << sub::to_hex(ref.payload.data(), ref.payload.size()) << "\n";
+    };
+    auto note_booked_refs = [&](const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk) {
+        if (!cba_fx) return;
+        std::string w;
+        if (auto v = view_at_cut(bk.credit_cut, w, relay_hint(bid)))
+            for (const auto& p : settle::project(*v))
+                if (::v37::xmr::is_xmr_kind(p.pay.kind)) note_booked_ref(p.pay);
+        const auto pay_of = cba_fx->pay_of();
+        for (const auto& [k, v] : bk.payout) { (void)v; note_booked_ref(pay_of(k)); }
+        if (bk.ecut_finder) note_booked_ref(*bk.ecut_finder);
+    };
     // EVERY NODE RECOMPUTES THE LANE COINBASE (operator rulings 2026-09-29,
     // xmr/xmr_coinbase_recompute.hpp). A decoded lane block whose coinbase is
     // not, byte for byte, the one the builder pipeline produces from THIS
@@ -2431,7 +2459,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         ci.has_view = settle::assert_ratified_geometry(*view, /*strict=*/true);
         if (ci.has_view) ci.payees = settle::project(*view);
-        res = rc::verify_lane_coinbase(blob, bk, L, cba_fx->pay_of(), li, ci);
+        res = rc::verify_lane_coinbase(blob, bk, L, cba_fx->pay_of_booked(), li, ci);
         if (res.verdict == rc::Verdict::Canonical) { ++canon_ok; return 1; }
         if (res.verdict == rc::Verdict::Undecidable) { ++canon_undecided; why = "cut-pending: " + res.why; return -1; }
         ++canon_mismatch;
@@ -2643,6 +2671,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ++cut_ok;
                 ++cba_booked;
                 cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: its committed cut still bounds the lane
+                note_booked_refs(bid, bk);   // BOOKED REFS
                 last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " NON-CANONICAL: credit dropped";
                 std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu DEBIT-ONLY (not canonical) payout{ %s}\n",
                             static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
@@ -2759,6 +2788,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         ++cut_ok;
         ++cba_booked;
         cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: this booked cut bounds every lane block above it
+        note_booked_refs(bid, bk);   // BOOKED REFS
         last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " src=" + credit_src + " credit{ " + amounts_str(credit) + "}";
         std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
@@ -2832,6 +2862,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (cv == 0) {
                 out.credit.clear();     // payouts debited, credit dropped
                 cut_floor_note(h, bid, bk.credit_cut.next_pos);
+                note_booked_refs(bid, bk);   // BOOKED REFS
                 std::printf("converge-debit: h=%llu bid=%s… booked under the SCRATCH lineage DEBIT-ONLY (not canonical) payout{ %s}\n",
                             static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), amounts_str(payout).c_str());
                 std::fflush(stdout);
@@ -2862,6 +2893,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         if (!paynow_net(h, bid, bk, out.credit, payout, why)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
         cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: the adopted lineage's booked cut
+        note_booked_refs(bid, bk);   // BOOKED REFS
         std::printf("converge-decode: h=%llu bid=%s… booked under the SCRATCH lineage (candidate #%zu) P=%llu credit{ %s} payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.digest_index,
                     static_cast<unsigned long long>(bk.credit_cut.next_pos), amounts_str(out.credit).c_str(), amounts_str(payout).c_str());
@@ -3202,6 +3234,21 @@ static int run_live(const XmrNodeConfig& cfg) {
         // coinbase carries an OWED output alongside the sink (multi-output proof).
         o2::XmrOwedFixture ledger(node.ledger());   //  ONE ledger — K_fair is built over the ledger FOUND/FINALIZE mutate
         cba_fx = &ledger; cba_scfg = &scfg;
+        if (!booked_refs_path.empty()) {   // BOOKED REFS: what the previous run's bookings taught
+            std::ifstream in(booked_refs_path);
+            std::size_t n = 0, bad = 0;
+            for (std::string ln; std::getline(in, ln);) {
+                const std::size_t sp = ln.find(' ');
+                std::vector<std::uint8_t> pl;
+                if (sp == std::string::npos || !sub::from_hex(ln.substr(sp + 1), pl)) { if (!ln.empty()) ++bad; continue; }
+                ::v37::ScriptRef r;
+                r.kind = static_cast<::v37::ScriptKind>(std::atoi(ln.substr(0, sp).c_str()));
+                r.payload = std::move(pl);
+                if (::v37::xmr::xmr_ref_valid(r) && ledger.learn_booked_ref(r)) ++n; else ++bad;
+            }
+            std::printf("booked-refs: %zu payee ref(s) restored from %s%s\n", n, booked_refs_path.c_str(),
+                        bad ? (" (" + std::to_string(bad) + " line(s) skipped)").c_str() : "");
+        }
         // R-C rework-2 (F1): every seed goes through the node's write-ahead event
         // log (FOUND + FINALIZE), so a restarted node's replayed boot digest history
         // (the RECON ring seed) contains the states it lived through; on a resumed
@@ -3246,7 +3293,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     g_credit_feed.empty() ? "-" : g_credit_feed.c_str(), (unsigned long long)g_credit_feed_lag_ms,
                     g_wire_out.empty() ? "-" : g_wire_out.c_str(), g_wire_in.empty() ? "-" : g_wire_in.c_str(), g_credit_mutate);
         if (cba_payee_ref) ledger.learn_ref(*cba_payee_ref);
-        if (fee_on) ledger.learn_ref(fee::donation_ref(don_net));   // fee model: give-author credit is paid as an ordinary owed output to the donation
+        if (fee_on) ledger.learn_booked_ref(fee::donation_ref(don_net));   // fee model: give-author credit is paid as an ordinary owed output to the donation (compiled in: every node holds it)
         if (owner_ref) ledger.learn_ref(*owner_ref);          // fee model: owner-fee receipts pay the owner
         std::printf("cba: coinbase-authority booking ARMED (lane_chain=%u, payee %s, sink identity %s…)\n", cfg.lane_chain,
                     cba_payee ? "learned" : "none", hex_of(scfg.residual_sink_identity).substr(0, 12).c_str());
@@ -3412,6 +3459,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // other state (the tip's lane block still unbooked or HELD: the #1861
         // H/H+1 double pay; a lagging or restarting node) holds the template
         // instead of serving a coinbase every node would book debit-only.
+        provider.set_owed_pay_of(ledger.pay_of_booked());   // BOOKED REFS: the owed pass every node rebuilds
         provider.set_ready_gate([&](std::uint64_t T, std::string* w) -> bool {
             const std::uint64_t want = c2pool::v37n::xmr::recon::builder_cut(T, cfg.d_conf);
             const std::uint64_t cur  = node.finalize_driver().cursor_height();
