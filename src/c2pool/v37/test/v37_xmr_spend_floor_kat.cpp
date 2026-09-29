@@ -203,6 +203,18 @@ void f2c_short_pool() {
 }
 
 // ---------------------------------------------------------------------------
+void f3b_worth_spending_first() {
+    std::printf("== F3b. with too few slots, a payout >= c goes before dust ==\n");
+    const std::uint64_t c = x6::spend_floor(kTail);
+    const P dust = payee(81, c / 2, 3);                              // the OLDEST, but dust
+    const P big = payee(82, kTail);                                   // new, but worth spending (reward >= the tail)
+    auto in = fee_on_inputs(dust.eb + big.eb + 1, true);
+    in.output_cap = 2;                                                // one payee slot
+    arm(in, {dust, big});
+    const auto outs = x6::allocate_exact_sum(in);
+    CHECK(to(outs, big.id) > 0 && to(outs, dust.id) == 0, "the only slot goes to the payout >= c, although the dust is older");
+}
+
 void f3_slots() {
     std::printf("== F3. too few output slots: oldest first ==\n");
     // s is the smallest but the OLDEST (a waiting balance since bin 7); a and b
@@ -375,6 +387,7 @@ int main() {
     f2b_no_room();
     f2c_short_pool();
     f3_slots();
+    f3b_worth_spending_first();
     f4_owed_floor();
     f5_receive();
     f6_off();
