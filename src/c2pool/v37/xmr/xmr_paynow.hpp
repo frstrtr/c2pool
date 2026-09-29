@@ -137,8 +137,8 @@ inline std::map<::v37::bytes32, long long> allocation(std::uint64_t total, std::
 //
 // THE RULE. In an empty cut the finder's own share counts as the work: the
 // block pays its FINDER the pool P = total - B (B = the V37N base: sum of owed
-// takes + sum of fixed), i.e. reward - 1 with the fee model ON (the donation
-// keeps its 1-piconero marker) and the whole reward with the fee model OFF
+// takes + sum of fixed), i.e. the whole reward with the fee model ON too (the
+// donation keeps its 0-amount marker) and the whole reward with the fee model OFF
 // (nothing is left for the residual sink, which then emits no output), minus
 // any owed takes the block also pays.
 //

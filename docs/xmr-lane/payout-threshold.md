@@ -60,8 +60,8 @@ into one transaction for pool members is a later stage (§7).
 
 * **Everyone fits (the normal case):** every payee in the window, dust
   included, is paid its exact E_b in this block. No balance, no advance.
-  Rehearsal M7b: a fresh pool with 40 dust miners, 24 blocks, every balance
-  is 0 except the 1-piconero donation marker.
+  Rehearsal M7b: a fresh pool with 40 dust miners, 24 blocks: every balance
+  is 0, and every block ends in the donation output as a 0-amount marker.
 * **Order when the block has no room for everyone.** Payouts worth spending
   (E_b ≥ c) come before dust: a slot spent on an output that costs more to
   spend than it holds is the worst use of a scarce slot. Within each group
@@ -109,7 +109,9 @@ into one transaction for pool members is a later stage (§7).
   keeps the total constant.
 * **Uncredited cash** (more pool than E_b credited to anyone) stays in the
   residual, which is the donation output. The fold splits the whole reward,
-  so in practice only the 1-piconero marker is left.
+  and its rounding dust stays with the miners, so in practice the donation
+  output is only its 0-amount marker plus the donation's own give-author
+  share.
 * **The owed queue** (K_fair, oldest first) stays as the safety net for
   balances at or above `c`: payees that did not fit, a restart, DROPS carries
   and the seeds. In steady state it is empty.

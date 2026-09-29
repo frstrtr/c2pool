@@ -354,7 +354,9 @@ private:
             const CoinbaseOutput& a = alt[i];
             const CoinbaseOutput& b = m_cb.outputs[i];
             if (a.role != b.role || !(a.pay == b.pay) || a.identity != b.identity) return false;
-            if (a.amount == 0) return false;   // never emit a zero-amount output
+            // never emit a zero-amount output, except the donation marker (a Fixed
+            // output declared at 0: the output itself is the marker, fee model v1)
+            if (a.amount == 0 && a.role != CoinbaseOutput::Role::Fixed) return false;
         }
         return true;
     }

@@ -19,17 +19,19 @@
 // fleet refuses at HELLO instead of diverging (ruling S4).
 //
 //   1. DONATION OUTPUT = MANDATORY, EXACTLY ONE OUTPUT (rulings S1 + 09-23).
-//      p2pool data.py: amounts[DONATION] += subsidy - sum(amounts), and V36
-//      requires the donation output to be >= 1 atomic unit; share credit to
-//      the donation script and the residual land in that ONE output. Here the
-//      lane coinbase carries ONE output to the donation address, LAST: a
-//      FixedOutput to the donation ref whose declared amount kDonationDustPico
-//      (1 piconero) is a MINIMUM; the residual sink IS the donation address,
+//      p2pool data.py: amounts[DONATION] += subsidy - sum(amounts), and the
+//      donation output is always emitted, even at 0 (pre-V36 p2pool; V36 LTC
+//      raised it to >= 1 atomic unit). Share credit to the donation script
+//      and the residual land in that ONE output. Here the lane coinbase
+//      carries ONE output to the donation address, LAST: a FixedOutput to the
+//      donation ref whose declared amount kDonationMarkerPico is 0 (ruling
+//      2026-09-29: the marker is the output itself, not an amount; Monero
+//      consensus accepts a 0-amount v2 coinbase output). The residual sink IS the donation address,
 //      so X6 (allocate_exact_sum, residual_folds_into_fixed) folds the whole
 //      exact-sum residual into it, and the donation's own K_fair payout
 //      (give-author credit, paid at its age position) is MERGED into it too:
-//          amount    = owed_paid + 1 + residual
-//          owed_part = min(owed_in, amount - 1)     (x6 CoinbaseOutput)
+//          amount    = owed_paid + residual      (may be 0)
+//          owed_part = min(owed_in, amount)       (x6 CoinbaseOutput)
 //      owed_in (the owed the coinbase's input set held for the donation;
 //      under the default W4Propose source that is its proposed K_fair take,
 //      so owed_part is exactly its K_fair payout, less any S2 dust it paid)
@@ -41,15 +43,17 @@
 //          canonical coinbase does not end in that one output, or pays the
 //          donation anywhere else;
 //        * receive side: apply_donation_rule() refuses to book a lane
-//          coinbase whose last output is not a >= 1 piconero donation output,
+//          coinbase whose last output is not the donation output,
 //          that pays the donation in an earlier output, or that lacks the
 //          owed_in tail (REFUSE-IF-ABSENT); it books owed_part as the
 //          donation's payout (a ledger deduction, like any K_fair payout)
-//          and the rest (1 + residual) as coverage.
-//   2. THE 1-PICONERO DUST COMES FROM THE LARGEST PAYEE (ruling S2, V36
-//      data.py "take 1 from the largest"). Only when the owed pass exhausts
-//      the budget (residual 0) does X6 deduct the minimum, from the LARGEST
-//      owed output (ties: earliest in K_fair order); the piconero stays owed.
+//          and the rest (the residual) as coverage.
+//   2. NO MINIMUM TO FUND (ruling S2 retired 2026-09-29). V36 LTC takes 1
+//      atomic unit from the largest payee when the residual is 0; with the
+//      marker at 0 there is nothing to take (X6 S2 is a no-op at a 0 minimum).
+//      Rounding dust stays with the miners (exact-sum split, largest
+//      remainder), as in Monero p2pool; give-author defaults to 0.1% and 0
+//      opts out entirely, leaving a 0-amount marker.
 //   3. GIVE-AUTHOR = A u16 INSIDE THE PoW-COMMITTED RECEIPT (ruling S3). The
 //      Family-B receipt's side_data_v2 carries give_author; its info_digest
 //      commits it and, with --relay-bind rbind, the coinbase 0x02 region
@@ -108,8 +112,9 @@ inline constexpr char kDonationAddress[] =
 // by v37_xmr_fee_model_kat (decode(kDonationAddress) must equal these bytes).
 inline constexpr char kDonationSpendHex[] = "14d413e6ccb14f0ba30999b97c8912a07321d893789b7f149810b7885b2cd7c7";
 inline constexpr char kDonationViewHex[]  = "b3157741ab68969aeb7fe9ebd4fa3ec5ce4dcdc7b43249fdb40311cb03779e03";
-// The V36 marker minimum: the donation output is never below 1 atomic unit.
-inline constexpr std::uint64_t kDonationDustPico = 1;
+// The donation marker's declared amount: 0. The output is always present
+// (pre-V36 p2pool shape); its amount is give-author credit + residual only.
+inline constexpr std::uint64_t kDonationMarkerPico = 0;
 // The give-author scale (v36 share_data.donation is a u16 over 65535).
 inline constexpr std::uint32_t kGiveAuthorScale = 65535;
 // Under the gate every PoW-committed receipt is pushed at this lane weight,
@@ -293,11 +298,11 @@ inline ::v37::bytes32 donation_identity() { return donation_identity(DonationNet
 // The mandatory donation output (declared LAST among the fixed outputs, and
 // paying the residual sink, so X6 folds the residual AND the donation's own
 // K_fair payout into it: the canonical tail is
-// [ ... owed ][ donation: owed_paid + 1 + residual ], one output).
+// [ ... owed ][ donation: owed_paid + residual (may be 0) ], one output).
 inline x6::FixedOutput donation_marker(DonationNet n) {
     x6::FixedOutput f;
     f.pay = donation_ref(n);
-    f.amount = kDonationDustPico;
+    f.amount = kDonationMarkerPico;
     f.identity = donation_identity(n);
     return f;
 }
@@ -412,11 +417,10 @@ inline std::optional<std::uint64_t> parse_donation_owed(const std::vector<unsign
     return parse_donation_owed_payload(*nf);
 }
 
-// The receive-side split of the ONE donation output (the X6 MERGE rule with
-// minimum kDonationDustPico): the part booked as the donation's payout.
+// The receive-side split of the ONE donation output (the X6 MERGE rule; the
+// marker minimum is 0): the part booked as the donation's payout.
 inline std::uint64_t donation_owed_part(std::uint64_t amount, std::uint64_t owed_in) {
-    const std::uint64_t over_min = amount > kDonationDustPico ? amount - kDonationDustPico : 0;
-    return owed_in < over_min ? owed_in : over_min;
+    return owed_in < amount ? owed_in : amount;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,11 +428,11 @@ inline std::uint64_t donation_owed_part(std::uint64_t amount, std::uint64_t owed
 //
 // Canonical tail (X6 order [owed] ++ [fixed], the residual AND the donation's
 // K_fair payout merged into the last fixed output because it pays the sink):
-//     ... owed (none to D) | D: owed_paid + 1 + residual
+//     ... owed (none to D) | D: owed_paid + residual (may be 0)
 //
 // Deterministic location, identical on every node: the LAST output pays the
-// donation identity D with amount >= kDonationDustPico and NO earlier output
-// pays D -> it is the donation output; otherwise REFUSE.
+// donation identity D (any amount, 0 included) and NO earlier output pays D
+// -> it is the donation output; otherwise REFUSE.
 // ---------------------------------------------------------------------------
 struct MarkerLocation {
     bool        ok = false;
@@ -442,11 +446,6 @@ inline MarkerLocation locate_donation_marker(const std::vector<::v37::bytes32>& 
     const std::size_t n = ids.size();
     if (n == 0 || amounts.size() != n) { m.why = "donation output absent: no outputs"; return m; }
     if (!(ids[n - 1] == D)) { m.why = "donation output absent: the last output does not pay the donation address"; return m; }
-    if (amounts[n - 1] < kDonationDustPico) {
-        m.why = "donation output absent: the last donation output pays " + std::to_string(amounts[n - 1]) +
-                " < " + std::to_string(kDonationDustPico) + " piconero";
-        return m;
-    }
     for (std::size_t i = 0; i + 1 < n; ++i)
         if (ids[i] == D) {
             m.why = "more than one donation output: output " + std::to_string(i) +
@@ -458,8 +457,9 @@ inline MarkerLocation locate_donation_marker(const std::vector<::v37::bytes32>& 
 }
 
 // Serve-side property over the builder's canonical output list (roles known):
-// exactly ONE output to D, last, Fixed, >= 1 piconero, its owed_part leaving
-// the minimum, and NO separate residual sink (the residual must have folded).
+// exactly ONE output to D, last, Fixed (any amount, 0 included), its
+// owed_part within its amount, and NO separate residual sink (the residual
+// must have folded).
 inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs,
                                               const ::v37::bytes32& D, const ::v37::ScriptRef& Dref) {
     MarkerLocation m;
@@ -470,9 +470,9 @@ inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutp
             return m;
         }
     if (n == 0 || outs[n - 1].role != x6::CoinbaseOutput::Role::Fixed || !(outs[n - 1].identity == D) ||
-        outs[n - 1].amount < kDonationDustPico || !(outs[n - 1].pay == Dref)) {
-        m.why = "donation output absent: the canonical coinbase does not end in the >= " +
-                std::to_string(kDonationDustPico) + "-piconero donation output (owed + 1 + residual)";
+        !(outs[n - 1].pay == Dref)) {
+        m.why = "donation output absent: the canonical coinbase does not end in the donation output "
+                "(owed + residual)";
         return m;
     }
     for (std::size_t i = 0; i + 1 < n; ++i)
@@ -481,9 +481,9 @@ inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutp
                     " also pays the donation address (its owed payout must merge into the last one)";
             return m;
         }
-    if (outs[n - 1].owed_part > outs[n - 1].amount - kDonationDustPico) {
+    if (outs[n - 1].owed_part > outs[n - 1].amount) {
         m.why = "the donation output's owed part " + std::to_string(outs[n - 1].owed_part) +
-                " leaves less than the " + std::to_string(kDonationDustPico) + "-piconero minimum";
+                " exceeds its amount " + std::to_string(outs[n - 1].amount);
         return m;
     }
     m.ok = true; m.marker = n - 1;

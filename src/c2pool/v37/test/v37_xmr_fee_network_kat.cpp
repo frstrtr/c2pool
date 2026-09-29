@@ -150,7 +150,7 @@ void suite_identities() {
         CHECK(d.ref() == ref_of(n), "N5 %s: donation_ref == make_xmr_std(decoded B, A)", name(n));
         CHECK(id_of(n) == ::v37::xmr::xmr_identity_key(ref_of(n)), "N6 %s: donation_identity == identity_key(donation_ref)", name(n));
         const x6::FixedOutput m = marker_of(n);
-        CHECK(m.pay == ref_of(n) && m.identity == id_of(n) && m.amount == fee::kDonationDustPico,
+        CHECK(m.pay == ref_of(n) && m.identity == id_of(n) && m.amount == fee::kDonationMarkerPico,
               "N7 %s: donation_marker pays this network's donation, minimum %llu", name(n), (unsigned long long)m.amount);
         CHECK(::v37::xmr::xmr_ref_valid(ref_of(n)), "N8 %s: the donation ref passes the LIVE ed25519 torsion check", name(n));
         ids.insert(hex(id_of(n)));

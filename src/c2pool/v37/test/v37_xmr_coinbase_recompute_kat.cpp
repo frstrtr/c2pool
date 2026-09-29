@@ -305,7 +305,7 @@ void r2_hint_above_total() {
     if (!b.ok) return;
     st::OwedLedger R = w.L;
     const auto v = receive(b, R, w.lane, w.cut);
-    const std::uint64_t took = v.bk.paynow_base ? *v.bk.paynow_base - fee::kDonationDustPico : 0;
+    const std::uint64_t took = v.bk.paynow_base ? *v.bk.paynow_base - fee::kDonationMarkerPico : 0;
     CHECK(v.bk.ok && took > b.reward, "V37N commits owed takes %llu > the block's total %llu (the builder's hint was larger)",
           (unsigned long long)took, (unsigned long long)b.reward);
     CHECK(v.r.canonical(), "recompute from the committed base: %s %s", verdict(v), v.r.why.c_str());
@@ -329,8 +329,8 @@ void r3_empty_cut() {
     if (b1.ok) {
         const auto v = receive(b1, E, w.lane, {});
         CHECK(v.bk.ok && v.bk.ecut_finder.has_value() && v.r.canonical(), "per-job finder (V37F + V37N): %s %s", verdict(v), v.r.why.c_str());
-        CHECK(v.r.expected_payout.count(f.id) && v.r.expected_payout.at(f.id) == static_cast<long long>(b1.reward - 1),
-              "the finder is paid reward - 1 (the donation keeps its marker)");
+        CHECK(v.r.expected_payout.count(f.id) && v.r.expected_payout.at(f.id) == static_cast<long long>(b1.reward - fee::kDonationMarkerPico),
+              "the finder is paid the whole reward (the donation keeps only its 0-amount marker)");
     }
 }
 

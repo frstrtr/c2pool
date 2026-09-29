@@ -419,7 +419,8 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
     // is deducted from the LARGEST owed output (ties: the earliest in K_fair
     // order); an output driven to 0 is dropped (its owed simply carries). The
     // deducted piconero stay OWED in the ledger (the on-chain booking pays the
-    // payee less), so nothing is lost -- exactly V36's dust rule.
+    // payee less), so nothing is lost -- exactly V36's dust rule. The fee
+    // model's marker is declared at 0 (2026-09-29), so there this is a no-op.
     std::uint64_t need = (fold && remaining < fold_min) ? fold_min - remaining : 0;
     while (need > 0 && !res.empty()) {
         std::size_t big = 0;

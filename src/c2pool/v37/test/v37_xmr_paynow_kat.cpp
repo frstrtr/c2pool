@@ -30,8 +30,8 @@
 //       an orphan nets nothing (ledger == a run without it).
 //   P4  the settlement source end-to-end (XmrOwedSettlementSource::build with
 //       a credit cut + the cut's projected payees): V37N base committed, the
-//       first block pays its miners reward - 1, the donation output is the
-//       1-piconero marker, shape stable across the reward fixpoint.
+//       first block pays its miners the whole reward, the donation output is
+//       the 0-amount marker, shape stable across the reward fixpoint.
 //
 // RED on the base: the pay-now API does not exist there, so this file builds
 // its BASE branch (no xmr_paynow.hpp): the same empty-ledger block goes
@@ -200,8 +200,8 @@ void suite_alloc() {
         std::uint64_t miners = 0; bool capped = true;
         for (const auto& p : ps) { const auto a = amount_to(outs, p.id); miners += a; if (a > eb.at(p.id)) capped = false; }
         CHECK(err == x6::BuildError::None && sum_of(outs) == kReward, "(a) empty ledger: exact-sum %llu == reward", (unsigned long long)sum_of(outs));
-        CHECK(don == fee::kDonationDustPico, "(a) the donation output carries ONLY its 1-piconero marker (got %llu)", (unsigned long long)don);
-        CHECK(miners == kReward - 1 && capped, "(a) the block's own miners are paid reward-1 = %llu, each <= its E_b", (unsigned long long)miners);
+        CHECK(don == fee::kDonationMarkerPico, "(a) the donation output carries ONLY its 0-amount marker (got %llu)", (unsigned long long)don);
+        CHECK(miners == kReward - fee::kDonationMarkerPico && capped, "(a) the block's own miners are paid the whole reward = %llu, each <= its E_b", (unsigned long long)miners);
         CHECK(outs.size() == 4 && outs.back().identity == D && outs[0].identity == ps[0].id && outs[2].identity == ps[2].id,
               "(a) canonical order: pay-now outputs identity ASC, then the ONE donation output LAST");
         CHECK(fee::inspect_donation_marker(outs, kNet).ok, "(a) the serve-side donation property still ACCEPTS the shape");
@@ -215,18 +215,18 @@ void suite_alloc() {
         in.owed = {oa, ox};
         x6::BuildError err{};
         const auto outs = x6::allocate_exact_sum(in, &err);
-        const std::uint64_t pool = kReward - 1 - 150000000000ull;
+        const std::uint64_t pool = kReward - fee::kDonationMarkerPico - 150000000000ull;
         std::vector<std::uint64_t> ebv; for (const auto& p : ps) ebv.push_back(eb.at(p.id));
         const auto al = x6::paynow_split(pool, ebv);
         CHECK(err == x6::BuildError::None && sum_of(outs) == kReward, "(b) exact-sum");
         CHECK(amount_to(outs, ps[0].id) == 100000000000ull + al[0], "(b) A: owed 1e11 + its pay-now %llu MERGED in one output", (unsigned long long)al[0]);
         CHECK(amount_to(outs, id_of(X)) == 50000000000ull, "(b) X (no work in this block) gets exactly its owed, no pay-now");
         CHECK(amount_to(outs, ps[1].id) == al[1] && amount_to(outs, ps[2].id) == al[2], "(b) B, C get their pay-now shares");
-        CHECK(amount_to(outs, D) == 1, "(b) donation == 1 (marker only)");
+        CHECK(amount_to(outs, D) == fee::kDonationMarkerPico, "(b) donation == 0 (marker only)");
         std::size_t nA = 0; for (const auto& o : outs) if (o.identity == ps[0].id) ++nA;
         CHECK(nA == 1 && outs.size() == 5, "(b) one output per identity (5 = A, X, B, C, donation)");
     }
-    // (c) full owed: the owed pass exhausts the budget -> no pay-now, S2 dust from the largest
+    // (c) full owed: the owed pass exhausts the budget -> no pay-now, the donation marker at 0
     {
         auto in = fee_on_inputs(kReward);
         x6::OwedEntry oa; oa.pay = ps[0].ref; oa.identity = ps[0].id; oa.owed = kReward; oa.first_eligible = 0;
@@ -237,7 +237,7 @@ void suite_alloc() {
         bool same = base_outs.size() == outs.size();
         for (std::size_t i = 0; same && i < outs.size(); ++i) same = outs[i].amount == base_outs[i].amount && outs[i].identity == base_outs[i].identity;
         CHECK(same, "(c) full owed: byte-identical to master's allocation (no pay-now)");
-        CHECK(amount_to(outs, ps[0].id) == kReward - 1 && amount_to(outs, D) == 1, "(c) S2 unchanged: the 1-piconero marker comes from the largest payee");
+        CHECK(amount_to(outs, ps[0].id) == kReward && amount_to(outs, D) == 0, "(c) the owed payee is paid the whole reward, the donation output is the 0 marker");
     }
     // (d) rounding: a tiny budget over 1:1:1 weights
     {
@@ -247,9 +247,9 @@ void suite_alloc() {
         const auto outs = x6::allocate_exact_sum(in);
         const auto e = eb_at(R, eq);
         bool capped = true; for (const auto& p : eq) if (amount_to(outs, p.id) > e.at(p.id)) capped = false;
-        CHECK(sum_of(outs) == R && amount_to(outs, D) == 1 && capped,
-              "(d) rounding: pool %llu over 3 equal E_b -> exact-sum, donation 1, each <= E_b (%llu/%llu/%llu)",
-              (unsigned long long)(R - 1), (unsigned long long)amount_to(outs, eq[0].id),
+        CHECK(sum_of(outs) == R && amount_to(outs, D) == 0 && capped,
+              "(d) rounding: pool %llu over 3 equal E_b -> exact-sum, the dust stays with the miners, donation 0, each <= E_b (%llu/%llu/%llu)",
+              (unsigned long long)R, (unsigned long long)amount_to(outs, eq[0].id),
               (unsigned long long)amount_to(outs, eq[1].id), (unsigned long long)amount_to(outs, eq[2].id));
     }
     // (e) the donation identity has E_b (give-author credit): its share stays IN the donation output
@@ -260,11 +260,11 @@ void suite_alloc() {
         const auto outs = x6::allocate_exact_sum(in);
         const auto e = eb_at(kReward, wd);
         std::vector<std::uint64_t> ebv; for (const auto& p : wd) ebv.push_back(e.at(p.id));
-        const auto al = x6::paynow_split(kReward - 1, ebv);
+        const auto al = x6::paynow_split(kReward - fee::kDonationMarkerPico, ebv);
         std::uint64_t alD = 0; for (std::size_t i = 0; i < wd.size(); ++i) if (wd[i].id == D) alD = al[i];
         std::size_t nD = 0; for (const auto& o : outs) if (o.identity == D) ++nD;
-        CHECK(nD == 1 && outs.back().identity == D && amount_to(outs, D) == 1 + alD && outs.back().owed_part == 0,
-              "(e) donation E_b share %llu merges into the ONE donation output (1 + share), owed_part 0 (coverage)", (unsigned long long)alD);
+        CHECK(nD == 1 && outs.back().identity == D && amount_to(outs, D) == fee::kDonationMarkerPico + alD && outs.back().owed_part == 0,
+              "(e) donation E_b share %llu merges into the ONE donation output (its share only), owed_part 0 (coverage)", (unsigned long long)alD);
     }
     // (f) cap: pay-now needs 3 new slots, the cap leaves 1 -> fail closed (the provider then drops pay-now)
     {
@@ -315,7 +315,7 @@ void suite_booking() {
     x6::OwedEntry ox; ox.pay = X; ox.identity = id_of(X); ox.owed = owedX; ox.first_eligible = 1;
     in.owed = {oa, ox};
     const auto outs = x6::allocate_exact_sum(in);
-    const std::uint64_t base = owedA + owedX + fee::kDonationDustPico;   // Σ owed takes + Σ fixed
+    const std::uint64_t base = owedA + owedX + fee::kDonationMarkerPico;   // Σ owed takes + Σ fixed
     // what the receiver reads from the chain: E_b at the cut, payout (non-donation), donation coverage
     Amounts credit; for (const auto& [k, v] : eb_at(kReward, ps)) credit[k] = static_cast<long long>(v);
     Amounts payout; long long sink_total = 0;
@@ -408,17 +408,17 @@ void suite_source() {
     auto src = o2::XmrOwedSettlementSource::build(L, pay_of, ctx, kReward, &why);
     CHECK(src != nullptr, "source builds: %s", why.empty() ? "ok" : why.c_str());
     if (!src) return;
-    CHECK(src->paynow_on() && src->paynow_base() == 1, "pay-now armed, V37N base = Σ owed (0) + Σ fixed (1) = %llu", (unsigned long long)src->paynow_base());
+    CHECK(src->paynow_on() && src->paynow_base() == fee::kDonationMarkerPico, "pay-now armed, V37N base = Σ owed (0) + Σ fixed (0) = %llu", (unsigned long long)src->paynow_base());
     const auto tail = src->extra_nonce_tail();
-    CHECK(c2pool::v37n::xmr::paynow::parse_payload(tail) == std::optional<std::uint64_t>(1) &&
+    CHECK(c2pool::v37n::xmr::paynow::parse_payload(tail) == std::optional<std::uint64_t>(fee::kDonationMarkerPico) &&
           fee::parse_donation_owed_payload(tail).has_value(),
-          "the 0x02 tail carries V37N(1) || V37D || V37C (%zu bytes)", tail.size());
+          "the 0x02 tail carries V37N(0) || V37D || V37C (%zu bytes)", tail.size());
     for (std::uint64_t R : std::vector<std::uint64_t>{kReward, kReward + 777777ull}) {
         const auto pm = src->payout_map_at(R);
         long long miners = 0; for (const auto& p : ps) miners += pm.count(p.id) ? pm.at(p.id) : 0;
         const long long don = pm.count(fee::donation_identity(kNet)) ? pm.at(fee::donation_identity(kNet)) : -1;
-        CHECK(src->shape_matches_at(R) && miners == static_cast<long long>(R - 1) && don == 1,
-              "first block @ reward %llu: miners paid %lld (= reward-1), donation %lld (marker only), shape stable",
+        CHECK(src->shape_matches_at(R) && miners == static_cast<long long>(R - fee::kDonationMarkerPico) && don == static_cast<long long>(fee::kDonationMarkerPico),
+              "first block @ reward %llu: miners paid %lld (= the whole reward), donation %lld (the 0 marker), shape stable",
               (unsigned long long)R, miners, don);
     }
     // no cut payees -> master's shape, no V37N
@@ -451,7 +451,7 @@ void suite_assembled() {
     x6::OwedEntry oa; oa.pay = ps[0].ref; oa.identity = ps[0].id; oa.owed = 1000000000ull; oa.first_eligible = 0;
     a.settle.owed = {oa};
     arm_paynow(a.settle, ps);
-    const std::uint64_t base = oa.owed + fee::kDonationDustPico;
+    const std::uint64_t base = oa.owed + fee::kDonationMarkerPico;
     a.extra_nonce_tail = pn::encode_tail(base);
     { const auto d = fee::encode_donation_owed_tail(x6::fold_identity_owed(a.settle)); a.extra_nonce_tail.insert(a.extra_nonce_tail.end(), d.begin(), d.end()); }
     c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = 77; cc.spine_digest[5] = 0x33;
@@ -476,8 +476,8 @@ void suite_assembled() {
     std::uint64_t sum = 0, miners = 0; std::size_t n_pn = 0;
     for (const auto& x : o) { sum += x.amount; if (x.role == x6::CoinbaseOutput::Role::PayNow) ++n_pn; }
     for (const auto& p : ps) miners += amount_to(o, p.id);
-    CHECK(sum == t->reward() && amount_to(o, fee::donation_identity(kNet)) == 1 && miners == t->reward() - 1 && n_pn == 2,
-          "assembled: exact-sum %llu, donation 1, miners reward-1 (A merged owed+pay-now, 2 PayNow outputs)", (unsigned long long)sum);
+    CHECK(sum == t->reward() && amount_to(o, fee::donation_identity(kNet)) == 0 && miners == t->reward() && n_pn == 2,
+          "assembled: exact-sum %llu, donation 0 (a real 0-amount output), miners the whole reward (A merged owed+pay-now, 2 PayNow outputs)", (unsigned long long)sum);
     const auto shp = o2::inspect_kfair_coinbase(*t, a.settle.lane_commitment, 5);
     CHECK(shp.kfair_order, "the K_fair coinbase shape gate ACCEPTS the pay-now outputs: %s", shp.why.empty() ? "ok" : shp.why.c_str());
 }
@@ -489,10 +489,10 @@ void suite_base() {
     const auto in = fee_on_inputs(kReward);   // empty ledger: the first pool block
     const auto outs = x6::allocate_exact_sum(in);
     std::uint64_t miners = 0; for (const auto& p : ps) miners += amount_to(outs, p.id);
-    CHECK(amount_to(outs, D) == fee::kDonationDustPico,
+    CHECK(amount_to(outs, D) == fee::kDonationMarkerPico,
           "(a) the donation output carries ONLY its marker -- got %llu of %llu (the WHOLE reward)",
           (unsigned long long)amount_to(outs, D), (unsigned long long)kReward);
-    CHECK(miners == kReward - 1, "(a) the block's own miners are paid reward-1 -- got %llu", (unsigned long long)miners);
+    CHECK(miners == kReward - fee::kDonationMarkerPico, "(a) the block's own miners are paid the whole reward -- got %llu", (unsigned long long)miners);
     CHECK(false, "net-at-FOUND pay-now booking (xmr_paynow.hpp) is absent");
 }
 #endif
