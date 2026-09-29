@@ -67,18 +67,25 @@ into one transaction for pool members is a later stage (§7).
 * **Short pool** (the owed pass paid old debts first): every admitted payee
   gets the same fraction of its E_b. Dust is admitted while the smallest
   admitted payee ≥ c still gets at least `c`.
-* **Payees that are not admitted** (no slot left) keep their E_b as a
-  balance. Their cash is **advanced in the same block**, pro rata over the
-  admitted payees ≥ c, at most their own E_b each. Their balance goes
-  negative by that advance, and their next credits repay it. The block is
-  distributed in full.
-* **Why this cannot grow.** The advances mirror the waiting balances
-  exactly, so every block pays out what it credits. When a waiting balance
-  is paid later, that block's other payees receive the same amount less. The
-  two cancel.
-* **Cash left after the advance cap** goes to the donation output. That
-  happens only when the credited work is a fraction of the reward, as in a
-  pool's first blocks. It is disclosed, and it is bounded by one block.
+* **Payees that are not admitted** (no slot left): their cash is
+  **redistributed** to the admitted payees pro rata, and it comes off their own
+  credit for this block. This is P2Pool's rule for outputs that do not fit.
+  Their work stays in the window and earns in the next blocks.
+* **Never an advance** (ruling 2026-09-29). Pay-now is a flow. A miner that
+  leaves or changes address never returns work paid ahead, so no payee is
+  paid more than it is credited. The redistribution is booked as a credit
+  delta (`allocate_exact_sum`'s `credit_delta`, Σ = 0). Every node gets the
+  delta from its recompute and applies it to the E_b before the net booking.
+  Rehearsal M7: no balance is ever negative.
+* The part of a waiting payee's E_b that the owed pass spent on older debts
+  (a short pool) stays its balance: that is the queue, not an advance.
+* **Why this cannot grow.** A redistribution moves credit and cash
+  together, so every block pays out what it credits. Balances come only from
+  the owed pass (the queue moving old debt onto current miners), and that
+  keeps the total constant.
+* **Uncredited cash** (more pool than E_b credited to anyone) stays in the
+  residual, which is the donation output. The fold splits the whole reward,
+  so in practice only the 1-piconero marker is left.
 * **The owed queue** (K_fair, oldest first) stays as the safety net for
   balances at or above `c`: payees that did not fit, a restart, DROPS carries
   and the seeds. In steady state it is empty.
@@ -153,7 +160,7 @@ today, and re-enters at the back when a new unpaid remainder appears.
 | rule | where | pinned by |
 |---|---|---|
 | `c` | `x6::spend_floor`, `fee_per_byte_at_floor`, `kInputWeight` (`src/impl/xmr/settle/xmr_coinbase.*`) | `v37_xmr_spend_floor_kat` F1 |
-| dust, the advance, slots, the owed floor | `allocate_exact_sum` under `CoinbaseInputs::spend_floor` | F2-F4, F6; rehearsal M7, M7b |
+| dust, redistribution, slots, the owed floor | `allocate_exact_sum` under `CoinbaseInputs::spend_floor` | F2-F4, F6; rehearsal M7, M7b |
 | the receive side | `paynow::net_booking(..., spend_floor)`: net of min(credit, paid) | F5 |
 | seniority from the floor, rotation | `OwedLedgerRules` (`w4_settlement.hpp`), `XmrNodeConfig::ledger_*` | F7-F9; rehearsal M7 |
 | the fixed output cap | `XmrBlockAssembler::build` (cap = wire ceiling under the floor); recompute accepts only it | rehearsal M8 |
@@ -174,7 +181,7 @@ pending set at the booking point is the same on every node.
 
 1. `c` (Monero's fee rule from the block total and `w_input`), with KATs
    against Monero's own numbers.
-2. Crumbs and the advance in pay-now, identical in the builder (X6) and the
+2. Dust and the redistribution in pay-now, identical in the builder (X6) and the
    receiver (`xmr_paynow`), recomputed; KATs and a rehearsal scenario with
    many small miners and too few slots.
 3. Seniority from `c` and rotation on a partial payment (§6, §6a), one

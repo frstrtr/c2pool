@@ -13,8 +13,8 @@
 //       (Blockchain::get_dynamic_base_fee arithmetic) times one RingCT input,
 //       quantized up; known values, monotone in the reward.
 //   F2  with room in the block every payee, dust included, is paid its exact
-//       E_b; F2b without room the dust waits as a balance and its cash is
-//       advanced pro rata to the payees >= c, at most their own E_b.
+//       E_b; F2b without room its cash is REDISTRIBUTED to the paid payees and
+//       taken off its credit (credit delta, sum 0): never an advance.
 //   F3  too few output slots: the largest payees get the slots, the rest
 //       wait; no CapTooSmall; the advance cap sends the excess to the residual.
 //   F4  the owed pass pays no balance below c.
@@ -144,7 +144,7 @@ void f2_crumbs() {
 }
 
 void f2b_no_room() {
-    std::printf("== F2b. dust without a slot waits; its cash is advanced ==\n");
+    std::printf("== F2b. no slot: its cash is redistributed, never advanced ==\n");
     const std::uint64_t c = x6::spend_floor(kTail);
     const P a = payee(15, 361000000000ull), b = payee(16, 239000000000ull);
     const P cr1 = payee(17, c - 1), cr2 = payee(18, c / 3);
@@ -153,14 +153,28 @@ void f2b_no_room() {
     auto in = fee_on_inputs(reward, true);
     in.output_cap = 3;                                                // donation (folds) + 2 payee slots
     arm(in, {a, b, cr1, cr2});
-    const auto outs = x6::allocate_exact_sum(in);
+    Amounts delta;
+    const auto outs = x6::allocate_exact_sum(in, nullptr, &delta);
     CHECK(sum_of(outs) == reward, "exact sum");
-    CHECK(to(outs, cr1.id) == 0 && to(outs, cr2.id) == 0, "no slot left: the dust keeps its E_b as a balance");
+    CHECK(to(outs, cr1.id) == 0 && to(outs, cr2.id) == 0, "no slot left: the dust gets no output");
     const std::uint64_t pa = to(outs, a.id), pb = to(outs, b.id);
-    CHECK(pa - a.eb + pb - b.eb == crumbs, "the payees >= c carry the dust's cash as an advance (%llu)", (unsigned long long)crumbs);
-    CHECK(pa <= 2 * a.eb && pb <= 2 * b.eb, "an advance is at most the payee's own E_b");
+    CHECK(pa - a.eb + pb - b.eb == crumbs, "the paid payees receive the dust's cash (%llu)", (unsigned long long)crumbs);
     const long double ra = static_cast<long double>(pa - a.eb) / crumbs;
-    CHECK(ra > 361.0L / 600.0L - 1e-6L && ra < 361.0L / 600.0L + 1e-6L, "the advance is pro rata to E_b");
+    CHECK(ra > 361.0L / 600.0L - 1e-6L && ra < 361.0L / 600.0L + 1e-6L, "pro rata to E_b");
+    long long dsum = 0; for (const auto& [k, d] : delta) dsum += d;
+    CHECK(dsum == 0, "the credit delta sums to zero: a redistribution, the block still credits its whole reward");
+    CHECK(delta[a.id] == static_cast<long long>(pa - a.eb) && delta[b.id] == static_cast<long long>(pb - b.eb),
+          "the paid payees are CREDITED what they got over E_b: no advance, nothing to repay");
+    CHECK(delta[cr1.id] == -static_cast<long long>(cr1.eb) && delta[cr2.id] == -static_cast<long long>(cr2.eb),
+          "the waiting dust is not credited the cash that went to others this block");
+    // book it: credit = E_b + delta, payout = the outputs; no balance goes negative
+    Amounts credit{{a.id, (long long)a.eb}, {b.id, (long long)b.eb}, {cr1.id, (long long)cr1.eb}, {cr2.id, (long long)cr2.eb}};
+    for (const auto& [k, d] : delta) { credit[k] += d; if (credit[k] == 0) credit.erase(k); }
+    Amounts payout{{a.id, (long long)pa}, {b.id, (long long)pb}};
+    st::OwedLedger L(7);
+    L.on_block_found("b", credit, payout); L.on_block_finalized("b", 1);
+    CHECK(L.effective_owed(a.id) == 0 && L.effective_owed(b.id) == 0 && L.effective_owed(cr1.id) == 0 && L.effective_owed(cr2.id) == 0,
+          "ledger after FINALIZE: every balance is 0 (no debt, no advance)");
 }
 
 // ---------------------------------------------------------------------------
@@ -179,16 +193,17 @@ void f3_slots() {
         CHECK(to(outs, a.id) + to(outs, b.id) + 1 == reward, "the two largest carry the whole block but the marker");
         CHECK(sum_of(outs) == reward, "exact sum");
     }
-    {   // a pool just started: the credited work is a fraction of the reward
+    {   // credited work below the reward (nobody waits): nothing is moved
         const std::uint64_t c = x6::spend_floor(kTail);
         const P only = payee(24, 2 * c), dust = payee(25, c / 2);
         auto in = fee_on_inputs(kTail, true);
         arm(in, {only, dust});
-        const auto outs = x6::allocate_exact_sum(in);
+        Amounts delta;
+        const auto outs = x6::allocate_exact_sum(in, nullptr, &delta);
         const ::v37::bytes32 D = fee::donation_identity(kNet);
-        CHECK(to(outs, dust.id) == dust.eb, "the dust miner is paid exactly (bootstrap: room for everyone)");
-        CHECK(to(outs, only.id) == 2 * only.eb, "the advance cap: E_b + at most E_b (got %llu)", (unsigned long long)to(outs, only.id));
-        CHECK(to(outs, D) == kTail - 2 * only.eb - dust.eb, "the cash beyond the cap goes to the donation output (disclosed)");
+        CHECK(to(outs, dust.id) == dust.eb && to(outs, only.id) == only.eb, "both are paid exactly their E_b");
+        CHECK(delta.empty(), "nobody waits, so nothing is redistributed");
+        CHECK(to(outs, D) == kTail - only.eb - dust.eb, "uncredited cash stays in the residual (the donation output)");
         CHECK(sum_of(outs) == kTail, "exact sum");
     }
 }

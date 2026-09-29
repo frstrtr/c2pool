@@ -137,6 +137,9 @@ struct Result {
     // The canonical coinbase's payout per identity (sink / folded donation
     // coverage excluded, like CoinbaseBooking::payout), for the alarm line.
     std::map<::v37::bytes32, long long> expected_payout;
+    // SPEND-COST FLOOR (canonical only): the redistribution the booking applies
+    // to the block's E_b before its pay-now net booking (x6::allocate_exact_sum).
+    std::map<::v37::bytes32, long long> credit_delta;
     bool canonical() const { return verdict == Verdict::Canonical; }
 };
 
@@ -275,7 +278,7 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
             res.verdict = Verdict::Canonical;
             res.cap = c;
             res.why.clear();
-            for (const auto& o : x6::allocate_exact_sum(in))
+            for (const auto& o : x6::allocate_exact_sum(in, nullptr, &res.credit_delta))
                 if (!(o.identity == lane.residual_sink_identity)) res.expected_payout[o.identity] += static_cast<long long>(o.amount);
             return res;
         }

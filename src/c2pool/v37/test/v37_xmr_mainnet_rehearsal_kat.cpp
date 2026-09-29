@@ -270,6 +270,10 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
         r.payout = bk.payout;                                           // DEBITED, credit DROPPED
     } else if (res.verdict == rc::Verdict::Canonical) {
         r.credit = fold(bk.total, W.view_at(h));
+        for (const auto& [k, d] : res.credit_delta) {   // SPEND-COST FLOOR: the redistribution
+            r.credit[k] += d;
+            if (r.credit[k] == 0) r.credit.erase(k);
+        }
         r.payout = bk.payout;
         const auto nb = pn::net_booking(bk.paynow_base, bk.total, r.credit, r.payout, bk.sink_total,
                                         fee::donation_identity(kNet), static_cast<long long>(fee::kDonationDustPico),
@@ -508,6 +512,9 @@ void m7_spend_floor() {
         else big_bal += bal;
     }
     CHECK(exact, "every key: E_b credited - paid on chain == its ledger balance (nothing lost, nothing invented)");
+    bool none_negative = true;
+    for (const auto& [k, eb] : r.eb_gross) { (void)eb; if (eo(r, k) < 0) none_negative = false; }
+    CHECK(none_negative, "no balance is negative: nobody is ever paid ahead of its work (no advance)");
     CHECK(bounded, "while the seeded float is repaid, a tiny miner is paid the same fraction of its E_b as everyone "
                    "(its balance stays under half of what it earned)");
     CHECK(tiny_paid > 0, "tiny miners are paid: %lld piconero reached them through the owed pass", tiny_paid);

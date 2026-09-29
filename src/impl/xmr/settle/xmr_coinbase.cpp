@@ -175,6 +175,40 @@ std::uint64_t spend_floor(std::uint64_t total) {
 // ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err) {
+    return allocate_exact_sum(in, err, nullptr);
+}
+
+namespace {
+// `amount` over `w` pro rata, uncapped, exact-sum: floor shares, then the
+// leftover one piconero each by largest remainder (ties: entry order).
+std::vector<std::uint64_t> prorata(std::uint64_t amount, const std::vector<std::uint64_t>& w) {
+    std::vector<std::uint64_t> out(w.size(), 0);
+    unsigned __int128 sum = 0;
+    for (const std::uint64_t x : w) sum += x;
+    if (amount == 0 || sum == 0) return out;
+    std::vector<unsigned __int128> rem(w.size(), 0);
+    std::uint64_t given = 0;
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        const unsigned __int128 num = static_cast<unsigned __int128>(amount) * w[i];
+        out[i] = static_cast<std::uint64_t>(num / sum);
+        rem[i] = num % sum;
+        given += out[i];
+    }
+    std::uint64_t left = amount - given;
+    std::vector<std::size_t> order(w.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return rem[x] > rem[y]; });
+    for (std::size_t j = 0; j < order.size() && left > 0; ++j) {
+        if (rem[order[j]] == 0) break;
+        ++out[order[j]]; --left;
+    }
+    return out;
+}
+}  // namespace
+
+std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildError* err,
+                                               std::map<::v37::bytes32, long long>* credit_delta) {
+    if (credit_delta) credit_delta->clear();
     auto fail = [&](BuildError e) -> std::vector<CoinbaseOutput> {
         if (err) *err = e;
         return {};
@@ -320,18 +354,30 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                     sum = s2;
                 }
                 // Each admitted payee gets its E_b (pro rata when the pool is short).
-                // The cash of the payees not admitted is ADVANCED to the admitted
-                // payees >= c, pro rata, at most their own E_b; the rest stays in the
-                // residual.
+                // REDISTRIBUTION, never an advance: when the pool has cash left over
+                // (it came from the payees without a slot), that cash, up to what
+                // those payees were credited, goes to the admitted payees pro rata,
+                // and the same amount comes off the waiting payees' credit, pro rata
+                // to their E_b. Cash beyond that stays in the residual.
                 alloc = paynow_split(pool, take);
                 std::uint64_t given = 0;
                 for (const std::uint64_t a : alloc) given += a;
-                if (pool > given) {
-                    std::vector<std::uint64_t> adv_w(ents.size(), 0);
-                    for (std::size_t i = 0; i < ents.size(); ++i)
-                        if (take[i] >= floor_c && take[i] > 0) adv_w[i] = take[i];
-                    const std::vector<std::uint64_t> adv = paynow_split(pool - given, adv_w);
-                    for (std::size_t i = 0; i < ents.size(); ++i) alloc[i] += adv[i];
+                std::vector<std::uint64_t> wait(ents.size(), 0);
+                unsigned __int128 wait_sum = 0;
+                for (std::size_t i = 0; i < ents.size(); ++i)
+                    if (take[i] == 0 && ents[i].eb > 0) { wait[i] = ents[i].eb; wait_sum += ents[i].eb; }
+                const unsigned __int128 spare = static_cast<unsigned __int128>(pool) - given;
+                const std::uint64_t moved = static_cast<std::uint64_t>(spare < wait_sum ? spare : wait_sum);
+                if (moved > 0) {
+                    const std::vector<std::uint64_t> plus = prorata(moved, take);
+                    const std::vector<std::uint64_t> minus = paynow_split(moved, wait);   // <= each E_b
+                    for (std::size_t i = 0; i < ents.size(); ++i) {
+                        alloc[i] += plus[i];
+                        if (credit_delta) {
+                            const long long d = static_cast<long long>(plus[i]) - static_cast<long long>(minus[i]);
+                            if (d != 0) (*credit_delta)[ents[i].identity] += d;
+                        }
+                    }
                 }
             } else {
                 alloc = paynow_split(pool, eb);
