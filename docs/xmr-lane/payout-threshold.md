@@ -96,6 +96,24 @@ This changes the W4 ledger (`first_eligible` is inside `owed_digest`), so it
 is a per-ledger switch that only the XMR lane turns on. Family A lanes stay
 byte-identical.
 
+## 6a. Rotation on a partial owed payment
+
+Ruling 2026-09-29 (external review 04 and audit O-1). A key the owed pass
+pays **only in part** goes to the back of the queue: its `first_eligible`
+becomes the height of that block. A key paid in full leaves the queue as
+today, and re-enters at the back when a new unpaid remainder appears.
+
+* No constant: no per-payee cap and no `C_share`. At most one key is paid in
+  part per block (the walk stops when the budget runs out), so the queue
+  turns over by construction.
+* A working miner is unaffected for its current work: pay-now pays each
+  block's E_b to the current miners pro rata, outside the queue. Only what
+  pay-now did not cover joins the key's balance and waits in the queue.
+* It closes O-1: without it, a key credited every block never reaches 0 and
+  keeps its old place for ever.
+* Like §6 it changes `first_eligible`, which is in `owed_digest`: the same
+  XMR-only ledger switch, shipped in the same consensus change.
+
 ## 7. Carried forward
 
 * **#1871 pay-now FILL** stays as the last-resort guard for a block whose
@@ -111,7 +129,8 @@ byte-identical.
    recompute; KATs and a rehearsal scenario with more payees than free outputs.
 2. The lottery (systematic sampling on `prev_id`); a KAT that checks
    expectation over many blocks and exact sums per block.
-3. Seniority from the threshold (XMR-only ledger switch). **Ships in the same
+3. Seniority from the threshold and rotation on a partial payment (§6a),
+   one XMR-only ledger switch. **Ships in the same
    consensus change as step 1**: a threshold without it is a sub-floor carry,
    which reopens external review 02 (parked keys season their age). Today the
    XMR floor is 0 and pinned on mainnet, so 02 is closed until then.
