@@ -2130,6 +2130,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     // already paid each payee out of THIS block's E_b. A pure function of the on-chain
     // bytes (V37N base, outputs) and the fold at the on-chain cut: every node nets the
     // same amounts. A coinbase that under-pays its own commitment is REFUSED.
+    // SPEND-COST FLOOR: the recompute's redistribution for a canonical block, by
+    // bid (x6::allocate_exact_sum credit_delta), applied to its E_b right before
+    // the pay-now net booking below.
+    std::map<std::string, Amounts> canon_credit_delta;
     std::uint64_t paynow_booked = 0, paynow_refused = 0;
     std::uint64_t ecut_booked = 0, ecut_refused = 0;   // EMPTY-CUT FINDER
     unsigned long long paynow_netted_total = 0;
@@ -2138,6 +2142,16 @@ static int run_live(const XmrNodeConfig& cfg) {
         namespace fee = ::c2pool::v37n::xmr::fee;
         const bool fee_on = fee::fee_model_on(cfg.lane_params);
         const ::v37::bytes32 sink_id = fee_on ? fee::donation_identity(donation_net_of(cfg.network)) : cba_scfg->residual_sink_identity;
+        // SPEND-COST FLOOR: the redistribution the recompute found in this canonical
+        // block (payees without a slot -> admitted payees), on the E_b first.
+        if (auto cd = canon_credit_delta.find(bid); cd != canon_credit_delta.end()) {
+            for (const auto& [k, d] : cd->second) {
+                auto it = credit.find(k);
+                const long long v = (it == credit.end() ? 0 : it->second) + d;
+                if (v == 0) { if (it != credit.end()) credit.erase(it); } else credit[k] = v;
+            }
+            canon_credit_delta.erase(cd);
+        }
         // EMPTY-CUT FINDER (operator ruling 09-26): a block committing a finder
         // (V37F) credits it the pool when the fold at its cut is EMPTY; the same
         // net booking below then requires the coinbase to pay it and nets it.
@@ -2494,7 +2508,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         ci.has_view = settle::assert_ratified_geometry(*view, /*strict=*/true);
         if (ci.has_view) ci.payees = settle::project(*view);
         res = rc::verify_lane_coinbase(blob, bk, L, cba_fx->pay_of_booked(), li, ci);
-        if (res.verdict == rc::Verdict::Canonical) { ++canon_ok; return 1; }
+        if (res.verdict == rc::Verdict::Canonical) {
+            if (res.credit_delta.empty()) canon_credit_delta.erase(bid);
+            else canon_credit_delta[bid] = res.credit_delta;   // applied by paynow_net before the net booking
+            ++canon_ok;
+            return 1;
+        }
         if (res.verdict == rc::Verdict::Undecidable) { ++canon_undecided; why = "cut-pending: " + res.why; return -1; }
         ++canon_mismatch;
         long long sum = 0;

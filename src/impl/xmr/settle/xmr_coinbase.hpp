@@ -73,6 +73,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -238,11 +239,10 @@ struct CoinbaseInputs {
     // pays, in the output cap's free slots, the payees with E_b >= c (largest
     // first, each keeping a pro-rata share >= c), then the dust (E_b < c, largest
     // first) while the smallest admitted payee >= c keeps a share >= c. Every
-    // admitted payee gets the same fraction of its E_b. The cash of the
-    // payees not admitted is advanced pro rata to the admitted payees >= c, at
-    // most their own E_b each; the rest stays in the residual. Those not admitted
-    // keep their E_b as a balance. Pay-now never fails the build for want of a
-    // slot.
+    // admitted payee gets the same fraction of its E_b. The cash of the payees
+    // not admitted is REDISTRIBUTED pro rata to the admitted payees and taken
+    // off the credit of those it came from (allocate_exact_sum's credit_delta):
+    // never an advance. Pay-now never fails the build for want of a slot.
     bool           spend_floor = false;
 
     // --- tx_extra ---
@@ -354,6 +354,15 @@ struct ReceivedCoinbase {
 // ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err = nullptr);
+
+// SPEND-COST FLOOR: the same allocation, plus the per-identity CREDIT DELTA the
+// block's booking applies to its E_b (payout-threshold.md §3): the cash of the
+// payees without a slot is REDISTRIBUTED to the admitted payees (+) and taken
+// off the credit of the payees it came from (-). Σ delta == 0. Empty when the
+// floor is off or everyone fits. Never an advance: no payee is paid more than
+// it is credited.
+std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildError* err,
+                                               std::map<::v37::bytes32, long long>* credit_delta);
 
 // S1: true iff the last fixed output IS the residual sink -- it pays
 // `residual_sink` (ScriptRef equality) under `residual_sink_identity` -- i.e.
