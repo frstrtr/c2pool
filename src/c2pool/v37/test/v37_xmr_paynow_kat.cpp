@@ -496,6 +496,63 @@ void suite_base() {
     CHECK(false, "net-at-FOUND pay-now booking (xmr_paynow.hpp) is absent");
 }
 #endif
+#if PAYNOW_FIX
+// ---------------------------------------------------------------------------
+// P7 -- SALTED TIE-BREAK in the XMR settlement source (#1867). Three owed keys
+// armed at the same bin: unsalted they come out identity ASC; with
+// kfair_salted_ties the order is sha256d("V37T" || prev_id || key) ASC, the
+// same for two builds, and every output still pays its full owed.
+void suite_salted() {
+    std::printf("== P7. salted tie-break (XMR source) ==\n");
+    std::vector<Payee> ps;
+    for (int i = 0; i < 6; ++i) { auto r = ref_of(static_cast<std::uint8_t>(31 + i)); ps.push_back({r, id_of(r), 1}); }
+    st::OwedLedger L(7);
+    Amounts credit; for (const auto& p : ps) credit[p.id] = 1000000;
+    L.on_block_found("seed", credit, {});
+    L.on_block_finalized("seed", 5);
+    std::map<::v37::bytes32, ::v37::ScriptRef> refs;
+    for (const auto& p : ps) refs[p.id] = p.ref;
+    refs[fee::donation_identity(kNet)] = fee::donation_ref(kNet);
+    o2::PayOfFn pay_of = [refs](const ::v37::bytes32& k) {
+        auto it = refs.find(k); if (it != refs.end()) return it->second;
+        ::v37::ScriptRef r; r.kind = ::v37::ScriptKind::RAW; return r; };
+    o2::XmrCoinbaseContext ctx;
+    ctx.monero_major_version = 16; ctx.height = 1234; ctx.base_reward = kReward; ctx.fees = 0; ctx.chain_id = 7;
+    for (std::size_t i = 0; i < 32; ++i) ctx.prev_id.data()[i] = static_cast<unsigned char>(0xA0 + i);
+    ctx.lane_commitment = L.owed_digest();
+    ctx.residual_sink = fee::donation_ref(kNet); ctx.residual_sink_identity = fee::donation_identity(kNet);
+    ctx.fixed = {fee::donation_marker(kNet)}; ctx.h_min = 0; ctx.output_cap = 64;
+    auto owed_order = [&](const o2::XmrCoinbaseContext& c) {
+        std::string why;
+        auto src = o2::XmrOwedSettlementSource::build(L, pay_of, c, kReward, &why);
+        std::vector<::v37::bytes32> v;
+        bool full = src != nullptr && src->shape_matches_at(kReward);
+        if (src)
+            for (const auto& o : src->outputs_at(kReward))
+                if (o.role == x6::CoinbaseOutput::Role::Owed) { v.push_back(o.identity); if (o.amount != 1000000) full = false; }
+        return std::make_pair(v, full);
+    };
+    auto sorted_ids = ps; std::sort(sorted_ids.begin(), sorted_ids.end(), [](const Payee& a, const Payee& b) { return a.id < b.id; });
+    std::vector<::v37::bytes32> id_asc; for (const auto& p : sorted_ids) id_asc.push_back(p.id);
+    std::vector<std::pair<::v37::bytes32, ::v37::bytes32>> hs;
+    for (const auto& p : ps) {
+        std::vector<std::uint8_t> b = {'V', '3', '7', 'T'};
+        b.insert(b.end(), ctx.prev_id.data(), ctx.prev_id.data() + 32);
+        b.insert(b.end(), p.id.begin(), p.id.end());
+        hs.emplace_back(::v37::sha256d(b), p.id);
+    }
+    std::sort(hs.begin(), hs.end());
+    std::vector<::v37::bytes32> salted_want; for (const auto& h : hs) salted_want.push_back(h.second);
+
+    const auto plain = owed_order(ctx);
+    CHECK(plain.second && plain.first == id_asc, "unsalted: 6 equal-age keys identity ASC, full amounts, shape ok");
+    o2::XmrCoinbaseContext cs = ctx; cs.kfair_salted_ties = true;
+    const auto salt1 = owed_order(cs), salt2 = owed_order(cs);
+    CHECK(salt1.second && salt1.first == salted_want, "salted: order == sha256d(V37T||prev_id||key) ASC, full amounts, shape ok");
+    CHECK(salt1.first == salt2.first, "salted: two builds on the same parent agree");
+    CHECK(salt1.first != id_asc, "salted: differs from identity ASC for this parent");
+}
+#endif
 
 }  // namespace
 
@@ -507,6 +564,7 @@ int main() {
     suite_booking();
     suite_source();
     suite_assembled();
+    suite_salted();
 #else
     suite_base();
 #endif

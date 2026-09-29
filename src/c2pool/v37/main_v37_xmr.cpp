@@ -2450,6 +2450,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         li.fixed = cba_scfg->fixed;
         li.pool_tag = cba_scfg->pool_tag;
         li.kfair = cba_scfg->kfair;
+        li.kfair_salted_ties = cba_scfg->kfair_salted_ties;
         rc::CutInputs ci;
         auto view = view_at_cut(bk.credit_cut, why, relay_hint(bid));   // the view fold_at_cut just folded
         if (!view) {
@@ -3262,6 +3263,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
         // and only blocks carrying it are booked as lane blocks here.
         scfg.pool_tag = pool_tag_of(cfg);
+        scfg.kfair_salted_ties = true;   // #1867: equal-age cohorts ordered by a hash of the parent id
         std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
                     hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
                     hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);

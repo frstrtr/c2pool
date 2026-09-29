@@ -184,6 +184,11 @@ struct XmrCoinbaseContext {
     std::uint8_t          monero_major_version = 16;
     std::uint64_t         height = 0;                 // block height; unlock = height + 60
     ::xmr::coin::Hash256  prev_id{};                  // parent block id (bin origin)
+    // SALTED TIE-BREAK (#1867): order equal-age K_fair cohorts by
+    // sha256d("V37T" || prev_id || key) instead of the raw identity. Builder
+    // policy (receivers book the on-chain coinbase), so off by default only to
+    // keep existing fixtures byte-identical; the daemon turns it on.
+    bool                  kfair_salted_ties = false;
     std::uint64_t         base_reward = 0;            // get_base_reward(already_generated_coins)
     std::uint64_t         fees = 0;                   // Σ selected tx fees (informational split)
 
@@ -340,8 +345,15 @@ public:
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
                                                   : std::numeric_limits<std::uint64_t>::max();
             };
-            OwedLedger::Proposal prop = ledger.propose_coinbase(owed_budget_w4, cap_owed,
-                                                                payable_ref, h_min_of);
+            OwedLedger::Proposal prop;
+            if (ctx.kfair_salted_ties) {
+                ::v37::bytes32 salt{};
+                std::memcpy(salt.data(), ctx.prev_id.data(), salt.size());
+                prop = ledger.propose_coinbase_salted(owed_budget_w4, cap_owed, salt,
+                                                      payable_ref, h_min_of);
+            } else {
+                prop = ledger.propose_coinbase(owed_budget_w4, cap_owed, payable_ref, h_min_of);
+            }
             in.owed.reserve(prop.outs.size());
             for (std::size_t i = 0; i < prop.outs.size(); ++i) {
                 x6::OwedEntry e;

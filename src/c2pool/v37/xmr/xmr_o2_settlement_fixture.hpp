@@ -175,6 +175,10 @@ struct XmrSettlementConfig {
     // node's own payee). Unset => an empty cut keeps master's residual shape.
     std::optional<::v37::ScriptRef> ecut_finder;
 
+    // SALTED TIE-BREAK (#1867): order equal-age K_fair cohorts by a hash of
+    // the parent block id instead of the raw identity (builder policy).
+    bool kfair_salted_ties = false;
+
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
     std::optional<::v37::bytes32> pool_tag;
@@ -325,6 +329,7 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.fixed                  = cfg.fixed;
     ctx.h_min                  = cfg.h_min;
     ctx.output_cap             = cfg.resolved_output_cap();
+    ctx.kfair_salted_ties      = cfg.kfair_salted_ties;
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
