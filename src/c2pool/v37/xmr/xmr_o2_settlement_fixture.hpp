@@ -339,8 +339,25 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
-    if (ctx.has_credit_cut && cfg.paynow_source)   // SAME-BLOCK PAY-NOW: E_b weights at that cut
+    if (ledger.rules().anchor_cut) {
+        // ANCHOR (ruling A 2026-09-29): pay-now pays the payees of the view at the
+        // ledger's anchor (the cut of the latest lane block finalized into it);
+        // no anchor yet = nobody (the empty-cut finder rule). The view must be
+        // readable, or the template is not built: a coinbase without its pay-now
+        // would not be the canonical one every node rebuilds.
+        if (ctx.has_credit_cut) {
+            if (const auto a = ledger.anchor_cut()) {
+                if (!cfg.paynow_source || !cfg.paynow_source(a->next_pos, a->spine, ctx.paynow_payees))
+                    return no("anchor-pending: the view at the ledger's anchor cut P=" + std::to_string(a->next_pos) +
+                              " is not readable here yet (the template waits for it)");
+            } else {
+                ctx.paynow_payees.clear();
+            }
+            ctx.has_paynow = true;
+        }
+    } else if (ctx.has_credit_cut && cfg.paynow_source) {   // SAME-BLOCK PAY-NOW: E_b weights at that cut
         ctx.has_paynow = cfg.paynow_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest, ctx.paynow_payees);
+    }
     if (ctx.has_paynow && ctx.paynow_payees.empty()) ctx.ecut_finder = cfg.ecut_finder;   // EMPTY-CUT FINDER
     if (why) why->clear();
     return ctx;
@@ -440,6 +457,7 @@ public:
         return fresh;
     }
     std::size_t booked_refs() const { return m_booked.size(); }
+    std::map<::v37::bytes32, ::v37::ScriptRef> booked_map() const { return m_booked; }   // a snapshot (share verdicts)
     std::vector<::v37::bytes32> booked_keys() const {
         std::vector<::v37::bytes32> v;
         for (const auto& [k, r] : m_booked) { (void)r; v.push_back(k); }

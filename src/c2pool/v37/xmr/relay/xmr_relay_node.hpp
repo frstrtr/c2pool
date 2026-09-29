@@ -413,6 +413,8 @@ struct RelayStats {
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
+    // SHARE-LEVEL CANONICAL COINBASE: receipts refused / parked / undecided at the verdict
+    std::atomic<u64> share_refused{0}, share_parked{0}, share_undecided_dropped{0}, share_undecided_trusted{0};
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
     // ★ RAIN-BACKFILL (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
@@ -1225,6 +1227,20 @@ public:
     std::size_t verify_parked_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_parked.size(); }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
     std::string last_unresolved() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_unresolved; }
+    std::string last_share_refused() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_share_refused; }
+
+    // SHARE-LEVEL CANONICAL COINBASE (P2Pool's share rule): a receipt earns lane
+    // credit only if its coinbase is the canonical lane coinbase
+    // (xmr_coinbase_recompute.hpp verify_share_coinbase). The daemon decides from
+    // finalized state (the ledger + the view at its anchor, keyed by the ledger
+    // state the receipt's 0x03 root commits). Called on a verify worker thread,
+    // after the structural check, before RandomX: 1 canonical, -1 not canonical
+    // (refused + strike), 0 not decidable here yet (parked like an unresolved
+    // context; past the patience an unsolicited receipt is dropped, a solicited
+    // one -- a repair of a winner's lane, Ruling A -- is admitted). Unset: no
+    // check (test rigs). Set before start().
+    using VerdictFn = std::function<int(const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 coinbase_height, std::string& why)>;
+    void set_share_verdict(VerdictFn f) { m_verdict = std::move(f); }
 
     // Test hook: disconnect one peer (the KAT's "B drops off the network").
     void drop_peer(PeerId p) { m_net.disconnect(p); }
@@ -2188,6 +2204,28 @@ private:
             m_st.structural++; forget_inflight(it.id);
             strike(it.from, std::string("structural ") + to_string(cr.stage) + ": " + cr.why);
             return;
+        }
+        // SHARE-LEVEL CANONICAL COINBASE: before RandomX (cheap, and a refused
+        // receipt never costs a hash). The coinbase height is the bin's + 1.
+        if (m_verdict) {
+            std::string vw;
+            const int v = m_verdict(it.r, pb, ctx->height + 1, vw);
+            if (v < 0) {
+                m_st.share_refused++; forget_inflight(it.id);
+                { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
+                strike(it.from, "share coinbase not canonical: " + vw);
+                return;
+            }
+            if (v == 0) {
+                const u32 patience = it.solicited ? m_o.solicited_unresolved_patience_ms : m_o.unresolved_patience_ms;
+                if (now - it.enq < std::chrono::milliseconds(patience)) {
+                    m_st.share_parked++;
+                    park(std::move(it), std::chrono::milliseconds(1000));
+                    return;
+                }
+                if (!it.solicited) { m_st.share_undecided_dropped++; forget_inflight(it.id); return; }
+                m_st.share_undecided_trusted++;   // a repair answer: the winner's lane holds it (Ruling A)
+            }
         }
         // RandomX token
         const auto p32 = static_cast<::c2pool::xmr::u32>(it.from);
@@ -3338,6 +3376,7 @@ private:
     RelayOptions m_o;
     ChainView&   m_chain;
     RxFn         m_rx;
+    VerdictFn    m_verdict;   // SHARE-LEVEL CANONICAL COINBASE
     LaneTipFn    m_tip;
     LogFn        m_log;
     u64          m_nonce = 0;
@@ -3364,6 +3403,7 @@ private:
     Clock::time_point m_solicited_at = Clock::now();
     std::string m_last_reject;
     std::string m_last_unresolved;
+    std::string m_last_share_refused;
 
     mutable std::mutex m_cmtx;         // receipt-context wants + serve requests
     std::map<bytes32, CtxWant> m_ctx_want;

@@ -134,6 +134,7 @@ std::uint64_t g_cap_at = 0; std::uint32_t g_cap = 0;
 bool g_no_seeds = false;   // M7b: a fresh pool, no seeded owed balances
 std::uint64_t g_reorg_at = 0;
 std::uint64_t g_decay_h = 0, g_decay_hl = 0;   // M10: dust decay horizon / half-life (bins); 0 = the lane's
+bool g_anchor = false;                          // M11: the ANCHOR rule (pay-now / E_b at the ledger's anchor)
 std::uint64_t g_leave_at = 0;                   // M10: tiny miners with an even index stop mining after this height   // M9: a lane block at this height is booked by nodes 0 and 1, then reorged out   // M8: the block at g_cap_at is built with this output cap
 
 struct LaneWorld {
@@ -169,6 +170,16 @@ struct LaneWorld {
 };
 ::v37::bytes32 the_tag() { ::v37::bytes32 t{}; t[0] = 0xC2; t[31] = 0x37; return t; }
 
+// The payees pay-now pays at height h on ledger L: the block's own cut, or,
+// under the ANCHOR rule, the view at L's anchor (the cut of the latest lane
+// block finalized into L; none = nobody).
+std::vector<st::WeightedPayee> paynow_view(const LaneWorld& W, const st::OwedLedger& L, std::uint64_t h) {
+    if (!g_anchor) return W.view_at(h);
+    const auto a = L.anchor_cut();
+    if (!a) return {};
+    return W.view_at((a->next_pos - 100) / 10);   // cut_at(h).next_pos == 100 + 10 h
+}
+
 // E_b at the cut: fold_eb's exact split (settle::split_reward), key-aggregated.
 Amounts fold(std::uint64_t reward, const std::vector<st::WeightedPayee>& wp) {
     const auto a = st::split_reward(reward, wp);
@@ -199,7 +210,7 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     ctx.spend_floor = g_spend_floor;
     ctx.has_credit_cut = true; ctx.credit_cut = W.cut_at(h);
     ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
-    ctx.has_paynow = true; ctx.paynow_payees = W.view_at(h);
+    ctx.has_paynow = true; ctx.paynow_payees = paynow_view(W, L, h);
     std::string why;
     auto src = o2::XmrOwedSettlementSource::build(L, owed_pay_of, ctx, subsidy + fees, &why);
     if (!src) { out.why = "source: " + why; return out; }
@@ -253,7 +264,8 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     // BOOKING MAP (main_v37_xmr.cpp decode_blob): outputs map only through the
     // booked refs and the refs of the block's own cut, never n.local.
     std::map<::v37::bytes32, ::v37::ScriptRef> resolve = n.booked;
-    for (const auto& w : W.view_at(h)) resolve[w.key] = w.pay;          // REJOIN-PAYEE: the block's own cut
+    const auto pv = paynow_view(W, n.L, h);                              // ANCHOR: the payees pay-now paid
+    for (const auto& w : pv) resolve[w.key] = w.pay;                     // REJOIN-PAYEE: the block's credit cut
     std::vector<::v37::bytes32> keys;
     for (const auto& [k, v] : resolve) { (void)v; keys.push_back(k); }
     const ::v37::bytes32 tag = the_tag();
@@ -266,14 +278,14 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     li.fixed = {fee::donation_marker(kNet)}; li.pool_tag = the_tag();
     li.kfair_salted_ties = true;
     li.spend_floor = g_spend_floor;
-    rc::CutInputs ci; ci.has_view = true; ci.payees = W.view_at(h);
+    rc::CutInputs ci; ci.has_view = true; ci.payees = pv;
     const auto res = rc::verify_lane_coinbase(b.blob, bk, n.L, pay_of_map(n.booked), li, ci);
     r.v = res.verdict; r.why = res.why;
     n.history.push_back(n.L);
     if (res.verdict == rc::Verdict::Mismatch) {
         r.payout = bk.payout;                                           // DEBITED, credit DROPPED
     } else if (res.verdict == rc::Verdict::Canonical) {
-        r.credit = fold(bk.total, W.view_at(h));
+        r.credit = fold(bk.total, pv);
         for (const auto& [k, d] : res.credit_delta) {   // SPEND-COST FLOOR: the redistribution
             r.credit[k] += d;
             if (r.credit[k] == 0) r.credit.erase(k);
@@ -286,9 +298,11 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     } else {
         return r;
     }
-    n.L.on_block_found(bid, r.credit, r.payout);
+    std::optional<st::AnchorCut> cut;   // ANCHOR: a canonical block's own cut is the next anchor
+    if (g_anchor && res.verdict == rc::Verdict::Canonical) { cut = st::AnchorCut{}; cut->next_pos = W.cut_at(h).next_pos; cut->spine = W.cut_at(h).spine_digest; }
+    n.L.on_block_found(bid, r.credit, r.payout, cut);
     n.note();
-    for (const auto& w : W.view_at(h)) n.booked[w.key] = w.pay;         // BOOKED refs, after success
+    for (const auto& w : pv) n.booked[w.key] = w.pay;                   // BOOKED refs, after success
     for (const auto& [k, v] : bk.payout) { (void)v; if (resolve.count(k)) n.booked[k] = resolve.at(k); }
     return r;
 }
@@ -321,6 +335,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
         const ::v37::LaneParams lp{};
         rules.decay_horizon = g_decay_h ? g_decay_h : lp.window;          // as the daemon sets them
         rules.decay_half_life = g_decay_hl ? g_decay_hl : lp.half_life;
+        rules.anchor_cut = g_anchor;
         for (auto& n : run.nodes) n.L = st::OwedLedger(kChain, rules);
     }
     for (auto& n : run.nodes) {
@@ -402,7 +417,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
                 const auto bk = auth::decode_lane_coinbase_fee(b.blob, kChain, cands, keys, pay_of_map(W.universe), kNet, &tag);
                 for (const auto& [k, v] : bk.payout) run.paid[k] += v;
                 if (!run.mismatch_at.count(h))
-                    for (const auto& [k, v] : fold(bk.total, W.view_at(h))) run.eb_gross[k] += v;
+                    for (const auto& [k, v] : fold(bk.total, paynow_view(W, run.nodes[0].history.back(), h))) run.eb_gross[k] += v;
                 std::uint64_t don = 0;
                 for (std::size_t o = 0; o < bk.out_identity.size(); ++o) if (bk.out_identity[o] == fee::donation_identity(kNet)) don += bk.out_amount[o];
                 run.donation_paid += static_cast<long long>(don);
@@ -620,6 +635,48 @@ void m10_decay() {
     CHECK(stay_n == 20 && stay_exact, "the 20 tiny miners who keep mining lose nothing to decay: credited - paid == balance, exactly");
 }
 
+void m11_anchor() {
+    std::printf("== M11. the ANCHOR rule: pay-now and E_b at the ledger's anchor (ruling A) ==\n");
+    g_spend_floor = true; g_anchor = true;
+    LaneWorld W;
+    const std::uint64_t H = 30;
+    Run r = simulate(W, H);
+    g_anchor = false; g_spend_floor = false;
+    CHECK(r.blocks == H && r.canonical == H && r.verdict_splits == 0 && r.split_heights == 0,
+          "every lane block canonical on every node, one verdict, one owed_digest at every height (canonical=%zu)", r.canonical);
+    const auto a = r.nodes[0].L.anchor_cut();
+    CHECK(a && a->next_pos == W.cut_at(H).next_pos && a->spine == W.cut_at(H).spine_digest,
+          "the anchor walked to the cut of the last finalized lane block (h=%llu, P=%llu)", (unsigned long long)H,
+          a ? (unsigned long long)a->next_pos : 0ull);
+    bool same_anchor = true;
+    for (const auto& n : r.nodes) if (!(n.L.anchor_cut() == a)) same_anchor = false;
+    CHECK(same_anchor, "every node holds the same anchor (it is in owed_digest)");
+    bool never_negative = true;
+    for (const auto& [k, v] : W.universe) { (void)v; if (eo(r, k) < 0) never_negative = false; }
+    CHECK(never_negative, "no balance is negative");
+    // the first blocks have no anchor: they credit nobody (a fresh pool's first blocks)
+    long long eb = 0; for (const auto& [k, c] : r.eb_gross) { (void)k; eb += c; }
+    CHECK(eb > 0, "once an anchor exists, blocks credit the miners of the window at it (E_b %lld piconero)", eb);
+
+    std::printf("== M11b. the ANCHOR rule without the floor: exact conservation per key ==\n");
+    g_anchor = true;
+    LaneWorld W2;
+    Run r2 = simulate(W2, 48);
+    g_anchor = false;
+    CHECK(r2.canonical == 48 && r2.verdict_splits == 0 && r2.split_heights == 0, "48 lane blocks canonical, one digest");
+    bool conserve = true;
+    for (std::size_t i = 0; i < W2.seeded.size(); ++i) {
+        const long long paid = r2.paid.count(W2.seeded[i].id) ? r2.paid.at(W2.seeded[i].id) : 0;
+        if (paid + eo(r2, W2.seeded[i].id) != W2.seed_amount[i]) conserve = false;
+    }
+    for (const auto& p : W2.miners) {
+        const long long e = r2.eb_gross.count(p.id) ? r2.eb_gross.at(p.id) : 0;
+        const long long paid = r2.paid.count(p.id) ? r2.paid.at(p.id) : 0;
+        if (e != paid + eo(r2, p.id)) conserve = false;
+    }
+    CHECK(conserve, "credited (E_b at each block's anchor, and the seeds) == paid on-chain + still owed, per key");
+}
+
 void m8_claimed_full() {
     std::printf("== M8. a builder claims too few output slots ==\n");
     g_spend_floor = true;
@@ -685,6 +742,7 @@ int main() {
     m7b_fresh_pool();
     m9_reorg();
     m10_decay();
+    m11_anchor();
     m8_claimed_full();
     m5_gate_and_config();
 #else

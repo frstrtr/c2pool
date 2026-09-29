@@ -98,6 +98,7 @@ public:
         r.rotate_on_payment = m_cfg.ledger_rotate_on_payment;
         r.decay_horizon = m_cfg.ledger_decay_horizon;
         r.decay_half_life = m_cfg.ledger_decay_half_life;
+        r.anchor_cut = m_cfg.ledger_anchor_cut;
         return r;
     }
 
@@ -555,7 +556,8 @@ public:
     // a coinbase — the fail-closed posture for a light/OOM build.
     bool on_network_block_won(std::uint64_t monero_height,
                               const c2pool::xmr::node::Hash& block_id,
-                              const Amounts& credit, const Amounts& payout) {
+                              const Amounts& credit, const Amounts& payout,
+                              std::optional<::c2pool::v37n::settle::AnchorCut> cut = std::nullopt) {
         if (m_cfg.network == MoneroNetwork::Mainnet && !m_cfg.i_understand_mainnet) {
             log("win: REFUSED to settle a MAINNET block without --i-understand-mainnet");
             return false;
@@ -565,6 +567,7 @@ public:
         fb.height = monero_height;
         fb.credit = credit;
         fb.payout = payout;
+        fb.cut = cut;   // ANCHOR: the block's own credit cut
         // ── ★ DROPS T3 (XMR arm) — the hook the BTC/DASH shell already has ──
         // Parity, not a second mechanism: the XMR finalize driver composes the
         // very same compose_credit_replace() the BTC-family driver does, so all

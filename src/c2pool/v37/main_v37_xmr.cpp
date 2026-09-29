@@ -99,6 +99,7 @@
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
 #include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
 #include "xmr/xmr_coinbase_recompute.hpp"    // every node recomputes the lane coinbase (rulings 2026-09-29)
+#include "xmr/relay/xmr_share_verdict.hpp"    // share-level canonical coinbase (the relay verdict)
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
 #include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
 #include "xmr/xmr_web_dashboard.hpp"        // XMR-WEB: the c2pool web dashboard (--web-port; OFF by default)
@@ -1742,8 +1743,15 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t cba_fetch_failed = 0;   // R-C rework-3 (D6): get_block transport/JSON failures -- transient, NOT refusals
     std::uint64_t cba_stale_root = 0;     // R-C rework-3 (D7): matched a historical root older than the age bound -> refused
 
+    // SHARE-LEVEL CANONICAL COINBASE: the per-ledger-state verdict inputs the
+    // relay workers read (xmr_share_verdict.hpp); share_publish is bound once
+    // the settlement ledger is.
+    using ShareStateEntry = c2pool::v37n::xmr::relay::ShareStateEntry;
+    auto share_store = std::make_shared<c2pool::v37n::xmr::relay::ShareStateStore>();
+    std::function<void()> share_publish;
     auto cba_ring_push = [&]() {
         const ::v37::bytes32 d = node.ledger().owed_digest();
+        if (share_publish) share_publish();   // SHARE-LEVEL CANONICAL COINBASE: this state's verdict inputs
         if (cba_ring.push(d, node.finalize_driver().digest_since())) {
             std::printf("cba-digest: cursor=%llu hw=%llu ledger_seq=%llu owed_digest=%s\n",
                         static_cast<unsigned long long>(node.finalize_driver().cursor_height()),
@@ -2237,6 +2245,36 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         return view;
     };
+    // ANCHOR (ruling A 2026-09-29, OwedLedgerRules::anchor_cut): a lane block's
+    // pay-now and E_b come from the view at the ANCHOR of the ledger it is
+    // booked on (the credit cut of the latest lane block finalized into it),
+    // not at its own cut, so every input of its coinbase is finalized state and
+    // a relayed share can be checked against it. No anchor yet (a fresh pool):
+    // the view credits nobody, and the empty-cut finder rule pays the finder.
+    // Rule off: the block's own cut, as before.
+    auto credit_cut_of = [&](const settle::OwedLedger& L, const c2pool::v37n::xmr::credit::CreditCut& own, bool& none) -> c2pool::v37n::xmr::credit::CreditCut {
+        none = false;
+        if (!L.rules().anchor_cut) return own;
+        const auto a = L.anchor_cut();
+        if (!a) { none = true; return own; }
+        c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = a->next_pos; cc.spine_digest = a->spine; return cc;
+    };
+    // The payees pay-now pays: 1 = known (`payees`, empty when nobody), 0 = not
+    // readable here yet (why: cut-pending), -1 = decided (why).
+    auto credit_payees = [&](const c2pool::v37n::xmr::credit::CreditCut& own, const settle::OwedLedger& L, bool& has_view,
+                             std::vector<settle::WeightedPayee>& payees, std::string& why, std::uint64_t relay_hint_pid = 0) -> int {
+        bool none = false;
+        const auto cc = credit_cut_of(L, own, none);
+        payees.clear();
+        if (none) { has_view = true; return 1; }
+        auto view = view_at_cut(cc, why, relay_hint_pid);
+        if (!view) return why.rfind("cut-pending:", 0) == 0 ? 0 : -1;
+        has_view = settle::assert_ratified_geometry(*view, /*strict=*/true);
+        if (has_view) payees = settle::project(*view);
+        return 1;
+    };
+    // the ledger decode_resolving resolves pay-now payees against (book_scratch: its scratch ledger)
+    const settle::OwedLedger* decode_ledger = nullptr;
     // REJOIN-PAYEE: decode a block's coinbase; an output mapping to no payee known
     // HERE is resolved against the payees of the view at the block's OWN on-chain
     // credit cut (xmr_cut_payees.hpp) before the fail-closed refusal: a view not
@@ -2253,10 +2291,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         auto bk = auth::decode_resolving_cut_payees(
             [&] { return decode_blob(blob, superseded_out, cands_override, cba_fx ? &cut_refs : nullptr); },
             [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::vector<settle::WeightedPayee>& out, std::string& w) -> int {
-                auto v = view_at_cut(cc, w, relay_hint(bid));
-                if (!v) return w.rfind("cut-pending:", 0) == 0 ? 0 : -1;
-                out = settle::project(*v);
-                return 1;
+                bool hv = false;   // ANCHOR: pay-now pays the payees of the booking ledger's anchor
+                return credit_payees(cc, decode_ledger ? *decode_ledger : node.ledger(), hv, out, w, relay_hint(bid));
             },
             [&](const ::v37::ScriptRef& ref) {
                 if (!cba_fx) return false;
@@ -2299,6 +2335,25 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (g_credit_mutate && !credit.empty()) credit.begin()->second += g_credit_mutate;   // the falsifier: a 1-piconero lie must show in owed_digest
         return true;
     };
+    auto fold_credit = [&](std::uint64_t reward, const c2pool::v37n::xmr::credit::CreditCut& own, const settle::OwedLedger& L, Amounts& credit,
+                           std::string& why, std::uint64_t relay_hint_pid = 0) -> bool {
+        bool none = false;
+        const auto cc = credit_cut_of(L, own, none);
+        if (none) { credit.clear(); if (drops) drops_fold_price = {}; return true; }
+        return fold_at_cut(reward, cc, credit, why, relay_hint_pid);
+    };
+    // ANCHOR: a canonical block's own cut becomes the ledger's anchor when it
+    // finalizes, so it must be reproducible here, as it had to be before the
+    // rule (the fold read it): pending -> HELD like every relay repair.
+    auto own_cut_anchor = [&](const c2pool::v37n::xmr::authority::CoinbaseBooking& bk, const settle::OwedLedger& L,
+                              o2::FinalizeConnectOptions::ChainBooking& out, std::string& why, std::uint64_t relay_hint_pid) -> bool {
+        if (!L.rules().anchor_cut) return true;
+        if (!view_at_cut(bk.credit_cut, why, relay_hint_pid)) return false;
+        settle::AnchorCut a; a.next_pos = bk.credit_cut.next_pos; a.spine = bk.credit_cut.spine_digest;
+        out.cut = a;
+        return true;
+    };
+
     // R-C rework-2/3: the RICH booking callback. Same authority as before for the
     // CREDIT side (fail-closed); on every refusal it reports the block's on-chain
     // PAYOUT map when it decodes from the ON-CHAIN BYTES + this node's own ring
@@ -2461,11 +2516,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::ofstream out(booked_refs_path, std::ios::app);
         out << static_cast<unsigned>(ref.kind) << " " << sub::to_hex(ref.payload.data(), ref.payload.size()) << "\n";
     };
-    auto note_booked_refs = [&](const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk) {
+    auto note_booked_refs = [&](const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
+                                const settle::OwedLedger& L) {
         if (!cba_fx) return;
-        std::string w;
-        if (auto v = view_at_cut(bk.credit_cut, w, relay_hint(bid)))
-            for (const auto& p : settle::project(*v))
+        std::string w; bool hv = false; std::vector<settle::WeightedPayee> ps;
+        if (credit_payees(bk.credit_cut, L, hv, ps, w, relay_hint(bid)) == 1)   // ANCHOR: the payees pay-now paid
+            for (const auto& p : ps)
                 if (::v37::xmr::is_xmr_kind(p.pay.kind)) note_booked_ref(p.pay);
         const auto pay_of = cba_fx->pay_of();
         for (const auto& [k, v] : bk.payout) { (void)v; note_booked_ref(pay_of(k)); }
@@ -2482,12 +2538,9 @@ static int run_live(const XmrNodeConfig& cfg) {
     // mismatch (res.why), -1 undecided (why = "cut-pending: ...": HELD).
     std::uint64_t canon_ok = 0, canon_mismatch = 0, canon_undecided = 0;
     long long canon_debited = 0;
-    auto canon_check = [&](std::uint64_t h, const std::string& bid, const std::vector<std::uint8_t>& blob,
-                           const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
-                           const c2pool::v37n::settle::OwedLedger& L,
-                           c2pool::v37n::xmr::recompute::Result& res, std::string& why) -> int {
-        namespace rc = c2pool::v37n::xmr::recompute;
-        rc::LaneInputs li;
+    // The lane's own recompute parameters (identical on every node of the lane).
+    auto lane_inputs_now = [&]() {
+        c2pool::v37n::xmr::recompute::LaneInputs li;
         li.chain_id = cfg.lane_chain;
         li.h_min = cba_scfg->h_min;
         li.owed_cap = cba_scfg->resolved_output_cap();
@@ -2499,15 +2552,54 @@ static int run_live(const XmrNodeConfig& cfg) {
         li.kfair_salted_ties = cba_scfg->kfair_salted_ties;
         li.spend_floor = cba_scfg->spend_floor;
         li.commit_total = cba_scfg->commit_total;
+        return li;
+    };
+    // SHARE-LEVEL CANONICAL COINBASE: publish, per ledger state, what a relay
+    // worker needs to rebuild a share's canonical coinbase: a frozen copy of the
+    // ledger, the payees at its anchor, the booked refs and the lane config.
+    // Main thread (the ledger-event observer and the relay tick).
+    share_publish = [&]() {
+        if (!cba_fx || !cba_scfg || !node.ledger().rules().anchor_cut) return;
+        const ::v37::bytes32 d = node.ledger().owed_digest();
+        std::shared_ptr<ShareStateEntry> e;
+        {
+            std::lock_guard<std::mutex> lk(share_store->mu);
+            for (const auto& x : share_store->ring)
+                if (x->digest == d) { if (x->has_view) return; e = std::make_shared<ShareStateEntry>(*x); break; }
+        }
+        if (!e) {
+            e = std::make_shared<ShareStateEntry>();
+            e->digest = d;
+            const auto r = ::v37::xmr::settle::mm_commitment_root(cfg.lane_chain, d);
+            std::memcpy(e->root.data(), r.data(), 32);
+            auto L = std::make_shared<settle::OwedLedger>(node.ledger());
+            (void)L->owed_digest();   // warm the memo: workers only read
+            e->ledger = L;
+            e->refs = cba_fx->booked_map();
+            e->lane = lane_inputs_now();
+        }
+        std::string w;
+        const c2pool::v37n::xmr::credit::CreditCut none{};
+        e->has_view = credit_payees(none, *e->ledger, e->view_ratified, e->payees, w) == 1;
+        std::lock_guard<std::mutex> lk(share_store->mu);
+        for (auto& x : share_store->ring)
+            if (x->digest == d) { x = e; return; }
+        share_store->ring.push_back(e);
+        while (share_store->ring.size() > 16) share_store->ring.pop_front();
+    };
+    auto canon_check = [&](std::uint64_t h, const std::string& bid, const std::vector<std::uint8_t>& blob,
+                           const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
+                           const c2pool::v37n::settle::OwedLedger& L,
+                           c2pool::v37n::xmr::recompute::Result& res, std::string& why) -> int {
+        namespace rc = c2pool::v37n::xmr::recompute;
+        const rc::LaneInputs li = lane_inputs_now();
         rc::CutInputs ci;
-        auto view = view_at_cut(bk.credit_cut, why, relay_hint(bid));   // the view fold_at_cut just folded
-        if (!view) {
+        // the view the credit fold just folded (ANCHOR: the ledger's anchor)
+        if (credit_payees(bk.credit_cut, L, ci.has_view, ci.payees, why, relay_hint(bid)) != 1) {
             if (why.rfind("cut-pending:", 0) != 0) why = "cut-pending: recompute: " + why;
             ++canon_undecided;
             return -1;
         }
-        ci.has_view = settle::assert_ratified_geometry(*view, /*strict=*/true);
-        if (ci.has_view) ci.payees = settle::project(*view);
         res = rc::verify_lane_coinbase(blob, bk, L, cba_fx->pay_of_booked(), li, ci);
         if (res.verdict == rc::Verdict::Canonical) {
             if (res.credit_delta.empty()) canon_credit_delta.erase(bid);
@@ -2698,7 +2790,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!cut_floor_gate(h, bid, bk.credit_cut.next_pos, why, true)) { if (why.rfind("cut-pending:", 0) != 0) ++cba_refused; return false; }   // CUT-FLOOR
         const char* credit_src = "chain";
         c2pool::v37n::settle::WorkPrice booking_price{};   // ★ DROPS: the price at the cut E_b comes from
-        if (auto wit = wire_cache.find(bid); wit != wire_cache.end()) {
+        // ANCHOR: the wire descriptor was pre-folded at the block's OWN cut, so
+        // under the anchor rule the authority fold below is the only source.
+        if (auto wit = wire_cache.find(bid); wit != wire_cache.end() && !node.ledger().rules().anchor_cut) {
             const auto& d = wit->second.d;
             const bool agree = d.cut_next_pos == bk.credit_cut.next_pos && d.cut_spine_digest == bk.credit_cut.spine_digest &&
                                d.reward == bk.total && d.h_b == h && d.owed_digest_at_win == bk.lane_commitment;
@@ -2706,12 +2800,12 @@ static int run_live(const XmrNodeConfig& cfg) {
             else if (wit->second.prefolded) { credit = wit->second.credit; ++wire_hit; credit_src = "wire-prefold(agreed)"; booking_price = wit->second.price; }
         }
         if (credit_src[0] == 'c') {
-            if (!fold_at_cut(bk.total, bk.credit_cut, credit, why, relay_hint(bid))) { if (why.rfind("cut-pending:", 0) != 0) ++cba_refused; return false; }
+            if (!fold_credit(bk.total, bk.credit_cut, node.ledger(), credit, why, relay_hint(bid))) { if (why.rfind("cut-pending:", 0) != 0) ++cba_refused; return false; }
             booking_price = drops_fold_price;
         } else {
             // belt-and-braces: the fast path must equal the authority fold whenever the authority is available NOW
             Amounts chk; std::string w2;
-            const bool chk_ok = fold_at_cut(bk.total, bk.credit_cut, chk, w2, relay_hint(bid));
+            const bool chk_ok = fold_credit(bk.total, bk.credit_cut, node.ledger(), chk, w2, relay_hint(bid));
             if (chk_ok) booking_price = drops_fold_price;
             if (chk_ok && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
         }
@@ -2725,7 +2819,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ++cut_ok;
                 ++cba_booked;
                 cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: its committed cut still bounds the lane
-                note_booked_refs(bid, bk);   // BOOKED REFS
+                note_booked_refs(bid, bk, node.ledger());   // BOOKED REFS
                 last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " NON-CANONICAL: credit dropped";
                 std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu DEBIT-ONLY (not canonical) payout{ %s}\n",
                             static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
@@ -2839,10 +2933,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         // ★ DROPS: hand the node the price at THIS cut; XmrNode::on_network_block_won
         // (called by FinalizeConnect right after this returns) takes it, one-shot.
         if (drops_live) drops->set_cut_price(booking_price);
+        if (!own_cut_anchor(bk, node.ledger(), out, why, relay_hint(bid))) { if (why.rfind("cut-pending:", 0) != 0) ++cba_refused; return false; }
         ++cut_ok;
         ++cba_booked;
         cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: this booked cut bounds every lane block above it
-        note_booked_refs(bid, bk);   // BOOKED REFS
+        note_booked_refs(bid, bk, node.ledger());   // BOOKED REFS
         last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " src=" + credit_src + " credit{ " + amounts_str(credit) + "}";
         std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
@@ -2874,7 +2969,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!cba_src.fetch(bid, sblob, why)) return false;   // transport: undecidable
         {
             std::string pend;
+            decode_ledger = q.ledger;   // ANCHOR: resolve pay-now payees against the scratch ledger's anchor
             bk = decode_resolving(sblob, bid, pend, nullptr, q.cands);
+            decode_ledger = nullptr;
             if (!pend.empty()) { why = pend; return false; }   // REJOIN-PAYEE: cut-pending -> undecidable
             if (!bk.ok) why = bk.why;
         }
@@ -2908,7 +3005,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); return false; }
         if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
         if (!cut_floor_gate(h, bid, bk.credit_cut.next_pos, why, false)) return false;   // CUT-FLOOR: the same decided refusal
-        if (!fold_at_cut(bk.total, bk.credit_cut, out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
+        if (!fold_credit(bk.total, bk.credit_cut, q.ledger ? *q.ledger : node.ledger(), out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
         if (q.ledger) {   // EVERY NODE RECOMPUTES THE LANE COINBASE: the same verdict on the scratch lineage
             c2pool::v37n::xmr::recompute::Result rr;
             const int cv = canon_check(h, bid, sblob, bk, *q.ledger, rr, why);
@@ -2916,7 +3013,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (cv == 0) {
                 out.credit.clear();     // payouts debited, credit dropped
                 cut_floor_note(h, bid, bk.credit_cut.next_pos);
-                note_booked_refs(bid, bk);   // BOOKED REFS
+                note_booked_refs(bid, bk, q.ledger ? *q.ledger : node.ledger());   // BOOKED REFS
                 std::printf("converge-debit: h=%llu bid=%s… booked under the SCRATCH lineage DEBIT-ONLY (not canonical) payout{ %s}\n",
                             static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), amounts_str(payout).c_str());
                 std::fflush(stdout);
@@ -2946,8 +3043,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
         }
         if (!paynow_net(h, bid, bk, out.credit, payout, why)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
+        if (!own_cut_anchor(bk, q.ledger ? *q.ledger : node.ledger(), out, why, relay_hint(bid))) return false;   // ANCHOR
         cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: the adopted lineage's booked cut
-        note_booked_refs(bid, bk);   // BOOKED REFS
+        note_booked_refs(bid, bk, q.ledger ? *q.ledger : node.ledger());   // BOOKED REFS
         std::printf("converge-decode: h=%llu bid=%s… booked under the SCRATCH lineage (candidate #%zu) P=%llu credit{ %s} payout{ %s}\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.digest_index,
                     static_cast<unsigned long long>(bk.credit_cut.next_pos), amounts_str(out.credit).c_str(), amounts_str(payout).c_str());
@@ -3328,6 +3426,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         scfg.paynow_source = [&](std::uint64_t P, const ::v37::bytes32& dg, std::vector<settle::WeightedPayee>& out) -> bool {
             bool mism = false;
             auto view = node.engine().settlement_view_by_cut(cfg.lane_chain, P, dg, &mism);
+            if (!view && node.ledger().rules().anchor_cut) {
+                // ANCHOR: the anchor is a finalized block's cut, D_conf+ blocks old and
+                // often out of the live ring: read it the way booking does (replay /
+                // relay repair). Main thread (the provider refreshes in the main loop).
+                c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = P; cc.spine_digest = dg;
+                std::string w;
+                view = view_at_cut(cc, w);
+            }
             if (!view || !settle::assert_ratified_geometry(*view, /*strict=*/true)) return false;
             std::size_t unresolved = 0;
             out = settle::project(*view, &unresolved);
@@ -3885,6 +3991,17 @@ static int run_live(const XmrNodeConfig& cfg) {
                     std::lock_guard<std::mutex> lk(relay_log_mtx);
                     if (relay_log_q.size() < 4096) relay_log_q.push_back(l);
                 });
+            // SHARE-LEVEL CANONICAL COINBASE (P2Pool's share rule): a receipt earns
+            // lane credit only if its coinbase is the canonical one (anchor rule on).
+            if (cfg.ledger_anchor_cut) {
+                auto st = share_store;
+                relay_node->set_share_verdict([st](const relay::FbReceipt& r, const ::v37::xmr::verify::ParsedBlob& pb,
+                                                   std::uint64_t cb_h, std::string& why) {
+                    return c2pool::v37n::xmr::relay::share_verdict(*st, r, pb, cb_h, why);
+                });
+                if (share_publish) share_publish();
+                std::printf("relay: share-level canonical coinbase check ON (a share must pay the canonical lane coinbase)\n");
+            }
             relay::XmrReceiptIngest::Options io;
             io.chain = cfg.lane_chain;
             io.order = (g_relay_order == "arrival") ? relay::XmrReceiptIngest::Order::Arrival
@@ -4151,6 +4268,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             };
             // Per-loop (main thread): chain view, admitted -> lane, bin closing, block-won.
             relay_tick = [&]() {
+                if (share_publish) share_publish();   // SHARE-LEVEL: retry a view at the anchor that was pending
                 {
                     const auto t = provider.current();
                     if (t.valid) {
@@ -5524,6 +5642,7 @@ int main(int argc, char** argv) {
         // window without credit, halving every lane half-life
         cfg.ledger_decay_horizon = cfg.lane_params.window;
         cfg.ledger_decay_half_life = cfg.lane_params.half_life;
+        cfg.ledger_anchor_cut = true;   // ANCHOR: every coinbase input is finalized state (share-level canonical coinbase)
     }
     const int rc = run_live(cfg);
     g_web = nullptr; g_web_extra = {}; g_web_name = {};

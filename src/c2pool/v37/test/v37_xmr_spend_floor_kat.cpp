@@ -42,6 +42,7 @@
 #include "c2pool/v37/xmr/xmr_fee_model.hpp"
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
 #include "c2pool/v37/w4_settlement.hpp"
+#include "c2pool/v37/xmr/xmr_settle_store.hpp"
 
 namespace x6  = ::v37::xmr::settle;
 namespace fee = c2pool::v37n::xmr::fee;
@@ -437,6 +438,68 @@ void f9_off() {
     CHECK(a.owed_digest() == b.owed_digest(), "a default ledger and an explicit rules-off ledger commit the same owed_digest");
 }
 
+void f11_anchor() {
+    std::printf("== F11. the ANCHOR: the credit cut of the latest lane block finalized into the ledger ==\n");
+    const ::v37::bytes32 k = payee(81, 1).id;
+    auto cut = [](std::uint64_t P, std::uint8_t tag) { st::AnchorCut c; c.next_pos = P; c.spine[0] = tag; return c; };
+    {   // rule off: the cut argument changes nothing (Family A and the gate-off lane stay byte-identical)
+        st::OwedLedger a(7), b(7);
+        a.on_block_found("x", Amounts{{k, 5}}, {});
+        b.on_block_found("x", Amounts{{k, 5}}, {}, cut(100, 1));
+        a.on_block_finalized("x", 1); b.on_block_finalized("x", 1);
+        CHECK(a.owed_digest() == b.owed_digest() && !b.anchor_cut(), "rule off: no anchor, digest unchanged by the cut");
+    }
+    st::OwedLedgerRules R; R.anchor_cut = true;
+    st::OwedLedger L(7, R);
+    const auto d0 = L.owed_digest();
+    CHECK(!L.anchor_cut(), "a fresh ledger has no anchor");
+    L.on_block_found("b1", Amounts{{k, 5}}, {}, cut(100, 1));
+    CHECK(!L.anchor_cut(), "FOUND does not move the anchor (pending state is outside owed_digest)");
+    L.on_block_finalized("b1", 10);
+    CHECK(L.anchor_cut() && *L.anchor_cut() == cut(100, 1), "FINALIZE makes the block's cut the anchor");
+    const auto d1 = L.owed_digest();
+    CHECK(!(d1 == d0), "the anchor is committed in owed_digest");
+    L.on_block_found("b2", Amounts{{k, 5}}, {}, cut(200, 2));
+    L.on_block_orphaned("b2", {});
+    CHECK(L.anchor_cut() && *L.anchor_cut() == cut(100, 1), "a pre-settle orphan takes its cut with it");
+    L.on_block_found("b3", Amounts{{k, 5}}, {});   // a debit-only / cutless block
+    L.on_block_finalized("b3", 11);
+    CHECK(L.anchor_cut() && *L.anchor_cut() == cut(100, 1), "a finalized block without a cut leaves the anchor where it is");
+    {   // two ledgers that differ only in the anchor differ in owed_digest
+        st::OwedLedger x(7, R), y(7, R);
+        x.on_block_found("b", Amounts{{k, 5}}, {}, cut(100, 1)); x.on_block_finalized("b", 1);
+        y.on_block_found("b", Amounts{{k, 5}}, {}, cut(100, 2)); y.on_block_finalized("b", 1);
+        CHECK(!(x.owed_digest() == y.owed_digest()), "another anchor spine -> another owed_digest");
+    }
+    {   // the settle store carries the cut: a schema-2 FOUND round-trips, a schema-1 record still reads
+        using c2pool::v37n::xmr::SettleEvent;
+        using c2pool::v37n::xmr::SettleEvKind;
+        SettleEvent e; e.kind = SettleEvKind::Found; e.bid = "b1"; e.credit = Amounts{{k, 5}};
+        c2pool::v37n::xmr::set_cut(e, cut(100, 1));
+        const SettleEvent back = SettleEvent::deserialize(e.serialize());
+        CHECK(back.has_cut && c2pool::v37n::xmr::anchor_of(back) == std::optional<st::AnchorCut>(cut(100, 1)),
+              "a FOUND event round-trips its credit cut (schema 2)");
+        SettleEvent old; old.kind = SettleEvKind::Found; old.bid = "b0"; old.credit = Amounts{{k, 5}};
+        const std::string raw = old.serialize();
+        CHECK(static_cast<std::uint8_t>(raw[0]) == 1 && !SettleEvent::deserialize(raw).has_cut,
+              "a cutless event keeps the schema-1 bytes and reads back without a cut");
+        c2pool::v37n::xmr::MemSettleStore store;
+        {
+            auto batch = store.batch();
+            batch->put(c2pool::v37n::xmr::store_codec::k_evt(7, 1), e.serialize());
+            SettleEvent f; f.kind = SettleEvKind::Finalize; f.bid = "b1"; f.bin_height = 10;
+            batch->put(c2pool::v37n::xmr::store_codec::k_evt(7, 2), f.serialize());
+            (void)batch->commit_sync();
+        }
+        st::OwedLedger replay(7, R);
+        bool ok = true;
+        c2pool::v37n::xmr::RecoveryDriver rd(store, 7);
+        (void)rd.recover(replay, ok);
+        CHECK(ok && replay.anchor_cut() == std::optional<st::AnchorCut>(cut(100, 1)) && replay.owed_digest() == d1,
+              "a restart replays the anchor from the event log (same owed_digest as the live ledger)");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -455,6 +518,7 @@ int main() {
     f8_rotation();
     f9_off();
     f10_decay();
+    f11_anchor();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

@@ -67,6 +67,9 @@ struct FoundBlock {
     settle::DropsCompose                  drops{};
     bool                                  has_carried_drops = false;
     Amounts                               carried_drops{};
+    // ANCHOR: the block's own on-chain credit cut (the ledger's next anchor at
+    // FINALIZE, anchor_cut rule). Absent for a debit-only / cutless block.
+    std::optional<settle::AnchorCut>      cut{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -202,10 +205,11 @@ public:
             if (it->second.canonical || m_ledger.is_settled(b.bid) || m_ledger.is_pending(b.bid)) return;
             SettleEvent ev;
             ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = credit; ev.payout = b.payout;
+            set_cut(ev, b.cut);
             write_event(ev);
-            m_ledger.on_block_found(b.bid, credit, b.payout);
+            m_ledger.on_block_found(b.bid, credit, b.payout, b.cut);
             ledger_event();   // R5
-            it->second.credit = b.credit; it->second.payout = b.payout; it->second.canonical = true;
+            it->second.credit = b.credit; it->second.payout = b.payout; it->second.cut = b.cut; it->second.canonical = true;
             return;   // m_by_height already lists it
         }
         SettleEvent ev;
@@ -213,8 +217,9 @@ public:
         ev.bid = b.bid;
         ev.credit = credit;
         ev.payout = b.payout;
+        set_cut(ev, b.cut);
         write_event(ev);
-        m_ledger.on_block_found(b.bid, credit, b.payout);
+        m_ledger.on_block_found(b.bid, credit, b.payout, b.cut);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
         ledger_event();   // R5

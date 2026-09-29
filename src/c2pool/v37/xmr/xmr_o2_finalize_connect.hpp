@@ -316,6 +316,9 @@ struct FinalizeConnectOptions {
         std::uint32_t extra_nonce = 0;          // its first 4 bytes, LE (builder_key = >> 20)
         bool          has_matched_since = false;// the 0x03 root matched a ring state ...
         std::uint64_t matched_since = 0;        // ... that became current at this coin height
+        // ANCHOR: the block's own on-chain credit cut, set on a CANONICAL booking
+        // only (it becomes the ledger's anchor when the block finalizes).
+        std::optional<::c2pool::v37n::settle::AnchorCut> cut;
     };
     std::function<bool(std::uint64_t, const std::string&, ChainBooking&)> book_from_chain_ex;
 
@@ -463,6 +466,7 @@ public:
         //       it was booked (the ledger already holds it from the replay)
         char          kind = 'a';
         Amounts       credit, payout;
+        std::optional<::c2pool::v37n::settle::AnchorCut> cut;   // ANCHOR (sidecar v2 trailing "cut=P:spine")
     };
     // R-C rework-3 (ruled (b)): the NODE-LOCAL LIABILITY record of one refused
     // lane block. `payout` = the per-payee part decoded from the on-chain bytes
@@ -744,7 +748,7 @@ private:
             Amounts credit, payout;
             if (rec.kind == 'a') { credit = amounts_from(rec.payee, rec.reward, nullptr); payout = credit; }
             else                 { credit = rec.credit; payout = rec.payout; }
-            const bool ok = m_node.on_network_block_won(rec.height, id, credit, payout);
+            const bool ok = m_node.on_network_block_won(rec.height, id, credit, payout, rec.cut);
             if (!ok || !m_node.ledger().is_pending(bid)) {
                 ++rep.stale_dropped;
                 say("boot: sidecar " + short_bid(bid) + " not admitted by the node/ledger; dropped");
@@ -1069,10 +1073,10 @@ public:
                 "(R4 gate released by a stall timeout, or a boot cursor mismatch); booking it anyway, operator's eyes needed");
         }
         c2pool::xmr::node::Hash id{}; (void)hash_from_hex(bid, id);
-        PendingRec rec; rec.height = h; rec.kind = 'c'; rec.credit = bk.credit; rec.payout = bk.payout;
+        PendingRec rec; rec.height = h; rec.kind = 'c'; rec.credit = bk.credit; rec.payout = bk.payout; rec.cut = bk.cut;
         rec.reward = 0; for (const auto& [k, v] : bk.payout) { (void)k; rec.reward += static_cast<std::uint64_t>(v); }
         m_pending[bid] = rec; (void)sidecar_flush();
-        if (!m_node.on_network_block_won(h, id, bk.credit, bk.payout) || !m_node.ledger().is_pending(bid)) {
+        if (!m_node.on_network_block_won(h, id, bk.credit, bk.payout, bk.cut) || !m_node.ledger().is_pending(bid)) {
             m_pending.erase(bid); (void)sidecar_flush();
             say("cba: node/ledger did not admit chain lane block " + short_bid(bid)); return;
         }
@@ -1960,6 +1964,7 @@ private:
         const bool ok = m_o.book_scratch(h, bid, q, bk);
         r.credit = bk.credit; r.payout = bk.payout; r.why = bk.why; r.payout_decoded = bk.payout_decoded;
         r.unattributed_pico = bk.unattributed_pico; r.total_pico = bk.total_pico; r.root_hex = lower_hex(bk.onchain_root_hex);
+        r.cut = bk.cut;   // ANCHOR
         if (ok) r.outcome = minority::DecodeOutcome::Booked;
         else if (bk.why.rfind("not-lane:", 0) == 0) r.outcome = minority::DecodeOutcome::NotLane;
         else if (bk.why.rfind("cut-pending:", 0) == 0 || bk.why.rfind("get_block", 0) == 0 ||
@@ -2108,7 +2113,7 @@ private:
         const std::string utc = utc_stamp();
         std::map<std::string, PendingRec> newp;
         for (const auto& p : res.pending) {
-            PendingRec r; r.height = p.h; r.kind = 'c'; r.credit = p.credit; r.payout = p.payout; r.found_unix_s = now_unix();
+            PendingRec r; r.height = p.h; r.kind = 'c'; r.credit = p.credit; r.payout = p.payout; r.cut = p.cut; r.found_unix_s = now_unix();
             for (const auto& [k, v] : p.payout) { (void)k; if (v > 0) r.reward += static_cast<std::uint64_t>(v); }
             newp[p.bid] = r;
         }
@@ -2553,7 +2558,8 @@ private:
                         std::to_string(r.reward) + " " +
                         (r.prev_id_hex.size() == 64 ? r.prev_id_hex : std::string("-")) + " " +
                         std::to_string(r.found_unix_s) + " " + std::string(1, r.kind) + " " +
-                        map_str(r.credit) + " " + map_str(r.payout) + "\n";
+                        map_str(r.credit) + " " + map_str(r.payout) +
+                        (r.cut ? " cut=" + std::to_string(r.cut->next_pos) + ":" + hex_of(r.cut->spine) : std::string()) + "\n";
         return s;
     }
     static bool parse_sidecar_line(const std::string& line, std::string& bid, PendingRec& r) {
@@ -2587,6 +2593,16 @@ private:
             if (kind.size() != 1 || (kind[0] != 'a' && kind[0] != 'c' && kind[0] != 'd')) return false;
             r.kind = kind[0];
             if (!map_parse(cm, r.credit) || !map_parse(pm, r.payout)) return false;
+            std::string ct;   // ANCHOR: optional trailing "cut=P:spine"
+            if (is >> ct) {
+                if (ct.rfind("cut=", 0) != 0) return false;
+                const std::size_t c = ct.find(':');
+                if (c == std::string::npos || ct.size() != c + 1 + 64) return false;
+                ::c2pool::v37n::settle::AnchorCut a;
+                try { a.next_pos = std::stoull(ct.substr(4, c - 4)); } catch (...) { return false; }
+                if (!hash_from_hex(lower_hex(ct.substr(c + 1)), a.spine)) return false;
+                r.cut = a;
+            }
         }
         return true;
     }

@@ -291,6 +291,7 @@ struct XmrNodeConfig {
     bool            ledger_rotate_on_payment = false;
     std::uint64_t   ledger_decay_horizon = 0;      // dust decay (payout-threshold.md §5): the lane window
     std::uint64_t   ledger_decay_half_life = 0;    // ... and the lane half-life, in bins
+    bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
     // the assembled coinbase carries a real K_fair OWED payee alongside the sink

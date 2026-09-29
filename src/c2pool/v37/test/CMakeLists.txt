@@ -859,10 +859,11 @@ if (BUILD_TESTING)
     target_compile_features(v37_xmr_share_verdict_kat PRIVATE cxx_std_20)
     target_include_directories(v37_xmr_share_verdict_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
     target_compile_definitions(v37_xmr_share_verdict_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-    target_link_libraries(v37_xmr_share_verdict_kat PRIVATE xmr_template xmr_node xmr_coin)
+    target_link_libraries(v37_xmr_share_verdict_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_share_verdict_kat COMMAND v37_xmr_share_verdict_kat)
 
     # ------------------------------------------------------------------

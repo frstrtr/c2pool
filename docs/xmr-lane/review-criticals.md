@@ -35,10 +35,11 @@ Closed natively.
   finder's power in any decentralized pool (a P2Pool finder can equally mine
   a block that pays only itself). The shortfall does not land on the queue:
   the dropped credit means the pool never owed that block to anyone.
-  **Open (stage C):** the thief's shares are still credited when they were
-  mined on its own template. The share rule (a share's coinbase must be the
-  canonical one, the `V37R` total) and its test are in place
-  (`coinbase-recompute.md` §6); the relay does not apply it yet.
+  **Its shares.** A share's coinbase must be the canonical one, as P2Pool
+  checks a share's generation transaction: the relay refuses a share mined
+  on a template that pays the block elsewhere (`coinbase-recompute.md` §6,
+  the `V37R` total and the anchor rule), so a thief cannot keep a found
+  block and still earn credit for its shares.
 * **The thief paying a ref only some nodes know.** Whether a block's outputs
   all map decides between debit-only booking (mismatch) and a ledger-neutral
   refusal. The booking decode used every ref the node had learned, including

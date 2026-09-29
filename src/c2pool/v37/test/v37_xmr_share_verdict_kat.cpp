@@ -51,6 +51,7 @@
 #include "c2pool/v37/xmr/xmr_fee_model.hpp"
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
+#include "c2pool/v37/xmr/relay/xmr_share_verdict.hpp"
 
 namespace x6   = ::v37::xmr::settle;
 namespace fee  = c2pool::v37n::xmr::fee;
@@ -198,6 +199,7 @@ struct Share {
     std::uint8_t major = 0;
     std::uint64_t height = 0;
     ::v37::bytes32 prev_id{};
+    ::v37::xmr::CoinbaseOpening opening;
 };
 Share share_of(const Block& b) {
     Share s;
@@ -216,6 +218,7 @@ Share share_of(const Block& b) {
     const auto direct = ::xmr::coin::tx_prefix_hash(prefix);
     if (std::memcmp(direct.data(), hp.data(), 32) != 0) return s;
     s.ok = true;
+    s.opening = op;
     s.tx_extra = op.tx_extra;
     s.prefix_hash = hp;
     s.major = static_cast<std::uint8_t>(pb.header.major_version);
@@ -393,6 +396,63 @@ void s8_cost() {
     CHECK(ok == n, "every repeat is canonical (%d/%d)", ok, n);
 }
 
+void s9_relay_store() {
+    std::printf("== S9. the relay verdict through the published state store (ANCHOR rule) ==\n");
+    namespace rl = c2pool::v37n::xmr::relay;
+    World w;
+    st::OwedLedgerRules R; R.anchor_cut = true;
+    st::OwedLedger L(kChain, R);
+    seed(L, w.K1.id, 40000000000ll, 10);
+    {   // a lane block finalized with its cut: the ledger's anchor (its view: w.cut)
+        st::AnchorCut a; a.next_pos = 4242; a.spine[3] = 0x77;
+        L.on_block_found("lane-1", Amounts{}, {}, a);
+        L.on_block_finalized("lane-1", 12);
+    }
+    rl::ShareStateStore store;
+    auto publish = [&](bool with_view) {
+        auto e = std::make_shared<rl::ShareStateEntry>();
+        e->digest = L.owed_digest();
+        const auto r = x6::mm_commitment_root(kChain, e->digest);
+        std::memcpy(e->root.data(), r.data(), 32);
+        e->ledger = std::make_shared<st::OwedLedger>(L);
+        (void)e->ledger->owed_digest();
+        e->refs = w.lane.refs;
+        e->lane = lane_inputs();
+        e->has_view = with_view; e->view_ratified = with_view;
+        if (with_view) e->payees = weighted(w.cut);
+        std::lock_guard<std::mutex> lk(store.mu);
+        store.ring.clear();
+        store.ring.push_back(e);
+    };
+    auto verdict = [&](const Share& sh, std::string& why) {
+        rl::FbReceipt fb;
+        fb.receipt.coinbase_opening = sh.opening;
+        ::v37::xmr::verify::ParsedBlob pb;
+        pb.major = sh.major; pb.prev_id = sh.prev_id;
+        return rl::share_verdict(store, fb, pb, sh.height, why);
+    };
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block b = build_block(L, w.lane, o);
+    CHECK(b.ok, "an honest template on the anchor ledger builds: %s", b.ok ? "ok" : b.why.c_str());
+    if (!b.ok) return;
+    const Share sh = share_of(b);
+    std::string why;
+    CHECK(verdict(sh, why) == 0, "the state is not published yet: undecidable (%s)", why.c_str());
+    publish(false);
+    CHECK(verdict(sh, why) == 0, "published without the view at its anchor: undecidable (%s)", why.c_str());
+    publish(true);
+    CHECK(verdict(sh, why) == 1, "published with the view: CANONICAL (%s)", why.c_str());
+    BuildOpts t; t.cut_payees = w.cut;
+    t.mutate = [&](x6::CoinbaseInputs& in) { in.paynow_at = nullptr; in.paynow_n = 0; in.owed.clear();
+                                             x6::OwedEntry e; e.pay = w.thief.ref; e.identity = w.thief.id; e.owed = 1ull << 50; in.owed.push_back(e); };
+    const Block tb = build_block(L, w.lane, t);
+    CHECK(tb.ok, "a thief template on the same state builds: %s", tb.ok ? "ok" : tb.why.c_str());
+    if (tb.ok) {
+        const int v = verdict(share_of(tb), why);
+        CHECK(v == -1, "the thief's share: REFUSED (%s)", why.c_str());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -405,6 +465,7 @@ int main() {
     s6_other_state();
     s7_block_path();
     s8_cost();
+    s9_relay_store();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }
