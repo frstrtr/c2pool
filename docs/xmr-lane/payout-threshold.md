@@ -16,22 +16,38 @@ consensus rules or from the lane's own consensus parameters.
 
 ## 2. The threshold
 
-    t = max(t_share, c, t_fit)
+    t = max(c, t_fit)
 
 | bound | meaning | derived from |
 |---|---|---|
-| `t_share` | the value of one share of the window at this block's cut: `R × w_fresh / W_cut`, where `w_fresh` is the undecayed weight of one minimum-difficulty share and `W_cut` the total decayed weight in the window at the committed credit cut (V37C). P2Pool's own rule ("minimum payout = block reward / 2160") generalised to a window whose carrier count changes. | the lane's consensus window (the same view `fold_eb` credits from) |
 | `c` | the cost to spend one output: `w_input × Fl`, with `Fl = R × 3000 / Mfw²` per byte, the consensus minimum fee (`Blockchain::check_fee` / `get_dynamic_base_fee`, Monero 2021 scaling). `w_input` is the weight one CLSAG input adds to a transaction. | Monero consensus (reward, median) and the tx format of the current hard fork |
 | `t_fit` | the smallest threshold at which every payout at or above it fits in the free part of the block's penalty-free zone: `(zone − weight of the block's transactions − coinbase overhead) / output size`. `zone = max(median, 300000)` (`CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5`). | Monero's block-reward penalty rule |
 
 Reference numbers (tail emission R = 0.6 XMR, median at the 300 kB floor):
-`Fl ≈ 20 000 piconero/byte`, `c ≈ 0.000014 XMR`. With a full window (8640
-receipts, half-life 2160, ≈ 3100 fresh-share equivalents),
-`t_share ≈ 0.00019 XMR`, close to P2Pool's 0.00027.
+`Fl ≈ 20 000 piconero/byte`, `c ≈ 0.000014 XMR`, about 0.0023% of the block.
+For comparison, P2Pool's minimum payout is about 0.00027 XMR.
+
+**No pool-side floor** (ruling, revised 2026-09-29). An earlier draft also
+had `t_share`, the value of one share of the window (P2Pool's rule). It is
+not a Monero rule, and it solves neither problem the threshold exists for:
+`c` already rules out payouts not worth spending, and `t_fit` already keeps
+the coinbase inside the free zone. It only sent every sub-share (DROPS)
+miner to the lottery, which undid the precision DROPS measures their work
+with. Without it, whenever the block has room, every payee at or above `c`
+is paid its exact E_b in that block.
 
 The zone is shared **dynamically** (ruling): the coinbase uses whatever the
 block's transactions leave free, so fee income is never displaced and the
 threshold only rises when the block is actually full.
+
+**Why the ledger cannot grow.** Every canonical block credits its whole
+reward (E_b) and pays it out: the owed pass first, then pay-now, then the
+1-piconero donation marker. The total owed is therefore constant across
+blocks, and paying an old debt only moves it to the current miners. The one
+leak was a block whose payouts did not fit (external review 06): E_b was
+credited and the residue went to the donation output. `t_fit` makes every
+payout at or above `t` fit, and the lottery pays exactly the sub-threshold
+sum in pieces of `t`. So every block pays out what it credits.
 
 ## 3. Payouts
 
@@ -91,7 +107,7 @@ byte-identical.
 
 ## 8. Implementation order
 
-1. The threshold (`t_share`, `c`, `t_fit`), the `V37H` commitment, and its
+1. The threshold (`c`, `t_fit`), the `V37H` commitment, and its
    recompute; KATs and a rehearsal scenario with more payees than free outputs.
 2. The lottery (systematic sampling on `prev_id`); a KAT that checks
    expectation over many blocks and exact sums per block.
