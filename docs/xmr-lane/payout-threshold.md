@@ -95,5 +95,8 @@ byte-identical.
    recompute; KATs and a rehearsal scenario with more payees than free outputs.
 2. The lottery (systematic sampling on `prev_id`); a KAT that checks
    expectation over many blocks and exact sums per block.
-3. Seniority from the threshold (XMR-only ledger switch).
+3. Seniority from the threshold (XMR-only ledger switch). **Ships in the same
+   consensus change as step 1**: a threshold without it is a sub-floor carry,
+   which reopens external review 02 (parked keys season their age). Today the
+   XMR floor is 0 and pinned on mainnet, so 02 is closed until then.
 4. Dust decay.

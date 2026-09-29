@@ -225,7 +225,7 @@ struct Node {
     st::OwedLedger L{kChain};
     std::vector<::v37::bytes32> ring;                           // owed_digest history, newest last
     std::map<::v37::bytes32, ::v37::ScriptRef> booked;          // BOOKED refs (owed pass)
-    std::map<::v37::bytes32, ::v37::ScriptRef> local;           // + out-of-band refs (decoding only)
+    std::map<::v37::bytes32, ::v37::ScriptRef> local;           // out-of-band refs: used by neither pass
     std::vector<st::OwedLedger> history;                         // ledger before booking each height (for a lagging builder)
     void note() { const auto d = L.owed_digest(); if (ring.empty() || !(ring.back() == d)) ring.push_back(d); }
 };
@@ -236,8 +236,9 @@ struct Booked { rc::Verdict v = rc::Verdict::Undecidable; std::string why; Amoun
 Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const std::string& bid) {
     Booked r;
     std::vector<::v37::bytes32> cands(n.ring.rbegin(), n.ring.rend());   // newest first, live at 0
-    std::map<::v37::bytes32, ::v37::ScriptRef> resolve = n.local;
-    for (const auto& [k, v] : n.booked) resolve[k] = v;
+    // BOOKING MAP (main_v37_xmr.cpp decode_blob): outputs map only through the
+    // booked refs and the refs of the block's own cut, never n.local.
+    std::map<::v37::bytes32, ::v37::ScriptRef> resolve = n.booked;
     for (const auto& w : W.view_at(h)) resolve[w.key] = w.pay;          // REJOIN-PAYEE: the block's own cut
     std::vector<::v37::bytes32> keys;
     for (const auto& [k, v] : resolve) { (void)v; keys.push_back(k); }
@@ -440,6 +441,18 @@ void m4_out_of_band_ref() {
           "the node with the out-of-band ref agrees with the others on every block (no split, no mismatch)");
 }
 
+void m6_thief_pays_local_ref() {
+    std::printf("== M6. a modified builder pays a ref only one node knows ==\n");
+    LaneWorld W;
+    const Payee ghost = payee(91);   // owed on every node; its ref known to node 2 only (its own payee, say)
+    W.universe[ghost.id] = ghost.ref;
+    Run r = simulate(W, 20, {}, {9}, ghost.id, 40000000000ll, ghost);
+    CHECK(r.verdict_splits == 0 && r.split_heights == 0,
+          "every node books h=9 the same way: outputs map only through refs every node holds at the booking point");
+    CHECK(r.mismatch == 0 && r.other == 1, "h=9 pays an output no booked or cut ref maps: refused on every node, ledger untouched (other=%zu)", r.other);
+    CHECK(eo(r, ghost.id) == 50000000000ll, "the ghost's owed balance is untouched by a block the pool never booked (owed %lld)", eo(r, ghost.id));
+}
+
 void m5_gate_and_config() {
     std::printf("== M5. the booking-point gate and the mainnet configuration ==\n");
     namespace recon = c2pool::v37n::xmr::recon;
@@ -454,6 +467,20 @@ void m5_gate_and_config() {
     CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(c).empty(), "mainnet --coinbase v37 --fee-model v1: the configuration rehearsed here");
     XmrNodeConfig s; s.network = c2pool::v37n::xmr::MoneroNetwork::Stagenet; s.coinbase = c2pool::v37n::xmr::CoinbaseMode::V37Settlement;
     CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(s).empty(), "stagenet and regtest rigs keep running as they are");
+
+    // O-4/O-5: every input of the recompute is a network constant on mainnet.
+    using c2pool::v37n::xmr::lane_knob_refusal;
+    CHECK(lane_knob_refusal(c, false, false).empty(), "mainnet with every lane knob at its default: allowed");
+    { XmrNodeConfig k = c; k.d_conf = 61;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "mainnet --d-conf 61: refused (moves the booking point)"); }
+    { XmrNodeConfig k = c; k.settle_h_min = 1;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "mainnet --settle-h-min 1: refused (the recompute rebuilds with it)"); }
+    { XmrNodeConfig k = c; k.settle_output_cap = 16;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "mainnet --settle-output-cap 16: refused (the recompute rebuilds with it)"); }
+    CHECK(!lane_knob_refusal(c, true, false).empty(), "mainnet --recon-max-root-age: refused");
+    CHECK(!lane_knob_refusal(c, false, true).empty(), "mainnet --no-book-deferral: refused");
+    { XmrNodeConfig k = s; k.d_conf = 4; k.settle_output_cap = 16;
+      CHECK(lane_knob_refusal(k, true, true).empty(), "test networks keep every knob for rigs"); }
 }
 #else
 void suite_base() {
@@ -471,6 +498,7 @@ int main() {
     m2_lagging_builder();
     m3_overpay();
     m4_out_of_band_ref();
+    m6_thief_pays_local_ref();
     m5_gate_and_config();
 #else
     suite_base();

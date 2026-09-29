@@ -274,20 +274,15 @@ struct XmrNodeConfig {
     bool            residual_sink_subaddress = false;
     // The v37 lane parameters (consensus once multi-node; explicit here).
     //
-    // STEP-0 k_floor hotfix — why the XMR floor is NOT moved into LaneParams
-    // (unlike Family A, where btc_node.hpp's coinbase_budget() now reads the
-    // digest-committed LaneParams::k_floor): the XMR lane settles under
-    // COINBASE AUTHORITY (xmr_coinbase_authority.hpp, RECON ruling "read from
-    // block"). Every node books the winner's ON-CHAIN coinbase — payout =
-    // CoinbaseBooking::payout decoded from the block — and never deducts a
-    // locally rebuilt coinbase, so a node running a different settle_h_min
-    // (or settle_output_cap) mines a different but VALID coinbase that every
-    // peer books identically; the K_fair recompute is a cross-check alarm only.
-    // A differing floor therefore cannot fork owed_digest here. The XMR lane
-    // keeps LaneParams::k_floor = 0 (Monero has no dust rule; the lane digest,
-    // the lane tag and the relay HELLO lane_params_digest stay byte-identical).
-    // If XMR ever settles by rebuild instead of by reading the block, this
-    // floor must move into LaneParams exactly as Family A's did.
+    // Consensus inputs of the recomputed coinbase (coinbase-recompute.md).
+    // Every node rebuilds every lane coinbase with its own settle_h_min and
+    // resolved output cap (xmr_coinbase_recompute.hpp LaneInputs), so a node
+    // running a different value calls an honest block non-canonical and books
+    // it debit-only: a ledger fork. They are therefore network constants:
+    // lane_knob_refusal() refuses a non-default value on mainnet. They stay
+    // out of LaneParams and the relay HELLO lane_params_digest (byte-identical
+    // to the running test rigs); moving them there is the gated follow-up.
+    // LaneParams::k_floor stays 0 on XMR (Monero has no dust rule).
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
@@ -562,6 +557,38 @@ inline std::string settlement_fee_model_refusal(const XmrNodeConfig& c) {
     return "--coinbase v37 on mainnet needs --fee-model v1: every node recomputes every lane coinbase, and "
            "with the fee model off the exact-sum residual goes to this node's own --residual-sink-* wallet, "
            "which no other node can derive (fee model v1 pays it to the protocol donation output)";
+}
+
+// ---------------------------------------------------------------------------
+// LANE KNOBS ARE NETWORK CONSTANTS ON MAINNET (external review O-4/O-5, and
+// every node recomputing every lane coinbase). Each of these changes what a
+// node books from the same chain, so two nodes that differ disagree on every
+// lane block and fork owed_digest:
+//   --d-conf              the booking point (builder_cut) and fe bin heights
+//   --settle-h-min        the owed floor the recompute rebuilds with
+//   --settle-output-cap   the owed-selection cap the recompute rebuilds with
+//   --recon-max-root-age  which committed roots a node accepts
+//   --no-book-deferral    pre-R6 booking order (the lagging-receiver fork)
+// Test networks keep them for rigs; a rig must set them identically.
+// ---------------------------------------------------------------------------
+inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root_age_set, bool no_book_deferral) {
+    if (c.network != MoneroNetwork::Mainnet) return {};
+    const XmrNodeConfig d{};
+    if (c.d_conf != d.d_conf)
+        return "--d-conf is a network constant on mainnet (" + std::to_string(d.d_conf) +
+               "): it moves the booking point every node recomputes lane coinbases at";
+    if (c.settle_h_min != d.settle_h_min)
+        return "--settle-h-min is a network constant on mainnet (" + std::to_string(d.settle_h_min) +
+               "): every node rebuilds every lane coinbase with it";
+    if (c.settle_output_cap != d.settle_output_cap)
+        return "--settle-output-cap is a network constant on mainnet (weight-aware default): every node "
+               "rebuilds every lane coinbase with it";
+    if (recon_max_root_age_set)
+        return "--recon-max-root-age is refused on mainnet: it changes which committed roots a node books";
+    if (no_book_deferral)
+        return "--no-book-deferral is refused on mainnet: it restores the pre-R6 booking order "
+               "(the lagging-receiver fork)";
+    return {};
 }
 
 // ---------------------------------------------------------------------------
