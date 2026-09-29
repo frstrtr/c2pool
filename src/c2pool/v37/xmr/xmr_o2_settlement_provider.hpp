@@ -609,6 +609,7 @@ private:
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
         a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
         a.extra_nonce_tail = src->extra_nonce_tail();   // recon(A+B credit): the on-chain credit cut (0x02 tail)
+        a.reward_total_field = scfg.commit_total;       // REWARD TOTAL: "V37R" first in the tail
         a.extra_nonce_bind_size = m_bind_size;          // SEAM-1: [extra_nonce 4 | rbind 32] (0 = none)
         a.extra_nonce_bind = m_bind;
         // GOOD-CITIZEN: mine the (already good-citizen-selected) set VERBATIM,

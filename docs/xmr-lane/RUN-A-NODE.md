@@ -543,6 +543,10 @@ the output set. Mainnet node numbers are not measured yet.
   will not follow the chain past the fork.
 - **Block withholding.** A miner can submit shares and keep a found block to
   itself. The pool cannot detect this. The same is true of every pool.
+- **Shares on a foreign template (open, stage C).** A share's coinbase is not
+  checked against the canonical one yet, so a miner can earn share credit on
+  a template that pays a found block to itself. The rule and its test exist
+  (`coinbase-recompute.md` §6); the relay does not apply it yet.
 - **Prototype.** The binary prints `EXPERIMENTAL prototype`. No release tag
   exists yet, and the output-set download is not published yet. Blocks with
   a merge-mining tag in the coinbase are handled since c2pool #1786.

@@ -152,7 +152,43 @@ projected view itself (R14).
   Test networks keep them; a rig must set them identically. Moving them into
   `LaneParams` and the HELLO `lane_params_digest` is the gated follow-up.
 
-## 6. Known limits and follow-ups
+## 6. Shares: the same rule (P2Pool's share rule)
+
+A share is a block candidate, so its coinbase must be the canonical one too.
+Without that a miner can mine on a template that pays the whole block to
+itself, keep a found block, and still earn pool credit for every share: the
+block is then booked debit-only against a throwaway key, and the shares keep
+their credit. A relayed receipt hides the outputs in its Keccak midstate, so
+nothing checked them.
+
+* **The total, "V37R".** Everything the recompute needs is in the receipt's
+  open `tx_extra` (V37C, V37N, V37D, V37F, V37P and the 0x03 root that
+  commits the ledger state), except the coinbase total, which depends on the
+  template's own transactions. The template now writes
+  `"V37R" || u64 total` first in the 0x02 tail, after the final reward
+  split. The field has a constant size, so its value never changes the
+  coinbase size, weight or reward. Every older field is located from the
+  end, so none moves. A block must state `V37R == Σ outputs`
+  (`LaneInputs::commit_total`, set by the daemon).
+* **The verdict.** `verify_share_coinbase` takes the opened `tx_extra`, the
+  prefix hash resumed from the receipt's midstate
+  (`verify::resume_prefix_hash`), and the height and parent of the hashing
+  blob. It rebuilds the canonical coinbase with the receipt's own 0x02
+  payload (the worker head differs per job) and compares prefix hashes.
+  Mismatch: no credit. Undecidable: this node does not hold the ledger state
+  the 0x03 root commits.
+* **Pinned by** `v37_xmr_share_verdict_kat`: an honest share is canonical at
+  any extra-nonce; a thief template is refused whether it keeps the donation
+  output or not; a rewritten total is refused; a template without V37R is
+  refused.
+* **Not wired yet (stage C).** The relay does not call the verdict yet. It
+  needs the ledger state of each receipt's booking point (a ring of recent
+  ledger snapshots, as P2Pool keeps its window), the view at the receipt's
+  cut, a per-template cache (one rebuild per template, then one Keccak per
+  share; uncached it is about 3.6 ms), and a verdict taken where the lane
+  pushes the receipt, identical on every node. Until then the gap stays open.
+
+## 7. Known limits and follow-ups
 
 * **Cap latitude.** The recompute accepts any cap that reproduces the block,
   so a builder can truncate its owed pass. Its only gain is pay-now to the

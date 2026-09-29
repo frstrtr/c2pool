@@ -214,6 +214,52 @@ inline bool finder_malformed(const std::vector<unsigned char>& tx_extra) {
     return nf && finder_magic_present(*nf) && !parse_finder_payload(*nf);
 }
 
+// ===========================================================================
+// REWARD TOTAL (share-level canonical coinbase, 2026-09-29). A share is a
+// block candidate, so its coinbase must be the canonical one, as P2Pool
+// checks a share's generation transaction. A receipt hides the outputs in
+// its Keccak midstate; everything else the recompute needs is in the open
+// 0x02 payload (V37C, V37N, V37D, V37F, V37P) except the coinbase total,
+// which depends on the template's own transactions. The template commits it
+// FIRST in the tail, written after the final reward split (constant 12 B, so
+// the value never changes the coinbase size, weight or reward):
+//     [ nonce | rbind? | pad | "V37R" total | "V37F"? | "V37N"? | "V37D"? | "V37P"? | "V37C" ]
+// Every older reader locates its own field from the end, so none shifts. A
+// block must commit V37R == the sum of its outputs (the recompute checks it).
+// ===========================================================================
+inline constexpr unsigned char kRewardTotalMagic[4] = {'V', '3', '7', 'R'};
+inline constexpr std::size_t   kRewardTotalFieldBytes = 4 + 8;   // 12
+
+inline std::vector<std::uint8_t> encode_reward_total(std::uint64_t total) {
+    std::vector<std::uint8_t> t(kRewardTotalMagic, kRewardTotalMagic + 4);
+    for (int i = 0; i < 8; ++i) t.push_back(static_cast<std::uint8_t>(total >> (8 * i)));
+    return t;
+}
+// The payload offset right after the V37R field (where V37F / V37N / ... begin).
+inline std::size_t end_before_finder(const std::vector<std::uint8_t>& p) {
+    std::size_t end = end_before_donation_tail(p);
+    if (parse_payload(p)) {
+        end -= kPayNowTailBytes;
+        if (end >= kFinderFieldBytes && std::memcmp(p.data() + end - kFinderFieldBytes, kFinderMagic, 4) == 0)
+            end -= kFinderFieldBytes;
+    }
+    return end;
+}
+inline std::optional<std::uint64_t> parse_reward_total_payload(const std::vector<std::uint8_t>& p) {
+    const std::size_t end = end_before_finder(p);
+    if (end < kRewardTotalFieldBytes) return std::nullopt;
+    const std::uint8_t* t = p.data() + end - kRewardTotalFieldBytes;
+    if (std::memcmp(t, kRewardTotalMagic, 4) != 0) return std::nullopt;
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(t[4 + i]) << (8 * i);
+    return v;
+}
+inline std::optional<std::uint64_t> parse_reward_total(const std::vector<unsigned char>& tx_extra) {
+    const auto nf = credit::extra_nonce_field(tx_extra);
+    if (!nf) return std::nullopt;
+    return parse_reward_total_payload(*nf);
+}
+
 // Receive side: turn the EMPTY fold at the cut into the finder's credit. A
 // no-op (true) when the block commits no finder. On a refusal `credit` is
 // left untouched and *why says why.

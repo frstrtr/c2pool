@@ -180,6 +180,9 @@ struct XmrSettlementConfig {
     bool kfair_salted_ties = false;
     // SPEND-COST FLOOR (payout-threshold.md §2-§3).
     bool spend_floor = false;
+    // REWARD TOTAL: the template commits "V37R" || total first in the 0x02 tail,
+    // so a share's receipt can be checked against the canonical coinbase.
+    bool commit_total = false;
 
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).

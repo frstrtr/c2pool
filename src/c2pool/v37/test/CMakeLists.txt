@@ -846,6 +846,26 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_coinbase_recompute_kat COMMAND v37_xmr_coinbase_recompute_kat)
 
     # ------------------------------------------------------------------
+    # SHARE-LEVEL CANONICAL COINBASE (P2Pool's share rule): a relayed
+    # receipt's coinbase, opened through its own Keccak midstate, must be the
+    # canonical lane coinbase (xmr_coinbase_recompute.hpp verify_share_coinbase,
+    # the "V37R" total). Real assembled blocks; no daemon, no RandomX.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_share_verdict_kat
+        v37_xmr_share_verdict_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_share_verdict_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_share_verdict_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_share_verdict_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_share_verdict_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_share_verdict_kat COMMAND v37_xmr_share_verdict_kat)
+
+    # ------------------------------------------------------------------
     # MAINNET REHEARSAL (isolated): the mainnet settlement configuration
     # (fee model v1, the mainnet donation identity, the R6 booking pipeline)
     # run in-process on three nodes with rotating builders -- honest run
