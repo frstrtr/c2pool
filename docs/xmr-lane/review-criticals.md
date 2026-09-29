@@ -58,8 +58,8 @@ Closed natively.
 Closed natively. The XMR owed floor is 0 and is now pinned on mainnet. With
 no floor there is no CARRY: a key at the head of the queue is paid in full,
 reaches 0 and is disarmed. A key cannot stay positive and unpaid at the head.
-The planned payout threshold would reintroduce a floor, so it ships in the
-same consensus change as seniority-from-the-threshold
+The planned spend-cost floor `c` reintroduces an owed floor, so it ships in the
+same consensus change as seniority from `c`
 (`payout-threshold.md` §6, §8).
 
 ## High
@@ -70,7 +70,7 @@ same consensus change as seniority-from-the-threshold
 | 04 | no per-payee cap | **Ruled (2026-09-29): rotation on a partial payment**, no cap constant: a key paid in part goes to the back of the queue (`payout-threshold.md` §6a). Designed, ships with the threshold. Also closes audit O-1. |
 | 05a | pre-settle orphan costs seniority | Refuted since #1704; pinned by #1876. |
 | 05b | post-settle orphan | By design. The finality boundary is D_conf = 60 (coinbase maturity) and is pinned on mainnet. |
-| 06 | residue owner, insolvency | The residue has one owner: the protocol donation output (fee model v1, mandatory on mainnet). **Open:** when pay-now needs more output slots than the block's cap has, pay-now is dropped, E_b is credited as owed, and the residual goes to the donation output (`xmr_o2_settlement_source.hpp`, CapTooSmall). The threshold's t_fit and the lottery close this. #1871 FILL is the last-resort guard. |
+| 06 | residue owner, insolvency | The residue has one owner: the protocol donation output (fee model v1, mandatory on mainnet). **Open:** when pay-now needs more output slots than the block's cap has, pay-now is dropped, E_b is credited as owed, and the residual goes to the donation output (`xmr_o2_settlement_source.hpp`, CapTooSmall). **Designed:** payees below the spend-cost floor `c` accumulate, payees that do not fit wait, and their cash is advanced to the payees paid in the same block, so every block pays out what it credits (`payout-threshold.md` §3). |
 | 07 | floor depends on address kind | Not applicable: Monero has one output kind and the floor is 0. |
 
 ## Low and disclosure
