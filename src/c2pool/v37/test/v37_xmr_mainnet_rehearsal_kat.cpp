@@ -280,7 +280,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
         }
         r.payout = bk.payout;
         const auto nb = pn::net_booking(bk.paynow_base, bk.total, r.credit, r.payout, bk.sink_total,
-                                        fee::donation_identity(kNet), static_cast<long long>(fee::kDonationDustPico),
+                                        fee::donation_identity(kNet), static_cast<long long>(fee::kDonationMarkerPico),
                                         g_spend_floor);
         if (!nb.ok) { r.v = rc::Verdict::Undecidable; r.why = nb.why; return r; }
     } else {
@@ -298,6 +298,7 @@ struct Run {
     std::set<std::uint64_t> mismatch_at;
     std::map<::v37::bytes32, long long> credited, paid, eb_gross;   // per identity (node 0 / on-chain / E_b at each cut)
     long long donation_paid = 0;
+    std::uint64_t donation_outputs = 0;   // blocks whose LAST output is the donation output (any amount)
     std::uint64_t blocks = 0;
     std::uint64_t min_payout = ~std::uint64_t{0}, min_floor = ~std::uint64_t{0};   // smallest non-donation output / smallest c seen
     std::size_t below_floor = 0;                                                     // outputs below their own block's c
@@ -405,6 +406,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
                 std::uint64_t don = 0;
                 for (std::size_t o = 0; o < bk.out_identity.size(); ++o) if (bk.out_identity[o] == fee::donation_identity(kNet)) don += bk.out_amount[o];
                 run.donation_paid += static_cast<long long>(don);
+                if (bk.ok && !bk.out_identity.empty() && bk.out_identity.back() == fee::donation_identity(kNet)) ++run.donation_outputs;
                 for (std::size_t o = 0; o < bk.out_identity.size(); ++o)
                     if (!(bk.out_identity[o] == fee::donation_identity(kNet))) {
                         run.min_payout = std::min(run.min_payout, bk.out_amount[o]);
@@ -457,8 +459,9 @@ void m1_honest() {
     CHECK(never_negative, "no key is ever left negative on an honest run");
     CHECK(eo(r, W.seeded[0].id) == 0 && eo(r, W.seeded[1].id) == 0 && eo(r, W.seeded[2].id) == 0,
           "the whole seeded owed queue (1.04 XMR, more than one block reward) was paid out through the owed pass");
-    CHECK(r.donation_paid >= static_cast<long long>(H * fee::kDonationDustPico),
-          "the MAINNET donation output is in every block (%lld piconero over %llu blocks)", r.donation_paid, (unsigned long long)H);
+    CHECK(r.donation_outputs == H,
+          "the MAINNET donation output is the last output of every block (%llu of %llu; %lld piconero)",
+          (unsigned long long)r.donation_outputs, (unsigned long long)H, r.donation_paid);
 }
 
 void m2_lagging_builder() {
@@ -560,10 +563,11 @@ void m7b_fresh_pool() {
     CHECK(r.canonical == 24 && r.verdict_splits == 0 && r.split_heights == 0, "all 24 blocks canonical on every node, one digest");
     long long worst = 0, total = 0;
     for (const auto& [k, eb] : r.eb_gross) { (void)eb; const long long b = eo(r, k); total += b; worst = std::max(worst, b < 0 ? -b : b); }
-    CHECK(total == 24 && worst <= 24,
-          "every miner, dust included, is paid its E_b in the block itself. The only balance is the 1-piconero donation "
-          "marker each block keeps back, spread by rounding (total %lld over 24 blocks, largest %lld piconero)", total, worst);
-    CHECK(r.donation_paid == 24, "the donation output carries only the 1-piconero marker per block (%lld)", r.donation_paid);
+    CHECK(total == 0 && worst == 0,
+          "every miner, dust included, is paid its E_b in the block itself: no balance is left (the donation marker is 0) "
+          "(total %lld over 24 blocks, largest %lld piconero)", total, worst);
+    CHECK(r.donation_paid == 0 && r.donation_outputs == 24,
+          "the donation output is in all 24 blocks, as the 0-amount marker (%lld piconero)", r.donation_paid);
 }
 
 void m9_reorg() {

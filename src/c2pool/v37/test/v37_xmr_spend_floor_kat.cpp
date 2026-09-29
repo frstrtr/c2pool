@@ -183,7 +183,7 @@ void f2d_debt_first() {
     P a = payee(71, kTail, 2);                                        // admitted; it also has an old balance
     const P w = payee(72, c / 2);                                     // dust without a slot
     const std::uint64_t old_debt = 3 * c;
-    auto in = fee_on_inputs(a.eb + w.eb + 1, true);
+    auto in = fee_on_inputs(a.eb + w.eb + fee::kDonationMarkerPico, true);
     in.output_cap = 2;                                                // one payee slot
     std::vector<x6::PayNowEntry> v;
     for (const P& p : {a, w}) { x6::PayNowEntry e; e.pay = p.ref; e.identity = p.id; e.eb = p.eb; e.age = p.age; v.push_back(e); }
@@ -214,7 +214,7 @@ void f2c_short_pool() {
     std::uint64_t sum = 0;
     for (int i = 0; i < 12; ++i) { ps.push_back(payee(static_cast<std::uint8_t>(60 + i), i == 0 ? c / 3 : 10000000000ull * (i + 1))); sum += ps.back().eb; }
     const std::uint64_t pool = sum / 2;
-    auto in = fee_on_inputs(pool + 1, true);
+    auto in = fee_on_inputs(pool + fee::kDonationMarkerPico, true);
     arm(in, ps);
     const auto outs = x6::allocate_exact_sum(in);
     std::size_t paid = 0; bool same = true;
@@ -226,7 +226,7 @@ void f2c_short_pool() {
     }
     CHECK(paid == ps.size(), "every payee with a slot is paid, dust included (%zu of %zu)", paid, ps.size());
     CHECK(same, "every payee gets the same fraction of its E_b (half: the pool holds half of what was credited)");
-    CHECK(sum_of(outs) == pool + 1 && to(outs, fee::donation_identity(kNet)) == 1, "every piconero of the pool is paid out; only the marker is left");
+    CHECK(sum_of(outs) == pool + fee::kDonationMarkerPico && to(outs, fee::donation_identity(kNet)) == fee::kDonationMarkerPico, "every piconero of the pool is paid out; only the 0-amount marker is left");
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +235,7 @@ void f3b_worth_spending_first() {
     const std::uint64_t c = x6::spend_floor(kTail);
     const P dust = payee(81, c / 2, 3);                              // the OLDEST, but dust
     const P big = payee(82, kTail);                                   // new, but worth spending (reward >= the tail)
-    auto in = fee_on_inputs(dust.eb + big.eb + 1, true);
+    auto in = fee_on_inputs(dust.eb + big.eb + fee::kDonationMarkerPico, true);
     in.output_cap = 2;                                                // one payee slot
     arm(in, {dust, big});
     const auto outs = x6::allocate_exact_sum(in);
@@ -261,7 +261,7 @@ void f3_slots() {
     }
     {   // equal ages: the salted tie decides, never the size of E_b
         P x = payee(26, 5000000000ull), y = payee(27, 400000000000ull);
-        auto in = fee_on_inputs(x.eb + y.eb + 1, true);
+        auto in = fee_on_inputs(x.eb + y.eb + fee::kDonationMarkerPico, true);
         in.output_cap = 2;                                            // one payee slot
         std::vector<x6::PayNowEntry> v;
         for (const P& p : {x, y}) { x6::PayNowEntry e; e.pay = p.ref; e.identity = p.id; e.eb = p.eb; v.push_back(e); }

@@ -357,7 +357,8 @@ struct ReceivedCoinbase {
 // coinbase by the fee model) re-derives owed_part without the ledger.
 // Invariant on success:
 //     Sum(result.amount) == in.budget()      (exact-sum, no burn)
-// and every result.amount > 0, and result.size() >= 1, and result.size() <=
+// and every result.amount > 0 except a Fixed output declared at 0 (the fee
+// model's donation marker), and result.size() >= 1, and result.size() <=
 // in.output_cap.
 //
 // Returns an empty vector and sets *err (if non-null) on ZeroBudget /
