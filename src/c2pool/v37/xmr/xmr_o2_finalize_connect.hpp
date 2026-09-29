@@ -435,6 +435,9 @@ struct FinalizeConnectOptions {
         const std::vector<::v37::bytes32>* cands = nullptr;
         const std::vector<std::uint64_t>*  superseded = nullptr;
         bool root_only = false;
+        // The scratch ledger at this block's booking point (the coinbase
+        // recompute's state; xmr_coinbase_recompute.hpp).
+        const ::c2pool::v37n::settle::OwedLedger* ledger = nullptr;
     };
     std::function<bool(std::uint64_t, const std::string&, const ScratchQuery&, ChainBooking&)> book_scratch;
 };
@@ -1949,10 +1952,11 @@ private:
     }
 
     minority::DecodeResult scratch_decode(std::uint64_t h, const std::string& bid, const std::vector<::v37::bytes32>& cands,
-                                          const std::vector<std::uint64_t>& sup, bool root_only) {
+                                          const std::vector<std::uint64_t>& sup, bool root_only,
+                                          const ::c2pool::v37n::settle::OwedLedger& ledger) {
         minority::DecodeResult r;
         FinalizeConnectOptions::ChainBooking bk;
-        FinalizeConnectOptions::ScratchQuery q; q.cands = &cands; q.superseded = &sup; q.root_only = root_only;
+        FinalizeConnectOptions::ScratchQuery q; q.cands = &cands; q.superseded = &sup; q.root_only = root_only; q.ledger = &ledger;
         const bool ok = m_o.book_scratch(h, bid, q, bk);
         r.credit = bk.credit; r.payout = bk.payout; r.why = bk.why; r.payout_decoded = bk.payout_decoded;
         r.unattributed_pico = bk.unattributed_pico; r.total_pico = bk.total_pico; r.root_hex = lower_hex(bk.onchain_root_hex);
@@ -2037,8 +2041,9 @@ private:
             for (auto& sub : subs) tries.emplace_back("Rs (own subset)", std::move(sub));
         }
         auto decode = [this](std::uint64_t h, const std::string& bid, const std::vector<::v37::bytes32>& cands,
-                             const std::vector<std::uint64_t>& sup, bool root_only) {
-            return scratch_decode(h, bid, cands, sup, root_only);
+                             const std::vector<std::uint64_t>& sup, bool root_only,
+                             const ::c2pool::v37n::settle::OwedLedger& ledger) {
+            return scratch_decode(h, bid, cands, sup, root_only, ledger);
         };
         std::string tried;
         std::size_t idx = 0;

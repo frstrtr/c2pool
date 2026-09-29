@@ -33,6 +33,9 @@
 //   R9  pay-now to a payee set other than the cut's: MISMATCH.
 //   R10 a block built on a ledger state that is not the booking point's
 //       (the receiver's cursor has moved on): MISMATCH.
+//   R11 the booking of a MISMATCH (ruling 2) on two receivers: payouts
+//       debited, credit dropped, one owed_digest, the double pay carried as
+//       a debt.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -426,6 +429,36 @@ void r10_stale_state() {
     CHECK(v.r.verdict == rc::Verdict::Mismatch && v.r.why.find("owed_digest") != std::string::npos,
           "recompute: %s -- %s", verdict(v), v.r.why.c_str());
 }
+
+// R11: the booking outcome of a non-canonical block (ruling 2) on two
+// receivers: payouts DEBITED, credit DROPPED, the same owed_digest on both,
+// and the double-paid key carried as a debt (forward repair, never a
+// clawback), not forgotten.
+void r11_debit_only_booking() {
+    std::printf("== R11. booking a non-canonical block: debit payouts, drop credit ==\n");
+    World w;
+    st::OwedLedger R = w.L;
+    R.on_block_found("A", Amounts{}, Amounts{{w.K1.id, 40000000000ll}});   // A paid K1 already
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block b = build_block(w.L, w.lane, o);   // the lagging builder pays K1 again
+    if (!b.ok) { CHECK(false, "builds: %s", b.why.c_str()); return; }
+    st::OwedLedger R1 = R, R2 = R;
+    const auto v1 = receive(b, R1, w.lane, w.cut), v2 = receive(b, R2, w.lane, w.cut);
+    CHECK(v1.r.verdict == rc::Verdict::Mismatch && v2.r.verdict == rc::Verdict::Mismatch && v1.r.why == v2.r.why,
+          "both receivers reach the same verdict: %s", v1.r.why.c_str());
+    // what book_from_chain_ex books on a mismatch: FOUND(credit = {}, payout = the gross on-chain map)
+    for (st::OwedLedger* L : {&R1, &R2}) {
+        L->on_block_found("B", Amounts{}, v1.bk.payout);
+        L->on_block_finalized("A", 50);
+        L->on_block_finalized("B", 51);
+    }
+    CHECK(R1.owed_digest() == R2.owed_digest(), "the same owed_digest on both receivers after FINALIZE");
+    const long long k1 = R1.effective_owed(w.K1.id);
+    CHECK(k1 == -40000000000ll, "K1 carries the double payment as a debt (EffectiveOwed %lld): forward repair, never forgotten", k1);
+    long long credited = 0;
+    for (const auto& p : w.cut) credited += R1.effective_owed(p.id) + (v1.bk.payout.count(p.id) ? v1.bk.payout.at(p.id) : 0);
+    CHECK(credited == 0, "the block's credit is DROPPED: its cut payees are debited exactly the pay-now they received (net %lld)", credited);
+}
 #else
 void suite_base() {
     std::printf("== BASE: no recompute on this tree ==\n");
@@ -448,6 +481,7 @@ int main() {
     r8_undertake();
     r9_paynow_misdirected();
     r10_stale_state();
+    r11_debit_only_booking();
 #else
     suite_base();
 #endif

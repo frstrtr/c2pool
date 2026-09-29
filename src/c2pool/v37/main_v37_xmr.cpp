@@ -98,6 +98,7 @@
 #include "xmr/xmr_cut_payees.hpp"          // REJOIN-PAYEE: resolve outputs against the payees of the block's own cut
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
 #include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
+#include "xmr/xmr_coinbase_recompute.hpp"    // every node recomputes the lane coinbase (rulings 2026-09-29)
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
 #include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
 #include "xmr/xmr_web_dashboard.hpp"        // XMR-WEB: the c2pool web dashboard (--web-port; OFF by default)
@@ -2392,6 +2393,54 @@ static int run_live(const XmrNodeConfig& cfg) {
                     rej.empty() ? "" : (" -- " + rej + " (winner_digest=" + hex_of(wit->second.drops->enrollment_digest).substr(0, 12) + "…)").c_str());
         return true;
     };
+    // EVERY NODE RECOMPUTES THE LANE COINBASE (operator rulings 2026-09-29,
+    // xmr/xmr_coinbase_recompute.hpp). A decoded lane block whose coinbase is
+    // not, byte for byte, the one the builder pipeline produces from THIS
+    // ledger at the block's booking point (R6: cursor h-1-D_conf on every
+    // node), the view at its on-chain cut and the lane config is booked with
+    // its on-chain payouts DEBITED and its credit DROPPED: forward repair of
+    // money that left the pool, never a clawback, never a free block. In force
+    // from the lane's genesis: no activation gate. Returns 1 canonical, 0
+    // mismatch (res.why), -1 undecided (why = "cut-pending: ...": HELD).
+    std::uint64_t canon_ok = 0, canon_mismatch = 0, canon_undecided = 0;
+    long long canon_debited = 0;
+    auto canon_check = [&](std::uint64_t h, const std::string& bid, const std::vector<std::uint8_t>& blob,
+                           const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
+                           const c2pool::v37n::settle::OwedLedger& L,
+                           c2pool::v37n::xmr::recompute::Result& res, std::string& why) -> int {
+        namespace rc = c2pool::v37n::xmr::recompute;
+        rc::LaneInputs li;
+        li.chain_id = cfg.lane_chain;
+        li.h_min = cba_scfg->h_min;
+        li.owed_cap = cba_scfg->resolved_output_cap();
+        li.residual_sink = cba_scfg->residual_sink;
+        li.residual_sink_identity = cba_scfg->residual_sink_identity;
+        li.fixed = cba_scfg->fixed;
+        li.pool_tag = cba_scfg->pool_tag;
+        li.kfair = cba_scfg->kfair;
+        rc::CutInputs ci;
+        auto view = view_at_cut(bk.credit_cut, why, relay_hint(bid));   // the view fold_at_cut just folded
+        if (!view) {
+            if (why.rfind("cut-pending:", 0) != 0) why = "cut-pending: recompute: " + why;
+            ++canon_undecided;
+            return -1;
+        }
+        ci.has_view = settle::assert_ratified_geometry(*view, /*strict=*/true);
+        if (ci.has_view) ci.payees = settle::project(*view);
+        res = rc::verify_lane_coinbase(blob, bk, L, cba_fx->pay_of(), li, ci);
+        if (res.verdict == rc::Verdict::Canonical) { ++canon_ok; return 1; }
+        if (res.verdict == rc::Verdict::Undecidable) { ++canon_undecided; why = "cut-pending: " + res.why; return -1; }
+        ++canon_mismatch;
+        long long sum = 0;
+        for (const auto& [k, v] : bk.payout) { (void)k; sum += v; }
+        canon_debited += sum;
+        std::printf("cba-ALARM recompute_mismatch: h=%llu bid=%s… %s -- NOT the canonical coinbase: payouts DEBITED (%lld piconero, %zu payee(s)), "
+                    "credit DROPPED (identical on every node); on-chain payout{ %s} canonical payout{ %s}\n",
+                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), res.why.c_str(), sum, bk.payout.size(),
+                    amounts_str(bk.payout).c_str(), amounts_str(res.expected_payout).c_str());
+        std::fflush(stdout);
+        return 0;
+    };
     fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
         Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
         if (cut_floor.on_block_at(h, bid))   // CUT-FLOOR: a reorged-out lane block no longer bounds the cut
@@ -2580,6 +2629,24 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (chk_ok) booking_price = drops_fold_price;
             if (chk_ok && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
         }
+        {   // EVERY NODE RECOMPUTES THE LANE COINBASE (rulings 2026-09-29)
+            c2pool::v37n::xmr::recompute::Result rr;
+            const int cv = canon_check(h, bid, chain_blob, bk, node.ledger(), rr, why);
+            if (cv < 0) return false;   // undecided: HELD like a relay repair, never refused
+            if (cv == 0) {
+                credit.clear();         // DROPPED: the block is booked like a withheld block
+                // payout == bk.payout: every on-chain payout (pay-now included) DEBITED
+                ++cut_ok;
+                ++cba_booked;
+                cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: its committed cut still bounds the lane
+                last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " NON-CANONICAL: credit dropped";
+                std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu DEBIT-ONLY (not canonical) payout{ %s}\n",
+                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
+                            bk.digest_index, static_cast<unsigned long long>(bk.total), bk.n_outputs, amounts_str(payout).c_str());
+                std::fflush(stdout);
+                return true;
+            }
+        }
         // ★ RAIN-BACKFILL: the composition HOLDs (cut-pending, retried; past the
         // booking retry bound it is HELD like an undecided relay repair, never
         // refused) until this node holds every raindrop every ready relay peer
@@ -2754,6 +2821,19 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
         if (!cut_floor_gate(h, bid, bk.credit_cut.next_pos, why, false)) return false;   // CUT-FLOOR: the same decided refusal
         if (!fold_at_cut(bk.total, bk.credit_cut, out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
+        if (q.ledger) {   // EVERY NODE RECOMPUTES THE LANE COINBASE: the same verdict on the scratch lineage
+            c2pool::v37n::xmr::recompute::Result rr;
+            const int cv = canon_check(h, bid, sblob, bk, *q.ledger, rr, why);
+            if (cv < 0) return false;   // cut-pending -> undecidable
+            if (cv == 0) {
+                out.credit.clear();     // payouts debited, credit dropped
+                cut_floor_note(h, bid, bk.credit_cut.next_pos);
+                std::printf("converge-debit: h=%llu bid=%s… booked under the SCRATCH lineage DEBIT-ONLY (not canonical) payout{ %s}\n",
+                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), amounts_str(payout).c_str());
+                std::fflush(stdout);
+                return true;
+            }
+        }
         // ★ DROPS-RESTART (defect 3): the scratch lineage books the winner's carried
         // delta too (journalled; the adoption's re-drive books it by block id) --
         // never the pre-DROPS local composition. Not carried yet => undecidable.
@@ -4322,11 +4402,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cut_ok, (unsigned long long)cut_pending, (unsigned long long)cut_miss, (unsigned long long)cut_repaired, (unsigned long long)cut_mismatch, (unsigned long long)cut_absent, (unsigned long long)cut_fold_refused,
                             (unsigned long long)wire_tx, (unsigned long long)wire_rx, (unsigned long long)wire_prefold, (unsigned long long)wire_pending, (unsigned long long)wire_hit, (unsigned long long)wire_mismatch, (unsigned long long)wire_diverged,
                             last_credit_line.c_str());
-                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu | lineage foreign=%llu untagged=%llu malformed=%llu\n",
+                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu | canonical ok=%llu MISMATCH=%llu undecided=%llu debited=%lld | lineage foreign=%llu untagged=%llu malformed=%llu\n",
                             (unsigned long long)cba_fetches, (unsigned long long)cba_booked, (unsigned long long)cba_not_lane, (unsigned long long)cba_refused,
                             (unsigned long long)cba_fetch_failed, (unsigned long long)cba_stale_root,
                             cba_lane_root_unknown, cba_ring.size(), (unsigned long long)cba_max_root_age,
                             (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch,
+                            (unsigned long long)canon_ok, (unsigned long long)canon_mismatch, (unsigned long long)canon_undecided, canon_debited,
                             (unsigned long long)cba_lineage_other[1], (unsigned long long)cba_lineage_other[2], (unsigned long long)cba_lineage_other[3]);
                 std::printf("  cba-payee: learned=%llu resolved=%llu pending=%llu unresolved=%llu (REJOIN-PAYEE: outputs resolved against the payees of the block's own credit cut)\n",
                             (unsigned long long)cut_payee_learned, (unsigned long long)cut_payee_resolved,
