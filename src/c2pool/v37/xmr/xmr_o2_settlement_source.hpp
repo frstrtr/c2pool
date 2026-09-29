@@ -243,10 +243,17 @@ public:
     //                 provider's first guess is base_reward + Σ selected fees).
     //                 0 => ctx.budget().
     //   age_of      : REQUIRED for KFairSource::X6Allocate, ignored otherwise.
+    //   owed_budget : the W4Propose owed pass budget, when the caller already
+    //                 knows it. Unset (every builder) => derived from
+    //                 reward_hint, as always. The receive-side recompute
+    //                 (xmr_coinbase_recompute.hpp) sets it to B - Σfixed from
+    //                 the block's committed V37N base B, which reproduces the
+    //                 builder's takes without the builder's mempool.
     static std::unique_ptr<XmrOwedSettlementSource>
     build(const OwedLedger& ledger, const PayOfFn& pay_of, const XmrCoinbaseContext& ctx,
           std::uint64_t reward_hint, std::string* why,
-          KFairSource source = KFairSource::W4Propose, const AgeOfFn& age_of = {})
+          KFairSource source = KFairSource::W4Propose, const AgeOfFn& age_of = {},
+          std::optional<std::uint64_t> owed_budget = std::nullopt)
     {
         auto refuse = [&](const std::string& msg) -> std::unique_ptr<XmrOwedSettlementSource> {
             if (why) *why = msg;
@@ -327,13 +334,13 @@ public:
             // fee model S2: a folded donation output's minimum is NOT reserved
             // here -- X6 sources it from the residual, else from the LARGEST
             // owed output (allocate_exact_sum), so W4 proposes over it too.
-            const std::uint64_t owed_budget =
+            const std::uint64_t owed_budget_w4 = owed_budget ? *owed_budget :
                 reward_hint - fixed_sum + (sink_folds ? ctx.fixed.back().amount : 0);
             auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
                                                   : std::numeric_limits<std::uint64_t>::max();
             };
-            OwedLedger::Proposal prop = ledger.propose_coinbase(owed_budget, cap_owed,
+            OwedLedger::Proposal prop = ledger.propose_coinbase(owed_budget_w4, cap_owed,
                                                                 payable_ref, h_min_of);
             in.owed.reserve(prop.outs.size());
             for (std::size_t i = 0; i < prop.outs.size(); ++i) {
