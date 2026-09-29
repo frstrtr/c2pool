@@ -1584,6 +1584,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::printf("REFUSED: %s\n", refusal.c_str());
         return 2;
     }
+    if (const std::string refusal = settlement_fee_model_refusal(cfg); !refusal.empty()) {
+        std::printf("REFUSED: %s\n", refusal.c_str());
+        return 2;
+    }
     if (const std::string refusal = solo_refusal(cfg); !refusal.empty()) {
         std::printf("REFUSED: %s\n", refusal.c_str());
         return 2;
@@ -3399,6 +3403,23 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ++shape_ok;
                 return true;
             });
+        // BOOKING-POINT GATE (every node recomputes the lane coinbase, rulings
+        // 2026-09-29). Every node books a lane block at height T with its
+        // finalize cursor at T - 1 - D_conf (R6), and the R4 booking gate lets
+        // the cursor stand there only once every chain block at or below T - 1
+        // is booked or decided. So "cursor == T - 1 - D_conf" is exactly the
+        // state every receiver recomputes this template's coinbase from. Any
+        // other state (the tip's lane block still unbooked or HELD: the #1861
+        // H/H+1 double pay; a lagging or restarting node) holds the template
+        // instead of serving a coinbase every node would book debit-only.
+        provider.set_ready_gate([&](std::uint64_t T, std::string* w) -> bool {
+            const std::uint64_t want = c2pool::v37n::xmr::recon::builder_cut(T, cfg.d_conf);
+            const std::uint64_t cur  = node.finalize_driver().cursor_height();
+            if (cur == want) return true;
+            if (w) *w = "the finalize cursor is at " + std::to_string(cur) + ", the booking point of height " + std::to_string(T) +
+                        " is " + std::to_string(want) + (cur < want ? " (the tip's lane blocks are not all booked yet)" : "");
+            return false;
+        });
 
         // ── GOOD-CITIZEN ────────────────────────────────────────────────────
         // The operator hard rule: a mined block ALWAYS carries the pool's valid
@@ -4455,10 +4476,11 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
             }
             if (!last_shape.empty())
-                std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu)\n",
+                std::printf("  coinbase: n_tx=%zu %s (gate ok=%llu refused=%llu booking-point held=%llu)\n",
                             last_selected_tx, last_shape.c_str(),
                             static_cast<unsigned long long>(shape_ok),
-                            static_cast<unsigned long long>(shape_refused));
+                            static_cast<unsigned long long>(shape_refused),
+                            static_cast<unsigned long long>(provider.ready_gate_held()));
             if (!native) {
                 // GOOD-CITIZEN headline for the daemon arm: what monerod offered
                 // on the last poll, what the served template selected, and how

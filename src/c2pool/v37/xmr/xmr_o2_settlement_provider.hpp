@@ -142,6 +142,11 @@ struct SettlementSnapshot {
     std::size_t                              n_outputs = 0;
     std::size_t                              n_tx = 0;
     bool                                     valid = false;
+    // The OwedLedger::ledger_seq() the template was assembled at. Every node
+    // recomputes the lane coinbase from the ledger at the block's booking
+    // point (xmr_coinbase_recompute.hpp), so a template must never outlive
+    // the ledger state it was built from: refresh() re-keys on it too.
+    std::uint64_t                            ledger_seq = 0;
 
     // --- C4: which arm produced this template, and under which epoch --------
     // Carried so the parity oracle can attribute a diff to an arm without
@@ -190,6 +195,16 @@ public:
     // xmr_settlement_coinbase_shape.hpp for the gate the daemon installs.
     using ShapeGate = std::function<bool(const asm_::AssembledTemplate&, std::string*)>;
 
+    // BOOKING-POINT GATE (every node recomputes the lane coinbase, operator
+    // rulings 2026-09-29). A block at height T is recomputed by every node
+    // from its ledger with the finalize cursor at T - 1 - D_conf (R6), so a
+    // template for T may be assembled only from exactly that state: a builder
+    // that has not yet booked the tip's lane block (the #1861 H/H+1 case)
+    // would serve a coinbase every node books debit-only. The gate answers
+    // "is the ledger at the booking point of height T?"; false (+ *why) holds
+    // the template (refresh() fails, the previous job stays served).
+    using ReadyGate = std::function<bool(std::uint64_t height, std::string*)>;
+
     // --- C4 seam constructor -------------------------------------------------
     // `source` is whichever arm the ArmResolver picked. The provider does not
     // own it and does not choose it: an arm that stops being ready is the
@@ -232,6 +247,9 @@ public:
 
     // MAIN THREAD, before the first refresh(). Not settable while serving.
     void set_shape_gate(ShapeGate g) { m_shape_gate = std::move(g); }
+    // MAIN THREAD, before the first refresh(). See ReadyGate.
+    void set_ready_gate(ReadyGate g) { m_ready_gate = std::move(g); }
+    std::uint64_t ready_gate_held() const { return m_gate_held.load(); }
 
     // MAIN THREAD, before the first refresh(). GOOD-CITIZEN: feed the selector's
     // chosen tx set into the block VERBATIM (bypass the p2pool 5-s age gate and
@@ -267,9 +285,9 @@ public:
     std::uint64_t finder_variants() const { return m_variants_built.load(); }
 
     // D2 (minority converges to majority): the owed ledger was re-lineaged in
-    // place. refresh() re-keys on (height, prev_id, backlog) only, so the cached
-    // template would keep committing the ABANDONED owed_digest until the next
-    // tip; drop it so the next refresh() assembles against the converged ledger.
+    // place. refresh() re-keys on (height, prev_id, backlog, ledger_seq); a
+    // re-lineaged ledger can land on the same seq, so drop the cached template
+    // and let the next refresh() assemble against the converged ledger.
     void invalidate() {
         std::lock_guard<std::mutex> lk(m_mtx);
         m_cur.valid = false;
@@ -304,6 +322,15 @@ public:
         node::MinerData md = std::move(*got);
         if (!md.valid()) { set_error("miner data source: invalid miner_data"); m_failures.fetch_add(1); return false; }
 
+        if (m_ready_gate) {   // BOOKING-POINT GATE: never a template from a ledger state receivers will not hold
+            std::string gw;
+            if (!m_ready_gate(md.height, &gw)) {
+                set_error("lane template held: " + (gw.empty() ? std::string("the ledger is not at the booking point") : gw));
+                m_gate_held.fetch_add(1);
+                return false;
+            }
+        }
+
         const native::MinerDataEpoch ep = m_src->epoch();
         node::Hash md_prev = md.prev_id;
         // EPOCH UNCHANGED => keep the existing template BYTE-FOR-BYTE. This is
@@ -312,7 +339,10 @@ public:
         // miner is already grinding (its shares would then miss on the daemon's
         // re-hash — "Low diff"). Only reassemble when the epoch moves.
         //
-        // The epoch is (height, prev_id, backlog_seq). The first two ARE the old
+        // The epoch is (height, prev_id, backlog_seq), plus the ledger_seq the
+        // template was assembled at (a coinbase is recomputed by every node from
+        // the ledger at its booking point, so it never outlives that state).
+        // The first two ARE the old
         // tip rule, character for character. The third is the good-citizen
         // term: BOTH arms advance it when the offered tx set moved under an
         // unchanged tip, rate-limited to one admission per backlog_refresh_s
@@ -329,7 +359,8 @@ public:
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_cur.valid && m_cur.height == md.height && m_cur.prev_id == md_prev
-                && m_cur.epoch.backlog_seq == ep.backlog_seq) {
+                && m_cur.epoch.backlog_seq == ep.backlog_seq
+                && m_cur.ledger_seq == m_ledger.ledger().ledger_seq()) {
                 m_last_error.clear();
                 m_refreshes.fetch_add(1);
                 return true;
@@ -561,6 +592,7 @@ private:
         for (const auto& t : md.tx_backlog) fees += t.fee;
 
         XmrParentContext parent = XmrParentContext::from_miner(xmr_md, base_reward, fees);
+        snap.ledger_seq = m_ledger.ledger().ledger_seq();
 
         std::string ss_why;
         std::unique_ptr<XmrOwedSettlementSource> src = build_settlement_source(
@@ -633,6 +665,8 @@ private:
     native::IMinerDataSource*                 m_src = nullptr;
     RefreshPump                               m_pump;
     ShapeGate                                 m_shape_gate;
+    ReadyGate                                 m_ready_gate;
+    std::atomic<std::uint64_t>                m_gate_held{0};
     std::size_t                               m_bind_size = 0;   // SEAM-1
     asm_::X6SettlementSource::ExtraNonceBindFn m_bind;           // SEAM-1
     bool                                      m_take_mempool_as_given = false;

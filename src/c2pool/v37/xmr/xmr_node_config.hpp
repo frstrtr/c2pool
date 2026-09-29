@@ -547,6 +547,24 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
 }
 
 // ---------------------------------------------------------------------------
+// FEE MODEL v1 IS MANDATORY for the v37 settlement coinbase on MAINNET
+// (operator ruling 2026-09-29). Every node recomputes every lane coinbase
+// (xmr_coinbase_recompute.hpp). With the fee model OFF the exact-sum residual
+// is paid to a per-node --residual-sink-* wallet: no other node can map that
+// output (a builder's block is unmapped everywhere else), and the residual is
+// the building node's own income. Fee model v1 pays it to the compiled-in
+// protocol donation output, the same owner on every node. Test networks keep
+// the OFF mode for rigs that share one sink.
+// ---------------------------------------------------------------------------
+inline std::string settlement_fee_model_refusal(const XmrNodeConfig& c) {
+    if (c.coinbase != CoinbaseMode::V37Settlement || c.network != MoneroNetwork::Mainnet) return {};
+    if (c.lane_params.fee.enabled && c.lane_params.fee.version == 1) return {};
+    return "--coinbase v37 on mainnet needs --fee-model v1: every node recomputes every lane coinbase, and "
+           "with the fee model off the exact-sum residual goes to this node's own --residual-sink-* wallet, "
+           "which no other node can derive (fee model v1 pays it to the protocol donation output)";
+}
+
+// ---------------------------------------------------------------------------
 // --native-solo's OWN preconditions, kept as a pure function for the same
 // reason arm_order_refusal() is: the thing the daemon refuses on and the thing
 // the KAT pins must be one piece of code.

@@ -36,6 +36,7 @@
 //   R11 the booking of a MISMATCH (ruling 2) on two receivers: payouts
 //       debited, credit dropped, one owed_digest, the double pay carried as
 //       a debt.
+//   R12 ruling 1: --coinbase v37 on mainnet refuses without --fee-model v1.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -55,6 +56,7 @@
 #include "c2pool/v37/xmr/xmr_fee_model.hpp"
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
+#include "c2pool/v37/xmr/xmr_node_config.hpp"
 #if __has_include("c2pool/v37/xmr/xmr_coinbase_recompute.hpp")
 #include "c2pool/v37/xmr/xmr_coinbase_recompute.hpp"
 #define RECOMPUTE_FIX 1
@@ -459,6 +461,24 @@ void r11_debit_only_booking() {
     for (const auto& p : w.cut) credited += R1.effective_owed(p.id) + (v1.bk.payout.count(p.id) ? v1.bk.payout.at(p.id) : 0);
     CHECK(credited == 0, "the block's credit is DROPPED: its cut payees are debited exactly the pay-now they received (net %lld)", credited);
 }
+
+// R12: ruling 1 -- fee model v1 is mandatory for --coinbase v37 on mainnet
+// (the one refusal the daemon applies, as a pure function).
+void r12_fee_model_mandatory() {
+    std::printf("== R12. fee model v1 is mandatory for --coinbase v37 on mainnet ==\n");
+    using c2pool::v37n::xmr::XmrNodeConfig;
+    using c2pool::v37n::xmr::CoinbaseMode;
+    using c2pool::v37n::xmr::MoneroNetwork;
+    XmrNodeConfig c;
+    c.network = MoneroNetwork::Mainnet; c.coinbase = CoinbaseMode::V37Settlement;
+    CHECK(!c2pool::v37n::xmr::settlement_fee_model_refusal(c).empty(), "mainnet + --coinbase v37 + fee model OFF: REFUSED");
+    c.lane_params.fee = ::v37::FeeModelGate::for_version(1);
+    CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(c).empty(), "mainnet + --coinbase v37 + --fee-model v1: allowed");
+    XmrNodeConfig t; t.network = MoneroNetwork::Regtest; t.coinbase = CoinbaseMode::V37Settlement;
+    CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(t).empty(), "regtest rigs keep the OFF mode (one shared sink)");
+    XmrNodeConfig a; a.network = MoneroNetwork::Mainnet; a.coinbase = CoinbaseMode::MonerodTemplate;
+    CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(a).empty(), "option A (monerod template) is not the settlement coinbase");
+}
 #else
 void suite_base() {
     std::printf("== BASE: no recompute on this tree ==\n");
@@ -482,6 +502,7 @@ int main() {
     r9_paynow_misdirected();
     r10_stale_state();
     r11_debit_only_booking();
+    r12_fee_model_mandatory();
 #else
     suite_base();
 #endif
