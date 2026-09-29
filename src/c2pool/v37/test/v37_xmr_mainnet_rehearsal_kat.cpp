@@ -131,7 +131,8 @@ o2::PayOfFn pay_of_map(const std::map<::v37::bytes32, ::v37::ScriptRef>& m) {
 // SPEND-COST FLOOR (payout-threshold.md §2-§3), as the daemon runs it; M7 turns it on.
 bool g_spend_floor = false;
 std::uint64_t g_cap_at = 0; std::uint32_t g_cap = 0;
-bool g_no_seeds = false;   // M7b: a fresh pool, no seeded owed balances   // M8: the block at g_cap_at is built with this output cap
+bool g_no_seeds = false;   // M7b: a fresh pool, no seeded owed balances
+std::uint64_t g_reorg_at = 0;   // M9: a lane block at this height is booked by nodes 0 and 1, then reorged out   // M8: the block at g_cap_at is built with this output cap
 
 struct LaneWorld {
     std::vector<Payee> miners;                    // m0..m5 (+ tiny miners, M7)
@@ -297,6 +298,7 @@ struct Run {
     std::uint64_t blocks = 0;
     std::uint64_t min_payout = ~std::uint64_t{0}, min_floor = ~std::uint64_t{0};   // smallest non-donation output / smallest c seen
     std::size_t below_floor = 0;                                                     // outputs below their own block's c
+    std::size_t reorg_booked = 0;                                                    // M9: bookings of the reorged-out block
     std::vector<Node> nodes;
 };
 
@@ -336,6 +338,21 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
     }
     std::map<std::uint64_t, std::string> bid_at;
     for (std::uint64_t h = 1; h <= H + kD; ++h) {
+        if (h == g_reorg_at) {
+            // M9: a competing lane block at h. Nodes 0 and 1 book it; node 2 saw
+            // the other branch first and never does. It is then reorged out
+            // (pre-settle) on 0 and 1, and the loop below books the winner.
+            Node& other = run.nodes[(h + 1) % 3];
+            const Block ob = build(other.L, pay_of_map(other.booked), W, h);
+            if (ob.ok) {
+                const std::string obid = "orphan-" + std::to_string(h);
+                for (std::size_t i = 0; i < 2; ++i) {
+                    const Booked r = book(run.nodes[i], ob, W, h, obid);
+                    if (r.v == rc::Verdict::Canonical) ++run.reorg_booked;
+                }
+                for (std::size_t i = 0; i < 2; ++i) { run.nodes[i].L.on_block_orphaned(obid, {}); run.nodes[i].note(); }
+            }
+        }
         if (h <= H) {
             Node& builder = run.nodes[h % 3];
             const st::OwedLedger& bl = (lag_at.count(h) && builder.history.size() >= 1) ? builder.history.back() : builder.L;
@@ -543,6 +560,25 @@ void m7b_fresh_pool() {
     CHECK(r.donation_paid == 24, "the donation output carries only the 1-piconero marker per block (%lld)", r.donation_paid);
 }
 
+void m9_reorg() {
+    std::printf("== M9. a lane block is reorged out after two of three nodes booked it ==\n");
+    g_spend_floor = true;
+    LaneWorld W;
+    for (int i = 0; i < 40; ++i) { const Payee p = payee(static_cast<std::uint8_t>(120 + i)); W.miners.push_back(p); W.universe[p.id] = p.ref; }
+    g_reorg_at = 12;
+    Run r = simulate(W, 30);
+    g_reorg_at = 0;
+    LaneWorld W2;
+    for (int i = 0; i < 40; ++i) { const Payee p = payee(static_cast<std::uint8_t>(120 + i)); W2.miners.push_back(p); W2.universe[p.id] = p.ref; }
+    Run base = simulate(W2, 30);
+    g_spend_floor = false;
+    CHECK(r.reorg_booked == 2, "the losing block was canonical and booked on nodes 0 and 1 (%zu)", r.reorg_booked);
+    CHECK(r.canonical == 30 && r.verdict_splits == 0 && r.split_heights == 0,
+          "after the reorg every node books every later block the same way: one verdict, one owed_digest at every height");
+    CHECK(r.nodes[0].L.owed_digest() == base.nodes[0].L.owed_digest(),
+          "the final ledger equals a run where the losing block never existed (rotation, redistribution and credit all undone)");
+}
+
 void m8_claimed_full() {
     std::printf("== M8. a builder claims too few output slots ==\n");
     g_spend_floor = true;
@@ -606,6 +642,7 @@ int main() {
     m6_thief_pays_local_ref();
     m7_spend_floor();
     m7b_fresh_pool();
+    m9_reorg();
     m8_claimed_full();
     m5_gate_and_config();
 #else
