@@ -103,6 +103,7 @@ struct LaneInputs {
     std::vector<x6::FixedOutput> fixed;         // fee model v1: {donation_marker}
     std::optional<::v37::bytes32> pool_tag;     // V37P (POOL-LINEAGE)
     o2::KFairSource  kfair = o2::KFairSource::W4Propose;
+    bool             kfair_salted_ties = false;  // #1867: equal-age cohorts by a hash of the parent id
 };
 
 // What the block's booking already established.
@@ -194,6 +195,7 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
     ctx.fixed                = lane.fixed;
     ctx.h_min                = lane.h_min;
     ctx.output_cap           = lane.owed_cap;
+    ctx.kfair_salted_ties    = lane.kfair_salted_ties;   // the salt is the block's own prev_id
     ctx.has_credit_cut       = bk.has_credit_cut;
     ctx.credit_cut           = bk.credit_cut;
     if (lane.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *lane.pool_tag; }

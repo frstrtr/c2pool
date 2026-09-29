@@ -1090,6 +1090,67 @@ public:
         return prop;
     }
 
+    // SALTED TIE-BREAK (external review finding 08, #1867). Every key that
+    // turns positive at one FINALIZE is armed at the same bin_height, so ties on
+    // first_eligible are the normal case, and the unsalted secondary key (the
+    // raw identity, ASC) lets a miner who grinds a low identity win every tie
+    // cohort for good. This overload keeps first_eligible as the primary key
+    // and orders each equal-age cohort by sha256d("V37T" || salt || key)
+    // instead. The salt is a value the builder cannot choose and nobody can
+    // predict before the parent block exists (the XMR builder passes the
+    // parent block id). Take rules (count cap, budget stop, h_min CARRY, amount
+    // bound) are exactly propose_coinbase's. Builder-side only: the order is
+    // not committed in owed_digest, and the generic W5 path does not call it.
+    template <typename PayOf, typename HminOf>
+    Proposal propose_coinbase_salted(u64 block_reward, unsigned slot_budget_C,
+                                     const bytes32& salt, PayOf&& pay_of,
+                                     HminOf&& h_min_of) const {
+        Proposal prop;
+        u64 budget = block_reward;
+        bool stop = false;
+        // Returns false once a stop condition (count cap / budget) is reached.
+        auto take = [&](const bytes32& k) -> bool {
+            if (slot_budget_C != 0 && prop.outs.size() >= slot_budget_C) return false;
+            if (budget == 0) return false;
+            long long owed = m_eo_index.value(k);
+            if (owed <= 0) return true;
+            u64 amt = std::min<u64>(static_cast<u64>(owed), budget);
+            ScriptRef pay = pay_of(k);
+            if (amt < h_min_of(pay.kind)) return true;   // sub-floor: CARRY
+            budget -= amt;
+            prop.outs.push_back(ProposedOut{k, pay, amt});
+            return true;
+        };
+        auto salted = [&](const bytes32& k) {
+            std::vector<std::uint8_t> b = {'V', '3', '7', 'T'};
+            b.insert(b.end(), salt.begin(), salt.end());
+            b.insert(b.end(), k.begin(), k.end());
+            return ::v37::sha256d(b);
+        };
+        std::vector<std::pair<bytes32, bytes32>> cohort;   // (salted, key)
+        u64 cohort_fe = 0;
+        auto flush = [&]() {
+            std::sort(cohort.begin(), cohort.end());
+            for (const auto& [h, k] : cohort) {
+                (void)h;
+                if (!take(k)) { stop = true; break; }
+            }
+            cohort.clear();
+        };
+        m_eo_index.for_each_eligible([&](const bytes32& k) -> bool {
+            const u64 fe = fe_at(k);
+            if (!cohort.empty() && fe != cohort_fe) {
+                flush();
+                if (stop) return false;
+            }
+            cohort_fe = fe;
+            cohort.emplace_back(salted(k), k);
+            return true;
+        });
+        if (!stop && !cohort.empty()) flush();
+        return prop;
+    }
+
     // The §4.5 OWED commitment over the FINALIZED partition only (pending keys
     // are re-derivable from the spine + FOUND set). Domain-separated sha256d,
     // sorted by key: "V37Q" || key || i64 finalW || u64 first_eligible.
