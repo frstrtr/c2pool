@@ -242,11 +242,10 @@ struct CoinbaseInputs {
 
     // --- SPEND-COST FLOOR (payout-threshold.md §3; off => master behaviour) ---
     // c = spend_floor(budget()). The owed pass pays no balance below c. Pay-now
-    // pays, in the output cap's free slots, the payees with E_b >= c (largest
-    // first, each keeping a pro-rata share >= c), then the dust (E_b < c, largest
-    // first) while the smallest admitted payee >= c keeps a share >= c. Every
-    // admitted payee gets the same fraction of its E_b. The cash of the payees
-    // not admitted is REDISTRIBUTED pro rata to the admitted payees and taken
+    // pays every payee that has a free output slot, oldest first when they do
+    // not all fit (PayNowEntry::age, then ::tie), each the same fraction of its
+    // E_b (all of it unless the owed pass left less). The cash of the payees
+    // without a slot is REDISTRIBUTED pro rata to the admitted payees and taken
     // off the credit of those it came from (allocate_exact_sum's credit_delta):
     // never an advance. Pay-now never fails the build for want of a slot.
     bool           spend_floor = false;

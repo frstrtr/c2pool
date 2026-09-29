@@ -69,9 +69,15 @@ into one transaction for pool members is a later stage (§7).
   The size of E_b never decides. A payee whose cash was redistributed has no
   balance, so it is the youngest again next block, and the salted tie rotates
   who waits.
-* **Short pool** (the owed pass paid old debts first): every admitted payee
-  gets the same fraction of its E_b. Dust is admitted while the smallest
-  admitted payee ≥ c still gets at least `c`.
+* **Short pool** (the owed pass paid old debts first): every payee with a
+  slot is still paid, and each gets the same fraction of its E_b. The rest
+  stays its balance, which the owed queue pays later: a partial payment, not
+  an advance.
+* **No packing problem.** A payment can be any amount, so filling the slots in
+  order and splitting the pool pro rata uses every slot and every piconero.
+  Only indivisible items need a knapsack. `v37_xmr_spend_floor_kat` F2c: a
+  pool holding half of what was credited pays all 12 payees half each, and
+  only the marker is left.
 * **Payees that are not admitted** (no slot left): their cash is
   **redistributed** to the admitted payees pro rata, and it comes off their own
   credit for this block. This is P2Pool's rule for outputs that do not fit.
