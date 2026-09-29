@@ -1,4 +1,4 @@
-# XMR lane: the spend-cost floor and crumbs
+# XMR lane: the spend-cost floor and paying dust
 
 Status: **§2, §3, §6 and §6a implemented** (the daemon turns them on from the
 lane's genesis); §5 (dust decay) is next. Operator discussion 2026-09-29,
@@ -11,9 +11,10 @@ enforces it.
 ## 1. Goal
 
 Each lane block distributes its whole reward to the miners of its window, in
-its own coinbase, and creates no payout that is not worth spending. Nothing
-is random, nothing is a pool-chosen constant: the one bound comes from Monero's
-consensus fee rule.
+its own coinbase, and records no debt it can avoid. Nothing is random,
+nothing is a pool-chosen constant: the one bound comes from Monero's consensus
+fee rule, and it decides only who goes first when the block has no room for
+everyone.
 
 ## 2. The floor c: the cost to spend one output
 
@@ -52,27 +53,35 @@ minimum payout is about 0.00027 XMR.
 
 ## 3. Payouts in a lane block
 
-* **Payees with E_b ≥ c** are paid their E_b in full, in this block (pay-now),
-  as today.
-* **Crumbs: payees with E_b < c** are credited their E_b but not paid. It
-  stays in their balance, and they are paid once the balance reaches `c`.
-* **The crumbs' cash is advanced in the same block.** It is spread pro rata
-  over the payees paid in this block, at most their own E_b each. Their
-  balance goes negative by that advance, and their next credits repay it.
-  The block is distributed in full, and no cash goes to the donation.
-* **Why this cannot grow.** A crumb balance is at most `c` per miner. The
-  advances mirror the crumbs exactly, so every block pays out what it
-  credits. When a crumb balance reaches `c` and is paid, that block's other
-  payees receive the same amount less. The two cancel.
-* **Too few output slots.** When the output cap cannot hold every payee at or
-  above `c`, the payees that fit are paid in a deterministic order: largest
-  E_b first, ties by the salted key. The rest become balances like crumbs,
-  and their cash is advanced the same way. Cash left after the advance cap
-  (a pool just started, with nothing to advance against) goes to the
-  donation output. It is disclosed, and it is bounded by one block.
+Ruling (2026-09-29, revised): **pay while there is room, dust included.**
+Accumulating dust as a debt only defers a payment the block could make now.
+Dust outputs are allowed to pile up on chain. Consolidating them for free
+into one transaction for pool members is a later stage (§7).
+
+* **Everyone fits (the normal case):** every payee in the window, dust
+  included, is paid its exact E_b in this block. No balance, no advance.
+  Rehearsal M7b: a fresh pool with 40 dust miners, 24 blocks, every balance
+  is 0 except the 1-piconero donation marker.
+* **Order when the block has no room for everyone:** payees with E_b ≥ c
+  first, then the dust, each tier largest E_b first (ties: identity ASC).
+* **Short pool** (the owed pass paid old debts first): every admitted payee
+  gets the same fraction of its E_b. Dust is admitted while the smallest
+  admitted payee ≥ c still gets at least `c`.
+* **Payees that are not admitted** (no slot left) keep their E_b as a
+  balance. Their cash is **advanced in the same block**, pro rata over the
+  admitted payees ≥ c, at most their own E_b each. Their balance goes
+  negative by that advance, and their next credits repay it. The block is
+  distributed in full.
+* **Why this cannot grow.** The advances mirror the waiting balances
+  exactly, so every block pays out what it credits. When a waiting balance
+  is paid later, that block's other payees receive the same amount less. The
+  two cancel.
+* **Cash left after the advance cap** goes to the donation output. That
+  happens only when the credited work is a fraction of the reward, as in a
+  pool's first blocks. It is disclosed, and it is bounded by one block.
 * **The owed queue** (K_fair, oldest first) stays as the safety net for
-  balances: crumbs that reached `c`, payees that did not fit, a restart,
-  DROPS carries and the seeds. In steady state it is nearly empty.
+  balances at or above `c`: payees that did not fit, a restart, DROPS carries
+  and the seeds. In steady state it is empty.
 * **The output cap is the wire ceiling (2700), fixed.** The coinbase takes its
   room before any transaction: the native trim reserves it, and the template's
   own pick counts the miner tx first. The transactions fill what is left of
@@ -129,6 +138,11 @@ today, and re-enters at the back when a new unpaid remainder appears.
 ## 7. Carried forward
 
 * **#1871 pay-now FILL** is superseded: §3 already places every piconero.
+* **Later: free consolidation of dust outputs.** Pool members' small
+  coinbase outputs would be merged, at no fee, into one transaction included
+  by pool builders. Monero accepts any fee inside a block
+  (`fee_good = kept_by_block || check_fee`). This rides the 0-fee
+  pool-member transaction task.
 * **Postponed:** 0-fee pool-member transactions included by pool builders
   (Monero accepts any fee inside a block: `fee_good = kept_by_block ||
   check_fee`), which would lower `c` for members. Also postponed: a weighted
@@ -139,7 +153,7 @@ today, and re-enters at the back when a new unpaid remainder appears.
 | rule | where | pinned by |
 |---|---|---|
 | `c` | `x6::spend_floor`, `fee_per_byte_at_floor`, `kInputWeight` (`src/impl/xmr/settle/xmr_coinbase.*`) | `v37_xmr_spend_floor_kat` F1 |
-| crumbs, the advance, slots, the owed floor | `allocate_exact_sum` under `CoinbaseInputs::spend_floor` | F2-F4, F6; rehearsal M7 |
+| dust, the advance, slots, the owed floor | `allocate_exact_sum` under `CoinbaseInputs::spend_floor` | F2-F4, F6; rehearsal M7, M7b |
 | the receive side | `paynow::net_booking(..., spend_floor)`: net of min(credit, paid) | F5 |
 | seniority from the floor, rotation | `OwedLedgerRules` (`w4_settlement.hpp`), `XmrNodeConfig::ledger_*` | F7-F9; rehearsal M7 |
 | the fixed output cap | `XmrBlockAssembler::build` (cap = wire ceiling under the floor); recompute accepts only it | rehearsal M8 |

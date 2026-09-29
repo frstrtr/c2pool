@@ -271,10 +271,13 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
             std::vector<std::uint64_t> eb;
             eb.reserve(ents.size());
             for (const auto& e : ents) eb.push_back(e.eb);
+            std::vector<std::uint64_t> alloc;
             if (in.spend_floor) {
-                // SPEND-COST FLOOR: who is paid now, and at weight 2*E_b (E_b plus
-                // at most E_b of advance). A payee needs a new slot unless it is the
-                // residual sink or already has an owed output to merge into.
+                // SPEND-COST FLOOR (payout-threshold.md §3). Who is paid now: the
+                // payees with E_b >= c first, then the dust (E_b < c) while slots and
+                // cash last, each tier largest E_b first (ties: identity ASC). A payee
+                // needs a new slot unless it is the residual sink or already has an
+                // owed output to merge into.
                 auto needs_slot = [&](const PayNowEntry& e) {
                     if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink) return false;
                     for (const auto& o : res)
@@ -283,32 +286,56 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                 };
                 std::vector<std::size_t> order;
                 for (std::size_t i = 0; i < ents.size(); ++i)
-                    if (ents[i].eb >= floor_c) order.push_back(i);
-                std::stable_sort(order.begin(), order.end(),
-                                 [&](std::size_t a, std::size_t b) { return ents[a].eb > ents[b].eb; });   // largest E_b first; ties: identity ASC
-                // Admit in that order while (a) a slot is free and (b) the pool
-                // still pays the newcomer at least c once it is shared pro rata:
-                // pool * w_i / Σw >= c for the smallest admitted, i.e. every
-                // admitted payee. Admission stops at the first that fails; the
-                // rest wait as balances, so no output below c is ever emitted.
-                std::vector<std::uint64_t> w(ents.size(), 0);
+                    if (ents[i].eb > 0) order.push_back(i);
+                std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                    const bool ga = ents[a].eb >= floor_c, gb = ents[b].eb >= floor_c;
+                    if (ga != gb) return ga;
+                    return ents[a].eb > ents[b].eb;
+                });
+                // Admission. Every admitted payee gets the same fraction of its E_b:
+                // all of it when the pool covers them, pool / Σeb when the owed pass
+                // left less. A payee >= c is admitted while its own share stays >= c;
+                // dust is admitted while the smallest admitted payee >= c still gets
+                // >= c (with no payee >= c: while its share is non-zero). The first
+                // payee that fails ends admission; a payee without a slot is
+                // skipped. Whoever is not admitted keeps E_b as a balance.
+                std::vector<std::uint64_t> take(ents.size(), 0);
                 std::size_t free_slots = cap_owed > n_slots ? cap_owed - n_slots : 0;
-                unsigned __int128 sum_w = 0;
+                unsigned __int128 sum = 0;
+                std::uint64_t min_big = 0;                    // the smallest admitted E_b >= c
                 for (const std::size_t i : order) {
                     const bool slot = needs_slot(ents[i]);
-                    if (slot && free_slots == 0) continue;   // no slot: it waits, as a balance
-                    const std::uint64_t wi = ents[i].eb > std::numeric_limits<std::uint64_t>::max() / 2
-                                                 ? std::numeric_limits<std::uint64_t>::max() : 2 * ents[i].eb;
-                    const unsigned __int128 s2 = sum_w + wi;
-                    const bool full = static_cast<unsigned __int128>(pool) >= s2;   // every admitted gets its whole weight
-                    if (!full && static_cast<unsigned __int128>(pool) * wi / s2 < floor_c) break;
+                    if (slot && free_slots == 0) continue;
+                    const unsigned __int128 s2 = sum + ents[i].eb;
+                    const bool covered = static_cast<unsigned __int128>(pool) >= s2;
+                    const bool big = ents[i].eb >= floor_c;
+                    if (!covered) {
+                        const std::uint64_t binding = big ? ents[i].eb : min_big;
+                        if (binding ? static_cast<unsigned __int128>(pool) * binding / s2 < floor_c
+                                    : static_cast<unsigned __int128>(pool) * ents[i].eb / s2 == 0) break;
+                    }
                     if (slot) --free_slots;
-                    w[i] = wi;
-                    sum_w = s2;
+                    if (big) min_big = ents[i].eb;           // descending within the tier
+                    take[i] = ents[i].eb;
+                    sum = s2;
                 }
-                eb = std::move(w);
+                // Each admitted payee gets its E_b (pro rata when the pool is short).
+                // The cash of the payees not admitted is ADVANCED to the admitted
+                // payees >= c, pro rata, at most their own E_b; the rest stays in the
+                // residual.
+                alloc = paynow_split(pool, take);
+                std::uint64_t given = 0;
+                for (const std::uint64_t a : alloc) given += a;
+                if (pool > given) {
+                    std::vector<std::uint64_t> adv_w(ents.size(), 0);
+                    for (std::size_t i = 0; i < ents.size(); ++i)
+                        if (take[i] >= floor_c && take[i] > 0) adv_w[i] = take[i];
+                    const std::vector<std::uint64_t> adv = paynow_split(pool - given, adv_w);
+                    for (std::size_t i = 0; i < ents.size(); ++i) alloc[i] += adv[i];
+                }
+            } else {
+                alloc = paynow_split(pool, eb);
             }
-            const std::vector<std::uint64_t> alloc = paynow_split(pool, eb);
             for (std::size_t i = 0; i < ents.size(); ++i) {
                 if (alloc[i] == 0) continue;
                 const PayNowEntry& e = ents[i];

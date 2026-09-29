@@ -12,9 +12,9 @@
 //   F1  c: Monero's consensus fee per byte at the 300 kB fee-median floor
 //       (Blockchain::get_dynamic_base_fee arithmetic) times one RingCT input,
 //       quantized up; known values, monotone in the reward.
-//   F2  pay-now with the floor: payees below c are crumbs (paid 0, keep their
-//       E_b); their cash is advanced pro rata to the paid payees, at most
-//       their own E_b; exact sum; only the donation marker is left over.
+//   F2  with room in the block every payee, dust included, is paid its exact
+//       E_b; F2b without room the dust waits as a balance and its cash is
+//       advanced pro rata to the payees >= c, at most their own E_b.
 //   F3  too few output slots: the largest payees get the slots, the rest
 //       wait; no CapTooSmall; the advance cap sends the excess to the residual.
 //   F4  the owed pass pays no balance below c.
@@ -126,12 +126,11 @@ void f1_floor() {
 
 // ---------------------------------------------------------------------------
 void f2_crumbs() {
-    std::printf("== F2. crumbs and the same-block advance ==\n");
+    std::printf("== F2. dust is paid when the block has room ==\n");
     const std::uint64_t c = x6::spend_floor(kTail);
     const P a = payee(11, 361000000000ull), b = payee(12, 239000000000ull);   // reward >= the tail, so c(reward) >= c(tail)
-    const P cr1 = payee(13, c - 1), cr2 = payee(14, c / 3);          // crumbs: below c
-    const std::uint64_t crumbs = cr1.eb + cr2.eb;
-    const std::uint64_t reward = a.eb + b.eb + crumbs + 1;            // the cut credits the whole reward but the marker
+    const P cr1 = payee(13, c - 1), cr2 = payee(14, c / 3);          // dust: below c
+    const std::uint64_t reward = a.eb + b.eb + cr1.eb + cr2.eb + 1;   // the cut credits the whole reward but the marker
     auto in = fee_on_inputs(reward, true);
     arm(in, {a, b, cr1, cr2});
     x6::BuildError err{};
@@ -139,13 +138,27 @@ void f2_crumbs() {
     const ::v37::bytes32 D = fee::donation_identity(kNet);
     CHECK(err == x6::BuildError::None, "builds");
     CHECK(sum_of(outs) == reward, "exact sum: %llu == %llu", (unsigned long long)sum_of(outs), (unsigned long long)reward);
-    CHECK(to(outs, cr1.id) == 0 && to(outs, cr2.id) == 0, "crumbs below c get no output");
+    CHECK(to(outs, cr1.id) == cr1.eb && to(outs, cr2.id) == cr2.eb, "with free slots the dust is paid its exact E_b (no balance, no debt)");
+    CHECK(to(outs, a.id) == a.eb && to(outs, b.id) == b.eb, "everyone gets exactly E_b: no advance is needed");
     CHECK(to(outs, D) == 1, "only the 1-piconero donation marker is left over (got %llu)", (unsigned long long)to(outs, D));
+}
+
+void f2b_no_room() {
+    std::printf("== F2b. dust without a slot waits; its cash is advanced ==\n");
+    const std::uint64_t c = x6::spend_floor(kTail);
+    const P a = payee(15, 361000000000ull), b = payee(16, 239000000000ull);
+    const P cr1 = payee(17, c - 1), cr2 = payee(18, c / 3);
+    const std::uint64_t crumbs = cr1.eb + cr2.eb;
+    const std::uint64_t reward = a.eb + b.eb + crumbs + 1;
+    auto in = fee_on_inputs(reward, true);
+    in.output_cap = 3;                                                // donation (folds) + 2 payee slots
+    arm(in, {a, b, cr1, cr2});
+    const auto outs = x6::allocate_exact_sum(in);
+    CHECK(sum_of(outs) == reward, "exact sum");
+    CHECK(to(outs, cr1.id) == 0 && to(outs, cr2.id) == 0, "no slot left: the dust keeps its E_b as a balance");
     const std::uint64_t pa = to(outs, a.id), pb = to(outs, b.id);
-    CHECK(pa >= a.eb && pb >= b.eb, "the paid payees get at least their E_b");
-    CHECK(pa - a.eb + pb - b.eb == crumbs, "their advance is exactly the crumbs' cash (%llu)", (unsigned long long)crumbs);
+    CHECK(pa - a.eb + pb - b.eb == crumbs, "the payees >= c carry the dust's cash as an advance (%llu)", (unsigned long long)crumbs);
     CHECK(pa <= 2 * a.eb && pb <= 2 * b.eb, "an advance is at most the payee's own E_b");
-    // pro rata: the advance splits 360:239 (within 1 piconero of rounding)
     const long double ra = static_cast<long double>(pa - a.eb) / crumbs;
     CHECK(ra > 361.0L / 600.0L - 1e-6L && ra < 361.0L / 600.0L + 1e-6L, "the advance is pro rata to E_b");
 }
@@ -166,15 +179,16 @@ void f3_slots() {
         CHECK(to(outs, a.id) + to(outs, b.id) + 1 == reward, "the two largest carry the whole block but the marker");
         CHECK(sum_of(outs) == reward, "exact sum");
     }
-    {   // a pool just started: one payable miner, nothing to advance against
+    {   // a pool just started: the credited work is a fraction of the reward
         const std::uint64_t c = x6::spend_floor(kTail);
         const P only = payee(24, 2 * c), dust = payee(25, c / 2);
         auto in = fee_on_inputs(kTail, true);
         arm(in, {only, dust});
         const auto outs = x6::allocate_exact_sum(in);
         const ::v37::bytes32 D = fee::donation_identity(kNet);
+        CHECK(to(outs, dust.id) == dust.eb, "the dust miner is paid exactly (bootstrap: room for everyone)");
         CHECK(to(outs, only.id) == 2 * only.eb, "the advance cap: E_b + at most E_b (got %llu)", (unsigned long long)to(outs, only.id));
-        CHECK(to(outs, D) == kTail - 2 * only.eb, "the cash beyond the cap goes to the donation output (disclosed; one block)");
+        CHECK(to(outs, D) == kTail - 2 * only.eb - dust.eb, "the cash beyond the cap goes to the donation output (disclosed)");
         CHECK(sum_of(outs) == kTail, "exact sum");
     }
 }
@@ -303,6 +317,7 @@ int main() {
     std::printf("v37_xmr_spend_floor_kat\n");
     f1_floor();
     f2_crumbs();
+    f2b_no_room();
     f3_slots();
     f4_owed_floor();
     f5_receive();
