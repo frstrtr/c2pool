@@ -154,6 +154,7 @@ struct DecodeResult {
     bool          payout_decoded = false;
     std::uint64_t unattributed_pico = 0, total_pico = 0;
     std::string   root_hex;
+    std::optional<::c2pool::v37n::settle::AnchorCut> cut;   // ANCHOR: the block's own credit cut (canonical Booked)
 };
 // cands/superseded: the scratch ring's candidates (live first), as ReconRing::
 // candidates() produces them. root_only: the refold already holds this block's
@@ -186,7 +187,7 @@ struct RefusedBlock {
     Amounts       old_payout;                      // its booked payout map (liability per payee)
     DecodeResult  r;                               // the scratch decode (when not forced)
 };
-struct PendingOut { std::uint64_t h = 0; std::string bid; Amounts credit, payout; };
+struct PendingOut { std::uint64_t h = 0; std::string bid; Amounts credit, payout; std::optional<::c2pool::v37n::settle::AnchorCut> cut; };
 
 struct RefoldResult {
     bool          ok = false;
@@ -227,7 +228,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
         const auto it = fin_since.find(e.bid);
         if (it == fin_since.end() || it->second > in.fork_h) continue;
         switch (e.kind) {
-            case SettleEvKind::Found:    L.on_block_found(e.bid, e.credit, e.payout); break;
+            case SettleEvKind::Found:    L.on_block_found(e.bid, e.credit, e.payout, anchor_of(e)); break;
             case SettleEvKind::Finalize: since = since_of_bin(e.bin_height); L.on_block_finalized(e.bid, e.bin_height); break;
             case SettleEvKind::Orphan:   L.on_block_orphaned(e.bid, e.payout); break;
         }
@@ -239,6 +240,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     const std::uint64_t top = in.cursor + 1 + D;
     std::map<std::uint64_t, std::string> pend;   // h -> bid
     std::map<std::string, std::pair<Amounts, Amounts>> maps;
+    std::map<std::string, std::optional<::c2pool::v37n::settle::AnchorCut>> cuts;
     auto book = [&](std::uint64_t h) -> bool {
         if (h <= in.fork_h || h > top) return true;
         const auto cb = in.chain_blocks.find(h);
@@ -254,16 +256,20 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
         }
         std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
         ring.candidates(L.owed_digest(), cands, sup);
-        DecodeResult r = decode(h, bid, cands, sup, had_old, L);
+        // ANCHOR: a block's E_b is folded at the anchor of the ledger it books
+        // on, which the refold may have changed, so its old maps are not reused.
+        const bool reuse = had_old && !in.rules.anchor_cut;
+        DecodeResult r = decode(h, bid, cands, sup, reuse, L);
         ++out.decoded;
         switch (r.outcome) {
             case DecodeOutcome::Booked: {
                 Amounts credit = r.credit, payout = r.payout;
-                if (had_old) { credit = om->second.first; payout = om->second.second; ++out.reused_maps; }
+                if (reuse) { credit = om->second.first; payout = om->second.second; ++out.reused_maps; }
                 SettleEvent fe; fe.kind = SettleEvKind::Found; fe.bid = bid; fe.credit = credit; fe.payout = payout;
-                L.on_block_found(bid, credit, payout);
+                set_cut(fe, r.cut);
+                L.on_block_found(bid, credit, payout, r.cut);
                 out.events.push_back(fe);
-                pend[h] = bid; maps[bid] = {credit, payout}; out.booked[bid] = h;
+                pend[h] = bid; maps[bid] = {credit, payout}; cuts[bid] = r.cut; out.booked[bid] = h;
                 note_state();
                 return true;
             }
@@ -297,7 +303,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     }
     for (const auto& [h, bid] : pend) {
         const auto& m = maps[bid];
-        out.pending.push_back(PendingOut{h, bid, m.first, m.second});
+        out.pending.push_back(PendingOut{h, bid, m.first, m.second, cuts[bid]});
     }
     out.digest = L.owed_digest();
     out.since = since;

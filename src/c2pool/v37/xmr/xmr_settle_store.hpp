@@ -81,7 +81,7 @@ struct ISettleStore {
 // Records: u8 ver=1 ‖ payload. Ints little-endian. Fail-closed on a short read.
 // ---------------------------------------------------------------------------
 namespace store_codec {
-constexpr std::uint8_t SCHEMA_VER = 1;
+constexpr std::uint8_t SCHEMA_VER = 2;   // 2: a FOUND event may carry the block's credit cut (ANCHOR)
 
 inline std::string chain_fmt(::v37::ChainId c) {
     char b[16];
@@ -160,15 +160,26 @@ struct SettleEvent {
     Amounts       credit;              // FOUND: per-key entitlement E_b
     Amounts       payout;              // FOUND/ORPHAN: coinbase outputs settled
     std::uint64_t bin_height = 0;      // FINALIZE: the monotone K_fair clock at THIS step
+    // FOUND, ANCHOR rule: the block's own on-chain credit cut (it becomes the
+    // ledger's anchor at FINALIZE). Absent => the record is byte-identical to
+    // the schema-1 layout.
+    bool          has_cut = false;
+    std::uint64_t cut_pos = 0;
+    std::string   cut_spine;           // 32 bytes
 
     std::string serialize() const {
         std::string s;
-        s.push_back(char(store_codec::SCHEMA_VER));
+        s.push_back(char(has_cut ? store_codec::SCHEMA_VER : std::uint8_t{1}));
         s.push_back(char(static_cast<std::uint8_t>(kind)));
         store_codec::put_str(s, bid);
         store_codec::put_amounts(s, credit);
         store_codec::put_amounts(s, payout);
         store_codec::put_u64(s, bin_height);
+        if (has_cut) {
+            s.push_back(char(1));
+            store_codec::put_u64(s, cut_pos);
+            store_codec::put_str(s, cut_spine);
+        }
         return s;
     }
     static SettleEvent deserialize(const std::string& blob) {
@@ -182,10 +193,29 @@ struct SettleEvent {
         e.credit = r.amounts();
         e.payout = r.amounts();
         e.bin_height = r.u64();
+        if (ver >= 2 && r.u8() == 1) {
+            e.has_cut = true;
+            e.cut_pos = r.u64();
+            e.cut_spine = r.str();
+            if (e.cut_spine.size() != 32) throw std::runtime_error("settle-store: bad credit-cut spine");
+        }
         r.expect_end();
         return e;
     }
 };
+
+// ANCHOR: the block's credit cut a FOUND event carries, in the ledger's type.
+inline std::optional<::c2pool::v37n::settle::AnchorCut> anchor_of(const SettleEvent& e) {
+    if (!e.has_cut || e.cut_spine.size() != 32) return std::nullopt;
+    ::c2pool::v37n::settle::AnchorCut c;
+    c.next_pos = e.cut_pos;
+    std::copy(e.cut_spine.begin(), e.cut_spine.end(), c.spine.begin());
+    return c;
+}
+inline void set_cut(SettleEvent& e, const std::optional<::c2pool::v37n::settle::AnchorCut>& c) {
+    e.has_cut = c.has_value();
+    if (c) { e.cut_pos = c->next_pos; e.cut_spine.assign(c->spine.begin(), c->spine.end()); }
+}
 
 // ---------------------------------------------------------------------------
 // MemSettleStore — in-memory ISettleStore for the smoke/KAT (no filesystem).
@@ -345,7 +375,7 @@ public:
                     ++st.max_event_seq;
                     switch (e.kind) {
                         case SettleEvKind::Found:
-                            ledger.on_block_found(e.bid, e.credit, e.payout); break;
+                            ledger.on_block_found(e.bid, e.credit, e.payout, anchor_of(e)); break;
                         case SettleEvKind::Finalize:
                             ledger.on_block_finalized(e.bid, e.bin_height); break;  // F1
                         case SettleEvKind::Orphan:

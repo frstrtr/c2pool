@@ -181,12 +181,50 @@ nothing checked them.
   any extra-nonce; a thief template is refused whether it keeps the donation
   output or not; a rewritten total is refused; a template without V37R is
   refused.
-* **Not wired yet (stage C).** The relay does not call the verdict yet. It
-  needs the ledger state of each receipt's booking point (a ring of recent
-  ledger snapshots, as P2Pool keeps its window), the view at the receipt's
-  cut, a per-template cache (one rebuild per template, then one Keccak per
-  share; uncached it is about 3.6 ms), and a verdict taken where the lane
-  pushes the receipt, identical on every node. Until then the gap stays open.
+* **The anchor (ruling A, 2026-09-29).** A share's coinbase cannot be
+  rebuilt from the builder's own credit cut: each node's receipt lane has its
+  own order (Ruling A of the relay), so a view at another node's cut needs a
+  relay repair per template. So a lane block's pay-now and E_b now come from
+  the **anchor**: the on-chain cut of the latest lane block FINALIZED into the
+  ledger the block builds on (`OwedLedgerRules::anchor_cut`). Every input of
+  the coinbase is then finalized state, the same on every node. The block
+  still commits its own V37C; that cut becomes the next anchor when the block
+  finalizes, so the window keeps moving. No anchor yet (a fresh pool): the
+  view credits nobody, and the empty-cut finder rule pays the finder. Cost:
+  a block pays the window as of D_conf blocks ago (about 2 hours), like a
+  PPLNS window with a lag. Each block still pays out everything it credits.
+  * The ledger carries the anchor in `owed_digest` ("V37A"), set at FINALIZE
+    from the cut its FOUND carried. A FOUND event persists it (settle store
+    schema 2; a cutless event keeps the schema-1 bytes), and so do the
+    sidecar ("cut=P:spine") and the refold. The refold re-decodes rather
+    than reusing old maps, since the anchor may differ on the new lineage.
+  * Booking folds E_b at the anchor of the booking-point ledger. The
+    recompute, the pay-now payee resolution and the booked refs use the same
+    view. A canonical block's own cut must still be reproducible (as before);
+    only then does it become an anchor. A debit-only block never does.
+  * The builder reads the view at its ledger's anchor (replay or repair on
+    the main thread). If the view is not readable yet, it builds no template
+    rather than a coinbase without its pay-now.
+* **The relay verdict.** The daemon publishes, per ledger state, a frozen
+  copy of the ledger, the payees at its anchor, the booked refs and the lane
+  config (`xmr_share_verdict.hpp`, keyed by the 0x03 root the state commits,
+  the last 16 states). A verify worker decides each relayed receipt before
+  RandomX:
+  * canonical: admitted;
+  * not canonical: refused, with a strike;
+  * not decidable here (a state this node does not hold, or its anchor view
+    not read yet): parked like an unknown context. Past the patience an
+    unsolicited receipt is dropped. A solicited one (a repair of a winner's
+    lane, which is the settlement authority under Ruling A) is admitted.
+  Pinned by `v37_xmr_share_verdict_kat` S9, `v37_xmr_spend_floor_kat` F11
+  (the ledger anchor, the store, a restart) and `v37_xmr_mainnet_rehearsal_kat`
+  M11 / M11b (3 nodes, every block canonical, one anchor, exact
+  conservation).
+* **Open.** An uncached verdict costs about 3.6 ms (one canonical rebuild).
+  A per-template cache (one rebuild per template, then one Keccak per share)
+  is a follow-up. A receipt a node could not decide but admitted as a repair
+  answer is trusted on the winner's word: an honest winner never holds a
+  refused receipt in its lane.
 
 ## 7. Known limits and follow-ups
 

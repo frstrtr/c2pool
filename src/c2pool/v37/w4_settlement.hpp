@@ -919,11 +919,32 @@ inline std::map<bytes32, long long> compose_credit_replace(
 //                      decay_half_life, down to 0. A new credit clears it. Never a donation: the write-off only
 //                      lowers the pool's liability. Each FINALIZE that writes
 //                      off carries the amounts in its owed-event leaf.
+//
+//   anchor_cut         (XMR, share-level canonical coinbase, ruling A
+//                      2026-09-29): the ledger carries the ANCHOR, the
+//                      on-chain credit cut (P, spine) of the most recent lane
+//                      block FINALIZED into it. A lane block pays its pay-now
+//                      and books its E_b at the anchor of the ledger it builds
+//                      on, not at its own cut, so every input of its coinbase
+//                      is finalized state, the same on every node, and a
+//                      relayed share can be checked against it without
+//                      reproducing the builder's node-local lane. The block's
+//                      own cut becomes the anchor when it finalizes. Committed
+//                      in owed_digest ("V37A").
 struct OwedLedgerRules {
     long long arm_floor = 0;
     bool      rotate_on_payment = false;
     u64       decay_horizon = 0;     // 0 = off
     u64       decay_half_life = 0;
+    bool      anchor_cut = false;
+};
+
+// ANCHOR (OwedLedgerRules::anchor_cut): a lane block's on-chain credit cut, raw
+// (w4 is chain-generic; the XMR tree maps it to credit::CreditCut).
+struct AnchorCut {
+    u64     next_pos = 0;
+    bytes32 spine{};
+    bool operator==(const AnchorCut&) const = default;
 };
 
 class OwedLedger {
@@ -944,12 +965,17 @@ public:
     // (the fold at b's burial-gated prefix) and the coinbase outputs broadcast
     // in b (K_fair over EffectiveOwed, from propose()). No finalW mutation —
     // deferred to finality. Durable, write-ahead (§5.2). Idempotent per bid.
+    // ANCHOR: `cut` is the block's own on-chain credit cut; it becomes the
+    // ledger's anchor when the block finalizes (anchor_cut rule only). A
+    // block with no cut to offer (a seed, a debit-only non-canonical block)
+    // passes none and leaves the anchor where it is.
     void on_block_found(const std::string& bid, const Amounts& credit,
-                        const Amounts& payout) {
+                        const Amounts& payout, std::optional<AnchorCut> cut = std::nullopt) {
         if (m_pending.count(bid) || m_settled.count(bid)) return;
         Pending p;
         for (const auto& [k, v] : credit) if (v != 0) p.credit[k] = v;
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
+        if (m_rules.anchor_cut) p.cut = cut;
         m_eo_index.on_found(p.payout,                 // R3: eo -= payout (fe frozen)
                             [this](const bytes32& k) { return fe_at(k); });
         auto ins = m_pending.emplace(bid, std::move(p));
@@ -1032,6 +1058,7 @@ public:
                         !(it->second.credit.count(k) && it->second.credit.at(k) > 0))
                         m_gone_since[k] = bin_height;
         }
+        if (m_rules.anchor_cut && it->second.cut) m_anchor = *it->second.cut;   // ANCHOR
         m_pending.erase(it);
         m_settled.insert(bid);
         const Amounts decayed = decay_dust(bin_height);
@@ -1243,10 +1270,23 @@ public:
                 for (int i = 0; i < 8; ++i) pre.push_back((b >> (8 * i)) & 0xff);
             }
         }
+        if (m_rules.anchor_cut) {   // ANCHOR: it decides every coinbase built on this state
+            const char at[4] = {'V', '3', '7', 'A'};
+            pre.insert(pre.end(), at, at + 4);
+            pre.push_back(m_anchor ? 1 : 0);
+            if (m_anchor) {
+                for (int i = 0; i < 8; ++i) pre.push_back((m_anchor->next_pos >> (8 * i)) & 0xff);
+                pre.insert(pre.end(), m_anchor->spine.begin(), m_anchor->spine.end());
+            }
+        }
         bytes32 d = ::v37::sha256d(pre);
         m_digest_memo.put(m_seq, d);
         return d;
     }
+
+    // ANCHOR: the credit cut of the most recent lane block finalized into this
+    // state (nullopt: none yet, or the rule is off).
+    std::optional<AnchorCut> anchor_cut() const { return m_anchor; }
 
     // DUST DECAY: the total written off so far (diagnostics / status line).
     long long decayed_total() const { return m_decayed_total; }
@@ -1298,7 +1338,7 @@ public:
     }
 
 private:
-    struct Pending { Amounts credit; Amounts payout; };
+    struct Pending { Amounts credit; Amounts payout; std::optional<AnchorCut> cut; };
 
     // The K_fair walk (first_eligible ASC, key ASC). With
     // OwedLedgerRules::rotate_on_payment, a key paid in a block that is still
@@ -1448,6 +1488,7 @@ private:
     std::map<bytes32, u64> m_gone_since;           // DUST DECAY: bin of the first lane block that passed it by
     std::map<bytes32, u64> m_decay_steps;          // DUST DECAY: halvings already applied
     long long m_decayed_total = 0;
+    std::optional<AnchorCut> m_anchor;   // ANCHOR (OwedLedgerRules::anchor_cut)
     u64 m_seq = 0;
     Amounts m_finalW;                              // finalized owed partition
     std::map<std::string, Pending> m_pending;      // FOUND, not yet finalized
