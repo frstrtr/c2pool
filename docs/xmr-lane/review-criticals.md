@@ -78,7 +78,7 @@ same consensus change as seniority-from-the-threshold
 | # | finding | XMR lane now |
 |---|---|---|
 | 08 | grindable tie-break | Closed: salted tie-break `sha256d("V37T" \|\| prev_id \|\| key)`, recomputed (R15). |
-| 09 | fees not disclosed | Legacy `src/c2pool/payout/` is not on the v37 path. The owner fee is disclosed in stratum (#1880) and the docs (#1879). A protocol cap on the owner fee is not yet ruled. |
+| 09 | fees not disclosed | Legacy `src/c2pool/payout/` is not on the v37 path. The owner fee is disclosed in stratum (#1880) and the docs (#1879). **Ruled (2026-09-29): no protocol cap.** The owner fee substitutes the payee of a job, and no other node can tell those receipts from the owner's own work, so a cap would be a rule nobody can check. Disclosure stays; the miner's protection is choice, and the incentive is to run their own all-in-one node (node, daemon and miner) at 0 fee. Later: per-job payee disclosure in stratum so a miner or proxy can check each job's payee against its rbind. |
 | E-1 | paper says largest-first | Paper erratum (#1881). |
 | EST_ONLY | estimator default branches on S | #1877 (default Combined). |
 | window | deflation by pulsing hashrate | Open, planned for v37.1 and disclosed. |
