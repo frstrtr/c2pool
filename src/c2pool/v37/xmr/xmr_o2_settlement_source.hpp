@@ -388,7 +388,12 @@ public:
             bool payable = true;
             for (const auto& w : pv->wp) {
                 if (pv->ref.count(w.key)) continue;
-                const ::v37::ScriptRef r = pay_of(w.key);
+                // The projected payee carries its own ref: the view at the cut
+                // is the same on every node, so pay-now never depends on what
+                // this node's resolver happens to have learned (the recompute,
+                // xmr_coinbase_recompute.hpp, rebuilds this on every node).
+                const ::v37::ScriptRef r = (::v37::xmr::is_xmr_kind(w.pay.kind) && ::v37::xmr::xmr_identity_key(w.pay) == w.key)
+                                               ? w.pay : pay_of(w.key);
                 if (!::v37::xmr::xmr_ref_valid(r)) { payable = false; break; }
                 pv->ref[w.key] = r;
             }

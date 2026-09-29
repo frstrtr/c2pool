@@ -249,6 +249,10 @@ public:
     void set_shape_gate(ShapeGate g) { m_shape_gate = std::move(g); }
     // MAIN THREAD, before the first refresh(). See ReadyGate.
     void set_ready_gate(ReadyGate g) { m_ready_gate = std::move(g); }
+    // MAIN THREAD, before the first refresh(). The owed pass's payee resolver
+    // (XmrOwedFixture::pay_of_booked in the daemon: the refs every node holds
+    // at the booking point). Unset => the fixture's full pay_of().
+    void set_owed_pay_of(PayOfFn f) { m_owed_pay_of = std::move(f); }
     std::uint64_t ready_gate_held() const { return m_gate_held.load(); }
 
     // MAIN THREAD, before the first refresh(). GOOD-CITIZEN: feed the selector's
@@ -596,7 +600,7 @@ private:
 
         std::string ss_why;
         std::unique_ptr<XmrOwedSettlementSource> src = build_settlement_source(
-            scfg, parent, m_ledger.ledger(), m_ledger.pay_of(),
+            scfg, parent, m_ledger.ledger(), m_owed_pay_of ? m_owed_pay_of : m_ledger.pay_of(),
             /*reward_hint=*/base_reward + fees, &ss_why);
         if (!src) { why = "settlement source refused: " + ss_why; return false; }
 
@@ -666,6 +670,7 @@ private:
     RefreshPump                               m_pump;
     ShapeGate                                 m_shape_gate;
     ReadyGate                                 m_ready_gate;
+    PayOfFn                                   m_owed_pay_of;
     std::atomic<std::uint64_t>                m_gate_held{0};
     std::size_t                               m_bind_size = 0;   // SEAM-1
     asm_::X6SettlementSource::ExtraNonceBindFn m_bind;           // SEAM-1
