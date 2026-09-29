@@ -44,6 +44,7 @@
 //   M5  the booking-point gate: a template is served only at cursor
 //       T - 1 - D_conf (recon::builder_cut), and mainnet refuses
 //       --coinbase v37 without --fee-model v1.
+// The lane rule rehearsed includes the salted K_fair tie-break (#1867).
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -182,6 +183,7 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     ctx.residual_sink = fee::donation_ref(kNet); ctx.residual_sink_identity = fee::donation_identity(kNet);
     ctx.fixed = {fee::donation_marker(kNet)};
     ctx.h_min = 0; ctx.output_cap = 2700;
+    ctx.kfair_salted_ties = true;   // mainnet: #1867 salted tie-break
     ctx.has_credit_cut = true; ctx.credit_cut = W.cut_at(h);
     ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
     ctx.has_paynow = true; ctx.paynow_payees = W.view_at(h);
@@ -247,6 +249,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     li.chain_id = kChain; li.h_min = 0; li.owed_cap = 2700; li.wire_cap = 2700;
     li.residual_sink = fee::donation_ref(kNet); li.residual_sink_identity = fee::donation_identity(kNet);
     li.fixed = {fee::donation_marker(kNet)}; li.pool_tag = the_tag();
+    li.kfair_salted_ties = true;
     rc::CutInputs ci; ci.has_view = true; ci.payees = W.view_at(h);
     const auto res = rc::verify_lane_coinbase(b.blob, bk, n.L, pay_of_map(n.booked), li, ci);
     r.v = res.verdict; r.why = res.why;
