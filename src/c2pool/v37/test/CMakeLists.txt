@@ -823,6 +823,29 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_paynow_kat COMMAND v37_xmr_paynow_kat)
 
     # ------------------------------------------------------------------
+    # EVERY NODE RECOMPUTES THE LANE COINBASE (operator rulings 2026-09-29,
+    # xmr/xmr_coinbase_recompute.hpp): REAL assembled blocks from the
+    # builder pipeline, decoded as booking decodes them, recomputed from the
+    # receiver's ledger. Honest blocks (owed + pay-now, a reward hint above
+    # the total, the empty-cut finder, a binding weight-aware cap) are
+    # canonical; the #1861 double pay, an over-payment, a K_fair reorder, an
+    # under-take, misdirected pay-now and a stale ledger state are not. Same
+    # link shape as the pay-now KAT (listed in BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_coinbase_recompute_kat
+        v37_xmr_coinbase_recompute_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_coinbase_recompute_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_coinbase_recompute_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_coinbase_recompute_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_coinbase_recompute_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_coinbase_recompute_kat COMMAND v37_xmr_coinbase_recompute_kat)
+
+    # ------------------------------------------------------------------
     # SAME-BLOCK PAY-NOW on POOL-LINEAGE: one lane coinbase carries both the
     # V37N pay-now base and the V37P pool tag in the canonical order
     # V37N | V37D | V37P | V37C (V37C last); every field reads back (codec,
