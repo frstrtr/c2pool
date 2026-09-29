@@ -185,9 +185,10 @@ struct XmrCoinbaseContext {
     std::uint8_t          monero_major_version = 16;
     std::uint64_t         height = 0;                 // block height; unlock = height + 60
     ::xmr::coin::Hash256  prev_id{};                  // parent block id (bin origin)
-    // DEBOUNCE (#1861, builder policy). owed_locked: keys whose owed balance
-    // was paid by a booked block that has not settled yet; they get no owed
-    // output here (their pay-now share, Rule L, is unaffected).
+    // DEBOUNCE (#1861, builder policy). owed_locked: keys that a booked, not
+    // yet settled block paid at least what they are still owed
+    // (OwedLedger::debounce_locked_keys); they get no owed output here (their
+    // pay-now share, Rule L, is unaffected).
     // owed_pass_suspended: this node cannot rule out a lane block on its
     // chain that it has not booked (the tip is not processed yet, or a lane
     // block is still retrying / deferred); the owed pass is skipped entirely

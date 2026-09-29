@@ -3136,15 +3136,16 @@ static int run_live(const XmrNodeConfig& cfg) {
         // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
         // and only blocks carrying it are booked as lane blocks here.
         scfg.pool_tag = pool_tag_of(cfg);
-        // DEBOUNCE (#1861, builder policy): a key whose owed balance a booked,
-        // unsettled block paid gets no owed output until that block settles; and
+        // DEBOUNCE (#1861, builder policy): a key that a booked, unsettled block
+        // paid at least what it is still owed gets no owed output until that
+        // block settles (a one-piconero payout locks nobody: ungriefable); and
         // while this node may not have booked a lane block on its chain (the
         // template's parent is not processed yet, or a block is retrying /
         // deferred) the owed pass is skipped and the block pays pay-now only.
         // This closes the lagged H/H+1 double pay; receivers are unchanged.
         scfg.owed_gate = [&](std::uint64_t height, std::set<::v37::bytes32>& locked) -> bool {
             ++debounce_templates;
-            locked = node.ledger().pending_payout_keys();
+            locked = node.ledger().debounce_locked_keys();
             debounce_locked_last = locked.size();
             if (height > node.hw().hw_height + 1) { ++debounce_suspended_tip; return false; }
             if (!fc.retrying().empty() || fc.deferred_now() > 0) { ++debounce_suspended_unbooked; return false; }

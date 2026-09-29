@@ -1122,16 +1122,25 @@ public:
         return d;
     }
 
-    // DEBOUNCE (#1861): every key that a FOUND-but-not-finalized block pays.
-    // Its owed payout is booked and deducted from EffectiveOwed, but until the
-    // block settles a builder that has not booked it yet can pay the same
-    // balance again; the XMR builder locks these keys out of its owed pass.
-    std::set<bytes32> pending_payout_keys() const {
-        std::set<bytes32> out;
+    // DEBOUNCE (#1861): the keys a FOUND-but-not-finalized block paid AT LEAST
+    // as much as they are still owed (Σ pending payout >= EffectiveOwed, i.e.
+    // at least half of today's balance was just paid). The XMR builder locks
+    // these out of its owed pass until the paying block settles, so a key
+    // paid in full and then credited again takes one owed output per settle
+    // window instead of one per block (finding 04). The "at least half"
+    // condition is what makes the lock ungriefable: a builder that pays
+    // thousands of keys one piconero each (booked under coinbase authority)
+    // locks nobody, because a piconero is never half of a balance worth
+    // paying; locking a key costs paying it what it is owed.
+    std::set<bytes32> debounce_locked_keys() const {
+        std::map<bytes32, long long> pend;
         for (const auto& [bid, p] : m_pending) {
             (void)bid;
-            for (const auto& [k, v] : p.payout) if (v != 0) out.insert(k);
+            for (const auto& [k, v] : p.payout) if (v != 0) pend[k] += v;
         }
+        std::set<bytes32> out;
+        for (const auto& [k, v] : pend)
+            if (v > 0 && v >= effective_owed(k)) out.insert(k);
         return out;
     }
 

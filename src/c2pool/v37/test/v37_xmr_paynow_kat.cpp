@@ -551,8 +551,22 @@ void suite_debounce() {
     {
         st::OwedLedger L = base;
         L.on_block_found("A", {}, owedA);
-        const auto locked = L.pending_payout_keys();
-        CHECK(locked.size() == 2 && locked.count(xid) && locked.count(yid), "pending_payout_keys == {X, Y} while A is unsettled");
+        const auto locked = L.debounce_locked_keys();
+        CHECK(locked.size() == 2 && locked.count(xid) && locked.count(yid), "debounce_locked_keys == {X, Y} while A is unsettled (paid in full)");
+        // GRIEFING: a booked block that paid 1 piconero each to X and a third
+        // key Z (a modified builder; booked under coinbase authority) locks
+        // neither: 1 is not half of what they are owed.
+        {
+            st::OwedLedger G = base;
+            const ::v37::bytes32 zid = id_of(ref_of(57));
+            G.on_block_found("seedZ", Amounts{{zid, 40000000000ll}}, {}); G.on_block_finalized("seedZ", 6);
+            G.on_block_found("grief", {}, Amounts{{xid, 1}, {zid, 1}});
+            const auto gl = G.debounce_locked_keys();
+            CHECK(gl.empty(), "griefing: 1-piconero payouts lock nobody (%zu locked)", gl.size());
+            G.on_block_found("half", {}, Amounts{{zid, 20000000000ll}});   // >= half of Z's balance
+            const auto hl = G.debounce_locked_keys();
+            CHECK(hl.size() == 1 && hl.count(zid), "a payout of at least half the balance locks the key");
+        }
         L.on_block_found("seed2", Amounts{{xid, 50000000000ll}}, {});   // X earns more, finalized
         L.on_block_finalized("seed2", 6);
         auto c = ctx_for(L); c.owed_locked = locked;
