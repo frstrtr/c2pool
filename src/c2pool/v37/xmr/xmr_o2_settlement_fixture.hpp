@@ -79,6 +79,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <set>
 #include <map>
 #include <memory>
 #include <optional>
@@ -174,6 +175,13 @@ struct XmrSettlementConfig {
     // pay when paynow_source finds the view at the cut but no payee in it (the
     // node's own payee). Unset => an empty cut keeps master's residual shape.
     std::optional<::v37::ScriptRef> ecut_finder;
+
+    // DEBOUNCE (#1861): asked once per template with the height of the block
+    // being built. Fills `locked` with the keys whose owed payout is still
+    // pending (their paying block has not settled) and returns false when the
+    // owed pass must be skipped (a lane block on this chain may be unbooked).
+    // Unset => no debounce (master's owed pass).
+    std::function<bool(std::uint64_t height, std::set<::v37::bytes32>& locked)> owed_gate;
 
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
@@ -325,6 +333,8 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.fixed                  = cfg.fixed;
     ctx.h_min                  = cfg.h_min;
     ctx.output_cap             = cfg.resolved_output_cap();
+    if (cfg.owed_gate)           // DEBOUNCE: lock pending payees; skip the owed pass when unsure
+        ctx.owed_pass_suspended = !cfg.owed_gate(parent.height, ctx.owed_locked);
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE

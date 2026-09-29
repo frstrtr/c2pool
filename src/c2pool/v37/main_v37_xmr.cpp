@@ -2160,6 +2160,11 @@ static int run_live(const XmrNodeConfig& cfg) {
     // the view was obtained (live ring, own replay, relay repair). Before, only a
     // receipt this node pushed itself (live ingest / reload) taught the ref.
     std::uint64_t cut_payee_learned = 0, cut_payee_resolved = 0, cut_payee_pending = 0, cut_payee_unresolved = 0;
+    // DEBOUNCE (#1861) counters: templates asked, owed pass skipped because the
+    // parent was not processed yet / a lane block was unbooked, and the keys
+    // locked out of the owed pass at the last template.
+    std::uint64_t debounce_templates = 0, debounce_suspended_tip = 0, debounce_suspended_unbooked = 0;
+    std::size_t   debounce_locked_last = 0;
     auto learn_view_payees = [&](const c2pool::v37n::SettlementView& v) -> std::size_t {
         std::size_t n = 0;
         if (cba_fx)
@@ -3131,6 +3136,20 @@ static int run_live(const XmrNodeConfig& cfg) {
         // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
         // and only blocks carrying it are booked as lane blocks here.
         scfg.pool_tag = pool_tag_of(cfg);
+        // DEBOUNCE (#1861, builder policy): a key whose owed balance a booked,
+        // unsettled block paid gets no owed output until that block settles; and
+        // while this node may not have booked a lane block on its chain (the
+        // template's parent is not processed yet, or a block is retrying /
+        // deferred) the owed pass is skipped and the block pays pay-now only.
+        // This closes the lagged H/H+1 double pay; receivers are unchanged.
+        scfg.owed_gate = [&](std::uint64_t height, std::set<::v37::bytes32>& locked) -> bool {
+            ++debounce_templates;
+            locked = node.ledger().pending_payout_keys();
+            debounce_locked_last = locked.size();
+            if (height > node.hw().hw_height + 1) { ++debounce_suspended_tip; return false; }
+            if (!fc.retrying().empty() || fc.deferred_now() > 0) { ++debounce_suspended_unbooked; return false; }
+            return true;
+        };
         std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
                     hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
                     hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
@@ -4331,6 +4350,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::printf("  cba-payee: learned=%llu resolved=%llu pending=%llu unresolved=%llu (REJOIN-PAYEE: outputs resolved against the payees of the block's own credit cut)\n",
                             (unsigned long long)cut_payee_learned, (unsigned long long)cut_payee_resolved,
                             (unsigned long long)cut_payee_pending, (unsigned long long)cut_payee_unresolved);
+                std::printf("  debounce: templates=%llu owed-pass skipped[parent-unprocessed=%llu unbooked-lane-block=%llu] locked_keys_now=%zu\n",
+                            (unsigned long long)debounce_templates, (unsigned long long)debounce_suspended_tip,
+                            (unsigned long long)debounce_suspended_unbooked, debounce_locked_last);
                 const auto& cs = cba_src.stats();
                 std::printf("  cba-src: %s native_hits=%llu native_hold=%llu holding=%zu get_block_rpc=%llu rpc_failed=%llu | compare equal=%llu MISMATCH=%llu unavailable=%llu | fallback_used=%llu\n",
                             cba_src.native_mode() ? "native" : "monerod",

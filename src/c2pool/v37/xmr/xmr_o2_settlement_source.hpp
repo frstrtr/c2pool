@@ -95,6 +95,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <set>
 #include <functional>
 #include <limits>
 #include <map>
@@ -184,6 +185,16 @@ struct XmrCoinbaseContext {
     std::uint8_t          monero_major_version = 16;
     std::uint64_t         height = 0;                 // block height; unlock = height + 60
     ::xmr::coin::Hash256  prev_id{};                  // parent block id (bin origin)
+    // DEBOUNCE (#1861, builder policy). owed_locked: keys whose owed balance
+    // was paid by a booked block that has not settled yet; they get no owed
+    // output here (their pay-now share, Rule L, is unaffected).
+    // owed_pass_suspended: this node cannot rule out a lane block on its
+    // chain that it has not booked (the tip is not processed yet, or a lane
+    // block is still retrying / deferred); the owed pass is skipped entirely
+    // and the block pays pay-now only, so no balance an unbooked block already
+    // paid can be paid again.
+    std::set<::v37::bytes32> owed_locked;
+    bool                  owed_pass_suspended = false;
     std::uint64_t         base_reward = 0;            // get_base_reward(already_generated_coins)
     std::uint64_t         fees = 0;                   // Σ selected tx fees (informational split)
 
@@ -307,8 +318,13 @@ public:
         // A key whose ref is not a payable XMR ref is downgraded to a RAW
         // sentinel; W4's h_min_of(RAW) = UINT64_MAX then CARRIES it (canon
         // branch, deterministic across nodes with the same backend).
-        std::size_t unpayable = 0;
+        std::size_t unpayable = 0, locked = 0;
         auto payable_ref = [&](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+            if (ctx.owed_locked.count(k)) {       // DEBOUNCE: carried until its paying block settles
+                ++locked;
+                ::v37::ScriptRef raw; raw.kind = ::v37::ScriptKind::RAW; raw.payload.clear();
+                return raw;
+            }
             ::v37::ScriptRef r = pay_of(k);
             if (!::v37::xmr::xmr_ref_valid(r)) {
                 ++unpayable;
@@ -322,7 +338,9 @@ public:
             std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - sink_slots,
                                   std::numeric_limits<unsigned>::max()));
 
-        if (source == KFairSource::W4Propose) {
+        if (ctx.owed_pass_suspended) {
+            // DEBOUNCE: no owed pass at all (pay-now only); in.owed stays empty.
+        } else if (source == KFairSource::W4Propose) {
             // W4 canon picks the set over budget - Σfixed with C = cap - fixed - sink.
             // fee model S2: a folded donation output's minimum is NOT reserved
             // here -- X6 sources it from the residual, else from the LARGEST
@@ -363,6 +381,8 @@ public:
             in.h_min = ctx.h_min;
         }
         s->m_unpayable = unpayable;
+        s->m_owed_locked = locked;
+        s->m_owed_suspended = ctx.owed_pass_suspended;
 
         // ---- SAME-BLOCK PAY-NOW (operator ruling 09-25, xmr_paynow.hpp) ----
         // Armed only on the default W4Propose source with a committed credit
@@ -587,6 +607,10 @@ public:
     const ::v37::bytes32&     owed_digest()  const { return m_owed_digest; }
     // Ledger keys with EffectiveOwed > 0 that were CARRIED as unpayable.
     std::size_t               carried_unpayable() const { return m_unpayable; }
+    // DEBOUNCE: owed keys carried because their paying block has not settled,
+    // and whether the whole owed pass was skipped for this snapshot.
+    std::size_t               carried_locked()  const { return m_owed_locked; }
+    bool                      owed_suspended()  const { return m_owed_suspended; }
     // SAME-BLOCK PAY-NOW: armed for this snapshot, and its committed base B.
     bool                      paynow_on()   const { return m_paynow_on; }
     std::uint64_t             paynow_base() const { return m_paynow_base; }
@@ -718,6 +742,8 @@ private:
     std::uint64_t        m_ledger_seq = 0;
     ::v37::bytes32       m_owed_digest{};
     std::size_t          m_unpayable = 0;
+    std::size_t          m_owed_locked = 0;
+    bool                 m_owed_suspended = false;
     bool                 m_paynow_on = false;
     std::uint64_t        m_paynow_base = 0;
     std::optional<::v37::ScriptRef> m_ecut_finder;   // EMPTY-CUT FINDER (V37F)

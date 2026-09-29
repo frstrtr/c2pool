@@ -496,6 +496,113 @@ void suite_base() {
     CHECK(false, "net-at-FOUND pay-now booking (xmr_paynow.hpp) is absent");
 }
 #endif
+#if PAYNOW_FIX
+// ---------------------------------------------------------------------------
+// P8 -- DEBOUNCE (#1861, builder policy). The lagged H/H+1 double pay: node 1
+// found A (pays the owed queue); node 2 builds B on A before it booked A, so
+// its ledger still shows the balances A paid. With the debounce:
+//   (a) a key whose paying block is booked but unsettled is LOCKED: no owed
+//       output, while its pay-now share (Rule L) is still paid;
+//   (b) with the owed pass SUSPENDED (B's builder has not booked A) the block
+//       has no owed outputs and pay-now takes the pool;
+//   (c) booking A and B on one ledger and finalizing both leaves no key
+//       negative; without the debounce the same schedule double pays.
+void suite_debounce() {
+    std::printf("== P8. debounce: lock pending payees, skip the owed pass when unsure ==\n");
+    const auto ps = three_payees();
+    const ::v37::bytes32 D = fee::donation_identity(kNet);
+    const auto X = ref_of(55), Y = ref_of(56);
+    const ::v37::bytes32 xid = id_of(X), yid = id_of(Y);
+    const long long owedX = 200000000000ll, owedY = 100000000000ll;
+    std::map<::v37::bytes32, ::v37::ScriptRef> refs;
+    for (const auto& p : ps) refs[p.id] = p.ref;
+    refs[xid] = X; refs[yid] = Y; refs[D] = fee::donation_ref(kNet);
+    o2::PayOfFn pay_of = [refs](const ::v37::bytes32& k) {
+        auto it = refs.find(k); if (it != refs.end()) return it->second;
+        ::v37::ScriptRef r; r.kind = ::v37::ScriptKind::RAW; return r; };
+    st::OwedLedger base(7);
+    base.on_block_found("seed", Amounts{{xid, owedX}, {yid, owedY}}, {});
+    base.on_block_finalized("seed", 5);
+    auto ctx_for = [&](const st::OwedLedger& L) {
+        o2::XmrCoinbaseContext ctx;
+        ctx.monero_major_version = 16; ctx.height = 1234; ctx.base_reward = kReward; ctx.fees = 0; ctx.chain_id = 7;
+        ctx.lane_commitment = L.owed_digest();
+        ctx.residual_sink = fee::donation_ref(kNet); ctx.residual_sink_identity = D;
+        ctx.fixed = {fee::donation_marker(kNet)}; ctx.h_min = 0; ctx.output_cap = 64;
+        ctx.has_credit_cut = true; ctx.credit_cut.next_pos = 99; ctx.has_paynow = true;
+        for (const auto& p : ps) { st::WeightedPayee w; w.key = p.id; w.weight = ::v37::U256(p.w); w.pay = p.ref; ctx.paynow_payees.push_back(w); }
+        return ctx;
+    };
+    auto owed_of = [](const o2::XmrOwedSettlementSource& s) {
+        Amounts m;
+        for (const auto& o : s.outputs_at(kReward))
+            if (o.role == x6::CoinbaseOutput::Role::Owed) m[o.identity] += static_cast<long long>(o.amount);
+        return m;
+    };
+    std::string why;
+    // node 1 builds A on the base ledger: the owed pass pays X and Y in full
+    auto srcA = o2::XmrOwedSettlementSource::build(base, pay_of, ctx_for(base), kReward, &why);
+    CHECK(srcA != nullptr, "A builds: %s", why.empty() ? "ok" : why.c_str());
+    if (!srcA) return;
+    const Amounts owedA = owed_of(*srcA);
+    CHECK(owedA.size() == 2 && owedA.at(xid) == owedX && owedA.at(yid) == owedY, "A: the owed pass pays X and Y in full");
+
+    // (a) A is booked on node 1 and not settled: X and Y are locked
+    {
+        st::OwedLedger L = base;
+        L.on_block_found("A", {}, owedA);
+        const auto locked = L.pending_payout_keys();
+        CHECK(locked.size() == 2 && locked.count(xid) && locked.count(yid), "pending_payout_keys == {X, Y} while A is unsettled");
+        L.on_block_found("seed2", Amounts{{xid, 50000000000ll}}, {});   // X earns more, finalized
+        L.on_block_finalized("seed2", 6);
+        auto c = ctx_for(L); c.owed_locked = locked;
+        auto s = o2::XmrOwedSettlementSource::build(L, pay_of, c, kReward, &why);
+        CHECK(s && owed_of(*s).empty() && s->carried_locked() == 1 && s->shape_matches_at(kReward),
+              "(a) X has a new 5e10 balance but is locked: no owed output, carried_locked=1");
+        std::uint64_t miners = 0; if (s) for (const auto& o : s->outputs_at(kReward)) if (o.role != x6::CoinbaseOutput::Role::Fixed) miners += o.amount;
+        CHECK(s && s->paynow_on() && miners == kReward - 1, "(a) pay-now still pays this block's miners the whole pool (reward-1)");
+    }
+    // (b) node 2 has not booked A: owed pass suspended, pay-now only
+    auto c2 = ctx_for(base); c2.owed_pass_suspended = true;
+    auto srcB = o2::XmrOwedSettlementSource::build(base, pay_of, c2, kReward, &why);
+    CHECK(srcB && owed_of(*srcB).empty() && srcB->owed_suspended() && srcB->paynow_on() && srcB->paynow_base() == 1,
+          "(b) suspended: no owed outputs, V37N base = fixed only (1), pay-now takes the pool");
+    // (c) every node books A and B from the chain and finalizes both
+    {
+        auto book = [&](const o2::XmrOwedSettlementSource& s, const std::string& bid, st::OwedLedger& L) {
+            Amounts credit; for (const auto& [k, v] : eb_at(kReward, ps)) credit[k] = static_cast<long long>(v);
+            Amounts payout; long long sink_total = 0;
+            for (const auto& o : s.outputs_at(kReward)) {
+                if (o.identity == D) sink_total += static_cast<long long>(o.amount - o.owed_part);
+                else payout[o.identity] += static_cast<long long>(o.amount);
+            }
+            (void)c2pool::v37n::xmr::paynow::net_booking(s.paynow_on() ? std::optional<std::uint64_t>(s.paynow_base()) : std::nullopt,
+                                                         kReward, credit, payout, sink_total, D, 1);
+            L.on_block_found(bid, credit, payout);
+        };
+        st::OwedLedger L = base;
+        book(*srcA, "A", L); book(*srcB, "B", L);
+        L.on_block_finalized("A", 65); L.on_block_finalized("B", 66);
+        auto neg = [](const st::OwedLedger& G, long long& sum, long long& mn) {
+            std::size_t n = 0; sum = 0; mn = 0;
+            for (const auto& [k, v] : G.finalW()) { (void)k; sum += v; if (v < 0) { ++n; if (v < mn) mn = v; } }
+            return n;
+        };
+        long long sum = 0, mn = 0;
+        const std::size_t n = neg(L, sum, mn);
+        CHECK(n == 0 && sum >= 0, "(c) debounce: A then B booked and settled, no negative row (sum %lld)", sum);
+
+        auto c3 = ctx_for(base);                       // contrast: no debounce
+        auto srcB0 = o2::XmrOwedSettlementSource::build(base, pay_of, c3, kReward, &why);
+        st::OwedLedger M = base;
+        if (srcB0) { book(*srcA, "A", M); book(*srcB0, "B", M); M.on_block_finalized("A", 65); M.on_block_finalized("B", 66); }
+        long long sum0 = 0, mn0 = 0;
+        const std::size_t n0 = neg(M, sum0, mn0);
+        CHECK(srcB0 && n0 == 2 && mn0 == -owedX,
+              "(c) contrast: without the debounce B pays X and Y again and both rows go negative (min %lld)", mn0);
+    }
+}
+#endif
 
 }  // namespace
 
@@ -507,6 +614,7 @@ int main() {
     suite_booking();
     suite_source();
     suite_assembled();
+    suite_debounce();
 #else
     suite_base();
 #endif

@@ -1122,6 +1122,19 @@ public:
         return d;
     }
 
+    // DEBOUNCE (#1861): every key that a FOUND-but-not-finalized block pays.
+    // Its owed payout is booked and deducted from EffectiveOwed, but until the
+    // block settles a builder that has not booked it yet can pay the same
+    // balance again; the XMR builder locks these keys out of its owed pass.
+    std::set<bytes32> pending_payout_keys() const {
+        std::set<bytes32> out;
+        for (const auto& [bid, p] : m_pending) {
+            (void)bid;
+            for (const auto& [k, v] : p.payout) if (v != 0) out.insert(k);
+        }
+        return out;
+    }
+
     // Diagnostics for the acceptance tests (never consensus).
     long long residual_total() const { return m_residual; }
     const std::vector<std::pair<std::string, long long>>& residual_events()
