@@ -899,11 +899,27 @@ inline std::map<bytes32, long long> compose_credit_replace(
 // negative EffectiveOwed (§4.4, forward repair, unclamped) — never a clawback.
 // ─────────────────────────────────────────────────────────────────────────
 
+// Ledger rules only the XMR lane turns on (docs/xmr-lane/payout-threshold.md
+// §6, §6a). Default: off, so Family A ledgers stay byte-identical.
+//   arm_floor          first_eligible (the K_fair age) is armed only while
+//                      finalW >= arm_floor, never below it: a parked sub-floor
+//                      balance earns no seniority (external review 02). A key
+//                      without an age is not paid by the owed pass.
+//   rotate_on_payment  a key paid in a finalized block that still has a
+//                      balance re-arms at that block's bin_height: paid ->
+//                      back of the queue (external review 04, audit O-1).
+struct OwedLedgerRules {
+    long long arm_floor = 0;
+    bool      rotate_on_payment = false;
+};
+
 class OwedLedger {
 public:
     using Amounts = std::map<bytes32, long long>;
 
-    explicit OwedLedger(::v37::ChainId chain) : m_chain(chain) {}
+    explicit OwedLedger(::v37::ChainId chain, OwedLedgerRules rules = {}) : m_chain(chain), m_rules(rules) {}
+
+    const OwedLedgerRules& rules() const { return m_rules; }
 
     ::v37::ChainId chain() const { return m_chain; }
     u64 ledger_seq() const { return m_seq; }
@@ -986,9 +1002,12 @@ public:
         for (const auto& [k, v] : it->second.credit) m_finalW[k] += v;
         for (const auto& [k, v] : it->second.payout) m_finalW[k] -= v;
         m_eo_index.apply_finalize_credit(it->second.credit);  // R3: eo += credit
+        std::vector<bytes32> paid;                            // rotate_on_payment
+        if (m_rules.rotate_on_payment)
+            for (const auto& [k, v] : it->second.payout) if (v > 0) paid.push_back(k);
         m_pending.erase(it);
         m_settled.insert(bid);
-        rearm_first_eligible(bin_height);
+        rearm_first_eligible(bin_height, paid);
         prune_finalized_zero_rows();                          // R3: drop 0/unarmed rows
         // FINALIZE consumes only (bid, bin_height); the amounts came from the
         // pending row the ledger already held, so the leaf carries no maps.
@@ -1072,7 +1091,7 @@ public:
         // sequence of keys (oracle KAT v37_w4_owed_incremental_test).
         Proposal prop;
         u64 budget = block_reward;
-        m_eo_index.for_each_eligible([&](const bytes32& k) -> bool {
+        for_each_in_turn([&](const bytes32& k, int) -> bool {
             // R1: slot_budget_C == 0 means UNBOUNDED output count (symmetric with
             // W5's max_payout_bytes == 0) — a 0 cap means "no count limit", NOT
             // "emit nothing". A positive C caps at the first C oldest-owed entries.
@@ -1081,6 +1100,7 @@ public:
             if (budget == 0) return false;
             long long owed = m_eo_index.value(k);
             if (owed <= 0) return true;    // (index holds only >0; defensive)
+            if (m_rules.arm_floor > 0 && !m_first_eligible.count(k)) return true;   // no age yet: below the floor
             u64 take = std::min<u64>(static_cast<u64>(owed), budget);
             ScriptRef pay = pay_of(k);
             if (take < h_min_of(pay.kind)) return true;   // sub-floor: CARRY
@@ -1115,6 +1135,7 @@ public:
             if (budget == 0) return false;
             long long owed = m_eo_index.value(k);
             if (owed <= 0) return true;
+            if (m_rules.arm_floor > 0 && !m_first_eligible.count(k)) return true;   // no age yet: below the floor
             u64 amt = std::min<u64>(static_cast<u64>(owed), budget);
             ScriptRef pay = pay_of(k);
             if (amt < h_min_of(pay.kind)) return true;   // sub-floor: CARRY
@@ -1130,6 +1151,7 @@ public:
         };
         std::vector<std::pair<bytes32, bytes32>> cohort;   // (salted, key)
         u64 cohort_fe = 0;
+        int cohort_pass = 0;
         auto flush = [&]() {
             std::sort(cohort.begin(), cohort.end());
             for (const auto& [h, k] : cohort) {
@@ -1138,13 +1160,14 @@ public:
             }
             cohort.clear();
         };
-        m_eo_index.for_each_eligible([&](const bytes32& k) -> bool {
+        for_each_in_turn([&](const bytes32& k, int pass) -> bool {
             const u64 fe = fe_at(k);
-            if (!cohort.empty() && fe != cohort_fe) {
+            if (!cohort.empty() && (fe != cohort_fe || pass != cohort_pass)) {
                 flush();
                 if (stop) return false;
             }
             cohort_fe = fe;
+            cohort_pass = pass;
             cohort.emplace_back(salted(k), k);
             return true;
         });
@@ -1233,6 +1256,36 @@ public:
 private:
     struct Pending { Amounts credit; Amounts payout; };
 
+    // The K_fair walk (first_eligible ASC, key ASC). With
+    // OwedLedgerRules::rotate_on_payment, a key paid in a block that is still
+    // pending walks after every other key (pass 1): its first_eligible moves to
+    // the back only at FINALIZE, D_conf blocks later, and until then it must
+    // not keep the front. The pending set at the booking point is the same on
+    // every node (R6), so this order is too. fn(k, pass) -> false stops.
+    template <typename Fn>
+    void for_each_in_turn(Fn&& fn) const {
+        if (!m_rules.rotate_on_payment) {
+            m_eo_index.for_each_eligible([&](const bytes32& k) -> bool { return fn(k, 0); });
+            return;
+        }
+        std::set<bytes32> recent;
+        for (const auto& [bid, p] : m_pending) {
+            (void)bid;
+            for (const auto& [k, v] : p.payout) if (v > 0) recent.insert(k);
+        }
+        bool go = true;
+        m_eo_index.for_each_eligible([&](const bytes32& k) -> bool {
+            if (recent.count(k)) return true;
+            go = fn(k, 0);
+            return go;
+        });
+        if (!go || recent.empty()) return;
+        m_eo_index.for_each_eligible([&](const bytes32& k) -> bool {
+            if (!recent.count(k)) return true;
+            return fn(k, 1);
+        });
+    }
+
     // The ONLY sequence advance. It mints the record-log leaf for the mutation
     // in the same step, so "one leaf per ledger_seq increment" is not a
     // convention a future edit can drift away from — there is no bump() that
@@ -1245,7 +1298,7 @@ private:
     // Re-arm/disarm first_eligible: a key whose EffectiveOwed just went from
     // <=0 to >0 is armed at `bin_height` (its age start); a key back at <=0 is
     // disarmed. Monotone bin_height (the coin high-water) is the K_fair clock.
-    void rearm_first_eligible(u64 bin_height) {
+    void rearm_first_eligible(u64 bin_height, const std::vector<bytes32>& paid = {}) {
         // R-A (P0 lane_commitment race-fork fix, RECON #1697): arm/disarm
         // first_eligible on the FINALIZED weight finalW(k) ALONE — NOT the
         // pending-netted EffectiveOwed(k) = finalW − Σ_pending payout. fe feeds
@@ -1265,12 +1318,21 @@ private:
         // Iterate m_finalW: every armed key has a finalW row (fe is set only for
         // a finalW>0 key, and prune_finalized_zero_rows never drops an armed row,
         // so fe-keys ⊆ finalW-keys — the iteration covers every disarm too).
+        // OwedLedgerRules::arm_floor: armed only at or above the floor (0 = the
+        // shipped w > 0 rule, byte-identical).
+        const long long floor = m_rules.arm_floor > 1 ? m_rules.arm_floor : 1;
         for (const auto& [k, w] : m_finalW) {
-            if (w > 0) {
+            if (w >= floor) {
                 if (!m_first_eligible.count(k)) m_first_eligible[k] = bin_height;
             } else {
                 m_first_eligible.erase(k);
             }
+        }
+        // OwedLedgerRules::rotate_on_payment: paid in this block and still owed
+        // -> its age restarts here (the back of the queue).
+        for (const bytes32& k : paid) {
+            auto fe = m_first_eligible.find(k);
+            if (fe != m_first_eligible.end()) fe->second = bin_height;
         }
         // Re-establish the ordered positive view from the just-updated fe.
         m_eo_index.rebuild_order([this](const bytes32& k) { return fe_at(k); });
@@ -1301,6 +1363,7 @@ private:
     }
 
     ::v37::ChainId m_chain;
+    OwedLedgerRules m_rules;
     u64 m_seq = 0;
     Amounts m_finalW;                              // finalized owed partition
     std::map<std::string, Pending> m_pending;      // FOUND, not yet finalized

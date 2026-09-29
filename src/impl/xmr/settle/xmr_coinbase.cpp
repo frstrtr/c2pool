@@ -152,6 +152,27 @@ std::vector<std::uint64_t> paynow_split(std::uint64_t pool,
 }
 
 // ---------------------------------------------------------------------------
+// Blockchain::get_dynamic_base_fee(block_reward, median) with the median at
+// the floor, in Monero's own arithmetic: lo = reward * ref_weight / median /
+// median (128-bit), lo -= lo / 20, at least 1.
+std::uint64_t fee_per_byte_at_floor(std::uint64_t reward) {
+    unsigned __int128 v = static_cast<unsigned __int128>(reward) * kFeeReferenceTxWeight;
+    v /= kFeeMedianFloor;
+    v /= kFeeMedianFloor;
+    std::uint64_t lo = static_cast<std::uint64_t>(v);
+    lo -= lo / 20;
+    return lo == 0 ? 1 : lo;
+}
+
+std::uint64_t spend_floor(std::uint64_t total) {
+    // Blockchain::check_fee: needed_fee = tx_weight * fee_per_byte, quantized up.
+    const unsigned __int128 need = static_cast<unsigned __int128>(kInputWeight) * fee_per_byte_at_floor(total);
+    const unsigned __int128 q = (need + kFeeQuantizationMask - 1) / kFeeQuantizationMask * kFeeQuantizationMask;
+    return q > std::numeric_limits<std::uint64_t>::max() ? std::numeric_limits<std::uint64_t>::max()
+                                                          : static_cast<std::uint64_t>(q);
+}
+
+// ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err) {
     auto fail = [&](BuildError e) -> std::vector<CoinbaseOutput> {
@@ -208,6 +229,8 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
     // position like any payee, but takes no output slot: its payout is moved
     // into the folded output after S2 (one output per fold identity).
     std::size_t n_slots = 0;
+    const std::uint64_t floor_c = in.spend_floor ? spend_floor(budget) : 0;
+    const std::uint64_t h_min = std::max(in.h_min, floor_c);   // SPEND-COST FLOOR: no owed payout below c
     for (const auto& e : sorted) {
         const bool merge = fold && is_fold_payee(in, e.pay, e.identity);
         if (!merge && n_slots >= cap_owed) {  // cap reached -> rest carries
@@ -215,11 +238,11 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
             break;
         }
         if (remaining == 0) break;           // budget exhausted -> rest carries
-        if (e.owed < in.h_min) continue;     // below payout floor -> carry, no output
+        if (e.owed < h_min) continue;        // below payout floor -> carry, no output
         std::uint64_t amt = std::min(e.owed, remaining);
         // Final partial below the payout floor: don't emit a sub-h_min owed
         // output; stop and let the residual sink absorb `remaining`.
-        if (amt < in.h_min) break;
+        if (amt < h_min) break;
         CoinbaseOutput o;
         o.pay = e.pay;
         o.identity = e.identity;
@@ -248,6 +271,43 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
             std::vector<std::uint64_t> eb;
             eb.reserve(ents.size());
             for (const auto& e : ents) eb.push_back(e.eb);
+            if (in.spend_floor) {
+                // SPEND-COST FLOOR: who is paid now, and at weight 2*E_b (E_b plus
+                // at most E_b of advance). A payee needs a new slot unless it is the
+                // residual sink or already has an owed output to merge into.
+                auto needs_slot = [&](const PayNowEntry& e) {
+                    if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink) return false;
+                    for (const auto& o : res)
+                        if (o.role == CoinbaseOutput::Role::Owed && o.identity == e.identity && o.pay == e.pay) return false;
+                    return true;
+                };
+                std::vector<std::size_t> order;
+                for (std::size_t i = 0; i < ents.size(); ++i)
+                    if (ents[i].eb >= floor_c) order.push_back(i);
+                std::stable_sort(order.begin(), order.end(),
+                                 [&](std::size_t a, std::size_t b) { return ents[a].eb > ents[b].eb; });   // largest E_b first; ties: identity ASC
+                // Admit in that order while (a) a slot is free and (b) the pool
+                // still pays the newcomer at least c once it is shared pro rata:
+                // pool * w_i / Σw >= c for the smallest admitted, i.e. every
+                // admitted payee. Admission stops at the first that fails; the
+                // rest wait as balances, so no output below c is ever emitted.
+                std::vector<std::uint64_t> w(ents.size(), 0);
+                std::size_t free_slots = cap_owed > n_slots ? cap_owed - n_slots : 0;
+                unsigned __int128 sum_w = 0;
+                for (const std::size_t i : order) {
+                    const bool slot = needs_slot(ents[i]);
+                    if (slot && free_slots == 0) continue;   // no slot: it waits, as a balance
+                    const std::uint64_t wi = ents[i].eb > std::numeric_limits<std::uint64_t>::max() / 2
+                                                 ? std::numeric_limits<std::uint64_t>::max() : 2 * ents[i].eb;
+                    const unsigned __int128 s2 = sum_w + wi;
+                    const bool full = static_cast<unsigned __int128>(pool) >= s2;   // every admitted gets its whole weight
+                    if (!full && static_cast<unsigned __int128>(pool) * wi / s2 < floor_c) break;
+                    if (slot) --free_slots;
+                    w[i] = wi;
+                    sum_w = s2;
+                }
+                eb = std::move(w);
+            }
             const std::vector<std::uint64_t> alloc = paynow_split(pool, eb);
             for (std::size_t i = 0; i < ents.size(); ++i) {
                 if (alloc[i] == 0) continue;

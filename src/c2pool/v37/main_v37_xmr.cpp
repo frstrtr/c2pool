@@ -2161,7 +2161,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         const Amounts gross_credit = credit, gross_payout = payout;
         const auto r = c2pool::v37n::xmr::paynow::net_booking(bk.paynow_base, bk.total, credit, payout, bk.sink_total, sink_id,
-                                                              fee_on ? static_cast<long long>(fee::kDonationDustPico) : 0);
+                                                              fee_on ? static_cast<long long>(fee::kDonationDustPico) : 0,
+                                                              cba_scfg && cba_scfg->spend_floor);
         if (!r.ok) {
             ++paynow_refused; why = r.why;
             std::printf("paynow-ALARM refused: h=%llu bid=%s… %s\n", static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), r.why.c_str());
@@ -2482,6 +2483,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         li.pool_tag = cba_scfg->pool_tag;
         li.kfair = cba_scfg->kfair;
         li.kfair_salted_ties = cba_scfg->kfair_salted_ties;
+        li.spend_floor = cba_scfg->spend_floor;
         rc::CutInputs ci;
         auto view = view_at_cut(bk.credit_cut, why, relay_hint(bid));   // the view fold_at_cut just folded
         if (!view) {
@@ -3295,6 +3297,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         // and only blocks carrying it are booked as lane blocks here.
         scfg.pool_tag = pool_tag_of(cfg);
         scfg.kfair_salted_ties = true;   // #1867: equal-age cohorts ordered by a hash of the parent id
+        scfg.spend_floor = true;         // payout-threshold.md §2-§3: Monero's spend cost is the payout floor
         std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
                     hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
                     hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
@@ -5492,6 +5495,10 @@ int main(int argc, char** argv) {
                         g_web_host.c_str(), static_cast<unsigned>(g_web_port));
             web.reset();
         }
+    }
+    if (cfg.coinbase == CoinbaseMode::V37Settlement) {   // payout-threshold.md §6, §6a: from the lane's genesis
+        cfg.ledger_arm_floor = static_cast<long long>(::v37::xmr::settle::spend_floor(::v37::xmr::settle::kTailSubsidy));
+        cfg.ledger_rotate_on_payment = true;
     }
     const int rc = run_live(cfg);
     g_web = nullptr; g_web_extra = {}; g_web_name = {};

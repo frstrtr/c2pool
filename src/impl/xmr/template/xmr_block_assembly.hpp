@@ -736,8 +736,15 @@ public:
         std::uint64_t fees_all = 0, weight_all = 0;
         for (const auto& t : mempool) { fees_all += t.fee; weight_all += t.weight; }
 
+        // SPEND-COST FLOOR (payout-threshold.md §3): the coinbase takes its room
+        // first and the transactions fill the rest (the trim above and the
+        // template's own pick both count the miner tx before any tx), so the cap
+        // is the wire ceiling, a constant every receiver can check. A cap chosen
+        // from the builder's own tx set is latitude a receiver cannot verify.
         if (base.output_cap == 0)
-            base.output_cap = ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
+            base.output_cap = base.spend_floor
+                ? a.wire_cap
+                : ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
 
         std::uint64_t hint = subsidy + fees_all;   // == the template's sizing-pass reward
         std::vector<std::uint64_t> tried;

@@ -170,6 +170,34 @@ struct PayNowEntry {
 std::vector<std::uint64_t> paynow_split(std::uint64_t pool,
                                         const std::vector<std::uint64_t>& eb);
 
+// ---------------------------------------------------------------------------
+// SPEND-COST FLOOR c (docs/xmr-lane/payout-threshold.md §2). The largest
+// minimum fee Monero can require to spend one coinbase output: Monero's
+// consensus fee per byte (Blockchain::get_dynamic_base_fee, 2021 scaling) at
+// the 300 kB fee-median floor, times the weight one input adds to a RingCT
+// transaction, rounded up to Monero's fee quantization. Every constant below
+// is Monero's (cryptonote_config.h), cited by name.
+inline constexpr std::uint64_t kFeeMedianFloor       = 300000;  // CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5
+inline constexpr std::uint64_t kFeeReferenceTxWeight = 3000;    // DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT
+inline constexpr std::uint64_t kFeeQuantizationMask  = 10000;   // 10^(CRYPTONOTE_DISPLAY_DECIMAL_POINT 12 - PER_KB_FEE_QUANTIZATION_DECIMALS 8)
+inline constexpr std::uint64_t kRingSize             = 16;      // HF_VERSION_MIN_MIXIN_15 (15) + the real input
+// One input: txin_to_key prefix (tag, amount 0, offset count, ring offsets at
+// their 1-byte minimum, key image) + CLSAG (s[ring], c1, D) + its pseudo-out.
+inline constexpr std::uint64_t kInputWeight =
+    (1 + 1 + 1 + kRingSize * 1 + 32) + (kRingSize * 32 + 32 + 32) + 32;   // 659
+static_assert(kInputWeight == 659, "one RingCT/CLSAG input at ring 16");
+
+// Monero's tail emission per block: FINAL_SUBSIDY_PER_MINUTE (3e11) x the
+// 2-minute target (DIFFICULTY_TARGET_V2). Every block since 2022 pays at least
+// this, so spend_floor(kTailSubsidy) is the smallest c any tail-era block has:
+// the XMR ledger's arm floor (OwedLedgerRules::arm_floor).
+inline constexpr std::uint64_t kTailSubsidy = 300000000000ull * 2;
+
+// Monero's minimum fee per byte for `reward` at the fee-median floor.
+std::uint64_t fee_per_byte_at_floor(std::uint64_t reward);
+// c: the cost to spend one output of a block whose coinbase total is `total`.
+std::uint64_t spend_floor(std::uint64_t total);
+
 struct CoinbaseInputs {
     // --- FENCE key ---
     std::uint8_t   monero_major_version = 0;
@@ -204,6 +232,16 @@ struct CoinbaseInputs {
     // upper bound on the entry count (the assembler's weight reserve).
     std::function<std::vector<PayNowEntry>(std::uint64_t budget)> paynow_at;
     std::size_t    paynow_n = 0;
+
+    // --- SPEND-COST FLOOR (payout-threshold.md §3; off => master behaviour) ---
+    // c = spend_floor(budget()). The owed pass pays no balance below c. Pay-now
+    // pays the payees with E_b >= c that fit in the output cap (largest E_b
+    // first when they do not all fit), and advances them the cash of the
+    // others (crumbs, and payees without a slot) pro rata, at most their own
+    // E_b each: paynow_split over weights 2*E_b. Cash beyond that stays in the
+    // residual. The others keep their E_b as a balance. Pay-now never fails
+    // the build for want of a slot.
+    bool           spend_floor = false;
 
     // --- tx_extra ---
     std::vector<unsigned char> extra_nonce; // 0x02 padded per-worker extranonce

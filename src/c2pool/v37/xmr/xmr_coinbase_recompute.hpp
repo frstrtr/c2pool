@@ -54,7 +54,11 @@
 //     transaction set. The recompute accepts the caps that can have produced
 //     the block's output count (n and n + 1) and the lane ceiling. A smaller
 //     cap only truncates the owed pass, which a builder can already force by
-//     filling its block with transactions: stated, not hidden.
+//     filling its block with transactions: stated, not hidden. With the
+//     spend-cost floor (LaneInputs::spend_floor) the cap is the wire ceiling
+//     and nothing else: the coinbase takes its room before any transaction,
+//     and a smaller claimed cap would let a builder push payees into an
+//     advance it keeps (payout-threshold.md §3).
 //
 // OUTCOME (ruling 2): a non-canonical lane block is booked with its on-chain
 // payouts DEBITED (money that left the pool on-chain is never forgotten:
@@ -104,6 +108,7 @@ struct LaneInputs {
     std::optional<::v37::bytes32> pool_tag;     // V37P (POOL-LINEAGE)
     o2::KFairSource  kfair = o2::KFairSource::W4Propose;
     bool             kfair_salted_ties = false;  // #1867: equal-age cohorts by a hash of the parent id
+    bool             spend_floor = false;        // payout-threshold.md §2-§3: c from the block's own total
 };
 
 // What the block's booking already established.
@@ -196,6 +201,7 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
     ctx.h_min                = lane.h_min;
     ctx.output_cap           = lane.owed_cap;
     ctx.kfair_salted_ties    = lane.kfair_salted_ties;   // the salt is the block's own prev_id
+    ctx.spend_floor          = lane.spend_floor;         // c is a function of bk.total alone
     ctx.has_credit_cut       = bk.has_credit_cut;
     ctx.credit_cut           = bk.credit_cut;
     if (lane.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *lane.pool_tag; }
@@ -256,8 +262,10 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
         if (std::find(caps.begin(), caps.end(), static_cast<std::uint32_t>(c)) == caps.end()) caps.push_back(static_cast<std::uint32_t>(c));
     };
     add_cap(lane.wire_cap);
-    add_cap(got.amounts.size());
-    add_cap(got.amounts.size() + 1);
+    if (!lane.spend_floor) {   // with the floor the cap is the wire ceiling, and nothing else reproduces
+        add_cap(got.amounts.size());
+        add_cap(got.amounts.size() + 1);
+    }
     x6::MatchResult first{false, x6::IDX_BUILD, "no candidate cap"};
     for (const std::uint32_t c : caps) {
         x6::CoinbaseInputs in = src->inputs_at(bk.total, *payload);

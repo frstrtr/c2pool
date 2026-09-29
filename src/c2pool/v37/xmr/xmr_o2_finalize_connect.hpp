@@ -2002,6 +2002,7 @@ private:
         if (!m_o.book_scratch) { ++m_stats.converge_failed; enter_diverged("no re-derivation decoder is installed (book_scratch)"); return; }
         minority::RefoldInput in;
         in.chain = m_cfg.lane_chain; in.d_conf = D; in.fork_h = F; in.cursor = c;
+        in.rules = m_node.ledger().rules();
         try {
             m_node.store().for_each_prefix(store_codec::k_evt_prefix(m_cfg.lane_chain), [&](const std::string&, const std::string& v) {
                 in.events.push_back(SettleEvent::deserialize(v)); return true; });

@@ -128,8 +128,13 @@ o2::PayOfFn pay_of_map(const std::map<::v37::bytes32, ::v37::ScriptRef>& m) {
 }
 
 // The lane: miners whose shares are in the view at each cut, and the owed seeds.
+// SPEND-COST FLOOR (payout-threshold.md §2-§3), as the daemon runs it; M7 turns it on.
+bool g_spend_floor = false;
+std::uint64_t g_cap_at = 0; std::uint32_t g_cap = 0;   // M8: the block at g_cap_at is built with this output cap
+
 struct LaneWorld {
-    std::vector<Payee> miners;                    // m0..m5
+    std::vector<Payee> miners;                    // m0..m5 (+ tiny miners, M7)
+    std::size_t n_big = 6;                        // miners[n_big..] are tiny: E_b below c
     std::vector<Payee> seeded;                    // s0..s2: old owed balances (lane config)
     std::vector<long long> seed_amount;
     std::map<::v37::bytes32, ::v37::ScriptRef> universe;   // every ref (for decoding outputs)
@@ -147,7 +152,9 @@ struct LaneWorld {
         for (std::size_t i = 0; i < miners.size(); ++i) {
             if ((h + i) % 4 == 0) continue;   // not every miner is in every window
             st::WeightedPayee w; w.key = miners[i].id; w.pay = miners[i].ref;
-            w.weight = ::v37::U256(1 + (h * 7 + i * 3) % 5);
+            const bool tiny = i >= n_big;
+            w.weight = tiny ? ::v37::U256(1 + (h + i * 7) % 30)                          // a few CPU hashes
+                            : ::v37::U256((1 + (h * 7 + i * 3) % 5) * (n_big < miners.size() ? 1000000ull : 1ull));
             v.push_back(w);
         }
         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
@@ -184,6 +191,7 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     ctx.fixed = {fee::donation_marker(kNet)};
     ctx.h_min = 0; ctx.output_cap = 2700;
     ctx.kfair_salted_ties = true;   // mainnet: #1867 salted tie-break
+    ctx.spend_floor = g_spend_floor;
     ctx.has_credit_cut = true; ctx.credit_cut = W.cut_at(h);
     ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
     ctx.has_paynow = true; ctx.paynow_payees = W.view_at(h);
@@ -193,6 +201,7 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     asm_::AssemblyInputs a;
     a.miner = md; a.mempool = mempool;
     a.settle = o2::assembly_settle_inputs(*src, true);
+    if (g_cap_at && h == g_cap_at) a.settle.output_cap = g_cap;   // M8: a claimed-full builder
     a.extra_nonce_tail = src->extra_nonce_tail();
     if (mutate) {   // a MODIFIED builder: tails re-derived from its edited inputs
         mutate(a.settle);
@@ -251,6 +260,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     li.residual_sink = fee::donation_ref(kNet); li.residual_sink_identity = fee::donation_identity(kNet);
     li.fixed = {fee::donation_marker(kNet)}; li.pool_tag = the_tag();
     li.kfair_salted_ties = true;
+    li.spend_floor = g_spend_floor;
     rc::CutInputs ci; ci.has_view = true; ci.payees = W.view_at(h);
     const auto res = rc::verify_lane_coinbase(b.blob, bk, n.L, pay_of_map(n.booked), li, ci);
     r.v = res.verdict; r.why = res.why;
@@ -261,7 +271,8 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
         r.credit = fold(bk.total, W.view_at(h));
         r.payout = bk.payout;
         const auto nb = pn::net_booking(bk.paynow_base, bk.total, r.credit, r.payout, bk.sink_total,
-                                        fee::donation_identity(kNet), static_cast<long long>(fee::kDonationDustPico));
+                                        fee::donation_identity(kNet), static_cast<long long>(fee::kDonationDustPico),
+                                        g_spend_floor);
         if (!nb.ok) { r.v = rc::Verdict::Undecidable; r.why = nb.why; return r; }
     } else {
         return r;
@@ -279,6 +290,8 @@ struct Run {
     std::map<::v37::bytes32, long long> credited, paid, eb_gross;   // per identity (node 0 / on-chain / E_b at each cut)
     long long donation_paid = 0;
     std::uint64_t blocks = 0;
+    std::uint64_t min_payout = ~std::uint64_t{0}, min_floor = ~std::uint64_t{0};   // smallest non-donation output / smallest c seen
+    std::size_t below_floor = 0;                                                     // outputs below their own block's c
     std::vector<Node> nodes;
 };
 
@@ -290,6 +303,12 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
              std::optional<Payee> oob_ref_on_node2 = std::nullopt) {
     Run run;
     run.nodes.resize(3);
+    if (g_spend_floor) {   // the daemon's XMR ledger rules come with the floor (payout-threshold.md §6, §6a)
+        st::OwedLedgerRules rules;
+        rules.arm_floor = static_cast<long long>(x6::spend_floor(x6::kTailSubsidy));
+        rules.rotate_on_payment = true;
+        for (auto& n : run.nodes) n.L = st::OwedLedger(kChain, rules);
+    }
     for (auto& n : run.nodes) {
         for (std::size_t i = 0; i < W.seeded.size(); ++i) {
             const std::string bid = "seed-" + std::to_string(i);
@@ -358,6 +377,12 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
                 std::uint64_t don = 0;
                 for (std::size_t o = 0; o < bk.out_identity.size(); ++o) if (bk.out_identity[o] == fee::donation_identity(kNet)) don += bk.out_amount[o];
                 run.donation_paid += static_cast<long long>(don);
+                for (std::size_t o = 0; o < bk.out_identity.size(); ++o)
+                    if (!(bk.out_identity[o] == fee::donation_identity(kNet))) {
+                        run.min_payout = std::min(run.min_payout, bk.out_amount[o]);
+                        if (bk.out_amount[o] < x6::spend_floor(bk.total)) ++run.below_floor;
+                    }
+                run.min_floor = std::min(run.min_floor, x6::spend_floor(bk.total));
             }
         }
         // FINALIZE(h - D) at bin h on every node (the synced order: book(h) -> FINALIZE(h - D))
@@ -453,6 +478,61 @@ void m6_thief_pays_local_ref() {
     CHECK(eo(r, ghost.id) == 50000000000ll, "the ghost's owed balance is untouched by a block the pool never booked (owed %lld)", eo(r, ghost.id));
 }
 
+void m7_spend_floor() {
+    std::printf("== M7. the spend-cost floor with many tiny miners ==\n");
+    g_spend_floor = true;
+    LaneWorld W;
+    for (int i = 0; i < 40; ++i) {                                   // 40 tiny miners: E_b far below c
+        const Payee p = payee(static_cast<std::uint8_t>(120 + i));
+        W.miners.push_back(p); W.universe[p.id] = p.ref;
+    }
+    const std::uint64_t H = 48;
+    Run r = simulate(W, H);
+    g_spend_floor = false;
+    CHECK(r.blocks == H && r.canonical == H && r.mismatch == 0 && r.other == 0,
+          "every one of %llu lane blocks is CANONICAL on every node (canonical=%zu mismatch=%zu other=%zu)",
+          (unsigned long long)H, r.canonical, r.mismatch, r.other);
+    CHECK(r.verdict_splits == 0 && r.split_heights == 0, "one verdict and one owed_digest on all three nodes, every height");
+    CHECK(r.below_floor == 0, "no output below its own block's c (smallest payout %llu, smallest c %llu)",
+          (unsigned long long)r.min_payout, (unsigned long long)r.min_floor);
+    bool exact = true, bounded = true;
+    long long tiny_paid = 0, tiny_bal = 0, big_bal = 0;
+    for (const auto& [k, eb] : r.eb_gross) {
+        const long long paid = r.paid.count(k) ? r.paid.at(k) : 0;
+        const long long bal = eo(r, k);
+        if (eb - paid != bal) exact = false;
+        bool tiny = false;
+        for (std::size_t i = W.n_big; i < W.miners.size(); ++i) if (W.miners[i].id == k) tiny = true;
+        if (tiny) { tiny_paid += paid; tiny_bal += bal; if (bal < 0 || bal >= 2 * static_cast<long long>(r.min_floor)) bounded = false; }
+        else big_bal += bal;
+    }
+    CHECK(exact, "every key: E_b credited - paid on chain == its ledger balance (nothing lost, nothing invented)");
+    CHECK(bounded, "every tiny miner's balance stays in [0, 2c): it is paid once it reaches c");
+    CHECK(tiny_paid > 0, "tiny miners are paid: %lld piconero reached them through the owed pass", tiny_paid);
+    long long seeds_now = 0, seeds_then = 0;
+    for (std::size_t i = 0; i < W.seeded.size(); ++i) { seeds_now += eo(r, W.seeded[i].id); seeds_then += W.seed_amount[i]; }
+    const long long total = tiny_bal + big_bal + seeds_now;
+    CHECK(total >= seeds_then && total - seeds_then <= static_cast<long long>(H),
+          "the ledger does not grow: total owed %lld == the seeded float %lld (+ at most 1 piconero marker per block); "
+          "the seeds moved to the miners (%lld), tiny crumbs %lld",
+          total, seeds_then, big_bal, tiny_bal);
+}
+
+void m8_claimed_full() {
+    std::printf("== M8. a builder claims too few output slots ==\n");
+    g_spend_floor = true;
+    LaneWorld W;
+    for (int i = 0; i < 6; ++i) { const Payee p = payee(static_cast<std::uint8_t>(170 + i)); W.miners.push_back(p); W.universe[p.id] = p.ref; }
+    W.n_big = W.miners.size();                                    // every miner is payable: nobody is a crumb
+    // h=9: the builder caps its coinbase at 4 outputs, so the payees without a
+    // slot wait and their cash is advanced to the ones paid (itself among them).
+    g_cap_at = 9; g_cap = 4;
+    Run r = simulate(W, 20);
+    g_cap_at = 0; g_spend_floor = false;
+    CHECK(r.mismatch_at == std::set<std::uint64_t>{9}, "the short-capped block (h=9) is a MISMATCH on every node (%zu)", r.mismatch);
+    CHECK(r.verdict_splits == 0 && r.split_heights == 0, "one verdict, one digest");
+}
+
 void m5_gate_and_config() {
     std::printf("== M5. the booking-point gate and the mainnet configuration ==\n");
     namespace recon = c2pool::v37n::xmr::recon;
@@ -499,6 +579,8 @@ int main() {
     m3_overpay();
     m4_out_of_band_ref();
     m6_thief_pays_local_ref();
+    m7_spend_floor();
+    m8_claimed_full();
     m5_gate_and_config();
 #else
     suite_base();

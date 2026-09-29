@@ -90,7 +90,14 @@ public:
             ::v37::xmr::xmr_point_check_fn point_check = nullptr)
         : m_cfg(std::move(cfg)), m_transport(transport),
           m_injected_point_check(point_check),
-          m_ledger(m_cfg.lane_chain) {}
+          m_ledger(m_cfg.lane_chain, ledger_rules()) {}
+
+    ::c2pool::v37n::settle::OwedLedgerRules ledger_rules() const {
+        ::c2pool::v37n::settle::OwedLedgerRules r;
+        r.arm_floor = m_cfg.ledger_arm_floor;
+        r.rotate_on_payment = m_cfg.ledger_rotate_on_payment;
+        return r;
+    }
 
     ~XmrNode() { stop(); }
 
@@ -504,7 +511,7 @@ public:
     // boot_digest_history(). Returns false (nothing changed) on a torn store.
     bool relineage(std::string* why = nullptr) {
         if (!m_store || !m_finalize) { if (why) *why = "node not up"; return false; }
-        OwedLedger fresh(m_cfg.lane_chain);
+        OwedLedger fresh(m_cfg.lane_chain, ledger_rules());
         std::vector<::v37::bytes32> ds; std::vector<std::uint64_t> ss; std::uint64_t last = 0;
         bool ok = false;
         const RecoveredState st = replay_store(fresh, ds, ss, last, ok);

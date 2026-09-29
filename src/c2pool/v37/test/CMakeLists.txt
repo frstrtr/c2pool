@@ -867,6 +867,25 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_mainnet_rehearsal_kat COMMAND v37_xmr_mainnet_rehearsal_kat)
 
     # ------------------------------------------------------------------
+    # v37_xmr_spend_floor_kat -- the spend-cost floor c (Monero's minimum
+    # fee to spend one output at the 300 kB fee-median floor) and crumbs:
+    # payees below c keep their E_b as a balance and their cash is advanced
+    # to the paid payees in the same block (docs/xmr-lane/payout-threshold.md).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_spend_floor_kat
+        v37_xmr_spend_floor_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_spend_floor_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_spend_floor_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_spend_floor_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_spend_floor_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_spend_floor_kat COMMAND v37_xmr_spend_floor_kat)
+
+    # ------------------------------------------------------------------
     # SAME-BLOCK PAY-NOW on POOL-LINEAGE: one lane coinbase carries both the
     # V37N pay-now base and the V37P pool tag in the canonical order
     # V37N | V37D | V37P | V37C (V37C last); every field reads back (codec,

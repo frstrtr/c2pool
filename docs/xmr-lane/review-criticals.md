@@ -58,19 +58,19 @@ Closed natively.
 Closed natively. The XMR owed floor is 0 and is now pinned on mainnet. With
 no floor there is no CARRY: a key at the head of the queue is paid in full,
 reaches 0 and is disarmed. A key cannot stay positive and unpaid at the head.
-The planned spend-cost floor `c` reintroduces an owed floor, so it ships in the
-same consensus change as seniority from `c`
-(`payout-threshold.md` §6, §8).
+The spend-cost floor `c` reintroduces an owed floor, so it ships in the same
+change as seniority from the floor: a balance below it has no age and is not
+paid by the owed pass (`OwedLedgerRules::arm_floor`, `v37_xmr_spend_floor_kat` F7).
 
 ## High
 
 | # | finding | XMR lane now |
 |---|---|---|
-| 03 | identity spam, O(N) walk | No floor, so the walk stops at budget 0 or the slot cap. Paid rows are pruned. Receipts self-carry under the carrier identity, so an identity costs a full share. |
-| 04 | no per-payee cap | **Ruled (2026-09-29): rotation on a partial payment**, no cap constant: a key paid in part goes to the back of the queue (`payout-threshold.md` §6a). Designed, ships with the threshold. Also closes audit O-1. |
+| 03 | identity spam, O(N) walk | A key needs a full share to exist (receipts self-carry under the carrier identity), and paid rows are pruned. With the floor, a sub-floor balance has no age and the owed walk skips it: that skip is the remaining O(sub-floor keys) cost, about 1 µs per key. Dust decay (`payout-threshold.md` §5, next) removes abandoned sub-floor rows. |
+| 04 | no per-payee cap | **Closed (ruled 2026-09-29): rotation on payment**, no cap constant. A key paid in part walks after every other key while the paying block is pending, and its age restarts at FINALIZE (`OwedLedgerRules::rotate_on_payment`, `v37_xmr_spend_floor_kat` F8). Also closes audit O-1. |
 | 05a | pre-settle orphan costs seniority | Refuted since #1704; pinned by #1876. |
 | 05b | post-settle orphan | By design. The finality boundary is D_conf = 60 (coinbase maturity) and is pinned on mainnet. |
-| 06 | residue owner, insolvency | The residue has one owner: the protocol donation output (fee model v1, mandatory on mainnet). **Open:** when pay-now needs more output slots than the block's cap has, pay-now is dropped, E_b is credited as owed, and the residual goes to the donation output (`xmr_o2_settlement_source.hpp`, CapTooSmall). **Designed:** payees below the spend-cost floor `c` accumulate, payees that do not fit wait, and their cash is advanced to the payees paid in the same block, so every block pays out what it credits (`payout-threshold.md` §3). |
+| 06 | residue owner, insolvency | The residue has one owner: the protocol donation output (fee model v1, mandatory on mainnet). **Closed:** payees below the spend-cost floor `c` and payees without an output slot keep their E_b as a balance, and their cash is advanced pro rata to the payees paid in the same block (at most their own E_b). Pay-now no longer fails for want of a slot, and every block pays out what it credits (`payout-threshold.md` §3; rehearsal M7: the ledger total stays at the seeded float over 48 blocks). Only a pool with nothing to advance against (its first blocks) sends cash to the donation output. |
 | 07 | floor depends on address kind | Not applicable: Monero has one output kind and the floor is 0. |
 
 ## Low and disclosure
