@@ -871,6 +871,16 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
                 std::printf("ledger-ALARM aggregate: sum(finalW)=%lld < 0 -- the ledger owes less than it has paid out "
                             "(owed-sign ruling C-3 violated; %zu negative rows, %lld)\n",
                             h.sum_final, h.negative_rows, h.negative_sum);
+            // Per-row bound (#1860, step 1): a key more than one block reward in
+            // debt cannot be repaired by its own next credit; either a modified
+            // builder paid it far above its balance or it was paid twice more
+            // than once. One reward is taken as Monero's tail emission (0.6 XMR),
+            // the floor of every mainnet reward.
+            constexpr long long kOneRewardPico = 600'000'000'000LL;
+            if (h.min_row < -kOneRewardPico)
+                std::printf("ledger-ALARM row: key %s… is %lld below zero, more than one block reward (%lld): forward "
+                            "repair cannot cover it from that key's own credit (owed-sign ruling C-4 shape)\n",
+                            hex_of(h.min_key).substr(0, 12).c_str(), h.min_row, kOneRewardPico);
         }
         // c2pool#1551. r7=0 is the claim that matters: it counts settlements the
         // same-height gate did not authorise, which is the only shape an
