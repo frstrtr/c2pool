@@ -67,7 +67,7 @@ same consensus change as seniority-from-the-threshold
 | # | finding | XMR lane now |
 |---|---|---|
 | 03 | identity spam, O(N) walk | No floor, so the walk stops at budget 0 or the slot cap. Paid rows are pruned. Receipts self-carry under the carrier identity, so an identity costs a full share. |
-| 04 | no per-payee cap | Open by design. Oldest-owed-first is recomputed, and a head balance drains by whole blocks. A cap with rotation needs a ruling. On XMR a balance above one reward needs the pool to be short of cash, which the threshold (t_fit) prevents. |
+| 04 | no per-payee cap | **Ruled (2026-09-29): rotation on a partial payment**, no cap constant: a key paid in part goes to the back of the queue (`payout-threshold.md` §6a). Designed, ships with the threshold. Also closes audit O-1. |
 | 05a | pre-settle orphan costs seniority | Refuted since #1704; pinned by #1876. |
 | 05b | post-settle orphan | By design. The finality boundary is D_conf = 60 (coinbase maturity) and is pinned on mainnet. |
 | 06 | residue owner, insolvency | The residue has one owner: the protocol donation output (fee model v1, mandatory on mainnet). **Open:** when pay-now needs more output slots than the block's cap has, pay-now is dropped, E_b is credited as owed, and the residual goes to the donation output (`xmr_o2_settlement_source.hpp`, CapTooSmall). The threshold's t_fit and the lottery close this. #1871 FILL is the last-resort guard. |
