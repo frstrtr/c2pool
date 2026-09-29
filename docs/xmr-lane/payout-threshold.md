@@ -201,6 +201,28 @@ that block's height. Before that, while the paying block is still pending,
 the K_fair walk visits keys with a pending payout after every other key. The
 pending set at the booking point is the same on every node.
 
+## Reorgs
+
+A lane block reorged out before FINALIZE (the usual case: Monero reorgs are
+shallower than D_conf = 60) is removed from the ledger's pending set, and
+everything this design adds follows it out:
+
+* **Rotation.** It reads the pending payouts, so the lost block's payments no
+  longer send anyone to the back.
+* **The redistribution** (credit delta). It is part of the lost block's
+  credit, which leaves with it.
+* **`first_eligible` and `owed_left`.** They come from the finalized ledger
+  at the booking point, which a reorg below FINALIZE does not touch.
+* **Refs learned from the lost block.** Only the nodes that booked it keep
+  them. That is harmless: only a key with a finalized balance can be paid,
+  and such a key was in the view of a block every node booked.
+
+Rehearsal M9 checks this. Two of three nodes book a competing lane block, it
+is reorged out, and the winner is booked. All three nodes then agree on
+every later block (one verdict, one `owed_digest`), and the final ledger
+equals a run where the losing block never existed. A reorg deeper than
+D_conf is the priced residual it always was (external review 05b).
+
 ## 9. Implementation order
 
 1. `c` (Monero's fee rule from the block total and `w_input`), with KATs
