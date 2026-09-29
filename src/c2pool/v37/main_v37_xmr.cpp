@@ -1588,6 +1588,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::printf("REFUSED: %s\n", refusal.c_str());
         return 2;
     }
+    if (const std::string refusal = lane_knob_refusal(cfg, g_recon_max_root_age != ~std::uint64_t{0}, g_no_book_deferral);
+        !refusal.empty()) {
+        std::printf("REFUSED: %s\n", refusal.c_str());
+        return 2;
+    }
     if (const std::string refusal = solo_refusal(cfg); !refusal.empty()) {
         std::printf("REFUSED: %s\n", refusal.c_str());
         return 2;
@@ -1863,8 +1868,17 @@ static int run_live(const XmrNodeConfig& cfg) {
     // coin height at which that state stopped being current (the root-age bound).
     // D2: `cands_override` = a SCRATCH candidate ring (the minority re-derivation
     // decodes under the lineage it is re-deriving, never under the live ring).
+    // BOOKING MAP (`booking_refs` non-null): the outputs of a block being BOOKED
+    // map only through refs every node holds at its booking point -- the booked
+    // refs plus the refs of the view at the block's own cut (`booking_refs`, the
+    // caller's per-block set). Whether an output maps decides debit-only booking
+    // (mismatch) vs a ledger-neutral refusal, so it must not depend on a ref this
+    // node learned out of band (relay arrival, its own payee, owner): a block
+    // paying such a ref would otherwise be debited here and refused elsewhere.
+    // A canonical coinbase pays only these refs (the recompute's own inputs).
     auto decode_blob = [&](const std::vector<std::uint8_t>& blob, std::vector<std::uint64_t>* superseded_out = nullptr,
-                           const std::vector<::v37::bytes32>* cands_override = nullptr)
+                           const std::vector<::v37::bytes32>* cands_override = nullptr,
+                           const std::map<::v37::bytes32, ::v37::ScriptRef>* booking_refs = nullptr)
             -> c2pool::v37n::xmr::authority::CoinbaseBooking {
         std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
         if (cands_override) cands = *cands_override;
@@ -1873,8 +1887,18 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (superseded_out) *superseded_out = std::move(sup);
         }
         std::vector<::v37::bytes32> keys;
-        for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
-        for (const auto& k : cba_fx->keys()) keys.push_back(k);
+        o2::PayOfFn pay_map = cba_fx->pay_of();
+        if (booking_refs) {
+            keys = cba_fx->booked_keys();
+            for (const auto& [k, r] : *booking_refs) { (void)r; keys.push_back(k); }
+            pay_map = [booked = cba_fx->pay_of_booked(), booking_refs](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+                if (auto it = booking_refs->find(k); it != booking_refs->end()) return it->second;
+                return booked(k);
+            };
+        } else {
+            for (const auto& [k, vv] : node.ledger().effective_owed_all()) { (void)vv; keys.push_back(k); }
+            for (const auto& k : cba_fx->keys()) keys.push_back(k);
+        }
         // fee model ON (S1/S4): the residual sink IS the donation address, and a lane coinbase
         // without the one mandatory donation output (owed + 1 + residual) is REFUSED here (every node,
         // own wins included). OFF: master's booking against the configured residual sink.
@@ -1882,10 +1906,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         // other is "not-lane:" (an ordinary Monero block for this pool).
         const ::v37::bytes32* ptag = cba_scfg->pool_tag ? &*cba_scfg->pool_tag : nullptr;
         if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))
-            return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, cba_fx->pay_of(),
+            return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, pay_map,
                                                                           donation_net_of(cfg.network), ptag);
         return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
-                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, cba_fx->pay_of(), ptag);
+                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, pay_map, ptag);
     };
     // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
     // D6a: WHERE the blob comes from. p2p-first + native templates: the native chain
@@ -2209,8 +2233,10 @@ static int run_live(const XmrNodeConfig& cfg) {
             -> c2pool::v37n::xmr::authority::CoinbaseBooking {
         namespace auth = c2pool::v37n::xmr::authority;
         auth::CutPayeeResult r;
+        std::map<::v37::bytes32, ::v37::ScriptRef> cut_refs;   // BOOKING MAP: this block's own cut
+        const auto booked = cba_fx ? cba_fx->pay_of_booked() : o2::PayOfFn{};
         auto bk = auth::decode_resolving_cut_payees(
-            [&] { return decode_blob(blob, superseded_out, cands_override); },
+            [&] { return decode_blob(blob, superseded_out, cands_override, cba_fx ? &cut_refs : nullptr); },
             [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::vector<settle::WeightedPayee>& out, std::string& w) -> int {
                 auto v = view_at_cut(cc, w, relay_hint(bid));
                 if (!v) return w.rfind("cut-pending:", 0) == 0 ? 0 : -1;
@@ -2218,9 +2244,14 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return 1;
             },
             [&](const ::v37::ScriptRef& ref) {
-                const bool fresh = cba_fx && cba_fx->learn_ref(ref);
-                if (fresh) ++cut_payee_learned;
-                return fresh; }, &r);
+                if (!cba_fx) return false;
+                if (cba_fx->learn_ref(ref)) ++cut_payee_learned;
+                const ::v37::bytes32 k = ::v37::xmr::xmr_identity_key(ref);
+                if (booked(k) == ref) return false;
+                auto [it, ins] = cut_refs.emplace(k, ref);
+                if (!ins && it->second == ref) return false;
+                it->second = ref;
+                return true; }, &r);
         pending_why.clear();
         if (r.status == auth::CutPayeeStatus::NotNeeded) return bk;
         if (r.status == auth::CutPayeeStatus::Pending) {

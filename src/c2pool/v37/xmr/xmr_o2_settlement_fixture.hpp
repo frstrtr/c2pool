@@ -434,6 +434,11 @@ public:
         return fresh;
     }
     std::size_t booked_refs() const { return m_booked.size(); }
+    std::vector<::v37::bytes32> booked_keys() const {
+        std::vector<::v37::bytes32> v;
+        for (const auto& [k, r] : m_booked) { (void)r; v.push_back(k); }
+        return v;
+    }
 
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key
     // is the canon identity_key(pay); the resolver learns pay for that key.

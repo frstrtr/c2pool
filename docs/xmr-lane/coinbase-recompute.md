@@ -116,6 +116,12 @@ empty-cut finder), the seeds, and the compiled-in donation.
 * the builder's templates (`XmrSettlementTemplateProvider::set_owed_pay_of`);
 * the recompute of every lane block.
 
+The same map decodes a block being booked: its outputs map only through the
+booked refs and the refs of the view at its own cut (`decode_blob`'s booking
+map). Whether every output maps decides debit-only booking versus a
+ledger-neutral refusal, so it must not depend on a ref learned out of band
+either (rehearsal M6: a block paying a ref one node knows).
+
 The daemon learns booked refs only when a booking **succeeds**. A block that
 is held and retried is therefore recomputed from the same set. The set is
 persisted in `<sidecar>.refs`, because bookings below a resumed cursor are
@@ -138,6 +144,13 @@ projected view itself (R14).
   With the fee model off, the residual is paid to this node's own
   `--residual-sink-*` wallet, which no other node can map or recompute. Test
   networks keep the off mode for rigs that share one sink.
+* **Lane knobs are network constants on mainnet** (review O-4/O-5).
+  `lane_knob_refusal()` refuses, on mainnet, a non-default `--d-conf` (the
+  booking point), `--settle-h-min` and `--settle-output-cap` (the recompute
+  rebuilds with them), `--recon-max-root-age` and `--no-book-deferral`. A node
+  that differs in any of them books honest blocks debit-only: a ledger fork.
+  Test networks keep them; a rig must set them identically. Moving them into
+  `LaneParams` and the HELLO `lane_params_digest` is the gated follow-up.
 
 ## 6. Known limits and follow-ups
 
