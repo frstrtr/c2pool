@@ -177,6 +177,33 @@ void f2b_no_room() {
           "ledger after FINALIZE: every balance is 0 (no debt, no advance)");
 }
 
+void f2d_debt_first() {
+    std::printf("== F2d. no slot: the spare cash pays an admitted payee's old debt first ==\n");
+    const std::uint64_t c = x6::spend_floor(kTail);
+    P a = payee(71, kTail, 2);                                        // admitted; it also has an old balance
+    const P w = payee(72, c / 2);                                     // dust without a slot
+    const std::uint64_t old_debt = 3 * c;
+    auto in = fee_on_inputs(a.eb + w.eb + 1, true);
+    in.output_cap = 2;                                                // one payee slot
+    std::vector<x6::PayNowEntry> v;
+    for (const P& p : {a, w}) { x6::PayNowEntry e; e.pay = p.ref; e.identity = p.id; e.eb = p.eb; e.age = p.age; v.push_back(e); }
+    for (auto& e : v) if (e.identity == a.id) e.owed_left = old_debt;
+    std::sort(v.begin(), v.end(), [](const x6::PayNowEntry& l, const x6::PayNowEntry& r) { return l.identity < r.identity; });
+    in.paynow_at = [v](std::uint64_t) { return v; };
+    in.paynow_n = 2;
+    Amounts delta;
+    const auto outs = x6::allocate_exact_sum(in, nullptr, &delta);
+    CHECK(to(outs, a.id) == a.eb + w.eb && to(outs, w.id) == 0, "A is paid its E_b plus the dust's cash, as a payment on its old debt");
+    CHECK(delta.empty(), "no credit moves: the waiting dust keeps its credit (it grows, or decays if abandoned)");
+    // book it on top of A's old balance
+    st::OwedLedger L(7);
+    L.on_block_found("old", Amounts{{a.id, (long long)old_debt}}, {}); L.on_block_finalized("old", 1);
+    L.on_block_found("b", Amounts{{a.id, (long long)a.eb}, {w.id, (long long)w.eb}}, Amounts{{a.id, (long long)(a.eb + w.eb)}});
+    L.on_block_finalized("b", 2);
+    CHECK(L.effective_owed(a.id) == static_cast<long long>(old_debt - w.eb) && L.effective_owed(w.id) == static_cast<long long>(w.eb),
+          "ledger: A's debt shrinks by the dust's cash, the dust keeps its balance; the total is unchanged and nothing is negative");
+}
+
 void f2c_short_pool() {
     std::printf("== F2c. a short pool fills every slot and every piconero ==\n");
     const std::uint64_t c = x6::spend_floor(kTail);
@@ -386,6 +413,7 @@ int main() {
     f2_crumbs();
     f2b_no_room();
     f2c_short_pool();
+    f2d_debt_first();
     f3_slots();
     f3b_worth_spending_first();
     f4_owed_floor();

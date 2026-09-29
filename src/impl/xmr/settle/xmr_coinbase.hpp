@@ -166,6 +166,11 @@ struct PayNowEntry {
     // sha256d("V37T" || prev_id || identity), which nobody can grind.
     std::uint64_t    age = 0;
     ::v37::bytes32   tie{};
+    // SPEND-COST FLOOR only: the payee's positive balance the owed pass left
+    // unpaid (EffectiveOwed at the booking point minus its owed take). Cash that
+    // no slot can carry to its own payee pays these debts first (never an
+    // advance), before any redistribution.
+    std::uint64_t    owed_left = 0;
 };
 
 // The pay-now split: `pool` over the entries in proportion to eb, exact-sum

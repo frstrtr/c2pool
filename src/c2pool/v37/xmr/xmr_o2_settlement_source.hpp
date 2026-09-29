@@ -401,6 +401,7 @@ public:
                 std::map<::v37::bytes32, ::v37::ScriptRef> ref;
                 std::map<::v37::bytes32, std::uint64_t> age;   // SPEND-COST FLOOR: first_eligible
                 std::map<::v37::bytes32, ::v37::bytes32> tie;  // sha256d("V37T" || prev_id || key)
+                std::map<::v37::bytes32, std::uint64_t> owed_left;   // positive balance after the owed take
             };
             auto pv = std::make_shared<PayNowSet>();
             pv->wp = ctx.paynow_payees;
@@ -426,6 +427,16 @@ public:
             if (payable) {
                 std::uint64_t base = fixed_sum;
                 for (const auto& e : in.owed) base += e.owed;
+                if (ctx.spend_floor) {   // x6::PayNowEntry::owed_left
+                    std::map<::v37::bytes32, std::uint64_t> took;
+                    for (const auto& e : in.owed) took[e.identity] += e.owed;
+                    for (const auto& [k, r] : pv->ref) {
+                        (void)r;
+                        const long long eo = ledger.effective_owed(k);
+                        const std::uint64_t t = took.count(k) ? took.at(k) : 0;
+                        if (eo > 0 && static_cast<std::uint64_t>(eo) > t) pv->owed_left[k] = static_cast<std::uint64_t>(eo) - t;
+                    }
+                }
                 std::shared_ptr<const PayNowSet> cpv = pv;
                 in.paynow_at = [cpv](std::uint64_t budget) {
                     const std::vector<std::uint64_t> amt = ::c2pool::v37n::settle::split_reward(budget, cpv->wp);
@@ -441,6 +452,7 @@ public:
                         e.eb = v;
                         if (auto a = cpv->age.find(k); a != cpv->age.end()) e.age = a->second;
                         if (auto t = cpv->tie.find(k); t != cpv->tie.end()) e.tie = t->second;
+                        if (auto o = cpv->owed_left.find(k); o != cpv->owed_left.end()) e.owed_left = o->second;
                         out.push_back(std::move(e));
                     }
                     return out;
