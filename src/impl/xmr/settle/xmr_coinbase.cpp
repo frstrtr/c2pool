@@ -307,11 +307,13 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
             for (const auto& e : ents) eb.push_back(e.eb);
             std::vector<std::uint64_t> alloc;
             if (in.spend_floor) {
-                // SPEND-COST FLOOR (payout-threshold.md §3). Who is paid now: the
-                // payees with E_b >= c first, then the dust (E_b < c) while slots and
-                // cash last, each tier largest E_b first (ties: identity ASC). A payee
-                // needs a new slot unless it is the residual sink or already has an
-                // owed output to merge into.
+                // SPEND-COST FLOOR (payout-threshold.md §3). Who is paid now when
+                // not everyone fits: OLDEST FIRST, the K_fair rule. A payee with a
+                // waiting balance goes by its first_eligible (ascending); a payee
+                // with none is the youngest; equal ages go by the salted tie, then
+                // identity. The size of E_b never decides. A payee needs a new slot
+                // unless it is the residual sink or already has an owed output to
+                // merge into.
                 auto needs_slot = [&](const PayNowEntry& e) {
                     if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink) return false;
                     for (const auto& o : res)
@@ -322,9 +324,10 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                 for (std::size_t i = 0; i < ents.size(); ++i)
                     if (ents[i].eb > 0) order.push_back(i);
                 std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-                    const bool ga = ents[a].eb >= floor_c, gb = ents[b].eb >= floor_c;
-                    if (ga != gb) return ga;
-                    return ents[a].eb > ents[b].eb;
+                    const std::uint64_t aa = ents[a].age ? ents[a].age : std::numeric_limits<std::uint64_t>::max();
+                    const std::uint64_t ab = ents[b].age ? ents[b].age : std::numeric_limits<std::uint64_t>::max();
+                    if (aa != ab) return aa < ab;
+                    return ents[a].tie < ents[b].tie;
                 });
                 // Admission. Every admitted payee gets the same fraction of its E_b:
                 // all of it when the pool covers them, pool / Σeb when the owed pass
@@ -336,7 +339,7 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                 std::vector<std::uint64_t> take(ents.size(), 0);
                 std::size_t free_slots = cap_owed > n_slots ? cap_owed - n_slots : 0;
                 unsigned __int128 sum = 0;
-                std::uint64_t min_big = 0;                    // the smallest admitted E_b >= c
+                std::uint64_t min_big = 0;                    // the smallest admitted E_b >= c (0: none yet)
                 for (const std::size_t i : order) {
                     const bool slot = needs_slot(ents[i]);
                     if (slot && free_slots == 0) continue;
@@ -349,7 +352,7 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                                     : static_cast<unsigned __int128>(pool) * ents[i].eb / s2 == 0) break;
                     }
                     if (slot) --free_slots;
-                    if (big) min_big = ents[i].eb;           // descending within the tier
+                    if (big && (min_big == 0 || ents[i].eb < min_big)) min_big = ents[i].eb;
                     take[i] = ents[i].eb;
                     sum = s2;
                 }

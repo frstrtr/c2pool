@@ -91,18 +91,18 @@ x6::CoinbaseInputs fee_on_inputs(std::uint64_t reward, bool floor) {
     return in;
 }
 
-struct P { ::v37::ScriptRef ref; ::v37::bytes32 id; std::uint64_t eb; };
+struct P { ::v37::ScriptRef ref; ::v37::bytes32 id; std::uint64_t eb; std::uint64_t age = 0; };
 // pay-now entries with explicit E_b, identity ASC (as the provider hands them).
 void arm(x6::CoinbaseInputs& in, std::vector<P> ps) {
     std::sort(ps.begin(), ps.end(), [](const P& a, const P& b) { return a.id < b.id; });
     in.paynow_at = [ps](std::uint64_t) {
         std::vector<x6::PayNowEntry> v;
-        for (const auto& p : ps) { x6::PayNowEntry e; e.pay = p.ref; e.identity = p.id; e.eb = p.eb; v.push_back(e); }
+        for (const auto& p : ps) { x6::PayNowEntry e; e.pay = p.ref; e.identity = p.id; e.eb = p.eb; e.age = p.age; v.push_back(e); }
         return v;
     };
     in.paynow_n = ps.size();
 }
-P payee(std::uint8_t k, std::uint64_t eb) { auto r = ref_of(k); return {r, id_of(r), eb}; }
+P payee(std::uint8_t k, std::uint64_t eb, std::uint64_t age = 0) { auto r = ref_of(k); return {r, id_of(r), eb, age}; }
 std::uint64_t to(const std::vector<x6::CoinbaseOutput>& outs, const ::v37::bytes32& id) {
     std::uint64_t s = 0; for (const auto& o : outs) if (o.identity == id) s += o.amount; return s;
 }
@@ -146,7 +146,7 @@ void f2_crumbs() {
 void f2b_no_room() {
     std::printf("== F2b. no slot: its cash is redistributed, never advanced ==\n");
     const std::uint64_t c = x6::spend_floor(kTail);
-    const P a = payee(15, 361000000000ull), b = payee(16, 239000000000ull);
+    const P a = payee(15, 361000000000ull, 1), b = payee(16, 239000000000ull, 2);   // the two oldest take the slots
     const P cr1 = payee(17, c - 1), cr2 = payee(18, c / 3);
     const std::uint64_t crumbs = cr1.eb + cr2.eb;
     const std::uint64_t reward = a.eb + b.eb + crumbs + 1;
@@ -179,8 +179,10 @@ void f2b_no_room() {
 
 // ---------------------------------------------------------------------------
 void f3_slots() {
-    std::printf("== F3. too few output slots ==\n");
-    const P a = payee(21, 300000000000ull), b = payee(22, 200000000000ull), s = payee(23, 99000000000ull);
+    std::printf("== F3. too few output slots: oldest first ==\n");
+    // s is the smallest but the OLDEST (a waiting balance since bin 7); a and b
+    // are new. With two slots s goes first, whatever its size.
+    const P a = payee(21, 300000000000ull), b = payee(22, 200000000000ull), s = payee(23, 99000000000ull, 7);
     const std::uint64_t reward = a.eb + b.eb + s.eb + 1;
     {
         auto in = fee_on_inputs(reward, true);
@@ -189,9 +191,22 @@ void f3_slots() {
         x6::BuildError err{};
         const auto outs = x6::allocate_exact_sum(in, &err);
         CHECK(err == x6::BuildError::None, "no CapTooSmall: a payee without a slot waits");
-        CHECK(to(outs, s.id) == 0, "the smallest payee has no slot and waits (balance)");
-        CHECK(to(outs, a.id) + to(outs, b.id) + 1 == reward, "the two largest carry the whole block but the marker");
+        CHECK(to(outs, s.id) >= s.eb, "the OLDEST payee gets a slot although it is the smallest");
+        CHECK((to(outs, a.id) == 0) != (to(outs, b.id) == 0), "of the two new payees exactly one gets the last slot (salted tie)");
         CHECK(sum_of(outs) == reward, "exact sum");
+    }
+    {   // equal ages: the salted tie decides, never the size of E_b
+        P x = payee(26, 5000000000ull), y = payee(27, 400000000000ull);
+        auto in = fee_on_inputs(x.eb + y.eb + 1, true);
+        in.output_cap = 2;                                            // one payee slot
+        std::vector<x6::PayNowEntry> v;
+        for (const P& p : {x, y}) { x6::PayNowEntry e; e.pay = p.ref; e.identity = p.id; e.eb = p.eb; v.push_back(e); }
+        v[0].tie[0] = 0x01; v[1].tie[0] = 0x02;                       // x's salted hash is lower
+        std::sort(v.begin(), v.end(), [](const x6::PayNowEntry& l, const x6::PayNowEntry& r) { return l.identity < r.identity; });
+        in.paynow_at = [v](std::uint64_t) { return v; };
+        in.paynow_n = 2;
+        const auto outs = x6::allocate_exact_sum(in);
+        CHECK(to(outs, x.id) > 0 && to(outs, y.id) == 0, "the lower salted hash wins the slot, the larger E_b waits");
     }
     {   // credited work below the reward (nobody waits): nothing is moved
         const std::uint64_t c = x6::spend_floor(kTail);

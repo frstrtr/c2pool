@@ -160,6 +160,12 @@ struct PayNowEntry {
     ::v37::ScriptRef pay;                 // payout target (XMR kind)
     ::v37::bytes32   identity{};          // ledger identity_key (== fold_eb key)
     std::uint64_t    eb = 0;              // E_b at this block's budget, piconero
+    // SPEND-COST FLOOR only: who gets a slot first when not everyone fits,
+    // oldest first (the K_fair rule). `age` is the payee's first_eligible in the
+    // ledger (0 = no waiting balance: the youngest); `tie` orders equal ages,
+    // sha256d("V37T" || prev_id || identity), which nobody can grind.
+    std::uint64_t    age = 0;
+    ::v37::bytes32   tie{};
 };
 
 // The pay-now split: `pool` over the entries in proportion to eb, exact-sum
