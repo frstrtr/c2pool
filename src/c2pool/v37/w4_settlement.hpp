@@ -1122,6 +1122,52 @@ public:
         return d;
     }
 
+    // LEDGER HEALTH (diagnostics only, never consensus, digest-neutral). One
+    // pass over the finalized partition and the pending payouts:
+    //   sum_final        Σ finalW over every row: what the pool still owes net
+    //                    of forward-repair debt. The owed-sign ruling C-3
+    //                    requires sum_final >= 0 (aggregate_ok()).
+    //   positive_*       the rows the pool owes (what K_fair will pay).
+    //   negative_*       rows below zero: over-payment netted forward (C-1),
+    //                    a negative DROPS delta (C-6), or a double pay. A
+    //                    negative row whose owner stopped mining is never
+    //                    repaid, so its sum is money the rest of the pool
+    //                    carries.
+    //   min_row/min_key  the most negative row (0 when none).
+    //   pending_payout   Σ payout of FOUND-not-finalized blocks (deducted from
+    //                    EffectiveOwed already, from finalW at FINALIZE).
+    struct Health {
+        std::size_t rows = 0;
+        long long   sum_final = 0;
+        std::size_t positive_rows = 0;
+        long long   positive_sum = 0;
+        std::size_t negative_rows = 0;
+        long long   negative_sum = 0;
+        long long   min_row = 0;
+        bytes32     min_key{};
+        long long   pending_payout = 0;
+        std::size_t pending_blocks = 0;
+        bool aggregate_ok() const { return sum_final >= 0; }
+    };
+    Health health() const {
+        Health h;
+        for (const auto& [k, v] : m_finalW) {
+            ++h.rows;
+            h.sum_final += v;
+            if (v > 0) { ++h.positive_rows; h.positive_sum += v; }
+            if (v < 0) {
+                ++h.negative_rows; h.negative_sum += v;
+                if (v < h.min_row) { h.min_row = v; h.min_key = k; }
+            }
+        }
+        for (const auto& [bid, p] : m_pending) {
+            (void)bid;
+            ++h.pending_blocks;
+            for (const auto& [k, v] : p.payout) { (void)k; h.pending_payout += v; }
+        }
+        return h;
+    }
+
     // Diagnostics for the acceptance tests (never consensus).
     long long residual_total() const { return m_residual; }
     const std::vector<std::pair<std::string, long long>>& residual_events()

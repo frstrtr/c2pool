@@ -859,6 +859,18 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             for (const auto& [k, v] : L.effective_owed_all()) { eo += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " "; if (v < eo_min) eo_min = v; }
             std::printf("  ledger: seq=%llu owed_digest=%s eo_min=%lld finalW{ %s} eo{ %s}\n",
                         static_cast<unsigned long long>(L.ledger_seq()), hex_of(L.owed_digest()).c_str(), eo_min, fw.c_str(), eo.c_str());
+            // LEDGER HEALTH: the aggregate the owed-sign ruling C-3 requires to be
+            // >= 0, and the negative rows (forward-repair debt nobody may repay).
+            const auto h = L.health();
+            std::printf("  ledger-health: rows=%zu sum_final=%lld owed=%lld (%zu rows) negative=%lld (%zu rows, min %lld at %s) "
+                        "pending_payout=%lld (%zu blocks) residual=%lld\n",
+                        h.rows, h.sum_final, h.positive_sum, h.positive_rows, h.negative_sum, h.negative_rows, h.min_row,
+                        h.negative_rows ? hex_of(h.min_key).substr(0, 8).c_str() : "-", h.pending_payout, h.pending_blocks,
+                        L.residual_total());
+            if (!h.aggregate_ok())
+                std::printf("ledger-ALARM aggregate: sum(finalW)=%lld < 0 -- the ledger owes less than it has paid out "
+                            "(owed-sign ruling C-3 violated; %zu negative rows, %lld)\n",
+                            h.sum_final, h.negative_rows, h.negative_sum);
         }
         // c2pool#1551. r7=0 is the claim that matters: it counts settlements the
         // same-height gate did not authorise, which is the only shape an
