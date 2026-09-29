@@ -249,14 +249,43 @@ struct NetResult {
 // it), `sink_total` = the coverage amount the sink / donation output carries
 // beyond its own owed part, `sink_identity` = its identity. No tail => a no-op.
 // On a refusal the maps are left untouched and ok == false.
+//
+// SPEND-COST FLOOR (`spend_floor`, payout-threshold.md §3). Who is paid now
+// depends on the builder's output cap, which a receiver cannot know, so the
+// allocation is not re-derived here: the recompute (xmr_coinbase_recompute.hpp)
+// has already proved the coinbase canonical. Each key is booked NET of what
+// both sides share, min(credit, paid): a crumb (paid 0) keeps its credit, an
+// advance (paid > credit) keeps the excess as a pending payout, a debt its
+// next credits repay. The balance after FINALIZE is the same either way;
+// netting only keeps pay-now out of the pending partition.
 inline NetResult net_booking(const std::optional<std::uint64_t>& base, std::uint64_t total,
                              std::map<::v37::bytes32, long long>& credit,
                              std::map<::v37::bytes32, long long>& payout,
                              long long sink_total, const ::v37::bytes32& sink_identity,
-                             long long sink_reserved = 0) {
+                             long long sink_reserved = 0, bool spend_floor = false) {
     NetResult r;
     if (!base) return r;
     r.pool = total > *base ? total - *base : 0;
+    if (spend_floor) {
+        for (auto c = credit.begin(); c != credit.end();) {
+            const ::v37::bytes32 k = c->first;
+            long long paid = 0;
+            if (k == sink_identity) paid = std::max<long long>(0, sink_total - sink_reserved);
+            else if (const auto p = payout.find(k); p != payout.end()) paid = p->second;
+            const long long a = std::min(c->second, paid);
+            if (a <= 0) { ++c; continue; }
+            r.alloc[k] = a;
+            r.netted += a;
+            if (!(k == sink_identity)) {
+                auto p = payout.find(k);
+                p->second -= a;
+                if (p->second == 0) payout.erase(p);
+            }
+            c->second -= a;
+            c = c->second == 0 ? credit.erase(c) : std::next(c);
+        }
+        return r;
+    }
     r.alloc = allocation(total, *base, credit);
     for (const auto& [k, a] : r.alloc) {
         if (k == sink_identity) {

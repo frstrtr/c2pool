@@ -284,6 +284,11 @@ struct XmrNodeConfig {
     // to the running test rigs); moving them there is the gated follow-up.
     // LaneParams::k_floor stays 0 on XMR (Monero has no dust rule).
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
+    // XMR ledger rules (w4 OwedLedgerRules; payout-threshold.md §6, §6a). The
+    // daemon sets them with the spend-cost floor (arm floor = spend_floor of
+    // the tail subsidy); off here so fixtures keep their golden digests.
+    long long       ledger_arm_floor = 0;
+    bool            ledger_rotate_on_payment = false;
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
     // the assembled coinbase carries a real K_fair OWED payee alongside the sink

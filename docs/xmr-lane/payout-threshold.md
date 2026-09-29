@@ -1,7 +1,8 @@
 # XMR lane: the spend-cost floor and crumbs
 
-Status: **agreed design, not yet implemented** (operator discussion,
-2026-09-29, revised the same day). This record keeps the decisions and their
+Status: **§2, §3, §6 and §6a implemented** (the daemon turns them on from the
+lane's genesis); §5 (dust decay) is next. Operator discussion 2026-09-29,
+revised the same day. This record keeps the decisions and their
 derivations so the implementation, review and paper can cite one source. It
 builds on the every-node coinbase recompute (`coinbase-recompute.md`): every
 rule below is a function of inputs every node holds, so the recompute
@@ -72,10 +73,16 @@ minimum payout is about 0.00027 XMR.
 * **The owed queue** (K_fair, oldest first) stays as the safety net for
   balances: crumbs that reached `c`, payees that did not fit, a restart,
   DROPS carries and the seeds. In steady state it is nearly empty.
-* **Builder latitude.** Receivers cannot verify the weight-aware output cap.
-  A builder that claims fewer slots makes more payees wait and advances more
-  to the ones paid. An advance is a debt, not a gain: a builder that takes
-  one and leaves steals at most its own E_b of that block.
+* **The output cap is the wire ceiling (2700), fixed.** The coinbase takes its
+  room before any transaction: the native trim reserves it, and the template's
+  own pick counts the miner tx first. The transactions fill what is left of
+  the free zone, and a 2700-output coinbase (about 113 kB) always fits in the
+  300 kB zone. So every receiver checks exactly one cap. Before this, the
+  cap came from the builder's own transaction set, which a receiver cannot
+  see. A builder could claim fewer slots, push payees into waiting and take
+  their cash as an advance on its own key, then abandon the key. That was
+  worth about its own hashrate share of extra income per block it found
+  (rehearsal M8: such a block is now non-canonical on every node).
 
 ## 4. Published
 
@@ -127,7 +134,29 @@ today, and re-enters at the back when a new unpaid remainder appears.
   check_fee`), which would lower `c` for members. Also postponed: a weighted
   multisig for the protocol donation address (governance).
 
-## 8. Implementation order
+## 8. Code
+
+| rule | where | pinned by |
+|---|---|---|
+| `c` | `x6::spend_floor`, `fee_per_byte_at_floor`, `kInputWeight` (`src/impl/xmr/settle/xmr_coinbase.*`) | `v37_xmr_spend_floor_kat` F1 |
+| crumbs, the advance, slots, the owed floor | `allocate_exact_sum` under `CoinbaseInputs::spend_floor` | F2-F4, F6; rehearsal M7 |
+| the receive side | `paynow::net_booking(..., spend_floor)`: net of min(credit, paid) | F5 |
+| seniority from the floor, rotation | `OwedLedgerRules` (`w4_settlement.hpp`), `XmrNodeConfig::ledger_*` | F7-F9; rehearsal M7 |
+| the fixed output cap | `XmrBlockAssembler::build` (cap = wire ceiling under the floor); recompute accepts only it | rehearsal M8 |
+| every node recomputes it | `LaneInputs::spend_floor`, `XmrCoinbaseContext::spend_floor` | rehearsal M7 (48 blocks, 3 nodes, one digest) |
+
+The ledger's arm floor is `spend_floor(kTailSubsidy)`: Monero's tail emission
+(`FINAL_SUBSIDY_PER_MINUTE` × 2 minutes) is the smallest reward of any block
+since 2022, so it gives the smallest `c` any block has. A constant floor keeps
+`first_eligible`, which is in `owed_digest`, a function of the finalized
+ledger alone.
+
+Rotation acts twice. At FINALIZE, the paid key's `first_eligible` moves to
+that block's height. Before that, while the paying block is still pending,
+the K_fair walk visits keys with a pending payout after every other key. The
+pending set at the booking point is the same on every node.
+
+## 9. Implementation order
 
 1. `c` (Monero's fee rule from the block total and `w_input`), with KATs
    against Monero's own numbers.

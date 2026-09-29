@@ -169,6 +169,7 @@ using DecodeFn = std::function<DecodeResult(std::uint64_t h, const std::string& 
 
 struct RefoldInput {
     ::v37::ChainId chain = 0;
+    ::c2pool::v37n::settle::OwedLedgerRules rules{};   // the live ledger's (XMR: arm floor, rotation)
     std::uint64_t  d_conf = 1;
     std::uint64_t  fork_h = 0;                     // F: every FINALIZE of a block mined at h <= F is kept
     std::uint64_t  cursor = 0;                     // c: the refold finalizes (F, c], books (F, c + 1 + D_conf]
@@ -212,7 +213,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
         if (e.kind == SettleEvKind::Finalize) fin_since[e.bid] = since_of_bin(e.bin_height);
         else if (e.kind == SettleEvKind::Found) old_maps[e.bid] = {e.credit, e.payout};
     }
-    OwedLedger L(in.chain);
+    OwedLedger L(in.chain, in.rules);
     recon::ReconRing ring(4096);
     std::uint64_t since = 0;
     ring.push(L.owed_digest(), 0);

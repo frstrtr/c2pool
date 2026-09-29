@@ -189,6 +189,10 @@ struct XmrCoinbaseContext {
     // policy (receivers book the on-chain coinbase), so off by default only to
     // keep existing fixtures byte-identical; the daemon turns it on.
     bool                  kfair_salted_ties = false;
+    // SPEND-COST FLOOR (payout-threshold.md §2-§3): x6::CoinbaseInputs::spend_floor.
+    // Off by default only to keep existing fixtures byte-identical; the daemon
+    // turns it on.
+    bool                  spend_floor = false;
     std::uint64_t         base_reward = 0;            // get_base_reward(already_generated_coins)
     std::uint64_t         fees = 0;                   // Σ selected tx fees (informational split)
 
@@ -314,6 +318,7 @@ public:
         in.residual_sink          = ctx.residual_sink;
         in.residual_sink_identity = ctx.residual_sink_identity;
         in.output_cap             = ctx.output_cap;
+        in.spend_floor            = ctx.spend_floor;
         in.extra_nonce.clear();
 
         // A key whose ref is not a payable XMR ref is downgraded to a RAW
