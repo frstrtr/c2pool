@@ -40,6 +40,7 @@
 //   R13 booked refs: a payee ref one node learned out of band never changes
 //       the verdict (the fork hazard of the full resolver, shown).
 //   R14 pay-now refs come from the view at the cut, not the resolver.
+//   R15 #1867 salted tie-break: a raw-identity order is a mismatch.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -233,6 +234,7 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o)
 
 #if RECOMPUTE_FIX
 namespace rc = c2pool::v37n::xmr::recompute;
+bool g_salted = false;   // the lane rule the receivers recompute with (#1867)
 
 struct Verified {
     auth::CoinbaseBooking bk;
@@ -254,6 +256,7 @@ Verified receive(const Block& b, const st::OwedLedger& R, const Lane& lane, cons
     li.residual_sink = fee::donation_ref(kNet); li.residual_sink_identity = fee::donation_identity(kNet);
     li.fixed = {fee::donation_marker(kNet)};
     li.pool_tag = the_tag();
+    li.kfair_salted_ties = g_salted;
     rc::CutInputs ci; ci.has_view = has_view; ci.payees = weighted(cut_payees);
     v.r = rc::verify_lane_coinbase(b.blob, v.bk, R, (booked ? *booked : lane).pay_of(), li, ci);
     return v;
@@ -520,6 +523,33 @@ void r14_paynow_refs_from_view() {
     CHECK(v.bk.ok && v.bk.paynow_base.has_value(), "pay-now is armed (V37N committed) without the resolver knowing the cut payees");
     CHECK(v.r.canonical(), "and the block is canonical: %s %s", verdict(v), v.r.why.c_str());
 }
+
+// R15: #1867 salted tie-break is part of the recomputed rule. Keys armed at
+// the same FINALIZE share first_eligible; the lane orders that cohort by
+// sha256d("V37T" || prev_id || key). A builder that orders it by the raw
+// identity instead (the grindable order) is a MISMATCH.
+void r15_salted_ties() {
+    std::printf("== R15. salted K_fair tie-break (#1867) ==\n");
+    World w;
+    st::OwedLedger L{kChain};
+    std::vector<Payee> tied;
+    for (int i = 0; i < 6; ++i) { Payee p = payee(static_cast<std::uint8_t>(70 + i)); w.lane.learn(p); tied.push_back(p); }
+    {
+        Amounts c; for (const auto& p : tied) c[p.id] = 20000000000ll + 1000 * static_cast<long long>(p.id[0]);
+        L.on_block_found("cohort", c, {});
+        L.on_block_finalized("cohort", 40);   // one FINALIZE: one age for all six
+    }
+    g_salted = true;
+    BuildOpts salted; salted.cut_payees = w.cut; salted.mutate_ctx = [](o2::XmrCoinbaseContext& c) { c.kfair_salted_ties = true; };
+    const Block bs = build_block(L, w.lane, salted);
+    BuildOpts plain; plain.cut_payees = w.cut;   // the raw identity order
+    const Block bp = build_block(L, w.lane, plain);
+    if (!bs.ok || !bp.ok) { CHECK(false, "builds: %s %s", bs.why.c_str(), bp.why.c_str()); g_salted = false; return; }
+    const auto vs = receive(bs, L, w.lane, w.cut), vp = receive(bp, L, w.lane, w.cut);
+    CHECK(vs.r.canonical(), "a builder with the salted order is canonical: %s %s", verdict(vs), vs.r.why.c_str());
+    CHECK(vp.r.verdict == rc::Verdict::Mismatch, "a builder with the raw identity order is a MISMATCH: %s", vp.r.why.c_str());
+    g_salted = false;
+}
 #else
 void suite_base() {
     std::printf("== BASE: no recompute on this tree ==\n");
@@ -546,6 +576,7 @@ int main() {
     r12_fee_model_mandatory();
     r13_booked_refs();
     r14_paynow_refs_from_view();
+    r15_salted_ties();
 #else
     suite_base();
 #endif
