@@ -54,6 +54,9 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace v37 {
 namespace xmr {
@@ -373,6 +376,45 @@ bool derive_tx_secret_key(const CoinbaseInputs& in, SecretKey& r_out) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// DERIVATION CACHE. Every node derives the same (r, payee, index) outputs
+// several times per lane block: the builder's template, the recompute's
+// builds (at the total, at the V37N base, per candidate output cap), the
+// booking decode and the minority re-derivation. r is one per block, so these
+// are the same scalar multiplications again (8*r*A ~120 us, the one-time key
+// ~46 us). Both are pure functions of their inputs, so a cache cannot change
+// a result; it is bounded (cleared when full) and locked, because stratum
+// threads also build coinbases.
+namespace {
+struct DerivationCache {
+    static constexpr std::size_t kMaxEntries = 1u << 16;
+    std::mutex mu;
+    std::unordered_map<std::string, KeyDerivation> kd;                    // r || A
+    std::unordered_map<std::string, std::pair<PublicKey, ViewTag>> outs;  // r || B || A || i
+};
+DerivationCache& derivation_cache() { static DerivationCache c; return c; }
+std::string cache_key(const SecretKey& r, const void* tail, std::size_t n, std::uint64_t i = ~std::uint64_t{0}) {
+    std::string k(reinterpret_cast<const char*>(r.data()), 32);
+    k.append(reinterpret_cast<const char*>(tail), n);
+    if (i != ~std::uint64_t{0}) k.append(reinterpret_cast<const char*>(&i), sizeof(i));
+    return k;
+}
+}  // namespace
+
+bool cached_key_derivation(const PublicKey& A, const SecretKey& r, KeyDerivation& D) {
+    DerivationCache& c = derivation_cache();
+    const std::string key = cache_key(r, A.data(), 32);
+    {
+        std::lock_guard<std::mutex> g(c.mu);
+        if (auto it = c.kd.find(key); it != c.kd.end()) { D = it->second; return true; }
+    }
+    if (!::xmr::coin::generate_key_derivation(A, r, D)) return false;
+    std::lock_guard<std::mutex> g(c.mu);
+    if (c.kd.size() >= DerivationCache::kMaxEntries) c.kd.clear();
+    c.kd.emplace(key, D);
+    return true;
+}
+
 bool derive_output(const SecretKey& r, const ::v37::ScriptRef& pay,
                    std::size_t vout_index, PublicKey& P_out, ViewTag& vt_out) {
     // -----------------------------------------------------------------------
@@ -386,10 +428,19 @@ bool derive_output(const SecretKey& r, const ::v37::ScriptRef& pay,
     std::memcpy(B.data(), pay.payload.data(), 32);
     std::memcpy(A.data(), pay.payload.data() + 32, 32);
 
+    DerivationCache& c = derivation_cache();
+    const std::string okey = cache_key(r, pay.payload.data(), 64, vout_index);
+    {
+        std::lock_guard<std::mutex> g(c.mu);
+        if (auto it = c.outs.find(okey); it != c.outs.end()) { P_out = it->second.first; vt_out = it->second.second; return true; }
+    }
     ::xmr::coin::KeyDerivation D;
-    if (!::xmr::coin::generate_key_derivation(A, r, D)) return false;   // D = 8*r*A
+    if (!cached_key_derivation(A, r, D)) return false;                 // D = 8*r*A
     if (!::xmr::coin::derive_public_key(D, vout_index, B, P_out)) return false; // P = H_s(D||i)G + B
     ::xmr::coin::derive_view_tag(D, vout_index, vt_out);               // vt = H("view_tag"||D||i)[0]
+    std::lock_guard<std::mutex> g(c.mu);
+    if (c.outs.size() >= DerivationCache::kMaxEntries) c.outs.clear();
+    c.outs.emplace(okey, std::make_pair(P_out, vt_out));
     return true;
 }
 

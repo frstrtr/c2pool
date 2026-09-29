@@ -340,6 +340,10 @@ bool derive_tx_secret_key(const CoinbaseInputs& in, SecretKey& r_out);
 bool derive_output(const SecretKey& r, const ::v37::ScriptRef& pay,
                    std::size_t vout_index, PublicKey& P_out, ViewTag& vt_out);
 
+// D = 8*r*A through the process-wide derivation cache (pure; bounded; locked).
+// derive_output uses it; so does the booking decode, which tries many payees.
+bool cached_key_derivation(const PublicKey& A, const SecretKey& r, KeyDerivation& D);
+
 // The merge-mining commitment root for a single v37 leaf:
 //   mm_root = keccak256(MM_LEAF_DOMAIN || chain_id_le32 || lane_commitment)
 // For a multi-aux tree (Tari coexistence) this is one leaf under a real Merkle
