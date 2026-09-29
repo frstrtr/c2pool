@@ -308,10 +308,11 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
             std::vector<std::uint64_t> alloc;
             if (in.spend_floor) {
                 // SPEND-COST FLOOR (payout-threshold.md §3). Who is paid now when
-                // not everyone fits: OLDEST FIRST, the K_fair rule. A payee with a
+                // not everyone fits: payouts worth spending (E_b >= c) before dust,
+                // and within each, OLDEST FIRST, the K_fair rule. A payee with a
                 // waiting balance goes by its first_eligible (ascending); a payee
                 // with none is the youngest; equal ages go by the salted tie, then
-                // identity. The size of E_b never decides. A payee needs a new slot
+                // identity. Beyond the c line the size of E_b never decides. A payee needs a new slot
                 // unless it is the residual sink or already has an owed output to
                 // merge into.
                 auto needs_slot = [&](const PayNowEntry& e) {
@@ -324,6 +325,8 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                 for (std::size_t i = 0; i < ents.size(); ++i)
                     if (ents[i].eb > 0) order.push_back(i);
                 std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                    const bool ga = ents[a].eb >= floor_c, gb = ents[b].eb >= floor_c;
+                    if (ga != gb) return ga;   // a slot goes to a payout worth spending (>= c) before dust
                     const std::uint64_t aa = ents[a].age ? ents[a].age : std::numeric_limits<std::uint64_t>::max();
                     const std::uint64_t ab = ents[b].age ? ents[b].age : std::numeric_limits<std::uint64_t>::max();
                     if (aa != ab) return aa < ab;
