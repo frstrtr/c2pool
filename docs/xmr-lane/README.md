@@ -35,6 +35,7 @@ Bitcoin-family lane and Monero pins FCMP++/CARROT timing. See the scoping note
 | X9 | [`finality-boundary.md`](finality-boundary.md) | settlement finality boundary (reorg depth >= D_conf, mainnet D_conf=60) + chain-ordered booking both sides (R4/R6) + the divergence cap (loud, bounded halt) |
 | D2 | [`d2-minority-converge.md`](d2-minority-converge.md) | minority converges to majority (operator ruling D2 = A): run detector (M unmatched from >= 2 builders), deterministic refold of the settled prefix, verified lineage switch, DIVERGED halt; D2-0 reorg-in booking gap |
 | RC | [`coinbase-recompute.md`](coinbase-recompute.md) | every node recomputes the lane coinbase at its booking point (rulings 2026-09-29: fee model v1 mandatory on mainnet, non-canonical = payouts debited + credit dropped, from genesis); booking-point template gate; booked payee refs |
+| PT | [`payout-threshold.md`](payout-threshold.md) | agreed design (not yet implemented): self-regulating payout threshold t = max(one window share, spend cost, free-zone fit), sub-threshold lottery fair in expectation, dust decay, seniority from the threshold |
 
 ## Open questions carried (route to operator / integrator)
 
