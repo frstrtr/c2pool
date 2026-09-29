@@ -874,10 +874,123 @@ static void test_db_geometry_seam() {
     e.stop();
 }
 
+
+// ── SALTED TIE-BREAK (external review finding 08, #1867).
+// propose_coinbase_salted keeps first_eligible primary and orders each
+// equal-age cohort by sha256d("V37T" || salt || key). Pinned:
+//   (a) oracle: for random ledgers, budgets and caps it equals a reference
+//       that sorts the eligible set by (fe, salted hash) and applies the
+//       shipped take rules (count cap, budget stop, h_min CARRY);
+//   (b) distinct ages: identical to the unsalted propose_coinbase;
+//   (c) the same salt gives the same order (every node alike); a different
+//       salt reorders a tie cohort; the lowest raw identity does not win
+//       every cohort.
+static void test_salted_ties() {
+    using Amounts = S::OwedLedger::Amounts;
+    auto key = [](std::uint8_t b) { bytes32 k{}; k[0] = b; k[31] = static_cast<std::uint8_t>(b * 7); return k; };
+    auto pay_of = [](const bytes32& k) {
+        ScriptRef r; r.kind = ScriptKind::P2WPKH; r.payload.assign(20, k[0]); return r;
+    };
+    auto salt_of = [](std::uint8_t b) { bytes32 s{}; s.fill(b); return s; };
+    auto salted = [](const bytes32& salt, const bytes32& k) {
+        std::vector<std::uint8_t> v = {'V', '3', '7', 'T'};
+        v.insert(v.end(), salt.begin(), salt.end());
+        v.insert(v.end(), k.begin(), k.end());
+        return ::v37::sha256d(v);
+    };
+    auto keys_of = [](const S::OwedLedger::Proposal& p) {
+        std::vector<bytes32> v; for (const auto& o : p.outs) v.push_back(o.key); return v;
+    };
+
+    // (a) oracle over random ledgers
+    std::uint64_t rng = 0x5eed1234ull;
+    auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    bool oracle_ok = true;
+    for (int t = 0; t < 300 && oracle_ok; ++t) {
+        S::OwedLedger L(1);
+        std::map<bytes32, std::pair<u64, long long>> want;   // key -> (fe, owed)
+        const int nbins = 1 + static_cast<int>(next() % 4);
+        for (int b = 0; b < nbins; ++b) {
+            Amounts credit;
+            const int n = 1 + static_cast<int>(next() % 6);
+            for (int i = 0; i < n; ++i) {
+                const bytes32 k = key(static_cast<std::uint8_t>(1 + next() % 40));
+                if (want.count(k) || credit.count(k)) continue;
+                credit[k] = 1 + static_cast<long long>(next() % 500);
+            }
+            const std::string bid = "t" + std::to_string(t) + "b" + std::to_string(b);
+            L.on_block_found(bid, credit, {});
+            L.on_block_finalized(bid, 10 + static_cast<u64>(b));
+            for (const auto& [k, v] : credit) want[k] = {10 + static_cast<u64>(b), v};
+        }
+        const bytes32 salt = salt_of(static_cast<std::uint8_t>(next()));
+        const u64 budget = next() % 2000;
+        const unsigned cap = static_cast<unsigned>(next() % 6);
+        const u64 floor = next() % 3 == 0 ? 100 : 0;
+        auto hmin = [floor](ScriptKind) -> u64 { return floor; };
+        std::vector<std::tuple<u64, bytes32, bytes32>> order;
+        for (const auto& [k, fv] : want) order.emplace_back(fv.first, salted(salt, k), k);
+        std::sort(order.begin(), order.end());
+        std::vector<std::pair<bytes32, u64>> ref;
+        u64 left = budget;
+        for (const auto& [fe, h, k] : order) {
+            (void)fe; (void)h;
+            if (cap != 0 && ref.size() >= cap) break;
+            if (left == 0) break;
+            const u64 amt = std::min<u64>(static_cast<u64>(want[k].second), left);
+            if (amt < floor) continue;
+            left -= amt;
+            ref.emplace_back(k, amt);
+        }
+        auto got = L.propose_coinbase_salted(budget, cap, salt, pay_of, hmin);
+        if (got.outs.size() != ref.size()) { oracle_ok = false; break; }
+        for (std::size_t i = 0; i < ref.size(); ++i)
+            if (got.outs[i].key != ref[i].first || got.outs[i].amount != ref[i].second) oracle_ok = false;
+    }
+    CHECK(oracle_ok);
+
+    // (b) distinct ages: salted == unsalted
+    {
+        S::OwedLedger L(1);
+        for (int i = 0; i < 6; ++i) {
+            const std::string bid = "d" + std::to_string(i);
+            L.on_block_found(bid, Amounts{{key(static_cast<std::uint8_t>(60 - i)), 100}}, {});
+            L.on_block_finalized(bid, 20 + static_cast<u64>(i));
+        }
+        auto hmin = [](ScriptKind) -> u64 { return 0; };
+        CHECK(keys_of(L.propose_coinbase_salted(450, 0, salt_of(9), pay_of, hmin)) ==
+              keys_of(L.propose_coinbase(450, 0, pay_of, hmin)));
+    }
+
+    // (c) one tie cohort of 8 keys
+    {
+        S::OwedLedger L(1);
+        Amounts credit;
+        for (std::uint8_t i = 1; i <= 8; ++i) credit[key(i)] = 100;
+        L.on_block_found("c", credit, {});
+        L.on_block_finalized("c", 30);
+        auto hmin = [](ScriptKind) -> u64 { return 0; };
+        const S::OwedLedger copy = L;
+        const auto a1 = keys_of(L.propose_coinbase_salted(800, 0, salt_of(1), pay_of, hmin));
+        const auto a2 = keys_of(copy.propose_coinbase_salted(800, 0, salt_of(1), pay_of, hmin));
+        CHECK(a1.size() == 8 && a1 == a2);
+        bool differs = false, lowest_not_always_first = false;
+        for (std::uint8_t s = 2; s < 20; ++s) {
+            const auto b = keys_of(L.propose_coinbase_salted(800, 0, salt_of(s), pay_of, hmin));
+            if (b != a1) differs = true;
+            if (!b.empty() && b[0] != key(1)) lowest_not_always_first = true;
+        }
+        CHECK(differs);
+        CHECK(lowest_not_always_first);
+        CHECK(keys_of(L.propose_coinbase(800, 0, pay_of, hmin))[0] == key(1));   // unsalted: lowest wins
+    }
+}
+
 int main() {
     test_split_kat();
     test_fold_against_engine();
     at_repair();
+    test_salted_ties();
     at_spine();
     at_broadcast();
     test_conservation();
