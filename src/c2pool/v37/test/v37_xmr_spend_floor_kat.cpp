@@ -177,6 +177,31 @@ void f2b_no_room() {
           "ledger after FINALIZE: every balance is 0 (no debt, no advance)");
 }
 
+void f2c_short_pool() {
+    std::printf("== F2c. a short pool fills every slot and every piconero ==\n");
+    const std::uint64_t c = x6::spend_floor(kTail);
+    // 12 payees, one of them dust, credited 2x what the pool holds (the owed
+    // pass took half of the block): nobody is dropped, everyone gets the same
+    // fraction, the rest stays each one's balance.
+    std::vector<P> ps;
+    std::uint64_t sum = 0;
+    for (int i = 0; i < 12; ++i) { ps.push_back(payee(static_cast<std::uint8_t>(60 + i), i == 0 ? c / 3 : 10000000000ull * (i + 1))); sum += ps.back().eb; }
+    const std::uint64_t pool = sum / 2;
+    auto in = fee_on_inputs(pool + 1, true);
+    arm(in, ps);
+    const auto outs = x6::allocate_exact_sum(in);
+    std::size_t paid = 0; bool same = true;
+    for (const auto& p : ps) {
+        const std::uint64_t got = to(outs, p.id);
+        if (got > 0) ++paid;
+        const long double f = static_cast<long double>(got) / p.eb;
+        if (f < 0.4999L || f > 0.5001L) same = false;
+    }
+    CHECK(paid == ps.size(), "every payee with a slot is paid, dust included (%zu of %zu)", paid, ps.size());
+    CHECK(same, "every payee gets the same fraction of its E_b (half: the pool holds half of what was credited)");
+    CHECK(sum_of(outs) == pool + 1 && to(outs, fee::donation_identity(kNet)) == 1, "every piconero of the pool is paid out; only the marker is left");
+}
+
 // ---------------------------------------------------------------------------
 void f3_slots() {
     std::printf("== F3. too few output slots: oldest first ==\n");
@@ -348,6 +373,7 @@ int main() {
     f1_floor();
     f2_crumbs();
     f2b_no_room();
+    f2c_short_pool();
     f3_slots();
     f4_owed_floor();
     f5_receive();

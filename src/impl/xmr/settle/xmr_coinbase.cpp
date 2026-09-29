@@ -329,32 +329,20 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                     if (aa != ab) return aa < ab;
                     return ents[a].tie < ents[b].tie;
                 });
-                // Admission. Every admitted payee gets the same fraction of its E_b:
-                // all of it when the pool covers them, pool / Σeb when the owed pass
-                // left less. A payee >= c is admitted while its own share stays >= c;
-                // dust is admitted while the smallest admitted payee >= c still gets
-                // >= c (with no payee >= c: while its share is non-zero). The first
-                // payee that fails ends admission; a payee without a slot is
-                // skipped. Whoever is not admitted keeps E_b as a balance.
+                // Admission: every payee that has a slot, in that order. Payments are
+                // divisible, so filling the slots in order and splitting the pool pro
+                // rata uses every slot and every piconero: no packing problem. Every
+                // admitted payee gets the same fraction of its E_b (all of it unless
+                // the owed pass left less; the rest stays its balance). A payee
+                // without a slot is skipped.
                 std::vector<std::uint64_t> take(ents.size(), 0);
                 std::size_t free_slots = cap_owed > n_slots ? cap_owed - n_slots : 0;
-                unsigned __int128 sum = 0;
-                std::uint64_t min_big = 0;                    // the smallest admitted E_b >= c (0: none yet)
                 for (const std::size_t i : order) {
-                    const bool slot = needs_slot(ents[i]);
-                    if (slot && free_slots == 0) continue;
-                    const unsigned __int128 s2 = sum + ents[i].eb;
-                    const bool covered = static_cast<unsigned __int128>(pool) >= s2;
-                    const bool big = ents[i].eb >= floor_c;
-                    if (!covered) {
-                        const std::uint64_t binding = big ? ents[i].eb : min_big;
-                        if (binding ? static_cast<unsigned __int128>(pool) * binding / s2 < floor_c
-                                    : static_cast<unsigned __int128>(pool) * ents[i].eb / s2 == 0) break;
+                    if (needs_slot(ents[i])) {
+                        if (free_slots == 0) continue;
+                        --free_slots;
                     }
-                    if (slot) --free_slots;
-                    if (big && (min_big == 0 || ents[i].eb < min_big)) min_big = ents[i].eb;
                     take[i] = ents[i].eb;
-                    sum = s2;
                 }
                 // Each admitted payee gets its E_b (pro rata when the pool is short).
                 // REDISTRIBUTION, never an advance: when the pool has cash left over
