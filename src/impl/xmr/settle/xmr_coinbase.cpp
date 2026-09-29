@@ -348,20 +348,34 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                     take[i] = ents[i].eb;
                 }
                 // Each admitted payee gets its E_b (pro rata when the pool is short).
-                // REDISTRIBUTION, never an advance: when the pool has cash left over
-                // (it came from the payees without a slot), that cash, up to what
-                // those payees were credited, goes to the admitted payees pro rata,
-                // and the same amount comes off the waiting payees' credit, pro rata
-                // to their E_b. Cash beyond that stays in the residual.
+                // Cash left over came from the payees without a slot. It goes, in
+                // this order, never as an advance:
+                //   (1) DEBT: the admitted payees' positive balances the owed pass
+                //       left unpaid (owed_left), in admission order. The waiting
+                //       payees keep their credit: the ledger grows by their E_b and
+                //       shrinks by the debt paid, the same amount. Their balance
+                //       then grows until it is paid, or decays if abandoned.
+                //   (2) REDISTRIBUTION of what is still left, up to what the waiting
+                //       payees were credited: to the admitted payees pro rata, and
+                //       taken off the waiting payees' credit (credit_delta).
+                //   (3) The rest (uncredited cash) stays in the residual.
                 alloc = paynow_split(pool, take);
                 std::uint64_t given = 0;
                 for (const std::uint64_t a : alloc) given += a;
+                std::uint64_t spare = pool - given;
+                for (const std::size_t i : order) {
+                    if (spare == 0) break;
+                    if (take[i] == 0 || ents[i].owed_left == 0) continue;
+                    if (ents[i].identity == in.residual_sink_identity && ents[i].pay == in.residual_sink) continue;
+                    const std::uint64_t d = std::min(spare, ents[i].owed_left);
+                    alloc[i] += d;
+                    spare -= d;
+                }
                 std::vector<std::uint64_t> wait(ents.size(), 0);
                 unsigned __int128 wait_sum = 0;
                 for (std::size_t i = 0; i < ents.size(); ++i)
                     if (take[i] == 0 && ents[i].eb > 0) { wait[i] = ents[i].eb; wait_sum += ents[i].eb; }
-                const unsigned __int128 spare = static_cast<unsigned __int128>(pool) - given;
-                const std::uint64_t moved = static_cast<std::uint64_t>(spare < wait_sum ? spare : wait_sum);
+                const std::uint64_t moved = static_cast<std::uint64_t>(static_cast<unsigned __int128>(spare) < wait_sum ? spare : wait_sum);
                 if (moved > 0) {
                     const std::vector<std::uint64_t> plus = prorata(moved, take);
                     const std::vector<std::uint64_t> minus = paynow_split(moved, wait);   // <= each E_b

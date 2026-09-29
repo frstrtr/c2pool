@@ -84,10 +84,17 @@ into one transaction for pool members is a later stage (§7).
   Only indivisible items need a knapsack. `v37_xmr_spend_floor_kat` F2c: a
   pool holding half of what was credited pays all 12 payees half each, and
   only the marker is left.
-* **Payees that are not admitted** (no slot left): their cash is
-  **redistributed** to the admitted payees pro rata, and it comes off their own
-  credit for this block. This is P2Pool's rule for outputs that do not fit.
-  Their work stays in the window and earns in the next blocks.
+* **Payees that are not admitted** (no slot left). Their cash goes, in order:
+  1. **Debt first.** It pays the admitted payees' old positive balances that
+     the owed pass left unpaid, in admission order. The waiting payees keep
+     their credit. The ledger grows by their E_b and shrinks by the debt paid,
+     the same amount. A waiting dust balance then grows until it is worth a
+     slot, or decays if its miner is gone (`v37_xmr_spend_floor_kat` F2d).
+  2. **Then redistribution** of what is left, when there is not enough debt
+     (e.g. the first overflow block). It goes to the admitted payees pro rata
+     and comes off the waiting payees' credit for this block. This is
+     P2Pool's rule for outputs that do not fit. Their work stays in the window
+     and earns in the next blocks.
 * **Never an advance** (ruling 2026-09-29). Pay-now is a flow. A miner that
   leaves or changes address never returns work paid ahead, so no payee is
   paid more than it is credited. The redistribution is booked as a credit
