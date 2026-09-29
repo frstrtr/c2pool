@@ -96,6 +96,8 @@ public:
         ::c2pool::v37n::settle::OwedLedgerRules r;
         r.arm_floor = m_cfg.ledger_arm_floor;
         r.rotate_on_payment = m_cfg.ledger_rotate_on_payment;
+        r.decay_horizon = m_cfg.ledger_decay_horizon;
+        r.decay_half_life = m_cfg.ledger_decay_half_life;
         return r;
     }
 

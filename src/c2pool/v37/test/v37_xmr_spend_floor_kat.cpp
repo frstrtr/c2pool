@@ -395,6 +395,38 @@ void f8_rotation() {
     }
 }
 
+void f10_decay() {
+    std::printf("== F10. dust decay: only a gone miner's dust, never active work ==\n");
+    st::OwedLedgerRules r; r.arm_floor = 1000; r.rotate_on_payment = true; r.decay_horizon = 100; r.decay_half_life = 50;
+    const ::v37::bytes32 A = key(0x10), D = key(0x20), S = key(0x30), N = key(0x40);
+    st::OwedLedger L(7, r);
+    int nb = 0;
+    auto block = [&](const Amounts& credit, const Amounts& payout, std::uint64_t bin) {
+        const std::string bid = "b" + std::to_string(++nb);
+        L.on_block_found(bid, credit, payout); L.on_block_finalized(bid, bin);
+    };
+    block(Amounts{{D, 800}, {S, 3}, {N, 5000}}, {}, 1);         // D: dust that will be abandoned; S: a tiny DROPS miner
+    block(Amounts{}, Amounts{{N, 5500}}, 2);                     // N pays out beyond its balance: a negative row
+    block(Amounts{}, {}, 500);                                   // no lane block credits anyone for a long time
+    CHECK(L.effective_owed(D) == 800, "a pool that finds no block decays nobody (D still 800 at bin 500)");
+    block(Amounts{{A, 5000}, {S, 2}}, {}, 520);                  // a lane block passes D by: D is gone from bin 520
+    CHECK(L.effective_owed(D) == 800, "passed by at bin 520, D keeps its balance for one more window (grace to come back)");
+    block(Amounts{{A, 5000}, {S, 1}}, {}, 630);
+    CHECK(L.effective_owed(D) == 400, "after the window it halves (400 at bin 630)");
+    block(Amounts{{A, 5000}, {S, 1}}, {}, 680);
+    CHECK(L.effective_owed(D) == 200, "and halves again each half-life (200 at bin 680)");
+    CHECK(L.effective_owed(S) == 7, "the active tiny miner keeps every piconero it earned (7): every lane block credits it");
+    block(Amounts{{D, 10}}, {}, 690);                            // D comes back
+    block(Amounts{{A, 5000}, {S, 1}}, {}, 700);
+    CHECK(L.effective_owed(D) == 210, "a returning miner stops the decay (200 + 10, untouched at bin 700)");
+    CHECK(L.effective_owed(N) == -500, "a negative row never decays");
+    CHECK(L.effective_owed(A) == 20000, "a balance at or above the floor never decays");
+    CHECK(L.decayed_total() == 600, "the write-off is counted (600): it lowers the liability, it is paid to nobody");
+    block(Amounts{{A, 1}}, {}, 2000);
+    block(Amounts{{A, 1}}, {}, 20000);
+    CHECK(L.effective_owed(D) == 0, "left long enough, abandoned dust decays to zero");
+}
+
 void f9_off() {
     std::printf("== F9. rules off: byte-identical ==\n");
     st::OwedLedger a(7), b(7, st::OwedLedgerRules{});
@@ -422,6 +454,7 @@ int main() {
     f7_seniority();
     f8_rotation();
     f9_off();
+    f10_decay();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

@@ -908,9 +908,22 @@ inline std::map<bytes32, long long> compose_credit_replace(
 //   rotate_on_payment  a key paid in a finalized block that still has a
 //                      balance re-arms at that block's bin_height: paid ->
 //                      back of the queue (external review 04, audit O-1).
+//   decay_horizon,     DUST DECAY (payout-threshold.md §5; needs arm_floor).
+//   decay_half_life    A balance with 0 < finalW < arm_floor decays only when
+//                      its key is GONE: a FINALIZE credited other keys but not
+//                      it (while a miner works, every lane block credits it,
+//                      DROPS near-miss credit included; a pool that finds no
+//                      block decays nobody). From that bin it keeps its balance
+//                      for decay_horizon more bins (one lane window to come
+//                      back), then halves at the FINALIZE that enters each
+//                      decay_half_life, down to 0. A new credit clears it. Never a donation: the write-off only
+//                      lowers the pool's liability. Each FINALIZE that writes
+//                      off carries the amounts in its owed-event leaf.
 struct OwedLedgerRules {
     long long arm_floor = 0;
     bool      rotate_on_payment = false;
+    u64       decay_horizon = 0;     // 0 = off
+    u64       decay_half_life = 0;
 };
 
 class OwedLedger {
@@ -1008,13 +1021,27 @@ public:
         std::vector<bytes32> paid;                            // rotate_on_payment
         if (m_rules.rotate_on_payment)
             for (const auto& [k, v] : it->second.payout) if (v > 0) paid.push_back(k);
+        if (decay_on()) {                                     // DUST DECAY: a credit restarts the clock
+            bool credits = false;
+            for (const auto& [k, v] : it->second.credit) if (v > 0) credits = true;
+            for (const auto& [k, v] : it->second.credit)
+                if (v > 0) { m_gone_since.erase(k); m_decay_steps.erase(k); }
+            if (credits)   // every sub-floor key this lane block passed by is gone from now
+                for (const auto& [k, w] : m_finalW)
+                    if (w > 0 && w < m_rules.arm_floor && !m_gone_since.count(k) &&
+                        !(it->second.credit.count(k) && it->second.credit.at(k) > 0))
+                        m_gone_since[k] = bin_height;
+        }
         m_pending.erase(it);
         m_settled.insert(bid);
+        const Amounts decayed = decay_dust(bin_height);
         rearm_first_eligible(bin_height, paid);
         prune_finalized_zero_rows();                          // R3: drop 0/unarmed rows
         // FINALIZE consumes only (bid, bin_height); the amounts came from the
-        // pending row the ledger already held, so the leaf carries no maps.
-        bump(owedevent::finalize_payload(bid, bin_height));
+        // pending row the ledger already held, so the leaf carries no maps,
+        // except the dust written off at this FINALIZE (empty when decay is off).
+        bump(decayed.empty() ? owedevent::finalize_payload(bid, bin_height)
+                             : owedevent::leaf_payload(owedevent::EV_FINALIZE, bid, bin_height, {}, {}, decayed));
     }
 
     // ── ORPHAN(b): a pure disposition of the pending state, or a priced
@@ -1205,10 +1232,24 @@ public:
             if (it != m_first_eligible.end()) fe = it->second;
             for (int i = 0; i < 8; ++i) pre.push_back((fe >> (8 * i)) & 0xff);
         }
+        if (decay_on()) {   // DUST DECAY state: it decides future balances, so it is committed
+            const char kt[4] = {'V', '3', '7', 'K'};
+            pre.insert(pre.end(), kt, kt + 4);
+            for (const auto& [k, g] : m_gone_since) {
+                auto ds = m_decay_steps.find(k);
+                const u64 b = ds == m_decay_steps.end() ? 0 : ds->second;
+                pre.insert(pre.end(), k.begin(), k.end());
+                for (int i = 0; i < 8; ++i) pre.push_back((g >> (8 * i)) & 0xff);
+                for (int i = 0; i < 8; ++i) pre.push_back((b >> (8 * i)) & 0xff);
+            }
+        }
         bytes32 d = ::v37::sha256d(pre);
         m_digest_memo.put(m_seq, d);
         return d;
     }
+
+    // DUST DECAY: the total written off so far (diagnostics / status line).
+    long long decayed_total() const { return m_decayed_total; }
 
     // Diagnostics for the acceptance tests (never consensus).
     long long residual_total() const { return m_residual; }
@@ -1349,11 +1390,48 @@ private:
     // finalW growth so it does not retain settled-to-zero payees forever.
     void prune_finalized_zero_rows() {
         for (auto it = m_finalW.begin(); it != m_finalW.end();) {
-            if (it->second == 0 && !m_first_eligible.count(it->first))
+            if (it->second == 0 && !m_first_eligible.count(it->first)) {
+                m_gone_since.erase(it->first);    // DUST DECAY state goes with the row
+                m_decay_steps.erase(it->first);
                 it = m_finalW.erase(it);
-            else
+            } else {
                 ++it;
+            }
         }
+    }
+
+    bool decay_on() const { return m_rules.arm_floor > 0 && m_rules.decay_horizon > 0 && m_rules.decay_half_life > 0; }
+
+    // DUST DECAY (OwedLedgerRules::decay_*). For every balance 0 < w < arm_floor
+    // whose key has had no credit for decay_horizon bins: the number of halvings
+    // due is 1 + (elapsed - horizon) / half_life; apply the ones not applied
+    // yet. Returns the amounts written off at this FINALIZE, per key.
+    Amounts decay_dust(u64 bin_height) {
+        Amounts off;
+        if (!decay_on()) return off;
+        for (auto& [k, w] : m_finalW) {
+            if (w <= 0 || w >= m_rules.arm_floor) continue;
+            auto gs = m_gone_since.find(k);
+            if (gs == m_gone_since.end()) continue;           // not gone: no lane block has passed it by
+            if (bin_height < gs->second + m_rules.decay_horizon) continue;
+            const u64 due = 1 + (bin_height - gs->second - m_rules.decay_horizon) / m_rules.decay_half_life;
+            u64& done = m_decay_steps[k];
+            if (due <= done) continue;
+            const u64 n = due - done;
+            const long long nw = n >= 63 ? 0 : (w >> n);
+            off[k] = w - nw;
+            done = due;
+        }
+        for (const auto& [k, v] : off) {
+            m_finalW[k] -= v;
+            m_decayed_total += v;
+        }
+        if (!off.empty()) {
+            Amounts neg;
+            for (const auto& [k, v] : off) neg[k] = -v;
+            m_eo_index.apply_finalize_credit(neg);   // eo follows finalW
+        }
+        return off;
     }
 
     // fe(k) with a 0 default — the value the index reads to order the positive
@@ -1367,6 +1445,9 @@ private:
 
     ::v37::ChainId m_chain;
     OwedLedgerRules m_rules;
+    std::map<bytes32, u64> m_gone_since;           // DUST DECAY: bin of the first lane block that passed it by
+    std::map<bytes32, u64> m_decay_steps;          // DUST DECAY: halvings already applied
+    long long m_decayed_total = 0;
     u64 m_seq = 0;
     Amounts m_finalW;                              // finalized owed partition
     std::map<std::string, Pending> m_pending;      // FOUND, not yet finalized
