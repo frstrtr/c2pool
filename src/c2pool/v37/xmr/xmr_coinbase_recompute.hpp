@@ -109,6 +109,7 @@ struct LaneInputs {
     o2::KFairSource  kfair = o2::KFairSource::W4Propose;
     bool             kfair_salted_ties = false;  // #1867: equal-age cohorts by a hash of the parent id
     bool             spend_floor = false;        // payout-threshold.md §2-§3: c from the block's own total
+    bool             commit_total = false;       // REWARD TOTAL: "V37R" == the coinbase total (share check)
 };
 
 // What the block's booking already established.
@@ -155,6 +156,129 @@ inline bool ends_with(const std::vector<std::uint8_t>& p, const std::vector<std:
 }
 }  // namespace detail
 
+// What a lane coinbase states in the open: everything the recompute needs
+// besides the receiver's own ledger, lane config and cut view. A block gives
+// it from its decode; a share from its receipt's open tx_extra (+ the height
+// and parent of its hashing blob).
+struct CoinbaseClaim {
+    std::uint8_t   major = 0;
+    std::uint64_t  height = 0;
+    ::v37::bytes32 prev_id{};
+    std::uint64_t  total = 0;                    // base reward + fees (exact-sum)
+    ::v37::bytes32 lane_commitment{};
+    bool           has_credit_cut = false;
+    credit::CreditCut credit_cut;
+    std::optional<std::uint64_t>    paynow_base;       // V37N
+    std::optional<std::uint64_t>    donation_owed_in;  // V37D
+    std::optional<::v37::ScriptRef> ecut_finder;       // V37F
+    bool                            ecut_finder_malformed = false;
+    std::vector<std::uint8_t>       payload;           // the whole 0x02 payload
+};
+
+// Steps 3-5 of the recompute: the canonical settlement source for a claim, or
+// nullptr with *mismatch set (the claim cannot be the canonical coinbase).
+inline std::unique_ptr<o2::XmrOwedSettlementSource>
+canonical_source(const CoinbaseClaim& cl, const OwedLedger& ledger, const o2::PayOfFn& pay_of,
+                 const LaneInputs& lane, const CutInputs& cut, std::string& mismatch) {
+    // --- the builder's context, from the lane config + the claim ---
+    o2::XmrCoinbaseContext ctx;
+    ctx.monero_major_version = cl.major;
+    ctx.height               = cl.height;
+    std::memcpy(ctx.prev_id.data(), cl.prev_id.data(), 32);
+    ctx.base_reward          = cl.total;   // X6 reads only base_reward + fees
+    ctx.fees                 = 0;
+    ctx.chain_id             = lane.chain_id;
+    ctx.lane_commitment      = cl.lane_commitment;
+    ctx.residual_sink        = lane.residual_sink;
+    ctx.residual_sink_identity = lane.residual_sink_identity;
+    ctx.fixed                = lane.fixed;
+    ctx.h_min                = lane.h_min;
+    ctx.output_cap           = lane.owed_cap;
+    ctx.kfair_salted_ties    = lane.kfair_salted_ties;   // the salt is the claim's own prev_id
+    ctx.spend_floor          = lane.spend_floor;         // c is a function of the total alone
+    ctx.has_credit_cut       = cl.has_credit_cut;
+    ctx.credit_cut           = cl.credit_cut;
+    if (lane.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *lane.pool_tag; }
+    ctx.has_paynow           = ctx.has_credit_cut && cut.has_view;
+    if (ctx.has_paynow) ctx.paynow_payees = cut.payees;
+
+    std::uint64_t fixed_sum = 0;
+    for (const auto& f : lane.fixed) fixed_sum += f.amount;
+
+    // REWARD TOTAL: the committed total must be the claim's own (a block's
+    // output sum; for a share, the value the check below rebuilds at).
+    if (lane.commit_total) {
+        const auto t = paynow::parse_reward_total_payload(cl.payload);
+        if (!t) { mismatch = "no V37R reward total in the 0x02 payload"; return nullptr; }
+        if (*t != cl.total) { mismatch = "V37R total " + std::to_string(*t) + " != the coinbase total " + std::to_string(cl.total); return nullptr; }
+    }
+
+    // --- the owed takes: at the total, or from the committed base ---
+    std::string why;
+    auto at_total = o2::XmrOwedSettlementSource::build(ledger, pay_of, ctx, cl.total, &why, lane.kfair);
+    if (!at_total) { mismatch = "the canonical coinbase cannot be built at this total: " + why; return nullptr; }
+    std::unique_ptr<o2::XmrOwedSettlementSource> src;
+    if (cl.paynow_base) {
+        const std::uint64_t B = *cl.paynow_base;
+        if (B < fixed_sum) { mismatch = "V37N base " + std::to_string(B) + " < the fixed outputs " + std::to_string(fixed_sum); return nullptr; }
+        std::uint64_t took_at_total = 0;
+        for (const auto& e : at_total->inputs().owed) took_at_total += e.owed;
+        const std::uint64_t took = B - fixed_sum;
+        if (took < took_at_total) {
+            mismatch = "under-take: the V37N base commits owed takes " + std::to_string(took) +
+                       " < " + std::to_string(took_at_total) + " the K_fair pass pays at the total " +
+                       std::to_string(cl.total) + " (owed money shifted to pay-now)";
+            return nullptr;
+        }
+        src = o2::XmrOwedSettlementSource::build(ledger, pay_of, ctx, cl.total, &why, lane.kfair, {}, took);
+        if (!src) { mismatch = "the canonical coinbase cannot be built at the committed base: " + why; return nullptr; }
+    } else {
+        src = std::move(at_total);
+    }
+    // EMPTY-CUT FINDER: the claim names its finder; the same snapshot re-armed for it.
+    if (cl.ecut_finder_malformed) { mismatch = "malformed V37F finder field"; return nullptr; }
+    if (cl.ecut_finder) {
+        auto f = src->with_finder(*cl.ecut_finder, &why);
+        if (!f) { mismatch = "V37F finder not canonical here: " + why; return nullptr; }
+        src = std::move(f);
+    }
+
+    // --- the committed 0x02 tail must be exactly the canonical one ---
+    const std::vector<std::uint8_t> tail = src->extra_nonce_tail();
+    if (!detail::ends_with(cl.payload, tail)) {
+        std::string w = "the 0x02 tail is not the canonical one";
+        const auto want_n = paynow::parse_payload(tail);
+        if (want_n != cl.paynow_base)
+            w += want_n ? (cl.paynow_base ? " (V37N base " + std::to_string(*cl.paynow_base) + " != canonical " + std::to_string(*want_n) + ")"
+                                          : " (V37N absent, canonical base " + std::to_string(*want_n) + ")")
+                        : " (V37N present, canonical coinbase has no pay-now)";
+        const auto want_d = fee::parse_donation_owed_payload(tail);
+        if (want_d != cl.donation_owed_in)
+            w += " (V37D owed_in " + (cl.donation_owed_in ? std::to_string(*cl.donation_owed_in) : std::string("absent")) +
+                 " != canonical " + (want_d ? std::to_string(*want_d) : std::string("absent")) + ")";
+        mismatch = w;
+        return nullptr;
+    }
+    return src;
+}
+
+// The output caps a canonical coinbase may have been built with. With the
+// spend floor the cap is the wire ceiling alone; without it the builder's
+// weight-aware cap is one of n / n+1 for an n-output coinbase (0 = unknown).
+inline std::vector<std::uint32_t> candidate_caps(const LaneInputs& lane, std::size_t n_outputs) {
+    std::vector<std::uint32_t> caps;
+    auto add_cap = [&](std::uint64_t c) {
+        if (c < 1 || c > lane.wire_cap) return;
+        if (std::find(caps.begin(), caps.end(), static_cast<std::uint32_t>(c)) == caps.end()) caps.push_back(static_cast<std::uint32_t>(c));
+    };
+    add_cap(lane.wire_cap);
+    if (!lane.spend_floor && n_outputs > 0) {
+        add_cap(n_outputs);
+        add_cap(n_outputs + 1);
+    }
+    return caps;
+}
+
 // Recompute the canonical coinbase of a decoded lane block and compare it
 // with the block's own. `bk` must be the coinbase-authority decode of `blob`
 // with a matched lane root (bk.is_lane); `ledger` the receiver's ledger
@@ -189,86 +313,26 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
     const auto payload = credit::extra_nonce_field(got.tx_extra);
     if (!payload) return mismatch("no 0x02 extra-nonce payload");
 
-    // --- 3. the builder's context, from the lane config + the block ---
-    o2::XmrCoinbaseContext ctx;
-    ctx.monero_major_version = bk.major;
-    ctx.height               = height;
-    std::memcpy(ctx.prev_id.data(), pb.header.prev_id.data(), 32);
-    ctx.base_reward          = bk.total;   // X6 reads only base_reward + fees
-    ctx.fees                 = 0;
-    ctx.chain_id             = lane.chain_id;
-    ctx.lane_commitment      = bk.lane_commitment;
-    ctx.residual_sink        = lane.residual_sink;
-    ctx.residual_sink_identity = lane.residual_sink_identity;
-    ctx.fixed                = lane.fixed;
-    ctx.h_min                = lane.h_min;
-    ctx.output_cap           = lane.owed_cap;
-    ctx.kfair_salted_ties    = lane.kfair_salted_ties;   // the salt is the block's own prev_id
-    ctx.spend_floor          = lane.spend_floor;         // c is a function of bk.total alone
-    ctx.has_credit_cut       = bk.has_credit_cut;
-    ctx.credit_cut           = bk.credit_cut;
-    if (lane.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *lane.pool_tag; }
-    ctx.has_paynow           = ctx.has_credit_cut && cut.has_view;
-    if (ctx.has_paynow) ctx.paynow_payees = cut.payees;
-
-    std::uint64_t fixed_sum = 0;
-    for (const auto& f : lane.fixed) fixed_sum += f.amount;
-
-    // --- 4. the owed takes: at the block's total, or from its committed base ---
-    std::string why;
-    auto at_total = o2::XmrOwedSettlementSource::build(ledger, pay_of, ctx, bk.total, &why, lane.kfair);
-    if (!at_total) return mismatch("the canonical coinbase cannot be built at this block's total: " + why);
-    std::unique_ptr<o2::XmrOwedSettlementSource> src;
-    if (bk.paynow_base) {
-        const std::uint64_t B = *bk.paynow_base;
-        if (B < fixed_sum) return mismatch("V37N base " + std::to_string(B) + " < the fixed outputs " + std::to_string(fixed_sum));
-        std::uint64_t took_at_total = 0;
-        for (const auto& e : at_total->inputs().owed) took_at_total += e.owed;
-        const std::uint64_t took = B - fixed_sum;
-        if (took < took_at_total)
-            return mismatch("under-take: the V37N base commits owed takes " + std::to_string(took) +
-                            " < " + std::to_string(took_at_total) + " the K_fair pass pays at this block's total " +
-                            std::to_string(bk.total) + " (owed money shifted to pay-now)");
-        src = o2::XmrOwedSettlementSource::build(ledger, pay_of, ctx, bk.total, &why, lane.kfair, {}, took);
-        if (!src) return mismatch("the canonical coinbase cannot be built at the committed base: " + why);
-    } else {
-        src = std::move(at_total);
-    }
-    // EMPTY-CUT FINDER: the block names its finder; the same snapshot re-armed for it.
-    if (bk.ecut_finder_malformed) return mismatch("malformed V37F finder field");
-    if (bk.ecut_finder) {
-        auto f = src->with_finder(*bk.ecut_finder, &why);
-        if (!f) return mismatch("V37F finder not canonical here: " + why);
-        src = std::move(f);
-    }
-
-    // --- 5. the committed 0x02 tail must be exactly the canonical one ---
-    const std::vector<std::uint8_t> tail = src->extra_nonce_tail();
-    if (!detail::ends_with(*payload, tail)) {
-        std::string w = "the 0x02 tail is not the canonical one";
-        const auto want_n = paynow::parse_payload(tail);
-        if (want_n != bk.paynow_base)
-            w += want_n ? (bk.paynow_base ? " (V37N base " + std::to_string(*bk.paynow_base) + " != canonical " + std::to_string(*want_n) + ")"
-                                          : " (V37N absent, canonical base " + std::to_string(*want_n) + ")")
-                        : " (V37N present, canonical coinbase has no pay-now)";
-        const auto want_d = fee::parse_donation_owed_payload(tail);
-        if (want_d != bk.donation_owed_in)
-            w += " (V37D owed_in " + (bk.donation_owed_in ? std::to_string(*bk.donation_owed_in) : std::string("absent")) +
-                 " != canonical " + (want_d ? std::to_string(*want_d) : std::string("absent")) + ")";
-        return mismatch(w);
-    }
+    // --- 3-5. the canonical source for what the block states ---
+    CoinbaseClaim cl;
+    cl.major = bk.major;
+    cl.height = height;
+    std::memcpy(cl.prev_id.data(), pb.header.prev_id.data(), 32);
+    cl.total = bk.total;
+    cl.lane_commitment = bk.lane_commitment;
+    cl.has_credit_cut = bk.has_credit_cut;
+    cl.credit_cut = bk.credit_cut;
+    cl.paynow_base = bk.paynow_base;
+    cl.donation_owed_in = bk.donation_owed_in;
+    cl.ecut_finder = bk.ecut_finder;
+    cl.ecut_finder_malformed = bk.ecut_finder_malformed;
+    cl.payload = *payload;
+    std::string mis;
+    const auto src = canonical_source(cl, ledger, pay_of, lane, cut, mis);
+    if (!src) return mismatch(mis);
 
     // --- 6. byte-compare R, every output and the whole tx_extra ---
-    std::vector<std::uint32_t> caps;
-    auto add_cap = [&](std::uint64_t c) {
-        if (c < 1 || c > lane.wire_cap) return;
-        if (std::find(caps.begin(), caps.end(), static_cast<std::uint32_t>(c)) == caps.end()) caps.push_back(static_cast<std::uint32_t>(c));
-    };
-    add_cap(lane.wire_cap);
-    if (!lane.spend_floor) {   // with the floor the cap is the wire ceiling, and nothing else reproduces
-        add_cap(got.amounts.size());
-        add_cap(got.amounts.size() + 1);
-    }
+    const std::vector<std::uint32_t> caps = candidate_caps(lane, got.amounts.size());
     x6::MatchResult first{false, x6::IDX_BUILD, "no candidate cap"};
     for (const std::uint32_t c : caps) {
         x6::CoinbaseInputs in = src->inputs_at(bk.total, *payload);
@@ -293,6 +357,84 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
     const std::string at = first.first_bad_index >= 0 ? " at output " + std::to_string(first.first_bad_index) : "";
     return mismatch(first.reason + at + " (canonical coinbase recomputed from the booking-point ledger; tried " +
                     std::to_string(caps.size()) + " output cap(s))", first.first_bad_index);
+}
+
+// ===========================================================================
+// SHARE-LEVEL CANONICAL COINBASE (P2Pool's share rule: a share is a block
+// candidate, so its generation transaction must be the canonical one). A
+// relayed receipt hides the coinbase outputs in its Keccak midstate; it opens
+// the tx_extra, whose 0x02 payload carries every recompute input (V37R total,
+// V37F, V37N, V37D, V37P, V37C) and whose 0x03 root commits the ledger state.
+// The caller resumes the receipt's opening to H(prefix) (verify::
+// resume_prefix_hash) and passes the height and parent of its hashing blob;
+// `ledger` must be the ledger state whose owed_digest the 0x03 root commits
+// (else Undecidable: this node does not hold that state) and `cut` the view
+// at the payload's credit cut.
+//
+// Canonical: the share is valid. Mismatch: it pays anything else (a template
+// that pays the finder, a donation output with the rest to the finder, a
+// wrong total): the share earns no credit. A thief can then no longer earn
+// pool credit on a template that keeps the block for itself.
+// ===========================================================================
+inline std::optional<::v37::bytes32> mm_root_of(const std::vector<unsigned char>& tx_extra) {
+    // The lane coinbase's tx_extra ends in 03 21 00 root[32] (depth 0, one leaf).
+    if (tx_extra.size() < 35) return std::nullopt;
+    const unsigned char* t = tx_extra.data() + tx_extra.size() - 35;
+    if (t[0] != 0x03 || t[1] != 0x21 || t[2] != 0x00) return std::nullopt;
+    ::v37::bytes32 r{};
+    std::memcpy(r.data(), t + 3, 32);
+    return r;
+}
+
+inline Result verify_share_coinbase(const std::vector<unsigned char>& tx_extra, const ::v37::bytes32& prefix_hash,
+                                    std::uint8_t major, std::uint64_t height, const ::v37::bytes32& prev_id,
+                                    const OwedLedger& ledger, const o2::PayOfFn& pay_of,
+                                    const LaneInputs& lane, const CutInputs& cut) {
+    Result res;
+    auto mismatch = [&](const std::string& w) { res.verdict = Verdict::Mismatch; res.why = "share-mismatch: " + w; return res; };
+    auto undecidable = [&](const std::string& w) { res.verdict = Verdict::Undecidable; res.why = "share-undecidable: " + w; return res; };
+
+    const auto root = mm_root_of(tx_extra);
+    if (!root) return mismatch("tx_extra does not end in the lane 0x03 root");
+    const auto want = x6::mm_commitment_root(lane.chain_id, ledger.owed_digest());
+    if (std::memcmp(root->data(), want.data(), 32) != 0)
+        return undecidable("the 0x03 root commits a ledger state other than the one supplied (" +
+                           detail::hex12(ledger.owed_digest()) + "...)");
+    const auto payload = credit::extra_nonce_field(tx_extra);
+    if (!payload) return mismatch("no 0x02 extra-nonce payload");
+    const auto total = paynow::parse_reward_total_payload(*payload);
+    if (!total) return mismatch("no V37R reward total (a share must state the total its outputs sum to)");
+
+    CoinbaseClaim cl;
+    cl.major = major;
+    cl.height = height;
+    cl.prev_id = prev_id;
+    cl.total = *total;
+    cl.lane_commitment = ledger.owed_digest();
+    if (const auto cc = credit::parse_from_tx_extra(tx_extra)) { cl.has_credit_cut = true; cl.credit_cut = *cc; }
+    cl.paynow_base = paynow::parse_payload(*payload);
+    cl.donation_owed_in = fee::parse_donation_owed_payload(*payload);
+    cl.ecut_finder = paynow::parse_finder_payload(*payload);
+    cl.ecut_finder_malformed = paynow::finder_malformed(tx_extra);
+    cl.payload = *payload;
+    LaneInputs l2 = lane;
+    l2.commit_total = true;   // a share's total is only what V37R states
+    std::string mis;
+    const auto src = canonical_source(cl, ledger, pay_of, l2, cut, mis);
+    if (!src) return mismatch(mis);
+
+    for (const std::uint32_t c : candidate_caps(lane, 0)) {
+        x6::CoinbaseInputs in = src->inputs_at(*total, *payload);
+        in.output_cap = c;
+        const x6::BuiltCoinbase b = x6::build_coinbase(in);
+        if (!b.ok) continue;
+        if (std::memcmp(b.prefix_hash.data(), prefix_hash.data(), 32) == 0) {
+            res.verdict = Verdict::Canonical;
+            res.cap = c;
+            return res;
+        }
+    }
+    return mismatch("the coinbase prefix hash is not the canonical one (the outputs pay other amounts or payees)");
 }
 
 }  // namespace c2pool::v37n::xmr::recompute

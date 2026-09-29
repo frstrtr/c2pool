@@ -2498,6 +2498,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         li.kfair = cba_scfg->kfair;
         li.kfair_salted_ties = cba_scfg->kfair_salted_ties;
         li.spend_floor = cba_scfg->spend_floor;
+        li.commit_total = cba_scfg->commit_total;
         rc::CutInputs ci;
         auto view = view_at_cut(bk.credit_cut, why, relay_hint(bid));   // the view fold_at_cut just folded
         if (!view) {
@@ -3317,6 +3318,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         scfg.pool_tag = pool_tag_of(cfg);
         scfg.kfair_salted_ties = true;   // #1867: equal-age cohorts ordered by a hash of the parent id
         scfg.spend_floor = true;         // payout-threshold.md §2-§3: Monero's spend cost is the payout floor
+        scfg.commit_total = true;        // share-level canonical coinbase: "V37R" total in every lane coinbase
         std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
                     hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
                     hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
