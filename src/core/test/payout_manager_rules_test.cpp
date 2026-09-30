@@ -90,4 +90,15 @@ TEST(PayoutRules, DemoCoinbaseEndsInTheDonation)
     EXPECT_EQ(o.back()["amount_satoshis"].get<uint64_t>(), 1u) << "0% give-author: the 1-satoshi marker, last";
 }
 
+TEST(PayoutRules, DemoCoinbaseNeverWrapsOnOverHundredPercent)
+{
+    PayoutManager pm(1.0, 86400);
+    const auto j = pm.build_coinbase_detailed(kReward, "LeD2fnnDJYZuyt8zgDsZ2oBGmuVcxGKCLd", 150.0, 30.0);
+    ASSERT_TRUE(j.contains("outputs")) << j.dump();
+    uint64_t sum = 0;
+    for (const auto& o : j["outputs"]) sum += o["amount_satoshis"].get<uint64_t>();
+    EXPECT_EQ(sum, kReward) << "a 150% RPC value is clamped; the outputs still sum to the reward";
+    for (const auto& o : j["outputs"]) EXPECT_LE(o["amount_satoshis"].get<uint64_t>(), kReward) << "no output wraps";
+}
+
 }  // namespace

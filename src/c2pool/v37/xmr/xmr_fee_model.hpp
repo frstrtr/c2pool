@@ -311,6 +311,48 @@ inline x6::FixedOutput donation_marker() { return donation_marker(DonationNet::M
 // ---------------------------------------------------------------------------
 // Give-author (receipt-carried u16)
 // ---------------------------------------------------------------------------
+// A percentage as an EXACT decimal: num / den with den = 10^k (k <= 9), parsed
+// from the operator's text with no floating point, so the u16 a receipt
+// commits to (and the owner-fee basis points) is the same on every platform
+// and compiler (an x87 or FMA build may round a double on a .5 boundary the
+// other way). Accepts DIGITS[.DIGITS] with at most 9 decimals; anything else
+// (a sign, an exponent, NaN, text) is refused.
+struct ExactPct { std::uint64_t num = 0, den = 1; bool ok = false; };
+inline ExactPct parse_pct_exact(const std::string& t) {
+    ExactPct r;
+    std::size_t i = 0, int_digits = 0, frac_digits = 0;
+    std::uint64_t num = 0, den = 1;
+    for (; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i, ++int_digits) {
+        if (num > 1000000000ull) return r;                 // far above 100: refuse
+        num = num * 10 + static_cast<std::uint64_t>(t[i] - '0');
+    }
+    if (i < t.size() && t[i] == '.') {
+        for (++i; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i, ++frac_digits) {
+            if (frac_digits == 9) return r;                // more than 9 decimals
+            num = num * 10 + static_cast<std::uint64_t>(t[i] - '0');
+            den *= 10;
+        }
+        if (frac_digits == 0) return r;                    // "1." is not a number
+    }
+    if (i != t.size() || int_digits == 0) return r;
+    r.num = num; r.den = den; r.ok = true;
+    return r;
+}
+// round-half-up(65535 * num / (100 * den)), clamped to [0, 65535], in integers.
+inline std::uint16_t give_author_u16(const ExactPct& p) {
+    if (!p.ok || p.num == 0) return 0;
+    const unsigned __int128 n = static_cast<unsigned __int128>(kGiveAuthorScale) * p.num * 2 + 100u * p.den;
+    const unsigned __int128 d = static_cast<unsigned __int128>(200u) * p.den;
+    const unsigned __int128 v = n / d;
+    return static_cast<std::uint16_t>(v > kGiveAuthorScale ? kGiveAuthorScale : v);
+}
+// round-half-up(10000 * num / (100 * den)) basis points, clamped to [0, 10000].
+inline std::uint32_t pct_to_bp(const ExactPct& p) {
+    if (!p.ok || p.num == 0) return 0;
+    const unsigned __int128 v = (static_cast<unsigned __int128>(p.num) * 200u + p.den) / (2u * p.den);
+    return static_cast<std::uint32_t>(v > 10000u ? 10000u : v);
+}
+
 // v36 encodes perfect_round(65535*pct/100) (stochastic rounding); the u16 is
 // minted into the receipt and is node-local policy, so a deterministic
 // round-half-up is used here (bias <= 0.5/65535, never consensus).
