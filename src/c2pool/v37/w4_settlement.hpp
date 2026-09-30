@@ -939,6 +939,15 @@ struct OwedLedgerRules {
     u64       decay_horizon = 0;     // 0 = off
     u64       decay_half_life = 0;
     bool      anchor_cut = false;
+    // MERKLE ROWS (XMR, paper §13): owed_digest commits the balances as the
+    // ROOT of a Merkle tree over the rows, so a light client proves one
+    // balance with a path of log2(rows) hashes instead of every row:
+    //   leaf  = sha256d("V37L" || key || i64 finalW || u64 first_eligible)
+    //   node  = sha256d("V37M" || left || right); an odd last node is carried up
+    //   rest  = sha256d("V37X" || the V37K / V37A sections, as before)
+    //   owed_digest = sha256d("V37Y" || u64 rows || root || rest)
+    // Off: owed_digest is the flat "V37Q" hash, byte-identical.
+    bool      merkle_rows = false;
 };
 
 // ANCHOR (OwedLedgerRules::anchor_cut): a lane block's on-chain credit cut, raw
@@ -1239,11 +1248,128 @@ public:
     // sorted by key: "V37Q" || key || i64 finalW || u64 first_eligible.
     // (R-A: tag bumped V37O->V37Q when fe became finalized-only; the "over the
     //  FINALIZED partition only" contract below is now literally enforced.)
+    // ---- MERKLE ROWS (paper §13) --------------------------------------------
+    static bytes32 owed_leaf(const bytes32& k, long long w, u64 fe) {
+        std::uint8_t b[4 + 32 + 8 + 8] = {'V', '3', '7', 'L'};
+        std::memcpy(b + 4, k.data(), 32);
+        const std::uint64_t uw = static_cast<std::uint64_t>(w);
+        for (int i = 0; i < 8; ++i) b[36 + i] = static_cast<std::uint8_t>(uw >> (8 * i));
+        for (int i = 0; i < 8; ++i) b[44 + i] = static_cast<std::uint8_t>(fe >> (8 * i));
+        return ::v37::sha256d(b, sizeof(b));
+    }
+    static bytes32 owed_node(const bytes32& l, const bytes32& r) {
+        std::uint8_t b[4 + 64] = {'V', '3', '7', 'M'};
+        std::memcpy(b + 4, l.data(), 32);
+        std::memcpy(b + 36, r.data(), 32);
+        return ::v37::sha256d(b, sizeof(b));
+    }
+    // Root of the leaves (bytes32{} for none). An odd last node is carried up
+    // unchanged, never paired with itself, so no two leaf lists share a root
+    // for the same count (the count is committed beside it).
+    static bytes32 owed_merkle_root(std::vector<bytes32> level) {
+        if (level.empty()) return bytes32{};
+        while (level.size() > 1) {
+            std::vector<bytes32> up;
+            up.reserve((level.size() + 1) / 2);
+            for (std::size_t i = 0; i + 1 < level.size(); i += 2) up.push_back(owed_node(level[i], level[i + 1]));
+            if (level.size() % 2) up.push_back(level.back());
+            level.swap(up);
+        }
+        return level[0];
+    }
+    static bytes32 owed_digest_of(u64 rows, const bytes32& root, const bytes32& rest) {
+        std::uint8_t b[4 + 8 + 64] = {'V', '3', '7', 'Y'};
+        for (int i = 0; i < 8; ++i) b[4 + i] = static_cast<std::uint8_t>(rows >> (8 * i));
+        std::memcpy(b + 12, root.data(), 32);
+        std::memcpy(b + 44, rest.data(), 32);
+        return ::v37::sha256d(b, sizeof(b));
+    }
+    // A balance and its path to owed_digest: the row, its index among the
+    // non-zero rows (key order), the row count, the sibling hashes root-ward
+    // (a level where the node is carried up has none), and the digest of the
+    // rest of the state.
+    struct OwedProof {
+        bytes32              key{};
+        long long            finalW = 0;
+        u64                  first_eligible = 0;
+        u64                  index = 0;
+        u64                  rows = 0;
+        std::vector<bytes32> path;
+        bytes32              rest{};
+    };
+    // The owed_digest this proof reproduces (nullopt: malformed). A verifier
+    // compares it with the digest a block commits.
+    static std::optional<bytes32> owed_digest_from_proof(const OwedProof& p) {
+        if (p.rows == 0 || p.index >= p.rows || p.finalW == 0) return std::nullopt;
+        bytes32 h = owed_leaf(p.key, p.finalW, p.first_eligible);
+        u64 i = p.index, m = p.rows;
+        std::size_t used = 0;
+        while (m > 1) {
+            if (i % 2 == 1) {                       // right child: sibling on the left
+                if (used >= p.path.size()) return std::nullopt;
+                h = owed_node(p.path[used++], h);
+            } else if (i + 1 < m) {                 // left child with a right sibling
+                if (used >= p.path.size()) return std::nullopt;
+                h = owed_node(h, p.path[used++]);
+            }                                       // else: odd last, carried up
+            i /= 2;
+            m = (m + 1) / 2;
+        }
+        if (used != p.path.size()) return std::nullopt;
+        return owed_digest_of(p.rows, h, p.rest);
+    }
+    // The proof for a key's finalized balance under merkle_rows (nullopt: the
+    // rule is off, or the key has no non-zero row).
+    std::optional<OwedProof> prove_owed(const bytes32& k) const {
+        if (!m_rules.merkle_rows) return std::nullopt;
+        std::vector<bytes32> level;
+        OwedProof p;
+        bool found = false;
+        for (const auto& [kk, w] : m_finalW) {
+            if (w == 0) continue;
+            if (kk == k) {
+                found = true; p.key = kk; p.finalW = w; p.index = level.size();
+                auto it = m_first_eligible.find(kk);
+                p.first_eligible = it == m_first_eligible.end() ? 0 : it->second;
+            }
+            u64 fe = 0;
+            if (auto it = m_first_eligible.find(kk); it != m_first_eligible.end()) fe = it->second;
+            level.push_back(owed_leaf(kk, w, fe));
+        }
+        if (!found) return std::nullopt;
+        p.rows = level.size();
+        u64 i = p.index;
+        while (level.size() > 1) {
+            if (i % 2 == 1) p.path.push_back(level[i - 1]);
+            else if (i + 1 < level.size()) p.path.push_back(level[i + 1]);
+            std::vector<bytes32> up;
+            for (std::size_t j = 0; j + 1 < level.size(); j += 2) up.push_back(owed_node(level[j], level[j + 1]));
+            if (level.size() % 2) up.push_back(level.back());
+            level.swap(up);
+            i /= 2;
+        }
+        p.rest = rest_digest();
+        return p;
+    }
+
     bytes32 owed_digest() const {
         // R3: memoized on m_seq. owed_digest is a pure function of ledger state
         // and m_seq bumps on every mutation, so a hit at an equal seq is the
         // byte-identical digest (read_cut hashes twice per attempt at one seq).
         if (const bytes32* c = m_digest_memo.get(m_seq)) return *c;
+        if (m_rules.merkle_rows) {   // MERKLE ROWS: root over the rows + the rest
+            std::vector<bytes32> leaves;
+            for (const auto& [k, w] : m_finalW) {
+                if (w == 0) continue;
+                u64 fe = 0;
+                if (auto it = m_first_eligible.find(k); it != m_first_eligible.end()) fe = it->second;
+                leaves.push_back(owed_leaf(k, w, fe));
+            }
+            const u64 rows = leaves.size();
+            const bytes32 d = owed_digest_of(rows, owed_merkle_root(std::move(leaves)), rest_digest());
+            m_digest_memo.put(m_seq, d);
+            return d;
+        }
         // R3: m_finalW is std::map<bytes32,long long>, already iterated in
         // ascending bytes32 order under std::less — the SAME comparator the old
         // std::sort used — so the removed sort reordered nothing; `pre` is
@@ -1261,6 +1387,14 @@ public:
             if (it != m_first_eligible.end()) fe = it->second;
             for (int i = 0; i < 8; ++i) pre.push_back((fe >> (8 * i)) & 0xff);
         }
+        append_rest(pre);
+        bytes32 d = ::v37::sha256d(pre);
+        m_digest_memo.put(m_seq, d);
+        return d;
+    }
+
+    // The V37K / V37A sections, byte for byte as the flat digest carries them.
+    void append_rest(std::vector<std::uint8_t>& pre) const {
         if (decay_on()) {   // DUST DECAY state: it decides future balances, so it is committed
             const char kt[4] = {'V', '3', '7', 'K'};
             pre.insert(pre.end(), kt, kt + 4);
@@ -1281,9 +1415,11 @@ public:
                 pre.insert(pre.end(), m_anchor->spine.begin(), m_anchor->spine.end());
             }
         }
-        bytes32 d = ::v37::sha256d(pre);
-        m_digest_memo.put(m_seq, d);
-        return d;
+    }
+    bytes32 rest_digest() const {
+        std::vector<std::uint8_t> pre = {'V', '3', '7', 'X'};
+        append_rest(pre);
+        return ::v37::sha256d(pre);
     }
 
     // ANCHOR: the credit cut of the most recent lane block finalized into this

@@ -334,9 +334,10 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
         rules.arm_floor = static_cast<long long>(x6::spend_floor(x6::kTailSubsidy));
         rules.rotate_on_payment = true;
         const ::v37::LaneParams lp{};
-        rules.decay_horizon = g_decay_h ? g_decay_h : lp.window;          // as the daemon sets them
-        rules.decay_half_life = g_decay_hl ? g_decay_hl : lp.half_life;
+        rules.decay_horizon = g_decay_h ? g_decay_h : ::c2pool::v37n::xmr::kXmrDustDecayHorizonHeights;     // as the daemon sets them
+        rules.decay_half_life = g_decay_hl ? g_decay_hl : ::c2pool::v37n::xmr::kXmrDustDecayHalfLifeHeights;
         rules.anchor_cut = g_anchor;
+        rules.merkle_rows = g_anchor;   // the daemon turns both on together (§13 light-client proofs)
         for (auto& n : run.nodes) n.L = st::OwedLedger(kChain, rules);
     }
     for (auto& n : run.nodes) {

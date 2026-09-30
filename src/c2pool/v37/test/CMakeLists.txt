@@ -866,6 +866,24 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_share_verdict_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_share_verdict_kat COMMAND v37_xmr_share_verdict_kat)
 
+    # PURPLE PAPER §13 on the XMR lane: owed_digest as a Merkle root over the
+    # balances (OwedLedgerRules::merkle_rows) and a light-client proof from a
+    # Monero header to one balance (xmr_light_proof.hpp).
+    add_executable(v37_xmr_light_proof_kat
+        v37_xmr_light_proof_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_light_proof_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_light_proof_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_light_proof_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_light_proof_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_light_proof_kat COMMAND v37_xmr_light_proof_kat)
+
     # ------------------------------------------------------------------
     # MAINNET REHEARSAL (isolated): the mainnet settlement configuration
     # (fee model v1, the mainnet donation identity, the R6 booking pipeline)
