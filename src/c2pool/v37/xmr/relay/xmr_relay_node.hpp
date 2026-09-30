@@ -3038,11 +3038,20 @@ private:
     }
     // NODE-NONCE: a HELLO carrying OUR node nonce = this node talking to
     // itself. The link is closed by the caller; the dial target behind it is
-    // retired for good (every mode, discovery ON or OFF).
+    // retired for good (every mode, discovery ON or OFF). The target is found
+    // by its pid OR by the dialed address: the self HELLO can be refused
+    // before the dial loop has stored t.pid, and a pid-only match then missed
+    // the target, which was dialed again after its backoff.
     void on_self_hello(PeerId p, const Hello&) {
         m_st.self_conn++;
+        std::string oh; u16 op = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it != m_peers.end()) { oh = it->second.out_host; op = it->second.out_port; }
+        }
         std::lock_guard<std::mutex> lk(m_tmtx);
-        for (auto& t : m_targets) if (t.pid == p && !t.self) {
+        for (auto& t : m_targets) if (!t.self && (t.pid == p || (!oh.empty() && t.host == oh && t.port == op))) {
             t.self = true;
             if (t.learned) t.used = true;
             log("relay: dial target " + peer_key(t.host, t.port) + " is THIS node (HELLO node nonce equal) -> never dialed again");
