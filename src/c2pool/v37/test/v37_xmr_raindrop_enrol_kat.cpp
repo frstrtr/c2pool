@@ -30,6 +30,8 @@
 //   RE4  the enrol mode applies: List without the payee / None enrol nobody.
 //   RE5  HELLO flag day: a different DROPS rule tag is refused BY NAME
 //        (DROPS_RULE_MISMATCH); rule 0 (gate OFF) is byte-identical.
+//   RE6  a raindrop whose ref payload is over 255 bytes (the V37G length
+//        byte) is refused and never enrolled.
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -414,6 +416,30 @@ static void re5_hello(Checker& C) {
 #endif
 }
 
+// RE6: the V37G record carries a ref's length in one byte; a longer ref is refused at the raindrop.
+static void re6_ref_bound(Checker& C, const World& W) {
+    std::printf("== RE6. a raindrop ref over 255 bytes is refused (the V37G length byte stays unambiguous) ==\n");
+#if RE_FIX
+    HNode n; auto w = make_w(n, true);
+    feed(*w, W.drops);
+    ::v37::ScriptRef big = W.rX;
+    big.payload.assign(300, 0x5a);
+    const bytes32 Z = ::v37::xmr::xmr_identity_key(big);
+    std::size_t taken = 0;
+    for (const auto& d : W.drops) if (d.ref == W.rX) taken += w->on_raindrop(big, d.bin, d.pow) ? 1 : 0;
+    const Out o = compose(*w, W, 130, {});
+    bool short_refs = true;
+    for (const auto& [k, r] : o.add) { (void)k; short_refs = short_refs && r.ref.payload.size() <= 255; }
+    std::printf("    long-ref raindrops taken=%zu enrol_add=%zu\n", taken, o.add.size());
+    C(taken == 0, "RE6 on_raindrop refuses every raindrop whose ref payload exceeds 255 bytes");
+    C(o.add.count(Z) == 0 && short_refs, "RE6 the long-ref payee is never in enrol_add; every enrolled ref fits the length byte");
+    C(o.effX == 113, "RE6 the short-ref payee X is enrolled as before");
+#else
+    (void)W;
+    C(false, "RE6 ref bound (absent on the base)");
+#endif
+}
+
 int main() {
     Checker C;
     const World W(kParams.subthreshold.K);
@@ -422,5 +448,6 @@ int main() {
     re3_gate(C, W);
     re4_modes(C, W);
     re5_hello(C);
+    re6_ref_bound(C, W);
     return C.done("v37_xmr_raindrop_enrol_kat");
 }

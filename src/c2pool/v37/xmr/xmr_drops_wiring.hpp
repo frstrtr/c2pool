@@ -1272,6 +1272,8 @@ public:
     // A raindrop by its payee REF: the identity is xmr_identity_key(ref) and the
     // ref is kept with the drop (one call, so a retained raindrop always has it).
     bool on_raindrop(const ::v37::ScriptRef& payee, std::uint64_t bin, const bytes32& pow_le) {
+        // RAINDROP ENROL: a ref the V37G length byte cannot hold is never harvested.
+        if (payee.payload.size() > ::c2pool::v37n::settle::kEnrolRefMaxPayload) return false;
         const bytes32 id = ::v37::xmr::xmr_identity_key(payee);
         note_drop_ref(id, payee);
         return on_raindrop(id, bin, pow_le);

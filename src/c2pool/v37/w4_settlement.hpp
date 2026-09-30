@@ -1044,6 +1044,10 @@ struct DropsFound {
 
 // The canonical bytes of registry records (the V37G section and the FOUND
 // leaf): u64 n, then per record key(32) || u64 eff || u8 kind || u8 len || payload.
+// The V37G record writes a ref's payload length in ONE byte. A longer ref
+// would make the section ambiguous, so the wiring refuses such a raindrop
+// before it is harvested (XmrDropsWiring::on_raindrop); XMR refs are <= 132.
+inline constexpr std::size_t kEnrolRefMaxPayload = 255;
 inline void put_enrol_records(std::vector<std::uint8_t>& b, const DropsEnrolRegistry& m) {
     const std::uint64_t n = m.size();
     for (int i = 0; i < 8; ++i) b.push_back((n >> (8 * i)) & 0xff);
