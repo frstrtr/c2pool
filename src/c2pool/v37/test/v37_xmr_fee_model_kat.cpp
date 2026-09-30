@@ -159,6 +159,26 @@ void suite_give_author() {
     CHECK(fee::give_author_u16(0.5) == 328, "0.5%% -> u16 328 (327.675 rounded half-up)");
     CHECK(fee::give_author_u16(100.0) == 65535 && fee::give_author_u16(250.0) == 65535, "100%% (and above) -> 65535");
     CHECK(fee::give_author_u16(-3.0) == 0, "negative -> 0");
+    // The node commits the EXACT integer form (no floating point on the path to
+    // the receipt): the decimal text parsed as num / 10^k, round-half-up in u128.
+    {
+        auto u = [](const char* t) { return fee::give_author_u16(fee::parse_pct_exact(t)); };
+        CHECK(u("0") == 0 && u("0.1") == 66 && u("0.5") == 328 && u("1") == 655 && u("100") == 65535 && u("250") == 65535,
+              "exact: 0 / 0.1 / 0.5 / 1 / 100 / 250 -> 0 / 66 / 328 / 655 / 65535 / 65535");
+        const char* bad[] = {"-1", "1e2", "1.", ".5", "abc", "", "0.1234567891", "nan"};
+        bool refused = true;
+        for (const char* b : bad) refused = refused && !fee::parse_pct_exact(b).ok;
+        CHECK(refused, "exact: a sign, an exponent, a bare dot, text, > 9 decimals are refused");
+        // The exact form agrees with the double form on every percentage in
+        // hundredths 0.00 .. 100.00, so no existing configuration changes value.
+        long diff = 0;
+        for (int h = 0; h <= 10000; ++h) {
+            char t[32]; std::snprintf(t, sizeof t, "%d.%02d", h / 100, h % 100);
+            if (fee::give_author_u16(fee::parse_pct_exact(t)) != fee::give_author_u16(h / 100.0)) ++diff;
+            if (fee::pct_to_bp(fee::parse_pct_exact(t)) != fee::pct_to_bp(h / 100.0)) ++diff;
+        }
+        CHECK(diff == 0, "exact == double on all 10001 hundredths (u16 and basis points), %ld differ", diff);
+    }
 
     const auto s0 = fee::split_receipt_weight(2000, 0);
     CHECK(s0.miner == 2000 && s0.donation == 0, "d=0: miner keeps the whole weight");

@@ -603,6 +603,17 @@ std::string PayoutManager::address_to_script_hex(const std::string& address) con
     return script.str();
 }
 
+// reward * pct / 100 in integers: the percent is clamped to [0, 100] and taken
+// in millionths of a percent, the product in 128 bits, floored. Never wraps and
+// never exceeds the reward (external review audit N2: a 150% RPC value made the
+// miner amount wrap through zero).
+static uint64_t amount_of_pct(uint64_t reward, double pct) {
+    if (!(pct > 0.0)) return 0;
+    if (pct >= 100.0) return reward;
+    const uint64_t micro = static_cast<uint64_t>(pct * 1000000.0 + 0.5);   // pct in 1e-6 %
+    return static_cast<uint64_t>((static_cast<unsigned __int128>(reward) * micro) / 100000000u);
+}
+
 // Enhanced coinbase construction methods
 nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_satoshis, const std::string& miner_address, 
                                                       double dev_fee_percent, double node_fee_percent) {
@@ -617,16 +628,19 @@ nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_sato
         if (dev_fee_percent > 0.0) {
             allocation.developer_percent = dev_fee_percent;
             allocation.developer_amount = std::max<uint64_t>(
-                static_cast<uint64_t>(block_reward_satoshis * dev_fee_percent / 100.0),
+                amount_of_pct(block_reward_satoshis, dev_fee_percent),
                 DeveloperPayoutConfig::MINIMAL_ATTRIBUTION_SATOSHIS);
         }
         
         if (node_fee_percent > 0.0) {
             allocation.node_owner_percent = node_fee_percent;
-            allocation.node_owner_amount = static_cast<uint64_t>(block_reward_satoshis * node_fee_percent / 100.0);
+            allocation.node_owner_amount = amount_of_pct(block_reward_satoshis, node_fee_percent);
         }
         
-        // Recalculate miner amount
+        // Recalculate miner amount; the fees never exceed the reward (no wrap)
+        if (allocation.developer_amount > block_reward_satoshis) allocation.developer_amount = block_reward_satoshis;
+        if (allocation.node_owner_amount > block_reward_satoshis - allocation.developer_amount)
+            allocation.node_owner_amount = block_reward_satoshis - allocation.developer_amount;
         allocation.miner_amount = block_reward_satoshis - allocation.developer_amount - allocation.node_owner_amount;
         
         // Build outputs array
@@ -710,10 +724,11 @@ std::string PayoutManager::build_complete_coinbase_transaction(uint64_t block_re
     std::vector<std::pair<std::string, uint64_t>> outputs;
     
     // Calculate amounts (the donation keeps the V36 1-satoshi marker)
-    uint64_t dev_amount = std::max<uint64_t>(static_cast<uint64_t>(block_reward_satoshis * dev_fee_percent / 100.0),
+    uint64_t dev_amount = std::max<uint64_t>(amount_of_pct(block_reward_satoshis, dev_fee_percent),
                                              block_reward_satoshis > 0 ? DeveloperPayoutConfig::MINIMAL_ATTRIBUTION_SATOSHIS : 0);
-    uint64_t node_amount = static_cast<uint64_t>(block_reward_satoshis * node_fee_percent / 100.0);
-    if (dev_amount + node_amount > block_reward_satoshis) node_amount = block_reward_satoshis - dev_amount;
+    if (dev_amount > block_reward_satoshis) dev_amount = block_reward_satoshis;
+    uint64_t node_amount = amount_of_pct(block_reward_satoshis, node_fee_percent);
+    if (node_amount > block_reward_satoshis - dev_amount) node_amount = block_reward_satoshis - dev_amount;
     uint64_t miner_amount = block_reward_satoshis - dev_amount - node_amount;
     
     // Add outputs: miner, node owner, then the donation LAST (V36)

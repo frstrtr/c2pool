@@ -212,6 +212,11 @@ static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-ter
 // how any receipt is folded. The donation output itself has NO knob.
 static double        g_give_author_pct = 0.1;            // --give-author-pct P: the u16 this node's receipts carry (default 0.1 with --fee-model v1; 0 opts out)
 static bool          g_give_author_set = false;          // --give-author-pct given explicitly (the fee-model-OFF refusal reads only an explicit value)
+// The same two settings as EXACT decimals: the only values that decide what a
+// receipt commits to (the give-author u16) and how often a job goes to the
+// owner (basis points). The doubles above are for display only.
+static c2pool::v37n::xmr::fee::ExactPct g_give_author_exact{1, 10, true};   // 0.1
+static c2pool::v37n::xmr::fee::ExactPct g_owner_fee_exact{0, 1, true};
 static double        g_owner_fee_pct = 0.0;              // --node-owner-fee-pct P: probability (%) a job commits to the owner
 static std::string   g_owner_address;                    // --node-owner-address ADDR: the owner's standard address
 // R-C rework-3 ruled defaults (docs/xmr-lane/r-c-rework-3.md).
@@ -1517,6 +1522,19 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::printf("REFUSED: the receipt relay needs a fixed --share-diff (the R-1 target every node must share)\n");
             return 2;
         }
+        if (cfg.lane_params.subthreshold.enabled
+            && cfg.lane_params.subthreshold.mode == c2pool::v37n::xmr::kXmrCreditModeCount) {
+            // DROPS Count credits every hash below the drops floor the floor's work.
+            // The floor it counts against is the exact one of the 288-bit normalised
+            // geometry (N < 2^(256-lz+shift), i.e. H * share_diff < 2^262), so any
+            // share_diff is exact; the floor itself must be the one the relay serves.
+            if (cfg.lane_params.subthreshold.count_floor_shift != c2pool::v37n::xmr::kXmrDropsFloorShift) {
+                std::printf("REFUSED: DROPS Count needs the XMR drops floor (count_floor_shift %u, not %u)\n",
+                            (unsigned)c2pool::v37n::xmr::kXmrDropsFloorShift,
+                            (unsigned)cfg.lane_params.subthreshold.count_floor_shift);
+                return 2;
+            }
+        }
         if (g_relay_order != "canonical" && g_relay_order != "arrival") {
             std::printf("REFUSED: --relay-order takes canonical|arrival\n");
             return 2;
@@ -1548,7 +1566,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     "(the fee model is OFF: this node is master-identical)\n");
         return 2;
     }
-    if (!cfg.lane_params.fee.enabled) g_give_author_pct = 0.0;   // the 0.1 default is a fee-model-v1 default only
+    if (!cfg.lane_params.fee.enabled) { g_give_author_pct = 0.0; g_give_author_exact = {0, 1, true}; }   // the 0.1 default is a fee-model-v1 default only
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -3352,8 +3370,8 @@ static int run_live(const XmrNodeConfig& cfg) {
 
         // fee model: node-local JOB policy (the payee + give-author a job's rbind commits to).
         std::optional<::v37::ScriptRef> owner_ref;
-        const std::uint32_t owner_bp = fee_on ? fee::pct_to_bp(g_owner_fee_pct) : 0;
-        const std::uint16_t my_give_author = fee_on ? fee::give_author_u16(g_give_author_pct) : 0;
+        const std::uint32_t owner_bp = fee_on ? fee::pct_to_bp(g_owner_fee_exact) : 0;          // integer, exact
+        const std::uint16_t my_give_author = fee_on ? fee::give_author_u16(g_give_author_exact) : 0;   // integer, exact
         if (fee_on && !g_owner_address.empty()) {
             const fee::DecodedAddress da = fee::decode_xmr_address(g_owner_address);
             if (!da.ok || da.subaddress || !::v37::xmr::xmr_ref_valid(da.ref())) {
@@ -5195,8 +5213,13 @@ int main(int argc, char** argv) {
             else throw cs::UsageError("--fee-model takes off|v1, got '" + m + "'");
         }
         // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
-        else if (a == "--give-author-pct")    { g_give_author_pct = cs::to_double(a, value()); g_give_author_set = true; }
-        else if (a == "--node-owner-fee-pct") g_owner_fee_pct = cs::to_double(a, value());
+        else if (a == "--give-author-pct" || a == "--node-owner-fee-pct") {
+            const std::string v = value();
+            const auto ex = c2pool::v37n::xmr::fee::parse_pct_exact(v);
+            if (!ex.ok) throw cs::UsageError(a + " wants a decimal percentage (digits, up to 9 decimals), got '" + v + "'");
+            if (a == "--give-author-pct") { g_give_author_pct = cs::to_double(a, v); g_give_author_exact = ex; g_give_author_set = true; }
+            else                           { g_owner_fee_pct = cs::to_double(a, v); g_owner_fee_exact = ex; }
+        }
         else if (a == "--node-owner-address") g_owner_address = value();
         else if (a == "--settle-h-min") cfg.settle_h_min = u64();
         else if (a == "--settle-output-cap") cfg.settle_output_cap = u32();
