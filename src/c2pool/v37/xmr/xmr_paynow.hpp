@@ -85,12 +85,44 @@ inline std::vector<std::uint8_t> encode_tail(std::uint64_t base) {
 // check fails closed (the lineage gate has already made such a block ordinary).
 // The payload offset right after the V37N field (== where V37D / V37P / V37C
 // begin), after stripping those three from the end exactly like the readers do.
-inline std::size_t end_before_donation_tail(const std::vector<std::uint8_t>& p) {
+// CANON: the declared TOTAL reward of the block, "V37R" || u64le (12 B), present
+// only under LaneParams::canon. It sits right after V37N and before V37D:
+//     [ nonce | rbind? | pad | "V37F" finder? | "V37N" B? | "V37R" total? | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine ]
+// A peer that recomputes the canonical coinbase needs the total the builder
+// split; every reader below strips it, so a block without it is byte-identical.
+inline constexpr unsigned char kRewardMagic[4] = {'V', '3', '7', 'R'};
+inline constexpr std::size_t   kRewardTailBytes = 4 + 8;   // 12
+
+inline std::vector<std::uint8_t> encode_reward_tail(std::uint64_t total) {
+    std::vector<std::uint8_t> t(kRewardMagic, kRewardMagic + 4);
+    for (int i = 0; i < 8; ++i) t.push_back(static_cast<std::uint8_t>(total >> (8 * i)));
+    return t;
+}
+
+// The payload offset right after the V37R field, i.e. after stripping V37C, V37P
+// and V37D from the end (each only if present).
+inline std::size_t end_before_reward_tail(const std::vector<std::uint8_t>& p) {
     std::size_t end = credit::end_before_credit_tail(p);
     if (credit::parse_pool_tag_payload(p) == credit::PoolTagParse::Present) end -= credit::kPoolTagFieldBytes;
     if (end >= fee::kDonationOwedTailBytes &&
         std::memcmp(p.data() + end - fee::kDonationOwedTailBytes, fee::kDonationOwedMagic, 4) == 0)
         end -= fee::kDonationOwedTailBytes;
+    return end;
+}
+// The declared total, nullopt when the payload carries no V37R field.
+inline std::optional<std::uint64_t> parse_reward_payload(const std::vector<std::uint8_t>& p) {
+    const std::size_t end = end_before_reward_tail(p);
+    if (end < kRewardTailBytes) return std::nullopt;
+    const std::uint8_t* t = p.data() + end - kRewardTailBytes;
+    if (std::memcmp(t, kRewardMagic, 4) != 0) return std::nullopt;
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(t[4 + i]) << (8 * i);
+    return v;
+}
+inline std::size_t end_before_donation_tail(const std::vector<std::uint8_t>& p) {
+    std::size_t end = end_before_reward_tail(p);
+    if (end >= kRewardTailBytes && std::memcmp(p.data() + end - kRewardTailBytes, kRewardMagic, 4) == 0)
+        end -= kRewardTailBytes;
     return end;
 }
 inline std::optional<std::uint64_t> parse_payload(const std::vector<std::uint8_t>& p) {

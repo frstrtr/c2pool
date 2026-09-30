@@ -89,6 +89,7 @@
 #include "impl/xmr/coin/xmr_crypto_types.hpp"        // Hash256, Bytes32
 #include "impl/xmr/settle/xmr_coinbase.hpp"          // x6::FixedOutput, CoinbaseInputs
 #include "impl/xmr/template/xmr_block_template.hpp"   // XmrMinerData (parent-context bridge)
+#include "xmr_canon_params.hpp"                  // CANON: kCanonOutputCap
 #include "xmr_o2_settlement_source.hpp"              // XmrOwedSettlementSource, XmrCoinbaseContext, KFairSource
 
 namespace c2pool::v37n::xmr::o2 {
@@ -175,6 +176,12 @@ struct XmrSettlementConfig {
     // node's own payee). Unset => an empty cut keeps master's residual shape.
     std::optional<::v37::ScriptRef> ecut_finder;
 
+    // CANON (LaneParams::canon): the coinbase is the deterministic function a peer
+    // recomputes (xmr_canonical_coinbase.hpp): the output cap is the lane constant
+    // kCanonOutputCap (the assembler does NOT shrink it by transaction weight) and
+    // the final reward is committed in the 0x02 tail as V37R.
+    bool canonical = false;
+
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
     std::optional<::v37::bytes32> pool_tag;
@@ -206,6 +213,7 @@ struct XmrSettlementConfig {
     // Concrete TOTAL-outputs cap to hand XmrOwedSettlementSource::build (which,
     // unlike XmrBlockAssembler, requires a concrete cap, not the 0 sentinel).
     std::uint32_t resolved_output_cap() const {
+        if (canonical) return ::c2pool::v37n::xmr::kCanonOutputCap;   // CANON: a lane constant
         return output_cap != 0 ? output_cap : output_cap_ceiling;
     }
 

@@ -123,6 +123,11 @@ inline constexpr std::size_t POOL_TAG_FIELD_BYTES = 37;      // 4 magic + 1 vers
 // consumer tree c2pool/v37/xmr/xmr_paynow.hpp paynow::kPayNowTailBytes == 12,
 // static_asserted in v37_xmr_paynow_kat). Present only when pay-now is armed.
 inline constexpr std::size_t PAYNOW_TAIL_BYTES = 12;  // 4 magic + 8 u64 base
+// CANON: the declared total reward rides right after V37N ("V37R" || u64le,
+// consumer tree xmr_paynow.hpp paynow::kRewardTailBytes == 12, static_asserted in
+// v37_xmr_canonical_coinbase_kat). Present only under LaneParams::canon.
+inline constexpr std::size_t REWARD_TAIL_BYTES = 12;  // 4 magic + 8 u64 total
+inline constexpr unsigned char REWARD_MAGIC[4] = {'V', '3', '7', 'R'};
 // EMPTY-CUT FINDER (operator ruling 09-26): in an empty-cut block the
 // committed finder payee rides right before V37N ("V37F" || u8 kind ||
 // payee[64], consumer tree xmr_paynow.hpp paynow::kFinderFieldBytes == 69,
@@ -327,7 +332,23 @@ public:
 
     // recon(A+B credit): the on-chain credit cut tail the template appends to the 0x02 payload.
     void set_extra_nonce_tail(std::vector<std::uint8_t> t) { m_tail = std::move(t); }
-    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override { return m_tail; }
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
+        if (!m_reward_commit) return m_tail;
+        // CANON: "V37R" || u64le(total) at the canonical position (after V37F/V37N,
+        // before V37D/V37P/V37C). budget() is the reward the template is building
+        // the FINAL pass at: create_miner_tx reads the tail after split_reward adopted it.
+        std::vector<std::uint8_t> t;
+        const std::size_t at = std::min(m_reward_at, m_tail.size());
+        t.insert(t.end(), m_tail.begin(), m_tail.begin() + static_cast<std::ptrdiff_t>(at));
+        t.insert(t.end(), REWARD_MAGIC, REWARD_MAGIC + 4);
+        const std::uint64_t total = m_in.budget();
+        for (int i = 0; i < 8; ++i) t.push_back(static_cast<std::uint8_t>(total >> (8 * i)));
+        t.insert(t.end(), m_tail.begin() + static_cast<std::ptrdiff_t>(at), m_tail.end());
+        return t;
+    }
+    // CANON (LaneParams::canon): commit the final reward as V37R at byte offset
+    // `at` of the tail. Default off => the tail is exactly what set_extra_nonce_tail gave.
+    void set_reward_commit(std::size_t at) { m_reward_commit = true; m_reward_at = at; }
 
     // SEAM-1 (GAP-2 rbind): the per-job binding the template writes after the
     // worker nonce. size 0 / no function => none (byte-identical template).
@@ -341,6 +362,8 @@ public:
 private:
     X6SettlementSource() = default;
     std::vector<std::uint8_t> m_tail;   // recon(A+B credit)
+    bool                      m_reward_commit = false;   // CANON
+    std::size_t                m_reward_at = 0;
     std::size_t      m_bind_size = 0;   // SEAM-1
     ExtraNonceBindFn m_bind;            // SEAM-1
 
@@ -661,6 +684,10 @@ struct AssemblyInputs {
     // recon(A+B credit): bytes appended to the 0x02 payload after the padded worker
     // nonce (the on-chain credit cut). Empty => byte-identical templates.
     std::vector<std::uint8_t>     extra_nonce_tail;
+    // CANON (LaneParams::canon): when set, the assembler inserts V37R || u64le(final
+    // reward) into the tail at byte offset reward_tail_at (right after V37F/V37N).
+    bool                          reward_commit = false;
+    std::size_t                   reward_tail_at = 0;
     // SEAM-1 (GAP-2 rbind): bytes written right after the 4-byte worker nonce,
     // per extra_nonce ([extra_nonce 4 | bind | padding | tail]). 0 / empty =>
     // byte-identical templates. Size <= EXTRA_NONCE_BIND_MAX.
@@ -750,6 +777,7 @@ public:
             std::unique_ptr<X6SettlementSource> seam = X6SettlementSource::build(in, subsidy, &sub);
             if (!seam) return fail("pass " + std::to_string(pass) + ": " + sub);
             seam->set_extra_nonce_tail(a.extra_nonce_tail);   // recon(A+B credit)
+            if (a.reward_commit) seam->set_reward_commit(a.reward_tail_at);   // CANON: V37R
             if (a.extra_nonce_bind_size > EXTRA_NONCE_BIND_MAX)
                 return fail("SEAM-1: extra_nonce_bind_size " + std::to_string(a.extra_nonce_bind_size) +
                             " > EXTRA_NONCE_BIND_MAX " + std::to_string(EXTRA_NONCE_BIND_MAX));
@@ -835,7 +863,7 @@ private:
             return false;
         }
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + FINDER_FIELD_BYTES + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; empty-cut finder: +69 V37F
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + FINDER_FIELD_BYTES + PAYNOW_TAIL_BYTES + REWARD_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; empty-cut finder: +69 V37F; canon: +12 V37R
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }

@@ -570,6 +570,15 @@ public:
         return t;
     }
 
+    // CANON: the byte offset inside extra_nonce_tail() where the V37R reward field
+    // belongs: right after V37F (finder) and V37N (pay-now base), before V37D.
+    [[nodiscard]] std::size_t reward_tail_offset() const {
+        std::size_t at = 0;
+        if (m_ecut_finder) at += paynow::kFinderFieldBytes;
+        if (m_paynow_on)   at += paynow::kPayNowTailBytes;
+        return at;
+    }
+
     // =====================================================================
     // Value accessors (provider ring / FOUND record / KATs / ACCEPT check)
     // =====================================================================

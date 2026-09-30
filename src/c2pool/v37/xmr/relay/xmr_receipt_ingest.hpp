@@ -89,6 +89,7 @@
 
 #include "xmr_relay_node.hpp"
 #include "../xmr_fee_model.hpp"     // receipt_lane_pushes (fee model S3)
+#include "../xmr_canon_verdict.hpp"  // CANON: the canonical-coinbase verdict a receipt is held to
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -124,7 +125,16 @@ public:
     struct Stats {
         u64 pushed = 0, push_failed = 0, late = 0, bins_closed = 0, reloaded = 0, reload_torn = 0, durable_writes = 0;
         u64 lane_pushes = 0;   // lane records written (== pushed with the fee model OFF)
+        // CANON (set_canon_check): verdicts on the receipt's coinbase. refused counts
+        // receipts dropped before the lane because enforcement is on and they mismatched.
+        u64 canon_match = 0, canon_mismatch = 0, canon_undecidable = 0, canon_refused = 0;
     };
+    // CANON: recompute the canonical coinbase a receipt commits and compare it with the
+    // receipt's own opening (xmr_canonical_coinbase.hpp). enforce == false is ALARM mode:
+    // the verdict is counted and handed to the callback's own log, the receipt still counts.
+    using CanonFn = std::function<canon::Result(const Admitted&)>;
+    void set_canon_check(CanonFn f, bool enforce) { m_canon = std::move(f); m_canon_enforce = enforce; }
+    bool canon_enforcing() const { return m_canon && m_canon_enforce; }
     // Engine push, done by the daemon (it owns the engine + the replay log).
     // Returns false if the record was not applied; fills the lane tip after it.
     using PushFn = std::function<bool(const ::v37::ScriptRef& payee, u64 w, u64& next_after, bytes32& digest_after)>;
@@ -201,6 +211,15 @@ public:
     }
 
     void on_admitted(Admitted a) {
+        if (m_canon && !a.drop) {
+            const canon::Result r = m_canon(a);
+            if (r.v == canon::Verdict::Match) ++m_st.canon_match;
+            else if (r.v == canon::Verdict::Undecidable) ++m_st.canon_undecidable;
+            else {
+                ++m_st.canon_mismatch;
+                if (m_canon_enforce) { ++m_st.canon_refused; return; }   // not credited: the work is on another block
+            }
+        }
         if (m_o.order == Order::Arrival) { push_one(a, true); return; }
         if (m_any_closed && a.bin <= m_closed_through) { ++m_st.late; push_one(a, true); return; }
         m_bins[a.bin].emplace(a.id, std::move(a));
@@ -298,6 +317,8 @@ private:
     }
 
     Options m_o;
+    CanonFn m_canon;
+    bool    m_canon_enforce = false;
     PushFn  m_push;
     AfterFn m_after;
     Stats   m_st;

@@ -40,6 +40,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <c2pool/v37/w4_settlement.hpp>          // OwedLedger, SettleHW (merged)
@@ -370,6 +371,21 @@ public:
         m_by_height.clear();
         m_seq = event_seq;
         m_last_since = digest_since;
+    }
+
+    // CANON: the lane blocks this driver has booked at heights >= `height` that are still
+    // PENDING in the ledger, with the payout each one booked. A verifier that re-derives
+    // a coinbase built at `height` removes exactly these from its ledger copy to get the
+    // builder's view (xmr_canonical_coinbase.hpp ledger_before).
+    std::vector<std::pair<std::string, Amounts>> pending_payouts_from(std::uint64_t height) const {
+        std::vector<std::pair<std::string, Amounts>> out;
+        for (auto it = m_by_height.lower_bound(height); it != m_by_height.end(); ++it)
+            for (const auto& bid : it->second) {
+                const auto f = m_found.find(bid);
+                if (f == m_found.end() || !f->second.canonical || !m_ledger.is_pending(bid)) continue;
+                out.emplace_back(bid, f->second.payout);
+            }
+        return out;
     }
 
 private:

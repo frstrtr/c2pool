@@ -399,6 +399,28 @@ struct FeeModelGate {
     }
 };
 
+// ── CANON: the canonical-coinbase gate (XMR lane) ──────────────────────────
+// A lane block's coinbase is a DETERMINISTIC function of replicated lane state:
+// owed ledger at the builder's cursor, the committed credit cut, the pending
+// payouts, the declared total reward ("V37R"), the parent header and a
+// lane-constant output cap. A peer recomputes that coinbase from the receipt it
+// is handed and compares the Keccak midstate + prefix tail the receipt already
+// carries (no extra traffic); a block whose payout differs from the canonical
+// one is not credited (stage 2). Two nodes whose gates differ disagree on which
+// receipts count, so the gate is folded into the relay HELLO lane_params_digest
+// ONLY when enabled (xmr_relay_wire.hpp "CAN1"): a mixed fleet refuses at HELLO.
+// Default OFF = master-identical bytes and digest.
+struct CanonGate {
+    bool enabled = false;          // DEFAULT OFF (flip = consensus change)
+    std::uint32_t version = 0;     // 0 = off; 1 = canonical coinbase v1
+
+    static CanonGate for_version(std::uint32_t v) {
+        CanonGate g{};             // unknown version => OFF (fail-safe)
+        if (v == 1) { g.enabled = true; g.version = 1; }
+        return g;
+    }
+};
+
 // ── K_FLOOR: the coinbase no-dust floor coefficient (STEP-0 hotfix) ────────
 // W5 (src/c2pool/v37/w5_coinbase.hpp) emits an owed balance as a coinbase
 // output only when it clears h_min(kind) = k_floor * output_size(kind); below
@@ -458,6 +480,9 @@ struct LaneParams {
     // ADD-ONLY, digest-neutral by construction (see FeeModelGate): the v36
     // fee model on the XMR lane, default OFF => master-identical.
     FeeModelGate fee{};
+    // ADD-ONLY, digest-neutral while OFF (see CanonGate): the canonical-coinbase
+    // rule on the XMR lane.
+    CanonGate canon{};
     // STEP-0 hotfix: the coinbase no-dust floor coefficient (see K_FLOOR_NONE
     // above). h_min(kind) = k_floor * output_size(kind). DIGEST-COMMITTED when
     // non-zero ("KFL1" in the V37H header leaf); 0 = no floor, digest-neutral.

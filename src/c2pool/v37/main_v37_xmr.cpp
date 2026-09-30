@@ -99,6 +99,7 @@
 #include "xmr/xmr_credit_cut.hpp"           // recon(A+B credit): the on-chain credit cut
 #include "xmr/xmr_paynow.hpp"               // SAME-BLOCK PAY-NOW: V37N base + net-at-FOUND booking
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
+#include "xmr/xmr_canonical_coinbase.hpp"    // CANON: recompute + compare the canonical lane coinbase (LaneParams::canon)
 #include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
 #include "xmr/xmr_web_dashboard.hpp"        // XMR-WEB: the c2pool web dashboard (--web-port; OFF by default)
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
@@ -1547,6 +1548,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         return 2;
     }
     if (!cfg.lane_params.fee.enabled) g_give_author_pct = 0.0;   // the 0.1 default is a fee-model-v1 default only
+    // CANON: the canonical-coinbase rule is a lane-level consensus choice (folded into the
+    // relay HELLO digest). It needs the mandatory donation output and a lane-constant cap.
+    if (const std::string refusal = c2pool::v37n::xmr::canon_refusal(
+            cfg.network == MoneroNetwork::Mainnet, cfg.coinbase == CoinbaseMode::V37Settlement,
+            c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params), cfg.lane_params.canon.enabled,
+            cfg.lane_params.canon.version, cfg.settle_output_cap); !refusal.empty()) {
+        std::printf("REFUSED: %s\n", refusal.c_str());
+        return 2;
+    }
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -1731,6 +1741,25 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::set<std::string> cba_lineage_seen;              // POOL-LINEAGE: bids logged once
     std::uint64_t cba_fetch_failed = 0;   // R-C rework-3 (D6): get_block transport/JSON failures -- transient, NOT refusals
     std::uint64_t cba_stale_root = 0;     // R-C rework-3 (D7): matched a historical root older than the age bound -> refused
+    // CANON (alarm mode): verdicts on the coinbase of a BOOKED lane block (the receipt side is counted in the ingest stats).
+    std::uint64_t canon_blk_match = 0, canon_blk_mismatch = 0, canon_blk_undec = 0;
+    std::uint64_t canon_rx_skipped = 0;                  // receipts not checked (rate bound)
+    std::set<std::string> canon_blk_seen;                // bids whose block verdict was final (Match / Mismatch)
+    std::map<std::string, bool> canon_blk_undec_seen;    // Undecidable logged once per bid
+    double canon_tokens = 8.0;                           // receipt checks cost a full coinbase rebuild: a small token bucket
+    std::chrono::steady_clock::time_point canon_refill = std::chrono::steady_clock::now();
+    std::string canon_last;                              // last mismatch reason (status line)
+    // CANON: recompute the canonical coinbase a block / receipt commits, over THIS node's ledger
+    // rolled back to the builder's pending set (lane blocks booked at >= the block's height removed).
+    // Needs the option-B settlement bound (cba_fx / cba_scfg); otherwise Undecidable.
+    auto canon_expected = [&](const c2pool::v37n::xmr::canon::BlockFacts& f) -> c2pool::v37n::xmr::canon::Expected {
+        namespace canon = c2pool::v37n::xmr::canon;
+        if (!cba_fx || !cba_scfg) {
+            canon::Expected e; e.pre = {canon::Verdict::Undecidable, "settlement ledger not bound yet"}; return e;
+        }
+        const auto led = canon::ledger_before(node.ledger(), node.finalize_driver().pending_payouts_from(f.height));
+        return canon::expected_coinbase(*cba_scfg, led, cba_fx->pay_of(), f);
+    };
 
     auto cba_ring_push = [&]() {
         const ::v37::bytes32 d = node.ledger().owed_digest();
@@ -2529,6 +2558,34 @@ static int run_live(const XmrNodeConfig& cfg) {
         // from here the payout side is fully decoded (proven coinbase authority, deterministic r)
         payout = bk.payout; out.payout_decoded = true;
         if (bk.height != h) { why = "coinbase txin_gen height " + std::to_string(bk.height) + " != chain height " + std::to_string(h); ++cba_refused; return false; }
+        // CANON stage 1 (ALARM mode): the on-chain miner_tx of a lane block vs the canonical coinbase this node
+        // recomputes. The chain stays the booking authority here (stage 2 books the payout but drops the credit
+        // of a mismatching block). Final verdicts (Match / Mismatch) are cached per bid; Undecidable retries.
+        if (cfg.lane_params.canon.enabled && !canon_blk_seen.count(bid)) {
+            namespace canon = c2pool::v37n::xmr::canon;
+            relay::BlockLayout L; std::string lw;
+            if (relay::parse_block_layout(chain_blob, L, &lw) && L.prefix_size >= L.extra_size && L.height == h) {
+                canon::BlockFacts f;
+                f.major = chain_blob.empty() ? 0 : chain_blob[0];
+                f.height = h;
+                std::memcpy(f.prev_id.data(), L.prev_id.data(), 32);
+                const auto pbeg = chain_blob.begin() + static_cast<std::ptrdiff_t>(L.miner_tx_offset);
+                const std::vector<std::uint8_t> prefix(pbeg, pbeg + static_cast<std::ptrdiff_t>(L.prefix_size));
+                f.tx_extra.assign(prefix.end() - static_cast<std::ptrdiff_t>(L.extra_size), prefix.end());
+                const canon::Expected e = canon_expected(f);
+                const canon::Result r = canon::verify_block_prefix(e, prefix);
+                if (r.v == canon::Verdict::Match) { ++canon_blk_match; canon_blk_seen.insert(bid); }
+                else if (r.v == canon::Verdict::Mismatch) {
+                    ++canon_blk_mismatch; canon_blk_seen.insert(bid);
+                    canon_last = "block " + bid.substr(0, 12) + " h=" + std::to_string(h) + ": " + r.why;
+                    std::printf("canon-ALARM block: %s -- booked as the chain paid it (alarm mode)\n", canon_last.c_str());
+                    std::fflush(stdout);
+                } else if (canon_blk_undec_seen.emplace(bid, true).second) {
+                    ++canon_blk_undec;
+                    std::printf("canon: block h=%llu bid=%s… undecidable here: %s\n", static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), r.why.c_str());
+                }
+            }
+        }
         // RECOMPUTE CROSS-CHECK (own win): our submitted bytes vs the chain's. Sanity only --
         // the chain decode above stays the authority whatever this says.
         if (auto rit = own_recompute.find(bid); rit != own_recompute.end()) {
@@ -3047,6 +3104,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         scfg.chain_id   = cfg.lane_chain;
         scfg.h_min      = cfg.settle_h_min;
         scfg.output_cap = cfg.settle_output_cap;
+        scfg.canonical  = cfg.lane_params.canon.enabled;   // CANON: lane-constant cap + V37R reward commit
         bool serving = false;
         if (fee_on) {
             if (!cfg.residual_sink_spend_hex.empty() || !cfg.residual_sink_view_hex.empty() || cfg.residual_sink_subaddress) {
@@ -3750,6 +3808,39 @@ static int run_live(const XmrNodeConfig& cfg) {
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
             // SMOKE-NOISE: a reloaded receipt's origin bin = its prev_id's height (lane-set digest only)
+            if (cfg.lane_params.canon.enabled) {
+                // CANON stage 1 (ALARM mode): a receipt's coinbase opening is compared with the canonical
+                // coinbase this node recomputes from replicated lane state. A mismatch is counted and
+                // alarmed, the receipt still counts (enforcement is stage 2). Each check is a full coinbase
+                // rebuild, so a small token bucket bounds the rate; unchecked receipts are counted.
+                relay_ingest->set_canon_check([&](const relay::Admitted& a) -> c2pool::v37n::xmr::canon::Result {
+                    namespace canon = c2pool::v37n::xmr::canon;
+                    const auto now = std::chrono::steady_clock::now();
+                    canon_tokens = std::min(8.0, canon_tokens + std::chrono::duration<double>(now - canon_refill).count() * 4.0);
+                    canon_refill = now;
+                    if (canon_tokens < 1.0) { ++canon_rx_skipped; return {canon::Verdict::Undecidable, "rate bound"}; }
+                    canon_tokens -= 1.0;
+                    ::v37::xmr::verify::ParsedBlob pb;
+                    if (!::v37::xmr::verify::parse_hashing_blob(a.r.receipt.hashing_blob, pb))
+                        return {canon::Verdict::Undecidable, "hashing blob does not parse"};
+                    canon::BlockFacts f;
+                    f.major = static_cast<std::uint8_t>(pb.major);
+                    f.height = a.bin + 1;
+                    std::memcpy(f.prev_id.data(), pb.prev_id.data(), 32);
+                    f.tx_extra = a.r.receipt.coinbase_opening.tx_extra;
+                    const canon::Expected e = canon_expected(f);
+                    const canon::Result r = canon::verify_opening(e, a.r.receipt.coinbase_opening);
+                    if (r.v == canon::Verdict::Mismatch) {
+                        canon_last = "receipt " + hex_of(a.id).substr(0, 12) + " h=" + std::to_string(f.height) + ": " + r.why;
+                        std::printf("canon-ALARM receipt: %s -- the coinbase this receipt's work is on does not pay what the lane "
+                                    "state dictates (alarm mode: still counted)\n", canon_last.c_str());
+                        std::fflush(stdout);
+                    }
+                    return r;
+                }, /*enforce=*/false);
+                std::printf("canon: canonical-coinbase v%u ON (ALARM mode: receipts whose coinbase differs from the canonical one are counted and alarmed, not yet refused) | output cap %u (lane constant) | total reward committed as V37R\n",
+                            cfg.lane_params.canon.version, (unsigned)c2pool::v37n::xmr::kCanonOutputCap);
+            }
             relay_ingest->set_bin_of([&](const relay::FbReceipt& r) -> std::optional<std::uint64_t> {
                 ::v37::xmr::verify::ParsedBlob pb;
                 if (!::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb)) return std::nullopt;
@@ -4280,6 +4371,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)relay_repair_suffix, (unsigned long long)relay_repair_shadow, (unsigned long long)relay_repair_deep_alarms,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
+                if (cfg.lane_params.canon.enabled) {
+                    std::printf("  canon: ALARM receipts match=%llu mismatch=%llu undecidable=%llu unchecked(rate)=%llu | blocks match=%llu mismatch=%llu undecidable=%llu%s%s\n",
+                                (unsigned long long)is.canon_match, (unsigned long long)is.canon_mismatch, (unsigned long long)is.canon_undecidable,
+                                (unsigned long long)canon_rx_skipped, (unsigned long long)canon_blk_match, (unsigned long long)canon_blk_mismatch,
+                                (unsigned long long)canon_blk_undec, canon_last.empty() ? "" : " | last: ", canon_last.c_str());
+                }
                 {   // REPAIR-CHAIN: the down-walk (requester) and the durable order (server)
                     const auto& rcs = relay_node->stats();
                     const auto ds = relay_node->durable_order_stats();
@@ -4867,6 +4964,13 @@ int main(int argc, char** argv) {
             if (m == "off" || m == "0") cfg.lane_params.fee = ::v37::FeeModelGate{};
             else if (m == "v1" || m == "1") cfg.lane_params.fee = ::v37::FeeModelGate::for_version(1);
             else throw cs::UsageError("--fee-model takes off|v1, got '" + m + "'");
+        }
+        // canonical coinbase (LaneParams::canon): off (default, master-identical) | v1
+        else if (a == "--canonical-coinbase") {
+            const std::string m = value();
+            if (m == "off" || m == "0") cfg.lane_params.canon = ::v37::CanonGate{};
+            else if (m == "v1" || m == "1") cfg.lane_params.canon = ::v37::CanonGate::for_version(1);
+            else throw cs::UsageError("--canonical-coinbase takes off|v1, got '" + m + "'");
         }
         // fee model: node-local JOB policy under the gate (see xmr/xmr_fee_model.hpp)
         else if (a == "--give-author-pct")    { g_give_author_pct = cs::to_double(a, value()); g_give_author_set = true; }

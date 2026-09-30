@@ -280,7 +280,7 @@ jobs:
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \
-                    v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
+                    v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat v37_xmr_canonical_coinbase_kat \
                     v37_xmr_web_dashboard_kat \
                     v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat v37_xmr_rejoin_payee_kat v37_xmr_empty_cut_finder_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
@@ -771,7 +771,7 @@ jobs:
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \
-                    v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
+                    v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat v37_xmr_canonical_coinbase_kat \
                     v37_xmr_web_dashboard_kat \
                     v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat v37_xmr_rejoin_payee_kat v37_xmr_empty_cut_finder_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \

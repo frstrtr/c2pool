@@ -1153,6 +1153,33 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_fee_rbind_kat COMMAND v37_xmr_fee_rbind_kat)
 
     # ------------------------------------------------------------------
+    # CANON: the canonical-coinbase rule (xmr_canonical_coinbase.hpp,
+    # LaneParams::canon). REAL assembled templates (fee model ON, rbind,
+    # pay-now, V37D/V37P/V37C and the new V37R total-reward tail) through the
+    # verifier: an honest build matches (receipt opening + block prefix); an
+    # omitted / underpaid / re-ordered payee, a stolen sink, a wrong declared
+    # total and an altered tail field mismatch; what a verifier cannot
+    # reproduce (another owed_digest / lineage, unreadable cut view, unlearned
+    # ref) is UNDECIDABLE, never a verdict; ledger_before rolls back the later
+    # pending blocks; the start-up rules and the HELLO digest fold. Same link
+    # shape as the rbind KAT (listed in BOTH build.yml --target lists).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_canonical_coinbase_kat
+        v37_xmr_canonical_coinbase_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_canonical_coinbase_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_canonical_coinbase_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_canonical_coinbase_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_canonical_coinbase_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_canonical_coinbase_kat COMMAND v37_xmr_canonical_coinbase_kat)
+
+    # ------------------------------------------------------------------
     # DON-NET: one fee-model donation identity per Monero network.
     #
     #   v37_xmr_fee_network_kat

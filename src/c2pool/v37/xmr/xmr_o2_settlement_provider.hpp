@@ -492,8 +492,9 @@ private:
             SettlementSnapshot::EcutVariants::V v;
             if (auto src = E.src->with_finder(*f)) {
                 asm_::AssemblyInputs a = E.recipe;
-                a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+                a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/!m_scfg.canonical);
                 a.extra_nonce_tail = src->extra_nonce_tail();
+                a.reward_commit = m_scfg.canonical; a.reward_tail_at = src->reward_tail_offset();   // CANON: V37R
                 std::string w;
                 auto t = asm_::XmrBlockAssembler::build(a, &w);
                 asm_::BlockBytes probe;
@@ -571,8 +572,9 @@ private:
         asm_::AssemblyInputs a;
         a.miner   = xmr_md;
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
-        a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+        a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/!scfg.canonical);   // CANON: the lane-constant cap stays explicit
         a.extra_nonce_tail = src->extra_nonce_tail();   // recon(A+B credit): the on-chain credit cut (0x02 tail)
+        a.reward_commit = scfg.canonical; a.reward_tail_at = src->reward_tail_offset();   // CANON: V37R after V37F/V37N
         a.extra_nonce_bind_size = m_bind_size;          // SEAM-1: [extra_nonce 4 | rbind 32] (0 = none)
         a.extra_nonce_bind = m_bind;
         // GOOD-CITIZEN: mine the (already good-citizen-selected) set VERBATIM,

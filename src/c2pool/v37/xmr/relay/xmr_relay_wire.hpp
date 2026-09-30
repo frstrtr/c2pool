@@ -92,6 +92,7 @@
 #include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"   // ::xmr::coin::keccak256
 #include "../xmr_fee_model.hpp"                    // S4: the fee-model gate folded into lane_params_digest
+#include "../xmr_canon_params.hpp"                 // CANON: the gate's lane constant folded into lane_params_digest
 #include <c2pool/v37/roundabout/rb_lane_tag.hpp>   // POOL-ID: LaneTagContext / lane_tag (S1, read-only use)
 #include <c2pool/v37/v37_node_lane_activation.hpp> // ENROL-REPL: kActivateConsensusV1 (the FB_BLOCK_WON v0x02 gate)
 
@@ -1002,6 +1003,15 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
         le::put64(b, ::c2pool::v37n::xmr::fee::kFeeReceiptWeight);
         le::putb(b, ::c2pool::v37n::xmr::fee::donation_identity(
                         static_cast<::c2pool::v37n::xmr::fee::DonationNet>(network)));
+    }
+    // CANON: folded ONLY when ON (same argument as FEE1): a gate-OFF node keeps
+    // master's digest; a gate-ON node differs from every gate-OFF node, so
+    // peers that disagree on which receipts count refuse each other at HELLO.
+    if (p.canon.enabled) {
+        static constexpr char kCanonTag[] = "CAN1";
+        b.insert(b.end(), kCanonTag, kCanonTag + 4);
+        le::put32(b, p.canon.version);
+        le::put32(b, ::c2pool::v37n::xmr::kCanonOutputCap);
     }
     return keccak_bytes(b);
 }
