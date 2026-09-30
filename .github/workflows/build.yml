@@ -696,7 +696,26 @@ jobs:
       # at job end -- i.e. AFTER Prune runner workspace has dropped the 44G tree,
       # which is exactly when the disk pressure clears (an earlier release would
       # free the slot while the tree is still on disk). Reap-guard identical to the
-      # RAM lock; honesty-gated at SLOTS=1 in heavy-leg-lock/test.sh.
+      # RAM lock; honesty-gated at SLOTS=1 in heavy-leg-lock/test.sh. A host with
+      # room for more trees raises it for itself only, via the runner-host file
+      # $HOME/.config/c2pool-ci/c2pool-heavy-disk.lock.slots (see the action).
+      #
+      # TMPDIR: keep this leg's scratch files on the build volume. Tests create
+      # per-case scratch dirs via std::filesystem::temp_directory_path()/$TMPDIR
+      # (thousands per run, several never removed) and the compiler writes its
+      # temps there; on a heavy host whose runner _work is a separate data disk,
+      # /tmp is the small root filesystem or a RAM-backed tmpfs, so two concurrent
+      # sanitizer legs would load it instead of the volume the disk guard gates.
+      # $RUNNER_TEMP is <_work>/_temp (the build volume) and Prune runner workspace
+      # empties it at job end, so the scratch never leaks either. Exported before
+      # the guard so the guard measures this path; github-hosted is unchanged.
+      - name: Keep temp files on the build volume (self-hosted)
+        if: runner.environment != 'github-hosted'
+        run: |
+          d="$RUNNER_TEMP/tmp"
+          mkdir -p "$d"
+          echo "TMPDIR=$d" >> "$GITHUB_ENV"
+          df -h "$d" /tmp || true
       - name: Acquire per-host heavy-disk semaphore
         if: runner.environment != 'github-hosted'
         uses: ./.github/actions/heavy-leg-lock
@@ -1113,7 +1132,26 @@ jobs:
       # at job end -- i.e. AFTER Prune runner workspace has dropped the 44G tree,
       # which is exactly when the disk pressure clears (an earlier release would
       # free the slot while the tree is still on disk). Reap-guard identical to the
-      # RAM lock; honesty-gated at SLOTS=1 in heavy-leg-lock/test.sh.
+      # RAM lock; honesty-gated at SLOTS=1 in heavy-leg-lock/test.sh. A host with
+      # room for more trees raises it for itself only, via the runner-host file
+      # $HOME/.config/c2pool-ci/c2pool-heavy-disk.lock.slots (see the action).
+      #
+      # TMPDIR: keep this leg's scratch files on the build volume. Tests create
+      # per-case scratch dirs via std::filesystem::temp_directory_path()/$TMPDIR
+      # (thousands per run, several never removed) and the compiler writes its
+      # temps there; on a heavy host whose runner _work is a separate data disk,
+      # /tmp is the small root filesystem or a RAM-backed tmpfs, so two concurrent
+      # sanitizer legs would load it instead of the volume the disk guard gates.
+      # $RUNNER_TEMP is <_work>/_temp (the build volume) and Prune runner workspace
+      # empties it at job end, so the scratch never leaks either. Exported before
+      # the guard so the guard measures this path; github-hosted is unchanged.
+      - name: Keep temp files on the build volume (self-hosted)
+        if: runner.environment != 'github-hosted'
+        run: |
+          d="$RUNNER_TEMP/tmp"
+          mkdir -p "$d"
+          echo "TMPDIR=$d" >> "$GITHUB_ENV"
+          df -h "$d" /tmp || true
       - name: Acquire per-host heavy-disk semaphore
         if: runner.environment != 'github-hosted'
         uses: ./.github/actions/heavy-leg-lock
