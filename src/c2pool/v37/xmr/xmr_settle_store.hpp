@@ -81,7 +81,7 @@ struct ISettleStore {
 // Records: u8 ver=1 ‖ payload. Ints little-endian. Fail-closed on a short read.
 // ---------------------------------------------------------------------------
 namespace store_codec {
-constexpr std::uint8_t SCHEMA_VER = 3;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields
+constexpr std::uint8_t SCHEMA_VER = 4;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments
 
 inline std::string chain_fmt(::v37::ChainId c) {
     char b[16];
@@ -173,10 +173,14 @@ struct SettleEvent {
     Amounts       drops_deposit;
     bool          drops_claim = false;
     Amounts       drops_claimed;
+    // FOUND, RAINDROP ENROL rule (schema 4): the payees the block enrolled by
+    // raindrop (eff + payout ref). Empty => byte-identical to schema 3.
+    ::c2pool::v37n::settle::DropsEnrolRegistry drops_enrol;
 
     std::string serialize() const {
         std::string s;
-        s.push_back(char(has_drops ? store_codec::SCHEMA_VER : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
+        const bool enrol = has_drops && !drops_enrol.empty();
+        s.push_back(char(enrol ? store_codec::SCHEMA_VER : has_drops ? std::uint8_t{3} : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
         s.push_back(char(static_cast<std::uint8_t>(kind)));
         store_codec::put_str(s, bid);
         store_codec::put_amounts(s, credit);
@@ -193,6 +197,15 @@ struct SettleEvent {
             store_codec::put_amounts(s, drops_deposit);
             s.push_back(char(drops_claim ? 1 : 0));
             store_codec::put_amounts(s, drops_claimed);
+        }
+        if (enrol) {   // schema 4
+            store_codec::put_u64(s, drops_enrol.size());
+            for (const auto& [k, r] : drops_enrol) {
+                s.append(reinterpret_cast<const char*>(k.data()), k.size());
+                store_codec::put_u64(s, r.eff);
+                s.push_back(char(static_cast<std::uint8_t>(r.ref.kind)));
+                store_codec::put_str(s, std::string(r.ref.payload.begin(), r.ref.payload.end()));
+            }
         }
         return s;
     }
@@ -219,6 +232,18 @@ struct SettleEvent {
             e.drops_claim = r.u8() == 1;
             e.drops_claimed = r.amounts();
         }
+        if (ver >= 4) {   // RAINDROP ENROL
+            const std::uint64_t n = r.u64();
+            for (std::uint64_t i = 0; i < n; ++i) {
+                const ::v37::bytes32 k = r.b32();
+                ::c2pool::v37n::settle::DropsEnrolRec rec;
+                rec.eff = r.u64();
+                rec.ref.kind = static_cast<::v37::ScriptKind>(r.u8());
+                const std::string pl = r.str();
+                rec.ref.payload.assign(pl.begin(), pl.end());
+                e.drops_enrol[k] = std::move(rec);
+            }
+        }
         r.expect_end();
         return e;
     }
@@ -238,12 +263,13 @@ inline std::optional<::c2pool::v37n::settle::DropsFound> drops_of(const SettleEv
     if (!e.has_drops) return std::nullopt;
     ::c2pool::v37n::settle::DropsFound d;
     d.deposit = e.drops_deposit; d.claim = e.drops_claim; d.claimed = e.drops_claimed;
+    d.enrol_add = e.drops_enrol;
     return d;
 }
 inline void set_drops(SettleEvent& e, const std::optional<::c2pool::v37n::settle::DropsFound>& d) {
     e.has_drops = d.has_value() && !d->empty();
-    e.drops_deposit.clear(); e.drops_claim = false; e.drops_claimed.clear();
-    if (e.has_drops) { e.drops_deposit = d->deposit; e.drops_claim = d->claim; e.drops_claimed = d->claimed; }
+    e.drops_deposit.clear(); e.drops_claim = false; e.drops_claimed.clear(); e.drops_enrol.clear();
+    if (e.has_drops) { e.drops_deposit = d->deposit; e.drops_claim = d->claim; e.drops_claimed = d->claimed; e.drops_enrol = d->enrol_add; }
 }
 inline void set_cut(SettleEvent& e, const std::optional<::c2pool::v37n::settle::AnchorCut>& c) {
     e.has_cut = c.has_value();

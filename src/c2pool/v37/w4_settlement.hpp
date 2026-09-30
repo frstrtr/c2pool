@@ -983,6 +983,18 @@ struct OwedLedgerRules {
     // is written off, and at FINALIZE(C) due -= claimed, due += D_C. `due` is
     // committed in owed_digest ("V37U"). Off: no deposit, no claim, no section.
     bool      drops_due = false;
+    // RAINDROP ENROL (XMR, handoff A3, ruling 2026-09-30; turned on with the
+    // DROPS due): the ledger keeps the DROPS enrolment REGISTRY, one record
+    // per payee {effective_from, payout ref}. A lane block's FOUND carries the
+    // payees its composition enrolled by raindrop (enrol_add: the first
+    // raindrop bin + 1 inside its harvest range, for payees absent from the
+    // registry); they join the registry at its FINALIZE and leave with an
+    // ORPHAN before it. The next composition's enrolment book reads the
+    // registry (finalized + pending), and a DROPS-only payee is paid through
+    // the registry ref (ledger state, never node-local). The finalized
+    // registry is committed in owed_digest ("V37G"). Off: no registry, no
+    // section, byte-identical.
+    bool      raindrop_enrol = false;
 };
 
 // ANCHOR (OwedLedgerRules::anchor_cut): a lane block's on-chain credit cut, raw
@@ -1004,16 +1016,45 @@ struct AnchorCut {
 //             together. It leaves `due` at FINALIZE(B); ORPHAN(B) returns it.
 //   writeoff  diagnostics only: the negative part apply_drops_due could not
 //             net (never carried, never a clawback). Not persisted.
+//   enrol_add (raindrop_enrol rule only) the payees this block's composition
+//             enrolled by raindrop; they join the registry at FINALIZE(B).
+// RAINDROP ENROL (OwedLedgerRules::raindrop_enrol): one registry record, a
+// payee enrolled by raindrop, effective from `eff` (its first raindrop bin + 1:
+// ex ante) and paid through `ref` (the PoW-bound payee ref the raindrop named;
+// identity == xmr_identity_key(ref), so every node derives the same ref).
+struct DropsEnrolRec {
+    u64              eff = 0;
+    ::v37::ScriptRef ref;
+    bool operator==(const DropsEnrolRec& o) const { return eff == o.eff && ref == o.ref; }
+};
+using DropsEnrolRegistry = std::map<bytes32, DropsEnrolRec>;
+#define C2POOL_XMR_RAINDROP_ENROL 1   // the A3 registry API is present (KATs test for it)
+
 struct DropsFound {
     std::map<bytes32, long long> deposit;
     bool                         claim = false;
     std::map<bytes32, long long> claimed;
     std::map<bytes32, long long> writeoff;
-    bool empty() const { return deposit.empty() && !claim && claimed.empty(); }
+    DropsEnrolRegistry           enrol_add;
+    bool empty() const { return deposit.empty() && !claim && claimed.empty() && enrol_add.empty(); }
     bool operator==(const DropsFound& o) const {
-        return deposit == o.deposit && claim == o.claim && claimed == o.claimed;
+        return deposit == o.deposit && claim == o.claim && claimed == o.claimed && enrol_add == o.enrol_add;
     }
 };
+
+// The canonical bytes of registry records (the V37G section and the FOUND
+// leaf): u64 n, then per record key(32) || u64 eff || u8 kind || u8 len || payload.
+inline void put_enrol_records(std::vector<std::uint8_t>& b, const DropsEnrolRegistry& m) {
+    const std::uint64_t n = m.size();
+    for (int i = 0; i < 8; ++i) b.push_back((n >> (8 * i)) & 0xff);
+    for (const auto& [k, r] : m) {
+        b.insert(b.end(), k.begin(), k.end());
+        for (int i = 0; i < 8; ++i) b.push_back((r.eff >> (8 * i)) & 0xff);
+        b.push_back(static_cast<std::uint8_t>(r.ref.kind));
+        b.push_back(static_cast<std::uint8_t>(r.ref.payload.size() & 0xff));
+        b.insert(b.end(), r.ref.payload.begin(), r.ref.payload.end());
+    }
+}
 
 // Saturating signed add (integer audit: no wrap on a consensus path).
 inline long long drops_sat_add(long long a, long long b) {
@@ -1081,6 +1122,8 @@ public:
                 for (const auto& [k, v] : drops->claimed) if (v != 0) p.claimed[k] = v;
             for (const auto& [k, v] : drops->writeoff) { (void)k; p.writeoff = drops_sat_add(p.writeoff, v); }
         }
+        if (m_rules.raindrop_enrol && drops)   // RAINDROP ENROL: the payees this block enrolled
+            for (const auto& [k, r] : drops->enrol_add) if (r.eff != 0) p.enrol_add[k] = r;
         m_eo_index.on_found(p.payout,                 // R3: eo -= payout (fe frozen)
                             [this](const bytes32& k) { return fe_at(k); });
         auto ins = m_pending.emplace(bid, std::move(p));
@@ -1095,8 +1138,42 @@ public:
             owedevent::detail::put_amap(leaf, q.deposit);
             owedevent::detail::put_amap(leaf, q.claimed);
         }
+        if (!q.enrol_add.empty()) {   // RAINDROP ENROL: never under the rule off
+            const char tg[4] = {'V', '3', '7', 'G'};
+            leaf.insert(leaf.end(), tg, tg + 4);
+            put_enrol_records(leaf, q.enrol_add);
+        }
         bump(leaf);
     }
+
+    // RAINDROP ENROL: the registry at this booking point, the finalized records
+    // plus the enrol_add of every pending row (the earliest eff wins; a payee
+    // is enrolled once). Empty with the rule off.
+    DropsEnrolRegistry drops_enrol_registry() const {
+        DropsEnrolRegistry r;
+        if (!m_rules.raindrop_enrol) return r;
+        r = m_enrol;
+        for (const auto& [bid, p] : m_pending) {
+            (void)bid;
+            for (const auto& [k, e] : p.enrol_add) {
+                auto [it, fresh] = r.try_emplace(k, e);
+                if (!fresh && e.eff < it->second.eff) it->second = e;
+            }
+        }
+        return r;
+    }
+    // RAINDROP ENROL: the payout ref the registry holds for `k` (finalized or pending).
+    std::optional<::v37::ScriptRef> drops_enrol_ref(const bytes32& k) const {
+        if (!m_rules.raindrop_enrol) return std::nullopt;
+        if (auto it = m_enrol.find(k); it != m_enrol.end()) return it->second.ref;
+        for (const auto& [bid, p] : m_pending) {
+            (void)bid;
+            if (auto e = p.enrol_add.find(k); e != p.enrol_add.end()) return e->second.ref;
+        }
+        return std::nullopt;
+    }
+    // RAINDROP ENROL: the committed (finalized) registry.
+    const DropsEnrolRegistry& drops_enrol_finalized() const { return m_enrol; }
 
     // DROPS DUE: what the next canonical booking on this ledger claims,
     // avail = due - SUM(claims of the pending rows), zero keys dropped. Empty
@@ -1196,6 +1273,11 @@ public:
             for (auto d = m_due.begin(); d != m_due.end();) d = d->second == 0 ? m_due.erase(d) : std::next(d);
             m_drops_writeoff = drops_sat_add(m_drops_writeoff, it->second.writeoff);
         }
+        if (m_rules.raindrop_enrol)   // RAINDROP ENROL: the block's enrolments join the registry
+            for (const auto& [k, e] : it->second.enrol_add) {
+                auto [r, fresh] = m_enrol.try_emplace(k, e);
+                if (!fresh && e.eff < r->second.eff) r->second = e;
+            }
         m_pending.erase(it);
         m_settled.insert(bid);
         const Amounts decayed = decay_dust(bin_height);
@@ -1543,6 +1625,11 @@ public:
                 for (int i = 0; i < 8; ++i) pre.push_back((uv >> (8 * i)) & 0xff);
             }
         }
+        if (m_rules.raindrop_enrol) {   // RAINDROP ENROL: it decides the next enrolment book and DROPS-only refs
+            const char gt[4] = {'V', '3', '7', 'G'};
+            pre.insert(pre.end(), gt, gt + 4);
+            put_enrol_records(pre, m_enrol);
+        }
         if (m_rules.anchor_cut) {   // ANCHOR: it decides every coinbase built on this state
             const char at[4] = {'V', '3', '7', 'A'};
             pre.insert(pre.end(), at, at + 4);
@@ -1616,6 +1703,7 @@ private:
     struct Pending {
         Amounts credit; Amounts payout; std::optional<AnchorCut> cut;
         Amounts deposit, claimed;   // DROPS DUE (rule on only)
+        DropsEnrolRegistry enrol_add;   // RAINDROP ENROL (rule on only)
         long long writeoff = 0;     // DROPS DUE diagnostics (never committed)
     };
 
@@ -1770,6 +1858,7 @@ private:
     std::optional<AnchorCut> m_anchor;   // ANCHOR (OwedLedgerRules::anchor_cut)
     Amounts   m_due;                     // DROPS DUE (OwedLedgerRules::drops_due), finalized, committed "V37U"
     long long m_drops_writeoff = 0;      // DROPS DUE diagnostics: written off at FINALIZE (never committed)
+    DropsEnrolRegistry m_enrol;          // RAINDROP ENROL (OwedLedgerRules::raindrop_enrol), finalized, committed "V37G"
     u64 m_seq = 0;
     Amounts m_finalW;                              // finalized owed partition
     std::map<std::string, Pending> m_pending;      // FOUND, not yet finalized

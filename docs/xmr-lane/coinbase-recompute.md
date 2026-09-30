@@ -205,6 +205,40 @@ nothing checked them.
   * The builder reads the view at its ledger's anchor (replay or repair on
     the main thread). If the view is not readable yet, it builds no template
     rather than a coinbase without its pay-now.
+* **The DROPS due (handoff A5, ruling 2026-09-30).** With the DROPS gate on,
+  a lane block's composed DROPS delta is never credit. It is held in the
+  block's pending row as a deposit and enters the committed map `due` at its
+  FINALIZE (`OwedLedgerRules::drops_due`, "V37U" in `owed_digest`). Every
+  canonical lane block claims the whole `avail = due - Σ pending claims` of
+  the ledger it books on: `E'(k) = max(0, E(k) + avail(k))` before the pay-now
+  allocation, the negative rest written off (never carried, never a
+  clawback). `XmrOwedSettlementSource::build` reads `avail` from the
+  booking-point ledger, so the builder, the block recompute and the share
+  verdict all apply the same due: a builder that omits or doubles it is a
+  Mismatch (rehearsal M12b, share verdict S11). Pay-now arms when the view
+  has payees or some `avail > 0`; the empty-cut finder only when neither.
+* **The enrolment registry (handoff A3, ruling 2026-09-30).** A payee is
+  enrolled for DROPS at the earliest of its first lane share + 1, the
+  ledger's registry record, and its first raindrop bin + 1 inside the
+  harvest range `[lo, hi)` of the block being composed. The payees enrolled
+  by raindrop ride the block's FOUND as `enrol_add` {eff, payout ref}; they
+  join the registry at FINALIZE ("V37G" in `owed_digest`, the finalized
+  records; `OwedLedgerRules::raindrop_enrol`) and leave with an ORPHAN
+  before it. The next composition reads the registry (finalized + pending)
+  at its booking point, so every node derives the same book whatever
+  raindrops it still holds below `lo`. The registry ref is what a DROPS-only
+  payee is paid through: `build` resolves a registry key to its ref before
+  the node's own resolver, and the booking decode maps outputs through the
+  registry refs, so a node that never saw the payee's raindrop (a late
+  joiner) recomputes an honest block as canonical (rehearsal M13b). Persisted
+  in the settle store (schema 4), the FinalizeConnect sidecar ("de=") and
+  the DROPS journal ("G").
+* **The flag day.** The due and the registry change what every block books
+  and pays, so with either rule on the HELLO enrol digest carries the DROPS
+  rule tag (`drops_rule_tag`: due = 1, raindrop enrolment = 2). A peer with
+  another rule set is refused at HELLO as `DROPS_RULE_MISMATCH`, naming both
+  rule sets; a gate-OFF node's HELLO digest is byte-identical to before.
+  Pinned by `v37_xmr_raindrop_enrol_kat` RE1..RE5.
 * **The relay verdict.** The daemon publishes, per ledger state, a frozen
   copy of the ledger, the payees at its anchor, the booked refs and the lane
   config (`xmr_share_verdict.hpp`, keyed by the 0x03 root the state commits,
@@ -238,7 +272,7 @@ The daemon runs `OwedLedgerRules::merkle_rows` together with the anchor rule.
 ```
 leaf        = sha256d("V37L" || key || i64 finalW || u64 first_eligible)   (non-zero rows, key order)
 node        = sha256d("V37M" || left || right)       (an odd last node is carried up)
-rest        = sha256d("V37X" || the V37K / V37A sections)
+rest        = sha256d("V37X" || the V37K / V37U / V37G / V37A sections)
 owed_digest = sha256d("V37Y" || u64 rows || root || rest)
 ```
 

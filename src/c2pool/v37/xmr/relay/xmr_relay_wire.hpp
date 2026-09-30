@@ -538,8 +538,10 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
 // EXPLICIT refusal with a reason, never a silent divergence (the memory-recorded
 // "mismatched-LaneParams nodes must reject explicitly" gap).
 inline constexpr char kEnrolSetMismatch[] = "ENROL_SET_MISMATCH";
+inline constexpr char kDropsRuleMismatch[] = "DROPS_RULE_MISMATCH";   // A3 + A5 flag day
 inline std::string enrol_mode_label(const std::optional<bytes32>& d) {
     if (!d) return "not carried (an auto-enrol-less build with an empty list)";
+    if (enrol_rule_of(*d) != 0) return "rule-tagged (drops rule " + drops_rule_label(enrol_rule_of(*d)) + ")";
     if (*d == enrol_mode_tag(EnrolMode::Auto)) return "auto (every payee)";
     if (*d == enrol_mode_tag(EnrolMode::None)) return "none (--drops-enrol none)";
     return "list (--drops-enrol ID...)";
@@ -554,6 +556,13 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.lane_params_digest != ours.lane_params_digest) {
         // ★ DROPS-ENROL-TIDY (flip 1): the enrol set is mixed into the digest, so
         // name it when the two HELLOs carry different enrol-set digests.
+        // A3 + A5 FLAG DAY: the DROPS rule tag rides the enrol digest; name it.
+        const std::uint32_t our_rule = ours.enrol_set ? enrol_rule_of(*ours.enrol_set) : 0u;
+        const std::uint32_t their_rule = theirs.enrol_set ? enrol_rule_of(*theirs.enrol_set) : 0u;
+        if (theirs.enrol_set != ours.enrol_set && our_rule != their_rule)
+            return std::string(kDropsRuleMismatch) + " drops rule ours=" + drops_rule_label(our_rule) +
+                   " theirs=" + drops_rule_label(their_rule) +
+                   " (flag day: every node of a pool must run the same DROPS due / raindrop-enrol rules)";
         if (theirs.enrol_set != ours.enrol_set)
             return std::string(kEnrolSetMismatch) + " enrol-set digest differs: ours=" +
                    (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +

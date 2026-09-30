@@ -72,6 +72,7 @@
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
 #include "c2pool/v37/xmr/xmr_recon_ring.hpp"
+#include "c2pool/v37/xmr/xmr_drops_wiring.hpp"   // M13 (A3): lane_enrollment_ex
 #if __has_include("c2pool/v37/xmr/xmr_coinbase_recompute.hpp")
 #include "c2pool/v37/xmr/xmr_coinbase_recompute.hpp"
 #define RECOMPUTE_FIX 1
@@ -145,6 +146,15 @@ bool g_anchor = false;                          // M11: the ANCHOR rule (pay-now
 bool g_drops_due = false;
 std::function<std::map<::v37::bytes32, long long>(std::uint64_t)> g_deposit;
 std::set<std::uint64_t> g_due_omit, g_due_double;   // M12b: builders that omit / double the due
+// M13 (handoff A3): raindrop enrolment. g_compose composes a node's DROPS
+// deposit (and, where the rule exists, enrol_add) from ITS ledger at the
+// booking point; g_late_node never learns a deposit payee's ref out of band
+// (a late joiner: it never saw the payee's raindrops).
+bool g_raindrop_enrol = false;
+int g_late_node = -1;
+using EnrolAdd = std::map<::v37::bytes32, std::pair<std::uint64_t, ::v37::ScriptRef>>;   // key -> (eff, ref)
+struct EnrolOut { Amounts deposit; EnrolAdd add; };
+std::function<EnrolOut(const st::OwedLedger&, std::uint64_t)> g_compose;
 std::uint64_t g_leave_at = 0;                   // M10: tiny miners with an even index stop mining after this height   // M9: a lane block at this height is booked by nodes 0 and 1, then reorged out   // M8: the block at g_cap_at is built with this output cap
 
 struct LaneWorld {
@@ -262,11 +272,13 @@ struct Node {
     std::map<::v37::bytes32, ::v37::ScriptRef> booked;          // BOOKED refs (owed pass)
     std::map<::v37::bytes32, ::v37::ScriptRef> local;           // out-of-band refs: used by neither pass
     std::vector<st::OwedLedger> history;                         // ledger before booking each height (for a lagging builder)
+    bool late = false;                                           // M13: a late joiner (no out-of-band deposit refs)
     void note() { const auto d = L.owed_digest(); if (ring.empty() || !(ring.back() == d)) ring.push_back(d); }
 };
 
 struct Booked { rc::Verdict v = rc::Verdict::Undecidable; std::string why; Amounts credit, payout; bool decoded = false;
-                Amounts gross, claimed, writeoff, deposit; };   // M12: E' before the net, the due claimed / written off, D_B
+                Amounts gross, claimed, writeoff, deposit;      // M12: E' before the net, the due claimed / written off, D_B
+                EnrolAdd enrol_add; };                          // M13: the payees this booking enrolled by raindrop
 
 // What book_from_chain_ex does with one lane block on one node.
 Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const std::string& bid) {
@@ -277,6 +289,9 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     std::map<::v37::bytes32, ::v37::ScriptRef> resolve = n.booked;
     const auto pv = paynow_view(W, n.L, h);                              // ANCHOR: the payees pay-now paid
     for (const auto& w : pv) resolve[w.key] = w.pay;                     // REJOIN-PAYEE: the block's credit cut
+#if defined(C2POOL_XMR_RAINDROP_ENROL)
+    for (const auto& [k, rec] : n.L.drops_enrol_registry()) resolve.emplace(k, rec.ref);   // A3 (a): registry refs map outputs
+#endif
     std::vector<::v37::bytes32> keys;
     for (const auto& [k, v] : resolve) { (void)v; keys.push_back(k); }
     const ::v37::bytes32 tag = the_tag();
@@ -301,6 +316,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
             r.claimed = n.L.drops_available();
             st::apply_drops_due(r.credit, r.claimed, &r.writeoff);
             if (g_deposit) r.deposit = g_deposit(h);
+            if (g_compose) { EnrolOut e = g_compose(n.L, h); r.deposit = e.deposit; r.enrol_add = e.add; }   // M13
         }
         for (const auto& [k, d] : res.credit_delta) {   // SPEND-COST FLOOR: the redistribution
             r.credit[k] += d;
@@ -320,10 +336,18 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     std::optional<st::DropsFound> df;   // M12: canonical bookings only (a debit-only block claims and deposits nothing)
     if (g_drops_due && res.verdict == rc::Verdict::Canonical) {
         df = st::DropsFound{}; df->deposit = r.deposit; df->claim = true; df->claimed = r.claimed; df->writeoff = r.writeoff;
+#if defined(C2POOL_XMR_RAINDROP_ENROL)
+        for (const auto& [k, e] : r.enrol_add) df->enrol_add[k] = st::DropsEnrolRec{e.first, e.second};   // M13 (A3)
+#endif
     }
     n.L.on_block_found(bid, r.credit, r.payout, cut, df ? &*df : nullptr);
     n.note();
-    for (const auto& [k, v] : r.deposit) { (void)v; if (W.universe.count(k)) n.booked[k] = W.universe.at(k); }   // BOOKED REFS: the deposit payees
+    if (!n.late)   // M13: a late joiner never saw the deposit payee's raindrop (drop_ref_of is node-local)
+        for (const auto& [k, v] : r.deposit) { (void)v; if (W.universe.count(k)) n.booked[k] = W.universe.at(k); }   // BOOKED REFS: the deposit payees
+#if defined(C2POOL_XMR_RAINDROP_ENROL)
+    if (!n.late)   // the late joiner keeps NO registry ref in its booked map: its recompute resolves X from the ledger alone
+        for (const auto& [k, rec] : n.L.drops_enrol_registry()) n.booked[k] = rec.ref;   // A3 (a): note_booked_refs teaches the registry refs
+#endif
     for (const auto& w : pv) n.booked[w.key] = w.pay;                   // BOOKED refs, after success
     for (const auto& [k, v] : bk.payout) { (void)v; if (resolve.count(k)) n.booked[k] = resolve.at(k); }
     return r;
@@ -342,6 +366,8 @@ struct Run {
     std::vector<Node> nodes;
     std::map<::v37::bytes32, long long> gross, claimed, writeoff, deposited;   // M12 (node 0)
     std::size_t neg_seen = 0;                                                   // M12: finalW < 0 on any node at any height
+    std::size_t late_noncanon = 0;                                              // M13: blocks the late joiner did not find CANONICAL
+    std::map<::v37::bytes32, std::uint64_t> enrolled_at;                        // M13: eff of each raindrop enrolment (node 0)
 };
 
 // Simulate H heights with builders rotating over the nodes. `lag_at`: the
@@ -362,8 +388,12 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
         rules.anchor_cut = g_anchor;
         rules.merkle_rows = g_anchor;   // the daemon turns both on together (§13 light-client proofs)
         rules.drops_due = g_drops_due;  // M12: the daemon turns it on with the anchor (DROPS gate on)
+#if defined(C2POOL_XMR_RAINDROP_ENROL)
+        rules.raindrop_enrol = g_raindrop_enrol;   // M13: the daemon turns it on with the due
+#endif
         for (auto& n : run.nodes) n.L = st::OwedLedger(kChain, rules);
     }
+    if (g_late_node >= 0) run.nodes[static_cast<std::size_t>(g_late_node)].late = true;
     for (auto& n : run.nodes) {
         for (std::size_t i = 0; i < (g_no_seeds ? 0 : W.seeded.size()); ++i) {
             const std::string bid = "seed-" + std::to_string(i);
@@ -453,7 +483,13 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
                     for (const auto& [k, c] : r.claimed) run.claimed[k] += c;
                     for (const auto& [k, c] : r.writeoff) run.writeoff[k] += c;
                     for (const auto& [k, c] : r.deposit) run.deposited[k] += c;
-                } else if (r.v != *v0) {
+                    for (const auto& [k, e] : r.enrol_add) run.enrolled_at.emplace(k, e.first);
+                }
+                if (static_cast<int>(i) == g_late_node && r.v != rc::Verdict::Canonical) {
+                    ++run.late_noncanon;
+                    if (run.late_noncanon <= 2) std::printf("    h=%llu late node%zu %s: %s\n", (unsigned long long)h, i, rc::to_string(r.v), r.why.substr(0, 160).c_str());
+                }
+                if (i != 0 && r.v != *v0) {
                     ++run.verdict_splits;
                     std::printf("    h=%llu VERDICT SPLIT node%zu %s (%s) vs node0 %s (%s)\n", (unsigned long long)h, i,
                                 rc::to_string(r.v), r.why.c_str(), rc::to_string(*v0), why0.c_str());
@@ -810,6 +846,100 @@ void m12_drops_due() {
     g_spend_floor = false; g_anchor = false; g_drops_due = false;
 }
 
+// M13 (handoff A3): raindrop enrolment across 3 nodes. X is a raindrop-only
+// miner (no share in any view) from block 3: raindrops at bins 10(h-1)+3 and
+// +7 of block h's harvest range [10(h-1), 10h). Every node composes its
+// deposit from ITS ledger at the booking point with the real rule
+// (lane_enrollment_ex: min of the share rule, the registry, the first raindrop
+// + 1): 0.001 XMR per enrolled raindrop interval. Node 2 is a LATE JOINER: it
+// never saw X's raindrops, so X's ref reaches it only as ledger state.
+void m13_raindrop_enrol() {
+    std::printf("== M13. raindrop enrolment (A3): a raindrop-only miner enrolled and paid on-chain; node 2 a late joiner ==\n");
+    g_spend_floor = true; g_anchor = true; g_drops_due = true; g_raindrop_enrol = true; g_late_node = 2;
+    LaneWorld W;
+    const Payee X = payee(0x5e);
+    W.universe[X.id] = X.ref;
+    const auto x_bins = [](std::uint64_t h) {
+        std::vector<std::uint64_t> v;
+        if (h >= 3) { v.push_back(10 * (h - 1) + 3); v.push_back(10 * (h - 1) + 7); }
+        return v;
+    };
+    g_compose = [X, x_bins](const st::OwedLedger& L, std::uint64_t h) {
+        EnrolOut o;
+        const auto bins = x_bins(h);
+        if (bins.empty()) return o;
+#if defined(C2POOL_XMR_RAINDROP_ENROL)
+        namespace dw = c2pool::v37n::xmr::drops;
+        const auto reg = L.drops_enrol_registry();
+        const std::map<::v37::bytes32, std::uint64_t> fdb{{X.id, bins.front()}};
+        const auto book = dw::lane_enrollment_ex(dw::LanePrefix{}, {}, c2pool::v37n::xmr::relay::EnrolMode::Auto, reg, fdb);
+        long long d = 0;
+        for (const auto b : bins) if (book.enrolled(X.id, b)) d += 1000000000ll;
+        if (d) o.deposit[X.id] = d;
+        if (!reg.count(X.id)) o.add[X.id] = {bins.front() + 1, X.ref};
+#else
+        (void)L;   // the base: enrolment needs a lane share; X has none -> never enrolled, nothing composed
+#endif
+        return o;
+    };
+    const std::uint64_t H = 36;
+    Run r = simulate(W, H);
+    const auto ea = r.enrolled_at.find(X.id);
+    std::printf("    X enrolled at eff=%llu; canonical=%zu mismatch=%zu verdict_splits=%zu digest_split_heights=%zu late_noncanon=%zu\n",
+                ea == r.enrolled_at.end() ? 0ull : (unsigned long long)ea->second, r.canonical, r.mismatch, r.verdict_splits,
+                r.split_heights, r.late_noncanon);
+    CHECK(ea != r.enrolled_at.end() && ea->second == 24, "X is enrolled at its first raindrop bin 23 + 1 = 24 (in [20,30) of h=3)");
+    CHECK(r.blocks == H && r.canonical == H && r.mismatch == 0 && r.verdict_splits == 0 && r.split_heights == 0 && r.late_noncanon == 0,
+          "every one of %llu lane blocks CANONICAL on all 3 nodes incl. the late joiner (late non-canonical %zu), 0 digest splits (%zu)",
+          (unsigned long long)H, r.late_noncanon, r.split_heights);
+    const long long xpaid = r.paid.count(X.id) ? r.paid.at(X.id) : 0;
+    const long long xdep = r.deposited.count(X.id) ? r.deposited.at(X.id) : 0;
+    CHECK(xpaid > 0 && xdep > 0, "the raindrop-only miner X is credited (deposited %lld) and paid ON-CHAIN (%lld piconero)", xdep, xpaid);
+    const ::v37::bytes32 don = fee::donation_identity(kNet);
+    long long seeds = 0, eb = 0, cl = 0, wo = 0, paid = 0, owed = 0, dep = 0, due = 0;
+    for (std::size_t i = 0; i < W.seeded.size(); ++i) seeds += W.seed_amount[i];
+    for (const auto& [k, v] : r.eb_gross) { (void)k; eb += v; }
+    for (const auto& [k, v] : r.claimed) { (void)k; cl += v; }
+    for (const auto& [k, v] : r.writeoff) { (void)k; wo += v; }
+    for (const auto& [k, v] : r.paid) if (!(k == don)) paid += v;
+    for (const auto& [k, v] : W.universe) { (void)v; if (!(k == don)) owed += eo(r, k); }
+    for (const auto& [k, v] : r.deposited) { (void)k; dep += v; }
+    for (const auto& [k, v] : r.nodes[0].L.drops_due()) { (void)k; due += v; }
+    const long long decayed = r.nodes[0].L.decayed_total();
+    std::printf("    seeds=%lld E_b=%lld claimed=%lld written_off=%lld | paid=%lld owed=%lld decayed=%lld | deposited=%lld due_left=%lld\n",
+                seeds, eb, cl, wo, paid, owed, decayed, dep, due);
+    CHECK(seeds + eb + cl == paid + owed + wo + decayed && dep == cl + due,
+          "conservation exact: seeds + E_b + claimed (%lld) == paid + owed + written_off + decayed (%lld); deposited %lld == claimed + due left %lld",
+          seeds + eb + cl, paid + owed + wo + decayed, dep, cl + due);
+
+    // M13b (addition a): X has a due from h=1 (a synthetic deposit) and its
+    // enrolment record rides the first deposit block; node 2 never saw X's
+    // raindrops. The base resolves X only from node-local refs: node 2 cannot
+    // pay X (payable=false) and refuses every block that does.
+    std::printf("== M13b. the late joiner recomputes an honest block CANONICAL from the V37G registry ref ==\n");
+    LaneWorld W2;
+    W2.universe[X.id] = X.ref;
+    g_compose = [X](const st::OwedLedger& L, std::uint64_t) {
+        EnrolOut o;
+        o.deposit[X.id] = 2000000000ll;
+#if defined(C2POOL_XMR_RAINDROP_ENROL)
+        if (!L.drops_enrol_registry().count(X.id)) o.add[X.id] = {1, X.ref};   // X's first raindrop at bin 0
+#else
+        (void)L;
+#endif
+        return o;
+    };
+    Run r2 = simulate(W2, 30);
+    const long long xpaid2 = r2.paid.count(X.id) ? r2.paid.at(X.id) : 0;
+    std::printf("    late joiner: non-canonical=%zu of %llu; verdict_splits=%zu digest_split_heights=%zu; X paid %lld\n",
+                r2.late_noncanon, (unsigned long long)r2.blocks, r2.verdict_splits, r2.split_heights, xpaid2);
+    CHECK(r2.late_noncanon == 0 && r2.verdict_splits == 0 && r2.split_heights == 0 && r2.canonical == r2.blocks && xpaid2 > 0,
+          "the late joiner finds every block CANONICAL (non-canonical %zu), one owed_digest (split heights %zu), X paid %lld",
+          r2.late_noncanon, r2.split_heights, xpaid2);
+    g_compose = nullptr; g_late_node = -1;
+    g_spend_floor = false; g_anchor = false; g_drops_due = false; g_raindrop_enrol = false;
+}
+
 void m8_claimed_full() {
     std::printf("== M8. a builder claims too few output slots ==\n");
     g_spend_floor = true;
@@ -877,6 +1007,7 @@ int main() {
     m10_decay();
     m11_anchor();
     m12_drops_due();
+    m13_raindrop_enrol();
     m8_claimed_full();
     m5_gate_and_config();
 #else

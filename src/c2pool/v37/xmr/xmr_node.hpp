@@ -101,6 +101,7 @@ public:
         r.anchor_cut = m_cfg.ledger_anchor_cut;
         r.merkle_rows = m_cfg.ledger_merkle_rows;
         r.drops_due = m_cfg.ledger_drops_due;
+        r.raindrop_enrol = m_cfg.ledger_raindrop_enrol;
         return r;
     }
 

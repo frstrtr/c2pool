@@ -2572,9 +2572,55 @@ private:
             s[0] = '3';
             s += " dd=" + map_str(r.drops->deposit);
             if (r.drops->claim) s += " dc=" + map_str(r.drops->claimed);
+            if (!r.drops->enrol_add.empty()) s += " de=" + enrol_str(r.drops->enrol_add);   // RAINDROP ENROL
         }
         s += "\n";
         return s;
+    }
+    // RAINDROP ENROL (sidecar v3 "de="): key64:eff:kind:payloadhex[,...]
+    static std::string enrol_str(const ::c2pool::v37n::settle::DropsEnrolRegistry& m) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        for (const auto& [k, r] : m) {
+            if (!s.empty()) s += ",";
+            s += hex_of(k) + ":" + std::to_string(r.eff) + ":" + std::to_string(static_cast<unsigned>(r.ref.kind)) + ":";
+            for (std::uint8_t b : r.ref.payload) { s.push_back(d[b >> 4]); s.push_back(d[b & 15]); }
+        }
+        return s;
+    }
+    static bool enrol_parse(const std::string& s, ::c2pool::v37n::settle::DropsEnrolRegistry& out) {
+        out.clear();
+        auto nib = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::size_t p = 0;
+        while (p < s.size()) {
+            std::size_t c = s.find(',', p); if (c == std::string::npos) c = s.size();
+            const std::string item = s.substr(p, c - p);
+            const std::size_t a = item.find(':'), b = item.find(':', a + 1), e = item.find(':', b + 1);
+            if (a != 64 || b == std::string::npos || e == std::string::npos) return false;
+            ::v37::bytes32 k{};
+            if (!hash_from_hex(lower_hex(item.substr(0, 64)), k)) return false;
+            ::c2pool::v37n::settle::DropsEnrolRec rec;
+            unsigned kind = 0;
+            try { rec.eff = std::stoull(item.substr(a + 1, b - a - 1)); kind = static_cast<unsigned>(std::stoul(item.substr(b + 1, e - b - 1))); }
+            catch (...) { return false; }
+            if (kind > 255) return false;
+            rec.ref.kind = static_cast<::v37::ScriptKind>(kind);
+            const std::string ph = item.substr(e + 1);
+            if (ph.size() % 2) return false;
+            for (std::size_t i = 0; i < ph.size(); i += 2) {
+                const int hi = nib(ph[i]), lo = nib(ph[i + 1]);
+                if (hi < 0 || lo < 0) return false;
+                rec.ref.payload.push_back(static_cast<std::uint8_t>(hi * 16 + lo));
+            }
+            out[k] = std::move(rec);
+            p = c + 1;
+        }
+        return true;
     }
     static bool parse_sidecar_line(const std::string& line, std::string& bid, PendingRec& r) {
         std::istringstream is(line);
@@ -2609,6 +2655,11 @@ private:
             if (!map_parse(cm, r.credit) || !map_parse(pm, r.payout)) return false;
             std::string ct;   // ANCHOR: optional trailing "cut=P:spine"; v3: then "dd=map" [" dc=map"]
             while (is >> ct) {
+                if (ver == "3" && ct.rfind("de=", 0) == 0) {   // RAINDROP ENROL
+                    if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
+                    if (!enrol_parse(ct.substr(3), r.drops->enrol_add)) return false;
+                    continue;
+                }
                 if (ver == "3" && (ct.rfind("dd=", 0) == 0 || ct.rfind("dc=", 0) == 0)) {
                     if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
                     Amounts m;

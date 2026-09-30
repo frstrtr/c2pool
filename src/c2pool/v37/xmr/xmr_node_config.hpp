@@ -326,6 +326,7 @@ struct XmrNodeConfig {
     std::uint64_t   ledger_decay_half_life = 0;    // ... and its half-life, Monero heights
     bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
     bool            ledger_drops_due = false;      // DROPS DUE (A5, ruling 09-30): the DROPS delta is a deposit into the committed due, claimed in pay-now
+    bool            ledger_raindrop_enrol = false; // RAINDROP ENROL (A3, ruling 09-30): the DROPS enrolment registry (V37G), refs are ledger state
     bool            ledger_merkle_rows = false;    // §13: owed_digest = a Merkle root over the balances (light-client proofs)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so

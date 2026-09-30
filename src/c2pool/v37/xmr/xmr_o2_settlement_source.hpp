@@ -260,7 +260,7 @@ public:
     //                 the block's committed V37N base B, which reproduces the
     //                 builder's takes without the builder's mempool.
     static std::unique_ptr<XmrOwedSettlementSource>
-    build(const OwedLedger& ledger, const PayOfFn& pay_of, const XmrCoinbaseContext& ctx,
+    build(const OwedLedger& ledger, const PayOfFn& pay_of_in, const XmrCoinbaseContext& ctx,
           std::uint64_t reward_hint, std::string* why,
           KFairSource source = KFairSource::W4Propose, const AgeOfFn& age_of = {},
           std::optional<std::uint64_t> owed_budget = std::nullopt)
@@ -270,6 +270,17 @@ public:
             return nullptr;
         };
         if (reward_hint == 0) reward_hint = ctx.budget();
+        // RAINDROP ENROL (A3, addition a): a payee the booking-point ledger's
+        // enrolment registry holds is paid through the REGISTRY ref -- ledger
+        // state, the same on every node -- so a node that never saw the payee's
+        // raindrop (a late joiner) builds and recomputes the same coinbase.
+        // Rule off (or no record): the caller's resolver, unchanged.
+        const PayOfFn pay_of = [&ledger, &pay_of_in](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+            if (const auto r = ledger.drops_enrol_ref(k);
+                r && ::v37::xmr::is_xmr_kind(r->kind) && ::v37::xmr::xmr_identity_key(*r) == k)
+                return *r;
+            return pay_of_in(k);
+        };
 
         // ---- fences / lane-parameter validity (fail-closed) ----
         if (!::v37::xmr::xmr_precarrot_ok(ctx.monero_major_version))
@@ -449,7 +460,8 @@ public:
             pv->avail = avail;
             bool payable = true;
             // DROPS DUE: a payee with avail > 0 and no share in the view is paid
-            // through its BOOKED ref (note_booked_refs taught it with the deposit).
+            // through its REGISTRY ref (RAINDROP ENROL, ledger state; pay_of above),
+            // else its BOOKED ref (note_booked_refs taught it with the deposit).
             std::vector<std::pair<::v37::bytes32, ::v37::ScriptRef>> want;
             for (const auto& w : pv->wp) want.emplace_back(w.key, w.pay);
             for (const auto& [k, v] : avail) if (v > 0) want.emplace_back(k, ::v37::ScriptRef{});

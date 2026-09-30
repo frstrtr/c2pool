@@ -36,6 +36,10 @@
 //               omits or doubles the due does not rebuild here (Mismatch).
 //   pay_of      the receiver's payee resolver (the refs the lane taught it,
 //               including every payee of the view at B's cut: REJOIN-PAYEE).
+//               RAINDROP ENROL (A3, rule raindrop_enrol): a key the ledger's
+//               enrolment registry holds resolves to the REGISTRY ref first
+//               (ledger state, inside build), so a DROPS-only payee is paid
+//               the same way on a node that never saw its raindrop.
 //   lane cfg    chain id, owed floor, owed-selection cap, the residual sink
 //               and fixed outputs (fee model v1: the protocol donation output,
 //               compiled in), the pool tag. Identical on every node of a lane.

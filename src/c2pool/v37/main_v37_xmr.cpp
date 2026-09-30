@@ -2340,6 +2340,10 @@ static int run_live(const XmrNodeConfig& cfg) {
         auth::CutPayeeResult r;
         std::map<::v37::bytes32, ::v37::ScriptRef> cut_refs;   // BOOKING MAP: this block's own cut
         const auto booked = cba_fx ? cba_fx->pay_of_booked() : o2::PayOfFn{};
+        // RAINDROP ENROL (A3, addition a): the registry refs of the booking ledger
+        // map outputs too (a DROPS-only payee paid from the due), ledger state.
+        for (const auto& [k, rec] : (decode_ledger ? *decode_ledger : node.ledger()).drops_enrol_registry())
+            if (::v37::xmr::is_xmr_kind(rec.ref.kind) && !(booked && booked(k) == rec.ref)) cut_refs.emplace(k, rec.ref);
         auto bk = auth::decode_resolving_cut_payees(
             [&] { return decode_blob(blob, superseded_out, cands_override, cba_fx ? &cut_refs : nullptr); },
             [&](const c2pool::v37n::xmr::credit::CreditCut& cc, std::vector<settle::WeightedPayee>& out, std::string& w) -> int {
@@ -2486,15 +2490,25 @@ static int run_live(const XmrNodeConfig& cfg) {
     // with S and the book from the lane prefix at P, priced at the cut. GAP 3:
     // the whole composition is booked; the carriage row bound applies to the
     // wire witness only (drops::wire_witness).
+    // RAINDROP ENROL (A3): `L` is the booking-point ledger; its enrolment
+    // registry (finalized + pending) joins the book, and the payees enrolled by
+    // raindrop here ride the booking's DropsFound::enrol_add.
     auto drops_compose_lane = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
-                                  const c2pool::v37n::settle::WorkPrice& price, std::string& why, DropsLaneOut& out) -> bool {
+                                  const c2pool::v37n::settle::WorkPrice& price, std::string& why, DropsLaneOut& out,
+                                  const settle::OwedLedger* booking_L = nullptr) -> bool {   // nullptr = the node's ledger (the live booking)
+        const settle::OwedLedger& L = booking_L ? *booking_L : node.ledger();
         const auto rgo = drops->range_for(h);
         if (!rgo) { ++drops_lane_hold; why = "cut-pending: drops range below h=" + std::to_string(h) + " undecidable (canonical predecessor not readable yet)"; return false; }
         const auto lp = drops_lane_prefix(bk.credit_cut, relay_hint(bid), why);
         if (!lp) { ++drops_lane_hold; return false; }
         out.rg = *rgo;
         drops_cut_at_h[h] = bk.credit_cut.next_pos;   // ★ DROPS-ENROL-TIDY: the reachable-cut set (lane-log bound)
-        out.lc = drops->compose_lane(rgo->first, rgo->second, *lp);
+        const auto reg = L.drops_enrol_registry();
+        out.lc = drops->compose_lane(rgo->first, rgo->second, *lp, &reg);
+        if (!out.lc.enrol_add.empty())
+            std::printf("drops-enrol: h=%llu bid=%s… raindrop enrolments=%zu registry=%zu range=[%llu,%llu)\n",
+                        static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), out.lc.enrol_add.size(), reg.size(),
+                        static_cast<unsigned long long>(rgo->first), static_cast<unsigned long long>(rgo->second));
         c2pool::v37n::settle::DropsCompose dctx;
         dctx.price = c2pool::v37n::xmr::drops::rescale_price(price, drops->receipt_weight());
         dctx.enrollment = &out.lc.book;
@@ -2540,6 +2554,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (!kf.empty()) drops_store->put_frame(bid, kf);
             }
             drops_store->put_booked(bid, lane.carry.delta);
+            drops_store->put_enrol(bid, lane.lc.enrol_add);   // RAINDROP ENROL (written only when non-empty)
         }
         if (hand_to_node) drops->set_carried(lane.carry.delta);
         long long csum = 0; for (const auto& [k, v] : lane.carry.delta) csum += v;
@@ -2574,6 +2589,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!cba_fx) return;
         if (deposit && drops)   // DROPS DUE (A5): the refs of the deposit payees (a DROPS-only payee is paid from the due)
             for (const auto& [k, v] : *deposit) { (void)v; if (const auto r = drops->drop_ref_of(k)) note_booked_ref(*r); }
+        for (const auto& [k, rec] : L.drops_enrol_registry()) { (void)k; note_booked_ref(rec.ref); }   // RAINDROP ENROL: ledger refs
         std::string w; bool hv = false; std::vector<settle::WeightedPayee> ps;
         if (credit_payees(bk.credit_cut, L, hv, ps, w, relay_hint(bid)) == 1)   // ANCHOR: the payees pay-now paid
             for (const auto& p : ps)
@@ -2916,7 +2932,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
             }
             for (auto& a : relay_node->drain_drops())
-                { drops->note_drop_ref(::v37::xmr::xmr_identity_key(a.r.payee), a.r.payee); drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow); }
+                (void)drops->on_raindrop(a.r.payee, a.bin, a.pow);   // + the ref (RAINDROP ENROL)
             if (auto hit = drops_hold_since.find(bid); hit != drops_hold_since.end()) {
                 drops_held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hit->second).count();
                 drops_hold_since.erase(hit); ++drops_hold_resolved;
@@ -2977,7 +2993,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!paynow_net(h, bid, bk, credit, payout, why, node.ledger(), live_due)) { ++cba_refused; return false; }   // SAME-BLOCK PAY-NOW: book net
         {   // DROPS DUE: the claim, and the deposit the node books (== the one-shot handed by drops_take_carry)
             settle::DropsFound d = live_due ? *live_due : settle::DropsFound{};
-            if (drops_live) d.deposit = drops_lane.carry.delta;
+            if (drops_live) { d.deposit = drops_lane.carry.delta; d.enrol_add = drops_lane.lc.enrol_add; }   // + RAINDROP ENROL
             if (!d.empty()) out.drops = std::move(d);
         }
         if (drops_live && relay_node) {   // ★ RAIN-BACKFILL(-2): once per booking that proceeds
@@ -3085,8 +3101,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         // delta too (journalled; the adoption's re-drive books it by block id) --
         // never the pre-DROPS local composition. Not carried yet => undecidable.
         std::optional<Amounts> scratch_deposit;   // GAP 2: the delta the scratch lineage books (DropsFound in ChainBooking)
+        settle::DropsEnrolRegistry scratch_enrol;  // RAINDROP ENROL: the raindrop enrolments of the scratch composition
         if (drops) {   // ★ DROPS-ENROL-LANE: the lane composition (a journalled booking is re-driven by block id)
-            if (drops_store && drops_store->booked(bid)) scratch_deposit = *drops_store->booked(bid);
+            if (drops_store && drops_store->booked(bid)) { scratch_deposit = *drops_store->booked(bid); scratch_enrol = drops_store->enrol(bid); }
             else {
                 if (!drops_live) { why = "cut-pending: relay repair of P=-: DROPS not live yet (flip 1: no pre-DROPS booking)"; return false; }
                 if (relay_node) {
@@ -3098,10 +3115,11 @@ static int run_live(const XmrNodeConfig& cfg) {
                                                   std::to_string(rgo->second) + ") incomplete (" + ds.why + ")"; return false; }
                     }
                     for (auto& a : relay_node->drain_drops())
-                        { drops->note_drop_ref(::v37::xmr::xmr_identity_key(a.r.payee), a.r.payee); drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow); }
+                        (void)drops->on_raindrop(a.r.payee, a.bin, a.pow);   // + the ref (RAINDROP ENROL)
                 }
                 DropsLaneOut lane;
-                if (!drops_compose_lane(h, bid, bk, drops_fold_price, why, lane)) return false;
+                if (!drops_compose_lane(h, bid, bk, drops_fold_price, why, lane, q.ledger ? &*q.ledger : &node.ledger())) return false;
+                scratch_enrol = lane.lc.enrol_add;   // RAINDROP ENROL
                 if (!drops_take_carry(h, bid, bk, why, false, lane)) return false;
                 scratch_deposit = lane.carry.delta;
             }
@@ -3111,6 +3129,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         {   // GAP 2: converge books the DROPS delta (and, under the rule, the claim) like the live booking
             settle::DropsFound d = scratch_due ? *scratch_due : settle::DropsFound{};
             if (scratch_deposit) d.deposit = *scratch_deposit;
+            d.enrol_add = scratch_enrol;   // RAINDROP ENROL
             if (!d.empty()) out.drops = std::move(d);
         }
         if (!own_cut_anchor(bk, q.ledger ? *q.ledger : node.ledger(), out, why, relay_hint(bid))) return false;   // ANCHOR
@@ -3835,6 +3854,11 @@ static int run_live(const XmrNodeConfig& cfg) {
                 const auto emode = enrol_none ? relay::EnrolMode::None
                                  : g_drops_enrol.empty() ? relay::EnrolMode::Auto : relay::EnrolMode::List;
                 drops->set_enrol_mode(emode);
+                // RAINDROP ENROL (A3, ruling 09-30): a payee enrols at its first raindrop
+                // (bin + 1) as well as at its first lane share; the record and its ref
+                // live in the ledger registry (V37G). Same gate as the ledger rule.
+                drops->set_raindrop_enrol(cfg.ledger_raindrop_enrol);
+                drops->set_drops_rule(c2pool::v37n::xmr::relay::drops_rule_tag(cfg.ledger_drops_due, cfg.ledger_raindrop_enrol));
                 std::set<::v37::bytes32> es;
                 for (const auto& e : (enrol_none ? std::vector<std::string>{} : g_drops_enrol)) {
                     std::vector<std::uint8_t> raw;
@@ -3898,7 +3922,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                                                             ro.network);   // S4: + FeeModelGate (+ this network's donation identity) iff ON
             if (drops_live)   // ★ DROPS-ENROL-LANE (flip 1): the enrol set is pool consensus -- another set = HELLO mismatch
                 ro.lane_params_digest = c2pool::v37n::xmr::drops::hello_digest_with_enrol(ro.lane_params_digest, drops->enrol_mode(),
-                                                                                         drops->enrol_set());   // ★ DROPS-AUTO-ENROL: mode folded
+                                                                                         drops->enrol_set(),   // ★ DROPS-AUTO-ENROL: mode folded
+                                                                                         drops->drops_rule()); // A3 + A5 FLAG DAY: rule tag
             ro.max_pushes_per_receipt = fee_on ? 2 : 1;   // fee model S3: (payee, donation) split
             // POOL-ID: the roundabout S1 lane_tag of THIS node's pool (own chain_id,
             // LaneParams geometry, shipped consensus version, authority 0;
@@ -3914,6 +3939,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             // ★ DROPS-AUTO-ENROL: carried in EVERY mode (auto / list / none are all pool consensus).
             if (drops_live)
                 ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_mode_digest(drops->enrol_mode(), drops->enrol_set());
+            if (ro.enrol_set_digest)   // A3 + A5 FLAG DAY: the DROPS rule tag, named at HELLO (rule 0: unchanged)
+                ro.enrol_set_digest = c2pool::v37n::xmr::relay::enrol_rule_digest(*ro.enrol_set_digest, drops->drops_rule());
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -4489,7 +4516,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 for (auto& a : relay_node->drain_admitted()) relay_ingest->on_admitted(std::move(a));
                 if (drops_live)   // ★ DROPS: every replicated raindrop (own + peers') -> the harvester
                     for (auto& a : relay_node->drain_drops())
-                        { drops->note_drop_ref(::v37::xmr::xmr_identity_key(a.r.payee), a.r.payee); drops->on_raindrop(::v37::xmr::xmr_identity_key(a.r.payee), a.bin, a.pow); }
+                        (void)drops->on_raindrop(a.r.payee, a.bin, a.pow);   // + the ref (RAINDROP ENROL)
                 // RELAY-BINCLOCK: the chain clock too (a suspended lane serves no new template)
                 relay_ingest->tick(relay::bin_close_height(provider.current().height, node.hw().hw_height));
                 for (const auto& [bw, pid] : relay_node->drain_block_won()) relay_on_cut(bw, pid);
@@ -5723,6 +5750,9 @@ int main(int argc, char** argv) {
         // DROPS DUE (A5, ruling 09-30): with the anchor, behind the DROPS gate (a
         // flip-0 build or a DROPS-off lane keeps owed_digest without "V37U").
         cfg.ledger_drops_due = c2pool::v37n::kDropsWiringArmed && cfg.lane_params.subthreshold.enabled;
+        // RAINDROP ENROL (A3, ruling 09-30): the enrolment registry (V37G) comes
+        // with the due; the DROPS wiring enrols by raindrop under the same gate.
+        cfg.ledger_raindrop_enrol = cfg.ledger_drops_due;
     }
     const int rc = run_live(cfg);
     g_web = nullptr; g_web_extra = {}; g_web_name = {};
