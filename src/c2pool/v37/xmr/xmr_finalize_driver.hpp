@@ -377,6 +377,18 @@ public:
     // PENDING in the ledger, with the payout each one booked. A verifier that re-derives
     // a coinbase built at `height` removes exactly these from its ledger copy to get the
     // builder's view (xmr_canonical_coinbase.hpp ledger_before).
+    // CANON: every canonical lane block booked at height >= lo (pending or already
+    // finalized), for ledger_at to reconstruct the builder's pending set from an
+    // older retained ledger state.
+    std::vector<FoundBlock> booked_since(std::uint64_t lo) const {
+        std::vector<FoundBlock> out;
+        for (auto it = m_by_height.lower_bound(lo); it != m_by_height.end(); ++it)
+            for (const auto& bid : it->second) {
+                const auto f = m_found.find(bid);
+                if (f != m_found.end() && f->second.canonical) out.push_back(f->second);
+            }
+        return out;
+    }
     std::vector<std::pair<std::string, Amounts>> pending_payouts_from(std::uint64_t height) const {
         std::vector<std::pair<std::string, Amounts>> out;
         for (auto it = m_by_height.lower_bound(height); it != m_by_height.end(); ++it)

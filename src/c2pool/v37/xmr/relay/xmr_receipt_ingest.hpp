@@ -74,6 +74,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <algorithm>
+#include <deque>
 #include <functional>
 #include <map>
 #include <optional>
@@ -121,6 +123,11 @@ public:
         std::string durable_path;         // "" = no durable log
         bool        fee_model = false;    // LaneParams::fee ON: split by the receipt's give_author u16
         u8          network = 0;          // HELLO network byte == fee::DonationNet: the donation payee (DON-NET)
+        // CANON (enforcing): how long a receipt whose coinbase cannot be checked YET (the builder's
+        // ledger state is not reproducible here) waits before it is expired (not credited), and the
+        // most receipts held at once (the oldest is expired past it).
+        u32         canon_hold_ms = 20 * 60 * 1000;
+        u32         canon_hold_max = 4096;
     };
     struct Stats {
         u64 pushed = 0, push_failed = 0, late = 0, bins_closed = 0, reloaded = 0, reload_torn = 0, durable_writes = 0;
@@ -128,6 +135,7 @@ public:
         // CANON (set_canon_check): verdicts on the receipt's coinbase. refused counts
         // receipts dropped before the lane because enforcement is on and they mismatched.
         u64 canon_match = 0, canon_mismatch = 0, canon_undecidable = 0, canon_refused = 0;
+        u64 canon_held = 0, canon_released = 0, canon_expired = 0;   // enforcing: undecidable receipts waiting / later admitted / given up
     };
     // CANON: recompute the canonical coinbase a receipt commits and compare it with the
     // receipt's own opening (xmr_canonical_coinbase.hpp). enforce == false is ALARM mode:
@@ -210,16 +218,28 @@ public:
         return n;
     }
 
+    // CANON: enforcing, an UNDECIDABLE receipt (its coinbase cannot be reproduced here YET) is held,
+    // not pushed and not refused; tick() re-checks it until it is decided or canon_hold_ms passes.
+    // A receipt that stays undecidable is expired (never credited): every node that can decide it
+    // agrees, and one that cannot does not guess.
+    std::size_t canon_pending() const { return m_held.size(); }
+
     void on_admitted(Admitted a) {
         if (m_canon && !a.drop) {
             const canon::Result r = m_canon(a);
             if (r.v == canon::Verdict::Match) ++m_st.canon_match;
-            else if (r.v == canon::Verdict::Undecidable) ++m_st.canon_undecidable;
-            else {
+            else if (r.v == canon::Verdict::Undecidable) {
+                ++m_st.canon_undecidable;
+                if (m_canon_enforce) { hold(std::move(a)); return; }
+            } else {
                 ++m_st.canon_mismatch;
                 if (m_canon_enforce) { ++m_st.canon_refused; return; }   // not credited: the work is on another block
             }
         }
+        admit(std::move(a));
+    }
+
+    void admit(Admitted a) {
         if (m_o.order == Order::Arrival) { push_one(a, true); return; }
         if (m_any_closed && a.bin <= m_closed_through) { ++m_st.late; push_one(a, true); return; }
         m_bins[a.bin].emplace(a.id, std::move(a));
@@ -228,6 +248,7 @@ public:
     // Close every bin whose window has passed. `template_height` = the height
     // of the block this node is currently building on top of the tip.
     void tick(u64 template_height, Clock::time_point now = Clock::now()) {
+        recheck_held(now);
         if (template_height) m_tip_seen.try_emplace(template_height, now);
         while (m_tip_seen.size() > 4096) m_tip_seen.erase(m_tip_seen.begin());
         while (!m_bins.empty()) {
@@ -252,6 +273,27 @@ public:
     const Options& options() const { return m_o; }
 
 private:
+    struct Held { Admitted a; Clock::time_point since; };
+    void hold(Admitted a) {
+        if (m_held.size() >= m_o.canon_hold_max) { ++m_st.canon_expired; m_held.pop_front(); }
+        m_held.push_back(Held{std::move(a), Clock::now()});
+        ++m_st.canon_held;
+    }
+    // At most kRecheckPerTick full recomputes per tick, oldest first (a rebuild derives one key per output).
+    void recheck_held(Clock::time_point now) {
+        if (!m_canon || m_held.empty()) return;
+        constexpr std::size_t kRecheckPerTick = 16;
+        std::size_t budget = std::min(kRecheckPerTick, m_held.size());
+        for (std::size_t i = 0; i < budget && !m_held.empty(); ++i) {
+            Held h = std::move(m_held.front()); m_held.pop_front();
+            const canon::Result r = m_canon(h.a);
+            if (r.v == canon::Verdict::Match) { ++m_st.canon_match; ++m_st.canon_released; admit(std::move(h.a)); }
+            else if (r.v == canon::Verdict::Mismatch) { ++m_st.canon_mismatch; ++m_st.canon_refused; }
+            else if (now - h.since > std::chrono::milliseconds(m_o.canon_hold_ms)) ++m_st.canon_expired;
+            else m_held.push_back(std::move(h));
+        }
+    }
+    std::deque<Held> m_held;
     bool push_one(const Admitted& a, bool durable) {
         u64 next_after = 0; bytes32 dig{};
         const auto pushes = ::c2pool::v37n::xmr::fee::receipt_lane_pushes(a.r.payee, a.r.side.give_author,

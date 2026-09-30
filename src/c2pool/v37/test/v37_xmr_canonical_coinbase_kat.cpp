@@ -26,8 +26,16 @@
 //   K7  the start-up rules and the HELLO digest fold.
 //   K8  the receipt ingest hook: alarm mode counts and still pushes, enforcement
 //       refuses a mismatch before the lane, undecidable is never refused.
+//   K9  ledger_at: the builder's pending set is rebuilt from an OLDER retained
+//       ledger state (a lane block booked late, a later block removed).
+//   K10 the recompute cache: receipts of one template share the outputs and the
+//       verdict is identical to the uncached one; a different tail misses.
+//   K11 the booking decision (match / mismatch / undecidable x enforce / alarm).
+//   K12 the ingest hold: an undecidable receipt is held, released on a match,
+//       refused on a mismatch, expired after the hold bound; raindrops exempt.
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -385,6 +393,7 @@ void k6_rollback() {
 }
 
 void k7_gate() {
+    static_assert(c2pool::v37n::xmr::kCanonOutputCap == 256, "update the --canonical-coinbase help text in main_v37_xmr.cpp");
     std::printf("== K7. start-up rules and the HELLO digest ==\n");
     using c2pool::v37n::xmr::canon_refusal;
     CHECK(canon_refusal(false, true, true, true, 1, 0).empty(), "testnet: canon v1 + fee v1 accepted");
@@ -428,9 +437,117 @@ void k8_ingest() {
     run(cn::Verdict::Mismatch, true, st);
     CHECK(st.canon_mismatch == 1 && st.canon_refused == 1 && st.pushed == 1, "enforcing: the mismatching receipt never reaches the lane (refused=%llu pushed=%llu)", (unsigned long long)st.canon_refused, (unsigned long long)st.pushed);
     run(cn::Verdict::Undecidable, true, st);
-    CHECK(st.canon_undecidable == 1 && st.canon_refused == 0 && st.pushed == 2, "enforcing: an undecidable receipt is counted, not refused here");
+    CHECK(st.canon_undecidable == 1 && st.canon_refused == 0 && st.canon_held == 1 && st.pushed == 1,
+          "enforcing: an undecidable receipt is counted and HELD (not refused, not pushed); the raindrop is exempt");
     run(cn::Verdict::Match, true, st);
     CHECK(st.canon_match == 1 && st.pushed == 2, "a match passes");
+}
+
+void k9_ledger_at() {
+    std::printf("== K9. ledger_at from an older retained state ==\n");
+    Lane b = make_lane();
+    const o2::OwedLedger snapshot = b.L;   // the state a verifier retained when this digest became current
+    const ::v37::bytes32 oldest = id_of(ref_of(11));
+    const long long bal = b.L.finalW().at(oldest);
+    b.L.on_block_found("X", Amounts{}, Amounts{{oldest, bal}});   // booked AFTER the snapshot, at height H-1
+    auto t = assemble(b.cfg, b.L, b.pay_of());
+    if (!t) { CHECK(false, "builder template"); return; }
+    const Seen s = see(*t, 1);
+    const std::uint64_t H = s.f.height;
+    // the verifier moved on: a later finalize (another digest) + pending X and Y (Y at H, after the coinbase)
+    Lane v = make_lane();
+    v.owe(payees_of({15})[0], 123456789);
+    const ::v37::bytes32 second = id_of(ref_of(12));
+    const cn::Result stale = check_receipt(v, s, v.pay_of());
+    CHECK(stale.v == cn::Verdict::Undecidable, "the live state is at another digest -> %s", cn::to_string(stale.v));
+    const std::vector<cn::Booked> booked = {
+        {"X", H - 1, Amounts{}, Amounts{{oldest, bal}}},
+        {"Y", H, Amounts{}, Amounts{{second, 1000}}}};
+    v.L.on_block_found("X", Amounts{}, Amounts{{oldest, bal}});
+    v.L.on_block_found("Y", Amounts{}, Amounts{{second, 1000}});
+    const o2::OwedLedger rolled = cn::ledger_at(snapshot, booked, H);
+    CHECK(rolled.is_pending("X") && !rolled.is_pending("Y") && rolled.owed_digest() == snapshot.owed_digest(),
+          "X (below H) is booked again over the snapshot, Y (at H) is not; the finalized partition is the snapshot's");
+    const cn::Result ok = check_receipt(v, s, v.pay_of(), &rolled);
+    CHECK(ok.v == cn::Verdict::Match, "the honest builder matches against the reconstructed state: %s %s", cn::to_string(ok.v), ok.why.c_str());
+    const o2::OwedLedger live_rolled = cn::ledger_at(v.L, booked, H);
+    CHECK(live_rolled.is_pending("X") && !live_rolled.is_pending("Y"), "with base == the live ledger it is ledger_before");
+}
+
+void k10_cache() {
+    std::printf("== K10. the recompute cache ==\n");
+    Lane b = make_lane(), v = make_lane();
+    auto t = assemble(b.cfg, b.L, b.pay_of());
+    if (!t) { CHECK(false, "builder template"); return; }
+    cn::Cache cache;
+    bool all = true;
+    for (std::uint32_t en : {0u, 7u, 99u, 123456u}) {
+        const Seen s = see(*t, en);
+        const cn::Expected c = cn::expected_coinbase_cached(cache, "st1", 4 + 32, v.cfg, v.L, v.pay_of(), s.f);
+        const cn::Expected u = cn::expected_coinbase(v.cfg, v.L, v.pay_of(), s.f);
+        all = all && c.ready() && u.ready() && c.cb.prefix == u.cb.prefix && c.cb.tx_extra == u.cb.tx_extra &&
+              cn::verify_opening(c, s.opening).v == cn::Verdict::Match;
+    }
+    CHECK(all, "cached == uncached (prefix, tx_extra) and Match at four extra nonces");
+    CHECK(cache.misses == 1 && cache.hits == 3, "one rebuild, three hits (hits=%llu misses=%llu)", (unsigned long long)cache.hits, (unsigned long long)cache.misses);
+    {   // a tampered builder has another tail: the cache must not answer for it
+        Lane b2 = make_lane();
+        auto t2 = assemble(b2.cfg, b2.L, b2.pay_of(), [](asm_::AssemblyInputs& a, const o2::XmrOwedSettlementSource& src) {
+            a.extra_nonce_tail[src.reward_tail_offset() + 4] ^= 1; });
+        const Seen s2 = see(*t2, 7);
+        const cn::Expected e2 = cn::expected_coinbase_cached(cache, "st1", 4 + 32, v.cfg, v.L, v.pay_of(), s2.f);
+        CHECK(cn::verify_opening(e2, s2.opening).v == cn::Verdict::Mismatch, "a receipt with another tail is not answered from the cache");
+    }
+    {   // a different state key misses
+        const Seen s = see(*t, 5);
+        const std::uint64_t m0 = cache.misses;
+        (void)cn::expected_coinbase_cached(cache, "st2", 4 + 32, v.cfg, v.L, v.pay_of(), s.f);
+        CHECK(cache.misses == m0 + 1, "another ledger state key rebuilds");
+    }
+}
+
+void k11_decision() {
+    std::printf("== K11. booking decision ==\n");
+    using cn::BookAs; using cn::Verdict;
+    CHECK(cn::book_decision(Verdict::Match, true) == BookAs::Normal, "match + enforcing -> normal");
+    CHECK(cn::book_decision(Verdict::Mismatch, true) == BookAs::PayoutOnly, "mismatch + enforcing -> debit its payouts, drop its credit");
+    CHECK(cn::book_decision(Verdict::Undecidable, true) == BookAs::Hold, "undecidable + enforcing -> hold (never refuse)");
+    CHECK(cn::book_decision(Verdict::Mismatch, false) == BookAs::Normal && cn::book_decision(Verdict::Undecidable, false) == BookAs::Normal,
+          "alarm-only: everything books as before");
+}
+
+void k12_hold() {
+    std::printf("== K12. the ingest hold ==\n");
+    namespace rl = c2pool::v37n::xmr::relay;
+    using Clock = std::chrono::steady_clock;
+    cn::Verdict now_v = cn::Verdict::Undecidable;
+    std::uint64_t pos = 0;
+    rl::XmrReceiptIngest::Options o; o.chain = kChain; o.order = rl::XmrReceiptIngest::Order::Arrival; o.canon_hold_ms = 1000;
+    rl::XmrReceiptIngest ing(o,
+        [&](const ::v37::ScriptRef&, std::uint64_t, std::uint64_t& next_after, ::v37::bytes32& dg) { next_after = ++pos; dg = {}; return true; },
+        [](const rl::Admitted&, std::uint64_t, std::uint32_t, std::uint64_t, const ::v37::bytes32&) {});
+    ing.set_canon_check([&](const rl::Admitted&) { return cn::Result{now_v, "x"}; }, true);
+    rl::Admitted a; a.r.payee = ref_of(41); a.id[0] = 1;
+    rl::Admitted b = a; b.id[0] = 2;
+    ing.on_admitted(a); ing.on_admitted(b);
+    CHECK(ing.canon_pending() == 2 && ing.stats().pushed == 0 && ing.stats().canon_held == 2, "two undecidable receipts are held, nothing pushed");
+    const auto t0 = Clock::now();
+    ing.tick(0, t0 + std::chrono::milliseconds(100));
+    CHECK(ing.canon_pending() == 2, "still undecidable within the hold bound: kept");
+    now_v = cn::Verdict::Match;
+    ing.tick(0, t0 + std::chrono::milliseconds(200));
+    CHECK(ing.canon_pending() == 0 && ing.stats().pushed == 2 && ing.stats().canon_released == 2, "decided Match: released into the lane (pushed=%llu)", (unsigned long long)ing.stats().pushed);
+    now_v = cn::Verdict::Undecidable;
+    rl::Admitted c = a; c.id[0] = 3;
+    ing.on_admitted(c);
+    now_v = cn::Verdict::Mismatch;
+    ing.tick(0, Clock::now() + std::chrono::milliseconds(50));
+    CHECK(ing.canon_pending() == 0 && ing.stats().pushed == 2 && ing.stats().canon_refused == 1, "decided Mismatch later: refused, never pushed");
+    now_v = cn::Verdict::Undecidable;
+    rl::Admitted d = a; d.id[0] = 4;
+    ing.on_admitted(d);
+    ing.tick(0, Clock::now() + std::chrono::milliseconds(5000));
+    CHECK(ing.canon_pending() == 0 && ing.stats().canon_expired == 1 && ing.stats().pushed == 2, "still undecidable past the hold bound: expired, not credited");
 }
 
 }  // namespace
@@ -445,6 +562,10 @@ int main() {
     k6_rollback();
     k7_gate();
     k8_ingest();
+    k9_ledger_at();
+    k10_cache();
+    k11_decision();
+    k12_hold();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

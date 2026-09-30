@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -100,6 +101,45 @@ inline o2::OwedLedger ledger_before(const o2::OwedLedger& live,
     for (const auto& [bid, payout] : pending_from)
         if (l.is_pending(bid)) l.on_block_orphaned(bid, payout);
     return l;
+}
+
+// A lane block this node has booked (the finalize driver's FoundBlock, reduced).
+struct Booked {
+    std::string           bid;
+    std::uint64_t         height = 0;
+    o2::OwedLedger::Amounts credit, payout;
+};
+
+// The builder's ledger from ANY retained state `base` of this node's ledger (the live
+// one or an older snapshot): the canonical lane blocks booked at height >= `height`
+// are removed again (pre-SETTLED orphan = pure removal), and the canonical lane blocks
+// booked at height < `height` that `base` has neither pending nor settled are booked
+// again, so the pending set is exactly "every lane block below the coinbase's height".
+// With base == the live ledger this is ledger_before.
+inline o2::OwedLedger ledger_at(const o2::OwedLedger& base, const std::vector<Booked>& booked, std::uint64_t height) {
+    o2::OwedLedger l = base;
+    for (const auto& b : booked) {
+        if (b.height >= height) { if (l.is_pending(b.bid)) l.on_block_orphaned(b.bid, b.payout); }
+        else if (!l.is_pending(b.bid) && !l.is_settled(b.bid)) l.on_block_found(b.bid, b.credit, b.payout);
+    }
+    return l;
+}
+
+// What to do with a LANE block at booking time, given the verdict. The chain stays
+// the authority on WHAT was paid; the rule decides whether the block also earns credit.
+enum class BookAs : std::uint8_t {
+    Normal,       // credit + payout, as before
+    PayoutOnly,   // a recognised but non-canonical block: debit its payouts, credit nothing, no DROPS delta
+    Hold,         // cannot decide yet: retry per ledger event (cut-pending family), never refuse
+};
+inline BookAs book_decision(Verdict v, bool enforce) {
+    if (!enforce) return BookAs::Normal;            // alarm mode only counts
+    switch (v) {
+        case Verdict::Match: return BookAs::Normal;
+        case Verdict::Mismatch: return BookAs::PayoutOnly;
+        case Verdict::Undecidable: return BookAs::Hold;
+    }
+    return BookAs::Hold;
 }
 
 // Recompute the canonical coinbase for `f`. `cfg` is this node's settlement
@@ -188,6 +228,57 @@ inline Expected expected_coinbase(const o2::XmrSettlementConfig& cfg, const o2::
     e.cb = src->build_at(*total, en);
     if (!e.cb.ok) return mism("canonical build refused: " + e.cb.detail);
     e.pre = {Verdict::Match, {}};
+    return e;
+}
+
+// A small cache of recomputed coinbases. Every receipt of one template shares the
+// outputs (the expensive part: one key derivation per output); only the 0x02 nonce and
+// rbind bytes differ. A hit re-serialises the prefix around the receipt's own payload,
+// so the comparison still runs over the receipt's real bytes. The caller's `state_key`
+// must change whenever the verifier's ledger / pending set changes.
+struct Cache {
+    std::deque<std::pair<std::string, Expected>> m;
+    std::size_t cap = 8;
+    std::uint64_t hits = 0, misses = 0;
+};
+
+inline std::vector<unsigned char> reserialize_prefix(const Expected& e, const std::vector<std::uint8_t>& payload,
+                                                     std::vector<unsigned char>& tx_extra_out) {
+    // prefix = head || varint(len(tx_extra)) || tx_extra ; only tx_extra depends on the payload
+    const std::size_t old_len = e.cb.tx_extra.size();
+    std::size_t vlen = 0; for (std::uint64_t v = old_len; ; v >>= 7) { ++vlen; if (v < 0x80) break; }
+    const std::size_t head = e.cb.prefix.size() - old_len - vlen;
+    tx_extra_out = x6::assemble_tx_extra(e.cb.R, std::vector<unsigned char>(payload.begin(), payload.end()), e.cb.mm_root);
+    std::vector<unsigned char> out(e.cb.prefix.begin(), e.cb.prefix.begin() + static_cast<std::ptrdiff_t>(head));
+    for (std::uint64_t v = tx_extra_out.size(); ; ) { const unsigned char c = static_cast<unsigned char>(v & 0x7f); v >>= 7; out.push_back(v ? (c | 0x80) : c); if (!v) break; }
+    out.insert(out.end(), tx_extra_out.begin(), tx_extra_out.end());
+    return out;
+}
+
+inline Expected expected_coinbase_cached(Cache& cache, const std::string& state_key, std::size_t skip_bytes,
+                                         const o2::XmrSettlementConfig& cfg, const o2::OwedLedger& ledger,
+                                         const o2::PayOfFn& pay_of, const BlockFacts& f) {
+    const auto nf = credit::extra_nonce_field(f.tx_extra);
+    std::string key;
+    if (nf && nf->size() > skip_bytes) {
+        key = state_key; key += '|'; key += std::to_string(f.height); key += '|'; key += std::to_string(f.major);
+        key.append(reinterpret_cast<const char*>(f.prev_id.data()), 32);
+        key.append(reinterpret_cast<const char*>(nf->data() + skip_bytes), nf->size() - skip_bytes);
+        for (auto& [k, e] : cache.m) if (k == key && e.ready()) {
+            ++cache.hits;
+            Expected out = e;
+            std::vector<unsigned char> extra;
+            const std::vector<unsigned char> prefix = reserialize_prefix(e, *nf, extra);
+            out.payload = *nf; out.cb.tx_extra = std::move(extra); out.cb.prefix = prefix;
+            return out;
+        }
+    }
+    ++cache.misses;
+    Expected e = expected_coinbase(cfg, ledger, pay_of, f);
+    if (!key.empty() && e.ready()) {
+        cache.m.emplace_back(key, e);
+        while (cache.m.size() > cache.cap) cache.m.pop_front();
+    }
     return e;
 }
 

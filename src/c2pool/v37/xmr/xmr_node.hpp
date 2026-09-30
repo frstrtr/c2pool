@@ -521,6 +521,28 @@ public:
             std::to_string(m_finalize->cursor_height()) + " unchanged");
         return true;
     }
+    // CANON: the ledger STATES the boot replay lived through, the last `keep` digest
+    // changes, oldest first. A coinbase commits the owed_digest its builder's ledger had;
+    // a node that restarted has lost every older state, so it replays the event log once
+    // more and keeps the recent ones (the verifier's base for blocks built below the live
+    // digest). Empty on a torn or missing store.
+    std::vector<std::pair<::v37::bytes32, OwedLedger>> boot_ledger_states(std::size_t keep) {
+        std::vector<std::pair<::v37::bytes32, OwedLedger>> out;
+        if (!m_store || keep == 0) return out;
+        const std::size_t total = m_boot_digests.size();
+        const std::size_t from = total > keep ? total - keep : 0;
+        OwedLedger fresh(m_cfg.lane_chain);
+        RecoveryDriver rec(*m_store, m_cfg.lane_chain);
+        std::size_t idx = 0;
+        ::v37::bytes32 last = fresh.owed_digest();
+        bool ok = false;
+        rec.recover(fresh, ok, {}, [&](const OwedLedger& l, const SettleEvent&) {
+            const ::v37::bytes32 d = l.owed_digest();
+            if (!(last == d)) { ++idx; last = d; if (idx >= from) out.emplace_back(d, l); }
+        });
+        if (!ok) out.clear();
+        return out;
+    }
     std::uint64_t relineages() const noexcept { return m_relineages; }
     ISettleStore& store() { return *m_store; }
     std::string   store_dir() const { return XmrNodeConfig_resolved(m_cfg); }
