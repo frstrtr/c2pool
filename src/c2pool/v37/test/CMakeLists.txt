@@ -1855,6 +1855,24 @@ if (BUILD_TESTING)
     target_link_libraries(v37_1_ridge_activation_test Threads::Threads)
     add_test(NAME v37_1_ridge_activation_test COMMAND v37_1_ridge_activation_test)
 
+    # V37.1 WIDTH LAW fixed point (research: docs/research/window-pulse/):
+    # the positional form is unchanged bit for bit, the native ridge measures
+    # its rate over the period's own span and settles at C * D / rate.
+    add_executable(v37_1_width_law_kat v37_1_width_law_kat.cpp)
+    target_compile_features(v37_1_width_law_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_1_width_law_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_1_width_law_kat Threads::Threads)
+    add_test(NAME v37_1_width_law_kat COMMAND v37_1_width_law_kat)
+
+    # XMR WINDOW vs PULSING HASHRATE (review "window deflation"): the shipped
+    # positional window through the REAL Lane pays a pulser, the miners it
+    # deflates and a schedule-aware hopper exactly their work's worth.
+    add_executable(v37_xmr_window_pulse_kat v37_xmr_window_pulse_kat.cpp)
+    target_compile_features(v37_xmr_window_pulse_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_window_pulse_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_window_pulse_kat Threads::Threads)
+    add_test(NAME v37_xmr_window_pulse_kat COMMAND v37_xmr_window_pulse_kat)
+
     # RDWR-OQ2 DROPS ACTIVATION — the gate-ON owed_digest MINT over the CORRECTED
     # replace-not-add composition, its regression KAT, and the conformance pins
     # for the three consumer seams that make DROPS reachable on a live node.
