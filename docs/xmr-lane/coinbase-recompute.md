@@ -230,6 +230,46 @@ nothing checked them.
   answer is trusted on the winner's word: an honest winner never holds a
   refused receipt in its lane.
 
+## 6a. Proving a balance to a light client (paper §13)
+
+The daemon runs `OwedLedgerRules::merkle_rows` together with the anchor rule.
+`owed_digest` is then a Merkle root over the balances:
+
+```
+leaf        = sha256d("V37L" || key || i64 finalW || u64 first_eligible)   (non-zero rows, key order)
+node        = sha256d("V37M" || left || right)       (an odd last node is carried up)
+rest        = sha256d("V37X" || the V37K / V37A sections)
+owed_digest = sha256d("V37Y" || u64 rows || root || rest)
+```
+
+The 0x03 root of every lane block commits
+`keccak(domain || chain || owed_digest)`, exactly as before.
+
+`xmr_light_proof.hpp` builds and checks the whole path from a Monero header
+to one balance:
+
+1. the hashing blob;
+2. the coinbase opening: the 200-byte Keccak midstate, a tail under 136
+   bytes, and tx_extra;
+3. the tx-tree branch;
+4. the balance path, `ceil(log2(rows))` hashes.
+
+The device checks the returned block id against its own header chain and
+Monero's PoW. No share-chain data is needed.
+
+The proved balance is the finalized one of the state the block commits, that
+is, its booking point.
+
+Pinned by `v37_xmr_light_proof_kat` LP1..LP5:
+- off is the flat digest, byte for byte;
+- every key of 1..33 rows is proved;
+- 1000 rows need a 10-hash path;
+- every tampering is refused: balance, age, key, index, count, sibling, rest,
+  0x03 root, chain, tree branch, another state.
+
+The rehearsal runs its anchor scenarios with the rule on: three nodes, one
+digest.
+
 ## 7. Known limits and follow-ups
 
 * **Cap latitude.** The recompute accepts any cap that reproduces the block,

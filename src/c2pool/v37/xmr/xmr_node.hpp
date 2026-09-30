@@ -99,6 +99,7 @@ public:
         r.decay_horizon = m_cfg.ledger_decay_horizon;
         r.decay_half_life = m_cfg.ledger_decay_half_life;
         r.anchor_cut = m_cfg.ledger_anchor_cut;
+        r.merkle_rows = m_cfg.ledger_merkle_rows;
         return r;
     }
 
