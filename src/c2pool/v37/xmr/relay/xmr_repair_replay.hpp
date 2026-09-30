@@ -239,7 +239,7 @@ public:
             s.pushes.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(P, (body - o) / 11 + 1)));
             for (std::uint64_t k = 0; k < P; ++k) {
                 std::uint64_t kind = 0, len = 0, w = 0;
-                if (!get(1, kind) || !get(2, len) || len > 64 || o + len > body) return bad("bad push record");
+                if (!get(1, kind) || !get(2, len) || len > 255 || o + len > body) return bad("bad push record");   // A2: 132-byte composite refs
                 ::v37::ScriptRef ref; ref.kind = static_cast<::v37::ScriptKind>(kind);
                 ref.payload.assign(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + len)); o += len;
                 if (!get(8, w)) return bad("bad push record");

@@ -63,6 +63,7 @@
 #include <c2pool/v37/v37_drops_enrollment.hpp>   // ★ R-SYBIL: the ex-ante enrolment book  // RDWR-OQ2 DROPS estimator (merged, gated)
 #include <sharechain/v37/v37_lane_executor.hpp>  // LaneSnapshot, IdentityView
 #include <sharechain/v37/v37_descriptor.hpp>     // ScriptRef, ScriptKind
+#include <sharechain/v37/v37_descriptor_xmr.hpp> // A2: XMR_LANE_GA split in project()
 #include <sharechain/v37/v37_fixed.hpp>          // U256, u64
 #include <sharechain/v37/v37_hash.hpp>           // bytes32, sha256d
 #include <c2pool/v37/w4_owed_incremental.hpp>    // R3: DigestMemo, EffectiveOwedIndex
@@ -220,7 +221,31 @@ inline std::vector<WeightedPayee> project(const View& v,
         out.push_back(WeightedPayee{e->key, w, e->pay});
     }
     if (unresolved) *unresolved = miss;
-    return out;
+    // A2: a composite give_author lane identity (XMR_LANE_GA) is split here,
+    // once, for every consumer. Fast path: no composite -> the vector above,
+    // byte-identical to before A2.
+    bool any_ga = false;
+    for (const auto& wp : out) if (wp.pay.kind == ::v37::xmr::XMR_LANE_GA) { any_ga = true; break; }
+    if (!any_ga) return out;
+    std::vector<WeightedPayee> merged;
+    std::map<bytes32, std::size_t> at;          // key -> index in `merged` (first appearance)
+    auto add = [&](const bytes32& key, const U256& w, const ScriptRef& pay) {
+        if (w.is_zero()) return;
+        auto it = at.find(key);
+        if (it == at.end()) { at.emplace(key, merged.size()); merged.push_back(WeightedPayee{key, w, pay}); }
+        else merged[it->second].weight += w;
+    };
+    for (const auto& wp : out) {
+        ::v37::xmr::XmrGiveAuthor g;
+        if (wp.pay.kind == ::v37::xmr::XMR_LANE_GA && ::v37::xmr::decode_xmr_give_author(wp.pay, g)) {
+            const auto sp = ::v37::xmr::xmr_ga_split(wp.weight, g.d);
+            add(::v37::xmr::xmr_identity_key(g.payee), sp.payee, g.payee);
+            add(::v37::xmr::xmr_identity_key(g.donation), sp.donation, g.donation);
+        } else {
+            add(wp.key, wp.weight, wp.pay);
+        }
+    }
+    return merged;
 }
 
 // E_b = split(reward, project(view)) as a key→amount map (per-block entitlement).

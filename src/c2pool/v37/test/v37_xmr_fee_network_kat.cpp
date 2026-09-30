@@ -207,11 +207,14 @@ void suite_pushes() {
     std::printf("== P. give-author pushes pay this network's donation ==\n");
     const ::v37::ScriptRef miner = ::v37::xmr::make_xmr_std(point_of(5), point_of(6));
     for (Net n : kNets) {
+        // A2: ONE push of weight 65535 whose composite identity names this network's donation.
         const auto p = pushes_of(miner, 655, n);
-        CHECK(p.size() == 2 && p[0].first == miner && p[0].second == 65535 - 655 && p[1].first == ref_of(n) && p[1].second == 655,
-              "P1 %s: d=655 -> (miner, 64880), (donation[%s], 655)", name(n), name(n));
+        ::v37::xmr::XmrGiveAuthor g;
+        const bool one = p.size() == 1 && p[0].second == 65535 && ::v37::xmr::decode_xmr_give_author(p[0].first, g);
+        CHECK(one && g.d == 655 && g.payee == miner && g.donation == ref_of(n),
+              "P1 %s: d=655 -> ONE push (composite(655, miner, donation[%s]), 65535)", name(n), name(n));
         if (n != Net::Mainnet)
-            CHECK(p.size() == 2 && !(p[1].first == fee::donation_ref()), "P2 %s: the donation push does NOT pay the mainnet identity", name(n));
+            CHECK(one && !(g.donation == fee::donation_ref()), "P2 %s: the composite does NOT name the mainnet donation", name(n));
     }
 }
 

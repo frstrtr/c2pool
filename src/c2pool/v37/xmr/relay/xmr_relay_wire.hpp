@@ -1003,6 +1003,7 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
         le::put64(b, ::c2pool::v37n::xmr::fee::kFeeReceiptWeight);
         le::putb(b, ::c2pool::v37n::xmr::fee::donation_identity(
                         static_cast<::c2pool::v37n::xmr::fee::DonationNet>(network)));
+        le::put32(b, ::c2pool::v37n::xmr::fee::kFeeLanePushRule);   // A2: one lane position per receipt
     }
     return keccak_bytes(b);
 }

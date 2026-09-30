@@ -378,19 +378,27 @@ inline SplitWeight split_receipt_weight(std::uint64_t w, std::uint16_t d) {
 }
 
 // ---------------------------------------------------------------------------
-// The lane pushes of ONE PoW-committed receipt (every node, same order).
-//   gate OFF: (payee, off_weight)                 -- byte-identical to master
-//   gate ON : (payee, 65535 - d) [+ (donation, d) iff d > 0], d = the receipt's
-//             OWN give_author u16 (side_data_v2), never the folding node's.
+// The lane push of ONE PoW-committed receipt (every node, same order).
+//   gate OFF: (payee, off_weight)                  -- byte-identical to master
+//   gate ON : exactly ONE push of weight 65535 (A2, kFeeLanePushRule = 2), so
+//             a receipt takes ONE lane position whatever its d:
+//               d == 0      -> (payee, 65535)
+//               d == 65535  -> (donation, 65535)
+//               otherwise   -> (composite(d, payee, donation), 65535); the
+//                              settlement projection splits its weight
+//                              floor(W*d/65535) to the donation, the rest to
+//                              the payee (settle::project, xmr_ga_split).
+//             d = the receipt's OWN give_author u16 (side_data_v2).
 // ---------------------------------------------------------------------------
+inline constexpr std::uint32_t kFeeLanePushRule = 2;
 inline std::vector<std::pair<::v37::ScriptRef, std::uint64_t>>
 receipt_lane_pushes(const ::v37::ScriptRef& payee, std::uint16_t give_author, bool fee_on,
                     std::uint64_t off_weight = 1, DonationNet net = DonationNet::Mainnet) {
     std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> v;
     if (!fee_on) { v.emplace_back(payee, off_weight); return v; }
-    const SplitWeight s = split_receipt_weight(kFeeReceiptWeight, give_author);
-    if (s.miner) v.emplace_back(payee, s.miner);
-    if (s.donation) v.emplace_back(donation_ref(net), s.donation);
+    if (give_author == 0) v.emplace_back(payee, kFeeReceiptWeight);
+    else if (give_author >= kGiveAuthorScale) v.emplace_back(donation_ref(net), kFeeReceiptWeight);
+    else v.emplace_back(::v37::xmr::make_xmr_give_author(give_author, payee, donation_ref(net)), kFeeReceiptWeight);
     return v;
 }
 

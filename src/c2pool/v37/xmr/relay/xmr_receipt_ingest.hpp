@@ -31,10 +31,11 @@
 // kReceiptWeight, flags 0} -- the record shape the credit-feed stand-in wrote,
 // so for a given order the lane is byte-identical to the stand-in's (master).
 // FeeModelGate ON (Options::fee_model, ruling S3): each receipt is pushed at
-// fee::kFeeReceiptWeight split by the give-author u16 it CARRIES in its
-// PoW-committed side_data_v2 -- (payee, 65535 - d) then (donation, d) iff
-// d > 0 (fee::receipt_lane_pushes) -- so one receipt spans 1 or 2 lane
-// positions, recorded as (pos_first, n_pushes) for the vault / repair.
+// fee::kFeeReceiptWeight as ONE push (A2, fee::receipt_lane_pushes): the payee
+// (d == 0), the donation (d == 65535) or the composite (d, payee, donation)
+// whose weight settle::project() splits by the give-author u16 the receipt
+// CARRIES in its PoW-committed side_data_v2 -- so one receipt spans exactly
+// one lane position, recorded as (pos_first, n_pushes = 1) for the vault / repair.
 //
 // DURABILITY: every pushed receipt is appended to <data-dir>/lane<chain>.receipts
 // as [u32 LE len][fb_receipt]. At boot the file is replayed IN ITS OWN ORDER

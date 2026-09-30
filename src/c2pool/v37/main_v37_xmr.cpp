@@ -2089,7 +2089,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
         }
         std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;   // the served [a0, P)
-        pushes.reserve(ids.size() * 2);
+        pushes.reserve(ids.size());   // A2: one push per receipt
         const bool fee_on = c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params);
         for (const auto& id : ids) {
             ::v37::ScriptRef payee; std::uint16_t give_author = 0;
