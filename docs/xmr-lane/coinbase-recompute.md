@@ -220,9 +220,13 @@ nothing checked them.
   (the ledger anchor, the store, a restart) and `v37_xmr_mainnet_rehearsal_kat`
   M11 / M11b (3 nodes, every block canonical, one anchor, exact
   conservation).
-* **Open.** An uncached verdict costs about 3.6 ms (one canonical rebuild).
-  A per-template cache (one rebuild per template, then one Keccak per share)
-  is a follow-up. A receipt a node could not decide but admitted as a repair
+* **Cost.** Every share of one template has the same canonical outputs:
+  they depend on the state, the parent, the height and the 0x02 tail from
+  V37R on, not on the worker head. The first canonical share of a template
+  is rebuilt (about 3.5 ms) and its prefix cached per state; a later share
+  splices its own 0x02 payload into it and compares one Keccak (about 3 µs,
+  `v37_xmr_share_verdict_kat` S10). A refused share is never cached.
+* **Open.** A receipt a node could not decide but admitted as a repair
   answer is trusted on the winner's word: an honest winner never holds a
   refused receipt in its lane.
 
