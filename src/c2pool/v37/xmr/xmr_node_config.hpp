@@ -42,6 +42,15 @@ namespace c2pool::v37n::xmr {
 inline constexpr std::uint32_t kXmrDropsFloorShift = 6;
 inline constexpr std::uint32_t kXmrCreditModeCount = 2;
 
+// DUST DECAY, in MONERO HEIGHTS (audit A9). The decay clock is the FINALIZE
+// bin_height, a Monero height, so its constants are named as heights here and
+// no longer borrowed from the lane's window / half-life, which count lane
+// POSITIONS. Same values as before (no consensus change): a gone key's
+// balance below c waits 8640 blocks (12 days at 120 s) for its miner to come
+// back, then halves every 2160 blocks (3 days).
+inline constexpr std::uint64_t kXmrDustDecayHorizonHeights  = 8640;
+inline constexpr std::uint64_t kXmrDustDecayHalfLifeHeights = 2160;
+
 // The XMR lane's default parameters: node_lane_params_no_kind(), and, when the
 // build arms DROPS, the Count estimator in place of the K-min one. K-min spends
 // a fixed budget of K order statistics per identity and branches on J < K, so on
@@ -313,8 +322,8 @@ struct XmrNodeConfig {
     // the tail subsidy); off here so fixtures keep their golden digests.
     long long       ledger_arm_floor = 0;
     bool            ledger_rotate_on_payment = false;
-    std::uint64_t   ledger_decay_horizon = 0;      // dust decay (payout-threshold.md §5): the lane window
-    std::uint64_t   ledger_decay_half_life = 0;    // ... and the lane half-life, in bins
+    std::uint64_t   ledger_decay_horizon = 0;      // dust decay (payout-threshold.md §5), Monero heights
+    std::uint64_t   ledger_decay_half_life = 0;    // ... and its half-life, Monero heights
     bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so

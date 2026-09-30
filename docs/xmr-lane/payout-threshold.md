@@ -95,6 +95,14 @@ into one transaction for pool members is a later stage (§7).
      and comes off the waiting payees' credit for this block. This is
      P2Pool's rule for outputs that do not fit. Their work stays in the window
      and earns in the next blocks.
+* **A balance below c is paid when there is room** (ruling 2026-09-30,
+  audit A8). The owed pass takes only balances at or above c. Every other
+  positive balance is then paid, in the salted order
+  `sha256d("V37T" ‖ prev_id ‖ identity)`, in the slots the pay-now admission
+  leaves free. A payee that already has an output here needs no slot. Each is
+  paid `min(balance, cash left)` before this block's pay-now pool is split:
+  debt before pay-now, as the owed pass is. An owed balance never waits while
+  a block has a slot for it (`v37_xmr_spend_floor_kat` F12).
 * **Never an advance** (ruling 2026-09-29). Pay-now is a flow. A miner that
   leaves or changes address never returns work paid ahead, so no payee is
   paid more than it is credited. The redistribution is booked as a credit
@@ -135,7 +143,10 @@ and on the HTTP status.
 ## 5. Abandoned dust
 
 Implemented (`OwedLedgerRules::decay_horizon`, `decay_half_life`; the daemon
-sets them to the lane's `window` = 8640 and `half_life` = 2160 bins).
+sets them to 8640 and 2160 **Monero heights**, the FINALIZE clock:
+`kXmrDustDecayHorizonHeights` / `kXmrDustDecayHalfLifeHeights`, 12 and 3 days
+at 120 s. They are named as heights, not borrowed from the lane's window and
+half-life, which count lane positions; audit A9).
 
 * **Only a gone miner.** A balance below the floor decays only after its key
   is **passed by**: a lane block credits other keys but not it. While a miner
@@ -143,8 +154,8 @@ sets them to the lane's `window` = 8640 and `half_life` = 2160 bins).
   active miner, however small, is never decayed. A pool that finds no block
   decays nobody.
 * **Grace, then halving.** From the bin it was passed by, the balance is kept
-  for one more lane window to come back. Then it halves at the FINALIZE that
-  enters each lane half-life, down to 0, and the row is removed. A new credit
+  for 8640 more heights to come back. Then it halves at the FINALIZE that
+  enters each 2160-height half-life, down to 0, and the row is removed. A new credit
   clears the state.
 * **Never a donation.** The write-off only lowers the pool's liability: the
   cash behind that balance already paid older debts. Each FINALIZE that
@@ -153,10 +164,16 @@ sets them to the lane's `window` = 8640 and `half_life` = 2160 bins).
 * **Negative rows and balances at or above the floor never decay.**
 * **Committed.** The decay state (the bin a key was passed by, the halvings
   applied) is part of `owed_digest` (tag `V37K`), so every node decays alike.
-* Pinned by `v37_xmr_spend_floor_kat` F10 and rehearsal M10. In M10, 20 tiny
-  miners leave: over 99% of their dust is written off, by the same amount on
-  every node. The 20 that stay lose nothing: credited − paid equals balance,
-  exactly.
+* **Paid first when there is room** (§3, A8). A balance below c is paid in
+  any block with a free slot and cash left, so decay only reaches dust that
+  had no room: a block overflowing its slots, or a pool whose cash the older
+  debts take.
+* Pinned by `v37_xmr_spend_floor_kat` F10 and F12, and by rehearsal M10 and
+  M10b:
+  - M10: 20 tiny miners leave while every block has room. Their dust is paid
+    in full and nothing decays.
+  - M10b: the same miners leave, but the old debts take every pool. Their dust
+    waits and decays by the same amount on every node.
 
 ## 6. Seniority from the threshold
 
