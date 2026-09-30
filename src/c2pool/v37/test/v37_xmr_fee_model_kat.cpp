@@ -152,6 +152,19 @@ void suite_address() {
 // ---------------------------------------------------------------------------
 // Suite B -- give-author u16 carried in the receipt
 // ---------------------------------------------------------------------------
+// A2: split one lane push into its settlement pieces (what settle::project does
+// to a composite's aggregated weight; a plain ref passes through).
+static std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pieces(const std::pair<::v37::ScriptRef, std::uint64_t>& p) {
+    std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> v;
+    ::v37::xmr::XmrGiveAuthor g;
+    if (::v37::xmr::decode_xmr_give_author(p.first, g)) {
+        const auto sp = ::v37::xmr::xmr_ga_split(::v37::U256::from_u128(p.second), g.d);
+        if (sp.payee.v[0]) v.emplace_back(g.payee, sp.payee.v[0]);
+        if (sp.donation.v[0]) v.emplace_back(g.donation, sp.donation.v[0]);
+    } else v.push_back(p);
+    return v;
+}
+
 void suite_give_author() {
     std::printf("== B. give-author: a u16 CARRIED IN THE RECEIPT, folded by weight ==\n");
     CHECK(fee::give_author_u16(0.0) == 0, "0%% -> u16 0 (the CCS default: off)");
@@ -208,8 +221,13 @@ void suite_give_author() {
     CHECK(p0.size() == 1 && p0[0].first == miner && p0[0].second == fee::kFeeReceiptWeight,
           "gate ON, d=0 -> ONE push (payee, 65535)");
     auto p1 = fee::receipt_lane_pushes(miner, 655, true);
-    CHECK(p1.size() == 2 && p1[0].first == miner && p1[0].second == 65535 - 655 && p1[1].first == fee::donation_ref() && p1[1].second == 655,
-          "gate ON, d=655 -> (payee, 64880) then (donation, 655): v36 att*(65535-d) / att*d");
+    ::v37::xmr::XmrGiveAuthor g1;
+    CHECK(p1.size() == 1 && p1[0].second == 65535 && ::v37::xmr::decode_xmr_give_author(p1[0].first, g1) &&
+          g1.d == 655 && g1.payee == miner && g1.donation == fee::donation_ref() && ::v37::xmr::xmr_ga_well_formed(p1[0].first),
+          "gate ON, d=655 -> ONE push (composite(655, payee, donation), 65535): one lane position per receipt (A2)");
+    const auto sp1 = pieces(p1[0]);
+    CHECK(sp1.size() == 2 && sp1[0].first == miner && sp1[0].second == 65535 - 655 && sp1[1].first == fee::donation_ref() && sp1[1].second == 655,
+          "  its settlement split: (payee, 64880) and (donation, 655): v36 att*(65535-d) / att*d, integer-exact");
     auto p2 = fee::receipt_lane_pushes(miner, 65535, true);
     CHECK(p2.size() == 1 && p2[0].first == fee::donation_ref() && p2[0].second == 65535, "gate ON, d=65535 -> the whole receipt to the donation");
     CHECK(fee::kFeeReceiptWeight == 65535 && fee::kFeeModelVersion == 1, "the pinned per-receipt weight (65535) and gate version (1)");
@@ -231,7 +249,10 @@ void suite_give_author() {
         std::map<::v37::bytes32, std::uint64_t> w;
         std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;
         for (const auto& [payee, d] : st)
-            for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) { pushes.push_back(p); w[::v37::xmr::xmr_identity_key(p.first)] += p.second; }
+            for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) {
+                pushes.push_back(p);
+                for (const auto& q : pieces(p)) w[::v37::xmr::xmr_identity_key(q.first)] += q.second;
+            }
         return std::make_pair(pushes, w);
     };
     const auto fa = fold(stream);   // "node A" (give-author 0.5%) folding
@@ -272,7 +293,9 @@ void suite_owner_fee() {
     CHECK(fee::choose_payee(miner, std::nullopt, 10000, 0, &sub) == miner && !sub, "no owner configured -> never substitutes");
     CHECK(::v37::xmr::xmr_ref_valid(owner), "the owner payee is an ordinary valid XMR ref (peer-admissible work)");
     const auto pushes = fee::receipt_lane_pushes(owner, 655, true);
-    CHECK(pushes.size() == 2 && pushes[0].first == owner, "an owner-fee receipt's lane pushes credit the OWNER (plus the donation share from its u16)");
+    ::v37::xmr::XmrGiveAuthor go;
+    CHECK(pushes.size() == 1 && ::v37::xmr::decode_xmr_give_author(pushes[0].first, go) && go.payee == owner,
+          "an owner-fee receipt's ONE lane push credits the OWNER (plus the donation share from its u16, split in project())");
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +525,7 @@ void suite_donation_blocks() {
         for (int i = 0; i < 40; ++i) stream.emplace_back((i & 1) ? mA : mB, (i & 1) ? dA : dB);
         auto ledger_of = [&](const std::vector<std::pair<::v37::ScriptRef, std::uint16_t>>& st) {
             std::map<::v37::ScriptRef, std::uint64_t> w;
-            for (const auto& [payee, d] : st) for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) w[p.first] += p.second;
+            for (const auto& [payee, d] : st) for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) for (const auto& q : pieces(p)) w[q.first] += q.second;
             std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> owed; std::uint64_t dn = 0;
             for (const auto& [ref, ww] : w) { if (ref == fee::donation_ref()) dn = ww * 1'000ull; else owed.emplace_back(ref, ww * 1'000ull); }
             return std::make_pair(owed, dn);
