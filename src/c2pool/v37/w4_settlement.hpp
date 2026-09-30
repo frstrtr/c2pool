@@ -564,8 +564,10 @@ inline subthreshold::SubthresholdParams to_subthreshold_params(
     subthreshold::SubthresholdParams sp;
     sp.enabled = p.subthreshold.enabled;          // ★ default false => gate OFF
     sp.K       = p.subthreshold.K;
-    sp.mode    = (p.subthreshold.mode == 1) ? subthreshold::CreditMode::Combined
+    sp.mode    = (p.subthreshold.mode == 2) ? subthreshold::CreditMode::Count
+               : (p.subthreshold.mode == 1) ? subthreshold::CreditMode::Combined
                                             : subthreshold::CreditMode::EstimateOnly;
+    sp.count_floor_shift = p.subthreshold.count_floor_shift;
     return sp;
 }
 

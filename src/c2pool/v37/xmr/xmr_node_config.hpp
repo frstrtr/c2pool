@@ -34,6 +34,29 @@
 
 namespace c2pool::v37n::xmr {
 
+// DROPS on the XMR lane: the raindrop floor is share_diff / 2^6 (the job
+// difficulty the node serves every miner), and the lane credits every hash
+// below it at the floor's work (SubthresholdGate mode 2, Count). One constant
+// for both, so the floor the relay admits and the floor the estimator prices
+// cannot drift apart.
+inline constexpr std::uint32_t kXmrDropsFloorShift = 6;
+inline constexpr std::uint32_t kXmrCreditModeCount = 2;
+
+// The XMR lane's default parameters: node_lane_params_no_kind(), and, when the
+// build arms DROPS, the Count estimator in place of the K-min one. K-min spends
+// a fixed budget of K order statistics per identity and branches on J < K, so on
+// the XMR geometry it is biased for small miners and pays for splitting
+// (docs/research/drops-split/). Count is exact and split-neutral, and costs
+// nothing more here: every raindrop is already relayed and verified.
+inline ::v37::LaneParams xmr_lane_params_default() {
+    ::v37::LaneParams p = ::c2pool::v37n::node_lane_params_no_kind();
+    if (p.subthreshold.enabled) {
+        p.subthreshold.mode = kXmrCreditModeCount;
+        p.subthreshold.count_floor_shift = kXmrDropsFloorShift;
+    }
+    return p;
+}
+
 // The Monero network the daemon binds to. Stagenet is the shipped default —
 // a v37 XMR node is prototype-grade and must never default to real value.
 //
@@ -165,7 +188,8 @@ struct XmrNodeConfig {
     // (LaneParams{}) today, and, if the build takes the V37.1 activation, the
     // consensus version WITHOUT ridge dimensions. An XMR ridge row is a canon
     // edit (ND-R6) with non-derivable constants: an operator ruling, not a port.
-    ::v37::LaneParams lane_params = ::c2pool::v37n::node_lane_params_no_kind();
+    // DROPS armed: the Count estimator (xmr_lane_params_default above).
+    ::v37::LaneParams lane_params = xmr_lane_params_default();
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) Monero block must be buried on

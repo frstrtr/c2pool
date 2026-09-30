@@ -149,22 +149,48 @@ E2 and E3 are the same rule at different k: E2 is `k = ∞`. One committed
 constant decides the trade between verification and small-miner variance, and
 neither setting has a sybil gradient.
 
-## Recommendation
+## Resolution (2026-09-30): E2, Count, in the first XMR release
 
-1. **Do not enable DROPS on XMR with the K-min estimator.** It is biased for
-   exactly the miners it targets and pays for splitting. It is gated off
-   today, and this is the reason to keep it off.
-2. **Replace the estimator before any flip:**
-   - E2 if the raindrop flood (64× the share traffic) is acceptable. It
-     already is in the current design, and E2 is the simplest rule with the
-     lowest variance.
-   - E3 if verification must stay bounded as the pool grows. Same properties,
-     one extra constant.
-3. **Fix the module's sybil KAT.** It must drive the censored stream with the
-   DROPS-JK fallback and small λ, and assert the mean and the variance under
-   a split, not only an upper bound on the mean.
-4. **Paper §5 and §8:** "a bounded number of its best" should become "the
-   pool's k best" (E3), or the count (E2), once ruled.
+Correction: DROPS is **not** gated off on XMR. The XMR build arms it by
+default (operator ruling 09-27, `c2pool_xmr_drops_default`), so the biased
+K-min estimator was the shipped rule. The operator ruled that DROPS must work
+in the first release, crediting each raindrop by its difficulty. It is now:
+
+- **SubthresholdGate mode 2, Count** (`CreditMode::Count`). Every hash below
+  the drops floor, shares included, is credited the floor target's own work:
+  `att(floor) = floor(2^256 / (h_floor + 1))`, the stdlib twin of
+  `target_to_average_attempts`. The credit is `(S + J) · att(floor)`, and the
+  REPLACE composition subtracts `S · att(share)`.
+  - On the 288-bit normalised geometry (lz = 32), att(floor) = 2^26 and
+    att(share) = 2^32, with no rounding.
+  - The design's paper §5 rule: the work of a unit is the work its target
+    expected, never the value its hash reached.
+- **The floor is exact for any share_diff.** The collector counts
+  near-misses below `(h_T + 1) << 6 = 2^230`, which is exactly
+  `H · share_diff < 2^262`. The relay's integer `floor_diff` admits a
+  superset, so a hash between the two floors is not counted.
+- **No K, no J < K rule and no order statistic.** It is unbiased and additive
+  over identities, so splitting changes neither the mean nor the variance.
+- It costs nothing extra: the node serves every miner its jobs at the floor,
+  and every raindrop is already relayed and verified.
+- The XMR default lane is `xmr_lane_params_default()`: `for_version(1)` with
+  mode 2 and `count_floor_shift` 6. It goes into the HELLO
+  `lane_params_digest`, so a K-min node is refused.
+- Pinned by `v37_xmr_drops_count_kat` (CT1..CT6):
+  - exact integers;
+  - the exact floor at share_diff 10000;
+  - unbiased and split-neutral in mean and variance on the censored stream;
+  - the K-min control paying the 16-way split +19%;
+  - the full seam: S = 1 with J = 63 is delta 0; S = 0 with J = 64 is one
+    share's entitlement; a non-enrolled payee gets no row.
+
+E3 (pool-wide bottom-k) stays the option if raindrop verification must be
+bounded as the pool grows.
+
+Still to do: fix the module's sybil KAT. It must drive the censored stream
+with small λ and assert the mean and the variance under a split. The K-min
+modes stay as they are for the other lanes, where the same bias applies and
+needs its own ruling.
 
 ## Files
 

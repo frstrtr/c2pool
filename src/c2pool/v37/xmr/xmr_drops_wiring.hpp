@@ -106,6 +106,7 @@
 
 #include <c2pool/v37/v37_drops_wiring.hpp>   // DropsWiring, TipBin, EnrollOutcome, kDropsWiringArmed
 #include <c2pool/v37/w4_settlement.hpp>      // settle::WorkPrice, work_price_at
+#include <c2pool/v37/xmr/xmr_node_config.hpp>  // kXmrDropsFloorShift
 #include <c2pool/v37/xmr/xmr_enrol_mode.hpp>   // EnrolMode, enrol_mode_tag (DROPS-AUTO-ENROL)
 
 namespace c2pool::v37n::xmr::drops {
@@ -123,7 +124,8 @@ inline constexpr unsigned kXmrDropsLz = 32;
 // floor exactly as it verifies a share against share_diff, so a peer cannot
 // flood the harvest with free hashes. A function of share_diff alone, and
 // share_diff is HELLO-checked, so every node applies the same floor.
-inline constexpr std::uint64_t kDropsFloorDiv = 64;
+inline constexpr std::uint64_t kDropsFloorDiv = 1ull << ::c2pool::v37n::xmr::kXmrDropsFloorShift;
+static_assert(kDropsFloorDiv == 64, "the XMR drops floor is share_diff / 64");
 inline std::uint64_t drops_floor_diff(std::uint64_t share_diff) {
     const std::uint64_t f = share_diff / kDropsFloorDiv;
     return f ? f : 1;
