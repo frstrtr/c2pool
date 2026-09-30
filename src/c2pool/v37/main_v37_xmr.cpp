@@ -5676,10 +5676,11 @@ int main(int argc, char** argv) {
     if (cfg.coinbase == CoinbaseMode::V37Settlement) {   // payout-threshold.md §6, §6a: from the lane's genesis
         cfg.ledger_arm_floor = static_cast<long long>(::v37::xmr::settle::spend_floor(::v37::xmr::settle::kTailSubsidy));
         cfg.ledger_rotate_on_payment = true;
-        // dust decay (§5): abandoned sub-floor balances decay after one lane
-        // window without credit, halving every lane half-life
-        cfg.ledger_decay_horizon = cfg.lane_params.window;
-        cfg.ledger_decay_half_life = cfg.lane_params.half_life;
+        // dust decay (§5): an abandoned balance below c decays after the
+        // horizon without credit, halving every half-life -- MONERO HEIGHTS
+        // (the FINALIZE clock), named as such (A9), not the lane's positions.
+        cfg.ledger_decay_horizon = c2pool::v37n::xmr::kXmrDustDecayHorizonHeights;
+        cfg.ledger_decay_half_life = c2pool::v37n::xmr::kXmrDustDecayHalfLifeHeights;
         cfg.ledger_anchor_cut = true;   // ANCHOR: every coinbase input is finalized state (share-level canonical coinbase)
     }
     const int rc = run_live(cfg);
