@@ -51,6 +51,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -973,6 +974,15 @@ struct OwedLedgerRules {
     //   owed_digest = sha256d("V37Y" || u64 rows || root || rest)
     // Off: owed_digest is the flat "V37Q" hash, byte-identical.
     bool      merkle_rows = false;
+    // DROPS DUE (XMR, handoff A5, ruling 2026-09-30; turned on with the anchor):
+    // a lane block's composed DROPS delta D_B is never credit. It is held in
+    // B's pending row as a DEPOSIT and enters the committed map `due` at B's
+    // FINALIZE. Every canonical lane block C booked on this ledger CLAIMS the
+    // whole avail = due - SUM(pending claims): its E_b becomes
+    // max(0, E_b + avail) per key (apply_drops_due), anything negative left over
+    // is written off, and at FINALIZE(C) due -= claimed, due += D_C. `due` is
+    // committed in owed_digest ("V37U"). Off: no deposit, no claim, no section.
+    bool      drops_due = false;
 };
 
 // ANCHOR (OwedLedgerRules::anchor_cut): a lane block's on-chain credit cut, raw
@@ -982,6 +992,54 @@ struct AnchorCut {
     bytes32 spine{};
     bool operator==(const AnchorCut&) const = default;
 };
+
+#define C2POOL_V37_DROPS_DUE 1   // the A5 DROPS-due API is present (KATs test for it)
+
+// DROPS DUE (OwedLedgerRules::drops_due): what one FOUND carries for the due.
+//   deposit   D_B, the block's composed DROPS delta (signed). It enters `due`
+//             at FINALIZE(B), never B's credit.
+//   claim     the booking is canonical: it took `claimed` into its E_b.
+//   claimed   the avail snapshot the booking folded (drops_available() of the
+//             booking-point ledger), the folded part and the written-off part
+//             together. It leaves `due` at FINALIZE(B); ORPHAN(B) returns it.
+//   writeoff  diagnostics only: the negative part apply_drops_due could not
+//             net (never carried, never a clawback). Not persisted.
+struct DropsFound {
+    std::map<bytes32, long long> deposit;
+    bool                         claim = false;
+    std::map<bytes32, long long> claimed;
+    std::map<bytes32, long long> writeoff;
+    bool empty() const { return deposit.empty() && !claim && claimed.empty(); }
+    bool operator==(const DropsFound& o) const {
+        return deposit == o.deposit && claim == o.claim && claimed == o.claimed;
+    }
+};
+
+// Saturating signed add (integer audit: no wrap on a consensus path).
+inline long long drops_sat_add(long long a, long long b) {
+    long long r = 0;
+    if (__builtin_add_overflow(a, b, &r)) return b > 0 ? std::numeric_limits<long long>::max()
+                                                       : std::numeric_limits<long long>::min();
+    return r;
+}
+
+// THE CLAMP (A5): E'(k) = max(0, E(k) + avail(k)) for every key of `avail`;
+// the negative remainder min(0, E(k) + avail(k)) goes to *writeoff. Keys of E
+// that are not in `avail` are untouched; a zero E' drops the key. Applied
+// BEFORE the pay-now allocation (the builder) and before the spend-floor
+// credit_delta (the receiver), so both see the same E'.
+inline void apply_drops_due(std::map<bytes32, long long>& credit,
+                            const std::map<bytes32, long long>& avail,
+                            std::map<bytes32, long long>* writeoff = nullptr) {
+    for (const auto& [k, a] : avail) {
+        if (a == 0) continue;
+        auto it = credit.find(k);
+        const long long v = drops_sat_add(it == credit.end() ? 0 : it->second, a);
+        if (v > 0) { credit[k] = v; continue; }
+        if (it != credit.end()) credit.erase(it);
+        if (v < 0 && writeoff) (*writeoff)[k] = v;
+    }
+}
 
 class OwedLedger {
 public:
@@ -1005,21 +1063,58 @@ public:
     // ledger's anchor when the block finalizes (anchor_cut rule only). A
     // block with no cut to offer (a seed, a debit-only non-canonical block)
     // passes none and leaves the anchor where it is.
+    // DROPS DUE: `drops` (drops_due rule only; ignored otherwise) carries the
+    // block's deposit D_B and, for a canonical booking, the avail snapshot it
+    // claimed (drops_available() of the booking-point ledger). The caller has
+    // already folded that snapshot into `credit` (apply_drops_due).
     void on_block_found(const std::string& bid, const Amounts& credit,
-                        const Amounts& payout, std::optional<AnchorCut> cut = std::nullopt) {
+                        const Amounts& payout, std::optional<AnchorCut> cut = std::nullopt,
+                        const DropsFound* drops = nullptr) {
         if (m_pending.count(bid) || m_settled.count(bid)) return;
         Pending p;
         for (const auto& [k, v] : credit) if (v != 0) p.credit[k] = v;
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
         if (m_rules.anchor_cut) p.cut = cut;
+        if (m_rules.drops_due && drops) {
+            for (const auto& [k, v] : drops->deposit) if (v != 0) p.deposit[k] = v;
+            if (drops->claim)
+                for (const auto& [k, v] : drops->claimed) if (v != 0) p.claimed[k] = v;
+            for (const auto& [k, v] : drops->writeoff) { (void)k; p.writeoff = drops_sat_add(p.writeoff, v); }
+        }
         m_eo_index.on_found(p.payout,                 // R3: eo -= payout (fe frozen)
                             [this](const bytes32& k) { return fe_at(k); });
         auto ins = m_pending.emplace(bid, std::move(p));
         // The leaf carries the NORMALIZED maps the ledger kept (zero rows
         // already dropped above), not the raw arguments.
-        bump(owedevent::found_payload(bid, ins.first->second.credit,
-                                      ins.first->second.payout));
+        std::vector<std::uint8_t> leaf = owedevent::found_payload(bid, ins.first->second.credit,
+                                                                  ins.first->second.payout);
+        const Pending& q = ins.first->second;
+        if (!q.deposit.empty() || !q.claimed.empty()) {   // DROPS DUE: never under the rule off
+            const char tu[4] = {'V', '3', '7', 'U'};
+            leaf.insert(leaf.end(), tu, tu + 4);
+            owedevent::detail::put_amap(leaf, q.deposit);
+            owedevent::detail::put_amap(leaf, q.claimed);
+        }
+        bump(leaf);
     }
+
+    // DROPS DUE: what the next canonical booking on this ledger claims,
+    // avail = due - SUM(claims of the pending rows), zero keys dropped. Empty
+    // with the rule off.
+    Amounts drops_available() const {
+        Amounts a;
+        if (!m_rules.drops_due) return a;
+        a = m_due;
+        for (const auto& [bid, p] : m_pending) {
+            (void)bid;
+            for (const auto& [k, v] : p.claimed) a[k] = drops_sat_add(a[k], -v);
+        }
+        for (auto it = a.begin(); it != a.end();) it = it->second == 0 ? a.erase(it) : std::next(it);
+        return a;
+    }
+    // DROPS DUE: the committed (finalized) map and the written-off total.
+    const Amounts& drops_due() const { return m_due; }
+    long long drops_written_off() const { return m_drops_writeoff; }
 
     // ── RDWR-OQ2 wiring: FOUND(b) with the gated sub-threshold estimator folded
     // into the per-key credit. `base_credit` is the ordinary E_b entitlement
@@ -1095,6 +1190,12 @@ public:
                         m_gone_since[k] = bin_height;
         }
         if (m_rules.anchor_cut && it->second.cut) m_anchor = *it->second.cut;   // ANCHOR
+        if (m_rules.drops_due) {   // DROPS DUE: due -= claimed (the whole snapshot), due += D_B
+            for (const auto& [k, v] : it->second.claimed) m_due[k] = drops_sat_add(m_due[k], -v);
+            for (const auto& [k, v] : it->second.deposit) m_due[k] = drops_sat_add(m_due[k], v);
+            for (auto d = m_due.begin(); d != m_due.end();) d = d->second == 0 ? m_due.erase(d) : std::next(d);
+            m_drops_writeoff = drops_sat_add(m_drops_writeoff, it->second.writeoff);
+        }
         m_pending.erase(it);
         m_settled.insert(bid);
         const Amounts decayed = decay_dust(bin_height);
@@ -1431,6 +1532,17 @@ public:
                 for (int i = 0; i < 8; ++i) pre.push_back((b >> (8 * i)) & 0xff);
             }
         }
+        if (m_rules.drops_due) {   // DROPS DUE: it decides the E_b of the next canonical lane block
+            const char ut[4] = {'V', '3', '7', 'U'};
+            pre.insert(pre.end(), ut, ut + 4);
+            const std::uint64_t n = m_due.size();
+            for (int i = 0; i < 8; ++i) pre.push_back((n >> (8 * i)) & 0xff);
+            for (const auto& [k, v] : m_due) {
+                pre.insert(pre.end(), k.begin(), k.end());
+                const std::uint64_t uv = static_cast<std::uint64_t>(v);
+                for (int i = 0; i < 8; ++i) pre.push_back((uv >> (8 * i)) & 0xff);
+            }
+        }
         if (m_rules.anchor_cut) {   // ANCHOR: it decides every coinbase built on this state
             const char at[4] = {'V', '3', '7', 'A'};
             pre.insert(pre.end(), at, at + 4);
@@ -1501,7 +1613,11 @@ public:
     }
 
 private:
-    struct Pending { Amounts credit; Amounts payout; std::optional<AnchorCut> cut; };
+    struct Pending {
+        Amounts credit; Amounts payout; std::optional<AnchorCut> cut;
+        Amounts deposit, claimed;   // DROPS DUE (rule on only)
+        long long writeoff = 0;     // DROPS DUE diagnostics (never committed)
+    };
 
     // The K_fair walk (first_eligible ASC, key ASC). With
     // OwedLedgerRules::rotate_on_payment, a key paid in a block that is still
@@ -1652,6 +1768,8 @@ private:
     std::map<bytes32, u64> m_decay_steps;          // DUST DECAY: halvings already applied
     long long m_decayed_total = 0;
     std::optional<AnchorCut> m_anchor;   // ANCHOR (OwedLedgerRules::anchor_cut)
+    Amounts   m_due;                     // DROPS DUE (OwedLedgerRules::drops_due), finalized, committed "V37U"
+    long long m_drops_writeoff = 0;      // DROPS DUE diagnostics: written off at FINALIZE (never committed)
     u64 m_seq = 0;
     Amounts m_finalW;                              // finalized owed partition
     std::map<std::string, Pending> m_pending;      // FOUND, not yet finalized

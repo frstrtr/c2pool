@@ -506,6 +506,56 @@ void s10_template_cache() {
     CHECK(ok == n, "every cached verdict is canonical (%d/%d)", ok, n);
 }
 
+// S11 (handoff A5): the share verdict reads the DROPS due from the frozen
+// ledger it is handed (XmrOwedSettlementSource::build), like the builder.
+void s11_drops_due() {
+    std::printf("== S11. the share verdict reads the DROPS due of its ledger (A5) ==\n");
+#if defined(C2POOL_V37_DROPS_DUE)
+    World w;
+    const Payee X = payee(77);        // a DROPS-only miner: no share in the view
+    w.lane.learn(X);                  // its ref, taught with the booked deposit (note_booked_refs)
+    st::OwedLedgerRules rules; rules.drops_due = true;
+    st::OwedLedger D(kChain, rules), N(kChain, rules);
+    for (st::OwedLedger* L : {&D, &N}) { seed(*L, w.K1.id, 40000000000ll, 10); seed(*L, w.K2.id, 25000000000ll, 11); }
+    st::DropsFound dep; dep.deposit = {{X.id, 3000000000ll}, {w.cut[0].id, -1000000000ll}};
+    D.on_block_found("dep", {}, {}, std::nullopt, &dep);
+    D.on_block_finalized("dep", 12);
+    N.on_block_found("dep", {}, {}, std::nullopt);
+    N.on_block_finalized("dep", 12);
+    CHECK(D.drops_available().size() == 2 && N.drops_available().empty(), "ledger D holds a due for 2 keys, ledger N none");
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block b = build_block(D, w.lane, o);
+    CHECK(b.ok, "a template on D builds: %s", b.ok ? "ok" : b.why.c_str());
+    if (!b.ok) return;
+    const Share s = share_of(b);
+    const auto r = w.verdict(s, &D);
+    CHECK(r.canonical(), "a share of the honest template (the due in pay-now) is canonical against D: %s %s", rc::to_string(r.verdict), r.why.c_str());
+    const auto rn = w.verdict(s, &N);
+    CHECK(!rn.canonical(), "the same share is NOT canonical against a ledger without the due: %s", rc::to_string(rn.verdict));
+    BuildOpts om = o;   // a builder that forgets the due: pay-now over the view only
+    om.mutate = [&](x6::CoinbaseInputs& in) {
+        auto orig = in.paynow_at;
+        const auto av = D.drops_available();
+        in.paynow_at = [orig, av](std::uint64_t budget) {
+            std::vector<x6::PayNowEntry> out;
+            for (auto e : orig(budget)) {
+                const auto a = av.find(e.identity);
+                if (a != av.end()) { const long long v = static_cast<long long>(e.eb) - a->second; if (v <= 0) continue; e.eb = static_cast<std::uint64_t>(v); }
+                out.push_back(e);
+            }
+            return out;
+        };
+    };
+    const Block bm = build_block(D, w.lane, om);
+    CHECK(bm.ok, "the due-omitting template builds");
+    if (!bm.ok) return;
+    const auto rm = w.verdict(share_of(bm), &D);
+    CHECK(!rm.canonical(), "a share of a template that omits the due is refused: %s %s", rc::to_string(rm.verdict), rm.why.c_str());
+#else
+    CHECK(false, "no DROPS-due rule on the base");
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -520,6 +570,7 @@ int main() {
     s8_cost();
     s9_relay_store();
     s10_template_cache();
+    s11_drops_due();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

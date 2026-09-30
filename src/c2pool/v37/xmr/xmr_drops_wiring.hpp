@@ -231,6 +231,25 @@ inline std::string verify_carry(const DropsCarry& c, bool binds) {
     return "";
 }
 
+// GAP 3 (row-bound DoS, handoff 2026-09-30): the carriage row bound applies
+// to the WIRE WITNESS only. The booked delta is always the whole lane
+// composition (every node composes it from the lane prefix); a delta with more
+// rows than kDropsCarryMaxRows travels as an EMPTY witness (the frame still
+// binds the enrolment digest), and a receiver checks a carried witness against
+// the witness of its own composition. Before this, the whole BOOKED delta was
+// cleared above the bound, so ~256 raindrops wiped every payee's DROPS.
+#define C2POOL_XMR_DROPS_WIRE_BOUND 1
+inline std::map<bytes32, long long> wire_witness_delta(const std::map<bytes32, long long>& booked) {
+    return booked.size() > kDropsCarryMaxRows ? std::map<bytes32, long long>{} : booked;
+}
+inline DropsCarry wire_witness(const DropsCarry& booked) {
+    return DropsCarry{wire_witness_delta(booked.delta), booked.enrollment_digest};
+}
+inline bool carried_delta_agrees(const std::map<bytes32, long long>& carried,
+                                 const std::map<bytes32, long long>& booked) {
+    return carried == wire_witness_delta(booked);
+}
+
 // ── (7) ★ DROPS-ENROL-LANE: the composition is a pure function of the LANE ──
 // Defect 4 (flip 1): the share counts S (covers(iv) only after THIS node armed)
 // and the EnrollmentBook (effective from THIS node's tip) were node-local, so a
@@ -616,7 +635,18 @@ public:
     std::size_t retained_intervals() const { return m_drops.size(); }
     std::pair<std::uint64_t, std::uint64_t> last_range() const { return {m_last_lo, m_last_hi}; }
 
+    // DROPS DUE (A5): identity -> the PoW-bound payee ref its raindrops carried,
+    // so a DROPS-only payee (no share in the anchor view) can be paid from the
+    // due once note_booked_refs teaches the ref with the booked deposit.
+    void observe_ref(const bytes32& identity, const ::v37::ScriptRef& ref) { m_refs[identity] = ref; }
+    std::optional<::v37::ScriptRef> ref_of(const bytes32& identity) const {
+        const auto it = m_refs.find(identity);
+        if (it == m_refs.end()) return std::nullopt;
+        return it->second;
+    }
+
 private:
+    std::map<bytes32, ::v37::ScriptRef> m_refs;                                     // DROPS DUE: identity -> ref
     std::uint32_t m_K;
     unsigned m_lz;
     std::uint64_t m_d_conf;
@@ -1118,6 +1148,17 @@ public:
     }
 
     // ── the two producers ──────────────────────────────────────────────────
+    // DROPS DUE (A5): remember the ref a raindrop's payee carried (the
+    // chain-ordered harvest keeps identity -> ref).
+    void note_drop_ref(const bytes32& payee_identity, const ::v37::ScriptRef& ref) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        m_coh.observe_ref(payee_identity, ref);
+    }
+    std::optional<::v37::ScriptRef> drop_ref_of(const bytes32& payee_identity) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        return m_coh.ref_of(payee_identity);
+    }
+
     // A relay-admitted RAINDROP (own or peer): a RandomX hash that met the
     // floor but not share_diff. Returns false (and harvests nothing) for a hash
     // that is actually a share or is below the floor: never both, never twice.

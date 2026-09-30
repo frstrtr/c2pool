@@ -30,6 +30,10 @@
 //               the same finalized partition and the same pending set. The
 //               block's committed lane_commitment must therefore BE this
 //               ledger's owed_digest; any other state is not canonical.
+//               DROPS DUE (A5, rule drops_due): the same ledger's avail = due
+//               - SUM(pending claims) joins every pay-now E_b (clamped at 0 per
+//               key) inside XmrOwedSettlementSource::build, so a block that
+//               omits or doubles the due does not rebuild here (Mismatch).
 //   pay_of      the receiver's payee resolver (the refs the lane taught it,
 //               including every payee of the view at B's cut: REJOIN-PAYEE).
 //   lane cfg    chain id, owed floor, owed-selection cap, the residual sink

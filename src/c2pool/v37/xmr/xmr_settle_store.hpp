@@ -81,7 +81,7 @@ struct ISettleStore {
 // Records: u8 ver=1 ‖ payload. Ints little-endian. Fail-closed on a short read.
 // ---------------------------------------------------------------------------
 namespace store_codec {
-constexpr std::uint8_t SCHEMA_VER = 2;   // 2: a FOUND event may carry the block's credit cut (ANCHOR)
+constexpr std::uint8_t SCHEMA_VER = 3;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields
 
 inline std::string chain_fmt(::v37::ChainId c) {
     char b[16];
@@ -166,19 +166,33 @@ struct SettleEvent {
     bool          has_cut = false;
     std::uint64_t cut_pos = 0;
     std::string   cut_spine;           // 32 bytes
+    // FOUND, DROPS DUE rule (schema 3): the block's deposit D_B and the avail
+    // snapshot a canonical booking claimed. Absent => byte-identical to the
+    // schema-1/2 layouts.
+    bool          has_drops = false;
+    Amounts       drops_deposit;
+    bool          drops_claim = false;
+    Amounts       drops_claimed;
 
     std::string serialize() const {
         std::string s;
-        s.push_back(char(has_cut ? store_codec::SCHEMA_VER : std::uint8_t{1}));
+        s.push_back(char(has_drops ? store_codec::SCHEMA_VER : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
         s.push_back(char(static_cast<std::uint8_t>(kind)));
         store_codec::put_str(s, bid);
         store_codec::put_amounts(s, credit);
         store_codec::put_amounts(s, payout);
         store_codec::put_u64(s, bin_height);
-        if (has_cut) {
-            s.push_back(char(1));
-            store_codec::put_u64(s, cut_pos);
-            store_codec::put_str(s, cut_spine);
+        if (has_cut || has_drops) {
+            s.push_back(char(has_cut ? 1 : 0));
+            if (has_cut) {
+                store_codec::put_u64(s, cut_pos);
+                store_codec::put_str(s, cut_spine);
+            }
+        }
+        if (has_drops) {   // schema 3
+            store_codec::put_amounts(s, drops_deposit);
+            s.push_back(char(drops_claim ? 1 : 0));
+            store_codec::put_amounts(s, drops_claimed);
         }
         return s;
     }
@@ -199,6 +213,12 @@ struct SettleEvent {
             e.cut_spine = r.str();
             if (e.cut_spine.size() != 32) throw std::runtime_error("settle-store: bad credit-cut spine");
         }
+        if (ver >= 3) {   // DROPS DUE
+            e.has_drops = true;
+            e.drops_deposit = r.amounts();
+            e.drops_claim = r.u8() == 1;
+            e.drops_claimed = r.amounts();
+        }
         r.expect_end();
         return e;
     }
@@ -211,6 +231,19 @@ inline std::optional<::c2pool::v37n::settle::AnchorCut> anchor_of(const SettleEv
     c.next_pos = e.cut_pos;
     std::copy(e.cut_spine.begin(), e.cut_spine.end(), c.spine.begin());
     return c;
+}
+// DROPS DUE: the drops fields a FOUND event carries, in the ledger's type
+// (nullopt: none; the ledger then books no deposit and no claim).
+inline std::optional<::c2pool::v37n::settle::DropsFound> drops_of(const SettleEvent& e) {
+    if (!e.has_drops) return std::nullopt;
+    ::c2pool::v37n::settle::DropsFound d;
+    d.deposit = e.drops_deposit; d.claim = e.drops_claim; d.claimed = e.drops_claimed;
+    return d;
+}
+inline void set_drops(SettleEvent& e, const std::optional<::c2pool::v37n::settle::DropsFound>& d) {
+    e.has_drops = d.has_value() && !d->empty();
+    e.drops_deposit.clear(); e.drops_claim = false; e.drops_claimed.clear();
+    if (e.has_drops) { e.drops_deposit = d->deposit; e.drops_claim = d->claim; e.drops_claimed = d->claimed; }
 }
 inline void set_cut(SettleEvent& e, const std::optional<::c2pool::v37n::settle::AnchorCut>& c) {
     e.has_cut = c.has_value();
@@ -375,7 +408,11 @@ public:
                     ++st.max_event_seq;
                     switch (e.kind) {
                         case SettleEvKind::Found:
-                            ledger.on_block_found(e.bid, e.credit, e.payout, anchor_of(e)); break;
+                            {
+                                const auto df = drops_of(e);
+                                ledger.on_block_found(e.bid, e.credit, e.payout, anchor_of(e), df ? &*df : nullptr);
+                            }
+                            break;
                         case SettleEvKind::Finalize:
                             ledger.on_block_finalized(e.bid, e.bin_height); break;  // F1
                         case SettleEvKind::Orphan:
