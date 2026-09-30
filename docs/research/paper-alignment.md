@@ -2,7 +2,7 @@
 
 Audit of 2026-09-30. The paper is `src/sharechain/v37/PURPLE-PAPER.md`, with
 §6, §8 and §9 as corrected on the audit date. The code is the XMR lane on
-branch `claude/nifty-allen-ktyg1s`. Each item was confirmed by reading the
+branch `v37/xmr-lane-review` (renamed from the session branch). Each item was confirmed by reading the
 code.
 
 ## Fixed at audit time

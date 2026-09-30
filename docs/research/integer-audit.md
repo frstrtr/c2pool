@@ -1,6 +1,6 @@
 # Integer-design audit of the consensus code
 
-Audit of 2026-09-30, branch `claude/nifty-allen-ktyg1s`.
+Audit of 2026-09-30, branch `v37/xmr-lane-review` (renamed from the session branch).
 
 **The rule.** Anything that decides consensus state must be pure integer,
 deterministic across platforms, with an explicit rule for truncation and
