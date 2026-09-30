@@ -131,6 +131,7 @@
 #include <ifaddrs.h>                           // RELAY-BOOTSTRAP: this machine's addresses (self-skip)
 #include <netdb.h>
 #include "xmr/relay/xmr_receipt_ingest.hpp"    // admitted receipts -> the lane (ordering policy + durable log)
+#include "xmr/relay/xmr_order_rule.hpp"        // the canonical lane order: (bin, id) with a bounded late tail (gap 4)
 #include "xmr/xmr_drops_wiring.hpp"            // ★ DROPS: the XMR shell's DropsWiring (flip-gated; DORMANT by default)
 #include "xmr/relay/xmr_relay_native_ctx.hpp"   // RC-CTX: receipt contexts from the native node + the own-template journal
 #include "xmr/relay/xmr_address.hpp"           // login address (base58) -> payee ref
@@ -1861,7 +1862,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     // given; null = the relay is off and every path below is the stand-in one.
     // Declaration order = teardown order in reverse: everything the relay's
     // threads touch (chain view, log queue, verifier) outlives relay_node.
-    std::uint64_t relay_cut_repaired = 0, relay_repair_rejected = 0, relay_own_replay = 0;
+    std::uint64_t relay_cut_repaired = 0, relay_repair_rejected = 0, relay_repair_order_refused = 0, relay_own_replay = 0;
     std::uint64_t relay_repair_suffix = 0, relay_repair_shadow = 0, relay_repair_deep_alarms = 0;   // REPAIR-HORIZON
     relay::RepairReplayer relay_replayer{2 * (g_relay_vault_horizon ? g_relay_vault_horizon : 8640)};   // REPAIR-HORIZON shadow
     std::set<std::string> relay_deep_alarmed;                                // REPAIR-HORIZON: one alarm per (P, spine)
@@ -1875,6 +1876,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::string   mint_last_err;
     std::map<std::string, std::optional<::v37::ScriptRef>> mint_payee_cache;
     relay::ChainView                          relay_chain;
+    relay::OwnOrderTail                       own_order_tail;   // gap 4: our own lane order's last receipts (id, bin)
     relay::NativeCtxSource                    relay_native_ctx;   // RC-CTX: unset unless a native node runs
     relay::NativeCtxFeeder                    relay_ctx_feeder;
     relay::CtxJournal                         relay_ctx_journal;
@@ -2087,6 +2089,47 @@ static int run_live(const XmrNodeConfig& cfg) {
                           hex_of(id).substr(0, 12) + " (serving peer set aside; asking another)";
                     return nullptr;
                 }
+        }
+        // THE CANONICAL ORDER over the COMPOSED [0, P) (gap 4, anchor rule only):
+        // no receipt twice across our own [0, a0) and the served [a0, P), and
+        // every served receipt within the late tail of the high-water (bin, id)
+        // (xmr_order_rule.hpp; the builder's ingest applies the same predicate).
+        if (cfg.ledger_anchor_cut) {
+            const auto bin_of_prev = [&](const ::v37::bytes32& prev_id) -> std::optional<std::uint64_t> {
+                const auto c = relay_chain.lookup(prev_id);
+                if (!c) return std::nullopt;
+                return c->height;
+            };
+            std::vector<relay::OrderEntry> served;
+            served.reserve(ids.size());
+            for (const auto& id : ids) {
+                ::v37::ScriptRef payee; std::uint64_t bin = 0; std::vector<std::uint8_t> raw;
+                if (!relay_node->cached_share(id, payee, bin, raw)) { ++cut_pending; why = "cut-pending: a repaired receipt left the verified cache (retry)"; return nullptr; }
+                if (bin == 0) {
+                    relay::FbReceipt r; ::v37::xmr::verify::ParsedBlob pb;
+                    if (relay::decode_fb_receipt(raw, r) && ::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb))
+                        if (const auto b = bin_of_prev(pb.prev_id)) bin = *b;
+                    if (bin == 0) { ++cut_pending; why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (retry)"; return nullptr; }
+                }
+                served.push_back(relay::OrderEntry{id, bin});
+            }
+            // our own [0, a0) is the composed prefix only when our lane digest at a0
+            // is the serving peer's; otherwise (a shadow base, or unknown) only the
+            // served suffix is checked, which never refuses an honest order
+            const auto own_a0 = a0 ? relay_node->digest_at_deep(a0) : std::nullopt;
+            const bool own_is_prefix = a0 && peer_a0_digest && own_a0 && *own_a0 == *peer_a0_digest;
+            const auto oc = relay::check_composed_order(a0, served,
+                [&](std::uint64_t pos, relay::OrderEntry& e, std::uint64_t& first) {
+                    return own_is_prefix && own_order_tail.at(pos, e, first, bin_of_prev);
+                });
+            if (!oc.ok) {
+                relay_node->repair_reject(P, spine);
+                ++relay_repair_rejected; ++relay_repair_order_refused; ++cut_pending;
+                why = "cut-pending: the composed order at P=" + std::to_string(P) + " breaks the canonical order: " + oc.why +
+                      " (own tail " + std::to_string(oc.own_walked) + (oc.own_complete ? "" : ", partial") +
+                      "; serving peer set aside; asking another)";
+                return nullptr;
+            }
         }
         std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;   // the served [a0, P)
         pushes.reserve(ids.size());   // A2: one push per receipt
@@ -4142,6 +4185,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             io.fee_model = fee_on;   // fee model S3: push split by the receipt's own PoW-committed give_author
             io.network = static_cast<std::uint8_t>(don_net);   // DON-NET: the donation payee of this network
+            // gap 4 (anchor rule only): drop a late receipt beyond the canonical order's late tail
+            io.late_tail_bins = cfg.ledger_anchor_cut ? relay::kLateTailBins : 0;
             relay_ingest = std::make_unique<relay::XmrReceiptIngest>(
                 io,
                 [&](const ::v37::ScriptRef& payee, std::uint64_t w, std::uint64_t& next_after, ::v37::bytes32& dig) -> bool {
@@ -4157,6 +4202,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                 },
                 [&](const relay::Admitted& a, std::uint64_t pos_first, std::uint32_t n_pushes, std::uint64_t next_after, const ::v37::bytes32& dig) {
                     relay_node->on_pushed(a.id, pos_first, n_pushes, a.raw, next_after, dig);
+                    if (cfg.ledger_anchor_cut) {   // gap 4: the own [0, a0) a repair's composed order is checked against
+                        ::v37::bytes32 prev_id{};
+                        ::v37::xmr::verify::ParsedBlob pb;
+                        if (a.bin == 0 && ::v37::xmr::verify::parse_hashing_blob(a.r.receipt.hashing_blob, pb)) prev_id = pb.prev_id;
+                        own_order_tail.note(pos_first, n_pushes, a.id, a.bin, prev_id);
+                    }
                     if (drops_live) {   // ★ DROPS-ENROL-LANE: our own lane order, position -> (payee, bin)
                         ::v37::bytes32 prev_id{};
                         if (a.bin == 0) {   // a durable-log reload carries no bin: resolved from prev_id at composition
@@ -4700,6 +4751,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)relay_repair_suffix, (unsigned long long)relay_repair_shadow, (unsigned long long)relay_repair_deep_alarms,
                             relay_chain.size(), (unsigned long long)relay_chain.tip(),
                             le.empty() ? "" : " | mint last_err=", le.c_str(), lr.empty() ? "" : " | last reject=", lr.c_str());
+                if (cfg.ledger_anchor_cut)   // gap 4: the canonical order (builder drops / receiver refusals)
+                    std::printf("  relay-order: late_tail=%llu bins late_dropped=%llu composed_order_refused=%llu own_tail=%zu\n",
+                                (unsigned long long)relay_ingest->options().late_tail_bins, (unsigned long long)is.late_dropped,
+                                (unsigned long long)relay_repair_order_refused, own_order_tail.size());
                 {   // REPAIR-CHAIN: the down-walk (requester) and the durable order (server)
                     const auto& rcs = relay_node->stats();
                     const auto ds = relay_node->durable_order_stats();
