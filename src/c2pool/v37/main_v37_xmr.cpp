@@ -2073,6 +2073,21 @@ static int run_live(const XmrNodeConfig& cfg) {
                   std::to_string(feed_log.size()) + " pushes (retry)";
             return nullptr;
         }
+        // ONE RECEIPT, ONE PLACE: an honest order never repeats an id (the relay
+        // dedups before the lane), so a served order that does is the winner
+        // counting a receipt twice to steer the next anchor. Refuse it; the
+        // spine check alone cannot, since the winner's own spine includes it.
+        {
+            std::set<::v37::bytes32> seen_ids;
+            for (const auto& id : ids)
+                if (!seen_ids.insert(id).second) {
+                    relay_node->repair_reject(P, spine);
+                    ++relay_repair_rejected; ++cut_pending;
+                    why = "cut-pending: the served order at P=" + std::to_string(P) + " repeats receipt " +
+                          hex_of(id).substr(0, 12) + " (serving peer set aside; asking another)";
+                    return nullptr;
+                }
+        }
         std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;   // the served [a0, P)
         pushes.reserve(ids.size() * 2);
         const bool fee_on = c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params);

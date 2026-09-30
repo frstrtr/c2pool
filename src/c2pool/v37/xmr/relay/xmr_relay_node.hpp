@@ -261,7 +261,7 @@ struct Admitted {
     bytes32          id{};
     FbReceipt        r;
     std::vector<u8>  raw;     // its exact fb_receipt bytes (vault / durable log / GETFRAMES)
-    u64              bin = 0; // origin bin = height of the block the share was mined on
+    u64              bin = 0; // origin bin = the height of the block the share would become (the template / coinbase height; prev_id -> bin in the ChainView)
     bool             own = false;
     // ★ DROPS (gate ON only): a RAINDROP — RandomX work that met the drops
     // floor but NOT share_diff. Never pushed to the lane, never cached, never
@@ -2206,10 +2206,15 @@ private:
             return;
         }
         // SHARE-LEVEL CANONICAL COINBASE: before RandomX (cheap, and a refused
-        // receipt never costs a hash). The coinbase height is the bin's + 1.
+        // receipt never costs a hash). The coinbase height is ctx->height itself:
+        // the ChainView maps prev_id to the height of the block built ON it (the
+        // template's height, the chain feed's h + 1), which is the coinbase's
+        // height. (It was passed + 1, so every honest share rebuilt one block
+        // high, was refused as non-canonical and struck its sender;
+        // v37_xmr_relay_multinode_kat M2 pins the height.)
         if (m_verdict) {
             std::string vw;
-            const int v = m_verdict(it.r, pb, ctx->height + 1, vw);
+            const int v = m_verdict(it.r, pb, ctx->height, vw);
             if (v < 0) {
                 m_st.share_refused++; forget_inflight(it.id);
                 { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
