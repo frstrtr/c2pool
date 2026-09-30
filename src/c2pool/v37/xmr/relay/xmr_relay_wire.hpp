@@ -962,6 +962,7 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
     // subthreshold (RDWR-OQ2)
     b.push_back(p.subthreshold.enabled ? 1 : 0);
     le::put32(b, p.subthreshold.K); le::put32(b, p.subthreshold.mode); le::put32(b, p.subthreshold.version);
+    if (p.subthreshold.count_floor_shift) le::put32(b, p.subthreshold.count_floor_shift);   // Count only
     // mrr
     le::put64(b, p.mrr.activation_pos); le::put64(b, p.mrr.ckpt_retain);
     // win

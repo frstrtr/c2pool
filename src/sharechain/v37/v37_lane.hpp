@@ -55,8 +55,13 @@ using MinerId = std::uint32_t;
 struct SubthresholdGate {
     bool enabled = false;        // ★ DEFAULT OFF (RDWR-OQ2; flip = consensus change)
     std::uint32_t K = 4;         // K-best near-misses; estimator enforces K >= 3
-    std::uint32_t mode = 0;      // 0 = EstimateOnly (S==0 only), 1 = Combined (sybil-neutral)
+    std::uint32_t mode = 0;      // 0 = EstimateOnly (S==0 only), 1 = Combined, 2 = Count
     std::uint32_t version = 0;   // consensus version marker: 0 = base; 1 = V37.1 estimator-on
+    // Count (mode 2) only: the drops floor is the share target times
+    // 2^count_floor_shift; every hash below it is credited the floor's work.
+    // 0 everywhere else. A lane that selects Count sets it with the floor it
+    // serves (XMR: share_diff / 64 => 6).
+    std::uint32_t count_floor_shift = 0;
 
     // ── CANONICAL version → gate map (the ADD-ONLY consensus version marker).
     // for_version() is the SINGLE SOURCE OF TRUTH translating a V37.x consensus
