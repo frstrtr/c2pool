@@ -453,6 +453,59 @@ void s9_relay_store() {
     }
 }
 
+void s10_template_cache() {
+    std::printf("== S10. the per-template cache: one rebuild per template, then one Keccak per share ==\n");
+    namespace rl = c2pool::v37n::xmr::relay;
+    World w;
+    rl::ShareStateStore store;
+    auto e = std::make_shared<rl::ShareStateEntry>();
+    e->digest = w.L.owed_digest();
+    const auto r = x6::mm_commitment_root(kChain, e->digest);
+    std::memcpy(e->root.data(), r.data(), 32);
+    e->ledger = std::make_shared<st::OwedLedger>(w.L);
+    (void)e->ledger->owed_digest();
+    e->refs = w.lane.refs;
+    e->lane = lane_inputs();
+    e->has_view = true; e->view_ratified = true;
+    e->payees = weighted(w.cut);
+    store.ring.push_back(e);
+    auto verdict = [&](const Share& sh, std::string& why) {
+        rl::FbReceipt fb;
+        fb.receipt.coinbase_opening = sh.opening;
+        ::v37::xmr::verify::ParsedBlob pb;
+        pb.major = sh.major; pb.prev_id = sh.prev_id;
+        return rl::share_verdict(store, fb, pb, sh.height, why);
+    };
+    BuildOpts o; o.cut_payees = w.cut;
+    std::vector<Share> shares;
+    for (const std::uint32_t en : {7u, 91u, 1234u, 65000u}) {
+        const Block b = build_block(w.L, w.lane, o, en);
+        if (!b.ok) { CHECK(false, "builds: %s", b.why.c_str()); return; }
+        shares.push_back(share_of(b));
+    }
+    std::string why;
+    CHECK(verdict(shares[0], why) == 1 && e->cache->misses == 1 && e->cache->hits == 0,
+          "the first share of the template: canonical, one rebuild (misses %llu)", (unsigned long long)e->cache->misses);
+    bool all = true;
+    for (std::size_t i = 1; i < shares.size(); ++i) all = all && verdict(shares[i], why) == 1;
+    CHECK(all && e->cache->hits == 3 && e->cache->misses == 1,
+          "three more workers' shares (other extra-nonces): canonical from the cache (hits %llu)", (unsigned long long)e->cache->hits);
+    BuildOpts t; t.cut_payees = w.cut;
+    t.mutate = [&](x6::CoinbaseInputs& in) { for (auto& x : in.owed) { x.pay = w.thief.ref; x.identity = w.thief.id; } };
+    const Block tb = build_block(w.L, w.lane, t, 91);
+    if (tb.ok) {
+        const int v = verdict(share_of(tb), why);
+        CHECK(v == -1, "a thief share with the same template tails: REFUSED through the cache (%s)", why.c_str());
+    }
+    const int n = 200;
+    int ok = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < n; ++i) ok += verdict(shares[static_cast<std::size_t>(i) % shares.size()], why) == 1;
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("    %d cached verdicts: %lld us each (vs a full rebuild in S8)\n", n, static_cast<long long>(us / n));
+    CHECK(ok == n, "every cached verdict is canonical (%d/%d)", ok, n);
+}
+
 }  // namespace
 
 int main() {
@@ -466,6 +519,7 @@ int main() {
     s7_block_path();
     s8_cost();
     s9_relay_store();
+    s10_template_cache();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

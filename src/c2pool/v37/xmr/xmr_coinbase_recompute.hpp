@@ -389,7 +389,8 @@ inline std::optional<::v37::bytes32> mm_root_of(const std::vector<unsigned char>
 inline Result verify_share_coinbase(const std::vector<unsigned char>& tx_extra, const ::v37::bytes32& prefix_hash,
                                     std::uint8_t major, std::uint64_t height, const ::v37::bytes32& prev_id,
                                     const OwedLedger& ledger, const o2::PayOfFn& pay_of,
-                                    const LaneInputs& lane, const CutInputs& cut) {
+                                    const LaneInputs& lane, const CutInputs& cut,
+                                    x6::BuiltCoinbase* built_out = nullptr) {
     Result res;
     auto mismatch = [&](const std::string& w) { res.verdict = Verdict::Mismatch; res.why = "share-mismatch: " + w; return res; };
     auto undecidable = [&](const std::string& w) { res.verdict = Verdict::Undecidable; res.why = "share-undecidable: " + w; return res; };
@@ -431,6 +432,7 @@ inline Result verify_share_coinbase(const std::vector<unsigned char>& tx_extra, 
         if (std::memcmp(b.prefix_hash.data(), prefix_hash.data(), 32) == 0) {
             res.verdict = Verdict::Canonical;
             res.cap = c;
+            if (built_out) *built_out = b;   // the relay's per-template cache (xmr_share_verdict.hpp)
             return res;
         }
     }
