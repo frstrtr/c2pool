@@ -28,6 +28,9 @@
 //   S7  the block path: the same honest block is canonical under the V37R
 //       rule, and V37R must equal the block's output sum.
 //   S8  cost: one canonical rebuild per template.
+//   S12 a sibling FOUND (same owed_digest, next ledger_seq): shares of both
+//       states are canonical; a forged or mixed share is refused; the state
+//       store is bounded (handoff gap 1).
 // ---------------------------------------------------------------------------
 #include <array>
 #include <chrono>
@@ -556,6 +559,130 @@ void s11_drops_due() {
 #endif
 }
 
+// S12 (handoff gap 1): a sibling FOUND bumps ledger_seq, not owed_digest, and
+// the builder then reads the new pending claims (A5 avail). The relay store is
+// keyed by (digest, ledger_seq) and the verdict tries every held state with
+// the share's root, so a share built before the FOUND and one built after it
+// are both canonical. On the base the store is keyed by the digest (the first
+// state of a digest is kept) and the verdict reads only the newest root match.
+namespace rl = c2pool::v37n::xmr::relay;
+std::shared_ptr<rl::ShareStateEntry> state_entry(const st::OwedLedger& L, const World& w) {
+    auto e = std::make_shared<rl::ShareStateEntry>();
+    e->digest = L.owed_digest();
+#if defined(C2POOL_XMR_SHARE_STATE_BY_SEQ)
+    e->ledger_seq = L.ledger_seq();
+#endif
+    const auto r = x6::mm_commitment_root(kChain, e->digest);
+    std::memcpy(e->root.data(), r.data(), 32);
+    e->ledger = std::make_shared<st::OwedLedger>(L);
+    (void)e->ledger->owed_digest();
+    e->refs = w.lane.refs;
+    e->lane = lane_inputs();
+    e->has_view = true; e->view_ratified = true;
+    e->payees = weighted(w.cut);
+    return e;
+}
+// The node's publisher rule (main_v37_xmr.cpp share_publish).
+void publish_state(rl::ShareStateStore& store, const st::OwedLedger& L, const World& w) {
+#if defined(C2POOL_XMR_SHARE_STATE_BY_SEQ)
+    if (auto x = store.find_state(L.owed_digest(), L.ledger_seq()); x && x->has_view) return;
+    store.put(state_entry(L, w));
+#else   // the base: an entry with the same owed_digest (and a view) is kept as is
+    std::lock_guard<std::mutex> lk(store.mu);
+    for (const auto& x : store.ring) if (x->digest == L.owed_digest() && x->has_view) return;
+    store.ring.push_back(state_entry(L, w));
+    while (store.ring.size() > 16) store.ring.pop_front();
+#endif
+}
+int relay_verdict(rl::ShareStateStore& store, const Share& sh, std::string& why) {
+    rl::FbReceipt fb;
+    fb.receipt.coinbase_opening = sh.opening;
+    ::v37::xmr::verify::ParsedBlob pb;
+    pb.major = sh.major; pb.prev_id = sh.prev_id;
+    return rl::share_verdict(store, fb, pb, sh.height, why);
+}
+
+void s12_state_by_seq() {
+    std::printf("== S12. a sibling FOUND: same owed_digest, next ledger_seq (gap 1) ==\n");
+    World w;
+    const Payee X = payee(77);   // a DROPS-only miner with a due
+    w.lane.learn(X);
+    st::OwedLedgerRules rules; rules.drops_due = true;
+    st::OwedLedger D(kChain, rules);
+    seed(D, w.K1.id, 40000000000ll, 10); seed(D, w.K2.id, 25000000000ll, 11);
+    st::DropsFound dep; dep.deposit = {{X.id, 3000000000ll}};
+    D.on_block_found("dep", {}, {}, std::nullopt, &dep);
+    D.on_block_finalized("dep", 12);
+    const st::OwedLedger Dn = D;   // state n: X has a due
+    st::DropsFound sib; sib.claim = true; sib.claimed = D.drops_available();
+    D.on_block_found("sibling", {}, {}, std::nullopt, &sib);   // a sibling lane block claims it
+    const st::OwedLedger Dn1 = D;  // state n+1
+    CHECK(Dn.owed_digest() == Dn1.owed_digest() && Dn1.ledger_seq() == Dn.ledger_seq() + 1,
+          "the FOUND keeps owed_digest and bumps ledger_seq (%llu -> %llu)",
+          (unsigned long long)Dn.ledger_seq(), (unsigned long long)Dn1.ledger_seq());
+    CHECK(Dn.drops_available().count(X.id) == 1 && Dn1.drops_available().count(X.id) == 0,
+          "avail(X) is claimed by the pending sibling: the builder's input changed");
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block bn = build_block(Dn, w.lane, o), bn1 = build_block(Dn1, w.lane, o);
+    CHECK(bn.ok && bn1.ok, "a template on each state builds");
+    if (!bn.ok || !bn1.ok) return;
+    const Share sa = share_of(bn), sb = share_of(bn1);
+    CHECK(sa.ok && sb.ok && sa.prefix_hash != sb.prefix_hash, "the two canonical coinbases differ (same 0x03 root)");
+    std::string why;
+    {   // the node's publisher, at state n and again at state n+1
+        rl::ShareStateStore store;
+        publish_state(store, Dn, w);
+        publish_state(store, Dn1, w);
+        const int va = relay_verdict(store, sa, why);
+        CHECK(va == 1, "publisher at n, n+1: the share built BEFORE the FOUND is canonical (%d: %s)", va, why.c_str());
+        const int vb = relay_verdict(store, sb, why);
+        CHECK(vb == 1, "publisher at n, n+1: the share built AFTER the FOUND is canonical (%d: %s)", vb, why.c_str());
+    }
+    rl::ShareStateStore both;   // both states held, n+1 newest
+    both.ring.push_back(state_entry(Dn, w)); both.ring.push_back(state_entry(Dn1, w));
+    const int va = relay_verdict(both, sa, why);
+    CHECK(va == 1, "both states held: the share built BEFORE the FOUND is canonical (%d: %s)", va, why.c_str());
+    const int vb = relay_verdict(both, sb, why);
+    CHECK(vb == 1, "both states held: the share built AFTER the FOUND is canonical (%d: %s)", vb, why.c_str());
+    BuildOpts t; t.cut_payees = w.cut;   // a forged share: the owed queue to the thief
+    t.mutate = [&](x6::CoinbaseInputs& in) { for (auto& x : in.owed) { x.pay = w.thief.ref; x.identity = w.thief.id; } };
+    const Block tb = build_block(Dn1, w.lane, t);
+    CHECK(tb.ok, "the forged template builds: %s", tb.ok ? "ok" : tb.why.c_str());
+    if (tb.ok) {
+        const int v = relay_verdict(both, share_of(tb), why);
+        CHECK(v == -1, "a forged share on the same root: REFUSED against every held state (%s)", why.c_str());
+    }
+    BuildOpts om = o;   // a stale mix: the due of state n paid on top of state n+1's claim
+    om.mutate = [&](x6::CoinbaseInputs& in) { x6::OwedEntry e; e.pay = X.ref; e.identity = X.id; e.owed = 3000000000ull; in.owed.push_back(e); };
+    const Block mb = build_block(Dn1, w.lane, om);
+    CHECK(mb.ok, "the mixed template builds: %s", mb.ok ? "ok" : mb.why.c_str());
+    if (mb.ok) {
+        const int v = relay_verdict(both, share_of(mb), why);
+        CHECK(v == -1, "a share that is canonical for neither state: REFUSED (%s)", why.c_str());
+    }
+#if defined(C2POOL_XMR_SHARE_STATE_BY_SEQ)
+    {   // retention: kMaxStates entries; the oldest is evicted
+        rl::ShareStateStore store;
+        store.put(state_entry(Dn, w));
+        st::OwedLedger Lk = Dn1;
+        for (std::size_t i = 0; i < rl::ShareStateStore::kMaxStates; ++i) {
+            st::DropsFound s2; s2.claim = true;
+            Lk.on_block_found("more-" + std::to_string(i), {}, {}, std::nullopt, &s2);
+            store.put(state_entry(Lk, w));
+        }
+        const bool evicted = !store.find_state(Dn.owed_digest(), Dn.ledger_seq());
+        CHECK(store.ring.size() == rl::ShareStateStore::kMaxStates && evicted,
+              "retention bound %zu: %zu held after %zu puts, the oldest (seq %llu) evicted",
+              rl::ShareStateStore::kMaxStates, store.ring.size(), rl::ShareStateStore::kMaxStates + 1,
+              (unsigned long long)Dn.ledger_seq());
+        const int v = relay_verdict(store, sa, why);
+        CHECK(v != 1, "a share of the evicted state is no longer canonical here (%d: %s)", v, why.c_str());
+    }
+#else
+    CHECK(false, "no (digest, ledger_seq) state key on the base: no retention test");
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -571,6 +698,7 @@ int main() {
     s9_relay_store();
     s10_template_cache();
     s11_drops_due();
+    s12_state_by_seq();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

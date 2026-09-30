@@ -2631,16 +2631,19 @@ static int run_live(const XmrNodeConfig& cfg) {
     // Main thread (the ledger-event observer and the relay tick).
     share_publish = [&]() {
         if (!cba_fx || !cba_scfg || !node.ledger().rules().anchor_cut) return;
+        // keyed by (owed_digest, ledger_seq): a FOUND bumps the seq, not the
+        // digest, and the builder then reads the new pending rows (gap 1)
         const ::v37::bytes32 d = node.ledger().owed_digest();
+        const std::uint64_t seq = node.ledger().ledger_seq();
         std::shared_ptr<ShareStateEntry> e;
-        {
-            std::lock_guard<std::mutex> lk(share_store->mu);
-            for (const auto& x : share_store->ring)
-                if (x->digest == d) { if (x->has_view) return; e = std::make_shared<ShareStateEntry>(*x); break; }
+        if (const auto x = share_store->find_state(d, seq)) {
+            if (x->has_view) return;
+            e = std::make_shared<ShareStateEntry>(*x);
         }
         if (!e) {
             e = std::make_shared<ShareStateEntry>();
             e->digest = d;
+            e->ledger_seq = seq;
             const auto r = ::v37::xmr::settle::mm_commitment_root(cfg.lane_chain, d);
             std::memcpy(e->root.data(), r.data(), 32);
             auto L = std::make_shared<settle::OwedLedger>(node.ledger());
@@ -2652,11 +2655,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::string w;
         const c2pool::v37n::xmr::credit::CreditCut none{};
         e->has_view = credit_payees(none, *e->ledger, e->view_ratified, e->payees, w) == 1;
-        std::lock_guard<std::mutex> lk(share_store->mu);
-        for (auto& x : share_store->ring)
-            if (x->digest == d) { x = e; return; }
-        share_store->ring.push_back(e);
-        while (share_store->ring.size() > 16) share_store->ring.pop_front();
+        share_store->put(e);   // bounded: ShareStateStore::kMaxStates
     };
     auto canon_check = [&](std::uint64_t h, const std::string& bid, const std::vector<std::uint8_t>& blob,
                            const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
