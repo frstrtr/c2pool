@@ -431,7 +431,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the per-share split on an individual share's page. FOLDED in for the same
     # reason; needs the same link set plus the header-only mint/producer weight
     # walk and coinbase allocator, both already reachable from `dash`.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp)
+    # #1835 outbound-redial KAT (test_dash_outbound_redial.cpp) drives the REAL
+    # NodeImpl dial path against a refused loopback port; folded into this
+    # EXISTING allowlisted target (it needs the `dash` OBJECT lib linked below)
+    # so it is built and run by CI rather than reported "Not Run".
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_outbound_redial.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
