@@ -131,6 +131,7 @@ o2::PayOfFn pay_of_map(const std::map<::v37::bytes32, ::v37::ScriptRef>& m) {
 // SPEND-COST FLOOR (payout-threshold.md §2-§3), as the daemon runs it; M7 turns it on.
 bool g_spend_floor = false;
 std::uint64_t g_cap_at = 0; std::uint32_t g_cap = 0;
+long long g_seed_scale = 1;   // M10b: the seeded old balances times this (a pool with no cash to spare)
 bool g_no_seeds = false;   // M7b: a fresh pool, no seeded owed balances
 std::uint64_t g_reorg_at = 0;
 std::uint64_t g_decay_h = 0, g_decay_hl = 0;   // M10: dust decay horizon / half-life (bins); 0 = the lane's
@@ -341,7 +342,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
     for (auto& n : run.nodes) {
         for (std::size_t i = 0; i < (g_no_seeds ? 0 : W.seeded.size()); ++i) {
             const std::string bid = "seed-" + std::to_string(i);
-            n.L.on_block_found(bid, Amounts{{W.seeded[i].id, W.seed_amount[i]}}, {});
+            n.L.on_block_found(bid, Amounts{{W.seeded[i].id, W.seed_amount[i] * g_seed_scale}}, {});
             n.L.on_block_finalized(bid, i + 1);
             n.booked[W.seeded[i].id] = W.seeded[i].ref;                 // a seed is lane config
         }
@@ -605,34 +606,51 @@ void m9_reorg() {
 }
 
 void m10_decay() {
-    std::printf("== M10. tiny miners leave; their dust decays alike on every node ==\n");
+    // A8 (operator ruling 2026-09-30): a balance below c is PAID when the block
+    // has room. Here every block has room, so the gone miners' dust is paid out
+    // and nothing is left to decay.
+    std::printf("== M10. tiny miners leave; with room, their dust is PAID (A8), nothing is lost ==\n");
     g_spend_floor = true; g_leave_at = 10; g_decay_h = 6; g_decay_hl = 3;
     LaneWorld W;
     for (int i = 0; i < 40; ++i) { const Payee p = payee(static_cast<std::uint8_t>(120 + i)); W.miners.push_back(p); W.universe[p.id] = p.ref; }
     Run r = simulate(W, 40);
     g_spend_floor = false; g_leave_at = 0; g_decay_h = g_decay_hl = 0;
     CHECK(r.canonical == 40 && r.verdict_splits == 0 && r.split_heights == 0, "all 40 blocks canonical, one verdict, one owed_digest at every height");
-    long long gone_bal = 0, stay_bal = 0;
-    std::size_t stay_n = 0;
-    for (std::size_t i = W.n_big; i < W.miners.size(); ++i) {
-        const long long b = eo(r, W.miners[i].id);
-        if (i % 2 == 0) gone_bal += b; else { stay_bal += b; ++stay_n; }
+    long long gone_bal = 0, gone_eb = 0, gone_paid = 0;
+    for (std::size_t i = W.n_big; i < W.miners.size(); i += 2) {
+        const auto& k = W.miners[i].id;
+        gone_bal += eo(r, k);
+        gone_eb += r.eb_gross.count(k) ? r.eb_gross.at(k) : 0;
+        gone_paid += r.paid.count(k) ? r.paid.at(k) : 0;
     }
-    CHECK(r.nodes[0].L.decayed_total() > 0 && r.nodes[0].L.decayed_total() == r.nodes[1].L.decayed_total() &&
-          r.nodes[1].L.decayed_total() == r.nodes[2].L.decayed_total(),
-          "the gone miners' dust decays, the same amount on every node (%lld piconero)", r.nodes[0].L.decayed_total());
-    CHECK(gone_bal * 100 <= r.nodes[0].L.decayed_total(), "the gone miners' dust is almost all written off (%lld left of %lld)",
-          gone_bal, gone_bal + r.nodes[0].L.decayed_total());
-    bool none_negative = true;
-    for (const auto& [k, eb] : r.eb_gross) { (void)eb; if (eo(r, k) < 0) none_negative = false; }
-    CHECK(none_negative, "no balance is negative");
-    bool stay_exact = true;
-    for (std::size_t i = W.n_big + 1; i < W.miners.size(); i += 2) {
+    CHECK(gone_bal == 0 && gone_eb > 0 && gone_paid == gone_eb,
+          "the gone miners' dust is paid in full when there is room (credited %lld, paid %lld, left %lld)", gone_eb, gone_paid, gone_bal);
+    CHECK(r.nodes[0].L.decayed_total() == 0 && r.nodes[1].L.decayed_total() == 0 && r.nodes[2].L.decayed_total() == 0,
+          "nothing decays: an owed balance never waits while a block has a slot for it");
+    bool exact = true;
+    for (std::size_t i = W.n_big; i < W.miners.size(); ++i) {
         const auto& k = W.miners[i].id;
         const long long eb = r.eb_gross.count(k) ? r.eb_gross.at(k) : 0, paid = r.paid.count(k) ? r.paid.at(k) : 0;
-        if (eb - paid != eo(r, k)) stay_exact = false;
+        if (eb - paid != eo(r, k)) exact = false;
     }
-    CHECK(stay_n == 20 && stay_exact, "the 20 tiny miners who keep mining lose nothing to decay: credited - paid == balance, exactly");
+    CHECK(exact, "every tiny miner: credited - paid == balance, exactly");
+
+    // M10b: no cash to spare (old balances 1000x the seeds take every pool in
+    // the owed pass), so the gone miners' dust waits and decays, alike on
+    // every node, as before.
+    std::printf("== M10b. no cash to spare: their dust waits and decays alike on every node ==\n");
+    g_spend_floor = true; g_leave_at = 10; g_decay_h = 6; g_decay_hl = 3; g_seed_scale = 1000;
+    LaneWorld W2;
+    for (int i = 0; i < 40; ++i) { const Payee p = payee(static_cast<std::uint8_t>(120 + i)); W2.miners.push_back(p); W2.universe[p.id] = p.ref; }
+    Run r2 = simulate(W2, 40);
+    g_spend_floor = false; g_leave_at = 0; g_decay_h = g_decay_hl = 0; g_seed_scale = 1;
+    CHECK(r2.canonical == 40 && r2.verdict_splits == 0 && r2.split_heights == 0, "all 40 blocks canonical, one verdict, one owed_digest at every height");
+    CHECK(r2.nodes[0].L.decayed_total() > 0 && r2.nodes[0].L.decayed_total() == r2.nodes[1].L.decayed_total() &&
+          r2.nodes[1].L.decayed_total() == r2.nodes[2].L.decayed_total(),
+          "the gone miners' dust decays, the same amount on every node (%lld piconero)", r2.nodes[0].L.decayed_total());
+    bool none_negative = true;
+    for (const auto& [k, eb] : r2.eb_gross) { (void)eb; if (eo(r2, k) < 0) none_negative = false; }
+    CHECK(none_negative, "no balance is negative");
 }
 
 void m11_anchor() {

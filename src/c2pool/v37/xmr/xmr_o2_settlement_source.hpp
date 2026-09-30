@@ -99,6 +99,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <optional>
 #include <string>
 #include <utility>
@@ -369,6 +370,37 @@ public:
                 in.owed.push_back(std::move(e));
             }
             in.h_min = 0;                                 // W4 already applied the floor
+            // A8 (operator ruling 2026-09-30): every positive balance the
+            // proposal did not take -- below c, so never armed, or otherwise
+            // left -- is paid WHEN THERE IS ROOM (x6 CoinbaseInputs::owed_dust).
+            // Canonical order: sha256d("V37T" || prev_id || identity) ASC, the
+            // salted tie nobody can grind. Amount: EffectiveOwed, so a balance
+            // is never paid beyond what is owed.
+            if (ctx.spend_floor) {
+                std::set<::v37::bytes32> taken;
+                for (const auto& o : prop.outs) taken.insert(o.key);
+                std::uint8_t pre[4 + 32 + 32] = {'V', '3', '7', 'T'};
+                std::memcpy(pre + 4, ctx.prev_id.data(), 32);
+                std::vector<std::pair<::v37::bytes32, x6::OwedEntry>> dust;
+                for (const auto& [k, owed] : ledger.effective_owed_all()) {
+                    if (owed <= 0 || taken.count(k)) continue;
+                    ::v37::ScriptRef r = payable_ref(k);
+                    if (!::v37::xmr::is_xmr_kind(r.kind)) continue;   // unpayable => carry
+                    x6::OwedEntry e;
+                    e.pay = r;
+                    e.owed = static_cast<std::uint64_t>(owed);
+                    e.first_eligible = 0;
+                    e.identity = k;
+                    std::memcpy(pre + 36, k.data(), 32);
+                    dust.emplace_back(::v37::sha256d(pre, sizeof(pre)), std::move(e));
+                }
+                std::sort(dust.begin(), dust.end(), [](const auto& a, const auto& b) {
+                    if (a.first != b.first) return a.first < b.first;
+                    return a.second.identity < b.second.identity;
+                });
+                in.owed_dust.reserve(dust.size());
+                for (auto& d : dust) in.owed_dust.push_back(std::move(d.second));
+            }
         }
         else {
             // X6 decides: every EffectiveOwed > 0 with its real age; X6 sorts

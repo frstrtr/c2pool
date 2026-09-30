@@ -53,6 +53,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -287,6 +289,46 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
         remaining -= amt;
     }
 
+    // ---- DUST DEBT WHEN THERE IS ROOM (audit A8, spend floor only). Pays the
+    // balances the owed pass skipped (in.owed_dust, canonical order) out of
+    // `pool`, one free slot each unless the payee already has an output here
+    // (`has_slot`); an existing Owed output of the payee takes the amount. The
+    // amounts paid per identity are returned so the pay-now DEBT step never
+    // pays the same balance twice.
+    std::map<::v37::bytes32, std::uint64_t> dust_paid;
+    auto pay_dust = [&](std::uint64_t& pool, std::size_t& free_slots,
+                        const std::function<bool(const OwedEntry&)>& has_slot) {
+        for (const OwedEntry& e : in.owed_dust) {
+            if (pool == 0) break;
+            if (e.owed == 0) continue;
+            if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink) continue;
+            if (fold && is_fold_payee(in, e.pay, e.identity)) continue;
+            CoinbaseOutput* existing = nullptr;
+            for (auto& o : res)
+                if (o.role == CoinbaseOutput::Role::Owed && o.identity == e.identity && o.pay == e.pay) { existing = &o; break; }
+            const bool reserved = !existing && has_slot(e);
+            if (!existing && !reserved) {
+                if (free_slots == 0) continue;
+                --free_slots;
+            }
+            const std::uint64_t amt = std::min(e.owed, pool);
+            if (existing) {
+                existing->amount += amt;
+            } else {
+                CoinbaseOutput o;
+                o.pay = e.pay;
+                o.identity = e.identity;
+                o.amount = amt;
+                o.role = CoinbaseOutput::Role::Owed;
+                res.push_back(std::move(o));
+                ++n_slots;   // a reserved (pay-now admitted) payee's slot, or a free one
+            }
+            dust_paid[e.identity] += amt;
+            pool -= amt;
+            remaining -= amt;
+        }
+    };
+
     // ---- SAME-BLOCK PAY-NOW (operator ruling 09-25): what the oldest-first
     // owed pass left above the folded donation minimum pays the payees whose
     // work THIS block credits, pro rata to their E_b at this budget, each
@@ -347,6 +389,15 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                     }
                     take[i] = ents[i].eb;
                 }
+                // Dust debt in the slots the admission left free (A8), paid
+                // before the pool is split: debt before this block's pay-now,
+                // as the owed pass is. An admitted payee needs no second slot.
+                std::uint64_t pool_left = pool;
+                pay_dust(pool_left, free_slots, [&](const OwedEntry& d) {
+                    for (std::size_t i = 0; i < ents.size(); ++i)
+                        if (take[i] > 0 && ents[i].identity == d.identity && ents[i].pay == d.pay) return true;
+                    return false;
+                });
                 // Each admitted payee gets its E_b (pro rata when the pool is short).
                 // Cash left over came from the payees without a slot. It goes, in
                 // this order, never as an advance:
@@ -359,15 +410,18 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                 //       payees were credited: to the admitted payees pro rata, and
                 //       taken off the waiting payees' credit (credit_delta).
                 //   (3) The rest (uncredited cash) stays in the residual.
-                alloc = paynow_split(pool, take);
+                alloc = paynow_split(pool_left, take);
                 std::uint64_t given = 0;
                 for (const std::uint64_t a : alloc) given += a;
-                std::uint64_t spare = pool - given;
+                std::uint64_t spare = pool_left - given;
                 for (const std::size_t i : order) {
                     if (spare == 0) break;
                     if (take[i] == 0 || ents[i].owed_left == 0) continue;
                     if (ents[i].identity == in.residual_sink_identity && ents[i].pay == in.residual_sink) continue;
-                    const std::uint64_t d = std::min(spare, ents[i].owed_left);
+                    const auto dp = dust_paid.find(ents[i].identity);
+                    const std::uint64_t already = dp == dust_paid.end() ? 0 : dp->second;   // A8: never twice
+                    if (ents[i].owed_left <= already) continue;
+                    const std::uint64_t d = std::min(spare, ents[i].owed_left - already);
                     alloc[i] += d;
                     spare -= d;
                 }
@@ -413,6 +467,14 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                 remaining -= alloc[i];
             }
         }
+    }
+
+    // No pay-now in this block (no view at the anchor yet): the dust debt still
+    // takes the slots and the cash the owed pass left (A8).
+    if (!in.paynow_at && in.spend_floor && !in.owed_dust.empty()) {
+        std::uint64_t pool = remaining > fold_min ? remaining - fold_min : 0;
+        std::size_t free_slots = cap_owed > n_slots ? cap_owed - n_slots : 0;
+        pay_dust(pool, free_slots, [](const OwedEntry&) { return false; });
     }
 
     // ---- S2: the folded donation minimum, when the residual cannot cover it,

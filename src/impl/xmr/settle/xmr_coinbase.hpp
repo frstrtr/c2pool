@@ -255,6 +255,15 @@ struct CoinbaseInputs {
     // off the credit of those it came from (allocate_exact_sum's credit_delta):
     // never an advance. Pay-now never fails the build for want of a slot.
     bool           spend_floor = false;
+    // SPEND-COST FLOOR only: the positive balances the owed pass does not take
+    // (below c, so unarmed, or otherwise not proposed), in the canonical order
+    // the source gives (sha256d("V37T" || prev_id || identity) ASC). They are
+    // paid WHEN THERE IS ROOM (operator ruling 2026-09-30, audit A8): after
+    // the owed pass and the pay-now admission, each takes a free output slot
+    // (none if its payee already has an output in this coinbase) and is paid
+    // min(owed, pool left) before the pay-now pool is split. Debt before the
+    // residual: an owed balance never waits while the block has a slot for it.
+    std::vector<OwedEntry> owed_dust;
 
     // --- tx_extra ---
     std::vector<unsigned char> extra_nonce; // 0x02 padded per-worker extranonce

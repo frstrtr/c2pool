@@ -502,6 +502,58 @@ void f11_anchor() {
 
 }  // namespace
 
+
+// ---------------------------------------------------------------------------
+void f12_dust_debt_when_room() {
+    std::printf("== F12. a balance below c is PAID when the block has room (audit A8) ==\n");
+    const std::uint64_t c = x6::spend_floor(kTail);
+    const std::uint64_t reward = 600000000000ull;
+    auto mk = [&](std::uint8_t k, std::uint64_t owed) { x6::OwedEntry e; auto r = ref_of(k); e.pay = r; e.identity = id_of(r); e.owed = owed; return e; };
+    // (a) no pay-now, room to spare: the dust debts are paid in full, the rest
+    //     of the pool stays in the donation residual.
+    {
+        auto in = fee_on_inputs(reward, true);
+        in.owed_dust = {mk(31, c / 2), mk(32, c - 1)};
+        const auto outs = x6::allocate_exact_sum(in);
+        CHECK(to(outs, in.owed_dust[0].identity) == c / 2 && to(outs, in.owed_dust[1].identity) == c - 1,
+              "no pay-now: both dust debts paid in full (%llu, %llu)",
+              (unsigned long long)to(outs, in.owed_dust[0].identity), (unsigned long long)to(outs, in.owed_dust[1].identity));
+        CHECK(sum_of(outs) == reward, "exact sum kept");
+    }
+    // (b) pay-now fills the pool: the dust debt is paid FIRST (debt before this
+    //     block's pay-now), a pay-now payee's own dust merges into its output
+    //     (no second slot), and its owed_left is not paid a second time.
+    {
+        const P a = payee(41, 300000000000ull), b = payee(42, 299000000000ull);
+        auto in = fee_on_inputs(reward, true);
+        arm(in, {a, b});
+        const x6::OwedEntry da = [&] { x6::OwedEntry e; e.pay = a.ref; e.identity = a.id; e.owed = c / 4; return e; }();
+        in.owed_dust = {da, mk(43, c / 5)};
+        // a's pay-now entry also names the same balance as owed_left
+        auto pn = in.paynow_at;
+        in.paynow_at = [pn, &a, c](std::uint64_t t) { auto v = pn(t); for (auto& e : v) if (e.identity == a.id) e.owed_left = c / 4; return v; };
+        const auto outs = x6::allocate_exact_sum(in);
+        std::size_t outs_a = 0; for (const auto& o : outs) if (o.identity == a.id) ++outs_a;
+        CHECK(outs_a == 1, "one output for the pay-now payee that also had a dust debt");
+        const std::uint64_t id43 = to(outs, mk(43, 0).identity);
+        CHECK(id43 == c / 5, "the other dust debt took a free slot and is paid in full (%llu)", (unsigned long long)id43);
+        CHECK(sum_of(outs) == reward, "exact sum kept");
+        CHECK(to(outs, a.id) + to(outs, b.id) + id43 + to(outs, fee::donation_identity(kNet)) == reward,
+              "the dust debts came out of the pool, not on top of it");
+        CHECK(to(outs, a.id) <= a.eb + c / 4, "a is never paid beyond its E_b plus its balance (no double pay of owed_left)");
+    }
+    // (c) no free slot: a dust debt whose payee has no output waits.
+    {
+        auto in = fee_on_inputs(reward, true);
+        in.output_cap = 2;   // the donation marker + one slot
+        in.owed_dust = {mk(51, c / 2), mk(52, c / 3)};
+        const auto outs = x6::allocate_exact_sum(in);
+        const std::uint64_t p1 = to(outs, in.owed_dust[0].identity), p2 = to(outs, in.owed_dust[1].identity);
+        CHECK((p1 > 0) + (p2 > 0) == 1, "one slot: exactly one dust debt is paid, in the given (salted) order; the other waits");
+        CHECK(p1 == c / 2, "the first in order took the slot");
+    }
+}
+
 int main() {
     std::printf("v37_xmr_spend_floor_kat\n");
     f1_floor();
@@ -519,6 +571,7 @@ int main() {
     f9_off();
     f10_decay();
     f11_anchor();
+    f12_dust_debt_when_room();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }
