@@ -8,6 +8,14 @@
 //   geometry_digest = sha256d( 'V37RBG' || geometry_leaf(LaneParams) )
 //   geometry_leaf   = 'V37H' || u64 window || u64 c0 || u64 rollup ||
 //                     u64 half_life || u64 |level_caps| || u64 caps[i]...
+//                     [ || 'KFL1' || u64 k_floor ]   iff k_floor != 0
+//
+// The optional KFL1 block (STEP-0 hotfix) is the coinbase no-dust floor: it
+// decides the canonical coinbase, so it is consensus and rides the geometry
+// digest exactly where the canon header leaf carries it. A zero k_floor (the
+// bare LaneParams{}, XMR) appends nothing, so every pre-hotfix tag is
+// unchanged; a Family-A lane (k_floor = f_ref = 10) tags differently from any
+// node running another floor and is refused as TAG_MISMATCH.
 //
 // geometry_leaf is recomputed STANDALONE from the public LaneParams fields and
 // is byte-for-byte the geometry prefix of the canon lane header leaf
@@ -52,6 +60,10 @@ inline std::vector<std::uint8_t> geometry_leaf(const ::v37::LaneParams& p) {
     put_u64(h, p.half_life);
     put_u64(h, static_cast<u64>(p.level_caps.size()));
     for (u64 c : p.level_caps) put_u64(h, c);
+    if (p.k_floor != ::v37::K_FLOOR_NONE) {   // mirror of the canon KFL1 block
+        put_tag(h, "KFL1");
+        put_u64(h, p.k_floor);
+    }
     return h;
 }
 

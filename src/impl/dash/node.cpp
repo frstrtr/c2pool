@@ -64,7 +64,30 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
             [i, data, remaining, this, addr]()
             {
                 auto& share = data->m_items[i];
-                if (share.hash().IsNull())
+
+                // The one wire type this chain admits (public: v16; private/
+                // isolated v36 sharechain: the type it mints). A share of the
+                // other type is dropped here: hash forced null, phase 2 frees it.
+                bool admitted = true;
+                try
+                {
+                    share.ACTION({
+                        check_share_type_admitted(share_t::version, m_tracker.m_coin_params);
+                    });
+                }
+                catch (const std::exception& e)
+                {
+                    admitted = false;
+                    share.ACTION({ obj->m_hash.SetNull(); });
+                    static std::atomic<uint64_t> s_rejected{0};
+                    const uint64_t n_rej = ++s_rejected;
+                    if (n_rej <= 3 || n_rej % 100 == 0)
+                        LOG_WARNING << "[Pool] share from " << addr.to_string()
+                                    << " rejected: " << e.what()
+                                    << " (rejected_total=" << n_rej << ")";
+                }
+
+                if (admitted && share.hash().IsNull())
                 {
                     try
                     {
@@ -252,7 +275,7 @@ NodeImpl::handle_get_share(std::vector<uint256> hashes, uint64_t parents,
     parents = std::min(parents, (uint64_t)1000 / hashes.size());
 
     // DPI-latch mitigation (DASH lane only). A stateful ISP-side per-flow DPI
-    // blackhole (TSPU-class CGN on the hotel uplink) silently drops ALL packets
+    // blackhole (TSPU-class CGN on the private host uplink) silently drops ALL packets
     // both directions once a single outbound-initiated TCP flow to the foreign
     // hoster accumulates ~13-16 KB of payload that does not classify as a known
     // protocol. c2pool's binary p2p sharereply is emitted as ONE async_write,
@@ -345,6 +368,12 @@ void NodeImpl::load_persisted_shares()
     // Only the newest window is loaded (LevelDB accumulates forever).
     const size_t keep = static_cast<size_t>(SharechainConfig::chain_length()) * 2 + 10;
     const size_t total_in_db = all_hashes.size();
+
+    // One store holds one share type: a private/isolated identity's subdir is
+    // keyed on the share version it mints (SharechainConfig::data_subdir,
+    // "dash_<id>_v36"), so the newest `keep` rows are all rows of the type the
+    // chain speaks — the window of master, unchanged. The per-row type check
+    // below stays as a cheap invariant.
     size_t skip = (total_in_db > keep) ? (total_in_db - keep) : 0;
 
     int loaded = 0, skipped = 0;
@@ -364,6 +393,18 @@ void NodeImpl::load_persisted_shares()
             chain::RawShare rshare(ver, PackStream(
                 std::vector<unsigned char>(data.begin() + 8, data.end())));
             auto share = dash::load_share(rshare, NetService{"database", 0});
+            // A row of a type this chain does not admit is skipped, never
+            // inserted (invariant; the version-keyed subdir already keeps
+            // other-type rows out of this store).
+            try {
+                check_share_type_admitted(share.version(), m_tracker.m_coin_params);
+            } catch (const std::exception& e) {
+                share.destroy();
+                ++skipped;
+                LOG_WARNING << "[Pool] skipped persisted share "
+                            << hash.GetHex().substr(0, 16) << ": " << e.what();
+                continue;
+            }
             // m_hash is not serialized — restore from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
             if (m_chain->contains(share.hash())) {
@@ -471,18 +512,23 @@ void NodeImpl::apply_min_protocol_ratchet()
     const uint32_t target  = SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION;  // 3600
     const uint32_t current =
         m_runtime_min_protocol_version.load(std::memory_order_relaxed);
-    if (current >= target)                    // already ratcheted -> latched, no-op
+    // Already ratcheted -> latched, no-op. On the private/isolated DASH v36
+    // sharechain the floor is SEEDED at 3600 (node.hpp, share_profile()
+    // .ratchet_floor_protocol_version), so this returns on the first call there.
+    if (current >= target)
         return;
     if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))
         return;
 
     // DASH DIVERGENCE FROM dgb (flagged for integrator): dgb keys the ratchet on the
-    // best share's static TYPE version (35 -> 36 after the format switch). DASH has
-    // NO v36 share TYPE — DashShare is permanently wire-type 16 — so "the best share
-    // is v36" is expressed by its m_desired_version VOTE reaching 36, and that vote is
-    // what the work-weighted tally is keyed by. Using the static type here would check
-    // weights[16] (always ~100% pre-crossing) and FALSELY lift the floor; using the
-    // vote checks weights[36], which is ~0 until the crossing actually happens.
+    // best share's static TYPE version (35 -> 36 after the format switch). On the
+    // public network DASH has no v36 share TYPE — DashShare is permanently wire-type
+    // 16 (the v36 type, DashV36Share, exists only on the private/isolated v36
+    // sharechain) — so "the best share is v36" is expressed by its m_desired_version
+    // VOTE reaching 36, and that vote is what the work-weighted tally is keyed by.
+    // Using the static type here would check weights[16] (always ~100% pre-crossing)
+    // and FALSELY lift the floor; using the vote checks weights[36], which is ~0
+    // until the crossing actually happens.
     int64_t best_desired = 0;
     uint256 prev_hash;
     m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {
@@ -1064,35 +1110,41 @@ void NodeImpl::start_outbound_connections()
         return;
     }
 
-    // btc/ltc node.cpp:1289-1327 port.
-    auto try_connect_peers = [this]()
-    {
-        const size_t outbound = m_outbound_addrs.size();
-        if (outbound >= m_target_outbound_peers || m_connections.size() >= m_max_peers)
-            return;
-
-        size_t needed = m_target_outbound_peers - outbound;
-        // Ask for a few extra in case some are already connected.
-        for (auto& ap : get_good_peers(needed + 4))
-        {
-            if (needed == 0)
-                break;
-            // Skip if already connected, already dialing, or banned.
-            if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr)
-                || is_banned(ap.addr))
-                continue;
-            LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
-            m_pending_outbound.insert(ap.addr);
-            core::Client::connect(ap.addr);
-            --needed;
-        }
-    };
-
     try_connect_peers();  // initial burst (--addnode/--connect seeds)
 
     // Periodic maintenance — top up outbound peers every 30 seconds.
     m_connect_timer = std::make_unique<core::Timer>(m_context, true);
-    m_connect_timer->start(30, try_connect_peers);
+    m_connect_timer->start(30, [this]() { try_connect_peers(); });
+}
+
+// One outbound dial-maintenance pass (btc/ltc node.cpp:1289-1327 port). Runs
+// on the IO thread: once from start_outbound_connections() and then on every
+// 30 s m_connect_timer tick. An address stays in m_pending_outbound from the
+// dial until the dial resolves: connected() on success, error() /
+// close_connection() once a socket existed, connect_failed() when it never did
+// (#1835: without that last one a refused dial was never retried). A member
+// (not a lambda) so the dial pass can be driven directly by a KAT.
+void NodeImpl::try_connect_peers()
+{
+    const size_t outbound = m_outbound_addrs.size();
+    if (outbound >= m_target_outbound_peers || m_connections.size() >= m_max_peers)
+        return;
+
+    size_t needed = m_target_outbound_peers - outbound;
+    // Ask for a few extra in case some are already connected.
+    for (auto& ap : get_good_peers(needed + 4))
+    {
+        if (needed == 0)
+            break;
+        // Skip if already connected, already dialing, or banned.
+        if (m_connections.contains(ap.addr) || m_pending_outbound.contains(ap.addr)
+            || is_banned(ap.addr))
+            continue;
+        LOG_INFO << "[Pool] Dialing outbound peer " << ap.addr.to_string();
+        m_pending_outbound.insert(ap.addr);
+        core::Client::connect(ap.addr);
+        --needed;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════

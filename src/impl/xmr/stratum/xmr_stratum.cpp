@@ -145,7 +145,8 @@ static std::string job_object(const JobNotify& j) {
 }
 
 std::string StratumDialect::build_login_ok(std::uint32_t req_id, std::uint32_t rpc_id,
-                                           const JobNotify& job) {
+                                           const JobNotify& job,
+                                           std::string_view extra_result) {
     std::string s;
     s += "{\"id\":";
     s += std::to_string(req_id);
@@ -153,7 +154,9 @@ std::string StratumDialect::build_login_ok(std::uint32_t req_id, std::uint32_t r
     s += u32_hex(rpc_id);
     s += "\",\"job\":{";
     s += job_object(job);
-    s += "},\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n";
+    s += "}";
+    if (!extra_result.empty()) { s += ","; s += extra_result; }   // FEE DISCLOSURE
+    s += ",\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n";
     return s;
 }
 
@@ -293,6 +296,9 @@ static std::uint32_t skeleton_random32() {
 
 bool XmrStratumServer::make_job(XmrStratumSession& s, std::uint32_t extra_nonce,
                                 JobNotify& out) {
+    // SEAM-1: bind this job's extra_nonce (payee + give-author) before its
+    // blob is built -- the template writes the binding into the coinbase.
+    if (m_job_binder) m_job_binder(extra_nonce, s.login().address);
     TemplateJob tj;
     if (!m_templates.get_job(extra_nonce, tj)) return false;
 
@@ -337,7 +343,7 @@ bool XmrStratumServer::handle_login(XmrStratumSession& s, std::uint32_t req_id,
 
     const std::uint32_t rpc_id = skeleton_random32();
     if (!m_transport.send_line(s.client_id(),
-                               StratumDialect::build_login_ok(req_id, rpc_id, job))) {
+                               StratumDialect::build_login_ok(req_id, rpc_id, job, m_login_extra))) {
         return false;
     }
     s.set_rpc_id(rpc_id);

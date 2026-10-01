@@ -89,4 +89,98 @@ inline std::optional<CreditCut> parse_from_tx_extra(const std::vector<unsigned c
     return parse_tail(*f);
 }
 
+// ---------------------------------------------------------------------------
+// POOL-LINEAGE (operator ruling 2026-09-25): the V37C tail's versioned pool-tag
+// field. Every lane block a pool builds commits its pool_tag
+// (xmr_pool_tag.hpp: sha256d('V37PT' || lane_tag || pool_genesis_id)) as
+//
+//     "V37P" | u8 version (= 1) | b32 pool_tag                        (37 B)
+//
+// placed IMMEDIATELY BEFORE the credit-cut tail (or last when the node has no
+// cut yet), so the 0x02 payload of a lineage-tagged pool reads
+//
+//     [ nonce 4 | rbind? | pad | "V37D" u64le? | "V37P" v pool_tag | "V37C" P spine? ]
+//
+// parse_tail() above is unchanged (V37C stays LAST). The field is END-anchored
+// like the rest of the tail, constant size, never patched per extra_nonce.
+// STRICT parse: a "V37P" magic with any version other than 1 is MALFORMED (a
+// reader never guesses the layout of a future version); no magic at the field
+// position = an untagged (pre-lineage) tail.
+// ---------------------------------------------------------------------------
+inline constexpr unsigned char kPoolTagMagic[4]   = {'V', '3', '7', 'P'};
+inline constexpr std::uint8_t  kPoolTagVersion    = 1;
+inline constexpr std::size_t   kPoolTagFieldBytes = 4 + 1 + 32;   // 37
+
+inline std::vector<std::uint8_t> encode_pool_tag_field(const ::v37::bytes32& pool_tag) {
+    std::vector<std::uint8_t> t;
+    t.reserve(kPoolTagFieldBytes);
+    t.insert(t.end(), kPoolTagMagic, kPoolTagMagic + 4);
+    t.push_back(kPoolTagVersion);
+    t.insert(t.end(), pool_tag.begin(), pool_tag.end());
+    return t;
+}
+
+enum class PoolTagParse : std::uint8_t {
+    Absent    = 0,   // no V37P field: an untagged (pre-lineage) payload
+    Present   = 1,   // a version-1 field; pool_tag filled
+    Malformed = 2,   // the V37P magic with an unknown version (strict reject)
+};
+
+// End offset of the part of a 0x02 payload BEFORE the credit-cut tail (the
+// payload size when there is no V37C tail).
+inline std::size_t end_before_credit_tail(const std::vector<std::uint8_t>& p) {
+    std::size_t end = p.size();
+    if (end >= kTailBytes && std::memcmp(p.data() + end - kTailBytes, kMagic, 4) == 0) end -= kTailBytes;
+    return end;
+}
+
+inline PoolTagParse parse_pool_tag_payload(const std::vector<std::uint8_t>& p, ::v37::bytes32* pool_tag = nullptr) {
+    const std::size_t end = end_before_credit_tail(p);
+    if (end < kPoolTagFieldBytes) return PoolTagParse::Absent;
+    const std::uint8_t* f = p.data() + end - kPoolTagFieldBytes;
+    if (std::memcmp(f, kPoolTagMagic, 4) != 0) return PoolTagParse::Absent;
+    if (f[4] != kPoolTagVersion) return PoolTagParse::Malformed;
+    if (pool_tag) std::memcpy(pool_tag->data(), f + 5, 32);
+    return PoolTagParse::Present;
+}
+
+inline PoolTagParse parse_pool_tag(const std::vector<unsigned char>& tx_extra, ::v37::bytes32* pool_tag = nullptr) {
+    const auto f = extra_nonce_field(tx_extra);
+    if (!f) return PoolTagParse::Absent;
+    return parse_pool_tag_payload(*f, pool_tag);
+}
+
+// ---------------------------------------------------------------------------
+// POOL-LINEAGE: chain-block classification by the V37C tail's pool tag
+// (xmr_pool_tag.hpp derives the tag).
+// ---------------------------------------------------------------------------
+enum class BlockLineage : std::uint8_t {
+    Own       = 0,   // carries OUR pool_tag: a lane block of this pool
+    Foreign   = 1,   // carries ANOTHER pool's tag: an ordinary block here
+    Untagged  = 2,   // no V37P field (pre-lineage tail / not a v37 block): ordinary
+    Malformed = 3,   // a V37P magic of an unknown version: strict reject -> ordinary
+};
+
+inline const char* to_string(BlockLineage c) {
+    switch (c) {
+        case BlockLineage::Own:       return "own";
+        case BlockLineage::Foreign:   return "foreign";
+        case BlockLineage::Untagged:  return "untagged";
+        case BlockLineage::Malformed: return "malformed";
+    }
+    return "?";
+}
+
+inline BlockLineage classify_lineage(const std::vector<unsigned char>& tx_extra, const ::v37::bytes32& our_pool_tag,
+                             ::v37::bytes32* seen = nullptr) {
+    ::v37::bytes32 t{};
+    switch (parse_pool_tag(tx_extra, &t)) {
+        case PoolTagParse::Absent:    return BlockLineage::Untagged;
+        case PoolTagParse::Malformed: return BlockLineage::Malformed;
+        case PoolTagParse::Present:   break;
+    }
+    if (seen) *seen = t;
+    return t == our_pool_tag ? BlockLineage::Own : BlockLineage::Foreign;
+}
+
 } // namespace c2pool::v37n::xmr::credit

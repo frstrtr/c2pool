@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// D1 regression gate — the 2026-08-07/08 hotel freeze (0 of 26 rigs, twice).
+// D1 regression gate — the 2026-08-07/08 production freeze (0 of 26 rigs, twice).
 //
 // Root cause (three identical gdb stacks 5 s apart on the live node):
 //   StratumSession::handle_submit -> DASHWorkSource::get_current_gbt_prevhash

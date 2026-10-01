@@ -24,6 +24,7 @@
 #include <cstring>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,33 @@ inline const std::array<const AuthorityPubkey*, 2>& DONATION_AUTHORITY_PUBKEYS()
         &DONATION_PUBKEY_MAINTAINER(),
     };
     return keys;
+}
+
+// Authority set of the private/isolated DASH v36 sharechain (--network-id):
+// the maintainer key ONLY. hash160(DONATION_PUBKEY_MAINTAINER) is the 20-byte
+// payee inside the DASH P2PKH DONATION_SCRIPT (share_check.hpp), which is also
+// the v36 donation payee on that chain, so the sole message authority is the
+// donation payee. The public chain keeps the 2-key COMBINED set above.
+inline const std::array<const AuthorityPubkey*, 1>& ISOLATED_AUTHORITY_PUBKEYS()
+{
+    static const std::array<const AuthorityPubkey*, 1> keys = {
+        &DONATION_PUBKEY_MAINTAINER(),
+    };
+    return keys;
+}
+
+// Authority-set selector keyed on SharechainConfig::ShareProfile::
+// maintainer_only_authority (taken as a bool so this header keeps its include
+// graph). Consumed by the v36 share verifier (share_check.hpp
+// active_message_authority() -> share_init_verify(const DashV36Share&)), which
+// passes the selected set to validate_message_data(). Every other caller keeps
+// the default DONATION_AUTHORITY_PUBKEYS() argument, so the public behaviour
+// (main_dash.cpp unpack/validate, the v16 path) is unchanged.
+inline std::span<const AuthorityPubkey* const> authority_pubkeys(bool maintainer_only)
+{
+    if (maintainer_only)
+        return std::span<const AuthorityPubkey* const>(ISOLATED_AUTHORITY_PUBKEYS());
+    return std::span<const AuthorityPubkey* const>(DONATION_AUTHORITY_PUBKEYS());
 }
 
 // ============================================================================
@@ -266,9 +294,12 @@ struct DecryptResult
     const AuthorityPubkey* authority_pubkey{nullptr};  // which key succeeded
 };
 
-// Decrypt encrypted envelope. Returns nullopt if all authority keys fail MAC.
+// Decrypt encrypted envelope. Returns nullopt if every key in `keys` fails MAC.
+// `keys` is the authority set to try (default: the public 2-key set; the
+// private/isolated v36 sharechain passes authority_pubkeys(true)).
 inline std::optional<DecryptResult> decrypt_message_data(
-    const unsigned char* data, size_t len)
+    const unsigned char* data, size_t len,
+    std::span<const AuthorityPubkey* const> keys = DONATION_AUTHORITY_PUBKEYS())
 {
     if (len < ENCRYPTION_HEADER_SIZE + 1) return std::nullopt;
 
@@ -281,7 +312,7 @@ inline std::optional<DecryptResult> decrypt_message_data(
 
     if (ct_len == 0) return std::nullopt;
 
-    for (const auto* pubkey_ptr : DONATION_AUTHORITY_PUBKEYS())
+    for (const auto* pubkey_ptr : keys)
     {
         // enc_key = HMAC-SHA256(pubkey, nonce)
         auto enc_key = hmac_sha256(
@@ -322,14 +353,16 @@ struct UnpackResult
 
 // Main entry point: decrypt + parse inner envelope.
 // Returns empty result on failure; caller checks fields.
-inline UnpackResult unpack_share_messages(const unsigned char* data, size_t len)
+inline UnpackResult unpack_share_messages(
+    const unsigned char* data, size_t len,
+    std::span<const AuthorityPubkey* const> keys = DONATION_AUTHORITY_PUBKEYS())
 {
     UnpackResult result;
 
     if (!data || len < ENCRYPTION_HEADER_SIZE + 4)
         return result;
 
-    auto dec = decrypt_message_data(data, len);
+    auto dec = decrypt_message_data(data, len, keys);
     if (!dec.has_value())
         return result;  // Decryption failed → signing_key_info = nullptr
 
@@ -375,12 +408,16 @@ inline UnpackResult unpack_share_messages(const unsigned char* data, size_t len)
 // Convenience: validate message_data from a share.
 // Returns empty string on success; returns error reason on failure.
 // Empty message_data is always valid.
-inline std::string validate_message_data(const std::vector<unsigned char>& message_data)
+// `keys` is the authority set (default: the public 2-key set, so every existing
+// caller is unchanged; the v36 share verifier passes the per-network set).
+inline std::string validate_message_data(
+    const std::vector<unsigned char>& message_data,
+    std::span<const AuthorityPubkey* const> keys = DONATION_AUTHORITY_PUBKEYS())
 {
     if (message_data.empty())
         return {};  // No messages — always valid
 
-    auto result = unpack_share_messages(message_data.data(), message_data.size());
+    auto result = unpack_share_messages(message_data.data(), message_data.size(), keys);
 
     if (!result.decrypted)
         return "message_data failed decryption against all "
@@ -391,7 +428,7 @@ inline std::string validate_message_data(const std::vector<unsigned char>& messa
 
     // Check authority_pubkey is one we recognise
     bool known = false;
-    for (const auto* pk : DONATION_AUTHORITY_PUBKEYS())
+    for (const auto* pk : keys)
     {
         if (pk == result.authority_pubkey) { known = true; break; }
     }

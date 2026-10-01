@@ -203,6 +203,52 @@ BEGIN_MESSAGE(tx_inject)
     }
 END_MESSAGE()
 
+// message_alert / message_alertack (D-MINER.7) -- miner-offline alert relay
+// over the sharechain p2p mesh. NON-CONSENSUS: these frames never touch shares,
+// the sharechain, templates or payouts. A DPI-bound origin node seals a small
+// signed alert for one Telegram-capable relay node and sends it over its
+// existing sharechain peer sockets; forwarders pass it on verbatim (only
+// m_hops_left changes, which is outside the signature); the relay answers with
+// a signed alertack. Policy + crypto live in alert_relay.hpp / alert_service.hpp.
+// Old peers ignore both commands: c2pool's MessageHandler::parse throws
+// out_of_range for an unknown command and the dispatch logs + drops it (no
+// disconnect); python p2pool skips unknown commands. With every
+// --alert-relay-* flag off this node never sends either command.
+// Commands: "alert" (5 chars), "alertack" (8 chars) -- both <= 12.
+BEGIN_MESSAGE(alert)
+    MESSAGE_FIELDS
+    (
+        (uint32_t, m_version),
+        (uint8_t, m_hops_left),
+        (uint32_t, m_timestamp),
+        (uint64_t, m_nonce),
+        (std::vector<unsigned char>, m_origin_pubkey),
+        (std::vector<unsigned char>, m_to_key_id),
+        (std::vector<unsigned char>, m_body),
+        (std::vector<unsigned char>, m_signature)
+    )
+    {
+        READWRITE(obj.m_version, obj.m_hops_left, obj.m_timestamp, obj.m_nonce,
+                  obj.m_origin_pubkey, obj.m_to_key_id, obj.m_body, obj.m_signature);
+    }
+END_MESSAGE()
+
+BEGIN_MESSAGE(alertack)
+    MESSAGE_FIELDS
+    (
+        (uint32_t, m_version),
+        (std::vector<unsigned char>, m_origin_pubkey),
+        (uint64_t, m_nonce),
+        (uint8_t, m_status),
+        (std::vector<unsigned char>, m_relay_pubkey),
+        (std::vector<unsigned char>, m_signature)
+    )
+    {
+        READWRITE(obj.m_version, obj.m_origin_pubkey, obj.m_nonce, obj.m_status,
+                  obj.m_relay_pubkey, obj.m_signature);
+    }
+END_MESSAGE()
+
 using Handler = MessageHandler<
     message_ping,
     message_addrme,
@@ -216,7 +262,9 @@ using Handler = MessageHandler<
     message_losing_tx,
     message_forget_tx,
     message_remember_tx,
-    message_tx_inject
+    message_tx_inject,
+    message_alert,       // D-MINER.7 miner-offline alert relay (non-consensus)
+    message_alertack
 >;
 
 } // namespace dash

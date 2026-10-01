@@ -109,6 +109,7 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     //    wrong tip is judged against the wrong rules.
     if (!synced_) {
         ++stats_.rejected;
+        ++stats_.rejected_not_synced;
         return verdict(Reason::NotSynced, false);
     }
 
@@ -125,6 +126,14 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     const TxDecodeStatus st = decode_relayed_tx(blob.data(), blob.size(), d);
     if (st != TxDecodeStatus::Ok) {
         ++stats_.rejected;
+        // A format from a fork above the implemented range is not understood,
+        // and not understanding it is not the sender's fault: an upgraded
+        // honest peer relays exactly these. Refused without a drop offence.
+        // A malformed transaction of a known format is judged as before.
+        if (tx_format_above_implemented(blob.data(), blob.size())) {
+            ++stats_.rejected_not_understood;
+            return verdict(Reason::NotUnderstood, false);
+        }
         switch (st) {
             case TxDecodeStatus::UnsupportedRctType:
                 return verdict(Reason::BadVersion, true);
@@ -174,6 +183,22 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     if (d.w.unlock_time != 0) {
         ++stats_.rejected;
         return verdict(Reason::UnlockNotZero, false, d.id);
+    }
+
+    // 3b) Already MINED? The chain index's oracle, asked at its current tip.
+    //     Not a consensus judgement of the sender (no drop): a tx the chain
+    //     carries is simply not a pool transaction any more, and holding it
+    //     would put it in the next template -- a block every monerod refuses.
+    if (mined_oracle_ != nullptr) {
+        if (const auto t = mined_oracle_->tip()) {
+            std::vector<Hash> mined, spent;
+            if (mined_oracle_->probe_mined(t->id, {d.id}, d.rct.key_images, mined, spent)
+                && (!mined.empty() || !spent.empty())) {
+                ++stats_.rejected;
+                ++stats_.rejected_already_mined;
+                return verdict(Reason::AlreadyMined, false, d.id);
+            }
+        }
     }
 
     // 4) Already held? Bump the sighting bookkeeping and say so. Re-sighting
@@ -549,6 +574,13 @@ std::vector<node::TxBacklogEntry> RelayedTxPool::selectable_backlog(
     return snapshot_locked(p);
 }
 
+std::vector<Hash> RelayedTxPool::key_images_of(const Hash& id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    const auto it = by_id_.find(id);
+    if (it == by_id_.end()) return {};
+    return it->second.key_images;
+}
+
 TxpoolSelectPolicy RelayedTxPool::policy() const {
     std::lock_guard<std::mutex> lk(mu_);
     return cfg_.policy;
@@ -607,6 +639,7 @@ void RelayedTxPool::on_block_connected(const BlockTxEvent& ev) {
     // is the height the input-consensus spendable-age / unlock rules judge a
     // ring member against.
     tip_height_ = ev.height;
+    tip_known_  = true;
 
     for (const Hash& id : ev.tx_hashes) {
         if (by_id_.find(id) == by_id_.end()) continue;
@@ -627,11 +660,18 @@ void RelayedTxPool::on_block_connected(const BlockTxEvent& ev) {
 }
 
 void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
+    note_block_disconnected(ev);
+    readmit_disconnected(ev);
+}
+
+void RelayedTxPool::note_block_disconnected(const BlockTxEvent& ev) {
     // The disconnected block is no longer the tip; the new tip is one lower.
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (ev.height > 0) tip_height_ = ev.height - 1;
-    }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (ev.height > 0) tip_height_ = ev.height - 1;
+    tip_known_ = true;
+}
+
+void RelayedTxPool::readmit_disconnected(const BlockTxEvent& ev) {
 
     // Bodies returned by the index are BEST EFFORT and carry no authority
     // (contracts/types.hpp must-fix d), so they go back through the SAME
@@ -647,6 +687,11 @@ void RelayedTxPool::on_block_disconnected(const BlockTxEvent& ev) {
     on_relayed(self, std::move(blobs), /*dandelionpp_fluff=*/true);
 }
 
+void RelayedTxPool::set_mined_oracle(const IChainView* chain) {
+    std::lock_guard<std::mutex> lk(mu_);
+    mined_oracle_ = chain;
+}
+
 void RelayedTxPool::set_synced(bool synced) {
     std::lock_guard<std::mutex> lk(mu_);
     synced_ = synced;
@@ -657,6 +702,20 @@ void RelayedTxPool::set_input_consensus_sources(const IRingMemberSource* ring_sr
     std::lock_guard<std::mutex> lk(mu_);
     ring_src_   = ring_src;
     spent_view_ = spent_view;
+}
+
+bool RelayedTxPool::seat_tip(std::uint64_t tip_height) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (tip_known_) return false;
+    tip_height_ = tip_height;
+    tip_known_  = true;
+    ++stats_.tip_seated;
+    return true;
+}
+
+bool RelayedTxPool::tip_known() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return tip_known_;
 }
 
 bool RelayedTxPool::synced() const {

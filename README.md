@@ -26,7 +26,7 @@ when NO dashd arm is given"; resolver in
 `src/impl/dash/coin/good_citizen_defaults.hpp`). The public node
 `dash.voidbind.com` runs this posture with no dashd on the host. A node started
 with `--coin-rpc H:P` keeps dashd as the reward-safe fallback arm — the
-operator's hotel deployment still runs dashd-attached — so both postures are
+operator's private deployment still runs dashd-attached — so both postures are
 supported by the same binary. The remaining work is the daemonless-finalize item
 below (retiring the `--coin-rpc` fallback entirely). See
 [Per-binary launch reference](#per-binary-launch-reference) for the flags.
@@ -123,8 +123,8 @@ and does not yet exist, so the work can be judged on what it actually is.
   prerequisites (identity view + read-at-version ring — PR #1485), W4 per-lane
   settlement (OWED-ledger fold + O2 cut + O5.5 — PR #1486), W5 coinbase assembly
   (oldest-owed-first K_fair + h_min carry + §13 root — PR #1487), and W3 carrier
-  relay over the v36 p2p (wire extension + R_MAX — PR #1484). W6 persistence /
-  restart-recovery is a **reviewed draft, not landed** (PR #1506).
+  relay over the v36 p2p (wire extension + R_MAX — PR #1484), and W6 persistence /
+  restart-recovery (PR #1506).
 - An isolated **"Family B: XMR lane"** (Monero / RandomX) under `src/impl/xmr/`,
   which does **not** touch the v37 consensus digest. Merged: the lane foundation
   (scaffold + vendored RandomX + X0 — PR #1500), buildable KAT-tested primitives
@@ -132,8 +132,9 @@ and does not yet exist, so the work can be judged on what it actually is.
   envelope (PR #1503), and stratum + FCMP-fenced coinbase-settlement + carrier wire
   (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **merged**
   (PR #1512); a **single-node stagenet daemon is live** (monerod-bound, PRs
-  #1520 / #1529). Multi-node canonical payees + section-13 state root are a
-  reviewed draft (PR #1551).
+  #1520 / #1529). Multi-node settlement commits one owed ledger (`owed_digest`)
+  with coinbase authority and an on-chain credit cut (PRs #1697 / #1704); the
+  earlier section-13 state-root draft (PR #1551) was closed in its favour.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
@@ -150,11 +151,11 @@ and does not yet exist, so the work can be judged on what it actually is.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
-- **XMR lane is single-node stagenet.** Its RandomX verify runs CI-gated in light
-  mode and against a live `monerod`-stagenet single node (PRs #1520 / #1529); the
-  XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR #1518).
-  The remaining gaps are multi-node consensus (PR #1551, draft) and mainnet, which
-  stays double-fenced.
+- **XMR lane is stagenet only.** Its RandomX verify runs CI-gated in light mode;
+  the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR
+  #1518). Three daemonless nodes have run together on stagenet in day-long
+  capstone tests (PRs #1697 / #1704 / #1857); no multi-node run has yet met the
+  full capstone bar. Mainnet stays double-fenced.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
@@ -1202,6 +1203,10 @@ cd build && ctest --output-on-failure -j$(nproc)
 ## V37 development
 
 - **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
+  Erratum E-1: section 9 says the coinbase pays owed amounts "largest first". The
+  code and the ratified rule pay **oldest first** (by when a balance became
+  eligible, ties broken by a salted hash no participant can choose). The corrected
+  text is in PR #1884 (repository copy) and PR #1881 (site).
 - Dev chat (Telegram): https://t.me/c2pooldev
 - V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
 

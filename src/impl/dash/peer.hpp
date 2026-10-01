@@ -15,6 +15,7 @@
 
 #include "coin/transaction.hpp"
 #include "tx_inject_relay.hpp"   // #157 M2: dash::PeerInjectGuard
+#include "alert_relay.hpp"       // D-MINER.7: dash::alert::PeerAlertGuard
 
 #include <chrono>
 #include <map>
@@ -61,6 +62,10 @@ struct Peer
     // bounded per-peer txid dedup set, consulted by ingest_peer_inject before any
     // submit_inject work. Inert unless --embedded-tx-inject is armed.
     dash::PeerInjectGuard m_inject_guard;
+
+    // D-MINER.7: per-peer alert/alertack rate windows, consulted before any
+    // alert-relay work. Inert unless an --alert-relay-* role is armed.
+    dash::alert::PeerAlertGuard m_alert_guard;
 };
 
 }; // namespace dash

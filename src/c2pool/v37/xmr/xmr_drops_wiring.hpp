@@ -1,0 +1,2037 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
+//
+// This file is part of c2pool and is distributed under the terms of the GNU
+// Affero General Public License, version 3 or (at your option) any later
+// version. See COPYING in the repository root.
+//
+// ===========================================================================
+// src/c2pool/v37/xmr/xmr_drops_wiring.hpp — DROPS on the XMR lane: the live
+// shell wiring (the XMR twin of main_v37_btc_dash.cpp's Step-2 block).
+//
+// WHAT WAS MISSING. XmrNode carries the four DROPS T3 seams (set_drop_harvester,
+// set_enrollment_book, set_pre_harvest, set_drops_price_fn) and the finalize
+// driver composes compose_credit_replace() at every FOUND, but main_v37_xmr.cpp
+// never built a DropsWiring and never called a seam. After the operator flip
+// every XMR node would be gate-ON and DORMANT: it converges and credits nobody.
+// This header is what the shell holds instead; the shell makes the calls.
+//
+// FOUR XMR FACTS THE BTC WIRING DOES NOT HAVE TO FACE, AND HOW EACH IS MET:
+//
+// (1) THE CLOCK. An XMR work event's origin bin is its TEMPLATE height — the
+//     height of the block it would become (relay Admitted::bin, the stratum
+//     AcceptedShare::height) — which is the native tip + 1. The bin a payee is
+//     drawing in RIGHT NOW is therefore tip + 1, so the ex-ante clock fed to the
+//     TipBin is open_bin_of_tip(tip) = tip + 1, and an enrolment made now takes
+//     effect at tip + 2: strictly after every draw the payee can have seen.
+//     Under --arm-order p2p-first the tip is the NATIVE node's verified levin
+//     tip (the shell's pump_tip height watch). It is never the burial frontier
+//     (that enters only through pre_harvest -> declare_at_frontier) and never a
+//     monerod poll.
+//
+// (2) THE TARGET GEOMETRY. The estimator is written for leading-zero-bit
+//     targets (h_T = 2^(256-lz) - 1, T = 2^lz); a Monero share is a DIFFICULTY
+//     test, H_le * share_diff < 2^256. normalized_hash() maps the RandomX hash
+//     onto the fixed geometry lz = kXmrDropsLz EXACTLY:
+//         N = floor(H_le * share_diff / 2^lz)      N < 2^(256-lz)  <=>  share
+//     so a share is a hash at or below h_T, a raindrop is a hash above it, and
+//     the estimator's work unit is 2^lz normalised attempts = ONE share.
+//
+// (3) THE DENOMINATION (DROPS-R1). A share enters the XMR lane as ONE push of
+//     w_raw = receipt_weight (relay::kReceiptWeight = 1, or fee::kFeeReceipt
+//     Weight with the fee model ON), not as 2^lz. The seam prices work as
+//     floor(reward * (work << Q) / SUM weight), so the WorkPrice handed to the
+//     node carries SUM weight re-expressed in the estimator's unit:
+//         sum' = floor((SUM weight << lz) / receipt_weight)
+//     so ONE share of estimated work prices exactly like ONE real share at the
+//     cut. Same cut, same project(), one integer rescale, no new constant.
+//
+// (4) REPLICATION. The XMR arm composes on EVERY node for EVERY lane block
+//     (FinalizeConnect -> XmrNode::on_network_block_won), from the node's OWN
+//     harvest. A raindrop only one node saw would move only that node's
+//     owed_digest. So raindrops travel the receipt relay exactly like shares
+//     (RandomX-verified by every receiver, flooded, deduped), and every node's
+//     harvester sees the same set; see XmrRelayNode::submit_own_drop.
+//
+// (5) THE ENROLMENT BOOK IS NODE-LOCAL (ENROL-REPL). Replicating the raindrops
+//     is not enough: the EnrollmentBook is decided at each node's OWN tip, so
+//     two nodes that enrolled the same payees at different tips (a late join, a
+//     restart, a partition) credit different intervals and compose different
+//     deltas for the same block -> owed_digest forks. The fix is the BTC/DASH
+//     rule (DROPS-R3, w3 v0x03): THE WINNER'S VIEW IS AUTHORITATIVE. The winner
+//     composes the delta ONCE, when it books its own win (compose_carry), and
+//     carries it with its enrolment-book digest on the relay (FB_BLOCK_WON v0x02); EVERY
+//     node -- the winner included -- books the CARRIED map for that block after
+//     the same deterministic check (verify_carry), and only advances (discards)
+//     its own buried harvest at the same frontier.
+// (6) RAIN-BACKFILL: CONSUMPTION FOLLOWS THE CHAIN, NOT THE BOOKING ORDER.
+//     DropHarvester::take_buried() RELEASES every interval below the frontier
+//     for good. A node that books its own sibling Y at h, then (1-deep reorg)
+//     the canonical X at h, composes X from an EMPTY harvest while every other
+//     node composed it from the full one -- owed_digest forks. And a raindrop
+//     that reaches a node after the release (partition, late join) is dropped
+//     as "late" on that node alone. ChainOrderedHarvest below RETAINS the
+//     raindrops + share counts (bounded) and composes the harvest of a lane
+//     block won at h as a PURE function of the retained set over
+//     [frontier(prev_lane(h)), h - D_conf), prev_lane(h) = the lane block the
+//     CANONICAL chain carries nearest below h (RAIN-BACKFILL-2: never a mark
+//     this node set or erased while booking, so an out-of-order booking -- h+1
+//     before h in a reorg -- or a replaced sibling derives exactly the ranges of
+//     a node that only ever booked the canonical chain, in order). The shell attaches it with
+//     attach_chain_order(); the composition HOLDs on the relay's drops_sync()
+//     over range_for(h) until the set is complete (xmr_relay_node.hpp).
+//
+// GATE OFF (the shipped default): make() returns nullptr, the shell constructs
+// nothing, attaches nothing, and every path below is unreachable.
+// ===========================================================================
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <string>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <deque>
+#include <cstring>   // memcpy/memcmp (DROPS-CARRY-LIVE record file)
+#include <unistd.h>   // fsync (DROPS-RESTART journal)
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <vector>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <c2pool/v37/v37_drops_wiring.hpp>   // DropsWiring, TipBin, EnrollOutcome, kDropsWiringArmed
+#include <c2pool/v37/w4_settlement.hpp>      // settle::WorkPrice, work_price_at
+#include <c2pool/v37/xmr/xmr_node_config.hpp>  // kXmrDropsFloorShift
+#include <c2pool/v37/xmr/xmr_enrol_mode.hpp>   // EnrolMode, enrol_mode_tag (DROPS-AUTO-ENROL)
+
+namespace c2pool::v37n::xmr::drops {
+
+using ::v37::bytes32;
+
+// The fixed leading-zero geometry every XMR raindrop and share-count row is
+// expressed in. 32 bits of head-room keeps the normalisation exact for every
+// share_diff < 2^32 (a product never saturates) and the estimator's h_T far
+// from both ends of the u256 range.
+inline constexpr unsigned kXmrDropsLz = 32;
+static_assert(kXmrDropsLz == ::c2pool::v37n::xmr::kXmrDropsWorkLz, "the window rule reads the same work unit");
+
+// A raindrop must still be real work: at least share_diff / kDropsFloorDiv
+// (and at least difficulty 1). The receiver RandomX-verifies it against this
+// floor exactly as it verifies a share against share_diff, so a peer cannot
+// flood the harvest with free hashes. A function of share_diff alone, and
+// share_diff is HELLO-checked, so every node applies the same floor.
+inline constexpr std::uint64_t kDropsFloorDiv = 1ull << ::c2pool::v37n::xmr::kXmrDropsFloorShift;
+static_assert(kDropsFloorDiv == 64, "the XMR drops floor is share_diff / 64");
+inline std::uint64_t drops_floor_diff(std::uint64_t share_diff) {
+    const std::uint64_t f = share_diff / kDropsFloorDiv;
+    return f ? f : 1;
+}
+
+// (1) the ex-ante clock: the bin a payee is drawing in at native tip `tip`.
+inline std::uint64_t open_bin_of_tip(std::uint64_t tip_height) { return tip_height + 1; }
+
+// (2) N = floor(H_le * share_diff / 2^kXmrDropsLz), saturated, as a big-endian
+// bytes32 (the W2 / estimator convention: byte 0 most significant).
+inline bytes32 normalized_hash(const bytes32& pow_le, std::uint64_t share_diff) {
+    std::array<std::uint64_t, 5> p{0, 0, 0, 0, 0};
+    unsigned __int128 carry = 0;
+    for (int w = 0; w < 4; ++w) {
+        std::uint64_t word = 0;
+        for (int i = 0; i < 8; ++i)
+            word |= static_cast<std::uint64_t>(pow_le[static_cast<std::size_t>(w * 8 + i)]) << (8 * i);
+        const unsigned __int128 prod = static_cast<unsigned __int128>(word) * share_diff + carry;
+        p[static_cast<std::size_t>(w)] = static_cast<std::uint64_t>(prod);
+        carry = prod >> 64;
+    }
+    p[4] = static_cast<std::uint64_t>(carry);
+    static_assert(kXmrDropsLz > 0 && kXmrDropsLz < 64, "single-limb shift");
+    std::array<std::uint64_t, 4> n{};
+    for (int i = 0; i < 4; ++i)
+        n[static_cast<std::size_t>(i)] = (p[static_cast<std::size_t>(i)] >> kXmrDropsLz) |
+                                         (p[static_cast<std::size_t>(i + 1)] << (64 - kXmrDropsLz));
+    if (p[4] >> kXmrDropsLz) n = {~0ull, ~0ull, ~0ull, ~0ull};   // saturate (far above h_T)
+    bytes32 out{};
+    for (int i = 0; i < 4; ++i)                                     // limb 3 = most significant
+        for (int b = 0; b < 8; ++b)
+            out[static_cast<std::size_t>((3 - i) * 8 + (7 - b))] =
+                static_cast<std::uint8_t>(n[static_cast<std::size_t>(i)] >> (8 * b));
+    return out;
+}
+
+// (3) the WorkPrice at a cut, re-expressed in the estimator's unit.
+inline ::c2pool::v37n::settle::WorkPrice rescale_price(::c2pool::v37n::settle::WorkPrice wp,
+                                                       std::uint64_t receipt_weight) {
+    if (!wp.valid || receipt_weight == 0) { wp.valid = false; return wp; }
+    // (sum << lz): a 5-limb value; then floor-divide by receipt_weight.
+    std::array<std::uint64_t, 5> s{0, 0, 0, 0, 0};
+    for (int i = 0; i < 4; ++i) {
+        s[static_cast<std::size_t>(i)] |= wp.sum_weight.v[static_cast<std::size_t>(i)] << kXmrDropsLz;
+        s[static_cast<std::size_t>(i + 1)] |= wp.sum_weight.v[static_cast<std::size_t>(i)] >> (64 - kXmrDropsLz);
+    }
+    unsigned __int128 rem = 0;
+    std::array<std::uint64_t, 5> q{0, 0, 0, 0, 0};
+    for (int i = 4; i >= 0; --i) {
+        const unsigned __int128 cur = (rem << 64) | s[static_cast<std::size_t>(i)];
+        q[static_cast<std::size_t>(i)] = static_cast<std::uint64_t>(cur / receipt_weight);
+        rem = cur % receipt_weight;
+    }
+    if (q[4]) { wp.valid = false; return wp; }   // beyond U256: no conversion expressible (fail closed)
+    for (int i = 0; i < 4; ++i) wp.sum_weight.v[static_cast<std::size_t>(i)] = q[static_cast<std::size_t>(i)];
+    wp.valid = !wp.sum_weight.is_zero();
+    return wp;
+}
+
+// The price at the SAME cut, through the SAME view, the fold reads.
+template <class View>
+inline ::c2pool::v37n::settle::WorkPrice drops_price_at(std::uint64_t reward, const View& v,
+                                                        std::uint64_t receipt_weight) {
+    return rescale_price(::c2pool::v37n::settle::work_price_at(reward, v), receipt_weight);
+}
+
+// ── (5) ENROL-REPL: the carried delta ────────────────────────────────────────
+// Feature marker (the KAT switches on it: absent on the base tree).
+#define C2POOL_XMR_DROPS_CARRY 1
+
+// The winner's composed DROPS delta + the digest of the book it composed under,
+// as carried by FB_BLOCK_WON v0x02 (xmr_relay_wire.hpp BlockWon::Drops).
+struct DropsCarry {
+    std::map<bytes32, long long> delta;   // no zero rows
+    bytes32 enrollment_digest{};
+    bool operator==(const DropsCarry&) const = default;
+};
+inline constexpr std::size_t kDropsCarryMaxRows = 256;   // == relay::kBlockWonDropsMaxRows
+
+// The winner's composition, ONCE: the SAME pure function the finalize driver
+// composes with (subthreshold_credit), zero rows dropped, plus the book digest.
+inline DropsCarry compose_carry(const ::v37::LaneParams& p,
+                                const std::vector<::c2pool::v37n::settle::HarvestedReceipt>& harvest,
+                                const ::c2pool::v37n::settle::DropsCompose& ctx) {
+    DropsCarry c;
+    for (const auto& [k, v] : ::c2pool::v37n::settle::subthreshold_credit(p, harvest, ctx))
+        if (v != 0) c.delta.emplace(k, v);
+    c.enrollment_digest = ctx.enrollment_digest();
+    return c;
+}
+// A4c: under the DROPS WINDOW rule (OwedLedgerRules::drops_window) the work is
+// booked as window weight (subthreshold_window) and nothing books a one-shot
+// coin delta, so none is composed: the carry is the book digest alone (an
+// EMPTY delta). The v0x02 frame then carries no price-dependent bytes, and a
+// receiver's own composition is EMPTY too (carried_delta_agrees). Rule off:
+// compose_carry, byte for byte.
+#define C2POOL_XMR_DROPS_CARRY_WINDOW 1
+inline DropsCarry compose_carry_ruled(const ::v37::LaneParams& p,
+                                      const std::vector<::c2pool::v37n::settle::HarvestedReceipt>& harvest,
+                                      const ::c2pool::v37n::settle::DropsCompose& ctx, bool window_rule) {
+    if (!window_rule) return compose_carry(p, harvest, ctx);
+    DropsCarry c;
+    c.enrollment_digest = ctx.enrollment_digest();
+    return c;
+}
+
+// What every node can check about a carried delta, deterministically, from the
+// frame and the chain alone ("" = book it). `binds` = the frame's (bid, h_b,
+// cut, reward, owed_digest_at_win) equal the ON-CHAIN commitment of the block
+// being booked. ★ DROPS-CARRY-SUFFIX: what a node BOOKS never depends on this
+// check -- every node, the winner included, books its own lane composition
+// (DROPS-ENROL-LANE); a refusal is a witness mismatch (counted + ALARMed).
+inline std::string verify_carry(const DropsCarry& c, bool binds) {
+    if (!binds) return "the carrying frame does not bind to the on-chain commitment (bid/h/cut/reward/owed_digest)";
+    if (c.delta.size() > kDropsCarryMaxRows) return "more rows than the carriage bound";
+    for (const auto& [k, v] : c.delta) if (v == 0) return "a zero delta row (non-canonical)";
+    if (!c.delta.empty() && c.enrollment_digest == ::c2pool::v37n::empty_enrollment_digest())
+        return "a non-empty delta composed under an EMPTY enrolment book (nobody enrolled => no delta)";
+    return "";
+}
+
+// GAP 3 (row-bound DoS, handoff 2026-09-30): the carriage row bound applies
+// to the WIRE WITNESS only. The booked delta is always the whole lane
+// composition (every node composes it from the lane prefix); a delta with more
+// rows than kDropsCarryMaxRows travels as an EMPTY witness (the frame still
+// binds the enrolment digest), and a receiver checks a carried witness against
+// the witness of its own composition. Before this, the whole BOOKED delta was
+// cleared above the bound, so ~256 raindrops wiped every payee's DROPS.
+#define C2POOL_XMR_DROPS_WIRE_BOUND 1
+inline std::map<bytes32, long long> wire_witness_delta(const std::map<bytes32, long long>& booked) {
+    return booked.size() > kDropsCarryMaxRows ? std::map<bytes32, long long>{} : booked;
+}
+inline DropsCarry wire_witness(const DropsCarry& booked) {
+    return DropsCarry{wire_witness_delta(booked.delta), booked.enrollment_digest};
+}
+inline bool carried_delta_agrees(const std::map<bytes32, long long>& carried,
+                                 const std::map<bytes32, long long>& booked) {
+    return carried == wire_witness_delta(booked);
+}
+
+// ── (7) ★ DROPS-ENROL-LANE: the composition is a pure function of the LANE ──
+// Defect 4 (flip 1): the share counts S (covers(iv) only after THIS node armed)
+// and the EnrollmentBook (effective from THIS node's tip) were node-local, so a
+// late-joining or restarted winner composed fewer rows than the other nodes and
+// only the winner could compose the carried delta (a dead winner stalled every
+// node). OPERATOR RULING 09-26: both inputs are derived from the REPLICATED lane
+// prefix [0, P) up to the block's ON-CHAIN credit cut P:
+//   S(payee, iv)  = the receipts of payee with origin bin iv among [0, P)
+//   enrolment     = for each payee of the pool's enrol set (HELLO-checked, so
+//                   every peer holds the same set), its FIRST share on the
+//                   prefix is its enrolment record on the lane: committed at the
+//                   lowest bin b of its receipts in [0, P), effective from b + 1
+//                   (strictly later: the ex-ante rule, EnrollmentBook::commit)
+// Every node that holds the prefix (its own order when its digest at P is the
+// on-chain spine, else the winner-side order the relay repair fetched) derives
+// the same rows, the same book and the same delta, so ANY node composes it. A
+// carried v0x02 trailer is a witness only: verify_carry() refuses one whose
+// enrollment_digest (or delta) differs from the lane derivation, and the node
+// books the lane derivation either way (a refusal can never fork a booking).
+// Flip 0: nothing below is constructed or called.
+#define C2POOL_XMR_DROPS_LANE_ENROL 1
+// ★ DROPS-ENROL-TIDY (flip 1): the lane-position log is bounded (folded below
+// the oldest reachable cut), the tip-based book / node-local share book are
+// retired (lane-only), and an enrol-set mismatch is refused at HELLO by name.
+#define C2POOL_XMR_DROPS_ENROL_TIDY 1
+
+// One receipt of the lane prefix: its payee identity and origin bin.
+struct LaneShare {
+    bytes32 payee{};
+    std::uint64_t bin = 0;
+    std::uint16_t give = 0;   // ★ d5: the receipt's give-author u16 (side_data_v2; folded only under the fee model)
+};
+using ShareCounts = std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t>;
+// The receipts of the lane prefix [0, P), as a multiset (order-free: the
+// winner's order and a repaired order of the same prefix carry the same set).
+// ★ DROPS-ENROL-TIDY: [0, base_P) may arrive FOLDED (our own pruned lane log,
+// XmrDropsWiring::prune_lane_log): base_first = each payee's lowest origin bin
+// among the folded receipts (all the enrolment reads of them), base_counts =
+// their S(payee, iv) for iv at or above the harvest retention floor (all a
+// reachable composition reads of them), base_n = how many were folded. A
+// repaired (winner-side) prefix carries no base: every receipt is in `shares`.
+struct LanePrefix {
+    std::uint64_t P = 0;
+    std::vector<LaneShare> shares;
+    std::uint64_t base_P = 0;
+    std::size_t base_n = 0;
+    std::map<bytes32, std::uint64_t> base_first;
+    ShareCounts base_counts;
+    // ★ d5: per payee, (SUM give-author u16, receipts) over the folded base
+    // (one row per payee, never pruned -- like base_first).
+    std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> base_give;
+    // ★ DROPS-CARRY-SUFFIX: the lane positions the prefix covers (folded base +
+    // every listed receipt's pushes). Diagnostic on the own order; on a merged
+    // (repaired) prefix it is THE invariant: == P, else the prefix is partial.
+    std::uint64_t positions = 0;
+    std::size_t receipts() const { return base_n + shares.size(); }
+};
+
+// ── (7b) ★ DROPS-CARRY-SUFFIX (capstone attempt 5, flip 1) ──────────────────
+// THE DEFECT. A receiver whose own order differs from the winner's at P takes
+// the relay repair; when the serving peer's vault no longer retains [0, a0)
+// (REPAIR-HORIZON) the served order covers only the SUFFIX [a0, P). The
+// settlement replay prepends OUR first a0 pushes (the digest gate at P
+// decides), but the DROPS prefix builder composed from the suffix alone,
+// labelled [0, P): every payee's first bin moved later and S shrank, so the
+// receivers booked a different enrolment book + delta than the winner and
+// the owed ledger split (h=2217148: 1080 receipts vs the winner's 2180).
+// THE FIX. The DROPS prefix is the receipt multiset the spine verified, WHOLE:
+// OUR lane log over [0, a0) (the same base the settlement replay used) + the
+// served [a0, P) (XmrDropsWiring::merged_prefix). Every receipt carries its
+// lane pushes, so the covered positions must equal P or the prefix HOLDs
+// (never composed from a part). A carried trailer stays a witness; a
+// mismatch on an honest node is an ALARM, never a different booking rule.
+#define C2POOL_XMR_DROPS_CARRY_SUFFIX 1
+struct ServedShare {   // one served (repaired) receipt of [a0, P), in the serving peer's order
+    bytes32 payee{};
+    std::uint64_t bin = 0;
+    std::uint16_t give = 0;
+    std::uint32_t n = 1;   // its lane pushes (fee model: payee + donation)
+};
+// Why a prefix HOLDs. retry=false = an invariant broke (the caller ALARMs).
+struct PrefixWhy { std::string text; bool retry = true; };
+// A reconstructed winner-side order, receipt by receipt: the DROPS mirror of
+// a relay repair SHADOW (xmr_repair_replay.hpp). When the settlement replay
+// reaches a later spine from a shadow's [0, a0) instead of our own order,
+// the DROPS prefix takes [0, a0) from the record of that shadow.
+struct PrefixRecord {
+    std::uint64_t P = 0;
+    LanePrefix fold;                 // the folded base [0, base_end) (no shares)
+    std::uint64_t base_end = 0;
+    std::vector<std::pair<std::uint64_t, ServedShare>> list;   // (first position, receipt) over [base_end, P)
+};
+
+// ★ DROPS-CARRY-LIVE (2): the records survive a restart, next to the relay
+// shadows they mirror (<settle_db>/lane<N>.shadow.drops): a replay from a
+// RELOADED shadow (xmr_repair_replay.hpp load()) still finds its DROPS record.
+// File: "V37DRPR1" | chain u32 | tag(32) | count u32 | per record (MRU last):
+// key (u16 len + bytes) | P u64 | base_end u64 | base_P u64 | base_n u64 |
+// base_first (u32 n + (payee, bin u64)) | base_counts (u32 n + (payee, bin,
+// count u64)) | base_give (u32 n + (payee, sum u64, n u64)) | list (u32 n +
+// (pos u64, payee, bin u64, give u16, n u32)) | sha256d(all before). Written
+// tmp + fsync + rename; a torn / foreign / bad-hash file = zero records.
+struct PrefixRecordFile {
+    static constexpr std::uint8_t kMagic[8] = {'V', '3', '7', 'D', 'R', 'P', 'R', '1'};
+    static void put(std::vector<std::uint8_t>& b, std::uint64_t v, int n) {
+        for (int i = 0; i < n; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+    }
+    static void put32b(std::vector<std::uint8_t>& b, const bytes32& x) { b.insert(b.end(), x.begin(), x.end()); }
+    static std::vector<std::uint8_t> encode(std::uint32_t chain, const bytes32& tag,
+                                            const std::vector<std::pair<std::string, const PrefixRecord*>>& recs) {
+        std::vector<std::uint8_t> b(kMagic, kMagic + 8);
+        put(b, chain, 4); put32b(b, tag); put(b, recs.size(), 4);
+        for (const auto& [key, r] : recs) {
+            put(b, key.size(), 2); b.insert(b.end(), key.begin(), key.end());
+            put(b, r->P, 8); put(b, r->base_end, 8); put(b, r->fold.base_P, 8); put(b, r->fold.base_n, 8);
+            put(b, r->fold.base_first.size(), 4);
+            for (const auto& [p, bin] : r->fold.base_first) { put32b(b, p); put(b, bin, 8); }
+            put(b, r->fold.base_counts.size(), 4);
+            for (const auto& [k, c] : r->fold.base_counts) { put32b(b, k.first); put(b, k.second, 8); put(b, c, 8); }
+            put(b, r->fold.base_give.size(), 4);
+            for (const auto& [p, g] : r->fold.base_give) { put32b(b, p); put(b, g.first, 8); put(b, g.second, 8); }
+            put(b, r->list.size(), 4);
+            for (const auto& [pos, x] : r->list) { put(b, pos, 8); put32b(b, x.payee); put(b, x.bin, 8); put(b, x.give, 2); put(b, x.n, 4); }
+        }
+        const bytes32 h = ::v37::sha256d(b);
+        b.insert(b.end(), h.begin(), h.end());
+        return b;
+    }
+    // nullopt + why = the whole file is ignored (zero records); records in file order (MRU last)
+    static std::optional<std::vector<std::pair<std::string, PrefixRecord>>> decode(const std::vector<std::uint8_t>& b, std::uint32_t chain,
+                                                                                  const bytes32& tag, std::string* why) {
+        const auto bad = [&](const char* w) -> std::optional<std::vector<std::pair<std::string, PrefixRecord>>> { if (why) *why = w; return std::nullopt; };
+        if (b.size() < 8 + 4 + 32 + 4 + 32 || std::memcmp(b.data(), kMagic, 8) != 0) return bad("bad magic/size");
+        const std::size_t body = b.size() - 32;
+        if (::v37::sha256d(std::vector<std::uint8_t>(b.begin(), b.begin() + static_cast<std::ptrdiff_t>(body))) !=
+            [&] { bytes32 h{}; std::memcpy(h.data(), b.data() + body, 32); return h; }()) return bad("hash trailer mismatch (torn or edited)");
+        std::size_t o = 8; bool ok = true;
+        const auto get = [&](int n) -> std::uint64_t {
+            if (!ok || o + static_cast<std::size_t>(n) > body) { ok = false; return 0; }
+            std::uint64_t v = 0; for (int i = n - 1; i >= 0; --i) v = (v << 8) | b[o + static_cast<std::size_t>(i)];
+            o += static_cast<std::size_t>(n); return v;
+        };
+        const auto get32b = [&]() -> bytes32 {
+            bytes32 x{}; if (!ok || o + 32 > body) { ok = false; return x; }
+            std::memcpy(x.data(), b.data() + o, 32); o += 32; return x;
+        };
+        if (get(4) != chain) return bad("another lane chain");
+        if (get32b() != tag) return bad("another lane geometry (lane_params_digest)");
+        const std::uint64_t count = get(4);
+        std::vector<std::pair<std::string, PrefixRecord>> out;
+        for (std::uint64_t i = 0; ok && i < count; ++i) {
+            const std::uint64_t kl = get(2);
+            if (!ok || o + kl > body) return bad("truncated key");
+            std::string key(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + kl)); o += kl;
+            PrefixRecord r;
+            r.P = get(8); r.base_end = get(8); r.fold.base_P = get(8); r.fold.base_n = static_cast<std::size_t>(get(8));
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) { const bytes32 p = get32b(); r.fold.base_first[p] = get(8); }
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) {
+                const bytes32 p = get32b(); const std::uint64_t bin = get(8); r.fold.base_counts[std::make_pair(p, bin)] = get(8);
+            }
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) {
+                const bytes32 p = get32b(); const std::uint64_t s = get(8); r.fold.base_give[p] = {s, get(8)};
+            }
+            for (std::uint64_t n = get(4), j = 0; ok && j < n; ++j) {
+                const std::uint64_t pos = get(8); ServedShare x; x.payee = get32b(); x.bin = get(8);
+                x.give = static_cast<std::uint16_t>(get(2)); x.n = static_cast<std::uint32_t>(get(4));
+                r.list.emplace_back(pos, x);
+            }
+            out.emplace_back(std::move(key), std::move(r));
+        }
+        if (!ok || o != body) return bad("malformed record body");
+        return out;
+    }
+    static bool write(const std::string& path, const std::vector<std::uint8_t>& b, std::string* why) {
+        const std::string tmp = path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        bool ok = f && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        if (f) ok = (std::fclose(f) == 0) && ok;
+        ok = ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+        if (!ok && why) *why = "cannot write " + path;
+        return ok;
+    }
+};
+// ★ DROPS-CARRY-LIVE (3): the origin bin of every receipt this node pushed,
+// across a restart. A durable-log reload carries no bin (the receipts log
+// holds the raw frames only) and the relay ChainView knows only the headers
+// seen since boot (its last 128 + the templates issued), so after a restart
+// the older receipts of a repaired prefix (and our own lane log) never
+// resolved: 'origin bin of a repaired receipt is not resolvable yet' on every
+// tick, composed=0. This journal is written at push time (a bin the verifier
+// resolved) next to the receipts log and reloaded at boot, before the reload
+// of the receipts log; drops_bin_of falls back to it. Record: prev_id(32) |
+// bin u64 LE | fnv1a64 of those 40 bytes. Append-only; a torn tail is dropped
+// at load; bounded (compacted, tmp + fsync + rename, to the newest kKeep).
+#define C2POOL_XMR_DROPS_CARRY_LIVE 1
+class LaneBinJournal {
+public:
+    static constexpr std::size_t kRec = 48;
+    static constexpr std::size_t kKeep = 65536;
+
+    explicit LaneBinJournal(std::string path = {}) : m_path(std::move(path)) {}
+    const std::string& path() const noexcept { return m_path; }
+    std::size_t load() {
+        m_map.clear(); m_order.clear(); m_bad = 0;
+        if (m_path.empty()) return 0;
+        std::FILE* f = std::fopen(m_path.c_str(), "rb");
+        if (!f) return 0;
+        std::uint8_t r[kRec];
+        while (std::fread(r, 1, kRec, f) == kRec) {
+            bytes32 prev{}; std::uint64_t bin = 0;
+            if (!decode(r, prev, bin)) { ++m_bad; break; }
+            remember(prev, bin);
+        }
+        std::fclose(f);
+        compact();
+        return m_map.size();
+    }
+    // One pushed receipt's (prev_id, bin); only a new or changed pair is written.
+    bool note(const bytes32& prev, std::uint64_t bin) {
+        if (m_path.empty() || bin == 0) return false;
+        if (const auto it = m_map.find(prev); it != m_map.end() && it->second == bin) return false;
+        std::uint8_t r[kRec]; encode(prev, bin, r);
+        std::FILE* f = std::fopen(m_path.c_str(), "ab");
+        if (!f) return false;
+        const bool ok = std::fwrite(r, 1, kRec, f) == kRec;
+        std::fclose(f);
+        if (!ok) return false;
+        remember(prev, bin);
+        ++m_written;
+        if (++m_file_recs > 2 * kKeep) compact();
+        return true;
+    }
+    std::optional<std::uint64_t> lookup(const bytes32& prev) const {
+        const auto it = m_map.find(prev);
+        if (it == m_map.end()) return std::nullopt;
+        return it->second;
+    }
+    std::size_t size() const noexcept { return m_map.size(); }
+    std::uint64_t written() const noexcept { return m_written; }
+    std::uint64_t bad_tail() const noexcept { return m_bad; }
+
+private:
+    static std::uint64_t fnv(const std::uint8_t* p, std::size_t n) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (std::size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+        return h;
+    }
+    static void encode(const bytes32& prev, std::uint64_t bin, std::uint8_t* r) {
+        std::memcpy(r, prev.data(), 32);
+        for (int i = 0; i < 8; ++i) r[32 + i] = static_cast<std::uint8_t>(bin >> (8 * i));
+        const std::uint64_t c = fnv(r, 40);
+        for (int i = 0; i < 8; ++i) r[40 + i] = static_cast<std::uint8_t>(c >> (8 * i));
+    }
+    static bool decode(const std::uint8_t* r, bytes32& prev, std::uint64_t& bin) {
+        std::uint64_t c = 0;
+        for (int i = 0; i < 8; ++i) c |= static_cast<std::uint64_t>(r[40 + i]) << (8 * i);
+        if (c != fnv(r, 40)) return false;
+        std::memcpy(prev.data(), r, 32);
+        bin = 0;
+        for (int i = 0; i < 8; ++i) bin |= static_cast<std::uint64_t>(r[32 + i]) << (8 * i);
+        return bin != 0;
+    }
+    void remember(const bytes32& prev, std::uint64_t bin) {
+        auto [it, fresh] = m_map.insert_or_assign(prev, bin);
+        (void)it;
+        if (fresh) m_order.push_back(prev);
+        while (m_order.size() > kKeep) { m_map.erase(m_order.front()); m_order.pop_front(); }
+    }
+    void compact() {
+        const std::string tmp = m_path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) return;
+        bool ok = true;
+        std::uint8_t r[kRec];
+        for (const auto& prev : m_order) { encode(prev, m_map.at(prev), r); ok = ok && std::fwrite(r, 1, kRec, f) == kRec; }
+        ok = ok && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        ok = (std::fclose(f) == 0) && ok;
+        if (ok) ok = std::rename(tmp.c_str(), m_path.c_str()) == 0;
+        if (!ok) std::remove(tmp.c_str());
+        else m_file_recs = m_order.size();
+    }
+    std::string m_path;
+    std::map<bytes32, std::uint64_t> m_map;
+    std::deque<bytes32> m_order;
+    std::uint64_t m_written = 0, m_bad = 0, m_file_recs = 0;
+};
+
+
+// ★ XMR-DROPS-DEFAULT d5 (fee model ON). The REPLACE delta is in WHOLE-receipt
+// units: one estimated share prices as kFeeReceiptWeight (65535) of lane weight,
+// i.e. the payee's 65535 - d AND the donation's d (v36: miner att*(65535-d),
+// donation att*d). It was booked to the payee alone, so the payee carried the
+// donation's slice of every replaced share and kept the donation's slice of
+// every estimated one. Split each payee's delta the way its receipts split:
+// d = the payee's mean give-author u16 over its receipts on the lane prefix
+// [0, P) -- a pure function of the replicated prefix (own order or repaired,
+// the same multiset), so every node derives the same rows:
+//     don = trunc(v * SUM d / (n * 65535)),  payee v - don,  donation += don
+// The row sum is unchanged (conserving); zero rows are dropped (canonical).
+// Fee model OFF (d is never folded) => the caller does not call it.
+inline void split_give_author(std::map<bytes32, long long>& delta, const LanePrefix& lp, const bytes32& donation) {
+    std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> g;   // payee -> (SUM d, n)
+    for (const auto& [k, v] : lp.base_give) { g[k].first += v.first; g[k].second += v.second; }
+    for (const auto& x : lp.shares) { auto& e = g[x.payee]; e.first += x.give; e.second += 1; }
+    std::map<bytes32, long long> out;
+    long long don_total = 0;
+    for (const auto& [k, v] : delta) {
+        if (k == donation) { out[k] += v; continue; }   // the donation row is never re-split
+        long long don = 0;
+        if (const auto it = g.find(k); it != g.end() && it->second.second && it->second.first) {
+            const __int128 num = static_cast<__int128>(v) * static_cast<__int128>(it->second.first);
+            const __int128 den = static_cast<__int128>(it->second.second) * 65535;
+            don = static_cast<long long>(num / den);   // truncation toward zero, both signs
+        }
+        out[k] += v - don;
+        don_total += don;
+    }
+    if (don_total) out[donation] += don_total;
+    delta.clear();
+    for (const auto& [k, v] : out) if (v != 0) delta.emplace(k, v);
+}
+
+// S(payee, iv) for iv in [lo, hi), from the prefix alone.
+inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std::uint64_t hi) {
+    ShareCounts s;
+    for (const auto& [k, n] : lp.base_counts)
+        if (k.second >= lo && k.second < hi) s[k] += n;
+    for (const auto& x : lp.shares)
+        if (x.bin >= lo && x.bin < hi) ++s[std::make_pair(x.payee, x.bin)];
+    return s;
+}
+// ★ DROPS WINDOW (A4b): the END position of a bin on the lane prefix [0, P):
+// P minus the receipts of LATER bins (folded ones through base_counts, which
+// are complete at or above the harvest retention floor, where every composed
+// bin is). A4c: and the bin's receipt count n (its slots are the n positions
+// up to the end), so the entry weighs the mean over the slots. A pure function
+// of the prefix multiset: the own order and a repaired order of the same
+// prefix give the same spans.
+class LaneBinEnd {
+public:
+    explicit LaneBinEnd(const LanePrefix& lp) : m_P(lp.P) {
+        for (const auto& [k, n] : lp.base_counts) m_bins.insert(m_bins.end(), n, k.second);
+        for (const auto& x : lp.shares) m_bins.push_back(x.bin);
+        std::sort(m_bins.begin(), m_bins.end());
+    }
+    ::c2pool::v37n::settle::DropsBinSpan operator()(std::uint64_t bin) const {
+        const auto hi = std::upper_bound(m_bins.begin(), m_bins.end(), bin);
+        const auto later = static_cast<std::uint64_t>(m_bins.end() - hi);
+        const auto in_bin = static_cast<std::uint64_t>(hi - std::lower_bound(m_bins.begin(), hi, bin));
+        const std::uint64_t c = later >= m_P ? 0 : m_P - later;
+        return ::c2pool::v37n::settle::DropsBinSpan{c, in_bin < c ? in_bin : c};
+    }
+private:
+    std::uint64_t m_P = 0;
+    std::vector<std::uint64_t> m_bins;
+};
+// ★ DROPS WINDOW + fee model (d5): split each position's entries by the
+// payee's mean give-author, exactly as split_give_author splits a delta.
+inline void split_give_author_window(::c2pool::v37n::settle::DropsWindow& w, const LanePrefix& lp, const bytes32& donation) {
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::map<bytes32, long long>> by_pos;   // (c, n) -> rows
+    for (const auto& [ck, v] : w) by_pos[std::make_pair(ck.c, ck.n)][ck.payee] = v;
+    w.clear();
+    for (auto& [cn, m] : by_pos) {
+        split_give_author(m, lp, donation);
+        for (const auto& [k, v] : m) if (v != 0) w[::c2pool::v37n::settle::DropsWindowKey(cn.first, cn.second, k)] = v;
+    }
+}
+// The enrolment book of the prefix: a pure function of (the enrol set, [0, P)).
+// ★ DROPS-AUTO-ENROL: Auto enrols EVERY payee of the prefix at its first share
+// (same rule, no set filter), None enrols nobody, List filters by the set.
+using ::c2pool::v37n::xmr::relay::EnrolMode;
+inline ::c2pool::v37n::EnrollmentBook lane_enrollment(const LanePrefix& lp, const std::set<bytes32>& enrol_set,
+                                                      EnrolMode mode = EnrolMode::List) {
+    std::map<bytes32, std::uint64_t> first;
+    if (mode == EnrolMode::None) return ::c2pool::v37n::EnrollmentBook{};
+    const auto in = [&](const bytes32& p) { return mode == EnrolMode::Auto || enrol_set.count(p) != 0; };
+    for (const auto& [payee, bin] : lp.base_first) {
+        if (!in(payee)) continue;
+        auto [it, fresh] = first.try_emplace(payee, bin);
+        if (!fresh && bin < it->second) it->second = bin;
+    }
+    for (const auto& x : lp.shares) {
+        if (!in(x.payee)) continue;
+        auto [it, fresh] = first.try_emplace(x.payee, x.bin);
+        if (!fresh && x.bin < it->second) it->second = x.bin;
+    }
+    ::c2pool::v37n::EnrollmentBook b;
+    for (const auto& [payee, bin] : first) (void)b.commit(payee, bin, bin + 1);
+    return b;
+}
+// ★ RAINDROP ENROL (handoff A3, ruling 2026-09-30; XmrDropsWiring::
+// set_raindrop_enrol). The enrolment book of a composition over [lo, hi) takes,
+// per payee admitted by the enrol mode, the EARLIEST effective_from of
+//   (1) the lane share rule: first share bin on the prefix [0, P) + 1;
+//   (2) the ledger registry at the booking point (finalized records plus the
+//       enrol_add of pending rows, OwedLedger::drops_enrol_registry);
+//   (3) the first raindrop bin b inside [lo, hi): b + 1.
+// Every input is replicated (the prefix, the booking-point ledger, the
+// retained raindrops over exactly the range the drops_sync HOLD completes), so
+// every node derives the same book; and each is ex ante (a raindrop at b takes
+// effect at b + 1). Integer-only.
+inline ::c2pool::v37n::EnrollmentBook lane_enrollment_ex(const LanePrefix& lp, const std::set<bytes32>& enrol_set,
+                                                         EnrolMode mode,
+                                                         const ::c2pool::v37n::settle::DropsEnrolRegistry& registry,
+                                                         const std::map<bytes32, std::uint64_t>& first_drop_bins) {
+    if (mode == EnrolMode::None) return ::c2pool::v37n::EnrollmentBook{};
+    const auto in = [&](const bytes32& p) { return mode == EnrolMode::Auto || enrol_set.count(p) != 0; };
+    std::map<bytes32, std::uint64_t> eff;
+    const auto take = [&](const bytes32& p, std::uint64_t e) {
+        if (e == 0 || !in(p)) return;
+        auto [it, fresh] = eff.try_emplace(p, e);
+        if (!fresh && e < it->second) it->second = e;
+    };
+    constexpr std::uint64_t kMax = ~std::uint64_t{0};
+    for (const auto& [payee, bin] : lp.base_first) if (bin < kMax) take(payee, bin + 1);
+    for (const auto& x : lp.shares) if (x.bin < kMax) take(x.payee, x.bin + 1);
+    for (const auto& [payee, r] : registry) take(payee, r.eff);
+    for (const auto& [payee, bin] : first_drop_bins) if (bin < kMax) take(payee, bin + 1);
+    ::c2pool::v37n::EnrollmentBook b;
+    for (const auto& [payee, e] : eff) (void)b.commit(payee, e - 1, e);
+    return b;
+}
+// The pool's enrol set, as it is mixed into the relay HELLO lane_params_digest
+// (flip 1 with a non-empty set only): a peer holding another set is refused at
+// HELLO instead of deriving a different book.
+inline bytes32 enrol_set_digest(const std::set<bytes32>& s) {
+    std::vector<std::uint8_t> b;
+    const char* dom = "V37ENROLSET1";
+    for (const char* p = dom; *p; ++p) b.push_back(static_cast<std::uint8_t>(*p));
+    ::c2pool::v37n::enroll_detail::put_le32(b, static_cast<std::uint32_t>(s.size()));
+    for (const auto& k : s) b.insert(b.end(), k.begin(), k.end());
+    return ::v37::sha256d(b);
+}
+// ★ DROPS-AUTO-ENROL: the mode-encoding enrol digest HELLO carries.
+// A3 + A5 FLAG DAY (v2): `drops_rule` (relay::drops_rule_tag) tags it when the
+// DROPS due or the raindrop enrolment is on; 0 = byte-identical to v1.
+inline bytes32 enrol_mode_digest(EnrolMode m, const std::set<bytes32>& s, std::uint32_t drops_rule = 0) {
+    const bytes32 base = m == EnrolMode::List ? enrol_set_digest(s) : ::c2pool::v37n::xmr::relay::enrol_mode_tag(m);
+    return ::c2pool::v37n::xmr::relay::enrol_rule_digest(base, drops_rule);
+}
+inline bytes32 hello_digest_with_enrol(const bytes32& lane_params_digest, EnrolMode m, const std::set<bytes32>& s,
+                                       std::uint32_t drops_rule = 0) {
+    std::vector<std::uint8_t> b(lane_params_digest.begin(), lane_params_digest.end());
+    const auto e = enrol_mode_digest(m, s, drops_rule);
+    b.insert(b.end(), e.begin(), e.end());
+    return ::v37::sha256d(b);
+}
+inline bytes32 hello_digest_with_enrol(const bytes32& lane_params_digest, const std::set<bytes32>& s) {
+    if (s.empty()) return lane_params_digest;
+    std::vector<std::uint8_t> b(lane_params_digest.begin(), lane_params_digest.end());
+    const auto e = enrol_set_digest(s);
+    b.insert(b.end(), e.begin(), e.end());
+    return ::v37::sha256d(b);
+}
+// The carried trailer against the lane derivation (`lane_digest` = the book
+// digest derived from [0, P)). "" = the witness agrees.
+inline std::string verify_carry(const DropsCarry& c, bool binds, const bytes32& lane_digest) {
+    std::string r = verify_carry(c, binds);
+    if (!r.empty()) return r;
+    if (c.enrollment_digest != lane_digest)
+        return "the carried enrollment_digest differs from the book derived from the lane prefix [0,P)";
+    return "";
+}
+// ── (6) RAIN-BACKFILL: the retained, chain-ordered harvest ───────────────────
+// Feature marker (the harvest-order KAT switches on it: absent on the base).
+#define C2POOL_XMR_HARVEST_CHAIN_PURE 1
+
+// THE HARVEST RANGE IS A PURE FUNCTION OF THE CANONICAL CHAIN (RAIN-BACKFILL-2).
+// The lane block won at h settles the intervals
+//
+//     range(h) = [ frontier(prev_lane(h)), frontier(h) ),  frontier(x) = x - D_conf
+//
+// where prev_lane(h) is the height of the lane block the CANONICAL chain carries
+// nearest below h (a PrevLaneFn the shell answers from the chain itself: the
+// block id at each height and whether its coinbase is a lane block). Nothing on
+// this path reads what THIS node booked, in which order, or what it booked and
+// then replaced: an out-of-order booking (h+1 before h during a reorg) or a
+// sibling booked and replaced composes exactly the ranges of a node that booked
+// the canonical chain in order, so consecutive canonical lane blocks tile the
+// intervals once each -- never an interval twice, never a gap.
+class ChainOrderedHarvest {
+public:
+    using Rows = std::vector<::c2pool::v37n::settle::HarvestedReceipt>;
+    using CoversFn = std::function<bool(std::uint64_t)>;
+    // prev_lane(h): the canonical lane block below h; kNoPrevLane = none on the
+    // chain below h (the first lane block: everything retained below its
+    // frontier); nullopt = UNDECIDABLE now (the shell HOLDs the composition).
+    using PrevLaneFn = std::function<std::optional<std::uint64_t>(std::uint64_t)>;
+    static constexpr std::uint64_t kNoPrevLane = 0;        // chain heights are >= 1
+    static constexpr std::uint64_t kReorgMargin = 64;      // intervals kept below the top range (>> any reorg depth)
+    static constexpr std::size_t   kBookedKept = 256;      // diagnostic range log
+
+    ChainOrderedHarvest(std::uint32_t K, unsigned lz, std::uint64_t d_conf) : m_K(K), m_lz(lz), m_d_conf(d_conf) {}
+    void set_d_conf(std::uint64_t d) { m_d_conf = d; }
+    std::uint64_t d_conf() const { return m_d_conf; }
+
+    // idempotent: the same (payee, normalised hash) at the same interval counts once
+    void observe_drop(const bytes32& payee, std::uint64_t interval, const bytes32& nhash) {
+        if (interval < m_floor) { ++m_late; return; }
+        if (m_drops[interval].insert(std::make_pair(payee, nhash)).second) ++m_observed;
+    }
+    // ★ DROPS-SET-PIN: the same, keyed by the raindrop's receipt id too, so a
+    // composition can name (pin) exactly the raindrops it used and another node
+    // can compose from exactly that set. `valid` = false: a raindrop this
+    // harvester refused (e.g. its hash is a share): a set naming it is refused.
+    struct DropRec { std::uint64_t interval = 0; bytes32 payee{}; bytes32 nhash{}; bool valid = true; };
+    void observe_drop_id(const bytes32& id, const bytes32& payee, std::uint64_t interval, const bytes32& nhash, bool valid = true) {
+        if (interval < m_floor) { ++m_late; return; }
+        m_drop_ids[id] = DropRec{interval, payee, nhash, valid};
+        if (valid) observe_drop(payee, interval, nhash);
+    }
+    // the ids of every (valid) raindrop held over [lo, hi), ascending
+    std::vector<bytes32> ids_over(std::uint64_t lo, std::uint64_t hi) const {
+        std::vector<bytes32> v;
+        for (const auto& [id, r] : m_drop_ids) if (r.valid && r.interval >= lo && r.interval < hi) v.push_back(id);
+        return v;   // std::map order == bytes32 operator< (the wire order)
+    }
+    // The members of a pinned set: the raindrop map over exactly `ids` (each
+    // must be held, valid and inside [lo, hi)). `missing` = ids not held here
+    // (the caller fetches them and HOLDs); `refused` = the first member that
+    // makes the set invalid for [lo, hi) (deterministic on every node).
+    using DropMap = std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>>;
+    DropMap members_of(const std::vector<bytes32>& ids, std::uint64_t lo, std::uint64_t hi,
+                       std::vector<bytes32>& missing, std::string& refused) const {
+        DropMap dm;
+        for (const auto& id : ids) {
+            auto it = m_drop_ids.find(id);
+            if (it == m_drop_ids.end()) { missing.push_back(id); continue; }
+            const DropRec& r = it->second;
+            if (refused.empty() && !r.valid) refused = "a pinned raindrop is not a raindrop (refused by the harvester)";
+            else if (refused.empty() && (r.interval < lo || r.interval >= hi))
+                refused = "a pinned raindrop's bin " + std::to_string(r.interval) + " is outside the block's range [" +
+                          std::to_string(lo) + "," + std::to_string(hi) + ")";
+            if (r.valid) dm[r.interval].insert(std::make_pair(r.payee, r.nhash));
+        }
+        return dm;
+    }
+    void observe_share(const bytes32& payee, std::uint64_t interval) {
+        if (interval < m_floor) return;
+        ++m_shares[std::make_pair(payee, interval)];
+    }
+    // ★ RAINDROP ENROL: each payee's first retained raindrop bin inside [lo, hi)
+    // (pure; arrival order free: the retained set is ordered by interval).
+    std::map<bytes32, std::uint64_t> first_drop_bins(std::uint64_t lo, std::uint64_t hi) const {
+        std::map<bytes32, std::uint64_t> f;
+        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it)
+            for (const auto& [payee, h] : it->second) { (void)h; f.try_emplace(payee, it->first); }
+        return f;
+    }
+    // RAINDROP ENROL x DROPS-SET-PIN: the same first bins over a pinned member
+    // map only (every node composes from the winner's set, never from what it
+    // happens to retain).
+    static std::map<bytes32, std::uint64_t> first_drop_bins_of(
+        const std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>>& dm) {
+        std::map<bytes32, std::uint64_t> f;
+        for (const auto& [bin, set] : dm)
+            for (const auto& [payee, h] : set) { (void)h; f.try_emplace(payee, bin); }
+        return f;
+    }
+
+    std::uint64_t frontier_of(std::uint64_t won_height) const {
+        return won_height > m_d_conf ? won_height - m_d_conf : 0;
+    }
+    // THE range: a pure function of (h, the canonical prev_lane(h)). nullopt = undecidable.
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> range_with(std::uint64_t won_height,
+                                                                      std::optional<std::uint64_t> prev_lane) const {
+        if (!prev_lane) return std::nullopt;
+        const std::uint64_t hi = frontier_of(won_height);
+        const std::uint64_t lo = (*prev_lane == kNoPrevLane || *prev_lane >= won_height) ? 0 : frontier_of(*prev_lane);
+        return std::make_pair(std::min(lo, hi), hi);
+    }
+
+    // The rows over [lo, hi) from the retained set (pure; `withheld` counts the
+    // rows whose share count S is not covered here -- never credited).
+    Rows rows_over(std::uint64_t lo, std::uint64_t hi, const CoversFn& covers,
+                   const ::c2pool::v37n::EnrollmentBook* enrollment, std::uint64_t* withheld = nullptr) const {
+        std::map<std::pair<bytes32, std::uint64_t>, std::vector<bytes32>> keys;   // (payee, interval) -> hashes
+        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it)
+            for (const auto& [payee, h] : it->second) keys[std::make_pair(payee, it->first)].push_back(h);
+        for (auto it = m_shares.begin(); it != m_shares.end(); ++it) {
+            const auto iv = it->first.second;
+            if (iv < lo || iv >= hi) continue;
+            if (keys.count(it->first)) continue;
+            if (!enrollment || !enrollment->enrolled(it->first.first, iv)) continue;   // share-only rows: enrolled payees
+            keys[it->first];
+        }
+        Rows out;
+        for (auto& [k, hashes] : keys) {
+            if (!covers || !covers(k.second)) { if (withheld) ++*withheld; continue; }   // S UNKNOWN here: withheld
+            ::c2pool::v37::subthreshold::ReceiptCollector rc(m_K, ::c2pool::v37n::drops_detail::h_t_of_lz(m_lz));
+            std::sort(hashes.begin(), hashes.end());
+            for (const auto& h : hashes) rc.observe(::c2pool::v37n::drops_detail::u256_of(h));
+            auto si = m_shares.find(k);
+            rc.set_shares(si == m_shares.end() ? 0 : si->second);
+            out.push_back(::c2pool::v37n::settle::HarvestedReceipt{k.first, k.second, rc});
+        }
+        return out;
+    }
+    // ★ DROPS-ENROL-LANE: the rows over [lo, hi) with S taken from the lane
+    // prefix (`S`, complete for [lo, hi) by construction: nothing withheld) and
+    // share-only rows for the payees `book` (the lane-derived book) enrols. Pure.
+    Rows rows_lane(std::uint64_t lo, std::uint64_t hi, const ShareCounts& S,
+                   const ::c2pool::v37n::EnrollmentBook& book) const {
+        return rows_lane_of(m_drops, lo, hi, S, book);
+    }
+    // ★ DROPS-SET-PIN: the same rows over a given raindrop map (a pinned set)
+    Rows rows_lane_of(const std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>>& drops,
+                      std::uint64_t lo, std::uint64_t hi, const ShareCounts& S,
+                      const ::c2pool::v37n::EnrollmentBook& book) const {
+        std::map<std::pair<bytes32, std::uint64_t>, std::vector<bytes32>> keys;
+        for (auto it = drops.lower_bound(lo); it != drops.end() && it->first < hi; ++it)
+            for (const auto& [payee, h] : it->second) keys[std::make_pair(payee, it->first)].push_back(h);
+        for (const auto& [k, n] : S) {
+            (void)n;
+            if (k.second < lo || k.second >= hi || keys.count(k)) continue;
+            if (!book.enrolled(k.first, k.second)) continue;   // share-only rows: enrolled payees
+            keys[k];
+        }
+        Rows out;
+        for (auto& [k, hashes] : keys) {
+            ::c2pool::v37::subthreshold::ReceiptCollector rc(m_K, ::c2pool::v37n::drops_detail::h_t_of_lz(m_lz));
+            std::sort(hashes.begin(), hashes.end());
+            for (const auto& h : hashes) rc.observe(::c2pool::v37n::drops_detail::u256_of(h));
+            auto si = S.find(k);
+            rc.set_shares(si == S.end() ? 0 : si->second);
+            out.push_back(::c2pool::v37n::settle::HarvestedReceipt{k.first, k.second, rc});
+        }
+        return out;
+    }
+    // the inputs digest of [lo, hi) with S from the lane prefix (diagnostic)
+    std::uint64_t lane_inputs_digest(std::uint64_t lo, std::uint64_t hi, const ShareCounts& S) const {
+        return lane_inputs_digest_of(m_drops, lo, hi, S);
+    }
+    std::uint64_t lane_inputs_digest_of(const std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>>& drops,
+                                        std::uint64_t lo, std::uint64_t hi, const ShareCounts& S) const {
+        std::uint64_t x = 1469598103934665603ULL;
+        auto mix = [&x](const unsigned char* p, std::size_t n) { for (std::size_t i = 0; i < n; ++i) { x ^= p[i]; x *= 1099511628211ULL; } };
+        for (auto it = drops.lower_bound(lo); it != drops.end() && it->first < hi; ++it) {
+            mix(reinterpret_cast<const unsigned char*>(&it->first), sizeof(it->first));
+            for (const auto& [payee, h] : it->second) { mix(payee.data(), payee.size()); mix(h.data(), h.size()); }
+        }
+        for (const auto& [k, s] : S) {
+            if (k.second < lo || k.second >= hi) continue;
+            mix(k.first.data(), k.first.size());
+            mix(reinterpret_cast<const unsigned char*>(&k.second), sizeof(k.second));
+            mix(reinterpret_cast<const unsigned char*>(&s), sizeof(s));
+        }
+        return x;
+    }
+
+    // A short digest of the retained inputs of [lo, hi) (payee, interval, hashes,
+    // S): what the rig compares across nodes per canonical block. Diagnostic.
+    std::uint64_t inputs_digest(std::uint64_t lo, std::uint64_t hi) const {
+        std::uint64_t x = 1469598103934665603ULL;
+        auto mix = [&x](const unsigned char* p, std::size_t n) { for (std::size_t i = 0; i < n; ++i) { x ^= p[i]; x *= 1099511628211ULL; } };
+        for (auto it = m_drops.lower_bound(lo); it != m_drops.end() && it->first < hi; ++it) {
+            mix(reinterpret_cast<const unsigned char*>(&it->first), sizeof(it->first));
+            for (const auto& [payee, h] : it->second) { mix(payee.data(), payee.size()); mix(h.data(), h.size()); }
+        }
+        for (const auto& [k, s] : m_shares) {
+            if (k.second < lo || k.second >= hi) continue;
+            mix(k.first.data(), k.first.size());
+            mix(reinterpret_cast<const unsigned char*>(&k.second), sizeof(k.second));
+            mix(reinterpret_cast<const unsigned char*>(&s), sizeof(s));
+        }
+        return x;
+    }
+
+    // Book a lane block won at `won_height` whose canonical predecessor lane
+    // block is `prev_lane`: the rows of range_with(won_height, prev_lane). The
+    // retained set is NOT consumed (a later booking at the same or a lower
+    // height -- a reorg -- re-derives from it); it is pruned only below the top
+    // range minus kReorgMargin.
+    Rows take(std::uint64_t won_height, std::optional<std::uint64_t> prev_lane, const CoversFn& covers,
+              const ::c2pool::v37n::EnrollmentBook* enrollment) {
+        const auto rg = range_with(won_height, prev_lane);
+        if (!rg) { ++m_undecided; return {}; }
+        const auto [lo, hi] = *rg;
+        m_last_lo = lo; m_last_hi = hi;
+        m_booked[won_height] = *rg;
+        while (m_booked.size() > kBookedKept) m_booked.erase(m_booked.begin());
+        Rows out = rows_over(lo, hi, covers, enrollment, &m_withheld);
+        if (won_height >= m_top) {   // bounded retention: keep kReorgMargin intervals below the top range
+            m_top = won_height;
+            if (lo > kReorgMargin) m_floor = std::max(m_floor, lo - kReorgMargin);
+        }
+        m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
+        for (auto it = m_drop_ids.begin(); it != m_drop_ids.end();) it = it->second.interval < m_floor ? m_drop_ids.erase(it) : std::next(it);
+        for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
+        return out;
+    }
+
+    // ★ DROPS-ENROL-TIDY: take() without the rows -- the same range, range log
+    // and bounded-retention bookkeeping, and nothing read from the node-local
+    // share book or an enrolment book. At flip 1 every booking books the lane
+    // composition (handed to the node as its carried delta), so the rows take()
+    // derives would be discarded anyway; the lane-only wiring advances with this.
+    void advance(std::uint64_t won_height, std::optional<std::uint64_t> prev_lane) {
+        const auto rg = range_with(won_height, prev_lane);
+        if (!rg) { ++m_undecided; return; }
+        const auto [lo, hi] = *rg;
+        m_last_lo = lo; m_last_hi = hi;
+        m_booked[won_height] = *rg;
+        while (m_booked.size() > kBookedKept) m_booked.erase(m_booked.begin());
+        if (won_height >= m_top) {
+            m_top = won_height;
+            if (lo > kReorgMargin) m_floor = std::max(m_floor, lo - kReorgMargin);
+        }
+        m_drops.erase(m_drops.begin(), m_drops.lower_bound(m_floor));
+        for (auto it = m_drop_ids.begin(); it != m_drop_ids.end();) it = it->second.interval < m_floor ? m_drop_ids.erase(it) : std::next(it);
+        for (auto it = m_shares.begin(); it != m_shares.end();) it = it->first.second < m_floor ? m_shares.erase(it) : std::next(it);
+    }
+
+    // ★ DROPS-RESTART (defect 1): prev_lane(h) from the canonical chain, as a
+    // pure walk. Only a block whose BYTES were read and whose coinbase carries
+    // no 03-21-00 lane tag is a deterministic "not lane"; a block that carries
+    // the tag is a lane block whether or not its root matched this node's ring
+    // yet (the candidate match is node state: a restarted node's ring is short).
+    // A chain row that is not readable, or bytes that are not readable, is
+    // UNDECIDABLE now: nullopt (the booking HOLDs) and NOTHING is memoised.
+    // kNoPrevLane only after walking down to height 1 or past max_walk.
+    enum class LaneProbe { Lane, NotLane, Undecidable };
+    static LaneProbe probe_of(bool bytes_read, bool is_lane, bool has_lane_tag) {
+        if (!bytes_read) return LaneProbe::Undecidable;
+        return (is_lane || has_lane_tag) ? LaneProbe::Lane : LaneProbe::NotLane;
+    }
+    struct WalkStats { std::uint64_t decoded = 0, none = 0, undecided = 0, row_missing = 0; };
+    using RowFn = std::function<std::optional<std::string>(std::uint64_t height)>;
+    using ProbeFn = std::function<LaneProbe(const std::string& bid)>;
+    static std::optional<std::uint64_t> walk_prev_lane(std::uint64_t won_height, std::uint64_t max_walk,
+                                                       const RowFn& row, const ProbeFn& probe,
+                                                       std::map<std::string, bool>& memo, WalkStats* st = nullptr) {
+        for (std::uint64_t x = won_height; x-- > 1 && won_height - x <= max_walk;) {
+            const auto b = row(x);
+            if (!b) { if (st) { ++st->undecided; ++st->row_missing; } return std::nullopt; }   // HOLD, never "none below"
+            auto it = memo.find(*b);
+            if (it == memo.end()) {
+                const LaneProbe p = probe(*b);
+                if (p == LaneProbe::Undecidable) { if (st) ++st->undecided; return std::nullopt; }   // HOLD, not memoised
+                if (st) ++st->decoded;
+                it = memo.emplace(*b, p == LaneProbe::Lane).first;
+            }
+            if (it->second) return x;
+        }
+        if (st) ++st->none;
+        return kNoPrevLane;
+    }
+
+    std::uint64_t observed() const { return m_observed; }
+    std::uint64_t late() const { return m_late; }
+    std::uint64_t withheld() const { return m_withheld; }
+    std::uint64_t undecided() const { return m_undecided; }
+    std::uint64_t floor() const { return m_floor; }
+    std::size_t marks() const { return m_booked.size(); }
+    std::size_t retained_intervals() const { return m_drops.size(); }
+    std::pair<std::uint64_t, std::uint64_t> last_range() const { return {m_last_lo, m_last_hi}; }
+
+    // DROPS DUE (A5): identity -> the PoW-bound payee ref its raindrops carried,
+    // so a DROPS-only payee (no share in the anchor view) can be paid from the
+    // due once note_booked_refs teaches the ref with the booked deposit.
+    void observe_ref(const bytes32& identity, const ::v37::ScriptRef& ref) { m_refs[identity] = ref; }
+    std::optional<::v37::ScriptRef> ref_of(const bytes32& identity) const {
+        const auto it = m_refs.find(identity);
+        if (it == m_refs.end()) return std::nullopt;
+        return it->second;
+    }
+
+private:
+    std::map<bytes32, ::v37::ScriptRef> m_refs;                                     // DROPS DUE: identity -> ref
+    std::uint32_t m_K;
+    unsigned m_lz;
+    std::uint64_t m_d_conf;
+    std::map<std::uint64_t, std::set<std::pair<bytes32, bytes32>>> m_drops;          // interval -> {(payee, N)}
+    std::map<bytes32, DropRec> m_drop_ids;                                          // ★ DROPS-SET-PIN: receipt id -> raindrop
+    std::map<std::pair<bytes32, std::uint64_t>, std::uint64_t> m_shares;            // (payee, interval) -> S
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> m_booked;       // diagnostic: h -> the range it composed
+    std::uint64_t m_floor = 0, m_top = 0, m_observed = 0, m_late = 0, m_withheld = 0, m_undecided = 0, m_last_lo = 0, m_last_hi = 0;
+};
+
+// ── ★ DROPS-RESTART (defects 2 + 3): the carried-delta journal ─────────────
+// Append-only, fsync'd, one record per line, next to the settlement store:
+//   W <bid> <hex FB_BLOCK_WON v0x01>   our own win, written when the win is
+//                                      registered (before its delta exists)
+//   F <bid> <hex FB_BLOCK_WON v0x02>   a carried frame: our composition,
+//                                      written BEFORE it is sent or booked, or
+//                                      a peer's frame once it booked CARRIED
+//   B <bid> <n> [<payee hex> <delta>]  the delta this node BOOKED for bid,
+//                                      written BEFORE the node books it
+//   P <bid> <h>                        our own block, written in the exact
+//                                      network gate BEFORE it is published
+//                                      (WRITE-AHEAD: a crash between the
+//                                      publish and the FOUND callback, where
+//                                      W is written, cannot lose the win)
+// After a restart the shell re-announces and serves every F frame, composes
+// every W without an F at its booking, and a boot / converge re-drive of a
+// pending FOUND books B (never a fresh local composition); a P without a W is
+// our own win all the same and is composed at its booking. The last record of
+// a kind for a bid wins. Only ever constructed under the flip.
+#define C2POOL_XMR_DROPS_RESTART 1
+#define C2POOL_XMR_DROPS_WRITEAHEAD 1
+class DropsCarryStore {
+public:
+    using Delta = std::map<bytes32, long long>;
+    explicit DropsCarryStore(std::string path) : m_path(std::move(path)) {}
+    struct Loaded { std::size_t own = 0, frames = 0, booked = 0, malformed = 0, published = 0; };
+    Loaded load() {
+        Loaded l;
+        std::FILE* f = std::fopen(m_path.c_str(), "r");
+        if (!f) return l;
+        std::string line;
+        auto take = [&](const std::string& ln) {
+            std::vector<std::string> t;
+            std::size_t i = 0;
+            while (i < ln.size()) {
+                while (i < ln.size() && ln[i] == ' ') ++i;
+                std::size_t j = i;
+                while (j < ln.size() && ln[j] != ' ') ++j;
+                if (j > i) t.push_back(ln.substr(i, j - i));
+                i = j;
+            }
+            if (t.size() < 3 || t[1].size() != 64) { ++l.malformed; return; }
+            if (t[0] == "P") {   // WRITE-AHEAD: our own block, journalled before it was published
+                std::uint64_t h = 0;
+                try { h = static_cast<std::uint64_t>(std::stoull(t[2])); } catch (...) { ++l.malformed; return; }
+                if (t.size() != 3) { ++l.malformed; return; }
+                { std::lock_guard<std::mutex> lk(m_pub_mu); m_pub[t[1]] = h; }
+                ++l.published;
+                return;
+            }
+            if (t[0] == "W" || t[0] == "F") {
+                std::vector<std::uint8_t> raw;
+                if (!unhex(t[2], raw)) { ++l.malformed; return; }
+                if (t[0] == "W") { m_own[t[1]] = std::move(raw); ++l.own; }
+                else             { m_frames[t[1]] = std::move(raw); ++l.frames; }
+                return;
+            }
+            if (t[0] == "B") {
+                std::size_t n = 0;
+                try { n = static_cast<std::size_t>(std::stoull(t[2])); } catch (...) { ++l.malformed; return; }
+                if (t.size() != 3 + 2 * n) { ++l.malformed; return; }
+                Delta d;
+                for (std::size_t k = 0; k < n; ++k) {
+                    std::vector<std::uint8_t> p;
+                    if (!unhex(t[3 + 2 * k], p) || p.size() != 32) { ++l.malformed; return; }
+                    bytes32 key{}; std::copy(p.begin(), p.end(), key.begin());
+                    try { d[key] = std::stoll(t[4 + 2 * k]); } catch (...) { ++l.malformed; return; }
+                }
+                m_booked[t[1]] = std::move(d);
+                ++l.booked;
+                return;
+            }
+            if (t[0] == "G") {   // RAINDROP ENROL: the booking's enrol_add (key eff kind payload) x n
+                std::size_t n = 0;
+                try { n = static_cast<std::size_t>(std::stoull(t[2])); } catch (...) { ++l.malformed; return; }
+                if (t.size() != 3 + 4 * n) { ++l.malformed; return; }
+                ::c2pool::v37n::settle::DropsEnrolRegistry g;
+                for (std::size_t k = 0; k < n; ++k) {
+                    std::vector<std::uint8_t> p, pl;
+                    if (!unhex(t[3 + 4 * k], p) || p.size() != 32 || (t[6 + 4 * k] != "-" && !unhex(t[6 + 4 * k], pl))) { ++l.malformed; return; }
+                    bytes32 key{}; std::copy(p.begin(), p.end(), key.begin());
+                    ::c2pool::v37n::settle::DropsEnrolRec r;
+                    unsigned long kind = 0;
+                    try { r.eff = std::stoull(t[4 + 4 * k]); kind = std::stoul(t[5 + 4 * k]); } catch (...) { ++l.malformed; return; }
+                    if (kind > 255) { ++l.malformed; return; }
+                    r.ref.kind = static_cast<::v37::ScriptKind>(kind);
+                    r.ref.payload = std::move(pl);
+                    g[key] = std::move(r);
+                }
+                m_enrol[t[1]] = std::move(g);
+                return;
+            }
+            if (t[0] == "V") {   // DROPS WINDOW (A4b): the booking's window entries (c span key work) x n
+                std::size_t n = 0;
+                try { n = static_cast<std::size_t>(std::stoull(t[2])); } catch (...) { ++l.malformed; return; }
+                if (t.size() != 3 + 4 * n) { ++l.malformed; return; }
+                ::c2pool::v37n::settle::DropsWindow w;
+                for (std::size_t k = 0; k < n; ++k) {
+                    std::vector<std::uint8_t> p;
+                    if (!unhex(t[5 + 4 * k], p) || p.size() != 32) { ++l.malformed; return; }
+                    bytes32 key{}; std::copy(p.begin(), p.end(), key.begin());
+                    try {
+                        w[::c2pool::v37n::settle::DropsWindowKey(static_cast<std::uint64_t>(std::stoull(t[3 + 4 * k])),
+                                                                 static_cast<std::uint64_t>(std::stoull(t[4 + 4 * k])), key)] =
+                            std::stoll(t[6 + 4 * k]);
+                    } catch (...) { ++l.malformed; return; }
+                }
+                m_window[t[1]] = std::move(w);
+                return;
+            }
+            ++l.malformed;
+        };
+        int c;
+        while ((c = std::fgetc(f)) != EOF) {
+            if (c == '\n') { if (!line.empty()) take(line); line.clear(); }
+            else line.push_back(static_cast<char>(c));
+        }
+        if (!line.empty()) ++l.malformed;   // a torn last line (crash mid-append): ignored
+        std::fclose(f);
+        return l;
+    }
+    bool put_own(const std::string& bid, const std::vector<std::uint8_t>& frame) {
+        m_own[bid] = frame;
+        return append("W " + bid + " " + hex(frame));
+    }
+    bool put_frame(const std::string& bid, const std::vector<std::uint8_t>& frame) {
+        m_frames[bid] = frame;
+        return append("F " + bid + " " + hex(frame));
+    }
+    bool put_booked(const std::string& bid, const Delta& d) {
+        m_booked[bid] = d;
+        std::string s = "B " + bid + " " + std::to_string(d.size());
+        for (const auto& [k, v] : d) s += " " + hex(std::vector<std::uint8_t>(k.begin(), k.end())) + " " + std::to_string(v);
+        return append(s);
+    }
+    // RAINDROP ENROL: the payees a booking enrolled by raindrop, journalled with
+    // its delta (a re-drive books both). Written only when non-empty.
+    bool put_enrol(const std::string& bid, const ::c2pool::v37n::settle::DropsEnrolRegistry& g) {
+        if (g.empty()) return true;
+        m_enrol[bid] = g;
+        std::string s = "G " + bid + " " + std::to_string(g.size());
+        for (const auto& [k, r] : g)
+            s += " " + hex(std::vector<std::uint8_t>(k.begin(), k.end())) + " " + std::to_string(r.eff) + " " +
+                 std::to_string(static_cast<unsigned>(r.ref.kind)) + " " + (r.ref.payload.empty() ? std::string("-") : hex(r.ref.payload));
+        return append(s);
+    }
+    ::c2pool::v37n::settle::DropsEnrolRegistry enrol(const std::string& bid) const {
+        auto it = m_enrol.find(bid);
+        return it == m_enrol.end() ? ::c2pool::v37n::settle::DropsEnrolRegistry{} : it->second;
+    }
+    // DROPS WINDOW (A4b): a booking's window entries, journalled with its delta
+    // (a re-drive books them). Written only when non-empty.
+    bool put_window(const std::string& bid, const ::c2pool::v37n::settle::DropsWindow& w) {
+        if (w.empty()) return true;
+        m_window[bid] = w;
+        std::string s = "V " + bid + " " + std::to_string(w.size());
+        for (const auto& [ck, v] : w)
+            s += " " + std::to_string(ck.c) + " " + std::to_string(ck.n) + " " +
+                 hex(std::vector<std::uint8_t>(ck.payee.begin(), ck.payee.end())) + " " + std::to_string(v);
+        return append(s);
+    }
+    ::c2pool::v37n::settle::DropsWindow window(const std::string& bid) const {
+        auto it = m_window.find(bid);
+        return it == m_window.end() ? ::c2pool::v37n::settle::DropsWindow{} : it->second;
+    }
+    // WRITE-AHEAD: our own block (monerod/levin block id, 64 hex) at height h,
+    // journalled BEFORE it is published. Called on the stratum listener thread
+    // (the exact network gate) as well as the main thread: locked.
+    bool put_published(const std::string& bid, std::uint64_t h) {
+        { std::lock_guard<std::mutex> lk(m_pub_mu); m_pub[bid] = h; }
+        return append("P " + bid + " " + std::to_string(h));
+    }
+    bool published(const std::string& bid) const {
+        std::lock_guard<std::mutex> lk(m_pub_mu);
+        return m_pub.count(bid) != 0;
+    }
+    std::size_t published_size() const {
+        std::lock_guard<std::mutex> lk(m_pub_mu);
+        return m_pub.size();
+    }
+    std::map<std::string, std::uint64_t> published_copy() const {   // ★ DROPS-SET-PIN: bid -> h
+        std::lock_guard<std::mutex> lk(m_pub_mu);
+        return m_pub;
+    }
+    // THE decision the booking takes for a lane block: is it OUR win whose carried
+    // delta is still to be composed (registered W, or published P), with no
+    // composed frame (F) yet? A P alone (crash between the publish and the FOUND
+    // callback) answers yes: the win survives, so the delta is still carried.
+    bool own_to_compose(const std::string& bid) const {
+        return (m_own.count(bid) != 0 || published(bid)) && m_frames.count(bid) == 0;
+    }
+    std::optional<Delta> booked(const std::string& bid) const {
+        auto it = m_booked.find(bid);
+        if (it == m_booked.end()) return std::nullopt;
+        return it->second;
+    }
+    bool has_frame(const std::string& bid) const { return m_frames.count(bid) != 0; }
+    const std::map<std::string, std::vector<std::uint8_t>>& own() const { return m_own; }
+    const std::map<std::string, std::vector<std::uint8_t>>& frames() const { return m_frames; }
+    std::size_t booked_size() const { return m_booked.size(); }
+    std::uint64_t write_failures() const { return m_write_fail.load(); }
+    const std::string& path() const { return m_path; }
+
+private:
+    static std::string hex(const std::vector<std::uint8_t>& b) {
+        static const char* d = "0123456789abcdef";
+        std::string s; s.reserve(b.size() * 2);
+        for (std::uint8_t x : b) { s.push_back(d[x >> 4]); s.push_back(d[x & 15]); }
+        return s;
+    }
+    static bool unhex(const std::string& s, std::vector<std::uint8_t>& out) {
+        if (s.size() % 2) return false;
+        auto nib = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+        out.clear(); out.reserve(s.size() / 2);
+        for (std::size_t i = 0; i < s.size(); i += 2) {
+            const int a = nib(s[i]), b = nib(s[i + 1]);
+            if (a < 0 || b < 0) return false;
+            out.push_back(static_cast<std::uint8_t>(a * 16 + b));
+        }
+        return true;
+    }
+    bool append(const std::string& line) {
+        if (m_path.empty()) return true;   // in-memory (a KAT)
+        std::lock_guard<std::mutex> lk(m_io_mu);   // the gate (listener thread) appends P concurrently
+        std::FILE* f = std::fopen(m_path.c_str(), "a");
+        if (!f) { ++m_write_fail; return false; }
+        const std::string l = line + "\n";
+        bool ok = std::fwrite(l.data(), 1, l.size(), f) == l.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        ok = (std::fclose(f) == 0) && ok;
+        if (!ok) ++m_write_fail;
+        return ok;
+    }
+    std::string m_path;
+    std::map<std::string, std::vector<std::uint8_t>> m_own, m_frames;
+    std::map<std::string, Delta> m_booked;
+    std::map<std::string, ::c2pool::v37n::settle::DropsEnrolRegistry> m_enrol;   // RAINDROP ENROL
+    std::map<std::string, ::c2pool::v37n::settle::DropsWindow> m_window;          // DROPS WINDOW (A4b)
+    mutable std::mutex m_pub_mu;
+    std::map<std::string, std::uint64_t> m_pub;   // WRITE-AHEAD: bid -> h, our own published blocks
+    std::mutex m_io_mu;
+    std::atomic<std::uint64_t> m_write_fail{0};
+};
+
+// ── THE XMR BUNDLE: one per lane, owned by the shell ────────────────────────
+class XmrDropsWiring {
+public:
+    // ★ THE DORMANCY GATE. nullptr unless the build took the consensus
+    // activation AND the lane geometry carries the gate AND there is a share
+    // difficulty to normalise against — the XMR twin of make_drops_wiring().
+    static std::unique_ptr<XmrDropsWiring> make(const ::v37::LaneParams& p,
+                                                std::uint64_t share_diff,
+                                                std::uint64_t receipt_weight) {
+        if constexpr (!::c2pool::v37n::kDropsWiringArmed) {
+            (void)p; (void)share_diff; (void)receipt_weight;
+            return nullptr;
+        } else {
+            if (!p.subthreshold.enabled || share_diff == 0 || receipt_weight == 0) return nullptr;
+            return std::unique_ptr<XmrDropsWiring>(
+                new XmrDropsWiring(p.subthreshold.K, share_diff, receipt_weight));
+        }
+    }
+    // The same construction without the build gate, for a KAT that must drive
+    // the gate-ON object inside a default (flip 0) build.
+    static std::unique_ptr<XmrDropsWiring> make_for_test(std::uint32_t K, std::uint64_t share_diff,
+                                                         std::uint64_t receipt_weight) {
+        return std::unique_ptr<XmrDropsWiring>(new XmrDropsWiring(K, share_diff, receipt_weight));
+    }
+
+    XmrDropsWiring(const XmrDropsWiring&) = delete;
+    XmrDropsWiring& operator=(const XmrDropsWiring&) = delete;
+
+    std::uint64_t share_diff() const { return m_share_diff; }
+    std::uint64_t floor_diff() const { return drops_floor_diff(m_share_diff); }
+    std::uint64_t receipt_weight() const { return m_receipt_weight; }
+
+    // ── (1) the clock: fed ONLY from the native tip ─────────────────────────
+    void observe_native_tip(std::uint64_t tip_height) { m_core.observe_tip(open_bin_of_tip(tip_height)); }
+    std::optional<std::uint64_t> now_interval() const { return m_core.now_interval(); }
+    ::c2pool::v37n::EnrollOutcome enroll_at_tip(const bytes32& payee) { return m_core.enroll_at_tip(payee); }
+    bool arm_at_tip() { return m_core.arm_at_tip(); }
+
+    // ── the node seams ─────────────────────────────────────────────────────
+    template <class Node>
+    void attach(Node& node) {
+        node.set_drop_harvester(&m_core.harvester());
+        node.set_enrollment_book(&m_core.enrollment());
+        node.set_pre_harvest(m_core.pre_harvest());
+        node.set_drops_price_fn([this]() { return take_cut_price(); });
+        if constexpr (requires { node.set_drops_carried_fn({}); })
+            node.set_drops_carried_fn([this]() { return take_carried(); });   // ENROL-REPL
+    }
+    // ★ RAIN-BACKFILL: compose from the retained, chain-ordered harvest (6)
+    // instead of the destructive take_buried(). Called by the shell right after
+    // attach(); a node without it keeps the take_buried() body.
+    template <class Node>
+    void attach_chain_order(Node& node, std::uint64_t d_conf) {
+        {
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            m_chain_order = true;
+            m_coh.set_d_conf(d_conf);
+        }
+        node.set_harvest_range_fn([this](std::uint64_t won_height) { return take_chain_ordered(won_height); });
+    }
+    bool chain_ordered() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_chain_order; }
+    // ★ RAIN-BACKFILL-2: the canonical chain's answer to "which lane block is
+    // nearest below h" (ChainOrderedHarvest::PrevLaneFn). Unset => every height
+    // is taken to be a lane block (prev_lane(h) = h - 1).
+    void set_prev_lane_fn(ChainOrderedHarvest::PrevLaneFn f) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        m_prev_lane = std::move(f);
+    }
+    std::optional<std::uint64_t> prev_lane(std::uint64_t won_height) const {
+        ChainOrderedHarvest::PrevLaneFn f;
+        { std::lock_guard<std::mutex> lk(m_hmtx); f = m_prev_lane; }   // asked OUTSIDE the lock (it may read the chain)
+        if (f) return f(won_height);
+        return won_height > 1 ? won_height - 1 : ChainOrderedHarvest::kNoPrevLane;
+    }
+    // the interval range the composition of a lane block won at h settles (the
+    // HOLD's range); nullopt = the canonical predecessor is undecidable now
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> range_for(std::uint64_t won_height) const {
+        const auto pl = prev_lane(won_height);
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        return m_coh.range_with(won_height, pl);
+    }
+    ChainOrderedHarvest::Rows take_chain_ordered(std::uint64_t won_height) {
+        const auto pl = prev_lane(won_height);
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        if (m_lane_only) { m_coh.advance(won_height, pl); return {}; }   // ★ DROPS-ENROL-TIDY
+        const auto& book = m_core.shares();
+        return m_coh.take(won_height, pl, [&book](std::uint64_t iv) { return book.covers(iv); }, &m_core.enrollment());
+    }
+    // ★ DROPS-ENROL-TIDY (flip 1): the composition is the lane derivation only.
+    // The tip-based EnrollmentBook and the node-local share book are no longer
+    // fed by the shell (no enroll_at_tip / arm_at_tip / on_share_pushed), the
+    // node is handed NO enrolment book, and the harvest seam only advances the
+    // retained set's range bookkeeping (every row it used to derive was
+    // discarded by the carried-delta booking). The one remaining reader of that
+    // seam is XmrNode's LOCAL-composition fallback (no carried delta AND no
+    // journalled booking), which the lane booking never reaches; with no book
+    // it composes nothing (fail-closed), never a node-local credit.
+    void set_lane_only(bool on = true) { std::lock_guard<std::mutex> lk(m_hmtx); m_lane_only = on; }
+    bool lane_only() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_only; }
+    // diagnostic: (rows, inputs digest) of [lo, hi) as the retained set stands now (pure)
+    std::pair<std::size_t, std::uint64_t> peek_rows(std::uint64_t lo, std::uint64_t hi) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        const auto& book = m_core.shares();
+        const auto rows = m_coh.rows_over(lo, hi, [&book](std::uint64_t iv) { return book.covers(iv); }, &m_core.enrollment());
+        return {rows.size(), m_coh.inputs_digest(lo, hi)};
+    }
+    struct ChainStats { std::uint64_t observed = 0, late = 0, withheld = 0, undecided = 0, floor = 0; std::size_t marks = 0, intervals = 0; std::uint64_t lo = 0, hi = 0; };
+    ChainStats chain_stats() const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        ChainStats c;
+        c.observed = m_coh.observed(); c.late = m_coh.late(); c.withheld = m_coh.withheld();
+        c.undecided = m_coh.undecided(); c.floor = m_coh.floor();
+        c.marks = m_coh.marks(); c.intervals = m_coh.retained_intervals();
+        c.lo = m_coh.last_range().first; c.hi = m_coh.last_range().second;
+        return c;
+    }
+
+    // ── ★ DROPS-ENROL-LANE (7): the lane prefix + the composition from it ───
+    // The pool's enrol set (identities; the same on every node: HELLO-checked).
+    void set_enrol_set(std::set<bytes32> s) { std::lock_guard<std::mutex> lk(m_hmtx); m_enrol_set = std::move(s); }
+    void set_enrol_mode(EnrolMode m) { std::lock_guard<std::mutex> lk(m_hmtx); m_enrol_mode = m; }   // ★ DROPS-AUTO-ENROL
+    EnrolMode enrol_mode() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_enrol_mode; }
+    std::set<bytes32> enrol_set() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_enrol_set; }
+    // A receipt the lane just pushed at positions [pos_first, pos_first + n):
+    // ONE share of `payee` at origin bin `bin` (0 = not known yet: a durable-log
+    // reload; resolved from `prev_id` when a prefix is derived).
+    void on_share_lane(const bytes32& payee, std::uint64_t bin, std::uint64_t pos_first, std::uint32_t n,
+                       const bytes32& prev_id, std::uint16_t give = 0) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        if (pos_first < m_lane_base_P) {   // ★ DROPS-ENROL-TIDY: a rewrite below the folded base
+            m_lane_base_stale = true;      // the fold no longer describes [0, base_P): own prefixes refuse (repair)
+            ++m_lane_below_base;
+            return;
+        }
+        m_lane_pos[pos_first] = LanePos{payee, bin, prev_id, give, n ? n : 1};
+        m_lane_pos_max = std::max(m_lane_pos_max, m_lane_pos.size());
+        if (pos_first == m_lane_contig) m_lane_contig = pos_first + (n ? n : 1);
+        else if (pos_first > m_lane_contig) ++m_lane_gaps;   // our own log no longer covers [0, P) past here
+    }
+    using BinOfFn = std::function<std::optional<std::uint64_t>(const bytes32& prev_id)>;
+
+    // ── ★ DROPS-ENROL-TIDY: THE LANE-LOG BOUND ─────────────────────────────
+    // INVARIANT. m_lane_pos is read ONLY by own_prefix(P), and only for a P the
+    // shell has matched to our own lane (relay digest_at(P) -- retained for
+    // P >= lane_next - H - 1, H = the relay vault horizon -- or the engine's
+    // settlement ring at P). The relay-repair answer never reads it (it is the
+    // winner-side order out of the relay vault + verified cache) and
+    // verify_carry reads only the digest compose_lane derives from a prefix.
+    // The lane blocks still bookable are the ones above the finalize cursor (a
+    // block at or below it is final and never re-booked), and a future block's
+    // cut is only readable here while it is inside H. So with
+    //     reach = min(the cut of every lane block not yet final, and of the
+    //                 newest final one;  lane_next - H - 1)
+    //     Q     = reach - kLanePosMargin            (lane_prune_point)
+    // no own_prefix(P) that can still be asked has P < Q, and the entries at
+    // positions < Q are FOLDED (not dropped): what [0, Q) contributes to any
+    // prefix with P >= Q is (a) each payee's lowest origin bin (enrolment) and
+    // (b) S(payee, iv) for iv >= the harvest retention floor (a composition
+    // settles [lo, hi) with lo >= that floor: below it the raindrops are
+    // already released, ChainOrderedHarvest::kReorgMargin). own_prefix(P) for
+    // P >= base_P therefore returns the SAME counts, book and digest as before
+    // the fold; for P < base_P it answers nullopt ("below the folded base"),
+    // which the shell treats like any other underivable own prefix (the relay
+    // repair), never a different composition. The log then holds at most the
+    // entries at positions in [Q, lane_next): <= H + 1 + kLanePosMargin + the
+    // span the oldest unfinalized cut trails the lane by, and the fold holds
+    // one bin per payee plus the counts of the retained interval window.
+    static constexpr std::uint64_t kLanePosMargin = 16;   // positions kept below the oldest reachable cut
+    static std::uint64_t lane_prune_point(std::optional<std::uint64_t> oldest_open_cut, std::uint64_t lane_next,
+                                          std::uint64_t horizon) {
+        const std::uint64_t h_floor = lane_next > horizon + 1 ? lane_next - horizon - 1 : 0;
+        const std::uint64_t reach = oldest_open_cut ? std::min(*oldest_open_cut, h_floor) : 0;   // no cut known yet: keep all
+        return reach > kLanePosMargin ? reach - kLanePosMargin : 0;
+    }
+    // Fold the entries at positions < Q (and < our contiguous coverage) into the
+    // base. Stops at the first entry whose origin bin is not resolvable yet (a
+    // reloaded receipt): nothing unresolvable is ever folded. Returns how many
+    // entries were folded.
+    std::size_t prune_lane_log(std::uint64_t Q, const BinOfFn& bin_of) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        if (m_lane_base_stale) return 0;
+        const std::uint64_t lim = std::min(Q, m_lane_contig);
+        std::size_t n = 0;
+        auto it = m_lane_pos.begin();
+        for (; it != m_lane_pos.end() && it->first < lim; ++it) {
+            LanePos& e = it->second;
+            if (e.bin == 0) {
+                const auto b = bin_of ? bin_of(e.prev_id) : std::nullopt;
+                if (!b || *b == 0) break;
+                e.bin = *b;
+            }
+            auto [fi, fresh] = m_lane_base_first.try_emplace(e.payee, e.bin);
+            if (!fresh && e.bin < fi->second) fi->second = e.bin;
+            ++m_lane_base_counts[std::make_pair(e.payee, e.bin)];
+            { auto& gv = m_lane_base_give[e.payee]; gv.first += e.give; gv.second += 1; }   // ★ d5
+            ++m_lane_base_n;
+            m_lane_base_end = std::max(m_lane_base_end, it->first + e.n);   // ★ DROPS-CARRY-SUFFIX
+            ++n;
+        }
+        m_lane_base_P = it == m_lane_pos.end() ? std::max(m_lane_base_P, lim) : std::max(m_lane_base_P, it->first);
+        m_lane_pos.erase(m_lane_pos.begin(), it);
+        const std::uint64_t fl = m_coh.floor();   // counts below the harvest retention floor are unreadable
+        for (auto ci = m_lane_base_counts.begin(); ci != m_lane_base_counts.end();)
+            ci = ci->first.second < fl ? m_lane_base_counts.erase(ci) : std::next(ci);
+        m_lane_pruned += n;
+        return n;
+    }
+    struct LaneLogStats { std::size_t entries = 0, max_entries = 0, base_payees = 0, base_counts = 0, base_n = 0;
+                          std::uint64_t base_P = 0, pruned = 0, below_base = 0; bool stale = false; };
+    LaneLogStats lane_log_stats() const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        LaneLogStats s;
+        s.entries = m_lane_pos.size(); s.max_entries = m_lane_pos_max; s.base_payees = m_lane_base_first.size();
+        s.base_counts = m_lane_base_counts.size(); s.base_n = m_lane_base_n; s.base_P = m_lane_base_P;
+        s.pruned = m_lane_pruned; s.below_base = m_lane_below_base; s.stale = m_lane_base_stale;
+        return s;
+    }
+    bool lane_log_has(std::uint64_t pos) const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_pos.count(pos) != 0; }
+
+    // Our OWN lane order's prefix [0, P) (the caller has checked that our digest
+    // at P is the on-chain spine). nullopt = our log does not cover [0, P) or a
+    // receipt's bin is not resolvable yet (`why`; the booking HOLDs).
+    std::optional<LanePrefix> own_prefix(std::uint64_t P, const BinOfFn& bin_of, std::string* why) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        if (P > m_lane_contig) {
+            if (why) *why = "our lane log covers [0," + std::to_string(m_lane_contig) + ") < P=" + std::to_string(P);
+            return std::nullopt;
+        }
+        if (m_lane_base_P > 0 && (P < m_lane_base_P || m_lane_base_stale)) {   // ★ DROPS-ENROL-TIDY
+            if (why) *why = m_lane_base_stale ? "our lane log was rewritten below its folded base (relay repair)"
+                                              : "P=" + std::to_string(P) + " is below our folded lane-log base " + std::to_string(m_lane_base_P);
+            return std::nullopt;
+        }
+        LanePrefix lp; lp.P = P;
+        lp.base_P = m_lane_base_P; lp.base_n = m_lane_base_n;
+        lp.base_first = m_lane_base_first; lp.base_counts = m_lane_base_counts;
+        lp.base_give = m_lane_base_give;   // ★ d5
+        for (auto it = m_lane_pos.begin(); it != m_lane_pos.end() && it->first < P; ++it) {
+            LanePos& e = it->second;
+            if (e.bin == 0) {
+                const auto b = bin_of ? bin_of(e.prev_id) : std::nullopt;
+                if (!b || *b == 0) {
+                    if (why) *why = "the origin bin of the receipt at lane position " + std::to_string(it->first) + " is not resolvable yet";
+                    return std::nullopt;
+                }
+                e.bin = *b;
+            }
+            lp.shares.push_back(LaneShare{e.payee, e.bin, e.give});
+            lp.positions = std::max(lp.positions, it->first + e.n);   // ★ DROPS-CARRY-SUFFIX (diagnostic)
+        }
+        lp.positions = std::max(lp.positions, m_lane_base_end);
+        return lp;
+    }
+    // ★ DROPS-CARRY-SUFFIX: the prefix [0, P) of a REPAIRED cut. `served` = the
+    // receipts the relay repair fetched for [a0, P) (repair_a0(); 0 = the whole
+    // order), `a0` > 0 = the caller verified that OUR order over [0, a0) is the
+    // winner's (the settlement replay reached the spine from our own first a0
+    // pushes, or the serving peer's digest at a0 equals ours). The prefix is
+    // our log over [0, a0) -- the folded base + every entry below a0, which
+    // must tile [0, a0) exactly -- followed by `served`. INVARIANT: the covered
+    // positions reach P (the last receipt may straddle P, the own_prefix rule)
+    // and no receipt starts at or past P. nullopt + why = HOLD (retry=false:
+    // the served list itself is not [a0, P) -- the caller ALARMs); never a
+    // partial prefix. Pure: every node that verified the same spine builds the
+    // same multiset, so the same S, book and delta as the winner's own_prefix.
+    std::optional<LanePrefix> merged_prefix(std::uint64_t P, std::uint64_t a0, const std::vector<ServedShare>& served,
+                                            const BinOfFn& bin_of, PrefixWhy* why, const PrefixRecord* base = nullptr,
+                                            PrefixRecord* out = nullptr) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        const auto hold = [&](std::string t, bool retry) -> std::optional<LanePrefix> {
+            if (why) { why->text = std::move(t); why->retry = retry; }
+            return std::nullopt;
+        };
+        if (a0 > P) return hold("the served order starts at a0=" + std::to_string(a0) + " past P=" + std::to_string(P), false);
+        LanePrefix lp; lp.P = P;
+        PrefixRecord rec; rec.P = P;
+        std::uint64_t pos = 0;
+        const auto take = [&](std::uint64_t at, const ServedShare& x) {
+            lp.shares.push_back(LaneShare{x.payee, x.bin, x.give});
+            if (out) rec.list.emplace_back(at, x);
+        };
+        if (a0 > 0 && base) {   // [0, a0) from a reconstructed winner-side order (the relay's SHADOW base)
+            if (base->base_end > a0 || base->P < a0)
+                return hold("the shadow record covers [" + std::to_string(base->base_end) + "," + std::to_string(base->P) +
+                            ") which does not reach a0=" + std::to_string(a0) + " from its fold", true);
+            lp.base_P = base->fold.base_P; lp.base_n = base->fold.base_n; lp.base_first = base->fold.base_first;
+            lp.base_counts = base->fold.base_counts; lp.base_give = base->fold.base_give;
+            pos = base->base_end;
+            for (const auto& [at, x] : base->list) {
+                if (at >= a0) break;
+                if (at != pos) return hold("the shadow record does not tile [0,a0) at position " + std::to_string(at), true);
+                take(at, x); pos += x.n ? x.n : 1;
+            }
+            if (pos != a0) return hold("a receipt of the shadow record straddles a0=" + std::to_string(a0), true);
+        } else if (a0 > 0) {    // [0, a0) from OUR lane log
+            if (m_lane_contig < a0)
+                return hold("our lane log covers [0," + std::to_string(m_lane_contig) + ") < a0=" + std::to_string(a0), true);
+            if (m_lane_base_stale) return hold("our lane log was rewritten below its folded base", true);
+            if (m_lane_base_end > a0)
+                return hold("our folded lane-log base covers [0," + std::to_string(m_lane_base_end) + ") past a0=" + std::to_string(a0) +
+                            " (only [0,a0) of our order is verified)", true);
+            lp.base_P = m_lane_base_P; lp.base_n = m_lane_base_n;
+            lp.base_first = m_lane_base_first; lp.base_counts = m_lane_base_counts;
+            lp.base_give = m_lane_base_give;
+            pos = m_lane_base_end;
+            for (auto it = m_lane_pos.lower_bound(m_lane_base_P); it != m_lane_pos.end() && it->first < a0; ++it) {
+                if (it->first != pos)
+                    return hold("our lane log does not tile [0,a0): position " + std::to_string(it->first) + " != " + std::to_string(pos), true);
+                LanePos& e = it->second;
+                if (e.bin == 0) {
+                    const auto bb = bin_of ? bin_of(e.prev_id) : std::nullopt;
+                    if (!bb || *bb == 0)
+                        return hold("the origin bin of the receipt at lane position " + std::to_string(it->first) + " is not resolvable yet", true);
+                    e.bin = *bb;
+                }
+                take(it->first, ServedShare{e.payee, e.bin, e.give, e.n});
+                pos += e.n;
+            }
+            if (pos != a0)
+                return hold("our lane log covers [0," + std::to_string(pos) + ") at the served start a0=" + std::to_string(a0) +
+                            " (a receipt straddles a0)", true);
+        }
+        const std::uint64_t fold_end = a0 > 0 ? (base ? base->base_end : m_lane_base_end) : 0;
+        for (const auto& x : served) {
+            if (pos >= P) return hold("the served order lists a receipt at position " + std::to_string(pos) + " >= P", false);
+            if (x.bin == 0) return hold("a served receipt carries no origin bin", true);
+            take(pos, x);
+            pos += x.n ? x.n : 1;
+        }
+        lp.positions = pos;
+        if (pos < P)
+            return hold("prefix positions " + std::to_string(pos) + " != P=" + std::to_string(P) + " (a0=" + std::to_string(a0) +
+                        ", served " + std::to_string(served.size()) + " receipts): not the whole [0,P)", false);
+        if (out) {   // the receipt-by-receipt order this prefix IS (the DROPS mirror of the relay's new shadow)
+            rec.fold.base_P = lp.base_P; rec.fold.base_n = lp.base_n; rec.fold.base_first = lp.base_first;
+            rec.fold.base_counts = lp.base_counts; rec.fold.base_give = lp.base_give;
+            rec.base_end = fold_end;
+            *out = std::move(rec);
+        }
+        return lp;
+    }
+    // ★ DROPS-CARRY-LIVE (1): our fold F = lane_base_end() passed the served
+    // start a0 (a peer's vault horizon; with small or mixed --relay-vault-horizon
+    // it can sit anywhere below P), so our [0, a0) is no longer separable from the
+    // fold. [0, a0) is verified (the caller's own-base check); if OUR order over
+    // [a0, F) IS the served order's first receipts -- the same receipt ids at the
+    // same positions (`own_ids` = our durable lane order over [a0, F): pos_first,
+    // id) -- then our [0, F) is the winner's [0, F) exactly and the prefix is our
+    // fold [0, F) + the served receipts from F on (merged_prefix(P, F, tail)).
+    // Returns how many served receipts lie in [a0, F) (the tail starts there);
+    // nullopt + why = the orders differ below F or a receipt straddles F (HOLD).
+    static std::optional<std::size_t> own_base_through(std::uint64_t a0, std::uint64_t F, const std::vector<ServedShare>& served,
+                                                       const std::vector<bytes32>& served_ids,
+                                                       const std::vector<std::pair<std::uint64_t, bytes32>>& own_ids,
+                                                       std::string* why) {
+        const auto no = [&](std::string t) -> std::optional<std::size_t> { if (why) *why = std::move(t); return std::nullopt; };
+        if (served.size() != served_ids.size()) return no("served ids and receipts differ in length");
+        if (F <= a0) return std::size_t{0};
+        std::uint64_t pos = a0; std::size_t k = 0;
+        for (const auto& [opos, oid] : own_ids) {
+            if (pos >= F) break;
+            if (opos != pos) return no("our durable order does not tile [a0,F) at position " + std::to_string(opos));
+            if (k >= served.size()) return no("the served order ends inside our fold [a0,F)");
+            if (served_ids[k] != oid)
+                return no("our order differs from the served order at position " + std::to_string(pos) +
+                          " below our fold end F=" + std::to_string(F));
+            pos += served[k].n ? served[k].n : 1; ++k;
+        }
+        if (pos != F)
+            return no("our durable order covers [" + std::to_string(a0) + "," + std::to_string(pos) + ") != [a0,F=" + std::to_string(F) + ")");
+        return k;
+    }
+    // ★ DROPS-CARRY-LIVE (1b): where a stored record may be folded. A later
+    // repair takes [0, a0) from a record only for a0 >= its fold end, and a0 is
+    // the SERVING peer's vault horizon, not ours: with mixed
+    // --relay-vault-horizon fleets a record folded 2 x OUR horizon below its
+    // end HELD for ever against a peer with a larger one (live: "the shadow
+    // record covers [327,359) which does not reach a0=322 from its fold",
+    // ours 16, the peer's 64). A record keeps at least 2 x the default vault
+    // horizon (the bound a default-horizon node already keeps), else 2 x ours.
+    static constexpr std::uint64_t kRecordKeepFloor = 2 * 8640;
+    static std::uint64_t record_fold_point(std::uint64_t P, std::uint64_t our_horizon) {
+        const std::uint64_t keep = std::max<std::uint64_t>(2 * our_horizon, kRecordKeepFloor);
+        return P > keep ? P - keep : 0;
+    }
+    // ★ DROPS-CARRY-SUFFIX: fold a record's entries below Q into its base (the
+    // own-log fold rule: first bin per payee, S above the harvest retention
+    // floor, give sums), bounding a record like the lane log. A later repair
+    // takes [0, a0) from a record only for a0 >= its base_end (else HOLD).
+    std::size_t fold_record(PrefixRecord& r, std::uint64_t Q) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        std::size_t n = 0;
+        auto it = r.list.begin();
+        for (; it != r.list.end() && it->first + (it->second.n ? it->second.n : 1) <= Q; ++it) {
+            const ServedShare& x = it->second;
+            auto [fi, fresh] = r.fold.base_first.try_emplace(x.payee, x.bin);
+            if (!fresh && x.bin < fi->second) fi->second = x.bin;
+            ++r.fold.base_counts[std::make_pair(x.payee, x.bin)];
+            { auto& gv = r.fold.base_give[x.payee]; gv.first += x.give; gv.second += 1; }
+            ++r.fold.base_n;
+            r.base_end = it->first + (x.n ? x.n : 1);
+            ++n;
+        }
+        r.list.erase(r.list.begin(), it);
+        r.fold.base_P = r.base_end;
+        const std::uint64_t fl = m_coh.floor();
+        for (auto ci = r.fold.base_counts.begin(); ci != r.fold.base_counts.end();)
+            ci = ci->first.second < fl ? r.fold.base_counts.erase(ci) : std::next(ci);
+        return n;
+    }
+    // THE composition inputs of a lane block whose harvest settles [lo, hi):
+    // rows, the lane-derived book (its digest) -- a pure function of the
+    // retained raindrops over [lo, hi) and the prefix.
+    struct LaneCompose {
+        ChainOrderedHarvest::Rows rows;
+        ::c2pool::v37n::EnrollmentBook book;
+        bytes32 digest{};
+        std::uint64_t inputs = 0;
+        std::size_t prefix_shares = 0;
+        // ★ RAINDROP ENROL: the payees this composition enrolled by raindrop that
+        // the registry did not hold (eff = first raindrop bin + 1, the ref the
+        // raindrop named). They ride the block's FOUND (DropsFound::enrol_add).
+        ::c2pool::v37n::settle::DropsEnrolRegistry enrol_add;
+    };
+    // `registry`: the booking-point ledger's enrolment registry
+    // (OwedLedger::drops_enrol_registry); read only with set_raindrop_enrol on.
+    LaneCompose compose_lane(std::uint64_t lo, std::uint64_t hi, const LanePrefix& lp,
+                             const ::c2pool::v37n::settle::DropsEnrolRegistry* registry = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        LaneCompose c;
+        const ShareCounts S = lane_share_counts(lp, lo, hi);
+        enrol_book_locked(c, lp, registry, m_coh.first_drop_bins(lo, hi));
+        c.rows = m_coh.rows_lane(lo, hi, S, c.book);
+        c.inputs = m_coh.lane_inputs_digest(lo, hi, S);
+        c.prefix_shares = lp.receipts();   // ★ DROPS-ENROL-TIDY: folded + listed (== shares.size() unfolded)
+        return c;
+    }
+    // THE book of a composition (m_hmtx held). Rule off: the lane share rule.
+    // ★ RAINDROP ENROL (A3) on: the min of the share rule, the registry and
+    // the first raindrop bin + 1 of `fdb` (the raindrops composed from); the
+    // payees enrolled by raindrop that the registry did not hold go to enrol_add.
+    void enrol_book_locked(LaneCompose& c, const LanePrefix& lp,
+                           const ::c2pool::v37n::settle::DropsEnrolRegistry* registry,
+                           const std::map<bytes32, std::uint64_t>& fdb) const {
+        if (m_raindrop_enrol) {
+            static const ::c2pool::v37n::settle::DropsEnrolRegistry kNone;
+            const auto& reg = registry ? *registry : kNone;
+            c.book = lane_enrollment_ex(lp, m_enrol_set, m_enrol_mode, reg, fdb);
+            for (const auto& [payee, bin] : fdb) {
+                if (reg.count(payee) || !c.book.find(payee)) continue;   // registered already / not admitted by the mode
+                ::c2pool::v37n::settle::DropsEnrolRec r;
+                r.eff = bin + 1;
+                if (const auto ref = m_coh.ref_of(payee)) r.ref = *ref;
+                c.enrol_add.emplace(payee, std::move(r));
+            }
+        } else {
+            c.book = lane_enrollment(lp, m_enrol_set, m_enrol_mode);
+        }
+        c.digest = c.book.book_digest();
+    }
+    // ★ DROPS-SET-PIN: THE raindrop set of a lane block is the winner's pinned
+    // id list (FB_BLOCK_WON v0x03), never what a node happens to hold when it
+    // composes. The winner pins every raindrop it holds over [lo, hi) (at most
+    // `cap`, the smallest ids: deterministic); every node -- the winner too --
+    // composes through compose_lane_pinned from exactly that list.
+    std::vector<bytes32> pinned_ids(std::uint64_t lo, std::uint64_t hi, std::size_t cap, bool* capped = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        auto v = m_coh.ids_over(lo, hi);
+        if (capped) *capped = v.size() > cap;
+        if (v.size() > cap) v.resize(cap);
+        return v;
+    }
+    struct PinnedCompose {
+        LaneCompose lc;
+        std::vector<bytes32> missing;   // members not held here: fetch + HOLD (never composed partially)
+        std::string refused;            // "" or why the set is invalid for [lo, hi): the carriage books EMPTY
+        bool ok() const { return missing.empty() && refused.empty(); }
+    };
+#define C2POOL_XMR_DROPS_PIN_ENROL 1   // the pinned composer enrols by raindrop + reads the registry
+    PinnedCompose compose_lane_pinned(std::uint64_t lo, std::uint64_t hi, const LanePrefix& lp,
+                                      const std::vector<bytes32>& ids,
+                                      const ::c2pool::v37n::settle::DropsEnrolRegistry* registry = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        PinnedCompose pc;
+        const auto dm = m_coh.members_of(ids, lo, hi, pc.missing, pc.refused);
+        const ShareCounts S = lane_share_counts(lp, lo, hi);
+        // RAINDROP ENROL x DROPS-SET-PIN: a raindrop enrols only from the pinned
+        // members; an incomplete or refused set enrols by the share rule and the
+        // registry alone (the same book on every node).
+        static const std::map<bytes32, std::uint64_t> kNoBins;
+        enrol_book_locked(pc.lc, lp, registry, pc.ok() ? ChainOrderedHarvest::first_drop_bins_of(dm) : kNoBins);
+        pc.lc.prefix_shares = lp.receipts();
+        if (!pc.ok()) return pc;   // no rows: the caller HOLDs (missing) or books EMPTY (refused)
+        pc.lc.rows = m_coh.rows_lane_of(dm, lo, hi, S, pc.lc.book);
+        pc.lc.inputs = m_coh.lane_inputs_digest_of(dm, lo, hi, S);
+        return pc;
+    }
+    // the set digest of a pinned list (journal / log; the v37.1 on-chain commitment)
+    static bytes32 set_digest(std::uint64_t h, const bytes32& bid, const std::vector<bytes32>& ids) {
+        std::vector<std::uint8_t> b = {'V', '3', '7', 'D', 'R', 'O', 'P', 'S', 'E', 'T', '1'};
+        for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(h >> (8 * i)));
+        b.insert(b.end(), bid.begin(), bid.end());
+        const std::uint32_t n = static_cast<std::uint32_t>(ids.size());
+        for (int i = 0; i < 4; ++i) b.push_back(static_cast<std::uint8_t>(n >> (8 * i)));
+        for (const auto& id : ids) b.insert(b.end(), id.begin(), id.end());
+        return ::v37::sha256d(b);
+    }
+    std::uint64_t lane_contig() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_contig; }
+    // ★ DROPS-CARRY-LIVE: the positions our folded lane-log base covers ([0, base_end))
+    std::uint64_t lane_base_end() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_base_end; }
+    std::uint64_t lane_gaps() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_lane_gaps; }
+
+    template <class Node>
+    static void detach(Node& node) {
+        node.set_drop_harvester(nullptr);
+        node.set_enrollment_book(nullptr);
+        node.set_pre_harvest({});
+        node.set_drops_price_fn({});
+        if constexpr (requires { node.set_drops_carried_fn({}); }) node.set_drops_carried_fn({});
+    }
+
+    // ── ENROL-REPL: the carried delta the NEXT on_network_block_won books ──
+    // Set by the shell's booking callback (the verified carried map, or {} for a
+    // refused one); taken one-shot by the node, like the cut price. nullopt =>
+    // the node composes locally (the pre-ENROL-REPL path; no carriage available).
+    void set_carried(const std::map<bytes32, long long>& delta) {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        m_carried = delta;
+    }
+    void clear_carried() {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        m_carried.reset();
+    }
+    std::optional<std::map<bytes32, long long>> take_carried() {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto c = std::move(m_carried);
+        m_carried.reset();
+        return c;
+    }
+
+    // ── the price at the cut the NEXT on_network_block_won settles ──────────
+    // Set by the shell's booking callback from the view it folded E_b from;
+    // taken (one-shot) by the node inside on_network_block_won, so a win that
+    // was not booked through a fold can never reuse a neighbour's price.
+    void set_cut_price(const ::c2pool::v37n::settle::WorkPrice& wp) {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        m_price = rescale_price(wp, m_receipt_weight);
+    }
+    void clear_cut_price() {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        m_price = {};
+    }
+    ::c2pool::v37n::settle::WorkPrice take_cut_price() {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto p = m_price;
+        m_price = {};
+        if (p.valid) ++m_priced; else ++m_unpriced;
+        return p;
+    }
+
+    // ── the two producers ──────────────────────────────────────────────────
+    // DROPS DUE (A5): remember the ref a raindrop's payee carried (the
+    // chain-ordered harvest keeps identity -> ref).
+    void note_drop_ref(const bytes32& payee_identity, const ::v37::ScriptRef& ref) {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        m_coh.observe_ref(payee_identity, ref);
+    }
+    std::optional<::v37::ScriptRef> drop_ref_of(const bytes32& payee_identity) const {
+        std::lock_guard<std::mutex> lk(m_hmtx);
+        return m_coh.ref_of(payee_identity);
+    }
+    // ★ RAINDROP ENROL (A3, ruling 2026-09-30): enrol a payee at its first
+    // raindrop (bin + 1) too, with the record in the ledger registry. Off by
+    // default (make / make_for_test), so the lane-only goldens hold; the shell
+    // turns it on with the ledger rule.
+    void set_raindrop_enrol(bool on) { std::lock_guard<std::mutex> lk(m_hmtx); m_raindrop_enrol = on; }
+    bool raindrop_enrol() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_raindrop_enrol; }
+    // A3 + A5 FLAG DAY: the DROPS rule tag the HELLO enrol digest carries
+    // (relay::drops_rule_tag; 0 = untagged).
+    void set_drops_rule(std::uint32_t r) { std::lock_guard<std::mutex> lk(m_hmtx); m_drops_rule = r; }
+    std::uint32_t drops_rule() const { std::lock_guard<std::mutex> lk(m_hmtx); return m_drops_rule; }
+    // A raindrop by its payee REF: the identity is xmr_identity_key(ref) and the
+    // ref is kept with the drop (one call, so a retained raindrop always has it).
+    bool on_raindrop(const ::v37::ScriptRef& payee, std::uint64_t bin, const bytes32& pow_le) {
+        // RAINDROP ENROL: a ref the V37G length byte cannot hold is never harvested.
+        if (payee.payload.size() > ::c2pool::v37n::settle::kEnrolRefMaxPayload) return false;
+        const bytes32 id = ::v37::xmr::xmr_identity_key(payee);
+        note_drop_ref(id, payee);
+        return on_raindrop(id, bin, pow_le);
+    }
+
+    // A relay-admitted RAINDROP (own or peer): a RandomX hash that met the
+    // floor but not share_diff. Returns false (and harvests nothing) for a hash
+    // that is actually a share or is below the floor: never both, never twice.
+    bool on_raindrop(const bytes32& payee_identity, std::uint64_t bin, const bytes32& pow_le) {
+        // no receipt id (a KAT / pre-SET-PIN caller): a synthetic one, a pure function of the raindrop
+        std::vector<std::uint8_t> b = {'V', '3', '7', 'D', 'R', 'O', 'P', 'I', 'D'};
+        b.insert(b.end(), payee_identity.begin(), payee_identity.end());
+        for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(bin >> (8 * i)));
+        b.insert(b.end(), pow_le.begin(), pow_le.end());
+        return on_raindrop_id(::v37::sha256d(b), payee_identity, bin, pow_le);
+    }
+    // ★ DROPS-SET-PIN x RAINDROP ENROL: the relay's admitted raindrop with its
+    // receipt id AND its payee ref (the ref rides the V37G enrolment record).
+    // A ref the V37G length byte cannot hold is kept as an INVALID member, so a
+    // pinned set naming it is refused alike on every node (never a HOLD forever).
+    bool on_raindrop_id(const bytes32& id, const ::v37::ScriptRef& payee, std::uint64_t bin, const bytes32& pow_le) {
+        const bytes32 ident = ::v37::xmr::xmr_identity_key(payee);
+        if (payee.payload.size() > ::c2pool::v37n::settle::kEnrolRefMaxPayload) {
+            const bytes32 n = normalized_hash(pow_le, m_share_diff);
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            if (m_chain_order) m_coh.observe_drop_id(id, ident, bin, n, false);
+            return false;
+        }
+        note_drop_ref(ident, payee);
+        return on_raindrop_id(id, ident, bin, pow_le);
+    }
+    // ★ DROPS-SET-PIN: the relay's admitted raindrop, with its receipt id
+    bool on_raindrop_id(const bytes32& id, const bytes32& payee_identity, std::uint64_t bin, const bytes32& pow_le) {
+        const bytes32 n = normalized_hash(pow_le, m_share_diff);
+        const unsigned lz = ::c2pool::v37n::leading_zero_bits(n);
+        if (lz >= kXmrDropsLz) {   // a SHARE: the lane path owns it
+            ++m_refused_share;
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            if (m_chain_order) m_coh.observe_drop_id(id, payee_identity, bin, n, false);   // a set naming it is refused
+            return false;
+        }
+        ::c2pool::v37n::HarvestedDrop d;
+        d.payee = payee_identity;
+        d.interval = bin;
+        d.hash = n;
+        d.consensus_lz = kXmrDropsLz;
+        d.own_lz = lz;
+        {
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            if (m_chain_order) { m_coh.observe_drop_id(id, payee_identity, bin, n); return true; }   // ★ RAIN-BACKFILL + SET-PIN
+        }
+        m_drop_sink(d);
+        return true;
+    }
+    // A relay receipt the lane just pushed: ONE share at (identity, origin bin).
+    void on_share_pushed(const bytes32& payee_identity, std::uint64_t bin) {
+        ::c2pool::v37n::EmittedPush p;
+        p.identity = payee_identity;
+        p.origin_bin = bin;
+        p.carrier_bin = bin;
+        p.w_raw = m_receipt_weight;
+        {
+            std::lock_guard<std::mutex> lk(m_hmtx);
+            if (m_chain_order) { m_coh.observe_share(payee_identity, bin); return; }   // ★ RAIN-BACKFILL
+        }
+        m_share_tee(p);
+    }
+
+    // ── diagnostics (never consensus) ──────────────────────────────────────
+    ::c2pool::v37n::DropsWiring& core() { return m_core; }
+    const ::c2pool::v37n::DropsWiring& core() const { return m_core; }
+    std::uint64_t priced() const { return m_priced; }
+    std::uint64_t unpriced() const { return m_unpriced; }
+    std::uint64_t refused_share() const { return m_refused_share; }
+
+private:
+    XmrDropsWiring(std::uint32_t K, std::uint64_t share_diff, std::uint64_t receipt_weight)
+        : m_core(K, [](std::uint64_t) { return kXmrDropsLz; }),
+          m_share_diff(share_diff), m_receipt_weight(receipt_weight), m_coh(K, kXmrDropsLz, 0) {
+        m_drop_sink = m_core.drop_sink();
+        m_share_tee = m_core.sink_filter()(::c2pool::v37n::RecordSink{});
+    }
+
+    ::c2pool::v37n::DropsWiring m_core;
+    std::uint64_t m_share_diff = 0;
+    std::uint64_t m_receipt_weight = 0;
+    ::c2pool::v37n::DropSink   m_drop_sink;
+    ::c2pool::v37n::RecordSink m_share_tee;
+    mutable std::mutex m_pmtx;
+    ::c2pool::v37n::settle::WorkPrice m_price{};
+    std::optional<std::map<bytes32, long long>> m_carried{};   // ENROL-REPL one-shot
+    std::uint64_t m_priced = 0, m_unpriced = 0, m_refused_share = 0;
+    mutable std::mutex m_hmtx;          // ★ RAIN-BACKFILL
+    bool m_chain_order = false;
+    ChainOrderedHarvest m_coh;
+    ChainOrderedHarvest::PrevLaneFn m_prev_lane{};   // ★ RAIN-BACKFILL-2
+    // ★ DROPS-ENROL-LANE (under m_hmtx): our own lane order, one entry per
+    // receipt (its first position), and how far it covers [0, P) contiguously.
+    // Only ever filled under the flip (the wiring does not exist at flip 0).
+    struct LanePos { bytes32 payee{}; std::uint64_t bin = 0; bytes32 prev_id{}; std::uint16_t give = 0;
+                     std::uint32_t n = 1; };   // ★ DROPS-CARRY-SUFFIX: its lane pushes
+    std::map<std::uint64_t, LanePos> m_lane_pos;
+    std::uint64_t m_lane_contig = 0, m_lane_gaps = 0;
+    std::set<bytes32> m_enrol_set;
+    EnrolMode m_enrol_mode = EnrolMode::List;   // ★ DROPS-AUTO-ENROL (the shell sets it; List = the pre-auto rule)
+    bool m_raindrop_enrol = false;              // ★ RAINDROP ENROL (A3; the shell sets it with the ledger rule)
+    std::uint32_t m_drops_rule = 0;             // A3 + A5 FLAG DAY: the HELLO rule tag
+    // ★ DROPS-ENROL-TIDY (under m_hmtx): the folded base [0, m_lane_base_P) of
+    // m_lane_pos (prune_lane_log) and the lane-only switch (set_lane_only).
+    std::uint64_t m_lane_base_P = 0, m_lane_pruned = 0, m_lane_below_base = 0;
+    std::size_t m_lane_base_n = 0, m_lane_pos_max = 0;
+    std::map<bytes32, std::uint64_t> m_lane_base_first;
+    std::map<bytes32, std::pair<std::uint64_t, std::uint64_t>> m_lane_base_give;   // ★ d5 (SUM give, n) per payee
+    ShareCounts m_lane_base_counts;
+    bool m_lane_base_stale = false;
+    std::uint64_t m_lane_base_end = 0;   // ★ DROPS-CARRY-SUFFIX: the positions the fold covers ([0, base_end))
+    bool m_lane_only = false;
+};
+
+// ★ DROPS-HARDEN (d3): which carried raindrop set a node keeps for a bid when
+// more than one set-carrying FB_BLOCK_WON reaches it. FB_BLOCK_WON is not
+// authenticated (the full fix is the v37.1 on-chain set digest, DESIGN Option
+// B), so the relay rule is: the FIRST set held for a bid stands -- a later
+// frame never overwrites it -- with one exception: a held set that came from a
+// peer other than the one that announced the block first (the relay's first
+// sender of that bid) yields ONCE to a different set from that announcer, while
+// the block is not booked. Our own win never adopts a foreign set (we compose
+// and pin it). Every differing later set is an equivocation (counted, logged
+// with both set digests by the caller).
+#define C2POOL_XMR_DROPS_SET_FIRST_WINS 1
+enum class SetFrameVerdict {
+    Adopt,               // nothing held: keep the incoming set
+    Same,                // the incoming set equals the held one
+    KeepFirst,           // equivocation: the held set stands
+    AnnouncerReplaces,   // equivocation: the block's first announcer's set replaces a non-announcer's (once)
+    OwnWin,              // our own block: a foreign set is never adopted
+};
+inline SetFrameVerdict set_frame_verdict(const std::vector<bytes32>* held, std::uint64_t held_from, bool held_locked,
+                                         const std::vector<bytes32>& incoming, std::uint64_t from, std::uint64_t announcer,
+                                         bool own_win) {
+    if (!held) return own_win ? SetFrameVerdict::OwnWin : SetFrameVerdict::Adopt;
+    if (*held == incoming) return SetFrameVerdict::Same;
+    if (!own_win && !held_locked && announcer != 0 && from == announcer && held_from != announcer)
+        return SetFrameVerdict::AnnouncerReplaces;
+    return SetFrameVerdict::KeepFirst;
+}
+inline const char* set_frame_verdict_name(SetFrameVerdict v) {
+    switch (v) {
+        case SetFrameVerdict::Adopt: return "adopt";
+        case SetFrameVerdict::Same: return "same";
+        case SetFrameVerdict::KeepFirst: return "kept-first";
+        case SetFrameVerdict::AnnouncerReplaces: return "announcer-replaces";
+        case SetFrameVerdict::OwnWin: return "own-win";
+    }
+    return "?";
+}
+
+}  // namespace c2pool::v37n::xmr::drops

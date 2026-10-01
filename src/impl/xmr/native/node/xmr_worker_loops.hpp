@@ -70,6 +70,7 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -360,6 +361,30 @@ public:
         return {};   // no verdict is invented; see the banner
     }
 
+    // TXPOOL-RESUME: a complement answer is admitted (fluffed) on the pool loop
+    // like any batch; the round is counted only once that admission has run,
+    // so "a round finished" means its transactions are already in the pool.
+    std::vector<TxRelayVerdict> on_complement(const PeerRef&                         from,
+                                              std::vector<std::vector<std::uint8_t>> blobs) override {
+        const bool queued = loop_.post([this, from, blobs = std::move(blobs)]() mutable {
+            const std::size_t n = blobs.size();
+            if (n != 0) (void)target_.on_complement(from, std::move(blobs));
+            complement_txs_.fetch_add(n, std::memory_order_relaxed);
+            complement_rounds_.fetch_add(1, std::memory_order_release);
+        });
+        if (!queued) {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++stats_.refused;
+        }
+        return {};
+    }
+    std::uint64_t complement_rounds() const noexcept {
+        return complement_rounds_.load(std::memory_order_acquire);
+    }
+    std::uint64_t complement_txs() const noexcept {
+        return complement_txs_.load(std::memory_order_relaxed);
+    }
+
     // A cheap read under the pool's own mutex; it allocates a vector of ids and
     // touches no proof, so it answers in place rather than costing a round trip
     // on the path that is about to write a frame.
@@ -378,6 +403,8 @@ private:
     FaultSink          faults_;
     mutable std::mutex mu_;
     Stats              stats_{};
+    std::atomic<std::uint64_t> complement_rounds_{0};
+    std::atomic<std::uint64_t> complement_txs_{0};
 };
 
 // ---------------------------------------------------------------------------

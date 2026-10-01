@@ -829,12 +829,38 @@ inline bool encode_response_get_objects(const ResponseGetObjects& m,
     return encode_body(epee::v_object(std::move(e)), out, err);
 }
 
+// The epee storage budget for a 2004 body, scaled to the body it guards.
+//
+// A PRUNED block_complete_entry costs one section and up to four keys per
+// block, plus one section and two keys ({blob, prunable_hash}) per
+// transaction. The generic budget (4096 sections / 4096 keys for the WHOLE
+// message) is sized for handshakes and peerlists: a 100-block mainnet span
+// with more than ~18 transactions per block exceeds it, so an honest 2004
+// decoded as "malformed" and the peer that served it was banned. On mainnet
+// that was every span -- the post-anchor catch-up stalled at the anchor while
+// it banned its way through the peer set.
+//
+// Scaling by BYTES (not by the span we asked for) keeps what the fixed budget
+// was for: a hostile body cannot buy more tree nodes than it pays for on the
+// wire. An honest transaction section costs well over 96 bytes (a ~56-byte
+// key/length envelope around a pruned blob that is never below ~150 bytes),
+// so size/96 sections and size/48 keys admit every honest span with margin,
+// and bound the decoded tree to a small multiple of the body -- which
+// levin_codec already caps at 32 MiB for this command.
+inline epee::Limits response_get_objects_storage_limits(std::size_t body_size) {
+    epee::Limits lim;
+    if (body_size / 96u > lim.max_objects) lim.max_objects = body_size / 96u;
+    if (body_size / 48u > lim.max_entries) lim.max_entries = body_size / 48u;
+    return lim;
+}
+
 inline bool decode_response_get_objects(const std::uint8_t* data, std::size_t size,
                                         ResponseGetObjects& out, MessageError& err,
                                         const MessageLimits& limits = MessageLimits{}) {
     out = ResponseGetObjects{};
     epee::Value root;
-    if (!parse_body(data, size, root, err)) return false;
+    if (!parse_body(data, size, root, err, response_get_objects_storage_limits(size)))
+        return false;
 
     if (const epee::Value* blocks = epee::find(root, "blocks")) {
         if (!blocks->is_array || blocks->type != epee::Type::Object) {

@@ -762,7 +762,7 @@ public:
         uint64_t height = 0;                  // template height
         // TOTAL of every coinbase output that does NOT go to miners, in
         // template order: masternode payee + operator split + superblock +
-        // the DIP-0027 platform OP_RETURN burn. Measured on the hotel
+        // the DIP-0027 platform OP_RETURN burn. Measured on the production node
         // (2026-08-05, DASH mainnet h=2516911): payment_amount_sat carried
         // only the MN payee (0.8298), so the dashboard's "miner" share read
         // 53% of the block when the ACCEPTED coinbase paid miners 25% -- the
@@ -1277,6 +1277,8 @@ private:
     bool m_testnet;  // Store testnet flag
     Blockchain m_blockchain;  // Store blockchain type
     std::string m_coin_label; // Raw configured coin string; fallback label for chains absent from the Blockchain enum
+    std::function<std::optional<nlohmann::json>(const std::string&)> m_rest_override_fn;   // per-coin REST override (unset = built-in routes)
+    std::string m_payout_scheme_label;       // per-coin scheme label (empty = serve static UI verbatim)
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     BlockchainAddressValidator m_address_validator;  // New address validator
     std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management
@@ -1757,6 +1759,24 @@ public:
     // dashboard labels every node truthfully instead of going blank. Web-layer
     // only -- never feeds consensus/address-validation.
     void set_coin_label(const std::string& sym) { m_coin_label = sym; }
+
+    // Per-coin REST override (c2pool-v37-xmr). A coin whose stats live OUTSIDE
+    // this class -- the v37 XMR node: its own stratum, its own owed ledger, its
+    // own chain view -- answers the p2pool-compatible GET endpoints itself.
+    // Consulted FIRST for every GET path; std::nullopt = "not mine", fall
+    // through to the built-in route. Unset (every other coin) = no change.
+    using rest_override_fn_t = std::function<std::optional<nlohmann::json>(const std::string& path)>;
+    void set_rest_override_fn(rest_override_fn_t fn) { m_rest_override_fn = std::move(fn); }
+    std::optional<nlohmann::json> call_rest_override(const std::string& path) const {
+        if (!m_rest_override_fn) return std::nullopt;
+        return m_rest_override_fn(path);
+    }
+    // Per-coin payout-scheme display name. Empty (default, every coin but
+    // XMR) = the static UI is served byte-for-byte. Non-empty = every served
+    // .html/.htm/.js/.mjs has the literal PPLNS rewritten by
+    // rewrite_payout_scheme_label() below (the v37 XMR scheme is WRS / PPR).
+    void set_payout_scheme_label(const std::string& label) { m_payout_scheme_label = label; }
+    const std::string& get_payout_scheme_label() const { return m_payout_scheme_label; }
     const std::string& get_pool_version() const { return m_pool_version; }
 
     /// Auto-detect public IP and version from external services.
@@ -1864,7 +1884,7 @@ private:
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
     // ── ALL-TIME best-share persistence ─────────────────────────────────
-    // Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+    // Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
     // best_share showed all_time == session == round — the "all-time" leg
     // reset on every restart because it lived only in memory, so the card
     // was quietly lying about what "all time" means. Persisted as a small
@@ -2082,7 +2102,7 @@ class WebServer
     bool solo_mode_;
     std::string solo_address_;
 
-    // Debounce state for trigger_work_refresh_debounced() (hotel interim fix
+    // Debounce state for trigger_work_refresh_debounced() (interim hardening fix
     // #3). Leading-edge-immediate + ~300 ms trailing-coalesce; the trailing
     // refresh is event-gated on a REAL work change (sharechain tip moved since
     // the last executed refresh). All state is touched only from the main
@@ -2183,5 +2203,15 @@ private:
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp
+
+/// Per-coin payout-scheme relabel of one served static text asset (used only
+/// when MiningInterface::get_payout_scheme_label() is non-empty). Every literal
+/// "PPLNS" becomes `label` where it stands as a word (visible text, titles,
+/// string literals, comments) and `ident` where it is glued to an identifier
+/// character [A-Za-z0-9_$] (loadMainPPLNS -> loadMainWRS), so the rewrite is
+/// the same everywhere it is applied and the served JS keeps linking.
+/// Returns the number of replacements.
+std::size_t rewrite_payout_scheme_label(std::string& text, const std::string& label,
+                                        const std::string& ident = "WRS");
 
 } // namespace core

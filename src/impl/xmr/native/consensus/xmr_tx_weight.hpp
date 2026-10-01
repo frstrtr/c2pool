@@ -54,7 +54,10 @@
 // PINNED SCOPE (fail-closed): BOTH entry points implement rct types 0
 // (coinbase), 5 (CLSAG) and 6 (BulletproofPlus) -- everything a node syncing
 // from a modern anchor can meet -- and return UnsupportedRctType for types 1, 2,
-// 3 and 4 rather than a guess.
+// 3 and 4 rather than a guess. Version-1 transactions (no rct part; still
+// valid on mainnet when spending unmixable pre-RingCT outputs) are in scope on
+// both paths: weight = blob size, fee = inputs - outputs, and the pruned path
+// measures their signatures because monerod sends a v1 blob unpruned.
 //
 // The full-blob path MEASURES the prunable bytes rather than predicting them, so
 // it is tempting to let it accept every type, and the first cut of this header
@@ -293,6 +296,11 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
     if (n_in == 0) return TxParseStatus::Malformed;
     info.n_inputs = static_cast<std::size_t>(n_in);
 
+    // Version 1 carries its fee in the clear: inputs minus outputs (monerod
+    // get_tx_fee). Version 2 amounts are zero and the fee lives in the rct base.
+    std::uint64_t amount_in = 0;
+    std::uint64_t amount_out = 0;
+
     for (std::uint64_t i = 0; i < n_in; ++i) {
         BlobReader::DepthGuard gi(r);
         if (!gi.entered()) return TxParseStatus::Malformed;
@@ -311,6 +319,8 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
             if (info.is_coinbase) return TxParseStatus::Malformed;
             std::uint64_t amount = 0;
             if (!r.read_varint(amount)) return TxParseStatus::Truncated;
+            if (amount_in > UINT64_MAX - amount) return TxParseStatus::Overflow;
+            amount_in += amount;
             std::uint64_t n_off = 0;
             if (!r.read_count(n_off, TX_MAX_RING)) return TxParseStatus::Truncated;
             if (n_off == 0) return TxParseStatus::Malformed;
@@ -343,6 +353,8 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
 
         std::uint64_t amount = 0;
         if (!r.read_varint(amount)) return TxParseStatus::Truncated;
+        if (amount_out > UINT64_MAX - amount) return TxParseStatus::Overflow;
+        amount_out += amount;
         std::uint8_t tag = 0;
         if (!r.read_byte(tag)) return TxParseStatus::Truncated;
         if (tag == TX_OUT_TO_KEY || tag == TX_OUT_TO_TAGGED_KEY) {
@@ -366,6 +378,11 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
     if (!r.read_count(extra_len, TX_MAX_EXTRA_BYTES)) return TxParseStatus::Truncated;
     if (!r.skip(static_cast<std::size_t>(extra_len))) return TxParseStatus::Truncated;
     info.extra_size = static_cast<std::size_t>(extra_len);
+
+    if (info.version == 1 && !info.is_coinbase) {
+        if (amount_out > amount_in) return TxParseStatus::Malformed;   // spends more than it has
+        info.fee = amount_in - amount_out;
+    }
 
     info.prefix_size = r.offset() - begin;
     return TxParseStatus::Ok;
@@ -432,7 +449,9 @@ inline void finish(TxWeightInfo& info) {
 
 // Parse a PRUNED transaction blob (prefix + rct base, as delivered by
 // GET_OBJECTS with prune=true) and RECONSTRUCT the prunable length, so the
-// weight is known without ever seeing the ring signatures.
+// weight is known without ever seeing the ring signatures. A version-1
+// transaction has no pruned form: its blob is the whole transaction and the
+// signatures are measured, not reconstructed (see the branch below).
 inline TxParseStatus parse_tx_pruned(const std::uint8_t* data, std::size_t size,
                                      TxWeightInfo& info, bool capture = false) {
     info = TxWeightInfo{};
@@ -444,6 +463,26 @@ inline TxParseStatus parse_tx_pruned(const std::uint8_t* data, std::size_t size,
     if (info.version >= 2) {
         st = detail::parse_rct_base(r, info, capture);
         if (st != TxParseStatus::Ok) return st;
+    } else {
+        // monerod never prunes a version-1 transaction: its "pruned" blob is
+        // the whole transaction, prefix plus the ring signatures -- one (c, r)
+        // pair of 32-byte scalars per ring member of every input, with no
+        // length prefix (the counts are implied by the prefix; a coinbase input
+        // has none). Version 1 is still valid on mainnet for a spend of
+        // unmixable pre-RingCT outputs (monerod check_tx_inputs), so honest
+        // spans carry it, and refusing it banned every peer that served one.
+        // The signatures are MEASURED here, not predicted, and the id is then
+        // the plain hash of the whole blob (tx_hash_from_parts, version < 2).
+        std::size_t sig_bytes = 0;
+        for (std::uint64_t rs : info.ring_sizes)
+            sig_bytes += 64u * static_cast<std::size_t>(rs);   // <= 4096 * 512 * 64
+        if (!r.skip(sig_bytes)) return TxParseStatus::Truncated;
+        if (r.remaining() != 0) return TxParseStatus::TrailingBytes;
+
+        info.prunable_size      = sig_bytes;
+        info.prunable_predicted = false;
+        detail::finish(info);
+        return TxParseStatus::Ok;
     }
 
     // The pruned blob must be consumed exactly: anything left over means we

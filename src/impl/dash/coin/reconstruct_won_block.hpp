@@ -132,9 +132,12 @@ resolve_other_tx_hashes(
 // The header build MIRRORS share_check.hpp share_init_verify byte-for-byte, so
 // X11(header) of the reconstructed block equals the share hash the tracker fired
 // on -- i.e. the reconstructed block IS the block the winning share solved.
+// MerkleLinkT: dash::MerkleLink (v16) or dash::v36::MerkleLink (v36); both fold
+// through the same templated check_merkle_link.
+template <typename MerkleLinkT>
 inline ReconstructedWonBlock
 frame_won_block(const bitcoin_family::coin::SmallBlockHeaderType& min_header,
-                const MerkleLink& merkle_link,
+                const MerkleLinkT& merkle_link,
                 const GentxCoinbase& gentx,
                 const std::vector<std::vector<unsigned char>>& other_tx_bodies)
 {
@@ -183,10 +186,14 @@ frame_won_block(const bitcoin_family::coin::SmallBlockHeaderType& min_header,
 // via tracker.chain -- exactly the reads the accept path already performed under
 // this same lock. Returns std::nullopt (never throws) on any unrecoverable
 // condition so the caller broadcasts NOTHING.
-template <typename TrackerT>
+// Both live share types: a v36 share (private/isolated v36 sharechain) carries
+// no transaction_hash_refs, so its block is always the coinbase-only [gentx];
+// generate_share_transaction overload-resolves to the v36 coinbase.
+template <typename ShareT, typename TrackerT>
+    requires is_live_share<ShareT>
 inline std::optional<ReconstructedWonBlock>
 reconstruct_won_block(const uint256& share_hash,
-                      const DashShare& share,
+                      const ShareT& share,
                       TrackerT& tracker,
                       const core::CoinParams& params,
                       const KnownTxLookup& known_txs = {})

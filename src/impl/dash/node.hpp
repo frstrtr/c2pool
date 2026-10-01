@@ -26,6 +26,8 @@
 #include "auto_ratchet.hpp"          // dash::apply_min_protocol_ratchet_decision (v36 accept-floor ratchet)
 #include "version_negotiation.hpp"   // dash::version_negotiation::get_desired_version_weights (ratchet window)
 #include "messages.hpp"
+#include "alert_service.hpp"      // D-MINER.7 miner-offline alert relay (non-consensus)
+#include "alert_wire.hpp"
 #include "coin/transaction.hpp"
 #include "coin/node_coin_state.hpp"       // dash::coin::NodeCoinState (node-held embedded bundle)
 #include "coin/coin_state_maintainer.hpp" // dash::coin::CoinStateMaintainer (reception/think driver)
@@ -386,14 +388,24 @@ protected:
     std::atomic<uint64_t> m_block_share_lock_forfeits{0};
 
     // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
-    // Runtime P2P accept-floor, seeded from the COLD config floor (1700, accept-all)
-    // and lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by apply_min_protocol_ratchet()
-    // once the work-weighted desired-version tally over the [9/10..10/10] window behind
-    // the best share holds >= 95% for v36. Mutated ONLY on the compute thread under the
-    // exclusive m_tracker_mutex (same sites as m_best_share_hash); it drives the LIVE
-    // m_min_protocol_gate.min_version so the handshake reception reflects the ratchet.
+    // Runtime P2P accept-floor, seeded from the per-network share profile
+    // (SharechainConfig::share_profile().ratchet_floor_protocol_version):
+    //   * public network: the COLD config floor MINIMUM_PROTOCOL_VERSION (1700,
+    //     accept-all) — the same initial value as before the profile existed —
+    //     lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by
+    //     apply_min_protocol_ratchet() once the work-weighted desired-version tally
+    //     over the [9/10..10/10] window behind the best share holds >= 95% for v36;
+    //   * private/isolated DASH v36 sharechain: 3600 from the start — the chain is
+    //     v36 from genesis, so a pre-v36 peer is refused at the handshake and the
+    //     ratchet is a latched no-op there.
+    // The profile is read when the node is CONSTRUCTED, so the identity must be set
+    // first (main_dash.cpp sets it before constructing dash::Node). Mutated ONLY on
+    // the compute thread under the exclusive m_tracker_mutex (same sites as
+    // m_best_share_hash); handle_version composes it with the operator knob
+    // (m_min_protocol_gate) by max(), so a --min-protocol below 3600 cannot lower
+    // the isolated floor.
     std::atomic<uint32_t> m_runtime_min_protocol_version{
-        SharechainConfig::MINIMUM_PROTOCOL_VERSION};
+        SharechainConfig::share_profile().ratchet_floor_protocol_version};
 
     // De-dup set for broadcast_share (hashes already relayed to peers).
     std::set<uint256> m_shared_share_hashes;
@@ -427,6 +439,12 @@ protected:
     std::function<coin::NodeCoinState::InjectSubmitResult(
         const coin::MutableTransaction&, uint32_t, int32_t)> m_tx_inject_sink;
     dash::NodeInjectSeen m_inject_seen;
+
+    // D-MINER.7: miner-offline alert relay runtime, installed by main_dash only
+    // when an --alert-relay-* role is armed. Null ⇒ inbound alert/alertack are
+    // ignored and nothing is ever sent (wire byte-identical to master).
+    // IO-thread-confined like m_inject_seen.
+    std::shared_ptr<dash::alert::AlertRelayService> m_alert_relay;
 
     // ── Share-download leg (#754) state — IO-thread only ────────────────
     // De-dup + per-cycle retry gate for in-flight sharereq targets (shared
@@ -724,6 +742,37 @@ public:
         // snapshot reflects the post-close map (IO thread).
         base_t::close_connection(service);
         publish_peer_info_snapshot();
+    }
+
+    // ── Socket-less dial failure (#1835) ────────────────────────────────
+    // core::Factory::Client reports a dial that never produced a socket
+    // (ECONNREFUSED / ETIMEDOUT / resolve error) here instead of through
+    // error() or close_connection(), which both need a socket. Without this
+    // override the address stayed in m_pending_outbound for the rest of the
+    // process and try_connect_peers() skipped it on every later pass, so a
+    // --connect/--addnode peer that was down at the first dial was never
+    // dialed again. Clearing the mark makes the next 30 s pass redial it.
+    //
+    // IO thread, same discipline as error(): the Factory calls this from its
+    // async resolve/connect handler, and only through a strong ref it holds
+    // for the dial (the UAF fix in factory.hpp), so this node is live for the
+    // whole call. Touch only this node's own IO-owned sets; defer nothing.
+    //
+    // m_outbound_addrs is cleared only when no connection to the address is
+    // live: a failed dial says nothing about a session that is already up.
+    // The display snapshot is refreshed only if that changed the outbound
+    // set; a failed dial never adds to m_peers, so nothing else it shows
+    // moves. INLINE for the same vtable reason as connected()/error().
+    void connect_failed(const NetService& addr) override
+    {
+        const bool was_pending = m_pending_outbound.erase(addr) > 0;
+        const bool was_outbound =
+            !m_connections.contains(addr) && m_outbound_addrs.erase(addr) > 0;
+        if (was_outbound)
+            publish_peer_info_snapshot();
+        if (was_pending)
+            LOG_INFO << "[Pool] Outbound dial to " << addr.to_string()
+                     << " failed; will retry on the next maintenance pass";
     }
 
     void cancel_peer_share_requests(const NetService& service)
@@ -1175,6 +1224,87 @@ public:
         }
     }
 
+    // ── D-MINER.7: miner-offline alert relay seam ────────────────────────
+    // main_dash installs the service next to the flag parse; unset (default)
+    // keeps both handlers inert. IO-THREAD ONLY (m_peers is IO-owned).
+    void set_alert_relay(std::shared_ptr<dash::alert::AlertRelayService> svc) { m_alert_relay = std::move(svc); }
+    bool has_alert_relay() const { return static_cast<bool>(m_alert_relay); }
+
+    void handle_peer_alert(const message_alert& msg, const peer_ptr& from)
+    {
+        // Belt: feature not armed on this node ⇒ ignore, never disconnect (an
+        // old/new peer that sends alert to a non-participating node is not
+        // misbehaving).
+        if (!m_alert_relay)
+        {
+            LOG_DEBUG_POOL << "[alert-relay] ignoring peer alert (feature off)";
+            return;
+        }
+        auto v = m_alert_relay->on_alert(dash::alert::to_frame(msg), from->m_nonce,
+                                         from->m_alert_guard, core::timestamp());
+        LOG_DEBUG_POOL << "[alert-relay] alert from " << from->addr().to_string()
+                       << ": " << dash::alert::verdict_name(v);
+    }
+
+    void handle_peer_alertack(const message_alertack& msg, const peer_ptr& from)
+    {
+        if (!m_alert_relay)
+        {
+            LOG_DEBUG_POOL << "[alert-relay] ignoring peer alertack (feature off)";
+            return;
+        }
+        auto v = m_alert_relay->on_ack(dash::alert::to_frame(msg), from->m_nonce,
+                                       from->m_alert_guard, core::timestamp());
+        LOG_DEBUG_POOL << "[alert-relay] alertack from " << from->addr().to_string()
+                       << ": " << dash::alert::verdict_name(v);
+    }
+
+    // Transport used by the alert service (installed via make_alert_transport).
+    // Unicast to one connected pool peer by its handshake nonce; false when that
+    // peer is no longer connected.
+    bool write_to_peer_nonce(uint64_t peer_nonce, std::unique_ptr<RawMessage> raw)
+    {
+        auto it = m_peers.find(peer_nonce);
+        if (it == m_peers.end() || !it->second) return false;
+        it->second->write(std::move(raw));
+        return true;
+    }
+
+    // Fan-out to every connected pool peer except `except_nonce` (0 = none).
+    // `make` builds a fresh RawMessage per peer (a RawMessage is consumed by
+    // the write). Returns the number of peers written.
+    template <typename MakeFn>
+    std::size_t write_to_all_peers_except(uint64_t except_nonce, MakeFn&& make)
+    {
+        std::size_t n = 0;
+        for (auto& entry : m_peers)
+        {
+            auto& p = entry.second;
+            if (!p || entry.first == except_nonce) continue;
+            p->write(make());
+            ++n;
+        }
+        return n;
+    }
+
+    dash::alert::Transport make_alert_transport()
+    {
+        dash::alert::Transport t;
+        t.send_alert = [this](uint64_t peer, const dash::alert::AlertFrame& f) {
+            return write_to_peer_nonce(peer, dash::alert::make_raw(f));
+        };
+        t.broadcast_alert = [this](uint64_t except, const dash::alert::AlertFrame& f) {
+            return write_to_all_peers_except(except, [&] { return dash::alert::make_raw(f); });
+        };
+        t.send_ack = [this](uint64_t peer, const dash::alert::AckFrame& a) {
+            return write_to_peer_nonce(peer, dash::alert::make_raw(a));
+        };
+        t.broadcast_ack = [this](uint64_t except, const dash::alert::AckFrame& a) {
+            return write_to_all_peers_except(except, [&] { return dash::alert::make_raw(a); });
+        };
+        return t;
+    }
+
     // ── #754 share-download leg surface ─────────────────────────────────
 
     /// Async share download: register the reply callback + dispatch the
@@ -1202,6 +1332,13 @@ public:
     /// from the run loop after listen(). Body in node.cpp (ltc
     /// node.cpp:1289-1327 port).
     void start_outbound_connections();
+
+    /// One outbound dial-maintenance pass: dial get_good_peers() candidates
+    /// that are not connected, not already being dialed and not banned, until
+    /// the outbound target is met. IO thread. Called once by
+    /// start_outbound_connections() and then on every 30 s m_connect_timer
+    /// tick. Body in node.cpp.
+    void try_connect_peers();
 
     // ── have_tx / losing_tx advertisement (SEND side) ─────────────────────
     // c2pool was RECEIVE-ONLY for the p2pool tx-pool advertisement: the
@@ -1522,6 +1659,8 @@ public:
     ADD_HANDLER(remember_tx, dash::message_remember_tx);
     ADD_HANDLER(forget_tx, dash::message_forget_tx);
     ADD_HANDLER(tx_inject, dash::message_tx_inject);   // #157 M2 miner/user tx-injection
+    ADD_HANDLER(alert, dash::message_alert);           // D-MINER.7 alert relay (non-consensus)
+    ADD_HANDLER(alertack, dash::message_alertack);     // D-MINER.7 alert relay ack
 };
 
 class Actual : public pool::Protocol<NodeImpl>
@@ -1542,6 +1681,8 @@ public:
     ADD_HANDLER(remember_tx, dash::message_remember_tx);
     ADD_HANDLER(forget_tx, dash::message_forget_tx);
     ADD_HANDLER(tx_inject, dash::message_tx_inject);   // #157 M2 miner/user tx-injection
+    ADD_HANDLER(alert, dash::message_alert);           // D-MINER.7 alert relay (non-consensus)
+    ADD_HANDLER(alertack, dash::message_alertack);     // D-MINER.7 alert relay ack
 };
 
 using Node = pool::NodeBridge<NodeImpl, Legacy, Actual>;
