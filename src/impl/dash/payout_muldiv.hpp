@@ -33,6 +33,10 @@
 // Header-only; boost is already a c2pool dependency (conan + system libboost).
 #include <boost/multiprecision/cpp_int.hpp>
 
+#include <core/uint256.hpp>   // uint288 (v36 consensus entry below)
+
+#include <stdexcept>
+
 namespace dash {
 namespace payout {
 
@@ -78,6 +82,47 @@ inline uint64_t payout_share(uint64_t weight, uint64_t worker_payout,
     return payout_share_portable(weight, worker_payout, total_weight, v36);
 }
 #endif
+
+
+// ---------------------------------------------------------------------------
+// v36 consensus entry (private/isolated DASH v36 sharechain; dormant until the
+// v36 share type is live). THE one exact payout muldiv the v36 verifier
+// (share_check.hpp build_v36_gentx), the v36 producer (share_producer.hpp
+// build_share_v36, via the same builder) and the stratum coinbase builder's
+// v36 arm (coinbase_builder.hpp compute_dash_payouts, via compute_v36_amounts)
+// all use, so the three cannot drift:
+//
+//     amount = floor(weight * worker_payout / total_weight)   (full weight)
+//
+// Wide inputs: the tracker's v36 decayed weights are uint288 values
+// (att * decay * 65535, att up to ~2^59 at DASH mainnet difficulty), so they
+// do not fit the uint64 payout_share() above. The product is taken in a
+// 512-bit boost intermediate (288 + 64 < 512): exact by construction and
+// MSVC-portable (no __int128). test_dash_v36_gentx pins it equal to
+// payout_share(..., v36=true) over the whole uint64 domain sweep and against
+// hand-computed answers above 2^64. total_weight == 0 throws (callers guard).
+// The quotient never exceeds worker_payout because weight <= total_weight for
+// every caller; a caller violating that gets a throw, never a truncated value.
+// ---------------------------------------------------------------------------
+inline uint64_t v36_worker_amount(const uint288& weight, uint64_t worker_payout,
+                                  const uint288& total_weight) {
+    using u512 = boost::multiprecision::uint512_t;
+    auto widen = [](const uint288& v) {
+        u512 out = 0;
+        for (int i = uint288::WIDTH - 1; i >= 0; --i) {
+            out <<= 32;
+            out |= v.pn[i];
+        }
+        return out;
+    };
+    const u512 den = widen(total_weight);
+    if (den == 0)
+        throw std::invalid_argument("v36_worker_amount: total_weight is zero");
+    const u512 q = (widen(weight) * u512(worker_payout)) / den;
+    if (q > u512(std::numeric_limits<uint64_t>::max()))
+        throw std::overflow_error("v36_worker_amount: amount exceeds 64 bits");
+    return static_cast<uint64_t>(q);
+}
 
 } // namespace payout
 } // namespace dash
