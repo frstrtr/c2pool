@@ -874,6 +874,125 @@ static void test_db_geometry_seam() {
     e.stop();
 }
 
+
+// ── K_fair AGE ACROSS A PRE-SETTLE ORPHAN (external review finding 05, #1864).
+// A payee selected at FOUND must keep its first_eligible when the paying block
+// orphans before SETTLED: since R-A (#1704) arm/disarm reads finalW alone, so a
+// pending payout never disarms. Pinned here so it cannot silently regress:
+//   (a) after FOUND pays A in full, a FINALIZE of an unrelated block (which
+//       runs the re-arm) leaves A's age intact;
+//   (b) after the pre-settle orphan A is back at the HEAD of K_fair, ahead of
+//       B armed one bin later, and is paid by the next block;
+//   (c) owed_digest equals a ledger that never saw the orphaned block, apart
+//       from the unrelated block both finalized;
+//   (d) contrast: once the paying block SETTLES, A's balance is 0 and its age
+//       is dropped, so a later credit arms it at the new bin (behind B).
+static void test_orphan_keeps_age() {
+    using Amounts = S::OwedLedger::Amounts;
+    auto key = [](std::uint8_t b) { bytes32 k{}; k[0] = b; return k; };
+    auto pay_of = [](const bytes32& k) {
+        ScriptRef r; r.kind = ScriptKind::P2WPKH; r.payload.assign(20, k[0]); return r;
+    };
+    auto no_floor = [](ScriptKind) -> u64 { return 0; };
+    auto first_of = [&](const S::OwedLedger& L, u64 budget) {
+        auto p = L.propose_coinbase(budget, 1, pay_of, no_floor);
+        return p.outs.empty() ? bytes32{} : p.outs[0].key;
+    };
+    auto payout_of = [](const S::OwedLedger::Proposal& p) {
+        Amounts m; for (const auto& o : p.outs) m[o.key] += static_cast<long long>(o.amount); return m;
+    };
+    const bytes32 A = key(1), B = key(2), C = key(3);
+
+    auto seed = [&](S::OwedLedger& L) {
+        L.on_block_found("sA", Amounts{{A, 300}}, {}); L.on_block_finalized("sA", 10);
+        L.on_block_found("sB", Amounts{{B, 300}}, {}); L.on_block_finalized("sB", 11);
+    };
+    S::OwedLedger L(1);
+    seed(L);
+    CHECK(first_of(L, 1000) == A);                       // A is oldest
+
+    auto pay = L.propose_coinbase(300, 1, pay_of, no_floor);
+    CHECK(pay.outs.size() == 1 && pay.outs[0].key == A && pay.outs[0].amount == 300);
+    L.on_block_found("pay", {}, payout_of(pay));
+    CHECK(first_of(L, 1000) == B);                       // A fully paid: not eligible
+
+    L.on_block_found("other", Amounts{{C, 50}}, {});     // (a) re-arm runs
+    L.on_block_finalized("other", 12);
+    CHECK(first_of(L, 1000) == B);
+
+    L.on_block_orphaned("pay", {});                      // (b) pre-settle orphan
+    CHECK(L.effective_owed(A) == 300);
+    CHECK(first_of(L, 1000) == A);                       // back at the head
+    auto next = L.propose_coinbase(1000, 0, pay_of, no_floor);
+    CHECK(!next.outs.empty() && next.outs[0].key == A && next.outs[0].amount == 300);
+
+    S::OwedLedger N(1);                                  // (c) never saw "pay"
+    seed(N);
+    N.on_block_found("other", Amounts{{C, 50}}, {});
+    N.on_block_finalized("other", 12);
+    CHECK(L.owed_digest() == N.owed_digest());
+
+    S::OwedLedger D(1);                                  // (d) contrast: it settles
+    seed(D);
+    auto pay2 = D.propose_coinbase(300, 1, pay_of, no_floor);
+    D.on_block_found("pay", {}, payout_of(pay2));
+    D.on_block_finalized("pay", 12);
+    CHECK(D.effective_owed(A) == 0);
+    D.on_block_found("late", Amounts{{A, 100}}, {});
+    D.on_block_finalized("late", 13);
+    CHECK(first_of(D, 1000) == B);                       // A re-armed at 13, after B (11)
+}
+
+// ── LEDGER HEALTH (diagnostics; external review finding 01, #1860). health()
+// reports the aggregate the owed-sign ruling C-3 requires to be >= 0 and the
+// negative rows. The H/H+1 double pay (a builder that has not booked A yet
+// pays the same balances again in B, and every node books both from the
+// chain) is exactly what it must flag.
+static void test_ledger_health() {
+    using Amounts = S::OwedLedger::Amounts;
+    auto key = [](std::uint8_t b) { bytes32 k{}; k[0] = b; return k; };
+    auto pay_of = [](const bytes32& k) {
+        ScriptRef r; r.kind = ScriptKind::P2WPKH; r.payload.assign(20, k[0]); return r;
+    };
+    auto no_floor = [](ScriptKind) -> u64 { return 0; };
+    auto payout_of = [](const S::OwedLedger::Proposal& p) {
+        Amounts m; for (const auto& o : p.outs) m[o.key] += static_cast<long long>(o.amount); return m;
+    };
+    const bytes32 A = key(1), B = key(2);
+
+    S::OwedLedger base(1);
+    base.on_block_found("s", Amounts{{A, 700}, {B, 300}}, {});
+    base.on_block_finalized("s", 1);
+    auto h0 = base.health();
+    CHECK(h0.rows == 2 && h0.sum_final == 1000 && h0.positive_sum == 1000);
+    CHECK(h0.negative_rows == 0 && h0.min_row == 0 && h0.aggregate_ok());
+
+    // honest single builder: pays at FOUND, settles, stays healthy
+    {
+        S::OwedLedger L = base;
+        L.on_block_found("A", {}, payout_of(L.propose_coinbase(1000, 0, pay_of, no_floor)));
+        auto hp = L.health();
+        CHECK(hp.pending_blocks == 1 && hp.pending_payout == 1000 && hp.sum_final == 1000);
+        L.on_block_finalized("A", 61);
+        auto h1 = L.health();
+        CHECK(h1.sum_final == 0 && h1.negative_rows == 0 && h1.aggregate_ok());
+        CHECK(h1.pending_blocks == 0 && h1.pending_payout == 0);
+    }
+    // lagged builder: B built on the pre-A ledger pays the same balances again
+    {
+        S::OwedLedger L = base;
+        const S::OwedLedger lagged = base;
+        L.on_block_found("A", {}, payout_of(L.propose_coinbase(1000, 0, pay_of, no_floor)));
+        L.on_block_found("B", {}, payout_of(lagged.propose_coinbase(1000, 0, pay_of, no_floor)));
+        L.on_block_finalized("A", 61);
+        L.on_block_finalized("B", 62);
+        auto h2 = L.health();
+        CHECK(h2.sum_final == -1000 && !h2.aggregate_ok());
+        CHECK(h2.negative_rows == 2 && h2.negative_sum == -1000);
+        CHECK(h2.min_row == -700 && h2.min_key == A);
+    }
+}
+
 int main() {
     test_split_kat();
     test_fold_against_engine();
@@ -884,6 +1003,8 @@ int main() {
     test_o55_persisted_restart();
     test_o2_consistent_cut();
     test_db_geometry_seam();
+    test_orphan_keeps_age();
+    test_ledger_health();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
