@@ -154,17 +154,28 @@ struct DecodeResult {
     bool          payout_decoded = false;
     std::uint64_t unattributed_pico = 0, total_pico = 0;
     std::string   root_hex;
+    std::optional<::c2pool::v37n::settle::AnchorCut> cut;   // ANCHOR: the block's own credit cut (canonical Booked)
+    // DROPS (gap 2): the block's composed DROPS delta and, under the DROPS-due
+    // rule, its claim, exactly as the live booking hands them to the node.
+    // Rule off: the deposit is composed into the credit (as the live finalize
+    // driver does); rule on: it is booked as the deposit.
+    std::optional<::c2pool::v37n::settle::DropsFound> drops;
 };
 // cands/superseded: the scratch ring's candidates (live first), as ReconRing::
 // candidates() produces them. root_only: the refold already holds this block's
 // booked maps (it was booked in the log being re-derived) -- the decoder only
 // has to say whether its 0x03 root matches the scratch ring (age-bounded).
+// ledger: the scratch ledger at this block's booking point (before its FOUND),
+// the state the every-node coinbase recompute (xmr_coinbase_recompute.hpp)
+// rebuilds the block's canonical coinbase from.
 using DecodeFn = std::function<DecodeResult(std::uint64_t h, const std::string& bid,
                                             const std::vector<::v37::bytes32>& cands,
-                                            const std::vector<std::uint64_t>& superseded, bool root_only)>;
+                                            const std::vector<std::uint64_t>& superseded, bool root_only,
+                                            const OwedLedger& ledger)>;
 
 struct RefoldInput {
     ::v37::ChainId chain = 0;
+    ::c2pool::v37n::settle::OwedLedgerRules rules{};   // the live ledger's (XMR: arm floor, rotation)
     std::uint64_t  d_conf = 1;
     std::uint64_t  fork_h = 0;                     // F: every FINALIZE of a block mined at h <= F is kept
     std::uint64_t  cursor = 0;                     // c: the refold finalizes (F, c], books (F, c + 1 + D_conf]
@@ -181,7 +192,8 @@ struct RefusedBlock {
     Amounts       old_payout;                      // its booked payout map (liability per payee)
     DecodeResult  r;                               // the scratch decode (when not forced)
 };
-struct PendingOut { std::uint64_t h = 0; std::string bid; Amounts credit, payout; };
+struct PendingOut { std::uint64_t h = 0; std::string bid; Amounts credit, payout; std::optional<::c2pool::v37n::settle::AnchorCut> cut;
+                    std::optional<::c2pool::v37n::settle::DropsFound> drops; };   // DROPS (gap 2)
 
 struct RefoldResult {
     bool          ok = false;
@@ -204,11 +216,12 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     // (1) which bids settled at or below F; their LAST booked maps.
     std::map<std::string, std::uint64_t> fin_since;
     std::map<std::string, std::pair<Amounts, Amounts>> old_maps;
+    std::map<std::string, std::optional<::c2pool::v37n::settle::DropsFound>> old_drops;   // DROPS (gap 2)
     for (const auto& e : in.events) {
         if (e.kind == SettleEvKind::Finalize) fin_since[e.bid] = since_of_bin(e.bin_height);
-        else if (e.kind == SettleEvKind::Found) old_maps[e.bid] = {e.credit, e.payout};
+        else if (e.kind == SettleEvKind::Found) { old_maps[e.bid] = {e.credit, e.payout}; old_drops[e.bid] = drops_of(e); }
     }
-    OwedLedger L(in.chain);
+    OwedLedger L(in.chain, in.rules);
     recon::ReconRing ring(4096);
     std::uint64_t since = 0;
     ring.push(L.owed_digest(), 0);
@@ -222,7 +235,11 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
         const auto it = fin_since.find(e.bid);
         if (it == fin_since.end() || it->second > in.fork_h) continue;
         switch (e.kind) {
-            case SettleEvKind::Found:    L.on_block_found(e.bid, e.credit, e.payout); break;
+            case SettleEvKind::Found: {
+                const auto df = drops_of(e);
+                L.on_block_found(e.bid, e.credit, e.payout, anchor_of(e), df ? &*df : nullptr);
+                break;
+            }
             case SettleEvKind::Finalize: since = since_of_bin(e.bin_height); L.on_block_finalized(e.bid, e.bin_height); break;
             case SettleEvKind::Orphan:   L.on_block_orphaned(e.bid, e.payout); break;
         }
@@ -234,6 +251,8 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     const std::uint64_t top = in.cursor + 1 + D;
     std::map<std::uint64_t, std::string> pend;   // h -> bid
     std::map<std::string, std::pair<Amounts, Amounts>> maps;
+    std::map<std::string, std::optional<::c2pool::v37n::settle::AnchorCut>> cuts;
+    std::map<std::string, std::optional<::c2pool::v37n::settle::DropsFound>> dropss;   // DROPS (gap 2)
     auto book = [&](std::uint64_t h) -> bool {
         if (h <= in.fork_h || h > top) return true;
         const auto cb = in.chain_blocks.find(h);
@@ -249,16 +268,31 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
         }
         std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
         ring.candidates(L.owed_digest(), cands, sup);
-        DecodeResult r = decode(h, bid, cands, sup, had_old);
+        // ANCHOR: a block's E_b is folded at the anchor of the ledger it books
+        // on, which the refold may have changed, so its old maps are not reused.
+        const bool reuse = had_old && !in.rules.anchor_cut;
+        DecodeResult r = decode(h, bid, cands, sup, reuse, L);
         ++out.decoded;
         switch (r.outcome) {
             case DecodeOutcome::Booked: {
                 Amounts credit = r.credit, payout = r.payout;
-                if (had_old) { credit = om->second.first; payout = om->second.second; ++out.reused_maps; }
+                std::optional<::c2pool::v37n::settle::DropsFound> df = r.drops;
+                if (reuse) {
+                    credit = om->second.first; payout = om->second.second; ++out.reused_maps;
+                    const auto od = old_drops.find(bid);
+                    df = od == old_drops.end() ? std::nullopt : od->second;
+                } else if (df && !in.rules.drops_due) {
+                    // gap 2, rule off: the live driver composes the delta into the credit
+                    credit = ::c2pool::v37n::settle::compose_credit_from_delta(credit, df->deposit);
+                    df.reset();
+                }
+                if (df && df->empty()) df.reset();
                 SettleEvent fe; fe.kind = SettleEvKind::Found; fe.bid = bid; fe.credit = credit; fe.payout = payout;
-                L.on_block_found(bid, credit, payout);
+                set_cut(fe, r.cut);
+                set_drops(fe, df);
+                L.on_block_found(bid, credit, payout, r.cut, df ? &*df : nullptr);
                 out.events.push_back(fe);
-                pend[h] = bid; maps[bid] = {credit, payout}; out.booked[bid] = h;
+                pend[h] = bid; maps[bid] = {credit, payout}; cuts[bid] = r.cut; dropss[bid] = df; out.booked[bid] = h;
                 note_state();
                 return true;
             }
@@ -292,7 +326,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     }
     for (const auto& [h, bid] : pend) {
         const auto& m = maps[bid];
-        out.pending.push_back(PendingOut{h, bid, m.first, m.second});
+        out.pending.push_back(PendingOut{h, bid, m.first, m.second, cuts[bid], dropss[bid]});
     }
     out.digest = L.owed_digest();
     out.since = since;

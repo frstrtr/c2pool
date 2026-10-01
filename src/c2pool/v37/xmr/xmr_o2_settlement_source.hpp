@@ -99,6 +99,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <optional>
 #include <string>
 #include <utility>
@@ -184,6 +185,15 @@ struct XmrCoinbaseContext {
     std::uint8_t          monero_major_version = 16;
     std::uint64_t         height = 0;                 // block height; unlock = height + 60
     ::xmr::coin::Hash256  prev_id{};                  // parent block id (bin origin)
+    // SALTED TIE-BREAK (#1867): order equal-age K_fair cohorts by
+    // sha256d("V37T" || prev_id || key) instead of the raw identity. Builder
+    // policy (receivers book the on-chain coinbase), so off by default only to
+    // keep existing fixtures byte-identical; the daemon turns it on.
+    bool                  kfair_salted_ties = false;
+    // SPEND-COST FLOOR (payout-threshold.md §2-§3): x6::CoinbaseInputs::spend_floor.
+    // Off by default only to keep existing fixtures byte-identical; the daemon
+    // turns it on.
+    bool                  spend_floor = false;
     std::uint64_t         base_reward = 0;            // get_base_reward(already_generated_coins)
     std::uint64_t         fees = 0;                   // Σ selected tx fees (informational split)
 
@@ -243,16 +253,34 @@ public:
     //                 provider's first guess is base_reward + Σ selected fees).
     //                 0 => ctx.budget().
     //   age_of      : REQUIRED for KFairSource::X6Allocate, ignored otherwise.
+    //   owed_budget : the W4Propose owed pass budget, when the caller already
+    //                 knows it. Unset (every builder) => derived from
+    //                 reward_hint, as always. The receive-side recompute
+    //                 (xmr_coinbase_recompute.hpp) sets it to B - Σfixed from
+    //                 the block's committed V37N base B, which reproduces the
+    //                 builder's takes without the builder's mempool.
     static std::unique_ptr<XmrOwedSettlementSource>
-    build(const OwedLedger& ledger, const PayOfFn& pay_of, const XmrCoinbaseContext& ctx,
+    build(const OwedLedger& ledger, const PayOfFn& pay_of_in, const XmrCoinbaseContext& ctx,
           std::uint64_t reward_hint, std::string* why,
-          KFairSource source = KFairSource::W4Propose, const AgeOfFn& age_of = {})
+          KFairSource source = KFairSource::W4Propose, const AgeOfFn& age_of = {},
+          std::optional<std::uint64_t> owed_budget = std::nullopt)
     {
         auto refuse = [&](const std::string& msg) -> std::unique_ptr<XmrOwedSettlementSource> {
             if (why) *why = msg;
             return nullptr;
         };
         if (reward_hint == 0) reward_hint = ctx.budget();
+        // RAINDROP ENROL (A3, addition a): a payee the booking-point ledger's
+        // enrolment registry holds is paid through the REGISTRY ref -- ledger
+        // state, the same on every node -- so a node that never saw the payee's
+        // raindrop (a late joiner) builds and recomputes the same coinbase.
+        // Rule off (or no record): the caller's resolver, unchanged.
+        const PayOfFn pay_of = [&ledger, &pay_of_in](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+            if (const auto r = ledger.drops_enrol_ref(k);
+                r && ::v37::xmr::is_xmr_kind(r->kind) && ::v37::xmr::xmr_identity_key(*r) == k)
+                return *r;
+            return pay_of_in(k);
+        };
 
         // ---- fences / lane-parameter validity (fail-closed) ----
         if (!::v37::xmr::xmr_precarrot_ok(ctx.monero_major_version))
@@ -302,6 +330,7 @@ public:
         in.residual_sink          = ctx.residual_sink;
         in.residual_sink_identity = ctx.residual_sink_identity;
         in.output_cap             = ctx.output_cap;
+        in.spend_floor            = ctx.spend_floor;
         in.extra_nonce.clear();
 
         // A key whose ref is not a payable XMR ref is downgraded to a RAW
@@ -327,14 +356,21 @@ public:
             // fee model S2: a folded donation output's minimum is NOT reserved
             // here -- X6 sources it from the residual, else from the LARGEST
             // owed output (allocate_exact_sum), so W4 proposes over it too.
-            const std::uint64_t owed_budget =
+            const std::uint64_t owed_budget_w4 = owed_budget ? *owed_budget :
                 reward_hint - fixed_sum + (sink_folds ? ctx.fixed.back().amount : 0);
             auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
                                                   : std::numeric_limits<std::uint64_t>::max();
             };
-            OwedLedger::Proposal prop = ledger.propose_coinbase(owed_budget, cap_owed,
-                                                                payable_ref, h_min_of);
+            OwedLedger::Proposal prop;
+            if (ctx.kfair_salted_ties) {
+                ::v37::bytes32 salt{};
+                std::memcpy(salt.data(), ctx.prev_id.data(), salt.size());
+                prop = ledger.propose_coinbase_salted(owed_budget_w4, cap_owed, salt,
+                                                      payable_ref, h_min_of);
+            } else {
+                prop = ledger.propose_coinbase(owed_budget_w4, cap_owed, payable_ref, h_min_of);
+            }
             in.owed.reserve(prop.outs.size());
             for (std::size_t i = 0; i < prop.outs.size(); ++i) {
                 x6::OwedEntry e;
@@ -345,6 +381,37 @@ public:
                 in.owed.push_back(std::move(e));
             }
             in.h_min = 0;                                 // W4 already applied the floor
+            // A8 (operator ruling 2026-09-30): every positive balance the
+            // proposal did not take -- below c, so never armed, or otherwise
+            // left -- is paid WHEN THERE IS ROOM (x6 CoinbaseInputs::owed_dust).
+            // Canonical order: sha256d("V37T" || prev_id || identity) ASC, the
+            // salted tie nobody can grind. Amount: EffectiveOwed, so a balance
+            // is never paid beyond what is owed.
+            if (ctx.spend_floor) {
+                std::set<::v37::bytes32> taken;
+                for (const auto& o : prop.outs) taken.insert(o.key);
+                std::uint8_t pre[4 + 32 + 32] = {'V', '3', '7', 'T'};
+                std::memcpy(pre + 4, ctx.prev_id.data(), 32);
+                std::vector<std::pair<::v37::bytes32, x6::OwedEntry>> dust;
+                for (const auto& [k, owed] : ledger.effective_owed_all()) {
+                    if (owed <= 0 || taken.count(k)) continue;
+                    ::v37::ScriptRef r = payable_ref(k);
+                    if (!::v37::xmr::is_xmr_kind(r.kind)) continue;   // unpayable => carry
+                    x6::OwedEntry e;
+                    e.pay = r;
+                    e.owed = static_cast<std::uint64_t>(owed);
+                    e.first_eligible = 0;
+                    e.identity = k;
+                    std::memcpy(pre + 36, k.data(), 32);
+                    dust.emplace_back(::v37::sha256d(pre, sizeof(pre)), std::move(e));
+                }
+                std::sort(dust.begin(), dust.end(), [](const auto& a, const auto& b) {
+                    if (a.first != b.first) return a.first < b.first;
+                    return a.second.identity < b.second.identity;
+                });
+                in.owed_dust.reserve(dust.size());
+                for (auto& d : dust) in.owed_dust.push_back(std::move(d.second));
+            }
         }
         else {
             // X6 decides: every EffectiveOwed > 0 with its real age; X6 sorts
@@ -370,30 +437,95 @@ public:
         // side maps outputs through the same learned refs). The base B = Σ owed
         // takes + Σ fixed is reward-independent, so the V37N tail is fixed for
         // the snapshot's life like V37D.
+        // DROPS DUE (A5): the booking-point ledger's avail = due - SUM(pending
+        // claims) joins every pay-now E_b (the clamp, apply_drops_due). Pay-now
+        // arms iff the view has payees OR some avail > 0; the empty-cut finder
+        // fires only when neither holds. Rule off: avail is empty (unchanged).
+        const std::map<::v37::bytes32, long long> avail =
+            ledger.rules().drops_due ? ledger.drops_available() : std::map<::v37::bytes32, long long>{};
+        bool avail_pos = false;
+        for (const auto& [k, v] : avail) { (void)k; if (v > 0) avail_pos = true; }
+        // DROPS WINDOW (A4b, ruling 2026-10-01 "Window price"): the pay-now
+        // split input is the cut's payees PLUS the booking-point window's DROPS
+        // weight at the cut (OwedLedger::drops_window_merge): DROPS work is in
+        // its payee's weight and in the SUM, paid in every lane block of its
+        // window. The receiver books the same split (main fold_credit). Rule
+        // off or nothing in the window: ctx.paynow_payees, byte for byte.
+        // The window is read at the cut the payees come from: the ledger's
+        // anchor under the anchor rule (ctx.credit_cut is then the block's own
+        // cut), else the block's credit cut.
+        const std::optional<std::uint64_t> win_at =
+            !ctx.has_credit_cut ? std::nullopt
+            : ledger.rules().anchor_cut ? (ledger.anchor_cut() ? std::optional<std::uint64_t>(ledger.anchor_cut()->next_pos) : std::nullopt)
+                                        : std::optional<std::uint64_t>(ctx.credit_cut.next_pos);
+        const std::vector<::c2pool::v37n::settle::WeightedPayee> win_payees =
+            win_at ? ledger.drops_window_merge(ctx.paynow_payees, *win_at) : ctx.paynow_payees;
+        if (!win_payees.empty() && ctx.paynow_payees.empty()) avail_pos = true;   // a DROPS-only window arms pay-now
         if (ctx.has_paynow && ctx.has_credit_cut && source == KFairSource::W4Propose &&
-            !ctx.paynow_payees.empty()) {
+            (!ctx.paynow_payees.empty() || avail_pos)) {
             struct PayNowSet {
                 std::vector<::c2pool::v37n::settle::WeightedPayee> wp;
                 std::map<::v37::bytes32, ::v37::ScriptRef> ref;
+                std::map<::v37::bytes32, std::uint64_t> age;   // SPEND-COST FLOOR: first_eligible
+                std::map<::v37::bytes32, ::v37::bytes32> tie;  // sha256d("V37T" || prev_id || key)
+                std::map<::v37::bytes32, std::uint64_t> owed_left;   // positive balance after the owed take
+                std::map<::v37::bytes32, long long> avail;           // DROPS DUE: the clamp input
             };
             auto pv = std::make_shared<PayNowSet>();
-            pv->wp = ctx.paynow_payees;
+            pv->wp = win_payees;
+            pv->avail = avail;
             bool payable = true;
-            for (const auto& w : pv->wp) {
-                if (pv->ref.count(w.key)) continue;
-                const ::v37::ScriptRef r = pay_of(w.key);
+            // DROPS DUE: a payee with avail > 0 and no share in the view is paid
+            // through its REGISTRY ref (RAINDROP ENROL, ledger state; pay_of above),
+            // else its BOOKED ref (note_booked_refs taught it with the deposit).
+            std::vector<std::pair<::v37::bytes32, ::v37::ScriptRef>> want;
+            for (const auto& w : pv->wp) want.emplace_back(w.key, w.pay);
+            for (const auto& [k, v] : avail) if (v > 0) want.emplace_back(k, ::v37::ScriptRef{});
+            for (const auto& [wkey, wpay] : want) {
+                if (pv->ref.count(wkey)) continue;
+                // The projected payee carries its own ref: the view at the cut
+                // is the same on every node, so pay-now never depends on what
+                // this node's resolver happens to have learned (the recompute,
+                // xmr_coinbase_recompute.hpp, rebuilds this on every node).
+                const ::v37::ScriptRef r = (::v37::xmr::is_xmr_kind(wpay.kind) && ::v37::xmr::xmr_identity_key(wpay) == wkey)
+                                               ? wpay : pay_of(wkey);
                 if (!::v37::xmr::xmr_ref_valid(r)) { payable = false; break; }
-                pv->ref[w.key] = r;
+                pv->ref[wkey] = r;
+                if (ctx.spend_floor) {   // oldest first when not everyone fits (x6::PayNowEntry::age / tie)
+                    pv->age[wkey] = ledger.first_eligible_of(wkey);
+                    std::uint8_t pre[4 + 32 + 32] = {'V', '3', '7', 'T'};
+                    std::memcpy(pre + 4, ctx.prev_id.data(), 32);
+                    std::memcpy(pre + 36, wkey.data(), 32);
+                    pv->tie[wkey] = ::v37::sha256d(pre, sizeof(pre));
+                }
             }
             if (payable) {
                 std::uint64_t base = fixed_sum;
                 for (const auto& e : in.owed) base += e.owed;
+                if (ctx.spend_floor) {   // x6::PayNowEntry::owed_left
+                    std::map<::v37::bytes32, std::uint64_t> took;
+                    for (const auto& e : in.owed) took[e.identity] += e.owed;
+                    for (const auto& [k, r] : pv->ref) {
+                        (void)r;
+                        const long long eo = ledger.effective_owed(k);
+                        const std::uint64_t t = took.count(k) ? took.at(k) : 0;
+                        if (eo > 0 && static_cast<std::uint64_t>(eo) > t) pv->owed_left[k] = static_cast<std::uint64_t>(eo) - t;
+                    }
+                }
                 std::shared_ptr<const PayNowSet> cpv = pv;
                 in.paynow_at = [cpv](std::uint64_t budget) {
                     const std::vector<std::uint64_t> amt = ::c2pool::v37n::settle::split_reward(budget, cpv->wp);
                     std::map<::v37::bytes32, std::uint64_t> agg;   // == fold_eb's credit map (key ASC)
                     for (std::size_t i = 0; i < cpv->wp.size(); ++i)
                         if (amt[i] > 0) agg[cpv->wp[i].key] += amt[i];
+                    // DROPS DUE (A5): E'(k) = max(0, E(k) + avail(k)), before the allocation
+                    for (const auto& [k, a] : cpv->avail) {
+                        if (a == 0) continue;
+                        auto it = agg.find(k);
+                        const __int128 v = static_cast<__int128>(it == agg.end() ? 0 : it->second) + a;
+                        if (v <= 0) { if (it != agg.end()) agg.erase(it); continue; }
+                        agg[k] = v > static_cast<__int128>(~std::uint64_t{0}) ? ~std::uint64_t{0} : static_cast<std::uint64_t>(v);
+                    }
                     std::vector<x6::PayNowEntry> out;
                     out.reserve(agg.size());
                     for (const auto& [k, v] : agg) {
@@ -401,6 +533,9 @@ public:
                         e.pay = cpv->ref.at(k);
                         e.identity = k;
                         e.eb = v;
+                        if (auto a = cpv->age.find(k); a != cpv->age.end()) e.age = a->second;
+                        if (auto t = cpv->tie.find(k); t != cpv->tie.end()) e.tie = t->second;
+                        if (auto o = cpv->owed_left.find(k); o != cpv->owed_left.end()) e.owed_left = o->second;
                         out.push_back(std::move(e));
                     }
                     return out;
@@ -424,7 +559,7 @@ public:
         // re-arms the SAME snapshot for the winning job's payee (the stratum
         // login, the owner on an owner-fee job, else the donation).
         if (!s->m_paynow_on && ctx.has_paynow && ctx.has_credit_cut && source == KFairSource::W4Propose &&
-            ctx.paynow_payees.empty()) {
+            ctx.paynow_payees.empty() && !avail_pos) {   // DROPS DUE: no finder while a due is payable
             std::uint64_t base = fixed_sum;
             for (const auto& e : in.owed) base += e.owed;
             s->m_ecut_eligible = true;

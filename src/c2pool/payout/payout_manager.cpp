@@ -25,24 +25,12 @@ namespace payout {
 
 // DeveloperPayoutConfig implementation
 DeveloperPayoutConfig::DeveloperPayoutConfig() {
-    // C2Pool developer addresses for mainnet
-    mainnet_addresses[Blockchain::LITECOIN] = "LhKRu8BydWjKAG6GyKHPz5Qf9xX9rVRVQg";  // LTC mainnet
-    mainnet_addresses[Blockchain::BITCOIN] = "bc1qc2pool0dev0payment0addr0for0btc0mining";  // BTC mainnet
-    mainnet_addresses[Blockchain::DOGECOIN] = "DQc2pool0dev0payment0addr0for0doge0mining";  // DOGE mainnet
-    
-    // C2Pool developer addresses for testnet
-    testnet_addresses[Blockchain::LITECOIN] = "tltc1qc2pool0dev0testnet0addr0for0ltc0testing";  // LTC testnet
-    testnet_addresses[Blockchain::BITCOIN] = "tb1qc2pool0dev0testnet0addr0for0btc0testing";  // BTC testnet
-    testnet_addresses[Blockchain::DOGECOIN] = "nQc2pool0dev0testnet0addr0for0doge0testing";  // DOGE testnet
-    
-    // Other blockchains (placeholder addresses - would be real in production)
-    mainnet_addresses[Blockchain::ETHEREUM] = "0xC2Pool0Dev0Payment0Addr0For0ETH0Mining";
-    mainnet_addresses[Blockchain::MONERO] = "4C2Pool0Dev0Payment0Addr0For0XMR0Mining";
-    mainnet_addresses[Blockchain::ZCASH] = "zc2pool0dev0payment0addr0for0zec0mining";
-    
-    testnet_addresses[Blockchain::ETHEREUM] = "0xC2Pool0Dev0Testnet0Addr0For0ETH0Testing";
-    testnet_addresses[Blockchain::MONERO] = "5C2Pool0Dev0Testnet0Addr0For0XMR0Testing";
-    testnet_addresses[Blockchain::ZCASH] = "ztc2pool0dev0testnet0addr0for0zec0testing";
+    // Only real donation addresses: LTC's V36 COMBINED_DONATION_SCRIPT (1-of-2
+    // P2SH, impl/ltc/config_pool.hpp). Other chains have none here (the
+    // placeholder strings that stood in for them were not valid addresses);
+    // their donation output comes from their own pool config.
+    mainnet_addresses[Blockchain::LITECOIN] = "MLhSmVQxMusLE3pjGFvp4unFckgjeD8LUA";  // LTC mainnet
+    testnet_addresses[Blockchain::LITECOIN] = "QZQGeMoG3MaLmWwRTcbMwuxYenkHE2zhUN";  // LTC testnet (same script)
 }
 
 std::string DeveloperPayoutConfig::get_developer_address(Blockchain blockchain, Network network) const {
@@ -52,27 +40,18 @@ std::string DeveloperPayoutConfig::get_developer_address(Blockchain blockchain, 
 }
 
 double DeveloperPayoutConfig::get_total_developer_fee() const {
-    // If user has not configured any donation, we'll use minimal attribution instead of percentage
-    if (configured_fee_percent == 0.0 && minimal_attribution_mode) {
-        return 0.0;  // Will be handled by get_developer_amount() for minimal attribution
-    }
-    // Use configured donation or default fee, whichever is higher
-    return std::max(default_fee_percent, configured_fee_percent);
+    // Exactly the miner's --give-author: no floor (V36).
+    return configured_fee_percent;
 }
 
 uint64_t DeveloperPayoutConfig::get_developer_amount(uint64_t block_reward) const {
-    if (configured_fee_percent == 0.0 && minimal_attribution_mode) {
-        // Use minimal attribution (1 satoshi) for software marking
-        return MINIMAL_ATTRIBUTION_SATOSHIS;
-    }
-    
-    // Use percentage-based calculation for donations
-    double percentage = get_total_developer_fee();
-    return static_cast<uint64_t>(block_reward * percentage / 100.0);
+    // The donation output: the give-author share, never below the V36 marker.
+    const uint64_t share = static_cast<uint64_t>(block_reward * configured_fee_percent / 100.0);
+    return std::max<uint64_t>(share, block_reward > 0 ? MINIMAL_ATTRIBUTION_SATOSHIS : 0);
 }
 
 bool DeveloperPayoutConfig::use_minimal_attribution() const {
-    return configured_fee_percent == 0.0 && minimal_attribution_mode;
+    return configured_fee_percent == 0.0;
 }
 
 bool DeveloperPayoutConfig::is_valid_developer_address(const std::string& address, Blockchain blockchain, Network network) const {
@@ -82,7 +61,7 @@ bool DeveloperPayoutConfig::is_valid_developer_address(const std::string& addres
 // NodeOwnerPayoutConfig implementation
 bool NodeOwnerPayoutConfig::is_valid() const {
     if (!enabled) return true;
-    return !payout_address.empty() && fee_percent >= 0.0 && fee_percent <= 50.0;
+    return !payout_address.empty() && fee_percent >= 0.0 && fee_percent <= 100.0;
 }
 
 void NodeOwnerPayoutConfig::set_payout_address(const std::string& address, Blockchain blockchain, Network network) {
@@ -373,7 +352,7 @@ PayoutManager::PayoutManager(Blockchain blockchain, Network network, double pool
     LOG_INFO << "Initializing C2Pool Payout Manager";
     LOG_INFO << "  Blockchain: " << static_cast<int>(blockchain);
     LOG_INFO << "  Network: " << (network == Network::TESTNET ? "testnet" : "mainnet");
-    LOG_INFO << "  Developer attribution: " << developer_config_.get_total_developer_fee() << "%";
+    LOG_INFO << "  Donation (give-author): " << developer_config_.get_total_developer_fee() << "% of each share's weight";
     
     // Try to auto-detect wallet address if enabled
     if (node_owner_config_.auto_detect_from_wallet) {
@@ -624,6 +603,17 @@ std::string PayoutManager::address_to_script_hex(const std::string& address) con
     return script.str();
 }
 
+// reward * pct / 100 in integers: the percent is clamped to [0, 100] and taken
+// in millionths of a percent, the product in 128 bits, floored. Never wraps and
+// never exceeds the reward (external review audit N2: a 150% RPC value made the
+// miner amount wrap through zero).
+static uint64_t amount_of_pct(uint64_t reward, double pct) {
+    if (!(pct > 0.0)) return 0;
+    if (pct >= 100.0) return reward;
+    const uint64_t micro = static_cast<uint64_t>(pct * 1000000.0 + 0.5);   // pct in 1e-6 %
+    return static_cast<uint64_t>((static_cast<unsigned __int128>(reward) * micro) / 100000000u);
+}
+
 // Enhanced coinbase construction methods
 nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_satoshis, const std::string& miner_address, 
                                                       double dev_fee_percent, double node_fee_percent) {
@@ -633,18 +623,24 @@ nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_sato
         // Calculate allocation using existing logic
         PayoutAllocation allocation = calculate_payout(block_reward_satoshis);
         
-        // Override with provided parameters if specified
+        // Override with provided parameters if specified (the donation keeps
+        // the V36 1-satoshi marker whatever the percent)
         if (dev_fee_percent > 0.0) {
             allocation.developer_percent = dev_fee_percent;
-            allocation.developer_amount = static_cast<uint64_t>(block_reward_satoshis * dev_fee_percent / 100.0);
+            allocation.developer_amount = std::max<uint64_t>(
+                amount_of_pct(block_reward_satoshis, dev_fee_percent),
+                DeveloperPayoutConfig::MINIMAL_ATTRIBUTION_SATOSHIS);
         }
         
         if (node_fee_percent > 0.0) {
             allocation.node_owner_percent = node_fee_percent;
-            allocation.node_owner_amount = static_cast<uint64_t>(block_reward_satoshis * node_fee_percent / 100.0);
+            allocation.node_owner_amount = amount_of_pct(block_reward_satoshis, node_fee_percent);
         }
         
-        // Recalculate miner amount
+        // Recalculate miner amount; the fees never exceed the reward (no wrap)
+        if (allocation.developer_amount > block_reward_satoshis) allocation.developer_amount = block_reward_satoshis;
+        if (allocation.node_owner_amount > block_reward_satoshis - allocation.developer_amount)
+            allocation.node_owner_amount = block_reward_satoshis - allocation.developer_amount;
         allocation.miner_amount = block_reward_satoshis - allocation.developer_amount - allocation.node_owner_amount;
         
         // Build outputs array
@@ -659,16 +655,8 @@ nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_sato
             });
         }
         
-        // Developer output
-        if (allocation.developer_amount > 0 && !allocation.developer_address.empty()) {
-            outputs.push_back({
-                {"address", allocation.developer_address},
-                {"amount_satoshis", allocation.developer_amount},
-                {"type", "developer"}
-            });
-        }
-        
-        // Node owner output
+        // Node owner output (a local/solo coinbase; in P2P mode the owner fee
+        // is a payee substitution at job issue, never an output)
         if (allocation.node_owner_amount > 0 && !allocation.node_owner_address.empty()) {
             outputs.push_back({
                 {"address", allocation.node_owner_address},
@@ -677,9 +665,20 @@ nlohmann::json PayoutManager::build_coinbase_detailed(uint64_t block_reward_sato
             });
         }
         
-        // Build complete coinbase transaction
+        // Donation output: always present, LAST, >= 1 satoshi (V36)
+        if (allocation.developer_amount > 0 && !allocation.developer_address.empty()) {
+            outputs.push_back({
+                {"address", allocation.developer_address},
+                {"amount_satoshis", allocation.developer_amount},
+                {"type", "donation"}
+            });
+        }
+        
+        // Build complete coinbase transaction (the same effective percents)
+        const double dev_pct = dev_fee_percent > 0.0 ? dev_fee_percent : developer_config_.get_total_developer_fee();
+        const double node_pct = node_fee_percent > 0.0 ? node_fee_percent : allocation.node_owner_percent;
         std::string coinbase_hex = build_complete_coinbase_transaction(block_reward_satoshis, miner_address, 
-                                                                      dev_fee_percent, node_fee_percent);
+                                                                      dev_pct, node_pct);
         
         result["outputs"] = outputs;
         result["coinbase_hex"] = coinbase_hex;
@@ -724,27 +723,30 @@ std::string PayoutManager::build_complete_coinbase_transaction(uint64_t block_re
     // Calculate outputs
     std::vector<std::pair<std::string, uint64_t>> outputs;
     
-    // Calculate amounts
-    uint64_t dev_amount = static_cast<uint64_t>(block_reward_satoshis * dev_fee_percent / 100.0);
-    uint64_t node_amount = static_cast<uint64_t>(block_reward_satoshis * node_fee_percent / 100.0);
+    // Calculate amounts (the donation keeps the V36 1-satoshi marker)
+    uint64_t dev_amount = std::max<uint64_t>(amount_of_pct(block_reward_satoshis, dev_fee_percent),
+                                             block_reward_satoshis > 0 ? DeveloperPayoutConfig::MINIMAL_ATTRIBUTION_SATOSHIS : 0);
+    if (dev_amount > block_reward_satoshis) dev_amount = block_reward_satoshis;
+    uint64_t node_amount = amount_of_pct(block_reward_satoshis, node_fee_percent);
+    if (node_amount > block_reward_satoshis - dev_amount) node_amount = block_reward_satoshis - dev_amount;
     uint64_t miner_amount = block_reward_satoshis - dev_amount - node_amount;
     
-    // Add outputs
+    // Add outputs: miner, node owner, then the donation LAST (V36)
     if (miner_amount > 0) {
         outputs.emplace_back(miner_address, miner_amount);
-    }
-    
-    if (dev_amount > 0) {
-        std::string dev_addr = get_developer_address();
-        if (!dev_addr.empty()) {
-            outputs.emplace_back(dev_addr, dev_amount);
-        }
     }
     
     if (node_amount > 0) {
         std::string node_addr = get_node_owner_address();
         if (!node_addr.empty()) {
             outputs.emplace_back(node_addr, node_amount);
+        }
+    }
+    
+    if (dev_amount > 0) {
+        std::string dev_addr = get_developer_address();
+        if (!dev_addr.empty()) {
+            outputs.emplace_back(dev_addr, dev_amount);
         }
     }
     
@@ -934,36 +936,22 @@ PayoutAllocation PayoutManager::calculate_payout(uint64_t block_reward) const {
     PayoutAllocation allocation;
     allocation.total_reward = block_reward;
     
-    // Calculate developer amount first (might be minimal attribution)
+    // The LOCAL (solo) split, as main_ltc's solo coinbase pays it: the
+    // give-author donation (>= the 1-satoshi V36 marker), the node owner fee
+    // as its own output (a local pool pays its owner directly; in P2P mode the
+    // owner fee is instead a payee substitution at job issue and never an
+    // output), the rest to the miners. No cap and no rescaling: the percents
+    // are the operator's own, disclosed at startup, and sum to <= 100
+    // (validate_configuration).
     allocation.developer_amount = developer_config_.get_developer_amount(block_reward);
-    
-    // Calculate node owner amount
     allocation.node_owner_percent = node_owner_config_.enabled ? node_owner_config_.fee_percent : 0.0;
     allocation.node_owner_amount = static_cast<uint64_t>(block_reward * allocation.node_owner_percent / 100.0);
-    
-    // Calculate miner amount (everything minus fees)
+    if (allocation.developer_amount + allocation.node_owner_amount > block_reward)
+        allocation.node_owner_amount = block_reward - allocation.developer_amount;
     allocation.miner_amount = block_reward - allocation.developer_amount - allocation.node_owner_amount;
-    
-    // Calculate percentages for logging
-    allocation.developer_percent = (allocation.developer_amount * 100.0) / block_reward;
-    allocation.miner_percent = (allocation.miner_amount * 100.0) / block_reward;
-    
-    // Ensure miner gets at least 49% (sanity check for large donations only)
-    if (allocation.miner_percent < 49.0 && !developer_config_.use_minimal_attribution()) {
-        LOG_WARNING << "Total fees exceed 51% of block reward, adjusting...";
-        double total_fees_percent = allocation.developer_percent + allocation.node_owner_percent;
-        double scale_factor = 51.0 / total_fees_percent;  // Scale down to max 51%
-        
-        allocation.developer_percent *= scale_factor;
-        allocation.node_owner_percent *= scale_factor;
-        allocation.miner_percent = 100.0 - allocation.developer_percent - allocation.node_owner_percent;
-        
-        // Recalculate amounts
-        allocation.developer_amount = static_cast<uint64_t>(block_reward * allocation.developer_percent / 100.0);
-        allocation.node_owner_amount = static_cast<uint64_t>(block_reward * allocation.node_owner_percent / 100.0);
-        allocation.miner_amount = block_reward - allocation.developer_amount - allocation.node_owner_amount;
-    }
-    
+    allocation.developer_percent = block_reward ? (allocation.developer_amount * 100.0) / block_reward : 0.0;
+    allocation.miner_percent = block_reward ? (allocation.miner_amount * 100.0) / block_reward : 0.0;
+
     // Set addresses
     allocation.developer_address = get_developer_address();
     allocation.node_owner_address = get_node_owner_address();
@@ -972,18 +960,18 @@ PayoutAllocation PayoutManager::calculate_payout(uint64_t block_reward) const {
 }
 
 void PayoutManager::set_developer_donation(double percent) {
-    if (percent < 0.0 || percent > 50.0) {
-        LOG_WARNING << "Developer donation must be between 0% and 50%, got: " << percent << "%";
+    if (percent < 0.0 || percent > 100.0) {
+        LOG_WARNING << "Donation (give-author) must be between 0% and 100%, got: " << percent << "%";
         return;
     }
     
     developer_config_.configured_fee_percent = percent;
-    LOG_INFO << "Developer donation set to " << percent << "% (total fee: " << developer_config_.get_total_developer_fee() << "%)";
+    LOG_INFO << "Donation (give-author) set to " << percent << "% of each share's weight";
 }
 
 void PayoutManager::set_node_owner_fee(double percent) {
-    if (percent < 0.0 || percent > 50.0) {
-        LOG_WARNING << "Node owner fee must be between 0% and 50%, got: " << percent << "%";
+    if (percent < 0.0 || percent > 100.0) {
+        LOG_WARNING << "Node owner fee must be between 0% and 100%, got: " << percent << "%";
         return;
     }
     
@@ -1066,11 +1054,11 @@ std::string PayoutManager::get_node_owner_config_path() const {
 }
 
 std::string PayoutManager::get_developer_address() const {
-    // Developer/donation addresses are defined in PoolConfig::get_donation_script()
-    // (consensus-level, per-version P2SH/P2PK scripts matching Python p2pool).
-    // This legacy PayoutManager method is not used for coinbase construction since P32.
-    LOG_WARNING << "get_developer_address() is deprecated — use PoolConfig::get_donation_script()";
-    return "";
+    // Display only: the sharechain builds the real donation output from
+    // PoolConfig::get_donation_script() (per share version). For LTC the
+    // configured address IS that V36 COMBINED_DONATION_SCRIPT; empty for a
+    // chain with no real donation address configured.
+    return developer_config_.get_developer_address(blockchain_, network_);
 }
 
 std::string PayoutManager::get_node_owner_address() const {
@@ -1215,39 +1203,28 @@ PayoutManager::calculate_pplns_outputs(uint64_t subsidy) const {
         return outputs;
     }
 
-    // Compute fee deductions
-    uint64_t dev_amount = developer_config_.get_developer_amount(subsidy);
-    uint64_t node_amount = 0;
-    if (node_owner_config_.enabled && node_owner_config_.fee_percent > 0.0) {
-        node_amount = static_cast<uint64_t>(subsidy * node_owner_config_.fee_percent / 100.0);
-    }
-    // Ensure fees don't exceed 51% of subsidy
-    if (dev_amount + node_amount > subsidy / 2) {
-        double scale = static_cast<double>(subsidy / 2) / (dev_amount + node_amount);
-        dev_amount = static_cast<uint64_t>(dev_amount * scale);
-        node_amount = static_cast<uint64_t>(node_amount * scale);
-    }
-    uint64_t miner_pool = subsidy - dev_amount - node_amount;
-
-    // Sum the PPLNS expected amounts (they distribute the full subsidy)
+    // The PPLNS map (ShareTracker::get_expected_payouts) is already the whole
+    // coinbase for the full subsidy, V36 rules: every share's weight split by
+    // its own give-author donation, the donation output = the donation shares
+    // + the rounding dust (>= 1 satoshi), and the node owner fee already
+    // inside the weights (its payee substitution at job issue). So nothing is
+    // deducted here: a donation or owner output added on top would count
+    // both twice. Only rescale to `subsidy` (the map may be for another one).
     double pplns_total = 0.0;
     for (const auto& [script, amount] : pplns_expected_payouts_) {
         pplns_total += amount;
     }
-
     if (pplns_total <= 0.0) {
         return outputs;
     }
 
-    // Scale PPLNS proportions to the miner_pool and convert to satoshis
     uint64_t distributed = 0;
     size_t largest_idx = 0;
     uint64_t largest_val = 0;
-
     for (const auto& [script, amount] : pplns_expected_payouts_) {
-        uint64_t sat = static_cast<uint64_t>(amount / pplns_total * miner_pool);
+        const uint64_t sat = static_cast<uint64_t>(amount / pplns_total * subsidy);
         if (sat < MINIMUM_PAYOUT_SATOSHIS) {
-            continue;  // Skip dust outputs
+            continue;
         }
         outputs.emplace_back(script, sat);
         distributed += sat;
@@ -1256,46 +1233,15 @@ PayoutManager::calculate_pplns_outputs(uint64_t subsidy) const {
             largest_idx = outputs.size() - 1;
         }
     }
-
-    // Assign rounding remainder to largest output
-    if (!outputs.empty() && distributed < miner_pool) {
-        outputs[largest_idx].second += (miner_pool - distributed);
+    if (!outputs.empty() && distributed < subsidy) {
+        outputs[largest_idx].second += (subsidy - distributed);
     }
 
-    // Add developer output
-    if (dev_amount > 0) {
-        std::string dev_addr = developer_config_.get_developer_address(blockchain_, network_);
-        if (!dev_addr.empty()) {
-            std::string script_hex = address_to_script_hex(dev_addr);
-            // Convert hex to bytes
-            std::vector<unsigned char> script_bytes;
-            for (size_t i = 0; i < script_hex.size(); i += 2) {
-                script_bytes.push_back(
-                    static_cast<unsigned char>(std::stoul(script_hex.substr(i, 2), nullptr, 16)));
-            }
-            outputs.emplace_back(std::move(script_bytes), dev_amount);
-        }
-    }
-
-    // Add node owner output
-    if (node_amount > 0 && !node_owner_config_.payout_address.empty()) {
-        std::string script_hex = address_to_script_hex(node_owner_config_.payout_address);
-        std::vector<unsigned char> script_bytes;
-        for (size_t i = 0; i < script_hex.size(); i += 2) {
-            script_bytes.push_back(
-                static_cast<unsigned char>(std::stoul(script_hex.substr(i, 2), nullptr, 16)));
-        }
-        outputs.emplace_back(std::move(script_bytes), node_amount);
-    }
-
-    // Sort by amount descending and cap to MAX_COINBASE_OUTPUTS
     std::sort(outputs.begin(), outputs.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
-
     if (outputs.size() > MAX_COINBASE_OUTPUTS) {
         outputs.resize(MAX_COINBASE_OUTPUTS);
     }
-
     return outputs;
 }
 

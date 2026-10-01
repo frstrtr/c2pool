@@ -162,6 +162,14 @@ inline constexpr std::size_t kBlockWonDropsRowBytes  = 32 + 8;
 // the consensus flip: at flip 0 the live decoder accepts exactly v0x01 (127 B),
 // as master does, and nothing emits v0x02 (the w3 v0x03 rule, w3_relay.hpp).
 inline constexpr bool        kBlockWonDropsLive      = ::c2pool::v37n::kActivateConsensusV1;
+// ★ DROPS-SET-PIN: FB_BLOCK_WON v0x03 (flip-only) = the v0x02 body + the
+// winner's RAINDROP SET: u32 n_ids | n_ids x receipt id (32), strictly
+// ascending, n_ids <= kBlockWonSetMaxIds. Every node composes the block's
+// DROPS rows from exactly these raindrops (never more, never fewer). A v0x02
+// frame still decodes (set = none) but is never booked from under pool rules v4.
+#define C2POOL_XMR_DROPS_SET_PIN 1
+inline constexpr u8          kFbBlockWonSetVersion   = 0x03;
+inline constexpr std::size_t kBlockWonSetMaxIds      = 16384;   // 512 KiB of ids (1 MiB carrier ceiling)
 // ★ DROPS-ENROL-TIDY: the 206-byte HELLO (enrol-set trailer) exists only under
 // the flip too: at flip 0 it is never emitted and the decoder refuses it as
 // "wrong length", exactly as master.
@@ -406,8 +414,12 @@ inline PoolId pool_id_of(u32 chain_id, const ::v37::LaneParams& p,
 //       generic; this version names it: a raindrops-OFF node (any build before
 //       this one, or -DV37_XMR_DROPS_DEFAULT=OFF) is refused AT HELLO as
 //       TAG_MISMATCH field=version with the DROPS reason, both directions.
+//   4 = + DROPS-SET-PIN: a lane block's DROPS rows are composed from exactly
+//       the winner's pinned raindrop set (FB_BLOCK_WON v0x03); a v3 node books
+//       from its own node-local set and would split the owed ledger.
 inline constexpr u32 kXmrPoolRulesVersionDropsOff = 2;
-inline constexpr u32 kXmrPoolRulesVersionDropsOn  = 3;
+inline constexpr u32 kXmrPoolRulesVersionDropsV3  = 3;   // DROPS on, node-local raindrop set (pre DROPS-SET-PIN)
+inline constexpr u32 kXmrPoolRulesVersionDropsOn  = 4;
 inline constexpr u32 kXmrPoolRulesVersion =
     ::c2pool::v37n::kActivateConsensusV1 ? kXmrPoolRulesVersionDropsOn : kXmrPoolRulesVersionDropsOff;
 #define C2POOL_XMR_DROPS_DEFAULT_RULES 1   // feature probe: the v3 (DROPS default) pool rules exist
@@ -419,6 +431,9 @@ inline std::string pool_rules_reason(u32 ours, u32 theirs) {
     if (ours == kXmrPoolRulesVersionDropsOff && theirs == kXmrPoolRulesVersionDropsOn)
         return ": the peer runs raindrops (DROPS) ON (the XMR-DROPS-DEFAULT build) and this node runs them OFF -- "
                "every node of a pool must run the same build";
+    if (ours == kXmrPoolRulesVersionDropsOn && theirs == kXmrPoolRulesVersionDropsV3)
+        return ": the peer composes raindrop credit from its own node-local raindrop set (pool rules v3, before "
+               "DROPS-SET-PIN) and would book a different DROPS delta -- upgrade it";
     if (theirs < ours && ours >= 2 && theirs < 2)
         return ": the peer runs older pool rules (pre-#1803: no V37F empty-cut finder / cut floor) and would stall on "
                "this pool's blocks -- upgrade it";
@@ -538,8 +553,10 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
 // EXPLICIT refusal with a reason, never a silent divergence (the memory-recorded
 // "mismatched-LaneParams nodes must reject explicitly" gap).
 inline constexpr char kEnrolSetMismatch[] = "ENROL_SET_MISMATCH";
+inline constexpr char kDropsRuleMismatch[] = "DROPS_RULE_MISMATCH";   // A3 + A5 flag day
 inline std::string enrol_mode_label(const std::optional<bytes32>& d) {
     if (!d) return "not carried (an auto-enrol-less build with an empty list)";
+    if (enrol_rule_of(*d) != 0) return "rule-tagged (drops rule " + drops_rule_label(enrol_rule_of(*d)) + ")";
     if (*d == enrol_mode_tag(EnrolMode::Auto)) return "auto (every payee)";
     if (*d == enrol_mode_tag(EnrolMode::None)) return "none (--drops-enrol none)";
     return "list (--drops-enrol ID...)";
@@ -554,6 +571,13 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.lane_params_digest != ours.lane_params_digest) {
         // ★ DROPS-ENROL-TIDY (flip 1): the enrol set is mixed into the digest, so
         // name it when the two HELLOs carry different enrol-set digests.
+        // A3 + A5 FLAG DAY: the DROPS rule tag rides the enrol digest; name it.
+        const std::uint32_t our_rule = ours.enrol_set ? enrol_rule_of(*ours.enrol_set) : 0u;
+        const std::uint32_t their_rule = theirs.enrol_set ? enrol_rule_of(*theirs.enrol_set) : 0u;
+        if (theirs.enrol_set != ours.enrol_set && our_rule != their_rule)
+            return std::string(kDropsRuleMismatch) + " drops rule ours=" + drops_rule_label(our_rule) +
+                   " theirs=" + drops_rule_label(their_rule) +
+                   " (flag day: every node of a pool must run the same DROPS due / raindrop-enrol / window rules)";
         if (theirs.enrol_set != ours.enrol_set)
             return std::string(kEnrolSetMismatch) + " enrol-set digest differs: ours=" +
                    (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +
@@ -585,6 +609,9 @@ struct BlockWon {
     struct Drops {
         std::map<bytes32, long long> delta;   // payee -> signed delta, no zero rows, <= kBlockWonDropsMaxRows
         bytes32 enrollment_digest{};          // winner's EnrollmentBook::book_digest() at the composition
+        // ★ DROPS-SET-PIN (v0x03): the receipt ids of the raindrops the delta was
+        // composed from, strictly ascending. nullopt = a v0x02 frame (no set).
+        std::optional<std::vector<bytes32>> set;
         bool operator==(const Drops&) const = default;
     };
     std::optional<Drops> drops;
@@ -595,15 +622,26 @@ struct BlockWon {
 // (and never with more than kBlockWonDropsMaxRows rows: {} is returned then).
 inline std::vector<u8> encode_block_won(const BlockWon& b) {
     if (b.drops && b.drops->delta.size() > kBlockWonDropsMaxRows) return {};
+    const bool v3 = b.drops && b.drops->set.has_value();
+    if (v3) {   // ★ DROPS-SET-PIN: canonical or nothing
+        const auto& ids = *b.drops->set;
+        if (ids.size() > kBlockWonSetMaxIds) return {};
+        for (std::size_t i = 1; i < ids.size(); ++i) if (!(ids[i - 1] < ids[i])) return {};
+    }
     std::vector<u8> f;
-    f.reserve(b.drops ? kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * b.drops->delta.size() : kBlockWonBytes);
-    f.push_back(FB_BLOCK_WON); f.push_back(b.drops ? kFbBlockWonDropsVersion : kFbVersion); le::put32(f, b.chain_id);
+    f.reserve(b.drops ? kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * b.drops->delta.size() +
+                        (v3 ? 4 + 32 * b.drops->set->size() : 0) : kBlockWonBytes);
+    f.push_back(FB_BLOCK_WON); f.push_back(v3 ? kFbBlockWonSetVersion : b.drops ? kFbBlockWonDropsVersion : kFbVersion); le::put32(f, b.chain_id);
     le::putb(f, b.bid); le::put64(f, b.h_b); le::put64(f, b.cut_next_pos); le::putb(f, b.cut_spine_digest);
     le::put64(f, b.reward); f.push_back(b.payout_emitted ? 1 : 0); le::putb(f, b.owed_digest_at_win);
     if (b.drops) {
         le::put16(f, static_cast<u16>(b.drops->delta.size()));
         for (const auto& [k, v] : b.drops->delta) { le::putb(f, k); le::put64(f, static_cast<u64>(v)); }
         le::putb(f, b.drops->enrollment_digest);
+        if (v3) {
+            le::put32(f, static_cast<u32>(b.drops->set->size()));
+            for (const auto& id : *b.drops->set) le::putb(f, id);
+        }
     }
     return f;
 }
@@ -615,7 +653,8 @@ inline std::vector<u8> encode_block_won(const BlockWon& b) {
 inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string* why = nullptr,
                              bool accept_drops = kBlockWonDropsLive) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    const bool v2 = accept_drops && f.size() >= 2 && f[1] == kFbBlockWonDropsVersion;
+    const bool v3 = accept_drops && f.size() >= 2 && f[1] == kFbBlockWonSetVersion;   // ★ DROPS-SET-PIN
+    const bool v2 = (accept_drops && f.size() >= 2 && f[1] == kFbBlockWonDropsVersion) || v3;
     if (!v2 && f.size() != kBlockWonBytes) return bad("block_won: wrong length");
     if (v2 && f.size() < kBlockWonDropsMinBytes) return bad("block_won: v0x02 short");
     if (f[0] != FB_BLOCK_WON) return bad("block_won: wrong opcode");
@@ -634,7 +673,9 @@ inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string*
     if (!v2) return true;
     const std::size_t n = le::get16(p); p += 2;
     if (n > kBlockWonDropsMaxRows) return bad("block_won: v0x02 rows over the bound");
-    if (f.size() != kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * n) return bad("block_won: v0x02 wrong length");
+    const std::size_t body = kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * n;
+    if (!v3 && f.size() != body) return bad("block_won: v0x02 wrong length");
+    if (v3 && f.size() < body + 4) return bad("block_won: v0x03 short");
     BlockWon::Drops d;
     for (std::size_t i = 0; i < n; ++i) {
         const bytes32 k = le::getb(p); p += 32;
@@ -643,7 +684,20 @@ inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string*
         if (!d.delta.empty() && !(d.delta.rbegin()->first < k)) return bad("block_won: v0x02 rows not strictly ascending");
         d.delta.emplace_hint(d.delta.end(), k, v);
     }
-    d.enrollment_digest = le::getb(p);
+    d.enrollment_digest = le::getb(p); p += 32;
+    if (v3) {   // ★ DROPS-SET-PIN: the set trailer, canonical or refused
+        const std::size_t m = le::get32(p); p += 4;
+        if (m > kBlockWonSetMaxIds) return bad("block_won: v0x03 raindrop set over the bound");
+        if (f.size() != body + 4 + 32 * m) return bad("block_won: v0x03 wrong length");
+        std::vector<bytes32> ids;
+        ids.reserve(m);
+        for (std::size_t i = 0; i < m; ++i) {
+            const bytes32 id = le::getb(p); p += 32;
+            if (!ids.empty() && !(ids.back() < id)) return bad("block_won: v0x03 raindrop set not strictly ascending");
+            ids.push_back(id);
+        }
+        d.set = std::move(ids);
+    }
     b.drops = std::move(d);
     return true;
 }
@@ -962,6 +1016,7 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
     // subthreshold (RDWR-OQ2)
     b.push_back(p.subthreshold.enabled ? 1 : 0);
     le::put32(b, p.subthreshold.K); le::put32(b, p.subthreshold.mode); le::put32(b, p.subthreshold.version);
+    if (p.subthreshold.count_floor_shift) le::put32(b, p.subthreshold.count_floor_shift);   // Count only
     // mrr
     le::put64(b, p.mrr.activation_pos); le::put64(b, p.mrr.ckpt_retain);
     // win
@@ -1002,6 +1057,7 @@ inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, Bi
         le::put64(b, ::c2pool::v37n::xmr::fee::kFeeReceiptWeight);
         le::putb(b, ::c2pool::v37n::xmr::fee::donation_identity(
                         static_cast<::c2pool::v37n::xmr::fee::DonationNet>(network)));
+        le::put32(b, ::c2pool::v37n::xmr::fee::kFeeLanePushRule);   // A2: one lane position per receipt
     }
     return keccak_bytes(b);
 }

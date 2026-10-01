@@ -210,7 +210,7 @@ int main() {
         for (std::uint64_t h = in.fork_h + 1; h <= c + 1 + D && h <= TOP; ++h) in.chain_blocks[h] = bid_of(h);
         in.refuse = {bid_of(X)};
         std::size_t calls = 0;
-        auto decode = [&](std::uint64_t h, const std::string&, const std::vector<::v37::bytes32>& cands, const std::vector<std::uint64_t>&, bool root_only) {
+        auto decode = [&](std::uint64_t h, const std::string&, const std::vector<::v37::bytes32>& cands, const std::vector<std::uint64_t>&, bool root_only, const ::c2pool::v37n::settle::OwedLedger&) {
             ++calls;
             mc::DecodeResult r;
             if (variant == 2 && h == 15) { r.outcome = mc::DecodeOutcome::Undecidable; r.why = "cut-pending: relay repair of P=9 in flight (test)"; return r; }

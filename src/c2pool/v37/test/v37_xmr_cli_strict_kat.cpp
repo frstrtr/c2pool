@@ -256,8 +256,8 @@ void version_rows() {
         check(r.out.find("mainnet height " + mh) != std::string::npos, tag + ": no pinned mainnet height " + mh);
         check(r.out.find("stagenet height " + sh) != std::string::npos, tag + ": no pinned stagenet height " + sh);
 #ifdef V37_XMR_DROPS_DEFAULT   // XMR-DROPS-DEFAULT: the build identity names the raindrops state
-        check(r.out.find("raindrops (DROPS): ON by default (pool rules v3)") != std::string::npos,
-              tag + ": no 'raindrops (DROPS): ON by default (pool rules v3)' line");
+        check(r.out.find("raindrops (DROPS): ON by default (pool rules v4)") != std::string::npos,   // v4 = DROPS-SET-PIN
+              tag + ": no 'raindrops (DROPS): ON by default (pool rules v4)' line");
 #else
         check(r.out.find("raindrops (DROPS): OFF") != std::string::npos, tag + ": no 'raindrops (DROPS): OFF' line");
 #endif
