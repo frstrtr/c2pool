@@ -158,6 +158,11 @@ int main() {
     CHECK(!is_xmr_dispatch_kind(ScriptKind::RAW));
     CHECK(!is_xmr_dispatch_kind(static_cast<ScriptKind>(0x0f)));
     CHECK(!is_xmr_dispatch_kind(static_cast<ScriptKind>(0x12)));
+    // A2: the composite give_author lane identity dispatches to the XMR
+    // validator; its kind byte is pinned at 0x1F (0x12 stays fenced above).
+    static_assert(static_cast<std::uint8_t>(xmr::XMR_LANE_GA) == 0x1F, "XMR_LANE_GA kind byte moved");
+    static_assert(xmr::XMR_GA_PAYLOAD_LEN == 132, "XMR_LANE_GA payload width moved");
+    CHECK(is_xmr_dispatch_kind(xmr::XMR_LANE_GA));
 
     // (1) XMR identity_key goldens hold (SHA-256 only; sanity that the extension
     //     header is intact and the digest path serializes 64-byte payloads).

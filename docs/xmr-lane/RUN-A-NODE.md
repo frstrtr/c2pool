@@ -323,7 +323,8 @@ All launch flags live in `node.env` in the data directory, one flag per
 line, each with a comment. Replace every `<placeholder>`: the pool id
 (`--pool-genesis`), the two public relay nodes (`--relay-peer`), your
 relay port, and your MAIN payout address. `--give-author-pct 0.1` gives
-0.1% of this node's jobs to the author; set it to 0 to opt out.
+0.1% of the credit of every share this node's miners find to the author; set
+it to 0 to opt out.
 `--node-owner-fee-pct` with `--node-owner-address` is optional: it makes a
 job pay the node owner instead of the miner with that probability; it is
 never a fixed output. `--mine` stays commented out. Relative paths in
@@ -394,7 +395,7 @@ What the flags do:
 | `--data-dir <dir>` | the settlement store |
 | `--randomx` | verify RandomX proof of work |
 | `--d-conf 60` | settlement finality depth in blocks. Use the pool's value. |
-| `--fee-model v1` | the pool fee model: one donation output in every pool block. Use the pool's value. |
+| `--fee-model v1` | the pool fee model: one donation output, last, in every pool block (it may carry 0). Use the pool's value. |
 | `--relay-bind rbind` | bind each share to its payee in the proof of work. Required with `--fee-model v1` and on mainnet. |
 | `--pool-genesis <hex64>` | the pool's id. Nodes with a different id refuse each other. |
 | `--relay-listen <host:port>` | accept relay connections from other pool nodes |
@@ -403,7 +404,7 @@ What the flags do:
 | `--payout-address <addr>` | this node's own payout address. The stratum port is served only when it is set. |
 | `--share-diff <n>` | share difficulty for miners. Use the pool's value. 0 means network difficulty (solo). |
 | `--stratum-bind-host <ip>`, `--stratum-port <p>` | where miners connect (default `127.0.0.1:3333`) |
-| `--give-author-pct <p>` | percent of this node's jobs given to the author (0.1 in the package's `node.env`; 0 opts out; the binary's own default is 0) |
+| `--give-author-pct <p>` | percent of each share's credit given to the author (default 0.1 with `--fee-model v1`; 0 opts out) |
 | `--web-port <p>`, `--web-host <ip>` | the dashboard (`http://<web-host>:<web-port>/`). Off unless `--web-port` is set. |
 | `--dashboard-dir <dir>` | the dashboard files (`web-static/`). `run-node.sh` sets it for the package. |
 | `--status-every <s>` | seconds between status blocks in the log |
@@ -424,8 +425,11 @@ Optional fee flags (fee model `v1` only): `--node-owner-fee-pct <p>` with
 `--node-owner-address <addr>` makes a job pay the node owner instead of the
 miner with probability p percent. It is decided per job, never a fixed
 output, and the owner address must be a MAIN address. The owner fee defaults to 0.
-`--give-author-pct <p>` donates p percent to the author; it defaults to 0.1
-(`--give-author-pct 0` opts out).
+`--give-author-pct <p>` donates p percent of each share's credit to the
+author; it defaults to 0.1 (`--give-author-pct 0` opts out). The share
+carries the value in its proof of work, and every node splits the share's
+weight by it (p2pool's `give_author`), so it is never a separate fee. With
+every miner at 0 the donation output is still in the block, at 0 piconero.
 
 ## 7. Point a miner at it
 
@@ -539,6 +543,10 @@ the output set. Mainnet node numbers are not measured yet.
   will not follow the chain past the fork.
 - **Block withholding.** A miner can submit shares and keep a found block to
   itself. The pool cannot detect this. The same is true of every pool.
+- **Shares on a foreign template.** A relayed share whose coinbase is not the
+  canonical lane coinbase earns no credit (`coinbase-recompute.md` §6). A
+  block pays the miners of its window as of about 2 hours ago (the anchor),
+  so a new miner's first payment comes about 2 hours after it starts.
 - **Prototype.** The binary prints `EXPERIMENTAL prototype`. No release tag
   exists yet, and the output-set download is not published yet. Blocks with
   a merge-mining tag in the coinbase are handled since c2pool #1786.

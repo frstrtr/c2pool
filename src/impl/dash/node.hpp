@@ -388,14 +388,24 @@ protected:
     std::atomic<uint64_t> m_block_share_lock_forfeits{0};
 
     // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
-    // Runtime P2P accept-floor, seeded from the COLD config floor (1700, accept-all)
-    // and lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by apply_min_protocol_ratchet()
-    // once the work-weighted desired-version tally over the [9/10..10/10] window behind
-    // the best share holds >= 95% for v36. Mutated ONLY on the compute thread under the
-    // exclusive m_tracker_mutex (same sites as m_best_share_hash); it drives the LIVE
-    // m_min_protocol_gate.min_version so the handshake reception reflects the ratchet.
+    // Runtime P2P accept-floor, seeded from the per-network share profile
+    // (SharechainConfig::share_profile().ratchet_floor_protocol_version):
+    //   * public network: the COLD config floor MINIMUM_PROTOCOL_VERSION (1700,
+    //     accept-all) — the same initial value as before the profile existed —
+    //     lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by
+    //     apply_min_protocol_ratchet() once the work-weighted desired-version tally
+    //     over the [9/10..10/10] window behind the best share holds >= 95% for v36;
+    //   * private/isolated DASH v36 sharechain: 3600 from the start — the chain is
+    //     v36 from genesis, so a pre-v36 peer is refused at the handshake and the
+    //     ratchet is a latched no-op there.
+    // The profile is read when the node is CONSTRUCTED, so the identity must be set
+    // first (main_dash.cpp sets it before constructing dash::Node). Mutated ONLY on
+    // the compute thread under the exclusive m_tracker_mutex (same sites as
+    // m_best_share_hash); handle_version composes it with the operator knob
+    // (m_min_protocol_gate) by max(), so a --min-protocol below 3600 cannot lower
+    // the isolated floor.
     std::atomic<uint32_t> m_runtime_min_protocol_version{
-        SharechainConfig::MINIMUM_PROTOCOL_VERSION};
+        SharechainConfig::share_profile().ratchet_floor_protocol_version};
 
     // De-dup set for broadcast_share (hashes already relayed to peers).
     std::set<uint256> m_shared_share_hashes;

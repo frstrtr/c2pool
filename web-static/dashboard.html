@@ -1943,6 +1943,7 @@
                         <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
                     </div>
                     <div class="graph-container compact" id="hashrate-graph"></div>
+                    <div class="graph-history-note" id="hashrate-graph-note" style="display:none; font-size:12px; color: var(--text-muted); padding: 4px 8px;"></div>
                     <div class="graph-stats compact">
                         <div class="graph-stat"><div class="graph-stat-label">Current</div><div class="graph-stat-value" id="graph-current">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Average</div><div class="graph-stat-value" id="graph-average">-</div></div>
@@ -1979,6 +1980,7 @@
                 <button class="fullscreen-close" onclick="toggleGraphFullscreen()">✕ Close</button>
             </div>
             <div class="fullscreen-graph" id="fullscreen-graph"></div>
+            <div class="graph-history-note" id="fs-graph-note" style="display:none; font-size:12px; color: var(--text-muted); padding: 4px 8px;"></div>
             <div class="fullscreen-stats">
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Current</div><div class="fullscreen-stat-value" id="fs-graph-current">-</div></div>
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Average</div><div class="fullscreen-stat-value" id="fs-graph-average">-</div></div>
@@ -7567,6 +7569,7 @@
             d3.json(endpoints[currentGraphPeriod], function(data) {
                 hashrateData = data;
                 if (!data || data.length === 0) {
+                    setGraphHistoryNote('hashrate-graph-note', [], 0);
                     document.getElementById('hashrate-graph').innerHTML = 
                         '<div style="text-align:center; color: var(--text-muted); padding: 100px 0;">No data available for this period</div>';
                     return;
@@ -7858,6 +7861,32 @@
             return false;
         }
 
+        // #942: a period view ("last_day") only spans this node's recorded
+        // history. After a restart the 1D graph can cover 33 minutes, so every
+        // block found earlier in the period sits left of the x-axis and is
+        // silently dropped. Clamping those markers to the edge would misplace
+        // them in time; instead say how many are not plotted and where the
+        // recorded history begins.
+        var GRAPH_PERIOD_SECONDS = {hour: 3600, day: 86400, week: 604800, month: 2592000, year: 31536000};
+        function setGraphHistoryNote(noteId, blocks, minTime) {
+            var el = document.getElementById(noteId);
+            if (!el) return;
+            var periodStart = Date.now() - (GRAPH_PERIOD_SECONDS[currentGraphPeriod] || 0) * 1000;
+            var hidden = (blocks || []).filter(function(b) {
+                var t = b.ts * 1000;
+                return t >= periodStart && t < minTime;
+            }).length;
+            if (hidden === 0) {
+                el.style.display = 'none';
+                el.textContent = '';
+                return;
+            }
+            el.textContent = 'Graph history on this node starts ' + new Date(minTime).toLocaleString() +
+                '; ' + hidden + (hidden === 1 ? ' block' : ' blocks') + ' found earlier in this period ' +
+                (hidden === 1 ? 'is' : 'are') + ' not plotted (listed under Recent Blocks).';
+            el.style.display = '';
+        }
+
         function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('hashrate-graph');
             blocks = blocks || [];
@@ -8038,6 +8067,8 @@
                 }
             });
             
+            setGraphHistoryNote('hashrate-graph-note', blocks, minTime);
+
             // Interpolate luck trend to align with hashrate time boundaries.
             // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
             // the render wall-clock "now". luck-if-found-now =
@@ -8797,6 +8828,8 @@
                 }
             });
             
+            setGraphHistoryNote('fs-graph-note', blocks, minTime);
+
             // Interpolate luck trend to align with hashrate time boundaries.
             // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
             // the render wall-clock "now". luck-if-found-now =

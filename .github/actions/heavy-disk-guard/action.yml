@@ -13,6 +13,13 @@ inputs:
   floor-gb:
     description: Minimum free GB required on the build volume before configure.
     default: "50"
+  tmp-floor-gb:
+    description: >
+      Minimum free GB required on the filesystem holding $TMPDIR (default /tmp)
+      when that is NOT the build volume. Ignored when TMPDIR is on the build
+      volume, which the sanitizer legs arrange by exporting TMPDIR under
+      $RUNNER_TEMP before this guard runs.
+    default: "4"
   ccache-max:
     description: Cap for the shared ccache (passed to `ccache -M`).
     default: "15G"
@@ -35,6 +42,7 @@ runs:
       shell: bash
       env:
         HEAVY_DISK_FLOOR_GB: ${{ inputs.floor-gb }}
+        HEAVY_DISK_TMP_FLOOR_GB: ${{ inputs.tmp-floor-gb }}
         HEAVY_DISK_CCACHE_MAX: ${{ inputs.ccache-max }}
         HEAVY_DISK_STALE_HOURS: ${{ inputs.stale-hours }}
       run: bash "$GITHUB_ACTION_PATH/guard.sh"

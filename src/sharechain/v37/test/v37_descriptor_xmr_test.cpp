@@ -94,5 +94,46 @@ int main() {
 
     if (g_fail == 0) std::printf("ALL XMR DESCRIPTOR KATS/CHECKS GREEN\n");
     else             std::printf("%d CHECK(S) FAILED\n", g_fail);
+    // (A2) composite give_author lane identity (kind 0x1F)
+    {
+        set_xmr_descriptor_validator(&xmr::xmr_descriptor_valid);
+        xmr::set_point_check_backend(&test_point_stub);
+        const ScriptRef payee = xmr::make_xmr_std(xmr::kat::STD_KAT.p0, xmr::kat::STD_KAT.p1);
+        const ScriptRef donat = xmr::make_xmr_std(xmr::kat::STD_KAT.p1, xmr::kat::STD_KAT.p0);
+        const ScriptRef ga = xmr::make_xmr_give_author(655, payee, donat);
+        CHECK(ga.kind == xmr::XMR_LANE_GA && ga.payload.size() == xmr::XMR_GA_PAYLOAD_LEN);
+        xmr::XmrGiveAuthor g;
+        CHECK(xmr::decode_xmr_give_author(ga, g) && g.d == 655 && g.payee == payee && g.donation == donat);
+        CHECK(xmr::xmr_ga_well_formed(ga) && xmr::xmr_ga_valid(ga));
+        PayoutDescriptor d; d.pay = ga;
+        CHECK(d.valid());                                           // dispatches to the XMR validator
+        CHECK(d.identity_preimage().size() == 1 + 1 + 1 + 132);     // u8 length field holds 132
+        // refusals: d out of range, payee == donation, torsion-failing half, bad length
+        CHECK(!xmr::xmr_ga_valid(xmr::make_xmr_give_author(0, payee, donat)));
+        CHECK(!xmr::xmr_ga_valid(xmr::make_xmr_give_author(65535, payee, donat)));
+        CHECK(xmr::xmr_ga_valid(xmr::make_xmr_give_author(1, payee, donat)) && xmr::xmr_ga_valid(xmr::make_xmr_give_author(65534, payee, donat)));
+        CHECK(!xmr::xmr_ga_valid(xmr::make_xmr_give_author(655, payee, payee)));
+        ScriptRef bad = xmr::make_xmr_std(xmr::kat::TORSION_FAIL_IDENTITY, xmr::kat::STD_KAT.p1);
+        CHECK(!xmr::xmr_ga_valid(xmr::make_xmr_give_author(655, bad, donat)));
+        ScriptRef shortp = ga; shortp.payload.pop_back();
+        CHECK(!xmr::decode_xmr_give_author(shortp, g));
+        // never an attribution or aux target; refused BEFORE delegating (no recursion)
+        PayoutDescriptor at; at.pay = payee; at.attribution = ga;
+        CHECK(!at.valid(true));
+        PayoutDescriptor ax; ax.pay = payee; ax.aux.push_back(AuxEntry{1, ga});
+        CHECK(!ax.valid());
+        PayoutDescriptor gx; gx.pay = ga; gx.aux.push_back(AuxEntry{1, payee});
+        CHECK(!gx.valid());
+        // the split: donation = floor(W*d/65535), payee = W - donation, exact at 2^255
+        auto s1 = xmr::xmr_ga_split(U256::from_u128(65535), 655);
+        CHECK(s1.donation.v[0] == 655 && s1.payee.v[0] == 64880);
+        auto s2 = xmr::xmr_ga_split(U256::from_u128(1), 65534);
+        CHECK(s2.donation.is_zero() && s2.payee.v[0] == 1);           // floor: the payee keeps the remainder
+        U256 big; big.v[3] = 0x8000000000000000ull;                    // 2^255
+        auto s3 = xmr::xmr_ga_split(big, 65534);
+        CHECK(s3.payee + s3.donation == big && s3.donation < big);
+        xmr::set_point_check_backend(nullptr);
+    }
+    std::printf("%s\n", g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;
 }
