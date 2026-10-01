@@ -47,6 +47,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <cstdio>
+#include <unistd.h>
 
 #include <c2pool/v37/w4_settlement.hpp>
 #include <c2pool/v37/xmr/xmr_settle_store.hpp>
@@ -472,6 +474,31 @@ static void d8_window() {
     CHECK(ok && R.owed_digest() == DL.owed_digest() && R.drops_window() == DL.drops_window(),
           "W6 a restarted ledger replayed from the store has the same digest and window");
     CHECK(no_negative(L) && no_negative(DL), "no key negative");
+#if defined(C2POOL_XMR_DROPS_WINDOW_SPAN)
+    {   // W7 A4c: the bin span n is part of the entry: committed (V37W), stored, journalled
+        st::DropsFound sp; sp.claim = true; sp.window = {{{100, 12, X}, 70}, {{112, 0, X}, 5}};
+        st::DropsFound pt; pt.claim = true; pt.window = {{{100, X}, 70}, {{112, 0, X}, 5}};
+        st::OwedLedger Ls(kChain, rules_win()), Lp(kChain, rules_win());
+        Ls.on_block_found("s", {}, {}, c1, &sp); Ls.on_block_finalized("s", 1);
+        Lp.on_block_found("s", {}, {}, c1, &pt); Lp.on_block_finalized("s", 1);
+        CHECK(Ls.drops_window() == sp.window && !(Ls.owed_digest() == Lp.owed_digest()),
+              "W7 A4c: the span n is committed (V37W differs from the point entry)");
+        xs::SettleEvent es; es.kind = xs::SettleEvKind::Found; es.bid = "s"; es.credit = {{Z, 5}};
+        xs::set_drops(es, sp);
+        const auto bs = xs::SettleEvent::deserialize(es.serialize());
+        CHECK(xs::drops_of(bs) && xs::drops_of(bs)->window == sp.window, "W7 A4c: store schema 5 round-trips the span");
+        const std::string path = "/tmp/v37_xmr_drops_due_kat_w7." + std::to_string(::getpid());
+        std::remove(path.c_str());
+        const std::string bid(64, static_cast<char>(0x61));   // 64 x a: a block id
+        { dw::DropsCarryStore js(path); js.put_window(bid, sp.window); }
+        dw::DropsCarryStore jr(path);
+        const auto ld = jr.load();
+        CHECK(ld.malformed == 0 && jr.window(bid) == sp.window, "W7 A4c: the drops journal V line round-trips the span");
+        std::remove(path.c_str());
+    }
+#else
+    CHECK(false, "W7 A4c: no bin span on the base");
+#endif
 #else
     CHECK(false, "no DROPS window rule on the base");
 #endif

@@ -365,7 +365,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     if (!n.late)   // M13: a late joiner never saw the deposit payee's raindrop (drop_ref_of is node-local)
         for (const auto& [k, v] : r.deposit) { (void)v; if (W.universe.count(k)) n.booked[k] = W.universe.at(k); }   // BOOKED REFS: the deposit payees
     if (!n.late)   // DROPS WINDOW: the window payees, as note_booked_refs teaches the composition's payees
-        for (const auto& [ck, v] : r.window) { (void)v; if (W.universe.count(ck.second)) n.booked[ck.second] = W.universe.at(ck.second); }
+        for (const auto& [ck, v] : r.window) { (void)v; if (W.universe.count(ck.payee)) n.booked[ck.payee] = W.universe.at(ck.payee); }
 #if defined(C2POOL_XMR_RAINDROP_ENROL)
     if (!n.late)   // the late joiner keeps NO registry ref in its booked map: its recompute resolves X from the ledger alone
         for (const auto& [k, rec] : n.L.drops_enrol_registry()) n.booked[k] = rec.ref;   // A3 (a): note_booked_refs teaches the registry refs
@@ -471,7 +471,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
                 };
             if (g_drops_window && (g_due_omit.count(h) || g_due_double.count(h))) {   // M12b (window): omit / double the DROPS payees
                 std::set<::v37::bytes32> dk;
-                for (const auto& [ck, v] : bl.drops_window()) if (v > 0) dk.insert(ck.second);
+                for (const auto& [ck, v] : bl.drops_window()) if (v > 0) dk.insert(ck.payee);
                 const bool dbl = g_due_double.count(h) != 0;
                 mut = [dk, dbl](x6::CoinbaseInputs& in) {
                     auto orig = in.paynow_at;
@@ -524,7 +524,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
                     for (const auto& [k, c] : r.writeoff) run.writeoff[k] += c;
                     for (const auto& [k, c] : r.deposit) run.deposited[k] += c;
                     for (const auto& [k, e] : r.enrol_add) run.enrolled_at.emplace(k, e.first);
-                    for (const auto& [ck, w] : r.window) run.windowed[ck.second] += w;
+                    for (const auto& [ck, w] : r.window) run.windowed[ck.payee] += w;
                 }
                 if (static_cast<int>(i) == g_late_node && r.v != rc::Verdict::Canonical) {
                     ++run.late_noncanon;
@@ -914,7 +914,7 @@ void m13_raindrop_enrol() {
         const std::map<::v37::bytes32, std::uint64_t> fdb{{X.id, bins.front()}};
         const auto book = dw::lane_enrollment_ex(dw::LanePrefix{}, {}, c2pool::v37n::xmr::relay::EnrolMode::Auto, reg, fdb);
         for (const auto b : bins)   // DROPS WINDOW: each enrolled raindrop bin at its end position
-            if (book.enrolled(X.id, b)) o.win[std::make_pair(std::uint64_t{101} + b, X.id)] = 1000000ll;
+            if (book.enrolled(X.id, b)) o.win[st::DropsWindowKey(std::uint64_t{101} + b, X.id)] = 1000000ll;
         if (!reg.count(X.id)) o.add[X.id] = {bins.front() + 1, X.ref};
 #else
         (void)L;   // the base: enrolment needs a lane share; X has none -> never enrolled, nothing composed
@@ -960,7 +960,7 @@ void m13_raindrop_enrol() {
     W2.universe[X.id] = X.ref;
     g_compose = [X, &W2](const st::OwedLedger& L, std::uint64_t h) {
         EnrolOut o;
-        o.win[std::make_pair(W2.cut_at(h).next_pos, X.id)] = 1000000ll;   // DROPS WINDOW
+        o.win[st::DropsWindowKey(W2.cut_at(h).next_pos, X.id)] = 1000000ll;   // DROPS WINDOW
 #if defined(C2POOL_XMR_RAINDROP_ENROL)
         if (!L.drops_enrol_registry().count(X.id)) o.add[X.id] = {1, X.ref};   // X's first raindrop at bin 0
 #else

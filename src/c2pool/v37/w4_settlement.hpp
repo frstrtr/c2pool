@@ -1057,11 +1057,39 @@ struct DropsEnrolRec {
 using DropsEnrolRegistry = std::map<bytes32, DropsEnrolRec>;
 #define C2POOL_XMR_RAINDROP_ENROL 1   // the A3 registry API is present (KATs test for it)
 
-// DROPS WINDOW (A4b): window entries, (c, payee) -> signed sub-threshold work
-// in the estimator's unit. c is the bin's END position on the lane prefix (the
-// number of receipts at or below the bin), so at a cut with next_pos N the
-// entry is N - c positions old: the age of the bin's last share.
-using DropsWindow = std::map<std::pair<u64, bytes32>, long long>;
+// DROPS WINDOW (A4b): window entries, (c, n, payee) -> signed sub-threshold
+// work in the estimator's unit. c is the bin's END position on the lane prefix
+// (the number of receipts at or below the bin), so at a cut with next_pos N the
+// bin's last slot is N - c positions old: the age of the bin's last share.
+// A4c (ruling 2026-10-01: withholding a share never pays): n is the number of
+// the bin's receipts on the prefix (its slots are the n positions up to c), and
+// the entry weighs the MEAN of lambda^age over those n slots
+// (drops_window_weights), which is what a share of the same work weighs at a
+// slot of its bin: the same work weighs the same as a share or as raindrops.
+// n == 0 (a bin without a receipt) weighs at c.
+struct DropsWindowKey {
+    u64     c = 0;
+    u64     n = 0;
+    bytes32 payee{};
+    DropsWindowKey() = default;
+    DropsWindowKey(u64 c_, const bytes32& k) : c(c_), payee(k) {}
+    DropsWindowKey(u64 c_, u64 n_, const bytes32& k) : c(c_), n(n_), payee(k) {}
+    bool operator<(const DropsWindowKey& o) const {
+        if (c != o.c) return c < o.c;
+        if (n != o.n) return n < o.n;
+        return payee < o.payee;
+    }
+    bool operator==(const DropsWindowKey& o) const { return c == o.c && n == o.n && payee == o.payee; }
+};
+using DropsWindow = std::map<DropsWindowKey, long long>;
+#define C2POOL_XMR_DROPS_WINDOW_SPAN 1   // A4c: entries carry the bin span (KATs test for it)
+
+// A bin on the lane prefix: its end position c and its receipt count n
+// (subthreshold_window's pos_of returns it).
+struct DropsBinSpan {
+    u64 c = 0;
+    u64 n = 0;
+};
 
 struct DropsFound {
     std::map<bytes32, long long> deposit;
@@ -1078,13 +1106,15 @@ struct DropsFound {
 };
 
 // The canonical bytes of window entries (the V37W section and the FOUND leaf):
-// u64 n, then per entry u64 c || key(32) || i64 work, (c, key) ascending.
+// u64 count, then per entry u64 c || u64 n || key(32) || i64 work, (c, n, key)
+// ascending.
 inline void put_drops_window(std::vector<std::uint8_t>& b, const DropsWindow& w) {
     const std::uint64_t n = w.size();
     for (int i = 0; i < 8; ++i) b.push_back((n >> (8 * i)) & 0xff);
     for (const auto& [ck, v] : w) {
-        for (int i = 0; i < 8; ++i) b.push_back((ck.first >> (8 * i)) & 0xff);
-        b.insert(b.end(), ck.second.begin(), ck.second.end());
+        for (int i = 0; i < 8; ++i) b.push_back((ck.c >> (8 * i)) & 0xff);
+        for (int i = 0; i < 8; ++i) b.push_back((ck.n >> (8 * i)) & 0xff);
+        b.insert(b.end(), ck.payee.begin(), ck.payee.end());
         const std::uint64_t uv = static_cast<std::uint64_t>(v);
         for (int i = 0; i < 8; ++i) b.push_back((uv >> (8 * i)) & 0xff);
     }
@@ -1107,20 +1137,32 @@ private:
     ::v37::DecayTables m_tab;
 };
 
+// A4c: the decay of an entry whose bin's last slot is `a0` positions old and
+// which spans n slots (ages a0 .. a0 + n - 1): the MEAN of lambda^age over the
+// slots, a slot at or beyond the window weighing zero exactly like a share
+// there. floor(SUM / n), integer only; n == 0 => lambda^a0 (the entry at c).
+inline u64 drops_window_mean_decay(const DropsWindowDecay& dec, u64 a0, u64 n, u64 W) {
+    if (n == 0) return dec.at(a0);
+    ::v37::u128 sum = 0;
+    for (u64 i = 0; i < n && a0 + i < W; ++i) sum += dec.at(a0 + i);
+    return static_cast<u64>(sum / n);
+}
+
 // Per payee, the window weight at a cut with next_pos N, split by sign:
 // (positive part, negative part), each a SUM of |work| << (62 - lz) * rw *
-// lambda^(N - c) over the entries with c <= N and N - c < W.
+// mean_{slots} lambda^age (drops_window_mean_decay) over the entries with
+// c <= N and N - c < W.
 using DropsWindowWeights = std::map<bytes32, std::pair<U256, U256>>;
 inline DropsWindowWeights drops_window_weights(const DropsWindow& w, u64 N, const DropsWindowRule& r) {
     DropsWindowWeights out;
     if (!r.on() || w.empty()) return out;
     const DropsWindowDecay dec(r);
     for (const auto& [ck, v] : w) {
-        if (v == 0 || ck.first > N || N - ck.first >= r.window) continue;
+        if (v == 0 || ck.c > N || N - ck.c >= r.window) continue;
         const u64 mag = v < 0 ? (v == std::numeric_limits<long long>::min() ? (u64(1) << 63) : u64(-v)) : u64(v);
         U256 x = U256::from_u128(static_cast<::v37::u128>(mag) << (62 - r.work_lz)).mul_small(r.rw);
-        x = x.mul_q(dec.at(N - ck.first));
-        auto& e = out[ck.second];
+        x = x.mul_q(drops_window_mean_decay(dec, N - ck.c, ck.n, r.window));
+        auto& e = out[ck.payee];
         if (v > 0) e.first += x; else e.second += x;
     }
     return out;
@@ -1207,8 +1249,9 @@ inline void apply_drops_due(std::map<bytes32, long long>& credit,
 // ★ DROPS WINDOW (A4b): the SAME composition as subthreshold_credit, the same
 // rows, the same enrolment and the same per-(payee, interval) dedup, but in
 // WORK, not coin: each credited (payee, bin) row books est - covered (the
-// Count REPLACE delta, signed, saturated into i64) at the bin's end position
-// c = pos_of(bin) on the lane prefix. Nothing is priced here: the window
+// Count REPLACE delta, signed, saturated into i64) at the bin's span on the
+// lane prefix, pos_of(bin) = DropsBinSpan{end position c, receipts n} (A4c:
+// the entry weighs the mean over the bin's slots). Nothing is priced here: the window
 // prices it in every lane block that holds it (drops_window_merge). Gate OFF
 // => EMPTY.
 template <class PosOf>
@@ -1236,7 +1279,8 @@ inline DropsWindow subthreshold_window(const ::v37::LaneParams& params,
         if (w.est.ge(w.covered)) { subthreshold::u320 d = w.est; d.sub(w.covered); v = static_cast<long long>(low_i64(d)); }
         else { subthreshold::u320 d = w.covered; d.sub(w.est); v = -static_cast<long long>(low_i64(d)); }
         if (v == 0) continue;
-        const auto ck = std::make_pair(static_cast<u64>(pos_of(hr.interval)), hr.payee);
+        const DropsBinSpan sp_of = pos_of(hr.interval);
+        const DropsWindowKey ck(sp_of.c, sp_of.n, hr.payee);
         const long long e = drops_sat_add(out.count(ck) ? out.at(ck) : 0, v);
         if (e == 0) out.erase(ck); else out[ck] = e;
     }
@@ -1461,7 +1505,7 @@ public:
             for (const auto& [ck, v] : it->second.window) m_dwin[ck] = drops_sat_add(m_dwin[ck], v);
             const u64 N = m_anchor ? m_anchor->next_pos : 0;
             for (auto d = m_dwin.begin(); d != m_dwin.end();)
-                d = (d->second == 0 || (d->first.first <= N && N - d->first.first >= m_rules.drops_window.window))
+                d = (d->second == 0 || (d->first.c <= N && N - d->first.c >= m_rules.drops_window.window))
                         ? m_dwin.erase(d) : std::next(d);
         }
         m_pending.erase(it);

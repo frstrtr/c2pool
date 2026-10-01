@@ -2568,13 +2568,16 @@ static int run_live(const XmrNodeConfig& cfg) {
         c2pool::v37n::settle::DropsCompose dctx;
         dctx.price = c2pool::v37n::xmr::drops::rescale_price(price, drops->receipt_weight());
         dctx.enrollment = &out.lc.book;
-        out.carry = c2pool::v37n::xmr::drops::compose_carry(cfg.lane_params, out.lc.rows, dctx);
+        // A4c: under the window rule no one-shot coin delta is booked, so none is
+        // composed or carried (the carry is the book digest alone); rule off: as before.
+        out.carry = c2pool::v37n::xmr::drops::compose_carry_ruled(cfg.lane_params, out.lc.rows, dctx,
+                                                                  L.rules().drops_window.on());
         if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))   // ★ d5: split by give-author, like the receipts
             c2pool::v37n::xmr::drops::split_give_author(out.carry.delta, *lp,
                 c2pool::v37n::xmr::fee::donation_identity(donation_net_of(cfg.network)));
-        // ★ DROPS WINDOW (A4b): the SAME rows in work, each at its bin's end
-        // position on the prefix: what the booking books (the delta above stays
-        // the wire witness only). Rule off: empty.
+        // ★ DROPS WINDOW (A4b): the SAME rows in work, each at its bin
+        // span on the prefix (A4c: end c and its n receipts): what the booking
+        // books (under the rule the carry above holds no delta). Rule off: empty.
         out.window.clear();
         if (L.rules().drops_window.on()) {
             const c2pool::v37n::xmr::drops::LaneBinEnd pos_of(*lp);

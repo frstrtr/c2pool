@@ -214,8 +214,9 @@ struct SettleEvent {
         if (win) {   // schema 5
             store_codec::put_u64(s, drops_window.size());
             for (const auto& [ck, v] : drops_window) {
-                store_codec::put_u64(s, ck.first);
-                s.append(reinterpret_cast<const char*>(ck.second.data()), ck.second.size());
+                store_codec::put_u64(s, ck.c);
+                store_codec::put_u64(s, ck.n);   // A4c: the bin span
+                s.append(reinterpret_cast<const char*>(ck.payee.data()), ck.payee.size());
                 store_codec::put_u64(s, static_cast<std::uint64_t>(v));
             }
         }
@@ -260,8 +261,9 @@ struct SettleEvent {
             const std::uint64_t n = r.u64();
             for (std::uint64_t i = 0; i < n; ++i) {
                 const std::uint64_t c = r.u64();
+                const std::uint64_t nb = r.u64();   // A4c: the bin span
                 const ::v37::bytes32 k = r.b32();
-                e.drops_window[std::make_pair(c, k)] = static_cast<long long>(r.u64());
+                e.drops_window[::c2pool::v37n::settle::DropsWindowKey(c, nb, k)] = static_cast<long long>(r.u64());
             }
         }
         r.expect_end();

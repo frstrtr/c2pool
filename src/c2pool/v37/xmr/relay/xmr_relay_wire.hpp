@@ -562,7 +562,7 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
         if (theirs.enrol_set != ours.enrol_set && our_rule != their_rule)
             return std::string(kDropsRuleMismatch) + " drops rule ours=" + drops_rule_label(our_rule) +
                    " theirs=" + drops_rule_label(their_rule) +
-                   " (flag day: every node of a pool must run the same DROPS due / raindrop-enrol rules)";
+                   " (flag day: every node of a pool must run the same DROPS due / raindrop-enrol / window rules)";
         if (theirs.enrol_set != ours.enrol_set)
             return std::string(kEnrolSetMismatch) + " enrol-set digest differs: ours=" +
                    (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +

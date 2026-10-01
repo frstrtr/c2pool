@@ -417,6 +417,9 @@ static void re5_hello(Checker& C) {
         C(win == 7 && a.rfind(rl::kDropsRuleMismatch, 0) == 0 && b.rfind(rl::kDropsRuleMismatch, 0) == 0 &&
           a.find("window") != std::string::npos,
           "RE5 A4b: the window rule is tag 7; a tag-3 / tag-7 fleet is refused BY NAME both ways (window named)");
+        const char* flag_day = "every node of a pool must run the same DROPS due / raindrop-enrol / window rules";
+        C(a.find(flag_day) != std::string::npos && b.find(flag_day) != std::string::npos,
+          "RE5 A4c: the flag-day text names the window rule too (both ways)");
     }
 #endif
     rl::Hello list_other = hello_with(dx::enrol_mode_digest(rl::EnrolMode::List, {b32_of(1)}, full), 5);

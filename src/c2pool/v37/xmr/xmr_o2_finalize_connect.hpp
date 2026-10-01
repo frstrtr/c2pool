@@ -2560,12 +2560,13 @@ private:
         }
         return true;
     }
-    // DROPS WINDOW (sidecar v3 "dw="): c:key64=work[,...] (signed decimal work)
+    // DROPS WINDOW (sidecar v3 "dw="): c.n:key64=work[,...] (signed decimal work;
+    // A4c: n = the bin span)
     static std::string window_str(const ::c2pool::v37n::settle::DropsWindow& w) {
         std::string s;
         for (const auto& [ck, v] : w) {
             if (!s.empty()) s += ",";
-            s += std::to_string(ck.first) + ":" + hex_of(ck.second) + "=" + std::to_string(v);
+            s += std::to_string(ck.c) + "." + std::to_string(ck.n) + ":" + hex_of(ck.payee) + "=" + std::to_string(v);
         }
         return s.empty() ? std::string("-") : s;
     }
@@ -2580,8 +2581,11 @@ private:
             if (colon == std::string::npos || item.size() < colon + 1 + 64 + 2 || item[colon + 1 + 64] != '=') return false;
             ::v37::bytes32 k{};
             if (!hash_from_hex(lower_hex(item.substr(colon + 1, 64)), k)) return false;
+            const std::size_t dot = item.find('.');
+            if (dot == std::string::npos || dot == 0 || dot + 1 >= colon) return false;
             try {
-                out[std::make_pair(static_cast<std::uint64_t>(std::stoull(item.substr(0, colon))), k)] =
+                out[::c2pool::v37n::settle::DropsWindowKey(static_cast<std::uint64_t>(std::stoull(item.substr(0, dot))),
+                                                           static_cast<std::uint64_t>(std::stoull(item.substr(dot + 1, colon - dot - 1))), k)] =
                     std::stoll(item.substr(colon + 1 + 64 + 1));
             } catch (...) { return false; }
             p = c + 1;
