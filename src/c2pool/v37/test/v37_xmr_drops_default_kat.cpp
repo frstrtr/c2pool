@@ -96,9 +96,12 @@ int main() {
           "DD1 a lane without the gate still builds nothing (fail-closed)");
 
     std::printf("-- DD2 HELLO refuses a raindrops-OFF node by name\n");
-    check(rl::kXmrPoolRulesVersion == rl::kXmrPoolRulesVersionDropsOn && rl::kXmrPoolRulesVersion == 3,
-          "DD2 this XMR build HELLOs pool rules v3");
-    check(rl::node_pool_id(7, cfg.lane_params) == rl::pool_id_of(7, cfg.lane_params, 3), "DD2 node_pool_id folds v3");
+    // DROPS-SET-PIN: pool rules v4 (the winner's pinned raindrop set); v3 = DROPS on with a node-local set
+    check(rl::kXmrPoolRulesVersion == rl::kXmrPoolRulesVersionDropsOn && rl::kXmrPoolRulesVersion == 4,
+          "DD2 this XMR build HELLOs pool rules v4");
+    check(rl::node_pool_id(7, cfg.lane_params) == rl::pool_id_of(7, cfg.lane_params, 4), "DD2 node_pool_id folds v4");
+    check(rl::pool_rules_reason(4, 3).find("node-local raindrop set") != std::string::npos,
+          "DD2 a v3 (pre DROPS-SET-PIN) peer is refused by name");
     const rl::Hello ours = hello_of(cfg.lane_params, rl::kXmrPoolRulesVersion, 1);
     const rl::Hello ours2 = hello_of(cfg.lane_params, rl::kXmrPoolRulesVersion, 2);
     const rl::Hello old = hello_of(::v37::LaneParams{}, rl::kXmrPoolRulesVersionDropsOff, 3);   // the pre-default XMR HELLO

@@ -89,7 +89,8 @@ public:
                                                  const std::vector<Push>& own, const std::vector<Push>& served,
                                                  Base* used = nullptr,
                                                  const std::optional<bytes32>& want_a0 = std::nullopt,
-                                                 const std::optional<bytes32>& own_a0 = std::nullopt) {
+                                                 const std::optional<bytes32>& own_a0 = std::nullopt,
+                                                 std::pair<std::uint64_t, bytes32>* shadow_end = nullptr) {
         if (used) *used = kNone;
         const auto skip = [&](const std::optional<bytes32>& have) { return a0 && want_a0 && have && *have != *want_a0; };
         auto adopt = [&](std::vector<Push>&& all, std::map<std::uint64_t, bytes32>&& digs, int from) {
@@ -122,6 +123,10 @@ public:
             if (skip(have)) continue;
             std::vector<Push> all; std::map<std::uint64_t, bytes32> digs;
             if (auto rv = run(chain, lp, P, spine, sh.pushes, a0, served, all, digs)) {
+                if (shadow_end) {   // ★ DROPS-CARRY-SUFFIX: WHICH shadow's [0, a0) reached the spine (its end)
+                    const auto e = sh.dig.find(sh.pushes.size());
+                    *shadow_end = {sh.pushes.size(), e == sh.dig.end() ? bytes32{} : e->second};
+                }
                 adopt(std::move(all), std::move(digs), static_cast<int>(i));
                 if (used) *used = kShadow;
                 return rv;

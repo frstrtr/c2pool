@@ -616,6 +616,17 @@ inline uint256 compute_ref_hash(const core::CoinParams& params,
     return check_merkle_link(Hash(sp), ref_merkle_link);
 }
 
+// v36 get_ref_hash (private/isolated DASH v36 sharechain; dormant until the
+// v36 producer lands). The carrier is the DashV36Share being minted; its
+// m_ref_merkle_link is empty by construction (data.py:285). Delegates to the
+// verifier's ONE v36 ref-stream builder (share_check.hpp
+// compute_v36_ref_hash / serialize_v36_ref_share_info), so producer and
+// verifier commit to the same bytes by construction.
+inline uint256 compute_ref_hash(const core::CoinParams& params, const DashV36Share& carrier)
+{
+    return compute_v36_ref_hash(params, carrier);
+}
+
 // ── gentx byte assembly (data.py:187-268 + dash/data.py tx_type) ─────────────
 
 struct GentxResult
@@ -781,8 +792,11 @@ inline GentxResult build_gentx(const ProspectiveShareInfo& info,
 // Inverse of dash::check_hash_link: captures the SHA256 midstate after the
 // gentx prefix so a submitted solve folds into the gentx txid. Mirrors
 // dgb::prefix_to_hash_link (share_check.hpp) on the dash HashLinkType.
-inline HashLinkType prefix_to_hash_link(const std::vector<unsigned char>& prefix,
-                                        const std::vector<unsigned char>& const_ending)
+// LinkT selects the output link type: HashLinkType (v16, the default — every
+// existing caller) or v36::V36HashLinkType (same members, v36 share).
+template <typename LinkT = HashLinkType>
+inline LinkT prefix_to_hash_link(const std::vector<unsigned char>& prefix,
+                                 const std::vector<unsigned char>& const_ending)
 {
     // Oracle asserts prefix.endswith(const_ending) — a producer bug otherwise.
     if (prefix.size() < const_ending.size() ||
@@ -792,7 +806,7 @@ inline HashLinkType prefix_to_hash_link(const std::vector<unsigned char>& prefix
     CSHA256 hasher;
     hasher.Write(prefix.data(), prefix.size());
 
-    HashLinkType out;
+    LinkT out;
     out.m_state.m_data.resize(32);
     for (int i = 0; i < 8; ++i)
         WriteBE32(out.m_state.m_data.data() + i * 4, hasher.s[i]);

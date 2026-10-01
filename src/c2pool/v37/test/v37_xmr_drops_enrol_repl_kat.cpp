@@ -299,8 +299,8 @@ int main() {
         // A4c: under the window rule the carry is composed by compose_carry_ruled (digest only)
         check((sh.find("compose_carry(cfg.lane_params, out.lc.rows, dctx)") != std::string::npos ||
                sh.find("compose_carry_ruled(cfg.lane_params, out.lc.rows, dctx,") != std::string::npos) &&
-              sh.find("bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest}") != std::string::npos,
-              "the own win carries its lane composition (FB_BLOCK_WON v0x02)");
+              sh.find("bw.drops = relay::BlockWon::Drops{carry.delta, carry.enrollment_digest") != std::string::npos,
+              "the own win carries its lane composition (FB_BLOCK_WON v0x02; v0x03 + the pinned set since DROPS-SET-PIN)");
 #else
         check(sh.find("drops->set_carried(wit->second.drops->delta)") != std::string::npos,
               "★ the booking callback books the WINNER's carried delta (never this node's own book)");

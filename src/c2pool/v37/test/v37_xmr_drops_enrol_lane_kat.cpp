@@ -286,7 +286,7 @@ int main() {
         const std::string sh = slurp(V37_XMR_SHELL_SRC);
         C(!sh.empty(), "EL7 shell source readable");
         const auto bk = sh.find("fo.book_from_chain_ex = [&]");
-        const auto cl = sh.find("if (!drops_compose_lane(h, bid, bk, booking_price, why, drops_lane)) return false;");
+        const auto cl = sh.find("if (!drops_compose_lane(h, bid, bk, booking_price, why, drops_lane,");   // + DROPS-SET-PIN's set
         const auto tk = sh.find("if (!drops_take_carry(h, bid, bk, why, true, drops_lane)) return false;");
         C(bk != std::string::npos && cl != std::string::npos && tk != std::string::npos && bk < cl && cl < tk,
           "EL7 ★ every lane block is composed from the lane prefix BEFORE the carried-delta check");
