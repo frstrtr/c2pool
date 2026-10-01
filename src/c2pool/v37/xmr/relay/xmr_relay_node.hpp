@@ -170,7 +170,11 @@
 #include <utility>
 #include <vector>
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <c2pool/v37/carrier_net.hpp>
+#include <sharechain/v37/v37_hash.hpp>   // DROPS-HARDEN: the persisted store trailer (sha256d)
 #include <c2pool/v37/carrier_supply.hpp>
 #include <c2pool/v37/frame_vault.hpp>
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
@@ -194,6 +198,10 @@
 // DROPS-VERIFY-SCALE: RelayOptions::verify_threads workers, XmrRelayNode::verify_worker(),
 // RelayStats::verify_threads / rx_unavail_parked (an rx-unavailable item is parked once).
 #define C2POOL_XMR_RELAY_VERIFY_POOL 1
+// DROPS-HARDEN: drops_fetch_ids bounded per id (drops_fetch_max_asks, then
+// drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
+// (drops_persist_path, drops_persist(), drops_load()).
+#define C2POOL_XMR_DROPS_HARDEN 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -360,11 +368,26 @@ struct RelayOptions {
     u32         drops_inv_retry_ms = 2000;                   // re-ask an unanswered inventory after this
     u32         drops_fetch_retry_ms = 2000;                 // re-ask still-missing ids after this
     u32         drops_fetch_max_asks = 8;                    // asks of one peer for its missing ids before it is set aside
+    // ★ DROPS-HARDEN (d1): a pinned id still missing after drops_fetch_max_asks
+    // asks is re-asked no more often than this (never forever at the fast rate)
+    u32         drops_fetch_slow_ms = 60000;
+    // ★ DROPS-HARDEN (d4): the servable raindrop store survives a restart
+    // (<settle_db>/lane<N>.drops: versioned, sha256d trailer, tmp + fsync +
+    // rename, bounded by drops_retain_bins / drops_store_max). "" = in-memory
+    // only (the library default: every pre-harden KAT unchanged).
+    std::string drops_persist_path;
+    u32         drops_persist_ms = 2000;                     // snapshot a changed store at most this often
     // RELAY-LIVENESS: PING every ready link this often (0 = keepalive OFF: no
     // PING sent or answered, no silence timeout); drop + redial a link whose
     // keepalive-speaking peer sent nothing for silence_timeout_ms (0 = never).
     u32         keepalive_ms = 5000;
     u32         silence_timeout_ms = 25000;
+    // RELAY-SEND-QUEUE: every send is queued per connection and written by that
+    // connection's own writer thread (carrier_net.hpp), so no reader, verify
+    // worker, maintenance tick or stratum path ever blocks on a peer's socket.
+    // A peer whose queue would exceed this many bytes is dropped (not the node
+    // stalled). 0 = the legacy synchronous send path.
+    std::size_t send_queue_bytes = 16u << 20;
     // RELAY-DISCOVERY (FB_GETADDR/FB_ADDR 0x4c/0x4d). OFF here (the library
     // default keeps every pre-discovery KAT byte-identical: 0x4c/0x4d are then
     // fb_unknown, nothing is asked or dialed beyond `peers`); the daemon turns
@@ -413,11 +436,19 @@ struct RelayStats {
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
+    std::atomic<u64> won_reoffer_skipped{0};   // RELAY-SEND-QUEUE: not re-offered, the peer node provably holds it
+    std::atomic<u64> won_held_confirmed{0};    // RELAY-SEND-QUEUE: re-offered frames a later PONG proved read
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
     // ★ RAIN-BACKFILL (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
     std::atomic<u64> drops_fetch_tx{0}, drops_ids_asked{0}, drops_fetchreq_rx{0}, drops_served{0}, drops_backfilled{0};
     std::atomic<u64> drops_sync_calls{0}, drops_sync_pending{0}, drops_sync_complete{0}, drops_peer_setaside{0};
+    std::atomic<u64> drops_pin_fetch_ids{0};   // ★ DROPS-SET-PIN: set members asked for by id
+    // ★ DROPS-HARDEN: pinned ids past drops_fetch_max_asks (slow re-ask), pruned
+    // ask entries; the persisted store (snapshots written / failed, entries loaded)
+    std::atomic<u64> drops_pin_capped{0}, drops_pin_slow_asks{0}, drops_pin_pruned{0};
+    std::atomic<u64> drops_pin_local{0};   // members handed to the harvest from this node's own store
+    std::atomic<u64> drops_persist_writes{0}, drops_persist_fail{0}, drops_persist_loaded{0};
     // REPAIR-HORIZON: BELOW_HORIZON answers that raised a repair's start and
     // re-asked (instead of setting the peer aside); prefix probes whose digest
     // at a0 matched ours / was unknown there; peers proven DEEP (divergence
@@ -552,6 +583,7 @@ public:
         });
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
         m_net.set_log([this](const std::string& s) { log("relay: " + s); });
+        m_net.set_send_queue(m_o.send_queue_bytes);   // RELAY-SEND-QUEUE (0 = synchronous, legacy)
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -611,6 +643,7 @@ public:
         if (m_maint_thread.joinable()) m_maint_thread.join();
         m_net.stop();
         if (m_o.discovery) save_book(true);   // RELAY-DISCOVERY: the book survives the restart
+        drops_persist();                      // ★ DROPS-HARDEN (d4): the raindrop store too
     }
 
     // DROPS-VERIFY-SCALE: the calling verify worker's index in [0, verify_threads)
@@ -651,7 +684,7 @@ public:
         a.own = true; a.drop = true;
         if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
         m_st.drops_own++;
-        drop_store_put(a.id, a.bin, a.raw);   // ★ RAIN-BACKFILL: servable
+        drop_store_put(a.id, a.bin, a.raw, a.pow);   // ★ RAIN-BACKFILL: servable
         flood(a.raw, 0);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
@@ -730,6 +763,101 @@ public:
         } else m_st.drops_sync_complete++;
         return out;
     }
+    // ── ★ DROPS-SET-PIN: fetch the named raindrops (a carried set's members this
+    // node's harvest does not hold). Main thread. Asks `hint` (the peer the
+    // frame came from: the winner holds every member by construction) first,
+    // then every ready peer after drops_fetch_retry_ms; an id is re-asked no
+    // more often than that. An id seen here (dedup set) but asked for anyway is
+    // forgotten first, so the served copy is admitted (the caller's harvest
+    // lacks it). Answers are admitted through admit_drop (PoW + ctx verified).
+    // Returns the number of fetch frames sent. Gate OFF: nothing.
+    // [lo, hi) = the block's range (FB_GETDROPS carries a non-empty range; a
+    // by-id fetch is served by id whatever it says).
+    std::size_t drops_fetch_ids(const std::vector<bytes32>& ids, PeerId hint, u64 lo, u64 hi) {
+        if (!m_o.drops_floor_diff || ids.empty()) return 0;
+        if (hi <= lo) hi = lo + 1;
+        if (hi - lo > kDropsMaxSpan) lo = hi - kDropsMaxSpan;
+        const auto now = Clock::now();
+        const auto retry = std::chrono::milliseconds(m_o.drops_fetch_retry_ms);
+        std::vector<bytes32> first, again;
+        std::vector<Admitted> local;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            // ★ DROPS-HARDEN (d1): at most drops_fetch_max_asks fast asks per id
+            // (each reaching every ready peer at most once), then one slow
+            // re-ask per drops_fetch_slow_ms -- an unservable set never keeps
+            // the fast rate forever. An entry leaves m_pin_asked when its id is
+            // admitted (admit_drop) or the caller forgets it (drops_pin_forget).
+            const auto slow = std::chrono::milliseconds(m_o.drops_fetch_slow_ms);
+            for (const auto& id : ids) {
+                auto it = m_pin_asked.find(id);
+                if (it == m_pin_asked.end()) { m_pin_asked.emplace(id, std::make_pair(now, 1u)); first.push_back(id); continue; }
+                const bool capped = it->second.second >= m_o.drops_fetch_max_asks;
+                if (now - it->second.first < (capped ? slow : retry)) continue;
+                if (capped) m_st.drops_pin_slow_asks++;
+                else if (it->second.second + 1 == m_o.drops_fetch_max_asks) m_st.drops_pin_capped++;
+                it->second.first = now; ++it->second.second;
+                again.push_back(id);
+            }
+            for (const auto& id : ids) m_drop_want[id] = now;   // the answer is SOLICITED (a deferred ctx is waited for)
+            // ★ DROPS-HARDEN (d4): a member this node's STORE holds (e.g. reloaded
+            // from lane<N>.drops after a restart) but its harvest lacks is handed
+            // to the harvest from the store (verified when first admitted), never
+            // asked of a peer -- a restarted winner serves its own members.
+            for (auto* v : {&first, &again}) {
+                std::vector<bytes32> rest;
+                for (const auto& id : *v) {
+                    const auto bi = m_drop_store_id.find(id);
+                    const auto pi = m_drop_pow.find(id);
+                    const auto si = bi == m_drop_store_id.end() ? m_drop_store.end() : m_drop_store.find(bi->second);
+                    Admitted a;
+                    if (pi == m_drop_pow.end() || si == m_drop_store.end() || !si->second.count(id) ||
+                        !decode_fb_receipt(si->second.at(id), a.r)) { rest.push_back(id); continue; }
+                    a.id = id; a.raw = si->second.at(id); a.bin = bi->second; a.drop = true; a.pow = pi->second;
+                    local.push_back(std::move(a));
+                    m_pin_asked.erase(id);
+                }
+                v->swap(rest);
+            }
+        }
+        if (!local.empty()) {
+            m_st.drops_pin_local += local.size();
+            std::lock_guard<std::mutex> lk(m_amtx);
+            for (auto& a : local) m_drops.push_back(std::move(a));
+        }
+        if (first.empty() && again.empty()) return 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);   // forget the dedup entry: the caller does not hold its bytes
+            for (const auto* v : {&first, &again})
+                for (const auto& id : *v) m_drop_seen.erase(id);
+        }
+        const auto peers = ready_peers();
+        const bool hint_ready = hint && std::find(peers.begin(), peers.end(), hint) != peers.end();
+        std::size_t sent = 0;
+        auto ask = [&](PeerId p, const std::vector<bytes32>& v) {
+            const u64 before = m_st.drops_fetch_tx.load();
+            send_drop_fetch(p, lo, hi, v);
+            sent += m_st.drops_fetch_tx.load() - before;
+        };
+        if (!first.empty()) {
+            if (hint_ready) ask(hint, first);
+            else for (PeerId p : peers) ask(p, first);
+        }
+        if (!again.empty()) for (PeerId p : peers) ask(p, again);
+        m_st.drops_pin_fetch_ids += first.size() + again.size();
+        return sent;
+    }
+    // the ids a set fetch asked for that are not admitted yet (diagnostic)
+    std::size_t drops_pin_asked() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_pin_asked.size(); }
+    // ★ DROPS-HARDEN (d1): the caller no longer wants these ids (the set is
+    // complete, or its block left the pending set): drop their ask state.
+    std::size_t drops_pin_forget(const std::vector<bytes32>& ids) {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        std::size_t n = 0;
+        for (const auto& id : ids) n += m_pin_asked.erase(id);
+        m_st.drops_pin_pruned += n;
+        return n;
+    }
     std::size_t drops_store_size() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_store_id.size(); }
     // The raindrop ids this node holds (servable) for [lo, hi), sorted (diagnostic / KAT).
     std::vector<bytes32> drops_held(u64 lo, u64 hi) const {
@@ -739,6 +867,18 @@ public:
             for (const auto& [id, raw] : it->second) { (void)raw; v.push_back(id); }
         std::sort(v.begin(), v.end());
         return v;
+    }
+    // RELAY-SEND-QUEUE diagnostics (one line; the smoke greps it).
+    std::string describe_sendq() const {
+        char b[400];
+        std::snprintf(b, sizeof b,
+            "relay-sendq: bound=%zu hwm=%zu full_drops=%llu slow_drops=%llu frames=%llu max_wait_ms=%llu | won reoffered=%llu skipped=%llu confirmed=%llu",
+            m_net.send_queue_limit(), m_net.queued_bytes_hwm(),
+            (unsigned long long)m_net.peers_dropped_queue_full(), (unsigned long long)m_net.peers_dropped_slow(),
+            (unsigned long long)m_net.async_frames_written(), (unsigned long long)m_net.async_max_wait_ms(),
+            (unsigned long long)m_st.won_reoffered.load(), (unsigned long long)m_st.won_reoffer_skipped.load(),
+            (unsigned long long)m_st.won_held_confirmed.load());
+        return b;
     }
     std::string describe_drops() const {
         const auto& s = m_st;
@@ -838,6 +978,11 @@ public:
         m_deep_walkers.erase(it);
         return fresh;
     }
+    // ★ DROPS-CARRY-LIVE: our own lane order over [a, p) from the durable order
+    // (pos_first, id); false = deep order off / not readable there.
+    bool own_order_ids(u64 a, u64 p, std::vector<std::pair<u64, bytes32>>& ids) const {
+        return m_dorder.ids_between(a, p, ids);
+    }
     // REPAIR-CHAIN: the durable order's serving counters (deep pages / frames).
     DurableLaneOrder::Stats durable_order_stats() const { return m_dorder.stats(); }
     u64 durable_order_bytes() const { return m_dorder.disk_bytes(); }
@@ -878,7 +1023,7 @@ public:
         const auto f = encode_block_won(b);
         remember_won_frame(f);   // ENROL-REPL (DROPS only): re-offered to a peer that HELLOs later
         std::size_t n = 0;
-        for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) ++n;
+        for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) { ++n; if (m_o.drops_floor_diff) note_won_sent(p, b.bid); }
         m_st.block_won_tx++;
         return n;
     }
@@ -1579,6 +1724,7 @@ private:
         }
         if (m_fetch) m_fetch->forget_peer(p);
         if (m_serve) m_serve->forget_peer(p);
+        { std::lock_guard<std::mutex> lk(m_bmtx); m_won_offer.erase(p); }   // RELAY-SEND-QUEUE
         if (m_o.drops_floor_diff) {   // ★ RAIN-BACKFILL: a dropped peer's inventories say nothing any more
             std::lock_guard<std::mutex> lk(m_dsmtx);
             for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();) it = (it->first.p == p) ? m_drop_inv.erase(it) : std::next(it);
@@ -1639,7 +1785,7 @@ private:
             auto it = m_peers.find(p);
             if (it != m_peers.end()) { it->second.ka = true; it->second.unanswered = 0; }
         }
-        if (op == FB_PONG) { m_st.pong_rx++; return; }
+        if (op == FB_PONG) { m_st.pong_rx++; on_pong_won(p, nonce); return; }
         m_st.ping_rx++;
         if (m_net.send_to(p, encode_ping(FB_PONG, nonce))) m_st.pong_tx++;
     }
@@ -1837,8 +1983,10 @@ private:
         if (!decode_block_won(f, b, &why)) { m_st.malformed++; return; }
         if (b.chain_id != m_o.chain) { m_st.wrong_chain++; return; }
         bool fresh = false;
+        const u64 from_node = m_o.drops_floor_diff ? peer_node_nonce(p) : 0;   // RELAY-SEND-QUEUE
         {
             std::lock_guard<std::mutex> lk(m_bmtx);
+            note_won_held(from_node, b.bid);   // that node holds this bid: never re-offer it back
             fresh = m_seen_bids.insert(b.bid).second;
             if (fresh) {
                 m_bid_peer[b.bid] = p;
@@ -1862,7 +2010,8 @@ private:
         if (m_o.drops_floor_diff && b.drops) { std::lock_guard<std::mutex> lk(m_bmtx); m_won_wanted.erase(b.bid); }
         m_st.block_won_rx++;
         remember_won_frame(f);   // ENROL-REPL (DROPS only)
-        for (PeerId q : ready_peers()) if (q != p) m_net.send_to(q, f);   // forward once (dedup by bid)
+        for (PeerId q : ready_peers())   // forward once (dedup by bid)
+            if (q != p && m_net.send_to(q, f) && m_o.drops_floor_diff) note_won_sent(q, b.bid);   // RELAY-SEND-QUEUE
     }
 
     // ★ ENROL-REPL (DROPS, gate ON only): under the flip every node books a lane
@@ -1880,7 +2029,7 @@ private:
         while (m_won_raw.size() > kWonReofferMax) m_won_raw.pop_front();
         // ★ DROPS-RESTART: every carried (v0x02) frame this node holds is servable
         // by bid (FB_GETWON), bounded; the newest frame for a bid wins.
-        if (f.size() >= kBlockWonDropsMinBytes && f[1] == kFbBlockWonDropsVersion) {
+        if (f.size() >= kBlockWonDropsMinBytes && (f[1] == kFbBlockWonDropsVersion || f[1] == kFbBlockWonSetVersion)) {
             BlockWon b; std::string why;
             if (decode_block_won(f, b, &why)) {
                 if (!m_won_by_bid.count(b.bid)) m_won_serve_order.push_back(b.bid);
@@ -1902,11 +2051,110 @@ private:
         }
         if (m_net.send_to(p, frame)) m_st.won_served++;
     }
+    // ★ RELAY-SEND-QUEUE: the HELLO re-offer used to push EVERY kept frame (up to
+    // 64 x ~512 KiB v0x03) synchronously from the reader thread, on both ends at
+    // once -> the send-send deadlock of capstone attempt 6. Now it only builds a
+    // per-peer TODO of the bids that peer's NODE is not known to hold, and
+    // pump_won_offer() hands them to the transport's queue one frame at a time,
+    // while that peer's queued bytes are under kWonPageBytes (the maintenance
+    // tick keeps topping it up). "Known to hold" (m_won_held, by HELLO
+    // node_nonce, so it survives the redial of the same process) is PROOF only:
+    // that node sent us the frame, or a PONG for a PING queued AFTER our copy
+    // came back (TCP order + its sequential reader). Nothing on the wire changes.
+    static constexpr std::size_t kWonPageBytes = 1u << 20;
+    static bool won_frame_bid(const std::vector<u8>& f, bytes32& bid) {
+        if (f.size() < 6 + 32 || f[0] != FB_BLOCK_WON) return false;
+        std::copy(f.begin() + 6, f.begin() + 6 + 32, bid.begin());
+        return true;
+    }
+    u64 peer_node_nonce(PeerId p) const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto it = m_peers.find(p);
+        return (it != m_peers.end() && it->second.hello_ok) ? it->second.remote.node_nonce : 0;
+    }
+    void note_won_held(u64 nn, const bytes32& bid) {   // m_bmtx held by the caller
+        if (!nn) return;
+        auto& h = m_won_held[nn];
+        if (h.size() >= 4 * kWonServeMax) h.clear();   // bound: forgetting only costs a re-offer
+        h.insert(bid);
+        if (m_won_held.size() > 256) { auto v = m_won_held.begin(); if (v->first == nn) ++v; m_won_held.erase(v); }
+    }
     void reoffer_won_to(PeerId p) {
         if (m_o.drops_floor_diff == 0) return;
-        std::vector<std::vector<u8>> raws;
-        { std::lock_guard<std::mutex> lk(m_bmtx); raws.assign(m_won_raw.begin(), m_won_raw.end()); }
-        for (const auto& f : raws) if (m_net.send_to(p, f)) m_st.won_reoffered++;
+        const u64 nn = peer_node_nonce(p);
+        std::vector<std::pair<std::vector<u8>, std::optional<bytes32>>> now;   // not servable by bid (v0x01): small, sent at once
+        {
+            std::lock_guard<std::mutex> lk(m_bmtx);
+            auto& o = m_won_offer[p];
+            o.todo.clear();
+            auto hit = nn ? m_won_held.find(nn) : m_won_held.end();
+            std::set<bytes32> queued;
+            for (const auto& f : m_won_raw) {
+                bytes32 bid{};
+                if (!won_frame_bid(f, bid)) { now.emplace_back(f, std::nullopt); continue; }
+                if (hit != m_won_held.end() && hit->second.count(bid)) { m_st.won_reoffer_skipped++; continue; }
+                if (!m_won_by_bid.count(bid)) { now.emplace_back(f, bid); continue; }
+                if (queued.insert(bid).second) o.todo.push_back(bid);
+            }
+        }
+        for (const auto& [f, bid] : now) {
+            if (!m_net.send_to(p, f)) continue;
+            m_st.won_reoffered++;
+            if (bid) note_won_sent(p, *bid);
+        }
+        pump_won_offer(p);
+    }
+    void pump_won_offer(PeerId p) {
+        for (;;) {
+            if (m_net.send_queue_limit() && m_net.queued_bytes(p) >= kWonPageBytes) return;
+            std::vector<u8> f;
+            bytes32 bid{};
+            {
+                std::lock_guard<std::mutex> lk(m_bmtx);
+                auto it = m_won_offer.find(p);
+                if (it == m_won_offer.end() || it->second.todo.empty()) return;
+                bid = it->second.todo.front();
+                it->second.todo.pop_front();
+                auto w = m_won_by_bid.find(bid);
+                if (w == m_won_by_bid.end()) continue;   // evicted since: nothing to offer
+                f = w->second;
+            }
+            if (!m_net.send_to(p, f)) {   // gone (or dropped): never leave a TODO behind a link that ended
+                if (!m_net.has_peer(p)) { std::lock_guard<std::mutex> lk(m_bmtx); m_won_offer.erase(p); }
+                return;
+            }
+            m_st.won_reoffered++;
+            note_won_sent(p, bid);
+        }
+    }
+    void note_won_sent(PeerId p, const bytes32& bid) {
+        const u64 at = m_ping_nonce.load();   // read AFTER the enqueue: a PING numbered > at is queued behind it
+        std::lock_guard<std::mutex> lk(m_bmtx);
+        auto it = m_won_offer.find(p);
+        if (it != m_won_offer.end() && it->second.unconfirmed.size() < 4 * kWonReofferMax)
+            it->second.unconfirmed.emplace_back(at, bid);
+    }
+    void on_pong_won(PeerId p, u64 nonce) {
+        if (m_o.drops_floor_diff == 0) return;
+        const u64 nn = peer_node_nonce(p);
+        if (!nn) return;
+        std::lock_guard<std::mutex> lk(m_bmtx);
+        auto it = m_won_offer.find(p);
+        if (it == m_won_offer.end()) return;
+        auto& u = it->second.unconfirmed;
+        for (auto e = u.begin(); e != u.end();) {
+            if (nonce > e->first) { note_won_held(nn, e->second); m_st.won_held_confirmed++; e = u.erase(e); }
+            else ++e;
+        }
+    }
+    void pump_won_offers() {   // maintenance tick
+        if (m_o.drops_floor_diff == 0) return;
+        std::vector<PeerId> ps;
+        {
+            std::lock_guard<std::mutex> lk(m_bmtx);
+            for (const auto& [p, o] : m_won_offer) if (!o.todo.empty()) ps.push_back(p);
+        }
+        for (PeerId p : ps) pump_won_offer(p);
     }
 
     // ── receipt context: serve (queue for the daemon's monerod) / receive ────
@@ -2319,25 +2567,29 @@ private:
         a.drop = true; a.pow = pow;
         m_st.drops_foreign++;
         if (it.solicited && drop_unwant(a.id)) m_st.drops_backfilled++;   // ★ RAIN-BACKFILL
-        drop_store_put(a.id, bin, a.raw);
+        drop_store_put(a.id, bin, a.raw, a.pow);
         flood(a.raw, it.from);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
     }
 
     // ── ★ RAIN-BACKFILL: the servable raindrop store + the two frames ────────
-    void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw) {
+    void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw, const bytes32& pow) {
         std::lock_guard<std::mutex> lk(m_dsmtx);
+        if (m_pin_asked.erase(id)) m_st.drops_pin_pruned++;   // ★ DROPS-HARDEN (d1): an asked id arrived
         if (!m_drop_store_id.emplace(id, bin).second) return;
         m_drop_store[bin].emplace(id, raw);
+        m_drop_pow[id] = pow;   // ★ DROPS-HARDEN (d4): persisted with the bytes
+        m_drop_dirty = true;
         // bounded: intervals older than the retain window, then the oldest interval
         const u64 tip = m_chain.tip();
         const u64 keep_from = tip > m_o.drops_retain_bins ? tip - m_o.drops_retain_bins : 0;
         while (!m_drop_store.empty() &&
                (m_drop_store.begin()->first < keep_from || m_drop_store_id.size() > m_o.drops_store_max)) {
             if (m_drop_store.begin()->first == bin && m_drop_store.size() == 1) break;   // never evict the one just stored
-            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); }
+            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); m_drop_pow.erase(x); }
             m_drop_store.erase(m_drop_store.begin());
+            m_drop_dirty = true;
         }
     }
     // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
@@ -2415,13 +2667,125 @@ private:
         }
         if (!miss.empty()) send_drop_fetch(p, lo, hi, miss);   // fetch at once (drops_sync re-asks)
     }
+    // ── ★ DROPS-HARDEN (d4): the persisted raindrop store ───────────────────
+    // <settle_db>/lane<N>.drops = "V37DRP1\0" | chain u32 | lane_params_digest 32
+    // | n u32 | n x (id 32 | bin u64 | pow 32 | len u32 | raw) | sha256d(all before) 32.
+    // Written from the maint thread when the store changed (at most every
+    // drops_persist_ms) and at stop(): tmp + fsync + rename. The store is bounded
+    // by drops_retain_bins / drops_store_max, so is the file.
+    static constexpr u8 kDropsFileMagic[8] = {'V', '3', '7', 'D', 'R', 'P', '1', 0};
+    static constexpr std::size_t kDropsFileMaxRaw = 65536;
+    static void dput(std::vector<u8>& b, u64 v, int n) { for (int i = 0; i < n; ++i) b.push_back(static_cast<u8>(v >> (8 * i))); }
+public:
+    bool drops_persist() {
+        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return false;
+        std::vector<u8> b;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            if (!m_drop_dirty) return false;
+            b.insert(b.end(), kDropsFileMagic, kDropsFileMagic + 8);
+            dput(b, m_o.chain, 4); b.insert(b.end(), m_o.lane_params_digest.begin(), m_o.lane_params_digest.end());
+            dput(b, m_drop_store_id.size(), 4);
+            for (const auto& [bin, m] : m_drop_store)
+                for (const auto& [id, raw] : m) {
+                    const auto pi = m_drop_pow.find(id);
+                    b.insert(b.end(), id.begin(), id.end()); dput(b, bin, 8);
+                    const bytes32 pw = pi == m_drop_pow.end() ? bytes32{} : pi->second;
+                    b.insert(b.end(), pw.begin(), pw.end());
+                    dput(b, raw.size(), 4); b.insert(b.end(), raw.begin(), raw.end());
+                }
+            m_drop_dirty = false;
+            m_drop_persisted_at = Clock::now();
+        }
+        const bytes32 h = ::v37::sha256d(b);
+        b.insert(b.end(), h.begin(), h.end());
+        const std::string tmp = m_o.drops_persist_path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        bool ok = f && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        if (f) ok = (std::fclose(f) == 0) && ok;
+        ok = ok && std::rename(tmp.c_str(), m_o.drops_persist_path.c_str()) == 0;
+        if (!ok) {
+            m_st.drops_persist_fail++;
+            { std::lock_guard<std::mutex> lk(m_dsmtx); m_drop_dirty = true; }
+            log("relay: drops store persist FAILED " + m_o.drops_persist_path + ": " + std::strerror(errno));
+            return false;
+        }
+        m_st.drops_persist_writes++;
+        return true;
+    }
+    // Boot (before start()): restore the store from drops_persist_path. The
+    // restored raindrops are servable at once, count as seen, and are queued for
+    // drain_drops() so the harvest holds exactly what the store holds (as before
+    // the restart). Any mismatch (magic, chain, lane, bounds, trailer) = the file
+    // is ignored (an empty store, as before DROPS-HARDEN); *why says so.
+    std::size_t drops_load(std::string* why = nullptr) {
+        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return 0;
+        std::FILE* f = std::fopen(m_o.drops_persist_path.c_str(), "rb");
+        if (!f) { if (why) *why = "absent"; return 0; }
+        std::vector<u8> b;
+        u8 buf[65536];
+        for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) b.insert(b.end(), buf, buf + n);
+        std::fclose(f);
+        auto bad = [&](const char* w) { if (why) *why = std::string(w) + " (" + m_o.drops_persist_path + " ignored: empty store)"; return std::size_t{0}; };
+        if (b.size() < 8 + 4 + 32 + 4 + 32 || std::memcmp(b.data(), kDropsFileMagic, 8) != 0) return bad("bad magic/size");
+        const std::size_t body = b.size() - 32;
+        if (::v37::sha256d(b.data(), body) != *reinterpret_cast<const bytes32*>(b.data() + body)) return bad("trailer hash mismatch (torn/corrupt)");
+        std::size_t o = 8;
+        auto get = [&](std::size_t n, u64& v) { if (o + n > body) return false; v = 0; for (std::size_t i = n; i-- > 0;) v = (v << 8) | b[o + i]; o += n; return true; };
+        auto get32 = [&](bytes32& x) { if (o + 32 > body) return false; std::memcpy(x.data(), b.data() + o, 32); o += 32; return true; };
+        u64 chain = 0, n = 0; bytes32 tag{};
+        if (!get(4, chain) || !get32(tag) || !get(4, n)) return bad("truncated header");
+        if (chain != m_o.chain || tag != m_o.lane_params_digest) return bad("another lane (chain / lane_params_digest differ)");
+        if (n > m_o.drops_store_max) return bad("more raindrops than drops_store_max");
+        struct E { bytes32 id; u64 bin; bytes32 pow; std::vector<u8> raw; };
+        std::vector<E> v; v.reserve(static_cast<std::size_t>(n));
+        for (u64 k = 0; k < n; ++k) {
+            E e; u64 len = 0;
+            if (!get32(e.id) || !get(8, e.bin) || !get32(e.pow) || !get(4, len) || len > kDropsFileMaxRaw || o + len > body) return bad("bad raindrop record");
+            e.raw.assign(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + len)); o += len;
+            FbReceipt r;
+            if (!decode_fb_receipt(e.raw, r) || receipt_id(r) != e.id) return bad("a record whose bytes are not its id");
+            v.push_back(std::move(e));
+        }
+        if (o != body) return bad("trailing bytes");
+        std::size_t loaded = 0;
+        for (auto& e : v) {
+            if (!drop_note_new(e.id)) continue;
+            {
+                std::lock_guard<std::mutex> lk(m_dsmtx);
+                if (!m_drop_store_id.emplace(e.id, e.bin).second) continue;
+                m_drop_store[e.bin].emplace(e.id, e.raw);
+                m_drop_pow[e.id] = e.pow;
+            }
+            Admitted a;
+            decode_fb_receipt(e.raw, a.r);
+            a.id = e.id; a.raw = std::move(e.raw); a.bin = e.bin; a.drop = true; a.pow = e.pow;
+            std::lock_guard<std::mutex> lk(m_amtx);
+            m_drops.push_back(std::move(a));
+            ++loaded;
+        }
+        m_st.drops_persist_loaded += loaded;
+        if (why) why->clear();
+        return loaded;
+    }
+private:
     void drops_maint() {
+        if (!m_o.drops_persist_path.empty()) {   // ★ DROPS-HARDEN (d4)
+            bool due = false;
+            {
+                std::lock_guard<std::mutex> lk(m_dsmtx);
+                due = m_drop_dirty && Clock::now() - m_drop_persisted_at >= std::chrono::milliseconds(m_o.drops_persist_ms);
+            }
+            if (due) drops_persist();
+        }
         std::lock_guard<std::mutex> lk(m_dsmtx);
         const auto now = Clock::now();
         for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();)
             it = (now - it->second.touched > std::chrono::minutes(10)) ? m_drop_inv.erase(it) : std::next(it);
         for (auto it = m_drop_want.begin(); it != m_drop_want.end();)
             it = (now - it->second > std::chrono::minutes(10)) ? m_drop_want.erase(it) : std::next(it);
+        for (auto it = m_pin_asked.begin(); it != m_pin_asked.end();)   // ★ DROPS-SET-PIN
+            it = (now - it->second.first > std::chrono::minutes(10)) ? m_pin_asked.erase(it) : std::next(it);
     }
 
     void flood(const std::vector<u8>& raw, PeerId except) {
@@ -3330,6 +3694,7 @@ private:
             if (m_o.drops_floor_diff) drops_maint();   // ★ RAIN-BACKFILL
             drive_ctx();
             drive_liveness();   // RELAY-LIVENESS
+            pump_won_offers();  // RELAY-SEND-QUEUE: page the won re-offer into each peer's queue
             if (m_o.discovery) disc_tick();   // RELAY-DISCOVERY
         }
     }
@@ -3378,8 +3743,12 @@ private:
     mutable std::mutex m_dsmtx;
     std::map<u64, std::map<bytes32, std::vector<u8>>> m_drop_store;        // bin -> id -> raw (servable)
     std::unordered_map<bytes32, u64, Bytes32Hash> m_drop_store_id;          // id -> bin
+    std::unordered_map<bytes32, bytes32, Bytes32Hash> m_drop_pow;           // ★ DROPS-HARDEN: id -> verified RandomX hash
+    bool m_drop_dirty = false;                                               // ★ DROPS-HARDEN: store changed since the last snapshot
+    Clock::time_point m_drop_persisted_at{};
     std::map<InvKey, PeerInv> m_drop_inv;
     std::unordered_map<bytes32, Clock::time_point, Bytes32Hash> m_drop_want; // fetched ids in flight (solicited)
+    std::unordered_map<bytes32, std::pair<Clock::time_point, u32>, Bytes32Hash> m_pin_asked;   // ★ DROPS-SET-PIN: id -> (last ask, asks)
     std::atomic<bool> m_drop_had_peer{false};
 
     mutable std::mutex m_pmtx;         // peers
@@ -3388,7 +3757,7 @@ private:
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
     Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
-    u64 m_ping_nonce = 0;                           // RELAY-LIVENESS (maintenance thread only)
+    std::atomic<u64> m_ping_nonce{0};               // RELAY-LIVENESS (bumped by maintenance only; read by the won re-offer)
 
     std::mutex m_tmtx;                 // dial targets + deferred drops
     std::vector<Target> m_targets;
@@ -3413,6 +3782,11 @@ private:
     static constexpr std::size_t kWonServeMax = 1024;
     std::map<bytes32, std::vector<u8>> m_won_by_bid;   // ★ DROPS-RESTART: carried frames servable by bid (DROPS only)
     std::deque<bytes32> m_won_serve_order;
+    // RELAY-SEND-QUEUE (guarded by m_bmtx): per-link paged won re-offer, and the
+    // bids each remote NODE (HELLO node_nonce) provably holds.
+    struct WonOffer { std::deque<bytes32> todo; std::vector<std::pair<u64, bytes32>> unconfirmed; };
+    std::map<PeerId, WonOffer> m_won_offer;
+    std::map<u64, std::set<bytes32>> m_won_held;
     std::set<bytes32> m_won_wanted;                    // ★ DROPS-RESTART: bids asked for with FB_GETWON
 
     mutable std::mutex m_dmtx;         // pos -> lane digest (the spine probe)
