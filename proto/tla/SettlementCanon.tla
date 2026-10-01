@@ -31,11 +31,16 @@
 \*   4. debt first: the cash the split leaves (a waiting payee's share, or cash nobody is
 \*      credited) pays the admitted payees' positive balances the owed pass left
 \*      (owed_left), in order;
-\*   5. redistribution: what is still left, up to the waiting payees' E_b, goes to the
-\*      admitted payees pro rata and comes off the waiting payees' credit (credit_delta).
-\*      With no admitted payee the cash stays in the residual and the waiting payees'
-\*      credit is still cut, as the code does (prorata over a zero weight is zero);
-\*      WitCreditKept shows this is reachable;
+\*   5. redistribution: what is still left, up to the waiting payees' E_b, comes off the
+\*      waiting payees' credit (credit_delta) and goes, with the same amount of credit,
+\*      to the admitted payees pro rata to their E_b. When nobody is admitted (the owed
+\*      pass took every slot) it goes to the payees the owed pass paid in this block,
+\*      pro rata to what it paid them, merged into their outputs (operator ruling
+\*      2026-10-02). Cash and credit move together, so the delta sums to zero. Only a
+\*      block with no payee output at all (no slot for anyone, Cap = 0 here) moves no
+\*      cash: the waiting payees' credit still comes off and the cash stays in the
+\*      residual, because crediting work whose cash went to the donation output would be
+\*      a claim nothing backs;
 \*   6. the rest stays in the residual (the donation output).
 \* No advance: no step pays a key more than its positive balance plus its credit.
 \*
@@ -55,6 +60,7 @@ CONSTANTS
     Reward,          \* cash a lane block distributes (the exact-sum total less the fixed outputs)
     SeedMax,         \* each key's genesis balance (the seeded float) is in 0..SeedMax
     Cap,             \* payee output slots in one coinbase, owed and pay-now outputs together
+                     \* (0: no slot for any payee, the degenerate case)
     OwedCap,         \* the most keys the owed pass takes in one block
     FINALITY_DEPTH,  \* D_conf: a block finalizes once FINALITY_DEPTH later blocks are booked
     MaxChainLen,     \* model bound: lane blocks on the chain
@@ -62,12 +68,13 @@ CONSTANTS
 
 ASSUME /\ Reward \in Nat \ {0}
        /\ SeedMax \in Nat
-       /\ Cap \in Nat \ {0}
+       /\ Cap \in Nat
        /\ OwedCap \in Nat
        /\ FINALITY_DEPTH \in Nat \ {0}
        /\ MaxChainLen \in Nat
        /\ Mutation \in {"none", "foreign_credit", "authority", "advance", "debt_unbounded",
-                       "held_debit", "nogate"}
+                       "redistribute_to_nobody", "keep_credit_unbacked",
+                       "degenerate_keep_credit", "held_debit", "nogate"}
 
 VARIABLES
     chain,   \* Seq of lane blocks on the chain, oldest first (index = lane height)
@@ -172,10 +179,25 @@ Alloc(E, ord) ==
         debt   == DebtWalk(ord, 1, pool - Sum(split), need, Zero)
         spare  == pool - Sum(split) - Sum(debt)
         wait   == [ k \in Miners |-> IF adm[k] THEN 0 ELSE E[k] ]
-        moved  == Min(spare, Sum(wait))
-        plus   == Prorata(moved, tk, ord)
+        nobody == Sum(tk) = 0
+        \* Who takes the moved cash: the admitted payees by E_b, else the payees the owed
+        \* pass paid by what it paid them, else nobody (no payee output).
+        \* MUTATION "redistribute_to_nobody": the rule before the ruling: with nobody
+        \* admitted the cash goes to nobody, the waiting credit still comes off.
+        recv   == IF ~nobody THEN tk
+                  ELSE IF Mutation = "redistribute_to_nobody" THEN Zero
+                  ELSE take
+        \* MUTATION "keep_credit_unbacked": with nobody admitted nothing moves, the
+        \* waiting payees keep their credit and the cash goes to the residual.
+        \* MUTATION "degenerate_keep_credit": the same, only with no payee output at all.
+        stuck  == nobody /\ (Mutation = "keep_credit_unbacked"
+                            \/ (Mutation = "degenerate_keep_credit" /\ Sum(take) = 0))
+        moved  == IF stuck THEN 0 ELSE Min(spare, Sum(wait))
+        plus   == Prorata(moved, recv, ord)
         minus  == PaySplit(moved, wait, ord)
     IN  [ debt   |-> debt,
+          nobody |-> nobody,
+          plus   |-> plus,
           pay    |-> [ k \in Miners |-> take[k] + split[k] + debt[k] + plus[k] ],
           \* MUTATION "advance": the redistributed cash is paid but not booked as credit
           \* (the cash of a payee without a slot paid as an advance).
@@ -289,6 +311,24 @@ PaidByDebitOnly(m) == \E i \in 1..Booked : book[i].verdict = "debit" /\ chain[i]
 UnpaidKeyNeverNegative ==
     \A m \in Miners : ~PaidByDebitOnly(m) => (owed[m] >= 0 /\ EO(m) >= 0)
 
+\* The redistribution only moves credit with cash: a canonical block that has a payee
+\* output books exactly its window credit in total (credit_delta sums to zero). A block
+\* with no payee output can move no cash and books less (only reachable with Cap = 0).
+RedistributionNeutral ==
+    \A i \in 1..Booked :
+        (book[i].verdict = "canon" /\ Sum(chain[i].pay) > 0) => Sum(book[i].credit) = Sum(chain[i].E)
+
+\* Solvency: no claim without cash. Every coinbase pays all its cash out, to keys or to
+\* the residual, so a balance is backed only if some block paid its cash to a key. No
+\* booked block credits more in total than it pays to keys, so the outstanding total
+\* (finalized balances plus the pending net of booked blocks) never exceeds the genesis
+\* float. A debit-only block only lowers it.
+RECURSIVE PendNet(_)
+PendNet(j) == IF j <= fin THEN 0 ELSE Sum(book[j].credit) - Sum(chain[j].pay) + PendNet(j - 1)
+LedgerTotal == Sum(owed) + PendNet(Booked)
+LedgerWithinFloat == LedgerTotal <= Sum(seed)
+NoClaimWithoutCash == \A i \in 1..Booked : Sum(book[i].credit) <= Sum(chain[i].pay)
+
 \* One function, two callers: an honest builder's block at the booking point is booked
 \* canonical on this node, also after it was held.
 HonestIsCanonical == \A i \in 1..Booked : chain[i].honest => book[i].verdict = "canon"
@@ -332,10 +372,11 @@ WitNoHeld == \A i \in 1..Height : chain[i].view
 \* The debt-first step pays a balance (SettlementCanon_debt.cfg; an action property).
 WitNoDebtFirst ==
     [][ BookStep => LET i == Len(book') IN Sum(Alloc(chain[i].E, chain[i].ord).debt) = 0 ]_vars
-\* A canonical block books less credit in total than its window credit E: the owed pass
-\* took every slot, no payee of the window was admitted, and the cash the redistribution
-\* moved stayed in the residual while the waiting payees' credit was cut.
-WitCreditKept ==
-    \A i \in 1..Booked : book[i].verdict = "canon" => Sum(book[i].credit) = Sum(chain[i].E)
+\* Nobody is admitted and the moved cash goes to the payees the owed pass paid (an action
+\* property).
+WitNoLeftoverToOwed ==
+    [][ BookStep => LET i == Len(book')
+                        a == Alloc(chain[i].E, chain[i].ord)
+                    IN  ~(a.nobody /\ Sum(a.plus) > 0) ]_vars
 
 =============================================================================
