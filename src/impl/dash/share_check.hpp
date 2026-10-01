@@ -6,6 +6,9 @@
 // Reference: ref/p2pool-dash/p2pool/data.py Share.__init__() + check()
 // Future-timestamp bound (private/isolated v36 profile only; public v16 has
 // none, oracle parity) — see check_share_timestamp_bound.
+// v36 share verification (DashV36Share; private/isolated v36 sharechain only,
+// dormant until the live ShareType admits wire-type 36) — see the
+// "DASH v36 share verification" section below share_init_verify(DashShare).
 //
 // PPLNS formula (v16, pre-V36 linear weights):
 //   weight_per_share = target_to_average_attempts(share.target) * (65535 - donation_field)
@@ -26,6 +29,7 @@
 #include "version_negotiation.hpp"   // dash::version_negotiation:: accept-path version gate
 #include "coin/gentx_coinbase.hpp"   // dash::coin::GentxCoinbase (won-block reconstruct SSOT hand-off)
 #include "config_pool.hpp"            // dash::SharechainConfig::share_profile() (future-timestamp gate)
+#include "share_messages.hpp"         // v36 message_data validation (authority_pubkeys, validate_message_data)
 
 #include <core/coin_params.hpp>
 #include <core/donation.hpp>          // cross-coin COMBINED_DONATION_SCRIPT SSOT (Bucket-2)
@@ -43,6 +47,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -50,7 +55,11 @@ namespace dash
 {
 
 // ── check_hash_link (same algorithm as LTC) ──────────────────────────────────
-inline uint256 check_hash_link(const HashLinkType& hash_link,
+// Templated over the hash-link type: the v16 dash::HashLinkType and the v36
+// dash::v36::V36HashLinkType carry the same members (state, VarStr extra_data,
+// length), so both shares fold through this ONE body.
+template <typename HashLinkT>
+inline uint256 check_hash_link(const HashLinkT& hash_link,
                                const std::vector<unsigned char>& data,
                                const std::vector<unsigned char>& const_ending = {})
 {
@@ -90,7 +99,10 @@ inline uint256 check_hash_link(const HashLinkType& hash_link,
 }
 
 // ── check_merkle_link ────────────────────────────────────────────────────────
-inline uint256 check_merkle_link(const uint256& tip_hash, const MerkleLink& link)
+// Templated over the link type: dash::MerkleLink (v16) and dash::v36::MerkleLink
+// (v36) carry the same members (branch, index); ONE body for both.
+template <typename MerkleLinkT>
+inline uint256 check_merkle_link(const uint256& tip_hash, const MerkleLinkT& link)
 {
     uint256 cur = tip_hash;
     for (size_t i = 0; i < link.m_branch.size(); ++i)
@@ -137,16 +149,22 @@ static const std::vector<unsigned char> COMBINED_DONATION_SCRIPT(
     core::donation::COMBINED_DONATION_SCRIPT.begin(),
     core::donation::COMBINED_DONATION_SCRIPT.end());
 
-// ── compute_gentx_before_refhash (Dash v16) ──────────────────────────────────
-inline std::vector<unsigned char> compute_gentx_before_refhash()
+// ── compute_gentx_before_refhash ─────────────────────────────────────────────
+// General form (LTC compute_gentx_before_refhash(share_version, params)
+// semantics): the gentx const_ending for a given donation script. The v16 path
+// uses DONATION_SCRIPT (zero-argument form below, identical bytes); the v36
+// verifier passes params.donation_script_func(36), which is the same P2PKH
+// DONATION_SCRIPT on the private/isolated v36 sharechain.
+inline std::vector<unsigned char> compute_gentx_before_refhash(
+    const std::vector<unsigned char>& donation_script)
 {
     std::vector<unsigned char> result;
 
-    // VarStr(DONATION_SCRIPT)
+    // VarStr(donation_script)
     {
         PackStream s;
         BaseScript bs;
-        bs.m_data = DONATION_SCRIPT;
+        bs.m_data = donation_script;
         s << bs;
         auto* p = reinterpret_cast<const unsigned char*>(s.data());
         result.insert(result.end(), p, p + s.size());
@@ -178,6 +196,12 @@ inline std::vector<unsigned char> compute_gentx_before_refhash()
     }
 
     return result;
+}
+
+// Dash v16 const_ending: VarStr(DONATION_SCRIPT) || int64(0) || 3 bytes.
+inline std::vector<unsigned char> compute_gentx_before_refhash()
+{
+    return compute_gentx_before_refhash(DONATION_SCRIPT);
 }
 
 // ── check_share_target_valid (Dash v16) ─────────────────────────────
@@ -403,6 +427,237 @@ inline uint256 share_init_verify(const DashShare& share,
     }
 
     return share_hash;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASH v36 share verification (DashV36Share, wire-type 36)
+//
+// Private/isolated DASH v36 sharechain only (custom --network-id). DORMANT:
+// the live ShareType is still {DashShare}, and every live share_init_verify
+// call site is DashShare-concrete, so nothing below is reachable from the
+// accept / mint / store path until the variant is widened. The public v16
+// verifier above is byte-unchanged.
+//
+// The v36 ref stream (ref_type preimage) is the cross-coin v36 share_info
+// shape — the LTC v36 ref stream (ltc/share_check.hpp share_init_verify) minus
+// the segwit_data slot (non-segwit coin, the BCH convention) and minus tx_info
+// (v >= 34) — followed by the DASH-specific suffix (coinbase_payload,
+// payment_amount, packed_payments) AFTER message_data. That is the DashV36Share
+// wire order (DashFormatter::WriteV36) with the non-ref fields removed:
+// ref_merkle_link, last_txout_nonce, hash_link and merkle_link are share-level
+// link fields (never in share_info), and coinbase_payload_outer is hash_link
+// DATA (appended after the ref_hash, as on v16), not ref-stream content.
+//
+// ONE builder, serialize_v36_ref_share_info, is used by the verifier here and
+// by the producer (share_producer.hpp compute_ref_hash(params, DashV36Share)),
+// so the two cannot drift.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The 8 IDENTIFIER bytes (params.active_identifier_hex(), hex-decoded) that
+// open every ref stream. Same loop as the v16 verifier; used by the v36 path.
+inline void append_identifier_bytes(PackStream& os, const core::CoinParams& params)
+{
+    const std::string hex = params.active_identifier_hex();
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+    {
+        unsigned char byte = static_cast<unsigned char>(
+            std::stoul(hex.substr(i, 2), nullptr, 16));
+        os.write(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(&byte), 1));
+    }
+}
+
+// v36 share_info serialization for the ref stream (field order and encodings
+// of DashFormatter::WriteV36, minus the non-ref fields; see section header).
+inline void serialize_v36_ref_share_info(PackStream& os, const DashV36Share& s)
+{
+    // ── share_data (standardized v36) ──
+    os << s.m_prev_hash;                                   // PossiblyNone(0, IntType(256))
+    os << s.m_coinbase;                                    // VarStr
+    os << s.m_nonce;                                       // uint32
+    os << s.m_pubkey_hash;                                 // v36 address: IntType(160)
+    os << s.m_pubkey_type;                                 // v36: IntType(8)
+    ::Serialize(os, VarInt(s.m_subsidy));                  // v36: VarInt
+    os << s.m_donation;                                    // uint16
+    { uint8_t si = static_cast<uint8_t>(s.m_stale_info); os << si; }  // EnumType<IntType<8>>
+    { uint64_t dv = s.m_desired_version; ::Serialize(os, VarInt(dv)); } // version-vote
+    // NO segwit_data (non-segwit coin).
+    os << s.m_merged_addresses;                            // v36 (empty/inert on DASH)
+    // NO tx_info (only for share version < 34).
+
+    // ── share_info (standardized v36) ──
+    os << s.m_far_share_hash;                              // PossiblyNone(0, IntType(256))
+    os << s.m_max_bits;
+    os << s.m_bits;
+    os << s.m_timestamp;
+    os << s.m_absheight;
+    ::Serialize(os, Using<v36::AbsworkV36Format>(s.m_abswork));  // v36: VarInt low64
+    os << s.m_merged_coinbase_info;                        // v36 (empty/inert on DASH)
+    os << s.m_merged_payout_hash;                          // v36 (zero/inert on DASH)
+
+    // ── v36 message_data: PossiblyNone(b'', VarStr) — empty => 0x00 ──
+    os << s.m_message_data;
+
+    // ── DASH-specific suffix, AFTER message_data (DashV36Share wire order) ──
+    os << s.m_coinbase_payload;                            // PossiblyNone('', VarStr)
+    os << s.m_payment_amount;                              // uint64
+    {
+        uint64_t count = s.m_packed_payments.size();
+        ::Serialize(os, VarInt(count));
+        for (const auto& pay : s.m_packed_payments)
+        {
+            BaseScript bs;
+            bs.m_data.assign(pay.m_payee.begin(), pay.m_payee.end());
+            os << bs;                                      // VarStr payee
+            os << pay.m_amount;                            // uint64
+        }
+    }
+}
+
+// identifier || v36 share_info — the exact bytes hashed into the ref_hash.
+inline std::vector<unsigned char> v36_ref_stream_bytes(const core::CoinParams& params,
+                                                       const DashV36Share& s)
+{
+    PackStream os;
+    append_identifier_bytes(os, params);
+    serialize_v36_ref_share_info(os, s);
+    const auto* p = reinterpret_cast<const unsigned char*>(os.data());
+    return std::vector<unsigned char>(p, p + os.size());
+}
+
+// ref_hash = check_merkle_link(sha256d(ref stream), ref_merkle_link).
+inline uint256 compute_v36_ref_hash(const core::CoinParams& params, const DashV36Share& s)
+{
+    const auto bytes = v36_ref_stream_bytes(params, s);
+    return check_merkle_link(Hash(std::span<const unsigned char>(bytes.data(), bytes.size())),
+                             s.m_ref_merkle_link);
+}
+
+// hash_link data: ref_hash || LE64(last_txout_nonce) || LE32(0) || outer
+// coinbase_payload VALUE appended raw (nothing when empty). Same framing as the
+// v16 verifier (see the coinbase_payload_outer note in share_init_verify above).
+inline std::vector<unsigned char> v36_hash_link_data(const uint256& ref_hash,
+                                                     uint64_t last_txout_nonce,
+                                                     const BaseScript& coinbase_payload_outer)
+{
+    std::vector<unsigned char> out;
+    out.insert(out.end(), ref_hash.data(), ref_hash.data() + 32);
+    {
+        const auto* p = reinterpret_cast<const unsigned char*>(&last_txout_nonce);
+        out.insert(out.end(), p, p + 8);
+    }
+    {
+        uint32_t zero = 0;
+        const auto* p = reinterpret_cast<const unsigned char*>(&zero);
+        out.insert(out.end(), p, p + 4);
+    }
+    const auto& cpd = coinbase_payload_outer.m_data;
+    if (!cpd.empty())
+        out.insert(out.end(), cpd.begin(), cpd.end());
+    return out;
+}
+
+// Largest message_data blob an honest producer can emit: the encryption header
+// (49) plus the MAX_TOTAL_MESSAGE_BYTES inner cap that create_message_data
+// enforces. Anything larger is rejected before any HMAC / ECDSA work.
+inline constexpr size_t MAX_MESSAGE_DATA_WIRE_BYTES =
+    ENCRYPTION_HEADER_SIZE + MAX_TOTAL_MESSAGE_BYTES;
+
+// message_data validation for a v36 share. Empty is valid (no messages).
+// Otherwise the blob must decrypt under one of `keys`, carry at least one
+// well-formed message, and every message must be ECDSA-signed by the key that
+// opened the envelope (validate_message_data). Throws on reject.
+inline void check_v36_message_data(const BaseScript& message_data,
+                                   std::span<const AuthorityPubkey* const> keys)
+{
+    if (message_data.m_data.empty())
+        return;
+    if (message_data.m_data.size() > MAX_MESSAGE_DATA_WIRE_BYTES)
+        throw std::invalid_argument("share message_data exceeds MAX_TOTAL_MESSAGE_BYTES");
+    const std::string err = validate_message_data(message_data.m_data, keys);
+    if (!err.empty())
+        throw std::invalid_argument("share " + err);
+}
+
+// The one place the per-network profile is read for message authority: the
+// maintainer key alone on the private/isolated v36 sharechain, the public
+// 2-key set otherwise.
+inline std::span<const AuthorityPubkey* const> active_message_authority()
+{
+    return authority_pubkeys(SharechainConfig::share_profile().maintainer_only_authority);
+}
+
+// ── share_init_verify (Dash v36) ─────────────────────────────────────────────
+// Same checks, same order as the v16 verifier: future-timestamp bound, coinbase
+// size, target validity, ref_hash + hash_link + merkle, X11 PoW; then the v36
+// message_data validation LAST (after the PoW gate, so an unmined share costs
+// no HMAC / ECDSA work; still before any chain-relative check). Returns the
+// share hash (X11 of the rebuilt header). `message_authority` is injectable so
+// the positive signed-message path is testable; production uses the overload
+// below, which passes active_message_authority().
+inline uint256 share_init_verify(const DashV36Share& share,
+                                 const core::CoinParams& params,
+                                 bool check_pow,
+                                 std::span<const AuthorityPubkey* const> message_authority)
+{
+    check_share_timestamp_bound(share.m_timestamp, share_clock_now(),
+                                future_timestamp_bound_active());
+
+    if (share.m_coinbase.m_data.size() < 2 || share.m_coinbase.m_data.size() > 100)
+        throw std::invalid_argument("bad coinbase size");
+
+    check_share_target_valid(chain::bits_to_target(share.m_bits), params);
+
+    // ── ref_hash → hash_link → gentx_hash ──
+    const uint256 ref_hash = compute_v36_ref_hash(params, share);
+    const auto hash_link_data =
+        v36_hash_link_data(ref_hash, share.m_last_txout_nonce, share.m_coinbase_payload_outer);
+    const uint256 gentx_hash = check_hash_link(
+        share.m_hash_link, hash_link_data,
+        compute_gentx_before_refhash(params.donation_script_func(36)));
+    g_last_gentx_hash = gentx_hash;
+
+    // ── merkle root (no segwit) ──
+    const uint256 merkle_root = check_merkle_link(gentx_hash, share.m_merkle_link);
+
+    // ── block header → X11 ──
+    PackStream header_stream;
+    {
+        uint32_t hdr_version = static_cast<uint32_t>(share.m_min_header.m_version);
+        header_stream << hdr_version;
+    }
+    header_stream << share.m_min_header.m_previous_block;
+    header_stream << merkle_root;
+    header_stream << share.m_min_header.m_timestamp;
+    header_stream << share.m_min_header.m_bits;
+    header_stream << share.m_min_header.m_nonce;
+
+    auto hdr_span = std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(header_stream.data()), header_stream.size());
+    const uint256 share_hash = params.pow_func(hdr_span);
+    g_last_pow_hash = share_hash;
+    {
+        uint256 block_target = chain::bits_to_target(share.m_min_header.m_bits);
+        g_last_init_is_block = (!block_target.IsNull() && share_hash <= block_target);
+    }
+
+    if (check_pow)
+    {
+        uint256 target = chain::bits_to_target(share.m_bits);
+        if (share_hash > target)
+            throw std::invalid_argument("share PoW hash does not meet target");
+    }
+
+    check_v36_message_data(share.m_message_data, message_authority);
+
+    return share_hash;
+}
+
+inline uint256 share_init_verify(const DashV36Share& share,
+                                 const core::CoinParams& params,
+                                 bool check_pow = true)
+{
+    return share_init_verify(share, params, check_pow, active_message_authority());
 }
 
 // ── decode_payee_script: "!" prefix → raw hex script, else → address_to_script2
