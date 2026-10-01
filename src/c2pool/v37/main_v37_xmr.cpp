@@ -501,6 +501,9 @@ struct ServeHooks {
     // listener thread for stratum jobs, and once on the main thread for the
     // in-process miner's fixed slot (address ""). Unset = no binding.
     std::function<void(std::uint32_t, const std::string&)> job_binder;
+    // FEE DISCLOSURE: JSON members for every stratum login reply's `result`
+    // ("c2pool":{fee_model, give_author_pct, node_owner_fee_pct}). Empty = none.
+    std::string login_extra;
 };
 
 // ---------------------------------------------------------------------------
@@ -573,6 +576,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     o2::StratumListener listener(template_source, rx, sink, lo);
     if (hooks.extra_nonce_base) listener.seed_extra_nonce(*hooks.extra_nonce_base);   // GAP-2
     if (hooks.job_binder) listener.set_job_binder(hooks.job_binder);                     // SEAM-1
+    if (!hooks.login_extra.empty()) listener.set_login_extra(hooks.login_extra);          // FEE DISCLOSURE
     // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
     // cache init never lands inside a miner's submit).
     listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
@@ -4641,6 +4645,17 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::fflush(stdout);
             };
         hooks.job_binder = job_binder;   // SEAM-1 (unset unless --relay-bind rbind)
+        // FEE DISCLOSURE (#1868): every login reply tells the miner this node's
+        // fee model and the two per-node percentages that can move its payout,
+        // BEFORE it mines. With the fee model off both are 0 by construction.
+        {
+            const bool fee_on_x = ::c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params);
+            auto pct = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.4f", v); return std::string(b); };
+            hooks.login_extra = "\"c2pool\":{\"fee_model\":" + std::to_string(fee_on_x ? cfg.lane_params.fee.version : 0u) +
+                                ",\"give_author_pct\":" + pct(fee_on_x ? g_give_author_pct : 0.0) +
+                                ",\"node_owner_fee_pct\":" + pct(fee_on_x ? g_owner_fee_pct : 0.0) + "}";
+            std::printf("stratum: FEE DISCLOSURE in every login reply: %s\n", hooks.login_extra.c_str());
+        }
         {   // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27): bind every job's finder
             // right after its rbind (the owner-fee roll is the rbind's), before its blob.
             auto rb = job_binder;
