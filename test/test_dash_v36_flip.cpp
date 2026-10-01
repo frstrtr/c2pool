@@ -45,6 +45,7 @@
 #include <gtest/gtest.h>
 
 #include "dash_v36_live_fixture.hpp"   // IdentityGuard, DataDirGuard, LiveNode, mine_v36, ...
+#include "dash_v36_mint_fixture.hpp"   // iso_prod_params, make_wd, solve_job, coinbase_outputs, handshake, ...
 
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/emergency_decay.hpp>
@@ -70,136 +71,8 @@
 
 namespace {
 
-using dash::mint::build_producer_job;
-using dash::mint::mint_from_inputs;
-using dash::mint::mint_from_inputs_any;
 using dash::mint::select_embed_blob;
-using dash::producer::BuiltShare;
-using dash::producer::BuiltV36Share;
-using MintShareInputs = dash::stratum::DASHWorkSource::MintShareInputs;
 using KeySpan = std::span<const dash::AuthorityPubkey* const>;
-
-// Private/isolated identity with the PRODUCTION CoinParams (no
-// current_share_version override — the flip is what sets 36), easy PoW.
-core::CoinParams iso_prod_params() {
-    SharechainConfig::reset_network_id();
-    SharechainConfig::set_network_id(ISO_ID, ISO_PFX);
-    return easy(dash::make_coin_params(false));
-}
-
-dash::coin::DashWorkData make_wd() {
-    dash::coin::DashWorkData wd;
-    wd.m_version        = 536870912;
-    wd.m_previous_block = tag_hash(0x77);
-    wd.m_height         = 1000;
-    wd.m_coinbase_value = SUBSIDY;
-    wd.m_bits           = 0x1b00ffffu;   // block target far harder than shares
-    wd.m_curtime        = PAST_TS + 5;
-    return wd;
-}
-
-uint256 sha256d_bytes(const Bytes& b) {
-    return dash::coinbase::sha256d(std::span<const unsigned char>(b.data(), b.size()));
-}
-
-// The miner + mining_submit side of one producer job (the test_dash_mint_runloop
-// solve_job idiom): coinb1/coinb2 split around the nonce64 slot, coinbase
-// reassembly with en1||en2, coinbase-only merkle root, a REAL X11 nonce search
-// against the job's committed share target, MintShareInputs as mining_submit
-// fills them (ref_hash recovered from the coinb1 tail).
-struct SolvedJob {
-    dash::mint::ProducerJobBuild build;
-    MintShareInputs in;
-    bool built{false};
-    bool solved{false};
-};
-
-template <typename ChainT>
-SolvedJob solve_job(ChainT& chain, const core::CoinParams& p, const uint256& prev,
-                    const uint160& miner, const dash::coin::DashWorkData& wd,
-                    uint32_t share_nonce, uint32_t desired_ts,
-                    const Bytes& message_data = {}) {
-    SolvedJob out;
-    const auto payout_script = dash::pubkey_hash_to_script2(miner);
-    auto b = build_producer_job(chain, p, prev, payout_script, wd, desired_ts,
-                                share_nonce, /*donation=*/0, "c2pool", 0.0, message_data);
-    if (!b) return out;
-    out.built = true;
-    out.build = *b;
-    const auto& job = b->job;
-
-    const Bytes coinb1(job.gentx_bytes.begin(), job.gentx_bytes.begin() + job.nonce64_offset);
-    const Bytes coinb2(job.gentx_bytes.begin() + job.nonce64_offset + 8, job.gentx_bytes.end());
-    const Bytes en1 = {0x01, 0x02, 0x03, 0x04};
-    const Bytes en2 = {0x05, 0x06, 0x07, 0x08};
-    Bytes coinbase = coinb1;
-    coinbase.insert(coinbase.end(), en1.begin(), en1.end());
-    coinbase.insert(coinbase.end(), en2.begin(), en2.end());
-    coinbase.insert(coinbase.end(), coinb2.begin(), coinb2.end());
-
-    const uint256 target = chain::bits_to_target(job.share_bits);
-    bitcoin_family::coin::BlockHeaderType hdr;
-    hdr.m_version        = wd.m_version;
-    hdr.m_previous_block = wd.m_previous_block;
-    hdr.m_merkle_root    = sha256d_bytes(coinbase);   // coinbase-only template
-    hdr.m_timestamp      = wd.m_curtime;
-    hdr.m_bits           = wd.m_bits;
-    Bytes header_bytes;
-    uint256 pow;
-    for (uint32_t n = 0; n < 4000000; ++n) {
-        hdr.m_nonce = n;
-        PackStream ps;
-        ps << hdr;
-        header_bytes = to_bytes(ps);
-        pow = dash::crypto::hash_x11(header_bytes.data(), header_bytes.size());
-        if (pow <= target) { out.solved = true; break; }
-    }
-    if (!out.solved) return out;
-
-    out.in.header_bytes    = header_bytes;
-    out.in.coinbase_bytes  = coinbase;
-    out.in.subsidy         = wd.m_coinbase_value;
-    out.in.prev_share_hash = prev;
-    out.in.payout_script   = payout_script;
-    out.in.pow_hash        = pow;
-    std::memcpy(out.in.ref_hash.begin(), coinb1.data() + coinb1.size() - 32, 32);
-    uint64_t n64 = 0;
-    for (int i = 7; i >= 0; --i)
-        n64 = (n64 << 8) | (i < 4 ? en1[i] : en2[i - 4]);
-    out.in.last_txout_nonce = n64;
-    return out;
-}
-
-// Coinbase outputs (value, scriptPubKey) of a serialized DASH coinbase.
-std::vector<std::pair<uint64_t, Bytes>> coinbase_outputs(const Bytes& tx) {
-    size_t o = 4;   // version int16 + type int16
-    auto varint = [&]() -> uint64_t {
-        const uint8_t c = tx.at(o++);
-        if (c < 0xfd) return c;
-        const int n = c == 0xfd ? 2 : c == 0xfe ? 4 : 8;
-        uint64_t v = 0;
-        for (int i = 0; i < n; ++i) v |= static_cast<uint64_t>(tx.at(o++)) << (8 * i);
-        return v;
-    };
-    EXPECT_EQ(varint(), 1u);   // one coinbase input
-    o += 36;
-    o += varint();             // scriptSig
-    o += 4;                    // sequence
-    std::vector<std::pair<uint64_t, Bytes>> outs;
-    const uint64_t n = varint();
-    for (uint64_t k = 0; k < n; ++k) {
-        uint64_t v = 0;
-        for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(tx.at(o++)) << (8 * i);
-        const uint64_t len = varint();
-        outs.emplace_back(v, Bytes(tx.begin() + o, tx.begin() + o + len));
-        o += len;
-    }
-    return outs;
-}
-
-const BuiltV36Share& v36_of(const dash::stratum::MintedShare& m) {
-    return std::get<BuiltV36Share>(m.built);
-}
 
 // ── message key material (test keypair; no authority seckey is in-tree) ─────
 struct TestKey { unsigned char sk[32]; dash::AuthorityPubkey pk; };
@@ -224,84 +97,6 @@ Bytes signed_blob(const TestKey& signer, const dash::AuthorityPubkey& envelope) 
     m.payload = {0x01, 0x02, 0x03, 0x04};
     std::vector<dash::ShareMessage> msgs{m};
     return dash::create_message_data(signer.sk, envelope, msgs);
-}
-
-// ── loopback handshake harness (the test_dash_addrme idiom) ─────────────────
-const std::vector<std::byte>& test_prefix() {
-    static const std::vector<std::byte> prefix{
-        std::byte{0xfc}, std::byte{0xc1}, std::byte{0xb7}, std::byte{0xdc}};
-    return prefix;
-}
-
-struct StubCommunicator : public core::ICommunicator {
-    void error(const message_error_type&, const NetService&,
-               const std::source_location = std::source_location::current()) override {}
-    void error(const boost::system::error_code&, const NetService&,
-               const std::source_location = std::source_location::current()) override {}
-    void handle(std::unique_ptr<RawMessage>, const NetService&) override {}
-    const std::vector<std::byte>& get_prefix() const override { return test_prefix(); }
-};
-
-struct LoopbackPair {
-    boost::asio::io_context ioc_peer, ioc_node;
-    std::unique_ptr<boost::asio::ip::tcp::acceptor> acceptor;
-    std::unique_ptr<boost::asio::ip::tcp::socket> theirs, ours;
-    LoopbackPair() {
-        using boost::asio::ip::tcp;
-        acceptor = std::make_unique<tcp::acceptor>(
-            ioc_peer, tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
-        acceptor->listen();
-        ours = std::make_unique<tcp::socket>(ioc_node);
-        ours->connect(acceptor->local_endpoint());
-        theirs = std::make_unique<tcp::socket>(acceptor->accept());
-    }
-};
-
-struct IoThread {
-    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> guard;
-    std::thread thread;
-    explicit IoThread(boost::asio::io_context& ioc)
-        : guard(boost::asio::make_work_guard(ioc)), thread([&ioc] { ioc.run(); }) {}
-    void stop(boost::asio::io_context& ioc) {
-        guard.reset();
-        ioc.stop();
-        if (thread.joinable()) thread.join();
-    }
-};
-
-dash::NodeImpl::peer_ptr make_socket_peer(LoopbackPair& pair, StubCommunicator& stub) {
-    auto sock = std::make_shared<core::Socket>(
-        std::move(pair.ours), core::outgoing, &stub,
-        std::weak_ptr<core::INetwork>{}, /*was_managed=*/false);
-    sock->init();
-    return std::make_shared<dash::NodeImpl::peer_t>(sock);
-}
-
-std::unique_ptr<RawMessage> make_version(uint32_t proto, uint64_t nonce) {
-    return dash::message_version::make_raw(
-        proto, uint64_t{0},
-        addr_t(1u, NetService("203.0.113.1", 9999)),
-        addr_t(1u, NetService("203.0.113.2", 8888)),
-        nonce, std::string("c2pool-dash-v36-flip-kat"), 1u, uint256());
-}
-
-// Outcome of the REAL NodeImpl::handle_version for one peer protocol version:
-// "" = admitted (returns a peer type), else the exception text.
-std::string handshake(uint32_t proto, uint64_t nonce) {
-    LoopbackPair pair;
-    StubCommunicator stub;
-    dash::NodeImpl node;   // rig-free; its ratchet seed is read from the live profile
-    auto peer = make_socket_peer(pair, stub);
-    IoThread io(pair.ioc_node);
-    std::string result;
-    try {
-        auto t = node.handle_version(make_version(proto, nonce), peer);
-        result = t.has_value() ? "" : "<no peer type>";
-    } catch (const std::exception& e) {
-        result = e.what();
-    }
-    io.stop(pair.ioc_node);
-    return result;
 }
 
 // ── synthetic chains for the retarget / payout-view KATs ────────────────────
