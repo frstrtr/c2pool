@@ -13,6 +13,7 @@
 #include <core/pack_types.hpp>
 
 #include <optional>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -71,7 +72,10 @@ struct DashShare : chain::BaseShare<uint256, 16>
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DASH v36 share (wire-type 36) — PHASE A: DEFINED + PARSEABLE, DORMANT.
+// DASH v36 share (wire-type 36) — the share type of the private/isolated DASH
+// v36 sharechain (a custom --network-id). Live on that profile only: the public
+// network (no --network-id) never loads a type-36 share (share_chain.hpp
+// load_share gate) and stays v16, p2pool-dash compatible.
 //
 // Byte-standardized to the cross-coin v36 share shape (the v36-standardize-for-
 // v37 goal: uniform structs). The STANDARDIZED PREFIX (min_header .. message_data)
@@ -99,10 +103,9 @@ struct DashShare : chain::BaseShare<uint256, 16>
 //     message_data so the ENTIRE standardized prefix stays byte-identical to
 //     bch/ltc/dgb. See the design note + PR body for the review decision.
 //
-// The version-vote (m_desired_version) is what #774's AutoRatchet reads to
-// activate; Phase A only DEFINES this type (dormant, unminted). current_share_version
-// stays 16, so nothing mints a v36 share and the live 1700 accept path is
-// byte-unchanged (Phase C flips activation via the ratchet, NOT here).
+// The version-vote (m_desired_version) is what #774's AutoRatchet reads. The
+// isolated chain admits exactly the type it mints (CoinParams::current_share_version,
+// share_check.hpp check_share_type_admitted); the mint flip to 36 is a later slice.
 struct DashV36Share : chain::BaseShare<uint256, 36>
 {
     // ── min_header (SmallBlockHeaderType — coin block header, standardized) ──
@@ -139,7 +142,7 @@ struct DashV36Share : chain::BaseShare<uint256, 36>
     uint64_t m_last_txout_nonce{0};
     v36::V36HashLinkType m_hash_link;   // v36: state + extra_data(VarStr) + length(VarInt)
     v36::MerkleLink m_merkle_link;
-    BaseScript m_message_data;          // v36 messaging hook — EMPTY on DASH in Phase A (Phase B)
+    BaseScript m_message_data;          // v36 messaging hook (validated by share_init_verify)
 
     // ── DASH-SPECIFIC SUFFIX (FLAGGED divergence — see struct header) ──
     BaseScript m_coinbase_payload;          // DIP3/DIP4 CBTX inner (PossiblyNone '', VarStr)
@@ -147,9 +150,9 @@ struct DashV36Share : chain::BaseShare<uint256, 36>
     std::vector<PackedPayment> m_packed_payments; // masternode/superblock/platform
     BaseScript m_coinbase_payload_outer;    // outer coinbase_payload_data (appended to hash_link)
 
-    // ── carried-but-UNSERIALIZED members (v36 wire omits tx_info; kept so a
-    //    future promotion into the live variant matches DashShare's field
-    //    surface for the shared generic-invoke call sites in node.cpp) ──
+    // ── carried-but-UNSERIALIZED members (v36 wire omits tx_info; kept so the
+    //    live variant's generic-invoke call sites in node.cpp / share_tracker.hpp
+    //    see DashShare's field surface; always EMPTY on a v36 share) ──
     std::vector<uint256> m_new_transaction_hashes;
     std::vector<uint64_t> m_transaction_hash_refs;
 
@@ -160,5 +163,12 @@ struct DashV36Share : chain::BaseShare<uint256, 36>
     DashV36Share(const uint256& hash, const uint256& prev_hash)
         : chain::BaseShare<uint256, 36>(hash, prev_hash) {}
 };
+
+// The share types a DASH sharechain can hold (the live ShareType variant,
+// share_chain.hpp). Public network: only DashShare is ever instantiated;
+// private/isolated v36 sharechain: DashShare parses but only the admitted type
+// (check_share_type_admitted) is accepted.
+template <typename T>
+concept is_live_share = std::is_same_v<T, DashShare> || std::is_same_v<T, DashV36Share>;
 
 } // namespace dash

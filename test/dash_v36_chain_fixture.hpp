@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
-// Test-only sharechain that admits DashV36Share, for driving the dormant v36
-// generation-transaction code (share_check.hpp generate_share_transaction /
-// verify_payout_commitment on DashV36Share, share_producer.hpp build_share_v36,
-// pplns_v36.hpp v36_pplns_window) before the live dash::ShareType is widened.
+// v36 sharechain helpers for the v36 generation-transaction KATs (share_check.hpp
+// generate_share_transaction / verify_payout_commitment on DashV36Share,
+// share_producer.hpp build_share_v36, pplns_v36.hpp v36_pplns_window).
 //
-// V36TestIndex mirrors dash::ShareIndex (share_chain.hpp) member for member;
-// only the variant differs ({DashShare, DashV36Share} instead of {DashShare}).
-// This is the same widening the live-variant slice makes; that slice retires
-// or aliases this fixture. Anonymous namespace per TU.
+// The live dash::ShareType now holds DashV36Share (live-variant slice), so the
+// former test-only variant/index/chain are ALIASES of the live types: every KAT
+// that uses this fixture runs over the production chain type. Anonymous
+// namespace per TU.
 
 #include <impl/dash/share.hpp>
 #include <impl/dash/share_chain.hpp>   // DashFormatter, ShareHasher
@@ -23,34 +22,10 @@
 
 namespace {
 
-using V36TestShareType =
-    chain::ShareVariants<dash::DashFormatter, dash::DashShare, dash::DashV36Share>;
+using V36TestShareType = dash::ShareType;
+using V36TestIndex = dash::ShareIndex;
 
-class V36TestIndex
-    : public chain::ShareIndex<uint256, V36TestShareType, dash::ShareHasher, V36TestIndex>
-{
-    using base_index = chain::ShareIndex<uint256, V36TestShareType, dash::ShareHasher, V36TestIndex>;
-
-public:
-    uint288 work;
-    uint288 min_work;
-    int64_t time_seen{0};
-    int32_t naughty{0};
-    bool is_block_solution{false};
-    uint256 pow_hash;
-
-    V36TestIndex() : base_index(), work(0), min_work(0) {}
-
-    template <typename ShareT> V36TestIndex(ShareT* share) : base_index(share)
-    {
-        work = chain::target_to_average_attempts(chain::bits_to_target(share->m_bits));
-        min_work = chain::target_to_average_attempts(chain::bits_to_target(share->m_max_bits));
-        time_seen = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-    }
-};
-
-struct V36TestChain : chain::ShareChain<V36TestIndex>
+struct V36TestChain : dash::ShareChain
 {
 };
 

@@ -85,8 +85,8 @@ inline uint64_t payout_share(uint64_t weight, uint64_t worker_payout,
 
 
 // ---------------------------------------------------------------------------
-// v36 consensus entry (private/isolated DASH v36 sharechain; dormant until the
-// v36 share type is live). THE one exact payout muldiv the v36 verifier
+// v36 consensus entry (private/isolated DASH v36 sharechain; reached only for a
+// v36 share, which only that profile loads). THE one exact payout muldiv the v36 verifier
 // (share_check.hpp build_v36_gentx), the v36 producer (share_producer.hpp
 // build_share_v36, via the same builder) and the stratum coinbase builder's
 // v36 arm (coinbase_builder.hpp compute_dash_payouts, via compute_v36_amounts)

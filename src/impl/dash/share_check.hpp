@@ -6,10 +6,12 @@
 // Reference: ref/p2pool-dash/p2pool/data.py Share.__init__() + check()
 // Future-timestamp bound (private/isolated v36 profile only; public v16 has
 // none, oracle parity) — see check_share_timestamp_bound.
-// v36 share verification (DashV36Share; private/isolated v36 sharechain only,
-// dormant until the live ShareType admits wire-type 36) — see the
+// v36 share verification (DashV36Share; private/isolated v36 sharechain only;
+// the public network never loads a type-36 share) — see the
 // "DASH v36 share verification" section below share_init_verify(DashShare).
-// v36 generation transaction (DashV36Share; same scope, same dormancy): see the
+// Share-type admission (which wire type a chain accepts) — see
+// check_share_type_admitted.
+// v36 generation transaction (DashV36Share; same scope): see the
 // "DASH v36 generation transaction" section at the end of this file. v36 formula:
 //   window  = decayed PPLNS from the PARENT over CHAIN_LENGTH shares (pplns_v36.hpp)
 //   amounts = worker_payout * weight / total_weight (full weight, NO finder fee),
@@ -56,6 +58,8 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 namespace dash
@@ -283,6 +287,30 @@ inline thread_local uint256 g_last_pow_hash;  // X11 hash of the share header
 // share_init_verify that produced it, on the same thread.
 inline thread_local uint256 g_last_gentx_hash;
 
+// ── Share-type admission ─────────────────────────────────────────────────────
+// A DASH sharechain admits exactly ONE wire type: the share version it mints,
+// CoinParams::current_share_version. Public network: 16 (p2pool-dash). Private/
+// isolated v36 sharechain: 16 until the flip slice sets current_share_version to
+// 36, then 36 — so a v16 share is not admitted on the v36 chain (and a v36 share
+// is not admitted on a chain still minting v16) with no further code. A single
+// knob arms "mint 36" and "reject 16" together: the flip MUST set
+// current_share_version, not only the mint type, or this gate does not arm.
+// A type-36 share never reaches this check on the public network: load_share
+// (share_chain.hpp) throws on it first, exactly as before the v36 type existed.
+// current_share_version == 0 (a default-constructed CoinParams, e.g. a KAT
+// tracker) means "not configured" and admits the DASH baseline, v16 — the only
+// type such a tracker ever verified. Throws std::invalid_argument.
+inline void check_share_type_admitted(int64_t wire_type, const core::CoinParams& params)
+{
+    const int64_t admitted = params.current_share_version != 0
+        ? static_cast<int64_t>(params.current_share_version)
+        : DashShare::version;
+    if (wire_type != admitted)
+        throw std::invalid_argument(
+            "share type v" + std::to_string(wire_type) +
+            " not admitted: this sharechain speaks v" + std::to_string(admitted));
+}
+
 // ── share_init_verify (Dash v16) ─────────────────────────────────────────────
 // Verifies PoW, hash_link, merkle_link. Returns share hash (SHA256d of header).
 inline uint256 share_init_verify(const DashShare& share,
@@ -439,11 +467,11 @@ inline uint256 share_init_verify(const DashShare& share,
 // ═══════════════════════════════════════════════════════════════════════════
 // DASH v36 share verification (DashV36Share, wire-type 36)
 //
-// Private/isolated DASH v36 sharechain only (custom --network-id). DORMANT:
-// the live ShareType is still {DashShare}, and every live share_init_verify
-// call site is DashShare-concrete, so nothing below is reachable from the
-// accept / mint / store path until the variant is widened. The public v16
-// verifier above is byte-unchanged.
+// Private/isolated DASH v36 sharechain only (custom --network-id). The live
+// ShareType holds DashV36Share, but only the isolated profile's load_share ever
+// instantiates one (the public network throws on wire type 36 at load), and the
+// accept path admits it only once the chain speaks v36
+// (check_share_type_admitted). The public v16 verifier above is byte-unchanged.
 //
 // The v36 ref stream (ref_type preimage) is the cross-coin v36 share_info
 // shape — the LTC v36 ref stream (ltc/share_check.hpp share_init_verify) minus
@@ -1198,6 +1226,23 @@ inline void verify_payout_commitment(const DashShare& share, TrackerT& tracker,
             " committed " + gentx_hash.ToString().substr(0, 16) + ")");
 }
 
+// One sharechain, one share type: a share must be the same TYPE as its parent
+// (oracle data.py:382, `type(self) is type(previous)`; a type change is only
+// ever a SUCCESSOR switch, and DASH has none). Rejects a v16 share on a v36
+// parent and a v36 share on a v16 parent, so a mixed-type chain cannot form on
+// either profile. Throws std::invalid_argument.
+template <typename WantT, typename ChainT>
+inline void check_parent_share_type(ChainT& chain, const uint256& prev_hash)
+{
+    chain.get_share(prev_hash).invoke([&](auto* parent) {
+        using ParentT = std::remove_pointer_t<decltype(parent)>;
+        if constexpr (!std::is_same_v<ParentT, WantT>)
+            throw std::invalid_argument(
+                "mixed share types on one sharechain: v" + std::to_string(WantT::version) +
+                " share on a v" + std::to_string(ParentT::version) + " parent");
+    });
+}
+
 // === verify_version_transition (Dash accept-path step 2: mint<->accept coupling) ===
 // Gates which shares the accept path ADMITS at a share-VERSION boundary, closing
 // the gap where dash had the version_negotiation primitives KAT-proven in
@@ -1226,6 +1271,10 @@ inline void verify_version_transition(const DashShare& share, ChainT& chain,
     const uint256 prev_hash = share.m_prev_hash;
     if (prev_hash.IsNull() || !chain.contains(prev_hash))
         return;  // genesis / unknown parent -- nothing to gate against
+
+    // Same share type as the parent (no-op on the public network, whose chain
+    // only ever holds DashShare).
+    check_parent_share_type<DashShare>(chain, prev_hash);
 
     // Predecessor desired_version (single-share window reuse; no new chain API).
     auto prev_counts = vn::get_desired_version_counts(chain, prev_hash, 1);
@@ -1271,6 +1320,21 @@ inline void verify_version_transition(const DashShare& share, ChainT& chain,
     // obsolete) is permitted, matching btc validate_version_switch. No gate.
 }
 
+// v36 (private/isolated v36 sharechain): the chain is v36 from genesis, so there
+// is no version boundary to gate. A genesis v36 share (null / unknown parent) and
+// a v36 share on a v36 parent are admitted without any desired_version vote; the
+// vote is still tallied (dashboard / AutoRatchet) but never gates admission here.
+// Only the share-type rule applies. No successor to v36 exists yet.
+template <typename ChainT>
+inline void verify_version_transition(const DashV36Share& share, ChainT& chain,
+                                      uint64_t /*chain_length*/)
+{
+    const uint256 prev_hash = share.m_prev_hash;
+    if (prev_hash.IsNull() || !chain.contains(prev_hash))
+        return;  // genesis v36 / unknown parent
+    check_parent_share_type<DashV36Share>(chain, prev_hash);
+}
+
 
 // === verify_share (Dash accept-path COMBINED entry) ==========================
 // The single entry a Dash node runs on every incoming share, mirroring
@@ -1292,11 +1356,15 @@ inline void verify_version_transition(const DashShare& share, ChainT& chain,
 // Returns the Phase-1 share hash (null when verify_init=false). The dashd-RPC
 // submitblock fallback is unaffected -- this gates SHARE admission, not block
 // submission.
-template <typename ChainT>
-inline uint256 verify_share(const DashShare& share, ChainT& chain,
+// Both live share types (share.hpp is_live_share); each phase overload-resolves
+// on the share type. The share-type admission gate runs first.
+template <typename ShareT, typename ChainT>
+    requires is_live_share<ShareT>
+inline uint256 verify_share(const ShareT& share, ChainT& chain,
                             uint64_t chain_length, const core::CoinParams& params,
                             bool verify_init = true, bool check_pow = true)
 {
+    check_share_type_admitted(ShareT::version, params);
     uint256 hash;
     if (verify_init)
         hash = share_init_verify(share, params, check_pow);   // Phase 1
@@ -1307,10 +1375,10 @@ inline uint256 verify_share(const DashShare& share, ChainT& chain,
 // ═══════════════════════════════════════════════════════════════════════════
 // DASH v36 generation transaction (DashV36Share, wire-type 36)
 //
-// Private/isolated DASH v36 sharechain only (custom --network-id). DORMANT like
-// the v36 share verifier above: the live ShareType is still {DashShare}, so no
-// accept / mint path instantiates anything here until the variant is widened.
-// Every v16 function above is byte-unchanged; the v36 arm is new overloads.
+// Private/isolated DASH v36 sharechain only (custom --network-id). Reached from
+// the accept path (share_tracker.hpp attempt_verify) for an admitted v36 share;
+// nothing mints a v36 share until the flip slice. Every v16 function above is
+// byte-unchanged; the v36 arm is new overloads.
 //
 // ONE coinbase assembler, build_v36_gentx, is used by the verifier
 // (generate_share_transaction(DashV36Share) below) and by the producer
