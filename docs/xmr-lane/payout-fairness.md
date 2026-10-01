@@ -279,10 +279,11 @@ it, three things can reduce what a miner receives:
   (`pct_to_bp`). Every stratum login reply now states the node's fee model,
   give-author and owner-fee percentages before the miner starts mining
   (`"c2pool":{"fee_model", "give_author_pct", "node_owner_fee_pct"}` in the
-  login result, #1880). Whether to cap the owner fee is still open (#1868).
-  [`review-criticals.md`](review-criticals.md) records a ruling against a
-  protocol cap, because no other node can tell a substituted job from the
-  owner's own work.
+  login result, #1880). There is no protocol cap on the owner fee (ruled
+  2026-09-29, recorded in [`review-criticals.md`](review-criticals.md)): no
+  other node can tell a substituted job from the owner's own work, so a cap
+  would be a rule nobody can check. Disclosure is the miner's protection,
+  together with the choice of node.
 
 `src/c2pool/payout/` is the legacy payout module of the pre-v37 LTC path. The
 v37 lanes do not use it. It now reports what the V36 sharechain pays: the
