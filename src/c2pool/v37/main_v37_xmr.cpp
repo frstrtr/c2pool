@@ -509,6 +509,9 @@ struct ServeHooks {
     // listener thread for stratum jobs, and once on the main thread for the
     // in-process miner's fixed slot (address ""). Unset = no binding.
     std::function<void(std::uint32_t, const std::string&)> job_binder;
+    // FEE DISCLOSURE: JSON members for every stratum login reply's `result`
+    // ("c2pool":{fee_model, give_author_pct, node_owner_fee_pct}). Empty = none.
+    std::string login_extra;
 };
 
 // ---------------------------------------------------------------------------
@@ -581,6 +584,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     o2::StratumListener listener(template_source, rx, sink, lo);
     if (hooks.extra_nonce_base) listener.seed_extra_nonce(*hooks.extra_nonce_base);   // GAP-2
     if (hooks.job_binder) listener.set_job_binder(hooks.job_binder);                     // SEAM-1
+    if (!hooks.login_extra.empty()) listener.set_login_extra(hooks.login_extra);          // FEE DISCLOSURE
     // Seed prefetch on the LISTENER thread, before jobs are pushed (Argon2d
     // cache init never lands inside a miner's submit).
     listener.set_template_hook([&](const strat::TemplateJob& peek) { rx.on_template(peek); });
@@ -869,6 +873,28 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             for (const auto& [k, v] : L.effective_owed_all()) { eo += hex_of(k).substr(0, 8) + "=" + std::to_string(v) + " "; if (v < eo_min) eo_min = v; }
             std::printf("  ledger: seq=%llu owed_digest=%s eo_min=%lld finalW{ %s} eo{ %s}\n",
                         static_cast<unsigned long long>(L.ledger_seq()), hex_of(L.owed_digest()).c_str(), eo_min, fw.c_str(), eo.c_str());
+            // LEDGER HEALTH: the aggregate the owed-sign ruling C-3 requires to be
+            // >= 0, and the negative rows (forward-repair debt nobody may repay).
+            const auto h = L.health();
+            std::printf("  ledger-health: rows=%zu sum_final=%lld owed=%lld (%zu rows) negative=%lld (%zu rows, min %lld at %s) "
+                        "pending_payout=%lld (%zu blocks) residual=%lld\n",
+                        h.rows, h.sum_final, h.positive_sum, h.positive_rows, h.negative_sum, h.negative_rows, h.min_row,
+                        h.negative_rows ? hex_of(h.min_key).substr(0, 8).c_str() : "-", h.pending_payout, h.pending_blocks,
+                        L.residual_total());
+            if (!h.aggregate_ok())
+                std::printf("ledger-ALARM aggregate: sum(finalW)=%lld < 0 -- the ledger owes less than it has paid out "
+                            "(owed-sign ruling C-3 violated; %zu negative rows, %lld)\n",
+                            h.sum_final, h.negative_rows, h.negative_sum);
+            // Per-row bound (#1860, step 1): a key more than one block reward in
+            // debt cannot be repaired by its own next credit; either a modified
+            // builder paid it far above its balance or it was paid twice more
+            // than once. One reward is taken as Monero's tail emission (0.6 XMR),
+            // the floor of every mainnet reward.
+            constexpr long long kOneRewardPico = 600'000'000'000LL;
+            if (h.min_row < -kOneRewardPico)
+                std::printf("ledger-ALARM row: key %s… is %lld below zero, more than one block reward (%lld): forward "
+                            "repair cannot cover it from that key's own credit (owed-sign ruling C-4 shape)\n",
+                            hex_of(h.min_key).substr(0, 12).c_str(), h.min_row, kOneRewardPico);
         }
         // c2pool#1551. r7=0 is the claim that matters: it counts settlements the
         // same-height gate did not authorise, which is the only shape an
@@ -1619,6 +1645,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::printf("REFUSED: %s\n", refusal.c_str());
         return 2;
     }
+    {
+        c2pool::v37n::xmr::LedgerKnobs k;
+        k.recon_max_root_age_set = g_recon_max_root_age != ~std::uint64_t{0};
+        k.no_book_deferral       = g_no_book_deferral;
+        if (const std::string refusal = mainnet_ledger_knob_refusal(cfg, k); !refusal.empty()) {
+            std::printf("REFUSED: %s\n", refusal.c_str());
+            return 2;
+        }
+    }
 
     // The native node comes up FIRST in p2p-first: it is the chain XmrNode's
     // finalize driver will be bound to, and that binding happens in bring_up().
@@ -2300,6 +2335,14 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t paynow_booked = 0, paynow_refused = 0;
     std::uint64_t ecut_booked = 0, ecut_refused = 0;   // EMPTY-CUT FINDER
     unsigned long long paynow_netted_total = 0;
+    // LEDGER HEALTH at booking (external review findings 01 and 06):
+    //   overpay_*      blocks whose coinbase paid a key more than max(0, finalW)
+    //                  + E_b at this booking (the honest builder's bound);
+    //   sink_unbacked_* cash that went to the residual sink / donation while
+    //                  the cut stayed credited (the #1865 gap): coverage minus
+    //                  the sink identity's own pay-now share and the marker.
+    std::uint64_t overpay_blocks = 0, sink_unbacked_blocks = 0;
+    long long     overpay_total = 0, sink_unbacked_total = 0;
     auto paynow_net = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
                           Amounts& credit, Amounts& payout, std::string& why,
                           const settle::OwedLedger& L, std::optional<settle::DropsFound>& due) -> bool {
@@ -2356,6 +2399,33 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
         }
         const Amounts gross_credit = credit, gross_payout = payout;
+        // OVERPAY ALARM (#1861): under coinbase authority every payout is booked,
+        // so the honest bound is only CHECKED here and a breach is loud, never a
+        // refusal (a receiver rule needs the C-5 ruling). An honest, synced
+        // builder pays k at most EffectiveOwed(k) + its pay-now share
+        // <= finalW(k) + E_b(k), and by R6 chain-ordered booking the finalW at
+        // this booking is the finalized partition it built against.
+        {
+            const auto& fw = node.ledger().finalW();
+            long long over = 0; std::string who;
+            for (const auto& [k, paid] : gross_payout) {
+                const auto f = fw.find(k);
+                const long long owed = (f == fw.end() || f->second < 0) ? 0 : f->second;
+                const auto c = gross_credit.find(k);
+                const long long eb = c == gross_credit.end() ? 0 : c->second;
+                if (paid > owed + eb) {
+                    over += paid - owed - eb;
+                    who += hex_of(k).substr(0, 8) + "=" + std::to_string(paid) + ">" + std::to_string(owed) + "+" + std::to_string(eb) + " ";
+                }
+            }
+            if (over > 0) {
+                ++overpay_blocks; overpay_total += over;
+                std::printf("ledger-ALARM overpay: h=%llu bid=%s… pays %lld above finalized-owed + E_b { %s} -- booked as read from the "
+                            "chain (coinbase authority); the excess nets forward as negative owed (a lagged or modified builder)\n",
+                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), over, who.c_str());
+                std::fflush(stdout);
+            }
+        }
         const auto r = c2pool::v37n::xmr::paynow::net_booking(bk.paynow_base, bk.total, credit, payout, bk.sink_total, sink_id,
                                                               fee_on ? static_cast<long long>(fee::kDonationMarkerPico) : 0,
                                                               cba_scfg && cba_scfg->spend_floor);
@@ -2364,6 +2434,12 @@ static int run_live(const XmrNodeConfig& cfg) {
             std::printf("paynow-ALARM refused: h=%llu bid=%s… %s\n", static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), r.why.c_str());
             std::fflush(stdout);
             return false;
+        }
+        {
+            long long alloc_sink = 0;
+            if (const auto it = r.alloc.find(sink_id); it != r.alloc.end()) alloc_sink = it->second;
+            const long long unbacked = bk.sink_total - alloc_sink - (fee_on ? static_cast<long long>(fee::kDonationMarkerPico) : 0);
+            if (unbacked > 0) { ++sink_unbacked_blocks; sink_unbacked_total += unbacked; }
         }
         if (bk.paynow_base) {
             ++paynow_booked; paynow_netted_total += static_cast<unsigned long long>(r.netted);
@@ -5174,6 +5250,17 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::fflush(stdout);
             };
         hooks.job_binder = job_binder;   // SEAM-1 (unset unless --relay-bind rbind)
+        // FEE DISCLOSURE (#1868): every login reply tells the miner this node's
+        // fee model and the two per-node percentages that can move its payout,
+        // BEFORE it mines. With the fee model off both are 0 by construction.
+        {
+            const bool fee_on_x = ::c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params);
+            auto pct = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.4f", v); return std::string(b); };
+            hooks.login_extra = "\"c2pool\":{\"fee_model\":" + std::to_string(fee_on_x ? cfg.lane_params.fee.version : 0u) +
+                                ",\"give_author_pct\":" + pct(fee_on_x ? g_give_author_pct : 0.0) +
+                                ",\"node_owner_fee_pct\":" + pct(fee_on_x ? g_owner_fee_pct : 0.0) + "}";
+            std::printf("stratum: FEE DISCLOSURE in every login reply: %s\n", hooks.login_extra.c_str());
+        }
         {   // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27): bind every job's finder
             // right after its rbind (the owner-fee roll is the rbind's), before its blob.
             auto rb = job_binder;
@@ -5427,6 +5514,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::printf("  cba-payee: learned=%llu resolved=%llu pending=%llu unresolved=%llu (REJOIN-PAYEE: outputs resolved against the payees of the block's own credit cut)\n",
                             (unsigned long long)cut_payee_learned, (unsigned long long)cut_payee_resolved,
                             (unsigned long long)cut_payee_pending, (unsigned long long)cut_payee_unresolved);
+                std::printf("  ledger-overpay: blocks=%llu total=%lld | sink-unbacked: blocks=%llu total=%lld (cash to the sink while the cut stayed credited)\n",
+                            (unsigned long long)overpay_blocks, overpay_total, (unsigned long long)sink_unbacked_blocks, sink_unbacked_total);
                 const auto& cs = cba_src.stats();
                 std::printf("  cba-src: %s native_hits=%llu native_hold=%llu holding=%zu get_block_rpc=%llu rpc_failed=%llu | compare equal=%llu MISMATCH=%llu unavailable=%llu | fallback_used=%llu\n",
                             cba_src.native_mode() ? "native" : "monerod",

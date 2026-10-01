@@ -676,6 +676,53 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
 }
 
 // ---------------------------------------------------------------------------
+// MAINNET: settings that reach the replicated owed ledger are not per-node
+// knobs. Every node books every lane block and must reach the same
+// owed_digest; a setting that changes WHAT a node books, or when it refuses,
+// splits the ledger between nodes that set it differently. None of these is
+// carried in the relay HELLO lane_params_digest, so a mismatch is not refused
+// at the handshake: it surfaces later as lane_root_refused and node-local
+// liability. On mainnet they are therefore pinned to the lane's value and
+// any other value is refused before anything starts. Test networks keep them
+// as knobs for rigs.
+//   --d-conf              FINALIZE runs at bin_height = h + D_conf, and
+//                         first_eligible (inside owed_digest) is stamped with
+//                         it: a different D_conf is a different digest.
+//                         60 is also Monero's coinbase maturity.
+//   --settle-h-min        the owed-output floor; non-zero re-creates the
+//                         parked-balance seniority of the generic path
+//                         (fairness audit, finding 02).
+//   --recon-max-root-age  the D7 bound decides whether a block is CREDITED or
+//                         refused into node-local liability.
+//   --no-book-deferral    documented to fork owed_digest on a lagging
+//                         receiver.
+// ---------------------------------------------------------------------------
+inline constexpr std::uint64_t kMainnetDConf = 60;
+
+struct LedgerKnobs {
+    bool recon_max_root_age_set = false;   // --recon-max-root-age given
+    bool no_book_deferral       = false;   // --no-book-deferral given
+};
+
+inline std::string mainnet_ledger_knob_refusal(const XmrNodeConfig& c, const LedgerKnobs& k) {
+    if (c.network != MoneroNetwork::Mainnet) return {};
+    if (c.d_conf != kMainnetDConf)
+        return "--d-conf " + std::to_string(c.d_conf) + " on mainnet: D_conf stamps first_eligible "
+               "(owed_digest), so a node with a different value books a different ledger; mainnet "
+               "runs the lane value " + std::to_string(kMainnetDConf);
+    if (c.settle_h_min != 0)
+        return "--settle-h-min " + std::to_string(c.settle_h_min) + " on mainnet: the XMR owed floor "
+               "is 0 until it is a digest-committed lane parameter";
+    if (k.recon_max_root_age_set)
+        return "--recon-max-root-age on mainnet: the root-age bound decides whether a block is "
+               "credited or refused, so every node must use the lane default";
+    if (k.no_book_deferral)
+        return "--no-book-deferral on mainnet: booking chain blocks as they arrive forks owed_digest "
+               "on a lagging receiver";
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 // The embedded node's operator flags, parsed as a PURE function of an argv
 // slice.
 //

@@ -299,23 +299,48 @@ TEST(RecentBlockDedup, BoundedFifoEvictsOldest)
 // Thread-safety: the pre-fix static was written unsynchronised from many stratum
 // session threads. Concurrent mark/query must not race or crash, and bounding
 // must still hold. (Run under TSan to catch the data race the static had.)
+//
+// Which entries survive depends on the interleaving (the FIFO evicts by insertion
+// order, and insertion order under concurrency is up to the scheduler), so this
+// test asserts only schedule-independent facts (#1853):
+//   * all 8 * 200 = 1600 seeds are distinct and outnumber the cap, so after the
+//     joins EXACTLY kRecentSubmitCap of them are still reported present: never
+//     more (the bound held) and never fewer (no entry was lost or corrupted);
+//   * the globally last mark is some thread's final seed (i == 199), and it
+//     cannot have been evicted, so at least one such seed is present.
 TEST(RecentBlockDedup, ConcurrentMarksAreSafeAndBounded)
 {
     core::MiningInterface mi{/*testnet=*/true};
+    static constexpr uint32_t CAP        = 256;          // mirrors kRecentSubmitCap (private)
+    static constexpr uint32_t kThreads   = 8;
+    static constexpr uint32_t kPerThread = 200;
+    static_assert(kThreads * kPerThread > CAP, "marks must outnumber the cap");
+
     std::vector<std::thread> ts;
-    for (int t = 0; t < 8; ++t) {
+    for (uint32_t t = 0; t < kThreads; ++t) {
         ts.emplace_back([&mi, t]() {
-            for (uint32_t i = 0; i < 200; ++i) {
-                uint32_t seed = static_cast<uint32_t>(t) * 1000u + i;
+            for (uint32_t i = 0; i < kPerThread; ++i) {
+                uint32_t seed = t * 1000u + i;
                 mi.mark_block_submitted(mk_hash(seed));
                 (void)mi.already_submitted_block(mk_hash(seed));
             }
         });
     }
     for (auto& th : ts) th.join();
-    // 1600 distinct marks >> cap(256): an early one MUST have been evicted, proving
-    // the bound held across concurrent writers without corruption.
-    EXPECT_FALSE(mi.already_submitted_block(mk_hash(0)));
+
+    uint32_t present = 0;
+    bool any_final_present = false;
+    for (uint32_t t = 0; t < kThreads; ++t) {
+        for (uint32_t i = 0; i < kPerThread; ++i) {
+            if (mi.already_submitted_block(mk_hash(t * 1000u + i))) {
+                ++present;
+                if (i == kPerThread - 1) any_final_present = true;
+            }
+        }
+    }
+    EXPECT_LE(present, CAP) << "bound violated: more than kRecentSubmitCap entries retained";
+    EXPECT_EQ(present, CAP) << "1600 distinct marks > cap: exactly kRecentSubmitCap must remain";
+    EXPECT_TRUE(any_final_present) << "the globally last mark can never be evicted";
 }
 
 } // namespace
