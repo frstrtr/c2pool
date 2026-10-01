@@ -90,7 +90,24 @@ public:
             ::v37::xmr::xmr_point_check_fn point_check = nullptr)
         : m_cfg(std::move(cfg)), m_transport(transport),
           m_injected_point_check(point_check),
-          m_ledger(m_cfg.lane_chain) {}
+          m_ledger(m_cfg.lane_chain, ledger_rules()) {}
+
+    ::c2pool::v37n::settle::OwedLedgerRules ledger_rules() const {
+        ::c2pool::v37n::settle::OwedLedgerRules r;
+        r.arm_floor = m_cfg.ledger_arm_floor;
+        r.rotate_on_payment = m_cfg.ledger_rotate_on_payment;
+        r.decay_horizon = m_cfg.ledger_decay_horizon;
+        r.decay_half_life = m_cfg.ledger_decay_half_life;
+        r.anchor_cut = m_cfg.ledger_anchor_cut;
+        r.merkle_rows = m_cfg.ledger_merkle_rows;
+        r.drops_due = m_cfg.ledger_drops_due;
+        r.raindrop_enrol = m_cfg.ledger_raindrop_enrol;
+        if (m_cfg.ledger_drops_window_rw != 0)   // DROPS WINDOW (A4b): the lane's own geometry
+            r.drops_window = ::c2pool::v37n::settle::DropsWindowRule{
+                m_cfg.lane_params.window, m_cfg.lane_params.half_life, m_cfg.lane_params.epoch_len(),
+                m_cfg.ledger_drops_window_rw, ::c2pool::v37n::xmr::kXmrDropsWorkLz};
+        return r;
+    }
 
     ~XmrNode() { stop(); }
 
@@ -504,7 +521,7 @@ public:
     // boot_digest_history(). Returns false (nothing changed) on a torn store.
     bool relineage(std::string* why = nullptr) {
         if (!m_store || !m_finalize) { if (why) *why = "node not up"; return false; }
-        OwedLedger fresh(m_cfg.lane_chain);
+        OwedLedger fresh(m_cfg.lane_chain, ledger_rules());
         std::vector<::v37::bytes32> ds; std::vector<std::uint64_t> ss; std::uint64_t last = 0;
         bool ok = false;
         const RecoveredState st = replay_store(fresh, ds, ss, last, ok);
@@ -546,7 +563,9 @@ public:
     // a coinbase — the fail-closed posture for a light/OOM build.
     bool on_network_block_won(std::uint64_t monero_height,
                               const c2pool::xmr::node::Hash& block_id,
-                              const Amounts& credit, const Amounts& payout) {
+                              const Amounts& credit, const Amounts& payout,
+                              std::optional<::c2pool::v37n::settle::AnchorCut> cut = std::nullopt,
+                              const ::c2pool::v37n::settle::DropsFound* due = nullptr) {
         if (m_cfg.network == MoneroNetwork::Mainnet && !m_cfg.i_understand_mainnet) {
             log("win: REFUSED to settle a MAINNET block without --i-understand-mainnet");
             return false;
@@ -556,6 +575,8 @@ public:
         fb.height = monero_height;
         fb.credit = credit;
         fb.payout = payout;
+        fb.cut = cut;   // ANCHOR: the block's own credit cut
+        if (due) fb.due = *due;   // DROPS DUE: the booking's claim (its deposit is the delta below)
         // ── ★ DROPS T3 (XMR arm) — the hook the BTC/DASH shell already has ──
         // Parity, not a second mechanism: the XMR finalize driver composes the
         // very same compose_credit_replace() the BTC-family driver does, so all

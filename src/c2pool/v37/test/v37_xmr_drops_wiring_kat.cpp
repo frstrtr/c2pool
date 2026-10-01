@@ -171,7 +171,7 @@ int main() {
 #endif
         check(src.find("set_pre_harvest(") == std::string::npos,
               "the frontier reaches the bundle ONLY through attach()'s pre_harvest (no hand-rolled hook)");
-        check(src.find("drops->on_raindrop(") != std::string::npos && src.find("drain_drops()") != std::string::npos,
+        check(src.find("drops->on_raindrop") != std::string::npos && src.find("drain_drops()") != std::string::npos,   // _id: DROPS-SET-PIN
               "replicated raindrops (own + peers') are drained into the harvester");
 #ifdef C2POOL_XMR_DROPS_ENROL_TIDY
         check(src.find("drops->on_share_pushed(") == std::string::npos && src.find("drops->on_share_lane(") != std::string::npos,

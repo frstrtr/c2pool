@@ -175,6 +175,33 @@ public:
         return true;
     }
 
+    // ★ DROPS-CARRY-LIVE: our own order over [a, p) (pos_first, id), read-only
+    // (no serving stats, no frame LRU). false = not readable (closed, broken,
+    // `a` not a receipt start, or a gap).
+    bool ids_between(std::uint64_t a, std::uint64_t p, std::vector<std::pair<std::uint64_t, bytes32>>& ids) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        ids.clear();
+        if (m_ofd < 0 || m_broken || a > p || p > m_next) return false;
+        if (a == p) return true;
+        std::uint64_t lo = 0, hi = m_nrec;
+        while (lo < hi) {
+            const std::uint64_t mid = lo + (hi - lo) / 2;
+            std::uint8_t r[8];
+            if (!get(m_ofd, kHdr + mid * kOrdRec, r, 8)) return false;
+            if (get64(r) < a) lo = mid + 1; else hi = mid;
+        }
+        std::uint64_t pos = a;
+        for (std::uint64_t i = lo; i < m_nrec && pos < p; ++i) {
+            std::uint8_t r[kOrdRec];
+            if (!get(m_ofd, kHdr + i * kOrdRec, r, kOrdRec)) return false;
+            if (get64(r) != pos) return false;
+            bytes32 id{}; std::memcpy(id.data(), r + 12, 32);
+            ids.emplace_back(pos, id);
+            pos += get32(r + 8);
+        }
+        return pos >= p;
+    }
+
     // The raw frame of an id this node served in a deep page, read back from
     // the receipts log and verified against the id (false = not servable).
     bool frame(const bytes32& id, std::vector<std::uint8_t>& out) {

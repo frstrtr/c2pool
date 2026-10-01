@@ -25,6 +25,39 @@ SWEEP="${HEAVY_LEG_SWEEP:-1}"
 SLOTS="${HEAVY_LEG_SLOTS:-2}"
 ACQ="$(mktemp -u /tmp/c2pool-heavy-acq.XXXXXX)"
 
+# --- per-host slot-count override (opt-in, one file per lock) ---
+# A host whose disk/RAM can take more (or fewer) concurrent holders of THIS lock
+# than the workflow's `slots:` input declares a positive integer in
+#   ${HOME}/.config/c2pool-ci/<basename of lock-file>.slots
+# e.g. ~/.config/c2pool-ci/c2pool-heavy-disk.lock.slots containing "2". Blank
+# lines and '#' comment lines are ignored. It is per lock basename, so raising
+# the disk semaphore never touches the RAM lock. No file (every host by
+# default) -> the input is used unchanged. An invalid value (non-integer, 0, or
+# above SLOTS_OVERRIDE_MAX) is ignored with a warning, never honored, so a typo
+# on one host can only ever fall back to the shipped behaviour.
+# HEAVY_LEG_CONFIG_DIR exists ONLY for the honesty-gate test.
+SLOTS_OVERRIDE_MAX=8
+SLOTS_SRC="action input"
+_cfg_dir="${HEAVY_LEG_CONFIG_DIR:-${HOME:+${HOME}/.config/c2pool-ci}}"
+if [ -n "$_cfg_dir" ]; then
+  _ovr="${_cfg_dir}/$(basename "$LOCK").slots"
+  if [ -e "$_ovr" ]; then
+    _val="$(grep -v '^[[:space:]]*#' "$_ovr" 2>/dev/null | tr -d ' \t\r\n' || true)"
+    case "$_val" in
+      ''|*[!0-9]*|0*)
+        echo "::warning::heavy-leg lock: ignoring host slot override $_ovr (value '${_val}' is not a positive integer) -- using action input slots=$SLOTS" ;;
+      *)
+        if [ "${#_val}" -gt 2 ] || [ "$_val" -gt "$SLOTS_OVERRIDE_MAX" ]; then
+          echo "::warning::heavy-leg lock: ignoring host slot override $_ovr (value '${_val}' exceeds max $SLOTS_OVERRIDE_MAX) -- using action input slots=$SLOTS"
+        else
+          SLOTS="$_val"
+          SLOTS_SRC="host override $_ovr"
+        fi ;;
+    esac
+  fi
+fi
+echo "heavy-leg lock ${LOCK}: slots=$SLOTS (source: $SLOTS_SRC)"
+
 # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a
 # ${HOLDERFILE}.<slot> marker ("holderpid workerpid"). Both are per-slot so two
 # concurrent holders never clobber each other's marker.
