@@ -128,14 +128,18 @@ inline core::CoinParams make_coin_params(bool testnet, const PoolOverrides& over
     // backward-compatible (legacy 1700-floor peers accept any >=1700) and is
     // REQUIRED for ratchet coherence: once two nodes ratchet their floor to 3600
     // they must each advertise >=3600 or they would reject each other.
-    // Both profiles: advertised_protocol_version equals SharechainConfig::
-    // share_profile().advertised_protocol_version (3600), and the cold floor
-    // stays 1700. The private/isolated chain's 3600 ratchet seed
+    // advertised_protocol_version is the active profile's
+    // (SharechainConfig::share_profile().advertised_protocol_version): 3600 on
+    // the public network (== ADVERTISED_PROTOCOL_VERSION, static_assert in
+    // config_pool.hpp), ISOLATED_V36_PROTOCOL_VERSION (3601) on the private/
+    // isolated v36 sharechain, where a peer build advertising 3600 lacks v36
+    // isolated support and is refused at the handshake. The cold floor stays
+    // 1700 on both profiles; the isolated chain's 3601 ratchet seed
     // (share_profile().ratchet_floor_protocol_version) seeds the node's
     // runtime accept floor (node.hpp m_runtime_min_protocol_version), never
     // this CoinParams field.
     p.minimum_protocol_version    = SharechainConfig::MINIMUM_PROTOCOL_VERSION;
-    p.advertised_protocol_version = SharechainConfig::ADVERTISED_PROTOCOL_VERSION;
+    p.advertised_protocol_version = SharechainConfig::share_profile().advertised_protocol_version;
     p.block_max_size           = 0;  // DASH: no segwit weight accounting
     p.block_max_weight         = 0;
 

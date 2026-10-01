@@ -21,11 +21,11 @@
 //       no flag), while A still finds it after switching back;
 //   (f) the private/isolated DASH v36 sharechain profile: keyed on the custom
 //       network id, exposes the v36 targets (share version 36, ratchet seed
-//       3600, P2PKH v36 donation, maintainer-only message authority, future-
-//       timestamp bound, emergency decay); the isolated CoinParams carry
-//       current_share_version 36 (the chain mints and admits v36), the public
-//       ones 16, and every no-flag CoinParams field is pinned byte-identical
-//       to master.
+//       and protocol advert 3601, P2PKH v36 donation, maintainer-only message
+//       authority, future-timestamp bound, emergency decay); the isolated
+//       CoinParams carry current_share_version 36 (the chain mints and admits
+//       v36) and advert 3601, the public ones 16 and 3600, and every no-flag
+//       CoinParams field is pinned byte-identical to master.
 //       (The future-timestamp bound IS consumed, by share_init_verify; its
 //       KATs live in test_dash_v36_future_timestamp*.cpp, linked into this
 //       same executable for the same process-global-identity reason.)
@@ -227,9 +227,11 @@ std::string x11_genesis_hex(const core::CoinParams& p) {
 // Every CoinParams field make_coin_params() fills, pinned to master's values.
 // `isolated` relaxes ONLY what the private/isolated profile is allowed to move:
 // the identifier/prefix slots (network id override), the v36+ donation arm
-// (P2PKH instead of COMBINED) and current_share_version (36: the isolated
-// chain mints and admits v36). Everything else, including both
-// protocol-version fields, must match master on BOTH profiles.
+// (P2PKH instead of COMBINED), current_share_version (36: the isolated
+// chain mints and admits v36) and advertised_protocol_version (3601: the
+// isolated chain refuses peer builds without v36 isolated support, which
+// advertise 3600). Everything else, including the 1700 cold protocol floor,
+// must match master on BOTH profiles; the public advert stays 3600.
 void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, bool isolated) {
     SCOPED_TRACE(std::string(testnet ? "testnet" : "mainnet") + (isolated ? " isolated" : " public"));
     EXPECT_EQ(p.symbol, "DASH");
@@ -249,7 +251,7 @@ void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, b
     EXPECT_EQ(p.target_lookbehind, 100u);
     EXPECT_EQ(p.spread, 10u);
     EXPECT_EQ(p.minimum_protocol_version, 1700u);
-    EXPECT_EQ(p.advertised_protocol_version, 3600u);
+    EXPECT_EQ(p.advertised_protocol_version, isolated ? 3601u : 3600u);
     EXPECT_EQ(p.block_max_size, 0u);
     EXPECT_EQ(p.block_max_weight, 0u);
     EXPECT_EQ(p.max_target.GetHex(), testnet
@@ -701,8 +703,15 @@ TEST(DashNetworkIdOverride, IsolatedProfileExposesV36Targets) {
     const auto& prof = SharechainConfig::share_profile();
     EXPECT_EQ(&prof, &SharechainConfig::ISOLATED_V36_PROFILE);
     EXPECT_EQ(prof.target_share_version, 36u);
-    EXPECT_EQ(prof.ratchet_floor_protocol_version, 3600u);
-    EXPECT_EQ(prof.advertised_protocol_version, 3600u);
+    // Advert AND accept floor 3601: strictly above the 3600 a build without
+    // v36 isolated support advertises, so such a build is refused at the
+    // handshake; the public ratchet target (NEW_MINIMUM 3600) is unchanged.
+    EXPECT_EQ(prof.ratchet_floor_protocol_version, 3601u);
+    EXPECT_EQ(prof.advertised_protocol_version, 3601u);
+    EXPECT_EQ(prof.advertised_protocol_version, prof.ratchet_floor_protocol_version);
+    EXPECT_GT(prof.advertised_protocol_version, SharechainConfig::ADVERTISED_PROTOCOL_VERSION);
+    EXPECT_EQ(SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION, 3600u);
+    EXPECT_EQ(SharechainConfig::ADVERTISED_PROTOCOL_VERSION, 3600u);
     EXPECT_TRUE(prof.v36_donation_p2pkh);
     EXPECT_TRUE(prof.maintainer_only_authority);
     EXPECT_TRUE(prof.future_timestamp_bound);
@@ -715,9 +724,11 @@ TEST(DashNetworkIdOverride, IsolatedProfileExposesV36Targets) {
         // PublicProfileIsTheV16Baseline).
         EXPECT_EQ(p.current_share_version, 36u);
         EXPECT_EQ(p.current_share_version, prof.target_share_version);
-        // The cold floor stays 1700 (the 3600 seed goes to the node runtime,
-        // not into CoinParams); the advert is 3600 on both profiles.
+        // The cold floor stays 1700 (the 3601 seed goes to the node runtime,
+        // not into CoinParams); the advert is the profile's: 3601 here, 3600
+        // on public (PublicProfileIsTheV16Baseline).
         EXPECT_EQ(p.minimum_protocol_version, 1700u);
+        EXPECT_EQ(p.advertised_protocol_version, 3601u);
         EXPECT_EQ(p.advertised_protocol_version, prof.advertised_protocol_version);
         // Identity behaviour unchanged by the profile.
         EXPECT_EQ(p.active_identifier_hex(), "0d3a5c0920263617");

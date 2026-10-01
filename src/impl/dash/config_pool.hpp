@@ -64,6 +64,33 @@ struct SharechainConfig
     static constexpr uint32_t NEW_MINIMUM_PROTOCOL_VERSION = 3600;  // AutoRatchet TARGET floor (v36-native)
     static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION  = 3600;  // v36-capability advert (>= target floor)
 
+    //   ISOLATED_V36_PROTOCOL_VERSION (3601): the protocol version the private/
+    //     isolated DASH v36 sharechain ADVERTISES and the accept floor its nodes
+    //     start at (ISOLATED_V36_PROFILE below). Strictly above
+    //     ADVERTISED_PROTOCOL_VERSION: a c2pool-dash build without v36 isolated
+    //     support advertises 3600 and cannot parse a type-36 share, so with the
+    //     same --network-id/--prefix it would pass a 3600 floor, get peered and
+    //     then fail on every share it is sent; at 3601 it is refused at the
+    //     handshake instead ("peer build lacks v36 isolated support — upgrade"),
+    //     not banned. It is NOT a ratchet target (NEW_MINIMUM_PROTOCOL_VERSION
+    //     stays the public 3600 target; apply_min_protocol_ratchet latches on
+    //     current >= target, so a 3601 seed is a no-op there) and the public
+    //     network never sees it (PUBLIC_PROFILE advertises 3600). Every protocol
+    //     comparison is an ordering (>=, <, max), none keys off "exactly 3600":
+    //     node.hpp handle_version (peer < floor -> refused; floor > 1700 &&
+    //     peer >= floor -> actual), node.cpp apply_min_protocol_ratchet and
+    //     auto_ratchet.hpp (current >= target -> latched), min_protocol_gate.hpp
+    //     (peer >= knob, composed by max), main_dash.cpp live share version
+    //     (floor >= 3600 -> 36), p2pool-dash p2p.py (peer < 1700 -> refused).
+    //     "v36 isolated support" is keyed on this bare number: any later change
+    //     to the isolated v36 share/ref/gentx wire format MUST bump it (3602, ...),
+    //     or builds with the older format pass the handshake again.
+    // BUMP RULE (docs/dash-v36-network.md): ANY change to the DASH v36 share,
+    // ref-stream or gentx wire format MUST bump this number (3601 -> 3602 -> ...)
+    // in the same PR, together with a KAT, or older builds pass the handshake
+    // again and then fail on every share they are sent.
+    static constexpr uint32_t ISOLATED_V36_PROTOCOL_VERSION = 3601;  // DASH v36 network advert AND accept floor
+
     // ---- testnet (networks/dash_testnet.py) ----
     static constexpr uint16_t TESTNET_P2P_PORT          = 18999;
     static constexpr uint16_t TESTNET_WORKER_PORT       = 17903;
@@ -192,8 +219,14 @@ struct SharechainConfig
     ///                                     CoinParams::minimum_protocol_version,
     ///                                     which stays the cold 1700 floor on
     ///                                     both profiles.
-    ///   advertised_protocol_version    -> equals CoinParams::advertised_protocol_version
-    ///                                     on both profiles (pinned by KAT).
+    ///   advertised_protocol_version    -> the version this node puts on the
+    ///                                     wire: node.hpp send_version and
+    ///                                     params.hpp make_coin_params
+    ///                                     (CoinParams::advertised_protocol_version)
+    ///                                     read it. 3600 on PUBLIC,
+    ///                                     ISOLATED_V36_PROTOCOL_VERSION (3601,
+    ///                                     == the isolated ratchet floor) on
+    ///                                     isolated (pinned by KAT).
     ///   v36_donation_p2pkh             -> params.hpp donation_script_func: on the
     ///                                     isolated chain a v36 share pays the
     ///                                     P2PKH DONATION_SCRIPT, not the COMBINED
@@ -233,13 +266,25 @@ struct SharechainConfig
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
         /*target_share_version=*/36,
-        /*ratchet_floor_protocol_version=*/NEW_MINIMUM_PROTOCOL_VERSION,
-        /*advertised_protocol_version=*/ADVERTISED_PROTOCOL_VERSION,
+        /*ratchet_floor_protocol_version=*/ISOLATED_V36_PROTOCOL_VERSION,
+        /*advertised_protocol_version=*/ISOLATED_V36_PROTOCOL_VERSION,
         /*v36_donation_p2pkh=*/true,
         /*maintainer_only_authority=*/true,
         /*future_timestamp_bound=*/true,
         /*emergency_decay=*/true,
     };
+    // The public profile is master's protocol pair, byte for byte.
+    static_assert(PUBLIC_PROFILE.advertised_protocol_version == ADVERTISED_PROTOCOL_VERSION &&
+                  PUBLIC_PROFILE.ratchet_floor_protocol_version == MINIMUM_PROTOCOL_VERSION,
+                  "public DASH protocol advert/floor must stay master's 3600/1700");
+    // The isolated advert is its own floor (two nodes of this build admit each
+    // other), strictly above a build without v36 isolated support, and at or
+    // above the public ratchet target (the ratchet is latched there).
+    static_assert(ISOLATED_V36_PROFILE.advertised_protocol_version ==
+                      ISOLATED_V36_PROFILE.ratchet_floor_protocol_version &&
+                  ISOLATED_V36_PROFILE.ratchet_floor_protocol_version > ADVERTISED_PROTOCOL_VERSION &&
+                  ISOLATED_V36_PROFILE.ratchet_floor_protocol_version >= NEW_MINIMUM_PROTOCOL_VERSION,
+                  "isolated DASH v36 protocol advert must equal its floor and exceed 3600");
 
     /// The active per-network share profile. Read LIVE from the process-global
     /// identity, so it is only coherent under the same ordering contract as the

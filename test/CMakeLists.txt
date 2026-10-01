@@ -437,14 +437,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # FOLDED in for the same reason; needs exactly this link set (a real
     # ctx-bound dash::NodeImpl + ShareTracker + c2pool_storage).
     # test_dash_v36_flip.cpp: the private/isolated DASH v36 sharechain MINTS
-    # v36 (current_share_version 36, v36 producer job + mint, ratchet seed 3600,
+    # v36 (current_share_version 36, v36 producer job + mint, ratchet seed 3601,
     # emergency decay retarget, operator blob embed, version-keyed data subdir,
     # web label, payout view). Same harness (test/dash_v36_live_fixture.hpp) and
     # link set as the live-variant KATs; folded in for the same reason.
     # test_dash_v36_e2e.cpp: the private/isolated DASH v36 sharechain two-node
     # end-to-end KATs (genesis from either node, byte-identical gentx + PPLNS
     # weights on both nodes, restart reload, emergency decay seen by both, v16
-    # peer refused at the handshake) plus the seeder of
+    # peers and builds without v36 isolated support refused at the handshake)
+    # plus the seeder of
     # scripts/dash_v36_isolated_e2e.sh (skipped unless its env is set). Same
     # harness (dash_v36_live_fixture.hpp + dash_v36_mint_fixture.hpp) and link
     # set; folded in for the same reason.

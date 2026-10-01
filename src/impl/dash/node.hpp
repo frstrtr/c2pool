@@ -395,14 +395,16 @@ protected:
     //     lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by
     //     apply_min_protocol_ratchet() once the work-weighted desired-version tally
     //     over the [9/10..10/10] window behind the best share holds >= 95% for v36;
-    //   * private/isolated DASH v36 sharechain: 3600 from the start — the chain is
-    //     v36 from genesis, so a pre-v36 peer is refused at the handshake and the
-    //     ratchet is a latched no-op there.
+    //   * private/isolated DASH v36 sharechain: ISOLATED_V36_PROTOCOL_VERSION
+    //     (3601) from the start — the chain is v36 from genesis, so a pre-v36
+    //     peer (1700) AND a build without v36 isolated support (advert 3600,
+    //     cannot parse a type-36 share) are refused at the handshake, and the
+    //     ratchet is a latched no-op there (3601 >= the 3600 target).
     // The profile is read when the node is CONSTRUCTED, so the identity must be set
     // first (main_dash.cpp sets it before constructing dash::Node). Mutated ONLY on
     // the compute thread under the exclusive m_tracker_mutex (same sites as
     // m_best_share_hash); handle_version composes it with the operator knob
-    // (m_min_protocol_gate) by max(), so a --min-protocol below 3600 cannot lower
+    // (m_min_protocol_gate) by max(), so a --min-protocol below 3601 cannot lower
     // the isolated floor.
     std::atomic<uint32_t> m_runtime_min_protocol_version{
         SharechainConfig::share_profile().ratchet_floor_protocol_version};
@@ -512,7 +514,8 @@ protected:
 public:
     // DISPLAY-ONLY read of the live P2P accept-floor (v36 ratchet output). Read
     // atomically off any thread; the dashboard's /version_signaling surfaces this
-    // as the "min-protocol floor" gauge (1700 pre-crossing -> 3600 post-ratchet).
+    // as the "min-protocol floor" gauge (1700 pre-crossing -> 3600 post-ratchet;
+    // 3601 from the start on the private/isolated v36 sharechain).
     // Consensus-neutral: a plain atomic load, no side effects.
     uint32_t runtime_min_protocol_version() const {
         return m_runtime_min_protocol_version.load(std::memory_order_relaxed);
@@ -790,10 +793,31 @@ public:
         }
     }
 
+    /// A peer-supplied subversion made safe for one log line: printable ASCII
+    /// only (anything else, and '"', becomes '?'), at most 64 characters.
+    static std::string printable_subversion(const std::string& s)
+    {
+        const std::size_t n = std::min<std::size_t>(s.size(), 64);
+        std::string out;
+        out.reserve(n + 3);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const auto c = static_cast<unsigned char>(s[i]);
+            out.push_back((c >= 0x20 && c < 0x7f && c != '"') ? static_cast<char>(c) : '?');
+        }
+        if (s.size() > n)
+            out += "...";
+        return out;
+    }
+
     void send_version(peer_ptr peer)
     {
         auto rmsg = dash::message_version::make_raw(
-            SharechainConfig::ADVERTISED_PROTOCOL_VERSION,  // advertise v36 capability (3600); >= ratchet target so ratcheted peers accept us. Legacy peers (floor 1700) accept any >=1700, so backward-compatible.
+            // The active profile's advert: public 3600 (v36 capability, >= the
+            // ratchet target so ratcheted peers accept us; legacy peers, floor
+            // 1700, accept any >= 1700, so backward-compatible), private/isolated
+            // v36 sharechain 3601 (== its accept floor).
+            SharechainConfig::share_profile().advertised_protocol_version,
             1,                                           // services
             addr_t{1, peer->addr()},                     // addr_to (the remote)
             addr_t{1, NetService{"0.0.0.0", SharechainConfig::p2p_port()}},  // addr_from
@@ -872,14 +896,30 @@ public:
         // the NodeBridge close the connection (pool/node.hpp handle()). The
         // effective floor is the MAX of the operator knob (m_min_protocol_gate,
         // IO-thread-owned) and the auto-ratchet floor (m_runtime_min_protocol_version,
-        // lifted 1700 -> 3600 on the compute thread by apply_min_protocol_ratchet).
+        // lifted 1700 -> 3600 on the compute thread by apply_min_protocol_ratchet;
+        // seeded at 3601 on the private/isolated v36 sharechain).
         // Reading the atomic here is race-free; at the cold default (both 1700) every
-        // real DASH peer is admitted (accept-all).
+        // real DASH peer is admitted (accept-all). A refusal is a disconnect, never a
+        // ban: an old build is not misbehaving.
         const uint32_t effective_floor = std::max(
             m_min_protocol_gate.min_version,
             m_runtime_min_protocol_version.load(std::memory_order_relaxed));
         if (msg->m_version < effective_floor)
-            throw std::runtime_error("peer protocol below min-protocol floor");
+        {
+            // The generic text is kept verbatim (public network, operator knob);
+            // on the private/isolated v36 sharechain it is extended so the
+            // operator sees WHY: the peer build cannot follow a v36 chain.
+            std::string why = "peer protocol below min-protocol floor";
+            if (SharechainConfig::isolated_v36())
+            {
+                why += ": peer build lacks v36 isolated support — upgrade (peer advertises protocol "
+                     + std::to_string(msg->m_version) + " \""
+                     + printable_subversion(msg->m_subversion)
+                     + "\", the DASH v36 network requires >= "
+                     + std::to_string(effective_floor) + ")";
+            }
+            throw std::runtime_error(why);
+        }
 
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;

@@ -1331,7 +1331,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << prof.target_share_version
                   << " (admits v" << prof.target_share_version << " only), ratchet seed "
                   << prof.ratchet_floor_protocol_version
-                  << " (peers below it refused; --min-protocol cannot lower it), emergency decay "
+                  << " (peers below it refused; the operator min-protocol knob, not yet a CLI flag, cannot lower it), advertises protocol "
+                  << prof.advertised_protocol_version
+                  << " (peer builds below it lack v36 isolated support: refused at the handshake,"
+                     " not banned; every node of this chain must run a build with it), emergency decay "
                   << (prof.emergency_decay ? "on" : "off") << "\n";
     }
     std::error_code mkdir_ec;
@@ -1963,7 +1966,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 out["min_protocol_version"]     = live_floor;
                 out["cold_min_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION);
                 out["new_min_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION);
-                out["advertised_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::ADVERTISED_PROTOCOL_VERSION);
+                // The active profile's advert: 3600 public (== ADVERTISED_PROTOCOL_VERSION),
+                // 3601 on the private/isolated v36 sharechain (what send_version puts on the wire).
+                out["advertised_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::share_profile().advertised_protocol_version);
                 // DASH shares are wire-format v16 through the whole crossing (only the
                 // desired-version vote moves 16→36; there is no v36 share FORMAT for
                 // DASH), so the node's live share version is 16 until the floor latches.
