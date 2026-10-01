@@ -28,6 +28,12 @@
 //       claim): the refold digest equals the live digest.
 //   D7  gap 3: a delta with more rows than the carriage bound stays whole in
 //       the booking; only the wire witness is empty; a witness check agrees.
+//   D8  A4b (ruling 2026-10-01, "Window price"; the daemon's rule set): the
+//       composition books WINDOW entries, never a deposit; FINALIZE commits
+//       them (V37W) and prunes at W; the split input adds them to the cut's
+//       payees (net-negative keys weigh nothing, the reward divided exactly);
+//       ORPHAN drops pending entries; rule off byte-identical; store schema 5
+//       and the finalize driver book the window, and a restart replays it.
 //
 // RED on the base (5600fbb8f): no C2POOL_V37_DROPS_DUE / wire-bound API, so
 // the base branch of each shim books the delta as credit at FOUND (the
@@ -376,6 +382,101 @@ static void d7_row_bound() {
           due_of(L).size(), got, big.size(), sum);
 }
 
+// ── D8: the DROPS WINDOW rule (handoff A4b, ruling 2026-10-01) ──────────────
+// The daemon's rule set: the due rule WITH the window. The composition books
+// window entries (work at a lane position), never a deposit; FINALIZE moves
+// them into the committed window ("V37W"), prunes entries W positions behind
+// the anchor, and every booking splits over the cut's payees plus the window.
+#if defined(C2POOL_XMR_DROPS_WINDOW)
+static st::OwedLedgerRules rules_win() {
+    st::OwedLedgerRules r = rules_on();
+    r.drops_window = st::DropsWindowRule{60, 2160, 4096, 1, 62};   // W 60 positions, work == lane weight
+    return r;
+}
+static std::vector<st::WeightedPayee> wpv(const Amounts& m) {
+    std::vector<st::WeightedPayee> v;
+    for (const auto& [k, w] : m) { st::WeightedPayee p; p.key = k; p.weight = ::v37::U256(static_cast<std::uint64_t>(w)); v.push_back(p); }
+    return v;
+}
+static Amounts split_of(std::uint64_t R, const std::vector<st::WeightedPayee>& wp) {
+    const auto a = st::split_reward(R, wp);
+    Amounts m;
+    for (std::size_t i = 0; i < wp.size(); ++i) if (a[i]) m[wp[i].key] += static_cast<long long>(a[i]);
+    return m;
+}
+#endif
+static void d8_window() {
+    std::printf("== D8. DROPS window (A4b): window weight at FINALIZE, split every block, pruned at W ==\n");
+#if defined(C2POOL_XMR_DROPS_WINDOW)
+    st::OwedLedger L(kChain, rules_win());
+    st::DropsFound d1; d1.claim = true; d1.window = {{{100, X}, 70}, {{100, Y}, -150}};
+    st::AnchorCut c1; c1.next_pos = 100;
+    L.on_block_found("w1", {{Z, 5}}, {}, c1, &d1);
+    CHECK(L.drops_window().empty() && L.drops_due().empty(), "W1 a pending block's entries are not in the window (and no due)");
+    const auto dg0 = L.owed_digest();
+    L.on_block_finalized("w1", 1);
+    CHECK(L.drops_window().size() == 2 && L.drops_due().empty() && fw(L, X) == 0,
+          "W1 FINALIZE moves the entries into the window, never into the due or credit (window %zu)", L.drops_window().size());
+    CHECK(!(L.owed_digest() == dg0), "W1 the committed window moves owed_digest (V37W)");
+    // W2 the split input: shares {Y 100, Z 5} + window {X +70, Y -150} at N = 100
+    const auto in = L.drops_window_merge(wpv({{Y, 100}, {Z, 5}}), 100);
+    const Amounts E = split_of(1000000, in);
+    long long tot = 0; for (const auto& [k, v] : E) { (void)k; tot += v; }
+    CHECK(!E.count(Y) && E.count(X) && E.count(Z) && tot == 1000000,
+          "W2 Y (100 - 150 < 0) weighs nothing, X (DROPS only) joins, the reward is divided exactly: %s", amap(E).c_str());
+    const long long ex = E.count(X) ? E.at(X) : 0, ez = E.count(Z) ? E.at(Z) : 0;
+    CHECK(ex * 5 - ez * 70 <= 75 && ez * 70 - ex * 5 <= 75, "W2 X : Z = 70 : 5 (X=%lld Z=%lld)", ex, ez);
+    // W3 the same window, every block, until W positions behind the anchor
+    st::OwedLedger L2 = L;
+    st::AnchorCut c2; c2.next_pos = 150;
+    L2.on_block_found("w2", {}, {}, c2, nullptr); L2.on_block_finalized("w2", 2);
+    CHECK(L2.drops_window().size() == 2, "W3 at anchor 150 (age 50 < 60) the entries stay");
+    st::AnchorCut c3; c3.next_pos = 160;
+    L2.on_block_found("w3", {}, {}, c3, nullptr); L2.on_block_finalized("w3", 3);
+    CHECK(L2.drops_window().empty(), "W3 at anchor 160 (age 60 = W) they are pruned");
+    CHECK(L2.drops_window_merge(wpv({{Z, 5}}), 160).size() == 1, "W3 out of the window: the split input is the shares only");
+    // W4 ORPHAN before settle removes a pending block's entries
+    st::OwedLedger L3(kChain, rules_win());
+    L3.on_block_found("o1", {}, {}, c1, &d1);
+    L3.on_block_orphaned("o1", {});
+    L3.on_block_found("o2", {}, {}, c1, nullptr); L3.on_block_finalized("o2", 1);
+    CHECK(L3.drops_window().empty(), "W4 ORPHAN(o1) pre-settle: its entries never enter the window");
+    // W5 gate OFF: the window is ignored, owed_digest byte-identical
+    st::OwedLedger off1(kChain, rules_on()), off2(kChain, rules_on());
+    off1.on_block_found("g", {{Z, 5}}, {}, c1, &d1); off1.on_block_finalized("g", 1);
+    st::DropsFound dn; dn.claim = true;
+    off2.on_block_found("g", {{Z, 5}}, {}, c1, &dn); off2.on_block_finalized("g", 1);
+    CHECK(off1.owed_digest() == off2.owed_digest() && off1.drops_window().empty(),
+          "W5 rule off: window entries are ignored, owed_digest byte-identical");
+    // W6 store schema 5 round trip; the driver books the window, never the carried delta
+    xs::SettleEvent ev; ev.kind = xs::SettleEvKind::Found; ev.bid = "w1"; ev.credit = {{Z, 5}};
+    xs::set_drops(ev, d1);
+    const std::string blob = ev.serialize();
+    const auto back = xs::SettleEvent::deserialize(blob);
+    CHECK(blob[0] == 5 && xs::drops_of(back) && *xs::drops_of(back) == d1, "W6 store schema 5 round-trips the window entries");
+    xs::MemSettleStore store;
+    st::OwedLedger DL(kChain, rules_win());
+    st::SettleHW hw;
+    xs::XmrFinalizeDriver drv(DL, hw, store, kChain, 1, 0, 0, [](std::uint64_t, const std::string&) { return true; });
+    xs::FoundBlock fb;
+    fb.bid = "b1"; fb.height = 7; fb.credit = {{Y, 1000}}; fb.cut = c1;
+    fb.has_carried_drops = true; fb.carried_drops = {{X, 500}, {Y, -900}};
+    fb.due = d1;
+    drv.on_block_found(fb);
+    st::OwedLedger R(kChain, rules_win());
+    bool ok = false;
+    xs::RecoveryDriver(store, kChain).recover(R, ok);
+    DL.on_block_finalized("b1", 8); R.on_block_finalized("b1", 8);
+    CHECK(DL.drops_due().empty() && DL.drops_window() == L.drops_window() && fw(DL, X) == 0,
+          "W6 the driver books the window, not the carried delta as a deposit (due empty)");
+    CHECK(ok && R.owed_digest() == DL.owed_digest() && R.drops_window() == DL.drops_window(),
+          "W6 a restarted ledger replayed from the store has the same digest and window");
+    CHECK(no_negative(L) && no_negative(DL), "no key negative");
+#else
+    CHECK(false, "no DROPS window rule on the base");
+#endif
+}
+
 int main() {
 #if defined(C2POOL_V37_DROPS_DUE)
     std::printf("v37_xmr_drops_due_kat: FIX tree (C2POOL_V37_DROPS_DUE)\n");
@@ -390,6 +491,7 @@ int main() {
     d6_converge(false);
     d6_converge(true);
     d7_row_bound();
+    d8_window();
     std::printf("\nv37_xmr_drops_due_kat: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

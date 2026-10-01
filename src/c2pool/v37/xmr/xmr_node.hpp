@@ -102,6 +102,10 @@ public:
         r.merkle_rows = m_cfg.ledger_merkle_rows;
         r.drops_due = m_cfg.ledger_drops_due;
         r.raindrop_enrol = m_cfg.ledger_raindrop_enrol;
+        if (m_cfg.ledger_drops_window_rw != 0)   // DROPS WINDOW (A4b): the lane's own geometry
+            r.drops_window = ::c2pool::v37n::settle::DropsWindowRule{
+                m_cfg.lane_params.window, m_cfg.lane_params.half_life, m_cfg.lane_params.epoch_len(),
+                m_cfg.ledger_drops_window_rw, ::c2pool::v37n::xmr::kXmrDropsWorkLz};
         return r;
     }
 

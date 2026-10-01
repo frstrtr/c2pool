@@ -118,6 +118,7 @@ using ::v37::bytes32;
 // share_diff < 2^32 (a product never saturates) and the estimator's h_T far
 // from both ends of the u256 range.
 inline constexpr unsigned kXmrDropsLz = 32;
+static_assert(kXmrDropsLz == ::c2pool::v37n::xmr::kXmrDropsWorkLz, "the window rule reads the same work unit");
 
 // A raindrop must still be real work: at least share_diff / kDropsFloorDiv
 // (and at least difficulty 1). The receiver RandomX-verifies it against this
@@ -346,6 +347,37 @@ inline ShareCounts lane_share_counts(const LanePrefix& lp, std::uint64_t lo, std
     for (const auto& x : lp.shares)
         if (x.bin >= lo && x.bin < hi) ++s[std::make_pair(x.payee, x.bin)];
     return s;
+}
+// ★ DROPS WINDOW (A4b): the END position of a bin on the lane prefix [0, P):
+// P minus the receipts of LATER bins (folded ones through base_counts, which
+// are complete at or above the harvest retention floor, where every composed
+// bin is). A pure function of the prefix multiset: the own order and a
+// repaired order of the same prefix give the same positions.
+class LaneBinEnd {
+public:
+    explicit LaneBinEnd(const LanePrefix& lp) : m_P(lp.P) {
+        for (const auto& [k, n] : lp.base_counts) m_bins.insert(m_bins.end(), n, k.second);
+        for (const auto& x : lp.shares) m_bins.push_back(x.bin);
+        std::sort(m_bins.begin(), m_bins.end());
+    }
+    std::uint64_t operator()(std::uint64_t bin) const {
+        const auto later = static_cast<std::uint64_t>(m_bins.end() - std::upper_bound(m_bins.begin(), m_bins.end(), bin));
+        return later >= m_P ? 0 : m_P - later;
+    }
+private:
+    std::uint64_t m_P = 0;
+    std::vector<std::uint64_t> m_bins;
+};
+// ★ DROPS WINDOW + fee model (d5): split each position's entries by the
+// payee's mean give-author, exactly as split_give_author splits a delta.
+inline void split_give_author_window(::c2pool::v37n::settle::DropsWindow& w, const LanePrefix& lp, const bytes32& donation) {
+    std::map<std::uint64_t, std::map<bytes32, long long>> by_pos;
+    for (const auto& [ck, v] : w) by_pos[ck.first][ck.second] = v;
+    w.clear();
+    for (auto& [c, m] : by_pos) {
+        split_give_author(m, lp, donation);
+        for (const auto& [k, v] : m) if (v != 0) w[std::make_pair(c, k)] = v;
+    }
 }
 // The enrolment book of the prefix: a pure function of (the enrol set, [0, P)).
 // ★ DROPS-AUTO-ENROL: Auto enrols EVERY payee of the prefix at its first share
@@ -792,6 +824,21 @@ public:
                 m_enrol[t[1]] = std::move(g);
                 return;
             }
+            if (t[0] == "V") {   // DROPS WINDOW (A4b): the booking's window entries (c key work) x n
+                std::size_t n = 0;
+                try { n = static_cast<std::size_t>(std::stoull(t[2])); } catch (...) { ++l.malformed; return; }
+                if (t.size() != 3 + 3 * n) { ++l.malformed; return; }
+                ::c2pool::v37n::settle::DropsWindow w;
+                for (std::size_t k = 0; k < n; ++k) {
+                    std::vector<std::uint8_t> p;
+                    if (!unhex(t[4 + 3 * k], p) || p.size() != 32) { ++l.malformed; return; }
+                    bytes32 key{}; std::copy(p.begin(), p.end(), key.begin());
+                    try { w[std::make_pair(static_cast<std::uint64_t>(std::stoull(t[3 + 3 * k])), key)] = std::stoll(t[5 + 3 * k]); }
+                    catch (...) { ++l.malformed; return; }
+                }
+                m_window[t[1]] = std::move(w);
+                return;
+            }
             ++l.malformed;
         };
         int c;
@@ -831,6 +878,21 @@ public:
     ::c2pool::v37n::settle::DropsEnrolRegistry enrol(const std::string& bid) const {
         auto it = m_enrol.find(bid);
         return it == m_enrol.end() ? ::c2pool::v37n::settle::DropsEnrolRegistry{} : it->second;
+    }
+    // DROPS WINDOW (A4b): a booking's window entries, journalled with its delta
+    // (a re-drive books them). Written only when non-empty.
+    bool put_window(const std::string& bid, const ::c2pool::v37n::settle::DropsWindow& w) {
+        if (w.empty()) return true;
+        m_window[bid] = w;
+        std::string s = "V " + bid + " " + std::to_string(w.size());
+        for (const auto& [ck, v] : w)
+            s += " " + std::to_string(ck.first) + " " + hex(std::vector<std::uint8_t>(ck.second.begin(), ck.second.end())) +
+                 " " + std::to_string(v);
+        return append(s);
+    }
+    ::c2pool::v37n::settle::DropsWindow window(const std::string& bid) const {
+        auto it = m_window.find(bid);
+        return it == m_window.end() ? ::c2pool::v37n::settle::DropsWindow{} : it->second;
     }
     // WRITE-AHEAD: our own block (monerod/levin block id, 64 hex) at height h,
     // journalled BEFORE it is published. Called on the stratum listener thread
@@ -899,6 +961,7 @@ private:
     std::map<std::string, std::vector<std::uint8_t>> m_own, m_frames;
     std::map<std::string, Delta> m_booked;
     std::map<std::string, ::c2pool::v37n::settle::DropsEnrolRegistry> m_enrol;   // RAINDROP ENROL
+    std::map<std::string, ::c2pool::v37n::settle::DropsWindow> m_window;          // DROPS WINDOW (A4b)
     mutable std::mutex m_pub_mu;
     std::map<std::string, std::uint64_t> m_pub;   // WRITE-AHEAD: bid -> h, our own published blocks
     std::mutex m_io_mu;

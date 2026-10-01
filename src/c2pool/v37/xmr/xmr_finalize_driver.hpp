@@ -202,8 +202,11 @@ public:
         std::optional<settle::DropsFound> df;
         if (due_rule) {
             settle::DropsFound d = b.due ? *b.due : settle::DropsFound{};
-            d.deposit = b.has_carried_drops ? b.carried_drops
-                                            : settle::subthreshold_credit(b.params, b.harvested, b.drops);
+            // DROPS WINDOW (A4b): the work is window weight (b.due->window, booked by
+            // the shell's composition), never a deposit: the delta is not priced once.
+            if (m_ledger.rules().drops_window.on()) d.deposit.clear();
+            else d.deposit = b.has_carried_drops ? b.carried_drops
+                                                 : settle::subthreshold_credit(b.params, b.harvested, b.drops);
             for (auto it = d.deposit.begin(); it != d.deposit.end();) it = it->second == 0 ? d.deposit.erase(it) : std::next(it);
             if (!d.empty()) df = std::move(d);
         }

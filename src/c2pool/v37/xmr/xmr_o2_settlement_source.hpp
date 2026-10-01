@@ -445,6 +445,22 @@ public:
             ledger.rules().drops_due ? ledger.drops_available() : std::map<::v37::bytes32, long long>{};
         bool avail_pos = false;
         for (const auto& [k, v] : avail) { (void)k; if (v > 0) avail_pos = true; }
+        // DROPS WINDOW (A4b, ruling 2026-10-01 "Window price"): the pay-now
+        // split input is the cut's payees PLUS the booking-point window's DROPS
+        // weight at the cut (OwedLedger::drops_window_merge): DROPS work is in
+        // its payee's weight and in the SUM, paid in every lane block of its
+        // window. The receiver books the same split (main fold_credit). Rule
+        // off or nothing in the window: ctx.paynow_payees, byte for byte.
+        // The window is read at the cut the payees come from: the ledger's
+        // anchor under the anchor rule (ctx.credit_cut is then the block's own
+        // cut), else the block's credit cut.
+        const std::optional<std::uint64_t> win_at =
+            !ctx.has_credit_cut ? std::nullopt
+            : ledger.rules().anchor_cut ? (ledger.anchor_cut() ? std::optional<std::uint64_t>(ledger.anchor_cut()->next_pos) : std::nullopt)
+                                        : std::optional<std::uint64_t>(ctx.credit_cut.next_pos);
+        const std::vector<::c2pool::v37n::settle::WeightedPayee> win_payees =
+            win_at ? ledger.drops_window_merge(ctx.paynow_payees, *win_at) : ctx.paynow_payees;
+        if (!win_payees.empty() && ctx.paynow_payees.empty()) avail_pos = true;   // a DROPS-only window arms pay-now
         if (ctx.has_paynow && ctx.has_credit_cut && source == KFairSource::W4Propose &&
             (!ctx.paynow_payees.empty() || avail_pos)) {
             struct PayNowSet {
@@ -456,7 +472,7 @@ public:
                 std::map<::v37::bytes32, long long> avail;           // DROPS DUE: the clamp input
             };
             auto pv = std::make_shared<PayNowSet>();
-            pv->wp = ctx.paynow_payees;
+            pv->wp = win_payees;
             pv->avail = avail;
             bool payable = true;
             // DROPS DUE: a payee with avail > 0 and no share in the view is paid

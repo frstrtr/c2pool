@@ -36,15 +36,23 @@ inline ::v37::bytes32 enrol_mode_tag(EnrolMode m) {   // Auto / None only (List 
 // byte-identical.
 inline constexpr std::uint32_t kDropsRuleDue = 1;            // A5: the DROPS due in the ledger
 inline constexpr std::uint32_t kDropsRuleRaindropEnrol = 2;  // A3: enrolment by raindrop, registry in the ledger
-inline std::uint32_t drops_rule_tag(bool due, bool raindrop_enrol) {
-    return (due ? kDropsRuleDue : 0u) | (raindrop_enrol ? kDropsRuleRaindropEnrol : 0u);
+// A4b (ruling 2026-10-01, "Window price"): DROPS work is window weight, paid in
+// every lane block of its window ("V37W"), never priced once. A node with it
+// and a node without it split the same lane block differently: a separate bit,
+// so a fleet mixing the A5 rule (tag 3) and the window rule (tag 7) is refused
+// at HELLO by name.
+inline constexpr std::uint32_t kDropsRuleWindow = 4;
+inline std::uint32_t drops_rule_tag(bool due, bool raindrop_enrol, bool window = false) {
+    return (due ? kDropsRuleDue : 0u) | (raindrop_enrol ? kDropsRuleRaindropEnrol : 0u) |
+           (window ? kDropsRuleWindow : 0u);
 }
 inline std::string drops_rule_label(std::uint32_t r) {
     if (r == 0) return "none (pre-A5 rules)";
     std::string s;
     if (r & kDropsRuleDue) s += "due";
     if (r & kDropsRuleRaindropEnrol) s += s.empty() ? "raindrop-enrol" : "+raindrop-enrol";
-    if (r & ~(kDropsRuleDue | kDropsRuleRaindropEnrol)) s += (s.empty() ? "" : "+") + std::string("unknown");
+    if (r & kDropsRuleWindow) s += s.empty() ? "window" : "+window";
+    if (r & ~(kDropsRuleDue | kDropsRuleRaindropEnrol | kDropsRuleWindow)) s += (s.empty() ? "" : "+") + std::string("unknown");
     return s;
 }
 // The rule-tagged enrol digest: sha256d("V37ENROLRULE2" || base || u32 rule)

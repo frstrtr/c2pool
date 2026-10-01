@@ -407,6 +407,18 @@ static void re5_hello(Checker& C) {
     std::printf("    mismatched-rule HELLOs: refused=%zu named DROPS_RULE_MISMATCH=%zu of 4\n", refused, named);
     C(refused == 4 && named == 4, "RE5 a peer with another DROPS rule is refused at HELLO BY NAME, both directions (4/4)");
     C(rl::hello_mismatch(ours, same).empty(), "RE5 a peer with the same rule is accepted");
+#if defined(C2POOL_XMR_DROPS_WINDOW)
+    {   // A4b: the window rule rides the same tag (bit 4): a fleet mixing tag 3 and tag 7 is refused BY NAME
+        const std::uint32_t win = rl::drops_rule_tag(true, true, true);
+        rl::Hello wp = hello_with(dx::enrol_mode_digest(rl::EnrolMode::Auto, {}, win), 6);
+        wp.lane_params_digest = dx::hello_digest_with_enrol(lpd, rl::EnrolMode::Auto, {}, win);
+        const std::string a = rl::hello_mismatch(ours, wp), b = rl::hello_mismatch(wp, ours);
+        std::printf("    window peer rule=%u -> %s\n", win, a.c_str());
+        C(win == 7 && a.rfind(rl::kDropsRuleMismatch, 0) == 0 && b.rfind(rl::kDropsRuleMismatch, 0) == 0 &&
+          a.find("window") != std::string::npos,
+          "RE5 A4b: the window rule is tag 7; a tag-3 / tag-7 fleet is refused BY NAME both ways (window named)");
+    }
+#endif
     rl::Hello list_other = hello_with(dx::enrol_mode_digest(rl::EnrolMode::List, {b32_of(1)}, full), 5);
     list_other.lane_params_digest = dx::hello_digest_with_enrol(lpd, rl::EnrolMode::List, {b32_of(1)}, full);
     C(rl::hello_mismatch(ours, list_other).rfind(rl::kEnrolSetMismatch, 0) == 0,

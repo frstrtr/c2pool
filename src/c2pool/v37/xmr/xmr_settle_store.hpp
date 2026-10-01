@@ -81,7 +81,7 @@ struct ISettleStore {
 // Records: u8 ver=1 ‖ payload. Ints little-endian. Fail-closed on a short read.
 // ---------------------------------------------------------------------------
 namespace store_codec {
-constexpr std::uint8_t SCHEMA_VER = 4;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments
+constexpr std::uint8_t SCHEMA_VER = 5;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments; 5: + the DROPS window entries
 
 inline std::string chain_fmt(::v37::ChainId c) {
     char b[16];
@@ -176,11 +176,15 @@ struct SettleEvent {
     // FOUND, RAINDROP ENROL rule (schema 4): the payees the block enrolled by
     // raindrop (eff + payout ref). Empty => byte-identical to schema 3.
     ::c2pool::v37n::settle::DropsEnrolRegistry drops_enrol;
+    // FOUND, DROPS WINDOW rule (schema 5, A4b): the block's window entries.
+    // Empty => byte-identical to schema 3/4.
+    ::c2pool::v37n::settle::DropsWindow drops_window;
 
     std::string serialize() const {
         std::string s;
-        const bool enrol = has_drops && !drops_enrol.empty();
-        s.push_back(char(enrol ? store_codec::SCHEMA_VER : has_drops ? std::uint8_t{3} : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
+        const bool win = has_drops && !drops_window.empty();
+        const bool enrol = has_drops && (!drops_enrol.empty() || win);
+        s.push_back(char(win ? std::uint8_t{5} : enrol ? std::uint8_t{4} : has_drops ? std::uint8_t{3} : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
         s.push_back(char(static_cast<std::uint8_t>(kind)));
         store_codec::put_str(s, bid);
         store_codec::put_amounts(s, credit);
@@ -205,6 +209,14 @@ struct SettleEvent {
                 store_codec::put_u64(s, r.eff);
                 s.push_back(char(static_cast<std::uint8_t>(r.ref.kind)));
                 store_codec::put_str(s, std::string(r.ref.payload.begin(), r.ref.payload.end()));
+            }
+        }
+        if (win) {   // schema 5
+            store_codec::put_u64(s, drops_window.size());
+            for (const auto& [ck, v] : drops_window) {
+                store_codec::put_u64(s, ck.first);
+                s.append(reinterpret_cast<const char*>(ck.second.data()), ck.second.size());
+                store_codec::put_u64(s, static_cast<std::uint64_t>(v));
             }
         }
         return s;
@@ -244,6 +256,14 @@ struct SettleEvent {
                 e.drops_enrol[k] = std::move(rec);
             }
         }
+        if (ver >= 5) {   // DROPS WINDOW
+            const std::uint64_t n = r.u64();
+            for (std::uint64_t i = 0; i < n; ++i) {
+                const std::uint64_t c = r.u64();
+                const ::v37::bytes32 k = r.b32();
+                e.drops_window[std::make_pair(c, k)] = static_cast<long long>(r.u64());
+            }
+        }
         r.expect_end();
         return e;
     }
@@ -264,12 +284,13 @@ inline std::optional<::c2pool::v37n::settle::DropsFound> drops_of(const SettleEv
     ::c2pool::v37n::settle::DropsFound d;
     d.deposit = e.drops_deposit; d.claim = e.drops_claim; d.claimed = e.drops_claimed;
     d.enrol_add = e.drops_enrol;
+    d.window = e.drops_window;
     return d;
 }
 inline void set_drops(SettleEvent& e, const std::optional<::c2pool::v37n::settle::DropsFound>& d) {
     e.has_drops = d.has_value() && !d->empty();
-    e.drops_deposit.clear(); e.drops_claim = false; e.drops_claimed.clear(); e.drops_enrol.clear();
-    if (e.has_drops) { e.drops_deposit = d->deposit; e.drops_claim = d->claim; e.drops_claimed = d->claimed; e.drops_enrol = d->enrol_add; }
+    e.drops_deposit.clear(); e.drops_claim = false; e.drops_claimed.clear(); e.drops_enrol.clear(); e.drops_window.clear();
+    if (e.has_drops) { e.drops_deposit = d->deposit; e.drops_claim = d->claim; e.drops_claimed = d->claimed; e.drops_enrol = d->enrol_add; e.drops_window = d->window; }
 }
 inline void set_cut(SettleEvent& e, const std::optional<::c2pool::v37n::settle::AnchorCut>& c) {
     e.has_cut = c.has_value();

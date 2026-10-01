@@ -2560,6 +2560,34 @@ private:
         }
         return true;
     }
+    // DROPS WINDOW (sidecar v3 "dw="): c:key64=work[,...] (signed decimal work)
+    static std::string window_str(const ::c2pool::v37n::settle::DropsWindow& w) {
+        std::string s;
+        for (const auto& [ck, v] : w) {
+            if (!s.empty()) s += ",";
+            s += std::to_string(ck.first) + ":" + hex_of(ck.second) + "=" + std::to_string(v);
+        }
+        return s.empty() ? std::string("-") : s;
+    }
+    static bool window_parse(const std::string& s, ::c2pool::v37n::settle::DropsWindow& out) {
+        out.clear();
+        if (s == "-") return true;
+        std::size_t p = 0;
+        while (p < s.size()) {
+            std::size_t c = s.find(',', p); if (c == std::string::npos) c = s.size();
+            const std::string item = s.substr(p, c - p);
+            const std::size_t colon = item.find(':');
+            if (colon == std::string::npos || item.size() < colon + 1 + 64 + 2 || item[colon + 1 + 64] != '=') return false;
+            ::v37::bytes32 k{};
+            if (!hash_from_hex(lower_hex(item.substr(colon + 1, 64)), k)) return false;
+            try {
+                out[std::make_pair(static_cast<std::uint64_t>(std::stoull(item.substr(0, colon))), k)] =
+                    std::stoll(item.substr(colon + 1 + 64 + 1));
+            } catch (...) { return false; }
+            p = c + 1;
+        }
+        return true;
+    }
     static std::string sidecar_line(const std::string& bid, const PendingRec& r) {
         std::string s = "2 " + bid + " " + std::to_string(r.height) + " " +
                         (r.payee ? hex_of(*r.payee) : std::string("-")) + " " +
@@ -2573,6 +2601,7 @@ private:
             s += " dd=" + map_str(r.drops->deposit);
             if (r.drops->claim) s += " dc=" + map_str(r.drops->claimed);
             if (!r.drops->enrol_add.empty()) s += " de=" + enrol_str(r.drops->enrol_add);   // RAINDROP ENROL
+            if (!r.drops->window.empty()) s += " dw=" + window_str(r.drops->window);         // DROPS WINDOW (A4b)
         }
         s += "\n";
         return s;
@@ -2655,6 +2684,11 @@ private:
             if (!map_parse(cm, r.credit) || !map_parse(pm, r.payout)) return false;
             std::string ct;   // ANCHOR: optional trailing "cut=P:spine"; v3: then "dd=map" [" dc=map"]
             while (is >> ct) {
+                if (ver == "3" && ct.rfind("dw=", 0) == 0) {   // DROPS WINDOW (A4b)
+                    if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
+                    if (!window_parse(ct.substr(3), r.drops->window)) return false;
+                    continue;
+                }
                 if (ver == "3" && ct.rfind("de=", 0) == 0) {   // RAINDROP ENROL
                     if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
                     if (!enrol_parse(ct.substr(3), r.drops->enrol_add)) return false;

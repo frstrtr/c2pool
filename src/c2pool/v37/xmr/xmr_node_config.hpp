@@ -40,6 +40,8 @@ namespace c2pool::v37n::xmr {
 // for both, so the floor the relay admits and the floor the estimator prices
 // cannot drift apart.
 inline constexpr std::uint32_t kXmrDropsFloorShift = 6;
+// DROPS WINDOW (A4b): log2 of one share's work in the estimator unit (== drops::kXmrDropsLz).
+inline constexpr unsigned kXmrDropsWorkLz = 32;
 inline constexpr std::uint32_t kXmrCreditModeCount = 2;
 
 // DUST DECAY, in MONERO HEIGHTS (audit A9). The decay clock is the FINALIZE
@@ -327,6 +329,7 @@ struct XmrNodeConfig {
     bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
     bool            ledger_drops_due = false;      // DROPS DUE (A5, ruling 09-30): the DROPS delta is a deposit into the committed due, claimed in pay-now
     bool            ledger_raindrop_enrol = false; // RAINDROP ENROL (A3, ruling 09-30): the DROPS enrolment registry (V37G), refs are ledger state
+    std::uint64_t   ledger_drops_window_rw = 0;    // DROPS WINDOW (A4b, ruling 10-01): one receipt's lane weight; != 0 => DROPS work is window weight (V37W), never priced once
     bool            ledger_merkle_rows = false;    // §13: owed_digest = a Merkle root over the balances (light-client proofs)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so

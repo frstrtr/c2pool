@@ -959,6 +959,22 @@ inline std::map<bytes32, long long> compose_credit_replace(
 //                      reproducing the builder's node-local lane. The block's
 //                      own cut becomes the anchor when it finalizes. Committed
 //                      in owed_digest ("V37A").
+// DROPS WINDOW (OwedLedgerRules::drops_window, handoff A4b): the lane geometry
+// the window weights are read with. A share at age a (positions behind the
+// cut) weighs rw * 2^62 * lambda^a (Q62, lambda = 2^(-1/half_life)) while
+// a < window; sub-threshold work w (the estimator's unit, 2^work_lz per share)
+// weighs (w << (62 - work_lz)) * rw * lambda^a, the same unit. All integer.
+struct DropsWindowRule {
+    u64      window = 0;      // W, lane positions (0 = rule off)
+    u64      half_life = 0;   // the lane's half_life (positions)
+    u64      epoch_len = 0;   // the lane's E (DecayTables geometry)
+    u64      rw = 0;          // one receipt's lane weight (Q62 units of 2^62)
+    unsigned work_lz = 0;     // log2 of one share's work in the estimator unit
+    bool on() const { return window && half_life && epoch_len && rw && work_lz && work_lz <= 62; }
+    bool operator==(const DropsWindowRule&) const = default;
+};
+#define C2POOL_XMR_DROPS_WINDOW 1   // the A4b window API is present (KATs test for it)
+
 struct OwedLedgerRules {
     long long arm_floor = 0;
     bool      rotate_on_payment = false;
@@ -995,6 +1011,17 @@ struct OwedLedgerRules {
     // registry is committed in owed_digest ("V37G"). Off: no registry, no
     // section, byte-identical.
     bool      raindrop_enrol = false;
+    // DROPS WINDOW (XMR, handoff A4b, operator ruling 2026-10-01 "Window
+    // price"; turned on with the DROPS due): sub-threshold work is not priced
+    // once. A lane block's composition books each payee's credited
+    // sub-threshold work per bin (the Count REPLACE delta in work units, signed)
+    // as WINDOW WEIGHT at that bin's lane position; it joins the committed
+    // window `dwin` at the block's FINALIZE and is paid in EVERY lane block
+    // whose cut holds it in the window, decayed by its age exactly like a
+    // share (drops_window_merge). The deposit / due path then carries nothing
+    // (no one-shot price, never paid twice). Committed in owed_digest ("V37W").
+    // Off (window == 0): no window, no section, byte-identical.
+    DropsWindowRule drops_window{};
 };
 
 // ANCHOR (OwedLedgerRules::anchor_cut): a lane block's on-chain credit cut, raw
@@ -1030,17 +1057,108 @@ struct DropsEnrolRec {
 using DropsEnrolRegistry = std::map<bytes32, DropsEnrolRec>;
 #define C2POOL_XMR_RAINDROP_ENROL 1   // the A3 registry API is present (KATs test for it)
 
+// DROPS WINDOW (A4b): window entries, (c, payee) -> signed sub-threshold work
+// in the estimator's unit. c is the bin's END position on the lane prefix (the
+// number of receipts at or below the bin), so at a cut with next_pos N the
+// entry is N - c positions old: the age of the bin's last share.
+using DropsWindow = std::map<std::pair<u64, bytes32>, long long>;
+
 struct DropsFound {
     std::map<bytes32, long long> deposit;
     bool                         claim = false;
     std::map<bytes32, long long> claimed;
     std::map<bytes32, long long> writeoff;
     DropsEnrolRegistry           enrol_add;
-    bool empty() const { return deposit.empty() && !claim && claimed.empty() && enrol_add.empty(); }
+    DropsWindow                  window;   // DROPS WINDOW (drops_window rule only): the block's window entries
+    bool empty() const { return deposit.empty() && !claim && claimed.empty() && enrol_add.empty() && window.empty(); }
     bool operator==(const DropsFound& o) const {
-        return deposit == o.deposit && claim == o.claim && claimed == o.claimed && enrol_add == o.enrol_add;
+        return deposit == o.deposit && claim == o.claim && claimed == o.claimed && enrol_add == o.enrol_add &&
+               window == o.window;
     }
 };
+
+// The canonical bytes of window entries (the V37W section and the FOUND leaf):
+// u64 n, then per entry u64 c || key(32) || i64 work, (c, key) ascending.
+inline void put_drops_window(std::vector<std::uint8_t>& b, const DropsWindow& w) {
+    const std::uint64_t n = w.size();
+    for (int i = 0; i < 8; ++i) b.push_back((n >> (8 * i)) & 0xff);
+    for (const auto& [ck, v] : w) {
+        for (int i = 0; i < 8; ++i) b.push_back((ck.first >> (8 * i)) & 0xff);
+        b.insert(b.end(), ck.second.begin(), ck.second.end());
+        const std::uint64_t uv = static_cast<std::uint64_t>(v);
+        for (int i = 0; i < 8; ++i) b.push_back((uv >> (8 * i)) & 0xff);
+    }
+}
+
+// lambda^age in Q62 on the lane's own decay tables (decay[age mod E] x
+// epoch_shift[age / E]), for age < rule.window. Integer only.
+class DropsWindowDecay {
+public:
+    explicit DropsWindowDecay(const DropsWindowRule& r) : m_E(r.epoch_len) {
+        m_tab.init(r.half_life, r.epoch_len, r.epoch_len, r.window / r.epoch_len + 4);
+    }
+    u64 at(u64 age) const {
+        const u64 d = m_tab.decay[age % m_E];
+        const u64 e = age / m_E;
+        return e == 0 ? d : ::v37::mul_q64(d, m_tab.epoch_shift[e]);
+    }
+private:
+    u64 m_E;
+    ::v37::DecayTables m_tab;
+};
+
+// Per payee, the window weight at a cut with next_pos N, split by sign:
+// (positive part, negative part), each a SUM of |work| << (62 - lz) * rw *
+// lambda^(N - c) over the entries with c <= N and N - c < W.
+using DropsWindowWeights = std::map<bytes32, std::pair<U256, U256>>;
+inline DropsWindowWeights drops_window_weights(const DropsWindow& w, u64 N, const DropsWindowRule& r) {
+    DropsWindowWeights out;
+    if (!r.on() || w.empty()) return out;
+    const DropsWindowDecay dec(r);
+    for (const auto& [ck, v] : w) {
+        if (v == 0 || ck.first > N || N - ck.first >= r.window) continue;
+        const u64 mag = v < 0 ? (v == std::numeric_limits<long long>::min() ? (u64(1) << 63) : u64(-v)) : u64(v);
+        U256 x = U256::from_u128(static_cast<::v37::u128>(mag) << (62 - r.work_lz)).mul_small(r.rw);
+        x = x.mul_q(dec.at(N - ck.first));
+        auto& e = out[ck.second];
+        if (v > 0) e.first += x; else e.second += x;
+    }
+    return out;
+}
+
+// THE WINDOW SPLIT INPUT: the cut's projected share payees with the window's
+// DROPS weight added per key (a DROPS-only payee joins with `pay_of(key)`),
+// each key's total clamped at zero (a net-negative key weighs nothing and is
+// dropped). split_reward over the result divides the reward exactly once: the
+// DROPS work is in every payee's weight AND in the SUM. Rule off or no entry
+// in the window: the input vector itself, byte for byte.
+template <class PayOf>
+inline std::vector<WeightedPayee> drops_window_merge(const std::vector<WeightedPayee>& shares,
+                                                     const DropsWindow& w, u64 N,
+                                                     const DropsWindowRule& r, PayOf&& pay_of) {
+    const DropsWindowWeights dw = drops_window_weights(w, N, r);
+    if (dw.empty()) return shares;
+    // One row per key (key ascending): share weight + DROPS positive part,
+    // minus the DROPS negative part, clamped at zero.
+    std::map<bytes32, std::pair<U256, ScriptRef>> acc;
+    for (const auto& p : shares) {
+        auto [it, fresh] = acc.try_emplace(p.key, p.weight, p.pay);
+        if (!fresh) it->second.first += p.weight;
+    }
+    for (const auto& [k, pn] : dw) {
+        (void)pn;
+        if (!acc.count(k)) acc.emplace(k, std::make_pair(U256{}, pay_of(k)));
+    }
+    std::vector<WeightedPayee> out;
+    for (const auto& [k, wp] : acc) {
+        U256 pos = wp.first;
+        U256 neg{};
+        if (auto it = dw.find(k); it != dw.end()) { pos += it->second.first; neg = it->second.second; }
+        if (!(neg < pos)) continue;                        // net <= 0: weighs nothing
+        out.push_back(WeightedPayee{k, pos - neg, wp.second});
+    }
+    return out;
+}
 
 // The canonical bytes of registry records (the V37G section and the FOUND
 // leaf): u64 n, then per record key(32) || u64 eff || u8 kind || u8 len || payload.
@@ -1086,6 +1204,45 @@ inline void apply_drops_due(std::map<bytes32, long long>& credit,
     }
 }
 
+// ★ DROPS WINDOW (A4b): the SAME composition as subthreshold_credit, the same
+// rows, the same enrolment and the same per-(payee, interval) dedup, but in
+// WORK, not coin: each credited (payee, bin) row books est - covered (the
+// Count REPLACE delta, signed, saturated into i64) at the bin's end position
+// c = pos_of(bin) on the lane prefix. Nothing is priced here: the window
+// prices it in every lane block that holds it (drops_window_merge). Gate OFF
+// => EMPTY.
+template <class PosOf>
+inline DropsWindow subthreshold_window(const ::v37::LaneParams& params,
+                                       const std::vector<HarvestedReceipt>& harvested,
+                                       const DropsCompose& ctx, PosOf&& pos_of) {
+    DropsWindow out;
+    const subthreshold::SubthresholdParams sp = to_subthreshold_params(params);
+    if (!sp.enabled) return out;
+    std::map<subthreshold::DedupKey, bool> already_seen;
+    constexpr u64 kMax = static_cast<u64>(std::numeric_limits<long long>::max());
+    const auto low_i64 = [&](const subthreshold::u320& x) -> u64 {   // saturated at INT64_MAX
+        for (int i = 1; i < 5; ++i) if (x.w[static_cast<std::size_t>(i)]) return kMax;
+        return x.w[0] > kMax ? kMax : x.w[0];
+    };
+    for (const auto& hr : harvested) {
+        subthreshold::DedupKey key;
+        key.payee = hr.payee;
+        key.seq   = hr.interval;
+        const subthreshold::IntervalWork w =
+            subthreshold::interval_work(sp, key, hr.collector, already_seen,
+                                        ctx.enrolled(hr.payee, hr.interval));
+        if (!w.credited) continue;
+        long long v = 0;
+        if (w.est.ge(w.covered)) { subthreshold::u320 d = w.est; d.sub(w.covered); v = static_cast<long long>(low_i64(d)); }
+        else { subthreshold::u320 d = w.covered; d.sub(w.est); v = -static_cast<long long>(low_i64(d)); }
+        if (v == 0) continue;
+        const auto ck = std::make_pair(static_cast<u64>(pos_of(hr.interval)), hr.payee);
+        const long long e = drops_sat_add(out.count(ck) ? out.at(ck) : 0, v);
+        if (e == 0) out.erase(ck); else out[ck] = e;
+    }
+    return out;
+}
+
 class OwedLedger {
 public:
     using Amounts = std::map<bytes32, long long>;
@@ -1128,6 +1285,8 @@ public:
         }
         if (m_rules.raindrop_enrol && drops)   // RAINDROP ENROL: the payees this block enrolled
             for (const auto& [k, r] : drops->enrol_add) if (r.eff != 0) p.enrol_add[k] = r;
+        if (m_rules.drops_window.on() && drops)   // DROPS WINDOW: the block's window entries
+            for (const auto& [ck, v] : drops->window) if (v != 0) p.window[ck] = v;
         m_eo_index.on_found(p.payout,                 // R3: eo -= payout (fe frozen)
                             [this](const bytes32& k) { return fe_at(k); });
         auto ins = m_pending.emplace(bid, std::move(p));
@@ -1146,6 +1305,11 @@ public:
             const char tg[4] = {'V', '3', '7', 'G'};
             leaf.insert(leaf.end(), tg, tg + 4);
             put_enrol_records(leaf, q.enrol_add);
+        }
+        if (!q.window.empty()) {   // DROPS WINDOW: never under the rule off
+            const char tw[4] = {'V', '3', '7', 'W'};
+            leaf.insert(leaf.end(), tw, tw + 4);
+            put_drops_window(leaf, q.window);
         }
         bump(leaf);
     }
@@ -1192,6 +1356,17 @@ public:
         }
         for (auto it = a.begin(); it != a.end();) it = it->second == 0 ? a.erase(it) : std::next(it);
         return a;
+    }
+    // DROPS WINDOW: the committed (finalized) window, and THE split input of a
+    // lane block booked on this ledger at a cut with next_pos N: the cut's
+    // projected payees plus the window's DROPS weight at N
+    // (drops_window_merge). A DROPS-only payee is paid through its registry
+    // ref (RAINDROP ENROL, ledger state). Rule off: `shares` unchanged.
+    const DropsWindow& drops_window() const { return m_dwin; }
+    std::vector<WeightedPayee> drops_window_merge(const std::vector<WeightedPayee>& shares, u64 N) const {
+        if (!m_rules.drops_window.on() || m_dwin.empty()) return shares;
+        return ::c2pool::v37n::settle::drops_window_merge(shares, m_dwin, N, m_rules.drops_window,
+            [this](const bytes32& k) { const auto r = drops_enrol_ref(k); return r ? *r : ScriptRef{}; });
     }
     // DROPS DUE: the committed (finalized) map and the written-off total.
     const Amounts& drops_due() const { return m_due; }
@@ -1282,6 +1457,13 @@ public:
                 auto [r, fresh] = m_enrol.try_emplace(k, e);
                 if (!fresh && e.eff < r->second.eff) r->second = e;
             }
+        if (m_rules.drops_window.on()) {   // DROPS WINDOW: the block's entries join; entries past the window leave
+            for (const auto& [ck, v] : it->second.window) m_dwin[ck] = drops_sat_add(m_dwin[ck], v);
+            const u64 N = m_anchor ? m_anchor->next_pos : 0;
+            for (auto d = m_dwin.begin(); d != m_dwin.end();)
+                d = (d->second == 0 || (d->first.first <= N && N - d->first.first >= m_rules.drops_window.window))
+                        ? m_dwin.erase(d) : std::next(d);
+        }
         m_pending.erase(it);
         m_settled.insert(bid);
         const Amounts decayed = decay_dust(bin_height);
@@ -1634,6 +1816,11 @@ public:
             pre.insert(pre.end(), gt, gt + 4);
             put_enrol_records(pre, m_enrol);
         }
+        if (m_rules.drops_window.on()) {   // DROPS WINDOW: it decides the E_b of every lane block it reaches
+            const char wt[4] = {'V', '3', '7', 'W'};
+            pre.insert(pre.end(), wt, wt + 4);
+            put_drops_window(pre, m_dwin);
+        }
         if (m_rules.anchor_cut) {   // ANCHOR: it decides every coinbase built on this state
             const char at[4] = {'V', '3', '7', 'A'};
             pre.insert(pre.end(), at, at + 4);
@@ -1708,6 +1895,7 @@ private:
         Amounts credit; Amounts payout; std::optional<AnchorCut> cut;
         Amounts deposit, claimed;   // DROPS DUE (rule on only)
         DropsEnrolRegistry enrol_add;   // RAINDROP ENROL (rule on only)
+        DropsWindow window;         // DROPS WINDOW (rule on only)
         long long writeoff = 0;     // DROPS DUE diagnostics (never committed)
     };
 
@@ -1862,6 +2050,7 @@ private:
     std::optional<AnchorCut> m_anchor;   // ANCHOR (OwedLedgerRules::anchor_cut)
     Amounts   m_due;                     // DROPS DUE (OwedLedgerRules::drops_due), finalized, committed "V37U"
     long long m_drops_writeoff = 0;      // DROPS DUE diagnostics: written off at FINALIZE (never committed)
+    DropsWindow        m_dwin;           // DROPS WINDOW (OwedLedgerRules::drops_window), finalized, committed "V37W"
     DropsEnrolRegistry m_enrol;          // RAINDROP ENROL (OwedLedgerRules::raindrop_enrol), finalized, committed "V37G"
     u64 m_seq = 0;
     Amounts m_finalW;                              // finalized owed partition
