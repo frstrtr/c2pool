@@ -252,8 +252,10 @@ struct CoinbaseInputs {
     // ::tie), each the same fraction of its
     // E_b (all of it unless the owed pass left less). The cash of the payees
     // without a slot is REDISTRIBUTED pro rata to the admitted payees and taken
-    // off the credit of those it came from (allocate_exact_sum's credit_delta):
-    // never an advance. Pay-now never fails the build for want of a slot.
+    // off the credit of those it came from (allocate_exact_sum's credit_delta,
+    // which sums to 0): never an advance. When nobody is admitted (the owed pass
+    // took every slot), the payees the owed pass paid receive it instead, pro
+    // rata to what they are paid. Pay-now never fails the build for want of a slot.
     bool           spend_floor = false;
     // SPEND-COST FLOOR only: the positive balances the owed pass does not take
     // (below c, so unarmed, or otherwise not proposed), in the canonical order

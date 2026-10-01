@@ -95,6 +95,15 @@ into one transaction for pool members is a later stage (§7).
      and comes off the waiting payees' credit for this block. This is
      P2Pool's rule for outputs that do not fit. Their work stays in the window
      and earns in the next blocks.
+  3. **Nobody admitted** (the owed pass took every slot; ruling 2026-10-02).
+     The payees paid in this block are then the ones the owed pass paid. The
+     cash goes to them, pro rata to what the owed pass paid them, into their
+     outputs (no new slot), and they are credited the same amount. Cash and
+     credit still move together, and nothing leaks to the donation output
+     (`v37_xmr_spend_floor_kat` F2e). Only when no payee has an output at all
+     (an output cap with no payee slot) does the cash stay in the residual; the
+     waiting payees' credit still comes off, because crediting work whose cash
+     went to the donation would be a claim nothing backs.
 * **A balance below c is paid when there is room** (ruling 2026-09-30,
   audit A8). The owed pass takes only balances at or above c. Every other
   positive balance is then paid, in the salted order
@@ -106,7 +115,8 @@ into one transaction for pool members is a later stage (§7).
 * **Never an advance** (ruling 2026-09-29). Pay-now is a flow. A miner that
   leaves or changes address never returns work paid ahead, so no payee is
   paid more than it is credited. The redistribution is booked as a credit
-  delta (`allocate_exact_sum`'s `credit_delta`, Σ = 0). Every node gets the
+  delta (`allocate_exact_sum`'s `credit_delta`, Σ = 0 whenever any payee has an
+  output). Every node gets the
   delta from its recompute and applies it to the E_b before the net booking.
   Rehearsal M7: no balance is ever negative.
 * The part of a waiting payee's E_b that the owed pass spent on older debts

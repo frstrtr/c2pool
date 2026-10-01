@@ -14,7 +14,8 @@
 //       quantized up; known values, monotone in the reward.
 //   F2  with room in the block every payee, dust included, is paid its exact
 //       E_b; F2b without room its cash is REDISTRIBUTED to the paid payees and
-//       taken off its credit (credit delta, sum 0): never an advance.
+//       taken off its credit (credit delta, sum 0): never an advance. F2e
+//       when nobody is admitted, the payees the owed pass paid receive it.
 //   F3  too few output slots: the largest payees get the slots, the rest
 //       wait; no CapTooSmall; the advance cap sends the excess to the residual.
 //   F4  the owed pass pays no balance below c.
@@ -203,6 +204,69 @@ void f2d_debt_first() {
     L.on_block_finalized("b", 2);
     CHECK(L.effective_owed(a.id) == static_cast<long long>(old_debt - w.eb) && L.effective_owed(w.id) == static_cast<long long>(w.eb),
           "ledger: A's debt shrinks by the dust's cash, the dust keeps its balance; the total is unchanged and nothing is negative");
+}
+
+void f2e_nobody_admitted() {
+    std::printf("== F2e. the owed pass takes every slot: the payees it paid receive the waiting cash ==\n");
+    const std::uint64_t c = x6::spend_floor(kTail);
+    auto owed_of = [](std::uint8_t k, std::uint64_t amt, std::uint64_t age) {
+        x6::OwedEntry e; e.pay = ref_of(k); e.identity = id_of(e.pay); e.owed = amt; e.first_eligible = age; return e;
+    };
+    const x6::OwedEntry o1 = owed_of(81, 8 * c, 1), o2 = owed_of(84, 4 * c, 2);   // old balances, no work in this block
+    const P w1 = payee(82, 361000000000ull), w2 = payee(83, 239000000000ull);       // this block's miners, no owed output
+    const std::uint64_t window = w1.eb + w2.eb;
+    const std::uint64_t reward = o1.owed + o2.owed + window + fee::kDonationMarkerPico;
+    auto in = fee_on_inputs(reward, true);
+    in.output_cap = 3;                                                // donation (folds) + two slots: the owed pass takes both
+    in.owed = {o1, o2};
+    arm(in, {w1, w2});
+    Amounts delta;
+    x6::BuildError err{};
+    const auto outs = x6::allocate_exact_sum(in, &err, &delta);
+    const ::v37::bytes32 D = fee::donation_identity(kNet);
+    CHECK(err == x6::BuildError::None && sum_of(outs) == reward, "builds, exact sum");
+    const std::uint64_t p1 = to(outs, o1.identity), p2 = to(outs, o2.identity);
+    CHECK(to(outs, w1.id) == 0 && to(outs, w2.id) == 0 && outs.size() == 3, "no slot is left: the window payees get no output");
+    CHECK(p1 + p2 == o1.owed + o2.owed + window, "the owed payees receive their balances plus the window's cash (%llu)",
+          (unsigned long long)window);
+    CHECK(p1 - o1.owed == 2 * (p2 - o2.owed), "pro rata to what the owed pass paid them (2:1)");
+    CHECK(to(outs, D) == fee::kDonationMarkerPico, "nothing leaks to the donation output: only its marker (got %llu)",
+          (unsigned long long)to(outs, D));
+    long long dsum = 0; for (const auto& [k2, d] : delta) dsum += d;
+    CHECK(dsum == 0, "the credit delta sums to zero (got %lld): cash and credit move together", dsum);
+    CHECK(delta[o1.identity] == static_cast<long long>(p1 - o1.owed) && delta[o2.identity] == static_cast<long long>(p2 - o2.owed) &&
+          delta[w1.id] == -static_cast<long long>(w1.eb) && delta[w2.id] == -static_cast<long long>(w2.eb),
+          "the owed payees are CREDITED what they got over their balance; the waiting payees' credit moves with the cash");
+    // book it: credit = E_b + delta, payout = the outputs; every balance ends at 0
+    Amounts credit{{w1.id, (long long)w1.eb}, {w2.id, (long long)w2.eb}};
+    for (const auto& [k2, d] : delta) { credit[k2] += d; if (credit[k2] == 0) credit.erase(k2); }
+    st::OwedLedger L(7);
+    L.on_block_found("old", Amounts{{o1.identity, (long long)o1.owed}, {o2.identity, (long long)o2.owed}}, {});
+    L.on_block_finalized("old", 1);
+    L.on_block_found("b", credit, Amounts{{o1.identity, (long long)p1}, {o2.identity, (long long)p2}});
+    L.on_block_finalized("b", 2);
+    CHECK(L.effective_owed(o1.identity) == 0 && L.effective_owed(o2.identity) == 0 &&
+          L.effective_owed(w1.id) == 0 && L.effective_owed(w2.id) == 0,
+          "ledger after FINALIZE: every balance is 0 (no unbacked claim, no debt)");
+}
+
+void f2f_no_payee_slot() {
+    std::printf("== F2f. no payee slot at all: the cash stays in the residual and the credit comes off ==\n");
+    const P w1 = payee(85, 361000000000ull), w2 = payee(86, 239000000000ull);
+    const std::uint64_t reward = w1.eb + w2.eb + fee::kDonationMarkerPico;
+    auto in = fee_on_inputs(reward, true);
+    in.output_cap = 1;                                                // the donation output only: no payee slot
+    arm(in, {w1, w2});
+    Amounts delta;
+    x6::BuildError err{};
+    const auto outs = x6::allocate_exact_sum(in, &err, &delta);
+    const ::v37::bytes32 D = fee::donation_identity(kNet);
+    CHECK(err == x6::BuildError::None && outs.size() == 1 && to(outs, D) == reward, "builds: one output, the residual carries the reward");
+    CHECK(delta[w1.id] == -static_cast<long long>(w1.eb) && delta[w2.id] == -static_cast<long long>(w2.eb),
+          "the waiting payees' credit comes off: no claim without its cash");
+    Amounts credit{{w1.id, (long long)w1.eb}, {w2.id, (long long)w2.eb}};
+    for (const auto& [k2, d] : delta) { credit[k2] += d; if (credit[k2] == 0) credit.erase(k2); }
+    CHECK(credit.empty(), "the block books no credit, so the ledger does not grow");
 }
 
 void f2c_short_pool() {
@@ -561,6 +625,8 @@ int main() {
     f2b_no_room();
     f2c_short_pool();
     f2d_debt_first();
+    f2e_nobody_admitted();
+    f2f_no_payee_slot();
     f3_slots();
     f3b_worth_spending_first();
     f4_owed_floor();

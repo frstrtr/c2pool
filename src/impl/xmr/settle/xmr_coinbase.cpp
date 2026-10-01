@@ -408,7 +408,14 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                 //       then grows until it is paid, or decays if abandoned.
                 //   (2) REDISTRIBUTION of what is still left, up to what the waiting
                 //       payees were credited: to the admitted payees pro rata, and
-                //       taken off the waiting payees' credit (credit_delta).
+                //       taken off the waiting payees' credit (credit_delta). When
+                //       nobody is admitted (the owed pass took every slot), it goes
+                //       to the payees the owed pass paid, pro rata to what they are
+                //       paid, into their outputs: they are the payees paid in this
+                //       block (operator ruling 2026-10-02, review-criticals 06).
+                //       Cash and credit move together, so credit_delta sums to 0,
+                //       except with no payee output at all: then the cash stays in
+                //       the residual and the waiting payees' credit still comes off.
                 //   (3) The rest (uncredited cash) stays in the residual.
                 alloc = paynow_split(pool_left, take);
                 std::uint64_t given = 0;
@@ -430,7 +437,9 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                 for (std::size_t i = 0; i < ents.size(); ++i)
                     if (take[i] == 0 && ents[i].eb > 0) { wait[i] = ents[i].eb; wait_sum += ents[i].eb; }
                 const std::uint64_t moved = static_cast<std::uint64_t>(static_cast<unsigned __int128>(spare) < wait_sum ? spare : wait_sum);
-                if (moved > 0) {
+                unsigned __int128 take_sum = 0;
+                for (const std::uint64_t t : take) take_sum += t;
+                if (moved > 0 && take_sum > 0) {
                     const std::vector<std::uint64_t> plus = prorata(moved, take);
                     const std::vector<std::uint64_t> minus = paynow_split(moved, wait);   // <= each E_b
                     for (std::size_t i = 0; i < ents.size(); ++i) {
@@ -440,6 +449,35 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildEr
                             if (d != 0) (*credit_delta)[ents[i].identity] += d;
                         }
                     }
+                } else if (moved > 0) {
+                    // Nobody admitted: the owed outputs of this block take the cash.
+                    std::vector<std::size_t> paid;
+                    std::vector<std::uint64_t> w;
+                    for (std::size_t j = 0; j < res.size(); ++j) {
+                        const CoinbaseOutput& o = res[j];
+                        if (o.role != CoinbaseOutput::Role::Owed || o.amount == 0) continue;
+                        if (o.identity == in.residual_sink_identity && o.pay == in.residual_sink) continue;
+                        if (fold && is_fold_payee(in, o.pay, o.identity)) continue;
+                        paid.push_back(j);
+                        w.push_back(o.amount);
+                    }
+                    const std::vector<std::uint64_t> minus = paynow_split(moved, wait);   // <= each E_b
+                    if (!paid.empty()) {
+                        const std::vector<std::uint64_t> plus = prorata(moved, w);   // sums to moved
+                        for (std::size_t j = 0; j < paid.size(); ++j) {
+                            if (plus[j] == 0) continue;
+                            res[paid[j]].amount += plus[j];
+                            remaining -= plus[j];
+                            if (credit_delta) (*credit_delta)[res[paid[j]].identity] += static_cast<long long>(plus[j]);
+                        }
+                    }
+                    // With no payee output at all (no slot for any payee) the cash
+                    // stays in the residual, so the waiting payees' credit still
+                    // comes off: crediting work whose cash went to the donation
+                    // would be a claim nothing backs (review-criticals 06).
+                    if (credit_delta)
+                        for (std::size_t i = 0; i < ents.size(); ++i)
+                            if (minus[i] != 0) (*credit_delta)[ents[i].identity] -= static_cast<long long>(minus[i]);
                 }
             } else {
                 alloc = paynow_split(pool, eb);
