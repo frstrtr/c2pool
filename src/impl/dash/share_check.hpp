@@ -290,11 +290,11 @@ inline thread_local uint256 g_last_gentx_hash;
 // ── Share-type admission ─────────────────────────────────────────────────────
 // A DASH sharechain admits exactly ONE wire type: the share version it mints,
 // CoinParams::current_share_version. Public network: 16 (p2pool-dash). Private/
-// isolated v36 sharechain: 16 until the flip slice sets current_share_version to
-// 36, then 36 — so a v16 share is not admitted on the v36 chain (and a v36 share
-// is not admitted on a chain still minting v16) with no further code. A single
-// knob arms "mint 36" and "reject 16" together: the flip MUST set
-// current_share_version, not only the mint type, or this gate does not arm.
+// isolated v36 sharechain: 36 (params.hpp, SharechainConfig::share_profile()
+// .target_share_version) — so a v16 share is not admitted on the v36 chain (and
+// a v36 share is not admitted on a chain minting v16). A single knob arms
+// "mint 36" and "reject 16" together: the mint path (mint_runloop.hpp,
+// share_producer_bind.hpp) reads the same current_share_version.
 // A type-36 share never reaches this check on the public network: load_share
 // (share_chain.hpp) throws on it first, exactly as before the v36 type existed.
 // current_share_version == 0 (a default-constructed CoinParams, e.g. a KAT
@@ -1376,8 +1376,9 @@ inline uint256 verify_share(const ShareT& share, ChainT& chain,
 // DASH v36 generation transaction (DashV36Share, wire-type 36)
 //
 // Private/isolated DASH v36 sharechain only (custom --network-id). Reached from
-// the accept path (share_tracker.hpp attempt_verify) for an admitted v36 share;
-// nothing mints a v36 share until the flip slice. Every v16 function above is
+// the accept path (share_tracker.hpp attempt_verify) for an admitted v36 share
+// and from the v36 producer (share_producer.hpp build_share_v36, minted by the
+// mint path on that chain). Every v16 function above is
 // byte-unchanged; the v36 arm is new overloads.
 //
 // ONE coinbase assembler, build_v36_gentx, is used by the verifier

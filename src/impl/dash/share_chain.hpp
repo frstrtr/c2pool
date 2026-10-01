@@ -333,7 +333,7 @@ using PublicShareType = chain::ShareVariants<DashFormatter, DashShare>;
 
 // The live share type: what the tracker, chain, storage and node hold. DashShare
 // stays variant index 0. DashV36Share is instantiated only on the private/isolated
-// v36 sharechain (load_share below; nothing mints it until the flip slice).
+// v36 sharechain (load_share below), where the mint path mints it.
 using ShareType = chain::ShareVariants<DashFormatter, DashShare, DashV36Share>;
 
 // ── Load share from wire format ──────────────────────────────────────────────

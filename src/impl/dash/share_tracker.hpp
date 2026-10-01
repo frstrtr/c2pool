@@ -24,6 +24,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <impl/nmc/coin/aux_id.hpp>          // nmc::coin::NMC_AUXPOW_CHAIN_ID (v37 bucket-2)
 #include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 #include "share_check.hpp"
+#include "emergency_decay.hpp"      // emergency_decay_clamp_ref (v36 time-decay rule, one copy)
 #include "config_pool.hpp"
 
 #include <core/log.hpp>           // LOG_INFO (PPLNS payout diagnostics)
@@ -1818,41 +1819,16 @@ public:
         // Step 3: Emergency time-based decay (death spiral prevention)
         // Phase 1b from p2pool-v36: doubles target every SHARE_PERIOD * 10
         // seconds past the threshold of SHARE_PERIOD * 20 seconds since last share.
-        uint256 clamp_ref_target = prev_max_target;
+        // The ONE copy of the rule (emergency_decay.hpp), shared with the
+        // producer retarget (share_producer.hpp compute_share_target), whose
+        // shift saturates at MAX_TARGET instead of wrapping.
         uint32_t prev_ts = 0;
         chain.get_share(prev_share_hash).invoke([&](auto* obj) {
             prev_ts = obj->m_timestamp;
         });
-
-        if (prev_ts > 0 && desired_timestamp > prev_ts)
-        {
-            auto time_since_share = desired_timestamp - prev_ts;
-            auto emergency_threshold = SharechainConfig::share_period() * 20;
-            if (time_since_share > emergency_threshold)
-            {
-                auto half_life = SharechainConfig::share_period() * 10;
-                auto excess = time_since_share - emergency_threshold;
-                auto halvings = excess / half_life;
-                auto remainder = excess % half_life;
-                // 2^halvings with linear interpolation for fractional part
-                uint256 eased = prev_max_target;
-                if (halvings < 256)
-                    eased <<= halvings;
-                else
-                    eased = MAX_TARGET;
-                // Linear interpolation: eased = eased * (half_life + remainder) / half_life
-                uint288 eased_288;
-                eased_288.SetHex(eased.GetHex());
-                eased_288 = eased_288 * static_cast<uint32_t>(half_life + remainder);
-                eased_288 = eased_288 / static_cast<uint32_t>(half_life);
-                uint288 max_288;
-                max_288.SetHex(MAX_TARGET.GetHex());
-                if (eased_288 > max_288)
-                    clamp_ref_target = MAX_TARGET;
-                else
-                    clamp_ref_target.SetHex(eased_288.GetHex());
-            }
-        }
+        const uint256 clamp_ref_target = emergency_decay_clamp_ref(
+            prev_max_target, prev_ts, desired_timestamp,
+            static_cast<uint32_t>(SharechainConfig::share_period()), MAX_TARGET);
 
         // Step 4: Clamp pre_target to ±10% of clamp_ref_target
         // pre_target2 = clip(pre_target, (clamp_ref * 9/10, clamp_ref * 11/10))

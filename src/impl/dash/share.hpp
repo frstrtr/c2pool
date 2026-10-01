@@ -104,8 +104,8 @@ struct DashShare : chain::BaseShare<uint256, 16>
 //     bch/ltc/dgb. See the design note + PR body for the review decision.
 //
 // The version-vote (m_desired_version) is what #774's AutoRatchet reads. The
-// isolated chain admits exactly the type it mints (CoinParams::current_share_version,
-// share_check.hpp check_share_type_admitted); the mint flip to 36 is a later slice.
+// isolated chain admits exactly the type it mints (CoinParams::current_share_version
+// = 36 there, share_check.hpp check_share_type_admitted).
 struct DashV36Share : chain::BaseShare<uint256, 36>
 {
     // ── min_header (SmallBlockHeaderType — coin block header, standardized) ──
