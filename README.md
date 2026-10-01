@@ -1203,6 +1203,10 @@ cd build && ctest --output-on-failure -j$(nproc)
 ## V37 development
 
 - **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
+  Erratum E-1: section 9 says the coinbase pays owed amounts "largest first". The
+  code and the ratified rule pay **oldest first** (by when a balance became
+  eligible, ties broken by a salted hash no participant can choose). The corrected
+  text is in PR #1884 (repository copy) and PR #1881 (site).
 - Dev chat (Telegram): https://t.me/c2pooldev
 - V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
 
