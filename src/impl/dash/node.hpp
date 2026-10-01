@@ -388,14 +388,24 @@ protected:
     std::atomic<uint64_t> m_block_share_lock_forfeits{0};
 
     // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
-    // Runtime P2P accept-floor, seeded from the COLD config floor (1700, accept-all)
-    // and lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by apply_min_protocol_ratchet()
-    // once the work-weighted desired-version tally over the [9/10..10/10] window behind
-    // the best share holds >= 95% for v36. Mutated ONLY on the compute thread under the
-    // exclusive m_tracker_mutex (same sites as m_best_share_hash); it drives the LIVE
-    // m_min_protocol_gate.min_version so the handshake reception reflects the ratchet.
+    // Runtime P2P accept-floor, seeded from the per-network share profile
+    // (SharechainConfig::share_profile().ratchet_floor_protocol_version):
+    //   * public network: the COLD config floor MINIMUM_PROTOCOL_VERSION (1700,
+    //     accept-all) — the same initial value as before the profile existed —
+    //     lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by
+    //     apply_min_protocol_ratchet() once the work-weighted desired-version tally
+    //     over the [9/10..10/10] window behind the best share holds >= 95% for v36;
+    //   * private/isolated DASH v36 sharechain: 3600 from the start — the chain is
+    //     v36 from genesis, so a pre-v36 peer is refused at the handshake and the
+    //     ratchet is a latched no-op there.
+    // The profile is read when the node is CONSTRUCTED, so the identity must be set
+    // first (main_dash.cpp sets it before constructing dash::Node). Mutated ONLY on
+    // the compute thread under the exclusive m_tracker_mutex (same sites as
+    // m_best_share_hash); handle_version composes it with the operator knob
+    // (m_min_protocol_gate) by max(), so a --min-protocol below 3600 cannot lower
+    // the isolated floor.
     std::atomic<uint32_t> m_runtime_min_protocol_version{
-        SharechainConfig::MINIMUM_PROTOCOL_VERSION};
+        SharechainConfig::share_profile().ratchet_floor_protocol_version};
 
     // De-dup set for broadcast_share (hashes already relayed to peers).
     std::set<uint256> m_shared_share_hashes;
@@ -732,6 +742,37 @@ public:
         // snapshot reflects the post-close map (IO thread).
         base_t::close_connection(service);
         publish_peer_info_snapshot();
+    }
+
+    // ── Socket-less dial failure (#1835) ────────────────────────────────
+    // core::Factory::Client reports a dial that never produced a socket
+    // (ECONNREFUSED / ETIMEDOUT / resolve error) here instead of through
+    // error() or close_connection(), which both need a socket. Without this
+    // override the address stayed in m_pending_outbound for the rest of the
+    // process and try_connect_peers() skipped it on every later pass, so a
+    // --connect/--addnode peer that was down at the first dial was never
+    // dialed again. Clearing the mark makes the next 30 s pass redial it.
+    //
+    // IO thread, same discipline as error(): the Factory calls this from its
+    // async resolve/connect handler, and only through a strong ref it holds
+    // for the dial (the UAF fix in factory.hpp), so this node is live for the
+    // whole call. Touch only this node's own IO-owned sets; defer nothing.
+    //
+    // m_outbound_addrs is cleared only when no connection to the address is
+    // live: a failed dial says nothing about a session that is already up.
+    // The display snapshot is refreshed only if that changed the outbound
+    // set; a failed dial never adds to m_peers, so nothing else it shows
+    // moves. INLINE for the same vtable reason as connected()/error().
+    void connect_failed(const NetService& addr) override
+    {
+        const bool was_pending = m_pending_outbound.erase(addr) > 0;
+        const bool was_outbound =
+            !m_connections.contains(addr) && m_outbound_addrs.erase(addr) > 0;
+        if (was_outbound)
+            publish_peer_info_snapshot();
+        if (was_pending)
+            LOG_INFO << "[Pool] Outbound dial to " << addr.to_string()
+                     << " failed; will retry on the next maintenance pass";
     }
 
     void cancel_peer_share_requests(const NetService& service)
@@ -1291,6 +1332,13 @@ public:
     /// from the run loop after listen(). Body in node.cpp (ltc
     /// node.cpp:1289-1327 port).
     void start_outbound_connections();
+
+    /// One outbound dial-maintenance pass: dial get_good_peers() candidates
+    /// that are not connected, not already being dialed and not banned, until
+    /// the outbound target is met. IO thread. Called once by
+    /// start_outbound_connections() and then on every 30 s m_connect_timer
+    /// tick. Body in node.cpp.
+    void try_connect_peers();
 
     // ── have_tx / losing_tx advertisement (SEND side) ─────────────────────
     // c2pool was RECEIVE-ONLY for the p2pool tx-pool advertisement: the

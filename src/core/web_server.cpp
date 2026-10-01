@@ -6322,10 +6322,13 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     // ETA cadence for the propagation countdown (display only): DASH mints one
     // share every 20s, the LTC-family every 10s.
     const int share_period_sec = (m_blockchain == Blockchain::DASH) ? 20 : 10;
+    // Wire type 36 is MergedMiningShare on the LTC family and DashV36Share on
+    // DASH (the private/isolated DASH v36 sharechain's share type).
     const std::map<int, std::string> share_type_names = {
         {16, "DashShare"},
         {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
-        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"}, {36, "MergedMiningShare"}
+        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"},
+        {36, m_blockchain == Blockchain::DASH ? "DashV36Share" : "MergedMiningShare"}
     };
 
     nlohmann::json result = nlohmann::json::object();

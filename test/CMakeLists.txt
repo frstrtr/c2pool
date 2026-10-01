@@ -286,7 +286,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     # SharechainConfig statics, and test_dash_conformance /
     # test_dash_share_hash_link pin goldens on the DEFAULT identity in-process.
     # Registered in build.yml's --target allowlist (both lines) so CI builds it.
-    add_executable(test_dash_network_id_override test_dash_network_id_override.cpp)
+    # The future-timestamp bound KATs (#1825, private/isolated v36 profile only)
+    # are linked in here too: the profile is keyed on the same global identity.
+    # So are the v36 ref-stream / share_init_verify(DashV36Share) /
+    # message_data KATs (test_dash_v36_ref_stream_verify.cpp): the message
+    # authority set is selected by the same profile. So are the v36 generation-
+    # transaction KATs (test_dash_v36_gentx.cpp): the v36 donation script is
+    # selected by the same profile.
+    add_executable(test_dash_network_id_override test_dash_network_id_override.cpp
+        test_dash_v36_future_timestamp.cpp test_dash_v36_future_timestamp_bound.cpp
+        test_dash_v36_ref_stream_verify.cpp test_dash_v36_gentx.cpp)
     target_link_libraries(test_dash_network_id_override PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -422,7 +431,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the per-share split on an individual share's page. FOLDED in for the same
     # reason; needs the same link set plus the header-only mint/producer weight
     # walk and coinbase allocator, both already reachable from `dash`.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp)
+    # test_dash_v36_live_variant.cpp: the private/isolated DASH v36 sharechain
+    # live-variant KATs (load gate, share-type admission, type dispatch, node
+    # receive -> tracker verify -> LevelDB persist -> reload of v36 shares).
+    # FOLDED in for the same reason; needs exactly this link set (a real
+    # ctx-bound dash::NodeImpl + ShareTracker + c2pool_storage).
+    # test_dash_v36_flip.cpp: the private/isolated DASH v36 sharechain MINTS
+    # v36 (current_share_version 36, v36 producer job + mint, ratchet seed 3600,
+    # emergency decay retarget, operator blob embed, version-keyed data subdir,
+    # web label, payout view). Same harness (test/dash_v36_live_fixture.hpp) and
+    # link set as the live-variant KATs; folded in for the same reason.
+    # #1835 outbound-redial KAT (test_dash_outbound_redial.cpp) drives the REAL
+    # NodeImpl dial path against a refused loopback port; folded into this
+    # EXISTING allowlisted target (it needs the `dash` OBJECT lib linked below)
+    # so it is built and run by CI rather than reported "Not Run".
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_outbound_redial.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

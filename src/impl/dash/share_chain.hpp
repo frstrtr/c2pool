@@ -3,8 +3,10 @@
 
 // Dash share chain types: ShareType variant, ShareIndex, ShareChain.
 // Uses the generic sharechain infrastructure from c2pool/sharechain/.
-// Only v16 shares exist for Dash.
+// Public network: v16 shares only. Private/isolated v36 sharechain (custom
+// --network-id): v36 shares (see load_share).
 
+#include "config_pool.hpp"
 #include "share.hpp"
 #include "share_types.hpp"
 
@@ -321,45 +323,40 @@ struct DashFormatter
     }
 };
 
-// ── ShareType: variant containing only v16 ───────────────────────────────────
-// For Dash, there's only one share version (v16).
+// ── ShareType ────────────────────────────────────────────────────────────────
+// PublicShareType is EXACTLY master's variant ({DashShare}, wire type 16 only).
+// It is the ONLY loader the public network (no --network-id) runs, so a type-36
+// share on the public network throws the same std::invalid_argument, with the
+// same text, from the same site (sharechain/share.hpp ShareVariants::load) as
+// before the v36 type existed.
+using PublicShareType = chain::ShareVariants<DashFormatter, DashShare>;
 
-using ShareType = chain::ShareVariants<DashFormatter, DashShare>;
-
-// ── PHASE A: v36 share-type dispatch (DORMANT) ───────────────────────────────
-// The live `ShareType` above is DELIBERATELY left as {DashShare} only, so the
-// live accept / mint / store / send paths (node.cpp) stay byte-unchanged and
-// keep compiling — several consume the share via generic-invoke lambdas that
-// call DashShare-concrete helpers (e.g. share_init_verify(const DashShare&) at
-// node.cpp:64). Promoting DashV36Share into the live variant requires guarding
-// those call sites with `if constexpr (std::is_same_v<share_t, DashShare>)`, and
-// is the FIRST wiring step of Phase B/C — NOT Phase A.
-//
-// This SEPARATE variant proves the v36 wire type round-trips through the REAL
-// chain::ShareVariants dispatch machinery (load map keyed by version 36 ->
-// DashV36Share, DashFormatter::ReadV36/WriteV36). It is what the round-trip KAT
-// exercises. Nothing mints a v36 share (current_share_version stays 16), so the
-// type is parseable/mintable-in-principle yet dormant until Phase-C activation.
-using V36ShareType = chain::ShareVariants<DashFormatter, DashV36Share>;
+// The live share type: what the tracker, chain, storage and node hold. DashShare
+// stays variant index 0. DashV36Share is instantiated only on the private/isolated
+// v36 sharechain (load_share below), where the mint path mints it.
+using ShareType = chain::ShareVariants<DashFormatter, DashShare, DashV36Share>;
 
 // ── Load share from wire format ──────────────────────────────────────────────
 
 inline ShareType load_share(chain::RawShare& rshare, NetService peer_addr)
 {
     auto stream = rshare.contents.as_stream();
-    auto share = ShareType::load(rshare.type, stream);
+    ShareType share;
+    if (SharechainConfig::isolated_v36())
+    {
+        // Private/isolated v36 sharechain: parse both wire types; the type the
+        // chain admits is enforced at verify/admit (check_share_type_admitted).
+        share = ShareType::load(rshare.type, stream);
+    }
+    else
+    {
+        // Public network: master's load map ({16}); an unknown type throws there.
+        // The heap object's ownership moves into the live variant (no copy).
+        PublicShareType::load(rshare.type, stream)
+            .invoke([&](auto* obj) { share = obj; });
+    }
     // Propagate ingestion source to the share so the dashboard / audit
     // trail can show which peer gossiped it. Matches LTC share.hpp:260.
-    share.ACTION({ obj->peer_addr = peer_addr; });
-    return share;
-}
-
-// PHASE A v36 load helper (dispatch-by-version-36). Mirrors load_share but over
-// the dormant V36ShareType variant; used by the round-trip KAT.
-inline V36ShareType load_v36_share(chain::RawShare& rshare, NetService peer_addr)
-{
-    auto stream = rshare.contents.as_stream();
-    auto share = V36ShareType::load(rshare.type, stream);
     share.ACTION({ obj->peer_addr = peer_addr; });
     return share;
 }

@@ -755,9 +755,11 @@ void print_banner(const char* argv0)
         << "        --message-blob-hex HEX (alias --transition-message) supplies an\n"
         << "        encrypted authority-signed message_data blob (from\n"
         << "        util/create_transition_message.py). Validated against the DASH\n"
-        << "        authority keys; drives the dashboard transition-notice panel now,\n"
-        << "        and is embedded in locally minted shares once v36 shares activate\n"
-        << "        (the live v16 wire has no message_data field). No consensus effect.\n"
+        << "        authority keys; drives the dashboard transition-notice panel on\n"
+        << "        every profile. On the private/isolated DASH v36 sharechain it is\n"
+        << "        also embedded into the message_data of locally minted v36 shares\n"
+        << "        when it validates against that chain's authority key (else not\n"
+        << "        embedded, logged). The public v16 wire has no message_data field.\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
         << "        base, -1/14 per 210240; masternode payment 3/4 of block value.\n";
 }
@@ -796,7 +798,14 @@ int check_coin_params()
     // get_coin_p2p_port. Assert the sharechain SSOT here.
     want(main.p2p_port == 8999,            "mainnet sharechain p2p_port == 8999 (SSOT)");
     want(test.p2p_port == 18999,           "testnet sharechain p2p_port == 18999 (SSOT)");
-    want(main.current_share_version == 16, "share_version == 16 (older-than-v35 baseline)");
+    // The share version the active identity mints: 16 on the public network
+    // (the older-than-v35 baseline, unchanged output), 36 on the private/
+    // isolated DASH v36 sharechain (a custom --network-id).
+    if (dash::SharechainConfig::share_profile().target_share_version == 16)
+        want(main.current_share_version == 16, "share_version == 16 (older-than-v35 baseline)");
+    else
+        want(main.current_share_version == 36,
+             "share_version == 36 (private/isolated DASH v36 sharechain)");
     want(main.address_version == 76,       "mainnet pubkey addr version == 76 (X...)");
     want(static_cast<bool>(main.pow_func), "pow_func wired");
 
@@ -1305,8 +1314,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     // Bucket-1 ISOLATION PRIMITIVE: DASH keeps its own net subdir + PREFIX,
     // per-coin AND per-pool-instance, in v36 and v37 — never standardised.
-    // A custom --network-id scopes the subdir by identity ("dash_<id>" /
-    // "dash_testnet_<id>", SharechainConfig::data_subdir): EVERY consumer below
+    // A custom --network-id scopes the subdir by identity AND the share version
+    // the chain mints ("dash_<id>_v36" / "dash_testnet_<id>_v36",
+    // SharechainConfig::data_subdir; a pre-v36 "dash_<id>" store is never
+    // opened, so one store holds one share type): EVERY consumer below
     // (sharechain LevelDB, addrs.json, pool/coin config, graph_db,
     // found_blocks_db, coin-side caches) builds its path from this one value,
     // so persisted shares and their is_verified flags can never cross
@@ -1316,10 +1327,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         std::cout << "[run] custom network-id: per-network state is identity-scoped under "
                   << (core::filesystem::config_path() / net_subdir).string() << "\n";
         const auto& prof = dash::SharechainConfig::share_profile();
-        std::cout << "[run] private/isolated DASH sharechain profile: target share version "
+        std::cout << "[run] private/isolated DASH sharechain profile: mints share v"
                   << prof.target_share_version
-                  << " (dormant: minting stays v16 until the flip), ratchet seed "
-                  << prof.ratchet_floor_protocol_version << "\n";
+                  << " (admits v" << prof.target_share_version << " only), ratchet seed "
+                  << prof.ratchet_floor_protocol_version
+                  << " (peers below it refused; --min-protocol cannot lower it), emergency decay "
+                  << (prof.emergency_decay ? "on" : "off") << "\n";
     }
     std::error_code mkdir_ec;
     std::filesystem::create_directories(
@@ -2035,7 +2048,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 //    counts, per-miner tally, and V36 propagation depth ──────────
                 std::map<int, int> desired_counts;   // m_desired_version → count
                 std::map<std::string, int> miner_counts;
-                int format_v16 = 0;
+                std::map<int, int> format_by_version;  // share TYPE (wire) version -> count
+                int format_total = 0;
                 int deepest_v36_pos = 0;
                 int v36_contiguous_from_tip = 0;
                 bool contiguous = true;
@@ -2063,7 +2077,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         data.share.invoke([&](auto* s) {
                             int dv = static_cast<int>(s->m_desired_version);
                             desired_counts[dv] += 1;
-                            format_v16 += 1;  // DashShare is wire-format v16
+                            // Wire type: DashShare=16 (public + pre-flip private
+                            // chain), DashV36Share=36 (private/isolated v36 chain).
+                            format_by_version[static_cast<int>(
+                                std::remove_pointer_t<decltype(s)>::version)] += 1;
+                            format_total += 1;
                             miner_counts[s->m_pubkey_hash.GetHex()] += 1;
                             // i == 0 is the best share (get_chain walks tip-first).
                             if (i == 0 && s->m_max_bits != 0)
@@ -2087,7 +2105,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // total_shares == the active-chain window actually tallied (matches
                 // main_ltc.cpp, where total_shares is the windowed skiplist count), so
                 // the gauge's version percentages divide by the same denominator.
-                out["total_shares"] = format_v16;
+                out["total_shares"] = format_total;
 
                 // Only publish when we actually measured one; an absent key makes
                 // /global_stats emit min_difficulty:null, which is the honest
@@ -2095,11 +2113,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // whole payload as None below 10 shares).
                 if (best_min_difficulty > 0.0)
                     out["min_difficulty"] = best_min_difficulty;
-                if (format_v16 > 0 && difficulty_sum > 0.0)
-                    out["average_difficulty"] = difficulty_sum / format_v16;
+                if (format_total > 0 && difficulty_sum > 0.0)
+                    out["average_difficulty"] = difficulty_sum / format_total;
 
+                // Public network: only DashShare exists, so this is exactly
+                // {"16": N} (or {} on an empty chain), as before.
                 nlohmann::json sbv = nlohmann::json::object();
-                if (format_v16 > 0) sbv["16"] = format_v16;
+                for (auto& [ver, cnt] : format_by_version)
+                    if (cnt > 0) sbv[std::to_string(ver)] = cnt;
                 out["shares_by_version"] = sbv;
 
                 nlohmann::json sbdv = nlohmann::json::object();
@@ -3673,11 +3694,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 std::optional<dash::coin::ReconstructedWonBlock> result;
                 won_tracker.chain.get_share(sh).invoke([&](auto* obj) {
                     if (!obj) return;
-                    using ShareT = std::decay_t<decltype(*obj)>;
-                    if constexpr (std::is_same_v<ShareT, dash::DashShare>) {
-                        result = dash::coin::reconstruct_won_block(
-                            sh, *obj, won_tracker, won_params, /*known_txs=*/{});
-                    }
+                    // Both live share types (v36 = private/isolated v36 sharechain;
+                    // its block is coinbase-only by construction).
+                    result = dash::coin::reconstruct_won_block(
+                        sh, *obj, won_tracker, won_params, /*known_txs=*/{});
                 });
                 return result;
             };
@@ -4049,6 +4069,42 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         dash::Node* node_ptr = &p2p_node;
         auto mint_registry = std::make_shared<dash::mint::FrozenJobRegistry>();
 
+        // ── Operator message blob -> minted v36 shares' message_data ──────
+        // Private/isolated DASH v36 sharechain only: the --message-blob-hex
+        // blob is embedded into every locally minted share when it validates
+        // against THIS chain's message authority (the maintainer key alone,
+        // share_check.hpp active_message_authority()). A blob that does not
+        // (e.g. keyed to the other authority key: it passes the dashboard's
+        // public 2-key check but a v36 peer would reject every share carrying
+        // it) is NOT embedded; shares mint with empty message_data so the node
+        // never orphans its own shares. Selected ONCE here: the ref_hash that
+        // keys the frozen-job registry commits message_data, so a runtime blob
+        // reload (/msg/load_blob) feeds the dashboard only, never this path.
+        std::vector<unsigned char> mint_embed_blob;
+        if (!operator_message_blob_hex.empty() &&
+            dash::SharechainConfig::share_profile().target_share_version >= 36)
+        {
+            std::string why;
+            if (!IsHex(operator_message_blob_hex)) {
+                // Odd length or a non-hex character: say so, rather than the
+                // "no operator message blob" an empty parse would report.
+                why = "--message-blob-hex is not valid hex (odd length or a non-hex character)";
+            } else {
+                std::vector<unsigned char> raw;
+                try { raw = ParseHex(operator_message_blob_hex); }
+                catch (const std::exception&) { raw.clear(); }
+                mint_embed_blob = dash::mint::select_embed_blob(
+                    raw, dash::SharechainConfig::share_profile(),
+                    dash::active_message_authority(), &why);
+            }
+            if (!mint_embed_blob.empty())
+                LOG_INFO << "[MINT] operator message blob (" << mint_embed_blob.size()
+                         << " bytes) is embedded into the message_data of minted v36 shares";
+            else
+                LOG_WARNING << "[MINT] operator message blob NOT embedded into minted v36 "
+                               "shares (" << why << "); shares mint with empty message_data";
+        }
+
         // ── Fee policy (README flags, LTC sharechain-lane port) ───────────
         // --give-author -> the share's donation field (oracle dev-fee channel;
         // the donation output itself is ALWAYS emitted by the gentx, even at
@@ -4178,7 +4234,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // work_source unwinds, so every use is null-guarded. It supplies the
             // per-address hashrate the 1.67% pool-share cap modulates on.
             [node_ptr, mint_params, mint_registry, job_cache, fee_policy,
-             &stratum_server](
+             mint_embed_blob, &stratum_server](
                 const uint256& prev_share_hash,
                 const std::vector<unsigned char>& payout_script,
                 const dash::coin::DashWorkData& wd)
@@ -4354,7 +4410,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     static_cast<uint32_t>(std::time(nullptr)), share_nonce,
                     identity->donation_u16,
                     /*coinbase_text=*/dash::SharechainConfig::coinbase_text(mint_params.is_testnet),
-                    local_hash_rate);
+                    local_hash_rate, mint_embed_blob);
                 if (!built)
                     return std::nullopt;
 
@@ -4429,7 +4485,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     ? dash::tracker_acquire::Urgency::BlockWinning
                     : dash::tracker_acquire::Urgency::Opportunistic;
 
-                std::optional<dash::producer::BuiltShare> built;
+                std::optional<dash::stratum::MintedShare> built;
                 {
                     auto guard = node_ptr->read_tracker(urgency);
                     if (!guard) {
@@ -4448,7 +4504,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         }
                         return uint256();
                     }
-                    built = dash::mint::mint_from_inputs(
+                    // The share type this chain mints: v16 DashShare (public)
+                    // or v36 DashV36Share (private/isolated v36 sharechain).
+                    built = dash::mint::mint_from_inputs_any(
                         guard->chain, mint_params, in, *frozen);
                 }
                 if (!built) {
@@ -4457,8 +4515,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return uint256();
                 }
 
-                dash::ShareType share;
-                share = new dash::DashShare(std::move(built->share));
+                dash::ShareType share = built->to_share_type();
                 // #889: same urgency for the tracker WRITE. add_local_share
                 // still returns ZERO if the bounded wait expires — the decline
                 // is preserved, it is just no longer silent (LOG_ERROR + a

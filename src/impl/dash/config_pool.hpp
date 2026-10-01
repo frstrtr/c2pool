@@ -180,33 +180,37 @@ struct SharechainConfig
     // with has_custom_network_id().
     static bool isolated_v36() { return has_custom_network_id(); }
 
-    /// Per-network share parameters. DEFINED here as the single source of
-    /// truth; each field is consumed by a later slice, so on its own this
-    /// struct flips NO minting / validation / handshake behaviour. Consumers:
-    ///   target_share_version           -> params.hpp current_share_version and
-    ///                                     the mint path desired_version
-    ///                                     (mint_runloop.hpp, share_producer_bind.hpp)
-    ///                                     [flip slice; until then BOTH profiles
-    ///                                     mint and verify v16]
+    /// Per-network share parameters, the single source of truth. Consumers:
+    ///   target_share_version           -> params.hpp current_share_version (the
+    ///                                     admitted AND minted share type), the
+    ///                                     mint path desired_version
+    ///                                     (mint_runloop.hpp build_producer_job
+    ///                                     reads params.current_share_version) and
+    ///                                     the data_subdir version key below.
     ///   ratchet_floor_protocol_version -> node.hpp runtime accept-floor seed
-    ///                                     (m_runtime_min_protocol_version)
-    ///                                     [flip slice]. NOT CoinParams::
-    ///                                     minimum_protocol_version, which stays
-    ///                                     the cold 1700 floor on both profiles.
+    ///                                     (m_runtime_min_protocol_version). NOT
+    ///                                     CoinParams::minimum_protocol_version,
+    ///                                     which stays the cold 1700 floor on
+    ///                                     both profiles.
     ///   advertised_protocol_version    -> equals CoinParams::advertised_protocol_version
     ///                                     on both profiles (pinned by KAT).
     ///   v36_donation_p2pkh             -> params.hpp donation_script_func: on the
     ///                                     isolated chain a v36 share pays the
     ///                                     P2PKH DONATION_SCRIPT, not the COMBINED
-    ///                                     P2SH (wired in this slice; inert because
-    ///                                     nothing mints or verifies v36 yet).
+    ///                                     P2SH.
     ///   maintainer_only_authority      -> share_messages.hpp authority_pubkeys()
-    ///                                     for decrypt/validate of message_data
-    ///                                     [v36 ref-stream slice].
-    ///   future_timestamp_bound         -> share_init_verify(DashV36Share)
-    ///                                     now+600 bound [future-timestamp slice].
+    ///                                     for decrypt/validate of message_data,
+    ///                                     and the operator blob embed selection
+    ///                                     (mint_runloop.hpp select_embed_blob).
+    ///   future_timestamp_bound         -> share_check.hpp
+    ///                                     future_timestamp_bound_active() /
+    ///                                     check_share_timestamp_bound: now+600
+    ///                                     bound, first statement of
+    ///                                     share_init_verify (wired; the v36
+    ///                                     share verifier reuses it).
     ///   emergency_decay                -> v36 time-decay retarget on the producer
-    ///                                     side [flip slice].
+    ///                                     side (share_producer.hpp
+    ///                                     compute_share_target).
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -269,13 +273,23 @@ struct SharechainConfig
     /// flags or learned peers persisted under a different identity (and
     /// switching back finds its own state untouched). The public (no-flag) path
     /// returns the legacy "dash" / "dash_testnet", byte-identical to master.
-    /// Keyed on the identifier only: the ref_hash commits the identifier, not
-    /// the prefix, so persisted shares are valid across a prefix change.
+    /// Keyed on the identifier, not the prefix: the ref_hash commits the
+    /// identifier, not the prefix, so persisted shares are valid across a
+    /// prefix change.
+    ///
+    /// A custom identity is ALSO keyed on the share version the chain mints
+    /// ("_v<target_share_version>", i.e. "dash_<id>_v36"): one store holds
+    /// exactly one share type. Rows a pre-v36 build of the same identity
+    /// persisted (v16, under "dash_<id>") are never opened by the v36 chain, so
+    /// no LevelDB height index is shared between the two types (one hash per
+    /// height: a v36 row at the same absheight would overwrite it) and the
+    /// reload window counts only rows of the type the chain speaks.
     static std::string data_subdir(bool testnet)
     {
         std::string d = testnet ? "dash_testnet" : "dash";
         if (has_custom_network_id())
-            d += "_" + override_identifier_hex;
+            d += "_" + override_identifier_hex + "_v"
+               + std::to_string(share_profile().target_share_version);
         return d;
     }
 

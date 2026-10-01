@@ -81,7 +81,7 @@ struct ISettleStore {
 // Records: u8 ver=1 ‖ payload. Ints little-endian. Fail-closed on a short read.
 // ---------------------------------------------------------------------------
 namespace store_codec {
-constexpr std::uint8_t SCHEMA_VER = 1;
+constexpr std::uint8_t SCHEMA_VER = 5;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments; 5: + the DROPS window entries
 
 inline std::string chain_fmt(::v37::ChainId c) {
     char b[16];
@@ -160,15 +160,66 @@ struct SettleEvent {
     Amounts       credit;              // FOUND: per-key entitlement E_b
     Amounts       payout;              // FOUND/ORPHAN: coinbase outputs settled
     std::uint64_t bin_height = 0;      // FINALIZE: the monotone K_fair clock at THIS step
+    // FOUND, ANCHOR rule: the block's own on-chain credit cut (it becomes the
+    // ledger's anchor at FINALIZE). Absent => the record is byte-identical to
+    // the schema-1 layout.
+    bool          has_cut = false;
+    std::uint64_t cut_pos = 0;
+    std::string   cut_spine;           // 32 bytes
+    // FOUND, DROPS DUE rule (schema 3): the block's deposit D_B and the avail
+    // snapshot a canonical booking claimed. Absent => byte-identical to the
+    // schema-1/2 layouts.
+    bool          has_drops = false;
+    Amounts       drops_deposit;
+    bool          drops_claim = false;
+    Amounts       drops_claimed;
+    // FOUND, RAINDROP ENROL rule (schema 4): the payees the block enrolled by
+    // raindrop (eff + payout ref). Empty => byte-identical to schema 3.
+    ::c2pool::v37n::settle::DropsEnrolRegistry drops_enrol;
+    // FOUND, DROPS WINDOW rule (schema 5, A4b): the block's window entries.
+    // Empty => byte-identical to schema 3/4.
+    ::c2pool::v37n::settle::DropsWindow drops_window;
 
     std::string serialize() const {
         std::string s;
-        s.push_back(char(store_codec::SCHEMA_VER));
+        const bool win = has_drops && !drops_window.empty();
+        const bool enrol = has_drops && (!drops_enrol.empty() || win);
+        s.push_back(char(win ? std::uint8_t{5} : enrol ? std::uint8_t{4} : has_drops ? std::uint8_t{3} : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
         s.push_back(char(static_cast<std::uint8_t>(kind)));
         store_codec::put_str(s, bid);
         store_codec::put_amounts(s, credit);
         store_codec::put_amounts(s, payout);
         store_codec::put_u64(s, bin_height);
+        if (has_cut || has_drops) {
+            s.push_back(char(has_cut ? 1 : 0));
+            if (has_cut) {
+                store_codec::put_u64(s, cut_pos);
+                store_codec::put_str(s, cut_spine);
+            }
+        }
+        if (has_drops) {   // schema 3
+            store_codec::put_amounts(s, drops_deposit);
+            s.push_back(char(drops_claim ? 1 : 0));
+            store_codec::put_amounts(s, drops_claimed);
+        }
+        if (enrol) {   // schema 4
+            store_codec::put_u64(s, drops_enrol.size());
+            for (const auto& [k, r] : drops_enrol) {
+                s.append(reinterpret_cast<const char*>(k.data()), k.size());
+                store_codec::put_u64(s, r.eff);
+                s.push_back(char(static_cast<std::uint8_t>(r.ref.kind)));
+                store_codec::put_str(s, std::string(r.ref.payload.begin(), r.ref.payload.end()));
+            }
+        }
+        if (win) {   // schema 5
+            store_codec::put_u64(s, drops_window.size());
+            for (const auto& [ck, v] : drops_window) {
+                store_codec::put_u64(s, ck.c);
+                store_codec::put_u64(s, ck.n);   // A4c: the bin span
+                s.append(reinterpret_cast<const char*>(ck.payee.data()), ck.payee.size());
+                store_codec::put_u64(s, static_cast<std::uint64_t>(v));
+            }
+        }
         return s;
     }
     static SettleEvent deserialize(const std::string& blob) {
@@ -182,10 +233,71 @@ struct SettleEvent {
         e.credit = r.amounts();
         e.payout = r.amounts();
         e.bin_height = r.u64();
+        if (ver >= 2 && r.u8() == 1) {
+            e.has_cut = true;
+            e.cut_pos = r.u64();
+            e.cut_spine = r.str();
+            if (e.cut_spine.size() != 32) throw std::runtime_error("settle-store: bad credit-cut spine");
+        }
+        if (ver >= 3) {   // DROPS DUE
+            e.has_drops = true;
+            e.drops_deposit = r.amounts();
+            e.drops_claim = r.u8() == 1;
+            e.drops_claimed = r.amounts();
+        }
+        if (ver >= 4) {   // RAINDROP ENROL
+            const std::uint64_t n = r.u64();
+            for (std::uint64_t i = 0; i < n; ++i) {
+                const ::v37::bytes32 k = r.b32();
+                ::c2pool::v37n::settle::DropsEnrolRec rec;
+                rec.eff = r.u64();
+                rec.ref.kind = static_cast<::v37::ScriptKind>(r.u8());
+                const std::string pl = r.str();
+                rec.ref.payload.assign(pl.begin(), pl.end());
+                e.drops_enrol[k] = std::move(rec);
+            }
+        }
+        if (ver >= 5) {   // DROPS WINDOW
+            const std::uint64_t n = r.u64();
+            for (std::uint64_t i = 0; i < n; ++i) {
+                const std::uint64_t c = r.u64();
+                const std::uint64_t nb = r.u64();   // A4c: the bin span
+                const ::v37::bytes32 k = r.b32();
+                e.drops_window[::c2pool::v37n::settle::DropsWindowKey(c, nb, k)] = static_cast<long long>(r.u64());
+            }
+        }
         r.expect_end();
         return e;
     }
 };
+
+// ANCHOR: the block's credit cut a FOUND event carries, in the ledger's type.
+inline std::optional<::c2pool::v37n::settle::AnchorCut> anchor_of(const SettleEvent& e) {
+    if (!e.has_cut || e.cut_spine.size() != 32) return std::nullopt;
+    ::c2pool::v37n::settle::AnchorCut c;
+    c.next_pos = e.cut_pos;
+    std::copy(e.cut_spine.begin(), e.cut_spine.end(), c.spine.begin());
+    return c;
+}
+// DROPS DUE: the drops fields a FOUND event carries, in the ledger's type
+// (nullopt: none; the ledger then books no deposit and no claim).
+inline std::optional<::c2pool::v37n::settle::DropsFound> drops_of(const SettleEvent& e) {
+    if (!e.has_drops) return std::nullopt;
+    ::c2pool::v37n::settle::DropsFound d;
+    d.deposit = e.drops_deposit; d.claim = e.drops_claim; d.claimed = e.drops_claimed;
+    d.enrol_add = e.drops_enrol;
+    d.window = e.drops_window;
+    return d;
+}
+inline void set_drops(SettleEvent& e, const std::optional<::c2pool::v37n::settle::DropsFound>& d) {
+    e.has_drops = d.has_value() && !d->empty();
+    e.drops_deposit.clear(); e.drops_claim = false; e.drops_claimed.clear(); e.drops_enrol.clear(); e.drops_window.clear();
+    if (e.has_drops) { e.drops_deposit = d->deposit; e.drops_claim = d->claim; e.drops_claimed = d->claimed; e.drops_enrol = d->enrol_add; e.drops_window = d->window; }
+}
+inline void set_cut(SettleEvent& e, const std::optional<::c2pool::v37n::settle::AnchorCut>& c) {
+    e.has_cut = c.has_value();
+    if (c) { e.cut_pos = c->next_pos; e.cut_spine.assign(c->spine.begin(), c->spine.end()); }
+}
 
 // ---------------------------------------------------------------------------
 // MemSettleStore — in-memory ISettleStore for the smoke/KAT (no filesystem).
@@ -345,7 +457,11 @@ public:
                     ++st.max_event_seq;
                     switch (e.kind) {
                         case SettleEvKind::Found:
-                            ledger.on_block_found(e.bid, e.credit, e.payout); break;
+                            {
+                                const auto df = drops_of(e);
+                                ledger.on_block_found(e.bid, e.credit, e.payout, anchor_of(e), df ? &*df : nullptr);
+                            }
+                            break;
                         case SettleEvKind::Finalize:
                             ledger.on_block_finalized(e.bid, e.bin_height); break;  // F1
                         case SettleEvKind::Orphan:
