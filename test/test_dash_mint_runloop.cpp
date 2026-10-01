@@ -808,6 +808,45 @@ TEST(DashMintRunloopPoolShareCap, FrozenDesiredTargetIsTheModulatedOne)
         "000000000000016635c48b2e932ea609a3b4aa32cefaa1ba023ea945da766f85");
 }
 
+// #865 — a miner-supplied share target REPLACES Cap 1 at the mint (work.py:312),
+// and the chain band still has the last word. At 43 TH/s Cap 1 alone clamps to
+// the band edge 0x1c088880 (LargeMinerClampsAtBandEdge). A supplied mid-band
+// target (0x1c092e50, bdiff ~27.88 — MidMinerInsideBand's bits) is committed
+// as-is; a supplied target easier than pre_target3 is floored to max_target
+// and band-clipped to pre_target3 (0x1d00ffff), never beyond.
+TEST(DashMintRunloopPoolShareCap, MinerSuppliedTargetReplacesCap1WithinBand)
+{
+    const core::CoinParams params = dash::make_coin_params(false);
+    dash::ShareTracker tracker;
+    tracker.m_coin_params = params;
+    auto wd = make_workdata();
+    const auto payout_script = dash::pubkey_hash_to_script2(h160_uniform(0x63));
+
+    auto build = [&](std::optional<uint256> supplied) {
+        return build_producer_job(tracker.chain, params, uint256(), payout_script,
+                                  wd, wd.m_curtime, 7, 0, "c2pool", 43e12, supplied);
+    };
+
+    auto capped = build(std::nullopt);
+    ASSERT_TRUE(capped.has_value());
+    EXPECT_EQ(capped->job.share_bits, 0x1c088880u);
+
+    auto mid = build(chain::bits_to_target(0x1c092e50u));
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_EQ(mid->job.share_bits, 0x1c092e50u);
+    EXPECT_EQ(mid->frozen.desired_target.GetHex(),
+              chain::bits_to_target(0x1c092e50u).GetHex());
+
+    uint256 easiest;
+    easiest.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    auto easy = build(easiest);
+    ASSERT_TRUE(easy.has_value());
+    EXPECT_EQ(easy->job.share_bits, 0x1d00ffffu);
+    EXPECT_EQ(easy->job.share_max_bits, 0x1d00ffffu);
+    EXPECT_EQ(dash::mint::desired_share_target(params, 43e12, easiest).GetHex(),
+              params.max_target.GetHex());
+}
+
 
 // ── (11-13) --redistribute pplns+boost port KATs ─────────────────────────────
 //
