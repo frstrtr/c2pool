@@ -377,7 +377,14 @@ enum class CreditMode {
 struct SubthresholdParams {
     bool enabled = false;                       // ★ DEFAULT OFF (RDWR-OQ2)
     std::uint32_t K = 4;                         // digest-committed; K>=3 guard
-    CreditMode mode = CreditMode::EstimateOnly;
+    // Combined by default. EstimateOnly branches on S (whether the miner
+    // published a share for the interval), so a miner who can withhold or
+    // publish picks the larger of S*T and Hhat for itself: the rejected clamp
+    // handed back as a strategy. Combined has no such branch. EstimateOnly
+    // stays selectable for tests and the NEVER_CONSENSUS witness only; every
+    // LaneParams factory that enables the gate selects Combined (pinned by
+    // v37_w4_estimator_wiring_test 9).
+    CreditMode mode = CreditMode::Combined;
     // J < K (fewer than K near-misses) => not estimable: no delta and the share
     // credit is kept (DROPS-JK). No fallback inflation, no share removal.
 };
