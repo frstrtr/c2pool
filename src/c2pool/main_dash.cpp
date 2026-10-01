@@ -56,7 +56,7 @@
 
 #include <core/coin_params.hpp>
 #include <core/coinbase_builder.hpp>       // c2pool::MAX_OPERATOR_TEXT_SOLO (--coinbase-text budget SSOT)
-#include <core/core_util.hpp>              // raise_nofile_limit (hotel interim fix #4)
+#include <core/core_util.hpp>              // raise_nofile_limit (interim hardening fix #4)
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>             // NetService (dashd RPC endpoint)
 
@@ -92,6 +92,7 @@
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
 #include <impl/dash/coin/block_json.hpp>         // dash::coin::block_to_explorer_json — /api/explorer getblock body decode
+#include <impl/dash/alert_service.hpp>            // D-MINER.7 miner-offline alert relay over the sharechain p2p (non-consensus)
 #include <impl/dash/coin/bestblock_diag.hpp>     // #1046 bestblock out=0 diagnostic classifier (RpcNotString/BadHexLen/Ok)
 #include <impl/dash/coin/coin_state_maintainer.hpp>  // dash::coin::CoinStateMaintainer — populate ordering gate (E2a)
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
@@ -168,6 +169,7 @@
 
 #include <cstdint>
 #include <cctype>       // std::tolower (--replay-utxo-expect normalize)
+#include <cerrno>       // errno (strict --alert-relay-* integer parse)
 #include <cstdlib>      // std::getenv
 #include <utility>      // std::as_const (qc-plan lambda: read-only qmgr access)
 #include <cstring>
@@ -326,7 +328,7 @@ std::string g_replay_mnlist_seed_file;        // --replay-mnlist-seed-file FILE 
 // seed is disabled; the DAEMONLESS E2d checkpoint bridge STAYS ARMED so the
 // payee/MN axis still bootstraps without dashd (compiled trust anchor + P2P
 // getmnlistd anchor SML, DIP-4 self-checked against our own PoW header chain,
-// per-block merkleRootMNList forward fold — fail-closed). This is the hotel
+// per-block merkleRootMNList forward fold — fail-closed). This is the production node
 // cut-rehearsal posture: serve daemonless, keep the RPC observe-only for the
 // shadow-compare and the reward-safe fallback arm.
 //   Provenance guarantee UNCHANGED: with this flag the payee source can only
@@ -348,6 +350,39 @@ bool        g_fold_only_proof = false;        // --embedded-fold-only-proof
 // byte-identical. Non-consensus, non-reward: a soak convenience whose
 // bad read fails to a clean zero and never wedges the node.
 std::string g_serve_gate_state_file;           // --serve-gate-state-file
+
+// ── D-MINER.7: miner-offline alert relay over the sharechain p2p ───────────
+// NON-CONSENSUS, DEFAULT OFF. A DPI-bound node (--alert-relay-origin) watches
+// its own stratum worker registry and relays small signed + sealed alerts over
+// its existing sharechain peer sockets to a Telegram-capable node
+// (--alert-relay-telegram), which hands them to scripts/alert_relay_telegram.py.
+// With none of these flags given, run_node never constructs the service: no
+// alert/alertack is ever sent and inbound ones are ignored (wire byte-identical
+// to master). Policy: src/impl/dash/alert_service.hpp.
+struct AlertRelayCli {
+    bool origin = false, telegram = false, forward = false, test = false;
+    bool show_key = false;   // --alert-relay-show-key: print this node's alert pubkey and exit
+    std::string key_file, label, accept_file;
+    std::vector<std::string> to, accept;
+    int64_t offline_after = 300, online_after = 60, min_interval = 600;
+    int64_t startup_grace = 600, stall_after = 900, retry_every = 60, retry_max = 60;
+    bool any() const { return origin || telegram || forward; }
+};
+AlertRelayCli g_alert_relay;
+
+// Strict non-negative integer parse for the --alert-relay-* numeric knobs.
+static bool parse_alert_relay_int(const char* flag, const char* s, int64_t& out)
+{
+    char* end = nullptr;
+    errno = 0;
+    long long v = std::strtoll(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 0 || v > 30LL * 86400) {
+        std::cerr << "error: " << flag << " expects an integer in [0, 2592000], got '" << s << "'\n";
+        return false;
+    }
+    out = static_cast<int64_t>(v);
+    return true;
+}
 
 // ── PR-2 FORWARD: mined-commitment index arming flags ─────────────────────
 // Arms dashd's mined-commitment store (mined_commitment_index.hpp). BOTH
@@ -378,7 +413,7 @@ bool        g_embedded_mined_commitment_index = false; // --embedded-mined-commi
 // [BLOCK-LEDGER] — our own block accounting, from PERSISTENT state
 // ───────────────────────────────────────────────────────────────────────────
 //
-// 2026-08-05, hotel: block h=2516911 was WON by the pool and ACCEPTED by the
+// 2026-08-05, production node: block h=2516911 was WON by the pool and ACCEPTED by the
 // chain (our exact PPLNS payout structure), and NEITHER node's log showed a
 // "BLOCK FOUND" line for it — the primary's log had been rotated that morning
 // and the reserve had restarted mid-evening. Counting our own blocks by
@@ -475,6 +510,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
+        << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
         << "           [--external-ip ADDR]\n"
@@ -494,6 +530,15 @@ void print_banner(const char* argv0)
         << "           [--embedded-fold-checkscripts]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
         << "           [--control-plane-token-file FILE]\n"
+        << "           [--alert-relay-origin --alert-relay-to PUBHEX... [--alert-relay-label STR]]\n"
+        << "           [--alert-relay-telegram --alert-relay-accept PUBHEX... | --alert-relay-accept-file FILE]\n"
+        << "           [--alert-relay-forward] [--alert-relay-key-file FILE] [--alert-relay-test]\n"
+        << "           [--alert-relay-show-key]  (print this node's alert pubkey, creating the key if needed, and exit)\n"
+        << "           [--alert-relay-offline-after S] [--alert-relay-online-after S] [--alert-relay-min-interval S]\n"
+        << "           [--alert-relay-startup-grace S] [--alert-relay-stall-after S]\n"
+        << "           [--alert-relay-retry-every S] [--alert-relay-retry-max N]\n"
+        << "             (miner-offline alerts relayed over the sharechain p2p to a Telegram-capable\n"
+        << "              node; non-consensus, all OFF by default -- docs/design/d-miner-7-p2p-alert-relay.md)\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
         << "           [--embedded-ingest-isdlock] [--embedded-ingest-dstx]\n"
         << "           [--embedded-proactive-rotate]\n"
@@ -578,6 +623,24 @@ void print_banner(const char* argv0)
         << "        never re-derived by peers, so overriding it cannot orphan a\n"
         << "        share -- but an override that drops /P2Pool-DASH/ makes your\n"
         << "        blocks unattributable on explorers.\n"
+        << "        --network-id HEX sets a PRIVATE sharechain IDENTIFIER (hex, 1..8\n"
+        << "        bytes, even length; left-padded to 8 bytes). This FORKS the\n"
+        << "        sharechain: the identifier is committed into every share's\n"
+        << "        ref_hash, so nodes with different values reject each other's\n"
+        << "        shares. Default = the live p2pool-dash identity (7242ef345e1bed6b,\n"
+        << "        testnet b6deb1e543fe2427). A custom id never dials public\n"
+        << "        sharechain seeds and keeps ALL per-network state (sharechain\n"
+        << "        LevelDB, addrs.json, ...) in its own <data-dir>/dash_<id>\n"
+        << "        (dash_testnet_<id>) subdir; seed private peers with --addnode.\n"
+        << "        Empty or all-zero ids (0, 00, 0000000000000000) = public.\n"
+        << "        --prefix HEX sets the private sharechain PREFIX (hex, 1..8 bytes),\n"
+        << "        an INDEPENDENT constant (never derived from the identifier). It\n"
+        << "        requires --network-id; with --network-id alone the compiled\n"
+        << "        network prefix is kept (3b3e1286f446b891, testnet 198b644f6821e3b3)\n"
+        << "        and the node still handshakes with public peers whose shares then\n"
+        << "        fail verification (startup WARNING): use --prefix for a private net.\n"
+        << "        Settings-file keys: [dash.sharechain] network_id / prefix\n"
+        << "        (money-class: need gate.money_ack_hash). CLI wins over the file.\n"
         << "        --coin-p2p-discover arms the DASH-isolated peer manager: seed\n"
         << "        (dnsseed.dash.org + fixed) bootstrap, source-scored + group-diverse\n"
         << "        (Sybil-capped) peer selection, anchors, and a self-healing dial\n"
@@ -669,7 +732,7 @@ void print_banner(const char* argv0)
         << "        --embedded-no-dashd-mn-seed cuts the PAYEE axis off from a\n"
         << "        configured dashd (no `protx list` seed) while KEEPING the\n"
         << "        daemonless E2d checkpoint bridge ARMED and the RPC observe-\n"
-        << "        only for --embedded-shadow-compare: the hotel cut-rehearsal\n"
+        << "        only for --embedded-shadow-compare: the production cut-rehearsal\n"
         << "        that serves DAEMONLESS instead of dashd-seeded. Add\n"
         << "        --embedded-fold-only-proof to also leave the bridge unarmed\n"
         << "        (strict replay-fold-only measurement, the old semantics).\n"
@@ -1180,7 +1243,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     dash::interfaces::Node coin_state;
     std::unique_ptr<dash::coin::NodeRPC> rpc;
-    // DASHD-CUT arm authority (hotel-reserve thrash fix). The dashd-fallback
+    // DASHD-CUT arm authority (reserve node thrash fix). The dashd-fallback
     // CoindRPC is constructed ONLY when the operator EXPLICITLY named a coin RPC
     // -- via --coin-rpc / --coin-daemon (endpoint), --coin-rpc-auth (creds path),
     // or a dashd-only one-shot on this path (--submit-block) -- AND creds
@@ -1242,7 +1305,22 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     // Bucket-1 ISOLATION PRIMITIVE: DASH keeps its own net subdir + PREFIX,
     // per-coin AND per-pool-instance, in v36 and v37 — never standardised.
-    const std::string net_subdir = testnet ? "dash_testnet" : "dash";
+    // A custom --network-id scopes the subdir by identity ("dash_<id>" /
+    // "dash_testnet_<id>", SharechainConfig::data_subdir): EVERY consumer below
+    // (sharechain LevelDB, addrs.json, pool/coin config, graph_db,
+    // found_blocks_db, coin-side caches) builds its path from this one value,
+    // so persisted shares and their is_verified flags can never cross
+    // identities. No flag: "dash" / "dash_testnet", byte-identical to master.
+    const std::string net_subdir = dash::SharechainConfig::data_subdir(testnet);
+    if (dash::SharechainConfig::has_custom_network_id()) {
+        std::cout << "[run] custom network-id: per-network state is identity-scoped under "
+                  << (core::filesystem::config_path() / net_subdir).string() << "\n";
+        const auto& prof = dash::SharechainConfig::share_profile();
+        std::cout << "[run] private/isolated DASH sharechain profile: target share version "
+                  << prof.target_share_version
+                  << " (dormant: minting stays v16 until the flip), ratchet seed "
+                  << prof.ratchet_floor_protocol_version << "\n";
+    }
     std::error_code mkdir_ec;
     std::filesystem::create_directories(
         core::filesystem::config_path() / net_subdir, mkdir_ec);  // best effort
@@ -1255,6 +1333,42 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // bootstrap addr store the NodeImpl ctor dials via start_outbound_connections().
     for (const auto& a : peer.addnodes)  config.pool()->m_bootstrap_addrs.push_back(a);
     for (const auto& c : peer.connects)  config.pool()->m_bootstrap_addrs.push_back(c);
+
+    // Sharechain bootstrap source (mirror of main_btc.cpp). DASH has no compiled
+    // public sharechain seed list, so PublicDefault adds nothing (unchanged
+    // behaviour); the resolver keeps a custom --network-id from ever dialing
+    // public seeds should one be added.
+    const bool has_custom_network_id = dash::SharechainConfig::has_custom_network_id();
+    const auto bootstrap_mode = dash::select_sharechain_bootstrap_mode(
+        /*has_explicit_peers=*/!peer.addnodes.empty() || !peer.connects.empty(),
+        /*regtest=*/false,  // --regtest maps onto the testnet identity on DASH
+        has_custom_network_id);
+    if (has_custom_network_id && dash::SharechainConfig::override_prefix_hex.empty()) {
+        // --network-id without --prefix keeps the PUBLIC frame prefix, so this
+        // node still completes the p2p handshake with public p2pool-dash peers
+        // (the prefix is all read_prefix checks) while every share either side
+        // sends fails ref_hash verification: wasted bandwidth, a noisy log and
+        // peers that ban/drop each other. A private net wants its own prefix.
+        LOG_WARNING << "[run] custom --network-id " << dash::SharechainConfig::identifier_hex()
+                    << " WITHOUT --prefix: keeping the public sharechain prefix "
+                    << dash::SharechainConfig::prefix_hex()
+                    << ". This node will still handshake with public p2pool-dash peers, but"
+                       " every share exchanged with them fails verification (different"
+                       " identifier). For a private sharechain also pass --prefix HEX.";
+    }
+    switch (bootstrap_mode) {
+    case dash::SharechainBootstrapMode::ExplicitPeers:
+    case dash::SharechainBootstrapMode::RegtestIsolated:
+        break;  // explicit --addnode/--connect peers only (added above)
+    case dash::SharechainBootstrapMode::CustomNetSuppressed:
+        std::cout << "[run] custom network-id: public sharechain seeds suppressed"
+                  << " (id=" << dash::SharechainConfig::identifier_hex()
+                  << " prefix=" << dash::SharechainConfig::prefix_hex()
+                  << "); supply --addnode to seed a private peer\n";
+        break;
+    case dash::SharechainBootstrapMode::PublicDefault:
+        break;  // DASH ships no compiled sharechain seeds: nothing to add
+    }
 
     // shared_ptr-owned + set_lifetime so the sharechain node's core::Server(accept)
     // and core::Client(dial) pin it with a strong ref per async op -- a resolve/
@@ -1309,7 +1423,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         std::cout << "[run] sharechain peer LISTENING on " << peer.listen_host << ":"
                   << bind_port
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
-                  << " prefix=" << dash::SharechainConfig::prefix_hex() << "\n";
+                  << " prefix=" << dash::SharechainConfig::prefix_hex()
+                  << " identifier=" << dash::SharechainConfig::identifier_hex()
+                  << (has_custom_network_id ? " (custom --network-id)" : "") << "\n";
     } else {
         // Symmetry with the LISTENING branch above: the --connect leg frames
         // every outbound packet with this same prefix (pool/node.hpp:88
@@ -1319,7 +1435,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // the log alone.
         std::cout << "[run] --connect mode: inbound listener suppressed"
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
-                  << " prefix=" << dash::SharechainConfig::prefix_hex() << "\n";
+                  << " prefix=" << dash::SharechainConfig::prefix_hex()
+                  << " identifier=" << dash::SharechainConfig::identifier_hex()
+                  << (has_custom_network_id ? " (custom --network-id)" : "") << "\n";
     }
     // #754 download/outbound slice: ACTIVE outbound dialing from the addr
     // store (--addnode/--connect seeds registered by the NodeImpl ctor) plus
@@ -1366,6 +1484,123 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // constructed + subscribed to the tip event later in the coin_p2p block, once
     // node_coin_state exists. OBSERVE-only: stats_json() touches no serving state.
     std::shared_ptr<dash::coin::EmbeddedOracleShadow> oracle_shadow;
+
+    // ── D-MINER.7: miner-offline alert relay (non-consensus, default OFF) ──
+    // Constructed ONLY when an --alert-relay-* role is given. It is attached to
+    // the sharechain node here (before the loop runs, so no peer event can race
+    // the install) and ticked by a timer armed below, once the stratum worker
+    // registry (DASHWorkSource) exists. Null ⇒ the alert/alertack handlers stay
+    // inert and nothing is ever sent.
+    std::shared_ptr<dash::alert::AlertRelayService> alert_relay;
+    if (g_alert_relay.any()) {
+        namespace da = dash::alert;
+        const std::string ar_dir =
+            (core::filesystem::config_path() / net_subdir / "alert_relay").string();
+        auto parse_pub = [](const std::string& hex, const char* flag, da::Bytes& out) -> bool {
+            auto raw = da::from_hex(hex);
+            if (!raw || !da::is_valid_pubkey(*raw)) {
+                std::cerr << "error: " << flag << " expects a 33-byte compressed secp256k1 pubkey"
+                             " in hex (66 chars), got '" << hex << "'\n";
+                return false;
+            }
+            out = std::move(*raw);
+            return true;
+        };
+        da::ServiceConfig ac;
+        ac.origin = g_alert_relay.origin;
+        ac.telegram = g_alert_relay.telegram;
+        ac.forward = g_alert_relay.forward;
+        ac.state_dir = ar_dir;
+        ac.label = g_alert_relay.label;
+        ac.retry_every = std::max<int64_t>(5, g_alert_relay.retry_every);
+        ac.retry_max = static_cast<int>(std::max<int64_t>(1, g_alert_relay.retry_max));
+        ac.test_on_start = g_alert_relay.test;
+        ac.det.offline_after = g_alert_relay.offline_after;
+        ac.det.online_after = g_alert_relay.online_after;
+        ac.det.min_interval = g_alert_relay.min_interval;
+        ac.det.startup_grace = g_alert_relay.startup_grace;
+        ac.det.stall_after = g_alert_relay.stall_after;
+        for (const auto& h : g_alert_relay.to) {
+            da::Bytes pub;
+            if (!parse_pub(h, "--alert-relay-to", pub)) return 1;
+            ac.relays.push_back(std::move(pub));
+        }
+        std::vector<std::string> accept_hex = g_alert_relay.accept;
+        if (!g_alert_relay.accept_file.empty()) {
+            std::ifstream af(g_alert_relay.accept_file);
+            if (!af) {
+                std::cerr << "error: cannot read --alert-relay-accept-file "
+                          << g_alert_relay.accept_file << "\n";
+                return 1;
+            }
+            std::string line;
+            while (std::getline(af, line)) {
+                auto hash = line.find('#');
+                if (hash != std::string::npos) line.resize(hash);
+                line.erase(0, line.find_first_not_of(" \t\r"));
+                line.erase(line.find_last_not_of(" \t\r") + 1);
+                if (!line.empty()) accept_hex.push_back(line);
+            }
+        }
+        for (const auto& h : accept_hex) {
+            da::Bytes pub;
+            if (!parse_pub(h, "--alert-relay-accept", pub)) return 1;
+            ac.accept.push_back(std::move(pub));
+        }
+        if (ac.origin && ac.relays.empty()) {
+            std::cerr << "error: --alert-relay-origin needs at least one --alert-relay-to PUBHEX"
+                         " (the relay node's alert pubkey, printed at its startup)\n";
+            return 1;
+        }
+        std::optional<da::KeyPair> ar_keys;
+        if (ac.origin || ac.telegram) {
+            std::error_code ec;
+            std::filesystem::create_directories(ar_dir, ec);
+            const std::string key_path = g_alert_relay.key_file.empty()
+                ? ar_dir + "/alert.key" : g_alert_relay.key_file;
+            bool created = false;
+            std::string kerr, kwarn;
+            ar_keys = da::load_or_create_key_file(key_path, created, kerr, kwarn);
+            if (!ar_keys) {
+                std::cerr << "error: " << kerr << "\n";
+                return 1;
+            }
+            if (!kwarn.empty()) LOG_WARNING << "[alert-relay] " << kwarn;
+            std::cout << "[alert-relay] " << (created ? "created" : "loaded") << " alert key "
+                      << key_path << "\n";
+        }
+        alert_relay = std::make_shared<da::AlertRelayService>(ac, ar_keys, core::timestamp());
+        std::string ierr;
+        if (!alert_relay->init(ierr)) {
+            std::cerr << "error: " << ierr << "\n";
+            return 1;
+        }
+        alert_relay->set_transport(p2p_node.make_alert_transport());
+        p2p_node.set_alert_relay(alert_relay);
+        std::cout << "[alert-relay] ARMED (non-consensus): origin=" << ac.origin
+                  << " telegram=" << ac.telegram << " forward=" << alert_relay->can_forward()
+                  << " state=" << ar_dir << "\n";
+        if (ar_keys)
+            std::cout << "[alert-relay] this node's alert pubkey: " << da::to_hex(ar_keys->pubkey)
+                      << "  (give it to the other side: --alert-relay-to on origins /"
+                         " --alert-relay-accept on the relay)\n";
+        if (ac.origin) {
+            std::cout << "[alert-relay] origin: " << ac.relays.size() << " relay(s); offline-after="
+                      << ac.det.offline_after << "s online-after=" << ac.det.online_after
+                      << "s min-interval=" << ac.det.min_interval << "s grace="
+                      << ac.det.startup_grace << "s stall-after=" << ac.det.stall_after
+                      << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max << "\n";
+        }
+        if (ac.telegram) {
+            std::cout << "[alert-relay] relay: " << ac.accept.size()
+                      << " allowlisted origin(s); outbox " << alert_relay->outbox_path()
+                      << " (Telegram sidecar: scripts/alert_relay_telegram.py --state-dir "
+                      << ar_dir << ")\n";
+            if (ac.accept.empty())
+                LOG_WARNING << "[alert-relay] --alert-relay-telegram with an EMPTY allowlist: every"
+                               " alert addressed to this node will be refused";
+        }
+    }
 
     std::unique_ptr<core::WebServer> web_server;
     auto enhanced_node = std::make_shared<dash::EnhancedDashNode>(testnet);
@@ -2260,7 +2495,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             p2p_node.tracker().m_on_share_difficulty =
                 [ws, testnet](double diff, const std::string& miner,
                               const uint256& share_hash) {
-                    // ── ENCODE THE MINER (hotel primary, 2026-08-05) ──────
+                    // ── ENCODE THE MINER (primary node, 2026-08-05) ──────
                     // The tracker reports the share's committed payout as a
                     // RAW hash160 hex, and the best_share card rendered it
                     // verbatim ("cfc7a034…3b8d") while the reserve — whose
@@ -2382,6 +2617,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             mi->load_transition_blobs((data_dir / "transition_messages").string());
         }
 
+        // D-MINER.7: read-only alert-relay status (no secrets: pubkeys, counters,
+        // detector state). Installed BEFORE web_server->start() so the web
+        // thread never races the std::function write; the lambda only reads
+        // the snapshot the IO thread publishes under the service's mutex.
+        if (alert_relay) {
+            mi->set_rest_override_fn(
+                [ar = alert_relay](const std::string& path) -> std::optional<nlohmann::json> {
+                    if (path == "/api/alert-relay/status") return ar->status_json();
+                    return std::nullopt;
+                });
+        }
+
         // Auto-detect the public IP for the "connect to this pool" panel.
         // Non-blocking, detached; identical to the LTC path.
         mi->auto_detect_external_info();
@@ -2422,7 +2669,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // arm could not be taken from any documented invocation. resolve_embedded_
     // arm() closes that with a ONE-WAY implication: the embedded opt-in implies
     // its own feed. The converse is deliberately absent — a transport flag NEVER
-    // moves the arm (the hotel incident where --coin-p2p-connect activated an
+    // moves the arm (the production incident where --coin-p2p-connect activated an
     // unguarded embedded arm on a live production node). Pinned by
     // test_dash_stratum_work_source's DashRunArmResolution suite.
     const dash::coin::ArmResolution run_arm =
@@ -2445,7 +2692,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // coin-state feed — an explicit --coin-p2p-connect / --coin-p2p-discover,
     // or the --embedded-mainnet opt-in that implies one (#738). With NONE of
     // those on argv, coin_p2p stays null, the run path is unchanged and the
-    // mining-hotel prod posture (NodeCoinState unpopulated -> dashd-RPC
+    // production posture (NodeCoinState unpopulated -> dashd-RPC
     // fallback) is untouched. Arming the feed alone still does NOT move the
     // arm: without --embedded-mainnet, work_source keeps serving the dashd
     // fallback no matter what this block populates. The coin-network wire MAGIC (dashd pchMessageStart: mainnet
@@ -3143,7 +3390,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // vs dashd's GBT -- guard untouched) returned an empty selection forever.
     //
     // Default (flag absent): NOTHING here is constructed or subscribed -- the
-    // dashd-RPC fallback path (mining-hotel prod) is byte-unchanged. With the
+    // dashd-RPC fallback path (production) is byte-unchanged. With the
     // flag: the lane opens its LevelDB, arms the mempool's fee machinery, and
     // subscribes the coin-state block_connected seam (leg 3, the same event
     // block_connect_ingest.hpp routes to CoinStateMaintainer). The LIVE block
@@ -3382,7 +3629,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // duplicate/inconclusive/already-have as success (so an ARM A accept is
     // never re-reported as failure); what ignore_failure=true additionally
     // suppressed was the ONLY record of a REAL dashd rejection reason. On the
-    // hotel mainnet orphans (h2508929/h2509044) the bad-cb-payee verdict was
+    // production mainnet orphans (h2508929/h2509044) the bad-cb-payee verdict was
     // swallowed and the log showed just "no-ack", masking a consensus-invalid
     // block as a mere broadcast hiccup. A won-block rejection reason is
     // reward-critical diagnosis: log it loudly.
@@ -3951,7 +4198,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // freezes the CURRENT wd's tx set around it yields a merkle-
                 // consistent but consensus-INVALID block: the coinbase underpays
                 // the MN payee by the fee delta's share and dashd rejects it
-                // with bad-cb-payee (hotel mainnet h2508929: paid the exact
+                // with bad-cb-payee (production mainnet h2508929: paid the exact
                 // GBT@fees=1074 amount vs expected GBT@fees=1301 amount;
                 // h2509044: paid GBT@fees=85791 vs expected GBT@fees=88051 --
                 // both found blocks lost). desired_tx_hashes equality pins the
@@ -4613,6 +4860,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     think_timer->expires_after(std::chrono::seconds(15));
     think_timer->async_wait(*think_tick);
 
+    // ── D-MINER.7: alert-relay tick (IO thread, every 5 s) ─────────────────
+    // Samples the SAME per-session stratum registry /local_stats reads
+    // (DASHWorkSource::get_stratum_workers, copied under its lock), keyed
+    // "ADDRESS.worker", then drives detector + retransmits + sidecar polling.
+    // Absent unless an --alert-relay-* role is armed.
+    std::unique_ptr<core::Timer> alert_relay_timer;
+    if (alert_relay) {
+        if (alert_relay->config().origin && stratum_port == 0)
+            LOG_WARNING << "[alert-relay] --alert-relay-origin without --stratum: no workers can"
+                           " ever be observed on this node";
+        alert_relay->publish_status(core::timestamp());
+        alert_relay_timer = std::make_unique<core::Timer>(&ioc, true);
+        // run_tick() catches anything the sampling or the tick throws (logged,
+        // counted in the status "tick.errors"): core::Timer does not re-arm
+        // after a throwing handler, and a dead alert timer would be silent.
+        alert_relay_timer->start(5, [ar = alert_relay, wsrc = work_source]() {
+            ar->run_tick([&ar, &wsrc]() {
+                std::vector<dash::alert::WorkerSample> samples;
+                if (ar->config().origin) {
+                    for (const auto& [sid, w] : wsrc->get_stratum_workers()) {
+                        dash::alert::WorkerSample smp;
+                        smp.key = w.worker_name.empty() ? w.username : w.username + "." + w.worker_name;
+                        smp.session = sid;
+                        smp.accepted = w.accepted;
+                        samples.push_back(std::move(smp));
+                    }
+                }
+                return samples;
+            }, static_cast<int64_t>(core::timestamp()));
+        });
+    }
+
     // ── E2a: wire the LIVE coin-P2P feed into the maintainer -> populate ──
     // GUARANTEE: this whole block is gated on `coin_p2p` (i.e. --coin-p2p-connect
     // was supplied). With NO flag, coin_p2p is null, none of the header chain /
@@ -4635,7 +4914,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // E2d: the daemonless MN-set bridge. Constructed for the whole embedded
     // arm so the tip-changed driver below can pump it unconditionally, but
     // only ARMED on the no-RPC path (an available `protx list` is strictly
-    // better than a pinned anchor, so the hotel/RPC posture is unchanged).
+    // better than a pinned anchor, so the production/RPC posture is unchanged).
     // Declared AFTER maintainer and BEFORE coin_feed_subs so teardown order is
     // subscriptions -> lane -> maintainer -> header_chain.
     std::unique_ptr<dash::coin::MnCheckpointLane> mn_ckpt_lane;
@@ -7567,7 +7846,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         } else {
             // ── E2d (#738): DAEMONLESS MN-SET SEED (checkpoint bridge) ───────
             // Reached when there is NO dashd RPC, OR when --embedded-no-dashd-mn-seed
-            // is set WITHOUT --embedded-fold-only-proof (the hotel cut-rehearsal:
+            // is set WITHOUT --embedded-fold-only-proof (the production cut-rehearsal:
             // RPC present but observe-only, payee axis seeded daemonlessly). Either
             // way the `protx list` dashd seed is NOT used here. The set comes from a
             // RELEASE-PINNED CHECKPOINT compiled into this binary, replayed
@@ -10220,7 +10499,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // WHY: DASH wired NONE of set_block_verify_fn / schedule_block_
         // verification (LTC wires both, main_ltc.cpp:2105/3013/4258/6315), so a
         // DASH found block sat "pending" on the dashboard forever and orphans
-        // (e.g. hotel 2508008) were found by humans, not the board. This arms
+        // (e.g. production block 2508008) were found by humans, not the board. This arms
         // the poller: verify_found_block fires the verdict fn at +30/+150/… s
         // and flips the row to confirmed/orphaned.
         //
@@ -10355,7 +10634,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     //     template (#1038/#1039); this is the standing-state complement, so the
     //     question is answerable without provoking a decline.
     //   • [BLOCK-LEDGER] — block h=2516911 was won and accepted by the chain,
-    //     and NEITHER hotel node's log showed it: the primary's log had been
+    //     and NEITHER production node's log showed it: the primary's log had been
     //     rotated that morning and the reserve had restarted. Counting our own
     //     blocks by grepping a rotated, restart-truncated log produced two
     //     wrong answers in ten minutes. This line is sourced from the found-
@@ -10601,7 +10880,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     //     m_blockcount_cache_at (impl/dash/coin/rpc.hpp:110-111). Adding a race
     //     on the money path in order to detect a freeze is the wrong trade.
     //   * a SECOND dashd connection was already an open question in the plan
-    //     (hotel auth / connection limits) and is not something to answer by
+    //     (private-host auth / connection limits) and is not something to answer by
     //     assumption on a production node.
     // So the independent reference is the PEER-ADVERTISED height —
     // HeaderChain::peer_tip_height(), a relaxed atomic that already existed and
@@ -11003,7 +11282,7 @@ int run_mine_block(bool testnet, const std::string& rpc_endpoint,
 
 int main(int argc, char** argv)
 {
-    // Mining-hotel interim fix #4: raise RLIMIT_NOFILE to 65536 at startup
+    // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup
     // (one fd per stratum/miner session + RPC + sharechain P2P; distro-default
     // 1024 starves the accept loop). Report the effective soft limit.
     {
@@ -11267,6 +11546,8 @@ int main(int argc, char** argv)
     // Empty => auto-detect the outbound public IP (current behaviour).
     std::string external_ip;                   // --external-ip / --stratum-advertise / --public-host
     std::string settings_path;                 // --settings PATH (M0b; empty => default probe)
+    std::string network_id_hex;                // --network-id: private sharechain IDENTIFIER (empty = public net)
+    std::string prefix_hex_cli;                // --prefix: private sharechain PREFIX (needs --network-id)
     bool want_dump_config = false;             // --dump-resolved-config (M0b)
     bool want_ack_money   = false;             // --ack-money-settings (M0b)
     // Optional encrypted authority message_data blob for local v36 shares +
@@ -11330,6 +11611,16 @@ int main(int argc, char** argv)
             addnode_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--connect") == 0 && i + 1 < argc)
             connect_raw.emplace_back(argv[++i]);
+        // Private sharechain identity (mirror of main_btc.cpp --network-id /
+        // --prefix). Validated and applied after the settings overlay below.
+        else if (std::strcmp(argv[i], "--network-id") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --network-id requires a HEX argument\n"; return 1; }
+            network_id_hex = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--prefix") == 0) {
+            if (i + 1 >= argc) { std::cerr << "error: --prefix requires a HEX argument\n"; return 1; }
+            prefix_hex_cli = argv[++i];
+        }
         else if (std::strcmp(argv[i], "--coin-p2p-connect") == 0 && i + 1 < argc)
             coin_p2p_raw.emplace_back(argv[++i]);
         else if (std::strcmp(argv[i], "--coin-p2p-discover") == 0)
@@ -11455,6 +11746,55 @@ int main(int argc, char** argv)
             embedded_tx_inject_hex_path = argv[++i];   // #157 local M1 submit file
         else if (std::strcmp(argv[i], "--control-plane-token-file") == 0 && i + 1 < argc)
             control_token_file_path = argv[++i];       // #157 Slice 3: control-plane apply token file (DORMANT arming seam)
+        // D-MINER.7 miner-offline alert relay (non-consensus, default OFF).
+        else if (std::strcmp(argv[i], "--alert-relay-origin") == 0)
+            g_alert_relay.origin = true;
+        else if (std::strcmp(argv[i], "--alert-relay-telegram") == 0)
+            g_alert_relay.telegram = true;
+        else if (std::strcmp(argv[i], "--alert-relay-forward") == 0)
+            g_alert_relay.forward = true;
+        else if (std::strcmp(argv[i], "--alert-relay-test") == 0)
+            g_alert_relay.test = true;
+        else if (std::strcmp(argv[i], "--alert-relay-show-key") == 0)
+            g_alert_relay.show_key = true;
+        else if (std::strcmp(argv[i], "--alert-relay-key-file") == 0 && i + 1 < argc)
+            g_alert_relay.key_file = argv[++i];
+        else if (std::strcmp(argv[i], "--alert-relay-to") == 0 && i + 1 < argc)
+            g_alert_relay.to.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--alert-relay-accept") == 0 && i + 1 < argc)
+            g_alert_relay.accept.emplace_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--alert-relay-accept-file") == 0 && i + 1 < argc)
+            g_alert_relay.accept_file = argv[++i];
+        else if (std::strcmp(argv[i], "--alert-relay-label") == 0 && i + 1 < argc)
+            g_alert_relay.label = argv[++i];
+        else if (std::strcmp(argv[i], "--alert-relay-offline-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.offline_after)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-online-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.online_after)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-min-interval") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.min_interval)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-startup-grace") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.startup_grace)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-stall-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.stall_after)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-retry-every") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_every)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-retry-max") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_max)) return 1;
+            ++i;
+        }
         else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
@@ -11599,7 +11939,7 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--web-host") == 0 && i + 1 < argc)
             web_host = argv[++i];
-        // Miner-facing host override for the dashboard Stratum URL. Both hotel
+        // Miner-facing host override for the dashboard Stratum URL. Both production
         // nodes NAT out through one gateway, so the auto-detected outbound IP
         // is NOT the address miners reach; the operator advertises the real
         // external-mapped host here. Aliases match how the flag is referenced.
@@ -11661,6 +12001,21 @@ int main(int argc, char** argv)
         }
         int rc_code = cs::wire_settings(path, c2pool::catalog::C_DASH, tracker, rc);
         if (rc_code != 0) return rc_code;
+        // Private sharechain identity (money-class rows: reaching here means the
+        // money-ack gate passed). Overlaid and VALIDATED on the merged (file +
+        // CLI) value BEFORE the --dump-resolved-config early exit, so a bad
+        // --network-id / --prefix (or settings-file value) errors on the dump
+        // lane exactly as on --run. Values are lower-cased in place; the
+        // override itself is applied once, below, before the run dispatch.
+        if (rc.file_set("sharechain.network_id")) network_id_hex = rc.get_string("sharechain.network_id").value_or(network_id_hex);
+        if (rc.file_set("sharechain.prefix"))     prefix_hex_cli = rc.get_string("sharechain.prefix").value_or(prefix_hex_cli);
+        {
+            std::string nid_err;
+            if (!dash::validate_network_id_args(network_id_hex, prefix_hex_cli, nid_err)) {
+                std::cerr << "error: " << nid_err << "\n";
+                return 1;
+            }
+        }
         if (want_dump_config) { cs::dump_resolved(rc); return 0; }
         // M1 (SAFE): publish an IMMUTABLE snapshot of the resolved LAUNCH config
         // for the read-only control-plane endpoints (GET /api/config[/schema],
@@ -11787,6 +12142,39 @@ int main(int argc, char** argv)
         std::cout << "[REPLAY-UTXO] --replay-utxo-hash/--replay-utxo-expect"
                      " require --replay-utxo-db PATH\n";
         return 2;
+    }
+
+    // ── --network-id / --prefix: resolve ONCE, here, before ANY consumer ─────
+    // The identity has three consumers that must agree: the p2p frame prefix
+    // (run_node: config.pool()->m_prefix), the share ref_hash identifier
+    // (make_coin_params -> CoinParams::active_identifier_hex, read by
+    // share_check.hpp and share_producer.hpp) and the startup log. All three
+    // read dash::SharechainConfig, so it is set exactly once, here, BEFORE the
+    // --mine-block / --run / --selftest dispatch below. Never move this after
+    // run_node: the frame prefix would stay public while ref_hash moved (and
+    // run_node's identity-scoped data subdir would stay the public one).
+    // Both values were validated (and lower-cased) on the merged file+CLI value
+    // in the settings block above, before the --dump-resolved-config exit.
+    dash::SharechainConfig::set_network_id(network_id_hex, prefix_hex_cli);
+
+    // D-MINER.7 key exchange helper: create-or-load the alert key (same default
+    // path run_node uses, identity-scoped by --testnet / --network-id), print
+    // the PUBLIC key and exit. The secret is never printed.
+    if (g_alert_relay.show_key) {
+        const std::string ar_dir = (core::filesystem::config_path()
+            / dash::SharechainConfig::data_subdir(testnet) / "alert_relay").string();
+        std::error_code ec;
+        std::filesystem::create_directories(ar_dir, ec);
+        const std::string key_path = g_alert_relay.key_file.empty()
+            ? ar_dir + "/alert.key" : g_alert_relay.key_file;
+        bool created = false;
+        std::string kerr, kwarn;
+        auto kp = dash::alert::load_or_create_key_file(key_path, created, kerr, kwarn);
+        if (!kp) { std::cerr << "error: " << kerr << "\n"; return 1; }
+        if (!kwarn.empty()) std::cerr << "warning: " << kwarn << "\n";
+        std::cerr << "[alert-relay] " << (created ? "created " : "loaded ") << key_path << "\n";
+        std::cout << dash::alert::to_hex(kp->pubkey) << "\n";
+        return 0;
     }
 
     // ── --coinbase-text: resolve ONCE, here, before any coinbase is built ────

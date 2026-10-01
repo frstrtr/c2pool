@@ -30,6 +30,10 @@
 //         0x48 FB_PING       RELAY-LIVENESS keepalive probe (u64 nonce; no consensus bytes)
 //         0x49 FB_PONG       its echo (same nonce)
 //       (a pre-0x48 node counts 0x48/0x49 as fb_unknown and KEEPS the socket)
+//         0x4a/0x4b      RESERVED (LANE-EPOCH)
+//         0x4c FB_GETADDR    RELAY-DISCOVERY: ask for relay addresses of this pool
+//         0x4d FB_ADDR       the answer: <= 256 x (family, ip, port, last_seen)
+//       (a pre-0x4c node counts 0x4c/0x4d as fb_unknown and KEEPS the socket)
 //     0x80..0x83   carrier_supply.hpp GETORDER/ORDER/GETFRAMES/FRAMES (reused)
 //
 // Every integer is little-endian, every decoder is TOTAL and BOUNDED (a bad
@@ -66,6 +70,10 @@
 // ===========================================================================
 #pragma once
 
+#include <arpa/inet.h>   // RELAY-DISCOVERY: inet_pton / inet_ntop (POSIX, as carrier_net.hpp)
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <array>
 #include <cstddef>
 #include <map>
@@ -78,6 +86,7 @@
 #include <sharechain/v37/v37_hash.hpp>             // ::v37::bytes32
 #include <sharechain/v37/v37_descriptor_xmr.hpp>   // ScriptRef, XMR_STD/XMR_SUB, xmr_identity_key
 #include <sharechain/v37/v37_lane.hpp>             // ::v37::LaneParams (read-only, for the HELLO digest)
+#include <c2pool/v37/xmr/xmr_enrol_mode.hpp>       // DROPS-AUTO-ENROL: EnrolMode, enrol_mode_tag
 
 #include "impl/xmr/receipt/xmr_receipt.hpp"        // ::v37::xmr::MoneroReceipt
 #include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
@@ -110,6 +119,9 @@ inline constexpr u8  FB_DROPINV   = 0x46;   // ★ DROPS backfill: the raindrop 
 inline constexpr u8  FB_GETWON    = 0x47;   // ★ DROPS-RESTART (gate ON only): ask any peer for a carried FB_BLOCK_WON v0x02 by bid
 inline constexpr u8  FB_PING      = 0x48;   // RELAY-LIVENESS
 inline constexpr u8  FB_PONG      = 0x49;   // RELAY-LIVENESS
+// 0x4a / 0x4b are RESERVED for LANE-EPOCH: never reuse them here.
+inline constexpr u8  FB_GETADDR   = 0x4c;   // RELAY-DISCOVERY: ask a peer for relay addresses of this pool
+inline constexpr u8  FB_ADDR      = 0x4d;   // RELAY-DISCOVERY: the answer (bounded sample of known-good peers)
 inline constexpr u8  kFbVersion   = 0x01;
 inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
@@ -150,6 +162,14 @@ inline constexpr std::size_t kBlockWonDropsRowBytes  = 32 + 8;
 // the consensus flip: at flip 0 the live decoder accepts exactly v0x01 (127 B),
 // as master does, and nothing emits v0x02 (the w3 v0x03 rule, w3_relay.hpp).
 inline constexpr bool        kBlockWonDropsLive      = ::c2pool::v37n::kActivateConsensusV1;
+// ★ DROPS-SET-PIN: FB_BLOCK_WON v0x03 (flip-only) = the v0x02 body + the
+// winner's RAINDROP SET: u32 n_ids | n_ids x receipt id (32), strictly
+// ascending, n_ids <= kBlockWonSetMaxIds. Every node composes the block's
+// DROPS rows from exactly these raindrops (never more, never fewer). A v0x02
+// frame still decodes (set = none) but is never booked from under pool rules v4.
+#define C2POOL_XMR_DROPS_SET_PIN 1
+inline constexpr u8          kFbBlockWonSetVersion   = 0x03;
+inline constexpr std::size_t kBlockWonSetMaxIds      = 16384;   // 512 KiB of ids (1 MiB carrier ceiling)
 // ★ DROPS-ENROL-TIDY: the 206-byte HELLO (enrol-set trailer) exists only under
 // the flip too: at flip 0 it is never emitted and the decoder refuses it as
 // "wrong length", exactly as master.
@@ -387,7 +407,38 @@ inline PoolId pool_id_of(u32 chain_id, const ::v37::LaneParams& p,
 // change of the lane-block validity rules that is not a consensus version.
 //   1 = SHIPPED_CONSENSUS_VERSION (V37.1, pre-#1803)
 //   2 = + #1803 EMPTY-CUT FINDER (V37F) + CUT-FLOOR
-inline constexpr u32 kXmrPoolRulesVersion = 2;
+//   3 = + XMR-DROPS-DEFAULT (operator ruling 09-27): raindrops (DROPS) ARMED
+//       in the XMR node by default (the XMR targets build with the V37.1
+//       activation, src/c2pool/CMakeLists.txt c2pool_xmr_drops_default). The
+//       DROPS gate itself rides lane_params_digest, but that refusal is
+//       generic; this version names it: a raindrops-OFF node (any build before
+//       this one, or -DV37_XMR_DROPS_DEFAULT=OFF) is refused AT HELLO as
+//       TAG_MISMATCH field=version with the DROPS reason, both directions.
+//   4 = + DROPS-SET-PIN: a lane block's DROPS rows are composed from exactly
+//       the winner's pinned raindrop set (FB_BLOCK_WON v0x03); a v3 node books
+//       from its own node-local set and would split the owed ledger.
+inline constexpr u32 kXmrPoolRulesVersionDropsOff = 2;
+inline constexpr u32 kXmrPoolRulesVersionDropsV3  = 3;   // DROPS on, node-local raindrop set (pre DROPS-SET-PIN)
+inline constexpr u32 kXmrPoolRulesVersionDropsOn  = 4;
+inline constexpr u32 kXmrPoolRulesVersion =
+    ::c2pool::v37n::kActivateConsensusV1 ? kXmrPoolRulesVersionDropsOn : kXmrPoolRulesVersionDropsOff;
+#define C2POOL_XMR_DROPS_DEFAULT_RULES 1   // feature probe: the v3 (DROPS default) pool rules exist
+// The explicit reason for a pool-rules version pair ("" = no special text).
+inline std::string pool_rules_reason(u32 ours, u32 theirs) {
+    if (ours == kXmrPoolRulesVersionDropsOn && theirs == kXmrPoolRulesVersionDropsOff)
+        return ": the peer runs raindrops (DROPS) OFF -- an XMR build before XMR-DROPS-DEFAULT; raindrops are pool "
+               "consensus (owed_digest), every node of a pool must run the same DROPS-default build -- upgrade it";
+    if (ours == kXmrPoolRulesVersionDropsOff && theirs == kXmrPoolRulesVersionDropsOn)
+        return ": the peer runs raindrops (DROPS) ON (the XMR-DROPS-DEFAULT build) and this node runs them OFF -- "
+               "every node of a pool must run the same build";
+    if (ours == kXmrPoolRulesVersionDropsOn && theirs == kXmrPoolRulesVersionDropsV3)
+        return ": the peer composes raindrop credit from its own node-local raindrop set (pool rules v3, before "
+               "DROPS-SET-PIN) and would book a different DROPS delta -- upgrade it";
+    if (theirs < ours && ours >= 2 && theirs < 2)
+        return ": the peer runs older pool rules (pre-#1803: no V37F empty-cut finder / cut floor) and would stall on "
+               "this pool's blocks -- upgrade it";
+    return "";
+}
 #define C2POOL_XMR_POOL_RULES_VERSION 1   // feature probe for KATs built on both trees
 inline PoolId node_pool_id(u32 chain_id, const ::v37::LaneParams& p) {
     return pool_id_of(chain_id, p, kXmrPoolRulesVersion);
@@ -406,7 +457,9 @@ struct Hello {
     u32     chain_id = 0;
     bytes32 lane_params_digest{};
     u64     share_diff = 0;
-    u64     node_nonce = 0;           // per process; self-connect detection
+    u64     node_nonce = 0;           // NODE-NONCE: random 64-bit per process (never 0), fixed at byte 51 of
+                                      // every HELLO v1 length: equal = a self-connection (closed, address SELF);
+                                      // a second HELLO-ok link with the same nonce = a duplicate (one is closed)
     u16     listen_port = 0;          // 0 = dial-only
     u64     lane_next_pos = 0;        // our lane tip (diagnostic + backfill hint)
     bytes32 lane_digest{};            // LaneSnapshot digest at that tip (diagnostic)
@@ -489,10 +542,7 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
         return out("chain_id", "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id));
     if (theirs.pool->version != ours.pool->version)
         return out("version", "consensus version " + std::to_string(theirs.pool->version) + " != ours " + std::to_string(ours.pool->version) +
-                   (theirs.pool->version < ours.pool->version && ours.pool->version == kXmrPoolRulesVersion
-                        ? ": the peer runs older pool rules (pre-#1803: no V37F empty-cut finder / cut floor) and would stall on "
-                          "this pool's blocks -- upgrade it"
-                        : ""));
+                   pool_rules_reason(ours.pool->version, theirs.pool->version));
     if (theirs.pool->authority != ours.pool->authority)
         return out("authority", "authority " + std::to_string(theirs.pool->authority) + " != ours " + std::to_string(ours.pool->authority));
     return out("geometry", "LaneParams geometry differs (window/c0/rollup/half_life/level_caps/k_floor)");
@@ -503,6 +553,12 @@ inline std::string pool_id_mismatch(const Hello& ours, const Hello& theirs) {
 // EXPLICIT refusal with a reason, never a silent divergence (the memory-recorded
 // "mismatched-LaneParams nodes must reject explicitly" gap).
 inline constexpr char kEnrolSetMismatch[] = "ENROL_SET_MISMATCH";
+inline std::string enrol_mode_label(const std::optional<bytes32>& d) {
+    if (!d) return "not carried (an auto-enrol-less build with an empty list)";
+    if (*d == enrol_mode_tag(EnrolMode::Auto)) return "auto (every payee)";
+    if (*d == enrol_mode_tag(EnrolMode::None)) return "none (--drops-enrol none)";
+    return "list (--drops-enrol ID...)";
+}
 inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
     if (auto t = pool_id_mismatch(ours, theirs); !t.empty()) return t;   // POOL-ID (subsumes chain_id when tagged)
@@ -517,8 +573,9 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
             return std::string(kEnrolSetMismatch) + " enrol-set digest differs: ours=" +
                    (ours.enrol_set ? hex32(*ours.enrol_set).substr(0, 12) : std::string("none")) + " theirs=" +
                    (theirs.enrol_set ? hex32(*theirs.enrol_set).substr(0, 12) : std::string("none")) +
-                   " (every node of a pool must run the identical --drops-enrol list)";
-        return "lane_params_digest differs (different LaneParams geometry/gates)";
+                   " mode ours=" + enrol_mode_label(ours.enrol_set) + " theirs=" + enrol_mode_label(theirs.enrol_set) +
+                   " (every node of a pool must run the identical --drops-enrol list / mode)";
+        return "lane_params_digest differs (different LaneParams geometry/gates: DROPS subthreshold / fee model / share weight)";
     }
     if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";
     return "";
@@ -543,6 +600,9 @@ struct BlockWon {
     struct Drops {
         std::map<bytes32, long long> delta;   // payee -> signed delta, no zero rows, <= kBlockWonDropsMaxRows
         bytes32 enrollment_digest{};          // winner's EnrollmentBook::book_digest() at the composition
+        // ★ DROPS-SET-PIN (v0x03): the receipt ids of the raindrops the delta was
+        // composed from, strictly ascending. nullopt = a v0x02 frame (no set).
+        std::optional<std::vector<bytes32>> set;
         bool operator==(const Drops&) const = default;
     };
     std::optional<Drops> drops;
@@ -553,15 +613,26 @@ struct BlockWon {
 // (and never with more than kBlockWonDropsMaxRows rows: {} is returned then).
 inline std::vector<u8> encode_block_won(const BlockWon& b) {
     if (b.drops && b.drops->delta.size() > kBlockWonDropsMaxRows) return {};
+    const bool v3 = b.drops && b.drops->set.has_value();
+    if (v3) {   // ★ DROPS-SET-PIN: canonical or nothing
+        const auto& ids = *b.drops->set;
+        if (ids.size() > kBlockWonSetMaxIds) return {};
+        for (std::size_t i = 1; i < ids.size(); ++i) if (!(ids[i - 1] < ids[i])) return {};
+    }
     std::vector<u8> f;
-    f.reserve(b.drops ? kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * b.drops->delta.size() : kBlockWonBytes);
-    f.push_back(FB_BLOCK_WON); f.push_back(b.drops ? kFbBlockWonDropsVersion : kFbVersion); le::put32(f, b.chain_id);
+    f.reserve(b.drops ? kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * b.drops->delta.size() +
+                        (v3 ? 4 + 32 * b.drops->set->size() : 0) : kBlockWonBytes);
+    f.push_back(FB_BLOCK_WON); f.push_back(v3 ? kFbBlockWonSetVersion : b.drops ? kFbBlockWonDropsVersion : kFbVersion); le::put32(f, b.chain_id);
     le::putb(f, b.bid); le::put64(f, b.h_b); le::put64(f, b.cut_next_pos); le::putb(f, b.cut_spine_digest);
     le::put64(f, b.reward); f.push_back(b.payout_emitted ? 1 : 0); le::putb(f, b.owed_digest_at_win);
     if (b.drops) {
         le::put16(f, static_cast<u16>(b.drops->delta.size()));
         for (const auto& [k, v] : b.drops->delta) { le::putb(f, k); le::put64(f, static_cast<u64>(v)); }
         le::putb(f, b.drops->enrollment_digest);
+        if (v3) {
+            le::put32(f, static_cast<u32>(b.drops->set->size()));
+            for (const auto& id : *b.drops->set) le::putb(f, id);
+        }
     }
     return f;
 }
@@ -573,7 +644,8 @@ inline std::vector<u8> encode_block_won(const BlockWon& b) {
 inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string* why = nullptr,
                              bool accept_drops = kBlockWonDropsLive) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    const bool v2 = accept_drops && f.size() >= 2 && f[1] == kFbBlockWonDropsVersion;
+    const bool v3 = accept_drops && f.size() >= 2 && f[1] == kFbBlockWonSetVersion;   // ★ DROPS-SET-PIN
+    const bool v2 = (accept_drops && f.size() >= 2 && f[1] == kFbBlockWonDropsVersion) || v3;
     if (!v2 && f.size() != kBlockWonBytes) return bad("block_won: wrong length");
     if (v2 && f.size() < kBlockWonDropsMinBytes) return bad("block_won: v0x02 short");
     if (f[0] != FB_BLOCK_WON) return bad("block_won: wrong opcode");
@@ -592,7 +664,9 @@ inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string*
     if (!v2) return true;
     const std::size_t n = le::get16(p); p += 2;
     if (n > kBlockWonDropsMaxRows) return bad("block_won: v0x02 rows over the bound");
-    if (f.size() != kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * n) return bad("block_won: v0x02 wrong length");
+    const std::size_t body = kBlockWonDropsMinBytes + kBlockWonDropsRowBytes * n;
+    if (!v3 && f.size() != body) return bad("block_won: v0x02 wrong length");
+    if (v3 && f.size() < body + 4) return bad("block_won: v0x03 short");
     BlockWon::Drops d;
     for (std::size_t i = 0; i < n; ++i) {
         const bytes32 k = le::getb(p); p += 32;
@@ -601,7 +675,20 @@ inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string*
         if (!d.delta.empty() && !(d.delta.rbegin()->first < k)) return bad("block_won: v0x02 rows not strictly ascending");
         d.delta.emplace_hint(d.delta.end(), k, v);
     }
-    d.enrollment_digest = le::getb(p);
+    d.enrollment_digest = le::getb(p); p += 32;
+    if (v3) {   // ★ DROPS-SET-PIN: the set trailer, canonical or refused
+        const std::size_t m = le::get32(p); p += 4;
+        if (m > kBlockWonSetMaxIds) return bad("block_won: v0x03 raindrop set over the bound");
+        if (f.size() != body + 4 + 32 * m) return bad("block_won: v0x03 wrong length");
+        std::vector<bytes32> ids;
+        ids.reserve(m);
+        for (std::size_t i = 0; i < m; ++i) {
+            const bytes32 id = le::getb(p); p += 32;
+            if (!ids.empty() && !(ids.back() < id)) return bad("block_won: v0x03 raindrop set not strictly ascending");
+            ids.push_back(id);
+        }
+        d.set = std::move(ids);
+    }
     b.drops = std::move(d);
     return true;
 }
@@ -777,6 +864,126 @@ inline bool decode_ping(const std::vector<u8>& f, u8& op, u64& nonce, std::strin
     if (f[1] != kFbVersion) return bad("ping: unknown version");
     op = f[0];
     nonce = le::get64(f.data() + 2);
+    return true;
+}
+
+// ── FB_GETADDR (0x4c) / FB_ADDR (0x4d): RELAY-DISCOVERY ─────────────────────
+// Peer discovery for the relay (mirrors v36 getaddrs/addrs): after HELLO ok a
+// node asks a peer for relay addresses; the peer answers with a random sample
+// of the peers it has itself completed a HELLO with (same pool id + network:
+// a HELLO-gated link never carries another pool's frames). Nothing here enters
+// a lane, a digest or a coinbase.
+//   GETADDR : u8 0x4c ; u8 ver ; u32 chain_id ; u16 want (1..256)          (8 B)
+//   ADDR    : u8 0x4d ; u8 ver ; u32 chain_id ; u16 n (0..256) ; n x entry
+//   entry   : u8 family (4|6) ; ip 16 B (IPv4 = 4 B + 12 zero B) ; u16 port (!= 0) ; u64 last_seen (unix s)
+inline constexpr std::size_t kAddrMaxEntries  = 256;
+inline constexpr std::size_t kGetAddrBytes    = 1 + 1 + 4 + 2;
+inline constexpr std::size_t kAddrHeader      = 1 + 1 + 4 + 2;
+inline constexpr std::size_t kAddrEntryBytes  = 1 + 16 + 2 + 8;
+inline constexpr std::size_t kAddrMaxFrame    = kAddrHeader + kAddrMaxEntries * kAddrEntryBytes;
+inline constexpr u8          kAddrFamV4 = 4, kAddrFamV6 = 6;
+
+struct AddrEntry {
+    u8 family = kAddrFamV4;
+    std::array<u8, 16> ip{};
+    u16 port = 0;
+    u64 last_seen = 0;
+    bool operator==(const AddrEntry&) const = default;
+};
+
+// "a.b.c.d" / IPv6 literal -> entry. false on anything else (no DNS here).
+inline bool addr_entry_of(const std::string& host, u16 port, u64 last_seen, AddrEntry& e) {
+    e = AddrEntry{}; e.port = port; e.last_seen = last_seen;
+    in_addr a4{};
+    if (::inet_pton(AF_INET, host.c_str(), &a4) == 1) { e.family = kAddrFamV4; std::memcpy(e.ip.data(), &a4, 4); return port != 0; }
+    in6_addr a6{};
+    if (::inet_pton(AF_INET6, host.c_str(), &a6) == 1) { e.family = kAddrFamV6; std::memcpy(e.ip.data(), &a6, 16); return port != 0; }
+    return false;
+}
+inline std::string addr_host(const AddrEntry& e) {
+    char b[INET6_ADDRSTRLEN] = {0};
+    if (e.family == kAddrFamV4) ::inet_ntop(AF_INET, e.ip.data(), b, sizeof b);
+    else ::inet_ntop(AF_INET6, e.ip.data(), b, sizeof b);
+    return b;
+}
+// Publicly routable? false for unspecified, loopback, RFC1918, CGNAT, link-local,
+// multicast / reserved (v4) and ::, ::1, fc00::/7, fe80::/10, ff00::/8, v4-mapped
+// private (v6). A private address is never handed to a public peer.
+inline bool addr_routable(const AddrEntry& e) {
+    const u8* p = e.ip.data();
+    auto v4 = [](const u8* q) {
+        if (q[0] == 0 || q[0] == 10 || q[0] == 127 || q[0] >= 224) return false;
+        if (q[0] == 169 && q[1] == 254) return false;
+        if (q[0] == 172 && (q[1] & 0xf0) == 16) return false;
+        if (q[0] == 192 && q[1] == 168) return false;
+        if (q[0] == 100 && (q[1] & 0xc0) == 64) return false;
+        return true;
+    };
+    if (e.family == kAddrFamV4) return v4(p);
+    static const u8 mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (std::memcmp(p, mapped, 12) == 0) return v4(p + 12);
+    bool zero15 = true;
+    for (int i = 0; i < 15; ++i) zero15 = zero15 && p[i] == 0;
+    if (zero15 && (p[15] == 0 || p[15] == 1)) return false;          // :: and ::1
+    if ((p[0] & 0xfe) == 0xfc) return false;                          // fc00::/7
+    if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80) return false;          // fe80::/10
+    if (p[0] == 0xff) return false;                                   // multicast
+    return true;
+}
+
+inline std::vector<u8> encode_getaddr(u32 chain_id, u16 want) {
+    if (want == 0 || want > kAddrMaxEntries) return {};
+    std::vector<u8> f; f.reserve(kGetAddrBytes);
+    f.push_back(FB_GETADDR); f.push_back(kFbVersion); le::put32(f, chain_id); le::put16(f, want);
+    return f;
+}
+inline bool decode_getaddr(const std::vector<u8>& f, u32& chain_id, u16& want, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() != kGetAddrBytes) return bad("getaddr: wrong length");
+    if (f[0] != FB_GETADDR) return bad("getaddr: wrong opcode");
+    if (f[1] != kFbVersion) return bad("getaddr: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    want = le::get16(f.data() + 6);
+    if (want == 0 || want > kAddrMaxEntries) return bad("getaddr: want out of range");
+    return true;
+}
+inline std::vector<u8> encode_addr(u32 chain_id, const std::vector<AddrEntry>& v) {
+    if (v.size() > kAddrMaxEntries) return {};
+    std::vector<u8> f; f.reserve(kAddrHeader + v.size() * kAddrEntryBytes);
+    f.push_back(FB_ADDR); f.push_back(kFbVersion); le::put32(f, chain_id); le::put16(f, static_cast<u16>(v.size()));
+    for (const auto& e : v) {
+        if ((e.family != kAddrFamV4 && e.family != kAddrFamV6) || e.port == 0) return {};
+        f.push_back(e.family);
+        if (e.family == kAddrFamV4) { f.insert(f.end(), e.ip.begin(), e.ip.begin() + 4); f.insert(f.end(), 12, 0); }
+        else f.insert(f.end(), e.ip.begin(), e.ip.end());
+        le::put16(f, e.port); le::put64(f, e.last_seen);
+    }
+    return f;
+}
+inline bool decode_addr(const std::vector<u8>& f, u32& chain_id, std::vector<AddrEntry>& out, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    out.clear();
+    if (f.size() < kAddrHeader || f.size() > kAddrMaxFrame) return bad("addr: wrong length");
+    if (f[0] != FB_ADDR) return bad("addr: wrong opcode");
+    if (f[1] != kFbVersion) return bad("addr: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    const std::size_t n = le::get16(f.data() + 6);
+    if (n > kAddrMaxEntries) return bad("addr: too many entries");
+    if (f.size() != kAddrHeader + n * kAddrEntryBytes) return bad("addr: length != n entries");
+    out.reserve(n);
+    const u8* p = f.data() + kAddrHeader;
+    for (std::size_t i = 0; i < n; ++i, p += kAddrEntryBytes) {
+        AddrEntry e;
+        e.family = p[0];
+        if (e.family != kAddrFamV4 && e.family != kAddrFamV6) { out.clear(); return bad("addr: unknown family"); }
+        std::memcpy(e.ip.data(), p + 1, 16);
+        if (e.family == kAddrFamV4)
+            for (int k = 4; k < 16; ++k) if (e.ip[k] != 0) { out.clear(); return bad("addr: ipv4 padding not zero"); }
+        e.port = le::get16(p + 17);
+        if (e.port == 0) { out.clear(); return bad("addr: port 0"); }
+        e.last_seen = le::get64(p + 19);
+        out.push_back(e);
+    }
     return true;
 }
 

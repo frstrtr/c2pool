@@ -118,9 +118,16 @@ switches them off.
    `c2pool-v37-xmr`, and no extra `CFLAGS`, `CXXFLAGS` or `LDFLAGS` in the
    environment.
 
-No compiled-in pinned snapshot exists on master yet. When one lands as data
-compiled into the daemon, the same check covers it, because it is part of the
-binary.
+The pinned snapshot (the stagenet and mainnet anchors, and the size and
+sha256 of each output-set file) is compiled into the daemon on master
+(c2pool #1777). The same check covers it, because it is part of the binary:
+`c2pool-v37-xmr --version` prints the pinned heights and block ids, and
+[PINNED-SNAPSHOTS.md](PINNED-SNAPSHOTS.md) lists every pinned value.
+
+The release package (`scripts/xmr-node/build-release.sh`) links libgcc
+statically (`-static-libgcc`) and strips the binary, so its bytes differ from the
+plain build described here. Run it with `STATIC_RUNTIME=0` and compare the
+unstripped binary in its build directory to reproduce the recipe above.
 
 ## Cross-host (not in this slice)
 

@@ -31,18 +31,39 @@
 // The digests of the shadow's last `keep` positions are what the relay's
 // prefix probe accepts besides our own (XmrRelayNode::note_alt_digests).
 // Node-local bookkeeping only: nothing here is on the wire or in consensus.
+//
+// REPAIR-CHAIN (capstone attempt 4). Two corrections to the above:
+// (1) the lane digest is a Merkle root over the lane STATE (v37_lane.hpp
+//     digest()), not an append-only chain: two orders that differ locally
+//     re-converge at the digest level once the differing buckets fold, so a
+//     repair needs ANY base whose state at some q equals the winner's, not the
+//     winner's order from 0. With a checkpoint step G (set_checkpoint_step) a
+//     shadow also keeps its digest at every multiple of G, which is what the
+//     relay's down-walk (XmrRelayNode deep_order) compares at q.
+// (2) the shadows were IN MEMORY ONLY: every restart dropped them, and two of
+//     the three attempt-4 holds were exactly that. enable_persist() writes them
+//     to <settle_db>/lane<N>.shadow after every adopt (atomic tmp + rename,
+//     sha256d trailer) and load() restores them at boot, before the relay
+//     starts; a missing / torn / foreign file = zero shadows (RC5), loudly.
 // ===========================================================================
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
+#include <string>
 #include <map>
 #include <optional>
 #include <memory>
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 #include <c2pool/v37/v37_engine.hpp>
+#include <sharechain/v37/v37_hash.hpp>
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -68,7 +89,8 @@ public:
                                                  const std::vector<Push>& own, const std::vector<Push>& served,
                                                  Base* used = nullptr,
                                                  const std::optional<bytes32>& want_a0 = std::nullopt,
-                                                 const std::optional<bytes32>& own_a0 = std::nullopt) {
+                                                 const std::optional<bytes32>& own_a0 = std::nullopt,
+                                                 std::pair<std::uint64_t, bytes32>* shadow_end = nullptr) {
         if (used) *used = kNone;
         const auto skip = [&](const std::optional<bytes32>& have) { return a0 && want_a0 && have && *have != *want_a0; };
         auto adopt = [&](std::vector<Push>&& all, std::map<std::uint64_t, bytes32>&& digs, int from) {
@@ -82,6 +104,7 @@ public:
             }
             m_sh.push_front(Shadow{std::move(all), std::move(digs)});
             while (m_sh.size() > kMaxShadows) m_sh.pop_back();
+            if (!m_path.empty()) persist();   // REPAIR-CHAIN (F1): a restart keeps the chain
         };
         if (!skip(own_a0) && a0 <= own.size()) {
             std::vector<Push> all; std::map<std::uint64_t, bytes32> digs;
@@ -100,6 +123,10 @@ public:
             if (skip(have)) continue;
             std::vector<Push> all; std::map<std::uint64_t, bytes32> digs;
             if (auto rv = run(chain, lp, P, spine, sh.pushes, a0, served, all, digs)) {
+                if (shadow_end) {   // ★ DROPS-CARRY-SUFFIX: WHICH shadow's [0, a0) reached the spine (its end)
+                    const auto e = sh.dig.find(sh.pushes.size());
+                    *shadow_end = {sh.pushes.size(), e == sh.dig.end() ? bytes32{} : e->second};
+                }
                 adopt(std::move(all), std::move(digs), static_cast<int>(i));
                 if (used) *used = kShadow;
                 return rv;
@@ -115,7 +142,127 @@ public:
         return out;
     }
 
+    // ── REPAIR-CHAIN ────────────────────────────────────────────────────────
+    struct PersistStats {
+        std::uint64_t writes = 0, write_fail = 0, bytes = 0;   // `bytes` = the last file's size
+        std::uint64_t loaded = 0, load_bad = 0;                // shadows restored / files ignored
+        std::string last_error;
+    };
+    void set_checkpoint_step(std::uint64_t g) { m_step = g; }
+    // Persist the shadows to `path` after every adopt. `tag` = the relay's
+    // lane_params_digest (a file of another lane geometry is ignored at load).
+    void enable_persist(const std::string& path, std::uint32_t chain, const bytes32& tag,
+                        std::uint64_t max_bytes = 256ull << 20) {
+        m_path = path; m_chain = chain; m_tag = tag; m_max_bytes = max_bytes ? max_bytes : (256ull << 20);
+    }
+    const PersistStats& persist_stats() const { return m_ps; }
+    const std::string& persist_path() const { return m_path; }
+    // Every shadow's (length, digest at its end): the KAT compares them across a restart.
+    std::vector<std::pair<std::uint64_t, bytes32>> shadow_ends() const {
+        std::vector<std::pair<std::uint64_t, bytes32>> v;
+        for (const auto& sh : m_sh) {
+            auto it = sh.dig.find(sh.pushes.size());
+            v.emplace_back(sh.pushes.size(), it == sh.dig.end() ? bytes32{} : it->second);
+        }
+        return v;
+    }
+
+    // Write every shadow (MRU first) to m_path: tmp + fsync + rename. Above
+    // m_max_bytes only the most recent shadow is written. false = kept the old file.
+    bool persist() {
+        if (m_path.empty()) return false;
+        std::vector<std::uint8_t> b;
+        std::size_t count = m_sh.size();
+        for (int pass = 0; pass < 2; ++pass) {
+            b.clear();
+            b.insert(b.end(), kMagic, kMagic + 8);
+            put(b, m_chain, 4); b.insert(b.end(), m_tag.begin(), m_tag.end());
+            put(b, m_keep, 8); put(b, m_step, 8); put(b, count, 4);
+            for (std::size_t i = 0; i < count; ++i) {
+                const Shadow& sh = m_sh[i];
+                put(b, sh.pushes.size(), 8); put(b, sh.dig.size(), 8);
+                for (const auto& [pos, d] : sh.dig) { put(b, pos, 8); b.insert(b.end(), d.begin(), d.end()); }
+                for (const auto& [ref, w] : sh.pushes) {
+                    b.push_back(static_cast<std::uint8_t>(ref.kind)); put(b, ref.payload.size(), 2);
+                    b.insert(b.end(), ref.payload.begin(), ref.payload.end()); put(b, w, 8);
+                }
+            }
+            if (b.size() + 32 <= m_max_bytes || count <= 1) break;
+            count = 1;   // over the cap: the MRU shadow only
+        }
+        const bytes32 h = ::v37::sha256d(b);
+        b.insert(b.end(), h.begin(), h.end());
+        const std::string tmp = m_path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        bool ok = f && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        if (f) ok = (std::fclose(f) == 0) && ok;
+        ok = ok && std::rename(tmp.c_str(), m_path.c_str()) == 0;
+        if (!ok) { ++m_ps.write_fail; m_ps.last_error = "cannot write " + m_path + ": " + std::strerror(errno); return false; }
+        ++m_ps.writes; m_ps.bytes = b.size();
+        return true;
+    }
+
+    // Restore the shadows from m_path (boot, before the relay starts). Any
+    // mismatch (magic, chain, lane tag, bounds, trailer) = the file is ignored:
+    // zero shadows, exactly RC5, with m_ps.last_error saying why. Returns the
+    // number of shadows restored.
+    std::size_t load() {
+        if (m_path.empty()) return 0;
+        std::FILE* f = std::fopen(m_path.c_str(), "rb");
+        if (!f) return 0;   // no file yet: nothing to restore
+        std::vector<std::uint8_t> b;
+        std::uint8_t buf[65536];
+        for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) b.insert(b.end(), buf, buf + n);
+        std::fclose(f);
+        auto bad = [&](const char* why) { ++m_ps.load_bad; m_ps.last_error = std::string(why) + " (" + m_path + " ignored: zero shadows)"; return std::size_t{0}; };
+        if (b.size() < 8 + 4 + 32 + 8 + 8 + 4 + 32 || std::memcmp(b.data(), kMagic, 8) != 0) return bad("bad magic/size");
+        const std::size_t body = b.size() - 32;
+        if (::v37::sha256d(b.data(), body) != *reinterpret_cast<const bytes32*>(b.data() + body)) return bad("trailer hash mismatch (torn/corrupt)");
+        std::size_t o = 8;
+        auto get = [&](std::size_t n, std::uint64_t& v) {
+            if (o + n > body) return false;
+            v = 0; for (std::size_t i = n; i-- > 0;) v = (v << 8) | b[o + i];
+            o += n; return true;
+        };
+        std::uint64_t chain = 0, keep = 0, step = 0, count = 0;
+        if (!get(4, chain) || o + 32 > body) return bad("truncated header");
+        bytes32 tag{}; std::memcpy(tag.data(), b.data() + o, 32); o += 32;
+        if (!get(8, keep) || !get(8, step) || !get(4, count)) return bad("truncated header");
+        if (chain != m_chain || tag != m_tag) return bad("another lane (chain / lane_params_digest differ)");
+        if (count > kMaxShadows) return bad("too many shadows");
+        std::deque<Shadow> sh;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            Shadow s; std::uint64_t P = 0, nd = 0;
+            if (!get(8, P) || !get(8, nd) || P > (1ull << 32) || nd > P + 1 || nd * 40 > body - o) return bad("bad shadow header");
+            for (std::uint64_t k = 0; k < nd; ++k) {
+                std::uint64_t pos = 0; bytes32 d{};
+                if (!get(8, pos) || o + 32 > body || pos > P) return bad("bad digest record");
+                std::memcpy(d.data(), b.data() + o, 32); o += 32;
+                s.dig.emplace(pos, d);
+            }
+            if (!s.dig.count(P)) return bad("a shadow without its end digest");
+            s.pushes.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(P, (body - o) / 11 + 1)));
+            for (std::uint64_t k = 0; k < P; ++k) {
+                std::uint64_t kind = 0, len = 0, w = 0;
+                if (!get(1, kind) || !get(2, len) || len > 64 || o + len > body) return bad("bad push record");
+                ::v37::ScriptRef ref; ref.kind = static_cast<::v37::ScriptKind>(kind);
+                ref.payload.assign(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + len)); o += len;
+                if (!get(8, w)) return bad("bad push record");
+                s.pushes.emplace_back(std::move(ref), w);
+            }
+            sh.push_back(std::move(s));
+        }
+        if (o != body) return bad("trailing bytes");
+        m_sh = std::move(sh);
+        m_ps.loaded += m_sh.size();
+        return m_sh.size();
+    }
+
 private:
+    static constexpr std::uint8_t kMagic[8] = {'V', '3', '7', 'S', 'H', 'D', '1', 0};
+    static void put(std::vector<std::uint8_t>& b, std::uint64_t v, int n) {
+        for (int i = 0; i < n; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+    }
     struct Shadow { std::vector<Push> pushes; std::map<std::uint64_t, bytes32> dig; };
 
     std::shared_ptr<const SettlementView> run(std::uint32_t chain, const ::v37::LaneParams& lp, std::uint64_t P,
@@ -131,7 +278,7 @@ private:
             scratch.submit_tracked(::v37::LaneRecord::push(chain, d, p.second, 0)).get();
             all.push_back(p);
             const std::uint64_t pos = all.size();
-            if (pos + m_keep >= P) {
+            if (pos + m_keep >= P || (m_step && pos % m_step == 0)) {   // + REPAIR-CHAIN checkpoints
                 if (auto s = scratch.snapshot(chain)) digs[pos] = s->digest;
             }
         };
@@ -144,7 +291,13 @@ private:
     }
 
     std::uint64_t m_keep;
+    std::uint64_t m_step = 0;          // REPAIR-CHAIN: checkpoint digest spacing (0 = RC5: last `keep` only)
     std::deque<Shadow> m_sh;
+    std::string m_path;                // REPAIR-CHAIN (F1): "" = in memory only (RC5)
+    std::uint32_t m_chain = 0;
+    bytes32 m_tag{};
+    std::uint64_t m_max_bytes = 256ull << 20;
+    PersistStats m_ps;
 };
 
 } // namespace c2pool::v37n::xmr::relay

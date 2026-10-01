@@ -205,14 +205,16 @@ C2P_PARAM("sharechain.p2p_max_peers", Sharechain, INT64, RESTART, C_LTC, LIT, "3
 C2P_PARAM("sharechain.ban_duration", Sharechain, INT64, LIVE, C_LTC, LIT, "300", NONE, "ban duration seconds")
   C2P_ALIAS("sharechain.ban_duration", BIN_LTC, "--ban-duration", VALUE)
 
-C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC, LIT, "", HEX_EVEN, "private sharechain identifier (forks chain)")
+C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain identifier (forks chain)")
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--network-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--chain-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_BTC, "--network-id", VALUE)
+  C2P_ALIAS("sharechain.network_id", BIN_DASH, "--network-id", VALUE)
 
-C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC, LIT, "", HEX_EVEN, "private sharechain prefix")
+C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain prefix")
   C2P_ALIAS("sharechain.prefix", BIN_LTC, "--prefix", VALUE)
   C2P_ALIAS("sharechain.prefix", BIN_BTC, "--prefix", VALUE)
+  C2P_ALIAS("sharechain.prefix", BIN_DASH, "--prefix", VALUE)
 
 C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT, "", HOSTPORT_V, "explicit coin-network dial")
   C2P_ALIAS("coin_p2p.connect", BIN_DASH, "--coin-p2p-connect", VALUE)
@@ -564,6 +566,59 @@ C2P_PARAM("embedded.fold_checkscripts", Embedded, BOOL, RESTART, C_DASH, LIT, "f
 
 C2P_PARAM("embedded.tx_inject", Embedded, BOOL, MONEY_LIVE, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection arm (opt-in, default OFF, reward-neutral; MONEY-path: arming changes mined-block body -> the full two-phase money-nonce + M0 tripwire gate, Slice B)")
   C2P_ALIAS("embedded.tx_inject", BIN_DASH, "--embedded-tx-inject", FLAG)
+
+// D-MINER.7 miner-offline alert relay over the sharechain p2p (non-consensus,
+// default OFF; see src/impl/dash/alert_service.hpp). RESTART: read at launch.
+C2P_PARAM("alert_relay.origin", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "origin role: detect offline stratum workers and relay signed alerts over the sharechain p2p")
+  C2P_ALIAS("alert_relay.origin", BIN_DASH, "--alert-relay-origin", FLAG)
+
+C2P_PARAM("alert_relay.telegram", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "relay role: accept allowlisted alerts addressed to this node for the Telegram sidecar")
+  C2P_ALIAS("alert_relay.telegram", BIN_DASH, "--alert-relay-telegram", FLAG)
+
+C2P_PARAM("alert_relay.forward", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "store-and-forward alerts not addressed to this node")
+  C2P_ALIAS("alert_relay.forward", BIN_DASH, "--alert-relay-forward", FLAG)
+
+C2P_PARAM("alert_relay.test", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "origin: send one test alert ~30s after start")
+  C2P_ALIAS("alert_relay.test", BIN_DASH, "--alert-relay-test", FLAG)
+
+C2P_PARAM("alert_relay.show_key", Meta, BOOL, COMPILE_TIME_READONLY, C_DASH, LIT, "false", NONE, "print this node's alert pubkey (creating the key if needed) and exit")
+  C2P_ALIAS("alert_relay.show_key", BIN_DASH, "--alert-relay-show-key", FLAG)
+
+C2P_PARAM("alert_relay.key_file", Global, PATH, RESTART, C_DASH, LIT, "", NONE, "alert secp256k1 key file (created 0600 on first use; default <data-dir>/<net>/alert_relay/alert.key)")
+  C2P_ALIAS("alert_relay.key_file", BIN_DASH, "--alert-relay-key-file", VALUE)
+
+C2P_PARAM("alert_relay.to", Global, HEX, RESTART, C_DASH, LIT, "", HEX_EVEN, "origin: relay pubkey to seal alerts for (repeatable)")
+  C2P_ALIAS("alert_relay.to", BIN_DASH, "--alert-relay-to", VALUE)
+
+C2P_PARAM("alert_relay.accept", Global, HEX, RESTART, C_DASH, LIT, "", HEX_EVEN, "relay: allowlisted origin pubkey (repeatable)")
+  C2P_ALIAS("alert_relay.accept", BIN_DASH, "--alert-relay-accept", VALUE)
+
+C2P_PARAM("alert_relay.accept_file", Global, PATH, RESTART, C_DASH, LIT, "", NONE, "relay: file of allowlisted origin pubkeys (one hex per line)")
+  C2P_ALIAS("alert_relay.accept_file", BIN_DASH, "--alert-relay-accept-file", VALUE)
+
+C2P_PARAM("alert_relay.label", Global, STRING, RESTART, C_DASH, LIT, "", NONE, "origin: short label shown in the alert text (<=32 chars)")
+  C2P_ALIAS("alert_relay.label", BIN_DASH, "--alert-relay-label", VALUE)
+
+C2P_PARAM("alert_relay.offline_after", Global, INT64, RESTART, C_DASH, LIT, "300", NONE, "origin: seconds a worker must be down before OFFLINE fires")
+  C2P_ALIAS("alert_relay.offline_after", BIN_DASH, "--alert-relay-offline-after", VALUE)
+
+C2P_PARAM("alert_relay.online_after", Global, INT64, RESTART, C_DASH, LIT, "60", NONE, "origin: seconds a worker must be back before BACK_ONLINE fires")
+  C2P_ALIAS("alert_relay.online_after", BIN_DASH, "--alert-relay-online-after", VALUE)
+
+C2P_PARAM("alert_relay.min_interval", Global, INT64, RESTART, C_DASH, LIT, "600", NONE, "origin: minimum seconds between OFFLINE alerts for one worker")
+  C2P_ALIAS("alert_relay.min_interval", BIN_DASH, "--alert-relay-min-interval", VALUE)
+
+C2P_PARAM("alert_relay.startup_grace", Global, INT64, RESTART, C_DASH, LIT, "600", NONE, "origin: no OFFLINE alerts this many seconds after start")
+  C2P_ALIAS("alert_relay.startup_grace", BIN_DASH, "--alert-relay-startup-grace", VALUE)
+
+C2P_PARAM("alert_relay.stall_after", Global, INT64, RESTART, C_DASH, LIT, "900", NONE, "origin: connected worker with no accepted share this long counts as down (0=off)")
+  C2P_ALIAS("alert_relay.stall_after", BIN_DASH, "--alert-relay-stall-after", VALUE)
+
+C2P_PARAM("alert_relay.retry_every", Global, INT64, RESTART, C_DASH, LIT, "60", NONE, "origin: seconds between retransmits of an unacked alert")
+  C2P_ALIAS("alert_relay.retry_every", BIN_DASH, "--alert-relay-retry-every", VALUE)
+
+C2P_PARAM("alert_relay.retry_max", Global, INT64, RESTART, C_DASH, LIT, "60", NONE, "origin: total transmissions per alert before it is recorded undelivered")
+  C2P_ALIAS("alert_relay.retry_max", BIN_DASH, "--alert-relay-retry-max", VALUE)
 
 C2P_PARAM("embedded.tx_inject_hex", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "#157 local tx-inject submit file (raw tx hex per line)")
   C2P_ALIAS("embedded.tx_inject_hex", BIN_DASH, "--embedded-tx-inject-hex", VALUE)

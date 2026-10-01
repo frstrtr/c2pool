@@ -2,7 +2,7 @@
 // Restart-reorg supersede detector -- KAT, exercised through DASH's REAL
 // ShareTracker API (dash::ShareTracker::compute_supersede_hint /
 // prioritize_challenger_heads). C++ analog of the LTC restart-reorg fix ported
-// to DASH (live money on the hotel sharechain).
+// to DASH (live money on the production sharechain).
 //
 // THE DEFECT this pins: a node that loads its persisted, fully-verified
 // sharechain then peers with a higher-work network STICKS on the old head.

@@ -38,9 +38,22 @@
 //   admit         : verified cache (the dedup set), recent ring (re-offer),
 //                   FLOOD to every HELLO'd peer except the source, and the
 //                   ADMITTED queue the daemon's main thread drains into the lane.
-// The verify worker owns the ONLY call into RandomX (the injected RxFn): one
-// LightVerifier on one thread, so a receipt flood can never sit in front of a
-// miner's submit on the stratum listener thread.
+// The verify workers own the ONLY calls into RandomX (the injected RxFn), on the
+// relay's OWN verifier, so a receipt flood can never sit in front of a miner's
+// submit on the stratum listener thread.
+//
+// DROPS-VERIFY-SCALE (capstone attempt 5 false start): with raindrops ON every
+// node RandomX-verifies every raindrop of the pool (64x the receipt load); one
+// verify thread capped a node at one core, the FIFO dropped items and receipts
+// verified after their bin closed went 'late' in arrival order (node-local lane
+// orders diverged). RelayOptions::verify_threads = N workers now run the SAME
+// process() on items popped from the one queue; the daemon's RxFn hashes on the
+// worker's own light VM (verify_worker() -> O2RandomXVerifier::randomx_hash_on)
+// over the SHARED seed caches (+~2.2 MiB per worker, no new 256 MiB cache).
+// Every admission predicate is a pure function of (bytes, seed, share_diff,
+// floor, chain), and the on-time lane order is (bin, id)-sorted by the ingest,
+// so N changes only WHEN an item is verified, never what is accepted.
+// verify_threads = 1 (the library default) is the pre-fix pipeline.
 //
 // ORDER IS NODE-LOCAL (Ruling A). This class never decides lane order; the
 // daemon's ingest (xmr_receipt_ingest.hpp) does, and the winner's on-chain cut
@@ -157,13 +170,19 @@
 #include <utility>
 #include <vector>
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <c2pool/v37/carrier_net.hpp>
+#include <sharechain/v37/v37_hash.hpp>   // DROPS-HARDEN: the persisted store trailer (sha256d)
 #include <c2pool/v37/carrier_supply.hpp>
 #include <c2pool/v37/frame_vault.hpp>
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
 #include "impl/xmr/coin/xmr_seedheight.hpp"
 #include "xmr_relay_wire.hpp"
+#include "xmr_relay_peerbook.hpp"   // RELAY-DISCOVERY
 #include "xmr_receipt_mint.hpp"
+#include "xmr_durable_order.hpp"   // REPAIR-CHAIN (F2-S)
 
 // UP-GATE: a remote HELLO read before our own up event ran for that link waits
 // for it (on_hello), and XmrRelayNode::set_test_up_delay_ms() exists.
@@ -173,6 +192,16 @@
 // RELAY-LIVENESS: FB_PING/FB_PONG keepalive + silence timeout
 // (RelayOptions::keepalive_ms / silence_timeout_ms, RelayStats::silent_drops).
 #define C2POOL_XMR_RELAY_LIVENESS 1
+
+// Feature marker: NODE-NONCE (self-connection = SELF in the book, one link per node).
+#define C2POOL_XMR_RELAY_NODE_NONCE 1
+// DROPS-VERIFY-SCALE: RelayOptions::verify_threads workers, XmrRelayNode::verify_worker(),
+// RelayStats::verify_threads / rx_unavail_parked (an rx-unavailable item is parked once).
+#define C2POOL_XMR_RELAY_VERIFY_POOL 1
+// DROPS-HARDEN: drops_fetch_ids bounded per id (drops_fetch_max_asks, then
+// drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
+// (drops_persist_path, drops_persist(), drops_load()).
+#define C2POOL_XMR_DROPS_HARDEN 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -276,6 +305,13 @@ struct RelayOptions {
     ::c2pool::v37n::FrameVaultOptions vault{};
     u32         hello_timeout_ms = 10000;
     std::size_t verify_queue_max = 4096;
+    // DROPS-VERIFY-SCALE: verify worker threads (each runs process(); the RxFn
+    // may read verify_worker() to hash on its own VM). 1 = the pre-fix single
+    // worker (the library default, every KAT byte-identical); the daemon passes
+    // --relay-verify-threads (auto = clamp(cores/2, 2, 8) minus --mine threads).
+    // Clamped to [1, kMaxVerifyThreads] at start(): up to N DoS tokens may be
+    // outstanding per peer, inside the per-peer burst (20).
+    std::size_t verify_threads = 1;
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
     u32         repair_state_timeout_ms = 20000;
@@ -299,6 +335,18 @@ struct RelayOptions {
     // Lane positions one receipt may span (fee model S3: 2 = (payee, donation)
     // split; 1 = the gate-OFF / master rule). Bounds the repair density check.
     u32         max_pushes_per_receipt = 1;
+    // REPAIR-CHAIN (capstone attempt 4): serve GETORDER below the vault horizon
+    // from this node's DURABLE lane order (xmr_durable_order.hpp sidecars at
+    // deep_order_path + ".order"/".digest", frames read back from
+    // receipts_log_path), and, as a requester, WALK a peer whose digest at a0
+    // differs DOWN (q = a0 - step x 2^k, aligned to step, down to 0 = the whole
+    // order) to the highest position where our own / a shadow's digest equals
+    // the peer's, then ask [q, P). false (the struct default) = RC5 byte for
+    // byte: vault-only serving, a differing peer is set aside as DEEP at once.
+    bool        deep_order = false;
+    std::string deep_order_path;                 // "" = no durable order (serving side off)
+    std::string receipts_log_path;               // the ingest's durable log (deep frames)
+    u64         deep_probe_step = 64;            // G: positions (and shadow checkpoint spacing)
     // repair context + refetch (see REPAIR CONTEXT above)
     u32         solicited_unresolved_patience_ms = 120000;   // a solicited receipt waits this long for its context
     u32         ctx_retry_ms = 2000;                         // re-ask an unanswered GETCTX (next peer) after this
@@ -320,11 +368,50 @@ struct RelayOptions {
     u32         drops_inv_retry_ms = 2000;                   // re-ask an unanswered inventory after this
     u32         drops_fetch_retry_ms = 2000;                 // re-ask still-missing ids after this
     u32         drops_fetch_max_asks = 8;                    // asks of one peer for its missing ids before it is set aside
+    // ★ DROPS-HARDEN (d1): a pinned id still missing after drops_fetch_max_asks
+    // asks is re-asked no more often than this (never forever at the fast rate)
+    u32         drops_fetch_slow_ms = 60000;
+    // ★ DROPS-HARDEN (d4): the servable raindrop store survives a restart
+    // (<settle_db>/lane<N>.drops: versioned, sha256d trailer, tmp + fsync +
+    // rename, bounded by drops_retain_bins / drops_store_max). "" = in-memory
+    // only (the library default: every pre-harden KAT unchanged).
+    std::string drops_persist_path;
+    u32         drops_persist_ms = 2000;                     // snapshot a changed store at most this often
     // RELAY-LIVENESS: PING every ready link this often (0 = keepalive OFF: no
     // PING sent or answered, no silence timeout); drop + redial a link whose
     // keepalive-speaking peer sent nothing for silence_timeout_ms (0 = never).
     u32         keepalive_ms = 5000;
     u32         silence_timeout_ms = 25000;
+    // RELAY-SEND-QUEUE: every send is queued per connection and written by that
+    // connection's own writer thread (carrier_net.hpp), so no reader, verify
+    // worker, maintenance tick or stratum path ever blocks on a peer's socket.
+    // A peer whose queue would exceed this many bytes is dropped (not the node
+    // stalled). 0 = the legacy synchronous send path.
+    std::size_t send_queue_bytes = 16u << 20;
+    // RELAY-DISCOVERY (FB_GETADDR/FB_ADDR 0x4c/0x4d). OFF here (the library
+    // default keeps every pre-discovery KAT byte-identical: 0x4c/0x4d are then
+    // fb_unknown, nothing is asked or dialed beyond `peers`); the daemon turns
+    // it ON (--relay-discovery on, the CLI default).
+    bool        discovery = false;
+    std::size_t max_outbound = 8;                 // dialed links (peers + learned) the node keeps up
+    // The SEED seam: addresses dialed as CANDIDATES at start (the built-in
+    // bootstrap list feeds this; --relay-peer stays a permanent dial target).
+    std::vector<std::pair<std::string, u16>> seeds;
+    // NODE-NONCE: this machine's addresses (numeric; the daemon gathers them).
+    // With the listen port they are OUR relay address: never dialed, never
+    // learned, never handed out (the listen host itself always counts).
+    std::vector<std::string> self_hosts;
+    std::vector<PeerRecord> book_load;            // persisted book (core::AddrStore) loaded at start
+    std::function<void(const std::vector<PeerRecord>&)> book_save;   // persist hook (dirty book, every book_save_ms + stop)
+    PeerBook::Limits book_limits{};
+    u32         book_save_ms = 15000;
+    u32         addr_reask_ms = 20000;            // re-ask GETADDR of a ready peer while below max_outbound
+    u32         addr_answer_min_ms = 5000;        // answer at most one GETADDR per peer per this
+    u16         addr_want = 64;                   // entries asked per GETADDR
+    std::size_t addr_answer_max = 64;             // entries per FB_ADDR answer
+    std::size_t addr_learn_per_answer = 64;       // entries taken from one FB_ADDR
+    std::size_t addr_learn_per_peer = 256;        // entries taken from one connection in total
+    u32         connect_timeout_ms = 3000;        // bound connect(2) (discovery ON only)
 };
 
 struct RelayStats {
@@ -333,6 +420,10 @@ struct RelayStats {
     std::atomic<u64> fa_ignored{0}, fb_unknown{0}, malformed{0}, wrong_chain{0};
     std::atomic<u64> rx_receipts{0}, dup{0}, queue_dropped{0}, unresolved_dropped{0}, expired{0};
     std::atomic<u64> structural{0}, rx_deferred{0}, rx_evals{0}, rx_valid{0}, rx_invalid{0}, rx_unavailable{0}, bans{0};
+    // DROPS-VERIFY-SCALE: verify workers running; items whose RandomX engine was
+    // unavailable (seed being keyed during a switch) PARKED once for a retry
+    // instead of forgotten (rx_unavailable counts only the ones finally dropped).
+    std::atomic<u64> verify_threads{0}, rx_unavail_parked{0};
     std::atomic<u64> admitted_own{0}, admitted_foreign{0}, admitted_solicited{0};
     std::atomic<u64> flood_frames{0}, reoffer_frames{0};
     std::atomic<u64> backfill_orders{0}, backfill_ids_asked{0};
@@ -345,16 +436,30 @@ struct RelayStats {
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
+    std::atomic<u64> won_reoffer_skipped{0};   // RELAY-SEND-QUEUE: not re-offered, the peer node provably holds it
+    std::atomic<u64> won_held_confirmed{0};    // RELAY-SEND-QUEUE: re-offered frames a later PONG proved read
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
     // ★ RAIN-BACKFILL (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_inv_tx{0}, drops_inv_rx{0}, drops_invreq_tx{0}, drops_invreq_rx{0};
     std::atomic<u64> drops_fetch_tx{0}, drops_ids_asked{0}, drops_fetchreq_rx{0}, drops_served{0}, drops_backfilled{0};
     std::atomic<u64> drops_sync_calls{0}, drops_sync_pending{0}, drops_sync_complete{0}, drops_peer_setaside{0};
+    std::atomic<u64> drops_pin_fetch_ids{0};   // ★ DROPS-SET-PIN: set members asked for by id
+    // ★ DROPS-HARDEN: pinned ids past drops_fetch_max_asks (slow re-ask), pruned
+    // ask entries; the persisted store (snapshots written / failed, entries loaded)
+    std::atomic<u64> drops_pin_capped{0}, drops_pin_slow_asks{0}, drops_pin_pruned{0};
+    std::atomic<u64> drops_pin_local{0};   // members handed to the harvest from this node's own store
+    std::atomic<u64> drops_persist_writes{0}, drops_persist_fail{0}, drops_persist_loaded{0};
     // REPAIR-HORIZON: BELOW_HORIZON answers that raised a repair's start and
     // re-asked (instead of setting the peer aside); prefix probes whose digest
     // at a0 matched ours / was unknown there; peers proven DEEP (divergence
     // below their horizon); receipts re-offered on HELLO because still unpushed.
     std::atomic<u64> repair_horizon_rearm{0}, repair_prefix_ok{0}, repair_prefix_unknown{0}, repair_deep{0};
+    // REPAIR-CHAIN: walk probes asked, walks that found an equal point (q > 0)
+    // or fell back to the whole order (q = 0), repairs made Ready through a
+    // walk, and walks ended by an RC5 peer (BELOW_HORIZON on a walk probe) or
+    // by a lineage that fails the gate (-> DEEP, loud, as before).
+    std::atomic<u64> repair_deep_probe{0}, repair_deep_equal{0}, repair_deep_full{0}, repair_deep_ready{0};
+    std::atomic<u64> repair_deep_rc5{0}, repair_deep_lineage{0};
     std::atomic<u64> reoffer_unpushed{0};
     // REPAIR-PAGE: repair GETORDER pages asked, the largest page asked (ids),
     // pages that timed out (the page was halved) and pages that grew it.
@@ -366,6 +471,13 @@ struct RelayStats {
     // never answered a PING (pre-0x48 builds: silence not enforced), and
     // maintenance gaps that re-armed every link's clock.
     std::atomic<u64> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
+    // RELAY-DISCOVERY
+    std::atomic<u64> getaddr_tx{0}, getaddr_rx{0}, getaddr_throttled{0}, addr_tx{0}, addr_rx{0}, addr_unsolicited{0};
+    std::atomic<u64> addr_learned{0}, addr_ignored{0}, disc_dialed{0}, disc_dial_ok{0}, disc_dup_dropped{0};
+    std::atomic<u64> disc_bad{0}, disc_self{0}, disc_saves{0}, disc_expired{0};
+    // NODE-NONCE: HELLOs refused as our own nonce (both ends of a self-dial count),
+    // dials / learns skipped as our own address, same-dialer duplicates left to the peer.
+    std::atomic<u64> self_conn{0}, self_skipped{0}, dup_deferred{0};
 };
 
 // ★ RAIN-BACKFILL: the composition's view of one interval range.
@@ -388,10 +500,50 @@ public:
     XmrRelayNode(RelayOptions o, ChainView& chain, RxFn rx, LaneTipFn tip, LogFn log)
         : m_o(std::move(o)), m_chain(chain), m_rx(std::move(rx)), m_tip(std::move(tip)),
           m_log(std::move(log)), m_dos(m_o.dos), m_vault(m_o.vault) {
-        std::random_device rd;
-        m_nonce = (static_cast<u64>(rd()) << 32) ^ rd() ^
-                  static_cast<u64>(Clock::now().time_since_epoch().count());
+        std::random_device rd;   // NODE-NONCE: a random 64-bit per-process nonce, never 0
+        do {
+            m_nonce = ((static_cast<u64>(rd()) << 32) | rd()) ^
+                      static_cast<u64>(Clock::now().time_since_epoch().count());
+        } while (m_nonce == 0);
         m_solicited = static_cast<double>(m_o.solicited_credits);
+        // REPAIR-CHAIN (F2-S): open (truncate) the durable-order sidecars BEFORE
+        // the boot reload re-pushes the receipts log through on_pushed, which
+        // rebuilds them; then the vault serves below its horizon from them.
+        if (m_o.deep_order && !m_o.deep_order_path.empty()) {
+            std::string why;
+            if (m_dorder.open(m_o.deep_order_path, m_o.receipts_log_path, &why)) {
+                m_dorder.set_verify([](const std::vector<u8>& f, const bytes32& id) {
+                    FbReceipt r; return decode_fb_receipt(f, r) && receipt_id(r) == id;
+                });
+                ::c2pool::v37n::FrameVaultDeep d;
+                d.order = [this](std::uint32_t chain, std::uint64_t a, std::uint64_t p, std::size_t max_ids,
+                                 ::c2pool::v37n::VaultOrder& out) -> bool {
+                    if (chain != m_o.chain) return false;
+                    out.ids.clear();
+                    if (a == p) {   // a walk probe below our horizon: its answer is our digest at a (spine probe)
+                        if (a > m_dorder.next_pos()) return false;
+                        note_deep_walker(t_serving_peer);
+                        out.p_served = a; return true;
+                    }
+                    // [0, P) is what EVERY repair asks first (RC5): it stays BELOW_HORIZON
+                    // (the requester re-arms to our horizon and asks a suffix, O(horizon)
+                    // ids) unless this peer is walking (probed below our horizon lately),
+                    // i.e. its walk reached q = 0 and it needs our whole order. One
+                    // walk = one whole order: the mark is consumed here (later pages
+                    // start at a > 0).
+                    if (a == 0 && !take_deep_walker(t_serving_peer)) return false;
+                    std::vector<std::pair<u64, bytes32>> ids; u64 ps = a;
+                    if (!m_dorder.order_page(a, p, max_ids, ids, ps)) return false;
+                    for (const auto& [pos, id] : ids) out.ids.push_back(::c2pool::v37n::VaultOrderId{pos, id});
+                    out.p_served = ps;
+                    return true;
+                };
+                d.frame = [this](const bytes32& id, std::vector<std::uint8_t>& f) { return m_dorder.frame(id, f); };
+                m_vault.set_deep(std::move(d));
+            } else if (m_log) {
+                m_log("relay: REPAIR-CHAIN durable order DISABLED (" + why + "): vault-only serving (RC5)");
+            }
+        }
     }
     ~XmrRelayNode() { stop(); }
     XmrRelayNode(const XmrRelayNode&) = delete;
@@ -408,10 +560,7 @@ public:
         }
         m_serve->set_spine_probe([this](std::uint32_t chain, std::uint64_t pos) -> std::optional<bytes32> {
             if (chain != m_o.chain) return std::nullopt;
-            std::lock_guard<std::mutex> lk(m_dmtx);
-            auto it = m_pos_digest.find(pos);
-            if (it == m_pos_digest.end()) return std::nullopt;
-            return it->second;
+            return digest_at_deep(pos);   // REPAIR-CHAIN: below one horizon from the durable order (off = memory only)
         });
         m_fetch->set_id_of_frame([](const std::vector<u8>& b) -> std::optional<bytes32> {
             FbReceipt r;
@@ -427,11 +576,14 @@ public:
         m_net.set_control([this](PeerId p, const std::vector<u8>& f) {
             note_rx(p);   // RELAY-LIVENESS: a supply frame proves the link alive too
             if (!hello_ok(p)) { m_st.pre_hello_dropped++; return; }
+            t_serving_peer = p;   // REPAIR-CHAIN: the deep source knows who asks (reader thread, synchronous)
             m_serve->on_control(p, f);
+            t_serving_peer = 0;
             m_fetch->on_control(p, f);
         });
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
         m_net.set_log([this](const std::string& s) { log("relay: " + s); });
+        m_net.set_send_queue(m_o.send_queue_bytes);   // RELAY-SEND-QUEUE (0 = synchronous, legacy)
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -439,12 +591,46 @@ public:
                 return false;
             }
         }
+        if (m_o.listen) {   // NODE-NONCE: our own relay addresses (listen host + this machine's)
+            const u16 lp = m_net.listen_port();
+            const bool wild = m_o.listen_host.empty() || m_o.listen_host == "0.0.0.0";
+            if (!wild) m_self_keys.insert(peer_key(m_o.listen_host, lp));
+            if (wild || m_o.listen_host == "127.0.0.1") m_self_keys.insert(peer_key("127.0.0.1", lp));
+            if (wild) for (const auto& h : m_o.self_hosts) m_self_keys.insert(peer_key(h, lp));
+        }
         {
             std::lock_guard<std::mutex> lk(m_tmtx);
-            for (const auto& [h, pt] : m_o.peers) m_targets.push_back(Target{h, pt, 0, Clock::now(), 1});
+            for (const auto& [h, pt] : m_o.peers) {
+                if (m_self_keys.count(peer_key(h, pt))) {   // NODE-NONCE: --relay-peer = this node
+                    m_st.self_skipped++;
+                    log("relay: --relay-peer " + peer_key(h, pt) + " is THIS node (our listen address) -> never dialed");
+                    continue;
+                }
+                m_targets.push_back(Target{h, pt, 0, Clock::now(), 1});
+            }
+        }
+        if (m_o.discovery) {   // RELAY-DISCOVERY: seed = stored book + seed list (+ --relay-peer, marked good on HELLO)
+            m_book.set_limits(m_o.book_limits);
+            const u64 now = wall_s();
+            for (const auto& k : m_self_keys) {   // NODE-NONCE: never learned / good / handed out
+                const auto c = k.rfind(':');
+                m_book.mark_self(k.substr(0, c), static_cast<u16>(std::stoul(k.substr(c + 1))));
+            }
+            m_book.load(m_o.book_load, now);
+            for (const auto& [h, pt] : m_o.seeds) m_book.learn(h, pt, now, now);
+            m_book.take_dirty();
+            if (m_o.connect_timeout_ms) m_net.set_connect_timeout(std::chrono::milliseconds(m_o.connect_timeout_ms));
+            log("relay-disc: discovery ON book=" + std::to_string(m_book.size()) + " (good=" + std::to_string(m_book.good()) +
+                ", loaded=" + std::to_string(m_o.book_load.size()) + ") seeds=" + std::to_string(m_o.seeds.size()) +
+                " relay-peers=" + std::to_string(m_o.peers.size()) + " max-outbound=" + std::to_string(m_o.max_outbound));
         }
         m_running = true;
-        m_verify_thread = std::thread([this] { verify_loop(); });
+        {   // DROPS-VERIFY-SCALE: N verify workers, each with its own index (verify_worker())
+            const std::size_t n = std::clamp<std::size_t>(m_o.verify_threads, 1, kMaxVerifyThreads);
+            m_st.verify_threads = n;
+            for (std::size_t i = 0; i < n; ++i)
+                m_verify_threads.emplace_back([this, i] { t_verify_worker = static_cast<int>(i); verify_loop(); });
+        }
         m_maint_thread  = std::thread([this] { maint_loop(); });
         return true;
     }
@@ -452,13 +638,22 @@ public:
     void stop() {
         if (!m_running.exchange(false)) return;
         m_qcv.notify_all();
-        if (m_verify_thread.joinable()) m_verify_thread.join();
+        for (auto& t : m_verify_threads) if (t.joinable()) t.join();
+        m_verify_threads.clear();
         if (m_maint_thread.joinable()) m_maint_thread.join();
         m_net.stop();
+        if (m_o.discovery) save_book(true);   // RELAY-DISCOVERY: the book survives the restart
+        drops_persist();                      // ★ DROPS-HARDEN (d4): the raindrop store too
     }
+
+    // DROPS-VERIFY-SCALE: the calling verify worker's index in [0, verify_threads)
+    // (-1 on any other thread). The daemon's RxFn hashes on that worker's VM.
+    static constexpr std::size_t kMaxVerifyThreads = 16;
+    static int verify_worker() noexcept { return t_verify_worker; }
 
     u16 listen_port() const { return m_net.listen_port(); }
     u64 node_nonce() const { return m_nonce; }
+    const std::set<std::string>& self_keys() const { return m_self_keys; }   // NODE-NONCE (fixed after start)
     const RelayOptions& options() const { return m_o; }
     const RelayStats& stats() const { return m_st; }
     ::c2pool::v37n::FrameVault& vault() { return m_vault; }
@@ -489,7 +684,7 @@ public:
         a.own = true; a.drop = true;
         if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
         m_st.drops_own++;
-        drop_store_put(a.id, a.bin, a.raw);   // ★ RAIN-BACKFILL: servable
+        drop_store_put(a.id, a.bin, a.raw, a.pow);   // ★ RAIN-BACKFILL: servable
         flood(a.raw, 0);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
@@ -568,6 +763,101 @@ public:
         } else m_st.drops_sync_complete++;
         return out;
     }
+    // ── ★ DROPS-SET-PIN: fetch the named raindrops (a carried set's members this
+    // node's harvest does not hold). Main thread. Asks `hint` (the peer the
+    // frame came from: the winner holds every member by construction) first,
+    // then every ready peer after drops_fetch_retry_ms; an id is re-asked no
+    // more often than that. An id seen here (dedup set) but asked for anyway is
+    // forgotten first, so the served copy is admitted (the caller's harvest
+    // lacks it). Answers are admitted through admit_drop (PoW + ctx verified).
+    // Returns the number of fetch frames sent. Gate OFF: nothing.
+    // [lo, hi) = the block's range (FB_GETDROPS carries a non-empty range; a
+    // by-id fetch is served by id whatever it says).
+    std::size_t drops_fetch_ids(const std::vector<bytes32>& ids, PeerId hint, u64 lo, u64 hi) {
+        if (!m_o.drops_floor_diff || ids.empty()) return 0;
+        if (hi <= lo) hi = lo + 1;
+        if (hi - lo > kDropsMaxSpan) lo = hi - kDropsMaxSpan;
+        const auto now = Clock::now();
+        const auto retry = std::chrono::milliseconds(m_o.drops_fetch_retry_ms);
+        std::vector<bytes32> first, again;
+        std::vector<Admitted> local;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            // ★ DROPS-HARDEN (d1): at most drops_fetch_max_asks fast asks per id
+            // (each reaching every ready peer at most once), then one slow
+            // re-ask per drops_fetch_slow_ms -- an unservable set never keeps
+            // the fast rate forever. An entry leaves m_pin_asked when its id is
+            // admitted (admit_drop) or the caller forgets it (drops_pin_forget).
+            const auto slow = std::chrono::milliseconds(m_o.drops_fetch_slow_ms);
+            for (const auto& id : ids) {
+                auto it = m_pin_asked.find(id);
+                if (it == m_pin_asked.end()) { m_pin_asked.emplace(id, std::make_pair(now, 1u)); first.push_back(id); continue; }
+                const bool capped = it->second.second >= m_o.drops_fetch_max_asks;
+                if (now - it->second.first < (capped ? slow : retry)) continue;
+                if (capped) m_st.drops_pin_slow_asks++;
+                else if (it->second.second + 1 == m_o.drops_fetch_max_asks) m_st.drops_pin_capped++;
+                it->second.first = now; ++it->second.second;
+                again.push_back(id);
+            }
+            for (const auto& id : ids) m_drop_want[id] = now;   // the answer is SOLICITED (a deferred ctx is waited for)
+            // ★ DROPS-HARDEN (d4): a member this node's STORE holds (e.g. reloaded
+            // from lane<N>.drops after a restart) but its harvest lacks is handed
+            // to the harvest from the store (verified when first admitted), never
+            // asked of a peer -- a restarted winner serves its own members.
+            for (auto* v : {&first, &again}) {
+                std::vector<bytes32> rest;
+                for (const auto& id : *v) {
+                    const auto bi = m_drop_store_id.find(id);
+                    const auto pi = m_drop_pow.find(id);
+                    const auto si = bi == m_drop_store_id.end() ? m_drop_store.end() : m_drop_store.find(bi->second);
+                    Admitted a;
+                    if (pi == m_drop_pow.end() || si == m_drop_store.end() || !si->second.count(id) ||
+                        !decode_fb_receipt(si->second.at(id), a.r)) { rest.push_back(id); continue; }
+                    a.id = id; a.raw = si->second.at(id); a.bin = bi->second; a.drop = true; a.pow = pi->second;
+                    local.push_back(std::move(a));
+                    m_pin_asked.erase(id);
+                }
+                v->swap(rest);
+            }
+        }
+        if (!local.empty()) {
+            m_st.drops_pin_local += local.size();
+            std::lock_guard<std::mutex> lk(m_amtx);
+            for (auto& a : local) m_drops.push_back(std::move(a));
+        }
+        if (first.empty() && again.empty()) return 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);   // forget the dedup entry: the caller does not hold its bytes
+            for (const auto* v : {&first, &again})
+                for (const auto& id : *v) m_drop_seen.erase(id);
+        }
+        const auto peers = ready_peers();
+        const bool hint_ready = hint && std::find(peers.begin(), peers.end(), hint) != peers.end();
+        std::size_t sent = 0;
+        auto ask = [&](PeerId p, const std::vector<bytes32>& v) {
+            const u64 before = m_st.drops_fetch_tx.load();
+            send_drop_fetch(p, lo, hi, v);
+            sent += m_st.drops_fetch_tx.load() - before;
+        };
+        if (!first.empty()) {
+            if (hint_ready) ask(hint, first);
+            else for (PeerId p : peers) ask(p, first);
+        }
+        if (!again.empty()) for (PeerId p : peers) ask(p, again);
+        m_st.drops_pin_fetch_ids += first.size() + again.size();
+        return sent;
+    }
+    // the ids a set fetch asked for that are not admitted yet (diagnostic)
+    std::size_t drops_pin_asked() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_pin_asked.size(); }
+    // ★ DROPS-HARDEN (d1): the caller no longer wants these ids (the set is
+    // complete, or its block left the pending set): drop their ask state.
+    std::size_t drops_pin_forget(const std::vector<bytes32>& ids) {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        std::size_t n = 0;
+        for (const auto& id : ids) n += m_pin_asked.erase(id);
+        m_st.drops_pin_pruned += n;
+        return n;
+    }
     std::size_t drops_store_size() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_store_id.size(); }
     // The raindrop ids this node holds (servable) for [lo, hi), sorted (diagnostic / KAT).
     std::vector<bytes32> drops_held(u64 lo, u64 hi) const {
@@ -577,6 +867,18 @@ public:
             for (const auto& [id, raw] : it->second) { (void)raw; v.push_back(id); }
         std::sort(v.begin(), v.end());
         return v;
+    }
+    // RELAY-SEND-QUEUE diagnostics (one line; the smoke greps it).
+    std::string describe_sendq() const {
+        char b[400];
+        std::snprintf(b, sizeof b,
+            "relay-sendq: bound=%zu hwm=%zu full_drops=%llu slow_drops=%llu frames=%llu max_wait_ms=%llu | won reoffered=%llu skipped=%llu confirmed=%llu",
+            m_net.send_queue_limit(), m_net.queued_bytes_hwm(),
+            (unsigned long long)m_net.peers_dropped_queue_full(), (unsigned long long)m_net.peers_dropped_slow(),
+            (unsigned long long)m_net.async_frames_written(), (unsigned long long)m_net.async_max_wait_ms(),
+            (unsigned long long)m_st.won_reoffered.load(), (unsigned long long)m_st.won_reoffer_skipped.load(),
+            (unsigned long long)m_st.won_held_confirmed.load());
+        return b;
     }
     std::string describe_drops() const {
         const auto& s = m_st;
@@ -616,6 +918,7 @@ public:
     void on_pushed(const bytes32& id, u64 pos_first, u32 n_pushes, const std::vector<u8>& raw,
                    u64 next_after, const bytes32& digest_after) {
         (void)m_vault.insert(m_o.chain, id, pos_first, n_pushes, raw);
+        m_dorder.append(pos_first, n_pushes, id, raw.size(), next_after, digest_after);   // REPAIR-CHAIN (no-op when closed)
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_unpushed.erase(id);   // REPAIR-HORIZON: in the lane now -> the GETORDER backfill covers it
@@ -644,13 +947,46 @@ public:
         std::lock_guard<std::mutex> lk(m_dmtx);
         return m_alt_digest.count(pos) != 0;
     }
-    // Our recorded lane digest at position `pos` (the spine probe's answer).
+    // Our recorded lane digest at position `pos` (the last horizon, in memory).
     std::optional<bytes32> digest_at(u64 pos) const {
         std::lock_guard<std::mutex> lk(m_dmtx);
         auto it = m_pos_digest.find(pos);
         if (it == m_pos_digest.end()) return std::nullopt;
         return it->second;
     }
+    // REPAIR-CHAIN: the same, falling back to the durable order below the
+    // in-memory horizon (the spine probe's answer; deep_order off = digest_at).
+    std::optional<bytes32> digest_at_deep(u64 pos) const {
+        if (auto d = digest_at(pos)) return d;
+        if (!m_o.deep_order || !m_dorder.is_open()) return std::nullopt;
+        return m_dorder.digest_at(pos);
+    }
+    // REPAIR-CHAIN: peers that probed below our vault horizon in the last 30 s
+    // (a down-walk): only they are served [0, P) from the durable order.
+    void note_deep_walker(PeerId p) {
+        if (!p) return;
+        std::lock_guard<std::mutex> lk(m_walker_mtx);
+        m_deep_walkers[p] = Clock::now();
+        if (m_deep_walkers.size() > 256) m_deep_walkers.erase(m_deep_walkers.begin());
+    }
+    bool take_deep_walker(PeerId p) {
+        if (!p) return false;
+        std::lock_guard<std::mutex> lk(m_walker_mtx);
+        auto it = m_deep_walkers.find(p);
+        if (it == m_deep_walkers.end()) return false;
+        const bool fresh = Clock::now() - it->second < std::chrono::seconds(30);
+        m_deep_walkers.erase(it);
+        return fresh;
+    }
+    // ★ DROPS-CARRY-LIVE: our own lane order over [a, p) from the durable order
+    // (pos_first, id); false = deep order off / not readable there.
+    bool own_order_ids(u64 a, u64 p, std::vector<std::pair<u64, bytes32>>& ids) const {
+        return m_dorder.ids_between(a, p, ids);
+    }
+    // REPAIR-CHAIN: the durable order's serving counters (deep pages / frames).
+    DurableLaneOrder::Stats durable_order_stats() const { return m_dorder.stats(); }
+    u64 durable_order_bytes() const { return m_dorder.disk_bytes(); }
+    bool durable_order_open() const { return m_dorder.is_open(); }
 
     // ── verified cache lookup (main thread, for a repair replay) ────────────
     // `give_author` = the u16 the receipt carries in its PoW-committed
@@ -687,7 +1023,7 @@ public:
         const auto f = encode_block_won(b);
         remember_won_frame(f);   // ENROL-REPL (DROPS only): re-offered to a peer that HELLOs later
         std::size_t n = 0;
-        for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) ++n;
+        for (PeerId p : ready_peers()) if (m_net.send_to(p, f)) { ++n; if (m_o.drops_floor_diff) note_won_sent(p, b.bid); }
         m_st.block_won_tx++;
         return n;
     }
@@ -790,7 +1126,10 @@ public:
                 std::lock_guard<std::mutex> ck(m_mtx);
                 for (const auto& id : r.ids) if (!m_cache.count(id)) ++missing;
             }
-            if (!missing) { r.st = Repair::St::Ready; m_st.repair_ready++; }
+            if (!missing) {
+                r.st = Repair::St::Ready; m_st.repair_ready++;
+                if (r.walk_from.count(r.served_by)) m_st.repair_deep_ready++;   // REPAIR-CHAIN: Ready through a down-walk
+            }
         }
         if (r.st == Repair::St::Ready) { if (ids) *ids = r.ids; return RepairState::Ready; }
         const bool exhausted = (r.st == Repair::St::Idle && r.exhausted);
@@ -809,7 +1148,8 @@ public:
             r.tried.insert(r.served_by);
             // REPAIR-HORIZON: a suffix order [a0, P) the peer asserted reaches the
             // spine, replayed after OUR [0, a0), did not: our prefix differs.
-            if (r.a0) { r.deep[r.served_by] = r.a0; m_st.repair_deep++; }
+            if (r.walk_from.count(r.served_by)) walk_failed_locked(r, r.served_by, /*rc5=*/false);   // REPAIR-CHAIN
+            else if (r.a0) { r.deep[r.served_by] = r.a0; m_st.repair_deep++; }
         }
         r.reset();
         m_st.repair_rejected++;
@@ -864,7 +1204,9 @@ public:
                     }
                     break;
                 case Repair::St::Ordering:
-                    s = std::string(r.probing ? "probing the prefix digest at a0=" + std::to_string(r.a0) + " of peer " : "ordering from peer ") +
+                    s = std::string(r.walk_from.count(r.cur) ? "REPAIR-CHAIN deep walk (step " + std::to_string(r.walk_k.count(r.cur) ? r.walk_k.at(r.cur) : 0) +
+                                                               " below a0=" + std::to_string(r.walk_from.at(r.cur)) + "): " : std::string()) +
+                        std::string(r.probing ? "probing the prefix digest at a0=" + std::to_string(r.a0) + " of peer " : "ordering from peer ") +
                         std::to_string(r.cur) + " (" + std::to_string(r.cursor) + "/" + std::to_string(P) + " ids" +
                         (r.a0 ? ", from a0=" + std::to_string(r.a0) : std::string()) + ", " + age(r.since) + ")";
                     break;
@@ -969,7 +1311,7 @@ public:
         // answer that arrived after its request timed out (claim() drops it).
         const SupplyServeStats sv = m_serve ? m_serve->stats() : SupplyServeStats{};
         const SupplyFetchStats fs = m_fetch ? m_fetch->stats() : SupplyFetchStats{};
-        char b[2800];
+        char b[3072];
         std::snprintf(b, sizeof b,
             "relay: conns=%zu ready=%zu hello ok=%llu rej=%llu tmo=%llu | rx recv=%llu dup=%llu struct=%llu "
             "rx_evals=%llu valid=%llu invalid=%llu deferred=%llu unavail=%llu bans=%llu unresolved=%llu expired=%llu qdrop=%llu | "
@@ -981,7 +1323,7 @@ public:
             "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
             "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu | "
             "order serve=%llu ids=%llu throttled=%llu | order ask=%llu ok=%llu timeouts=%llu late=%llu | "
-            "repair-page pages=%llu max=%llu timeouts=%llu grown=%llu",
+            "repair-page pages=%llu max=%llu timeouts=%llu grown=%llu | verify threads=%llu q=%zu parked=%zu unavail_parked=%llu",
             m_net.n_peers(), ready_peers().size(),
             (unsigned long long)s.hello_ok.load(), (unsigned long long)s.hello_rejected.load(), (unsigned long long)s.hello_timeout.load(),
             (unsigned long long)s.rx_receipts.load(), (unsigned long long)s.dup.load(), (unsigned long long)s.structural.load(),
@@ -1018,9 +1360,14 @@ public:
             (unsigned long long)fs.orders_requested, (unsigned long long)fs.orders_ok, (unsigned long long)fs.timeouts,
             (unsigned long long)fs.unsolicited,
             (unsigned long long)s.repair_order_pages.load(), (unsigned long long)s.repair_order_page_max.load(),
-            (unsigned long long)s.repair_page_timeouts.load(), (unsigned long long)s.repair_page_grown.load());
+            (unsigned long long)s.repair_page_timeouts.load(), (unsigned long long)s.repair_page_grown.load(),
+            (unsigned long long)s.verify_threads.load(), verify_queue_size(), verify_parked_size(),
+            (unsigned long long)s.rx_unavail_parked.load());
         return b;
     }
+    // DROPS-VERIFY-SCALE: verify queue depth (items waiting for a worker) and parked items.
+    std::size_t verify_queue_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_q.size(); }
+    std::size_t verify_parked_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_parked.size(); }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
     std::string last_unresolved() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_unresolved; }
 
@@ -1046,6 +1393,54 @@ public:
         log("relay: PARTITION for " + std::to_string(secs.count()) + " s (all relay links dropped)");
     }
 
+    // ── RELAY-DISCOVERY (read side) ─────────────────────────────────────────
+    const PeerBook& book() const { return m_book; }
+    // The relay address of every HELLO-ok link ("host:port"; "?" = an inbound
+    // peer that announced no listen port) with its direction.
+    std::vector<std::pair<std::string, bool /*outbound*/>> ready_links() const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        std::vector<std::pair<std::string, bool>> v;
+        for (const auto& [p, s] : m_peers) {
+            (void)p;
+            if (s.hello_ok) v.emplace_back(s.addr_key.empty() ? std::string("?") : s.addr_key, !s.out_host.empty());
+        }
+        return v;
+    }
+    // One status line: book size, good, dials, learned, the link graph.
+    std::string disc_describe() const {
+        std::size_t out = 0, in = 0;
+        std::string links;
+        for (const auto& [k, o] : ready_links()) {
+            (o ? out : in)++;
+            links += (links.empty() ? "" : ",") + k + (o ? ">" : "<");
+        }
+        const auto& s = m_st;
+        char b[1024];
+        std::snprintf(b, sizeof b,
+            "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu | dialed=%llu dial_ok=%llu learned=%llu | "
+            "getaddr tx=%llu rx=%llu throttled=%llu | addr tx=%llu rx=%llu unsolicited=%llu ignored=%llu | "
+            "dup_dropped=%llu refused=%llu self=%llu saves=%llu expired=%llu | "
+            "nonce=%016llx self_conn=%llu self_skipped=%llu self_book=%zu dup_deferred=%llu | peers=[",
+            m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in,
+            (unsigned long long)s.disc_dialed.load(), (unsigned long long)s.disc_dial_ok.load(), (unsigned long long)s.addr_learned.load(),
+            (unsigned long long)s.getaddr_tx.load(), (unsigned long long)s.getaddr_rx.load(), (unsigned long long)s.getaddr_throttled.load(),
+            (unsigned long long)s.addr_tx.load(), (unsigned long long)s.addr_rx.load(), (unsigned long long)s.addr_unsolicited.load(),
+            (unsigned long long)s.addr_ignored.load(), (unsigned long long)s.disc_dup_dropped.load(), (unsigned long long)s.disc_bad.load(),
+            (unsigned long long)s.disc_self.load(), (unsigned long long)s.disc_saves.load(), (unsigned long long)s.disc_expired.load(),
+            (unsigned long long)m_nonce, (unsigned long long)s.self_conn.load(), (unsigned long long)s.self_skipped.load(),
+            m_book.self_size(), (unsigned long long)s.dup_deferred.load());
+        return std::string(b) + links + "]";
+    }
+    // Persist now (the daemon's shutdown path; the maintenance thread saves a dirty book on its own).
+    void save_book(bool force) {
+        if (!m_o.discovery || !m_o.book_save) return;
+        if (!m_book.take_dirty() && !force) return;
+        m_o.book_save(m_book.records());
+        m_st.disc_saves++;
+    }
+    // Test hook: send one FB_GETADDR to every ready peer now.
+    void ask_addrs_now() { for (PeerId p : ready_peers()) send_getaddr(p); }
+
 private:
     // ── state ───────────────────────────────────────────────────────────────
     struct PeerSt {
@@ -1059,6 +1454,13 @@ private:
         bool ka = false;                            // the peer answered / sent a PING on THIS link
         u32  unanswered = 0;                        // PINGs sent while !ka
         bool legacy_noted = false;
+        // RELAY-DISCOVERY
+        std::string out_host; u16 out_port = 0;     // set iff WE dialed this link (the dialed address)
+        std::string addr_key;                       // the peer's relay address (dialed, or remote ip:HELLO listen_port)
+        std::string remote_ip;                      // inbound: the socket's remote address
+        Clock::time_point getaddr_tx{}, getaddr_rx{};
+        bool addr_pending = false;                  // a GETADDR of ours is unanswered on this link
+        std::size_t addr_learned = 0;
     };
     static constexpr u32 kLegacyProbes = 3;         // unanswered PINGs before a peer counts as pre-0x48
     struct Target {
@@ -1072,6 +1474,9 @@ private:
         u32  prehello_fails = 0;
         bool hello_seen = false;       // the current link reached HELLO ok
         bool hello_timed_out = false;  // the current link hit the HELLO timeout
+        bool learned = false;          // RELAY-DISCOVERY: from the book (one link, then retired)
+        bool used = false;             // RELAY-DISCOVERY: a learned target was dialed once
+        bool self = false;             // NODE-NONCE: its HELLO carried OUR nonce -> never dialed again
     };
     static constexpr int kRefusedBackoffCapS = 16;
     static constexpr int kSilentBackoffCapS  = 60;
@@ -1094,6 +1499,7 @@ private:
         std::vector<u8> raw;
         bytes32 id{};
         bool solicited = false;
+        bool rx_retried = false;   // DROPS-VERIFY-SCALE: parked once already on rx-unavailable
         Clock::time_point enq = Clock::now();
         Clock::time_point not_before = Clock::now();
     };
@@ -1127,6 +1533,16 @@ private:
         bytes32 a0_digest{}; bool has_a0_digest = false;   // the serving peer's digest at a0 (probe answer)
         PeerId rearm = 0, prefer = 0;
         std::map<PeerId, u64> deep;
+        // REPAIR-CHAIN (F2-R): the DOWN-WALK of a peer whose digest at a0
+        // differed -- the a0 it started from and the step count (this attempt),
+        // the peers whose walk ended in a lineage that cannot reach the spine or
+        // at an RC5 peer (never re-walked for this repair: DEEP as RC5 does), and
+        // the equal point a finished walk found (a re-ask probes there first).
+        std::map<PeerId, u64> walk_from;
+        std::map<PeerId, u32> walk_k;
+        std::set<PeerId> walk_checked;   // the peer's digest at P was probed == spine (its lineage reaches the cut)
+        std::set<PeerId> walk_failed;
+        std::map<PeerId, u64> walk_ok;
         Clock::time_point since = Clock::now();
         // REPAIR-PAGE liveness (#1808 review): when Ordering from `cur` began and
         // the first page it asked (0 = no page answered yet); they size the cap.
@@ -1141,6 +1557,7 @@ private:
             st = St::Idle; ids.clear(); cursor = 0; cur = 0; served_by = 0; since = Clock::now();
             a0 = 0; probing = false; has_a0_digest = false; ordering_page = 0;
             cached_seen = 0; fetch_tried.clear(); refetches = 0;
+            walk_from.clear(); walk_k.clear(); walk_checked.clear();
         }
     };
     struct CtxWant {
@@ -1262,7 +1679,11 @@ private:
             bool over = false;
             {
                 std::lock_guard<std::mutex> lk(m_pmtx);
-                m_peers[p] = PeerSt{};
+                PeerSt st{};
+                // RELAY-DISCOVERY: a dial's up event runs on the dialing (maintenance)
+                // thread, before add_peer_id returns: this link is OUR dial of m_dial_*.
+                if (std::this_thread::get_id() == m_maint_tid.load()) { st.out_host = m_dial_host; st.out_port = m_dial_port; }
+                m_peers[p] = st;
                 over = m_peers.size() > m_o.max_peers;
             }
             // RELAY-FD: the up event runs on the dialing/accepting thread AFTER
@@ -1303,6 +1724,7 @@ private:
         }
         if (m_fetch) m_fetch->forget_peer(p);
         if (m_serve) m_serve->forget_peer(p);
+        { std::lock_guard<std::mutex> lk(m_bmtx); m_won_offer.erase(p); }   // RELAY-SEND-QUEUE
         if (m_o.drops_floor_diff) {   // ★ RAIN-BACKFILL: a dropped peer's inventories say nothing any more
             std::lock_guard<std::mutex> lk(m_dsmtx);
             for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();) it = (it->first.p == p) ? m_drop_inv.erase(it) : std::next(it);
@@ -1321,6 +1743,8 @@ private:
             std::lock_guard<std::mutex> lk(m_tmtx);
             for (auto& t : m_targets) if (t.pid == p) {
                 t.pid = 0;
+                // RELAY-DISCOVERY: a learned address whose link ended before HELLO failed
+                if (m_o.discovery && !t.hello_seen) m_book.mark_failed(t.host, t.port, wall_s());
                 t.next_try = Clock::now() + std::chrono::seconds(prehello_delay_s(t));   // SMOKE-NOISE
                 t.hello_seen = false; t.hello_timed_out = false;
             }
@@ -1342,6 +1766,8 @@ private:
         if (m_o.drops_floor_diff && op == FB_DROPINV) { on_dropinv(p, f); return; }
         if (m_o.drops_floor_diff && op == FB_GETWON) { on_getwon(p, f); return; }     // ★ DROPS-RESTART (gate ON only)
         if ((op == FB_PING || op == FB_PONG) && m_o.keepalive_ms) { on_ping(p, f); return; }
+        if (m_o.discovery && op == FB_GETADDR) { on_getaddr(p, f); return; }   // RELAY-DISCOVERY
+        if (m_o.discovery && op == FB_ADDR) { on_addr(p, f); return; }
         m_st.fb_unknown++;                                            // a future 0x4a..0x4f: count, keep socket
     }
 
@@ -1359,7 +1785,7 @@ private:
             auto it = m_peers.find(p);
             if (it != m_peers.end()) { it->second.ka = true; it->second.unanswered = 0; }
         }
-        if (op == FB_PONG) { m_st.pong_rx++; return; }
+        if (op == FB_PONG) { m_st.pong_rx++; on_pong_won(p, nonce); return; }
         m_st.ping_rx++;
         if (m_net.send_to(p, encode_ping(FB_PONG, nonce))) m_st.pong_tx++;
     }
@@ -1445,6 +1871,8 @@ private:
                 m_last_reject = "hello: " + mis;
             }
             log("relay: peer " + std::to_string(p) + " HELLO REFUSED: " + mis + " -> drop");
+            if (h.node_nonce == m_nonce) on_self_hello(p, h);   // NODE-NONCE: a self-connection
+            if (m_o.discovery) disc_refused(p, mis, h);   // RELAY-DISCOVERY: never good, never re-learned
             m_net.disconnect(p);
             return;
         }
@@ -1468,6 +1896,7 @@ private:
         }
         log("relay: peer " + std::to_string(p) + " HELLO ok (lane next_pos=" + std::to_string(h.lane_next_pos) +
             " listen=" + std::to_string(h.listen_port) + ")");
+        if (m_o.discovery && !disc_hello_ok(p, h)) return;   // RELAY-DISCOVERY: a duplicate link was dropped
         reoffer_to(p);
         reoffer_won_to(p);   // ENROL-REPL (DROPS only; a no-op at flip 0)
         if (m_o.drops_floor_diff) {   // ★ RAIN-BACKFILL: pull the peer's recent raindrops (both sides do this)
@@ -1554,8 +1983,10 @@ private:
         if (!decode_block_won(f, b, &why)) { m_st.malformed++; return; }
         if (b.chain_id != m_o.chain) { m_st.wrong_chain++; return; }
         bool fresh = false;
+        const u64 from_node = m_o.drops_floor_diff ? peer_node_nonce(p) : 0;   // RELAY-SEND-QUEUE
         {
             std::lock_guard<std::mutex> lk(m_bmtx);
+            note_won_held(from_node, b.bid);   // that node holds this bid: never re-offer it back
             fresh = m_seen_bids.insert(b.bid).second;
             if (fresh) {
                 m_bid_peer[b.bid] = p;
@@ -1579,7 +2010,8 @@ private:
         if (m_o.drops_floor_diff && b.drops) { std::lock_guard<std::mutex> lk(m_bmtx); m_won_wanted.erase(b.bid); }
         m_st.block_won_rx++;
         remember_won_frame(f);   // ENROL-REPL (DROPS only)
-        for (PeerId q : ready_peers()) if (q != p) m_net.send_to(q, f);   // forward once (dedup by bid)
+        for (PeerId q : ready_peers())   // forward once (dedup by bid)
+            if (q != p && m_net.send_to(q, f) && m_o.drops_floor_diff) note_won_sent(q, b.bid);   // RELAY-SEND-QUEUE
     }
 
     // ★ ENROL-REPL (DROPS, gate ON only): under the flip every node books a lane
@@ -1597,7 +2029,7 @@ private:
         while (m_won_raw.size() > kWonReofferMax) m_won_raw.pop_front();
         // ★ DROPS-RESTART: every carried (v0x02) frame this node holds is servable
         // by bid (FB_GETWON), bounded; the newest frame for a bid wins.
-        if (f.size() >= kBlockWonDropsMinBytes && f[1] == kFbBlockWonDropsVersion) {
+        if (f.size() >= kBlockWonDropsMinBytes && (f[1] == kFbBlockWonDropsVersion || f[1] == kFbBlockWonSetVersion)) {
             BlockWon b; std::string why;
             if (decode_block_won(f, b, &why)) {
                 if (!m_won_by_bid.count(b.bid)) m_won_serve_order.push_back(b.bid);
@@ -1619,11 +2051,110 @@ private:
         }
         if (m_net.send_to(p, frame)) m_st.won_served++;
     }
+    // ★ RELAY-SEND-QUEUE: the HELLO re-offer used to push EVERY kept frame (up to
+    // 64 x ~512 KiB v0x03) synchronously from the reader thread, on both ends at
+    // once -> the send-send deadlock of capstone attempt 6. Now it only builds a
+    // per-peer TODO of the bids that peer's NODE is not known to hold, and
+    // pump_won_offer() hands them to the transport's queue one frame at a time,
+    // while that peer's queued bytes are under kWonPageBytes (the maintenance
+    // tick keeps topping it up). "Known to hold" (m_won_held, by HELLO
+    // node_nonce, so it survives the redial of the same process) is PROOF only:
+    // that node sent us the frame, or a PONG for a PING queued AFTER our copy
+    // came back (TCP order + its sequential reader). Nothing on the wire changes.
+    static constexpr std::size_t kWonPageBytes = 1u << 20;
+    static bool won_frame_bid(const std::vector<u8>& f, bytes32& bid) {
+        if (f.size() < 6 + 32 || f[0] != FB_BLOCK_WON) return false;
+        std::copy(f.begin() + 6, f.begin() + 6 + 32, bid.begin());
+        return true;
+    }
+    u64 peer_node_nonce(PeerId p) const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto it = m_peers.find(p);
+        return (it != m_peers.end() && it->second.hello_ok) ? it->second.remote.node_nonce : 0;
+    }
+    void note_won_held(u64 nn, const bytes32& bid) {   // m_bmtx held by the caller
+        if (!nn) return;
+        auto& h = m_won_held[nn];
+        if (h.size() >= 4 * kWonServeMax) h.clear();   // bound: forgetting only costs a re-offer
+        h.insert(bid);
+        if (m_won_held.size() > 256) { auto v = m_won_held.begin(); if (v->first == nn) ++v; m_won_held.erase(v); }
+    }
     void reoffer_won_to(PeerId p) {
         if (m_o.drops_floor_diff == 0) return;
-        std::vector<std::vector<u8>> raws;
-        { std::lock_guard<std::mutex> lk(m_bmtx); raws.assign(m_won_raw.begin(), m_won_raw.end()); }
-        for (const auto& f : raws) if (m_net.send_to(p, f)) m_st.won_reoffered++;
+        const u64 nn = peer_node_nonce(p);
+        std::vector<std::pair<std::vector<u8>, std::optional<bytes32>>> now;   // not servable by bid (v0x01): small, sent at once
+        {
+            std::lock_guard<std::mutex> lk(m_bmtx);
+            auto& o = m_won_offer[p];
+            o.todo.clear();
+            auto hit = nn ? m_won_held.find(nn) : m_won_held.end();
+            std::set<bytes32> queued;
+            for (const auto& f : m_won_raw) {
+                bytes32 bid{};
+                if (!won_frame_bid(f, bid)) { now.emplace_back(f, std::nullopt); continue; }
+                if (hit != m_won_held.end() && hit->second.count(bid)) { m_st.won_reoffer_skipped++; continue; }
+                if (!m_won_by_bid.count(bid)) { now.emplace_back(f, bid); continue; }
+                if (queued.insert(bid).second) o.todo.push_back(bid);
+            }
+        }
+        for (const auto& [f, bid] : now) {
+            if (!m_net.send_to(p, f)) continue;
+            m_st.won_reoffered++;
+            if (bid) note_won_sent(p, *bid);
+        }
+        pump_won_offer(p);
+    }
+    void pump_won_offer(PeerId p) {
+        for (;;) {
+            if (m_net.send_queue_limit() && m_net.queued_bytes(p) >= kWonPageBytes) return;
+            std::vector<u8> f;
+            bytes32 bid{};
+            {
+                std::lock_guard<std::mutex> lk(m_bmtx);
+                auto it = m_won_offer.find(p);
+                if (it == m_won_offer.end() || it->second.todo.empty()) return;
+                bid = it->second.todo.front();
+                it->second.todo.pop_front();
+                auto w = m_won_by_bid.find(bid);
+                if (w == m_won_by_bid.end()) continue;   // evicted since: nothing to offer
+                f = w->second;
+            }
+            if (!m_net.send_to(p, f)) {   // gone (or dropped): never leave a TODO behind a link that ended
+                if (!m_net.has_peer(p)) { std::lock_guard<std::mutex> lk(m_bmtx); m_won_offer.erase(p); }
+                return;
+            }
+            m_st.won_reoffered++;
+            note_won_sent(p, bid);
+        }
+    }
+    void note_won_sent(PeerId p, const bytes32& bid) {
+        const u64 at = m_ping_nonce.load();   // read AFTER the enqueue: a PING numbered > at is queued behind it
+        std::lock_guard<std::mutex> lk(m_bmtx);
+        auto it = m_won_offer.find(p);
+        if (it != m_won_offer.end() && it->second.unconfirmed.size() < 4 * kWonReofferMax)
+            it->second.unconfirmed.emplace_back(at, bid);
+    }
+    void on_pong_won(PeerId p, u64 nonce) {
+        if (m_o.drops_floor_diff == 0) return;
+        const u64 nn = peer_node_nonce(p);
+        if (!nn) return;
+        std::lock_guard<std::mutex> lk(m_bmtx);
+        auto it = m_won_offer.find(p);
+        if (it == m_won_offer.end()) return;
+        auto& u = it->second.unconfirmed;
+        for (auto e = u.begin(); e != u.end();) {
+            if (nonce > e->first) { note_won_held(nn, e->second); m_st.won_held_confirmed++; e = u.erase(e); }
+            else ++e;
+        }
+    }
+    void pump_won_offers() {   // maintenance tick
+        if (m_o.drops_floor_diff == 0) return;
+        std::vector<PeerId> ps;
+        {
+            std::lock_guard<std::mutex> lk(m_bmtx);
+            for (const auto& [p, o] : m_won_offer) if (!o.todo.empty()) ps.push_back(p);
+        }
+        for (PeerId p : ps) pump_won_offer(p);
     }
 
     // ── receipt context: serve (queue for the daemon's monerod) / receive ────
@@ -1922,10 +2453,21 @@ private:
         bytes32 pow{};
         m_st.rx_evals++;
         if (!m_rx || !m_rx(it.r.receipt.hashing_blob.bytes, ctx->seed, pow)) {
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());   // our fault: give the token back
+            }
+            // DROPS-VERIFY-SCALE: the engine refuses while a switch keys the new
+            // seed's cache (async_next_seed): park ONCE and retry instead of
+            // silently forgetting the item (it was lost on this node only).
+            if (m_rx && !it.rx_retried) {
+                it.rx_retried = true;
+                m_st.rx_unavail_parked++;
+                park(std::move(it), std::chrono::milliseconds(500));
+                return;
+            }
             m_st.rx_unavailable++;
-            std::lock_guard<std::mutex> lk(m_mtx);
-            if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());   // our fault: give the token back
-            m_inflight.erase(it.id);
+            forget_inflight(it.id);
             return;
         }
         if (meets_share_diff(pow, m_o.share_diff)) {
@@ -2025,25 +2567,29 @@ private:
         a.drop = true; a.pow = pow;
         m_st.drops_foreign++;
         if (it.solicited && drop_unwant(a.id)) m_st.drops_backfilled++;   // ★ RAIN-BACKFILL
-        drop_store_put(a.id, bin, a.raw);
+        drop_store_put(a.id, bin, a.raw, a.pow);
         flood(a.raw, it.from);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
     }
 
     // ── ★ RAIN-BACKFILL: the servable raindrop store + the two frames ────────
-    void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw) {
+    void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw, const bytes32& pow) {
         std::lock_guard<std::mutex> lk(m_dsmtx);
+        if (m_pin_asked.erase(id)) m_st.drops_pin_pruned++;   // ★ DROPS-HARDEN (d1): an asked id arrived
         if (!m_drop_store_id.emplace(id, bin).second) return;
         m_drop_store[bin].emplace(id, raw);
+        m_drop_pow[id] = pow;   // ★ DROPS-HARDEN (d4): persisted with the bytes
+        m_drop_dirty = true;
         // bounded: intervals older than the retain window, then the oldest interval
         const u64 tip = m_chain.tip();
         const u64 keep_from = tip > m_o.drops_retain_bins ? tip - m_o.drops_retain_bins : 0;
         while (!m_drop_store.empty() &&
                (m_drop_store.begin()->first < keep_from || m_drop_store_id.size() > m_o.drops_store_max)) {
             if (m_drop_store.begin()->first == bin && m_drop_store.size() == 1) break;   // never evict the one just stored
-            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); }
+            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); m_drop_pow.erase(x); }
             m_drop_store.erase(m_drop_store.begin());
+            m_drop_dirty = true;
         }
     }
     // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
@@ -2121,13 +2667,125 @@ private:
         }
         if (!miss.empty()) send_drop_fetch(p, lo, hi, miss);   // fetch at once (drops_sync re-asks)
     }
+    // ── ★ DROPS-HARDEN (d4): the persisted raindrop store ───────────────────
+    // <settle_db>/lane<N>.drops = "V37DRP1\0" | chain u32 | lane_params_digest 32
+    // | n u32 | n x (id 32 | bin u64 | pow 32 | len u32 | raw) | sha256d(all before) 32.
+    // Written from the maint thread when the store changed (at most every
+    // drops_persist_ms) and at stop(): tmp + fsync + rename. The store is bounded
+    // by drops_retain_bins / drops_store_max, so is the file.
+    static constexpr u8 kDropsFileMagic[8] = {'V', '3', '7', 'D', 'R', 'P', '1', 0};
+    static constexpr std::size_t kDropsFileMaxRaw = 65536;
+    static void dput(std::vector<u8>& b, u64 v, int n) { for (int i = 0; i < n; ++i) b.push_back(static_cast<u8>(v >> (8 * i))); }
+public:
+    bool drops_persist() {
+        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return false;
+        std::vector<u8> b;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            if (!m_drop_dirty) return false;
+            b.insert(b.end(), kDropsFileMagic, kDropsFileMagic + 8);
+            dput(b, m_o.chain, 4); b.insert(b.end(), m_o.lane_params_digest.begin(), m_o.lane_params_digest.end());
+            dput(b, m_drop_store_id.size(), 4);
+            for (const auto& [bin, m] : m_drop_store)
+                for (const auto& [id, raw] : m) {
+                    const auto pi = m_drop_pow.find(id);
+                    b.insert(b.end(), id.begin(), id.end()); dput(b, bin, 8);
+                    const bytes32 pw = pi == m_drop_pow.end() ? bytes32{} : pi->second;
+                    b.insert(b.end(), pw.begin(), pw.end());
+                    dput(b, raw.size(), 4); b.insert(b.end(), raw.begin(), raw.end());
+                }
+            m_drop_dirty = false;
+            m_drop_persisted_at = Clock::now();
+        }
+        const bytes32 h = ::v37::sha256d(b);
+        b.insert(b.end(), h.begin(), h.end());
+        const std::string tmp = m_o.drops_persist_path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        bool ok = f && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+        if (f) ok = (std::fclose(f) == 0) && ok;
+        ok = ok && std::rename(tmp.c_str(), m_o.drops_persist_path.c_str()) == 0;
+        if (!ok) {
+            m_st.drops_persist_fail++;
+            { std::lock_guard<std::mutex> lk(m_dsmtx); m_drop_dirty = true; }
+            log("relay: drops store persist FAILED " + m_o.drops_persist_path + ": " + std::strerror(errno));
+            return false;
+        }
+        m_st.drops_persist_writes++;
+        return true;
+    }
+    // Boot (before start()): restore the store from drops_persist_path. The
+    // restored raindrops are servable at once, count as seen, and are queued for
+    // drain_drops() so the harvest holds exactly what the store holds (as before
+    // the restart). Any mismatch (magic, chain, lane, bounds, trailer) = the file
+    // is ignored (an empty store, as before DROPS-HARDEN); *why says so.
+    std::size_t drops_load(std::string* why = nullptr) {
+        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return 0;
+        std::FILE* f = std::fopen(m_o.drops_persist_path.c_str(), "rb");
+        if (!f) { if (why) *why = "absent"; return 0; }
+        std::vector<u8> b;
+        u8 buf[65536];
+        for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) b.insert(b.end(), buf, buf + n);
+        std::fclose(f);
+        auto bad = [&](const char* w) { if (why) *why = std::string(w) + " (" + m_o.drops_persist_path + " ignored: empty store)"; return std::size_t{0}; };
+        if (b.size() < 8 + 4 + 32 + 4 + 32 || std::memcmp(b.data(), kDropsFileMagic, 8) != 0) return bad("bad magic/size");
+        const std::size_t body = b.size() - 32;
+        if (::v37::sha256d(b.data(), body) != *reinterpret_cast<const bytes32*>(b.data() + body)) return bad("trailer hash mismatch (torn/corrupt)");
+        std::size_t o = 8;
+        auto get = [&](std::size_t n, u64& v) { if (o + n > body) return false; v = 0; for (std::size_t i = n; i-- > 0;) v = (v << 8) | b[o + i]; o += n; return true; };
+        auto get32 = [&](bytes32& x) { if (o + 32 > body) return false; std::memcpy(x.data(), b.data() + o, 32); o += 32; return true; };
+        u64 chain = 0, n = 0; bytes32 tag{};
+        if (!get(4, chain) || !get32(tag) || !get(4, n)) return bad("truncated header");
+        if (chain != m_o.chain || tag != m_o.lane_params_digest) return bad("another lane (chain / lane_params_digest differ)");
+        if (n > m_o.drops_store_max) return bad("more raindrops than drops_store_max");
+        struct E { bytes32 id; u64 bin; bytes32 pow; std::vector<u8> raw; };
+        std::vector<E> v; v.reserve(static_cast<std::size_t>(n));
+        for (u64 k = 0; k < n; ++k) {
+            E e; u64 len = 0;
+            if (!get32(e.id) || !get(8, e.bin) || !get32(e.pow) || !get(4, len) || len > kDropsFileMaxRaw || o + len > body) return bad("bad raindrop record");
+            e.raw.assign(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + len)); o += len;
+            FbReceipt r;
+            if (!decode_fb_receipt(e.raw, r) || receipt_id(r) != e.id) return bad("a record whose bytes are not its id");
+            v.push_back(std::move(e));
+        }
+        if (o != body) return bad("trailing bytes");
+        std::size_t loaded = 0;
+        for (auto& e : v) {
+            if (!drop_note_new(e.id)) continue;
+            {
+                std::lock_guard<std::mutex> lk(m_dsmtx);
+                if (!m_drop_store_id.emplace(e.id, e.bin).second) continue;
+                m_drop_store[e.bin].emplace(e.id, e.raw);
+                m_drop_pow[e.id] = e.pow;
+            }
+            Admitted a;
+            decode_fb_receipt(e.raw, a.r);
+            a.id = e.id; a.raw = std::move(e.raw); a.bin = e.bin; a.drop = true; a.pow = e.pow;
+            std::lock_guard<std::mutex> lk(m_amtx);
+            m_drops.push_back(std::move(a));
+            ++loaded;
+        }
+        m_st.drops_persist_loaded += loaded;
+        if (why) why->clear();
+        return loaded;
+    }
+private:
     void drops_maint() {
+        if (!m_o.drops_persist_path.empty()) {   // ★ DROPS-HARDEN (d4)
+            bool due = false;
+            {
+                std::lock_guard<std::mutex> lk(m_dsmtx);
+                due = m_drop_dirty && Clock::now() - m_drop_persisted_at >= std::chrono::milliseconds(m_o.drops_persist_ms);
+            }
+            if (due) drops_persist();
+        }
         std::lock_guard<std::mutex> lk(m_dsmtx);
         const auto now = Clock::now();
         for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();)
             it = (now - it->second.touched > std::chrono::minutes(10)) ? m_drop_inv.erase(it) : std::next(it);
         for (auto it = m_drop_want.begin(); it != m_drop_want.end();)
             it = (now - it->second > std::chrono::minutes(10)) ? m_drop_want.erase(it) : std::next(it);
+        for (auto it = m_pin_asked.begin(); it != m_pin_asked.end();)   // ★ DROPS-SET-PIN
+            it = (now - it->second.first > std::chrono::minutes(10)) ? m_pin_asked.erase(it) : std::next(it);
     }
 
     void flood(const std::vector<u8>& raw, PeerId except) {
@@ -2238,6 +2896,46 @@ private:
         m_st.repair_page_timeouts++;
     }
 
+    // REPAIR-CHAIN (F2-R): the next ask of peer p's down-walk (m_rmtx held):
+    // q_k = a0 - G x 2^k aligned down to G (G = deep_probe_step), a zero-length
+    // probe [q, q); at q = 0 the whole order [0, P) instead (the winner's order
+    // itself -- always sufficient when this peer's lineage IS the winner's).
+    Job walk_step_locked(Repair& r, PeerId p, const Job& j) {
+        const u64 G = std::max<u64>(1, m_o.deep_probe_step);
+        const u64 from = r.walk_from[p];
+        const u32 k = r.walk_k[p]++;
+        const u64 back = k >= 40 ? from : std::min<u64>(from, G << k);
+        u64 q = from - back;
+        q -= q % G;
+        if (q == 0 && k == 0 && from > 1) q = from - 1;   // probe below the peer's horizon once before [0, P)
+        Job n = j;
+        n.max_ids = 0; n.ids.clear();
+        r.since = Clock::now();
+        r.has_a0_digest = false;
+        if (q == 0) {
+            m_st.repair_deep_full++;
+            n.probe = false; n.a = 0; n.p = r.P; n.spine = r.spine;
+            r.a0 = 0; r.cursor = 0; r.probing = false;
+            return n;
+        }
+        m_st.repair_deep_probe++;
+        n.probe = true; n.a = n.p = q; n.spine = bytes32{};
+        if (const auto d = digest_at_deep(q)) n.spine = *d;
+        r.a0 = q; r.cursor = q; r.probing = true;
+        return n;
+    }
+    // REPAIR-CHAIN: a walked peer whose order cannot reach the spine (or an RC5
+    // peer that refuses the walk) -> DEEP exactly as RC5 names it (m_rmtx held).
+    void walk_failed_locked(Repair& r, PeerId p, bool rc5) {
+        auto wf = r.walk_from.find(p);
+        if (wf == r.walk_from.end()) return;
+        r.deep[p] = wf->second;
+        r.walk_failed.insert(p);
+        r.walk_ok.erase(p);
+        m_st.repair_deep++;
+        if (rc5) m_st.repair_deep_rc5++; else m_st.repair_deep_lineage++;
+    }
+
     void on_order(PeerId p, const CtrlOrder& o) {
         // SupplyRequester now hands a NON-OK ORDER (BELOW_HORIZON, DISABLED,
         // BAD_RANGE) to the order callback too, so RepairDriver can name the
@@ -2261,7 +2959,13 @@ private:
             if (cj && cj->repair && cj->kind == Job::Kind::Order) {
                 std::lock_guard<std::mutex> lk(m_rmtx);
                 auto it = m_repairs.find(cj->key);
-                if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p) {
+                if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p &&
+                    it->second.walk_from.count(p)) {
+                    // REPAIR-CHAIN: a walk PROBE refused = an RC5 peer (no durable order):
+                    // DEEP as RC5 names it. A refused whole-order step (its walker mark
+                    // was taken by another repair of ours) is only set aside: re-walked.
+                    if (cj->probe) walk_failed_locked(it->second, p, /*rc5=*/true);
+                } else if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p) {
                     Repair& r = it->second;
                     const u64 was = r.a0_of.count(p) ? r.a0_of[p] : 0;
                     if (o.lowest_retained > was && o.lowest_retained > cj->a && o.lowest_retained < r.P) {
@@ -2297,10 +3001,11 @@ private:
         }
         // REPAIR
         if (j->probe) {   // REPAIR-HORIZON: the peer's digest at a0 vs ours
-            const auto ours = digest_at(j->a);
+            const auto ours = m_o.deep_order ? digest_at_deep(j->a) : digest_at(j->a);   // REPAIR-CHAIN: any position
             const bool alt_known = alt_digest_known(j->a);   // the shadows (reconstructed winner-side orders)
             const bool alt_eq = o.have_spine && alt_digest_is(j->a, o.spine_digest);
             bool go = false; std::string alarm;
+            std::optional<Job> walk;   // REPAIR-CHAIN: the next step of a down-walk
             {
                 std::lock_guard<std::mutex> lk(m_rmtx);
                 auto it = m_repairs.find(j->key);
@@ -2308,7 +3013,53 @@ private:
                 Repair& r = it->second;
                 if (r.st != Repair::St::Ordering || r.cur != p || !r.probing || r.a0 != j->a) return;
                 r.probing = false;
-                if (o.p_served == j->a && o.have_spine && (ours || alt_known) && !(ours && o.spine_digest == *ours) && !alt_eq) {
+                const bool differs = o.p_served == j->a && o.have_spine && (ours || alt_known) &&
+                                     !(ours && o.spine_digest == *ours) && !alt_eq;
+                const bool equal = o.p_served == j->a && o.have_spine && ((ours && o.spine_digest == *ours) || alt_eq);
+                if (r.walk_from.count(p) && !r.walk_checked.count(p)) {
+                    // REPAIR-CHAIN: the walk's first probe is [P, P): a peer whose own
+                    // digest at P is not the winner's spine cannot serve this cut from
+                    // ANY start -- name it DEEP now instead of walking its whole order
+                    if (o.p_served == j->a && o.have_spine && o.spine_digest == r.spine) {
+                        r.walk_checked.insert(p);
+                        walk = walk_step_locked(r, p, *j);
+                    } else if (!o.have_spine || o.p_served != j->a) {
+                        r.tried.insert(p); r.reset();   // the peer does not know P yet (lagging): retry later, not DEEP
+                    } else {
+                        walk_failed_locked(r, p, /*rc5=*/false);
+                        r.tried.insert(p); r.reset();
+                        alarm = "relay: REPAIR-CHAIN repair of P=" + std::to_string(r.P) + ": peer " + std::to_string(p) +
+                                "'s lane digest at P is not the winner's spine -- its lineage cannot serve this cut (peer set aside as DEEP)";
+                    }
+                } else if (r.walk_from.count(p) && !equal) {
+                    // REPAIR-CHAIN (F2-R): no equal state at this step (differs, or
+                    // unknown on either side): step further down
+                    walk = walk_step_locked(r, p, *j);
+                } else if (r.walk_from.count(p)) {
+                    m_st.repair_deep_equal++;
+                    r.walk_ok[p] = j->a;
+                    r.a0_digest = o.spine_digest; r.has_a0_digest = true;
+                    r.since = Clock::now();
+                    go = true;
+                } else if (differs && m_o.deep_order && !r.walk_failed.count(p)) {
+                    // REPAIR-CHAIN (F2-R): instead of setting the peer aside as DEEP,
+                    // walk down to where our own / a shadow's state equals the peer's
+                    r.walk_from[p] = j->a;
+                    r.walk_k[p] = 0;
+                    if (auto wo = r.walk_ok.find(p); wo != r.walk_ok.end() && wo->second < j->a) {
+                        r.walk_checked.insert(p);   // a previous walk of this peer passed the [P, P) check
+                        Job n = *j; n.a = n.p = wo->second; n.probe = true;   // the equal point a previous walk found
+                        if (const auto d = digest_at_deep(n.a)) n.spine = *d;
+                        r.a0 = r.cursor = n.a; r.probing = true; r.since = Clock::now();
+                        m_st.repair_deep_probe++;
+                        walk = std::move(n);
+                    } else {   // first: the peer's digest at P ([P, P), inside its vault)
+                        Job n = *j; n.a = n.p = r.P; n.probe = true; n.spine = r.spine; n.max_ids = 0;
+                        r.a0 = r.cursor = r.P; r.probing = true; r.since = Clock::now();
+                        m_st.repair_deep_probe++;
+                        walk = std::move(n);
+                    }
+                } else if (differs) {
                     const bool fresh = r.deep.emplace(p, j->a).second;   // log a peer's DEEP once per repair
                     r.deep[p] = j->a;
                     m_st.repair_deep++;
@@ -2324,6 +3075,7 @@ private:
                 }
             }
             if (!alarm.empty()) log(alarm);
+            if (walk) queue_job(p, std::move(*walk));
             if (go) {
                 Job n = *j; n.probe = false; n.p = j->key.first; n.spine = j->key.second;   // the suffix order [a0, P)
                 queue_job(p, std::move(n));
@@ -2381,6 +3133,7 @@ private:
             }
             if (!o.have_spine || o.spine_digest != r.spine) {
                 // this peer's order does not reach the winner's digest at P
+                if (o.have_spine) walk_failed_locked(r, p, /*rc5=*/false);   // REPAIR-CHAIN: a walked lineage -> DEEP (loud)
                 m_st.repair_spine_mismatch++; r.tried.insert(p); r.reset(); return;
             }
             m_st.repair_order_ok++;
@@ -2545,8 +3298,278 @@ private:
         if (!issue.empty()) pump_jobs();
     }
 
+    // ── RELAY-DISCOVERY (FB_GETADDR 0x4c / FB_ADDR 0x4d) ────────────────────
+    static u64 wall_s() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+    static bool dialable_v4(const AddrEntry& e) {
+        return e.family == kAddrFamV4 && e.ip[0] != 0 && e.port != 0;   // IPv4 transport; never 0.0.0.0/8
+    }
+    static bool is_public_host(const std::string& ip) {
+        AddrEntry e; return addr_entry_of(ip, 1, 0, e) && addr_routable(e);
+    }
+    // Addresses we are linked to (dialed, or announced by an inbound peer).
+    std::set<std::string> linked_keys() const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        std::set<std::string> k;
+        for (const auto& [p, s] : m_peers) {
+            (void)p;
+            if (!s.addr_key.empty()) k.insert(s.addr_key);
+            if (!s.out_host.empty()) k.insert(peer_key(s.out_host, s.out_port));
+        }
+        return k;
+    }
+    void send_getaddr(PeerId p) {
+        const auto f = encode_getaddr(m_o.chain, m_o.addr_want);
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it == m_peers.end() || !it->second.hello_ok) return;
+            it->second.addr_pending = true;
+            it->second.getaddr_tx = Clock::now();
+        }
+        if (m_net.send_to(p, f)) m_st.getaddr_tx++;
+    }
+    // A HELLO refused on a link WE dialed: that address is never good and never re-learned.
+    void disc_refused(PeerId p, const std::string& mis, const Hello& hr) {
+        std::string h; u16 port = 0;
+        const bool self = hr.node_nonce == m_nonce;
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it == m_peers.end()) return;
+            h = it->second.out_host; port = it->second.out_port;
+        }
+        if (h.empty()) {
+            // NODE-NONCE: the accepting end of a self-dial: our announced address
+            // (socket ip : HELLO listen port) is ours -- never learned or handed out.
+            if (self && hr.listen_port) m_book.mark_self(m_net.remote_ip(p), hr.listen_port);
+            return;
+        }
+        if (self) {
+            m_st.disc_self++;
+            m_book.mark_self(h, port);   // NODE-NONCE: never dialed, learned or handed out again
+            log("relay-disc: " + peer_key(h, port) + " is THIS node (HELLO node nonce equal) -> marked self");
+            return;
+        }
+        m_st.disc_bad++;
+        m_book.mark_bad(h, port);
+        log("relay-disc: " + peer_key(h, port) + " refused at HELLO -> never good, not re-learned (" + mis + ")");
+    }
+    // NODE-NONCE: a HELLO carrying OUR node nonce = this node talking to
+    // itself. The link is closed by the caller; the dial target behind it is
+    // retired for good (every mode, discovery ON or OFF).
+    void on_self_hello(PeerId p, const Hello&) {
+        m_st.self_conn++;
+        std::lock_guard<std::mutex> lk(m_tmtx);
+        for (auto& t : m_targets) if (t.pid == p && !t.self) {
+            t.self = true;
+            if (t.learned) t.used = true;
+            log("relay: dial target " + peer_key(t.host, t.port) + " is THIS node (HELLO node nonce equal) -> never dialed again");
+        }
+    }
+    // NODE-NONCE: every address known to belong to a node we hold a HELLO-ok
+    // link to (under that address or another one): dialing it again could only
+    // make a duplicate link. A restarted node has a new nonce, so its old
+    // addresses are dialable again at once.
+    static constexpr std::size_t kAddrNonceMax = 4096;
+    std::set<std::string> linked_node_keys() const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        std::set<u64> live;
+        for (const auto& [p, s] : m_peers) { (void)p; if (s.hello_ok) live.insert(s.remote.node_nonce); }
+        std::set<std::string> v;
+        for (const auto& [k, n] : m_addr_nonce) if (live.count(n)) v.insert(k);
+        return v;
+    }
+    // HELLO ok: a dialed address becomes GOOD, so does an inbound peer's
+    // announced address (it proved the pool id on this socket); a second link to the same node is dropped
+    // (both ends keep the link dialed by the LOWER node nonce). false = this
+    // link was the duplicate and is being dropped.
+    bool disc_hello_ok(PeerId p, const Hello& h) {
+        const u64 now = wall_s();
+        std::string out_host; u16 out_port = 0;
+        PeerId dup = 0; bool dup_out = false;
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it == m_peers.end()) return false;
+            out_host = it->second.out_host; out_port = it->second.out_port;
+            for (const auto& [q, s] : m_peers)
+                if (q != p && s.hello_ok && s.remote.node_nonce == h.node_nonce) { dup = q; dup_out = !s.out_host.empty(); break; }
+        }
+        std::string key, rip;
+        if (!out_host.empty()) {
+            m_book.mark_good(out_host, out_port, now);
+            key = peer_key(out_host, out_port);
+            bool learned = false;
+            {
+                std::lock_guard<std::mutex> lk(m_tmtx);
+                for (const auto& t : m_targets) if (t.learned && t.host == out_host && t.port == out_port) learned = true;
+            }
+            if (learned) m_st.disc_dial_ok++;
+        } else {
+            rip = m_net.remote_ip(p);
+            if (!rip.empty() && h.listen_port) {
+                // The peer proved the pool id at HELLO from this socket address: its
+                // announced relay address (socket ip : HELLO listen port) is good. A
+                // listen port that turns out unreachable is failed out by dialers.
+                key = peer_key(rip, h.listen_port);
+                m_book.mark_good(rip, h.listen_port, now);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it == m_peers.end()) return false;
+            it->second.addr_key = key; it->second.remote_ip = rip;
+            if (!key.empty()) {   // NODE-NONCE: this address is that node (bounded, refreshed on every HELLO)
+                if (m_addr_nonce.size() >= kAddrNonceMax && !m_addr_nonce.count(key)) m_addr_nonce.erase(m_addr_nonce.begin());
+                m_addr_nonce[key] = h.node_nonce;
+            }
+        }
+        if (dup) {
+            // NODE-NONCE: one link per node, the same one on both ends (dup_link_rule).
+            const DupPick pick = dup_link_rule(m_nonce, h.node_nonce, !out_host.empty(), dup_out);
+            if (pick == DupPick::Defer) {
+                m_st.dup_deferred++;
+                log("relay-disc: duplicate link to node " + std::to_string(h.node_nonce & 0xffff) +
+                    " dialed twice by the peer -> the peer closes one");
+            } else {
+                const bool drop_p = pick == DupPick::DropNew;
+                const PeerId gone = drop_p ? p : dup;
+                m_st.disc_dup_dropped++;
+                log("relay-disc: duplicate link to node " + std::to_string(h.node_nonce & 0xffff) + " -> dropping peer " +
+                    std::to_string(gone) + " (keep the link dialed by the lower node nonce; no penalty)");
+                m_net.disconnect(gone);
+                if (drop_p) return false;
+            }
+        }
+        send_getaddr(p);
+        return true;
+    }
+    void on_getaddr(PeerId p, const std::vector<u8>& f) {
+        u32 chain = 0; u16 want = 0;
+        if (!decode_getaddr(f, chain, want)) { m_st.malformed++; return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        m_st.getaddr_rx++;
+        std::string asker_key, asker_ip;
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it == m_peers.end()) return;
+            PeerSt& s = it->second;
+            const auto now = Clock::now();
+            if (s.getaddr_rx != Clock::time_point{} && now - s.getaddr_rx < std::chrono::milliseconds(m_o.addr_answer_min_ms)) {
+                m_st.getaddr_throttled++;   // rate limit: one answer per peer per addr_answer_min_ms
+                return;
+            }
+            s.getaddr_rx = now;
+            asker_key = s.addr_key;
+            asker_ip = s.out_host.empty() ? s.remote_ip : s.out_host;
+        }
+        // never hand a private / loopback address to a public peer; never the asker itself
+        const bool asker_public = is_public_host(asker_ip);
+        const auto sample = m_book.sample_good(std::min<std::size_t>(want, m_o.addr_answer_max), [&](const PeerRecord& r) {
+            if (peer_key(r.host, r.port) == asker_key) return false;
+            AddrEntry e;
+            if (!addr_entry_of(r.host, r.port, r.last_seen, e)) return false;
+            return !asker_public || addr_routable(e);
+        });
+        std::vector<AddrEntry> v;
+        for (const auto& r : sample) { AddrEntry e; if (addr_entry_of(r.host, r.port, r.last_seen, e)) v.push_back(e); }
+        if (m_net.send_to(p, encode_addr(m_o.chain, v))) m_st.addr_tx++;
+    }
+    void on_addr(PeerId p, const std::vector<u8>& f) {
+        u32 chain = 0; std::vector<AddrEntry> v;
+        if (!decode_addr(f, chain, v)) { m_st.malformed++; return; }
+        if (chain != m_o.chain) { m_st.wrong_chain++; return; }
+        std::string src_ip; std::size_t budget = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it == m_peers.end()) return;
+            PeerSt& s = it->second;
+            if (!s.addr_pending) { m_st.addr_unsolicited++; return; }   // an ADDR we did not ask for: ignored
+            s.addr_pending = false;
+            src_ip = s.out_host.empty() ? s.remote_ip : s.out_host;
+            budget = s.addr_learned >= m_o.addr_learn_per_peer ? 0 : m_o.addr_learn_per_peer - s.addr_learned;
+        }
+        m_st.addr_rx++;
+        const bool src_public = is_public_host(src_ip);
+        const std::size_t take = std::min({v.size(), m_o.addr_learn_per_answer, budget});
+        const u64 now = wall_s();
+        std::size_t learned = 0;
+        for (std::size_t i = 0; i < take; ++i) {
+            const AddrEntry& e = v[i];
+            if (!dialable_v4(e) || (src_public && !addr_routable(e))) { m_st.addr_ignored++; continue; }
+            if (m_book.is_self(addr_host(e), e.port)) { m_st.self_skipped++; continue; }   // NODE-NONCE: our own address
+            if (m_book.learn(addr_host(e), e.port, e.last_seen, now)) ++learned;
+        }
+        m_st.addr_ignored += v.size() - take;
+        m_st.addr_learned += learned;
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto it = m_peers.find(p);
+        if (it != m_peers.end()) it->second.addr_learned += take;
+    }
+    // Maintenance thread, ~1 s: retire used learned targets, dial new
+    // candidates up to max_outbound, re-ask addresses while below it, refresh
+    // the connected good peers, expire stale entries, persist a dirty book.
+    void disc_tick() {
+        const auto nowc = Clock::now();
+        if (nowc - m_disc_tick < std::chrono::seconds(1)) return;
+        m_disc_tick = nowc;
+        const u64 now = wall_s();
+        {
+            std::lock_guard<std::mutex> lk(m_tmtx);
+            m_targets.erase(std::remove_if(m_targets.begin(), m_targets.end(),
+                                           [](const Target& t) { return t.learned && t.used && !t.pid; }), m_targets.end());
+        }
+        std::size_t out = 0;
+        std::vector<std::pair<PeerId, std::pair<std::string, u16>>> outs;
+        std::vector<PeerId> reask;
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            for (const auto& [p, s] : m_peers) {
+                if (s.hello_ok && s.out_host.empty() && !s.remote_ip.empty() && s.remote.listen_port)
+                    outs.push_back({p, {s.remote_ip, s.remote.listen_port}});
+                if (s.out_host.empty()) continue;
+                ++out;
+                if (s.hello_ok) outs.push_back({p, {s.out_host, s.out_port}});
+            }
+            for (const auto& [p, s] : m_peers)
+                if (s.hello_ok && nowc - s.getaddr_tx >= std::chrono::milliseconds(m_o.addr_reask_ms)) reask.push_back(p);
+        }
+        std::set<std::string> skip = linked_keys();
+        for (const auto& k : linked_node_keys()) skip.insert(k);   // NODE-NONCE: aliases of linked nodes
+        {
+            std::lock_guard<std::mutex> lk(m_tmtx);
+            for (const auto& t : m_targets) {
+                skip.insert(peer_key(t.host, t.port));
+                if (t.learned && !t.used) ++out;   // queued dials count toward the target
+            }
+        }
+        if (m_dialing.load() && !m_partitioned.load() && out < m_o.max_outbound && m_net.n_peers() < m_o.max_peers) {
+            const auto c = m_book.dial_candidates(m_o.max_outbound - out, now, skip);
+            std::lock_guard<std::mutex> lk(m_tmtx);
+            for (const auto& r : c) {
+                Target t{r.host, r.port, 0, Clock::now(), 1};
+                t.learned = true;
+                m_targets.push_back(t);
+                m_st.disc_dialed++;
+            }
+        }
+        if (out < m_o.max_outbound) for (PeerId p : reask) send_getaddr(p);
+        if (nowc - m_disc_slow >= std::chrono::seconds(60)) {
+            m_disc_slow = nowc;
+            for (const auto& [p, a] : outs) { (void)p; m_book.mark_good(a.first, a.second, now); }   // connected: last_seen fresh
+            m_st.disc_expired += m_book.expire(now);
+        }
+        if (nowc - m_disc_saved >= std::chrono::milliseconds(m_o.book_save_ms)) { m_disc_saved = nowc; save_book(false); }
+    }
     // ── maintenance: dial/redial, HELLO timeouts, fetch timeouts, drops ──────
     void maint_loop() {
+        m_maint_tid.store(std::this_thread::get_id());   // RELAY-DISCOVERY: marks our own dials in on_peer_up
         while (m_running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             if (!m_running.load()) break;
@@ -2584,12 +3607,20 @@ private:
             if (m_dialing.load()) {
                 std::vector<std::size_t> due;
                 const auto live = m_net.peer_ids();
+                // RELAY-DISCOVERY: an address already linked (e.g. the peer dialed US) is not dialed again
+                const std::set<std::string> linked = m_o.discovery ? linked_keys() : std::set<std::string>{};
+                // NODE-NONCE: an address whose node (by HELLO nonce) is linked under ANOTHER address
+                const std::set<std::string> aliased = m_o.discovery ? linked_node_keys() : std::set<std::string>{};
                 {
                     std::lock_guard<std::mutex> lk(m_tmtx);
                     for (std::size_t i = 0; i < m_targets.size(); ++i) {
                         auto& t = m_targets[i];
                         if (t.pid && std::find(live.begin(), live.end(), t.pid) == live.end()) t.pid = 0;
-                        if (!t.pid && Clock::now() >= t.next_try) due.push_back(i);
+                        if (t.self) continue;   // NODE-NONCE: this node itself, never dialed again
+                        if (!t.pid && Clock::now() >= t.next_try) {
+                            if (linked.count(peer_key(t.host, t.port)) || aliased.count(peer_key(t.host, t.port))) { t.next_try = Clock::now() + std::chrono::seconds(5); if (t.learned) t.used = true; continue; }
+                            due.push_back(i);
+                        }
                     }
                 }
                 for (std::size_t i : due) {
@@ -2599,7 +3630,9 @@ private:
                         host = m_targets[i].host; port = m_targets[i].port;
                     }
                     m_st.dials++;
+                    m_dial_host = host; m_dial_port = port;   // RELAY-DISCOVERY (maintenance thread only)
                     const PeerId pid = m_net.add_peer_id(host, port);
+                    m_dial_host.clear(); m_dial_port = 0;
                     // the peer's HELLO may already have been accepted before t.pid is set
                     const bool hello_now = pid && hello_ok(pid);
                     std::lock_guard<std::mutex> lk(m_tmtx);
@@ -2616,9 +3649,13 @@ private:
                             // redialed on the very next tick (250 ms). Back off here.
                             t.next_try = Clock::now() + std::chrono::seconds(prehello_delay_s(t));
                             t.hello_seen = false;
+                            if (m_o.discovery && !hello_now) m_book.mark_failed(host, port, wall_s());   // RELAY-DISCOVERY
                         }
+                        if (t.learned) t.used = true;
                     } else {
                         m_st.dial_fail++;
+                        if (m_o.discovery) m_book.mark_failed(t.host, t.port, wall_s());   // RELAY-DISCOVERY
+                        if (t.learned) t.used = true;
                         t.next_try = Clock::now() + std::chrono::seconds(t.backoff_s);
                         t.backoff_s = std::min(60, t.backoff_s * 2);
                     }
@@ -2657,6 +3694,8 @@ private:
             if (m_o.drops_floor_diff) drops_maint();   // ★ RAIN-BACKFILL
             drive_ctx();
             drive_liveness();   // RELAY-LIVENESS
+            pump_won_offers();  // RELAY-SEND-QUEUE: page the won re-offer into each peer's queue
+            if (m_o.discovery) disc_tick();   // RELAY-DISCOVERY
         }
     }
 
@@ -2667,6 +3706,8 @@ private:
     LaneTipFn    m_tip;
     LogFn        m_log;
     u64          m_nonce = 0;
+    std::set<std::string> m_self_keys;   // NODE-NONCE: our relay addresses (set in start())
+    std::map<std::string, u64> m_addr_nonce;   // NODE-NONCE: relay address -> node nonce (under m_pmtx)
     RelayStats   m_st;
 
     ::c2pool::v37n::CarrierPeerNode m_net;
@@ -2702,8 +3743,12 @@ private:
     mutable std::mutex m_dsmtx;
     std::map<u64, std::map<bytes32, std::vector<u8>>> m_drop_store;        // bin -> id -> raw (servable)
     std::unordered_map<bytes32, u64, Bytes32Hash> m_drop_store_id;          // id -> bin
+    std::unordered_map<bytes32, bytes32, Bytes32Hash> m_drop_pow;           // ★ DROPS-HARDEN: id -> verified RandomX hash
+    bool m_drop_dirty = false;                                               // ★ DROPS-HARDEN: store changed since the last snapshot
+    Clock::time_point m_drop_persisted_at{};
     std::map<InvKey, PeerInv> m_drop_inv;
     std::unordered_map<bytes32, Clock::time_point, Bytes32Hash> m_drop_want; // fetched ids in flight (solicited)
+    std::unordered_map<bytes32, std::pair<Clock::time_point, u32>, Bytes32Hash> m_pin_asked;   // ★ DROPS-SET-PIN: id -> (last ask, asks)
     std::atomic<bool> m_drop_had_peer{false};
 
     mutable std::mutex m_pmtx;         // peers
@@ -2712,7 +3757,7 @@ private:
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
     Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
-    u64 m_ping_nonce = 0;                           // RELAY-LIVENESS (maintenance thread only)
+    std::atomic<u64> m_ping_nonce{0};               // RELAY-LIVENESS (bumped by maintenance only; read by the won re-offer)
 
     std::mutex m_tmtx;                 // dial targets + deferred drops
     std::vector<Target> m_targets;
@@ -2737,6 +3782,11 @@ private:
     static constexpr std::size_t kWonServeMax = 1024;
     std::map<bytes32, std::vector<u8>> m_won_by_bid;   // ★ DROPS-RESTART: carried frames servable by bid (DROPS only)
     std::deque<bytes32> m_won_serve_order;
+    // RELAY-SEND-QUEUE (guarded by m_bmtx): per-link paged won re-offer, and the
+    // bids each remote NODE (HELLO node_nonce) provably holds.
+    struct WonOffer { std::deque<bytes32> todo; std::vector<std::pair<u64, bytes32>> unconfirmed; };
+    std::map<PeerId, WonOffer> m_won_offer;
+    std::map<u64, std::set<bytes32>> m_won_held;
     std::set<bytes32> m_won_wanted;                    // ★ DROPS-RESTART: bids asked for with FB_GETWON
 
     mutable std::mutex m_dmtx;         // pos -> lane digest (the spine probe)
@@ -2744,9 +3794,22 @@ private:
     std::multimap<u64, bytes32> m_alt_digest;   // REPAIR-HORIZON: the shadows' digests (note_alt_digests)
 
     ::c2pool::v37n::FrameVault m_vault;
+    mutable DurableLaneOrder m_dorder;   // REPAIR-CHAIN (F2-S); declared after m_vault, destroyed before it
+    mutable std::mutex m_walker_mtx;
+    std::map<PeerId, Clock::time_point> m_deep_walkers;   // REPAIR-CHAIN: peers walking below our horizon
+    static inline thread_local PeerId t_serving_peer = 0;
+    static inline thread_local int t_verify_worker = -1;   // DROPS-VERIFY-SCALE
+
+    // RELAY-DISCOVERY
+    PeerBook m_book;                   // own lock
+    std::atomic<std::thread::id> m_maint_tid{};   // the dialing thread (set once by maint_loop)
+    std::string m_dial_host;           // the address being dialed (maintenance thread only)
+    u16 m_dial_port = 0;
+    Clock::time_point m_disc_tick{}, m_disc_slow = Clock::now(), m_disc_saved = Clock::now();   // maintenance thread only
 
     std::atomic<bool> m_running{false};
-    std::thread m_verify_thread, m_maint_thread;
+    std::vector<std::thread> m_verify_threads;   // DROPS-VERIFY-SCALE: verify_threads workers
+    std::thread m_maint_thread;
 };
 
 } // namespace c2pool::v37n::xmr::relay
