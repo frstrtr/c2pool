@@ -33,7 +33,11 @@ on:
       - '.github/workflows/btc-embedded-standalone-smoke.yml'
 
 concurrency:
-  group: btc-standalone-smoke-${{ github.workflow }}-${{ github.ref }}
+  # See coin-matrix.yml: github.workflow is the CALLER name when reused, so
+  # scope the reused-path group to the run instance to stop a rerun of a
+  # superseded CI Required run from cancelling the live leg; direct triggers
+  # keep a stable per-ref group.
+  group: btc-standalone-smoke-${{ github.ref }}-${{ github.workflow == 'BTC embedded-standalone daemonless smoke' && 'direct' || github.run_id }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:

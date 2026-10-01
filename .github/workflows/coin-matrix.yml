@@ -24,7 +24,16 @@ on:
 # oversubscription root cause, not just queue depth). Per-ref group so
 # distinct PRs/branches never cancel each other.
 concurrency:
-  group: coin-matrix-${{ github.workflow }}-${{ github.ref }}
+  # github.workflow resolves to the CALLER name ("CI Required") when this
+  # workflow is reused, so as a leg it is a constant that cannot discriminate
+  # run instances: a re-run of a SUPERSEDED CI Required run then shares this
+  # group with the live run and cancels its coin matrix (a red CI Required
+  # unrelated to the diff). Scope the reused-path group to the run instance
+  # (github.run_id) so a rerun never collides with the live run; new-push
+  # superseding is handled by the parent ci-required-<ref> group. Direct
+  # triggers keep a stable per-ref group so back-to-back runs still auto-cancel
+  # and protect the shared self-hosted pool.
+  group: coin-matrix-${{ github.ref }}-${{ github.workflow == 'Coin matrix' && 'direct' || github.run_id }}
   cancel-in-progress: true
 
 
