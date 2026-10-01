@@ -67,6 +67,13 @@ struct FoundBlock {
     settle::DropsCompose                  drops{};
     bool                                  has_carried_drops = false;
     Amounts                               carried_drops{};
+    // ANCHOR: the block's own on-chain credit cut (the ledger's next anchor at
+    // FINALIZE, anchor_cut rule). Absent for a debit-only / cutless block.
+    std::optional<settle::AnchorCut>      cut{};
+    // DROPS DUE (OwedLedgerRules::drops_due): the booking's claim (canonical
+    // bookings only; the credit above already folds it). Under the rule the
+    // composed delta is booked as this block's DEPOSIT, never its credit.
+    std::optional<settle::DropsFound>     due{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -190,8 +197,22 @@ public:
     void on_block_found(const FoundBlock& b) {
         // DROPS T3: the composed credit. Gate OFF (default) => byte for byte
         // b.credit (compose_credit_* return the base map when the delta is empty).
+        // DROPS DUE rule: the delta is the deposit, the credit is b.credit as booked.
+        const bool due_rule = m_ledger.rules().drops_due;
+        std::optional<settle::DropsFound> df;
+        if (due_rule) {
+            settle::DropsFound d = b.due ? *b.due : settle::DropsFound{};
+            // DROPS WINDOW (A4b): the work is window weight (b.due->window, booked by
+            // the shell's composition), never a deposit: the delta is not priced once.
+            if (m_ledger.rules().drops_window.on()) d.deposit.clear();
+            else d.deposit = b.has_carried_drops ? b.carried_drops
+                                                 : settle::subthreshold_credit(b.params, b.harvested, b.drops);
+            for (auto it = d.deposit.begin(); it != d.deposit.end();) it = it->second == 0 ? d.deposit.erase(it) : std::next(it);
+            if (!d.empty()) df = std::move(d);
+        }
         const Amounts credit =
-            b.has_carried_drops
+            due_rule ? b.credit
+            : b.has_carried_drops
                 ? settle::compose_credit_from_delta(b.credit, b.carried_drops)
                 : settle::compose_credit_replace(b.params, b.credit, b.harvested,
                                                  b.drops);
@@ -202,10 +223,12 @@ public:
             if (it->second.canonical || m_ledger.is_settled(b.bid) || m_ledger.is_pending(b.bid)) return;
             SettleEvent ev;
             ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = credit; ev.payout = b.payout;
+            set_cut(ev, b.cut);
+            set_drops(ev, df);
             write_event(ev);
-            m_ledger.on_block_found(b.bid, credit, b.payout);
+            m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr);
             ledger_event();   // R5
-            it->second.credit = b.credit; it->second.payout = b.payout; it->second.canonical = true;
+            it->second.credit = b.credit; it->second.payout = b.payout; it->second.cut = b.cut; it->second.canonical = true;
             return;   // m_by_height already lists it
         }
         SettleEvent ev;
@@ -213,8 +236,10 @@ public:
         ev.bid = b.bid;
         ev.credit = credit;
         ev.payout = b.payout;
+        set_cut(ev, b.cut);
+        set_drops(ev, df);
         write_event(ev);
-        m_ledger.on_block_found(b.bid, credit, b.payout);
+        m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
         ledger_event();   // R5

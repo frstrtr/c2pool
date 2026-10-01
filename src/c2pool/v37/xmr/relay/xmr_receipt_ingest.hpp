@@ -31,10 +31,11 @@
 // kReceiptWeight, flags 0} -- the record shape the credit-feed stand-in wrote,
 // so for a given order the lane is byte-identical to the stand-in's (master).
 // FeeModelGate ON (Options::fee_model, ruling S3): each receipt is pushed at
-// fee::kFeeReceiptWeight split by the give-author u16 it CARRIES in its
-// PoW-committed side_data_v2 -- (payee, 65535 - d) then (donation, d) iff
-// d > 0 (fee::receipt_lane_pushes) -- so one receipt spans 1 or 2 lane
-// positions, recorded as (pos_first, n_pushes) for the vault / repair.
+// fee::kFeeReceiptWeight as ONE push (A2, fee::receipt_lane_pushes): the payee
+// (d == 0), the donation (d == 65535) or the composite (d, payee, donation)
+// whose weight settle::project() splits by the give-author u16 the receipt
+// CARRIES in its PoW-committed side_data_v2 -- so one receipt spans exactly
+// one lane position, recorded as (pos_first, n_pushes = 1) for the vault / repair.
 //
 // DURABILITY: every pushed receipt is appended to <data-dir>/lane<chain>.receipts
 // as [u32 LE len][fb_receipt]. At boot the file is replayed IN ITS OWN ORDER
@@ -89,6 +90,7 @@
 
 #include "xmr_relay_node.hpp"
 #include "../xmr_fee_model.hpp"     // receipt_lane_pushes (fee model S3)
+#include "xmr_order_rule.hpp"        // OrderHighWater (handoff gap 4)
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -120,10 +122,16 @@ public:
         std::string durable_path;         // "" = no durable log
         bool        fee_model = false;    // LaneParams::fee ON: split by the receipt's give_author u16
         u8          network = 0;          // HELLO network byte == fee::DonationNet: the donation payee (DON-NET)
+        // THE CANONICAL ORDER'S LATE TAIL (xmr_order_rule.hpp, gap 4): 0 = off
+        // (the legacy order). Else a receipt the lane's high-water key would not
+        // admit (a late one more than this many bins behind it) is dropped, never
+        // pushed: the same predicate a repair receiver applies to the winner's order.
+        u64         late_tail_bins = 0;
     };
     struct Stats {
         u64 pushed = 0, push_failed = 0, late = 0, bins_closed = 0, reloaded = 0, reload_torn = 0, durable_writes = 0;
         u64 lane_pushes = 0;   // lane records written (== pushed with the fee model OFF)
+        u64 late_dropped = 0;  // late receipts beyond the late tail (never pushed; late_tail_bins > 0 only)
     };
     // Engine push, done by the daemon (it owns the engine + the replay log).
     // Returns false if the record was not applied; fills the lane tip after it.
@@ -133,7 +141,7 @@ public:
     using AfterFn = std::function<void(const Admitted&, u64 pos_first, u32 n_pushes, u64 next_after, const bytes32& digest_after)>;
 
     XmrReceiptIngest(Options o, PushFn push, AfterFn after)
-        : m_o(std::move(o)), m_push(std::move(push)), m_after(std::move(after)) {}
+        : m_o(std::move(o)), m_push(std::move(push)), m_after(std::move(after)), m_hw(m_o.late_tail_bins) {}
 
     // ── SMOKE-NOISE: the compared, order-free lane-set digest (see header) ──
     struct LaneSet { u64 through = 0; u64 n = 0; u64 unbinned = 0; bytes32 digest{}; };
@@ -201,8 +209,8 @@ public:
     }
 
     void on_admitted(Admitted a) {
-        if (m_o.order == Order::Arrival) { push_one(a, true); return; }
-        if (m_any_closed && a.bin <= m_closed_through) { ++m_st.late; push_one(a, true); return; }
+        if (m_o.order == Order::Arrival) { if (tail_admits(a)) push_one(a, true); return; }
+        if (m_any_closed && a.bin <= m_closed_through) { ++m_st.late; if (tail_admits(a)) push_one(a, true); return; }
         m_bins[a.bin].emplace(a.id, std::move(a));
     }
 
@@ -233,6 +241,12 @@ public:
     const Options& options() const { return m_o; }
 
 private:
+    // gap 4: the builder side of the canonical-order rule (late_tail_bins > 0).
+    bool tail_admits(const Admitted& a) {
+        if (!m_o.late_tail_bins || !a.bin || m_hw.admits(a.bin, a.id)) return true;
+        ++m_st.late_dropped;
+        return false;
+    }
     bool push_one(const Admitted& a, bool durable) {
         u64 next_after = 0; bytes32 dig{};
         const auto pushes = ::c2pool::v37n::xmr::fee::receipt_lane_pushes(a.r.payee, a.r.side.give_author,
@@ -255,6 +269,9 @@ private:
             ++m_st.durable_writes;
         }
         set_note(a);
+        if (a.bin) m_hw.note(a.bin, a.id);
+        else if (m_o.late_tail_bins && m_bin_of)   // a durable-log reload: its bin from its prev_id, when known
+            if (const auto b = m_bin_of(a.r); b && *b) m_hw.note(*b, a.id);
         if (m_after) m_after(a, next_after - n, n, next_after, dig);
         return true;
     }
@@ -302,6 +319,7 @@ private:
     AfterFn m_after;
     Stats   m_st;
     BinOfFn m_bin_of;
+    OrderHighWater m_hw{kLateTailBins};   // gap 4: the lane's high-water (bin, id) key
     std::map<u64, SetAcc> m_set_bins;                     // origin bin -> order-free accumulator
     SetAcc  m_set_old;                                    // bins folded out of m_set_bins
     std::vector<std::pair<bytes32, FbReceipt>> m_unbinned;   // reloaded, bin not resolved yet

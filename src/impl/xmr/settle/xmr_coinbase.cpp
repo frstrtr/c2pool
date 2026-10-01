@@ -53,7 +53,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <limits>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace v37 {
 namespace xmr {
@@ -149,8 +154,63 @@ std::vector<std::uint64_t> paynow_split(std::uint64_t pool,
 }
 
 // ---------------------------------------------------------------------------
+// Blockchain::get_dynamic_base_fee(block_reward, median) with the median at
+// the floor, in Monero's own arithmetic: lo = reward * ref_weight / median /
+// median (128-bit), lo -= lo / 20, at least 1.
+std::uint64_t fee_per_byte_at_floor(std::uint64_t reward) {
+    unsigned __int128 v = static_cast<unsigned __int128>(reward) * kFeeReferenceTxWeight;
+    v /= kFeeMedianFloor;
+    v /= kFeeMedianFloor;
+    std::uint64_t lo = static_cast<std::uint64_t>(v);
+    lo -= lo / 20;
+    return lo == 0 ? 1 : lo;
+}
+
+std::uint64_t spend_floor(std::uint64_t total) {
+    // Blockchain::check_fee: needed_fee = tx_weight * fee_per_byte, quantized up.
+    const unsigned __int128 need = static_cast<unsigned __int128>(kInputWeight) * fee_per_byte_at_floor(total);
+    const unsigned __int128 q = (need + kFeeQuantizationMask - 1) / kFeeQuantizationMask * kFeeQuantizationMask;
+    return q > std::numeric_limits<std::uint64_t>::max() ? std::numeric_limits<std::uint64_t>::max()
+                                                          : static_cast<std::uint64_t>(q);
+}
+
+// ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err) {
+    return allocate_exact_sum(in, err, nullptr);
+}
+
+namespace {
+// `amount` over `w` pro rata, uncapped, exact-sum: floor shares, then the
+// leftover one piconero each by largest remainder (ties: entry order).
+std::vector<std::uint64_t> prorata(std::uint64_t amount, const std::vector<std::uint64_t>& w) {
+    std::vector<std::uint64_t> out(w.size(), 0);
+    unsigned __int128 sum = 0;
+    for (const std::uint64_t x : w) sum += x;
+    if (amount == 0 || sum == 0) return out;
+    std::vector<unsigned __int128> rem(w.size(), 0);
+    std::uint64_t given = 0;
+    for (std::size_t i = 0; i < w.size(); ++i) {
+        const unsigned __int128 num = static_cast<unsigned __int128>(amount) * w[i];
+        out[i] = static_cast<std::uint64_t>(num / sum);
+        rem[i] = num % sum;
+        given += out[i];
+    }
+    std::uint64_t left = amount - given;
+    std::vector<std::size_t> order(w.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) { return rem[x] > rem[y]; });
+    for (std::size_t j = 0; j < order.size() && left > 0; ++j) {
+        if (rem[order[j]] == 0) break;
+        ++out[order[j]]; --left;
+    }
+    return out;
+}
+}  // namespace
+
+std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildError* err,
+                                               std::map<::v37::bytes32, long long>* credit_delta) {
+    if (credit_delta) credit_delta->clear();
     auto fail = [&](BuildError e) -> std::vector<CoinbaseOutput> {
         if (err) *err = e;
         return {};
@@ -205,6 +265,8 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
     // position like any payee, but takes no output slot: its payout is moved
     // into the folded output after S2 (one output per fold identity).
     std::size_t n_slots = 0;
+    const std::uint64_t floor_c = in.spend_floor ? spend_floor(budget) : 0;
+    const std::uint64_t h_min = std::max(in.h_min, floor_c);   // SPEND-COST FLOOR: no owed payout below c
     for (const auto& e : sorted) {
         const bool merge = fold && is_fold_payee(in, e.pay, e.identity);
         if (!merge && n_slots >= cap_owed) {  // cap reached -> rest carries
@@ -212,11 +274,11 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
             break;
         }
         if (remaining == 0) break;           // budget exhausted -> rest carries
-        if (e.owed < in.h_min) continue;     // below payout floor -> carry, no output
+        if (e.owed < h_min) continue;        // below payout floor -> carry, no output
         std::uint64_t amt = std::min(e.owed, remaining);
         // Final partial below the payout floor: don't emit a sub-h_min owed
         // output; stop and let the residual sink absorb `remaining`.
-        if (amt < in.h_min) break;
+        if (amt < h_min) break;
         CoinbaseOutput o;
         o.pay = e.pay;
         o.identity = e.identity;
@@ -226,6 +288,46 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         if (!merge) ++n_slots;
         remaining -= amt;
     }
+
+    // ---- DUST DEBT WHEN THERE IS ROOM (audit A8, spend floor only). Pays the
+    // balances the owed pass skipped (in.owed_dust, canonical order) out of
+    // `pool`, one free slot each unless the payee already has an output here
+    // (`has_slot`); an existing Owed output of the payee takes the amount. The
+    // amounts paid per identity are returned so the pay-now DEBT step never
+    // pays the same balance twice.
+    std::map<::v37::bytes32, std::uint64_t> dust_paid;
+    auto pay_dust = [&](std::uint64_t& pool, std::size_t& free_slots,
+                        const std::function<bool(const OwedEntry&)>& has_slot) {
+        for (const OwedEntry& e : in.owed_dust) {
+            if (pool == 0) break;
+            if (e.owed == 0) continue;
+            if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink) continue;
+            if (fold && is_fold_payee(in, e.pay, e.identity)) continue;
+            CoinbaseOutput* existing = nullptr;
+            for (auto& o : res)
+                if (o.role == CoinbaseOutput::Role::Owed && o.identity == e.identity && o.pay == e.pay) { existing = &o; break; }
+            const bool reserved = !existing && has_slot(e);
+            if (!existing && !reserved) {
+                if (free_slots == 0) continue;
+                --free_slots;
+            }
+            const std::uint64_t amt = std::min(e.owed, pool);
+            if (existing) {
+                existing->amount += amt;
+            } else {
+                CoinbaseOutput o;
+                o.pay = e.pay;
+                o.identity = e.identity;
+                o.amount = amt;
+                o.role = CoinbaseOutput::Role::Owed;
+                res.push_back(std::move(o));
+                ++n_slots;   // a reserved (pay-now admitted) payee's slot, or a free one
+            }
+            dust_paid[e.identity] += amt;
+            pool -= amt;
+            remaining -= amt;
+        }
+    };
 
     // ---- SAME-BLOCK PAY-NOW (operator ruling 09-25): what the oldest-first
     // owed pass left above the folded donation minimum pays the payees whose
@@ -245,7 +347,103 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
             std::vector<std::uint64_t> eb;
             eb.reserve(ents.size());
             for (const auto& e : ents) eb.push_back(e.eb);
-            const std::vector<std::uint64_t> alloc = paynow_split(pool, eb);
+            std::vector<std::uint64_t> alloc;
+            if (in.spend_floor) {
+                // SPEND-COST FLOOR (payout-threshold.md §3). Who is paid now when
+                // not everyone fits: payouts worth spending (E_b >= c) before dust,
+                // and within each, OLDEST FIRST, the K_fair rule. A payee with a
+                // waiting balance goes by its first_eligible (ascending); a payee
+                // with none is the youngest; equal ages go by the salted tie, then
+                // identity. Beyond the c line the size of E_b never decides. A payee needs a new slot
+                // unless it is the residual sink or already has an owed output to
+                // merge into.
+                auto needs_slot = [&](const PayNowEntry& e) {
+                    if (e.identity == in.residual_sink_identity && e.pay == in.residual_sink) return false;
+                    for (const auto& o : res)
+                        if (o.role == CoinbaseOutput::Role::Owed && o.identity == e.identity && o.pay == e.pay) return false;
+                    return true;
+                };
+                std::vector<std::size_t> order;
+                for (std::size_t i = 0; i < ents.size(); ++i)
+                    if (ents[i].eb > 0) order.push_back(i);
+                std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                    const bool ga = ents[a].eb >= floor_c, gb = ents[b].eb >= floor_c;
+                    if (ga != gb) return ga;   // a slot goes to a payout worth spending (>= c) before dust
+                    const std::uint64_t aa = ents[a].age ? ents[a].age : std::numeric_limits<std::uint64_t>::max();
+                    const std::uint64_t ab = ents[b].age ? ents[b].age : std::numeric_limits<std::uint64_t>::max();
+                    if (aa != ab) return aa < ab;
+                    return ents[a].tie < ents[b].tie;
+                });
+                // Admission: every payee that has a slot, in that order. Payments are
+                // divisible, so filling the slots in order and splitting the pool pro
+                // rata uses every slot and every piconero: no packing problem. Every
+                // admitted payee gets the same fraction of its E_b (all of it unless
+                // the owed pass left less; the rest stays its balance). A payee
+                // without a slot is skipped.
+                std::vector<std::uint64_t> take(ents.size(), 0);
+                std::size_t free_slots = cap_owed > n_slots ? cap_owed - n_slots : 0;
+                for (const std::size_t i : order) {
+                    if (needs_slot(ents[i])) {
+                        if (free_slots == 0) continue;
+                        --free_slots;
+                    }
+                    take[i] = ents[i].eb;
+                }
+                // Dust debt in the slots the admission left free (A8), paid
+                // before the pool is split: debt before this block's pay-now,
+                // as the owed pass is. An admitted payee needs no second slot.
+                std::uint64_t pool_left = pool;
+                pay_dust(pool_left, free_slots, [&](const OwedEntry& d) {
+                    for (std::size_t i = 0; i < ents.size(); ++i)
+                        if (take[i] > 0 && ents[i].identity == d.identity && ents[i].pay == d.pay) return true;
+                    return false;
+                });
+                // Each admitted payee gets its E_b (pro rata when the pool is short).
+                // Cash left over came from the payees without a slot. It goes, in
+                // this order, never as an advance:
+                //   (1) DEBT: the admitted payees' positive balances the owed pass
+                //       left unpaid (owed_left), in admission order. The waiting
+                //       payees keep their credit: the ledger grows by their E_b and
+                //       shrinks by the debt paid, the same amount. Their balance
+                //       then grows until it is paid, or decays if abandoned.
+                //   (2) REDISTRIBUTION of what is still left, up to what the waiting
+                //       payees were credited: to the admitted payees pro rata, and
+                //       taken off the waiting payees' credit (credit_delta).
+                //   (3) The rest (uncredited cash) stays in the residual.
+                alloc = paynow_split(pool_left, take);
+                std::uint64_t given = 0;
+                for (const std::uint64_t a : alloc) given += a;
+                std::uint64_t spare = pool_left - given;
+                for (const std::size_t i : order) {
+                    if (spare == 0) break;
+                    if (take[i] == 0 || ents[i].owed_left == 0) continue;
+                    if (ents[i].identity == in.residual_sink_identity && ents[i].pay == in.residual_sink) continue;
+                    const auto dp = dust_paid.find(ents[i].identity);
+                    const std::uint64_t already = dp == dust_paid.end() ? 0 : dp->second;   // A8: never twice
+                    if (ents[i].owed_left <= already) continue;
+                    const std::uint64_t d = std::min(spare, ents[i].owed_left - already);
+                    alloc[i] += d;
+                    spare -= d;
+                }
+                std::vector<std::uint64_t> wait(ents.size(), 0);
+                unsigned __int128 wait_sum = 0;
+                for (std::size_t i = 0; i < ents.size(); ++i)
+                    if (take[i] == 0 && ents[i].eb > 0) { wait[i] = ents[i].eb; wait_sum += ents[i].eb; }
+                const std::uint64_t moved = static_cast<std::uint64_t>(static_cast<unsigned __int128>(spare) < wait_sum ? spare : wait_sum);
+                if (moved > 0) {
+                    const std::vector<std::uint64_t> plus = prorata(moved, take);
+                    const std::vector<std::uint64_t> minus = paynow_split(moved, wait);   // <= each E_b
+                    for (std::size_t i = 0; i < ents.size(); ++i) {
+                        alloc[i] += plus[i];
+                        if (credit_delta) {
+                            const long long d = static_cast<long long>(plus[i]) - static_cast<long long>(minus[i]);
+                            if (d != 0) (*credit_delta)[ents[i].identity] += d;
+                        }
+                    }
+                }
+            } else {
+                alloc = paynow_split(pool, eb);
+            }
             for (std::size_t i = 0; i < ents.size(); ++i) {
                 if (alloc[i] == 0) continue;
                 const PayNowEntry& e = ents[i];
@@ -271,11 +469,20 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
         }
     }
 
+    // No pay-now in this block (no view at the anchor yet): the dust debt still
+    // takes the slots and the cash the owed pass left (A8).
+    if (!in.paynow_at && in.spend_floor && !in.owed_dust.empty()) {
+        std::uint64_t pool = remaining > fold_min ? remaining - fold_min : 0;
+        std::size_t free_slots = cap_owed > n_slots ? cap_owed - n_slots : 0;
+        pay_dust(pool, free_slots, [](const OwedEntry&) { return false; });
+    }
+
     // ---- S2: the folded donation minimum, when the residual cannot cover it,
     // is deducted from the LARGEST owed output (ties: the earliest in K_fair
     // order); an output driven to 0 is dropped (its owed simply carries). The
     // deducted piconero stay OWED in the ledger (the on-chain booking pays the
-    // payee less), so nothing is lost -- exactly V36's dust rule.
+    // payee less), so nothing is lost -- exactly V36's dust rule. The fee
+    // model's marker is declared at 0 (2026-09-29), so there this is a no-op.
     std::uint64_t need = (fold && remaining < fold_min) ? fold_min - remaining : 0;
     while (need > 0 && !res.empty()) {
         std::size_t big = 0;
@@ -373,6 +580,45 @@ bool derive_tx_secret_key(const CoinbaseInputs& in, SecretKey& r_out) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// DERIVATION CACHE. Every node derives the same (r, payee, index) outputs
+// several times per lane block: the builder's template, the recompute's
+// builds (at the total, at the V37N base, per candidate output cap), the
+// booking decode and the minority re-derivation. r is one per block, so these
+// are the same scalar multiplications again (8*r*A ~120 us, the one-time key
+// ~46 us). Both are pure functions of their inputs, so a cache cannot change
+// a result; it is bounded (cleared when full) and locked, because stratum
+// threads also build coinbases.
+namespace {
+struct DerivationCache {
+    static constexpr std::size_t kMaxEntries = 1u << 16;
+    std::mutex mu;
+    std::unordered_map<std::string, KeyDerivation> kd;                    // r || A
+    std::unordered_map<std::string, std::pair<PublicKey, ViewTag>> outs;  // r || B || A || i
+};
+DerivationCache& derivation_cache() { static DerivationCache c; return c; }
+std::string cache_key(const SecretKey& r, const void* tail, std::size_t n, std::uint64_t i = ~std::uint64_t{0}) {
+    std::string k(reinterpret_cast<const char*>(r.data()), 32);
+    k.append(reinterpret_cast<const char*>(tail), n);
+    if (i != ~std::uint64_t{0}) k.append(reinterpret_cast<const char*>(&i), sizeof(i));
+    return k;
+}
+}  // namespace
+
+bool cached_key_derivation(const PublicKey& A, const SecretKey& r, KeyDerivation& D) {
+    DerivationCache& c = derivation_cache();
+    const std::string key = cache_key(r, A.data(), 32);
+    {
+        std::lock_guard<std::mutex> g(c.mu);
+        if (auto it = c.kd.find(key); it != c.kd.end()) { D = it->second; return true; }
+    }
+    if (!::xmr::coin::generate_key_derivation(A, r, D)) return false;
+    std::lock_guard<std::mutex> g(c.mu);
+    if (c.kd.size() >= DerivationCache::kMaxEntries) c.kd.clear();
+    c.kd.emplace(key, D);
+    return true;
+}
+
 bool derive_output(const SecretKey& r, const ::v37::ScriptRef& pay,
                    std::size_t vout_index, PublicKey& P_out, ViewTag& vt_out) {
     // -----------------------------------------------------------------------
@@ -386,10 +632,19 @@ bool derive_output(const SecretKey& r, const ::v37::ScriptRef& pay,
     std::memcpy(B.data(), pay.payload.data(), 32);
     std::memcpy(A.data(), pay.payload.data() + 32, 32);
 
+    DerivationCache& c = derivation_cache();
+    const std::string okey = cache_key(r, pay.payload.data(), 64, vout_index);
+    {
+        std::lock_guard<std::mutex> g(c.mu);
+        if (auto it = c.outs.find(okey); it != c.outs.end()) { P_out = it->second.first; vt_out = it->second.second; return true; }
+    }
     ::xmr::coin::KeyDerivation D;
-    if (!::xmr::coin::generate_key_derivation(A, r, D)) return false;   // D = 8*r*A
+    if (!cached_key_derivation(A, r, D)) return false;                 // D = 8*r*A
     if (!::xmr::coin::derive_public_key(D, vout_index, B, P_out)) return false; // P = H_s(D||i)G + B
     ::xmr::coin::derive_view_tag(D, vout_index, vt_out);               // vt = H("view_tag"||D||i)[0]
+    std::lock_guard<std::mutex> g(c.mu);
+    if (c.outs.size() >= DerivationCache::kMaxEntries) c.outs.clear();
+    c.outs.emplace(okey, std::make_pair(P_out, vt_out));
     return true;
 }
 

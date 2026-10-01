@@ -54,6 +54,8 @@
 #include <c2pool/v37/xmr/xmr_fee_model.hpp>
 #include <c2pool/v37/v37_engine.hpp>
 #include <c2pool/v37/w2_receipt.hpp>
+#include <c2pool/v37/w4_settlement.hpp>   // A2: settle::project splits the composite
+#include <c2pool/v37/xmr/relay/xmr_repair_replay.hpp>   // A2: shadow round trip with 132-byte refs
 
 using namespace gap2test;
 namespace asm_ = ::c2pool::xmr::assembly;
@@ -258,17 +260,63 @@ int main() {
         for (const auto& a : adm) { nodeA.ing->on_admitted(a); nodeB.ing->on_admitted(a); off.ing->on_admitted(a); }
         C(nodeA.digest() == nodeB.digest() && nodeA.log == nodeB.log,
           "G1 gate ON: nodes with DIFFERENT give-author % fold the same receipts to a BYTE-IDENTICAL lane (" + hex(nodeA.digest()).substr(0, 16) + ")");
-        u64 don = 0, tot = 0, want_don = 0;
-        for (const auto& [p, w] : nodeA.log) { tot += w; if (p == fee::donation_ref()) don += w; }
+        // A2: one push of 65535 per receipt; a d != 0 receipt pushes the composite
+        // (d, payee, donation), whose split gives the donation exactly d of 65535.
+        u64 don = 0, tot = 0, want_don = 0; bool all_ga = true;
+        for (const auto& [p, w] : nodeA.log) {
+            tot += w;
+            ::v37::xmr::XmrGiveAuthor g;
+            if (!::v37::xmr::decode_xmr_give_author(p, g) || !(g.donation == fee::donation_ref())) { all_ga = false; continue; }
+            don += ::v37::xmr::xmr_ga_split(::v37::U256::from_u128(w), g.d).donation.v[0];
+        }
         for (const auto& a : adm) want_don += a.r.side.give_author;
-        C(tot == adm.size() * fee::kFeeReceiptWeight && don == want_don,
-          "G2 each receipt = 65535 lane weight; the donation holds exactly Σ(receipt u16) = " + std::to_string(want_don));
-        C(nodeA.next() == 2 * adm.size() && nodeA.spans.size() == adm.size() && nodeA.spans[0] == std::make_pair<u64, u32>(0, 2) &&
-          nodeA.spans[1] == std::make_pair<u64, u32>(2, 2), "G3 a d != 0 receipt spans 2 positions, reported as (pos_first, n_pushes) for the vault");
+        C(all_ga && tot == adm.size() * fee::kFeeReceiptWeight && don == want_don,
+          "G2 each receipt = ONE push of 65535 lane weight; the composite split gives the donation exactly Σ(receipt u16) = " + std::to_string(want_don));
+        C(nodeA.next() == adm.size() && nodeA.log.size() == adm.size() && nodeA.spans.size() == adm.size() &&
+          nodeA.spans[0] == std::make_pair<u64, u32>(0, 1) && nodeA.spans[1] == std::make_pair<u64, u32>(1, 1),
+          "G3 a d != 0 receipt takes ONE position (A2), reported as (pos_first, 1) for the vault; next_pos == receipts");
+        {   // G7: settle::project() splits every composite and merges by key; weight is conserved
+            const auto snap = nodeA.eng->snapshot(7);
+            const auto wp = c2pool::v37n::settle::project(*snap);
+            ::v37::U256 in_sum, out_sum; for (const auto& [mid, w] : snap->payout) in_sum += w;
+            bool no_ga = true, has_don = false, has_a = false, has_b = false;
+            const auto don_key = fee::donation_identity(), ka = ::v37::xmr::xmr_identity_key(payA), kb = ::v37::xmr::xmr_identity_key(payB);
+            std::map<::v37::bytes32, int> seen; bool dup = false;
+            for (const auto& x : wp) {
+                out_sum += x.weight; no_ga = no_ga && x.pay.kind != ::v37::xmr::XMR_LANE_GA;
+                has_don |= x.key == don_key; has_a |= x.key == ka; has_b |= x.key == kb; dup |= ++seen[x.key] > 1;
+            }
+            C(no_ga && has_don && has_a && has_b && !dup && wp.size() == 3 && in_sum == out_sum,
+              "G7 project() splits the composites into payee A, payee B and the donation, merged by key, weight conserved (" + std::to_string(wp.size()) + " payees)");
+        }
         bool master_shape = off.log.size() == adm.size();
         for (std::size_t i = 0; master_shape && i < adm.size(); ++i) master_shape = off.log[i].first == adm[i].r.payee && off.log[i].second == 1;
         C(master_shape && off.next() == adm.size(), "G4 gate OFF: one push (payee, 1) per receipt, give-author ignored -- master's lane");
         C(off.digest() != nodeA.digest(), "G5 ON vs OFF fold different lanes (why S4 makes a mixed fleet refuse at HELLO)");
+        {   // G8: gate OFF never sees a composite -> project() takes the fast path (one entry per payee, no donation)
+            const auto snap = off.eng->snapshot(7);
+            const auto wp = c2pool::v37n::settle::project(*snap);
+            bool no_ga = true, no_don = true;
+            for (const auto& x : wp) { no_ga = no_ga && x.pay.kind != ::v37::xmr::XMR_LANE_GA; no_don = no_don && !(x.key == fee::donation_identity()); }
+            C(no_ga && no_don && wp.size() == 2, "G8 gate OFF: project() output has no composite and no donation (fast path, pre-A2 shape)");
+        }
+        {   // G9: a repair shadow holding 132-byte composite refs persists and reloads (loader limit 255, A2)
+            const u64 P = nodeA.log.size();
+            c2pool::v37n::xmr::relay::RepairReplayer rr(4);
+            const auto rv = rr.replay(7, ::v37::LaneParams{}, P, nodeA.digest(), 0, {}, nodeA.log);
+            const std::string sp = (std::filesystem::temp_directory_path() / ("v37_fee_rbind_kat_" + std::to_string(::getpid()) + ".shadow")).string();
+            std::filesystem::remove(sp);
+            bytes32 tag{}; tag[0] = 0xA2;
+            rr.enable_persist(sp, 7, tag);
+            const bool wrote = rv && rr.shadows() == 1 && rr.persist();
+            c2pool::v37n::xmr::relay::RepairReplayer back(4);
+            back.enable_persist(sp, 7, tag);
+            const std::size_t n = back.load();
+            C(wrote && n == 1 && back.persist_stats().load_bad == 0 && back.shadow_digests() == rr.shadow_digests(),
+              "G9 a repair shadow of " + std::to_string(P) + " composite (132-byte) pushes persists and reloads byte-identically" +
+              (back.persist_stats().last_error.empty() ? std::string() : " [" + back.persist_stats().last_error + "]"));
+            std::filesystem::remove(sp);
+        }
         // durable reload replays the split identically
         const std::string path = (std::filesystem::temp_directory_path() / ("v37_fee_rbind_kat_" + std::to_string(::getpid()) + ".receipts")).string();
         std::filesystem::remove(path);

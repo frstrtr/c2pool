@@ -269,7 +269,7 @@ struct Admitted {
     bytes32          id{};
     FbReceipt        r;
     std::vector<u8>  raw;     // its exact fb_receipt bytes (vault / durable log / GETFRAMES)
-    u64              bin = 0; // origin bin = height of the block the share was mined on
+    u64              bin = 0; // origin bin = the height of the block the share would become (the template / coinbase height; prev_id -> bin in the ChainView)
     bool             own = false;
     // ★ DROPS (gate ON only): a RAINDROP — RandomX work that met the drops
     // floor but NOT share_diff. Never pushed to the lane, never cached, never
@@ -436,6 +436,8 @@ struct RelayStats {
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
+    // SHARE-LEVEL CANONICAL COINBASE: receipts refused / parked / undecided at the verdict
+    std::atomic<u64> share_refused{0}, share_parked{0}, share_undecided_dropped{0}, share_undecided_trusted{0};
     std::atomic<u64> won_reoffer_skipped{0};   // RELAY-SEND-QUEUE: not re-offered, the peer node provably holds it
     std::atomic<u64> won_held_confirmed{0};    // RELAY-SEND-QUEUE: re-offered frames a later PONG proved read
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
@@ -1370,6 +1372,20 @@ public:
     std::size_t verify_parked_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_parked.size(); }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
     std::string last_unresolved() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_unresolved; }
+    std::string last_share_refused() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_share_refused; }
+
+    // SHARE-LEVEL CANONICAL COINBASE (P2Pool's share rule): a receipt earns lane
+    // credit only if its coinbase is the canonical lane coinbase
+    // (xmr_coinbase_recompute.hpp verify_share_coinbase). The daemon decides from
+    // finalized state (the ledger + the view at its anchor, keyed by the ledger
+    // state the receipt's 0x03 root commits). Called on a verify worker thread,
+    // after the structural check, before RandomX: 1 canonical, -1 not canonical
+    // (refused + strike), 0 not decidable here yet (parked like an unresolved
+    // context; past the patience an unsolicited receipt is dropped, a solicited
+    // one -- a repair of a winner's lane, Ruling A -- is admitted). Unset: no
+    // check (test rigs). Set before start().
+    using VerdictFn = std::function<int(const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 coinbase_height, std::string& why)>;
+    void set_share_verdict(VerdictFn f) { m_verdict = std::move(f); }
 
     // Test hook: disconnect one peer (the KAT's "B drops off the network").
     void drop_peer(PeerId p) { m_net.disconnect(p); }
@@ -2437,6 +2453,33 @@ private:
             strike(it.from, std::string("structural ") + to_string(cr.stage) + ": " + cr.why);
             return;
         }
+        // SHARE-LEVEL CANONICAL COINBASE: before RandomX (cheap, and a refused
+        // receipt never costs a hash). The coinbase height is ctx->height itself:
+        // the ChainView maps prev_id to the height of the block built ON it (the
+        // template's height, the chain feed's h + 1), which is the coinbase's
+        // height. (It was passed + 1, so every honest share rebuilt one block
+        // high, was refused as non-canonical and struck its sender;
+        // v37_xmr_relay_multinode_kat M2 pins the height.)
+        if (m_verdict) {
+            std::string vw;
+            const int v = m_verdict(it.r, pb, ctx->height, vw);
+            if (v < 0) {
+                m_st.share_refused++; forget_inflight(it.id);
+                { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
+                strike(it.from, "share coinbase not canonical: " + vw);
+                return;
+            }
+            if (v == 0) {
+                const u32 patience = it.solicited ? m_o.solicited_unresolved_patience_ms : m_o.unresolved_patience_ms;
+                if (now - it.enq < std::chrono::milliseconds(patience)) {
+                    m_st.share_parked++;
+                    park(std::move(it), std::chrono::milliseconds(1000));
+                    return;
+                }
+                if (!it.solicited) { m_st.share_undecided_dropped++; forget_inflight(it.id); return; }
+                m_st.share_undecided_trusted++;   // a repair answer: the winner's lane holds it (Ruling A)
+            }
+        }
         // RandomX token
         const auto p32 = static_cast<::c2pool::xmr::u32>(it.from);
         bool granted = false;
@@ -3359,11 +3402,20 @@ private:
     }
     // NODE-NONCE: a HELLO carrying OUR node nonce = this node talking to
     // itself. The link is closed by the caller; the dial target behind it is
-    // retired for good (every mode, discovery ON or OFF).
+    // retired for good (every mode, discovery ON or OFF). The target is found
+    // by its pid OR by the dialed address: the self HELLO can be refused
+    // before the dial loop has stored t.pid, and a pid-only match then missed
+    // the target, which was dialed again after its backoff.
     void on_self_hello(PeerId p, const Hello&) {
         m_st.self_conn++;
+        std::string oh; u16 op = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it != m_peers.end()) { oh = it->second.out_host; op = it->second.out_port; }
+        }
         std::lock_guard<std::mutex> lk(m_tmtx);
-        for (auto& t : m_targets) if (t.pid == p && !t.self) {
+        for (auto& t : m_targets) if (!t.self && (t.pid == p || (!oh.empty() && t.host == oh && t.port == op))) {
             t.self = true;
             if (t.learned) t.used = true;
             log("relay: dial target " + peer_key(t.host, t.port) + " is THIS node (HELLO node nonce equal) -> never dialed again");
@@ -3703,6 +3755,7 @@ private:
     RelayOptions m_o;
     ChainView&   m_chain;
     RxFn         m_rx;
+    VerdictFn    m_verdict;   // SHARE-LEVEL CANONICAL COINBASE
     LaneTipFn    m_tip;
     LogFn        m_log;
     u64          m_nonce = 0;
@@ -3729,6 +3782,7 @@ private:
     Clock::time_point m_solicited_at = Clock::now();
     std::string m_last_reject;
     std::string m_last_unresolved;
+    std::string m_last_share_refused;
 
     mutable std::mutex m_cmtx;         // receipt-context wants + serve requests
     std::map<bytes32, CtxWant> m_ctx_want;

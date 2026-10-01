@@ -231,6 +231,43 @@ inline u320 estimate_combined(std::uint64_t S, std::uint32_t K, const u256& h_K)
                     denom_hk_plus1(h_K));
 }
 
+// COUNT estimator (CreditMode::Count): every hash that met the drops floor is
+// worth the floor's own work, the work its TARGET expected (paper §5: the work
+// of a unit is a function of the target it was required to meet, never of the
+// value its hash reached). Shares met the floor too, so the interval's hashes
+// below the floor are S + J:
+//     Hhat_count = (S + J) * 2^256 / ((h_T + 1) << floor_shift)
+// A sum of per-hash terms, so it is exactly unbiased and exactly additive over
+// identities: splitting a miner changes neither the mean nor the variance of
+// what it is credited (docs/research/drops-split/). No K, no order statistic,
+// no branch on J. Its relative variance is 1/(S + J), the Poisson floor.
+//
+// Integer throughout, in the design's own unit: the work of ONE unit at the
+// floor target is att(floor) = floor(2^256 / (h_floor + 1)), the stdlib twin
+// of chain::target_to_average_attempts (uint288), and the credit is that
+// per-unit work times the number of units, as p2pool sums att per share. On
+// the XMR geometry (normalised hashes, lz = 32: h_T + 1 = 2^224, floor
+// 2^230) att(floor) = 2^26, exactly 1/64 of a share's 2^32.
+inline u320 mul_u64(const u320& a, std::uint64_t m) {
+    u320 r;
+    unsigned __int128 carry = 0;
+    for (std::size_t i = 0; i < r.w.size(); ++i) {
+        const unsigned __int128 cur = (unsigned __int128)a.w[i] * m + carry;
+        r.w[i] = (std::uint64_t)cur;
+        carry = cur >> 64;
+    }
+    return r;   // callers keep (S + J) * att < 2^320 (att <= 2^256, S + J < 2^64)
+}
+inline u320 att_of_floor(const u256& h_T, std::uint32_t floor_shift) {
+    u320 d = denom_hk_plus1(h_T);                 // h_T + 1 (the share target)
+    for (std::uint32_t i = 0; i < floor_shift; ++i) d.shl1();   // (h_T + 1) << shift
+    return divfloor(coeff_times_2_256(1), d);     // floor(2^256 / (h_floor + 1))
+}
+inline u320 estimate_count(std::uint64_t S, std::uint64_t J, const u256& h_T,
+                           std::uint32_t floor_shift) {
+    return mul_u64(att_of_floor(h_T, floor_shift), S + J);
+}
+
 // Censoring-corrected receipts-only form (submission threshold h_T, i.e. only
 // hashes with hash-value > h_T are visible):
 //   (K-1) / (1/D'_K - 1/T) = floor( (K-1) * 2^256 / (h_(K) + 1 - h_T) ).
@@ -278,6 +315,17 @@ inline u320 share_covered_work(std::uint64_t S, const u256& h_T) {
     return divfloor(coeff_times_2_256(S), d);
 }
 
+// The same share work in the design's per-unit form, S * att(T),
+// att(T) = floor(2^256 / (h_T + 1)) (target_to_average_attempts), which is what
+// Count removes, so both sides of its REPLACE delta are att sums. On the
+// leading-zero geometry (h_T + 1 = 2^(256-lz)) it equals share_covered_work()
+// bit for bit; off it the two part, and share_covered_work() stays as it is for
+// the K-min modes, whose minted goldens it feeds (an operator ruling to move).
+inline u320 share_covered_work_att(std::uint64_t S, const u256& h_T) {
+    if (S == 0 || h_T.is_zero()) return u320{};
+    return mul_u64(divfloor(coeff_times_2_256(1), denom_hk_plus1(h_T)), S);
+}
+
 // The module's deterministic low-63-bit fold of a bounded hash count into the
 // OwedLedger's i64 credit unit. Exposed because the REPLACE composition folds
 // BOTH sides (estimate and share work) and a caller re-deriving the rule from
@@ -319,7 +367,19 @@ public:
     // target_hash h_T: a hash <= h_T is a SHARE (accounted by shares); a hash in
     // (h_T, ...] is a below-target near-miss eligible to be retained.
     ReceiptCollector(std::uint32_t K, const u256& target_hash)
-        : m_K(K), m_hT(target_hash) {}
+        : m_K(K), m_hT(target_hash) {
+        // The exact floors (h_T + 1) * 2^s, s = 1..kMaxFloorShift, for Count.
+        // A floor that would pass 2^256 saturates: every hash is below it.
+        u320 f = denom_hk_plus1(target_hash);
+        for (std::uint32_t sh = 1; sh <= kMaxFloorShift; ++sh) {
+            f.shl1();
+            bool big = false;
+            for (int i = 256; i < 320; ++i) if (f.bit(i)) { big = true; break; }
+            m_floor_sat[sh] = big;
+            if (!big) for (int i = 0; i < 4; ++i) m_floor[sh].w[static_cast<std::size_t>(i)] = f.w[static_cast<std::size_t>(i)];
+        }
+    }
+    static constexpr std::uint32_t kMaxFloorShift = 16;
 
     // Present one hash. Shares (hash <= h_T) increment S; near-misses compete for
     // the K best (we keep the K SMALLEST near-miss hash values).
@@ -328,7 +388,10 @@ public:
             ++m_S;
             return;
         }
-        // near-miss: keep K smallest hashes (ascending).
+        // near-miss: count it below every exact floor (Count), keep the K
+        // smallest (K-min modes).
+        for (std::uint32_t sh = 1; sh <= kMaxFloorShift; ++sh)
+            if (m_floor_sat[sh] || hash < m_floor[sh]) ++m_J[sh];
         m_best.push_back(hash);
         std::size_t n = m_best.size();
         // insertion toward front while smaller
@@ -353,6 +416,13 @@ public:
 
     std::uint64_t shares() const { return m_S; }
     std::size_t near_miss_count() const { return m_best.size(); }
+    // J below the EXACT floor (h_T + 1) * 2^shift: every near-miss under it,
+    // not only the K kept (CreditMode::Count). The relay may admit a raindrop
+    // at an integer floor a hair above the exact one; such a hash is not
+    // counted, so each counted hash is worth exactly 2^-shift of a share.
+    std::uint64_t near_miss_below(std::uint32_t shift) const {
+        return (shift >= 1 && shift <= kMaxFloorShift) ? m_J[shift] : 0;
+    }
     bool has_K() const { return m_best.size() >= m_K; }
     // h_(K): the K-th smallest retained near-miss hash.
     const u256& h_K() const { return m_best[m_K - 1]; }
@@ -363,6 +433,9 @@ private:
     std::uint32_t m_K;
     u256 m_hT;
     std::uint64_t m_S = 0;
+    std::array<std::uint64_t, kMaxFloorShift + 1> m_J{};     // near-misses below floor s
+    std::array<u256, kMaxFloorShift + 1> m_floor{};           // (h_T + 1) << s
+    std::array<bool, kMaxFloorShift + 1> m_floor_sat{};       // floor >= 2^256
     std::vector<u256> m_best;  // K smallest near-miss hashes, ascending
 };
 
@@ -371,7 +444,8 @@ private:
 // --------------------------------------------------------------------------- //
 enum class CreditMode {
     EstimateOnly,  // credit the estimate ONLY where shares don't account (S==0)
-    Combined       // fuse shares+near-misses into one estimator (S+K-1)*D'_K
+    Combined,      // fuse shares+near-misses into one estimator (S+K-1)*D'_K
+    Count          // every hash below the drops floor at the floor's work, (S+J)*W_floor
 };
 
 struct SubthresholdParams {
@@ -387,6 +461,12 @@ struct SubthresholdParams {
     CreditMode mode = CreditMode::Combined;
     // J < K (fewer than K near-misses) => not estimable: no delta and the share
     // credit is kept (DROPS-JK). No fallback inflation, no share removal.
+    // (K-min modes only. Count has no K and no J < K rule.)
+    //
+    // Count only: the drops floor is the share target times 2^count_floor_shift
+    // (XMR: share_diff / 64 => 6). A lane that serves every miner its jobs at
+    // the floor sees every hash below it, which is what Count needs.
+    std::uint32_t count_floor_shift = 0;
 };
 
 // The dedup key for interval-straddle protection: estimate-dedup is per
@@ -457,9 +537,22 @@ inline IntervalWork interval_work(const SubthresholdParams& p, const DedupKey& k
                                   bool enrolled) {
     IntervalWork w;
     if (!p.enabled) return w;                     // ★ gate OFF: nothing enters
-    if (!k_guard_ok(p.K)) return w;               // K >= 3 guard
     if (already_seen.count(key)) return w;        // straddle dedup, per (payee,seq)
     if (!enrolled) return w;                      // ★ R-SYBIL: DROPS never applies
+    if (p.mode == CreditMode::Count) {
+        // No K, no J < K rule: every hash below the floor is one floor unit of
+        // work, shares included, and the REPLACE composition swaps S * T for it.
+        if (p.count_floor_shift == 0 || p.count_floor_shift > ReceiptCollector::kMaxFloorShift)
+            return w;                             // no (valid) floor declared: nothing
+        const std::uint64_t J = rc.near_miss_below(p.count_floor_shift);
+        if (rc.shares() == 0 && J == 0) return w;
+        already_seen[key] = true;
+        w.credited = true;
+        w.est = estimate_count(rc.shares(), J, rc.target_hash(), p.count_floor_shift);
+        w.covered = share_covered_work_att(rc.shares(), rc.target_hash());
+        return w;
+    }
+    if (!k_guard_ok(p.K)) return w;               // K >= 3 guard
     if (!rc.has_K()) return w;                    // ★ DROPS-JK: J < K => not
                                                   //   estimable: no delta, the
                                                   //   share credit is kept

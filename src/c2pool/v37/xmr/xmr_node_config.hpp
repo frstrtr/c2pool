@@ -34,6 +34,40 @@
 
 namespace c2pool::v37n::xmr {
 
+// DROPS on the XMR lane: the raindrop floor is share_diff / 2^6 (the job
+// difficulty the node serves every miner), and the lane credits every hash
+// below it at the floor's work (SubthresholdGate mode 2, Count). One constant
+// for both, so the floor the relay admits and the floor the estimator prices
+// cannot drift apart.
+inline constexpr std::uint32_t kXmrDropsFloorShift = 6;
+// DROPS WINDOW (A4b): log2 of one share's work in the estimator unit (== drops::kXmrDropsLz).
+inline constexpr unsigned kXmrDropsWorkLz = 32;
+inline constexpr std::uint32_t kXmrCreditModeCount = 2;
+
+// DUST DECAY, in MONERO HEIGHTS (audit A9). The decay clock is the FINALIZE
+// bin_height, a Monero height, so its constants are named as heights here and
+// no longer borrowed from the lane's window / half-life, which count lane
+// POSITIONS. Same values as before (no consensus change): a gone key's
+// balance below c waits 8640 blocks (12 days at 120 s) for its miner to come
+// back, then halves every 2160 blocks (3 days).
+inline constexpr std::uint64_t kXmrDustDecayHorizonHeights  = 8640;
+inline constexpr std::uint64_t kXmrDustDecayHalfLifeHeights = 2160;
+
+// The XMR lane's default parameters: node_lane_params_no_kind(), and, when the
+// build arms DROPS, the Count estimator in place of the K-min one. K-min spends
+// a fixed budget of K order statistics per identity and branches on J < K, so on
+// the XMR geometry it is biased for small miners and pays for splitting
+// (docs/research/drops-split/). Count is exact and split-neutral, and costs
+// nothing more here: every raindrop is already relayed and verified.
+inline ::v37::LaneParams xmr_lane_params_default() {
+    ::v37::LaneParams p = ::c2pool::v37n::node_lane_params_no_kind();
+    if (p.subthreshold.enabled) {
+        p.subthreshold.mode = kXmrCreditModeCount;
+        p.subthreshold.count_floor_shift = kXmrDropsFloorShift;
+    }
+    return p;
+}
+
 // The Monero network the daemon binds to. Stagenet is the shipped default —
 // a v37 XMR node is prototype-grade and must never default to real value.
 //
@@ -71,7 +105,7 @@ inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 //     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
 //     without a valid sink the daemon refuses to serve. Under --fee-model v1
 //     (LaneParams::fee) the ONE mandated fixed output is the protocol donation
-//     output (owed + 1 + residual) and the residual sink IS the donation address
+//     output (owed + residual, may be 0) and the residual sink IS the donation address
 //     (xmr_fee_model.hpp, compiled-in -- no per-node knob).
 enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
@@ -165,7 +199,8 @@ struct XmrNodeConfig {
     // (LaneParams{}) today, and, if the build takes the V37.1 activation, the
     // consensus version WITHOUT ridge dimensions. An XMR ridge row is a canon
     // edit (ND-R6) with non-derivable constants: an operator ruling, not a port.
-    ::v37::LaneParams lane_params = ::c2pool::v37n::node_lane_params_no_kind();
+    // DROPS armed: the Count estimator (xmr_lane_params_default above).
+    ::v37::LaneParams lane_params = xmr_lane_params_default();
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) Monero block must be buried on
@@ -274,21 +309,28 @@ struct XmrNodeConfig {
     bool            residual_sink_subaddress = false;
     // The v37 lane parameters (consensus once multi-node; explicit here).
     //
-    // STEP-0 k_floor hotfix — why the XMR floor is NOT moved into LaneParams
-    // (unlike Family A, where btc_node.hpp's coinbase_budget() now reads the
-    // digest-committed LaneParams::k_floor): the XMR lane settles under
-    // COINBASE AUTHORITY (xmr_coinbase_authority.hpp, RECON ruling "read from
-    // block"). Every node books the winner's ON-CHAIN coinbase — payout =
-    // CoinbaseBooking::payout decoded from the block — and never deducts a
-    // locally rebuilt coinbase, so a node running a different settle_h_min
-    // (or settle_output_cap) mines a different but VALID coinbase that every
-    // peer books identically; the K_fair recompute is a cross-check alarm only.
-    // A differing floor therefore cannot fork owed_digest here. The XMR lane
-    // keeps LaneParams::k_floor = 0 (Monero has no dust rule; the lane digest,
-    // the lane tag and the relay HELLO lane_params_digest stay byte-identical).
-    // If XMR ever settles by rebuild instead of by reading the block, this
-    // floor must move into LaneParams exactly as Family A's did.
+    // Consensus inputs of the recomputed coinbase (coinbase-recompute.md).
+    // Every node rebuilds every lane coinbase with its own settle_h_min and
+    // resolved output cap (xmr_coinbase_recompute.hpp LaneInputs), so a node
+    // running a different value calls an honest block non-canonical and books
+    // it debit-only: a ledger fork. They are therefore network constants:
+    // lane_knob_refusal() refuses a non-default value on mainnet. They stay
+    // out of LaneParams and the relay HELLO lane_params_digest (byte-identical
+    // to the running test rigs); moving them there is the gated follow-up.
+    // LaneParams::k_floor stays 0 on XMR (Monero has no dust rule).
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
+    // XMR ledger rules (w4 OwedLedgerRules; payout-threshold.md §6, §6a). The
+    // daemon sets them with the spend-cost floor (arm floor = spend_floor of
+    // the tail subsidy); off here so fixtures keep their golden digests.
+    long long       ledger_arm_floor = 0;
+    bool            ledger_rotate_on_payment = false;
+    std::uint64_t   ledger_decay_horizon = 0;      // dust decay (payout-threshold.md §5), Monero heights
+    std::uint64_t   ledger_decay_half_life = 0;    // ... and its half-life, Monero heights
+    bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
+    bool            ledger_drops_due = false;      // DROPS DUE (A5, ruling 09-30): the DROPS delta is a deposit into the committed due, claimed in pay-now
+    bool            ledger_raindrop_enrol = false; // RAINDROP ENROL (A3, ruling 09-30): the DROPS enrolment registry (V37G), refs are ledger state
+    std::uint64_t   ledger_drops_window_rw = 0;    // DROPS WINDOW (A4b, ruling 10-01): one receipt's lane weight; != 0 => DROPS work is window weight (V37W), never priced once
+    bool            ledger_merkle_rows = false;    // §13: owed_digest = a Merkle root over the balances (light-client proofs)
     std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
     // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
     // the assembled coinbase carries a real K_fair OWED payee alongside the sink
@@ -543,6 +585,56 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
                "nowhere to relay a found block "
                "(--native-solo is the deliberate exception: a private chain of our own, with no "
                "network to relay to)";
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// FEE MODEL v1 IS MANDATORY for the v37 settlement coinbase on MAINNET
+// (operator ruling 2026-09-29). Every node recomputes every lane coinbase
+// (xmr_coinbase_recompute.hpp). With the fee model OFF the exact-sum residual
+// is paid to a per-node --residual-sink-* wallet: no other node can map that
+// output (a builder's block is unmapped everywhere else), and the residual is
+// the building node's own income. Fee model v1 pays it to the compiled-in
+// protocol donation output, the same owner on every node. Test networks keep
+// the OFF mode for rigs that share one sink.
+// ---------------------------------------------------------------------------
+inline std::string settlement_fee_model_refusal(const XmrNodeConfig& c) {
+    if (c.coinbase != CoinbaseMode::V37Settlement || c.network != MoneroNetwork::Mainnet) return {};
+    if (c.lane_params.fee.enabled && c.lane_params.fee.version == 1) return {};
+    return "--coinbase v37 on mainnet needs --fee-model v1: every node recomputes every lane coinbase, and "
+           "with the fee model off the exact-sum residual goes to this node's own --residual-sink-* wallet, "
+           "which no other node can derive (fee model v1 pays it to the protocol donation output)";
+}
+
+// ---------------------------------------------------------------------------
+// LANE KNOBS ARE NETWORK CONSTANTS ON MAINNET (external review O-4/O-5, and
+// every node recomputing every lane coinbase). Each of these changes what a
+// node books from the same chain, so two nodes that differ disagree on every
+// lane block and fork owed_digest:
+//   --d-conf              the booking point (builder_cut) and fe bin heights
+//   --settle-h-min        the owed floor the recompute rebuilds with
+//   --settle-output-cap   the owed-selection cap the recompute rebuilds with
+//   --recon-max-root-age  which committed roots a node accepts
+//   --no-book-deferral    pre-R6 booking order (the lagging-receiver fork)
+// Test networks keep them for rigs; a rig must set them identically.
+// ---------------------------------------------------------------------------
+inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root_age_set, bool no_book_deferral) {
+    if (c.network != MoneroNetwork::Mainnet) return {};
+    const XmrNodeConfig d{};
+    if (c.d_conf != d.d_conf)
+        return "--d-conf is a network constant on mainnet (" + std::to_string(d.d_conf) +
+               "): it moves the booking point every node recomputes lane coinbases at";
+    if (c.settle_h_min != d.settle_h_min)
+        return "--settle-h-min is a network constant on mainnet (" + std::to_string(d.settle_h_min) +
+               "): every node rebuilds every lane coinbase with it";
+    if (c.settle_output_cap != d.settle_output_cap)
+        return "--settle-output-cap is a network constant on mainnet (weight-aware default): every node "
+               "rebuilds every lane coinbase with it";
+    if (recon_max_root_age_set)
+        return "--recon-max-root-age is refused on mainnet: it changes which committed roots a node books";
+    if (no_book_deferral)
+        return "--no-book-deferral is refused on mainnet: it restores the pre-R6 booking order "
+               "(the lagging-receiver fork)";
     return {};
 }
 
