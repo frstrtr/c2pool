@@ -1074,7 +1074,7 @@ if (BUILD_TESTING)
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1108,6 +1108,15 @@ if (BUILD_TESTING)
     #                               due and raindrop-enrol rules on; a control
     #                               that pays raindrops in every window block
     #                               trips it. ALSO on BOTH build.yml lists.
+    #   v37_xmr_drops_pin_enrol_kat THE MERGE SEAM (master #1857 x A3 / gap 4):
+    #                               the pinned raindrop set composer enrols a
+    #                               DROPS-only payee from the PINNED members only
+    #                               and reads the booking-point registry; a
+    #                               long-ref raindrop is an invalid member (set
+    #                               refused, never a HOLD); one composed-order
+    #                               rule for the replay and the DROPS prefix.
+    #                               RED on the plain merge. ALSO on BOTH
+    #                               build.yml --target lists.
     #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
     #                               relay repair of a lane longer than every
     #                               peer's vault horizon was Exhausted forever
@@ -1215,6 +1224,9 @@ if (BUILD_TESTING)
     target_compile_definitions(v37_xmr_drops_enrol_repl_kat PRIVATE
         V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
         V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
+    # the merge seam KAT reads the shell for its source pins (PE5)
+    target_compile_definitions(v37_xmr_drops_pin_enrol_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # DROPS-RESTART (flip-1 multinode robustness): v37_xmr_drops_restart_kat --
     # the prev_lane walk HOLDs (never decides) on an unreadable row / unreadable
     # bytes and takes a tagged block as a lane block even before this node's
