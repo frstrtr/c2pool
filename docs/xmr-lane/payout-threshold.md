@@ -137,8 +137,9 @@ into one transaction for pool members is a later stage (§7).
 ## 4. Published
 
 `c` is recomputed by every node from the block's total, so nothing is added
-to the 0x02 payload. Miners see the current `c` in the stratum login reply
-and on the HTTP status.
+to the 0x02 payload. Neither the stratum login reply nor the HTTP status
+shows it yet; the login reply carries the fee model and the two fee
+percentages (#1880). `c` follows from the block total (`spend_floor`).
 
 ## 5. Abandoned dust
 
