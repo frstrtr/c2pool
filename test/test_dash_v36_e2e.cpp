@@ -322,7 +322,7 @@ TEST(DashV36E2E, GenesisBootstrapsFromEitherNode)
     for (int minter : {0, 1}) {
         SCOPED_TRACE(minter == 0 ? "genesis minted by node A" : "genesis minted by node B");
         const auto f = fresh_iso();   // a fresh identity for each run
-        ASSERT_TRUE(SharechainConfig::isolated_v36());
+        ASSERT_TRUE(SharechainConfig::v36_network());
         ASSERT_EQ(f.p.current_share_version, 36u);
         const std::string sub = SharechainConfig::data_subdir(false);
         ASSERT_EQ(sub, "dash_" + f.ident.id + "_v36") << "identity- and version-scoped store";
@@ -641,7 +641,7 @@ TEST(DashV36E2E, SeedStoreForLoopbackRig)
     core::filesystem::set_data_dir(dir);
     SharechainConfig::is_testnet = true;
     SharechainConfig::set_network_id(netid, prefix);
-    ASSERT_TRUE(SharechainConfig::isolated_v36());
+    ASSERT_TRUE(SharechainConfig::v36_network());
     const auto p = dash::make_coin_params(true);   // production testnet params, no easy()
     ASSERT_EQ(p.current_share_version, 36u);
     const std::string sub = SharechainConfig::data_subdir(true);

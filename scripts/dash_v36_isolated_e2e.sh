@@ -169,7 +169,7 @@ run_once() {   # run_once SEEDER(A|B)
   }
   start_node "$SEED" 1
   local SL="$D/$SEED.log.1"
-  wait_for 60 "seed node profile banner" grep -q "private/isolated DASH sharechain profile: mints share v36" "$SL"
+  wait_for 60 "seed node profile banner" grep -q "DASH v36 network profile: mints share v36" "$SL"
   wait_for 90 "seed node reloads $COUNT shares" grep -q "Loaded $COUNT persisted DASH shares" "$SL"
   wait_for 30 "seed node seeds best from the persisted chain" grep -q "Seeded best share from persisted chain: ${TIP:0:16}" "$SL"
   wait_for 60 "seed node web" synced "${WEB[$SEED]}" "$TIP" "$COUNT"

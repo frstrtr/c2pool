@@ -910,7 +910,7 @@ public:
             // on the private/isolated v36 sharechain it is extended so the
             // operator sees WHY: the peer build cannot follow a v36 chain.
             std::string why = "peer protocol below min-protocol floor";
-            if (SharechainConfig::isolated_v36())
+            if (SharechainConfig::v36_network())
             {
                 why += ": peer build lacks v36 isolated support — upgrade (peer advertises protocol "
                      + std::to_string(msg->m_version) + " \""
