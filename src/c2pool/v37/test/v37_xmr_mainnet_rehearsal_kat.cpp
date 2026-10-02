@@ -1020,8 +1020,30 @@ void m5_gate_and_config() {
       CHECK(!lane_knob_refusal(k, false, false).empty(), "mainnet --settle-output-cap 16: refused (the recompute rebuilds with it)"); }
     CHECK(!lane_knob_refusal(c, true, false).empty(), "mainnet --recon-max-root-age: refused");
     CHECK(!lane_knob_refusal(c, false, true).empty(), "mainnet --no-book-deferral: refused");
-    { XmrNodeConfig k = s; k.d_conf = 4; k.settle_output_cap = 16;
-      CHECK(lane_knob_refusal(k, true, true).empty(), "test networks keep every knob for rigs"); }
+    // LANE-RULES (K6): the regtest rigs keep every knob (D_conf 3/4/10 included); stagenet and
+    // testnet keep the settlement knobs but not a D_conf below Monero's coinbase maturity.
+    { XmrNodeConfig k = s; k.network = c2pool::v37n::xmr::MoneroNetwork::Regtest; k.d_conf = 4; k.settle_output_cap = 16;
+      k.owed_demo_amount = 1; k.drain_q = 16;
+      CHECK(lane_knob_refusal(k, true, true).empty(), "regtest keeps every knob for rigs (d_conf 4, output cap, demo, drain_q)"); }
+    { XmrNodeConfig k = s; k.settle_output_cap = 16; k.owed_demo_amount = 1;
+      CHECK(lane_knob_refusal(k, true, true).empty(), "stagenet keeps the settlement knobs (the lane-rules HELLO/pool_tag name a mismatch)"); }
+    { XmrNodeConfig k = c; k.owed_demo_amount = 1;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet --owed-demo-amount 1: refused (seeds rows no other node has)"); }
+    { XmrNodeConfig k = c; k.drain_q = 16;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain_q 16: refused (the drain Q is a network constant)"); }
+    for (const auto net : {c2pool::v37n::xmr::MoneroNetwork::Mainnet, c2pool::v37n::xmr::MoneroNetwork::Stagenet,
+                           c2pool::v37n::xmr::MoneroNetwork::Testnet}) {
+        XmrNodeConfig k = s; k.network = net; k.d_conf = 59;
+        const std::string why = lane_knob_refusal(k, false, false);
+        CHECK(!why.empty() && why.find("coinbase maturity") != std::string::npos,
+              "K6 --d-conf 59 on %s: refused below the coinbase maturity (%s)", c2pool::v37n::xmr::to_string(net), why.substr(0, 48).c_str());
+        k.d_conf = 3;
+        CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 --d-conf 3 on %s: refused", c2pool::v37n::xmr::to_string(net));
+    }
+    { XmrNodeConfig k = s; k.network = c2pool::v37n::xmr::MoneroNetwork::Regtest; k.d_conf = 3;
+      CHECK(lane_knob_refusal(k, false, false).empty(), "K6 --d-conf 3 on regtest: accepted (the KAT rigs)"); }
+    { XmrNodeConfig k = s; k.d_conf = 61;
+      CHECK(lane_knob_refusal(k, false, false).empty(), "K6 --d-conf 61 on stagenet: accepted (above the floor; LANE-RULES names a mismatch)"); }
 }
 #else
 void suite_base() {

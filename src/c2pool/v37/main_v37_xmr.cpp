@@ -102,6 +102,7 @@
 #include "xmr/relay/xmr_share_verdict.hpp"    // share-level canonical coinbase (the relay verdict)
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
 #include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
+#include "xmr/xmr_lane_rules_build.hpp"      // LANE-RULES: the lane-rules list (HELLO + pool_tag)
 #include "xmr/xmr_web_dashboard.hpp"        // XMR-WEB: the c2pool web dashboard (--web-port; OFF by default)
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
@@ -290,8 +291,48 @@ static ::v37::bytes32 pool_genesis_of(const XmrNodeConfig& cfg) {
     return g_pool_genesis ? *g_pool_genesis
                           : c2pool::v37n::xmr::lineage::default_pool_genesis(lineage_network_byte(cfg.network));
 }
-static ::v37::bytes32 pool_tag_of(const XmrNodeConfig& cfg) {
-    return c2pool::v37n::xmr::lineage::pool_tag_for(cfg.lane_chain, cfg.lane_params, pool_genesis_of(cfg));
+// LANE-RULES: the tag folds the node's lane-rules digest (xmr_pool_tag.hpp).
+static ::v37::bytes32 pool_tag_of(const XmrNodeConfig& cfg, const ::v37::bytes32& rules_digest) {
+    return c2pool::v37n::xmr::lineage::pool_tag_for(cfg.lane_chain, cfg.lane_params, pool_genesis_of(cfg), rules_digest);
+}
+// ★ DROPS: the enrol mode / set --drops-enrol gives (none | ID... | nothing =
+// auto). One parse for the DROPS block and the LANE-RULES list; `bad`
+// collects entries that are neither a 64-hex identity nor a valid XMR address.
+static relay::EnrolMode drops_enrol_of(std::set<::v37::bytes32>& es, std::vector<std::string>* bad = nullptr) {
+    const bool enrol_none = std::find(g_drops_enrol.begin(), g_drops_enrol.end(), "none") != g_drops_enrol.end();
+    const auto emode = enrol_none ? relay::EnrolMode::None
+                     : g_drops_enrol.empty() ? relay::EnrolMode::Auto : relay::EnrolMode::List;
+    es.clear();
+    for (const auto& e : (enrol_none ? std::vector<std::string>{} : g_drops_enrol)) {
+        std::vector<std::uint8_t> raw;
+        if (e.size() == 64 && sub::from_hex(e, raw) && raw.size() == 32) { ::v37::bytes32 k{}; std::memcpy(k.data(), raw.data(), 32); es.insert(k); }
+        else if (const auto da = relay::decode_address(e); da && ::v37::xmr::xmr_ref_valid(da->ref()))
+            es.insert(::v37::xmr::xmr_identity_key(da->ref()));
+        else if (bad) bad->push_back(e);
+    }
+    return emode;
+}
+// LANE-RULES: the two HELLO digests this node will send -- lane_params_digest
+// (+ the enrol fold when DROPS is live) and the rule-tagged enrol digest --
+// computed from the configuration BEFORE the DROPS wiring exists, because the
+// lane-rules list (and so the pool_tag the template commits) needs them first.
+// The relay block recomputes them from the live wiring and refuses to start if
+// they differ, so the list can never describe another HELLO than the one sent.
+struct HelloDigests { ::v37::bytes32 lpd{}; std::optional<::v37::bytes32> enrol; };
+static HelloDigests hello_digests_of(const XmrNodeConfig& cfg) {
+    HelloDigests d;
+    const relay::BindMode bind = (g_relay_bind == "rbind") ? relay::BindMode::Rbind : relay::BindMode::None;
+    d.lpd = relay::lane_params_digest(cfg.lane_params, cfg.stratum_share_diff, bind, lineage_network_byte(cfg.network));
+    const std::uint64_t rw = c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params) ? c2pool::v37n::xmr::fee::kFeeReceiptWeight
+                                                                                  : relay::kReceiptWeight;
+    // drops_live == the wiring builds (make() != nullptr) AND the relay replicates raindrops
+    if (!relay_enabled() || !c2pool::v37n::xmr::drops::XmrDropsWiring::make(cfg.lane_params, cfg.stratum_share_diff, rw)) return d;
+    std::set<::v37::bytes32> es;
+    const auto emode = drops_enrol_of(es);
+    const std::uint32_t rule = relay::drops_rule_tag(cfg.ledger_drops_due, cfg.ledger_raindrop_enrol, cfg.ledger_drops_window_rw != 0);
+    d.lpd = c2pool::v37n::xmr::drops::hello_digest_with_enrol(d.lpd, emode, es, rule);
+    d.enrol = relay::enrol_rule_digest(c2pool::v37n::xmr::drops::enrol_mode_digest(emode, es), rule);
+    return d;
 }
 static bool split_hostport(const std::string& s, std::string& host, std::uint16_t& port) {
     const auto c = s.rfind(':');
@@ -4155,12 +4196,37 @@ static int run_live(const XmrNodeConfig& cfg) {
         // recon(A+B credit): the template commits THIS node's receipt-lane cut (P, spine) on-chain (0x02 tail)
         scfg.credit_cut_source = [&](std::uint64_t& P, ::v37::bytes32& dg) -> bool {
             auto s = node.engine().snapshot(cfg.lane_chain); if (!s) return false; P = s->next_pos; dg = s->digest; return true; };
-        // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
-        // and only blocks carrying it are booked as lane blocks here.
-        scfg.pool_tag = pool_tag_of(cfg);
         scfg.kfair_salted_ties = true;   // #1867: equal-age cohorts ordered by a hash of the parent id
         scfg.spend_floor = true;         // payout-threshold.md §2-§3: Monero's spend cost is the payout floor
         scfg.commit_total = true;        // share-level canonical coinbase: "V37R" total in every lane coinbase
+        // LANE-RULES (operator ruling R3): ONE list of every consensus-relevant lane rule
+        // outside LaneParams (xmr_lane_rules.hpp), built once from the final settlement
+        // config. The relay HELLO carries it (a peer with other rules is refused BY NAME,
+        // LANE_RULES_MISMATCH) and its digest is folded into the pool_tag below (a node
+        // with other rules sees our lane blocks as ordinary blocks: never debit-only).
+        std::optional<lanerules::LaneRules> lane_rules;
+        {
+            const HelloDigests hd = hello_digests_of(cfg);
+            lanerules::LaneRulesInputs li;
+            li.book_deferral      = !g_no_book_deferral;
+            li.recon_max_root_age = g_recon_max_root_age;
+            li.kfair_salted_ties  = scfg.kfair_salted_ties;
+            li.spend_floor        = scfg.spend_floor;
+            li.commit_total       = scfg.commit_total;
+            li.output_cap_ceiling = scfg.output_cap_ceiling;
+            li.residual_sink_id   = scfg.residual_sink_identity;
+            li.lane_params_digest = hd.lpd;
+            li.enrol_digest       = hd.enrol ? *hd.enrol : ::v37::bytes32{};
+            lane_rules = lanerules::lane_rules_of(cfg, li);
+        }
+        const ::v37::bytes32 lane_rules_digest = lanerules::rules_digest(*lane_rules);
+        // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
+        // and only blocks carrying it are booked as lane blocks here.
+        scfg.pool_tag = pool_tag_of(cfg, lane_rules_digest);
+        std::printf("lane-rules: digest=%s (%zu fields, TLV %zu B) %s\n", hex_of(lane_rules_digest).c_str(),
+                    lanerules::kFieldCount, lanerules::encode_tlv(*lane_rules).size(), lanerules::to_text(*lane_rules).c_str());
+        std::printf("lane-rules: -> pool_tag=%s (a peer with another list is refused at HELLO as %s; its lane blocks "
+                    "are ordinary blocks here)\n", hex_of(*scfg.pool_tag).c_str(), lanerules::kLaneRulesMismatch);
         std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
                     hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
                     hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
@@ -4506,8 +4572,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                     std::printf("REFUSED: --drops-enrol none cannot be combined with an enrol list\n");
                     node.stop(); return 2;
                 }
-                const auto emode = enrol_none ? relay::EnrolMode::None
-                                 : g_drops_enrol.empty() ? relay::EnrolMode::Auto : relay::EnrolMode::List;
+                std::set<::v37::bytes32> es;
+                std::vector<std::string> enrol_bad;
+                const auto emode = drops_enrol_of(es, &enrol_bad);   // LANE-RULES: the same parse the list's digests used
                 drops->set_enrol_mode(emode);
                 // RAINDROP ENROL (A3, ruling 09-30): a payee enrols at its first raindrop
                 // (bin + 1) as well as at its first lane share; the record and its ref
@@ -4515,15 +4582,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                 drops->set_raindrop_enrol(cfg.ledger_raindrop_enrol);
                 drops->set_drops_rule(c2pool::v37n::xmr::relay::drops_rule_tag(cfg.ledger_drops_due, cfg.ledger_raindrop_enrol,
                                                                                cfg.ledger_drops_window_rw != 0));   // + DROPS WINDOW (A4b)
-                std::set<::v37::bytes32> es;
-                for (const auto& e : (enrol_none ? std::vector<std::string>{} : g_drops_enrol)) {
-                    std::vector<std::uint8_t> raw;
-                    if (e.size() == 64 && sub::from_hex(e, raw) && raw.size() == 32) { ::v37::bytes32 k{}; std::memcpy(k.data(), raw.data(), 32); es.insert(k); }
-                    else if (const auto da = relay::decode_address(e); da && ::v37::xmr::xmr_ref_valid(da->ref()))
-                        es.insert(::v37::xmr::xmr_identity_key(da->ref()));
-                    else
-                        std::printf("DROPS: --drops-enrol %s is neither a 64-hex identity nor a valid XMR address -- NOT in the enrol set\n", e.c_str());
-                }
+                for (const auto& e : enrol_bad)
+                    std::printf("DROPS: --drops-enrol %s is neither a 64-hex identity nor a valid XMR address -- NOT in the enrol set\n", e.c_str());
                 std::printf("DROPS: enrol mode = %s, enrol set = %zu identit%s (HELLO enrol digest %s…): %s\n",
                             relay::to_string(emode), es.size(), es.size() == 1 ? "y" : "ies",
                             hex_of(c2pool::v37n::xmr::drops::enrol_mode_digest(emode, es)).substr(0, 12).c_str(),
@@ -4602,6 +4662,21 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_mode_digest(drops->enrol_mode(), drops->enrol_set());
             if (ro.enrol_set_digest)   // A3 + A5 FLAG DAY: the DROPS rule tag, named at HELLO (rule 0: unchanged)
                 ro.enrol_set_digest = c2pool::v37n::xmr::relay::enrol_rule_digest(*ro.enrol_set_digest, drops->drops_rule());
+            {   // LANE-RULES: the list (and the pool_tag) were built from the HELLO digests this node
+                // would send; the live DROPS wiring must have produced exactly those (fail-closed).
+                const ::v37::bytes32 ed = ro.enrol_set_digest ? *ro.enrol_set_digest : ::v37::bytes32{};
+                if (!lane_rules || lane_rules->lane_params_digest != ro.lane_params_digest || lane_rules->enrol_digest != ed) {
+                    std::printf("REFUSED: internal: the lane-rules list disagrees with the relay HELLO digests "
+                                "(lane_params_digest %s vs %s, enrol %s vs %s)\n",
+                                lane_rules ? hex_of(lane_rules->lane_params_digest).substr(0, 16).c_str() : "-",
+                                hex_of(ro.lane_params_digest).substr(0, 16).c_str(),
+                                lane_rules ? hex_of(lane_rules->enrol_digest).substr(0, 16).c_str() : "-",
+                                hex_of(ed).substr(0, 16).c_str());
+                    node.stop();
+                    return 2;
+                }
+                ro.lane_rules = lane_rules;
+            }
             ro.listen = !g_relay_listen.empty();
             if (ro.listen && !split_hostport(g_relay_listen, ro.listen_host, ro.listen_port)) {
                 std::printf("REFUSED: --relay-listen wants HOST:PORT, got \"%s\"\n", g_relay_listen.c_str());
@@ -6259,7 +6334,7 @@ int main(int argc, char** argv) {
                 "  --relay-listen HOST:PORT     bind the receipt relay\n"
                 "  --pool-genesis <hex64>       POOL-LINEAGE: this pool's 32-byte genesis id (default: the fixed per-network\n"
                 "                               id = the ONE default pool); every node of a pool runs the same id, a new pool\n"
-                "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT'||lane_tag||id)\n"
+                "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT2'||lane_tag||id||rules)\n"
                 "                               is committed in every lane coinbase; blocks without OUR tag are ordinary blocks\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
                 "  --no-relay-bootstrap         do not also dial the built-in bootstrap relay peers (mainnet:\n"

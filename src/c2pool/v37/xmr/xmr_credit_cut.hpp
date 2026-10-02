@@ -92,7 +92,7 @@ inline std::optional<CreditCut> parse_from_tx_extra(const std::vector<unsigned c
 // ---------------------------------------------------------------------------
 // POOL-LINEAGE (operator ruling 2026-09-25): the V37C tail's versioned pool-tag
 // field. Every lane block a pool builds commits its pool_tag
-// (xmr_pool_tag.hpp: sha256d('V37PT' || lane_tag || pool_genesis_id)) as
+// (xmr_pool_tag.hpp: sha256d('V37PT2' || lane_tag || pool_genesis_id || rules_digest)) as
 //
 //     "V37P" | u8 version (= 1) | b32 pool_tag                        (37 B)
 //

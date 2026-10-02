@@ -87,6 +87,7 @@
 #include <sharechain/v37/v37_descriptor_xmr.hpp>   // ScriptRef, XMR_STD/XMR_SUB, xmr_identity_key
 #include <sharechain/v37/v37_lane.hpp>             // ::v37::LaneParams (read-only, for the HELLO digest)
 #include <c2pool/v37/xmr/xmr_enrol_mode.hpp>       // DROPS-AUTO-ENROL: EnrolMode, enrol_mode_tag
+#include <c2pool/v37/xmr/xmr_lane_rules.hpp>       // LANE-RULES: the lane-rules TLV list HELLO carries
 
 #include "impl/xmr/receipt/xmr_receipt.hpp"        // ::v37::xmr::MoneroReceipt
 #include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
@@ -151,6 +152,15 @@ inline constexpr std::size_t kHelloBytesPoolGenesis = kHelloBytesPoolId + kHello
 // (so the 174-byte frame keeps its meaning); never at flip 0.
 inline constexpr std::size_t kHelloEnrolSetBytes    = 32;
 inline constexpr std::size_t kHelloBytesEnrolSet    = kHelloBytesPoolGenesis + kHelloEnrolSetBytes;  // 206
+// LANE-RULES (operator ruling R3, 2026-10-02): a HELLO with a pool genesis may
+// carry the node's lane-rules list (xmr_lane_rules.hpp) after the 174-byte
+// frame:  u8 enrol_flag (0 | 1) | enrol-set digest 32 iff flag 1 |
+//         u16 rules_len | rules TLV (rules_len bytes)
+// The enrol slot moves behind an explicit flag so the frame is unambiguous;
+// a rules frame is ALWAYS longer than 206 B (the v1 list alone is 278 B), so
+// the four legacy lengths keep their meaning and decode with rules = none.
+inline constexpr std::size_t kHelloRulesMinBytes    = kHelloBytesPoolGenesis + 1 + 2;   // 177 + the TLV
+inline constexpr std::size_t kHelloRulesMaxTlv      = 4096;
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
 // ENROL-REPL: FB_BLOCK_WON v0x02 (flip-only) = the 127-byte v0x01 body + the
 // winner's composed DROPS delta: u16 n | n x (payee 32 | i64 delta) | enrollment_digest 32.
@@ -376,7 +386,7 @@ inline bool decode_receipts_frame(const std::vector<u8>& f, ReceiptsFrame& out, 
 //
 // POOL-LINEAGE (operator ruling 2026-09-25): the pool's 32-byte genesis id
 // rides right after it (u8[32], HELLO 174 B). The block-level pool_tag every
-// lane coinbase commits is sha256d('V37PT' || lane_tag || genesis)
+// lane coinbase commits is sha256d('V37PT2' || lane_tag || genesis || rules_digest)
 // (xmr_pool_tag.hpp), so two nodes with the same lane_tag but a different
 // genesis build DIFFERENT pools: refused as TAG_MISMATCH field=pool_genesis.
 struct PoolId {
@@ -466,6 +476,8 @@ struct Hello {
     BindMode bind = BindMode::None;
     std::optional<PoolId> pool;       // POOL-ID extension (none = a 102-byte HELLO)
     std::optional<bytes32> enrol_set; // ★ DROPS-ENROL-TIDY: enrol_set_digest (flip 1, needs pool->genesis; none = <= 174 B)
+    // LANE-RULES: the node's lane-rules list (needs pool->genesis; none = a legacy-length HELLO)
+    std::optional<::c2pool::v37n::xmr::lanerules::LaneRules> rules;
     bool operator==(const Hello&) const = default;
 };
 
@@ -477,15 +489,26 @@ inline std::vector<u8> encode_hello(const Hello& h) {
     le::put64(f, h.lane_next_pos); le::putb(f, h.lane_digest); f.push_back(static_cast<u8>(h.bind));
     if (h.pool) { le::putb(f, h.pool->lane_tag); le::put32(f, h.pool->version); le::put32(f, h.pool->authority); }
     if (h.pool && h.pool->genesis) le::putb(f, *h.pool->genesis);   // POOL-LINEAGE
-    if (kHelloEnrolSetLive && h.pool && h.pool->genesis && h.enrol_set) le::putb(f, *h.enrol_set);   // ★ DROPS-ENROL-TIDY (flip 1)
+    const bool enrol = kHelloEnrolSetLive && h.pool && h.pool->genesis && h.enrol_set;
+    if (h.pool && h.pool->genesis && h.rules) {   // LANE-RULES: flag | enrol? | u16 len | TLV
+        const auto t = ::c2pool::v37n::xmr::lanerules::encode_tlv(*h.rules);
+        if (t.size() > kHelloRulesMaxTlv) return {};
+        f.push_back(enrol ? 1 : 0);
+        if (enrol) le::putb(f, *h.enrol_set);
+        le::put16(f, static_cast<u16>(t.size()));
+        f.insert(f.end(), t.begin(), t.end());
+        return f;
+    }
+    if (enrol) le::putb(f, *h.enrol_set);   // ★ DROPS-ENROL-TIDY (flip 1)
     return f;
 }
 
 inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kHelloBytes && f.size() != kHelloBytesPoolId && f.size() != kHelloBytesPoolGenesis &&
-        !(kHelloEnrolSetLive && f.size() == kHelloBytesEnrolSet))   // flip 0: exactly master's three frames
-        return bad("hello: wrong length");
+    const bool legacy_len = f.size() == kHelloBytes || f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis ||
+                            (kHelloEnrolSetLive && f.size() == kHelloBytesEnrolSet);   // flip 0: exactly master's three frames
+    const bool rules_len = f.size() > kHelloBytesEnrolSet;                               // LANE-RULES (always > 206 B)
+    if (!legacy_len && !rules_len) return bad("hello: wrong length");
     if (f[0] != FB_HELLO) return bad("hello: wrong opcode");
     if (f[1] != kFbVersion) return bad("hello: unknown version");
     if (le::get32(f.data() + 2) != kFbMagic) return bad("hello: bad magic (not a c2pool XMR relay)");
@@ -502,6 +525,35 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
     h.bind = static_cast<BindMode>(p[0]); p += 1;
     h.pool.reset();
     h.enrol_set.reset();
+    h.rules.reset();
+    if (rules_len) {   // LANE-RULES: the 174-byte frame | flag | enrol? | u16 len | TLV
+        PoolId id;
+        id.lane_tag = le::getb(p); p += 32;
+        id.version = le::get32(p); p += 4;
+        id.authority = le::get32(p); p += 4;
+        id.genesis = le::getb(p); p += 32;
+        const u8 flag = p[0]; p += 1;
+        if (flag > 1 || (flag == 1 && !kHelloEnrolSetLive)) return bad("hello: rules frame with an unknown enrol flag");
+        std::size_t rest = f.size() - kHelloBytesPoolGenesis - 1;
+        if (flag == 1) {
+            if (rest < 32 + 2) return bad("hello: rules length mismatch");
+            h.enrol_set = le::getb(p); p += 32; rest -= 32;
+        }
+        if (rest < 2) return bad("hello: rules length mismatch");
+        const std::size_t n = le::get16(p); p += 2; rest -= 2;
+        if (n != rest || n > kHelloRulesMaxTlv) return bad("hello: rules length mismatch");
+        ::c2pool::v37n::xmr::lanerules::LaneRules r;
+        std::string rw;
+        if (!::c2pool::v37n::xmr::lanerules::decode_tlv(p, n, r, &rw)) {
+            if (why) *why = "hello: " + rw;
+            return false;
+        }
+        if (r.lane_params_digest != h.lane_params_digest)
+            return bad("hello: rules lane_params_digest differs from the HELLO's own (an inconsistent peer)");
+        h.pool = id;
+        h.rules = std::move(r);
+        return true;
+    }
     if (f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis || f.size() == kHelloBytesEnrolSet) {
         PoolId id;
         id.lane_tag = le::getb(p); p += 32;
@@ -561,9 +613,20 @@ inline std::string enrol_mode_label(const std::optional<bytes32>& d) {
     if (*d == enrol_mode_tag(EnrolMode::None)) return "none (--drops-enrol none)";
     return "list (--drops-enrol ID...)";
 }
+// LANE-RULES (operator ruling R3): every consensus-relevant lane rule outside
+// LaneParams rides HELLO as a list; a difference is refused BY NAME, both values
+// (LANE_RULES_MISMATCH field=d_conf ours=60 theirs=61 (+N more: ...)), right
+// after the pool id and before the LaneParams digest. A list that differs only
+// in the two HELLO digests it repeats (fields 27/28) is left to the specific
+// share_diff / bind / LaneParams / enrol / DROPS texts below; if those pass and
+// the lists still differ (an inconsistent peer), the rules refusal names it.
+using ::c2pool::v37n::xmr::lanerules::kLaneRulesMismatch;
+using ::c2pool::v37n::xmr::lanerules::is_lane_rules_mismatch;
 inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
     if (auto t = pool_id_mismatch(ours, theirs); !t.empty()) return t;   // POOL-ID (subsumes chain_id when tagged)
+    if (auto t = ::c2pool::v37n::xmr::lanerules::lane_rules_mismatch(ours.rules, theirs.rules, true); !t.empty())
+        return t;                                                         // LANE-RULES
     if (theirs.chain_id != ours.chain_id) return "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id);
     if (theirs.share_diff != ours.share_diff)
         return "share_diff " + std::to_string(theirs.share_diff) + " != ours " + std::to_string(ours.share_diff) + " (R-1 pin)";
@@ -586,6 +649,8 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
                    " (every node of a pool must run the identical --drops-enrol list / mode)";
         return "lane_params_digest differs (different LaneParams geometry/gates: DROPS subthreshold / fee model / share weight)";
     }
+    if (auto t = ::c2pool::v37n::xmr::lanerules::lane_rules_mismatch(ours.rules, theirs.rules); !t.empty())
+        return t;                                                         // LANE-RULES: fields 27/28 alone
     if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";
     return "";
 }

@@ -291,6 +291,10 @@ struct RelayOptions {
     // ★ DROPS-ENROL-TIDY (flip 1 only): the --drops-enrol set digest, sent in
     // HELLO (with a pool genesis) so a mismatch is refused by name. nullopt at flip 0.
     std::optional<bytes32> enrol_set_digest;
+    // LANE-RULES (operator ruling R3): this node's lane-rules list, sent in HELLO
+    // (with a pool genesis) and compared field by field with every peer's; the
+    // same list's digest is folded into the on-chain pool_tag. nullopt = none.
+    std::optional<::c2pool::v37n::xmr::lanerules::LaneRules> lane_rules;
     bool        listen = false;                   // false = dial-only
     std::string listen_host = "127.0.0.1";
     u16         listen_port = 0;                  // 0 = an ephemeral port (tests), read back via listen_port()
@@ -417,6 +421,7 @@ struct RelayOptions {
 struct RelayStats {
     std::atomic<u64> hello_sent{0}, hello_ok{0}, hello_rejected{0}, hello_timeout{0}, pre_hello_dropped{0};
     std::atomic<u64> hello_tag_mismatch{0};       // POOL-ID: HELLOs refused as TAG_MISMATCH (also in hello_rejected)
+    std::atomic<u64> hello_rules_mismatch{0};     // LANE-RULES: HELLOs refused as LANE_RULES_MISMATCH (also in hello_rejected)
     std::atomic<u64> fa_ignored{0}, fb_unknown{0}, malformed{0}, wrong_chain{0};
     std::atomic<u64> rx_receipts{0}, dup{0}, queue_dropped{0}, unresolved_dropped{0}, expired{0};
     std::atomic<u64> structural{0}, rx_deferred{0}, rx_evals{0}, rx_valid{0}, rx_invalid{0}, rx_unavailable{0}, bans{0};
@@ -1088,6 +1093,7 @@ public:
         h.network = m_o.network; h.chain_id = m_o.chain; h.lane_params_digest = m_o.lane_params_digest;
         h.share_diff = m_o.share_diff; h.node_nonce = m_nonce; h.listen_port = m_net.listen_port();
         h.bind = m_o.bind; h.pool = m_o.pool_id; h.enrol_set = m_o.enrol_set_digest;
+        h.rules = m_o.lane_rules;   // LANE-RULES
         if (m_tip) { const auto t = m_tip(); h.lane_next_pos = t.first; h.lane_digest = t.second; }
         return h;
     }
@@ -1321,7 +1327,7 @@ public:
             "won tx=%llu rx=%llu | repair start=%llu order_ok=%llu spine_mis=%llu peer_fail=%llu ids=%llu ready=%llu rejected=%llu open=%zu | "
             "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu | "
             "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
-            "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu | "
+            "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu rules_mismatch=%llu | "
             "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
             "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu | "
             "order serve=%llu ids=%llu throttled=%llu | order ask=%llu ok=%llu timeouts=%llu late=%llu | "
@@ -1349,7 +1355,7 @@ public:
             (unsigned long long)s.ctx_served.load(), (unsigned long long)s.ctx_unknown_tx.load(),
             (unsigned long long)s.repair_refetch.load(), (unsigned long long)s.repair_evicted.load(),
             (unsigned long long)s.upgraded_solicited.load(), (unsigned long long)s.unresolved_solicited_dropped.load(),
-            (unsigned long long)s.hello_tag_mismatch.load(),
+            (unsigned long long)s.hello_tag_mismatch.load(), (unsigned long long)s.hello_rules_mismatch.load(),
             (unsigned long long)s.repair_horizon_rearm.load(), (unsigned long long)s.repair_prefix_ok.load(),
             (unsigned long long)s.repair_prefix_unknown.load(), (unsigned long long)s.repair_deep.load(),
             (unsigned long long)s.reoffer_unpushed.load(),
@@ -1882,6 +1888,7 @@ private:
         if (!mis.empty()) {
             m_st.hello_rejected++;
             if (is_tag_mismatch(mis)) m_st.hello_tag_mismatch++;   // POOL-ID: another pool's node
+            if (is_lane_rules_mismatch(mis)) m_st.hello_rules_mismatch++;   // LANE-RULES: other lane rules = another pool
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
                 m_last_reject = "hello: " + mis;

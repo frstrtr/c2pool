@@ -58,6 +58,7 @@
 #include <c2pool/v37/xmr/relay/xmr_relay_node.hpp>
 #include <c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp>
 #include <c2pool/v37/v37_engine.hpp>
+#include <c2pool/v37/xmr/xmr_lane_rules.hpp>
 
 using namespace gap2test;
 using namespace std::chrono_literals;
@@ -71,6 +72,8 @@ struct Cfg {
     ::v37::LaneParams lp{};
     u32 version = ::v37::SHIPPED_CONSENSUS_VERSION;
     bool tagged = true;
+    // P8 LANE-RULES: the node's lane-rules list (needs a pool genesis on the wire)
+    std::optional<c2pool::v37n::xmr::lanerules::LaneRules> rules;
 };
 
 static RelayOptions opts(const Cfg& c, bool listen, std::vector<u16> dial) {
@@ -80,6 +83,11 @@ static RelayOptions opts(const Cfg& c, bool listen, std::vector<u16> dial) {
 #ifdef C2POOL_XMR_RELAY_POOL_ID
     if (c.tagged) o.pool_id = pool_id_of(c.chain, c.lp, c.version);
 #endif
+    if (c.rules) {   // P8 LANE-RULES
+        if (o.pool_id) o.pool_id->genesis = b32_of(0x6e);
+        o.lane_rules = c.rules;
+        o.lane_rules->lane_params_digest = o.lane_params_digest;   // the list repeats the HELLO's own digest
+    }
     o.listen = listen; o.listen_host = "127.0.0.1"; o.listen_port = 0;
     for (u16 p : dial) o.peers.emplace_back("127.0.0.1", p);
     o.hello_timeout_ms = 3000;
@@ -467,6 +475,64 @@ int main() {
         Cfg now_c; now_c.version = ours_v;
         Cfg pre_c;   // version = SHIPPED_CONSENSUS_VERSION: the RC4 5db1f675 HELLO
         mismatch_case(C, "P7", now_c, pre_c, "version");
+    }
+
+    // ── P8 LANE-RULES (operator ruling R3): other lane rules = another pool ──
+    {
+        std::printf("-- P8 LANE-RULES: A d_conf 60 vs B d_conf 61 (same chain, geometry, genesis, version)\n");
+        c2pool::v37n::xmr::lanerules::LaneRules r60;
+        r60.d_conf = 60; r60.output_cap = 2700; r60.recon_max_root_age = 240; r60.book_deferral = 1; r60.coinbase_maturity = 60;
+        auto r61 = r60; r61.d_conf = 61;
+        Cfg ca = same; ca.rules = r60;
+        Cfg cb = same; cb.rules = r61;
+        TNode A("A", ca, true, {});
+        C(A.start(), "P8 A starts (d_conf 60)");
+        TNode B("B", cb, true, {A.relay->listen_port()});
+        C(B.start(), "P8 B starts (d_conf 61), dials A");
+        std::vector<TNode*> all{&A, &B};
+        for (auto* n : all) { for (int i = 0; i < 4; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
+        const SynthBlock bA = make_block(100, prev[0], 1, nullptr, 3, 10);
+        const SynthBlock bB = make_block(100, prev[0], 2, nullptr, 3, 11);
+        for (std::uint32_t k = 0; k < 4; ++k) A.relay->submit_own(own(bA, 10 + k, pA, kChain));
+        for (std::uint32_t k = 0; k < 3; ++k) B.relay->submit_own(own(bB, 20 + k, pB, kChain));
+        const std::string la = "LANE_RULES_MISMATCH field=d_conf ours=60 theirs=61", lb = "LANE_RULES_MISMATCH field=d_conf ours=61 theirs=60";
+        const bool seen = wait_for([&] { return A.count_logs("HELLO REFUSED", la) >= 1 && B.count_logs("HELLO REFUSED", lb) >= 1; }, all, 10000ms);
+        std::this_thread::sleep_for(1500ms);   // B keeps redialing meanwhile
+        for (auto* n : all) n->pump();
+        std::printf("    last reject at A: %s\n", A.relay->last_reject().c_str());
+        C(seen, "P8 both nodes log HELLO REFUSED: LANE_RULES_MISMATCH field=d_conf with both values (each its own side)");
+        const u64 ra = A.relay->stats().hello_rules_mismatch.load(), rb = B.relay->stats().hello_rules_mismatch.load();
+        C(ra >= 1 && rb >= 1 && A.relay->describe().find("rules_mismatch=") != std::string::npos,
+          "P8 the hello_rules_mismatch counter moved on both (A=" + std::to_string(ra) + " B=" + std::to_string(rb) + ") and is on the status line");
+        C(A.relay->stats().hello_ok.load() == 0 && B.relay->stats().hello_ok.load() == 0 && A.relay->ready_peers().empty() &&
+          B.relay->ready_peers().empty(), "P8 no HELLO ever completed: 0 ready peers on both");
+        C(A.relay->stats().admitted_foreign.load() == 0 && B.relay->stats().admitted_foreign.load() == 0 &&
+          A.relay->cache_size() == 4 && B.relay->cache_size() == 3, "P8 no receipt crossed (each cache holds only its own)");
+        B.relay->set_dialing(false);
+    }
+    {
+        std::printf("-- P8b LANE-RULES: equal lists interoperate, byte-identical lane (== the P5 tagged digest)\n");
+        c2pool::v37n::xmr::lanerules::LaneRules r60;
+        r60.d_conf = 60; r60.output_cap = 2700; r60.recon_max_root_age = 240; r60.book_deferral = 1; r60.coinbase_maturity = 60;
+        Cfg ca = same; ca.rules = r60;
+        TNode A("A", ca, true, {});
+        C(A.start(), "P8b A starts");
+        TNode B("B", ca, true, {A.relay->listen_port()});
+        C(B.start(), "P8b B starts (the same list)");
+        std::vector<TNode*> all{&A, &B};
+        C(wait_for([&] { return A.relay->ready_peers().size() == 1 && B.relay->ready_peers().size() == 1; }, all), "P8b A<->B HELLO ok");
+        const auto rh = A.relay->remote_hello(A.relay->ready_peers().front());
+        C(rh && rh->rules && rh->rules->d_conf == 60, "P8b the peer's HELLO carried its lane-rules list");
+        for (auto* n : all) { for (int i = 0; i < 4; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
+        const SynthBlock bA = make_block(100, prev[0], 1, nullptr, 3, 10);
+        const SynthBlock bB = make_block(100, prev[0], 2, nullptr, 3, 11);
+        for (std::uint32_t k = 0; k < 4; ++k) A.relay->submit_own(own(bA, 10 + k, pA, kChain));
+        for (std::uint32_t k = 0; k < 3; ++k) B.relay->submit_own(own(bB, 20 + k, pB, kChain));
+        C(wait_for([&] { return A.relay->cache_size() == 7 && B.relay->cache_size() == 7; }, all), "P8b A and B exchange their 7 receipts");
+        for (auto* n : all) n->template_height = 101;
+        C(wait_for([&] { return A.next_pos() == 7 && B.next_pos() == 7; }, all), "P8b bin 100 closed on A and B (7 pushes)");
+        C(A.digest() == B.digest() && A.digest() == tagged_digest,
+          "P8b byte-identical lane digests, equal to the list-less pair's (" + hex(A.digest()).substr(0, 16) + ")");
     }
     return C.done("v37_xmr_relay_pool_id_kat");
 }
