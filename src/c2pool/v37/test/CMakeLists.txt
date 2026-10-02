@@ -712,7 +712,7 @@ if (BUILD_TESTING)
     # POOL-LINEAGE -- the block-level pool id (operator ruling 2026-09-25).
     #
     #   v37_xmr_pool_lineage_kat
-    #     pool_tag = sha256d('V37PT' || lane_tag || pool_genesis_id) (formula,
+    #     pool_tag = sha256d('V37PT2' || lane_tag || pool_genesis_id || rules_digest) (formula,
     #     S1 lane_tag input, per-network default genesis, --pool-genesis
     #     parse); the V37C tail's versioned "V37P" field (37 B, before V37C,
     #     V37C/V37D still parse, strict version); classify own -> lane block,
@@ -722,7 +722,9 @@ if (BUILD_TESTING)
     #     answers "not-lane:" for another pool's and a pre-lineage block (the
     #     ungated decoder reproduces the D-1 cross-pool match); the widest
     #     payload (two-byte 0x02 varint) assembles; the relay HELLO carries the
-    #     genesis (+32 B) and refuses another as TAG_MISMATCH field=pool_genesis.
+    #     genesis (+32 B) and refuses another as TAG_MISMATCH field=pool_genesis;
+    #     suite G (LANE-RULES): other lane rules -> another tag -> a real block
+    #     is Foreign (never Mismatch / debit-only), the tag moves only its value.
     #     Listed in BOTH build.yml --target lists.
     # ------------------------------------------------------------------
     add_executable(v37_xmr_pool_lineage_kat
@@ -1074,7 +1076,15 @@ if (BUILD_TESTING)
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
     # ------------------------------------------------------------------
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat)
+    #   v37_xmr_lane_rules_kat     LANE-RULES (operator ruling R3, 10-02): the
+    #                               lane-rules list (every consensus-relevant
+    #                               rule outside LaneParams): TLV codec + digest
+    #                               goldens, one HELLO refusal BY NAME per field
+    #                               (LANE_RULES_MISMATCH), rules_absent, the
+    #                               property HELLO-compatible <=> same pool_tag.
+    #                               RED on the base. ALSO on BOTH build.yml
+    #                               --target lists.
+    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed

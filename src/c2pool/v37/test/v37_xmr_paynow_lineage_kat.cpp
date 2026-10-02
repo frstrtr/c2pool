@@ -58,6 +58,7 @@
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_o2_settlement_provider.hpp"
 #include "c2pool/v37/xmr/xmr_pool_tag.hpp"
+#include "c2pool/v37/xmr/xmr_lane_rules.hpp"   // LANE-RULES: the pool_tag folds a rules digest
 #include "c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp"
 #if __has_include("c2pool/v37/xmr/xmr_paynow.hpp")
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
@@ -274,8 +275,8 @@ void suite_source_order() {
 void suite_blocks() {
     std::printf("== L3. real assembled blocks: tag classifies BEFORE any pay-now booking ==\n");
     const ::v37::LaneParams lp{};
-    const auto TAG_A = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0));
-    const auto TAG_B = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xB0));
+    const auto TAG_A = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0), c2pool::v37n::xmr::lanerules::rules_digest(c2pool::v37n::xmr::lanerules::LaneRules{}));
+    const auto TAG_B = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xB0), c2pool::v37n::xmr::lanerules::rules_digest(c2pool::v37n::xmr::lanerules::LaneRules{}));
     Built a(TAG_A, true), b(TAG_B, true), u(std::nullopt, true), t(TAG_A, false);
     CHECK(a.ok && b.ok && u.ok && t.ok, "four templates build + materialize (A tag+pay-now, B tag+pay-now, untagged pay-now, A tag only): %s",
           !a.ok ? a.why.c_str() : !b.ok ? b.why.c_str() : !u.ok ? u.why.c_str() : !t.ok ? t.why.c_str() : "ok");
@@ -410,7 +411,7 @@ void suite_widest() {
 void suite_base() {
     std::printf("== BASE: POOL-LINEAGE alone, no pay-now on this tree ==\n");
     const ::v37::LaneParams lp{};
-    Built a(lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0)), true);
+    Built a(lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0), c2pool::v37n::xmr::lanerules::rules_digest(c2pool::v37n::xmr::lanerules::LaneRules{})), true);
     CHECK(a.ok, "tagged template builds: %s", a.ok ? "ok" : a.why.c_str());
     bool has_n = false;
     if (a.ok) {

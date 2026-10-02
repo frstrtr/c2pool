@@ -338,6 +338,11 @@ struct XmrNodeConfig {
     // The owed payee is a distinct torsion-valid payee derived from the sink
     // material with spend/view swapped (see main). Proof-only; no live ledger yet.
     std::uint64_t   owed_demo_amount = 0;
+    // DRAIN (operator ruling R2): the old-balance drain parameter Q of the
+    // lane-rules list (xmr_lane_rules.hpp field 23). 0 = no drain = master's
+    // coinbase bytes. No CLI flag: the drain rule sets it on its own flag day;
+    // lane_knob_refusal() pins it to kMainnetDrainQ on mainnet.
+    std::uint32_t   drain_q = 0;
 
     // --- M2: the NATIVE template source ------------------------------------
     // --xmr-template-source monerod|native. See TemplateSourceMode above.
@@ -616,9 +621,21 @@ inline std::string settlement_fee_model_refusal(const XmrNodeConfig& c) {
 //   --settle-output-cap   the owed-selection cap the recompute rebuilds with
 //   --recon-max-root-age  which committed roots a node accepts
 //   --no-book-deferral    pre-R6 booking order (the lagging-receiver fork)
-// Test networks keep them for rigs; a rig must set them identically.
+//   --owed-demo-amount    seeds owed rows at serve start (LANE-RULES: refused)
+//   drain_q               the drain rule's Q (LANE-RULES: the network constant)
+// Test networks keep them for rigs; a rig must set them identically (and the
+// LANE-RULES HELLO / pool_tag now refuse a rig that does not, by name).
+// LANE-RULES (O1): D_conf below Monero's coinbase maturity (60) is refused on
+// EVERY network but regtest -- a lane block must not be booked before its
+// coinbase can be spent; the regtest rigs keep 3/4/10.
 // ---------------------------------------------------------------------------
+inline constexpr std::uint64_t kXmrMinDConf   = 60;   // == XMR_COINBASE_MATURITY (static_assert in xmr_lane_rules_build.hpp)
+inline constexpr std::uint32_t kMainnetDrainQ = 0;    // no drain on mainnet until the drain rule's flag day
 inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root_age_set, bool no_book_deferral) {
+    if (c.network != MoneroNetwork::Regtest && c.d_conf < kXmrMinDConf)
+        return "--d-conf " + std::to_string(c.d_conf) + " is below Monero's coinbase maturity (" +
+               std::to_string(kXmrMinDConf) + "): a lane block would be booked before its coinbase can be spent; "
+               "only regtest rigs may run a shorter D_conf";
     if (c.network != MoneroNetwork::Mainnet) return {};
     const XmrNodeConfig d{};
     if (c.d_conf != d.d_conf)
@@ -635,6 +652,12 @@ inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root
     if (no_book_deferral)
         return "--no-book-deferral is refused on mainnet: it restores the pre-R6 booking order "
                "(the lagging-receiver fork)";
+    if (c.owed_demo_amount != d.owed_demo_amount)
+        return "--owed-demo-amount is refused on mainnet: it seeds owed rows no other node has (a proof-only "
+               "demo), so owed_digest would differ from the first block";
+    if (c.drain_q != kMainnetDrainQ)
+        return "drain_q " + std::to_string(c.drain_q) + " on mainnet: the drain rule's Q is a network constant (" +
+               std::to_string(kMainnetDrainQ) + ")";
     return {};
 }
 
