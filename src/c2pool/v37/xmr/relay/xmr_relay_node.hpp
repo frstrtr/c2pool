@@ -155,6 +155,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -202,6 +203,16 @@
 // drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
 // (drops_persist_path, drops_persist(), drops_load()).
 #define C2POOL_XMR_DROPS_HARDEN 1
+// DROPS-RETAIN (stagenet attempt 6, h=2220425): the servable raindrop store is
+// sized by what this node still has to book, not by a count. L1: a floor
+// (set_drops_floor_bin: frontier of the newest finalized lane block - 64) and a
+// BYTE budget (RelayOptions::drops_store_bytes; drops_store_max is an optional
+// count, 0 = none); L2: drops_pin_servable() (the winner pins only what it can
+// serve) and drops_pin_retain()/drops_pin_release() (a pinned set is never
+// evicted while its block is undecided here); the store persisted as per-bin
+// append-only segments (<persist>.d/<bin>.seg), loaded newest-first up to the
+// budget; drops_sync pages a truncated inventory per bin.
+#define C2POOL_XMR_DROPS_RETAIN 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -366,19 +377,32 @@ struct RelayOptions {
     u64         drops_floor_diff = 0;
     std::size_t drops_seen_max = 65536;                      // raindrop dedup set bound
     // ★ RAIN-BACKFILL (gate ON only; inert with drops_floor_diff == 0)
-    u64         drops_retain_bins = 512;                     // intervals below the tip kept servable
-    std::size_t drops_store_max = 65536;                     // raindrops kept servable (bounded)
-    u64         drops_hello_bins = 64;                       // HELLO: pull the peer's inventory of [tip - this, tip + 2)
+    // ★ DROPS-RETAIN: until the daemon sets a floor (set_drops_floor_bin) the
+    // legacy window evicts intervals below tip - drops_retain_bins; once a
+    // floor is set it alone decides (a slow pool's range is older than any
+    // fixed tip window). Either way a RETAINED (pinned) raindrop stays.
+    u64         drops_retain_bins = 512;                     // intervals below the tip kept servable (no floor set)
+    // ★ DROPS-RETAIN (L1): the hard bound is BYTES (raw receipt + ~160 B of
+    // index per raindrop). Over it the oldest unretained bins are evicted and
+    // counted (drops_store_overflow_bins, loud): the winner then pins only what
+    // it can serve, so an overflow costs raindrop credit, never a split.
+    // drops_store_max: an optional COUNT bound on top (0 = none; it was 65536
+    // = ~73 min at 15 raindrops/s, younger than any D_conf-60 range: attempt 6).
+    std::size_t drops_store_max = 0;
+    u64         drops_store_bytes = 512ull << 20;            // 512 MiB (--drops-store-bytes)
+    u64         drops_hello_bins = 64;                     // HELLO: pull the peer's inventory of [tip - this, tip + 2)
     u32         drops_inv_retry_ms = 2000;                   // re-ask an unanswered inventory after this
     u32         drops_fetch_retry_ms = 2000;                 // re-ask still-missing ids after this
     u32         drops_fetch_max_asks = 8;                    // asks of one peer for its missing ids before it is set aside
     // ★ DROPS-HARDEN (d1): a pinned id still missing after drops_fetch_max_asks
     // asks is re-asked no more often than this (never forever at the fast rate)
     u32         drops_fetch_slow_ms = 60000;
-    // ★ DROPS-HARDEN (d4): the servable raindrop store survives a restart
-    // (<settle_db>/lane<N>.drops: versioned, sha256d trailer, tmp + fsync +
-    // rename, bounded by drops_retain_bins / drops_store_max). "" = in-memory
-    // only (the library default: every pre-harden KAT unchanged).
+    // ★ DROPS-HARDEN (d4): the servable raindrop store survives a restart.
+    // ★ DROPS-RETAIN: as per-bin append-only segments <path>.d/<bin>.seg (one
+    // header + checksummed records; a changed bin appends, a partly evicted bin
+    // is rewritten tmp + fsync + rename, an evicted bin is unlinked); a legacy
+    // whole-store file at <path> is read once (newest bins first, up to the
+    // budget) and migrated. "" = in-memory only (the library default).
     std::string drops_persist_path;
     u32         drops_persist_ms = 2000;                     // snapshot a changed store at most this often
     // RELAY-LIVENESS: PING every ready link this often (0 = keepalive OFF: no
@@ -456,6 +480,15 @@ struct RelayStats {
     std::atomic<u64> drops_pin_capped{0}, drops_pin_slow_asks{0}, drops_pin_pruned{0};
     std::atomic<u64> drops_pin_local{0};   // members handed to the harvest from this node's own store
     std::atomic<u64> drops_persist_writes{0}, drops_persist_fail{0}, drops_persist_loaded{0};
+    // ★ DROPS-RETAIN: bins evicted below the floor / the legacy window, bins
+    // evicted over the budget (overflow: loud), raindrops kept by a pin past an
+    // eviction, candidate set members skipped as unservable (L2a), segment
+    // appends / rewrites / unlinks / torn tails, bins skipped at load (budget),
+    // inventories paged per bin (K6)
+    std::atomic<u64> drops_evict_floor_bins{0}, drops_store_overflow_bins{0}, drops_evict_kept_pinned{0};
+    std::atomic<u64> drops_set_unservable_skipped{0};
+    std::atomic<u64> drops_seg_appends{0}, drops_seg_rewrites{0}, drops_seg_unlinks{0}, drops_seg_torn{0};
+    std::atomic<u64> drops_load_over_budget{0}, drops_inv_paged{0};
     // REPAIR-HORIZON: BELOW_HORIZON answers that raised a repair's start and
     // re-asked (instead of setting the peer aside); prefix probes whose digest
     // at a0 matched ours / was unknown there; peers proven DEEP (divergence
@@ -728,40 +761,14 @@ public:
             return out;
         }
         const auto now = Clock::now();
-        std::vector<std::pair<PeerId, std::vector<bytes32>>> fetch;
-        std::vector<PeerId> ask_inv;
+        SyncWork work;
         {
             std::lock_guard<std::mutex> lk(m_dsmtx);
-            for (PeerId p : peers) {
-                PeerInv& inv = m_drop_inv[InvKey{p, lo, hi}];
-                inv.touched = now;
-                if (!inv.answered) {
-                    if (inv.asked == Clock::time_point{} || now - inv.asked >= std::chrono::milliseconds(m_o.drops_inv_retry_ms)) {
-                        inv.asked = now; ask_inv.push_back(p);
-                    }
-                    continue;
-                }
-                if (inv.set_aside) { ++out.peers_ok; ++out.set_aside; continue; }
-                std::vector<bytes32> miss;
-                for (const auto& id : inv.ids) if (!drop_held_locked(id)) miss.push_back(id);
-                if (miss.empty()) { ++out.peers_ok; continue; }
-                out.missing += miss.size();
-                if (inv.fetched == Clock::time_point{} || now - inv.fetched >= std::chrono::milliseconds(m_o.drops_fetch_retry_ms)) {
-                    if (inv.asks >= m_o.drops_fetch_max_asks) {
-                        inv.set_aside = true; ++out.peers_ok; ++out.set_aside; m_st.drops_peer_setaside++;
-                        log("relay: drops backfill: peer " + std::to_string(p) + " did not serve " + std::to_string(miss.size()) +
-                            " raindrop(s) of its own inventory of [" + std::to_string(lo) + "," + std::to_string(hi) + ") after " +
-                            std::to_string(inv.asks) + " asks -> set aside for this range");
-                        continue;
-                    }
-                    ++inv.asks; inv.fetched = now;
-                    for (const auto& id : miss) m_drop_want[id] = now;
-                    fetch.emplace_back(p, std::move(miss));
-                }
-            }
+            for (PeerId p : peers)
+                if (drops_sync_step_locked(p, lo, hi, now, out, work)) ++out.peers_ok;
         }
-        for (PeerId p : ask_inv) send_drop_invreq(p, lo, hi);
-        for (auto& [p, ids] : fetch) send_drop_fetch(p, lo, hi, ids);
+        for (const auto& [p, l, h] : work.ask_inv) send_drop_invreq(p, l, h);
+        for (auto& [p, l, h, ids] : work.fetch) send_drop_fetch(p, l, h, ids);
         out.complete = (out.peers_ok == out.peers);
         if (!out.complete) {
             m_st.drops_sync_pending++;
@@ -874,6 +881,99 @@ public:
             for (const auto& [id, raw] : it->second) { (void)raw; v.push_back(id); }
         std::sort(v.begin(), v.end());
         return v;
+    }
+    // ── ★ DROPS-RETAIN (L2a): the winner pins only what it can SERVE. Of the
+    // candidate ids (its harvest over the range, ascending), keep those this
+    // store holds, at most `cap` (the smallest: deterministic), and retain them
+    // under `key` in the same critical section (no eviction can slip between
+    // the check and the pin). `skipped` = candidates not servable here.
+    std::vector<bytes32> drops_pin_servable(const std::string& key, std::vector<bytes32> candidates, std::size_t cap,
+                                            std::size_t* skipped = nullptr, bool* capped = nullptr) {
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        std::vector<bytes32> out;
+        std::size_t skip = 0;
+        bool over = false;
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        for (const auto& id : candidates) {
+            if (!m_drop_store_id.count(id)) { ++skip; continue; }
+            if (out.size() < cap) out.push_back(id); else over = true;
+        }
+        retain_locked(key, out);
+        m_st.drops_set_unservable_skipped += skip;
+        if (skipped) *skipped = skip;
+        if (capped) *capped = over;
+        return out;
+    }
+    // ── ★ DROPS-RETAIN (L2b): a pinned set is never evicted while its block is
+    // undecided here. retain = union under `key` (a block id); the ids need not
+    // be held yet (a member fetched later is retained on arrival). release at
+    // the block's decision here (FINALIZE, decided refusal, wire_cache eviction).
+    std::size_t drops_pin_retain(const std::string& key, const std::vector<bytes32>& ids) {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        return retain_locked(key, ids);
+    }
+    std::size_t drops_pin_release(const std::string& key) {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        auto it = m_drop_pins.find(key);
+        if (it == m_drop_pins.end()) return 0;
+        std::size_t n = 0;
+        for (const auto& id : it->second) {
+            auto r = m_drop_retained.find(id);
+            if (r != m_drop_retained.end() && --r->second == 0) { m_drop_retained.erase(r); ++n; }
+        }
+        m_drop_pins.erase(it);
+        drop_store_evict_locked(~u64{0});   // what the pin kept below the floor / over the budget goes now
+        return n;
+    }
+    std::vector<std::string> drops_pin_keys() const {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        std::vector<std::string> v;
+        for (const auto& [k, ids] : m_drop_pins) { (void)ids; v.push_back(k); }
+        return v;
+    }
+    bool drops_pin_has(const std::string& key) const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_pins.count(key) != 0; }
+    std::size_t drops_retained_size() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_retained.size(); }
+    // ── ★ DROPS-RETAIN (L1): the servable floor (bins), pushed by the daemon on
+    // every finalize step: frontier_of(newest finalized lane block) - 64. Every
+    // block this node may still compose has its range at or above it. Monotone.
+    void set_drops_floor_bin(u64 floor) {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        if (m_drop_floor_set && floor <= m_drop_floor) return;
+        m_drop_floor = floor; m_drop_floor_set = true;
+        drop_store_evict_locked(~u64{0});
+    }
+    u64 drops_floor_bin() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_floor; }
+    bool drops_floor_set() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_floor_set; }
+    u64 drops_store_bytes() const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_store_bytes; }
+    // oldest / newest bin held (0, 0 = empty)
+    std::pair<u64, u64> drops_store_bins() const {
+        std::lock_guard<std::mutex> lk(m_dsmtx);
+        if (m_drop_store.empty()) return {0, 0};
+        return {m_drop_store.begin()->first, m_drop_store.rbegin()->first};
+    }
+    std::string describe_retain() const {
+        const auto& s = m_st;
+        std::size_t n = 0, pins = 0, ret = 0; u64 bytes = 0, floor = 0, lo = 0, hi = 0; bool fset = false;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            n = m_drop_store_id.size(); bytes = m_drop_store_bytes; pins = m_drop_pins.size(); ret = m_drop_retained.size();
+            floor = m_drop_floor; fset = m_drop_floor_set;
+            if (!m_drop_store.empty()) { lo = m_drop_store.begin()->first; hi = m_drop_store.rbegin()->first; }
+        }
+        char b[700];
+        std::snprintf(b, sizeof b,
+            "drops-retain: store=%zu bytes=%llu budget=%llu bins=[%llu,%llu] floor=%s%llu pins=%zu retained=%zu | evict floor_bins=%llu "
+            "overflow_bins=%llu kept_pinned=%llu | set_unservable_skipped=%llu | seg appends=%llu rewrites=%llu unlinks=%llu torn=%llu "
+            "load_over_budget=%llu | inv_paged=%llu",
+            n, (unsigned long long)bytes, (unsigned long long)m_o.drops_store_bytes, (unsigned long long)lo, (unsigned long long)hi,
+            fset ? "" : "unset/", (unsigned long long)floor, pins, ret,
+            (unsigned long long)s.drops_evict_floor_bins.load(), (unsigned long long)s.drops_store_overflow_bins.load(),
+            (unsigned long long)s.drops_evict_kept_pinned.load(), (unsigned long long)s.drops_set_unservable_skipped.load(),
+            (unsigned long long)s.drops_seg_appends.load(), (unsigned long long)s.drops_seg_rewrites.load(),
+            (unsigned long long)s.drops_seg_unlinks.load(), (unsigned long long)s.drops_seg_torn.load(),
+            (unsigned long long)s.drops_load_over_budget.load(), (unsigned long long)s.drops_inv_paged.load());
+        return b;
     }
     // RELAY-SEND-QUEUE diagnostics (one line; the smoke greps it).
     std::string describe_sendq() const {
@@ -2611,6 +2711,9 @@ private:
         return true;
     }
     void admit_drop(Item it, u64 bin, const bytes32& pow) {
+        // ★ DROPS-RETAIN: the store outlives the dedup FIFO (drops_seen_max): a
+        // raindrop it still holds is a duplicate, never re-admitted / re-flooded
+        if (!it.solicited) { std::lock_guard<std::mutex> lk(m_dsmtx); if (m_drop_store_id.count(it.id)) { m_st.drops_dup++; return; } }
         if (!drop_note_new(it.id)) { m_st.drops_dup++; return; }
         Admitted a;
         a.id = it.id; a.r = std::move(it.r); a.raw = std::move(it.raw); a.bin = bin; a.own = false;
@@ -2627,20 +2730,124 @@ private:
     void drop_store_put(const bytes32& id, u64 bin, const std::vector<u8>& raw, const bytes32& pow) {
         std::lock_guard<std::mutex> lk(m_dsmtx);
         if (m_pin_asked.erase(id)) m_st.drops_pin_pruned++;   // ★ DROPS-HARDEN (d1): an asked id arrived
-        if (!m_drop_store_id.emplace(id, bin).second) return;
+        if (!store_insert_locked(id, bin, raw, pow)) return;
+        if (seg_on()) m_seg_append[bin].push_back(id);   // ★ DROPS-RETAIN: appended to <bin>.seg at the next persist
+        drop_store_evict_locked(bin);
+    }
+    // ── ★ DROPS-RETAIN: the store's index + byte accounting (m_dsmtx held) ──
+    static constexpr u64 kDropEntryOverhead = 160;   // id + bin + pow + map nodes, per raindrop
+    bool seg_on() const { return !m_o.drops_persist_path.empty() && m_o.drops_floor_diff != 0; }   // segment work is tracked
+    static u64 drop_entry_bytes(const std::vector<u8>& raw) { return static_cast<u64>(raw.size()) + kDropEntryOverhead; }
+    bool store_insert_locked(const bytes32& id, u64 bin, const std::vector<u8>& raw, const bytes32& pow) {
+        if (!m_drop_store_id.emplace(id, bin).second) return false;
         m_drop_store[bin].emplace(id, raw);
         m_drop_pow[id] = pow;   // ★ DROPS-HARDEN (d4): persisted with the bytes
+        m_drop_store_bytes += drop_entry_bytes(raw);
         m_drop_dirty = true;
-        // bounded: intervals older than the retain window, then the oldest interval
-        const u64 tip = m_chain.tip();
-        const u64 keep_from = tip > m_o.drops_retain_bins ? tip - m_o.drops_retain_bins : 0;
-        while (!m_drop_store.empty() &&
-               (m_drop_store.begin()->first < keep_from || m_drop_store_id.size() > m_o.drops_store_max)) {
-            if (m_drop_store.begin()->first == bin && m_drop_store.size() == 1) break;   // never evict the one just stored
-            for (const auto& [x, r] : m_drop_store.begin()->second) { (void)r; m_drop_store_id.erase(x); m_drop_pow.erase(x); }
-            m_drop_store.erase(m_drop_store.begin());
-            m_drop_dirty = true;
+        return true;
+    }
+    std::size_t retain_locked(const std::string& key, const std::vector<bytes32>& ids) {
+        auto& held = m_drop_pins[key];
+        std::unordered_set<bytes32, Bytes32Hash> have(held.begin(), held.end());
+        std::size_t n = 0;
+        for (const auto& id : ids) {
+            if (!have.insert(id).second) continue;
+            held.push_back(id);
+            ++m_drop_retained[id]; ++n;
         }
+        return n;
+    }
+    bool drop_over_budget_locked() const {
+        return m_drop_store_bytes > m_o.drops_store_bytes || (m_o.drops_store_max && m_drop_store_id.size() > m_o.drops_store_max);
+    }
+    // Evict the UNRETAINED raindrops of one bin; a bin left empty is erased
+    // (its segment unlinked), a bin left with pinned raindrops only is kept
+    // (its segment rewritten without the evicted records). Returns the next bin.
+    using DropStoreIt = std::map<u64, std::map<bytes32, std::vector<u8>>>::iterator;
+    DropStoreIt evict_bin_locked(DropStoreIt it, bool overflow) {
+        const u64 bin = it->first;
+        auto& m = it->second;
+        std::size_t gone = 0, kept = 0;
+        for (auto jt = m.begin(); jt != m.end();) {
+            if (m_drop_retained.count(jt->first)) { ++kept; ++jt; continue; }
+            m_drop_store_bytes -= drop_entry_bytes(jt->second);
+            m_drop_store_id.erase(jt->first); m_drop_pow.erase(jt->first);
+            jt = m.erase(jt); ++gone;
+        }
+        if (gone) {
+            m_drop_dirty = true;
+            if (overflow) m_st.drops_store_overflow_bins++; else m_st.drops_evict_floor_bins++;
+        }
+        if (kept) m_st.drops_evict_kept_pinned += kept;   // pinned raindrops an eviction pass had to step over
+        if (m.empty()) {
+            m_seg_append.erase(bin); m_seg_rewrite.erase(bin);
+            if (seg_on()) m_seg_unlink.insert(bin);
+            return m_drop_store.erase(it);
+        }
+        if (gone && seg_on()) { m_seg_append.erase(bin); m_seg_rewrite.insert(bin); }
+        return std::next(it);
+    }
+    // L1: (1) every unretained raindrop below the floor (or, before the daemon
+    // set one, below tip - drops_retain_bins); (2) over the byte budget / the
+    // optional count, the oldest unretained bins (overflow: counted, loud).
+    // `just` = the bin just stored (never evicted while it is the only bin).
+    void drop_store_evict_locked(u64 just) {
+        u64 keep_from = m_drop_floor;
+        if (!m_drop_floor_set) {
+            const u64 tip = m_chain.tip();
+            keep_from = tip > m_o.drops_retain_bins ? tip - m_o.drops_retain_bins : 0;
+        }
+        for (auto it = m_drop_store.begin(); it != m_drop_store.end() && it->first < keep_from;) {
+            if (it->first == just && m_drop_store.size() == 1) break;   // never evict the one just stored
+            it = evict_bin_locked(it, false);
+        }
+        if (!drop_over_budget_locked()) return;
+        for (auto it = m_drop_store.begin(); it != m_drop_store.end() && drop_over_budget_locked();) {
+            if (it->first == just && std::next(it) == m_drop_store.end()) break;   // the newest bin, just stored
+            it = evict_bin_locked(it, true);
+        }
+    }
+    // ★ DROPS-RETAIN (K6): one inventory key of drops_sync; true = this peer's
+    // inventory of [l, h) is held here (or the peer is set aside for it). An
+    // inventory truncated at kDropsInvMaxIds over more than one bin is paged:
+    // one key per bin, each asked and fetched on its own.
+    struct SyncWork {
+        std::vector<std::tuple<PeerId, u64, u64>> ask_inv;
+        std::vector<std::tuple<PeerId, u64, u64, std::vector<bytes32>>> fetch;
+    };
+    bool drops_sync_step_locked(PeerId p, u64 l, u64 h, Clock::time_point now, DropsSync& out, SyncWork& work) {
+        PeerInv& inv = m_drop_inv[InvKey{p, l, h}];
+        inv.touched = now;
+        if (!inv.answered) {
+            if (inv.asked == Clock::time_point{} || now - inv.asked >= std::chrono::milliseconds(m_o.drops_inv_retry_ms)) {
+                inv.asked = now; work.ask_inv.emplace_back(p, l, h);
+            }
+            return false;
+        }
+        if (inv.set_aside) { ++out.set_aside; return true; }
+        if (inv.ids.size() >= kDropsInvMaxIds && h - l > 1) {   // truncated: page per bin
+            if (!m_drop_inv.count(InvKey{p, l, l + 1})) m_st.drops_inv_paged++;
+            bool ok = true;
+            for (u64 b = l; b < h; ++b) ok = drops_sync_step_locked(p, b, b + 1, now, out, work) && ok;
+            return ok;
+        }
+        std::vector<bytes32> miss;
+        for (const auto& id : inv.ids) if (!drop_held_locked(id)) miss.push_back(id);
+        if (miss.empty()) return true;
+        out.missing += miss.size();
+        if (inv.fetched == Clock::time_point{} || now - inv.fetched >= std::chrono::milliseconds(m_o.drops_fetch_retry_ms)) {
+            if (inv.asks >= m_o.drops_fetch_max_asks) {
+                inv.set_aside = true; ++out.set_aside; m_st.drops_peer_setaside++;
+                log("relay: drops backfill: peer " + std::to_string(p) + " did not serve " + std::to_string(miss.size()) +
+                    " raindrop(s) of its own inventory of [" + std::to_string(l) + "," + std::to_string(h) + ") after " +
+                    std::to_string(inv.asks) + " asks -> set aside for this range");
+                return true;
+            }
+            ++inv.asks; inv.fetched = now;
+            for (const auto& id : miss) m_drop_want[id] = now;
+            work.fetch.emplace_back(p, l, h, std::move(miss));
+        }
+        return false;
     }
     // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
     bool drop_held_locked(const bytes32& id) const {
@@ -2717,65 +2924,233 @@ private:
         }
         if (!miss.empty()) send_drop_fetch(p, lo, hi, miss);   // fetch at once (drops_sync re-asks)
     }
-    // ── ★ DROPS-HARDEN (d4): the persisted raindrop store ───────────────────
-    // <settle_db>/lane<N>.drops = "V37DRP1\0" | chain u32 | lane_params_digest 32
-    // | n u32 | n x (id 32 | bin u64 | pow 32 | len u32 | raw) | sha256d(all before) 32.
+    // ── ★ DROPS-HARDEN (d4) + ★ DROPS-RETAIN: the persisted raindrop store ──
+    // Per-bin append-only segments <drops_persist_path>.d/<bin>.seg:
+    //   header  "V37DRS1\0" | chain u32 | lane_params_digest 32 | bin u64
+    //   record  id 32 | pow 32 | len u32 | raw | chk 8 (sha256d of the record's bytes before it, first 8)
     // Written from the maint thread when the store changed (at most every
-    // drops_persist_ms) and at stop(): tmp + fsync + rename. The store is bounded
-    // by drops_retain_bins / drops_store_max, so is the file.
+    // drops_persist_ms) and at stop(): new raindrops of a bin are APPENDED (+
+    // fsync), a bin that lost raindrops to an eviction is REWRITTEN (tmp + fsync
+    // + rename), an evicted bin is UNLINKED. The old design rewrote the WHOLE
+    // store every ~2.4 s (56 MB at the 65536 cap: ~23 MB/s on every host, A6).
+    // A torn record ends its segment (the valid prefix loads; the bin is
+    // rewritten). The legacy whole-store file <drops_persist_path> = "V37DRP1\0"
+    // | chain u32 | lane_params_digest 32 | n u32 | n x (id 32 | bin u64 | pow 32 |
+    // len u32 | raw) | sha256d(all before) 32 is read when no segment exists.
     static constexpr u8 kDropsFileMagic[8] = {'V', '3', '7', 'D', 'R', 'P', '1', 0};
+    static constexpr u8 kDropsSegMagic[8] = {'V', '3', '7', 'D', 'R', 'S', '1', 0};
     static constexpr std::size_t kDropsFileMaxRaw = 65536;
+    static constexpr std::size_t kDropsSegHeader = 8 + 4 + 32 + 8;
     static void dput(std::vector<u8>& b, u64 v, int n) { for (int i = 0; i < n; ++i) b.push_back(static_cast<u8>(v >> (8 * i))); }
-public:
-    bool drops_persist() {
-        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return false;
-        std::vector<u8> b;
-        {
-            std::lock_guard<std::mutex> lk(m_dsmtx);
-            if (!m_drop_dirty) return false;
-            b.insert(b.end(), kDropsFileMagic, kDropsFileMagic + 8);
-            dput(b, m_o.chain, 4); b.insert(b.end(), m_o.lane_params_digest.begin(), m_o.lane_params_digest.end());
-            dput(b, m_drop_store_id.size(), 4);
-            for (const auto& [bin, m] : m_drop_store)
-                for (const auto& [id, raw] : m) {
-                    const auto pi = m_drop_pow.find(id);
-                    b.insert(b.end(), id.begin(), id.end()); dput(b, bin, 8);
-                    const bytes32 pw = pi == m_drop_pow.end() ? bytes32{} : pi->second;
-                    b.insert(b.end(), pw.begin(), pw.end());
-                    dput(b, raw.size(), 4); b.insert(b.end(), raw.begin(), raw.end());
-                }
-            m_drop_dirty = false;
-            m_drop_persisted_at = Clock::now();
-        }
-        const bytes32 h = ::v37::sha256d(b);
-        b.insert(b.end(), h.begin(), h.end());
-        const std::string tmp = m_o.drops_persist_path + ".tmp";
+    std::string seg_dir() const { return m_o.drops_persist_path + ".d"; }
+    std::string seg_path(u64 bin) const { return seg_dir() + "/" + std::to_string(bin) + ".seg"; }
+    void seg_header(std::vector<u8>& b, u64 bin) const {
+        b.insert(b.end(), kDropsSegMagic, kDropsSegMagic + 8);
+        dput(b, m_o.chain, 4); b.insert(b.end(), m_o.lane_params_digest.begin(), m_o.lane_params_digest.end());
+        dput(b, bin, 8);
+    }
+    static void seg_record(std::vector<u8>& b, const bytes32& id, const bytes32& pow, const std::vector<u8>& raw) {
+        const std::size_t at = b.size();
+        b.insert(b.end(), id.begin(), id.end()); b.insert(b.end(), pow.begin(), pow.end());
+        dput(b, raw.size(), 4); b.insert(b.end(), raw.begin(), raw.end());
+        const bytes32 h = ::v37::sha256d(b.data() + at, b.size() - at);
+        b.insert(b.end(), h.begin(), h.begin() + 8);
+    }
+    static bool write_file_atomic(const std::string& path, const std::vector<u8>& b) {
+        const std::string tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         bool ok = f && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
         if (f) ok = (std::fclose(f) == 0) && ok;
-        ok = ok && std::rename(tmp.c_str(), m_o.drops_persist_path.c_str()) == 0;
-        if (!ok) {
+        return ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+    }
+public:
+    bool drops_persist() {
+        if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return false;
+        std::map<u64, std::vector<u8>> appends, rewrites;
+        std::set<u64> unlinks;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            if (m_seg_append.empty() && m_seg_rewrite.empty() && m_seg_unlink.empty()) { m_drop_dirty = false; return false; }
+            auto pow_of = [&](const bytes32& id) { const auto pi = m_drop_pow.find(id); return pi == m_drop_pow.end() ? bytes32{} : pi->second; };
+            for (u64 bin : m_seg_rewrite) {
+                const auto it = m_drop_store.find(bin);
+                if (it == m_drop_store.end()) { unlinks.insert(bin); continue; }
+                auto& b = rewrites[bin];
+                seg_header(b, bin);
+                for (const auto& [id, raw] : it->second) seg_record(b, id, pow_of(id), raw);
+            }
+            for (const auto& [bin, ids] : m_seg_append) {
+                if (m_seg_rewrite.count(bin)) continue;
+                const auto it = m_drop_store.find(bin);
+                if (it == m_drop_store.end()) continue;
+                auto& b = appends[bin];
+                for (const auto& id : ids)
+                    if (const auto r = it->second.find(id); r != it->second.end()) seg_record(b, id, pow_of(id), r->second);
+            }
+            unlinks.insert(m_seg_unlink.begin(), m_seg_unlink.end());
+            m_seg_append.clear(); m_seg_rewrite.clear(); m_seg_unlink.clear();
+            m_drop_dirty = false;
+            m_drop_persisted_at = Clock::now();
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(seg_dir(), ec);
+        std::set<u64> failed;
+        for (u64 bin : unlinks)   // first: a bin evicted and re-created since the last persist starts afresh
+            if (std::remove(seg_path(bin).c_str()) == 0) m_st.drops_seg_unlinks++;
+        for (const auto& [bin, b] : rewrites) {
+            if (write_file_atomic(seg_path(bin), b)) m_st.drops_seg_rewrites++;
+            else failed.insert(bin);
+        }
+        for (const auto& [bin, b] : appends) {
+            if (b.empty()) continue;
+            std::FILE* f = std::fopen(seg_path(bin).c_str(), "ab");
+            bool ok = f != nullptr;
+            if (ok && std::fseek(f, 0, SEEK_END) == 0 && std::ftell(f) == 0) {   // a new segment: its header first
+                std::vector<u8> h; seg_header(h, bin);
+                ok = std::fwrite(h.data(), 1, h.size(), f) == h.size();
+            }
+            ok = ok && std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0 && ::fsync(::fileno(f)) == 0;
+            if (f) ok = (std::fclose(f) == 0) && ok;
+            if (ok) m_st.drops_seg_appends++; else failed.insert(bin);
+        }
+        if (!failed.empty()) {
             m_st.drops_persist_fail++;
-            { std::lock_guard<std::mutex> lk(m_dsmtx); m_drop_dirty = true; }
-            log("relay: drops store persist FAILED " + m_o.drops_persist_path + ": " + std::strerror(errno));
+            { std::lock_guard<std::mutex> lk(m_dsmtx); for (u64 bin : failed) m_seg_rewrite.insert(bin); m_drop_dirty = true; }
+            log("relay: drops store persist FAILED for " + std::to_string(failed.size()) + " segment(s) under " + seg_dir() + ": " +
+                std::strerror(errno));
             return false;
         }
         m_st.drops_persist_writes++;
+        if (m_legacy_migrate.exchange(false))   // the legacy file is now segments: never read again
+            (void)std::rename(m_o.drops_persist_path.c_str(), (m_o.drops_persist_path + ".migrated").c_str());
         return true;
     }
-    // Boot (before start()): restore the store from drops_persist_path. The
-    // restored raindrops are servable at once, count as seen, and are queued for
-    // drain_drops() so the harvest holds exactly what the store holds (as before
-    // the restart). Any mismatch (magic, chain, lane, bounds, trailer) = the file
-    // is ignored (an empty store, as before DROPS-HARDEN); *why says so.
+    // Boot (before start()): restore the store. The restored raindrops are
+    // servable at once, count as seen, and are queued for drain_drops() so the
+    // harvest holds exactly what the store holds (as before the restart).
+    // ★ DROPS-RETAIN: segments are read NEWEST bin first while the store is
+    // under its budget; an older bin past the budget keeps only its pinned
+    // raindrops (drops_pin_retain before drops_load) and its segment is
+    // dropped (drops_load_over_budget). A segment of another lane or with a bad
+    // header is ignored; a torn tail ends that segment (the valid prefix loads).
+    // No segment: the legacy whole-store file, read the same way (it used to be
+    // ignored WHOLE when it held more than drops_store_max: a restart cliff);
+    // any mismatch there (magic, chain, lane, trailer) = ignored, *why says so.
+    struct LoadRec { bytes32 id; u64 bin; bytes32 pow; std::vector<u8> raw; };
     std::size_t drops_load(std::string* why = nullptr) {
         if (m_o.drops_persist_path.empty() || !m_o.drops_floor_diff) return 0;
-        std::FILE* f = std::fopen(m_o.drops_persist_path.c_str(), "rb");
-        if (!f) { if (why) *why = "absent"; return 0; }
-        std::vector<u8> b;
+        std::vector<std::pair<u64, std::string>> segs;
+        std::error_code ec;
+        if (std::filesystem::is_directory(seg_dir(), ec))
+            for (const auto& e : std::filesystem::directory_iterator(seg_dir(), ec)) {
+                const std::string n = e.path().filename().string();
+                if (n.size() < 5 || n.compare(n.size() - 4, 4, ".seg") != 0) continue;
+                const std::string num = n.substr(0, n.size() - 4);
+                if (num.empty() || num.size() > 20 || num.find_first_not_of("0123456789") != std::string::npos) continue;
+                segs.emplace_back(std::stoull(num), e.path().string());
+            }
+        if (segs.empty()) return drops_load_legacy(why);
+        std::sort(segs.rbegin(), segs.rend());   // newest bin first
+        std::size_t loaded = 0, torn = 0, bad = 0, over = 0;
+        bool closed = false;   // once a bin does not fit, every older bin keeps its pinned raindrops only
+        for (const auto& [bin, p] : segs) {
+            std::vector<u8> b;
+            if (!slurp_file(p, b)) { ++bad; continue; }
+            std::vector<LoadRec> v;
+            const int r = parse_segment(b, bin, v);
+            if (r < 0) { ++bad; continue; }
+            if (r > 0) { ++torn; m_st.drops_seg_torn++; std::lock_guard<std::mutex> lk(m_dsmtx); m_seg_rewrite.insert(bin); }
+            if (!load_bin(bin, v, closed)) ++over;
+            loaded += v.size();
+        }
+        m_st.drops_persist_loaded += loaded;
+        if (why) {
+            why->clear();
+            if (torn || bad || over)
+                *why = "segments=" + std::to_string(segs.size()) + " torn=" + std::to_string(torn) + " ignored=" + std::to_string(bad) +
+                       " over_budget=" + std::to_string(over);
+        }
+        return loaded;
+    }
+private:
+    static bool slurp_file(const std::string& p, std::vector<u8>& b) {
+        std::FILE* f = std::fopen(p.c_str(), "rb");
+        if (!f) return false;
         u8 buf[65536];
         for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) b.insert(b.end(), buf, buf + n);
         std::fclose(f);
+        return true;
+    }
+    static bool record_ok(const LoadRec& e) {
+        FbReceipt r;
+        return decode_fb_receipt(e.raw, r) && receipt_id(r) == e.id;
+    }
+    // -1 = not a segment of this lane / this bin; 0 = whole; 1 = torn tail (the valid prefix is in v)
+    int parse_segment(const std::vector<u8>& b, u64 bin, std::vector<LoadRec>& v) const {
+        if (b.size() < kDropsSegHeader || std::memcmp(b.data(), kDropsSegMagic, 8) != 0) return -1;
+        auto rd = [&](std::size_t at, int n) { u64 x = 0; for (int i = n; i-- > 0;) x = (x << 8) | b[at + static_cast<std::size_t>(i)]; return x; };
+        if (rd(8, 4) != m_o.chain || std::memcmp(b.data() + 12, m_o.lane_params_digest.data(), 32) != 0 || rd(44, 8) != bin) return -1;
+        std::size_t o = kDropsSegHeader;
+        while (o < b.size()) {
+            if (o + 32 + 32 + 4 > b.size()) return 1;
+            LoadRec e; e.bin = bin;
+            std::memcpy(e.id.data(), b.data() + o, 32); std::memcpy(e.pow.data(), b.data() + o + 32, 32);
+            const u64 len = rd(o + 64, 4);
+            if (len > kDropsFileMaxRaw || o + 68 + len + 8 > b.size()) return 1;
+            const bytes32 h = ::v37::sha256d(b.data() + o, 68 + static_cast<std::size_t>(len));
+            if (std::memcmp(h.data(), b.data() + o + 68 + len, 8) != 0) return 1;
+            e.raw.assign(b.begin() + static_cast<std::ptrdiff_t>(o + 68), b.begin() + static_cast<std::ptrdiff_t>(o + 68 + len));
+            if (!record_ok(e)) return 1;
+            v.push_back(std::move(e));
+            o += 68 + static_cast<std::size_t>(len) + 8;
+        }
+        return 0;
+    }
+    // Insert one bin's records (newest-first loading). A bin that fits under the
+    // budget (bytes, and the optional count) whole: all of them; else -- and for
+    // every older bin after it (`closed`) -- the pinned ones only (the segment is
+    // then rewritten or unlinked). false = the bin was (partly) dropped.
+    bool load_bin(u64 bin, std::vector<LoadRec>& v, bool& closed) {
+        bool full = true;
+        {
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            if (!closed) {
+                u64 add = 0;
+                for (const auto& e : v) add += drop_entry_bytes(e.raw);
+                closed = m_drop_store_bytes + add > m_o.drops_store_bytes ||
+                         (m_o.drops_store_max && m_drop_store_id.size() + v.size() > m_o.drops_store_max);
+            }
+            full = !closed;
+            if (!full) {
+                v.erase(std::remove_if(v.begin(), v.end(), [&](const LoadRec& e) { return !m_drop_retained.count(e.id); }), v.end());
+                m_st.drops_load_over_budget++;
+                if (v.empty()) m_seg_unlink.insert(bin); else m_seg_rewrite.insert(bin);
+                m_drop_dirty = true;
+            }
+        }
+        std::vector<LoadRec> kept;
+        for (auto& e : v) {
+            if (!drop_note_new(e.id)) continue;
+            { std::lock_guard<std::mutex> lk(m_dsmtx); if (!store_insert_locked(e.id, e.bin, e.raw, e.pow)) continue; }
+            kept.push_back(std::move(e));
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_amtx);
+            for (auto& e : kept) {
+                Admitted a;
+                decode_fb_receipt(e.raw, a.r);
+                a.id = e.id; a.raw = std::move(e.raw); a.bin = e.bin; a.drop = true; a.pow = e.pow;
+                m_drops.push_back(std::move(a));
+            }
+        }
+        v.swap(kept);
+        return full;
+    }
+    // the legacy whole-store file (pre-DROPS-RETAIN): newest bins first up to
+    // the budget, then migrated (every loaded bin is written as a segment)
+    std::size_t drops_load_legacy(std::string* why) {
+        std::vector<u8> b;
+        if (!slurp_file(m_o.drops_persist_path, b)) { if (why) *why = "absent"; return 0; }
         auto bad = [&](const char* w) { if (why) *why = std::string(w) + " (" + m_o.drops_persist_path + " ignored: empty store)"; return std::size_t{0}; };
         if (b.size() < 8 + 4 + 32 + 4 + 32 || std::memcmp(b.data(), kDropsFileMagic, 8) != 0) return bad("bad magic/size");
         const std::size_t body = b.size() - 32;
@@ -2786,36 +3161,26 @@ public:
         u64 chain = 0, n = 0; bytes32 tag{};
         if (!get(4, chain) || !get32(tag) || !get(4, n)) return bad("truncated header");
         if (chain != m_o.chain || tag != m_o.lane_params_digest) return bad("another lane (chain / lane_params_digest differ)");
-        if (n > m_o.drops_store_max) return bad("more raindrops than drops_store_max");
-        struct E { bytes32 id; u64 bin; bytes32 pow; std::vector<u8> raw; };
-        std::vector<E> v; v.reserve(static_cast<std::size_t>(n));
+        std::map<u64, std::vector<LoadRec>, std::greater<u64>> by_bin;   // newest first
         for (u64 k = 0; k < n; ++k) {
-            E e; u64 len = 0;
+            LoadRec e; u64 len = 0;
             if (!get32(e.id) || !get(8, e.bin) || !get32(e.pow) || !get(4, len) || len > kDropsFileMaxRaw || o + len > body) return bad("bad raindrop record");
             e.raw.assign(b.begin() + static_cast<std::ptrdiff_t>(o), b.begin() + static_cast<std::ptrdiff_t>(o + len)); o += len;
-            FbReceipt r;
-            if (!decode_fb_receipt(e.raw, r) || receipt_id(r) != e.id) return bad("a record whose bytes are not its id");
-            v.push_back(std::move(e));
+            if (!record_ok(e)) return bad("a record whose bytes are not its id");
+            by_bin[e.bin].push_back(std::move(e));
         }
         if (o != body) return bad("trailing bytes");
-        std::size_t loaded = 0;
-        for (auto& e : v) {
-            if (!drop_note_new(e.id)) continue;
-            {
-                std::lock_guard<std::mutex> lk(m_dsmtx);
-                if (!m_drop_store_id.emplace(e.id, e.bin).second) continue;
-                m_drop_store[e.bin].emplace(e.id, e.raw);
-                m_drop_pow[e.id] = e.pow;
-            }
-            Admitted a;
-            decode_fb_receipt(e.raw, a.r);
-            a.id = e.id; a.raw = std::move(e.raw); a.bin = e.bin; a.drop = true; a.pow = e.pow;
-            std::lock_guard<std::mutex> lk(m_amtx);
-            m_drops.push_back(std::move(a));
-            ++loaded;
+        std::size_t loaded = 0, over = 0;
+        bool closed = false;
+        for (auto& [bin, v] : by_bin) {
+            if (!load_bin(bin, v, closed)) ++over;
+            loaded += v.size();
+            std::lock_guard<std::mutex> lk(m_dsmtx);
+            if (m_drop_store.count(bin)) { m_seg_rewrite.insert(bin); m_drop_dirty = true; }   // migrate to a segment
         }
         m_st.drops_persist_loaded += loaded;
-        if (why) why->clear();
+        if (loaded) m_legacy_migrate = true;
+        if (why) { why->clear(); if (over) *why = "legacy file: " + std::to_string(over) + " bin(s) past the budget dropped"; }
         return loaded;
     }
 private:
@@ -2827,6 +3192,15 @@ private:
                 due = m_drop_dirty && Clock::now() - m_drop_persisted_at >= std::chrono::milliseconds(m_o.drops_persist_ms);
             }
             if (due) drops_persist();
+        }
+        {   // ★ DROPS-RETAIN: an overflow evicts raindrops a pending block may still need: loud (at most once a minute)
+            const u64 ov = m_st.drops_store_overflow_bins.load();
+            if (ov != m_overflow_logged && Clock::now() - m_overflow_log_at >= std::chrono::minutes(1)) {
+                m_overflow_logged = ov; m_overflow_log_at = Clock::now();
+                log("relay: drops-ALARM store over budget (--drops-store-bytes " + std::to_string(m_o.drops_store_bytes) +
+                    "): overflow_bins=" + std::to_string(ov) + " -- the oldest unretained raindrops were evicted; a winner pins only "
+                    "what it can serve, so this costs raindrop credit, never a split");
+            }
         }
         std::lock_guard<std::mutex> lk(m_dsmtx);
         const auto now = Clock::now();
@@ -3805,6 +4179,18 @@ private:
     std::map<u64, std::map<bytes32, std::vector<u8>>> m_drop_store;        // bin -> id -> raw (servable)
     std::unordered_map<bytes32, u64, Bytes32Hash> m_drop_store_id;          // id -> bin
     std::unordered_map<bytes32, bytes32, Bytes32Hash> m_drop_pow;           // ★ DROPS-HARDEN: id -> verified RandomX hash
+    // ★ DROPS-RETAIN: bytes held, the servable floor (L1), the pinned sets (L2b:
+    // key -> ids, id -> number of keys), the segment work since the last persist
+    u64 m_drop_store_bytes = 0;
+    u64 m_drop_floor = 0;
+    bool m_drop_floor_set = false;
+    std::map<std::string, std::vector<bytes32>> m_drop_pins;
+    std::unordered_map<bytes32, u32, Bytes32Hash> m_drop_retained;
+    std::map<u64, std::vector<bytes32>> m_seg_append;   // bin -> ids to append to <bin>.seg
+    std::set<u64> m_seg_rewrite, m_seg_unlink;          // bins to rewrite whole / to unlink
+    u64 m_overflow_logged = 0;                          // ★ DROPS-RETAIN (maint thread only)
+    Clock::time_point m_overflow_log_at{};
+    std::atomic<bool> m_legacy_migrate{false};          // a legacy lane<N>.drops was loaded: renamed once segments exist
     bool m_drop_dirty = false;                                               // ★ DROPS-HARDEN: store changed since the last snapshot
     Clock::time_point m_drop_persisted_at{};
     std::map<InvKey, PeerInv> m_drop_inv;
