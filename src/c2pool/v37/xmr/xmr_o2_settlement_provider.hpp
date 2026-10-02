@@ -508,6 +508,7 @@ public:
 private:
     static constexpr std::size_t kFinderBindCap = 1u << 16;   // bound on remembered job finders
     static constexpr std::size_t kVariantCap    = 256;        // per-snapshot finder variants
+    static constexpr int         kDrainFixpointPasses = ::v37::xmr::settle::kDrainFixpointPasses;   // THE DRAIN RULE: snapshot-at-final-reward rebuilds
 
     // The template a job is served / submitted from: the snapshot's own, or its
     // finder variant. Deterministic per (snapshot, extra_nonce): a variant is
@@ -623,6 +624,28 @@ private:
         std::string as_why;
         std::unique_ptr<asm_::AssembledTemplate> tpl = asm_::XmrBlockAssembler::build(a, &as_why);
         if (!tpl) { why = "assembler refused: " + as_why; return false; }
+        // THE DRAIN RULE: the owed takes are chosen at Delta(R), so the snapshot
+        // must be cut at the template's FINAL reward (every receiver recomputes
+        // at the coinbase total: takes chosen at another reward are an over- or
+        // under-take). Rebuild at the reward the template settled on until the
+        // two agree (the payee set can move the reward through the coinbase
+        // weight, so this is a fixpoint, bounded; fail closed beyond).
+        {
+            std::uint64_t hint = src->reward_hint(), reward = tpl->reward();
+            const bool fx = ::v37::xmr::settle::drain_reward_fixpoint(
+                src->drain_on(), hint, reward,
+                [&](std::uint64_t r, std::string& w) -> std::optional<std::uint64_t> {
+                    src = build_settlement_source(scfg, parent, m_ledger.ledger(), m_owed_pay_of ? m_owed_pay_of : m_ledger.pay_of(), r, &ss_why);
+                    if (!src) { w = "settlement source refused (drain fixpoint): " + ss_why; return std::nullopt; }
+                    a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+                    a.extra_nonce_tail = src->extra_nonce_tail();
+                    tpl = asm_::XmrBlockAssembler::build(a, &as_why);
+                    if (!tpl) { w = "assembler refused (drain fixpoint): " + as_why; return std::nullopt; }
+                    return tpl->reward();
+                },
+                why);
+            if (!fx) return false;
+        }
 
         // A probe materialisation locks in the layout (nonce offset, blob sizes).
         asm_::BlockBytes probe;

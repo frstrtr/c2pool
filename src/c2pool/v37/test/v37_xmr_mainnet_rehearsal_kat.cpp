@@ -138,6 +138,11 @@ bool g_spend_floor = false;
 std::uint64_t g_cap_at = 0; std::uint32_t g_cap = 0;
 long long g_seed_scale = 1;   // M10b: the seeded old balances times this (a pool with no cash to spare)
 bool g_no_seeds = false;   // M7b: a fresh pool, no seeded owed balances
+// M7c: THE DRAIN RULE (rulings R1/R2/R5 2026-10-02) on every node and builder,
+// lane blocks g_hstep Monero heights apart (dh), the lane height in the ledger.
+o2::DrainRule g_drain{};
+std::uint64_t g_hstep = 1;
+std::uint64_t mheight(std::uint64_t h) { return 3000000 + h * g_hstep; }
 std::uint64_t g_reorg_at = 0;
 std::uint64_t g_decay_h = 0, g_decay_hl = 0;   // M10: dust decay horizon / half-life (bins); 0 = the lane's
 bool g_anchor = false;                          // M11: the ANCHOR rule (pay-now / E_b at the ledger's anchor)
@@ -230,7 +235,7 @@ struct Block { bool ok = false; std::string why; std::vector<std::uint8_t> blob;
 Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneWorld& W, std::uint64_t h,
             const std::function<void(x6::CoinbaseInputs&)>& mutate = {}) {
     Block out;
-    const auto md = akat::miner(3000000 + h, 300000, kAgc);
+    const auto md = akat::miner(mheight(h), 300000, kAgc);
     const std::uint64_t subsidy = asm_::xmr_base_reward(md.already_generated_coins);
     const auto mempool = akat::txs(2, 1500, 20000000);
     std::uint64_t fees = 0; for (const auto& t : mempool) fees += t.fee;
@@ -247,11 +252,21 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     ctx.has_credit_cut = true; ctx.credit_cut = W.cut_at(h);
     ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
     ctx.has_paynow = true; ctx.paynow_payees = paynow_view(W, L, h);
+    ctx.drain = g_drain;   // M7c: THE DRAIN RULE
     std::string why;
     auto src = o2::XmrOwedSettlementSource::build(L, owed_pay_of, ctx, subsidy + fees, &why);
     if (!src) { out.why = "source: " + why; return out; }
     asm_::AssemblyInputs a;
     a.miner = md; a.mempool = mempool;
+    for (int pass = 0; src->drain_on() && pass < 4; ++pass) {   // THE DRAIN RULE: the provider's final-reward fixpoint
+        asm_::AssemblyInputs p = a;
+        p.settle = o2::assembly_settle_inputs(*src, true);
+        p.extra_nonce_tail = src->extra_nonce_tail();
+        auto t0 = asm_::XmrBlockAssembler::build(p, &why);
+        if (!t0 || t0->reward() == src->reward_hint()) break;
+        src = o2::XmrOwedSettlementSource::build(L, owed_pay_of, ctx, t0->reward(), &why);
+        if (!src) { out.why = "source (fixpoint): " + why; return out; }
+    }
     a.settle = o2::assembly_settle_inputs(*src, true);
     if (g_cap_at && h == g_cap_at) a.settle.output_cap = g_cap;   // M8: a claimed-full builder
     a.extra_nonce_tail = src->extra_nonce_tail();
@@ -295,7 +310,8 @@ struct Node {
 struct Booked { rc::Verdict v = rc::Verdict::Undecidable; std::string why; Amounts credit, payout; bool decoded = false;
                 Amounts gross, claimed, writeoff, deposit;      // M12: E' before the net, the due claimed / written off, D_B
                 EnrolAdd enrol_add;                             // M13: the payees this booking enrolled by raindrop
-                st::DropsWindow window; };                      // DROPS WINDOW: the booking's window entries                          // M13: the payees this booking enrolled by raindrop
+                st::DropsWindow window;
+                std::set<::v37::bytes32> gross_keys; };                // THE DRAIN RULE: G_b                      // DROPS WINDOW: the booking's window entries                          // M13: the payees this booking enrolled by raindrop
 
 // What book_from_chain_ex does with one lane block on one node.
 Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const std::string& bid) {
@@ -321,6 +337,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     li.fixed = {fee::donation_marker(kNet)}; li.pool_tag = the_tag();
     li.kfair_salted_ties = true;
     li.spend_floor = g_spend_floor;
+    li.drain = g_drain;   // M7c
     rc::CutInputs ci; ci.has_view = true; ci.payees = pv;
     const auto res = rc::verify_lane_coinbase(b.blob, bk, n.L, pay_of_map(n.booked), li, ci);
     r.v = res.verdict; r.why = res.why;
@@ -328,7 +345,8 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     if (res.verdict == rc::Verdict::Mismatch) {
         r.payout = bk.payout;                                           // DEBITED, credit DROPPED
     } else if (res.verdict == rc::Verdict::Canonical) {
-        r.credit = fold(bk.total, win_input(n.L, pv));   // DROPS WINDOW: + the window at the anchor
+        // THE DRAIN RULE (D7): the window is booked at P, where the canonical coinbase split it
+        r.credit = fold(res.drain_on ? res.split_at : bk.total, win_input(n.L, pv));   // DROPS WINDOW: + the window at the anchor
         if (g_drops_due) {   // M12 (A5): claim the whole avail BEFORE the redistribution, as paynow_net does
             r.claimed = n.L.drops_available();
             st::apply_drops_due(r.credit, r.claimed, &r.writeoff);
@@ -337,6 +355,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
             if (g_window) r.window = g_window(h);
             if (g_drops_window) r.deposit.clear();   // DROPS WINDOW: window weight, never a deposit
         }
+        for (const auto& [k, v] : r.credit) if (v > 0) r.gross_keys.insert(k);   // THE DRAIN RULE: G_b, before the redistribution
         for (const auto& [k, d] : res.credit_delta) {   // SPEND-COST FLOOR: the redistribution
             r.credit[k] += d;
             if (r.credit[k] == 0) r.credit.erase(k);
@@ -360,7 +379,8 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
         for (const auto& [k, e] : r.enrol_add) df->enrol_add[k] = st::DropsEnrolRec{e.first, e.second};   // M13 (A3)
 #endif
     }
-    n.L.on_block_found(bid, r.credit, r.payout, cut, df ? &*df : nullptr);
+    st::LaneFound lf; lf.height = mheight(h); lf.gross = r.gross_keys;   // THE DRAIN RULE (ignored with the rules off)
+    n.L.on_block_found(bid, r.credit, r.payout, cut, df ? &*df : nullptr, &lf);
     n.note();
     if (!n.late)   // M13: a late joiner never saw the deposit payee's raindrop (drop_ref_of is node-local)
         for (const auto& [k, v] : r.deposit) { (void)v; if (W.universe.count(k)) n.booked[k] = W.universe.at(k); }   // BOOKED REFS: the deposit payees
@@ -392,6 +412,7 @@ struct Run {
     std::map<::v37::bytes32, std::uint64_t> enrolled_at;                        // M13: eff of each raindrop enrolment (node 0)
     std::map<::v37::bytes32, long long> windowed;                               // DROPS WINDOW: work booked into the window (node 0)
     std::size_t win_max = 0;                                                    // DROPS WINDOW: the largest committed window (node 0)
+    std::vector<long long> F_at;                                                // M7c: SUM max(0, EffectiveOwed) on node 0 after each height
 };
 
 // Simulate H heights with builders rotating over the nodes. `lag_at`: the
@@ -416,6 +437,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
         rules.raindrop_enrol = g_raindrop_enrol;   // M13: the daemon turns it on with the due
 #endif
         if (g_drops_window) rules.drops_window = kRehearsalWindow;   // A4b: the daemon turns it on with the due
+        rules.lane_height = rules.decay_from_gross = g_drain.on();   // THE DRAIN RULE's ledger bits
         for (auto& n : run.nodes) n.L = st::OwedLedger(kChain, rules);
     }
     if (g_late_node >= 0) run.nodes[static_cast<std::size_t>(g_late_node)].late = true;
@@ -566,6 +588,7 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
         for (const auto& n : run.nodes)
             for (const auto& [k, v] : n.L.finalW()) { (void)k; if (v < 0) ++run.neg_seen; }
         run.win_max = std::max(run.win_max, run.nodes[0].L.drops_window().size());
+        {   long long F = 0; for (const auto& [k, v] : run.nodes[0].L.effective_owed_all()) { (void)k; if (v > 0) F += v; } run.F_at.push_back(F); }
         const auto d0 = run.nodes[0].L.owed_digest();
         bool same = true;
         for (const auto& n : run.nodes) if (!(n.L.owed_digest() == d0)) same = false;
@@ -696,6 +719,62 @@ void m7_spend_floor() {
           "the ledger does not grow: total owed %lld == the seeded float %lld (+ at most 1 piconero marker per block); "
           "the seeds moved to the miners (%lld), tiny crumbs %lld",
           total, seeds_then, big_bal, tiny_bal);
+}
+
+
+// M7c (B7): THE DRAIN RULE on three nodes. Its claim "a canonical block
+// creates no new balance" holds under three stated preconditions (amendment
+// A3), each KATted: (iii) seeds do create owed -- the 1.04 XMR float -- and
+// the drain pays it to 0 within ceil(F / (R * min(dh, 64) / 256)) blocks and
+// it stays 0; (ii) a DROPS due with the window rule OFF creates owed through
+// its claim, which the drain pays back once the deposits stop; (i) the empty-
+// cut finder is v37_xmr_coinbase_recompute_kat R19.
+void m7c_drain() {
+    std::printf("== M7c. THE DRAIN RULE: the seeded 1.04 XMR float reaches 0 and stays 0; A3 preconditions ==\n");
+    g_spend_floor = true; g_drain = o2::DrainRule{1, 16, 64}; g_hstep = 64;   // a lane block every 64 Monero heights: R/4 each
+    LaneWorld W;
+    for (int i = 0; i < 40; ++i) { const Payee p = payee(static_cast<std::uint8_t>(120 + i)); W.miners.push_back(p); W.universe[p.id] = p.ref; }
+    const std::uint64_t H = 24;
+    Run r = simulate(W, H);
+    CHECK(r.blocks == H && r.canonical == H && r.mismatch == 0 && r.other == 0 && r.verdict_splits == 0 && r.split_heights == 0,
+          "(iii) every one of %llu drain blocks is CANONICAL on every node, one owed_digest per height (canonical=%zu)",
+          (unsigned long long)H, r.canonical);
+    long long seeds = 0; for (const auto a : W.seed_amount) seeds += a;
+    const auto blk = asm_::xmr_base_reward(kAgc) + 2 * 20000000ull;   // the rig's coinbase total
+    const std::uint64_t bound = (static_cast<std::uint64_t>(seeds) + blk / 4 - 1) / (blk / 4);
+    std::size_t zero_at = r.F_at.size();
+    for (std::size_t i = 0; i < r.F_at.size(); ++i) if (r.F_at[i] == 0) { zero_at = i; break; }
+    bool stays = zero_at < r.F_at.size();
+    for (std::size_t i = zero_at; i < r.F_at.size(); ++i) if (r.F_at[i] != 0) stays = false;
+    std::printf("    float %lld, R/4 %llu: F reaches 0 after block %zu (bound %llu blocks); F series:", seeds,
+                (unsigned long long)(blk / 4), zero_at + 1, (unsigned long long)bound);
+    for (std::size_t i = 0; i < r.F_at.size() && i < 10; ++i) std::printf(" %lld", r.F_at[i]);
+    std::printf("\n");
+    CHECK(r.F_at.size() > 0 && r.F_at[0] < seeds && zero_at + 1 <= bound && stays,
+          "(iii) the seeded %lld piconero reaches 0 within ceil(F / (R/4)) = %llu blocks and stays 0 (no canonical block creates a balance)",
+          seeds, (unsigned long long)bound);
+    bool none = true;
+    for (const auto& [k, eb] : r.eb_gross) { (void)eb; if (eo(r, k) != 0) none = false; }
+    CHECK(none, "every miner, dust included, ends with no balance: each block paid its window E_b(P) in full");
+    g_hstep = 1; g_drain = o2::DrainRule{}; g_spend_floor = false;
+
+    // (ii) DROPS due with the window rule OFF: the claim adds avail to E_b, so the
+    // window is short and keeps a balance; the drain pays it back after the deposits.
+    g_spend_floor = true; g_anchor = true; g_drops_due = true; g_drops_window = false; g_no_seeds = true;
+    g_drain = o2::DrainRule{1, 16, 64}; g_hstep = 64;
+    LaneWorld W2;
+    const Payee X = payee(0x5e);
+    W2.universe[X.id] = X.ref;
+    g_deposit = [&](std::uint64_t h) { return (h >= 6 && h <= 8) ? std::map<::v37::bytes32, long long>{{X.id, 300000000000ll}} : std::map<::v37::bytes32, long long>{}; };
+    Run r2 = simulate(W2, 30);
+    long long fmax = 0; for (const auto f : r2.F_at) fmax = std::max(fmax, f);
+    CHECK(r2.canonical == 30 && r2.verdict_splits == 0 && r2.split_heights == 0, "(ii) 30 blocks canonical on every node, one digest");
+    CHECK(fmax > 0 && !r2.F_at.empty() && r2.F_at.back() == 0,
+          "(ii) a DROPS due claimed with the window rule off creates owed (F up to %lld): the stated precondition; the drain "
+          "pays it back to 0 once the deposits stop (F at the end %lld)", fmax, r2.F_at.empty() ? -1 : r2.F_at.back());
+    g_deposit = nullptr;
+    g_hstep = 1; g_drain = o2::DrainRule{};
+    g_spend_floor = false; g_anchor = false; g_drops_due = false; g_no_seeds = false;
 }
 
 void m7b_fresh_pool() {
@@ -1023,13 +1102,37 @@ void m5_gate_and_config() {
     // LANE-RULES (K6): the regtest rigs keep every knob (D_conf 3/4/10 included); stagenet and
     // testnet keep the settlement knobs but not a D_conf below Monero's coinbase maturity.
     { XmrNodeConfig k = s; k.network = c2pool::v37n::xmr::MoneroNetwork::Regtest; k.d_conf = 4; k.settle_output_cap = 16;
-      k.owed_demo_amount = 1; k.drain_q = 16;
-      CHECK(lane_knob_refusal(k, true, true).empty(), "regtest keeps every knob for rigs (d_conf 4, output cap, demo, drain_q)"); }
+      k.owed_demo_amount = 1; k.drain_q = 16; k.drain_h_cap = 64; k.drain_rule_version = 1;
+      CHECK(lane_knob_refusal(k, true, true).empty(), "regtest keeps every knob for rigs (d_conf 4, output cap, demo, the drain triple)"); }
+    // THE DRAIN RULE (B17): the triple is checked on every network, pinned on mainnet.
+    for (const auto net : {c2pool::v37n::xmr::MoneroNetwork::Regtest, c2pool::v37n::xmr::MoneroNetwork::Stagenet,
+                           c2pool::v37n::xmr::MoneroNetwork::Testnet}) {
+        XmrNodeConfig k = s; k.network = net;
+        k.drain_q = 16; k.drain_h_cap = 64; k.drain_rule_version = 1;
+        CHECK(lane_knob_refusal(k, false, false).empty(), "K6 drain {1,16,64} on %s: accepted", c2pool::v37n::xmr::to_string(net));
+        struct T { std::uint32_t v, q, cap; const char* what; };
+        for (const T t : {T{0, 16, 0, "Q without the rule version (v == 0 needs Q == H_cap == 0)"},
+                          T{0, 0, 64, "H_cap without the rule version"},
+                          T{1, 0, 64, "version 1 with Q == 0"},
+                          T{1, 16, 0, "version 1 with H_cap == 0"},
+                          T{1, 16, 256, "H_cap >= Q * 16 (Delta could reach R: nobody admitted)"},
+                          T{2, 16, 64, "a newer rule version than this build"}}) {
+            XmrNodeConfig b = s; b.network = net; b.drain_rule_version = t.v; b.drain_q = t.q; b.drain_h_cap = t.cap;
+            const std::string why = lane_knob_refusal(b, false, false);
+            CHECK(!why.empty() && why.find("drain rule") != std::string::npos, "K6 drain {%u,%u,%u} on %s: refused, %s",
+                  t.v, t.q, t.cap, c2pool::v37n::xmr::to_string(net), t.what);
+        }
+    }
+    { XmrNodeConfig k = c; k.drain_q = 16; k.drain_h_cap = 64; k.drain_rule_version = 1;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain {1,16,64}: refused (0/0/0 until the operator's mainnet flag day)"); }
+    CHECK(c2pool::v37n::xmr::kMainnetDrainQ == 0 && c2pool::v37n::xmr::kMainnetDrainHCap == 0 && c2pool::v37n::xmr::kMainnetDrainRuleVersion == 0 &&
+          c2pool::v37n::xmr::kLaneDrainQ == 16 && c2pool::v37n::xmr::kLaneDrainHCap == 64 && c2pool::v37n::xmr::kLaneDrainRuleVersion == 1,
+          "K6 the network constants: mainnet 0/0/0, the test networks 16/64/1");
     { XmrNodeConfig k = s; k.settle_output_cap = 16; k.owed_demo_amount = 1;
       CHECK(lane_knob_refusal(k, true, true).empty(), "stagenet keeps the settlement knobs (the lane-rules HELLO/pool_tag name a mismatch)"); }
     { XmrNodeConfig k = c; k.owed_demo_amount = 1;
       CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet --owed-demo-amount 1: refused (seeds rows no other node has)"); }
-    { XmrNodeConfig k = c; k.drain_q = 16;
+    { XmrNodeConfig k = c; k.drain_q = 16; k.drain_h_cap = 64; k.drain_rule_version = 1;
       CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain_q 16: refused (the drain Q is a network constant)"); }
     for (const auto net : {c2pool::v37n::xmr::MoneroNetwork::Mainnet, c2pool::v37n::xmr::MoneroNetwork::Stagenet,
                            c2pool::v37n::xmr::MoneroNetwork::Testnet}) {
@@ -1064,6 +1167,7 @@ int main() {
     m6_thief_pays_local_ref();
     m7_spend_floor();
     m7b_fresh_pool();
+    m7c_drain();
     m9_reorg();
     m10_decay();
     m11_anchor();

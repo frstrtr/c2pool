@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,10 @@ struct FoundBlock {
     // bookings only; the credit above already folds it). Under the rule the
     // composed delta is booked as this block's DEPOSIT, never its credit.
     std::optional<settle::DropsFound>     due{};
+    // THE DRAIN RULE (OwedLedgerRules::decay_from_gross): the block's gross
+    // credited set G_b (a canonical booking; empty for a debit-only one). The
+    // lane height is `height` above (OwedLedgerRules::lane_height).
+    std::set<settle::bytes32>             gross{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -216,6 +221,14 @@ public:
                 ? settle::compose_credit_from_delta(b.credit, b.carried_drops)
                 : settle::compose_credit_replace(b.params, b.credit, b.harvested,
                                                  b.drops);
+        // THE DRAIN RULE: the lane height and gross set ride the FOUND (event + ledger) under the rules only.
+        std::optional<settle::LaneFound> lf;
+        if (m_ledger.rules().lane_height || m_ledger.rules().decay_from_gross) {
+            settle::LaneFound l;
+            l.height = b.height;
+            l.gross = b.gross;
+            lf = std::move(l);
+        }
         //  fix 2: a record left non-canonical by an ORPHAN may be re-FOUND when the block
         // becomes canonical again (branch flip-flop). The OwedLedger already admits it (the
         // pre-SETTLED orphan was a pure pending removal); only this per-bid idempotency stood in the way.
@@ -225,8 +238,9 @@ public:
             ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = credit; ev.payout = b.payout;
             set_cut(ev, b.cut);
             set_drops(ev, df);
+            set_lane(ev, lf);
             write_event(ev);
-            m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr);
+            m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr, lf ? &*lf : nullptr);
             ledger_event();   // R5
             it->second.credit = b.credit; it->second.payout = b.payout; it->second.cut = b.cut; it->second.canonical = true;
             return;   // m_by_height already lists it
@@ -238,8 +252,9 @@ public:
         ev.payout = b.payout;
         set_cut(ev, b.cut);
         set_drops(ev, df);
+        set_lane(ev, lf);
         write_event(ev);
-        m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr);
+        m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr, lf ? &*lf : nullptr);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
         ledger_event();   // R5

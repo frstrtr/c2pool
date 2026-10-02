@@ -927,6 +927,43 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_spend_floor_kat COMMAND v37_xmr_spend_floor_kat)
 
     # ------------------------------------------------------------------
+    # v37_xmr_drain_kat -- THE DRAIN RULE (operator rulings R1/R2/R5,
+    # 2026-10-02; docs/xmr-lane/settlement-drain.md): old balances are paid
+    # only out of Delta = min(F, R * min(dh, 64) / 256) per lane block and the
+    # window's E_b is split at P = R - debt_paid: 0 new owed, F = 0 is master
+    # byte for byte (a golden over 10,000 random inputs), K_o in a contested
+    # block, F over the whole ledger, Delta per Monero height, the B6
+    # fail-closed split and the gross-set dust clock.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_drain_kat
+        v37_xmr_drain_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_drain_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_drain_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_drain_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_drain_kat PRIVATE xmr_template xmr_node xmr_coin)
+    add_test(NAME v37_xmr_drain_kat COMMAND v37_xmr_drain_kat)
+
+    # ------------------------------------------------------------------
+    # v37_xmr_drain_wiring_kat -- THE DRAIN RULE's daemon-side activation
+    # chain and the receiver's D7 pieces, through the functions the daemon
+    # calls (network triple -> XmrNode ledger rules -> settlement rule ->
+    # template context; the builder's reward fixpoint; the refold at P, G_b,
+    # the finder at P), and operator ruling O-2: a lane-root-refused block is
+    # FOUND as an empty booking carrying its height (dh counts it), restart-safe.
+    # Network-free, RandomX-free (the v37_xmr_relay_repair_hold_kat shape).
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_drain_wiring_kat v37_xmr_drain_wiring_kat.cpp)
+    target_compile_features(v37_xmr_drain_wiring_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_drain_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_drain_wiring_kat PRIVATE xmr_node Threads::Threads)
+    add_test(NAME v37_xmr_drain_wiring_kat COMMAND v37_xmr_drain_wiring_kat)
+
+    # ------------------------------------------------------------------
     # SAME-BLOCK PAY-NOW on POOL-LINEAGE: one lane coinbase carries both the
     # V37N pay-now base and the V37P pool tag in the canonical order
     # V37N | V37D | V37P | V37C (V37C last); every field reads back (codec,

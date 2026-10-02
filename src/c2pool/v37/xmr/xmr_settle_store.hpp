@@ -43,6 +43,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -81,7 +82,7 @@ struct ISettleStore {
 // Records: u8 ver=1 ‖ payload. Ints little-endian. Fail-closed on a short read.
 // ---------------------------------------------------------------------------
 namespace store_codec {
-constexpr std::uint8_t SCHEMA_VER = 5;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments; 5: + the DROPS window entries
+constexpr std::uint8_t SCHEMA_VER = 6;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments; 5: + the DROPS window entries; 6: + the drain rule's lane height and gross set
 
 inline std::string chain_fmt(::v37::ChainId c) {
     char b[16];
@@ -179,11 +180,38 @@ struct SettleEvent {
     // FOUND, DROPS WINDOW rule (schema 5, A4b): the block's window entries.
     // Empty => byte-identical to schema 3/4.
     ::c2pool::v37n::settle::DropsWindow drops_window;
+    // FOUND, THE DRAIN RULE (schema 6): the lane block's Monero height and its
+    // gross credited set G_b (OwedLedgerRules::lane_height / decay_from_gross).
+    // Absent => byte-identical to schema 1-5. A schema-6 record writes every
+    // earlier section (empty when unused) and a flags byte (bit 0: has_drops).
+    bool          has_lane = false;
+    std::uint64_t lane_height = 0;
+    std::set<::v37::bytes32> lane_gross;
 
     std::string serialize() const {
         std::string s;
         const bool win = has_drops && !drops_window.empty();
         const bool enrol = has_drops && (!drops_enrol.empty() || win);
+        if (has_lane) {   // schema 6: every section present, then the flags byte and the lane section
+            s.push_back(char(6));
+            s.push_back(char(static_cast<std::uint8_t>(kind)));
+            store_codec::put_str(s, bid);
+            store_codec::put_amounts(s, credit);
+            store_codec::put_amounts(s, payout);
+            store_codec::put_u64(s, bin_height);
+            s.push_back(char(has_cut ? 1 : 0));
+            if (has_cut) { store_codec::put_u64(s, cut_pos); store_codec::put_str(s, cut_spine); }
+            store_codec::put_amounts(s, drops_deposit);
+            s.push_back(char(drops_claim ? 1 : 0));
+            store_codec::put_amounts(s, drops_claimed);
+            put_enrol(s);
+            put_window(s);
+            s.push_back(char(has_drops ? 1 : 0));
+            store_codec::put_u64(s, lane_height);
+            store_codec::put_u64(s, lane_gross.size());
+            for (const auto& k : lane_gross) s.append(reinterpret_cast<const char*>(k.data()), k.size());
+            return s;
+        }
         s.push_back(char(win ? std::uint8_t{5} : enrol ? std::uint8_t{4} : has_drops ? std::uint8_t{3} : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
         s.push_back(char(static_cast<std::uint8_t>(kind)));
         store_codec::put_str(s, bid);
@@ -202,25 +230,27 @@ struct SettleEvent {
             s.push_back(char(drops_claim ? 1 : 0));
             store_codec::put_amounts(s, drops_claimed);
         }
-        if (enrol) {   // schema 4
-            store_codec::put_u64(s, drops_enrol.size());
-            for (const auto& [k, r] : drops_enrol) {
-                s.append(reinterpret_cast<const char*>(k.data()), k.size());
-                store_codec::put_u64(s, r.eff);
-                s.push_back(char(static_cast<std::uint8_t>(r.ref.kind)));
-                store_codec::put_str(s, std::string(r.ref.payload.begin(), r.ref.payload.end()));
-            }
-        }
-        if (win) {   // schema 5
-            store_codec::put_u64(s, drops_window.size());
-            for (const auto& [ck, v] : drops_window) {
-                store_codec::put_u64(s, ck.c);
-                store_codec::put_u64(s, ck.n);   // A4c: the bin span
-                s.append(reinterpret_cast<const char*>(ck.payee.data()), ck.payee.size());
-                store_codec::put_u64(s, static_cast<std::uint64_t>(v));
-            }
-        }
+        if (enrol) put_enrol(s);    // schema 4
+        if (win) put_window(s);     // schema 5
         return s;
+    }
+    void put_enrol(std::string& s) const {
+        store_codec::put_u64(s, drops_enrol.size());
+        for (const auto& [k, r] : drops_enrol) {
+            s.append(reinterpret_cast<const char*>(k.data()), k.size());
+            store_codec::put_u64(s, r.eff);
+            s.push_back(char(static_cast<std::uint8_t>(r.ref.kind)));
+            store_codec::put_str(s, std::string(r.ref.payload.begin(), r.ref.payload.end()));
+        }
+    }
+    void put_window(std::string& s) const {
+        store_codec::put_u64(s, drops_window.size());
+        for (const auto& [ck, v] : drops_window) {
+            store_codec::put_u64(s, ck.c);
+            store_codec::put_u64(s, ck.n);   // A4c: the bin span
+            s.append(reinterpret_cast<const char*>(ck.payee.data()), ck.payee.size());
+            store_codec::put_u64(s, static_cast<std::uint64_t>(v));
+        }
     }
     static SettleEvent deserialize(const std::string& blob) {
         store_codec::Reader r(blob);
@@ -266,6 +296,13 @@ struct SettleEvent {
                 e.drops_window[::c2pool::v37n::settle::DropsWindowKey(c, nb, k)] = static_cast<long long>(r.u64());
             }
         }
+        if (ver >= 6) {   // THE DRAIN RULE: flags (bit 0 has_drops), then the lane section
+            e.has_drops = (r.u8() & 1) != 0;
+            e.has_lane = true;
+            e.lane_height = r.u64();
+            const std::uint64_t n = r.u64();
+            for (std::uint64_t i = 0; i < n; ++i) e.lane_gross.insert(r.b32());
+        }
         r.expect_end();
         return e;
     }
@@ -293,6 +330,19 @@ inline void set_drops(SettleEvent& e, const std::optional<::c2pool::v37n::settle
     e.has_drops = d.has_value() && !d->empty();
     e.drops_deposit.clear(); e.drops_claim = false; e.drops_claimed.clear(); e.drops_enrol.clear(); e.drops_window.clear();
     if (e.has_drops) { e.drops_deposit = d->deposit; e.drops_claim = d->claim; e.drops_claimed = d->claimed; e.drops_enrol = d->enrol_add; e.drops_window = d->window; }
+}
+// THE DRAIN RULE: the lane fields a FOUND event carries, in the ledger's type.
+inline std::optional<::c2pool::v37n::settle::LaneFound> lane_of(const SettleEvent& e) {
+    if (!e.has_lane) return std::nullopt;
+    ::c2pool::v37n::settle::LaneFound l;
+    l.height = e.lane_height; l.gross = e.lane_gross;
+    return l;
+}
+inline void set_lane(SettleEvent& e, const std::optional<::c2pool::v37n::settle::LaneFound>& l) {
+    e.has_lane = l.has_value();
+    e.lane_height = l ? l->height : 0;
+    e.lane_gross.clear();
+    if (l) e.lane_gross = l->gross;
 }
 inline void set_cut(SettleEvent& e, const std::optional<::c2pool::v37n::settle::AnchorCut>& c) {
     e.has_cut = c.has_value();
@@ -459,7 +509,8 @@ public:
                         case SettleEvKind::Found:
                             {
                                 const auto df = drops_of(e);
-                                ledger.on_block_found(e.bid, e.credit, e.payout, anchor_of(e), df ? &*df : nullptr);
+                                const auto lf = lane_of(e);   // THE DRAIN RULE
+                                ledger.on_block_found(e.bid, e.credit, e.payout, anchor_of(e), df ? &*df : nullptr, lf ? &*lf : nullptr);
                             }
                             break;
                         case SettleEvKind::Finalize:

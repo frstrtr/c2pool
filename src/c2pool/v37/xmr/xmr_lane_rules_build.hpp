@@ -72,9 +72,9 @@ inline LaneRules lane_rules_of(const XmrNodeConfig& c, const LaneRulesInputs& in
                                   : in.residual_sink_id;
     r.pool_rules_version = ::c2pool::v37n::xmr::relay::kXmrPoolRulesVersion;
     r.owed_demo_amount   = c.owed_demo_amount;
-    r.drain_q            = c.drain_q;   // 0 until the drain rule's own flag day (slice B)
-    r.drain_h_cap        = 0;
-    r.drain_rule_version = 0;
+    r.drain_q            = c.drain_q;              // THE DRAIN RULE (settlement-drain.md): 16 / 64 / 1 on the
+    r.drain_h_cap        = c.drain_h_cap;          // test networks from its flag day, 0 / 0 / 0 = master
+    r.drain_rule_version = c.drain_rule_version;
     r.pool_tag_codec     = ::c2pool::v37n::xmr::credit::kPoolTagVersion;
     r.lane_params_digest = in.lane_params_digest;
     r.enrol_digest       = in.enrol_digest;
