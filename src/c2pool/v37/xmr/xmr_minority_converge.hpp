@@ -160,6 +160,8 @@ struct DecodeResult {
     // Rule off: the deposit is composed into the credit (as the live finalize
     // driver does); rule on: it is booked as the deposit.
     std::optional<::c2pool::v37n::settle::DropsFound> drops;
+    // THE DRAIN RULE: the booking's gross credited set G_b (empty: debit-only).
+    std::set<::v37::bytes32> gross;
 };
 // cands/superseded: the scratch ring's candidates (live first), as ReconRing::
 // candidates() produces them. root_only: the refold already holds this block's
@@ -193,7 +195,9 @@ struct RefusedBlock {
     DecodeResult  r;                               // the scratch decode (when not forced)
 };
 struct PendingOut { std::uint64_t h = 0; std::string bid; Amounts credit, payout; std::optional<::c2pool::v37n::settle::AnchorCut> cut;
-                    std::optional<::c2pool::v37n::settle::DropsFound> drops; };   // DROPS (gap 2)
+                    std::optional<::c2pool::v37n::settle::DropsFound> drops;      // DROPS (gap 2)
+                    std::set<::v37::bytes32> gross;                              // THE DRAIN RULE
+                    bool empty = false; };                                       // O-2: an empty FOUND of a refused block
 
 struct RefoldResult {
     bool          ok = false;
@@ -217,10 +221,16 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     std::map<std::string, std::uint64_t> fin_since;
     std::map<std::string, std::pair<Amounts, Amounts>> old_maps;
     std::map<std::string, std::optional<::c2pool::v37n::settle::DropsFound>> old_drops;   // DROPS (gap 2)
+    std::map<std::string, std::set<::v37::bytes32>> old_gross;                            // THE DRAIN RULE
+    std::set<std::string> old_empty;   // O-2: an empty FOUND (a refused block's height only) books no money
     for (const auto& e : in.events) {
         if (e.kind == SettleEvKind::Finalize) fin_since[e.bid] = since_of_bin(e.bin_height);
-        else if (e.kind == SettleEvKind::Found) { old_maps[e.bid] = {e.credit, e.payout}; old_drops[e.bid] = drops_of(e); }
+        else if (e.kind == SettleEvKind::Found) {
+            old_maps[e.bid] = {e.credit, e.payout}; old_drops[e.bid] = drops_of(e); old_gross[e.bid] = e.lane_gross;
+            if (in.rules.lane_height && e.credit.empty() && e.payout.empty()) old_empty.insert(e.bid); else old_empty.erase(e.bid);
+        }
     }
+    const bool lane_rule = in.rules.lane_height || in.rules.decay_from_gross;   // THE DRAIN RULE
     OwedLedger L(in.chain, in.rules);
     recon::ReconRing ring(4096);
     std::uint64_t since = 0;
@@ -237,7 +247,8 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
         switch (e.kind) {
             case SettleEvKind::Found: {
                 const auto df = drops_of(e);
-                L.on_block_found(e.bid, e.credit, e.payout, anchor_of(e), df ? &*df : nullptr);
+                const auto lf = lane_of(e);   // THE DRAIN RULE
+                L.on_block_found(e.bid, e.credit, e.payout, anchor_of(e), df ? &*df : nullptr, lf ? &*lf : nullptr);
                 break;
             }
             case SettleEvKind::Finalize: since = since_of_bin(e.bin_height); L.on_block_finalized(e.bid, e.bin_height); break;
@@ -253,17 +264,47 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     std::map<std::string, std::pair<Amounts, Amounts>> maps;
     std::map<std::string, std::optional<::c2pool::v37n::settle::AnchorCut>> cuts;
     std::map<std::string, std::optional<::c2pool::v37n::settle::DropsFound>> dropss;   // DROPS (gap 2)
+    std::map<std::string, std::set<::v37::bytes32>> grosss;                             // THE DRAIN RULE
+    std::set<std::string> empties;                                                      // O-2
+    // THE DRAIN RULE, operator ruling O-2: a lane-root-refused block (forced, or
+    // decoded "lane-root-refused:" under the scratch ring) is FOUND as an EMPTY
+    // booking carrying its height, exactly as the live booking does
+    // (FinalizeConnect::found_refused_empty), so dh and V37Z are reproduced.
+    auto found_empty = [&](std::uint64_t h, const std::string& bid) {
+        ::c2pool::v37n::settle::LaneFound l; l.height = h;
+        SettleEvent fe; fe.kind = SettleEvKind::Found; fe.bid = bid;
+        set_lane(fe, std::optional<::c2pool::v37n::settle::LaneFound>(l));
+        L.on_block_found(bid, {}, {}, std::nullopt, nullptr, &l);
+        out.events.push_back(fe);
+        pend[h] = bid; maps[bid] = {}; cuts[bid] = std::nullopt; dropss[bid] = std::nullopt; grosss[bid] = {}; empties.insert(bid);
+        note_state();
+    };
     auto book = [&](std::uint64_t h) -> bool {
         if (h <= in.fork_h || h > top) return true;
         const auto cb = in.chain_blocks.find(h);
         if (cb == in.chain_blocks.end() || cb->second.empty()) return true;
         const std::string& bid = cb->second;
         const auto om = old_maps.find(bid);
-        const bool had_old = om != old_maps.end();
+        const bool had_old = om != old_maps.end() && !old_empty.count(bid);   // O-2: an empty FOUND is no booking of money
         if (in.refuse.count(bid)) {
             RefusedBlock rb; rb.h = h; rb.bid = bid; rb.forced = true; rb.had_old = had_old;
             if (had_old) rb.old_payout = om->second.second;
             out.refused.push_back(std::move(rb));
+            if (in.rules.lane_height) {
+                // O-2: the majority refused it; it FOUND it empty iff the refusal
+                // was on the lane-root path, i.e. iff the block's root is not in
+                // the scratch ring (the majority's history). Root-only decode.
+                std::vector<::v37::bytes32> fc; std::vector<std::uint64_t> fs;
+                ring.candidates(L.owed_digest(), fc, fs);
+                const DecodeResult fr = decode(h, bid, fc, fs, /*root_only=*/true, L);
+                ++out.decoded;
+                if (fr.outcome == DecodeOutcome::Undecidable) {
+                    out.undecidable = true;
+                    out.why = "h=" + std::to_string(h) + " bid=" + bid.substr(0, 12) + " undecidable (forced, root): " + fr.why;
+                    return false;
+                }
+                if (fr.outcome == DecodeOutcome::Refused && fr.why.rfind("lane-root-refused:", 0) == 0) found_empty(h, bid);
+            }
             return true;
         }
         std::vector<::v37::bytes32> cands; std::vector<std::uint64_t> sup;
@@ -277,10 +318,12 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
             case DecodeOutcome::Booked: {
                 Amounts credit = r.credit, payout = r.payout;
                 std::optional<::c2pool::v37n::settle::DropsFound> df = r.drops;
+                std::set<::v37::bytes32> gross = r.gross;
                 if (reuse) {
                     credit = om->second.first; payout = om->second.second; ++out.reused_maps;
                     const auto od = old_drops.find(bid);
                     df = od == old_drops.end() ? std::nullopt : od->second;
+                    if (const auto og = old_gross.find(bid); og != old_gross.end()) gross = og->second;
                 } else if (df && !in.rules.drops_due) {
                     // gap 2, rule off: the live driver composes the delta into the credit
                     credit = ::c2pool::v37n::settle::compose_credit_from_delta(credit, df->deposit);
@@ -290,9 +333,12 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
                 SettleEvent fe; fe.kind = SettleEvKind::Found; fe.bid = bid; fe.credit = credit; fe.payout = payout;
                 set_cut(fe, r.cut);
                 set_drops(fe, df);
-                L.on_block_found(bid, credit, payout, r.cut, df ? &*df : nullptr);
+                std::optional<::c2pool::v37n::settle::LaneFound> lf;   // THE DRAIN RULE: height + G_b, as the live driver
+                if (lane_rule) { ::c2pool::v37n::settle::LaneFound l; l.height = h; l.gross = gross; lf = std::move(l); }
+                set_lane(fe, lf);
+                L.on_block_found(bid, credit, payout, r.cut, df ? &*df : nullptr, lf ? &*lf : nullptr);
                 out.events.push_back(fe);
-                pend[h] = bid; maps[bid] = {credit, payout}; cuts[bid] = r.cut; dropss[bid] = df; out.booked[bid] = h;
+                pend[h] = bid; maps[bid] = {credit, payout}; cuts[bid] = r.cut; dropss[bid] = df; grosss[bid] = gross; out.booked[bid] = h;
                 note_state();
                 return true;
             }
@@ -301,6 +347,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
                 RefusedBlock rb; rb.h = h; rb.bid = bid; rb.had_old = had_old; rb.r = r;
                 if (had_old) rb.old_payout = om->second.second;
                 out.refused.push_back(std::move(rb));
+                if (in.rules.lane_height && r.why.rfind("lane-root-refused:", 0) == 0) found_empty(h, bid);   // O-2
                 return true;
             }
             case DecodeOutcome::Undecidable:
@@ -326,7 +373,7 @@ inline RefoldResult refold(const RefoldInput& in, const DecodeFn& decode) {
     }
     for (const auto& [h, bid] : pend) {
         const auto& m = maps[bid];
-        out.pending.push_back(PendingOut{h, bid, m.first, m.second, cuts[bid], dropss[bid]});
+        out.pending.push_back(PendingOut{h, bid, m.first, m.second, cuts[bid], dropss[bid], grosss[bid], empties.count(bid) > 0});
     }
     out.digest = L.owed_digest();
     out.since = since;

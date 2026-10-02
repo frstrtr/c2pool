@@ -20,11 +20,12 @@ builder runs it to make a template. Every other node runs the same code to
 check the block (§2). The block's reward is spent in this order:
 
 1. **Owed balances** from earlier blocks, oldest first, each at least the
-   spend-cost floor c.
-2. **Smaller balances** (below c), from the cash that is left, in output
+   spend-cost floor c, out of the block's debt slice
+   `Delta = min(F, R × min(dh, 64) / 256)` (the drain rule, §3).
+2. **Smaller balances** (below c), from what is left of that slice, in output
    slots that pay-now does not need.
-3. **Pay-now**: each miner of the window is paid its share of this block, in
-   this block.
+3. **Pay-now**: each miner of the window is paid its share of the rest of the
+   block, `P = R − debt_paid`, in this block.
 4. **The residual**, whatever is left, in the donation output, which is
    always the last output.
 
@@ -122,14 +123,32 @@ floor (`fee_per_byte_at_floor`) times the weight of one ring-16 CLSAG input
 block's own total. At a reward of 0.6 XMR, c is about 0.0000125 XMR
 ([`payout-threshold.md`](payout-threshold.md) §2).
 
+**The drain rule** (operator rulings 2026-10-02,
+[`settlement-drain.md`](settlement-drain.md)). Old balances are paid only out
+of a bounded slice of the block, `Delta = min(F, R × min(dh, 64) / 256)`:
+F is the sum of every positive balance in the ledger, dh the Monero heights
+since this pool's previous lane block (ledger state, `V37Z`). That is R/256
+per Monero height, the operator's "1/16 of a block" at P2Pool-main cadence,
+at most a quarter of any block. The window is paid first: its E_b is split at
+`P = R − debt_paid` and, when everyone has a slot, paid in full, so a
+canonical block creates no new balance and the float falls to 0. With no old
+balance the block is master's, byte for byte. The three numbers (Q = 16,
+H_cap = 64, rule version 1) are lane rules 23-25: a node with other values is
+refused at HELLO and sees our lane blocks as ordinary blocks
+([`lane-rules.md`](lane-rules.md)).
+
 **Owed pass.** Balances are paid oldest first, by `first_eligible` ascending
 (K_fair). Equal ages are the normal case. They are ordered by
 `sha256d("V37T" || prev_id || key)`, where `prev_id` is the parent block id: a
 value the builder cannot choose and nobody can predict before the parent
 exists (`OwedLedger::propose_coinbase_salted`, `w4_settlement.hpp`; turned on
 by `kfair_salted_ties` in `main_v37_xmr.cpp`). Each key takes
-min(balance, budget left) until the budget or the output cap of 2700 runs
-out. A balance below c is not taken here (`allocate_exact_sum`).
+min(balance, budget left) until the budget (Delta under the drain rule) or the
+output cap of 2700 runs out. A balance below c is not taken here
+(`allocate_exact_sum`); under the drain rule a take below c(R) is handed to
+the dust pass instead of being skipped. When the owed outputs and the window
+do not all fit, the owed pass keeps at most
+`K_o = max(1, cap_owed × owed_paid_1 / R)` slots, its cash share of the block.
 
 **Pay-now.** What the owed pass leaves pays the miners of the window, each its
 E_b: its share of the block's total by window weight (`settle::split_reward`
@@ -152,16 +171,19 @@ balance is the youngest), with ties broken by the same salted hash. Beyond
 the c line, the size of E_b never decides (`allocate_exact_sum` with
 `CoinbaseInputs::spend_floor`).
 
-**Short pool.** When the owed pass left less than the window's total E_b,
-every payee with a slot gets the same fraction of its E_b (`paynow_split`).
-The rest stays as its balance, and the owed queue pays it later. That is a
-partial payment, not an advance.
+**Short pool.** With the drain rule the window's E_b is split at P, the cash
+the debt left, so the pool is not short for old debt. When it is short for
+another reason (a DROPS due claimed with the window rule off), every payee
+with a slot gets the same fraction of its E_b (`paynow_split`); the rest
+stays its balance and the drain pays it later. That is a partial payment,
+not an advance.
 
-**Payees without a slot.** Their cash first pays the admitted payees' own
-balances that the owed pass left unpaid, and the waiting payees keep that much
-of their E_b as a balance. What is still left is redistributed: it goes to the
+**Payees without a slot.** Their cash is redistributed: it goes to the
 admitted payees pro rata and comes off the waiting payees' credit for this
-block, which is P2Pool's rule for outputs that do not fit. Their work stays in
+block, which is P2Pool's rule for outputs that do not fit (ruling R4,
+2026-10-02, to revisit before FCMP++). Master's earlier DEBT FIRST step,
+which paid the admitted payees' old balances out of the waiting payees' cash
+and left those waiting an IOU, is removed by the drain rule. Their work stays in
 the window and earns in later blocks. Anything left after that stays in the
 residual. The redistribution is a credit delta that sums to zero, and every
 node gets it from its own recompute (the `credit_delta` of
@@ -318,12 +340,16 @@ mainnet these settings are pinned, and the node refuses to start otherwise
 - `--d-conf` must be 60;
 - `--settle-h-min` must be 0;
 - `--settle-output-cap` must stay at its default;
-- `--recon-max-root-age` and `--no-book-deferral` are refused.
+- `--recon-max-root-age` and `--no-book-deferral` are refused;
+- the drain rule's lane rules (`drain_q`, `drain_h_cap`, `drain_rule_version`)
+  are network constants with no flag: 0 / 0 / 0 on mainnet until the
+  operator's flag day, 16 / 64 / 1 on the test networks.
 
 The fee model is part of the relay handshake, and so is the DROPS rule set.
-The other settings are not, so on a test network a mismatch in them is not
-refused at HELLO; it shows up later as debit-only bookings and a split
-ledger. `--give-author-pct` and `--node-owner-fee-pct` may differ between
+Since the lane-rules list ([`lane-rules.md`](lane-rules.md)) every other
+setting above, the drain rule's three included, is in the HELLO and in the
+pool_tag: a node with another value is refused by name and books our lane
+blocks as ordinary blocks, never debit-only. `--give-author-pct` and `--node-owner-fee-pct` may differ between
 nodes: the give-author value rides in each receipt, and the owner fee only
 changes a job's payee.
 
@@ -369,3 +395,11 @@ changes a job's payee.
   closed by #1884.
 - **Address privacy.** On the BTC-family lanes the byte floor makes address
   reuse cheaper (§6). This does not apply on XMR.
+- **The drain's price.** While old balances exist the window gives up
+  `min(dh, 64) / 256` of each block (6.0-6.3 % on average at P2Pool-main
+  cadence, at most 25 % of one block); after that, nothing. A lane that finds
+  a block less often than every 64 Monero heights drains in more days: at
+  P2Pool-mini cadence 1.2 XMR takes about 1.4 days, at nano cadence about 16
+  days ([`settlement-drain.md`](settlement-drain.md)). In an overflowing pool
+  the sub-c waiters lose their share of those blocks to the admitted payees
+  (P2Pool's rule, ruling R4).

@@ -510,6 +510,35 @@ int main() {
           A.relay->cache_size() == 4 && B.relay->cache_size() == 3, "P8 no receipt crossed (each cache holds only its own)");
         B.relay->set_dialing(false);
     }
+    {   // B16: THE DRAIN RULE's flag day. A runs {1,16,64}, B master's {0,0,0}: refused by name, both sides.
+        std::printf("-- P8c LANE-RULES: A drain {1,16,64} vs B drain {0,0,0} (the drain rule's flag day)\n");
+        c2pool::v37n::xmr::lanerules::LaneRules r0;
+        r0.d_conf = 60; r0.output_cap = 2700; r0.recon_max_root_age = 240; r0.book_deferral = 1; r0.coinbase_maturity = 60;
+        auto r1 = r0; r1.drain_q = 16; r1.drain_h_cap = 64; r1.drain_rule_version = 1;
+        Cfg ca = same; ca.rules = r1;
+        Cfg cb = same; cb.rules = r0;
+        TNode A("A", ca, true, {});
+        C(A.start(), "P8c A starts (drain {1,16,64})");
+        TNode B("B", cb, true, {A.relay->listen_port()});
+        C(B.start(), "P8c B starts (drain {0,0,0}), dials A");
+        std::vector<TNode*> all{&A, &B};
+        for (auto* n : all) { for (int i = 0; i < 4; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
+        const SynthBlock bA = make_block(100, prev[0], 1, nullptr, 3, 10);
+        const SynthBlock bB = make_block(100, prev[0], 2, nullptr, 3, 11);
+        for (std::uint32_t k = 0; k < 4; ++k) A.relay->submit_own(own(bA, 10 + k, pA, kChain));
+        for (std::uint32_t k = 0; k < 3; ++k) B.relay->submit_own(own(bB, 20 + k, pB, kChain));
+        const std::string la = "LANE_RULES_MISMATCH field=drain_q ours=16 theirs=0 (+2 more: drain_h_cap 64/0, drain_rule_version 1/0)";
+        const std::string lb = "LANE_RULES_MISMATCH field=drain_q ours=0 theirs=16 (+2 more: drain_h_cap 0/64, drain_rule_version 0/1)";
+        const bool seen = wait_for([&] { return A.count_logs("HELLO REFUSED", la) >= 1 && B.count_logs("HELLO REFUSED", lb) >= 1; }, all, 10000ms);
+        std::this_thread::sleep_for(1500ms);
+        for (auto* n : all) n->pump();
+        std::printf("    last reject at A: %s\n", A.relay->last_reject().c_str());
+        C(seen, "P8c both nodes log HELLO REFUSED: " + la + " (and the mirror at B)");
+        C(A.relay->stats().hello_ok.load() == 0 && B.relay->stats().hello_ok.load() == 0 && A.relay->ready_peers().empty() &&
+          B.relay->ready_peers().empty(), "P8c no HELLO ever completed: 0 ready peers on both");
+        C(A.relay->cache_size() == 4 && B.relay->cache_size() == 3, "P8c no receipt crossed (each cache holds only its own)");
+        B.relay->set_dialing(false);
+    }
     {
         std::printf("-- P8b LANE-RULES: equal lists interoperate, byte-identical lane (== the P5 tagged digest)\n");
         c2pool::v37n::xmr::lanerules::LaneRules r60;

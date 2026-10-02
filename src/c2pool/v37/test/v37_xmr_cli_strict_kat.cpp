@@ -180,6 +180,9 @@ struct Bad { std::vector<std::string> tail; std::string names; const char* what;
 void bad_rows() {
     const std::vector<Bad> rows = {
         {{"--bogus-flag"},                     "--bogus-flag",          "an unknown flag"},
+        {{"--drain-q", "16"},                  "--drain-q",             "the drain rule's Q (a network constant, never a flag)"},
+        {{"--drain-h-cap", "64"},              "--drain-h-cap",         "the drain rule's H_cap (a network constant, never a flag)"},
+        {{"--drain-rule-version", "1"},        "--drain-rule-version",  "the drain rule's version (the flag day, never a flag)"},
         {{"--verison"},                        "--verison",             "a typo of --version"},
         {{"--netwrok", "regtest"},             "--netwrok",             "a typo of --network"},
         {{"--rpc-prot", "1"},                  "--rpc-prot",            "a typo of --rpc-port"},

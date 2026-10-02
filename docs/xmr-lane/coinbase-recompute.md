@@ -63,6 +63,20 @@ Two builder inputs are not available to a receiver:
   refused as an **under-take**. Without V37N, the X6 pass at the final total
   truncates the takes to exactly the greedy pass at that total, so the
   recompute runs at the total.
+  **Under the drain rule** ([`settlement-drain.md`](settlement-drain.md)) the
+  takes are a function of the ledger, the total and dh: the K_fair pass at
+  `Delta = min(F, R × min(dh, 64) / 256)`. The recompute derives F, dh and
+  Delta from its own ledger (no claim field) and requires the V37N base to
+  state exactly those takes: more is an **over-take** (old debt beyond
+  Delta), less an under-take, both a Mismatch, and there is no rebuild at a
+  committed base. The builder therefore cuts its snapshot at the template's
+  final reward (`xmr_o2_settlement_provider.hpp`, a bounded fixpoint). A
+  canonical drain block is booked at `P = R − debt_paid`
+  (`Result::split_at`): the receiver refolds the window's E_b there before the
+  net booking (`v37_xmr_coinbase_recompute_kat` R16-R19: the over-take, the
+  under-take, takes at a larger hint, the window credited at R, more than K_o
+  owed slots, a skipped sub-c take, another dh and a version-0 builder are
+  each a Mismatch on every receiver).
 * **The output cap.** The assembler resolves a weight-aware cap from its own
   transaction set. The recompute accepts the caps that can have produced the
   block's output count (`n` and `n + 1`) and the lane ceiling. A smaller cap

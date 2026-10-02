@@ -61,6 +61,7 @@
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
 #include "c2pool/v37/xmr/xmr_node_config.hpp"
+#include "c2pool/v37/xmr/xmr_finalize_driver.hpp"   // THE DRAIN RULE: FOUND (height, G_b) through the store
 #if __has_include("c2pool/v37/xmr/xmr_coinbase_recompute.hpp")
 #include "c2pool/v37/xmr/xmr_coinbase_recompute.hpp"
 #define RECOMPUTE_FIX 1
@@ -160,6 +161,12 @@ struct BuildOpts {
     // V37N / V37D tails are then re-derived from the edited inputs.
     std::function<void(x6::CoinbaseInputs&)> mutate;
     std::function<void(o2::XmrCoinbaseContext&)> mutate_ctx;
+    // THE DRAIN RULE: an honest rule-on builder (spend floor, {1,16,64}) cuts
+    // its snapshot at the template's FINAL reward (the provider's fixpoint);
+    // fixpoint = false keeps the takes chosen at the first reward hint.
+    bool drain = false;
+    bool fixpoint = true;
+    std::uint32_t cap = 2700;
 };
 
 struct Block {
@@ -184,7 +191,8 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o)
     ctx.lane_commitment = o.commit_digest ? *o.commit_digest : L.owed_digest();
     ctx.residual_sink = fee::donation_ref(kNet); ctx.residual_sink_identity = fee::donation_identity(kNet);
     ctx.fixed = {fee::donation_marker(kNet)};
-    ctx.h_min = 0; ctx.output_cap = 2700;
+    ctx.h_min = 0; ctx.output_cap = o.cap;
+    if (o.drain) { ctx.spend_floor = true; ctx.drain = o2::DrainRule{1, 16, 64}; }
     ctx.has_credit_cut = true; ctx.credit_cut = the_cut();
     ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
     ctx.has_paynow = o.has_view;
@@ -201,6 +209,8 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o)
     asm_::AssemblyInputs a;
     a.miner = md;
     a.mempool = o.mempool;
+    a.wire_cap = o.cap;
+    auto settle_from = [&]() {
     a.settle = o2::assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
     a.extra_nonce_tail = src->extra_nonce_tail();
     if (o.mutate) {
@@ -219,10 +229,21 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o)
         const auto c = cr::encode_tail(the_cut()); t.insert(t.end(), c.begin(), c.end());
         a.extra_nonce_tail = t;
     }
+    };
+    settle_from();
     a.extra_nonce_bind_size = 32;
     a.extra_nonce_bind = [](std::uint32_t en, std::uint8_t* b) { for (int i = 0; i < 32; ++i) b[i] = static_cast<std::uint8_t>(en * 13 + i); return true; };
     auto t = asm_::XmrBlockAssembler::build(a, &why);
     if (!t) { out.why = "assembler: " + why; return out; }
+    // THE DRAIN RULE: the provider's fixpoint (xmr_o2_settlement_provider.hpp)
+    for (int pass = 0; o.fixpoint && src->drain_on() && t->reward() != src->reward_hint() && pass < 4; ++pass) {
+        src = o2::XmrOwedSettlementSource::build(L, lane.pay_of(), ctx, t->reward(), &why);
+        if (!src) { out.why = "source (fixpoint): " + why; return out; }
+        if (o.finder) { auto f = src->with_finder(*o.finder, &why); if (!f) { out.why = "finder: " + why; return out; } src = std::move(f); }
+        settle_from();
+        t = asm_::XmrBlockAssembler::build(a, &why);
+        if (!t) { out.why = "assembler (fixpoint): " + why; return out; }
+    }
     asm_::BlockBytes b;
     if (!t->materialize(7, b, &why)) { out.why = "materialize: " + why; return out; }
     out.ok = true;
@@ -235,6 +256,8 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o)
 #if RECOMPUTE_FIX
 namespace rc = c2pool::v37n::xmr::recompute;
 bool g_salted = false;   // the lane rule the receivers recompute with (#1867)
+bool g_drain = false;    // THE DRAIN RULE on the receivers (spend floor + {1,16,64})
+std::uint32_t g_cap = 2700;
 
 struct Verified {
     auth::CoinbaseBooking bk;
@@ -252,7 +275,8 @@ Verified receive(const Block& b, const st::OwedLedger& R, const Lane& lane, cons
     const ::v37::bytes32 tag = the_tag();
     v.bk = auth::decode_lane_coinbase_fee(b.blob, kChain, ring, keys, lane.pay_of(), kNet, &tag);
     rc::LaneInputs li;
-    li.chain_id = kChain; li.h_min = 0; li.owed_cap = 2700; li.wire_cap = 2700;
+    li.chain_id = kChain; li.h_min = 0; li.owed_cap = g_cap; li.wire_cap = g_cap;
+    if (g_drain) { li.spend_floor = true; li.drain = o2::DrainRule{1, 16, 64}; }
     li.residual_sink = fee::donation_ref(kNet); li.residual_sink_identity = fee::donation_identity(kNet);
     li.fixed = {fee::donation_marker(kNet)};
     li.pool_tag = the_tag();
@@ -550,6 +574,206 @@ void r15_salted_ties() {
     CHECK(vp.r.verdict == rc::Verdict::Mismatch, "a builder with the raw identity order is a MISMATCH: %s", vp.r.why.c_str());
     g_salted = false;
 }
+
+// ---------------------------------------------------------------------------
+// THE DRAIN RULE (rulings R1/R2/R5 2026-10-02, settlement-drain.md).
+// R16 (B12): dh lives in the ledger: the FOUND height, prev = max(pending,
+// settled), seeds never move it, an orphan drops out, "V37Z" in owed_digest
+// under the rule only, and the settle-store replay reproduces it.
+void r16_lane_height_in_ledger() {
+    std::printf("== R16. THE DRAIN RULE: the previous lane block's height is ledger state ==\n");
+    st::OwedLedgerRules on; on.lane_height = true; on.decay_from_gross = true;
+    st::OwedLedger L(kChain, on), M(kChain), M2(kChain);
+    const ::v37::bytes32 k = payee(31).id;
+    auto lf = [](std::uint64_t h) { st::LaneFound f; f.height = h; return f; };
+    L.on_block_found("seed", Amounts{{k, 5000}}, {}); L.on_block_finalized("seed", 1);
+    CHECK(L.prev_lane_height() == 0, "a seed is not a lane block: prev_lane_height 0");
+    const auto f100 = lf(100), f130 = lf(130);
+    L.on_block_found("b100", {}, {}, std::nullopt, nullptr, &f100);
+    L.on_block_found("b130", {}, {}, std::nullopt, nullptr, &f130);
+    CHECK(L.prev_lane_height() == 130 && L.heights_since_last_lane(150) == 20, "pending lane blocks count: prev 130, dh(150) = 20");
+    L.on_block_orphaned("b130", {});
+    CHECK(L.prev_lane_height() == 100, "an orphaned pending lane block drops out: prev 100");
+    const ::v37::bytes32 d_before = L.owed_digest();
+    L.on_block_finalized("b100", 160);
+    CHECK(L.last_settled_lane_height() == 100 && !(L.owed_digest() == d_before), "FINALIZE commits it (V37Z): settled 100, owed_digest moves");
+    // rule off: the same calls (the lane info ignored) leave master's ledger, byte for byte
+    for (st::OwedLedger* X : {&M, &M2}) { X->on_block_found("seed", Amounts{{k, 5000}}, {}); X->on_block_finalized("seed", 1); }
+    M.on_block_found("b100", {}, {}, std::nullopt, nullptr, &f100); M2.on_block_found("b100", {}, {});
+    M.on_block_finalized("b100", 160); M2.on_block_finalized("b100", 160);
+    CHECK(M.owed_digest() == M2.owed_digest() && M.owed_event_mmr_root() == M2.owed_event_mmr_root() && M.prev_lane_height() == 0,
+          "rule off: owed_digest and the event MMR are master's (no V37Z, no lane leaf)");
+    CHECK(!(L.owed_digest() == M.owed_digest()), "rule on: the V37Z section makes the digest differ from master's");
+    // the settle store: FOUND events carry (height, G_b); a replay rebuilds the same ledger
+    namespace xs = c2pool::v37n::xmr;
+    xs::MemSettleStore store;
+    st::OwedLedger D(kChain, on);
+    st::SettleHW hw;
+    xs::XmrFinalizeDriver drv(D, hw, store, kChain, 2, 0, 0, [](std::uint64_t, const std::string&) { return true; });
+    xs::FoundBlock a; a.bid = "aa01"; a.height = 200; a.gross = {k};
+    xs::FoundBlock b; b.bid = "aa02"; b.height = 230; b.gross = {};
+    drv.on_block_found(a); drv.on_block_found(b);
+    (void)drv.advance_to_tip(203, ::v37::bytes32{});   // finalizes a (200 + D_conf 2 <= 203)
+    st::OwedLedger D2(kChain, on);
+    bool ok = false;
+    xs::RecoveryDriver(store, kChain).recover(D2, ok);
+    CHECK(ok && D.last_settled_lane_height() == 200 && D.prev_lane_height() == 230 &&
+          D2.prev_lane_height() == 230 && D2.last_settled_lane_height() == 200 && D2.owed_digest() == D.owed_digest() &&
+          D2.owed_event_mmr_root() == D.owed_event_mmr_root(),
+          "the store replay reproduces the lane heights (settled 200, pending 230), owed_digest and the event MMR");
+}
+
+// A world whose float is larger than one block's slice (F > Delta).
+struct DrainWorld : World {
+    Payee K4 = payee(24);
+    DrainWorld() { lane.learn(K4); seed(L, K4.id, 900000000000ll, 12); }   // 0.9 XMR: F = 0.965 XMR
+};
+
+// R17 (B13): a REAL drain block is canonical on a receiver; it books at P.
+void r17_drain_block_canonical() {
+    std::printf("== R17. THE DRAIN RULE: a real drain block is canonical; the receiver books at P ==\n");
+    DrainWorld w;
+    g_drain = true;
+    BuildOpts o; o.cut_payees = w.cut; o.drain = true;
+    const Block b = build_block(w.L, w.lane, o);
+    CHECK(b.ok, "builds: %s", b.ok ? "ok" : b.why.c_str());
+    if (!b.ok) { g_drain = false; return; }
+    st::OwedLedger R = w.L;
+    const auto v = receive(b, R, w.lane, w.cut);
+    CHECK(v.r.canonical() && v.r.drain_on, "recompute: %s %s", verdict(v), v.r.why.c_str());
+    CHECK(v.r.F == 965000000000ull && v.r.dh == 0 && v.r.delta == b.reward / 4 && v.r.debt_paid == v.r.delta &&
+          v.r.split_at == b.reward - v.r.debt_paid,
+          "F %llu, dh 0 (first lane block: the cap), Delta = R/4 = %llu, debt_paid = Delta, split_at = R - debt_paid = %llu",
+          (unsigned long long)v.r.F, (unsigned long long)v.r.delta, (unsigned long long)v.r.split_at);
+    // the booking (main: drain_refold + paynow_net): E_b refolded at P, + the redistribution, net of the pay-now
+    Amounts credit;
+    const auto wp = weighted(w.cut);
+    const auto amt = st::split_reward(v.r.split_at, wp);
+    for (std::size_t i = 0; i < wp.size(); ++i) if (amt[i]) credit[wp[i].key] += static_cast<long long>(amt[i]);
+    for (const auto& [k, d] : v.r.credit_delta) credit[k] += d;
+    Amounts payout = v.bk.payout;
+    const auto nb = pn::net_booking(v.bk.paynow_base, v.bk.total, credit, payout, v.bk.sink_total, fee::donation_identity(kNet),
+                                    static_cast<long long>(fee::kDonationMarkerPico), true);
+    long long left = 0, owed_paid = 0;
+    for (const auto& [k, c] : credit) if (c > 0) left += c;
+    for (const auto& [k, p] : payout) owed_paid += p;
+    CHECK(nb.ok && left == 0 && owed_paid == static_cast<long long>(v.r.debt_paid),
+          "the window rows net to 0 (left %lld); what stays booked is exactly the old debt paid (%lld)", left, owed_paid);
+    g_drain = false;
+}
+
+// R18 (B15): every deviation from the drain rule is a Mismatch, the same on
+// every receiver (booked debit-only by main, one owed_digest everywhere).
+void r18_drain_deviations() {
+    std::printf("== R18. THE DRAIN RULE: every deviation is a MISMATCH on every receiver ==\n");
+    g_drain = true;
+    auto judge = [&](const char* name, const st::OwedLedger& builder_ledger, const st::OwedLedger& Lr, const Lane& lane,
+                     const std::vector<Payee>& cut, BuildOpts o) {
+        o.drain = true;
+        const Block b = build_block(builder_ledger, lane, o);
+        if (!b.ok) { CHECK(false, "%s: builds: %s", name, b.why.c_str()); return; }
+        st::OwedLedger R1 = Lr, R2 = Lr;   // two receivers at the same booking point
+        const auto v1 = receive(b, R1, lane, cut), v2 = receive(b, R2, lane, cut);
+        CHECK(v1.r.verdict == rc::Verdict::Mismatch && v2.r.verdict == rc::Verdict::Mismatch && v1.r.why == v2.r.why,
+              "%s: MISMATCH on both receivers: %s", name, v1.r.why.c_str());
+    };
+    {   // the honest block first: canonical
+        DrainWorld w;
+        BuildOpts o; o.cut_payees = w.cut; o.drain = true;
+        const Block b = build_block(w.L, w.lane, o);
+        const auto v = b.ok ? receive(b, w.L, w.lane, w.cut) : Verified{};
+        CHECK(b.ok && v.r.canonical(), "honest drain block: %s %s", b.ok ? verdict(v) : b.why.c_str(), v.r.why.c_str());
+    }
+    {   DrainWorld w; BuildOpts o; o.cut_payees = w.cut;
+        o.mutate = [](x6::CoinbaseInputs& in) { in.owed.back().owed += 1000000000ull; in.drain_budget += 1000000000ull; };
+        judge("(a) old debt beyond Delta (over-take)", w.L, w.L, w.lane, w.cut, o); }
+    {   DrainWorld w; BuildOpts o; o.cut_payees = w.cut;
+        o.mutate = [](x6::CoinbaseInputs& in) { in.owed.back().owed -= 1000000000ull; };
+        judge("(b) less than the Delta pass (under-take)", w.L, w.L, w.lane, w.cut, o); }
+    {   DrainWorld w; BuildOpts o; o.cut_payees = w.cut; o.hint_extra = 400000000000ull; o.fixpoint = false;
+        judge("(c) takes chosen at a larger reward hint (master's R2 case)", w.L, w.L, w.lane, w.cut, o); }
+    {   DrainWorld w; BuildOpts o; o.cut_payees = w.cut;
+        o.mutate = [](x6::CoinbaseInputs& in) { in.paynow_first = false; };
+        judge("(d) the window credited at R with DEBT FIRST (master's pay-now)", w.L, w.L, w.lane, w.cut, o); }
+    {   // (e) a contested block: 30 debts of 2c, 30 window payees, a 24-output wire cap
+        g_cap = 24;
+        World w;
+        const std::uint64_t c2 = 2 * x6::spend_floor(600090000000ull);
+        for (std::uint8_t i = 0; i < 30; ++i) { Payee d = payee(static_cast<std::uint8_t>(120 + i)); w.lane.learn(d); seed(w.L, d.id, static_cast<long long>(c2), 20 + i); }
+        std::vector<Payee> cut;
+        for (std::uint8_t i = 0; i < 30; ++i) { Payee p = payee(static_cast<std::uint8_t>(160 + i), 1); w.lane.learn(p); cut.push_back(p); }
+        BuildOpts h; h.cut_payees = cut; h.drain = true; h.cap = 24;
+        const Block hb = build_block(w.L, w.lane, h);
+        const auto hv = hb.ok ? receive(hb, w.L, w.lane, cut) : Verified{};
+        CHECK(hb.ok && hv.r.canonical(), "(e) the honest contested block (K_o cut) is canonical: %s %s", hb.ok ? verdict(hv) : hb.why.c_str(), hv.r.why.c_str());
+        BuildOpts o; o.cut_payees = cut; o.cap = 24;
+        o.mutate = [](x6::CoinbaseInputs& in) { in.paynow_first = false; };   // no K_o: the owed pass keeps every slot it filled
+        judge("(e) more than K_o owed slots in a contested block", w.L, w.L, w.lane, cut, o);
+        g_cap = 2700;
+    }
+    {   // (f) a band balance (in [arm floor, c(R)) at a 1.2 XMR reward) skipped instead of routed to the dust pass
+        World w;
+        Payee g = payee(77); w.lane.learn(g);
+        seed(w.L, g.id, 20000000ll, 13);
+        BuildOpts o; o.cut_payees = w.cut; o.mempool = akat::txs(3, 2000, 200000000000ull);
+        o.mutate = [g](x6::CoinbaseInputs& in) {
+            in.owed_dust.erase(std::remove_if(in.owed_dust.begin(), in.owed_dust.end(), [&](const x6::OwedEntry& e) { return e.identity == g.id; }),
+                               in.owed_dust.end());
+        };
+        judge("(f) a sub-c proposed take skipped instead of routed", w.L, w.L, w.lane, w.cut, o);
+    }
+    {   // (g) dh from another predecessor: the builder holds a lane block the receivers do not
+        st::OwedLedgerRules on; on.lane_height = true; on.decay_from_gross = true;
+        DrainWorld w;
+        st::OwedLedger Lr(kChain, on);
+        seed(Lr, w.K1.id, 40000000000ll, 10); seed(Lr, w.K2.id, 25000000000ll, 11); seed(Lr, w.K4.id, 900000000000ll, 12);
+        st::OwedLedger Lb = Lr;
+        st::LaneFound f; f.height = kHeight - 5;
+        Lb.on_block_found("phantom", {}, {}, std::nullopt, nullptr, &f);   // pending: owed_digest unchanged
+        CHECK(Lb.owed_digest() == Lr.owed_digest(), "(g) the builder's ledger commits the same owed_digest");
+        BuildOpts o; o.cut_payees = w.cut;
+        judge("(g) dh from another predecessor (Delta at dh 5, not the cap)", Lb, Lr, w.lane, w.cut, o);
+    }
+    {   DrainWorld w; BuildOpts o; o.cut_payees = w.cut;
+        o.mutate_ctx = [](o2::XmrCoinbaseContext& c) { c.drain = o2::DrainRule{}; };
+        judge("(h) a version-0 (master) builder on a rule-on receiver", w.L, w.L, w.lane, w.cut, o); }
+    g_drain = false;
+}
+
+// R19 (B7 (i), amendment A3): the empty-cut finder under the drain rule. A
+// fresh pool (F = 0): the finder's credit is the pool and it nets to 0. With
+// old debt and dust paid in an empty cut the finder is credited P = R -
+// debt_paid (main paynow_net under the rule), which is what it was paid: no
+// new balance either way.
+void r19_ecut_finder_drain() {
+    std::printf("== R19. THE DRAIN RULE: the empty-cut finder is credited what it is paid (no new owed) ==\n");
+    g_drain = true;
+    World w;
+    const Payee f = payee(52), dust = payee(53);
+    w.lane.learn(f); w.lane.learn(dust);
+    seed(w.L, dust.id, 5000000ll, 14);   // a sub-floor balance: the dust pass pays it (debt beyond the owed takes)
+    st::OwedLedger E{kChain};
+    for (int pass = 0; pass < 2; ++pass) {
+        const st::OwedLedger& L = pass == 0 ? E : w.L;
+        BuildOpts o; o.finder = f.ref; o.drain = true;
+        const Block b = build_block(L, w.lane, o);
+        if (!b.ok) { CHECK(false, "R19 %s: builds: %s", pass ? "debt" : "fresh", b.why.c_str()); continue; }
+        const auto v = receive(b, L, w.lane, {});
+        Amounts credit; std::string ew; ::v37::bytes32 fid{};
+        const bool fok = pn::apply_empty_cut_finder(v.bk.ecut_finder, v.bk.ecut_finder_malformed, v.bk.paynow_base, v.bk.total, credit, &ew, &fid);
+        if (v.r.drain_on && v.r.split_at != 0 && v.r.split_at != v.bk.total) { credit.clear(); credit[fid] = static_cast<long long>(v.r.split_at); }
+        for (const auto& [k, d] : v.r.credit_delta) credit[k] += d;
+        Amounts payout = v.bk.payout;
+        const auto nb = pn::net_booking(v.bk.paynow_base, v.bk.total, credit, payout, v.bk.sink_total, fee::donation_identity(kNet),
+                                        static_cast<long long>(fee::kDonationMarkerPico), true);
+        long long left = 0; for (const auto& [k, c] : credit) if (c > 0) left += c;
+        CHECK(v.r.canonical() && v.bk.ecut_finder && fok && nb.ok && left == 0,
+              "R19 %s: canonical (%s), V37F finder credited %s and netted: left %lld (debt_paid %llu, P %llu, total %llu)",
+              pass ? "old debt + dust in an empty cut" : "fresh pool (F = 0)", verdict(v), pass ? "P = R - debt_paid" : "the pool",
+              left, (unsigned long long)v.r.debt_paid, (unsigned long long)v.r.split_at, (unsigned long long)v.bk.total);
+    }
+    g_drain = false;
+}
 #else
 void suite_base() {
     std::printf("== BASE: no recompute on this tree ==\n");
@@ -577,6 +801,10 @@ int main() {
     r13_booked_refs();
     r14_paynow_refs_from_view();
     r15_salted_ties();
+    r16_lane_height_in_ledger();
+    r17_drain_block_canonical();
+    r18_drain_deviations();
+    r19_ecut_finder_drain();
 #else
     suite_base();
 #endif

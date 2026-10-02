@@ -42,9 +42,9 @@ final settlement configuration:
 | 5 | book_deferral | 20 | residual_sink_id (fee ON: the donation identity) |
 | 6 | arm_floor | 21 | pool_rules_version |
 | 7 | rotate_on_payment | 22 | owed_demo_amount |
-| 8 | decay_horizon | 23 | drain_q (0 = no drain) |
-| 9 | decay_half_life | 24 | drain_h_cap (0) |
-| 10 | anchor_cut | 25 | drain_rule_version (0) |
+| 8 | decay_horizon | 23 | drain_q (0 = no drain; 16) |
+| 9 | decay_half_life | 24 | drain_h_cap (0; 64) |
+| 10 | anchor_cut | 25 | drain_rule_version (0; 1) |
 | 11 | merkle_rows | 26 | pool_tag_codec |
 | 12 | drops_rule | 27 | lane_params_digest (the HELLO one) |
 | 13 | drops_window_rw | 28 | enrol_digest (the HELLO one, 0 without DROPS) |
@@ -75,10 +75,16 @@ Every input of `pool_tag` is a HELLO-compared field (chain_id and geometry via
 `lane_tag`, the genesis, the list), so HELLO-compatible <=> the same pool_tag
 (KAT `v37_xmr_lane_rules_kat` suite E, 10,000 random perturbations).
 
-The drain placeholders (23-25) are 0, so the coinbase bytes at default rules
-equal master's except the 32-byte tag value. The drain rule only sets them: a
-`Q = 16` node and a `Q = 0` node already refuse each other and see each other's
-blocks as Foreign, before the drain rule exists.
+Fields 23-25 are the drain rule ([`settlement-drain.md`](settlement-drain.md),
+operator rulings 2026-10-02): `drain_rule_version = 1, drain_q = 16,
+drain_h_cap = 64` on the test networks from its flag day, `0 / 0 / 0` (master's
+coinbase bytes) on mainnet until the operator's own. A rule-on node and a
+rule-off node refuse each other at HELLO by name
+(`LANE_RULES_MISMATCH field=drain_q ours=16 theirs=0 (+2 more: drain_h_cap
+64/0, drain_rule_version 1/0)`, `v37_xmr_relay_pool_id_kat` P8c) and see each
+other's blocks as Foreign, so the amendment-A2 fork (a `Q = 0` node booking
+drain blocks debit-only) cannot happen. The flag day is a pool restart with a
+fresh `--pool-genesis`.
 
 ## 3. The refusal and the log lines
 
@@ -117,7 +123,13 @@ if they differ.
 * `--d-conf` below Monero's coinbase maturity (60) is refused on every network
   but regtest (the regtest rigs keep 3/4/10).
 * Mainnet, in addition to the earlier five: `--owed-demo-amount` is refused and
-  `drain_q` must equal the network constant (0 until the drain rule's flag day).
+  the drain triple must equal the network constants (0 / 0 / 0 until the
+  drain rule's mainnet flag day).
+* Every network: the drain triple is valid (`x6::drain_rule_refusal`):
+  `version 0 <=> Q == 0 && H_cap == 0`; version 1 needs `Q >= 1` and
+  `1 <= H_cap < Q * 16` (so Delta < R and the window always keeps a slot); a
+  newer version is refused ("upgrade"). There is no flag for any of the three
+  (`v37_xmr_cli_strict_kat` refuses `--drain-*` as unknown; rehearsal K6).
 
 On mainnet the knobs stay pinned, so the rules digest is a build identity: two
 binaries that differ in a compiled-in rule refuse each other at HELLO and book

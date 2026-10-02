@@ -31,6 +31,7 @@
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
 #include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
 #include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
+#include "impl/xmr/settle/xmr_drain_rule.hpp"   // THE DRAIN RULE: drain_rule_refusal
 
 namespace c2pool::v37n::xmr {
 
@@ -343,6 +344,13 @@ struct XmrNodeConfig {
     // coinbase bytes. No CLI flag: the drain rule sets it on its own flag day;
     // lane_knob_refusal() pins it to kMainnetDrainQ on mainnet.
     std::uint32_t   drain_q = 0;
+    // THE DRAIN RULE's other two lane rules (fields 24 / 25, docs/xmr-lane/
+    // settlement-drain.md): H_cap (heights counted per lane block, at most)
+    // and the rule version (0 = master; 1 = R1/R2/R5 of 2026-10-02). Set by the
+    // network defaults at the flag day, never by a flag; lane_knob_refusal()
+    // checks the triple on every network and pins it on mainnet.
+    std::uint32_t   drain_h_cap = 0;
+    std::uint32_t   drain_rule_version = 0;
 
     // --- M2: the NATIVE template source ------------------------------------
     // --xmr-template-source monerod|native. See TemplateSourceMode above.
@@ -631,7 +639,32 @@ inline std::string settlement_fee_model_refusal(const XmrNodeConfig& c) {
 // ---------------------------------------------------------------------------
 inline constexpr std::uint64_t kXmrMinDConf   = 60;   // == XMR_COINBASE_MATURITY (static_assert in xmr_lane_rules_build.hpp)
 inline constexpr std::uint32_t kMainnetDrainQ = 0;    // no drain on mainnet until the drain rule's flag day
+inline constexpr std::uint32_t kMainnetDrainHCap = 0;
+inline constexpr std::uint32_t kMainnetDrainRuleVersion = 0;
+// The drain rule's test-network defaults (rule version 1, B-SPEC section 2):
+// R / 256 per Monero height, at most R / 4 per lane block.
+inline constexpr std::uint32_t kLaneDrainQ = 16;
+inline constexpr std::uint32_t kLaneDrainHCap = 64;
+inline constexpr std::uint32_t kLaneDrainRuleVersion = 1;
+// The network's triple, set by main() before run_live (the flag day: one pool
+// restart with a fresh --pool-genesis on the test networks; mainnet keeps
+// 0/0/0 until the operator's own flag day). Never a flag: lane_knob_refusal()
+// pins mainnet, the lane rules (fields 23-25) pin every peer.
+inline void apply_network_drain(XmrNodeConfig& c) {
+    if (c.network == MoneroNetwork::Mainnet) {
+        c.drain_q = kMainnetDrainQ;
+        c.drain_h_cap = kMainnetDrainHCap;
+        c.drain_rule_version = kMainnetDrainRuleVersion;
+    } else {
+        c.drain_q = kLaneDrainQ;
+        c.drain_h_cap = kLaneDrainHCap;
+        c.drain_rule_version = kLaneDrainRuleVersion;
+    }
+}
 inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root_age_set, bool no_book_deferral) {
+    if (const std::string dr = ::v37::xmr::settle::drain_rule_refusal(c.drain_rule_version, c.drain_q, c.drain_h_cap); !dr.empty())
+        return "drain rule (version " + std::to_string(c.drain_rule_version) + ", Q " + std::to_string(c.drain_q) +
+               ", H_cap " + std::to_string(c.drain_h_cap) + "): " + dr;
     if (c.network != MoneroNetwork::Regtest && c.d_conf < kXmrMinDConf)
         return "--d-conf " + std::to_string(c.d_conf) + " is below Monero's coinbase maturity (" +
                std::to_string(kXmrMinDConf) + "): a lane block would be booked before its coinbase can be spent; "
@@ -658,6 +691,10 @@ inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root
     if (c.drain_q != kMainnetDrainQ)
         return "drain_q " + std::to_string(c.drain_q) + " on mainnet: the drain rule's Q is a network constant (" +
                std::to_string(kMainnetDrainQ) + ")";
+    if (c.drain_h_cap != kMainnetDrainHCap || c.drain_rule_version != kMainnetDrainRuleVersion)
+        return "drain_h_cap " + std::to_string(c.drain_h_cap) + " / drain_rule_version " + std::to_string(c.drain_rule_version) +
+               " on mainnet: the drain rule is a network constant (" + std::to_string(kMainnetDrainHCap) + " / " +
+               std::to_string(kMainnetDrainRuleVersion) + " until the operator's mainnet flag day)";
     return {};
 }
 

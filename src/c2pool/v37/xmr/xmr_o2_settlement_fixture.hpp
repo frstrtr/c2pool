@@ -183,6 +183,9 @@ struct XmrSettlementConfig {
     // REWARD TOTAL: the template commits "V37R" || total first in the 0x02 tail,
     // so a share's receipt can be checked against the canonical coinbase.
     bool commit_total = false;
+    // THE DRAIN RULE (lane-rules fields 23-25; settlement-drain.md). Off
+    // (0/0/0) => master's coinbase bytes; the daemon sets the network's triple.
+    DrainRule drain{};
 
     // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
     // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
@@ -336,6 +339,7 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.output_cap             = cfg.resolved_output_cap();
     ctx.kfair_salted_ties      = cfg.kfair_salted_ties;
     ctx.spend_floor            = cfg.spend_floor;
+    ctx.drain                  = cfg.drain;   // THE DRAIN RULE
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
     if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE

@@ -204,6 +204,7 @@ static bool          g_cba_monerod_compare = false;      // --cba-monerod-compar
 static std::uint64_t g_cba_refetch_bound = 120;          // --cba-refetch-bound: COLD-BOOT body refetch requests per block (0 = off)
 static bool          g_cba_monerod_fallback = false;     // --cba-monerod-fallback: a native miss asks monerod instead of HOLDING
 static bool          g_relay_feed_monerod_compare = false;   // --relay-feed-monerod-compare: D6b compare-only oracle (counts, never decides)
+static std::string   g_drain_status;            // THE DRAIN RULE: the last canonical booking's F / dh / Delta / P (status line)
 static std::uint64_t g_divergence_cap_heights = 0;       // --divergence-cap-heights N (0 = 2 * D_conf)
 static std::uint64_t g_divergence_cap_ticks = 20;        // --divergence-cap-ticks N
 static std::uint64_t g_divergence_cap_terminal = 2;      // --divergence-cap-terminal N (0 = off)
@@ -918,10 +919,11 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
             // >= 0, and the negative rows (forward-repair debt nobody may repay).
             const auto h = L.health();
             std::printf("  ledger-health: rows=%zu sum_final=%lld owed=%lld (%zu rows) negative=%lld (%zu rows, min %lld at %s) "
-                        "pending_payout=%lld (%zu blocks) residual=%lld\n",
+                        "pending_payout=%lld (%zu blocks) residual=%lld last_lane_h=%llu\n",
                         h.rows, h.sum_final, h.positive_sum, h.positive_rows, h.negative_sum, h.negative_rows, h.min_row,
                         h.negative_rows ? hex_of(h.min_key).substr(0, 8).c_str() : "-", h.pending_payout, h.pending_blocks,
-                        L.residual_total());
+                        L.residual_total(), static_cast<unsigned long long>(h.last_lane_height));
+            if (!g_drain_status.empty()) std::printf("  drain: %s\n", g_drain_status.c_str());   // THE DRAIN RULE
             if (!h.aggregate_ok())
                 std::printf("ledger-ALARM aggregate: sum(finalW)=%lld < 0 -- the ledger owes less than it has paid out "
                             "(owed-sign ruling C-3 violated; %zu negative rows, %lld)\n",
@@ -2384,9 +2386,13 @@ static int run_live(const XmrNodeConfig& cfg) {
     //                  the sink identity's own pay-now share and the marker.
     std::uint64_t overpay_blocks = 0, sink_unbacked_blocks = 0;
     long long     overpay_total = 0, sink_unbacked_total = 0;
+    // THE DRAIN RULE: `split_at` (0 = rule off) is the recompute's P, the budget the
+    // window's E_b was split at (the credit was refolded there); `gross_out` gets
+    // G_b, the keys this block's window credits (the dust-decay clock).
     auto paynow_net = [&](std::uint64_t h, const std::string& bid, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
                           Amounts& credit, Amounts& payout, std::string& why,
-                          const settle::OwedLedger& L, std::optional<settle::DropsFound>& due) -> bool {
+                          const settle::OwedLedger& L, std::optional<settle::DropsFound>& due,
+                          std::uint64_t split_at = 0, std::set<::v37::bytes32>* gross_out = nullptr) -> bool {
         namespace fee = ::c2pool::v37n::xmr::fee;
         // DROPS DUE (A5): this canonical booking claims the whole avail of the
         // booking-point ledger L: E' = max(0, E + avail), BEFORE the spend-floor
@@ -2406,6 +2412,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             due = std::move(d);
         }
+        // THE DRAIN RULE (R5, decay clock): G_b = {k : E'_b(k) > 0}, after the
+        // DROPS-due clamp, before the redistribution, the finder and the netting.
+        if (gross_out) *gross_out = c2pool::v37n::xmr::paynow::drain_gross_set(credit, L.rules().decay_from_gross);
         const bool fee_on = fee::fee_model_on(cfg.lane_params);
         const ::v37::bytes32 sink_id = fee_on ? fee::donation_identity(donation_net_of(cfg.network)) : cba_scfg->residual_sink_identity;
         // SPEND-COST FLOOR: the redistribution the recompute found in this canonical
@@ -2430,6 +2439,9 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::fflush(stdout);
                 return false;
             }
+            // THE DRAIN RULE: the finder's E_b is the pool the debt left (P),
+            // which is what the canonical coinbase paid it: no new balance.
+            if (bk.ecut_finder) c2pool::v37n::xmr::paynow::drain_finder_credit(credit, fid, split_at, bk.total);
             if (bk.ecut_finder) {
                 ++ecut_booked;
                 const auto it = credit.find(fid);
@@ -3100,6 +3112,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         li.kfair_salted_ties = cba_scfg->kfair_salted_ties;
         li.spend_floor = cba_scfg->spend_floor;
         li.commit_total = cba_scfg->commit_total;
+        li.drain = cba_scfg->drain;   // THE DRAIN RULE
         return li;
     };
     // SHARE-LEVEL CANONICAL COINBASE: publish, per ledger state, what a relay
@@ -3160,11 +3173,40 @@ static int run_live(const XmrNodeConfig& cfg) {
         for (const auto& [k, v] : bk.payout) { (void)k; sum += v; }
         canon_debited += sum;
         std::printf("cba-ALARM recompute_mismatch: h=%llu bid=%s… %s -- NOT the canonical coinbase: payouts DEBITED (%lld piconero, %zu payee(s)), "
-                    "credit DROPPED (identical on every node); on-chain payout{ %s} canonical payout{ %s}\n",
+                    "credit DROPPED (identical on every node); on-chain payout{ %s} canonical payout{ %s}%s\n",
                     static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), res.why.c_str(), sum, bk.payout.size(),
-                    amounts_str(bk.payout).c_str(), amounts_str(res.expected_payout).c_str());
+                    amounts_str(bk.payout).c_str(), amounts_str(res.expected_payout).c_str(),
+                    res.drain_on ? (" delta=" + std::to_string(res.delta) + " F=" + std::to_string(res.F) + " dh=" + std::to_string(res.dh) +
+                                    " split_at=" + std::to_string(res.split_at)).c_str() : "");
         std::fflush(stdout);
         return 0;
+    };
+    // THE DRAIN RULE (D7): refold the window's credit at the recompute's split_at
+    // (P) when the canonical coinbase split it there; a no-op when the rule is off
+    // or no old debt was paid (P == the total). The DROPS cut price stays the one
+    // folded at the total. Undecidable (cut-pending) like the fold it repeats.
+    auto drain_refold = [&](const c2pool::v37n::xmr::recompute::Result& rr, const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
+                            const settle::OwedLedger& L, Amounts& credit, std::string& why, std::uint64_t hint,
+                            std::uint64_t h, const std::string& bid) -> bool {
+        if (!rr.canonical() || !rr.drain_on) return true;
+        g_drain_status = "h=" + std::to_string(h) + " bid=" + bid.substr(0, 12) + " F=" + std::to_string(rr.F) + " dh=" + std::to_string(rr.dh) +
+                         " Delta=" + std::to_string(rr.delta) + " debt_paid=" + std::to_string(rr.debt_paid) + " P=" + std::to_string(rr.split_at) +
+                         " total=" + std::to_string(bk.total);
+        const auto saved_price = drops_fold_price;
+        bool refolded = false;
+        const bool ok = c2pool::v37n::xmr::paynow::drain_refold_credit(
+            true, true, rr.split_at, bk.total, credit,
+            [&](std::uint64_t P, Amounts& c) { return fold_credit(P, bk.credit_cut, L, c, why, hint); }, &refolded);
+        drops_fold_price = saved_price;
+        if (!ok) return false;
+        if (!refolded) return true;
+        std::printf("drain-book: h=%llu bid=%s… F=%llu dh=%llu Delta=%llu debt_paid=%llu -> window credit split at P=%llu of total=%llu\n",
+                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), static_cast<unsigned long long>(rr.F),
+                    static_cast<unsigned long long>(rr.dh), static_cast<unsigned long long>(rr.delta),
+                    static_cast<unsigned long long>(rr.debt_paid), static_cast<unsigned long long>(rr.split_at),
+                    static_cast<unsigned long long>(bk.total));
+        std::fflush(stdout);
+        return true;
     };
     fo.book_from_chain_ex = [&](std::uint64_t h, const std::string& bid, o2::FinalizeConnectOptions::ChainBooking& out) -> bool {
         Amounts& credit = out.credit; Amounts& payout = out.payout; std::string& why = out.why;
@@ -3356,8 +3398,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (chk_ok) booking_price = drops_fold_price;
             if (chk_ok && chk != credit) { ++wire_mismatch; credit = chk; credit_src = "chain(wire-prefold-DISAGREED)"; }
         }
+        c2pool::v37n::xmr::recompute::Result rr;   // THE DRAIN RULE reads its split_at below
         {   // EVERY NODE RECOMPUTES THE LANE COINBASE (rulings 2026-09-29)
-            c2pool::v37n::xmr::recompute::Result rr;
             const int cv = canon_check(h, bid, chain_blob, bk, node.ledger(), rr, why);
             if (cv < 0) return false;   // undecided: HELD like a relay repair, never refused
             if (cv == 0) {
@@ -3375,6 +3417,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return true;
             }
         }
+        // THE DRAIN RULE (D7): the canonical coinbase paid the window E_b at P, the
+        // pool the old debt left, so the block is booked at P too: every admitted
+        // payee nets to 0 and no canonical block leaves a window balance.
+        if (!drain_refold(rr, bk, node.ledger(), credit, why, relay_hint(bid), h, bid)) return false;
         // ★ RAIN-BACKFILL: the composition HOLDs (cut-pending, retried; past the
         // booking retry bound it is HELD like an undecided relay repair, never
         // refused) until this node holds every raindrop every ready relay peer
@@ -3496,7 +3542,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (!drops_take_carry(h, bid, bk, why, true, drops_lane)) return false;
         }
         std::optional<settle::DropsFound> live_due;
-        if (!paynow_net(h, bid, bk, credit, payout, why, node.ledger(), live_due)) { ++cba_refused; return false; }   // SAME-BLOCK PAY-NOW: book net
+        if (!paynow_net(h, bid, bk, credit, payout, why, node.ledger(), live_due,
+                        rr.drain_on ? rr.split_at : 0, &out.gross)) { ++cba_refused; return false; }   // SAME-BLOCK PAY-NOW: book net
         {   // DROPS DUE: the claim, and the deposit the node books (== the one-shot handed by drops_take_carry)
             settle::DropsFound d = live_due ? *live_due : settle::DropsFound{};
             if (drops_live) { d.deposit = drops_lane.carry.delta; d.enrol_add = drops_lane.lc.enrol_add; }   // + RAINDROP ENROL
@@ -3593,8 +3640,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!bk.has_credit_cut) { why = "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"; return false; }
         if (!cut_floor_gate(h, bid, bk.credit_cut.next_pos, why, false)) return false;   // CUT-FLOOR: the same decided refusal
         if (!fold_credit(bk.total, bk.credit_cut, q.ledger ? *q.ledger : node.ledger(), out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
+        c2pool::v37n::xmr::recompute::Result rr;   // THE DRAIN RULE reads its split_at below
         if (q.ledger) {   // EVERY NODE RECOMPUTES THE LANE COINBASE: the same verdict on the scratch lineage
-            c2pool::v37n::xmr::recompute::Result rr;
             const int cv = canon_check(h, bid, sblob, bk, *q.ledger, rr, why);
             if (cv < 0) return false;   // cut-pending -> undecidable
             if (cv == 0) {
@@ -3606,6 +3653,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::fflush(stdout);
                 return true;
             }
+            if (!drain_refold(rr, bk, *q.ledger, out.credit, why, relay_hint(bid), h, bid)) return false;   // THE DRAIN RULE (D7)
         }
         // ★ DROPS-RESTART (defect 3): the scratch lineage books the winner's carried
         // delta too (journalled; the adoption's re-drive books it by block id) --
@@ -3646,7 +3694,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
         }
         std::optional<settle::DropsFound> scratch_due;
-        if (!paynow_net(h, bid, bk, out.credit, payout, why, q.ledger ? *q.ledger : node.ledger(), scratch_due)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
+        if (!paynow_net(h, bid, bk, out.credit, payout, why, q.ledger ? *q.ledger : node.ledger(), scratch_due,
+                        rr.drain_on ? rr.split_at : 0, &out.gross)) return false;   // SAME-BLOCK PAY-NOW: the same net booking
         {   // GAP 2: converge books the DROPS delta (and, under the rule, the claim) like the live booking
             settle::DropsFound d = scratch_due ? *scratch_due : settle::DropsFound{};
             if (scratch_deposit) d.deposit = *scratch_deposit;
@@ -4199,6 +4248,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         scfg.kfair_salted_ties = true;   // #1867: equal-age cohorts ordered by a hash of the parent id
         scfg.spend_floor = true;         // payout-threshold.md §2-§3: Monero's spend cost is the payout floor
         scfg.commit_total = true;        // share-level canonical coinbase: "V37R" total in every lane coinbase
+        // THE DRAIN RULE (rulings R1/R2/R5 2026-10-02, settlement-drain.md): the
+        // network's triple (lane-rules fields 23-25), 0/0/0 = master's coinbase.
+        scfg.drain = c2pool::v37n::xmr::o2::drain_rule_of(cfg);
         // LANE-RULES (operator ruling R3): ONE list of every consensus-relevant lane rule
         // outside LaneParams (xmr_lane_rules.hpp), built once from the final settlement
         // config. The relay HELLO carries it (a peer with other rules is refused BY NAME,
@@ -6602,6 +6654,11 @@ int main(int argc, char** argv) {
         cfg.ledger_drops_window_rw = !cfg.ledger_drops_due ? 0
             : c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params) ? c2pool::v37n::xmr::fee::kFeeReceiptWeight
                                                                     : c2pool::v37n::xmr::relay::kReceiptWeight;
+        // THE DRAIN RULE (rulings R1/R2/R5 2026-10-02, settlement-drain.md): its
+        // flag day on the test networks (one pool restart with a fresh
+        // --pool-genesis: the lane-rules digest and so the pool_tag move);
+        // mainnet keeps 0/0/0 until the operator's own flag day.
+        c2pool::v37n::xmr::apply_network_drain(cfg);
     }
     const int rc = run_live(cfg);
     g_web = nullptr; g_web_extra = {}; g_web_name = {};

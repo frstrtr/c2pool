@@ -1022,6 +1022,30 @@ struct OwedLedgerRules {
     // (no one-shot price, never paid twice). Committed in owed_digest ("V37W").
     // Off (window == 0): no window, no section, byte-identical.
     DropsWindowRule drops_window{};
+    // THE DRAIN RULE (XMR, drain_rule_version >= 1, operator rulings R2/R5
+    // 2026-10-02; both on together, on the drain rule's flag day):
+    //   lane_height       a lane block's FOUND carries its Monero height; the
+    //                     ledger keeps the greatest height of a FINALIZED lane
+    //                     block (committed in owed_digest, "V37Z") and serves
+    //                     prev_lane_height() = max(that, the pending lane
+    //                     blocks' heights): the drain's dh is h - prev.
+    //   decay_from_gross  the dust-decay clock is driven by the block's GROSS
+    //                     credited set G_b = {k : E'_b(k) > 0} (the fold at the
+    //                     cut after the DROPS-due clamp, before redistribution,
+    //                     finder and netting), carried by the FOUND, instead of
+    //                     the netted pending credit (which pay-now first nets to
+    //                     0 for every window payee, so no clock would ever start).
+    // Off: no height, no gross set, no section: byte-identical.
+    bool      lane_height = false;
+    bool      decay_from_gross = false;
+};
+
+// THE DRAIN RULE: what a lane block's FOUND carries for the ledger under
+// OwedLedgerRules::lane_height / decay_from_gross (ignored with the rules off).
+struct LaneFound {
+    u64               height = 0;   // the lane block's Monero height (0: not a lane block)
+    std::set<bytes32> gross;        // G_b: the keys whose window work this block credits
+    bool operator==(const LaneFound&) const = default;
 };
 
 // ANCHOR (OwedLedgerRules::anchor_cut): a lane block's on-chain credit cut, raw
@@ -1313,11 +1337,15 @@ public:
     // block's deposit D_B and, for a canonical booking, the avail snapshot it
     // claimed (drops_available() of the booking-point ledger). The caller has
     // already folded that snapshot into `credit` (apply_drops_due).
+    // DRAIN RULE: `lane` (lane_height / decay_from_gross rules only) carries the
+    // block's Monero height and its gross credited set; a seed passes none.
     void on_block_found(const std::string& bid, const Amounts& credit,
                         const Amounts& payout, std::optional<AnchorCut> cut = std::nullopt,
-                        const DropsFound* drops = nullptr) {
+                        const DropsFound* drops = nullptr, const LaneFound* lane = nullptr) {
         if (m_pending.count(bid) || m_settled.count(bid)) return;
         Pending p;
+        if (lane && m_rules.lane_height) p.height = lane->height;
+        if (lane && m_rules.decay_from_gross) p.gross = lane->gross;
         for (const auto& [k, v] : credit) if (v != 0) p.credit[k] = v;
         for (const auto& [k, v] : payout) if (v != 0) p.payout[k] = v;
         if (m_rules.anchor_cut) p.cut = cut;
@@ -1354,6 +1382,14 @@ public:
             const char tw[4] = {'V', '3', '7', 'W'};
             leaf.insert(leaf.end(), tw, tw + 4);
             put_drops_window(leaf, q.window);
+        }
+        if (q.height != 0 || !q.gross.empty()) {   // DRAIN RULE: never under the rules off
+            const char tz[4] = {'V', '3', '7', 'Z'};
+            leaf.insert(leaf.end(), tz, tz + 4);
+            for (int i = 0; i < 8; ++i) leaf.push_back(static_cast<std::uint8_t>((q.height >> (8 * i)) & 0xff));
+            const u64 n = q.gross.size();
+            for (int i = 0; i < 8; ++i) leaf.push_back(static_cast<std::uint8_t>((n >> (8 * i)) & 0xff));
+            for (const auto& k : q.gross) leaf.insert(leaf.end(), k.begin(), k.end());
         }
         bump(leaf);
     }
@@ -1478,7 +1514,16 @@ public:
         std::vector<bytes32> paid;                            // rotate_on_payment
         if (m_rules.rotate_on_payment)
             for (const auto& [k, v] : it->second.payout) if (v > 0) paid.push_back(k);
-        if (decay_on()) {                                     // DUST DECAY: a credit restarts the clock
+        if (m_rules.lane_height && it->second.height > m_last_settled_lane_height)   // DRAIN RULE: dh's finalized half
+            m_last_settled_lane_height = it->second.height;
+        if (decay_on() && m_rules.decay_from_gross) {         // DRAIN RULE (R5): the clock runs on the GROSS set G_b
+            const std::set<bytes32>& g = it->second.gross;
+            for (const bytes32& k : g) { m_gone_since.erase(k); m_decay_steps.erase(k); }   // credited: the clock resets
+            if (!g.empty())   // every sub-floor key this lane block passed by is gone from now
+                for (const auto& [k, w] : m_finalW)
+                    if (w > 0 && w < m_rules.arm_floor && !m_gone_since.count(k) && !g.count(k))
+                        m_gone_since[k] = bin_height;
+        } else if (decay_on()) {                              // DUST DECAY: a credit restarts the clock
             bool credits = false;
             for (const auto& [k, v] : it->second.credit) if (v > 0) credits = true;
             for (const auto& [k, v] : it->second.credit)
@@ -1554,6 +1599,23 @@ public:
             // surfaced as a ledger event; finalW untouched (terminal)
             bump(owedevent::orphan_settled_payload(bid, settled_payout));
         }
+    }
+
+    // DRAIN RULE (lane_height): the Monero height of this pool's previous lane
+    // block -- the greatest height of a lane block FOUND here and not orphaned,
+    // finalized (committed, "V37Z") or pending; 0 = none. Seeds carry none.
+    u64 last_settled_lane_height() const { return m_last_settled_lane_height; }
+    u64 prev_lane_height() const {
+        u64 h = m_last_settled_lane_height;
+        for (const auto& [bid, p] : m_pending) { (void)bid; if (p.height > h) h = p.height; }
+        return h;
+    }
+    // dh for a lane block at Monero height `h`: h - prev_lane_height(), or 0 when
+    // there is no previous lane block (or it is not below h); the drain maps 0
+    // to its cap (x6::drain_delta).
+    u64 heights_since_last_lane(u64 h) const {
+        const u64 prev = prev_lane_height();
+        return (prev > 0 && h > prev) ? h - prev : 0;
     }
 
     // EffectiveOwed(key) = finalW - Σ_{pending} payout. A coinbase draws on this
@@ -1874,6 +1936,11 @@ public:
                 pre.insert(pre.end(), m_anchor->spine.begin(), m_anchor->spine.end());
             }
         }
+        if (m_rules.lane_height) {   // DRAIN RULE: the finalized half of dh decides the next block's Delta
+            const char zt[4] = {'V', '3', '7', 'Z'};
+            pre.insert(pre.end(), zt, zt + 4);
+            for (int i = 0; i < 8; ++i) pre.push_back((m_last_settled_lane_height >> (8 * i)) & 0xff);
+        }
     }
     bytes32 rest_digest() const {
         std::vector<std::uint8_t> pre = {'V', '3', '7', 'X'};
@@ -1913,6 +1980,7 @@ public:
         bytes32     min_key{};
         long long   pending_payout = 0;
         std::size_t pending_blocks = 0;
+        u64         last_lane_height = 0;   // DRAIN RULE: prev_lane_height() (0 = none / rule off)
         bool aggregate_ok() const { return sum_final >= 0; }
     };
     Health health() const {
@@ -1931,6 +1999,7 @@ public:
             ++h.pending_blocks;
             for (const auto& [k, v] : p.payout) { (void)k; h.pending_payout += v; }
         }
+        h.last_lane_height = prev_lane_height();
         return h;
     }
 
@@ -1987,6 +2056,8 @@ private:
         DropsEnrolRegistry enrol_add;   // RAINDROP ENROL (rule on only)
         DropsWindow window;         // DROPS WINDOW (rule on only)
         long long writeoff = 0;     // DROPS DUE diagnostics (never committed)
+        u64 height = 0;             // DRAIN RULE (lane_height): the lane block's Monero height
+        std::set<bytes32> gross;    // DRAIN RULE (decay_from_gross): G_b
     };
 
     // The K_fair walk (first_eligible ASC, key ASC). With
@@ -2138,6 +2209,7 @@ private:
     std::map<bytes32, u64> m_decay_steps;          // DUST DECAY: halvings already applied
     long long m_decayed_total = 0;
     std::optional<AnchorCut> m_anchor;   // ANCHOR (OwedLedgerRules::anchor_cut)
+    u64       m_last_settled_lane_height = 0;   // DRAIN RULE (lane_height), committed "V37Z"
     Amounts   m_due;                     // DROPS DUE (OwedLedgerRules::drops_due), finalized, committed "V37U"
     long long m_drops_writeoff = 0;      // DROPS DUE diagnostics: written off at FINALIZE (never committed)
     DropsWindow        m_dwin;           // DROPS WINDOW (OwedLedgerRules::drops_window), finalized, committed "V37W"

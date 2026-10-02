@@ -183,6 +183,8 @@ static void suite_codec(Checker& C) {
         moved([](auto&, auto& i) { i.residual_sink_id = b32_of(9); }, "residual_sink_id");
         moved([](auto& k, auto&) { k.owed_demo_amount = 1; }, "owed_demo_amount");
         moved([](auto& k, auto&) { k.drain_q = 16; }, "drain_q");
+        moved([](auto& k, auto&) { k.drain_h_cap = 64; }, "drain_h_cap");                 // THE DRAIN RULE (B16)
+        moved([](auto& k, auto&) { k.drain_rule_version = 1; }, "drain_rule_version");
         moved([](auto&, auto& i) { i.enrol_digest = b32_of(3); }, "enrol_digest");
         moved([](auto&, auto& i) { i.spend_floor = false; }, "spend_floor");
         c2pool::v37n::xmr::XmrNodeConfig f = c; f.lane_params.fee = ::v37::FeeModelGate::for_version(1);
@@ -320,6 +322,13 @@ static void suite_property(Checker& C) {
     const std::string mq = hello_mismatch(ours, hello_with(q, 3));
     C(mq.rfind("LANE_RULES_MISMATCH field=drain_q ours=0 theirs=16", 0) == 0 && tag_of(q) != base_tag,
       "E drain_q 0 vs 16 alone flips both: the HELLO refusal (" + mq.substr(0, 52) + ") and the pool_tag");
+    // B16: THE DRAIN RULE's flag day, {1,16,64} against master's {0,0,0}: one refusal naming all three, another pool_tag
+    lr::LaneRules on = base; on.drain_q = 16; on.drain_h_cap = 64; on.drain_rule_version = 1;
+    const std::string m16 = hello_mismatch(hello_with(on, 4), hello_with(base, 5));
+    std::printf("    %s\n", m16.c_str());
+    C(m16.rfind("LANE_RULES_MISMATCH field=drain_q ours=16 theirs=0 (+2 more: drain_h_cap 64/0, drain_rule_version 1/0)", 0) == 0 &&
+      tag_of(on) != base_tag && tag_of(on) != tag_of(q),
+      "E drain {1,16,64} vs {0,0,0}: field=drain_q ours=16 theirs=0 (+2 more: drain_h_cap 64/0, drain_rule_version 1/0), another pool_tag");
 }
 
 int main() {

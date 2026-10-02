@@ -54,6 +54,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -280,6 +281,43 @@ inline bool apply_empty_cut_finder(const std::optional<::v37::ScriptRef>& finder
     const std::uint64_t pool = total > *base ? total - *base : 0;
     if (pool > 0) credit[id] = static_cast<long long>(pool);
     return true;
+}
+
+// ---- THE DRAIN RULE (D7), the receive side (settlement-drain.md). Three
+// pieces of the booking that main_v37_xmr.cpp calls, kept here so a KAT links
+// them (v37_xmr_drain_wiring_kat W4).
+//
+// (a) The window's credit is folded at P = split_at whenever the canonical
+// coinbase split the window there (the recompute's AllocStats::split_at): a
+// no-op when the block is not canonical, the rule is off, or no old debt was
+// paid (P == the total). `fold(P, credit)` repeats the booking's own fold at P
+// (false = undecidable, like the fold it repeats). *refolded says whether it ran.
+template <class Fold>
+inline bool drain_refold_credit(bool canonical, bool drain_on, std::uint64_t split_at, std::uint64_t total,
+                                std::map<::v37::bytes32, long long>& credit, Fold&& fold, bool* refolded = nullptr) {
+    if (refolded) *refolded = false;
+    if (!canonical || !drain_on || split_at == total) return true;
+    if (!fold(split_at, credit)) return false;
+    if (refolded) *refolded = true;
+    return true;
+}
+// (b) R5, the decay clock: G_b = {k : E'_b(k) > 0}, read after the DROPS-due
+// clamp and before the redistribution, the finder and the netting. Empty when
+// the gross clock is off (master) -- and for a debit-only booking.
+inline std::set<::v37::bytes32> drain_gross_set(const std::map<::v37::bytes32, long long>& credit, bool decay_from_gross) {
+    std::set<::v37::bytes32> g;
+    if (decay_from_gross)
+        for (const auto& [k, v] : credit) if (v > 0) g.insert(k);
+    return g;
+}
+// (c) The empty-cut finder under the rule: its E_b is the pool the debt left
+// (P), which is what the canonical coinbase paid it, so it keeps no balance.
+// A no-op when no split happened (split_at 0 = rule off, or == the total).
+inline void drain_finder_credit(std::map<::v37::bytes32, long long>& credit, const ::v37::bytes32& finder,
+                                std::uint64_t split_at, std::uint64_t total) {
+    if (split_at == 0 || split_at == total) return;
+    credit.clear();
+    credit[finder] = static_cast<long long>(split_at);
 }
 
 struct NetResult {
