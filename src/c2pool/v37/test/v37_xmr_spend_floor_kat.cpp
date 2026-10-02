@@ -15,8 +15,8 @@
 //   F2  with room in the block every payee, dust included, is paid its exact
 //       E_b; F2b without room its cash is REDISTRIBUTED to the paid payees and
 //       taken off its credit (credit delta, sum 0): never an advance.
-//   F3  too few output slots: the largest payees get the slots, the rest
-//       wait; no CapTooSmall; the advance cap sends the excess to the residual.
+//   F3  too few output slots: oldest first (equal ages by the salted tie),
+//       the rest wait; no CapTooSmall; their cash is redistributed (F2b).
 //   F4  the owed pass pays no balance below c.
 //   F5  the receive side books every key NET of min(credit, paid): a crumb
 //       keeps its credit, an advance stays a pending payout, and the balance

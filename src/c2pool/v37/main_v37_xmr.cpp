@@ -2462,7 +2462,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (over > 0) {
                 ++overpay_blocks; overpay_total += over;
                 std::printf("ledger-ALARM overpay: h=%llu bid=%s… pays %lld above finalized-owed + E_b { %s} -- booked as read from the "
-                            "chain (coinbase authority); the excess nets forward as negative owed (a lagged or modified builder)\n",
+                            "chain (a non-canonical block is booked debit-only); the excess nets forward as negative owed (a lagged or modified builder)\n",
                             static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), over, who.c_str());
                 std::fflush(stdout);
             }
@@ -4155,8 +4155,8 @@ static int run_live(const XmrNodeConfig& cfg) {
             return 2;
         }
         if (fee_on)
-            std::printf("fee-model: v%u ON | donation[%s]=%s… (identity %s…) ONE mandatory output = max(%llu, residual) "
-                        "(residual folds in, S1; dust from the LARGEST payee, S2) | give-author %.4f%% (u16=%u, PoW-bound "
+            std::printf("fee-model: v%u ON | donation[%s]=%s… (identity %s…) ONE mandatory output = the residual, a "
+                        "%llu-pico marker when nothing is left (residual folds in, S1) | give-author %.4f%% (u16=%u, PoW-bound "
                         "in this node's receipts, S3) | node-owner fee %.4f%% -> %s (rolled at job issue) | finder bonus: NONE\n",
                         cfg.lane_params.fee.version, fee::to_string(don_net),
                         std::string(fee::donation_address(don_net)).substr(0, 12).c_str(),
@@ -6407,12 +6407,13 @@ int main(int argc, char** argv) {
                 "                               wallet the exact-sum residual is paid to\n"
                 "  --residual-sink-subaddress   the sink keys are a subaddress (D_i, A_main)\n"
                 "  --fee-model <off|v1>         the v36 fee model (LaneParams::fee; default off =\n"
-                "                               master-identical). v1: ONE mandatory donation output\n"
-                "                               = max(1 pico, residual) (compiled-in address, the\n"
-                "                               residual sink; --residual-sink-* refused), the dust\n"
-                "                               from the LARGEST payee, receipts pushed at 65535 split\n"
-                "                               by their PoW-bound give-author u16. Every peer must\n"
-                "                               agree (folded into the relay HELLO digest)\n"
+                "                               master-identical). v1: ONE mandatory donation output,\n"
+                "                               always last: the residual, a 0-amount marker when\n"
+                "                               nothing is left (compiled-in address, the residual\n"
+                "                               sink; --residual-sink-* refused); receipts pushed at\n"
+                "                               65535 split by their PoW-bound give-author u16.\n"
+                "                               Every peer must agree (folded into the relay HELLO\n"
+                "                               digest)\n"
                 "  --give-author-pct <p>        (v1) give-author %% carried as a u16 in the receipts\n"
                 "                               THIS node's jobs bind (default 0.1; 0 opts out; folded\n"
                 "                               everywhere)\n"
