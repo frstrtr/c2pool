@@ -417,6 +417,13 @@ Every node of one pool must use the same `--pool-genesis`, `--fee-model`,
 in its HELLO and refuses a peer from another pool. The `relay:` status line counts
 those refusals as `tag_mismatch=`.
 
+Every settlement knob is also part of the pool (LANE-RULES,
+[lane-rules.md](lane-rules.md)): the node prints its whole list at startup
+(`lane-rules: digest=... d_conf=60 ...`), and a peer with any other value is
+refused at HELLO by name, for example `LANE_RULES_MISMATCH field=d_conf ours=60
+theirs=61`, counted as `rules_mismatch=`. Its lane blocks are ordinary blocks for
+this pool. `--d-conf` below 60 is refused on every network but regtest.
+
 With DROPS (sub-threshold credit, test builds only for now) every node of one
 pool must also use the identical `--drops-enrol` list: a node with another list
 is refused at HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… theirs=…`.
