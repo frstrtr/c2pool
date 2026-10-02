@@ -29,7 +29,8 @@ Commands marked `<!-- check -->` in the source of this file are run by
   `GLIBC_FLOOR` file or newer, and libstdc++ from GCC 13 or newer
   (`BUILDINFO.txt` names both). Ubuntu 22.04 is too old.
 - 4 CPU threads or more, 4 GB RAM to run the node (8 GB to build it), 20 GB
-  free disk for stagenet. With DROPS, plan up to 512 MiB more RAM and about
+  free disk for stagenet. With DROPS, plan up to about 600 MiB more RAM (a full
+  512 MiB store budget measures about 1.15 KB of RSS per raindrop) and about
   0.5 GB more disk for the raindrop store (`--drops-store-bytes`,
   [drops-store.md](drops-store.md)). Measured numbers are in
   [Resources](#resources).
@@ -356,7 +357,8 @@ stops the node cleanly (SIGINT) when it falls below `MEMGUARD_MIN_MB`
 (1024 MB by default, set in `node.env`), so the node gives way before the
 machine runs out of memory. The unit sets `OOMScoreAdjust=1000` for the
 same reason and a `MemoryMax=4G` hint. Raise that for mainnet, and by the
-raindrop store budget (`--drops-store-bytes`, 512 MiB by default) when DROPS is on.
+raindrop store's RSS (about 600 MiB at the default `--drops-store-bytes` of
+512 MiB) when DROPS is on.
 
 The dashboard is at `http://127.0.0.1:8080/` (the `--web-host` and
 `--web-port` lines). To see it from another machine, forward the port

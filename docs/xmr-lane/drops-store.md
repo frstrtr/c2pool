@@ -73,7 +73,8 @@ bounded by a floor and a byte budget, not by a count:
   budget. Before the first finalize step the old window (`--drops-retain-bins`,
   512 bins below the tip) applies;
 - the budget is `--drops-store-bytes` (default 536870912 = 512 MiB; raw receipt
-  plus about 160 B of index per raindrop). Over it the oldest unretained bins
+  plus about 160 B of index per raindrop). Measured RSS is about 1.15 KB per
+  raindrop, so a full budget costs about 600 MiB of memory. Over it the oldest unretained bins
   are evicted and counted (`overflow_bins`, `relay: drops-ALARM store over
   budget`). Because the winner pins only what it can serve, an overflow costs
   raindrop credit in that block, never a split.
