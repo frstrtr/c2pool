@@ -29,7 +29,10 @@ Commands marked `<!-- check -->` in the source of this file are run by
   `GLIBC_FLOOR` file or newer, and libstdc++ from GCC 13 or newer
   (`BUILDINFO.txt` names both). Ubuntu 22.04 is too old.
 - 4 CPU threads or more, 4 GB RAM to run the node (8 GB to build it), 20 GB
-  free disk for stagenet. Measured numbers are in [Resources](#resources).
+  free disk for stagenet. With DROPS, plan up to 512 MiB more RAM and about
+  0.5 GB more disk for the raindrop store (`--drops-store-bytes`,
+  [drops-store.md](drops-store.md)). Measured numbers are in
+  [Resources](#resources).
 - A shell account. You need `sudo` only for a system-wide install or to
   install build packages.
 - For stagenet: a stagenet payout address (`5...`), and from your pool's
@@ -352,7 +355,8 @@ For a user unit that keeps running after you log out, an admin runs
 stops the node cleanly (SIGINT) when it falls below `MEMGUARD_MIN_MB`
 (1024 MB by default, set in `node.env`), so the node gives way before the
 machine runs out of memory. The unit sets `OOMScoreAdjust=1000` for the
-same reason and a `MemoryMax=4G` hint. Raise that for mainnet.
+same reason and a `MemoryMax=4G` hint. Raise that for mainnet, and by the
+raindrop store budget (`--drops-store-bytes`, 512 MiB by default) when DROPS is on.
 
 The dashboard is at `http://127.0.0.1:8080/` (the `--web-host` and
 `--web-port` lines). To see it from another machine, forward the port
@@ -427,6 +431,11 @@ this pool. `--d-conf` below 60 is refused on every network but regtest.
 With DROPS (sub-threshold credit, test builds only for now) every node of one
 pool must also use the identical `--drops-enrol` list: a node with another list
 is refused at HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… theirs=…`.
+The servable raindrop store keeps every raindrop the node may still have to
+book (the range of a lane block is about 2 hours old when it is found) up to a
+byte budget, `--drops-store-bytes` (default 512 MiB), on disk under
+`<data-dir>/lane<N>.drops.d/`. Sizing, alarms and the stagenet incident that set
+these rules: [drops-store.md](drops-store.md).
 
 Optional fee flags (fee model `v1` only): `--node-owner-fee-pct <p>` with
 `--node-owner-address <addr>` makes a job pay the node owner instead of the
@@ -536,6 +545,7 @@ Measured on stagenet, Ubuntu 26.04, i5-14500T, one levin peer, 2026-09-25:
 | Boot to first stratum job | 282-287 s (catch-up of about 1,650 blocks behind the anchor) |
 | Clean restart from `--native-snapshot-path` | stratum listening after 10 s; the lane was not suspended |
 | Node memory | peak RssAnon 0.99 GB, VmHWM 1.18 GB |
+| DROPS raindrop store (attempt 6: 15 raindrops/s, lane blocks ~45 min apart) | about 1 KB RAM + 870 B disk per raindrop; the window the store must hold is ~5 h = ~270k raindrops = ~270 MB RAM, ~235 MB disk (budget 512 MiB). Before 2026-10-02 it was capped at 65536 raindrops (64 MB, 56 MB on disk, ~73 min), younger than any range |
 | Levin traffic in the first 407 s (two levin peers) | 1.6 MB in, 0.11 MB out |
 
 The output-set file is memory-mapped, so it also shows up in the page
