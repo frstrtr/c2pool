@@ -5,10 +5,10 @@ Review: [Fairness gaps in the c2pool payout ledger](https://gist.github.com/SChe
 Tracking issues #1860 to #1869. Audit response: v37 payout fairness audit, 2026-09-28.
 
 This record states, for the XMR lane with every node recomputing the lane
-coinbase (`coinbase-recompute.md`, PR #1882), which findings the protocol now
+coinbase (`coinbase-recompute.md`, PR #1884), which findings the protocol now
 closes by its own rules ("natively": no trusted builder, no node-local
 setting), which are closed by the agreed threshold design
-(`payout-threshold.md`, not yet implemented), and which stay open.
+(`payout-threshold.md`, implemented in #1884), and which stay open.
 
 ## Critical
 
