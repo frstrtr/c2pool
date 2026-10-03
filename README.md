@@ -161,7 +161,7 @@ and does not yet exist, so the work can be judged on what it actually is.
   balances drain from a capped slice of each block (PR #1895).
   Since 2026-09-27 the lane also has: an installable node package with a
   run-a-node guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md));
-  raindrops (small-miner credits) on by default (PR #1818); a built-in mainnet
+  raindrops (sub-threshold work credited like shares) on by default (PR #1818); a built-in mainnet
   bootstrap list, peer discovery and a persistent peer book (PRs #1819 / #1820);
   repair below the vault horizon that survives restarts (PR #1824); a verify worker
   pool for raindrops (PR #1839); a refusal of node-local settings that would split
