@@ -107,6 +107,20 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using bytes32 = ::v37::bytes32;
 
+// ★ HOLD-ROUND-2 (B): the share verdict's codes (xmr_share_verdict.hpp ->
+// XmrRelayNode::set_share_verdict). 1 canonical, -1 refused (a strike), 0 not
+// decidable here yet (parked under the patience). Beyond those, a take that is
+// the drain Delta at ANOTHER dh is lane-prefix SKEW, never a strike:
+//   AHEAD   the sender booked a lane block this node has not (yet): parked
+//           until this node's share state advances (per-peer bound), re-judged;
+//   BEHIND  the sender has not booked a lane block this node holds: dropped;
+//   LATE    a lane block at or above the share's height is booked here: the
+//           share can never be the block at that height: dropped.
+inline constexpr int kShareVerdictAhead  = 2;
+inline constexpr int kShareVerdictBehind = 3;
+inline constexpr int kShareVerdictLate   = 4;
+#define C2POOL_XMR_SHARE_VERDICT_SKEW 1
+
 // ── the first-byte namespace ────────────────────────────────────────────────
 inline constexpr u8  FB_NS_FIRST  = 0x40;
 inline constexpr u8  FB_NS_LAST   = 0x4f;
@@ -885,6 +899,28 @@ inline bool decode_getdrops(const std::vector<u8>& f, u32& chain_id, u64& lo, u6
     ids.clear();
     for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + kDropsGetHeader + 32 * i));
     return true;
+}
+// ★ HOLD-ROUND-2 (C1): ONE bin's inventory PAGE by cursor. GETDROPS [bin,
+// bin+1) carrying the same id TWICE = "your inventory of this bin, ids > it"
+// (answered with DROPINV [bin, bin+1), ascending, <= kDropsInvMaxIds). A plain
+// fetch never repeats an id (inventories are sorted sets), so the form is
+// unambiguous; an old server serves it as a fetch of that id (a receipt the
+// asker already holds) and the asker keeps its unpaged page after
+// drops_inv_page_max_asks. Relay wire only (Family B); no consensus byte.
+#define C2POOL_XMR_DROPS_PAGE 1
+inline bool is_getdrops_page(u64 lo, u64 hi, const std::vector<bytes32>& ids) {
+    return hi == lo + 1 && ids.size() == 2 && ids[0] == ids[1];
+}
+inline std::vector<u8> encode_getdrops_page(u32 chain_id, u64 bin, const bytes32& after) {
+    return encode_getdrops(chain_id, bin, bin + 1, std::vector<bytes32>{after, after});
+}
+// ★ HOLD-ROUND-2 (C4): a raindrop minted on a job whose height the chain has
+// passed by more than this many heights is refused at the minter. Stagenet
+// attempt 7: a HELD node's template froze at h=2220689 (the booking-point
+// gate) and its miners filled that one bin with ~130k dead raindrops for hours.
+inline constexpr u64 kDropMintStaleHeights = 2;
+inline bool drop_mint_stale(u64 job_height, u64 chain_tip, u64 grace = kDropMintStaleHeights) {
+    return chain_tip > job_height + grace;
 }
 inline std::vector<u8> encode_dropinv(u32 chain_id, u64 lo, u64 hi, const std::vector<bytes32>& ids) {
     if (hi <= lo || hi - lo > kDropsMaxSpan || ids.size() > kDropsInvMaxIds) return {};

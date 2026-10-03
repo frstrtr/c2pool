@@ -24,6 +24,18 @@
 //    0  this node does not hold that state (yet), or the view at its anchor
 //       is not readable yet      -> park; the relay decides what to do past
 //                                   its patience (xmr_relay_node.hpp)
+//    ★ HOLD-ROUND-2 (B) lane-prefix SKEW (xmr_relay_wire.hpp kShareVerdict*):
+//    2  AHEAD  the committed owed takes are the drain Delta at a SMALLER dh'
+//              than ours: the sender's ledger holds a lane block at h - dh'
+//              above our prev_lane_height() -> parked until our state
+//              advances, never a strike
+//    3  BEHIND the take is the Delta at a LARGER dh': the sender has not
+//              booked a lane block we hold -> dropped, never a strike
+//    4  LATE   a lane block at or above the share's height is booked here
+//              (our dh is 0 -> the cap) -> dropped, never a strike
+//    Stagenet attempt 7: the finder's post-FOUND shares (dh 4) were judged on
+//    the receivers' older prefix (dh 14) -> "under-take" -> -1 -> a strike each
+//    -> the finder banned every ~3 s -> the repair of its block never finished.
 // ===========================================================================
 #pragma once
 
@@ -192,7 +204,30 @@ inline int share_verdict_one(const std::shared_ptr<const ShareStateEntry>& e, co
         }
         return 1;
     }
-    if (res.verdict == rc::Verdict::Mismatch) return -1;
+    if (res.verdict == rc::Verdict::Mismatch) {
+        // ★ HOLD-ROUND-2 (B): a drain take mismatch explained by the lane prefix
+        if (res.take_mismatch && e->ledger) {
+            const std::uint64_t prev = e->ledger->prev_lane_height();
+            if (prev > 0 && coinbase_height <= prev) {
+                why = "late: a lane block at height " + std::to_string(prev) + " >= this share's height " +
+                      std::to_string(coinbase_height) + " is booked here (" + res.why + ")";
+                return kShareVerdictLate;
+            }
+            if (res.skew_dh) {
+                const std::uint64_t eff = (res.dh == 0 || res.dh > res.drain_h_cap) ? res.drain_h_cap : res.dh;
+                if (res.skew_dh < eff) {
+                    why = "ahead: the take is the drain Delta at dh " + std::to_string(res.skew_dh) + " (a lane block at " +
+                          std::to_string(coinbase_height - res.skew_dh) + " not booked here; ours dh " + std::to_string(res.dh) +
+                          ", prev_lane " + std::to_string(prev) + ")";
+                    return kShareVerdictAhead;
+                }
+                why = "behind: the take is the drain Delta at dh " + std::to_string(res.skew_dh) + " (the sender has not booked "
+                      "our lane block at " + std::to_string(prev) + "; ours dh " + std::to_string(res.dh) + ")";
+                return kShareVerdictBehind;
+            }
+        }
+        return -1;
+    }
     return 0;
 }
 
@@ -212,14 +247,22 @@ inline int share_verdict(ShareStateStore& store, const FbReceipt& r, const ::v37
     if (!::v37::xmr::verify::resume_prefix_hash(op, hp)) { why = "the coinbase opening does not resume"; return -1; }
     bool undecided = false;
     std::string first_why, undecided_why;
+    int skew = 0; std::string skew_why;   // HOLD-ROUND-2 (B): AHEAD > BEHIND > LATE, any state
     for (const auto& e : es) {
         std::string w;
         const int v = share_verdict_one(e, r, pb, coinbase_height, hp, w);
         if (v == 1) { why.clear(); return 1; }
         if (v == 0 && !undecided) { undecided = true; undecided_why = w; }
+        if (v >= kShareVerdictAhead) {
+            const int rank = v == kShareVerdictAhead ? 3 : v == kShareVerdictBehind ? 2 : 1;
+            const int cur  = skew == kShareVerdictAhead ? 3 : skew == kShareVerdictBehind ? 2 : skew == kShareVerdictLate ? 1 : 0;
+            if (rank > cur) { skew = v; skew_why = w; }
+        }
         if (first_why.empty()) first_why = w;
     }
     if (undecided) { why = undecided_why; return 0; }
+    // a share some held state explains as lane-prefix skew is never a strike
+    if (skew) { why = skew_why; return skew; }
     why = first_why;
     if (es.size() > 1) why += " (against each of the " + std::to_string(es.size()) + " held states with that root)";
     return -1;

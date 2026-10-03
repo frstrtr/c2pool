@@ -4,8 +4,8 @@ How a lane block's raindrops (DROPS, sub-threshold credit) are chosen, kept and
 fetched, and how much memory and disk that takes. Code: `xmr_relay_node.hpp`
 (the servable store), `xmr_drops_wiring.hpp` (the harvest and the range),
 `main_v37_xmr.cpp` (`drops_compose_lane`, `wire_cache_prune`),
-`xmr_o2_finalize_connect.hpp` (`is_relay_repair_pending`). KATs:
-`v37_xmr_drops_retain_kat`, `v37_xmr_relay_repair_hold_kat` (K1/K1b),
+`xmr_o2_finalize_connect.hpp` (`is_undecided`). KATs:
+`v37_xmr_drops_retain_kat` (R1-R12), `v37_xmr_relay_repair_hold_kat` (K1/K1b, A1-A3),
 `v37_xmr_drops_set_kat`, `v37_xmr_drops_harden_kat`.
 
 ## 1. The range and the set
@@ -92,7 +92,8 @@ than the count) is read once when no segment exists and renamed
 
 A backfill inventory that reaches the frame bound (16384 ids) over more than one
 bin is paged: one inventory per bin, each fetched on its own (a 31-bin range
-holds about 44k ids at 15 raindrops/s).
+holds about 44k ids at 15 raindrops/s). One bin over the bound is paged by
+cursor (section 6).
 
 ## 4. Memory and disk
 
@@ -123,10 +124,57 @@ blocks days apart needs a disk-backed store (not built yet).
   the relay store` (the winner's own composition skipped evicted ids);
 - `relay: drops-ALARM store over budget` (at most once a minute);
 - `drops-store: raindrop store <path>(.d) restored=N bytes=B budget=B retained=R`
-  (boot).
+  (boot);
+- `drops-backfill: ... | pages tx=.. served=.. rx=.. gaveup=.. | refused=..
+  refused_held=.. budget_setaside=..` (section 6); `drops: ... | mint drops=..
+  below_floor=.. stale=..` (raindrops refused on a stale job).
 
 What to check on a running pool: on the winner `drops-sync: ... raindrops_held=N`
 equals the pinned count; `drops-backfill: ... served>0` on the winner after a
 receiver's fetch; `pin_slow_asks` does not grow; `drops-retain: store=` exceeds
 65536 on a pool past 73 minutes of history and its `floor=` tracks the finalize
 cursor.
+
+## 6. The re-ask storm (stagenet attempt 7, 2026-10-02) and paging within a bin
+
+Node A held B's lane block 2220689 (HOLD, `finality-boundary.md`): its finalize
+cursor stopped, the booking-point gate froze its template at h=2220689, and its
+miners kept hashing that job for hours: about 130k raindrops in ONE bin. B's
+link to A was reset every ~3 s (the share strikes of `coinbase-recompute.md`
+section "Share verdict and lane-prefix skew"), and every HELLO pulled A's
+inventory of the last 64 bins: the 16384 smallest ids of bin 2220689, fetched
+at once outside the ask budget, overflowing B's verify queue or expired by the
+index horizon, never admitted, never counted as held, asked again at the next
+HELLO. The per-peer ask counter was keyed by the connection and erased at every
+disconnect, so the 8-ask set-aside fired once in three hours. B asked 3.75M ids;
+A served 3.58M. B's own next block then held on "drops backfill ... incomplete
+(2/2 peer(s) unconfirmed, 0 raindrop(s) missing)": the page of a dead bin can
+never be confirmed. The fix (relay wire only, Family B; no consensus byte):
+
+- **C1, one bin is paged by cursor.** `FB_GETDROPS [bin, bin+1)` carrying the
+  same id twice means "your inventory of this bin, ids above this one"
+  (`encode_getdrops_page`); the answer is a `FB_DROPINV [bin, bin+1)` page. A
+  plain fetch never repeats an id, so the form is unambiguous; an old server
+  serves it as a fetch of that one id, and the asker keeps its unpaged page
+  after `drops_inv_page_max_asks` (3) unanswered pages (`gaveup`). A sync of one
+  bin is complete only when every page is held (base: complete at 16384).
+- **C2, an id this node cannot admit counts as held.** A fetched or flooded
+  raindrop dropped before admission (beyond the index horizon, structurally bad,
+  refused by the share verdict, its context unknown past the patience, not a
+  raindrop at all, or asked 10 minutes ago and never admitted) enters a bounded
+  set (`drops_refused_max`, 262144); the backfill counts it as held, so the
+  peer's inventory is confirmed and the id is not asked again. "Complete" means
+  "holds every raindrop it would admit". A queue overflow is NOT a refusal (the
+  id may be admitted on a re-ask).
+- **C3, the ask budget is per node.** Inventories are keyed by the peer's HELLO
+  node nonce, kept across a disconnect (aged out after 10 minutes untouched);
+  the fetch-at-once of a HELLO inventory goes through the same budget. After
+  `drops_fetch_max_asks` (8) asks in all the peer is set aside for that range
+  (`budget_setaside`). The HELLO inventory skips bins below the index horizon.
+- **C4, no raindrop on a stale job.** The minter refuses a raindrop whose job
+  height the chain tip has passed by more than 2 heights (`stale=`): one job late
+  is honest work, a frozen template is not.
+
+KATs: `v37_xmr_drops_retain_kat` R9 (20,000 raindrops of one bin), R10 (an
+inadmissible id is not re-asked across forced reconnects), R11 (set aside after
+8 asks in all across reconnects), R12 (the stale-job rule and its wiring).

@@ -36,14 +36,25 @@
 //       nothing held.                                                (as pre-fix)
 //   D3  a HELD relay repair whose block then decodes lane-root-refused (synced,
 //       root matches nothing) is refused-not-credited, hold cleared. (as pre-fix)
-//   N1  a NON-relay cut-pending past the bound keeps its pre-RC-HOLD release
-//       (booking_stall_timeout, refused): the change is narrow.     (as pre-fix)
+//   N1  (inverted by HOLD-ROUND-2 A) a NON-relay cut-pending past the bound
+//       is HELD too; the pre-fix release (booking_stall_timeout, refused) was
+//       the attempt-7 split.                                         (red pre-fix)
 //   K1  ★ DROPS-RETAIN (L3): "drops set of h=.. has N/M pinned raindrop(s)
 //       not held" past the bound is HELD (stall=0 refused=0), books when the
 //       members arrive; two nodes completing the set at attempts 3 and 45
 //       (bound 30) book the same block, identical owed_digest. (red pre-fix)
 //   K1b the same for "drops set of h=.. not carried yet" (FB_GETWON and the
 //       scratch-lineage variant).                                   (red pre-fix)
+//   A1  ★ HOLD-ROUND-2 (A): the attempt-7 reason "drops lane prefix of P=..:
+//       the served order is the SUFFIX .." past the bound is HELD
+//       (booking_stall_alarm=1, refused=0), books when the data arrives; two
+//       nodes resolving at attempts 3 and 45 hold identical owed_digest. (red)
+//   A2  table: every cut-pending reason of DESIGN §2.1 (and the fetch / root-
+//       unknown holds) HELD past the bound; every DECIDED reason (§2.2) refused
+//       on attempt 1.                                     (red pre-fix: 15 rows)
+//   A3  the liveness cost, pinned: a HELD block at h passes main's booking-point
+//       gate for T=h only, never above; released on booking. (red pre-fix:
+//       the block is refused at the bound and the gate released)
 //
 // Network-free, RandomX-free (monerod STUB + the injected test point-check
 // backend, the v37_xmr_cba_native_booking_kat shape). Nonzero exit on failure.
@@ -59,6 +70,7 @@
 #include <vector>
 
 #include "c2pool/v37/xmr/xmr_o2_finalize_connect.hpp"
+#include "c2pool/v37/xmr/xmr_recon_ring.hpp"
 
 namespace o2 = c2pool::v37n::xmr::o2;
 
@@ -236,12 +248,16 @@ void decided_refused(const std::filesystem::path& tmp) {
         (void)r.fc->drain_before_stop();
     }
     {
+        // ★ HOLD-ROUND-2 (A): N1's assertion WAS the bug (a non-relay cut-pending
+        // refused at the bound). Inverted: "our lane tip T < P" past the bound is
+        // HELD like every other cut-pending reason; A1-A3 below are the full pins.
         Rig r(tmp, "n1", [](std::uint64_t) { return std::string("cut-pending: our lane tip 3 < P=9 (receiver behind the winner's cut; retry)"); });
         if (!r.ok) return;
         r.chain(1, 4); r.ticks(1); r.chain(5, 10); r.ticks(60);
-        check("N1 a NON-relay cut-pending past the bound keeps its release (booking_stall_timeout=1, refused=1, relay_repair_stall=0)",
-              r.st().booking_stall_timeout == 1 && r.st().refused == 1 && r.st().relay_repair_stall_timeout == 0 &&
-              r.st().held_now == 0 && r.cursor() == 7,
+        check("N1 (inverted by HOLD-ROUND-2 A) a non-relay cut-pending past the bound is HELD: stall_timeout=0, refused=0, held_now=1, cursor 1 "
+              "(base: booking_stall_timeout=1 refused=1)",
+              r.st().booking_stall_timeout == 0 && r.st().refused == 0 && r.st().liability_blocks == 0 &&
+              r.st().held_now == 1 && r.cursor() == 1,
               r.brief());
         (void)r.fc->drain_before_stop();
     }
@@ -298,6 +314,155 @@ void drops_set_hold(const std::filesystem::path& tmp) {
     (void)x.fc->drain_before_stop(); (void)y.fc->drain_before_stop();
 }
 
+// ── HOLD-ROUND-2 (A): EVERY cut-pending reason is UNDECIDED -> HELD ──
+// Stagenet attempt 7 (h=2220689, binary b261fb1a5): receivers A and C held B's
+// block on "drops lane prefix of P=2356: the served order is the SUFFIX ..."; the
+// reason was not in the relay-repair list, so at retry 601 both REFUSED it into
+// node-local liability while B booked and finalized it: an owed_digest split.
+const std::string kSuffixWhy =
+    "cut-pending: drops lane prefix of P=2356: the served order is the SUFFIX [225,2356) and our [0,225) is not the "
+    "order the spine verified (shadow base without a DROPS record, or the settlement replay is pending) -- HOLD, never "
+    "composed from a suffix";
+
+std::uint64_t stall_alarm_of(const Rig& r) {
+#ifdef C2POOL_XMR_HOLD_ROUND2_UNDECIDED
+    return r.st().booking_stall_alarm;
+#else
+    return 0;   // base: no alarm counter; the bound REFUSES (booking_stall_timeout)
+#endif
+}
+
+void undecided_suffix_hold(const std::filesystem::path& tmp) {
+    std::printf("-- A1: the attempt-7 SUFFIX reason past the bound is HELD, then books; two nodes converge --\n");
+    bool arrived = false;
+    Rig r(tmp, "a1", [&](std::uint64_t) { return arrived ? std::string() : kSuffixWhy; });
+    if (!r.ok) return;
+    r.chain(1, 4); r.ticks(1); r.chain(5, 10); r.ticks(60);
+    check("A1 SUFFIX reason past the retry bound (60 attempts > 30): HELD, booking_stall_alarm=1, stall_timeout=0, refused=0, "
+          "liability=0, R4 gate holds the cursor at 1 (base: refused=1 liability=1 -- the attempt-7 split)",
+          r.attempts > 30 && r.st().held_now == 1 && stall_alarm_of(r) == 1 && r.st().booking_stall_timeout == 0 &&
+          r.st().refused == 0 && r.st().liability_blocks == 0 && r.cursor() == 1 && !r.node->ledger().is_settled(r.bid5),
+          r.brief() + " stall_alarm=" + std::to_string(stall_alarm_of(r)));
+    arrived = true;   // the order / its base arrives: the prefix composes
+    r.ticks(12);
+    check("A1 the data arrives -> booked=1, held_resolved=1, settled, cursor 7",
+          r.booked == 1 && r.st().refused == 0 && r.st().held_now == 0 && r.st().held_resolved == 1 &&
+          r.node->ledger().is_settled(r.bid5) && r.cursor() == 7,
+          r.brief());
+    (void)r.fc->drain_before_stop();
+    Rig x(tmp, "a1-x", [](std::uint64_t n) { return n >= 3 ? std::string() : kSuffixWhy; });
+    Rig y(tmp, "a1-y", [](std::uint64_t n) { return n >= 45 ? std::string() : kSuffixWhy; });
+    if (!x.ok || !y.ok) return;
+    for (Rig* q : {&x, &y}) { q->chain(1, 4); q->ticks(1); q->chain(5, 10); }
+    for (int i = 0; i < 120; ++i) { x.ticks(1); y.ticks(1); }
+    const bool same = x.node->ledger().owed_digest() == y.node->ledger().owed_digest();
+    check("A1 two nodes, the SUFFIX resolves at attempt 3 vs 45 (> bound): both book h=5, byte-identical owed_digest, 0 refused, "
+          "0 liability (base: Y refuses into liability -> owed_digest split)",
+          x.node->ledger().is_settled(x.bid5) && y.node->ledger().is_settled(y.bid5) && same && x.st().refused == 0 &&
+          y.st().refused == 0 && y.st().liability_blocks == 0 && x.cursor() == 7 && y.cursor() == 7,
+          "X{" + x.brief() + "} Y{" + y.brief() + "} digest_equal=" + (same ? "yes" : "NO"));
+    (void)x.fc->drain_before_stop(); (void)y.fc->drain_before_stop();
+}
+
+// A2: the table of every reason a booking can stay undecided (DESIGN §2.1, the
+// producers in main_v37_xmr.cpp) and every DECIDED reason (§2.2).
+void undecided_table(const std::filesystem::path& tmp) {
+    std::printf("-- A2: every cut-pending reason HELD past the bound; every DECIDED reason refused on attempt 1 --\n");
+    const std::string sp = "cut-pending: ";
+    const std::vector<std::pair<const char*, std::string>> undecided = {
+        {"#1 replay log behind", sp + "replay log has 120 records < P=173 (receiver behind the winner's cut; retry)"},
+        {"#2 replay no matching cut", sp + "replay reached P=173 but published no matching cut (retry)"},
+        {"#3 relay repair in flight", kRepairWhy},
+        {"#3b relay repair no peer", kRepairExhaustedWhy},
+        {"#4 served but replay short", sp + "relay repair of P=173 served [40,173) but our replay log has only 30 pushes (retry)"},
+        {"#5 served order repeats", sp + "the served order at P=173 repeats receipt 0123456789ab (serving peer set aside; asking another)"},
+        {"#6 receipt left cache", kReceiptLeftWhy},
+        {"#6b receipt left cache (prefix)", sp + "a repaired receipt left the verified cache (drops lane prefix; retry)"},
+        {"#7 origin bin", sp + "the origin bin of a repaired receipt is not resolvable yet (retry)"},
+        {"#7b origin bin (prefix)", sp + "the origin bin of a repaired receipt is not resolvable yet (drops lane prefix; retry)"},
+        {"#8 composed order breaks", sp + "the composed order at P=173 breaks the canonical order: rank 4 > rank 3 (own tail 2, partial; serving peer set aside; asking another)"},
+        {"#9 order did not reproduce", kOrderRejectedWhy},
+        {"#10 CUT-FLOOR wait", sp + "CUT-FLOOR wait: the lower chain block 0123456789ab h=4 is undecided (its committed cut may raise the floor under P=173)"},
+        {"#11 lane tip behind", sp + "our lane tip 3 < P=9 (receiver behind the winner's cut; retry)"},
+        {"#12 prefix not derivable", sp + "drops lane prefix [0,173) not derivable (own lane log has a gap at 40)"},
+        {"#13 prefix awaiting order", sp + "relay repair of P=173: drops lane prefix awaiting the winner-side order (own order: gap at 40)"},
+        {"#14 SUFFIX (attempt 7)", kSuffixWhy},
+        {"#15 prefix not derivable yet", sp + "drops lane prefix of P=173 not derivable yet: replay pending"},
+        {"#16 range below undecidable", sp + "drops range below h=5 undecidable (canonical predecessor not readable yet)"},
+        {"#17 prefix covers < P", sp + "drops lane prefix covers 100 positions < P=173"},
+        {"#18 pinned not held", kPinnedNotHeldWhy},
+        {"#19 recompute view", sp + "recompute: the view at P=173 is not readable yet"},
+        {"#20 recompute undecidable", sp + "lane-prefix skew: the take equals the drain Delta at dh 4, ours is 14"},
+        {"#21 DROPS not live", sp + "relay repair of P=-: DROPS not live yet (flip 1: no pre-DROPS booking)"},
+        {"#22 ledger not bound", sp + "settlement ledger not bound yet (boot)"},
+        {"#23 backfill below", sp + "drops backfill of intervals below h=5 undecidable (the canonical predecessor lane block is not readable yet)"},
+        {"#23b backfill incomplete", sp + "drops backfill of intervals [2,5) incomplete (2/2 peer(s) unconfirmed, 0 raindrop(s) missing)"},
+        {"#24 set not carried", kSetNotCarriedWhy},
+        {"#24b set not carried (scratch)", kSetNotCarriedScratchWhy},
+        {"#25 no scratch ring", sp + "no scratch ring (internal)"},
+        {"#26 REJOIN-PAYEE pend", sp + "the view at P=173 is not readable yet [payee resolution: output 2 maps to no known payee -- the payees of the block's own credit cut P=173]"},
+        {"#27 get_block", "get_block(0123456789ab): connection refused"},
+        {"#27b native-hold", "native-hold: the native chain index does not hold the block body"},
+        {"#27c does not parse", "coinbase blob does not parse"},
+        {"#28 lane-root-unknown", "lane-root-unknown: the ring is not at the winner's state yet"},
+    };
+    int k = 0;
+    for (const auto& [tag, why] : undecided) {
+        Rig r(tmp, "a2u-" + std::to_string(k++), [w = why](std::uint64_t) { return w; });
+        if (!r.ok) return;
+        r.chain(1, 4); r.ticks(1); r.chain(5, 10); r.ticks(60);
+        const std::string name = std::string("A2 UNDECIDED ") + tag + ": HELD past the bound (refused=0, liability=0, held_now=1, cursor 1)";
+        check(name.c_str(), r.attempts > 1 && r.st().refused == 0 && r.st().refused_not_credited == 0 &&
+                            r.st().liability_blocks == 0 && r.st().held_now == 1 && r.cursor() == 1 &&
+                            !r.node->ledger().is_settled(r.bid5),
+              r.brief());
+        (void)r.fc->drain_before_stop();
+    }
+    const std::vector<std::pair<const char*, std::string>> decided = {
+        {"lane-root-refused", "lane-root-refused:" + std::string(64, 'e') + ":no candidate digest (test)"},
+        {"not-lane", "not-lane: no v37 settlement ledger bound (option A)"},
+        {"txin_gen height", "coinbase txin_gen height 4 != chain height 5"},
+        {"no credit cut", "no on-chain credit cut (0x02 V37C tail) -- E_b unreproducible (fail-closed)"},
+        {"cut-floor-refused", "cut-floor-refused: P=173 is below the floor 180 committed at h=4"},
+        {"credit-cut MISMATCH (replay)", kDecidedMismatchWhy},
+        {"credit-cut MISMATCH (published)", "credit-cut MISMATCH: we published P=173 with a DIFFERENT lane digest (fail-closed: different records in the same prefix)"},
+        {"fold_eb REFUSED", "fold_eb REFUSED at the on-chain cut (geometry not ratified)"},
+    };
+    for (const auto& [tag, why] : decided) {
+        Rig r(tmp, "a2d-" + std::to_string(k++), [w = why](std::uint64_t) { return w; });
+        if (!r.ok) return;
+        r.chain(1, 4); r.ticks(1); r.chain(5, 10); r.ticks(3);
+        const bool is_root_refused = std::string(tag) == "lane-root-refused", is_not_lane = std::string(tag) == "not-lane";
+        const bool outcome = is_root_refused ? r.st().refused_not_credited == 1
+                           : is_not_lane     ? r.st().refused == 0
+                                             : (r.st().refused == 1 && r.st().liability_blocks == 1);
+        const std::string name = std::string("A2 DECIDED ") + tag + ": decided on attempt 1 (no hold, gate released, cursor 7)";
+        check(name.c_str(), r.attempts == 1 && outcome && r.st().held_now == 0 && r.booked == 0 &&
+                            !r.node->ledger().is_settled(r.bid5) && r.cursor() == 7,
+              r.brief() + " rnc=" + std::to_string(r.st().refused_not_credited));
+        (void)r.fc->drain_before_stop();
+    }
+}
+
+// A3: the liveness cost, pinned. A HELD block at h keeps the finalize cursor at
+// builder_cut(h) = h-1-D_conf, so main's BOOKING-POINT GATE (provider ready_gate:
+// cursor == builder_cut(T)) builds a template for T = h at most -- never above.
+void hold_gates_template(const std::filesystem::path& tmp) {
+    std::printf("-- A3: a HELD block at h gates every template above h; released on booking --\n");
+    namespace recon = c2pool::v37n::xmr::recon;
+    bool arrived = false;
+    Rig r(tmp, "a3", [&](std::uint64_t) { return arrived ? std::string() : kSuffixWhy; });
+    if (!r.ok) return;
+    r.chain(1, 4); r.ticks(1); r.chain(5, 10); r.ticks(60);
+    auto gate = [&](std::uint64_t T) { return r.cursor() == recon::builder_cut(T, r.c.d_conf); };
+    check("A3 held at h=5: the booking-point gate passes T=5 only; T=6..11 held (the node mines nothing above the held height)",
+          r.st().held_now == 1 && gate(5) && !gate(6) && !gate(11), r.brief());
+    arrived = true;
+    r.ticks(12);
+    check("A3 booked: the gate releases up to the tip's next height (T=11 passes)", r.st().held_now == 0 && gate(11), r.brief());
+    (void)r.fc->drain_before_stop();
+}
+
 } // namespace
 
 int main() {
@@ -310,6 +475,9 @@ int main() {
     repair_family(tmp);
     decided_refused(tmp);
     drops_set_hold(tmp);   // ★ DROPS-RETAIN (L3)
+    undecided_suffix_hold(tmp);   // ★ HOLD-ROUND-2 (A)
+    undecided_table(tmp);
+    hold_gates_template(tmp);
     std::filesystem::remove_all(tmp);
     std::printf("== %s (%d failure(s)) ==\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

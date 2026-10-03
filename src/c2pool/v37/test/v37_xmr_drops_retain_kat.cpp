@@ -47,6 +47,12 @@
 //       a torn tail keeps the valid prefix; another lane's segment is ignored.
 //   R8  source pins: the shell wires L1/L2 (pin servable, retain at admission
 //       and boot, release at forget, the floor at each finalize step, the knob).
+//   R9-R12 ★ HOLD-ROUND-2 (C), the attempt-7 re-ask storm: R9 one bin of
+//       20,000 raindrops is paged by cursor (base: 3,616 never asked); R10 a
+//       fetched raindrop this node cannot admit counts as held (base: re-asked
+//       forever); R11 the ask budget is per NODE and survives reconnects (base:
+//       reset at every disconnect, never set aside); R12 the minter refuses a
+//       raindrop on a job the chain passed (base: minted).
 //
 // RED on the base (ed360c4c), GREEN on the fix.
 #include <algorithm>
@@ -567,6 +573,151 @@ static void r6_paging(Checker& C) {
     C(complete && got == 20000, "R6 drops_sync answers complete only once all 20,000 are held (base: complete at 16,384, 3,616 never asked)");
 }
 
+// ── HOLD-ROUND-2 (C): the attempt-7 re-ask storm ────────────────────────────
+// B asked 3.75M raindrop ids in 3 h: A's held template froze at h=2220689, its
+// miners filled that ONE bin with ~130k raindrops; every HELLO (a ban loop:
+// one per ~3 s) pulled the 16384 smallest ids, fetched them at once outside the
+// ask budget, could never admit them (queue / horizon), never counted them held,
+// and erased the per-peer ask counter at the disconnect.
+static bool sync_until(XmrRelayNode& r, u64 lo, u64 hi, std::chrono::milliseconds limit, const std::function<void()>& tick = {}) {
+    const auto dl = std::chrono::steady_clock::now() + limit;
+    while (std::chrono::steady_clock::now() < dl) {
+        if (r.drops_sync(lo, hi).complete) return true;
+        if (tick) tick();
+        std::this_thread::sleep_for(50ms);
+    }
+    return r.drops_sync(lo, hi).complete;
+}
+// R9 (C1): ONE bin over kDropsInvMaxIds is paged by cursor
+static void r9_one_bin_paging(Checker& C) {
+    std::printf("R9 (C1): a peer holds 20,000 raindrops of ONE bin; the inventory frame carries at most %zu ids\n", rl::kDropsInvMaxIds);
+    std::string why;
+    auto os = ropts({}); os.drops_fetch_retry_ms = 2000;
+    Node S(os, 110);
+    C(S.relay->start(why), "R9 S starts " + why);
+    for (std::uint32_t k = 0; k < 20000; ++k) S.relay->submit_own_drop(drop_at(100, k, payee_n(k % 4)));
+    C(S.relay->drops_held(100, 101).size() == 20000, "R9 S holds 20,000 raindrops of bin 100");
+    auto orr = ropts({S.relay->listen_port()}); orr.drops_fetch_retry_ms = 2000;
+    Node R(orr, 110);
+    C(R.relay->start(why) && wait_for([&] { return R.relay->ready_peers().size() == 1; }, {&R, &S}), "R9 R dials S");
+    const bool complete = sync_until(*R.relay, 100, 101, 40000ms, [&] { R.pump(); });
+    const std::size_t got = R.relay->drops_held(100, 101).size();
+#if defined(C2POOL_XMR_DROPS_PAGE)
+    const unsigned long long pages = R.relay->stats().drops_inv_pages_rx.load(), served = S.relay->stats().drops_inv_pages_served.load();
+#else
+    const unsigned long long pages = 0, served = 0;
+#endif
+    std::printf("  drops_sync complete=%d held=%zu/20000 pages_rx=%llu pages_served=%llu\n", complete ? 1 : 0, got, pages, served);
+    C(complete && got == 20000 && pages >= 1 && served >= 1,
+      "R9 drops_sync of one bin is complete only once all 20,000 are held, via cursor pages (base: complete at 16,384, 3,616 never asked)");
+}
+
+// A bare relay node for R10/R11: its own ChainView (bins 90..tip) and a RandomX
+// function the test controls (rx_ok = false: the engine never verifies).
+struct RawNode {
+    ChainView chain;
+    std::unique_ptr<XmrRelayNode> relay;
+    RawNode(RelayOptions ro, std::uint64_t tip, bool rx_ok) {
+        for (std::uint64_t b = 90; b <= tip; ++b) chain.note(prev_of(b), b, bytes32{});
+        chain.set_tip(tip);
+        relay = std::make_unique<XmrRelayNode>(
+            ro, chain,
+            [rx_ok](const std::vector<u8>& blob, const bytes32&, bytes32& pow) { return rx_ok && fake_rx(blob, pow); },
+            []() -> std::pair<u64, bytes32> { return {0, bytes32{}}; }, [](const std::string&) {});
+    }
+    ~RawNode() { relay->stop(); }
+};
+// R10 (C2): a fetched raindrop this node cannot admit counts as held -- the sync
+// completes and the id is not asked again, across forced reconnects.
+static void r10_refused_held(Checker& C) {
+    std::printf("R10 (C2): 40 raindrops of bin 115 whose Monero context neither node holds (inadmissible at R)\n");
+    std::string why;
+    auto os = ropts({}); os.drops_fetch_retry_ms = 100;
+    Node S(os, 110);                      // S's chain stops at 110: it holds the raindrops, not their context
+    C(S.relay->start(why), "R10 S starts " + why);
+    for (std::uint32_t k = 0; k < 40; ++k) S.relay->submit_own_drop(drop_at(115, k, payee_n(k % 4)));
+    C(S.relay->drops_held(115, 116).size() == 40, "R10 S holds the 40 raindrops of bin 115");
+    auto orr = ropts({S.relay->listen_port()}); orr.drops_fetch_retry_ms = 100; orr.solicited_unresolved_patience_ms = 300;
+    RawNode R(orr, 110, true);
+    C(R.relay->start(why), "R10 R starts, dials S " + why);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (R.relay->ready_peers().empty() && std::chrono::steady_clock::now() - t0 < 10s) std::this_thread::sleep_for(20ms);
+    int reconnects = 0;
+    auto last = std::chrono::steady_clock::now();
+    bool complete = false;
+    const auto dl = std::chrono::steady_clock::now() + 6s;
+    while (std::chrono::steady_clock::now() < dl) {   // a forced reconnect every 600 ms (the attempt-7 ban loop, slowed)
+        if (!complete) complete = R.relay->drops_sync(115, 116).complete;
+        else (void)R.relay->drops_sync(115, 116);
+        if (std::chrono::steady_clock::now() - last > 600ms) {
+            for (auto p : R.relay->ready_peers()) { R.relay->drop_peer(p); ++reconnects; }
+            last = std::chrono::steady_clock::now();
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    const auto& rs = R.relay->stats();
+#if defined(C2POOL_XMR_DROPS_PAGE)
+    const unsigned long long refused_held = rs.drops_refused_held.load();
+#else
+    const unsigned long long refused_held = 0;
+#endif
+    std::printf("  reconnects=%d complete=%d ids_asked=%llu unresolved_dropped=%llu refused_held=%llu set_aside=%llu\n", reconnects,
+                complete ? 1 : 0, (unsigned long long)rs.drops_ids_asked.load(), (unsigned long long)rs.unresolved_dropped.load(),
+                refused_held, (unsigned long long)rs.drops_peer_setaside.load());
+    C(complete && refused_held > 0 && rs.drops_ids_asked.load() <= 8 * 40,
+      "R10 the inadmissible ids count as held: drops_sync complete, ids_asked <= 8N (asks only until the first refusal) across " + std::to_string(reconnects) +
+      " reconnects (base: never held, re-asked every 100 ms, ids_asked=" + std::to_string(rs.drops_ids_asked.load()) + ")");
+}
+// R11 (C3): the ask budget is per NODE and survives reconnects: a peer that never
+// gets its inventory fetched is set aside after drops_fetch_max_asks asks in all.
+static void r11_budget_by_node(Checker& C) {
+    std::printf("R11 (C3): R can never verify (RandomX unavailable): every fetched raindrop is lost; reconnect every 700 ms\n");
+    std::string why;
+    auto os = ropts({}); os.drops_fetch_retry_ms = 100;
+    Node S(os, 120);
+    C(S.relay->start(why), "R11 S starts " + why);
+    for (std::uint32_t k = 0; k < 40; ++k) S.relay->submit_own_drop(drop_at(115, 100 + k, payee_n(k % 4)));
+    auto orr = ropts({S.relay->listen_port()}); orr.drops_fetch_retry_ms = 100;
+    RawNode R(orr, 120, /*rx_ok=*/false);
+    C(R.relay->start(why), "R11 R starts, dials S " + why);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (R.relay->ready_peers().empty() && std::chrono::steady_clock::now() - t0 < 10s) std::this_thread::sleep_for(20ms);
+    int reconnects = 0;
+    auto last = std::chrono::steady_clock::now();
+    const auto dl = std::chrono::steady_clock::now() + 7s;
+    while (std::chrono::steady_clock::now() < dl) {
+        (void)R.relay->drops_sync(115, 116);
+        if (std::chrono::steady_clock::now() - last > 700ms) {
+            for (auto p : R.relay->ready_peers()) { R.relay->drop_peer(p); ++reconnects; }
+            last = std::chrono::steady_clock::now();
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    const auto& rs = R.relay->stats();
+    std::printf("  reconnects=%d ids_asked=%llu set_aside=%llu rx_unavailable=%llu\n", reconnects,
+                (unsigned long long)rs.drops_ids_asked.load(), (unsigned long long)rs.drops_peer_setaside.load(),
+                (unsigned long long)rs.rx_unavailable.load());
+    C(rs.drops_peer_setaside.load() >= 1 && rs.drops_ids_asked.load() <= 9 * 40,
+      "R11 set aside after 8 asks IN ALL (node-keyed budget), ids_asked <= 9N across " + std::to_string(reconnects) +
+      " reconnects (base: the budget reset at every disconnect, set_aside=" + std::to_string(rs.drops_peer_setaside.load()) +
+      " ids_asked=" + std::to_string(rs.drops_ids_asked.load()) + ")");
+}
+// R12 (C4): never a raindrop on a job the chain has passed
+static void r12_stale_mint(Checker& C) {
+    std::printf("R12 (C4): the minter refuses raindrops on a stale job\n");
+#if defined(C2POOL_XMR_DROPS_PAGE)
+    C(rl::drop_mint_stale(2220689, 2220753) && !rl::drop_mint_stale(2220689, 2220689) && !rl::drop_mint_stale(2220689, 2220691) &&
+      rl::drop_mint_stale(2220689, 2220692),
+      "R12 job 2220689 at tip 2220753 (attempt 7's frozen template): STALE; at tip h..h+2: minted (one job late is honest work)");
+    const std::string src = slurp(V37_XMR_SHELL_SRC);
+    C(!src.empty() && src.find("relay::drop_mint_stale(acc.height, relay_chain.tip())") != std::string::npos &&
+      src.find("++drops_mint_stale; return;") != std::string::npos && src.find("stale=%llu") != std::string::npos,
+      "R12 the shell refuses a stale raindrop BEFORE minting it and counts it (mint drops ... stale=)");
+#else
+    C(false, "R12 the base mints raindrops on any job (attempt 7: ~130k into the frozen bin 2220689)");
+#endif
+}
+
 // ── R7 (K7): per-bin append-only segments ───────────────────────────────────
 static void r7_segments(Checker& C, const std::string& dir) {
     std::printf("R7: the store persisted as per-bin segments\n");
@@ -648,6 +799,10 @@ int main() {
     r4_retained(C);
     r5_floor_budget(C, dir);
     r6_paging(C);
+    r9_one_bin_paging(C);    // HOLD-ROUND-2 (C1)
+    r10_refused_held(C);     // HOLD-ROUND-2 (C2)
+    r11_budget_by_node(C);   // HOLD-ROUND-2 (C3)
+    r12_stale_mint(C);       // HOLD-ROUND-2 (C4)
     r7_segments(C, dir);
     {   // R2: a store too small for the window (the same count knob on both trees)
         auto o = ropts({}); o.drops_store_max = 600;

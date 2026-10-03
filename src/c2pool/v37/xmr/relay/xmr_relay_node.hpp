@@ -328,6 +328,12 @@ struct RelayOptions {
     // outstanding per peer, inside the per-peer burst (20).
     std::size_t verify_threads = 1;
     u32         unresolved_patience_ms = 30000;
+    // ★ HOLD-ROUND-2 (B): shares the verdict classifies AHEAD (the sender booked
+    // a lane block this node has not yet) wait for this node's share state to
+    // advance (notify_share_state_advanced), not for a clock: bounded per peer
+    // and in total, the oldest evicted first (dropped, never a strike).
+    std::size_t share_ahead_per_peer = 512;
+    std::size_t share_ahead_max = 4096;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
     u32         repair_state_timeout_ms = 20000;
     // REPAIR-PAGE: ids per GETORDER page of a relay repair. Pre-fix every page
@@ -394,6 +400,11 @@ struct RelayOptions {
     u32         drops_inv_retry_ms = 2000;                   // re-ask an unanswered inventory after this
     u32         drops_fetch_retry_ms = 2000;                 // re-ask still-missing ids after this
     u32         drops_fetch_max_asks = 8;                    // asks of one peer for its missing ids before it is set aside
+    // ★ HOLD-ROUND-2 (C): cursor pages of one bin's inventory asked before an
+    // unanswering (old) server's unpaged page is kept; and the bound of the set
+    // of fetched-but-inadmissible raindrop ids (counted as held: never re-asked).
+    u32         drops_inv_page_max_asks = 3;
+    std::size_t drops_refused_max = 262144;
     // ★ DROPS-HARDEN (d1): a pinned id still missing after drops_fetch_max_asks
     // asks is re-asked no more often than this (never forever at the fast rate)
     u32         drops_fetch_slow_ms = 60000;
@@ -467,6 +478,8 @@ struct RelayStats {
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
     // SHARE-LEVEL CANONICAL COINBASE: receipts refused / parked / undecided at the verdict
     std::atomic<u64> share_refused{0}, share_parked{0}, share_undecided_dropped{0}, share_undecided_trusted{0};
+    // ★ HOLD-ROUND-2 (B): lane-prefix skew at the verdict (never a strike)
+    std::atomic<u64> share_skew_ahead{0}, share_skew_behind{0}, share_late{0}, share_ahead_rejudged{0}, share_ahead_evicted{0};
     std::atomic<u64> won_reoffer_skipped{0};   // RELAY-SEND-QUEUE: not re-offered, the peer node provably holds it
     std::atomic<u64> won_held_confirmed{0};    // RELAY-SEND-QUEUE: re-offered frames a later PONG proved read
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
@@ -489,6 +502,12 @@ struct RelayStats {
     std::atomic<u64> drops_set_unservable_skipped{0};
     std::atomic<u64> drops_seg_appends{0}, drops_seg_rewrites{0}, drops_seg_unlinks{0}, drops_seg_torn{0};
     std::atomic<u64> drops_load_over_budget{0}, drops_inv_paged{0};
+    // ★ HOLD-ROUND-2 (C): one-bin inventory pages by cursor (asked / served /
+    // received / given up on an old server), fetched ids that were not
+    // admissible here (refused: counted held), and inventories whose fetch-at-
+    // once hit the per-peer ask budget (keyed by node, kept across reconnects)
+    std::atomic<u64> drops_inv_pages_tx{0}, drops_inv_pages_served{0}, drops_inv_pages_rx{0}, drops_inv_page_gaveup{0};
+    std::atomic<u64> drops_refused{0}, drops_refused_held{0}, drops_inv_budget_setaside{0};
     // REPAIR-HORIZON: BELOW_HORIZON answers that raised a repair's start and
     // re-asked (instead of setting the peer aside); prefix probes whose digest
     // at a0 matched ours / was unknown there; peers proven DEEP (divergence
@@ -762,12 +781,15 @@ public:
         }
         const auto now = Clock::now();
         SyncWork work;
+        std::vector<std::pair<PeerId, u64>> keyed;   // HOLD-ROUND-2 (C3): (connection, node key), outside m_dsmtx
+        for (PeerId p : peers) keyed.emplace_back(p, inv_node(p));
         {
             std::lock_guard<std::mutex> lk(m_dsmtx);
-            for (PeerId p : peers)
-                if (drops_sync_step_locked(p, lo, hi, now, out, work)) ++out.peers_ok;
+            for (const auto& [p, node] : keyed)
+                if (drops_sync_step_locked(p, node, lo, hi, now, out, work)) ++out.peers_ok;
         }
         for (const auto& [p, l, h] : work.ask_inv) send_drop_invreq(p, l, h);
+        for (const auto& [p, l, after] : work.ask_page) send_drop_page(p, l, after);
         for (auto& [p, l, h, ids] : work.fetch) send_drop_fetch(p, l, h, ids);
         out.complete = (out.peers_ok == out.peers);
         if (!out.complete) {
@@ -989,10 +1011,11 @@ public:
     }
     std::string describe_drops() const {
         const auto& s = m_st;
-        char b[900];
+        char b[1200];
         std::snprintf(b, sizeof b,
             "drops-backfill: store=%zu invreq tx=%llu rx=%llu inv tx=%llu rx=%llu | fetch tx=%llu ids_asked=%llu fetchreq_rx=%llu served=%llu "
-            "backfilled=%llu | sync calls=%llu pending=%llu complete=%llu set_aside=%llu | getwon asked=%llu served=%llu unknown=%llu solicited_rx=%llu won_reoffered=%llu",
+            "backfilled=%llu | sync calls=%llu pending=%llu complete=%llu set_aside=%llu | getwon asked=%llu served=%llu unknown=%llu solicited_rx=%llu won_reoffered=%llu"
+            " | pages tx=%llu served=%llu rx=%llu gaveup=%llu | refused=%llu refused_held=%llu budget_setaside=%llu",
             drops_store_size(),
             (unsigned long long)s.drops_invreq_tx.load(), (unsigned long long)s.drops_invreq_rx.load(),
             (unsigned long long)s.drops_inv_tx.load(), (unsigned long long)s.drops_inv_rx.load(),
@@ -1002,7 +1025,11 @@ public:
             (unsigned long long)s.drops_sync_pending.load(), (unsigned long long)s.drops_sync_complete.load(),
             (unsigned long long)s.drops_peer_setaside.load(),
             (unsigned long long)s.won_asked.load(), (unsigned long long)s.won_served.load(), (unsigned long long)s.won_unknown.load(),
-            (unsigned long long)s.won_solicited_rx.load(), (unsigned long long)s.won_reoffered.load());
+            (unsigned long long)s.won_solicited_rx.load(), (unsigned long long)s.won_reoffered.load(),
+            (unsigned long long)s.drops_inv_pages_tx.load(), (unsigned long long)s.drops_inv_pages_served.load(),
+            (unsigned long long)s.drops_inv_pages_rx.load(), (unsigned long long)s.drops_inv_page_gaveup.load(),
+            (unsigned long long)s.drops_refused.load(), (unsigned long long)s.drops_refused_held.load(),
+            (unsigned long long)s.drops_inv_budget_setaside.load());
         return b;
     }
 
@@ -1476,6 +1503,31 @@ public:
     // DROPS-VERIFY-SCALE: verify queue depth (items waiting for a worker) and parked items.
     std::size_t verify_queue_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_q.size(); }
     std::size_t verify_parked_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_parked.size(); }
+    std::size_t share_ahead_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_ahead.size(); }
+    // ★ HOLD-ROUND-2 (B): the main thread published a new share state (a lane
+    // block booked / a FOUND / a view readable): every AHEAD share is re-judged.
+    void notify_share_state_advanced() {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (m_ahead.empty()) return;
+        const auto now = Clock::now();
+        for (auto& x : m_ahead) { x.not_before = now; m_parked.push_back(std::move(x)); m_st.share_ahead_rejudged++; }
+        m_ahead.clear(); m_ahead_n.clear();
+        m_qcv.notify_one();
+    }
+    // The share-verdict counters (VERIFY S6: only the last refusal showed).
+    std::string describe_shares() const {
+        const auto& s = m_st;
+        char b[420];
+        std::snprintf(b, sizeof b,
+            "relay-shares: refused=%llu parked=%llu undecided_dropped=%llu trusted=%llu | skew ahead=%llu behind=%llu late=%llu "
+            "ahead_now=%zu rejudged=%llu evicted=%llu",
+            (unsigned long long)s.share_refused.load(), (unsigned long long)s.share_parked.load(),
+            (unsigned long long)s.share_undecided_dropped.load(), (unsigned long long)s.share_undecided_trusted.load(),
+            (unsigned long long)s.share_skew_ahead.load(), (unsigned long long)s.share_skew_behind.load(),
+            (unsigned long long)s.share_late.load(), share_ahead_size(),
+            (unsigned long long)s.share_ahead_rejudged.load(), (unsigned long long)s.share_ahead_evicted.load());
+        return b;
+    }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
     std::string last_unresolved() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_unresolved; }
     std::string last_share_refused() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_share_refused; }
@@ -1693,16 +1745,26 @@ private:
         PeerId proof_from = 0;
     };
     // ★ RAIN-BACKFILL: one peer's inventory of one interval range.
+    // ★ HOLD-ROUND-2 (C3): keyed by the peer NODE (its HELLO node_nonce), not
+    // the connection: the ask budget (drops_fetch_max_asks) and the set-aside
+    // survive a reconnect. Stagenet attempt 7: the key was the connection and
+    // was erased at every disconnect, so under a ~3 s ban loop the 8-ask
+    // set-aside fired once in 3 h while 3.75M ids were asked.
     struct InvKey {
-        PeerId p = 0; u64 lo = 0, hi = 0;
-        bool operator<(const InvKey& o) const { return std::tie(p, lo, hi) < std::tie(o.p, o.lo, o.hi); }
+        u64 node = 0; u64 lo = 0, hi = 0;
+        bool operator<(const InvKey& o) const { return std::tie(node, lo, hi) < std::tie(o.node, o.lo, o.hi); }
     };
     struct PeerInv {
         bool answered = false, set_aside = false;
+        bool more = false;              // HOLD-ROUND-2 (C1): a one-bin inventory filled kDropsInvMaxIds: page on
         std::vector<bytes32> ids;
-        u32 asks = 0;
-        Clock::time_point asked{}, fetched{}, touched{};
+        u32 asks = 0, page_asks = 0;
+        Clock::time_point asked{}, fetched{}, touched{}, page_asked{};
     };
+    u64 inv_node(PeerId p) const {
+        const u64 nn = peer_node_nonce(p);
+        return nn ? nn : (static_cast<u64>(p) | (u64{1} << 63));   // before HELLO: the connection (tagged)
+    }
     static std::string hex_short(const bytes32& b) {
         static const char* d = "0123456789abcdef";
         std::string s; for (int i = 0; i < 6; ++i) { s.push_back(d[b[i] >> 4]); s.push_back(d[b[i] & 15]); } return s + "…";
@@ -1847,10 +1909,10 @@ private:
         if (m_fetch) m_fetch->forget_peer(p);
         if (m_serve) m_serve->forget_peer(p);
         { std::lock_guard<std::mutex> lk(m_bmtx); m_won_offer.erase(p); }   // RELAY-SEND-QUEUE
-        if (m_o.drops_floor_diff) {   // ★ RAIN-BACKFILL: a dropped peer's inventories say nothing any more
-            std::lock_guard<std::mutex> lk(m_dsmtx);
-            for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();) it = (it->first.p == p) ? m_drop_inv.erase(it) : std::next(it);
-        }
+        // ★ HOLD-ROUND-2 (C3): a dropped peer's inventories are KEPT (keyed by its
+        // node, aged out after 10 min untouched): its ask budget and set-aside
+        // survive the reconnect (pre-fix they were erased here, so a ban loop
+        // re-asked the same inventory from zero every ~3 s).
         {
             std::lock_guard<std::mutex> lk(m_rmtx);
             for (auto& [k, r] : m_repairs) {
@@ -2026,10 +2088,14 @@ private:
             m_drop_had_peer = true;
             const u64 tip = m_chain.tip();
             if (tip) {
-                const u64 hi = tip + 2, lo = tip > m_o.drops_hello_bins ? tip - m_o.drops_hello_bins : 0;
+                u64 hi = tip + 2, lo = tip > m_o.drops_hello_bins ? tip - m_o.drops_hello_bins : 0;
+                // HOLD-ROUND-2 (C): nothing below the index horizon is admissible
+                // unsolicited -- never pull its inventory
+                if (m_o.index_horizon && tip > m_o.index_horizon) lo = std::max(lo, tip - m_o.index_horizon);
+                const u64 node = inv_node(p);
                 {
                     std::lock_guard<std::mutex> lk(m_dsmtx);
-                    PeerInv& inv = m_drop_inv[InvKey{p, lo, hi}];
+                    PeerInv& inv = m_drop_inv[InvKey{node, lo, hi}];
                     inv.asked = Clock::now(); inv.touched = inv.asked;
                 }
                 send_drop_invreq(p, lo, hi);
@@ -2460,7 +2526,20 @@ private:
                     }
                     return false;
                 };
-                if (!upg(m_q)) upg(m_parked);
+                if (!upg(m_q) && !upg(m_parked)) {
+                    // HOLD-ROUND-2 (B): an AHEAD-parked flood copy -> back to the
+                    // patience path as solicited (a repair answer, Ruling A)
+                    for (auto ait = m_ahead.begin(); ait != m_ahead.end(); ++ait) {
+                        if (ait->id != it.id || ait->solicited) continue;
+                        auto n = m_ahead_n.find(ait->from);
+                        if (n != m_ahead_n.end() && n->second && --n->second == 0) m_ahead_n.erase(n);
+                        Item x = std::move(*ait); m_ahead.erase(ait);
+                        x.solicited = true; x.from = it.from; x.enq = Clock::now(); x.not_before = Clock::now();
+                        m_parked.push_back(std::move(x));
+                        m_st.upgraded_solicited++;
+                        break;
+                    }
+                }
             }
             m_st.dup++;
             return;
@@ -2510,6 +2589,23 @@ private:
         std::lock_guard<std::mutex> lk(m_mtx);
         m_inflight.erase(id);
     }
+    // HOLD-ROUND-2 (B): park an AHEAD share until the share state advances.
+    void park_ahead(Item it) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto evict = [&](std::deque<Item>::iterator victim) {
+            auto n = m_ahead_n.find(victim->from);
+            if (n != m_ahead_n.end() && n->second && --n->second == 0) m_ahead_n.erase(n);
+            m_inflight.erase(victim->id);
+            m_ahead.erase(victim);
+            m_st.share_ahead_evicted++;
+        };
+        if (m_o.share_ahead_per_peer && m_ahead_n[it.from] >= m_o.share_ahead_per_peer) {
+            for (auto v = m_ahead.begin(); v != m_ahead.end(); ++v) if (v->from == it.from) { evict(v); break; }
+        }
+        while (!m_ahead.empty() && m_ahead.size() >= std::max<std::size_t>(1, m_o.share_ahead_max)) evict(m_ahead.begin());
+        ++m_ahead_n[it.from];
+        m_ahead.push_back(std::move(it));
+    }
 
     void process(Item it) {
         const auto now = Clock::now();
@@ -2520,7 +2616,7 @@ private:
         // context: prev_id -> (bin, seed)
         ::v37::xmr::verify::ParsedBlob pb;
         if (!::v37::xmr::verify::parse_hashing_blob(it.r.receipt.hashing_blob, pb)) {
-            m_st.structural++; forget_inflight(it.id); strike(it.from, "hashing blob does not parse"); return;
+            m_st.structural++; forget_inflight(it.id); note_drop_refused(it.id); strike(it.from, "hashing blob does not parse"); return;
         }
         const auto ctx = m_chain.lookup(pb.prev_id);
         if (!ctx) {
@@ -2534,6 +2630,7 @@ private:
                 park(std::move(it), std::chrono::milliseconds(1000));
             } else {
                 m_st.unresolved_dropped++;
+                note_drop_refused(it.id);   // HOLD-ROUND-2 (C2)
                 const std::string why = "receipt " + hex_short(it.id) + " from peer " + std::to_string(it.from) +
                                         (it.solicited ? " (solicited)" : "") + ": Monero context prev_id " + hex_short(pb.prev_id) +
                                         " unknown here after " + std::to_string(patience / 1000) + " s";
@@ -2551,12 +2648,12 @@ private:
         }
         const u64 tip = m_chain.tip();
         if (!it.solicited && m_o.index_horizon && ctx->height + m_o.index_horizon < tip) {
-            m_st.expired++; forget_inflight(it.id); return;
+            m_st.expired++; forget_inflight(it.id); note_drop_refused(it.id); return;
         }
         CheckCtx cc; cc.lane_chain = m_o.chain; cc.share_diff = m_o.share_diff; cc.bind = m_o.bind;
         const CheckResult cr = check_structural(it.r, cc);
         if (!cr.ok()) {
-            m_st.structural++; forget_inflight(it.id);
+            m_st.structural++; forget_inflight(it.id); note_drop_refused(it.id);
             strike(it.from, std::string("structural ") + to_string(cr.stage) + ": " + cr.why);
             return;
         }
@@ -2569,9 +2666,25 @@ private:
         // v37_xmr_relay_multinode_kat M2 pins the height.)
         if (m_verdict) {
             std::string vw;
-            const int v = m_verdict(it.r, pb, ctx->height, vw);
+            int v = m_verdict(it.r, pb, ctx->height, vw);
+            if (v >= kShareVerdictAhead) {
+                // ★ HOLD-ROUND-2 (B): lane-prefix SKEW -- the sender is a lane block
+                // ahead of (or behind) this node. Never a strike: the attempt-7 ban
+                // loop (every finder share struck on the receivers' older prefix).
+                if (it.solicited) {
+                    v = 0;   // a repair answer: the patience path, then trusted (Ruling A)
+                } else if (v == kShareVerdictAhead) {
+                    m_st.share_skew_ahead++;
+                    park_ahead(std::move(it));
+                    return;
+                } else {
+                    (v == kShareVerdictBehind ? m_st.share_skew_behind : m_st.share_late)++;
+                    forget_inflight(it.id); note_drop_refused(it.id);
+                    return;
+                }
+            }
             if (v < 0) {
-                m_st.share_refused++; forget_inflight(it.id);
+                m_st.share_refused++; forget_inflight(it.id); note_drop_refused(it.id);
                 { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
                 strike(it.from, "share coinbase not canonical: " + vw);
                 return;
@@ -2647,6 +2760,7 @@ private:
         const bool confirmed = again && ::c2pool::xmr::confirm_invalid(pow.data(), pow2.data(), true,
                                                                         !meets_share_diff(pow2, m_o.share_diff));
         m_st.rx_invalid++;
+        note_drop_refused(it.id);   // HOLD-ROUND-2 (C2): not a raindrop at all
         ::c2pool::xmr::Action a;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
@@ -2813,10 +2927,11 @@ private:
     // one key per bin, each asked and fetched on its own.
     struct SyncWork {
         std::vector<std::tuple<PeerId, u64, u64>> ask_inv;
+        std::vector<std::tuple<PeerId, u64, bytes32>> ask_page;   // HOLD-ROUND-2 (C1): (peer, bin, cursor)
         std::vector<std::tuple<PeerId, u64, u64, std::vector<bytes32>>> fetch;
     };
-    bool drops_sync_step_locked(PeerId p, u64 l, u64 h, Clock::time_point now, DropsSync& out, SyncWork& work) {
-        PeerInv& inv = m_drop_inv[InvKey{p, l, h}];
+    bool drops_sync_step_locked(PeerId p, u64 node, u64 l, u64 h, Clock::time_point now, DropsSync& out, SyncWork& work) {
+        PeerInv& inv = m_drop_inv[InvKey{node, l, h}];
         inv.touched = now;
         if (!inv.answered) {
             if (inv.asked == Clock::time_point{} || now - inv.asked >= std::chrono::milliseconds(m_o.drops_inv_retry_ms)) {
@@ -2826,14 +2941,29 @@ private:
         }
         if (inv.set_aside) { ++out.set_aside; return true; }
         if (inv.ids.size() >= kDropsInvMaxIds && h - l > 1) {   // truncated: page per bin
-            if (!m_drop_inv.count(InvKey{p, l, l + 1})) m_st.drops_inv_paged++;
+            if (!m_drop_inv.count(InvKey{node, l, l + 1})) m_st.drops_inv_paged++;
             bool ok = true;
-            for (u64 b = l; b < h; ++b) ok = drops_sync_step_locked(p, b, b + 1, now, out, work) && ok;
+            for (u64 b = l; b < h; ++b) ok = drops_sync_step_locked(p, node, b, b + 1, now, out, work) && ok;
             return ok;
+        }
+        // ★ HOLD-ROUND-2 (C1): ONE bin over kDropsInvMaxIds (VERIFY F3: a bin was
+        // never paged, so "complete" held with the rest never asked): the next
+        // page by cursor (GETDROPS [l, l+1) with the id twice = "ids > it"). An
+        // old server answers that with the receipt, never a page: after
+        // drops_inv_page_max_asks unanswered asks its unpaged page is kept.
+        bool paging = false;
+        if (h - l == 1 && inv.more && !inv.ids.empty()) {
+            if (inv.page_asks >= m_o.drops_inv_page_max_asks) { inv.more = false; m_st.drops_inv_page_gaveup++; }
+            else {
+                paging = true;
+                if (inv.page_asked == Clock::time_point{} || now - inv.page_asked >= std::chrono::milliseconds(m_o.drops_inv_retry_ms)) {
+                    inv.page_asked = now; ++inv.page_asks; work.ask_page.emplace_back(p, l, inv.ids.back());
+                }
+            }
         }
         std::vector<bytes32> miss;
         for (const auto& id : inv.ids) if (!drop_held_locked(id)) miss.push_back(id);
-        if (miss.empty()) return true;
+        if (miss.empty()) return !paging;
         out.missing += miss.size();
         if (inv.fetched == Clock::time_point{} || now - inv.fetched >= std::chrono::milliseconds(m_o.drops_fetch_retry_ms)) {
             if (inv.asks >= m_o.drops_fetch_max_asks) {
@@ -2850,16 +2980,45 @@ private:
         return false;
     }
     // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
-    bool drop_held_locked(const bytes32& id) const {
+    bool drop_held_locked(const bytes32& id) {
         if (m_drop_store_id.count(id)) return true;
-        std::lock_guard<std::mutex> lk(m_mtx);
-        return m_drop_seen.count(id) != 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_drop_seen.count(id) != 0) return true;
+        }
+        // ★ HOLD-ROUND-2 (C2): fetched here and not admissible (beyond the index
+        // horizon, structurally bad, refused by the verdict, no context, not a
+        // raindrop) -- "complete" = holds every raindrop it WOULD admit. Pre-fix
+        // such an id was never "held", so it was asked again at every inventory
+        // (B in attempt 7: the bin-2220689 page asked 3.75M times).
+        if (drop_refused_has(id)) { m_st.drops_refused_held++; return true; }
+        return false;
+    }
+    // m_drmtx is a LEAF lock (taken under m_mtx or m_dsmtx, never the reverse).
+    bool drop_refused_has(const bytes32& id) const {
+        std::lock_guard<std::mutex> lk(m_drmtx);
+        return m_drop_refused.count(id) != 0;
+    }
+    void note_drop_refused(const bytes32& id) {
+        if (!m_o.drops_floor_diff) return;
+        std::lock_guard<std::mutex> lk(m_drmtx);
+        if (!m_drop_refused.insert(id).second) return;
+        m_drop_refused_order.push_back(id);
+        m_st.drops_refused++;
+        while (m_drop_refused_order.size() > std::max<std::size_t>(1, m_o.drops_refused_max)) {
+            m_drop_refused.erase(m_drop_refused_order.front()); m_drop_refused_order.pop_front();
+        }
     }
     bool drop_wanted(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.count(id) != 0; }
     bool drop_unwant(const bytes32& id) { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.erase(id) != 0; }
     void send_drop_invreq(PeerId p, u64 lo, u64 hi) {
         const auto f = encode_getdrops(m_o.chain, lo, hi, {});
         if (!f.empty() && m_net.send_to(p, f)) m_st.drops_invreq_tx++;
+    }
+    // HOLD-ROUND-2 (C1): the next inventory page of ONE bin (ids > after)
+    void send_drop_page(PeerId p, u64 bin, const bytes32& after) {
+        const auto f = encode_getdrops_page(m_o.chain, bin, after);
+        if (!f.empty() && m_net.send_to(p, f)) m_st.drops_inv_pages_tx++;
     }
     void send_drop_fetch(PeerId p, u64 lo, u64 hi, const std::vector<bytes32>& ids) {
         for (std::size_t i = 0; i < ids.size(); i += kDropsGetMaxIds) {
@@ -2873,11 +3032,19 @@ private:
         u32 chain = 0; u64 lo = 0, hi = 0; std::vector<bytes32> ids; std::string why;
         if (!decode_getdrops(f, chain, lo, hi, ids, &why)) { m_st.malformed++; strike(p, why); return; }
         if (chain != m_o.chain) { m_st.wrong_chain++; return; }
-        if (ids.empty()) {                                   // inventory
+        const bool page = is_getdrops_page(lo, hi, ids);   // HOLD-ROUND-2 (C1): "ids > ids[0] in bin lo"
+        if (ids.empty() || page) {                           // inventory (or its next page)
             m_st.drops_invreq_rx++;
             std::vector<bytes32> inv;
             {
                 std::lock_guard<std::mutex> lk(m_dsmtx);
+                if (page) {
+                    m_st.drops_inv_pages_served++;
+                    auto bi = m_drop_store.find(lo);
+                    if (bi != m_drop_store.end())
+                        for (auto it = bi->second.upper_bound(ids[0]); it != bi->second.end() && inv.size() < kDropsInvMaxIds; ++it)
+                            inv.push_back(it->first);
+                } else
                 for (auto it = m_drop_store.lower_bound(lo); it != m_drop_store.end() && it->first < hi; ++it)
                     for (const auto& [id, raw] : it->second) { (void)raw; if (inv.size() < kDropsInvMaxIds) inv.push_back(id); }
             }
@@ -2911,17 +3078,48 @@ private:
         if (!decode_dropinv(f, chain, lo, hi, ids, &why)) { m_st.malformed++; strike(p, why); return; }
         if (chain != m_o.chain) { m_st.wrong_chain++; return; }
         m_st.drops_inv_rx++;
+        const u64 node = inv_node(p);   // HOLD-ROUND-2 (C3): outside m_dsmtx
         std::vector<bytes32> miss;
+        bool set_aside_now = false;
         {
             std::lock_guard<std::mutex> lk(m_dsmtx);
-            auto it = m_drop_inv.find(InvKey{p, lo, hi});
+            auto it = m_drop_inv.find(InvKey{node, lo, hi});
             if (it == m_drop_inv.end()) return;              // unsolicited: ignored
             PeerInv& inv = it->second;
-            inv.answered = true; inv.ids = std::move(ids);
+            // HOLD-ROUND-2 (C1): the answer to a cursor page appends (every id above
+            // the last one held); anything else is a fresh inventory
+            const bool page = inv.answered && inv.more && hi == lo + 1 && !inv.ids.empty() &&
+                              (ids.empty() || inv.ids.back() < ids.front());
+            std::size_t from = 0;
+            if (page) {
+                from = inv.ids.size();
+                inv.ids.insert(inv.ids.end(), ids.begin(), ids.end());
+                inv.more = ids.size() >= kDropsInvMaxIds; inv.page_asks = 0; inv.page_asked = Clock::time_point{};
+                m_st.drops_inv_pages_rx++;
+            } else {
+                inv.ids = std::move(ids);
+                inv.more = (hi == lo + 1 && inv.ids.size() >= kDropsInvMaxIds);
+            }
+            inv.answered = true;
             const auto now = Clock::now();
-            for (const auto& id : inv.ids) if (!drop_held_locked(id)) { miss.push_back(id); m_drop_want[id] = now; }
-            if (!miss.empty()) { ++inv.asks; inv.fetched = now; }
+            for (std::size_t i = from; i < inv.ids.size(); ++i) if (!drop_held_locked(inv.ids[i])) miss.push_back(inv.ids[i]);
+            // HOLD-ROUND-2 (C3): the fetch-at-once goes through the per-node ask
+            // budget (pre-fix it bypassed it, and each reconnect reset it)
+            if (!miss.empty()) {
+                if (inv.set_aside) miss.clear();
+                else if (inv.asks >= m_o.drops_fetch_max_asks) {
+                    inv.set_aside = true; set_aside_now = true; miss.clear();
+                    m_st.drops_peer_setaside++; m_st.drops_inv_budget_setaside++;
+                } else {
+                    ++inv.asks; inv.fetched = now;
+                    for (const auto& id : miss) m_drop_want[id] = now;
+                }
+            }
         }
+        if (set_aside_now)
+            log("relay: drops backfill: peer " + std::to_string(p) + " (node " + std::to_string(node) + ") inventory of [" +
+                std::to_string(lo) + "," + std::to_string(hi) + ") still unfetched after " + std::to_string(m_o.drops_fetch_max_asks) +
+                " asks across reconnects -> set aside");
         if (!miss.empty()) send_drop_fetch(p, lo, hi, miss);   // fetch at once (drops_sync re-asks)
     }
     // ── ★ DROPS-HARDEN (d4) + ★ DROPS-RETAIN: the persisted raindrop store ──
@@ -3206,8 +3404,12 @@ private:
         const auto now = Clock::now();
         for (auto it = m_drop_inv.begin(); it != m_drop_inv.end();)
             it = (now - it->second.touched > std::chrono::minutes(10)) ? m_drop_inv.erase(it) : std::next(it);
-        for (auto it = m_drop_want.begin(); it != m_drop_want.end();)
-            it = (now - it->second > std::chrono::minutes(10)) ? m_drop_want.erase(it) : std::next(it);
+        for (auto it = m_drop_want.begin(); it != m_drop_want.end();) {
+            if (now - it->second > std::chrono::minutes(10)) {
+                note_drop_refused(it->first);   // HOLD-ROUND-2 (C2): asked 10 min ago, never admitted
+                it = m_drop_want.erase(it);
+            } else ++it;
+        }
         for (auto it = m_pin_asked.begin(); it != m_pin_asked.end();)   // ★ DROPS-SET-PIN
             it = (now - it->second.first > std::chrono::minutes(10)) ? m_pin_asked.erase(it) : std::next(it);
     }
@@ -4159,6 +4361,8 @@ private:
     std::deque<bytes32> m_unpushed_order;
     std::deque<Item> m_q;
     std::deque<Item> m_parked;
+    std::deque<Item> m_ahead;                   // HOLD-ROUND-2 (B): AHEAD shares, re-judged on a share-state advance
+    std::map<PeerId, std::size_t> m_ahead_n;    // ... per sending peer (bounded: share_ahead_per_peer)
     double m_solicited = 0;
     Clock::time_point m_solicited_at = Clock::now();
     std::string m_last_reject;
@@ -4173,6 +4377,9 @@ private:
     std::vector<Admitted> m_admitted;
     std::vector<Admitted> m_drops;   // ★ DROPS: admitted raindrops (m_amtx)
     std::unordered_set<bytes32, Bytes32Hash> m_drop_seen;   // ★ DROPS dedup (m_mtx)
+    mutable std::mutex m_drmtx;                                       // HOLD-ROUND-2 (C2): leaf lock
+    std::unordered_set<bytes32, Bytes32Hash> m_drop_refused;         // fetched, not admissible here (bounded FIFO)
+    std::deque<bytes32> m_drop_refused_order;
     std::deque<bytes32> m_drop_order;
     // ★ RAIN-BACKFILL (m_dsmtx; gate ON only)
     mutable std::mutex m_dsmtx;

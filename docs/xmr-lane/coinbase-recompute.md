@@ -282,6 +282,46 @@ nothing checked them.
   answer is trusted on the winner's word: an honest winner never holds a
   refused receipt in its lane.
 
+### 6.1 Share verdict and lane-prefix skew (HOLD-ROUND-2)
+
+A FOUND changes the finder's ledger at once (its own lane block is pending, so
+`prev_lane_height()` moves up) but not `owed_digest`, so its next shares commit
+the same 0x03 root as before while their drain takes are cut at a smaller dh.
+A receiver that has not booked that lane block yet rebuilds the takes at its
+own, larger dh and sees an under-take. Stagenet attempt 7: B's shares at
+h=2220693 committed 9375000000 = R*4/256, A and C rebuilt 32812500000 =
+R*14/256, every share was -1, each -1 a strike: B was banned every ~3 s (86350
+bans on A), so the repair of B's block never finished.
+
+The share verdict now classifies a drain take mismatch before it strikes
+(`xmr_share_verdict.hpp`, `rc::drain_skew_dh`, integer bisection over
+`[1, H_cap]`, at most 7 evaluations at H_cap 64):
+
+| case | test | verdict | relay |
+|---|---|---|---|
+| LATE | a lane block at or above the share's height is booked here | 4 | dropped, no strike |
+| AHEAD | the take is the drain Delta at a dh' SMALLER than ours (the sender holds a lane block at h-dh' this node has not booked) | 2 | parked (512 per peer, 4096 in all, oldest evicted), re-judged at every share-state publish; no strike |
+| BEHIND | the take is the Delta at a LARGER dh' (the sender lacks a lane block we hold) | 3 | dropped, no strike |
+| anything else (no dh' gives the take exactly, or the mismatch is in payees / outputs / tail) | | -1 | refused, a strike, as before |
+
+A solicited receipt (a repair answer) with any skew verdict takes the patience
+path and is trusted past it (Ruling A), as before. The inversion is exact while
+the take is below F (Delta is then independent of F); a take capped by the
+sender's F, or a mismatch when both dh are past H_cap, still strikes (stated
+limit). Counters: `relay-shares: refused= parked= ... skew ahead= behind= late=
+ahead_now= rejudged= evicted=`. KATs: `v37_xmr_share_verdict_kat` S13 (B1-B4),
+`v37_xmr_relay_multinode_kat` M8 (200 AHEAD shares: bans 0, bounded, admitted
+after the state advances), `v37_xmr_hold_round2_kat`.
+
+The same numbers reach the block recompute: `rc::Result` carries `took`,
+`took_canon`, `R`, `prev_lane` and `skew_dh` on a take Mismatch, and the
+`cba-ALARM recompute_mismatch` line prints `prev_lane=` and `take_skew:`. The
+verdict of a block stays a DECIDED Mismatch: once every lower lane block is
+decided alike (`finality-boundary.md` section 4a), every node computes the same
+prev_lane, so the Mismatch is uniform. Turning a skew Mismatch into a hold was
+considered and rejected: a block built on a lower block that was refused
+everywhere would then hold forever (`v37_xmr_coinbase_recompute_kat` R20).
+
 ## 6a. Proving a balance to a light client (paper §13)
 
 The daemon runs `OwedLedgerRules::merkle_rows` together with the anchor rule.

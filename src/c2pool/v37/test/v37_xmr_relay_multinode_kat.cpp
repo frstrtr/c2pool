@@ -39,6 +39,10 @@
 //       ours), and the suffix [a0,P) -- and, since this spine is one X never
 //       held, the suffix fails the spine check at P: X is set aside, the repair
 //       is Exhausted and never Ready, and no further GETORDER follows.
+//   M8  HOLD-ROUND-2 (B5): 200 shares the verdict classifies AHEAD (lane-prefix
+//       skew): bans=0, refused=0, the peer stays; parked bounded per peer (64
+//       kept, the oldest dropped without a strike); re-judged CANONICAL and
+//       admitted once the share state advances. (red on the base: -1 -> bans)
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -353,6 +357,65 @@ int main() {
           "M7 X was asked exactly three times -- [0,P) refused, probe [a0,a0), suffix [a0,P) (" + std::to_string(orders) +
           ", then " + std::to_string(orders_after) + " after more polls): the empty refused order is not taken for progress");
         X.relay->set_dialing(false); Y.relay->set_dialing(false);
+    }
+
+    // ── M8 (HOLD-ROUND-2 B5): a lane-prefix-SKEW verdict is never a strike ──
+    // Stagenet attempt 7: every finder share the receivers judged on their older
+    // lane prefix was -1 -> a strike -> the finder banned every ~3 s (86350 bans
+    // on A). The share verdict now classifies those AHEAD (v37_xmr_share_verdict_kat
+    // S13 B1); the relay parks them (bounded per peer), never strikes, and
+    // re-judges them when the node's share state advances.
+    {
+        RelayOptions qo = opts(true, {});
+#if defined(C2POOL_XMR_SHARE_VERDICT_SKEW)
+        qo.share_ahead_per_peer = 64;
+#endif
+        TNode Q("Q", qo, XmrReceiptIngest::Order::Canonical);
+        C(Q.relay->start(why), "M8 Q starts " + why);
+        TNode P("P", opts(false, {Q.relay->listen_port()}), XmrReceiptIngest::Order::Canonical);
+        C(P.relay->start(why), "M8 P (the finder) starts, dials Q " + why);
+        std::vector<TNode*> pq{&P, &Q};
+        C(wait_for([&] { return P.relay->ready_peers().size() == 1 && Q.relay->ready_peers().size() == 1; }, pq), "M8 P-Q up");
+        std::atomic<bool> advanced{false};
+        std::atomic<u64> judged{0};
+        Q.relay->set_share_verdict([&](const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64, std::string& w) {
+            ++judged;
+            if (advanced.load()) return 1;
+            w = "ahead: the take is the drain Delta at dh 4 (a lane block not booked here)";
+#if defined(C2POOL_XMR_SHARE_VERDICT_SKEW)
+            return kShareVerdictAhead;
+#else
+            return -1;   // the base verdict for that share (S13 B1: under-take)
+#endif
+        });
+        const bytes32 prevM = b32_of(0x77);
+        for (auto* n : pq) { n->note_bin(prevM, 105); n->template_height = 105; }
+        const SynthBlock blkM = make_block(105, prevM, 6, nullptr, 3, 15);
+        for (std::uint32_t k = 0; k < 200; ++k) P.relay->submit_own(own(blkM, 1000 + k, pA));
+        const auto& qs = Q.relay->stats();
+        C(wait_for([&] { return judged.load() >= 200 || qs.bans.load() >= 1; }, pq, 15000ms), "M8 Q judged P's 200 shares");
+        std::this_thread::sleep_for(300ms);
+#if defined(C2POOL_XMR_SHARE_VERDICT_SKEW)
+        const u64 ahead = qs.share_skew_ahead.load(), evicted = qs.share_ahead_evicted.load();
+        const std::size_t now_ahead = Q.relay->share_ahead_size();
+#else
+        const u64 ahead = 0, evicted = 0; const std::size_t now_ahead = 0;
+#endif
+        C(qs.bans.load() == 0 && qs.share_refused.load() == 0 && Q.relay->ready_peers().size() == 1,
+          "M8 200 AHEAD shares: bans=0, refused=0, P stays connected (base: -1 -> strikes -> bans=" + std::to_string(qs.bans.load()) +
+          " refused=" + std::to_string(qs.share_refused.load()) + ")");
+        C(ahead == 200 && now_ahead == 64 && evicted == 136 && Q.relay->cache_size() == 0,
+          "M8 parked AHEAD, bounded per peer: ahead=" + std::to_string(ahead) + " held=" + std::to_string(now_ahead) +
+          " evicted=" + std::to_string(evicted) + " (64 kept, the oldest 136 dropped without a strike), none admitted yet");
+        advanced = true;   // the node booked the finder's lane block: share_publish -> notify
+#if defined(C2POOL_XMR_SHARE_VERDICT_SKEW)
+        Q.relay->notify_share_state_advanced();
+#endif
+        const bool admitted64 = wait_for([&] { return Q.relay->cache_size() == 64; }, pq, 20000ms);
+        C(admitted64 && qs.bans.load() == 0,
+          "M8 the state advances: the 64 parked shares are re-judged CANONICAL and admitted (cache=" +
+          std::to_string(Q.relay->cache_size()) + "), still bans=" + std::to_string(qs.bans.load()));
+        P.relay->set_dialing(false);
     }
 
     for (auto* n : all) n->dump_logs();

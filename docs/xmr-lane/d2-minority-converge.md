@@ -95,6 +95,12 @@ rig will "converge" the minority away from an honest block the majority
 should have credited, and the "majority unaffected" KAT would assert the
 wrong ledger.
 
+> Since RC-HOLD and HOLD-ROUND-2 (`finality-boundary.md` section 4a) a stalled
+> repair is HELD on the majority, never refused on a retry count: the
+> "stalls past `retry_bound` -> REFUSED" path below no longer exists. D2 still
+> owns the DECIDED divergences (a cut the majority reproduces as a different
+> digest, `lane-root-refused`, the finality boundary).
+
 **D2 proper is still required.** With D2-0 fixed, the general class remains:
 a block whose credit cut the majority genuinely cannot reproduce (the
 minority's relay was cut, its miners minted receipts during isolation, the
