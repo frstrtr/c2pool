@@ -145,7 +145,8 @@ static std::string job_object(const JobNotify& j) {
 }
 
 std::string StratumDialect::build_login_ok(std::uint32_t req_id, std::uint32_t rpc_id,
-                                           const JobNotify& job) {
+                                           const JobNotify& job,
+                                           std::string_view extra_result) {
     std::string s;
     s += "{\"id\":";
     s += std::to_string(req_id);
@@ -153,7 +154,9 @@ std::string StratumDialect::build_login_ok(std::uint32_t req_id, std::uint32_t r
     s += u32_hex(rpc_id);
     s += "\",\"job\":{";
     s += job_object(job);
-    s += "},\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n";
+    s += "}";
+    if (!extra_result.empty()) { s += ","; s += extra_result; }   // FEE DISCLOSURE
+    s += ",\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n";
     return s;
 }
 
@@ -340,7 +343,7 @@ bool XmrStratumServer::handle_login(XmrStratumSession& s, std::uint32_t req_id,
 
     const std::uint32_t rpc_id = skeleton_random32();
     if (!m_transport.send_line(s.client_id(),
-                               StratumDialect::build_login_ok(req_id, rpc_id, job))) {
+                               StratumDialect::build_login_ok(req_id, rpc_id, job, m_login_extra))) {
         return false;
     }
     s.set_rpc_id(rpc_id);

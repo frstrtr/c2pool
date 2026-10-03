@@ -316,6 +316,16 @@ struct FinalizeConnectOptions {
         std::uint32_t extra_nonce = 0;          // its first 4 bytes, LE (builder_key = >> 20)
         bool          has_matched_since = false;// the 0x03 root matched a ring state ...
         std::uint64_t matched_since = 0;        // ... that became current at this coin height
+        // ANCHOR: the block's own on-chain credit cut, set on a CANONICAL booking
+        // only (it becomes the ledger's anchor when the block finalizes).
+        std::optional<::c2pool::v37n::settle::AnchorCut> cut;
+        // DROPS: the block's composed delta (deposit) and, under the DROPS-due
+        // rule, the claim of a canonical booking. Handed to the node with the
+        // booking; the converge refold books it too (gap 2).
+        std::optional<::c2pool::v37n::settle::DropsFound> drops;
+        // THE DRAIN RULE (OwedLedgerRules::decay_from_gross): the block's gross
+        // credited set G_b (a canonical booking; empty for a debit-only one).
+        std::set<::v37::bytes32> gross;
     };
     std::function<bool(std::uint64_t, const std::string&, ChainBooking&)> book_from_chain_ex;
 
@@ -435,6 +445,9 @@ struct FinalizeConnectOptions {
         const std::vector<::v37::bytes32>* cands = nullptr;
         const std::vector<std::uint64_t>*  superseded = nullptr;
         bool root_only = false;
+        // The scratch ledger at this block's booking point (the coinbase
+        // recompute's state; xmr_coinbase_recompute.hpp).
+        const ::c2pool::v37n::settle::OwedLedger* ledger = nullptr;
     };
     std::function<bool(std::uint64_t, const std::string&, const ScratchQuery&, ChainBooking&)> book_scratch;
 };
@@ -454,12 +467,18 @@ public:
         // booking and for a debit-only one).
         //   'a' option-A own win  (credit == payout == {payee: reward})
         //   'c' coinbase-authority CREDITED booking (credit, payout as booked)
+        //   'e' EMPTY booking of a lane-root-refused block under the drain
+        //       rule (operator ruling O-2): credit {}, payout {}, its height
+        //       only (dh counts it); its payout is node-local LIABILITY
         //   'd' DEBIT-ONLY booking of a refused block (credit = {}, payout) --
         //       rework-2 LEGACY: rework-3 never writes one (refuse-side money is
         //       node-local); a v2 sidecar that still carries one is re-driven as
         //       it was booked (the ledger already holds it from the replay)
         char          kind = 'a';
         Amounts       credit, payout;
+        std::optional<::c2pool::v37n::settle::AnchorCut> cut;   // ANCHOR (sidecar v2 trailing "cut=P:spine")
+        std::optional<::c2pool::v37n::settle::DropsFound> drops;   // DROPS DUE (sidecar v3 trailing "dd=" / "dc=")
+        std::set<::v37::bytes32> gross;                             // THE DRAIN RULE: G_b (sidecar v3 trailing "dg=")
     };
     // R-C rework-3 (ruled (b)): the NODE-LOCAL LIABILITY record of one refused
     // lane block. `payout` = the per-payee part decoded from the on-chain bytes
@@ -570,6 +589,8 @@ public:
         // R-C: `refused_not_credited` = SYNCED-but-unmatched lane blocks refused-
         // not-credited (loud alarm, gate released, NEVER a halt by itself).
         std::uint64_t refused_not_credited = 0;
+        // O-2 (drain rule): refused lane blocks FOUND as an empty booking.
+        std::uint64_t refused_found_empty = 0;
         // R-C rework-3 (ruled (b)): the NODE-LOCAL LIABILITY of refused lane
         // blocks. `liability_blocks` refused blocks recorded; `_attributed_pico`
         // the per-payee part (on-chain bytes only), `_unattributed_pico` the rest
@@ -741,7 +762,9 @@ private:
             Amounts credit, payout;
             if (rec.kind == 'a') { credit = amounts_from(rec.payee, rec.reward, nullptr); payout = credit; }
             else                 { credit = rec.credit; payout = rec.payout; }
-            const bool ok = m_node.on_network_block_won(rec.height, id, credit, payout);
+            const bool ok = rec.kind == 'e' ? m_node.on_lane_block_refused(rec.height, id)   // O-2: the empty FOUND
+                                            : m_node.on_network_block_won(rec.height, id, credit, payout, rec.cut,
+                                                                          rec.drops ? &*rec.drops : nullptr, &rec.gross);
             if (!ok || !m_node.ledger().is_pending(bid)) {
                 ++rep.stale_dropped;
                 say("boot: sidecar " + short_bid(bid) + " not admitted by the node/ledger; dropped");
@@ -754,7 +777,7 @@ private:
                 say("boot: LEGACY rework-2 debit-only record " + short_bid(bid) + " re-driven as booked (the ledger already "
                     "holds it from the replay); rework-3 never writes one -- refuse-side money is node-local liability");
             }
-            if (rec.kind != 'd') m_race.observe_own(rec.height, bid, rec.found_unix_s);   // a debit is not an own/credited block
+            if (rec.kind != 'd' && rec.kind != 'e') m_race.observe_own(rec.height, bid, rec.found_unix_s);   // a debit / an empty FOUND is not an own/credited block
             if (pending) ++rep.reseeded; else ++rep.reregistered;
             say(std::string("boot: ") + (pending ? "re-drove pending FOUND " : "RE-REGISTERED lost FOUND ") +
                 short_bid(bid) + " h=" + std::to_string(rec.height) + " kind=" + std::string(1, rec.kind) +
@@ -982,7 +1005,7 @@ public:
             // credited (loud alarm, the R4 gate RELEASED for this height), its
             // on-chain payout recorded as NODE-LOCAL LIABILITY (rework-3 (b)), and
             // one OBSERVATION for the lineage vote -- never by itself a halt.
-            if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, bk); return; }
+            if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, bk); found_refused_empty(h, bid); return; }
             const bool root_unknown = (why.rfind("lane-root-unknown:", 0) == 0);   // R5
             // D6a: "native-hold:" = the native chain index does not hold the block body
             // (p2p-first booking reads it there, not from monerod) -- a transient fetch
@@ -1066,10 +1089,12 @@ public:
                 "(R4 gate released by a stall timeout, or a boot cursor mismatch); booking it anyway, operator's eyes needed");
         }
         c2pool::xmr::node::Hash id{}; (void)hash_from_hex(bid, id);
-        PendingRec rec; rec.height = h; rec.kind = 'c'; rec.credit = bk.credit; rec.payout = bk.payout;
+        PendingRec rec; rec.height = h; rec.kind = 'c'; rec.credit = bk.credit; rec.payout = bk.payout; rec.cut = bk.cut; rec.drops = bk.drops;
+        rec.gross = bk.gross;   // THE DRAIN RULE
         rec.reward = 0; for (const auto& [k, v] : bk.payout) { (void)k; rec.reward += static_cast<std::uint64_t>(v); }
         m_pending[bid] = rec; (void)sidecar_flush();
-        if (!m_node.on_network_block_won(h, id, bk.credit, bk.payout) || !m_node.ledger().is_pending(bid)) {
+        if (!m_node.on_network_block_won(h, id, bk.credit, bk.payout, bk.cut, bk.drops ? &*bk.drops : nullptr, &bk.gross) ||
+            !m_node.ledger().is_pending(bid)) {
             m_pending.erase(bid); (void)sidecar_flush();
             say("cba: node/ledger did not admit chain lane block " + short_bid(bid)); return;
         }
@@ -1538,6 +1563,27 @@ private:
         return reached;
     }
 
+    // ── THE DRAIN RULE, operator ruling O-2: the refused lane block is FOUND as
+    // an EMPTY booking carrying its Monero height (credit {}, payout {}), so the
+    // next lane block's dh counts it on every node alike. Its payout stays the
+    // node-local LIABILITY recorded above. A no-op with the rule off (master).
+    void found_refused_empty(std::uint64_t h, const std::string& bid) {
+        if (!m_node.ledger().rules().lane_height) return;
+        if (m_pending.count(bid) || m_node.ledger().is_pending(bid) || m_node.ledger().is_settled(bid)) return;
+        c2pool::xmr::node::Hash id{};
+        if (!hash_from_hex(bid, id)) return;
+        PendingRec rec; rec.height = h; rec.kind = 'e'; rec.found_unix_s = now_unix();
+        m_pending[bid] = rec; (void)sidecar_flush();
+        if (!m_node.on_lane_block_refused(h, id) || !m_node.ledger().is_pending(bid)) {
+            m_pending.erase(bid); (void)sidecar_flush();
+            say("cba: node/ledger did not admit the empty FOUND of refused lane block " + short_bid(bid));
+            return;
+        }
+        ++m_stats.refused_found_empty;
+        say("cba: refused lane block " + short_bid(bid) + " h=" + std::to_string(h) + " FOUND as an EMPTY booking (drain rule "
+            "O-2: its height counts for dh; no money in the ledger) -> finalizes when hw >= " + std::to_string(h + m_cfg.d_conf));
+    }
+
     // ── R-C (rework-2): a SYNCED receiver's unmatched-root lane block ────────
     // main tagged it "lane-root-refused:<roothex>:". REFUSE-not-credit it -- do
     // NOT book its credit, do NOT hold the finalize gate for it (the cursor is
@@ -1949,13 +1995,17 @@ private:
     }
 
     minority::DecodeResult scratch_decode(std::uint64_t h, const std::string& bid, const std::vector<::v37::bytes32>& cands,
-                                          const std::vector<std::uint64_t>& sup, bool root_only) {
+                                          const std::vector<std::uint64_t>& sup, bool root_only,
+                                          const ::c2pool::v37n::settle::OwedLedger& ledger) {
         minority::DecodeResult r;
         FinalizeConnectOptions::ChainBooking bk;
-        FinalizeConnectOptions::ScratchQuery q; q.cands = &cands; q.superseded = &sup; q.root_only = root_only;
+        FinalizeConnectOptions::ScratchQuery q; q.cands = &cands; q.superseded = &sup; q.root_only = root_only; q.ledger = &ledger;
         const bool ok = m_o.book_scratch(h, bid, q, bk);
         r.credit = bk.credit; r.payout = bk.payout; r.why = bk.why; r.payout_decoded = bk.payout_decoded;
         r.unattributed_pico = bk.unattributed_pico; r.total_pico = bk.total_pico; r.root_hex = lower_hex(bk.onchain_root_hex);
+        r.cut = bk.cut;   // ANCHOR
+        r.drops = bk.drops;   // DROPS (gap 2): the refold books the delta the live booking hands the node
+        r.gross = bk.gross;   // THE DRAIN RULE: G_b
         if (ok) r.outcome = minority::DecodeOutcome::Booked;
         else if (bk.why.rfind("not-lane:", 0) == 0) r.outcome = minority::DecodeOutcome::NotLane;
         else if (bk.why.rfind("cut-pending:", 0) == 0 || bk.why.rfind("get_block", 0) == 0 ||
@@ -1998,6 +2048,7 @@ private:
         if (!m_o.book_scratch) { ++m_stats.converge_failed; enter_diverged("no re-derivation decoder is installed (book_scratch)"); return; }
         minority::RefoldInput in;
         in.chain = m_cfg.lane_chain; in.d_conf = D; in.fork_h = F; in.cursor = c;
+        in.rules = m_node.ledger().rules();
         try {
             m_node.store().for_each_prefix(store_codec::k_evt_prefix(m_cfg.lane_chain), [&](const std::string&, const std::string& v) {
                 in.events.push_back(SettleEvent::deserialize(v)); return true; });
@@ -2037,8 +2088,9 @@ private:
             for (auto& sub : subs) tries.emplace_back("Rs (own subset)", std::move(sub));
         }
         auto decode = [this](std::uint64_t h, const std::string& bid, const std::vector<::v37::bytes32>& cands,
-                             const std::vector<std::uint64_t>& sup, bool root_only) {
-            return scratch_decode(h, bid, cands, sup, root_only);
+                             const std::vector<std::uint64_t>& sup, bool root_only,
+                             const ::c2pool::v37n::settle::OwedLedger& ledger) {
+            return scratch_decode(h, bid, cands, sup, root_only, ledger);
         };
         std::string tried;
         std::size_t idx = 0;
@@ -2102,7 +2154,8 @@ private:
         const std::string utc = utc_stamp();
         std::map<std::string, PendingRec> newp;
         for (const auto& p : res.pending) {
-            PendingRec r; r.height = p.h; r.kind = 'c'; r.credit = p.credit; r.payout = p.payout; r.found_unix_s = now_unix();
+            PendingRec r; r.height = p.h; r.kind = p.empty ? 'e' : 'c'; r.credit = p.credit; r.payout = p.payout; r.cut = p.cut; r.drops = p.drops; r.found_unix_s = now_unix();
+            r.gross = p.gross;   // THE DRAIN RULE
             for (const auto& [k, v] : p.payout) { (void)k; if (v > 0) r.reward += static_cast<std::uint64_t>(v); }
             newp[p.bid] = r;
         }
@@ -2349,7 +2402,7 @@ private:
                 ++t.settled; ++m_stats.settled;
                 // R-C rework-2: a DEBIT-ONLY record is not a credit -- the race
                 // gate's credit authorisation (R-7) does not apply to it.
-                if (rec.kind != 'd') race_confirm_credit(bid, rec.height);
+                if (rec.kind != 'd' && rec.kind != 'e') race_confirm_credit(bid, rec.height);   // O-2: an empty FOUND credits nothing
                 say("FINALIZED " + short_bid(bid) + " h=" + std::to_string(rec.height) +
                     " SETTLED at bin_height=" + std::to_string(rec.height + m_cfg.d_conf) +
                     (rec.payee ? " effective_owed(payee)=" +
@@ -2517,7 +2570,7 @@ private:
     //    (bids/keys are hex; '-' = absent):
     //    v1 (read only):  1 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
     //    v2 (R-C rework-2, written): the v1 fields, then
-    //                     <kind a|c|d> <credit-map|-> <payout-map|->
+    //                     <kind a|c|d|e> <credit-map|-> <payout-map|->
     //    map = key64=amount[,key64=amount...] (signed decimal amounts)
     static std::string map_str(const Amounts& m) {
         if (m.empty()) return "-";
@@ -2541,21 +2594,113 @@ private:
         }
         return true;
     }
+    // DROPS WINDOW (sidecar v3 "dw="): c.n:key64=work[,...] (signed decimal work;
+    // A4c: n = the bin span)
+    static std::string window_str(const ::c2pool::v37n::settle::DropsWindow& w) {
+        std::string s;
+        for (const auto& [ck, v] : w) {
+            if (!s.empty()) s += ",";
+            s += std::to_string(ck.c) + "." + std::to_string(ck.n) + ":" + hex_of(ck.payee) + "=" + std::to_string(v);
+        }
+        return s.empty() ? std::string("-") : s;
+    }
+    static bool window_parse(const std::string& s, ::c2pool::v37n::settle::DropsWindow& out) {
+        out.clear();
+        if (s == "-") return true;
+        std::size_t p = 0;
+        while (p < s.size()) {
+            std::size_t c = s.find(',', p); if (c == std::string::npos) c = s.size();
+            const std::string item = s.substr(p, c - p);
+            const std::size_t colon = item.find(':');
+            if (colon == std::string::npos || item.size() < colon + 1 + 64 + 2 || item[colon + 1 + 64] != '=') return false;
+            ::v37::bytes32 k{};
+            if (!hash_from_hex(lower_hex(item.substr(colon + 1, 64)), k)) return false;
+            const std::size_t dot = item.find('.');
+            if (dot == std::string::npos || dot == 0 || dot + 1 >= colon) return false;
+            try {
+                out[::c2pool::v37n::settle::DropsWindowKey(static_cast<std::uint64_t>(std::stoull(item.substr(0, dot))),
+                                                           static_cast<std::uint64_t>(std::stoull(item.substr(dot + 1, colon - dot - 1))), k)] =
+                    std::stoll(item.substr(colon + 1 + 64 + 1));
+            } catch (...) { return false; }
+            p = c + 1;
+        }
+        return true;
+    }
     static std::string sidecar_line(const std::string& bid, const PendingRec& r) {
         std::string s = "2 " + bid + " " + std::to_string(r.height) + " " +
                         (r.payee ? hex_of(*r.payee) : std::string("-")) + " " +
                         std::to_string(r.reward) + " " +
                         (r.prev_id_hex.size() == 64 ? r.prev_id_hex : std::string("-")) + " " +
                         std::to_string(r.found_unix_s) + " " + std::string(1, r.kind) + " " +
-                        map_str(r.credit) + " " + map_str(r.payout) + "\n";
+                        map_str(r.credit) + " " + map_str(r.payout) +
+                        (r.cut ? " cut=" + std::to_string(r.cut->next_pos) + ":" + hex_of(r.cut->spine) : std::string());
+        if (r.drops && !r.drops->empty()) {   // DROPS DUE (v3): the deposit and the claim
+            s[0] = '3';
+            s += " dd=" + map_str(r.drops->deposit);
+            if (r.drops->claim) s += " dc=" + map_str(r.drops->claimed);
+            if (!r.drops->enrol_add.empty()) s += " de=" + enrol_str(r.drops->enrol_add);   // RAINDROP ENROL
+            if (!r.drops->window.empty()) s += " dw=" + window_str(r.drops->window);         // DROPS WINDOW (A4b)
+        }
+        if (!r.gross.empty()) {   // THE DRAIN RULE (v3 "dg="): the gross credited set
+            s[0] = '3';
+            s += " dg=";
+            bool first = true;
+            for (const auto& k : r.gross) { if (!first) s += ","; first = false; s += hex_of(k); }
+        }
+        s += "\n";
         return s;
+    }
+    // RAINDROP ENROL (sidecar v3 "de="): key64:eff:kind:payloadhex[,...]
+    static std::string enrol_str(const ::c2pool::v37n::settle::DropsEnrolRegistry& m) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        for (const auto& [k, r] : m) {
+            if (!s.empty()) s += ",";
+            s += hex_of(k) + ":" + std::to_string(r.eff) + ":" + std::to_string(static_cast<unsigned>(r.ref.kind)) + ":";
+            for (std::uint8_t b : r.ref.payload) { s.push_back(d[b >> 4]); s.push_back(d[b & 15]); }
+        }
+        return s;
+    }
+    static bool enrol_parse(const std::string& s, ::c2pool::v37n::settle::DropsEnrolRegistry& out) {
+        out.clear();
+        auto nib = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        std::size_t p = 0;
+        while (p < s.size()) {
+            std::size_t c = s.find(',', p); if (c == std::string::npos) c = s.size();
+            const std::string item = s.substr(p, c - p);
+            const std::size_t a = item.find(':'), b = item.find(':', a + 1), e = item.find(':', b + 1);
+            if (a != 64 || b == std::string::npos || e == std::string::npos) return false;
+            ::v37::bytes32 k{};
+            if (!hash_from_hex(lower_hex(item.substr(0, 64)), k)) return false;
+            ::c2pool::v37n::settle::DropsEnrolRec rec;
+            unsigned kind = 0;
+            try { rec.eff = std::stoull(item.substr(a + 1, b - a - 1)); kind = static_cast<unsigned>(std::stoul(item.substr(b + 1, e - b - 1))); }
+            catch (...) { return false; }
+            if (kind > 255) return false;
+            rec.ref.kind = static_cast<::v37::ScriptKind>(kind);
+            const std::string ph = item.substr(e + 1);
+            if (ph.size() % 2) return false;
+            for (std::size_t i = 0; i < ph.size(); i += 2) {
+                const int hi = nib(ph[i]), lo = nib(ph[i + 1]);
+                if (hi < 0 || lo < 0) return false;
+                rec.ref.payload.push_back(static_cast<std::uint8_t>(hi * 16 + lo));
+            }
+            out[k] = std::move(rec);
+            p = c + 1;
+        }
+        return true;
     }
     static bool parse_sidecar_line(const std::string& line, std::string& bid, PendingRec& r) {
         std::istringstream is(line);
         std::string ver, payee, prev;
         unsigned long long h = 0, reward = 0, ts = 0;
         if (!(is >> ver >> bid >> h >> payee >> reward >> prev >> ts)) return false;
-        if (ver != "1" && ver != "2") return false;
+        if (ver != "1" && ver != "2" && ver != "3") return false;
         std::array<std::uint8_t, 32> tmp{};
         bid = lower_hex(bid);
         if (!hash_from_hex(bid, tmp)) return false;
@@ -2575,12 +2720,52 @@ private:
             r.prev_id_hex = prev;
         }
         r.kind = 'a';
-        if (ver == "2") {
+        if (ver == "2" || ver == "3") {
             std::string kind, cm, pm;
             if (!(is >> kind >> cm >> pm)) return false;
-            if (kind.size() != 1 || (kind[0] != 'a' && kind[0] != 'c' && kind[0] != 'd')) return false;
+            if (kind.size() != 1 || (kind[0] != 'a' && kind[0] != 'c' && kind[0] != 'd' && kind[0] != 'e')) return false;
             r.kind = kind[0];
             if (!map_parse(cm, r.credit) || !map_parse(pm, r.payout)) return false;
+            std::string ct;   // ANCHOR: optional trailing "cut=P:spine"; v3: then "dd=map" [" dc=map"]
+            while (is >> ct) {
+                if (ver == "3" && ct.rfind("dg=", 0) == 0) {   // THE DRAIN RULE: G_b
+                    const std::string g = ct.substr(3);
+                    std::size_t p = 0;
+                    while (p < g.size()) {
+                        std::size_t c = g.find(',', p); if (c == std::string::npos) c = g.size();
+                        ::v37::bytes32 k{};
+                        if (c - p != 64 || !hash_from_hex(lower_hex(g.substr(p, 64)), k)) return false;
+                        r.gross.insert(k);
+                        p = c + 1;
+                    }
+                    continue;
+                }
+                if (ver == "3" && ct.rfind("dw=", 0) == 0) {   // DROPS WINDOW (A4b)
+                    if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
+                    if (!window_parse(ct.substr(3), r.drops->window)) return false;
+                    continue;
+                }
+                if (ver == "3" && ct.rfind("de=", 0) == 0) {   // RAINDROP ENROL
+                    if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
+                    if (!enrol_parse(ct.substr(3), r.drops->enrol_add)) return false;
+                    continue;
+                }
+                if (ver == "3" && (ct.rfind("dd=", 0) == 0 || ct.rfind("dc=", 0) == 0)) {
+                    if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
+                    Amounts m;
+                    if (!map_parse(ct.substr(3), m)) return false;
+                    if (ct[1] == 'd') r.drops->deposit = std::move(m);
+                    else { r.drops->claim = true; r.drops->claimed = std::move(m); }
+                    continue;
+                }
+                if (ct.rfind("cut=", 0) != 0 || r.cut) return false;
+                const std::size_t c = ct.find(':');
+                if (c == std::string::npos || ct.size() != c + 1 + 64) return false;
+                ::c2pool::v37n::settle::AnchorCut a;
+                try { a.next_pos = std::stoull(ct.substr(4, c - 4)); } catch (...) { return false; }
+                if (!hash_from_hex(lower_hex(ct.substr(c + 1)), a.spine)) return false;
+                r.cut = a;
+            }
         }
         return true;
     }

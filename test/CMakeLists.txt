@@ -449,11 +449,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     # scripts/dash_v36_isolated_e2e.sh (skipped unless its env is set). Same
     # harness (dash_v36_live_fixture.hpp + dash_v36_mint_fixture.hpp) and link
     # set; folded in for the same reason.
+    # test_dash_v36_template_txs.cpp + test_dash_v36_finder_block.cpp: the DASH
+    # v36 network commits the template's transactions (the coinbase
+    # merkle_link a peer verifies the PoW from, no tx body on the wire) and the
+    # finder assembles the full won block from its frozen job. Same harness and
+    # link set; folded in for the same reason.
+    # test_dash_share_precheck.cpp (#1828): the per-message caps on incoming
+    # 'shares' / 'sharereply' and the no-hashing field checks, driven through
+    # the REAL Legacy / Actual handle_message of a dash::Node with a counting
+    # X11 (dropped before X11 is measured). Same harness and link set; folded
+    # in for the same reason.
     # #1835 outbound-redial KAT (test_dash_outbound_redial.cpp) drives the REAL
     # NodeImpl dial path against a refused loopback port; folded into this
     # EXISTING allowlisted target (it needs the `dash` OBJECT lib linked below)
     # so it is built and run by CI rather than reported "Not Run".
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_outbound_redial.cpp)
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

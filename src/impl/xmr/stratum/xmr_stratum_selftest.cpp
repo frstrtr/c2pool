@@ -209,6 +209,13 @@ static void test_response_goldens() {
     CHECK(contains(login_ok, "\"seed_hash\":\"aaaaaaaa"), "login_ok seed_hash");
     CHECK(contains(login_ok, "\"next_seed_hash\":\"bbbbbbbb"), "login_ok next_seed_hash");
     CHECK(contains(login_ok, "\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n"), "login_ok tail");
+    // FEE DISCLOSURE: an extra member list is spliced after `job`, before
+    // `extensions`; without one the reply is byte-identical to the dialect's.
+    std::string login_fee = StratumDialect::build_login_ok(42, 0xcafebabe, j,
+        "\"c2pool\":{\"fee_model\":1,\"give_author_pct\":0.1000,\"node_owner_fee_pct\":0.0000}");
+    CHECK(contains(login_fee, "},\"c2pool\":{\"fee_model\":1,\"give_author_pct\":0.1000,\"node_owner_fee_pct\":0.0000},"
+                              "\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n"), "login_ok fee disclosure spliced");
+    CHECK(login_ok == StratumDialect::build_login_ok(42, 0xcafebabe, j, ""), "login_ok without disclosure unchanged");
 
     std::string notify = StratumDialect::build_job_notify(j);
     CHECK(contains(notify, "\"method\":\"job\""), "notify method job");

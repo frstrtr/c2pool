@@ -111,6 +111,10 @@ void Legacy::HANDLER(getaddrs)
 
 void Legacy::HANDLER(shares)
 {
+    // #1828: per-message caps before any share is parsed or hashed.
+    if (!precheck_raw_shares(msg->m_shares, precheck::Kind::shares, peer->addr()))
+        return;
+
     try {
         dash::HandleSharesData result; //share, txs
 
@@ -195,13 +199,19 @@ void Legacy::HANDLER(sharereq)
         {
             rshares.emplace_back(share.version(), pack(share));
         }
+        // #1828: a reply over the oracle payload cap would be dropped by the
+        // receiver (p2pool-dash util/p2protocol.py:38, and our own receive
+        // cap); answer too_long instead, as p2pool-dash does
+        // (p2pool/p2p.py:399-404 handle_sharereq on p2protocol.TooLong).
+        if (!precheck::sharereply_fits(rshares))
+            throw std::invalid_argument("sharereply payload exceeds 3145728 bytes");
         auto reply_msg = message_sharereply::make_raw(msg->m_id, dash::ShareReplyResult::good, rshares);
         peer->write(std::move(reply_msg));
     }
     catch (const std::invalid_argument &e)
     {
-        // Serialization overflow: the packed shares exceeded the P2P message
-        // size limit (32 MB). Reply with too_long so the peer requests a
+        // The packed shares exceed the oracle payload cap (3145728 bytes,
+        // sharereply_fits above). Reply with too_long so the peer requests a
         // smaller batch. This is the correct behavior per Python p2pool.
         LOG_WARNING << "Share reply too large, sending too_long: " << e.what();
         auto reply_msg = message_sharereply::make_raw(msg->m_id, dash::ShareReplyResult::too_long, {});
@@ -218,6 +228,15 @@ void Legacy::HANDLER(sharereq)
 void Legacy::HANDLER(sharereply)
 {
     dash::ShareReplyData result;
+    // #1828: a reply over the per-message caps resolves the pending request
+    // EMPTY right away (the same outcome as a non-good result), before any
+    // share is parsed or hashed.
+    if (msg->m_result == ShareReplyResult::good
+        && !precheck_raw_shares(msg->m_shares, precheck::Kind::sharereply, peer->addr()))
+    {
+        got_share_reply(msg->m_id, result);
+        return;
+    }
     if (msg->m_result == ShareReplyResult::good)
     {
         result.m_items.reserve(msg->m_shares.size());
