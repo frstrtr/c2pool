@@ -136,6 +136,19 @@ inline constexpr int kShareVerdictLate   = 4;
 inline constexpr int kShareVerdictUnbased = 5;
 inline constexpr unsigned kShareUnbasedMaxRounds = 4;
 #define C2POOL_XMR_SHARE_VERDICT_UNBASED 1
+// ★ RULES RATCHET R1, RECEIPT ADMISSION (F1-F3): FOREIGN -- decided under the
+// committed receipt test (xmr_share_verdict.hpp): this node's finalize cursor
+// has passed the builder cut of the receipt's bin, and the receipt's 0x03 root
+// is no canonical ledger state admissible for that bin (not in this node's
+// canonical digest history, or superseded more than the root-age bound before
+// the builder cut). Refused, never admitted, remembered in the refused memo;
+// no strike (a peer on another lineage is not misbehaving).
+inline constexpr int kShareVerdictForeign = 6;
+// A receipt that stays undecided (verdict 0) past its patience is never
+// admitted: a solicited copy is re-judged on every share-state advance for at
+// most this many rounds, then dropped (never trusted, never a strike).
+inline constexpr unsigned kShareUndecidedMaxRounds = 4;
+#define C2POOL_XMR_RECEIPT_ADMISSION 1
 
 // ── the first-byte namespace ────────────────────────────────────────────────
 inline constexpr u8  FB_NS_FIRST  = 0x40;

@@ -57,7 +57,11 @@ using bytes32 = ::v37::bytes32;
 
 // The field table: id, name, wire type. Ids are frozen once shipped; a new
 // rule takes the next id. 23-25 are the drain rule's placeholders (operator
-// ruling R2): 0 = no drain = master's coinbase bytes.
+// ruling R2): 0 = no drain = master's coinbase bytes. 30 (RULES RATCHET R1,
+// operator ruling 2026-10-03): empty_cut = the receipt-admission rule set --
+// only verdict-1 receipts enter a lane order, the committed receipt test, and
+// a canonical lane block whose own cut is decided bad is booked with no cut
+// (the anchor stays where it is: OwedLedgerRules::empty_cut).
 #define C2POOL_XMR_LANE_RULES_FIELDS(X)              \
     X( 1, d_conf,             std::uint64_t)         \
     X( 2, settle_h_min,       std::uint64_t)         \
@@ -87,7 +91,8 @@ using bytes32 = ::v37::bytes32;
     X(26, pool_tag_codec,     std::uint8_t)          \
     X(27, lane_params_digest, ::v37::bytes32)        \
     X(28, enrol_digest,       ::v37::bytes32)        \
-    X(29, spend_floor,        std::uint8_t)
+    X(29, spend_floor,        std::uint8_t)          \
+    X(30, empty_cut,          std::uint8_t)
 
 // The two fields HELLO already compares through its own refusals (the
 // LaneParams digest and the rule-tagged enrol digest): a list that differs
@@ -115,7 +120,7 @@ inline constexpr FieldInfo kFields[] = {
 #undef C2POOL_LR_INFO
 };
 inline constexpr std::size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
-static_assert(kFieldCount == 29, "the v1 lane-rules list has 29 fields");
+static_assert(kFieldCount == 30, "the v1 lane-rules list has 30 fields (R1: + empty_cut)");
 
 inline const char* field_name(std::uint8_t id) {
     for (const auto& f : kFields)

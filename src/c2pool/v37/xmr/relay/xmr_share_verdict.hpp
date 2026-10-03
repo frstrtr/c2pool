@@ -40,6 +40,26 @@
 //    Stagenet attempt 7: the finder's post-FOUND shares (dh 4) were judged on
 //    the receivers' older prefix (dh 14) -> "under-take" -> -1 -> a strike each
 //    -> the finder banned every ~3 s -> the repair of its block never finished.
+//
+// ★ RULES RATCHET R1, RECEIPT ADMISSION (F1-F3, operator ruling 2026-10-03):
+//   * only verdict 1 admits (xmr_relay_node.hpp); 0 and every skew code park
+//     and are re-judged, never admitted, never a strike;
+//   * F2 retention: every (digest, seq) state whose digest was superseded less
+//     than kLateTailBins + 1 + A heights (A = the root-age bound) behind the
+//     finalize cursor is kept, so a synced node can evaluate every receipt the
+//     lane order can still admit; retention never decides anything;
+//   * THE COMMITTED RECEIPT TEST (CommittedHistory, published by the daemon):
+//     b = the receipt's bin (its coinbase height), bcut = b - 1 - D_conf (the
+//     builder cut of that bin, the block-level D7 rule). Once this node's
+//     finalize cursor is >= bcut, the receipt's 0x03 root must be the root of
+//     a state in this node's canonical digest history that was current within
+//     A heights of bcut, else the verdict is FOREIGN (decided, refused, no
+//     strike). Before the cursor gets there an unmatched root is 0 (not yet).
+//     A function of the receipt bytes and the chain: every node on the same
+//     ledger lineage answers alike, whatever it retained.
+//   * a recompute -1 against retained states is decided only when this node
+//     holds the digest COMPLETE from the moment it became current (it was
+//     running then and evicted none of its states); otherwise 0.
 // ===========================================================================
 #pragma once
 
@@ -56,7 +76,9 @@
 #include "impl/xmr/coin/xmr_blob.hpp"                 // tx_prefix_hash
 #include "impl/xmr/receipt/xmr_receipt_verify.hpp"   // resume_prefix_hash, ParsedBlob
 #include "xmr_relay_wire.hpp"                          // FbReceipt
+#include "xmr_order_rule.hpp"                          // kLateTailBins (F2 retention span)
 #include "../xmr_coinbase_recompute.hpp"               // verify_share_coinbase, mm_root_of
+#include "../xmr_recon_ring.hpp"                       // builder_cut, root_age (the committed test)
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -92,7 +114,62 @@ struct ShareStateEntry {
     bool view_ratified = false;                     // ... and its geometry is ratified
     std::vector<::c2pool::v37n::settle::WeightedPayee> payees;
     std::shared_ptr<ShareTemplateCache> cache = std::make_shared<ShareTemplateCache>();
+    // ★ R1 ADMISSION (F2): the coin height the digest became current at (the
+    // finalize driver's digest_since), and whether this node published the
+    // digest's FIRST state live (it was running when the digest became
+    // current): only then does it hold every (digest, seq) of that digest.
+    std::uint64_t since = 0;
+    bool from_birth = false;
 };
+
+// ★ R1 ADMISSION: THE COMMITTED RECEIPT TEST's inputs, published by the daemon
+// (main thread) from its canonical digest history (the RECON ring, seeded from
+// the boot replay, so a restarted node holds the same (digest, since) pairs as
+// a node that never stopped) and its finalize cursor. Immutable once published.
+struct CommittedHistory {
+    struct Entry {
+        ::v37::bytes32 digest{};
+        ::v37::bytes32 root{};             // mm_commitment_root(chain, digest)
+        std::uint64_t  since = 0;          // the coin height it became current at
+        std::uint64_t  superseded = ::c2pool::v37n::xmr::recon::kSupersededNever;   // the next state's since
+    };
+    std::vector<Entry> entries;            // oldest first; the live digest last (superseded = never)
+    std::uint64_t cursor = 0;              // this node's finalize cursor height
+    std::uint64_t d_conf = 0;
+    std::uint64_t max_root_age = 0;        // the root-age bound A (0 = unbounded, the lane rule's knob)
+    bool warm = false;                     // the history is complete enough to decide (boot-seeded or past warm-up)
+};
+
+// The committed test alone (no recompute): 1 = the root is an admissible
+// canonical state for bin `coinbase_height`; -1 = decided not (FOREIGN);
+// 0 = not decidable here yet (cursor before the builder cut, or not warm).
+inline int committed_root_test(const CommittedHistory& h, const ::v37::bytes32& root, std::uint64_t coinbase_height,
+                               std::string* why = nullptr) {
+    namespace rr = ::c2pool::v37n::xmr::recon;
+    const std::uint64_t bcut = rr::builder_cut(coinbase_height, h.d_conf);
+    bool in_history = false;
+    std::uint64_t best_age = ~std::uint64_t{0};
+    for (const auto& e : h.entries) {
+        if (e.root != root) continue;
+        in_history = true;
+        const std::uint64_t age = rr::root_age(e.superseded, bcut);
+        if (age < best_age) best_age = age;
+        if (h.max_root_age == 0 || age <= h.max_root_age) return 1;
+    }
+    if (!h.warm || h.cursor < bcut) {
+        if (why) *why = "not yet: this node's finalize cursor " + std::to_string(h.cursor) + " has not reached the builder cut " +
+                        std::to_string(bcut) + " of bin " + std::to_string(coinbase_height) + (h.warm ? "" : " (history warming up)");
+        return 0;
+    }
+    if (why) {
+        *why = in_history ? "foreign: the 0x03 root is a canonical state superseded " + std::to_string(best_age) + " heights before the builder cut " +
+                                std::to_string(bcut) + " of bin " + std::to_string(coinbase_height) + " (bound " + std::to_string(h.max_root_age) + ")"
+                          : "foreign: the 0x03 root is no state of this node's canonical history (" + std::to_string(h.entries.size()) +
+                                " states) and the cursor " + std::to_string(h.cursor) + " has passed the builder cut " + std::to_string(bcut) +
+                                " of bin " + std::to_string(coinbase_height);
+    }
+    return -1;
+}
 
 // STATE KEY = (owed_digest, ledger_seq). A sibling FOUND bumps ledger_seq
 // without changing owed_digest (the digest covers the settled rows, not the
@@ -102,12 +179,35 @@ struct ShareStateEntry {
 // on the old ledger and refused. Both states commit the same 0x03 root, so
 // the verdict tries every held entry with that root: a share is canonical if
 // it is the canonical coinbase of ANY held state it commits (handoff gap 1).
-// Retention: the newest kMaxStates entries, oldest evicted first.
+// ★ R1 ADMISSION (F2) RETENTION: put(e, cursor, span) keeps every state whose
+// digest is current or was superseded at a height >= cursor - span (the
+// daemon passes span = kLateTailBins + 1 + A); kMaxStates is a hard memory
+// cap above that (oldest evicted first; an evicted digest is no longer
+// complete, so it never yields a decided -1). put(e) alone = the cap only.
 #define C2POOL_XMR_SHARE_STATE_BY_SEQ 1
+#define C2POOL_XMR_SHARE_STATE_RETENTION 1
 struct ShareStateStore {
-    static constexpr std::size_t kMaxStates = 16;
+    static constexpr std::size_t kMaxStates = 1024;
     std::mutex mu;
-    std::deque<std::shared_ptr<const ShareStateEntry>> ring;   // newest last, bounded (kMaxStates)
+    std::deque<std::shared_ptr<const ShareStateEntry>> ring;   // newest last, bounded (span, then kMaxStates)
+    std::map<::v37::bytes32, std::uint64_t> superseded_at;     // digest -> the since of the digest that replaced it
+    std::set<::v37::bytes32> broken;                           // digests with an evicted state (not complete any more)
+    std::shared_ptr<const CommittedHistory> history;           // null = no committed test (the pre-R1 answers)
+    void set_history(std::shared_ptr<const CommittedHistory> h) {
+        std::lock_guard<std::mutex> lk(mu);
+        history = std::move(h);
+    }
+    std::shared_ptr<const CommittedHistory> history_now() {
+        std::lock_guard<std::mutex> lk(mu);
+        return history;
+    }
+    // every retained state of `digest` is held, from its first one on
+    bool complete(const ::v37::bytes32& digest) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (broken.count(digest)) return false;
+        for (const auto& x : ring) if (x->digest == digest && x->from_birth) return true;
+        return false;
+    }
     std::shared_ptr<const ShareStateEntry> find_root(const ::v37::bytes32& root) {
         std::lock_guard<std::mutex> lk(mu);
         for (auto it = ring.rbegin(); it != ring.rend(); ++it)
@@ -128,14 +228,43 @@ struct ShareStateStore {
             if (x->digest == digest && x->ledger_seq == seq) return x;
         return nullptr;
     }
-    // Replace the entry with the same (digest, ledger_seq); else append and
-    // evict the oldest past kMaxStates.
-    void put(std::shared_ptr<const ShareStateEntry> e) {
+    // Replace the entry with the same (digest, ledger_seq); else append. Then
+    // evict: (F2) every state of a digest superseded below cursor - span (when
+    // span != 0), and the oldest past kMaxStates (that digest is no longer
+    // complete here).
+    void put(std::shared_ptr<const ShareStateEntry> e, std::uint64_t cursor = 0, std::uint64_t span = 0) {
         std::lock_guard<std::mutex> lk(mu);
+        bool replaced = false;
         for (auto& x : ring)
-            if (x->digest == e->digest && x->ledger_seq == e->ledger_seq) { x = std::move(e); return; }
-        ring.push_back(std::move(e));
-        while (ring.size() > kMaxStates) ring.pop_front();
+            if (x->digest == e->digest && x->ledger_seq == e->ledger_seq) { x = e; replaced = true; break; }
+        if (!replaced) {
+            if (!ring.empty() && ring.back()->digest != e->digest && !superseded_at.count(ring.back()->digest))
+                superseded_at[ring.back()->digest] = e->since;   // the newest digest was replaced by this one
+            ring.push_back(e);
+        }
+        if (span) {
+            while (!ring.empty()) {
+                const auto& f = ring.front();
+                const auto s = superseded_at.find(f->digest);
+                if (f->digest == ring.back()->digest || s == superseded_at.end() || s->second + span >= cursor) break;
+                ring.pop_front();
+            }
+        }
+        while (ring.size() > kMaxStates) {
+            broken.insert(ring.front()->digest);
+            ring.pop_front();
+        }
+        // forget the bookkeeping of digests no longer held
+        for (auto it = superseded_at.begin(); it != superseded_at.end();) {
+            bool held = false;
+            for (const auto& x : ring) if (x->digest == it->first) { held = true; break; }
+            it = held ? std::next(it) : superseded_at.erase(it);
+        }
+        for (auto it = broken.begin(); it != broken.end();) {
+            bool held = false;
+            for (const auto& x : ring) if (x->digest == *it) { held = true; break; }
+            it = held ? std::next(it) : broken.erase(it);
+        }
     }
 };
 
@@ -273,14 +402,29 @@ inline int share_verdict_one(const std::shared_ptr<const ShareStateEntry>& e, co
 // the share is the canonical coinbase of any of them; else 0 if one of them
 // could not decide (no view yet, or undecidable); else -1. The answer is a
 // function of the SET of held states, never of their order.
+// ★ R1 ADMISSION: with a published CommittedHistory the root is first put
+// through the committed test (FOREIGN when decided not admissible), a root
+// that is admissible but has no retained state answers 0 (F2: never trusted,
+// never refused for what this node happened to retain), and a recompute -1
+// stands only on a digest this node holds complete (else 0).
 inline int share_verdict(ShareStateStore& store, const FbReceipt& r, const ::v37::xmr::verify::ParsedBlob& pb,
                          std::uint64_t coinbase_height, std::string& why) {
     namespace rc = ::c2pool::v37n::xmr::recompute;
     const auto& op = r.receipt.coinbase_opening;
     const auto root = rc::mm_root_of(op.tx_extra);
     if (!root) { why = "tx_extra does not end in the lane 0x03 root"; return -1; }
+    const auto hist = store.history_now();
+    if (hist) {
+        std::string cw;
+        const int c = committed_root_test(*hist, *root, coinbase_height, &cw);
+        if (c < 0) { why = cw; return kShareVerdictForeign; }
+    }
     const auto es = store.find_all_root(*root);
-    if (es.empty()) { why = "the ledger state its 0x03 root commits is not held here"; return 0; }
+    if (es.empty()) {
+        why = hist ? "the canonical ledger state its 0x03 root commits is not retained here (or not reached yet): undecided"
+                   : "the ledger state its 0x03 root commits is not held here";
+        return 0;
+    }
     ::v37::bytes32 hp{};
     if (!::v37::xmr::verify::resume_prefix_hash(op, hp)) { why = "the coinbase opening does not resume"; return -1; }
     bool undecided = false;
@@ -302,6 +446,14 @@ inline int share_verdict(ShareStateStore& store, const FbReceipt& r, const ::v37
     if (skew) { why = skew_why; return skew; }
     why = first_why;
     if (es.size() > 1) why += " (against each of the " + std::to_string(es.size()) + " held states with that root)";
+    // ★ R1 ADMISSION: a -1 is decided only against the COMPLETE state set of
+    // that digest (this node was running when it became current and evicted
+    // none of its states); a node that holds part of it answers 0.
+    if (hist && !store.complete(es.front()->digest)) {
+        why = "undecided: not canonical for the " + std::to_string(es.size()) + " retained state(s) of its digest, which this node does not hold "
+              "complete (" + why + ")";
+        return 0;
+    }
     return -1;
 }
 

@@ -58,10 +58,10 @@ final settlement configuration:
 | 12 | drops_rule | 27 | lane_params_digest (the HELLO one) |
 | 13 | drops_window_rw | 28 | enrol_digest (the HELLO one, 0 without DROPS) |
 | 14 | kfair_salted_ties | 29 | spend_floor |
-| 15 | commit_total | | |
+| 15 | commit_total | 30 | empty_cut (R1: receipt admission, coinbase-recompute.md section 6.2) |
 
 Serialisation: a TLV list `u8 id | u8 len | value (little-endian)`, ids strictly
-ascending, every known id present (278 bytes for v1). A field added later takes
+ascending, every known id present (281 bytes for v1 with field 30). A field added later takes
 the next id; a reader keeps an id it does not know and refuses the peer by name.
 
 ```
@@ -135,7 +135,7 @@ At startup the node prints its whole list, so two operators can diff their
 nodes without connecting them:
 
 ```
-lane-rules: digest=<64 hex> (29 fields, TLV 278 B) d_conf=60 settle_h_min=0 output_cap=2700 ...
+lane-rules: digest=<64 hex> (30 fields, TLV 281 B) d_conf=60 settle_h_min=0 output_cap=2700 ...
 lane-rules: -> pool_tag=<64 hex> (a peer with another list is refused at HELLO as LANE_RULES_MISMATCH; ...)
 ```
 

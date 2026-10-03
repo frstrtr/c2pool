@@ -34,6 +34,14 @@
 //   S14 HOLD-ROUND-2 V2: an F-capped take (F below R*dh/256, or both dh past
 //       H_cap) is AHEAD / BEHIND too, 120 copies -> strikes 0 bans 0; a take
 //       above every drain regime still strikes.
+//   S16 R1 receipt admission (F3-K5): the committed receipt test -- a real
+//       state superseded beyond the root-age bound is FOREIGN on a node that
+//       holds it and one that never did; a state ahead of the cursor is 0
+//       until the cursor passes the bin's builder cut; -1 only on a digest
+//       held complete.
+//   S17 R1 receipt admission (F2): every state retained within the span, a
+//       superseded digest evicted whole past it, the hard cap marks it
+//       incomplete.
 //   S13 HOLD-ROUND-2 (B): a drain take that is the Delta at another dh is
 //       lane-prefix SKEW: AHEAD (parked) / BEHIND / LATE (dropped), never -1;
 //       a forged take or a thief template stays -1; the AHEAD share re-judges
@@ -1066,6 +1074,166 @@ void s15_unbased_prefix_mismatch() {
     CHECK(v5 == 1, "U5 after the state advances to L1 the parked share re-judges CANONICAL (%d %s)", v5, why.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// S16 (RULES RATCHET R1, receipt admission, F3-K5): THE COMMITTED RECEIPT TEST.
+// A receipt's 0x03 root must be a canonical ledger state admissible for its
+// bin: current within A (the root-age bound) heights of the bin's builder cut
+// bcut = b - 1 - D_conf. Once the node's finalize cursor is >= bcut the answer
+// is final and does not depend on what the node retained:
+//   (a) a REAL state superseded beyond the range is FOREIGN on a node that
+//       still holds it and on one that never did (base: 1 / 0);
+//   (b) a state ahead of the node's cursor is 0 until the cursor passes bcut,
+//       then 1 once the state is held (or FOREIGN when it never was canonical
+//       here);
+//   (c) admissible but not retained here -> 0, never trusted, never refused;
+//   (d) a recompute -1 stands only on a digest held complete (from its birth).
+// ---------------------------------------------------------------------------
+#if defined(C2POOL_XMR_RECEIPT_ADMISSION)
+std::shared_ptr<rl::CommittedHistory> history(std::vector<std::pair<const st::OwedLedger*, std::uint64_t>> states,
+                                              std::uint64_t cursor) {
+    auto h = std::make_shared<rl::CommittedHistory>();
+    for (std::size_t i = 0; i < states.size(); ++i) {
+        rl::CommittedHistory::Entry e;
+        e.digest = states[i].first->owed_digest();
+        const auto r = x6::mm_commitment_root(kChain, e.digest);
+        std::memcpy(e.root.data(), r.data(), 32);
+        e.since = states[i].second;
+        e.superseded = i + 1 < states.size() ? states[i + 1].second : c2pool::v37n::xmr::recon::kSupersededNever;
+        h->entries.push_back(e);
+    }
+    h->cursor = cursor; h->d_conf = 60; h->max_root_age = 240; h->warm = true;
+    return h;
+}
+#endif
+void s16_committed_receipt_test() {
+    std::printf("== S16. the committed receipt test (R1 receipt admission, F3-K5) ==\n");
+#if defined(C2POOL_XMR_RECEIPT_ADMISSION)
+    World w;
+    const st::OwedLedger L0 = w.L;              // the receipt's state D0
+    st::OwedLedger L1 = w.L; seed(L1, w.K2.id, 1000000000ll, 13);   // the next state D1
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block b = build_block(L0, w.lane, o);
+    CHECK(b.ok, "an honest template on D0 builds: %s", b.ok ? "ok" : b.why.c_str());
+    if (!b.ok) return;
+    const Share sh = share_of(b);
+    const std::uint64_t bcut = kHeight - 1 - 60;
+    std::string why;
+    // (a) D0 superseded 241 heights before bcut (> A = 240): FOREIGN everywhere
+    {
+        rl::ShareStateStore holds, never;
+        auto e0 = state_entry(L0, w); e0->from_birth = true;
+        holds.put(e0);
+        const auto h = history({{&L0, 100}, {&L1, bcut - 241}}, bcut);
+        holds.set_history(h); never.set_history(h);
+        const int vh = relay_verdict(holds, sh, why);
+        CHECK(vh == rl::kShareVerdictForeign, "(a) a real state superseded beyond the range: FOREIGN on the node that HOLDS it (%d %s)", vh, why.c_str());
+        const int vn = relay_verdict(never, sh, why);
+        CHECK(vn == rl::kShareVerdictForeign, "(a) ... and FOREIGN on a node that never held it (%d %s)", vn, why.c_str());
+        auto h2 = history({{&L0, 100}, {&L1, bcut - 240}}, bcut);   // exactly A: admissible
+        holds.set_history(h2);
+        const int va = relay_verdict(holds, sh, why);
+        CHECK(va == 1, "(a) superseded exactly A = 240 heights before bcut: admissible, canonical (%d %s)", va, why.c_str());
+    }
+    // (b) the state is ahead of this node's cursor
+    {
+        rl::ShareStateStore n;
+        n.set_history(history({{&L1, 50}}, bcut - 5));   // the node is behind: its history ends before D0
+        const int v0 = relay_verdict(n, sh, why);
+        CHECK(v0 == 0, "(b) cursor %llu < bcut %llu, root not in the history yet: 0 (not yet) -- %s",
+              (unsigned long long)(bcut - 5), (unsigned long long)bcut, why.c_str());
+        n.set_history(history({{&L1, 50}, {&L0, bcut}}, bcut));   // the node reaches D0
+        auto e0 = state_entry(L0, w); e0->from_birth = true; e0->since = bcut;
+        n.put(e0);
+        const int v1 = relay_verdict(n, sh, why);
+        CHECK(v1 == 1, "(b) the cursor passes bcut and D0 is held: canonical (%d %s)", v1, why.c_str());
+        rl::ShareStateStore m;
+        m.set_history(history({{&L1, 50}}, bcut));   // the cursor passed bcut and D0 was never canonical here
+        const int vf = relay_verdict(m, sh, why);
+        CHECK(vf == rl::kShareVerdictForeign, "(b) the cursor passed bcut and the root is no canonical state here: FOREIGN (%d %s)", vf, why.c_str());
+    }
+    // (c) admissible, not retained here: 0 -- never trusted, never refused
+    {
+        rl::ShareStateStore n;
+        n.set_history(history({{&L0, 100}, {&L1, bcut - 10}}, bcut + 20));
+        const int v = relay_verdict(n, sh, why);
+        CHECK(v == 0, "(c) admissible (age 10 <= A) but not retained here: 0 (%s)", why.c_str());
+    }
+    // (d) a thief template on D0: -1 only when D0 is held complete
+    {
+        BuildOpts t; t.cut_payees = w.cut;
+        t.mutate = [&](x6::CoinbaseInputs& in) { for (auto& e : in.owed) { e.pay = w.thief.ref; e.identity = w.thief.id; } };
+        const Block tb = build_block(L0, w.lane, t);
+        CHECK(tb.ok, "(d) a thief template on D0 builds: %s", tb.ok ? "ok" : tb.why.c_str());
+        if (!tb.ok) return;
+        const Share ts = share_of(tb);
+        rl::ShareStateStore part, full;
+        const auto h = history({{&L0, bcut}}, bcut);
+        part.set_history(h); full.set_history(h);
+        auto ep = state_entry(L0, w); ep->from_birth = false; part.put(ep);    // restarted while D0 was current
+        auto ef = state_entry(L0, w); ef->from_birth = true; full.put(ef);
+        const int vp = relay_verdict(part, ts, why);
+        CHECK(vp == 0, "(d) D0 held but not from its birth (a restart): the thief share is 0, never a decided -1 (%s)", why.c_str());
+        const int vf = relay_verdict(full, ts, why);
+        CHECK(vf == -1, "(d) D0 held complete: the thief share is REFUSED -1 (%s)", why.c_str());
+    }
+#else
+    CHECK(false, "no committed receipt test on the base (root not held -> 0; a held root is judged whatever its age)");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// S17 (RULES RATCHET R1, receipt admission, F2): STATE RETENTION. Every
+// (digest, seq) state is kept while its digest is current or was superseded
+// within `span` heights of the cursor (the daemon: kLateTailBins + 1 + A);
+// beyond, all states of that digest go together; kMaxStates is a hard cap
+// above, and a digest it truncates is no longer complete. Retention never
+// decides a verdict.
+// ---------------------------------------------------------------------------
+void s17_retention() {
+    std::printf("== S17. F2 state retention (R1 receipt admission) ==\n");
+#if defined(C2POOL_XMR_SHARE_STATE_RETENTION)
+    World w;
+    st::OwedLedger D0 = w.L;
+    const std::uint64_t span = 30 + 1 + 240;
+    rl::ShareStateStore store;
+    std::vector<std::uint64_t> seqs;
+    for (int i = 0; i < 5; ++i) {   // five states of D0 (sibling FOUNDs bump the seq)
+        auto e = state_entry(D0, w); e->since = 100; e->from_birth = (i == 0);
+        store.put(e, 120, span);
+        seqs.push_back(D0.ledger_seq());
+        D0.on_block_found("sib-" + std::to_string(i), {}, {});
+    }
+    st::OwedLedger D1 = w.L; seed(D1, w.K2.id, 1000000000ll, 14);
+    auto e1 = state_entry(D1, w); e1->since = 200; e1->from_birth = true;
+    store.put(e1, 200, span);
+    std::size_t held0 = 0;
+    for (auto q : seqs) if (store.find_state(w.L.owed_digest(), q)) ++held0;
+    CHECK(held0 == 5 && store.complete(w.L.owed_digest()), "all 5 states of D0 retained after D1 (superseded at 200), D0 complete (%zu)", held0);
+    store.put(e1, 200 + span, span);   // cursor = superseded + span: still within
+    held0 = 0; for (auto q : seqs) if (store.find_state(w.L.owed_digest(), q)) ++held0;
+    CHECK(held0 == 5, "cursor %llu = 200 + span: D0's 5 states still retained (%zu)", (unsigned long long)(200 + span), held0);
+    store.put(e1, 200 + span + 1, span);
+    held0 = 0; for (auto q : seqs) if (store.find_state(w.L.owed_digest(), q)) ++held0;
+    CHECK(held0 == 0 && store.find_state(D1.owed_digest(), D1.ledger_seq()),
+          "cursor one past: every state of D0 evicted together, the current D1 kept (%zu)", held0);
+    CHECK(rl::ShareStateStore::kMaxStates >= 2 * span, "the hard cap %zu >= 2 x span %llu (one state per height, twice)",
+          rl::ShareStateStore::kMaxStates, (unsigned long long)span);
+    {   // the hard cap truncates the oldest digest: it is no longer complete
+        rl::ShareStateStore c;
+        st::OwedLedger Dk = w.L;
+        auto f0 = state_entry(Dk, w); f0->from_birth = true; c.put(f0);
+        for (std::size_t i = 0; i < rl::ShareStateStore::kMaxStates; ++i) {
+            Dk.on_block_found("cap-" + std::to_string(i), {}, {});
+            c.put(state_entry(Dk, w));
+        }
+        CHECK(c.ring.size() == rl::ShareStateStore::kMaxStates && !c.complete(w.L.owed_digest()),
+              "the cap evicts the digest's first state: %zu held, the digest is no longer complete", c.ring.size());
+    }
+#else
+    CHECK(false, "no span retention on the base (the newest 16 states)");
+#endif
+}
+
 int main() {
     std::printf("v37_xmr_share_verdict_kat\n");
     s1_honest();
@@ -1083,6 +1251,8 @@ int main() {
     s13_lane_prefix_skew();   // HOLD-ROUND-2 (B)
     s14_f_capped_take();      // HOLD-ROUND-2 V2
     s15_unbased_prefix_mismatch();   // HOLD-ROUND-3 F4
+    s16_committed_receipt_test();    // R1 receipt admission (F3-K5)
+    s17_retention();                 // R1 receipt admission (F2)
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

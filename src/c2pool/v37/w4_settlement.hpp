@@ -1003,6 +1003,15 @@ struct OwedLedgerRules {
     u64       decay_horizon = 0;     // 0 = off
     u64       decay_half_life = 0;
     bool      anchor_cut = false;
+    // EMPTY-CUT (XMR, RULES RATCHET R1, operator ruling 2026-10-03; rides
+    // anchor_cut): a canonical lane block whose own credit cut is DECIDED bad
+    // -- the winner-side order reaches the committed spine and carries a
+    // receipt every node refuses under the committed receipt test -- books
+    // its money as decided and passes NO cut, so its FINALIZE leaves the anchor
+    // where it is (the next decided cut covers the honest receipts). Undecided
+    // cuts stay HELD. A booking-side rule (the daemon decides the cut); the
+    // ledger reads a missing cut exactly as before.
+    bool      empty_cut = false;
     // MERKLE ROWS (XMR, paper §13): owed_digest commits the balances as the
     // ROOT of a Merkle tree over the rows, so a light client proves one
     // balance with a path of log2(rows) hashes instead of every row:

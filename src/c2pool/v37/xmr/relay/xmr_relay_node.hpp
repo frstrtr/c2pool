@@ -420,6 +420,11 @@ struct RelayOptions {
     // of fetched-but-inadmissible raindrop ids (counted as held: never re-asked).
     u32         drops_inv_page_max_asks = 3;
     std::size_t drops_refused_max = 262144;
+    // ★ R1 ADMISSION (F3): the bound of the refused memo (receipt id -> the
+    // committed reason, payee, give-author, bin of a receipt refused by the
+    // share verdict). A cache only: a node without an entry re-fetches the
+    // bytes and reaches the same verdict.
+    std::size_t refused_memo_max = 65536;
     // ★ DROPS-HARDEN (d1): a pinned id still missing after drops_fetch_max_asks
     // asks is re-asked no more often than this (never forever at the fast rate)
     u32         drops_fetch_slow_ms = 60000;
@@ -497,6 +502,12 @@ struct RelayStats {
     std::atomic<u64> share_skew_ahead{0}, share_skew_behind{0}, share_late{0}, share_ahead_rejudged{0}, share_ahead_evicted{0};
     // ★ HOLD-ROUND-3 (F4): prefix-hash mismatches with no V37N base: parked (never struck), dropped after the re-judge bound
     std::atomic<u64> share_unbased_parked{0}, share_unbased_expired{0};
+    // ★ R1 ADMISSION (F1-F3): FOREIGN refusals (no strike), solicited undecided
+    // receipts waiting on a share-state advance / dropped past the round bound,
+    // copies of an already refused receipt skipped (the refused memo), and the
+    // memo's live size. share_undecided_trusted above stays 0 (nothing trusts).
+    std::atomic<u64> share_foreign{0}, share_undecided_waiting{0}, share_undecided_expired{0};
+    std::atomic<u64> refused_memo_hits{0}, refused_memo_evicted{0}, repair_set_aside_refused{0};
     std::atomic<u64> won_reoffer_skipped{0};   // RELAY-SEND-QUEUE: not re-offered, the peer node provably holds it
     std::atomic<u64> won_held_confirmed{0};    // RELAY-SEND-QUEUE: re-offered frames a later PONG proved read
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
@@ -1219,6 +1230,29 @@ public:
     }
     std::size_t cache_size() const { std::lock_guard<std::mutex> lk(m_mtx); return m_cache.size(); }
 
+    // ── ★ R1 ADMISSION (F3): the refused memo ──────────────────────────────
+    // A receipt the share verdict REFUSED (-1 or FOREIGN: decided under the
+    // committed test) after the structural check, with what a repair needs to
+    // replay its lane position (payee, give-author, origin bin) and the reason.
+    // The repair counts such an id as decided (never re-asked), and the cut
+    // test (xmr_cut_admission.hpp) reads it: a winner-side order that reaches
+    // the committed spine with a refused receipt in it is a decided-bad cut.
+    struct RefusedRec {
+        std::string reason;
+        ::v37::ScriptRef payee;
+        u16 give_author = 0;
+        u64 bin = 0;
+        int verdict = -1;
+    };
+    bool refused(const bytes32& id, RefusedRec* out = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_rfmtx);
+        auto it = m_refused.find(id);
+        if (it == m_refused.end()) return false;
+        if (out) *out = it->second;
+        return true;
+    }
+    std::size_t refused_size() const { std::lock_guard<std::mutex> lk(m_rfmtx); return m_refused.size(); }
+
     // ── block-winner fast path ──────────────────────────────────────────────
     std::size_t broadcast_block_won(const BlockWon& b) {
         {
@@ -1331,7 +1365,7 @@ public:
             std::size_t missing = 0;
             {
                 std::lock_guard<std::mutex> ck(m_mtx);
-                for (const auto& id : r.ids) if (!m_cache.count(id)) ++missing;
+                for (const auto& id : r.ids) if (!m_cache.count(id) && !refused(id)) ++missing;   // R1: a refused id is decided
             }
             if (!missing) {
                 r.st = Repair::St::Ready; m_st.repair_ready++;
@@ -1384,6 +1418,20 @@ public:
         m_st.repair_rejected++;
         lk.unlock();
         if (!note.empty()) log(note);
+    }
+    // ★ R1 ADMISSION (F3): the order this repair was served reached the spine
+    // but carries a receipt this node refused: set its peer aside (no deep
+    // fallback: its order is not wrong, it is refused here) and ask the other
+    // ready peers for the same spine. Exhausted afterwards = no ready peer
+    // serves the spine without a refused receipt (xmr_cut_admission.hpp).
+    void repair_set_aside(u64 P, const bytes32& spine) {
+        std::lock_guard<std::mutex> lk(m_rmtx);
+        auto it = m_repairs.find(std::make_pair(P, spine));
+        if (it == m_repairs.end()) return;
+        Repair& r = it->second;
+        if (r.served_by) r.tried.insert(r.served_by);
+        r.reset();
+        m_st.repair_set_aside_refused++;
     }
     // ★ HOLD-ROUND-3 F3a: the caller holds NO verified base for [0, a0) of this
     // cut (own digest at a0 differs, no shadow record / another a0 -- see
@@ -1516,12 +1564,15 @@ public:
                 case Repair::St::Fetching: {
                     std::size_t missing = 0, verifying = 0;
                     std::lock_guard<std::mutex> ck(m_mtx);
+                    std::size_t refused_n = 0;
                     for (const auto& id : r.ids) {
                         if (m_cache.count(id)) continue;
+                        if (refused(id)) { ++refused_n; continue; }   // R1 ADMISSION: decided (memo)
                         ++missing;
                         if (m_inflight.count(id)) ++verifying; else idle_ids.push_back(id);
                     }
                     s = "fetching: " + std::to_string(missing) + "/" + std::to_string(r.ids.size()) + " receipts missing" +
+                        (refused_n ? ", " + std::to_string(refused_n) + " refused here" : std::string()) +
                         (r.a0 ? " of [" + std::to_string(r.a0) + "," + std::to_string(P) + ")" : std::string()) + " (" +
                         std::to_string(verifying) + " in verify, " + std::to_string(idle_ids.size()) + " to re-ask; order from peer " +
                         std::to_string(r.served_by) + ", refetches=" + std::to_string(r.refetches) + ", last progress " + age(r.last_progress) + " ago)";
@@ -1692,19 +1743,25 @@ public:
     // The share-verdict counters (VERIFY S6: only the last refusal showed).
     std::string describe_shares() const {
         const auto& s = m_st;
-        char b[560];
+        char b[768];
         // HOLD-ROUND-3 (4.10): `parked` / `ahead` are cumulative; `park_now` (the
         // undecided park) and `ahead_now` (the AHEAD/UNBASED park) are LIVE depths.
+        // R1 ADMISSION: `trusted` stays 0 (only verdict 1 admits); `foreign` =
+        // committed-test refusals (no strike); `waiting` / `expired` = solicited
+        // undecided receipts re-judged on a state advance / dropped past the bound.
         std::snprintf(b, sizeof b,
-            "relay-shares: refused=%llu parked=%llu undecided_dropped=%llu trusted=%llu | skew ahead=%llu behind=%llu late=%llu "
-            "unbased=%llu unbased_expired=%llu | park_now=%zu ahead_now=%zu rejudged=%llu evicted=%llu",
-            (unsigned long long)s.share_refused.load(), (unsigned long long)s.share_parked.load(),
+            "relay-shares: refused=%llu foreign=%llu parked=%llu undecided_dropped=%llu trusted=%llu waiting=%llu expired=%llu | "
+            "skew ahead=%llu behind=%llu late=%llu unbased=%llu unbased_expired=%llu | park_now=%zu ahead_now=%zu rejudged=%llu "
+            "evicted=%llu | refused_memo=%zu hits=%llu",
+            (unsigned long long)s.share_refused.load(), (unsigned long long)s.share_foreign.load(), (unsigned long long)s.share_parked.load(),
             (unsigned long long)s.share_undecided_dropped.load(), (unsigned long long)s.share_undecided_trusted.load(),
+            (unsigned long long)s.share_undecided_waiting.load(), (unsigned long long)s.share_undecided_expired.load(),
             (unsigned long long)s.share_skew_ahead.load(), (unsigned long long)s.share_skew_behind.load(),
             (unsigned long long)s.share_late.load(),
             (unsigned long long)s.share_unbased_parked.load(), (unsigned long long)s.share_unbased_expired.load(),
             verify_parked_size(), share_ahead_size(),
-            (unsigned long long)s.share_ahead_rejudged.load(), (unsigned long long)s.share_ahead_evicted.load());
+            (unsigned long long)s.share_ahead_rejudged.load(), (unsigned long long)s.share_ahead_evicted.load(),
+            refused_size(), (unsigned long long)s.refused_memo_hits.load());
         return b;
     }
     std::string last_reject() const { std::lock_guard<std::mutex> lk(m_mtx); return m_last_reject; }
@@ -1719,8 +1776,11 @@ public:
     // after the structural check, before RandomX: 1 canonical, -1 not canonical
     // (refused + strike), 0 not decidable here yet (parked like an unresolved
     // context; past the patience an unsolicited receipt is dropped, a solicited
-    // one -- a repair of a winner's lane, Ruling A -- is admitted). Unset: no
-    // check (test rigs). Set before start().
+    // one is re-judged on each share-state advance for a bounded number of
+    // rounds and then dropped: R1 ADMISSION, nothing is admitted on anything
+    // but 1), kShareVerdictForeign (refused under the committed test, no
+    // strike), and the skew codes (xmr_relay_wire.hpp). Unset: no check (test
+    // rigs). Set before start().
     using VerdictFn = std::function<int(const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 coinbase_height, std::string& why)>;
     void set_share_verdict(VerdictFn f) { m_verdict = std::move(f); }
 
@@ -1857,6 +1917,7 @@ private:
         Clock::time_point not_before = Clock::now();
         u64 ahead_node = 0;        // HOLD-ROUND-2 V4: the sender NODE an AHEAD park is counted under (inv_node)
         unsigned unbased_rounds = 0;   // HOLD-ROUND-3 (F4): UNBASED re-judges so far (dropped past kShareUnbasedMaxRounds)
+        unsigned undecided_rounds = 0; // R1 ADMISSION (F1): solicited undecided re-judges so far (dropped past kShareUndecidedMaxRounds)
     };
     struct CacheEntry { ::v37::ScriptRef payee; std::vector<u8> raw; u64 bin = 0; u16 give_author = 0; };
     struct Job {
@@ -2703,6 +2764,7 @@ private:
 
     // ── the verify queue ────────────────────────────────────────────────────
     void enqueue(Item it) {
+        if (refused(it.id)) { m_st.refused_memo_hits++; return; }   // ★ R1 ADMISSION: decided already (the memo)
         std::lock_guard<std::mutex> lk(m_mtx);
         if (m_cache.count(it.id)) { m_st.dup++; return; }
         if (m_o.drops_floor_diff && drop_seen_locked(it.id)) { m_st.drops_dup++; return; }   // ★ DROPS
@@ -2723,7 +2785,8 @@ private:
                 };
                 if (!upg(m_q) && !upg(m_parked)) {
                     // HOLD-ROUND-2 (B): an AHEAD-parked flood copy -> back to the
-                    // patience path as solicited (a repair answer, Ruling A)
+                    // verify path as solicited (R1 ADMISSION: judged like any copy,
+                    // admitted only on verdict 1)
                     for (auto ait = m_ahead.begin(); ait != m_ahead.end(); ++ait) {
                         if (ait->id != it.id || ait->solicited) continue;
                         auto n = m_ahead_n.find(ait->ahead_node);
@@ -2874,16 +2937,27 @@ private:
         // height. (It was passed + 1, so every honest share rebuilt one block
         // high, was refused as non-canonical and struck its sender;
         // v37_xmr_relay_multinode_kat M2 pins the height.)
+        // ★ RULES RATCHET R1, RECEIPT ADMISSION (F1): ONLY verdict 1 admits a
+        // receipt (cache, lane order, drop store), solicited or not. A solicited
+        // copy (backfill, raindrop backfill, repair answer) is judged exactly like
+        // a flood: undecided and skew copies park and are re-judged when the
+        // share state advances, and are dropped without admission past a bound;
+        // never trusted, never a strike. A decided refusal (-1, FOREIGN) is kept
+        // in the refused memo (the repair reads it: xmr_cut_admission.hpp).
         if (m_verdict) {
             std::string vw;
             int v = m_verdict(it.r, pb, ctx->height, vw);
+            if (v == kShareVerdictForeign) {
+                m_st.share_foreign++; forget_inflight(it.id); note_drop_refused(it.id);
+                note_refused(it, ctx->height, v, vw);
+                { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
+                return;   // decided, never a strike (another lineage is not misbehaving)
+            }
             if (v >= kShareVerdictAhead) {
                 // ★ HOLD-ROUND-2 (B): lane-prefix SKEW -- the sender is a lane block
                 // ahead of (or behind) this node. Never a strike: the attempt-7 ban
                 // loop (every finder share struck on the receivers' older prefix).
-                if (it.solicited) {
-                    v = 0;   // a repair answer: the patience path, then trusted (Ruling A)
-                } else if (v == kShareVerdictAhead) {
+                if (v == kShareVerdictAhead) {
                     m_st.share_skew_ahead++;
                     park_ahead(std::move(it));
                     return;
@@ -2909,6 +2983,7 @@ private:
             }
             if (v < 0) {
                 m_st.share_refused++; forget_inflight(it.id); note_drop_refused(it.id);
+                note_refused(it, ctx->height, v, vw);
                 { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
                 strike(it.from, "share coinbase not canonical: " + vw);
                 return;
@@ -2921,7 +2996,22 @@ private:
                     return;
                 }
                 if (!it.solicited) { m_st.share_undecided_dropped++; forget_inflight(it.id); return; }
-                m_st.share_undecided_trusted++;   // a repair answer: the winner's lane holds it (Ruling A)
+                // ★ R1 ADMISSION (F1): a solicited receipt still undecided past its
+                // patience waits for this node's state to reach its own (re-judged
+                // on every share-state advance), at most kShareUndecidedMaxRounds
+                // rounds, then it is dropped. Never trusted, never a strike.
+                if (++it.undecided_rounds > kShareUndecidedMaxRounds) {
+                    m_st.share_undecided_expired++; m_st.share_undecided_dropped++;
+                    forget_inflight(it.id);
+                    return;
+                }
+                m_st.share_undecided_waiting++;
+                park_ahead(std::move(it));
+                return;
+            }
+            if (v != 1) {   // an unknown code: never admitted
+                m_st.share_undecided_dropped++; forget_inflight(it.id);
+                return;
             }
         }
         // RandomX token
@@ -3231,6 +3321,19 @@ private:
         m_st.drops_refused++;
         while (m_drop_refused_order.size() > std::max<std::size_t>(1, m_o.drops_refused_max)) {
             m_drop_refused.erase(m_drop_refused_order.front()); m_drop_refused_order.pop_front();
+        }
+    }
+    // ★ R1 ADMISSION (F3): remember a decided refusal (bounded FIFO).
+    void note_refused(const Item& it, u64 bin, int v, const std::string& why) {
+        RefusedRec rec;
+        rec.reason = why; rec.payee = it.r.payee; rec.give_author = it.r.side.give_author; rec.bin = bin; rec.verdict = v;
+        std::lock_guard<std::mutex> lk(m_rfmtx);
+        if (m_refused.count(it.id)) return;
+        m_refused.emplace(it.id, std::move(rec));
+        m_refused_order.push_back(it.id);
+        while (m_refused_order.size() > std::max<std::size_t>(1, m_o.refused_memo_max)) {
+            m_refused.erase(m_refused_order.front()); m_refused_order.pop_front();
+            m_st.refused_memo_evicted++;
         }
     }
     bool drop_wanted(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.count(id) != 0; }
@@ -4006,7 +4109,7 @@ private:
             // ids still in verify are asked too: the solicited copy upgrades a
             // parked unsolicited flood of the same receipt (context fetch,
             // longer patience) instead of letting it expire as "unresolved"
-            for (const auto& id : r.ids) if (!m_cache.count(id)) need.push_back(id);
+            for (const auto& id : r.ids) if (!m_cache.count(id) && !refused(id)) need.push_back(id);   // R1: never re-ask a refused id
         }
         for (std::size_t i = 0; i < need.size(); i += kCtrlMaxIdsPerFetch) {
             Job f; f.kind = Job::Kind::Frames; f.repair = true; f.key = j->key;
@@ -4095,7 +4198,7 @@ private:
                     {
                         std::lock_guard<std::mutex> ck(m_mtx);
                         for (const auto& id : r.ids) {
-                            if (m_cache.count(id)) { ++cached; continue; }
+                            if (m_cache.count(id) || refused(id)) { ++cached; continue; }   // R1: a refused id is decided
                             if (!m_inflight.count(id)) idle.push_back(id);
                         }
                     }
@@ -4631,6 +4734,10 @@ private:
     std::vector<Admitted> m_drops;   // ★ DROPS: admitted raindrops (m_amtx)
     std::unordered_set<bytes32, Bytes32Hash> m_drop_seen;   // ★ DROPS dedup (m_mtx)
     mutable std::mutex m_drmtx;                                       // HOLD-ROUND-2 (C2): leaf lock
+    // ★ R1 ADMISSION (F3): the refused memo (bounded FIFO). m_rfmtx is a LEAF lock.
+    std::unordered_map<bytes32, RefusedRec, Bytes32Hash> m_refused;
+    std::deque<bytes32> m_refused_order;
+    mutable std::mutex m_rfmtx;
     std::unordered_set<bytes32, Bytes32Hash> m_drop_refused;         // fetched, not admissible here (bounded FIFO)
     std::deque<bytes32> m_drop_refused_order;
     std::deque<bytes32> m_drop_order;

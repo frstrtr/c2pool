@@ -910,6 +910,49 @@ if (BUILD_TESTING)
     # DoS budget), the real FinalizeConnect booking the finder's block on the
     # attempt-7 SUFFIX reason, the recompute of its next block, owed_digest at
     # FINALIZE. Red on b261fb1a5 (bans, refused, recompute_mismatch, a split).
+    # ------------------------------------------------------------------
+    #   v37_xmr_admission_relay_kat (RULES RATCHET R1, receipt admission,
+    #     operator ruling 2026-10-03): over loopback TCP with the REAL share
+    #     verdict, a receipt is admitted only on verdict 1 -- the HELLO
+    #     backfill, the raindrop inventory, the repair answer of a won cut,
+    #     a solicited skew verdict; the refused memo; the decided-bad cut.
+    #     RED on the base. Listed in BOTH build.yml --target lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_admission_relay_kat
+        v37_xmr_admission_relay_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_admission_relay_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_admission_relay_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_admission_relay_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_admission_relay_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_admission_relay_kat COMMAND v37_xmr_admission_relay_kat)
+
+    #   v37_xmr_empty_cut_kat (RULES RATCHET R1, receipt admission, F3 EMPTY-CUT):
+    #     the booking of a canonical lane block whose own cut is decided bad
+    #     (no cut, the anchor stays), the held / withheld undecided cases, the
+    #     DROPS range carried, the money independent of the cut. RED on the
+    #     base. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_empty_cut_kat
+        v37_xmr_empty_cut_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_empty_cut_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_empty_cut_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_empty_cut_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_empty_cut_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_empty_cut_kat COMMAND v37_xmr_empty_cut_kat)
+
     add_executable(v37_xmr_hold_round2_kat
         v37_xmr_hold_round2_kat.cpp
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp

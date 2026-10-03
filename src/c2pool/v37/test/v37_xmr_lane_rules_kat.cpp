@@ -7,11 +7,11 @@
 // and must not recognise the other's lane blocks as its own.
 //
 //   A  codec: TLV golden bytes + rules_digest golden for a literal list, the
-//      field table (29 ids, ascending, names), round trip, strict decode
+//      field table (30 ids, ascending, names), round trip, strict decode
 //      (width, order, missing, truncated), an unknown id is kept and named;
 //      the daemon's builder (lane_rules_of) maps every config knob to its field
 //   B  one refusal per parameter: two HELLOs equal except field i (every i in
-//      1..29) -> hello_mismatch starts "LANE_RULES_MISMATCH field=<name_i>
+//      1..30) -> hello_mismatch starts "LANE_RULES_MISMATCH field=<name_i>
 //      ours=<v> theirs=<v>", both directions; three fields -> "+2 more" names
 //      the other two
 //   C  equal lists -> compatible and byte-identical HELLO frames; the frame
@@ -23,6 +23,11 @@
 //      hello_mismatch == "" <=> equal pool_tag; the digest of the list read
 //      back from the HELLO frame is the digest the pool_tag folds; drain_q
 //      0 vs 16 alone flips both
+//
+// RE-PIN (RULES RATCHET R1, receipt admission, operator ruling 2026-10-03):
+// field 30 empty_cut (u8) joins the list: 29 -> 30 fields, the literal TLV
+// 278 -> 281 bytes (+ "1e 01 01"), a new rules_digest golden, the HELLO with
+// the list 521 -> 524 bytes, and the "newer build" unknown id is now 31.
 //
 // Red on master: the header, the HELLO list and the pool_tag fold do not
 // exist (the KAT does not compile); with the list carried but not compared /
@@ -66,6 +71,7 @@ static lr::LaneRules literal_rules() {
     r.fee_version = 0; r.residual_sink_id = b32_of(0x51); r.pool_rules_version = 4; r.owed_demo_amount = 0;
     r.drain_q = 0; r.drain_h_cap = 0; r.drain_rule_version = 0; r.pool_tag_codec = 1;
     r.lane_params_digest = b32_of(0x27); r.enrol_digest = b32_of(0x28); r.spend_floor = 1;
+    r.empty_cut = 1;   // R1 RECEIPT ADMISSION
     return r;
 }
 
@@ -110,22 +116,23 @@ static Hello hello_with(const std::optional<lr::LaneRules>& r, u64 nonce) {
 
 static void suite_codec(Checker& C) {
     std::printf("-- A codec: the TLV list, its digest, strict decode, the builder\n");
-    C(lr::kFieldCount == 29, "A the v1 list has 29 fields");
+    C(lr::kFieldCount == 30, "A the v1 list has 30 fields");
     bool asc = true, named = true;
     for (std::size_t i = 0; i < lr::kFieldCount; ++i) {
         if (lr::kFields[i].id != i + 1) asc = false;
         if (!lr::field_name(lr::kFields[i].id) || std::string(lr::field_name(lr::kFields[i].id)) != lr::kFields[i].name) named = false;
     }
-    C(asc && named, "A ids are 1..29 in table order, every id has its name");
+    C(asc && named, "A ids are 1..30 in table order, every id has its name");
     C(std::string(lr::field_name(1)) == "d_conf" && std::string(lr::field_name(23)) == "drain_q" &&
-      std::string(lr::field_name(27)) == "lane_params_digest" && std::string(lr::field_name(29)) == "spend_floor",
-      "A pinned names: 1 d_conf, 23 drain_q, 27 lane_params_digest, 29 spend_floor");
+      std::string(lr::field_name(27)) == "lane_params_digest" && std::string(lr::field_name(29)) == "spend_floor" &&
+      std::string(lr::field_name(30)) == "empty_cut",
+      "A pinned names: 1 d_conf, 23 drain_q, 27 lane_params_digest, 29 spend_floor, 30 empty_cut");
     const lr::LaneRules r = literal_rules();
     const auto t = lr::encode_tlv(r);
-    C(t.size() == 278, "A the v1 list is 278 bytes (58 B of id|len + 220 B of values): " + std::to_string(t.size()));
+    C(t.size() == 281, "A the v1 list is 281 bytes (60 B of id|len + 221 B of values): " + std::to_string(t.size()));
     golden(C, "A literal TLV", hx(t),
-           "01083c000000000000000208000000000000000003048c0a00000408f00000000000000005010106085031bf00000000000701010808c021000000000000090870080000000000000a01010b01010c04070000000d0801000000000000000e01010f01011008930200000000000011080070c9b28b00000012083c000000000000001304000000001420d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9150404000000160800000000000000001704000000001804000000001904000000001a01011b20bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c931c20d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb21d0101");
-    golden(C, "A literal rules_digest", hx(lr::rules_digest(r)), "92764ec333905fcb40d6afdd3fba483e8fca10c78951180cb6547ee9925061e3");
+           "01083c000000000000000208000000000000000003048c0a00000408f00000000000000005010106085031bf00000000000701010808c021000000000000090870080000000000000a01010b01010c04070000000d0801000000000000000e01010f01011008930200000000000011080070c9b28b00000012083c000000000000001304000000001420d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9150404000000160800000000000000001704000000001804000000001904000000001a01011b20bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c931c20d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb21d01011e0101");
+    golden(C, "A literal rules_digest", hx(lr::rules_digest(r)), "3895471cd8257fd1cd7d65168b166fff961616661b2aa78b5b23d9dc926efbd4");
     lr::LaneRules back; std::string why;
     C(lr::decode_tlv(t, back, &why) && back == r && lr::encode_tlv(back) == t, "A round trip (decode . encode = id, re-encode byte-identical)");
     C(t[0] == 1 && t[1] == 8 && t[2] == 60, "A entry 1 = d_conf, 8 bytes, little-endian 60");
@@ -137,21 +144,21 @@ static void suite_codec(Checker& C) {
     };
     { auto x = t; x[1] = 7; refuse(x, "d_conf with width 7", "width"); }
     { auto x = t; x.pop_back(); refuse(x, "a truncated last value", "runs past"); }
-    { auto x = t; x.push_back(30); refuse(x, "a dangling entry header", "truncated"); }
+    { auto x = t; x.push_back(31); refuse(x, "a dangling entry header", "truncated"); }
     { auto x = t; x[0] = 2; refuse(x, "ids out of order (2 then 2)", "ascending"); }
     { auto x = t; x[0] = 0; refuse(x, "id 0", "ascending"); }
     { std::vector<u8> x(t.begin() + 10, t.end()); refuse(x, "d_conf missing", "d_conf missing"); }
-    // an unknown id (a newer build's field 30) is kept, re-encoded and named
+    // an unknown id (a newer build's field 31) is kept, re-encoded and named
     {
-        auto x = t; x.push_back(30); x.push_back(2); x.push_back(0xAB); x.push_back(0xCD);
+        auto x = t; x.push_back(31); x.push_back(2); x.push_back(0xAB); x.push_back(0xCD);
         lr::LaneRules nr; std::string w;
         const bool ok = lr::decode_tlv(x, nr, &w);
-        C(ok && nr.unknown.size() == 1 && nr.unknown[0].first == 30 && lr::encode_tlv(nr) == x,
-          "A an unknown id 30 is kept and re-encoded byte-identical");
+        C(ok && nr.unknown.size() == 1 && nr.unknown[0].first == 31 && lr::encode_tlv(nr) == x,
+          "A an unknown id 31 is kept and re-encoded byte-identical");
         const std::string m = lr::lane_rules_mismatch(r, nr);
         std::printf("    %s\n", m.c_str());
-        C(lr::is_lane_rules_mismatch(m) && m.find("field=rules_unknown_id 30") != std::string::npos && m.find("newer build") != std::string::npos,
-          "A a peer with an unknown field: LANE_RULES_MISMATCH field=rules_unknown_id 30 (a newer build)");
+        C(lr::is_lane_rules_mismatch(m) && m.find("field=rules_unknown_id 31") != std::string::npos && m.find("newer build") != std::string::npos,
+          "A a peer with an unknown field: LANE_RULES_MISMATCH field=rules_unknown_id 31 (a newer build)");
         C(lr::rules_digest(nr) != lr::rules_digest(r), "A the unknown field moves the digest (and the pool_tag)");
     }
     // the daemon's builder: every knob lands in its field
@@ -195,7 +202,7 @@ static void suite_codec(Checker& C) {
 }
 
 static void suite_refusal(Checker& C) {
-    std::printf("-- B one refusal per parameter (every field 1..29, both directions)\n");
+    std::printf("-- B one refusal per parameter (every field 1..30, both directions)\n");
     const lr::LaneRules base = literal_rules();
     const Hello ours = hello_with(base, 1);
     int named = 0, both = 0;
@@ -217,8 +224,8 @@ static void suite_refusal(Checker& C) {
             std::printf("    field %2u %-19s -> \"%s\"\n", unsigned(f.id), f.name, m.substr(0, 110).c_str());
         if (!ok) C(false, std::string("B field ") + f.name + " is refused by name with both values");
     }
-    C(named == 29, "B all 29 fields are refused BY NAME with both values (" + std::to_string(named) + "/29)");
-    C(both == 29, "B ... in both directions, values swapped (" + std::to_string(both) + "/29)");
+    C(named == 30, "B all 30 fields are refused BY NAME with both values (" + std::to_string(named) + "/30)");
+    C(both == 30, "B ... in both directions, values swapped (" + std::to_string(both) + "/30)");
     // three fields at once: the first is named in full, the other two in the tail
     lr::LaneRules t3 = base; t3.d_conf = 61; t3.output_cap = 16; t3.drain_q = 16;
     const std::string m3 = hello_mismatch(ours, hello_with(t3, 3));
@@ -245,12 +252,12 @@ static void suite_frames(Checker& C) {
     Hello a2 = a; a2.node_nonce = 8;
     C(encode_hello(a2) == encode_hello(b), "C equal lists -> byte-identical HELLO frames");
     const auto f = encode_hello(a);
-    C(f.size() == kHelloBytesPoolGenesis + 1 + 2 + 278 + 66, "C HELLO with the list = 174 + flag 1 + len 2 + 278 + epoch trailer 66 = 521 B (" +
+    C(f.size() == kHelloBytesPoolGenesis + 1 + 2 + 281 + 66, "C HELLO with the list = 174 + flag 1 + len 2 + 281 + epoch trailer 66 = 524 B (" +
                                                             std::to_string(f.size()) + ")");
     Hello back; std::string why;
     Hello a_rx = a; a_rx.epochs = hello_epochs_of(a);   // the decoder fills the epoch list it read
     C(decode_hello(f, back, &why) && back == a_rx && back.rules && *back.rules == r && back.epochs.size() == 1 && back.epoch_cur == 1,
-      "C the 521-byte HELLO round-trips (list + the one-entry epoch trailer kept)");
+      "C the 524-byte HELLO round-trips (list + the one-entry epoch trailer kept)");
     C(lr::rules_digest(*back.rules) == lr::rules_digest(r), "C the digest of the list read back == the sender's digest");
     Hello legacy = a; legacy.rules.reset();
     const auto f174 = encode_hello(legacy);
@@ -263,7 +270,7 @@ static void suite_frames(Checker& C) {
       "C the 142- and 102-byte HELLOs still decode (rules = none)");
     Hello nogen = a; nogen.pool->genesis.reset();
     C(encode_hello(nogen).size() == kHelloBytesPoolId, "C no genesis -> no list on the wire (142 B)");
-    auto bad_len = f; bad_len[kHelloBytesPoolGenesis + 1] ^= 1;   // rules_len low byte
+    auto bad_len = f; bad_len[kHelloBytesPoolGenesis + 1] ^= 0x80;   // rules_len low byte (R1 re-pin: 281 ^ 1 = 280 parses as a shorter list)
     C(!decode_hello(bad_len, back, &why) && why == "hello: rules length mismatch", "C a wrong rules_len -> \"" + why + "\"");
     auto bad_flag = f; bad_flag[kHelloBytesPoolGenesis] = 2;
     C(!decode_hello(bad_flag, back, &why), "C an unknown enrol flag -> refused (" + why + ")");

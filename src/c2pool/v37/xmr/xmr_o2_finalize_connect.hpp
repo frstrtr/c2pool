@@ -564,6 +564,11 @@ public:
         // now), next to `relay_repair_held*`.
         std::uint64_t booking_stall_alarm = 0;
         std::uint64_t undecided_held = 0, undecided_held_resolved = 0, undecided_held_now = 0;
+        // ★ R1 RECEIPT ADMISSION (F3): held lane blocks whose winner-side order no
+        // connected peer serves (the cut-pending reason carries the "withheld:"
+        // marker, xmr_cut_admission.hpp): undecided, never refused on a timeout,
+        // counted apart so an operator sees a withholding finder, not a slow peer.
+        std::uint64_t withheld_cut_held = 0, withheld_cut_held_now = 0;
         std::uint64_t late_booked_post_finalize = 0;
         std::uint64_t stale_pending_rebooked = 0;   // RACE-DIVERGE: stale m_pending entries retired at a one-tick re-delivery
         // R5: lane blocks whose 03 root matched no candidate digest, kept in the
@@ -1477,6 +1482,7 @@ private:
                  why.find("not carried yet") != std::string::npos));
     }
     void note_relay_held_resolved(const std::string& bid, const char* how) {
+        if (m_withheld_held.erase(bid)) m_stats.withheld_cut_held_now = m_withheld_held.size();   // R1 (F3)
         if (m_undecided_held.erase(bid)) {
             ++m_stats.undecided_held_resolved; m_stats.undecided_held_now = m_undecided_held.size();
             say(std::string("cba: undecided HOLD of lane block ") + short_bid(bid) + " RESOLVED: " + how +
@@ -1509,6 +1515,14 @@ private:
         }
         if (undecided && m_undecided_held.insert(bid).second) {   // HOLD-ROUND-2 (A): a non-relay cut-pending reason
             ++m_stats.undecided_held; m_stats.undecided_held_now = m_undecided_held.size();
+        }
+        // ★ R1 RECEIPT ADMISSION (F3): a withheld order (no connected peer serves it)
+        if (why.rfind("cut-pending:", 0) == 0 && why.find("withheld:") != std::string::npos && m_withheld_held.insert(bid).second) {
+            ++m_stats.withheld_cut_held; m_stats.withheld_cut_held_now = m_withheld_held.size();
+            say("cba-ALARM withheld_cut_held: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) +
+                " -- no connected peer serves the order of its credit cut (" + why.substr(0, 120) + "). UNDECIDED: HELD, never "
+                "refused on a timeout; it books (or is booked EMPTY-CUT) once the order is served. withheld_cut_held_now=" +
+                std::to_string(m_withheld_held.size()));
         }
         if (fresh || m_stats.held_alarms % 10 == 0)
             say("cba-ALARM HELD: chain lane block " + short_bid(bid) + " h=" + std::to_string(h) + " is still " +
@@ -2187,6 +2201,7 @@ private:
     void clean_booking_state(const std::string& bid) {
         m_retry.erase(bid); m_retry_n.erase(bid); m_deferred.erase(bid); m_root_unknown_bids.erase(bid); m_first_cursor.erase(bid);
         if (m_held.erase(bid)) { ++m_stats.held_resolved; m_stats.held_now = m_held.size(); }
+        if (m_withheld_held.erase(bid)) m_stats.withheld_cut_held_now = m_withheld_held.size();   // R1 (F3)
     }
     void archive_for_converge(const std::string& utc) {
         std::vector<std::string> files = { m_node.store_dir() + "/settle.img" };
@@ -2882,6 +2897,7 @@ private:
     bool                              m_held_lag = false;    //  HELD-LAG (non-terminal)
     std::set<std::string>             m_relay_held;          // RC-HOLD: held bids whose cause is a relay repair in flight
     std::set<std::string>             m_undecided_held;      // HOLD-ROUND-2 (A): held bids on any other cut-pending reason
+    std::set<std::string>             m_withheld_held;       // R1 (F3): held bids whose cut order no connected peer serves
     std::function<void(bool, const std::string&)> m_iso_hook;
     std::function<void(bool, const std::string&)> m_contested_hook;   // rework-3: CONTESTED -> lane suspend
     std::uint64_t                     m_tick = 0;
