@@ -300,6 +300,15 @@ struct SharechainConfig
     ///                                     65536. Pinned against the
     ///                                     share_precheck.hpp constants by
     ///                                     static_assert there.
+    ///   full_misbehaviour_grading      -> peer_misbehaviour.hpp applies() /
+    ///                                     classify_verify_failure: which
+    ///                                     receive-path offences are charged
+    ///                                     to the sending peer (#1829).
+    ///                                     Public: only the two the
+    ///                                     p2pool-dash oracle itself answers
+    ///                                     with a disconnect (invalid PoW /
+    ///                                     target, structural field checks).
+    ///                                     DASH v36 network: every offence.
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -312,6 +321,7 @@ struct SharechainConfig
         uint32_t max_shares_per_shares_msg;
         uint32_t max_shares_per_sharereply;
         uint32_t max_share_wire_bytes;
+        bool     full_misbehaviour_grading;
     };
 
     static constexpr ShareProfile PUBLIC_PROFILE{
@@ -325,6 +335,7 @@ struct SharechainConfig
         /*max_shares_per_shares_msg=*/13162,   // (3145728 - 3) / 239
         /*max_shares_per_sharereply=*/13162,
         /*max_share_wire_bytes=*/3145728,
+        /*full_misbehaviour_grading=*/false,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
         /*target_share_version=*/36,
@@ -337,6 +348,7 @@ struct SharechainConfig
         /*max_shares_per_shares_msg=*/64,
         /*max_shares_per_sharereply=*/1001,
         /*max_share_wire_bytes=*/65536,
+        /*full_misbehaviour_grading=*/true,
     };
     // The public profile is master's protocol pair, byte for byte.
     static_assert(PUBLIC_PROFILE.advertised_protocol_version == ADVERTISED_PROTOCOL_VERSION &&
