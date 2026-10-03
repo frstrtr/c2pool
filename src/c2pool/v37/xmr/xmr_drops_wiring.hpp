@@ -1174,6 +1174,17 @@ public:
         if (!bytes_read) return LaneProbe::Undecidable;
         return (is_lane || has_lane_tag) ? LaneProbe::Lane : LaneProbe::NotLane;
     }
+    // ★ R1 RECEIPT ADMISSION (F3, xmr_cut_admission.hpp): a lane block booked
+    // EMPTY-CUT composed no DROPS from its cut, so it is no predecessor for the
+    // harvest range: the next decided lane block's range reaches back over it
+    // and harvests its raindrops (decided before that block is booked: the
+    // booking is chain-ordered, R6).
+#define C2POOL_XMR_DROPS_EMPTY_CUT_SKIP 1
+    static LaneProbe probe_of(bool bytes_read, bool is_lane, bool has_lane_tag, bool empty_cut) {
+        if (!bytes_read) return LaneProbe::Undecidable;
+        if (empty_cut) return LaneProbe::NotLane;
+        return probe_of(true, is_lane, has_lane_tag);
+    }
     struct WalkStats { std::uint64_t decoded = 0, none = 0, undecided = 0, row_missing = 0; };
     using RowFn = std::function<std::optional<std::string>(std::uint64_t height)>;
     using ProbeFn = std::function<LaneProbe(const std::string& bid)>;

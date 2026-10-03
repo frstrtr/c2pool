@@ -195,10 +195,10 @@ struct LaneFixture {
         ledger.seed_owed(::v37::xmr::make_xmr_sub(P1, P2), 1'000'000'000ull);
         scfg.h_min = 0; scfg.output_cap = 0;
         scfg.set_residual_sink_std(P4, P2);
-        // POOL-LINEAGE: every lane coinbase the daemon builds carries its V37P
-        // pool tag; without any V37 field the coinbase has the merge-mining-pool
-        // shape and is decided not-lane (MM-PARSE-2).
-        ::v37::bytes32 tag; tag.fill(0xA1); scfg.pool_tag = tag;
+        // RULES RATCHET: every lane coinbase the daemon builds carries its V37P v2
+        // pool field at [4..49); without any V37 field the coinbase has the
+        // merge-mining-pool shape and is decided not-lane (MM-PARSE-2).
+        ::v37::bytes32 tag; tag.fill(0xA1); scfg.pool_field = c2pool::v37n::xmr::credit::PoolField{tag, 1, 1};
     }
 };
 class CannedTransport final : public ::c2pool::xmr::node::IMonerodTransport {

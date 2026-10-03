@@ -422,8 +422,8 @@ int main() {
         rl::BlockWon x; std::string why;
         C(!rl::decode_block_won(f3, x, &why, false) && why == "block_won: wrong length", "DS8 a flip-0 decoder refuses v0x03: " + why);
         C(rl::kBlockWonDropsLive == ::c2pool::v37n::kActivateConsensusV1 &&
-          rl::kXmrPoolRulesVersion == (::c2pool::v37n::kActivateConsensusV1 ? 4u : 2u),
-          "DS8 v0x03 only under the flip; pool rules v4 (flip 1) / v2 (flip 0, unchanged)");
+          rl::kXmrPoolRulesVersion == (::c2pool::v37n::kActivateConsensusV1 ? 5u : 2u),
+          "DS8 v0x03 only under the flip; pool rules v5 (flip 1, RULES RATCHET R1) / v2 (flip 0, unchanged)");
     }
 #else
     C(false, "DS8 no v0x03 on the base");

@@ -490,8 +490,8 @@ void f11_anchor() {
               "a FOUND event round-trips its credit cut (schema 2)");
         SettleEvent old; old.kind = SettleEvKind::Found; old.bid = "b0"; old.credit = Amounts{{k, 5}};
         const std::string raw = old.serialize();
-        CHECK(static_cast<std::uint8_t>(raw[0]) == 1 && !SettleEvent::deserialize(raw).has_cut,
-              "a cutless event keeps the schema-1 bytes and reads back without a cut");
+        CHECK(static_cast<std::uint8_t>(raw[0]) == 7 && !SettleEvent::deserialize(raw).has_cut,
+              "a cutless event is a ver-7 record (RULES RATCHET: every record ver 7) and reads back without a cut");
         c2pool::v37n::xmr::MemSettleStore store;
         {
             auto batch = store.batch();

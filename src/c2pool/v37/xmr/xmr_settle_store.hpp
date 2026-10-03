@@ -82,7 +82,7 @@ struct ISettleStore {
 // Records: u8 ver=1 ‖ payload. Ints little-endian. Fail-closed on a short read.
 // ---------------------------------------------------------------------------
 namespace store_codec {
-constexpr std::uint8_t SCHEMA_VER = 6;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments; 5: + the DROPS window entries; 6: + the drain rule's lane height and gross set
+constexpr std::uint8_t SCHEMA_VER = 7;   // 2: a FOUND event may carry the block's credit cut (ANCHOR); 3: + the DROPS-due fields; 4: + the raindrop enrolments; 5: + the DROPS window entries; 6: + the drain rule's lane height and gross set; 7 (RULES RATCHET R1, the flag day): every record ver 7 -- kinds 1-3 = the schema-6 layout + the ballot box; kind 4 = the RATCHET record (its own 55-byte layout); the genesis record (GenesisRec v2, w6_persistence.hpp) under k_genesis
 
 inline std::string chain_fmt(::v37::ChainId c) {
     char b[16];
@@ -101,12 +101,17 @@ inline std::string k_evt(::v37::ChainId c, std::uint64_t seq) {
     return "v37s:levt:" + chain_fmt(c) + ":" + seq_fmt(seq);
 }
 inline std::string k_evt_prefix(::v37::ChainId c){ return "v37s:levt:" + chain_fmt(c) + ":"; }
+// RULES RATCHET (spec sec. 3.5): the pool's GenesisRec v2 (pool_id, the genesis
+// inputs, the deployment list), written at every start, checked at every open.
+inline std::string k_genesis(::v37::ChainId c)   { return "v37s:genesis:" + chain_fmt(c); }
 
 // serialize a u64 LE ---------------------------------------------------------
 inline void put_u64(std::string& s, std::uint64_t x) {
     for (int i = 0; i < 8; ++i) s.push_back(char((x >> (8 * i)) & 0xff));
 }
 inline void put_i64(std::string& s, long long v) { put_u64(s, static_cast<std::uint64_t>(v)); }
+inline void put_u16(std::string& s, std::uint16_t x) { for (int i = 0; i < 2; ++i) s.push_back(char((x >> (8 * i)) & 0xff)); }
+inline void put_u32(std::string& s, std::uint32_t x) { for (int i = 0; i < 4; ++i) s.push_back(char((x >> (8 * i)) & 0xff)); }
 inline void put_amounts(std::string& s, const Amounts& m) {
     put_u64(s, m.size());
     for (const auto& [k, v] : m) {   // std::map canonical key order
@@ -128,6 +133,16 @@ struct Reader {
         if (o + n > s.size()) throw std::runtime_error("settle-store: torn record (short read)");
     }
     std::uint8_t u8()  { need(1); return std::uint8_t(s[o++]); }
+    std::uint16_t u16() {
+        need(2); std::uint16_t x = 0;
+        for (int i = 0; i < 2; ++i) x |= std::uint16_t(std::uint8_t(s[o++])) << (8 * i);
+        return x;
+    }
+    std::uint32_t u32() {
+        need(4); std::uint32_t x = 0;
+        for (int i = 0; i < 4; ++i) x |= std::uint32_t(std::uint8_t(s[o++])) << (8 * i);
+        return x;
+    }
     std::uint64_t u64() {
         need(8); std::uint64_t x = 0;
         for (int i = 0; i < 8; ++i) x |= std::uint64_t(std::uint8_t(s[o++])) << (8 * i);
@@ -150,10 +165,20 @@ struct Reader {
 } // namespace store_codec
 
 // ---------------------------------------------------------------------------
-// The three persisted ledger-event kinds (W6 EvKind). Written write-ahead by
-// XmrNode as the OwedLedger mutates; replayed in seq order on recovery.
+// The persisted ledger-event kinds (W6 EvKind + RULES RATCHET kind 4). Written
+// write-ahead by XmrNode as the OwedLedger mutates; replayed in seq order on
+// recovery. Schema 7 (the R1 flag day): every record is written as ver 7 --
+//   kinds 1-3: the schema-6 layout (every section present, flags byte, lane section)
+//              + box section: u8 n | n x (u16 ballot | b32 weight LE)   (ascending ballot;
+//              n = 0 for FINALIZE / ORPHAN, for a debit-only FOUND and before R2 fills it)
+//   kind 4   : u8 ver 7 | u8 kind 4 | u32 epoch_no | b32 rules_digest | u64 H_act | u8 akind (1 signal | 2 height) | u64 h_L   (55 B)
+// deserialize branches on `kind` right after the version byte; ver > 7 is
+// "record schema newer than reader" (fail-closed); a kind-4 record for an epoch
+// this build's ledger table lacks refuses the open (RecoveryDriver).
 // ---------------------------------------------------------------------------
-enum class SettleEvKind : std::uint8_t { Found = 1, Finalize = 2, Orphan = 3 };
+enum class SettleEvKind : std::uint8_t { Found = 1, Finalize = 2, Orphan = 3, Ratchet = 4 };
+using BallotBoxRec = std::map<std::uint16_t, ::v37::U256>;   // the FOUND box (settle::BallotBox)
+constexpr std::size_t kRatchetRecordBytes = 1 + 1 + 4 + 32 + 8 + 1 + 8;   // 55
 
 struct SettleEvent {
     SettleEvKind  kind = SettleEvKind::Found;
@@ -187,13 +212,32 @@ struct SettleEvent {
     bool          has_lane = false;
     std::uint64_t lane_height = 0;
     std::set<::v37::bytes32> lane_gross;
+    // FOUND, RULES RATCHET (schema 7): the block's ballot box (window weight per
+    // ballot word at its cut). Empty until R2 fills it; never digested.
+    BallotBoxRec  box;
+    // RATCHET (kind 4, schema 7): the epoch that came into force.
+    std::uint32_t  epoch_no = 0;
+    ::v37::bytes32 rules_digest{};
+    std::uint64_t  H_act = 0;
+    std::uint8_t   akind = 0;          // 1 signal | 2 height
+    std::uint64_t  h_L = 0;
 
     std::string serialize() const {
         std::string s;
-        const bool win = has_drops && !drops_window.empty();
-        const bool enrol = has_drops && (!drops_enrol.empty() || win);
-        if (has_lane) {   // schema 6: every section present, then the flags byte and the lane section
-            s.push_back(char(6));
+        if (kind == SettleEvKind::Ratchet) {   // schema 7, kind 4: its own 55-byte layout
+            s.push_back(char(7));
+            s.push_back(char(4));
+            store_codec::put_u32(s, epoch_no);
+            s.append(reinterpret_cast<const char*>(rules_digest.data()), rules_digest.size());
+            store_codec::put_u64(s, H_act);
+            s.push_back(char(akind));
+            store_codec::put_u64(s, h_L);
+            return s;
+        }
+        // schema 7 (the R1 flag day): every record carries every section (the
+        // schema-6 body), then the flags byte, the lane section and the box.
+        {
+            s.push_back(char(7));
             s.push_back(char(static_cast<std::uint8_t>(kind)));
             store_codec::put_str(s, bid);
             store_codec::put_amounts(s, credit);
@@ -207,32 +251,19 @@ struct SettleEvent {
             put_enrol(s);
             put_window(s);
             s.push_back(char(has_drops ? 1 : 0));
-            store_codec::put_u64(s, lane_height);
-            store_codec::put_u64(s, lane_gross.size());
-            for (const auto& k : lane_gross) s.append(reinterpret_cast<const char*>(k.data()), k.size());
+            store_codec::put_u64(s, has_lane ? lane_height : 0);
+            store_codec::put_u64(s, has_lane ? lane_gross.size() : 0);
+            if (has_lane) for (const auto& k : lane_gross) s.append(reinterpret_cast<const char*>(k.data()), k.size());
+            s.push_back(char(has_lane ? 1 : 0));   // schema 7: the lane flag (schema 6 implied it by the version)
+            s.push_back(char(static_cast<std::uint8_t>(box.size() > 255 ? 255 : box.size())));
+            std::size_t n = 0;
+            for (const auto& [ballot, w] : box) {   // std::map: ascending ballot
+                if (n++ >= 255) break;
+                store_codec::put_u16(s, ballot);
+                for (int i = 0; i < 4; ++i) store_codec::put_u64(s, w.v[i]);   // U256 LE
+            }
             return s;
         }
-        s.push_back(char(win ? std::uint8_t{5} : enrol ? std::uint8_t{4} : has_drops ? std::uint8_t{3} : has_cut ? std::uint8_t{2} : std::uint8_t{1}));
-        s.push_back(char(static_cast<std::uint8_t>(kind)));
-        store_codec::put_str(s, bid);
-        store_codec::put_amounts(s, credit);
-        store_codec::put_amounts(s, payout);
-        store_codec::put_u64(s, bin_height);
-        if (has_cut || has_drops) {
-            s.push_back(char(has_cut ? 1 : 0));
-            if (has_cut) {
-                store_codec::put_u64(s, cut_pos);
-                store_codec::put_str(s, cut_spine);
-            }
-        }
-        if (has_drops) {   // schema 3
-            store_codec::put_amounts(s, drops_deposit);
-            s.push_back(char(drops_claim ? 1 : 0));
-            store_codec::put_amounts(s, drops_claimed);
-        }
-        if (enrol) put_enrol(s);    // schema 4
-        if (win) put_window(s);     // schema 5
-        return s;
     }
     void put_enrol(std::string& s) const {
         store_codec::put_u64(s, drops_enrol.size());
@@ -258,7 +289,20 @@ struct SettleEvent {
         if (ver > store_codec::SCHEMA_VER)
             throw std::runtime_error("settle-store: record schema newer than reader");
         SettleEvent e;
-        e.kind = static_cast<SettleEvKind>(r.u8());
+        const std::uint8_t kind = r.u8();
+        if (kind == static_cast<std::uint8_t>(SettleEvKind::Ratchet)) {   // schema 7, kind 4
+            if (ver < 7) throw std::runtime_error("settle-store: RATCHET record under a pre-7 schema");
+            e.kind = SettleEvKind::Ratchet;
+            e.epoch_no = r.u32();
+            e.rules_digest = r.b32();
+            e.H_act = r.u64();
+            e.akind = r.u8();
+            e.h_L = r.u64();
+            r.expect_end();
+            return e;
+        }
+        if (kind < 1 || kind > 3) throw std::runtime_error("settle-store: unknown event kind " + std::to_string(kind));
+        e.kind = static_cast<SettleEvKind>(kind);
         e.bid = r.str();
         e.credit = r.amounts();
         e.payout = r.amounts();
@@ -302,6 +346,17 @@ struct SettleEvent {
             e.lane_height = r.u64();
             const std::uint64_t n = r.u64();
             for (std::uint64_t i = 0; i < n; ++i) e.lane_gross.insert(r.b32());
+        }
+        if (ver >= 7) {   // RULES RATCHET: the lane flag, then the ballot box
+            e.has_lane = (r.u8() & 1) != 0;
+            if (!e.has_lane) { e.lane_height = 0; e.lane_gross.clear(); }
+            const std::uint8_t n = r.u8();
+            for (std::uint8_t i = 0; i < n; ++i) {
+                const std::uint16_t ballot = r.u16();
+                ::v37::U256 w;
+                for (int k = 0; k < 4; ++k) w.v[k] = r.u64();
+                e.box[ballot] = w;
+            }
         }
         r.expect_end();
         return e;
@@ -517,6 +572,23 @@ public:
                             ledger.on_block_finalized(e.bid, e.bin_height); break;  // F1
                         case SettleEvKind::Orphan:
                             ledger.on_block_orphaned(e.bid, e.payout); break;
+                        case SettleEvKind::Ratchet: {   // RULES RATCHET: replayed at its position (write-ahead, spec sec. 3.3 / 3.6)
+                            const auto* tab = ledger.epochs();
+                            const std::uint32_t known = tab ? tab->epoch_max() : 1u;
+                            if (!tab || e.epoch_no > known)
+                                throw std::runtime_error("settle-store: RATCHET for epoch " + std::to_string(e.epoch_no) +
+                                                         "; this build knows <= " + std::to_string(known) + "; upgrade");
+                            if (!ledger.apply_ratchet(e.epoch_no)) {
+                                // The row exists but is not LOCKED_IN above epoch_cur: re-derive the
+                                // lock-in from the record (the decision rode HELLO / the tally; the
+                                // record is the write-ahead truth) and apply.
+                                if (!ledger.lock_in_epoch(e.epoch_no, e.h_L, e.H_act) || !ledger.apply_ratchet(e.epoch_no))
+                                    throw std::runtime_error("settle-store: RATCHET for epoch " + std::to_string(e.epoch_no) +
+                                                             " cannot be applied at its position (epoch_cur " +
+                                                             std::to_string(ledger.epoch_cur()) + ")");
+                            }
+                            break;
+                        }
                     }
                     if (after_event) after_event(ledger);
                     if (after_event_ev) after_event_ev(ledger, e);

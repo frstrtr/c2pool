@@ -214,26 +214,30 @@ static void d3_digest() {
 
 // ── D4: settle store schema 3 ────────────────────────────────────────────────
 static void d4_store() {
-    std::printf("== D4. settle store: schema 3 carries the drops fields; schema 1/2 unchanged ==\n");
+    // RULES RATCHET R1 (schema 7, the flag day): EVERY record is written as ver 7 with every
+    // section present (the schema-6 body + the lane flag + the ballot box); the drops fields
+    // round-trip exactly as before. Re-pinned from the schema-1/2/3 version bytes.
+    std::printf("== D4. settle store: every record ver 7; the drops fields round-trip ==\n");
     xs::SettleEvent e; e.kind = xs::SettleEvKind::Found; e.bid = "B1"; e.credit = {{Y, 1000}}; e.payout = {{Z, 3}};
     const std::string s1 = e.serialize();
-    CHECK(!s1.empty() && s1[0] == 1, "no cut, no drops: schema-1 record (first byte %d)", s1.empty() ? -1 : (int)s1[0]);
+    CHECK(!s1.empty() && s1[0] == 7 && !xs::drops_of(xs::SettleEvent::deserialize(s1)) && !xs::anchor_of(xs::SettleEvent::deserialize(s1)),
+          "no cut, no drops: a ver-7 record with empty sections (first byte %d)", s1.empty() ? -1 : (int)s1[0]);
     st::AnchorCut cut; cut.next_pos = 42; cut.spine = key(0x77);
     xs::set_cut(e, cut);
     const std::string s2 = e.serialize();
-    CHECK(s2[0] == 2, "cut, no drops: schema-2 record (first byte %d)", (int)s2[0]);
+    CHECK(s2[0] == 7 && xs::anchor_of(xs::SettleEvent::deserialize(s2)) == cut, "cut, no drops: ver 7, the cut round-trips (first byte %d)", (int)s2[0]);
 #if defined(C2POOL_V37_DROPS_DUE)
     st::DropsFound d; d.deposit = {{X, 500}, {Y, -900}}; d.claim = true; d.claimed = {{X, 11}};
     xs::set_drops(e, d);
     const std::string s3 = e.serialize();
     const auto r = xs::SettleEvent::deserialize(s3);
-    CHECK(s3[0] == 3 && xs::drops_of(r) && *xs::drops_of(r) == d && xs::anchor_of(r) == cut,
-          "cut + drops: schema-3 record round-trips (first byte %d)", (int)s3[0]);
+    CHECK(s3[0] == 7 && xs::drops_of(r) && *xs::drops_of(r) == d && xs::anchor_of(r) == cut,
+          "cut + drops: the ver-7 record round-trips (first byte %d)", (int)s3[0]);
     xs::SettleEvent n; n.kind = xs::SettleEvKind::Found; n.bid = "B2"; xs::set_drops(n, d);
     const auto rn = xs::SettleEvent::deserialize(n.serialize());
     CHECK(xs::drops_of(rn) && *xs::drops_of(rn) == d && !xs::anchor_of(rn), "drops without a cut round-trips");
     xs::set_drops(n, st::DropsFound{});
-    CHECK(n.serialize()[0] == 1, "an empty DropsFound writes no drops section (schema 1)");
+    CHECK(n.serialize()[0] == 7 && !xs::drops_of(xs::SettleEvent::deserialize(n.serialize())), "an empty DropsFound: ver 7, has_drops 0 (no drops read back)");
 #else
     CHECK(false, "no schema-3 drops fields on the base");
 #endif
@@ -455,7 +459,7 @@ static void d8_window() {
     xs::set_drops(ev, d1);
     const std::string blob = ev.serialize();
     const auto back = xs::SettleEvent::deserialize(blob);
-    CHECK(blob[0] == 5 && xs::drops_of(back) && *xs::drops_of(back) == d1, "W6 store schema 5 round-trips the window entries");
+    CHECK(blob[0] == 7 && xs::drops_of(back) && *xs::drops_of(back) == d1, "W6 store (ver 7) round-trips the window entries");
     xs::MemSettleStore store;
     st::OwedLedger DL(kChain, rules_win());
     st::SettleHW hw;

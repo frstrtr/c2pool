@@ -2,9 +2,10 @@
 // Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
 //
 // GAP-2 KAT helpers: a synthetic, byte-exact Monero block whose coinbase has the
-// v37 lane shape (0x01 R | 0x02 [extra_nonce | (rbind) | pad | V37C tail] |
-// 0x03 MM root), deterministic payees (valid ed25519 points), and a tiny check
-// harness. Test-only.
+// v37 lane shape (0x01 R | 0x02 [extra_nonce | (V37P v2 head | rbind) | pad |
+// V37C tail] | 0x03 MM root), deterministic payees (valid ed25519 points), and
+// a tiny check harness. Test-only. RULES RATCHET R1: a BOUND block carries the
+// 45-byte V37P v2 field at [4..49) and rbind at [49..81) (kRbindOffset).
 #pragma once
 
 #include <array>
@@ -16,6 +17,7 @@
 
 #include <c2pool/v37/xmr/relay/xmr_relay_wire.hpp>
 #include <c2pool/v37/xmr/relay/xmr_receipt_mint.hpp>
+#include <c2pool/v37/xmr/xmr_credit_cut.hpp>        // RULES RATCHET: PoolField / encode_pool_field (the head before rbind)
 #include "impl/xmr/coin/xmr_blob.hpp"
 #include "impl/xmr/coin/xmr_derivation.hpp"
 
@@ -42,6 +44,8 @@ inline void put_varint(std::vector<u8>& b, std::uint64_t v) {
 }
 
 inline bytes32 b32_of(u8 seed) { bytes32 b{}; for (int i = 0; i < 32; ++i) b[i] = static_cast<u8>(seed * 31 + i * 7 + 1); return b; }
+// RULES RATCHET: the pool field every bound synthetic block carries at [4..49) (pool_id = b32_of(0x9d), epoch 1 of 1).
+inline ::c2pool::v37n::xmr::credit::PoolField test_pool_field() { return ::c2pool::v37n::xmr::credit::PoolField{b32_of(0x9d), 1, 1}; }
 
 // A valid XMR_STD payee from a label (s*G for spend and view, like the daemon's owed-demo keys).
 inline ::v37::ScriptRef payee_of(const std::string& label) {
@@ -72,8 +76,9 @@ struct SynthBlock {
     std::uint64_t   height = 0;
 };
 
-// rbind: when non-null, the 0x02 payload is [extra_nonce | rbind | pad | V37C tail]
-// (the SEAM-1 layout); else [extra_nonce | pad | V37C tail] (today's template).
+// rbind: when non-null, the 0x02 payload is [extra_nonce | V37P v2 head 45 | rbind | pad | V37C tail]
+// (the SEAM-1 layout under RULES RATCHET R1: rbind at [49..81)); else
+// [extra_nonce | pad | V37C tail] (an unbound block, no head).
 inline SynthBlock make_block(std::uint64_t height, const bytes32& prev_id, std::uint32_t extra_nonce,
                              const bytes32* rbind, std::size_t n_other_tx, u8 salt) {
     SynthBlock sb; sb.prev_id = prev_id; sb.height = height;
@@ -91,7 +96,11 @@ inline SynthBlock make_block(std::uint64_t height, const bytes32& prev_id, std::
     extra.push_back(0x01); { const bytes32 R = b32_of(static_cast<u8>(salt + 9)); extra.insert(extra.end(), R.begin(), R.end()); }
     std::vector<u8> nonce;
     for (int i = 0; i < 4; ++i) nonce.push_back(static_cast<u8>(extra_nonce >> (8 * i)));
-    if (rbind) nonce.insert(nonce.end(), rbind->begin(), rbind->end());
+    if (rbind) {
+        const auto head = ::c2pool::v37n::xmr::credit::encode_pool_field(test_pool_field());   // RULES RATCHET: V37P v2 at [4..49)
+        nonce.insert(nonce.end(), head.begin(), head.end());
+        nonce.insert(nonce.end(), rbind->begin(), rbind->end());                               // rbind at [49..81)
+    }
     for (int i = 0; i < 3; ++i) nonce.push_back(0);                          // weight padding
     const char tail[4] = {'V', '3', '7', 'C'}; nonce.insert(nonce.end(), tail, tail + 4);
     for (int i = 0; i < 8; ++i) nonce.push_back(static_cast<u8>(i + 1));      // P

@@ -549,7 +549,7 @@ private:
             if (auto src = E.src->with_finder(*f, &why)) {
                 asm_::AssemblyInputs a = E.recipe;
                 a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
-                a.extra_nonce_tail = src->extra_nonce_tail();
+                a.extra_nonce_tail = src->extra_nonce_tail(); a.extra_nonce_head = src->extra_nonce_head();
                 auto t = asm_::XmrBlockAssembler::build(a, &why);
                 asm_::BlockBytes probe;
                 if (!t) { stage = "assembler"; }
@@ -648,7 +648,7 @@ private:
         a.miner   = xmr_md;
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
         a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
-        a.extra_nonce_tail = src->extra_nonce_tail();   // recon(A+B credit): the on-chain credit cut (0x02 tail)
+        a.extra_nonce_tail = src->extra_nonce_tail(); a.extra_nonce_head = src->extra_nonce_head();   // recon(A+B credit): the on-chain credit cut (0x02 tail)
         a.reward_total_field = scfg.commit_total;       // REWARD TOTAL: "V37R" first in the tail
         a.extra_nonce_bind_size = m_bind_size;          // SEAM-1: [extra_nonce 4 | rbind 32] (0 = none)
         a.extra_nonce_bind = m_bind;
@@ -677,7 +677,7 @@ private:
                     src = build_settlement_source(scfg, parent, m_ledger.ledger(), m_owed_pay_of ? m_owed_pay_of : m_ledger.pay_of(), r, &ss_why);
                     if (!src) { w = "settlement source refused (drain fixpoint): " + ss_why; return std::nullopt; }
                     a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
-                    a.extra_nonce_tail = src->extra_nonce_tail();
+                    a.extra_nonce_tail = src->extra_nonce_tail(); a.extra_nonce_head = src->extra_nonce_head();
                     tpl = asm_::XmrBlockAssembler::build(a, &as_why);
                     if (!tpl) { w = "assembler refused (drain fixpoint): " + as_why; return std::nullopt; }
                     return tpl->reward();

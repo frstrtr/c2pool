@@ -38,7 +38,8 @@
 //   payload = "V37L"                      (4 bytes, domain tag; unused
 //                                          elsewhere in the tree)
 //           || u8   evkind                (1 FOUND, 2 FINALIZE, 3 ORPHAN —
-//                                          the same numbering as w6 EvKind)
+//                                          the same numbering as w6 EvKind;
+//                                          4 RATCHET: its own payload, below)
 //           || u32  LE len(bid) || bid    (the lower-hex block id, exactly as
 //                                          keyed in the ledger)
 //           || u64  LE bin_height
@@ -82,6 +83,7 @@
 // differ in leaf_count and root. It is recorded here rather than papered over.
 
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -98,7 +100,7 @@ using ::v37::u64;
 using Amounts = std::map<bytes32, long long>;
 
 // Same numbering as w6_persistence.hpp's EvKind (static_assert'd there).
-enum EvKind : std::uint8_t { EV_FOUND = 1, EV_FINALIZE = 2, EV_ORPHAN = 3 };
+enum EvKind : std::uint8_t { EV_FOUND = 1, EV_FINALIZE = 2, EV_ORPHAN = 3, EV_RATCHET = 4 };
 
 inline constexpr char LEAF_TAG[4] = {'V', '3', '7', 'L'};
 
@@ -143,6 +145,28 @@ inline std::vector<std::uint8_t> leaf_payload(std::uint8_t evkind,
     return p;
 }
 
+// ── RULES RATCHET (spec sec. 3.3, C3): the RATCHET event's leaf ────────────
+//   payload = "V37L" || u8 0x04 || u32 LE epoch_no || b32 rules_digest || u64 LE H_act
+//   leaf    = sha256d(0x00 || payload)
+// The kind-4 payload has no bid, no bin_height, no amaps (a parser branches on
+// evkind right after the tag). Position: the first mutation after the finalize
+// cursor reaches H_act - 1 - D_conf (R3 appends it); nothing node-local enters.
+inline std::vector<std::uint8_t> ratchet_payload(std::uint32_t epoch_no, const bytes32& rules_digest, u64 H_act) {
+    std::vector<std::uint8_t> p;
+    p.reserve(4 + 1 + 4 + 32 + 8);
+    p.insert(p.end(), LEAF_TAG, LEAF_TAG + 4);
+    p.push_back(EV_RATCHET);
+    detail::put_u32(p, epoch_no);
+    p.insert(p.end(), rules_digest.begin(), rules_digest.end());
+    detail::put_u64(p, H_act);
+    return p;
+}
+// The evkind of a leaf payload (0: not a V37L payload).
+inline std::uint8_t leaf_evkind(const std::vector<std::uint8_t>& payload) {
+    if (payload.size() < 5 || std::memcmp(payload.data(), LEAF_TAG, 4) != 0) return 0;
+    return payload[4];
+}
+
 // ── the four canonical mutations ─────────────────────────────────────────
 inline std::vector<std::uint8_t> found_payload(const std::string& bid,
                                                const Amounts& credit,
@@ -183,6 +207,9 @@ public:
     }
     u64 append_orphan_settled(const std::string& bid, const Amounts& settled) {
         return m_log.append(orphan_settled_payload(bid, settled));
+    }
+    u64 append_ratchet(std::uint32_t epoch_no, const bytes32& rules_digest, u64 H_act) {
+        return m_log.append(ratchet_payload(epoch_no, rules_digest, H_act));
     }
 
     bytes32 root() const { return m_log.root(); }

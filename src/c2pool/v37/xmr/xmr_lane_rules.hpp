@@ -28,9 +28,11 @@
 //   * HELLO carries the list in the clear (xmr_relay_wire.hpp), so a refusal
 //     names the parameter and both values: LANE_RULES_MISMATCH field=d_conf
 //     ours=60 theirs=61;
-//   * the on-chain pool_tag folds rules_digest (xmr_pool_tag.hpp), so a node
-//     with other rules classifies our lane blocks Foreign ("not-lane": an
-//     ordinary Monero block) and books nothing of them -- never debit-only.
+//   * (RULES RATCHET R1, 2026-10-03) rules_digest is the per-epoch digest of
+//     the Deployment table (xmr_epoch.hpp): the HELLO carries every epoch's
+//     digest and the RATCHET event commits it. Nothing on chain names a rule
+//     any more: a lane block names its POOL (pool_id, xmr_pool_tag.hpp) and
+//     its EPOCH (V37P v2). The former pool_tag (V37PT2) is retired.
 //
 // A field added later is appended with a new id. A reader that meets an id it
 // does not know keeps it (`unknown`) and refuses the peer by name
@@ -55,7 +57,11 @@ using bytes32 = ::v37::bytes32;
 
 // The field table: id, name, wire type. Ids are frozen once shipped; a new
 // rule takes the next id. 23-25 are the drain rule's placeholders (operator
-// ruling R2): 0 = no drain = master's coinbase bytes.
+// ruling R2): 0 = no drain = master's coinbase bytes. 30 (RULES RATCHET R1,
+// operator ruling 2026-10-03): empty_cut = the receipt-admission rule set --
+// only verdict-1 receipts enter a lane order, the committed receipt test, and
+// a canonical lane block whose own cut is decided bad is booked with no cut
+// (the anchor stays where it is: OwedLedgerRules::empty_cut).
 #define C2POOL_XMR_LANE_RULES_FIELDS(X)              \
     X( 1, d_conf,             std::uint64_t)         \
     X( 2, settle_h_min,       std::uint64_t)         \
@@ -85,7 +91,8 @@ using bytes32 = ::v37::bytes32;
     X(26, pool_tag_codec,     std::uint8_t)          \
     X(27, lane_params_digest, ::v37::bytes32)        \
     X(28, enrol_digest,       ::v37::bytes32)        \
-    X(29, spend_floor,        std::uint8_t)
+    X(29, spend_floor,        std::uint8_t)          \
+    X(30, empty_cut,          std::uint8_t)
 
 // The two fields HELLO already compares through its own refusals (the
 // LaneParams digest and the rule-tagged enrol digest): a list that differs
@@ -113,7 +120,7 @@ inline constexpr FieldInfo kFields[] = {
 #undef C2POOL_LR_INFO
 };
 inline constexpr std::size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
-static_assert(kFieldCount == 29, "the v1 lane-rules list has 29 fields");
+static_assert(kFieldCount == 30, "the v1 lane-rules list has 30 fields (R1: + empty_cut)");
 
 inline const char* field_name(std::uint8_t id) {
     for (const auto& f : kFields)
@@ -303,6 +310,50 @@ inline std::string lane_rules_mismatch(const std::optional<LaneRules>& ours, con
     }
     if (ours->unknown != theirs->unknown) s += " (+ unknown lane-rules ids: a newer build)";
     return s + kLaneRulesWhy;
+}
+
+// ── R-MIN: the minority's balances are protected by the FORMAT (RULES RATCHET, C16) ──
+// What no epoch may change (spec sec. 7), checked fail-closed at three points:
+// (1) at start on the node's own rules, (2) on every Deployment of the compiled
+// epoch table (KAT), (3) in decode_hello on a mainnet peer's TLV (and, R3, on
+// every adopted Deployment whose rules are known).
+//   (a) mainnet: settle_h_min == 0 and owed_demo_amount == 0 ("no premine":
+//       SUM finalW = 0 at the genesis, the empty-ledger owed_digest is a function
+//       of the epoch-1 rules alone);
+//   (b) mainnet: residual_sink_id == the fixed donation identity (`mainnet_sink_id`,
+//       fee::donation_identity(Mainnet), passed by the caller: this header has no
+//       fee-model dependency);
+//   (c) the drain floor wherever a drain exists (drain_rule_version >= 1, every
+//       network; mainnet runs 16 / 64 AT the floor): 16 * drain_q <= 256 and
+//       drain_h_cap >= 64 and drain_h_cap < 16 * drain_q, so Delta_e(dh) >=
+//       R * min(dh, 64) / 256 for every epoch (TLA MinorityPaidNoSlower).
+// "" = constitutional; else R_MIN_VIOLATION field=<name> value=<v> (<why>).
+inline constexpr char kRMinViolation[] = "R_MIN_VIOLATION";
+inline bool is_r_min_violation(const std::string& why) { return why.rfind(kRMinViolation, 0) == 0; }
+inline constexpr std::uint32_t kRMinDrainQMax   = 16;    // 16 * Q <= 256
+inline constexpr std::uint32_t kRMinDrainHCapMin = 64;   // H_cap >= 64
+inline std::string constitutional_check(std::uint8_t network, const LaneRules& r, const bytes32* mainnet_sink_id = nullptr) {
+    auto out = [](const char* field, const std::string& value, const std::string& why) {
+        return std::string(kRMinViolation) + " field=" + field + " value=" + value + " (" + why + ")";
+    };
+    if (network == 0) {
+        if (r.settle_h_min != 0)
+            return out("settle_h_min", std::to_string(r.settle_h_min), "constitutional on mainnet: the owed floor is 0, R-MIN (a); no epoch may change it");
+        if (r.owed_demo_amount != 0)
+            return out("owed_demo_amount", std::to_string(r.owed_demo_amount), "constitutional on mainnet: no premine, R-MIN (a); the genesis creates no balance for anyone");
+        if (mainnet_sink_id && !(r.residual_sink_id == *mainnet_sink_id))
+            return out("residual_sink_id", detail::hex(r.residual_sink_id.data(), 16),
+                       "constitutional on mainnet: the residual sink is the fixed donation identity " + detail::hex(mainnet_sink_id->data(), 16) + ", R-MIN (b)");
+    }
+    if (r.drain_rule_version >= 1) {   // (c): the floor of any drain that exists
+        if (r.drain_q == 0 || 16u * static_cast<std::uint64_t>(r.drain_q) > 256u)
+            return out("drain_q", std::to_string(r.drain_q), "the drain floor is 16 * Q <= 256, R-MIN (c): a slower drain lowers what the minority is paid");
+        if (r.drain_h_cap < kRMinDrainHCapMin)
+            return out("drain_h_cap", std::to_string(r.drain_h_cap), "the drain floor is H_cap >= 64, R-MIN (c): a smaller cap delays the minority's balances");
+        if (static_cast<std::uint64_t>(r.drain_h_cap) >= 16u * static_cast<std::uint64_t>(r.drain_q))
+            return out("drain_h_cap", std::to_string(r.drain_h_cap), "H_cap < 16 * Q (Delta < R: the window always keeps a slot), R-MIN (c)");
+    }
+    return {};
 }
 
 } // namespace c2pool::v37n::xmr::lanerules

@@ -7,11 +7,11 @@
 // and must not recognise the other's lane blocks as its own.
 //
 //   A  codec: TLV golden bytes + rules_digest golden for a literal list, the
-//      field table (29 ids, ascending, names), round trip, strict decode
+//      field table (30 ids, ascending, names), round trip, strict decode
 //      (width, order, missing, truncated), an unknown id is kept and named;
 //      the daemon's builder (lane_rules_of) maps every config knob to its field
 //   B  one refusal per parameter: two HELLOs equal except field i (every i in
-//      1..29) -> hello_mismatch starts "LANE_RULES_MISMATCH field=<name_i>
+//      1..30) -> hello_mismatch starts "LANE_RULES_MISMATCH field=<name_i>
 //      ours=<v> theirs=<v>", both directions; three fields -> "+2 more" names
 //      the other two
 //   C  equal lists -> compatible and byte-identical HELLO frames; the frame
@@ -23,6 +23,11 @@
 //      hello_mismatch == "" <=> equal pool_tag; the digest of the list read
 //      back from the HELLO frame is the digest the pool_tag folds; drain_q
 //      0 vs 16 alone flips both
+//
+// RE-PIN (RULES RATCHET R1, receipt admission, operator ruling 2026-10-03):
+// field 30 empty_cut (u8) joins the list: 29 -> 30 fields, the literal TLV
+// 278 -> 281 bytes (+ "1e 01 01"), a new rules_digest golden, the HELLO with
+// the list 521 -> 524 bytes, and the "newer build" unknown id is now 31.
 //
 // Red on master: the header, the HELLO list and the pool_tag fold do not
 // exist (the KAT does not compile); with the list carried but not compared /
@@ -66,6 +71,7 @@ static lr::LaneRules literal_rules() {
     r.fee_version = 0; r.residual_sink_id = b32_of(0x51); r.pool_rules_version = 4; r.owed_demo_amount = 0;
     r.drain_q = 0; r.drain_h_cap = 0; r.drain_rule_version = 0; r.pool_tag_codec = 1;
     r.lane_params_digest = b32_of(0x27); r.enrol_digest = b32_of(0x28); r.spend_floor = 1;
+    r.empty_cut = 1;   // R1 RECEIPT ADMISSION
     return r;
 }
 
@@ -110,22 +116,23 @@ static Hello hello_with(const std::optional<lr::LaneRules>& r, u64 nonce) {
 
 static void suite_codec(Checker& C) {
     std::printf("-- A codec: the TLV list, its digest, strict decode, the builder\n");
-    C(lr::kFieldCount == 29, "A the v1 list has 29 fields");
+    C(lr::kFieldCount == 30, "A the v1 list has 30 fields");
     bool asc = true, named = true;
     for (std::size_t i = 0; i < lr::kFieldCount; ++i) {
         if (lr::kFields[i].id != i + 1) asc = false;
         if (!lr::field_name(lr::kFields[i].id) || std::string(lr::field_name(lr::kFields[i].id)) != lr::kFields[i].name) named = false;
     }
-    C(asc && named, "A ids are 1..29 in table order, every id has its name");
+    C(asc && named, "A ids are 1..30 in table order, every id has its name");
     C(std::string(lr::field_name(1)) == "d_conf" && std::string(lr::field_name(23)) == "drain_q" &&
-      std::string(lr::field_name(27)) == "lane_params_digest" && std::string(lr::field_name(29)) == "spend_floor",
-      "A pinned names: 1 d_conf, 23 drain_q, 27 lane_params_digest, 29 spend_floor");
+      std::string(lr::field_name(27)) == "lane_params_digest" && std::string(lr::field_name(29)) == "spend_floor" &&
+      std::string(lr::field_name(30)) == "empty_cut",
+      "A pinned names: 1 d_conf, 23 drain_q, 27 lane_params_digest, 29 spend_floor, 30 empty_cut");
     const lr::LaneRules r = literal_rules();
     const auto t = lr::encode_tlv(r);
-    C(t.size() == 278, "A the v1 list is 278 bytes (58 B of id|len + 220 B of values): " + std::to_string(t.size()));
+    C(t.size() == 281, "A the v1 list is 281 bytes (60 B of id|len + 221 B of values): " + std::to_string(t.size()));
     golden(C, "A literal TLV", hx(t),
-           "01083c000000000000000208000000000000000003048c0a00000408f00000000000000005010106085031bf00000000000701010808c021000000000000090870080000000000000a01010b01010c04070000000d0801000000000000000e01010f01011008930200000000000011080070c9b28b00000012083c000000000000001304000000001420d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9150404000000160800000000000000001704000000001804000000001904000000001a01011b20bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c931c20d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb21d0101");
-    golden(C, "A literal rules_digest", hx(lr::rules_digest(r)), "92764ec333905fcb40d6afdd3fba483e8fca10c78951180cb6547ee9925061e3");
+           "01083c000000000000000208000000000000000003048c0a00000408f00000000000000005010106085031bf00000000000701010808c021000000000000090870080000000000000a01010b01010c04070000000d0801000000000000000e01010f01011008930200000000000011080070c9b28b00000012083c000000000000001304000000001420d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9150404000000160800000000000000001704000000001804000000001904000000001a01011b20bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c931c20d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb21d01011e0101");
+    golden(C, "A literal rules_digest", hx(lr::rules_digest(r)), "3895471cd8257fd1cd7d65168b166fff961616661b2aa78b5b23d9dc926efbd4");
     lr::LaneRules back; std::string why;
     C(lr::decode_tlv(t, back, &why) && back == r && lr::encode_tlv(back) == t, "A round trip (decode . encode = id, re-encode byte-identical)");
     C(t[0] == 1 && t[1] == 8 && t[2] == 60, "A entry 1 = d_conf, 8 bytes, little-endian 60");
@@ -137,21 +144,21 @@ static void suite_codec(Checker& C) {
     };
     { auto x = t; x[1] = 7; refuse(x, "d_conf with width 7", "width"); }
     { auto x = t; x.pop_back(); refuse(x, "a truncated last value", "runs past"); }
-    { auto x = t; x.push_back(30); refuse(x, "a dangling entry header", "truncated"); }
+    { auto x = t; x.push_back(31); refuse(x, "a dangling entry header", "truncated"); }
     { auto x = t; x[0] = 2; refuse(x, "ids out of order (2 then 2)", "ascending"); }
     { auto x = t; x[0] = 0; refuse(x, "id 0", "ascending"); }
     { std::vector<u8> x(t.begin() + 10, t.end()); refuse(x, "d_conf missing", "d_conf missing"); }
-    // an unknown id (a newer build's field 30) is kept, re-encoded and named
+    // an unknown id (a newer build's field 31) is kept, re-encoded and named
     {
-        auto x = t; x.push_back(30); x.push_back(2); x.push_back(0xAB); x.push_back(0xCD);
+        auto x = t; x.push_back(31); x.push_back(2); x.push_back(0xAB); x.push_back(0xCD);
         lr::LaneRules nr; std::string w;
         const bool ok = lr::decode_tlv(x, nr, &w);
-        C(ok && nr.unknown.size() == 1 && nr.unknown[0].first == 30 && lr::encode_tlv(nr) == x,
-          "A an unknown id 30 is kept and re-encoded byte-identical");
+        C(ok && nr.unknown.size() == 1 && nr.unknown[0].first == 31 && lr::encode_tlv(nr) == x,
+          "A an unknown id 31 is kept and re-encoded byte-identical");
         const std::string m = lr::lane_rules_mismatch(r, nr);
         std::printf("    %s\n", m.c_str());
-        C(lr::is_lane_rules_mismatch(m) && m.find("field=rules_unknown_id 30") != std::string::npos && m.find("newer build") != std::string::npos,
-          "A a peer with an unknown field: LANE_RULES_MISMATCH field=rules_unknown_id 30 (a newer build)");
+        C(lr::is_lane_rules_mismatch(m) && m.find("field=rules_unknown_id 31") != std::string::npos && m.find("newer build") != std::string::npos,
+          "A a peer with an unknown field: LANE_RULES_MISMATCH field=rules_unknown_id 31 (a newer build)");
         C(lr::rules_digest(nr) != lr::rules_digest(r), "A the unknown field moves the digest (and the pool_tag)");
     }
     // the daemon's builder: every knob lands in its field
@@ -162,7 +169,7 @@ static void suite_codec(Checker& C) {
         in.lane_params_digest = b32_of(0x27);
         const lr::LaneRules d = lr::lane_rules_of(c, in);
         C(d.d_conf == 60 && d.output_cap == 2700 && d.recon_max_root_age == 240 && d.book_deferral == 1 && d.drain_q == 0 &&
-          d.input_weight == 659 && d.coinbase_maturity == 60 && d.pool_tag_codec == 1 &&
+          d.input_weight == 659 && d.coinbase_maturity == 60 && d.pool_tag_codec == 2 &&   // RULES RATCHET: the V37P v2 codec
           d.pool_rules_version == c2pool::v37n::xmr::relay::kXmrPoolRulesVersion && d.lane_params_digest == b32_of(0x27),
           "A builder: default stagenet config -> d_conf 60, cap 2700, root age 240, deferral on, drain 0, constants");
         auto moved = [&](auto edit, const char* field) {
@@ -195,7 +202,7 @@ static void suite_codec(Checker& C) {
 }
 
 static void suite_refusal(Checker& C) {
-    std::printf("-- B one refusal per parameter (every field 1..29, both directions)\n");
+    std::printf("-- B one refusal per parameter (every field 1..30, both directions)\n");
     const lr::LaneRules base = literal_rules();
     const Hello ours = hello_with(base, 1);
     int named = 0, both = 0;
@@ -217,8 +224,8 @@ static void suite_refusal(Checker& C) {
             std::printf("    field %2u %-19s -> \"%s\"\n", unsigned(f.id), f.name, m.substr(0, 110).c_str());
         if (!ok) C(false, std::string("B field ") + f.name + " is refused by name with both values");
     }
-    C(named == 29, "B all 29 fields are refused BY NAME with both values (" + std::to_string(named) + "/29)");
-    C(both == 29, "B ... in both directions, values swapped (" + std::to_string(both) + "/29)");
+    C(named == 30, "B all 30 fields are refused BY NAME with both values (" + std::to_string(named) + "/30)");
+    C(both == 30, "B ... in both directions, values swapped (" + std::to_string(both) + "/30)");
     // three fields at once: the first is named in full, the other two in the tail
     lr::LaneRules t3 = base; t3.d_conf = 61; t3.output_cap = 16; t3.drain_q = 16;
     const std::string m3 = hello_mismatch(ours, hello_with(t3, 3));
@@ -245,10 +252,12 @@ static void suite_frames(Checker& C) {
     Hello a2 = a; a2.node_nonce = 8;
     C(encode_hello(a2) == encode_hello(b), "C equal lists -> byte-identical HELLO frames");
     const auto f = encode_hello(a);
-    C(f.size() == kHelloBytesPoolGenesis + 1 + 2 + 278, "C HELLO with the list = 174 + flag 1 + len 2 + 278 = 455 B (" +
-                                                       std::to_string(f.size()) + ")");
+    C(f.size() == kHelloBytesPoolGenesis + 1 + 2 + 281 + 66, "C HELLO with the list = 174 + flag 1 + len 2 + 281 + epoch trailer 66 = 524 B (" +
+                                                            std::to_string(f.size()) + ")");
     Hello back; std::string why;
-    C(decode_hello(f, back, &why) && back == a && back.rules && *back.rules == r, "C the 455-byte HELLO round-trips (list kept)");
+    Hello a_rx = a; a_rx.epochs = hello_epochs_of(a);   // the decoder fills the epoch list it read
+    C(decode_hello(f, back, &why) && back == a_rx && back.rules && *back.rules == r && back.epochs.size() == 1 && back.epoch_cur == 1,
+      "C the 524-byte HELLO round-trips (list + the one-entry epoch trailer kept)");
     C(lr::rules_digest(*back.rules) == lr::rules_digest(r), "C the digest of the list read back == the sender's digest");
     Hello legacy = a; legacy.rules.reset();
     const auto f174 = encode_hello(legacy);
@@ -261,7 +270,7 @@ static void suite_frames(Checker& C) {
       "C the 142- and 102-byte HELLOs still decode (rules = none)");
     Hello nogen = a; nogen.pool->genesis.reset();
     C(encode_hello(nogen).size() == kHelloBytesPoolId, "C no genesis -> no list on the wire (142 B)");
-    auto bad_len = f; bad_len[kHelloBytesPoolGenesis + 1] ^= 1;   // rules_len low byte
+    auto bad_len = f; bad_len[kHelloBytesPoolGenesis + 1] ^= 0x80;   // rules_len low byte (R1 re-pin: 281 ^ 1 = 280 parses as a shorter list)
     C(!decode_hello(bad_len, back, &why) && why == "hello: rules length mismatch", "C a wrong rules_len -> \"" + why + "\"");
     auto bad_flag = f; bad_flag[kHelloBytesPoolGenesis] = 2;
     C(!decode_hello(bad_flag, back, &why), "C an unknown enrol flag -> refused (" + why + ")");
@@ -274,7 +283,8 @@ static void suite_frames(Checker& C) {
         Hello e = a; e.enrol_set = b32_of(0x28);
         const auto fe = encode_hello(e);
         Hello be;
-        C(fe.size() == f.size() + 32 && decode_hello(fe, be, &why) && be == e, "C with the enrol slot: +32 B, round trip (flag 1)");
+        Hello e_rx = e; e_rx.epochs = hello_epochs_of(e);
+        C(fe.size() == f.size() + 32 && decode_hello(fe, be, &why) && be == e_rx, "C with the enrol slot: +32 B, round trip (flag 1)");
     }
     // D migration
     const std::string m = hello_mismatch(a, legacy), mr = hello_mismatch(legacy, a);
@@ -287,11 +297,9 @@ static void suite_frames(Checker& C) {
 }
 
 static void suite_property(Checker& C) {
-    std::printf("-- E property: HELLO-compatible <=> the same pool_tag (10,000 random perturbations of 1-3 fields)\n");
-    const ::v37::LaneParams lp{};
-    const bytes32 G = b32_of(0x6e);
+    std::printf("-- E property: HELLO-compatible <=> the same rules_digest, the epoch-1 Deployment's (10,000 random perturbations of 1-3 fields)\n");
     const lr::LaneRules base = literal_rules();
-    auto tag_of = [&](const lr::LaneRules& r) { return lineage::pool_tag_for(0, lp, G, lr::rules_digest(r)); };
+    auto tag_of = [&](const lr::LaneRules& r) { return lr::rules_digest(r); };   // RULES RATCHET: the digest HELLO's Deployment carries
     const bytes32 base_tag = tag_of(base);
     const Hello ours = hello_with(base, 1);
     std::uint64_t s = 0x9e3779b97f4a7c15ull;
@@ -309,26 +317,78 @@ static void suite_property(Checker& C) {
         const bool same_tag = tag_of(t) == base_tag;
         ++n;
         if (compatible == same_tag) ++iff_ok;
-        else std::printf("    counterexample %d: compatible=%d same_tag=%d (%s)\n", i, compatible, same_tag, hello_mismatch(ours, rx).c_str());
+        else std::printf("    counterexample %d: compatible=%d same_digest=%d (%s)\n", i, compatible, same_tag, hello_mismatch(ours, rx).c_str());
         if (dec && rx.rules && lr::rules_digest(*rx.rules) == lr::rules_digest(t)) ++readback_ok;
         if (same_tag) ++equal_cases; else ++refused_cases;
     }
     std::printf("    %d cases: %d unchanged lists, %d changed; iff held %d, read-back digest held %d\n", n, equal_cases,
                 refused_cases, iff_ok, readback_ok);
-    C(iff_ok == n, "E hello_mismatch == \"\" <=> equal pool_tag on every case (" + std::to_string(iff_ok) + "/" + std::to_string(n) + ")");
-    C(readback_ok == n, "E the list read back from the HELLO frame has the digest the pool_tag folds (" + std::to_string(readback_ok) + ")");
+    C(iff_ok == n, "E hello_mismatch == \"\" <=> equal rules_digest (the epoch-1 Deployment) on every case (" + std::to_string(iff_ok) + "/" + std::to_string(n) + ")");
+    C(readback_ok == n, "E the list read back from the HELLO frame has the digest its Deployment carries (" + std::to_string(readback_ok) + ")");
     C(equal_cases > 100 && refused_cases > 5000, "E both sides of the iff are exercised");
     lr::LaneRules q = base; q.drain_q = 16;
     const std::string mq = hello_mismatch(ours, hello_with(q, 3));
     C(mq.rfind("LANE_RULES_MISMATCH field=drain_q ours=0 theirs=16", 0) == 0 && tag_of(q) != base_tag,
-      "E drain_q 0 vs 16 alone flips both: the HELLO refusal (" + mq.substr(0, 52) + ") and the pool_tag");
-    // B16: THE DRAIN RULE's flag day, {1,16,64} against master's {0,0,0}: one refusal naming all three, another pool_tag
+      "E drain_q 0 vs 16 alone flips both: the HELLO refusal (" + mq.substr(0, 52) + ") and the rules_digest");
+    // B16: THE DRAIN RULE's flag day, {1,16,64} against master's {0,0,0}: one refusal naming all three, another rules_digest
     lr::LaneRules on = base; on.drain_q = 16; on.drain_h_cap = 64; on.drain_rule_version = 1;
     const std::string m16 = hello_mismatch(hello_with(on, 4), hello_with(base, 5));
     std::printf("    %s\n", m16.c_str());
     C(m16.rfind("LANE_RULES_MISMATCH field=drain_q ours=16 theirs=0 (+2 more: drain_h_cap 64/0, drain_rule_version 1/0)", 0) == 0 &&
       tag_of(on) != base_tag && tag_of(on) != tag_of(q),
-      "E drain {1,16,64} vs {0,0,0}: field=drain_q ours=16 theirs=0 (+2 more: drain_h_cap 64/0, drain_rule_version 1/0), another pool_tag");
+      "E drain {1,16,64} vs {0,0,0}: field=drain_q ours=16 theirs=0 (+2 more: drain_h_cap 64/0, drain_rule_version 1/0), another rules_digest");
+}
+
+// RULES RATCHET R1 (spec sec. 7, C16): R-MIN -- what no epoch may change.
+static void suite_rmin(Checker& C) {
+    std::printf("-- F R-MIN: constitutional_check on mainnet (a, b) and the drain floor wherever a drain exists (c)\n");
+    const bytes32 sink = b32_of(0x51);   // the "mainnet donation identity" of this rig
+    lr::LaneRules m = literal_rules();   // settle_h_min 0, owed_demo_amount 0, residual_sink_id = sink, drain 0/0/0
+    m.drain_q = 16; m.drain_h_cap = 64; m.drain_rule_version = 1;
+    C(lr::constitutional_check(0, m, &sink).empty(), "F mainnet rules at the floor (h_min 0, demo 0, the fixed sink, drain 16/64/1): constitutional");
+    { lr::LaneRules t = m; t.settle_h_min = 1;
+      const std::string w = lr::constitutional_check(0, t, &sink);
+      C(lr::is_r_min_violation(w) && w.rfind("R_MIN_VIOLATION field=settle_h_min value=1", 0) == 0, "F (a) mainnet settle_h_min 1: " + w.substr(0, 60)); }
+    { lr::LaneRules t = m; t.owed_demo_amount = 5;
+      const std::string w = lr::constitutional_check(0, t, &sink);
+      C(w.rfind("R_MIN_VIOLATION field=owed_demo_amount value=5", 0) == 0, "F (a) mainnet owed_demo_amount 5 (a premine): " + w.substr(0, 60)); }
+    { lr::LaneRules t = m; t.residual_sink_id = b32_of(0x52);
+      const std::string w = lr::constitutional_check(0, t, &sink);
+      C(w.rfind("R_MIN_VIOLATION field=residual_sink_id", 0) == 0, "F (b) mainnet another residual sink: " + w.substr(0, 50));
+      C(lr::constitutional_check(0, t, nullptr).empty(), "F (b) ... not checked when the caller has no fixed sink to compare with"); }
+    { lr::LaneRules t = m; t.drain_q = 32;
+      const std::string w = lr::constitutional_check(0, t, &sink);
+      C(w.rfind("R_MIN_VIOLATION field=drain_q value=32", 0) == 0, "F (c) drain_q 32 (16 Q > 256: a slower drain): " + w.substr(0, 50)); }
+    { lr::LaneRules t = m; t.drain_h_cap = 32;
+      const std::string w = lr::constitutional_check(0, t, &sink);
+      C(w.rfind("R_MIN_VIOLATION field=drain_h_cap value=32", 0) == 0, "F (c) drain_h_cap 32 (< 64: a delayed drain): " + w.substr(0, 50)); }
+    { lr::LaneRules t = m; t.drain_h_cap = 256;
+      const std::string w = lr::constitutional_check(0, t, &sink);
+      C(w.rfind("R_MIN_VIOLATION field=drain_h_cap value=256", 0) == 0, "F (c) drain_h_cap 256 (>= 16 Q: nobody admitted): " + w.substr(0, 50)); }
+    { lr::LaneRules t = m; t.drain_q = 8; t.drain_h_cap = 64;
+      C(lr::constitutional_check(0, t, &sink).empty(), "F (c) a FASTER drain (Q 8, H_cap 64) is constitutional (what a majority may still decide)"); }
+    { lr::LaneRules t = m; t.drain_h_cap = 128;
+      C(lr::constitutional_check(0, t, &sink).empty(), "F (c) a larger cap (H_cap 128 < 16 Q) is constitutional (the attempt-11 epoch-2 rule)"); }
+    // (a) / (b) are mainnet-only; (c) binds every network that runs a drain; a network without a drain (version 0) is not bound
+    { lr::LaneRules t = m; t.settle_h_min = 1; t.owed_demo_amount = 5; t.residual_sink_id = b32_of(0x52);
+      C(lr::constitutional_check(2, t, &sink).empty(), "F stagenet: h_min / demo / sink are knobs (R-MIN (a), (b) are mainnet)"); }
+    { lr::LaneRules t = m; t.drain_h_cap = 32;
+      C(lr::is_r_min_violation(lr::constitutional_check(2, t, &sink)), "F stagenet: the drain floor binds (H_cap 32 refused)"); }
+    { lr::LaneRules t = literal_rules();   // drain 0/0/0: no drain exists
+      C(lr::constitutional_check(3, t, &sink).empty(), "F regtest without a drain: not bound by (c)"); }
+    // point 3: decode_hello refuses a MAINNET peer's unconstitutional TLV by name; a stagenet peer's passes
+    {
+        lr::LaneRules t = m; t.owed_demo_amount = 7;
+        Hello h = hello_with(t, 9); h.network = 0;
+        h.pool->genesis = b32_of(0x6e);
+        const auto f = encode_hello(h);
+        Hello back; std::string why;
+        C(!f.empty() && !decode_hello(f, back, &why) && why.find("R_MIN_VIOLATION field=owed_demo_amount value=7") != std::string::npos,
+          "F decode_hello: a mainnet peer with owed_demo_amount 7 is refused by name (" + why.substr(0, 60) + ")");
+        Hello s = h; s.network = 2;
+        const auto fs = encode_hello(s);
+        C(decode_hello(fs, back, &why), "F decode_hello: the same TLV from a stagenet peer decodes (" + why + ")");
+    }
 }
 
 int main() {
@@ -339,5 +399,6 @@ int main() {
     suite_refusal(C);
     suite_frames(C);
     suite_property(C);
+    suite_rmin(C);
     return C.done("v37_xmr_lane_rules_kat");
 }

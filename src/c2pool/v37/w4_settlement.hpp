@@ -209,11 +209,21 @@ inline std::vector<u64> split_reward(u64 reward,
 // over the view type so it reads BOTH the tip LaneSnapshot (V37Engine::snapshot)
 // and the burial-gated SettlementView (settlement_view_at ring) — both carry a
 // MinerId-keyed `payout` map and the OI-W4-1 `identities` view.
+// RULES RATCHET (spec sec. 2.3 / 6.2): the BALLOT BOX of a view -- the window
+// weight per ballot word, a pure function of (v.payout, v.identities) exactly
+// as E_b is. A plain payee ref and the GA composite count as ballot 0; the BV
+// composite puts its payee slice into box[ballot] and its donation slice into
+// box[0] (C12: the donation slice never votes). The box is NOT digested: the
+// block's 0x03 root commits the view, which determines the box.
+using BallotBox = std::map<std::uint16_t, U256>;
+
 template <class View>
 inline std::vector<WeightedPayee> project(const View& v,
-                                          std::size_t* unresolved = nullptr) {
+                                          std::size_t* unresolved = nullptr,
+                                          BallotBox* box = nullptr) {
     std::vector<WeightedPayee> out;
     std::size_t miss = 0;
+    if (box) box->clear();
     if (!v.identities) { if (unresolved) *unresolved = v.payout.size(); return out; }
     for (const auto& [mid, w] : v.payout) {
         if (w.is_zero()) continue;                       // §2.3: floored-to-0 dropped
@@ -223,27 +233,38 @@ inline std::vector<WeightedPayee> project(const View& v,
     }
     if (unresolved) *unresolved = miss;
     // A2: a composite give_author lane identity (XMR_LANE_GA) is split here,
-    // once, for every consumer. Fast path: no composite -> the vector above,
-    // byte-identical to before A2.
+    // once, for every consumer; RULES RATCHET: so is the ballot composite
+    // (XMR_LANE_BV). Fast path: no composite -> the vector above, byte-identical
+    // to before A2 (the box, when asked for, is every weight under ballot 0).
     bool any_ga = false;
-    for (const auto& wp : out) if (wp.pay.kind == ::v37::xmr::XMR_LANE_GA) { any_ga = true; break; }
-    if (!any_ga) return out;
+    for (const auto& wp : out)
+        if (wp.pay.kind == ::v37::xmr::XMR_LANE_GA || wp.pay.kind == ::v37::xmr::XMR_LANE_BV) { any_ga = true; break; }
+    if (!any_ga) {
+        if (box) for (const auto& wp : out) (*box)[0] += wp.weight;
+        return out;
+    }
     std::vector<WeightedPayee> merged;
     std::map<bytes32, std::size_t> at;          // key -> index in `merged` (first appearance)
-    auto add = [&](const bytes32& key, const U256& w, const ScriptRef& pay) {
+    auto add = [&](const bytes32& key, const U256& w, const ScriptRef& pay, std::uint16_t ballot) {
         if (w.is_zero()) return;
+        if (box) (*box)[ballot] += w;
         auto it = at.find(key);
         if (it == at.end()) { at.emplace(key, merged.size()); merged.push_back(WeightedPayee{key, w, pay}); }
         else merged[it->second].weight += w;
     };
     for (const auto& wp : out) {
         ::v37::xmr::XmrGiveAuthor g;
+        ::v37::xmr::XmrBallotIdentity bv;
         if (wp.pay.kind == ::v37::xmr::XMR_LANE_GA && ::v37::xmr::decode_xmr_give_author(wp.pay, g)) {
             const auto sp = ::v37::xmr::xmr_ga_split(wp.weight, g.d);
-            add(::v37::xmr::xmr_identity_key(g.payee), sp.payee, g.payee);
-            add(::v37::xmr::xmr_identity_key(g.donation), sp.donation, g.donation);
+            add(::v37::xmr::xmr_identity_key(g.payee), sp.payee, g.payee, 0);
+            add(::v37::xmr::xmr_identity_key(g.donation), sp.donation, g.donation, 0);
+        } else if (wp.pay.kind == ::v37::xmr::XMR_LANE_BV && ::v37::xmr::decode_xmr_ballot_identity(wp.pay, bv)) {
+            const auto sp = ::v37::xmr::xmr_ga_split(wp.weight, bv.d);   // d == 0: all to the payee
+            add(::v37::xmr::xmr_identity_key(bv.payee), sp.payee, bv.payee, bv.ballot);
+            add(::v37::xmr::xmr_identity_key(bv.donation), sp.donation, bv.donation, 0);
         } else {
-            add(wp.key, wp.weight, wp.pay);
+            add(wp.key, wp.weight, wp.pay, 0);
         }
     }
     return merged;
@@ -515,13 +536,14 @@ struct EbFold {
     EbSource source = EbSource::LiveOnly;
     u64      next_pos = 0;           // == P, the burial-gated prefix read
     std::size_t unresolved = 0;      // OI-W4-1 broken-invariant counter
+    BallotBox box;                   // RULES RATCHET: the window weight per ballot (the tally's input, R3)
 };
 
 template <class View>
 inline std::optional<EbFold> fold_eb(u64 reward, const View& v, bool strict = true) {
     if (!assert_ratified_geometry(v, strict)) return std::nullopt;
     EbFold f;
-    std::vector<WeightedPayee> payees = project(v, &f.unresolved);
+    std::vector<WeightedPayee> payees = project(v, &f.unresolved, &f.box);
     std::vector<u64> amt = split_reward(reward, payees);
     for (std::size_t i = 0; i < payees.size(); ++i)
         if (amt[i] > 0) f.credit[payees[i].key] += amt[i];
@@ -981,6 +1003,15 @@ struct OwedLedgerRules {
     u64       decay_horizon = 0;     // 0 = off
     u64       decay_half_life = 0;
     bool      anchor_cut = false;
+    // EMPTY-CUT (XMR, RULES RATCHET R1, operator ruling 2026-10-03; rides
+    // anchor_cut): a canonical lane block whose own credit cut is DECIDED bad
+    // -- the winner-side order reaches the committed spine and carries a
+    // receipt every node refuses under the committed receipt test -- books
+    // its money as decided and passes NO cut, so its FINALIZE leaves the anchor
+    // where it is (the next decided cut covers the honest receipts). Undecided
+    // cuts stay HELD. A booking-side rule (the daemon decides the cut); the
+    // ledger reads a missing cut exactly as before.
+    bool      empty_cut = false;
     // MERKLE ROWS (XMR, paper §13): owed_digest commits the balances as the
     // ROOT of a Merkle tree over the rows, so a light client proves one
     // balance with a path of log2(rows) hashes instead of every row:
@@ -1039,6 +1070,59 @@ struct OwedLedgerRules {
     bool      lane_height = false;
     bool      decay_from_gross = false;
 };
+
+// RULES RATCHET (operator rulings 2026-10-03, spec sec. 3.1-3.3): the EPOCH
+// TABLE of a lane's ledger. Every row is one Deployment's activation state;
+// epoch_cur names the row whose OwedLedgerRules the ledger runs (m_rules ==
+// rows[epoch_cur].rules: the RATCHET event changes it, nothing else does).
+// With a table the digest commits "V37Y" (the epoch IN FORCE) and "V37V" (the
+// lock-ins decided, not yet active) FIRST in `rest`, always, from epoch 1; a
+// ledger WITHOUT a table (the BTC / DASH lanes) is byte-identical to before.
+// Forward only: DEFINED -> STARTED -> LOCKED_IN -> ACTIVE | FAILED.
+enum class EpochState : std::uint8_t { Defined = 0, Started = 1, LockedIn = 2, Active = 3, Failed = 4 };
+inline const char* to_string(EpochState s) {
+    switch (s) {
+        case EpochState::Defined:  return "DEFINED";
+        case EpochState::Started:  return "STARTED";
+        case EpochState::LockedIn: return "LOCKED_IN";
+        case EpochState::Active:   return "ACTIVE";
+        case EpochState::Failed:   return "FAILED";
+    }
+    return "?";
+}
+struct EpochRow {
+    std::uint32_t epoch_no = 1;
+    bytes32       rules_digest{};     // lanerules::rules_digest(rules_of(epoch_no))
+    std::uint8_t  kind = 0;           // 0 genesis, 1 signal, 2 height
+    u64           h_L = 0;            // the FINALIZE height that decided the lock-in (genesis: 0)
+    u64           H_act = 0;          // the first height booked under this epoch (epoch 1: 0)
+    EpochState    state = EpochState::Active;
+    OwedLedgerRules rules;            // the ledger rules of this epoch (derived from its LaneRules)
+    bool operator==(const EpochRow&) const = default;
+};
+struct LedgerEpochTable {
+    std::vector<EpochRow> rows;       // ascending epoch_no; rows.front() = epoch 1 (ACTIVE, H_act 0)
+    std::uint32_t epoch_cur = 1;
+    const EpochRow* find(std::uint32_t e) const { for (const auto& r : rows) if (r.epoch_no == e) return &r; return nullptr; }
+    EpochRow* find(std::uint32_t e) { for (auto& r : rows) if (r.epoch_no == e) return &r; return nullptr; }
+    std::uint32_t epoch_max() const { std::uint32_t m = 0; for (const auto& r : rows) if (r.epoch_no > m) m = r.epoch_no; return m; }
+    // epoch_of(h) = max { e : state in {LOCKED_IN, ACTIVE}, H_act <= h }, H_act(1) = 0.
+    std::uint32_t epoch_of(u64 height) const {
+        std::uint32_t e = 0;
+        for (const auto& r : rows)
+            if ((r.state == EpochState::LockedIn || r.state == EpochState::Active) && r.H_act <= height && r.epoch_no > e) e = r.epoch_no;
+        return e == 0 ? 1u : e;
+    }
+    bool operator==(const LedgerEpochTable&) const = default;
+};
+// The one-row table of a lane at its genesis: epoch 1 = `rules`, ACTIVE from 0.
+inline LedgerEpochTable genesis_epoch_table(const bytes32& rules_digest, const OwedLedgerRules& rules) {
+    LedgerEpochTable t;
+    EpochRow r; r.epoch_no = 1; r.rules_digest = rules_digest; r.kind = 0; r.h_L = 0; r.H_act = 0; r.state = EpochState::Active; r.rules = rules;
+    t.rows.push_back(r);
+    t.epoch_cur = 1;
+    return t;
+}
 
 // THE DRAIN RULE: what a lane block's FOUND carries for the ledger under
 // OwedLedgerRules::lane_height / decay_from_gross (ignored with the rules off).
@@ -1316,8 +1400,70 @@ public:
     using Amounts = std::map<bytes32, long long>;
 
     explicit OwedLedger(::v37::ChainId chain, OwedLedgerRules rules = {}) : m_chain(chain), m_rules(rules) {}
+    // RULES RATCHET: a ledger WITH an epoch table (the XMR lane). m_rules is the
+    // row of epoch_cur; V37Y / V37V are committed from the first digest.
+    OwedLedger(::v37::ChainId chain, LedgerEpochTable epochs) : m_chain(chain), m_epochs(std::move(epochs)) {
+        if (const EpochRow* r = m_epochs->find(m_epochs->epoch_cur)) m_rules = r->rules;
+    }
 
     const OwedLedgerRules& rules() const { return m_rules; }
+    // RULES RATCHET: the epoch table (nullptr: a ledger without one, BTC / DASH).
+    const LedgerEpochTable* epochs() const { return m_epochs ? &*m_epochs : nullptr; }
+    std::uint32_t epoch_cur() const { return m_epochs ? m_epochs->epoch_cur : 1u; }
+    std::uint32_t epoch_max() const { return m_epochs ? m_epochs->epoch_max() : 1u; }
+    std::uint32_t epoch_of(u64 height) const { return m_epochs ? m_epochs->epoch_of(height) : 1u; }
+    // The rules a dormant row decays under (R-MIN (d): grandfathered by the epoch
+    // captured at gone_since); the current rules without a table or a record.
+    const OwedLedgerRules& sched_rules_of(const bytes32& k) const {
+        if (!m_epochs) return m_rules;
+        auto it = m_sched_epoch.find(k);
+        if (it == m_sched_epoch.end()) return m_rules;
+        const EpochRow* r = m_epochs->find(it->second);
+        return r ? r->rules : m_rules;
+    }
+    std::optional<std::uint32_t> sched_epoch_of(const bytes32& k) const {
+        auto it = m_sched_epoch.find(k);
+        if (it == m_sched_epoch.end()) return std::nullopt;
+        return it->second;
+    }
+    // R3 adds a Deployment the table lacks (a follower adopting a descriptor, a
+    // compiled table growing on upgrade): DEFINED, not in force; data, not a
+    // mutation (V37Y / V37V do not change). False: no table, or the epoch exists.
+    bool add_epoch_row(const EpochRow& row) {
+        if (!m_epochs || m_epochs->find(row.epoch_no) || row.epoch_no <= m_epochs->epoch_cur) return false;
+        m_epochs->rows.push_back(row);
+        std::sort(m_epochs->rows.begin(), m_epochs->rows.end(), [](const EpochRow& a, const EpochRow& b) { return a.epoch_no < b.epoch_no; });
+        return true;
+    }
+    // The LOCK-IN decision (R3's tally at FINALIZE(h_L), or kind 2 at start):
+    // row e DEFINED / STARTED -> LOCKED_IN with (h_L, H_act). It is committed in
+    // "V37V" from the next digest; the caller applies it BEFORE the FINALIZE
+    // mutation that decided it, so the digest after that FINALIZE carries it
+    // (the memo is invalidated here in any case).
+    bool lock_in_epoch(std::uint32_t e, u64 h_L, u64 H_act) {
+        if (!m_epochs) return false;
+        EpochRow* r = m_epochs->find(e);
+        if (!r || e <= m_epochs->epoch_cur || (r->state != EpochState::Defined && r->state != EpochState::Started)) return false;
+        r->state = EpochState::LockedIn; r->h_L = h_L; r->H_act = H_act;
+        m_digest_memo.valid = false;
+        return true;
+    }
+    // THE RATCHET EVENT (EvKind 4, spec sec. 3.3): epoch_cur := e, m_rules :=
+    // rows[e].rules, V37Y := (e, digest, H_act), V37V drops e. No row, no pending
+    // map, no first_eligible, no gone_since, no due, no anchor, no lane height
+    // changes: SUM finalW before == after (TLA LedgerContinuity). Takes the next
+    // seq like every mutation (the "V37L" 0x04 leaf). False: no table, e is not
+    // a LOCKED_IN row above epoch_cur.
+    bool apply_ratchet(std::uint32_t e) {
+        if (!m_epochs) return false;
+        EpochRow* r = m_epochs->find(e);
+        if (!r || e <= m_epochs->epoch_cur || r->state != EpochState::LockedIn) return false;
+        r->state = EpochState::Active;
+        m_epochs->epoch_cur = e;
+        m_rules = r->rules;
+        bump(::c2pool::v37n::owedevent::ratchet_payload(e, r->rules_digest, r->H_act));
+        return true;
+    }
     // The K_fair age of `k` (its first_eligible; 0 = none). Finalized-only, so
     // it is the same on every node at a booking point.
     u64 first_eligible_of(const bytes32& k) const { return fe_at(k); }
@@ -1518,21 +1664,21 @@ public:
             m_last_settled_lane_height = it->second.height;
         if (decay_on() && m_rules.decay_from_gross) {         // DRAIN RULE (R5): the clock runs on the GROSS set G_b
             const std::set<bytes32>& g = it->second.gross;
-            for (const bytes32& k : g) { m_gone_since.erase(k); m_decay_steps.erase(k); }   // credited: the clock resets
+            for (const bytes32& k : g) { m_gone_since.erase(k); m_decay_steps.erase(k); m_sched_epoch.erase(k); }   // credited: the clock resets
             if (!g.empty())   // every sub-floor key this lane block passed by is gone from now
                 for (const auto& [k, w] : m_finalW)
                     if (w > 0 && w < m_rules.arm_floor && !m_gone_since.count(k) && !g.count(k))
-                        m_gone_since[k] = bin_height;
+                        start_decay_clock(k, bin_height);
         } else if (decay_on()) {                              // DUST DECAY: a credit restarts the clock
             bool credits = false;
             for (const auto& [k, v] : it->second.credit) if (v > 0) credits = true;
             for (const auto& [k, v] : it->second.credit)
-                if (v > 0) { m_gone_since.erase(k); m_decay_steps.erase(k); }
+                if (v > 0) { m_gone_since.erase(k); m_decay_steps.erase(k); m_sched_epoch.erase(k); }
             if (credits)   // every sub-floor key this lane block passed by is gone from now
                 for (const auto& [k, w] : m_finalW)
                     if (w > 0 && w < m_rules.arm_floor && !m_gone_since.count(k) &&
                         !(it->second.credit.count(k) && it->second.credit.at(k) > 0))
-                        m_gone_since[k] = bin_height;
+                        start_decay_clock(k, bin_height);
         }
         if (m_rules.anchor_cut && it->second.cut) m_anchor = *it->second.cut;   // ANCHOR
         if (m_rules.drops_due) {   // DROPS DUE: due -= claimed (the whole snapshot), due += D_B
@@ -1893,8 +2039,39 @@ public:
         return d;
     }
 
-    // The V37K / V37A sections, byte for byte as the flat digest carries them.
+    // The V37Y / V37V / V37K / V37A ... sections, byte for byte as the flat digest
+    // carries them. RULES RATCHET (C4/C13): with an epoch table the first two are
+    // ALWAYS present, from epoch 1 --
+    //   "V37Y" | u32 epoch_no | b32 rules_digest | u64 H_act         the epoch IN FORCE (48 B)
+    //   "V37V" | u8 n | n x (u32 epoch_no | u8 kind | u64 h_L | u64 H_act)   LOCKED_IN, not yet ACTIVE, ascending
+    // -- then the tagged sections switched by the rule bits of the epoch in
+    // force, as before (a new rule = a new tag; a shipped tag never changes
+    // width or meaning). V37V commits lock-in DECISIONS, never the running
+    // counters. A ledger without a table writes neither (BTC / DASH: unchanged).
     void append_rest(std::vector<std::uint8_t>& pre) const {
+        if (m_epochs) {
+            const EpochRow* cur = m_epochs->find(m_epochs->epoch_cur);
+            const char yt[4] = {'V', '3', '7', 'Y'};
+            pre.insert(pre.end(), yt, yt + 4);
+            const std::uint32_t e = m_epochs->epoch_cur;
+            for (int i = 0; i < 4; ++i) pre.push_back((e >> (8 * i)) & 0xff);
+            const bytes32 rd = cur ? cur->rules_digest : bytes32{};
+            pre.insert(pre.end(), rd.begin(), rd.end());
+            const u64 ha = cur ? cur->H_act : 0;
+            for (int i = 0; i < 8; ++i) pre.push_back((ha >> (8 * i)) & 0xff);
+            const char vt[4] = {'V', '3', '7', 'V'};
+            pre.insert(pre.end(), vt, vt + 4);
+            std::uint8_t n = 0;
+            for (const auto& r : m_epochs->rows) if (r.state == EpochState::LockedIn) ++n;
+            pre.push_back(n);
+            for (const auto& r : m_epochs->rows) {   // rows are kept ascending
+                if (r.state != EpochState::LockedIn) continue;
+                for (int i = 0; i < 4; ++i) pre.push_back((r.epoch_no >> (8 * i)) & 0xff);
+                pre.push_back(r.kind);
+                for (int i = 0; i < 8; ++i) pre.push_back((r.h_L >> (8 * i)) & 0xff);
+                for (int i = 0; i < 8; ++i) pre.push_back((r.H_act >> (8 * i)) & 0xff);
+            }
+        }
         if (decay_on()) {   // DUST DECAY state: it decides future balances, so it is committed
             const char kt[4] = {'V', '3', '7', 'K'};
             pre.insert(pre.end(), kt, kt + 4);
@@ -1904,6 +2081,11 @@ public:
                 pre.insert(pre.end(), k.begin(), k.end());
                 for (int i = 0; i < 8; ++i) pre.push_back((g >> (8 * i)) & 0xff);
                 for (int i = 0; i < 8; ++i) pre.push_back((b >> (8 * i)) & 0xff);
+                if (m_epochs) {   // RULES RATCHET (R-MIN (d)): the row's schedule epoch (+4 B per row)
+                    auto se = m_sched_epoch.find(k);
+                    const std::uint32_t sched = se == m_sched_epoch.end() ? m_epochs->epoch_cur : se->second;
+                    for (int i = 0; i < 4; ++i) pre.push_back((sched >> (8 * i)) & 0xff);
+                }
             }
         }
         if (m_rules.drops_due) {   // DROPS DUE: it decides the E_b of the next canonical lane block
@@ -2153,6 +2335,7 @@ private:
             if (it->second == 0 && !m_first_eligible.count(it->first)) {
                 m_gone_since.erase(it->first);    // DUST DECAY state goes with the row
                 m_decay_steps.erase(it->first);
+                m_sched_epoch.erase(it->first);   // RULES RATCHET: and its schedule epoch
                 it = m_finalW.erase(it);
             } else {
                 ++it;
@@ -2160,21 +2343,34 @@ private:
         }
     }
 
-    bool decay_on() const { return m_rules.arm_floor > 0 && m_rules.decay_horizon > 0 && m_rules.decay_half_life > 0; }
+    static bool decay_on(const OwedLedgerRules& r) { return r.arm_floor > 0 && r.decay_horizon > 0 && r.decay_half_life > 0; }
+    bool decay_on() const { return decay_on(m_rules); }
+    // RULES RATCHET (R-MIN (d)): the dormant clock starts under the CURRENT
+    // epoch's arm_floor and records sched_epoch = epoch_cur; the row then decays
+    // by THAT epoch's schedule whatever later epochs decide (TLA
+    // NoOwedReductionByRatchet). Without a table nothing is recorded.
+    void start_decay_clock(const bytes32& k, u64 bin_height) {
+        m_gone_since[k] = bin_height;
+        if (m_epochs) m_sched_epoch[k] = m_epochs->epoch_cur;
+    }
 
     // DUST DECAY (OwedLedgerRules::decay_*). For every balance 0 < w < arm_floor
     // whose key has had no credit for decay_horizon bins: the number of halvings
     // due is 1 + (elapsed - horizon) / half_life; apply the ones not applied
-    // yet. Returns the amounts written off at this FINALIZE, per key.
+    // yet. Returns the amounts written off at this FINALIZE, per key. The
+    // schedule (arm_floor / horizon / half-life) is the one of the epoch the row
+    // went dormant under (sched_rules_of; the current rules without a table).
     Amounts decay_dust(u64 bin_height) {
         Amounts off;
-        if (!decay_on()) return off;
+        if (!decay_on() && m_sched_epoch.empty()) return off;
         for (auto& [k, w] : m_finalW) {
-            if (w <= 0 || w >= m_rules.arm_floor) continue;
             auto gs = m_gone_since.find(k);
             if (gs == m_gone_since.end()) continue;           // not gone: no lane block has passed it by
-            if (bin_height < gs->second + m_rules.decay_horizon) continue;
-            const u64 due = 1 + (bin_height - gs->second - m_rules.decay_horizon) / m_rules.decay_half_life;
+            const OwedLedgerRules& sr = sched_rules_of(k);
+            if (!decay_on(sr)) continue;
+            if (w <= 0 || w >= sr.arm_floor) continue;
+            if (bin_height < gs->second + sr.decay_horizon) continue;
+            const u64 due = 1 + (bin_height - gs->second - sr.decay_horizon) / sr.decay_half_life;
             u64& done = m_decay_steps[k];
             if (due <= done) continue;
             const u64 n = due - done;
@@ -2205,6 +2401,8 @@ private:
 
     ::v37::ChainId m_chain;
     OwedLedgerRules m_rules;
+    std::optional<LedgerEpochTable> m_epochs;      // RULES RATCHET: the epoch table (XMR lane); none = BTC / DASH
+    std::map<bytes32, std::uint32_t> m_sched_epoch; // RULES RATCHET (R-MIN (d)): the epoch a dormant row decays under
     std::map<bytes32, u64> m_gone_since;           // DUST DECAY: bin of the first lane block that passed it by
     std::map<bytes32, u64> m_decay_steps;          // DUST DECAY: halvings already applied
     long long m_decayed_total = 0;

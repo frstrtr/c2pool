@@ -30,7 +30,9 @@
 // ===========================================================================
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -54,6 +56,9 @@
 #include "xmr_node_config.hpp"
 #include "xmr_settle_store.hpp"
 #include "xmr_finalize_driver.hpp"
+#include "xmr_pool_tag.hpp"                           // RULES RATCHET: PoolIdentity (the GenesisRec v2 binding)
+#include "xmr_epoch.hpp"                              // RULES RATCHET: Deployment, the epoch table
+#include <c2pool/v37/w6_persistence.hpp>             // RULES RATCHET: GenesisRec v2 codec (persist::encode_genesis_v2)
 
 namespace c2pool::v37n::xmr {
 
@@ -80,6 +85,14 @@ inline ::v37::bytes32 bytes32_of(const c2pool::xmr::node::Hash& h) {
 
 class XmrNode {
 public:
+    // review 2026-10-04 (O2): one ledger state of the boot replay (boot_share_states()).
+    struct BootShareState {
+        ::v37::bytes32 digest{};
+        std::uint64_t  ledger_seq = 0;
+        std::uint64_t  since = 0;   // the coin height its digest became current at
+        std::size_t    run = 0;     // index of its digest in boot_digest_history()
+        std::shared_ptr<const ::c2pool::v37n::settle::OwedLedger> ledger;
+    };
     // `transport` is the live I/O seam (production: LiveMonerodTransport; tests:
     // MockMonerodTransport). Ownership stays with the caller so a test can drive
     // frames into it directly. `point_check` optionally injects the ed25519
@@ -99,6 +112,7 @@ public:
         r.decay_horizon = m_cfg.ledger_decay_horizon;
         r.decay_half_life = m_cfg.ledger_decay_half_life;
         r.anchor_cut = m_cfg.ledger_anchor_cut;
+        r.empty_cut = m_cfg.ledger_anchor_cut && m_cfg.ledger_empty_cut;   // R1 RECEIPT ADMISSION (rides the anchor)
         r.merkle_rows = m_cfg.ledger_merkle_rows;
         r.drops_due = m_cfg.ledger_drops_due;
         r.raindrop_enrol = m_cfg.ledger_raindrop_enrol;
@@ -415,10 +429,49 @@ public:
         m_store = std::make_unique<FileSettleStore>(dbdir);
         log("store: opened " + dbdir);
 
+        // 2b) RULES RATCHET R1: the store is bound to ONE pool (GenesisRec v2).
+        if (m_identity) {
+            namespace persist = ::c2pool::v37n::persist;
+            namespace ep = ::c2pool::v37n::xmr::epoch;
+            const std::string key = store_codec::k_genesis(m_cfg.lane_chain);
+            const auto stored = m_store->get(key);
+            const std::uint32_t knows_max = m_deployments.empty() ? ep::kGenesisEpoch : ep::epoch_max_of(m_deployments);
+            if (const std::string r = genesis_open_refusal(stored, *m_identity, knows_max); !r.empty())
+                throw std::runtime_error("XmrNode: " + r + " -- refusing to start");
+            persist::GenesisRecV2 g;
+            if (stored) { if (auto old = persist::decode_genesis_v2(*stored)) g = *old; }
+            g.params.window = m_cfg.lane_params.window; g.params.c0 = m_cfg.lane_params.c0; g.params.rollup = m_cfg.lane_params.rollup;
+            g.params.half_life = m_cfg.lane_params.half_life; g.params.level_caps = m_cfg.lane_params.level_caps;
+            g.params.journal_depth = m_cfg.lane_params.journal_depth;
+            if (!stored) g.ts = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count());
+            g.pool_id = m_identity->pool_id; g.network = m_identity->network; g.chain_id = m_identity->chain_id;
+            g.pool_genesis = m_identity->pool_genesis;
+            g.genesis_form = static_cast<std::uint8_t>(m_identity->form);
+            g.H = m_identity->spec.height; g.block_hash = m_identity->spec.block_hash; g.headline = m_identity->spec.headline;
+            g.epochs.clear();   // the list is REWRITTEN with this build's table at every start (data, not consensus)
+            for (const auto& dep : m_deployments) {
+                persist::GenesisDeploymentRec d;
+                d.epoch_no = dep.epoch_no; d.rules_digest = dep.rules_digest; d.kind = dep.kind;
+                d.start = dep.start_height; d.timeout = dep.timeout_height; d.fixed = dep.fixed_height;
+                g.epochs.push_back(d);
+            }
+            auto b = m_store->batch();
+            b->put(key, persist::encode_genesis_v2(g));
+            if (!b->commit_sync()) throw std::runtime_error("XmrNode: the genesis record could not be written -- refusing to start");
+            static const char* hd = "0123456789abcdef";
+            std::string pid;
+            for (int i = 0; i < 8; ++i) { pid.push_back(hd[m_identity->pool_id[i] >> 4]); pid.push_back(hd[m_identity->pool_id[i] & 15]); }
+            log(std::string("genesis: ") + (stored ? "record checked (same pool), " : "record written, ") +
+                "pool_id=" + pid + "... epochs=" + std::to_string(g.epochs.size()) + " knows<=" + std::to_string(knows_max));
+        }
+
         // 3) RecoveryDriver BEFORE engine.start() — rebuild ledger + hw + cursor.
         {
             bool ok = false;
-            m_recovered = replay_store(m_ledger, m_boot_digests, m_boot_since, m_boot_last_since, ok);
+            m_boot_share_states.clear();
+            m_recovered = replay_store(m_ledger, m_boot_digests, m_boot_since, m_boot_last_since, ok,
+                                       m_boot_share_span ? &m_boot_share_states : nullptr);
             if (!ok)
                 throw std::runtime_error(
                     "XmrNode: settlement store is torn (F2 fail-closed) — refusing to start");
@@ -545,6 +598,61 @@ public:
     std::uint64_t relineages() const noexcept { return m_relineages; }
     ISettleStore& store() { return *m_store; }
     std::string   store_dir() const { return XmrNodeConfig_resolved(m_cfg); }
+
+    // ── RULES RATCHET R1 (spec sec. 3.1 / 3.5) ─────────────────────────────
+    // The epoch table the ledger runs: epoch 1 = this node's lane rules, ACTIVE
+    // from H_act 0, so every owed_digest commits V37Y / V37V from the first one.
+    // Call BEFORE bring_up() (the replay computes digests).
+    void set_epoch_table(::c2pool::v37n::settle::LedgerEpochTable t) {
+        m_ledger = OwedLedger(m_cfg.lane_chain, std::move(t));
+    }
+    // The pool identity and the build's deployment list: bring_up() binds them to
+    // the store (GenesisRec v2) -- a store of another pool, a raw genesis on
+    // mainnet, a pre-R1 (v1 / absent-codec) record or an epoch this build lacks
+    // refuses the open; the list is REWRITTEN at every start (data, not consensus).
+    // Call BEFORE bring_up(). Without it (KAT rigs, tools) no genesis record is
+    // kept or checked.
+    void set_pool_identity(const ::c2pool::v37n::xmr::lineage::PoolIdentity& id,
+                           std::vector<::c2pool::v37n::xmr::epoch::Deployment> deployments) {
+        m_identity = id;
+        m_deployments = std::move(deployments);
+    }
+    const std::optional<::c2pool::v37n::xmr::lineage::PoolIdentity>& pool_identity() const { return m_identity; }
+    // The genesis record as the store holds it (nullopt: none / not a v2 record).
+    std::optional<::c2pool::v37n::persist::GenesisRecV2> genesis_record() {
+        if (!m_store) return std::nullopt;
+        const auto v = m_store->get(store_codec::k_genesis(m_cfg.lane_chain));
+        if (!v) return std::nullopt;
+        return ::c2pool::v37n::persist::decode_genesis_v2(*v);
+    }
+    // The pure open rule over a store's genesis value (nullopt = no record yet).
+    // "" = open; else the refusal text. `knows_max` = this build's highest epoch.
+    static std::string genesis_open_refusal(const std::optional<std::string>& stored,
+                                            const ::c2pool::v37n::xmr::lineage::PoolIdentity& id,
+                                            std::uint32_t knows_max) {
+        namespace persist = ::c2pool::v37n::persist;
+        namespace lineage = ::c2pool::v37n::xmr::lineage;
+        static const char* d = "0123456789abcdef";
+        auto hx = [&](const ::v37::bytes32& b) { std::string s; for (std::uint8_t x : b) { s.push_back(d[x >> 4]); s.push_back(d[x & 15]); } return s; };
+        if (!stored) return {};
+        const auto g = persist::decode_genesis_v2(*stored);
+        if (!g) return "settle-store: the genesis record is not a GenesisRec v2 (a pre-R1 store or a torn record): the attempt-11 "
+                       "genesis is fresh, there is no migration -- start this pool on a new --data-dir";
+        if (!(g->pool_id == id.pool_id))
+            return "settle-store: store belongs to pool " + hx(g->pool_id) + ", this node is " + hx(id.pool_id) +
+                   " (pool genesis " + hx(g->pool_genesis) + " vs " + hx(id.pool_genesis) + ")";
+        if (g->network != id.network || g->chain_id != id.chain_id)
+            return "settle-store: the genesis record names network " + std::to_string(g->network) + " chain " + std::to_string(g->chain_id) +
+                   ", this node runs network " + std::to_string(id.network) + " chain " + std::to_string(id.chain_id);
+        if (g->genesis_form == static_cast<std::uint8_t>(lineage::GenesisForm::Raw) && id.network == 0)
+            return "settle-store: the store was created with a RAW pool genesis and this is mainnet: " +
+                   std::string(lineage::raw_genesis_refusal(0));
+        for (const auto& e : g->epochs)
+            if (e.epoch_no > knows_max)
+                return "settle-store: the genesis record lists epoch " + std::to_string(e.epoch_no) + "; this build knows <= " +
+                       std::to_string(knows_max) + "; upgrade";
+        return {};
+    }
 
     // Teardown in donor order: network first, then drain-and-join the engine.
     void stop() {
@@ -764,6 +872,15 @@ public:
     const ::v37::bytes32& seed_digest() const { return m_seed_digest; }
     const std::vector<std::string>& construction_log() const { return m_log; }
     const RecoveredState& recovered() const { return m_recovered; }
+    // ★ review 2026-10-04 (O2): the share states of the boot replay. A node that
+    // restarts rebuilds a frozen ledger copy of every (owed_digest, ledger_seq)
+    // state whose digest is current or was superseded within `span` heights of
+    // the replay's end, so a receipt built on a state that was current before
+    // the restart is judged (1 / -1) exactly as on a node that never stopped.
+    // set_boot_share_span() before bring_up(); 0 (default) keeps none.
+    void set_boot_share_span(std::uint64_t span) { m_boot_share_span = span; }
+    const std::vector<BootShareState>& boot_share_states() const { return m_boot_share_states; }
+    void clear_boot_share_states() { std::vector<BootShareState>().swap(m_boot_share_states); }
     // R-B(i) follow-up: every distinct owed_digest state the replayed store passed
     // through, oldest first (ends at the live digest). Seeds the RECON candidate ring
     // so a RESUMED node matches peer roots against its full canonical history (the
@@ -985,17 +1102,36 @@ private:
 
     // RecoveryDriver replay + the canonical (digest, since) history (R-B(i)
     // follow-up + R-C rework-3 D7): shared by bring_up and relineage.
+    // review 2026-10-04 (O2): `keep` (bring_up only) receives a frozen copy of
+    // every (owed_digest, ledger_seq) state the replay passes whose digest is
+    // current or was superseded less than m_boot_share_span heights before the
+    // replay's running since (whole digests only: every state of a kept digest,
+    // from its first one, so the share verdict holds it complete).
     RecoveredState replay_store(OwedLedger& ledger, std::vector<::v37::bytes32>& ds, std::vector<std::uint64_t>& ss,
-                                std::uint64_t& last_since, bool& ok) {
+                                std::uint64_t& last_since, bool& ok, std::vector<BootShareState>* keep = nullptr) {
         RecoveryDriver rec(*m_store, m_cfg.lane_chain);
         ds.clear(); ss.clear();
         ds.push_back(ledger.owed_digest());   // the empty anchor / anchor-boot state
         ss.push_back(0);
+        std::deque<BootShareState> kq;          // O2: the kept states, oldest first
+        auto keep_state = [&](const OwedLedger& l, std::uint64_t run_s) {
+            if (!keep) return;
+            if (!kq.empty() && kq.back().digest == l.owed_digest() && kq.back().ledger_seq == l.ledger_seq()) return;
+            BootShareState b;
+            b.digest = l.owed_digest(); b.ledger_seq = l.ledger_seq(); b.since = run_s; b.run = ds.size() - 1;
+            auto L = std::make_shared<OwedLedger>(l);
+            (void)L->owed_digest();   // warm the memo: the verify workers only read
+            b.ledger = std::move(L);
+            kq.push_back(std::move(b));
+            // evict whole digest runs superseded more than the span before the running since
+            while (!kq.empty() && kq.front().run + 1 < ds.size() && ss[kq.front().run + 1] + m_boot_share_span < run_s) kq.pop_front();
+        };
+        keep_state(ledger, 0);
         // R-C rework-3 (D7): pair every replayed digest state with the coin
         // height it became current at (Finalize: bin_height - D_conf; the
         // formula XmrFinalizeDriver::since_of_bin applies live).
         std::uint64_t since = 0;
-        RecoveredState st = rec.recover(ledger, ok, {}, [this, &since, &ds, &ss](const OwedLedger& l, const SettleEvent& e) {
+        RecoveredState st = rec.recover(ledger, ok, {}, [this, &since, &ds, &ss, &keep_state](const OwedLedger& l, const SettleEvent& e) {
             if (e.kind == SettleEvKind::Finalize)
                 since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
             const ::v37::bytes32 d = l.owed_digest();
@@ -1003,8 +1139,10 @@ private:
                 ds.push_back(d);
                 ss.push_back(since);
             }
+            keep_state(l, ss.back());
         });
         last_since = since;
+        if (keep) keep->assign(std::make_move_iterator(kq.begin()), std::make_move_iterator(kq.end()));
         return st;
     }
 
@@ -1027,9 +1165,13 @@ private:
     ::v37::xmr::xmr_point_check_fn         m_injected_point_check;
 
     std::unique_ptr<ISettleStore>          m_store;
+    std::optional<::c2pool::v37n::xmr::lineage::PoolIdentity> m_identity;          // RULES RATCHET: the GenesisRec v2 binding
+    std::vector<::c2pool::v37n::xmr::epoch::Deployment>       m_deployments;       // RULES RATCHET: this build's table
     OwedLedger                             m_ledger;
     SettleHW                               m_hw;
     RecoveredState                         m_recovered;
+    std::uint64_t                          m_boot_share_span = 0;   // review O2: 0 = no boot share states kept
+    std::vector<BootShareState>            m_boot_share_states;
     std::vector<::v37::bytes32>            m_boot_digests;   // R-B(i) follow-up: canonical owed_digest history from boot replay
     std::vector<std::uint64_t>             m_boot_since;     // R-C rework-3 (D7): since-height per boot digest
     std::uint64_t                          m_boot_last_since = 0;

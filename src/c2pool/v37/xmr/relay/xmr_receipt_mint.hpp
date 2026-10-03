@@ -30,7 +30,9 @@
 //   info_digest == side_digest_v2 -> R-1 (t_origin == share_diff) -> the
 //   crypto opening (midstate -> H(prefix) -> coinbase hash -> branch -> the
 //   blob's tree_root) -> tx_extra shape (0x02 + 0x03 present = a lane coinbase)
-//   -> [BindMode::Rbind] 0x02 payload [4..36) == rbind_v1(chain, side).
+//   -> [BindMode::Rbind] 0x02 payload [49..81) == rbind_v1(chain, side)
+//      (RULES RATCHET R1: the V37P v2 pool field occupies [4..49); the former
+//      CheckStage::Reserved is gone -- every u16 is a well-formed ballot).
 // A receipt that fails here costs the sender a structural strike and never
 // reaches RandomX.
 // ===========================================================================
@@ -43,6 +45,7 @@
 #include <vector>
 
 #include "xmr_relay_wire.hpp"
+#include "../xmr_credit_cut.hpp"                      // RULES RATCHET: kRbindOffset (49)
 #include "impl/xmr/receipt/xmr_receipt_verify.hpp"   // build_coinbase_opening / verify_crypto_opening / parse_*
 #include "impl/xmr/coin/xmr_blob.hpp"                // tx_prefix_hash / coinbase_tx_hash / tree_root / make_coinbase_branch
 
@@ -195,8 +198,12 @@ inline bool mint_receipt(const std::vector<u8>& full_blob, const std::vector<u8>
 }
 
 // ── the structural check ────────────────────────────────────────────────────
+// RULES RATCHET R1: CheckStage::Reserved is DELETED (the word is the ballot;
+// any u16 is well-formed and there is NO range check against the deployment
+// table: admission must be identical on every node). The numbering keeps its
+// gap so logs stay comparable.
 enum class CheckStage : u8 {
-    Ok = 0, Budget, PayeeKind, PayeePoint, Identity, Chain, Reserved, InfoDigest, R1,
+    Ok = 0, Budget, PayeeKind, PayeePoint, Identity, Chain, InfoDigest = 7, R1,
     Opening, ExtraShape, Bind,
 };
 inline const char* to_string(CheckStage s) {
@@ -207,7 +214,6 @@ inline const char* to_string(CheckStage s) {
         case CheckStage::PayeePoint: return "payee-point";
         case CheckStage::Identity: return "identity";
         case CheckStage::Chain: return "chain";
-        case CheckStage::Reserved: return "reserved";
         case CheckStage::InfoDigest: return "info-digest";
         case CheckStage::R1: return "r1-target";
         case CheckStage::Opening: return "opening";
@@ -244,7 +250,6 @@ inline CheckResult check_structural(const FbReceipt& r, const CheckCtx& c) {
     if (r.side.identity != ::v37::xmr::xmr_identity_key(r.payee))
         return fail(CheckStage::Identity, "side.identity != identity_key(payee)");
     if (r.side.chain_id != c.lane_chain) return fail(CheckStage::Chain, "side.chain_id != lane");
-    if (r.side.reserved != 0) return fail(CheckStage::Reserved, "side.reserved != 0");
     if (r.receipt.info_digest != side_digest_v2(r.side))
         return fail(CheckStage::InfoDigest, "info_digest != side_digest_v2(side)");
     if (r.side.t_hi != 0 || r.side.t_lo != c.share_diff)
@@ -259,10 +264,11 @@ inline CheckResult check_structural(const FbReceipt& r, const CheckCtx& c) {
     if (!::v37::xmr::verify::parse_tx_extra(r.receipt.coinbase_opening.tx_extra, px) || !px.has_pubkey ||
         !px.has_nonce || !px.has_mm)
         return fail(CheckStage::ExtraShape, "tx_extra is not a v37 lane coinbase (needs 0x01 + 0x02 + 0x03)");
-    if (c.bind == BindMode::Rbind) {
+    if (c.bind == BindMode::Rbind) {   // RULES RATCHET: rbind sits after the 45-byte V37P v2 head, at [49..81)
         const bytes32 rb = rbind_v1(c.lane_chain, r.side);
-        if (px.nonce.size() < 4 + 32 || std::memcmp(px.nonce.data() + 4, rb.data(), 32) != 0)
-            return fail(CheckStage::Bind, "coinbase 0x02[4..36) != rbind_v1(chain, side_data_v2)");
+        constexpr std::size_t off = ::c2pool::v37n::xmr::credit::kRbindOffset;
+        if (px.nonce.size() < off + 32 || std::memcmp(px.nonce.data() + off, rb.data(), 32) != 0)
+            return fail(CheckStage::Bind, "coinbase 0x02[49..81) != rbind_v1(chain, side_data_v2)");
     }
     return out;
 }

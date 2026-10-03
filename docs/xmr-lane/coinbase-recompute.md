@@ -166,9 +166,10 @@ projected view itself (R14).
   Test networks keep them; a rig must set them identically. LANE-RULES
   (operator ruling R3, [lane-rules.md](lane-rules.md)): every one of them, and
   every compiled-in rule constant, is now in the lane-rules list the HELLO
-  compares by name (`LANE_RULES_MISMATCH`) and the on-chain `pool_tag` folds,
-  so a node with other values is refused at HELLO and sees our lane blocks as
-  ordinary blocks: never debit-only. `--d-conf` below 60 is refused off regtest.
+  compares by name (`LANE_RULES_MISMATCH`) as the pool's epoch-1 Deployment
+  (RULES RATCHET R1: nothing on chain names a rule; a same-pool block built
+  under other rules is a recompute Mismatch, and the deviant node is the one
+  refused at HELLO), so a node with other values is refused at HELLO: never debit-only. `--d-conf` below 60 is refused off regtest.
 
 ## 6. Shares: the same rule (P2Pool's share rule)
 
@@ -265,14 +266,15 @@ nothing checked them.
 * **The relay verdict.** The daemon publishes, per ledger state, a frozen
   copy of the ledger, the payees at its anchor, the booked refs and the lane
   config (`xmr_share_verdict.hpp`, keyed by the 0x03 root the state commits,
-  the last 16 states). A verify worker decides each relayed receipt before
-  RandomX:
+  retained per section 6.2). A verify worker decides each relayed receipt
+  before RandomX:
   * canonical: admitted;
   * not canonical: refused, with a strike;
+  * not an admissible canonical state under the committed receipt test
+    (section 6.2): refused (FOREIGN), no strike;
   * not decidable here (a state this node does not hold, or its anchor view
-    not read yet): parked like an unknown context. Past the patience an
-    unsolicited receipt is dropped. A solicited one (a repair of a winner's
-    lane, which is the settlement authority under Ruling A) is admitted.
+    not read yet): parked like an unknown context, never admitted until it
+    re-judges canonical (section 6.2).
   Pinned by `v37_xmr_share_verdict_kat` S9, `v37_xmr_spend_floor_kat` F11
   (the ledger anchor, the store, a restart) and `v37_xmr_mainnet_rehearsal_kat`
   M11 / M11b (3 nodes, every block canonical, one anchor, exact
@@ -283,9 +285,8 @@ nothing checked them.
   is rebuilt (about 3.5 ms) and its prefix cached per state; a later share
   splices its own 0x02 payload into it and compares one Keccak (about 3 µs,
   `v37_xmr_share_verdict_kat` S10). A refused share is never cached.
-* **Open.** A receipt a node could not decide but admitted as a repair
-  answer is trusted on the winner's word: an honest winner never holds a
-  refused receipt in its lane.
+* **Admission (R1).** Only verdict 1 admits; a won block whose served order
+  carries a receipt refused here stays HELD (section 6.2).
 
 ### 6.1 Share verdict and lane-prefix skew (HOLD-ROUND-2)
 
@@ -325,8 +326,9 @@ under-take parks and a forged over-take up to G(H_cap) and >= our F drops,
 neither a strike (bounded, never admitted: a parked share must re-judge
 canonical).
 
-A solicited receipt (a repair answer) with any skew verdict takes the patience
-path and is trusted past it (Ruling A), as before. Counters: `relay-shares:
+A solicited receipt (a backfill or repair answer) with a skew verdict is
+handled exactly like a flooded copy (section 6.2): it is admitted only once it
+re-judges canonical. Counters: `relay-shares:
 refused= parked= ... skew ahead= behind= late= ahead_now= rejudged= evicted=`.
 KATs: `v37_xmr_share_verdict_kat` S13 (B1-B4) and S14 (V2: F below R*dh/256 and
 both dh past H_cap, 120 copies each through the DoS budget: strikes 0, bans 0;
@@ -343,6 +345,77 @@ decided alike (`finality-boundary.md` section 4a), every node computes the same
 prev_lane, so the Mismatch is uniform. Turning a skew Mismatch into a hold was
 considered and rejected: a block built on a lower block that was refused
 everywhere would then hold forever (`v37_xmr_coinbase_recompute_kat` R20).
+
+### 6.2 Receipt admission and the held cut (rules ratchet R1)
+
+Operator ruling 2026-10-03, lane rule field 30 (`empty_cut`), shipped in the
+R1 flag day; revised after review on 2026-10-04 (see "Field 30" below).
+
+**Admission.** A receipt enters the verified cache, a lane order or the
+raindrop store only when its share verdict is 1, whatever path it arrived on
+(flood, HELLO backfill, raindrop inventory, repair answer). A receipt still
+undecided past its patience is dropped (a flood) or re-judged on every
+share-state advance for `kShareUndecidedMaxRounds` rounds and then dropped (a
+solicited copy). Skew verdicts park or drop as in section 6.1. Nothing is
+admitted on an undecided or skew verdict, and none of these is a strike. A
+relay under this rule refuses to start without a share verdict installed.
+
+**The committed receipt test.** For a receipt of bin b (its coinbase height)
+let bcut = b - 1 - D_conf, the builder cut of that bin (the block-level D7
+rule). Once this node's finalize cursor is at or past bcut, the receipt's 0x03
+root must be the root of a state in this node's canonical digest history that
+was current within A heights of bcut (A = the root-age bound, 4 x D_conf). If it
+is not, the verdict is FOREIGN: refused, kept in the refused memo, no strike.
+Before the cursor gets there an unmatched root is undecided. The history is
+the RECON ring, seeded from the full boot replay of the event log. FOREIGN is
+answered only when that history reaches back over every state admissible for
+the bin: it starts at the lane's first state, or its oldest entry became
+current before bcut - A. A history that starts later answers undecided, and
+the publisher marks the history `warm` only once it reaches back over the
+whole span the lane order can still admit (late tail + 1 + D_conf + A).
+
+**Retention (F2) and restarts.** Every (digest, seq) share state is kept while
+its digest is current or was superseded within `kLateTailBins + 1 + A` heights
+of the cursor, so a synced node can evaluate every receipt its lane order can
+still admit. A restarted node rebuilds those states from its boot replay
+(every state of each digest in the span, from its first one) and publishes
+them before its live state, so it holds each such digest complete and judges a
+receipt built before the restart exactly as a node that never stopped. A state
+whose anchor view is not readable yet answers undecided until the view
+arrives. Retention never decides a verdict: an admissible root whose state is
+not held is undecided, and a recompute -1 is decided only on a digest this
+node holds complete.
+
+**The cut of a won block.** Under the anchor rule a canonical lane block's
+money reads the ANCHOR, never its own cut. Its own cut (P, spine) only becomes
+the next anchor at its FINALIZE, so it must be reproducible here:
+
+| own cut | condition | booking |
+|---|---|---|
+| valid | the view at (P, spine) is reproducible here from admitted receipts | as before: cut = (P, spine) |
+| undecided | the order or a receipt is not here yet; no connected peer serves the order (counted as `withheld_cut_held`); or the served order reaches the spine but carries a receipt refused here (its serving peer is set aside) | HELD as before; never refused, never a strike or a ban |
+
+The lane digest at P folds the per-miner accumulators (identity keys and
+weights), not receipt ids, so a served order is authenticated only in its
+payee and weight sequence: another receipt of the same payee and weight
+reaches the same spine, and which peers hold the order at a given moment is
+node-local. A served order therefore never decides a cut. An order that breaks
+the order rule, repeats an id or carries a refused receipt only sets its
+serving peer aside, and the cut stays HELD until an order of admitted receipts
+reproduces the spine.
+
+**Field 30.** Field 30 stays in the lane-rules list with value 1 (same TLV
+bytes, same rules digest as at R1). It selects the receipt-admission rules
+above (the committed receipt test, retention, and a -1 only on a complete
+digest). Its EMPTY-CUT booking branch (the money as decided, NO cut, the anchor
+stays, no DROPS composed from the cut, CUT-FLOOR not raised) is kept but
+RESERVED: nothing reaches it, because nothing decides a cut bad from served
+data. A later rule that lets the next lane block attest the previous block's
+cut (a committed receipt-id digest, or none) is expected to reuse the field;
+the v37.1 set digest is the other route.
+
+KATs: `v37_xmr_admission_relay_kat` (R1-R6), `v37_xmr_empty_cut_kat` (E1-E8),
+`v37_xmr_share_verdict_kat` S16-S19.
 
 ## 6a. Proving a balance to a light client (paper §13)
 

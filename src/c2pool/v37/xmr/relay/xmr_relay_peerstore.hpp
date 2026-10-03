@@ -40,8 +40,8 @@ inline void peer_service_apply(std::uint64_t svc, PeerRecord& r) {
     r.fails = static_cast<std::uint32_t>((svc >> 8) & 0xff);
 }
 
-inline std::string peerstore_file_name(std::uint8_t network, const std::string& pool_tag_hex) {
-    return "relay_peers_" + std::to_string(network) + "_" + pool_tag_hex.substr(0, 16) + ".json";
+inline std::string peerstore_file_name(std::uint8_t network, const std::string& pool_hex) {   // lane_tag[0..8) || pool_genesis[0..8), hex
+    return "relay_peers_" + std::to_string(network) + "_" + pool_hex.substr(0, 16) + ".json";
 }
 
 // Load every record of the store at `path` (created empty if absent). false +

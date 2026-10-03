@@ -83,11 +83,15 @@ struct CoinbaseBooking {
     // fee model: the donation owed_in commitment (0x02 tail "V37D"), if any.
     // Read by decode_lane_coinbase_fee only; gate OFF coinbases carry none.
     std::optional<std::uint64_t> donation_owed_in;
-    // POOL-LINEAGE: how the V37C tail's pool tag classified this block (set
-    // only when the caller passes its pool_tag; Own = a lane block of ours).
+    // RULES RATCHET: how the V37P v2 head field classified this block (set only
+    // when the caller passes its pool_id; Own = a lane block of ours). `pool_field`
+    // is the field as parsed (pool_id, epoch_cur, epoch_max) for Own / Foreign;
+    // the EPOCH decision (validate / misbuilt / HOLD, spec sec. 1.4) is the
+    // booking code's, which knows the ledger's epoch_of(h).
     bool                 lineage_gated = false;
     credit::BlockLineage lineage = credit::BlockLineage::Untagged;
-    ::v37::bytes32       lineage_seen_tag{};   // the foreign tag (lineage == Foreign)
+    credit::PoolField    pool_field{};         // the parsed field (lineage Own / Foreign)
+    ::v37::bytes32       lineage_seen_tag{};   // the foreign pool_id (lineage == Foreign)
     // SAME-BLOCK PAY-NOW: the committed base B (0x02 tail "V37N"), if any.
     // The booking nets the pay-now it implies (xmr_paynow.hpp net_booking).
     std::optional<std::uint64_t> paynow_base;
@@ -103,13 +107,13 @@ struct CoinbaseBooking {
 // merge-mining pool ends its tx_extra the same way (mainnet: 01 pubkey | 02
 // 4-byte nonce | 03 21 00 root -- p2pool and others, several blocks a day).
 // A v37 lane coinbase also carries at least one V37 field in its 0x02 payload:
-// the V37P pool tag (every lane coinbase since POOL-LINEAGE; a malformed V37P
-// counts, the lineage gate then rejects it), the V37C credit cut, or the V37D
-// donation owed_in. None of them -> decided NOT a lane block.
+// the V37P pool field (every lane coinbase; a malformed V37P counts, the
+// lineage gate then rejects it), the V37C credit cut, or the V37D donation
+// owed_in. None of them -> decided NOT a lane block.
 inline bool has_v37_lane_fields(const std::vector<unsigned char>& tx_extra) {
     const auto f = credit::extra_nonce_field(tx_extra);
     if (!f) return false;
-    return credit::parse_pool_tag_payload(*f) != credit::PoolTagParse::Absent ||
+    return credit::parse_pool_field_payload(*f) != credit::PoolFieldParse::Absent ||
            credit::parse_tail(*f).has_value() ||
            fee::parse_donation_owed_payload(*f).has_value();
 }
@@ -123,7 +127,7 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
                                                 const ::v37::ScriptRef& sink_ref,
                                                 const ::v37::bytes32& sink_identity,
                                                 PayOf&& pay_of,
-                                                const ::v37::bytes32* pool_tag = nullptr) {
+                                                const ::v37::bytes32* pool_id = nullptr) {
     namespace cons = ::c2pool::xmr::native;
     namespace set_ = ::v37::xmr::settle;
     CoinbaseBooking b;
@@ -154,25 +158,26 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     if (got.tx_extra.size() < 35) { b.why = "not-lane: tx_extra too short for 03 tag"; return b; }
     const unsigned char* tag = got.tx_extra.data() + got.tx_extra.size() - 35;
     if (tag[0] != 0x03 || tag[1] != 0x21 || tag[2] != 0x00) { b.why = "not-lane: no 03 21 00 tail"; return b; }
-    // POOL-LINEAGE (operator ruling 2026-09-25): only a block whose V37C tail
-    // carries OUR pool_tag is a lane block. Another pool's block, an untagged
-    // (pre-lineage) tail or a malformed V37P field is an ORDINARY Monero block
-    // for this pool: "not-lane:" -- never matched against the candidate ring,
-    // so never booked as a lane cut, never refused, never held, never a
-    // lane-root question (no root fingerprint either). nullptr = the
-    // pre-lineage behaviour (KATs, tools).
-    if (pool_tag) {
+    // RULES RATCHET R1 (spec sec. 1.4): only a block whose V37P v2 head carries
+    // OUR pool_id is a lane block. Another pool's block, an untagged payload or
+    // a malformed V37P field (a version other than 2, which no epoch may change)
+    // is an ORDINARY Monero block for this pool: "not-lane:" -- never matched
+    // against the candidate ring, so never booked as a lane cut, never refused,
+    // never held, never a lane-root question (no root fingerprint either).
+    // nullptr = the ungated decoder (KATs, tools).
+    if (pool_id) {
         b.lineage_gated = true;
-        b.lineage = credit::classify_lineage(got.tx_extra, *pool_tag, &b.lineage_seen_tag);
+        b.lineage = credit::classify_lineage(got.tx_extra, *pool_id, &b.pool_field);
+        if (b.lineage == credit::BlockLineage::Foreign) b.lineage_seen_tag = b.pool_field.pool_id;
         if (b.lineage != credit::BlockLineage::Own) {
             static const char* d = "0123456789abcdef";
             std::string th;
             for (int i = 0; i < 6; ++i) { th += d[b.lineage_seen_tag[i] >> 4]; th += d[b.lineage_seen_tag[i] & 15]; }
             b.why = b.lineage == credit::BlockLineage::Foreign
-                        ? "not-lane: foreign pool_tag " + th + "... (another pool's block: an ordinary Monero block for this pool)"
+                        ? "not-lane: foreign pool_id " + th + "... (another pool's block: an ordinary Monero block for this pool)"
                     : b.lineage == credit::BlockLineage::Malformed
-                        ? std::string("not-lane: malformed V37P pool-tag field (strict reject: an ordinary block for this pool)")
-                        : std::string("not-lane: no pool_tag in the V37C tail (pre-lineage / older pool: an ordinary block for this pool)");
+                        ? std::string("not-lane: malformed V37P pool field (strict reject: an ordinary block for this pool)")
+                        : std::string("not-lane: no V37P pool field at 0x02[4..49) (not a v37 lane block: an ordinary block for this pool)");
             return b;
         }
     }
@@ -180,8 +185,8 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     // merge-mining pool's coinbase, decided "not-lane:" from the bytes for EVERY
     // caller -- never "lane-root-unknown" (retried, HELD, then refused with an
     // alarm + liability + a lineage vote), never matched against the ring. With
-    // a pool_tag the lineage gate above already rejected it (Untagged); this is
-    // the same decision for a caller without one (pre-lineage API, tools).
+    // a pool_id the lineage gate above already rejected it (Untagged); this is
+    // the same decision for a caller without one (ungated API, tools).
     if (!has_v37_lane_fields(got.tx_extra)) {
         b.why = "not-lane: 03 21 00 tail without any V37 field (V37P/V37C/V37D) in the 0x02 payload "
                 "(a merge-mining pool's coinbase: an ordinary Monero block)";
@@ -308,11 +313,11 @@ inline CoinbaseBooking decode_lane_coinbase_fee(const std::vector<std::uint8_t>&
                                                 PayOf&& pay_of,
                                                 ::c2pool::v37n::xmr::fee::DonationNet net =
                                                     ::c2pool::v37n::xmr::fee::DonationNet::Mainnet,
-                                                const ::v37::bytes32* pool_tag = nullptr) {
+                                                const ::v37::bytes32* pool_id = nullptr) {
     namespace fee = ::c2pool::v37n::xmr::fee;
     const ::v37::bytes32 D = fee::donation_identity(net);
     CoinbaseBooking b = decode_lane_coinbase(blob, chain_id, candidates, keys, fee::donation_ref(net),
-                                             D, std::forward<PayOf>(pay_of), pool_tag);
+                                             D, std::forward<PayOf>(pay_of), pool_id);
     if (!b.ok) return b;
     std::string w;
     if (!fee::apply_donation_rule(b.out_identity, b.out_amount, D, b.donation_owed_in,

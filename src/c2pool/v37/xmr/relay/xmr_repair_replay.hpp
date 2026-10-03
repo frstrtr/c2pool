@@ -102,16 +102,21 @@ public:
     // known and differs is skipped (`own_a0` = our lane digest at a0). On
     // success that push list becomes the most recent shadow (replacing the
     // shadow it extended, if it came from one).
+    // ★ R1 ADMISSION (F3): `adopt_shadow` = false authenticates only (the view
+    // is returned, no shadow is kept): an order that carries a receipt this
+    // node refused must never become the base of a later repair.
     std::shared_ptr<const SettlementView> replay(std::uint32_t chain, const ::v37::LaneParams& lp,
                                                  std::uint64_t P, const bytes32& spine, std::uint64_t a0,
                                                  const std::vector<Push>& own, const std::vector<Push>& served,
                                                  Base* used = nullptr,
                                                  const std::optional<bytes32>& want_a0 = std::nullopt,
                                                  const std::optional<bytes32>& own_a0 = std::nullopt,
-                                                 std::pair<std::uint64_t, bytes32>* shadow_end = nullptr) {
+                                                 std::pair<std::uint64_t, bytes32>* shadow_end = nullptr,
+                                                 bool adopt_shadow = true) {
         if (used) *used = kNone;
         const auto skip = [&](const std::optional<bytes32>& have) { return a0 && want_a0 && have && *have != *want_a0; };
         auto adopt = [&](std::vector<Push>&& all, std::map<std::uint64_t, bytes32>&& digs, int from) {
+            if (!adopt_shadow) return;   // R1 ADMISSION: authenticate only
             if (from >= 0) m_sh.erase(m_sh.begin() + from);
             // the new order supersedes every shadow it extends (same digest at that shadow's end)
             for (auto it = m_sh.begin(); it != m_sh.end();) {

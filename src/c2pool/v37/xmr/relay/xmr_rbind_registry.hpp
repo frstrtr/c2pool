@@ -10,8 +10,11 @@
 //
 // The per-JOB receipt binding the template writes into the coinbase:
 //
-//     0x02 payload = [extra_nonce 4 | rbind 32 | weight padding | tail]
+//     0x02 payload = [extra_nonce 4 | V37P v2 45 | rbind 32 | weight padding | tail]
 //     rbind        = rbind_v1(chain_id, side_data_v2)          (relay wire)
+// (RULES RATCHET R1: the per-template pool field precedes the per-job binding,
+// so rbind sits at [49..81); side_data_v2 carries the job's BALLOT, written by
+// the binder in R2 -- 0 here, the delegated abstain.)
 //
 // Every stratum job gets a FRESH extra_nonce (XmrStratumServer::make_job), so
 // extra_nonce is the job key. Right before the job's blob is built the
@@ -46,20 +49,24 @@ namespace c2pool::v37n::xmr::relay {
 
 struct JobBinding {
     ::v37::ScriptRef payee;             // the payee this job's coinbase commits to
-    SideDataV2       side;              // t_origin, identity(payee), chain, give_author
+    SideDataV2       side;              // t_origin, identity(payee), chain, give_author, ballot
     bytes32          rbind{};           // rbind_v1(chain, side)
+    u16              ballot = 0;        // RULES RATCHET: the ballot word this job's receipts carry (== side.ballot; R2 writes it)
     bool             owner_substituted = false;   // bookkeeping only (the owner-fee roll hit)
 };
 
-// The binding for one job (pure).
+// The binding for one job (pure). `ballot` is the u16 the session was told at
+// login (R2: own flag | epoch_no; 0 = delegated abstain, today's receipt).
 inline JobBinding make_job_binding(u32 chain, u64 share_diff, const ::v37::ScriptRef& payee,
-                                   u16 give_author, bool owner_substituted = false) {
+                                   u16 give_author, u16 ballot = 0, bool owner_substituted = false) {
     JobBinding b;
     b.payee = payee;
     b.side.t_lo = share_diff;
     b.side.identity = ::v37::xmr::xmr_identity_key(payee);
     b.side.chain_id = chain;
     b.side.give_author = give_author;
+    b.side.ballot = ballot;
+    b.ballot = ballot;
     b.rbind = rbind_v1(chain, b.side);
     b.owner_substituted = owner_substituted;
     return b;

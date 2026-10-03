@@ -328,6 +328,7 @@ struct XmrNodeConfig {
     std::uint64_t   ledger_decay_horizon = 0;      // dust decay (payout-threshold.md §5), Monero heights
     std::uint64_t   ledger_decay_half_life = 0;    // ... and its half-life, Monero heights
     bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
+    bool            ledger_empty_cut = false;      // R1 RECEIPT ADMISSION: a decided-bad own cut books with no cut (ruling 10-03)
     bool            ledger_drops_due = false;      // DROPS DUE (A5, ruling 09-30): the DROPS delta is a deposit into the committed due, claimed in pay-now
     bool            ledger_raindrop_enrol = false; // RAINDROP ENROL (A3, ruling 09-30): the DROPS enrolment registry (V37G), refs are ledger state
     std::uint64_t   ledger_drops_window_rw = 0;    // DROPS WINDOW (A4b, ruling 10-01): one receipt's lane weight; != 0 => DROPS work is window weight (V37W), never priced once
@@ -632,24 +633,30 @@ inline std::string settlement_fee_model_refusal(const XmrNodeConfig& c) {
 //   --owed-demo-amount    seeds owed rows at serve start (LANE-RULES: refused)
 //   drain_q               the drain rule's Q (LANE-RULES: the network constant)
 // Test networks keep them for rigs; a rig must set them identically (and the
-// LANE-RULES HELLO / pool_tag now refuse a rig that does not, by name).
+// LANE-RULES HELLO (the epoch-1 Deployment) refuses a rig that does not, by name).
 // LANE-RULES (O1): D_conf below Monero's coinbase maturity (60) is refused on
 // EVERY network but regtest -- a lane block must not be booked before its
 // coinbase can be spent; the regtest rigs keep 3/4/10.
 // ---------------------------------------------------------------------------
 inline constexpr std::uint64_t kXmrMinDConf   = 60;   // == XMR_COINBASE_MATURITY (static_assert in xmr_lane_rules_build.hpp)
-inline constexpr std::uint32_t kMainnetDrainQ = 0;    // no drain on mainnet until the drain rule's flag day
-inline constexpr std::uint32_t kMainnetDrainHCap = 0;
-inline constexpr std::uint32_t kMainnetDrainRuleVersion = 0;
+// RULES RATCHET R1 (operator rulings 2026-10-03, spec sec. 7(c)): the drain
+// rule is constitutional (R-MIN (c): 16 * Q <= 256, H_cap >= 64, H_cap < 16 Q)
+// and the ratchet is THE LAST flag day before the mainnet genesis, so mainnet
+// runs the drain AT the floor from its genesis: 16 / 64 / 1 (R / 256 per
+// Monero height, at most R / 4 per lane block). 0 / 0 / 0 (master's coinbase)
+// is no longer a mainnet state.
+inline constexpr std::uint32_t kMainnetDrainQ = 16;
+inline constexpr std::uint32_t kMainnetDrainHCap = 64;
+inline constexpr std::uint32_t kMainnetDrainRuleVersion = 1;
 // The drain rule's test-network defaults (rule version 1, B-SPEC section 2):
 // R / 256 per Monero height, at most R / 4 per lane block.
 inline constexpr std::uint32_t kLaneDrainQ = 16;
 inline constexpr std::uint32_t kLaneDrainHCap = 64;
 inline constexpr std::uint32_t kLaneDrainRuleVersion = 1;
-// The network's triple, set by main() before run_live (the flag day: one pool
-// restart with a fresh --pool-genesis on the test networks; mainnet keeps
-// 0/0/0 until the operator's own flag day). Never a flag: lane_knob_refusal()
-// pins mainnet, the lane rules (fields 23-25) pin every peer.
+// The network's triple, set by main() before run_live. Never a flag:
+// lane_knob_refusal() pins mainnet, lanerules::constitutional_check() refuses
+// anything below the R-MIN floor on every network with a drain, the lane
+// rules (fields 23-25) pin every peer. Every network runs 16 / 64 / 1.
 inline void apply_network_drain(XmrNodeConfig& c) {
     if (c.network == MoneroNetwork::Mainnet) {
         c.drain_q = kMainnetDrainQ;
@@ -694,7 +701,7 @@ inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root
     if (c.drain_h_cap != kMainnetDrainHCap || c.drain_rule_version != kMainnetDrainRuleVersion)
         return "drain_h_cap " + std::to_string(c.drain_h_cap) + " / drain_rule_version " + std::to_string(c.drain_rule_version) +
                " on mainnet: the drain rule is a network constant (" + std::to_string(kMainnetDrainHCap) + " / " +
-               std::to_string(kMainnetDrainRuleVersion) + " until the operator's mainnet flag day)";
+               std::to_string(kMainnetDrainRuleVersion) + ", the R-MIN floor, from the mainnet genesis)";
     return {};
 }
 

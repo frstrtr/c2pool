@@ -72,8 +72,12 @@ std::string triple(std::uint32_t v, std::uint32_t q, std::uint32_t h) {
 void w1_network_triple() {
     std::printf("-- W1: the network triple, the node's ledger rules, the settlement rule --\n");
     struct Net { xs::MoneroNetwork n; const char* name; bool on; };
+    // RULES RATCHET R1 (operator rulings 2026-10-03, spec sec. 7(c)): the drain floor is
+    // constitutional and the ratchet is the last flag day before the mainnet genesis, so
+    // mainnet runs the drain AT the floor (16 / 64 / 1) from its genesis -- 0 / 0 / 0 is no
+    // longer a mainnet state (re-pinned here; the 0/0/0 arm stays as a hand-set rig below).
     for (const Net& t : {Net{xs::MoneroNetwork::Stagenet, "stagenet", true}, Net{xs::MoneroNetwork::Testnet, "testnet", true},
-                         Net{xs::MoneroNetwork::Mainnet, "mainnet", false}}) {
+                         Net{xs::MoneroNetwork::Mainnet, "mainnet", true}}) {
         xs::XmrNodeConfig c; c.network = t.n; c.lane_chain = 7;
         xs::apply_network_drain(c);
         const bool trip = t.on ? (c.drain_rule_version == 1 && c.drain_q == 16 && c.drain_h_cap == 64)
@@ -85,8 +89,8 @@ void w1_network_triple() {
         const std::string d = std::string(t.name) + " triple " + triple(c.drain_rule_version, c.drain_q, c.drain_h_cap) +
                               " lane_height=" + std::to_string(r.lane_height) + " decay_from_gross=" + std::to_string(r.decay_from_gross) +
                               " rule.on=" + std::to_string(dr.on());
-        check(t.on ? "W1 test network: 16/64/1; XmrNode ledger rules lane_height + decay_from_gross ON; settlement rule ON"
-                   : "W1 mainnet: 0/0/0; XmrNode ledger rules lane_height + decay_from_gross OFF; settlement rule OFF (master)",
+        check(t.on ? "W1 every network: 16/64/1 (mainnet at the R-MIN floor from its genesis); XmrNode ledger rules lane_height + decay_from_gross ON; settlement rule ON"
+                   : "W1 (unreachable since RULES RATCHET R1: no network runs 0/0/0)",
               trip && r.lane_height == t.on && r.decay_from_gross == t.on && dr.on() == t.on &&
               dr.version == c.drain_rule_version && dr.q == c.drain_q && dr.h_cap == c.drain_h_cap, d);
     }

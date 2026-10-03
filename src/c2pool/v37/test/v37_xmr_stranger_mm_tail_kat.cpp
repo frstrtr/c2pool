@@ -19,8 +19,8 @@
 // bytes that needs a V37 field (V37P / V37C / V37D) in the 0x02 payload.
 //
 // Two callers of decode_lane_coinbase are exercised:
-//   BYTES   no pool_tag (the pre-lineage API: tools, scanners, KATs)
-//   DAEMON  our pool_tag (what main_v37_xmr passes since POOL-LINEAGE #1774)
+//   BYTES   no pool_id (the ungated API: tools, scanners, KATs)
+//   DAEMON  our pool_id (what main_v37_xmr passes; RULES RATCHET: the V37P v2 head)
 //
 //   D  the coinbase authority:
 //      (1) the REAL mainnet block 3700900 (p2pool shape) -> not-lane in both
@@ -186,7 +186,7 @@ struct LaneBlock {
         ledger.seed_owed(::v37::xmr::make_xmr_sub(P1, P2), 1'000'000'000ull);
         scfg.h_min = 0; scfg.output_cap = 0;
         scfg.set_residual_sink_std(P4, P2);
-        if (tag) scfg.pool_tag = *tag;
+        if (tag) scfg.pool_field = credit::PoolField{*tag, 1, 1};   // RULES RATCHET: the V37P v2 head
         if (cut) scfg.credit_cut_source = [](std::uint64_t& P, ::v37::bytes32& dg) { P = 0x00BC614Eull; dg = fill32(0x5C); return true; };
         if (!src.poll(&why)) return;
         provider = std::make_unique<o2::XmrSettlementTemplateProvider>(src, ledger, scfg, 0);
@@ -202,7 +202,7 @@ enum class Caller { Bytes, Daemon };
 const char* name_of(Caller c) { return c == Caller::Bytes ? "BYTES" : "DAEMON"; }
 
 // decode_blob exactly as main_v37_xmr (gate OFF): the candidate ring, our keys,
-// the configured sink, and (DAEMON) our pool_tag.
+// the configured sink, and (DAEMON) our pool_id.
 auth::CoinbaseBooking decode(LaneBlock& L, const Bytes& blob, Caller c, bool root_known = true) {
     std::vector<::v37::bytes32> cands{root_known ? L.digest() : fill32(0x77)};
     return auth::decode_lane_coinbase(blob, LANE_CHAIN, cands, L.ledger.keys(), L.scfg.residual_sink,
@@ -392,8 +392,8 @@ int main() {
         if (shape) nx.insert(nx.end(), x.begin() + 35, x.begin() + 39);
         nx.insert(nx.end(), x.end() - 35, x.end());
         if (!shape || !with_extra(X.own, nx, X.stripped)) { check("stripped block builds", false); return 1; }
-        check("V0 our lane coinbase carries the V37P field (01 R | 02 payload [.. V37P tag] | 03 21 00 root)",
-              credit::parse_pool_tag(x) == credit::PoolTagParse::Present, "extra=" + std::to_string(x.size()) + " B");
+        check("V0 our lane coinbase carries the V37P v2 field at the head (01 R | 02 [nonce | V37P ..] | 03 21 00 root)",
+              credit::parse_pool_field(x) == credit::PoolFieldParse::Present, "extra=" + std::to_string(x.size()) + " B");
     }
     suite_decode(A, X);
     suite_finalize(A, X, tmp);

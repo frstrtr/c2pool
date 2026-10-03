@@ -11,7 +11,8 @@
 // Both rules change the lane coinbase's 0x02 tail. A lane block of a pool with
 // pay-now armed carries BOTH fields, in ONE canonical order, V37C last:
 //
-//     [ nonce 4 | rbind? | pad | "V37N" B | "V37D" owed_in? | "V37P" 1 pool_tag | "V37C" P spine ]
+//     [ nonce 4 | "V37P" v2 45 | rbind? | pad | "V37N" B | "V37D" owed_in? | "V37C" P spine ]
+//     (RULES RATCHET R1: the pool field rides at the HEAD, [4..49); the tail is unchanged)
 //
 // and every reader strips the fields after its own from the END. The pool tag
 // classifies the block BEFORE anything is booked: another pool's block (or an
@@ -164,10 +165,10 @@ struct Built {
     asm_::BlockBytes                                   bytes;
     bool                                               ok = false;
     std::string                                        why;
-    Built(std::optional<::v37::bytes32> tag, bool paynow) {
+    Built(std::optional<credit::PoolField> field, bool paynow) {
         lane.scfg.credit_cut_source = [](std::uint64_t& P, ::v37::bytes32& dg) {
             const credit::CreditCut c = fixture_cut(); P = c.next_pos; dg = c.spine_digest; return true; };
-        lane.scfg.pool_tag = tag;
+        lane.scfg.pool_field = field;   // RULES RATCHET: the V37P v2 head
 #if PAYNOW_FIX
         if (paynow) {
             const auto wp = lane.wp;
@@ -196,46 +197,46 @@ Parsed_ parse_(const asm_::BlockBytes& b) {
 #if PAYNOW_FIX
 namespace pn = c2pool::v37n::xmr::paynow;
 
-std::vector<std::uint8_t> payload_of(std::optional<std::uint64_t> v37n, bool v37d, const ::v37::bytes32* tag, bool cut,
-                                     std::size_t lead = 14) {
-    std::vector<std::uint8_t> p(lead, 0x00);
-    if (lead >= 4) { p[0] = 0xDE; p[1] = 0xAD; p[2] = 0xBE; p[3] = 0xEF; }
+// [nonce 4 | V37P v2 45? | pad 10 | V37N? | V37D? | V37C?] (RULES RATCHET: the head after the nonce)
+std::vector<std::uint8_t> payload_of(std::optional<std::uint64_t> v37n, bool v37d, const ::v37::bytes32* tag, bool cut) {
+    std::vector<std::uint8_t> p = {0xDE, 0xAD, 0xBE, 0xEF};
+    if (tag)  { const auto t = credit::encode_pool_field(credit::PoolField{*tag, 1, 1}); p.insert(p.end(), t.begin(), t.end()); }
+    p.resize(p.size() + 10, 0x00);
     if (v37n) { const auto t = pn::encode_tail(*v37n);             p.insert(p.end(), t.begin(), t.end()); }
     if (v37d) { const auto t = fee::encode_donation_owed_tail(424242); p.insert(p.end(), t.begin(), t.end()); }
-    if (tag)  { const auto t = credit::encode_pool_tag_field(*tag);   p.insert(p.end(), t.begin(), t.end()); }
     if (cut)  { const auto t = credit::encode_tail(fixture_cut());   p.insert(p.end(), t.begin(), t.end()); }
     return p;
 }
 
 // ---------------------------------------------------------------------------
 void suite_codec() {
-    std::printf("== L1. codec: V37N | V37D | V37P | V37C in one payload ==\n");
+    std::printf("== L1. codec: [V37P head] | V37N | V37D | V37C in one payload ==\n");
     const auto T = b32(0x50);
     constexpr std::uint64_t B = 0x0102030405060708ull;
     for (int v37d = 0; v37d < 2; ++v37d) {
         const auto p = payload_of(B, v37d, &T, true);
-        ::v37::bytes32 got{};
-        CHECK(pn::parse_payload(p) == std::optional<std::uint64_t>(B), "[..|V37N%s|V37P|V37C]: the pay-now base reads back through V37P",
+        credit::PoolField got{};
+        CHECK(pn::parse_payload(p) == std::optional<std::uint64_t>(B), "[V37P head|..|V37N%s|V37C]: the pay-now base reads back (the head is not in the tail)",
               v37d ? "|V37D" : "");
-        CHECK(credit::parse_pool_tag_payload(p, &got) == credit::PoolTagParse::Present && got == T, "  the pool tag reads back (Present)");
+        CHECK(credit::parse_pool_field_payload(p, &got) == credit::PoolFieldParse::Present && got.pool_id == T, "  the pool field reads back at [4..49) (Present)");
         const auto dn = fee::parse_donation_owed_payload(p);
         CHECK(v37d ? (dn && *dn == 424242) : !dn, "  V37D %s", v37d ? "reads back" : "absent");
         const auto cc = credit::parse_tail(p);
         CHECK(cc && *cc == fixture_cut(), "  V37C still LAST (parse_tail unchanged)");
     }
     CHECK(pn::parse_payload(payload_of(B, true, nullptr, true)) == std::optional<std::uint64_t>(B),
-          "untagged [..|V37N|V37D|V37C] (pay-now's own layout) still parses");
-    CHECK(!pn::parse_payload(payload_of(std::nullopt, true, &T, true)), "tagged, no V37N -> no pay-now (nullopt)");
+          "unfielded [..|V37N|V37D|V37C] (pay-now's own layout) still parses");
+    CHECK(!pn::parse_payload(payload_of(std::nullopt, true, &T, true)), "fielded, no V37N -> no pay-now (nullopt)");
     auto pm = payload_of(B, true, &T, true);
-    pm[pm.size() - 44 - 37 + 4] = 2;   // V37P version byte
-    CHECK(credit::parse_pool_tag_payload(pm) == credit::PoolTagParse::Malformed && !pn::parse_payload(pm) &&
-              !fee::parse_donation_owed_payload(pm),
-          "malformed V37P (version 2): V37N and V37D reads fail CLOSED (never mis-located)");
+    pm[4 + 4] = 1;   // V37P version byte
+    CHECK(credit::parse_pool_field_payload(pm) == credit::PoolFieldParse::Malformed && pn::parse_payload(pm) == std::optional<std::uint64_t>(B) &&
+              fee::parse_donation_owed_payload(pm).has_value(),
+          "a malformed V37P head (version 1) is the lineage gate's business: the END-anchored V37N / V37D reads are unaffected");
 }
 
 // ---------------------------------------------------------------------------
 void suite_source_order() {
-    std::printf("== L2. the settlement source emits V37N | V37D | V37P | V37C ==\n");
+    std::printf("== L2. the settlement source emits the V37P head and the tail V37N | V37D | V37C ==\n");
     constexpr fee::DonationNet kNet = fee::DonationNet::Regtest;
     constexpr std::uint64_t kReward = 600000000000ull + 12345ull;
     LaneFixture f;
@@ -253,31 +254,33 @@ void suite_source_order() {
     ctx.fixed = {fee::donation_marker(kNet)}; ctx.h_min = 0; ctx.output_cap = 64;
     ctx.has_credit_cut = true; ctx.credit_cut = fixture_cut();
     ctx.has_paynow = true; ctx.paynow_payees = f.wp;
-    const auto T = b32(0x77);
-    ctx.has_pool_tag = true; ctx.pool_tag = T;
+    const credit::PoolField F{b32(0x77), 1, 1};
+    ctx.has_pool_field = true; ctx.pool_field = F;
     std::string why;
     auto src = o2::XmrOwedSettlementSource::build(L, pay_of, ctx, kReward, &why);
-    CHECK(src != nullptr && src->paynow_on(), "source builds with pay-now + pool tag + fee model ON: %s", why.empty() ? "ok" : why.c_str());
+    CHECK(src != nullptr && src->paynow_on(), "source builds with pay-now + pool field + fee model ON: %s", why.empty() ? "ok" : why.c_str());
     if (!src) return;
     const auto tail = src->extra_nonce_tail();
     std::vector<std::uint8_t> want = pn::encode_tail(src->paynow_base());
-    for (const auto& part : {fee::encode_donation_owed_tail(0), credit::encode_pool_tag_field(T), credit::encode_tail(fixture_cut())})
+    for (const auto& part : {fee::encode_donation_owed_tail(0), credit::encode_tail(fixture_cut())})
         want.insert(want.end(), part.begin(), part.end());
-    CHECK(tail == want && tail.size() == 12 + 12 + 37 + 44,
-          "tail == V37N(%llu) || V37D(0) || V37P || V37C byte for byte (%zu B)", (unsigned long long)src->paynow_base(), tail.size());
-    ::v37::bytes32 got{};
-    CHECK(pn::parse_payload(tail) == std::optional<std::uint64_t>(src->paynow_base()) && fee::parse_donation_owed_payload(tail) &&
-              credit::parse_pool_tag_payload(tail, &got) == credit::PoolTagParse::Present && got == T && credit::parse_tail(tail),
-          "every field reads back from the source's own tail");
+    CHECK(tail == want && tail.size() == 12 + 12 + 44,
+          "tail == V37N(%llu) || V37D(0) || V37C byte for byte (%zu B): no V37P in the tail", (unsigned long long)src->paynow_base(), tail.size());
+    CHECK(src->extra_nonce_head() == credit::encode_pool_field(F) && src->extra_nonce_head().size() == 45,
+          "head == the 45-byte V37P v2 field (written after the nonce, before rbind)");
+    CHECK(pn::parse_payload(tail) == std::optional<std::uint64_t>(src->paynow_base()) && fee::parse_donation_owed_payload(tail) && credit::parse_tail(tail),
+          "every tail field reads back from the source's own tail");
 }
 
 // ---------------------------------------------------------------------------
 void suite_blocks() {
     std::printf("== L3. real assembled blocks: tag classifies BEFORE any pay-now booking ==\n");
     const ::v37::LaneParams lp{};
-    const auto TAG_A = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0), c2pool::v37n::xmr::lanerules::rules_digest(c2pool::v37n::xmr::lanerules::LaneRules{}));
-    const auto TAG_B = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xB0), c2pool::v37n::xmr::lanerules::rules_digest(c2pool::v37n::xmr::lanerules::LaneRules{}));
-    Built a(TAG_A, true), b(TAG_B, true), u(std::nullopt, true), t(TAG_A, false);
+    (void)lp;
+    const auto TAG_A = lineage::pool_id(3, LANE_CHAIN, b32(0xA0));
+    const auto TAG_B = lineage::pool_id(3, LANE_CHAIN, b32(0xB0));
+    const credit::PoolField FA{TAG_A, 1, 1}, FB{TAG_B, 1, 1};
+    Built a(FA, true), b(FB, true), u(std::nullopt, true), t(FA, false);
     CHECK(a.ok && b.ok && u.ok && t.ok, "four templates build + materialize (A tag+pay-now, B tag+pay-now, untagged pay-now, A tag only): %s",
           !a.ok ? a.why.c_str() : !b.ok ? b.why.c_str() : !u.ok ? u.why.c_str() : !t.ok ? t.why.c_str() : "ok");
     if (!(a.ok && b.ok && u.ok && t.ok)) return;
@@ -290,10 +293,10 @@ void suite_blocks() {
           "A vs the tag-only block: 0x02 payload %zu -> %zu B (+12: the V37N field only)", t.bytes.extra_nonce_size, a.bytes.extra_nonce_size);
     const std::uint8_t* ap = a.bytes.full_blob.data() + a.bytes.extra_nonce_offset;
     const std::size_t en = a.bytes.extra_nonce_size;
-    const auto fn = pn::encode_tail(B), fp = credit::encode_pool_tag_field(TAG_A), fc = credit::encode_tail(fixture_cut());
-    CHECK(en >= 93 && std::memcmp(ap + en - 44, fc.data(), 44) == 0 && std::memcmp(ap + en - 81, fp.data(), 37) == 0 &&
-              std::memcmp(ap + en - 93, fn.data(), 12) == 0,
-          "A's payload ends V37N | V37P | V37C (fee OFF: no V37D), V37C last");
+    const auto fn = pn::encode_tail(B), fp = credit::encode_pool_field(FA), fc = credit::encode_tail(fixture_cut());
+    CHECK(en >= 4 + 45 + 56 && std::memcmp(ap + 4, fp.data(), 45) == 0 && std::memcmp(ap + en - 44, fc.data(), 44) == 0 &&
+              std::memcmp(ap + en - 56, fn.data(), 12) == 0,
+          "A's payload: V37P v2 at [4..49), then ends V37N | V37C (fee OFF: no V37D), V37C last");
 
     std::vector<::v37::bytes32> cands{a.lane.ledger.ledger().owed_digest()};
     const auto keys = a.lane.ledger.keys();
@@ -354,21 +357,21 @@ void suite_blocks() {
           "an untagged pay-now block: Untagged -> \"not-lane:\", V37N never read");
     // --- a malformed V37P on our pay-now block: strict reject, no V37N
     std::vector<std::uint8_t> mal = a.bytes.full_blob;
-    mal[a.bytes.extra_nonce_offset + en - 81 + 4] = 2;
+    mal[a.bytes.extra_nonce_offset + 4 + 4] = 1;
     const auto mk = auth::decode_lane_coinbase(mal, LANE_CHAIN, cands, keys, a.lane.scfg.residual_sink,
                                                a.lane.scfg.residual_sink_identity, a.lane.ledger.pay_of(), &TAG_A);
-    CHECK(!mk.is_lane && mk.lineage == lineage::BlockLineage::Malformed && !mk.paynow_base, "V37P version flipped to 2: Malformed -> ordinary, V37N never read");
+    CHECK(!mk.is_lane && mk.lineage == lineage::BlockLineage::Malformed && !mk.paynow_base, "V37P version flipped to 1: Malformed -> ordinary, V37N never read");
     // --- the K_fair shape gate ACCEPTs the tagged pay-now template
     const o2::KFairCoinbaseShape sa = o2::inspect_kfair_coinbase(*a.snap.tpl, a.lane.ledger.ledger().owed_digest());
     CHECK(sa.ok && sa.canonical, "shape gate ACCEPTs the tagged pay-now template: %s", sa.ok ? "ok" : sa.why.c_str());
     asm_::BlockBytes a1; std::string w1;
     CHECK(a.snap.tpl->materialize(1, a1, &w1) && std::memcmp(a1.full_blob.data() + a1.extra_nonce_offset + 4, ap + 4, en - 4) == 0,
-          "extra_nonce 1: padding + V37N + V37P + V37C untouched");
+          "extra_nonce 1: the V37P head + padding + V37N + V37C untouched");
 }
 
 // ---------------------------------------------------------------------------
 void suite_widest() {
-    std::printf("== L4. widest payload [nonce|rbind 32|pad|V37N|V37D|V37P|V37C] = 151 B ==\n");
+    std::printf("== L4. wide payload [nonce|V37P 45|rbind 32|pad|V37N|V37D|V37C] = 159 B ==\n");
     namespace akat = ::c2pool::xmr::assembly::kat;
     asm_::AssemblyInputs a;
     a.miner = akat::miner(3000000, 300000, 18000000000000000000ull);
@@ -384,17 +387,17 @@ void suite_widest() {
     }
     const auto TAG = b32(0x77);
     constexpr std::uint64_t B = 10000000001ull;
+    a.extra_nonce_head = credit::encode_pool_field(credit::PoolField{TAG, 1, 1});   // RULES RATCHET: the head
     a.extra_nonce_tail = pn::encode_tail(B);
     { const auto d = fee::encode_donation_owed_tail(x6::fold_identity_owed(a.settle)); a.extra_nonce_tail.insert(a.extra_nonce_tail.end(), d.begin(), d.end()); }
-    { const auto f = credit::encode_pool_tag_field(TAG); a.extra_nonce_tail.insert(a.extra_nonce_tail.end(), f.begin(), f.end()); }
     { const auto c = credit::encode_tail(fixture_cut()); a.extra_nonce_tail.insert(a.extra_nonce_tail.end(), c.begin(), c.end()); }
     a.extra_nonce_bind_size = 32;
     a.extra_nonce_bind = [](std::uint32_t en, std::uint8_t* out) { for (int i = 0; i < 32; ++i) out[i] = static_cast<std::uint8_t>(en * 7 + i); return true; };
     std::string why;
     auto t = asm_::XmrBlockAssembler::build(a, &why);
-    const std::size_t bound = static_cast<std::size_t>(::c2pool::xmr::EXTRA_NONCE_MAX_SIZE) + ::c2pool::xmr::EXTRA_NONCE_BIND_MAX +
-                              asm_::PAYNOW_TAIL_BYTES + asm_::DONATION_OWED_TAIL_BYTES + asm_::POOL_TAG_FIELD_BYTES + asm_::CREDIT_CUT_TAIL_BYTES;
-    CHECK(t != nullptr && bound == 151, "the widest payload builds (bound 14 + 32 + 12 + 12 + 37 + 44 = %zu): %s", bound, t ? "ok" : why.c_str());
+    const std::size_t bound = static_cast<std::size_t>(::c2pool::xmr::EXTRA_NONCE_MAX_SIZE) + asm_::POOL_FIELD_BYTES + ::c2pool::xmr::EXTRA_NONCE_BIND_MAX +
+                              asm_::PAYNOW_TAIL_BYTES + asm_::DONATION_OWED_TAIL_BYTES + asm_::CREDIT_CUT_TAIL_BYTES;
+    CHECK(t != nullptr && bound == 159, "the payload builds (bound 14 + 45 + 32 + 12 + 12 + 44 = %zu): %s", bound, t ? "ok" : why.c_str());
     if (!t) return;
     asm_::BlockBytes b;
     const bool m = t->materialize(5, b, &why);
@@ -405,14 +408,15 @@ void suite_widest() {
     const bool pp = asm_::parse_coinbase_prefix(b.full_blob.data() + b.miner_tx_offset, b.miner_tx_size, rc, &h, &used);
     CHECK(pp && pn::parse(rc.tx_extra) == std::optional<std::uint64_t>(B) && fee::parse_donation_owed(rc.tx_extra).has_value() &&
               lineage::classify_lineage(rc.tx_extra, TAG) == lineage::BlockLineage::Own && credit::parse_from_tx_extra(rc.tx_extra) == std::optional<credit::CreditCut>(fixture_cut()),
-          "V37N base, V37D, V37P (Own) and V37C all read back from the block");
+          "V37N base, V37D, V37P (Own, at the head) and V37C all read back from the block");
 }
 #else
 void suite_base() {
     std::printf("== BASE: POOL-LINEAGE alone, no pay-now on this tree ==\n");
     const ::v37::LaneParams lp{};
-    Built a(lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0), c2pool::v37n::xmr::lanerules::rules_digest(c2pool::v37n::xmr::lanerules::LaneRules{})), true);
-    CHECK(a.ok, "tagged template builds: %s", a.ok ? "ok" : a.why.c_str());
+    (void)lp;
+    Built a(credit::PoolField{lineage::pool_id(3, LANE_CHAIN, b32(0xA0)), 1, 1}, true);
+    CHECK(a.ok, "fielded template builds: %s", a.ok ? "ok" : a.why.c_str());
     bool has_n = false;
     if (a.ok) {
         const std::uint8_t* ap = a.bytes.full_blob.data() + a.bytes.extra_nonce_offset;
