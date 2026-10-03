@@ -11,9 +11,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Daemonless Dash
 
-Security Model: Zero RPC / Zero Local Credentials".
-
-Explicitly highlight: "Unlike legacy P2Pool forks that require RPC credentials to a local Dash Core daemon, C2Pool speaks the Dash P2P wire protocol natively. It requires zero RPC credentials, zero local wallet access, and zero administrative daemon permissions.
+Security model: no RPC and no local credentials. Older P2Pool forks need RPC
+credentials to a local Dash Core daemon. c2pool speaks the Dash P2P wire protocol
+itself, so it needs no RPC credentials, no local wallet access and no
+administrative access to a daemon.
 
 c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
@@ -94,6 +95,7 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
 | **Dash** (DASH) | X11 | — | Live, daemonless (`c2pool-dash --run`; dash.voidbind.com); dashd-attached posture via `--coin-rpc` still supported |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
+| **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
@@ -133,21 +135,23 @@ and does not yet exist, so the work can be judged on what it actually is.
   (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **merged**
   (PR #1512); a **single-node stagenet daemon is live** (monerod-bound, PRs
   #1520 / #1529). Multi-node settlement commits one owed ledger (`owed_digest`)
-  with coinbase authority and an on-chain credit cut (PRs #1697 / #1704); the
-  earlier section-13 state-root draft (PR #1551) was closed in its favour.
+  with an on-chain credit cut (PRs #1697 / #1704); the earlier section-13
+  state-root draft (PR #1551) was closed in its favour. Every node recomputes the
+  lane coinbase and books a block that does not match as debit-only (PR #1884);
+  every consensus parameter is part of the pool identity (PR #1894); and old
+  balances drain from a capped slice of each block (PR #1895).
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
 - The production multi-coin pool code (v36 line) that c2pool actually runs.
 
 ### What does NOT yet exist — the honest gaps
-- **Not wired into a live node.** The v37 engine exists as a **reference/prototype
-  behind CI**; it is **not** connected to a live production node lifecycle for
-  settlement. The F1 finalize-driver obligation is **dormant** — no production
-  finalize caller is wired — so nothing settles on a live network today.
-- **No public v37 testnet.** There is no running v37 network; the engine and lanes
-  exercise **simnet / loopback only**. The runnable v37 artifacts are the engine
-  tree and the prototypes above.
+- **Not wired into a production node.** Outside the XMR lane, the v37 engine is a
+  **reference/prototype behind CI** and nothing settles on a live network. The
+  XMR lane settles on Monero stagenet in the author's multi-node test runs; it is
+  not in production anywhere.
+- **No public v37 network.** The XMR lane runs on Monero stagenet in test runs;
+  the other lanes exercise **simnet / loopback only**.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
