@@ -103,6 +103,10 @@ void Actual::HANDLER(getaddrs)
 
 void Actual::HANDLER(shares)
 {
+    // #1828: per-message caps before any share is parsed or hashed.
+    if (!precheck_raw_shares(msg->m_shares, precheck::Kind::shares, peer->addr()))
+        return;
+
     dash::HandleSharesData result;
 
     for (auto wrappedshare : msg->m_shares)
@@ -159,6 +163,12 @@ void Actual::HANDLER(sharereq)
         {
             rshares.emplace_back(share.version(), pack(share));
         }
+        // #1828: a reply over the oracle payload cap would be dropped by the
+        // receiver (p2pool-dash util/p2protocol.py:38, and our own receive
+        // cap); answer too_long instead, as p2pool-dash does
+        // (p2pool/p2p.py:399-404 handle_sharereq on p2protocol.TooLong).
+        if (!precheck::sharereply_fits(rshares))
+            throw std::invalid_argument("sharereply payload exceeds 3145728 bytes");
         auto reply_msg = message_sharereply::make_raw(msg->m_id, dash::ShareReplyResult::good, rshares);
         peer->write(std::move(reply_msg));
     }
@@ -178,6 +188,15 @@ void Actual::HANDLER(sharereq)
 void Actual::HANDLER(sharereply)
 {
     dash::ShareReplyData result;
+    // #1828: a reply over the per-message caps resolves the pending request
+    // EMPTY right away (the same outcome as a non-good result), before any
+    // share is parsed or hashed.
+    if (msg->m_result == ShareReplyResult::good
+        && !precheck_raw_shares(msg->m_shares, precheck::Kind::sharereply, peer->addr()))
+    {
+        got_share_reply(msg->m_id, result);
+        return;
+    }
     if (msg->m_result == ShareReplyResult::good)
     {
         result.m_items.reserve(msg->m_shares.size());

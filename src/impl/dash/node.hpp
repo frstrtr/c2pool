@@ -20,6 +20,7 @@
 #include "share.hpp"
 #include "share_chain.hpp"
 #include "share_tracker.hpp"
+#include "share_precheck.hpp"        // #1828 per-message caps on incoming shares
 #include "peer.hpp"
 #include "min_protocol_gate.hpp"
 #include "tracker_acquire.hpp"       // #889: bounded acquisition — BLOCK-WINNING mint path only
@@ -386,6 +387,13 @@ protected:
     // read from anywhere (dashboard/KAT) — atomic, relaxed; it is a diagnostic
     // gauge, not a synchronisation point.
     std::atomic<uint64_t> m_block_share_lock_forfeits{0};
+
+    // #1828: incoming 'shares' / 'sharereply' messages dropped whole by the
+    // per-message caps, and shares dropped by them (whole-message drops plus
+    // per-share oversize drops). IO thread writes, anyone reads; diagnostic
+    // gauges, relaxed. Node-global: per-peer attribution is #1829.
+    std::atomic<uint64_t> m_precheck_dropped_messages{0};
+    std::atomic<uint64_t> m_precheck_dropped_shares{0};
 
     // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
     // Runtime P2P accept-floor, seeded from the per-network share profile
@@ -1035,6 +1043,16 @@ public:
     // translation unit (slice .4) and are intentionally link-deferred here;
     // the dispatch layer object-compiles against these declarations.
     void processing_shares(HandleSharesData& data, NetService addr);
+
+    /// #1828: the per-message caps (share_precheck.hpp precheck_raw_shares,
+    /// numbers from the live SharechainConfig::share_profile()) applied to an
+    /// incoming 'shares' / 'sharereply' before any share is parsed or hashed.
+    /// Erases oversize items in place; returns false when the whole message
+    /// is dropped. Counts, logs (rate-limited); no ban, no disconnect.
+    /// IO thread. Body in node.cpp.
+    bool precheck_raw_shares(std::vector<chain::RawShare>& shares,
+                             precheck::Kind kind, const NetService& addr);
+
     std::vector<dash::ShareType> handle_get_share(std::vector<uint256> hashes,
         uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
 
@@ -1165,6 +1183,15 @@ public:
     /// a line someone has to notice.
     uint64_t block_share_lock_forfeits() const {
         return m_block_share_lock_forfeits.load(std::memory_order_relaxed);
+    }
+
+    /// #1828 observability: incoming share messages dropped whole by the
+    /// per-message caps, and shares dropped by them.
+    uint64_t precheck_dropped_messages() const {
+        return m_precheck_dropped_messages.load(std::memory_order_relaxed);
+    }
+    uint64_t precheck_dropped_shares() const {
+        return m_precheck_dropped_shares.load(std::memory_order_relaxed);
     }
 
     /// Register the current template's txs in m_known_txs so send_shares can

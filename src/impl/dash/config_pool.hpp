@@ -286,6 +286,20 @@ struct SharechainConfig
     ///   emergency_decay                -> v36 time-decay retarget on the producer
     ///                                     side (share_producer.hpp
     ///                                     compute_share_target).
+    ///   max_shares_per_shares_msg,
+    ///   max_shares_per_sharereply,
+    ///   max_share_wire_bytes           -> share_precheck.hpp precheck_raw_shares:
+    ///                                     per-message caps on incoming
+    ///                                     'shares' / 'sharereply', applied
+    ///                                     before any share is parsed or
+    ///                                     hashed (#1828). Public: the
+    ///                                     oracle's 3145728-byte payload cap
+    ///                                     re-expressed (nothing an honest
+    ///                                     p2pool-dash peer sends is refused).
+    ///                                     DASH v36 network: 64 / 1001 /
+    ///                                     65536. Pinned against the
+    ///                                     share_precheck.hpp constants by
+    ///                                     static_assert there.
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -295,6 +309,9 @@ struct SharechainConfig
         bool     maintainer_only_authority;
         bool     future_timestamp_bound;
         bool     emergency_decay;
+        uint32_t max_shares_per_shares_msg;
+        uint32_t max_shares_per_sharereply;
+        uint32_t max_share_wire_bytes;
     };
 
     static constexpr ShareProfile PUBLIC_PROFILE{
@@ -305,6 +322,9 @@ struct SharechainConfig
         /*maintainer_only_authority=*/false,
         /*future_timestamp_bound=*/false,
         /*emergency_decay=*/false,
+        /*max_shares_per_shares_msg=*/13162,   // (3145728 - 3) / 239
+        /*max_shares_per_sharereply=*/13162,
+        /*max_share_wire_bytes=*/3145728,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
         /*target_share_version=*/36,
@@ -314,6 +334,9 @@ struct SharechainConfig
         /*maintainer_only_authority=*/true,
         /*future_timestamp_bound=*/true,
         /*emergency_decay=*/true,
+        /*max_shares_per_shares_msg=*/64,
+        /*max_shares_per_sharereply=*/1001,
+        /*max_share_wire_bytes=*/65536,
     };
     // The public profile is master's protocol pair, byte for byte.
     static_assert(PUBLIC_PROFILE.advertised_protocol_version == ADVERTISED_PROTOCOL_VERSION &&
