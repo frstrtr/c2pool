@@ -159,6 +159,28 @@ and does not yet exist, so the work can be judged on what it actually is.
   lane coinbase and books a block that does not match as debit-only (PR #1884);
   every consensus parameter is part of the pool identity (PR #1894); and old
   balances drain from a capped slice of each block (PR #1895).
+  Since 2026-09-27 the lane also has: an installable node package with a
+  run-a-node guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md));
+  raindrops (small-miner credits) on by default (PR #1818); a built-in mainnet
+  bootstrap list, peer discovery and a persistent peer book (PRs #1819 / #1820);
+  repair below the vault horizon that survives restarts (PR #1824); a verify worker
+  pool for raindrops (PR #1839); a refusal of node-local settings that would split
+  the owed ledger on mainnet (PR #1872); and the node's fees disclosed in every
+  stratum login reply (PR #1880). The payout rules, fees and known limits are
+  written up in [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md)
+  (PR #1879), and a public comparison with other decentralized pools is in
+  [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR #1901).
+- **Rule upgrades without stopping the pool, voted by miners' work (designed, not
+  implemented).** Rule epochs are appended to the lane's history and activate by a
+  vote weighted by miners' finalized work. Each miner's work votes; by default the
+  vote is delegated to the node operator, and any miner can override it with one
+  word in a stock xmrig password. Old nodes hold instead of forking, and a fixed
+  constitution means earned balances cannot be reduced, delayed or redirected by
+  any vote. Today a rule change on the XMR lane is still a new pool genesis. The
+  design note is in PR #1908 (draft). The first slice, which fixes the pool identity
+  from a derived genesis and adds the epoch and vote sections to the wire and the
+  store, is in PR #1911 (draft). It is meant to be the last flag day before the
+  Monero mainnet genesis.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
@@ -178,7 +200,10 @@ and does not yet exist, so the work can be judged on what it actually is.
   the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR
   #1518). Three daemonless nodes have run together on stagenet in day-long
   capstone tests (PRs #1697 / #1704 / #1857); no multi-node run has yet met the
-  full capstone bar. Mainnet stays double-fenced.
+  full capstone bar. Attempt 9 started on 2026-10-03 at 09:36 UTC (24 hours).
+  Mainnet stays double-fenced. Funding for the mainnet milestone is requested in
+  Monero CCS proposal !699 (25 XMR), which is on the agenda of the Monero community
+  workgroup meeting of 2026-10-03.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
