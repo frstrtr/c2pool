@@ -140,13 +140,6 @@ and does not yet exist, so the work can be judged on what it actually is.
   lane coinbase and books a block that does not match as debit-only (PR #1884);
   every consensus parameter is part of the pool identity (PR #1894); and old
   balances drain from a capped slice of each block (PR #1895).
-- **Rule upgrades without stopping the pool (designed, not implemented):** rule
-  epochs appended to the lane's history and activated by a vote weighted by
-  miners' finalized work (delegated to the node operator by default, overridable
-  by any miner from a stock xmrig password); old nodes hold instead of forking;
-  earned balances cannot be voted away. Today a rule change on the XMR lane is
-  still a new pool genesis. Design note:
-  [docs/xmr-lane/rules-ratchet.md](docs/xmr-lane/rules-ratchet.md).
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
