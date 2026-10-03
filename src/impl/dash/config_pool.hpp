@@ -331,6 +331,9 @@ struct SharechainConfig
     ///                                     (a peer cannot compute them). 0 for
     ///                                     a coinbase-only share. Unused where
     ///                                     both flags above are false.
+    // The profiles below use designated initializers: C++20 requires them in
+    // declaration order, so adding a field can never shift a value into the
+    // neighbouring field of the same type without a compile error.
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -350,36 +353,36 @@ struct SharechainConfig
     };
 
     static constexpr ShareProfile PUBLIC_PROFILE{
-        /*target_share_version=*/16,
-        /*ratchet_floor_protocol_version=*/MINIMUM_PROTOCOL_VERSION,
-        /*advertised_protocol_version=*/ADVERTISED_PROTOCOL_VERSION,
-        /*v36_donation_p2pkh=*/false,
-        /*maintainer_only_authority=*/false,
-        /*future_timestamp_bound=*/false,
-        /*emergency_decay=*/false,
-        /*max_shares_per_shares_msg=*/13162,   // (3145728 - 3) / 239
-        /*max_shares_per_sharereply=*/13162,
-        /*max_share_wire_bytes=*/3145728,
-        /*full_misbehaviour_grading=*/false,
-        /*naughty_seed=*/false,
-        /*excessive_reward_warning=*/false,
-        /*naughty_fee_allowance_x_reward=*/0,
+        .target_share_version = 16,
+        .ratchet_floor_protocol_version = MINIMUM_PROTOCOL_VERSION,
+        .advertised_protocol_version = ADVERTISED_PROTOCOL_VERSION,
+        .v36_donation_p2pkh = false,
+        .maintainer_only_authority = false,
+        .future_timestamp_bound = false,
+        .emergency_decay = false,
+        .max_shares_per_shares_msg = 13162,   // (3145728 - 3) / 239
+        .max_shares_per_sharereply = 13162,
+        .max_share_wire_bytes = 3145728,
+        .full_misbehaviour_grading = false,
+        .naughty_seed = false,
+        .excessive_reward_warning = false,
+        .naughty_fee_allowance_x_reward = 0,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
-        /*target_share_version=*/36,
-        /*ratchet_floor_protocol_version=*/ISOLATED_V36_PROTOCOL_VERSION,
-        /*advertised_protocol_version=*/ISOLATED_V36_PROTOCOL_VERSION,
-        /*v36_donation_p2pkh=*/true,
-        /*maintainer_only_authority=*/true,
-        /*future_timestamp_bound=*/true,
-        /*emergency_decay=*/true,
-        /*max_shares_per_shares_msg=*/64,
-        /*max_shares_per_sharereply=*/1001,
-        /*max_share_wire_bytes=*/65536,
-        /*full_misbehaviour_grading=*/true,
-        /*naughty_seed=*/false,   // p2pool v35+ parity: no excessive-reward seed
-        /*excessive_reward_warning=*/true,
-        /*naughty_fee_allowance_x_reward=*/1,
+        .target_share_version = 36,
+        .ratchet_floor_protocol_version = ISOLATED_V36_PROTOCOL_VERSION,
+        .advertised_protocol_version = ISOLATED_V36_PROTOCOL_VERSION,
+        .v36_donation_p2pkh = true,
+        .maintainer_only_authority = true,
+        .future_timestamp_bound = true,
+        .emergency_decay = true,
+        .max_shares_per_shares_msg = 64,
+        .max_shares_per_sharereply = 1001,
+        .max_share_wire_bytes = 65536,
+        .full_misbehaviour_grading = true,
+        .naughty_seed = false,   // p2pool v35+ parity: no excessive-reward seed
+        .excessive_reward_warning = true,
+        .naughty_fee_allowance_x_reward = 1,
     };
     // The public profile is master's protocol pair, byte for byte.
     static_assert(PUBLIC_PROFILE.advertised_protocol_version == ADVERTISED_PROTOCOL_VERSION &&
