@@ -267,6 +267,13 @@ static bool          g_relay_deep_order = true;         // --relay-deep-order on
 static bool          g_relay_shadow_persist = true;     // --relay-shadow-persist on|off (off = RC5)
 static std::uint64_t g_relay_deep_probe_step = 64;      // --relay-deep-probe-step N
 static std::uint64_t g_relay_shadow_persist_bytes = 256ull << 20;   // --relay-shadow-persist-bytes N
+// ★ HOLD-ROUND-3 F3b: --relay-order-retain N -- the durable lane order serves (and keeps on
+// disk) the last N positions; 0 = everything. Unset = by network: 1,000,000 on mainnet
+// (DESIGN 3.3: ~84 MB of .order/.digest, a lineage gap of 5.5 h at 50 receipts/s), 0 on
+// stagenet / testnet / regtest. The shadows' RAM budget follows it (4 x N pushes).
+static constexpr std::uint64_t kRelayOrderRetainUnset = ~std::uint64_t{0};
+static constexpr std::uint64_t kRelayOrderRetainMainnet = 1000000;
+static std::uint64_t g_relay_order_retain = kRelayOrderRetainUnset;
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 // --test-crash-after-publish N (regtest rig only): the process exits (137, no cleanup) right after its
 // N-th found block was PUBLISHED and before its FOUND event reaches finalize-connect -- the window in
@@ -2017,6 +2024,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     std::uint64_t relay_repair_suffix = 0, relay_repair_shadow = 0, relay_repair_deep_alarms = 0;   // REPAIR-HORIZON
     relay::RepairReplayer relay_replayer{2 * (g_relay_vault_horizon ? g_relay_vault_horizon : 8640)};   // REPAIR-HORIZON shadow
     std::set<std::string> relay_deep_alarmed;                                // REPAIR-HORIZON: one alarm per (P, spine)
+    // ★ HOLD-ROUND-3 F3a: whole-order fallbacks every peer refused (one alarm per cut), whole orders verified at the spine,
+    // and DROPS prefix holds that armed the fallback (no verified base for [0, a0))
+    std::set<std::string> relay_full_alarmed;
+    std::uint64_t relay_repair_full_alarms = 0, relay_repair_full_verified = 0, drops_lane_full_fallback = 0;
     std::mutex    relay_log_mtx;
     std::vector<std::string> relay_log_q;
     std::atomic<std::uint64_t> mint_ok{0}, mint_fail{0}, mint_below{0}, mint_nopayee{0};
@@ -2240,6 +2251,18 @@ static int run_live(const XmrNodeConfig& cfg) {
             // REPAIR-HORIZON: a divergence below every ready peer's vault horizon is
             // named LOUDLY (once per cut) -- still undecided: the block HOLDS (RC-HOLD)
             std::uint64_t deep_a0 = 0;
+            // ★ HOLD-ROUND-3 F3a: the WHOLE-ORDER fallback refused by every peer (below their
+            // retention / RC5 peers) -- named once per cut; the block HOLDS (undecided)
+            std::string full_detail;
+            if (st == relay::XmrRelayNode::RepairState::Exhausted && relay_node->repair_full_exhausted(P, spine, &full_detail) &&
+                relay_full_alarmed.insert(key).second) {
+                ++relay_repair_full_alarms;
+                std::printf("relay-ALARM REPAIR-DEEP RETENTION: the whole order [0,%llu) of the winner's cut spine=%s… is served by no connected "
+                            "peer (%s): its positions are below every peer's --relay-order-retain window, or the peers run without a durable order. "
+                            "The block HOLDS; this node needs a peer that retains those positions, or the cold-boot path (ledger + lane snapshot). [%s]\n",
+                            (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), full_detail.c_str(), relay_node->repair_status(P, spine).c_str());
+                std::fflush(stdout);
+            }
             if (st == relay::XmrRelayNode::RepairState::Exhausted && relay_node->repair_deep_divergence(P, spine, &deep_a0) &&
                 relay_deep_alarmed.insert(key).second) {
                 ++relay_repair_deep_alarms;
@@ -2255,12 +2278,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         std::optional<::v37::bytes32> peer_a0_digest;
         const std::uint64_t a0 = relay_node->repair_a0(P, spine, &peer_a0_digest);   // REPAIR-HORIZON: 0 = the whole order
-        if (a0 > feed_log.size()) {
-            ++cut_pending;
-            why = "cut-pending: relay repair of P=" + std::to_string(P) + " served [" + std::to_string(a0) + ",P) but our replay log has only " +
-                  std::to_string(feed_log.size()) + " pushes (retry)";
-            return nullptr;
-        }
+        // ★ HOLD-ROUND-3 F3a: a served suffix [a0, P) that starts beyond our own replay
+        // log (a fresh or long-partitioned node) used to return "our replay log has
+        // only N pushes (retry)" here -- for ever: our log never reaches a0 (positions
+        // are node-local). The replayer skips our own log as a base by itself
+        // (a0 > own.size()) and tries the shadows; with none, the replay fails, the
+        // repair is rejected and the relay falls back to the WHOLE order [0, P).
         // ONE RECEIPT, ONE PLACE: an honest order never repeats an id (the relay
         // dedups before the lane), so a served order that does is the winner
         // counting a receipt twice to steer the next anchor. Refuse it; the
@@ -2339,8 +2362,11 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!rv) {
             relay_node->repair_reject(P, spine);
             ++relay_repair_rejected; ++cut_pending;
+            // ★ HOLD-ROUND-3 F3a: a suffix that reached the spine from no base held here now arms the
+            // relay's WHOLE-ORDER fallback (repair_reject); the status names it
             why = "cut-pending: the repaired order did not reproduce the winner's spine at P=" + std::to_string(P) +
-                  " (serving peer set aside; asking another)";
+                  (a0 ? " from any base held here for [0," + std::to_string(a0) + ") (own order, every shadow) -> whole-order fallback ["
+                      : " (serving peer set aside; asking another) [") + relay_node->repair_status(P, spine) + "]";
             return nullptr;
         }
         replay_cache[key] = rv; ++cut_repaired; ++relay_cut_repaired;
@@ -2350,9 +2376,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (drops_on_replay) drops_on_replay(key, P, a0, replay_base[key], ids);   // ★ DROPS-CARRY-SUFFIX
         if (a0) ++relay_repair_suffix;
         if (base_used == relay::RepairReplayer::kShadow) ++relay_repair_shadow;
+        const bool full_fallback = a0 == 0 && relay_node->repair_full_only(P, spine);   // ★ HOLD-ROUND-3 F3a
+        if (full_fallback) ++relay_repair_full_verified;
         // HOLD-ROUND-3 (4.10): name the base -- own, or WHICH shadow (its end P_end:digest)
-        std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, every one admitted here: RandomX-verified, or our own)%s\n",
+        std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, every one admitted here: RandomX-verified, or our own)%s%s\n",
                     (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), ids.size(),
+                    full_fallback ? " -- the WHOLE order [0,P) fetched in pages by the deep fallback, VERIFIED: its lane digest at P is the committed spine" : "",
                     a0 ? (" -- SUFFIX [" + std::to_string(a0) + "," + std::to_string(P) + ") after the first " + std::to_string(a0) +
                           (base_used == relay::RepairReplayer::kShadow ? " pushes of the SHADOW P_end=" + std::to_string(shadow_end.first) + ":" +
                                                                              hex_of(shadow_end.second).substr(0, 12) + " (a reconstructed winner-side order)"
@@ -2944,6 +2973,25 @@ static int run_live(const XmrNodeConfig& cfg) {
                 c2pool::v37n::xmr::drops::SuffixHoldCause hc = dec.cause;
                 hc.peer_a0 = peer_a0; hc.ours_a0 = ours_a0; hc.own_why = owhy;
                 why = c2pool::v37n::xmr::drops::suffix_hold_why(hc);
+                // ★ HOLD-ROUND-3 F3a: the universal fallback. No base here composes [0, a0):
+                // either the settlement view exists but its base has no DROPS record /
+                // another digest at a0 / another a0 (hc.replay_base >= 0), or the replay
+                // ran now and the relay has already rejected the suffix (the repair is no
+                // longer Ready: repair_reject armed the fallback). Either way the DROPS
+                // prefix needs the WHOLE committed order [0, P): ask the relay for it in
+                // pages (idempotent); the hold text names the fallback and its state. A
+                // transient replay failure (the suffix still Ready, no base verdict) keeps
+                // the plain hold and retries.
+                const bool suffix_gone = relay_node->repair_poll(P, cc.spine_digest, hint, nullptr) != relay::XmrRelayNode::RepairState::Ready ||
+                                         relay_node->repair_a0(P, cc.spine_digest) == 0;
+                if (hc.replay_base >= 0 || suffix_gone) {
+                    ++drops_lane_full_fallback;
+                    relay_node->repair_require_full(P, cc.spine_digest,
+                        hc.replay_base >= 0 ? "a verified view exists but no DROPS base for [0,a0): " + std::string(c2pool::v37n::xmr::drops::replay_base_name(hc.replay_base)) +
+                                              (hc.shadow_record_missing ? " without a record" : hc.shadow_a0_mismatch ? " with another digest at a0" : hc.replay_a0 != a0 ? " at another a0" : "")
+                                            : "the suffix replay reached the spine from no base held here");
+                    why += " -> WHOLE-ORDER fallback: fetching [0," + std::to_string(P) + ") in pages [" + relay_node->repair_status(P, cc.spine_digest) + "]";
+                }
                 if (drops_suffix_logged.size() > 4096) drops_suffix_logged.clear();
                 if (drops_suffix_logged.insert(pkey + ":" + why).second) {
                     std::printf("drops-HOLD suffix: %s\n", why.c_str());
@@ -5010,11 +5058,16 @@ static int run_live(const XmrNodeConfig& cfg) {
             // sidecars, truncated + rebuilt by the boot reload below)
             ro.deep_order = g_relay_deep_order;
             ro.deep_probe_step = g_relay_deep_probe_step ? g_relay_deep_probe_step : 64;
+            // ★ HOLD-ROUND-3 F3b: retention of the durable order (by network unless --relay-order-retain)
+            const std::uint64_t relay_order_retain = g_relay_order_retain != kRelayOrderRetainUnset ? g_relay_order_retain
+                                                   : (cfg.network == MoneroNetwork::Mainnet ? kRelayOrderRetainMainnet : 0);
+            ro.deep_order_retain = relay_order_retain;
             if (g_relay_deep_order) {
                 std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
                 ro.deep_order_path = cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain);
                 ro.receipts_log_path = ro.deep_order_path + ".receipts";   // == io.durable_path below
             }
+            if (relay_order_retain) relay_replayer.set_ram_budget(4 * relay_order_retain);   // F3b: the shadows' RAM bound (kMaxShadows x R)
             o2::O2RandomXVerifier* rxp = relay_rx.get();
             // DROPS-VERIFY-SCALE: N verify workers, each hashing on its OWN light VM
             // over the relay verifier's SHARED seed caches (+~2.2 MiB RSS per worker,
@@ -5208,11 +5261,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)drops_records_loaded, w.empty() ? "" : " -- ", w.c_str());
                 }
             }
-            std::printf("relay: REPAIR-CHAIN deep-order=%s (%s: %llu positions rebuilt from the receipts log) shadow-persist=%s probe-step=%llu\n",
+            std::printf("relay: REPAIR-CHAIN deep-order=%s (%s: %llu positions rebuilt from the receipts log) shadow-persist=%s probe-step=%llu "
+                        "| F3 order-retain=%llu positions (%s; lowest retained after the reload %llu) shadow-ram-budget=%llu pushes "
+                        "deep-serve budget=%llu x P + %u ids per cut, %u cuts/peer/hour\n",
                         g_relay_deep_order ? (relay_node->durable_order_open() ? "on" : "DISABLED (sidecar error: vault-only, RC5)") : "off",
                         ro.deep_order_path.empty() ? "-" : (ro.deep_order_path + ".order/.digest").c_str(),
                         (unsigned long long)relay_node->durable_order_stats().positions, g_relay_shadow_persist ? "on" : "off",
-                        (unsigned long long)ro.deep_probe_step);
+                        (unsigned long long)ro.deep_probe_step,
+                        (unsigned long long)ro.deep_order_retain, ro.deep_order_retain ? "whole orders served while within it" : "unbounded",
+                        (unsigned long long)relay_node->durable_order_lowest(), (unsigned long long)relay_replayer.ram_budget(),
+                        (unsigned long long)ro.deep_order_ids_factor, (unsigned)ro.deep_order_budget_page_ids, (unsigned)ro.deep_order_cuts_per_hour);
             std::string why;
             if (drops_store && drops) {   // ★ DROPS-RESTART: re-announce + serve our journalled carried frames; resume own wins
                 for (const auto& [b, f] : drops_store->frames()) {
@@ -5806,6 +5864,24 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)relay_replayer.persist_stats().bytes, (unsigned long long)ds.positions,
                                 (unsigned long long)ds.pages, (unsigned long long)ds.ids, (unsigned long long)ds.frames,
                                 (unsigned long long)ds.frame_miss);
+                    // ★ HOLD-ROUND-3 F3: the whole-order fallback (requester), the deep-serve budget + retention (server), the shadows' RAM
+                    const auto dsb = relay_node->deep_serve_stats();
+                    std::printf("  relay-deep-order: fallback required=%llu reask=%llu refused=%llu ready=%llu verified=%llu exhausted=%llu alarms=%llu drops_prefix_fallback=%llu | "
+                                "serve cuts=%llu first_ask=%llu over_budget=%llu below_retention=%llu served_pages=%llu ids=%llu | "
+                                "retain=%llu lowest=%llu prunes=%llu pruned_positions=%llu freed=%llu B punch_fail=%llu disk=%llu B | "
+                                "shadows=%zu folded=%zu pushes=%llu budget=%llu folds=%llu\n",
+                                (unsigned long long)rcs.repair_full_required.load(), (unsigned long long)rcs.repair_full_reask.load(),
+                                (unsigned long long)rcs.repair_full_refused.load(), (unsigned long long)rcs.repair_full_ready.load(),
+                                (unsigned long long)relay_repair_full_verified, (unsigned long long)rcs.repair_full_exhausted.load(),
+                                (unsigned long long)relay_repair_full_alarms, (unsigned long long)drops_lane_full_fallback,
+                                (unsigned long long)rcs.deep_serve_cuts.load(), (unsigned long long)rcs.deep_serve_first_ask.load(),
+                                (unsigned long long)rcs.deep_serve_over_budget.load(), (unsigned long long)rcs.deep_serve_below_retention.load(),
+                                (unsigned long long)dsb.served_pages, (unsigned long long)dsb.served_ids,
+                                (unsigned long long)relay_node->durable_order_retain(), (unsigned long long)relay_node->durable_order_lowest(),
+                                (unsigned long long)ds.prunes, (unsigned long long)ds.pruned_positions, (unsigned long long)ds.freed_bytes,
+                                (unsigned long long)ds.punch_fail, (unsigned long long)relay_node->durable_order_bytes(),
+                                relay_replayer.shadows(), relay_replayer.shadows_folded(), (unsigned long long)relay_replayer.pushes_held(),
+                                (unsigned long long)relay_replayer.ram_budget(), (unsigned long long)relay_replayer.folds());
                 }
                 {   // SMOKE-NOISE: the value nodes compare (order-free, xmr_receipt_ingest.hpp);
                     // the ab-credit lane digest below is this node's push order (node-local by design)
@@ -6460,6 +6536,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-shadow-persist")     g_relay_shadow_persist = cs::one_of(a, value(), {"on", "off"}) == "on";
         else if (a == "--relay-deep-probe-step")    g_relay_deep_probe_step = u64();
         else if (a == "--relay-shadow-persist-bytes") g_relay_shadow_persist_bytes = u64();
+        else if (a == "--relay-order-retain")       g_relay_order_retain = u64();   // ★ HOLD-ROUND-3 F3b (0 = unbounded)
         else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
         else if (a == "--test-crash-after-publish")     g_test_crash_after_publish = u32();
         else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = u32();
@@ -6638,6 +6715,9 @@ int main(int argc, char** argv) {
                 "  --relay-shadow-persist on|off keep the repair shadows across restarts (lane<N>.shadow; default on)\n"
                 "  --relay-deep-probe-step N    down-walk step / shadow checkpoint spacing (default 64)\n"
                 "  --relay-shadow-persist-bytes N  shadow file cap; above it only the newest shadow (default 256 MiB)\n"
+                "  --relay-order-retain N       the durable lane order serves the last N positions (lane<N>.order/.digest\n"
+                "                               pruned below; repair shadows bounded at 4 x N pushes); 0 = everything.\n"
+                "                               Default: 1000000 on mainnet, 0 on stagenet/testnet/regtest\n"
                 "  --relay-bind none|rbind      rbind = write + require the SEAM-1 payee/give-author\n"
                 "                               binding (coinbase 0x02 [extra_nonce|rbind]); mainnet\n"
                 "                               and --fee-model v1 relays need it\n"

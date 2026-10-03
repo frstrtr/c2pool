@@ -1141,7 +1141,7 @@ if (BUILD_TESTING)
     #                               property HELLO-compatible <=> same pool_tag.
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_drops_retain_kat v37_xmr_hold_round3_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_drops_retain_kat v37_xmr_hold_round3_kat v37_xmr_deep_order_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1385,6 +1385,18 @@ if (BUILD_TESTING)
     # (F2), the composition memo (R3-8), source pins. RED on the base, GREEN on
     # the fix. ALSO on BOTH build.yml --target lists.
     target_compile_definitions(v37_xmr_hold_round3_kat PRIVATE
+        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
+    # HOLD-ROUND-3 F3 (stagenet attempt 8, the no-base hold): v37_xmr_deep_order_kat
+    # -- the WHOLE-ORDER fallback and bounded retention. A fresh receiver (no own
+    # match, no shadow, no record) books a cut past the vault horizon through
+    # deep pages served without a prior walker mark (R3-3; base: Exhausted +
+    # DEEP-DIVERGENCE for ever); a peer cannot be made to serve unbounded pages
+    # (per-peer ids / cuts budget, ask-twice protocol); the durable order keeps
+    # R positions, hole-punches below, refuses + alarms a pruned position while
+    # a longer-retaining peer serves (R3-5), and a restart reloads the pruned
+    # state deterministically; the shadows' RAM is bounded; source pins. RED on
+    # the base, GREEN on the fix. ALSO on BOTH build.yml --target lists.
+    target_compile_definitions(v37_xmr_deep_order_kat PRIVATE
         V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # RELAY-SEND-QUEUE (capstone attempt 6 false start): v37_xmr_relay_send_queue_kat
     # -- two relay nodes over loopback TCP, each holding 32 carried FB_BLOCK_WON

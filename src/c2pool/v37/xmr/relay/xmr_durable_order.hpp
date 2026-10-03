@@ -30,12 +30,40 @@
 // found again through a bounded id -> log_off map (the ids of recent deep
 // pages) and read back from the receipts log, verified against the id.
 // Node-local bookkeeping only: nothing here is on the wire or in consensus.
+//
+// HOLD-ROUND-3 F3 (stagenet attempt 8): two additions, both node-local.
+//  RETENTION  set_retain(R): the order serves positions >= next_pos - R only
+//             (R = 0: everything, the stagenet default). Below that point the
+//             fixed records of both sidecars are HOLE-PUNCHED (disk freed, the
+//             offsets kept: every reader is position-indexed), amortised every
+//             R/16 (>= 1024) appends, and digest_at / order_page / ids_between
+//             answer "unknown / cannot serve" there -- a requester that needs a
+//             pruned position hears BELOW_HORIZON and names the retention in
+//             its alarm (never a silent hold). The receipts log itself is NOT
+//             pruned here: it is the lane's durability (the boot reload replays
+//             it from byte 0), so its head needs a lane-state checkpoint first.
+//  BUDGET     DeepServeBudget: who may be served a WHOLE order [0, P) from
+//             here, and how much. The 30-s "deep walker" mark (a probe below
+//             our horizon in the last 30 s) was the only key to a deep [0, P)
+//             page; a requester whose probe landed exactly at our vault start
+//             never got one (attempt 8, node A). Now the key is the ASK ITSELF:
+//             every repair asks [0, P) first and is told BELOW_HORIZON (it
+//             re-arms to a suffix, O(horizon) ids, exactly as before); a peer
+//             that asks [0, P) a SECOND time for the same P means it (its walk
+//             reached q = 0, or its suffix replay found no base) and is served
+//             in pages, under a per-peer budget: ids_factor x P + one page ids
+//             per (peer, P), cuts_per_hour distinct cuts per peer. No wire
+//             byte changes: the same GETORDER, the same BELOW_HORIZON answer.
 // ===========================================================================
 #pragma once
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/falloc.h>   // FALLOC_FL_PUNCH_HOLE (retention: free the pruned head, keep offsets)
+#endif
+#include <chrono>
 
 #include <algorithm>
 #include <cerrno>
@@ -43,6 +71,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -69,7 +98,13 @@ public:
         std::uint64_t frames = 0, frame_bytes = 0, frame_miss = 0;
         std::uint64_t digests = 0;                            // probe digests answered from disk
         std::uint64_t write_fail = 0, gap = 0;
+        // F3 retention: prunes done, positions pruned in all, sidecar bytes freed
+        // (hole-punched; 0 when the filesystem cannot punch), punches that failed,
+        // and asks refused because they reached below the retained window
+        std::uint64_t prunes = 0, pruned_positions = 0, freed_bytes = 0, punch_fail = 0, below_retention = 0;
     };
+    // F3 retention: one prune, for the owner's log line
+    struct PruneEvent { std::uint64_t from = 0, to = 0, order_bytes = 0, digest_bytes = 0, retain = 0; bool punched = false; };
     // true iff `frame` decodes to a receipt whose id is `id` (the relay's decoder)
     using VerifyFn = std::function<bool(const std::vector<std::uint8_t>& frame, const bytes32& id)>;
 
@@ -97,10 +132,26 @@ public:
     void set_verify(VerifyFn f) { std::lock_guard<std::mutex> lk(m_mtx); m_verify = std::move(f); }
     Stats stats() const { std::lock_guard<std::mutex> lk(m_mtx); return m_st; }
     std::uint64_t next_pos() const { std::lock_guard<std::mutex> lk(m_mtx); return m_next; }
+    // F3 retention: logical disk use = the retained records only (the pruned head is a hole)
     std::uint64_t disk_bytes() const {
         std::lock_guard<std::mutex> lk(m_mtx);
-        return m_ofd < 0 ? 0 : 2 * kHdr + m_nrec * kOrdRec + m_next * kDigRec;
+        return m_ofd < 0 ? 0 : 2 * kHdr + (m_nrec - m_low_rec) * kOrdRec + (m_next - m_low) * kDigRec;
     }
+    // ── F3 retention ────────────────────────────────────────────────────────
+    // Keep the last R positions servable (0 = all). Takes effect at the next
+    // append; the boot reload re-applies it deterministically (same files, same
+    // lowest retained position after the same pushes).
+    // `slab` = appends between prunes (0 = max(1024, R / 16); the KAT lowers it).
+    void set_retain(std::uint64_t R, std::uint64_t slab = 0) { std::lock_guard<std::mutex> lk(m_mtx); m_retain = R; m_slab = slab; }
+    std::uint64_t retain() const { std::lock_guard<std::mutex> lk(m_mtx); return m_retain; }
+    // The lowest position this order still serves (0 = never pruned).
+    std::uint64_t lowest_retained() const { std::lock_guard<std::mutex> lk(m_mtx); return m_low; }
+    // The last prune, once (the owner logs it).
+    std::optional<PruneEvent> take_prune() {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto e = m_prune; m_prune.reset(); return e;
+    }
+#define C2POOL_XMR_DURABLE_ORDER_RETAIN 1
 
     // One receipt pushed at [pos_first, pos_first + n) (the ingest's m_after
     // triple, in push order: the boot reload first, then every live push).
@@ -123,12 +174,16 @@ public:
         }
         ++m_nrec; m_next = next_after;
         ++m_st.records; m_st.positions += n;
+        // F3 retention: amortised -- prune once the head exceeds R by a slab
+        if (m_retain && m_next > m_low + m_retain + (m_slab ? m_slab : std::max<std::uint64_t>(1024, m_retain / 16))) prune_locked();
     }
 
-    // The lane digest after `pos` pushes, from disk (nullopt = unknown).
+    // The lane digest after `pos` pushes, from disk (nullopt = unknown; also
+    // below the retained window -- the owner's probe then states no digest).
     std::optional<bytes32> digest_at(std::uint64_t pos) {
         std::lock_guard<std::mutex> lk(m_mtx);
         if (m_dfd < 0 || m_broken || pos == 0 || pos > m_next) return std::nullopt;
+        if (pos < m_low) { ++m_st.below_retention; return std::nullopt; }
         bytes32 d{};
         if (!get(m_dfd, kHdr + (pos - 1) * kDigRec, d.data(), 32)) return std::nullopt;
         bytes32 z{};
@@ -145,7 +200,8 @@ public:
         std::lock_guard<std::mutex> lk(m_mtx);
         ids.clear(); p_served = a;
         if (m_ofd < 0 || m_broken || a > p || a >= m_next || max_ids == 0) return false;
-        std::uint64_t lo = 0, hi = m_nrec;   // first record with pos_first >= a
+        if (a < m_low) { ++m_st.below_retention; return false; }   // F3 retention: pruned here (BELOW_HORIZON to the asker)
+        std::uint64_t lo = m_low_rec, hi = m_nrec;   // first record with pos_first >= a (the pruned head is a hole)
         while (lo < hi) {
             const std::uint64_t mid = lo + (hi - lo) / 2;
             std::uint8_t r[8];
@@ -183,7 +239,8 @@ public:
         ids.clear();
         if (m_ofd < 0 || m_broken || a > p || p > m_next) return false;
         if (a == p) return true;
-        std::uint64_t lo = 0, hi = m_nrec;
+        if (a < m_low) { ++m_st.below_retention; return false; }   // F3 retention
+        std::uint64_t lo = m_low_rec, hi = m_nrec;
         while (lo < hi) {
             const std::uint64_t mid = lo + (hi - lo) / 2;
             std::uint8_t r[8];
@@ -250,12 +307,53 @@ private:
             while (m_lru_order.size() > kFrameLruMax) { m_lru.erase(m_lru_order.front()); m_lru_order.pop_front(); }
         }
     }
+    // F3 retention (m_mtx held): the new lowest served position is the START of
+    // the first record at or above next - R (a page must begin at a receipt
+    // boundary); the records below it become a hole in both sidecars. The
+    // digest of the position just below stays (a probe at exactly `low` reads
+    // record low - 1).
+    void prune_locked() {
+        if (m_retain == 0 || m_next <= m_retain) return;
+        const std::uint64_t want = m_next - m_retain;
+        std::uint64_t lo = m_low_rec, hi = m_nrec;   // first record with pos_first >= want
+        while (lo < hi) {
+            const std::uint64_t mid = lo + (hi - lo) / 2;
+            std::uint8_t r[8];
+            if (!get(m_ofd, kHdr + mid * kOrdRec, r, 8)) return;
+            if (get64(r) < want) lo = mid + 1; else hi = mid;
+        }
+        if (lo >= m_nrec || lo <= m_low_rec) return;
+        std::uint8_t r[8];
+        if (!get(m_ofd, kHdr + lo * kOrdRec, r, 8)) return;
+        const std::uint64_t low = get64(r);
+        if (low <= m_low || low == 0) return;
+        PruneEvent e; e.from = m_low; e.to = low; e.retain = m_retain;
+        e.order_bytes = (lo - m_low_rec) * kOrdRec;
+        const std::uint64_t dig_keep_from = low >= 1 ? low - 1 : 0;   // keep the digest after `low` pushes
+        const std::uint64_t dig_lo = m_low >= 1 ? m_low - 1 : 0;
+        e.digest_bytes = dig_keep_from > dig_lo ? (dig_keep_from - dig_lo) * kDigRec : 0;
+        bool punched = false;
+#if defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
+        const int f1 = ::fallocate(m_ofd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                   static_cast<off_t>(kHdr + m_low_rec * kOrdRec), static_cast<off_t>(e.order_bytes));
+        const int f2 = e.digest_bytes ? ::fallocate(m_dfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                                    static_cast<off_t>(kHdr + dig_lo * kDigRec), static_cast<off_t>(e.digest_bytes)) : 0;
+        punched = (f1 == 0 && f2 == 0);
+#endif
+        if (punched) m_st.freed_bytes += e.order_bytes + e.digest_bytes; else ++m_st.punch_fail;
+        e.punched = punched;
+        m_st.pruned_positions += low - m_low;
+        ++m_st.prunes;
+        m_low = low; m_low_rec = lo;
+        m_prune = e;
+    }
     void close() { std::lock_guard<std::mutex> lk(m_mtx); close_locked(); }
     void close_locked() {
         if (m_ofd >= 0) ::close(m_ofd);
         if (m_dfd >= 0) ::close(m_dfd);
         m_ofd = m_dfd = -1;
         m_nrec = m_next = m_log_off = 0; m_broken = false;
+        m_low = m_low_rec = 0; m_prune.reset();
         m_lru.clear(); m_lru_order.clear();
     }
     struct H32 { std::size_t operator()(const bytes32& b) const { std::size_t h; std::memcpy(&h, b.data(), sizeof h); return h; } };
@@ -265,10 +363,121 @@ private:
     int m_ofd = -1, m_dfd = -1;
     std::uint64_t m_nrec = 0, m_next = 0, m_log_off = 0;
     bool m_broken = false;
+    std::uint64_t m_retain = 0, m_slab = 0;  // F3 retention: 0 = everything; slab 0 = auto
+    std::uint64_t m_low = 0, m_low_rec = 0;  // lowest served position / its record index
+    std::optional<PruneEvent> m_prune;
     VerifyFn m_verify;
     std::unordered_map<bytes32, std::uint64_t, H32> m_lru;
     std::deque<bytes32> m_lru_order;
+    mutable Stats m_st;   // below_retention is counted from const readers too
+};
+
+// ★ HOLD-ROUND-3 F3b: who is served a WHOLE lane order [0, P) from the durable
+// order, and how much (see the file header). Keyed by the asking connection
+// and the P it asks for; bounded (256 peers x 64 cuts, oldest out). The
+// clock is injectable for the KAT. No wire byte: the first [0, P) ask of a
+// (peer, P) is refused exactly as the vault refuses it today; the second is
+// the deliberate one.
+class DeepServeBudget {
+public:
+    using Clock = std::chrono::steady_clock;
+    enum class Verdict { Serve = 0, FirstAsk = 1, OverIds = 2, OverCuts = 3 };
+    struct Options {
+        std::uint64_t ids_factor = 2;        // ids per (peer, P) <= ids_factor x P + page
+        std::uint64_t page_ids = 4096;       // + one page of slack (kCtrlMaxIdsPerOrder)
+        std::uint32_t cuts_per_hour = 8;     // distinct P a peer may be served whole per rolling hour
+        std::chrono::seconds window{3600};
+    };
+    struct Stats { std::uint64_t cuts = 0, first_ask = 0, over_ids = 0, over_cuts = 0, served_pages = 0, served_ids = 0; };
+    struct Ask { Verdict v = Verdict::Serve; bool first_page = false; std::uint64_t ids_used = 0, ids_max = 0; std::uint32_t cuts_hour = 0; };
+
+    DeepServeBudget() = default;
+    explicit DeepServeBudget(const Options& o) : m_o(o) {}
+    void set_options(Options o) { std::lock_guard<std::mutex> lk(m_mtx); m_o = o; }
+    Options options() const { std::lock_guard<std::mutex> lk(m_mtx); return m_o; }
+    Stats stats() const { std::lock_guard<std::mutex> lk(m_mtx); return m_st; }
+
+    // A deep ORDER ask [a, P) of `want` ids by `peer` (a == 0: the whole order).
+    Ask ask(std::uint64_t peer, std::uint64_t a, std::uint64_t P, std::uint64_t want, Clock::time_point now = Clock::now()) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        Ask r;
+        Peer& pe = peer_locked(peer, now);
+        auto it = pe.cuts.find(P);
+        const bool fresh = it == pe.cuts.end();
+        if (fresh) {
+            while (pe.cuts.size() >= kCutsPerPeer) pe.cuts.erase(pe.cuts.begin());
+            it = pe.cuts.emplace(P, Cut{}).first;
+        }
+        Cut& c = it->second;
+        r.ids_max = m_o.ids_factor * P + m_o.page_ids;
+        r.ids_used = c.ids;
+        if (P > a && want > P - a) want = P - a;   // a page never carries more than the positions left
+        if (a == 0 && !c.asked_once) {   // the routine first ask: BELOW_HORIZON, as before (the asker re-arms to a suffix)
+            c.asked_once = true; ++m_st.first_ask; r.v = Verdict::FirstAsk; return r;
+        }
+        // a rolling-hour count of the cuts this peer was served from here
+        while (!pe.starts.empty() && now - pe.starts.front() > m_o.window) pe.starts.pop_front();
+        r.cuts_hour = static_cast<std::uint32_t>(pe.starts.size());
+        if (!c.counted) {
+            if (pe.starts.size() >= m_o.cuts_per_hour) { ++m_st.over_cuts; r.v = Verdict::OverCuts; return r; }
+        }
+        if (c.ids + want > r.ids_max) { ++m_st.over_ids; r.v = Verdict::OverIds; return r; }
+        if (!c.counted) { c.counted = true; pe.starts.push_back(now); ++m_st.cuts; r.cuts_hour = static_cast<std::uint32_t>(pe.starts.size()); }
+        r.first_page = !c.served;
+        c.served = true;
+        r.v = Verdict::Serve;
+        return r;
+    }
+    // The page that was served (ids actually sent).
+    void served(std::uint64_t peer, std::uint64_t P, std::uint64_t n_ids) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto pi = m_peers.find(peer);
+        if (pi == m_peers.end()) return;
+        auto it = pi->second.cuts.find(P);
+        if (it == pi->second.cuts.end()) return;
+        it->second.ids += n_ids;
+        ++m_st.served_pages; m_st.served_ids += n_ids;
+    }
+    // A refusal is logged once per (peer, P, verdict): true = first time.
+    bool note_logged(std::uint64_t peer, std::uint64_t P, Verdict v) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto pi = m_peers.find(peer);
+        if (pi == m_peers.end()) return false;
+        auto it = pi->second.cuts.find(P);
+        if (it == pi->second.cuts.end()) return false;
+        const std::uint8_t bit = static_cast<std::uint8_t>(1u << static_cast<unsigned>(v));
+        if (it->second.logged & bit) return false;
+        it->second.logged |= bit;
+        return true;
+    }
+    void forget_peer(std::uint64_t peer) { std::lock_guard<std::mutex> lk(m_mtx); m_peers.erase(peer); }
+    static const char* name(Verdict v) {
+        switch (v) { case Verdict::Serve: return "serve"; case Verdict::FirstAsk: return "first-ask"; case Verdict::OverIds: return "over-ids-budget"; case Verdict::OverCuts: return "over-cuts-budget"; }
+        return "?";
+    }
+
+private:
+    static constexpr std::size_t kPeers = 256, kCutsPerPeer = 64;
+    struct Cut { bool asked_once = false, counted = false, served = false; std::uint8_t logged = 0; std::uint64_t ids = 0; };
+    struct Peer { std::map<std::uint64_t, Cut> cuts; std::deque<Clock::time_point> starts; Clock::time_point seen{}; };
+    Peer& peer_locked(std::uint64_t peer, Clock::time_point now) {
+        auto it = m_peers.find(peer);
+        if (it == m_peers.end()) {
+            while (m_peers.size() >= kPeers) {   // oldest-seen out
+                auto victim = m_peers.begin();
+                for (auto vi = m_peers.begin(); vi != m_peers.end(); ++vi) if (vi->second.seen < victim->second.seen) victim = vi;
+                m_peers.erase(victim);
+            }
+            it = m_peers.emplace(peer, Peer{}).first;
+        }
+        it->second.seen = now;
+        return it->second;
+    }
+    mutable std::mutex m_mtx;
+    Options m_o;
+    std::map<std::uint64_t, Peer> m_peers;
     Stats m_st;
 };
+#define C2POOL_XMR_DEEP_SERVE_BUDGET 1
 
 } // namespace c2pool::v37n::xmr::relay

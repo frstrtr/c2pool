@@ -368,6 +368,17 @@ struct RelayOptions {
     std::string deep_order_path;                 // "" = no durable order (serving side off)
     std::string receipts_log_path;               // the ingest's durable log (deep frames)
     u64         deep_probe_step = 64;            // G: positions (and shadow checkpoint spacing)
+    // ★ HOLD-ROUND-3 F3: the durable order serves the last deep_order_retain
+    // positions only (0 = all; the daemon's mainnet default is 1,000,000) and a
+    // WHOLE order [0, P) is served to a peer that asks it twice (the second ask
+    // is deliberate), under a per-peer budget: ids_factor x P + one page ids
+    // per (peer, P), cuts_per_hour distinct cuts per rolling hour (see
+    // DeepServeBudget). No wire change.
+    u64         deep_order_retain = 0;
+    u64         deep_order_retain_slab = 0;      // appends between prunes (0 = max(1024, R/16); KAT knob)
+    u64         deep_order_ids_factor = 2;
+    u64         deep_order_budget_page_ids = kCtrlMaxIdsPerOrder;   // + one page of slack per cut (KAT knob)
+    u32         deep_order_cuts_per_hour = 8;
     // repair context + refetch (see REPAIR CONTEXT above)
     u32         solicited_unresolved_patience_ms = 120000;   // a solicited receipt waits this long for its context
     u32         ctx_retry_ms = 2000;                         // re-ask an unanswered GETCTX (next peer) after this
@@ -521,6 +532,17 @@ struct RelayStats {
     // by a lineage that fails the gate (-> DEEP, loud, as before).
     std::atomic<u64> repair_deep_probe{0}, repair_deep_equal{0}, repair_deep_full{0}, repair_deep_ready{0};
     std::atomic<u64> repair_deep_rc5{0}, repair_deep_lineage{0};
+    // ★ HOLD-ROUND-3 F3a (requester): repairs switched to the WHOLE-ORDER
+    // fallback (no verified base for [0, a0): by the caller, or by a suffix
+    // replay that reached the spine from no base), whole-order asks re-asked
+    // once after a first refusal, refusals that set a peer aside, repairs made
+    // Ready through the fallback, and fallbacks every peer refused (the loud
+    // retention alarm; the block holds).
+    std::atomic<u64> repair_full_required{0}, repair_full_reask{0}, repair_full_refused{0}, repair_full_ready{0}, repair_full_exhausted{0};
+    // ★ HOLD-ROUND-3 F3b (server): whole orders served from the durable order,
+    // and deep asks refused: the routine first [0, P) ask, over the per-peer
+    // ids / cuts budget, or below our retention window (pruned here).
+    std::atomic<u64> deep_serve_cuts{0}, deep_serve_first_ask{0}, deep_serve_over_budget{0}, deep_serve_below_retention{0};
     std::atomic<u64> reoffer_unpushed{0};
     // REPAIR-PAGE: repair GETORDER pages asked, the largest page asked (ids),
     // pages that timed out (the page was halved) and pages that grew it.
@@ -576,27 +598,76 @@ public:
                 m_dorder.set_verify([](const std::vector<u8>& f, const bytes32& id) {
                     FbReceipt r; return decode_fb_receipt(f, r) && receipt_id(r) == id;
                 });
+                m_dorder.set_retain(m_o.deep_order_retain, m_o.deep_order_retain_slab);   // F3b retention (0 = everything)
+                {
+                    DeepServeBudget::Options bo;
+                    bo.ids_factor = m_o.deep_order_ids_factor ? m_o.deep_order_ids_factor : 2;
+                    bo.page_ids = m_o.deep_order_budget_page_ids;
+                    bo.cuts_per_hour = m_o.deep_order_cuts_per_hour ? m_o.deep_order_cuts_per_hour : 8;
+                    m_deep_budget.set_options(bo);
+                }
                 ::c2pool::v37n::FrameVaultDeep d;
                 d.order = [this](std::uint32_t chain, std::uint64_t a, std::uint64_t p, std::size_t max_ids,
                                  ::c2pool::v37n::VaultOrder& out) -> bool {
                     if (chain != m_o.chain) return false;
                     out.ids.clear();
+                    const u64 low = m_dorder.lowest_retained();
                     if (a == p) {   // a walk probe below our horizon: its answer is our digest at a (spine probe)
                         if (a > m_dorder.next_pos()) return false;
-                        note_deep_walker(t_serving_peer);
+                        if (a < low) { m_st.deep_serve_below_retention++; return false; }   // F3b: pruned here -> BELOW_HORIZON
                         out.p_served = a; return true;
                     }
-                    // [0, P) is what EVERY repair asks first (RC5): it stays BELOW_HORIZON
-                    // (the requester re-arms to our horizon and asks a suffix, O(horizon)
-                    // ids) unless this peer is walking (probed below our horizon lately),
-                    // i.e. its walk reached q = 0 and it needs our whole order. One
-                    // walk = one whole order: the mark is consumed here (later pages
-                    // start at a > 0).
-                    if (a == 0 && !take_deep_walker(t_serving_peer)) return false;
+                    // ★ HOLD-ROUND-3 F3b: a deep page is served under the per-peer budget,
+                    // not a 30-s walker mark. [0, P) is what EVERY repair asks first: that
+                    // first ask stays BELOW_HORIZON (the requester re-arms to our horizon
+                    // and asks a suffix, O(horizon) ids, exactly as before); the SECOND
+                    // [0, P) ask of the same peer for the same P is deliberate (its walk
+                    // reached q = 0, or its suffix replay found no base) and is served in
+                    // pages while within our retention and its budget.
+                    const PeerId peer = t_serving_peer;
+                    if (a < low) {   // below our retention window: refused, loudly (never a silent hold on the asker's side either)
+                        m_st.deep_serve_below_retention++;
+                        // the same u64 the vault already states: what we retain from here = the durable order's floor
+                        // (the asker re-arms its suffix to it and its alarm names it); no wire format change
+                        out.lowest_retained = std::max(out.lowest_retained, low);
+                        bool first = false;
+                        {
+                            std::lock_guard<std::mutex> lk(m_deep_log_mtx);
+                            if (m_deep_retention_logged.size() > 4096) m_deep_retention_logged.clear();
+                            first = m_deep_retention_logged.insert(std::make_pair(peer, p)).second;
+                        }
+                        if (first)
+                            this->log("relay-deep-serve: ALARM peer " + std::to_string(peer) + " asked order positions [" + std::to_string(a) + "," +
+                                std::to_string(p) + ") below our retention: lowest retained " + std::to_string(low) + " (--relay-order-retain " +
+                                std::to_string(m_dorder.retain()) + " positions, lane at " + std::to_string(m_dorder.next_pos()) +
+                                ") -- REFUSED (BELOW_HORIZON); that peer needs a longer-retaining peer or the cold-boot path");
+                        return false;
+                    }
+                    const auto ask = m_deep_budget.ask(peer, a, p, max_ids);
+                    if (ask.v != DeepServeBudget::Verdict::Serve) {
+                        if (ask.v == DeepServeBudget::Verdict::FirstAsk) m_st.deep_serve_first_ask++;
+                        else {
+                            m_st.deep_serve_over_budget++;
+                            if (m_deep_budget.note_logged(peer, p, ask.v))
+                                this->log("relay-deep-serve: peer " + std::to_string(peer) + " asked deep order [" + std::to_string(a) + "," + std::to_string(p) +
+                                    ") -- REFUSED, " + DeepServeBudget::name(ask.v) + " (ids served " + std::to_string(ask.ids_used) + " of " +
+                                    std::to_string(ask.ids_max) + " for this cut; cuts this hour " + std::to_string(ask.cuts_hour) + " of " +
+                                    std::to_string(m_deep_budget.options().cuts_per_hour) + ")");
+                        }
+                        return false;
+                    }
                     std::vector<std::pair<u64, bytes32>> ids; u64 ps = a;
                     if (!m_dorder.order_page(a, p, max_ids, ids, ps)) return false;
                     for (const auto& [pos, id] : ids) out.ids.push_back(::c2pool::v37n::VaultOrderId{pos, id});
                     out.p_served = ps;
+                    m_deep_budget.served(peer, p, ids.size());
+                    if (ask.first_page && a == 0) {
+                        m_st.deep_serve_cuts++;
+                        this->log("relay-deep-serve: peer " + std::to_string(peer) + " asked the WHOLE order [0," + std::to_string(p) +
+                            ") a second time -> serving it from the durable order in pages of <= " + std::to_string(max_ids) +
+                            " ids (budget: cut " + std::to_string(ask.cuts_hour) + "/" + std::to_string(m_deep_budget.options().cuts_per_hour) +
+                            " this hour, <= " + std::to_string(ask.ids_max) + " ids; retention lowest=" + std::to_string(low) + ")");
+                    }
                     return true;
                 };
                 d.frame = [this](const bytes32& id, std::vector<std::uint8_t>& f) { return m_dorder.frame(id, f); };
@@ -1055,6 +1126,12 @@ public:
                    u64 next_after, const bytes32& digest_after) {
         (void)m_vault.insert(m_o.chain, id, pos_first, n_pushes, raw);
         m_dorder.append(pos_first, n_pushes, id, raw.size(), next_after, digest_after);   // REPAIR-CHAIN (no-op when closed)
+        if (const auto pr = m_dorder.take_prune())   // ★ HOLD-ROUND-3 F3b: one line per prune (range, bytes freed)
+            log("relay-deep-order: pruned the durable order below position " + std::to_string(pr->to) + " (positions [" + std::to_string(pr->from) +
+                "," + std::to_string(pr->to) + ") of a lane at " + std::to_string(next_after) + "; retention " + std::to_string(pr->retain) +
+                " positions; .order " + std::to_string(pr->order_bytes) + " B + .digest " + std::to_string(pr->digest_bytes) + " B " +
+                (pr->punched ? "freed" : "NOT freed: this filesystem cannot punch holes (logical retention only)") +
+                "; the receipts log is kept whole: it is the lane's durability)");
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_unpushed.erase(id);   // REPAIR-HORIZON: in the lane now -> the GETORDER backfill covers it
@@ -1097,23 +1174,11 @@ public:
         if (!m_o.deep_order || !m_dorder.is_open()) return std::nullopt;
         return m_dorder.digest_at(pos);
     }
-    // REPAIR-CHAIN: peers that probed below our vault horizon in the last 30 s
-    // (a down-walk): only they are served [0, P) from the durable order.
-    void note_deep_walker(PeerId p) {
-        if (!p) return;
-        std::lock_guard<std::mutex> lk(m_walker_mtx);
-        m_deep_walkers[p] = Clock::now();
-        if (m_deep_walkers.size() > 256) m_deep_walkers.erase(m_deep_walkers.begin());
-    }
-    bool take_deep_walker(PeerId p) {
-        if (!p) return false;
-        std::lock_guard<std::mutex> lk(m_walker_mtx);
-        auto it = m_deep_walkers.find(p);
-        if (it == m_deep_walkers.end()) return false;
-        const bool fresh = Clock::now() - it->second < std::chrono::seconds(30);
-        m_deep_walkers.erase(it);
-        return fresh;
-    }
+    // ★ HOLD-ROUND-3 F3b: the deep-serve budget (whole orders served from the
+    // durable order; see DeepServeBudget) and the order's retention window.
+    DeepServeBudget::Stats deep_serve_stats() const { return m_deep_budget.stats(); }
+    u64 durable_order_lowest() const { return m_dorder.lowest_retained(); }
+    u64 durable_order_retain() const { return m_dorder.retain(); }
     // ★ DROPS-CARRY-LIVE: our own lane order over [a, p) from the durable order
     // (pos_first, id); false = deep order off / not readable there.
     bool own_order_ids(u64 a, u64 p, std::vector<std::pair<u64, bytes32>>& ids) const {
@@ -1266,6 +1331,17 @@ public:
             if (!missing) {
                 r.st = Repair::St::Ready; m_st.repair_ready++;
                 if (r.walk_from.count(r.served_by)) m_st.repair_deep_ready++;   // REPAIR-CHAIN: Ready through a down-walk
+                if (r.a0 == 0 && (r.full_only || r.walk_from.count(r.served_by))) {
+                    // ★ HOLD-ROUND-3 F3a: one line per deep whole-order fetch (peer, pages, bytes, the committed digest it is verified against)
+                    if (r.full_only) m_st.repair_full_ready++;
+                    const std::string line = "relay-deep-order: fetched the WHOLE order [0," + std::to_string(r.P) + ") of spine " + hex_short(r.spine) +
+                        " from peer " + std::to_string(r.served_by) + " in " + std::to_string(r.pages) + " page(s), " + std::to_string(r.ids.size()) +
+                        " ids (" + std::to_string(r.ids.size() * 40) + " B on the wire)" + (r.full_only ? " via the whole-order fallback" : " at the end of a down-walk") +
+                        "; the settlement replay verifies it against the committed digest at P next";
+                    lk.unlock(); log(line); lk.lock();
+                    it = m_repairs.find(key);
+                    if (it == m_repairs.end()) return RepairState::Pending;
+                }
             }
         }
         if (r.st == Repair::St::Ready) { if (ids) *ids = r.ids; return RepairState::Ready; }
@@ -1277,20 +1353,88 @@ public:
     // The replay of a Ready order did NOT reproduce `spine` (the serving peer
     // lied, or served a different lane): forget it and ask someone else.
     void repair_reject(u64 P, const bytes32& spine) {
-        std::lock_guard<std::mutex> lk(m_rmtx);
+        std::unique_lock<std::mutex> lk(m_rmtx);
         auto it = m_repairs.find(std::make_pair(P, spine));
         if (it == m_repairs.end()) return;
         Repair& r = it->second;
+        std::string note;
         if (r.served_by) {
-            r.tried.insert(r.served_by);
             // REPAIR-HORIZON: a suffix order [a0, P) the peer asserted reaches the
             // spine, replayed after OUR [0, a0), did not: our prefix differs.
-            if (r.walk_from.count(r.served_by)) walk_failed_locked(r, r.served_by, /*rc5=*/false);   // REPAIR-CHAIN
-            else if (r.a0) { r.deep[r.served_by] = r.a0; m_st.repair_deep++; }
+            if (r.walk_from.count(r.served_by)) { r.tried.insert(r.served_by); walk_failed_locked(r, r.served_by, /*rc5=*/false); }   // REPAIR-CHAIN
+            else if (r.a0 && !r.full_only) {
+                // ★ HOLD-ROUND-3 F3a: no base here reproduces the spine from [0, a0)
+                // (own, every shadow): instead of naming the peer DEEP (attempt 8:
+                // every peer DEEP -> Exhausted -> DEEP-DIVERGENCE, the block held for
+                // ever), fall back to the WHOLE order [0, P) -- from this very peer first
+                // (it holds the cut's lineage; it said so with its digest at P).
+                r.full_only = true; r.prefer = r.served_by;
+                m_st.repair_full_required++;
+                note = "relay: REPAIR-DEEP repair of P=" + std::to_string(r.P) + ": the suffix [" + std::to_string(r.a0) + "," + std::to_string(r.P) +
+                       ") from peer " + std::to_string(r.served_by) + " reached the spine from no base held here (own order, " +
+                       "every shadow) -> WHOLE-ORDER fallback: asking [0," + std::to_string(r.P) + ") in pages (this peer first)";
+            } else r.tried.insert(r.served_by);
         }
         r.reset();
         m_st.repair_rejected++;
+        lk.unlock();
+        if (!note.empty()) log(note);
     }
+    // ★ HOLD-ROUND-3 F3a: the caller holds NO verified base for [0, a0) of this
+    // cut (own digest at a0 differs, no shadow record / another a0 -- see
+    // drops::decide_suffix_base): switch the repair to the WHOLE-ORDER fallback.
+    // A Ready / in-flight suffix is discarded (its serving peer is re-asked
+    // first: it holds the lineage); a Ready whole order stays Ready. Idempotent.
+    void repair_require_full(u64 P, const bytes32& spine, const std::string& cause = std::string()) {
+        std::unique_lock<std::mutex> lk(m_rmtx);
+        auto it = m_repairs.find(std::make_pair(P, spine));
+        if (it == m_repairs.end()) {
+            Repair r; r.P = P; r.spine = spine; r.since = Clock::now();
+            it = m_repairs.emplace(std::make_pair(P, spine), std::move(r)).first;
+            m_st.repair_started++;
+        }
+        Repair& r = it->second;
+        const bool was = r.full_only;
+        r.full_only = true;
+        bool restarted = false;
+        if (r.st == Repair::St::Ready && r.a0 == 0) { /* a whole order: keep it */ }
+        else if (r.st != Repair::St::Idle && r.a0 > 0) { r.prefer = r.served_by ? r.served_by : r.cur; r.reset(); restarted = true; }
+        else if (r.st == Repair::St::Idle) { r.exhausted = false; r.tried.clear(); }
+        if (!was) m_st.repair_full_required++;
+        lk.unlock();
+        if (!was)
+            log("relay: REPAIR-DEEP repair of P=" + std::to_string(P) + " spine=" + hex_short(spine) + ": WHOLE-ORDER fallback armed" +
+                (cause.empty() ? std::string() : " (" + cause + ")") + " -> asking every peer for [0," + std::to_string(P) + ") in pages" +
+                (restarted ? "; the served suffix is discarded" : ""));
+        drive_repairs();
+    }
+    // ★ HOLD-ROUND-3 F3a: the whole-order fallback was refused by EVERY ready
+    // peer (twice each: below their retention, or RC5 peers with no durable
+    // order). Undecided -- the caller HOLDS and alarms (never a silent hold);
+    // `detail` names each refusing peer and what it said it retains.
+    bool repair_full_exhausted(u64 P, const bytes32& spine, std::string* detail = nullptr) const {
+        std::lock_guard<std::mutex> lk(m_rmtx);
+        auto it = m_repairs.find(std::make_pair(P, spine));
+        if (it == m_repairs.end()) return false;
+        const Repair& r = it->second;
+        if (!r.full_only || !(r.st == Repair::St::Idle && r.exhausted)) return false;
+        if (detail) {
+            std::string s;
+            for (const auto& [p, n] : r.full_refused) {
+                const auto lo = r.full_lowest.find(p);
+                s += (s.empty() ? "" : ", ") + std::string("peer ") + std::to_string(p) + " refused x" + std::to_string(n) +
+                     (lo != r.full_lowest.end() ? " (retains >= " + std::to_string(lo->second) + ")" : "");
+            }
+            *detail = s.empty() ? "no peer answered the whole-order ask" : s;
+        }
+        return true;
+    }
+    bool repair_full_only(u64 P, const bytes32& spine) const {
+        std::lock_guard<std::mutex> lk(m_rmtx);
+        auto it = m_repairs.find(std::make_pair(P, spine));
+        return it != m_repairs.end() && it->second.full_only;
+    }
+#define C2POOL_XMR_DEEP_ORDER_FALLBACK 1
     std::size_t repairs_open() const { std::lock_guard<std::mutex> lk(m_rmtx); return m_repairs.size(); }
     // REPAIR-HORIZON: the first lane position the Ready order covers. 0 = the
     // whole order [0, P) (ids = P positions); a0 > 0 = the serving peer's vault
@@ -1332,6 +1476,21 @@ public:
                 case Repair::St::Idle:
                     s = r.exhausted ? "idle: every ready peer tried (" + std::to_string(r.tried.size()) + "), none serves an order reaching this spine"
                                     : "idle: waiting for a ready peer";
+                    if (r.full_only) {   // ★ HOLD-ROUND-3 F3a: the whole-order fallback, named
+                        s += "; WHOLE-ORDER fallback [0," + std::to_string(r.P) + ")";
+                        if (r.exhausted) {
+                            s += ": every ready peer refused it twice (";
+                            bool first = true;
+                            for (const auto& [p, n] : r.full_refused) {
+                                const auto lo = r.full_lowest.find(p);
+                                s += (first ? "" : ", ") + std::string("peer ") + std::to_string(p) + " x" + std::to_string(n) +
+                                     (lo != r.full_lowest.end() ? " retains >= " + std::to_string(lo->second) : "");
+                                first = false;
+                            }
+                            s += ") -- the cut's positions are below every serving peer's retention (--relay-order-retain) or the peers run "
+                                 "without a durable order; this node needs a longer-retaining peer or the cold-boot path (ledger + lane snapshot)";
+                        }
+                    }
                     if (!r.deep.empty()) {   // REPAIR-HORIZON: the loud, named outcome
                         s += "; DEEP-DIVERGENCE: our lane order differs from the winner's BELOW the vault horizon of " +
                              std::to_string(r.deep.size()) + " peer(s) (";
@@ -1341,7 +1500,8 @@ public:
                     }
                     break;
                 case Repair::St::Ordering:
-                    s = std::string(r.walk_from.count(r.cur) ? "REPAIR-CHAIN deep walk (step " + std::to_string(r.walk_k.count(r.cur) ? r.walk_k.at(r.cur) : 0) +
+                    s = std::string(r.full_only ? "WHOLE-ORDER fallback (pages=" + std::to_string(r.pages) + "): " : std::string()) +
+                        std::string(r.walk_from.count(r.cur) ? "REPAIR-CHAIN deep walk (step " + std::to_string(r.walk_k.count(r.cur) ? r.walk_k.at(r.cur) : 0) +
                                                                " below a0=" + std::to_string(r.walk_from.at(r.cur)) + "): " : std::string()) +
                         std::string(r.probing ? "probing the prefix digest at a0=" + std::to_string(r.a0) + " of peer " : "ordering from peer ") +
                         std::to_string(r.cur) + " (" + std::to_string(r.cursor) + "/" + std::to_string(P) + " ids" +
@@ -1458,6 +1618,8 @@ public:
             "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
             "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu rules_mismatch=%llu | "
             "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
+            "deep-fallback required=%llu reask=%llu refused=%llu ready=%llu exhausted=%llu | "
+            "deep-serve cuts=%llu first_ask=%llu over_budget=%llu below_retention=%llu retain=%llu lowest=%llu | "
             "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu | "
             "order serve=%llu ids=%llu throttled=%llu | order ask=%llu ok=%llu timeouts=%llu late=%llu | "
             "repair-page pages=%llu max=%llu timeouts=%llu grown=%llu | verify threads=%llu q=%zu parked=%zu unavail_parked=%llu",
@@ -1488,6 +1650,12 @@ public:
             (unsigned long long)s.repair_horizon_rearm.load(), (unsigned long long)s.repair_prefix_ok.load(),
             (unsigned long long)s.repair_prefix_unknown.load(), (unsigned long long)s.repair_deep.load(),
             (unsigned long long)s.reoffer_unpushed.load(),
+            (unsigned long long)s.repair_full_required.load(), (unsigned long long)s.repair_full_reask.load(),
+            (unsigned long long)s.repair_full_refused.load(), (unsigned long long)s.repair_full_ready.load(),
+            (unsigned long long)s.repair_full_exhausted.load(),
+            (unsigned long long)s.deep_serve_cuts.load(), (unsigned long long)s.deep_serve_first_ask.load(),
+            (unsigned long long)s.deep_serve_over_budget.load(), (unsigned long long)s.deep_serve_below_retention.load(),
+            (unsigned long long)m_dorder.retain(), (unsigned long long)m_dorder.lowest_retained(),
             m_o.keepalive_ms, m_o.silence_timeout_ms,
             (unsigned long long)s.ping_tx.load(), (unsigned long long)s.ping_rx.load(),
             (unsigned long long)s.pong_tx.load(), (unsigned long long)s.pong_rx.load(),
@@ -1725,6 +1893,19 @@ private:
         std::set<PeerId> walk_checked;   // the peer's digest at P was probed == spine (its lineage reaches the cut)
         std::set<PeerId> walk_failed;
         std::map<PeerId, u64> walk_ok;
+        // ★ HOLD-ROUND-3 F3a: the WHOLE-ORDER fallback. full_only = this repair
+        // asks every peer [0, P) (never a suffix again: no verified base for
+        // [0, a0) exists here); full_refused = whole-order refusals per peer
+        // (the first is re-asked once: the server serves the SECOND ask; the
+        // second sets the peer aside); full_lowest = what each refusing peer
+        // said it retains (the alarm names it); full_next = peers whose next
+        // ask starts at 0 (a refused walk step, re-asked); pages / page_ids =
+        // the ORDER pages of the attempt in flight (the fetch line).
+        bool full_only = false, full_alarmed = false;
+        std::map<PeerId, u32> full_refused;
+        std::map<PeerId, u64> full_lowest;
+        std::set<PeerId> full_next;
+        u64 pages = 0, page_ids = 0;
         Clock::time_point since = Clock::now();
         // REPAIR-PAGE liveness (#1808 review): when Ordering from `cur` began and
         // the first page it asked (0 = no page answered yet); they size the cap.
@@ -1740,6 +1921,7 @@ private:
             a0 = 0; probing = false; has_a0_digest = false; ordering_page = 0;
             cached_seen = 0; fetch_tried.clear(); refetches = 0;
             walk_from.clear(); walk_k.clear(); walk_checked.clear();
+            pages = 0; page_ids = 0;   // F3a: per attempt (full_only / full_refused / full_lowest / full_next persist)
         }
     };
     struct CtxWant {
@@ -3623,10 +3805,20 @@ private:
                 std::lock_guard<std::mutex> lk(m_rmtx);
                 auto it = m_repairs.find(cj->key);
                 if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p &&
+                    (it->second.full_only || (!cj->probe && cj->a == 0 && it->second.walk_from.count(p)))) {
+                    // ★ HOLD-ROUND-3 F3a: a refused WHOLE-ORDER ask [0, P) (the fallback, or a
+                    // walk's last step). The server refuses the first [0, P) ask of a (peer, P)
+                    // by design and serves the second: re-ask this peer ONCE from 0; a second
+                    // refusal (below its retention, or no durable order) sets it aside.
+                    Repair& r = it->second;
+                    const u32 n = ++r.full_refused[p];
+                    r.full_lowest[p] = o.lowest_retained;
+                    if (n == 1) { r.rearm = p; r.full_next.insert(p); m_st.repair_full_reask++; }
+                    else m_st.repair_full_refused++;
+                } else if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p &&
                     it->second.walk_from.count(p)) {
                     // REPAIR-CHAIN: a walk PROBE refused = an RC5 peer (no durable order):
-                    // DEEP as RC5 names it. A refused whole-order step (its walker mark
-                    // was taken by another repair of ours) is only set aside: re-walked.
+                    // DEEP as RC5 names it.
                     if (cj->probe) walk_failed_locked(it->second, p, /*rc5=*/true);
                 } else if (it != m_repairs.end() && it->second.st == Repair::St::Ordering && it->second.cur == p) {
                     Repair& r = it->second;
@@ -3769,6 +3961,7 @@ private:
                                             : (o.p_served >= prev + 1 && o.p_served <= prev + mp));
             if (!dense) { m_st.repair_peer_fail++; r.tried.insert(p); r.reset(); return; }
             for (const auto& e : o.ids) r.ids.push_back(e.id);
+            ++r.pages; r.page_ids += o.ids.size();   // F3a: the fetch line's page count
             // REPAIR-PAGE: a page that ADVANCES the cursor is progress: restart
             // the Ordering clock, so a repair of many small pages is bounded per
             // page by repair_state_timeout_ms. #1808 review: only a SUBSTANTIAL
@@ -3942,13 +4135,31 @@ private:
                 for (PeerId p : ready) if (!pick && !r.tried.count(p)) pick = p;
                 if (!pick) {
                     r.exhausted = !ready.empty();
+                    if (r.exhausted && r.full_only && !r.full_alarmed) {   // ★ HOLD-ROUND-3 F3a: loud, once per repair
+                        r.full_alarmed = true;
+                        m_st.repair_full_exhausted++;
+                        std::string who;
+                        for (const auto& [p, n] : r.full_refused) {
+                            const auto lo = r.full_lowest.find(p);
+                            who += (who.empty() ? "" : ", ") + std::string("peer ") + std::to_string(p) + " x" + std::to_string(n) +
+                                   (lo != r.full_lowest.end() ? " (retains >= " + std::to_string(lo->second) + ")" : "");
+                        }
+                        notes.push_back("relay-ALARM REPAIR-DEEP RETENTION: the WHOLE order [0," + std::to_string(r.P) + ") of the winner's cut spine=" +
+                                        hex_short(r.spine) + " is served by NO connected peer: every ready peer refused it twice [" +
+                                        (who.empty() ? "no answer" : who) + "] -- its positions are below every peer's --relay-order-retain window, or the "
+                                        "peers run without a durable order. The block HOLDS (undecided); this node needs a peer retaining those positions "
+                                        "or the cold-boot path (ledger + lane snapshot). Re-asking every 5 s.");
+                    }
                     if (r.exhausted && Clock::now() - r.since > std::chrono::seconds(5)) { r.tried.clear(); r.since = Clock::now(); }
                     continue;
                 }
                 r.exhausted = false;
                 // REPAIR-HORIZON: from this peer's known vault start a0 (0 = the whole
                 // order); a0 > 0 asks the zero-length prefix probe [a0, a0) first.
-                const u64 a0 = r.a0_of.count(pick) ? r.a0_of[pick] : 0;
+                // ★ HOLD-ROUND-3 F3a: a whole-order fallback (or a re-asked whole-order
+                // step) starts at 0 whatever the peer's horizon.
+                const bool from_zero = r.full_only || r.full_next.erase(pick) > 0;
+                const u64 a0 = from_zero ? 0 : (r.a0_of.count(pick) ? r.a0_of[pick] : 0);
                 r.st = Repair::St::Ordering; r.cur = pick; r.a0 = a0; r.cursor = a0; r.probing = a0 > 0; r.ids.clear(); r.since = Clock::now();
                 r.ordering_started = r.since; r.ordering_page = 0;   // REPAIR-PAGE liveness: the per-peer cap starts here
                 Job j; j.kind = Job::Kind::Order; j.repair = true; j.key = k; j.a = a0; j.p = r.P; j.spine = r.spine;
@@ -4486,8 +4697,10 @@ private:
 
     ::c2pool::v37n::FrameVault m_vault;
     mutable DurableLaneOrder m_dorder;   // REPAIR-CHAIN (F2-S); declared after m_vault, destroyed before it
-    mutable std::mutex m_walker_mtx;
-    std::map<PeerId, Clock::time_point> m_deep_walkers;   // REPAIR-CHAIN: peers walking below our horizon
+    // ★ HOLD-ROUND-3 F3b: the whole-order serve budget + once-per-(peer, P) retention alarms
+    mutable DeepServeBudget m_deep_budget;
+    mutable std::mutex m_deep_log_mtx;
+    std::set<std::pair<PeerId, u64>> m_deep_retention_logged;
     static inline thread_local PeerId t_serving_peer = 0;
     static inline thread_local int t_verify_worker = -1;   // DROPS-VERIFY-SCALE
 

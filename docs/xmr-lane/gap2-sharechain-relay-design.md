@@ -423,6 +423,8 @@ traffic. **Ruling owed (OQ-1): default policy + L.**
 --relay-reoffer-seconds S      sender-side re-offer window (default 60)
 --relay-order canonical|arrival, --relay-bin-lag L          (§4.4)
 --relay-vault-entries N / --relay-vault-bytes N / --relay-vault-horizon N   (FrameVault bounds)
+--relay-order-retain N         durable lane order: serve + keep the last N positions, hole-punch below; whole orders
+                               [0,P) served to a peer that asks twice, under a per-peer budget; 0 = all (default 1000000 mainnet, 0 elsewhere)
 --no-relay-serve               do not answer GETORDER/GETFRAMES (dial-only observers)
 ```
 `--relay-*` and `--credit-feed/--wire-*` are mutually exclusive (REFUSED at
