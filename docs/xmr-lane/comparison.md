@@ -14,7 +14,12 @@ on stagenet on 2026-10-03. Cells marked *(design)* describe parts that are
 written down but not yet running on the lane.
 
 The P2Pool and p2poolv2 columns come from reading their sources (Monero
-P2Pool `side_chain.cpp`; p2poolv2 `ShareChain.tla` and its store).
+P2Pool `side_chain.cpp`; p2poolv2 `ShareChain.tla` and its store). The
+"Protocol upgrades" row rests on Monero P2Pool's release notes and README
+(each hardfork has a published date and time, and nodes must update before
+it) and on classical p2pool's `work.py` (a share version switches at 95
+percent of recent shares); p2poolv2 and Braidpool do not describe an upgrade
+mechanism in the material we read.
 
 ## The comparison, compressed
 
@@ -29,6 +34,7 @@ P2Pool `side_chain.cpp`; p2poolv2 `ShareChain.tla` and its store).
 | **State and sync** | full window | window | RocksDB window | DAG | **window of bins; log-size roll-up of older bins *(design)*** |
 | **Formal checks and determinism** | none | fixed-point payout math | TLA+ specs | research | **integer-only consensus; TLA+ models of the ledger rules, checked with TLC at small bounds (the C++ is not proven against them)** |
 | **Pool-majority attack** (over half of the pool's own hashrate) | reorg the sharechain, orphan honest shares and take their PPLNS place; censor; withhold | the same per sidechain (main, mini and nano are each attackable alone); uncles soften orphaning | sharechain reorg (classical model) | no orphaning in the DAG; payouts depend on the custody signer threshold | **no reorg or orphan path: receipts stand alone, their order is a fixed rule, every node recomputes the coinbase, finality is Monero's (60 blocks); a majority can only leave fresh work out of the blocks it finds, until an honest block includes it, and withhold** |
+| **Protocol upgrades** | a new share version, taken up when 95% of recent shares signal it; nodes that do not upgrade cannot read the new shares and fork off | hardfork of the sidechain at a published date and time; every node must update before it to keep mining | not specified | not specified | *(design)* **rule epochs appended to the history, voted by miners' work with delegation to the node by default; old nodes hold instead of forking; earned balances cannot be voted away** |
 | **Maturity** | a decade live (now dead on BTC) | production, proven | early | early | **multi-node runs on stagenet; the mainnet run is the Monero CCS milestone** |
 
 ## The systems in short
@@ -79,6 +85,12 @@ accounting belongs to an operator.
 5. **Stall, not split.** When nodes cannot agree on a booking, a node stops
    and waits rather than split the ledger. A stall is the chosen failure
    mode, and it is a liveness cost.
+6. **Protocol upgrades.** Today a rule change on the lane is a new pool
+   genesis: old nodes see the new blocks as another pool's and the owed
+   ledger starts over. Monero P2Pool's timed hardforks and classical
+   p2pool's share-version switch run today; the rule-epoch design that would
+   fix this ([`rules-ratchet.md`](rules-ratchet.md)) is written, not
+   implemented.
 
 ## What v37 borrowed
 
