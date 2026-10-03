@@ -748,6 +748,25 @@ if (BUILD_TESTING AND GTest_FOUND)
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_dc_proof_test "" AUTO)
 
+    # --- DGB+DOGE (phase DA) -- "one parent per DOGE block" AuxPoW invariant ----
+    # Pins the core merged-mining consensus invariant this deployment rests on: a
+    # DOGE block is merge-mined under EXACTLY ONE parent (DGB here -- a SEPARATE
+    # deployment from canonical LTC+DOGE, never both). Structural (static_assert:
+    # one CPureBlockHeader + one DGB-typed CMerkleTx, two parents unrepresentable)
+    # plus a parse round-trip (one recovered DGB parent coinbase + header, re-parse
+    # idempotent). Distinct from the dual-target (fire) and dc_proof (byte-parity)
+    # siblings. Links ltc_coin like them -- the -DAUX_DOGE consumption path couples
+    # to ltc by design. Test-only; consumes the shared module, modifies nothing.
+    # MUST appear in BOTH this registration AND the build.yml --target allowlist.
+    add_executable(dgb_aux_one_parent_invariant_test aux_one_parent_invariant_test.cpp)
+    target_compile_definitions(dgb_aux_one_parent_invariant_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_one_parent_invariant_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_one_parent_invariant_test "" AUTO)
+
     # --- DGB+DOGE (M3) -- bind_aux_doge_parsers() PRODUCTION-binding KAT --------
     # Proves the production dgb node seam coin/node.hpp's bind_aux_doge_parsers()
     # is NON-HOLLOW: it instantiates a dgb::coin::Node, calls the (now real) bind
