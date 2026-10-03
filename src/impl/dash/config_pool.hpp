@@ -33,6 +33,10 @@ struct SharechainConfig
 {
     // ---- mainnet (networks/dash.py) ----
     static constexpr uint16_t P2P_PORT                  = 8999;
+    // Sharechain port of the named DASH v36 network (--net dash-v36). Not an
+    // oracle constant: the v36 network is c2pool's own, and a separate port lets
+    // a v36 node run on the same host as a v16 node on P2P_PORT.
+    static constexpr uint16_t V36_P2P_PORT              = 8998;
     static constexpr uint16_t WORKER_PORT               = 7903;
     static constexpr uint32_t SHARE_PERIOD              = 20;     // seconds
     static constexpr uint32_t CHAIN_LENGTH              = 4320;   // 24*60*60//20
@@ -101,7 +105,13 @@ struct SharechainConfig
 
     static inline bool is_testnet = false;
 
-    static uint16_t p2p_port()          { return is_testnet ? TESTNET_P2P_PORT : P2P_PORT; }
+    // --net dash-v36 is mainnet-only, so the testnet port needs no v36 variant.
+    // A custom --network-id (private network) keeps P2P_PORT.
+    static uint16_t p2p_port()
+    {
+        if (is_testnet) return TESTNET_P2P_PORT;
+        return is_named_v36_network() ? V36_P2P_PORT : P2P_PORT;
+    }
     static uint16_t worker_port()       { return is_testnet ? TESTNET_WORKER_PORT : WORKER_PORT; }
     static uint32_t share_period()      { return is_testnet ? TESTNET_SHARE_PERIOD : SHARE_PERIOD; }
     static uint32_t chain_length()      { return is_testnet ? TESTNET_CHAIN_LENGTH : CHAIN_LENGTH; }
@@ -742,14 +752,18 @@ inline void apply_sharechain_identity(SharechainConfig::NamedNetwork named,
 // ---------------------------------------------------------------------------
 // Built-in sharechain seeds of the DASH v36 network. Dialed ONLY when --net
 // dash-v36 is set and no --addnode/--connect is given
-// (SharechainBootstrapMode::V36NetworkSeeds).
-// TODO(operator approval): the list is EMPTY until the operator approves the
-// first entries (candidate: dash.voidbind.com:8999, once a v36 node is deployed
-// there). Until then a node of this network needs --addnode HOST:PORT.
+// (SharechainBootstrapMode::V36NetworkSeeds). Operator-approved public nodes
+// of the network, HOST:PORT on the v36 sharechain port
+// (SharechainConfig::V36_P2P_PORT);
+// IP literals, so dialing needs no DNS. An explicit --addnode/--connect
+// replaces the whole list.
 // ---------------------------------------------------------------------------
 inline std::vector<std::string> v36_network_seed_hosts()
 {
-    return {};
+    return {
+        "158.220.92.171:8998",   // dash.voidbind.com
+        "109.123.238.32:8998",   // Singapore
+    };
 }
 
 // ---------------------------------------------------------------------------
