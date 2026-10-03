@@ -480,6 +480,8 @@ struct RelayStats {
     std::atomic<u64> share_refused{0}, share_parked{0}, share_undecided_dropped{0}, share_undecided_trusted{0};
     // ★ HOLD-ROUND-2 (B): lane-prefix skew at the verdict (never a strike)
     std::atomic<u64> share_skew_ahead{0}, share_skew_behind{0}, share_late{0}, share_ahead_rejudged{0}, share_ahead_evicted{0};
+    // ★ HOLD-ROUND-3 (F4): prefix-hash mismatches with no V37N base: parked (never struck), dropped after the re-judge bound
+    std::atomic<u64> share_unbased_parked{0}, share_unbased_expired{0};
     std::atomic<u64> won_reoffer_skipped{0};   // RELAY-SEND-QUEUE: not re-offered, the peer node provably holds it
     std::atomic<u64> won_held_confirmed{0};    // RELAY-SEND-QUEUE: re-offered frames a later PONG proved read
     std::atomic<u64> won_asked{0}, won_served{0}, won_unknown{0}, won_solicited_rx{0};   // ★ DROPS-RESTART (FB_GETWON)
@@ -1517,14 +1519,18 @@ public:
     // The share-verdict counters (VERIFY S6: only the last refusal showed).
     std::string describe_shares() const {
         const auto& s = m_st;
-        char b[420];
+        char b[560];
+        // HOLD-ROUND-3 (4.10): `parked` / `ahead` are cumulative; `park_now` (the
+        // undecided park) and `ahead_now` (the AHEAD/UNBASED park) are LIVE depths.
         std::snprintf(b, sizeof b,
             "relay-shares: refused=%llu parked=%llu undecided_dropped=%llu trusted=%llu | skew ahead=%llu behind=%llu late=%llu "
-            "ahead_now=%zu rejudged=%llu evicted=%llu",
+            "unbased=%llu unbased_expired=%llu | park_now=%zu ahead_now=%zu rejudged=%llu evicted=%llu",
             (unsigned long long)s.share_refused.load(), (unsigned long long)s.share_parked.load(),
             (unsigned long long)s.share_undecided_dropped.load(), (unsigned long long)s.share_undecided_trusted.load(),
             (unsigned long long)s.share_skew_ahead.load(), (unsigned long long)s.share_skew_behind.load(),
-            (unsigned long long)s.share_late.load(), share_ahead_size(),
+            (unsigned long long)s.share_late.load(),
+            (unsigned long long)s.share_unbased_parked.load(), (unsigned long long)s.share_unbased_expired.load(),
+            verify_parked_size(), share_ahead_size(),
             (unsigned long long)s.share_ahead_rejudged.load(), (unsigned long long)s.share_ahead_evicted.load());
         return b;
     }
@@ -1677,6 +1683,7 @@ private:
         Clock::time_point enq = Clock::now();
         Clock::time_point not_before = Clock::now();
         u64 ahead_node = 0;        // HOLD-ROUND-2 V4: the sender NODE an AHEAD park is counted under (inv_node)
+        unsigned unbased_rounds = 0;   // HOLD-ROUND-3 (F4): UNBASED re-judges so far (dropped past kShareUnbasedMaxRounds)
     };
     struct CacheEntry { ::v37::ScriptRef payee; std::vector<u8> raw; u64 bin = 0; u16 give_author = 0; };
     struct Job {
@@ -2691,6 +2698,20 @@ private:
                     v = 0;   // a repair answer: the patience path, then trusted (Ruling A)
                 } else if (v == kShareVerdictAhead) {
                     m_st.share_skew_ahead++;
+                    park_ahead(std::move(it));
+                    return;
+                } else if (v == kShareVerdictUnbased) {
+                    // ★ HOLD-ROUND-3 (F4): no V37N base, the outputs differ: a lane
+                    // block ahead / behind, or garbage -- parked like AHEAD (the same
+                    // per-node / total bounds), re-judged on every share-state advance,
+                    // dropped without a strike once kShareUnbasedMaxRounds re-judges
+                    // never turned canonical. Never a strike, never a ban (attempt 8).
+                    if (++it.unbased_rounds > kShareUnbasedMaxRounds) {
+                        m_st.share_unbased_expired++;
+                        forget_inflight(it.id); note_drop_refused(it.id);
+                        return;
+                    }
+                    m_st.share_unbased_parked++;
                     park_ahead(std::move(it));
                     return;
                 } else {

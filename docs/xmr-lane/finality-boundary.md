@@ -225,6 +225,40 @@ P; the no-relay hold says when our order does not. KAT:
 `v37_xmr_drops_carry_suffix_kat` CS13. Open items of this round: see
 `coinbase-recompute.md` section 7.
 
+**Hold round 3 (stagenet attempt 8): the suffix base is decided now, the
+origin bin survives a restart, an unbased mismatch is parked.** Attempt 8 held
+2220998 (P=2451 > vault horizon 2160) on node A although A's relay had already
+matched the finder's digest at a0=312 through A's shadow of the finder's
+lineage and A held that shadow's DROPS record: the DROPS prefix derivation
+accepted only a finished settlement replay, and the replay ran only from the
+fold, after the composition the hold aborted on every retry. Node B, restarted,
+held on "the origin bin of a repaired receipt is not resolvable yet" for five
+receipts whose parent was an orphaned block (gone from a ChainView rebuilt from
+main-chain headers): the DROPS path consulted the origin-bin journal, the
+replay path did not. Both lineage splits were born at receivers striking the
+finder's post-FOUND shares before pay-now armed (no V37N base, so the take
+classifier of round 2 had nothing to classify). Node-local fixes, no lane rule,
+wire byte or owed_digest byte changed: (F1) `drops_lane_prefix` decides the
+base of [0, a0) through `drops::decide_suffix_base` -- our own order when our
+digest at a0 is the peer's, else the settlement replay's base, RUN NOW
+(`relay_view`, idempotent, cached) when none has run, a shadow's record only
+when that shadow's digest at a0 is exactly the peer's; everything else still
+holds, named (`drops-HOLD suffix: ... [replay now: ...]`), and the chosen base
+is logged once per cut (`drops-prefix base:`). (F2) one origin-bin resolver
+(ChainView, then the journal) behind the replay path, the DROPS path and the
+receipts-log reload, which now hands the journalled bin to the relay cache and
+the lane set; `relay-lane-set` lists the unbinned ids. (F4) a prefix-hash
+mismatch with no V37N base is `kShareVerdictUnbased`: parked like AHEAD under
+the same bounds, re-judged on each share-state advance, dropped without a
+strike after `kShareUnbasedMaxRounds`; never a strike, never a ban. (R3-8) a
+finished lane composition is memoized per (block, cut, set, price, ledger
+state) so a held booking does not recompose on every retry. KATs:
+`v37_xmr_hold_round3_kat` (R3-1 the attempt-8 shape on three nodes, R3-2 the
+restart, R3-4/R3-7 green pins, R3-8, source pins), `v37_xmr_share_verdict_kat`
+S15, `v37_xmr_relay_multinode_kat` M10. Not in this round: F3 (the deep
+whole-order fetch as the universal fallback, bounded retention) and the
+checkpointed spine (a lane-rule change, v37.1).
+
 ## 4b. Recovery: VERIFIED resync (W6) -- design, not yet implemented
 
 The old contract ("stop the node and copy `settle.img` from a converged peer")

@@ -363,6 +363,11 @@ struct SuffixHoldCause {
     std::uint64_t replay_a0 = 0;
     bool shadow_record_missing = false;  // base = shadow, and that shadow has no DROPS record
     std::string own_why;                 // own_prefix's reason ("" = own order not tried / not the cause)
+    // ★ HOLD-ROUND-3 (F1): the settlement replay was run from the prefix
+    // derivation itself (no longer waited for); when it failed, its reason.
+    bool replay_ran_now = false;
+    std::string replay_why;
+    bool shadow_a0_mismatch = false;     // base = shadow with a record, but its digest at a0 is not the peer's
 };
 inline std::string hold_hex12(const std::optional<bytes32>& b, const char* none) {
     if (!b) return none;
@@ -379,9 +384,12 @@ inline std::string suffix_hold_why(const SuffixHoldCause& c) {
     else if (!c.ours_a0) cause = "our digest at a0 is not retained here";
     else if (*c.peer_a0 != *c.ours_a0) cause = "our [0,a0) is not the serving peer's (a0 digests differ)";
     else cause = "a0 digests agree";
-    if (c.replay_base < 0) cause += "; the settlement replay of this cut has not run";
+    if (c.replay_base < 0) cause += c.replay_ran_now ? "; the settlement replay was run now and did not verify a base" :
+                                                       "; the settlement replay of this cut has not run";
     else if (c.replay_a0 != c.a0) cause += "; the replay ran at a0=" + std::to_string(c.replay_a0);
     else if (c.shadow_record_missing) cause += "; the replay's shadow base has no DROPS record";
+    else if (c.shadow_a0_mismatch) cause += "; the replay's shadow base has another digest at a0 than the serving peer";
+    if (!c.replay_why.empty()) cause += " [replay now: " + c.replay_why + "]";
     return "cut-pending: drops lane prefix of P=" + std::to_string(c.P) + ": the served order is the SUFFIX [" + std::to_string(c.a0) + "," +
            std::to_string(c.P) + ") and our [0," + std::to_string(c.a0) + ") is not the order the spine verified -- HOLD, never "
            "composed from a suffix; cause: " + cause + " (a0 digest peer=" + hold_hex12(c.peer_a0, "none") + " ours=" +
@@ -396,6 +404,132 @@ inline std::string awaiting_order_why(std::uint64_t P, const char* repair_state,
            (own_why.empty() ? std::string() : "; own order: " + own_why) + ")";
 }
 #define C2POOL_XMR_PREFIX_HOLD_CAUSE 1
+
+// ★ HOLD-ROUND-3 (F1): WHICH [0, a0) a suffix repair's DROPS prefix stands on,
+// decided by the SAME digest gate as the settlement view -- and decided NOW.
+//
+// Stagenet attempt 8 (node A, 2220998, P=2451 > vault horizon 2160): the relay
+// repair served the SUFFIX [312, P) and its prefix probe had already matched
+// C's digest at 312 through A's SHADOW of C's lineage (REPAIR-CHAIN), but the
+// DROPS prefix derivation accepted only (a) our own digest at a0 == the peer's
+// or (b) a finished settlement replay (replay_base) -- and the replay ran only
+// from the fold, AFTER the DROPS composition, which the hold aborted on every
+// retry: "a0 digests differ; the settlement replay of this cut has not run"
+// x490, templates frozen. Nothing was missing; the sequencing was circular.
+//
+// The rule, in one place (the shell's drops_lane_prefix calls it; the KAT pins
+// it): own digest at a0 equal to the serving peer's -> OUR lane log is the base
+// (kOwn). Else the settlement replay's base for this cut; when none has run
+// yet, RUN IT NOW (relay_view: idempotent, cached in replay_cache, the fold
+// later finds the cached view) and read its result: a record for the whole
+// cut (drops_on_replay stored it) -> kRecord; base kOwn -> kOwn; base kShadow
+// -> the DROPS record of that shadow, accepted only when the shadow's recorded
+// digest at a0 is EXACTLY the serving peer's (the probe's equality; a peer that
+// stated no digest leaves the spine gate at P as the only check) -> kShadow.
+// Anything else HOLDs with its cause (SuffixHoldCause); never a composition
+// from a suffix. Node-local sequencing only: no lane rule, wire byte or
+// owed_digest reads it.
+struct SuffixBaseDecision {
+    enum Kind { kHold = 0, kOwn = 1, kRecord = 2, kShadow = 3 } kind = kHold;
+    std::string shadow_key;      // kShadow: "P_end:digesthex" of the shadow whose record is [0, a0)
+    bool replay_ran_now = false; // the settlement replay was run from here
+    bool exact = false;          // the base's digest at a0 equals the serving peer's (own: always; shadow: when the peer stated one)
+    SuffixHoldCause cause;       // kHold: why (suffix_hold_why renders it)
+    const char* base_name() const { return kind == kOwn ? "own" : kind == kRecord ? "record" : kind == kShadow ? "shadow" : "none"; }
+};
+struct SuffixBaseQuery {
+    std::uint64_t P = 0, a0 = 0;
+    std::optional<bytes32> peer_a0, ours_a0;
+    std::string own_why;
+    std::string cut_key;   // "P:spinehex" of this cut (a replay that just ran adopts its order as the shadow of that key)
+    // the settlement replay's base for this cut: false = none yet; else (base, a0, shadow_key)
+    std::function<bool(int& base, std::uint64_t& a0, std::string& shadow_key)> replay_base;
+    std::function<bool(std::string& why)> run_replay;              // relay_view(P, spine) now; true = a view
+    std::function<bool()> cut_record;                               // a DROPS record for the whole cut exists
+    std::function<bool(const std::string& shadow_key)> shadow_record;   // that shadow's DROPS record exists
+    // the shadow (its key) whose recorded digest at a0 equals the peer's; nullopt = none
+    std::function<std::optional<std::string>(std::uint64_t a0, const bytes32& peer_a0)> shadow_with_digest;
+};
+inline SuffixBaseDecision decide_suffix_base(const SuffixBaseQuery& q) {
+    SuffixBaseDecision d;
+    d.cause.P = q.P; d.cause.a0 = q.a0; d.cause.peer_a0 = q.peer_a0; d.cause.ours_a0 = q.ours_a0; d.cause.own_why = q.own_why;
+    if (q.a0 == 0) { d.kind = SuffixBaseDecision::kOwn; d.exact = true; return d; }   // the served order IS [0, P)
+    if (q.peer_a0 && q.ours_a0 && *q.peer_a0 == *q.ours_a0) { d.kind = SuffixBaseDecision::kOwn; d.exact = true; return d; }
+    int base = -1; std::uint64_t ra0 = 0; std::string skey;
+    bool have = q.replay_base && q.replay_base(base, ra0, skey);
+    if (!have && q.run_replay) {
+        d.replay_ran_now = d.cause.replay_ran_now = true;
+        std::string why;
+        if (!q.run_replay(why)) d.cause.replay_why = why;
+        have = q.replay_base && q.replay_base(base, ra0, skey);
+    }
+    if (q.cut_record && q.cut_record()) { d.kind = SuffixBaseDecision::kRecord; d.exact = true; return d; }
+    if (!have) return d;   // kHold: no base verified this cut (cause: replay not run / ran and failed)
+    d.cause.replay_base = base; d.cause.replay_a0 = ra0;
+    if (ra0 != q.a0) return d;   // the replay stood on another a0 (a re-armed repair): hold, named
+    if (base == 2 /* RepairReplayer::kOwn */) { d.kind = SuffixBaseDecision::kOwn; d.exact = true; return d; }
+    if (base == 3 /* RepairReplayer::kShadow */) {
+        if (!q.shadow_record || !q.shadow_record(skey)) { d.cause.shadow_record_missing = true; return d; }
+        if (q.peer_a0) {
+            // the shadow holding the peer's digest at a0 must be the base itself or the
+            // order the replay of THIS cut just adopted (it supersedes the base shadow it
+            // extended: RepairReplayer::adopt); a match through another lineage, or none
+            // (the replay reached the spine by a bucket-fold re-convergence), HOLDs
+            const auto m = q.shadow_with_digest ? q.shadow_with_digest(q.a0, *q.peer_a0) : std::nullopt;
+            if (!m || (*m != skey && *m != q.cut_key)) { d.cause.shadow_a0_mismatch = true; return d; }
+            d.exact = true;
+        }
+        d.kind = SuffixBaseDecision::kShadow; d.shadow_key = skey;
+        return d;
+    }
+    return d;
+}
+#define C2POOL_XMR_SUFFIX_BASE_NOW 1
+
+// ★ HOLD-ROUND-3 (R3-8): a lane composition is a pure function of (block, cut,
+// pinned set, cut price, booking ledger state); a booking that HOLDs after it
+// (the fold's own hold, a set member in flight) retried it on every attempt --
+// attempt 8 node B: `drops-lane: composed=481` for one block, five scratch
+// replays a minute. The shell keys the finished composition here and returns it
+// on the next attempt with the same key; any input change is a new key.
+template <class T>
+class ComposeMemo {
+public:
+    explicit ComposeMemo(std::size_t keep = 8) : m_keep(keep ? keep : 1) {}
+    bool get(const std::string& key, T& out) {
+        const auto it = m_map.find(key);
+        if (it == m_map.end()) { ++m_miss; return false; }
+        ++m_hit; out = it->second; return true;
+    }
+    void put(const std::string& key, const T& v) {
+        if (!m_map.count(key)) {
+            m_order.push_back(key);
+            while (m_order.size() > m_keep) { m_map.erase(m_order.front()); m_order.pop_front(); }
+        }
+        m_map[key] = v; ++m_put;
+    }
+    void forget_prefix(const std::string& prefix) {   // a block decided: its entries are dead
+        for (auto it = m_order.begin(); it != m_order.end();) {
+            if (it->rfind(prefix, 0) == 0) { m_map.erase(*it); it = m_order.erase(it); } else ++it;
+        }
+    }
+    std::size_t size() const noexcept { return m_map.size(); }
+    std::uint64_t hits() const noexcept { return m_hit; }
+    std::uint64_t misses() const noexcept { return m_miss; }
+    std::uint64_t puts() const noexcept { return m_put; }
+    // the key: every input the composition reads (a change in any = a new composition)
+    static std::string key_of(const std::string& bid, std::uint64_t P, const bytes32& spine, const std::string& set_tag,
+                              std::uint64_t reward, const std::string& price_tag, std::uint64_t ledger_seq) {
+        return bid + "|" + std::to_string(P) + ":" + hold_hex12(spine, "-") + "|" + set_tag + "|" + std::to_string(reward) + "/" + price_tag +
+               "|" + std::to_string(ledger_seq);
+    }
+private:
+    std::size_t m_keep;
+    std::map<std::string, T> m_map;
+    std::deque<std::string> m_order;
+    std::uint64_t m_hit = 0, m_miss = 0, m_put = 0;
+};
+#define C2POOL_XMR_COMPOSE_MEMO 1
 // A reconstructed winner-side order, receipt by receipt: the DROPS mirror of
 // a relay repair SHADOW (xmr_repair_replay.hpp). When the settlement replay
 // reaches a later spine from a shadow's [0, a0) instead of our own order,

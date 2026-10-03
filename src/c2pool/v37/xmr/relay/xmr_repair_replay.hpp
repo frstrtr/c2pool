@@ -141,6 +141,22 @@ public:
         for (const auto& sh : m_sh) for (const auto& [p, d] : sh.dig) out.emplace(p, d);
         return out;
     }
+    // ★ HOLD-ROUND-3 (F1): WHICH shadow the relay's prefix probe matched -- the
+    // most recently used shadow whose recorded digest at `pos` is exactly `d`,
+    // as (its length P_end, its digest at P_end) = the key of its DROPS record
+    // ("P_end:digesthex", main_v37_xmr.cpp drops_records). nullopt = none: the
+    // probe matched our own order, or nothing (attempt 8: node A's relay chose
+    // C's lineage through this shadow and no line said so).
+    std::optional<std::pair<std::uint64_t, bytes32>> shadow_with_digest(std::uint64_t pos, const bytes32& d) const {
+        for (const auto& sh : m_sh) {
+            const auto it = sh.dig.find(pos);
+            if (it == sh.dig.end() || it->second != d) continue;
+            const auto e = sh.dig.find(sh.pushes.size());
+            return std::make_pair(static_cast<std::uint64_t>(sh.pushes.size()), e == sh.dig.end() ? bytes32{} : e->second);
+        }
+        return std::nullopt;
+    }
+#define C2POOL_XMR_SHADOW_WITH_DIGEST 1
 
     // ── REPAIR-CHAIN ────────────────────────────────────────────────────────
     struct PersistStats {

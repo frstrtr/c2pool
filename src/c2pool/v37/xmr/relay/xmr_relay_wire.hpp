@@ -120,6 +120,18 @@ inline constexpr int kShareVerdictAhead  = 2;
 inline constexpr int kShareVerdictBehind = 3;
 inline constexpr int kShareVerdictLate   = 4;
 #define C2POOL_XMR_SHARE_VERDICT_SKEW 1
+// ★ HOLD-ROUND-3 (F4): UNBASED -- the coinbase prefix hash is not the canonical
+// one and the share commits NO V37N base (pay-now not armed: the first hours of
+// a pool, a template without a readable view), so the drain take it embodies
+// cannot be read and the AHEAD / BEHIND classification above has no number to
+// classify. The sender is a lane block ahead of or behind this node (the same
+// skew, invisible in the tail) or sends garbage: parked like AHEAD and re-judged
+// when the share state advances, dropped without a strike after
+// kShareUnbasedMaxRounds re-judges that never turned canonical. Never a strike,
+// never a ban: stagenet attempt 8's three lineages were born at these strikes.
+inline constexpr int kShareVerdictUnbased = 5;
+inline constexpr unsigned kShareUnbasedMaxRounds = 4;
+#define C2POOL_XMR_SHARE_VERDICT_UNBASED 1
 
 // ── the first-byte namespace ────────────────────────────────────────────────
 inline constexpr u8  FB_NS_FIRST  = 0x40;

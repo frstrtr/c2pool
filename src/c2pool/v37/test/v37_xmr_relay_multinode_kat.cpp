@@ -522,6 +522,85 @@ int main() {
         H.relay->set_dialing(false); X.relay->set_dialing(false);
     }
 
+    // ── M10 (HOLD-ROUND-3 F4): an UNBASED verdict is parked, never a strike, and expires ──
+    // Stagenet attempt 8: a prefix-hash mismatch with no V37N base was -1 -> a strike
+    // (A 223 / B 126 / C 162 refused, A banned B); the share verdict now returns
+    // kShareVerdictUnbased (v37_xmr_share_verdict_kat S15). The relay parks it like
+    // AHEAD under the same bounds, re-judges it on every share-state advance, and
+    // drops it without a strike after kShareUnbasedMaxRounds re-judges that never
+    // turned canonical; a share whose state does arrive is admitted.
+    {
+        RelayOptions qo = opts(true, {});
+#if defined(C2POOL_XMR_SHARE_VERDICT_SKEW)
+        qo.share_ahead_per_peer = 64;
+#endif
+        TNode Q("Q", qo, XmrReceiptIngest::Order::Canonical);
+        C(Q.relay->start(why), "M10 Q starts " + why);
+        TNode P("P", opts(false, {Q.relay->listen_port()}), XmrReceiptIngest::Order::Canonical);
+        C(P.relay->start(why), "M10 P (the finder, pay-now not armed) starts, dials Q " + why);
+        std::vector<TNode*> pq{&P, &Q};
+        C(wait_for([&] { return P.relay->ready_peers().size() == 1 && Q.relay->ready_peers().size() == 1; }, pq), "M10 P-Q up");
+        std::atomic<bool> advanced{false};
+        std::atomic<u64> judged{0};
+        Q.relay->set_share_verdict([&](const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64, std::string& w) {
+            ++judged;
+            if (advanced.load()) return 1;
+            w = "unbased: the coinbase prefix hash is not the canonical one of this state and the share commits no V37N base";
+#if defined(C2POOL_XMR_SHARE_VERDICT_UNBASED)
+            return kShareVerdictUnbased;
+#else
+            return -1;   // the base verdict for that share (a strike)
+#endif
+        });
+        const bytes32 prevU = b32_of(0x79);
+        for (auto* n : pq) { n->note_bin(prevU, 106); n->template_height = 106; }
+        const SynthBlock blkU = make_block(106, prevU, 7, nullptr, 3, 17);
+        for (std::uint32_t k = 0; k < 200; ++k) P.relay->submit_own(own(blkU, 5000 + k, pA));
+        const auto& qs = Q.relay->stats();
+        C(wait_for([&] { return judged.load() >= 200 || qs.bans.load() >= 1; }, pq, 15000ms), "M10 Q judged P's 200 shares");
+        std::this_thread::sleep_for(300ms);
+#if defined(C2POOL_XMR_SHARE_VERDICT_UNBASED)
+        const u64 unb = qs.share_unbased_parked.load(), evicted = qs.share_ahead_evicted.load();
+        const std::size_t now_ahead = Q.relay->share_ahead_size();
+#else
+        const u64 unb = 0, evicted = 0; const std::size_t now_ahead = 0;
+#endif
+        C(qs.bans.load() == 0 && qs.share_refused.load() == 0 && Q.relay->ready_peers().size() == 1,
+          "M10 200 UNBASED shares: bans=0, refused=0, P stays connected (8a7ed91b3: -1 -> strikes -> bans=" + std::to_string(qs.bans.load()) +
+          " refused=" + std::to_string(qs.share_refused.load()) + ")");
+        C(unb == 200 && now_ahead == 64 && evicted == 136 && Q.relay->cache_size() == 0,
+          "M10 parked like AHEAD under the same bounds: unbased=" + std::to_string(unb) + " held=" + std::to_string(now_ahead) +
+          " evicted=" + std::to_string(evicted) + " (64 kept per node, the oldest dropped without a strike), none admitted");
+        // four share-state advances that never make them canonical: the 64 expire, no strike
+        for (unsigned r = 1; r <= 4; ++r) {
+#if defined(C2POOL_XMR_SHARE_VERDICT_SKEW)
+            Q.relay->notify_share_state_advanced();
+#endif
+            wait_for([&] { return judged.load() >= 200 + 64 * r; }, pq, 15000ms);
+            std::this_thread::sleep_for(150ms);
+        }
+#if defined(C2POOL_XMR_SHARE_VERDICT_UNBASED)
+        const u64 expired = qs.share_unbased_expired.load();
+#else
+        const u64 expired = 0;
+#endif
+        C(expired == 64 && Q.relay->share_ahead_size() == 0 && Q.relay->cache_size() == 0 && qs.bans.load() == 0,
+          "M10 after kShareUnbasedMaxRounds re-judges the 64 EXPIRE: dropped (" + std::to_string(expired) + "), none admitted, still bans=0 (the park does not fill with junk)");
+        // the honest finder's case: its state arrives at the next advance -> admitted
+        for (std::uint32_t k = 0; k < 32; ++k) P.relay->submit_own(own(blkU, 7000 + k, pA));
+        C(wait_for([&] { return judged.load() >= 200 + 256 + 32; }, pq, 15000ms) && Q.relay->share_ahead_size() == 32,
+          "M10 32 more UNBASED shares parked (" + std::to_string(Q.relay->share_ahead_size()) + ")");
+        advanced = true;   // the node booked the finder's lane block: share_publish -> notify
+#if defined(C2POOL_XMR_SHARE_VERDICT_SKEW)
+        Q.relay->notify_share_state_advanced();
+#endif
+        const bool admitted32 = wait_for([&] { return Q.relay->cache_size() == 32; }, pq, 20000ms);
+        C(admitted32 && qs.bans.load() == 0 && qs.share_refused.load() == 0,
+          "M10 the state advances: the 32 parked shares re-judge CANONICAL and are admitted on time (cache=" + std::to_string(Q.relay->cache_size()) +
+          "), bans=0 refused=0");
+        P.relay->set_dialing(false);
+    }
+
     for (auto* n : all) n->dump_logs();
     std::printf("    A %s\n    B %s\n    C %s\n", A.relay->describe().c_str(), B.relay->describe().c_str(), Cn.relay->describe().c_str());
     return C.done("v37_xmr_relay_multinode_kat");

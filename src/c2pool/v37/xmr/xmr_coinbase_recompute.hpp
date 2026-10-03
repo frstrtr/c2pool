@@ -170,9 +170,18 @@ struct Result {
     bool          take_mismatch = false;
     std::uint64_t took = 0, took_canon = 0, R = 0, prev_lane = 0, skew_dh = 0;
     std::uint32_t drain_q = 0, drain_h_cap = 0;
+    // ★ HOLD-ROUND-3 (F4): a share Mismatch at the LAST step (the tails agree,
+    // the outputs' prefix hash does not) and whether the claim committed a V37N
+    // base. Without one the take check above never ran: the outputs differ by a
+    // drain take no field states (the sender's prev lane block differs from
+    // ours) or by anything else -- undecidable here, never a strike
+    // (xmr_share_verdict.hpp kShareVerdictUnbased).
+    bool          prefix_hash_mismatch = false;
+    bool          has_paynow_base = false;
     bool canonical() const { return verdict == Verdict::Canonical; }
 };
 #define C2POOL_XMR_RECOMPUTE_TAKE_SKEW 1
+#define C2POOL_XMR_RECOMPUTE_UNBASED_FLAG 1
 
 // ★ HOLD-ROUND-2 (B): the dh' a committed take was cut at. Delta(dh) =
 // min(F, floor(R * min(dh, H_cap) / (Q * 16))) is non-decreasing in dh, so the
@@ -572,6 +581,7 @@ inline Result verify_share_coinbase(const std::vector<unsigned char>& tx_extra, 
     cl.payload = *payload;
     LaneInputs l2 = lane;
     l2.commit_total = true;   // a share's total is only what V37R states
+    res.has_paynow_base = cl.paynow_base.has_value();   // ★ HOLD-ROUND-3 (F4)
     std::string mis;
     const auto src = canonical_source(cl, ledger, pay_of, l2, cut, mis, &res);
     if (!src) return mismatch(mis);
@@ -588,6 +598,8 @@ inline Result verify_share_coinbase(const std::vector<unsigned char>& tx_extra, 
             return res;
         }
     }
+    res.prefix_hash_mismatch = true;   // ★ HOLD-ROUND-3 (F4): the tails agreed; only the outputs differ
+    res.prev_lane = ledger.prev_lane_height();
     return mismatch("the coinbase prefix hash is not the canonical one (the outputs pay other amounts or payees)");
 }
 
