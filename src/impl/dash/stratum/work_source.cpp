@@ -209,7 +209,7 @@ GetWork DASHWorkSource::get_work(const WorkJobTargetInputs& job_in) const
     // Mainnet embedded gate (see resource_template_now): default OFF keeps an
     // unconfigured mainnet node on the reward-safe dashd fallback (fail-closed);
     // testnet/regtest and the --embedded-mainnet opt-in run the embedded arm.
-    if (!is_testnet_ && !embedded_mainnet_) {
+    if ((!is_testnet_ && !embedded_mainnet_) || dashd_templates_only_) {
         coin::DashWorkData w =
             dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{};
         // THE THIRD FALLBACK PRODUCER, and the last silent one. This legacy
@@ -937,10 +937,13 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
     // run the embedded arm. Even when enabled, the NodeCoinState viability gate
     // (SML+quorum fresh at the tip, non-superblock, credit-pool seed height at
     // tip, bestCL fresh) fails safe to the fallback, so no invalid template mines.
-    const bool embedded_arm_enabled = is_testnet_ || embedded_mainnet_;
+    // The DASH v36 network (set_dashd_templates_only) never serves the
+    // embedded arm: its templates come from dashd only.
+    const bool embedded_arm_enabled =
+        (is_testnet_ || embedded_mainnet_) && !dashd_templates_only_;
     try {
         const bool populated = coin_state_.populated();
-        if (!embedded_arm_enabled && populated) {
+        if (!embedded_arm_enabled && populated && !dashd_templates_only_) {
             static std::once_flag mainnet_gate_logged;
             std::call_once(mainnet_gate_logged, [] {
                 LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm disabled on "
@@ -959,7 +962,14 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
             // The mainnet gate refused BEFORE viability was ever consulted;
             // name that, or the operator reads "dashd-fallback" and starts
             // hunting a coin-state fault that does not exist.
-            if (!embedded_arm_enabled) {
+            if (!embedded_arm_enabled && dashd_templates_only_) {
+                // The DASH v36 network takes dashd templates only: the
+                // embedded arm is refused by policy, not by coin state.
+                arm.decline.viable    = false;
+                arm.decline.cause     = "dashd-templates-only";
+                arm.decline.value     = "v36-network";
+                arm.decline.threshold = "--coin-rpc";
+            } else if (!embedded_arm_enabled) {
                 // The mainnet opt-in is off, so viability was never even
                 // consulted. Name the GATE, not the coin state -- an
                 // operator here must flip a flag, not chase a sync fault.

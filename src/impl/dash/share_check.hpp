@@ -37,6 +37,7 @@
 #include "coin/gentx_coinbase.hpp"   // dash::coin::GentxCoinbase (won-block reconstruct SSOT hand-off)
 #include "config_pool.hpp"            // dash::SharechainConfig::share_profile() (future-timestamp gate)
 #include "share_messages.hpp"         // v36 message_data validation (authority_pubkeys, validate_message_data)
+#include "share_precheck.hpp"         // #1828 cheap structural checks before any hashing
 #include "pplns_v36.hpp"              // v36 PPLNS window + amounts rule (CumulativeWeights, compute_v36_amounts)
 
 #include <core/coin_params.hpp>
@@ -227,9 +228,9 @@ inline std::vector<unsigned char> compute_gentx_before_refhash()
 inline void check_share_target_valid(const uint256& target, const core::CoinParams& params)
 {
     if (target.IsNull())
-        throw std::invalid_argument("share target is zero");
+        throw SharePoWTargetMiss("share target is zero");
     if (target > params.max_target)
-        throw std::invalid_argument("share target invalid");
+        throw SharePoWTargetMiss("share target invalid");
 }
 
 // ── Future-timestamp bound (private/isolated v36 sharechain only) ────────────
@@ -264,7 +265,7 @@ inline void check_share_timestamp_bound(uint32_t share_timestamp, uint32_t now, 
         return;
     if (static_cast<uint64_t>(share_timestamp) >
         static_cast<uint64_t>(now) + SHARE_TIMESTAMP_FUTURE_BOUND_SECS)
-        throw std::invalid_argument("share timestamp is too far in the future");
+        throw ShareClockReject("share timestamp is too far in the future");
 }
 
 // The one place the per-network profile is read for this rule.
@@ -323,11 +324,15 @@ inline uint256 share_init_verify(const DashShare& share,
                                 future_timestamp_bound_active());
 
     if (share.m_coinbase.m_data.size() < 2 || share.m_coinbase.m_data.size() > 100)
-        throw std::invalid_argument("bad coinbase size");
+        throw ShareStructureReject("bad coinbase size");
 
     // ── Share target validity (oracle: target > MAX_TARGET → "share target invalid") ──
     // Unconditional — NOT gated by check_pow, matching p2pool-dash Share.__init__.
     check_share_target_valid(chain::bits_to_target(share.m_bits), params);
+
+    // Oracle field checks with no hashing (data.py:318-319 merkle branch <= 16,
+    // data.py:335-340 transaction_hash_refs), before the ref stream (#1828).
+    precheck::check_v16_structure(share);
 
     // ── Compute ref_hash ──
     PackStream ref_stream;
@@ -458,7 +463,7 @@ inline uint256 share_init_verify(const DashShare& share,
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (share_hash > target)
-            throw std::invalid_argument("share PoW hash does not meet target");
+            throw SharePoWTargetMiss("share PoW hash does not meet target");
     }
 
     return share_hash;
@@ -592,11 +597,8 @@ inline std::vector<unsigned char> v36_hash_link_data(const uint256& ref_hash,
     return out;
 }
 
-// Largest message_data blob an honest producer can emit: the encryption header
-// (49) plus the MAX_TOTAL_MESSAGE_BYTES inner cap that create_message_data
-// enforces. Anything larger is rejected before any HMAC / ECDSA work.
-inline constexpr size_t MAX_MESSAGE_DATA_WIRE_BYTES =
-    ENCRYPTION_HEADER_SIZE + MAX_TOTAL_MESSAGE_BYTES;
+// MAX_MESSAGE_DATA_WIRE_BYTES (49 + 512) lives in share_precheck.hpp, which
+// also applies it before any hashing (check_v36_structure).
 
 // message_data validation for a v36 share. Empty is valid (no messages).
 // Otherwise the blob must decrypt under one of `keys`, carry at least one
@@ -624,9 +626,11 @@ inline std::span<const AuthorityPubkey* const> active_message_authority()
 
 // ── share_init_verify (Dash v36) ─────────────────────────────────────────────
 // Same checks, same order as the v16 verifier: future-timestamp bound, coinbase
-// size, target validity, ref_hash + hash_link + merkle, X11 PoW; then the v36
-// message_data validation LAST (after the PoW gate, so an unmined share costs
-// no HMAC / ECDSA work; still before any chain-relative check). Returns the
+// size, target validity, the no-hashing field checks (check_v36_structure:
+// merkle branches <= 16, message_data size cap, pubkey_type 0, merged fields
+// empty), ref_hash + hash_link + merkle, X11 PoW; then the v36 message_data
+// validation LAST (after the PoW gate, so an unmined share costs no HMAC /
+// ECDSA work; still before any chain-relative check). Returns the
 // share hash (X11 of the rebuilt header). `message_authority` is injectable so
 // the positive signed-message path is testable; production uses the overload
 // below, which passes active_message_authority().
@@ -639,9 +643,12 @@ inline uint256 share_init_verify(const DashV36Share& share,
                                 future_timestamp_bound_active());
 
     if (share.m_coinbase.m_data.size() < 2 || share.m_coinbase.m_data.size() > 100)
-        throw std::invalid_argument("bad coinbase size");
+        throw ShareStructureReject("bad coinbase size");
 
     check_share_target_valid(chain::bits_to_target(share.m_bits), params);
+
+    // Field checks with no hashing, before the ref stream (#1828).
+    precheck::check_v36_structure(share);
 
     // ── ref_hash → hash_link → gentx_hash ──
     const uint256 ref_hash = compute_v36_ref_hash(params, share);
@@ -680,7 +687,7 @@ inline uint256 share_init_verify(const DashV36Share& share,
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (share_hash > target)
-            throw std::invalid_argument("share PoW hash does not meet target");
+            throw SharePoWTargetMiss("share PoW hash does not meet target");
     }
 
     check_v36_message_data(share.m_message_data, message_authority);
@@ -1402,8 +1409,9 @@ inline uint256 verify_share(const ShareT& share, ChainT& chain,
 //                   [OP_RETURN 0x6a 0x28 ref_hash || LE64(last_txout_nonce), value 0]
 //   tx layout     = the v16 dash tx_type layout (version/type int16 pair {3,5} +
 //                   VarStr(extra_payload) iff coinbase_payload is non-empty).
-// Daemonless coinbase-only: a v36 share carries no tx refs; the gentx depends
-// only on the share's own fields and the sharechain.
+// A v36 share carries no tx refs (the template's txs are committed by the
+// coinbase merkle_link, folded into the header root in share_init_verify); the
+// gentx depends only on the share's own fields and the sharechain.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // The v36 coinbase bytes, the hash_link prefix cut and the txid.

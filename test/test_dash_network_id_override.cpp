@@ -21,11 +21,18 @@
 //       no flag), while A still finds it after switching back;
 //   (f) the private/isolated DASH v36 sharechain profile: keyed on the custom
 //       network id, exposes the v36 targets (share version 36, ratchet seed
-//       3600, P2PKH v36 donation, maintainer-only message authority, future-
-//       timestamp bound, emergency decay); the isolated CoinParams carry
-//       current_share_version 36 (the chain mints and admits v36), the public
-//       ones 16, and every no-flag CoinParams field is pinned byte-identical
-//       to master.
+//       and protocol advert 3601, P2PKH v36 donation, maintainer-only message
+//       authority, future-timestamp bound, emergency decay); the isolated
+//       CoinParams carry current_share_version 36 (the chain mints and admits
+//       v36) and advert 3601, the public ones 16 and 3600, and every no-flag
+//       CoinParams field is pinned byte-identical to master.
+//   (g) the named DASH v36 network (--net dash-v36 / settings key
+//       sharechain.network = "v36"): resolves to exactly the formerly reserved
+//       identity ac2785363c0180b8 / 8d8516bac9edd280, runs the v36 profile
+//       (advert and floor 3601), keys its store as dash_ac2785363c0180b8_v36,
+//       is an error together with --network-id / --prefix / --testnet, dials
+//       only its own (empty for now) seed list, goes through the money-acked
+//       settings-file path, and leaves the no-flag public identity untouched.
 //       (The future-timestamp bound IS consumed, by share_init_verify; its
 //       KATs live in test_dash_v36_future_timestamp*.cpp, linked into this
 //       same executable for the same process-global-identity reason.)
@@ -57,8 +64,13 @@
 #include <btclibs/util/strencodings.h>  // ParseHexBytes, HexStr
 #include <c2pool/storage/sharechain_storage.hpp>
 #include <core/filesystem.hpp>
+#include <core/settings_file.hpp>   // (g) settings-file path of sharechain.network
+#include <core/settings_cli.hpp>    // (g) --net through the catalog CLI scan
+#include <core/param_catalog.hpp>
 
 #include <chrono>
+#include <fstream>
+#include <unistd.h>  // getpid (per-process temp names)
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -227,9 +239,11 @@ std::string x11_genesis_hex(const core::CoinParams& p) {
 // Every CoinParams field make_coin_params() fills, pinned to master's values.
 // `isolated` relaxes ONLY what the private/isolated profile is allowed to move:
 // the identifier/prefix slots (network id override), the v36+ donation arm
-// (P2PKH instead of COMBINED) and current_share_version (36: the isolated
-// chain mints and admits v36). Everything else, including both
-// protocol-version fields, must match master on BOTH profiles.
+// (P2PKH instead of COMBINED), current_share_version (36: the isolated
+// chain mints and admits v36) and advertised_protocol_version (3601: the
+// isolated chain refuses peer builds without v36 isolated support, which
+// advertise 3600). Everything else, including the 1700 cold protocol floor,
+// must match master on BOTH profiles; the public advert stays 3600.
 void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, bool isolated) {
     SCOPED_TRACE(std::string(testnet ? "testnet" : "mainnet") + (isolated ? " isolated" : " public"));
     EXPECT_EQ(p.symbol, "DASH");
@@ -241,7 +255,10 @@ void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, b
     EXPECT_EQ(p.dust_threshold, 100000u);
     EXPECT_TRUE(p.softforks_required.empty());
     EXPECT_EQ(p.segwit_activation_version, 0u);
-    EXPECT_EQ(p.p2p_port,    testnet ? 18999 : 8999);
+    // The named v36 network has its own sharechain port (V36_P2P_PORT); every
+    // other identity keeps master's port.
+    EXPECT_EQ(p.p2p_port,    testnet ? 18999
+                             : (SharechainConfig::is_named_v36_network() ? 8998 : 8999));
     EXPECT_EQ(p.worker_port, testnet ? 17903 : 7903);
     EXPECT_EQ(p.share_period, 20u);
     EXPECT_EQ(p.chain_length, 4320u);
@@ -249,7 +266,7 @@ void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, b
     EXPECT_EQ(p.target_lookbehind, 100u);
     EXPECT_EQ(p.spread, 10u);
     EXPECT_EQ(p.minimum_protocol_version, 1700u);
-    EXPECT_EQ(p.advertised_protocol_version, 3600u);
+    EXPECT_EQ(p.advertised_protocol_version, isolated ? 3601u : 3600u);
     EXPECT_EQ(p.block_max_size, 0u);
     EXPECT_EQ(p.block_max_weight, 0u);
     EXPECT_EQ(p.max_target.GetHex(), testnet
@@ -494,6 +511,14 @@ TEST(DashNetworkIdOverride, BootstrapModePrecedence) {
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(true,  false, false), M::ExplicitPeers);
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false, true),  M::CustomNetSuppressed);
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false, false), M::PublicDefault);
+    // Named DASH v36 network (4th argument): its own seed list, below explicit
+    // peers and regtest, above the unnamed-custom-id suppression (the named net
+    // also fills the override slots, so has_custom_network_id is true for it).
+    EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false, true,  true),  M::V36NetworkSeeds);
+    EXPECT_EQ(dash::select_sharechain_bootstrap_mode(true,  false, true,  true),  M::ExplicitPeers);
+    EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, true,  true,  true),  M::RegtestIsolated);
+    EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false, true,  false), M::CustomNetSuppressed);
+    EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false, false, false), M::PublicDefault);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -649,28 +674,28 @@ TEST(DashNetworkIdOverride, NoFlagCoinParamsByteIdenticalToMaster) {
 
 TEST(DashNetworkIdOverride, IsolatedProfileIsKeyedOnCustomNetworkId) {
     IdentityGuard g;
-    EXPECT_FALSE(SharechainConfig::isolated_v36());
+    EXPECT_FALSE(SharechainConfig::v36_network());
 
     // Every spelling of the public network is NEVER isolated.
     for (const char* v : {"", "0", "00", "000", "0000", "00000000",
                           "0000000000000000", "00000000000000000"}) {
         SCOPED_TRACE(std::string("id=\"") + v + "\"");
         SharechainConfig::set_network_id(v, "");
-        EXPECT_FALSE(SharechainConfig::isolated_v36());
+        EXPECT_FALSE(SharechainConfig::v36_network());
         SharechainConfig::set_network_id(v, "0badc0ffee11");
-        EXPECT_FALSE(SharechainConfig::isolated_v36());
+        EXPECT_FALSE(SharechainConfig::v36_network());
     }
 
     for (bool testnet : {false, true}) {
         SCOPED_TRACE(testnet ? "testnet" : "mainnet");
         SharechainConfig::reset_network_id();
         SharechainConfig::is_testnet = testnet;
-        EXPECT_FALSE(SharechainConfig::isolated_v36());
+        EXPECT_FALSE(SharechainConfig::v36_network());
         SharechainConfig::set_network_id("abcd");
-        EXPECT_TRUE(SharechainConfig::isolated_v36());
-        EXPECT_EQ(SharechainConfig::isolated_v36(), SharechainConfig::has_custom_network_id());
+        EXPECT_TRUE(SharechainConfig::v36_network());
+        EXPECT_EQ(SharechainConfig::v36_network(), SharechainConfig::has_custom_network_id());
         SharechainConfig::reset_network_id();
-        EXPECT_FALSE(SharechainConfig::isolated_v36());
+        EXPECT_FALSE(SharechainConfig::v36_network());
     }
 }
 
@@ -701,8 +726,15 @@ TEST(DashNetworkIdOverride, IsolatedProfileExposesV36Targets) {
     const auto& prof = SharechainConfig::share_profile();
     EXPECT_EQ(&prof, &SharechainConfig::ISOLATED_V36_PROFILE);
     EXPECT_EQ(prof.target_share_version, 36u);
-    EXPECT_EQ(prof.ratchet_floor_protocol_version, 3600u);
-    EXPECT_EQ(prof.advertised_protocol_version, 3600u);
+    // Advert AND accept floor 3601: strictly above the 3600 a build without
+    // v36 isolated support advertises, so such a build is refused at the
+    // handshake; the public ratchet target (NEW_MINIMUM 3600) is unchanged.
+    EXPECT_EQ(prof.ratchet_floor_protocol_version, 3601u);
+    EXPECT_EQ(prof.advertised_protocol_version, 3601u);
+    EXPECT_EQ(prof.advertised_protocol_version, prof.ratchet_floor_protocol_version);
+    EXPECT_GT(prof.advertised_protocol_version, SharechainConfig::ADVERTISED_PROTOCOL_VERSION);
+    EXPECT_EQ(SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION, 3600u);
+    EXPECT_EQ(SharechainConfig::ADVERTISED_PROTOCOL_VERSION, 3600u);
     EXPECT_TRUE(prof.v36_donation_p2pkh);
     EXPECT_TRUE(prof.maintainer_only_authority);
     EXPECT_TRUE(prof.future_timestamp_bound);
@@ -715,9 +747,11 @@ TEST(DashNetworkIdOverride, IsolatedProfileExposesV36Targets) {
         // PublicProfileIsTheV16Baseline).
         EXPECT_EQ(p.current_share_version, 36u);
         EXPECT_EQ(p.current_share_version, prof.target_share_version);
-        // The cold floor stays 1700 (the 3600 seed goes to the node runtime,
-        // not into CoinParams); the advert is 3600 on both profiles.
+        // The cold floor stays 1700 (the 3601 seed goes to the node runtime,
+        // not into CoinParams); the advert is the profile's: 3601 here, 3600
+        // on public (PublicProfileIsTheV16Baseline).
         EXPECT_EQ(p.minimum_protocol_version, 1700u);
+        EXPECT_EQ(p.advertised_protocol_version, 3601u);
         EXPECT_EQ(p.advertised_protocol_version, prof.advertised_protocol_version);
         // Identity behaviour unchanged by the profile.
         EXPECT_EQ(p.active_identifier_hex(), "0d3a5c0920263617");
@@ -785,4 +819,316 @@ TEST(DashNetworkIdOverride, IsolatedAuthoritySetIsMaintainerOnlyAndPaysTheDonati
     const auto& fk = dash::DONATION_PUBKEY_FORRESTV();
     const auto fh = dash::hash160(fk.data(), fk.size());
     EXPECT_NE(std::vector<unsigned char>(fh.begin(), fh.end()), payee);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (g) The named DASH v36 network: --net dash-v36 / sharechain.network = "v36".
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+
+// The DASH v36 network identity, transcribed (the formerly RESERVED pair in the
+// config_pool.hpp history comment), never re-exported from the SSOT.
+constexpr const char* V36_ID  = "ac2785363c0180b8";
+constexpr const char* V36_PFX = "8d8516bac9edd280";
+
+// main()'s resolution, through the same seam main_dash.cpp calls.
+bool resolve_identity(std::string net, std::string nid, std::string pfx, bool testnet,
+                      std::string* err_out = nullptr)
+{
+    SharechainConfig::NamedNetwork named = SharechainConfig::NamedNetwork::None;
+    std::string err;
+    if (!dash::validate_sharechain_identity_args(net, nid, pfx, testnet, named, err)) {
+        if (err_out) *err_out = err;
+        return false;
+    }
+    dash::apply_sharechain_identity(named, nid, pfx);
+    return true;
+}
+
+void expect_v36_network_identity()
+{
+    EXPECT_EQ(SharechainConfig::identifier_hex(), V36_ID);
+    EXPECT_EQ(SharechainConfig::prefix_hex(),     V36_PFX);
+    EXPECT_EQ(SharechainConfig::V36_NETWORK_IDENTIFIER_HEX, V36_ID);
+    EXPECT_EQ(SharechainConfig::V36_NETWORK_PREFIX_HEX,     V36_PFX);
+    EXPECT_TRUE(SharechainConfig::is_named_v36_network());
+    EXPECT_TRUE(SharechainConfig::v36_network());
+    EXPECT_TRUE(SharechainConfig::has_custom_network_id());
+}
+
+std::string write_tmp(const std::string& name, const std::string& body)
+{
+    const auto p = std::filesystem::temp_directory_path()
+        / ("c2pool_dash_net_" + std::to_string(::getpid()) + "_" + name);
+    std::ofstream(p) << body;
+    return p.string();
+}
+
+} // namespace
+
+TEST(DashV36Network, NetDashV36ResolvesToTheV36IdentityAndProfile) {
+    IdentityGuard g;
+    ASSERT_TRUE(resolve_identity("dash-v36", "", "", /*testnet=*/false));
+    expect_v36_network_identity();
+
+    // v36 profile: advert AND accept floor 3601 (the refuse-old floor), share v36.
+    const auto& prof = SharechainConfig::share_profile();
+    EXPECT_EQ(&prof, &SharechainConfig::ISOLATED_V36_PROFILE);
+    EXPECT_EQ(prof.target_share_version, 36u);
+    EXPECT_EQ(prof.advertised_protocol_version, 3601u);
+    EXPECT_EQ(prof.ratchet_floor_protocol_version, 3601u);
+
+    const auto p = dash::make_coin_params(false);
+    EXPECT_EQ(p.active_identifier_hex(), V36_ID);
+    EXPECT_EQ(p.active_prefix_hex(),     V36_PFX);
+    EXPECT_EQ(p.current_share_version, 36u);
+    EXPECT_EQ(p.advertised_protocol_version, 3601u);
+    EXPECT_EQ(p.minimum_protocol_version, 1700u);  // cold floor unchanged; 3601 seeds the runtime floor
+    expect_coin_params_master_fields(p, /*testnet=*/false, /*v36 profile*/true);
+
+    // The identifier is what the ref stream commits (first 8 bytes).
+    const auto bytes = ref_stream_bytes(p, fixture_f1_info());
+    EXPECT_EQ(hex_of_bytes(bytes).substr(0, 16), V36_ID);
+    EXPECT_NE(hex_of(dash::producer::compute_ref_hash(p, fixture_f1_info())), F1_REF_HASH_HEX);
+
+    // Store: same rule as a custom id.
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_ac2785363c0180b8_v36");
+
+    SharechainConfig::reset_network_id();
+    EXPECT_FALSE(SharechainConfig::is_named_v36_network());
+    EXPECT_FALSE(SharechainConfig::v36_network());
+    EXPECT_EQ(SharechainConfig::identifier_hex(), MAIN_ID);
+    EXPECT_EQ(SharechainConfig::prefix_hex(),     MAIN_PFX);
+    EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
+}
+
+TEST(DashV36Network, NameSpellingsAreCanonicalized) {
+    for (const char* v : {"dash-v36", "v36", "DASH-V36", "V36", "Dash-V36"}) {
+        SCOPED_TRACE(v);
+        IdentityGuard g;
+        std::string name = v;
+        SharechainConfig::NamedNetwork n = SharechainConfig::NamedNetwork::None;
+        std::string err;
+        ASSERT_TRUE(dash::parse_named_network(name, n, err)) << err;
+        EXPECT_EQ(n, SharechainConfig::NamedNetwork::V36);
+        EXPECT_EQ(name, "dash-v36");
+        ASSERT_TRUE(resolve_identity(v, "", "", false));
+        expect_v36_network_identity();
+    }
+    for (const char* v : {"dash-v37", "v16", "dash", "public", "mainnet", "dash_v36", " v36"}) {
+        SCOPED_TRACE(v);
+        IdentityGuard g;
+        std::string err;
+        EXPECT_FALSE(resolve_identity(v, "", "", false, &err));
+        EXPECT_NE(err.find("dash-v36"), std::string::npos) << err;  // names the valid choice
+        EXPECT_FALSE(SharechainConfig::has_custom_network_id());
+    }
+}
+
+TEST(DashV36Network, NetConflictsWithNetworkIdPrefixAndTestnet) {
+    IdentityGuard g;
+    std::string err;
+    EXPECT_FALSE(resolve_identity("dash-v36", "abcd", "", false, &err));
+    EXPECT_NE(err.find("--network-id"), std::string::npos) << err;
+    EXPECT_NE(err.find("cannot be combined"), std::string::npos) << err;
+
+    err.clear();
+    EXPECT_FALSE(resolve_identity("dash-v36", "", "0badc0ffee11", false, &err));
+    EXPECT_NE(err.find("--prefix"), std::string::npos) << err;
+
+    err.clear();
+    EXPECT_FALSE(resolve_identity("dash-v36", "abcd", "0badc0ffee11", false, &err));
+    EXPECT_NE(err.find("cannot be combined"), std::string::npos) << err;
+
+    // Even the reserved pair itself, or an all-'0' public spelling, is a conflict:
+    // two identity sources are never silently merged.
+    for (const char* nid : {V36_ID, "0", "0000000000000000"}) {
+        SCOPED_TRACE(nid);
+        err.clear();
+        EXPECT_FALSE(resolve_identity("v36", nid, "", false, &err));
+        EXPECT_NE(err.find("cannot be combined"), std::string::npos) << err;
+    }
+
+    err.clear();
+    EXPECT_FALSE(resolve_identity("dash-v36", "", "", /*testnet=*/true, &err));
+    EXPECT_NE(err.find("--testnet"), std::string::npos) << err;
+
+    // Nothing was applied by any refused combination.
+    EXPECT_FALSE(SharechainConfig::has_custom_network_id());
+    EXPECT_FALSE(SharechainConfig::is_named_v36_network());
+    EXPECT_EQ(SharechainConfig::identifier_hex(), MAIN_ID);
+}
+
+TEST(DashV36Network, NoNetKeepsPublicAndCustomIdPaths) {
+    // No flags at all: public v16 identity, byte-identical to master.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("", "", "", false));
+        EXPECT_FALSE(SharechainConfig::has_custom_network_id());
+        EXPECT_FALSE(SharechainConfig::is_named_v36_network());
+        EXPECT_FALSE(SharechainConfig::v36_network());
+        EXPECT_EQ(SharechainConfig::identifier_hex(), MAIN_ID);
+        EXPECT_EQ(SharechainConfig::prefix_hex(),     MAIN_PFX);
+        EXPECT_EQ(SharechainConfig::data_subdir(false), "dash");
+        EXPECT_EQ(SharechainConfig::data_subdir(true),  "dash_testnet");
+        EXPECT_EQ(&SharechainConfig::share_profile(), &SharechainConfig::PUBLIC_PROFILE);
+        EXPECT_EQ(SharechainConfig::share_profile().advertised_protocol_version, 3600u);
+        expect_coin_params_master_fields(dash::make_coin_params(false), false, false);
+        expect_coin_params_master_fields(dash::make_coin_params(true),  true,  false);
+        const auto pm = dash::make_coin_params(false);
+        EXPECT_EQ(hex_of_bytes(ref_stream_bytes(pm, fixture_f1_info())), F1_REF_STREAM_HEX);
+        EXPECT_EQ(hex_of(dash::producer::compute_ref_hash(pm, fixture_f1_info())), F1_REF_HASH_HEX);
+    }
+    // A custom --network-id still runs the v36 profile but is NOT the named net.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("", "abcd", "0badc0ffee11", /*testnet=*/true));
+        EXPECT_TRUE(SharechainConfig::v36_network());
+        EXPECT_FALSE(SharechainConfig::is_named_v36_network());
+        EXPECT_EQ(SharechainConfig::identifier_hex(), "000000000000abcd");
+        EXPECT_EQ(SharechainConfig::data_subdir(true), "dash_testnet_000000000000abcd_v36");
+        EXPECT_EQ(dash::select_sharechain_bootstrap_mode(false, false,
+                      SharechainConfig::has_custom_network_id(),
+                      SharechainConfig::is_named_v36_network()),
+                  dash::SharechainBootstrapMode::CustomNetSuppressed);
+    }
+}
+
+TEST(DashV36Network, SeedListIsTheApprovedPublicNodes) {
+    IdentityGuard g;
+    // The operator-approved seeds, pinned: a change to the list must update
+    // this line in the same PR.
+    const std::vector<std::string> expected{"158.220.92.171:8998", "109.123.238.32:8998"};
+    EXPECT_EQ(dash::v36_network_seed_hosts(), expected);
+    for (const auto& hp : dash::v36_network_seed_hosts()) {
+        const auto colon = hp.rfind(':');
+        ASSERT_NE(colon, std::string::npos) << hp;
+        EXPECT_EQ(hp.substr(colon + 1), std::to_string(SharechainConfig::V36_P2P_PORT))
+            << hp << ": seeds listen on the v36 sharechain port";
+    }
+    ASSERT_TRUE(resolve_identity("dash-v36", "", "", false));
+    EXPECT_EQ(dash::select_sharechain_bootstrap_mode(/*explicit=*/false, /*regtest=*/false,
+                  SharechainConfig::has_custom_network_id(),
+                  SharechainConfig::is_named_v36_network()),
+              dash::SharechainBootstrapMode::V36NetworkSeeds);
+    EXPECT_EQ(dash::select_sharechain_bootstrap_mode(/*explicit=*/true, false,
+                  SharechainConfig::has_custom_network_id(),
+                  SharechainConfig::is_named_v36_network()),
+              dash::SharechainBootstrapMode::ExplicitPeers);
+}
+
+TEST(DashV36Network, SharechainPortPerIdentity) {
+    // v16 public network: 8999, unchanged.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("", "", "", false));
+        EXPECT_EQ(SharechainConfig::p2p_port(), 8999);
+    }
+    // Named v36 network: its own port, so it can run beside a v16 node on one host.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("dash-v36", "", "", false));
+        EXPECT_EQ(SharechainConfig::V36_P2P_PORT, 8998);
+        EXPECT_NE(SharechainConfig::V36_P2P_PORT, SharechainConfig::P2P_PORT);
+        EXPECT_EQ(SharechainConfig::p2p_port(), 8998);
+        EXPECT_EQ(dash::make_coin_params(false).p2p_port, 8998);
+    }
+    // A custom --network-id (private network) keeps the v16 port on mainnet and
+    // the testnet port on testnet.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("", "abcd", "0badc0ffee11", false));
+        EXPECT_EQ(SharechainConfig::p2p_port(), 8999);
+        SharechainConfig::is_testnet = true;
+        EXPECT_EQ(SharechainConfig::p2p_port(), 18999);
+    }
+}
+
+TEST(DashV36Network, SettingsFileAndCliSelectTheV36Network) {
+    namespace cs = c2pool::settings;
+    using c2pool::catalog::C_DASH;
+
+    // The catalog row: money-class, DASH-only, aliased to --net.
+    const auto* row = c2pool::catalog::find_by_canon("sharechain.network");
+    ASSERT_NE(row, nullptr);
+    EXPECT_TRUE(row->applies_to(C_DASH));
+    EXPECT_TRUE(row->is_money());
+    EXPECT_EQ(c2pool::catalog::find_by_alias(c2pool::catalog::Bin::BIN_DASH, "--net"), row);
+
+    const std::string body = "[dash]\n[dash.sharechain]\nnetwork = \"v36\"\n";
+
+    // (1) Unacked settings file: refused like network_id (money class, exit 78).
+    {
+        IdentityGuard g;
+        const auto path = write_tmp("unacked.toml", body);
+        cs::CliTracker cli; cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(C_DASH);
+        const auto r = cs::SettingsFile::load(path, C_DASH, cli, rc);
+        EXPECT_EQ(r.status, cs::LoadStatus::RefusedMoney);
+        EXPECT_EQ(r.exit_code, 78);
+        EXPECT_FALSE(rc.file_set("sharechain.network"));
+        std::filesystem::remove(path);
+    }
+    // (2) Acked: the value reaches main()'s overlay and selects the v36 network.
+    {
+        IdentityGuard g;
+        const auto p0 = write_tmp("ack0.toml", body);
+        const std::string h = cs::SettingsFile::compute_money_ack_hash(p0, C_DASH);
+        const auto path = write_tmp("acked.toml",
+            "[gate]\nmoney_ack_hash = \"" + h + "\"\n" + body);
+        cs::CliTracker cli; cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(C_DASH);
+        ASSERT_EQ(cs::wire_settings(path, C_DASH, cli, rc), 0);
+        ASSERT_TRUE(rc.file_set("sharechain.network"));
+        const std::string net = rc.get_string("sharechain.network").value_or("");
+        EXPECT_EQ(net, "v36");
+        ASSERT_TRUE(resolve_identity(net, "", "", false));
+        expect_v36_network_identity();
+        EXPECT_EQ(SharechainConfig::data_subdir(false), "dash_ac2785363c0180b8_v36");
+        std::filesystem::remove(p0);
+        std::filesystem::remove(path);
+    }
+    // (3) Acked file with BOTH network and network_id: the merged values conflict.
+    {
+        IdentityGuard g;
+        const std::string both = "[dash]\n[dash.sharechain]\nnetwork = \"v36\"\nnetwork_id = \"abcd\"\n";
+        const auto p0 = write_tmp("both0.toml", both);
+        const std::string h = cs::SettingsFile::compute_money_ack_hash(p0, C_DASH);
+        const auto path = write_tmp("both.toml",
+            "[gate]\nmoney_ack_hash = \"" + h + "\"\n" + both);
+        cs::CliTracker cli; cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(C_DASH);
+        ASSERT_EQ(cs::wire_settings(path, C_DASH, cli, rc), 0);
+        std::string err;
+        EXPECT_FALSE(resolve_identity(rc.get_string("sharechain.network").value_or(""),
+                                      rc.get_string("sharechain.network_id").value_or(""),
+                                      "", false, &err));
+        EXPECT_NE(err.find("cannot be combined"), std::string::npos) << err;
+        EXPECT_FALSE(SharechainConfig::has_custom_network_id());
+        std::filesystem::remove(p0);
+        std::filesystem::remove(path);
+    }
+    // (4) CLI: --net is a catalog alias, so the scan records it as a CLI value
+    //     (and a file value for the same key is skipped: CLI wins).
+    {
+        IdentityGuard g;
+        std::vector<std::string> args = {"c2pool-dash", "--net", "dash-v36"};
+        std::vector<char*> argv;
+        for (auto& a : args) argv.push_back(a.data());
+        cs::CliTracker cli; cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(C_DASH);
+        cs::scan_cli(static_cast<int>(argv.size()), argv.data(),
+                     c2pool::catalog::Bin::BIN_DASH, cli, rc);
+        EXPECT_EQ(rc.get_string("sharechain.network").value_or(""), "dash-v36");
+        EXPECT_FALSE(rc.file_set("sharechain.network"));
+    }
+    // (5) Default: the key is unset, so nothing is dumped and nothing selected.
+    {
+        IdentityGuard g;
+        cs::ResolvedConfig rc;
+        rc.seed_compiled_defaults(C_DASH);
+        EXPECT_FALSE(rc.file_set("sharechain.network"));
+        EXPECT_EQ(rc.get_string("sharechain.network").value_or(""), "");
+        EXPECT_EQ(rc.dump().find("sharechain.network="), std::string::npos);
+    }
 }

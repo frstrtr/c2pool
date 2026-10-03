@@ -323,6 +323,9 @@ struct FinalizeConnectOptions {
         // rule, the claim of a canonical booking. Handed to the node with the
         // booking; the converge refold books it too (gap 2).
         std::optional<::c2pool::v37n::settle::DropsFound> drops;
+        // THE DRAIN RULE (OwedLedgerRules::decay_from_gross): the block's gross
+        // credited set G_b (a canonical booking; empty for a debit-only one).
+        std::set<::v37::bytes32> gross;
     };
     std::function<bool(std::uint64_t, const std::string&, ChainBooking&)> book_from_chain_ex;
 
@@ -464,6 +467,9 @@ public:
         // booking and for a debit-only one).
         //   'a' option-A own win  (credit == payout == {payee: reward})
         //   'c' coinbase-authority CREDITED booking (credit, payout as booked)
+        //   'e' EMPTY booking of a lane-root-refused block under the drain
+        //       rule (operator ruling O-2): credit {}, payout {}, its height
+        //       only (dh counts it); its payout is node-local LIABILITY
         //   'd' DEBIT-ONLY booking of a refused block (credit = {}, payout) --
         //       rework-2 LEGACY: rework-3 never writes one (refuse-side money is
         //       node-local); a v2 sidecar that still carries one is re-driven as
@@ -472,6 +478,7 @@ public:
         Amounts       credit, payout;
         std::optional<::c2pool::v37n::settle::AnchorCut> cut;   // ANCHOR (sidecar v2 trailing "cut=P:spine")
         std::optional<::c2pool::v37n::settle::DropsFound> drops;   // DROPS DUE (sidecar v3 trailing "dd=" / "dc=")
+        std::set<::v37::bytes32> gross;                             // THE DRAIN RULE: G_b (sidecar v3 trailing "dg=")
     };
     // R-C rework-3 (ruled (b)): the NODE-LOCAL LIABILITY record of one refused
     // lane block. `payout` = the per-payee part decoded from the on-chain bytes
@@ -582,6 +589,8 @@ public:
         // R-C: `refused_not_credited` = SYNCED-but-unmatched lane blocks refused-
         // not-credited (loud alarm, gate released, NEVER a halt by itself).
         std::uint64_t refused_not_credited = 0;
+        // O-2 (drain rule): refused lane blocks FOUND as an empty booking.
+        std::uint64_t refused_found_empty = 0;
         // R-C rework-3 (ruled (b)): the NODE-LOCAL LIABILITY of refused lane
         // blocks. `liability_blocks` refused blocks recorded; `_attributed_pico`
         // the per-payee part (on-chain bytes only), `_unattributed_pico` the rest
@@ -753,8 +762,9 @@ private:
             Amounts credit, payout;
             if (rec.kind == 'a') { credit = amounts_from(rec.payee, rec.reward, nullptr); payout = credit; }
             else                 { credit = rec.credit; payout = rec.payout; }
-            const bool ok = m_node.on_network_block_won(rec.height, id, credit, payout, rec.cut,
-                                                        rec.drops ? &*rec.drops : nullptr);
+            const bool ok = rec.kind == 'e' ? m_node.on_lane_block_refused(rec.height, id)   // O-2: the empty FOUND
+                                            : m_node.on_network_block_won(rec.height, id, credit, payout, rec.cut,
+                                                                          rec.drops ? &*rec.drops : nullptr, &rec.gross);
             if (!ok || !m_node.ledger().is_pending(bid)) {
                 ++rep.stale_dropped;
                 say("boot: sidecar " + short_bid(bid) + " not admitted by the node/ledger; dropped");
@@ -767,7 +777,7 @@ private:
                 say("boot: LEGACY rework-2 debit-only record " + short_bid(bid) + " re-driven as booked (the ledger already "
                     "holds it from the replay); rework-3 never writes one -- refuse-side money is node-local liability");
             }
-            if (rec.kind != 'd') m_race.observe_own(rec.height, bid, rec.found_unix_s);   // a debit is not an own/credited block
+            if (rec.kind != 'd' && rec.kind != 'e') m_race.observe_own(rec.height, bid, rec.found_unix_s);   // a debit / an empty FOUND is not an own/credited block
             if (pending) ++rep.reseeded; else ++rep.reregistered;
             say(std::string("boot: ") + (pending ? "re-drove pending FOUND " : "RE-REGISTERED lost FOUND ") +
                 short_bid(bid) + " h=" + std::to_string(rec.height) + " kind=" + std::string(1, rec.kind) +
@@ -995,7 +1005,7 @@ public:
             // credited (loud alarm, the R4 gate RELEASED for this height), its
             // on-chain payout recorded as NODE-LOCAL LIABILITY (rework-3 (b)), and
             // one OBSERVATION for the lineage vote -- never by itself a halt.
-            if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, bk); return; }
+            if (why.rfind("lane-root-refused:", 0) == 0) { note_refused_frontier(h, bid, bk); found_refused_empty(h, bid); return; }
             const bool root_unknown = (why.rfind("lane-root-unknown:", 0) == 0);   // R5
             // D6a: "native-hold:" = the native chain index does not hold the block body
             // (p2p-first booking reads it there, not from monerod) -- a transient fetch
@@ -1080,9 +1090,10 @@ public:
         }
         c2pool::xmr::node::Hash id{}; (void)hash_from_hex(bid, id);
         PendingRec rec; rec.height = h; rec.kind = 'c'; rec.credit = bk.credit; rec.payout = bk.payout; rec.cut = bk.cut; rec.drops = bk.drops;
+        rec.gross = bk.gross;   // THE DRAIN RULE
         rec.reward = 0; for (const auto& [k, v] : bk.payout) { (void)k; rec.reward += static_cast<std::uint64_t>(v); }
         m_pending[bid] = rec; (void)sidecar_flush();
-        if (!m_node.on_network_block_won(h, id, bk.credit, bk.payout, bk.cut, bk.drops ? &*bk.drops : nullptr) ||
+        if (!m_node.on_network_block_won(h, id, bk.credit, bk.payout, bk.cut, bk.drops ? &*bk.drops : nullptr, &bk.gross) ||
             !m_node.ledger().is_pending(bid)) {
             m_pending.erase(bid); (void)sidecar_flush();
             say("cba: node/ledger did not admit chain lane block " + short_bid(bid)); return;
@@ -1552,6 +1563,27 @@ private:
         return reached;
     }
 
+    // ── THE DRAIN RULE, operator ruling O-2: the refused lane block is FOUND as
+    // an EMPTY booking carrying its Monero height (credit {}, payout {}), so the
+    // next lane block's dh counts it on every node alike. Its payout stays the
+    // node-local LIABILITY recorded above. A no-op with the rule off (master).
+    void found_refused_empty(std::uint64_t h, const std::string& bid) {
+        if (!m_node.ledger().rules().lane_height) return;
+        if (m_pending.count(bid) || m_node.ledger().is_pending(bid) || m_node.ledger().is_settled(bid)) return;
+        c2pool::xmr::node::Hash id{};
+        if (!hash_from_hex(bid, id)) return;
+        PendingRec rec; rec.height = h; rec.kind = 'e'; rec.found_unix_s = now_unix();
+        m_pending[bid] = rec; (void)sidecar_flush();
+        if (!m_node.on_lane_block_refused(h, id) || !m_node.ledger().is_pending(bid)) {
+            m_pending.erase(bid); (void)sidecar_flush();
+            say("cba: node/ledger did not admit the empty FOUND of refused lane block " + short_bid(bid));
+            return;
+        }
+        ++m_stats.refused_found_empty;
+        say("cba: refused lane block " + short_bid(bid) + " h=" + std::to_string(h) + " FOUND as an EMPTY booking (drain rule "
+            "O-2: its height counts for dh; no money in the ledger) -> finalizes when hw >= " + std::to_string(h + m_cfg.d_conf));
+    }
+
     // ── R-C (rework-2): a SYNCED receiver's unmatched-root lane block ────────
     // main tagged it "lane-root-refused:<roothex>:". REFUSE-not-credit it -- do
     // NOT book its credit, do NOT hold the finalize gate for it (the cursor is
@@ -1973,6 +2005,7 @@ private:
         r.unattributed_pico = bk.unattributed_pico; r.total_pico = bk.total_pico; r.root_hex = lower_hex(bk.onchain_root_hex);
         r.cut = bk.cut;   // ANCHOR
         r.drops = bk.drops;   // DROPS (gap 2): the refold books the delta the live booking hands the node
+        r.gross = bk.gross;   // THE DRAIN RULE: G_b
         if (ok) r.outcome = minority::DecodeOutcome::Booked;
         else if (bk.why.rfind("not-lane:", 0) == 0) r.outcome = minority::DecodeOutcome::NotLane;
         else if (bk.why.rfind("cut-pending:", 0) == 0 || bk.why.rfind("get_block", 0) == 0 ||
@@ -2121,7 +2154,8 @@ private:
         const std::string utc = utc_stamp();
         std::map<std::string, PendingRec> newp;
         for (const auto& p : res.pending) {
-            PendingRec r; r.height = p.h; r.kind = 'c'; r.credit = p.credit; r.payout = p.payout; r.cut = p.cut; r.drops = p.drops; r.found_unix_s = now_unix();
+            PendingRec r; r.height = p.h; r.kind = p.empty ? 'e' : 'c'; r.credit = p.credit; r.payout = p.payout; r.cut = p.cut; r.drops = p.drops; r.found_unix_s = now_unix();
+            r.gross = p.gross;   // THE DRAIN RULE
             for (const auto& [k, v] : p.payout) { (void)k; if (v > 0) r.reward += static_cast<std::uint64_t>(v); }
             newp[p.bid] = r;
         }
@@ -2368,7 +2402,7 @@ private:
                 ++t.settled; ++m_stats.settled;
                 // R-C rework-2: a DEBIT-ONLY record is not a credit -- the race
                 // gate's credit authorisation (R-7) does not apply to it.
-                if (rec.kind != 'd') race_confirm_credit(bid, rec.height);
+                if (rec.kind != 'd' && rec.kind != 'e') race_confirm_credit(bid, rec.height);   // O-2: an empty FOUND credits nothing
                 say("FINALIZED " + short_bid(bid) + " h=" + std::to_string(rec.height) +
                     " SETTLED at bin_height=" + std::to_string(rec.height + m_cfg.d_conf) +
                     (rec.payee ? " effective_owed(payee)=" +
@@ -2536,7 +2570,7 @@ private:
     //    (bids/keys are hex; '-' = absent):
     //    v1 (read only):  1 <bid64> <height> <payee64|-> <reward> <prev64|-> <found_unix_s>
     //    v2 (R-C rework-2, written): the v1 fields, then
-    //                     <kind a|c|d> <credit-map|-> <payout-map|->
+    //                     <kind a|c|d|e> <credit-map|-> <payout-map|->
     //    map = key64=amount[,key64=amount...] (signed decimal amounts)
     static std::string map_str(const Amounts& m) {
         if (m.empty()) return "-";
@@ -2606,6 +2640,12 @@ private:
             if (r.drops->claim) s += " dc=" + map_str(r.drops->claimed);
             if (!r.drops->enrol_add.empty()) s += " de=" + enrol_str(r.drops->enrol_add);   // RAINDROP ENROL
             if (!r.drops->window.empty()) s += " dw=" + window_str(r.drops->window);         // DROPS WINDOW (A4b)
+        }
+        if (!r.gross.empty()) {   // THE DRAIN RULE (v3 "dg="): the gross credited set
+            s[0] = '3';
+            s += " dg=";
+            bool first = true;
+            for (const auto& k : r.gross) { if (!first) s += ","; first = false; s += hex_of(k); }
         }
         s += "\n";
         return s;
@@ -2683,11 +2723,23 @@ private:
         if (ver == "2" || ver == "3") {
             std::string kind, cm, pm;
             if (!(is >> kind >> cm >> pm)) return false;
-            if (kind.size() != 1 || (kind[0] != 'a' && kind[0] != 'c' && kind[0] != 'd')) return false;
+            if (kind.size() != 1 || (kind[0] != 'a' && kind[0] != 'c' && kind[0] != 'd' && kind[0] != 'e')) return false;
             r.kind = kind[0];
             if (!map_parse(cm, r.credit) || !map_parse(pm, r.payout)) return false;
             std::string ct;   // ANCHOR: optional trailing "cut=P:spine"; v3: then "dd=map" [" dc=map"]
             while (is >> ct) {
+                if (ver == "3" && ct.rfind("dg=", 0) == 0) {   // THE DRAIN RULE: G_b
+                    const std::string g = ct.substr(3);
+                    std::size_t p = 0;
+                    while (p < g.size()) {
+                        std::size_t c = g.find(',', p); if (c == std::string::npos) c = g.size();
+                        ::v37::bytes32 k{};
+                        if (c - p != 64 || !hash_from_hex(lower_hex(g.substr(p, 64)), k)) return false;
+                        r.gross.insert(k);
+                        p = c + 1;
+                    }
+                    continue;
+                }
                 if (ver == "3" && ct.rfind("dw=", 0) == 0) {   // DROPS WINDOW (A4b)
                     if (!r.drops) r.drops = ::c2pool::v37n::settle::DropsFound{};
                     if (!window_parse(ct.substr(3), r.drops->window)) return false;

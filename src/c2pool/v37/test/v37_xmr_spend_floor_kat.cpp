@@ -15,8 +15,8 @@
 //   F2  with room in the block every payee, dust included, is paid its exact
 //       E_b; F2b without room its cash is REDISTRIBUTED to the paid payees and
 //       taken off its credit (credit delta, sum 0): never an advance.
-//   F3  too few output slots: the largest payees get the slots, the rest
-//       wait; no CapTooSmall; the advance cap sends the excess to the residual.
+//   F3  too few output slots: oldest first (equal ages by the salted tie),
+//       the rest wait; no CapTooSmall; their cash is redistributed (F2b).
 //   F4  the owed pass pays no balance below c.
 //   F5  the receive side books every key NET of min(credit, paid): a crumb
 //       keeps its credit, an advance stays a pending payout, and the balance
@@ -27,6 +27,13 @@
 //   F8  rotation (review 04 / audit O-1): a key paid in part walks after the
 //       others at once (pending) and for good after FINALIZE.
 //   F9  rules off: the ledger is byte-identical to the shipped one.
+//   F4b THE DRAIN RULE (R5, the F4 band): a balance in [arm floor, c(R)) is
+//       proposed, routed to the dust list and paid when there is room, out of
+//       Delta - owed_paid; again at a reward 8x the tail (c x 8).
+//   F10b THE DRAIN RULE (R5, the decay clock): under pay-now first every
+//       window row nets to 0, so the clock runs on the gross set G_b: a gone
+//       key starts at the first FINALIZE whose G_b omits it, an active dust
+//       miner in every G_b never decays, an empty-cut block passes nobody by.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -34,6 +41,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -43,6 +51,7 @@
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
 #include "c2pool/v37/w4_settlement.hpp"
 #include "c2pool/v37/xmr/xmr_settle_store.hpp"
+#include "c2pool/v37/xmr/xmr_o2_settlement_source.hpp"   // THE DRAIN RULE: the real source (D0-D2)
 
 namespace x6  = ::v37::xmr::settle;
 namespace fee = c2pool::v37n::xmr::fee;
@@ -554,6 +563,95 @@ void f12_dust_debt_when_room() {
     }
 }
 
+// ---------------------------------------------------------------------------
+void f4b_band_drained() {
+    std::printf("== F4b. THE DRAIN RULE: a balance in [arm floor, c(R)) is paid by the dust pass ==\n");
+    namespace o2 = c2pool::v37n::xmr::o2;
+    for (const std::uint64_t mult : {2ull, 8ull}) {
+        const std::uint64_t R = kTail * mult;                 // fees raise c(R) above the arm floor (x8: the FCMP++-sized band)
+        const std::uint64_t arm = x6::spend_floor(x6::kTailSubsidy);
+        const std::uint64_t c = x6::spend_floor(R);
+        const std::uint64_t w = (arm + c) / 2;              // inside the band: armed, proposed, below c(R)
+        st::OwedLedgerRules r; r.arm_floor = static_cast<long long>(arm); r.rotate_on_payment = true;
+        r.decay_horizon = 8640; r.decay_half_life = 2160; r.lane_height = true; r.decay_from_gross = true;
+        st::OwedLedger L(7, r);
+        const auto g = ref_of(41), p1 = ref_of(42), p2 = ref_of(43);
+        L.on_block_found("seed", Amounts{{id_of(g), static_cast<long long>(w)}}, {});
+        L.on_block_finalized("seed", 1);
+        std::map<::v37::bytes32, ::v37::ScriptRef> refs{{id_of(g), g}, {id_of(p1), p1}, {id_of(p2), p2},
+                                                        {fee::donation_identity(kNet), fee::donation_ref(kNet)}};
+        const o2::PayOfFn pay_of = [refs](const ::v37::bytes32& k) {
+            auto it = refs.find(k); if (it != refs.end()) return it->second;
+            ::v37::ScriptRef raw; raw.kind = ::v37::ScriptKind::RAW; return raw;
+        };
+        auto build = [&](o2::DrainRule drain, std::string* why) {
+            o2::XmrCoinbaseContext ctx;
+            ctx.monero_major_version = 16; ctx.height = 5000; ctx.prev_id.data()[0] = 9;
+            ctx.base_reward = R; ctx.chain_id = 7; ctx.lane_commitment = L.owed_digest();
+            ctx.residual_sink = fee::donation_ref(kNet); ctx.residual_sink_identity = fee::donation_identity(kNet);
+            ctx.fixed = {fee::donation_marker(kNet)}; ctx.output_cap = 16;
+            ctx.kfair_salted_ties = true; ctx.spend_floor = true;
+            ctx.has_credit_cut = true; ctx.credit_cut.next_pos = 10; ctx.has_paynow = true;
+            for (const auto& p : {p1, p2}) { st::WeightedPayee wp; wp.key = id_of(p); wp.weight = ::v37::U256(std::uint64_t{1}); wp.pay = p; ctx.paynow_payees.push_back(wp); }
+            ctx.drain = drain;
+            return o2::XmrOwedSettlementSource::build(L, pay_of, ctx, R, why);
+        };
+        std::string why;
+        const auto src = build(o2::DrainRule{1, 16, 64}, &why);
+        CHECK(src != nullptr, "x%llu: builds: %s", (unsigned long long)mult, why.c_str());
+        if (!src) continue;
+        bool in_owed = false, in_dust = false;
+        for (const auto& e : src->inputs().owed) if (e.identity == id_of(g)) in_owed = true;
+        for (const auto& e : src->inputs().owed_dust) if (e.identity == id_of(g)) in_dust = true;
+        x6::AllocStats stt;
+        const auto outs = x6::allocate_exact_sum(src->inputs_at(R, {}), nullptr, nullptr, &stt);
+        CHECK(!in_owed && in_dust && to(outs, id_of(g)) == w && stt.dust_paid == w && w <= src->drain_delta(),
+              "x%llu: c(R)=%llu, a balance %llu in [%llu, c(R)) is routed to the dust list and paid in full by the dust pass "
+              "(min(owed, Delta - owed_paid), Delta %llu)", (unsigned long long)mult, (unsigned long long)c, (unsigned long long)w,
+              (unsigned long long)arm, (unsigned long long)src->drain_delta());
+        const auto off = build(o2::DrainRule{}, &why);   // master: proposed, skipped by X6, absent from the dust list
+        CHECK(off && to(x6::allocate_exact_sum(off->inputs_at(R, {})), id_of(g)) == 0,
+              "x%llu: rule off (master): the band balance is proposed, skipped by X6 and never paid (RESULTS 13)", (unsigned long long)mult);
+    }
+}
+
+// ---------------------------------------------------------------------------
+void f10b_gross_clock() {
+    std::printf("== F10b. THE DRAIN RULE: the dust-decay clock runs on the gross set G_b ==\n");
+    st::OwedLedgerRules r; r.arm_floor = 1000; r.rotate_on_payment = true; r.decay_horizon = 100; r.decay_half_life = 50;
+    r.lane_height = true; r.decay_from_gross = true;
+    const ::v37::bytes32 A = key(0x11), D = key(0x21), S = key(0x31), Q = key(0x41);
+    st::OwedLedger L(7, r);
+    int nb = 0;
+    std::uint64_t h = 100;
+    // a pay-now-first lane block: every window row nets to 0 credit; G_b is the window
+    auto block = [&](std::set<::v37::bytes32> gross, std::uint64_t bin) {
+        const std::string bid = "g" + std::to_string(++nb);
+        st::LaneFound lf; lf.height = h++; lf.gross = std::move(gross);
+        L.on_block_found(bid, {}, {}, std::nullopt, nullptr, &lf); L.on_block_finalized(bid, bin);
+    };
+    L.on_block_found("seed", Amounts{{D, 800}, {S, 3}, {Q, 600}}, {}); L.on_block_finalized("seed", 1);
+    block({}, 400);                                  // an empty cut: G_b = {} passes nobody by
+    block({}, 499);
+    CHECK(L.effective_owed(D) == 800 && L.effective_owed(Q) == 600, "empty-cut blocks (G_b = {}) pass nobody by: D 800, Q 600 at bin 499");
+    block({A, S}, 520);                              // netted to 0, but G_b = {A, S}: D and Q are passed by
+    block({A, S}, 630);
+    CHECK(L.effective_owed(D) == 400 && L.effective_owed(Q) == 300, "the first FINALIZE whose G_b omits them starts the clock: halved at bin 630");
+    block({A, S, Q}, 640);                           // Q's window work is back
+    block({A, S, Q}, 700);
+    CHECK(L.effective_owed(D) == 200 && L.effective_owed(Q) == 300, "a key in G_b stops its decay (Q 300); D keeps halving (200 at 700)");
+    CHECK(L.effective_owed(S) == 3, "the active dust miner S, in every G_b, never decays (3)");
+    // the gap this closes: the same blocks with the netted credit as the clock
+    st::OwedLedgerRules r0 = r; r0.decay_from_gross = false;
+    st::OwedLedger L0(7, r0);
+    L0.on_block_found("seed", Amounts{{D, 800}}, {}); L0.on_block_finalized("seed", 1);
+    for (std::uint64_t bin : {520ull, 630ull, 700ull}) {
+        const std::string bid = "n" + std::to_string(bin);
+        L0.on_block_found(bid, {}, {}); L0.on_block_finalized(bid, bin);
+    }
+    CHECK(L0.effective_owed(D) == 800, "without the gross set a netted-to-0 block passes nobody by: D never decays (800)");
+}
+
 int main() {
     std::printf("v37_xmr_spend_floor_kat\n");
     f1_floor();
@@ -564,12 +662,14 @@ int main() {
     f3_slots();
     f3b_worth_spending_first();
     f4_owed_floor();
+    f4b_band_drained();
     f5_receive();
     f6_off();
     f7_seniority();
     f8_rotation();
     f9_off();
     f10_decay();
+    f10b_gross_clock();
     f11_anchor();
     f12_dust_debt_when_room();
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");

@@ -175,6 +175,32 @@ inline const char* to_string(KFairSource s) {
 }
 
 // ---------------------------------------------------------------------------
+// THE DRAIN RULE's lane rules (lane-rules fields 25 / 23 / 24; operator rulings
+// R1/R2 2026-10-02, docs/xmr-lane/settlement-drain.md). version 0 = master.
+// Version 1: old balances are paid only out of Delta = min(F, R * min(dh,
+// H_cap) / (Q * 16)) per lane block (x6::drain_delta), a proposed take below
+// c(R) goes to the dust pass (the F4 band), and the window's E_b is split at
+// P = R - debt_paid (x6 CoinbaseInputs::paynow_first). Needs the spend floor.
+// ---------------------------------------------------------------------------
+struct DrainRule {
+    std::uint32_t version = 0;   // drain_rule_version
+    std::uint32_t q = 0;         // drain_q
+    std::uint32_t h_cap = 0;     // drain_h_cap
+    bool on() const { return version >= 1 && q >= 1 && h_cap >= 1; }
+    bool operator==(const DrainRule&) const = default;
+};
+// The settlement config's rule from the node config's lane-rules triple (main
+// builds the XmrSettlementConfig with it; v37_xmr_drain_wiring_kat W1).
+template <class NodeCfg>
+inline DrainRule drain_rule_of(const NodeCfg& c) {
+    DrainRule r;
+    r.version = c.drain_rule_version;
+    r.q = c.drain_q;
+    r.h_cap = c.drain_h_cap;
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // The consensus-derived context for ONE template (mirrors mbp_wiring.hpp:78-91
 // CoinbaseContext field-for-field, minus the per-WORKER extra_nonce, which the
 // template patches itself). Every field is a pure function of the mainchain
@@ -229,6 +255,8 @@ struct XmrCoinbaseContext {
     // the block pays this payee -- the template's finder -- the pay-now pool
     // and commits it as the 0x02 field V37F. Unset => master's residual shape.
     std::optional<::v37::ScriptRef> ecut_finder;
+    // THE DRAIN RULE (DrainRule above). Off by default: master's coinbase bytes.
+    DrainRule             drain{};
 
     std::uint64_t budget() const { return base_reward + fees; }
 };
@@ -351,12 +379,32 @@ public:
             std::min<std::size_t>(ctx.output_cap - ctx.fixed.size() - sink_slots,
                                   std::numeric_limits<unsigned>::max()));
 
+        // ---- THE DRAIN RULE D0: the block's debt slice. F over the WHOLE ledger
+        // (amendment A1: never filtered by payee-ref resolvability), dh from the
+        // ledger's last lane block (a chain fact every node holds at the booking
+        // point), Delta = min(F, R * min(dh, H_cap) / (Q * 16)) at the reward
+        // the owed set is chosen at. The receiver's recompute derives the same
+        // three numbers from its own ledger (no claim field).
+        const bool drain = ctx.drain.on() && ctx.spend_floor && source == KFairSource::W4Propose;
+        if (drain) {
+            unsigned __int128 f = 0;
+            for (const auto& [k, eo] : ledger.effective_owed_all()) { (void)k; if (eo > 0) f += static_cast<unsigned __int128>(eo); }
+            s->m_drain_F = f > ~std::uint64_t{0} ? ~std::uint64_t{0} : static_cast<std::uint64_t>(f);
+            s->m_drain_dh = ledger.heights_since_last_lane(ctx.height);
+            s->m_drain_delta = x6::drain_delta(s->m_drain_F, reward_hint, s->m_drain_dh, ctx.drain.q, ctx.drain.h_cap);
+            s->m_drain_on = true;
+            in.paynow_first = true;
+            in.drain_budget = s->m_drain_delta;
+        }
+
         if (source == KFairSource::W4Propose) {
             // W4 canon picks the set over budget - Σfixed with C = cap - fixed - sink.
             // fee model S2: a folded donation output's minimum is NOT reserved
             // here -- X6 sources it from the residual, else from the LARGEST
             // owed output (allocate_exact_sum), so W4 proposes over it too.
-            const std::uint64_t owed_budget_w4 = owed_budget ? *owed_budget :
+            // THE DRAIN RULE: the owed pass runs at Delta (a committed V37N base
+            // never overrides it: the takes are a function of the ledger and R).
+            const std::uint64_t owed_budget_w4 = drain ? s->m_drain_delta : owed_budget ? *owed_budget :
                 reward_hint - fixed_sum + (sink_folds ? ctx.fixed.back().amount : 0);
             auto h_min_of = [&](::v37::ScriptKind k) -> std::uint64_t {
                 return ::v37::xmr::is_xmr_kind(k) ? ctx.h_min
@@ -372,7 +420,17 @@ public:
                 prop = ledger.propose_coinbase(owed_budget_w4, cap_owed, payable_ref, h_min_of);
             }
             in.owed.reserve(prop.outs.size());
+            // THE DRAIN RULE D2 (R5, the F4 band): a proposed take below c(R) --
+            // a balance in [arm floor, c(R)) or the budget-stopped last partial --
+            // is not handed to the owed pass (which would skip it for ever); its
+            // key falls through to the dust list below, which under the rule
+            // holds only BALANCES below c(R) (F4-partial): a budget-stopped take
+            // below c(R) of a balance >= c(R) is not paid at all. The order
+            // index keeps the proposal's.
+            const std::uint64_t drain_c = drain ? x6::spend_floor(reward_hint) : 0;
+            std::set<::v37::bytes32> routed;
             for (std::size_t i = 0; i < prop.outs.size(); ++i) {
+                if (drain && prop.outs[i].amount < drain_c) { routed.insert(prop.outs[i].key); continue; }
                 x6::OwedEntry e;
                 e.pay            = prop.outs[i].pay;
                 e.owed           = prop.outs[i].amount;   // exactly the proposed take
@@ -389,12 +447,20 @@ public:
             // is never paid beyond what is owed.
             if (ctx.spend_floor) {
                 std::set<::v37::bytes32> taken;
-                for (const auto& o : prop.outs) taken.insert(o.key);
+                for (const auto& o : prop.outs) if (!routed.count(o.key)) taken.insert(o.key);
                 std::uint8_t pre[4 + 32 + 32] = {'V', '3', '7', 'T'};
                 std::memcpy(pre + 4, ctx.prev_id.data(), 32);
                 std::vector<std::pair<::v37::bytes32, x6::OwedEntry>> dust;
                 for (const auto& [k, owed] : ledger.effective_owed_all()) {
                     if (owed <= 0 || taken.count(k)) continue;
+                    // F4-partial (operator ruling 2026-10-02): under the drain
+                    // rule the dust pass pays only balances below c(R). A balance
+                    // >= c(R) is paid by the owed pass alone, never in part as a
+                    // sub-c output: a budget-stopped take below c(R) carries one
+                    // block, its age untouched, and the unspent part of Delta
+                    // stays in P = R - debt_paid (the window's cash, credited;
+                    // never the donation's).
+                    if (drain && static_cast<std::uint64_t>(owed) >= drain_c) continue;
                     ::v37::ScriptRef r = payable_ref(k);
                     if (!::v37::xmr::is_xmr_kind(r.kind)) continue;   // unpayable => carry
                     x6::OwedEntry e;
@@ -605,6 +671,7 @@ public:
         s->m_ledger_seq = m_ledger_seq;  s->m_owed_digest = m_owed_digest;  s->m_unpayable = m_unpayable;
         s->m_inputs = m_inputs;  s->m_inputs.paynow_at = nullptr;  s->m_inputs.paynow_n = 0;
         s->m_ecut_eligible = true;  s->m_ecut_base = m_ecut_base;
+        s->m_drain_on = m_drain_on;  s->m_drain_F = m_drain_F;  s->m_drain_dh = m_drain_dh;  s->m_drain_delta = m_drain_delta;
         s->arm_finder(fr);
         s->m_built = x6::build_coinbase(s->inputs_at(m_reward_hint, {}));
         if (!s->m_built.ok) return no("X6 refused the finder variant");
@@ -727,6 +794,11 @@ public:
     std::uint64_t             paynow_base() const { return m_paynow_base; }
     // EMPTY-CUT FINDER: the committed finder payee (armed only in an empty cut).
     const std::optional<::v37::ScriptRef>& ecut_finder() const { return m_ecut_finder; }
+    // THE DRAIN RULE (D0): in force for this snapshot, and F, dh, Delta as derived.
+    bool                      drain_on()    const { return m_drain_on; }
+    std::uint64_t             drain_F()     const { return m_drain_F; }
+    std::uint64_t             drain_dh()    const { return m_drain_dh; }
+    std::uint64_t             drain_delta() const { return m_drain_delta; }
 
     // The full X6 result at reward_hint (empty extra_nonce => no 0x02 tag; use
     // build_at() for the template-equal tx_extra).
@@ -858,6 +930,10 @@ private:
     std::optional<::v37::ScriptRef> m_ecut_finder;   // EMPTY-CUT FINDER (V37F)
     bool                 m_ecut_eligible = false;   // the cut is empty (with_finder may arm)
     std::uint64_t        m_ecut_base = 0;           // its pay-now base B
+    bool                 m_drain_on = false;        // THE DRAIN RULE (D0)
+    std::uint64_t        m_drain_F = 0;             // SUM max(0, EffectiveOwed), whole ledger
+    std::uint64_t        m_drain_dh = 0;            // heights since the last lane block (0: none => H_cap)
+    std::uint64_t        m_drain_delta = 0;         // the owed pass's budget
 
     x6::CoinbaseInputs   m_inputs;     // fixed part; reward + extra_nonce applied per query
     x6::BuiltCoinbase    m_built;      // X6 at reward_hint: r, R, keys, view tags, mm_root, order

@@ -82,6 +82,7 @@
 #include "impl/xmr/coin/xmr_crypto_types.hpp"   // Bytes32, PublicKey, SecretKey, ...
 #include "impl/xmr/coin/xmr_derivation.hpp"     // generate_key_derivation, derive_*
 #include "impl/xmr/coin/xmr_blob.hpp"           // BlobWriter, tx hashes, tree_root
+#include "impl/xmr/settle/xmr_drain_rule.hpp"   // THE DRAIN RULE: drain_delta, kDrainRefCadence
 
 // --- PayoutDescriptor canon + the XMR kind extension (descriptor-kinds leg) --
 #include "sharechain/v37/v37_descriptor_xmr.hpp" // v37::xmr::XMR_STD/XMR_SUB, fences
@@ -205,6 +206,9 @@ static_assert(kInputWeight == 659, "one RingCT/CLSAG input at ring 16");
 // the XMR ledger's arm floor (OwedLedgerRules::arm_floor).
 inline constexpr std::uint64_t kTailSubsidy = 300000000000ull * 2;
 
+// THE DRAIN RULE: kDrainRefCadence, drain_delta, drain_rule_refusal live in
+// xmr_drain_rule.hpp (dependency-free: the node config checks the triple).
+
 // Monero's minimum fee per byte for `reward` at the fee-median floor.
 std::uint64_t fee_per_byte_at_floor(std::uint64_t reward);
 // c: the cost to spend one output of a block whose coinbase total is `total`.
@@ -265,6 +269,18 @@ struct CoinbaseInputs {
     // residual: an owed balance never waits while the block has a slot for it.
     std::vector<OwedEntry> owed_dust;
 
+    // --- THE DRAIN RULE (spend floor + pay-now only; false => master) ---
+    // paynow_first: the owed pass ran at drain_budget (= Delta, chosen by the
+    // source), so here: (D4) in a contested block the owed pass keeps
+    // K_o = max(1, cap_owed * owed_paid_1 / R) slots, owed_paid_1 the FIRST
+    // pass's cash; (D5) the dust pass draws on drain_budget - owed_paid only;
+    // (D6) admission is decided on paynow_at(R) as before, the AMOUNTS are
+    // paynow_at(P) with P the pay-now pool left after the debt (paid in full
+    // when everyone fits), DEBT FIRST is gone and the redistribution falls
+    // back to the owed payees when the admitted payees' E_b(P) sums to 0.
+    bool           paynow_first = false;
+    std::uint64_t  drain_budget = 0;
+
     // --- tx_extra ---
     std::vector<unsigned char> extra_nonce; // 0x02 padded per-worker extranonce
 
@@ -300,6 +316,20 @@ enum class BuildError : std::uint8_t {
     BadSinkDescriptor,  // residual_sink is not a valid XMR ref
     BadPayeeDescriptor, // an owed/fixed pay is not a valid XMR ref
     DerivationFailed,   // r*G or an ECDH derivation failed (bad point)
+    PayNowSplit,        // drain rule: a payee has E_b(P) > 0 but E_b(R) == 0 (fail-closed; amendment B6)
+};
+
+// What one allocation did (allocate_exact_sum's optional out-parameter): the
+// numbers the drain rule's booking and its alarm / status lines read.
+struct AllocStats {
+    std::uint64_t owed_paid_1 = 0;   // cash of the FIRST owed pass (Role::Owed outputs, merge included)
+    std::uint64_t owed_paid   = 0;   // cash of the owed pass that stands (after a K_o re-run)
+    std::uint64_t dust_paid   = 0;   // the dust pass (A8)
+    std::uint64_t debt_paid   = 0;   // owed_paid + dust_paid: every old balance this block pays
+    std::uint64_t split_at    = 0;   // P: the budget the window's E_b is split at (== budget without the drain)
+    std::uint64_t k_o         = 0;   // the owed pass's slot cap in a contested block (0: not contested)
+    bool          contested   = false;
+    std::uint64_t w_d         = 0;   // pay-now payees with E_b > 0 that need a slot of their own
 };
 
 const char* to_string(BuildError e);
@@ -384,6 +414,10 @@ std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
 // it is credited.
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildError* err,
                                                std::map<::v37::bytes32, long long>* credit_delta);
+// ... and what it did (AllocStats), for the drain rule's booking.
+std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildError* err,
+                                               std::map<::v37::bytes32, long long>* credit_delta,
+                                               AllocStats* stats);
 
 // S1: true iff the last fixed output IS the residual sink -- it pays
 // `residual_sink` (ScriptRef equality) under `residual_sink_identity` -- i.e.

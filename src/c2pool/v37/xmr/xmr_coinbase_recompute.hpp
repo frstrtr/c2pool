@@ -118,6 +118,7 @@ struct LaneInputs {
     bool             kfair_salted_ties = false;  // #1867: equal-age cohorts by a hash of the parent id
     bool             spend_floor = false;        // payout-threshold.md §2-§3: c from the block's own total
     bool             commit_total = false;       // REWARD TOTAL: "V37R" == the coinbase total (share check)
+    o2::DrainRule    drain{};                    // THE DRAIN RULE (lane-rules 23-25): Delta, F4 routing, pay-now at P
 };
 
 // What the block's booking already established.
@@ -149,6 +150,15 @@ struct Result {
     // SPEND-COST FLOOR (canonical only): the redistribution the booking applies
     // to the block's E_b before its pay-now net booking (x6::allocate_exact_sum).
     std::map<::v37::bytes32, long long> credit_delta;
+    // THE DRAIN RULE (canonical only, rule on): where the booking splits the
+    // window's E_b (P = the pay-now pool after the debt; == the total when no
+    // debt is paid or the rule is off), what the block paid of old debt, and
+    // the slice it was allowed (Delta of F, dh) -- for the booking's refold at
+    // P and the alarm / status lines.
+    std::uint64_t split_at = 0;
+    std::uint64_t debt_paid = 0;
+    std::uint64_t delta = 0, F = 0, dh = 0;
+    bool          drain_on = false;
     bool canonical() const { return verdict == Verdict::Canonical; }
 };
 
@@ -204,6 +214,7 @@ canonical_source(const CoinbaseClaim& cl, const OwedLedger& ledger, const o2::Pa
     ctx.output_cap           = lane.owed_cap;
     ctx.kfair_salted_ties    = lane.kfair_salted_ties;   // the salt is the claim's own prev_id
     ctx.spend_floor          = lane.spend_floor;         // c is a function of the total alone
+    ctx.drain                = lane.drain;               // THE DRAIN RULE: Delta from (ledger, total, height)
     ctx.has_credit_cut       = cl.has_credit_cut;
     ctx.credit_cut           = cl.credit_cut;
     if (lane.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *lane.pool_tag; }
@@ -226,7 +237,28 @@ canonical_source(const CoinbaseClaim& cl, const OwedLedger& ledger, const o2::Pa
     auto at_total = o2::XmrOwedSettlementSource::build(ledger, pay_of, ctx, cl.total, &why, lane.kfair);
     if (!at_total) { mismatch = "the canonical coinbase cannot be built at this total: " + why; return nullptr; }
     std::unique_ptr<o2::XmrOwedSettlementSource> src;
-    if (cl.paynow_base) {
+    if (at_total->drain_on()) {
+        // THE DRAIN RULE: the owed takes are a function of (ledger, total, dh),
+        // the K_fair pass at Delta. The committed V37N base must state exactly
+        // those takes: more is an over-take (old debt beyond Delta), less an
+        // under-take (owed money shifted to pay-now). Both are a Mismatch; there
+        // is no rebuild at a committed base.
+        if (cl.paynow_base) {
+            const std::uint64_t B = *cl.paynow_base;
+            if (B < fixed_sum) { mismatch = "V37N base " + std::to_string(B) + " < the fixed outputs " + std::to_string(fixed_sum); return nullptr; }
+            std::uint64_t took_canon = 0;
+            for (const auto& e : at_total->inputs().owed) took_canon += e.owed;
+            const std::uint64_t took = B - fixed_sum;
+            if (took != took_canon) {
+                mismatch = std::string(took < took_canon ? "under-take" : "over-take") + ": the V37N base commits owed takes " +
+                           std::to_string(took) + " != " + std::to_string(took_canon) + " the K_fair pass pays at Delta " +
+                           std::to_string(at_total->drain_delta()) + " (F " + std::to_string(at_total->drain_F()) + ", dh " +
+                           std::to_string(at_total->drain_dh()) + ", total " + std::to_string(cl.total) + ")";
+                return nullptr;
+            }
+        }
+        src = std::move(at_total);
+    } else if (cl.paynow_base) {
         const std::uint64_t B = *cl.paynow_base;
         if (B < fixed_sum) { mismatch = "V37N base " + std::to_string(B) + " < the fixed outputs " + std::to_string(fixed_sum); return nullptr; }
         std::uint64_t took_at_total = 0;
@@ -338,6 +370,9 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
     std::string mis;
     const auto src = canonical_source(cl, ledger, pay_of, lane, cut, mis);
     if (!src) return mismatch(mis);
+    res.drain_on = src->drain_on();   // THE DRAIN RULE: the slice every node derives (alarm / status)
+    res.delta = src->drain_delta(); res.F = src->drain_F(); res.dh = src->drain_dh();
+    res.split_at = bk.total;
 
     // --- 6. byte-compare R, every output and the whole tx_extra ---
     const std::vector<std::uint32_t> caps = candidate_caps(lane, got.amounts.size());
@@ -350,8 +385,11 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
             res.verdict = Verdict::Canonical;
             res.cap = c;
             res.why.clear();
-            for (const auto& o : x6::allocate_exact_sum(in, nullptr, &res.credit_delta))
+            x6::AllocStats st;
+            for (const auto& o : x6::allocate_exact_sum(in, nullptr, &res.credit_delta, &st))
                 if (!(o.identity == lane.residual_sink_identity)) res.expected_payout[o.identity] += static_cast<long long>(o.amount);
+            res.split_at = st.split_at;   // == the total unless the drain rule split at P
+            res.debt_paid = st.debt_paid;
             return res;
         }
         if (c == caps.front()) first = m;   // report against the lane ceiling

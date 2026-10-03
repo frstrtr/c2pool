@@ -114,7 +114,7 @@ TEST(DashV36FutureTimestamp, ProfileSwitchIsTheOnlyGate) {
         // A custom network id => private/isolated v36 profile => bound on.
         SharechainConfig::reset_network_id();
         SharechainConfig::set_network_id("abcd");
-        EXPECT_TRUE(SharechainConfig::isolated_v36());
+        EXPECT_TRUE(SharechainConfig::v36_network());
         EXPECT_TRUE(dash::future_timestamp_bound_active());
         EXPECT_EQ(dash::future_timestamp_bound_active(),
                   SharechainConfig::share_profile().future_timestamp_bound);

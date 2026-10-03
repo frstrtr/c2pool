@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <core/uint256.hpp>
 
@@ -32,6 +33,10 @@ struct SharechainConfig
 {
     // ---- mainnet (networks/dash.py) ----
     static constexpr uint16_t P2P_PORT                  = 8999;
+    // Sharechain port of the named DASH v36 network (--net dash-v36). Not an
+    // oracle constant: the v36 network is c2pool's own, and a separate port lets
+    // a v36 node run on the same host as a v16 node on P2P_PORT.
+    static constexpr uint16_t V36_P2P_PORT              = 8998;
     static constexpr uint16_t WORKER_PORT               = 7903;
     static constexpr uint32_t SHARE_PERIOD              = 20;     // seconds
     static constexpr uint32_t CHAIN_LENGTH              = 4320;   // 24*60*60//20
@@ -64,6 +69,33 @@ struct SharechainConfig
     static constexpr uint32_t NEW_MINIMUM_PROTOCOL_VERSION = 3600;  // AutoRatchet TARGET floor (v36-native)
     static constexpr uint32_t ADVERTISED_PROTOCOL_VERSION  = 3600;  // v36-capability advert (>= target floor)
 
+    //   ISOLATED_V36_PROTOCOL_VERSION (3601): the protocol version the private/
+    //     isolated DASH v36 sharechain ADVERTISES and the accept floor its nodes
+    //     start at (ISOLATED_V36_PROFILE below). Strictly above
+    //     ADVERTISED_PROTOCOL_VERSION: a c2pool-dash build without v36 isolated
+    //     support advertises 3600 and cannot parse a type-36 share, so with the
+    //     same --network-id/--prefix it would pass a 3600 floor, get peered and
+    //     then fail on every share it is sent; at 3601 it is refused at the
+    //     handshake instead ("peer build lacks v36 isolated support — upgrade"),
+    //     not banned. It is NOT a ratchet target (NEW_MINIMUM_PROTOCOL_VERSION
+    //     stays the public 3600 target; apply_min_protocol_ratchet latches on
+    //     current >= target, so a 3601 seed is a no-op there) and the public
+    //     network never sees it (PUBLIC_PROFILE advertises 3600). Every protocol
+    //     comparison is an ordering (>=, <, max), none keys off "exactly 3600":
+    //     node.hpp handle_version (peer < floor -> refused; floor > 1700 &&
+    //     peer >= floor -> actual), node.cpp apply_min_protocol_ratchet and
+    //     auto_ratchet.hpp (current >= target -> latched), min_protocol_gate.hpp
+    //     (peer >= knob, composed by max), main_dash.cpp live share version
+    //     (floor >= 3600 -> 36), p2pool-dash p2p.py (peer < 1700 -> refused).
+    //     "v36 isolated support" is keyed on this bare number: any later change
+    //     to the isolated v36 share/ref/gentx wire format MUST bump it (3602, ...),
+    //     or builds with the older format pass the handshake again.
+    // BUMP RULE (docs/dash-v36-network.md): ANY change to the DASH v36 share,
+    // ref-stream or gentx wire format MUST bump this number (3601 -> 3602 -> ...)
+    // in the same PR, together with a KAT, or older builds pass the handshake
+    // again and then fail on every share they are sent.
+    static constexpr uint32_t ISOLATED_V36_PROTOCOL_VERSION = 3601;  // DASH v36 network advert AND accept floor
+
     // ---- testnet (networks/dash_testnet.py) ----
     static constexpr uint16_t TESTNET_P2P_PORT          = 18999;
     static constexpr uint16_t TESTNET_WORKER_PORT       = 17903;
@@ -73,7 +105,13 @@ struct SharechainConfig
 
     static inline bool is_testnet = false;
 
-    static uint16_t p2p_port()          { return is_testnet ? TESTNET_P2P_PORT : P2P_PORT; }
+    // --net dash-v36 is mainnet-only, so the testnet port needs no v36 variant.
+    // A custom --network-id (private network) keeps P2P_PORT.
+    static uint16_t p2p_port()
+    {
+        if (is_testnet) return TESTNET_P2P_PORT;
+        return is_named_v36_network() ? V36_P2P_PORT : P2P_PORT;
+    }
     static uint16_t worker_port()       { return is_testnet ? TESTNET_WORKER_PORT : WORKER_PORT; }
     static uint32_t share_period()      { return is_testnet ? TESTNET_SHARE_PERIOD : SHARE_PERIOD; }
     static uint32_t chain_length()      { return is_testnet ? TESTNET_CHAIN_LENGTH : CHAIN_LENGTH; }
@@ -89,17 +127,31 @@ struct SharechainConfig
     // Mainnet = the live p2pool-dash fleet identity (oracle p2pool/dash.py:9-10). The single
     // live DASH sharechain is keyed to 7242ef345e1bed6b / 3b3e1286f446b891.
     //
-    // RESERVED (future v36 self-identity): ac2785363c0180b8 / 8d8516bac9edd280. A 2026-08-25
-    // switch (#1344) made this the default before any v36 network existed, isolating the node
-    // from the only live network and breaking both handshake AND share validation against the
-    // fleet — reverted here. When a real v36 network launches, reintroduce this identity through
-    // the v36 activation machinery (AutoRatchet / Phase C), not as the plain default.
-    //   RESERVED v36 self-identity:
-    //     IDENTIFIER_HEX = "ac2785363c0180b8";  PREFIX_HEX = "8d8516bac9edd280";
+    // HISTORY of the v36 identity ac2785363c0180b8 / 8d8516bac9edd280: it was
+    // RESERVED as the future v36 self-identity. A 2026-08-25 switch (#1344) made it
+    // the default before any v36 network existed, isolating the node from the only
+    // live network and breaking both handshake AND share validation against the
+    // fleet; that was reverted (#1424). The rule kept from then: this identity is
+    // NEVER the plain default. It is now the identity of the DASH v36 network and is
+    // selected ONLY by name (--net dash-v36 / settings key sharechain.network = "v36",
+    // select_named_network below); the no-flag default stays the live p2pool-dash
+    // identity above.
     static inline const std::string IDENTIFIER_HEX         = "7242ef345e1bed6b";  // live p2pool-dash fleet
     static inline const std::string PREFIX_HEX             = "3b3e1286f446b891";  // live p2pool-dash fleet
     static inline const std::string TESTNET_IDENTIFIER_HEX = "b6deb1e543fe2427";
     static inline const std::string TESTNET_PREFIX_HEX     = "198b644f6821e3b3";
+
+    // ---- The DASH v36 network (--net dash-v36) ------------------------------
+    // A p2pool v36 sharechain for DASH that starts at share v36 from genesis. Its
+    // identifier/prefix pair is the formerly reserved v36 self-identity (history
+    // above). Two independent constants, like every other network's pair: the
+    // prefix is NEVER derived from the identifier.
+    static inline const std::string V36_NETWORK_IDENTIFIER_HEX = "ac2785363c0180b8";
+    static inline const std::string V36_NETWORK_PREFIX_HEX     = "8d8516bac9edd280";
+    // Canonical CLI name (--net) and settings-file value (sharechain.network).
+    // Both surfaces accept both spellings (parse_named_network).
+    static constexpr const char* V36_NETWORK_NAME          = "dash-v36";
+    static constexpr const char* V36_NETWORK_SETTINGS_NAME = "v36";
 
     // ---- Private sharechain override (--network-id / --prefix) -----------
     // Port of btc::PoolConfig::set_network_id (btc/config_pool.hpp). Set ONCE in
@@ -116,6 +168,13 @@ struct SharechainConfig
     // build without this seam. constant-initialized (no dynamic init), like BTC.
     static inline std::string override_identifier_hex;   // empty = public network
     static inline std::string override_prefix_hex;       // empty = compiled network default
+
+    // Named network selection (--net). None = no named network: the identity is
+    // the public default or a custom --network-id. V36 = the DASH v36 network: the
+    // identity above is set through the same override slots, so every consumer of
+    // identifier_hex()/prefix_hex()/data_subdir() needs no change.
+    enum class NamedNetwork { None, V36 };
+    static inline NamedNetwork named_network = NamedNetwork::None;
 
     /// True for every spelling of "the public network": the empty string or
     /// any run of '0' characters of any length ("0", "00", "00000000",
@@ -158,27 +217,47 @@ struct SharechainConfig
             override_prefix_hex = to8(prefix_hex_override);
     }
 
+    /// Select a named network. V36 sets exactly the DASH v36 network identity
+    /// (V36_NETWORK_IDENTIFIER_HEX / V36_NETWORK_PREFIX_HEX). Callers MUST
+    /// validate with validate_named_network_args() first (it rejects a named
+    /// network combined with --network-id / --prefix), so this never mixes a
+    /// named identity with a custom one. None is a no-op.
+    static void select_named_network(NamedNetwork n)
+    {
+        if (n == NamedNetwork::None)
+            return;
+        named_network           = n;
+        override_identifier_hex = V36_NETWORK_IDENTIFIER_HEX;
+        override_prefix_hex     = V36_NETWORK_PREFIX_HEX;
+    }
+
     /// Clear any override (tests only: production sets the identity once).
     static void reset_network_id()
     {
         override_identifier_hex.clear();
         override_prefix_hex.clear();
+        named_network = NamedNetwork::None;
     }
 
+    /// True for ANY non-default identity: a custom --network-id AND the named
+    /// DASH v36 network (both fill the override slots).
     static bool has_custom_network_id() { return !override_identifier_hex.empty(); }
 
-    // ---- Private/isolated DASH v36 sharechain profile ---------------------
-    // A custom --network-id selects the private/isolated DASH v36 sharechain
-    // profile: a sharechain that no p2pool-dash node can join (the identifier
-    // is committed in every ref_hash), so it is free to start at share v36 from
-    // genesis. The public network (no flag, or any all-'0' spelling, see
-    // is_public_network_id) is NEVER isolated_v36 and stays the v16,
-    // p2pool-dash compatible chain.
+    /// True only for the named DASH v36 network (--net dash-v36).
+    static bool is_named_v36_network() { return named_network == NamedNetwork::V36; }
+
+    // ---- DASH v36 network profile -------------------------------------------
+    // The DASH v36 network (--net dash-v36) and any custom --network-id (test
+    // networks) run the v36 profile: a sharechain that no p2pool-dash node can
+    // join (the identifier is committed in every ref_hash), so it starts at share
+    // v36 from genesis. The public network (no flag, or any all-'0' spelling, see
+    // is_public_network_id) is NEVER v36_network() and stays the v16, p2pool-dash
+    // compatible chain.
     //
     // The profile is DERIVED from override_identifier_hex (no state of its own),
-    // so set_network_id / reset_network_id drive it and it can never disagree
-    // with has_custom_network_id().
-    static bool isolated_v36() { return has_custom_network_id(); }
+    // so select_named_network / set_network_id / reset_network_id drive it and it
+    // can never disagree with has_custom_network_id().
+    static bool v36_network() { return has_custom_network_id(); }
 
     /// Per-network share parameters, the single source of truth. Consumers:
     ///   target_share_version           -> params.hpp current_share_version (the
@@ -192,8 +271,14 @@ struct SharechainConfig
     ///                                     CoinParams::minimum_protocol_version,
     ///                                     which stays the cold 1700 floor on
     ///                                     both profiles.
-    ///   advertised_protocol_version    -> equals CoinParams::advertised_protocol_version
-    ///                                     on both profiles (pinned by KAT).
+    ///   advertised_protocol_version    -> the version this node puts on the
+    ///                                     wire: node.hpp send_version and
+    ///                                     params.hpp make_coin_params
+    ///                                     (CoinParams::advertised_protocol_version)
+    ///                                     read it. 3600 on PUBLIC,
+    ///                                     ISOLATED_V36_PROTOCOL_VERSION (3601,
+    ///                                     == the isolated ratchet floor) on
+    ///                                     isolated (pinned by KAT).
     ///   v36_donation_p2pkh             -> params.hpp donation_script_func: on the
     ///                                     isolated chain a v36 share pays the
     ///                                     P2PKH DONATION_SCRIPT, not the COMBINED
@@ -211,6 +296,29 @@ struct SharechainConfig
     ///   emergency_decay                -> v36 time-decay retarget on the producer
     ///                                     side (share_producer.hpp
     ///                                     compute_share_target).
+    ///   max_shares_per_shares_msg,
+    ///   max_shares_per_sharereply,
+    ///   max_share_wire_bytes           -> share_precheck.hpp precheck_raw_shares:
+    ///                                     per-message caps on incoming
+    ///                                     'shares' / 'sharereply', applied
+    ///                                     before any share is parsed or
+    ///                                     hashed (#1828). Public: the
+    ///                                     oracle's 3145728-byte payload cap
+    ///                                     re-expressed (nothing an honest
+    ///                                     p2pool-dash peer sends is refused).
+    ///                                     DASH v36 network: 64 / 1001 /
+    ///                                     65536. Pinned against the
+    ///                                     share_precheck.hpp constants by
+    ///                                     static_assert there.
+    ///   full_misbehaviour_grading      -> peer_misbehaviour.hpp applies() /
+    ///                                     classify_verify_failure: which
+    ///                                     receive-path offences are charged
+    ///                                     to the sending peer (#1829).
+    ///                                     Public: only the two the
+    ///                                     p2pool-dash oracle itself answers
+    ///                                     with a disconnect (invalid PoW /
+    ///                                     target, structural field checks).
+    ///                                     DASH v36 network: every offence.
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -220,6 +328,10 @@ struct SharechainConfig
         bool     maintainer_only_authority;
         bool     future_timestamp_bound;
         bool     emergency_decay;
+        uint32_t max_shares_per_shares_msg;
+        uint32_t max_shares_per_sharereply;
+        uint32_t max_share_wire_bytes;
+        bool     full_misbehaviour_grading;
     };
 
     static constexpr ShareProfile PUBLIC_PROFILE{
@@ -230,16 +342,36 @@ struct SharechainConfig
         /*maintainer_only_authority=*/false,
         /*future_timestamp_bound=*/false,
         /*emergency_decay=*/false,
+        /*max_shares_per_shares_msg=*/13162,   // (3145728 - 3) / 239
+        /*max_shares_per_sharereply=*/13162,
+        /*max_share_wire_bytes=*/3145728,
+        /*full_misbehaviour_grading=*/false,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
         /*target_share_version=*/36,
-        /*ratchet_floor_protocol_version=*/NEW_MINIMUM_PROTOCOL_VERSION,
-        /*advertised_protocol_version=*/ADVERTISED_PROTOCOL_VERSION,
+        /*ratchet_floor_protocol_version=*/ISOLATED_V36_PROTOCOL_VERSION,
+        /*advertised_protocol_version=*/ISOLATED_V36_PROTOCOL_VERSION,
         /*v36_donation_p2pkh=*/true,
         /*maintainer_only_authority=*/true,
         /*future_timestamp_bound=*/true,
         /*emergency_decay=*/true,
+        /*max_shares_per_shares_msg=*/64,
+        /*max_shares_per_sharereply=*/1001,
+        /*max_share_wire_bytes=*/65536,
+        /*full_misbehaviour_grading=*/true,
     };
+    // The public profile is master's protocol pair, byte for byte.
+    static_assert(PUBLIC_PROFILE.advertised_protocol_version == ADVERTISED_PROTOCOL_VERSION &&
+                  PUBLIC_PROFILE.ratchet_floor_protocol_version == MINIMUM_PROTOCOL_VERSION,
+                  "public DASH protocol advert/floor must stay master's 3600/1700");
+    // The isolated advert is its own floor (two nodes of this build admit each
+    // other), strictly above a build without v36 isolated support, and at or
+    // above the public ratchet target (the ratchet is latched there).
+    static_assert(ISOLATED_V36_PROFILE.advertised_protocol_version ==
+                      ISOLATED_V36_PROFILE.ratchet_floor_protocol_version &&
+                  ISOLATED_V36_PROFILE.ratchet_floor_protocol_version > ADVERTISED_PROTOCOL_VERSION &&
+                  ISOLATED_V36_PROFILE.ratchet_floor_protocol_version >= NEW_MINIMUM_PROTOCOL_VERSION,
+                  "isolated DASH v36 protocol advert must equal its floor and exceed 3600");
 
     /// The active per-network share profile. Read LIVE from the process-global
     /// identity, so it is only coherent under the same ordering contract as the
@@ -248,7 +380,7 @@ struct SharechainConfig
     /// only under that ordering.
     static const ShareProfile& share_profile()
     {
-        return isolated_v36() ? ISOLATED_V36_PROFILE : PUBLIC_PROFILE;
+        return v36_network() ? ISOLATED_V36_PROFILE : PUBLIC_PROFILE;
     }
 
     static const std::string& identifier_hex()
@@ -276,6 +408,9 @@ struct SharechainConfig
     /// Keyed on the identifier, not the prefix: the ref_hash commits the
     /// identifier, not the prefix, so persisted shares are valid across a
     /// prefix change.
+    ///
+    /// The named DASH v36 network takes the same rule on its identifier:
+    /// "dash_ac2785363c0180b8_v36".
     ///
     /// A custom identity is ALSO keyed on the share version the chain mints
     /// ("_v<target_share_version>", i.e. "dash_<id>_v36"): one store holds
@@ -516,6 +651,122 @@ inline bool validate_network_id_args(std::string& network_id_hex,
 }
 
 // ---------------------------------------------------------------------------
+// --net NAME / settings key sharechain.network argument validation (pure seam)
+//
+// Runs in main() on the MERGED values (argv overlaid by the settings file),
+// BEFORE validate_network_id_args. Accepted names:
+//   ""                      no named network: the identity comes from
+//                           --network-id / --prefix, or is the public default
+//   "dash-v36" or "v36"     the DASH v36 network (V36_NETWORK_IDENTIFIER_HEX /
+//                           V36_NETWORK_PREFIX_HEX, the v36 profile)
+// Case-insensitive; normalized in place to the canonical "dash-v36".
+// Rejected:
+//   * any other name (the error lists the valid ones);
+//   * a named network together with --network-id or --prefix (ANY value, even
+//     an all-'0' public spelling): the name already fixes both, so a second
+//     identity source is an operator mistake, never silently resolved;
+//   * a named network with --testnet / --regtest: the DASH v36 network is a
+//     mainnet sharechain; a test network uses --testnet with its own
+//     --network-id / --prefix.
+// ---------------------------------------------------------------------------
+inline bool parse_named_network(std::string& name,
+                                SharechainConfig::NamedNetwork& out,
+                                std::string& err)
+{
+    std::string lc = name;
+    for (char& c : lc)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    if (lc.empty()) {
+        out = SharechainConfig::NamedNetwork::None;
+        return true;
+    }
+    if (lc == SharechainConfig::V36_NETWORK_NAME || lc == SharechainConfig::V36_NETWORK_SETTINGS_NAME) {
+        out  = SharechainConfig::NamedNetwork::V36;
+        name = SharechainConfig::V36_NETWORK_NAME;
+        return true;
+    }
+    err = "unknown --net \"" + name + "\" (sharechain.network): valid names are \""
+        + std::string(SharechainConfig::V36_NETWORK_NAME) + "\" (settings value \""
+        + SharechainConfig::V36_NETWORK_SETTINGS_NAME
+        + "\"), or leave it unset for the public DASH sharechain";
+    return false;
+}
+
+inline bool validate_named_network_args(std::string& net_name,
+                                        const std::string& network_id_hex,
+                                        const std::string& prefix_hex,
+                                        bool testnet,
+                                        SharechainConfig::NamedNetwork& out,
+                                        std::string& err)
+{
+    if (!parse_named_network(net_name, out, err))
+        return false;
+    if (out == SharechainConfig::NamedNetwork::None)
+        return true;
+    if (!network_id_hex.empty() || !prefix_hex.empty()) {
+        err = "--net " + net_name + " cannot be combined with "
+            + std::string(!network_id_hex.empty() ? "--network-id" : "--prefix")
+            + " (sharechain.network_id / sharechain.prefix): the DASH v36 network"
+              " already fixes its identifier " + SharechainConfig::V36_NETWORK_IDENTIFIER_HEX
+            + " and prefix " + SharechainConfig::V36_NETWORK_PREFIX_HEX
+            + ". Use --net " + net_name + " alone, or --network-id/--prefix alone"
+              " for a different network";
+        return false;
+    }
+    if (testnet) {
+        err = "--net " + net_name + " is a mainnet sharechain and cannot be combined with"
+              " --testnet / --regtest; for a test network use --testnet with its own"
+              " --network-id / --prefix";
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The whole identity resolution main() runs, as one pure seam (KAT-covered):
+// validate the merged (settings file + CLI) --net / --network-id / --prefix
+// values, then apply them ONCE. A named network and a custom id are mutually
+// exclusive (validate_named_network_args), so apply sets exactly one of them.
+// ---------------------------------------------------------------------------
+inline bool validate_sharechain_identity_args(std::string& net_name,
+                                              std::string& network_id_hex,
+                                              std::string& prefix_hex,
+                                              bool testnet,
+                                              SharechainConfig::NamedNetwork& named,
+                                              std::string& err)
+{
+    return validate_named_network_args(net_name, network_id_hex, prefix_hex, testnet, named, err)
+        && validate_network_id_args(network_id_hex, prefix_hex, err);
+}
+
+inline void apply_sharechain_identity(SharechainConfig::NamedNetwork named,
+                                      const std::string& network_id_hex,
+                                      const std::string& prefix_hex)
+{
+    if (named != SharechainConfig::NamedNetwork::None)
+        SharechainConfig::select_named_network(named);  // --net dash-v36
+    else
+        SharechainConfig::set_network_id(network_id_hex, prefix_hex);
+}
+
+// ---------------------------------------------------------------------------
+// Built-in sharechain seeds of the DASH v36 network. Dialed ONLY when --net
+// dash-v36 is set and no --addnode/--connect is given
+// (SharechainBootstrapMode::V36NetworkSeeds). Operator-approved public nodes
+// of the network, HOST:PORT on the v36 sharechain port
+// (SharechainConfig::V36_P2P_PORT);
+// IP literals, so dialing needs no DNS. An explicit --addnode/--connect
+// replaces the whole list.
+// ---------------------------------------------------------------------------
+inline std::vector<std::string> v36_network_seed_hosts()
+{
+    return {
+        "158.220.92.171:8998",   // dash.voidbind.com
+        "109.123.238.32:8998",   // Singapore
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Sharechain bootstrap-source selection (pure, testable seam)
 //
 // Mirror of btc::select_sharechain_bootstrap_mode (btc/config_pool.hpp). DASH
@@ -533,14 +784,22 @@ enum class SharechainBootstrapMode {
     RegtestIsolated,      // (unused on DASH; BTC parity)
     CustomNetSuppressed,  // custom --network-id, no explicit peers: 0 public seeds
     PublicDefault,        // public net, no explicit peers: compiled defaults (none today)
+    V36NetworkSeeds,      // --net dash-v36, no explicit peers: v36_network_seed_hosts() only
 };
 
-// Precedence: explicit peers > regtest > custom-network-id > public default.
+// Precedence: explicit peers > regtest > named DASH v36 network > custom
+// network id > public default. The named network sets the override slots too
+// (has_custom_network_id is true for it), so it is tested FIRST: it dials its
+// own seed list, never the public one, and is never treated as an unnamed
+// custom id. The 3-argument form (named_v36_network = false) is the BTC-parity
+// signature, unchanged.
 inline SharechainBootstrapMode select_sharechain_bootstrap_mode(
-    bool has_explicit_peers, bool regtest, bool has_custom_network_id)
+    bool has_explicit_peers, bool regtest, bool has_custom_network_id,
+    bool named_v36_network = false)
 {
     if (has_explicit_peers)    return SharechainBootstrapMode::ExplicitPeers;
     if (regtest)               return SharechainBootstrapMode::RegtestIsolated;
+    if (named_v36_network)     return SharechainBootstrapMode::V36NetworkSeeds;
     if (has_custom_network_id) return SharechainBootstrapMode::CustomNetSuppressed;
     return SharechainBootstrapMode::PublicDefault;
 }
