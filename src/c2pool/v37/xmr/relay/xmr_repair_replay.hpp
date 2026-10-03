@@ -77,6 +77,24 @@ public:
 
     explicit RepairReplayer(std::uint64_t keep_digests) : m_keep(keep_digests ? keep_digests : 1) {}
 
+    // ★ HOLD-ROUND-3 F3b: bound the shadows' RAM. A shadow is a whole push list
+    // [0, P_end) because the scratch replay (run) starts at position 0 -- there
+    // is no lane-state checkpoint to start from -- so a shadow cannot be
+    // folded below a point and still serve as a BASE. Above the budget (total
+    // pushes over every shadow; 0 = unbounded, the stagenet default) the
+    // least recently used shadows are FOLDED TO THEIR DIGESTS: the probe
+    // witness (shadow_digests / shadow_with_digest) and the DROPS record key
+    // stay, the pushes go, and replay() skips them as a base -- the caller
+    // then takes the whole-order fallback (F3a), bounded by the server's
+    // retention. Folded shadows are not persisted (digests alone cannot be
+    // reloaded as a base either). The daemon's mainnet default is 4 x R.
+    void set_ram_budget(std::uint64_t max_pushes) { m_max_pushes = max_pushes; fold_over_budget(); }
+    std::uint64_t ram_budget() const { return m_max_pushes; }
+    std::uint64_t pushes_held() const { std::uint64_t n = 0; for (const auto& sh : m_sh) n += sh.pushes.size(); return n; }
+    std::size_t shadows_folded() const { std::size_t n = 0; for (const auto& sh : m_sh) n += sh.folded ? 1 : 0; return n; }
+    std::uint64_t folds() const { return m_folds; }
+#define C2POOL_XMR_SHADOW_RAM_BUDGET 1
+
     // Replay base[0, a0) + served (the pushes of the served ids [a0, P)) for
     // our own order, then each shadow; the view at (P, spine) of the first that
     // reproduces the spine, or null. `want_a0` = the serving peer's digest at
@@ -97,13 +115,14 @@ public:
             if (from >= 0) m_sh.erase(m_sh.begin() + from);
             // the new order supersedes every shadow it extends (same digest at that shadow's end)
             for (auto it = m_sh.begin(); it != m_sh.end();) {
-                const std::uint64_t L = it->pushes.size();
+                const std::uint64_t L = it->length;
                 auto a = digs.find(L); auto b = it->dig.find(L);
                 if (L <= all.size() && a != digs.end() && b != it->dig.end() && a->second == b->second) it = m_sh.erase(it);
                 else ++it;
             }
             m_sh.push_front(Shadow{std::move(all), std::move(digs)});
             while (m_sh.size() > kMaxShadows) m_sh.pop_back();
+            fold_over_budget();               // F3b: the RAM bound (LRU shadows -> digests only)
             if (!m_path.empty()) persist();   // REPAIR-CHAIN (F1): a restart keeps the chain
         };
         if (!skip(own_a0) && a0 <= own.size()) {
@@ -117,7 +136,7 @@ public:
         if (!a0) return nullptr;   // the served order IS the whole prefix: nothing else to try
         for (std::size_t i = 0; i < m_sh.size(); ++i) {
             const Shadow& sh = m_sh[i];
-            if (a0 > sh.pushes.size()) continue;
+            if (sh.folded || a0 > sh.pushes.size()) continue;   // F3b: a digest-only witness is no base
             std::optional<bytes32> have;
             if (auto it = sh.dig.find(a0); it != sh.dig.end()) have = it->second;
             if (skip(have)) continue;
@@ -151,8 +170,8 @@ public:
         for (const auto& sh : m_sh) {
             const auto it = sh.dig.find(pos);
             if (it == sh.dig.end() || it->second != d) continue;
-            const auto e = sh.dig.find(sh.pushes.size());
-            return std::make_pair(static_cast<std::uint64_t>(sh.pushes.size()), e == sh.dig.end() ? bytes32{} : e->second);
+            const auto e = sh.dig.find(sh.length);
+            return std::make_pair(sh.length, e == sh.dig.end() ? bytes32{} : e->second);
         }
         return std::nullopt;
     }
@@ -177,25 +196,27 @@ public:
     std::vector<std::pair<std::uint64_t, bytes32>> shadow_ends() const {
         std::vector<std::pair<std::uint64_t, bytes32>> v;
         for (const auto& sh : m_sh) {
-            auto it = sh.dig.find(sh.pushes.size());
-            v.emplace_back(sh.pushes.size(), it == sh.dig.end() ? bytes32{} : it->second);
+            auto it = sh.dig.find(sh.length);
+            v.emplace_back(sh.length, it == sh.dig.end() ? bytes32{} : it->second);
         }
         return v;
     }
 
-    // Write every shadow (MRU first) to m_path: tmp + fsync + rename. Above
-    // m_max_bytes only the most recent shadow is written. false = kept the old file.
+    // Write every UNFOLDED shadow (MRU first) to m_path: tmp + fsync + rename.
+    // Above m_max_bytes only the most recent shadow is written. false = kept the old file.
     bool persist() {
         if (m_path.empty()) return false;
         std::vector<std::uint8_t> b;
-        std::size_t count = m_sh.size();
+        std::vector<const Shadow*> keep;   // F3b: a folded shadow (digests only) cannot be reloaded as a base
+        for (const auto& sh : m_sh) if (!sh.folded) keep.push_back(&sh);
+        std::size_t count = keep.size();
         for (int pass = 0; pass < 2; ++pass) {
             b.clear();
             b.insert(b.end(), kMagic, kMagic + 8);
             put(b, m_chain, 4); b.insert(b.end(), m_tag.begin(), m_tag.end());
             put(b, m_keep, 8); put(b, m_step, 8); put(b, count, 4);
             for (std::size_t i = 0; i < count; ++i) {
-                const Shadow& sh = m_sh[i];
+                const Shadow& sh = *keep[i];
                 put(b, sh.pushes.size(), 8); put(b, sh.dig.size(), 8);
                 for (const auto& [pos, d] : sh.dig) { put(b, pos, 8); b.insert(b.end(), d.begin(), d.end()); }
                 for (const auto& [ref, w] : sh.pushes) {
@@ -266,11 +287,13 @@ public:
                 if (!get(8, w)) return bad("bad push record");
                 s.pushes.emplace_back(std::move(ref), w);
             }
+            s.length = P;
             sh.push_back(std::move(s));
         }
         if (o != body) return bad("trailing bytes");
         m_sh = std::move(sh);
         m_ps.loaded += m_sh.size();
+        fold_over_budget();
         return m_sh.size();
     }
 
@@ -279,7 +302,23 @@ private:
     static void put(std::vector<std::uint8_t>& b, std::uint64_t v, int n) {
         for (int i = 0; i < n; ++i) b.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
     }
-    struct Shadow { std::vector<Push> pushes; std::map<std::uint64_t, bytes32> dig; };
+    // length = P_end (== pushes.size() unless folded); folded = digests only (F3b)
+    struct Shadow {
+        std::vector<Push> pushes; std::map<std::uint64_t, bytes32> dig;
+        std::uint64_t length = 0; bool folded = false;
+        Shadow() = default;
+        Shadow(std::vector<Push>&& p, std::map<std::uint64_t, bytes32>&& d) : pushes(std::move(p)), dig(std::move(d)), length(pushes.size()) {}
+    };
+    // F3b: fold the least recently used shadows to digests until the pushes held fit the budget
+    void fold_over_budget() {
+        if (!m_max_pushes) return;
+        for (auto it = m_sh.rbegin(); it != m_sh.rend() && pushes_held() > m_max_pushes; ++it) {
+            if (it->folded) continue;
+            std::vector<Push>().swap(it->pushes);
+            it->folded = true;
+            ++m_folds;
+        }
+    }
 
     std::shared_ptr<const SettlementView> run(std::uint32_t chain, const ::v37::LaneParams& lp, std::uint64_t P,
                                               const bytes32& spine, const std::vector<Push>& base, std::uint64_t a0,
@@ -313,6 +352,8 @@ private:
     std::uint32_t m_chain = 0;
     bytes32 m_tag{};
     std::uint64_t m_max_bytes = 256ull << 20;
+    std::uint64_t m_max_pushes = 0;    // F3b: 0 = unbounded
+    std::uint64_t m_folds = 0;
     PersistStats m_ps;
 };
 
