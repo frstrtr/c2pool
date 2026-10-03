@@ -331,6 +331,12 @@ class StratumServer
     // because sessions_.size() >= StratumConfig::max_stratum_connections.
     std::atomic<uint64_t> refused_connections_{0};
 
+    // Drain-mode admission gate (#866 action 2). Default true = the legacy
+    // accept path, unchanged. false refuses every new connection regardless of
+    // the cap -- the cap alone cannot express "refuse all" because 0 = unlimited.
+    std::atomic<bool> accepting_{true};
+    std::atomic<uint64_t> refused_draining_{0};
+
     // p2pool RateMonitor pair (work.py:223-226):
     //   local_rate_monitor: per-user hashrate (for get_local_rates)
     //   local_addr_rate_monitor: per-address hashrate (for get_local_addr_rates)
@@ -398,6 +404,18 @@ public:
     uint64_t get_refused_connections() const { return refused_connections_.load(); }
     /// Live session count (dead sessions pruned lazily — see notify_all()).
     size_t get_session_count() const;
+
+    /// Drain-mode hooks (#866 action 2). Default-inert: while accepting is true
+    /// (the default) nothing changes. set_accepting(false) closes each new
+    /// connection on accept and bumps get_refused_draining(); live sessions are
+    /// left alone. Coin-side drain controllers drive these; core has no policy.
+    void set_accepting(bool accepting) { accepting_.store(accepting); }
+    bool is_accepting() const { return accepting_.load(); }
+    uint64_t get_refused_draining() const { return refused_draining_.load(); }
+    /// Close up to n live sessions: unauthorized ones first, then lowest
+    /// hashrate first. Each close runs the normal disconnect path. Returns the
+    /// number closed. Call on the io thread.
+    size_t drop_sessions(size_t n);
     /// Diagnostics: {distinct SharedJobPayload blocks, total active jobs}
     /// summed across all sessions. Bounded-memory evidence: distinct payloads
     /// track retained work GENERATIONS, not sessions × jobs. Test/diag hook —
