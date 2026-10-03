@@ -3,7 +3,10 @@
 // v37_xmr_pool_lineage_kat -- POOL-LINEAGE: the block-level pool id
 // (operator ruling 2026-09-25).
 //
-//   pool_tag = sha256d( 'V37PT' || lane_tag || pool_genesis_id )
+//   pool_tag = sha256d( 'V37PT2' || lane_tag || pool_genesis_id || rules_digest )
+//
+// (LANE-RULES flag day 2026-10-02: rules_digest = the node's lane-rules list,
+// xmr_lane_rules.hpp; suite G pins the binding.)
 //
 // committed in the V37C coinbase tail of every lane block as the versioned
 // field "V37P" | u8 1 | b32 pool_tag (37 B) just before the credit cut, and
@@ -29,6 +32,14 @@
 //      (a TWO-byte length varint) assembles, materializes and parses.
 //   F  the relay HELLO: +32 B genesis, round trip, a different genesis =
 //      TAG_MISMATCH field=pool_genesis, same genesis = compatible.
+//   G  LANE-RULES (operator ruling R3): same chain_id, geometry and genesis,
+//      different lane rules (d_conf 60/61, drain_q 0/16, settle_h_min) ->
+//      different pool_tag; a REAL block built under rules X is Foreign
+//      ("not-lane", nothing booked, owed_digest untouched) on a rules-Y node
+//      and Own on a rules-X node; what the pre-LANE-RULES tag did instead (Own
+//      -> recompute Mismatch = debit-only, the A2 fork) is reproduced; the
+//      default-rules block differs from a legacy-tag block in exactly the 32
+//      tag bytes (K2, K3, K5 of A-DESIGN section 5).
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -52,6 +63,9 @@
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_o2_settlement_provider.hpp"
 #include "c2pool/v37/xmr/xmr_pool_tag.hpp"
+#include "c2pool/v37/xmr/xmr_lane_rules.hpp"
+#include "c2pool/v37/xmr/xmr_lane_rules_build.hpp"
+#include "c2pool/v37/xmr/xmr_coinbase_recompute.hpp"
 #include "c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp"
 #include "c2pool/v37/xmr/relay/xmr_relay_wire.hpp"
 
@@ -65,6 +79,7 @@ namespace credit  = c2pool::v37n::xmr::credit;
 namespace auth    = c2pool::v37n::xmr::authority;
 namespace fee     = c2pool::v37n::xmr::fee;
 namespace lineage = c2pool::v37n::xmr::lineage;
+namespace lr      = c2pool::v37n::xmr::lanerules;
 namespace relay   = c2pool::v37n::xmr::relay;
 namespace x6      = ::v37::xmr::settle;
 namespace G4      = c2pool::xmr::native::golden_c4;
@@ -106,29 +121,35 @@ template <class V> std::string hex(const V& v) { return hex(reinterpret_cast<con
 // (regenerate with V37_XMR_POOL_LINEAGE_KAT_PRINT=1 only on a deliberate move).
 // ---------------------------------------------------------------------------
 constexpr const char* GOLDEN_REGTEST_DEFAULT_GENESIS = "95f448de1c380509b4fd7250ee9d2675fc52fec311e8baf66eb8bcf63bbf7d7f";
-constexpr const char* GOLDEN_REGTEST_DEFAULT_POOL_TAG = "3aed952f5525426d99c4ba07c2f8b5283bec072bf62903985d4c04df366fd033";
+// LANE-RULES: the tag of that pool under the all-zero lane-rules list (V37PT2).
+// (Pre-LANE-RULES V37PT value: 3aed952f5525426d99c4ba07c2f8b5283bec072bf62903985d4c04df366fd033.)
+constexpr const char* GOLDEN_REGTEST_DEFAULT_POOL_TAG = "c7df51e5cd9286fff847dff841bd8e277ed15a8c9c22942c560cf5d410be8af0";
 
 void suite_derivation() {
-    std::printf("== A. pool_tag = sha256d('V37PT' || lane_tag || pool_genesis_id) ==\n");
+    std::printf("== A. pool_tag = sha256d('V37PT2' || lane_tag || pool_genesis_id || rules_digest) ==\n");
     const ::v37::LaneParams p{};
     const auto lt = lineage::lane_tag_of(0, p);
     const auto lt_ref = ::c2pool::v37n::rb::lane_tag(::c2pool::v37n::rb::LaneTagContext::of(0, p, ::v37::SHIPPED_CONSENSUS_VERSION, 0), 0, 0, 0);
     CHECK(lt == lt_ref, "lane_tag input == the S1 single-roundabout tag (map_epoch 0, rb 0, stripe 0)");
     CHECK(lt == relay::pool_id_of(0, p).lane_tag, "lane_tag input == the relay HELLO lane_tag (pool_id_of)");
     const auto g = b32(0x11);
-    std::vector<std::uint8_t> pre = {'V', '3', '7', 'P', 'T'};
+    const auto rd = lr::rules_digest(lr::LaneRules{});
+    std::vector<std::uint8_t> pre = {'V', '3', '7', 'P', 'T', '2'};
     pre.insert(pre.end(), lt.begin(), lt.end());
     pre.insert(pre.end(), g.begin(), g.end());
-    CHECK(pre.size() == 69, "preimage is 5 + 32 + 32 = 69 bytes");
-    CHECK(lineage::pool_tag(lt, g) == ::v37::sha256d(pre), "pool_tag == sha256d of the raw preimage");
-    CHECK(lineage::pool_tag_for(0, p, g) == lineage::pool_tag(lt, g), "pool_tag_for(chain, LaneParams, genesis) == pool_tag(lane_tag_of, genesis)");
-    CHECK(lineage::pool_tag(lt, b32(0x12)) != lineage::pool_tag(lt, g), "another genesis -> another pool_tag");
-    CHECK(lineage::pool_tag_for(7, p, g) != lineage::pool_tag_for(0, p, g), "another chain_id (another lane_tag) -> another pool_tag");
+    pre.insert(pre.end(), rd.begin(), rd.end());
+    CHECK(pre.size() == 102, "preimage is 6 + 32 + 32 + 32 = 102 bytes");
+    CHECK(lineage::pool_tag(lt, g, rd) == ::v37::sha256d(pre), "pool_tag == sha256d of the raw preimage");
+    CHECK(lineage::pool_tag_for(0, p, g, rd) == lineage::pool_tag(lt, g, rd),
+          "pool_tag_for(chain, LaneParams, genesis, rules) == pool_tag(lane_tag_of, genesis, rules)");
+    CHECK(lineage::pool_tag(lt, b32(0x12), rd) != lineage::pool_tag(lt, g, rd), "another genesis -> another pool_tag");
+    CHECK(lineage::pool_tag_for(7, p, g, rd) != lineage::pool_tag_for(0, p, g, rd), "another chain_id (another lane_tag) -> another pool_tag");
+    CHECK(lineage::pool_tag(lt, g, b32(0x13)) != lineage::pool_tag(lt, g, rd), "another lane-rules digest -> another pool_tag");
     const auto dg0 = lineage::default_pool_genesis(0), dg2 = lineage::default_pool_genesis(2), dg3 = lineage::default_pool_genesis(3);
     std::vector<std::uint8_t> gp = {'V', '3', '7', 'P', 'G', 3};
     CHECK(dg3 == ::v37::sha256d(gp), "default genesis(regtest) == sha256d('V37PG' || u8 3)");
     CHECK(dg0 != dg2 && dg2 != dg3 && dg0 != dg3, "one default pool PER network (mainnet/stagenet/regtest ids differ)");
-    const auto tag3 = lineage::pool_tag_for(0, p, dg3);
+    const auto tag3 = lineage::pool_tag_for(0, p, dg3, rd);
     if (std::getenv("V37_XMR_POOL_LINEAGE_KAT_PRINT"))
         std::printf("GOLDEN_REGTEST_DEFAULT_GENESIS=%s\nGOLDEN_REGTEST_DEFAULT_POOL_TAG=%s\n", hex(dg3).c_str(), hex(tag3).c_str());
     CHECK(hex(dg3) == GOLDEN_REGTEST_DEFAULT_GENESIS, "frozen default regtest genesis %s", hex(dg3).substr(0, 16).c_str());
@@ -291,10 +312,12 @@ struct Built {
     asm_::BlockBytes                                   bytes;
     bool                                               ok = false;
     std::string                                        why;
-    explicit Built(std::optional<::v37::bytes32> tag) {
+    explicit Built(std::optional<::v37::bytes32> tag, std::uint64_t h_min = 0, bool commit_total = false) {
         lane.scfg.credit_cut_source = [](std::uint64_t& P, ::v37::bytes32& dg) {
             const credit::CreditCut c = fixture_cut(); P = c.next_pos; dg = c.spine_digest; return true; };
         lane.scfg.pool_tag = tag;
+        lane.scfg.h_min = h_min;   // suite G: a node whose lane rules carry another owed floor
+        lane.scfg.commit_total = commit_total;   // ... or another commit_total ruling
         if (!src.poll(&why)) { why = "daemon arm did not parse the capture: " + why; return; }
         provider = std::make_unique<o2::XmrSettlementTemplateProvider>(src, lane.ledger, lane.scfg, 0);
         if (!provider->refresh()) { why = provider->last_error(); return; }
@@ -314,8 +337,9 @@ Parsed_ parse_(const asm_::BlockBytes& b) {
 void suite_blocks() {
     std::printf("== D. real assembled blocks: pool A (ours) vs pool B vs a pre-lineage block, same ledger + config ==\n");
     const ::v37::LaneParams lp{};
-    const auto TAG_A = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0));
-    const auto TAG_B = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xB0));
+    const auto RD = lr::rules_digest(lr::LaneRules{});
+    const auto TAG_A = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xA0), RD);
+    const auto TAG_B = lineage::pool_tag_for(LANE_CHAIN, lp, b32(0xB0), RD);
     Built a(TAG_A), b(TAG_B), u(std::nullopt);
     CHECK(a.ok && b.ok && u.ok, "three templates build + materialize (%s / %s / %s)", a.ok ? "ok" : a.why.c_str(),
           b.ok ? "ok" : b.why.c_str(), u.ok ? "ok" : u.why.c_str());
@@ -489,6 +513,127 @@ void suite_hello() {
     CHECK(relay::is_tag_mismatch(mis_geo) && mis_geo.find("field=geometry") != std::string::npos, "same genesis, other geometry: still field=geometry");
 }
 
+// ---------------------------------------------------------------------------
+// Suite G -- LANE-RULES: the lane rules are part of the pool (K2, K3, K5).
+// ---------------------------------------------------------------------------
+// A node's lane-rules list through the daemon's own builder (lane_rules_of).
+// The rulings match this fixture's builder (no salted ties, no spend floor,
+// commit_total as asked).
+lr::LaneRules node_rules(std::uint64_t d_conf, std::uint32_t drain_q = 0, std::uint64_t h_min = 0, bool commit_total = false) {
+    c2pool::v37n::xmr::XmrNodeConfig c;
+    c.network = c2pool::v37n::xmr::MoneroNetwork::Regtest;
+    c.d_conf = d_conf; c.drain_q = drain_q; c.settle_h_min = h_min;
+    lr::LaneRulesInputs in;
+    in.kfair_salted_ties = false; in.spend_floor = false; in.commit_total = commit_total;
+    in.lane_params_digest = relay::lane_params_digest(::v37::LaneParams{}, 1, relay::BindMode::None, 3);
+    return lr::lane_rules_of(c, in);
+}
+// The pre-LANE-RULES tag: sha256d('V37PT' || lane_tag || genesis) -- what every
+// node computed whatever its lane rules were.
+::v37::bytes32 legacy_tag(const ::v37::bytes32& lt, const ::v37::bytes32& g) {
+    std::vector<std::uint8_t> pre = {'V', '3', '7', 'P', 'T'};
+    pre.insert(pre.end(), lt.begin(), lt.end());
+    pre.insert(pre.end(), g.begin(), g.end());
+    return ::v37::sha256d(pre);
+}
+
+void suite_rules() {
+    std::printf("== G. LANE-RULES: same chain_id + geometry + genesis, different lane rules = different pools ==\n");
+    const ::v37::LaneParams lp{};
+    const auto G = b32(0xA0);
+    const auto lt = lineage::lane_tag_of(LANE_CHAIN, lp);
+    const lr::LaneRules r60 = node_rules(60), r61 = node_rules(61), r60b = node_rules(60);
+    const lr::LaneRules q16 = node_rules(60, 16), hm = node_rules(60, 0, 2'500'000'000ull);
+    auto tag = [&](const lr::LaneRules& r) { return lineage::pool_tag_for(LANE_CHAIN, lp, G, lr::rules_digest(r)); };
+    CHECK(r60 == r60b && tag(r60) == tag(r60b), "equal configs -> equal lane rules -> the SAME pool_tag");
+    CHECK(tag(r60) != tag(r61), "d_conf 60 vs 61 -> different pool_tag (%s.. / %s..)", hex(tag(r60)).substr(0, 12).c_str(),
+          hex(tag(r61)).substr(0, 12).c_str());
+    CHECK(tag(r60) != tag(q16), "drain_q 0 vs 16 -> different pool_tag (the drain placeholder is in the tag before the rule exists)");
+    CHECK(tag(r60) != tag(hm), "settle_h_min 0 vs 2.5e9 -> different pool_tag");
+    CHECK(legacy_tag(lt, G) != tag(r60), "the V37PT2 tag differs from the pre-LANE-RULES V37PT tag (flag day)");
+
+    // --- K2: a REAL block built under rules X is Foreign on a rules-Y node
+    Built x(tag(r61)), y(tag(r60));
+    CHECK(x.ok && y.ok, "two templates build + materialize (%s / %s)", x.ok ? "ok" : x.why.c_str(), y.ok ? "ok" : y.why.c_str());
+    if (!(x.ok && y.ok)) return;
+    std::vector<::v37::bytes32> cands{y.lane.ledger.ledger().owed_digest()};
+    const auto keys = y.lane.ledger.keys();
+    auto decode = [&](const asm_::BlockBytes& b, const ::v37::bytes32& t) {
+        return auth::decode_lane_coinbase(b.full_blob, LANE_CHAIN, cands, keys, y.lane.scfg.residual_sink,
+                                          y.lane.scfg.residual_sink_identity, y.lane.ledger.pay_of(), &t);
+    };
+    const auto t60 = tag(r60), t61 = tag(r61);
+    const auto on_y = decode(x.bytes, t60), on_x = decode(x.bytes, t61), y_own = decode(y.bytes, t60);
+    CHECK(!on_y.ok && !on_y.is_lane && on_y.lineage == lineage::BlockLineage::Foreign && on_y.why.rfind("not-lane:", 0) == 0 &&
+          on_y.payout.empty() && !on_y.has_credit_cut,
+          "K2 the d_conf-61 node's block on a d_conf-60 node: Foreign -> \"not-lane:\" (never booked): %s", on_y.why.c_str());
+    CHECK(on_x.ok && on_x.is_lane && on_x.lineage == lineage::BlockLineage::Own, "K2 the same block on a d_conf-61 node: Own (a lane block)");
+    CHECK(y_own.ok && y_own.is_lane && y_own.lineage == lineage::BlockLineage::Own, "K2 the d_conf-60 node's own block: Own");
+    Built z(tag(r60b));
+    CHECK(z.ok && z.bytes.full_blob == y.bytes.full_blob, "K2 equal rules: byte-identical block (same tag, same coinbase)");
+
+    // --- K3: the A2 fork closed. X builds with the default rulings; Y runs another
+    // settlement ruling (commit_total ON: every lane coinbase must carry the "V37R" total).
+    // Under the legacy tag Y took X's block as its own lane block and its recompute said
+    // Mismatch = debit-only (owed_digest forks); under LANE-RULES the block is Foreign on Y
+    // and the recompute is never reached. (An owed-floor difference is NOT a reliable
+    // witness here: without the spend floor the recompute also tries the n / n+1 output
+    // caps, which can reproduce a higher floor's coinbase.)
+    namespace rc = c2pool::v37n::xmr::recompute;
+    auto lane_inputs = [&](bool commit_total, const ::v37::bytes32& t) {
+        rc::LaneInputs li;
+        li.chain_id = LANE_CHAIN; li.h_min = 0; li.owed_cap = 2700; li.wire_cap = 2700; li.commit_total = commit_total;
+        li.residual_sink = y.lane.scfg.residual_sink; li.residual_sink_identity = y.lane.scfg.residual_sink_identity;
+        li.pool_tag = t;
+        return li;
+    };
+    const auto LT = legacy_tag(lt, G);
+    Built xl(LT);
+    const auto bk_legacy = decode(xl.bytes, LT);
+    CHECK(xl.ok && bk_legacy.ok && bk_legacy.is_lane && bk_legacy.lineage == lineage::BlockLineage::Own,
+          "pre-LANE-RULES: X's block is Own on the commit_total node Y (one legacy tag for both)");
+    const auto before = y.lane.ledger.ledger().owed_digest();
+    const auto v_y = rc::verify_lane_coinbase(xl.bytes.full_blob, bk_legacy, y.lane.ledger.ledger(), y.lane.ledger.pay_of(),
+                                              lane_inputs(true, LT), rc::CutInputs{});
+    const auto v_x = rc::verify_lane_coinbase(xl.bytes.full_blob, bk_legacy, y.lane.ledger.ledger(), y.lane.ledger.pay_of(),
+                                              lane_inputs(false, LT), rc::CutInputs{});
+    std::printf("    legacy recompute on Y: %s (%s)\n", rc::to_string(v_y.verdict), v_y.why.c_str());
+    CHECK(v_y.verdict == rc::Verdict::Mismatch, "pre-LANE-RULES: Y's recompute = Mismatch (debit-only: the A2 fork, reproduced)");
+    CHECK(v_x.verdict == rc::Verdict::Canonical, "X's own recompute of it = Canonical (the two nodes disagree on the same block)");
+    const lr::LaneRules ct = node_rules(60, 0, 0, true);
+    const auto tct = tag(ct);
+    CHECK(tct != t60, "commit_total OFF vs ON -> different pool_tag");
+    const auto bk_new = decode(y.bytes, tct);   // y.bytes: built under the default rules (tag t60)
+    CHECK(!bk_new.ok && !bk_new.is_lane && bk_new.lineage == lineage::BlockLineage::Foreign && bk_new.payout.empty() && !bk_new.has_credit_cut,
+          "K3 LANE-RULES: X's block is Foreign on Y: no lane cut, no payout to debit, no recompute (%s)", bk_new.why.substr(0, 40).c_str());
+    CHECK(y.lane.ledger.ledger().owed_digest() == before, "K3 Y's owed_digest is untouched");
+    const auto bk_self = decode(y.bytes, t60);
+    const auto v_self = rc::verify_lane_coinbase(y.bytes.full_blob, bk_self, y.lane.ledger.ledger(), y.lane.ledger.pay_of(),
+                                                 lane_inputs(false, t60), rc::CutInputs{});
+    CHECK(bk_self.is_lane && v_self.verdict == rc::Verdict::Canonical, "K3 on an equal-rules node it is Own and books Canonical");
+    Built yc(tct, 0, true);
+    const auto bk_yc = decode(yc.bytes, tct);
+    const auto v_yc = rc::verify_lane_coinbase(yc.bytes.full_blob, bk_yc, y.lane.ledger.ledger(), y.lane.ledger.pay_of(),
+                                               lane_inputs(true, tct), rc::CutInputs{});
+    CHECK(yc.ok && bk_yc.is_lane && v_yc.verdict == rc::Verdict::Canonical, "K3 Y's own (commit_total) block: Own, Canonical on Y");
+
+    // --- K5: at default rules the coinbase moves by the 32-byte tag VALUE only
+    Built lg(LT), nw(t60);
+    bool only_tag = lg.ok && nw.ok && lg.bytes.full_blob.size() == nw.bytes.full_blob.size() &&
+                    lg.bytes.extra_nonce_offset == nw.bytes.extra_nonce_offset && lg.bytes.miner_tx_size == nw.bytes.miner_tx_size;
+    std::size_t ndiff = 0;
+    if (only_tag) {
+        const std::size_t lead = nw.bytes.extra_nonce_size - 44 - 37;   // [nonce|pad] before the V37P field (no rbind / V37D here)
+        const std::size_t v0 = nw.bytes.extra_nonce_offset + lead + 5, v1 = v0 + 32;
+        for (std::size_t i = 0; i < nw.bytes.full_blob.size(); ++i)
+            if (lg.bytes.full_blob[i] != nw.bytes.full_blob[i]) { ++ndiff; if (i < v0 || i >= v1) only_tag = false; }
+        only_tag = only_tag && std::equal(t60.begin(), t60.end(), nw.bytes.full_blob.begin() + static_cast<std::ptrdiff_t>(v0)) &&
+                   std::equal(LT.begin(), LT.end(), lg.bytes.full_blob.begin() + static_cast<std::ptrdiff_t>(v0));
+    }
+    CHECK(only_tag && ndiff > 0, "K5 default rules vs the legacy tag: same size, same offsets, %zu differing bytes ALL inside the "
+                                 "32-byte V37P value (every other coinbase byte identical)", ndiff);
+}
+
 } // namespace
 
 int main() {
@@ -499,6 +644,7 @@ int main() {
     suite_blocks();
     suite_widest();
     suite_hello();
+    suite_rules();
     std::printf("=== %d/%d checks passed ===\n", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;
 }

@@ -176,6 +176,8 @@ public:
     void seed_extra_nonce(std::uint32_t base) { m_server.seed_extra_nonce(base); }
     // SEAM-1: per-job binding hook (see XmrStratumServer::set_job_binder). Call before start().
     void set_job_binder(::v37::xmr::stratum::XmrStratumServer::JobBinder f) { m_server.set_job_binder(std::move(f)); }
+    // FEE DISCLOSURE (see XmrStratumServer::set_login_extra). Call before start().
+    void set_login_extra(std::string json_members) { m_server.set_login_extra(std::move(json_members)); }
 
     ~StratumListener() override { stop(); }
 

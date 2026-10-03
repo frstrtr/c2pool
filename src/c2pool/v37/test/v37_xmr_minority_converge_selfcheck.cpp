@@ -31,6 +31,11 @@
 //        UNDECIDABLE (no partial result);
 //   MC5  the marker / observation codecs round-trip (incl. the work field;
 //        a pre-D-1=C line without it reads as work 1);
+//   MC7  THE DRAIN RULE: the refold of a ledger with lane heights (V37Z) and
+//        gross sets G_b reproduces the live owed_digest under the rule;
+//   MC8  O-2 under the refold: a lane-root-refused block is FOUND empty (as the
+//        majority's live booking did), a forced block whose root the majority
+//        holds is not; empty FOUNDs of the old log are never reused as money;
 //   MC6  work weighting: blocks carrying different difficulties are weighed by
 //        their work, not counted (2 heavy unmatched vs 4 light own/matched).
 // ===========================================================================
@@ -77,6 +82,38 @@ struct SimNode {
     }
     void book(std::uint64_t h, const Amounts& credit, const Amounts& payout) {
         c2pool::v37n::xmr::FoundBlock fb; fb.bid = bid_of(h); fb.height = h; fb.credit = credit; fb.payout = payout;
+        drv.on_block_found(fb);
+    }
+    void advance(std::uint64_t h) { (void)drv.advance_to_tip(h, ::v37::bytes32{}); }
+    std::vector<SettleEvent> events() {
+        std::vector<SettleEvent> ev;
+        store.for_each_prefix(c2pool::v37n::xmr::store_codec::k_evt_prefix(chain),
+                              [&](const std::string&, const std::string& v) { ev.push_back(SettleEvent::deserialize(v)); return true; });
+        return ev;
+    }
+};
+
+// The same node with explicit ledger rules (THE DRAIN RULE: lane heights V37Z
+// and the gross clock ride the FOUND as the live driver writes them).
+struct SimNodeR {
+    std::uint64_t D = 3;
+    ::v37::ChainId chain = 7;
+    c2pool::v37n::xmr::MemSettleStore store;
+    c2pool::v37n::xmr::OwedLedger ledger;
+    c2pool::v37n::xmr::SettleHW hw;
+    c2pool::v37n::xmr::XmrFinalizeDriver drv;
+    std::vector<std::pair<::v37::bytes32, std::uint64_t>> ring;
+    std::set<::v37::bytes32> known;
+    explicit SimNodeR(const ::c2pool::v37n::settle::OwedLedgerRules& r)
+        : ledger(7, r), drv{ledger, hw, store, 7, 3, 0, 0, [](std::uint64_t, const std::string&) { return true; }} {
+        ring.emplace_back(ledger.owed_digest(), 0); known.insert(ledger.owed_digest());
+        drv.set_ledger_event_observer([this] {
+            const auto d = ledger.owed_digest();
+            if (!(ring.back().first == d)) { ring.emplace_back(d, drv.digest_since()); known.insert(d); }
+        });
+    }
+    void book(std::uint64_t h, const Amounts& credit, const Amounts& payout, const std::set<::v37::bytes32>& gross) {
+        c2pool::v37n::xmr::FoundBlock fb; fb.bid = bid_of(h); fb.height = h; fb.credit = credit; fb.payout = payout; fb.gross = gross;
         drv.on_block_found(fb);
     }
     void advance(std::uint64_t h) { (void)drv.advance_to_tip(h, ::v37::bytes32{}); }
@@ -210,7 +247,7 @@ int main() {
         for (std::uint64_t h = in.fork_h + 1; h <= c + 1 + D && h <= TOP; ++h) in.chain_blocks[h] = bid_of(h);
         in.refuse = {bid_of(X)};
         std::size_t calls = 0;
-        auto decode = [&](std::uint64_t h, const std::string&, const std::vector<::v37::bytes32>& cands, const std::vector<std::uint64_t>&, bool root_only) {
+        auto decode = [&](std::uint64_t h, const std::string&, const std::vector<::v37::bytes32>& cands, const std::vector<std::uint64_t>&, bool root_only, const ::c2pool::v37n::settle::OwedLedger&) {
             ++calls;
             mc::DecodeResult r;
             if (variant == 2 && h == 15) { r.outcome = mc::DecodeOutcome::Undecidable; r.why = "cut-pending: relay repair of P=9 in flight (test)"; return r; }
@@ -240,6 +277,98 @@ int main() {
         } else {
             check("MC4b a cut-pending decode inside the re-derivation makes the WHOLE attempt UNDECIDABLE (no partial result to adopt)",
                   !res.ok && res.undecidable && res.why.find("cut-pending") != std::string::npos, res.why);
+        }
+    }
+    // ── MC7 / MC8 THE DRAIN RULE (lane heights V37Z + the gross clock) ──────
+    {
+        ::c2pool::v37n::settle::OwedLedgerRules rules; rules.lane_height = true; rules.decay_from_gross = true;
+        auto gross_of = [](const Amounts& cr) { std::set<::v37::bytes32> g; for (const auto& [k, v] : cr) if (v > 0) g.insert(k); return g; };
+        auto maps_at = [](std::uint64_t h) {
+            Amounts cr, po; cr[key_of(static_cast<std::uint8_t>(0x10 + h % 3))] = static_cast<long long>(1000 + 17 * h);
+            po[key_of(static_cast<std::uint8_t>(0x10 + (h + 1) % 3))] = static_cast<long long>(300 + h);
+            return std::make_pair(cr, po);
+        };
+        // MC7: one node's own log (lane blocks 5,7,9,11 with G_b), refolded from below
+        // its first block: the refold must reproduce its V37Z / gross-clock ledger.
+        {
+            const std::uint64_t D = 3, TOP = 14;
+            SimNodeR n(rules);
+            for (std::uint64_t h = 1; h <= TOP; ++h) {
+                if (h >= 5 && h % 2 == 1) { const auto m = maps_at(h); n.book(h, m.first, m.second, gross_of(m.first)); }
+                n.advance(h);
+            }
+            const std::uint64_t c = n.drv.cursor_height();
+            mc::RefoldInput in; in.chain = 7; in.rules = rules; in.d_conf = D; in.fork_h = 4; in.cursor = c; in.events = n.events();
+            for (std::uint64_t h = in.fork_h + 1; h <= c + 1 + D && h <= TOP; ++h) in.chain_blocks[h] = bid_of(h);
+            auto decode = [&](std::uint64_t h, const std::string&, const std::vector<::v37::bytes32>&, const std::vector<std::uint64_t>&, bool root_only,
+                              const ::c2pool::v37n::settle::OwedLedger&) {
+                mc::DecodeResult r;
+                if (h < 5 || h % 2 == 0) { r.outcome = mc::DecodeOutcome::NotLane; return r; }
+                r.outcome = mc::DecodeOutcome::Booked;
+                if (!root_only) { const auto m = maps_at(h); r.credit = m.first; r.payout = m.second; r.gross = gross_of(m.first); }
+                return r;
+            };
+            const mc::RefoldResult res = mc::refold(in, decode);
+            check("MC7 THE DRAIN RULE: the refold of a ledger with lane heights (V37Z) and gross sets G_b reproduces the live node's "
+                  "(digest, since) sequence and owed_digest under the rule",
+                  res.ok && n.ledger.last_settled_lane_height() == 11 && res.ring == n.ring && res.digest == n.ledger.owed_digest() &&
+                  res.pending.size() == n.ledger.pending_count(),
+                  "settled_lane=" + std::to_string(n.ledger.last_settled_lane_height()) + " states=" + std::to_string(res.ring.size()) + "/" +
+                  std::to_string(n.ring.size()) + " digest_eq=" + std::to_string(res.digest == n.ledger.owed_digest()));
+        }
+        // MC8: the MC4 shape under the rule with O-2. X (own, isolated) was refused
+        // by the majority for a non-root reason (nothing FOUND); Y (own, on the
+        // minority lineage) was refused on the lane-root path (FOUND empty on the
+        // majority); the majority blocks the minority could not match were FOUND
+        // empty on the minority. refold(R = {X}) must reproduce the majority.
+        {
+            const std::uint64_t D = 3, TOP = 20, X = 8, Y = 13;
+            SimNodeR maj(rules), mino(rules);
+            std::map<std::uint64_t, ::v37::bytes32> commit;
+            std::set<std::uint64_t> maj_refused_on_mino;
+            for (std::uint64_t h = 1; h <= TOP; ++h) {
+                if (h >= 5) {
+                    const auto m = maps_at(h);
+                    const bool own = (h == X) || (h == Y);
+                    commit[h] = own ? mino.ledger.owed_digest() : maj.ledger.owed_digest();
+                    if (!own) maj.book(h, m.first, m.second, gross_of(m.first));
+                    else if (h == Y) maj.book(h, {}, {}, {});                         // O-2: lane-root refused -> empty FOUND
+                    if (own || mino.known.count(commit[h])) mino.book(h, m.first, m.second, gross_of(m.first));
+                    else { maj_refused_on_mino.insert(h); mino.book(h, {}, {}, {}); }   // O-2 on the minority
+                }
+                maj.advance(h); mino.advance(h);
+            }
+            const std::uint64_t c = mino.drv.cursor_height();
+            mc::RefoldInput in; in.chain = 7; in.rules = rules; in.d_conf = D; in.fork_h = 7; in.cursor = c; in.events = mino.events();
+            for (std::uint64_t h = in.fork_h + 1; h <= c + 1 + D && h <= TOP; ++h) in.chain_blocks[h] = bid_of(h);
+            in.refuse = {bid_of(X)};
+            auto decode = [&](std::uint64_t h, const std::string&, const std::vector<::v37::bytes32>& cands, const std::vector<std::uint64_t>&, bool root_only,
+                              const ::c2pool::v37n::settle::OwedLedger&) {
+                mc::DecodeResult r;
+                bool m = false; for (const auto& d : cands) if (d == commit[h]) { m = true; break; }
+                if (!m) { r.outcome = mc::DecodeOutcome::Refused; r.why = "lane-root-refused:test"; r.total_pico = 5000; r.unattributed_pico = 5000; return r; }
+                r.outcome = mc::DecodeOutcome::Booked;
+                if (!root_only) { const auto mm = maps_at(h); r.credit = mm.first; r.payout = mm.second; r.gross = gross_of(mm.first); }
+                return r;
+            };
+            const mc::RefoldResult res = mc::refold(in, decode);
+            bool y_empty = false, x_found = false;
+            for (const auto& p : res.pending) { if (p.bid == bid_of(Y) && p.empty) y_empty = true; if (p.bid == bid_of(X)) x_found = true; }
+            for (const auto& e : res.events) {
+                if (e.kind != SettleEvKind::Found) continue;
+                if (e.bid == bid_of(X)) x_found = true;
+                if (e.bid == bid_of(Y) && e.credit.empty() && e.payout.empty()) y_empty = true;
+            }
+            std::size_t released = 0; for (const auto h : maj_refused_on_mino) if (res.booked.count(bid_of(h))) ++released;
+            check("MC8 O-2 under the refold: the lane-root-refused Y is FOUND EMPTY (as the majority did), the forced X whose root the "
+                  "majority holds is NOT FOUND (refused for another reason), the majority blocks the minority had FOUND empty are "
+                  "re-decoded and credited (never reused as empty), and the majority's (digest, since) sequence is reproduced",
+                  res.ok && !maj_refused_on_mino.empty() && released == maj_refused_on_mino.size() && !x_found &&
+                  y_empty && maj.ledger.is_settled(bid_of(Y)) && res.ring == maj.ring && res.digest == maj.ledger.owed_digest(),
+                  "released=" + std::to_string(released) + "/" + std::to_string(maj_refused_on_mino.size()) + " x_found=" + std::to_string(x_found) +
+                  " states=" + std::to_string(res.ring.size()) + "/" + std::to_string(maj.ring.size()) +
+                  " digest_eq=" + std::to_string(res.digest == maj.ledger.owed_digest()) + " maj_settled_lane=" +
+                  std::to_string(maj.ledger.last_settled_lane_height()));
         }
     }
     // ── MC5 codecs ──────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
 // --network-id) MINTS v36 — CoinParams::current_share_version is the profile's
 // target share version (36), the mint path builds DashV36Share with
 // desired_version 36 and the P2PKH donation, the node's runtime accept floor is
-// seeded at 3600, the producer retarget carries the v36 emergency time-decay,
+// seeded at the isolated protocol version 3601, the producer retarget carries the v36 emergency time-decay,
 // and the operator message blob is embedded into minted shares when it
 // validates against the chain's (maintainer-only) authority. The public network
 // (no --network-id) is byte-identical to master: it mints v16 exactly as
@@ -16,9 +16,12 @@
 //      coinbase pays the parent's window) that its own tracker and a second
 //      node accept; the public mint path is byte-identical to mint_from_inputs.
 //   C. The flipped isolated chain drops a v16 peer share at node receive.
-//   D. Ratchet seed 3600 on isolated (the ratchet is a no-op there), 1700 on
-//      public; the REAL handle_version refuses a 1700 peer on isolated and
-//      admits 3600; public still admits 1700.
+//   D. Ratchet seed 3601 on isolated (the ratchet is a no-op there), 1700 on
+//      public; the REAL handle_version refuses 1700, 3599 and 3600 (a build
+//      without v36 isolated support) on isolated with "peer build lacks v36
+//      isolated support -- upgrade" and admits 3601; public still admits 1700,
+//      3600 and 3601. The REAL send_version advertises 3600 on public (frame
+//      byte-identical to master's recipe) and 3601 on isolated.
 //   E. Emergency decay: exact max_bits/bits after a stall on isolated, none on
 //      public; the shift saturates instead of wrapping; a producer job commits
 //      the eased bits and the mined share passes the peer checks.
@@ -57,6 +60,7 @@
 #include <impl/bitcoin_family/coin/base_block.hpp>
 
 #include <c2pool/storage/sharechain_storage.hpp>
+#include <core/packet.hpp>
 #include <core/socket.hpp>
 #include <core/web_server.hpp>
 
@@ -337,7 +341,7 @@ TEST(DashV36Flip, IsolatedRejectsV16PeerShareAfterFlip)
 // D. Ratchet seed + live handshake
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST(DashV36Flip, RatchetSeedIs3600OnIsolated1700OnPublic)
+TEST(DashV36Flip, RatchetSeedIsIsolatedProtocolOnIsolated1700OnPublic)
 {
     IdentityGuard guard;
     {
@@ -349,25 +353,80 @@ TEST(DashV36Flip, RatchetSeedIs3600OnIsolated1700OnPublic)
     SharechainConfig::set_network_id(ISO_ID, ISO_PFX);
     {
         dash::NodeImpl iso;
-        EXPECT_EQ(iso.runtime_min_protocol_version(), 3600u)
-            << "the v36-from-genesis chain starts ratcheted";
-        iso.apply_min_protocol_ratchet();   // latched: no-op
-        EXPECT_EQ(iso.runtime_min_protocol_version(), 3600u);
+        EXPECT_EQ(iso.runtime_min_protocol_version(), 3601u)
+            << "the v36-from-genesis chain starts at the isolated protocol floor, "
+               "strictly above a 3600 build without v36 isolated support";
+        iso.apply_min_protocol_ratchet();   // latched (3601 >= the 3600 target): no-op
+        EXPECT_EQ(iso.runtime_min_protocol_version(), 3601u)
+            << "the public ratchet target (3600) never lowers the isolated floor";
     }
 }
 
-TEST(DashV36Flip, IsolatedHandshakeRefuses1700Admits3600)
+TEST(DashV36Flip, IsolatedHandshakeRefusesBelow3601Admits3601)
 {
     IdentityGuard guard;
-    const std::string refused = "peer protocol below min-protocol floor";
-    // Public: the cold floor admits the p2pool-dash 1700 peer (master behaviour).
+    const std::string floor_text = "peer protocol below min-protocol floor";
+    const std::string upgrade_text = "peer build lacks v36 isolated support \u2014 upgrade";
+    // Public: the cold floor admits the p2pool-dash 1700 peer, a 3600 build and
+    // a 3601 build (master behaviour, unchanged).
     EXPECT_EQ(handshake(1700, 0x1111'2222'3333'4401ull), "");
     EXPECT_EQ(handshake(3600, 0x1111'2222'3333'4402ull), "");
+    EXPECT_EQ(handshake(3601, 0x1111'2222'3333'4406ull), "");
 
     SharechainConfig::set_network_id(ISO_ID, ISO_PFX);
-    EXPECT_EQ(handshake(1700, 0x1111'2222'3333'4403ull), refused);
-    EXPECT_EQ(handshake(3599, 0x1111'2222'3333'4404ull), refused);
-    EXPECT_EQ(handshake(3600, 0x1111'2222'3333'4405ull), "");
+    // 1700 = p2pool-dash, 3599 = below the public target, 3600 = a c2pool-dash
+    // build without v36 isolated support (it advertises 3600, would pass a 3600
+    // floor, then fail to parse every type-36 share).
+    for (const auto& [proto, nonce] : {std::pair{1700u, 0x1111'2222'3333'4403ull},
+                                       std::pair{3599u, 0x1111'2222'3333'4404ull},
+                                       std::pair{3600u, 0x1111'2222'3333'4405ull}}) {
+        const auto r = handshake(proto, nonce);
+        EXPECT_TRUE(has_substr(r, floor_text)) << "proto " << proto;
+        EXPECT_TRUE(has_substr(r, upgrade_text)) << "proto " << proto;
+        EXPECT_TRUE(has_substr(r, "peer advertises protocol " + std::to_string(proto)))
+            << "proto " << proto;
+        EXPECT_TRUE(has_substr(r, "requires >= 3601")) << "proto " << proto;
+    }
+    EXPECT_EQ(handshake(3601, 0x1111'2222'3333'4407ull), "");
+    EXPECT_EQ(handshake(3602, 0x1111'2222'3333'4408ull), "");
+}
+
+// The version advert on the wire (the REAL NodeImpl::send_version over a
+// loopback socket): the public frame is byte-identical to master's (protocol
+// 3600, services 1, addr_to = the remote, addr_from = 0.0.0.0:p2p_port,
+// "c2pool", mode 1, the node's head advert); the private/isolated v36
+// sharechain advertises 3601, every other byte built the same way.
+TEST(DashV36Flip, VersionAdvertIs3600PublicAnd3601Isolated)
+{
+    IdentityGuard guard;
+    auto check = [](uint32_t expect_proto) {
+        LoopbackPair pair;
+        StubCommunicator stub;
+        dash::NodeImpl node;   // rig-free; reads the live profile
+        auto peer = make_socket_peer(pair, stub);
+        IoThread io(pair.ioc_node);
+        node.send_version(peer);
+        const Bytes got = read_one_frame(*pair.theirs);
+        io.stop(pair.ioc_node);
+        constexpr std::size_t HDR = 4 + 12 + 4 + 4;   // prefix | command | length | checksum
+        ASSERT_GE(got.size(), HDR + 4 + 8 + 26 + 26 + 8);
+        uint32_t proto = 0;
+        std::memcpy(&proto, got.data() + HDR, 4);
+        EXPECT_EQ(proto, expect_proto);
+        // Rebuild the whole frame from master's recipe; the nonce is the node's
+        // private random value, taken from the frame (payload offset 64).
+        uint64_t nonce = 0;
+        std::memcpy(&nonce, got.data() + HDR + 4 + 8 + 26 + 26, 8);
+        auto want = dash::message_version::make_raw(
+            expect_proto, 1, addr_t{1, peer->addr()},
+            addr_t{1, NetService{"0.0.0.0", SharechainConfig::p2p_port()}},
+            nonce, std::string("c2pool"), 1, node.advertised_best_share());
+        auto ps = core::Packet::from_message(test_prefix(), want);
+        EXPECT_EQ(got, to_bytes(ps)) << "version frame bytes";
+    };
+    check(3600u);   // public: master's advert, byte for byte
+    SharechainConfig::set_network_id(ISO_ID, ISO_PFX);
+    check(3601u);   // private/isolated v36 sharechain
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

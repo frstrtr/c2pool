@@ -9,9 +9,10 @@ protocol version given with --proto, and reports what the node does with it:
     EOF after <ms> ms        the node closed the connection (handshake refused)
     still open after <s> s   the node kept the connection (handshake admitted)
 
-A p2pool-dash (python) peer advertises protocol 1700; the private/isolated v36
-sharechain starts with its accept floor ratcheted to 3600, so --proto 1700 must
-be refused and --proto 3600 admitted.
+A p2pool-dash (python) peer advertises protocol 1700 and a c2pool-dash build
+without v36 isolated support advertises 3600; the private/isolated v36
+sharechain advertises 3601 and starts with its accept floor at 3601, so
+--proto 1700 and --proto 3600 must be refused and --proto 3601 admitted.
 
 Framing (src/core/packet.hpp, src/impl/dash/messages.hpp):
     prefix | command[12] (NUL padded) | length u32 LE | sha256d(payload)[:4] | payload
