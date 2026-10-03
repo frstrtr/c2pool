@@ -371,10 +371,14 @@ changes a job's payee.
   surfaced, never re-owed. The loss falls on the payees of that block. Nodes
   that followed different chains through such a reorg also keep different
   ledgers ([`finality-boundary.md`](finality-boundary.md)).
-- **Late receipts.** A receipt more than 30 bins (about one hour) behind the
-  highest bin already in the lane order is dropped and not credited
-  (`kLateTailBins`, `src/c2pool/v37/xmr/relay/xmr_order_rule.hpp`). This bound
-  has not been ratified.
+- **Late receipts.** A receipt is credited at the bin its work was done in, so a
+  receipt that arrives after the next lane block is still paid in full by the
+  blocks that follow. Only a receipt more than 30 bins (about one hour) behind
+  the highest bin already in the lane order is dropped and not credited
+  (`kLateTailBins`, `src/c2pool/v37/xmr/relay/xmr_order_rule.hpp`), because the
+  order has to close. A node cut off for longer than that, or a pool majority
+  that leaves other miners' receipts out for that long, loses that work. This
+  bound has not been ratified.
 - **Registry growth.** The DROPS enrolment registry (V37G) gains a record for
   every payee enrolled by raindrop and is never pruned
   (`w4_settlement.hpp`). Neither is the identity-to-ref map of the DROPS
