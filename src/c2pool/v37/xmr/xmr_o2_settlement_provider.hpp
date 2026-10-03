@@ -89,6 +89,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -287,6 +288,19 @@ public:
         return it->second;
     }
     std::uint64_t finder_variants() const { return m_variants_built.load(); }
+    // PER-JOB EMPTY-CUT FINDER variants the provider could NOT build (served the
+    // default template instead) and the last refusal's link + reason, for the
+    // status line: a non-zero count on an empty cut means bound jobs are paying
+    // the donation instead of their finder.
+    std::uint64_t finder_variants_refused() const { return m_variants_refused.load(); }
+    std::string   finder_last_refusal() const { std::lock_guard<std::mutex> lk(m_refuse_mtx); return m_last_refusal; }
+    // How many of the retained templates are eligible empty cuts (per-job finder armed).
+    std::size_t   ecut_templates() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        std::size_t n = 0;
+        for (const auto& [id, s] : m_ring) { (void)id; if (s.valid && s.ecut) ++n; }
+        return n;
+    }
 
     // D2 (minority converges to majority): the owed ledger was re-lineaged in
     // place. refresh() re-keys on (height, prev_id, backlog, ledger_seq); a
@@ -526,23 +540,48 @@ private:
         if (it == E.by_fid.end()) {
             if (E.by_fid.size() >= kVariantCap) return dflt;
             SettlementSnapshot::EcutVariants::V v;
-            if (auto src = E.src->with_finder(*f)) {
+            // Built ONCE per (template, finder) and kept, refusals included, so the line
+            // below is once per job's finder, never per share. A refusal names its link
+            // (with_finder / assembler / probe / shape gate): a silent fall-back to the
+            // default template is how nine pre-anchor stagenet blocks paid nobody.
+            std::string why;
+            std::string stage;
+            if (auto src = E.src->with_finder(*f, &why)) {
                 asm_::AssemblyInputs a = E.recipe;
                 a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
                 a.extra_nonce_tail = src->extra_nonce_tail();
-                std::string w;
-                auto t = asm_::XmrBlockAssembler::build(a, &w);
+                auto t = asm_::XmrBlockAssembler::build(a, &why);
                 asm_::BlockBytes probe;
-                if (t && t->materialize(0, probe, &w) && inspect_kfair_coinbase(*t, src->owed_digest()).ok) {
+                if (!t) { stage = "assembler"; }
+                else if (!t->materialize(0, probe, &why)) { stage = "probe materialize"; }
+                else if (const KFairCoinbaseShape sh = inspect_kfair_coinbase(*t, src->owed_digest()); !sh.ok) { stage = "shape gate"; why = sh.why; }
+                else {
                     v.tpl = std::shared_ptr<const asm_::AssembledTemplate>(t.release());
                     v.nonce_offset = probe.nonce_offset;
                     m_variants_built.fetch_add(1);
+                    std::printf("ecut-variant: tpl=%u en=%u finder=%s… -> V37F armed (outputs=%zu, 0x02 payload %zu B)\n",
+                                snap.template_id, extra_nonce, hex8(fid).c_str(), v.tpl->outputs().size(), probe.extra_nonce_size);
                 }
+            } else {
+                stage = "with_finder";
             }
+            if (!v.tpl) {
+                m_variants_refused.fetch_add(1);
+                { std::lock_guard<std::mutex> rl(m_refuse_mtx); m_last_refusal = stage + ": " + why; }
+                std::printf("ecut-variant: tpl=%u en=%u finder=%s… -> REFUSED by %s: %s -- this job is served the DEFAULT template (the donation takes the finder's pool)\n",
+                            snap.template_id, extra_nonce, hex8(fid).c_str(), stage.c_str(), why.c_str());
+            }
+            std::fflush(stdout);
             it = E.by_fid.emplace(fid, std::move(v)).first;
         }
         if (!it->second.tpl) return dflt;
         return {it->second.tpl, it->second.nonce_offset};
+    }
+    static std::string hex8(const ::v37::bytes32& b) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        for (int i = 0; i < 4; ++i) { s += d[b[i] >> 4]; s += d[b[i] & 15]; }
+        return s;
     }
 
     static constexpr std::size_t RING = 6;      // retain a few templates so in-flight jobs resolve
@@ -665,6 +704,12 @@ private:
             auto E = std::make_shared<SettlementSnapshot::EcutVariants>();
             E->recipe = a;
             if (src->ecut_finder()) E->default_fid = ::v37::xmr::xmr_identity_key(*src->ecut_finder());
+            // Once per template (a fresh pool's pre-anchor blocks only): the empty cut is
+            // eligible, so each bound job's finder variant is built on first use (tpl_for).
+            std::printf("ecut: template h=%llu: EMPTY CUT eligible -> per-job finder variants (default finder=%s, drain=%s Delta=%llu, 0x02 payload %zu B)\n",
+                        (unsigned long long)tpl->height(), src->ecut_finder() ? hex8(*E->default_fid).c_str() : "none (the residual pays the donation)",
+                        src->drain_on() ? "on" : "off", (unsigned long long)src->drain_delta(), probe.extra_nonce_size);
+            std::fflush(stdout);
             E->src = std::shared_ptr<const XmrOwedSettlementSource>(src.release());
             snap.ecut = std::move(E);
         }
@@ -717,6 +762,9 @@ private:
     std::map<std::uint32_t, ::v37::ScriptRef> m_finder_by_en;
     std::deque<std::uint32_t> m_finder_order;
     mutable std::atomic<std::uint64_t> m_variants_built{0};
+    mutable std::atomic<std::uint64_t> m_variants_refused{0};
+    mutable std::mutex m_refuse_mtx;
+    mutable std::string m_last_refusal;
 };
 
 // ---------------------------------------------------------------------------

@@ -403,6 +403,29 @@ inline NetResult net_booking(const std::optional<std::uint64_t>& base, std::uint
     return r;
 }
 
+// ---- SINK-UNBACKED (the status alarm's predicate, NoClaimWithoutCash) -----
+// `sink_total` = the coverage the sink / donation output carries, `alloc_sink`
+// = the sink identity's own pay-now share of THIS block (net_booking's alloc),
+// `marker` = the fee model's declared donation minimum, `credit_left` = the
+// credit net_booking left, i.e. what FINALIZE will still book for this block.
+// The amount of coverage no pay-now explains, counted ONLY while the block
+// still holds a claim (some credit_left > 0): float parked in the donation
+// wallet while miners are credited E_b at FINALIZE (the #1865 gap). A block
+// whose fold at the cut is EMPTY and which commits no V37N (every pre-anchor
+// block of a fresh pool, or an empty-cut finder block netted to nothing) has
+// no claim, so nothing is unbacked: 0. Before this predicate the counter fired
+// on every residual without V37N (attempt 8: nine pre-anchor blocks, 5.12 XMR
+// "unbacked" with credit {} on three nodes).
+#define C2POOL_V37_XMR_SINK_UNBACKED_SCOPED 1   // feature probe for KATs built on both trees
+inline long long sink_unbacked_amount(long long sink_total, long long alloc_sink, long long marker,
+                                      const std::map<::v37::bytes32, long long>& credit_left) {
+    const long long unbacked = sink_total - alloc_sink - marker;
+    if (unbacked <= 0) return 0;
+    for (const auto& kv : credit_left)
+        if (kv.second > 0) return unbacked;
+    return 0;
+}
+
 // ===========================================================================
 // WHO IS THE EMPTY-CUT FINDER (operator ruling 09-27). The builder side only:
 // the receive side (apply_empty_cut_finder) accepts and books ANY valid V37F
