@@ -774,11 +774,58 @@ void r19_ecut_finder_drain() {
     }
     g_drain = false;
 }
+
+// R20 (HOLD-ROUND-2 D): the attempt-7 recompute_mismatch on A (h=2220694): the
+// finder built its block on a prefix with its own lane block at h-4 (pending),
+// the receiver recomputed it on a prefix whose last lane block was at h-14 (it
+// had REFUSED the h-4 block on an undecided reason). The recompute is exact on
+// the receiver's inputs and the verdict stays a DECIDED Mismatch (uniform on
+// every node whose lower lane blocks were decided alike -- rule (A) makes that
+// hold); what changes is the evidence: the Result names the skew (the take is
+// the drain Delta at dh' = 4 vs ours 14) and the prev_lane the recompute ran on,
+// which the cba-ALARM line now prints (base: only the inner why).
+void r20_lane_prefix_skew() {
+    std::printf("== R20. HOLD-ROUND-2 (D): a block built on another lane prefix names the skew ==\n");
+    DrainWorld w;
+    g_drain = true;
+    st::OwedLedgerRules on; on.lane_height = true;
+    st::OwedLedger L0(kChain, on);
+    seed(L0, w.K1.id, 40000000000ll, 10); seed(L0, w.K2.id, 25000000000ll, 11); seed(L0, w.K4.id, 900000000000ll, 12);
+    st::LaneFound la; la.height = kHeight - 14;
+    L0.on_block_found("lane-a", Amounts{{w.K1.id, 1000}}, {}, std::nullopt, nullptr, &la);
+    L0.on_block_finalized("lane-a", 13);
+    st::OwedLedger L1 = L0;
+    st::LaneFound lb; lb.height = kHeight - 4;
+    L1.on_block_found("lane-b", Amounts{}, {}, std::nullopt, nullptr, &lb);
+    BuildOpts o; o.cut_payees = w.cut; o.drain = true;
+    const Block b1 = build_block(L1, w.lane, o), b0 = build_block(L0, w.lane, o);
+    CHECK(b1.ok && b0.ok, "the finder's block (prev lane h-4) and an L0 block (prev lane h-14) build: %s %s", b1.why.c_str(), b0.why.c_str());
+    if (!b1.ok || !b0.ok) { g_drain = false; return; }
+    const auto own = receive(b1, L1, w.lane, w.cut);
+    CHECK(own.r.canonical() && own.r.dh == 4, "on the finder's own prefix: CANONICAL, dh 4 (%s)", own.r.why.c_str());
+    const auto a = receive(b1, L0, w.lane, w.cut);
+    CHECK(a.r.verdict == rc::Verdict::Mismatch && a.r.why.find("under-take") != std::string::npos,
+          "on the receiver's older prefix: a DECIDED Mismatch, under-take (unchanged: uniform once the lower block is decided alike) -- %s",
+          a.r.why.c_str());
+#if defined(C2POOL_XMR_RECOMPUTE_TAKE_SKEW)
+    CHECK(a.r.take_mismatch && a.r.skew_dh == 4 && a.r.dh == 14 && a.r.prev_lane == kHeight - 14 &&
+          a.r.took == a.r.R * 4 / 256 && a.r.took_canon == a.r.R * 14 / 256,
+          "D1 the Result names the skew: took %llu = R*4/256 (dh' %llu), ours %llu = R*14/256 (dh %llu, prev_lane h-14)",
+          (unsigned long long)a.r.took, (unsigned long long)a.r.skew_dh, (unsigned long long)a.r.took_canon, (unsigned long long)a.r.dh);
+    const auto bh = receive(b0, L1, w.lane, w.cut);
+    CHECK(bh.r.verdict == rc::Verdict::Mismatch && bh.r.take_mismatch && bh.r.skew_dh == 14 && bh.r.dh == 4,
+          "D1 the mirror (a block built before the receiver's lane block): over-take, skew dh' 14 > ours 4 (%s)", bh.r.why.c_str());
+#else
+    CHECK(false, "D1 no take-skew evidence in the base Result (the alarm line cannot name prev_lane / the skew)");
+#endif
+    g_drain = false;
+}
 #else
 void suite_base() {
     std::printf("== BASE: no recompute on this tree ==\n");
     CHECK(false, "xmr_coinbase_recompute.hpp is absent: a receiver books whatever payout map a lane block carries");
 }
+
 #endif
 
 }  // namespace
@@ -805,6 +852,7 @@ int main() {
     r17_drain_block_canonical();
     r18_drain_deviations();
     r19_ecut_finder_drain();
+    r20_lane_prefix_skew();   // HOLD-ROUND-2 (D)
 #else
     suite_base();
 #endif

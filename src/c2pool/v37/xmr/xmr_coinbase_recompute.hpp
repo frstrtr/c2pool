@@ -159,8 +159,105 @@ struct Result {
     std::uint64_t debt_paid = 0;
     std::uint64_t delta = 0, F = 0, dh = 0;
     bool          drain_on = false;
+    // ★ HOLD-ROUND-2 (B)/(D): the drain take check's own numbers when it FAILED
+    // (take_mismatch): the committed owed takes, the canonical ones, the total R,
+    // the lane's Q / H_cap and the receiver's prev_lane_height(); plus skew_dh,
+    // the smallest dh' in [1, H_cap] whose drain Delta equals `took` while ours
+    // does not (0 = none): the claim was built on a ledger whose previous lane
+    // block sits at height - dh' (a lane-prefix SKEW, not a forged take). Set on
+    // a Mismatch only; the verdict itself is unchanged. `prev_lane` is also set
+    // whenever the drain rule ran (the alarm line prints it).
+    bool          take_mismatch = false;
+    std::uint64_t took = 0, took_canon = 0, R = 0, prev_lane = 0, skew_dh = 0;
+    std::uint32_t drain_q = 0, drain_h_cap = 0;
     bool canonical() const { return verdict == Verdict::Canonical; }
 };
+#define C2POOL_XMR_RECOMPUTE_TAKE_SKEW 1
+
+// ★ HOLD-ROUND-2 (B): the dh' a committed take was cut at. Delta(dh) =
+// min(F, floor(R * min(dh, H_cap) / (Q * 16))) is non-decreasing in dh, so the
+// smallest dh' in [1, H_cap] with Delta(dh') >= took is found by bisection
+// (<= 7 evaluations at H_cap 64, integer-only). Returns 0 when no dh' gives
+// exactly `took`, or when our own dh gives it too (a plateau of the floor: the
+// take is not a dh skew). Exact only while took < F (the formula is then
+// F-independent, so the sender's F need not equal ours).
+inline std::uint64_t drain_skew_dh(std::uint64_t took, std::uint64_t F, std::uint64_t R, std::uint64_t dh,
+                                   std::uint32_t q, std::uint32_t h_cap) {
+    if (q == 0 || h_cap == 0 || took == 0 || took >= F) return 0;
+    std::uint64_t lo = 1, hi = h_cap;
+    if (x6::drain_delta(F, R, hi, q, h_cap) < took) return 0;
+    while (lo < hi) {
+        const std::uint64_t mid = lo + (hi - lo) / 2;
+        if (x6::drain_delta(F, R, mid, q, h_cap) >= took) hi = mid; else lo = mid + 1;
+    }
+    if (x6::drain_delta(F, R, lo, q, h_cap) != took) return 0;
+    if (x6::drain_delta(F, R, dh, q, h_cap) == took) return 0;
+    return lo;
+}
+
+// ★ HOLD-ROUND-2 V2: the drain regime a mismatched take falls in, on the
+// receiver's own numbers. A share is judged only against held states with its
+// own 0x03 root, i.e. the SAME owed_digest: the sender's ledger and ours differ
+// by PENDING lane blocks alone, whose payouts lower F (EffectiveOwed = finalW -
+// pending payouts) and whose heights raise prev_lane. With G(d) = the Delta at
+// F = infinity = floor(R * min(d, H_cap) / (Q * 16)), our F_r, our Delta_r and
+// eff = our dh capped (0 -> H_cap):
+//   AHEAD   the sender holds a pending lane block we do not: F_s <= F_r and
+//           dh_s <= dh_r, so its take is at most ours. EVERY under-take is one:
+//           the Delta at a smaller dh (G(d) == took, d < eff), or an F-capped
+//           take (took = F_s, the smaller float), or both.
+//   BEHIND  we hold a pending lane block the sender does not: F_s >= F_r and
+//           dh_s >= dh_r. An over-take is one iff took <= G(H_cap) and either
+//           G(d) == took at a d > eff, or took >= F_r (an F-capped take of the
+//           larger float; both sides past H_cap included), or our own pass
+//           under-filled Delta_r (took_canon < Delta_r) and took <= Delta_r.
+//   NONE    an over-take in none of those forms, or any take above G(H_cap):
+//           no ledger with this owed_digest builds it -> the caller strikes.
+// Stagenet attempt 7: F fell 5.0e11 -> 1.65e11 in 6 h against R/4 = 1.5e11;
+// the dh-only inversion (drain_skew_dh, exact while took < F) fell back to a
+// strike for every F-capped take. Integer-only, <= 8 evaluations.
+enum class TakeSkew : std::uint8_t { None = 0, Ahead = 1, Behind = 2 };
+struct TakeSkewClass {
+    TakeSkew      kind = TakeSkew::None;
+    std::uint64_t dh = 0;          // the d with G(d) == took (0 = off the R grid: the F-capped form)
+    std::uint64_t g_max = 0;       // G(H_cap): no drain regime takes more
+    const char*   regime = "";
+};
+// the smallest d in [1, H_cap] with G(d) == took, else 0 (G = the Delta at F = infinity)
+inline std::uint64_t drain_grid_dh(std::uint64_t took, std::uint64_t R, std::uint32_t q, std::uint32_t h_cap) {
+    constexpr std::uint64_t kInf = ~std::uint64_t{0};
+    if (q == 0 || h_cap == 0 || took == 0) return 0;
+    std::uint64_t lo = 1, hi = h_cap;
+    if (x6::drain_delta(kInf, R, hi, q, h_cap) < took) return 0;
+    while (lo < hi) {
+        const std::uint64_t mid = lo + (hi - lo) / 2;
+        if (x6::drain_delta(kInf, R, mid, q, h_cap) >= took) hi = mid; else lo = mid + 1;
+    }
+    return x6::drain_delta(kInf, R, lo, q, h_cap) == took ? lo : 0;
+}
+inline TakeSkewClass classify_take_skew(std::uint64_t took, std::uint64_t took_canon, std::uint64_t F, std::uint64_t delta,
+                                        std::uint64_t R, std::uint64_t dh, std::uint32_t q, std::uint32_t h_cap) {
+    TakeSkewClass c;
+    if (q == 0 || h_cap == 0 || took == took_canon) { c.regime = "no drain take mismatch"; return c; }
+    c.g_max = x6::drain_delta(~std::uint64_t{0}, R, h_cap, q, h_cap);
+    if (took > c.g_max) { c.regime = "above the largest drain Delta G(H_cap)"; return c; }
+    const std::uint64_t eff = (dh == 0 || dh > h_cap) ? h_cap : dh;
+    const std::uint64_t g = drain_grid_dh(took, R, q, h_cap);
+    if (took < took_canon) {
+        c.kind = TakeSkew::Ahead;
+        c.dh = (g && g < eff) ? g : 0;
+        c.regime = c.dh ? "the Delta at a smaller dh" : "F-capped: the sender's smaller float";
+        return c;
+    }
+    c.dh = g;
+    if (g && g > eff) { c.kind = TakeSkew::Behind; c.regime = "the Delta at a larger dh"; return c; }
+    if (took >= F) { c.kind = TakeSkew::Behind; c.regime = "F-capped: took >= our F, the sender's larger float"; return c; }
+    if (took_canon < delta && took <= delta) { c.kind = TakeSkew::Behind; c.regime = "our own pass under-fills Delta"; return c; }
+    c.dh = 0;
+    c.regime = "an over-take below our F and off every larger dh";
+    return c;
+}
+#define C2POOL_XMR_TAKE_SKEW_REGIMES 1
 
 namespace detail {
 inline std::string hex12(const ::v37::bytes32& b) {
@@ -197,7 +294,7 @@ struct CoinbaseClaim {
 // nullptr with *mismatch set (the claim cannot be the canonical coinbase).
 inline std::unique_ptr<o2::XmrOwedSettlementSource>
 canonical_source(const CoinbaseClaim& cl, const OwedLedger& ledger, const o2::PayOfFn& pay_of,
-                 const LaneInputs& lane, const CutInputs& cut, std::string& mismatch) {
+                 const LaneInputs& lane, const CutInputs& cut, std::string& mismatch, Result* diag = nullptr) {
     // --- the builder's context, from the lane config + the claim ---
     o2::XmrCoinbaseContext ctx;
     ctx.monero_major_version = cl.major;
@@ -250,6 +347,14 @@ canonical_source(const CoinbaseClaim& cl, const OwedLedger& ledger, const o2::Pa
             for (const auto& e : at_total->inputs().owed) took_canon += e.owed;
             const std::uint64_t took = B - fixed_sum;
             if (took != took_canon) {
+                if (diag) {   // HOLD-ROUND-2 (B)/(D): the numbers, for the skew classification
+                    diag->take_mismatch = true;
+                    diag->took = took; diag->took_canon = took_canon; diag->R = cl.total;   // drain_on stays unset: no source was built
+                    diag->delta = at_total->drain_delta(); diag->F = at_total->drain_F(); diag->dh = at_total->drain_dh();
+                    diag->drain_q = lane.drain.q; diag->drain_h_cap = lane.drain.h_cap;
+                    diag->prev_lane = ledger.prev_lane_height();
+                    diag->skew_dh = drain_skew_dh(took, diag->F, cl.total, diag->dh, lane.drain.q, lane.drain.h_cap);
+                }
                 mismatch = std::string(took < took_canon ? "under-take" : "over-take") + ": the V37N base commits owed takes " +
                            std::to_string(took) + " != " + std::to_string(took_canon) + " the K_fair pass pays at Delta " +
                            std::to_string(at_total->drain_delta()) + " (F " + std::to_string(at_total->drain_F()) + ", dh " +
@@ -368,10 +473,11 @@ inline Result verify_lane_coinbase(const std::vector<std::uint8_t>& blob,
     cl.ecut_finder_malformed = bk.ecut_finder_malformed;
     cl.payload = *payload;
     std::string mis;
-    const auto src = canonical_source(cl, ledger, pay_of, lane, cut, mis);
+    const auto src = canonical_source(cl, ledger, pay_of, lane, cut, mis, &res);
     if (!src) return mismatch(mis);
     res.drain_on = src->drain_on();   // THE DRAIN RULE: the slice every node derives (alarm / status)
     res.delta = src->drain_delta(); res.F = src->drain_F(); res.dh = src->drain_dh();
+    if (res.drain_on) res.prev_lane = ledger.prev_lane_height();
     res.split_at = bk.total;
 
     // --- 6. byte-compare R, every output and the whole tx_extra ---
@@ -467,7 +573,7 @@ inline Result verify_share_coinbase(const std::vector<unsigned char>& tx_extra, 
     LaneInputs l2 = lane;
     l2.commit_total = true;   // a share's total is only what V37R states
     std::string mis;
-    const auto src = canonical_source(cl, ledger, pay_of, l2, cut, mis);
+    const auto src = canonical_source(cl, ledger, pay_of, l2, cut, mis, &res);
     if (!src) return mismatch(mis);
 
     for (const std::uint32_t c : candidate_caps(lane, 0)) {

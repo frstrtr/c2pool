@@ -161,6 +161,70 @@ deferral, both sides) and FC18a-d (not before the window; HELD-LAG at it,
 non-terminal; HELD past the retry bound with nothing dropped; refused-with-
 the-gate-released once decidable, HELD-LAG cleared).
 
+## 4a. Every undecided booking HOLDs; only a decided reason refuses (HOLD-ROUND-2)
+
+Stagenet attempt 7 (2026-10-02, binary `b261fb1a5`): receivers A and C held B's
+lane block 2220689 on `cut-pending: drops lane prefix of P=2356: the served
+order is the SUFFIX [225,2356) ...`. That reason was not in the relay-repair
+list the connector held past its retry bound, so at retry 601 (about 48 min)
+both REFUSED the block into node-local liability (`booking_stall_timeout`)
+while B booked and finalized it: an owed_digest split. A local retry count had
+decided a booking.
+
+**The rule.** `FinalizeConnect::is_undecided(why)` is the PREFIX: every
+`cut-pending:` reason is undecided (the data that decides the block is not on
+this node yet). Past `retry_bound` such a block is HELD exactly like a
+root-unknown or fetch failure: it stays in the retry set (the R4 gate holds),
+is retried every `held_retry_every` ticks, books the moment the data arrives,
+and is refused only if it later resolves to a DECIDED reason. The relay-repair
+list (`is_relay_repair_pending`) only labels the hold for its own counters.
+
+| class | reasons (producers in `main_v37_xmr.cpp`) | past the bound |
+|---|---|---|
+| UNDECIDED (28) | replay log behind P; replay without a matching cut; relay repair in flight / served but short / no peer serves it; a served order that repeats a receipt or breaks the canonical order (peer set aside); a repaired receipt left the cache; origin bin not resolvable; repaired order did not reproduce the spine; CUT-FLOOR wait; our lane tip < P; drops lane prefix not derivable / awaiting the order / the SUFFIX above an unverified base / covers < P; drops range below h undecidable; pinned raindrops not held; drops set not carried yet; drops backfill incomplete / undecidable; recompute: view not readable; recompute Undecidable; DROPS not live yet; ledger not bound (boot); no scratch ring; REJOIN-PAYEE pending; block fetch / parse failure; lane-root-unknown | HELD (15 of them were REFUSED before) |
+| DECIDED (9) | `lane-root-refused:`; `not-lane:`; txin_gen height != chain height; no on-chain credit cut; `cut-floor-refused:`; credit-cut MISMATCH (replay / published); fold_eb REFUSED; recompute Mismatch (booked DEBIT-ONLY); an invalid set (an EMPTY delta booked) | refused / booked at once |
+
+A DECIDED outcome is a function of bytes every honest node holds (the block,
+the view at its cut, the ledger at its anchor), so it is uniform as long as
+every lower lane block was decided alike; the HOLD rule keeps that induction
+from breaking at the first slow peer. No consensus byte changes.
+
+**What it costs.** A HELD node parks its finalize cursor at `h - 1 - D_conf`;
+main's booking-point gate then builds no template above `h` (the node mines
+nothing new for the pool) until the data arrives. Relaying, serving and
+repairing continue. Its ledger stays byte-identical to every other honest
+node's up to `h - 1`: stuck, never split. A finder that publishes a block and
+withholds its order stalls every receiver (loud) instead of splitting them; a
+decidable fallback needs the set digest on chain (v37.1).
+
+**Recovery.** (i) The data arrives: the order from any peer whose vault or
+shadow record covers it, the set via `FB_GETWON` from any node that booked it,
+members by id from any retaining store; (ii) a restart re-derives the hold (it
+never clears one); (iii) D2 minority-converge is for DECIDED divergence only (a
+HELD node is behind, not a minority); (iv) the operator resumes from a peer's
+snapshot past the hold.
+
+**Alarms.** `cba-ALARM booking_stall_alarm: ... HELD, NOT refused` once per
+block at the bound; `cba-ALARM HELD: ... cut-pending (undecided ...)` every
+`held_retry_every` attempts; status `r4/r5: ... stall_timeout=0 stall_alarm=N
+(relay_repair_stall=.. held=.. resolved=.. now=..; undecided_held=..
+resolved=.. now=..)`. `stall_timeout` (a refusal at the bound) stays 0.
+KATs: `v37_xmr_relay_repair_hold_kat` A1-A3 (and N1, inverted),
+`v37_xmr_hold_round2_kat` (the attempt-7 shape on three nodes).
+
+**Every prefix hold names its cause (O1).** Attempt 7's SUFFIX hold printed no
+cause: A's own log covered P and no `reconstructed view at P=2356` line exists
+on A or C, so which branch failed was unreadable. The SUFFIX text now carries
+`cause:` (the serving peer stated no digest at a0 / ours is not retained / the
+a0 digests differ; the settlement replay has not run / ran at another a0 / its
+shadow base has no DROPS record), `a0 digest peer=<12 hex> ours=<12 hex |
+not-retained>`, the replay base and `own order: <owhy>`, and is logged once per
+(cut, cause) as `drops-HOLD suffix: ...`. The awaiting-order hold names the
+repair state (pending / exhausted) and whether our order reaches the spine at
+P; the no-relay hold says when our order does not. KAT:
+`v37_xmr_drops_carry_suffix_kat` CS13. Open items of this round: see
+`coinbase-recompute.md` section 7.
+
 ## 4b. Recovery: VERIFIED resync (W6) -- design, not yet implemented
 
 The old contract ("stop the node and copy `settle.img` from a converged peer")

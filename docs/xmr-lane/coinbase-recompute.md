@@ -282,6 +282,63 @@ nothing checked them.
   answer is trusted on the winner's word: an honest winner never holds a
   refused receipt in its lane.
 
+### 6.1 Share verdict and lane-prefix skew (HOLD-ROUND-2)
+
+A FOUND changes the finder's ledger at once (its own lane block is pending, so
+`prev_lane_height()` moves up) but not `owed_digest`, so its next shares commit
+the same 0x03 root as before while their drain takes are cut at a smaller dh.
+A receiver that has not booked that lane block yet rebuilds the takes at its
+own, larger dh and sees an under-take. Stagenet attempt 7: B's shares at
+h=2220693 committed 9375000000 = R*4/256, A and C rebuilt 32812500000 =
+R*14/256, every share was -1, each -1 a strike: B was banned every ~3 s (86350
+bans on A), so the repair of B's block never finished.
+
+The share verdict now classifies a drain take mismatch before it strikes
+(`xmr_share_verdict.hpp`, `rc::drain_skew_dh`, integer bisection over
+`[1, H_cap]`, at most 7 evaluations at H_cap 64):
+
+| case | test | verdict | relay |
+|---|---|---|---|
+| LATE | a lane block at or above the share's height is booked here | 4 | dropped, no strike |
+| AHEAD | any UNDER-take: the drain Delta at a dh' SMALLER than ours, or a take capped by the sender's smaller F (the sender holds a lane block this node has not booked) | 2 | parked (512 per sender NODE, 4096 in all; at the cap the heaviest node's oldest goes first), re-judged at every share-state publish; no strike |
+| BEHIND | an OVER-take no larger than G(H_cap) that is the Delta at a LARGER dh', or is >= our F (a take capped by the sender's larger F; both dh past H_cap included), or fits our own pass that under-fills Delta (the sender lacks a lane block we hold) | 3 | dropped, no strike |
+| anything else (a take above G(H_cap); an over-take below our F off every larger dh; a mismatch in payees / outputs / tail) | | -1 | refused, a strike, as before |
+
+**Why every regime (V2).** A share is judged only against held states with
+its own 0x03 root, so the two ledgers have the same `owed_digest` and differ by
+PENDING lane blocks alone: a pending payout lowers F, a pending height raises
+prev_lane. With G(d) = floor(R * min(d, H_cap) / (Q * 16)) (the Delta at
+F = infinity), a sender AHEAD of us has F_s <= F_r and dh_s <= dh_r, so its
+take is never above ours; a sender BEHIND has F_s >= F_r and dh_s >= dh_r. The
+first version inverted only the dh form (`rc::drain_skew_dh`, exact while the
+take is below F on both sides) and struck everything else: once F drops below
+R*dh/256 every take is F-capped and the ban loop returns. Attempt 7's F fell
+from 5.0e11 to 1.65e11 in 6 h against R/4 = 1.5e11. `rc::classify_take_skew`
+covers the F-capped forms and both dh past H_cap; a strike needs a take that
+no ledger with this digest builds. The price: in the F-capped regime a forged
+under-take parks and a forged over-take up to G(H_cap) and >= our F drops,
+neither a strike (bounded, never admitted: a parked share must re-judge
+canonical).
+
+A solicited receipt (a repair answer) with any skew verdict takes the patience
+path and is trusted past it (Ruling A), as before. Counters: `relay-shares:
+refused= parked= ... skew ahead= behind= late= ahead_now= rejudged= evicted=`.
+KATs: `v37_xmr_share_verdict_kat` S13 (B1-B4) and S14 (V2: F below R*dh/256 and
+both dh past H_cap, 120 copies each through the DoS budget: strikes 0, bans 0;
+forged takes above G(H_cap) still -1), `v37_xmr_relay_multinode_kat` M8 (200
+AHEAD shares: bans 0, bounded, admitted after the state advances) and M9 (V4:
+one budget per node across a reconnect; the heaviest node evicted first),
+`v37_xmr_hold_round2_kat`.
+
+The same numbers reach the block recompute: `rc::Result` carries `took`,
+`took_canon`, `R`, `prev_lane` and `skew_dh` on a take Mismatch, and the
+`cba-ALARM recompute_mismatch` line prints `prev_lane=` and `take_skew:`. The
+verdict of a block stays a DECIDED Mismatch: once every lower lane block is
+decided alike (`finality-boundary.md` section 4a), every node computes the same
+prev_lane, so the Mismatch is uniform. Turning a skew Mismatch into a hold was
+considered and rejected: a block built on a lower block that was refused
+everywhere would then hold forever (`v37_xmr_coinbase_recompute_kat` R20).
+
 ## 6a. Proving a balance to a light client (paper §13)
 
 The daemon runs `OwedLedgerRules::merkle_rows` together with the anchor rule.
@@ -324,6 +381,23 @@ digest.
 
 ## 7. Known limits and follow-ups
 
+* **HOLD-ROUND-2 open items** (VERIFY 2026-10-03; V2, V4 and DESIGN O1 are
+  closed): **V3** BEHIND / LATE drops are a no-strike channel bounded only by
+  the per-peer ingest burst and the 4096 verify queue (a slow skew-drop ban
+  budget per node, e.g. a strike after 10k in 10 min, = O4); **V5** the
+  inventory and AHEAD keys use the HELLO node nonce, which is not
+  authenticated: a peer presenting another node's nonce spends that node's
+  budget (bind to nonce + remote address); **V6** "refused" raindrops also
+  cover "asked and never admitted" and "context unknown past the patience",
+  so a node lagging on monerod holds honest raindrops as refused (fairness
+  only; the pin path does not consult the set); **O2** confirm that
+  `prev_lane_height()` counting a DEBIT-ONLY booking is intended for the
+  drain's dh; **O3** HELLO re-offer replays receipts the peer already judged
+  (an "already judged" filter); **O4** one cheap-reject budget serves
+  malformed frames and verdict rejects alike (a separate, slower one for
+  verdicts); **O5** the verify-queue drop and the horizon expiry are silent
+  (a per-minute alarm when they jump). V1 (a withholding finder stalls the
+  pool) stays the accepted price until the v37.1 set digest.
 * **Cap latitude.** The recompute accepts any cap that reproduces the block,
   so a builder can truncate its owed pass. Its only gain is pay-now to the
   current cut, whose share of E_b it already gets. Tx stuffing gives the same
