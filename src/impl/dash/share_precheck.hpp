@@ -11,7 +11,8 @@
 //      share is parsed (node.cpp NodeImpl::precheck_raw_shares, called first
 //      thing by the four HANDLER(shares) / HANDLER(sharereply) bodies). Pure,
 //      no parsing, no hashing. A message over a cap is dropped and counted;
-//      no ban and no disconnect here (graded bans are #1829).
+//      on the DASH v36 network the sender is also charged a precheck_drop
+//      offence (peer_misbehaviour.hpp, #1829).
 //
 //   2. check_v16_structure() / check_v36_structure(): field checks that need
 //      no hashing, called by share_init_verify right after the target check
@@ -46,6 +47,35 @@ namespace dash
 // check_v36_structure, before any hashing).
 inline constexpr size_t MAX_MESSAGE_DATA_WIRE_BYTES =
     ENCRYPTION_HEADER_SIZE + MAX_TOTAL_MESSAGE_BYTES;
+
+// Typed share_init_verify rejects (#1829), so the receive path can grade the
+// sending peer (peer_misbehaviour.hpp classify_verify_failure) by what failed,
+// not by the message text. All derive from std::invalid_argument, and every
+// text is unchanged, so existing catch (std::exception&) /
+// catch (std::invalid_argument&) sites and text pins keep working. Defined here
+// because share_check.hpp includes this header.
+//
+// The share's PoW hash does not meet its own target, or the target is zero or
+// easier than MAX_TARGET (oracle: PeerMisbehavingError, p2pool/data.py:356-362).
+struct SharePoWTargetMiss : std::invalid_argument
+{
+    using std::invalid_argument::invalid_argument;
+};
+
+// A field check with no hashing failed: coinbase size, merkle branch > 16,
+// transaction_hash_refs (oracle: ValueError / AssertionError in Share.__init__,
+// p2pool/data.py:317-340), or a v36 field check below.
+struct ShareStructureReject : std::invalid_argument
+{
+    using std::invalid_argument::invalid_argument;
+};
+
+// The share timestamp is too far ahead of the local clock (DASH v36 network
+// only). Never charged to the peer: it depends on our own clock.
+struct ShareClockReject : std::invalid_argument
+{
+    using std::invalid_argument::invalid_argument;
+};
 
 namespace precheck
 {
@@ -190,7 +220,7 @@ inline bool sharereply_fits(const std::vector<chain::RawShare>& shares)
 inline void check_merkle_branch_len(std::size_t n)
 {
     if (n > MAX_MERKLE_BRANCH_LEN)
-        throw std::invalid_argument("merkle branch too long");
+        throw ShareStructureReject("merkle branch too long");
 }
 
 // data.py:335-340:
@@ -201,7 +231,7 @@ inline void check_merkle_branch_len(std::size_t n)
 inline void check_tx_hash_refs(const std::vector<uint64_t>& refs, std::size_t new_tx_count)
 {
     if (refs.size() % 2 != 0)
-        throw std::invalid_argument("bad transaction_hash_refs");
+        throw ShareStructureReject("bad transaction_hash_refs");
     std::vector<bool> seen(new_tx_count, false);
     std::size_t distinct = 0;
     for (std::size_t i = 0; i + 1 < refs.size(); i += 2)
@@ -209,11 +239,11 @@ inline void check_tx_hash_refs(const std::vector<uint64_t>& refs, std::size_t ne
         const uint64_t share_count = refs[i];
         const uint64_t tx_count = refs[i + 1];
         if (share_count >= MAX_TX_REF_SHARE_COUNT)
-            throw std::invalid_argument("bad transaction_hash_refs");
+            throw ShareStructureReject("bad transaction_hash_refs");
         if (share_count != 0)
             continue;
         if (tx_count >= new_tx_count)
-            throw std::invalid_argument("bad transaction_hash_refs");
+            throw ShareStructureReject("bad transaction_hash_refs");
         if (!seen[tx_count])
         {
             seen[tx_count] = true;
@@ -221,7 +251,7 @@ inline void check_tx_hash_refs(const std::vector<uint64_t>& refs, std::size_t ne
         }
     }
     if (distinct != new_tx_count)
-        throw std::invalid_argument("bad transaction_hash_refs");
+        throw ShareStructureReject("bad transaction_hash_refs");
 }
 
 // v16 (both networks): the data.py Share.__init__ checks c2pool did not have.
@@ -239,14 +269,14 @@ inline void check_v36_structure(const DashV36Share& share)
     check_merkle_branch_len(share.m_ref_merkle_link.m_branch.size());
     // Same text as check_v36_message_data, which keeps its own check.
     if (share.m_message_data.m_data.size() > MAX_MESSAGE_DATA_WIRE_BYTES)
-        throw std::invalid_argument("share message_data exceeds MAX_TOTAL_MESSAGE_BYTES");
+        throw ShareStructureReject("share message_data exceeds MAX_TOTAL_MESSAGE_BYTES");
     // DASH pays P2PKH only and has no merged-mining child (share.hpp): the
     // producer always emits pubkey_type 0 and the merged fields empty.
     if (share.m_pubkey_type != 0)
-        throw std::invalid_argument("share pubkey_type must be 0 (P2PKH)");
+        throw ShareStructureReject("share pubkey_type must be 0 (P2PKH)");
     if (!share.m_merged_addresses.empty() || !share.m_merged_coinbase_info.empty()
         || !share.m_merged_payout_hash.IsNull())
-        throw std::invalid_argument("share merged-mining fields must be empty");
+        throw ShareStructureReject("share merged-mining fields must be empty");
 }
 
 } // namespace precheck

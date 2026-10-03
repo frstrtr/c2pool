@@ -23,7 +23,7 @@
 //      'too long' by both sharereq handlers (p2pool/p2p.py:399-404 parity).
 //   5. Pins: the minimal v16 RawShare size behind the public count cap, the
 //      exact payload arithmetic, the profile numbers, the drop counters, and
-//      no ban on a drop (graded bans are #1829).
+//      no ban on a single drop (one drop stays below the #1829 threshold).
 //
 // Red on the base revision: build this TU with DASH_PRECHECK_BASE_REVISION
 // defined (it fences out the pins, which name new symbols); every behavioural
@@ -284,7 +284,7 @@ TEST(DashSharePrecheck, OversizeV36ShareDroppedBeforeX11)
 #ifndef DASH_PRECHECK_BASE_REVISION
     EXPECT_EQ(rig.node->precheck_dropped_messages(), 0u) << "per-share drop, not a whole-message drop";
     EXPECT_EQ(rig.node->precheck_dropped_shares(), 1u);
-    EXPECT_FALSE(rig.node->is_banned(rig.peer->addr())) << "no ban here (#1829)";
+    EXPECT_FALSE(rig.node->is_banned(rig.peer->addr())) << "one drop stays below the #1829 threshold";
 #endif
 }
 
@@ -306,7 +306,7 @@ TEST(DashSharePrecheck, TooManySharesMessageDroppedBeforeX11)
 #ifndef DASH_PRECHECK_BASE_REVISION
         EXPECT_EQ(rig.node->precheck_dropped_messages(), 1u);
         EXPECT_EQ(rig.node->precheck_dropped_shares(), 65u);
-        EXPECT_FALSE(rig.node->is_banned(rig.peer->addr()));
+        EXPECT_FALSE(rig.node->is_banned(rig.peer->addr())) << "one drop stays below the #1829 threshold";
 #endif
     }
     {
@@ -346,7 +346,7 @@ TEST(DashSharePrecheck, OverPayloadSharesMessageDroppedOnPublicProfile)
 #ifndef DASH_PRECHECK_BASE_REVISION
     EXPECT_EQ(rig.node->precheck_dropped_messages(), 1u);
     EXPECT_EQ(rig.node->precheck_dropped_shares(), 3u);
-    EXPECT_FALSE(rig.node->is_banned(rig.peer->addr()));
+    EXPECT_FALSE(rig.node->is_banned(rig.peer->addr())) << "one drop stays below the #1829 threshold";
 #endif
 }
 
@@ -385,7 +385,7 @@ TEST(DashSharePrecheck, SharereplyOverCountResolvesEmptyBeforeX11)
 #ifndef DASH_PRECHECK_BASE_REVISION
         EXPECT_EQ(rig.node->precheck_dropped_messages(), 1u);
         EXPECT_EQ(rig.node->precheck_dropped_shares(), 1002u);
-        EXPECT_FALSE(rig.node->is_banned(rig.peer->addr()));
+        EXPECT_FALSE(rig.node->is_banned(rig.peer->addr())) << "one drop stays below the #1829 threshold";
 #endif
     }
 }

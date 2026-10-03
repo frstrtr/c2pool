@@ -228,9 +228,9 @@ inline std::vector<unsigned char> compute_gentx_before_refhash()
 inline void check_share_target_valid(const uint256& target, const core::CoinParams& params)
 {
     if (target.IsNull())
-        throw std::invalid_argument("share target is zero");
+        throw SharePoWTargetMiss("share target is zero");
     if (target > params.max_target)
-        throw std::invalid_argument("share target invalid");
+        throw SharePoWTargetMiss("share target invalid");
 }
 
 // ── Future-timestamp bound (private/isolated v36 sharechain only) ────────────
@@ -265,7 +265,7 @@ inline void check_share_timestamp_bound(uint32_t share_timestamp, uint32_t now, 
         return;
     if (static_cast<uint64_t>(share_timestamp) >
         static_cast<uint64_t>(now) + SHARE_TIMESTAMP_FUTURE_BOUND_SECS)
-        throw std::invalid_argument("share timestamp is too far in the future");
+        throw ShareClockReject("share timestamp is too far in the future");
 }
 
 // The one place the per-network profile is read for this rule.
@@ -324,7 +324,7 @@ inline uint256 share_init_verify(const DashShare& share,
                                 future_timestamp_bound_active());
 
     if (share.m_coinbase.m_data.size() < 2 || share.m_coinbase.m_data.size() > 100)
-        throw std::invalid_argument("bad coinbase size");
+        throw ShareStructureReject("bad coinbase size");
 
     // ── Share target validity (oracle: target > MAX_TARGET → "share target invalid") ──
     // Unconditional — NOT gated by check_pow, matching p2pool-dash Share.__init__.
@@ -463,7 +463,7 @@ inline uint256 share_init_verify(const DashShare& share,
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (share_hash > target)
-            throw std::invalid_argument("share PoW hash does not meet target");
+            throw SharePoWTargetMiss("share PoW hash does not meet target");
     }
 
     return share_hash;
@@ -643,7 +643,7 @@ inline uint256 share_init_verify(const DashV36Share& share,
                                 future_timestamp_bound_active());
 
     if (share.m_coinbase.m_data.size() < 2 || share.m_coinbase.m_data.size() > 100)
-        throw std::invalid_argument("bad coinbase size");
+        throw ShareStructureReject("bad coinbase size");
 
     check_share_target_valid(chain::bits_to_target(share.m_bits), params);
 
@@ -687,7 +687,7 @@ inline uint256 share_init_verify(const DashV36Share& share,
     {
         uint256 target = chain::bits_to_target(share.m_bits);
         if (share_hash > target)
-            throw std::invalid_argument("share PoW hash does not meet target");
+            throw SharePoWTargetMiss("share PoW hash does not meet target");
     }
 
     check_v36_message_data(share.m_message_data, message_authority);
