@@ -67,7 +67,8 @@ inline constexpr uint8_t  MINER_REWARD_UNLOCK_TIME   = 60;    // CRYPTONOTE_MINE
 inline constexpr uint8_t  NONCE_SIZE                 = 4;     // header miner nonce
 inline constexpr uint8_t  EXTRA_NONCE_SIZE           = 4;     // per-worker extra nonce (min)
 inline constexpr uint8_t  EXTRA_NONCE_MAX_SIZE       = EXTRA_NONCE_SIZE + 10; // padded to keep miner-tx weight invariant
-inline constexpr uint8_t  EXTRA_NONCE_BIND_MAX       = 32;    // SEAM-1: max per-job binding bytes after the nonce (rbind_v1)
+inline constexpr uint8_t  EXTRA_NONCE_HEAD_MAX       = 45;    // RULES RATCHET: max per-TEMPLATE head bytes right after the nonce (the V37P v2 pool field)
+inline constexpr uint8_t  EXTRA_NONCE_BIND_MAX       = 32;    // SEAM-1: max per-job binding bytes after the head (rbind_v1)
 inline constexpr uint8_t  TX_VERSION                 = 2;
 inline constexpr uint8_t  TXIN_GEN                   = 0xFF;  // gen (coinbase) input tag
 inline constexpr uint8_t  TXOUT_TO_TAGGED_KEY        = 3;     // output target since view-tags (HF15)
@@ -178,12 +179,25 @@ public:
     // are byte-identical for every implementer that does not override.
     [[nodiscard]] virtual std::vector<uint8_t> extra_nonce_tail() const { return {}; }
 
+    // RULES RATCHET R1 (c2pool/v37/xmr/xmr_credit_cut.hpp): the per-TEMPLATE head
+    // written right after the 4-byte worker nonce and BEFORE the per-job binding:
+    //     0x02 payload = [extra_nonce 4 | head H | bind N | weight padding | tail]
+    // The XMR lane puts its V37P v2 pool field (45 B: "V37P" 02 pool_id epoch_cur
+    // epoch_max) here, so every reader finds (pool_id, epoch) at a FIXED offset
+    // [4..49) whatever the tail carries, and rbind moves to [49..81). Constant
+    // for the template's life, never patched per job. Default empty => the
+    // template bytes are byte-identical for every implementer that does not
+    // override. Size <= EXTRA_NONCE_HEAD_MAX.
+    [[nodiscard]] virtual std::vector<uint8_t> extra_nonce_head() const { return {}; }
+
     // SEAM-1 (GAP-2 rbind): a per-extra_nonce BINDING region written right
-    // after the 4-byte worker nonce inside the 0x02 payload:
-    //     0x02 payload = [extra_nonce 4 | bind N | weight padding | tail]
-    // The relay binds a receipt's side_data_v2 (payee, give-author) to the
-    // share's RandomX PoW by putting rbind_v1(chain, side) here (N = 32);
-    // check_structural(BindMode::Rbind) reads payload[4..36). Default N = 0
+    // after the 4-byte worker nonce and the per-template head inside the 0x02
+    // payload:
+    //     0x02 payload = [extra_nonce 4 | head H | bind N | weight padding | tail]
+    // The relay binds a receipt's side_data_v2 (payee, give-author, ballot) to
+    // the share's RandomX PoW by putting rbind_v1(chain, side) here (N = 32);
+    // check_structural(BindMode::Rbind) reads payload[4+H .. 4+H+32) = [49..81)
+    // with the XMR lane's 45-byte head. Default N = 0
     // => the template bytes are byte-identical for every implementer that
     // does not override (the gate-OFF / --relay-bind none case).
     [[nodiscard]] virtual size_t extra_nonce_bind_size() const { return 0; }
@@ -323,7 +337,8 @@ private:
 
     std::atomic<uint64_t> m_finalReward{0};
     uint32_t        m_extraNonceSize = 0;
-    uint32_t        m_extraNonceBindSize = 0;   // SEAM-1: bytes after the worker nonce patched per extra_nonce
+    uint32_t        m_extraNonceHeadSize = 0;   // RULES RATCHET: constant per-template bytes right after the nonce (never patched)
+    uint32_t        m_extraNonceBindSize = 0;   // SEAM-1: bytes after the head patched per extra_nonce
     uint64_t        m_merkleTreeData = 0;
     size_t          m_merkleTreeDataSize = 0;
 

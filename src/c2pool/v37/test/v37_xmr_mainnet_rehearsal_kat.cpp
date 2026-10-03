@@ -201,7 +201,8 @@ struct LaneWorld {
     }
     cr::CreditCut cut_at(std::uint64_t h) const { cr::CreditCut c; c.next_pos = 100 + 10 * h; c.spine_digest[0] = static_cast<std::uint8_t>(h); c.spine_digest[1] = 0x5c; return c; }
 };
-::v37::bytes32 the_tag() { ::v37::bytes32 t{}; t[0] = 0xC2; t[31] = 0x37; return t; }
+::v37::bytes32 the_tag() { ::v37::bytes32 t{}; t[0] = 0xC2; t[31] = 0x37; return t; }   // the pool_id of this rig
+cr::PoolField the_field() { return cr::PoolField{the_tag(), 1, 1}; }                         // RULES RATCHET: V37P v2 (epoch 1 of 1)
 
 // The payees pay-now pays at height h on ledger L: the block's own cut, or,
 // under the ANCHOR rule, the view at L's anchor (the cut of the latest lane
@@ -250,7 +251,7 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     ctx.kfair_salted_ties = true;   // mainnet: #1867 salted tie-break
     ctx.spend_floor = g_spend_floor;
     ctx.has_credit_cut = true; ctx.credit_cut = W.cut_at(h);
-    ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
+    ctx.has_pool_field = true; ctx.pool_field = the_field();   // RULES RATCHET: the V37P v2 head
     ctx.has_paynow = true; ctx.paynow_payees = paynow_view(W, L, h);
     ctx.drain = g_drain;   // M7c: THE DRAIN RULE
     std::string why;
@@ -261,7 +262,7 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     for (int pass = 0; src->drain_on() && pass < 4; ++pass) {   // THE DRAIN RULE: the provider's final-reward fixpoint
         asm_::AssemblyInputs p = a;
         p.settle = o2::assembly_settle_inputs(*src, true);
-        p.extra_nonce_tail = src->extra_nonce_tail();
+        p.extra_nonce_tail = src->extra_nonce_tail(); p.extra_nonce_head = src->extra_nonce_head();
         auto t0 = asm_::XmrBlockAssembler::build(p, &why);
         if (!t0 || t0->reward() == src->reward_hint()) break;
         src = o2::XmrOwedSettlementSource::build(L, owed_pay_of, ctx, t0->reward(), &why);
@@ -270,6 +271,7 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
     a.settle = o2::assembly_settle_inputs(*src, true);
     if (g_cap_at && h == g_cap_at) a.settle.output_cap = g_cap;   // M8: a claimed-full builder
     a.extra_nonce_tail = src->extra_nonce_tail();
+    a.extra_nonce_head = src->extra_nonce_head();   // RULES RATCHET: the V37P v2 head
     if (mutate) {   // a MODIFIED builder: tails re-derived from its edited inputs
         mutate(a.settle);
         std::vector<std::uint8_t> t;
@@ -279,7 +281,6 @@ Block build(const st::OwedLedger& L, const o2::PayOfFn& owed_pay_of, const LaneW
         auto app = [&](const std::vector<std::uint8_t>& v) { t.insert(t.end(), v.begin(), v.end()); };
         app(pn::encode_tail(B));
         app(fee::encode_donation_owed_tail(x6::fold_identity_owed(a.settle)));
-        app(cr::encode_pool_tag_field(the_tag()));
         app(cr::encode_tail(W.cut_at(h)));
         a.extra_nonce_tail = t;
     }
@@ -334,7 +335,7 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     rc::LaneInputs li;
     li.chain_id = kChain; li.h_min = 0; li.owed_cap = 2700; li.wire_cap = 2700;
     li.residual_sink = fee::donation_ref(kNet); li.residual_sink_identity = fee::donation_identity(kNet);
-    li.fixed = {fee::donation_marker(kNet)}; li.pool_tag = the_tag();
+    li.fixed = {fee::donation_marker(kNet)}; li.pool_field = the_field();
     li.kfair_salted_ties = true;
     li.spend_floor = g_spend_floor;
     li.drain = g_drain;   // M7c
@@ -1085,6 +1086,7 @@ void m5_gate_and_config() {
     CHECK(!c2pool::v37n::xmr::settlement_fee_model_refusal(c).empty(), "mainnet --coinbase v37 without --fee-model v1: refused");
     c.lane_params.fee = ::v37::FeeModelGate::for_version(1);
     CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(c).empty(), "mainnet --coinbase v37 --fee-model v1: the configuration rehearsed here");
+    c2pool::v37n::xmr::apply_network_drain(c);   // as main() does before run_live: RULES RATCHET R1, mainnet runs the drain at the R-MIN floor (16 / 64 / 1)
     XmrNodeConfig s; s.network = c2pool::v37n::xmr::MoneroNetwork::Stagenet; s.coinbase = c2pool::v37n::xmr::CoinbaseMode::V37Settlement;
     CHECK(c2pool::v37n::xmr::settlement_fee_model_refusal(s).empty(), "stagenet and regtest rigs keep running as they are");
 
@@ -1123,17 +1125,22 @@ void m5_gate_and_config() {
                   t.v, t.q, t.cap, c2pool::v37n::xmr::to_string(net), t.what);
         }
     }
+    // RULES RATCHET R1 (operator rulings 2026-10-03, spec sec. 7(c)): the drain rule is constitutional and the
+    // ratchet is the LAST flag day before the mainnet genesis, so mainnet runs the drain AT the R-MIN floor
+    // (16 / 64 / 1) from its genesis; 0 / 0 / 0 is refused on mainnet as any other value is.
     { XmrNodeConfig k = c; k.drain_q = 16; k.drain_h_cap = 64; k.drain_rule_version = 1;
-      CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain {1,16,64}: refused (0/0/0 until the operator's mainnet flag day)"); }
-    CHECK(c2pool::v37n::xmr::kMainnetDrainQ == 0 && c2pool::v37n::xmr::kMainnetDrainHCap == 0 && c2pool::v37n::xmr::kMainnetDrainRuleVersion == 0 &&
+      CHECK(lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain {1,16,64}: accepted (the R-MIN floor, the mainnet constant from the genesis)"); }
+    { XmrNodeConfig k = c; k.drain_q = 0; k.drain_h_cap = 0; k.drain_rule_version = 0;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain {0,0,0} (master's coinbase): refused (no longer a mainnet state)"); }
+    CHECK(c2pool::v37n::xmr::kMainnetDrainQ == 16 && c2pool::v37n::xmr::kMainnetDrainHCap == 64 && c2pool::v37n::xmr::kMainnetDrainRuleVersion == 1 &&
           c2pool::v37n::xmr::kLaneDrainQ == 16 && c2pool::v37n::xmr::kLaneDrainHCap == 64 && c2pool::v37n::xmr::kLaneDrainRuleVersion == 1,
-          "K6 the network constants: mainnet 0/0/0, the test networks 16/64/1");
+          "K6 the network constants: mainnet 16/64/1 (at the R-MIN floor), the test networks 16/64/1");
     { XmrNodeConfig k = s; k.settle_output_cap = 16; k.owed_demo_amount = 1;
       CHECK(lane_knob_refusal(k, true, true).empty(), "stagenet keeps the settlement knobs (the lane-rules HELLO/pool_tag name a mismatch)"); }
     { XmrNodeConfig k = c; k.owed_demo_amount = 1;
       CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet --owed-demo-amount 1: refused (seeds rows no other node has)"); }
-    { XmrNodeConfig k = c; k.drain_q = 16; k.drain_h_cap = 64; k.drain_rule_version = 1;
-      CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain_q 16: refused (the drain Q is a network constant)"); }
+    { XmrNodeConfig k = c; k.drain_q = 8; k.drain_h_cap = 64; k.drain_rule_version = 1;
+      CHECK(!lane_knob_refusal(k, false, false).empty(), "K6 mainnet drain_q 8: refused (the drain Q is a network constant, 16)"); }
     for (const auto net : {c2pool::v37n::xmr::MoneroNetwork::Mainnet, c2pool::v37n::xmr::MoneroNetwork::Stagenet,
                            c2pool::v37n::xmr::MoneroNetwork::Testnet}) {
         XmrNodeConfig k = s; k.network = net; k.d_conf = 59;

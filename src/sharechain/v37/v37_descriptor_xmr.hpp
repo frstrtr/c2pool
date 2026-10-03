@@ -112,6 +112,14 @@ inline constexpr ScriptKind XMR_SUB = static_cast<ScriptKind>(0x11);
 // payee and the donation before any consumer sees it. 0x12 is NOT used (the
 // P-1 fence in v37_xmr_canon_p1_kat pins 0x12 as a non-dispatch kind).
 inline constexpr ScriptKind XMR_LANE_GA = static_cast<ScriptKind>(0x1F);
+// RULES RATCHET (operator rulings 2026-10-03, spec sec. 2.3): the COMPOSITE lane
+// identity WITH A BALLOT -- the receipt's ballot word (u16: own flag bit 15 |
+// epoch_no bits 0..14), its give_author d and the two payout refs. A lane key
+// only, never a payout target: project() splits its weight into the payee and
+// the donation and sums the payee slice into box[ballot], the donation slice
+// into box[0]. Minted (R2) for every admitted receipt with ballot != 0 or
+// 1 <= d <= 65534; GA (0x1F) is then no longer minted but stays decodable.
+inline constexpr ScriptKind XMR_LANE_BV = static_cast<ScriptKind>(0x1E);
 
 inline constexpr std::size_t XMR_POINT_LEN   = 32;  // one ed25519 point encoding
 inline constexpr std::size_t XMR_PAYLOAD_LEN = 64;  // B||A or D_i||A_main
@@ -186,15 +194,18 @@ inline bool xmr_ref_valid(const ScriptRef& r) {
 // XMR kind. Non-XMR refs defer to the canon's own valid(). This is what the
 // wired canon does inline; provided here for pre-tap use and for tests.
 inline bool xmr_ga_valid(const ScriptRef& r);   // A2, defined below
+inline bool xmr_bv_valid(const ScriptRef& r);   // RULES RATCHET, defined below
 inline bool xmr_descriptor_valid(const PayoutDescriptor& d,
                                  bool allow_attribution = false) {
-    // A2: the composite lane kind is a lane key, never an attribution or aux
-    // target. Refuse it there FIRST: the delegated canon valid() would
-    // re-dispatch on 0x1F and recurse.
-    if (d.attribution.has_value() && d.attribution->kind == XMR_LANE_GA) return false;
-    for (const auto& e : d.aux) if (e.ref.kind == XMR_LANE_GA) return false;
+    // A2 / RULES RATCHET: the composite lane kinds are lane keys, never an
+    // attribution or aux target. Refuse them there FIRST: the delegated canon
+    // valid() would re-dispatch on 0x1F / 0x1E and recurse.
+    if (d.attribution.has_value() && (d.attribution->kind == XMR_LANE_GA || d.attribution->kind == XMR_LANE_BV)) return false;
+    for (const auto& e : d.aux) if (e.ref.kind == XMR_LANE_GA || e.ref.kind == XMR_LANE_BV) return false;
     if (d.pay.kind == XMR_LANE_GA)
         return xmr_ga_valid(d.pay) && !d.attribution.has_value() && d.raw_script.empty() && d.aux.empty();
+    if (d.pay.kind == XMR_LANE_BV)
+        return xmr_bv_valid(d.pay) && !d.attribution.has_value() && d.raw_script.empty() && d.aux.empty();
     // XMR pay: enforce the torsion rule (the canon's ref_well_formed by itself
     // would reject the unknown kind byte; here we accept it once valid).
     if (is_xmr_kind(d.pay.kind)) {
@@ -338,6 +349,60 @@ inline XmrGaSplit xmr_ga_split(const ::v37::U256& W, std::uint16_t d) {
     s.payee = W - s.donation;
     return s;
 }
+
+// --- RULES RATCHET: composite lane identity with a ballot (XMR_LANE_BV, 0x1E) ---
+// payload (134 B) = u16 ballot LE | u16 d LE | payee kind u8 | payee payload (64) |
+//                   donation kind u8 | donation payload (64)
+// Well-formed iff d <= 65534, both halves are XMR address refs (64-byte
+// payloads) and the payee differs from the donation; any u16 is a well-formed
+// ballot (0x0000 delegated abstain, 0x8000 own abstain, 0x8000|n stated,
+// n delegated). The canon identity_key() of the composite is its lane key.
+inline constexpr std::size_t XMR_BV_PAYLOAD_LEN = 2 + 2 + 2 * (1 + XMR_PAYLOAD_LEN);   // 134
+inline constexpr std::uint16_t XMR_BALLOT_OWN_FLAG = 0x8000;
+inline constexpr std::uint16_t XMR_BALLOT_EPOCH_MASK = 0x7FFF;
+struct XmrBallotIdentity { std::uint16_t ballot = 0; std::uint16_t d = 0; ScriptRef payee{}; ScriptRef donation{}; };
+inline ScriptRef make_xmr_ballot_identity(std::uint16_t ballot, std::uint16_t d, const ScriptRef& payee, const ScriptRef& donation) {
+    ScriptRef r;
+    r.kind = XMR_LANE_BV;
+    r.payload.reserve(XMR_BV_PAYLOAD_LEN);
+    r.payload.push_back(static_cast<std::uint8_t>(ballot & 0xff));
+    r.payload.push_back(static_cast<std::uint8_t>(ballot >> 8));
+    r.payload.push_back(static_cast<std::uint8_t>(d & 0xff));
+    r.payload.push_back(static_cast<std::uint8_t>(d >> 8));
+    r.payload.push_back(static_cast<std::uint8_t>(payee.kind));
+    r.payload.insert(r.payload.end(), payee.payload.begin(), payee.payload.end());
+    r.payload.push_back(static_cast<std::uint8_t>(donation.kind));
+    r.payload.insert(r.payload.end(), donation.payload.begin(), donation.payload.end());
+    return r;
+}
+// Structural decode only (no torsion check).
+inline bool decode_xmr_ballot_identity(const ScriptRef& r, XmrBallotIdentity& out) {
+    if (r.kind != XMR_LANE_BV || r.payload.size() != XMR_BV_PAYLOAD_LEN) return false;
+    const std::uint8_t* p = r.payload.data();
+    XmrBallotIdentity g;
+    g.ballot = static_cast<std::uint16_t>(p[0] | (static_cast<std::uint16_t>(p[1]) << 8));
+    g.d = static_cast<std::uint16_t>(p[2] | (static_cast<std::uint16_t>(p[3]) << 8));
+    g.payee.kind = static_cast<ScriptKind>(p[4]);
+    g.payee.payload.assign(p + 5, p + 5 + XMR_PAYLOAD_LEN);
+    const std::uint8_t* q = p + 5 + XMR_PAYLOAD_LEN;
+    g.donation.kind = static_cast<ScriptKind>(q[0]);
+    g.donation.payload.assign(q + 1, q + 1 + XMR_PAYLOAD_LEN);
+    if (!is_xmr_kind(g.payee.kind) || !is_xmr_kind(g.donation.kind)) return false;
+    out = std::move(g);
+    return true;
+}
+inline bool xmr_bv_well_formed(const ScriptRef& r) {
+    XmrBallotIdentity g;
+    return decode_xmr_ballot_identity(r, g) && g.d <= XMR_GA_SCALE - 1 && !(g.payee == g.donation);
+}
+inline bool xmr_bv_valid(const ScriptRef& r) {
+    XmrBallotIdentity g;
+    if (!decode_xmr_ballot_identity(r, g)) return false;
+    if (g.d > XMR_GA_SCALE - 1 || g.payee == g.donation) return false;
+    return xmr_ref_valid(g.payee) && xmr_ref_valid(g.donation);
+}
+inline constexpr bool xmr_ballot_own(std::uint16_t ballot) { return (ballot & XMR_BALLOT_OWN_FLAG) != 0; }
+inline constexpr std::uint16_t xmr_ballot_epoch(std::uint16_t ballot) { return static_cast<std::uint16_t>(ballot & XMR_BALLOT_EPOCH_MASK); }
 
 // The canon identity_key() (sha256d of VERSION||kind||len||payload) works
 // unchanged for XMR kinds — append_ref's u8 length field already fits 64. This

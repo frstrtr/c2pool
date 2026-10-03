@@ -187,9 +187,10 @@ struct XmrSettlementConfig {
     // (0/0/0) => master's coinbase bytes; the daemon sets the network's triple.
     DrainRule drain{};
 
-    // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
-    // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
-    std::optional<::v37::bytes32> pool_tag;
+    // RULES RATCHET R1: the pool-identity field (V37P v2: pool_id, epoch_cur,
+    // epoch_max) every lane block this pool builds commits first in its 0x02
+    // payload (xmr_credit_cut.hpp). Unset => no V37P field (KAT rigs / tools).
+    std::optional<credit::PoolField> pool_field;
 
     // ---- sink constructors (payout-target bytes, never address strings) ----
     // Set the sink from raw 32-byte key material; also fills residual_sink_identity.
@@ -342,7 +343,7 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.drain                  = cfg.drain;   // THE DRAIN RULE
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
-    if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
+    if (cfg.pool_field) { ctx.has_pool_field = true; ctx.pool_field = *cfg.pool_field; }   // RULES RATCHET: the V37P v2 head
     if (ledger.rules().anchor_cut) {
         // ANCHOR (ruling A 2026-09-29): pay-now pays the payees of the view at the
         // ledger's anchor (the cut of the latest lane block finalized into it);

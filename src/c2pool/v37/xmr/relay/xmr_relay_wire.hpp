@@ -52,7 +52,10 @@
 //       meet the lane's share difficulty. A forged or altered blob/coinbase
 //       fails one of those two checks.
 //   side_data_v2 (56 B) = t_origin.lo u64 | t_origin.hi u64 | identity b32 |
-//       chain_id u32 | give_author u16 | reserved u16
+//       chain_id u32 | give_author u16 | ballot u16
+//       (RULES RATCHET R1: the former reserved word is the BALLOT -- own flag
+//       bit 15 | epoch_no bits 0..14; 0 = delegated abstain / no ballot, so a
+//       receipt with ballot 0 is BYTE-IDENTICAL to a pre-ratchet receipt)
 //   payee ref (66 B)    = u8 kind (0x10 XMR_STD | 0x11 XMR_SUB) | u8 len=64 | 64 B
 //
 //   info_digest == side_digest_v2(side) (self-consistency), identity ==
@@ -88,6 +91,7 @@
 #include <sharechain/v37/v37_lane.hpp>             // ::v37::LaneParams (read-only, for the HELLO digest)
 #include <c2pool/v37/xmr/xmr_enrol_mode.hpp>       // DROPS-AUTO-ENROL: EnrolMode, enrol_mode_tag
 #include <c2pool/v37/xmr/xmr_lane_rules.hpp>       // LANE-RULES: the lane-rules TLV list HELLO carries
+#include <c2pool/v37/xmr/xmr_epoch.hpp>            // RULES RATCHET: the Deployment list HELLO carries after the TLV
 
 #include "impl/xmr/receipt/xmr_receipt.hpp"        // ::v37::xmr::MoneroReceipt
 #include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
@@ -187,6 +191,17 @@ inline constexpr std::size_t kHelloBytesEnrolSet    = kHelloBytesPoolGenesis + k
 // the four legacy lengths keep their meaning and decode with rules = none.
 inline constexpr std::size_t kHelloRulesMinBytes    = kHelloBytesPoolGenesis + 1 + 2;   // 177 + the TLV
 inline constexpr std::size_t kHelloRulesMaxTlv      = 4096;
+// RULES RATCHET R1 (operator rulings 2026-10-03): a rules frame carries the
+// EPOCH TRAILER after the TLV, mandatory:
+//         u32 epoch_cur | u8 n_epochs | n_epochs x Deployment (61 B)   (n in 1..64)
+// epoch_cur is an epoch_no of the list (the sender's V37Y.epoch_no), entry 1 is
+// kind 0, the TLV is the rules of epoch_cur (its digest == that entry's
+// rules_digest). A pre-ratchet rules frame (no trailer) is refused as "hello:
+// rules length mismatch", a pre-ratchet node refuses ours the same way: the
+// flag day refuses by name in both directions (and TAG_MISMATCH field=version
+// names it before that, kXmrPoolRulesVersion below).
+inline constexpr std::size_t kHelloEpochTrailerMin  = 4 + 1 + ::c2pool::v37n::xmr::epoch::kDeploymentBytes;   // 66: one entry
+inline constexpr std::size_t kHelloEpochMaxEntries  = ::c2pool::v37n::xmr::epoch::kMaxDeployments;
 inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
 // ENROL-REPL: FB_BLOCK_WON v0x02 (flip-only) = the 127-byte v0x01 body + the
 // winner's composed DROPS delta: u16 n | n x (payee 32 | i64 delta) | enrollment_digest 32.
@@ -245,18 +260,23 @@ struct SideDataV2 {
     bytes32 identity{};              // xmr_identity_key(payee)
     u32     chain_id = 0;            // lane ChainId
     u16     give_author = 0;         // the receipt-carried give-author u16 (fee model S3; folded only under FeeModelGate)
-    u16     reserved = 0;            // must be 0
+    // RULES RATCHET: the BALLOT word (was `reserved`, always 0). own flag bit 15 |
+    // epoch_no bits 0..14: 0x0000 delegated abstain / no ballot, 0x8000 the miner
+    // said vote=0, 0x000n epoch n by delegation, 0x800n epoch n stated by the
+    // miner. Under rbind (the preimage is unchanged). Any u16 is well-formed; the
+    // binder writes it (R2), the tally reads it (R3); 0 here = today's receipt.
+    u16     ballot = 0;
 
     std::vector<u8> bytes() const {
         std::vector<u8> b; b.reserve(kSideV2Bytes);
         le::put64(b, t_lo); le::put64(b, t_hi); le::putb(b, identity);
-        le::put32(b, chain_id); le::put16(b, give_author); le::put16(b, reserved);
+        le::put32(b, chain_id); le::put16(b, give_author); le::put16(b, ballot);
         return b;
     }
     static SideDataV2 from(const u8* p) {
         SideDataV2 s;
         s.t_lo = le::get64(p); s.t_hi = le::get64(p + 8); s.identity = le::getb(p + 16);
-        s.chain_id = le::get32(p + 48); s.give_author = le::get16(p + 52); s.reserved = le::get16(p + 54);
+        s.chain_id = le::get32(p + 48); s.give_author = le::get16(p + 52); s.ballot = le::get16(p + 54);
         return s;
     }
     bool operator==(const SideDataV2&) const = default;
@@ -410,11 +430,12 @@ inline bool decode_receipts_frame(const std::vector<u8>& f, ReceiptsFrame& out, 
 // a tagged node refuses a tagless peer explicitly (a pre-POOL-ID build) -- the
 // pre-POOL-ID end refuses the 142-byte HELLO itself ("hello: wrong length").
 //
-// POOL-LINEAGE (operator ruling 2026-09-25): the pool's 32-byte genesis id
-// rides right after it (u8[32], HELLO 174 B). The block-level pool_tag every
-// lane coinbase commits is sha256d('V37PT2' || lane_tag || genesis || rules_digest)
-// (xmr_pool_tag.hpp), so two nodes with the same lane_tag but a different
-// genesis build DIFFERENT pools: refused as TAG_MISMATCH field=pool_genesis.
+// POOL-LINEAGE (operator ruling 2026-09-25) / RULES RATCHET R1 (2026-10-03):
+// the pool's 32-byte genesis rides right after it (u8[32], HELLO 174 B). The
+// pool_id every lane coinbase commits (V37P v2) is sha256d('V37PID' || network
+// || chain_id || genesis) (xmr_pool_tag.hpp), so two nodes with the same
+// lane_tag but a different genesis build DIFFERENT pools: refused as
+// TAG_MISMATCH field=pool_genesis.
 struct PoolId {
     bytes32 lane_tag{};
     u32     version = 0;              // V37.x consensus version folded into the tag
@@ -453,20 +474,35 @@ inline PoolId pool_id_of(u32 chain_id, const ::v37::LaneParams& p,
 //   4 = + DROPS-SET-PIN: a lane block's DROPS rows are composed from exactly
 //       the winner's pinned raindrop set (FB_BLOCK_WON v0x03); a v3 node books
 //       from its own node-local set and would split the owed ledger.
+//   5 = + RULES RATCHET R1 (operator rulings 2026-10-03; THE LAST flag day):
+//       pool identity from a derived genesis (V37GEN / V37PID), V37P v2 (45 B)
+//       at the fixed offset with rbind moved to [49..81), the side ballot word,
+//       V37Y / V37V in every owed_digest, settle-store schema 7 with GenesisRec
+//       v2, the HELLO epoch trailer, R-MIN. A v4 node is refused AT HELLO as
+//       TAG_MISMATCH field=version with the ratchet reason, both directions.
 inline constexpr u32 kXmrPoolRulesVersionDropsOff = 2;
 inline constexpr u32 kXmrPoolRulesVersionDropsV3  = 3;   // DROPS on, node-local raindrop set (pre DROPS-SET-PIN)
-inline constexpr u32 kXmrPoolRulesVersionDropsOn  = 4;
+inline constexpr u32 kXmrPoolRulesVersionDropsOn  = 4;   // DROPS-SET-PIN, pre-ratchet (pool_tag V37PT2, V37P v1 in the tail)
+inline constexpr u32 kXmrPoolRulesVersionRatchet  = 5;   // RULES RATCHET R1
 inline constexpr u32 kXmrPoolRulesVersion =
-    ::c2pool::v37n::kActivateConsensusV1 ? kXmrPoolRulesVersionDropsOn : kXmrPoolRulesVersionDropsOff;
+    ::c2pool::v37n::kActivateConsensusV1 ? kXmrPoolRulesVersionRatchet : kXmrPoolRulesVersionDropsOff;
 #define C2POOL_XMR_DROPS_DEFAULT_RULES 1   // feature probe: the v3 (DROPS default) pool rules exist
 // The explicit reason for a pool-rules version pair ("" = no special text).
 inline std::string pool_rules_reason(u32 ours, u32 theirs) {
-    if (ours == kXmrPoolRulesVersionDropsOn && theirs == kXmrPoolRulesVersionDropsOff)
+    // the DROPS-default line (v2 vs >= v3): the oldest difference, named first
+    if (ours >= kXmrPoolRulesVersionDropsV3 && theirs == kXmrPoolRulesVersionDropsOff)
         return ": the peer runs raindrops (DROPS) OFF -- an XMR build before XMR-DROPS-DEFAULT; raindrops are pool "
                "consensus (owed_digest), every node of a pool must run the same DROPS-default build -- upgrade it";
-    if (ours == kXmrPoolRulesVersionDropsOff && theirs == kXmrPoolRulesVersionDropsOn)
+    if (ours == kXmrPoolRulesVersionDropsOff && theirs >= kXmrPoolRulesVersionDropsV3)
         return ": the peer runs raindrops (DROPS) ON (the XMR-DROPS-DEFAULT build) and this node runs them OFF -- "
                "every node of a pool must run the same build";
+    // the RULES RATCHET flag day (v5 vs v3 / v4)
+    if (ours == kXmrPoolRulesVersionRatchet && theirs < kXmrPoolRulesVersionRatchet && theirs >= kXmrPoolRulesVersionDropsV3)
+        return ": the peer runs the pre-RATCHET pool rules (pool_tag in the V37C tail, rbind at 0x02[4..36), no epoch table); "
+               "this pool names itself by a derived genesis (V37PID) and its epoch (V37P v2 at 0x02[4..49)) -- the LAST flag day; upgrade it";
+    if (ours < kXmrPoolRulesVersionRatchet && ours >= kXmrPoolRulesVersionDropsV3 && theirs == kXmrPoolRulesVersionRatchet)
+        return ": the peer runs the RULES RATCHET build (pool identity from a derived genesis, V37P v2, epoch table) and this node "
+               "runs the pre-RATCHET rules -- every node of a pool must run the ratchet build; upgrade this node";
     if (ours == kXmrPoolRulesVersionDropsOn && theirs == kXmrPoolRulesVersionDropsV3)
         return ": the peer composes raindrop credit from its own node-local raindrop set (pool rules v3, before "
                "DROPS-SET-PIN) and would book a different DROPS delta -- upgrade it";
@@ -504,8 +540,19 @@ struct Hello {
     std::optional<bytes32> enrol_set; // ★ DROPS-ENROL-TIDY: enrol_set_digest (flip 1, needs pool->genesis; none = <= 174 B)
     // LANE-RULES: the node's lane-rules list (needs pool->genesis; none = a legacy-length HELLO)
     std::optional<::c2pool::v37n::xmr::lanerules::LaneRules> rules;
+    // RULES RATCHET R1: the epoch trailer (with `rules`; mandatory on a rules
+    // frame). epoch_cur = the sender's V37Y.epoch_no; epochs = its Deployment
+    // list (entry 1 = epoch 1, kind 0). An encoder given `rules` without any
+    // epochs sends the one-entry list {epoch 1 = rules_digest(rules)}.
+    u32 epoch_cur = 1;
+    std::vector<::c2pool::v37n::xmr::epoch::Deployment> epochs;
     bool operator==(const Hello&) const = default;
 };
+// The epoch list a HELLO sends: `epochs` as given, else the genesis entry of `rules`.
+inline std::vector<::c2pool::v37n::xmr::epoch::Deployment> hello_epochs_of(const Hello& h) {
+    if (!h.epochs.empty() || !h.rules) return h.epochs;
+    return {::c2pool::v37n::xmr::epoch::genesis_deployment(::c2pool::v37n::xmr::lanerules::rules_digest(*h.rules))};
+}
 
 inline std::vector<u8> encode_hello(const Hello& h) {
     std::vector<u8> f; f.reserve(kHelloBytesPoolGenesis);
@@ -516,13 +563,18 @@ inline std::vector<u8> encode_hello(const Hello& h) {
     if (h.pool) { le::putb(f, h.pool->lane_tag); le::put32(f, h.pool->version); le::put32(f, h.pool->authority); }
     if (h.pool && h.pool->genesis) le::putb(f, *h.pool->genesis);   // POOL-LINEAGE
     const bool enrol = kHelloEnrolSetLive && h.pool && h.pool->genesis && h.enrol_set;
-    if (h.pool && h.pool->genesis && h.rules) {   // LANE-RULES: flag | enrol? | u16 len | TLV
+    if (h.pool && h.pool->genesis && h.rules) {   // LANE-RULES: flag | enrol? | u16 len | TLV | RULES RATCHET: the epoch trailer
         const auto t = ::c2pool::v37n::xmr::lanerules::encode_tlv(*h.rules);
         if (t.size() > kHelloRulesMaxTlv) return {};
+        const auto eps = hello_epochs_of(h);
+        if (eps.empty() || eps.size() > kHelloEpochMaxEntries) return {};
         f.push_back(enrol ? 1 : 0);
         if (enrol) le::putb(f, *h.enrol_set);
         le::put16(f, static_cast<u16>(t.size()));
         f.insert(f.end(), t.begin(), t.end());
+        le::put32(f, h.epoch_cur);
+        f.push_back(static_cast<u8>(eps.size()));
+        for (const auto& d : eps) ::c2pool::v37n::xmr::epoch::put_deployment(f, d);
         return f;
     }
     if (enrol) le::putb(f, *h.enrol_set);   // ★ DROPS-ENROL-TIDY (flip 1)
@@ -552,7 +604,9 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
     h.pool.reset();
     h.enrol_set.reset();
     h.rules.reset();
-    if (rules_len) {   // LANE-RULES: the 174-byte frame | flag | enrol? | u16 len | TLV
+    h.epoch_cur = 1;
+    h.epochs.clear();
+    if (rules_len) {   // LANE-RULES: the 174-byte frame | flag | enrol? | u16 len | TLV | RULES RATCHET: u32 epoch_cur | u8 n | n x Deployment
         PoolId id;
         id.lane_tag = le::getb(p); p += 32;
         id.version = le::get32(p); p += 4;
@@ -567,17 +621,42 @@ inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = 
         }
         if (rest < 2) return bad("hello: rules length mismatch");
         const std::size_t n = le::get16(p); p += 2; rest -= 2;
-        if (n != rest || n > kHelloRulesMaxTlv) return bad("hello: rules length mismatch");
+        // RULES RATCHET: the TLV is followed by the epoch trailer (>= 66 B); a
+        // frame whose rest is exactly the TLV is a pre-ratchet rules frame.
+        if (n > kHelloRulesMaxTlv || rest < n + kHelloEpochTrailerMin) return bad("hello: rules length mismatch");
         ::c2pool::v37n::xmr::lanerules::LaneRules r;
         std::string rw;
         if (!::c2pool::v37n::xmr::lanerules::decode_tlv(p, n, r, &rw)) {
             if (why) *why = "hello: " + rw;
             return false;
         }
+        p += n; rest -= n;
         if (r.lane_params_digest != h.lane_params_digest)
             return bad("hello: rules lane_params_digest differs from the HELLO's own (an inconsistent peer)");
+        const u32 epoch_cur = le::get32(p); p += 4; rest -= 4;
+        const std::size_t ne = p[0]; p += 1; rest -= 1;
+        if (ne < 1 || ne > kHelloEpochMaxEntries) return bad("hello: epoch list count out of 1..64");
+        if (rest != ne * ::c2pool::v37n::xmr::epoch::kDeploymentBytes) return bad("hello: rules length mismatch");
+        std::vector<::c2pool::v37n::xmr::epoch::Deployment> eps;
+        eps.reserve(ne);
+        for (std::size_t i = 0; i < ne; ++i) { eps.push_back(::c2pool::v37n::xmr::epoch::get_deployment(p)); p += ::c2pool::v37n::xmr::epoch::kDeploymentBytes; }
+        if (const std::string er = ::c2pool::v37n::xmr::epoch::deployments_refusal(eps); !er.empty()) { if (why) *why = "hello: " + er; return false; }
+        const auto* cur = ::c2pool::v37n::xmr::epoch::find_deployment(eps, epoch_cur);
+        if (!cur) return bad("hello: epoch_cur is not an epoch of the list");
+        if (!(cur->rules_digest == ::c2pool::v37n::xmr::lanerules::rules_digest(r)))
+            return bad("hello: the rules TLV is not the rules of epoch_cur (its digest differs from the Deployment's)");
+        // R-MIN (spec sec. 7, point 3): a mainnet peer's rules must be constitutional.
+        if (h.network == 0) {
+            const bytes32 sink = ::c2pool::v37n::xmr::fee::donation_identity(::c2pool::v37n::xmr::fee::DonationNet::Mainnet);
+            if (const std::string rm = ::c2pool::v37n::xmr::lanerules::constitutional_check(0, r, &sink); !rm.empty()) {
+                if (why) *why = "hello: " + rm;
+                return false;
+            }
+        }
         h.pool = id;
         h.rules = std::move(r);
+        h.epoch_cur = epoch_cur;
+        h.epochs = std::move(eps);
         return true;
     }
     if (f.size() == kHelloBytesPoolId || f.size() == kHelloBytesPoolGenesis || f.size() == kHelloBytesEnrolSet) {
@@ -648,11 +727,48 @@ inline std::string enrol_mode_label(const std::optional<bytes32>& d) {
 // the lists still differ (an inconsistent peer), the rules refusal names it.
 using ::c2pool::v37n::xmr::lanerules::kLaneRulesMismatch;
 using ::c2pool::v37n::xmr::lanerules::is_lane_rules_mismatch;
+// RULES RATCHET (spec sec. 4.2, step 3): for every epoch_no in BOTH lists the
+// two Deployments must be byte-identical; else LANE_RULES_MISMATCH epoch=N
+// field=<first differing field> ours=.. theirs=... A peer that knows FEWER
+// epochs is accepted (a follower); one that knows MORE is accepted (we are
+// the follower; R3 adopts its extra entries for the tally). "" = compatible.
+inline std::string epochs_mismatch(const Hello& ours, const Hello& theirs) {
+    const auto a = hello_epochs_of(ours), b = hello_epochs_of(theirs);
+    if (a.empty() || b.empty()) return "";   // a legacy frame on either side: the TLV / length rules decide
+    for (const auto& x : a) {
+        const auto* y = ::c2pool::v37n::xmr::epoch::find_deployment(b, x.epoch_no);
+        if (!y || *y == x) continue;
+        const std::string head = std::string(kLaneRulesMismatch) + " epoch=" + std::to_string(x.epoch_no) + " field=";
+        if (!(x.rules_digest == y->rules_digest)) {
+            // The CURRENT epoch of both: the TLV diff names the parameter and both values
+            // (LANE_RULES_MISMATCH field=d_conf ours=60 theirs=61 ...); a list that differs
+            // only in the two HELLO digests (27/28) is left to the specific texts below.
+            if (ours.rules && theirs.rules && ours.epoch_cur == x.epoch_no && theirs.epoch_cur == x.epoch_no) {
+                const std::string t = ::c2pool::v37n::xmr::lanerules::lane_rules_mismatch(ours.rules, theirs.rules, true);
+                if (!t.empty()) return t;
+                continue;
+            }
+            return head + "rules_digest ours=" + hex32(x.rules_digest).substr(0, 16) + " theirs=" + hex32(y->rules_digest).substr(0, 16) +
+                   " (the two nodes define epoch " + std::to_string(x.epoch_no) + " with different lane rules: another pool)";
+        }
+        if (x.kind != y->kind) return head + "kind ours=" + std::to_string(x.kind) + " theirs=" + std::to_string(y->kind);
+        if (x.start_height != y->start_height) return head + "start ours=" + std::to_string(x.start_height) + " theirs=" + std::to_string(y->start_height);
+        if (x.timeout_height != y->timeout_height) return head + "timeout ours=" + std::to_string(x.timeout_height) + " theirs=" + std::to_string(y->timeout_height);
+        return head + "fixed ours=" + std::to_string(x.fixed_height) + " theirs=" + std::to_string(y->fixed_height);
+    }
+    return "";
+}
 inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
     if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
     if (auto t = pool_id_mismatch(ours, theirs); !t.empty()) return t;   // POOL-ID (subsumes chain_id when tagged)
-    if (auto t = ::c2pool::v37n::xmr::lanerules::lane_rules_mismatch(ours.rules, theirs.rules, true); !t.empty())
-        return t;                                                         // LANE-RULES
+    if (auto t = epochs_mismatch(ours, theirs); !t.empty()) return t;    // RULES RATCHET: the common Deployments, byte for byte
+    // LANE-RULES: the TLV is compared only when both run the same epoch (a peer
+    // on another current epoch is a follower or ahead; its TLV was compared
+    // through its Deployment's rules_digest above).
+    const bool same_epoch = !ours.rules || !theirs.rules || ours.epoch_cur == theirs.epoch_cur;
+    if (same_epoch)
+        if (auto t = ::c2pool::v37n::xmr::lanerules::lane_rules_mismatch(ours.rules, theirs.rules, true); !t.empty())
+            return t;                                                     // LANE-RULES
     if (theirs.chain_id != ours.chain_id) return "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id);
     if (theirs.share_diff != ours.share_diff)
         return "share_diff " + std::to_string(theirs.share_diff) + " != ours " + std::to_string(ours.share_diff) + " (R-1 pin)";
@@ -675,8 +791,9 @@ inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
                    " (every node of a pool must run the identical --drops-enrol list / mode)";
         return "lane_params_digest differs (different LaneParams geometry/gates: DROPS subthreshold / fee model / share weight)";
     }
-    if (auto t = ::c2pool::v37n::xmr::lanerules::lane_rules_mismatch(ours.rules, theirs.rules); !t.empty())
-        return t;                                                         // LANE-RULES: fields 27/28 alone
+    if (same_epoch)
+        if (auto t = ::c2pool::v37n::xmr::lanerules::lane_rules_mismatch(ours.rules, theirs.rules); !t.empty())
+            return t;                                                     // LANE-RULES: fields 27/28 alone
     if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";
     return "";
 }

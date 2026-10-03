@@ -141,7 +141,7 @@ rc::LaneInputs lane_inputs() {
     li.chain_id = kChain; li.h_min = 0; li.owed_cap = 2700; li.wire_cap = 2700;
     li.residual_sink = fee::donation_ref(kNet); li.residual_sink_identity = fee::donation_identity(kNet);
     li.fixed = {fee::donation_marker(kNet)};
-    li.pool_tag = the_tag();
+    li.pool_field = cr::PoolField{the_tag(), 1, 1};   // RULES RATCHET: the V37P v2 head (epoch 1 of 1)
     li.spend_floor = true; li.commit_total = true;
     li.drain = o2::DrainRule{1, 16, 64};
     return li;
@@ -163,7 +163,7 @@ Built build_block(const st::OwedLedger& L, const World& w, std::uint32_t extra_n
     ctx.fixed = {fee::donation_marker(kNet)};
     ctx.h_min = 0; ctx.output_cap = 2700;
     ctx.has_credit_cut = true; ctx.credit_cut = the_cut();
-    ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
+    ctx.has_pool_field = true; ctx.pool_field = cr::PoolField{the_tag(), 1, 1};   // RULES RATCHET: the V37P v2 head
     ctx.has_paynow = true; ctx.paynow_payees = weighted(w.cut);
     ctx.spend_floor = true; ctx.drain = o2::DrainRule{1, 16, 64};
     std::string why;
@@ -171,7 +171,7 @@ Built build_block(const st::OwedLedger& L, const World& w, std::uint32_t extra_n
     if (!src) { out.why = "source: " + why; return out; }
     asm_::AssemblyInputs a;
     a.miner = md; a.mempool = mempool; a.reward_total_field = true;
-    a.settle = o2::assembly_settle_inputs(*src, true); a.extra_nonce_tail = src->extra_nonce_tail();
+    a.settle = o2::assembly_settle_inputs(*src, true); a.extra_nonce_tail = src->extra_nonce_tail(); a.extra_nonce_head = src->extra_nonce_head();   // RULES RATCHET: the V37P v2 head
     a.extra_nonce_bind_size = 32;
     a.extra_nonce_bind = [](std::uint32_t en, std::uint8_t* b) { for (int i = 0; i < 32; ++i) b[i] = static_cast<std::uint8_t>(en * 13 + i); return true; };
     auto t = asm_::XmrBlockAssembler::build(a, &why);
@@ -179,7 +179,7 @@ Built build_block(const st::OwedLedger& L, const World& w, std::uint32_t extra_n
     for (int pass = 0; src->drain_on() && t->reward() != src->reward_hint() && pass < 4; ++pass) {
         src = o2::XmrOwedSettlementSource::build(L, w.pay_of(), ctx, t->reward(), &why);
         if (!src) { out.why = "source (fixpoint): " + why; return out; }
-        a.settle = o2::assembly_settle_inputs(*src, true); a.extra_nonce_tail = src->extra_nonce_tail();
+        a.settle = o2::assembly_settle_inputs(*src, true); a.extra_nonce_tail = src->extra_nonce_tail(); a.extra_nonce_head = src->extra_nonce_head();   // RULES RATCHET: the V37P v2 head
         t = asm_::XmrBlockAssembler::build(a, &why);
         if (!t) { out.why = "assembler (fixpoint): " + why; return out; }
     }

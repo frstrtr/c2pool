@@ -30,6 +30,7 @@
 // ===========================================================================
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -54,6 +55,9 @@
 #include "xmr_node_config.hpp"
 #include "xmr_settle_store.hpp"
 #include "xmr_finalize_driver.hpp"
+#include "xmr_pool_tag.hpp"                           // RULES RATCHET: PoolIdentity (the GenesisRec v2 binding)
+#include "xmr_epoch.hpp"                              // RULES RATCHET: Deployment, the epoch table
+#include <c2pool/v37/w6_persistence.hpp>             // RULES RATCHET: GenesisRec v2 codec (persist::encode_genesis_v2)
 
 namespace c2pool::v37n::xmr {
 
@@ -415,6 +419,43 @@ public:
         m_store = std::make_unique<FileSettleStore>(dbdir);
         log("store: opened " + dbdir);
 
+        // 2b) RULES RATCHET R1: the store is bound to ONE pool (GenesisRec v2).
+        if (m_identity) {
+            namespace persist = ::c2pool::v37n::persist;
+            namespace ep = ::c2pool::v37n::xmr::epoch;
+            const std::string key = store_codec::k_genesis(m_cfg.lane_chain);
+            const auto stored = m_store->get(key);
+            const std::uint32_t knows_max = m_deployments.empty() ? ep::kGenesisEpoch : ep::epoch_max_of(m_deployments);
+            if (const std::string r = genesis_open_refusal(stored, *m_identity, knows_max); !r.empty())
+                throw std::runtime_error("XmrNode: " + r + " -- refusing to start");
+            persist::GenesisRecV2 g;
+            if (stored) { if (auto old = persist::decode_genesis_v2(*stored)) g = *old; }
+            g.params.window = m_cfg.lane_params.window; g.params.c0 = m_cfg.lane_params.c0; g.params.rollup = m_cfg.lane_params.rollup;
+            g.params.half_life = m_cfg.lane_params.half_life; g.params.level_caps = m_cfg.lane_params.level_caps;
+            g.params.journal_depth = m_cfg.lane_params.journal_depth;
+            if (!stored) g.ts = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count());
+            g.pool_id = m_identity->pool_id; g.network = m_identity->network; g.chain_id = m_identity->chain_id;
+            g.pool_genesis = m_identity->pool_genesis;
+            g.genesis_form = static_cast<std::uint8_t>(m_identity->form);
+            g.H = m_identity->spec.height; g.block_hash = m_identity->spec.block_hash; g.headline = m_identity->spec.headline;
+            g.epochs.clear();   // the list is REWRITTEN with this build's table at every start (data, not consensus)
+            for (const auto& dep : m_deployments) {
+                persist::GenesisDeploymentRec d;
+                d.epoch_no = dep.epoch_no; d.rules_digest = dep.rules_digest; d.kind = dep.kind;
+                d.start = dep.start_height; d.timeout = dep.timeout_height; d.fixed = dep.fixed_height;
+                g.epochs.push_back(d);
+            }
+            auto b = m_store->batch();
+            b->put(key, persist::encode_genesis_v2(g));
+            if (!b->commit_sync()) throw std::runtime_error("XmrNode: the genesis record could not be written -- refusing to start");
+            static const char* hd = "0123456789abcdef";
+            std::string pid;
+            for (int i = 0; i < 8; ++i) { pid.push_back(hd[m_identity->pool_id[i] >> 4]); pid.push_back(hd[m_identity->pool_id[i] & 15]); }
+            log(std::string("genesis: ") + (stored ? "record checked (same pool), " : "record written, ") +
+                "pool_id=" + pid + "... epochs=" + std::to_string(g.epochs.size()) + " knows<=" + std::to_string(knows_max));
+        }
+
         // 3) RecoveryDriver BEFORE engine.start() — rebuild ledger + hw + cursor.
         {
             bool ok = false;
@@ -545,6 +586,61 @@ public:
     std::uint64_t relineages() const noexcept { return m_relineages; }
     ISettleStore& store() { return *m_store; }
     std::string   store_dir() const { return XmrNodeConfig_resolved(m_cfg); }
+
+    // ── RULES RATCHET R1 (spec sec. 3.1 / 3.5) ─────────────────────────────
+    // The epoch table the ledger runs: epoch 1 = this node's lane rules, ACTIVE
+    // from H_act 0, so every owed_digest commits V37Y / V37V from the first one.
+    // Call BEFORE bring_up() (the replay computes digests).
+    void set_epoch_table(::c2pool::v37n::settle::LedgerEpochTable t) {
+        m_ledger = OwedLedger(m_cfg.lane_chain, std::move(t));
+    }
+    // The pool identity and the build's deployment list: bring_up() binds them to
+    // the store (GenesisRec v2) -- a store of another pool, a raw genesis on
+    // mainnet, a pre-R1 (v1 / absent-codec) record or an epoch this build lacks
+    // refuses the open; the list is REWRITTEN at every start (data, not consensus).
+    // Call BEFORE bring_up(). Without it (KAT rigs, tools) no genesis record is
+    // kept or checked.
+    void set_pool_identity(const ::c2pool::v37n::xmr::lineage::PoolIdentity& id,
+                           std::vector<::c2pool::v37n::xmr::epoch::Deployment> deployments) {
+        m_identity = id;
+        m_deployments = std::move(deployments);
+    }
+    const std::optional<::c2pool::v37n::xmr::lineage::PoolIdentity>& pool_identity() const { return m_identity; }
+    // The genesis record as the store holds it (nullopt: none / not a v2 record).
+    std::optional<::c2pool::v37n::persist::GenesisRecV2> genesis_record() {
+        if (!m_store) return std::nullopt;
+        const auto v = m_store->get(store_codec::k_genesis(m_cfg.lane_chain));
+        if (!v) return std::nullopt;
+        return ::c2pool::v37n::persist::decode_genesis_v2(*v);
+    }
+    // The pure open rule over a store's genesis value (nullopt = no record yet).
+    // "" = open; else the refusal text. `knows_max` = this build's highest epoch.
+    static std::string genesis_open_refusal(const std::optional<std::string>& stored,
+                                            const ::c2pool::v37n::xmr::lineage::PoolIdentity& id,
+                                            std::uint32_t knows_max) {
+        namespace persist = ::c2pool::v37n::persist;
+        namespace lineage = ::c2pool::v37n::xmr::lineage;
+        static const char* d = "0123456789abcdef";
+        auto hx = [&](const ::v37::bytes32& b) { std::string s; for (std::uint8_t x : b) { s.push_back(d[x >> 4]); s.push_back(d[x & 15]); } return s; };
+        if (!stored) return {};
+        const auto g = persist::decode_genesis_v2(*stored);
+        if (!g) return "settle-store: the genesis record is not a GenesisRec v2 (a pre-R1 store or a torn record): the attempt-11 "
+                       "genesis is fresh, there is no migration -- start this pool on a new --data-dir";
+        if (!(g->pool_id == id.pool_id))
+            return "settle-store: store belongs to pool " + hx(g->pool_id) + ", this node is " + hx(id.pool_id) +
+                   " (pool genesis " + hx(g->pool_genesis) + " vs " + hx(id.pool_genesis) + ")";
+        if (g->network != id.network || g->chain_id != id.chain_id)
+            return "settle-store: the genesis record names network " + std::to_string(g->network) + " chain " + std::to_string(g->chain_id) +
+                   ", this node runs network " + std::to_string(id.network) + " chain " + std::to_string(id.chain_id);
+        if (g->genesis_form == static_cast<std::uint8_t>(lineage::GenesisForm::Raw) && id.network == 0)
+            return "settle-store: the store was created with a RAW pool genesis and this is mainnet: " +
+                   std::string(lineage::raw_genesis_refusal(0));
+        for (const auto& e : g->epochs)
+            if (e.epoch_no > knows_max)
+                return "settle-store: the genesis record lists epoch " + std::to_string(e.epoch_no) + "; this build knows <= " +
+                       std::to_string(knows_max) + "; upgrade";
+        return {};
+    }
 
     // Teardown in donor order: network first, then drain-and-join the engine.
     void stop() {
@@ -1027,6 +1123,8 @@ private:
     ::v37::xmr::xmr_point_check_fn         m_injected_point_check;
 
     std::unique_ptr<ISettleStore>          m_store;
+    std::optional<::c2pool::v37n::xmr::lineage::PoolIdentity> m_identity;          // RULES RATCHET: the GenesisRec v2 binding
+    std::vector<::c2pool::v37n::xmr::epoch::Deployment>       m_deployments;       // RULES RATCHET: this build's table
     OwedLedger                             m_ledger;
     SettleHW                               m_hw;
     RecoveredState                         m_recovered;

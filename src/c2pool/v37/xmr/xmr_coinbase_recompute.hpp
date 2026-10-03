@@ -42,7 +42,8 @@
 //               the same way on a node that never saw its raindrop.
 //   lane cfg    chain id, owed floor, owed-selection cap, the residual sink
 //               and fixed outputs (fee model v1: the protocol donation output,
-//               compiled in), the pool tag. Identical on every node of a lane.
+//               compiled in), the pool id and the epoch in force. Identical on
+//               every node of a lane.
 //   the block   height, prev_id, major version, the exact-sum total, the
 //               credit cut (V37C), the pay-now payees projected from the view
 //               at that cut (the SAME view fold_eb books), the committed owed
@@ -113,7 +114,8 @@ struct LaneInputs {
     ::v37::ScriptRef residual_sink;             // fee model v1: the donation ref
     ::v37::bytes32   residual_sink_identity{};
     std::vector<x6::FixedOutput> fixed;         // fee model v1: {donation_marker}
-    std::optional<::v37::bytes32> pool_tag;     // V37P (POOL-LINEAGE)
+    std::optional<credit::PoolField> pool_field;   // RULES RATCHET: the V37P v2 head this lane writes (pool_id, epoch_cur, epoch_max)
+    std::uint32_t    epoch_cur = 1;              // RULES RATCHET: epoch_of(h) of the ledger at the booking (R1: 1; R3 picks it per height)
     o2::KFairSource  kfair = o2::KFairSource::W4Propose;
     bool             kfair_salted_ties = false;  // #1867: equal-age cohorts by a hash of the parent id
     bool             spend_floor = false;        // payout-threshold.md §2-§3: c from the block's own total
@@ -323,7 +325,29 @@ canonical_source(const CoinbaseClaim& cl, const OwedLedger& ledger, const o2::Pa
     ctx.drain                = lane.drain;               // THE DRAIN RULE: Delta from (ledger, total, height)
     ctx.has_credit_cut       = cl.has_credit_cut;
     ctx.credit_cut           = cl.credit_cut;
-    if (lane.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *lane.pool_tag; }
+    if (lane.pool_field) { ctx.has_pool_field = true; ctx.pool_field = *lane.pool_field; }
+    // RULES RATCHET (spec sec. 1.4): the head field of the claim must name THIS
+    // pool and the epoch of its height. A block of my pool built under another
+    // epoch_cur is "misbuilt": recomputed anyway, Mismatch -> debit-only (the
+    // caller alarms); a malformed field or a foreign pool_id never reaches the
+    // recompute on the chain path (the authority's lineage gate), but a share
+    // can carry anything, so both are refused here as well.
+    if (lane.pool_field) {
+        credit::PoolField pf;
+        const credit::PoolFieldParse st = credit::parse_pool_field_payload(cl.payload, &pf);
+        if (st == credit::PoolFieldParse::Absent) { mismatch = "no V37P pool field at 0x02[4..49)"; return nullptr; }
+        if (st == credit::PoolFieldParse::Malformed) { mismatch = "malformed V37P pool field (not version 2)"; return nullptr; }
+        if (!(pf.pool_id == lane.pool_field->pool_id)) { mismatch = "V37P pool_id is another pool's"; return nullptr; }
+        if (pf.epoch_max < pf.epoch_cur) {
+            mismatch = "V37P epoch_max " + std::to_string(pf.epoch_max) + " < epoch_cur " + std::to_string(pf.epoch_cur);
+            return nullptr;
+        }
+        if (pf.epoch_cur != lane.epoch_cur) {
+            mismatch = "misbuilt: V37P epoch_cur " + std::to_string(pf.epoch_cur) + " != epoch_of(h) " + std::to_string(lane.epoch_cur) +
+                       " (a block of this pool built under another epoch)";
+            return nullptr;
+        }
+    }
     ctx.has_paynow           = ctx.has_credit_cut && cut.has_view;
     if (ctx.has_paynow) ctx.paynow_payees = cut.payees;
 

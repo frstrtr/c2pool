@@ -113,12 +113,16 @@ inline constexpr std::size_t CREDIT_CUT_TAIL_BYTES = 44;  // 4 magic + 8 u64 P +
 // fee::kDonationOwedTailBytes == 12, "V37D" || u64le; mirrored and
 // static_asserted in v37_xmr_fee_model_kat). Present only under the gate.
 inline constexpr std::size_t DONATION_OWED_TAIL_BYTES = 12;  // 4 magic + 8 u64 owed_in
-// POOL-LINEAGE: the V37C tail's versioned pool-tag field ("V37P" | u8 ver |
-// b32 pool_tag, consumer tree xmr_credit_cut.hpp credit::kPoolTagFieldBytes;
-// static_asserted in v37_xmr_pool_lineage_kat), just before the credit cut.
-// With it the 0x02 payload can exceed 127 B (rbind + V37D + V37P + V37C), so
-// the length is a TWO-byte varint there: the probe below reads it as a varint.
-inline constexpr std::size_t POOL_TAG_FIELD_BYTES = 37;      // 4 magic + 1 version + 32 pool_tag
+// RULES RATCHET R1 (operator rulings 2026-10-03): the pool-identity field
+// "V37P" | u8 2 | b32 pool_id | u32 epoch_cur | u32 epoch_max (45 B, consumer
+// tree xmr_credit_cut.hpp credit::kPoolFieldBytes; static_asserted in
+// v37_xmr_pool_lineage_kat) rides FIRST in the 0x02 payload, right after the
+// 4-byte worker nonce and before the per-job rbind (the template's
+// extra_nonce_head seam), so every reader finds it at the fixed offset [4..49).
+// With it the 0x02 payload can exceed 127 B, so the length is a TWO-byte
+// varint there: the probe below reads it as a varint.
+inline constexpr std::size_t POOL_FIELD_BYTES = 45;          // 4 magic + 1 version + 32 pool_id + 4 epoch_cur + 4 epoch_max
+inline constexpr std::size_t POOL_TAG_FIELD_BYTES = POOL_FIELD_BYTES;   // the former name (the 37-byte v1 field is retired)
 // SAME-BLOCK PAY-NOW: the committed base B rides first ("V37N" || u64le,
 // consumer tree c2pool/v37/xmr/xmr_paynow.hpp paynow::kPayNowTailBytes == 12,
 // static_asserted in v37_xmr_paynow_kat). Present only when pay-now is armed.
@@ -127,15 +131,24 @@ inline constexpr std::size_t PAYNOW_TAIL_BYTES = 12;  // 4 magic + 8 u64 base
 // committed finder payee rides right before V37N ("V37F" || u8 kind ||
 // payee[64], consumer tree xmr_paynow.hpp paynow::kFinderFieldBytes == 69,
 // static_asserted in v37_xmr_empty_cut_finder_kat). The widest payload is
-// then 14 + 32 + 69 + 12 + 12 + 37 + 44 = 220 B (<= 255, two-byte varint).
+// then 4 + 45 + 32 + 10 + 69 + 12 + 12 + 44 = 228 B (<= 255, two-byte varint).
 inline constexpr std::size_t FINDER_FIELD_BYTES = 69;  // 4 magic + 1 kind + 64 payee
 // REWARD TOTAL (share-level canonical coinbase): "V37R" || u64le(total) FIRST
 // in the tail (consumer tree xmr_paynow.hpp paynow::kRewardTotalFieldBytes ==
 // 12, static_asserted in v37_xmr_share_verdict_kat). Written by the seam from
 // the FINAL adopted budget, so a receipt's open tx_extra carries the total its
-// hidden outputs sum to. Widest payload: 220 + 12 = 232 B (<= 255).
+// hidden outputs sum to. Widest payload: 228 + 12 = 240 B (<= 255).
 inline constexpr std::size_t REWARD_TOTAL_FIELD_BYTES = 12;  // 4 magic + 8 u64 total
 inline constexpr unsigned char REWARD_TOTAL_MAGIC[4] = {'V', '3', '7', 'R'};
+// RULES RATCHET (C6): the widest 0x02 payload the seam can write must fit
+// Monero's TX_EXTRA_NONCE_MAX_COUNT (255): nonce 4 + V37P 45 + rbind 32 + pad 10
+// + V37R 12 + V37F 69 + V37N 12 + V37D 12 + V37C 44 = 240 B. 15 B of headroom for
+// future epoch-able fields between V37P and V37C.
+inline constexpr std::size_t WIDEST_EXTRA_NONCE_PAYLOAD_BYTES =
+    EXTRA_NONCE_MAX_SIZE + POOL_FIELD_BYTES + EXTRA_NONCE_BIND_MAX + REWARD_TOTAL_FIELD_BYTES + FINDER_FIELD_BYTES +
+    PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + CREDIT_CUT_TAIL_BYTES;
+static_assert(WIDEST_EXTRA_NONCE_PAYLOAD_BYTES == 240, "the widest 0x02 payload is 240 B");
+static_assert(WIDEST_EXTRA_NONCE_PAYLOAD_BYTES <= 255, "the 0x02 payload must fit Monero's TX_EXTRA_NONCE_MAX_COUNT (255)");
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -334,6 +347,9 @@ public:
 
     // recon(A+B credit): the on-chain credit cut tail the template appends to the 0x02 payload.
     void set_extra_nonce_tail(std::vector<std::uint8_t> t) { m_tail = std::move(t); }
+    // RULES RATCHET: the per-template head (the V37P v2 pool field) right after the nonce.
+    void set_extra_nonce_head(std::vector<std::uint8_t> h) { m_head = std::move(h); }
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_head() const override { return m_head; }
     // REWARD TOTAL: prefix the tail with "V37R" || u64le(budget). The template
     // re-reads the tail on every create_miner_tx, and the budget it reads on the
     // final call is the adopted final reward (split_reward runs first).
@@ -359,6 +375,7 @@ public:
 private:
     X6SettlementSource() = default;
     std::vector<std::uint8_t> m_tail;   // recon(A+B credit)
+    std::vector<std::uint8_t> m_head;   // RULES RATCHET: the V37P v2 pool field (constant per template)
     bool             m_total_field = false;   // REWARD TOTAL ("V37R" first in the tail)
     std::size_t      m_bind_size = 0;   // SEAM-1
     ExtraNonceBindFn m_bind;            // SEAM-1
@@ -400,7 +417,7 @@ struct BlockBytes {
     std::size_t nonce_offset = 0;            // 4-B header nonce, same offset in BOTH blobs (39 for v16 / 5-B timestamp varint)
     std::size_t miner_tx_offset = 0;         // == header size
     std::size_t extra_nonce_offset = 0;      // in full_blob: first byte of the 0x02 payload
-    std::size_t extra_nonce_size = 0;        // 4..14 (padded) [+32 SEAM-1 rbind] [+12 V37D] [+37 V37P pool tag] [+44 credit-cut tail]
+    std::size_t extra_nonce_size = 0;        // 4..14 (padded) [+45 V37P v2 head] [+32 SEAM-1 rbind] [+12 V37R] [+69 V37F] [+12 V37N] [+12 V37D] [+44 credit-cut tail]
     std::size_t merkle_root_offset = 0;      // in full_blob: the 32-B root inside the 0x03 tag
     std::size_t miner_tx_size = 0;           // incl. trailing rct_type byte
     ::xmr::coin::Hash256 merkle_root{};      // MM commitment root patched at merkle_root_offset (== X6 mm_root)
@@ -682,6 +699,10 @@ struct AssemblyInputs {
     // recon(A+B credit): bytes appended to the 0x02 payload after the padded worker
     // nonce (the on-chain credit cut). Empty => byte-identical templates.
     std::vector<std::uint8_t>     extra_nonce_tail;
+    // RULES RATCHET R1: the per-TEMPLATE head written right after the 4-byte worker
+    // nonce and before the per-job binding (the V37P v2 pool field, 45 B). Empty
+    // => byte-identical templates. Size <= EXTRA_NONCE_HEAD_MAX.
+    std::vector<std::uint8_t>     extra_nonce_head;
     // REWARD TOTAL: the seam writes "V37R" || u64le(final reward) before
     // extra_nonce_tail (share-level canonical coinbase; fee model v1 lanes).
     bool                          reward_total_field = false;
@@ -785,6 +806,10 @@ public:
             if (a.extra_nonce_bind_size > EXTRA_NONCE_BIND_MAX)
                 return fail("SEAM-1: extra_nonce_bind_size " + std::to_string(a.extra_nonce_bind_size) +
                             " > EXTRA_NONCE_BIND_MAX " + std::to_string(EXTRA_NONCE_BIND_MAX));
+            if (a.extra_nonce_head.size() > EXTRA_NONCE_HEAD_MAX)
+                return fail("RULES RATCHET: extra_nonce_head " + std::to_string(a.extra_nonce_head.size()) +
+                            " B > EXTRA_NONCE_HEAD_MAX " + std::to_string(EXTRA_NONCE_HEAD_MAX));
+            seam->set_extra_nonce_head(a.extra_nonce_head);                              // RULES RATCHET: the V37P v2 head
             seam->set_extra_nonce_bind(a.extra_nonce_bind_size, a.extra_nonce_bind);   // SEAM-1
 
             std::unique_ptr<XmrBlockTemplate> tpl(new XmrBlockTemplate(seam.get()));
@@ -852,7 +877,7 @@ private:
         const std::vector<std::uint8_t> full = rec.m_tpl->get_block_template_blob(rec.m_internal_tid, 0, no, eo, ro, root);
         const std::size_t header = no + NONCE_SIZE;
         // 0x02 tag layout: 02 | varint(len) | payload. len < 0x80 is one byte;
-        // POOL-LINEAGE: with rbind + V37D + V37P + V37C it can reach 0x80..0xff
+        // with the V37P v2 head + rbind + the tail fields it reaches 0x80..0xff
         // (two bytes: lo|0x80, 0x01).
         if (eo < 2 || eo > full.size()) {
             if (why) *why = "internal: extra-nonce tag layout";
@@ -866,8 +891,8 @@ private:
             if (why) *why = "internal: extra-nonce tag layout";
             return false;
         }
-        // The widest 0x02 payload the seam writes: padded nonce 14 + rbind 32 + V37R 12 +
-        // V37F 69 + V37N 12 + V37D 12 + V37P 37 + V37C 44 = 232 B (<= 255, two-byte varint).
+        // The widest 0x02 payload the seam writes: padded nonce 14 + V37P 45 + rbind 32 + V37R 12 +
+        // V37F 69 + V37N 12 + V37D 12 + V37C 44 = 240 B (<= 255, two-byte varint; WIDEST_EXTRA_NONCE_PAYLOAD_BYTES).
         // REWARD TOTAL was missing from this bound: a per-job EMPTY-CUT FINDER variant
         // (V37F + V37N) under --relay-bind rbind with the V37R total is 232 B and this
         // self-check refused it as "out of range"; the provider then served the DEFAULT
@@ -875,7 +900,7 @@ private:
         // attempts 7 and 8 paid R - Delta to the donation instead of their finder
         // (v37_xmr_empty_cut_finder_kat E9). Receivers parse the length as a varint <= 255.
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + REWARD_TOTAL_FIELD_BYTES + FINDER_FIELD_BYTES + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; empty-cut finder: +69 V37F; REWARD TOTAL: +12 V37R
+            rec.m_extra_nonce_size > WIDEST_EXTRA_NONCE_PAYLOAD_BYTES) {   // 240: nonce 14 + V37P 45 + rbind 32 + V37R 12 + V37F 69 + V37N 12 + V37D 12 + V37C 44
             if (why) *why = "internal: extra-nonce size out of range (" + std::to_string(rec.m_extra_nonce_size) + " B)";
             return false;
         }

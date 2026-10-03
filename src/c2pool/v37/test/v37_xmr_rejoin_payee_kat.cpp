@@ -164,8 +164,8 @@ struct Winner {
         scfg.set_residual_sink_std(point_of(4), point_of(2));
         scfg.credit_cut_source = [](std::uint64_t& P, ::v37::bytes32& dg) {
             const credit::CreditCut c = fixture_cut(); P = c.next_pos; dg = c.spine_digest; return true; };
-        tag = lineage::pool_tag_for(LANE_CHAIN, ::v37::LaneParams{}, b32(0xA0), c2pool::v37n::xmr::lanerules::rules_digest(c2pool::v37n::xmr::lanerules::LaneRules{}));
-        scfg.pool_tag = tag;
+        tag = lineage::pool_id(3, LANE_CHAIN, b32(0xA0));   // RULES RATCHET: the pool_id (V37PID of a raw regtest genesis)
+        scfg.pool_field = credit::PoolField{tag, 1, 1};
         const auto w = wp;
         scfg.paynow_source = [w](std::uint64_t, const ::v37::bytes32&, std::vector<st::WeightedPayee>& out) { out = w; return !out.empty(); };
         if (!src.poll(&why)) { why = "daemon arm did not parse the capture: " + why; return; }

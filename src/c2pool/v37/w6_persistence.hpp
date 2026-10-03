@@ -224,6 +224,25 @@ struct CarrierRec { u64 boot_id = 0, incarnation = 0, lane_version_after = 0, ne
                     bytes32 digest_after{}; std::uint8_t accepted_mask = 0; u64 w_raw_carrier = 0;
                     std::vector<u64> w_raw_receipt; };
 struct GenesisRec { bytes32 first_share_hash{}; LaneParamsRec params; u64 ts = 0; };
+// RULES RATCHET R1 (spec sec. 3.5): GenesisRec v2 -- the pool identity, the
+// genesis inputs and the epoch list, bound to the store. Its OWN version byte
+// (2) leads the record (the shared SCHEMA_VER stays 1 for every other record,
+// so the BTC / DASH stores keep decoding); a v1 record is refused by the XMR
+// node at open (the attempt-11 genesis is fresh: no migration).
+//   u8 ver = 2 | u8 kind (K_GENESIS) | b32 first_share_hash | LaneParamsRec | u64 ts
+//   | b32 pool_id | u8 network | u32 chain_id | b32 pool_genesis
+//   | u8 genesis_form (1 derived | 2 raw) | u64 H | b32 block_hash | u8 len | headline[len]   (raw: H 0, hash 0, len 0)
+//   | u8 n_epochs | n x ( u32 epoch_no | b32 rules_digest | u8 kind | u64 start | u64 timeout | u64 fixed )
+constexpr std::uint8_t GENESIS_V2 = 2;
+struct GenesisDeploymentRec { std::uint32_t epoch_no = 1; bytes32 rules_digest{}; std::uint8_t kind = 0; u64 start = 0, timeout = 0, fixed = 0;
+                              bool operator==(const GenesisDeploymentRec&) const = default; };
+struct GenesisRecV2 {
+    bytes32 first_share_hash{}; LaneParamsRec params; u64 ts = 0;
+    bytes32 pool_id{}; std::uint8_t network = 3; std::uint32_t chain_id = 0; bytes32 pool_genesis{};
+    std::uint8_t genesis_form = 2; u64 H = 0; bytes32 block_hash{}; std::string headline;
+    std::vector<GenesisDeploymentRec> epochs;
+    bool operator==(const GenesisRecV2&) const = default;
+};
 struct TipRec     { bytes32 share_hash{}; u64 next_pos = 0; u64 boot_id = 0; };
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -388,6 +407,52 @@ inline std::optional<GenesisRec> decode_genesis(const std::string& v) {
     g.params.level_caps.clear();
     for (std::uint32_t i = 0; i < n; ++i) { u64 cap = r.u64v(); if (!r.ok) return std::nullopt; g.params.level_caps.push_back(cap); }
     g.params.journal_depth = r.u64v(); g.ts = r.u64v();
+    if (!r.done()) return std::nullopt; return g;
+}
+
+// ── genesis v2 (RULES RATCHET R1): pool identity + genesis inputs + the epoch list ──
+inline std::string encode_genesis_v2(const GenesisRecV2& g) {
+    Writer w; w.u8(GENESIS_V2); w.u8(K_GENESIS); w.b32(g.first_share_hash);
+    w.u64v(g.params.window); w.u64v(g.params.c0); w.u64v(g.params.rollup); w.u64v(g.params.half_life);
+    w.u32(static_cast<std::uint32_t>(g.params.level_caps.size()));
+    for (u64 cap : g.params.level_caps) w.u64v(cap);
+    w.u64v(g.params.journal_depth); w.u64v(g.ts);
+    w.b32(g.pool_id); w.u8(g.network); w.u32(g.chain_id); w.b32(g.pool_genesis);
+    w.u8(g.genesis_form); w.u64v(g.H); w.b32(g.block_hash);
+    const std::size_t hl = g.headline.size() > 255 ? 255 : g.headline.size();
+    w.u8(static_cast<std::uint8_t>(hl)); w.s.append(g.headline, 0, hl);
+    const std::size_t n = g.epochs.size() > 255 ? 255 : g.epochs.size();
+    w.u8(static_cast<std::uint8_t>(n));
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& d = g.epochs[i];
+        w.u32(d.epoch_no); w.b32(d.rules_digest); w.u8(d.kind); w.u64v(d.start); w.u64v(d.timeout); w.u64v(d.fixed);
+    }
+    return w.s;
+}
+// nullopt: not a v2 genesis record (a v1 record, another kind, a torn record).
+inline std::optional<GenesisRecV2> decode_genesis_v2(const std::string& v) {
+    Reader r(v);
+    const std::uint8_t ver = r.u8(); const std::uint8_t kind = r.u8();
+    if (!r.ok || ver != GENESIS_V2 || kind != K_GENESIS) return std::nullopt;
+    GenesisRecV2 g; g.first_share_hash = r.b32();
+    g.params.window = r.u64v(); g.params.c0 = r.u64v(); g.params.rollup = r.u64v(); g.params.half_life = r.u64v();
+    std::uint32_t n = r.u32(); if (!r.ok) return std::nullopt;
+    if (n > 64 || n > (v.size() - r.o) / 8) return std::nullopt;
+    g.params.level_caps.clear();
+    for (std::uint32_t i = 0; i < n; ++i) { u64 cap = r.u64v(); if (!r.ok) return std::nullopt; g.params.level_caps.push_back(cap); }
+    g.params.journal_depth = r.u64v(); g.ts = r.u64v();
+    g.pool_id = r.b32(); g.network = r.u8(); g.chain_id = r.u32(); g.pool_genesis = r.b32();
+    g.genesis_form = r.u8(); g.H = r.u64v(); g.block_hash = r.b32();
+    const std::uint8_t hl = r.u8(); if (!r.ok) return std::nullopt;
+    g.headline = r.raw(hl); if (!r.ok) return std::nullopt;
+    const std::uint8_t ne = r.u8(); if (!r.ok) return std::nullopt;
+    if (ne > (v.size() - r.o) / 61) return std::nullopt;
+    for (std::uint8_t i = 0; i < ne; ++i) {
+        GenesisDeploymentRec d;
+        d.epoch_no = r.u32(); d.rules_digest = r.b32(); d.kind = r.u8(); d.start = r.u64v(); d.timeout = r.u64v(); d.fixed = r.u64v();
+        if (!r.ok) return std::nullopt;
+        g.epochs.push_back(d);
+    }
     if (!r.done()) return std::nullopt; return g;
 }
 

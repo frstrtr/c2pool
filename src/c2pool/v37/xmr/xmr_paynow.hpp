@@ -30,7 +30,7 @@
 // (owed_digest commits the finalized partition only). So the builder commits
 // the reward-INDEPENDENT base  B = Σ owed takes of its input set + Σ fixed
 // declared amounts  as the 12-byte 0x02 tail "V37N" || u64le(B), placed before
-// the fee model's "V37D" tail, the POOL-LINEAGE "V37P" field and the V37C
+// the fee model's "V37D" tail and the V37C
 // credit-cut tail. Receiver: P =
 // total - B (0 when negative: the owed pass then exhausted the budget), and
 // alloc = paynow_split(P, E_b at the on-chain cut) -- the SAME function over
@@ -77,18 +77,16 @@ inline std::vector<std::uint8_t> encode_tail(std::uint64_t base) {
     return t;
 }
 
-// The base B from a 0x02 payload: strip the V37C tail, then the POOL-LINEAGE
-// V37P field, then the V37D tail (each only if present), then read "V37N"
-// u64le at the end. nullopt = no pay-now. Canonical order of a lane payload:
-//     [ nonce | rbind? | pad | "V37F" finder? | "V37N" B | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine ]
+// The base B from a 0x02 payload: strip the V37C tail, then the V37D tail
+// (each only if present), then read "V37N" u64le at the end. nullopt = no
+// pay-now. Canonical order of a lane payload (RULES RATCHET R1: the V37P v2
+// pool field rides at the HEAD, [4..49), never in the tail):
+//     [ nonce | "V37P" v2 | rbind? | pad | "V37R" total | "V37F" finder? | "V37N" B | "V37D" owed_in? | "V37C" P spine ]
 // (V37F: the EMPTY-CUT FINDER field below, only in an empty-cut block.)
-// A malformed V37P field (unknown version) is NOT skipped, so the V37N magic
-// check fails closed (the lineage gate has already made such a block ordinary).
-// The payload offset right after the V37N field (== where V37D / V37P / V37C
-// begin), after stripping those three from the end exactly like the readers do.
+// The payload offset right after the V37N field (== where V37D / V37C begin),
+// after stripping those two from the end exactly like the readers do.
 inline std::size_t end_before_donation_tail(const std::vector<std::uint8_t>& p) {
     std::size_t end = credit::end_before_credit_tail(p);
-    if (credit::parse_pool_tag_payload(p) == credit::PoolTagParse::Present) end -= credit::kPoolTagFieldBytes;
     if (end >= fee::kDonationOwedTailBytes &&
         std::memcmp(p.data() + end - fee::kDonationOwedTailBytes, fee::kDonationOwedMagic, 4) == 0)
         end -= fee::kDonationOwedTailBytes;
@@ -220,11 +218,11 @@ inline bool finder_malformed(const std::vector<unsigned char>& tx_extra) {
 // block candidate, so its coinbase must be the canonical one, as P2Pool
 // checks a share's generation transaction. A receipt hides the outputs in
 // its Keccak midstate; everything else the recompute needs is in the open
-// 0x02 payload (V37C, V37N, V37D, V37F, V37P) except the coinbase total,
+// 0x02 payload (V37P, V37C, V37N, V37D, V37F) except the coinbase total,
 // which depends on the template's own transactions. The template commits it
 // FIRST in the tail, written after the final reward split (constant 12 B, so
 // the value never changes the coinbase size, weight or reward):
-//     [ nonce | rbind? | pad | "V37R" total | "V37F"? | "V37N"? | "V37D"? | "V37P"? | "V37C" ]
+//     [ nonce | "V37P" v2 | rbind? | pad | "V37R" total | "V37F"? | "V37N"? | "V37D"? | "V37C" ]
 // Every older reader locates its own field from the end, so none shifts. A
 // block must commit V37R == the sum of its outputs (the recompute checks it).
 // ===========================================================================

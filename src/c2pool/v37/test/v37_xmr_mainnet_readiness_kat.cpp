@@ -72,6 +72,9 @@
 
 #include "c2pool/v37/xmr/xmr_native_template_backend.hpp"
 #include "c2pool/v37/xmr/xmr_node_config.hpp"
+#include "c2pool/v37/xmr/xmr_fee_model.hpp"          // F: the mainnet donation identity (R-MIN (b))
+#include "c2pool/v37/xmr/xmr_lane_rules_build.hpp"   // F: lane_rules_of (the mainnet epoch-1 rules)
+#include "c2pool/v37/xmr/xmr_pool_tag.hpp"           // F: raw_genesis_refusal
 #include "impl/xmr/native/anchor/xmr_anchor_load.hpp"
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
@@ -866,6 +869,49 @@ void suite_e_gate4() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// F -- RULES RATCHET R1 (spec sec. 7, 8): the mainnet configuration is at the
+// R-MIN floor, the compiled epoch-1 rules are constitutional, and a raw pool
+// genesis is refused on mainnet (the derived form is mandatory there).
+// ---------------------------------------------------------------------------
+void suite_f_ratchet() {
+    std::printf("\n-- F: RULES RATCHET R-MIN at the floor; raw genesis refused on mainnet --\n");
+    namespace lr = c2pool::v37n::xmr::lanerules;
+    namespace fee = c2pool::v37n::xmr::fee;
+    namespace lineage = c2pool::v37n::xmr::lineage;
+    XmrNodeConfig c;
+    c.network = MoneroNetwork::Mainnet;
+    cfgns::apply_network_drain(c);
+    check(c.drain_q == 16 && c.drain_h_cap == 64 && c.drain_rule_version == 1 &&
+              cfgns::kMainnetDrainQ == 16 && cfgns::kMainnetDrainHCap == 64 && cfgns::kMainnetDrainRuleVersion == 1,
+          "F1 mainnet drain triple = 16 / 64 / 1 (the R-MIN floor, from the mainnet genesis)");
+    lr::LaneRulesInputs in;
+    in.kfair_salted_ties = true; in.spend_floor = true; in.commit_total = true;
+    in.residual_sink_id = fee::donation_identity(fee::DonationNet::Mainnet);
+    const lr::LaneRules rules = lr::lane_rules_of(c, in);
+    const ::v37::bytes32 sink = fee::donation_identity(fee::DonationNet::Mainnet);
+    const std::string r = lr::constitutional_check(0, rules, &sink);
+    check(r.empty(), "F2 the mainnet epoch-1 rules pass constitutional_check (settle_h_min 0, owed_demo_amount 0, the fixed sink, "
+                     "drain at the floor): " + (r.empty() ? std::string("ok") : r));
+    check(rules.settle_h_min == 0 && rules.owed_demo_amount == 0 && rules.pool_tag_codec == 2,
+          "F3 the mainnet epoch-1 rules: settle_h_min 0, owed_demo_amount 0 (no premine), pool_tag_codec 2 (V37P v2)");
+    {
+        XmrNodeConfig k = c; k.drain_h_cap = 32;
+        const lr::LaneRules t = lr::lane_rules_of(k, in);
+        const std::string w = lr::constitutional_check(0, t, &sink);
+        check(lr::is_r_min_violation(w), "F4 drain_h_cap 32 on mainnet: R_MIN_VIOLATION (" + w.substr(0, 48) + ")");
+    }
+    const std::string raw = lineage::raw_genesis_refusal(0);
+    check(raw == "mainnet: the pool genesis must be derived, use --pool-genesis-from",
+          "F5 a raw pool genesis is REFUSED on mainnet: \"" + raw + "\"");
+    check(lineage::raw_genesis_refusal(1).empty() && lineage::raw_genesis_refusal(2).empty() && lineage::raw_genesis_refusal(3).empty(),
+          "F6 ... and accepted on stagenet / testnet / regtest (the test nets with a warning)");
+    const auto deps = lr::genesis_deployments(rules);
+    check(deps.size() == 1 && deps[0].epoch_no == 1 && deps[0].kind == 0 && deps[0].rules_digest == lr::rules_digest(rules) &&
+              c2pool::v37n::xmr::epoch::deployments_refusal(deps).empty(),
+          "F7 the compiled table is the one-entry genesis list: epoch 1, kind 0, rules_digest(rules), start/timeout/fixed 0, valid");
+}
+
 } // namespace
 
 int main() {
@@ -875,6 +921,7 @@ int main() {
     suite_c_seeds();
     suite_d_snapshot();
     suite_e_gate4();
+    suite_f_ratchet();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

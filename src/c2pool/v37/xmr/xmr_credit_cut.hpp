@@ -15,9 +15,10 @@
 // This PoC carries exactly those 40 bytes (+4 magic) in the coinbase 0x02
 // extra-nonce payload, AFTER the per-worker nonce + weight padding:
 //
-//     0x02  varint(len)  [ nonce(4) | pad(0..10) | "V37C" | u64le P | b32 spine ]
+//     0x02  varint(len)  [ nonce(4) | V37P v2 (45) | rbind? | pad(0..10) | ... | "V37C" | u64le P | b32 spine ]
 //
-// so deterministic r (lane_commitment/prev_id/height) and the 0x03 root are
+// (RULES RATCHET R1: the pool-identity field V37P v2 rides FIRST after the
+// nonce, see below; the credit cut stays the END-anchored tail.) So deterministic r (lane_commitment/prev_id/height) and the 0x03 root are
 // UNTOUCHED, the miner_tx weight stays invariant (a constant +44), and every
 // byte is under the block's PoW. CONSENSUS SEAM (operator-hand at landing):
 // this changes the coinbase bytes -> a coinbase-shape golden.
@@ -90,40 +91,54 @@ inline std::optional<CreditCut> parse_from_tx_extra(const std::vector<unsigned c
 }
 
 // ---------------------------------------------------------------------------
-// POOL-LINEAGE (operator ruling 2026-09-25): the V37C tail's versioned pool-tag
-// field. Every lane block a pool builds commits its pool_tag
-// (xmr_pool_tag.hpp: sha256d('V37PT2' || lane_tag || pool_genesis_id || rules_digest)) as
+// POOL IDENTITY (RULES RATCHET R1, operator rulings 2026-10-03): the V37P v2
+// field at the FIXED OFFSET, first in the 0x02 payload after the 4-byte extra
+// nonce, BEFORE the per-job rbind:
 //
-//     "V37P" | u8 version (= 1) | b32 pool_tag                        (37 B)
+//     V37P v2 (45 B) = "V37P" | u8 0x02 | b32 pool_id | u32 epoch_cur | u32 epoch_max
+//     0x02 payload   = [ nonce 4 | V37P 45 | rbind 32? | pad 0..10 | "V37R" 12 | "V37F" 69? |
+//                        "V37N" 12? | "V37D" 12? | "V37C" 44 ]
+//     offsets        : V37P at [4..49); rbind at [49..81) when present; V37C END-anchored
+//     widest payload : 4 + 45 + 32 + 10 + 12 + 69 + 12 + 12 + 44 = 240 B (<= 255, Monero's
+//                      TX_EXTRA_NONCE_MAX_COUNT; the length is a two-byte varint)
 //
-// placed IMMEDIATELY BEFORE the credit-cut tail (or last when the node has no
-// cut yet), so the 0x02 payload of a lineage-tagged pool reads
-//
-//     [ nonce 4 | rbind? | pad | "V37D" u64le? | "V37P" v pool_tag | "V37C" P spine? ]
-//
-// parse_tail() above is unchanged (V37C stays LAST). The field is END-anchored
-// like the rest of the tail, constant size, never patched per extra_nonce.
-// STRICT parse: a "V37P" magic with any version other than 1 is MALFORMED (a
-// reader never guesses the layout of a future version); no magic at the field
-// position = an untagged (pre-lineage) tail.
+// A node of ANY epoch finds (pool_id, epoch_cur) at 0x02[4..49) in every later
+// block whatever later epochs put behind it. epoch_cur = the epoch the coinbase
+// was built under (must equal epoch_of(height)); epoch_max = the highest epoch
+// the builder's binary implements (a capability, the follower's WARN / HOLD
+// input; never a vote). The field is per TEMPLATE (never patched per job); the
+// nonce and rbind are per job. STRICT parse: a "V37P" magic with any version
+// other than 2 is MALFORMED (a reader never guesses the layout of another
+// version); no magic at [4..8) = an Untagged payload (not a lane block).
 // ---------------------------------------------------------------------------
-inline constexpr unsigned char kPoolTagMagic[4]   = {'V', '3', '7', 'P'};
-inline constexpr std::uint8_t  kPoolTagVersion    = 1;
-inline constexpr std::size_t   kPoolTagFieldBytes = 4 + 1 + 32;   // 37
+inline constexpr unsigned char kPoolFieldMagic[4] = {'V', '3', '7', 'P'};
+inline constexpr std::uint8_t  kPoolFieldVersion  = 2;
+inline constexpr std::size_t   kPoolFieldOffset   = 4;                 // right after the 4-byte extra nonce
+inline constexpr std::size_t   kPoolFieldBytes    = 4 + 1 + 32 + 4 + 4; // 45
+inline constexpr std::size_t   kRbindOffset       = kPoolFieldOffset + kPoolFieldBytes;   // 49: rbind at [49..81)
 
-inline std::vector<std::uint8_t> encode_pool_tag_field(const ::v37::bytes32& pool_tag) {
+struct PoolField {
+    ::v37::bytes32 pool_id{};
+    std::uint32_t  epoch_cur = 1;
+    std::uint32_t  epoch_max = 1;
+    bool operator==(const PoolField&) const = default;
+};
+
+inline std::vector<std::uint8_t> encode_pool_field(const PoolField& f) {
     std::vector<std::uint8_t> t;
-    t.reserve(kPoolTagFieldBytes);
-    t.insert(t.end(), kPoolTagMagic, kPoolTagMagic + 4);
-    t.push_back(kPoolTagVersion);
-    t.insert(t.end(), pool_tag.begin(), pool_tag.end());
+    t.reserve(kPoolFieldBytes);
+    t.insert(t.end(), kPoolFieldMagic, kPoolFieldMagic + 4);
+    t.push_back(kPoolFieldVersion);
+    t.insert(t.end(), f.pool_id.begin(), f.pool_id.end());
+    for (int i = 0; i < 4; ++i) t.push_back(static_cast<std::uint8_t>(f.epoch_cur >> (8 * i)));
+    for (int i = 0; i < 4; ++i) t.push_back(static_cast<std::uint8_t>(f.epoch_max >> (8 * i)));
     return t;
 }
 
-enum class PoolTagParse : std::uint8_t {
-    Absent    = 0,   // no V37P field: an untagged (pre-lineage) payload
-    Present   = 1,   // a version-1 field; pool_tag filled
-    Malformed = 2,   // the V37P magic with an unknown version (strict reject)
+enum class PoolFieldParse : std::uint8_t {
+    Absent    = 0,   // no V37P magic at [4..8): an untagged payload (not a lane block)
+    Present   = 1,   // a version-2 field; `out` filled
+    Malformed = 2,   // the V37P magic with another version (strict reject)
 };
 
 // End offset of the part of a 0x02 payload BEFORE the credit-cut tail (the
@@ -134,31 +149,37 @@ inline std::size_t end_before_credit_tail(const std::vector<std::uint8_t>& p) {
     return end;
 }
 
-inline PoolTagParse parse_pool_tag_payload(const std::vector<std::uint8_t>& p, ::v37::bytes32* pool_tag = nullptr) {
-    const std::size_t end = end_before_credit_tail(p);
-    if (end < kPoolTagFieldBytes) return PoolTagParse::Absent;
-    const std::uint8_t* f = p.data() + end - kPoolTagFieldBytes;
-    if (std::memcmp(f, kPoolTagMagic, 4) != 0) return PoolTagParse::Absent;
-    if (f[4] != kPoolTagVersion) return PoolTagParse::Malformed;
-    if (pool_tag) std::memcpy(pool_tag->data(), f + 5, 32);
-    return PoolTagParse::Present;
+inline PoolFieldParse parse_pool_field_payload(const std::vector<std::uint8_t>& p, PoolField* out = nullptr) {
+    if (p.size() < kPoolFieldOffset + 4) return PoolFieldParse::Absent;
+    const std::uint8_t* f = p.data() + kPoolFieldOffset;
+    if (std::memcmp(f, kPoolFieldMagic, 4) != 0) return PoolFieldParse::Absent;
+    if (p.size() < kPoolFieldOffset + kPoolFieldBytes || f[4] != kPoolFieldVersion) return PoolFieldParse::Malformed;
+    if (out) {
+        std::memcpy(out->pool_id.data(), f + 5, 32);
+        out->epoch_cur = 0; out->epoch_max = 0;
+        for (int i = 0; i < 4; ++i) out->epoch_cur |= static_cast<std::uint32_t>(f[37 + i]) << (8 * i);
+        for (int i = 0; i < 4; ++i) out->epoch_max |= static_cast<std::uint32_t>(f[41 + i]) << (8 * i);
+    }
+    return PoolFieldParse::Present;
 }
 
-inline PoolTagParse parse_pool_tag(const std::vector<unsigned char>& tx_extra, ::v37::bytes32* pool_tag = nullptr) {
+inline PoolFieldParse parse_pool_field(const std::vector<unsigned char>& tx_extra, PoolField* out = nullptr) {
     const auto f = extra_nonce_field(tx_extra);
-    if (!f) return PoolTagParse::Absent;
-    return parse_pool_tag_payload(*f, pool_tag);
+    if (!f) return PoolFieldParse::Absent;
+    return parse_pool_field_payload(*f, out);
 }
 
 // ---------------------------------------------------------------------------
-// POOL-LINEAGE: chain-block classification by the V37C tail's pool tag
-// (xmr_pool_tag.hpp derives the tag).
+// Chain-block classification by the V37P v2 field (spec sec. 1.4). The EPOCH
+// decision (validate / misbuilt / HOLD) is taken by the booking code, which
+// knows the ledger's epoch_of(h); this classifier answers the POOL question and
+// hands back (pool_id, epoch_cur, epoch_max).
 // ---------------------------------------------------------------------------
 enum class BlockLineage : std::uint8_t {
-    Own       = 0,   // carries OUR pool_tag: a lane block of this pool
-    Foreign   = 1,   // carries ANOTHER pool's tag: an ordinary block here
-    Untagged  = 2,   // no V37P field (pre-lineage tail / not a v37 block): ordinary
-    Malformed = 3,   // a V37P magic of an unknown version: strict reject -> ordinary
+    Own       = 0,   // carries OUR pool_id: a lane block of this pool
+    Foreign   = 1,   // carries ANOTHER pool's id: an ordinary block here
+    Untagged  = 2,   // no V37P field (not a v37 lane block): ordinary
+    Malformed = 3,   // a V37P magic of another version: strict reject -> ordinary
 };
 
 inline const char* to_string(BlockLineage c) {
@@ -171,16 +192,16 @@ inline const char* to_string(BlockLineage c) {
     return "?";
 }
 
-inline BlockLineage classify_lineage(const std::vector<unsigned char>& tx_extra, const ::v37::bytes32& our_pool_tag,
-                             ::v37::bytes32* seen = nullptr) {
-    ::v37::bytes32 t{};
-    switch (parse_pool_tag(tx_extra, &t)) {
-        case PoolTagParse::Absent:    return BlockLineage::Untagged;
-        case PoolTagParse::Malformed: return BlockLineage::Malformed;
-        case PoolTagParse::Present:   break;
+inline BlockLineage classify_lineage(const std::vector<unsigned char>& tx_extra, const ::v37::bytes32& our_pool_id,
+                                     PoolField* seen = nullptr) {
+    PoolField f;
+    switch (parse_pool_field(tx_extra, &f)) {
+        case PoolFieldParse::Absent:    return BlockLineage::Untagged;
+        case PoolFieldParse::Malformed: return BlockLineage::Malformed;
+        case PoolFieldParse::Present:   break;
     }
-    if (seen) *seen = t;
-    return t == our_pool_tag ? BlockLineage::Own : BlockLineage::Foreign;
+    if (seen) *seen = f;
+    return f.pool_id == our_pool_id ? BlockLineage::Own : BlockLineage::Foreign;
 }
 
 } // namespace c2pool::v37n::xmr::credit

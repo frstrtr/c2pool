@@ -37,8 +37,9 @@ Commands marked `<!-- check -->` in the source of this file are run by
 - A shell account. You need `sudo` only for a system-wide install or to
   install build packages.
 - For stagenet: a stagenet payout address (`5...`), and from your pool's
-  operator the pool genesis id and one or more relay peers
-  (see [Join a pool](#6-join-a-pool)).
+  operator the pool genesis (the block height, its hash and the headline the
+  pool was derived from, see [pool-genesis.md](pool-genesis.md)) and one or
+  more relay peers (see [Join a pool](#6-join-a-pool)).
 - The payout address must be a MAIN (standard) address: `4...` on mainnet,
   `5...` on stagenet. Subaddresses and integrated addresses are not
   supported as payees. The node refuses a subaddress for
@@ -293,13 +294,15 @@ Make a data directory:
 mkdir -p ~/xmr-stagenet/data
 ```
 
-Set these values. Your pool operator gives you `POOL_GENESIS`,
-`RELAY_PEER`, the fee model and the share difficulty. A new pool picks a
-new random genesis id with `openssl rand -hex 32`.
+Set these values. Your pool operator gives you `POOL_GENESIS_FROM`,
+`RELAY_PEER`, the fee model and the share difficulty. A new pool is named by
+a stagenet block at least 60 deep and a headline of the day
+([pool-genesis.md](pool-genesis.md)); every node of the pool runs the same
+three inputs, and anyone can recompute the pool id from a block explorer.
 
 ```sh
 ADDR=5...                       # your stagenet payout address
-POOL_GENESIS=<64 hex digits>    # the pool's genesis id
+POOL_GENESIS_FROM='<H>:<hash64>:"<headline>"'   # the pool's genesis: block height, its hash, the headline
 RELAY_PEER=<host:port>          # a relay address of a node already in the pool
 RELAY_LISTEN=0.0.0.0:<port>     # where this node accepts relay peers
 LEVIN_PEER=<ip>:38080           # a monerod levin port you trust (yours if you have one)
@@ -324,8 +327,8 @@ the network's seed nodes. On a slow link also add
 ### 6.1 With the package
 
 All launch flags live in `node.env` in the data directory, one flag per
-line, each with a comment. Replace every `<placeholder>`: the pool id
-(`--pool-genesis`), the two public relay nodes (`--relay-peer`), your
+line, each with a comment. Replace every `<placeholder>`: the pool genesis
+(`--pool-genesis-from`), the two public relay nodes (`--relay-peer`), your
 relay port, and your MAIN payout address. `--give-author-pct 0.1` gives
 0.1% of the credit of every share this node's miners find to the author; set
 it to 0 to opt out.
@@ -378,7 +381,7 @@ nohup ~/c2pool/build/src/c2pool/c2pool-v37-xmr --network stagenet \
   --native-snapshot-path ~/xmr-stagenet/data/native.snap \
   --data-dir ~/xmr-stagenet/data \
   --randomx --d-conf 60 --fee-model v1 --relay-bind rbind \
-  --pool-genesis "$POOL_GENESIS" --relay-listen "$RELAY_LISTEN" --relay-peer "$RELAY_PEER" \
+  --pool-genesis-from "$POOL_GENESIS_FROM" --relay-listen "$RELAY_LISTEN" --relay-peer "$RELAY_PEER" \
   --payout-address "$ADDR" --share-diff 10000 --give-author-pct 0.1 \
   --web-port 8080 --web-host 127.0.0.1 --dashboard-dir ~/c2pool/web-static \
   --stratum-bind-host "$STRATUM_BIND" --stratum-port "$STRATUM_PORT" \
@@ -403,7 +406,8 @@ What the flags do:
 | `--d-conf 60` | settlement finality depth in blocks. Use the pool's value. |
 | `--fee-model v1` | the pool fee model: one donation output, last, in every pool block (it may carry 0). Use the pool's value. |
 | `--relay-bind rbind` | bind each share to its payee in the proof of work. Required with `--fee-model v1` and on mainnet. |
-| `--pool-genesis <hex64>` | the pool's id. Nodes with a different id refuse each other. |
+| `--pool-genesis-from <H>:<hash64>:"<headline>"` | the pool's genesis, derived from the chain: a block height >= 60 deep, its hash, a headline (1..120 printable ASCII). The node checks the hash on its chain and refuses to start otherwise. Required on mainnet. Nodes with a different genesis refuse each other ([pool-genesis.md](pool-genesis.md)). |
+| `--pool-genesis <hex64>` | the RAW form (regtest; testnet / stagenet with a warning; refused on mainnet). |
 | `--relay-listen <host:port>` | accept relay connections from other pool nodes |
 | `--relay-peer <host:port>` | dial a pool node. Repeat it for more peers. |
 | `--no-relay-bootstrap` | do not also dial the built-in bootstrap nodes (mainnet only; see [BOOTSTRAP-NODES.md](BOOTSTRAP-NODES.md)) |
@@ -418,17 +422,20 @@ What the flags do:
 When the relay link is up, the `relay:` status line shows `conns=1 ready=1
 hello ok=1` for one peer.
 
-Every node of one pool must use the same `--pool-genesis`, `--fee-model`,
-`--relay-bind`, `--d-conf` and `--share-diff`. The relay compares the pool id
-in its HELLO and refuses a peer from another pool. The `relay:` status line counts
-those refusals as `tag_mismatch=`.
+Every node of one pool must use the same `--pool-genesis-from` (the three
+inputs), `--fee-model`, `--relay-bind`, `--d-conf` and `--share-diff`. The
+relay compares the pool genesis in its HELLO and refuses a peer from another
+pool. The `relay:` status line counts those refusals as `tag_mismatch=`. At
+start the node prints `genesis: H=.. hash=.. headline=".." pool_genesis=..
+pool_id=..`; the `pool_id` is the one in every lane coinbase (`V37P` v2).
 
 Every settlement knob is also part of the pool (LANE-RULES,
 [lane-rules.md](lane-rules.md)): the node prints its whole list at startup
 (`lane-rules: digest=... d_conf=60 ...`), and a peer with any other value is
 refused at HELLO by name, for example `LANE_RULES_MISMATCH field=d_conf ours=60
-theirs=61`, counted as `rules_mismatch=`. Its lane blocks are ordinary blocks for
-this pool. `--d-conf` below 60 is refused on every network but regtest.
+theirs=61`, counted as `rules_mismatch=`. The rules are the pool's epoch 1
+(`epochs: run=1 known<=1`); a rule change is a later epoch, never a new
+genesis. `--d-conf` below 60 is refused on every network but regtest.
 
 With DROPS (sub-threshold credit, test builds only for now) every node of one
 pool must also use the identical `--drops-enrol` list: a node with another list

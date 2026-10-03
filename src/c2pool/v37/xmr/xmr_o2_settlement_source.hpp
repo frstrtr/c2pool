@@ -238,10 +238,11 @@ struct XmrCoinbaseContext {
     // winner folds E_b at. Carried as the 0x02 tail (xmr_credit_cut.hpp).
     bool                  has_credit_cut = false;
     credit::CreditCut     credit_cut;
-    // POOL-LINEAGE: the pool_tag this pool commits in the V37C tail (the V37P
-    // field, xmr_credit_cut.hpp). Unset => no field (master's bytes).
-    bool                  has_pool_tag = false;
-    ::v37::bytes32        pool_tag{};
+    // RULES RATCHET R1: the pool-identity field this pool commits FIRST in the
+    // 0x02 payload, right after the nonce (V37P v2: pool_id, epoch_cur,
+    // epoch_max; xmr_credit_cut.hpp). Unset => no field (KAT rigs / tools).
+    bool                  has_pool_field = false;
+    credit::PoolField     pool_field{};
 
     // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): the projected lane payees AT the
     // credit cut above (settle::project of the view fold_eb reads there), so
@@ -745,13 +746,20 @@ public:
     // receive side splits the ONE donation output without the ledger
     // (xmr_fee_model.hpp). owed_in is reward-independent (the snapshot's
     // input set), so the tail is fixed for the snapshot's life.
+    // RULES RATCHET R1: the per-template head -- the V37P v2 pool field at the
+    // fixed offset [4..49), before the per-job rbind. Empty when the ctx has none.
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_head() const override {
+        if (!m_ctx.has_pool_field) return {};
+        return credit::encode_pool_field(m_ctx.pool_field);
+    }
     [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
         std::vector<std::uint8_t> t;
-        // Canonical 0x02 tail order (PAY-NOW on POOL-LINEAGE):
-        //     [ nonce | rbind? | pad | "V37F" finder? | "V37N" B? | "V37D" owed_in? | "V37P" v pool_tag? | "V37C" P spine? ]
-        // V37C stays LAST (parse_tail unchanged), V37P sits right before it
-        // (parse_pool_tag), V37D before V37P, V37N first; every reader strips
-        // the fields after its own from the end (xmr_paynow.hpp parse_payload).
+        // Canonical 0x02 layout (RULES RATCHET R1):
+        //     [ nonce 4 | "V37P" v2 45 | rbind 32? | pad | "V37R" total | "V37F" finder? | "V37N" B? | "V37D" owed_in? | "V37C" P spine? ]
+        // The head (V37P) is written by extra_nonce_head() above; this is the
+        // TAIL: V37C stays LAST (parse_tail unchanged), V37D before it, V37N before
+        // that, V37F first; every reader strips the fields after its own from the
+        // end (xmr_paynow.hpp parse_payload).
         if (m_ecut_finder) t = paynow::encode_finder_field(*m_ecut_finder);   // EMPTY-CUT FINDER (V37F), before V37N
         if (m_paynow_on) {                                                     // SAME-BLOCK PAY-NOW base (V37N)
             const std::vector<std::uint8_t> n = paynow::encode_tail(m_paynow_base);
@@ -760,10 +768,6 @@ public:
         if (x6::residual_folds_into_fixed(m_inputs)) {
             const std::vector<std::uint8_t> d = fee::encode_donation_owed_tail(x6::fold_identity_owed(m_inputs));
             t.insert(t.end(), d.begin(), d.end());
-        }
-        if (m_ctx.has_pool_tag) {   // POOL-LINEAGE: V37P just before the credit cut
-            const std::vector<std::uint8_t> f = credit::encode_pool_tag_field(m_ctx.pool_tag);
-            t.insert(t.end(), f.begin(), f.end());
         }
         if (m_ctx.has_credit_cut) {
             const std::vector<std::uint8_t> c = credit::encode_tail(m_ctx.credit_cut);

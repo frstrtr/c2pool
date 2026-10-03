@@ -138,6 +138,7 @@ XmrBlockTemplate& XmrBlockTemplate::operator=(const XmrBlockTemplate& b)
     m_majorVersion               = b.m_majorVersion;
     m_finalReward                = b.m_finalReward.load();
     m_extraNonceSize             = b.m_extraNonceSize;
+    m_extraNonceHeadSize         = b.m_extraNonceHeadSize;
     m_extraNonceBindSize         = b.m_extraNonceBindSize;
     m_merkleTreeData             = b.m_merkleTreeData;
     m_merkleTreeDataSize         = b.m_merkleTreeDataSize;
@@ -279,20 +280,29 @@ int XmrBlockTemplate::create_miner_tx(const XmrMinerData& data,
     // invariance trick above is untouched and the per-extra_nonce patch (first
     // EXTRA_NONCE_SIZE bytes only) never touches it.
     const std::vector<uint8_t> nonce_tail = m_settle->extra_nonce_tail();
-    // SEAM-1: the per-job binding region sits right after the 4-byte worker
-    // nonce ([extra_nonce 4 | bind N | padding | tail]); constant size, so the
-    // weight-invariance padding above is untouched. N = 0 => byte-identical.
+    // RULES RATCHET: the per-TEMPLATE head (the V37P v2 pool field) sits right
+    // after the 4-byte worker nonce; SEAM-1: the per-job binding region follows
+    // it ([extra_nonce 4 | head H | bind N | padding | tail]); both constant
+    // size, so the weight-invariance padding above is untouched. H = N = 0 =>
+    // byte-identical to the pre-ratchet template.
+    const std::vector<uint8_t> head = m_settle->extra_nonce_head();
+    if (head.size() > EXTRA_NONCE_HEAD_MAX) {
+        return -1;  // fail closed: the per-job patch buffers are sized for EXTRA_NONCE_HEAD_MAX
+    }
     const size_t bind_size = m_settle->extra_nonce_bind_size();
     if (bind_size > EXTRA_NONCE_BIND_MAX) {
         return -1;  // fail closed: the per-job patch buffers are sized for EXTRA_NONCE_BIND_MAX
     }
+    m_extraNonceHeadSize = static_cast<uint32_t>(head.size());
     m_extraNonceBindSize = static_cast<uint32_t>(bind_size);
-    writeVarint(corrected_extra_nonce_size + bind_size + nonce_tail.size(), m_minerTxExtra);
+    writeVarint(corrected_extra_nonce_size + head.size() + bind_size + nonce_tail.size(), m_minerTxExtra);
 
     uint64_t extraNonceOffsetInMinerTx = m_minerTxExtra.size();
-    m_minerTxExtra.insert(m_minerTxExtra.end(), corrected_extra_nonce_size + bind_size, 0);
+    m_minerTxExtra.insert(m_minerTxExtra.end(), EXTRA_NONCE_SIZE, 0);                                 // the worker nonce (patched per job)
+    m_minerTxExtra.insert(m_minerTxExtra.end(), head.begin(), head.end());                            // the head (constant)
+    m_minerTxExtra.insert(m_minerTxExtra.end(), bind_size + (corrected_extra_nonce_size - EXTRA_NONCE_SIZE), 0);   // bind (per job) + weight padding
     m_minerTxExtra.insert(m_minerTxExtra.end(), nonce_tail.begin(), nonce_tail.end());
-    m_extraNonceSize = static_cast<uint32_t>(corrected_extra_nonce_size + bind_size + nonce_tail.size());
+    m_extraNonceSize = static_cast<uint32_t>(corrected_extra_nonce_size + head.size() + bind_size + nonce_tail.size());
 
     // 0x03 : merge-mining tag. v37 commitment (owed_digest/info_digest) rides
     // here as the single MM-tree leaf (root == leaf for a 1-leaf tree).
@@ -325,16 +335,19 @@ hash XmrBlockTemplate::calc_miner_tx_hash(uint32_t extra_nonce) const
     const uint8_t* data = m_blockTemplateBlob.data() + m_minerTxOffsetInTemplate;
 
     const size_t extra_nonce_offset = m_extraNonceOffsetInTemplate - m_minerTxOffsetInTemplate;
-    // The per-job mutable head of the 0x02 payload: the 4-byte worker nonce,
-    // then the SEAM-1 binding region (m_extraNonceBindSize bytes, 0 = none).
-    uint8_t extra_nonce_buf[EXTRA_NONCE_SIZE + EXTRA_NONCE_BIND_MAX] = {
+    // The per-job mutable region of the 0x02 payload: the 4-byte worker nonce,
+    // the constant per-template head (copied from the template so the region
+    // stays contiguous) and the SEAM-1 binding region (m_extraNonceBindSize
+    // bytes, 0 = none).
+    uint8_t extra_nonce_buf[EXTRA_NONCE_SIZE + EXTRA_NONCE_HEAD_MAX + EXTRA_NONCE_BIND_MAX] = {
         static_cast<uint8_t>(extra_nonce >> 0),
         static_cast<uint8_t>(extra_nonce >> 8),
         static_cast<uint8_t>(extra_nonce >> 16),
         static_cast<uint8_t>(extra_nonce >> 24),
     };
-    const size_t en_len = EXTRA_NONCE_SIZE + m_extraNonceBindSize;
-    if (m_extraNonceBindSize) (void)m_settle->extra_nonce_bind(extra_nonce, extra_nonce_buf + EXTRA_NONCE_SIZE);
+    const size_t en_len = EXTRA_NONCE_SIZE + m_extraNonceHeadSize + m_extraNonceBindSize;
+    if (m_extraNonceHeadSize) std::memcpy(extra_nonce_buf + EXTRA_NONCE_SIZE, data + extra_nonce_offset + EXTRA_NONCE_SIZE, m_extraNonceHeadSize);
+    if (m_extraNonceBindSize) (void)m_settle->extra_nonce_bind(extra_nonce, extra_nonce_buf + EXTRA_NONCE_SIZE + m_extraNonceHeadSize);
 
     // v37: single MM-tree leaf, so the tag's 32-B root IS the commitment leaf.
     const hash merge_mining_root = m_settle->commitment_leaf(extra_nonce);
@@ -346,7 +359,7 @@ hash XmrBlockTemplate::calc_miner_tx_hash(uint32_t extra_nonce) const
     const size_t tx_size = m_minerTxSize - 1;
 
     hash full_hash;
-    uint8_t tx_buf[288 + EXTRA_NONCE_BIND_MAX];
+    uint8_t tx_buf[288 + EXTRA_NONCE_HEAD_MAX + EXTRA_NONCE_BIND_MAX];
 
     const size_t N = m_minerTxKeccakStateInputLength;
     const bool fast = N && (N <= extra_nonce_offset) && (N < tx_size) && (tx_size - N <= sizeof(tx_buf));
@@ -768,13 +781,18 @@ std::vector<uint8_t> XmrBlockTemplate::get_block_template_blob(uint32_t template
     extra_nonce_offset = t->m_extraNonceOffsetInTemplate;
     merkle_root_offset = t->m_extraNonceOffsetInTemplate + t->m_extraNonceSize + 2 + t->m_merkleTreeDataSize;
 
-    // patch this worker's extra nonce (+ the SEAM-1 binding region, if any)
-    uint8_t en[EXTRA_NONCE_SIZE + EXTRA_NONCE_BIND_MAX] = {
+    // patch this worker's extra nonce (+ the SEAM-1 binding region after the
+    // constant head, if any); the head itself is already in the template blob
+    uint8_t en[EXTRA_NONCE_SIZE] = {
         static_cast<uint8_t>(extra_nonce >> 0), static_cast<uint8_t>(extra_nonce >> 8),
         static_cast<uint8_t>(extra_nonce >> 16), static_cast<uint8_t>(extra_nonce >> 24),
     };
-    if (t->m_extraNonceBindSize) (void)t->m_settle->extra_nonce_bind(extra_nonce, en + EXTRA_NONCE_SIZE);
-    std::memcpy(blob.data() + extra_nonce_offset, en, EXTRA_NONCE_SIZE + t->m_extraNonceBindSize);
+    std::memcpy(blob.data() + extra_nonce_offset, en, EXTRA_NONCE_SIZE);
+    if (t->m_extraNonceBindSize) {
+        uint8_t bind[EXTRA_NONCE_BIND_MAX] = {};
+        (void)t->m_settle->extra_nonce_bind(extra_nonce, bind);
+        std::memcpy(blob.data() + extra_nonce_offset + EXTRA_NONCE_SIZE + t->m_extraNonceHeadSize, bind, t->m_extraNonceBindSize);
+    }
 
     // patch the MM commitment root for this extra nonce
     merkle_root = t->m_settle->commitment_leaf(extra_nonce);

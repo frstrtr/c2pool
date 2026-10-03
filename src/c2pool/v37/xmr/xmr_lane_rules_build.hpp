@@ -3,16 +3,19 @@
 // LANE-RULES (operator ruling R3, 2026-10-02): the node's own LaneRules
 // (xmr_lane_rules.hpp), built ONCE from its configuration. main_v37_xmr.cpp
 // calls lane_rules_of() after the settlement config is complete, prints the
-// list (the "lane-rules:" startup line), folds rules_digest into the pool_tag
-// every lane coinbase commits and hands the same object to the relay HELLO.
-// KATs build a node's list through the same function.
+// list (the "lane-rules:" startup line), makes it the epoch-1 Deployment of
+// the relay HELLO (RULES RATCHET R1: rules_digest rides the epoch table, not
+// the chain) and derives the ledger's OwedLedgerRules from it (owed_rules_of).
+// KATs build a node's list through the same functions.
 #pragma once
 
 #include <cstdint>
 
 #include "impl/xmr/settle/xmr_coinbase.hpp"   // kInputWeight, kTailSubsidy, XMR_COINBASE_MATURITY
 #include "relay/xmr_relay_wire.hpp"           // kXmrPoolRulesVersion
-#include "xmr_credit_cut.hpp"                 // kPoolTagVersion
+#include "xmr_credit_cut.hpp"                 // kPoolFieldVersion (the V37P v2 codec)
+#include "xmr_epoch.hpp"                      // RULES RATCHET: the one-entry epoch table
+#include <c2pool/v37/w4_settlement.hpp>       // OwedLedgerRules (owed_rules_of)
 #include "xmr_enrol_mode.hpp"                 // drops_rule_tag
 #include "xmr_fee_model.hpp"                  // fee_model_on, donation_identity
 #include "xmr_lane_rules.hpp"
@@ -75,11 +78,40 @@ inline LaneRules lane_rules_of(const XmrNodeConfig& c, const LaneRulesInputs& in
     r.drain_q            = c.drain_q;              // THE DRAIN RULE (settlement-drain.md): 16 / 64 / 1 on the
     r.drain_h_cap        = c.drain_h_cap;          // test networks from its flag day, 0 / 0 / 0 = master
     r.drain_rule_version = c.drain_rule_version;
-    r.pool_tag_codec     = ::c2pool::v37n::xmr::credit::kPoolTagVersion;
+    r.pool_tag_codec     = ::c2pool::v37n::xmr::credit::kPoolFieldVersion;   // RULES RATCHET: V37P v2
     r.lane_params_digest = in.lane_params_digest;
     r.enrol_digest       = in.enrol_digest;
     r.spend_floor        = in.spend_floor ? 1 : 0;
     return r;
+}
+
+
+// RULES RATCHET: the OwedLedgerRules bits of ONE epoch's LaneRules (spec sec. 3.1:
+// m_rules = rules_by_epoch[epoch_cur]; the RATCHET event switches it). The DROPS
+// bits come from the rule tag (xmr_enrol_mode.hpp: due 1, raindrop-enrol 2,
+// window 4); the drain rule turns lane_height and decay_from_gross on together;
+// the window geometry is the lane's own.
+inline ::c2pool::v37n::settle::OwedLedgerRules owed_rules_of(const LaneRules& r, const ::v37::LaneParams& lp) {
+    ::c2pool::v37n::settle::OwedLedgerRules o;
+    o.arm_floor         = static_cast<long long>(r.arm_floor);
+    o.rotate_on_payment = r.rotate_on_payment != 0;
+    o.decay_horizon     = r.decay_horizon;
+    o.decay_half_life   = r.decay_half_life;
+    o.anchor_cut        = r.anchor_cut != 0;
+    o.merkle_rows       = r.merkle_rows != 0;
+    o.drops_due         = (r.drops_rule & ::c2pool::v37n::xmr::relay::kDropsRuleDue) != 0;
+    o.raindrop_enrol    = (r.drops_rule & ::c2pool::v37n::xmr::relay::kDropsRuleRaindropEnrol) != 0;
+    o.lane_height       = r.drain_rule_version >= 1;
+    o.decay_from_gross  = r.drain_rule_version >= 1;
+    if (r.drops_window_rw != 0)
+        o.drops_window = ::c2pool::v37n::settle::DropsWindowRule{lp.window, lp.half_life, lp.epoch_len(), r.drops_window_rw,
+                                                                 ::c2pool::v37n::xmr::kXmrDropsWorkLz};
+    return o;
+}
+
+// The one-entry epoch table of slice R1: epoch 1 = these rules, ACTIVE from H_act 0.
+inline std::vector<::c2pool::v37n::xmr::epoch::Deployment> genesis_deployments(const LaneRules& r) {
+    return {::c2pool::v37n::xmr::epoch::genesis_deployment(rules_digest(r))};
 }
 
 } // namespace c2pool::v37n::xmr::lanerules
