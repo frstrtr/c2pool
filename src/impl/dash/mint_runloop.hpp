@@ -27,7 +27,10 @@
 // The public network mints the LEGACY v16 DashShare the live network speaks.
 // The private/isolated DASH v36 sharechain (custom --network-id; CoinParams::
 // current_share_version == 36) mints DashV36Share through the v36 arm of the
-// same functions (build_producer_job, mint_from_inputs_any), coinbase-only.
+// same functions (build_producer_job, mint_from_inputs_any). A v36 share
+// commits the template's transactions through the coinbase merkle_link (the
+// branch from the coinbase to the header merkle root); the finder assembles the
+// full block from its frozen job (FrozenMintJob::tx_data_hex).
 //
 // Header-only, fenced to src/impl/dash/. Nothing in src/core is touched; the
 // dashd-RPC fallback path is untouched.
@@ -51,6 +54,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -123,6 +127,59 @@ inline uint256 desired_share_target(const core::CoinParams& params,
     return desired;
 }
 
+// shared_template_bodies — ONE body vector per template, shared by every frozen
+// job built over it. build_producer_job runs once per (payout, template); the
+// FrozenJobRegistry keeps up to 512 jobs, so a per-job copy of a full template's
+// hex would pin 512 copies of the same bodies. The memo keys on the template's
+// complete tx hash list (a txid is the hash of its body, so equal lists mean
+// equal bodies) and holds only weak_ptrs: it never extends a body vector's life
+// past the last frozen job that references it. Thread-safe (stratum sessions
+// build producer jobs concurrently).
+class TemplateBodiesMemo
+{
+public:
+    std::shared_ptr<const std::vector<std::string>>
+    get(const dash::coin::DashWorkData& wd)
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        for (auto it = m_slots.begin(); it != m_slots.end();) {
+            auto sp = it->bodies.lock();
+            if (!sp) { it = m_slots.erase(it); continue; }
+            if (it->tx_hashes == wd.m_tx_hashes && sp->size() == wd.m_tx_data_hex.size())
+                return sp;
+            ++it;
+        }
+        auto sp = std::make_shared<const std::vector<std::string>>(wd.m_tx_data_hex);
+        m_slots.push_back(Slot{wd.m_tx_hashes, sp});
+        while (m_slots.size() > kSlots) m_slots.pop_front();
+        return sp;
+    }
+
+    std::size_t live_slots()
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        std::size_t n = 0;
+        for (const auto& s : m_slots) n += s.bodies.expired() ? 0 : 1;
+        return n;
+    }
+
+    static TemplateBodiesMemo& instance()
+    {
+        static TemplateBodiesMemo m;
+        return m;
+    }
+
+private:
+    static constexpr std::size_t kSlots = 8;   // a few templates overlap at a tip change
+    struct Slot
+    {
+        std::vector<uint256>                          tx_hashes;
+        std::weak_ptr<const std::vector<std::string>> bodies;
+    };
+    std::mutex       m_mu;
+    std::deque<Slot> m_slots;
+};
+
 template <typename ChainT>
 inline std::optional<ProducerJobBuild> build_producer_job(
     ChainT& chain,
@@ -138,18 +195,18 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     const std::vector<unsigned char>& message_data = {})
 {
     const bool v36 = core::version_gate::is_v36_active(params.current_share_version);
-    if (v36 && !wd.m_tx_hashes.empty()) {
-        // The private/isolated v36 chain is coinbase-only (daemonless): a v36
-        // share commits no tx refs and its won block is rebuilt as [gentx]
-        // alone (coin/reconstruct_won_block.hpp), so a template carrying txs
-        // could never be reconstructed. Decline the producer job; the
-        // non-producer coinbase still serves work.
+    if (v36 && wd.m_tx_data_hex.size() != wd.m_tx_hashes.size()) {
+        // The DASH v36 network commits the template's transactions through the
+        // coinbase merkle_link and the finder assembles the won block from the
+        // bodies frozen with this job. A template whose bodies do not match its
+        // tx hash list could never be assembled: decline the producer job
+        // (fail-closed); the non-producer coinbase still serves work.
         static int v36_tx_log = 0;
         if (v36_tx_log++ % 50 == 0)
-            LOG_WARNING << "[MINT] v36 producer job declined: the work template carries "
-                        << wd.m_tx_hashes.size()
-                        << " transaction(s); the private/isolated DASH v36 sharechain "
-                           "mints coinbase-only shares";
+            LOG_ERROR << "[MINT] v36 producer job declined: the work template carries "
+                      << wd.m_tx_hashes.size() << " transaction hash(es) but "
+                      << wd.m_tx_data_hex.size()
+                      << " body(ies) -- the won block could not be assembled";
         return std::nullopt;
     }
 
@@ -287,6 +344,11 @@ inline std::optional<ProducerJobBuild> build_producer_job(
     // --fee substitution the submit-time username script differs from it.
     out.frozen.payout_script_override = payout_script;
     out.frozen.message_data       = pin.message_data;    // committed in ref_hash (v36)
+    // v36: the template's tx bodies (template order, parallel to
+    // desired_tx_hashes) -- the finder assembles the won block from them
+    // (coin/reconstruct_won_block.hpp). Null on v16 and on coinbase-only jobs.
+    if (v36 && !wd.m_tx_hashes.empty())
+        out.frozen.tx_data_hex = TemplateBodiesMemo::instance().get(wd);
     return out;
 }
 
@@ -537,6 +599,13 @@ inline std::optional<ResolvedIdentity> resolve_mint_identity(
 // the job context a solved coinbase belongs to. FIFO-evicted at `capacity`
 // (default 512 — comfortably above MAX_ACTIVE_JOBS * sessions on one node);
 // a miss at mint time is a fail-closed decline, never a guess.
+// On the DASH v36 network the ref_hash does not cover the template's tx set
+// (the share carries no tx refs; the set is committed by the coinbase
+// merkle_link instead). Every producer build draws a fresh random share nonce,
+// so two tx sets never share a ref in practice, and both consumers re-check the
+// set anyway: the mint's X11 identity gate (the rebuilt merkle_link must
+// reproduce the solved header) and the finder's block assembly
+// (v36_finder_block_bodies: the frozen hashes must fold to the share's link).
 class FrozenJobRegistry
 {
 public:

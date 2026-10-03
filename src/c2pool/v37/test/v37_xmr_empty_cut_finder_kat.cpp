@@ -13,15 +13,15 @@
 // 1-3 blocks) nobody is credited, so the WHOLE reward still went to the
 // donation output (fee model ON) / residual sink (fee model OFF). The rule: in
 // an empty cut the finder's own share counts as the work -- the block pays its
-// finder the pay-now pool (reward - 1 with the fee model ON: the donation keeps
-// its 1-piconero marker; the whole reward with it OFF), and the finder payee
+// finder the pay-now pool (the whole reward, fee model ON or OFF: the donation
+// keeps only its 0-amount marker), and the finder payee
 // is committed in the block itself ("V37F" || kind || payee[64], right before
 // V37N) so every node reproduces the coinbase and the booking from the bytes.
 //
 //   E1  codec: V37F | V37N | V37D | V37P | V37C read back from one payload;
 //       V37F without V37N is not read; a malformed kind is flagged.
 //   E2  the settlement source, fee model ON and OFF, empty cut: the finder is
-//       paid reward - 1 / reward, the donation 1 / the sink nothing; the tail
+//       paid the whole reward, the donation 0 / the sink nothing; the tail
 //       is V37F || V37N || (V37D) || V37C; shape stable across the fixpoint.
 //   E3  receive-side rule on the maps + a REAL OwedLedger: credit {finder: P},
 //       net at FOUND, FINALIZE books nothing more (no double pay, paid ==
@@ -269,11 +269,12 @@ auth::CoinbaseBooking decode(const Built& x, const std::vector<std::uint8_t>& bl
 
 // ---------------------------------------------------------------------------
 // E5 (both trees): a cut that credits work is byte-identical to the base tree.
-// Goldens: keccak256(miner_tx) of the base tree's block (53d8228fa + PAY-NOW);
+// Goldens: keccak256(miner_tx) of the base tree's block (53d8228fa + PAY-NOW;
+// the fee-ON golden re-pinned 2026-09-29 for the 0-amount donation marker);
 // the miner_tx is a pure function of the capture + ledger (the header's
 // timestamp is not, so the full blob is compared within one run only).
 const char* kGoldenWorkFeeOff = "1a9225c45708bc260c6cd3f6357c4ef6d519c9c0f1e382a1060b1d067f7cda45";
-const char* kGoldenWorkFeeOn  = "928bbe617a68d3068179a1efd293d23bd0cd85fe38c68aea4029112bfac869f0";
+const char* kGoldenWorkFeeOn  = "f8fc466b8b4dda7c4cc436e7c018f8144d8be75ffe468dd899520ef1975627fb";
 void suite_nonempty_unchanged() {
     std::printf("== E5. NON-EMPTY cut: byte-identical to the base (finder armed or not) ==\n");
     for (int f = 0; f < 2; ++f) {
@@ -340,7 +341,7 @@ void suite_source() {
         auto src = o2::XmrOwedSettlementSource::build(c.L, c.pay_of(), c.ctx, kReward, &why);
         CHECK(src != nullptr, "fee %s: source builds: %s", fee_on ? "ON" : "OFF", why.empty() ? "ok" : why.c_str());
         if (!src) continue;
-        const std::uint64_t B = fee_on ? fee::kDonationDustPico : 0;
+        const std::uint64_t B = fee_on ? fee::kDonationMarkerPico : 0;
         CHECK(src->paynow_on() && src->ecut_finder() && *src->ecut_finder() == finder_ref() && src->paynow_base() == B,
               "fee %s: empty-cut finder armed, V37N base = %llu", fee_on ? "ON" : "OFF", (unsigned long long)src->paynow_base());
         std::vector<std::uint8_t> want = pn::encode_finder_field(finder_ref());
@@ -448,7 +449,7 @@ void suite_blocks() {
         Built b(fee_on, seed, Cut::Empty, finder_ref());
         CHECK(b.ok, "%s: empty-cut block builds + materializes: %s", tag, b.ok ? "ok" : b.why.c_str());
         if (!b.ok) continue;
-        const std::uint64_t B = (fee_on ? fee::kDonationDustPico : 0) + (seed ? 6'000'000'000ull : 0);
+        const std::uint64_t B = (fee_on ? fee::kDonationMarkerPico : 0) + (seed ? 6'000'000'000ull : 0);
         const Parsed_ p = parse_(b.bytes.full_blob, b.bytes);
         CHECK(p.ok && pn::parse_finder(p.got.tx_extra) == std::optional<::v37::ScriptRef>(finder_ref()) &&
                   pn::parse(p.got.tx_extra) == std::optional<std::uint64_t>(B),
@@ -458,8 +459,8 @@ void suite_blocks() {
         CHECK(bk.ok && bk.ecut_finder && pm_get(bk.payout, F) == bk.total - B,
               "%s: every output maps from the block alone; finder paid %llu = total %llu - B (%s)", tag,
               (unsigned long long)pm_get(bk.payout, F), (unsigned long long)bk.total, bk.ok ? "ok" : bk.why.c_str());
-        if (fee_on) CHECK(bk.ok && !bk.out_amount.empty() && bk.out_amount.back() == 1 && bk.out_identity.back() == fee::donation_identity(kNet),
-                          "%s: the donation output LAST carries only its 1-piconero marker", tag);
+        if (fee_on) CHECK(bk.ok && !bk.out_amount.empty() && bk.out_amount.back() == 0 && bk.out_identity.back() == fee::donation_identity(kNet),
+                          "%s: the donation output LAST is the 0-amount marker (present, maps, pays nothing)", tag);
         else CHECK(bk.ok && bk.sink_total == 0, "%s: the residual sink gets nothing (sink_total %lld)", tag, bk.sink_total);
         if (bk.ok) {
             Amounts credit_m, payout = bk.payout; std::string w;
@@ -524,7 +525,7 @@ void suite_widest() {
     a.settle.paynow_n = 1;
     ::v37::bytes32 T{}; T[3] = 0x44;
     a.extra_nonce_tail = pn::encode_finder_field(fr);
-    for (const auto& part : {pn::encode_tail(1), fee::encode_donation_owed_tail(0), credit::encode_pool_tag_field(T), credit::encode_tail(fixture_cut())})
+    for (const auto& part : {pn::encode_tail(fee::kDonationMarkerPico), fee::encode_donation_owed_tail(0), credit::encode_pool_tag_field(T), credit::encode_tail(fixture_cut())})
         a.extra_nonce_tail.insert(a.extra_nonce_tail.end(), part.begin(), part.end());
     a.extra_nonce_bind_size = 32;
     a.extra_nonce_bind = [](std::uint32_t en, std::uint8_t* out) { for (int i = 0; i < 32; ++i) out[i] = static_cast<std::uint8_t>(en * 7 + i); return true; };
@@ -541,12 +542,12 @@ void suite_widest() {
     const bool pp = asm_::parse_coinbase_prefix(b.full_blob.data() + b.miner_tx_offset, b.miner_tx_size, rc, &h, &used);
     ::v37::bytes32 got{};
     const auto nf = credit::extra_nonce_field(rc.tx_extra);
-    CHECK(pp && pn::parse_finder(rc.tx_extra) == std::optional<::v37::ScriptRef>(fr) && pn::parse(rc.tx_extra) == std::optional<std::uint64_t>(1) &&
+    CHECK(pp && pn::parse_finder(rc.tx_extra) == std::optional<::v37::ScriptRef>(fr) && pn::parse(rc.tx_extra) == std::optional<std::uint64_t>(fee::kDonationMarkerPico) &&
               fee::parse_donation_owed(rc.tx_extra).has_value() && nf && credit::parse_pool_tag_payload(*nf, &got) == credit::PoolTagParse::Present &&
               got == T && credit::parse_from_tx_extra(rc.tx_extra) == std::optional<credit::CreditCut>(fixture_cut()),
           "every field reads back from the block's own bytes");
     std::uint64_t to_f = 0; for (const auto& o : t->outputs()) if (o.identity == fid) to_f += o.amount;
-    CHECK(to_f == t->reward() - 1, "assembled: finder paid reward - 1 = %llu", (unsigned long long)to_f);
+    CHECK(to_f == t->reward(), "assembled: finder paid the whole reward = %llu (the donation marker is 0)", (unsigned long long)to_f);
     const auto shp = o2::inspect_kfair_coinbase(*t, a.settle.lane_commitment, 5);
     CHECK(shp.kfair_order, "the K_fair coinbase shape gate ACCEPTS the finder output: %s", shp.why.empty() ? "ok" : shp.why.c_str());
 }
@@ -766,7 +767,7 @@ void suite_login() {
         Built b(fee_on, false, Cut::Empty, fee_on ? std::nullopt : std::optional<::v37::ScriptRef>(D));
         CHECK(b.ok, "%s: fresh-pool empty-cut template builds: %s", tag, b.ok ? "ok" : b.why.c_str());
         if (!b.ok) continue;
-        const std::uint64_t B = fee_on ? fee::kDonationDustPico : 0;
+        const std::uint64_t B = fee_on ? fee::kDonationMarkerPico : 0;
         b.provider->bind_finder(11, pn::choose_ecut_finder(addr_of(L, P), kNet, false, O).payee);
         b.provider->bind_finder(12, pn::choose_ecut_finder(addr_of(L, fee::kPrefixMainnetSub), kNet, false, O).payee);
         b.provider->bind_finder(13, pn::choose_ecut_finder(addr_of(L, P), kNet, true, O).payee);

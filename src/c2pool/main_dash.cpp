@@ -145,6 +145,7 @@
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
+#include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: dashd templates only)
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
 #include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
@@ -510,6 +511,7 @@ void print_banner(const char* argv0)
         << "       " << argv0 << " --run [--coin-rpc H:P] [--coin-rpc-auth PATH]\n"
         << "           [--testnet] [--submit-block HEX | --submit-block-file PATH]\n"
         << "           [--listen [HOST:]PORT] [--addnode HOST:PORT]... [--connect HOST:PORT]...\n"
+        << "           [--net dash-v36]  (the DASH v36 network)\n"
         << "           [--network-id HEX [--prefix HEX]]  (private sharechain identity)\n"
         << "           [--stratum [HOST:]PORT] [--coin-p2p-connect HOST:PORT]... [--coin-p2p-discover]\n"
         << "           [--web-port PORT] [--web-host ADDR] [--dashboard-dir PATH]\n"
@@ -641,6 +643,14 @@ void print_banner(const char* argv0)
         << "        fail verification (startup WARNING): use --prefix for a private net.\n"
         << "        Settings-file keys: [dash.sharechain] network_id / prefix\n"
         << "        (money-class: need gate.money_ack_hash). CLI wins over the file.\n"
+        << "        --net dash-v36 joins the DASH v36 network: a p2pool v36 sharechain\n"
+        << "        for DASH that mints and accepts share v36 only (identifier\n"
+        << "        ac2785363c0180b8, prefix 8d8516bac9edd280, protocol 3601; state in\n"
+        << "        <data-dir>/dash_ac2785363c0180b8_v36). It FORKS from the default\n"
+        << "        v16 sharechain. Mainnet only; cannot be combined with --network-id,\n"
+        << "        --prefix or --testnet. No built-in seeds yet: pass --addnode\n"
+        << "        HOST:PORT. Settings-file key: [dash.sharechain] network = \"v36\"\n"
+        << "        (money-class). Without --net the node stays on the v16 sharechain.\n"
         << "        --coin-p2p-discover arms the DASH-isolated peer manager: seed\n"
         << "        (dnsseed.dash.org + fixed) bootstrap, source-scored + group-diverse\n"
         << "        (Sybil-capped) peer selection, anchors, and a self-healing dial\n"
@@ -805,7 +815,7 @@ int check_coin_params()
         want(main.current_share_version == 16, "share_version == 16 (older-than-v35 baseline)");
     else
         want(main.current_share_version == 36,
-             "share_version == 36 (private/isolated DASH v36 sharechain)");
+             "share_version == 36 (DASH v36 network profile)");
     want(main.address_version == 76,       "mainnet pubkey addr version == 76 (X...)");
     want(static_cast<bool>(main.pow_func), "pow_func wired");
 
@@ -1324,14 +1334,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // identities. No flag: "dash" / "dash_testnet", byte-identical to master.
     const std::string net_subdir = dash::SharechainConfig::data_subdir(testnet);
     if (dash::SharechainConfig::has_custom_network_id()) {
-        std::cout << "[run] custom network-id: per-network state is identity-scoped under "
-                  << (core::filesystem::config_path() / net_subdir).string() << "\n";
+        if (dash::SharechainConfig::is_named_v36_network())
+            std::cout << "[run] DASH v36 network (--net " << dash::SharechainConfig::V36_NETWORK_NAME
+                      << "): id=" << dash::SharechainConfig::identifier_hex()
+                      << " prefix=" << dash::SharechainConfig::prefix_hex()
+                      << ", per-network state under "
+                      << (core::filesystem::config_path() / net_subdir).string() << "\n";
+        else
+            std::cout << "[run] custom network-id: per-network state is identity-scoped under "
+                      << (core::filesystem::config_path() / net_subdir).string() << "\n";
         const auto& prof = dash::SharechainConfig::share_profile();
-        std::cout << "[run] private/isolated DASH sharechain profile: mints share v"
+        std::cout << "[run] DASH v36 network profile: mints share v"
                   << prof.target_share_version
                   << " (admits v" << prof.target_share_version << " only), ratchet seed "
                   << prof.ratchet_floor_protocol_version
-                  << " (peers below it refused; --min-protocol cannot lower it), emergency decay "
+                  << " (peers below it refused; the operator min-protocol knob, not yet a CLI flag, cannot lower it), advertises protocol "
+                  << prof.advertised_protocol_version
+                  << " (peer builds below it lack v36 isolated support: refused at the handshake,"
+                     " not banned; every node of this chain must run a build with it), emergency decay "
                   << (prof.emergency_decay ? "on" : "off") << "\n";
     }
     std::error_code mkdir_ec;
@@ -1355,7 +1375,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     const auto bootstrap_mode = dash::select_sharechain_bootstrap_mode(
         /*has_explicit_peers=*/!peer.addnodes.empty() || !peer.connects.empty(),
         /*regtest=*/false,  // --regtest maps onto the testnet identity on DASH
-        has_custom_network_id);
+        has_custom_network_id,
+        /*named_v36_network=*/dash::SharechainConfig::is_named_v36_network());
     if (has_custom_network_id && dash::SharechainConfig::override_prefix_hex.empty()) {
         // --network-id without --prefix keeps the PUBLIC frame prefix, so this
         // node still completes the p2p handshake with public p2pool-dash peers
@@ -1381,6 +1402,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         break;
     case dash::SharechainBootstrapMode::PublicDefault:
         break;  // DASH ships no compiled sharechain seeds: nothing to add
+    case dash::SharechainBootstrapMode::V36NetworkSeeds: {
+        // --net dash-v36 with no --addnode/--connect: the network's own built-in
+        // seeds (never the public ones). Empty until the operator approves the
+        // first entries (dash::v36_network_seed_hosts TODO).
+        const auto seeds = dash::v36_network_seed_hosts();
+        std::size_t added = 0;
+        for (const auto& hp : seeds) {
+            NetService ns;
+            if (parse_hostport(hp, ns)) {  // entries are HOST:PORT
+                config.pool()->m_bootstrap_addrs.push_back(ns);
+                ++added;
+            }
+        }
+        if (added == 0)
+            std::cout << "[run] DASH v36 network: no built-in seeds yet; supply --addnode HOST:PORT"
+                         " to reach a peer of this network\n";
+        else
+            std::cout << "[run] DASH v36 network: " << added << " built-in seed(s)\n";
+        break;
+    }
     }
 
     // shared_ptr-owned + set_lifetime so the sharechain node's core::Server(accept)
@@ -1438,7 +1479,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
                   << " prefix=" << dash::SharechainConfig::prefix_hex()
                   << " identifier=" << dash::SharechainConfig::identifier_hex()
-                  << (has_custom_network_id ? " (custom --network-id)" : "") << "\n";
+                  << (dash::SharechainConfig::is_named_v36_network() ? " (DASH v36 network)"
+                      : has_custom_network_id ? " (custom --network-id)" : "") << "\n";
     } else {
         // Symmetry with the LISTENING branch above: the --connect leg frames
         // every outbound packet with this same prefix (pool/node.hpp:88
@@ -1450,7 +1492,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                   << " — min-proto=" << dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION
                   << " prefix=" << dash::SharechainConfig::prefix_hex()
                   << " identifier=" << dash::SharechainConfig::identifier_hex()
-                  << (has_custom_network_id ? " (custom --network-id)" : "") << "\n";
+                  << (dash::SharechainConfig::is_named_v36_network() ? " (DASH v36 network)"
+                      : has_custom_network_id ? " (custom --network-id)" : "") << "\n";
     }
     // #754 download/outbound slice: ACTIVE outbound dialing from the addr
     // store (--addnode/--connect seeds registered by the NodeImpl ctor) plus
@@ -1963,7 +2006,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 out["min_protocol_version"]     = live_floor;
                 out["cold_min_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::MINIMUM_PROTOCOL_VERSION);
                 out["new_min_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION);
-                out["advertised_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::ADVERTISED_PROTOCOL_VERSION);
+                // The active profile's advert: 3600 public (== ADVERTISED_PROTOCOL_VERSION),
+                // 3601 on the private/isolated v36 sharechain (what send_version puts on the wire).
+                out["advertised_protocol_version"] = static_cast<int64_t>(dash::SharechainConfig::share_profile().advertised_protocol_version);
                 // DASH shares are wire-format v16 through the whole crossing (only the
                 // desired-version vote moves 16→36; there is no v36 share FORMAT for
                 // DASH), so the node's live share version is 16 until the floor latches.
@@ -3681,23 +3726,39 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // txs fails loud (broadcast NOTHING, telemetry still recorded) rather than
     // emit an incomplete block -- reward-safe, and it fills in with mempool
     // tx-selection later with no change here.
+    //
+    // The DASH v36 network: a v36 share commits the template's txs through its
+    // coinbase merkle_link and carries no tx refs, so only the finder can
+    // rebuild the full block -- from the producer job it froze (mint_registry,
+    // keyed by the share's ref_hash; FrozenMintJob::tx_data_hex). Every other
+    // node refuses a tx-committing v36 won block (the finder's stratum arm
+    // already submitted it). The registry is created here so the reconstructor
+    // and the mint wiring below share the one instance.
+    auto mint_registry = std::make_shared<dash::mint::FrozenJobRegistry>();
     {
         auto& won_tracker = p2p_node.tracker();
         const core::CoinParams won_params = mint_params;
         core::MiningInterface* won_mi =
             web_server ? web_server->get_mining_interface() : nullptr;
 
+        // v36 finder bodies: the template this node froze for the share's ref.
+        dash::coin::FinderBodiesLookup won_finder =
+            [mint_registry](const uint256& ref) -> std::optional<dash::coin::FinderTemplateBodies> {
+                auto job = mint_registry->get(ref);
+                if (!job || !job->tx_data_hex) return std::nullopt;
+                return dash::coin::FinderTemplateBodies{job->desired_tx_hashes, job->tx_data_hex};
+            };
         dash::coin::WonBlockReconstructor won_reconstruct =
-            [&won_tracker, won_params](const uint256& sh)
+            [&won_tracker, won_params, won_finder](const uint256& sh)
                 -> std::optional<dash::coin::ReconstructedWonBlock> {
                 if (!won_tracker.chain.contains(sh)) return std::nullopt;
                 std::optional<dash::coin::ReconstructedWonBlock> result;
                 won_tracker.chain.get_share(sh).invoke([&](auto* obj) {
                     if (!obj) return;
-                    // Both live share types (v36 = private/isolated v36 sharechain;
-                    // its block is coinbase-only by construction).
+                    // Both live share types (v36 = the DASH v36 network; a
+                    // tx-committing v36 block is rebuilt from won_finder only).
                     result = dash::coin::reconstruct_won_block(
-                        sh, *obj, won_tracker, won_params, /*known_txs=*/{});
+                        sh, *obj, won_tracker, won_params, /*known_txs=*/{}, won_finder);
                 });
                 return result;
             };
@@ -3909,6 +3970,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // to real dashd (both merkle roots reproduced from the mnlistdiff wire); the
     // SML+quorum freshness + superblock viability gates keep it fail-safe.
     work_source->set_embedded_mainnet(embedded_mainnet);
+    // The DASH v36 network (custom --network-id) takes its mining work from
+    // dashd getblocktemplate only: its shares commit the template's txs and the
+    // finder assembles the block from the bodies dashd served. Without a dashd
+    // RPC arm there is no mining work at all -- stratum is not started (the node
+    // still relays the sharechain). Public profile: unchanged.
+    const dash::coin::V36WorkPolicy v36_work_policy = dash::coin::resolve_v36_work_policy(
+        dash::SharechainConfig::share_profile().target_share_version >= 36,
+        static_cast<bool>(rpc));
+    work_source->set_dashd_templates_only(v36_work_policy.dashd_templates_only);
+    if (v36_work_policy.dashd_templates_only) {
+        if (v36_work_policy.serve_stratum)
+            std::cout << "[run] the DASH v36 network takes mining work from dashd "
+                         "getblocktemplate only (embedded template arm not served)\n";
+        else
+            std::cout << "[run] the DASH v36 network takes mining work from dashd "
+                         "getblocktemplate only: --coin-rpc/--coin-daemon (with creds) "
+                         "is REQUIRED; stratum NOT started (sharechain relay only)\n";
+    }
     // #961 cross-lane (B4): publish DASH's REGISTRY-SOURCED own-coin payout-address
     // acceptance into the StratumConfig the core StratumServer reads, so the SAME
     // decide_payout_address() door-reject (mining.authorize) + no-empty-payout
@@ -4067,7 +4146,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // node's IO-thread invariants (try_to_lock tracker access) hold.
     {
         dash::Node* node_ptr = &p2p_node;
-        auto mint_registry = std::make_shared<dash::mint::FrozenJobRegistry>();
+        // mint_registry: created above, shared with the won-block reconstructor.
 
         // ── Operator message blob -> minted v36 shares' message_data ──────
         // Private/isolated DASH v36 sharechain only: the --message-blob-hex
@@ -4652,7 +4731,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // sees it once live. Display/telemetry only; never drives coinbase.
     dash::coin::CoinStateMaintainer* coinwork_maintainer = nullptr;
 
-    if (stratum_port != 0) {
+    if (stratum_port != 0 && v36_work_policy.serve_stratum) {
         stratum_server = std::make_unique<core::StratumServer>(
             ioc, stratum_host, stratum_port, work_source);
         if (stratum_server->start()) {
@@ -4851,6 +4930,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << stratum_port << " -- stratum disabled\n";
             stratum_server.reset();
         }
+    } else if (stratum_port != 0) {
+        std::cout << "[run] stratum disabled: the DASH v36 network requires a dashd "
+                     "RPC arm (--coin-rpc) for mining work\n";
     } else {
         std::cout << "[run] stratum disabled (no --stratum flag)\n";
     }
@@ -11605,6 +11687,8 @@ int main(int argc, char** argv)
     std::string settings_path;                 // --settings PATH (M0b; empty => default probe)
     std::string network_id_hex;                // --network-id: private sharechain IDENTIFIER (empty = public net)
     std::string prefix_hex_cli;                // --prefix: private sharechain PREFIX (needs --network-id)
+    std::string net_name;                      // --net NAME: named sharechain network ("dash-v36"; empty = none)
+    dash::SharechainConfig::NamedNetwork named_network = dash::SharechainConfig::NamedNetwork::None;
     bool want_dump_config = false;             // --dump-resolved-config (M0b)
     bool want_ack_money   = false;             // --ack-money-settings (M0b)
     // Optional encrypted authority message_data blob for local v36 shares +
@@ -11677,6 +11761,12 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--prefix") == 0) {
             if (i + 1 >= argc) { std::cerr << "error: --prefix requires a HEX argument\n"; return 1; }
             prefix_hex_cli = argv[++i];
+        }
+        // Named sharechain network (--net dash-v36 = the DASH v36 network).
+        // Validated with the identity flags after the settings overlay below.
+        else if (std::strcmp(argv[i], "--net") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') { std::cerr << "error: --net requires a NAME argument (dash-v36)\n"; return 1; }
+            net_name = argv[++i];
         }
         else if (std::strcmp(argv[i], "--coin-p2p-connect") == 0 && i + 1 < argc)
             coin_p2p_raw.emplace_back(argv[++i]);
@@ -12066,9 +12156,13 @@ int main(int argc, char** argv)
         // override itself is applied once, below, before the run dispatch.
         if (rc.file_set("sharechain.network_id")) network_id_hex = rc.get_string("sharechain.network_id").value_or(network_id_hex);
         if (rc.file_set("sharechain.prefix"))     prefix_hex_cli = rc.get_string("sharechain.prefix").value_or(prefix_hex_cli);
+        if (rc.file_set("sharechain.network"))    net_name       = rc.get_string("sharechain.network").value_or(net_name);
         {
             std::string nid_err;
-            if (!dash::validate_network_id_args(network_id_hex, prefix_hex_cli, nid_err)) {
+            // --net first: it rejects --net combined with --network-id /
+            // --prefix (from either surface) before either is applied.
+            if (!dash::validate_sharechain_identity_args(net_name, network_id_hex, prefix_hex_cli,
+                                                         testnet, named_network, nid_err)) {
                 std::cerr << "error: " << nid_err << "\n";
                 return 1;
             }
@@ -12212,7 +12306,7 @@ int main(int argc, char** argv)
     // run_node's identity-scoped data subdir would stay the public one).
     // Both values were validated (and lower-cased) on the merged file+CLI value
     // in the settings block above, before the --dump-resolved-config exit.
-    dash::SharechainConfig::set_network_id(network_id_hex, prefix_hex_cli);
+    dash::apply_sharechain_identity(named_network, network_id_hex, prefix_hex_cli);
 
     // D-MINER.7 key exchange helper: create-or-load the alert key (same default
     // path run_node uses, identity-scoped by --testnet / --network-id), print

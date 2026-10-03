@@ -358,6 +358,16 @@ public:
     /// not a superblock height — else it fails safe to the dashd fallback.
     void set_embedded_mainnet(bool v) { embedded_mainnet_ = v; }
 
+    /// The DASH v36 network takes its mining work from dashd getblocktemplate
+    /// only (coin/v36_work_policy.hpp): when ON, the embedded template arm is
+    /// never served -- on testnet/regtest and under --embedded-mainnet alike --
+    /// and every template comes from the dashd fallback, whose tx bodies the
+    /// finder assembles the won block from. The decline is published as
+    /// no_work_reason "dashd-templates-only". Default OFF: the public profile
+    /// is unchanged.
+    void set_dashd_templates_only(bool v) { dashd_templates_only_ = v; }
+    bool dashd_templates_only() const { return dashd_templates_only_; }
+
     /// GBT-xcheck reward-safety BACKSTOP (soak). When a dashd is reachable (the
     /// fallback arm), cross-check the EMBEDDED CbTx's creditPoolBalance against
     /// dashd getblocktemplate's before serving; on mismatch, serve dashd's
@@ -826,6 +836,7 @@ private:
     bool is_testnet_{false};
     bool is_regtest_{false};  // #961: --regtest payout-address acceptance set
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
+    bool dashd_templates_only_{false};   // DASH v36 network: never serve the embedded arm
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
     bool tx_serve_own_set_{false};   // --embedded-tx-serve-own-set: serve own valid tx set instead of dashd-parity swap (DEFAULT OFF)
     // Observability for the own-set referee (lock-free; published in embedded_arm_status_json).

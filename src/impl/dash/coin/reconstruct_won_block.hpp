@@ -37,9 +37,19 @@
 //
 // COINBASE-ONLY is the DAEMONLESS NORM (transactions==[]): the share carries no
 // transaction_hash_refs, other_tx_hashes is empty, the block is [gentx] alone,
-// and merkle_root == gentx_txid (an empty merkle_link is identity). That is the
-// path this reconstructor takes today; the ref-walk + known-tx bodies fill in
-// automatically as embedded mempool tx-selection lands, with no change here.
+// and merkle_root == gentx_txid (an empty merkle_link is identity). On the v16
+// share the ref-walk + known-tx bodies fill in automatically as embedded mempool
+// tx-selection lands, with no change here.
+//
+// THE DASH v36 NETWORK commits the template's transactions differently: a v36
+// share carries no tx refs, only the coinbase merkle_link (the branch from the
+// coinbase to the header merkle root), which is all a peer needs to verify the
+// PoW. The tx BODIES exist only on the node that served the template -- the
+// finder -- frozen with the producer job (FrozenMintJob::tx_data_hex). A v36
+// share whose link is non-empty is therefore rebuilt ONLY from the finder's
+// frozen job (FinderBodiesLookup), and only when those bodies hash to the
+// share's committed merkle root; every other node refuses it (fail-loud, never
+// an incomplete block) -- the finder's stratum arm already carried the block.
 //
 // Reward/consensus-NEUTRAL: it READS already-validated share_info + the on-chain
 // PPLNS window (the SAME reads the accept path already did under the same tracker
@@ -48,11 +58,14 @@
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -78,6 +91,90 @@ namespace coin
 // references other txs fails loud (coinbase-only still reconstructs).
 using KnownTxLookup =
     std::function<const std::vector<unsigned char>*(const uint256&)>;
+
+// ── v36 finder bodies ───────────────────────────────────────────────────────
+// The template a v36 producer job was built over, as the finder froze it: the
+// tx hashes in template order (FrozenMintJob::desired_tx_hashes) and the
+// parallel hex bodies (FrozenMintJob::tx_data_hex). Looked up by the share's
+// ref_hash (the FrozenJobRegistry key); nullopt when this node holds no such
+// job (not the finder, or the job was evicted).
+struct FinderTemplateBodies
+{
+    std::vector<uint256> tx_hashes;
+    std::shared_ptr<const std::vector<std::string>> tx_data_hex;
+};
+using FinderBodiesLookup =
+    std::function<std::optional<FinderTemplateBodies>(const uint256& ref_hash)>;
+
+// v36_finder_block_bodies (pure): the non-coinbase bodies of a v36 won block, in
+// template order, or nullopt (with the cause in *why) unless ALL of:
+//   * one body per tx hash, at least one;
+//   * sha256d(body[i]) == tx_hashes[i] (the body IS the committed tx);
+//   * the merkle root over [gentx_txid] ++ tx_hashes (dashcore's fold: duplicate
+//     the last node of an odd layer; a CVE-2012-2459 duplicate-pair mutation is
+//     refused) equals check_merkle_link(gentx_txid, share.m_merkle_link) -- the
+//     root the share's header commits and peers verified the PoW over.
+// So the block framed from these bodies passes dashd's merkle-root check by
+// construction, or nothing is framed.
+inline std::optional<std::vector<std::vector<unsigned char>>>
+v36_finder_block_bodies(const DashV36Share& share,
+                        const uint256& gentx_txid,
+                        const FinderTemplateBodies& fb,
+                        std::string* why = nullptr)
+{
+    auto fail = [&](std::string cause)
+        -> std::optional<std::vector<std::vector<unsigned char>>> {
+        if (why) *why = std::move(cause);
+        return std::nullopt;
+    };
+    if (!fb.tx_data_hex)
+        return fail("no template tx bodies frozen with the job");
+    if (fb.tx_hashes.empty())
+        return fail("the frozen job carries no transactions");
+    if (fb.tx_data_hex->size() != fb.tx_hashes.size())
+        return fail(std::to_string(fb.tx_hashes.size()) + " tx hashes but " +
+                    std::to_string(fb.tx_data_hex->size()) + " bodies");
+
+    std::vector<std::vector<unsigned char>> bodies;
+    bodies.reserve(fb.tx_hashes.size());
+    for (size_t i = 0; i < fb.tx_hashes.size(); ++i) {
+        std::vector<unsigned char> body = ParseHex((*fb.tx_data_hex)[i]);
+        if (body.empty() || body.size() * 2 != (*fb.tx_data_hex)[i].size())
+            return fail("tx " + std::to_string(i) + " body is not valid hex");
+        const uint256 txid = Hash(std::span<const unsigned char>(body.data(), body.size()));
+        if (txid != fb.tx_hashes[i])
+            return fail("tx " + std::to_string(i) + " body hashes to " +
+                        txid.GetHex().substr(0, 16) + ", template lists " +
+                        fb.tx_hashes[i].GetHex().substr(0, 16));
+        bodies.push_back(std::move(body));
+    }
+
+    std::vector<uint256> layer;
+    layer.reserve(1 + fb.tx_hashes.size());
+    layer.push_back(gentx_txid);
+    layer.insert(layer.end(), fb.tx_hashes.begin(), fb.tx_hashes.end());
+    while (layer.size() > 1) {
+        for (size_t pos = 0; pos + 1 < layer.size(); pos += 2)
+            if (layer[pos] == layer[pos + 1])
+                return fail("duplicate txid pair in the template (mutated merkle tree)");
+        if (layer.size() & 1) layer.push_back(layer.back());
+        std::vector<uint256> next;
+        next.reserve(layer.size() / 2);
+        for (size_t i = 0; i + 1 < layer.size(); i += 2) {
+            unsigned char buf[64];
+            std::memcpy(buf,      layer[i].data(),     32);
+            std::memcpy(buf + 32, layer[i + 1].data(), 32);
+            next.push_back(Hash(std::span<const unsigned char>(buf, 64)));
+        }
+        layer.swap(next);
+    }
+    const uint256 committed = check_merkle_link(gentx_txid, share.m_merkle_link);
+    if (layer[0] != committed)
+        return fail("template merkle root " + layer[0].GetHex().substr(0, 16) +
+                    " != the share's committed root " + committed.GetHex().substr(0, 16));
+    if (why) why->clear();
+    return bodies;
+}
 
 // ── resolve_other_tx_hashes (DASH) ──────────────────────────────────────────
 // Resolve a share's transaction_hash_refs to the ordered other_tx hash list,
@@ -186,9 +283,13 @@ frame_won_block(const bitcoin_family::coin::SmallBlockHeaderType& min_header,
 // via tracker.chain -- exactly the reads the accept path already performed under
 // this same lock. Returns std::nullopt (never throws) on any unrecoverable
 // condition so the caller broadcasts NOTHING.
-// Both live share types: a v36 share (private/isolated v36 sharechain) carries
-// no transaction_hash_refs, so its block is always the coinbase-only [gentx];
-// generate_share_transaction overload-resolves to the v36 coinbase.
+// Both live share types; generate_share_transaction overload-resolves to the
+// v36 coinbase. A v36 share (the DASH v36 network) carries no tx refs: with an
+// empty merkle_link its block is the coinbase-only [gentx]; with a non-empty
+// link the template's bodies come from `finder` (this node's frozen producer
+// job for the share's ref_hash) and must hash to the committed merkle root,
+// else nothing is built. `finder` is ignored for the v16 DashShare, whose other
+// txs resolve through the ref-walk + `known_txs` exactly as before.
 template <typename ShareT, typename TrackerT>
     requires is_live_share<ShareT>
 inline std::optional<ReconstructedWonBlock>
@@ -196,7 +297,8 @@ reconstruct_won_block(const uint256& share_hash,
                       const ShareT& share,
                       TrackerT& tracker,
                       const core::CoinParams& params,
-                      const KnownTxLookup& known_txs = {})
+                      const KnownTxLookup& known_txs = {},
+                      const FinderBodiesLookup& finder = {})
 {
     // Guard: the coinbase recompute needs the parent's PPLNS window in-chain.
     if (share.m_prev_hash.IsNull() || !tracker.chain.contains(share.m_prev_hash)) {
@@ -220,6 +322,37 @@ reconstruct_won_block(const uint256& share_hash,
                     << " coinbase regen empty -- NOT broadcast.";
         return std::nullopt;
     }
+
+    // 2 (v36). The DASH v36 network: the share commits the template's txs
+    //    through its merkle_link; only the finder holds the bodies.
+    if constexpr (std::is_same_v<ShareT, DashV36Share>) {
+        (void)known_txs;
+        if (share.m_merkle_link.m_branch.empty())
+            return frame_won_block(share.m_min_header, share.m_merkle_link, gentx, {});
+
+        const uint256 ref_hash = compute_v36_ref_hash(params, share);
+        std::optional<FinderTemplateBodies> fb;
+        if (finder) fb = finder(ref_hash);
+        if (!fb) {
+            LOG_WARNING << "[EMB-DASH] v36 won-block " << share_hash.GetHex().substr(0, 16)
+                      << " commits a " << share.m_merkle_link.m_branch.size()
+                      << "-branch merkle link but this node holds no template bodies for ref="
+                      << ref_hash.GetHex().substr(0, 16)
+                      << " (not the finder / frozen job evicted) -- NOT rebuilt; the "
+                         "finder's stratum arm carries the full block";
+            return std::nullopt;
+        }
+        std::string why;
+        auto bodies = v36_finder_block_bodies(share, gentx.txid, *fb, &why);
+        if (!bodies) {
+            LOG_ERROR << "[EMB-DASH] v36 won-block " << share_hash.GetHex().substr(0, 16)
+                      << " frozen template does not match the share's merkle link ("
+                      << why << ") -- INCOMPLETE, NOT broadcast.";
+            return std::nullopt;
+        }
+        return frame_won_block(share.m_min_header, share.m_merkle_link, gentx, *bodies);
+    }
+    (void)finder;   // v16: other txs resolve through the ref-walk below
 
     // 2. Resolve any other (non-coinbase) tx bodies. Empty for the coinbase-only
     //    daemonless norm. Missing body / malformed ref -> fail loud.

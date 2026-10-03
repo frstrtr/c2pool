@@ -9,7 +9,11 @@
 // on a chain that still carries lane blocks of an EARLIER pool (same chain_id
 // and config) could not decide their roots, held them and suspended the lane.
 //
-//   pool_tag = sha256d( 'V37PT' || lane_tag || pool_genesis_id )     (32 B)
+//   pool_tag = sha256d( 'V37PT2' || lane_tag || pool_genesis_id || rules_digest )   (32 B)
+//
+// (LANE-RULES flag day, operator ruling R3 2026-10-02: rules_digest joined the
+// preimage and the domain moved from 'V37PT' to 'V37PT2'; the V37P field, its
+// 37 bytes and its version byte are unchanged.)
 //
 //   lane_tag         the S1 roundabout tag the relay HELLO already carries
 //                    (rb_lane_tag.hpp, single-roundabout values map_epoch 0,
@@ -20,6 +24,15 @@
 //                    is ONE default pool per network; a new pool picks its own
 //                    random id (e.g. `openssl rand -hex 32`) and every node of
 //                    that pool runs with it.
+//   rules_digest     sha256d of the node's LaneRules list (xmr_lane_rules.hpp):
+//                    every settlement rule outside LaneParams (D_conf, owed
+//                    floor, output cap, root-age bound, booking order, ledger
+//                    rule bits, compiled-in constants, the drain placeholders)
+//                    plus the HELLO lane_params_digest and enrol digest. A node
+//                    with other rules computes ANOTHER pool_tag, so our lane
+//                    blocks are Foreign ("not-lane") on it and it books none of
+//                    them: never Mismatch / debit-only. Every input is a
+//                    HELLO-compared field, so HELLO-compatible <=> equal tag.
 //
 // Every lane block a pool builds commits pool_tag in the V37C coinbase tail
 // (the versioned "V37P" field, xmr_credit_cut.hpp). A chain block is a LANE
@@ -47,7 +60,7 @@ namespace c2pool::v37n::xmr::lineage {
 
 using ::v37::bytes32;
 
-inline constexpr const char* TAG_POOL_TAG     = "V37PT";   // pool_tag domain
+inline constexpr const char* TAG_POOL_TAG     = "V37PT2";  // pool_tag domain (LANE-RULES: was "V37PT")
 inline constexpr const char* TAG_POOL_GENESIS = "V37PG";   // default per-network genesis domain
 
 // The default pool genesis of a network (0 mainnet 1 testnet 2 stagenet 3
@@ -67,16 +80,20 @@ inline bytes32 lane_tag_of(std::uint32_t chain_id, const ::v37::LaneParams& p,
     return ::c2pool::v37n::rb::lane_tag(ctx, 0, 0, 0);
 }
 
-inline bytes32 pool_tag(const bytes32& lane_tag, const bytes32& pool_genesis_id) {
+// `rules_digest` = lanerules::rules_digest(the node's LaneRules). There is no
+// overload without it: a tag that ignores the lane rules is the A2 fork.
+inline bytes32 pool_tag(const bytes32& lane_tag, const bytes32& pool_genesis_id, const bytes32& rules_digest) {
     std::vector<std::uint8_t> b;
     ::c2pool::v37n::rb::put_tag(b, TAG_POOL_TAG);
     ::c2pool::v37n::rb::put_b32(b, lane_tag);
     ::c2pool::v37n::rb::put_b32(b, pool_genesis_id);
+    ::c2pool::v37n::rb::put_b32(b, rules_digest);
     return ::c2pool::v37n::rb::hash_bytes(b);
 }
 
-inline bytes32 pool_tag_for(std::uint32_t chain_id, const ::v37::LaneParams& p, const bytes32& pool_genesis_id) {
-    return pool_tag(lane_tag_of(chain_id, p), pool_genesis_id);
+inline bytes32 pool_tag_for(std::uint32_t chain_id, const ::v37::LaneParams& p, const bytes32& pool_genesis_id,
+                            const bytes32& rules_digest) {
+    return pool_tag(lane_tag_of(chain_id, p), pool_genesis_id, rules_digest);
 }
 
 // --pool-genesis <hex64>: exactly 64 hex digits (either case), nothing else.

@@ -129,6 +129,13 @@ inline constexpr std::size_t PAYNOW_TAIL_BYTES = 12;  // 4 magic + 8 u64 base
 // static_asserted in v37_xmr_empty_cut_finder_kat). The widest payload is
 // then 14 + 32 + 69 + 12 + 12 + 37 + 44 = 220 B (<= 255, two-byte varint).
 inline constexpr std::size_t FINDER_FIELD_BYTES = 69;  // 4 magic + 1 kind + 64 payee
+// REWARD TOTAL (share-level canonical coinbase): "V37R" || u64le(total) FIRST
+// in the tail (consumer tree xmr_paynow.hpp paynow::kRewardTotalFieldBytes ==
+// 12, static_asserted in v37_xmr_share_verdict_kat). Written by the seam from
+// the FINAL adopted budget, so a receipt's open tx_extra carries the total its
+// hidden outputs sum to. Widest payload: 220 + 12 = 232 B (<= 255).
+inline constexpr std::size_t REWARD_TOTAL_FIELD_BYTES = 12;  // 4 magic + 8 u64 total
+inline constexpr unsigned char REWARD_TOTAL_MAGIC[4] = {'V', '3', '7', 'R'};
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -327,7 +334,18 @@ public:
 
     // recon(A+B credit): the on-chain credit cut tail the template appends to the 0x02 payload.
     void set_extra_nonce_tail(std::vector<std::uint8_t> t) { m_tail = std::move(t); }
-    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override { return m_tail; }
+    // REWARD TOTAL: prefix the tail with "V37R" || u64le(budget). The template
+    // re-reads the tail on every create_miner_tx, and the budget it reads on the
+    // final call is the adopted final reward (split_reward runs first).
+    void set_reward_total_field(bool on) { m_total_field = on; }
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
+        if (!m_total_field) return m_tail;
+        std::vector<std::uint8_t> t(REWARD_TOTAL_MAGIC, REWARD_TOTAL_MAGIC + 4);
+        const std::uint64_t v = m_in.budget();
+        for (int i = 0; i < 8; ++i) t.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        t.insert(t.end(), m_tail.begin(), m_tail.end());
+        return t;
+    }
 
     // SEAM-1 (GAP-2 rbind): the per-job binding the template writes after the
     // worker nonce. size 0 / no function => none (byte-identical template).
@@ -341,6 +359,7 @@ public:
 private:
     X6SettlementSource() = default;
     std::vector<std::uint8_t> m_tail;   // recon(A+B credit)
+    bool             m_total_field = false;   // REWARD TOTAL ("V37R" first in the tail)
     std::size_t      m_bind_size = 0;   // SEAM-1
     ExtraNonceBindFn m_bind;            // SEAM-1
 
@@ -354,7 +373,9 @@ private:
             const CoinbaseOutput& a = alt[i];
             const CoinbaseOutput& b = m_cb.outputs[i];
             if (a.role != b.role || !(a.pay == b.pay) || a.identity != b.identity) return false;
-            if (a.amount == 0) return false;   // never emit a zero-amount output
+            // never emit a zero-amount output, except the donation marker (a Fixed
+            // output declared at 0: the output itself is the marker, fee model v1)
+            if (a.amount == 0 && a.role != CoinbaseOutput::Role::Fixed) return false;
         }
         return true;
     }
@@ -661,6 +682,9 @@ struct AssemblyInputs {
     // recon(A+B credit): bytes appended to the 0x02 payload after the padded worker
     // nonce (the on-chain credit cut). Empty => byte-identical templates.
     std::vector<std::uint8_t>     extra_nonce_tail;
+    // REWARD TOTAL: the seam writes "V37R" || u64le(final reward) before
+    // extra_nonce_tail (share-level canonical coinbase; fee model v1 lanes).
+    bool                          reward_total_field = false;
     // SEAM-1 (GAP-2 rbind): bytes written right after the 4-byte worker nonce,
     // per extra_nonce ([extra_nonce 4 | bind | padding | tail]). 0 / empty =>
     // byte-identical templates. Size <= EXTRA_NONCE_BIND_MAX.
@@ -736,8 +760,15 @@ public:
         std::uint64_t fees_all = 0, weight_all = 0;
         for (const auto& t : mempool) { fees_all += t.fee; weight_all += t.weight; }
 
+        // SPEND-COST FLOOR (payout-threshold.md §3): the coinbase takes its room
+        // first and the transactions fill the rest (the trim above and the
+        // template's own pick both count the miner tx before any tx), so the cap
+        // is the wire ceiling, a constant every receiver can check. A cap chosen
+        // from the builder's own tx set is latitude a receiver cannot verify.
         if (base.output_cap == 0)
-            base.output_cap = ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
+            base.output_cap = base.spend_floor
+                ? a.wire_cap
+                : ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
 
         std::uint64_t hint = subsidy + fees_all;   // == the template's sizing-pass reward
         std::vector<std::uint64_t> tried;
@@ -750,6 +781,7 @@ public:
             std::unique_ptr<X6SettlementSource> seam = X6SettlementSource::build(in, subsidy, &sub);
             if (!seam) return fail("pass " + std::to_string(pass) + ": " + sub);
             seam->set_extra_nonce_tail(a.extra_nonce_tail);   // recon(A+B credit)
+            seam->set_reward_total_field(a.reward_total_field);  // REWARD TOTAL
             if (a.extra_nonce_bind_size > EXTRA_NONCE_BIND_MAX)
                 return fail("SEAM-1: extra_nonce_bind_size " + std::to_string(a.extra_nonce_bind_size) +
                             " > EXTRA_NONCE_BIND_MAX " + std::to_string(EXTRA_NONCE_BIND_MAX));

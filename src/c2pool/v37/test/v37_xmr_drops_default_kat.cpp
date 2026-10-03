@@ -10,7 +10,8 @@
 // V37.1 activation (src/c2pool/CMakeLists.txt c2pool_xmr_drops_default); every
 // other coin keeps the flip at 0. Pins:
 //   DD1  the XMR build is armed: kActivateConsensusV1, kDropsWiringArmed, the
-//        default XmrNodeConfig lane = for_version(1) (DROPS ON, ridge OFF), and
+//        default XmrNodeConfig lane = for_version(1) + the Count estimator
+//        (DROPS ON, ridge OFF), and
 //        the DROPS bundle is constructed from it (make() non-null).
 //   DD2  HELLO: pool rules v3; a raindrops-OFF node (pool rules v2, bare
 //        LaneParams{}) is refused BOTH directions as TAG_MISMATCH field=version
@@ -76,8 +77,17 @@ int main() {
           cfg.lane_params.subthreshold.version == on.subthreshold.version,
           "DD1 XmrNodeConfig{}.lane_params carries the DROPS gate of for_version(1) (K=" +
           std::to_string(cfg.lane_params.subthreshold.K) + ")");
-    check(rl::lane_params_digest(cfg.lane_params, 8, rl::BindMode::None, 3) == rl::lane_params_digest(on, 8, rl::BindMode::None, 3),
-          "DD1 the default lane is field-for-field for_version(1) on the HELLO digest (no ridge, no fee)");
+    // The XMR default is for_version(1) with the Count estimator in place of
+    // K-min (mode 2, the drops floor shift 6): nothing else differs.
+    ::v37::LaneParams on_count = on;
+    on_count.subthreshold.mode = ::c2pool::v37n::xmr::kXmrCreditModeCount;
+    on_count.subthreshold.count_floor_shift = ::c2pool::v37n::xmr::kXmrDropsFloorShift;
+    check(cfg.lane_params.subthreshold.mode == 2 && cfg.lane_params.subthreshold.count_floor_shift == 6,
+          "DD1 the default XMR lane credits raindrops by Count (mode 2, floor shift 6)");
+    check(rl::lane_params_digest(cfg.lane_params, 8, rl::BindMode::None, 3) == rl::lane_params_digest(on_count, 8, rl::BindMode::None, 3),
+          "DD1 the default lane is field-for-field for_version(1) + Count on the HELLO digest (no ridge, no fee)");
+    check(rl::lane_params_digest(cfg.lane_params, 8, rl::BindMode::None, 3) != rl::lane_params_digest(on, 8, rl::BindMode::None, 3),
+          "DD1 a K-min (mode 1) XMR node is refused on lane_params_digest");
     check(!cfg.lane_params.fee.enabled, "DD1 the fee model stays opt-in (--fee-model v1)");
     auto w = dx::XmrDropsWiring::make(cfg.lane_params, 8, rl::kReceiptWeight);
     check(w != nullptr && w->floor_diff() == dx::drops_floor_diff(8), "DD1 XmrDropsWiring::make(default lane) builds the bundle");
@@ -86,9 +96,12 @@ int main() {
           "DD1 a lane without the gate still builds nothing (fail-closed)");
 
     std::printf("-- DD2 HELLO refuses a raindrops-OFF node by name\n");
-    check(rl::kXmrPoolRulesVersion == rl::kXmrPoolRulesVersionDropsOn && rl::kXmrPoolRulesVersion == 3,
-          "DD2 this XMR build HELLOs pool rules v3");
-    check(rl::node_pool_id(7, cfg.lane_params) == rl::pool_id_of(7, cfg.lane_params, 3), "DD2 node_pool_id folds v3");
+    // DROPS-SET-PIN: pool rules v4 (the winner's pinned raindrop set); v3 = DROPS on with a node-local set
+    check(rl::kXmrPoolRulesVersion == rl::kXmrPoolRulesVersionDropsOn && rl::kXmrPoolRulesVersion == 4,
+          "DD2 this XMR build HELLOs pool rules v4");
+    check(rl::node_pool_id(7, cfg.lane_params) == rl::pool_id_of(7, cfg.lane_params, 4), "DD2 node_pool_id folds v4");
+    check(rl::pool_rules_reason(4, 3).find("node-local raindrop set") != std::string::npos,
+          "DD2 a v3 (pre DROPS-SET-PIN) peer is refused by name");
     const rl::Hello ours = hello_of(cfg.lane_params, rl::kXmrPoolRulesVersion, 1);
     const rl::Hello ours2 = hello_of(cfg.lane_params, rl::kXmrPoolRulesVersion, 2);
     const rl::Hello old = hello_of(::v37::LaneParams{}, rl::kXmrPoolRulesVersionDropsOff, 3);   // the pre-default XMR HELLO

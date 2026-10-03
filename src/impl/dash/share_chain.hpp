@@ -342,7 +342,7 @@ inline ShareType load_share(chain::RawShare& rshare, NetService peer_addr)
 {
     auto stream = rshare.contents.as_stream();
     ShareType share;
-    if (SharechainConfig::isolated_v36())
+    if (SharechainConfig::v36_network())
     {
         // Private/isolated v36 sharechain: parse both wire types; the type the
         // chain admits is enforced at verify/admit (check_share_type_admitted).
