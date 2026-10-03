@@ -951,6 +951,120 @@ void s14_f_capped_take() {
 
 }  // namespace
 
+// ── S15 (HOLD-ROUND-3 F4): a prefix-hash mismatch with NO V37N base is never a strike ──
+// Stagenet attempt 8: before pay-now armed (the view at the cut credits nobody
+// for the first hours of a pool) templates carry no V37N base, so the finder's
+// post-FOUND shares -- cut at ITS dh, judged at the receivers' older dh -- fail
+// only at the last step ("the coinbase prefix hash is not the canonical one"),
+// the take classifier of S13/S14 had no number to classify, and every copy
+// was a strike (A 223, B 126, C 162; A banned B). Each struck receipt was
+// admitted later, in the late tail: three lane lineages, and the P > horizon
+// SUFFIX hold of 2220998 downstream. Same owed_digest both sides, the sender
+// one PENDING lane block apart, the cut EMPTY (no pay-now, no V37N):
+//   U1 the finder's share (built on L1) judged at L0 -> UNBASED (5): parked
+//      like AHEAD, never a strike; 120 copies -> strikes 0 bans 0 (base: -1 x 120 -> a ban)
+//   U2 the mirror (built on L0) judged at L1 -> UNBASED too (the sender's lag is
+//      invisible without a take; the relay expires it after kShareUnbasedMaxRounds)
+//   U3 a lane block AT the share's height booked here -> LATE (as the take form)
+//   U4 a thief template with no V37N is UNBASED as well (never a strike: the
+//      park bounds and the re-judge rounds are the only cost); a V37N-bearing
+//      forged take still strikes (S13 B3 unchanged)
+//   U5 the receiver books the finder's block (share_publish puts L1): the parked
+//      share re-judges CANONICAL
+#if defined(C2POOL_XMR_SHARE_VERDICT_UNBASED)
+constexpr int kUnbased = rl::kShareVerdictUnbased;
+#else
+constexpr int kUnbased = 5;   // the base has no UNBASED code (it returns -1)
+#endif
+std::shared_ptr<rl::ShareStateEntry> unbased_entry(const st::OwedLedger& L, const World& w) {
+    auto e = drain_entry(L, w);
+    e->payees.clear();   // the view at the anchor credits nobody: pay-now not armed, no V37N in the canonical tail
+    return e;
+}
+void s15_unbased_prefix_mismatch() {
+    std::printf("== S15. a prefix-hash mismatch with no V37N base (pay-now not armed): parked, never a strike ==\n");
+    World w;
+    st::OwedLedgerRules rules; rules.lane_height = true;
+    st::OwedLedger L0(kChain, rules);
+    seed(L0, w.K1.id, 40000000000ll, 10); seed(L0, w.K2.id, 25000000000ll, 11);
+    st::LaneFound la; la.height = kHeight - 14;
+    L0.on_block_found("lane-a", Amounts{{w.K1.id, 1000}}, {}, std::nullopt, nullptr, &la);
+    L0.on_block_finalized("lane-a", 12);
+    st::OwedLedger L1 = L0;
+    st::LaneFound lb; lb.height = kHeight - 4;
+    L1.on_block_found("lane-b", Amounts{}, Amounts{{w.K1.id, 2000000000ll}}, std::nullopt, nullptr, &lb);   // the finder's own FOUND, pending
+    st::OwedLedger L2 = L0;
+    st::LaneFound lc; lc.height = kHeight;
+    L2.on_block_found("lane-c", Amounts{}, {}, std::nullopt, nullptr, &lc);
+    CHECK(L0.prev_lane_height() == kHeight - 14 && L1.prev_lane_height() == kHeight - 4 && L0.owed_digest() == L1.owed_digest(),
+          "L0 prev_lane h-14, L1 = L0 + pending lane block at h-4 (same owed_digest), L2 prev_lane = h");
+    BuildOpts o; o.cut_payees = {}; o.drain = true;   // an EMPTY cut: pay-now not armed -> no V37N base
+    const Block b0 = build_block(L0, w.lane, o), b1 = build_block(L1, w.lane, o);
+    CHECK(b0.ok && b1.ok, "drain templates with an empty cut build on L0 and L1: %s %s", b0.why.c_str(), b1.why.c_str());
+    if (!b0.ok || !b1.ok) return;
+    const Share s0 = share_of(b0), s1 = share_of(b1);
+    const auto p0 = cr::extra_nonce_field(s0.tx_extra), p1 = cr::extra_nonce_field(s1.tx_extra);
+    CHECK(s0.ok && s1.ok && p0 && p1 && !pn::parse_payload(*p0) && !pn::parse_payload(*p1),
+          "neither share commits a V37N base (the attempt-8 first-hours shape)");
+    std::string why;
+    {
+        rl::ShareStateStore own0, own1;
+        own0.put(unbased_entry(L0, w)); own1.put(unbased_entry(L1, w));
+        const int v0 = relay_verdict(own0, s0, why); const std::string w0 = why;
+        const int v1 = relay_verdict(own1, s1, why);
+        CHECK(v0 == 1 && v1 == 1, "each share is CANONICAL on the state it was built on (L0: %d %s; L1: %d %s)", v0, w0.c_str(), v1, why.c_str());
+    }
+    rl::ShareStateStore at0;
+    at0.put(unbased_entry(L0, w));
+    {
+        std::uint64_t strikes = 0, bans = 0, parked = 0, dropped = 0;
+        ::c2pool::xmr::CarrierDosBudget dos;
+        bool banned = false;
+        int v = 0;
+        for (int i = 0; i < 120; ++i) {
+            v = relay_verdict(at0, s1, why);
+            if (v < 0) { ++strikes; if (dos.on_cheap_reject(2) == ::c2pool::xmr::Action::Ban && !banned) { banned = true; ++bans; } }
+            else if (v == kUnbased || v == kAhead) ++parked;
+            else ++dropped;
+        }
+        CHECK(v == kUnbased && why.find("unbased") != std::string::npos && why.find("no V37N base") != std::string::npos,
+              "U1 the finder's post-FOUND share (no V37N) on a receiver at L0: UNBASED (%d; base: -1 'prefix hash is not the canonical one' -> a strike) -- %s",
+              v, why.c_str());
+        CHECK(strikes == 0 && bans == 0 && parked == 120,
+              "U1 120 copies: strikes %llu bans %llu parked %llu (8a7ed91b3: 120 strikes -> 1 ban; attempt 8: A banned B)",
+              (unsigned long long)strikes, (unsigned long long)bans, (unsigned long long)parked);
+    }
+    rl::ShareStateStore at1;
+    at1.put(unbased_entry(L1, w));
+    const int vb = relay_verdict(at1, s0, why);
+    CHECK(vb == kUnbased, "U2 the mirror (a share built before the receiver's lane block, no V37N): UNBASED too (%d, parked; the relay expires it) -- %s", vb, why.c_str());
+    rl::ShareStateStore at2;
+    at2.put(unbased_entry(L2, w));
+    const int vl = relay_verdict(at2, s0, why);
+    CHECK(vl == kLate && why.find("late") != std::string::npos, "U3 a lane block AT the share's height booked here: LATE (%d, dropped, no strike) -- %s", vl, why.c_str());
+    {
+        BuildOpts t = o;
+        t.mutate = [&](x6::CoinbaseInputs& in) { for (auto& x : in.owed) { x.pay = w.thief.ref; x.identity = w.thief.id; } };
+        const Block tb = build_block(L0, w.lane, t);
+        CHECK(tb.ok, "a thief template with no V37N builds: %s", tb.why.c_str());
+        if (tb.ok) {
+            const int v = relay_verdict(at0, share_of(tb), why);
+            CHECK(v == kUnbased, "U4 a thief template with no V37N base is UNBASED (%d): parked, never a strike -- bounded by the park and its re-judge rounds (the accepted no-strike channel)", v);
+        }
+        BuildOpts f; f.cut_payees = w.cut; f.drain = true; f.retail = true;   // pay-now armed: a V37N base
+        f.mutate = [](x6::CoinbaseInputs& in) { if (!in.owed.empty()) in.owed.front().owed += 1000000007ull; in.drain_budget += 1000000007ull; };
+        const Block fb = build_block(L0, w.lane, f);
+        if (fb.ok) {
+            rl::ShareStateStore d0; d0.put(drain_entry(L0, w));
+            const int v = relay_verdict(d0, share_of(fb), why);
+            CHECK(v == -1, "U4 a V37N-bearing forged take still strikes (-1, as S13 B3): F4 widens no channel for shares that state a take -- %s", why.c_str());
+        }
+    }
+    at0.put(unbased_entry(L1, w));   // the receiver books the finder's lane block: share_publish puts L1
+    const int v5 = relay_verdict(at0, s1, why);
+    CHECK(v5 == 1, "U5 after the state advances to L1 the parked share re-judges CANONICAL (%d %s)", v5, why.c_str());
+}
+
 int main() {
     std::printf("v37_xmr_share_verdict_kat\n");
     s1_honest();
@@ -967,6 +1081,7 @@ int main() {
     s12_state_by_seq();
     s13_lane_prefix_skew();   // HOLD-ROUND-2 (B)
     s14_f_capped_take();      // HOLD-ROUND-2 V2
+    s15_unbased_prefix_mismatch();   // HOLD-ROUND-3 F4
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

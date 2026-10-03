@@ -132,7 +132,9 @@ public:
         u64 pushed = 0, push_failed = 0, late = 0, bins_closed = 0, reloaded = 0, reload_torn = 0, durable_writes = 0;
         u64 lane_pushes = 0;   // lane records written (== pushed with the fee model OFF)
         u64 late_dropped = 0;  // late receipts beyond the late tail (never pushed; late_tail_bins > 0 only)
+        u64 reload_binned = 0; // ★ HOLD-ROUND-3 (F2): reloaded receipts whose bin set_bin_of resolved at reload
     };
+#define C2POOL_XMR_RELOAD_BIN_RESOLVE 1
     // Engine push, done by the daemon (it owns the engine + the replay log).
     // Returns false if the record was not applied; fills the lane tip after it.
     using PushFn = std::function<bool(const ::v37::ScriptRef& payee, u64 w, u64& next_after, bytes32& digest_after)>;
@@ -144,7 +146,11 @@ public:
         : m_o(std::move(o)), m_push(std::move(push)), m_after(std::move(after)), m_hw(m_o.late_tail_bins) {}
 
     // ── SMOKE-NOISE: the compared, order-free lane-set digest (see header) ──
-    struct LaneSet { u64 through = 0; u64 n = 0; u64 unbinned = 0; bytes32 digest{}; };
+    struct LaneSet {
+        u64 through = 0; u64 n = 0; u64 unbinned = 0; bytes32 digest{};
+        std::vector<bytes32> unbinned_ids;   // ★ HOLD-ROUND-3 (4.10): the first kUnbinnedListed unresolved ids, for the status line
+    };
+    static constexpr std::size_t kUnbinnedListed = 8;
     // Origin bin of a receipt that carries none (a durable-log reload): its
     // prev_id's height in the ChainView. nullopt = not resolvable yet.
     using BinOfFn = std::function<std::optional<u64>(const FbReceipt&)>;
@@ -163,6 +169,7 @@ public:
         // grace window): the effective `through` is the last fully pushed bin.
         if (!m_bins.empty() && m_bins.begin()->first <= through) through = m_bins.begin()->first - 1;
         LaneSet out; out.through = through; out.unbinned = m_unbinned.size();
+        for (const auto& [id, r] : m_unbinned) { (void)r; if (out.unbinned_ids.size() >= kUnbinnedListed) break; out.unbinned_ids.push_back(id); }
         std::array<u64, 4> acc = m_set_old.acc;
         out.n = m_set_old.n;
         for (const auto& [b, e] : m_set_bins) {
@@ -178,6 +185,13 @@ public:
 
     // Replay the durable log (boot). on_loaded(Admitted) runs BEFORE the push so
     // the caller can re-seed the relay's dedup set. Returns records re-pushed.
+    // ★ HOLD-ROUND-3 (F2): a logged receipt carries no bin; it is resolved HERE
+    // through set_bin_of (the ChainView, else the origin-bin journal written at
+    // push time) before on_loaded sees it, so the relay's verified cache, the own
+    // order tail and the lane set all carry the bin a restart would otherwise
+    // lose. Stagenet attempt 8: node B restarted with 5 receipts whose parent was
+    // an ORPHANED block (gone from a ChainView rebuilt from main-chain headers);
+    // the settlement replay asked the ChainView alone and held forever.
     std::size_t reload(const std::function<void(const Admitted&)>& on_loaded) {
         if (m_o.durable_path.empty()) return 0;
         std::ifstream in(m_o.durable_path, std::ios::binary);
@@ -195,6 +209,8 @@ public:
             a.id = receipt_id(a.r);
             off += 4 + len;
             good_end = off;
+            if (a.bin == 0 && m_bin_of)   // ★ HOLD-ROUND-3 (F2): the journalled bin survives the reload
+                if (const auto b = m_bin_of(a.r); b && *b) { a.bin = *b; ++m_st.reload_binned; }
             if (on_loaded) on_loaded(a);
             if (!push_one(a, /*durable=*/false)) break;
             ++n;

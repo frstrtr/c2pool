@@ -241,6 +241,29 @@ inline int share_verdict_one(const std::shared_ptr<const ShareStateEntry>& e, co
             }
             why = res.why + " -- outside every drain regime: " + k.regime + " (G(H_cap) " + std::to_string(k.g_max) + "; " + nums + ")";
         }
+        // ★ HOLD-ROUND-3 (F4): the tails agree and the outputs do not, and the
+        // share commits NO V37N base -- the drain take it embodies is not stated
+        // anywhere, so the AHEAD / BEHIND regimes above had nothing to classify
+        // and this was a -1. Stagenet attempt 8: every lineage split was born
+        // here (receivers struck the finder's post-FOUND shares before pay-now
+        // armed, admitted them later in the late tail). The share's state is the
+        // same owed_digest as ours (else verdict 0), so it is a lane block ahead
+        // of us, behind us, or garbage: LATE when a lane block at or above its
+        // height is booked here (as the take form), else UNBASED -- parked like
+        // AHEAD, re-judged when our state advances, dropped without a strike
+        // after kShareUnbasedMaxRounds (xmr_relay_node.hpp). Never a strike.
+        if (!res.take_mismatch && res.prefix_hash_mismatch && !res.has_paynow_base) {
+            const std::uint64_t prev = e->ledger ? e->ledger->prev_lane_height() : res.prev_lane;
+            if (prev > 0 && coinbase_height <= prev) {
+                why = "late: a lane block at height " + std::to_string(prev) + " >= this share's height " +
+                      std::to_string(coinbase_height) + " is booked here (no V37N base; " + res.why + ")";
+                return kShareVerdictLate;
+            }
+            why = "unbased: the coinbase prefix hash is not the canonical one of this state and the share commits no V37N base "
+                  "(pay-now not armed): the sender's prev lane block differs from ours (" + std::to_string(prev) +
+                  ") or the template is not a lane template -- parked, re-judged on the next share state, never a strike";
+            return kShareVerdictUnbased;
+        }
         return -1;
     }
     return 0;
@@ -268,10 +291,9 @@ inline int share_verdict(ShareStateStore& store, const FbReceipt& r, const ::v37
         const int v = share_verdict_one(e, r, pb, coinbase_height, hp, w);
         if (v == 1) { why.clear(); return 1; }
         if (v == 0 && !undecided) { undecided = true; undecided_why = w; }
-        if (v >= kShareVerdictAhead) {
-            const int rank = v == kShareVerdictAhead ? 3 : v == kShareVerdictBehind ? 2 : 1;
-            const int cur  = skew == kShareVerdictAhead ? 3 : skew == kShareVerdictBehind ? 2 : skew == kShareVerdictLate ? 1 : 0;
-            if (rank > cur) { skew = v; skew_why = w; }
+        if (v >= kShareVerdictAhead) {   // AHEAD > UNBASED > BEHIND > LATE (HOLD-ROUND-3: UNBASED parks like AHEAD)
+            auto rank_of = [](int c) { return c == kShareVerdictAhead ? 4 : c == kShareVerdictUnbased ? 3 : c == kShareVerdictBehind ? 2 : c == kShareVerdictLate ? 1 : 0; };
+            if (rank_of(v) > rank_of(skew)) { skew = v; skew_why = w; }
         }
         if (first_why.empty()) first_why = w;
     }

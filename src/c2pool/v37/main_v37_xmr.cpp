@@ -1964,6 +1964,10 @@ static int run_live(const XmrNodeConfig& cfg) {
     // ALARMs (positions != P) and carried-witness mismatches on this node.
     std::uint64_t drops_lane_shadow_prefix = 0, drops_lane_record_prefix = 0, drops_records_made = 0, drops_record_miss = 0;
     std::uint64_t drops_lane_suffix_prefix = 0, drops_lane_hold_a0 = 0, drops_prefix_alarms = 0, drops_carry_mismatch_alarms = 0;
+    // ★ HOLD-ROUND-3: F1 settlement replays run from the prefix derivation; R3-8 compositions served from the memo
+    std::uint64_t drops_lane_replay_now = 0, drops_lane_memo_hits = 0;
+    std::set<std::string> drops_prefix_base_logged;   // one `drops-prefix base:` line per cut
+    c2pool::v37n::xmr::drops::ComposeMemo<DropsLaneOut> drops_compose_memo{8};
     std::set<std::string> drops_prefix_alarmed;
     const char* drops_prefix_src = "own"; std::uint64_t drops_prefix_a0 = 0;
     std::uint64_t drops_lane_composed = 0, drops_lane_nowin = 0, drops_lane_hold = 0, drops_lane_own_prefix = 0, drops_lane_repaired_prefix = 0;
@@ -2192,10 +2196,20 @@ static int run_live(const XmrNodeConfig& cfg) {
     // `use_own`: our own [0, a0) is the composed prefix (the walk reads our own
     // order tail); otherwise only the served suffix is checked, which never
     // refuses an honest order.
+    // ★ HOLD-ROUND-3 (F2): ONE origin-bin resolver for every path. The ChainView
+    // first; a header this boot never saw (a side block the chain reorged out,
+    // gone from a ChainView rebuilt from main-chain headers) -> the bin we
+    // journalled at push time (LaneBinJournal, DROPS-CARRY-LIVE (3)). Stagenet
+    // attempt 8, node B after its restart: the DROPS path had the journal, the
+    // settlement replay's canonical-order check had the ChainView alone -> "the
+    // origin bin of a repaired receipt is not resolvable yet" x593, permanent.
+    auto bin_of_prev = [&](const ::v37::bytes32& prev_id) -> std::optional<std::uint64_t> {
+        if (const auto c = relay_chain.lookup(prev_id)) return c->height;
+        if (const auto b = drops_bin_journal.lookup(prev_id)) { ++drops_bin_journal_hits; return b; }
+        return std::nullopt;
+    };
     const auto composed_bin_of_prev = [&](const ::v37::bytes32& prev_id) -> std::optional<std::uint64_t> {
-        const auto c = relay_chain.lookup(prev_id);
-        if (!c) return std::nullopt;
-        return c->height;
+        return bin_of_prev(prev_id);   // F2: the journal fallback on the replay path too
     };
     auto composed_order_check = [&](std::uint64_t a0, const std::vector<relay::OrderEntry>& served, bool use_own) -> relay::OrderCheck {
         if (!cfg.ledger_anchor_cut) return relay::OrderCheck{};   // the rule rides the anchor rule (gate OFF: as master)
@@ -2274,9 +2288,17 @@ static int run_live(const XmrNodeConfig& cfg) {
                 if (!relay_node->cached_share(id, payee, bin, raw)) { ++cut_pending; why = "cut-pending: a repaired receipt left the verified cache (retry)"; return nullptr; }
                 if (bin == 0) {
                     relay::FbReceipt r; ::v37::xmr::verify::ParsedBlob pb;
-                    if (relay::decode_fb_receipt(raw, r) && ::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb))
+                    ::v37::bytes32 prev{};
+                    if (relay::decode_fb_receipt(raw, r) && ::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb)) {
+                        prev = pb.prev_id;
                         if (const auto b = composed_bin_of_prev(pb.prev_id)) bin = *b;
-                    if (bin == 0) { ++cut_pending; why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (retry)"; return nullptr; }
+                    }
+                    if (bin == 0) {   // HOLD-ROUND-3 (4.10): name the receipt and its parent
+                        ++cut_pending;
+                        why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (retry; receipt " + hex_of(id).substr(0, 12) +
+                              " prev_id " + hex_of(prev).substr(0, 12) + " unknown to the chain view and the origin-bin journal)";
+                        return nullptr;
+                    }
                 }
                 served.push_back(relay::OrderEntry{id, bin});
             }
@@ -2328,12 +2350,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (drops_on_replay) drops_on_replay(key, P, a0, replay_base[key], ids);   // ★ DROPS-CARRY-SUFFIX
         if (a0) ++relay_repair_suffix;
         if (base_used == relay::RepairReplayer::kShadow) ++relay_repair_shadow;
+        // HOLD-ROUND-3 (4.10): name the base -- own, or WHICH shadow (its end P_end:digest)
         std::printf("relay-repair: reconstructed view at P=%llu spine=%s… from the winner-side order (%zu receipts, every one admitted here: RandomX-verified, or our own)%s\n",
                     (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), ids.size(),
                     a0 ? (" -- SUFFIX [" + std::to_string(a0) + "," + std::to_string(P) + ") after the first " + std::to_string(a0) +
-                          (base_used == relay::RepairReplayer::kShadow ? " pushes of the SHADOW (the last reconstructed winner-side order)"
+                          (base_used == relay::RepairReplayer::kShadow ? " pushes of the SHADOW P_end=" + std::to_string(shadow_end.first) + ":" +
+                                                                             hex_of(shadow_end.second).substr(0, 12) + " (a reconstructed winner-side order)"
                                                                        : " pushes of our own order") +
-                          " (the serving peer's vault horizon)").c_str() : "");
+                          " (the serving peer's vault horizon; base=" + std::string(base_used == relay::RepairReplayer::kShadow ? "shadow" : "own") +
+                          " peer a0 digest=" + (peer_a0_digest ? hex_of(*peer_a0_digest).substr(0, 12) : std::string("none")) + ")").c_str() : "");
         std::fflush(stdout);
         return rv;
     };
@@ -2708,12 +2733,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     // fetched (the same order fold_at_cut's relay_view replayed). nullopt = not
     // derivable now (HOLD, the relay-repair family; never refused).
     auto drops_bin_of = [&](const ::v37::bytes32& prev_id) -> std::optional<std::uint64_t> {
-        const auto c = relay_chain.lookup(prev_id);
-        if (!c) {   // ★ DROPS-CARRY-LIVE (3): a header this boot has not seen -- the bin we journalled at push time
-            if (const auto b = drops_bin_journal.lookup(prev_id)) { ++drops_bin_journal_hits; return b; }
-            return std::nullopt;
-        }
-        return c->height;
+        return bin_of_prev(prev_id);   // ★ DROPS-CARRY-LIVE (3) + HOLD-ROUND-3 (F2): the one resolver (ChainView, then the journal)
     };
     // ★ DROPS-ENROL-TIDY: fold our own lane log below the oldest cut a booking can
     // still ask it for (XmrDropsWiring "THE LANE-LOG BOUND"): the cuts of the lane
@@ -2746,9 +2766,16 @@ static int run_live(const XmrNodeConfig& cfg) {
             (void)relay_node->cached(id, nullptr, &give);
             if (bin == 0) {
                 relay::FbReceipt r; ::v37::xmr::verify::ParsedBlob pb;
-                if (relay::decode_fb_receipt(raw, r) && ::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb))
+                ::v37::bytes32 prev{};
+                if (relay::decode_fb_receipt(raw, r) && ::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb)) {
+                    prev = pb.prev_id;
                     if (const auto b = drops_bin_of(pb.prev_id)) bin = *b;
-                if (bin == 0) { why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (drops lane prefix; retry)"; return false; }
+                }
+                if (bin == 0) {
+                    why = "cut-pending: the origin bin of a repaired receipt is not resolvable yet (drops lane prefix; retry; receipt " +
+                          hex_of(id).substr(0, 12) + " prev_id " + hex_of(prev).substr(0, 12) + " unknown to the chain view and the origin-bin journal)";
+                    return false;
+                }
             }
             const auto n = c2pool::v37n::xmr::fee::receipt_lane_pushes(payee, give, fee_on, relay::kReceiptWeight,
                                                                        donation_net_of(cfg.network)).size();
@@ -2867,24 +2894,40 @@ static int run_live(const XmrNodeConfig& cfg) {
         const std::uint64_t a0 = relay_node->repair_a0(P, cc.spine_digest, &peer_a0);
         const c2pool::v37n::xmr::drops::PrefixRecord* shadow_rec = nullptr;
         if (a0 > 0) {
-            bool own_base = false, shadow_missing = false;
+            // ★ HOLD-ROUND-3 (F1): the base of [0, a0) is decided NOW by the settlement
+            // replay's own digest gate (drops::decide_suffix_base): our own order when
+            // our digest at a0 is the serving peer's; else the replay's base for this
+            // cut -- run HERE when it has not run yet (relay_view: idempotent, cached;
+            // the fold finds the cached view) -- a record for the whole cut, our own
+            // pushes, or the DROPS record of the SHADOW whose digest at a0 is exactly
+            // the peer's. Attempt 8, node A: the shadow existed, the record existed,
+            // the probe had matched them; only the replay had never been reached.
             const std::optional<::v37::bytes32> ours_a0 = relay_node->digest_at_deep(a0);
-            if (peer_a0 && ours_a0 && *ours_a0 == *peer_a0) own_base = true;
-            if (!own_base && rbi != replay_base.end() && rbi->second.a0 == a0) {
-                own_base = rbi->second.base == static_cast<int>(relay::RepairReplayer::kOwn);
-                if (!own_base && rbi->second.base == static_cast<int>(relay::RepairReplayer::kShadow)) {
-                    if (const auto ri = drops_records.find(rbi->second.shadow_key); ri != drops_records.end()) {
-                        shadow_rec = &ri->second; own_base = true;   // [0, a0) = that shadow's DROPS record
-                    } else shadow_missing = true;
-                }
-            }
-            if (!own_base) {
+            c2pool::v37n::xmr::drops::SuffixBaseQuery q;
+            q.P = P; q.a0 = a0; q.peer_a0 = peer_a0; q.ours_a0 = ours_a0; q.own_why = owhy; q.cut_key = pkey;
+            q.replay_base = [&](int& base, std::uint64_t& ra0, std::string& skey) {
+                const auto it = replay_base.find(pkey);
+                if (it == replay_base.end()) return false;
+                base = it->second.base; ra0 = it->second.a0; skey = it->second.shadow_key;
+                return true;
+            };
+            q.run_replay = [&](std::string& w) {
+                ++drops_lane_replay_now;
+                return relay_view(P, cc.spine_digest, hint, w) != nullptr;
+            };
+            q.cut_record = [&] { return drops_records.count(pkey) != 0; };
+            q.shadow_record = [&](const std::string& k) { return drops_records.count(k) != 0; };
+            q.shadow_with_digest = [&](std::uint64_t at, const ::v37::bytes32& d) -> std::optional<std::string> {
+                const auto m = relay_replayer.shadow_with_digest(at, d);
+                if (!m) return std::nullopt;
+                return std::to_string(m->first) + ":" + hex_of(m->second);
+            };
+            const auto dec = c2pool::v37n::xmr::drops::decide_suffix_base(q);
+            if (dec.kind == c2pool::v37n::xmr::drops::SuffixBaseDecision::kHold) {
                 ++drops_lane_hold_a0;
                 // HOLD-ROUND-2 O1: the two a0 digests, the replay base and owhy (attempt 7: the cause was unreadable)
-                c2pool::v37n::xmr::drops::SuffixHoldCause hc;
-                hc.P = P; hc.a0 = a0; hc.peer_a0 = peer_a0; hc.ours_a0 = ours_a0; hc.own_why = owhy;
-                hc.shadow_record_missing = shadow_missing;
-                if (rbi != replay_base.end()) { hc.replay_base = rbi->second.base; hc.replay_a0 = rbi->second.a0; }
+                c2pool::v37n::xmr::drops::SuffixHoldCause hc = dec.cause;
+                hc.peer_a0 = peer_a0; hc.ours_a0 = ours_a0; hc.own_why = owhy;
                 why = c2pool::v37n::xmr::drops::suffix_hold_why(hc);
                 if (drops_suffix_logged.size() > 4096) drops_suffix_logged.clear();
                 if (drops_suffix_logged.insert(pkey + ":" + why).second) {
@@ -2893,6 +2936,32 @@ static int run_live(const XmrNodeConfig& cfg) {
                 }
                 return std::nullopt;
             }
+            // HOLD-ROUND-3 (4.10): WHICH base the probe matched, once per cut
+            if (drops_prefix_base_logged.size() > 4096) drops_prefix_base_logged.clear();
+            if (drops_prefix_base_logged.insert(pkey).second) {
+                std::printf("drops-prefix base: P=%llu spine=%s… a0=%llu base=%s%s%s exact_a0_match=%s replay_ran_now=%s (a0 digest peer=%s ours=%s)\n",
+                            (unsigned long long)P, hex_of(cc.spine_digest).substr(0, 12).c_str(), (unsigned long long)a0, dec.base_name(),
+                            dec.kind == c2pool::v37n::xmr::drops::SuffixBaseDecision::kShadow ? " P_end:digest=" : "",
+                            dec.kind == c2pool::v37n::xmr::drops::SuffixBaseDecision::kShadow ? dec.shadow_key.substr(0, dec.shadow_key.find(':') + 13).c_str() : "",
+                            dec.exact ? "yes" : "no", dec.replay_ran_now ? "yes" : "no",
+                            c2pool::v37n::xmr::drops::hold_hex12(peer_a0, "none").c_str(), c2pool::v37n::xmr::drops::hold_hex12(ours_a0, "not-retained").c_str());
+                std::fflush(stdout);
+            }
+            if (dec.kind == c2pool::v37n::xmr::drops::SuffixBaseDecision::kRecord) {
+                // the replay run above left the record of the WHOLE cut (drops_on_replay)
+                const auto rbi2 = replay_base.find(pkey);
+                if (const auto ri = drops_records.find(pkey); ri != drops_records.end())
+                    if (auto lp = drops->merged_prefix(P, P, {}, drops_bin_of, &pw, &ri->second, nullptr)) {
+                        ++drops_lane_repaired_prefix; ++drops_lane_record_prefix; ++drops_lane_suffix_prefix;
+                        drops_prefix_src = "record"; drops_prefix_a0 = rbi2 != replay_base.end() ? rbi2->second.a0 : a0;
+                        return lp;
+                    }
+                why = "cut-pending: drops lane prefix of P=" + std::to_string(P) + " not derivable yet: " + pw.text;
+                return std::nullopt;
+            }
+            if (dec.kind == c2pool::v37n::xmr::drops::SuffixBaseDecision::kShadow)
+                shadow_rec = &drops_records.at(dec.shadow_key);   // [0, a0) = that shadow's DROPS record (decide_suffix_base saw it)
+            // kOwn: our own lane log over [0, a0) (shadow_rec stays null)
         }
         std::vector<c2pool::v37n::xmr::drops::ServedShare> served;
         if (!drops_served_of(ids, served, why)) return std::nullopt;
@@ -2954,6 +3023,28 @@ static int run_live(const XmrNodeConfig& cfg) {
         const settle::OwedLedger& L = booking_L ? *booking_L : node.ledger();
         const auto rgo = drops->range_for(h);
         if (!rgo) { ++drops_lane_hold; why = "cut-pending: drops range below h=" + std::to_string(h) + " undecidable (canonical predecessor not readable yet)"; return false; }
+        // ★ HOLD-ROUND-3 (R3-8): a finished composition of this (block, cut, pinned
+        // set, price, booking-ledger state) is reused by the next attempt instead of
+        // re-run (attempt 8, node B: composed=481 for ONE held block). Any input
+        // change is another key; the live booking only (a scratch ledger is not memoized).
+        std::string memo_key;
+        if (!booking_L) {
+            std::string set_tag = "own";
+            if (pin) {
+                if (const auto bb = c2pool::v37n::cut_bid_bytes(bid))
+                    set_tag = hex_of(c2pool::v37n::xmr::drops::XmrDropsWiring::set_digest(h, *bb, *pin)).substr(0, 16);
+                else set_tag = "pin" + std::to_string(pin->size());
+            }
+            const std::string price_tag = std::to_string(price.sum_weight.v[0]) + "." + std::to_string(price.sum_weight.v[1]) + "." +
+                                          std::to_string(price.sum_weight.v[2]) + "." + std::to_string(price.sum_weight.v[3]) + (price.valid ? "v" : "x");
+            memo_key = c2pool::v37n::xmr::drops::ComposeMemo<DropsLaneOut>::key_of(bid, bk.credit_cut.next_pos, bk.credit_cut.spine_digest, set_tag,
+                                                                                    price.reward, price_tag, L.ledger_seq());
+            if (drops_compose_memo.get(memo_key, out)) {
+                ++drops_lane_memo_hits;
+                drops_cut_at_h[h] = bk.credit_cut.next_pos;
+                return true;
+            }
+        }
         const auto lp = drops_lane_prefix(bk.credit_cut, relay_hint(bid), why);
         if (!lp) { ++drops_lane_hold; return false; }
         // ★ DROPS-CARRY-SUFFIX (R5): the determinism guard -- a prefix is composed
@@ -3041,6 +3132,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     c2pool::v37n::xmr::fee::donation_identity(donation_net_of(cfg.network)));
         }
         ++drops_lane_composed;
+        if (!memo_key.empty()) drops_compose_memo.put(memo_key, out);   // ★ HOLD-ROUND-3 (R3-8)
         drops_prune_lane_log();   // ★ DROPS-ENROL-TIDY
         return true;
     };
@@ -5056,13 +5148,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                     }
                     ledger.learn_ref(a.r.payee);   // every node can resolve every credited payee's output
                 });
-            // SMOKE-NOISE: a reloaded receipt's origin bin = its prev_id's height (lane-set digest only)
+            // SMOKE-NOISE: a reloaded receipt's origin bin = its prev_id's height. HOLD-ROUND-3
+            // (F2): through the ONE resolver (ChainView, then the origin-bin journal), and
+            // the ingest's reload resolves every logged receipt's bin with it BEFORE the
+            // relay cache / own order tail / lane set see the receipt (set_bin_of precedes
+            // reload below), so a side-block parent gone from the ChainView keeps its bin.
             relay_ingest->set_bin_of([&](const relay::FbReceipt& r) -> std::optional<std::uint64_t> {
                 ::v37::xmr::verify::ParsedBlob pb;
                 if (!::v37::xmr::verify::parse_hashing_blob(r.receipt.hashing_blob, pb)) return std::nullopt;
-                const auto c = relay_chain.lookup(pb.prev_id);
-                if (!c) return std::nullopt;
-                return c->height;
+                return bin_of_prev(pb.prev_id);
             });
             const std::size_t reloaded = relay_ingest->reload([&](const relay::Admitted& a) {
                 relay_node->note_reloaded(a);
@@ -5651,10 +5745,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)drops->lane_contig(), (unsigned long long)drops->lane_gaps(),
                             ll.entries, ll.max_entries, (unsigned long long)ll.base_P, ll.base_n, ll.base_payees, ll.base_counts,
                             (unsigned long long)ll.below_base, ll.stale ? " STALE" : "");
-                std::printf("  drops-live: fold_ext=%llu records_loaded=%llu records_persist_fail=%llu bin_journal=%zu written=%llu hits=%llu\n",
+                std::printf("  drops-live: fold_ext=%llu records_loaded=%llu records_persist_fail=%llu bin_journal=%zu written=%llu hits=%llu "
+                            "| replay_now=%llu memo hits=%llu entries=%zu\n",
                             (unsigned long long)drops_lane_fold_ext, (unsigned long long)drops_records_loaded,
                             (unsigned long long)drops_records_persist_fail, drops_bin_journal.size(),
-                            (unsigned long long)drops_bin_journal.written(), (unsigned long long)drops_bin_journal_hits);
+                            (unsigned long long)drops_bin_journal.written(), (unsigned long long)drops_bin_journal_hits,
+                            (unsigned long long)drops_lane_replay_now, (unsigned long long)drops_lane_memo_hits, drops_compose_memo.size());
             }
             if (relay_node) {   // GAP-2
                 std::printf("  %s\n", relay_node->describe().c_str());
@@ -5701,9 +5797,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                     const std::uint64_t th = relay::bin_close_height(provider.current().height, node.hw().hw_height);   // RELAY-BINCLOCK
                     const std::uint64_t through = th > g_relay_bin_lag + 1 ? th - g_relay_bin_lag - 1 : 0;
                     const auto ls = relay_ingest->lane_set(through);
-                    std::printf("  relay-lane-set: through_bin=%llu n=%llu digest=%s… unbinned=%llu (compare THIS across nodes; lane digest = node-local order)\n",
+                    std::string unb;   // HOLD-ROUND-3 (4.10): WHICH receipts have no origin bin
+                    for (const auto& id : ls.unbinned_ids) unb += (unb.empty() ? " [" : " ") + hex_of(id).substr(0, 12);
+                    if (!unb.empty()) unb += ls.unbinned > ls.unbinned_ids.size() ? " ...]" : "]";
+                    std::printf("  relay-lane-set: through_bin=%llu n=%llu digest=%s… unbinned=%llu%s (compare THIS across nodes; lane digest = node-local order)\n",
                                 (unsigned long long)ls.through, (unsigned long long)ls.n,
-                                hex_of(ls.digest).substr(0, 16).c_str(), (unsigned long long)ls.unbinned);
+                                hex_of(ls.digest).substr(0, 16).c_str(), (unsigned long long)ls.unbinned, unb.c_str());
                 }
                 if (relay_native_src) {   // D6b
                     const auto& fs = relay_native_feed.stats();

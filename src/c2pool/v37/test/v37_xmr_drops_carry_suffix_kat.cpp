@@ -721,10 +721,13 @@ int main() {
         const auto end = sh.find("auto drops_compose_lane = [&]");
         C(dp != std::string::npos && ra != std::string::npos && mp != std::string::npos && dp < ra && ra < mp && mp < end,
           "CS8 ★ the repaired DROPS prefix = merged_prefix(P, repair_a0, served) (never the served ids alone)");
-        C(sh.find("rbi->second.base == static_cast<int>(relay::RepairReplayer::kOwn)") != std::string::npos &&
+        // HOLD-ROUND-3 (F1): the own / shadow / record rule moved into drops::decide_suffix_base
+        // (v37_xmr_hold_round3_kat R3-1 drives it); the shell decides through it, and the
+        // replay still records which base reached the spine
+        C(sh.find("const auto dec = c2pool::v37n::xmr::drops::decide_suffix_base(q);") != std::string::npos &&
           sh.find("replay_base[key] = ReplayBase{static_cast<int>(base_used), a0,") != std::string::npos,
-          "CS8 ★ our [0,a0) is used only when the settlement replay reached the spine from OUR order (else HOLD)");
-        C(sh.find("shadow_rec = &ri->second; own_base = true;") != std::string::npos && sh.find("drops_store_record(pkey, std::move(rec));") != std::string::npos &&
+          "CS8 ★ our [0,a0) is used only when the settlement replay reached the spine from OUR order (decide_suffix_base; else HOLD)");
+        C(sh.find("shadow_rec = &drops_records.at(dec.shadow_key);") != std::string::npos && sh.find("drops_store_record(pkey, std::move(rec));") != std::string::npos &&
           sh.find("if (drops_on_replay) drops_on_replay(key, P, a0, replay_base[key], ids);") != std::string::npos,
           "CS8 ★ a SHADOW base takes [0,a0) from that shadow's DROPS record (recorded when the relay replay verifies the order)");
         C(sh.find("drops-ALARM carry-mismatch:") != std::string::npos && sh.find("drops-ALARM prefix-positions:") != std::string::npos,
