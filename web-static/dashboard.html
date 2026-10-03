@@ -2022,6 +2022,7 @@
                         <tbody></tbody>
                     </table>
                 </div>
+                <div id="node_role_note" style="display: none; color: var(--muted); margin: 8px 0;">Relay node: no Stratum acceptor runs here, so no miners can connect to it. An empty list is expected on this node, not a fault.</div>
                 <div class="loading" id="active_miners_loading">Loading miners</div>
             </div>
         </div>
@@ -3475,8 +3476,13 @@
 
                 var local = d3.sum(values(local_stats.miner_hash_rates));
                 var local_dead = d3.sum(values(local_stats.miner_dead_hash_rates));
-                d3.select('#local_rate').text(format_hashrate(local));
-                d3.select('#local_doa').text(local > 0 ? d3.format('.2p')(local_dead/local) : '0%');
+                // #942: on a relay node (no Stratum acceptor) local hashrate is
+                // not applicable, not a measured 0. Older binaries omit
+                // node_role and keep the old rendering.
+                var _relayNode = local_stats.node_role === 'relay';
+                d3.select('#local_rate').text(_relayNode ? 'n/a (relay node)' : format_hashrate(local));
+                d3.select('#local_doa').text(_relayNode ? 'n/a' : (local > 0 ? d3.format('.2p')(local_dead/local) : '0%'));
+                d3.select('#node_role_note').style('display', _relayNode ? null : 'none');
                 
                 d3.select('#shares_total').text(local_stats.shares.total);
                 d3.select('#shares_orphan').text(local_stats.shares.orphan);
