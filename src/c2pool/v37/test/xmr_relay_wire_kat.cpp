@@ -91,22 +91,23 @@ int main() {
         const auto f = encode_hello(r);
         // RULES RATCHET R1: the rules frame carries the epoch trailer u32 epoch_cur | u8 n | n x 61 B after the TLV.
         // RE-PIN (R1 receipt admission): the TLV has field 30 empty_cut: 278 -> 281 B, the frame 521 -> 524 B.
-        C(f.size() == kHelloBytesPoolGenesis + 1 + 2 + 281 + 4 + 1 + 61, "W2r hello + rules + epoch trailer = 174 + 1 + 2 + 281 + 66 = 524 bytes");
+        // RE-PIN (G9 review O6): field 31 noncanon_net: 281 -> 284 B, the frame 524 -> 527 B, a new Deployment digest.
+        C(f.size() == kHelloBytesPoolGenesis + 1 + 2 + 284 + 4 + 1 + 61, "W2r hello + rules + epoch trailer = 174 + 1 + 2 + 284 + 66 = 527 bytes");
         golden(C, "W2r hello+rules+epochs", hex(f),
-               "400143325852030700000020272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f9d0070000000000008877665544332211c8af92100000000000003f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a111800e61c22c223c04b630ec8759d185602087e34b312241af9d35dee518f35f7c3a80100000000000000bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d9400190101083c000000000000000208000000000000000003048c0a00000408f0000000000000000501010608000000000000000007010008080000000000000000090800000000000000000a01000b01000c04000000000d0800000000000000000e01000f0100100893020000000000001108000000000000000012083c000000000000001304000000001420f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2150400000000160800000000000000001704000000001804000000001904000000001a01011b2020272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f91c2000000000000000000000000000000000000000000000000000000000000000001d01001e01000100000001010000003d3eadc4883ca841f3e0c042ac2f8a3e82a3e97450c4f5735144771deed626bc00000000000000000000000000000000000000000000000000");
+               "400143325852030700000020272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f9d0070000000000008877665544332211c8af92100000000000003f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a111800e61c22c223c04b630ec8759d185602087e34b312241af9d35dee518f35f7c3a80100000000000000bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d94001c0101083c000000000000000208000000000000000003048c0a00000408f0000000000000000501010608000000000000000007010008080000000000000000090800000000000000000a01000b01000c04000000000d0800000000000000000e01000f0100100893020000000000001108000000000000000012083c000000000000001304000000001420f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2150400000000160800000000000000001704000000001804000000001904000000001a01011b2020272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f91c2000000000000000000000000000000000000000000000000000000000000000001d01001e01001f0100010000000101000000a2cebf46cf0c09aad67ca11b19e9df4cb69668583659fe559e4bd7aae7bba83a00000000000000000000000000000000000000000000000000");
         Hello back; std::string why;
         Hello r_expl = r; r_expl.epoch_cur = 1; r_expl.epochs = hello_epochs_of(r);   // the decoder fills the list it read
         C(decode_hello(f, back, &why) && back == r_expl && back.epochs.size() == 1 && back.epochs[0].epoch_no == 1 && back.epochs[0].kind == 0 &&
           back.epochs[0].rules_digest == c2pool::v37n::xmr::lanerules::rules_digest(lr),
           "W2r round trip: epoch_cur 1, one Deployment {1, rules_digest(TLV), kind 0} (" + why + ")");
         {   // the trailer is MANDATORY: the pre-ratchet 455-byte frame (TLV, no trailer) is refused by name
-            std::vector<u8> pre(f.begin(), f.begin() + static_cast<std::ptrdiff_t>(kHelloBytesPoolGenesis + 1 + 2 + 281));
+            std::vector<u8> pre(f.begin(), f.begin() + static_cast<std::ptrdiff_t>(kHelloBytesPoolGenesis + 1 + 2 + 284));
             { const bool rf = !decode_hello(pre, back, &why); C(rf && why == "hello: rules length mismatch", "W2r a pre-ratchet rules frame (no epoch trailer) -> \"" + why + "\""); }
-            auto bad_cur = f; bad_cur[kHelloBytesPoolGenesis + 1 + 2 + 281] = 2;   // epoch_cur 2: not in the list
+            auto bad_cur = f; bad_cur[kHelloBytesPoolGenesis + 1 + 2 + 284] = 2;   // epoch_cur 2: not in the list
             { const bool rf = !decode_hello(bad_cur, back, &why); C(rf && why == "hello: epoch_cur is not an epoch of the list", "W2r epoch_cur outside the list -> \"" + why + "\""); }
-            auto bad_dig = f; bad_dig[kHelloBytesPoolGenesis + 1 + 2 + 281 + 5 + 4] ^= 1;   // the Deployment's rules_digest != the TLV's
+            auto bad_dig = f; bad_dig[kHelloBytesPoolGenesis + 1 + 2 + 284 + 5 + 4] ^= 1;   // the Deployment's rules_digest != the TLV's
             { const bool rf = !decode_hello(bad_dig, back, &why); C(rf && why.find("not the rules of epoch_cur") != std::string::npos, "W2r a Deployment digest that is not the TLV's -> refused (" + why + ")"); }
-            auto bad_kind = f; bad_kind[kHelloBytesPoolGenesis + 1 + 2 + 281 + 5 + 36] = 1;   // epoch 1 kind 1
+            auto bad_kind = f; bad_kind[kHelloBytesPoolGenesis + 1 + 2 + 284 + 5 + 36] = 1;   // epoch 1 kind 1
             { const bool rf = !decode_hello(bad_kind, back, &why); C(rf && why.find("epoch 1 must be kind 0") != std::string::npos, "W2r epoch 1 of another kind -> refused (" + why + ")"); }
             Hello two = r; two.epochs = hello_epochs_of(r);
             c2pool::v37n::xmr::epoch::Deployment d2; d2.epoch_no = 2; d2.kind = 1; d2.rules_digest = b32_of(0x22); d2.start_height = 100; d2.timeout_height = 200;
@@ -133,7 +134,7 @@ int main() {
             Hello b; legacy_ok = legacy_ok && decode_hello(encode_hello(*x), b, &why) && !b.rules && b == *x;
         }
         C(legacy_ok, "W2r the 174/142/102-byte HELLOs still decode, rules = none");
-        auto t = f; t[kHelloBytesPoolGenesis + 1] ^= 0x80;   // R1 re-pin: 281 ^ 1 = 280 parses as a shorter list; ^ 0x80 runs past the frame
+        auto t = f; t[kHelloBytesPoolGenesis + 1] ^= 0x80;   // rules_len 284 = 0x11c; ^ 0x80 = 412 runs past the frame
         C(!decode_hello(t, back, &why) && why == "hello: rules length mismatch", "W2r a wrong rules_len -> \"" + why + "\"");
         t = f; t.pop_back();
         C(!decode_hello(t, back, &why) && why == "hello: rules length mismatch", "W2r one byte short -> rules length mismatch");

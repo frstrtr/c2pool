@@ -36,6 +36,14 @@
 //   MC8  O-2 under the refold: a lane-root-refused block is FOUND empty (as the
 //        majority's live booking did), a forced block whose root the majority
 //        holds is not; empty FOUNDs of the old log are never reused as money;
+//   MC9  (G9 review O6, lane rule 31 noncanon_net) the scratch twin of the
+//        debit-only booking: a majority lineage with one NON-CANONICAL lane
+//        block (booked FOUND(credit = {}, payout = the debit net of the window
+//        credit at its cut)); the minority never booked it; the refold
+//        decodes it under the scratch lineage with the same rule, converges to
+//        the majority's (digest, since) sequence, and on the scratch ledger the
+//        fairly paid window keys owe NOTHING (EO 0), the overpaid key exactly
+//        its excess;
 //   MC6  work weighting: blocks carrying different difficulties are weighed by
 //        their work, not counted (2 heavy unmatched vs 4 light own/matched).
 // ===========================================================================
@@ -48,6 +56,7 @@
 
 #include "c2pool/v37/xmr/xmr_minority_converge.hpp"
 #include "c2pool/v37/xmr/xmr_finalize_driver.hpp"
+#include "c2pool/v37/xmr/xmr_paynow.hpp"   // G9 O6: paynow::debit_only_booking (the debit-only booking)
 
 namespace mc = c2pool::v37n::xmr::minority;
 using c2pool::v37n::xmr::Amounts;
@@ -370,6 +379,68 @@ int main() {
                   " digest_eq=" + std::to_string(res.digest == maj.ledger.owed_digest()) + " maj_settled_lane=" +
                   std::to_string(maj.ledger.last_settled_lane_height()));
         }
+    }
+    // ── MC9 (G9 review O6): the scratch twin of the debit-only NET booking ────
+    {
+        ::c2pool::v37n::settle::OwedLedgerRules r9; r9.lane_height = true; r9.decay_from_gross = true;
+#if defined(C2POOL_XMR_NONCANON_NET)
+        r9.noncanon_net = true;   // lane rule 31 (the daemon's settlement config)
+#endif
+        const std::uint64_t D = 3, TOP = 16, NC = 8;
+        const ::v37::bytes32 W1 = key_of(0x31), W2 = key_of(0x32), K = key_of(0x33);
+        const Amounts E9{{W1, 1000}, {W2, 2000}};                  // the window credit at NC's cut, folded at its total
+        const Amounts gross9{{W1, 1000}, {W2, 1500}, {K, 700}};    // NC paid W1 / W2 at most their credit, K above it
+        auto debit9 = [&](const ::c2pool::v37n::settle::OwedLedger& L) -> Amounts {
+#if defined(C2POOL_XMR_NONCANON_NET)
+            return c2pool::v37n::xmr::paynow::debit_only_booking(L.rules().noncanon_net, E9, gross9).payout;
+#else
+            (void)L; return gross9;   // no rule: the whole on-chain payout is the debit
+#endif
+        };
+        auto gross_of = [](const Amounts& cr) { std::set<::v37::bytes32> g; for (const auto& [k, v] : cr) if (v > 0) g.insert(k); return g; };
+        auto maps_at = [](std::uint64_t h) {
+            Amounts cr, po; cr[key_of(static_cast<std::uint8_t>(0x10 + h % 3))] = static_cast<long long>(1000 + 17 * h);
+            po[key_of(static_cast<std::uint8_t>(0x10 + (h + 1) % 3))] = static_cast<long long>(300 + h);
+            return std::make_pair(cr, po);
+        };
+        auto lane = [&](std::uint64_t h) { return h == NC || (h >= 5 && h % 2 == 1); };
+        SimNodeR maj(r9), mino(r9);
+        for (std::uint64_t h = 1; h <= TOP; ++h) {
+            if (lane(h)) {
+                if (h == NC) maj.book(h, {}, debit9(maj.ledger), {});    // NON-CANONICAL: credit dropped, the debit booked
+                else { const auto m = maps_at(h); maj.book(h, m.first, m.second, gross_of(m.first)); mino.book(h, m.first, m.second, gross_of(m.first)); }
+            }
+            maj.advance(h); mino.advance(h);
+        }
+        const std::uint64_t c = mino.drv.cursor_height();
+        mc::RefoldInput in; in.chain = 7; in.rules = r9; in.d_conf = D; in.fork_h = 4; in.cursor = c; in.events = mino.events();
+        for (std::uint64_t h = in.fork_h + 1; h <= c + 1 + D && h <= TOP; ++h) in.chain_blocks[h] = bid_of(h);
+        long long eo_w1 = 1, eo_w2 = 1, eo_k = 1;
+        bool seen = false, scratch_debit = false;
+        auto decode = [&](std::uint64_t h, const std::string&, const std::vector<::v37::bytes32>&, const std::vector<std::uint64_t>&, bool root_only,
+                          const ::c2pool::v37n::settle::OwedLedger& L) {
+            mc::DecodeResult r;
+            if (h > NC && (L.is_pending(bid_of(NC)) || L.is_settled(bid_of(NC)))) {   // the scratch ledger after NC's FOUND
+                eo_w1 = L.effective_owed(W1); eo_w2 = L.effective_owed(W2); eo_k = L.effective_owed(K); seen = true;
+            }
+            if (!lane(h)) { r.outcome = mc::DecodeOutcome::NotLane; return r; }
+            r.outcome = mc::DecodeOutcome::Booked;
+            if (h == NC) { scratch_debit = !root_only; r.payout = debit9(L); return r; }   // the scratch twin: the same rule on the scratch ledger
+            if (!root_only) { const auto m = maps_at(h); r.credit = m.first; r.payout = m.second; r.gross = gross_of(m.first); }
+            return r;
+        };
+        const mc::RefoldResult res = mc::refold(in, decode);
+        check("MC9 G9 O6: a lineage with one NON-CANONICAL lane block, decoded under the scratch lineage (the minority never booked it), "
+              "converges to the majority's (digest, since) sequence and owed_digest",
+              res.ok && scratch_debit && res.ring == maj.ring && res.digest == maj.ledger.owed_digest(),
+              "scratch_decoded=" + std::to_string(scratch_debit) + " states=" + std::to_string(res.ring.size()) + "/" + std::to_string(maj.ring.size()) +
+              " digest_eq=" + std::to_string(res.digest == maj.ledger.owed_digest()));
+        check("MC9 G9 O6: on the scratch ledger the window keys the block paid within their credit owe NOTHING (EO 0) and the key "
+              "paid above it owes exactly the excess (-700); the live ledger agrees",
+              seen && eo_w1 == 0 && eo_w2 == 0 && eo_k == -700 &&
+              maj.ledger.effective_owed(W1) == 0 && maj.ledger.effective_owed(W2) == 0 && maj.ledger.effective_owed(K) == -700,
+              "scratch EO W1=" + std::to_string(eo_w1) + " W2=" + std::to_string(eo_w2) + " K=" + std::to_string(eo_k) +
+              " live W1=" + std::to_string(maj.ledger.effective_owed(W1)));
     }
     // ── MC5 codecs ──────────────────────────────────────────────────────────
     {

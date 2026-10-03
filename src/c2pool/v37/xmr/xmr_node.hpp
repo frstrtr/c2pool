@@ -113,6 +113,7 @@ public:
         r.decay_half_life = m_cfg.ledger_decay_half_life;
         r.anchor_cut = m_cfg.ledger_anchor_cut;
         r.empty_cut = m_cfg.ledger_anchor_cut && m_cfg.ledger_empty_cut;   // R1 RECEIPT ADMISSION (rides the anchor)
+        r.noncanon_net = m_cfg.ledger_noncanon_net;   // G9 O6: a Mismatch books the debit net of the window credit
         r.merkle_rows = m_cfg.ledger_merkle_rows;
         r.drops_due = m_cfg.ledger_drops_due;
         r.raindrop_enrol = m_cfg.ledger_raindrop_enrol;

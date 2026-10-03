@@ -50,8 +50,10 @@
 // ===========================================================================
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <set>
@@ -399,6 +401,55 @@ inline NetResult net_booking(const std::optional<std::uint64_t>& base, std::uint
         r.netted += a;
     }
     return r;
+}
+
+// ---- NON-CANONICAL NET BOOKING (lane rule 31 `noncanon_net`, G9 review O6) ----
+// A lane block whose recompute verdict is a decided Mismatch credits nobody
+// (its window credit is dropped: the block is booked like a withheld block),
+// and what it paid on chain is a pending debit (forward repair, never a
+// clawback). Before this rule the debit was the WHOLE gross payout, so every
+// window key such a block paid its fair pay-now carried that pay-now as a
+// permanent negative row. Under the rule each payout is netted against the
+// key's window credit at the block's own committed cut folded at the block's
+// total (`fold`: the map the booking holds before the verdict -- no DROPS
+// due, no drain refold at P, no credit_delta, no empty-cut finder):
+//     a_k   = min(max(fold[k], 0), paid[k])        (fold[k] = 0 when absent)
+//     net_k = paid[k] - a_k                         (kept only when > 0)
+// A key paid at most its window credit owes nothing; a key paid above it owes
+// exactly the excess. An empty fold (a pre-anchor or finder block) caps
+// nothing. Integer min / subtraction on piconero, no division. `payout` is
+// netted in place; returns SUM a_k.
+#define C2POOL_XMR_NONCANON_NET 1   // feature probe for KATs built on both trees
+inline long long debit_only_net(const std::map<::v37::bytes32, long long>& fold,
+                                std::map<::v37::bytes32, long long>& payout) {
+    long long netted = 0;
+    for (auto p = payout.begin(); p != payout.end();) {
+        const auto f = fold.find(p->first);
+        const long long e = (f == fold.end() || f->second < 0) ? 0 : f->second;
+        const long long a = std::min(e, p->second);
+        if (a > 0) { p->second -= a; netted += a; }
+        p = p->second <= 0 ? payout.erase(p) : std::next(p);
+    }
+    return netted;
+}
+
+// The booking of a decided Mismatch, the ONE function the live booking, the
+// scratch lineage (D2 converge) and the KATs share: FOUND(credit = {},
+// payout = `payout`), the debit net of `fold` under the rule, the gross
+// on-chain map without it. `debited` = SUM of the booked debit, `netted` =
+// SUM a_k (0 with the rule off).
+struct DebitOnly {
+    std::map<::v37::bytes32, long long> payout;   // the FOUND payout (the pending debit)
+    long long debited = 0;
+    long long netted  = 0;
+};
+inline DebitOnly debit_only_booking(bool noncanon_net, const std::map<::v37::bytes32, long long>& fold,
+                                    const std::map<::v37::bytes32, long long>& gross) {
+    DebitOnly d;
+    d.payout = gross;
+    if (noncanon_net) d.netted = debit_only_net(fold, d.payout);
+    for (const auto& kv : d.payout) d.debited += kv.second;
+    return d;
 }
 
 // ---- SINK-UNBACKED (the status alarm's predicate, NoClaimWithoutCash) -----

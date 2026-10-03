@@ -32,6 +32,12 @@
 //       a credit cut + the cut's projected payees): V37N base committed, the
 //       first block pays its miners the whole reward, the donation output is
 //       the 0-amount marker, shape stable across the reward fixpoint.
+//   P6  (G9 review O6, lane rule 31 noncanon_net) debit_only_net: the debit
+//       of a Mismatch block is each payout net of the key's window credit at
+//       the cut: credit {k1: 5, k2: 7}, payout {k1: 5, k2: 9, k3: 4} ->
+//       {k2: 2, k3: 4}, netted 12; a zero / negative credit caps nothing; an
+//       empty fold leaves the map unchanged; debit_only_booking with the rule
+//       off books the gross map (RED on the base: the symbol is absent).
 //
 // RED on the base: the pay-now API does not exist there, so this file builds
 // its BASE branch (no xmr_paynow.hpp): the same empty-ledger block goes
@@ -554,6 +560,51 @@ void suite_salted() {
 }
 #endif
 
+// P6 (G9 review O6): the debit of a non-canonical block, net of the window credit.
+void suite_debit_only_net() {
+    std::printf("== P6. debit_only_net: a Mismatch block's debit, net of the window credit at its cut ==\n");
+#if defined(C2POOL_XMR_NONCANON_NET)
+    namespace pn = c2pool::v37n::xmr::paynow;
+    auto key = [](std::uint8_t b) { ::v37::bytes32 k{}; k[0] = b; k[31] = static_cast<std::uint8_t>(b ^ 0x5a); return k; };
+    const ::v37::bytes32 k1 = key(1), k2 = key(2), k3 = key(3);
+    {
+        const Amounts credit{{k1, 5}, {k2, 7}};
+        Amounts payout{{k1, 5}, {k2, 9}, {k3, 4}};
+        const long long netted = pn::debit_only_net(credit, payout);
+        CHECK(payout == (Amounts{{k2, 2}, {k3, 4}}) && netted == 12,
+              "credit {k1:5, k2:7}, payout {k1:5, k2:9, k3:4} -> debit {k2:2, k3:4}, netted 12 (got %zu entries, netted %lld)",
+              payout.size(), netted);
+    }
+    {
+        const Amounts credit{{k1, 0}, {k2, -3}};
+        Amounts payout{{k1, 5}, {k2, 9}};
+        const long long netted = pn::debit_only_net(credit, payout);
+        CHECK(payout == (Amounts{{k1, 5}, {k2, 9}}) && netted == 0, "a zero or negative window credit caps nothing (netted %lld)", netted);
+    }
+    {
+        Amounts payout{{k1, 5}, {k3, 4}};
+        const long long netted = pn::debit_only_net(Amounts{}, payout);
+        CHECK(payout == (Amounts{{k1, 5}, {k3, 4}}) && netted == 0, "an empty fold (pre-anchor / finder block) leaves the debit unchanged");
+    }
+    {
+        const Amounts credit{{k1, 10}};
+        Amounts payout{{k1, 10}};
+        const long long netted = pn::debit_only_net(credit, payout);
+        CHECK(payout.empty() && netted == 10, "a key paid exactly its window credit owes nothing: no row is left");
+    }
+    {
+        const Amounts credit{{k1, 5}, {k2, 7}};
+        const Amounts gross{{k1, 5}, {k2, 9}, {k3, 4}};
+        const auto on = pn::debit_only_booking(true, credit, gross), off = pn::debit_only_booking(false, credit, gross);
+        CHECK(on.payout == (Amounts{{k2, 2}, {k3, 4}}) && on.debited == 6 && on.netted == 12,
+              "debit_only_booking, rule on: debit {k2:2, k3:4}, debited 6, netted 12");
+        CHECK(off.payout == gross && off.debited == 18 && off.netted == 0, "debit_only_booking, rule off: the gross map (debited 18, netted 0)");
+    }
+#else
+    CHECK(false, "paynow::debit_only_net is absent: a Mismatch block debits every key its whole on-chain payout");
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -565,6 +616,7 @@ int main() {
     suite_source();
     suite_assembled();
     suite_salted();
+    suite_debit_only_net();
 #else
     suite_base();
 #endif

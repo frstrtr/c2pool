@@ -590,15 +590,16 @@ void suite_hello() {
     const auto id = lineage::pool_id(back.network, back.chain_id, *back.pool->genesis);
     CHECK(id == lineage::pool_id(3, 0, b32(0xA0)) && lineage::pool_id(other.network, other.chain_id, *other.pool->genesis) != id,
           "pool_id recomputed from the decoded HELLO (network, chain_id, genesis); the other genesis gives another pool_id");
-    // a rules frame carries the epoch trailer: 174 + 1 + 2 + 281 + 66 = 524 B (R1 receipt admission: + field 30 empty_cut)
+    // a rules frame carries the epoch trailer: 174 + 1 + 2 + 284 + 66 = 527 B (R1 receipt admission: + field 30 empty_cut;
+    // G9 review O6: + field 31 noncanon_net)
     relay::Hello r = h;
     lr::LaneRules rules; rules.lane_params_digest = h.lane_params_digest;
     r.rules = rules;
-    const auto e524 = relay::encode_hello(r);
+    const auto e527 = relay::encode_hello(r);
     relay::Hello rb;
-    CHECK(e524.size() == 524 && relay::decode_hello(e524, rb, &why) && rb.epochs.size() == 1 && rb.epoch_cur == 1 &&
+    CHECK(e527.size() == 527 && relay::decode_hello(e527, rb, &why) && rb.epochs.size() == 1 && rb.epoch_cur == 1 &&
               rb.epochs[0].rules_digest == lr::rules_digest(rules),
-          "a rules HELLO = 524 B: the epoch trailer carries epoch_cur 1 and the one Deployment (%s)", why.c_str());
+          "a rules HELLO = 527 B: the epoch trailer carries epoch_cur 1 and the one Deployment (%s)", why.c_str());
 }
 
 // ---------------------------------------------------------------------------

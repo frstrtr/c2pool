@@ -1012,6 +1012,16 @@ struct OwedLedgerRules {
     // cuts stay HELD. A booking-side rule (the daemon decides the cut); the
     // ledger reads a missing cut exactly as before.
     bool      empty_cut = false;
+    // NON-CANONICAL NET BOOKING (XMR, lane rule 31 `noncanon_net`, G9 review
+    // O6; the epoch-1 rule set of R1): a lane block whose recompute verdict is
+    // a decided Mismatch is booked FOUND(credit = {}, payout = the debit) with
+    // the debit NET of each key's window credit at the block's own cut folded
+    // at its total (paynow::debit_only_net): a key paid at most that credit
+    // owes nothing, a key paid above it owes exactly the excess (forward
+    // repair kept). A booking-side rule (the daemon nets the maps before the
+    // FOUND); the ledger books the maps it is given exactly as before.
+    // Off: the whole on-chain payout is the debit.
+    bool      noncanon_net = false;
     // MERKLE ROWS (XMR, paper §13): owed_digest commits the balances as the
     // ROOT of a Merkle tree over the rows, so a light client proves one
     // balance with a path of log2(rows) hashes instead of every row:

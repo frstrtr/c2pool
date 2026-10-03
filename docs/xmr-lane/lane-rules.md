@@ -59,9 +59,10 @@ final settlement configuration:
 | 13 | drops_window_rw | 28 | enrol_digest (the HELLO one, 0 without DROPS) |
 | 14 | kfair_salted_ties | 29 | spend_floor |
 | 15 | commit_total | 30 | empty_cut (R1: receipt admission, coinbase-recompute.md section 6.2; its EMPTY-CUT booking branch is reserved) |
+| | | 31 | noncanon_net (R1, G9 review O6: a Mismatch block's debit is net of the window credit at its cut, coinbase-recompute.md section 3) |
 
 Serialisation: a TLV list `u8 id | u8 len | value (little-endian)`, ids strictly
-ascending, every known id present (281 bytes for v1 with field 30). A field added later takes
+ascending, every known id present (284 bytes for v1 with field 31). A field added later takes
 the next id; a reader keeps an id it does not know and refuses the peer by name.
 
 ```
@@ -75,7 +76,7 @@ The digest is the `rules_digest` of the epoch's Deployment (RULES RATCHET R1):
   `u8 enrol_flag | enrol digest 32 (iff flag 1) | u16 rules_len | TLV |
   u32 epoch_cur | u8 n_epochs | n x Deployment (61 B)` where
   `Deployment = u32 epoch_no | b32 rules_digest | u8 kind | u64 start |
-  u64 timeout | u64 fixed` (521 B with the one-entry list, or 553 B with the
+  u64 timeout | u64 fixed` (527 B with the one-entry list, or 559 B with the
   enrol slot; +61 B per further epoch, n <= 64). The trailer is mandatory on a
   rules frame: entry 1 is epoch 1 (kind 0, genesis), `epoch_cur` is an entry of
   the list and the TLV is the rules of `epoch_cur` (its digest equals that
@@ -135,7 +136,7 @@ At startup the node prints its whole list, so two operators can diff their
 nodes without connecting them:
 
 ```
-lane-rules: digest=<64 hex> (30 fields, TLV 281 B) d_conf=60 settle_h_min=0 output_cap=2700 ...
+lane-rules: digest=<64 hex> (31 fields, TLV 284 B) d_conf=60 settle_h_min=0 output_cap=2700 ...
 lane-rules: -> pool_tag=<64 hex> (a peer with another list is refused at HELLO as LANE_RULES_MISMATCH; ...)
 ```
 
@@ -203,9 +204,9 @@ nothing of each other's blocks.
 
 | KAT | pins |
 |---|---|
-| `v37_xmr_lane_rules_kat` | TLV/digest goldens, strict decode, one refusal per field (29/29, both directions), rules_absent, the 521-byte frame round trip, the property HELLO-compatible <=> equal lists (10,000 perturbations), F: R-MIN (a)-(c) and the `decode_hello` refusal of a mainnet peer |
+| `v37_xmr_lane_rules_kat` | TLV/digest goldens, strict decode, one refusal per field (31/31, both directions; noncanon_net 1 vs 0 named), rules_absent, the 527-byte frame round trip, the property HELLO-compatible <=> equal lists (10,000 perturbations), F: R-MIN (a)-(c) and the `decode_hello` refusal of a mainnet peer |
 | `v37_xmr_pool_lineage_kat` G | d_conf 60/61, drain_q 0/16, h_min -> different rules_digest -> refused at HELLO by name while the pool_id is the same; a same-pool block under other rules / another epoch_cur is a recompute Mismatch; equal rules Canonical |
 | `v37_xmr_relay_pool_id_kat` P8, E | two live relay nodes, d_conf 60 vs 61: both refuse by name, counter moves, nothing crosses; equal lists interoperate with a byte-identical lane; E: the epoch trailer on the wire, a peer that knows more epochs is accepted, a differing common Deployment is refused `epoch=2 field=start` |
-| `xmr_relay_wire_kat` W2r | the 521-byte HELLO golden, legacy lengths, `hello: rules length mismatch` for a pre-ratchet frame, the trailer refusals |
+| `xmr_relay_wire_kat` W2r | the 527-byte HELLO golden, legacy lengths, `hello: rules length mismatch` for a pre-ratchet frame, the trailer refusals |
 | `v37_xmr_epoch_kat` | V37Y / V37V layouts and the empty-ledger anchor, the Deployment codec, the RATCHET event and its leaf, settle-store schema 7 and the fail-closed matrix, GenesisRec v2 |
 | `v37_xmr_mainnet_readiness_kat` F, `v37_xmr_mainnet_rehearsal_kat` K6 | R-MIN at the floor on the mainnet configuration; the raw genesis refused on mainnet; the tightened `lane_knob_refusal()` |

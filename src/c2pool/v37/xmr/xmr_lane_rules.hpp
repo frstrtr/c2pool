@@ -61,7 +61,12 @@ using bytes32 = ::v37::bytes32;
 // operator ruling 2026-10-03): empty_cut = the receipt-admission rule set --
 // only verdict-1 receipts enter a lane order, the committed receipt test, and
 // a canonical lane block whose own cut is decided bad is booked with no cut
-// (the anchor stays where it is: OwedLedgerRules::empty_cut).
+// (the anchor stays where it is: OwedLedgerRules::empty_cut). 31 (G9 review
+// O6, the epoch-1 rule set of R1): noncanon_net = a lane block whose recompute
+// verdict is a decided Mismatch books its payouts NET of each key's window
+// credit at the block's own cut (paynow::debit_only_net): only what a key was
+// paid above that credit is its pending debit (OwedLedgerRules::noncanon_net).
+// 0 = the whole on-chain payout is the debit.
 #define C2POOL_XMR_LANE_RULES_FIELDS(X)              \
     X( 1, d_conf,             std::uint64_t)         \
     X( 2, settle_h_min,       std::uint64_t)         \
@@ -92,7 +97,8 @@ using bytes32 = ::v37::bytes32;
     X(27, lane_params_digest, ::v37::bytes32)        \
     X(28, enrol_digest,       ::v37::bytes32)        \
     X(29, spend_floor,        std::uint8_t)          \
-    X(30, empty_cut,          std::uint8_t)
+    X(30, empty_cut,          std::uint8_t)          \
+    X(31, noncanon_net,       std::uint8_t)
 
 // The two fields HELLO already compares through its own refusals (the
 // LaneParams digest and the rule-tagged enrol digest): a list that differs
@@ -120,7 +126,7 @@ inline constexpr FieldInfo kFields[] = {
 #undef C2POOL_LR_INFO
 };
 inline constexpr std::size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
-static_assert(kFieldCount == 30, "the v1 lane-rules list has 30 fields (R1: + empty_cut)");
+static_assert(kFieldCount == 31, "the v1 lane-rules list has 31 fields (R1: + empty_cut, + noncanon_net)");
 
 inline const char* field_name(std::uint8_t id) {
     for (const auto& f : kFields)
