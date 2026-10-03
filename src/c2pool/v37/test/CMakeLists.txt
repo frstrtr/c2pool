@@ -744,6 +744,17 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_epoch_kat COMMAND v37_xmr_epoch_kat)
 
     # ------------------------------------------------------------------
+    #   v37_xmr_adversary_knobs_kat  (ADVERSARY KNOBS, test-only fault injection)
+    #     the knob config, the mainnet refusal (every knob refused), the loud
+    #     banner gate, the per-minute rate gate, the probability gate and the
+    #     censor decision. Pure, no consensus dependency. BOTH build.yml lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_adversary_knobs_kat v37_xmr_adversary_knobs_kat.cpp)
+    target_compile_features(v37_xmr_adversary_knobs_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_adversary_knobs_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME v37_xmr_adversary_knobs_kat COMMAND v37_xmr_adversary_knobs_kat)
+
+    # ------------------------------------------------------------------
     # POOL IDENTITY -- RULES RATCHET R1 (operator rulings 2026-10-03; was
     # POOL-LINEAGE 2026-09-25: the pool_tag is retired).
     #
