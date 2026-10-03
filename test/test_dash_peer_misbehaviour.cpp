@@ -363,7 +363,7 @@ TEST(DashPeerMisbehaviour, FiveInvalidPowSharesBanOnPublicProfile)
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_peerban_pubpow");
     const auto p = public_params();
-    ASSERT_FALSE(SharechainConfig::isolated_v36());
+    ASSERT_FALSE(SharechainConfig::v36_network());
     dash::ShareChain scratch;
     const auto b = mine_v16(scratch, p, info(uint256(), 1, 0xaa, 16));
     Rig rig(p, /*legacy=*/true);
@@ -690,7 +690,7 @@ TEST(DashPeerMisbehaviour, PublicHonestOracleBehavioursNotPenalised)
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_peerban_public");
     const auto p = public_params();
-    ASSERT_FALSE(SharechainConfig::isolated_v36());
+    ASSERT_FALSE(SharechainConfig::v36_network());
     dash::ShareChain scratch;
     const auto honest = mine_v16(scratch, p, info(uint256(), 1, 0xaa, 16));
     scratch.add(new dash::DashShare(honest.share));
