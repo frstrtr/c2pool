@@ -121,6 +121,7 @@
 #include "xmr/xmr_recon_ring.hpp"                 // R-C rework-3 (D7): the RECON ring + root-age bound
 #include "xmr/xmr_lane_suspend_state.hpp"         // R-C rework-3 (D5 + contested): the lane-suspend causes
 #include "xmr/xmr_test_suspend_knob.hpp"          // FAULT-KNOB (TEST-ONLY): SIGUSR2 forces a lane suspension
+#include "xmr/xmr_adversary_knobs.hpp"          // ADVERSARY KNOBS (TEST-ONLY): off by default, refused on mainnet
 #include "xmr/xmr_lane_resume_fresh.hpp"         // RESUME-FRESH: the resume edge refreshes the template before the gate opens
 // GAP-2: the real c2pool-to-c2pool receipt relay (docs/xmr-lane/gap2-sharechain-relay-design.md).
 // OFF unless --relay-listen / --relay-peer is given; off = this daemon byte-identical to before.
@@ -284,6 +285,8 @@ static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partitio
 // which an own win's registration (and its DROPS carried delta) used to live only in memory.
 static std::uint32_t g_test_crash_after_publish = 0;
 static std::uint32_t g_test_published = 0;
+// ADVERSARY KNOBS (TEST-ONLY, xmr/xmr_adversary_knobs.hpp): off by default, refused on mainnet.
+static c2pool::v37n::xmr::AdversaryKnobs g_adv;
 static std::string   g_relay_bind = "none";             // --relay-bind none|rbind (rbind needs SEAM-1 in the template)
 // XMR-WEB: the web dashboard (core::WebServer + web-static/, the one every coin
 // binary serves). OFF unless --web-port: off = no socket, no thread, no call.
@@ -1618,6 +1621,13 @@ static int run_live(const XmrNodeConfig& cfg) {
         std::printf("REFUSED: --test-crash-after-publish is a regtest-only fault knob (network=%s)\n", to_string(cfg.network));
         return 2;
     }
+    // ADVERSARY KNOBS (TEST-ONLY): any knob set is refused on mainnet, before anything starts.
+    if (const std::string r = c2pool::v37n::xmr::AdversaryKnobs::refusal(cfg.network == MoneroNetwork::Mainnet, g_adv);
+        !r.empty()) {
+        std::printf("REFUSED: %s\n", r.c_str());
+        return 2;
+    }
+    g_adv.banner();   // loud ADVERSARY banner when any knob is set (test networks only)
     // REGTEST-ONLY rig knobs (the receipt-feed carrier stand-in, the v0x02
     // fast-path file relay, and the amount-sensitivity falsifier) are fenced OFF
     // on mainnet: they simulate the not-yet-landed S-1 carrier relay and must
@@ -6663,6 +6673,13 @@ int main(int argc, char** argv) {
         else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
         else if (a == "--test-crash-after-publish")     g_test_crash_after_publish = u32();
         else if (a == "--test-suspend-lane-seconds")    g_test_suspend_s = u32();
+        // ADVERSARY KNOBS (TEST-ONLY): hidden, integer-only, 0 = OFF, refused on mainnet.
+        else if (a == "--adv-withhold-blocks")    g_adv.withhold_pct = u32();
+        else if (a == "--adv-censor-receipts")    g_adv.censor_receipts = 1;
+        else if (a == "--adv-garbage")            g_adv.garbage_rate = u32();
+        else if (a == "--adv-stale-replay")       g_adv.replay_rate = u32();
+        else if (a == "--adv-self-pay")           g_adv.self_pay = 1;
+        else if (a == "--adv-wrong-epoch-ballot") g_adv.wrong_epoch_ballot = 1;
         else if (a == "--web-port")      g_web_port = u16();      // XMR-WEB: 0 = off (the default)
         else if (a == "--web-host")      g_web_host = value();
         else if (a == "--dashboard-dir") g_web_dir = value();
