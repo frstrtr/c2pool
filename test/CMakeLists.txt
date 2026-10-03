@@ -437,17 +437,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # FOLDED in for the same reason; needs exactly this link set (a real
     # ctx-bound dash::NodeImpl + ShareTracker + c2pool_storage).
     # test_dash_v36_flip.cpp: the private/isolated DASH v36 sharechain MINTS
-    # v36 (current_share_version 36, v36 producer job + mint, ratchet seed 3600,
+    # v36 (current_share_version 36, v36 producer job + mint, ratchet seed 3601,
     # emergency decay retarget, operator blob embed, version-keyed data subdir,
     # web label, payout view). Same harness (test/dash_v36_live_fixture.hpp) and
     # link set as the live-variant KATs; folded in for the same reason.
     # test_dash_v36_e2e.cpp: the private/isolated DASH v36 sharechain two-node
     # end-to-end KATs (genesis from either node, byte-identical gentx + PPLNS
     # weights on both nodes, restart reload, emergency decay seen by both, v16
-    # peer refused at the handshake) plus the seeder of
+    # peers and builds without v36 isolated support refused at the handshake)
+    # plus the seeder of
     # scripts/dash_v36_isolated_e2e.sh (skipped unless its env is set). Same
     # harness (dash_v36_live_fixture.hpp + dash_v36_mint_fixture.hpp) and link
     # set; folded in for the same reason.
+    # test_dash_v36_template_txs.cpp + test_dash_v36_finder_block.cpp: the DASH
+    # v36 network commits the template's transactions (the coinbase
+    # merkle_link a peer verifies the PoW from, no tx body on the wire) and the
+    # finder assembles the full won block from its frozen job. Same harness and
+    # link set; folded in for the same reason.
     # test_dash_share_precheck.cpp (#1828): the per-message caps on incoming
     # 'shares' / 'sharereply' and the no-hashing field checks, driven through
     # the REAL Legacy / Actual handle_message of a dash::Node with a counting
@@ -463,7 +469,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (disconnect, inbound refusal, decay, per-offence weights, public-network
     # oracle parity, whitelist). Same harness and link set; folded in for the
     # same reason.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp)
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

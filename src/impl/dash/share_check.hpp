@@ -1409,8 +1409,9 @@ inline uint256 verify_share(const ShareT& share, ChainT& chain,
 //                   [OP_RETURN 0x6a 0x28 ref_hash || LE64(last_txout_nonce), value 0]
 //   tx layout     = the v16 dash tx_type layout (version/type int16 pair {3,5} +
 //                   VarStr(extra_payload) iff coinbase_payload is non-empty).
-// Daemonless coinbase-only: a v36 share carries no tx refs; the gentx depends
-// only on the share's own fields and the sharechain.
+// A v36 share carries no tx refs (the template's txs are committed by the
+// coinbase merkle_link, folded into the header root in share_init_verify); the
+// gentx depends only on the share's own fields and the sharechain.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // The v36 coinbase bytes, the hash_link prefix cut and the txid.

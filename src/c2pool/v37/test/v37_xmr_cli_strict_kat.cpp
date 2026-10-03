@@ -180,6 +180,9 @@ struct Bad { std::vector<std::string> tail; std::string names; const char* what;
 void bad_rows() {
     const std::vector<Bad> rows = {
         {{"--bogus-flag"},                     "--bogus-flag",          "an unknown flag"},
+        {{"--drain-q", "16"},                  "--drain-q",             "the drain rule's Q (a network constant, never a flag)"},
+        {{"--drain-h-cap", "64"},              "--drain-h-cap",         "the drain rule's H_cap (a network constant, never a flag)"},
+        {{"--drain-rule-version", "1"},        "--drain-rule-version",  "the drain rule's version (the flag day, never a flag)"},
         {{"--verison"},                        "--verison",             "a typo of --version"},
         {{"--netwrok", "regtest"},             "--netwrok",             "a typo of --network"},
         {{"--rpc-prot", "1"},                  "--rpc-prot",            "a typo of --rpc-port"},
@@ -256,8 +259,8 @@ void version_rows() {
         check(r.out.find("mainnet height " + mh) != std::string::npos, tag + ": no pinned mainnet height " + mh);
         check(r.out.find("stagenet height " + sh) != std::string::npos, tag + ": no pinned stagenet height " + sh);
 #ifdef V37_XMR_DROPS_DEFAULT   // XMR-DROPS-DEFAULT: the build identity names the raindrops state
-        check(r.out.find("raindrops (DROPS): ON by default (pool rules v3)") != std::string::npos,
-              tag + ": no 'raindrops (DROPS): ON by default (pool rules v3)' line");
+        check(r.out.find("raindrops (DROPS): ON by default (pool rules v4)") != std::string::npos,   // v4 = DROPS-SET-PIN
+              tag + ": no 'raindrops (DROPS): ON by default (pool rules v4)' line");
 #else
         check(r.out.find("raindrops (DROPS): OFF") != std::string::npos, tag + ": no 'raindrops (DROPS): OFF' line");
 #endif

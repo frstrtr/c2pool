@@ -54,6 +54,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -137,8 +138,8 @@ inline std::map<::v37::bytes32, long long> allocation(std::uint64_t total, std::
 //
 // THE RULE. In an empty cut the finder's own share counts as the work: the
 // block pays its FINDER the pool P = total - B (B = the V37N base: sum of owed
-// takes + sum of fixed), i.e. reward - 1 with the fee model ON (the donation
-// keeps its 1-piconero marker) and the whole reward with the fee model OFF
+// takes + sum of fixed), i.e. the whole reward with the fee model ON too (the
+// donation keeps its 0-amount marker) and the whole reward with the fee model OFF
 // (nothing is left for the residual sink, which then emits no output), minus
 // any owed takes the block also pays.
 //
@@ -214,6 +215,52 @@ inline bool finder_malformed(const std::vector<unsigned char>& tx_extra) {
     return nf && finder_magic_present(*nf) && !parse_finder_payload(*nf);
 }
 
+// ===========================================================================
+// REWARD TOTAL (share-level canonical coinbase, 2026-09-29). A share is a
+// block candidate, so its coinbase must be the canonical one, as P2Pool
+// checks a share's generation transaction. A receipt hides the outputs in
+// its Keccak midstate; everything else the recompute needs is in the open
+// 0x02 payload (V37C, V37N, V37D, V37F, V37P) except the coinbase total,
+// which depends on the template's own transactions. The template commits it
+// FIRST in the tail, written after the final reward split (constant 12 B, so
+// the value never changes the coinbase size, weight or reward):
+//     [ nonce | rbind? | pad | "V37R" total | "V37F"? | "V37N"? | "V37D"? | "V37P"? | "V37C" ]
+// Every older reader locates its own field from the end, so none shifts. A
+// block must commit V37R == the sum of its outputs (the recompute checks it).
+// ===========================================================================
+inline constexpr unsigned char kRewardTotalMagic[4] = {'V', '3', '7', 'R'};
+inline constexpr std::size_t   kRewardTotalFieldBytes = 4 + 8;   // 12
+
+inline std::vector<std::uint8_t> encode_reward_total(std::uint64_t total) {
+    std::vector<std::uint8_t> t(kRewardTotalMagic, kRewardTotalMagic + 4);
+    for (int i = 0; i < 8; ++i) t.push_back(static_cast<std::uint8_t>(total >> (8 * i)));
+    return t;
+}
+// The payload offset right after the V37R field (where V37F / V37N / ... begin).
+inline std::size_t end_before_finder(const std::vector<std::uint8_t>& p) {
+    std::size_t end = end_before_donation_tail(p);
+    if (parse_payload(p)) {
+        end -= kPayNowTailBytes;
+        if (end >= kFinderFieldBytes && std::memcmp(p.data() + end - kFinderFieldBytes, kFinderMagic, 4) == 0)
+            end -= kFinderFieldBytes;
+    }
+    return end;
+}
+inline std::optional<std::uint64_t> parse_reward_total_payload(const std::vector<std::uint8_t>& p) {
+    const std::size_t end = end_before_finder(p);
+    if (end < kRewardTotalFieldBytes) return std::nullopt;
+    const std::uint8_t* t = p.data() + end - kRewardTotalFieldBytes;
+    if (std::memcmp(t, kRewardTotalMagic, 4) != 0) return std::nullopt;
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(t[4 + i]) << (8 * i);
+    return v;
+}
+inline std::optional<std::uint64_t> parse_reward_total(const std::vector<unsigned char>& tx_extra) {
+    const auto nf = credit::extra_nonce_field(tx_extra);
+    if (!nf) return std::nullopt;
+    return parse_reward_total_payload(*nf);
+}
+
 // Receive side: turn the EMPTY fold at the cut into the finder's credit. A
 // no-op (true) when the block commits no finder. On a refusal `credit` is
 // left untouched and *why says why.
@@ -236,6 +283,43 @@ inline bool apply_empty_cut_finder(const std::optional<::v37::ScriptRef>& finder
     return true;
 }
 
+// ---- THE DRAIN RULE (D7), the receive side (settlement-drain.md). Three
+// pieces of the booking that main_v37_xmr.cpp calls, kept here so a KAT links
+// them (v37_xmr_drain_wiring_kat W4).
+//
+// (a) The window's credit is folded at P = split_at whenever the canonical
+// coinbase split the window there (the recompute's AllocStats::split_at): a
+// no-op when the block is not canonical, the rule is off, or no old debt was
+// paid (P == the total). `fold(P, credit)` repeats the booking's own fold at P
+// (false = undecidable, like the fold it repeats). *refolded says whether it ran.
+template <class Fold>
+inline bool drain_refold_credit(bool canonical, bool drain_on, std::uint64_t split_at, std::uint64_t total,
+                                std::map<::v37::bytes32, long long>& credit, Fold&& fold, bool* refolded = nullptr) {
+    if (refolded) *refolded = false;
+    if (!canonical || !drain_on || split_at == total) return true;
+    if (!fold(split_at, credit)) return false;
+    if (refolded) *refolded = true;
+    return true;
+}
+// (b) R5, the decay clock: G_b = {k : E'_b(k) > 0}, read after the DROPS-due
+// clamp and before the redistribution, the finder and the netting. Empty when
+// the gross clock is off (master) -- and for a debit-only booking.
+inline std::set<::v37::bytes32> drain_gross_set(const std::map<::v37::bytes32, long long>& credit, bool decay_from_gross) {
+    std::set<::v37::bytes32> g;
+    if (decay_from_gross)
+        for (const auto& [k, v] : credit) if (v > 0) g.insert(k);
+    return g;
+}
+// (c) The empty-cut finder under the rule: its E_b is the pool the debt left
+// (P), which is what the canonical coinbase paid it, so it keeps no balance.
+// A no-op when no split happened (split_at 0 = rule off, or == the total).
+inline void drain_finder_credit(std::map<::v37::bytes32, long long>& credit, const ::v37::bytes32& finder,
+                                std::uint64_t split_at, std::uint64_t total) {
+    if (split_at == 0 || split_at == total) return;
+    credit.clear();
+    credit[finder] = static_cast<long long>(split_at);
+}
+
 struct NetResult {
     bool          ok = true;
     std::string   why;
@@ -249,14 +333,43 @@ struct NetResult {
 // it), `sink_total` = the coverage amount the sink / donation output carries
 // beyond its own owed part, `sink_identity` = its identity. No tail => a no-op.
 // On a refusal the maps are left untouched and ok == false.
+//
+// SPEND-COST FLOOR (`spend_floor`, payout-threshold.md §3). Who is paid now
+// depends on the builder's output cap, which a receiver cannot know, so the
+// allocation is not re-derived here: the recompute (xmr_coinbase_recompute.hpp)
+// has already proved the coinbase canonical. Each key is booked NET of what
+// both sides share, min(credit, paid): a crumb (paid 0) keeps its credit, an
+// advance (paid > credit) keeps the excess as a pending payout, a debt its
+// next credits repay. The balance after FINALIZE is the same either way;
+// netting only keeps pay-now out of the pending partition.
 inline NetResult net_booking(const std::optional<std::uint64_t>& base, std::uint64_t total,
                              std::map<::v37::bytes32, long long>& credit,
                              std::map<::v37::bytes32, long long>& payout,
                              long long sink_total, const ::v37::bytes32& sink_identity,
-                             long long sink_reserved = 0) {
+                             long long sink_reserved = 0, bool spend_floor = false) {
     NetResult r;
     if (!base) return r;
     r.pool = total > *base ? total - *base : 0;
+    if (spend_floor) {
+        for (auto c = credit.begin(); c != credit.end();) {
+            const ::v37::bytes32 k = c->first;
+            long long paid = 0;
+            if (k == sink_identity) paid = std::max<long long>(0, sink_total - sink_reserved);
+            else if (const auto p = payout.find(k); p != payout.end()) paid = p->second;
+            const long long a = std::min(c->second, paid);
+            if (a <= 0) { ++c; continue; }
+            r.alloc[k] = a;
+            r.netted += a;
+            if (!(k == sink_identity)) {
+                auto p = payout.find(k);
+                p->second -= a;
+                if (p->second == 0) payout.erase(p);
+            }
+            c->second -= a;
+            c = c->second == 0 ? credit.erase(c) : std::next(c);
+        }
+        return r;
+    }
     r.alloc = allocation(total, *base, credit);
     for (const auto& [k, a] : r.alloc) {
         if (k == sink_identity) {

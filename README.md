@@ -11,9 +11,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Daemonless Dash
 
-Security Model: Zero RPC / Zero Local Credentials".
-
-Explicitly highlight: "Unlike legacy P2Pool forks that require RPC credentials to a local Dash Core daemon, C2Pool speaks the Dash P2P wire protocol natively. It requires zero RPC credentials, zero local wallet access, and zero administrative daemon permissions.
+Security model: no RPC and no local credentials. Older P2Pool forks need RPC
+credentials to a local Dash Core daemon. c2pool speaks the Dash P2P wire protocol
+itself, so it needs no RPC credentials, no local wallet access and no
+administrative access to a daemon.
 
 c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
@@ -94,6 +95,7 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
 | **Dash** (DASH) | X11 | — | Live, daemonless (`c2pool-dash --run`; dash.voidbind.com); dashd-attached posture via `--coin-rpc` still supported |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
+| **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
@@ -123,8 +125,8 @@ and does not yet exist, so the work can be judged on what it actually is.
   prerequisites (identity view + read-at-version ring — PR #1485), W4 per-lane
   settlement (OWED-ledger fold + O2 cut + O5.5 — PR #1486), W5 coinbase assembly
   (oldest-owed-first K_fair + h_min carry + §13 root — PR #1487), and W3 carrier
-  relay over the v36 p2p (wire extension + R_MAX — PR #1484). W6 persistence /
-  restart-recovery is a **reviewed draft, not landed** (PR #1506).
+  relay over the v36 p2p (wire extension + R_MAX — PR #1484), and W6 persistence /
+  restart-recovery (PR #1506).
 - An isolated **"Family B: XMR lane"** (Monero / RandomX) under `src/impl/xmr/`,
   which does **not** touch the v37 consensus digest. Merged: the lane foundation
   (scaffold + vendored RandomX + X0 — PR #1500), buildable KAT-tested primitives
@@ -132,29 +134,32 @@ and does not yet exist, so the work can be judged on what it actually is.
   envelope (PR #1503), and stratum + FCMP-fenced coinbase-settlement + carrier wire
   (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **merged**
   (PR #1512); a **single-node stagenet daemon is live** (monerod-bound, PRs
-  #1520 / #1529). Multi-node canonical payees + section-13 state root are a
-  reviewed draft (PR #1551).
+  #1520 / #1529). Multi-node settlement commits one owed ledger (`owed_digest`)
+  with an on-chain credit cut (PRs #1697 / #1704); the earlier section-13
+  state-root draft (PR #1551) was closed in its favour. Every node recomputes the
+  lane coinbase and books a block that does not match as debit-only (PR #1884);
+  every consensus parameter is part of the pool identity (PR #1894); and old
+  balances drain from a capped slice of each block (PR #1895).
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
 - The production multi-coin pool code (v36 line) that c2pool actually runs.
 
 ### What does NOT yet exist — the honest gaps
-- **Not wired into a live node.** The v37 engine exists as a **reference/prototype
-  behind CI**; it is **not** connected to a live production node lifecycle for
-  settlement. The F1 finalize-driver obligation is **dormant** — no production
-  finalize caller is wired — so nothing settles on a live network today.
-- **No public v37 testnet.** There is no running v37 network; the engine and lanes
-  exercise **simnet / loopback only**. The runnable v37 artifacts are the engine
-  tree and the prototypes above.
+- **Not wired into a production node.** Outside the XMR lane, the v37 engine is a
+  **reference/prototype behind CI** and nothing settles on a live network. The
+  XMR lane settles on Monero stagenet in the author's multi-node test runs; it is
+  not in production anywhere.
+- **No public v37 network.** The XMR lane runs on Monero stagenet in test runs;
+  the other lanes exercise **simnet / loopback only**.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
-- **XMR lane is single-node stagenet.** Its RandomX verify runs CI-gated in light
-  mode and against a live `monerod`-stagenet single node (PRs #1520 / #1529); the
-  XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR #1518).
-  The remaining gaps are multi-node consensus (PR #1551, draft) and mainnet, which
-  stays double-fenced.
+- **XMR lane is stagenet only.** Its RandomX verify runs CI-gated in light mode;
+  the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR
+  #1518). Three daemonless nodes have run together on stagenet in day-long
+  capstone tests (PRs #1697 / #1704 / #1857); no multi-node run has yet met the
+  full capstone bar. Mainnet stays double-fenced.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
@@ -1202,6 +1207,10 @@ cd build && ctest --output-on-failure -j$(nproc)
 ## V37 development
 
 - **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
+  Erratum E-1: section 9 says the coinbase pays owed amounts "largest first". The
+  code and the ratified rule pay **oldest first** (by when a balance became
+  eligible, ties broken by a salted hash no participant can choose). The corrected
+  text is in PR #1884 (repository copy) and PR #1881 (site).
 - Dev chat (Telegram): https://t.me/c2pooldev
 - V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
 

@@ -289,6 +289,13 @@ blocks at heights in `(F, cursor + D_conf]` from this node's chain view
    next tick; `converge_retry_bound` (600 ticks, the R4 bound) attempts ->
    DIVERGED. A block that decodes as a hard refusal (unmapped output, cut
    mismatch) is refused in the scratch too (it would be on the majority).
+   Under the drain rule (ruling O-2, `settlement-drain.md`) a block the
+   majority refused on the lane-root path counts for dh: it is FOUND as an
+   EMPTY booking carrying its height, live and in the scratch alike. So the
+   scratch FOUNDs empty every block that decodes `lane-root-refused`, and
+   every block in `R` whose root is not in the scratch ring (a root-only
+   decode); an empty FOUND in the old log is never reused as a booking of
+   money (the block is decoded again).
 3. CHECK: every `unmatched` root of the run must equal
    `mm_commitment_root(chain_id, d)` for some `d` in the scratch ring with
    root age within `cba_max_root_age` (same rule as live, D7). All M match

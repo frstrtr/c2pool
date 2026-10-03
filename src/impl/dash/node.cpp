@@ -612,8 +612,9 @@ void NodeImpl::apply_min_protocol_ratchet()
     const uint32_t current =
         m_runtime_min_protocol_version.load(std::memory_order_relaxed);
     // Already ratcheted -> latched, no-op. On the private/isolated DASH v36
-    // sharechain the floor is SEEDED at 3600 (node.hpp, share_profile()
-    // .ratchet_floor_protocol_version), so this returns on the first call there.
+    // sharechain the floor is SEEDED at ISOLATED_V36_PROTOCOL_VERSION (3601,
+    // node.hpp, share_profile().ratchet_floor_protocol_version), above this
+    // target, so this returns on the first call there and never lowers it.
     if (current >= target)
         return;
     if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))

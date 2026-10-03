@@ -216,6 +216,12 @@ C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DAS
   C2P_ALIAS("sharechain.prefix", BIN_BTC, "--prefix", VALUE)
   C2P_ALIAS("sharechain.prefix", BIN_DASH, "--prefix", VALUE)
 
+// Named sharechain network (DASH): "v36" / "dash-v36" = the DASH v36 network
+// (identifier ac2785363c0180b8, prefix 8d8516bac9edd280). Money-class: it
+// changes the chain identity like network_id. Exclusive with network_id/prefix.
+C2P_PARAM("sharechain.network", Sharechain, ENUM_STR, MONEY_RESTART, C_DASH, LIT, "", ENUM_MEMBER, "named sharechain network: v36 = the DASH v36 network (forks chain)")
+  C2P_ALIAS("sharechain.network", BIN_DASH, "--net", VALUE)
+
 C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT, "", HOSTPORT_V, "explicit coin-network dial")
   C2P_ALIAS("coin_p2p.connect", BIN_DASH, "--coin-p2p-connect", VALUE)
   C2P_ALIAS("coin_p2p.connect", BIN_BCH, "--peer", VALUE)

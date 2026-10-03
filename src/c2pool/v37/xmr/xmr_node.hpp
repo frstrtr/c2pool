@@ -90,7 +90,28 @@ public:
             ::v37::xmr::xmr_point_check_fn point_check = nullptr)
         : m_cfg(std::move(cfg)), m_transport(transport),
           m_injected_point_check(point_check),
-          m_ledger(m_cfg.lane_chain) {}
+          m_ledger(m_cfg.lane_chain, ledger_rules()) {}
+
+    ::c2pool::v37n::settle::OwedLedgerRules ledger_rules() const {
+        ::c2pool::v37n::settle::OwedLedgerRules r;
+        r.arm_floor = m_cfg.ledger_arm_floor;
+        r.rotate_on_payment = m_cfg.ledger_rotate_on_payment;
+        r.decay_horizon = m_cfg.ledger_decay_horizon;
+        r.decay_half_life = m_cfg.ledger_decay_half_life;
+        r.anchor_cut = m_cfg.ledger_anchor_cut;
+        r.merkle_rows = m_cfg.ledger_merkle_rows;
+        r.drops_due = m_cfg.ledger_drops_due;
+        r.raindrop_enrol = m_cfg.ledger_raindrop_enrol;
+        // THE DRAIN RULE (drain_rule_version >= 1): the lane height (dh, "V37Z")
+        // and the gross-set decay clock ride the same flag day.
+        r.lane_height = m_cfg.drain_rule_version >= 1;
+        r.decay_from_gross = m_cfg.drain_rule_version >= 1;
+        if (m_cfg.ledger_drops_window_rw != 0)   // DROPS WINDOW (A4b): the lane's own geometry
+            r.drops_window = ::c2pool::v37n::settle::DropsWindowRule{
+                m_cfg.lane_params.window, m_cfg.lane_params.half_life, m_cfg.lane_params.epoch_len(),
+                m_cfg.ledger_drops_window_rw, ::c2pool::v37n::xmr::kXmrDropsWorkLz};
+        return r;
+    }
 
     ~XmrNode() { stop(); }
 
@@ -504,7 +525,7 @@ public:
     // boot_digest_history(). Returns false (nothing changed) on a torn store.
     bool relineage(std::string* why = nullptr) {
         if (!m_store || !m_finalize) { if (why) *why = "node not up"; return false; }
-        OwedLedger fresh(m_cfg.lane_chain);
+        OwedLedger fresh(m_cfg.lane_chain, ledger_rules());
         std::vector<::v37::bytes32> ds; std::vector<std::uint64_t> ss; std::uint64_t last = 0;
         bool ok = false;
         const RecoveredState st = replay_store(fresh, ds, ss, last, ok);
@@ -546,7 +567,10 @@ public:
     // a coinbase — the fail-closed posture for a light/OOM build.
     bool on_network_block_won(std::uint64_t monero_height,
                               const c2pool::xmr::node::Hash& block_id,
-                              const Amounts& credit, const Amounts& payout) {
+                              const Amounts& credit, const Amounts& payout,
+                              std::optional<::c2pool::v37n::settle::AnchorCut> cut = std::nullopt,
+                              const ::c2pool::v37n::settle::DropsFound* due = nullptr,
+                              const std::set<::v37::bytes32>* gross = nullptr) {
         if (m_cfg.network == MoneroNetwork::Mainnet && !m_cfg.i_understand_mainnet) {
             log("win: REFUSED to settle a MAINNET block without --i-understand-mainnet");
             return false;
@@ -556,6 +580,9 @@ public:
         fb.height = monero_height;
         fb.credit = credit;
         fb.payout = payout;
+        fb.cut = cut;   // ANCHOR: the block's own credit cut
+        if (due) fb.due = *due;   // DROPS DUE: the booking's claim (its deposit is the delta below)
+        if (gross) fb.gross = *gross;   // THE DRAIN RULE: G_b (the decay clock); the height is fb.height
         // ── ★ DROPS T3 (XMR arm) — the hook the BTC/DASH shell already has ──
         // Parity, not a second mechanism: the XMR finalize driver composes the
         // very same compose_credit_replace() the BTC-family driver does, so all
@@ -613,6 +640,30 @@ public:
             std::to_string(monero_height) + " registered (awaiting D_conf=" +
             std::to_string(m_cfg.d_conf) + ")");
         if (m_drops) log_drops_found(fb, monero_height);   // ★ DROPS: attached only under the flip
+        return true;
+    }
+
+    // THE DRAIN RULE, operator ruling O-2 (2026-10-02): a lane block REFUSED on
+    // the lane-root path (a stale or unknown 0x03 root, live or under the
+    // scratch lineage) is FOUND as an EMPTY booking carrying its Monero height,
+    // so dh (the previous lane block's height) is a pure chain function.
+    // credit {}, payout {}, G_b {}: no money moves in the ledger (the block's
+    // on-chain payout stays node-local LIABILITY), no DROPS harvest is taken
+    // or composed. Only under the lane-height rule (drain_rule_version >= 1);
+    // false (nothing registered) otherwise, which is master.
+    bool on_lane_block_refused(std::uint64_t monero_height, const c2pool::xmr::node::Hash& block_id) {
+        if (!m_ledger.rules().lane_height) return false;
+        if (m_cfg.network == MoneroNetwork::Mainnet && !m_cfg.i_understand_mainnet) {
+            log("win: REFUSED to settle a MAINNET block without --i-understand-mainnet");
+            return false;
+        }
+        FoundBlock fb;
+        fb.bid = hex_of(block_id);
+        fb.height = monero_height;
+        fb.params = m_cfg.lane_params;
+        m_finalize->on_block_found(fb);
+        log("win: EMPTY FOUND " + fb.bid.substr(0, 12) + "… at height " + std::to_string(monero_height) +
+            " (lane-root refused: its height counts for dh, no money in the ledger)");
         return true;
     }
 

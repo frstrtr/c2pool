@@ -182,6 +182,16 @@ int main() {
     for (int i = 0; i < 8; ++i) prev[i] = b32_of(static_cast<u8>(100 + i));
     for (auto* n : all) { for (int i = 0; i < 4; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
 
+    // SHARE-VERDICT HEIGHT: B's share verdict records the coinbase height the
+    // relay hands it. Every M2 receipt is mined on prev[0], whose ChainView
+    // context is the NEW block's height 100 (note_bin(prev[0], 100), as the
+    // template and the chain feed note it), so the verdict must see 100, not
+    // 101: a wrong height rebuilds every honest share as non-canonical.
+    std::mutex vh_mtx; std::vector<u64> verdict_heights;
+    B.relay->set_share_verdict([&](const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 cb_h, std::string&) {
+        std::lock_guard<std::mutex> lk(vh_mtx); verdict_heights.push_back(cb_h); return 1;
+    });
+
     // ── M2 flood + dedup ────────────────────────────────────────────────────
     const SynthBlock blkA = make_block(100, prev[0], 1, nullptr, 3, 10);
     const SynthBlock blkC = make_block(100, prev[0], 2, nullptr, 3, 11);
@@ -196,6 +206,13 @@ int main() {
     C(A.relay->stats().admitted_own.load() == 4 && A.relay->stats().admitted_foreign.load() == 3, "M2 A: 4 own + 3 foreign admitted, once each");
     C(B.relay->stats().admitted_foreign.load() == 7 && B.relay->stats().admitted_own.load() == 0, "M2 B: 7 foreign admitted, once each");
     C(Cn.relay->stats().admitted_own.load() == 3 && Cn.relay->stats().admitted_foreign.load() == 4, "M2 C: 3 own + 4 foreign admitted, once each");
+    {
+        std::lock_guard<std::mutex> lk(vh_mtx);
+        bool all100 = verdict_heights.size() == 7;
+        for (u64 h : verdict_heights) all100 = all100 && h == 100;
+        C(all100, "M2 the share verdict gets the coinbase height of the mined block (100) for all 7 receipts, got " +
+                  std::to_string(verdict_heights.size()) + (verdict_heights.empty() ? "" : " first " + std::to_string(verdict_heights[0])));
+    }
     C(A.rx_calls.load() == 3 && B.rx_calls.load() == 7 && Cn.rx_calls.load() == 4,
       "M2 RandomX ran once per FOREIGN receipt per node (A 3, B 7, C 4), never at the minter");
     C(A.relay->stats().dup.load() >= 1, "M2 the duplicate own submit was deduped");

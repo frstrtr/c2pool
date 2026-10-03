@@ -238,12 +238,38 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
         ::v37::ScriptRef ref = pay_of(k);
         if (::v37::xmr::is_xmr_kind(ref.kind)) refs.emplace_back(k, ref);
     }
+    // COST. derive_output per (output, ref) pair is ~160 us (8*r*A ~120 us,
+    // the one-time key ~46 us): O(outputs x refs) scalar multiplications, 650 s
+    // for 2700 outputs x 3000 refs. Same result, same first-match order, with
+    // D = 8*r*A computed once per ref (lazily) and the view tag (one hash,
+    // ~0.5 us) checked before the one-time key: a match needs both, so a tag
+    // miss skips the scalar multiplication.
+    struct Deriv { bool tried = false, ok = false; ::xmr::coin::KeyDerivation D; ::xmr::coin::PublicKey B; };
+    std::vector<Deriv> deriv(refs.size());
+    auto derivation_of = [&](std::size_t j) -> const Deriv& {
+        Deriv& d = deriv[j];
+        if (d.tried) return d;
+        d.tried = true;
+        const ::v37::ScriptRef& ref = refs[j].second;
+        if (!::v37::xmr::is_xmr_kind(ref.kind) || ref.payload.size() != ::v37::xmr::XMR_PAYLOAD_LEN) return d;
+        ::xmr::coin::PublicKey A;
+        std::memcpy(d.B.data(), ref.payload.data(), 32);        // spend B || view A (XMR_SUB: D_i || A)
+        std::memcpy(A.data(), ref.payload.data() + 32, 32);
+        d.ok = set_::cached_key_derivation(A, r, d.D);
+        return d;
+    };
     for (std::size_t i = 0; i < got.keys.size(); ++i) {
         bool found = false;
-        for (const auto& [id, ref] : refs) {
-            ::xmr::coin::PublicKey P; ::xmr::coin::ViewTag vt;
-            if (!set_::derive_output(r, ref, i, P, vt)) continue;
-            if (P == got.keys[i] && vt.tag == got.view_tags[i].tag) {
+        for (std::size_t j = 0; j < refs.size(); ++j) {
+            const auto& id = refs[j].first;
+            const Deriv& d = derivation_of(j);
+            if (!d.ok) continue;
+            ::xmr::coin::ViewTag vt;
+            ::xmr::coin::derive_view_tag(d.D, i, vt);
+            if (vt.tag != got.view_tags[i].tag) continue;
+            ::xmr::coin::PublicKey P;
+            if (!::xmr::coin::derive_public_key(d.D, i, d.B, P)) continue;
+            if (P == got.keys[i]) {
                 b.out_identity.push_back(id); b.out_amount.push_back(got.amounts[i]);
                 if (id == sink_identity) b.sink_total += static_cast<long long>(got.amounts[i]); // D1: never deduct the sink from a ledger key
                 else b.payout[id] += static_cast<long long>(got.amounts[i]);
@@ -264,10 +290,10 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
 // fee model (xmr_fee_model.hpp): the every-node REFUSE-IF-ABSENT booking rule.
 // The residual sink IS the donation address, so every vout to it was tallied
 // as coverage above; this locates the ONE mandatory donation output (last,
-// >= 1 piconero; the donation's K_fair payout + the V36 marker + the folded
-// residual, rulings S1 + 09-23), refusing the coinbase when it is absent,
+// any amount, 0 included; the donation's K_fair payout + the folded residual,
+// rulings S1 + 09-23), refusing the coinbase when it is absent,
 // when an earlier output also pays the donation, or when the owed_in tail is
-// missing, and books min(owed_in, amount - 1) of it as the donation's payout
+// missing, and books min(owed_in, amount) of it as the donation's payout
 // (give-author credit settled, an owed deduction); the rest stays coverage.
 // Only a FeeModelGate-ON node calls this; gate OFF books with
 // decode_lane_coinbase() against its configured sink, exactly as master.

@@ -1669,11 +1669,14 @@ int main(int argc, char* argv[]) {
         
         // Log payout configuration
         LOG_INFO << "C2Pool Payout Configuration:";
-        LOG_INFO << "  Developer fee: " << payout_manager->get_developer_config().get_total_developer_fee() << "%";
-        LOG_INFO << "  Developer address: " << payout_manager->get_developer_address();
+        LOG_INFO << "  Donation (give-author): " << payout_manager->get_developer_config().get_total_developer_fee()
+                 << "% of each share's weight (no floor; 0 leaves only the 1-satoshi marker)";
+        LOG_INFO << "  Donation address: " << payout_manager->get_developer_address();
         if (payout_manager->has_node_owner_fee()) {
             const auto& node_config = payout_manager->get_node_owner_config();
-            LOG_INFO << "  Node owner fee: " << node_config.fee_percent << "%";
+            LOG_INFO << "  Node owner fee: " << node_config.fee_percent
+                     << "% (P2P: that share of this node's jobs pays the owner instead of the miner; "
+                        "solo: an owner output of that share of the reward)";
             LOG_INFO << "  Node owner address: " << payout_manager->get_node_owner_address();
             
             // Show address source
