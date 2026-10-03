@@ -141,7 +141,8 @@ std::vector<st::WeightedPayee> weighted(const std::vector<Payee>& ps) {
 }
 
 cr::CreditCut the_cut() { cr::CreditCut c; c.next_pos = 4242; c.spine_digest[3] = 0x77; return c; }
-::v37::bytes32 the_tag() { ::v37::bytes32 t{}; t[0] = 0xC2; t[31] = 0x37; return t; }
+::v37::bytes32 the_tag() { ::v37::bytes32 t{}; t[0] = 0xC2; t[31] = 0x37; return t; }   // the pool_id of this rig
+cr::PoolField the_field() { return cr::PoolField{the_tag(), 1, 1}; }                         // RULES RATCHET: V37P v2 (epoch 1 of 1)
 
 struct BuildOpts {
     std::vector<Payee> cut_payees;
@@ -179,7 +180,7 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o,
     ctx.fixed = {fee::donation_marker(kNet)};
     ctx.h_min = 0; ctx.output_cap = 2700;
     ctx.has_credit_cut = true; ctx.credit_cut = the_cut();
-    ctx.has_pool_tag = true; ctx.pool_tag = the_tag();
+    ctx.has_pool_field = true; ctx.pool_field = the_field();   // RULES RATCHET: the V37P v2 head
     ctx.has_paynow = true;
     ctx.paynow_payees = weighted(o.cut_payees);
     ctx.spend_floor = true;
@@ -194,6 +195,7 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o,
     auto settle_from = [&]() {
         a.settle = o2::assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
         a.extra_nonce_tail = src->extra_nonce_tail();
+        a.extra_nonce_head = src->extra_nonce_head();   // RULES RATCHET: the V37P v2 head
         if (o.mutate) o.mutate(a.settle);   // the thief keeps the honest tails: only the outputs change
         if (o.mutate && o.retail) {         // ... unless it re-derives them (a forged V37N base)
             std::vector<std::uint8_t> t;
@@ -204,7 +206,6 @@ Block build_block(const st::OwedLedger& L, const Lane& lane, const BuildOpts& o,
                 const auto n = pn::encode_tail(B); t.insert(t.end(), n.begin(), n.end());
             }
             const auto d = fee::encode_donation_owed_tail(x6::fold_identity_owed(a.settle)); t.insert(t.end(), d.begin(), d.end());
-            const auto p = cr::encode_pool_tag_field(the_tag()); t.insert(t.end(), p.begin(), p.end());
             const auto c = cr::encode_tail(the_cut()); t.insert(t.end(), c.begin(), c.end());
             a.extra_nonce_tail = t;
         }
@@ -273,7 +274,7 @@ rc::LaneInputs lane_inputs() {
     li.chain_id = kChain; li.h_min = 0; li.owed_cap = 2700; li.wire_cap = 2700;
     li.residual_sink = fee::donation_ref(kNet); li.residual_sink_identity = fee::donation_identity(kNet);
     li.fixed = {fee::donation_marker(kNet)};
-    li.pool_tag = the_tag();
+    li.pool_field = the_field();
     li.spend_floor = true;
     li.commit_total = true;
     return li;

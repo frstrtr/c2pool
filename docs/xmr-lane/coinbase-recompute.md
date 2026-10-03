@@ -166,9 +166,10 @@ projected view itself (R14).
   Test networks keep them; a rig must set them identically. LANE-RULES
   (operator ruling R3, [lane-rules.md](lane-rules.md)): every one of them, and
   every compiled-in rule constant, is now in the lane-rules list the HELLO
-  compares by name (`LANE_RULES_MISMATCH`) and the on-chain `pool_tag` folds,
-  so a node with other values is refused at HELLO and sees our lane blocks as
-  ordinary blocks: never debit-only. `--d-conf` below 60 is refused off regtest.
+  compares by name (`LANE_RULES_MISMATCH`) as the pool's epoch-1 Deployment
+  (RULES RATCHET R1: nothing on chain names a rule; a same-pool block built
+  under other rules is a recompute Mismatch, and the deviant node is the one
+  refused at HELLO), so a node with other values is refused at HELLO: never debit-only. `--d-conf` below 60 is refused off regtest.
 
 ## 6. Shares: the same rule (P2Pool's share rule)
 

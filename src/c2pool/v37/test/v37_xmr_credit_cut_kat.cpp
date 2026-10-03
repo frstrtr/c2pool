@@ -73,6 +73,11 @@ namespace G4     = c2pool::xmr::native::golden_c4;
 static_assert(asm_::CREDIT_CUT_TAIL_BYTES == credit::kTailBytes,
               "impl-tree CREDIT_CUT_TAIL_BYTES must mirror credit::kTailBytes (44)");
 static_assert(credit::kTailBytes == 44, "R1: 4 magic + 8 u64 P + 32 spine");
+// RULES RATCHET R1: the pool field at the fixed offset, rbind behind it, the 255-B cap.
+static_assert(asm_::POOL_FIELD_BYTES == credit::kPoolFieldBytes && credit::kPoolFieldBytes == 45, "V37P v2 is 45 B");
+static_assert(credit::kPoolFieldOffset == 4 && credit::kRbindOffset == 49, "V37P at [4..49), rbind at [49..81)");
+static_assert(asm_::WIDEST_EXTRA_NONCE_PAYLOAD_BYTES == 240 && asm_::WIDEST_EXTRA_NONCE_PAYLOAD_BYTES <= 255,
+              "the widest 0x02 payload is 240 B (<= Monero's TX_EXTRA_NONCE_MAX_COUNT)");
 
 namespace {
 
@@ -519,15 +524,60 @@ void suite_second_boundary() {
     CHECK(!headers_equal_masking_ts(w, n + 1, hdr, n), "control: a different header length is caught");
 }
 
+// ---------------------------------------------------------------------------
+// Suite E -- RULES RATCHET R1: the V37P v2 head at [4..49), rbind at [49..81),
+// the credit cut still END-anchored; the widest payload bound is 240 B.
+// ---------------------------------------------------------------------------
+void suite_head() {
+    std::printf("== E. the pool field heads the payload: [nonce 4 | V37P 45 | rbind 32 | pad | V37C 44] ==\n");
+    Built u(true);
+    if (!CHECK_RET(u.ok, "armed, unfielded template builds: %s", u.ok ? "ok" : u.why.c_str())) return;
+    // a fielded + bound template through the same provider
+    struct BuiltF {
+        LaneFixture lane; CannedTransport tx{G4::MD_RAW_JSON}; tmpl::MonerodMinerDataSource src{tx};
+        std::unique_ptr<o2::XmrSettlementTemplateProvider> provider; o2::SettlementSnapshot snap; asm_::BlockBytes bytes; bool ok = false; std::string why;
+        BuiltF() {
+            lane.scfg.credit_cut_source = [](std::uint64_t& P, ::v37::bytes32& dg) { const credit::CreditCut c = fixture_cut(); P = c.next_pos; dg = c.spine_digest; return true; };
+            ::v37::bytes32 id{}; id[0] = 0x1D; id[31] = 0xE5;
+            lane.scfg.pool_field = credit::PoolField{id, 1, 1};
+            if (!src.poll(&why)) return;
+            provider = std::make_unique<o2::XmrSettlementTemplateProvider>(src, lane.ledger, lane.scfg, 0);
+            provider->set_extra_nonce_bind(32, [](std::uint32_t en, std::uint8_t* out) { for (int i = 0; i < 32; ++i) out[i] = static_cast<std::uint8_t>(en * 3 + i + 1); return true; });
+            if (!provider->refresh()) { why = provider->last_error(); return; }
+            snap = provider->current();
+            if (!snap.valid || !snap.tpl) { why = "no template"; return; }
+            ok = snap.tpl->materialize(0, bytes, &why);
+        }
+    } f;
+    if (!CHECK_RET(f.ok, "fielded + bound template builds: %s", f.ok ? "ok" : f.why.c_str())) return;
+    CHECK(f.bytes.extra_nonce_size == u.bytes.extra_nonce_size + 45 + 32, "0x02 payload: %zu -> %zu B (+45 head +32 rbind)", u.bytes.extra_nonce_size, f.bytes.extra_nonce_size);
+    const std::uint8_t* fp = f.bytes.full_blob.data() + f.bytes.extra_nonce_offset;
+    const auto head = credit::encode_pool_field(*f.lane.scfg.pool_field);
+    CHECK(std::memcmp(fp + credit::kPoolFieldOffset, head.data(), 45) == 0, "the V37P v2 field sits at [4..49)");
+    bool rb = true; for (int i = 0; i < 32; ++i) rb = rb && fp[credit::kRbindOffset + i] == static_cast<std::uint8_t>(0 * 3 + i + 1);
+    CHECK(rb, "rbind_v1 sits at [49..81) (kRbindOffset), after the head");
+    const auto tail = credit::encode_tail(fixture_cut());
+    CHECK(std::memcmp(fp + f.bytes.extra_nonce_size - 44, tail.data(), 44) == 0 && credit::parse_tail(std::vector<std::uint8_t>(fp, fp + f.bytes.extra_nonce_size)) == std::optional<credit::CreditCut>(fixture_cut()),
+          "the credit cut is still the END-anchored tail and parses");
+    asm_::BlockBytes f1; std::string w1;
+    const bool m1 = f.snap.tpl->materialize(1, f1, &w1);
+    const std::uint8_t* fp1 = f1.full_blob.data() + f1.extra_nonce_offset;
+    bool rb1 = true; for (int i = 0; i < 32; ++i) rb1 = rb1 && fp1[credit::kRbindOffset + i] == static_cast<std::uint8_t>(1 * 3 + i + 1);
+    CHECK(m1 && std::memcmp(fp1 + 4, head.data(), 45) == 0 && rb1 && fp1[0] == 1,
+          "extra_nonce 1: the nonce and rbind change per job, the head is constant per template");
+    CHECK(::c2pool::xmr::EXTRA_NONCE_HEAD_MAX == 45 && ::c2pool::xmr::EXTRA_NONCE_BIND_MAX == 32, "EXTRA_NONCE_HEAD_MAX 45, EXTRA_NONCE_BIND_MAX 32");
+}
+
 } // namespace
 
 int main() {
-    std::printf("=== v37_xmr_credit_cut_kat (R1: on-chain credit cut, armed coinbase shape) ===\n");
+    std::printf("=== v37_xmr_credit_cut_kat (R1: on-chain credit cut, armed coinbase shape; RULES RATCHET: the V37P v2 head) ===\n");
     suite_format();
     std::string uh, ah;
     suite_armed_vs_unarmed(uh, ah);
     suite_golden(uh, ah);
     suite_second_boundary();
+    suite_head();
     std::printf("=== %d/%d checks passed ===\n", g_checks - g_fail, g_checks);
     return g_fail == 0 ? 0 : 1;
 }

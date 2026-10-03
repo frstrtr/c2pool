@@ -347,9 +347,11 @@ mainnet these settings are pinned, and the node refuses to start otherwise
 
 The fee model is part of the relay handshake, and so is the DROPS rule set.
 Since the lane-rules list ([`lane-rules.md`](lane-rules.md)) every other
-setting above, the drain rule's three included, is in the HELLO and in the
-pool_tag: a node with another value is refused by name and books our lane
-blocks as ordinary blocks, never debit-only. `--give-author-pct` and `--node-owner-fee-pct` may differ between
+setting above, the drain rule's three included, is in the HELLO as the
+pool's epoch-1 Deployment (RULES RATCHET R1, [`pool-genesis.md`](pool-genesis.md)):
+a node with another value is refused by name at HELLO; a block of the same
+pool built under other rules is a recompute Mismatch (debit-only) for the
+deviant node alone. `--give-author-pct` and `--node-owner-fee-pct` may differ between
 nodes: the give-author value rides in each receipt, and the owner fee only
 changes a job's payee.
 

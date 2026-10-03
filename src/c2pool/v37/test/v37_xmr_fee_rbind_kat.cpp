@@ -7,8 +7,9 @@
 //
 //   T  SEAM-1 on REAL assembled templates (XmrBlockAssembler, 6 owed + 5 txs,
 //      the midstate fast path): with a per-job binder the 0x02 payload is
-//      [extra_nonce 4 | rbind 32 | pad | tail]; payload[4..36) ==
-//      rbind_v1(chain, side) for every bound job; the served miner_tx prefix
+//      [extra_nonce 4 | V37P v2 45 | rbind 32 | pad | tail]; payload[49..81) ==
+//      rbind_v1(chain, side) for every bound job (RULES RATCHET R1: the pool
+//      field precedes the binding, kRbindOffset 49); the served miner_tx prefix
 //      re-derives under X6 (canonical_coinbase_matches) with the payload AS
 //      ASSEMBLED; the hashing blob's tree root is the root of the TRUE
 //      coinbase hash (the patched fast path == a full re-hash); an unbound
@@ -70,7 +71,7 @@ constexpr u64 kSd = 5000;
 
 // Build a K2-shaped template (6 owed + 5 txs => the extra nonce sits past one
 // Keccak block, i.e. the midstate FAST path), optionally with a binder.
-std::unique_ptr<asm_::AssembledTemplate> build_tpl(const RbindRegistry* reg, std::string& why, bool bind_fn_only = false) {
+std::unique_ptr<asm_::AssembledTemplate> build_tpl(const RbindRegistry* reg, std::string& why, bool bind_fn_only = false, bool head = true) {
     asm_::AssemblyInputs a;
     a.miner = akat::miner(3000000, 300000, 18000000000000000000ull);
     a.settle = akat::lane_ctx();
@@ -81,6 +82,7 @@ std::unique_ptr<asm_::AssembledTemplate> build_tpl(const RbindRegistry* reg, std
         a.settle.owed.push_back(e);
     }
     if (reg) {
+        if (head) a.extra_nonce_head = ::c2pool::v37n::xmr::credit::encode_pool_field(test_pool_field());   // RULES RATCHET: the V37P v2 head
         a.extra_nonce_bind_size = bind_fn_only ? 0 : RbindRegistry::kBindBytes;
         a.extra_nonce_bind = [reg](std::uint32_t en, std::uint8_t* out) { return reg->bind_bytes(en, out); };
     }
@@ -147,7 +149,7 @@ int main() {
         C(small.size() == 2 && !small.get(1) && small.get(3), "J5 bounded FIFO (oldest job ages out)");
         bool hit = false;
         const ::v37::ScriptRef p = fee::choose_payee(payA, owner, 10000, 7, &hit);
-        const JobBinding jo = make_job_binding(chain, kSd, p, 0, hit);
+        const JobBinding jo = make_job_binding(chain, kSd, p, 0, /*ballot=*/0, hit);
         C(hit && jo.payee == owner && jo.side.identity == ::v37::xmr::xmr_identity_key(owner) && jo.owner_substituted,
           "J6 owner-fee hit at job issue: the PoW-bound side names the OWNER");
     }
@@ -160,15 +162,21 @@ int main() {
     auto t = build_tpl(&R, why);
     C(t != nullptr, "T1 bound template builds (6 owed + 5 txs) " + why);
     auto t0 = build_tpl(nullptr, why);
-    auto tf = build_tpl(&R, why, /*bind_fn_only=*/true);
-    C(t0 && tf, "T2 unbound templates build");
+    auto tf = build_tpl(&R, why, /*bind_fn_only=*/true, /*head=*/false);
+    auto th = build_tpl(&R, why, /*bind_fn_only=*/true, /*head=*/true);
+    C(t0 && tf && th, "T2 unbound templates build");
     if (!t || !t0 || !tf) return C.done("v37_xmr_fee_rbind_kat");
     {
         asm_::BlockBytes a0, af;
         C(t0->materialize(7, a0) && tf->materialize(7, af) && a0.full_blob == af.full_blob && a0.hashing_blob == af.hashing_blob,
           "T2 a binder with size 0 == no binder: BYTE-IDENTICAL to a pre-SEAM-1 template");
-        asm_::BlockBytes b0; C(t0->materialize(0, b0) && b0.extra_nonce_size + 32 == [&]{ asm_::BlockBytes x; (void)t->materialize(0, x); return x.extra_nonce_size; }(),
-          "T3 the bound payload is exactly 32 bytes longer ([extra_nonce | rbind 32 | pad | tail])");
+        asm_::BlockBytes b0; C(t0->materialize(0, b0) && b0.extra_nonce_size + 45 + 32 == [&]{ asm_::BlockBytes x; (void)t->materialize(0, x); return x.extra_nonce_size; }(),
+          "T3 the bound payload is exactly 45 + 32 bytes longer ([extra_nonce | V37P v2 45 | rbind 32 | pad | tail])");
+        asm_::BlockBytes bh; C(th && th->materialize(0, bh) && bh.extra_nonce_size == b0.extra_nonce_size + 45 &&
+          ::c2pool::v37n::xmr::credit::parse_pool_field_payload(std::vector<u8>(bh.full_blob.begin() + static_cast<std::ptrdiff_t>(bh.extra_nonce_offset),
+                                                                                bh.full_blob.begin() + static_cast<std::ptrdiff_t>(bh.extra_nonce_offset + bh.extra_nonce_size))) ==
+              ::c2pool::v37n::xmr::credit::PoolFieldParse::Present,
+          "T3b a head without a binder: +45 only, the V37P v2 field reads back at [4..49)");
     }
     for (std::uint32_t en : {7u, 8u}) {
         asm_::BlockBytes b; std::vector<u8> nonce;
@@ -177,8 +185,11 @@ int main() {
         C(mat, tag + " materialize + parse 0x02 " + why);
         if (!mat) continue;
         const auto jb = R.get(en);
-        C(nonce.size() >= 36 && nonce[0] == static_cast<u8>(en) && nonce[1] == 0 && std::memcmp(nonce.data() + 4, jb->rbind.data(), 32) == 0,
-          tag + " payload = [extra_nonce LE | rbind_v1(chain, side) | ...]");
+        ::c2pool::v37n::xmr::credit::PoolField pf;
+        C(nonce.size() >= 81 && nonce[0] == static_cast<u8>(en) && nonce[1] == 0 &&
+          ::c2pool::v37n::xmr::credit::parse_pool_field_payload(nonce, &pf) == ::c2pool::v37n::xmr::credit::PoolFieldParse::Present && pf == test_pool_field() &&
+          std::memcmp(nonce.data() + ::c2pool::v37n::xmr::credit::kRbindOffset, jb->rbind.data(), 32) == 0,
+          tag + " payload = [extra_nonce LE | V37P v2 (pool_id, 1/1) | rbind_v1(chain, side) at [49..81) | ...]");
         C(canonical_ok(*t, b, nonce), tag + " served prefix == X6 build_coinbase(payload as assembled): canonical_coinbase_matches");
         C(root_is_true(b), tag + " hashing-blob tree root == root of the TRUE coinbase hash (patched fast path == full re-hash)");
         C(b.miner_tx_offset + 0 < b.extra_nonce_offset && b.extra_nonce_offset - b.miner_tx_offset >= 136,
@@ -186,9 +197,9 @@ int main() {
     }
     {
         asm_::BlockBytes b; std::vector<u8> nonce;
-        C(t->materialize(9, b) && payload_of(b, nonce) && nonce.size() >= 36 &&
-          std::all_of(nonce.begin() + 4, nonce.begin() + 36, [](u8 x) { return x == 0; }) && root_is_true(b) && canonical_ok(*t, b, nonce),
-          "T4 an UNBOUND job (en=9): the region stays zero, still a canonical, correctly-hashed block");
+        C(t->materialize(9, b) && payload_of(b, nonce) && nonce.size() >= 81 &&
+          std::all_of(nonce.begin() + 49, nonce.begin() + 81, [](u8 x) { return x == 0; }) && root_is_true(b) && canonical_ok(*t, b, nonce),
+          "T4 an UNBOUND job (en=9): the rbind region [49..81) stays zero (the head stays), still a canonical, correctly-hashed block");
     }
 
     // ── R: the relay mint on SEAM-1 templates ────────────────────────────────
@@ -200,7 +211,7 @@ int main() {
         const JobBinding j7 = *R.get(7), j8 = *R.get(8);
         FbReceipt r7, r8;
         C(mint_receipt(b7.full_blob, with_nonce_hb(b7, 1234), j7.side, j7.payee, r7, &why), "R1 mint on the bound job 7 (payee A, u16 655) " + why);
-        C(check_structural(r7, rb).ok(), "R1 check_structural ACCEPTS under bind=rbind (0x02[4..36) == rbind_v1)");
+        C(check_structural(r7, rb).ok(), "R1 check_structural ACCEPTS under bind=rbind (0x02[49..81) == rbind_v1)");
         C(check_structural(r7, none).ok(), "R1 bind=none also accepts it (the binding is extra, not different)");
         C(mint_receipt(b8.full_blob, with_nonce_hb(b8, 99), j8.side, j8.payee, r8, &why) && check_structural(r8, rb).ok(),
           "R2 a second job (payee B, u16 0) on the same template also ACCEPTS");

@@ -709,22 +709,59 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_stranger_mm_tail_kat COMMAND v37_xmr_stranger_mm_tail_kat)
 
     # ------------------------------------------------------------------
-    # POOL-LINEAGE -- the block-level pool id (operator ruling 2026-09-25).
+    #   v37_xmr_epoch_kat  (RULES RATCHET R1, operator rulings 2026-10-03)
+    #     The EPOCH TABLE in the ledger and the stores: V37Y / V37V first in
+    #     every XMR owed_digest from epoch 1 (the empty-ledger anchor golden; a
+    #     ledger without a table keeps the bare V37Q anchor), the Deployment
+    #     codec (61 B) and validity, the RATCHET event (LedgerContinuity, forward
+    #     only, the "V37L" 0x04 leaf), settle-store schema 7 (every record ver 7
+    #     with the ballot box; kind 4 = 55 B; ver 8 newer-than-reader; the
+    #     RecoveryDriver replays a RATCHET at its position and REFUSES one for an
+    #     epoch the build lacks), GenesisRec v2 (own version byte 2) and the
+    #     open rules (another pool / network / chain, raw on mainnet, an unknown
+    #     epoch -> refuse; announced-not-active -> open), owed_rules_of.
+    #     RED on the base. Listed in BOTH build.yml --target lists.
+    #   v37_xmr_ballot_kat / v37_xmr_decay_grandfather_kat (RULES RATCHET R1):
+    #     in the GAP-2 foreach above -- the side ballot word, XMR_LANE_BV and the
+    #     ballot box of project() / fold_eb; the dust-decay schedule
+    #     grandfathered by the epoch at gone_since (R-MIN (d)). RED on the base.
+    #     Listed in BOTH build.yml --target lists.
+    # ------------------------------------------------------------------
+    add_executable(v37_xmr_epoch_kat
+        v37_xmr_epoch_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+    target_compile_features(v37_xmr_epoch_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_epoch_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/native/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_epoch_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+    target_link_libraries(v37_xmr_epoch_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_epoch_kat COMMAND v37_xmr_epoch_kat)
+
+    # ------------------------------------------------------------------
+    # POOL IDENTITY -- RULES RATCHET R1 (operator rulings 2026-10-03; was
+    # POOL-LINEAGE 2026-09-25: the pool_tag is retired).
     #
     #   v37_xmr_pool_lineage_kat
-    #     pool_tag = sha256d('V37PT2' || lane_tag || pool_genesis_id || rules_digest) (formula,
-    #     S1 lane_tag input, per-network default genesis, --pool-genesis
-    #     parse); the V37C tail's versioned "V37P" field (37 B, before V37C,
-    #     V37C/V37D still parse, strict version); classify own -> lane block,
-    #     other tag / untagged tail -> ordinary, malformed -> strict reject;
-    #     REAL assembled blocks: the coinbase delta vs the untagged shape is
-    #     exactly the field, the coinbase-authority decoder books OUR block and
-    #     answers "not-lane:" for another pool's and a pre-lineage block (the
-    #     ungated decoder reproduces the D-1 cross-pool match); the widest
-    #     payload (two-byte 0x02 varint) assembles; the relay HELLO carries the
-    #     genesis (+32 B) and refuses another as TAG_MISMATCH field=pool_genesis;
-    #     suite G (LANE-RULES): other lane rules -> another tag -> a real block
-    #     is Foreign (never Mismatch / debit-only), the tag moves only its value.
+    #     pool_genesis = sha256d('V37GEN' || hash(H) || u8 len || headline),
+    #     pool_id = sha256d('V37PID' || network || chain_id || genesis) (goldens;
+    #     the headline grammar; --pool-genesis-from; the chain check; the raw
+    #     form refused on mainnet); the V37P v2 field (45 B) at the FIXED offset
+    #     0x02[4..49) with rbind at [49..81) (strict version, the tail readers
+    #     untouched); classify own -> lane block, other -> ordinary, no field ->
+    #     ordinary, another version -> strict reject; REAL assembled blocks: the
+    #     coinbase delta vs the unfielded shape is exactly the 45-byte head, the
+    #     coinbase-authority decoder books OUR block, parses (pool_id, epochs)
+    #     and answers "not-lane:" for another pool's / an unfielded block; the
+    #     widest payload (240 B) assembles; the HELLO carries the genesis and
+    #     the epoch trailer; suite G: other lane rules = another epoch-1 digest
+    #     = refused at HELLO by name (the same pool_id on chain), a same-pool
+    #     block under other rules / another epoch_cur is a recompute Mismatch.
     #     Listed in BOTH build.yml --target lists.
     # ------------------------------------------------------------------
     add_executable(v37_xmr_pool_lineage_kat
@@ -1141,7 +1178,7 @@ if (BUILD_TESTING)
     #                               property HELLO-compatible <=> same pool_tag.
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_drops_retain_kat v37_xmr_hold_round3_kat v37_xmr_deep_order_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_drops_retain_kat v37_xmr_hold_round3_kat v37_xmr_deep_order_kat v37_xmr_ballot_kat v37_xmr_decay_grandfather_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1653,8 +1690,10 @@ if (BUILD_TESTING)
     target_compile_features(v37_xmr_mainnet_readiness_kat PRIVATE cxx_std_20)
     target_include_directories(v37_xmr_mainnet_readiness_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_compile_definitions(v37_xmr_mainnet_readiness_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
     target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE xmr_node xmr_coin Threads::Threads)
     if (TARGET Boost::headers)
         target_link_libraries(v37_xmr_mainnet_readiness_kat PRIVATE Boost::headers)

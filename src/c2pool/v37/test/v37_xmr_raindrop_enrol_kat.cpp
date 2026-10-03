@@ -318,16 +318,17 @@ static void re3_gate(Checker& C, const World& W) {
     C(of.digest == lane_only.book_digest() && of.add.empty() && of.effX == 0,
       "RE3 set_raindrop_enrol OFF: the book is the lane-only book (digest byte-identical), nothing enrolled by raindrop");
 #if RE_FIX
-    // settle store schema 4 round-trip; empty enrol_add stays schema 3
+    // settle store round-trip (RULES RATCHET R1: every record is ver 7; an empty enrol_add reads back empty)
     namespace xs = ::c2pool::v37n::xmr;
     xs::SettleEvent e; e.kind = xs::SettleEvKind::Found; e.bid = "b";
     st::DropsFound d; d.deposit = o.delta; d.enrol_add = o.add;
     xs::set_drops(e, d);
     const std::string blob = e.serialize();
     const auto back = xs::drops_of(xs::SettleEvent::deserialize(blob));
-    C(blob[0] == 4 && back && back->enrol_add == o.add, "RE3 settle store: schema 4 carries enrol_add {eff, ref} and round-trips");
+    C(blob[0] == 7 && back && back->enrol_add == o.add, "RE3 settle store (ver 7) carries enrol_add {eff, ref} and round-trips");
     d.enrol_add.clear(); xs::set_drops(e, d);
-    C(e.serialize()[0] == 3, "RE3 settle store: no enrol_add = schema 3 (byte-identical to A5)");
+    { const auto back0 = xs::drops_of(xs::SettleEvent::deserialize(e.serialize()));
+      C(e.serialize()[0] == 7 && back0 && back0->enrol_add.empty(), "RE3 settle store: no enrol_add -> ver 7, an empty registry section reads back"); }
     // the carry-store journal (G record) round-trips
     const std::string path = "/tmp/v37_xmr_raindrop_enrol_kat." + std::to_string(::getpid()) + ".drops";
     std::remove(path.c_str());

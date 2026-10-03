@@ -59,6 +59,7 @@
 #include <c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp>
 #include <c2pool/v37/v37_engine.hpp>
 #include <c2pool/v37/xmr/xmr_lane_rules.hpp>
+#include <c2pool/v37/xmr/xmr_epoch.hpp>   // E RULES RATCHET: Deployment
 
 using namespace gap2test;
 using namespace std::chrono_literals;
@@ -74,6 +75,8 @@ struct Cfg {
     bool tagged = true;
     // P8 LANE-RULES: the node's lane-rules list (needs a pool genesis on the wire)
     std::optional<c2pool::v37n::xmr::lanerules::LaneRules> rules;
+    // E RULES RATCHET: the node's Deployment list (empty = the one-entry genesis list of `rules`)
+    std::vector<c2pool::v37n::xmr::epoch::Deployment> epochs;
 };
 
 static RelayOptions opts(const Cfg& c, bool listen, std::vector<u16> dial) {
@@ -87,6 +90,10 @@ static RelayOptions opts(const Cfg& c, bool listen, std::vector<u16> dial) {
         if (o.pool_id) o.pool_id->genesis = b32_of(0x6e);
         o.lane_rules = c.rules;
         o.lane_rules->lane_params_digest = o.lane_params_digest;   // the list repeats the HELLO's own digest
+        if (!c.epochs.empty()) {   // E RULES RATCHET: an explicit list (epoch 1 rebuilt from the list the HELLO carries)
+            o.epochs = c.epochs;
+            o.epochs[0] = c2pool::v37n::xmr::epoch::genesis_deployment(c2pool::v37n::xmr::lanerules::rules_digest(*o.lane_rules));
+        }
     }
     o.listen = listen; o.listen_host = "127.0.0.1"; o.listen_port = 0;
     for (u16 p : dial) o.peers.emplace_back("127.0.0.1", p);
@@ -562,6 +569,43 @@ int main() {
         C(wait_for([&] { return A.next_pos() == 7 && B.next_pos() == 7; }, all), "P8b bin 100 closed on A and B (7 pushes)");
         C(A.digest() == B.digest() && A.digest() == tagged_digest,
           "P8b byte-identical lane digests, equal to the list-less pair's (" + hex(A.digest()).substr(0, 16) + ")");
+        // RULES RATCHET R1 (E): the peer's HELLO carried the epoch trailer -- epoch_cur 1 and
+        // the one Deployment {1, rules_digest(list), kind 0}; the same pool_id on both.
+        C(rh && rh->epoch_cur == 1 && rh->epochs.size() == 1 && rh->epochs[0].epoch_no == 1 && rh->epochs[0].kind == 0 &&
+          rh->epochs[0].rules_digest == c2pool::v37n::xmr::lanerules::rules_digest(*rh->rules),
+          "E the peer's HELLO carried the epoch trailer: epoch_cur 1, Deployment {1, rules_digest(TLV), kind 0}");
+    }
+    {   // RULES RATCHET R1 (E): identical common Deployments interoperate; a peer that knows MORE epochs is a
+        // follower-of relation, accepted; a common Deployment that differs is refused by name.
+        std::printf("-- E RULES RATCHET: identical common Deployments interoperate; an extra epoch is accepted; a differing one is refused\n");
+        c2pool::v37n::xmr::lanerules::LaneRules r60;
+        r60.d_conf = 60; r60.output_cap = 2700; r60.recon_max_root_age = 240; r60.book_deferral = 1; r60.coinbase_maturity = 60;
+        c2pool::v37n::xmr::epoch::Deployment d2; d2.epoch_no = 2; d2.kind = 1; d2.rules_digest = b32_of(0x22); d2.start_height = 1000; d2.timeout_height = 2000;
+        Cfg ca = same; ca.rules = r60;
+        TNode A("A", ca, true, {});
+        C(A.start(), "E A starts (epochs {1})");
+        Cfg cb = ca; cb.epochs = {c2pool::v37n::xmr::epoch::Deployment{}, d2};   // entry 0 is rebuilt from the rules by opts()
+        TNode B("B", cb, true, {A.relay->listen_port()});
+        C(B.start(), "E B starts (epochs {1, 2}: it knows a Deployment A lacks)");
+        std::vector<TNode*> all{&A, &B};
+        C(wait_for([&] { return A.relay->ready_peers().size() == 1 && B.relay->ready_peers().size() == 1; }, all), "E A<->B HELLO ok: a peer that knows MORE epochs is accepted (A is the follower)");
+        const auto rh = A.relay->remote_hello(A.relay->ready_peers().front());
+        C(rh && rh->epochs.size() == 2 && rh->epochs[1] == d2, "E A sees B's two Deployments in the HELLO (R3 adopts epoch 2 for the tally)");
+        B.relay->set_dialing(false);
+        // a differing common Deployment (epoch 2 with another start) between two {1, 2} nodes: refused by name
+        TNode Cn("C", cb, true, {});
+        C(Cn.start(), "E C starts (epochs {1, 2})");
+        Cfg cd_ = cb; cd_.epochs[1].start_height = 1001;
+        TNode D("D", cd_, true, {Cn.relay->listen_port()});
+        C(D.start(), "E D starts (epoch 2 start 1001), dials C");
+        std::vector<TNode*> cd{&Cn, &D};
+        const std::string lc = "LANE_RULES_MISMATCH epoch=2 field=start ours=1000 theirs=1001";
+        const bool seen = wait_for([&] { return Cn.count_logs("HELLO REFUSED", lc) >= 1; }, cd, 10000ms);
+        std::this_thread::sleep_for(500ms);
+        for (auto* n : cd) n->pump();
+        C(seen, "E C logs HELLO REFUSED: " + lc);
+        C(Cn.relay->stats().hello_rules_mismatch.load() >= 1 && Cn.relay->ready_peers().empty(), "E counted as rules_mismatch, 0 ready peers on C");
+        D.relay->set_dialing(false);
     }
     return C.done("v37_xmr_relay_pool_id_kat");
 }

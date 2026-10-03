@@ -304,8 +304,12 @@ struct RelayOptions {
     std::optional<bytes32> enrol_set_digest;
     // LANE-RULES (operator ruling R3): this node's lane-rules list, sent in HELLO
     // (with a pool genesis) and compared field by field with every peer's; the
-    // same list's digest is folded into the on-chain pool_tag. nullopt = none.
+    // same list's digest is the epoch-1 Deployment (RULES RATCHET). nullopt = none.
     std::optional<::c2pool::v37n::xmr::lanerules::LaneRules> lane_rules;
+    // RULES RATCHET R1: the epoch trailer of the HELLO (with lane_rules). Empty
+    // epochs => the one-entry list {epoch 1 = rules_digest(lane_rules)}.
+    u32         epoch_cur = 1;
+    std::vector<::c2pool::v37n::xmr::epoch::Deployment> epochs;
     bool        listen = false;                   // false = dial-only
     std::string listen_host = "127.0.0.1";
     u16         listen_port = 0;                  // 0 = an ephemeral port (tests), read back via listen_port()
@@ -1288,6 +1292,7 @@ public:
         h.share_diff = m_o.share_diff; h.node_nonce = m_nonce; h.listen_port = m_net.listen_port();
         h.bind = m_o.bind; h.pool = m_o.pool_id; h.enrol_set = m_o.enrol_set_digest;
         h.rules = m_o.lane_rules;   // LANE-RULES
+        h.epoch_cur = m_o.epoch_cur; h.epochs = m_o.epochs;   // RULES RATCHET: the epoch trailer
         if (m_tip) { const auto t = m_tip(); h.lane_next_pos = t.first; h.lane_digest = t.second; }
         return h;
     }

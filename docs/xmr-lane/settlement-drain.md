@@ -1,8 +1,10 @@
 # XMR lane: the drain rule (pay the old balances, never create a new one)
 
 Status: **implemented** behind lane rules 23-25 (`drain_rule_version = 1`,
-`drain_q = 16`, `drain_h_cap = 64` on the test networks from the rule's flag
-day; `0 / 0 / 0` = master on mainnet until the operator's own flag day).
+`drain_q = 16`, `drain_h_cap = 64` on every network: the test networks from the
+rule's flag day, mainnet from its genesis -- RULES RATCHET R1 made the drain
+floor constitutional, R-MIN (c) in [lane-rules.md](lane-rules.md) sec. 4, and
+`16 / 64` IS the floor; `0 / 0 / 0` is no longer a mainnet state).
 Operator rulings R1-R5 of 2026-10-02, on the settlement study of the same
 week. Payout scheme: Work Receipt Settlement (WRS), pay-per-receipt. This page
 summarises the study (method, data, numbers) and states the rule as the code

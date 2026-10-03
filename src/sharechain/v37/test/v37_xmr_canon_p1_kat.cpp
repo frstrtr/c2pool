@@ -163,6 +163,12 @@ int main() {
     static_assert(static_cast<std::uint8_t>(xmr::XMR_LANE_GA) == 0x1F, "XMR_LANE_GA kind byte moved");
     static_assert(xmr::XMR_GA_PAYLOAD_LEN == 132, "XMR_LANE_GA payload width moved");
     CHECK(is_xmr_dispatch_kind(xmr::XMR_LANE_GA));
+    // RULES RATCHET: the composite lane identity WITH A BALLOT dispatches to the
+    // XMR validator; its kind byte is pinned at 0x1E (134-byte payload).
+    static_assert(static_cast<std::uint8_t>(xmr::XMR_LANE_BV) == 0x1E, "XMR_LANE_BV kind byte moved");
+    static_assert(xmr::XMR_BV_PAYLOAD_LEN == 134, "XMR_LANE_BV payload width moved");
+    CHECK(is_xmr_dispatch_kind(xmr::XMR_LANE_BV));
+    CHECK(!is_xmr_dispatch_kind(static_cast<ScriptKind>(0x1D)));
 
     // (1) XMR identity_key goldens hold (SHA-256 only; sanity that the extension
     //     header is intact and the digest path serializes 64-byte payloads).

@@ -58,7 +58,7 @@ int main() {
         const SynthBlock sb = make_block(201, b32_of(22), 10, &rbA, 4, 3);
         FbReceipt r; std::string why;
         C(mint_receipt(sb.full_blob, with_nonce(sb, 1), sideA, payA, r, &why), "B2 mint on the SEAM-1 layout " + why);
-        C(check_structural(r, rb).ok(), "B2 bind=rbind: ACCEPT when 0x02[4..36) == rbind_v1(chain, side)");
+        C(check_structural(r, rb).ok(), "B2 bind=rbind: ACCEPT when 0x02[49..81) == rbind_v1(chain, side) (RULES RATCHET: after the V37P v2 head)");
         C(check_structural(r, none).ok(), "B2 bind=none also accepts it (the binding is extra, not different)");
         auto expect = [&](FbReceipt t, CheckStage st, const std::string& what) {
             const auto res = check_structural(t, rb);
@@ -78,8 +78,16 @@ int main() {
           expect(t, CheckStage::Identity, "side.identity != identity_key(payee)"); }
         { FbReceipt t = r; t.side.chain_id = chain + 1; t.receipt.info_digest = side_digest_v2(t.side);
           expect(t, CheckStage::Chain, "side.chain_id != lane"); }
-        { FbReceipt t = r; t.side.reserved = 1; t.receipt.info_digest = side_digest_v2(t.side);
-          expect(t, CheckStage::Reserved, "side.reserved != 0"); }
+        // RULES RATCHET R1: the former reserved word is the BALLOT -- any u16 is well-formed (no Reserved
+        // stage); a ballot the job was not bound with fails the PoW binding, one it was bound with passes.
+        { FbReceipt t = r; t.side.ballot = 1; t.receipt.info_digest = side_digest_v2(t.side);
+          expect(t, CheckStage::Bind, "ballot changed to 1 (info_digest re-made): not the bound ballot -> refused at Bind, never a 'reserved' refusal"); }
+        { SideDataV2 sideV = sideA; sideV.ballot = 0x8002;
+          const bytes32 rbV = rbind_v1(chain, sideV);
+          const SynthBlock sbv = make_block(203, b32_of(24), 12, &rbV, 4, 5);
+          FbReceipt rv; std::string wv;
+          C(mint_receipt(sbv.full_blob, with_nonce(sbv, 1), sideV, payA, rv, &wv) && check_structural(rv, rb).ok() && check_structural(rv, none).ok(),
+            "B2 a job bound WITH ballot 0x8002: the receipt (ballot 0x8002 in side_data_v2) is ACCEPTED under rbind and none " + wv); }
         { FbReceipt t = r; t.receipt.hashing_blob.bytes[sb.nonce_offset] ^= 0x80;
           C(check_structural(t, rb).ok(), "B2 a different nonce is structurally fine (only RandomX can judge it)"); }
     }

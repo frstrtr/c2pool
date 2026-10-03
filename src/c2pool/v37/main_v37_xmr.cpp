@@ -101,8 +101,9 @@
 #include "xmr/xmr_coinbase_recompute.hpp"    // every node recomputes the lane coinbase (rulings 2026-09-29)
 #include "xmr/relay/xmr_share_verdict.hpp"    // share-level canonical coinbase (the relay verdict)
 #include "xmr/xmr_fee_model.hpp"            // fee model: donation marker/sink, give-author u16, owner-fee roll
-#include "xmr/xmr_pool_tag.hpp"             // POOL-LINEAGE: pool_genesis_id / pool_tag (block-level pool id)
-#include "xmr/xmr_lane_rules_build.hpp"      // LANE-RULES: the lane-rules list (HELLO + pool_tag)
+#include "xmr/xmr_pool_tag.hpp"             // RULES RATCHET: the pool identity (derived genesis V37GEN -> pool_id V37PID)
+#include "xmr/xmr_lane_rules_build.hpp"      // LANE-RULES: the lane-rules list (HELLO; the epoch-1 Deployment)
+#include "xmr/xmr_epoch.hpp"                 // RULES RATCHET: the Deployment list / epoch table
 #include "xmr/xmr_web_dashboard.hpp"        // XMR-WEB: the c2pool web dashboard (--web-port; OFF by default)
 #include <c2pool/v37/w3_relay.hpp>           // recon(A+B credit): CutDescriptor + CarrierWire (the REAL v0x02 codec)
 #include <c2pool/v37/w3_wire_freeze.hpp>     // recon(A+B credit): fixture_a (a well-formed carrier body to ride the descriptor)
@@ -236,7 +237,10 @@ static bool g_lane_suspended_now = false;                  // R-C rework-2: main
 // GAP-2 relay knobs (design §6). All default OFF: with neither --relay-listen nor
 // --relay-peer the daemon is byte-identical to the stand-in build.
 static std::string   g_relay_listen;                    // --relay-listen HOST:PORT
-static std::optional<::v37::bytes32> g_pool_genesis;    // POOL-LINEAGE: --pool-genesis <hex64> (unset = the network default)
+static std::optional<::v37::bytes32> g_pool_genesis;    // RAW pool genesis: --pool-genesis <hex64> (unset = the network default; test networks only)
+static std::optional<c2pool::v37n::xmr::lineage::GenesisSpec> g_pool_genesis_from;   // RULES RATCHET: --pool-genesis-from <H>:<hash64>:"<headline>"
+static std::optional<c2pool::v37n::xmr::lineage::PoolIdentity> g_pool_identity;      // RULES RATCHET: the identity this node runs with (set in run_live)
+static std::optional<c2pool::v37n::xmr::lanerules::LaneRules>  g_lane_rules;         // RULES RATCHET: the node's lane rules (= the epoch-1 Deployment), built before the node
 static std::vector<std::string> g_relay_peers;          // --relay-peer HOST:PORT (repeatable)
 static bool          g_no_relay_bootstrap = false;     // --no-relay-bootstrap (RELAY-BOOTSTRAP: drop the built-in list)
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
@@ -291,19 +295,31 @@ static std::function<void(xweb::XmrWebState&)> g_web_extra;               // run
 static std::function<std::string(const ::v37::bytes32&)> g_web_name;      // run_live: ledger key -> address
 static std::atomic<std::uint64_t> g_web_net_diff{0};    // the template difficulty (share weight when --share-diff 0)
 static bool relay_enabled() { return !g_relay_listen.empty() || !g_relay_peers.empty(); }
-// POOL-LINEAGE: the pool genesis id (--pool-genesis, else the per-network
-// default) and the block-level pool_tag every lane coinbase commits.
+// RULES RATCHET R1 (operator rulings 2026-10-03): the pool identity.
+//   derived  --pool-genesis-from <H>:<hash64>:"<headline>"  pool_genesis = sha256d("V37GEN" || hash(H) || u8 len || headline)
+//   raw      --pool-genesis <hex64> | the per-network default  (regtest; testnet / stagenet with a WARNING; REFUSED on mainnet)
+//   pool_id  = sha256d("V37PID" || u8 network || u32 chain_id || b32 pool_genesis), committed in every lane coinbase (V37P v2).
 static std::uint8_t lineage_network_byte(MoneroNetwork n) {
     return n == MoneroNetwork::Mainnet ? 0 : n == MoneroNetwork::Testnet ? 1 : n == MoneroNetwork::Stagenet ? 2 : 3;
 }
-static ::v37::bytes32 pool_genesis_of(const XmrNodeConfig& cfg) {
-    return g_pool_genesis ? *g_pool_genesis
-                          : c2pool::v37n::xmr::lineage::default_pool_genesis(lineage_network_byte(cfg.network));
+static std::optional<c2pool::v37n::xmr::lineage::PoolIdentity> resolve_pool_identity(const XmrNodeConfig& cfg, std::string* why) {
+    namespace lineage = c2pool::v37n::xmr::lineage;
+    const std::uint8_t net = lineage_network_byte(cfg.network);
+    if (g_pool_genesis_from) {
+        if (g_pool_genesis) { if (why) *why = "genesis: --pool-genesis-from and --pool-genesis are mutually exclusive"; return std::nullopt; }
+        return lineage::identity_derived(net, cfg.lane_chain, *g_pool_genesis_from);
+    }
+    if (const std::string r = lineage::raw_genesis_refusal(net); !r.empty()) { if (why) *why = r; return std::nullopt; }
+    return lineage::identity_raw(net, cfg.lane_chain, g_pool_genesis ? *g_pool_genesis : lineage::default_pool_genesis(net));
 }
-// LANE-RULES: the tag folds the node's lane-rules digest (xmr_pool_tag.hpp).
-static ::v37::bytes32 pool_tag_of(const XmrNodeConfig& cfg, const ::v37::bytes32& rules_digest) {
-    return c2pool::v37n::xmr::lineage::pool_tag_for(cfg.lane_chain, cfg.lane_params, pool_genesis_of(cfg), rules_digest);
-}
+// The node's lane rules (LANE-RULES; RULES RATCHET: the epoch-1 Deployment and
+// the ledger's epoch table), a pure function of the configuration -- built
+// BEFORE the node exists (the ledger's first digest commits their digest) and
+// rebuilt where the settlement config is complete (the two must agree).
+static c2pool::v37n::xmr::lanerules::LaneRules build_lane_rules(const XmrNodeConfig& cfg, const ::v37::bytes32& residual_sink_id,
+                                                                std::uint32_t output_cap_ceiling, bool kfair_salted_ties,
+                                                                bool spend_floor, bool commit_total);
+static ::v37::bytes32 early_residual_sink_identity(const XmrNodeConfig& cfg);
 // ★ DROPS: the enrol mode / set --drops-enrol gives (none | ID... | nothing =
 // auto). One parse for the DROPS block and the LANE-RULES list; `bad`
 // collects entries that are neither a 64-hex identity nor a valid XMR address.
@@ -324,7 +340,7 @@ static relay::EnrolMode drops_enrol_of(std::set<::v37::bytes32>& es, std::vector
 // LANE-RULES: the two HELLO digests this node will send -- lane_params_digest
 // (+ the enrol fold when DROPS is live) and the rule-tagged enrol digest --
 // computed from the configuration BEFORE the DROPS wiring exists, because the
-// lane-rules list (and so the pool_tag the template commits) needs them first.
+// lane-rules list (the epoch-1 Deployment the HELLO and the ledger commit) needs them first.
 // The relay block recomputes them from the live wiring and refuses to start if
 // they differ, so the list can never describe another HELLO than the one sent.
 struct HelloDigests { ::v37::bytes32 lpd{}; std::optional<::v37::bytes32> enrol; };
@@ -342,6 +358,38 @@ static HelloDigests hello_digests_of(const XmrNodeConfig& cfg) {
     d.lpd = c2pool::v37n::xmr::drops::hello_digest_with_enrol(d.lpd, emode, es, rule);
     d.enrol = relay::enrol_rule_digest(c2pool::v37n::xmr::drops::enrol_mode_digest(emode, es), rule);
     return d;
+}
+
+static c2pool::v37n::xmr::fee::DonationNet donation_net_of(MoneroNetwork n);   // defined below (DON-NET)
+// RULES RATCHET: the lane-rules list from the configuration (see the declaration above).
+static c2pool::v37n::xmr::lanerules::LaneRules build_lane_rules(const XmrNodeConfig& cfg, const ::v37::bytes32& residual_sink_id,
+                                                                std::uint32_t output_cap_ceiling, bool kfair_salted_ties,
+                                                                bool spend_floor, bool commit_total) {
+    namespace lanerules = c2pool::v37n::xmr::lanerules;
+    const HelloDigests hd = hello_digests_of(cfg);
+    lanerules::LaneRulesInputs li;
+    li.book_deferral      = !g_no_book_deferral;
+    li.recon_max_root_age = g_recon_max_root_age;
+    li.kfair_salted_ties  = kfair_salted_ties;
+    li.spend_floor        = spend_floor;
+    li.commit_total       = commit_total;
+    li.output_cap_ceiling = output_cap_ceiling;
+    li.residual_sink_id   = residual_sink_id;
+    li.lane_params_digest = hd.lpd;
+    li.enrol_digest       = hd.enrol ? *hd.enrol : ::v37::bytes32{};
+    return lanerules::lane_rules_of(cfg, li);
+}
+// The residual sink identity the complete settlement config will carry: fee ON
+// -> the network's donation identity; fee OFF -> the configured sink (both hex
+// given), else none (the serving gate refuses later; the list still names zeros).
+static ::v37::bytes32 early_residual_sink_identity(const XmrNodeConfig& cfg) {
+    namespace fee = ::c2pool::v37n::xmr::fee;
+    if (fee::fee_model_on(cfg.lane_params)) return fee::donation_identity(donation_net_of(cfg.network));
+    o2::XmrSettlementConfig scratch;
+    if (!cfg.residual_sink_spend_hex.empty() && !cfg.residual_sink_view_hex.empty() &&
+        scratch.set_residual_sink_hex(cfg.residual_sink_spend_hex, cfg.residual_sink_view_hex, cfg.residual_sink_subaddress))
+        return scratch.residual_sink_identity;
+    return ::v37::bytes32{};
 }
 static bool split_hostport(const std::string& s, std::string& host, std::uint16_t& port) {
     const auto c = s.rfind(':');
@@ -1723,8 +1771,35 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!native) return 2;
     }
 
+    // ── RULES RATCHET R1: the pool identity, the lane rules (= the epoch-1 Deployment), R-MIN ──
+    // All three are pure functions of the configuration and are needed BEFORE the
+    // node exists: the ledger's first digest commits the epoch-1 rules digest
+    // (V37Y) and the store is bound to the pool (GenesisRec v2) at bring_up().
+    {
+        std::string why;
+        g_pool_identity = resolve_pool_identity(cfg, &why);
+        if (!g_pool_identity) {
+            std::printf("REFUSED: %s\n", why.c_str());
+            return 2;
+        }
+        if (g_pool_identity->form == c2pool::v37n::xmr::lineage::GenesisForm::Raw && cfg.network != MoneroNetwork::Regtest)
+            std::printf("WARNING: %s\n", c2pool::v37n::xmr::lineage::raw_genesis_warning());
+        g_lane_rules = build_lane_rules(cfg, early_residual_sink_identity(cfg), o2::XmrSettlementConfig{}.output_cap_ceiling,
+                                        /*kfair_salted_ties=*/true, /*spend_floor=*/true, /*commit_total=*/true);
+        const ::v37::bytes32 mainnet_sink = c2pool::v37n::xmr::fee::donation_identity(c2pool::v37n::xmr::fee::DonationNet::Mainnet);
+        if (const std::string r = lanerules::constitutional_check(lineage_network_byte(cfg.network), *g_lane_rules, &mainnet_sink); !r.empty()) {
+            std::printf("REFUSED: %s\n", r.c_str());   // R-MIN (spec sec. 7): fail-closed at start on the node's own rules
+            return 2;
+        }
+        std::printf("%s\n", c2pool::v37n::xmr::lineage::identity_line(*g_pool_identity).c_str());
+    }
+
     LiveMonerodTransport transport(cfg.monerod);
     XmrNode node(cfg, transport);
+    // RULES RATCHET: the ledger runs the one-row epoch table (epoch 1 = these rules, ACTIVE from H_act 0)
+    // and the store is bound to the pool identity + this build's deployment list at bring_up().
+    node.set_epoch_table(settle::genesis_epoch_table(lanerules::rules_digest(*g_lane_rules), node.ledger_rules()));
+    node.set_pool_identity(*g_pool_identity, lanerules::genesis_deployments(*g_lane_rules));
     o2::NativeChainSource chain_src;
     if (p2p_first) {
         chain_src = o2::native_chain_source(*native);
@@ -1743,6 +1818,41 @@ static int run_live(const XmrNodeConfig& cfg) {
     // R-C rework-2 (F2): daemon-first re-drives every chain gap (downtime / a ZMQ
     // gap wider than the reconcile walk) through the booking path.
     if (!p2p_first) node.enable_gap_redrive(true);
+    // RULES RATCHET (spec sec. 1.1 (c)): a DERIVED genesis is checked against the
+    // chain view at start -- hash(H) must be the block at height H and H must be
+    // >= D_conf deep -- and the node refuses to start otherwise.
+    if (g_pool_identity->form == c2pool::v37n::xmr::lineage::GenesisForm::Derived) {
+        const auto& spec = g_pool_identity->spec;
+        std::optional<::v37::bytes32> hash_at;
+        std::uint64_t tip = 0;
+        bool answered = false;
+        if (p2p_first && native && native->node()) {
+            auto* nn = native->node();
+            if (const auto t = nn->index().tip()) { tip = t->height; answered = true; }
+            if (const auto b = nn->index().by_height(spec.height)) { ::v37::bytes32 id{}; std::memcpy(id.data(), b->id.data(), 32); hash_at = id; }
+        } else if (!p2p_first && !cfg.no_daemon_rpc) {
+            transport.rpc_post(node::MoneroDaemonRpc::body_get_miner_data(), [&](const node::RpcResponse& r) {
+                if (!r.ok()) return;
+                if (const auto md = node::MoneroDaemonRpc::parse_miner_data(r.body)) { tip = md->height ? md->height - 1 : 0; answered = true; }
+            });
+            transport.rpc_post(node::MoneroDaemonRpc::body_get_block_header_by_height(spec.height), [&](const node::RpcResponse& r) {
+                if (!r.ok()) return;
+                if (const auto b = node::MoneroDaemonRpc::parse_block_header(r.body)) { ::v37::bytes32 id{}; std::memcpy(id.data(), b->id.data(), 32); hash_at = id; }
+            });
+        }
+        if (!answered) {
+            std::printf("REFUSED: genesis: no chain view can answer height %llu at start (daemon RPC off or the embedded node has no tip yet): "
+                        "the derived genesis cannot be checked\n", static_cast<unsigned long long>(spec.height));
+            return 2;
+        }
+        if (const std::string r = c2pool::v37n::xmr::lineage::genesis_chain_refusal(spec, hash_at, tip, cfg.d_conf); !r.empty()) {
+            std::printf("REFUSED: %s\n", r.c_str());
+            return 2;
+        }
+        std::printf("genesis: verified on this chain: height %llu carries the stated block hash, %llu deep (tip %llu, needs >= %llu)\n",
+                    static_cast<unsigned long long>(spec.height), static_cast<unsigned long long>(tip - spec.height),
+                    static_cast<unsigned long long>(tip), static_cast<unsigned long long>(cfg.d_conf));
+    }
     try {
         node.bring_up();
     } catch (const std::exception& e) {
@@ -2092,14 +2202,14 @@ static int run_live(const XmrNodeConfig& cfg) {
         // fee model ON (S1/S4): the residual sink IS the donation address, and a lane coinbase
         // without the one mandatory donation output (owed + residual, 0 included) is REFUSED here (every node,
         // own wins included). OFF: master's booking against the configured residual sink.
-        // POOL-LINEAGE: only a block carrying OUR pool_tag is a lane block; any
-        // other is "not-lane:" (an ordinary Monero block for this pool).
-        const ::v37::bytes32* ptag = cba_scfg->pool_tag ? &*cba_scfg->pool_tag : nullptr;
+        // RULES RATCHET: only a block whose V37P v2 head carries OUR pool_id is a
+        // lane block; any other is "not-lane:" (an ordinary Monero block for this pool).
+        const ::v37::bytes32* pid = cba_scfg->pool_field ? &cba_scfg->pool_field->pool_id : nullptr;
         if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))
             return c2pool::v37n::xmr::authority::decode_lane_coinbase_fee(blob, cfg.lane_chain, cands, keys, pay_map,
-                                                                          donation_net_of(cfg.network), ptag);
+                                                                          donation_net_of(cfg.network), pid);
         return c2pool::v37n::xmr::authority::decode_lane_coinbase(blob, cfg.lane_chain, cands, keys,
-                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, pay_map, ptag);
+                            cba_scfg->residual_sink, cba_scfg->residual_sink_identity, pay_map, pid);
     };
     // fetch + decode one block's coinbase under coinbase authority (shared by the chain path and the fast path)
     // D6a: WHERE the blob comes from. p2p-first + native templates: the native chain
@@ -3309,7 +3419,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         li.residual_sink = cba_scfg->residual_sink;
         li.residual_sink_identity = cba_scfg->residual_sink_identity;
         li.fixed = cba_scfg->fixed;
-        li.pool_tag = cba_scfg->pool_tag;
+        li.pool_field = cba_scfg->pool_field;                        // RULES RATCHET: the V37P v2 head (pool_id, epochs)
+        li.epoch_cur = cba_fx ? cba_fx->ledger().epoch_cur() : 1u;   // RULES RATCHET: the ledger's epoch in force (R3: epoch_of(h))
         li.kfair = cba_scfg->kfair;
         li.kfair_salted_ties = cba_scfg->kfair_salted_ties;
         li.spend_floor = cba_scfg->spend_floor;
@@ -4491,34 +4602,35 @@ static int run_live(const XmrNodeConfig& cfg) {
         // LANE-RULES (operator ruling R3): ONE list of every consensus-relevant lane rule
         // outside LaneParams (xmr_lane_rules.hpp), built once from the final settlement
         // config. The relay HELLO carries it (a peer with other rules is refused BY NAME,
-        // LANE_RULES_MISMATCH) and its digest is folded into the pool_tag below (a node
+        // LANE_RULES_MISMATCH) and its digest is the epoch-1 Deployment's / the ledger's V37Y (a node
         // with other rules sees our lane blocks as ordinary blocks: never debit-only).
-        std::optional<lanerules::LaneRules> lane_rules;
-        {
-            const HelloDigests hd = hello_digests_of(cfg);
-            lanerules::LaneRulesInputs li;
-            li.book_deferral      = !g_no_book_deferral;
-            li.recon_max_root_age = g_recon_max_root_age;
-            li.kfair_salted_ties  = scfg.kfair_salted_ties;
-            li.spend_floor        = scfg.spend_floor;
-            li.commit_total       = scfg.commit_total;
-            li.output_cap_ceiling = scfg.output_cap_ceiling;
-            li.residual_sink_id   = scfg.residual_sink_identity;
-            li.lane_params_digest = hd.lpd;
-            li.enrol_digest       = hd.enrol ? *hd.enrol : ::v37::bytes32{};
-            lane_rules = lanerules::lane_rules_of(cfg, li);
+        std::optional<lanerules::LaneRules> lane_rules = build_lane_rules(cfg, scfg.residual_sink_identity, scfg.output_cap_ceiling,
+                                                                          scfg.kfair_salted_ties, scfg.spend_floor, scfg.commit_total);
+        // RULES RATCHET: the ledger's epoch table was built from the EARLY list (before bring_up);
+        // the complete settlement config must yield the same list (fail-closed, an internal error otherwise).
+        if (!g_lane_rules || !(*g_lane_rules == *lane_rules)) {
+            std::printf("REFUSED: internal: the lane-rules list built from the complete settlement config differs from the early "
+                        "list the ledger's epoch table was built from (%s)\n",
+                        g_lane_rules ? lanerules::lane_rules_mismatch(g_lane_rules, lane_rules).substr(0, 120).c_str() : "no early list");
+            node.stop();
+            return 2;
         }
         const ::v37::bytes32 lane_rules_digest = lanerules::rules_digest(*lane_rules);
-        // POOL-LINEAGE: every lane block this pool builds commits its pool_tag (V37C tail, V37P field),
-        // and only blocks carrying it are booked as lane blocks here.
-        scfg.pool_tag = pool_tag_of(cfg, lane_rules_digest);
+        const auto deployments = lanerules::genesis_deployments(*lane_rules);
+        // RULES RATCHET: every lane block this pool builds commits the V37P v2 field FIRST in its 0x02 payload
+        // (pool_id, epoch_cur = the ledger's epoch in force, epoch_max = this build's table), and only blocks
+        // carrying OUR pool_id are booked as lane blocks here.
+        scfg.pool_field = c2pool::v37n::xmr::credit::PoolField{g_pool_identity->pool_id, node.ledger().epoch_cur(),
+                                                                c2pool::v37n::xmr::epoch::epoch_max_of(deployments)};
         std::printf("lane-rules: digest=%s (%zu fields, TLV %zu B) %s\n", hex_of(lane_rules_digest).c_str(),
                     lanerules::kFieldCount, lanerules::encode_tlv(*lane_rules).size(), lanerules::to_text(*lane_rules).c_str());
-        std::printf("lane-rules: -> pool_tag=%s (a peer with another list is refused at HELLO as %s; its lane blocks "
-                    "are ordinary blocks here)\n", hex_of(*scfg.pool_tag).c_str(), lanerules::kLaneRulesMismatch);
-        std::printf("lineage: pool genesis=%s (%s) pool_tag=%s | V37P field %zu B in every lane coinbase; a block without OUR tag is an ordinary block\n",
-                    hex_of(pool_genesis_of(cfg)).c_str(), g_pool_genesis ? "--pool-genesis" : "network default",
-                    hex_of(*scfg.pool_tag).c_str(), c2pool::v37n::xmr::credit::kPoolTagFieldBytes);
+        std::printf("epochs: run=%u known<=%u | epoch 1 = these rules (kind 0, H_act 0); a peer whose common Deployments differ "
+                    "is refused at HELLO as %s epoch=N\n", node.ledger().epoch_cur(), c2pool::v37n::xmr::epoch::epoch_max_of(deployments),
+                    lanerules::kLaneRulesMismatch);
+        std::printf("%s\n", c2pool::v37n::xmr::lineage::identity_line(*g_pool_identity).c_str());
+        std::printf("lineage: V37P v2 (%zu B) at 0x02[4..49) in every lane coinbase: pool_id + epoch_cur %u + epoch_max %u; rbind at [49..81); "
+                    "a block without OUR pool_id is an ordinary block\n", c2pool::v37n::xmr::credit::kPoolFieldBytes,
+                    scfg.pool_field->epoch_cur, scfg.pool_field->epoch_max);
         // SAME-BLOCK PAY-NOW (operator ruling 09-25, fee model ON and OFF): the projected
         // payees of the SAME view fold_at_cut folds E_b at, so the builder pays exactly the
         // E_b split every node books. No view at the cut / unratified geometry => no pay-now.
@@ -4943,7 +5055,10 @@ static int run_live(const XmrNodeConfig& cfg) {
             // FLAG DAY (#1803): built with the XMR pool-rules version (kXmrPoolRulesVersion),
             // so a pre-#1803 node is refused here as TAG_MISMATCH field=version.
             ro.pool_id = relay::node_pool_id(cfg.lane_chain, cfg.lane_params);
-            ro.pool_id->genesis = pool_genesis_of(cfg);   // POOL-LINEAGE: another genesis = TAG_MISMATCH field=pool_genesis
+            ro.pool_id->genesis = g_pool_identity->pool_genesis;   // another genesis = TAG_MISMATCH field=pool_genesis
+            // RULES RATCHET: the epoch trailer (epoch_cur + this build's Deployment list) after the TLV
+            ro.epoch_cur = node.ledger().epoch_cur();
+            ro.epochs = lanerules::genesis_deployments(*lane_rules);
             // ★ DROPS-ENROL-TIDY (flip 1): the enrol-set digest rides HELLO next to the
             // genesis, so a peer with another --drops-enrol list is refused by name
             // (ENROL_SET_MISMATCH, both digests) instead of a generic digest refusal.
@@ -4952,7 +5067,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 ro.enrol_set_digest = c2pool::v37n::xmr::drops::enrol_mode_digest(drops->enrol_mode(), drops->enrol_set());
             if (ro.enrol_set_digest)   // A3 + A5 FLAG DAY: the DROPS rule tag, named at HELLO (rule 0: unchanged)
                 ro.enrol_set_digest = c2pool::v37n::xmr::relay::enrol_rule_digest(*ro.enrol_set_digest, drops->drops_rule());
-            {   // LANE-RULES: the list (and the pool_tag) were built from the HELLO digests this node
+            {   // LANE-RULES: the list (the epoch-1 Deployment) was built from the HELLO digests this node
                 // would send; the live DROPS wiring must have produced exactly those (fail-closed).
                 const ::v37::bytes32 ed = ro.enrol_set_digest ? *ro.enrol_set_digest : ::v37::bytes32{};
                 if (!lane_rules || lane_rules->lane_params_digest != ro.lane_params_digest || lane_rules->enrol_digest != ed) {
@@ -5021,7 +5136,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.max_outbound = g_relay_max_outbound;
             if (ro.discovery) {
                 std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
-                const std::string tag = hex_of(ro.pool_id->lane_tag).substr(0, 8) + hex_of(pool_genesis_of(cfg)).substr(0, 8);
+                const std::string tag = hex_of(ro.pool_id->lane_tag).substr(0, 8) + hex_of(g_pool_identity->pool_genesis).substr(0, 8);
                 relay_book_path = cfg.resolved_settle_db_path() + "/" + relay::peerstore_file_name(ro.network, tag);
                 std::string why_load;
                 if (!relay::peerstore_load(relay_book_path, ro.book_load, &why_load))
@@ -5337,8 +5452,10 @@ static int run_live(const XmrNodeConfig& cfg) {
                             ro.pool_id->version, ro.pool_id->authority,
                             relay::hex32(::c2pool::v37n::rb::geometry_digest(cfg.lane_params)).c_str(),
                             relay::encode_hello(relay_node->our_hello()).size());
-                std::printf("relay: POOL-LINEAGE pool_genesis=%s in HELLO (+%zu B)\n",
-                            relay::hex32(*ro.pool_id->genesis).c_str(), relay::kHelloPoolGenesisBytes);
+                std::printf("relay: pool_genesis=%s in HELLO (+%zu B) | pool_id=%s | epoch trailer: epoch_cur=%u n=%zu (+%zu B)\n",
+                            relay::hex32(*ro.pool_id->genesis).c_str(), relay::kHelloPoolGenesisBytes,
+                            relay::hex32(g_pool_identity->pool_id).c_str(), ro.epoch_cur, ro.epochs.size(),
+                            4 + 1 + ro.epochs.size() * c2pool::v37n::xmr::epoch::kDeploymentBytes);
                 if (bind == relay::BindMode::None)
                     std::printf("relay: NOTE bind=none -- receipts are PoW-verified (opening -> tree_root -> RandomX >= share_diff) "
                                 "but the payee/give-author are NOT PoW-bound (run --relay-bind rbind: SEAM-1 writes rbind into the coinbase 0x02 region)\n");
@@ -5382,7 +5499,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     bool owner_hit = false;
                     const ::v37::ScriptRef payee = address.empty() ? *miner
                         : fee::choose_payee(*miner, owner_ref, owner_bp, roll, &owner_hit);
-                    if (reg->put(en, relay::make_job_binding(lane, share_diff, payee, my_give_author, owner_hit))) {
+                    if (reg->put(en, relay::make_job_binding(lane, share_diff, payee, my_give_author, /*ballot (R2 writes it)=*/0, owner_hit))) {
                         ++bind_jobs;
                         if (owner_hit) ++bind_owner;
                     }
@@ -6500,12 +6617,18 @@ int main(int argc, char** argv) {
         else if (a == "--relay-feed-monerod-compare") g_relay_feed_monerod_compare = true;
         // GAP-2 relay knobs
         else if (a == "--relay-listen")             g_relay_listen = value();
-        else if (a == "--pool-genesis") {           // POOL-LINEAGE
+        else if (a == "--pool-genesis") {           // the RAW pool genesis (test networks; refused on mainnet)
             const std::string h = value();
             ::v37::bytes32 g{};
             if (!c2pool::v37n::xmr::lineage::parse_genesis_hex(h, g))
                 throw cs::UsageError("--pool-genesis wants 64 hex digits (the pool's 32-byte genesis id), got '" + h + "'");
             g_pool_genesis = g;
+        }
+        else if (a == "--pool-genesis-from") {      // RULES RATCHET: the DERIVED pool genesis
+            c2pool::v37n::xmr::lineage::GenesisSpec spec;
+            if (const std::string r = c2pool::v37n::xmr::lineage::parse_genesis_from(value(), spec); !r.empty())
+                throw cs::UsageError(r);
+            g_pool_genesis_from = spec;
         }
         else if (a == "--relay-peer")               g_relay_peers.push_back(value());
         else if (a == "--no-relay-bootstrap")       g_no_relay_bootstrap = true;
@@ -6680,10 +6803,15 @@ int main(int argc, char** argv) {
                 "  --data-dir <path>            override the settlement store dir\n"
                 " GAP-2 receipt relay (c2pool<->c2pool over TCP; OFF by default; --coinbase v37; mainnet only with rbind):\n"
                 "  --relay-listen HOST:PORT     bind the receipt relay\n"
-                "  --pool-genesis <hex64>       POOL-LINEAGE: this pool's 32-byte genesis id (default: the fixed per-network\n"
-                "                               id = the ONE default pool); every node of a pool runs the same id, a new pool\n"
-                "                               picks a random one (openssl rand -hex 32). pool_tag = sha256d('V37PT2'||lane_tag||id||rules)\n"
-                "                               is committed in every lane coinbase; blocks without OUR tag are ordinary blocks\n"
+                "  --pool-genesis-from <H>:<hash64>:\"<headline>\"\n"
+                "                               the pool genesis DERIVED from the chain (docs/xmr-lane/pool-genesis.md): H = a block height\n"
+                "                               >= 60 deep at launch, hash64 = its block hash (any explorer), headline = 1..120 printable\n"
+                "                               ASCII bytes. pool_genesis = sha256d('V37GEN' || hash || u8 len || headline), pool_id =\n"
+                "                               sha256d('V37PID' || network || chain_id || pool_genesis) is committed in every lane coinbase\n"
+                "                               (V37P v2) and in the HELLO. The node checks (H, hash) on its chain and refuses to start otherwise.\n"
+                "                               REQUIRED on mainnet. Every node of a pool runs the same three inputs.\n"
+                "  --pool-genesis <hex64>       the RAW pool genesis (regtest; testnet / stagenet with a WARNING; refused on mainnet).\n"
+                "                               Default: the fixed per-network id. Nodes with a different genesis refuse each other.\n"
                 "  --relay-peer HOST:PORT       dial a relay peer (repeatable; redial 1..60 s backoff)\n"
                 "  --no-relay-bootstrap         do not also dial the built-in bootstrap relay peers (mainnet:\n"
                 "                               the public pool nodes, docs/xmr-lane/BOOTSTRAP-NODES.md;\n"
@@ -6959,7 +7087,7 @@ int main(int argc, char** argv) {
                                                                     : c2pool::v37n::xmr::relay::kReceiptWeight;
         // THE DRAIN RULE (rulings R1/R2/R5 2026-10-02, settlement-drain.md): its
         // flag day on the test networks (one pool restart with a fresh
-        // --pool-genesis: the lane-rules digest and so the pool_tag move);
+        // --pool-genesis: the lane-rules digest, i.e. the epoch-1 Deployment, moves);
         // mainnet keeps 0/0/0 until the operator's own flag day.
         c2pool::v37n::xmr::apply_network_drain(cfg);
     }
