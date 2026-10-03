@@ -255,7 +255,10 @@ void expect_coin_params_master_fields(const core::CoinParams& p, bool testnet, b
     EXPECT_EQ(p.dust_threshold, 100000u);
     EXPECT_TRUE(p.softforks_required.empty());
     EXPECT_EQ(p.segwit_activation_version, 0u);
-    EXPECT_EQ(p.p2p_port,    testnet ? 18999 : 8999);
+    // The named v36 network has its own sharechain port (V36_P2P_PORT); every
+    // other identity keeps master's port.
+    EXPECT_EQ(p.p2p_port,    testnet ? 18999
+                             : (SharechainConfig::is_named_v36_network() ? 8998 : 8999));
     EXPECT_EQ(p.worker_port, testnet ? 17903 : 7903);
     EXPECT_EQ(p.share_period, 20u);
     EXPECT_EQ(p.chain_length, 4320u);
@@ -995,13 +998,13 @@ TEST(DashV36Network, SeedListIsTheApprovedPublicNodes) {
     IdentityGuard g;
     // The operator-approved seeds, pinned: a change to the list must update
     // this line in the same PR.
-    const std::vector<std::string> expected{"158.220.92.171:8999", "109.123.238.32:8999"};
+    const std::vector<std::string> expected{"158.220.92.171:8998", "109.123.238.32:8998"};
     EXPECT_EQ(dash::v36_network_seed_hosts(), expected);
     for (const auto& hp : dash::v36_network_seed_hosts()) {
         const auto colon = hp.rfind(':');
         ASSERT_NE(colon, std::string::npos) << hp;
-        EXPECT_EQ(hp.substr(colon + 1), std::to_string(SharechainConfig::P2P_PORT))
-            << hp << ": seeds listen on the sharechain port";
+        EXPECT_EQ(hp.substr(colon + 1), std::to_string(SharechainConfig::V36_P2P_PORT))
+            << hp << ": seeds listen on the v36 sharechain port";
     }
     ASSERT_TRUE(resolve_identity("dash-v36", "", "", false));
     EXPECT_EQ(dash::select_sharechain_bootstrap_mode(/*explicit=*/false, /*regtest=*/false,
@@ -1012,6 +1015,33 @@ TEST(DashV36Network, SeedListIsTheApprovedPublicNodes) {
                   SharechainConfig::has_custom_network_id(),
                   SharechainConfig::is_named_v36_network()),
               dash::SharechainBootstrapMode::ExplicitPeers);
+}
+
+TEST(DashV36Network, SharechainPortPerIdentity) {
+    // v16 public network: 8999, unchanged.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("", "", "", false));
+        EXPECT_EQ(SharechainConfig::p2p_port(), 8999);
+    }
+    // Named v36 network: its own port, so it can run beside a v16 node on one host.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("dash-v36", "", "", false));
+        EXPECT_EQ(SharechainConfig::V36_P2P_PORT, 8998);
+        EXPECT_NE(SharechainConfig::V36_P2P_PORT, SharechainConfig::P2P_PORT);
+        EXPECT_EQ(SharechainConfig::p2p_port(), 8998);
+        EXPECT_EQ(dash::make_coin_params(false).p2p_port, 8998);
+    }
+    // A custom --network-id (private network) keeps the v16 port on mainnet and
+    // the testnet port on testnet.
+    {
+        IdentityGuard g;
+        ASSERT_TRUE(resolve_identity("", "abcd", "0badc0ffee11", false));
+        EXPECT_EQ(SharechainConfig::p2p_port(), 8999);
+        SharechainConfig::is_testnet = true;
+        EXPECT_EQ(SharechainConfig::p2p_port(), 18999);
+    }
 }
 
 TEST(DashV36Network, SettingsFileAndCliSelectTheV36Network) {

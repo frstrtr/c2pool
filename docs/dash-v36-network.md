@@ -35,6 +35,7 @@ c2pool-dash --run --net dash-v36 --addnode HOST:PORT ...
 | share version minted and accepted | 36 |
 | protocol advert and accept floor | 3601 |
 | state directory | `<data-dir>/dash_ac2785363c0180b8_v36` |
+| sharechain port (listen default, advertised) | 8998 (`V36_P2P_PORT`); the v16 sharechain stays on 8999 |
 
 The settings-file form is `network = "v36"` under `[dash.sharechain]`. It is a money-class key, so the file needs `[gate].money_ack_hash` (`--ack-money-settings`). The CLI wins over the file.
 
@@ -43,4 +44,4 @@ Rules:
 - `--net dash-v36` cannot be combined with `--network-id` or `--prefix` (from either the CLI or the settings file). The node exits with an error that names the conflicting flag.
 - `--net dash-v36` is a mainnet network and cannot be combined with `--testnet` / `--regtest`. A test network uses `--testnet --network-id HEX --prefix HEX`, which runs the same v36 profile under its own identity.
 - Without `--net` (and without `--network-id`) the node stays on the default v16 sharechain, `7242ef345e1bed6b` / `3b3e1286f446b891`, unchanged.
-- Built-in seeds: when `--net dash-v36` is set and no `--addnode` / `--connect` is given, the node dials only the network's own seed list (`dash::v36_network_seed_hosts`). The operator-approved seeds are `158.220.92.171:8999` (dash.voidbind.com) and `109.123.238.32:8999`, on the sharechain port. An explicit `--addnode` / `--connect` replaces the list.
+- Built-in seeds: when `--net dash-v36` is set and no `--addnode` / `--connect` is given, the node dials only the network's own seed list (`dash::v36_network_seed_hosts`). The operator-approved seeds are `158.220.92.171:8998` (dash.voidbind.com) and `109.123.238.32:8998`, on the v36 sharechain port. An explicit `--addnode` / `--connect` replaces the list.
