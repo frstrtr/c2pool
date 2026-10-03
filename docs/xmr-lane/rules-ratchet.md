@@ -2,11 +2,14 @@
 
 Status: designed, not implemented. Nothing in this document runs yet.
 
-Design study of 2026-10-03, written for node operators and miners. Every
-number below is a proposal until the operator rules on it, and is marked
-"proposed" where it appears. Where this page and the code disagree, the code
-is what runs today, and today is described in section 1. Payout scheme: Work
-Receipt Settlement (WRS), pay-per-receipt.
+Design study of 2026-10-03, written for node operators and miners. Decided
+2026-10-03; it is planned to land before the Monero mainnet genesis, and its
+format change is the last one that needs a new genesis. The values and
+choices below are the operator's decisions of that date and are marked
+"decided (not implemented yet)" where they appear; none of them runs. Where
+this page and the code disagree, the code is what runs today, and today is
+described in section 1. Payout scheme: Work Receipt Settlement (WRS),
+pay-per-receipt.
 
 ## 1. The problem: today every rule change is a new pool
 
@@ -51,8 +54,8 @@ pool and the rules it runs.
   file.** The tally of section 3 runs over lane blocks that are final (60
   Monero blocks deep, the lane's existing finality depth), in the order every
   node already books them. When the tally holds, the epoch locks in at that
-  height; it activates a fixed number of heights later (GRACE, proposed 1440
-  heights, about two days on mainnet). GRACE is the warning time: every node,
+  height; it activates a fixed number of heights later (GRACE, 1440 heights
+  on mainnet, about two days). GRACE is the warning time: every node,
   upgraded or not, knows the activation height in advance.
 * **The activation is a ledger event.** At the activation height a RATCHET
   event is appended to the owed ledger, at the same position on every node.
@@ -70,8 +73,8 @@ pool and the rules it runs.
   node's window and are paid by the next block, whichever epoch builds it:
   the window is geometry, the payout split is the rule of the block.
 * **Forward only.** There is no deactivation and no fallback. A deployment
-  that has not locked in by its timeout (proposed about 60 days on mainnet)
-  has failed; the pool continues on the current epoch and a retry needs a new
+  that has not locked in by its timeout (43 200 heights on mainnet, about 60
+  days) has failed; the pool continues on the current epoch and a retry needs a new
   epoch number. Undoing a rule is a new epoch with the old values. This is
   the ledger's own rule (nothing final is ever rewound) applied to the rules
   themselves.
@@ -86,9 +89,10 @@ pool and the rules it runs.
   recomputes the same activation when it books the chain in order; it needs
   no peer to tell it.
 
-Two activation kinds are proposed, both fixed in the format: by vote
-(section 3) for mainnet, and by a published fixed height for operator-run
-test networks and as the emergency path. In both cases an old node holds
+Two activation kinds are part of the format: by vote (section 3) for
+mainnet, and by a published fixed height for operator-run test networks and
+as the emergency path. There is one tally, the vote; no second node-level
+tally exists beside it. In both cases an old node holds
 (section 4) rather than forking.
 
 ## 3. Who votes: miners, by their work
@@ -178,7 +182,7 @@ cheap to take: switch node, and the vote follows the payout identity. This is
 the same trust boundary the payee and the node owner fee already sit on
 (`review-criticals.md`, item 09).
 
-### 3.6 When an epoch locks in (all numbers proposed)
+### 3.6 When an epoch locks in (decided, not implemented yet)
 
 On every finalized lane block, in chain order, a deployment passes if:
 
@@ -188,9 +192,10 @@ On every finalized lane block, in chain order, a deployment passes if:
 
 It locks in when it has passed on every finalized block for at least 48 lane
 blocks (about a day at one lane block per 17 Monero blocks) and across at
-least two full windows of work. The second condition keeps a small pool from
-locking in on a few blocks; the first keeps a large pool from locking in on
-a few minutes. Then GRACE, then activation.
+least 17 280 lane positions of work (two full windows) on mainnet. The second
+condition keeps a small pool from locking in on a few blocks; the first keeps
+a large pool from locking in on a few minutes. Then GRACE, then activation.
+The values for every network are in section 6.
 
 Who can block: 25 percent of the work that takes a side, or any coalition of
 abstain and no above 50 percent of all work. The direct/delegated split is
@@ -288,7 +293,8 @@ replays the ledger silently under the old rules.
 Some things must be the same forever, either because an old node must be able
 to read them in every future block, or because they protect money already
 earned. Changing one of them is a true flag day (a new genesis). The design
-calls this list the constitution. Proposed contents:
+calls this list the constitution. It lands with the format before the Monero
+mainnet genesis. Its contents:
 
 1. The pool id, the on-chain field that carries it with the epoch numbers,
    and its fixed place in the coinbase.
@@ -314,8 +320,8 @@ calls this list the constitution. Proposed contents:
     could still starve a balance after the boundary without "lowering" it:
     pay it arbitrarily slowly, decay it as dust faster, park it behind a
     minimum, redirect the residual, or seed new liabilities ahead of it. So
-    the design makes those rules constitutional on mainnet or grandfathers
-    them: no minimum balance for payment, no seeded balances, the residual
+    those rules are constitutional on mainnet or grandfathered (decided
+    2026-10-03): no minimum balance for payment, no seeded balances, the residual
     sink fixed, a floor on how fast old balances must drain (an epoch may pay
     them faster, never slower), and dust decay applied by the schedule in
     force when a balance went dormant. With these, "a majority cannot
@@ -328,21 +334,24 @@ coinbase fields between the fixed ones, the drain parameters above their
 floor, output caps, tie rules, relay frame versions. Those change future
 credit, and future credit is the majority's to decide: it is their work.
 
-## 6. Numbers (all proposed, none ruled)
+## 6. Numbers: decided (not implemented yet)
+
+Decided by the operator on 2026-10-03. Nothing below runs yet.
 
 | Quantity | mainnet | stagenet / testnet | regtest |
 |---|---|---|---|
 | Yes needed, of voting work | 75 percent | 75 percent | 75 percent |
 | Yes needed, of all window work | 50 percent | 50 percent | 50 percent |
-| Lock-in must hold for (lane blocks) | 48 (about a day) | 8 | 2 |
-| Lock-in must hold across (work) | 2 full windows | 1 window | none |
-| GRACE (Monero heights from lock-in to activation) | 1440 (about 2 days) | 120 | 2 x finality depth |
-| Timeout (heights after the deployment starts) | 43 200 (about 60 days) | 10 080 | 1000 |
-| Finality depth (existing, constitutional) | 60 | 60 | as configured |
+| Lock-in must hold for (finalized lane blocks) | 48 (about a day) | 8 | 2 |
+| Lock-in must hold across (lane positions of work) | 17 280 (2 full windows) | 8 640 (1 window) | 0 |
+| GRACE (Monero heights from lock-in to activation) | 1440 (about 2 days) | 120 | 2 x D_conf |
+| Timeout (heights after the deployment starts) | 43 200 (about 60 days) | 10 080 | 1 000 |
+| A node with no `--vote` set | abstains, and so does the work delegated to it | same | same |
+| Finality depth D_conf (existing, constitutional) | 60 | 60 | as configured |
 
 Why 75 and not 95: the question is not noise (the box is a census of the
 window, not a sample) but who can say no. A quarter of the work that takes a
-side is the proposed size of a minority that can block a rule. Bitcoin's
+side is the size of a minority that can block a rule. Bitcoin's
 version bits let 5 percent of blocks block; classical p2pool and the lane's
 V36 predecessor let 5 percent of shares block; this design lets 25 percent of
 voting work block, and any abstain-plus-no coalition above half of all work.
@@ -373,6 +382,9 @@ the epoch section in the ledger digest, the store schema, the handshake
 epoch list) each move digests that every node must agree on, so the intent
 is to ship them together, once, before the mainnet genesis: the last flag
 day. The vote itself, the login reply and the per-job proof can follow as
-ordinary upgrades once the format exists. Open points for the operator: the
-thresholds and windows of section 6, whether a direct-vote warning line is
-wanted, and the exact list of constitutional items in section 5.
+ordinary upgrades once the format exists. Decided on 2026-10-03: the ballot
+carrier, the delegation default, the tally weights, the thresholds, windows,
+GRACE and timeout of section 6, that followers learn deployments from their
+peers, the minority protection of section 5, and that the format lands
+before the Monero mainnet genesis. Still open: the wording of the warning
+shown when a lock-in is carried mostly by delegation.
