@@ -242,6 +242,7 @@ static bool          g_no_relay_bootstrap = false;     // --no-relay-bootstrap (
 static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-enrol <64-hex identity | XMR address> (repeatable)
 static std::uint64_t g_drops_retain_bins = 0;           // ★ DROPS-HARDEN: --drops-retain-bins N (0 = the relay default 512)
 static bool g_drops_store_persist = true;              // ★ DROPS-HARDEN: --drops-store-persist on|off (lane<N>.drops)
+static std::uint64_t g_drops_store_bytes = 0;          // ★ DROPS-RETAIN: --drops-store-bytes N (0 = the relay default 512 MiB)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
 static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
 static bool          g_relay_discovery = true;          // --relay-discovery on|off (FB_GETADDR/FB_ADDR + persistent peer book)
@@ -1936,6 +1937,8 @@ static int run_live(const XmrNodeConfig& cfg) {
     // ★ DROPS-SET-PIN counters (flip 1 only)
     std::uint64_t drops_set_pinned = 0, drops_set_capped = 0, drops_set_composed = 0, drops_set_hold_frame = 0,
                   drops_set_hold_members = 0, drops_set_fetch_frames = 0, drops_set_refused = 0, drops_set_getwon = 0;
+    std::uint64_t drops_set_unservable = 0;   // ★ DROPS-RETAIN (L2a): own compositions that skipped evicted harvest ids
+    std::uint64_t drops_floor_cursor = ~std::uint64_t{0};   // ★ DROPS-RETAIN (L1): the finalize cursor the floor was last derived at
     std::map<std::string, std::chrono::steady_clock::time_point> drops_set_getwon_at;   // FB_GETWON throttle per bid
     // ★ DROPS-SET-PIN (liveness): our own win is composed, pinned and carried as
     // soon as its range is backfilled after FOUND -- D_conf blocks before any
@@ -2938,7 +2941,27 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         std::vector<decltype(relay::BlockWon::bid)> ids;
         if (pin) ids = *pin;
-        else {
+        else if (relay_node) {
+            // ★ DROPS-RETAIN (L2a): the winner pins only what its relay store can
+            // SERVE (harvest ∩ store, the smallest kBlockWonSetMaxIds) and retains
+            // that set until the block is decided here (L2b). Attempt 6: A pinned
+            // 16384 harvested ids its store had evicted (raindrops_held=0) and
+            // served none of them. A set is the winner's bounded choice already
+            // (16384 of ~44k): receivers accept any valid set, no rule changes.
+            bool capped = false;
+            std::size_t skipped = 0;
+            ids = relay_node->drops_pin_servable(bid, drops->pinned_ids(rgo->first, rgo->second, SIZE_MAX), relay::kBlockWonSetMaxIds,
+                                                 &skipped, &capped);
+            if (capped) ++drops_set_capped;
+            if (skipped) {
+                ++drops_set_unservable;
+                std::printf("drops-ALARM set-unservable: h=%llu bid=%s… range=[%llu,%llu) %zu harvested raindrop(s) are not in the relay "
+                            "store (evicted) -> not pinned (pinned=%zu servable); they earn nothing in this block\n",
+                            (unsigned long long)h, bid.substr(0, 12).c_str(), (unsigned long long)rgo->first,
+                            (unsigned long long)rgo->second, skipped, ids.size());
+                std::fflush(stdout);
+            }
+        } else {
             bool capped = false;
             ids = drops->pinned_ids(rgo->first, rgo->second, relay::kBlockWonSetMaxIds, &capped);
             if (capped) ++drops_set_capped;
@@ -3941,6 +3964,9 @@ static int run_live(const XmrNodeConfig& cfg) {
         c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = d.cut_next_pos; cc.spine_digest = d.cut_spine_digest;
         std::string why;
         if (fold_at_cut(d.reward, cc, wc.credit, why, from_pid)) { wc.prefolded = true; ++wire_prefold; if (drops) wc.price = drops_fold_price; } else ++wire_pending;
+        // ★ DROPS-RETAIN (L2b): a carried set's members stay servable here until
+        // the block is decided here (released when wire_cache forgets the bid)
+        if (relay_node && wc.drops_set) relay_node->drops_pin_retain(bid, *wc.drops_set);
         wire_cache[bid] = wc;
         std::printf("ab-wire-rx: peer win h=%llu bid=%s… P=%llu reward=%llu owed_at_win %s | prefold=%s%s (relay peer %llu)\n",
                     (unsigned long long)d.h_b, bid.substr(0,12).c_str(), (unsigned long long)d.cut_next_pos, (unsigned long long)d.reward,
@@ -3965,6 +3991,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         };
         auto forget = [&](std::map<std::string, WireCache>::iterator it) {
             if (relay_node && it->second.drops_set) relay_node->drops_pin_forget(*it->second.drops_set);
+            if (relay_node) relay_node->drops_pin_release(it->first);   // ★ DROPS-RETAIN (L2b): decided here (or evicted)
             drops_set_getwon_at.erase(it->first);
             return wire_cache.erase(it);
         };
@@ -3988,6 +4015,23 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         wire_cache_bytes_now = total;
         if (total > wire_cache_bytes_max) wire_cache_bytes_max = total;
+        if (relay_node && drops) {
+            // ★ DROPS-RETAIN (L2b): a pin whose bid wire_cache no longer holds (an own
+            // composition that never reached it, a pruned scratch route) is released
+            for (const auto& k : relay_node->drops_pin_keys())
+                if (!wire_cache.count(k)) relay_node->drops_pin_release(k);
+            // ★ DROPS-RETAIN (L1): the servable floor = frontier_of(F) - kReorgMargin, F =
+            // the newest lane block below this node's finalize cursor. Every block
+            // this node may still compose (pending, or the next one found) has its
+            // range at or above it; the margin is the harvest's own (64 bins).
+            if (drops_live && cur != drops_floor_cursor) {
+                if (const auto rg = drops->range_for(cur)) {   // [frontier_of(prev_lane(cur)), ...): undecidable -> next tick
+                    drops_floor_cursor = cur;
+                    constexpr std::uint64_t kMargin = c2pool::v37n::xmr::drops::ChainOrderedHarvest::kReorgMargin;
+                    relay_node->set_drops_floor_bin(rg->first > kMargin ? rg->first - kMargin : 0);
+                }
+            }
+        }
     };
     // THE RECEIPT FEED (the carrier-relay stand-in): a shared append-only file "idx weight" per line; every node
     // pushes the SAME records in the SAME order (submit_tracked+get: one record per burst => every prefix published).
@@ -4687,6 +4731,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.bind = bind;
             ro.drops_floor_diff = drops_live ? drops->floor_diff() : 0;   // ★ DROPS: 0 = master's receiver
             if (drops_live && g_drops_retain_bins) ro.drops_retain_bins = g_drops_retain_bins;   // ★ DROPS-HARDEN
+            if (drops_live && g_drops_store_bytes) ro.drops_store_bytes = g_drops_store_bytes;   // ★ DROPS-RETAIN (L1)
             if (drops_live && g_drops_store_persist) {   // ★ DROPS-HARDEN (d4): <settle_db>/lane<N>.drops, next to lane<N>.shadow
                 std::error_code ec; std::filesystem::create_directories(cfg.resolved_settle_db_path(), ec);
                 ro.drops_persist_path = cfg.resolved_settle_db_path() + "/lane" + std::to_string(cfg.lane_chain) + ".drops";
@@ -5032,6 +5077,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                     wc.drops = c2pool::v37n::xmr::drops::DropsCarry{kb.drops->delta, kb.drops->enrollment_digest};
                     wc.drops_set = kb.drops->set;   // ★ DROPS-SET-PIN
                     wc.drops_locked = true;          // ★ DROPS-HARDEN (d3): journalled (ours, or booked verified) = final
+                    if (wc.drops_set) relay_node->drops_pin_retain(b, *wc.drops_set);   // ★ DROPS-RETAIN (L2b): before drops_load
                     wire_cache[b] = wc;
                     relay_node->adopt_won_frame(f);
                     ++drops_reloaded_frames;
@@ -5059,8 +5105,10 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (drops_live && !relay_node->options().drops_persist_path.empty()) {   // ★ DROPS-HARDEN (d4)
                 std::string dw;
                 const std::size_t nd = relay_node->drops_load(&dw);
-                std::printf("drops-store: raindrop store %s restored=%zu retain_bins=%llu%s%s\n", relay_node->options().drops_persist_path.c_str(),
-                            nd, (unsigned long long)relay_node->options().drops_retain_bins, dw.empty() ? "" : " -- ", dw.c_str());
+                std::printf("drops-store: raindrop store %s(.d) restored=%zu bytes=%llu budget=%llu retained=%zu retain_bins=%llu%s%s\n",
+                            relay_node->options().drops_persist_path.c_str(), nd, (unsigned long long)relay_node->drops_store_bytes(),
+                            (unsigned long long)relay_node->options().drops_store_bytes, relay_node->drops_retained_size(),
+                            (unsigned long long)relay_node->options().drops_retain_bins, dw.empty() ? "" : " -- ", dw.c_str());
             }
             if (!relay_node->start(why)) { std::printf("REFUSED: %s\n", why.c_str()); node.stop(); return 2; }
             if (g_relay_partition_s) {   // test-only knob, never on mainnet (the relay is refused there)
@@ -5534,6 +5582,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 (unsigned long long)rs.drops_persist_writes.load(), (unsigned long long)rs.drops_persist_fail.load(),
                                 (unsigned long long)rs.drops_persist_loaded.load());
                 }
+                std::printf("  %s | set_unservable=%llu\n", relay_node->describe_retain().c_str(),   // ★ DROPS-RETAIN
+                            (unsigned long long)drops_set_unservable);
                 std::printf("  drops-set: pinned=%llu capped=%llu composed=%llu hold_frame=%llu hold_members=%llu fetch_frames=%llu "
                             "fetch_ids=%llu refused=%llu getwon=%llu early=%llu early_gaveup=%llu\n",
                             (unsigned long long)drops_set_pinned, (unsigned long long)drops_set_capped, (unsigned long long)drops_set_composed,
@@ -6218,6 +6268,7 @@ int main(int argc, char** argv) {
         else if (a == "--drops-enrol")              g_drops_enrol.push_back(value());
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
         else if (a == "--drops-retain-bins")        g_drops_retain_bins = u64();
+        else if (a == "--drops-store-bytes")        g_drops_store_bytes = u64();   // ★ DROPS-RETAIN
         else if (a == "--drops-store-persist")      g_drops_store_persist = cs::one_of(a, value(), {"on", "off"}) == "on";
         else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
         else if (a == "--relay-discovery")          g_relay_discovery = cs::one_of(a, value(), {"on", "off"}) == "on";
@@ -6397,7 +6448,11 @@ int main(int argc, char** argv) {
                 "                               only the listed payees. none: nobody (credits zero). Every node of a pool must run the\n"
                 "                               same mode and list -- HELLO refuses ENROL_SET_MISMATCH by name\n"
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
-                "  --drops-retain-bins N        DROPS: raindrop intervals below the tip kept servable (default 512)\n"
+                "  --drops-retain-bins N        DROPS: raindrop intervals below the tip kept servable until the first finalize\n"
+                "                               step sets the floor (default 512); then the floor (frontier of the newest finalized\n"
+                "                               lane block - 64) decides\n"
+                "  --drops-store-bytes N        DROPS: hard byte budget of the servable raindrop store (default 536870912 = 512 MiB;\n"
+                "                               ~1 KB per raindrop). Over it the oldest unpinned bins are evicted (drops-ALARM)\n"
                 "  --drops-store-persist on|off DROPS: keep the servable raindrop store across restarts (lane<N>.drops; default on)\n"
                 "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
                 "  --relay-verify-threads N     RandomX verify workers for peer receipts + raindrops (default 0 =\n"

@@ -1423,13 +1423,23 @@ private:
     // repaired receipt left the verified cache, a served order that did not
     // reproduce the spine (that PEER is set aside -- it says nothing about the
     // block). All undecided.
+    // ★ DROPS-RETAIN (L3): so are the two DROPS-SET-PIN holds -- a pinned
+    // member not held here yet (fetched by id) and the winner's set not carried
+    // yet (FB_GETWON). Refusing either on a retry count made the node that could
+    // not fetch in time refuse a block every other node booked (stagenet
+    // attempt 6, h=2220425: an owed-ledger split at its FINALIZE). HELD instead:
+    // a withholding winner costs liveness (loud), never an honest split.
+#define C2POOL_XMR_DROPS_RETAIN_HOLD 1
     static bool is_relay_repair_pending(const std::string& why) {
         return why.rfind("cut-pending:", 0) == 0 &&
                (why.find("relay repair of P=") != std::string::npos ||
                 why.find("repaired receipt") != std::string::npos ||
                 why.find("repaired order") != std::string::npos ||
                 why.find("drops backfill of intervals") != std::string::npos ||  // ★ RAIN-BACKFILL: undecided, never refused
-                why.find("CUT-FLOOR wait") != std::string::npos);                // CUT-FLOOR: a lower block undecided, never refused
+                why.find("CUT-FLOOR wait") != std::string::npos ||               // CUT-FLOOR: a lower block undecided, never refused
+                why.find("pinned raindrop(s) not held") != std::string::npos ||  // ★ DROPS-RETAIN (L3): members being fetched
+                (why.find("drops set of h=") != std::string::npos &&             // ★ DROPS-RETAIN (L3): the set not carried yet
+                 why.find("not carried yet") != std::string::npos));
     }
     void note_relay_held_resolved(const std::string& bid, const char* how) {
         if (!m_relay_held.erase(bid)) return;

@@ -21,6 +21,8 @@
 //        reloads into the harvest queue, and a restarted winner serves its
 //        own members to a peer that never held them; a torn / foreign file
 //        is ignored; the file is bounded by drops_retain_bins.
+//        (DROPS-RETAIN: per-bin segments lane<N>.drops.d/<bin>.seg; a torn
+//        record ends its own segment only; another lane's segments ignored.)
 //   DH4  d2 + shell source pins: wire_cache is pruned (settled / orphaned
 //        bids + a byte cap), relay_on_cut uses the first-set-wins verdict and
 //        logs set-equivocation, own and journalled sets are final, the store
@@ -298,7 +300,12 @@ int main() {
             C(wait_for([&] { return W.relay->stats().drops_persist_writes.load() >= 1; }, {&W}, 5000ms),
               "DH3 the changed store is snapshotted by the maint thread (<= drops_persist_ms)");
         }   // W stops (a final snapshot) = the winner restarts
+#if defined(C2POOL_XMR_DROPS_RETAIN)   // DROPS-RETAIN: per-bin append-only segments under lane<N>.drops.d
+        C(std::filesystem::exists(path + ".d/103.seg") && std::filesystem::exists(path + ".d/104.seg") && !std::filesystem::exists(path),
+          "DH3 lane<N>.drops.d/<bin>.seg written (one segment per bin; DROPS-RETAIN)");
+#else
         C(std::filesystem::exists(path) && !std::filesystem::exists(path + ".tmp"), "DH3 lane<N>.drops written via tmp + rename");
+#endif
         auto o = ropts(true, {}); o.drops_persist_path = path;
         RNode W2(o); bins.note(W2);
         const std::size_t n = W2.relay->drops_load(&why);
@@ -331,6 +338,23 @@ int main() {
               W3.relay->stats().drops_ids_asked.load() == 0, "DH3 a member in the node's own store is handed to its harvest locally (no peer asked)");
         }
         // torn / foreign files are ignored (an empty store, loud)
+#if defined(C2POOL_XMR_DROPS_RETAIN)
+        {   // DROPS-RETAIN: a torn record ends ITS segment only (the valid prefix + every other bin load)
+            std::filesystem::copy(path + ".d", dir + "/torn.drops.d");
+            const std::string seg = dir + "/torn.drops.d/103.seg";
+            std::string b = slurp(seg); b[b.size() / 2] ^= 0x01;
+            std::ofstream(seg, std::ios::binary | std::ios::trunc) << b;
+            auto ot = ropts(true, {}); ot.drops_persist_path = dir + "/torn.drops";
+            RNode T(ot);
+            const std::size_t nt = T.relay->drops_load(&why);
+            C(nt >= 3 && nt < 6 && T.relay->stats().drops_seg_torn.load() == 1 && T.relay->drops_held(104, 105).size() == 3,
+              "DH3 a torn segment keeps its valid prefix, the other bin loads whole: loaded=" + std::to_string(nt) + " " + why);
+            auto of = ropts(true, {}); of.drops_persist_path = path; of.chain = kChain + 1;
+            RNode F(of);
+            const std::size_t nf = F.relay->drops_load(&why);
+            C(nf == 0 && why.find("ignored=2") != std::string::npos, "DH3 another lane's segments are ignored: " + why);
+        }
+#else
         {
             std::string b = slurp(path); b[b.size() / 2] ^= 0x01;
             std::ofstream(dir + "/torn.drops", std::ios::binary) << b;
@@ -343,6 +367,7 @@ int main() {
             const std::size_t nf = F.relay->drops_load(&why);
             C(nf == 0 && why.find("another lane") != std::string::npos, "DH3 another lane's file is ignored: " + why);
         }
+#endif
         // bounded by drops_retain_bins: tip 107, retain 2 -> only bins >= 105 are kept (and persisted)
         {
             const std::string pb = dir + "/bounded.drops";

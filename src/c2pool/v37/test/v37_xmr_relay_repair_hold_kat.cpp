@@ -38,6 +38,12 @@
 //       root matches nothing) is refused-not-credited, hold cleared. (as pre-fix)
 //   N1  a NON-relay cut-pending past the bound keeps its pre-RC-HOLD release
 //       (booking_stall_timeout, refused): the change is narrow.     (as pre-fix)
+//   K1  ★ DROPS-RETAIN (L3): "drops set of h=.. has N/M pinned raindrop(s)
+//       not held" past the bound is HELD (stall=0 refused=0), books when the
+//       members arrive; two nodes completing the set at attempts 3 and 45
+//       (bound 30) book the same block, identical owed_digest. (red pre-fix)
+//   K1b the same for "drops set of h=.. not carried yet" (FB_GETWON and the
+//       scratch-lineage variant).                                   (red pre-fix)
 //
 // Network-free, RandomX-free (monerod STUB + the injected test point-check
 // backend, the v37_xmr_cba_native_booking_kat shape). Nonzero exit on failure.
@@ -241,6 +247,57 @@ void decided_refused(const std::filesystem::path& tmp) {
     }
 }
 
+// ── K1/K1b (DROPS-RETAIN L3): the DROPS-SET-PIN holds are undecided too ──
+// Stagenet attempt 6 (h=2220425): receivers missing 6 and 4 of the winner's
+// 16384 pinned raindrops retried 600 times, then booking_stall_timeout REFUSED
+// the block into node-local liability while the winner booked it -- an
+// owed-ledger split at its FINALIZE. N1 above keeps its non-relay reason.
+const std::string kPinnedNotHeldWhy =
+    "cut-pending: drops set of h=5 has 3/10 pinned raindrop(s) not held (fetching by id)";
+const std::string kSetNotCarriedWhy =
+    "cut-pending: drops set of h=5 not carried yet (the winner's FB_BLOCK_WON v0x03; FB_GETWON asked of 0 peer(s))";
+const std::string kSetNotCarriedScratchWhy = "cut-pending: drops set of h=5 not carried yet (scratch lineage)";
+
+void drops_set_hold(const std::filesystem::path& tmp) {
+    std::printf("-- K1/K1b: a pinned raindrop not held / a set not carried yet past the bound is HELD, then books --\n");
+    const std::vector<std::pair<std::string, std::string>> whys = {{"K1 pinned-not-held", kPinnedNotHeldWhy},
+                                                                   {"K1b set-not-carried", kSetNotCarriedWhy},
+                                                                   {"K1b set-not-carried-scratch", kSetNotCarriedScratchWhy}};
+    int k = 0;
+    for (const auto& [tag, why] : whys) {
+        bool arrived = false;
+        Rig r(tmp, "k1-" + std::to_string(k++), [&arrived, w = why](std::uint64_t) { return arrived ? std::string() : w; });
+        if (!r.ok) return;
+        r.chain(1, 4); r.ticks(1); r.chain(5, 10); r.ticks(60);
+        const std::string held = tag + ": past the retry bound (60 attempts > 30) the block is HELD: stall=0 refused=0 "
+                                 "liability=0 held=1 relay_repair_held=1, the R4 gate holds the cursor at 1 (base: stall=1 refused=1)";
+        check(held.c_str(), r.attempts > 30 && r.st().booking_stall_timeout == 0 && r.st().refused == 0 &&
+                            r.st().liability_blocks == 0 && r.st().held_now == 1 && r.st().relay_repair_held == 1 &&
+                            r.fc->held().count(r.bid5) && r.cursor() == 1 && !r.node->ledger().is_settled(r.bid5),
+              r.brief());
+        arrived = true;   // the members (or the set) arrive: the composition completes
+        r.ticks(12);
+        const std::string booked = tag + ": on arrival the held block books + settles, the hold resolves, the cursor walks to 7";
+        check(booked.c_str(), r.booked == 1 && r.st().refused == 0 && r.st().held_now == 0 &&
+                              r.st().relay_repair_held_resolved == 1 && r.node->ledger().is_settled(r.bid5) && r.cursor() == 7,
+              r.brief());
+        (void)r.fc->drain_before_stop();
+    }
+    // the attempt-6 shape on two nodes: X completes the set at attempt 3, Y only at attempt 45 (> bound 30)
+    Rig x(tmp, "k1-x", [](std::uint64_t n) { return n >= 3 ? std::string() : kPinnedNotHeldWhy; });
+    Rig y(tmp, "k1-y", [](std::uint64_t n) { return n >= 45 ? std::string() : kPinnedNotHeldWhy; });
+    if (!x.ok || !y.ok) return;
+    for (Rig* r : {&x, &y}) { r->chain(1, 4); r->ticks(1); r->chain(5, 10); }
+    for (int i = 0; i < 120; ++i) { x.ticks(1); y.ticks(1); }
+    const bool same = x.node->ledger().owed_digest() == y.node->ledger().owed_digest();
+    check("K1 two nodes, set completed at attempt 3 vs 45 (> bound): both book h=5, byte-identical owed_digest, 0 refused, 0 liability "
+          "(base: Y refuses into liability -> owed_digest split)",
+          x.node->ledger().is_settled(x.bid5) && y.node->ledger().is_settled(y.bid5) && same && x.st().refused == 0 &&
+          y.st().refused == 0 && y.st().liability_blocks == 0 && x.cursor() == 7 && y.cursor() == 7,
+          "X{" + x.brief() + "} Y{" + y.brief() + "} digest_equal=" + (same ? "yes" : "NO"));
+    (void)x.fc->drain_before_stop(); (void)y.fc->drain_before_stop();
+}
+
 } // namespace
 
 int main() {
@@ -252,6 +309,7 @@ int main() {
     two_nodes_converge(tmp);
     repair_family(tmp);
     decided_refused(tmp);
+    drops_set_hold(tmp);   // ★ DROPS-RETAIN (L3)
     std::filesystem::remove_all(tmp);
     std::printf("== %s (%d failure(s)) ==\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
