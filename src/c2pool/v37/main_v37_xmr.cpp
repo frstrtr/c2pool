@@ -2420,8 +2420,14 @@ static int run_live(const XmrNodeConfig& cfg) {
     //   overpay_*      blocks whose coinbase paid a key more than max(0, finalW)
     //                  + E_b at this booking (the honest builder's bound);
     //   sink_unbacked_* cash that went to the residual sink / donation while
-    //                  the cut stayed credited (the #1865 gap): coverage minus
-    //                  the sink identity's own pay-now share and the marker.
+    //                  the cut still holds credit FINALIZE will book (the #1865
+    //                  gap, NoClaimWithoutCash): coverage minus the sink
+    //                  identity's own pay-now share and the marker, counted only
+    //                  when the credit left after netting is non-empty. A block
+    //                  whose fold at the cut is EMPTY and which commits no V37N
+    //                  (a pre-anchor block of a fresh pool) is not a claim and is
+    //                  not counted (paynow::sink_unbacked_amount; attempt 8
+    //                  counted nine such blocks as "unbacked").
     std::uint64_t overpay_blocks = 0, sink_unbacked_blocks = 0;
     long long     overpay_total = 0, sink_unbacked_total = 0;
     // THE DRAIN RULE: `split_at` (0 = rule off) is the recompute's P, the budget the
@@ -2529,8 +2535,17 @@ static int run_live(const XmrNodeConfig& cfg) {
         {
             long long alloc_sink = 0;
             if (const auto it = r.alloc.find(sink_id); it != r.alloc.end()) alloc_sink = it->second;
-            const long long unbacked = bk.sink_total - alloc_sink - (fee_on ? static_cast<long long>(fee::kDonationMarkerPico) : 0);
-            if (unbacked > 0) { ++sink_unbacked_blocks; sink_unbacked_total += unbacked; }
+            // `credit` is what net_booking left: the credit FINALIZE will still book.
+            const long long unbacked = c2pool::v37n::xmr::paynow::sink_unbacked_amount(
+                bk.sink_total, alloc_sink, fee_on ? static_cast<long long>(fee::kDonationMarkerPico) : 0, credit);
+            if (unbacked > 0) {
+                ++sink_unbacked_blocks; sink_unbacked_total += unbacked;
+                long long left = 0;
+                for (const auto& [k, v] : credit) { (void)k; if (v > 0) left += v; }
+                std::printf("sink-unbacked: h=%llu bid=%s… sink_total=%lld alloc_sink=%lld credit_left=%lld (cash to the sink / donation while the cut still holds credit to book)\n",
+                            static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), bk.sink_total, alloc_sink, left);
+                std::fflush(stdout);
+            }
         }
         if (bk.paynow_base) {
             ++paynow_booked; paynow_netted_total += static_cast<unsigned long long>(r.netted);
@@ -5834,8 +5849,18 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::printf("  cba-payee: learned=%llu resolved=%llu pending=%llu unresolved=%llu (REJOIN-PAYEE: outputs resolved against the payees of the block's own credit cut)\n",
                             (unsigned long long)cut_payee_learned, (unsigned long long)cut_payee_resolved,
                             (unsigned long long)cut_payee_pending, (unsigned long long)cut_payee_unresolved);
-                std::printf("  ledger-overpay: blocks=%llu total=%lld | sink-unbacked: blocks=%llu total=%lld (cash to the sink while the cut stayed credited)\n",
+                std::printf("  ledger-overpay: blocks=%llu total=%lld | sink-unbacked: blocks=%llu total=%lld (cash to the sink while the cut still holds credit to book)\n",
                             (unsigned long long)overpay_blocks, overpay_total, (unsigned long long)sink_unbacked_blocks, sink_unbacked_total);
+                // PER-JOB EMPTY-CUT FINDER: eligible templates in the ring, variants built, variants the
+                // provider could not build (those jobs are served the default template: the donation
+                // takes the finder's pool) and why the last one was refused.
+                {
+                    const std::string lr = provider.finder_last_refusal();
+                    std::printf("  ecut: eligible_tpl=%zu variants_built=%llu variants_refused=%llu%s%s\n",
+                                provider.ecut_templates(), (unsigned long long)provider.finder_variants(),
+                                (unsigned long long)provider.finder_variants_refused(),
+                                lr.empty() ? "" : " last_refusal=", lr.c_str());
+                }
                 const auto& cs = cba_src.stats();
                 std::printf("  cba-src: %s native_hits=%llu native_hold=%llu holding=%zu get_block_rpc=%llu rpc_failed=%llu | compare equal=%llu MISMATCH=%llu unavailable=%llu | fallback_used=%llu\n",
                             cba_src.native_mode() ? "native" : "monerod",

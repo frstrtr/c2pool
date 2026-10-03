@@ -49,6 +49,15 @@
 //       submits pays that job's login L; owner-fee job -> owner; subaddress /
 //       integrated / invalid login -> donation; never the node payout; a work
 //       cut is byte-unchanged. RED on 9d6d3648 (finder = the node payout).
+//   E9  FRESH POOL UNDER THE RULES (stagenet attempts 7/8): the daemon's live
+//       configuration (anchor rule, DROPS due, fee model, spend floor, drain
+//       {1,16,64}, salted ties, V37R, pool_tag, rbind) with NO finalized lane
+//       block: every bound job's block pays its finder R - Delta as V37F + V37N,
+//       the donation keeps its 0 marker, the booking nets to nothing, another
+//       node's recompute calls it canonical. F = 0 and F = 499999999998. RED on
+//       master 64c4372df (the default template was served: nobody paid).
+//   E10 the `sink-unbacked` alarm counts sink cash only against credit still
+//       to be booked: an empty-cut block without V37N and no credit is 0.
 //
 // RED on the base (PAY-NOW #1787 without this rule): the BASE branch builds
 // the same empty-cut blocks and the "finder is paid" checks FAIL with the
@@ -73,6 +82,7 @@
 #include "impl/xmr/template/xmr_block_assembly.hpp"
 
 #include "c2pool/v37/xmr/xmr_coinbase_authority.hpp"
+#include "c2pool/v37/xmr/xmr_coinbase_recompute.hpp"   // E9: the receiver's canonical verdict
 #include "c2pool/v37/xmr/xmr_credit_cut.hpp"
 #include "c2pool/v37/xmr/xmr_fee_model.hpp"
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
@@ -97,6 +107,7 @@ namespace asm_   = c2pool::xmr::assembly;
 namespace credit = c2pool::v37n::xmr::credit;
 namespace auth   = c2pool::v37n::xmr::authority;
 namespace fee    = c2pool::v37n::xmr::fee;
+namespace rc     = c2pool::v37n::xmr::recompute;   // E9
 namespace pn     = c2pool::v37n::xmr::paynow;
 namespace x6     = ::v37::xmr::settle;
 namespace st     = c2pool::v37n::settle;
@@ -181,11 +192,38 @@ struct SrcCase {
 };
 
 // ---- REAL assembled blocks: the provider over the C4 monerod capture ------
+// E9 "FRESH POOL UNDER THE RULES": the daemon's live configuration (main_v37_xmr.cpp
+// with the anchor rule, DROPS due, the spend floor, the drain triple of the test
+// networks, salted ties, the V37R total, a pool_tag and --relay-bind rbind), over a
+// ledger with NO finalized lane block (anchor none). `seeds` = finalized owed on
+// DEMO keys nobody mines for (--owed-demo-amount): the float F the drain repays.
+struct LiveRules {
+    bool on = false;
+    std::vector<std::uint64_t> seeds;
+};
+st::OwedLedgerRules live_ledger_rules() {
+    st::OwedLedgerRules r;
+    r.arm_floor = static_cast<long long>(x6::spend_floor(x6::kTailSubsidy));
+    r.anchor_cut = true;         // ANCHOR (ruling A 2026-09-29): pay-now pays the view at the anchor
+    r.drops_due = true;          // DROPS DUE (A5): on with the anchor
+    r.lane_height = true;        // THE DRAIN RULE's ledger bits (lane-rules 23-25 ON)
+    r.decay_from_gross = true;
+    return r;
+}
+::v37::bytes32 live_tag() { ::v37::bytes32 t{}; t[0] = 0xE9; t[31] = 0x37; return t; }
+const ::v37::ScriptRef& demo_ref(int i) {   // the three DEMO keys of --owed-demo-amount (1x, 2x, 3x)
+    static const ::v37::ScriptRef r[3] = {ref_of(61), ref_of(62), ref_of(63)};
+    return r[i % 3];
+}
+
 struct LaneFixture {
-    o2::XmrOwedFixture      ledger{static_cast<::v37::ChainId>(LANE_CHAIN)};
+    st::OwedLedger          ext;      // the ledger the fixture wraps (rules fixed at construction)
+    o2::XmrOwedFixture      ledger;
     o2::XmrSettlementConfig scfg;
     std::vector<st::WeightedPayee> wp;
-    LaneFixture(bool fee_on, bool seed) {
+    LaneFixture(bool fee_on, bool seed, const LiveRules* live = nullptr)
+        : ext(static_cast<::v37::ChainId>(LANE_CHAIN), live && live->on ? live_ledger_rules() : st::OwedLedgerRules{}),
+          ledger(ext) {
         const auto P2 = point_of(2);
         const ::v37::ScriptRef r[3] = {::v37::xmr::make_xmr_std(point_of(1), P2), ::v37::xmr::make_xmr_std(point_of(3), P2),
                                        ::v37::xmr::make_xmr_std(point_of(5), P2)};
@@ -203,6 +241,14 @@ struct LaneFixture {
             scfg.fixed = {fee::donation_marker(kNet)};
         } else {
             scfg.set_residual_sink_std(point_of(4), P2);
+        }
+        if (live && live->on) {
+            for (std::size_t i = 0; i < live->seeds.size(); ++i) ledger.seed_owed(demo_ref(static_cast<int>(i)), live->seeds[i]);
+            scfg.spend_floor = true;                        // main: payout-threshold.md §2-§3
+            scfg.drain = o2::DrainRule{1, 16, 64};          // main: drain_rule_of(cfg), the test-network triple
+            scfg.kfair_salted_ties = true;                  // main: #1867
+            scfg.commit_total = true;                       // main: "V37R" in every lane coinbase
+            scfg.pool_tag = live_tag();                     // main: POOL-LINEAGE
         }
     }
 };
@@ -229,7 +275,8 @@ struct Built {
     asm_::BlockBytes                                   bytes;
     bool                                               ok = false;
     std::string                                        why;
-    Built(bool fee_on, bool seed, Cut cut, std::optional<::v37::ScriptRef> finder) : lane(fee_on, seed) {
+    Built(bool fee_on, bool seed, Cut cut, std::optional<::v37::ScriptRef> finder, const LiveRules* live = nullptr)
+        : lane(fee_on, seed, live) {
         lane.scfg.credit_cut_source = [](std::uint64_t& P, ::v37::bytes32& dg) {
             const credit::CreditCut c = fixture_cut(); P = c.next_pos; dg = c.spine_digest; return true; };
         if (cut != Cut::None) {
@@ -245,6 +292,9 @@ struct Built {
 #endif
         if (!src.poll(&why)) { why = "daemon arm did not parse the capture: " + why; return; }
         provider = std::make_unique<o2::XmrSettlementTemplateProvider>(src, lane.ledger, lane.scfg, 0);
+        if (live && live->on)   // main: --relay-bind rbind writes [extra_nonce 4 | rbind 32] into the 0x02 payload
+            provider->set_extra_nonce_bind(32, [](std::uint32_t en, std::uint8_t* b) {
+                for (int i = 0; i < 32; ++i) b[i] = static_cast<std::uint8_t>(en * 13 + i); return true; });
         if (!provider->refresh()) { why = provider->last_error(); return; }
         snap = provider->current();
         if (!snap.valid || !snap.tpl) { why = "no template"; return; }
@@ -262,9 +312,10 @@ Parsed_ parse_(const std::vector<std::uint8_t>& blob, const asm_::BlockBytes& b)
 auth::CoinbaseBooking decode(const Built& x, const std::vector<std::uint8_t>& blob, bool fee_on) {
     std::vector<::v37::bytes32> cands{x.lane.ledger.ledger().owed_digest()};
     const auto keys = x.lane.ledger.keys();
-    if (fee_on) return auth::decode_lane_coinbase_fee(blob, LANE_CHAIN, cands, keys, x.lane.ledger.pay_of(), kNet);
+    const ::v37::bytes32* tag = x.lane.scfg.pool_tag ? &*x.lane.scfg.pool_tag : nullptr;   // E9: the lineage gate, as main
+    if (fee_on) return auth::decode_lane_coinbase_fee(blob, LANE_CHAIN, cands, keys, x.lane.ledger.pay_of(), kNet, tag);
     return auth::decode_lane_coinbase(blob, LANE_CHAIN, cands, keys, x.lane.scfg.residual_sink,
-                                      x.lane.scfg.residual_sink_identity, x.lane.ledger.pay_of());
+                                      x.lane.scfg.residual_sink_identity, x.lane.ledger.pay_of(), tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -529,15 +580,20 @@ void suite_widest() {
         a.extra_nonce_tail.insert(a.extra_nonce_tail.end(), part.begin(), part.end());
     a.extra_nonce_bind_size = 32;
     a.extra_nonce_bind = [](std::uint32_t en, std::uint8_t* out) { for (int i = 0; i < 32; ++i) out[i] = static_cast<std::uint8_t>(en * 7 + i); return true; };
+    a.reward_total_field = true;   // main: scfg.commit_total -- "V37R" first in the tail (the E9 width: 220 + 12 = 232 B)
     std::string why;
     auto t = asm_::XmrBlockAssembler::build(a, &why);
     const std::size_t widest = static_cast<std::size_t>(::c2pool::xmr::EXTRA_NONCE_MAX_SIZE) + ::c2pool::xmr::EXTRA_NONCE_BIND_MAX +
-                               asm_::FINDER_FIELD_BYTES + asm_::PAYNOW_TAIL_BYTES + asm_::DONATION_OWED_TAIL_BYTES +
+                               asm_::REWARD_TOTAL_FIELD_BYTES + asm_::FINDER_FIELD_BYTES + asm_::PAYNOW_TAIL_BYTES + asm_::DONATION_OWED_TAIL_BYTES +
                                asm_::POOL_TAG_FIELD_BYTES + asm_::CREDIT_CUT_TAIL_BYTES;
-    CHECK(t != nullptr && widest <= 255, "the widest payload assembles (bound %zu <= 255): %s", widest, t ? "ok" : why.c_str());
+    CHECK(t != nullptr && widest == 232 && widest <= 255, "the widest payload rbind + V37R + V37F + V37N + V37D + V37P + V37C assembles (bound %zu <= 255): %s", widest, t ? "ok" : why.c_str());
     if (!t) return;
     asm_::BlockBytes b;
-    CHECK(t->materialize(5, b, &why), "materializes (0x02 payload %zu B)", b.extra_nonce_size);
+    // The padded nonce is 4..14 B (the amount-varint slack), so `widest` is a bound: the live
+    // payload here is 222 B, above the pre-fix bound of 220 that refused every finder variant.
+    CHECK(t->materialize(5, b, &why) && b.extra_nonce_size > 220 && b.extra_nonce_size <= widest,
+          "materializes wider than the pre-fix bound 220 and within %zu (0x02 payload %zu B)", widest, b.extra_nonce_size);
+    CHECK(pn::parse_reward_total(parse_(b.full_blob, b).got.tx_extra) == std::optional<std::uint64_t>(t->reward()), "V37R reads back as the template's reward");
     x6::ReceivedCoinbase rc; std::uint64_t h = 0; std::size_t used = 0;
     const bool pp = asm_::parse_coinbase_prefix(b.full_blob.data() + b.miner_tx_offset, b.miner_tx_size, rc, &h, &used);
     ::v37::bytes32 got{};
@@ -718,7 +774,7 @@ const ::v37::ScriptRef& owner_r()   { static const ::v37::ScriptRef r = ref_of(4
 
 // One job of a real empty-cut block: bind (or not) its finder, then decode the
 // block the job's share would submit.
-struct JobBlock { bool ok = false; std::string why; std::optional<::v37::ScriptRef> v37f; auth::CoinbaseBooking bk; std::vector<std::uint8_t> mtx; };
+struct JobBlock { bool ok = false; std::string why; std::optional<::v37::ScriptRef> v37f; auth::CoinbaseBooking bk; std::vector<std::uint8_t> mtx; std::vector<std::uint8_t> blob; };
 JobBlock job_block(Built& b, std::uint32_t en, bool fee_on) {
     JobBlock j;
     c2pool::v37n::xmr::submit::BlockCandidate c;
@@ -730,6 +786,7 @@ JobBlock job_block(Built& b, std::uint32_t en, bool fee_on) {
     }
     j.v37f = pn::parse_finder(got.tx_extra);
     j.bk = decode(b, c.full_blob, fee_on);
+    j.blob = c.full_blob;   // E9: the block another node recomputes
     j.mtx.assign(c.full_blob.begin() + static_cast<std::ptrdiff_t>(bb.miner_tx_offset),
                  c.full_blob.begin() + static_cast<std::ptrdiff_t>(bb.miner_tx_offset + bb.miner_tx_size + c.full_blob.size() - bb.full_blob.size()));
     o2::SettlementStratumTemplateSource ts(*b.provider);
@@ -823,6 +880,164 @@ void suite_login_base() {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// E9 FRESH POOL UNDER THE RULES (stagenet attempts 7 and 8, the `sink-unbacked:
+// blocks=9 total=5117686357972` alarm): the daemon's live configuration -- the
+// anchor rule, DROPS due, the fee model, the spend floor, the drain triple
+// {1,16,64}, salted ties, the V37R total, a pool_tag, --relay-bind rbind -- over
+// a ledger with NO finalized lane block (no anchor yet). The rulings of
+// 09-26/09-27 and docs/xmr-lane/coinbase-recompute.md: such a block credits
+// nobody and pays its FINDER (the winning job's bound login) the pool
+// P = R - Delta as V37F + V37N; the donation output is its 0-amount marker.
+// Twice: F = 0 (mainnet from block 1: Delta = 0, P = R) and F = 499999999998
+// on three DEMO keys (attempt 8: Delta = R * 64 / 256, the first lane block).
+// Every bound job's block must carry V37F(login) + V37N, pay the finder exactly
+// R - debt_paid, book net with no credit left and no unexplained sink coverage,
+// and be CANONICAL for another node's recompute. RED on master 64c4372df: the
+// bound jobs are served the DEFAULT template (no V37F / V37N, R - Delta to the
+// donation); diagnose_variant() replays tpl_for()'s silent exits and names the
+// refusing link.
+// ---------------------------------------------------------------------------
+#ifdef C2POOL_V37_XMR_ECUT_FINDER_LOGIN
+std::string diagnose_variant(const Built& b, const ::v37::ScriptRef& fr) {
+    if (!b.snap.ecut) return "snapshot not an eligible empty cut (snap.ecut == nullptr: XmrOwedSettlementSource::m_ecut_eligible false)";
+    std::string why;
+    auto src = b.snap.ecut->src->with_finder(fr, &why);
+    if (!src) return "with_finder REFUSED: " + why;
+    asm_::AssemblyInputs a = b.snap.ecut->recipe;
+    a.settle = o2::assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+    a.extra_nonce_tail = src->extra_nonce_tail();
+    auto t = asm_::XmrBlockAssembler::build(a, &why);
+    if (!t) return "assembler REFUSED the variant: " + why;
+    asm_::BlockBytes probe;
+    if (!t->materialize(0, probe, &why)) return "variant probe materialize REFUSED: " + why;
+    const o2::KFairCoinbaseShape sh = o2::inspect_kfair_coinbase(*t, src->owed_digest());
+    if (!sh.ok) return "shape gate REFUSED the variant: " + sh.why;
+    return "variant builds (V37F armed, " + std::to_string(t->outputs().size()) + " outputs)";
+}
+
+void suite_fresh_pool_under_rules() {
+    std::printf("== E9. FRESH POOL UNDER THE RULES: anchor ON + DROPS due + fee ON + drain {1,16,64} + rbind, no finalized lane block ==\n");
+    const ::v37::ScriptRef L = login_ref(), M = ref_of(44), N = ref_of(45);
+    const std::uint64_t P = fee::kPrefixMainnetStd;   // regtest addresses use the mainnet bytes
+    const ::v37::bytes32 Did = fee::donation_identity(kNet);
+    for (int pass = 0; pass < 2; ++pass) {
+        LiveRules lr; lr.on = true;
+        if (pass == 1) lr.seeds = {83333333333ull, 166666666666ull, 249999999999ull};   // attempt 8: F0 = 499999999998 (1x, 2x, 3x)
+        const char* tag = pass == 0 ? "F = 0 (mainnet genesis)" : "F = 499999999998 (attempt 8 seeds)";
+        Built b(true, false, Cut::Empty, std::nullopt, &lr);
+        CHECK(b.ok, "%s: the fresh-pool template builds under the live rules: %s", tag, b.ok ? "ok" : b.why.c_str());
+        if (!b.ok) continue;
+        const st::OwedLedger& Lg = b.lane.ledger.ledger();
+        CHECK(!Lg.anchor_cut() && Lg.rules().anchor_cut && Lg.rules().drops_due && b.lane.scfg.drain.on() && b.lane.scfg.spend_floor,
+              "%s: no anchor yet; anchor rule ON, DROPS due ON, drain ON, spend floor ON", tag);
+        unsigned long long F = 0;
+        for (const auto& [k, eo] : Lg.effective_owed_all()) { (void)k; if (eo > 0) F += static_cast<unsigned long long>(eo); }
+        const std::uint64_t R = b.snap.reward;
+        const std::uint64_t Delta = x6::drain_delta(F, R, Lg.heights_since_last_lane(b.snap.height), 16, 64);
+        CHECK(F == (pass == 0 ? 0ull : 499999999998ull) && Delta == (pass == 0 ? 0 : R * 64 / 256),
+              "%s: F = %llu, R = %llu, dh = 0 -> the cap 64, Delta = %llu", tag, F, (unsigned long long)R, (unsigned long long)Delta);
+        {   // the default job (no binding): attempt 8's on-chain shape, for the record
+            const JobBlock d = job_block(b, 14, true);
+            const std::uint64_t don = d.bk.ok && !d.bk.out_amount.empty() ? d.bk.out_amount.back() : 0;
+            std::printf("  [info] %s: unbound job en=14 (the default template): V37F %s, V37N %s, outputs %zu, donation output %llu (%s)\n", tag,
+                        d.v37f ? "yes" : "no", d.bk.paynow_base ? "yes" : "no", d.bk.out_amount.size(), (unsigned long long)don,
+                        d.ok ? (d.bk.ok ? "ok" : d.bk.why.c_str()) : d.why.c_str());
+        }
+        // Three logins through the real finder choice (main's job binder: choose_ecut_finder -> provider.bind_finder).
+        b.provider->bind_finder(11, pn::choose_ecut_finder(addr_of(L, P), kNet, false, std::nullopt).payee);
+        b.provider->bind_finder(12, pn::choose_ecut_finder(addr_of(M, P), kNet, false, std::nullopt).payee);
+        b.provider->bind_finder(13, pn::choose_ecut_finder(addr_of(N, P), kNet, false, std::nullopt).payee);
+        LaneFixture other(true, false, &lr);   // another node of the lane: the same rules and seeds, no anchor either
+        CHECK(other.ledger.ledger().owed_digest() == Lg.owed_digest(), "%s: a second node holds the same ledger state (owed_digest)", tag);
+        for (const auto& [en, who, name] : std::vector<std::tuple<std::uint32_t, ::v37::ScriptRef, const char*>>{
+                 {11, L, "login L"}, {12, M, "login M"}, {13, N, "login N"}}) {
+            const JobBlock j = job_block(b, en, true);
+            const ::v37::bytes32 W = id_of(who);
+            std::uint64_t debt = 0;   // what the owed outputs pay (the DEMO keys): debt_paid <= Delta
+            for (const auto& [k, v] : j.bk.payout) if (k != W && k != Did) debt += static_cast<std::uint64_t>(v);
+            const std::uint64_t finder_paid = pm_get(j.bk.payout, W);
+            const std::uint64_t don = j.bk.ok && !j.bk.out_amount.empty() ? j.bk.out_amount.back() : ~0ull;
+            const bool armed = j.ok && j.v37f == std::optional<::v37::ScriptRef>(who) && j.bk.ok && j.bk.ecut_finder && j.bk.paynow_base.has_value();
+            CHECK(armed, "%s job en=%u (%s): the served + submitted block carries V37F = %s and V37N -- %s", tag, en, name, name,
+                  j.ok ? (j.bk.ok ? (armed ? "ok" : diagnose_variant(b, who).c_str()) : j.bk.why.c_str()) : j.why.c_str());
+            if (!armed) continue;
+            CHECK(finder_paid == j.bk.total - debt && debt <= Delta && (pass == 0 ? debt == 0 : debt == Delta) &&
+                      don == fee::kDonationMarkerPico && !j.bk.out_identity.empty() && j.bk.out_identity.back() == Did,
+                  "%s job en=%u: the finder is paid R - Delta = %llu - %llu = %llu; the donation output is its 0 marker (%llu)", tag, en,
+                  (unsigned long long)j.bk.total, (unsigned long long)debt, (unsigned long long)finder_paid, (unsigned long long)don);
+            // The booking every node does (main paynow_net): the finder's credit is the pool P, netted to nothing.
+            Amounts credit; std::string w; ::v37::bytes32 fid{};
+            const bool fok = pn::apply_empty_cut_finder(j.bk.ecut_finder, j.bk.ecut_finder_malformed, j.bk.paynow_base, j.bk.total, credit, &w, &fid);
+            pn::drain_finder_credit(credit, fid, j.bk.total - debt, j.bk.total);
+            Amounts payout = j.bk.payout;
+            const auto nb = pn::net_booking(j.bk.paynow_base, j.bk.total, credit, payout, j.bk.sink_total, Did,
+                                            static_cast<long long>(fee::kDonationMarkerPico), true);
+            long long alloc_sink = 0;
+            if (const auto it = nb.alloc.find(Did); it != nb.alloc.end()) alloc_sink = it->second;
+            long long left = 0;
+            for (const auto& [k, c] : credit) { (void)k; if (c > 0) left += c; }
+            CHECK(fok && nb.ok && left == 0 && nb.netted == static_cast<long long>(finder_paid) &&
+                      j.bk.sink_total - alloc_sink - static_cast<long long>(fee::kDonationMarkerPico) == 0,
+                  "%s job en=%u: booked net: the finder credited and paid %llu, credit left 0, sink coverage no pay-now explains 0 (%s)", tag, en,
+                  (unsigned long long)finder_paid, fok ? (nb.ok ? "ok" : nb.why.c_str()) : w.c_str());
+            // The recompute on another node. Pre-anchor = the view credits nobody (main credit_payees: none -> has_view, payees {}).
+            rc::LaneInputs li;
+            li.chain_id = LANE_CHAIN; li.h_min = 0;
+            li.owed_cap = b.lane.scfg.resolved_output_cap(); li.wire_cap = li.owed_cap;
+            li.residual_sink = b.lane.scfg.residual_sink; li.residual_sink_identity = b.lane.scfg.residual_sink_identity;
+            li.fixed = b.lane.scfg.fixed; li.pool_tag = b.lane.scfg.pool_tag;
+            li.kfair_salted_ties = true; li.spend_floor = true; li.commit_total = true; li.drain = b.lane.scfg.drain;
+            rc::CutInputs ci; ci.has_view = true;
+            const rc::Result r = rc::verify_lane_coinbase(j.blob, j.bk, other.ledger.ledger(), other.ledger.pay_of(), li, ci);
+            CHECK(r.canonical() && r.debt_paid == debt && r.split_at == j.bk.total - debt,
+                  "%s job en=%u: another node's recompute: %s (debt_paid %llu, P %llu) %s", tag, en, rc::to_string(r.verdict),
+                  (unsigned long long)r.debt_paid, (unsigned long long)r.split_at, r.why.c_str());
+        }
+        CHECK(b.provider->finder_variants() == 3, "%s: 3 finder variants built (L, M, N), each once (%llu)", tag,
+              (unsigned long long)b.provider->finder_variants());
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// E10 the `sink-unbacked` status alarm (main paynow_net) means NoClaimWithoutCash:
+// coverage the sink / donation output carries that no pay-now of THIS block
+// explains, counted only while the cut still holds credit FINALIZE will book.
+// A block whose fold at the cut is EMPTY and which commits no V37N (attempt 8's
+// nine pre-anchor blocks, credit {}) is not a claim: it must not count. RED on
+// master 64c4372df: every residual without V37N counted (blocks=9).
+// ---------------------------------------------------------------------------
+void suite_sink_unbacked_scope() {
+    std::printf("== E10. sink-unbacked alarm scope: sink cash counts only against credit still to be booked ==\n");
+#ifdef C2POOL_V37_XMR_SINK_UNBACKED_SCOPED
+    const Amounts none;
+    Amounts some; some[id_of(ref_of(31))] = 5;
+    CHECK(pn::sink_unbacked_amount(450000000000ll, 0, 0, none) == 0,
+          "an empty-cut block without V37N and no credit left: 0 (attempt 8 block 2220893: donation 450000000000, credit {})");
+    CHECK(pn::sink_unbacked_amount(450000000000ll, 0, 0, some) == 450000000000ll,
+          "the same coverage while the cut still holds credit (the #1865 gap): counted in full");
+    CHECK(pn::sink_unbacked_amount(571295573ll, 571295573ll, 0, some) == 0,
+          "coverage fully explained by the sink's own pay-now share: 0 (attempt 8 block 2220964)");
+    CHECK(pn::sink_unbacked_amount(7, 0, 7, some) == 0, "the marker alone: 0");
+    Amounts neg; neg[id_of(ref_of(31))] = -3;
+    CHECK(pn::sink_unbacked_amount(100, 0, 0, neg) == 0, "only negative credit left (over-credit netted forward): nothing to book, 0");
+    // the real pre-anchor DEFAULT block (an unbound job), booked as main does
+    LiveRules lr; lr.on = true; lr.seeds = {83333333333ull, 166666666666ull, 249999999999ull};
+    Built b(true, false, Cut::Empty, std::nullopt, &lr);
+    if (!b.ok) { CHECK(false, "fresh-pool template builds: %s", b.why.c_str()); return; }
+    const JobBlock d = job_block(b, 14, true);
+    Amounts credit, payout = d.bk.payout;
+    const auto nb = pn::net_booking(d.bk.paynow_base, d.bk.total, credit, payout, d.bk.sink_total, fee::donation_identity(kNet), 0, true);
+    long long alloc_sink = 0;
+    if (const auto it = nb.alloc.find(fee::donation_identity(kNet)); it != nb.alloc.end()) alloc_sink = it->second;
+    CHECK(d.ok && d.bk.ok && !d.bk.paynow_base && d.bk.sink_total > 0 && pn::sink_unbacked_amount(d.bk.sink_total, alloc_sink, 0, credit) == 0,
+          "the default pre-anchor block (no V37N, donation coverage %lld, credit {}) does not increment the counter", d.bk.sink_total);
+#else
+    CHECK(false, "no scoped sink-unbacked predicate on this tree (main counts every residual without V37N: attempt 8 'sink-unbacked: blocks=9')");
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -838,9 +1053,11 @@ int main() {
 #endif
 #ifdef C2POOL_V37_XMR_ECUT_FINDER_LOGIN
     suite_login();
+    suite_fresh_pool_under_rules();
 #else
     suite_login_base();
 #endif
+    suite_sink_unbacked_scope();
 #if !ECUT_FIX
     suite_base();
     suite_nonempty_unchanged();

@@ -866,9 +866,17 @@ private:
             if (why) *why = "internal: extra-nonce tag layout";
             return false;
         }
+        // The widest 0x02 payload the seam writes: padded nonce 14 + rbind 32 + V37R 12 +
+        // V37F 69 + V37N 12 + V37D 12 + V37P 37 + V37C 44 = 232 B (<= 255, two-byte varint).
+        // REWARD TOTAL was missing from this bound: a per-job EMPTY-CUT FINDER variant
+        // (V37F + V37N) under --relay-bind rbind with the V37R total is 232 B and this
+        // self-check refused it as "out of range"; the provider then served the DEFAULT
+        // template for every bound job, and the nine pre-anchor stagenet lane blocks of
+        // attempts 7 and 8 paid R - Delta to the donation instead of their finder
+        // (v37_xmr_empty_cut_finder_kat E9). Receivers parse the length as a varint <= 255.
         if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
-            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + FINDER_FIELD_BYTES + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; empty-cut finder: +69 V37F
-            if (why) *why = "internal: extra-nonce size out of range";
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + REWARD_TOTAL_FIELD_BYTES + FINDER_FIELD_BYTES + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; empty-cut finder: +69 V37F; REWARD TOTAL: +12 V37R
+            if (why) *why = "internal: extra-nonce size out of range (" + std::to_string(rec.m_extra_nonce_size) + " B)";
             return false;
         }
         // miner_tx ends right after the MM root + the rct_type byte

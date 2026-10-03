@@ -208,7 +208,12 @@ nothing checked them.
   the coinbase is then finalized state, the same on every node. The block
   still commits its own V37C; that cut becomes the next anchor when the block
   finalizes, so the window keeps moving. No anchor yet (a fresh pool): the
-  view credits nobody, and the empty-cut finder rule pays the finder. Cost:
+  view credits nobody, and the empty-cut finder rule pays the finder: every
+  lane block found before the pool's first lane block is final carries
+  V37F (the winning job's bound login) + V37N and pays that finder
+  `R - Delta`, the donation output being its 0-amount marker (its 0x02
+  payload is then the widest, up to 232 B with rbind and V37R; `ecut-variant:`
+  lines name a refused variant, the status line counts them). Cost:
   a block pays the window as of D_conf blocks ago (about 2 hours), like a
   PPLNS window with a lag. Each block still pays out everything it credits.
   * The ledger carries the anchor in `owed_digest` ("V37A"), set at FINALIZE
