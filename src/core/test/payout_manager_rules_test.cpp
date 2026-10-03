@@ -101,4 +101,37 @@ TEST(PayoutRules, DemoCoinbaseNeverWrapsOnOverHundredPercent)
     for (const auto& o : j["outputs"]) EXPECT_LE(o["amount_satoshis"].get<uint64_t>(), kReward) << "no output wraps";
 }
 
+// amount_of_pct known answers: reward * micro overflows 64 bits, so these pin
+// the 128-bit floor (native __int128 on GCC/Clang, boost uint128 on MSVC).
+uint64_t donation_of(PayoutManager& pm, uint64_t reward, double pct)
+{
+    const auto j = pm.build_coinbase_detailed(reward, "LeD2fnnDJYZuyt8zgDsZ2oBGmuVcxGKCLd", pct, 0.0);
+    EXPECT_TRUE(j.contains("outputs")) << j.dump();
+    if (!j.contains("outputs") || j["outputs"].empty()) return 0;
+    const auto& d = j["outputs"].back();
+    EXPECT_EQ(d["type"], "donation");
+    return d["amount_satoshis"].get<uint64_t>();
+}
+
+TEST(PayoutRules, AmountOfPctKnownAnswers)
+{
+    PayoutManager pm(1.0, 86400);
+    constexpr uint64_t R = 2100000000000007ULL;   // 21M coins in satoshis + 7
+    EXPECT_EQ(donation_of(pm, R, 12.345678), 259259238000000ULL) << "floor of R*12345678/1e8";
+    EXPECT_EQ(donation_of(pm, R, 99.999999), 2099999979000006ULL) << "floor of R*99999999/1e8";
+    EXPECT_EQ(donation_of(pm, R, 0.000001), 21000000ULL);
+    EXPECT_EQ(donation_of(pm, R, 100.0), R);
+}
+
+TEST(PayoutRules, AmountOfPctClampsOverHundredPercent)
+{
+    PayoutManager pm(1.0, 86400);
+    const auto j = pm.build_coinbase_detailed(kReward, "LeD2fnnDJYZuyt8zgDsZ2oBGmuVcxGKCLd", 150.0, 0.0);
+    ASSERT_TRUE(j.contains("outputs")) << j.dump();
+    const auto& o = j["outputs"];
+    ASSERT_EQ(o.size(), 1u) << "150% leaves no miner output: " << j.dump();
+    EXPECT_EQ(o.back()["type"], "donation");
+    EXPECT_EQ(o.back()["amount_satoshis"].get<uint64_t>(), kReward) << "150% clamps to exactly the reward";
+}
+
 }  // namespace

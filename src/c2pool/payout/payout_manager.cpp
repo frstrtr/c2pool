@@ -19,6 +19,9 @@
 #endif
 #include <nlohmann/json.hpp>
 #include <core/log.hpp>
+#if !defined(__SIZEOF_INT128__)
+#include <boost/multiprecision/cpp_int.hpp>   // MSVC: amount_of_pct's 128-bit product
+#endif
 
 namespace c2pool {
 namespace payout {
@@ -607,11 +610,21 @@ std::string PayoutManager::address_to_script_hex(const std::string& address) con
 // in millionths of a percent, the product in 128 bits, floored. Never wraps and
 // never exceeds the reward (external review audit N2: a 150% RPC value made the
 // miner amount wrap through zero).
+//
+// GCC/Clang keep the native unsigned __int128 product; MSVC has no __int128
+// (error C4235) and uses boost::multiprecision::uint128_t, the same fallback as
+// bch::coin::abla::muldiv. Both are exact 128-bit floors, so the result is
+// bit-identical (micro <= 1e8, so the quotient never exceeds the reward).
 static uint64_t amount_of_pct(uint64_t reward, double pct) {
     if (!(pct > 0.0)) return 0;
     if (pct >= 100.0) return reward;
     const uint64_t micro = static_cast<uint64_t>(pct * 1000000.0 + 0.5);   // pct in 1e-6 %
+#if defined(__SIZEOF_INT128__)
     return static_cast<uint64_t>((static_cast<unsigned __int128>(reward) * micro) / 100000000u);
+#else
+    using u128 = boost::multiprecision::uint128_t;
+    return static_cast<uint64_t>((u128(reward) * u128(micro)) / u128(100000000u));
+#endif
 }
 
 // Enhanced coinbase construction methods
