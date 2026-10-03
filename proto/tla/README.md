@@ -9,7 +9,7 @@ state machine. Runnable artifacts for the V37 prototyping line (off `master`).
 |------|----------------|-------|
 | `Settlement.tla` | finality-gated owed/overlay state machine — `BlockFound→OverlayAdded`, `BlockFinalized→OwedSettled+OverlayCleared`, `BlockOrphaned→OverlayReverted` | `Settlement.cfg` (full), `Settlement_small.cfg` (fast) |
 | `Lanes.tla` | per-lane Push/Tick decay vs ground-truth windowed recompute; invariants I1 (dedup), I2 (mono), I3 (no-stale / acc-bounded / determinism), I4 (bin-clock) | `Lanes.cfg` (canonical), `Lanes_wide.cfg` (wider), `Lanes_free.cfg` (negative control) |
-| `SettlementCanon.tla` | the XMR lane ledger under the every-node coinbase recompute (`docs/xmr-lane/coinbase-recompute.md`): a canonical block books its credit and payouts, a mismatch is booked debit-only (payouts debited, credit dropped), an undecidable block is held; the pay-in-block allocation in abstract form with the drain rule of the operator rulings of 2026-10-02 (pay-now first: the window credited and paid at P = R - debt_paid; old balances paid only out of Delta = min(F, R * min(dh, HCap) div DrainQ); contested slots follow cash, K_o from the first owed pass; DEBT FIRST removed; redistribution as a credit delta; no advance, no claim without cash); `DrainQ = 0` is master's allocation | `SettlementCanon.cfg` (the rule, one slot), `SettlementCanon_ko.cfg` (contested slots, K_o), `SettlementCanon_noslot.cfg` (no payee slot), `SettlementCanon_master.cfg` (master, DrainQ = 0), `SettlementCanon_len3.cfg` (three blocks, long), `check-settlement-canon.sh` (negative controls, witnesses) |
+| `SettlementCanon.tla` | the XMR lane ledger under the every-node coinbase recompute (`docs/xmr-lane/coinbase-recompute.md`): a canonical block books its credit and payouts, a mismatch is booked debit-only (credit dropped, payouts debited net of each key's window credit at the cut: lane rule 31 noncanon_net), an undecidable block is held; the pay-in-block allocation in abstract form with the drain rule of the operator rulings of 2026-10-02 (pay-now first: the window credited and paid at P = R - debt_paid; old balances paid only out of Delta = min(F, R * min(dh, HCap) div DrainQ); contested slots follow cash, K_o from the first owed pass; DEBT FIRST removed; redistribution as a credit delta; no advance, no claim without cash); `DrainQ = 0` is master's allocation | `SettlementCanon.cfg` (the rule, one slot), `SettlementCanon_ko.cfg` (contested slots, K_o), `SettlementCanon_noslot.cfg` (no payee slot), `SettlementCanon_master.cfg` (master, DrainQ = 0), `SettlementCanon_len3.cfg` (three blocks, long), `check-settlement-canon.sh` (negative controls, witnesses) |
 
 ## Verified results
 
@@ -50,6 +50,12 @@ slots) and `MasterWhenNoFloat` (F = 0 gives master's payouts and credit). "Negat
 means: a canonical block never makes a balance negative and never deepens a debt; a
 debit-only block may drive the key it paid negative (that key carries the payment as a
 debt, by design), so `UnpaidKeyNeverNegative` covers the keys no debit-only block paid.
+Lane rule 31 (`noncanon_net`, G9 review O6): a debit-only block debits only what a key
+was paid above its window credit at the block's cut, so `WindowPaidKeyNeverNegative`
+(every config) covers every key no debit-only block paid above that credit;
+`NonCanonicalEarnsNothing` is stated as credit <= min(E, pay); the booking before the
+rule (`Mutation = "debit_all"`) is its negative control. The state counts above are
+unchanged by the rule.
 Solvency: no block credits more than it pays to keys, so the outstanding total never
 exceeds the genesis float. The redistribution moves cash and credit together whenever
 the block has a payee output; when the admitted payees' credit at P sums to 0 the cash

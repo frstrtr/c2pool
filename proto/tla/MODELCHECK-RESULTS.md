@@ -298,3 +298,63 @@ have nothing to act on here), the V37N owed base, the source and determinism of 
 than the genesis balances that amendment A3 lists as preconditions of "no new owed" (the
 empty-cut finder credit, DROPS due with the window rule off), reorgs below FINALIZE
 (`Settlement.tla`) and the share rule (V37R).
+
+## SettlementCanon.tla — the debit-only NET booking (lane rule 31, G9 review O6) → GREEN
+
+A non-canonical lane block is booked debit-only: its credit is dropped and its payouts are
+debited. Before lane rule 31 `noncanon_net` the debit was the whole payout, so a window key
+the block paid within its window credit carried that pay-now as a permanent debt. Under the
+rule the block books `credit = min(E, pay)` per key (the C++ booking: credit `{}` and the
+payout `pay - min(E, pay)`, `paynow::debit_only_net`; the pending payout and FINALIZE are
+the same), so only a payment above the key's window credit at the block's cut is a debt.
+The module hard-wires the rule; Mutation `"debit_all"` is the booking before it.
+
+* `NonCanonicalEarnsNothing` is restated: a debit-only block credits a key at most
+  `min(E, pay)` (it never raises a balance and only books cash it paid); still caught by
+  `foreign_credit`.
+* New invariant `WindowPaidKeyNeverNegative`: a key that no debit-only block paid above its
+  window credit at that block's cut has `owed >= 0` and `EffectiveOwed >= 0`. It is in every
+  config. `mut-debit-all` violates it (3 states: genesis; a non-canonical block pays m2 1
+  with E(m2) = 2; booked debit-only, m2's EffectiveOwed is -1).
+* `WitNoNegative` stays violated (`wit-negative`): an overpayment is still a debt, the
+  forward repair is kept. `wit-noncanon-net` shows the netting is reached (the strict
+  `NonCanonicalCreditsNobody` of the booking before the rule is violated).
+
+```
+run:              settlement-canon-o6-2026-10-04
+date:             2026-10-04 (02:50:05 to 03:01:27, UTC+4), workstation-191
+tool:             TLC2 Version 2.19 of 08 August 2024 (rev 5a47802)
+tla2tools sha256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+jre:              OpenJDK 25.0.4.1, 6 workers, -Xmx8g, breadth-first
+command:          TLC_WORKERS=6 proto/tla/check-settlement-canon.sh tla2tools.jar <out>
+model sha256:     SettlementCanon.tla 398176683918b7d39717aefa6599e6b6df560ab32e930b4a9cafad872b777ea0
+config sha256:    SettlementCanon.cfg 45be6c3d4b91f880a813c271210982e275db6362022549fd7390f859ee37e08e
+                  SettlementCanon_ko.cfg bf6627138920ea5cc96c17dc85aed17fb9a31f8774350a824543b418a0b43b34
+                  SettlementCanon_noslot.cfg 83864fc4d171efd0c6ff118f300bca2fb287d95635065e74cef7e97b62a49c32
+                  SettlementCanon_master.cfg b0c2d2788a350a1fc5ad49d39c1ceace0c8be2ba0f44bee7f9ca5ecfe6665c0e
+                  SettlementCanon_len3.cfg 70bbeb78cf8e6fd6aadf8ef7ea0722776bc0fb33928ccb35d2a6409aa0c67a4d
+script sha256:    check-settlement-canon.sh 3377adb6c5d3d1255146f02181d6201e6adc626d6941d192550beaa23b21a553
+invariants:       the drain section's set + WindowPaidKeyNeverNegative (every config)
+result:           Model checking completed. No error has been found. (green, green-ko,
+                  green-noslot, green-master, green-len3)
+states:           3904344 states generated, 3051279 distinct states found, 0 left; depth 6
+ko states:        33048 generated, 29688 distinct, depth 3
+noslot states:    79588 generated, 61636 distinct, depth 7
+master states:    305124 generated, 239444 distinct, depth 7
+len3 states:      89865444 generated, 61514884 distinct, 0 left; depth 10, no error
+                  (run alone, the script's green-len3 command, 6 workers, 03:01:42 to 03:44:43)
+verdicts:         37 runs, 37 PASS (check-settlement-canon.sh, exit 0)
+```
+
+The state counts equal the drain section's: the rule changes what a debit-only block books,
+not which states are reachable. New runs of the script (the others as in the drain section):
+
+| run | change | expected | result | distinct | trace |
+|---|---|---|---|---|---|
+| mut-debit-all | `"debit_all"`: a debit-only block debits its whole payout (the booking before lane rule 31); `WindowPaidKeyNeverNegative` alone | counterexample | `Error: Invariant WindowPaidKeyNeverNegative is violated.` | 98,831 | 3 |
+| wit-noncanon-net | witness: `NonCanonicalCreditsNobody` (a debit-only block credits nobody) | reached | `Error: Invariant NonCanonicalCreditsNobody is violated.` | 100,851 | 3 |
+| mut-foreign-credit | `"foreign_credit"` against the restated `NonCanonicalEarnsNothing` | counterexample | `Error: Invariant NonCanonicalEarnsNothing is violated.` | 94,081 | 3 |
+| wit-negative | `WitNoNegative`: an overpayment is still a debt | reached | `Error: Invariant WitNoNegative is violated.` | 2,340,619 | 6 |
+
+The research runs that chose the rule over three other candidates (keep the gross debit,
+collect a debtor's pay-now, cap at E_b(P)) are not repeated here.
