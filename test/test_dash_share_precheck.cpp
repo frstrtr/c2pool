@@ -323,7 +323,7 @@ TEST(DashSharePrecheck, OverPayloadSharesMessageDroppedOnPublicProfile)
     IdentityGuard guard;
     DataDirGuard dd("c2pool_dash_precheck_payload");
     const auto p = public_params();
-    ASSERT_FALSE(SharechainConfig::isolated_v36());
+    ASSERT_FALSE(SharechainConfig::v36_network());
     dash::ShareChain scratch;
     const auto b = mine_v16(scratch, p, info(uint256(), 1, 0xaa, 16));
     const Bytes w = wire_of(b.share);
