@@ -332,7 +332,7 @@ struct RelayOptions {
     // a lane block this node has not yet) wait for this node's share state to
     // advance (notify_share_state_advanced), not for a clock: bounded per peer
     // and in total, the oldest evicted first (dropped, never a strike).
-    std::size_t share_ahead_per_peer = 512;
+    std::size_t share_ahead_per_peer = 512;   // per sender NODE (V4: inv_node, survives a reconnect)
     std::size_t share_ahead_max = 4096;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
     u32         repair_state_timeout_ms = 20000;
@@ -1676,6 +1676,7 @@ private:
         bool rx_retried = false;   // DROPS-VERIFY-SCALE: parked once already on rx-unavailable
         Clock::time_point enq = Clock::now();
         Clock::time_point not_before = Clock::now();
+        u64 ahead_node = 0;        // HOLD-ROUND-2 V4: the sender NODE an AHEAD park is counted under (inv_node)
     };
     struct CacheEntry { ::v37::ScriptRef payee; std::vector<u8> raw; u64 bin = 0; u16 give_author = 0; };
     struct Job {
@@ -2531,7 +2532,7 @@ private:
                     // patience path as solicited (a repair answer, Ruling A)
                     for (auto ait = m_ahead.begin(); ait != m_ahead.end(); ++ait) {
                         if (ait->id != it.id || ait->solicited) continue;
-                        auto n = m_ahead_n.find(ait->from);
+                        auto n = m_ahead_n.find(ait->ahead_node);
                         if (n != m_ahead_n.end() && n->second && --n->second == 0) m_ahead_n.erase(n);
                         Item x = std::move(*ait); m_ahead.erase(ait);
                         x.solicited = true; x.from = it.from; x.enq = Clock::now(); x.not_before = Clock::now();
@@ -2590,22 +2591,37 @@ private:
         m_inflight.erase(id);
     }
     // HOLD-ROUND-2 (B): park an AHEAD share until the share state advances.
+    // ★ V4: the per-sender bound is keyed by the sender NODE (its HELLO
+    // node_nonce, inv_node), not the connection: a peer that reconnects (or is
+    // re-dialed after every drop) keeps one share_ahead_per_peer budget. At
+    // share_ahead_max the HEAVIEST node's oldest entry goes first (ties: the
+    // oldest such entry), never the global oldest: N connections of fabricated
+    // AHEAD takes cannot evict an honest finder's few parked shares.
     void park_ahead(Item it) {
+        it.ahead_node = inv_node(it.from);   // takes m_pmtx: before m_mtx
         std::lock_guard<std::mutex> lk(m_mtx);
         auto evict = [&](std::deque<Item>::iterator victim) {
-            auto n = m_ahead_n.find(victim->from);
+            auto n = m_ahead_n.find(victim->ahead_node);
             if (n != m_ahead_n.end() && n->second && --n->second == 0) m_ahead_n.erase(n);
             m_inflight.erase(victim->id);
             m_ahead.erase(victim);
             m_st.share_ahead_evicted++;
         };
-        if (m_o.share_ahead_per_peer && m_ahead_n[it.from] >= m_o.share_ahead_per_peer) {
-            for (auto v = m_ahead.begin(); v != m_ahead.end(); ++v) if (v->from == it.from) { evict(v); break; }
+        if (m_o.share_ahead_per_peer && m_ahead_n[it.ahead_node] >= m_o.share_ahead_per_peer) {
+            for (auto v = m_ahead.begin(); v != m_ahead.end(); ++v) if (v->ahead_node == it.ahead_node) { evict(v); break; }
         }
-        while (!m_ahead.empty() && m_ahead.size() >= std::max<std::size_t>(1, m_o.share_ahead_max)) evict(m_ahead.begin());
-        ++m_ahead_n[it.from];
+        while (!m_ahead.empty() && m_ahead.size() >= std::max<std::size_t>(1, m_o.share_ahead_max)) {
+            std::size_t top = 0;
+            for (const auto& [node, c] : m_ahead_n) { (void)node; top = std::max(top, c); }
+            auto v = m_ahead.begin();
+            for (; v != m_ahead.end(); ++v) { const auto c = m_ahead_n.find(v->ahead_node); if (c != m_ahead_n.end() && c->second == top) break; }
+            evict(v == m_ahead.end() ? m_ahead.begin() : v);
+        }
+        ++m_ahead_n[it.ahead_node];
         m_ahead.push_back(std::move(it));
     }
+    // HOLD-ROUND-2 V4: AHEAD shares parked per sender node (inv_node keys)
+    std::map<u64, std::size_t> share_ahead_by_node() const { std::lock_guard<std::mutex> lk(m_mtx); return m_ahead_n; }
 
     void process(Item it) {
         const auto now = Clock::now();
@@ -4362,7 +4378,7 @@ private:
     std::deque<Item> m_q;
     std::deque<Item> m_parked;
     std::deque<Item> m_ahead;                   // HOLD-ROUND-2 (B): AHEAD shares, re-judged on a share-state advance
-    std::map<PeerId, std::size_t> m_ahead_n;    // ... per sending peer (bounded: share_ahead_per_peer)
+    std::map<u64, std::size_t> m_ahead_n;       // ... per sending NODE (inv_node; bounded: share_ahead_per_peer) -- V4
     double m_solicited = 0;
     Clock::time_point m_solicited_at = Clock::now();
     std::string m_last_reject;

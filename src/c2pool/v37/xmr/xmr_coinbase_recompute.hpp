@@ -195,6 +195,70 @@ inline std::uint64_t drain_skew_dh(std::uint64_t took, std::uint64_t F, std::uin
     return lo;
 }
 
+// ★ HOLD-ROUND-2 V2: the drain regime a mismatched take falls in, on the
+// receiver's own numbers. A share is judged only against held states with its
+// own 0x03 root, i.e. the SAME owed_digest: the sender's ledger and ours differ
+// by PENDING lane blocks alone, whose payouts lower F (EffectiveOwed = finalW -
+// pending payouts) and whose heights raise prev_lane. With G(d) = the Delta at
+// F = infinity = floor(R * min(d, H_cap) / (Q * 16)), our F_r, our Delta_r and
+// eff = our dh capped (0 -> H_cap):
+//   AHEAD   the sender holds a pending lane block we do not: F_s <= F_r and
+//           dh_s <= dh_r, so its take is at most ours. EVERY under-take is one:
+//           the Delta at a smaller dh (G(d) == took, d < eff), or an F-capped
+//           take (took = F_s, the smaller float), or both.
+//   BEHIND  we hold a pending lane block the sender does not: F_s >= F_r and
+//           dh_s >= dh_r. An over-take is one iff took <= G(H_cap) and either
+//           G(d) == took at a d > eff, or took >= F_r (an F-capped take of the
+//           larger float; both sides past H_cap included), or our own pass
+//           under-filled Delta_r (took_canon < Delta_r) and took <= Delta_r.
+//   NONE    an over-take in none of those forms, or any take above G(H_cap):
+//           no ledger with this owed_digest builds it -> the caller strikes.
+// Stagenet attempt 7: F fell 5.0e11 -> 1.65e11 in 6 h against R/4 = 1.5e11;
+// the dh-only inversion (drain_skew_dh, exact while took < F) fell back to a
+// strike for every F-capped take. Integer-only, <= 8 evaluations.
+enum class TakeSkew : std::uint8_t { None = 0, Ahead = 1, Behind = 2 };
+struct TakeSkewClass {
+    TakeSkew      kind = TakeSkew::None;
+    std::uint64_t dh = 0;          // the d with G(d) == took (0 = off the R grid: the F-capped form)
+    std::uint64_t g_max = 0;       // G(H_cap): no drain regime takes more
+    const char*   regime = "";
+};
+// the smallest d in [1, H_cap] with G(d) == took, else 0 (G = the Delta at F = infinity)
+inline std::uint64_t drain_grid_dh(std::uint64_t took, std::uint64_t R, std::uint32_t q, std::uint32_t h_cap) {
+    constexpr std::uint64_t kInf = ~std::uint64_t{0};
+    if (q == 0 || h_cap == 0 || took == 0) return 0;
+    std::uint64_t lo = 1, hi = h_cap;
+    if (x6::drain_delta(kInf, R, hi, q, h_cap) < took) return 0;
+    while (lo < hi) {
+        const std::uint64_t mid = lo + (hi - lo) / 2;
+        if (x6::drain_delta(kInf, R, mid, q, h_cap) >= took) hi = mid; else lo = mid + 1;
+    }
+    return x6::drain_delta(kInf, R, lo, q, h_cap) == took ? lo : 0;
+}
+inline TakeSkewClass classify_take_skew(std::uint64_t took, std::uint64_t took_canon, std::uint64_t F, std::uint64_t delta,
+                                        std::uint64_t R, std::uint64_t dh, std::uint32_t q, std::uint32_t h_cap) {
+    TakeSkewClass c;
+    if (q == 0 || h_cap == 0 || took == took_canon) { c.regime = "no drain take mismatch"; return c; }
+    c.g_max = x6::drain_delta(~std::uint64_t{0}, R, h_cap, q, h_cap);
+    if (took > c.g_max) { c.regime = "above the largest drain Delta G(H_cap)"; return c; }
+    const std::uint64_t eff = (dh == 0 || dh > h_cap) ? h_cap : dh;
+    const std::uint64_t g = drain_grid_dh(took, R, q, h_cap);
+    if (took < took_canon) {
+        c.kind = TakeSkew::Ahead;
+        c.dh = (g && g < eff) ? g : 0;
+        c.regime = c.dh ? "the Delta at a smaller dh" : "F-capped: the sender's smaller float";
+        return c;
+    }
+    c.dh = g;
+    if (g && g > eff) { c.kind = TakeSkew::Behind; c.regime = "the Delta at a larger dh"; return c; }
+    if (took >= F) { c.kind = TakeSkew::Behind; c.regime = "F-capped: took >= our F, the sender's larger float"; return c; }
+    if (took_canon < delta && took <= delta) { c.kind = TakeSkew::Behind; c.regime = "our own pass under-fills Delta"; return c; }
+    c.dh = 0;
+    c.regime = "an over-take below our F and off every larger dh";
+    return c;
+}
+#define C2POOL_XMR_TAKE_SKEW_REGIMES 1
+
 namespace detail {
 inline std::string hex12(const ::v37::bytes32& b) {
     static const char* d = "0123456789abcdef";

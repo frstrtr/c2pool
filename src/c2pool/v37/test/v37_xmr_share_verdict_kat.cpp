@@ -31,6 +31,9 @@
 //   S12 a sibling FOUND (same owed_digest, next ledger_seq): shares of both
 //       states are canonical; a forged or mixed share is refused; the state
 //       store is bounded (handoff gap 1).
+//   S14 HOLD-ROUND-2 V2: an F-capped take (F below R*dh/256, or both dh past
+//       H_cap) is AHEAD / BEHIND too, 120 copies -> strikes 0 bans 0; a take
+//       above every drain regime still strikes.
 //   S13 HOLD-ROUND-2 (B): a drain take that is the Delta at another dh is
 //       lane-prefix SKEW: AHEAD (parked) / BEHIND / LATE (dropped), never -1;
 //       a forged take or a thief template stays -1; the AHEAD share re-judges
@@ -53,6 +56,7 @@
 #include "impl/xmr/receipt/xmr_receipt_verify.hpp"
 #include "impl/xmr/settle/xmr_coinbase.hpp"
 #include "impl/xmr/template/xmr_block_assembly.hpp"
+#include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
 #include "c2pool/v37/xmr/xmr_coinbase_authority.hpp"
 #include "c2pool/v37/xmr/xmr_coinbase_recompute.hpp"
 #include "c2pool/v37/xmr/xmr_fee_model.hpp"
@@ -820,6 +824,131 @@ void s13_lane_prefix_skew() {
 #endif
 }
 
+// ── S14 (HOLD-ROUND-2 V2): an F-capped take is a skew too, never a strike ──
+// VERIFY V2: the dh-only inversion (drain_skew_dh) is exact only while the
+// take is below F on BOTH sides; past that it fell back to -1. Attempt 7's F
+// fell 5.0e11 -> 1.65e11 in 6 h against R/4 = 1.5e11: the ban loop was hours
+// away. Same owed_digest, the sender one PENDING lane block apart (its payout
+// lowers the sender's F):
+//   V2a F below R*dh/256 on both sides (F ~7e9 < R*4/256 ~1.33e10): the
+//       finder's share (took = F_s) on a receiver without its block -> AHEAD;
+//       the mirror (took = F_r > ours) -> BEHIND; 120 copies of each through
+//       the relay's DoS budget -> strikes 0, bans 0; the state advances -> 1.
+//   V2b both dh past H_cap (dh 100 vs 80 > 64), F_r > G(64) > F_s: the
+//       F-capped take -> AHEAD; the mirror (G(64) >= our F) -> BEHIND.
+//   V2c forged takes outside every drain regime still strike: above G(H_cap)
+//       (in the small-F world and the past-H_cap world) and B3's over-take
+//       below our F off every larger dh.
+int s14_judge_n(rl::ShareStateStore& st, const Share& sh, int n, std::uint64_t& strikes, std::uint64_t& bans,
+                std::uint64_t& parked, std::uint64_t& dropped, std::string& why) {
+    ::c2pool::xmr::CarrierDosBudget dos;
+    bool banned = false;
+    int v = 0;
+    for (int i = 0; i < n; ++i) {
+        v = relay_verdict(st, sh, why);
+        if (v < 0) { ++strikes; if (dos.on_cheap_reject(2) == ::c2pool::xmr::Action::Ban && !banned) { banned = true; ++bans; } }
+        else if (v == kAhead) ++parked;
+        else if (v == kBehind || v == kLate) ++dropped;
+    }
+    return v;
+}
+struct S14World {
+    st::OwedLedger S0, S1;   // S1 = S0 + the finder's pending lane block (payout `paid`)
+};
+S14World s14_ledgers(const World& w, long long k1, long long k2, std::uint64_t prev_dh, std::uint64_t found_dh, long long paid) {
+    st::OwedLedgerRules rules; rules.lane_height = true;
+    st::OwedLedger S0(kChain, rules);
+    seed(S0, w.K1.id, k1, 10); seed(S0, w.K2.id, k2, 11);
+    st::LaneFound la; la.height = kHeight - prev_dh;
+    S0.on_block_found("s14-prev", Amounts{}, {}, std::nullopt, nullptr, &la);
+    S0.on_block_finalized("s14-prev", 12);
+    S14World x{S0, S0};
+    st::LaneFound lb; lb.height = kHeight - found_dh;
+    x.S1.on_block_found("s14-found", Amounts{}, Amounts{{w.K1.id, paid}}, std::nullopt, nullptr, &lb);
+    return x;
+}
+long long s14_F(const st::OwedLedger& L) {
+    long long f = 0; for (const auto& [k, e] : L.effective_owed_all()) { (void)k; if (e > 0) f += e; } return f;
+}
+// one skew family: AHEAD (S1's share at S0), BEHIND (S0's share at S1), each n times; then S0 advances to S1
+void s14_family(const char* tag, const World& w, const S14World& x, int n) {
+    BuildOpts o; o.cut_payees = w.cut; o.drain = true;
+    const Block b0 = build_block(x.S0, w.lane, o), b1 = build_block(x.S1, w.lane, o);
+    CHECK(b0.ok && b1.ok && x.S0.owed_digest() == x.S1.owed_digest(),
+          "%s drain templates build on S0 / S1 (same owed_digest; F %lld / %lld, prev_lane %llu / %llu): %s %s", tag, s14_F(x.S0), s14_F(x.S1),
+          (unsigned long long)x.S0.prev_lane_height(), (unsigned long long)x.S1.prev_lane_height(), b0.why.c_str(), b1.why.c_str());
+    if (!b0.ok || !b1.ok) return;
+    const Share s0 = share_of(b0), s1 = share_of(b1);
+    std::string why;
+    std::uint64_t strikes = 0, bans = 0, parked = 0, dropped = 0;
+    rl::ShareStateStore at0; at0.put(drain_entry(x.S0, w));
+    rl::ShareStateStore at1; at1.put(drain_entry(x.S1, w));
+    {
+        const int v0 = relay_verdict(at0, s0, why); const std::string w0 = why;
+        const int v1 = relay_verdict(at1, s1, why);
+        CHECK(v0 == 1 && v1 == 1, "%s each share is CANONICAL on its own state (%d %s / %d %s)", tag, v0, w0.c_str(), v1, why.c_str());
+    }
+    const int va = s14_judge_n(at0, s1, n, strikes, bans, parked, dropped, why);
+    CHECK(va == kAhead && why.find("ahead") != std::string::npos && strikes == 0 && bans == 0 && parked == (std::uint64_t)n,
+          "%s the finder's share on a receiver without its lane block: AHEAD x%d, strikes %llu bans %llu parked %llu (cc97146361: -1, a strike each) -- %s",
+          tag, n, (unsigned long long)strikes, (unsigned long long)bans, (unsigned long long)parked, why.c_str());
+    strikes = bans = parked = dropped = 0;
+    const int vb = s14_judge_n(at1, s0, n, strikes, bans, parked, dropped, why);
+    CHECK(vb == kBehind && why.find("behind") != std::string::npos && strikes == 0 && bans == 0 && dropped == (std::uint64_t)n,
+          "%s a share built before the receiver's lane block: BEHIND x%d, strikes %llu bans %llu dropped %llu (cc97146361: -1) -- %s",
+          tag, n, (unsigned long long)strikes, (unsigned long long)bans, (unsigned long long)dropped, why.c_str());
+    at0.put(drain_entry(x.S1, w));
+    const int vr = relay_verdict(at0, s1, why);
+    CHECK(vr == 1, "%s the receiver's state advances to S1: the parked share re-judges CANONICAL (%d %s)", tag, vr, why.c_str());
+}
+// a forged take on ledger L (owed.front + `add`, its V37N re-derived), judged on L's own state
+int s14_forged(const World& w, const st::OwedLedger& L, std::uint64_t add, std::string& why) {
+    BuildOpts f; f.cut_payees = w.cut; f.drain = true; f.retail = true;
+    f.mutate = [add](x6::CoinbaseInputs& in) { if (!in.owed.empty()) in.owed.front().owed += add; in.drain_budget += add; };
+    const Block fb = build_block(L, w.lane, f);
+    if (!fb.ok) { why = "forged template does not build: " + fb.why; return 99; }
+    rl::ShareStateStore st; st.put(drain_entry(L, w));
+    return relay_verdict(st, share_of(fb), why);
+}
+void s14_f_capped_take() {
+    std::printf("== S14. an F-capped take (F below R*dh/256; both dh past H_cap) is a skew: park / drop, never a strike ==\n");
+    World w;
+    const int n = 120;   // past the relay's 100-strike ban threshold
+    // V2a: F ~7e9 below R*4/256 ~1.33e10 on both sides (R ~8.52e11; receiver dh 14, finder dh 4)
+    const S14World a = s14_ledgers(w, 4000000000ll, 3000000000ll, 14, 4, 2000000000ll);
+    s14_family("V2a", w, a, n);
+    // V2b: both dh past H_cap 64 (receiver dh 100, finder dh 80); F_r 2.5e11 > G(64) ~2.13e11 > F_s 1.9e11
+    const S14World b = s14_ledgers(w, 150000000000ll, 100000000000ll, 100, 80, 60000000000ll);
+    s14_family("V2b", w, b, n);
+    // V2c: forged takes outside every drain regime still strike
+    std::string why;
+    int v = s14_forged(w, a.S0, 300000000000ull, why);   // took ~3.07e11 > G(64) ~2.13e11
+    CHECK(v == -1 && why.find("take") != std::string::npos,
+          "V2c a forged take above G(H_cap) in the small-F world: REFUSED -1 (a strike) -- %s", why.c_str());
+    v = s14_forged(w, b.S0, 1000000007ull, why);          // took = G(64) + 1.000000007 XMR
+    CHECK(v == -1 && why.find("take") != std::string::npos,
+          "V2c a forged take 1.000000007 XMR above G(H_cap) past H_cap: REFUSED -1 (a strike) -- %s", why.c_str());
+#if defined(C2POOL_XMR_TAKE_SKEW_REGIMES)
+    // the classifier on the attempt-7 numbers (R/4 = 150021985000) once F < R/4
+    const std::uint64_t R = 600087940000ull, G = R * 64 / 256, F = 120000000000ull;
+    using rc::TakeSkew;
+    const auto c1 = rc::classify_take_skew(110000000000ull, F, F, F, R, 70, 16, 64);        // finder F-capped below ours
+    const auto c2 = rc::classify_take_skew(G, F, F, F, R, 70, 16, 64);                       // finder at G(64), we F-capped
+    const auto c3 = rc::classify_take_skew(G + 1, F, F, F, R, 70, 16, 64);                   // above every regime
+    const auto c4 = rc::classify_take_skew(R * 4 / 256, R * 14 / 256, F, R * 14 / 256, R, 14, 16, 64);   // attempt-7 dh 4 vs 14
+    const auto c5 = rc::classify_take_skew(R * 14 / 256 + 1000000007ull, R * 14 / 256, F, R * 14 / 256, R, 14, 16, 64);   // B3
+    const auto c6 = rc::classify_take_skew(R * 20 / 256, R * 14 / 256, F, R * 14 / 256, R, 14, 16, 64);  // the Delta at dh 20
+    CHECK(c1.kind == TakeSkew::Ahead && c1.dh == 0 && c2.kind == TakeSkew::Behind && c3.kind == TakeSkew::None &&
+          c4.kind == TakeSkew::Ahead && c4.dh == 4 && c5.kind == TakeSkew::None && c6.kind == TakeSkew::Behind && c6.dh == 20 &&
+          rc::drain_grid_dh(G, R, 16, 64) == 64 && rc::drain_grid_dh(G + 1, R, 16, 64) == 0,
+          "classify_take_skew: F-capped under-take AHEAD; G(64) over our F BEHIND; G(64)+1 NONE; dh 4 vs 14 AHEAD@4; "
+          "B3 over-take below F NONE; G(20) at ours 14 BEHIND@20 (%s / %s / %s / %s / %s / %s)",
+          c1.regime, c2.regime, c3.regime, c4.regime, c5.regime, c6.regime);
+#else
+    CHECK(false, "no classify_take_skew on cc97146361");
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -837,6 +966,7 @@ int main() {
     s11_drops_due();
     s12_state_by_seq();
     s13_lane_prefix_skew();   // HOLD-ROUND-2 (B)
+    s14_f_capped_take();      // HOLD-ROUND-2 V2
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

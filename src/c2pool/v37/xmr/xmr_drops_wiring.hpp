@@ -351,6 +351,51 @@ struct ServedShare {   // one served (repaired) receipt of [a0, P), in the servi
 };
 // Why a prefix HOLDs. retry=false = an invariant broke (the caller ALARMs).
 struct PrefixWhy { std::string text; bool retry = true; };
+// ★ HOLD-ROUND-2 O1: a prefix-derivation HOLD names its cause. Stagenet
+// attempt 7 held 2220689 on the SUFFIX text for 601 retries; no line said
+// which branch failed (no "reconstructed view at P=2356" on A or C, own log
+// contiguous past P). The texts keep their "cut-pending:" prefix (undecided).
+struct SuffixHoldCause {
+    std::uint64_t P = 0, a0 = 0;
+    std::optional<bytes32> peer_a0;      // the serving peer's digest at a0 (repair_a0)
+    std::optional<bytes32> ours_a0;      // ours at a0 (digest_at_deep); nullopt = not retained here
+    int replay_base = -1;                // the settlement replay's base for this cut (RepairReplayer::Base); -1 = none yet
+    std::uint64_t replay_a0 = 0;
+    bool shadow_record_missing = false;  // base = shadow, and that shadow has no DROPS record
+    std::string own_why;                 // own_prefix's reason ("" = own order not tried / not the cause)
+};
+inline std::string hold_hex12(const std::optional<bytes32>& b, const char* none) {
+    if (!b) return none;
+    static const char* d = "0123456789abcdef";
+    std::string s; for (int i = 0; i < 6; ++i) { s.push_back(d[(*b)[i] >> 4]); s.push_back(d[(*b)[i] & 15]); } return s;
+}
+inline const char* replay_base_name(int b) {
+    switch (b) { case -1: return "no replay yet"; case 0: return "none"; case 1: return "full"; case 2: return "own"; case 3: return "shadow"; }
+    return "?";
+}
+inline std::string suffix_hold_why(const SuffixHoldCause& c) {
+    std::string cause;
+    if (!c.peer_a0) cause = "the serving peer stated no digest at a0";
+    else if (!c.ours_a0) cause = "our digest at a0 is not retained here";
+    else if (*c.peer_a0 != *c.ours_a0) cause = "our [0,a0) is not the serving peer's (a0 digests differ)";
+    else cause = "a0 digests agree";
+    if (c.replay_base < 0) cause += "; the settlement replay of this cut has not run";
+    else if (c.replay_a0 != c.a0) cause += "; the replay ran at a0=" + std::to_string(c.replay_a0);
+    else if (c.shadow_record_missing) cause += "; the replay's shadow base has no DROPS record";
+    return "cut-pending: drops lane prefix of P=" + std::to_string(c.P) + ": the served order is the SUFFIX [" + std::to_string(c.a0) + "," +
+           std::to_string(c.P) + ") and our [0," + std::to_string(c.a0) + ") is not the order the spine verified -- HOLD, never "
+           "composed from a suffix; cause: " + cause + " (a0 digest peer=" + hold_hex12(c.peer_a0, "none") + " ours=" +
+           hold_hex12(c.ours_a0, "not-retained") + "; replay base " + replay_base_name(c.replay_base) + " a0=" + std::to_string(c.replay_a0) +
+           "; own order: " + (c.own_why.empty() ? std::string("-") : c.own_why) + ")";
+}
+// the relay repair has not produced the winner-side order yet: its state, and
+// why our own order could not serve (spine at P not ours, or own_prefix's reason)
+inline std::string awaiting_order_why(std::uint64_t P, const char* repair_state, bool own_spine, const std::string& own_why) {
+    return "cut-pending: relay repair of P=" + std::to_string(P) + ": drops lane prefix awaiting the winner-side order (repair " +
+           repair_state + "; our order reaches the spine at P: " + (own_spine ? "yes" : "no") +
+           (own_why.empty() ? std::string() : "; own order: " + own_why) + ")";
+}
+#define C2POOL_XMR_PREFIX_HOLD_CAUSE 1
 // A reconstructed winner-side order, receipt by receipt: the DROPS mirror of
 // a relay repair SHADOW (xmr_repair_replay.hpp). When the settlement replay
 // reaches a later spine from a shadow's [0, a0) instead of our own order,

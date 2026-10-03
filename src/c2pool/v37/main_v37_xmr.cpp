@@ -1993,6 +1993,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     // merged (repaired) prefix, receipt by receipt, keyed "P:spinehex" (the
     // end of the winner-side order it is); bounded like the shadows.
     std::map<std::string, c2pool::v37n::xmr::drops::PrefixRecord> drops_records;
+    std::set<std::string> drops_suffix_logged;   // HOLD-ROUND-2 O1: one log line per (cut, cause)
     std::deque<std::string> drops_record_lru;
     // set once the DROPS wiring exists (flip 1): records the order a relay
     // replay just verified, receipt by receipt, the moment it becomes a shadow
@@ -2832,12 +2833,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                 return lp;
             }
         }
-        if (!relay_node) { why = "cut-pending: drops lane prefix [0," + std::to_string(P) + ") not derivable (" + owhy + ")"; return std::nullopt; }
+        if (!relay_node) {   // HOLD-ROUND-2 O1: say whether our own order reached the spine at P
+            why = "cut-pending: drops lane prefix [0," + std::to_string(P) + ") not derivable (" +
+                  (own ? owhy : "our order does not reach the spine at P" + (owhy.empty() ? std::string() : "; " + owhy)) + ")";
+            return std::nullopt;
+        }
         std::vector<::v37::bytes32> ids;
         const auto st = relay_node->repair_poll(P, cc.spine_digest, hint, &ids);
         if (st != relay::XmrRelayNode::RepairState::Ready) {
-            why = "cut-pending: relay repair of P=" + std::to_string(P) + ": drops lane prefix awaiting the winner-side order" +
-                  (owhy.empty() ? std::string() : " (own order: " + owhy + ")");
+            why = c2pool::v37n::xmr::drops::awaiting_order_why(   // HOLD-ROUND-2 O1: the repair state + why our own order did not serve
+                P, st == relay::XmrRelayNode::RepairState::Exhausted ? "exhausted (every peer set aside)" : "pending", own, owhy);
             return std::nullopt;
         }
         // ★ DROPS-CARRY-SUFFIX: `ids` cover [a0, P) only (repair_a0() > 0: the
@@ -2862,20 +2867,30 @@ static int run_live(const XmrNodeConfig& cfg) {
         const std::uint64_t a0 = relay_node->repair_a0(P, cc.spine_digest, &peer_a0);
         const c2pool::v37n::xmr::drops::PrefixRecord* shadow_rec = nullptr;
         if (a0 > 0) {
-            bool own_base = false;
-            if (peer_a0) if (const auto ours = relay_node->digest_at_deep(a0); ours && *ours == *peer_a0) own_base = true;
+            bool own_base = false, shadow_missing = false;
+            const std::optional<::v37::bytes32> ours_a0 = relay_node->digest_at_deep(a0);
+            if (peer_a0 && ours_a0 && *ours_a0 == *peer_a0) own_base = true;
             if (!own_base && rbi != replay_base.end() && rbi->second.a0 == a0) {
                 own_base = rbi->second.base == static_cast<int>(relay::RepairReplayer::kOwn);
-                if (!own_base && rbi->second.base == static_cast<int>(relay::RepairReplayer::kShadow))
+                if (!own_base && rbi->second.base == static_cast<int>(relay::RepairReplayer::kShadow)) {
                     if (const auto ri = drops_records.find(rbi->second.shadow_key); ri != drops_records.end()) {
                         shadow_rec = &ri->second; own_base = true;   // [0, a0) = that shadow's DROPS record
-                    }
+                    } else shadow_missing = true;
+                }
             }
             if (!own_base) {
                 ++drops_lane_hold_a0;
-                why = "cut-pending: drops lane prefix of P=" + std::to_string(P) + ": the served order is the SUFFIX [" + std::to_string(a0) +
-                      "," + std::to_string(P) + ") and our [0," + std::to_string(a0) + ") is not the order the spine verified "
-                      "(shadow base without a DROPS record, or the settlement replay is pending) -- HOLD, never composed from a suffix";
+                // HOLD-ROUND-2 O1: the two a0 digests, the replay base and owhy (attempt 7: the cause was unreadable)
+                c2pool::v37n::xmr::drops::SuffixHoldCause hc;
+                hc.P = P; hc.a0 = a0; hc.peer_a0 = peer_a0; hc.ours_a0 = ours_a0; hc.own_why = owhy;
+                hc.shadow_record_missing = shadow_missing;
+                if (rbi != replay_base.end()) { hc.replay_base = rbi->second.base; hc.replay_a0 = rbi->second.a0; }
+                why = c2pool::v37n::xmr::drops::suffix_hold_why(hc);
+                if (drops_suffix_logged.size() > 4096) drops_suffix_logged.clear();
+                if (drops_suffix_logged.insert(pkey + ":" + why).second) {
+                    std::printf("drops-HOLD suffix: %s\n", why.c_str());
+                    std::fflush(stdout);
+                }
                 return std::nullopt;
             }
         }

@@ -37,6 +37,8 @@
 //        after later blocks (no booked row is ever reduced or rewritten); the
 //        winner's own block composed through the receivers' route
 //        (merged_prefix of its own order) equals its own_prefix composition.
+//   CS13 HOLD-ROUND-2 O1: the SUFFIX hold carries both a0 digests, the
+//        replay base and owhy; the awaiting-order hold its repair state.
 //   CS8  source pins: the shell builds the repaired prefix through
 //        merged_prefix with repair_a0 + the verified-base check, ALARMs a
 //        carried mismatch, and books the lane composition either way.
@@ -741,6 +743,42 @@ int main() {
           "CS8 ★ (LIVE 1) a fold past a0 extends the verified own base by receipt identity (lane prefix + replay record)");
         C(sh.find("XmrDropsWiring::record_fold_point(") != std::string::npos && sh.find("if (rec.P > H2) (void)drops->fold_record(rec, rec.P - H2);") == std::string::npos,
           "CS8 ★ (LIVE 1b) a stored record folds at record_fold_point (never 2 x our horizon alone)");
+    }
+    // ── CS13 (HOLD-ROUND-2 O1): a prefix-derivation HOLD names its cause ──
+    // Stagenet attempt 7 held 2220689 on the SUFFIX text for 601 retries and no
+    // line said which branch failed. The text now carries both a0 digests, the
+    // replay base and owhy; the awaiting-order text carries the repair state.
+    std::printf("CS13: the prefix holds name their cause (O1)\n");
+    {
+#if defined(C2POOL_XMR_PREFIX_HOLD_CAUSE)
+        dx::SuffixHoldCause hc;
+        hc.P = 2356; hc.a0 = 2166; hc.peer_a0 = b32_of(0xab); hc.ours_a0 = b32_of(0xcd);
+        hc.replay_base = 3; hc.replay_a0 = 2166; hc.shadow_record_missing = true; hc.own_why = "gap at 2170";
+        const std::string t = dx::suffix_hold_why(hc);
+        C(t.rfind("cut-pending: ", 0) == 0 && t.find("SUFFIX [2166,2356)") != std::string::npos &&
+          t.find("peer=" + dx::hold_hex12(hc.peer_a0, "")) != std::string::npos && t.find("ours=" + dx::hold_hex12(hc.ours_a0, "")) != std::string::npos &&
+          t.find("a0 digests differ") != std::string::npos && t.find("shadow base has no DROPS record") != std::string::npos &&
+          t.find("replay base shadow") != std::string::npos && t.find("own order: gap at 2170") != std::string::npos,
+          "CS13 the SUFFIX hold carries the two a0 digests, the replay base, the missing shadow record and owhy -- " + t);
+        dx::SuffixHoldCause h2; h2.P = 2356; h2.a0 = 2166; h2.peer_a0 = b32_of(0xab);
+        const std::string t2 = dx::suffix_hold_why(h2);
+        C(t2.find("ours=not-retained") != std::string::npos && t2.find("not retained here") != std::string::npos &&
+          t2.find("has not run") != std::string::npos && t2.find("own order: -") != std::string::npos,
+          "CS13 ours not retained + no replay yet are named -- " + t2);
+        const std::string t3 = dx::awaiting_order_why(173, "pending", false, "gap at 40");
+        C(t3.rfind("cut-pending: relay repair of P=173", 0) == 0 && t3.find("repair pending") != std::string::npos &&
+          t3.find("spine at P: no") != std::string::npos && t3.find("own order: gap at 40") != std::string::npos,
+          "CS13 the awaiting-order hold carries the repair state and whether our order reached the spine -- " + t3);
+#else
+        C(false, "CS13 no prefix-hold cause on cc97146361 (the SUFFIX text names no digest, no owhy)");
+#endif
+        const std::string sh = slurp(V37_XMR_SHELL_SRC);
+        C(sh.find("why = c2pool::v37n::xmr::drops::suffix_hold_why(hc);") != std::string::npos &&
+          sh.find("hc.peer_a0 = peer_a0; hc.ours_a0 = ours_a0; hc.own_why = owhy;") != std::string::npos &&
+          sh.find("drops-HOLD suffix: %s") != std::string::npos,
+          "CS13 the shell builds the SUFFIX hold from both a0 digests + owhy and logs it once per (cut, cause)");
+        C(sh.find("drops::awaiting_order_why(") != std::string::npos && sh.find("our order does not reach the spine at P") != std::string::npos,
+          "CS13 the awaiting-order and no-relay holds name the repair state / the own-order cause");
     }
     return C.done("v37_xmr_drops_carry_suffix_kat");
 }

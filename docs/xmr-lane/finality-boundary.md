@@ -212,6 +212,19 @@ resolved=.. now=..)`. `stall_timeout` (a refusal at the bound) stays 0.
 KATs: `v37_xmr_relay_repair_hold_kat` A1-A3 (and N1, inverted),
 `v37_xmr_hold_round2_kat` (the attempt-7 shape on three nodes).
 
+**Every prefix hold names its cause (O1).** Attempt 7's SUFFIX hold printed no
+cause: A's own log covered P and no `reconstructed view at P=2356` line exists
+on A or C, so which branch failed was unreadable. The SUFFIX text now carries
+`cause:` (the serving peer stated no digest at a0 / ours is not retained / the
+a0 digests differ; the settlement replay has not run / ran at another a0 / its
+shadow base has no DROPS record), `a0 digest peer=<12 hex> ours=<12 hex |
+not-retained>`, the replay base and `own order: <owhy>`, and is logged once per
+(cut, cause) as `drops-HOLD suffix: ...`. The awaiting-order hold names the
+repair state (pending / exhausted) and whether our order reaches the spine at
+P; the no-relay hold says when our order does not. KAT:
+`v37_xmr_drops_carry_suffix_kat` CS13. Open items of this round: see
+`coinbase-recompute.md` section 7.
+
 ## 4b. Recovery: VERIFIED resync (W6) -- design, not yet implemented
 
 The old contract ("stop the node and copy `settle.img` from a converged peer")
