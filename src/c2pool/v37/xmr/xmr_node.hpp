@@ -32,6 +32,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -84,6 +85,14 @@ inline ::v37::bytes32 bytes32_of(const c2pool::xmr::node::Hash& h) {
 
 class XmrNode {
 public:
+    // review 2026-10-04 (O2): one ledger state of the boot replay (boot_share_states()).
+    struct BootShareState {
+        ::v37::bytes32 digest{};
+        std::uint64_t  ledger_seq = 0;
+        std::uint64_t  since = 0;   // the coin height its digest became current at
+        std::size_t    run = 0;     // index of its digest in boot_digest_history()
+        std::shared_ptr<const ::c2pool::v37n::settle::OwedLedger> ledger;
+    };
     // `transport` is the live I/O seam (production: LiveMonerodTransport; tests:
     // MockMonerodTransport). Ownership stays with the caller so a test can drive
     // frames into it directly. `point_check` optionally injects the ed25519
@@ -460,7 +469,9 @@ public:
         // 3) RecoveryDriver BEFORE engine.start() — rebuild ledger + hw + cursor.
         {
             bool ok = false;
-            m_recovered = replay_store(m_ledger, m_boot_digests, m_boot_since, m_boot_last_since, ok);
+            m_boot_share_states.clear();
+            m_recovered = replay_store(m_ledger, m_boot_digests, m_boot_since, m_boot_last_since, ok,
+                                       m_boot_share_span ? &m_boot_share_states : nullptr);
             if (!ok)
                 throw std::runtime_error(
                     "XmrNode: settlement store is torn (F2 fail-closed) — refusing to start");
@@ -861,6 +872,15 @@ public:
     const ::v37::bytes32& seed_digest() const { return m_seed_digest; }
     const std::vector<std::string>& construction_log() const { return m_log; }
     const RecoveredState& recovered() const { return m_recovered; }
+    // ★ review 2026-10-04 (O2): the share states of the boot replay. A node that
+    // restarts rebuilds a frozen ledger copy of every (owed_digest, ledger_seq)
+    // state whose digest is current or was superseded within `span` heights of
+    // the replay's end, so a receipt built on a state that was current before
+    // the restart is judged (1 / -1) exactly as on a node that never stopped.
+    // set_boot_share_span() before bring_up(); 0 (default) keeps none.
+    void set_boot_share_span(std::uint64_t span) { m_boot_share_span = span; }
+    const std::vector<BootShareState>& boot_share_states() const { return m_boot_share_states; }
+    void clear_boot_share_states() { std::vector<BootShareState>().swap(m_boot_share_states); }
     // R-B(i) follow-up: every distinct owed_digest state the replayed store passed
     // through, oldest first (ends at the live digest). Seeds the RECON candidate ring
     // so a RESUMED node matches peer roots against its full canonical history (the
@@ -1082,17 +1102,36 @@ private:
 
     // RecoveryDriver replay + the canonical (digest, since) history (R-B(i)
     // follow-up + R-C rework-3 D7): shared by bring_up and relineage.
+    // review 2026-10-04 (O2): `keep` (bring_up only) receives a frozen copy of
+    // every (owed_digest, ledger_seq) state the replay passes whose digest is
+    // current or was superseded less than m_boot_share_span heights before the
+    // replay's running since (whole digests only: every state of a kept digest,
+    // from its first one, so the share verdict holds it complete).
     RecoveredState replay_store(OwedLedger& ledger, std::vector<::v37::bytes32>& ds, std::vector<std::uint64_t>& ss,
-                                std::uint64_t& last_since, bool& ok) {
+                                std::uint64_t& last_since, bool& ok, std::vector<BootShareState>* keep = nullptr) {
         RecoveryDriver rec(*m_store, m_cfg.lane_chain);
         ds.clear(); ss.clear();
         ds.push_back(ledger.owed_digest());   // the empty anchor / anchor-boot state
         ss.push_back(0);
+        std::deque<BootShareState> kq;          // O2: the kept states, oldest first
+        auto keep_state = [&](const OwedLedger& l, std::uint64_t run_s) {
+            if (!keep) return;
+            if (!kq.empty() && kq.back().digest == l.owed_digest() && kq.back().ledger_seq == l.ledger_seq()) return;
+            BootShareState b;
+            b.digest = l.owed_digest(); b.ledger_seq = l.ledger_seq(); b.since = run_s; b.run = ds.size() - 1;
+            auto L = std::make_shared<OwedLedger>(l);
+            (void)L->owed_digest();   // warm the memo: the verify workers only read
+            b.ledger = std::move(L);
+            kq.push_back(std::move(b));
+            // evict whole digest runs superseded more than the span before the running since
+            while (!kq.empty() && kq.front().run + 1 < ds.size() && ss[kq.front().run + 1] + m_boot_share_span < run_s) kq.pop_front();
+        };
+        keep_state(ledger, 0);
         // R-C rework-3 (D7): pair every replayed digest state with the coin
         // height it became current at (Finalize: bin_height - D_conf; the
         // formula XmrFinalizeDriver::since_of_bin applies live).
         std::uint64_t since = 0;
-        RecoveredState st = rec.recover(ledger, ok, {}, [this, &since, &ds, &ss](const OwedLedger& l, const SettleEvent& e) {
+        RecoveredState st = rec.recover(ledger, ok, {}, [this, &since, &ds, &ss, &keep_state](const OwedLedger& l, const SettleEvent& e) {
             if (e.kind == SettleEvKind::Finalize)
                 since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
             const ::v37::bytes32 d = l.owed_digest();
@@ -1100,8 +1139,10 @@ private:
                 ds.push_back(d);
                 ss.push_back(since);
             }
+            keep_state(l, ss.back());
         });
         last_since = since;
+        if (keep) keep->assign(std::make_move_iterator(kq.begin()), std::make_move_iterator(kq.end()));
         return st;
     }
 
@@ -1129,6 +1170,8 @@ private:
     OwedLedger                             m_ledger;
     SettleHW                               m_hw;
     RecoveredState                         m_recovered;
+    std::uint64_t                          m_boot_share_span = 0;   // review O2: 0 = no boot share states kept
+    std::vector<BootShareState>            m_boot_share_states;
     std::vector<::v37::bytes32>            m_boot_digests;   // R-B(i) follow-up: canonical owed_digest history from boot replay
     std::vector<std::uint64_t>             m_boot_since;     // R-C rework-3 (D7): since-height per boot digest
     std::uint64_t                          m_boot_last_since = 0;

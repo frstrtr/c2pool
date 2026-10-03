@@ -18,31 +18,30 @@
 //
 //   VALID      the view at the cut is reproducible here from receipts this
 //              node admitted (verdict 1): book as before, cut = (P, spine).
-//   EMPTY-CUT  the cut is DECIDED bad: the winner-side order that reaches the
-//              committed spine carries a receipt this node refused under the
-//              committed receipt test (xmr_share_verdict.hpp), and no ready
-//              peer serves an order for that spine without one. The block's
-//              money is booked exactly as decided (canonical, debit-only or
-//              O-2 as before) with NO cut: its FINALIZE leaves the anchor where
-//              it is. No DROPS deposit, window or enrolment is composed from
-//              that cut, the CUT-FLOOR is not raised, and the DROPS harvest
-//              range of the next decided lane block reaches back over it.
-//   PENDING    not decided yet (data still arriving, or withheld): HELD, as
-//              before. A cut whose order no connected peer serves is counted as
-//              `withheld` (FinalizeConnect withheld_cut_held): undecided, never
-//              refused on a timeout.
+//   PENDING    not decided yet: HELD, as before. That includes data still
+//              arriving, an order no connected peer serves (counted as
+//              `withheld`, FinalizeConnect withheld_cut_held), and -- after the
+//              review of 2026-10-04 -- a served order that reaches the spine but
+//              carries a receipt this node refused: its serving peer is set
+//              aside and the cut stays HELD. Never a ban, never a strike.
+//   EMPTY-CUT  RESERVED. The booking branch (money as decided, NO cut, the
+//              anchor stays, no DROPS composed, CUT-FLOOR not raised) is kept,
+//              but nothing reaches it: a cut is never decided bad from what a
+//              peer served (below). Lane-rules field 30 stays present for the
+//              rule that will let a later lane block attest the previous
+//              block's cut (a committed receipt-id digest, or none).
 //
-// WHAT THE SPINE BINDS. The lane digest at P folds the per-miner accumulators
-// (identity keys and weights), not receipt ids: a served order is
-// authenticated in its payee/weight sequence. Hence:
-//   * an order that breaks the order rule or repeats an id only sets its
-//     serving peer aside (pending), never decides the cut;
-//   * a served order with a refused receipt sets its peer aside first; the cut
-//     is decided bad only once every ready peer was asked and none served an
-//     order for the spine without a refused receipt.
-// A cut-level commitment of the receipt ids (the v37.1 set digest) is what
-// would bind the ids themselves.
-//
+// WHY A SERVED ORDER NEVER DECIDES A CUT. The lane digest at P folds the
+// per-miner accumulators (identity keys and weights), not receipt ids: a served
+// order is authenticated only in its payee/weight sequence, so another receipt
+// of the same payee and weight can stand in for an honest one and still reach
+// the spine, and which peers hold the order at a given moment is node-local.
+// So an order that breaks the order rule, repeats an id, or carries a receipt
+// refused here only sets its serving peer aside; the cut stays HELD until an
+// order of admitted receipts reproduces the spine. A cut-level commitment of
+// the receipt ids (the v37.1 set digest, or the cut attestation above) is what
+// would make "this cut holds a refused receipt" a property of the chain.
+
 // Pure functions only; main_v37_xmr.cpp wires them (relay_view, own_cut_decide)
 // and the KATs drive them directly.
 // ===========================================================================
@@ -59,8 +58,12 @@
 namespace c2pool::v37n::xmr::cutadm {
 
 #define C2POOL_XMR_EMPTY_CUT 1
+// review 2026-10-04 (D1/D2): a refused receipt in a served order sets its peer
+// aside and keeps the cut HELD; no served order is ever decided bad.
+#define C2POOL_XMR_CUT_HELD_ON_REFUSED 1
 
-// A decided-bad own cut reports this prefix (never "cut-pending:").
+// A decided-bad own cut would report this prefix (never "cut-pending:").
+// RESERVED: no caller produces it (a served order never decides a cut).
 inline constexpr const char* kCutBadPrefix = "cut-bad:";
 // The undecided reason of a cut whose winner-side order no connected peer
 // serves carries this marker (class 3: withheld; still "cut-pending:").
@@ -75,18 +78,19 @@ inline bool is_withheld(const std::string& why) { return is_pending(why) && why.
 // (the relay's refused memo: decided under the committed test), or missing
 // (not here yet: in verify, parked, or never served).
 enum class Served : std::uint8_t { Admitted, Refused, Missing };
-enum class OrderVerdict : std::uint8_t { Valid, Bad, Pending };
+enum class OrderVerdict : std::uint8_t { Valid, Bad, Pending };   // Bad: RESERVED, never returned
 
 struct OrderInput {
     std::vector<Served> receipts;   // the served positions [a0, P)
     bool spine_reproduced = false;  // the replay of [0, a0) + the served pushes reached the committed spine
-    bool every_peer_tried = false;  // the repair asked every ready peer (Exhausted) since this variant
+    bool every_peer_tried = false;  // the repair asked every ready peer (Exhausted); does not decide anything
 };
 
-// Valid: every served receipt admitted and the spine reproduced. Bad: the
-// spine reproduced, a served receipt refused, every ready peer tried. Pending
-// otherwise (a missing receipt, a spine not reproduced -- the serving peer is
-// set aside --, or a refused variant while other peers are still to be asked).
+// Valid: every served receipt admitted and the spine reproduced. Pending
+// otherwise: a missing receipt, a spine not reproduced, or a served receipt
+// refused here -- in the last two cases the serving peer is set aside and the
+// cut stays HELD, whatever the other peers answered (`every_peer_tried` is
+// informational only). Never Bad: the spine does not bind receipt ids.
 inline OrderVerdict classify_served_order(const OrderInput& in, std::string* why = nullptr) {
     std::size_t refused = 0, missing = 0;
     for (const auto s : in.receipts) {
@@ -102,13 +106,10 @@ inline OrderVerdict classify_served_order(const OrderInput& in, std::string* why
         return OrderVerdict::Pending;
     }
     if (!refused) return OrderVerdict::Valid;
-    if (!in.every_peer_tried) {
-        if (why) *why = std::to_string(refused) + " served receipt(s) refused here; asking the other ready peers for the same spine";
-        return OrderVerdict::Pending;
-    }
     if (why) *why = std::to_string(refused) + " of " + std::to_string(in.receipts.size()) +
-                    " served receipt(s) refused under the committed receipt test, and no ready peer serves the spine without them";
-    return OrderVerdict::Bad;
+                    " served receipt(s) refused here: the serving peer is set aside and the cut stays HELD" +
+                    (in.every_peer_tried ? " (every ready peer tried; asked again on the next round)" : " (asking the other ready peers)");
+    return OrderVerdict::Pending;
 }
 
 // ── the own cut of a booking ─────────────────────────────────────────────────

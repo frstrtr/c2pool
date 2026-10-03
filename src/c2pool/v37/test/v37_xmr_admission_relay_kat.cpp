@@ -21,14 +21,17 @@
 //   R3 (REVIEW K3)  the repair answer of a won block's cut that covers them:
 //      the repair completes (each id admitted or refused here), the order
 //      reaches the committed spine, the peer is set aside, every ready peer is
-//      tried -> DECIDED BAD -> the booking passes no cut (EMPTY-CUT).
+//      tried -> still PENDING: the cut stays HELD (review 2026-10-04 D1/D2: a
+//      served order never decides a cut; EMPTY-CUT is reserved).
 //                                         (base: every id cached -> anchored)
 //   R4 (REVIEW K4)  a solicited AHEAD / UNBASED verdict is never admitted: parked
 //      and re-judged on share-state advances; UNBASED expires.
 //                                                     (base: trusted, admitted)
 //   R5 (F3-K8)      the refused memo is a cache: a node that never saw the
 //      receipts (a restart) fetches the bytes, reaches the same verdict and
-//      decides the same served order BAD.                (base: no memo)
+//      keeps the same served order PENDING (HELD).        (base: no memo)
+//   R6 (review 2026-10-04, O7) a relay under the admission rule with no share
+//      verdict installed refuses to start.   (base: starts, receipts unchecked)
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -300,8 +303,15 @@ int main() {
         in.every_peer_tried = exh;
         std::string w2;
         const auto v2 = cutadm::classify_served_order(in, &w2);
-        C(exh && v2 == cutadm::OrderVerdict::Bad, "R3 T set aside, every ready peer tried (Exhausted) -> DECIDED BAD (" + w2 + ")");
-        const std::string bad_why = std::string(cutadm::kCutBadPrefix) + " " + w2;
+        // review 2026-10-04 (D1/D2): a served order never decides a cut -- the
+        // refused variant keeps the cut HELD even once every ready peer was tried
+        C(exh && v2 == cutadm::OrderVerdict::Pending, "R3 T set aside, every ready peer tried (Exhausted): still PENDING, the cut HELD (" + w2 + ")");
+        {
+            const auto held = cutadm::classify_own_cut(true, true, false, "cut-pending: " + w2);
+            C(held == cutadm::OwnCut::Pending, std::string("R3 the booking: ") + cutadm::to_string(held) + " (HELD, no EMPTY-CUT from a served order)");
+        }
+        // the RESERVED EMPTY-CUT branch, reachable only from a cut-bad reason no served order produces
+        const std::string bad_why = std::string(cutadm::kCutBadPrefix) + " (reserved)";
         const auto own = cutadm::classify_own_cut(true, true, false, bad_why);
         {
             ::c2pool::v37n::xmr::credit::CreditCut cc; cc.next_pos = P; cc.spine_digest = spineT;
@@ -342,8 +352,8 @@ int main() {
         const auto v5 = cutadm::classify_served_order(in5);
         bool refetched = false;
         { std::lock_guard<std::mutex> lk(jm5); refetched = judged5.count(thf[0].id) && judged5.count(thf[1].id); }
-        C(ready && refetched && v5 == cutadm::OrderVerdict::Bad,
-          "R5 V5 fetched and judged the refused receipts itself (no memo) and decides the same served order BAD, as V1b did from its memo");
+        C(ready && refetched && v5 == cutadm::OrderVerdict::Pending,
+          "R5 V5 fetched and judged the refused receipts itself (no memo) and keeps the same served order PENDING (HELD), as V1b did from its memo");
         V5.relay->set_dialing(false);
 #else
         C(false, "R5 no refused memo on the base");
@@ -406,6 +416,25 @@ int main() {
             V2.relay->set_dialing(false);
         }
         T2.relay->set_dialing(false);
+    }
+
+    // ── R6 (review 2026-10-04, O7): no start without the share verdict ────
+    {
+#if defined(C2POOL_XMR_VERDICT_REQUIRED)
+        RelayOptions o6 = opts(false, {});
+        o6.require_share_verdict = true;
+        TNode V6("V6", o6);
+        std::string w6;
+        const bool started = V6.relay->start(w6);
+        C(!started && !w6.empty(), "R6 the admission rule on and no share verdict installed: the relay refuses to start (" + w6 + ")");
+        TNode V6b("V6b", o6);
+        V6b.relay->set_share_verdict([](const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64, std::string&) { return 1; });
+        std::string w6b;
+        C(V6b.relay->start(w6b), "R6 (control) with the verdict installed it starts " + w6b);
+        V6b.relay->set_dialing(false);
+#else
+        C(false, "R6 the base starts a relay with no share verdict under the admission rule (every receipt unchecked)");
+#endif
     }
 
     V1.relay->set_dialing(false); V1b.relay->set_dialing(false);

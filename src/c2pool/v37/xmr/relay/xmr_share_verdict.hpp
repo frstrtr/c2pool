@@ -140,6 +140,31 @@ struct CommittedHistory {
     bool warm = false;                     // the history is complete enough to decide (boot-seeded or past warm-up)
 };
 
+// ★ review 2026-10-04 (O3): does the history reach back over every canonical
+// state admissible for a bin whose builder cut is `bcut`? Admissible = a state
+// superseded at or after bcut - A (A = max_root_age; 0 = unbounded, so every
+// state back to the lane's first). The entries are contiguous (each one's
+// superseded is the next one's since), so it suffices that the oldest entry is
+// the lane's first state (since 0) or became current before bcut - A.
+#define C2POOL_XMR_HISTORY_REACH 1
+inline bool committed_history_reaches(const CommittedHistory& h, std::uint64_t bcut) {
+    if (h.entries.empty()) return false;
+    const std::uint64_t f = h.entries.front().since;
+    if (f == 0) return true;
+    if (h.max_root_age == 0 || bcut <= h.max_root_age) return false;
+    return f < bcut - h.max_root_age;
+}
+// `warm` (the daemon's publisher): the history reaches back over the whole span
+// the lane order can still admit at this cursor -- the late tail, plus one bin,
+// plus D_conf (the builder cut of the oldest admissible bin), plus A.
+inline bool committed_history_warm(const CommittedHistory& h, std::uint64_t late_tail_bins) {
+    if (h.entries.empty()) return false;
+    if (h.entries.front().since == 0) return true;
+    if (h.max_root_age == 0) return false;
+    const std::uint64_t span = late_tail_bins + 1 + h.d_conf + h.max_root_age;
+    return h.cursor > span && h.entries.front().since < h.cursor - span;
+}
+
 // The committed test alone (no recompute): 1 = the root is an admissible
 // canonical state for bin `coinbase_height`; -1 = decided not (FOREIGN);
 // 0 = not decidable here yet (cursor before the builder cut, or not warm).
@@ -155,6 +180,18 @@ inline int committed_root_test(const CommittedHistory& h, const ::v37::bytes32& 
         const std::uint64_t age = rr::root_age(e.superseded, bcut);
         if (age < best_age) best_age = age;
         if (h.max_root_age == 0 || age <= h.max_root_age) return 1;
+    }
+    // ★ review 2026-10-04 (O3): FOREIGN only when the history held here reaches
+    // back over EVERY state admissible for this bin: from the lane's first state
+    // (since 0), or from a state that became current before bcut - A. A history
+    // that starts later (a boot seed from a later point, an evicted ring front)
+    // cannot tell an old admissible root from a foreign one: undecided (0).
+    if (!committed_history_reaches(h, bcut)) {
+        if (why) *why = "not yet: the canonical history held here starts at since " +
+                        std::to_string(h.entries.empty() ? 0 : h.entries.front().since) +
+                        ", after the oldest state admissible for bin " + std::to_string(coinbase_height) + " (builder cut " +
+                        std::to_string(bcut) + ", bound " + std::to_string(h.max_root_age) + ")";
+        return 0;
     }
     if (!h.warm || h.cursor < bcut) {
         if (why) *why = "not yet: this node's finalize cursor " + std::to_string(h.cursor) + " has not reached the builder cut " +
@@ -267,6 +304,28 @@ struct ShareStateStore {
         }
     }
 };
+
+// ★ review 2026-10-04 (O2): a restarted node rebuilds, from its boot replay
+// (XmrNode::boot_share_states), every state of each digest the lane order can
+// still need, oldest first, and publishes them before its live state. Each such
+// digest is held complete here (every one of its states, from its first), so a
+// receipt built on a state current before the restart is judged 1 / -1 exactly
+// as on a node that never stopped (O1: a recompute -1 is decided alike).
+// The boot states REPLACE whatever the store held (a live state published
+// before them would otherwise sit in front of older digests and corrupt the
+// superseded-at order); the caller re-publishes its live state right after.
+// The committed history is kept.
+#define C2POOL_XMR_BOOT_SHARE_STATES 1
+inline std::size_t put_boot_states(ShareStateStore& store, const std::vector<std::shared_ptr<ShareStateEntry>>& states,
+                                   std::uint64_t cursor, std::uint64_t span) {
+    if (states.empty()) return 0;
+    {
+        std::lock_guard<std::mutex> lk(store.mu);
+        store.ring.clear(); store.superseded_at.clear(); store.broken.clear();
+    }
+    for (const auto& e : states) { e->from_birth = true; store.put(e, cursor, span); }
+    return states.size();
+}
 
 // The verdict of one held state `e` (1 / -1 / 0, as share_verdict).
 inline int share_verdict_one(const std::shared_ptr<const ShareStateEntry>& e, const FbReceipt& r,

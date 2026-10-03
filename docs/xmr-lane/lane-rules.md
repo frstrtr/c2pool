@@ -58,7 +58,7 @@ final settlement configuration:
 | 12 | drops_rule | 27 | lane_params_digest (the HELLO one) |
 | 13 | drops_window_rw | 28 | enrol_digest (the HELLO one, 0 without DROPS) |
 | 14 | kfair_salted_ties | 29 | spend_floor |
-| 15 | commit_total | 30 | empty_cut (R1: receipt admission, coinbase-recompute.md section 6.2) |
+| 15 | commit_total | 30 | empty_cut (R1: receipt admission, coinbase-recompute.md section 6.2; its EMPTY-CUT booking branch is reserved) |
 
 Serialisation: a TLV list `u8 id | u8 len | value (little-endian)`, ids strictly
 ascending, every known id present (281 bytes for v1 with field 30). A field added later takes

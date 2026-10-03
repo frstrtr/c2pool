@@ -149,6 +149,8 @@ inline constexpr int kShareVerdictForeign = 6;
 // most this many rounds, then dropped (never trusted, never a strike).
 inline constexpr unsigned kShareUndecidedMaxRounds = 4;
 #define C2POOL_XMR_RECEIPT_ADMISSION 1
+// review 2026-10-04 (O7): RelayOptions::require_share_verdict (start() refuses without the verdict)
+#define C2POOL_XMR_VERDICT_REQUIRED 1
 
 // ── the first-byte namespace ────────────────────────────────────────────────
 inline constexpr u8  FB_NS_FIRST  = 0x40;

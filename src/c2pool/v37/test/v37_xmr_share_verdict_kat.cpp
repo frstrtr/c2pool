@@ -42,6 +42,14 @@
 //   S17 R1 receipt admission (F2): every state retained within the span, a
 //       superseded digest evicted whole past it, the hard cap marks it
 //       incomplete.
+//   S18 review 2026-10-04 (O3): a history seeded later than the admissible
+//       span of a bin never decides FOREIGN for it (0), and `warm` is not set
+//       until the history reaches back over late tail + 1 + D_conf + A.
+//   S19 review 2026-10-04 (O1, O2): a node restarted while a digest was
+//       current rebuilds its states from the boot replay: a thief receipt on
+//       that digest is -1 there as on a node that never stopped, and both keep
+//       the cut that serves it HELD; an honest receipt on a pre-boot state is
+//       admitted (1) after the restart.
 //   S13 HOLD-ROUND-2 (B): a drain take that is the Delta at another dh is
 //       lane-prefix SKEW: AHEAD (parked) / BEHIND / LATE (dropped), never -1;
 //       a forged take or a thief template stays -1; the AHEAD share re-judges
@@ -71,6 +79,7 @@
 #include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
 #include "c2pool/v37/xmr/xmr_paynow.hpp"
 #include "c2pool/v37/xmr/relay/xmr_share_verdict.hpp"
+#include "c2pool/v37/xmr/xmr_cut_admission.hpp"   // review 2026-10-04: S19 (the served-order outcome)
 
 namespace x6   = ::v37::xmr::settle;
 namespace fee  = c2pool::v37n::xmr::fee;
@@ -1234,6 +1243,168 @@ void s17_retention() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// S18 (review 2026-10-04, O3): A LATE-SEEDED HISTORY. The committed test may
+// answer FOREIGN only when the history held here reaches back over every state
+// admissible for the bin (from the lane's first state, or from a state current
+// before bcut - A). A history whose oldest entry is later cannot tell an old
+// admissible root from a foreign one: 0. `warm` follows the same rule over the
+// whole span the lane order can still admit (late tail + 1 + D_conf + A).
+// ---------------------------------------------------------------------------
+void s18_late_seeded_history() {
+    std::printf("== S18. a late-seeded history never decides FOREIGN (review O3) ==\n");
+#if defined(C2POOL_XMR_RECEIPT_ADMISSION)
+    World w;
+    const st::OwedLedger L0 = w.L;              // the receipt's state D0
+    st::OwedLedger L1 = w.L; seed(L1, w.K2.id, 1000000000ll, 13);   // the next state D1
+    BuildOpts o; o.cut_payees = w.cut;
+    const Block b = build_block(L0, w.lane, o);
+    CHECK(b.ok, "an honest template on D0 builds: %s", b.ok ? "ok" : b.why.c_str());
+    if (!b.ok) return;
+    const Share sh = share_of(b);
+    const std::uint64_t bcut = kHeight - 1 - 60;
+    std::string why;
+    // D0 was current until bcut - 100 (age 100 <= A = 240: admissible). The late
+    // seed starts at D1 (since bcut - 100), the cursor has passed bcut.
+    {
+        rl::ShareStateStore n;
+        n.set_history(history({{&L1, bcut - 100}}, bcut + 10));   // warm = true, as a boot-seeded ring was marked
+        const int v = relay_verdict(n, sh, why);
+        CHECK(v == 0, "a history seeded at since bcut-100 (after the oldest admissible state of the bin): 0, never FOREIGN (%d %s)", v, why.c_str());
+    }
+    {
+        rl::ShareStateStore f;
+        f.set_history(history({{&L0, 0}, {&L1, bcut - 100}}, bcut + 10));   // from the lane's first state
+        auto e0 = state_entry(L0, w); e0->from_birth = true; f.put(e0);
+        const int v = relay_verdict(f, sh, why);
+        CHECK(v == 1, "(control) the full history from the lane's first state with D0 held: canonical (%d %s)", v, why.c_str());
+        rl::ShareStateStore g;
+        g.set_history(history({{&L1, 0}}, bcut + 10));   // reaches back, D0 never canonical here
+        const int vg = relay_verdict(g, sh, why);
+        CHECK(vg == rl::kShareVerdictForeign, "(control) a history from the lane's first state without D0: FOREIGN (%d %s)", vg, why.c_str());
+        rl::ShareStateStore d;
+        d.set_history(history({{&L1, bcut - 241}}, bcut + 10));   // seeded before bcut - A: reaches back
+        const int vd = relay_verdict(d, sh, why);
+        CHECK(vd == rl::kShareVerdictForeign, "(control) a history seeded at since bcut-241 (< bcut - A) without D0: FOREIGN (%d %s)", vd, why.c_str());
+    }
+#if defined(C2POOL_XMR_HISTORY_REACH)
+    {
+        const std::uint64_t span = rl::kLateTailBins + 1 + 60 + 240;
+        const auto late = history({{&L1, bcut - 100}}, bcut + 10);
+        const auto deep = history({{&L1, bcut + 10 - span - 1}}, bcut + 10);
+        const auto edge = history({{&L1, bcut + 10 - span}}, bcut + 10);
+        const auto first = history({{&L0, 0}, {&L1, bcut - 100}}, bcut + 10);
+        CHECK(!rl::committed_history_warm(*late, rl::kLateTailBins) && !rl::committed_history_warm(*edge, rl::kLateTailBins) &&
+              rl::committed_history_warm(*deep, rl::kLateTailBins) && rl::committed_history_warm(*first, rl::kLateTailBins),
+              "warm only when the history reaches back over late tail + 1 + D_conf + A = %llu heights (or from the lane's first state)",
+              (unsigned long long)span);
+    }
+#else
+    CHECK(false, "the base marks a boot-seeded history warm whatever its depth");
+#endif
+#else
+    CHECK(false, "no committed receipt test on the base");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// S19 (review 2026-10-04, O1 + O2): A RESTARTED NODE. A node that restarted
+// while digest D0 was current rebuilds every state of D0 from its boot replay
+// (XmrNode::boot_share_states -> relay::put_boot_states): D0 is held complete,
+// so a thief receipt on D0 is -1 there exactly as on a node that never
+// stopped, and the cut that serves it is HELD on both (never decided bad from
+// a served order). An honest receipt on a state current before the restart is
+// admitted after it.  Base: the restarted node holds only its live state, not
+// from its birth -> the thief receipt is 0 (missing) there and -1 (refused) on
+// the complete node, which decides the cut bad: two outcomes.
+// ---------------------------------------------------------------------------
+void s19_restarted_node() {
+    std::printf("== S19. a restarted node rebuilds its share states (review O1, O2) ==\n");
+#if defined(C2POOL_XMR_RECEIPT_ADMISSION) && defined(C2POOL_XMR_EMPTY_CUT)
+    namespace cutadm = c2pool::v37n::xmr::cutadm;
+    World w;
+    const st::OwedLedger L0 = w.L;              // D0
+    st::OwedLedger L1 = w.L; seed(L1, w.K2.id, 1000000000ll, 13);   // D1
+    const std::uint64_t bcut = kHeight - 1 - 60;
+    std::string why;
+    // the restarted node's store: the boot replay's states (fix) or its live state alone (base)
+    auto restarted = [&](std::vector<const st::OwedLedger*> boot, const st::OwedLedger& live) {
+        auto s = std::make_shared<rl::ShareStateStore>();
+#if defined(C2POOL_XMR_BOOT_SHARE_STATES)
+        std::vector<std::shared_ptr<rl::ShareStateEntry>> es;
+        for (const auto* L : boot) es.push_back(state_entry(*L, w));
+        rl::put_boot_states(*s, es, bcut, 0);
+        (void)live;
+#else
+        (void)boot;
+        auto e = state_entry(live, w); e->from_birth = live.ledger_seq() == 0;   // the base publisher at boot
+        s->put(e);
+#endif
+        return s;
+    };
+    // O1: a thief receipt on D0, the live digest at the restart
+    {
+        BuildOpts t; t.cut_payees = w.cut;
+        t.mutate = [&](x6::CoinbaseInputs& in) { for (auto& e : in.owed) { e.pay = w.thief.ref; e.identity = w.thief.id; } };
+        const Block tb = build_block(L0, w.lane, t);
+        CHECK(tb.ok, "O1 a thief template on D0 builds: %s", tb.ok ? "ok" : tb.why.c_str());
+        if (!tb.ok) return;
+        const Share ts = share_of(tb);
+        const auto h = history({{&L0, bcut}}, bcut);
+        rl::ShareStateStore full;
+        full.set_history(h);
+        auto ef = state_entry(L0, w); ef->from_birth = true; full.put(ef);
+        auto rs = restarted({&L0}, L0);
+        rs->set_history(h);
+        const int vf = relay_verdict(full, ts, why);
+        const std::string wf = why;
+        const int vr = relay_verdict(*rs, ts, why);
+        CHECK(vf == -1 && vr == -1, "O1 the thief receipt: -1 on the node that never stopped AND on the restarted node (%d / %d: %s | %s)",
+              vf, vr, wf.c_str(), why.c_str());
+        // the served order of a cut that carries it: 5 admitted + the thief receipt, the spine reproduced, every peer tried
+        auto outcome = [&](int v) {
+            cutadm::OrderInput in;
+            for (int i = 0; i < 5; ++i) in.receipts.push_back(cutadm::Served::Admitted);
+            in.receipts.push_back(v < 0 ? cutadm::Served::Refused : v == 1 ? cutadm::Served::Admitted : cutadm::Served::Missing);
+            in.spine_reproduced = true; in.every_peer_tried = true;
+            std::string cw;
+            const auto ov = cutadm::classify_served_order(in, &cw);
+            const std::string reason = ov == cutadm::OrderVerdict::Bad ? std::string(cutadm::kCutBadPrefix) + " " + cw
+                                     : ov == cutadm::OrderVerdict::Valid ? std::string() : "cut-pending: " + cw;
+            return cutadm::classify_own_cut(true, true, ov == cutadm::OrderVerdict::Valid, reason);
+        };
+        const auto of = outcome(vf), orr = outcome(vr);
+        CHECK(of == cutadm::OwnCut::Pending && orr == cutadm::OwnCut::Pending,
+              "O1 the cut holding it: HELD on both nodes, the same outcome (%s / %s)", cutadm::to_string(of), cutadm::to_string(orr));
+#if defined(C2POOL_XMR_BOOT_SHARE_STATES)
+        CHECK(rs->complete(L0.owed_digest()), "O2 the restarted node holds D0 complete (every state from the boot replay)");
+#else
+        CHECK(false, "O2 the base restarted node does not hold D0 complete");
+#endif
+    }
+    // O2: an honest receipt on D0 after the restart, D1 live
+    {
+        BuildOpts o; o.cut_payees = w.cut;
+        const Block b = build_block(L0, w.lane, o);
+        CHECK(b.ok, "O2 an honest template on D0 builds: %s", b.ok ? "ok" : b.why.c_str());
+        if (!b.ok) return;
+        const Share sh = share_of(b);
+        const auto h = history({{&L0, 0}, {&L1, bcut - 10}}, bcut + 5);   // D0 superseded 10 heights before bcut: admissible
+        rl::ShareStateStore full;
+        full.set_history(h);
+        auto e0 = state_entry(L0, w); e0->from_birth = true; full.put(e0);
+        auto e1 = state_entry(L1, w); e1->from_birth = true; e1->since = bcut - 10; full.put(e1);
+        auto rs = restarted({&L0, &L1}, L1);
+        rs->set_history(h);
+        const int vf = relay_verdict(full, sh, why);
+        const int vr = relay_verdict(*rs, sh, why);
+        CHECK(vf == 1 && vr == 1, "O2 an honest receipt on the pre-boot state D0: admitted (1) on both nodes (%d / %d: %s)", vf, vr, why.c_str());
+    }
+#else
+    CHECK(false, "no committed receipt test / no EMPTY-CUT header on the base");
+#endif
+}
+
 int main() {
     std::printf("v37_xmr_share_verdict_kat\n");
     s1_honest();
@@ -1253,6 +1424,8 @@ int main() {
     s15_unbased_prefix_mismatch();   // HOLD-ROUND-3 F4
     s16_committed_receipt_test();    // R1 receipt admission (F3-K5)
     s17_retention();                 // R1 receipt admission (F2)
+    s18_late_seeded_history();       // review 2026-10-04 (O3)
+    s19_restarted_node();            // review 2026-10-04 (O1, O2)
     std::printf("\n%d/%d checks passed -- %s\n", g_checks - g_fail, g_checks, g_fail ? "FAIL" : "ALL PASS");
     return g_fail ? 1 : 0;
 }

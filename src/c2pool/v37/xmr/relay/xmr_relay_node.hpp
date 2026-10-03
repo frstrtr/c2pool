@@ -425,6 +425,10 @@ struct RelayOptions {
     // share verdict). A cache only: a node without an entry re-fetches the
     // bytes and reaches the same verdict.
     std::size_t refused_memo_max = 65536;
+    // ★ review 2026-10-04 (O7): the R1 admission rule needs the share verdict
+    // (only verdict 1 admits). With this set, start() refuses to run a node
+    // whose verdict function was never installed (set_share_verdict).
+    bool        require_share_verdict = false;
     // ★ DROPS-HARDEN (d1): a pinned id still missing after drops_fetch_max_asks
     // asks is re-asked no more often than this (never forever at the fast rate)
     u32         drops_fetch_slow_ms = 60000;
@@ -698,6 +702,11 @@ public:
 
     // ── lifecycle ───────────────────────────────────────────────────────────
     bool start(std::string& why) {
+        if (m_o.require_share_verdict && !m_verdict) {   // review O7
+            why = "the receipt-admission rule is on and no share verdict is installed: every receipt would enter the lane "
+                  "order unchecked -- refusing to start";
+            return false;
+        }
         m_serve = std::make_unique<SupplyService>(m_vault, [this](PeerId p, const std::vector<u8>& f) { return m_net.send_to(p, f); });
         m_fetch = std::make_unique<SupplyRequester>([this](PeerId p, const std::vector<u8>& f) { return m_net.send_to(p, f); });
         {
@@ -1780,7 +1789,8 @@ public:
     // rounds and then dropped: R1 ADMISSION, nothing is admitted on anything
     // but 1), kShareVerdictForeign (refused under the committed test, no
     // strike), and the skew codes (xmr_relay_wire.hpp). Unset: no check (test
-    // rigs). Set before start().
+    // rigs only: with RelayOptions::require_share_verdict, start() refuses to
+    // run without it). Set before start().
     using VerdictFn = std::function<int(const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 coinbase_height, std::string& why)>;
     void set_share_verdict(VerdictFn f) { m_verdict = std::move(f); }
 

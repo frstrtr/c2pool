@@ -1856,6 +1856,13 @@ static int run_live(const XmrNodeConfig& cfg) {
                     static_cast<unsigned long long>(spec.height), static_cast<unsigned long long>(tip - spec.height),
                     static_cast<unsigned long long>(tip), static_cast<unsigned long long>(cfg.d_conf));
     }
+    // ★ review 2026-10-04 (O2): the boot replay keeps the share states the lane
+    // order can still need (late tail + 1 + A + D_conf), rebuilt below.
+    if (cfg.ledger_anchor_cut && cfg.ledger_empty_cut) {
+        const std::uint64_t a0 = g_recon_max_root_age == ~std::uint64_t{0}
+            ? c2pool::v37n::xmr::recon::default_max_root_age(cfg.d_conf) : g_recon_max_root_age;
+        if (a0) node.set_boot_share_span(c2pool::v37n::xmr::relay::kLateTailBins + 1 + a0 + cfg.d_conf);
+    }
     try {
         node.bring_up();
     } catch (const std::exception& e) {
@@ -2347,16 +2354,17 @@ static int run_live(const XmrNodeConfig& cfg) {
     };
     // ★ R1 RECEIPT ADMISSION (F3, xmr_cut_admission.hpp): a served order that
     // reaches the spine but carries a receipt refused here is a REFUSED VARIANT:
-    // its peer is set aside and the other ready peers are asked. `own_cut` (the
-    // booking's own cut under the empty_cut rule) turns "every ready peer tried,
-    // none served the spine without a refused receipt" into the decided-bad
-    // reason (cut-bad:); any other caller keeps it undecided.
-    std::map<std::string, c2pool::v37n::xmr::cutadm::OrderInput> relay_bad_variant;   // key -> the refused variant
-    std::map<std::string, std::string> relay_bad_decided;                              // key -> the cut-bad reason
-    std::uint64_t relay_refused_variants = 0, relay_cut_bad = 0;
+    // its peer is set aside and the cut stays HELD (cut-pending), as for an order
+    // that breaks the order rule or repeats an id. Review 2026-10-04 (D1/D2): no
+    // served order ever decides a cut bad (the spine does not bind receipt ids,
+    // and which peers hold the order is node-local), so `own_cut` changes
+    // nothing here; the EMPTY-CUT booking branch is reserved.
+    std::map<std::string, c2pool::v37n::xmr::cutadm::OrderInput> relay_bad_variant;   // key -> the refused variant (the reason only)
+    std::uint64_t relay_refused_variants = 0;
     auto relay_view = [&](std::uint64_t P, const ::v37::bytes32& spine, std::uint64_t hint, std::string& why, bool own_cut = false)
             -> std::shared_ptr<const c2pool::v37n::SettlementView> {
         namespace cutadm = c2pool::v37n::xmr::cutadm;
+        (void)own_cut;
         const std::string key = std::to_string(P) + ":" + hex_of(spine);
         if (auto it = replay_cache.find(key); it != replay_cache.end()) return it->second;
         if (const auto d = relay_node->digest_at(P); d && *d == spine && feed_log.size() >= P) {
@@ -2364,30 +2372,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             if (v) ++relay_own_replay;
             return v;
         }
-        if (own_cut) {
-            if (auto bd = relay_bad_decided.find(key); bd != relay_bad_decided.end()) { why = bd->second; return nullptr; }
-        }
         std::vector<::v37::bytes32> ids;
         const auto st = relay_node->repair_poll(P, spine, hint, &ids);
         if (st != relay::XmrRelayNode::RepairState::Ready) {
-            // R1 ADMISSION (F3): every ready peer tried after a refused variant -> decided bad
-            if (own_cut && st == relay::XmrRelayNode::RepairState::Exhausted) {
-                if (auto bv = relay_bad_variant.find(key); bv != relay_bad_variant.end()) {
-                    cutadm::OrderInput in = bv->second;
-                    in.every_peer_tried = true;
-                    std::string cw;
-                    if (cutadm::classify_served_order(in, &cw) == cutadm::OrderVerdict::Bad) {
-                        ++relay_cut_bad;
-                        why = std::string(cutadm::kCutBadPrefix) + " the winner-side order at P=" + std::to_string(P) + " spine=" +
-                              hex_of(spine).substr(0, 12) + " " + cw;
-                        relay_bad_decided[key] = why;
-                        std::printf("relay-cut-bad: P=%llu spine=%s… DECIDED BAD: %s -- the block books with no cut (EMPTY-CUT, the anchor stays)\n",
-                                    (unsigned long long)P, hex_of(spine).substr(0, 12).c_str(), cw.c_str());
-                        std::fflush(stdout);
-                        return nullptr;
-                    }
-                }
-            }
             ++cut_pending;
             // the stuck stage in words (FinalizeConnect prints it; past the retry
             // bound the block is HELD (RC-HOLD) -- an undecided repair never refuses)
@@ -2522,16 +2509,16 @@ static int run_live(const XmrNodeConfig& cfg) {
                                         &shadow_end, /*adopt_shadow=*/!any_refused);   // R1: a refused variant is never a base
         if (rv && any_refused) {
             // ★ R1 ADMISSION (F3): the order reaches the spine with a receipt refused
-            // here -- a REFUSED VARIANT. Never a view: its peer is set aside and the
-            // other ready peers are asked; the own-cut booking decides it bad once
-            // every ready peer was tried (above).
+            // here -- a REFUSED VARIANT. Never a view, never a decision: its peer is
+            // set aside, the other ready peers are asked, and the cut stays HELD
+            // (review 2026-10-04 D1/D2; no ban, no strike).
             order_in.spine_reproduced = true;
             std::string cw;
             (void)cutadm::classify_served_order(order_in, &cw);
             relay_bad_variant[key] = order_in;
             relay_node->repair_set_aside(P, spine);
             ++relay_refused_variants; ++cut_pending;
-            why = "cut-pending: the served order at P=" + std::to_string(P) + " reaches the spine but " + cw + " (serving peer set aside)";
+            why = "cut-pending: the served order at P=" + std::to_string(P) + " reaches the spine but " + cw;
             return nullptr;
         }
         if (rv) relay_node->note_alt_digests(relay_replayer.shadow_digests());
@@ -3568,10 +3555,84 @@ static int run_live(const XmrNodeConfig& cfg) {
         hist->cursor = cur;
         hist->d_conf = cfg.d_conf;
         hist->max_root_age = cba_max_root_age;
-        static constexpr std::size_t kShareHistWarmupK = 4;   // the block-level R-C warm-up depth (kReconWarmupK)
-        hist->warm = cba_ring_seeded || cba_ring.size() > kShareHistWarmupK;
+        // review 2026-10-04 (O3): warm only once the history reaches back over the
+        // whole span the lane order can still admit (late tail + 1 + D_conf + A),
+        // or from the lane's first state; committed_root_test re-checks it per bin.
+        hist->warm = c2pool::v37n::xmr::relay::committed_history_warm(*hist, relay::kLateTailBins);
         share_store->set_history(std::move(hist));
         share_hist_n = cba_ring.size(); share_hist_cursor = cur; share_hist_live = live;
+    };
+    // ★ review 2026-10-04 (O2): the share states of the boot replay. A restarted
+    // node publishes every state the replay kept (whole digests, so each is
+    // complete here) before its live state, so a receipt built on a state that
+    // was current before the restart is judged as on a node that never stopped.
+    // A state whose anchor view is not readable yet answers 0 and is retried on
+    // the relay tick (share_retry_boot_views).
+    std::vector<std::shared_ptr<ShareStateEntry>> share_boot_pending;
+    std::uint64_t share_boot_rebuilt = 0;
+    // Bounded: one round every 10 s, newest states first, at most 4 distinct
+    // anchors per round (each may poll a relay repair), 60 rounds in all; a
+    // state still without a view then simply stays undecided (verdict 0).
+    std::chrono::steady_clock::time_point share_boot_retry_at{};
+    unsigned share_boot_rounds = 0;
+    auto share_retry_boot_views = [&]() {
+        if (share_boot_pending.empty()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < share_boot_retry_at) return;
+        share_boot_retry_at = now + std::chrono::seconds(10);
+        if (++share_boot_rounds > 60) { share_boot_pending.clear(); return; }
+        bool any = false;
+        const std::uint64_t span = cba_max_root_age ? relay::kLateTailBins + 1 + cba_max_root_age : 0;
+        std::set<std::string> tried;   // anchors asked this round
+        for (std::size_t k = share_boot_pending.size(); k-- > 0;) {
+            const auto& cur = share_boot_pending[k];
+            const auto a = cur->ledger->anchor_cut();
+            const std::string ak = a ? std::to_string(a->next_pos) + ":" + hex_of(a->spine) : std::string("none");
+            if (!tried.count(ak) && tried.size() >= 4) continue;
+            tried.insert(ak);
+            std::string w;
+            const c2pool::v37n::xmr::credit::CreditCut none{};
+            auto e = std::make_shared<ShareStateEntry>(*cur);
+            const int c = credit_payees(none, *e->ledger, e->view_ratified, e->payees, w);
+            if (c == 0) continue;                      // still not readable: a later round
+            if (c == 1) {
+                e->has_view = true;
+                if (share_store->find_state(e->digest, e->ledger_seq)) { share_store->put(e, node.finalize_driver().cursor_height(), span); any = true; }
+            }
+            share_boot_pending.erase(share_boot_pending.begin() + static_cast<std::ptrdiff_t>(k));   // readable now, or decided unreadable
+        }
+        if (any && relay_node) relay_node->notify_share_state_advanced();
+    };
+    auto share_publish_boot = [&]() {
+        if (!cba_fx || !cba_scfg || !node.ledger().rules().anchor_cut || !node.ledger().rules().empty_cut) return;
+        const auto& bs = node.boot_share_states();
+        if (bs.empty()) return;
+        share_publish_history();
+        const std::uint64_t span = cba_max_root_age ? relay::kLateTailBins + 1 + cba_max_root_age : 0;
+        std::vector<std::shared_ptr<ShareStateEntry>> rebuilt;
+        rebuilt.reserve(bs.size());
+        for (const auto& b : bs) {
+            auto e = std::make_shared<ShareStateEntry>();
+            e->digest = b.digest; e->ledger_seq = b.ledger_seq; e->root = share_root_of(b.digest);
+            e->ledger = b.ledger;
+            e->refs = cba_fx->booked_map();
+            e->lane = lane_inputs_now();
+            e->lane.epoch_cur = b.ledger->epoch_cur();   // the epoch in force at THAT state
+            e->since = b.since;
+            e->has_view = false;   // the view at its anchor: share_retry_boot_views (bounded), never all at once
+            share_boot_pending.push_back(e);
+            rebuilt.push_back(std::move(e));
+        }
+        // every state of each kept digest (from_birth): held complete here
+        share_boot_rebuilt += c2pool::v37n::xmr::relay::put_boot_states(*share_store, rebuilt, node.finalize_driver().cursor_height(), span);
+        share_published_once = true; share_last_digest = bs.back().digest;
+        share_retry_boot_views();
+        const std::size_t viewed = bs.size() - share_boot_pending.size();
+        std::printf("share-states: %zu state(s) of the boot replay rebuilt (%zu with the view at their anchor, %zu pending; span %llu)\n",
+                    bs.size(), viewed, share_boot_pending.size(), static_cast<unsigned long long>(span));
+        std::fflush(stdout);
+        node.clear_boot_share_states();
+        if (relay_node) relay_node->notify_share_state_advanced();
     };
     share_publish = [&]() {
         if (!cba_fx || !cba_scfg || !node.ledger().rules().anchor_cut) return;
@@ -5223,6 +5284,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             ro.share_diff = cfg.stratum_share_diff;
             ro.bind = bind;
             ro.drops_floor_diff = drops_live ? drops->floor_diff() : 0;   // ★ DROPS: 0 = master's receiver
+            ro.require_share_verdict = cfg.ledger_anchor_cut && cfg.ledger_empty_cut;   // review O7: no start without the verdict
             if (drops_live && g_drops_retain_bins) ro.drops_retain_bins = g_drops_retain_bins;   // ★ DROPS-HARDEN
             if (drops_live && g_drops_store_bytes) ro.drops_store_bytes = g_drops_store_bytes;   // ★ DROPS-RETAIN (L1)
             if (drops_live && g_drops_store_persist) {   // ★ DROPS-HARDEN (d4): <settle_db>/lane<N>.drops, next to lane<N>.shadow
@@ -5430,6 +5492,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                                                    std::uint64_t cb_h, std::string& why) {
                     return c2pool::v37n::xmr::relay::share_verdict(*st, r, pb, cb_h, why);
                 });
+                share_publish_boot();   // review O2: the boot replay's states first, oldest first
                 if (share_publish) share_publish();
                 std::printf("relay: share-level canonical coinbase check ON (a share must pay the canonical lane coinbase)\n");
             }
@@ -5767,6 +5830,7 @@ static int run_live(const XmrNodeConfig& cfg) {
             // Per-loop (main thread): chain view, admitted -> lane, bin closing, block-won.
             relay_tick = [&]() {
                 if (share_publish) share_publish();   // SHARE-LEVEL: retry a view at the anchor that was pending
+                share_retry_boot_views();             // review O2: the rebuilt states' views too
                 {
                     const auto t = provider.current();
                     if (t.valid) {

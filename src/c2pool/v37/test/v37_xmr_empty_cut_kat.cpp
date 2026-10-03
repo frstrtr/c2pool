@@ -22,29 +22,31 @@
 // receipt test (relay::committed_root_test); the DROPS harvest range from
 // ChainOrderedHarvest::walk_prev_lane / range_with.
 //
-//   E1 (F3-K1, REVIEW K5) honest receipts survive: finder X's cut B covers the
-//      honest r1..r5 and one refused receipt t; three nodes book B EMPTY-CUT,
-//      the anchor stays; the next honest block C's cut covers r1..r6 and
-//      becomes the anchor on all three; its view credits r1..r6 and pays t's
-//      key 0.                (base: B's cut is anchored with t, its key paid)
-//   E2 (F3-K2) the finder <= solo: the anchor in force right after FINALIZE(B)
-//      and the next three honest anchors credit the key t paid 0 piconero.
-//                                                        (base: > 0)
-//   E3 (F3-K3) no indefinite hold: the decided-bad cut books at the next held
-//      retry past the bound; held_now 0, the cursor passes h + D_conf.
-//                                                        (base: HELD forever)
-//   E4 (F3-K4) identical booking: the served order reaching node 1 at attempt
-//      5, node 2 500 ticks past the retry bound, node 3 after a restart (its
-//      verdict from the boot-seeded committed history alone): one owed_digest
-//      and one anchor at FINALIZE(C).  (base: nodes 1-2 HOLD B, the restarted
-//      node 3 answers 0 for t and anchors B's cut)
+//   REVIEW 2026-10-04 (D1/D2): a served order never decides a cut. A cut whose
+//   served order carries a refused receipt keeps its peer set aside and stays
+//   HELD on every node; the EMPTY-CUT booking branch is RESERVED (E7 pins the
+//   branch itself). E1-E4 are re-pinned to that rule:
+//   E1 a cut B that carries the refused receipt t: HELD on all three nodes, no
+//      node books it, none anchors B's cut; the honest anchor view at C would
+//      credit r1..r6 and pay t's key 0.     (ed4712059: B booked EMPTY-CUT)
+//   E2 (F3-K2) the finder <= solo: the anchor in force after B and the next
+//      three honest anchors credit the key t paid 0 piconero.
+//   E3 no decision past the bound: B HELD (held_now 1), never booked.
+//                                         (ed4712059: decided bad and booked)
+//   E4 one outcome whatever the arrival tick or a restart: the three nodes hold
+//      B alike, one owed_digest.          (ed4712059: booked EMPTY-CUT)
 //   E5 (F3-K6) withheld stays held, loudly: an order no peer serves is HELD,
 //      withheld_cut_held 1, refused 0.                   (base: no counter)
 //   E6 (F3-K7) the DROPS range is carried: the next decided block's harvest
 //      range reaches back over the EMPTY-CUT block and harvests its raindrops.
 //   E7 (F3-K9) money independent of the cut: credit, payout, balances and the
 //      lane height equal a decided-valid booking at the same anchor; only V37A
-//      (the anchor) differs.
+//      (the anchor) differs. (The RESERVED branch, driven directly.)
+//   E8 (review 2026-10-04, O2) a REAL restart: an XmrNode reopened on the same
+//      store rebuilds, from its boot replay, every share state of each digest
+//      within the span, each a frozen ledger at exactly its (digest, seq), the
+//      live state last; published, each digest is held complete.
+//                                         (ed4712059: nothing rebuilt)
 // ---------------------------------------------------------------------------
 #include <unistd.h>
 
@@ -245,12 +247,14 @@ void run(const std::filesystem::path& tmp) {
                 (unsigned long long)n1.anchor.next_pos, hx6(n1.digest).c_str(), (unsigned long long)n1.cursor);
     std::printf("  n2: booked_b=%llu attempts=%llu held_max=%llu | n3: booked_b=%llu\n", (unsigned long long)n2.booked_b,
                 (unsigned long long)n2.attempts_b, (unsigned long long)n2.held_max, (unsigned long long)n3.booked_b);
-    check("E1 (F3-K1) B booked with NO cut on all three nodes (EMPTY-CUT), none refused",
-          n1.booked_b == 1 && n2.booked_b == 1 && n3.booked_b == 1 && n1.b_cut_none && n2.b_cut_none && n3.b_cut_none &&
-          n1.refused == 0 && n2.refused == 0 && n3.refused == 0);
-    check("E1 the anchor after FINALIZE(C) is C's honest cut on all three (B never anchored)",
-          n1.anchored && n1.anchor.next_pos == cutC.next_pos && n1.anchor.spine == cutC.spine &&
-          n2.anchored && n2.anchor.spine == cutC.spine && n3.anchored && n3.anchor.spine == cutC.spine);
+    check("E1 B (its served order carries the refused t) is HELD on all three nodes: never booked, none refused",
+          n1.booked_b == 0 && n2.booked_b == 0 && n3.booked_b == 0 && n1.held_end == 1 && n2.held_end == 1 && n3.held_end == 1 &&
+          n1.refused == 0 && n2.refused == 0 && n3.refused == 0,
+          "booked " + std::to_string(n1.booked_b) + "/" + std::to_string(n2.booked_b) + "/" + std::to_string(n3.booked_b) +
+          " held " + std::to_string(n1.held_end) + "/" + std::to_string(n2.held_end) + "/" + std::to_string(n3.held_end));
+    check("E1 no node anchors B's cut (the cut with t)",
+          !(n1.anchored && n1.anchor.spine == cutB.spine) && !(n2.anchored && n2.anchor.spine == cutB.spine) &&
+          !(n3.anchored && n3.anchor.spine == cutB.spine));
     {
         long long sum_r = 0; bool all_paid = true;
         for (int i = 0; i < 6; ++i) { const long long p = paid_at(honest, cutC.next_pos, cutC.spine, r[static_cast<std::size_t>(i)]); sum_r += p; all_paid = all_paid && p > 0; }
@@ -260,9 +264,9 @@ void run(const std::filesystem::path& tmp) {
         const long long pt_b = paid_at(finder, cutB.next_pos, cutB.spine, T);
         check("E1 (control) had B's cut been anchored, t's key would be paid " + std::to_string(pt_b), pt_b > 0);
     }
-    check("E4 (F3-K4) one owed_digest and one anchor on all three at FINALIZE(C) (arrival tick and restart do not matter)",
-          n1.digest == n2.digest && n2.digest == n3.digest && n1.anchored && n2.anchored && n3.anchored &&
-          n1.cursor >= kHC && n2.cursor >= kHC && n3.cursor >= kHC,
+    check("E4 one outcome on all three (arrival tick and restart do not matter): B HELD alike, one owed_digest, one cursor",
+          n1.digest == n2.digest && n2.digest == n3.digest && n1.anchored == n2.anchored && n2.anchored == n3.anchored &&
+          n1.cursor == n2.cursor && n2.cursor == n3.cursor,
           hx6(n1.digest) + " / " + hx6(n2.digest) + " / " + hx6(n3.digest));
     // E2: the anchor in force right after FINALIZE(B), then three more honest anchors: t's key paid 0 at each
     {
@@ -284,9 +288,9 @@ void run(const std::filesystem::path& tmp) {
     {
         Served sv; sv.t_verdict = t_verdict; sv.ready_at = kRetryBound + 10;
         const auto n = run_node(tmp, "k3", sv, cutB, cutC, 80);
-        check("E3 (F3-K3) past the bound B was HELD (held_max 1), then decided bad and BOOKED: held_now 0, the cursor passed h + D_conf",
-              n.held_max == 1 && n.held_end == 0 && n.booked_b == 1 && n.cursor >= kHB + kDconf,
-              "held_max " + std::to_string(n.held_max) + " held_end " + std::to_string(n.held_end) + " cursor " + std::to_string(n.cursor));
+        check("E3 past the bound B is HELD (held_now 1) and never booked: a served order with a refused receipt decides nothing",
+              n.held_max == 1 && n.held_end == 1 && n.booked_b == 0 && n.refused == 0,
+              "held_max " + std::to_string(n.held_max) + " held_end " + std::to_string(n.held_end) + " booked " + std::to_string(n.booked_b));
     }
     // ── E5 (F3-K6): withheld stays held, loudly ────────────────────────────
     {
@@ -354,6 +358,67 @@ void run(const std::filesystem::path& tmp) {
               Lv.anchor_cut() && Lv.anchor_cut()->spine == cutB.spine && !Le.anchor_cut() && Lv.owed_digest() != Le.owed_digest());
 #else
         check("E7 (F3-K9) no EMPTY-CUT booking on the base (a decided-bad cut never books)", false);
+#endif
+    }
+
+    // ── E8 (review O2): a REAL restart rebuilds the share states ──────────
+    {
+        Served sv; sv.t_verdict = 1; sv.ready_at = 1;   // B and C book: FOUND / FINALIZE events in the store
+        const auto live = run_node(tmp, "k8", sv, cutB, cutC, 80);
+        check("E8 the first run books B and C (the store holds their events)", live.booked_b == 1 && live.cursor >= kHC);
+        using namespace c2pool::v37n::xmr;
+        XmrNodeConfig c; c.network = MoneroNetwork::Stagenet; c.lane_chain = kChain; c.d_conf = kDconf;
+        c.ledger_anchor_cut = true;
+#if defined(C2POOL_XMR_EMPTY_CUT)
+        c.ledger_empty_cut = true;
+#endif
+        c.settle_db_path = (tmp / "store-k8").string();
+        c2pool::xmr::node::MockMonerodTransport mock;
+        XmrNode node(c, mock, &smoke::test_point_check);
+#if defined(C2POOL_XMR_BOOT_SHARE_STATES)
+        node.set_boot_share_span(1000);
+#endif
+        try { node.bring_up(); } catch (const std::exception& e) { check("E8 restart bring_up", false, e.what()); return; }
+        check("E8 the restarted node replays to the same owed_digest", node.ledger().owed_digest() == live.digest);
+        auto store = std::make_shared<rl::ShareStateStore>();
+        std::size_t n_states = 0, digests = 0, exact = 0;
+        ::v37::bytes32 last{}; std::uint64_t last_seq = 0;
+#if defined(C2POOL_XMR_BOOT_SHARE_STATES)
+        {
+            std::vector<std::shared_ptr<rl::ShareStateEntry>> es;
+            std::set<::v37::bytes32> ds;
+            for (const auto& b : node.boot_share_states()) {
+                auto e = std::make_shared<rl::ShareStateEntry>();
+                e->digest = b.digest; e->ledger_seq = b.ledger_seq; e->since = b.since; e->ledger = b.ledger;
+                if (b.ledger && b.ledger->owed_digest() == b.digest && b.ledger->ledger_seq() == b.ledger_seq) ++exact;
+                ds.insert(b.digest);
+                es.push_back(e);
+                last = b.digest; last_seq = b.ledger_seq;
+            }
+            n_states = es.size(); digests = ds.size();
+            rl::put_boot_states(*store, es, node.finalize_driver().cursor_height(), 0);
+        }
+#else
+        {   // ed4712059: the restarted node publishes its live state only, from_birth = (seq == 0)
+            auto e = std::make_shared<rl::ShareStateEntry>();
+            e->digest = node.ledger().owed_digest(); e->ledger_seq = node.ledger().ledger_seq();
+            e->from_birth = e->ledger_seq == 0;
+            store->put(e);
+        }
+#endif
+        std::printf("  E8: %zu state(s) rebuilt over %zu digest(s), %zu exact; last seq %llu (live seq %llu)\n", n_states, digests, exact,
+                    (unsigned long long)last_seq, (unsigned long long)node.ledger().ledger_seq());
+        check("E8 every share state of the boot replay rebuilt: >= 2 digests, each copy at exactly its (digest, seq), the live state last",
+              n_states >= 2 && digests >= 2 && exact == n_states && last == node.ledger().owed_digest() && last_seq == node.ledger().ledger_seq());
+        bool all_complete = digests >= 2;
+#if defined(C2POOL_XMR_BOOT_SHARE_STATES)
+        for (const auto& b : node.boot_share_states()) all_complete = all_complete && store->complete(b.digest);
+#else
+        all_complete = false;
+#endif
+        check("E8 published, every rebuilt digest (the live one and those before the restart) is held complete", all_complete);
+#if defined(C2POOL_XMR_BOOT_SHARE_STATES)
+        node.clear_boot_share_states();
 #endif
     }
 }
