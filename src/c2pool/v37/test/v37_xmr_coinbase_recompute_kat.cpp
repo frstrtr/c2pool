@@ -35,7 +35,11 @@
 //       (the receiver's cursor has moved on): MISMATCH.
 //   R11 the booking of a MISMATCH (ruling 2) on two receivers: payouts
 //       debited, credit dropped, one owed_digest, the double pay carried as
-//       a debt.
+//       a debt. R11b (G9 review O6, lane rule 31 noncanon_net): the debit is
+//       net of each key's window credit at the cut, so the fairly paid cut
+//       payees owe nothing (EO 0, one negative row: K1's); rule off = every
+//       payout debited. R11d: the settle-store replay carries the NET map.
+//   R11c an overpaid window key owes exactly the excess above its credit.
 //   R12 ruling 1: --coinbase v37 on mainnet refuses without --fee-model v1.
 //   R13 booked refs: a payee ref one node learned out of band never changes
 //       the verdict (the fork hazard of the full resolver, shown).
@@ -463,10 +467,36 @@ void r10_stale_state() {
           "recompute: %s -- %s", verdict(v), v.r.why.c_str());
 }
 
+// G9 review O6 (lane rule 31 noncanon_net): what book_from_chain_ex books for
+// a decided Mismatch. E = the window credit at the block's own cut folded at
+// its total (fold_eb's exact split, key-aggregated: the map the booking holds
+// before the verdict); the debit = each payout net of E under the rule
+// (paynow::debit_only_booking), the gross on-chain map on a tree without it.
+Amounts fold_at_total(std::uint64_t total, const std::vector<Payee>& cut) {
+    const auto wp = weighted(cut);
+    const auto a = st::split_reward(total, wp);
+    Amounts m;
+    for (std::size_t i = 0; i < wp.size(); ++i) if (a[i]) m[wp[i].key] += static_cast<long long>(a[i]);
+    return m;
+}
+Amounts mismatch_debit(const auth::CoinbaseBooking& bk, const std::vector<Payee>& cut, bool noncanon_net = true) {
+#if defined(C2POOL_XMR_NONCANON_NET)
+    return pn::debit_only_booking(noncanon_net, fold_at_total(bk.total, cut), bk.payout).payout;
+#else
+    (void)cut; (void)noncanon_net;
+    return bk.payout;   // no rule: the whole on-chain payout is the debit
+#endif
+}
+
 // R11: the booking outcome of a non-canonical block (ruling 2) on two
 // receivers: payouts DEBITED, credit DROPPED, the same owed_digest on both,
 // and the double-paid key carried as a debt (forward repair, never a
 // clawback), not forgotten.
+// R11b (G9 review O6, lane rule 31 noncanon_net): the cut payees the block
+// paid their pay-now (at most their window credit at its cut) owe NOTHING
+// after FINALIZE: EO 0, no negative row; only K1's double payment is a row.
+// R11d: the settle-store journal carries the NET map; a replay rebuilds the
+// same pending row and the same owed_digest.
 void r11_debit_only_booking() {
     std::printf("== R11. booking a non-canonical block: debit payouts, drop credit ==\n");
     World w;
@@ -479,18 +509,116 @@ void r11_debit_only_booking() {
     const auto v1 = receive(b, R1, w.lane, w.cut), v2 = receive(b, R2, w.lane, w.cut);
     CHECK(v1.r.verdict == rc::Verdict::Mismatch && v2.r.verdict == rc::Verdict::Mismatch && v1.r.why == v2.r.why,
           "both receivers reach the same verdict: %s", v1.r.why.c_str());
-    // what book_from_chain_ex books on a mismatch: FOUND(credit = {}, payout = the gross on-chain map)
+    const Amounts E = fold_at_total(v1.bk.total, w.cut);
+    bool within = true;
+    for (const auto& p : w.cut) {
+        const long long paid = v1.bk.payout.count(p.id) ? v1.bk.payout.at(p.id) : 0;
+        if (paid <= 0 || paid > (E.count(p.id) ? E.at(p.id) : 0)) within = false;
+    }
+    CHECK(within, "precondition: the block paid every cut payee a pay-now within its window credit at the cut (E_b at the total)");
+    // what book_from_chain_ex books on a mismatch: FOUND(credit = {}, payout = the debit)
+    const Amounts debit = mismatch_debit(v1.bk, w.cut);
     for (st::OwedLedger* L : {&R1, &R2}) {
-        L->on_block_found("B", Amounts{}, v1.bk.payout);
+        L->on_block_found("B", Amounts{}, debit);
         L->on_block_finalized("A", 50);
         L->on_block_finalized("B", 51);
     }
     CHECK(R1.owed_digest() == R2.owed_digest(), "the same owed_digest on both receivers after FINALIZE");
     const long long k1 = R1.effective_owed(w.K1.id);
     CHECK(k1 == -40000000000ll, "K1 carries the double payment as a debt (EffectiveOwed %lld): forward repair, never forgotten", k1);
-    long long credited = 0;
-    for (const auto& p : w.cut) credited += R1.effective_owed(p.id) + (v1.bk.payout.count(p.id) ? v1.bk.payout.at(p.id) : 0);
-    CHECK(credited == 0, "the block's credit is DROPPED: its cut payees are debited exactly the pay-now they received (net %lld)", credited);
+    CHECK(R1.effective_owed(w.K2.id) == 0, "K2, paid exactly what it was owed, owes nothing (EffectiveOwed %lld)", R1.effective_owed(w.K2.id));
+    bool cut_zero = true;
+    std::string eos;
+    for (const auto& p : w.cut) { const long long e = R1.effective_owed(p.id); eos += " " + std::to_string(e); if (e != 0) cut_zero = false; }
+    CHECK(cut_zero, "R11b the block's credit is DROPPED and its fairly paid cut payees owe NOTHING: EffectiveOwed 0 each (got%s)", eos.c_str());
+    const auto hl = R1.health();
+    CHECK(hl.negative_rows == 1 && hl.min_row == -40000000000ll && hl.min_key == w.K1.id,
+          "R11b exactly one negative row, K1's double payment (negative_rows %zu, min_row %lld)", hl.negative_rows, hl.min_row);
+    // rule off (lane rule 31 = 0): the booking as shipped before it, every payout debited
+    {
+        st::OwedLedger R0 = R;
+        const auto v0 = receive(b, R0, w.lane, w.cut);
+#if defined(C2POOL_XMR_NONCANON_NET)
+        R0.on_block_found("B", Amounts{}, mismatch_debit(v0.bk, w.cut, /*noncanon_net=*/false));
+#else
+        R0.on_block_found("B", Amounts{}, v0.bk.payout);
+#endif
+        R0.on_block_finalized("A", 50); R0.on_block_finalized("B", 51);
+        long long credited = 0;
+        for (const auto& p : w.cut) credited += R0.effective_owed(p.id) + (v0.bk.payout.count(p.id) ? v0.bk.payout.at(p.id) : 0);
+        CHECK(credited == 0 && R0.health().negative_rows == 1 + w.cut.size(),
+              "rule off: every cut payee is debited exactly the pay-now it received (net %lld, %zu negative rows)", credited, R0.health().negative_rows);
+    }
+    // R11d: the settle store journals the booked maps; a replay rebuilds the same ledger
+    {
+        namespace xs = c2pool::v37n::xmr;
+        xs::MemSettleStore store;
+        st::OwedLedger D(kChain);
+        st::SettleHW hw;
+        xs::XmrFinalizeDriver drv(D, hw, store, kChain, 2, 0, 0, [](std::uint64_t, const std::string&) { return true; });
+        xs::FoundBlock s1; s1.bid = "5eed01"; s1.height = 1; s1.credit = {{w.K1.id, 40000000000ll}};
+        xs::FoundBlock s2; s2.bid = "5eed02"; s2.height = 2; s2.credit = {{w.K2.id, 25000000000ll}};
+        drv.on_block_found(s1); drv.on_block_found(s2);
+        (void)drv.advance_to_tip(5, ::v37::bytes32{});   // the seeds finalize (height + D_conf 2 <= 5)
+        xs::FoundBlock fa; fa.bid = "aa0a"; fa.height = 10; fa.payout = {{w.K1.id, 40000000000ll}};
+        xs::FoundBlock fb; fb.bid = "aa0b"; fb.height = 11; fb.payout = debit;
+        drv.on_block_found(fa); drv.on_block_found(fb);
+        st::OwedLedger D2(kChain);
+        bool ok = false;
+        xs::RecoveryDriver(store, kChain).recover(D2, ok);
+        long long want_pending = 40000000000ll;
+        for (const auto& [k, v] : v1.bk.payout) {
+            const long long e = E.count(k) ? std::max<long long>(E.at(k), 0) : 0;
+            want_pending += v - std::min(e, v);   // the NET map, computed here from its definition
+        }
+        bool cut_pending_zero = true;
+        for (const auto& p : w.cut) if (D2.effective_owed(p.id) != 0) cut_pending_zero = false;
+        CHECK(ok && D2.owed_digest() == D.owed_digest() && D2.owed_event_mmr_root() == D.owed_event_mmr_root() &&
+              D2.health().pending_payout == want_pending && D.health().pending_payout == want_pending && cut_pending_zero &&
+              D2.effective_owed(w.K1.id) == -40000000000ll,
+              "R11d the journal replay rebuilds the same owed_digest and the pending row of the NET map (pending payout %lld, want %lld; "
+              "cut payees' EffectiveOwed 0 while pending)", D2.health().pending_payout, want_pending);
+    }
+}
+
+// R11c (G9 review O6, lane rule 31 noncanon_net): a builder that pays a window
+// key W its window credit E_b(W) plus X (taken from another window key V) is a
+// Mismatch; W owes exactly X after FINALIZE -- not E_b(W) + X (the whole
+// payout), not 0 -- and V, paid less than its credit, owes nothing.
+void r11c_overpaid_window_key() {
+    std::printf("== R11c. an overpayment above the window credit is still a debt, exactly the excess ==\n");
+    Lane lane;
+    std::vector<Payee> cut = {payee(11, 1), payee(12, 2), payee(13, 3)};
+    for (const auto& p : cut) lane.learn(p);
+    st::OwedLedger L{kChain};                      // no owed balance: the pay-now pool is the whole total
+    const ::v37::bytes32 W = cut[2].id, V = cut[0].id;
+    const long long X = 7000000000ll;              // 0.007 XMR moved from V to W
+    BuildOpts o; o.cut_payees = cut;
+    o.mutate = [W, V, X](x6::CoinbaseInputs& in) {
+        auto orig = in.paynow_at;
+        in.paynow_at = [orig, W, V, X](std::uint64_t budget) {
+            auto v = orig(budget);
+            for (auto& e : v) {
+                if (e.identity == W) e.eb += static_cast<std::uint64_t>(X);
+                else if (e.identity == V) e.eb -= static_cast<std::uint64_t>(X);
+            }
+            return v;
+        };
+    };
+    const Block b = build_block(L, lane, o);
+    if (!b.ok) { CHECK(false, "builds: %s", b.why.c_str()); return; }
+    st::OwedLedger R = L;
+    const auto v = receive(b, R, lane, cut);
+    CHECK(v.r.verdict == rc::Verdict::Mismatch, "recompute: %s -- %s", verdict(v), v.r.why.c_str());
+    const Amounts E = fold_at_total(v.bk.total, cut);
+    const long long pw = v.bk.payout.count(W) ? v.bk.payout.at(W) : 0, ew = E.count(W) ? E.at(W) : 0;
+    CHECK(pw == ew + X, "the block paid W its window credit plus X (paid %lld, E_b %lld, X %lld)", pw, ew, X);
+    R.on_block_found("B", Amounts{}, mismatch_debit(v.bk, cut));
+    R.on_block_finalized("B", 60);
+    CHECK(R.effective_owed(W) == -X, "W owes exactly the excess X (EffectiveOwed %lld, want %lld; the whole payout would be %lld)",
+          R.effective_owed(W), -X, -pw);
+    CHECK(R.effective_owed(V) == 0 && R.effective_owed(cut[1].id) == 0 && R.health().negative_rows == 1,
+          "V (paid below its credit) and the fairly paid key owe nothing: one negative row (%zu)", R.health().negative_rows);
 }
 
 // R12: ruling 1 -- fee model v1 is mandatory for --coinbase v37 on mainnet
@@ -845,6 +973,7 @@ int main() {
     r9_paynow_misdirected();
     r10_stale_state();
     r11_debit_only_booking();
+    r11c_overpaid_window_key();
     r12_fee_model_mandatory();
     r13_booked_refs();
     r14_paynow_refs_from_view();

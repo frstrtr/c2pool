@@ -83,6 +83,7 @@ inline LaneRules lane_rules_of(const XmrNodeConfig& c, const LaneRulesInputs& in
     r.enrol_digest       = in.enrol_digest;
     r.spend_floor        = in.spend_floor ? 1 : 0;
     r.empty_cut          = c.ledger_empty_cut ? 1 : 0;   // R1 RECEIPT ADMISSION
+    r.noncanon_net       = c.ledger_noncanon_net ? 1 : 0;   // G9 O6: a Mismatch books the debit net of the window credit
     return r;
 }
 
@@ -100,6 +101,7 @@ inline ::c2pool::v37n::settle::OwedLedgerRules owed_rules_of(const LaneRules& r,
     o.decay_half_life   = r.decay_half_life;
     o.anchor_cut        = r.anchor_cut != 0;
     o.empty_cut         = r.anchor_cut != 0 && r.empty_cut != 0;   // R1: rides the anchor rule
+    o.noncanon_net      = r.noncanon_net != 0;                     // G9 O6: the debit-only net booking
     o.merkle_rows       = r.merkle_rows != 0;
     o.drops_due         = (r.drops_rule & ::c2pool::v37n::xmr::relay::kDropsRuleDue) != 0;
     o.raindrop_enrol    = (r.drops_rule & ::c2pool::v37n::xmr::relay::kDropsRuleRaindropEnrol) != 0;

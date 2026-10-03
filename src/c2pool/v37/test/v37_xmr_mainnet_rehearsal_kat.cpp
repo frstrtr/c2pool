@@ -22,7 +22,11 @@
 //                  its BOOKED refs;
 //   canonical      FOUND(E_b at the cut net of pay-now, payout net of pay-now)
 //                  exactly as paynow_net books it;
-//   mismatch       FOUND(credit = {}, payout = the gross on-chain map);
+//   mismatch       FOUND(credit = {}, payout = the debit): the on-chain map
+//                  net of each key's window credit at the cut folded at the
+//                  total under lane rule 31 noncanon_net (the daemon's
+//                  settlement config; paynow::debit_only_booking), the gross
+//                  map without it;
 //   booked refs    learned only after the booking succeeds.
 //
 // Builders rotate over the three nodes. Owed seeds (lane config, identical on
@@ -45,6 +49,11 @@
 //       ledger due, a J = 0 share miner never goes negative (the clamp writes
 //       the rest off), conservation holds; M12b: a builder that omits or
 //       doubles the due is a MISMATCH on every node.
+//   M-O6 (G9 review O6, lane rule 31 noncanon_net) under the drain rule: a
+//       SKIP-DRAIN block (no owed pass, the window paid its E_b(R)) leaves no
+//       negative row and every window key at 0; a SELF-TAKE block (the window
+//       paid E_b(P), Delta to a key outside the window) leaves exactly one
+//       negative row, -Delta; rule off: every key either block paid is a row.
 //   M5  the booking-point gate: a template is served only at cursor
 //       T - 1 - D_conf (recon::builder_cut), and mainnet refuses
 //       --coinbase v37 without --fee-model v1.
@@ -168,6 +177,13 @@ std::function<st::DropsWindow(std::uint64_t)> g_window;
 using EnrolAdd = std::map<::v37::bytes32, std::pair<std::uint64_t, ::v37::ScriptRef>>;   // key -> (eff, ref)
 struct EnrolOut { Amounts deposit; EnrolAdd add; st::DropsWindow win; };
 std::function<EnrolOut(const st::OwedLedger&, std::uint64_t)> g_compose;
+// M-O6 (G9 review O6): lane rule 31 noncanon_net on the nodes' ledgers (the
+// daemon's settlement config turns it on), a skip-drain builder and a
+// self-take builder (Delta to the given key; the Delta it took is recorded).
+bool g_noncanon_net = true;
+std::set<std::uint64_t> g_skipdrain_at;
+std::map<std::uint64_t, ::v37::bytes32> g_selftake_at;
+std::uint64_t g_selftake_took = 0;
 std::uint64_t g_leave_at = 0;                   // M10: tiny miners with an even index stop mining after this height   // M9: a lane block at this height is booked by nodes 0 and 1, then reorged out   // M8: the block at g_cap_at is built with this output cap
 
 struct LaneWorld {
@@ -343,8 +359,13 @@ Booked book(Node& n, const Block& b, const LaneWorld& W, std::uint64_t h, const 
     const auto res = rc::verify_lane_coinbase(b.blob, bk, n.L, pay_of_map(n.booked), li, ci);
     r.v = res.verdict; r.why = res.why;
     n.history.push_back(n.L);
-    if (res.verdict == rc::Verdict::Mismatch) {
-        r.payout = bk.payout;                                           // DEBITED, credit DROPPED
+    if (res.verdict == rc::Verdict::Mismatch) {                         // DEBITED, credit DROPPED
+#if defined(C2POOL_XMR_NONCANON_NET)
+        // G9 O6 (lane rule 31): the debit net of the window credit at the cut folded at the total
+        r.payout = pn::debit_only_booking(n.L.rules().noncanon_net, fold(bk.total, win_input(n.L, pv)), bk.payout).payout;
+#else
+        r.payout = bk.payout;
+#endif
     } else if (res.verdict == rc::Verdict::Canonical) {
         // THE DRAIN RULE (D7): the window is booked at P, where the canonical coinbase split it
         r.credit = fold(res.drain_on ? res.split_at : bk.total, win_input(n.L, pv));   // DROPS WINDOW: + the window at the anchor
@@ -439,6 +460,9 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
 #endif
         if (g_drops_window) rules.drops_window = kRehearsalWindow;   // A4b: the daemon turns it on with the due
         rules.lane_height = rules.decay_from_gross = g_drain.on();   // THE DRAIN RULE's ledger bits
+#if defined(C2POOL_XMR_NONCANON_NET)
+        rules.noncanon_net = g_noncanon_net;   // G9 O6: lane rule 31 (the daemon's settlement config)
+#endif
         for (auto& n : run.nodes) n.L = st::OwedLedger(kChain, rules);
     }
     if (g_late_node >= 0) run.nodes[static_cast<std::size_t>(g_late_node)].late = true;
@@ -492,6 +516,19 @@ Run simulate(const LaneWorld& W, std::uint64_t H, std::set<std::uint64_t> lag_at
                         e.first_eligible = in.owed.size(); in.owed.push_back(e);
                     }
                 };
+            if (g_skipdrain_at.count(h))   // M-O6: no owed pass, the window paid its E_b(R) (P = R)
+                mut = [](x6::CoinbaseInputs& in) { in.owed.clear(); in.owed_dust.clear(); in.drain_budget = 0; };
+            if (const auto st_ = g_selftake_at.find(h); st_ != g_selftake_at.end()) {   // M-O6: Delta to one key, the window E_b(P)
+                const ::v37::bytes32 k = st_->second;
+                const ::v37::ScriptRef ref = W.universe.at(k);
+                mut = [k, ref](x6::CoinbaseInputs& in) {
+                    const std::uint64_t D = in.drain_budget;
+                    g_selftake_took = D;
+                    in.owed.clear(); in.owed_dust.clear();
+                    x6::OwedEntry e; e.identity = k; e.pay = ref; e.owed = D; e.first_eligible = 0;
+                    in.owed.push_back(e);
+                };
+            }
             if (g_drops_window && (g_due_omit.count(h) || g_due_double.count(h))) {   // M12b (window): omit / double the DROPS payees
                 std::set<::v37::bytes32> dk;
                 for (const auto& [ck, v] : bl.drops_window()) if (v > 0) dk.insert(ck.payee);
@@ -776,6 +813,62 @@ void m7c_drain() {
     g_deposit = nullptr;
     g_hstep = 1; g_drain = o2::DrainRule{};
     g_spend_floor = false; g_anchor = false; g_drops_due = false; g_no_seeds = false;
+}
+
+// M-O6 (G9 review O6, lane rule 31 noncanon_net): the accounting of a debit-only
+// lane block under the drain rule. A skip-drain block (no owed pass; the window
+// paid exactly its E_b(R)) is a Mismatch on every node; booked net of the
+// window credit it leaves NO row: every window key stays at 0. A self-take
+// block (the window paid E_b(P), the drain slice Delta to a miner outside this
+// block's window) leaves exactly one negative row, that key's -Delta. With the
+// rule off every key either block paid carries its pay-now as a negative row.
+void m_o6_debit_only_net() {
+    std::printf("== M-O6. debit-only blocks under the drain rule: the debit is the payout above the window credit ==\n");
+    g_spend_floor = true; g_drain = o2::DrainRule{1, 16, 64}; g_hstep = 64;
+    const std::uint64_t H = 12, SKIP = 3, SELF = 5;
+    struct Out { Run r; st::OwedLedger::Health hl; std::uint64_t took = 0; };
+    auto run_with = [&](bool rule) {
+        g_noncanon_net = rule;
+        LaneWorld W;
+        // the self-take payee: miner i with (SELF + i) % 4 == 0 is not in the window at SELF (its ref is booked earlier)
+        std::size_t ti = 0;
+        for (std::size_t i = 0; i < W.n_big; ++i) if ((SELF + i) % 4 == 0) { ti = i; break; }
+        g_skipdrain_at = {SKIP};
+        g_selftake_at = {{SELF, W.miners[ti].id}};
+        g_selftake_took = 0;
+        Out o; o.r = simulate(W, H);
+        o.hl = o.r.nodes[0].L.health();
+        o.took = g_selftake_took;
+        g_skipdrain_at.clear(); g_selftake_at.clear();
+        return std::make_pair(o, W.miners[ti].id);
+    };
+    auto [on, thief] = run_with(true);
+    auto [off, thief0] = run_with(false);
+    (void)thief0;
+    g_noncanon_net = true;
+    g_hstep = 1; g_drain = o2::DrainRule{}; g_spend_floor = false;
+    CHECK(on.r.mismatch_at == (std::set<std::uint64_t>{SKIP, SELF}) && on.r.verdict_splits == 0 && on.r.split_heights == 0,
+          "the skip-drain block (h=%llu) and the self-take block (h=%llu) are MISMATCH on every node, one owed_digest per height (mismatch=%zu)",
+          (unsigned long long)SKIP, (unsigned long long)SELF, on.r.mismatch);
+    CHECK(on.took > 0, "the self-take builder kept the drain slice Delta = %llu piconero", (unsigned long long)on.took);
+    LaneWorld W;
+    bool window_zero = true;
+    std::string bad;
+    for (const auto& p : W.miners) {
+        if (p.id == thief) continue;
+        const long long e = eo(on.r, p.id);
+        if (e != 0) { window_zero = false; bad += " " + std::to_string(e); }
+    }
+    CHECK(window_zero, "M-O6 every fairly paid window key ends at 0: the skip-drain block's pay-now E_b(R) and the self-take block's E_b(P) "
+                       "are netted against their window credit (%s)", bad.empty() ? "all 0" : bad.c_str());
+    CHECK(on.hl.negative_rows == 1 && on.hl.min_key == thief && on.hl.min_row == -static_cast<long long>(on.took),
+          "M-O6 exactly one negative row: the self-take payee's -Delta (negative_rows %zu, min_row %lld, want %lld)",
+          on.hl.negative_rows, on.hl.min_row, -static_cast<long long>(on.took));
+    std::printf("    rule off: negative_rows %zu, negative_sum %lld piconero (rule on: %zu, %lld)\n",
+                off.hl.negative_rows, off.hl.negative_sum, on.hl.negative_rows, on.hl.negative_sum);
+    CHECK(off.r.mismatch_at == on.r.mismatch_at && off.hl.negative_rows > on.hl.negative_rows + 3,
+          "rule off (lane rule 31 = 0): every window key either block paid carries its pay-now as a permanent negative row (%zu rows)",
+          off.hl.negative_rows);
 }
 
 void m7b_fresh_pool() {
@@ -1175,6 +1268,7 @@ int main() {
     m7_spend_floor();
     m7b_fresh_pool();
     m7c_drain();
+    m_o6_debit_only_net();
     m9_reorg();
     m10_decay();
     m11_anchor();

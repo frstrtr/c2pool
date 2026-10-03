@@ -31,6 +31,8 @@
 # Negative controls of the recompute (from the model before the rule; each checked
 # against its property alone):
 #   mut-foreign-credit    a debit-only block keeps its credit      -> NonCanonicalEarnsNothing
+#   mut-debit-all         a debit-only block debits its WHOLE payout (the booking before
+#                         lane rule 31 noncanon_net, G9 review O6) -> WindowPaidKeyNeverNegative
 #   mut-authority         no verdict: a mismatch books as canonical -> UnpaidKeyNeverNegative
 #                         or LedgerWithinFloat (both checked; the first found wins)
 #   mut-authority-cnn     the same                                 -> CanonicalNeverNegative
@@ -43,7 +45,10 @@
 #   mut-held-debit        an undecidable block booked debit-only   -> HonestIsCanonical
 #   mut-nogate            builder without the booking-point gate   -> HonestIsCanonical
 # Reachability witnesses (each must be violated, i.e. the path is reached):
-#   wit-negative          a debit-only block drives a key negative
+#   wit-negative          a debit-only block drives a key negative (a key paid above its
+#                         window credit: the forward repair is kept under lane rule 31)
+#   wit-noncanon-net      a debit-only block nets a payout against the window credit
+#                         (lane rule 31)
 #   wit-redistribution    the credit_delta moves credit
 #   wit-held              a block is held
 #   wit-leftover-to-owed  nobody admitted, the owed-paid payees take the moved cash
@@ -142,6 +147,8 @@ expect mut-hcap-full 'Action property SomeoneAdmitted is violated'
 
 run mut-foreign-credit SettlementCanon.cfg foreign_credit 'INVARIANT NonCanonicalEarnsNothing'
 expect mut-foreign-credit 'Invariant NonCanonicalEarnsNothing is violated'
+run mut-debit-all SettlementCanon.cfg debit_all 'INVARIANT WindowPaidKeyNeverNegative'
+expect mut-debit-all 'Invariant WindowPaidKeyNeverNegative is violated'
 run mut-authority SettlementCanon.cfg authority \
     "INVARIANT UnpaidKeyNeverNegative${NL}INVARIANT LedgerWithinFloat"
 expect mut-authority 'Invariant (UnpaidKeyNeverNegative|LedgerWithinFloat) is violated'
@@ -166,6 +173,8 @@ expect mut-nogate 'Invariant HonestIsCanonical is violated'
 
 run wit-negative SettlementCanon.cfg none 'INVARIANT WitNoNegative'
 expect wit-negative 'Invariant WitNoNegative is violated'
+run wit-noncanon-net SettlementCanon.cfg none 'INVARIANT NonCanonicalCreditsNobody'
+expect wit-noncanon-net 'Invariant NonCanonicalCreditsNobody is violated'
 run wit-redistribution SettlementCanon.cfg none 'INVARIANT WitNoRedistribution'
 expect wit-redistribution 'Invariant WitNoRedistribution is violated'
 run wit-held SettlementCanon.cfg none 'INVARIANT WitNoHeld'

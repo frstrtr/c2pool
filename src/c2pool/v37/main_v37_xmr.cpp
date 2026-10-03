@@ -3494,6 +3494,7 @@ static int run_live(const XmrNodeConfig& cfg) {
     // mismatch (res.why), -1 undecided (why = "cut-pending: ...": HELD).
     std::uint64_t canon_ok = 0, canon_mismatch = 0, canon_undecided = 0;
     long long canon_debited = 0;
+    long long canon_netted = 0;   // G9 O6 (noncanon_net): payouts of Mismatch blocks netted against the window credit at their cut
     // The lane's own recompute parameters (identical on every node of the lane).
     auto lane_inputs_now = [&]() {
         c2pool::v37n::xmr::recompute::LaneInputs li;
@@ -3673,10 +3674,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         // verdict parked as AHEAD of this node's lane prefix are re-judged
         if (relay_node) relay_node->notify_share_state_advanced();
     };
+    // `fold` = the window credit the booking folded at the block's own cut at its
+    // total (before the verdict); on a Mismatch `debit` receives the booking
+    // (paynow::debit_only_booking: the debit net of `fold` under lane rule 31
+    // noncanon_net, the gross on-chain map without it).
     auto canon_check = [&](std::uint64_t h, const std::string& bid, const std::vector<std::uint8_t>& blob,
                            const c2pool::v37n::xmr::authority::CoinbaseBooking& bk,
                            const c2pool::v37n::settle::OwedLedger& L,
-                           c2pool::v37n::xmr::recompute::Result& res, std::string& why) -> int {
+                           c2pool::v37n::xmr::recompute::Result& res, std::string& why,
+                           const Amounts& fold, c2pool::v37n::xmr::paynow::DebitOnly& debit) -> int {
         namespace rc = c2pool::v37n::xmr::recompute;
         const rc::LaneInputs li = lane_inputs_now();
         rc::CutInputs ci;
@@ -3695,9 +3701,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         if (res.verdict == rc::Verdict::Undecidable) { ++canon_undecided; why = "cut-pending: " + res.why; return -1; }
         ++canon_mismatch;
-        long long sum = 0;
-        for (const auto& [k, v] : bk.payout) { (void)k; sum += v; }
+        // G9 O6 (lane rule 31 noncanon_net): the debit is what each key was paid
+        // ABOVE its window credit at this cut; a fairly paid key owes nothing.
+        debit = c2pool::v37n::xmr::paynow::debit_only_booking(L.rules().noncanon_net, fold, bk.payout);
+        const long long sum = debit.debited;
         canon_debited += sum;
+        canon_netted += debit.netted;
         // HOLD-ROUND-2 (D): the verdict is uniform only while every lower lane
         // block was DECIDED alike (rule (A) holds the booking otherwise); the
         // line states that condition and the inputs it ran on (prev_lane, dh),
@@ -3708,9 +3717,12 @@ static int run_live(const XmrNodeConfig& cfg) {
               std::to_string(res.skew_dh) + "=" + std::to_string(h > res.skew_dh ? h - res.skew_dh : 0) + " in the finder's prefix) vs ours dh " +
               std::to_string(res.dh) + " (prev_lane " + std::to_string(res.prev_lane) + ")"
             : std::string();
-        std::printf("cba-ALARM recompute_mismatch: h=%llu bid=%s… %s -- NOT the canonical coinbase: payouts DEBITED (%lld piconero, %zu payee(s)), "
+        const std::string net_note = L.rules().noncanon_net
+            ? " net of the window credit at the cut (" + std::to_string(debit.netted) + " piconero netted)"
+            : std::string(" gross");
+        std::printf("cba-ALARM recompute_mismatch: h=%llu bid=%s… %s -- NOT the canonical coinbase: payouts DEBITED (%lld piconero, %zu payee(s),%s), "
                     "credit DROPPED (the same on every node whose lower lane blocks were decided alike); on-chain payout{ %s} canonical payout{ %s}%s%s\n",
-                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), res.why.c_str(), sum, bk.payout.size(),
+                    static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), res.why.c_str(), sum, debit.payout.size(), net_note.c_str(),
                     amounts_str(bk.payout).c_str(), amounts_str(res.expected_payout).c_str(),
                     (res.drain_on || res.take_mismatch) ? (" delta=" + std::to_string(res.delta) + " F=" + std::to_string(res.F) + " dh=" + std::to_string(res.dh) +
                                     " prev_lane=" + std::to_string(res.prev_lane) + " split_at=" + std::to_string(res.split_at)).c_str() : "",
@@ -3938,19 +3950,23 @@ static int run_live(const XmrNodeConfig& cfg) {
         }
         c2pool::v37n::xmr::recompute::Result rr;   // THE DRAIN RULE reads its split_at below
         {   // EVERY NODE RECOMPUTES THE LANE COINBASE (rulings 2026-09-29)
-            const int cv = canon_check(h, bid, chain_blob, bk, node.ledger(), rr, why);
+            c2pool::v37n::xmr::paynow::DebitOnly debit;
+            const int cv = canon_check(h, bid, chain_blob, bk, node.ledger(), rr, why, credit, debit);
             if (cv < 0) return false;   // undecided: HELD like a relay repair, never refused
             if (cv == 0) {
                 credit.clear();         // DROPPED: the block is booked like a withheld block
-                // payout == bk.payout: every on-chain payout (pay-now included) DEBITED
+                // G9 O6: the on-chain payouts (pay-now included) DEBITED, net of the
+                // window credit at the cut under lane rule 31 (noncanon_net)
+                payout = std::move(debit.payout);
                 ++cut_ok;
                 ++cba_booked;
                 cut_floor_note(h, bid, bk.credit_cut.next_pos);   // CUT-FLOOR: its committed cut still bounds the lane
                 note_booked_refs(bid, bk, node.ledger());   // BOOKED REFS
                 last_credit_line = "h=" + std::to_string(h) + " P=" + std::to_string(bk.credit_cut.next_pos) + " NON-CANONICAL: credit dropped";
-                std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu DEBIT-ONLY (not canonical) payout{ %s}\n",
+                std::printf("cba-book: h=%llu bid=%s… lane_commitment=%s… (candidate #%zu) total=%llu outputs=%zu DEBIT-ONLY (not canonical) payout{ %s}%s\n",
                             static_cast<unsigned long long>(h), bid.substr(0, 12).c_str(), hex_of(bk.lane_commitment).substr(0, 12).c_str(),
-                            bk.digest_index, static_cast<unsigned long long>(bk.total), bk.n_outputs, amounts_str(payout).c_str());
+                            bk.digest_index, static_cast<unsigned long long>(bk.total), bk.n_outputs, amounts_str(payout).c_str(),
+                            node.ledger().rules().noncanon_net ? (" netted=" + std::to_string(debit.netted)).c_str() : "");
                 std::fflush(stdout);
                 return true;
             }
@@ -4210,10 +4226,12 @@ static int run_live(const XmrNodeConfig& cfg) {
         if (!fold_credit(bk.total, bk.credit_cut, q.ledger ? *q.ledger : node.ledger(), out.credit, why, relay_hint(bid))) return false;   // cut-pending -> undecidable
         c2pool::v37n::xmr::recompute::Result rr;   // THE DRAIN RULE reads its split_at below
         if (q.ledger) {   // EVERY NODE RECOMPUTES THE LANE COINBASE: the same verdict on the scratch lineage
-            const int cv = canon_check(h, bid, sblob, bk, *q.ledger, rr, why);
+            c2pool::v37n::xmr::paynow::DebitOnly debit;
+            const int cv = canon_check(h, bid, sblob, bk, *q.ledger, rr, why, out.credit, debit);
             if (cv < 0) return false;   // cut-pending -> undecidable
             if (cv == 0) {
-                out.credit.clear();     // payouts debited, credit dropped
+                out.credit.clear();     // payouts debited (G9 O6: net under noncanon_net), credit dropped
+                payout = std::move(debit.payout);
                 cut_floor_note(h, bid, bk.credit_cut.next_pos);
                 note_booked_refs(bid, bk, q.ledger ? *q.ledger : node.ledger());   // BOOKED REFS
                 std::printf("converge-debit: h=%llu bid=%s… booked under the SCRATCH lineage DEBIT-ONLY (not canonical) payout{ %s}\n",
@@ -6284,12 +6302,12 @@ static int run_live(const XmrNodeConfig& cfg) {
                             (unsigned long long)cut_ok, (unsigned long long)cut_pending, (unsigned long long)cut_miss, (unsigned long long)cut_repaired, (unsigned long long)cut_mismatch, (unsigned long long)cut_absent, (unsigned long long)cut_fold_refused,
                             (unsigned long long)wire_tx, (unsigned long long)wire_rx, (unsigned long long)wire_prefold, (unsigned long long)wire_pending, (unsigned long long)wire_hit, (unsigned long long)wire_mismatch, (unsigned long long)wire_diverged,
                             last_credit_line.c_str());
-                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu | canonical ok=%llu MISMATCH=%llu undecided=%llu debited=%lld | lineage foreign=%llu untagged=%llu malformed=%llu\n",
+                std::printf("  cba: fetches=%llu booked=%llu not_lane=%llu refused=%llu fetch_failed=%llu stale_root=%llu root_unknown_bids=%llu ring=%zu max_root_age=%llu | recompute captured=%llu unavailable=%llu ok=%llu MISMATCH=%llu | canonical ok=%llu MISMATCH=%llu undecided=%llu debited=%lld netted=%lld | lineage foreign=%llu untagged=%llu malformed=%llu\n",
                             (unsigned long long)cba_fetches, (unsigned long long)cba_booked, (unsigned long long)cba_not_lane, (unsigned long long)cba_refused,
                             (unsigned long long)cba_fetch_failed, (unsigned long long)cba_stale_root,
                             cba_lane_root_unknown, cba_ring.size(), (unsigned long long)cba_max_root_age,
                             (unsigned long long)recompute_captured, (unsigned long long)recompute_unavailable, (unsigned long long)recompute_ok, (unsigned long long)recompute_mismatch,
-                            (unsigned long long)canon_ok, (unsigned long long)canon_mismatch, (unsigned long long)canon_undecided, canon_debited,
+                            (unsigned long long)canon_ok, (unsigned long long)canon_mismatch, (unsigned long long)canon_undecided, canon_debited, canon_netted,
                             (unsigned long long)cba_lineage_other[1], (unsigned long long)cba_lineage_other[2], (unsigned long long)cba_lineage_other[3]);
                 std::printf("  cba-payee: learned=%llu resolved=%llu pending=%llu unresolved=%llu (REJOIN-PAYEE: outputs resolved against the payees of the block's own credit cut)\n",
                             (unsigned long long)cut_payee_learned, (unsigned long long)cut_payee_resolved,
@@ -7325,6 +7343,7 @@ int main(int argc, char** argv) {
         cfg.ledger_decay_half_life = c2pool::v37n::xmr::kXmrDustDecayHalfLifeHeights;
         cfg.ledger_anchor_cut = true;   // ANCHOR: every coinbase input is finalized state (share-level canonical coinbase)
         cfg.ledger_empty_cut = true;    // R1 RECEIPT ADMISSION (ruling 10-03): verdict-1 admission, the committed receipt test, EMPTY-CUT
+        cfg.ledger_noncanon_net = true; // G9 O6 (lane rule 31): a Mismatch books only the payout above the window credit at its cut as debit
         cfg.ledger_merkle_rows = true;  // §13: the balances as a Merkle root, so a light client proves one with log2(rows) hashes
         // DROPS DUE (A5, ruling 09-30): with the anchor, behind the DROPS gate (a
         // flip-0 build or a DROPS-off lane keeps owed_digest without "V37U").

@@ -90,14 +90,36 @@ Two builder inputs are not available to a receiver:
 
 * **canonical**: booking proceeds as before (RAIN-BACKFILL, DROPS, pay-now
   net booking).
-* **mismatch**: `FOUND(credit = {}, payout = the gross on-chain map)`, with
-  pay-now included. Money that left the pool on-chain is debited: this is
-  forward repair (C-1/C-6), never a clawback, and a double-paid key carries
-  the second payment as a debt. The credit is dropped and the block is
-  treated as withheld. Refusing the whole block instead would leave the
-  double-paid key undebited, which is strictly worse. DROPS composition is
-  skipped exactly as a refusal skips it. The CUT-FLOOR still notes the
-  block's cut. Alarm line: `cba-ALARM recompute_mismatch`.
+* **mismatch**: `FOUND(credit = {}, payout = the debit)`. Money that left
+  the pool on-chain is debited: this is forward repair (C-1/C-6), never a
+  clawback, and a double-paid key carries the second payment as a debt. The
+  credit is dropped and the block is treated as withheld. Refusing the whole
+  block instead would leave the double-paid key undebited, which is strictly
+  worse. DROPS composition is skipped exactly as a refusal skips it. The
+  CUT-FLOOR still notes the block's cut. Alarm line: `cba-ALARM
+  recompute_mismatch` (it reports the debit and, under the rule below, the
+  amount netted; the status line carries `debited=` and `netted=`).
+  **The debit is net of the window credit** (lane rule 31 `noncanon_net`,
+  G9 review O6, the epoch-1 rule set of R1; `paynow::debit_only_net`): each
+  on-chain payout (pay-now included, sink coverage excluded, the donation
+  identity's owed part included) is netted against the key's window credit
+  at the block's own committed cut, folded at the block's total (the fold
+  the booking already holds before the verdict: no DROPS due, no drain
+  refold at P, no `credit_delta`, no empty-cut finder):
+  `a_k = min(max(E_k, 0), paid_k)`, debit `paid_k - a_k` (kept when > 0).
+  A window key paid at most its credit owes nothing (no negative row, no
+  `D_conf` dip of its EffectiveOwed, no K_fair rotation); a key paid above
+  it owes exactly the excess. An empty fold (a pre-anchor or empty-cut
+  finder block) caps nothing. Before the rule the whole gross payout was the
+  debit, so every fairly paid window key of such a block carried its pay-now
+  as a permanent negative row (nothing reads a negative row under the drain
+  rule; on master it ate the key's later credit). The rule changes no
+  coinbase, tx_extra, recompute or share verdict, only the booked maps (and
+  so `owed_digest` after a non-canonical block): a node without it is
+  another pool (`LANE_RULES_MISMATCH field=noncanon_net`). The journal,
+  the owed_digest FOUND leaf and an orphan carry the NET map. TLA:
+  `WindowPaidKeyNeverNegative` (proto/tla/SettlementCanon.tla); the
+  booking before the rule is its negative control (`mut-debit-all`).
 * **undecided** (the view at the cut is not readable here yet): `cut-pending`,
   HELD like a relay repair, never refused.
 
@@ -111,7 +133,11 @@ wire-arrival timing. Here every input is replicated at the booking point:
 the ledger (R6), the view at the cut, the lane config, the block bytes, and
 the booked refs (§4). The verdict is therefore identical on every node.
 `v37_xmr_coinbase_recompute_kat` R11 books a mismatch on two receivers and
-checks one `owed_digest`.
+checks one `owed_digest`; R11b/R11c/R11d pin the net debit (fairly paid cut
+payees at 0 and one negative row, an overpaid window key at exactly its
+excess, the settle-store replay of the net row); `v37_xmr_mainnet_rehearsal_kat`
+M-O6 runs a skip-drain and a self-take block on three nodes;
+`v37_xmr_minority_converge_selfcheck` MC9 the scratch-lineage twin.
 
 ## 4. Booked refs
 

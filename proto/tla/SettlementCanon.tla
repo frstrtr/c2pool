@@ -10,8 +10,14 @@
 \*   canonical    the on-chain payouts are the recompute's: the block is booked with its
 \*                credit (E_b at the split point P plus the redistribution delta) and its
 \*                payouts.
-\*   mismatch     anything else: booked DEBIT-ONLY. Its on-chain payouts are debited
-\*                (forward repair, never a clawback) and its credit is dropped.
+\*   mismatch     anything else: booked DEBIT-ONLY. Its credit is dropped and its on-chain
+\*                payouts are debited (forward repair, never a clawback), each NET of the
+\*                key's window credit at the block's cut (lane rule 31 noncanon_net, G9
+\*                review O6, paynow::debit_only_net): only what a key was paid above its
+\*                window credit E is a debt; a fairly paid window key owes nothing.
+\*                Modelled as credit min(E, pay) per key (the ledger books the pending
+\*                payout pay - min(E, pay), NetPay). Mutation "debit_all" is the booking
+\*                before the rule (the whole payout debited).
 \*   undecidable  the view at the block's cut is not readable on this node yet: the block
 \*                is HELD (cut-pending). It is not booked, nothing after it is booked, and
 \*                the finalize cursor does not pass its booking point until it is decided.
@@ -112,7 +118,7 @@ ASSUME /\ Reward \in Nat \ {0}
                        "redistribute_to_nobody", "keep_credit_unbacked",
                        "degenerate_keep_credit", "held_debit", "nogate",
                        "debt_first_on", "delta_unbounded", "no_ko", "credit_at_reward",
-                       "split_at_delta"}
+                       "split_at_delta", "debit_all"}
 
 VARIABLES
     chain,   \* Seq of lane blocks on the chain, oldest first (index = lane height)
@@ -150,8 +156,8 @@ Height == Len(chain)
 Booked == Len(book)
 
 \* Pay-now net booking (paynow::net_booking): a booked block's PENDING payout to m is net
-\* of what it also credits m, min(credit, paid). A debit-only block credits nothing, so its
-\* whole payout is pending.
+\* of what it also credits m, min(credit, paid). A debit-only block credits min(E, pay)
+\* (DebitExcessCredit), so only the part of its payout above E is pending.
 NetPay(i, m) == Pos(chain[i].pay[m] - book[i].credit[m])
 
 RECURSIVE PendPay(_, _)
@@ -344,9 +350,17 @@ ViewArrives(i) ==
 \* The verdict, decided at the booking point: the on-chain payouts are the recompute's.
 AllocOf(i) == Alloc(chain[i].E, chain[i].ord, chain[i].dh)
 Canonical(i) == chain[i].pay = AllocOf(i).pay
+\* NON-CANONICAL NET BOOKING (lane rule 31 noncanon_net, G9 review O6): a non-canonical
+\* block is booked with credit min(E, pay) per key: the part of each payout the key's
+\* window credit at the block's cut covers nets to nothing, the rest (an overpayment) is
+\* the pending debit. The C++ booking passes credit {} and the payout pay - min(E, pay)
+\* (paynow::debit_only_net): the same pending payout and the same FINALIZE.
+DebitExcessCredit(i) == [ m \in Miners |-> Min(chain[i].E[m], chain[i].pay[m]) ]
 
 \* FOUND: book the next block, in order, at its booking point, once decided.
 \* MUTATION "held_debit": an undecidable block is booked debit-only instead of held.
+\* MUTATION "debit_all": a non-canonical block debits its whole payout (the booking before
+\* lane rule 31).
 \* MUTATION "foreign_credit": a debit-only block keeps its window credit.
 \* MUTATION "authority": no verdict (coinbase authority): a block that is not canonical
 \* is booked like a canonical one, with its window credit and whatever it paid.
@@ -366,7 +380,9 @@ Book ==
          ELSE IF Mutation = "authority"
          THEN [ verdict |-> "canon", credit |-> chain[i].E, ep |-> chain[i].E ]
          ELSE [ verdict |-> "debit", ep |-> Zero,
-                credit  |-> IF Mutation = "foreign_credit" THEN chain[i].E ELSE Zero ])
+                credit  |-> IF Mutation = "foreign_credit" THEN chain[i].E
+                            ELSE IF Mutation = "debit_all" THEN Zero
+                            ELSE DebitExcessCredit(i) ])
     /\ UNCHANGED << chain, fin, owed, seed >>
 
 \* FINALIZE: the oldest booked block once FINALITY_DEPTH later blocks are booked. A held
@@ -406,9 +422,22 @@ RECURSIVE NetFin(_, _)
 NetFin(n, m) == IF n = 0 THEN 0 ELSE book[n].credit[m] - chain[n].pay[m] + NetFin(n - 1, m)
 Conservation == \A m \in Miners : owed[m] = seed[m] + NetFin(fin, m)
 
-\* A non-canonical block never credits anybody: it is booked debit-only.
+\* A non-canonical block never credits a key beyond what it paid it, nor beyond the key's
+\* window credit at its cut: no balance ever rises from a non-canonical block, and the
+\* credit it books is cash the block already paid (lane rule 31 books min(E, pay); the
+\* booking before it booked Zero). Caught: foreign_credit (credit E where E > pay).
 NonCanonicalEarnsNothing ==
-    \A i \in 1..Booked : book[i].verdict = "debit" => book[i].credit = Zero
+    \A i \in 1..Booked : book[i].verdict = "debit" =>
+        \A m \in Miners : book[i].credit[m] <= Min(chain[i].E[m], chain[i].pay[m])
+
+\* G9 review O6: a key that no debit-only block paid above its window credit at that
+\* block's cut -- a fairly paid window key, or a key no debit-only block paid -- never
+\* carries a debt. Holds under lane rule 31; the booking before it violates it
+\* (mut-debit-all: a fairly paid window key carries its whole pay-now as a debt).
+PaidAboveWindowByDebitOnly(m) ==
+    \E i \in 1..Booked : book[i].verdict = "debit" /\ chain[i].pay[m] > chain[i].E[m]
+WindowPaidKeyNeverNegative ==
+    \A m \in Miners : ~PaidAboveWindowByDebitOnly(m) => (owed[m] >= 0 /\ EO(m) >= 0)
 
 \* What "negative" means now. A debit-only block MAY drive the key it paid negative: that
 \* key carries the payment as a debt (forward repair), accepted by design (WitNoNegative
@@ -535,8 +564,14 @@ MasterWhenNoFloat ==
 -------------------------------------------------------------------------------
 \* REACHABILITY WITNESSES (each expected VIOLATED; check-settlement-canon.sh)
 
-\* A debit-only block can drive a key negative.
+\* A debit-only block can drive a key negative (under lane rule 31: a key paid above its
+\* window credit, the forward repair).
 WitNoNegative == \A m \in Miners : owed[m] >= 0
+\* The net booking of a non-canonical block is exercised: a debit-only block nets some
+\* payout against the window credit (the strict "credits nobody" of the booking before
+\* lane rule 31 is violated).
+NonCanonicalCreditsNobody ==
+    \A i \in 1..Booked : book[i].verdict = "debit" => book[i].credit = Zero
 \* The redistribution (credit_delta) is exercised: a canonical block books a credit other
 \* than the window's credit at P.
 WitNoRedistribution == \A i \in 1..Booked : book[i].verdict = "canon" => book[i].credit = book[i].ep

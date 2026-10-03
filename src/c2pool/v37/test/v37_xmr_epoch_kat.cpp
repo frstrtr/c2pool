@@ -329,6 +329,21 @@ void suite_g() {
     CHECK(sc::k_genesis(0xABCD) == "v37s:genesis:0000043981", "the store key v37s:genesis:<chain>");
 }
 
+// G9 review O6: lane rule 31 noncanon_net -> OwedLedgerRules::noncanon_net, the
+// bit the booking of a decided Mismatch reads (a template: this file also builds
+// on a tree without the field, where the check FAILS instead of not compiling).
+template <class LR> bool noncanon_net_maps(LR r, bool on) {
+    if constexpr (requires { r.noncanon_net; }) {
+        r.noncanon_net = on ? 1 : 0;
+        const auto o = lr::owed_rules_of(r, ::v37::LaneParams{});
+        if constexpr (requires { o.noncanon_net; }) return o.noncanon_net == on;
+        else return false;
+    } else {
+        (void)r; (void)on;
+        return false;
+    }
+}
+
 void suite_o() {
     std::printf("== O. owed_rules_of(LaneRules) ==\n");
     lr::LaneRules r;
@@ -342,6 +357,8 @@ void suite_o() {
     lr::LaneRules q = r; q.drops_rule = 0; q.drops_window_rw = 0; q.drain_rule_version = 0;
     const settle::OwedLedgerRules oq = lr::owed_rules_of(q, lp);
     CHECK(!oq.drops_due && !oq.raindrop_enrol && !oq.lane_height && !oq.decay_from_gross && !oq.drops_window.on(), "rule tag 0 / no drain -> the bits off");
+    CHECK(noncanon_net_maps(r, true) && noncanon_net_maps(r, false),
+          "G9 O6: lane rule 31 noncanon_net 1 / 0 -> OwedLedgerRules::noncanon_net on / off (the debit-only net booking of the epoch)");
     const auto deps = lr::genesis_deployments(r);
     CHECK(deps.size() == 1 && deps[0].rules_digest == lr::rules_digest(r) && deps[0].epoch_no == 1 && deps[0].kind == 0, "genesis_deployments: {epoch 1 = rules_digest(r)}");
 }

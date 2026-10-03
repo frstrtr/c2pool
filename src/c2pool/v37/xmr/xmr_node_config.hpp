@@ -329,6 +329,7 @@ struct XmrNodeConfig {
     std::uint64_t   ledger_decay_half_life = 0;    // ... and its half-life, Monero heights
     bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
     bool            ledger_empty_cut = false;      // R1 RECEIPT ADMISSION: a decided-bad own cut books with no cut (ruling 10-03)
+    bool            ledger_noncanon_net = false;   // G9 O6 (lane rule 31): a Mismatch books only the payout above the window credit as debit
     bool            ledger_drops_due = false;      // DROPS DUE (A5, ruling 09-30): the DROPS delta is a deposit into the committed due, claimed in pay-now
     bool            ledger_raindrop_enrol = false; // RAINDROP ENROL (A3, ruling 09-30): the DROPS enrolment registry (V37G), refs are ledger state
     std::uint64_t   ledger_drops_window_rw = 0;    // DROPS WINDOW (A4b, ruling 10-01): one receipt's lane weight; != 0 => DROPS work is window weight (V37W), never priced once
