@@ -4466,6 +4466,18 @@ nlohmann::json MiningInterface::rest_local_stats()
     else
         result["local_hashps"] = nullptr;
 
+    // #942 node_role -- what kind of node this is, so the dashboard can say
+    // "not applicable here" instead of rendering zero miners / 0 H/s as a
+    // measurement. "mining" = a miner-facing Stratum acceptor runs on this
+    // node; "relay" = none does (e.g. c2pool-dash without --stratum), so it
+    // only relays the sharechain and cannot have local miners. The signal is
+    // the same seam local_hashps reads: every acceptor (WebServer's own on
+    // the LTC path; c2pool-dash, btc and bip110 their own) wires
+    // set_stratum_hashrate_fn only once it is actually listening. Display
+    // only; reads a std::function set at startup, no tracker or peer state,
+    // so no new lock surface.
+    result["node_role"] = m_stratum_hashrate_fn ? "mining" : "relay";
+
     // shares — {total, orphan, dead}
     // Sharechain stats now use O(log n) StatsSkipList — no caching needed.
     nlohmann::json cached_sc;
