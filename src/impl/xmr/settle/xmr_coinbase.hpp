@@ -73,6 +73,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,7 @@
 #include "impl/xmr/coin/xmr_crypto_types.hpp"   // Bytes32, PublicKey, SecretKey, ...
 #include "impl/xmr/coin/xmr_derivation.hpp"     // generate_key_derivation, derive_*
 #include "impl/xmr/coin/xmr_blob.hpp"           // BlobWriter, tx hashes, tree_root
+#include "impl/xmr/settle/xmr_drain_rule.hpp"   // THE DRAIN RULE: drain_delta, kDrainRefCadence
 
 // --- PayoutDescriptor canon + the XMR kind extension (descriptor-kinds leg) --
 #include "sharechain/v37/v37_descriptor_xmr.hpp" // v37::xmr::XMR_STD/XMR_SUB, fences
@@ -159,6 +161,17 @@ struct PayNowEntry {
     ::v37::ScriptRef pay;                 // payout target (XMR kind)
     ::v37::bytes32   identity{};          // ledger identity_key (== fold_eb key)
     std::uint64_t    eb = 0;              // E_b at this block's budget, piconero
+    // SPEND-COST FLOOR only: who gets a slot first when not everyone fits,
+    // oldest first (the K_fair rule). `age` is the payee's first_eligible in the
+    // ledger (0 = no waiting balance: the youngest); `tie` orders equal ages,
+    // sha256d("V37T" || prev_id || identity), which nobody can grind.
+    std::uint64_t    age = 0;
+    ::v37::bytes32   tie{};
+    // SPEND-COST FLOOR only: the payee's positive balance the owed pass left
+    // unpaid (EffectiveOwed at the booking point minus its owed take). Cash that
+    // no slot can carry to its own payee pays these debts first (never an
+    // advance), before any redistribution.
+    std::uint64_t    owed_left = 0;
 };
 
 // The pay-now split: `pool` over the entries in proportion to eb, exact-sum
@@ -169,6 +182,37 @@ struct PayNowEntry {
 // V37N base (see c2pool/v37/xmr/xmr_paynow.hpp).
 std::vector<std::uint64_t> paynow_split(std::uint64_t pool,
                                         const std::vector<std::uint64_t>& eb);
+
+// ---------------------------------------------------------------------------
+// SPEND-COST FLOOR c (docs/xmr-lane/payout-threshold.md §2). The largest
+// minimum fee Monero can require to spend one coinbase output: Monero's
+// consensus fee per byte (Blockchain::get_dynamic_base_fee, 2021 scaling) at
+// the 300 kB fee-median floor, times the weight one input adds to a RingCT
+// transaction, rounded up to Monero's fee quantization. Every constant below
+// is Monero's (cryptonote_config.h), cited by name.
+inline constexpr std::uint64_t kFeeMedianFloor       = 300000;  // CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5
+inline constexpr std::uint64_t kFeeReferenceTxWeight = 3000;    // DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT
+inline constexpr std::uint64_t kFeeQuantizationMask  = 10000;   // 10^(CRYPTONOTE_DISPLAY_DECIMAL_POINT 12 - PER_KB_FEE_QUANTIZATION_DECIMALS 8)
+inline constexpr std::uint64_t kRingSize             = 16;      // HF_VERSION_MIN_MIXIN_15 (15) + the real input
+// One input: txin_to_key prefix (tag, amount 0, offset count, ring offsets at
+// their 1-byte minimum, key image) + CLSAG (s[ring], c1, D) + its pseudo-out.
+inline constexpr std::uint64_t kInputWeight =
+    (1 + 1 + 1 + kRingSize * 1 + 32) + (kRingSize * 32 + 32 + 32) + 32;   // 659
+static_assert(kInputWeight == 659, "one RingCT/CLSAG input at ring 16");
+
+// Monero's tail emission per block: FINAL_SUBSIDY_PER_MINUTE (3e11) x the
+// 2-minute target (DIFFICULTY_TARGET_V2). Every block since 2022 pays at least
+// this, so spend_floor(kTailSubsidy) is the smallest c any tail-era block has:
+// the XMR ledger's arm floor (OwedLedgerRules::arm_floor).
+inline constexpr std::uint64_t kTailSubsidy = 300000000000ull * 2;
+
+// THE DRAIN RULE: kDrainRefCadence, drain_delta, drain_rule_refusal live in
+// xmr_drain_rule.hpp (dependency-free: the node config checks the triple).
+
+// Monero's minimum fee per byte for `reward` at the fee-median floor.
+std::uint64_t fee_per_byte_at_floor(std::uint64_t reward);
+// c: the cost to spend one output of a block whose coinbase total is `total`.
+std::uint64_t spend_floor(std::uint64_t total);
 
 struct CoinbaseInputs {
     // --- FENCE key ---
@@ -205,6 +249,38 @@ struct CoinbaseInputs {
     std::function<std::vector<PayNowEntry>(std::uint64_t budget)> paynow_at;
     std::size_t    paynow_n = 0;
 
+    // --- SPEND-COST FLOOR (payout-threshold.md §3; off => master behaviour) ---
+    // c = spend_floor(budget()). The owed pass pays no balance below c. Pay-now
+    // pays every payee that has a free output slot; when they do not all fit,
+    // payouts >= c before dust, oldest first within each (PayNowEntry::age, then
+    // ::tie), each the same fraction of its
+    // E_b (all of it unless the owed pass left less). The cash of the payees
+    // without a slot is REDISTRIBUTED pro rata to the admitted payees and taken
+    // off the credit of those it came from (allocate_exact_sum's credit_delta):
+    // never an advance. Pay-now never fails the build for want of a slot.
+    bool           spend_floor = false;
+    // SPEND-COST FLOOR only: the positive balances the owed pass does not take
+    // (below c, so unarmed, or otherwise not proposed), in the canonical order
+    // the source gives (sha256d("V37T" || prev_id || identity) ASC). They are
+    // paid WHEN THERE IS ROOM (operator ruling 2026-09-30, audit A8): after
+    // the owed pass and the pay-now admission, each takes a free output slot
+    // (none if its payee already has an output in this coinbase) and is paid
+    // min(owed, pool left) before the pay-now pool is split. Debt before the
+    // residual: an owed balance never waits while the block has a slot for it.
+    std::vector<OwedEntry> owed_dust;
+
+    // --- THE DRAIN RULE (spend floor + pay-now only; false => master) ---
+    // paynow_first: the owed pass ran at drain_budget (= Delta, chosen by the
+    // source), so here: (D4) in a contested block the owed pass keeps
+    // K_o = max(1, cap_owed * owed_paid_1 / R) slots, owed_paid_1 the FIRST
+    // pass's cash; (D5) the dust pass draws on drain_budget - owed_paid only;
+    // (D6) admission is decided on paynow_at(R) as before, the AMOUNTS are
+    // paynow_at(P) with P the pay-now pool left after the debt (paid in full
+    // when everyone fits), DEBT FIRST is gone and the redistribution falls
+    // back to the owed payees when the admitted payees' E_b(P) sums to 0.
+    bool           paynow_first = false;
+    std::uint64_t  drain_budget = 0;
+
     // --- tx_extra ---
     std::vector<unsigned char> extra_nonce; // 0x02 padded per-worker extranonce
 
@@ -240,6 +316,20 @@ enum class BuildError : std::uint8_t {
     BadSinkDescriptor,  // residual_sink is not a valid XMR ref
     BadPayeeDescriptor, // an owed/fixed pay is not a valid XMR ref
     DerivationFailed,   // r*G or an ECDH derivation failed (bad point)
+    PayNowSplit,        // drain rule: a payee has E_b(P) > 0 but E_b(R) == 0 (fail-closed; amendment B6)
+};
+
+// What one allocation did (allocate_exact_sum's optional out-parameter): the
+// numbers the drain rule's booking and its alarm / status lines read.
+struct AllocStats {
+    std::uint64_t owed_paid_1 = 0;   // cash of the FIRST owed pass (Role::Owed outputs, merge included)
+    std::uint64_t owed_paid   = 0;   // cash of the owed pass that stands (after a K_o re-run)
+    std::uint64_t dust_paid   = 0;   // the dust pass (A8)
+    std::uint64_t debt_paid   = 0;   // owed_paid + dust_paid: every old balance this block pays
+    std::uint64_t split_at    = 0;   // P: the budget the window's E_b is split at (== budget without the drain)
+    std::uint64_t k_o         = 0;   // the owed pass's slot cap in a contested block (0: not contested)
+    bool          contested   = false;
+    std::uint64_t w_d         = 0;   // pay-now payees with E_b > 0 that need a slot of their own
 };
 
 const char* to_string(BuildError e);
@@ -306,7 +396,8 @@ struct ReceivedCoinbase {
 // coinbase by the fee model) re-derives owed_part without the ledger.
 // Invariant on success:
 //     Sum(result.amount) == in.budget()      (exact-sum, no burn)
-// and every result.amount > 0, and result.size() >= 1, and result.size() <=
+// and every result.amount > 0 except a Fixed output declared at 0 (the fee
+// model's donation marker), and result.size() >= 1, and result.size() <=
 // in.output_cap.
 //
 // Returns an empty vector and sets *err (if non-null) on ZeroBudget /
@@ -314,6 +405,19 @@ struct ReceivedCoinbase {
 // ---------------------------------------------------------------------------
 std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in,
                                                BuildError* err = nullptr);
+
+// SPEND-COST FLOOR: the same allocation, plus the per-identity CREDIT DELTA the
+// block's booking applies to its E_b (payout-threshold.md §3): the cash of the
+// payees without a slot is REDISTRIBUTED to the admitted payees (+) and taken
+// off the credit of the payees it came from (-). Σ delta == 0. Empty when the
+// floor is off or everyone fits. Never an advance: no payee is paid more than
+// it is credited.
+std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildError* err,
+                                               std::map<::v37::bytes32, long long>* credit_delta);
+// ... and what it did (AllocStats), for the drain rule's booking.
+std::vector<CoinbaseOutput> allocate_exact_sum(const CoinbaseInputs& in, BuildError* err,
+                                               std::map<::v37::bytes32, long long>* credit_delta,
+                                               AllocStats* stats);
 
 // S1: true iff the last fixed output IS the residual sink -- it pays
 // `residual_sink` (ScriptRef equality) under `residual_sink_identity` -- i.e.
@@ -339,6 +443,10 @@ bool derive_tx_secret_key(const CoinbaseInputs& in, SecretKey& r_out);
 // Returns false on a bad point.
 bool derive_output(const SecretKey& r, const ::v37::ScriptRef& pay,
                    std::size_t vout_index, PublicKey& P_out, ViewTag& vt_out);
+
+// D = 8*r*A through the process-wide derivation cache (pure; bounded; locked).
+// derive_output uses it; so does the booking decode, which tries many payees.
+bool cached_key_derivation(const PublicKey& A, const SecretKey& r, KeyDerivation& D);
 
 // The merge-mining commitment root for a single v37 leaf:
 //   mm_root = keccak256(MM_LEAF_DOMAIN || chain_id_le32 || lane_commitment)

@@ -98,14 +98,23 @@ reap() {  # $1 lock-base  $2 marker-base
 }
 
 fail=0
+npass=0
+nfail=0
+ok()  { echo "-> PASS: $*"; npass=$((npass+1)); }
+bad() { echo "-> FAIL: $*"; nfail=$((nfail+1)); fail=1; }
+
+# Never consult the real ~/.config/c2pool-ci of whoever runs this: every case
+# below reads its slot override from a sandbox dir (empty unless a case plants one).
+export HEAVY_LEG_CONFIG_DIR="$TMP/cfg-none"
+mkdir -p "$HEAVY_LEG_CONFIG_DIR"
 
 echo; echo "### CASE 1  FIXED (sweep on): all $SLOTS slots saturated -> orphans reaped -> GREEN"
 L1="$TMP/case1.lock"; H1="$TMP/case1.holder"
 saturate "$L1" "$H1" || exit 1
 if run_guard 1 20 "$L1" "$H1"; then
-  echo "-> PASS: guard reaped the stale holders on every slot and acquired the lock"
+  ok "guard reaped the stale holders on every slot and acquired the lock"
 else
-  echo "-> FAIL: guard did NOT recover from reapable orphans saturating all slots"; fail=1
+  bad "guard did NOT recover from reapable orphans saturating all slots"
 fi
 reap "$L1" "$H1"
 
@@ -113,9 +122,9 @@ echo; echo "### CASE 2  LEAKED (sweep off): same saturation must block -> RED"
 L2="$TMP/case2.lock"; H2="$TMP/case2.holder"
 saturate "$L2" "$H2" || exit 1
 if run_guard 0 5 "$L2" "$H2"; then
-  echo "-> FAIL: guard acquired despite live orphans on every slot -- sweep is not load-bearing (hollow)"; fail=1
+  bad "guard acquired despite live orphans on every slot -- sweep is not load-bearing (hollow)"
 else
-  echo "-> PASS: orphans blocked every slot and acquire failed red, as it must without the sweep"
+  ok "orphans blocked every slot and acquire failed red, as it must without the sweep"
 fi
 reap "$L2" "$H2"
 
@@ -133,7 +142,7 @@ run_disk() {  # $1 sweep(0/1)  $2 wait(s)  $3 lock-base  $4 marker-base
   bash "$ACQ2"
 }
 disk_reap() {  # $1 marker  $2 lock
-  [ -f "$1" ] && awk {print } "$1" | xargs -r kill 2>/dev/null || true
+  [ -f "$1" ] && awk '{print $1}' "$1" | xargs -r kill 2>/dev/null || true
   fuser -k "$2" 2>/dev/null || true
   sleep 0.3 || true
 }
@@ -143,14 +152,14 @@ L3="$TMP/case3.lock"; H3="$TMP/case3.holder"
 SLOTS=1 plant_orphan "$L3.1" "$H3.1" || exit 1
 rm -f "$TMP/genv-disk"
 if run_disk 1 20 "$L3" "$H3"; then
-  echo "-> PASS: disk semaphore reaped the stale holder and acquired slot 1"
+  ok "disk semaphore reaped the stale holder and acquired slot 1"
   if grep -q ^HEAVY_DISK_LOCK_HOLDER= "$TMP/genv-disk" 2>/dev/null; then
-    echo "-> PASS: holder pid exported under HEAVY_DISK_LOCK_HOLDER"
+    ok "holder pid exported under HEAVY_DISK_LOCK_HOLDER"
   else
-    echo "-> FAIL: holder-env override did not export HEAVY_DISK_LOCK_HOLDER"; fail=1
+    bad "holder-env override did not export HEAVY_DISK_LOCK_HOLDER"
   fi
 else
-  echo "-> FAIL: disk semaphore did NOT recover from a reapable orphan on its sole slot"; fail=1
+  bad "disk semaphore did NOT recover from a reapable orphan on its sole slot"
 fi
 disk_reap "$H3.1" "$L3.1"
 
@@ -158,15 +167,111 @@ echo; echo "### CASE 4  DISK LEAKED (sweep off, SLOTS=1): saturation must block 
 L4="$TMP/case4.lock"; H4="$TMP/case4.holder"
 SLOTS=1 plant_orphan "$L4.1" "$H4.1" || exit 1
 if run_disk 0 5 "$L4" "$H4"; then
-  echo "-> FAIL: disk semaphore acquired despite a live orphan on its sole slot -- hollow sweep"; fail=1
+  bad "disk semaphore acquired despite a live orphan on its sole slot -- hollow sweep"
 else
-  echo "-> PASS: orphan blocked the sole slot and acquire failed red without the sweep"
+  ok "orphan blocked the sole slot and acquire failed red without the sweep"
 fi
 disk_reap "$H4.1" "$L4.1"
 
+# ----------------------------------------------------------------------------
+# Per-host slot-count override (${HOME}/.config/c2pool-ci/<lock basename>.slots).
+# Every case below drives the composite acquire.sh with the disk semaphore's
+# production input (slots=1) and proves the slot count BEHAVIOURALLY: how many
+# holders get in concurrently, and that the next one waits.
+# ----------------------------------------------------------------------------
+# $1 lock-base  $2 marker-base  $3 wait(s)  $4 GITHUB_ENV file ; extra env via caller
+run_slot() {
+  HEAVY_LEG_LOCK="$1" HEAVY_LEG_HOLDERFILE="$2" \
+  HEAVY_LEG_WAIT="$3" HEAVY_LEG_TTL=90 HEAVY_LEG_SWEEP=1 HEAVY_LEG_SLOTS=1 \
+  RUNNER_NAME="honesty-test-override" GITHUB_ENV="$4" \
+  bash "$ACQ2"
+}
+holder_of() { sed -n 's/^HEAVY_LEG_LOCK_HOLDER=//p' "$1" 2>/dev/null | tail -1; }
+drop() {  # $1 GITHUB_ENV file of the holder to release
+  local h; h="$(holder_of "$1")"
+  [ -n "$h" ] && kill "$h" 2>/dev/null || true
+  sleep 0.5 || true
+}
+drop_all() {  # $1 lock-base
+  local lk
+  for lk in "$1".*; do [ -e "$lk" ] && fuser -k "$lk" >/dev/null 2>&1 || true; done
+  sleep 0.3 || true
+}
+
+echo; echo "### CASE 5  OVERRIDE ABSENT: no file for this lock -> input slots=1, a 2nd holder waits"
+L5="$TMP/case5.lock"; H5="$TMP/case5.holder"; C5="$TMP/cfg5"
+mkdir -p "$C5"
+# A file for a DIFFERENT lock basename must not leak onto this one.
+echo 3 > "$C5/c2pool-heavy-leg.lock.slots"
+if HEAVY_LEG_CONFIG_DIR="$C5" run_slot "$L5" "$H5" 10 "$TMP/g5a" > "$TMP/c5a.log" 2>&1; then
+  ok "CASE 5: first holder acquired"
+else
+  bad "CASE 5: first holder failed to acquire"
+fi
+grep -q "slots=1 (source: action input)" "$TMP/c5a.log" \
+  && ok "CASE 5: logs slots=1 from the action input" || bad "CASE 5: source line missing/wrong: $(grep slots= "$TMP/c5a.log")"
+if HEAVY_LEG_CONFIG_DIR="$C5" run_slot "$L5" "$H5" 3 "$TMP/g5b" > "$TMP/c5b.log" 2>&1; then
+  bad "CASE 5: a 2nd holder got in with no override -- slot count is not 1"
+else
+  ok "CASE 5: 2nd holder blocked (1 slot), exactly as today"
+fi
+drop_all "$L5"
+
+echo; echo "### CASE 6  OVERRIDE=2 at \${HOME}/.config/c2pool-ci: two holders run concurrently, a third waits"
+L6="$TMP/case6.lock"; H6="$TMP/case6.holder"; HOME6="$TMP/home6"
+mkdir -p "$HOME6/.config/c2pool-ci"
+printf '# two ASan build trees fit this host\n2\n' > "$HOME6/.config/c2pool-ci/case6.lock.slots"
+# Production path: no HEAVY_LEG_CONFIG_DIR, lookup derives from $HOME.
+run6() { ( unset HEAVY_LEG_CONFIG_DIR; HOME="$HOME6" run_slot "$@" ); }
+if run6 "$L6" "$H6" 10 "$TMP/g6a" > "$TMP/c6a.log" 2>&1; then ok "CASE 6: holder A acquired"; else bad "CASE 6: holder A failed"; fi
+if run6 "$L6" "$H6" 10 "$TMP/g6b" > "$TMP/c6b.log" 2>&1; then ok "CASE 6: holder B acquired concurrently with A"; else bad "CASE 6: holder B blocked -- override not honoured"; fi
+grep -q "slots=2 (source: host override $HOME6/.config/c2pool-ci/case6.lock.slots)" "$TMP/c6a.log" \
+  && ok "CASE 6: logs slots=2 from the host override file" || bad "CASE 6: source line missing/wrong: $(grep slots= "$TMP/c6a.log")"
+grep -q "slot 1/2" "$TMP/c6a.log" && grep -q "slot 2/2" "$TMP/c6b.log" \
+  && ok "CASE 6: A and B hold distinct slots 1/2 and 2/2" || bad "CASE 6: unexpected slot numbers: $(grep -h acquired "$TMP/c6a.log" "$TMP/c6b.log")"
+run6 "$L6" "$H6" 30 "$TMP/g6c" > "$TMP/c6c.log" 2>&1 &
+C6PID=$!
+sleep 5
+if kill -0 "$C6PID" 2>/dev/null && ! grep -q "lock acquired" "$TMP/c6c.log"; then
+  ok "CASE 6: third holder C is WAITING while both slots are held"
+else
+  bad "CASE 6: third holder C did not wait: $(cat "$TMP/c6c.log")"
+fi
+drop "$TMP/g6a"   # free A's slot -> C must now get in (it waits, it is not failed)
+if wait "$C6PID"; then
+  ok "CASE 6: C acquired as soon as A released ($(grep -o 'slot [0-9]*/[0-9]*' "$TMP/c6c.log"))"
+else
+  bad "CASE 6: C failed after a slot was freed: $(tail -3 "$TMP/c6c.log")"
+fi
+drop_all "$L6"
+
+echo; echo "### CASE 7  OVERRIDE INVALID: falls back to input slots=1 with a warning"
+n7=0
+for v in abc 0 -1 1.5 99 007 ''; do
+  n7=$((n7+1))
+  L7="$TMP/case7-$n7.lock"; H7="$TMP/case7-$n7.holder"; C7="$TMP/cfg7-$n7"
+  mkdir -p "$C7"; printf '%s\n' "$v" > "$C7/case7-$n7.lock.slots"
+  if HEAVY_LEG_CONFIG_DIR="$C7" run_slot "$L7" "$H7" 10 "$TMP/g7a-$n7" > "$TMP/c7a-$n7.log" 2>&1 \
+     && grep -q "::warning::heavy-leg lock: ignoring host slot override" "$TMP/c7a-$n7.log" \
+     && grep -q "slots=1 (source: action input)" "$TMP/c7a-$n7.log"; then
+    ok "CASE 7: value '$v' ignored with a warning, input slots=1 used"
+  else
+    bad "CASE 7: value '$v' not handled: $(cat "$TMP/c7a-$n7.log")"
+  fi
+  if [ "$v" = abc ]; then
+    if HEAVY_LEG_CONFIG_DIR="$C7" run_slot "$L7" "$H7" 3 "$TMP/g7b-$n7" > "$TMP/c7b-$n7.log" 2>&1; then
+      bad "CASE 7: 2nd holder got in under an invalid override -- fallback is not 1 slot"
+    else
+      ok "CASE 7: 2nd holder blocked under invalid override (fallback really is 1 slot)"
+    fi
+  fi
+  drop_all "$L7"
+done
+
 echo
+echo "RESULT: ${npass} passed, ${nfail} failed"
 if [ "$fail" = 0 ]; then
-  echo "HONESTY GATE PASSED: perturb -> reaped -> green ; restore leak -> red"
+  echo "HONESTY GATE PASSED: perturb -> reaped -> green ; restore leak -> red ; slot override honoured/ignored as specified"
 else
   echo "HONESTY GATE FAILED"
 fi

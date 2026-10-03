@@ -150,7 +150,7 @@ void suite_identities() {
         CHECK(d.ref() == ref_of(n), "N5 %s: donation_ref == make_xmr_std(decoded B, A)", name(n));
         CHECK(id_of(n) == ::v37::xmr::xmr_identity_key(ref_of(n)), "N6 %s: donation_identity == identity_key(donation_ref)", name(n));
         const x6::FixedOutput m = marker_of(n);
-        CHECK(m.pay == ref_of(n) && m.identity == id_of(n) && m.amount == fee::kDonationDustPico,
+        CHECK(m.pay == ref_of(n) && m.identity == id_of(n) && m.amount == fee::kDonationMarkerPico,
               "N7 %s: donation_marker pays this network's donation, minimum %llu", name(n), (unsigned long long)m.amount);
         CHECK(::v37::xmr::xmr_ref_valid(ref_of(n)), "N8 %s: the donation ref passes the LIVE ed25519 torsion check", name(n));
         ids.insert(hex(id_of(n)));
@@ -207,11 +207,14 @@ void suite_pushes() {
     std::printf("== P. give-author pushes pay this network's donation ==\n");
     const ::v37::ScriptRef miner = ::v37::xmr::make_xmr_std(point_of(5), point_of(6));
     for (Net n : kNets) {
+        // A2: ONE push of weight 65535 whose composite identity names this network's donation.
         const auto p = pushes_of(miner, 655, n);
-        CHECK(p.size() == 2 && p[0].first == miner && p[0].second == 65535 - 655 && p[1].first == ref_of(n) && p[1].second == 655,
-              "P1 %s: d=655 -> (miner, 64880), (donation[%s], 655)", name(n), name(n));
+        ::v37::xmr::XmrGiveAuthor g;
+        const bool one = p.size() == 1 && p[0].second == 65535 && ::v37::xmr::decode_xmr_give_author(p[0].first, g);
+        CHECK(one && g.d == 655 && g.payee == miner && g.donation == ref_of(n),
+              "P1 %s: d=655 -> ONE push (composite(655, miner, donation[%s]), 65535)", name(n), name(n));
         if (n != Net::Mainnet)
-            CHECK(p.size() == 2 && !(p[1].first == fee::donation_ref()), "P2 %s: the donation push does NOT pay the mainnet identity", name(n));
+            CHECK(one && !(g.donation == fee::donation_ref()), "P2 %s: the composite does NOT name the mainnet donation", name(n));
     }
 }
 

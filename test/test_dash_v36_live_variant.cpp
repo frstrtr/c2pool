@@ -64,7 +64,7 @@ TEST(DashV36LiveVariant, PublicTypeThirtySixThrowsExactlyAsMasterAndIsolatedLoad
     const Bytes w16 = wire_of(v16);
 
     // ── public network ──
-    ASSERT_FALSE(SharechainConfig::isolated_v36());
+    ASSERT_FALSE(SharechainConfig::v36_network());
     EXPECT_EQ(invalid_arg_text([&] { auto s = load(36, w36); s.destroy(); }), MASTER_UNKNOWN_TYPE_TEXT);
     // The same text an arbitrary unknown type gets: the generic load-map miss,
     // not a new DASH-specific message.
@@ -86,7 +86,7 @@ TEST(DashV36LiveVariant, PublicTypeThirtySixThrowsExactlyAsMasterAndIsolatedLoad
 
     // ── private/isolated v36 sharechain ──
     SharechainConfig::set_network_id(ISO_ID, ISO_PFX);
-    ASSERT_TRUE(SharechainConfig::isolated_v36());
+    ASSERT_TRUE(SharechainConfig::v36_network());
     {
         auto s = load(36, w36);
         EXPECT_EQ(s.version(), 36);

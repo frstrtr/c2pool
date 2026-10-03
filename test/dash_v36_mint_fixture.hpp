@@ -9,8 +9,9 @@
 // (solve_job: the stratum merkle branches folded into the header root, a REAL
 // X11 nonce search against the job's committed share target), coinbase output
 // parsing, and the loopback version-handshake harness that drives the REAL
-// NodeImpl::handle_version. Everything is in an anonymous namespace: each
-// including TU gets its own copy.
+// NodeImpl::handle_version (and reads the REAL send_version frame).
+// Everything is in an anonymous namespace: each including TU gets its own
+// copy.
 
 #include "dash_v36_live_fixture.hpp"
 
@@ -24,7 +25,10 @@
 
 #include <boost/asio.hpp>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -334,6 +338,45 @@ std::string handshake_on(dash::NodeImpl& node, LoopbackPair& pair, StubCommunica
     }
     io.stop(pair.ioc_node);
     return result;
+}
+
+// Handshake results are exception texts; assert on a substring (no gmock in
+// this target).
+::testing::AssertionResult has_substr(const std::string& s, const std::string& sub) {
+    if (s.find(sub) != std::string::npos) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << "\"" << s << "\" does not contain \"" << sub << "\"";
+}
+
+// Reads exactly one wire frame (prefix | command[12] | length u32 LE |
+// checksum[4] | payload) off the far end of a loopback pair. Bounded by a
+// deadline so a missing write fails the assertion instead of hanging CI;
+// returns what arrived (possibly short) on timeout.
+Bytes read_one_frame(boost::asio::ip::tcp::socket& s,
+                     std::chrono::milliseconds budget = std::chrono::milliseconds(3000)) {
+    constexpr std::size_t HDR = 4 + 12 + 4 + 4;
+    Bytes buf;
+    std::size_t want = HDR;
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    s.non_blocking(true);
+    while (buf.size() < want && std::chrono::steady_clock::now() < deadline) {
+        std::array<unsigned char, 4096> chunk{};
+        boost::system::error_code ec;
+        const std::size_t n = s.read_some(
+            boost::asio::buffer(chunk.data(), std::min(chunk.size(), want - buf.size())), ec);
+        if (n > 0) {
+            buf.insert(buf.end(), chunk.begin(), chunk.begin() + n);
+            if (buf.size() == HDR && want == HDR) {
+                uint32_t len = 0;
+                std::memcpy(&len, buf.data() + 4 + 12, 4);
+                want = HDR + len;
+            }
+        } else if (ec == boost::asio::error::would_block) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        } else if (ec) {
+            break;
+        }
+    }
+    return buf;
 }
 
 // The same on a fresh rig-free node, destroyed before its loopback pair.
