@@ -32,6 +32,22 @@ supported by the same binary. The remaining work is the daemonless-finalize item
 below (retiring the `--coin-rpc` fallback entirely). See
 [Per-binary launch reference](#per-binary-launch-reference) for the flags.
 
+**DASH v36 network (code merged 2026-10-03, seed nodes not yet deployed).**
+`c2pool-dash --net dash-v36` joins a separate DASH sharechain that uses the V36
+share format. It has its own identity (network id `ac2785363c0180b8`, protocol
+3601), so it never mixes with the v16 `p2pool-dash` sharechain, and its own P2P
+port **8998**. The v16 network keeps 8999 and is unchanged. What the v36 network
+adds:
+- v36 shares commit the template's transactions, and the node that finds a block
+  assembles the full block (PR #1856);
+- cheap pre-checks before X11, plus size and count caps on incoming shares
+  (PR #1850);
+- a graded misbehaviour score and ban for sharechain peers (PR #1858);
+- built-in seeds on port 8998, so a node started with `--net dash-v36` and no
+  `--addnode` finds the network by itself (PR #1859).
+The two public seed nodes are being deployed; until they listen on 8998, the
+v36 network has no public peers.
+
 ## Governance
 
 Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
@@ -117,7 +133,10 @@ and does not yet exist, so the work can be judged on what it actually is.
 ### What exists
 - A **formally specified** settlement/lanes core: TLA⁺ specs, model-checked with
   TLC (green over the bounded configurations checked in). This is a proof over a
-  *model*, not evidence at scale.
+  *model*, not evidence at scale. `proto/tla/Settlement.tla` revision 2 records
+  the owed-sign decisions (a per-key floor, a non-negative aggregate, no
+  clawback; PR #1846), and `proto/tla/SettlementCanon.tla` models the XMR lane
+  ledger under the coinbase recompute and the drain rule (PR #1892).
 - **A v37 engine consumer tree implemented in C++** under `src/c2pool/v37/` — the
   Work Receipts / Roundabout settlement pipeline as a **reference/prototype engine
   behind CI, not a production node.** Merged behind CI: the W1 O1 executor and W2
@@ -140,6 +159,28 @@ and does not yet exist, so the work can be judged on what it actually is.
   lane coinbase and books a block that does not match as debit-only (PR #1884);
   every consensus parameter is part of the pool identity (PR #1894); and old
   balances drain from a capped slice of each block (PR #1895).
+  Since 2026-09-27 the lane also has: an installable node package with a
+  run-a-node guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md));
+  raindrops (sub-threshold work credited like shares) on by default (PR #1818); a built-in mainnet
+  bootstrap list, peer discovery and a persistent peer book (PRs #1819 / #1820);
+  repair below the vault horizon that survives restarts (PR #1824); a verify worker
+  pool for raindrops (PR #1839); a refusal of node-local settings that would split
+  the owed ledger on mainnet (PR #1872); and the node's fees disclosed in every
+  stratum login reply (PR #1880). The payout rules, fees and known limits are
+  written up in [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md)
+  (PR #1879), and a public comparison with other decentralized pools is in
+  [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR #1901).
+- **Rule upgrades without stopping the pool, voted by miners' work (designed, not
+  implemented).** Rule epochs are appended to the lane's history and activate by a
+  vote weighted by miners' finalized work. Each miner's work votes; by default the
+  vote is delegated to the node operator, and any miner can override it with one
+  word in a stock xmrig password. Old nodes hold instead of forking, and a fixed
+  constitution means earned balances cannot be reduced, delayed or redirected by
+  any vote. Today a rule change on the XMR lane is still a new pool genesis. The
+  design note is in PR #1908 (draft). The first slice, which fixes the pool identity
+  from a derived genesis and adds the epoch and vote sections to the wire and the
+  store, is in PR #1911 (draft). It is meant to be the last flag day before the
+  Monero mainnet genesis.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
@@ -159,7 +200,10 @@ and does not yet exist, so the work can be judged on what it actually is.
   the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR
   #1518). Three daemonless nodes have run together on stagenet in day-long
   capstone tests (PRs #1697 / #1704 / #1857); no multi-node run has yet met the
-  full capstone bar. Mainnet stays double-fenced.
+  full capstone bar. Attempt 9 started on 2026-10-03 at 09:36 UTC (24 hours).
+  Mainnet stays double-fenced. Funding for the mainnet milestone is requested in
+  Monero CCS proposal !699 (25 XMR), which is on the agenda of the Monero community
+  workgroup meeting of 2026-10-03.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
@@ -201,11 +245,13 @@ and does not yet exist, so the work can be judged on what it actually is.
 
 ### CI / repo state
 - The v37 research line is merged to `master` (PR #809, "V37 dev"), and the v37
-  engine consumer tree (`src/c2pool/v37/`, W1–W5) and the isolated XMR Family-B lane
-  (`src/impl/xmr/`) now build behind CI on both build legs. **Current master CI is
-  green across the required per-coin gates and the coin matrix** (DASH / LTC / BCH /
-  DGB / DOGE); the RandomX-dependent XMR checks run CI-gated in light mode, and the
-  CodeQL security scan is a non-gating job.
+  engine consumer tree (`src/c2pool/v37/`, W1 to W6) and the isolated XMR Family-B lane
+  (`src/impl/xmr/`) now build behind CI on both build legs. Branch protection
+  requires the per-coin gates and the coin matrix (DASH / LTC / BCH / DGB / DOGE)
+  to pass before a merge; the CI badge above shows the state of the latest master
+  run. The RandomX-dependent XMR checks run CI-gated in light mode, and the
+  CodeQL security scan is a non-gating job. A few v37 relay and soak tests have
+  known timing flakes, tracked in issues #1885, #1889, #1890 and #1905.
 
 ### Provenance
 c2pool builds on ideas from p2pool but is an **independent codebase**. No outside
@@ -262,7 +308,17 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 
 ### Verify downloads
 
-Each release includes a `SHA256SUMS` file. Verify after downloading:
+Each release includes a `SHA256SUMS` file, and recent releases also include a
+detached signature `SHA256SUMS.asc` (from v0.2.7; added to v0.2.8 on 2026-10-03).
+Check the signature with the maintainer key published at
+<https://github.com/frstrtr.gpg> (key `50AB1379285EFE76`):
+
+```bash
+curl -s https://github.com/frstrtr.gpg | gpg --import
+gpg --verify SHA256SUMS.asc SHA256SUMS
+```
+
+Then verify the files:
 
 ```bash
 # Linux / macOS
@@ -591,6 +647,10 @@ the DGB pool. See [c2pool-dgb](#c2pool-dgb--digibyte-scrypt) below.
 | 9326 | P2Pool sharechain (peer-to-peer) |
 | 9327 | Stratum mining |
 | 8080 | Web dashboard + REST API |
+
+Per-coin binaries use their own defaults. For DASH: sharechain 8999 on the v16
+network and **8998** on the v36 network (`--net dash-v36`); a private
+`--network-id` chain keeps 8999 (18999 on testnet).
 
 ---
 
