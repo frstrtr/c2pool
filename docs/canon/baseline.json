@@ -1,0 +1,162 @@
+{
+  "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
+  "commit": "65b90571a13164c964116610c202d6d07d39e5e9",
+  "rules": {
+    "C01": {
+      "checks": {
+        "carrier-sharechain-kat": {
+          "kats": {
+            "xmr_carrier_sharechain_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C02": {
+      "checks": {
+        "no-display-only-prev-own": {
+          "count": 3,
+          "per_file": {
+            "src/impl/xmr/receipt/xmr_admission.hpp": 1,
+            "src/impl/xmr/receipt/xmr_receipt.hpp": 2
+          },
+          "status": "fail"
+        },
+        "prev-own-enforced-kat": {
+          "kats": {
+            "xmr_receipt_prev_own_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C03": {
+      "checks": {
+        "engine-n-ctx-bins": {
+          "status": "pass"
+        },
+        "late-tail-bins": {
+          "status": "fail"
+        },
+        "legally-dead-kat": {
+          "kats": {
+            "xmr_receipt_legally_dead_kat": false
+          },
+          "status": "fail"
+        },
+        "w2-n-ctx": {
+          "status": "pass"
+        },
+        "xmr-admission-n-ctx": {
+          "status": "pass"
+        }
+      },
+      "status": "fail"
+    },
+    "C04": {
+      "checks": {
+        "owed-ledger-symbols": {
+          "count": 97,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 12,
+            "src/c2pool/v37/xmr/relay/xmr_share_verdict.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 9,
+            "src/c2pool/v37/xmr/xmr_finalize_driver.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_light_proof.hpp": 5,
+            "src/c2pool/v37/xmr/xmr_minority_converge.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_node.hpp": 5,
+            "src/c2pool/v37/xmr/xmr_node_config.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_node_smoke.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp": 10,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_provider.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_source.hpp": 10,
+            "src/c2pool/v37/xmr/xmr_settle_store.hpp": 5,
+            "src/impl/xmr/mbp/mbp_wiring.hpp": 6,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 6,
+            "src/impl/xmr/settle/xmr_coinbase.hpp": 3,
+            "src/impl/xmr/settle/xmr_drain_rule.hpp": 11,
+            "src/impl/xmr/template/xmr_block_assembly.hpp": 1
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C05": {
+      "checks": {
+        "no-uncle-code": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C06": {
+      "checks": {
+        "credit-kats": {
+          "kats": {
+            "v37_w2_ingestion_test": true,
+            "xmr_receipt_bind_v2_kat": true,
+            "xmr_receipt_kat": true
+          },
+          "status": "pass"
+        },
+        "no-credit-from-achieved": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "r1-stage-admission": {
+          "status": "pass"
+        },
+        "r1-stage-relay": {
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C07": {
+      "checks": {
+        "exact-sum-kats": {
+          "kats": {
+            "xmr_coinbase_kat": true,
+            "xmr_e2e_kat": true
+          },
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C08": {
+      "checks": {
+        "clock-reads-outside-allowlist": {
+          "count": 85,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp": 1,
+            "src/c2pool/v37/xmr/relay/xmr_relay_node.hpp": 71,
+            "src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp": 13
+          },
+          "status": "fail"
+        },
+        "no-clock-in-consensus-core": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "fail"
+    },
+    "C09": {
+      "checks": {},
+      "status": "pass"
+    },
+    "C10": {
+      "checks": {},
+      "status": "n/a"
+    }
+  }
+}
