@@ -600,7 +600,7 @@ if (BUILD_TESTING)
     #     native template path never touches the transport.
     #
     #     Heaviest of the v37 consumer KATs and deliberately so: it links
-    #     `xmr_template` (the p2pool whole-block template port), compiles the X6
+    #     `xmr_template` (the clean-room whole-block template), compiles the X6
     #     executor (settle/xmr_coinbase.cpp) and the ed25519 point-check
     #     registrar, because a settlement coinbase that is not actually derived
     #     is not the thing M2 claims to have preserved. Both are already on the

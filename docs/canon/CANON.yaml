@@ -758,8 +758,8 @@ rules:
         pattern: 'This file is part of the Monero P2Pool|terms of the GNU (?:Lesser )?General Public License|SPDX-License-Identifier:\s*(?:GPL|LGPL|MPL)-'
         scope: xmr_lane_licence
         code_only: false
-        note: 'Today src/impl/xmr/template/xmr_block_template.{hpp,cpp} are adapted from SChernykh/p2pool (GPL-3.0-only) with no recorded ruling; the clean-room version replaces them (D17).'
-    status_now: fail
+        note: 'The p2pool-derived src/impl/xmr/template/xmr_block_template.{hpp,cpp} (GPL-3.0-only) were replaced by the clean-room version in #1922 (D17 closed).'
+    status_now: pass
     deviation: [D13, D17]
 
   - id: C33

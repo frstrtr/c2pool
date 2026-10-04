@@ -905,7 +905,7 @@ target_include_directories(c2pool-v37-xmr PRIVATE
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
 c2pool_xmr_drops_default(c2pool-v37-xmr)   # XMR-DROPS-DEFAULT: raindrops ON (see the helper)
 target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
-# xmr_template carries the p2pool block-template port + the authored primitive
+# xmr_template carries the clean-room block template + the authored primitive
 # seam bodies (xmr_coin_primitives.cpp). Link it EXACTLY ONCE and NEVER define
 # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES here (that ODR path is KAT-only).
 # M2 (--xmr-template-source native): the embedded native-minimal Monero node.
