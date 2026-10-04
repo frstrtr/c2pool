@@ -748,3 +748,17 @@ rules:
         note: 'Slices S1 and S2 create this KAT: monotone template height along the carrier chain (a lower child is invalid, a same-height race is valid on both sides), the dead or live decision of a receipt from chain data with no clock, and the retarget time base as a Monero height span.'
     status_now: fail
     deviation: [D1]
+
+  - id: C34
+    title: towing retired lanes
+    statement: 'When a lane is retired (a rule epoch change, a roundabout merge, or death below a committed demonstrated-work floor such as about 5 % of its origin work, compared in integers), its successor lane TOWS it: the retired lane live window entries stay payable inside the successor window at their origin bins and age out by time, so no in-window work is lost or counted twice; a retired lane never freezes; the evaporation rule of a dead lane is distinct from the widening rule of a live low-luck lane; and commitments are never forgotten (MMR) while bodies may be (see C23, C24).'
+    source: 'the: docs/c2pool-v37-design-of-record-status.md ("Consequence for evaporation / fork retirement"); docs/v37/MRR-REDESIGN.md section B6 (forget stale forks and bodies, never commitments); branch research/adaptive-roundabout docs/v37-persistent-version-agnostic-roundabout-spine.md sections 3 and 9.3 (a version transition is an append; LANE_OPEN and LANE_SEAL; chain of chains); the#66 section 2.8, commit 9a43115 (trailer drain, verdict BOUNDED: the retired lane drains in about W successor pushes)'
+    ruling: 'operator 2026-09-06 (trailer coupling for a frozen retired lane, U-13); operator 2026-10-04 18:35 +04 (towing as a canon rule, target state under Path B)'
+    scope: [src/c2pool/v37/xmr/, src/sharechain/v37/]
+    checks:
+      - name: towing-kat
+        type: required_kat
+        kats: [xmr_lane_tow_kat]
+        note: 'Pins, for a rule epoch change and for a merge: no in-window work lost, none counted twice, the retired lane drains by time (origin bins) and never freezes, and the death floor is an integer compare against committed demonstrated work. Today the XMR lane runs the positional window of src/sharechain/v37/v37_lane.hpp (LaneParams window = 8640, eviction by position), which freezes an unfed lane.'
+    status_now: fail
+    deviation: [D14]

@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "d81d526747244c207b0bc638ab0ff628a8985c0e",
+  "commit": "89046b80225949911e3348535b285df4da93395d",
   "rules": {
     "C01": {
       "checks": {
@@ -849,6 +849,17 @@
         "carrier-timestamp-kat": {
           "kats": {
             "xmr_carrier_timestamp_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C34": {
+      "checks": {
+        "towing-kat": {
+          "kats": {
+            "xmr_lane_tow_kat": false
           },
           "status": "fail"
         }
