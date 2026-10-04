@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "7b5529300e88e62d89437bc2507c351ef882f1f4",
+  "commit": "d7b31d4edc6341abaeb7e5697f8bc7b43f1c8ac0",
   "rules": {
     "C01": {
       "checks": {
@@ -249,16 +249,18 @@
     },
     "C18": {
       "checks": {
-        "drops-code-may-not-grow": {
-          "count": 0,
-          "per_file": {},
+        "count-estimator-kats": {
+          "kats": {
+            "v37_xmr_drops_count_kat": true,
+            "v37_xmr_drops_default_kat": true
+          },
           "status": "pass"
         },
-        "drops-default-off": {
-          "status": "fail"
+        "drops-default-on": {
+          "status": "pass"
         }
       },
-      "status": "fail"
+      "status": "pass"
     },
     "C19": {
       "checks": {

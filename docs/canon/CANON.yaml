@@ -454,27 +454,23 @@ rules:
     deviation: []
 
   - id: C18
-    title: raindrops off in Path B v1
-    statement: 'Raindrops (DROPS) are OFF in Path B v1: no XMR build arms them by default, and they return only as a later ratchet epoch with an estimator that has no branch on S.'
-    source: 'SCHERNYKH-ALIGNMENT.md row "Estimator branch on S"; PLAN-STRICT (raindrops are not in v1); PATH-B.md later rulings'
-    ruling: 'operator 2026-10-04 15:51 +04 (raindrops OFF in Path B v1)'
+    title: raindrops on in Path B v1
+    state: proposed
+    statement: 'Raindrops (DROPS) are ON in Path B v1: the Count estimator, carried by open carriage, with raindrop payees inside roundabout payment groups; the XMR node arms them by default.'
+    source: 'operator ruling 2026-10-04 22:27 +04 (raindrops come back in Path B v1, subject to load, carrier-capacity, group-growth and sybil checks; supersedes the raindrops-off ruling of 2026-10-04 15:51 +04)'
+    waits_for: 'the load, carrier-capacity, group-growth and sybil checks of the design run the 2026-10-04 22:27 +04 ruling calls for'
     scope: [src/c2pool/CMakeLists.txt, src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
     checks:
-      - name: drops-default-off
+      - name: drops-default-on
         type: required
-        pattern: 'option\(V37_XMR_DROPS_DEFAULT\s+"[^"]*"\s+OFF\)'
-        paths: [CMakeLists.txt, src/c2pool/CMakeLists.txt]
+        pattern: 'option\(V37_XMR_DROPS_DEFAULT\s+"[^"]*"\s+ON\)'
+        paths: [src/c2pool/CMakeLists.txt]
         code_only: false
-        note: 'Today option(V37_XMR_DROPS_DEFAULT ... ON) arms DROPS (V37_ACTIVATE_CONSENSUS_V1) in every default XMR build.'
-      - name: drops-code-may-not-grow
-        type: forbidden
-        pattern: '(?i)\b\w*raindrop\w*\b|\bXmrDropsWiring\b'
-        scope: xmr_lane_code
-        code_only: true
-        allowlist: allowlist/C18-drops.txt
-        note: 'The raindrop code stays, dormant, for the later ratchet epoch (operator 2026-10-04 18:47 +04); the allowlist records it file by file and it may not grow.'
-    status_now: fail
-    deviation: [D8]
+        note: 'The XMR node and its KATs build with raindrops armed (c2pool_xmr_drops_default).'
+      - name: count-estimator-kats
+        type: required_kat
+        kats: [v37_xmr_drops_count_kat, v37_xmr_drops_default_kat]
+    status_now: pass
 
   - id: C19
     title: node-owner fee checkable by the receipt hash
