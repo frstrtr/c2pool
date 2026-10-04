@@ -1113,7 +1113,11 @@ def main(argv=None):
     ap.add_argument("--pr-body", help="file with the pull request body (enables rule C10)")
     ap.add_argument("--changed-files", help="file listing the PR's changed paths, one per line")
     ap.add_argument("--base", help="git ref to diff against for the changed files (instead of --changed-files)")
-    ap.add_argument("--write-baseline", action="store_true", help="write the baseline from this run")
+    ap.add_argument("--write-baseline", action="store_true",
+                    help="write the baseline from this run; refused while the run has new violations "
+                         "against the existing baseline (the baseline only ratchets down)")
+    ap.add_argument("--accept-new", action="store_true",
+                    help="with --write-baseline: write it even over new violations (needs an operator ruling)")
     ap.add_argument("--selftest", action="store_true", help="run the parser and helper self-test")
     ap.add_argument("--quiet", action="store_true", help="print only new violations and the summary")
     a = ap.parse_args(argv)
@@ -1131,7 +1135,7 @@ def main(argv=None):
         base_path = os.path.abspath(a.baseline or os.path.join(canon_dir, canon.get("baseline", "baseline.json")))
         register = parse_register(reg_path)
         baseline = None
-        if os.path.isfile(base_path) and not a.write_baseline:
+        if os.path.isfile(base_path):
             with open(base_path, encoding="utf-8") as f:
                 baseline = json.load(f)
         tree = Tree(a.root)
@@ -1156,6 +1160,12 @@ def main(argv=None):
 
     head = tree.head()
     if a.write_baseline:
+        if new and baseline is not None and not a.accept_new:
+            print("canon_check: baseline NOT written: %d new violation(s) against the existing baseline; "
+                  "fix them, or pass --accept-new under an operator ruling" % len(new), file=sys.stderr)
+            for m in new:
+                print("  NEW %s" % m, file=sys.stderr)
+            return 1
         b = make_baseline(results, head)
         with open(base_path, "w", encoding="utf-8") as f:
             json.dump(b, f, indent=2, sort_keys=True)
