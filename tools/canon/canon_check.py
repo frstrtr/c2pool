@@ -1101,7 +1101,7 @@ def selftest(canon_path):
             parse_yaml(bad)
             fails.append("yaml accepted %r" % bad)
         except CanonError:
-            pass
+            pass  # expected: the YAML subset parser refuses this input
     ok(glob_to_re("src/impl/xmr/**").match("src/impl/xmr/a/b.hpp"), "glob **")
     ok(not glob_to_re("src/impl/xmr/*.hpp").match("src/impl/xmr/a/b.hpp"), "glob *")
     ok(glob_to_re("**/test/**").match("src/impl/xmr/test/x.cpp"), "glob leading **")
@@ -1130,7 +1130,7 @@ def selftest(canon_path):
 
     class _T(Tree):
         def __init__(self):
-            self.root = "/"
+            super().__init__("/")
 
         def select(self, include, exclude=(), exts=None):
             return ["CMakeLists.txt"]
