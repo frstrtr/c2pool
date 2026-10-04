@@ -1,0 +1,5 @@
+# Canon rule C35 allowlist: reviewed narrowing casts in the XMR lane
+# consensus core. Format: <path> <max count> <reason>. A cast is listed only
+# with its proof (static_assert, documented bound or explicit refusal) and the
+# extreme-value KAT that pins it. Empty at the baseline of 2026-10-04: the 133
+# casts counted then are unreviewed and recorded as deviation D15.
