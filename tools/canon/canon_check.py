@@ -767,6 +767,31 @@ def parse_canon_line(body, known_ids):
     return True, ids, "Canon: %s" % ", ".join(ids)
 
 
+KAT_LINE_RE = re.compile(r"^[ \t>*_-]*KAT:[ \t]*(.+?)[ \t*_]*$", re.M)
+
+
+def parse_kat_line(body, registered):
+    """Returns (ok, names, message). 'KAT: none (reason)' needs a reason; every
+    named test must be registered in the tree's CMake."""
+    m = KAT_LINE_RE.search(body or "")
+    if not m:
+        return False, [], "no 'KAT:' line in the PR body"
+    val = m.group(1).strip()
+    if re.match(r"^none\b", val, re.I):
+        if re.search(r"\(\s*\S.{2,}\)", val):
+            return True, [], "KAT: none, with a reason"
+        return False, [], "'KAT: none' needs a reason in parentheses"
+    bare = re.sub(r"\([^)]*\)", " ", val)   # "(RED on master, GREEN here)" is commentary
+    names = [x.strip("`.;:") for x in re.split(r"[,\s]+", bare) if x.strip("`.;:")]
+    names = [x for x in names if x.upper() not in ("RED", "GREEN", "RED/GREEN", "AND")]
+    if not names:
+        return False, [], "empty 'KAT:' line"
+    unknown = [x for x in names if x not in registered]
+    if unknown:
+        return False, names, "KAT(s) not registered in CMake: %s" % ", ".join(unknown)
+    return True, names, "KAT: %s" % ", ".join(names)
+
+
 def check_pr_body(tree, canon, canon_dir, chk, ctx):
     if ctx.pr_body is None:
         return {"status": "n/a", "detail": "no --pr-body given"}
@@ -774,9 +799,15 @@ def check_pr_body(tree, canon, canon_dir, chk, ctx):
     pats = [glob_to_re(p) for p in chk.get("paths") or []]
     touched = sorted(f for f in changed if any(r.match(f) for r in pats))
     if not touched:
-        return {"status": "pass", "detail": "no consensus path touched (%d changed file(s))" % len(changed),
+        return {"status": "pass", "detail": "no governed path touched (%d changed file(s))" % len(changed),
                 "touched": []}
-    ok, ids, msg = parse_canon_line(ctx.pr_body, ctx.rule_ids)
+    line = chk.get("line", "Canon")
+    if line == "Canon":
+        ok, ids, msg = parse_canon_line(ctx.pr_body, ctx.rule_ids)
+    elif line == "KAT":
+        ok, ids, msg = parse_kat_line(ctx.pr_body, set(ctx.tests(tree)))
+    else:
+        raise CanonError("check %s: unknown pr_body line %r" % (chk.get("name"), line))
     return {"status": "pass" if ok else "fail", "detail": msg, "touched": touched[:20], "named": ids}
 
 
@@ -804,6 +835,13 @@ class Ctx:
         return self._targets
 
 
+# A ruled rule is the design: failing it without an open deviation is a NEW
+# violation. A proposed rule is a researched gate that still waits for an
+# operator ruling: it is evaluated and reported, never fails the run, needs no
+# deviation, and becomes ruled (state: ruled, ruling: ...) in the PR that
+# records the ruling.
+RULE_STATES = ("ruled", "proposed")
+
 CHECKS = {
     "forbidden": check_forbidden,
     "required": check_required,
@@ -826,7 +864,18 @@ def run(tree, canon, canon_dir, register, baseline, ctx):
         for f in ("statement", "source", "checks"):
             if not r.get(f):
                 raise CanonError("rule %s: missing %s" % (rid, f))
+        state = r.get("state", "ruled")
+        if state not in RULE_STATES:
+            raise CanonError("rule %s: state %r is not one of %s" % (rid, state, ", ".join(RULE_STATES)))
+        if state == "ruled" and not r.get("ruling"):
+            raise CanonError("rule %s: a ruled rule names its ruling (who, when)" % rid)
+        if state == "proposed":
+            if not r.get("waits_for"):
+                raise CanonError("rule %s: a proposed rule names the ruling it waits for (waits_for)" % rid)
+            if r.get("deviation"):
+                raise CanonError("rule %s: a proposed rule has no deviation; it is not yet the design" % rid)
         res = {"id": rid, "title": r.get("title", ""), "deviations": list(r.get("deviation") or []),
+               "state": state, "ruling": r.get("ruling"), "waits_for": r.get("waits_for"),
                "status_now": r.get("status_now"), "checks": []}
         names = set()
         for chk in r["checks"]:
@@ -899,7 +948,13 @@ def run(tree, canon, canon_dir, register, baseline, ctx):
         if res["status"] == "fail" and not open_devs and not any(
                 c["type"] in ("register", "pr_body") for c in res["checks"] if c["status"] == "fail"):
             res["new"].insert(0, "rule fails and has no open deviation in the register")
-        if res["new"]:
+        if res["state"] == "proposed":
+            for m in res["new"]:
+                if "no open deviation" not in m:
+                    notes.append("%s (proposed, waits for: %s) %s" % (rid, res["waits_for"], m))
+            res["new"] = []
+            res["verdict"] = "proposed"
+        elif res["new"]:
             res["verdict"] = "NEW"
         elif res["status"] == "fail":
             res["verdict"] = "known"
@@ -953,6 +1008,8 @@ def check_register(results, register, canon):
     for res in results:
         if any(c["type"] == "register" for c in res["checks"]):
             continue
+        if res.get("state") == "proposed":
+            continue
         failing = any(c["status"] == "fail" and c["type"] != "pr_body" for c in res["checks"])
         if failing:
             if not [d for d in res["deviations"] if register.get(d, {}).get("state") in OPEN_WORDS]:
@@ -991,17 +1048,17 @@ def signature(results, new):
 def print_table(results, new, notes, closable, head, out=sys.stdout):
     w = out.write
     w("canon_check: %s\n\n" % (head or "(no git head)"))
-    w("%-4s %-6s %-6s %-10s %s\n" % ("RULE", "STATUS", "VERDICT", "DEVIATION", "CHECKS"))
+    w("%-4s %-6s %-8s %-10s %s\n" % ("RULE", "STATUS", "VERDICT", "DEVIATION", "CHECKS"))
     for r in results:
         first = True
         for c in r["checks"]:
             line = "%s=%s (%s)" % (c["name"], c["status"], c.get("detail", ""))
             if first:
-                w("%-4s %-6s %-6s %-10s %s\n" % (r["id"], r["status"], r["verdict"],
+                w("%-4s %-6s %-8s %-10s %s\n" % (r["id"], r["status"], r["verdict"],
                                                ",".join(r["deviations"]) or "-", line))
                 first = False
             else:
-                w("%-4s %-6s %-6s %-10s %s\n" % ("", "", "", "", line))
+                w("%-4s %-6s %-8s %-10s %s\n" % ("", "", "", "", line))
     w("\nNEW VIOLATIONS: %d\n" % len(new))
     for m in new:
         w("  NEW %s\n" % m)
@@ -1059,6 +1116,14 @@ def selftest(canon_path):
     ok(parse_canon_line("Canon: none (non-consensus)", set())[0], "canon line none")
     ok(not parse_canon_line("no line here", set())[0], "canon line missing")
     ok(not parse_canon_line("Canon: C99", {"C01"})[0], "canon line unknown id")
+    ok(parse_kat_line("KAT: xmr_a_kat, xmr_b_kat (RED on master, GREEN here)", {"xmr_a_kat", "xmr_b_kat"})[0],
+       "kat line with commentary")
+    ok(not parse_kat_line("KAT: xmr_a_kat stray", {"xmr_a_kat"})[0], "kat line rejects stray words")
+    ok(parse_kat_line("KAT: xmr_a_kat, xmr_b_kat", {"xmr_a_kat", "xmr_b_kat"})[0], "kat line names")
+    ok(not parse_kat_line("KAT: xmr_c_kat", {"xmr_a_kat"})[0], "kat line unknown test")
+    ok(parse_kat_line("KAT: none (comment-only change)", set())[0], "kat line none with reason")
+    ok(not parse_kat_line("KAT: none", set())[0], "kat line none without reason")
+    ok(not parse_kat_line("no line", set())[0], "kat line missing")
     cm = ("set(L a_kat b_kat)\nforeach(k IN LISTS L)\n  add_test(NAME ${k} COMMAND ${k})\nendforeach()\n"
           "foreach(z c_kat d_kat)\n add_test(NAME ${z} COMMAND ${z})\nendforeach()\n"
           "add_test(NAME e_kat COMMAND e_bin --x) # add_test(NAME f_kat COMMAND f)\n")
