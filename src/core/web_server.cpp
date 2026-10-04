@@ -2812,9 +2812,13 @@ nlohmann::json MiningInterface::rest_stratum_stats()
     std::set<std::string> unique_addrs;
     std::map<std::string, int> ip_connections;   // IP → connection count
     std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique workers
+    const auto liveness = observe_worker_liveness(workers, now_steady);
+    int connections_silent = 0;
 
     nlohmann::json workers_json = nlohmann::json::object();
     for (const auto& [sid, w] : workers) {
+        const WorkerLiveness& lv = liveness.at(sid);
+        if (lv.silent) ++connections_silent;
         total_hashrate += w.hashrate;
         total_accepted += w.accepted;
         total_rejected += w.rejected;
@@ -2854,6 +2858,14 @@ nlohmann::json MiningInterface::rest_stratum_stats()
             // Keep earliest first_seen
             if (first_seen_ts < workers_json[worker_key]["first_seen"].get<uint64_t>())
                 workers_json[worker_key]["first_seen"] = first_seen_ts;
+            // #959: a worker is silent only if every one of its connections is;
+            // report the freshest connection's silence.
+            auto& wj = workers_json[worker_key];
+            wj["silent"] = wj["silent"].get<bool>() && lv.silent;
+            if (lv.silent_seconds < wj["silent_seconds"].get<int64_t>()) {
+                wj["silent_seconds"] = lv.silent_seconds;
+                wj["silent_threshold_seconds"] = lv.threshold_seconds;
+            }
         } else {
             workers_json[worker_key] = {
                 {"hash_rate", w.hashrate},
@@ -2869,7 +2881,10 @@ nlohmann::json MiningInterface::rest_stratum_stats()
                 {"shares", w.accepted + w.stale},
                 {"connected_seconds", elapsed},
                 {"remote_endpoint", w.remote_endpoint},
-                {"rtt_ms", w.rtt_ms}
+                {"rtt_ms", w.rtt_ms},
+                {"silent", lv.silent},
+                {"silent_seconds", lv.silent_seconds},
+                {"silent_threshold_seconds", lv.threshold_seconds}
             };
         }
     }
@@ -2886,6 +2901,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
 
     result["pool"] = {
         {"connections", static_cast<int>(workers.size())},
+        {"connections_active", static_cast<int>(workers.size()) - connections_silent},
+        {"connections_silent", connections_silent},
         {"workers", static_cast<int>(unique_addrs.size())},
         {"unique_addresses", static_cast<int>(unique_addrs.size())},
         {"total_accepted", total_accepted},
@@ -4477,6 +4494,26 @@ nlohmann::json MiningInterface::rest_local_stats()
     // only; reads a std::function set at startup, no tracker or peer state,
     // so no new lock surface.
     result["node_role"] = m_stratum_hashrate_fn ? "mining" : "relay";
+
+    // #959 active/total: a session count alone hides dead rigs that stay
+    // authorized, so the headline splits live contributors from SILENT
+    // sessions (authorized, no accepted share past the threshold). Reads the
+    // worker registry copy under its own short mutex, no tracker/peer lock.
+    {
+        const auto workers = effective_stratum_workers();
+        const auto liveness = observe_worker_liveness(
+            workers, std::chrono::steady_clock::now());
+        int silent = 0;
+        for (const auto& [sid, lv] : liveness)
+            if (lv.silent) ++silent;
+        const int total = static_cast<int>(workers.size());
+        result["stratum_sessions"] = {
+            {"total", total},
+            {"active", total - silent},
+            {"silent", silent},
+            {"silent_floor_seconds", kSilentFloorSeconds}
+        };
+    }
 
     // shares — {total, orphan, dead}
     // Sharechain stats now use O(log n) StatsSkipList — no caching needed.
@@ -7891,6 +7928,62 @@ std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::effective_st
     if (m_stratum_workers_fn)
         return m_stratum_workers_fn();
     return {};
+}
+
+MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
+    const WorkerInfo& w,
+    std::optional<std::chrono::steady_clock::time_point> last_share_at,
+    std::chrono::steady_clock::time_point now)
+{
+    WorkerLiveness out;
+    out.has_shared = last_share_at.has_value();
+
+    // Expected seconds between accepted shares at this session's vardiff.
+    double expected_s = 0.0;
+    if (w.hashrate > 0.0 && w.difficulty > 0.0)
+        expected_s = w.difficulty * 4294967296.0 / w.hashrate;
+    double scaled = expected_s * kSilentExpectedIntervals;
+    int64_t thr = kSilentFloorSeconds;
+    if (scaled > static_cast<double>(thr))
+        thr = scaled >= static_cast<double>(kSilentCapSeconds)
+            ? kSilentCapSeconds : static_cast<int64_t>(std::ceil(scaled));
+    out.threshold_seconds = thr;
+
+    // No share and no known connect time: nothing to measure from, so never
+    // call it silent.
+    if (!last_share_at && w.connected_at == std::chrono::steady_clock::time_point{})
+        return out;
+
+    const auto ref = last_share_at ? *last_share_at : w.connected_at;
+    out.silent_seconds = std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::seconds>(now - ref).count());
+    out.silent = out.silent_seconds >= thr;
+    return out;
+}
+
+std::map<std::string, MiningInterface::WorkerLiveness>
+MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>& workers,
+                                         std::chrono::steady_clock::time_point now) const
+{
+    std::map<std::string, WorkerLiveness> out;
+    std::lock_guard<std::mutex> lock(m_share_seen_mutex);
+    for (auto it = m_share_seen.begin(); it != m_share_seen.end();) {
+        if (workers.count(it->first)) ++it;
+        else it = m_share_seen.erase(it);   // session gone
+    }
+    for (const auto& [sid, w] : workers) {
+        auto [it, fresh] = m_share_seen.try_emplace(sid);
+        ShareSeen& seen = it->second;
+        if (fresh || w.accepted != seen.accepted) {
+            if (w.accepted > 0)
+                seen.last_share_at = now;
+            else
+                seen.last_share_at.reset();
+            seen.accepted = w.accepted;
+        }
+        out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+    }
+    return out;
 }
 
 // ──────────── /web/ sub-endpoints (share chain inspection) ───────────────
