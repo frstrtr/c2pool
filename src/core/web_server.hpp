@@ -2066,7 +2066,43 @@ public:
     void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
+    // #959 worker liveness. An authorized Stratum session that stops sending
+    // shares is SILENT -- distinct from both connected and disconnected -- so a
+    // dead rig holding a session is not counted as live capacity. Silence is
+    // measured from the session's last accepted share (or from connect if it
+    // never shared). The threshold is a 15-minute floor, raised to 6 expected
+    // share intervals at the session's own vardiff so a slow rig is not called
+    // silent between honest shares (Poisson: P(no share in 6 intervals) ~0.25%).
+    struct WorkerLiveness {
+        bool silent{false};
+        bool has_shared{false};          // an accepted share was seen this session
+        int64_t silent_seconds{0};       // since last share, else since connect
+        int64_t threshold_seconds{0};
+    };
+    static constexpr int64_t kSilentFloorSeconds = 900;
+    static constexpr int64_t kSilentCapSeconds = 7 * 24 * 3600;
+    static constexpr double kSilentExpectedIntervals = 6.0;
+    static WorkerLiveness classify_worker_liveness(
+        const WorkerInfo& w,
+        std::optional<std::chrono::steady_clock::time_point> last_share_at,
+        std::chrono::steady_clock::time_point now);
+    // Track when each session's accepted count last moved and classify every
+    // session in `workers`. Coin-agnostic: works on the effective registry
+    // (LTC's own or a coin target's), so no per-coin work source changes. The
+    // first sighting of a session that already has shares is stamped `now`
+    // (silence is never overstated); resolution is the gap between polls.
+    std::map<std::string, WorkerLiveness> observe_worker_liveness(
+        const std::map<std::string, WorkerInfo>& workers,
+        std::chrono::steady_clock::time_point now) const;
+
 private:
+    struct ShareSeen {
+        uint64_t accepted{0};
+        std::optional<std::chrono::steady_clock::time_point> last_share_at;
+    };
+    mutable std::map<std::string, ShareSeen> m_share_seen;   // keyed by session_id
+    mutable std::mutex m_share_seen_mutex;
+
     // Effective per-worker registry for the stats/display path: the locally
     // registered workers (LTC dashboard-owned acceptor) when present, else the
     // external provider (coin-target acceptor bound to its own IWorkSource).
