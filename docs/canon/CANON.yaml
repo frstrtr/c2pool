@@ -36,6 +36,11 @@
 #                 run and has no deviation. The PR that records the ruling sets
 #                 state: ruled and adds the ruling.
 #
+# CANON OF RECORD: frstrtr/c2pool-monero docs/canon/ (operator ruling
+# 2026-10-04 18:10 +04: XMR work moves there from Path B slice S0). This copy
+# stays as the canon of the XMR lane files in frstrtr/c2pool until they leave;
+# change the record there first and mirror here.
+#
 # Syntax: the YAML subset read by canon_check.py (no tabs, no block scalars,
 # no anchors, no flow mappings). Regexes are single-quoted (backslash literal).
 # Design documents cited as "the:" live in the frstrtr/the repository.
@@ -457,7 +462,7 @@ rules:
       - name: drops-default-off
         type: required
         pattern: 'option\(V37_XMR_DROPS_DEFAULT\s+"[^"]*"\s+OFF\)'
-        paths: [src/c2pool/CMakeLists.txt]
+        paths: [CMakeLists.txt, src/c2pool/CMakeLists.txt]
         code_only: false
         note: 'Today option(V37_XMR_DROPS_DEFAULT ... ON) arms DROPS (V37_ACTIVATE_CONSENSUS_V1) in every default XMR build.'
       - name: drops-code-may-not-grow
@@ -465,6 +470,8 @@ rules:
         pattern: '(?i)\b\w*raindrop\w*\b|\bXmrDropsWiring\b'
         scope: xmr_lane_code
         code_only: true
+        allowlist: allowlist/C18-drops.txt
+        note: 'The raindrop code stays, dormant, for the later ratchet epoch (operator 2026-10-04 18:47 +04); the allowlist records it file by file and it may not grow.'
     status_now: fail
     deviation: [D8]
 
@@ -648,7 +655,7 @@ rules:
         type: required_kat
         kats: [v37_xmr_lane_rules_kat, v37_xmr_relay_pool_id_kat, v37_xmr_pool_lineage_kat]
     status_now: pass
-    deviation: []
+    deviation: [D16]
 
   - id: C28
     title: daemonless consensus path
