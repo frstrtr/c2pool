@@ -36,10 +36,11 @@
 #                 run and has no deviation. The PR that records the ruling sets
 #                 state: ruled and adds the ruling.
 #
-# CANON OF RECORD: frstrtr/c2pool-monero docs/canon/ (operator ruling
-# 2026-10-04 18:10 +04: XMR work moves there from Path B slice S0). This copy
-# stays as the canon of the XMR lane files in frstrtr/c2pool until they leave;
-# change the record there first and mirror here.
+# CANON OF RECORD: this file, frstrtr/c2pool docs/canon/ (operator ruling
+# 2026-10-04 20:16 +04: XMR development returns to frstrtr/c2pool; the
+# repository frstrtr/c2pool-monero is archived, read only). The deviations
+# register DEVIATIONS.md is mirrored in frstrtr/the (branch
+# v37/xmr-path-b-2026-10-04); rule and deviation ids are the same in both.
 #
 # Syntax: the YAML subset read by canon_check.py (no tabs, no block scalars,
 # no anchors, no flow mappings). Regexes are single-quoted (backslash literal).
@@ -601,9 +602,9 @@ rules:
 
   - id: C26
     title: provable fees
-    statement: 'Every fee is derivable and checkable from receipts and chain data: the give-author value inside the receipt preimage, the donation output a 0-amount marker, the author donation 0 by default on Monero, the owner fee by receipt hash (C19), no fixed per-node fee output, no developer fee floor, and disclosure in the stratum login reply and the docs.'
-    source: 'src/c2pool/v37/xmr/xmr_fee_model.hpp (rulings S1 to S3, 2026-09-29 marker); frstrtr/c2pool #1880 (login disclosure, merged); bsd-carve.md (author donation 0); SCHERNYKH-ALIGNMENT.md row 09'
-    ruling: 'operator 2026-09-29 (0-amount donation marker, no minimum to fund); 2026-10-03 20:46 +04 (author donation 0 by default); 2026-10-04 15:51 +04 (owner fee by receipt hash)'
+    statement: 'Every fee is derivable and checkable from receipts and chain data: the give-author value inside the receipt preimage, the donation output a 0-amount marker, the author donation default 0.1 % under fee model v1, disclosed in the stratum login reply and the docs, and a node may set it to 0; the owner fee by receipt hash (C19), no fixed per-node fee output, no developer fee floor.'
+    source: 'src/c2pool/v37/xmr/xmr_fee_model.hpp (rulings S1 to S3, 2026-09-29 marker); frstrtr/c2pool #1880 (login disclosure, merged); docs/xmr-lane/RUN-A-NODE.md (give-author default and opt-out); SCHERNYKH-ALIGNMENT.md row 09'
+    ruling: 'operator 2026-09-29 (0-amount donation marker, no minimum to fund); 2026-10-04 15:51 +04 (owner fee by receipt hash); 2026-10-04 20:25 +04 (author donation default 0.1 %, disclosed, a node may set 0; supersedes the default-0 ruling of 2026-10-03 20:46 +04)'
     scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp, src/impl/xmr/stratum/]
     checks:
       - name: give-author-in-preimage
@@ -617,21 +618,37 @@ rules:
         paths: [src/c2pool/v37/xmr/xmr_fee_model.hpp]
         min: 0
         max: 0
-      - name: give-author-default-zero
+      - name: give-author-default
         type: required
-        pattern: 'static\s+double\s+g_give_author_pct\s*=\s*0(?:\.0+)?\s*;'
+        pattern: 'static\s+double\s+g_give_author_pct\s*=\s*0\.1\s*;'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: true
-        note: 'Today the default is 0.1 % whenever --fee-model v1 is on (main_v37_xmr.cpp:216, :1641).'
+        note: 'The 0.1 % default applies under --fee-model v1 only; with the fee model off the node zeroes it (main_v37_xmr.cpp:1641).'
+      - name: give-author-opt-out
+        type: required
+        pattern: 'a\s*==\s*"--give-author-pct"'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+        note: 'A node sets its own value, 0 included (--give-author-pct 0 opts out).'
       - name: login-disclosure
         type: required
         pattern: 'node_owner_fee_pct'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
+      - name: login-disclosure-give-author
+        type: required
+        pattern: 'give_author_pct\\":'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+      - name: docs-disclosure
+        type: required
+        pattern: 'defaults to 0\.1 \(`--give-author-pct 0` opts out\)'
+        paths: [docs/xmr-lane/RUN-A-NODE.md]
+        code_only: false
       - name: fee-kats
         type: required_kat
         kats: [v37_xmr_fee_model_kat, xmr_stratum_selftest]
-    status_now: fail
+    status_now: pass
     deviation: [D12]
 
   - id: C27
@@ -728,19 +745,26 @@ rules:
     deviation: []
 
   - id: C32
-    title: permissive licence for the Monero deliverable
-    statement: 'The Monero deliverable is permissively licensed at every stage (BSD-3-Clause), so no XMR lane file carries a new copyleft header and the copyleft header count in XMR lane paths may only fall.'
-    source: 'Monero CCS committee on MR !699 (permissive at every stage or the proposal is terminated); frstrtr/the bsd-carve.md (frstrtr/c2pool-monero, BSD-3)'
-    ruling: 'CCS committee mandate relayed by the operator 2026-10-03 20:33 +04; operator chose BSD-3 (2026-10-03); operator 2026-10-04 18:10 +04 (frstrtr/c2pool-monero, BSD-3, is the repository of record for XMR work from slice S0)'
+    title: XMR lane licence
+    statement: 'XMR lane files carry the repository licence (AGPL-3.0-or-later): no own file in the XMR lane paths declares another licence, and no copyleft code from third parties enters those paths without a recorded operator ruling.'
+    source: 'operator ruling 2026-10-04 20:27 +04 (licence back to the original; the clean-room template replaces the p2pool-derived one); docs/xmr-lane/LICENSING.md and PROVENANCE.md'
+    ruling: 'operator 2026-10-04 20:27 +04 (XMR lane files keep the repository licence, AGPL-3.0-or-later; the GPL-3.0-only p2pool-derived template is replaced by the clean-room version; supersedes the BSD-3 rulings of 2026-10-03 and 2026-10-04 18:10 +04)'
     scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
     checks:
-      - name: no-copyleft-header
+      - name: repository-licence
         type: forbidden
-        pattern: 'SPDX-License-Identifier:\s*(?:AGPL|GPL|LGPL)'
+        pattern: 'SPDX-License-Identifier:\s*(?!AGPL-3\.0-or-later\b)\S+'
         scope: xmr_lane_licence
         code_only: false
+        note: 'Vendored upstream trees keep their own notices and are outside the scope.'
+      - name: no-third-party-copyleft
+        type: forbidden
+        pattern: 'This file is part of the Monero P2Pool|terms of the GNU (?:Lesser )?General Public License|SPDX-License-Identifier:\s*(?:GPL|LGPL|MPL)-'
+        scope: xmr_lane_licence
+        code_only: false
+        note: 'Today src/impl/xmr/template/xmr_block_template.{hpp,cpp} are adapted from SChernykh/p2pool (GPL-3.0-only) with no recorded ruling; the clean-room version replaces them (D17).'
     status_now: fail
-    deviation: [D13]
+    deviation: [D13, D17]
 
   - id: C33
     title: dual hardened timestamp server
