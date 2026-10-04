@@ -13,8 +13,8 @@
 // the two disconnected legs already in the tree into one producer of a FULL,
 // SUBMITTABLE Monero block:
 //
-//   * the p2pool-derived whole-block template builder
-//       XmrBlockTemplate  (xmr_block_template.{hpp,cpp}, GPL-3 via AGPLv3 s13)
+//   * the clean-room whole-block template builder
+//       XmrBlockTemplate  (xmr_block_template.{hpp,cpp}, clean-room, AGPL-3)
 //     which serialises  header || miner_tx || varint(n_tx) || 32*n tx hashes,
 //     does the penalty-aware tx selection, the Keccak-midstate per-extra-nonce
 //     coinbase re-hash, the tree_hash main branch and the 76..128 B RandomX
@@ -223,8 +223,8 @@ inline std::vector<unsigned char> extra_nonce_bytes(std::uint32_t extra_nonce, s
 // amounts, which is why re-deriving is unnecessary and the template's two-pass
 // flow stays sound.
 //
-// Call protocol with XmrBlockTemplate::update() (upstream order, pinned to the
-// p2pool commit named in xmr_block_template.hpp):
+// Call protocol with XmrBlockTemplate::update() (the order it follows, pinned
+// by xmr_block_assembly_kat):
 //   payees() ... merkle_tree_data() ... split_reward(base + sum(fees))   [1]
 //   create_miner_tx(dry_run)  -> derive_output_key not called
 //   [tx selection]            split_reward(final_reward)                 [2]
@@ -673,7 +673,7 @@ struct AssemblyInputs {
 
     // GOOD-CITIZEN (native arm). When true, `mempool` is the FINAL set the AGPL
     // good-citizen selector already chose: the template mines it VERBATIM (no
-    // p2pool 5-s age gate, no penalty-zone greedy re-select). This file still
+    // 5-s mempool age gate, no penalty-zone greedy re-select). This file still
     // enforces a coinbase-aware hard trim so the block never crosses 2*median
     // (which would zero the reward and refuse the block) -- the trim only ever
     // pops from the fee-rate TAIL and never the first entry, so a non-empty
