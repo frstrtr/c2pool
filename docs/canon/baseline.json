@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "49adcf887f91561a8f08ec5e8cf33006472f5ac6",
+  "commit": "7b5529300e88e62d89437bc2507c351ef882f1f4",
   "rules": {
     "C01": {
       "checks": {
@@ -481,12 +481,9 @@
     "C32": {
       "checks": {
         "no-third-party-copyleft": {
-          "count": 4,
-          "per_file": {
-            "src/impl/xmr/template/xmr_block_template.cpp": 2,
-            "src/impl/xmr/template/xmr_block_template.hpp": 2
-          },
-          "status": "fail"
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
         },
         "repository-licence": {
           "count": 0,
@@ -494,7 +491,7 @@
           "status": "pass"
         }
       },
-      "status": "fail"
+      "status": "pass"
     },
     "C33": {
       "checks": {

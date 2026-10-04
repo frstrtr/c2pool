@@ -30,7 +30,7 @@ src/impl/xmr/native/p2p/xmr_peer_pool.hpp 2 peer pool deadlines (monotonic)
 src/impl/xmr/native/txpool/xmr_relayed_txpool.cpp 2 Monero txpool receive times and the Monero unlock-time rule
 src/impl/xmr/native/template/xmr_monerod_miner_data.hpp 1 monerod poll timing
 src/impl/xmr/pow/xmr_cpu_miner.hpp 4 built-in CPU miner job timing and hashrate
-src/impl/xmr/template/xmr_block_template.cpp 4 local Monero block template content: rng seed, mempool age gate, last-updated, header timestamp (the Monero chain checks it)
+src/impl/xmr/template/xmr_block_template.cpp 1 local Monero block template content: one read for the mempool age gate and the header timestamp (the Monero chain checks it)
 src/impl/xmr/template/xmr_block_assembly.hpp 4 seconds_since_epoch helper, its self-check and a template receive time
 src/impl/xmr/template/xmr_coin_primitives.cpp 2 seconds_since_epoch helper definition
 src/impl/xmr/template/xmr_coin_primitives.hpp 1 seconds_since_epoch helper declaration
