@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "89046b80225949911e3348535b285df4da93395d",
+  "commit": "2747b19b66c019be770146d1d8866f880a428f58",
   "rules": {
     "C01": {
       "checks": {
@@ -860,6 +860,51 @@
         "towing-kat": {
           "kats": {
             "xmr_lane_tow_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C35": {
+      "checks": {
+        "narrowing-casts-may-not-grow": {
+          "count": 133,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_coinbase_authority.hpp": 6,
+            "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 4,
+            "src/c2pool/v37/xmr/xmr_credit_cut.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_drops_wiring.hpp": 16,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 11,
+            "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 4,
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_paynow.hpp": 7,
+            "src/impl/xmr/native/consensus/xmr_blob_reader.hpp": 6,
+            "src/impl/xmr/native/consensus/xmr_block_id.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_block_parse.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_difficulty.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_reward.hpp": 10,
+            "src/impl/xmr/native/consensus/xmr_tx_weight.hpp": 2,
+            "src/impl/xmr/pow/randomx_verify.hpp": 6,
+            "src/impl/xmr/receipt/xmr_receipt_verify.cpp": 1,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 10,
+            "src/impl/xmr/settle/xmr_drain_rule.hpp": 3,
+            "src/sharechain/v37/nr_ladder.hpp": 6,
+            "src/sharechain/v37/v37_descriptor_xmr.hpp": 1,
+            "src/sharechain/v37/v37_fixed.hpp": 10,
+            "src/sharechain/v37/v37_lane.hpp": 22
+          },
+          "status": "fail"
+        },
+        "no-saturating-helpers": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "wide-int-extreme-kat": {
+          "kats": {
+            "xmr_wide_int_extreme_kat": false
           },
           "status": "fail"
         }

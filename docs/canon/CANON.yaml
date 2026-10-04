@@ -762,3 +762,30 @@ rules:
         note: 'Pins, for a rule epoch change and for a merge: no in-window work lost, none counted twice, the retired lane drains by time (origin bins) and never freezes, and the death floor is an integer compare against committed demonstrated work. Today the XMR lane runs the positional window of src/sharechain/v37/v37_lane.hpp (LaneParams window = 8640, eviction by position), which freezes an unfed lane.'
     status_now: fail
     deviation: [D14]
+
+  - id: C35
+    title: wide integer arithmetic
+    statement: 'On consensus work and money paths every sum and product is computed in a width proven not to overflow (work values and window totals in 256 or 288 bits, since a hash-normalised work value N = floor(H x share_diff / 2^lz) needs 288 bits before narrowing; weight x reward products in at least 320 bits; estimator numerators in 576 bits where used), with no silent truncation, wrap or saturation that loses value, and every narrowing is either proven unreachable (static_assert or a documented bound) or an explicit refusal, each pinned by an extreme-value KAT (see C30).'
+    source: 'frstrtr/c2pool 1aaa8756d and docs/research/integer-audit.md (exact fee percentages, U256::mul_small saturates instead of wrapping, no wrap in payout; open item C3 compose_credit_from_delta, BTC/DASH, unbounded long long, gated off); src/c2pool/v37/xmr/xmr_drops_wiring.hpp lines 30 to 185 (288-bit normalised hash, unsigned __int128 limb products); earlier fixes #1308 (LTC u64) and #1406 (BTC saturate)'
+    ruling: 'operator 2026-10-04 18:43 +04 (mind 288 and higher bit operations to prevent fracturing of data)'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/, src/sharechain/v37/]
+    checks:
+      - name: wide-int-extreme-kat
+        type: required_kat
+        kats: [xmr_wide_int_extreme_kat]
+        note: 'Slices S3 and S4: the Path B window split and the Merkle-sum window totals at extreme values (2^64 - 1 rewards, maximal window weights, the largest normalised work), no wrap, no lost piconero, every narrowing refused or proven.'
+      - name: narrowing-casts-may-not-grow
+        type: forbidden
+        pattern: 'static_cast<\s*(?:std::)?(?:u?int64_t|u?int32_t|u64|u32|i64|i32|unsigned long long|long long|unsigned)\s*>\s*\(|\(\s*(?:std::)?(?:u?int64_t|u?int32_t|u64|u32)\s*\)\s*[\w(]'
+        scope: xmr_consensus_core
+        code_only: true
+        allowlist: allowlist/C35-narrowing.txt
+        note: 'Narrowing casts in the consensus core; a reviewed cast moves to the allowlist with its proof (static_assert, documented bound or refusal) and its KAT.'
+      - name: no-saturating-helpers
+        type: forbidden
+        pattern: '\b\w*[Ss]aturat\w*\b|\bsat_(?:add|sub|mul)\w*\b'
+        scope: xmr_consensus_core
+        code_only: true
+        note: 'A saturating helper loses value silently on a money path; none in the consensus core today.'
+    status_now: fail
+    deviation: [D15]
