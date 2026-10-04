@@ -4513,6 +4513,9 @@ nlohmann::json MiningInterface::rest_local_stats()
             {"silent", silent},
             {"silent_floor_seconds", kSilentFloorSeconds}
         };
+        // #959 slice B: name the silent workers and how long each has been
+        // silent, so the operator sees which rig died, not just a count.
+        result["workers_silent"] = silent_workers_list(workers, liveness);
     }
 
     // shares — {total, orphan, dead}
@@ -7982,6 +7985,54 @@ MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>
             seen.accepted = w.accepted;
         }
         out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+    }
+    return out;
+}
+
+nlohmann::json MiningInterface::silent_workers_list(
+    const std::map<std::string, WorkerInfo>& workers,
+    const std::map<std::string, WorkerLiveness>& liveness)
+{
+    struct Agg {
+        bool silent{true};
+        bool has_shared{false};
+        int64_t silent_seconds{std::numeric_limits<int64_t>::max()};
+        int64_t threshold_seconds{0};
+        int connections{0};
+    };
+    std::map<std::string, Agg> by_worker;
+    for (const auto& [sid, w] : workers) {
+        auto lv_it = liveness.find(sid);
+        if (lv_it == liveness.end()) continue;
+        const WorkerLiveness& lv = lv_it->second;
+        const std::string key = w.worker_name.empty()
+            ? w.username : w.username + "." + w.worker_name;
+        Agg& a = by_worker[key];
+        a.silent = a.silent && lv.silent;
+        a.has_shared = a.has_shared || lv.has_shared;
+        ++a.connections;
+        if (lv.silent_seconds < a.silent_seconds) {
+            a.silent_seconds = lv.silent_seconds;
+            a.threshold_seconds = lv.threshold_seconds;
+        }
+    }
+
+    std::vector<std::pair<std::string, Agg>> silent;
+    for (const auto& [key, a] : by_worker)
+        if (a.silent) silent.emplace_back(key, a);
+    std::stable_sort(silent.begin(), silent.end(), [](const auto& x, const auto& y) {
+        return x.second.silent_seconds > y.second.silent_seconds;
+    });
+
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& [key, a] : silent) {
+        out.push_back({
+            {"worker", key},
+            {"silent_seconds", a.silent_seconds},
+            {"threshold_seconds", a.threshold_seconds},
+            {"has_shared", a.has_shared},
+            {"connections", a.connections}
+        });
     }
     return out;
 }

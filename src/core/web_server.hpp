@@ -2094,6 +2094,14 @@ public:
     std::map<std::string, WorkerLiveness> observe_worker_liveness(
         const std::map<std::string, WorkerInfo>& workers,
         std::chrono::steady_clock::time_point now) const;
+    // #959 workers_silent: one entry per worker ("ADDRESS.worker", grouped as
+    // /stratum_stats groups them) whose every connection is SILENT, longest
+    // silence first. A worker with one live connection is not listed. Its
+    // silent_seconds is the freshest connection's, so silence is never
+    // overstated.
+    static nlohmann::json silent_workers_list(
+        const std::map<std::string, WorkerInfo>& workers,
+        const std::map<std::string, WorkerLiveness>& liveness);
 
 private:
     struct ShareSeen {

@@ -122,3 +122,53 @@ TEST(WorkerLiveness, LocalAndStratumStatsReportSilent) {
     EXPECT_TRUE(s["workers"]["XaddrD9.D2"]["silent"].get<bool>());
     EXPECT_FALSE(s["workers"]["XaddrD9.D4"]["silent"].get<bool>());
 }
+
+// Slice B: /local_stats names the silent worker, not just counts it.
+TEST(WorkerLiveness, LocalStatsListsSilentWorkers) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    mi.register_stratum_worker("dead", worker(now - seconds(3600)));
+    auto live = worker(now - seconds(3600));
+    live.worker_name = "D4";
+    mi.register_stratum_worker("live", live);
+    mi.update_stratum_worker("live", 1e9, 0.0, 1.0, 10, 0, 0);
+
+    auto r = mi.rest_local_stats();
+    ASSERT_TRUE(r.contains("workers_silent"));
+    ASSERT_EQ(r["workers_silent"].size(), 1u);
+    EXPECT_EQ(r["workers_silent"][0]["worker"], "XaddrD9.D2");
+    EXPECT_FALSE(r["workers_silent"][0]["has_shared"].get<bool>());
+    EXPECT_GE(r["workers_silent"][0]["silent_seconds"].get<int64_t>(), 3600);
+}
+
+// A worker is listed only if every connection is silent; longest silence first.
+TEST(WorkerLiveness, SilentListGroupsByWorkerAndSorts) {
+    const auto now = Clock::now();
+    std::map<std::string, MiningInterface::WorkerInfo> ws;
+    std::map<std::string, MiningInterface::WorkerLiveness> lv;
+    auto add = [&](const std::string& sid, const std::string& name,
+                   bool silent, int64_t secs) {
+        auto w = worker(now);
+        w.worker_name = name;
+        ws[sid] = w;
+        MiningInterface::WorkerLiveness l;
+        l.silent = silent;
+        l.silent_seconds = secs;
+        l.threshold_seconds = MiningInterface::kSilentFloorSeconds;
+        lv[sid] = l;
+    };
+    add("a1", "D2", true, 2000);
+    add("a2", "D2", true, 1000);   // freshest of D2's two silent connections
+    add("b1", "D9", true, 5000);
+    add("c1", "D4", true, 9000);
+    add("c2", "D4", false, 10);    // D4 still has a live connection
+
+    auto out = MiningInterface::silent_workers_list(ws, lv);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0]["worker"], "XaddrD9.D9");
+    EXPECT_EQ(out[0]["silent_seconds"], 5000);
+    EXPECT_EQ(out[1]["worker"], "XaddrD9.D2");
+    EXPECT_EQ(out[1]["silent_seconds"], 1000);
+    EXPECT_EQ(out[1]["connections"], 2);
+}
