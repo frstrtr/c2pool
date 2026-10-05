@@ -41,10 +41,19 @@
 //   K8  a lying context: a block whose coinbase claims a height its (known)
 //       parent does not have is REJECTED (ctx bad), never noted, and the repair
 //       that needs it stays Pending with the reason
+//   K9  a context with no work: a peer serves a sibling whose proof of work
+//       misses the difficulty C's own index implies; C bans the peer, never
+//       notes the block, and the repair that needs it stays Pending
+//
+// Each node's own chain index is modelled by the blocks it noted itself
+// (note_bin); contexts are judged against it (relay::judge_block_ctx) at a
+// model difficulty of 2, so the fake RandomX's zero hash is real work and an
+// all-ones hash (a block registered as "no work") is not.
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <thread>
 
 #include "xmr_relay_test_util.hpp"
@@ -66,10 +75,15 @@ static bytes32 block_id(const SynthBlock& sb) {   // keccak256(varint(len) | has
     bytes32 b; std::memcpy(b.data(), h.data(), 32); return b;
 }
 
+static constexpr u64 kCtxDiff = 2;   // the model index's difficulty for every context block
+
 struct TNode {
     std::string name;
     ChainView chain;
     std::atomic<u64> rx_calls{0};
+    std::mutex imtx;
+    std::map<bytes32, u64> index;              // this node's own chain: block id -> its height
+    std::set<std::vector<u8>> no_work;         // hashing blobs whose RandomX hash misses any difficulty
     std::unique_ptr<c2pool::v37n::V37Engine> engine;
     std::unique_ptr<XmrRelayNode> relay;
     std::unique_ptr<XmrReceiptIngest> ingest;
@@ -85,7 +99,12 @@ struct TNode {
         engine->submit_tracked(::v37::LaneRecord::add_lane(kChain, ::v37::LaneParams{})).get();
         relay = std::make_unique<XmrRelayNode>(
             ro, chain,
-            [this](const std::vector<u8>&, const bytes32&, bytes32& pow) { ++rx_calls; pow.fill(0); return true; },
+            [this](const std::vector<u8>& blob, const bytes32&, bytes32& pow) {
+                ++rx_calls;
+                std::lock_guard<std::mutex> lk(imtx);
+                pow.fill(no_work.count(blob) ? 0xff : 0);
+                return true;
+            },
             [this]() -> std::pair<u64, bytes32> {
                 auto s = engine->snapshot(kChain);
                 if (!s) return {0, bytes32{}};
@@ -105,9 +124,25 @@ struct TNode {
             [this](const Admitted& a, u64 pos, u32 n_pushes, u64 next_after, const bytes32& dig) {
                 relay->on_pushed(a.id, pos, n_pushes, a.raw, next_after, dig);
             });
+        wire_index();   // before start(): contexts are judged against this node's own chain
     }
     ~TNode() { relay->stop(); engine->stop(); }
-    void note_bin(const bytes32& prev, u64 height) { chain.note(prev, height, bytes32{}); chain.set_tip(height); }
+    void note_bin(const bytes32& prev, u64 height) {
+        { std::lock_guard<std::mutex> lk(imtx); index[prev] = height - 1; }
+        chain.note(prev, height, bytes32{}); chain.set_tip(height);
+    }
+    void wire_index() {
+        CtxChainSource cs;
+        cs.verified = [this](const bytes32& id) { std::lock_guard<std::mutex> lk(imtx); return index.count(id) != 0; };
+        cs.target = [this](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t, CtxTarget& out, std::string& why) {
+            std::lock_guard<std::mutex> lk(imtx);
+            const auto it = index.find(anchor);
+            if (it == index.end()) { why = "anchor not held"; return false; }
+            out.diff_lo = kCtxDiff; out.diff_hi = 0; out.height = it->second + above.size() + 1; out.seed = bytes32{};
+            return true;
+        };
+        relay->set_ctx_chain(std::move(cs));
+    }
     // the daemon's main-thread duties for the relay (main_v37_xmr.cpp relay_tick)
     void pump() {
         {
@@ -360,6 +395,33 @@ int main() {
         C(!Cn.chain.lookup(idZ), "K8 Z never entered C's ChainView");
         const auto zl = Cn.grep_logs("REJECTED: block claims height 105");
         C(!zl.empty(), "K8 logged: " + zl);
+    }
+
+    // ── K9 a context with no work ───────────────────────────────────────────
+    {
+        // Q (h=100, on G) hashes to all-ones on C's verifier: below any
+        // difficulty. A (the minter) believes it and serves it; C must refuse
+        // it AND ban A, and Q never reaches C's ChainView.
+        const SynthBlock Q = make_block(100, idG, 96, nullptr, 1, 67);
+        const bytes32 idQ = block_id(Q);
+        { std::lock_guard<std::mutex> lk(Cn.imtx); Cn.no_work.insert(Q.hashing_blob); }
+        A.note_bin(idQ, 101); B.note_bin(idQ, 101);
+        A.monerod_add(Q);
+        const SynthBlock onQ = make_block(101, idQ, 15, nullptr, 1, 74);
+        A.relay->submit_own(own(onQ, 500, pA, 101));
+        for (auto* n : all) n->template_height = 110;
+        C(wait_for([&] { return A.next_pos() == 12 && B.next_pos() == 12; }, all), "K9 A and B push 1 receipt mined on Q");
+        const u64 P9 = 12; const bytes32 spine9 = A.digest();
+        const u64 bans0 = Cn.relay->stats().bans.load();
+        const bool forged = wait_for([&] { Cn.relay->repair_poll(P9, spine9, 0, nullptr); return Cn.relay->stats().ctx_pow_forged.load() >= 1; }, all, 15000ms);
+        C(forged, "K9 Q's context is judged FORGED (its proof of work misses the difficulty C's index implies)");
+        C(Cn.relay->stats().bans.load() > bans0, "K9 ...and the peer that served it is BANNED");
+        C(!Cn.chain.lookup(idQ), "K9 Q never entered C's ChainView");
+        const auto ql = Cn.grep_logs("FORGED");
+        C(!ql.empty(), "K9 logged: " + ql);
+        C(Cn.relay->repair_poll(P9, spine9, 0, nullptr) != XmrRelayNode::RepairState::Ready, "K9 the repair that needs Q stays not Ready");
+        C(Cn.relay->stats().ctx_pow_ok.load() + Cn.relay->stats().ctx_indexed.load() >= 3,
+          "K9 the honest contexts before it (X, X1, X2) were all judged usable");
     }
 
     for (auto* n : all) n->dump_logs();

@@ -79,8 +79,13 @@
 // verified from its bytes (verify_block_ctx: id recomputed, height from the
 // coinbase) and linked to a parent this node already knows AT that height
 // (recursively for a chain of up to ctx_max_depth unknown blocks); the seed is
-// taken from our own chain. The repair then (a) keeps its order while it
-// fetches, (b) re-asks idle missing frames with peer failover instead of
+// taken from our own chain. Before it is used, its WORK is checked
+// (judge_block_ctx, set_ctx_chain): our own verified Monero chain index holds
+// it, or its proof of work meets the difficulty its parent implies in that
+// index, at most ctx_max_depth (2) unknown blocks above it; a hash below that
+// difficulty bans the sender, anything we cannot judge yet waits. With no
+// index wired, peers are not asked and a peer-served context is never used.
+// The repair then (a) keeps its order while it fetches, (b) re-asks idle missing frames with peer failover instead of
 // discarding the order, (c) re-asks at once when the serving peer drops, and
 // (d) reports WHICH stage is stuck (repair_status) so a stall that does reach
 // the booking retry bound is refused with a loud, distinct reason.
@@ -355,7 +360,10 @@ struct RelayOptions {
     u32         solicited_unresolved_patience_ms = 120000;   // a solicited receipt waits this long for its context
     u32         ctx_retry_ms = 2000;                         // re-ask an unanswered GETCTX (next peer) after this
     u32         ctx_max_rounds = 30;                         // rounds over every ready peer before a want is dropped
-    u32         ctx_max_depth = 8;                           // unknown blocks chained above a known parent
+    // Unknown blocks chained above our own chain index (2 = the tip-freshness
+    // bound: a template is never more than 2 Monero heights past its tip, so
+    // deeper waits for our own Monero sync).
+    u32         ctx_max_depth = 2;
     std::size_t ctx_want_max = 128;
     u32         repair_refetch_ms = 3000;                    // re-ask idle missing frames of a Fetching repair
     // ★ DROPS (gate ON only). 0 = OFF, the shipped default: a receipt below
@@ -438,6 +446,10 @@ struct RelayStats {
     std::atomic<u64> repair_refetch{0}, repair_evicted{0}, upgraded_solicited{0}, unresolved_solicited_dropped{0};
     std::atomic<u64> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0},
                      ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_req_dropped{0};
+    // context WORK (judge_block_ctx): held by our index / proof of work verified /
+    // waiting (cannot judge yet) / forged (sender banned) / a peer's context
+    // refused because no chain index is wired
+    std::atomic<u64> ctx_indexed{0}, ctx_pow_ok{0}, ctx_pow_deferred{0}, ctx_pow_forged{0}, ctx_unchecked{0};
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
@@ -1286,6 +1298,7 @@ public:
     // A block blob for a wanted id, from a peer (FB_CTX) or our own monerod
     // (from == 0). Verified here; never trusted.
     void offer_ctx(const bytes32& id, const std::vector<u8>& blob, PeerId from) {
+        if (from && !m_ctx_chain && !blob.empty()) { m_st.ctx_unchecked++; return; }   // no index to check its work against
         {
             std::lock_guard<std::mutex> lk(m_cmtx);
             auto it = m_ctx_want.find(id);
@@ -1326,7 +1339,8 @@ public:
             "admitted own=%llu foreign=%llu solicited=%llu cache=%zu | flood=%llu reoffer=%llu backfill orders=%llu ids=%llu | "
             "won tx=%llu rx=%llu | repair start=%llu order_ok=%llu spine_mis=%llu peer_fail=%llu ids=%llu ready=%llu rejected=%llu open=%zu | "
             "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu | "
-            "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
+            "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu "
+            "indexed=%llu pow_ok=%llu pow_deferred=%llu forged=%llu unchecked=%llu | "
             "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu rules_mismatch=%llu | "
             "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
             "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu | "
@@ -1353,6 +1367,9 @@ public:
             (unsigned long long)s.ctx_rx.load(), (unsigned long long)s.ctx_resolved.load(), (unsigned long long)s.ctx_bad.load(),
             (unsigned long long)s.ctx_unknown_rx.load(), (unsigned long long)s.ctx_gave_up.load(),
             (unsigned long long)s.ctx_served.load(), (unsigned long long)s.ctx_unknown_tx.load(),
+            (unsigned long long)s.ctx_indexed.load(), (unsigned long long)s.ctx_pow_ok.load(),
+            (unsigned long long)s.ctx_pow_deferred.load(), (unsigned long long)s.ctx_pow_forged.load(),
+            (unsigned long long)s.ctx_unchecked.load(),
             (unsigned long long)s.repair_refetch.load(), (unsigned long long)s.repair_evicted.load(),
             (unsigned long long)s.upgraded_solicited.load(), (unsigned long long)s.unresolved_solicited_dropped.load(),
             (unsigned long long)s.hello_tag_mismatch.load(), (unsigned long long)s.hello_rules_mismatch.load(),
@@ -1392,6 +1409,10 @@ public:
     // check (test rigs). Set before start().
     using VerdictFn = std::function<int(const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 coinbase_height, std::string& why)>;
     void set_share_verdict(VerdictFn f) { m_verdict = std::move(f); }
+    // The node's own verified Monero chain index, for the WORK behind a
+    // receipt context (judge_block_ctx). Unset: a context served by a peer is
+    // never used and peers are not asked (own sources only). Set before start().
+    void set_ctx_chain(CtxChainSource s) { m_ctx_chain = std::move(s); }
 
     // Test hook: disconnect one peer (the KAT's "B drops off the network").
     void drop_peer(PeerId p) { m_net.disconnect(p); }
@@ -1591,6 +1612,7 @@ private:
         bool have_proof = false;
         BlockCtx proof{};
         PeerId proof_from = 0;
+        bool defer_noted = false;          // a deferred proof is counted + logged once
     };
     // ★ RAIN-BACKFILL: one peer's inventory of one interval range.
     struct InvKey {
@@ -2231,6 +2253,13 @@ private:
             }
             const auto par = m_chain.lookup(w.proof.parent);
             if (!par) {
+                // A parent our own index holds verified resolves from our own
+                // bodies; only blocks above the index count toward the bound.
+                const bool parent_indexed = m_ctx_chain && m_ctx_chain.verified(w.proof.parent);
+                if (parent_indexed) {
+                    want_ctx(w.proof.parent, w.proof_from ? w.proof_from : w.from, w.depth);
+                    return;
+                }
                 if (w.depth + 1 >= m_o.ctx_max_depth) {
                     {
                         std::lock_guard<std::mutex> lk(m_cmtx);
@@ -2262,6 +2291,62 @@ private:
                     return;   // the proof is kept; retried by drive_ctx once the seed is noted
                 }
                 seed = *s;
+            }
+            // The WORK behind it, before it can influence admission.
+            if (m_ctx_chain) {
+                const CtxPowVerdict v = judge_block_ctx(
+                    w.proof, m_ctx_chain,
+                    [this](const bytes32& b) -> std::optional<CtxPowRec> {
+                        std::lock_guard<std::mutex> lk(m_cmtx);
+                        const auto it = m_ctx_pow.find(b);
+                        if (it == m_ctx_pow.end()) return std::nullopt;
+                        return it->second;
+                    },
+                    m_o.ctx_max_depth, m_rx);
+                const std::string src = w.proof_from ? "peer " + std::to_string(w.proof_from) : std::string("own source");
+                if (v.kind == CtxPow::Forged) {
+                    m_st.ctx_pow_forged++;
+                    {
+                        std::lock_guard<std::mutex> lk(m_cmtx);
+                        m_ctx_want.erase(id);
+                    }
+                    if (w.proof_from) {
+                        m_st.bans++;
+                        log("relay: context for " + hex_short(id) + " from " + src + " FORGED (" + v.why + "): peer BANNED");
+                        ban_later(w.proof_from);
+                    } else {
+                        log("relay: context for " + hex_short(id) + " from " + src + " REFUSED: " + v.why);
+                    }
+                    return;
+                }
+                if (v.kind == CtxPow::Defer) {
+                    bool first = false;
+                    {
+                        std::lock_guard<std::mutex> lk(m_cmtx);
+                        auto it = m_ctx_want.find(id);
+                        if (it != m_ctx_want.end() && !it->second.defer_noted) { it->second.defer_noted = true; first = true; }
+                    }
+                    if (first) {
+                        m_st.ctx_pow_deferred++;
+                        log("relay: context for " + hex_short(id) + " from " + src + " WAITS: " + v.why);
+                    }
+                    return;   // the proof is kept; drive_ctx retries it (never a penalty)
+                }
+                if (v.kind == CtxPow::Accept) {
+                    m_st.ctx_pow_ok++;
+                    std::lock_guard<std::mutex> lk(m_cmtx);
+                    if (m_ctx_pow.emplace(id, CtxPowRec{w.proof.parent, v.step}).second) {
+                        m_ctx_pow_order.push_back(id);
+                        while (m_ctx_pow_order.size() > kCtxPowKeep) { m_ctx_pow.erase(m_ctx_pow_order.front()); m_ctx_pow_order.pop_front(); }
+                    }
+                } else {
+                    m_st.ctx_indexed++;
+                }
+            } else if (w.proof_from) {
+                m_st.ctx_unchecked++;   // unreachable: offer_ctx refuses these; kept fail-closed
+                std::lock_guard<std::mutex> lk(m_cmtx);
+                m_ctx_want.erase(id);
+                return;
             }
             m_chain.note(id, bin, seed);
             m_st.ctx_resolved++;
@@ -2302,7 +2387,13 @@ private:
                     it = m_ctx_want.erase(it);
                     continue;
                 }
-                if (w.have_proof) { retry_proofs.push_back(it->first); ++it; continue; }
+                if (w.have_proof) {   // a deferred proof is retried at the ask pace, not every tick
+                    if (!w.defer_noted || now - w.last_ask >= std::chrono::milliseconds(m_o.ctx_retry_ms)) {
+                        if (w.defer_noted) w.last_ask = now;
+                        retry_proofs.push_back(it->first);
+                    }
+                    ++it; continue;
+                }
                 if (m_chain.lookup(it->first)) {   // RC-CTX: resolved meanwhile by the ChainView's feeder (native index / journal)
                     m_st.ctx_resolved++;
                     resolved_now.push_back(it->first);
@@ -2310,6 +2401,7 @@ private:
                     continue;
                 }
                 if (w.last_ask != Clock::time_point{} && now - w.last_ask < std::chrono::milliseconds(m_o.ctx_retry_ms)) { ++it; continue; }
+                if (!m_ctx_chain) { ++it; continue; }   // nothing to check a peer's block against: own sources only
                 PeerId pick = 0;
                 if (w.from && !w.asked.count(w.from) && std::find(ready.begin(), ready.end(), w.from) != ready.end()) pick = w.from;
                 for (PeerId p : ready) if (!pick && !w.asked.count(p)) pick = p;
@@ -3794,6 +3886,10 @@ private:
     mutable std::mutex m_cmtx;         // receipt-context wants + serve requests
     std::map<bytes32, CtxWant> m_ctx_want;
     std::deque<std::pair<PeerId, std::vector<bytes32>>> m_ctx_serve;
+    CtxChainSource m_ctx_chain;        // our own verified Monero chain index (set before start)
+    std::map<bytes32, CtxPowRec> m_ctx_pow;   // blocks verified here by proof of work (under m_cmtx)
+    std::deque<bytes32> m_ctx_pow_order;
+    static constexpr std::size_t kCtxPowKeep = 256;
 
     std::mutex m_amtx;               // admitted queue
     std::vector<Admitted> m_admitted;

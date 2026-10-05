@@ -720,13 +720,77 @@ public:
     // entry cache (connected blocks, including ones a reorg disconnected) or a
     // held alternative block's entry. Read-only; false when neither holds it.
     // The relay serves a receipt's Monero context (FB_GETCTX) from here, and
-    // re-verifies every byte (id recomputed) before it uses one.
+    // re-verifies every byte (id recomputed) before it uses one. An alternative
+    // block is served only once the gate has passed it (or the run checks no
+    // proof of work at all): a parked or held block is bytes a stranger sent,
+    // and a peer that is served one would refuse it.
     bool block_blob_of(const Hash& id, std::vector<std::uint8_t>& out) const {
         std::lock_guard<std::mutex> lk(mu_);
         const auto it = entries_.find(key_(id));
         if (it != entries_.end() && !it->second.entry.block_blob.empty()) { out = it->second.entry.block_blob; return true; }
-        if (const AltBlock* a = alt_.find(id); a && a->has_entry && !a->entry.block_blob.empty()) { out = a->entry.block_blob; return true; }
+        if (const AltBlock* a = alt_.find(id);
+            a && a->has_entry && !a->entry.block_blob.empty() && (a->pow_verified || a->adoptable)) {
+            out = a->entry.block_blob;
+            return true;
+        }
         return false;
+    }
+
+    // --- receipt contexts (the relay's FB_CTX check) ------------------------------------
+    // A Monero block a lane peer serves as a receipt's context is used only if
+    // this index holds it verified, or if its proof of work meets the difficulty
+    // its parent implies here. Neither read stores anything.
+    //
+    // holds_verified: a best-chain row, or a resolved alternative block the gate
+    // passed (or that a run without proof-of-work checking would adopt).
+    bool holds_verified(const Hash& id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return holds_verified_locked_(id);
+    }
+
+    // The difficulty, height and RandomX seed of the block that would follow
+    // `anchor_id` (held verified here) extended by `above`: blocks the caller
+    // verified itself on top of it, oldest first, as (timestamp, difficulty).
+    // The window is the one an offered block on that branch is judged with; the
+    // seed is resolved on the anchor's branch. The rules version never drops
+    // below the tip's. false + why = cannot judge it now (never a fault).
+    bool context_target(const Hash& anchor_id,
+                        const std::vector<std::pair<std::uint64_t, U128>>& above,
+                        std::uint8_t major_version, U128& difficulty, Hash& seed,
+                        std::uint64_t& height, std::string& why) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!holds_verified_locked_(anchor_id)) {
+            why = "the anchor block is not held verified";
+            return false;
+        }
+        std::uint64_t anchor_h = 0;
+        if (const RowRecord* r = rows_.by_id(anchor_id)) anchor_h = r->row.height;
+        else anchor_h = alt_.find(anchor_id)->height;
+        const RowRecord* tip = rows_.tip();
+        const std::uint8_t floor_v = tip ? tip->row.major_version : 0;
+        const std::uint8_t rules = hf_rules_version(major_version > floor_v ? major_version : floor_v);
+        height = anchor_h + above.size() + 1;
+        if (above.empty()) {
+            if (!branch_difficulty_locked_(anchor_id, anchor_h, rules, difficulty, why)) return false;
+        } else {
+            std::vector<DifficultyRow> window;
+            if (!branch_window_locked_(anchor_id, anchor_h, window, why)) return false;
+            DifficultyWindow dw;
+            dw.seed(window);
+            U128 cum = dw.newest_cumulative_difficulty();
+            for (const auto& [ts, d] : above) {
+                cum = u128_add(cum, d);
+                dw.push(ts, cum);
+            }
+            difficulty = dw.next_difficulty(rules);
+        }
+        const std::optional<Hash> s = seed_on_branch_(rx_seedheight(height), anchor_id);
+        if (!s) {
+            why = "the RandomX seed block for that height is not held";
+            return false;
+        }
+        seed = *s;
+        return true;
     }
 
     // --- the settlement clock ------------------------------------------------------------
@@ -1527,6 +1591,26 @@ private:
             out = view_.state().difficulty_window().next_difficulty(rules_version);
             return true;
         }
+        std::vector<DifficultyRow> window;
+        if (!branch_window_locked_(parent_id, parent_height, window, why)) return false;
+        DifficultyWindow dw;
+        dw.seed(window);
+        out = dw.next_difficulty(rules_version);
+        return true;
+    }
+
+    // The rows themselves (oldest first, at most 735, ending at `parent_id`):
+    // the consensus state's own window when the parent is the tip, else the
+    // branch rebuilt as above. Shared with context_target().
+    bool branch_window_locked_(const Hash& parent_id, std::uint64_t parent_height,
+                               std::vector<DifficultyRow>& window, std::string& why) const {
+        window.clear();
+        const RowRecord* tip = rows_.tip();
+        if (tip && parent_id == tip->row.id) {
+            const auto& rows = view_.state().difficulty_window().rows();
+            window.assign(rows.begin(), rows.end());
+            return true;
+        }
 
         // Collect the branch part first, walking down from the parent while it
         // is an alt block.
@@ -1550,7 +1634,6 @@ private:
             if (upper.size() >= DIFFICULTY_BLOCKS_COUNT) break;
         }
 
-        std::vector<DifficultyRow> window;
         if (upper.size() < DIFFICULTY_BLOCKS_COUNT) {
             const RowRecord* anchor_row = rows_.by_id(cursor);
             if (!anchor_row) {
@@ -1574,10 +1657,6 @@ private:
         if (window.size() > DIFFICULTY_BLOCKS_COUNT)
             window.erase(window.begin(),
                          window.begin() + static_cast<long>(window.size() - DIFFICULTY_BLOCKS_COUNT));
-
-        DifficultyWindow dw;
-        dw.seed(window);
-        out = dw.next_difficulty(rules_version);
         return true;
     }
 
@@ -2544,6 +2623,15 @@ private:
         return b && b->has_entry;
     }
 
+    // A best-chain row, or a resolved alternative block the gate passed (or
+    // that a run without proof-of-work checking would adopt). A parked orphan,
+    // an unjudgeable park and a held block are not.
+    bool holds_verified_locked_(const Hash& id) const {
+        if (rows_.contains(id)) return true;
+        const AltBlock* b = alt_.find(id);
+        return b && b->resolved && (b->pow_verified || b->adoptable);
+    }
+
     // D3a: is the block a peer just pushed one this index HAS as a valid block?
     // On the best chain (it connected, reorged in, or was already there), or held
     // in the alt pool as a RESOLVED, ADOPTABLE candidate with its bodies. A parked
@@ -2797,8 +2885,10 @@ private:
     }
     struct Reader {
         const std::uint8_t* p; std::size_t n; std::size_t off = 0; bool bad = false;
+        // Every bound is written as "need > n - off" after "off <= n", so a
+        // length read from the file can never wrap the comparison.
         std::uint64_t u64() {
-            if (off + 8 > n) { bad = true; return 0; }
+            if (off > n || n - off < 8) { bad = true; return 0; }
             std::uint64_t v = 0;
             for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(p[off + i]) << (8 * i);
             off += 8;
@@ -2806,7 +2896,7 @@ private:
         }
         Hash hash() {
             Hash h{};
-            if (off + 32 > n) { bad = true; return h; }
+            if (off > n || n - off < 32) { bad = true; return h; }
             for (int i = 0; i < 32; ++i) h[static_cast<std::size_t>(i)] = p[off + i];
             off += 32;
             return h;
@@ -2814,7 +2904,7 @@ private:
         std::vector<std::uint8_t> bytes() {
             const std::uint64_t len = u64();
             std::vector<std::uint8_t> b;
-            if (bad || off + len > n) { bad = true; return b; }
+            if (bad || off > n || len > n - off) { bad = true; return b; }
             b.assign(p + off, p + off + len);
             off += static_cast<std::size_t>(len);
             return b;
