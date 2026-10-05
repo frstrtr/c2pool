@@ -113,14 +113,18 @@ inline bool tx_format_above_implemented(const std::uint8_t* data, std::size_t si
     std::uint64_t unlock = 0;
     if (!r.read_varint(unlock)) return false;
 
+    // Monero's parse ceilings (xmr_tx_weight.hpp, structural bounds), the same
+    // ones the consensus parser applies to a non-coinbase transaction.
     std::uint64_t n_in = 0;
-    if (!r.read_count(n_in, TX_MAX_INPUTS) || n_in == 0) return false;
+    if (!r.read_count(n_in, MAX_VIN_COUNT) || n_in == 0) return false;
+    std::uint64_t total_key_offsets = 0;   // < MAX_TOTAL_KEY_OFFSETS, as in deserialize_vin
     for (std::uint64_t i = 0; i < n_in; ++i) {
         std::uint8_t tag = 0;
         if (!r.read_byte(tag) || tag != TX_IN_TO_KEY) return false;
         std::uint64_t amount = 0, n_off = 0;
         if (!r.read_varint(amount)) return false;
-        if (!r.read_count(n_off, TX_MAX_RING)) return false;
+        if (!r.read_count(n_off, MAX_TOTAL_KEY_OFFSETS - 1 - total_key_offsets)) return false;
+        total_key_offsets += n_off;
         for (std::uint64_t k = 0; k < n_off; ++k) {
             std::uint64_t off = 0;
             if (!r.read_varint(off)) return false;
@@ -129,7 +133,7 @@ inline bool tx_format_above_implemented(const std::uint8_t* data, std::size_t si
     }
 
     std::uint64_t n_out = 0;
-    if (!r.read_count(n_out, TX_MAX_OUTPUTS) || n_out == 0) return false;
+    if (!r.read_count(n_out, MAX_NON_COINBASE_VOUT_COUNT) || n_out == 0) return false;
     for (std::uint64_t i = 0; i < n_out; ++i) {
         std::uint64_t amount = 0;
         std::uint8_t  tag    = 0;
@@ -143,7 +147,7 @@ inline bool tx_format_above_implemented(const std::uint8_t* data, std::size_t si
     }
 
     std::uint64_t extra_len = 0;
-    if (!r.read_count(extra_len, TX_MAX_EXTRA_BYTES)) return false;
+    if (!r.read_count(extra_len, UINT64_MAX)) return false;   // bounded by the bytes present
     if (!r.skip(static_cast<std::size_t>(extra_len))) return false;
 
     std::uint8_t rct_type = 0;

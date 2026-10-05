@@ -136,6 +136,30 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_consensus_state_kat COMMAND xmr_native_consensus_state_kat)
 
+    # 5b) Monero's transaction count ceilings and nothing tighter: a block whose
+    #     coinbase has 5,000 (and exactly 3,125,000 = MAX_COINBASE_VOUT_COUNT)
+    #     outputs parses, evaluates and connects; counts above Monero's
+    #     ceilings are refused; a truncated buffer with a huge count is refused
+    #     without a large allocation; the v17 miner-output rule
+    #     (FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS) is keyed on the major version.
+    #     Peak memory ~110 MB (one 3,125,000-output block blob). Added to BOTH
+    #     --target lists in build.yml.
+    add_executable(xmr_native_coinbase_outputs_limit_kat xmr_coinbase_outputs_limit_kat.cpp)
+    target_include_directories(xmr_native_coinbase_outputs_limit_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE xmr_native_txpool xmr_coin)
+    target_compile_features(xmr_native_coinbase_outputs_limit_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_coinbase_outputs_limit_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME xmr_native_coinbase_outputs_limit_kat COMMAND xmr_native_coinbase_outputs_limit_kat)
+    set_tests_properties(xmr_native_coinbase_outputs_limit_kat PROPERTIES TIMEOUT 300)
+
     # -----------------------------------------------------------------------
     # Wave 1, component C2b: the trust-anchor bundle (../anchor/). One target,
     # STL-only, registered in BOTH `--target` lists in build.yml.

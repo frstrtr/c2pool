@@ -40,6 +40,7 @@ Bitcoin-family lane and Monero pins FCMP++/CARROT timing. See the scoping note
 | DR | [`settlement-drain.md`](settlement-drain.md) | the drain rule (operator rulings 2026-10-02, lane rules 23-25): old balances paid only out of Delta = min(F, R x min(dh, 64) / 256) per lane block, the window paid first at P = R - debt_paid, DEBT FIRST removed, K_o in contested blocks, the F4 band and the gross-set decay clock; the study behind it (method, data provenance, numbers) |
 | RV | [`review-criticals.md`](review-criticals.md) | the external payout review ([gist](https://gist.github.com/SChernykh/636eca0b73181277ea85401b6b1e24ba)) finding by finding against the recomputed coinbase: what is closed natively, what the threshold design closes, what stays open |
 | PF | [`performance.md`](performance.md) | per-block cost: measured primitives, ledger scaling, the output-mapping and derivation-cache fixes, next steps |
+| CMP | [`comparison.md`](comparison.md) | the lane next to classical p2pool, Monero P2Pool, p2poolv2 and Braidpool, axis by axis, including a pool-majority attack; where v37 is weaker |
 
 ## Open questions carried (route to operator / integrator)
 

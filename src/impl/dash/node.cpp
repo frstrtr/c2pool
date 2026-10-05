@@ -85,6 +85,11 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                         LOG_WARNING << "[Pool] share from " << addr.to_string()
                                     << " rejected: " << e.what()
                                     << " (rejected_total=" << n_rej << ")";
+                    // #1829: graded on the DASH v36 network only (note_misbehaviour
+                    // filters by network). The scorer is IO-thread state.
+                    boost::asio::post(*m_context, [this, addr]() {
+                        note_misbehaviour(addr, misbehaviour::Offence::wrong_share_type);
+                    });
                 }
 
                 if (admitted && share.hash().IsNull())
@@ -95,9 +100,21 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                             obj->m_hash = share_init_verify(*obj, m_tracker.m_coin_params, true);
                         });
                     }
-                    catch (const std::exception&)
+                    catch (const std::exception& e)
                     {
-                        // leave hash null — phase 2 will skip this share
+                        // Leave hash null: phase 2 skips this share. #1829:
+                        // charge the sender by what failed (the one shared
+                        // rule, misbehaviour::classify_verify_failure):
+                        // invalid PoW / target and structural rejects on both
+                        // networks, any other verify failure on the DASH v36
+                        // network only, a future timestamp never. The scorer
+                        // is IO-thread state, so the charge is posted there.
+                        const auto offence = misbehaviour::classify_verify_failure(
+                            e, SharechainConfig::share_profile().full_misbehaviour_grading);
+                        if (offence)
+                            boost::asio::post(*m_context, [this, addr, o = *offence]() {
+                                note_misbehaviour(addr, o);
+                            });
                     }
                 }
 
@@ -112,6 +129,88 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                         });
                 }
             });
+    }
+}
+
+bool NodeImpl::precheck_raw_shares(std::vector<chain::RawShare>& shares,
+                                   precheck::Kind kind, const NetService& addr)
+{
+    const auto r = precheck::precheck_raw_shares(shares, kind, SharechainConfig::share_profile());
+    if (r.message_dropped)
+        m_precheck_dropped_messages.fetch_add(1, std::memory_order_relaxed);
+    if (r.shares_dropped)
+    {
+        m_precheck_dropped_shares.fetch_add(r.shares_dropped, std::memory_order_relaxed);
+        static std::atomic<uint64_t> s_dropped{0};
+        const uint64_t n = ++s_dropped;
+        if (n <= 3 || n % 100 == 0)
+            LOG_WARNING << "[Pool] " << precheck::kind_name(kind) << " from " << addr.to_string()
+                        << ": dropped " << r.shares_dropped
+                        << (r.message_dropped ? " shares (whole message): " : " shares: ")
+                        << r.reason << " (drop_events_total=" << n << ")";
+        // #1829: one charge per message, DASH v36 network only (the public
+        // caps are the oracle's own receive rule, which only skips the frame).
+        note_misbehaviour(addr, misbehaviour::Offence::precheck_drop);
+    }
+    return !r.message_dropped;
+}
+
+// #1829: charge one offence against `addr` (peer_misbehaviour.hpp has the
+// policy and the oracle citations). IO thread, same discipline as m_ban_list.
+//
+// KEYED BY IP, BANNED BY IP (LTC #1601 parity, ltc/node.cpp note_invalid_pow_share):
+// the score accumulates per source IP, so redialing from a new port does not
+// reset it, and the ban goes to m_ip_ban_list, which is_banned() consults for
+// any port: connected() refuses the inbound reconnect before the handshake and
+// the dialer skips the address. Every open connection from that IP is closed.
+// The run_think hard ban of think()'s bad_peer_addresses (IP:port) is separate
+// and unchanged.
+void NodeImpl::note_misbehaviour(const NetService& addr, misbehaviour::Offence offence)
+{
+    if (addr.port() == 0)          // db-load pseudo-peer, never a network peer
+        return;
+    if (is_whitelisted(addr))      // --addnode / --connect seeds are never scored
+        return;
+    if (!misbehaviour::applies(offence, SharechainConfig::share_profile().full_misbehaviour_grading))
+        return;
+    m_misbehaviour_notes[static_cast<std::size_t>(offence)].fetch_add(1, std::memory_order_relaxed);
+
+    const std::string ip = addr.address();
+    if (!m_misbehaviour.note(ip, misbehaviour::weight(offence), m_misbehaviour_now()))
+        return;   // below the threshold: no action, the score keeps decaying
+
+    using Scorer = misbehaviour::PeerMisbehaviourScorer<std::string>;
+    LOG_WARNING << "[MISBEHAVIOR] peer IP " << ip
+                << " crossed the misbehaviour threshold (" << Scorer::BAN_THRESHOLD
+                << ", " << Scorer::HALFLIFE_SECONDS << "s half-life), last offence "
+                << misbehaviour::name(offence) << " from " << addr.to_string()
+                << " - IP-banning for " << m_ban_duration.count() << "s and disconnecting";
+    m_ip_ban_list[ip] = std::chrono::steady_clock::now() + m_ban_duration;
+    m_misbehaviour_bans.fetch_add(1, std::memory_order_relaxed);
+    m_misbehaviour.clear(ip);
+    disconnect_ip(ip);
+}
+
+void NodeImpl::prune_misbehaviour()
+{
+    m_misbehaviour.prune(m_misbehaviour_now());
+}
+
+void NodeImpl::disconnect_ip(const std::string& ip)
+{
+    std::vector<NetService> to_close;
+    for (const auto& [service, peer] : m_connections)
+        if (service.address() == ip)
+            to_close.push_back(service);
+    // error(), not close_connection(): error() also drops the peer's nonce
+    // entry from m_peers, so a reconnect after the ban expires is not refused
+    // as a duplicate, and it cancels the peer's pending share requests.
+    for (const auto& service : to_close)
+        error("misbehaviour score crossed the ban threshold", service);
+    for (auto it = m_pending_outbound.begin(); it != m_pending_outbound.end(); )
+    {
+        if (it->address() == ip) it = m_pending_outbound.erase(it);
+        else ++it;
     }
 }
 
@@ -801,6 +900,8 @@ void NodeImpl::run_think()
                     else ++it;
                 }
             }
+            // #1829: forget misbehaviour scores that decayed to ~0.
+            prune_misbehaviour();
 
             // #754 share-download leg (p2pool node.py download loop; ltc
             // node.cpp:1600-1618 port): reset the per-cycle gate — p2pool

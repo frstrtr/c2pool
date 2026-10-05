@@ -17,10 +17,20 @@ void Actual::handle_message(std::unique_ptr<RawMessage> rmsg, peer_ptr peer)
     try 
     {
         result = m_handler.parse(rmsg);
+    } catch (const std::out_of_range& ec)
+    {
+        // Unknown command: dropped, never charged (p2pool-dash skips it,
+        // util/p2protocol.py:49-53).
+        LOG_WARNING << "Failed to parse message '" << rmsg->m_command << "' from "
+                    << peer->addr().to_string() << ": " << ec.what();
+        return;
     } catch (const std::exception& ec)
     {
         LOG_WARNING << "Failed to parse message '" << rmsg->m_command << "' from "
                     << peer->addr().to_string() << ": " << ec.what();
+        // #1829: a known command whose payload does not parse. Graded on the
+        // DASH v36 network only (note_misbehaviour filters by network).
+        note_misbehaviour(peer->addr(), misbehaviour::Offence::parse_failure);
         return;
     }
 
@@ -103,6 +113,10 @@ void Actual::HANDLER(getaddrs)
 
 void Actual::HANDLER(shares)
 {
+    // #1828: per-message caps before any share is parsed or hashed.
+    if (!precheck_raw_shares(msg->m_shares, precheck::Kind::shares, peer->addr()))
+        return;
+
     dash::HandleSharesData result;
 
     for (auto wrappedshare : msg->m_shares)
@@ -120,6 +134,9 @@ void Actual::HANDLER(shares)
         {
             LOG_WARNING << "Failed to load share (type=" << wrappedshare.type
                         << ") from " << peer->addr().to_string() << ": " << e.what();
+            // #1829: DASH v36 network only; on the public network this
+            // (e.g. a share of a type it does not know) is only logged.
+            note_misbehaviour(peer->addr(), misbehaviour::Offence::parse_failure);
             continue;
         }
 
@@ -159,6 +176,12 @@ void Actual::HANDLER(sharereq)
         {
             rshares.emplace_back(share.version(), pack(share));
         }
+        // #1828: a reply over the oracle payload cap would be dropped by the
+        // receiver (p2pool-dash util/p2protocol.py:38, and our own receive
+        // cap); answer too_long instead, as p2pool-dash does
+        // (p2pool/p2p.py:399-404 handle_sharereq on p2protocol.TooLong).
+        if (!precheck::sharereply_fits(rshares))
+            throw std::invalid_argument("sharereply payload exceeds 3145728 bytes");
         auto reply_msg = message_sharereply::make_raw(msg->m_id, dash::ShareReplyResult::good, rshares);
         peer->write(std::move(reply_msg));
     }
@@ -178,6 +201,15 @@ void Actual::HANDLER(sharereq)
 void Actual::HANDLER(sharereply)
 {
     dash::ShareReplyData result;
+    // #1828: a reply over the per-message caps resolves the pending request
+    // EMPTY right away (the same outcome as a non-good result), before any
+    // share is parsed or hashed.
+    if (msg->m_result == ShareReplyResult::good
+        && !precheck_raw_shares(msg->m_shares, precheck::Kind::sharereply, peer->addr()))
+    {
+        got_share_reply(msg->m_id, result);
+        return;
+    }
     if (msg->m_result == ShareReplyResult::good)
     {
         result.m_items.reserve(msg->m_shares.size());
@@ -194,6 +226,7 @@ void Actual::HANDLER(sharereply)
             {
                 LOG_WARNING << "Failed to deserialize share (type=" << rshare.type
                             << ") from " << peer->addr().to_string() << ": " << e.what();
+                note_misbehaviour(peer->addr(), misbehaviour::Offence::parse_failure);   // #1829, v36 only
                 continue;
             }
         }

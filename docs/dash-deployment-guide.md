@@ -15,6 +15,9 @@ mining site. Applies to v0.2.3 on Ubuntu-class Linux x86_64.
 > `--web-port`/`--web-host`/`--dashboard-dir`, the money flags and the
 > settings-file control plane — is in the README's
 > [c2pool-dash launch reference](../README.md#c2pool-dash--dash-x11).
+> A fresh daemonless node needs `--embedded-mn-bridge-max 40000` until the
+> compiled masternode anchor is bumped
+> ([#1906](https://github.com/frstrtr/c2pool/issues/1906)).
 
 ## 1. What v0.2.3 is (and is not)
 

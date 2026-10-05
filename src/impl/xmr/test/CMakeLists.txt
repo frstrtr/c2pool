@@ -360,7 +360,7 @@ if (BUILD_TESTING)
 
     # =========================================================================
     # X9 OPTION B — whole-block settlement coinbase (consumer-tree; no consensus
-    # digest). Both link xmr_template (the p2pool block-template port + the
+    # digest). Both link xmr_template (the clean-room block template + the
     # authored xmr_coin_primitives.cpp seam bodies), so the primitive bodies are
     # provided ONCE by the library and neither TU defines
     # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES (the ODR rule).

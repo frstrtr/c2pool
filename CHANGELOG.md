@@ -23,6 +23,13 @@
   experimental — the fork coin is effectively unlisted (block reward ≈ 0), so the
   value is strategic, not revenue.
 
+### DASH: fresh daemonless node needs `--embedded-mn-bridge-max 40000` until the anchor bump (#1906)
+- The compiled masternode anchor (h=2522504) is now more than 20000 blocks behind
+  the tip. A fresh node on default flags fails closed (`[MN-CKPT] FAIL-CLOSED:
+  checkpoint is STALE`) and serves no embedded template. Start a fresh node with
+  `--embedded-mn-bridge-max 40000` until the anchor is bumped. Nodes that resume
+  from a persisted bridge cursor are not affected.
+
 ### DASH — good-citizen serving is the daemonless binary default (opt-out)
 - **A bare `c2pool-dash --run` (no `--coin-rpc`/`--coin-rpc-auth`/`--submit-block`)
   now serves the FULL mempool + special txs (DIP types 1-4) + funded superblocks

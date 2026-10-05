@@ -4933,7 +4933,31 @@ static int run_live(const XmrNodeConfig& cfg) {
                     node::Hash h{}; std::memcpy(h.data(), id.data(), 32);
                     return nn->index().block_blob_of(h, blob);
                 };
-                std::printf("relay: receipt contexts from the native node (best-chain rows + retained bodies; FB_GETCTX served natively)\n");
+                // The WORK behind a receipt context is judged against the same
+                // verified index: held there, or proof of work at the difficulty
+                // its parent implies there (relay::judge_block_ctx).
+                relay::CtxChainSource ctx_chain;
+                ctx_chain.verified = [nn](const ::v37::bytes32& id) {
+                    node::Hash h{}; std::memcpy(h.data(), id.data(), 32);
+                    return nn->index().holds_verified(h);
+                };
+                ctx_chain.target = [nn](const ::v37::bytes32& anchor, const std::vector<relay::CtxStep>& above,
+                                        std::uint64_t major, relay::CtxTarget& out, std::string& why) {
+                    node::Hash a{}; std::memcpy(a.data(), anchor.data(), 32);
+                    std::vector<std::pair<std::uint64_t, node::Difficulty128>> rows;
+                    rows.reserve(above.size());
+                    for (const auto& st : above) { node::Difficulty128 d{}; d.lo = st.diff_lo; d.hi = st.diff_hi; rows.emplace_back(st.timestamp, d); }
+                    node::Difficulty128 d{}; node::Hash seed{}; std::uint64_t h = 0;
+                    const std::uint8_t mv = static_cast<std::uint8_t>(major > 255 ? 255 : major);
+                    if (!nn->index().context_target(a, rows, mv, d, seed, h, why)) return false;
+                    out.diff_lo = d.lo; out.diff_hi = d.hi; out.height = h;
+                    std::memcpy(out.seed.data(), seed.data(), 32);
+                    return true;
+                };
+                relay_node->set_ctx_chain(std::move(ctx_chain));
+                std::printf("relay: receipt contexts from the native node (best-chain rows + retained bodies; FB_GETCTX served natively; context work checked against the native index)\n");
+            } else {
+                std::printf("relay: no native chain index: a receipt context is taken from our own monerod only (a peer-served one is never used)\n");
             }
             io.fee_model = fee_on;   // fee model S3: push split by the receipt's own PoW-committed give_author
             io.network = static_cast<std::uint8_t>(don_net);   // DON-NET: the donation payee of this network

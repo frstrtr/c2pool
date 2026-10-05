@@ -169,6 +169,24 @@ struct TNode {
             [this](const Admitted& a, u64 pos, u32 n_pushes, u64 next_after, const bytes32& dig) {
                 relay->on_pushed(a.id, pos, n_pushes, a.raw, next_after, dig);
             });
+        // The WORK behind a context is judged against this node's own (fake)
+        // index, as main_v37_xmr.cpp binds the native one: best-chain rows are
+        // held verified; a block above them needs proof of work at a model
+        // difficulty of 2, which the zero-hash RandomX fake meets.
+        CtxChainSource cs;
+        cs.verified = [this](const bytes32& id) {
+            std::lock_guard<std::mutex> lk(idx.m);
+            for (const auto& [h, rid] : idx.rows) if (rid == id) return true;
+            return false;
+        };
+        cs.target = [this](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t, CtxTarget& out, std::string& why) {
+            std::lock_guard<std::mutex> lk(idx.m);
+            for (const auto& [h, rid] : idx.rows)
+                if (rid == anchor) { out.diff_lo = 2; out.diff_hi = 0; out.height = h + above.size() + 1; out.seed = bytes32{}; return true; }
+            why = "anchor not held";
+            return false;
+        };
+        relay->set_ctx_chain(std::move(cs));
     }
     ~TNode() { relay->stop(); engine->stop(); }
     // the template this node is serving (main_v37_xmr.cpp relay_tick: note(prev, height, seed))

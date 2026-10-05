@@ -255,6 +255,7 @@ jobs:
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
+                    xmr_native_coinbase_outputs_limit_kat \
                     xmr_native_anchor_self_check_kat xmr_native_anchor_gate4_kat xmr_native_chain_index_kat \
                     xmr_native_reorg_follow_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
@@ -283,7 +284,7 @@ jobs:
                     v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
                     v37_xmr_web_dashboard_kat \
                     v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat v37_xmr_rejoin_payee_kat v37_xmr_empty_cut_finder_kat \
-                    v37_xmr_coinbase_recompute_kat v37_xmr_mainnet_rehearsal_kat v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat \
+                    v37_xmr_coinbase_recompute_kat v37_xmr_mainnet_rehearsal_kat v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     v37_xmr_p2p_publish_retry_kat \
@@ -766,6 +767,7 @@ jobs:
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
                     xmr_levin_codec_kat xmr_epee_storage_kat xmr_levin_messages_kat xmr_levin_fuzz_kat \
                     xmr_native_block_id_kat xmr_native_consensus_state_kat \
+                    xmr_native_coinbase_outputs_limit_kat \
                     xmr_native_anchor_self_check_kat xmr_native_anchor_gate4_kat xmr_native_chain_index_kat \
                     xmr_native_reorg_follow_kat \
                     xmr_levin_socket_kat xmr_levin_link_kat \
@@ -794,7 +796,7 @@ jobs:
                     v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
                     v37_xmr_web_dashboard_kat \
                     v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat v37_xmr_rejoin_payee_kat v37_xmr_empty_cut_finder_kat \
-                    v37_xmr_coinbase_recompute_kat v37_xmr_mainnet_rehearsal_kat v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat \
+                    v37_xmr_coinbase_recompute_kat v37_xmr_mainnet_rehearsal_kat v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat \
                     v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     v37_xmr_p2p_publish_retry_kat \

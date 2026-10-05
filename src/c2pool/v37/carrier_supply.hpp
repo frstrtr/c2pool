@@ -482,34 +482,35 @@ private:
     static void b32(std::vector<std::uint8_t>& b, const bytes32& h) {
         b.insert(b.end(), h.begin(), h.end());
     }
+    // Peer data: bounds are "p > size || size - p < k", never "p + k > size".
     static bool g8(const std::vector<std::uint8_t>& b, std::size_t& p, std::uint8_t& v) {
-        if (p + 1 > b.size()) return false;
+        if (p > b.size() || b.size() - p < 1) return false;
         v = b[p++];
         return true;
     }
     static bool g16(const std::vector<std::uint8_t>& b, std::size_t& p, std::uint16_t& v) {
-        if (p + 2 > b.size()) return false;
+        if (p > b.size() || b.size() - p < 2) return false;
         v = 0;
         for (int i = 0; i < 2; ++i) v |= static_cast<std::uint16_t>(b[p + i]) << (8 * i);
         p += 2;
         return true;
     }
     static bool g32(const std::vector<std::uint8_t>& b, std::size_t& p, std::uint32_t& v) {
-        if (p + 4 > b.size()) return false;
+        if (p > b.size() || b.size() - p < 4) return false;
         v = 0;
         for (int i = 0; i < 4; ++i) v |= static_cast<std::uint32_t>(b[p + i]) << (8 * i);
         p += 4;
         return true;
     }
     static bool g64(const std::vector<std::uint8_t>& b, std::size_t& p, std::uint64_t& v) {
-        if (p + 8 > b.size()) return false;
+        if (p > b.size() || b.size() - p < 8) return false;
         v = 0;
         for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(b[p + i]) << (8 * i);
         p += 8;
         return true;
     }
     static bool g32b(const std::vector<std::uint8_t>& b, std::size_t& p, bytes32& h) {
-        if (p + 32 > b.size()) return false;
+        if (p > b.size() || b.size() - p < 32) return false;
         for (int i = 0; i < 32; ++i) h[i] = b[p + i];
         p += 32;
         return true;

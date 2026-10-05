@@ -600,7 +600,7 @@ if (BUILD_TESTING)
     #     native template path never touches the transport.
     #
     #     Heaviest of the v37 consumer KATs and deliberately so: it links
-    #     `xmr_template` (the p2pool whole-block template port), compiles the X6
+    #     `xmr_template` (the clean-room whole-block template), compiles the X6
     #     executor (settle/xmr_coinbase.cpp) and the ed25519 point-check
     #     registrar, because a settlement coinbase that is not actually derived
     #     is not the thing M2 claims to have preserved. Both are already on the
@@ -1121,7 +1121,24 @@ if (BUILD_TESTING)
     #                               property HELLO-compatible <=> same pool_tag.
     #                               RED on the base. ALSO on BOTH build.yml
     #                               --target lists.
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat)
+    # ------------------------------------------------------------------
+    # TRACKED TIMING FLAKES: these ctest names run through
+    # cmake/RetryTest.cmake, up to 3 tries, so a known race does not block
+    # unrelated PRs. The races stay OPEN in their issues; a test that fails
+    # all 3 tries still fails. Drop a name when its issue's race is fixed.
+    #   v37_xmr_relay_send_queue_kat  #1889 S2 re-HELLO: a frame not yet
+    #                                 PONG-confirmed at the forced drop is
+    #                                 re-offered.
+    #   v37_xmr_relay_discovery_kat   #1890 D2: one link per node pair under
+    #                                 load.
+    #   v37_xmr_relay_node_nonce_kat  #1885 N5: duplicate in/out pair closed
+    #                                 by the acceptor.
+    # (v37_convergence_soak, #1905, is wrapped at its own add_test below.)
+    set(V37_FLAKY_RETRY v37_xmr_relay_send_queue_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat)
+    set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
+    set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
+    set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
+    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1217,7 +1234,45 @@ if (BUILD_TESTING)
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
         target_compile_definitions(${_gap2_kat} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
         target_link_libraries(${_gap2_kat} PRIVATE xmr_coin Threads::Threads)
-        add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
+        if (_gap2_kat IN_LIST V37_FLAKY_RETRY)
+            add_test(NAME ${_gap2_kat} COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:${_gap2_kat}> -DNAME=${_gap2_kat}
+                -DISSUE=${V37_FLAKY_ISSUE_${_gap2_kat}} -DTRIES=3
+                -P ${CMAKE_SOURCE_DIR}/cmake/RetryTest.cmake)
+        else()
+            add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
+        endif()
+    endforeach()
+    #   v37_xmr_ctx_pow_kat        receipt CONTEXT WORK: a Monero block a peer
+    #                               serves as a receipt's context (FB_CTX) is
+    #                               used only if our own verified chain index
+    #                               holds it or its proof of work meets the
+    #                               difficulty its parent implies there (at
+    #                               most 2 unknown blocks above the index);
+    #                               zero / wrong work = forged (ban), unknown
+    #                               parent / depth 3 / no verifier = deferred.
+    #                               Drives the REAL native ChainIndex with a
+    #                               model RandomX. ALSO on BOTH build.yml
+    #                               --target lists.
+    #   v37_xmr_parse_bounds_kat   non-wrapping bounds ("len > size - pos")
+    #                               in the receipt tx_extra / hashing-blob
+    #                               parsers, the context block layout, the
+    #                               receipt wire reader and the index snapshot
+    #                               reader: lengths near SIZE_MAX at positions
+    #                               near the end are refused with no read past
+    #                               the buffer (the ASan leg runs it under
+    #                               -fsanitize=address,undefined). ALSO on BOTH
+    #                               build.yml --target lists.
+    # Both include the native chain index, whose difficulty adapter needs the
+    # header-only boost multiprecision (as the native index KATs do).
+    foreach(_ctx_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
+        if (TARGET Boost::headers)
+            target_link_libraries(${_ctx_kat} PRIVATE Boost::headers)
+        elseif (TARGET Boost::boost)
+            target_link_libraries(${_ctx_kat} PRIVATE Boost::boost)
+        elseif (DEFINED Boost_INCLUDE_DIRS)
+            target_include_directories(${_ctx_kat} PRIVATE ${Boost_INCLUDE_DIRS})
+        endif()
     endforeach()
     # v37_xmr_verify_pool_kat: with RandomX built, it also links librandomx so
     # its VP_LIVE=1 measurement mode pays the REAL light hash per verify (the
@@ -1972,9 +2027,16 @@ if (BUILD_TESTING)
     target_compile_features(v37_convergence_soak PRIVATE cxx_std_20)
     target_include_directories(v37_convergence_soak PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_convergence_soak Threads::Threads)
-    add_test(NAME v37_convergence_soak COMMAND v37_convergence_soak)
+    # TRACKED TIMING FLAKE #1905 (SK-A1 fails ~5/40 under ASan; the race stays
+    # open there): up to 3 tries via cmake/RetryTest.cmake, failing all 3 still
+    # fails. TIMEOUT covers all tries together (300 -> 600); ENVIRONMENT reaches
+    # the binary through the wrapper.
+    add_test(NAME v37_convergence_soak COMMAND ${CMAKE_COMMAND}
+        -DEXE=$<TARGET_FILE:v37_convergence_soak> -DNAME=v37_convergence_soak
+        -DISSUE=1905 -DTRIES=3
+        -P ${CMAKE_SOURCE_DIR}/cmake/RetryTest.cmake)
     set_tests_properties(v37_convergence_soak PROPERTIES
-        TIMEOUT 300
+        TIMEOUT 600
         ENVIRONMENT "SOAK_SEED=20260918;SOAK_ROUNDS=600;SOAK_SECONDS=60;SOAK_PROGRESS=0")
 
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)

@@ -7,18 +7,20 @@ state machine. Runnable artifacts for the V37 prototyping line (off `master`).
 
 | file | what it models | check |
 |------|----------------|-------|
-| `Settlement.tla` | finality-gated owed/overlay state machine — `BlockFound→OverlayAdded`, `BlockFinalized→OwedSettled+OverlayCleared`, `BlockOrphaned→OverlayReverted` | `Settlement.cfg` (full), `Settlement_small.cfg` (fast) |
+| `Settlement.tla` | finality-gated owed/overlay state machine (revision 2: signed owed) -- `BlockFound→OverlayAdded` with a signed DROPS-composed credit row, `BlockFinalized→OwedSettled+OverlayCleared`, `BlockOrphaned→OverlayReverted`, `DeepOrphan→priced residual` | `Settlement.cfg` (full), `Settlement_small.cfg` (fast), `Settlement_noC4.cfg` / `Settlement_clawback.cfg` / `Settlement_nomass.cfg` (negative controls) |
 | `Lanes.tla` | per-lane Push/Tick decay vs ground-truth windowed recompute; invariants I1 (dedup), I2 (mono), I3 (no-stale / acc-bounded / determinism), I4 (bin-clock) | `Lanes.cfg` (canonical), `Lanes_wide.cfg` (wider), `Lanes_free.cfg` (negative control) |
 | `SettlementCanon.tla` | the XMR lane ledger under the every-node coinbase recompute (`docs/xmr-lane/coinbase-recompute.md`): a canonical block books its credit and payouts, a mismatch is booked debit-only (payouts debited, credit dropped), an undecidable block is held; the pay-in-block allocation in abstract form with the drain rule of the operator rulings of 2026-10-02 (pay-now first: the window credited and paid at P = R - debt_paid; old balances paid only out of Delta = min(F, R * min(dh, HCap) div DrainQ); contested slots follow cash, K_o from the first owed pass; DEBT FIRST removed; redistribution as a credit delta; no advance, no claim without cash); `DrainQ = 0` is master's allocation | `SettlementCanon.cfg` (the rule, one slot), `SettlementCanon_ko.cfg` (contested slots, K_o), `SettlementCanon_noslot.cfg` (no payee slot), `SettlementCanon_master.cfg` (master, DrainQ = 0), `SettlementCanon_len3.cfg` (three blocks, long), `check-settlement-canon.sh` (negative controls, witnesses) |
 
 ## Verified results
 
-Settlement (`Settlement.cfg`): **GREEN** — no error, 87,885 distinct states,
-depth 10. Invariants `TypeOK`, `NoNegativeOwed`, `OverlayNeverExceedsOwed`,
-`SettledImpliesFinalized`, `MonoOnFinal`, `Conservation` (per-miner no-robbery),
-`SettleOnce`. Two real bugs found + fixed en route: scalar-credit inflation
-(credit must be a per-miner vector) and tip-truncation un-burying finalized
-blocks (reorg modelled as same-height swap, not truncation).
+Settlement (`Settlement.cfg`, revision 2): **GREEN** -- no error, 606,013 distinct
+states, depth 7. Invariants `TypeOK`, `KeyFloor` (per key `>= -KeyBound`),
+`AggregateNonNeg`, `SettledImpliesFinalized`, `SettleOnce`, `Conservation` (signed,
+per key, over the book of SETTLED records), `ResidualBound` (orphan after SETTLED);
+action properties `MonoOnFinal`, `NoClawback`. Revision 1 (`NoNegativeOwed`,
+`OverlayNeverExceedsOwed`) is withdrawn: it held only because a negative value could
+not be expressed. What changed and why: `ERRATA.md`. The three negative controls each
+yield a counterexample for their matching property.
 
 Lanes (`Lanes.cfg`, λ=2/3): **GREEN** — no error, 4,368 distinct states, depth 15.
 `Lanes_wide.cfg` (λ=1/2): GREEN, 2,132,609 states, depth 23.
@@ -87,4 +89,11 @@ java -cp tla2tools.jar tlc2.TLC -config SettlementCanon_noslot.cfg SettlementCan
 java -cp tla2tools.jar tlc2.TLC -config SettlementCanon_len3.cfg   SettlementCanon.tla   # long
 proto/tla/check-settlement-canon.sh path/to/tla2tools.jar [out-dir]   # all SettlementCanon runs
 TLC_LONG=1 proto/tla/check-settlement-canon.sh path/to/tla2tools.jar  # plus SettlementCanon_len3.cfg
+```
+
+Owed-sign checks (revision 2: base-red, spec GREEN, three negative controls, two
+reachability witnesses) in one go, one verdict line per run:
+
+```
+proto/tla/check-owed-sign.sh path/to/tla2tools.jar [out-dir]
 ```

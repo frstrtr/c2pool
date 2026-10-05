@@ -198,7 +198,7 @@ namespace {
 // lands. No shared-base / other-coin edit; dashd-RPC fallback untouched.
 struct PeeringConfig {
     std::string listen_host = "0.0.0.0";   // --listen [HOST:]PORT bind interface
-    uint16_t    listen_port = 0;           // 0 => sharechain SSOT default (8999/18999)
+    uint16_t    listen_port = 0;           // 0 => sharechain SSOT default (8999/18999; 8998 under --net dash-v36)
     bool        listen_set  = false;
     std::vector<NetService> addnodes;      // --addnode HOST:PORT (persistent outbound)
     std::vector<NetService> connects;      // --connect HOST:PORT (connect-only; no listen/discovery)
@@ -480,7 +480,7 @@ void log_block_ledger(core::MiningInterface* mi)
 // until the sharechain pool-node leaf lands.
 void report_peering(const PeeringConfig& peer, bool testnet)
 {
-    const uint16_t ssot = testnet ? 18999 : 8999;
+    const uint16_t ssot = testnet ? 18999 : dash::SharechainConfig::p2p_port();
     const uint16_t bind = peer.listen_port ? peer.listen_port : ssot;
     if (!peer.connects.empty() && !peer.listen_set) {
         std::cout << "[run] sharechain peering: --connect mode ("
@@ -648,8 +648,8 @@ void print_banner(const char* argv0)
         << "        ac2785363c0180b8, prefix 8d8516bac9edd280, protocol 3601; state in\n"
         << "        <data-dir>/dash_ac2785363c0180b8_v36). It FORKS from the default\n"
         << "        v16 sharechain. Mainnet only; cannot be combined with --network-id,\n"
-        << "        --prefix or --testnet. No built-in seeds yet: pass --addnode\n"
-        << "        HOST:PORT. Settings-file key: [dash.sharechain] network = \"v36\"\n"
+        << "        --prefix or --testnet. Dials the network's built-in seeds unless\n"
+        << "        --addnode/--connect is given. Settings-file key: [dash.sharechain] network = \"v36\"\n"
         << "        (money-class). Without --net the node stays on the v16 sharechain.\n"
         << "        --coin-p2p-discover arms the DASH-isolated peer manager: seed\n"
         << "        (dnsseed.dash.org + fixed) bootstrap, source-scored + group-diverse\n"

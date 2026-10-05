@@ -1,0 +1,868 @@
+# The c2pool v37 design canon: machine-readable rules.
+#
+# Each rule gives an id, a short title, a one-line statement with its values,
+# the code it governs and the checks a machine runs. source and ruling hold an
+# opaque reference (ref: the:Cnn) to the full text, which is kept outside this
+# repository. tools/canon/canon_check.py runs the checks (in CI on every pull
+# request and push to master, and daily from cron) and fails on any NEW
+# violation: a failing rule with no open deviation in DEVIATIONS.md, a check
+# that passed in baseline.json and fails now, a forbidden count above the
+# baseline, a required KAT that disappeared, or a pull request without a
+# required body line.
+#
+# A rule is changed only in a pull request whose body names it ("Canon: C03").
+#
+# Check types:
+#   required_kat  each named ctest must be registered in CMake, built by the CI
+#                 build.yml --target lists, and (when a ctest junit is given)
+#                 pass.
+#   constant      regex with one capture group; every captured integer must lie
+#                 in [min, max]; absent_ok allows the constant to be gone.
+#   forbidden     regex that must not match in the scope, minus an allowlist
+#                 (path, count, reason); the remaining count may never grow
+#                 over baseline.json.
+#   required      regex that must match at least min_count times in the scope.
+#   pr_body       a pull request touching the paths carries a body line:
+#                 "Canon: C03, C07" (line: Canon, rule C10), "KAT: <ctest
+#                 names>" or "KAT: none (reason)" (line: KAT, rule C31), or
+#                 "Design: <URL or path>" or "Design: none (reason)" (line:
+#                 Design, rule C40).
+#   register      every failing rule maps to an open deviation (rule C09).
+#
+# open_items (optional, per rule): open spec items; no check reads them.
+#
+# Rule states:
+#   ruled         (default) failing it without an open deviation is a NEW
+#                 violation.
+#   proposed      evaluated and reported, never fails a run, has no deviation;
+#                 waits_for names what it waits for.
+#
+# Syntax: the YAML subset read by canon_check.py (no tabs, no block scalars,
+# no anchors, no flow mappings). Regexes are single-quoted (backslash literal).
+
+version: 1
+register: DEVIATIONS.md
+baseline: baseline.json
+
+scopes:
+  xmr_lane_code:
+    include:
+      - src/c2pool/v37/xmr/**
+      - src/impl/xmr/**
+      - src/c2pool/v37/main_v37_xmr.cpp
+    exclude:
+      - '**/test/**'
+      - '**/tests/**'
+      - src/impl/xmr/third_party/**
+      - src/impl/xmr/coin/vendor/**
+      - src/impl/xmr/coin/compat/**
+      - src/impl/xmr/settle/_compile_check/**
+    extensions: [.hpp, .cpp, .h, .cc, .ipp, .inc]
+  xmr_lane_and_engine_code:
+    include:
+      - src/c2pool/v37/xmr/**
+      - src/impl/xmr/**
+      - src/c2pool/v37/main_v37_xmr.cpp
+      - src/sharechain/v37/**
+    exclude:
+      - '**/test/**'
+      - '**/tests/**'
+      - src/impl/xmr/third_party/**
+      - src/impl/xmr/coin/vendor/**
+      - src/impl/xmr/coin/compat/**
+      - src/impl/xmr/settle/_compile_check/**
+    extensions: [.hpp, .cpp, .h, .cc, .ipp, .inc]
+  xmr_lane_licence:
+    include:
+      - src/c2pool/v37/xmr/**
+      - src/impl/xmr/**
+      - src/c2pool/v37/main_v37_xmr.cpp
+      - src/c2pool/v37/test/*xmr*
+      - src/sharechain/v37/v37_descriptor_xmr*
+      - src/sharechain/v37/test/*xmr*
+    exclude:
+      - src/impl/xmr/third_party/**
+      - src/impl/xmr/coin/vendor/**
+    extensions: [.hpp, .cpp, .h, .c, .cc, .ipp, .inc, .py, .cmake, .txt]
+  xmr_consensus_core:
+    include:
+      - src/impl/xmr/receipt/**
+      - src/impl/xmr/settle/**
+      - src/impl/xmr/native/consensus/**
+      - src/impl/xmr/pow/randomx_verify.hpp
+      - src/c2pool/v37/xmr/relay/xmr_order_rule.hpp
+      - src/c2pool/v37/xmr/relay/xmr_share_verdict.hpp
+      - src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp
+      - src/c2pool/v37/xmr/relay/xmr_rbind_registry.hpp
+      - src/c2pool/v37/xmr/xmr_lane_rules.hpp
+      - src/c2pool/v37/xmr/xmr_lane_rules_build.hpp
+      - src/c2pool/v37/xmr/xmr_credit_cut.hpp
+      - src/c2pool/v37/xmr/xmr_cut_payees.hpp
+      - src/c2pool/v37/xmr/xmr_coinbase_authority.hpp
+      - src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp
+      - src/c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp
+      - src/c2pool/v37/xmr/xmr_paynow.hpp
+      - src/c2pool/v37/xmr/xmr_fee_model.hpp
+      - src/c2pool/v37/xmr/xmr_pool_tag.hpp
+      - src/c2pool/v37/xmr/xmr_drops_wiring.hpp
+      - src/sharechain/v37/**
+    exclude:
+      - '**/test/**'
+      - src/impl/xmr/settle/_compile_check/**
+    extensions: [.hpp, .cpp, .h, .cc, .ipp, .inc]
+
+rules:
+  - id: C01
+    title: carrier sharechain
+    statement: 'XMR lane carriers are shares of a sharechain with a parent link and a fork choice; receipts carry the credited work.'
+    source: 'ref: the:C01'
+    ruling: 'ref: the:C01'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/]
+    checks:
+      - name: carrier-sharechain-kat
+        type: required_kat
+        kats: [xmr_carrier_sharechain_kat]
+    status_now: fail
+    deviation: [D1]
+
+  - id: C02
+    title: receipt binds the previous own share
+    statement: 'The receipt PoW preimage binds the miner''s previous on-chain share (prev_own_share) and verification enforces it; carriage is open (C36).'
+    source: 'ref: the:C02'
+    ruling: 'ref: the:C02'
+    scope: [src/impl/xmr/receipt/, src/c2pool/v37/xmr/relay/]
+    checks:
+      - name: no-display-only-prev-own
+        type: forbidden
+        pattern: '(?i)prev_own_share[^\n]*display.only|display.only[^\n]*prev_own_share'
+        scope: xmr_lane_code
+        code_only: false
+      - name: prev-own-enforced-kat
+        type: required_kat
+        kats: [xmr_receipt_prev_own_kat]
+    status_now: fail
+    deviation: [D2]
+
+  - id: C03
+    title: open origin bin, F = 48
+    statement: 'Lateness bound = the open origin bin, F = 48 Monero heights; liveness judged at own position + 2; no hop bound; tip freshness 0 <= h(r) - h(tip) <= 2 for every receipt, refused at admission otherwise; no late tail.'
+    source: 'ref: the:C03'
+    ruling: 'ref: the:C03'
+    scope: [src/c2pool/v37/xmr/relay/, src/impl/xmr/receipt/, src/sharechain/v37/, src/c2pool/v37/w2_receipt.hpp]
+    checks:
+      - name: late-tail-bins
+        type: constant
+        pattern: '\bkLateTailBins\s*=\s*([0-9]+)'
+        paths: [src/c2pool/v37/xmr/**]
+        extensions: [.hpp, .cpp, .h]
+        min: 0
+        max: 2
+        absent_ok: true
+      - name: carriage-window-f
+        type: constant
+        pattern: '\bu64\s+n_ctx\s*=\s*([0-9]+)'
+        paths: [src/impl/xmr/receipt/xmr_admission.hpp]
+        min: 48
+        max: 48
+      - name: engine-n-ctx-bins
+        type: constant
+        pattern: '\bN_CTX_BINS\s*=\s*([0-9]+)'
+        paths: [src/sharechain/v37/nr_ladder.hpp]
+        min: 0
+        max: 2
+        note: 'Generic v37 engine (other lanes).'
+      - name: w2-n-ctx
+        type: constant
+        pattern: '\bW2_N_CTX\s*=\s*([0-9]+)'
+        paths: [src/c2pool/v37/w2_receipt.hpp]
+        min: 0
+        max: 2
+        note: 'Generic v37 engine (other lanes).'
+      - name: no-hop-bound
+        type: forbidden
+        pattern: '\b(?:R_HOPS|r_hops|kRHops|kMaxHops|max_hops)\b'
+        scope: xmr_lane_code
+        code_only: true
+      - name: legally-dead-kat
+        type: required_kat
+        kats: [xmr_receipt_legally_dead_kat]
+      - name: freshness-kat
+        type: required_kat
+        kats: [xmr_receipt_freshness_kat]
+    status_now: fail
+    deviation: [D3, D18]
+
+  - id: C04
+    title: no owed ledger
+    statement: 'The XMR payout path holds no owed ledger, no allocate_exact_sum owed and dust passes and no drain rule; each pool block pays its window split in its own coinbase.'
+    source: 'ref: the:C04'
+    ruling: 'ref: the:C04'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: owed-ledger-symbols
+        type: forbidden
+        pattern: '\b(?:OwedLedger|allocate_exact_sum|drain_delta|drain_rule_refusal|drain_reward_fixpoint|kDrainRefCadence|kDrainRuleVersion|kDrainFixpointPasses)\b'
+        scope: xmr_lane_code
+        code_only: true
+    status_now: fail
+    deviation: [D4]
+
+  - id: C05
+    title: no uncles
+    statement: 'XMR lane consensus code has no uncles; a share that lost the ordering race is carried as a receipt and credited in full.'
+    source: 'ref: the:C05'
+    ruling: 'ref: the:C05'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/sharechain/v37/]
+    checks:
+      - name: no-uncle-code
+        type: forbidden
+        pattern: '(?i)uncle'
+        scope: xmr_lane_and_engine_code
+        code_only: true
+    status_now: pass
+    deviation: [D5]
+
+  - id: C06
+    title: credit = work(T_origin)
+    statement: 'A receipt is credited work(T_origin); T_origin equals the consensus target of its origin bin (R-1); achieved difficulty does not set the credit.'
+    source: 'ref: the:C06'
+    ruling: 'ref: the:C06'
+    scope: [src/impl/xmr/receipt/, src/c2pool/v37/xmr/relay/, src/c2pool/v37/w2_receipt.hpp]
+    checks:
+      - name: credit-kats
+        type: required_kat
+        kats: [xmr_receipt_kat, xmr_receipt_bind_v2_kat, v37_w2_ingestion_test]
+      - name: r1-stage-admission
+        type: required
+        pattern: 'AdmitStage::R1Target'
+        paths: [src/impl/xmr/receipt/xmr_admission.hpp]
+        code_only: true
+        min_count: 2
+      - name: r1-stage-relay
+        type: required
+        pattern: '\bCheckStage::R1\b'
+        paths: [src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp]
+        code_only: true
+        min_count: 1
+      - name: no-credit-from-achieved
+        type: forbidden
+        pattern: '\b(?:w_raw|weight|credit|work)\w*\s*\+?=\s*[^;]*\bachieved\w*'
+        scope: xmr_lane_and_engine_code
+        code_only: true
+    status_now: pass
+    deviation: []
+
+  - id: C07
+    title: exact-sum coinbase
+    statement: 'Each pool block coinbase: sum of outputs = block reward + fees, to the piconero; every payee of the window split; no lottery.'
+    source: 'ref: the:C07'
+    ruling: 'ref: the:C07'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/]
+    checks:
+      - name: exact-sum-kats
+        type: required_kat
+        kats: [xmr_coinbase_kat, xmr_e2e_kat]
+    status_now: pass
+    deviation: []
+
+  - id: C08
+    title: no wall clock in consensus
+    statement: 'No wall-clock read decides XMR lane consensus; consensus time is the origin bin (the mainchain height in the preimage).'
+    source: 'ref: the:C08'
+    ruling: 'ref: the:C08'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/c2pool/v37/main_v37_xmr.cpp, src/sharechain/v37/]
+    checks:
+      - name: no-clock-in-consensus-core
+        type: forbidden
+        pattern: '\b\w+::now\s*\(|\b(?:gettimeofday|clock_gettime|localtime_r|localtime|gmtime_r|gmtime|timespec_get|now_unix|seconds_since_epoch|wall_now_s|wall_seconds)\s*\(|\bstd::time\s*\(|(?<![\w:.>])time\s*\(\s*(?:nullptr|NULL|0)?\s*\)'
+        scope: xmr_consensus_core
+        code_only: true
+      - name: clock-reads-outside-allowlist
+        type: forbidden
+        pattern: '\b\w+::now\s*\(|\b(?:gettimeofday|clock_gettime|localtime_r|localtime|gmtime_r|gmtime|timespec_get|now_unix|seconds_since_epoch|wall_now_s|wall_seconds)\s*\(|\bstd::time\s*\(|(?<![\w:.>])time\s*\(\s*(?:nullptr|NULL|0)?\s*\)'
+        scope: xmr_lane_code
+        code_only: true
+        allowlist: allowlist/C08-clock.txt
+    status_now: fail
+    deviation: [D1, D4]
+
+  - id: C09
+    title: register consistency
+    statement: 'Every failing ruled rule maps to an open deviation; register and canon name each other.'
+    source: 'ref: the:C09'
+    ruling: 'ref: the:C09'
+    scope: [docs/canon/]
+    checks:
+      - name: register-consistency
+        type: register
+    status_now: pass
+    deviation: []
+
+  - id: C10
+    title: Canon line
+    statement: 'A pull request touching the listed paths carries a "Canon: Cnn, ..." or "Canon: none (reason)" body line.'
+    source: 'ref: the:C10'
+    ruling: 'ref: the:C10'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/sharechain/v37/, src/c2pool/v37/main_v37_xmr.cpp, docs/canon/, tools/canon/]
+    checks:
+      - name: pr-canon-line
+        type: pr_body
+        paths:
+          - src/c2pool/v37/xmr/**
+          - src/impl/xmr/**
+          - src/sharechain/v37/**
+          - src/c2pool/v37/main_v37_xmr.cpp
+          - docs/canon/**
+          - tools/canon/**
+          - .github/workflows/canon-check.yml
+    status_now: pass
+    deviation: []
+
+  - id: C11
+    title: share-difficulty retarget, T = 10 s, d_min = 20000
+    statement: 'XMR lane share difficulty retargets from chain data (Monero heights) toward T = 10 s with floor d_min = 20000.'
+    source: 'ref: the:C11'
+    ruling: 'ref: the:C11'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: retarget-kat
+        type: required_kat
+        kats: [xmr_share_retarget_kat]
+      - name: no-fixed-share-diff-refusal
+        type: forbidden
+        pattern: 'needs a fixed --share-diff'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+    status_now: fail
+    deviation: [D6]
+
+  - id: C12
+    title: roundabout assignment by PoW hash bits
+    state: proposed
+    statement: 'PROPOSED: with more than one roundabout chain, a share is assigned to a roundabout only by low bits of its PoW hash, after it is found; the template commits a tips root of every roundabout.'
+    source: 'ref: the:C12'
+    waits_for: 'operator ruling (ref: the:C12)'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/]
+    checks:
+      - name: hashbits-kat
+        type: required_kat
+        kats: [xmr_roundabout_hashbits_kat]
+    status_now: fail
+    deviation: []
+
+  - id: C13
+    title: K = 1 and the N rule
+    statement: 'v1: one carrier chain, K = 1 payment group; the window holds at most N(B) = min(N_param, 3/4 C_eff(B)) distinct payees, from Monero chain data; whole oldest bins leave the window while payees exceed N(B); every window payee gets an output in every block; no prev_id group draw; K > 1 only by ratchet vote (C23).'
+    source: 'ref: the:C13'
+    ruling: 'ref: the:C13'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/]
+    checks:
+      - name: output-gate-kat
+        type: required_kat
+        kats: [xmr_coinbase_output_gate_kat]
+      - name: output-cap-within-n-rule
+        type: constant
+        pattern: '\boutput_cap_ceiling\s*=\s*([0-9]+)'
+        paths: [src/c2pool/v37/xmr/xmr_lane_rules_build.hpp]
+        min: 1
+        max: 2676
+    status_now: fail
+    deviation: [D7]
+
+  - id: C14
+    title: no whale rule, no identity map
+    statement: 'The XMR lane has no whale rule and no identity-keyed roundabout map.'
+    source: 'ref: the:C14'
+    ruling: 'ref: the:C14'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/sharechain/v37/]
+    checks:
+      - name: no-whale-rule
+        type: forbidden
+        pattern: '(?i)whale'
+        scope: xmr_lane_and_engine_code
+        code_only: true
+      - name: no-identity-roundabout-map
+        type: forbidden
+        pattern: '#\s*include\s*[<"][^>"]*roundabout/rb_(?:map|stripe)\.hpp'
+        scope: xmr_lane_code
+        code_only: false
+    status_now: pass
+    deviation: []
+
+  - id: C15
+    title: one security domain
+    statement: 'The 51 % threshold is pool-wide; no per-roundabout security floor or partition.'
+    source: 'ref: the:C15'
+    ruling: 'ref: the:C15'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/]
+    checks:
+      - name: no-per-roundabout-security-gate
+        type: forbidden
+        pattern: '#\s*include\s*[<"][^>"]*roundabout/rb_(?:gate|admission)\.hpp|(?i:\bsecurity_floor\b)'
+        scope: xmr_lane_code
+        code_only: false
+    status_now: pass
+    deviation: []
+
+  - id: C16
+    title: split and merge gates from chain data
+    statement: 'Every split and merge gate is a pure function of Monero chain data at an epoch boundary, at most one step per epoch, with hysteresis.'
+    source: 'ref: the:C16'
+    ruling: 'ref: the:C16'
+    scope: [src/c2pool/v37/roundabout/, src/c2pool/v37/xmr/]
+    checks:
+      - name: no-clock-in-gates
+        type: forbidden
+        pattern: '\b\w+::now\s*\(|\b(?:gettimeofday|clock_gettime|localtime_r|localtime|gmtime_r|gmtime|timespec_get|now_unix|seconds_since_epoch|wall_now_s|wall_seconds)\s*\(|\bstd::time\s*\(|(?<![\w:.>])time\s*\(\s*(?:nullptr|NULL|0)?\s*\)'
+        paths: [src/c2pool/v37/roundabout/**, src/c2pool/v37/xmr/**/*split*, src/c2pool/v37/xmr/**/*merge*, src/c2pool/v37/xmr/**/*arc*, src/impl/xmr/settle/**]
+        exclude: ['**/test/**']
+        extensions: [.hpp, .cpp, .h]
+        code_only: true
+    status_now: pass
+    deviation: []
+
+  - id: C17
+    title: merge window bound
+    state: proposed
+    statement: 'PROPOSED: a merged chain starts with window bound N1 + N2, minus one per new share down to N; merge gate without per-epoch summary decay (M >= 3 blockless epochs, median of 3 summaries or band [0.75, 2.5] H_ref).'
+    source: 'ref: the:C17'
+    waits_for: 'operator ruling (ref: the:C17)'
+    scope: [src/c2pool/v37/xmr/]
+    checks:
+      - name: merge-bound-kat
+        type: required_kat
+        kats: [xmr_merge_window_bound_kat]
+    status_now: fail
+    deviation: []
+
+  - id: C18
+    title: raindrops, slice S5
+    state: proposed
+    statement: 'PROPOSED: raindrop receipts at d/64 in 128 separate raindrop slots (both provisional), by open carriage (C36); per-identity floor W x f_spend / R (C38); estimator choice per identity fixed ex ante; K = 1 (C13).'
+    source: 'ref: the:C18'
+    waits_for: 'ship gate (ref: the:C18)'
+    scope: [src/c2pool/CMakeLists.txt, src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: raindrop-kat
+        type: required_kat
+        kats: [xmr_raindrop_kat]
+      - name: count-estimator-kats
+        type: required_kat
+        kats: [v37_xmr_drops_count_kat, v37_xmr_drops_default_kat]
+    status_now: fail
+
+  - id: C19
+    title: node-owner fee as a weight split
+    statement: 'The owner is credited floor(work x p / 10000) of each receipt and the miner the rest; p (basis points) and the owner address are in the receipt PoW preimage, set at node start (--node-owner-fee-pct, --node-owner-address), default 0, disclosed; every node recomputes the split; no protocol cap.'
+    source: 'ref: the:C19'
+    ruling: 'ref: the:C19'
+    scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: no-job-substitution
+        type: forbidden
+        pattern: '\b(?:choose_payee|owner_fee_hit)\b'
+        scope: xmr_lane_code
+        code_only: true
+      - name: owner-fee-receipt-kat
+        type: required_kat
+        kats: [xmr_owner_fee_receipt_kat]
+    status_now: fail
+    deviation: [D9]
+
+  - id: C20
+    title: per-job payout proof
+    statement: 'Each job carries a proof the miner checks before hashing: coinbase Merkle branch to the hashing blob, own output by view key, amount = exact split of the window of the job tip (C37) from a Merkle-sum window commitment tied to the carrier chain, and the owner fee terms (C19).'
+    source: 'ref: the:C20'
+    ruling: 'ref: the:C20'
+    scope: [src/impl/xmr/stratum/, src/c2pool/v37/xmr/]
+    checks:
+      - name: payout-proof-kat
+        type: required_kat
+        kats: [xmr_payout_proof_kat]
+    status_now: fail
+    deviation: [D10]
+
+  - id: C21
+    title: every window member paid directly
+    statement: 'Each pool block pays every member of its window directly in its own coinbase, exact sum; no lottery, no payment queue, no seniority.'
+    source: 'ref: the:C21'
+    ruling: 'ref: the:C21'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/]
+    checks:
+      - name: no-queue-or-seniority
+        type: forbidden
+        pattern: '\b(?:first_eligible|arm_floor|PayNowEntry)\b'
+        scope: xmr_lane_code
+        code_only: true
+      - name: window-split-kat
+        type: required_kat
+        kats: [xmr_window_split_kat]
+    status_now: fail
+    deviation: [D4]
+
+  - id: C22
+    title: legally dead by chain data
+    statement: 'LEGALLY DEAD is decided by chain data only: template height is non-decreasing along the carrier chain; a receipt is dead when the placing chain recorded a newer Monero height by its own position + 2 (own position = tip position + 1); a same-height race stays live.'
+    source: 'ref: the:C22'
+    ruling: 'ref: the:C22'
+    scope: [src/c2pool/v37/xmr/relay/, src/impl/xmr/receipt/]
+    checks:
+      - name: legally-dead-kat
+        type: required_kat
+        kats: [xmr_receipt_legally_dead_kat]
+      - name: no-grace-timer
+        type: forbidden
+        pattern: '\bgrace_ms\b'
+        scope: xmr_lane_code
+        code_only: true
+    status_now: fail
+    deviation: [D1, D3]
+
+  - id: C23
+    title: rules ratchet
+    statement: 'A rule change is a new epoch appended to the committed history; pool identity = sha256d("V37GEN" || monero_block_hash(H) || headline), H at least D_conf deep; activation by PoW ballot (default delegation to the node, vote=n override) at 75 % of the voting work AND 50 % of all window work; GRACE 1440; timeout 43200; non-upgraded nodes HOLD as followers.'
+    source: 'ref: the:C23'
+    ruling: 'ref: the:C23'
+    scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: headline-genesis
+        type: required
+        pattern: '"V37GEN"'
+        scope: xmr_lane_code
+        code_only: false
+      - name: ratchet-kats
+        type: required_kat
+        kats: [v37_xmr_epoch_kat, v37_xmr_ballot_kat, xmr_epoch_tally_kat]
+    status_now: fail
+    deviation: [D11]
+
+  - id: C24
+    title: accounting across rule epochs
+    statement: 'Receipts and windows carry across a rule epoch change; no work credited before the change is lost or counted twice.'
+    source: 'ref: the:C24'
+    ruling: 'ref: the:C24'
+    scope: [src/c2pool/v37/xmr/]
+    checks:
+      - name: epoch-accounting-kat
+        type: required_kat
+        kats: [xmr_epoch_accounting_kat]
+    status_now: fail
+    deviation: [D11]
+
+  - id: C25
+    title: provable work
+    statement: 'Every credited unit is a PoW-proven receipt bound to pool, chain, payee and origin bin, credited work(T_origin) (C06) whoever carries it and in any order; lane state is a deterministic function of chain data; its commitments allow light-client proofs.'
+    source: 'ref: the:C25'
+    ruling: 'ref: the:C25'
+    scope: [src/impl/xmr/receipt/, src/c2pool/v37/xmr/]
+    checks:
+      - name: receipt-bindings
+        type: required
+        pattern: '(?s)struct\s+ReceiptSideData\s*\{.*?\bt_origin\b.*?\bpayout_identity\b.*?\bchain_id\b.*?\};'
+        paths: [src/impl/xmr/receipt/xmr_receipt.hpp]
+        code_only: true
+      - name: provable-work-kats
+        type: required_kat
+        kats: [xmr_receipt_kat, xmr_receipt_bind_v2_kat, v37_xmr_light_proof_kat]
+    status_now: pass
+    deviation: []
+
+  - id: C26
+    title: provable fees
+    statement: 'give-author value in the receipt preimage; donation output a 0-amount marker; author donation default 0.1 % under fee model v1, disclosed in the stratum login reply and the docs, settable to 0; node-owner fee per C19; no fixed per-node fee output; no developer fee floor.'
+    source: 'ref: the:C26'
+    ruling: 'ref: the:C26'
+    scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp, src/impl/xmr/stratum/]
+    checks:
+      - name: give-author-in-preimage
+        type: required
+        pattern: '\bu16\s+give_author\b'
+        paths: [src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp]
+        code_only: true
+      - name: donation-marker-zero
+        type: constant
+        pattern: '\bkDonationMarkerPico\s*=\s*([0-9]+)'
+        paths: [src/c2pool/v37/xmr/xmr_fee_model.hpp]
+        min: 0
+        max: 0
+      - name: give-author-default
+        type: required
+        pattern: 'static\s+double\s+g_give_author_pct\s*=\s*0\.1\s*;'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: true
+      - name: give-author-opt-out
+        type: required
+        pattern: 'a\s*==\s*"--give-author-pct"'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+      - name: login-disclosure
+        type: required
+        pattern: 'node_owner_fee_pct'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+      - name: login-disclosure-give-author
+        type: required
+        pattern: 'give_author_pct\\":'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+      - name: docs-disclosure
+        type: required
+        pattern: 'defaults to 0\.1 \(`--give-author-pct 0` opts out\)'
+        paths: [docs/xmr-lane/RUN-A-NODE.md]
+        code_only: false
+      - name: fee-kats
+        type: required_kat
+        kats: [v37_xmr_fee_model_kat, xmr_stratum_selftest]
+    status_now: pass
+    deviation: [D12]
+
+  - id: C27
+    title: pool identity binds every lane rule
+    statement: 'Every lane rule is committed in the relay HELLO and the pool_tag; a node with different lane parameters is refused with LANE_RULES_MISMATCH naming the field.'
+    source: 'ref: the:C27'
+    ruling: 'ref: the:C27'
+    scope: [src/c2pool/v37/xmr/]
+    checks:
+      - name: mismatch-refusal
+        type: required
+        pattern: 'kLaneRulesMismatch\[\]\s*=\s*"LANE_RULES_MISMATCH"'
+        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        code_only: false
+      - name: rules-digest-in-pool-tag
+        type: required
+        pattern: '\brules_digest\b'
+        paths: [src/c2pool/v37/xmr/xmr_pool_tag.hpp]
+        code_only: true
+      - name: lane-rules-kats
+        type: required_kat
+        kats: [v37_xmr_lane_rules_kat, v37_xmr_relay_pool_id_kat, v37_xmr_pool_lineage_kat]
+    status_now: pass
+    deviation: [D16]
+
+  - id: C28
+    title: daemonless consensus path
+    statement: 'No monerod RPC on the consensus path; the node follows Monero over levin with its own verified chain index from pinned anchors.'
+    source: 'ref: the:C28'
+    ruling: 'ref: the:C28'
+    scope: [src/impl/xmr/native/, src/c2pool/v37/xmr/]
+    checks:
+      - name: no-rpc-in-consensus-core
+        type: forbidden
+        pattern: '\b(?:MoneroDaemonRpc|rpc_post|json_rpc|get_block_template|daemon_rpc)\b'
+        scope: xmr_consensus_core
+        code_only: true
+      - name: native-chain-kats
+        type: required_kat
+        kats: [xmr_native_chain_index_kat, xmr_native_anchor_self_check_kat, xmr_native_snapshot_resume_kat]
+    status_now: pass
+    deviation: []
+
+  - id: C29
+    title: good citizen
+    statement: 'The template never builds a coinbase-only block while the pool holds valid transactions.'
+    source: 'ref: the:C29'
+    ruling: 'ref: the:C29'
+    scope: [src/impl/xmr/native/template/, src/impl/xmr/template/]
+    checks:
+      - name: citizen-selector
+        type: required
+        pattern: '\bselect_good_citizen\b'
+        paths: [src/impl/xmr/native/template/**]
+        code_only: true
+      - name: citizen-kats
+        type: required_kat
+        kats: [xmr_native_citizen_select_kat, xmr_native_backlog_famine_kat]
+    status_now: pass
+    deviation: []
+
+  - id: C30
+    title: integer-only consensus arithmetic
+    statement: 'No float or double on the XMR consensus core paths outside the allowlist; the allowlist count may not grow.'
+    source: 'ref: the:C30'
+    ruling: 'ref: the:C30'
+    scope: [src/impl/xmr/receipt/, src/impl/xmr/settle/, src/c2pool/v37/xmr/, src/sharechain/v37/]
+    checks:
+      - name: no-float-in-consensus-core
+        type: forbidden
+        pattern: '\b(?:float|double)\b'
+        scope: xmr_consensus_core
+        code_only: true
+        allowlist: allowlist/C30-float.txt
+    status_now: pass
+    deviation: []
+
+  - id: C31
+    title: KAT line
+    statement: 'A pull request changing XMR lane consensus code names in a "KAT:" body line the registered test that fails without the change, or "KAT: none (reason)".'
+    source: 'ref: the:C31'
+    ruling: 'ref: the:C31'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/sharechain/v37/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: pr-kat-line
+        type: pr_body
+        line: KAT
+        paths:
+          - src/c2pool/v37/xmr/**
+          - src/impl/xmr/**
+          - src/sharechain/v37/**
+          - src/c2pool/v37/main_v37_xmr.cpp
+    status_now: pass
+    deviation: []
+
+  - id: C32
+    title: XMR lane licence
+    statement: 'XMR lane files carry AGPL-3.0-or-later; no other licence is declared in the lane paths; no third-party copyleft code in them.'
+    source: 'ref: the:C32'
+    ruling: 'ref: the:C32'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: repository-licence
+        type: forbidden
+        pattern: 'SPDX-License-Identifier:\s*(?!AGPL-3\.0-or-later\b)\S+'
+        scope: xmr_lane_licence
+        code_only: false
+      - name: no-third-party-copyleft
+        type: forbidden
+        pattern: 'This file is part of the Monero P2Pool|terms of the GNU (?:Lesser )?General Public License|SPDX-License-Identifier:\s*(?:GPL|LGPL|MPL)-'
+        scope: xmr_lane_licence
+        code_only: false
+    status_now: pass
+    deviation: [D13, D17]
+
+  - id: C33
+    title: dual timestamp chain
+    statement: 'Consensus time comes from the Monero chain (origin bin = committed mainchain height) and the carrier sharechain (order of seen Monero tips); template height is non-decreasing along the carrier chain; the retarget time base is a Monero height span; wall-clock timestamps are sanity bounds only (C03, C08, C11, C22).'
+    source: 'ref: the:C33'
+    ruling: 'ref: the:C33'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/receipt/]
+    checks:
+      - name: carrier-timestamp-kat
+        type: required_kat
+        kats: [xmr_carrier_timestamp_kat]
+    status_now: fail
+    deviation: [D1]
+
+  - id: C34
+    title: towing retired lanes
+    statement: 'A retired lane (rule epoch change, merge, or below a committed demonstrated-work floor, integer compare) is towed by its successor: live window entries stay payable at their origin bins and age out by time; no work lost or counted twice; a retired lane never freezes; commitments kept (MMR), bodies may be dropped (C23, C24).'
+    source: 'ref: the:C34'
+    ruling: 'ref: the:C34'
+    scope: [src/c2pool/v37/xmr/, src/sharechain/v37/]
+    checks:
+      - name: towing-kat
+        type: required_kat
+        kats: [xmr_lane_tow_kat]
+    status_now: fail
+    deviation: [D14]
+
+  - id: C35
+    title: wide integer arithmetic
+    statement: 'Work and window totals in 256 or 288 bits, weight x reward products in at least 320 bits, estimator numerators in 576 bits; no silent truncation, wrap or saturation; every narrowing proven unreachable or an explicit refusal, pinned by an extreme-value KAT (C30).'
+    source: 'ref: the:C35'
+    ruling: 'ref: the:C35'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/, src/sharechain/v37/]
+    checks:
+      - name: wide-int-extreme-kat
+        type: required_kat
+        kats: [xmr_wide_int_extreme_kat]
+      - name: narrowing-casts-may-not-grow
+        type: forbidden
+        pattern: 'static_cast<\s*(?:std::)?(?:u?int64_t|u?int32_t|u64|u32|i64|i32|unsigned long long|long long|unsigned)\s*>\s*\(|\(\s*(?:std::)?(?:u?int64_t|u?int32_t|u64|u32)\s*\)\s*[\w(]'
+        scope: xmr_consensus_core
+        code_only: true
+        allowlist: allowlist/C35-narrowing.txt
+      - name: no-saturating-helpers
+        type: forbidden
+        pattern: '\b\w*[Ss]aturat\w*\b|\bsat_(?:add|sub|mul)\w*\b'
+        scope: xmr_consensus_core
+        code_only: true
+    status_now: fail
+    deviation: [D15]
+
+  - id: C36
+    title: open carriage, R_MAX = 16
+    statement: 'Any carrier may carry live receipts of any miner while their origin bin is open (C03); selection: pending receipts by origin bin ascending, then sha256d(id || parent id), first R_MAX taken; R_MAX = 16, a lane rule (C27); carrying expected, not required; credit at the origin bin whoever carries; prev_own_share kept (C02).'
+    source: 'ref: the:C36'
+    ruling: 'ref: the:C36'
+    scope: [src/impl/xmr/receipt/, src/impl/xmr/wire/, src/c2pool/v37/xmr/relay/, src/c2pool/v37/xmr/]
+    checks:
+      - name: carriage-kat
+        type: required_kat
+        kats: [xmr_receipt_carriage_kat]
+      - name: r-max-lane-rule
+        type: constant
+        pattern: '\bR_MAX_XMR\s*=\s*([0-9]+)'
+        paths: [src/impl/xmr/**]
+        exclude: ['**/test/**', 'src/impl/xmr/settle/_compile_check/**']
+        extensions: [.hpp, .cpp, .h]
+        min: 16
+        max: 16
+    status_now: fail
+    deviation: [D19]
+
+  - id: C37
+    title: payout from pre-block state
+    statement: 'The coinbase a receipt commits is split_reward(R, window(tip)) of its own tip; every node checks it for every receipt (carrier, carried, raindrop) at admission before RandomX, refuses a mismatch and bans the sender; the canonical coinbase is computed once per tip (deterministic tx key from the tip).'
+    source: 'ref: the:C37'
+    ruling: 'ref: the:C37'
+    scope: [src/impl/xmr/receipt/, src/impl/xmr/settle/, src/impl/xmr/native/relay/, src/c2pool/v37/xmr/]
+    checks:
+      - name: solo-leech-kat
+        type: required_kat
+        kats: [xmr_receipt_solo_leech_kat]
+      - name: receipt-admission-coinbase-check
+        type: required
+        pattern: '\bcanonical_coinbase_matches\s*\('
+        paths: [src/impl/xmr/receipt/**]
+        exclude: ['**/test/**']
+        code_only: true
+        min_count: 1
+    open_items:
+      - 'D_net(h)/R(h) branch: open'
+      - 'coinbase output order under v17: open'
+    status_now: fail
+    deviation: [D20]
+
+  - id: C38
+    title: window by work, W_max
+    statement: 'window(tip) = whole origin bins back from the tip until raw work reaches min(COVERAGE x D_net, R x d / f_spend), COVERAGE = 2, then the N rule (C13); weight = work(T_origin), no decay; W_max = R x d / f_spend in work, f_spend from spend_floor (Monero chain data); no payee output below f_spend.'
+    source: 'ref: the:C38'
+    ruling: 'ref: the:C38'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/, src/sharechain/v37/]
+    checks:
+      - name: window-kats
+        type: required_kat
+        kats: [xmr_window_kat, xmr_window_spend_floor_kat]
+    status_now: fail
+    deviation: [D21, D22]
+
+  - id: C39
+    title: reference fairness scenarios
+    statement: 'Required tests: (1) one 20 % miner and 40,000 miners of 0.002 % on a 0.6 XMR block: every window payee paid, outputs sum to R, outputs <= N(B); (2) pulse and hopper schedules as a deterministic expected-value test, paid/fair within 0.003 of 1 per class.'
+    source: 'ref: the:C39'
+    ruling: 'ref: the:C39'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/]
+    checks:
+      - name: fairness-kats
+        type: required_kat
+        kats: [v37_xmr_fairness_cap_kat, v37_xmr_fairness_schedules_kat]
+    status_now: fail
+    deviation: [D23]
+
+  - id: C40
+    title: design reference before code
+    statement: 'A pull request on the listed paths carries a "Design:" body line naming at least one URL or path, or "Design: none (reason)".'
+    source: 'ref: the:C40'
+    ruling: 'ref: the:C40'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/sharechain/v37/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: pr-design-line
+        type: pr_body
+        line: Design
+        paths:
+          - src/c2pool/v37/xmr/**
+          - src/impl/xmr/**
+          - src/sharechain/v37/**
+          - src/c2pool/v37/main_v37_xmr.cpp
+    status_now: pass
+    deviation: []

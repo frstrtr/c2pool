@@ -424,9 +424,11 @@ refused at HELLO by name, for example `LANE_RULES_MISMATCH field=d_conf ours=60
 theirs=61`, counted as `rules_mismatch=`. Its lane blocks are ordinary blocks for
 this pool. `--d-conf` below 60 is refused on every network but regtest.
 
-With DROPS (sub-threshold credit, test builds only for now) every node of one
-pool must also use the identical `--drops-enrol` list: a node with another list
-is refused at HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… theirs=…`.
+Raindrops (DROPS, sub-threshold credit) are on by default. With no
+`--drops-enrol`, every payee enrols at its first share and the enrolment is part
+of the ledger. If you give an explicit `--drops-enrol` list instead, every node of
+one pool must use the identical list: a node with another list is refused at
+HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… theirs=…`.
 
 Optional fee flags (fee model `v1` only): `--node-owner-fee-pct <p>` with
 `--node-owner-address <addr>` makes a job pay the node owner instead of the

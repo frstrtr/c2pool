@@ -35,7 +35,7 @@ add_subdirectory(coin)
 add_subdirectory(node)
 
 # X9 OPTION B: the whole-block template builder library (xmr_template =
-# xmr_block_template.cpp p2pool port + the authored xmr_coin_primitives.cpp seam
+# the clean-room xmr_block_template.cpp + the authored xmr_coin_primitives.cpp seam
 # bodies over xmr_coin). Unconditional like coin/node — its TUs compile only when
 # a dependent target links it (the c2pool-v37-xmr daemon behind --coinbase v37,
 # and the assembly KAT in test/). See template/CMakeLists.txt.

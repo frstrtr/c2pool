@@ -33,6 +33,10 @@ struct SharechainConfig
 {
     // ---- mainnet (networks/dash.py) ----
     static constexpr uint16_t P2P_PORT                  = 8999;
+    // Sharechain port of the named DASH v36 network (--net dash-v36). Not an
+    // oracle constant: the v36 network is c2pool's own, and a separate port lets
+    // a v36 node run on the same host as a v16 node on P2P_PORT.
+    static constexpr uint16_t V36_P2P_PORT              = 8998;
     static constexpr uint16_t WORKER_PORT               = 7903;
     static constexpr uint32_t SHARE_PERIOD              = 20;     // seconds
     static constexpr uint32_t CHAIN_LENGTH              = 4320;   // 24*60*60//20
@@ -101,7 +105,13 @@ struct SharechainConfig
 
     static inline bool is_testnet = false;
 
-    static uint16_t p2p_port()          { return is_testnet ? TESTNET_P2P_PORT : P2P_PORT; }
+    // --net dash-v36 is mainnet-only, so the testnet port needs no v36 variant.
+    // A custom --network-id (private network) keeps P2P_PORT.
+    static uint16_t p2p_port()
+    {
+        if (is_testnet) return TESTNET_P2P_PORT;
+        return is_named_v36_network() ? V36_P2P_PORT : P2P_PORT;
+    }
     static uint16_t worker_port()       { return is_testnet ? TESTNET_WORKER_PORT : WORKER_PORT; }
     static uint32_t share_period()      { return is_testnet ? TESTNET_SHARE_PERIOD : SHARE_PERIOD; }
     static uint32_t chain_length()      { return is_testnet ? TESTNET_CHAIN_LENGTH : CHAIN_LENGTH; }
@@ -286,6 +296,29 @@ struct SharechainConfig
     ///   emergency_decay                -> v36 time-decay retarget on the producer
     ///                                     side (share_producer.hpp
     ///                                     compute_share_target).
+    ///   max_shares_per_shares_msg,
+    ///   max_shares_per_sharereply,
+    ///   max_share_wire_bytes           -> share_precheck.hpp precheck_raw_shares:
+    ///                                     per-message caps on incoming
+    ///                                     'shares' / 'sharereply', applied
+    ///                                     before any share is parsed or
+    ///                                     hashed (#1828). Public: the
+    ///                                     oracle's 3145728-byte payload cap
+    ///                                     re-expressed (nothing an honest
+    ///                                     p2pool-dash peer sends is refused).
+    ///                                     DASH v36 network: 64 / 1001 /
+    ///                                     65536. Pinned against the
+    ///                                     share_precheck.hpp constants by
+    ///                                     static_assert there.
+    ///   full_misbehaviour_grading      -> peer_misbehaviour.hpp applies() /
+    ///                                     classify_verify_failure: which
+    ///                                     receive-path offences are charged
+    ///                                     to the sending peer (#1829).
+    ///                                     Public: only the two the
+    ///                                     p2pool-dash oracle itself answers
+    ///                                     with a disconnect (invalid PoW /
+    ///                                     target, structural field checks).
+    ///                                     DASH v36 network: every offence.
     struct ShareProfile
     {
         uint32_t target_share_version;
@@ -295,6 +328,10 @@ struct SharechainConfig
         bool     maintainer_only_authority;
         bool     future_timestamp_bound;
         bool     emergency_decay;
+        uint32_t max_shares_per_shares_msg;
+        uint32_t max_shares_per_sharereply;
+        uint32_t max_share_wire_bytes;
+        bool     full_misbehaviour_grading;
     };
 
     static constexpr ShareProfile PUBLIC_PROFILE{
@@ -305,6 +342,10 @@ struct SharechainConfig
         /*maintainer_only_authority=*/false,
         /*future_timestamp_bound=*/false,
         /*emergency_decay=*/false,
+        /*max_shares_per_shares_msg=*/13162,   // (3145728 - 3) / 239
+        /*max_shares_per_sharereply=*/13162,
+        /*max_share_wire_bytes=*/3145728,
+        /*full_misbehaviour_grading=*/false,
     };
     static constexpr ShareProfile ISOLATED_V36_PROFILE{
         /*target_share_version=*/36,
@@ -314,6 +355,10 @@ struct SharechainConfig
         /*maintainer_only_authority=*/true,
         /*future_timestamp_bound=*/true,
         /*emergency_decay=*/true,
+        /*max_shares_per_shares_msg=*/64,
+        /*max_shares_per_sharereply=*/1001,
+        /*max_share_wire_bytes=*/65536,
+        /*full_misbehaviour_grading=*/true,
     };
     // The public profile is master's protocol pair, byte for byte.
     static_assert(PUBLIC_PROFILE.advertised_protocol_version == ADVERTISED_PROTOCOL_VERSION &&
@@ -707,14 +752,18 @@ inline void apply_sharechain_identity(SharechainConfig::NamedNetwork named,
 // ---------------------------------------------------------------------------
 // Built-in sharechain seeds of the DASH v36 network. Dialed ONLY when --net
 // dash-v36 is set and no --addnode/--connect is given
-// (SharechainBootstrapMode::V36NetworkSeeds).
-// TODO(operator approval): the list is EMPTY until the operator approves the
-// first entries (candidate: dash.voidbind.com:8999, once a v36 node is deployed
-// there). Until then a node of this network needs --addnode HOST:PORT.
+// (SharechainBootstrapMode::V36NetworkSeeds). Operator-approved public nodes
+// of the network, HOST:PORT on the v36 sharechain port
+// (SharechainConfig::V36_P2P_PORT);
+// IP literals, so dialing needs no DNS. An explicit --addnode/--connect
+// replaces the whole list.
 // ---------------------------------------------------------------------------
 inline std::vector<std::string> v36_network_seed_hosts()
 {
-    return {};
+    return {
+        "158.220.92.171:8998",   // dash.voidbind.com
+        "109.123.238.32:8998",   // Singapore
+    };
 }
 
 // ---------------------------------------------------------------------------
