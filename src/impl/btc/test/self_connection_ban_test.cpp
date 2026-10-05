@@ -42,6 +42,8 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -116,10 +118,11 @@ btc::NodeImpl::peer_ptr make_socket_peer(SocketPair& pair, StubCommunicator& stu
     return std::make_shared<btc::NodeImpl::peer_t>(sock);
 }
 
-std::unique_ptr<RawMessage> version_with_nonce(uint64_t nonce)
+std::unique_ptr<RawMessage> version_with_nonce(
+    uint64_t nonce, uint32_t version = btc::PoolConfig::ADVERTISED_PROTOCOL_VERSION)
 {
     return btc::message_version::make_raw(
-        btc::PoolConfig::ADVERTISED_PROTOCOL_VERSION, 1,
+        version, 1,
         addr_t{1, NetService{"0.0.0.0", 0}},
         addr_t{1, NetService{"0.0.0.0", btc::PoolConfig::P2P_PORT}},
         nonce, std::string("/c2pool:test/"), 1, uint256{});
@@ -129,13 +132,14 @@ std::unique_ptr<RawMessage> version_with_nonce(uint64_t nonce)
 // verdict; the peer's own address is written to *peer_ip.
 std::optional<pool::PeerConnectionType>
 handshake(Probe& node, const std::string& bind_addr, uint64_t their_nonce,
-          std::string* peer_ip = nullptr)
+          std::string* peer_ip = nullptr,
+          uint32_t their_version = btc::PoolConfig::ADVERTISED_PROTOCOL_VERSION)
 {
     SocketPair pair(bind_addr);
     StubCommunicator stub;
     auto peer = make_socket_peer(pair, stub);
     if (peer_ip) *peer_ip = peer->addr().address();
-    return node.handle_version(version_with_nonce(their_nonce), peer);
+    return node.handle_version(version_with_nonce(their_nonce, their_version), peer);
 }
 
 constexpr uint64_t kOurNonce   = 0x5e1f'5e1f'5e1f'5e1full;
@@ -234,13 +238,21 @@ TEST_F(BtcSelfConnectionBan, ForeignNonceIsNotBanned)
     Probe node;
     node.set_nonce(kOurNonce);
 
-    // The accepted arm runs on past the self check into the post-insert
-    // handshake writes, and the addrme there calls core::Server::listen_port().
-    // On a node whose acceptor was never opened that is a bare
-    // local_endpoint() and throws (the unguarded accessor tracked in #925).
-    // Production's NodeBridge turns the throw into error()+disconnect. That is
-    // outside this case, so only the ban state is asserted here.
-    try { handshake(node, "127.0.0.2", kOtherNonce); } catch (const std::exception&) {}
+    // A foreign nonce must pass the self check without a ban. The peer
+    // advertises a protocol below MINIMUM_PROTOCOL_VERSION, so handle_version
+    // stops at the pre-insert refusal, the first exit after the self check, and
+    // never reaches the addrme write. That write calls
+    // core::Server::listen_port(), which on this rig-free node dereferences an
+    // EMPTY std::optional acceptor. That is undefined behaviour, not a clean
+    // throw: UBSan reports a null reference binding (io_object_impl.hpp:127).
+    // The accessor is the unguarded one tracked in #925 and is shared core, so
+    // it is out of scope here. This case covers the self-check arm only, not
+    // the post-insert handshake.
+    static_assert(btc::PoolConfig::MINIMUM_PROTOCOL_VERSION > 0);
+    EXPECT_THROW(handshake(node, "127.0.0.2", kOtherNonce, nullptr,
+                           btc::PoolConfig::MINIMUM_PROTOCOL_VERSION - 1),
+                 std::runtime_error)
+        << "an old foreign peer is refused pre-insert, not treated as self";
 
     EXPECT_FALSE(node.is_banned(NetService{std::string("127.0.0.2"), btc::PoolConfig::P2P_PORT}));
     EXPECT_EQ(node.ban_seconds_left("127.0.0.2"), 0);
