@@ -22,7 +22,7 @@
 //   SD5  bounded queue: one connection's submits are queued (bound 8, the
 //        rest answered busy) and verified one per pass, so another miner's
 //        login is answered before that queue drains
-//   SD6  login deadline (test clock): no login after 9 s = open, after 10.5 s
+//   SD6  login deadline (test clock): no login after 1.9 s = open, after 2.1 s
 //        = closed + address banned (redial refused); a logged-in miner and an
 //        address-less 127.0.0.1 client are not address-banned
 // Nonzero exit on any failure.
@@ -178,11 +178,12 @@ int main() {
     // ── SD1 defaults ────────────────────────────────────────────────────────
     {
         const o2::StratumListenerOptions d;
-        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000, 64 burst + 8/s submits, 64 queued, login 10 s, ban 600 s, "
-              "score -5/+1 ban at -15 (max 1000)",
+        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000, 64 burst + 8/s submits, 64 queued, login 2 s, "
+              "ban 8 s (= burst / rate), score -5/+1 ban at -15 (max 1000), 256 (job id, nonce) pairs remembered",
               d.bind_host == "127.0.0.1" && d.min_difficulty == 16000 && d.submit_burst == 64.0 && d.submit_rate == 8.0 &&
-              d.max_pending_submits == 64 && d.login_timeout_ms == 10000 && d.ban_seconds == 600 && d.bad_share_points == -5 &&
-              d.good_share_points == 1 && d.ban_score == -15 && d.max_score == 1000);
+              d.max_pending_submits == 64 && d.login_timeout_ms == 2000 && d.ban_seconds == 8 &&
+              d.ban_seconds * d.submit_rate == d.submit_burst && d.bad_share_points == -5 &&
+              d.good_share_points == 1 && d.ban_score == -15 && d.max_score == 1000 && d.max_seen_submits == 256);
     }
 
     // ── SD2 minimum difficulty ──────────────────────────────────────────────
@@ -323,16 +324,16 @@ int main() {
         const int local = dial_from("127.0.0.1", R.L.bound_port());
         int miner = -1;
         const std::string jid = R.login(miner, "127.0.0.61", "");
-        off_ms = 9000;
-        const bool open_at_9 = !closed_within(silent, 300);
-        off_ms = 10500;
-        const bool closed_at_10 = closed_within(silent, 3000);
+        off_ms = 1900;
+        const bool open_at_1_9 = !closed_within(silent, 300);
+        off_ms = 2100;
+        const bool closed_at_2_1 = closed_within(silent, 3000);
         const bool local_closed = closed_within(local, 3000);
         const bool miner_open = !closed_within(miner, 300);
         ::close(silent); ::close(local);
         const auto s = R.L.stats();
-        check("SD6 no login: open at +9 s, closed at +10.5 s; the logged-in miner stays open",
-              silent >= 0 && open_at_9 && closed_at_10 && local_closed && miner_open && s.login_timeouts == 2 && !jid.empty(),
+        check("SD6 no login: open at +1.9 s, closed at +2.1 s; the logged-in miner stays open",
+              silent >= 0 && open_at_1_9 && closed_at_2_1 && local_closed && miner_open && s.login_timeouts == 2 && !jid.empty(),
               "timeouts=" + std::to_string(s.login_timeouts));
         const int again = dial_from("127.0.0.60", R.L.bound_port());
         const bool refused = again >= 0 && closed_within(again, 3000);

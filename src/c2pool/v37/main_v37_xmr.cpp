@@ -554,8 +554,8 @@ struct ServeHooks {
     // FEE DISCLOSURE: JSON members for every stratum login reply's `result`
     // ("c2pool":{fee_model, give_author_pct, node_owner_fee_pct}). Empty = none.
     std::string login_extra;
-    // NET-DOS: the stratum "+diff" floor is at least this (the raindrop floor
-    // while raindrops are on). 0 = the listener default alone.
+    // NET-DOS: the stratum "+diff" floor is at least this (share_diff / 64,
+    // the raindrop floor). 0 = the listener default alone.
     std::uint64_t stratum_min_diff = 0;
 };
 
@@ -5377,7 +5377,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         ServeHooks hooks;
         hooks.cba_tick = [&]() { cba_ring_push(); feed_pump(); wire_pump(); if (relay_tick) relay_tick(); };   // recon(A+B credit): + receipt feed + v0x02 fast path (+ GAP-2 relay)
         hooks.on_share = relay_on_share;
-        hooks.stratum_min_diff = drops ? drops->floor_diff() : 0;   // NET-DOS: never below the raindrop floor
+        // NET-DOS: never below share_diff / 64 (the raindrop floor), raindrops on or off
+        hooks.stratum_min_diff = cfg.stratum_share_diff ? c2pool::v37n::xmr::drops::drops_floor_diff(cfg.stratum_share_diff) : 0;
         if (drops_store)   // ★ DROPS WRITE-AHEAD (flip 1 only: the journal exists only under the flip)
             hooks.pre_publish = [&](const std::vector<std::uint8_t>& hashing_blob, std::uint64_t h) {
                 const std::string b = hex_of(sub::block_id_of_hashing_blob(hashing_blob));
