@@ -4814,6 +4814,8 @@ static int run_live(const XmrNodeConfig& cfg) {
                 while (k < 4 && std::getline(ss, tok, ',')) { try { v[k++] = std::stod(tok); } catch (...) { k = -1; break; } }
                 if (k != 4) { std::printf("REFUSED: --relay-rx-budget wants P,C,G,GC (refill/s, cap per address; refill/s, cap global)\n"); node.stop(); return 2; }
                 ro.dos.per_peer_refill = v[0]; ro.dos.per_peer_capacity = v[1]; ro.dos.global_refill = v[2]; ro.dos.global_capacity = v[3];
+                // address ban = the per-address burst over its refill rate
+                if (v[0] > 0) ro.ban_seconds = static_cast<std::uint32_t>(std::ceil(v[1] / v[0]));
             }
             ro.solicited_credits = g_relay_solicited;
             ro.backfill_positions = g_relay_backfill;

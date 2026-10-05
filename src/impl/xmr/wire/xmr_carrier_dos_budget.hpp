@@ -160,7 +160,7 @@ struct DosPolicy {
     bool refund_on_valid     = true;   // meter only WASTED randomx (recommended)
 
     // released sources whose state is kept (spent bucket or non-zero score)
-    std::size_t retain_max   = 4096;
+    std::size_t retain_max   = 16384;
 };
 
 // The decision the relay acts on for one carrier, produced by this policy.

@@ -311,7 +311,9 @@ struct RelayOptions {
     // BY ADDRESS for ban_seconds: every link from it is dropped, it is refused
     // at accept and not dialed until the ban ends (127.0.0.1 / ::1: the link is
     // dropped, no address ban). The RandomX budget is per address too.
-    u32         ban_seconds = 600;
+    // Default 16 s = dos.per_peer_capacity / dos.per_peer_refill (8 / 0.5 per
+    // s); the daemon sets it from --relay-rx-budget the same way.
+    u32         ban_seconds = 16;
     u64         index_horizon = 64;               // blocks; older unsolicited receipts are dropped
     ::c2pool::xmr::DosPolicy dos{};
     u32         solicited_credits = 256;

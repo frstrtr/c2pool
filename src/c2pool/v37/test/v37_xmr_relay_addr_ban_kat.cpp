@@ -10,13 +10,15 @@
 //   K1  address keys: one per IPv4 address and per IPv6 /64 (two addresses of
 //       one /64 share a key, the next /64 does not); IPv4-mapped IPv6 keys as
 //       IPv4; 127.0.0.1 and ::1 have no key; every key is >= kAddrKeyMin
-//   K2  transport: an address banned for 600 s is refused at accept (no PeerId,
-//       no peer event) at +0 s and +599 s and accepted at +601 s (test clock);
+//   K2  transport: an address banned for the relay default (16 s) is refused at
+//       accept (no PeerId, no peer event) at +0 s and +15 s and accepted at
+//       +17 s (test clock);
 //       another address is accepted meanwhile; a banned address is not dialed
 //   K3  transport: per-address accept cap 1: a second connection from the same
 //       address is refused while the first is up and accepted after it ends;
 //       127.0.0.1 is not capped
-//   K4  RandomX budget per address (policy 8 burst, 0.5/s; global 256, 16/s):
+//   K4  RandomX budget per address (policy 8 burst, 0.5/s; global 256, 16/s;
+//       relay ban 16 s = burst / refill; 16384 released addresses kept):
 //       one address gets 8 grants at once and 8 + 0.5/s after, whatever it
 //       asks; 32 addresses take the global burst between them and a 33rd gets
 //       nothing more at that instant; an address that spent its bucket finds it
@@ -136,9 +138,10 @@ int main() {
         int c1 = dial_from("127.0.0.2", port);
         C(c1 >= 0 && wait_until([&] { return S.ups.load() == 1; }), "K2 127.0.0.2 connects (accepted)");
         const PeerId p1 = S.last.load();
-        const auto k = S.node.ban(p1, std::chrono::seconds(600));
-        C(k == key_of("127.0.0.2") && closed_by_peer(c1, 3000) && wait_until([&] { return S.downs.load() == 1; }),
-          "K2 ban(peer, 600 s) bans 127.0.0.2 and drops the link");
+        const long long ban_s = RelayOptions{}.ban_seconds;
+        const auto k = S.node.ban(p1, std::chrono::seconds(ban_s));
+        C(ban_s == 16 && k == key_of("127.0.0.2") && closed_by_peer(c1, 3000) && wait_until([&] { return S.downs.load() == 1; }),
+          "K2 ban(peer, 16 s, the relay default) bans 127.0.0.2 and drops the link");
         ::close(c1);
         int c2 = dial_from("127.0.0.2", port);
         C(c2 >= 0 && closed_by_peer(c2, 3000) && wait_until([&] { return S.node.refused_banned() == 1; }) && S.ups.load() == 1,
@@ -147,15 +150,15 @@ int main() {
         int c3 = dial_from("127.0.0.3", port);
         C(c3 >= 0 && wait_until([&] { return S.ups.load() == 2; }) && !closed_by_peer(c3, 200),
           "K2 another address (127.0.0.3) is accepted meanwhile");
-        S.offset_s = 599;
+        S.offset_s = ban_s - 1;
         int c4 = dial_from("127.0.0.2", port);
         C(c4 >= 0 && closed_by_peer(c4, 3000) && wait_until([&] { return S.node.refused_banned() == 2; }) && S.ups.load() == 2,
-          "K2 +599 s: still refused");
+          "K2 +15 s: still refused");
         ::close(c4);
-        S.offset_s = 601;
+        S.offset_s = ban_s + 1;
         int c5 = dial_from("127.0.0.2", port);
         C(c5 >= 0 && wait_until([&] { return S.ups.load() == 3; }) && !closed_by_peer(c5, 200) && S.node.refused_banned() == 2,
-          "K2 +601 s: the ban expired, 127.0.0.2 is accepted again");
+          "K2 +17 s: the ban expired, 127.0.0.2 is accepted again");
         ::close(c3); ::close(c5);
         CarrierPeerNode cli;
         C(cli.ban_key(key_of("127.0.0.9"), std::chrono::seconds(60)) && cli.add_peer_id("127.0.0.9", port) == 0 &&
@@ -192,8 +195,11 @@ int main() {
     {
         namespace cx = ::c2pool::xmr;
         cx::DosPolicy pol;   // the defaults: per source 8 / 0.5 s^-1, global 256 / 16 s^-1
-        C(pol.per_peer_capacity == 8.0 && pol.per_peer_refill == 0.5 && pol.global_capacity == 256.0 && pol.global_refill == 16.0,
-          "K4 default budget: 8 burst + 0.5/s per address, 256 + 16/s global");
+        C(pol.per_peer_capacity == 8.0 && pol.per_peer_refill == 0.5 && pol.global_capacity == 256.0 && pol.global_refill == 16.0 &&
+          pol.retain_max == 16384,
+          "K4 default budget: 8 burst + 0.5/s per address, 256 + 16/s global; 16384 released addresses kept");
+        C(RelayOptions{}.ban_seconds * pol.per_peer_refill == pol.per_peer_capacity,
+          "K4 relay ban default (16 s) = per-address burst / refill");
         cx::CarrierDosBudget dos(pol);
         const cx::nanos_t t0 = 1'000'000'000LL;
         const u64 A = key_of("10.0.0.1");
