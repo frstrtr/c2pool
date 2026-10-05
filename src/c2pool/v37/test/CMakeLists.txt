@@ -1138,7 +1138,7 @@ if (BUILD_TESTING)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1241,6 +1241,37 @@ if (BUILD_TESTING)
                 -P ${CMAKE_SOURCE_DIR}/cmake/RetryTest.cmake)
         else()
             add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
+        endif()
+    endforeach()
+    #   v37_xmr_ctx_pow_kat        receipt CONTEXT WORK: a Monero block a peer
+    #                               serves as a receipt's context (FB_CTX) is
+    #                               used only if our own verified chain index
+    #                               holds it or its proof of work meets the
+    #                               difficulty its parent implies there (at
+    #                               most 2 unknown blocks above the index);
+    #                               zero / wrong work = forged (ban), unknown
+    #                               parent / depth 3 / no verifier = deferred.
+    #                               Drives the REAL native ChainIndex with a
+    #                               model RandomX. ALSO on BOTH build.yml
+    #                               --target lists.
+    #   v37_xmr_parse_bounds_kat   non-wrapping bounds ("len > size - pos")
+    #                               in the receipt tx_extra / hashing-blob
+    #                               parsers, the context block layout, the
+    #                               receipt wire reader and the index snapshot
+    #                               reader: lengths near SIZE_MAX at positions
+    #                               near the end are refused with no read past
+    #                               the buffer (the ASan leg runs it under
+    #                               -fsanitize=address,undefined). ALSO on BOTH
+    #                               build.yml --target lists.
+    # Both include the native chain index, whose difficulty adapter needs the
+    # header-only boost multiprecision (as the native index KATs do).
+    foreach(_ctx_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
+        if (TARGET Boost::headers)
+            target_link_libraries(${_ctx_kat} PRIVATE Boost::headers)
+        elseif (TARGET Boost::boost)
+            target_link_libraries(${_ctx_kat} PRIVATE Boost::boost)
+        elseif (DEFINED Boost_INCLUDE_DIRS)
+            target_include_directories(${_ctx_kat} PRIVATE ${Boost_INCLUDE_DIRS})
         endif()
     endforeach()
     # v37_xmr_verify_pool_kat: with RandomX built, it also links librandomx so
