@@ -23,6 +23,7 @@
 #include <impl/dgb/redistribute.hpp>
 #include <impl/dgb/share_tracker.hpp>
 #include <impl/dgb/config_pool.hpp>
+#include <impl/dgb/address_encoding.hpp>
 
 namespace {
 
@@ -250,7 +251,8 @@ TEST(DgbRedistribute, FeeIdentityPlumbedFromNodeOwnerAddressMintsOperatorScript)
     EXPECT_TRUE(fallback_script().empty());
 
     // GREEN (the fix): plumb the operator identity from the node-owner address.
-    ASSERT_TRUE(dgb::set_operator_identity_from_address(r, kNodeOwnerAddr));
+    const auto kMainnet = dgb::address_acceptance(/*testnet=*/false, /*regtest=*/false);
+    ASSERT_TRUE(dgb::set_operator_identity_from_address(r, kNodeOwnerAddr, kMainnet));
 
     // The fee arm now mints under the operator's P2PKH payout identity.
     dgb::RedistributeResult armed = r.pick(tracker, best);
@@ -268,10 +270,96 @@ TEST(DgbRedistribute, FeeIdentityPlumbedFromNodeOwnerAddressMintsOperatorScript)
     // Empty / undecodable address -> false, operator identity left untouched
     // (fail-safe: the fee arm stays the empty-script no-op).
     dgb::Redistributor r2;
-    EXPECT_FALSE(dgb::set_operator_identity_from_address(r2, ""));
-    EXPECT_FALSE(dgb::set_operator_identity_from_address(r2, "not-a-valid-address"));
+    EXPECT_FALSE(dgb::set_operator_identity_from_address(r2, "", kMainnet));
+    EXPECT_FALSE(dgb::set_operator_identity_from_address(r2, "not-a-valid-address", kMainnet));
     r2.set_mode(dgb::RedistributeMode::FEE);
     EXPECT_TRUE(r2.pick(tracker, best).pubkey_hash.IsNull());
+}
+
+// --- #1312: DGB P2SH operator address must arm a P2SH fee identity ----------
+// RED before: core::address_to_hash160's chain-agnostic P2SH whitelist has no
+// DGB P2SH byte (mainnet 0x3f 'S', testnet 0x8c), so an S-address armed type 0
+// and the fee arm paid 76a914<h160>88ac -- a script nobody holds the key for
+// (fee burn). It also armed foreign-coin addresses. GREEN after: the address is
+// classified against DGB's own network acceptance and typed by script shape.
+//
+// Every vector below encodes the SAME hash160 0102..14, independently derived
+// (base58check over version || hash160 || sha256d(..)[:4]; bech32 per BIP173).
+// The encoder reproduces the mainnet P2PKH vector pinned in the test above.
+const uint8_t kH160[20] = {
+    0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,
+    0x0b,0x0c,0x0d,0x0e,0x0f,0x10,0x11,0x12,0x13,0x14};
+
+// Arm a fresh FEE-mode redistributor from `addr`; returns the pick result
+// (null pubkey_hash when the setter refused the address).
+dgb::RedistributeResult arm_fee(const std::string& addr,
+                                const core::CoinAddressAcceptance& acc,
+                                bool& armed)
+{
+    dgb::Redistributor r;
+    r.set_hybrid_weights(dgb::parse_redistribute_spec("fee"));
+    armed = dgb::set_operator_identity_from_address(r, addr, acc);
+    dgb::ShareTracker tracker;
+    uint256 best;
+    return r.pick(tracker, best);
+}
+
+TEST(DgbRedistribute, Issue1312MainnetSAddressArmsP2shFeeIdentity)
+{
+    const auto mainnet = dgb::address_acceptance(false, false);
+    bool armed = false;
+    auto rr = arm_fee("SMPL7pCX7q6pEkTyoipdVgHvk9tE5D6XNW", mainnet, armed);  // 0x3f
+    ASSERT_TRUE(armed);
+    EXPECT_EQ(rr.pubkey_type, 2);   // P2SH -> a914<h160>87, not a burn P2PKH
+    EXPECT_EQ(std::memcmp(rr.pubkey_hash.data(), kH160, 20), 0);
+}
+
+TEST(DgbRedistribute, Issue1312TestnetP2shAndP2pkhFollowNetwork)
+{
+    const auto testnet = dgb::address_acceptance(/*testnet=*/true, false);
+    const auto regtest = dgb::address_acceptance(false, /*regtest=*/true);
+    const auto mainnet = dgb::address_acceptance(false, false);
+    bool armed = false;
+
+    // testnet P2SH 0x8c: also absent from the core whitelist -> was type 0.
+    auto rr = arm_fee("yLQmwB9hninHD8Ceh2UAqLFWCzirppNLik", testnet, armed);
+    ASSERT_TRUE(armed);
+    EXPECT_EQ(rr.pubkey_type, 2);
+    EXPECT_EQ(std::memcmp(rr.pubkey_hash.data(), kH160, 20), 0);
+
+    // Regtest reuses the testnet base58 bytes.
+    rr = arm_fee("yLQmwB9hninHD8Ceh2UAqLFWCzirppNLik", regtest, armed);
+    ASSERT_TRUE(armed);
+    EXPECT_EQ(rr.pubkey_type, 2);
+
+    // testnet P2PKH 0x7e stays type 0.
+    rr = arm_fee("shgL9eyfrCJ1m4FSM9oi3aSVPw7etdbBf3", testnet, armed);
+    ASSERT_TRUE(armed);
+    EXPECT_EQ(rr.pubkey_type, 0);
+    EXPECT_EQ(std::memcmp(rr.pubkey_hash.data(), kH160, 20), 0);
+
+    // Wrong network for the running node -> refused, fee arm stays null.
+    rr = arm_fee("yLQmwB9hninHD8Ceh2UAqLFWCzirppNLik", mainnet, armed);
+    EXPECT_FALSE(armed);
+    EXPECT_TRUE(rr.pubkey_hash.IsNull());
+    rr = arm_fee("SMPL7pCX7q6pEkTyoipdVgHvk9tE5D6XNW", testnet, armed);
+    EXPECT_FALSE(armed);
+    EXPECT_TRUE(rr.pubkey_hash.IsNull());
+}
+
+TEST(DgbRedistribute, Issue1312ForeignOrWitnessAddressNeverArms)
+{
+    const auto mainnet = dgb::address_acceptance(false, false);
+    bool armed = true;
+    for (const char* addr : {
+             "LKKHMBjCU89fyFNgSRprDoD8Jb25N8uWvd",              // LTC P2PKH 0x30
+             "16L5yRNPTuciSgXGHqYwn9N6NeoKqopAu",               // BTC P2PKH 0x00
+             "ltc1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc5dyg36p",     // LTC P2WPKH
+             "dgb1qqypqxpq9qcrsszg2pvxq6rs0zqg3yyc57rkd6l"}) {  // own P2WPKH: no (h160,type) form
+        auto rr = arm_fee(addr, mainnet, armed);
+        EXPECT_FALSE(armed) << addr;
+        EXPECT_TRUE(rr.pubkey_hash.IsNull()) << addr;
+    }
 }
 
 } // namespace
