@@ -243,9 +243,9 @@ static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-en
 static std::uint64_t g_drops_retain_bins = 0;           // ★ DROPS-HARDEN: --drops-retain-bins N (0 = the relay default 512)
 static bool g_drops_store_persist = true;              // ★ DROPS-HARDEN: --drops-store-persist on|off (lane<N>.drops)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
-static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
+static std::size_t   g_relay_max_inbound = 22;          // --relay-max-inbound N (accepted links; --relay-max-peers is an alias)
 static bool          g_relay_discovery = true;          // --relay-discovery on|off (FB_GETADDR/FB_ADDR + persistent peer book)
-static std::size_t   g_relay_max_outbound = 8;          // --relay-max-outbound N (dialed links kept up; peers + learned)
+static std::size_t   g_relay_max_outbound = 10;         // --relay-max-outbound N (dialed links kept up; peers + learned)
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
 static std::string   g_relay_rx_budget = "0.5,8,16,256"; // --relay-rx-budget P,C,G,GC (P,C per address)
 static std::uint32_t g_relay_verify_threads = 0;       // --relay-verify-threads N (0 = auto; DROPS-VERIFY-SCALE)
@@ -4783,7 +4783,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 g_relay_discovery ? "discovery seeds (candidates; good after HELLO)"
                                                   : "permanent dial targets (--relay-discovery off)");
             }
-            ro.max_peers = g_relay_max_peers;
+            ro.max_inbound = g_relay_max_inbound;
             // RELAY-DISCOVERY: peer exchange + a persistent book per pool id + network
             // in the data dir. Relay-only: no coinbase / digest byte depends on it.
             std::string relay_book_path;
@@ -6228,7 +6228,7 @@ int main(int argc, char** argv) {
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
         else if (a == "--drops-retain-bins")        g_drops_retain_bins = u64();
         else if (a == "--drops-store-persist")      g_drops_store_persist = cs::one_of(a, value(), {"on", "off"}) == "on";
-        else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
+        else if (a == "--relay-max-inbound" || a == "--relay-max-peers") g_relay_max_inbound = static_cast<std::size_t>(u64());
         else if (a == "--relay-discovery")          g_relay_discovery = cs::one_of(a, value(), {"on", "off"}) == "on";
         else if (a == "--relay-max-outbound")       g_relay_max_outbound = static_cast<std::size_t>(u64());
         else if (a == "--relay-index-horizon")      g_relay_horizon = u64();
@@ -6408,7 +6408,9 @@ int main(int argc, char** argv) {
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
                 "  --drops-retain-bins N        DROPS: raindrop intervals below the tip kept servable (default 512)\n"
                 "  --drops-store-persist on|off DROPS: keep the servable raindrop store across restarts (lane<N>.drops; default on)\n"
-                "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
+                "  --relay-max-inbound N        accepted relay links (default 22; --relay-max-peers N is an alias);\n"
+                "                               they never take an outbound slot\n"
+                "  --relay-index-horizon N  --relay-rx-budget P,C,G,GC (refill/s, cap per address; global)\n"
                 "  --relay-verify-threads N     RandomX verify workers for peer receipts + raindrops (default 0 =\n"
                 "                               auto: clamp(cores/2, 2, 8) minus --mine threads; ~2.2 MiB each,\n"
                 "                               the seed caches are shared). 1 = the pre-fix single worker\n"
@@ -6416,7 +6418,7 @@ int main(int argc, char** argv) {
                 "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
                 "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
                 "  --relay-discovery on|off     relay peer discovery (FB_GETADDR/FB_ADDR) + persistent peer book (default on)\n"
-                "  --relay-max-outbound N       dialed relay links kept up, --relay-peer + learned (default 8)\n"
+                "  --relay-max-outbound N       dialed relay links kept up, --relay-peer + learned (default 10)\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
                 "  --relay-vault-entries N --relay-vault-bytes N --relay-vault-horizon N  --no-relay-serve\n"
                 "  --relay-deep-order on|off    serve + ask repair orders below the vault horizon from the\n"

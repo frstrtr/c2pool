@@ -308,7 +308,7 @@ void compat_rows() {
         {"--relay-listen", "127.0.0.1:7320"}, {"--pool-genesis", H64}, {"--relay-peer", "127.0.0.1:7322"},
         {"--no-relay-bootstrap"},
         {"--drops-enrol", H64}, {"--drops-enrol", "none"}, {"--drops-enrol-min-tip", "0"},
-        {"--relay-max-peers", "8"}, {"--relay-discovery", "on"}, {"--relay-discovery", "off"},
+        {"--relay-max-peers", "8"}, {"--relay-max-inbound", "22"}, {"--relay-discovery", "on"}, {"--relay-discovery", "off"},
         {"--relay-max-outbound", "8"}, {"--relay-max-outbound", "0"}, {"--relay-index-horizon", "64"}, {"--relay-rx-budget", "1,20,16,256"},
         {"--relay-solicited-credits", "256"}, {"--relay-backfill-positions", "2048"}, {"--relay-reoffer-seconds", "60"},
         {"--relay-order", "canonical"}, {"--relay-order", "arrival"}, {"--relay-bin-lag", "1"},

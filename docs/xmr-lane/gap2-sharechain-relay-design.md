@@ -415,7 +415,8 @@ traffic. **Ruling owed (OQ-1): default policy + L.**
 ```
 --relay-listen HOST:PORT       bind the receipt relay (default: off)
 --relay-peer HOST:PORT         dial a peer (repeatable; redial with backoff)
---relay-max-peers N            inbound+outbound cap (default 8)
+--relay-max-inbound N          accepted links cap (default 22; alias --relay-max-peers); never takes an outbound slot
+--relay-max-outbound N         dialed links kept up (default 10); dialing continues while below it
 --relay-index-horizon N        oldest admissible receipt bin, in blocks behind tip (default 64)
 --relay-rx-budget P,C,G,GC     per-address refill/s, cap, global refill/s, cap (default 0.5,8,16,256)
 --relay-solicited-credits N    extra RandomX tokens for frames WE fetched (default 256)

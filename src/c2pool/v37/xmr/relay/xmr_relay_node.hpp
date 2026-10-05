@@ -299,7 +299,11 @@ struct RelayOptions {
     std::string listen_host = "127.0.0.1";
     u16         listen_port = 0;                  // 0 = an ephemeral port (tests), read back via listen_port()
     std::vector<std::pair<std::string, u16>> peers;
-    std::size_t max_peers = 8;
+    // Inbound links (accepted) and outbound links (dialed) are counted apart.
+    // max_inbound caps accepted links only (over it a connection is closed at
+    // accept), so an inbound link never takes one of the max_outbound slots
+    // below, and the node keeps dialing while it has fewer than max_outbound.
+    std::size_t max_inbound = 22;
     // Per address (IPv4, IPv6 /64; 127.0.0.1 and ::1 exempt) at most
     // max_inbound_per_addr accepted links at once; another is closed at accept.
     std::size_t max_inbound_per_addr = 1;
@@ -405,7 +409,7 @@ struct RelayOptions {
     // fb_unknown, nothing is asked or dialed beyond `peers`); the daemon turns
     // it ON (--relay-discovery on, the CLI default).
     bool        discovery = false;
-    std::size_t max_outbound = 8;                 // dialed links (peers + learned) the node keeps up
+    std::size_t max_outbound = 10;                // dialed links (peers + learned) the node keeps up; dialing continues while below it
     // The SEED seam: addresses dialed as CANDIDATES at start (the built-in
     // bootstrap list feeds this; --relay-peer stays a permanent dial target).
     std::vector<std::pair<std::string, u16>> seeds;
@@ -602,7 +606,7 @@ public:
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
         m_net.set_log([this](const std::string& s) { log("relay: " + s); });
         m_net.set_send_queue(m_o.send_queue_bytes);   // RELAY-SEND-QUEUE (0 = synchronous, legacy)
-        m_net.set_inbound_limits(0, m_o.max_inbound_per_addr);   // ADDRESS BANS: per-address accept cap
+        m_net.set_inbound_limits(m_o.max_inbound, m_o.max_inbound_per_addr);   // inbound caps, at accept
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -1453,11 +1457,11 @@ public:
         const auto& s = m_st;
         char b[1024];
         std::snprintf(b, sizeof b,
-            "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu | dialed=%llu dial_ok=%llu learned=%llu | "
+            "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu/%zu | dialed=%llu dial_ok=%llu learned=%llu | "
             "getaddr tx=%llu rx=%llu throttled=%llu | addr tx=%llu rx=%llu unsolicited=%llu ignored=%llu | "
             "dup_dropped=%llu refused=%llu self=%llu saves=%llu expired=%llu | "
             "nonce=%016llx self_conn=%llu self_skipped=%llu self_book=%zu dup_deferred=%llu | peers=[",
-            m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in,
+            m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in, m_o.max_inbound,
             (unsigned long long)s.disc_dialed.load(), (unsigned long long)s.disc_dial_ok.load(), (unsigned long long)s.addr_learned.load(),
             (unsigned long long)s.getaddr_tx.load(), (unsigned long long)s.getaddr_rx.load(), (unsigned long long)s.getaddr_throttled.load(),
             (unsigned long long)s.addr_tx.load(), (unsigned long long)s.addr_rx.load(), (unsigned long long)s.addr_unsolicited.load(),
@@ -1732,14 +1736,21 @@ private:
                 // thread, before add_peer_id returns: this link is OUR dial of m_dial_*.
                 if (std::this_thread::get_id() == m_maint_tid.load()) { st.out_host = m_dial_host; st.out_port = m_dial_port; }
                 m_peers[p] = st;
-                over = m_peers.size() > m_o.max_peers;
+                // Only accepted links count against max_inbound (the transport
+                // already refuses at accept; this is the backstop). A dialed link
+                // is never refused here: inbound links cannot take outbound slots.
+                if (inbound) {
+                    std::size_t n_in = 0;
+                    for (const auto& [q, ps] : m_peers) { (void)q; if (ps.inbound) ++n_in; }
+                    over = n_in > m_o.max_inbound;
+                }
             }
             // RELAY-FD: the up event runs on the dialing/accepting thread AFTER
             // the connection's reader started. A peer that closes at once (a
             // partitioned node refusing us) can unwind that reader and fire the
             // DOWN event before this line ran; no second down event follows, so
             // the entry just made would be a ghost: never HELLO'd, re-counted
-            // as a HELLO timeout every tick, and counted against max_peers
+            // as a HELLO timeout every tick, and counted against max_inbound
             // forever -- enough of them and every new link is over_cap, so the
             // relay never heals. Re-check the transport after inserting: a down
             // event that lands after this check erases the entry itself.
@@ -3657,7 +3668,9 @@ private:
                 if (t.learned && !t.used) ++out;   // queued dials count toward the target
             }
         }
-        if (m_dialing.load() && !m_partitioned.load() && out < m_o.max_outbound && m_net.n_peers() < m_o.max_peers) {
+        // Dial while fewer than max_outbound links are ours, however many
+        // inbound links are up (they never count against this).
+        if (m_dialing.load() && !m_partitioned.load() && out < m_o.max_outbound) {
             const auto c = m_book.dial_candidates(m_o.max_outbound - out, now, skip);
             std::lock_guard<std::mutex> lk(m_tmtx);
             for (const auto& r : c) {

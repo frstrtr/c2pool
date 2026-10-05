@@ -1308,7 +1308,13 @@ if (BUILD_TESTING)
     #                               confirmed invalid PoW bans the sender's
     #                               address. Loopback 127.0.0.x only. ALSO on
     #                               BOTH build.yml --target lists.
-    foreach(_netdos_kat v37_xmr_relay_addr_ban_kat)
+    #   v37_xmr_relay_eclipse_kat   inbound and outbound relay links counted
+    #                               apart: with every inbound slot full a
+    #                               further inbound link is refused at accept,
+    #                               and the node still dials until its outbound
+    #                               target is met (no more). ALSO on BOTH
+    #                               build.yml --target lists.
+    foreach(_netdos_kat v37_xmr_relay_addr_ban_kat v37_xmr_relay_eclipse_kat)
         add_executable(${_netdos_kat}
             ${_netdos_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
