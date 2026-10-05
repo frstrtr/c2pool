@@ -618,10 +618,10 @@
     },
     "C39": {
       "checks": {
-        "reviewer-kats": {
+        "fairness-kats": {
           "kats": {
-            "v37_xmr_reviewer_cap_kat": false,
-            "v37_xmr_reviewer_schedules_kat": false
+            "v37_xmr_fairness_cap_kat": false,
+            "v37_xmr_fairness_schedules_kat": false
           },
           "status": "fail"
         }
