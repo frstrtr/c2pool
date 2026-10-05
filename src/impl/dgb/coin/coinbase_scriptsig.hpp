@@ -34,20 +34,30 @@ namespace dgb::coin
 // convention (LTC `/c2pool/`, BTC `/c2pool-btc/`, BCH `/c2pool-bch/`).
 inline constexpr std::string_view DGB_POOL_TAG = "/c2pool-dgb/";
 
-// BIP34 minimally-encoded height push for the coinbase scriptSig.
-// Returns [OP_PUSHBYTES_n][n height bytes, little-endian], where n is the
-// smallest byte count that encodes the height with the high bit of the top
-// byte clear (script-integer sign-safety — a set high bit would be parsed as a
-// negative number). Byte-identical to btc::stratum::bip34_height_push.
+// BIP34 height push for the coinbase scriptSig, byte-identical to DigiByte
+// Core's `CScript() << nHeight` (the prefix ContextualCheckBlock compares
+// against -> bad-cb-height on mismatch) and the oracle p2pool-dgb-scrypt
+// coinbase:
+//   h == 0       -> OP_0               (0x00)
+//   1 <= h <= 16 -> OP_1..OP_16        (0x51..0x60), NOT a 1-byte data push
+//   h >= 17      -> [OP_PUSHBYTES_n][n height bytes, little-endian], n minimal
+//                   with the top byte's high bit clear (script-integer
+//                   sign-safety -- a set high bit would parse as negative).
+// Heights 1..16 only occur on a fresh regtest/testnet chain, but there a
+// data-push encoding is a guaranteed bad-cb-height block loss (#902).
 inline std::vector<unsigned char> bip34_height_push(uint32_t h)
 {
+    if (h == 0)
+        return {0x00};                                          // OP_0
+    if (h <= 16)
+        return {static_cast<unsigned char>(0x50 + h)};          // OP_1..OP_16
+
     std::vector<unsigned char> enc;
     uint32_t tmp = h;
     while (tmp) {
         enc.push_back(static_cast<unsigned char>(tmp & 0xff));
         tmp >>= 8;
     }
-    if (enc.empty())        enc.push_back(0);       // height 0 -> single 0x00
     if (enc.back() & 0x80)  enc.push_back(0);       // sign-bit safety pad
 
     std::vector<unsigned char> out;
