@@ -14,8 +14,8 @@ report, and exits non-zero on any NEW violation:
     missing from CMake, no longer built by CI, or failed in a given junit;
   * a pull request that touches consensus paths without a "Canon:" line in its
     body, or that names an unknown rule, without a "KAT:" line naming
-    registered tests (rule C31), or without a "Design:" line naming the design
-    section and the evidence (rule C40) (only with --pr-body);
+    registered tests (rule C31), or without a "Design:" line naming a
+    reference (rule C40) (only with --pr-body);
   * a register that does not match the canon (rule C09).
 
 It also reports what can be tightened: a deviation whose rules all pass now
@@ -798,10 +798,10 @@ DESIGN_LINE_RE = re.compile(r"^[ \t>*_-]*Design:[ \t]*(.+?)[ \t*_]*$", re.M)
 
 
 def parse_design_line(body):
-    """Returns (ok, refs, message). Rule C40: the line points to the published
-    design section and the simulation evidence, as references (a URL or a
-    repository path, i.e. a token with a '/'), or reads 'Design: none (reason)'
-    for a change that implements no Path B slice."""
+    """Returns (ok, refs, message). Rule C40: a slice pull request carries a
+    'Design:' line naming at least one reference (a URL or a repository path,
+    i.e. a token with a '/'); any other pull request on the governed paths
+    reads 'Design: none (reason)'."""
     m = DESIGN_LINE_RE.search(body or "")
     if not m:
         return False, [], "no 'Design:' line in the PR body"
@@ -1151,8 +1151,8 @@ def selftest(canon_path):
     ok(parse_kat_line("KAT: none (comment-only change)", set())[0], "kat line none with reason")
     ok(not parse_kat_line("KAT: none", set())[0], "kat line none without reason")
     ok(not parse_kat_line("no line", set())[0], "kat line missing")
-    ok(parse_design_line("x\nDesign: docs/xmr-lane/path-b.md section 2.5; evidence: sim/FLOOD.md s.11\n")[1] ==
-       ["docs/xmr-lane/path-b.md", "sim/FLOOD.md"], "design line refs")
+    ok(parse_design_line("x\nDesign: docs/canon/CANON.yaml C40; evidence: ref the:K08, docs/canon/DEVIATIONS.md\n")[1] ==
+       ["docs/canon/CANON.yaml", "docs/canon/DEVIATIONS.md"], "design line refs")
     ok(parse_design_line("Design: none (comment-only change)")[0], "design line none with reason")
     ok(not parse_design_line("Design: none")[0], "design line none without reason")
     ok(not parse_design_line("Design: see the design")[0], "design line without a reference")

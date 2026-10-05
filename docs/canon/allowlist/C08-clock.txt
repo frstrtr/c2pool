@@ -7,11 +7,10 @@
 # Raising a count or adding a file needs a review that the new read decides
 # nothing in consensus, and a pull request body with "Canon: C08".
 #
-# Deliberately NOT listed (counted as C08 violations under D1 and D4 until
-# Path B removes that machinery): src/c2pool/v37/xmr/relay/xmr_relay_node.hpp,
-# src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp (bin close after a
-# wall-clock grace period) and src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp
-# (the lineage vote ages observations by wall-clock seconds).
+# Not listed (counted as C08 violations under D1 and D4 until the slices that
+# close D1/D4 land): src/c2pool/v37/xmr/relay/xmr_relay_node.hpp,
+# src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp and
+# src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp.
 #
 # Reviewed 2026-10-04 at frstrtr/c2pool master 65b90571a.
 
