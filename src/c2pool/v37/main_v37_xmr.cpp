@@ -247,7 +247,7 @@ static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
 static bool          g_relay_discovery = true;          // --relay-discovery on|off (FB_GETADDR/FB_ADDR + persistent peer book)
 static std::size_t   g_relay_max_outbound = 8;          // --relay-max-outbound N (dialed links kept up; peers + learned)
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
-static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
+static std::string   g_relay_rx_budget = "0.5,8,16,256"; // --relay-rx-budget P,C,G,GC (P,C per address)
 static std::uint32_t g_relay_verify_threads = 0;       // --relay-verify-threads N (0 = auto; DROPS-VERIFY-SCALE)
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
 static std::uint64_t g_relay_backfill = 2048;           // --relay-backfill-positions N
@@ -4802,9 +4802,9 @@ static int run_live(const XmrNodeConfig& cfg) {
             }
             ro.index_horizon = g_relay_horizon;
             {
-                double v[4] = {1, 20, 16, 256}; int k = 0; std::stringstream ss(g_relay_rx_budget); std::string tok;
+                double v[4] = {0.5, 8, 16, 256}; int k = 0; std::stringstream ss(g_relay_rx_budget); std::string tok;
                 while (k < 4 && std::getline(ss, tok, ',')) { try { v[k++] = std::stod(tok); } catch (...) { k = -1; break; } }
-                if (k != 4) { std::printf("REFUSED: --relay-rx-budget wants P,C,G,GC (refill/s, cap per peer; refill/s, cap global)\n"); node.stop(); return 2; }
+                if (k != 4) { std::printf("REFUSED: --relay-rx-budget wants P,C,G,GC (refill/s, cap per address; refill/s, cap global)\n"); node.stop(); return 2; }
                 ro.dos.per_peer_refill = v[0]; ro.dos.per_peer_capacity = v[1]; ro.dos.global_refill = v[2]; ro.dos.global_capacity = v[3];
             }
             ro.solicited_credits = g_relay_solicited;

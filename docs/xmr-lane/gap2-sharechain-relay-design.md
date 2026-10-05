@@ -417,7 +417,7 @@ traffic. **Ruling owed (OQ-1): default policy + L.**
 --relay-peer HOST:PORT         dial a peer (repeatable; redial with backoff)
 --relay-max-peers N            inbound+outbound cap (default 8)
 --relay-index-horizon N        oldest admissible receipt bin, in blocks behind tip (default 64)
---relay-rx-budget P,C,G,GC     per-peer refill/s, cap, global refill/s, cap (default 1,20,16,256)
+--relay-rx-budget P,C,G,GC     per-address refill/s, cap, global refill/s, cap (default 0.5,8,16,256)
 --relay-solicited-credits N    extra RandomX tokens for frames WE fetched (default 256)
 --relay-backfill-positions N   GETORDER depth on connect (default 2048)
 --relay-reoffer-seconds S      sender-side re-offer window (default 60)

@@ -1283,6 +1283,31 @@ if (BUILD_TESTING)
         target_link_libraries(v37_xmr_relay_peerstore_kat PRIVATE xmr_relay_peerstore)
         add_test(NAME v37_xmr_relay_peerstore_kat COMMAND v37_xmr_relay_peerstore_kat)
     endif()
+    # NET-DOS (relay network policy; no consensus):
+    #   v37_xmr_relay_addr_ban_kat  bans and RandomX budgets by ADDRESS (IPv4,
+    #                               IPv6 /64): a banned address is refused at
+    #                               accept until the ban expires and is not
+    #                               dialed; per-address accept cap; one address
+    #                               gets at most its share of the global RandomX
+    #                               budget and a reconnect does not refill it; a
+    #                               confirmed invalid PoW bans the sender's
+    #                               address. Loopback 127.0.0.x only. ALSO on
+    #                               BOTH build.yml --target lists.
+    foreach(_netdos_kat v37_xmr_relay_addr_ban_kat)
+        add_executable(${_netdos_kat}
+            ${_netdos_kat}.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_compile_features(${_netdos_kat} PRIVATE cxx_std_20)
+        target_include_directories(${_netdos_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+        target_compile_definitions(${_netdos_kat} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        target_link_libraries(${_netdos_kat} PRIVATE xmr_coin Threads::Threads)
+        add_test(NAME ${_netdos_kat} COMMAND ${_netdos_kat})
+    endforeach()
     # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
     # enrolment book is node-local, so a lane block books the WINNER's composed
     # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book

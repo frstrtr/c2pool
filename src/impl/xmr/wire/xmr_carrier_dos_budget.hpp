@@ -48,13 +48,16 @@
 //   share cadence and each carrier drives <= 1 + R_MAX (= 3 at R_MAX_XMR=2)
 //   RandomX hashes; dedup collapses the duplicate relays of the same carrier
 //   before any hash. So a single honest peer forces well under 1 wasted hash/s.
-//   Defaults: refill = 1 token/s (=> a throttled flooder costs <= ~1.5% of one
-//   core), capacity = 20 (a short burst). Backstop: a GLOBAL grant bucket sized
-//   to a target aggregate core fraction, because N per-peer buckets still sum to
-//   N * refill * 15 ms; at refill=1 that is one core at ~66 concurrent hostile
-//   peers, so the global bucket (default refill 16/s, capacity 256 => <= ~25% of
-//   one core sustained) is the real aggregate ceiling and the per-peer bucket is
-//   the fairness layer that stops any single peer eating it.
+//   Defaults: per SOURCE refill 0.5 token/s, capacity 8; GLOBAL refill 16/s,
+//   capacity 256. The global bucket is the aggregate ceiling; the per-source
+//   bucket is the fairness layer that stops any single source eating it.
+//
+// SOURCES: the per-source key is a u64 chosen by the caller. The XMR relay uses
+//   the remote ADDRESS (IPv4, IPv6 /64; net_addr_ban.hpp) where it has one, so
+//   every connection from one address shares one bucket and one score, and the
+//   connection id for 127.0.0.1 / ::1. release() keeps a source's state while it
+//   is spent or scored (bounded, oldest dropped first), so a reconnect does not
+//   start from a full bucket and a zero score.
 //
 // ISOLATION: header-only, per-instance policy objects + pure predicates, in the
 // spirit of src/impl/dash/min_protocol_gate.hpp. NO consensus state, NO wire
@@ -62,7 +65,9 @@
 // disconnect/ban-list) is xmr_carrier_relay.hpp + the reception slice, out of
 // scope here. A monotone injected clock is the only environment coupling.
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <unordered_map>
 
@@ -137,9 +142,9 @@ struct PeerState {
 // Policy constants (per-instance knobs).
 // ---------------------------------------------------------------------------
 struct DosPolicy {
-    // per-peer RandomX bucket
-    double per_peer_capacity = 20.0;   // burst of unverified carriers
-    double per_peer_refill   = 1.0;    // ~1 wasted hash/s => ~1.5% core when throttled
+    // per-source RandomX bucket (a source = one address, or one connection)
+    double per_peer_capacity = 8.0;    // burst of unverified carriers
+    double per_peer_refill   = 0.5;    // wasted hashes/s once the burst is spent
 
     // global backstop bucket (aggregate RandomX-grant ceiling across all peers)
     double global_capacity   = 256.0;
@@ -153,6 +158,9 @@ struct DosPolicy {
                                        // tolerance when confirm_invalid re-verify
                                        // is enabled.
     bool refund_on_valid     = true;   // meter only WASTED randomx (recommended)
+
+    // released sources whose state is kept (spent bucket or non-zero score)
+    std::size_t retain_max   = 4096;
 };
 
 // The decision the relay acts on for one carrier, produced by this policy.
@@ -175,11 +183,11 @@ public:
         : policy_(p), global_(p.global_capacity, p.global_refill) {}
 
     // (1) GRANT GATE — called at admission stage 5 entry (seed resolved, resident),
-    // via the relay's seed_for_bin hook. Takes one token from BOTH the per-peer
+    // via the relay's seed_for_bin hook. Takes one token from BOTH the per-source
     // and the global bucket. Returns true iff a RandomX evaluation is authorized.
     // On denial by either bucket the carrier is DEFERRED (no penalty): a
     // budget-starved carrier is not proven hostile.
-    bool grant_randomx(u32 peer_id, nanos_t now) {
+    bool grant_randomx(u64 peer_id, nanos_t now) {
         PeerState& ps = peer(peer_id);
         if (ps.banned) return false;
         // Global first so a single peer can't drain the aggregate under the
@@ -192,7 +200,7 @@ public:
 
     // (2a) A granted evaluation proved the PoW VALID (Accept). Refund the tokens
     // if policy says meter-only-wasted (default). Honest, PoW-rate-limited work.
-    void on_valid_pow(u32 peer_id, nanos_t now) {
+    void on_valid_pow(u64 peer_id, nanos_t now) {
         if (!policy_.refund_on_valid) return;
         PeerState& ps = peer(peer_id);
         ps.rx.refund(now);
@@ -204,7 +212,7 @@ public:
     // it crosses the threshold. `confirmed` must be true only after any
     // UNSTABLE-HARDWARE re-verify already agreed the PoW is bad (see
     // confirm_invalid() below); a single unconfirmed local miss must NOT ban.
-    Action on_invalid_pow(u32 peer_id, bool confirmed) {
+    Action on_invalid_pow(u64 peer_id, bool confirmed) {
         PeerState& ps = peer(peer_id);
         ++ps.invalid_pow;
         if (!confirmed) return Action::Drop;              // hardware flap suspected
@@ -217,7 +225,7 @@ public:
     // Costs ~us; bump the soft score only. A structural flooder is bounded by the
     // coarse message-rate limit, not by banning honest reorg-races, so this
     // reaches the ban threshold only under sustained garbage.
-    Action on_cheap_reject(u32 peer_id) {
+    Action on_cheap_reject(u64 peer_id) {
         PeerState& ps = peer(peer_id);
         ++ps.structural;
         ps.score += policy_.score_structural;
@@ -225,16 +233,39 @@ public:
         return Action::Drop;
     }
 
-    bool banned(u32 peer_id) { return peer(peer_id).banned; }
-    void forget(u32 peer_id) { peers_.erase(peer_id); }   // on peer disconnect
+    bool banned(u64 peer_id) { return peer(peer_id).banned; }
+    // Like banned(), without creating state for an unknown source.
+    bool is_banned(u64 peer_id) const {
+        auto it = peers_.find(peer_id);
+        return it != peers_.end() && it->second.banned;
+    }
+    bool known(u64 peer_id) const { return peers_.count(peer_id) != 0; }
+    void forget(u64 peer_id) { peers_.erase(peer_id); }   // on peer disconnect / once a ban is recorded elsewhere
+
+    // The last connection of a source went away. Its state is dropped when it
+    // holds nothing (full bucket, zero score, not banned); otherwise it is KEPT,
+    // so the source finds the same bucket and score when it reconnects. At most
+    // policy.retain_max released sources are kept (the oldest goes first).
+    void release(u64 peer_id, nanos_t now) {
+        auto it = peers_.find(peer_id);
+        if (it == peers_.end()) return;
+        PeerState& ps = it->second;
+        if (!ps.banned && ps.score == 0 && ps.rx.level(now) >= ps.rx.capacity) { peers_.erase(it); return; }
+        retained_.push_back(peer_id);
+        while (retained_.size() > policy_.retain_max) {
+            peers_.erase(retained_.front());
+            retained_.pop_front();
+        }
+    }
+    std::size_t sources() const { return peers_.size(); }
 
     // diagnostics / tests
-    const PeerState& state(u32 peer_id) { return peer(peer_id); }
+    const PeerState& state(u64 peer_id) { return peer(peer_id); }
     double global_level(nanos_t now)    { return global_.level(now); }
     const DosPolicy& policy() const     { return policy_; }
 
 private:
-    PeerState& peer(u32 id) {
+    PeerState& peer(u64 id) {
         auto it = peers_.find(id);
         if (it != peers_.end()) return it->second;
         PeerState ps;
@@ -244,7 +275,8 @@ private:
 
     DosPolicy                           policy_;
     TokenBucket                         global_;
-    std::unordered_map<u32, PeerState>  peers_;
+    std::unordered_map<u64, PeerState>  peers_;
+    std::deque<u64>                     retained_;
 };
 
 // ---------------------------------------------------------------------------
