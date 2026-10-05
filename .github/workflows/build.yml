@@ -244,6 +244,7 @@ jobs:
                     v37_descriptor_xmr_test \
                     v37_xmr_canon_p1_kat \
                     v37_xmr_relay_addr_ban_kat \
+                    v37_xmr_stratum_dos_kat \
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \
                     c2pool-v37-btc v37_btc_node_smoke v37_btc_digest_drift_kat f1_finalize_kat_btc c2pool-v37-btc-dash \
@@ -759,6 +760,7 @@ jobs:
                     v37_descriptor_xmr_test \
                     v37_xmr_canon_p1_kat \
                     v37_xmr_relay_addr_ban_kat \
+                    v37_xmr_stratum_dos_kat \
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \
                     c2pool-v37-btc v37_btc_node_smoke v37_btc_digest_drift_kat f1_finalize_kat_btc \

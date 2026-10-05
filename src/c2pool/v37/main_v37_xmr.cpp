@@ -554,6 +554,9 @@ struct ServeHooks {
     // FEE DISCLOSURE: JSON members for every stratum login reply's `result`
     // ("c2pool":{fee_model, give_author_pct, node_owner_fee_pct}). Empty = none.
     std::string login_extra;
+    // NET-DOS: the stratum "+diff" floor is at least this (the raindrop floor
+    // while raindrops are on). 0 = the listener default alone.
+    std::uint64_t stratum_min_diff = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -623,6 +626,11 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     o2::StratumListenerOptions lo;
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
+    lo.min_difficulty = std::max(lo.min_difficulty, hooks.stratum_min_diff);   // NET-DOS
+    std::printf("stratum: minimum requested difficulty %llu; submit budget %.0f burst + %.0f/s per connection; "
+                "login deadline %d ms; ban %d s by address\n",
+                static_cast<unsigned long long>(lo.min_difficulty), lo.submit_burst, lo.submit_rate,
+                lo.login_timeout_ms, lo.ban_seconds);
     o2::StratumListener listener(template_source, rx, sink, lo);
     if (hooks.extra_nonce_base) listener.seed_extra_nonce(*hooks.extra_nonce_base);   // GAP-2
     if (hooks.job_binder) listener.set_job_binder(hooks.job_binder);                     // SEAM-1
@@ -5367,6 +5375,7 @@ static int run_live(const XmrNodeConfig& cfg) {
         ServeHooks hooks;
         hooks.cba_tick = [&]() { cba_ring_push(); feed_pump(); wire_pump(); if (relay_tick) relay_tick(); };   // recon(A+B credit): + receipt feed + v0x02 fast path (+ GAP-2 relay)
         hooks.on_share = relay_on_share;
+        hooks.stratum_min_diff = drops ? drops->floor_diff() : 0;   // NET-DOS: never below the raindrop floor
         if (drops_store)   // ★ DROPS WRITE-AHEAD (flip 1 only: the journal exists only under the flip)
             hooks.pre_publish = [&](const std::vector<std::uint8_t>& hashing_blob, std::uint64_t h) {
                 const std::string b = hex_of(sub::block_id_of_hashing_blob(hashing_blob));

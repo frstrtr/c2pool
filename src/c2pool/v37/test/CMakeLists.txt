@@ -480,6 +480,21 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_resume_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_resume_kat COMMAND v37_xmr_stratum_resume_kat)
+    # v37_xmr_stratum_dos_kat (NET-DOS, stratum): the listener's DoS policy over
+    # loopback from 127.0.0.x source addresses -- the minimum requested
+    # difficulty, the per-connection submit budget (over it: dropped unverified
+    # + address ban), duplicate (job id, nonce) refusal, the share score ban,
+    # the bounded per-connection submit queue verified one hash per pass (a
+    # flooding miner does not stall another's login), and the login deadline
+    # (test clock). Stub template source + verifier: no RandomX, no monerod.
+    # Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_stratum_dos_kat
+        v37_xmr_stratum_dos_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_dos_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_dos_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_dos_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_dos_kat COMMAND v37_xmr_stratum_dos_kat)
     # v37_xmr_test_suspend_knob_kat (FAULT-KNOB, TEST-ONLY): the
     # --test-suspend-lane-seconds / SIGUSR2 knob that forces a lane suspension
     # on a live node -- off by default, refused on mainnet, arm/fire/release
