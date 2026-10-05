@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "d7b31d4edc6341abaeb7e5697f8bc7b43f1c8ac0",
+  "commit": "b6e094c3f494962d691c790308dadd8e381469bf",
   "rules": {
     "C01": {
       "checks": {
@@ -34,8 +34,17 @@
     },
     "C03": {
       "checks": {
+        "carriage-window-f": {
+          "status": "fail"
+        },
         "engine-n-ctx-bins": {
           "status": "pass"
+        },
+        "freshness-kat": {
+          "kats": {
+            "xmr_receipt_freshness_kat": false
+          },
+          "status": "fail"
         },
         "late-tail-bins": {
           "status": "fail"
@@ -46,10 +55,12 @@
           },
           "status": "fail"
         },
-        "w2-n-ctx": {
+        "no-hop-bound": {
+          "count": 0,
+          "per_file": {},
           "status": "pass"
         },
-        "xmr-admission-n-ctx": {
+        "w2-n-ctx": {
           "status": "pass"
         }
       },
@@ -256,11 +267,14 @@
           },
           "status": "pass"
         },
-        "drops-default-on": {
-          "status": "pass"
+        "raindrop-kat": {
+          "kats": {
+            "xmr_raindrop_kat": false
+          },
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C19": {
       "checks": {
@@ -561,6 +575,62 @@
         }
       },
       "status": "fail"
+    },
+    "C36": {
+      "checks": {
+        "carriage-kat": {
+          "kats": {
+            "xmr_receipt_carriage_kat": false
+          },
+          "status": "fail"
+        },
+        "r-max-lane-rule": {
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C37": {
+      "checks": {
+        "receipt-admission-coinbase-check": {
+          "status": "fail"
+        },
+        "solo-leech-kat": {
+          "kats": {
+            "xmr_receipt_solo_leech_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C38": {
+      "checks": {
+        "window-kats": {
+          "kats": {
+            "xmr_window_kat": false,
+            "xmr_window_spend_floor_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C39": {
+      "checks": {
+        "reviewer-kats": {
+          "kats": {
+            "v37_xmr_reviewer_cap_kat": false,
+            "v37_xmr_reviewer_schedules_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C40": {
+      "checks": {},
+      "status": "n/a"
     }
   }
 }

@@ -23,10 +23,15 @@
 #                 never grow over baseline.json.
 #   required      regex that must match at least min_count times in the scope.
 #   pr_body       a pull request touching the paths carries a body line:
-#                 "Canon: C03, C07" (line: Canon, rule C10) or "KAT: <ctest
+#                 "Canon: C03, C07" (line: Canon, rule C10), "KAT: <ctest
 #                 names>" (line: KAT, rule C31; every name registered in CMake,
-#                 or "KAT: none (reason)").
+#                 or "KAT: none (reason)") or "Design: <design section>;
+#                 evidence: <runs>" (line: Design, rule C40; at least one URL
+#                 or path, or "Design: none (reason)").
 #   register      every failing rule maps to an open deviation (rule C09).
+#
+# open_items (optional, per rule): spec items owed for the rule, listed so they
+# are not lost; they are not rules and no check reads them.
 #
 # Rule states:
 #   ruled         (default) the design: names its ruling (who, when); failing
@@ -41,6 +46,12 @@
 # repository frstrtr/c2pool-monero is retired, no further work). The deviations
 # register DEVIATIONS.md is mirrored in frstrtr/the (branch
 # v37/xmr-path-b-2026-10-04); rule and deviation ids are the same in both.
+#
+# PUBLIC COMMITMENTS: docs/canon/COMMITMENTS.md maps every promise of the
+# operator's public reply to the external review (gist 636eca0b, comment
+# 6406130, 2026-10-04) to the rules here that hold the design to it, and
+# records the Path B rulings of 2026-10-04 and 2026-10-05 with their evidence.
+# A rule cited there is changed only together with that register.
 #
 # Syntax: the YAML subset read by canon_check.py (no tabs, no block scalars,
 # no anchors, no flow mappings). Regexes are single-quoted (backslash literal).
@@ -134,9 +145,9 @@ rules:
 
   - id: C02
     title: receipt binds the previous own share
-    statement: A receipt's PoW preimage binds the miner's previous on-chain share, and verification enforces that binding (the receipt rides the miner's own next carrier); prev_own_share is never display-only.
-    source: 'the: docs/c2pool-v37-work-receipts.md section 2 (receipt context, carriage) and section 3 (hoard and replay); PLAN-STRICT slice S2'
-    ruling: 'operator 2026-10-04 (Path B 11:22 +04; correction 15:00 +04)'
+    statement: 'A receipt''s PoW preimage binds the miner''s previous on-chain share, and verification enforces that binding against replay; prev_own_share is never display-only. Since ruling R2 the binding no longer decides who carries the receipt: carriage is open, any carrier may carry a live receipt it has seen (C36).'
+    source: 'the: docs/c2pool-v37-work-receipts.md section 2 (receipt context, carriage) and section 3 (hoard and replay); ~/v37-work/mrrpathb/DESIGN.md section 2.5 (prev_own_share under open carriage) and "Operator rulings" R2; PLAN-STRICT slice S2'
+    ruling: 'operator 2026-10-04 (Path B 11:22 +04; correction 15:00 +04); 2026-10-04 21:07-22:12 +04 (R2: open carriage; receipts still commit prev_own_share against replay; C02 modified, new C36)'
     scope: [src/impl/xmr/receipt/, src/c2pool/v37/xmr/relay/]
     checks:
       - name: no-display-only-prev-own
@@ -148,15 +159,15 @@ rules:
       - name: prev-own-enforced-kat
         type: required_kat
         kats: [xmr_receipt_prev_own_kat]
-        note: Slice S2 creates this KAT; it rejects a receipt whose prev_own_share is not the miner's previous on-chain carrier, and one carried by another miner's carrier.
+        note: 'Slice S2 creates this KAT; it rejects a receipt whose prev_own_share is not the miner''s previous on-chain share (a replay), and accepts a valid receipt carried by another miner''s carrier (open carriage, C36).'
     status_now: fail
     deviation: [D2]
 
   - id: C03
-    title: lateness bounded by N_CTX, tightened by LEGALLY DEAD
-    statement: Receipt lateness is bounded by N_CTX = 2 mainchain blocks and Path B tightens it to LEGALLY DEAD (a receipt for a Monero height the chain has passed is worth 0, decided by chain data); there is no full-weight late tail.
-    source: 'the: docs/c2pool-v37-work-receipts.md section 2 (N_CTX, default 2); docs/c2pool-v37-the-temporal-levels.md section 3; PATH-B.md ledger-free rules (LEGALLY DEAD)'
-    ruling: 'ratified V37.0 (N_CTX = 2); operator 2026-10-04 11:22 +04 (Path B, LEGALLY DEAD)'
+    title: lateness bounded by the open origin bin, liveness at own position + 2, tip freshness
+    statement: 'In the XMR lane the only lateness bound is the open origin bin: a receipt may be carried while its origin bin (the Monero height of its template) is open, F = 48 Monero heights (about 96 minutes, about 576 carrier positions), and is credited at that bin. Liveness is judged at the work''s own position + 2 (own position = position of its tip + 1; LEGALLY DEAD, C22), so lateness of CARRIAGE is not staleness of WORK. There is no hop bound (R_HOPS deleted; code may keep a defensive bound of at most F x 12 hops only as a consequence of the open-bin rule, never as its own rule). Every receipt, carrier or not, passes tip freshness 0 <= h(r) - h(tip) <= 2 in Monero heights, judged from the receipt and its tip only (never from the placing chain or the carriage time) and refused at admission otherwise; 2 is a lane rule. There is no full-weight late tail for stale work.'
+    source: 'the: docs/c2pool-v37-work-receipts.md section 2 (N_CTX, default 2, superseded for the XMR lane by R1); docs/c2pool-v37-the-temporal-levels.md section 3; PATH-B.md ledger-free rules (LEGALLY DEAD); ~/v37-work/mrrpathb/DESIGN.md sections 2.3 and 2.5, "Operator rulings" R1 and section 7 items 1 and 4; fverify/VERIFY.md findings FV-C and FV-1; fflood/FLOOD.md section 11 (4); docs/canon/COMMITMENTS.md (rulings R1, 1, 3, 3'')'
+    ruling: 'ratified V37.0 (N_CTX = 2); operator 2026-10-04 11:22 +04 (Path B, LEGALLY DEAD); 2026-10-04 21:07-22:12 +04 (R1: carriage window F = 48 bins, liveness at own position + 2, credit by origin bin); 2026-10-05 07:45 +04 (ruling 1: R_HOPS deleted, the open origin bin is the only lateness bound); 2026-10-05 08:23 and 13:49 +04 (rulings 3 and 3'': tip freshness 0 <= h(r) - h(tip) <= 2 for every receipt, judged from the receipt and its tip)'
     scope: [src/c2pool/v37/xmr/relay/, src/impl/xmr/receipt/, src/sharechain/v37/, src/c2pool/v37/w2_receipt.hpp]
     checks:
       - name: late-tail-bins
@@ -167,30 +178,44 @@ rules:
         min: 0
         max: 2
         absent_ok: true
-      - name: xmr-admission-n-ctx
+        note: 'The 30-bin late tail of the order rule (src/c2pool/v37/xmr/relay/xmr_order_rule.hpp:59) admits stale work at full weight (D3). It goes with the order rule (slice S4); LEGALLY DEAD and tip freshness replace it (slice S2). Late carriage of LIVE work is the open-bin rule (carriage-window-f), not this tail.'
+      - name: carriage-window-f
         type: constant
         pattern: '\bu64\s+n_ctx\s*=\s*([0-9]+)'
         paths: [src/impl/xmr/receipt/xmr_admission.hpp]
-        min: 0
-        max: 2
+        min: 48
+        max: 48
+        note: 'Receipt admission refuses a receipt with carrier_bin - bin > n_ctx (stage Expiry, src/impl/xmr/receipt/xmr_admission.hpp:229); today n_ctx = 2 (line 87), which refuses live work carried more than two Monero heights late. R1 makes this bound the open origin bin, F = 48 (D18). The exact open and seal compare is pinned by xmr_receipt_carriage_kat (C36) and xmr_receipt_legally_dead_kat; slice S2 may rename the constant to F and moves this check with it in the same pull request. Replaces the check xmr-admission-n-ctx (n_ctx <= 2).'
       - name: engine-n-ctx-bins
         type: constant
         pattern: '\bN_CTX_BINS\s*=\s*([0-9]+)'
         paths: [src/sharechain/v37/nr_ladder.hpp]
         min: 0
         max: 2
+        note: 'The generic v37 engine of the other lanes keeps the ratified V37.0 N_CTX = 2; the XMR lane carriage window is F (carriage-window-f).'
       - name: w2-n-ctx
         type: constant
         pattern: '\bW2_N_CTX\s*=\s*([0-9]+)'
         paths: [src/c2pool/v37/w2_receipt.hpp]
         min: 0
         max: 2
+        note: 'As engine-n-ctx-bins: the W2 receipt layer of the generic engine, not the XMR lane.'
+      - name: no-hop-bound
+        type: forbidden
+        pattern: '\b(?:R_HOPS|r_hops|kRHops|kMaxHops|max_hops)\b'
+        scope: xmr_lane_code
+        code_only: true
+        note: 'Ruling 1 (2026-10-05 07:45 +04) deleted R_HOPS: with R_HOPS 8 a selfish attacker at a = 0.45 gets 1.279 and honest miners lose 42 % of their work; without it 0.985 (VERIFY.md FV-C). A defensive hop count derived from F (at most F x 12) is named for the open-bin rule, not as a hop bound.'
       - name: legally-dead-kat
         type: required_kat
         kats: [xmr_receipt_legally_dead_kat]
-        note: Slice S2 creates this KAT; a receipt for a Monero height the carrier chain has passed is credited 0, a same-height race stays live on both sides, and no clock takes part.
+        note: 'Slice S2 creates this KAT: a stale template one and two heights behind is dead once the placing chain records the new height by its own position + 2, a same-height race stays live on both sides, an honest orphan carried late at any depth inside the open bin stays live, and no clock takes part.'
+      - name: freshness-kat
+        type: required_kat
+        kats: [xmr_receipt_freshness_kat]
+        note: 'Slice S2 creates this KAT (rulings 3 and 3''): h(r) - h(tip) = -1 refused, 0, 1 and 2 accepted, 3 refused; a late-carried orphan with h(r) - h(tip) <= 2 accepted at any depth; judged from the receipt and its tip only.'
     status_now: fail
-    deviation: [D3]
+    deviation: [D3, D18]
 
   - id: C04
     title: no owed ledger in the XMR payout path
@@ -351,29 +376,29 @@ rules:
   - id: C12
     title: assignment only by unsteerable bits
     state: proposed
-    statement: 'PROPOSED: work is assigned to roundabouts (and a pool block to a payee arc) only by bits the miner cannot steer, the low bits of the share PoW hash (whose top bytes the target zeroes), never by identity or node choice, and the template commits a tips root of every roundabout.'
-    source: '~/v37-work/rbdefense/SPEC.md sections 2.1 to 2.3 and 2.7 (defense d), RESULTS.txt T1 to T5, TLA RBAssign (Agreement, RbIsBits, OnePaid green; node-tip negative control fails); DESIGN-PREAMBLE (parity bits of the PoW hash under evaluation)'
+    statement: 'PROPOSED: when the pool runs more than one roundabout chain (a later epoch; v1 runs one chain, C13), work is assigned to roundabouts only by bits the miner cannot steer, the low bits of the share PoW hash (whose top bytes the target zeroes), after the share is found, never by identity or node choice, and the template commits a tips root of every roundabout; every roundabout then holds the attacker fraction of the whole pool, so a chain split buys no payout benefit and an attacker who aims must throw away every share that lands elsewhere. Payment groups are not drawn by these bits (ruling 8: the prev_id group draw is deleted; K > 1 pays the finder''s group, C13).'
+    source: '~/v37-work/rbdefense/SPEC.md sections 2.1 to 2.3 and 2.7 (defense d), RESULTS.txt T1 to T5, TLA RBAssign (Agreement, RbIsBits, OnePaid green; node-tip negative control fails); DESIGN-PREAMBLE (parity bits of the PoW hash under evaluation); the public reply of 2026-10-04 (docs/canon/COMMITMENTS.md rows A7, A9, C5); ruling 8 of 2026-10-05 (docs/canon/COMMITMENTS.md)'
     waits_for: 'operator ruling on rbdefense open ruling 1 (adopt the hash-bit assignment d with a tips root in the template)'
     scope: [src/c2pool/v37/xmr/, src/impl/xmr/]
     checks:
       - name: hashbits-kat
         type: required_kat
         kats: [xmr_roundabout_hashbits_kat]
-        note: 'NoSteer and RbIsBits: a miner fraction of any roundabout window equals its global share for every strategy, and the paid roundabout or arc of a template is fixed by unsteerable bits.'
+        note: 'NoSteer and RbIsBits: a miner fraction of any roundabout window equals its global share for every strategy, and the roundabout a share lands in is fixed by unsteerable bits of its own PoW.'
     status_now: fail
     deviation: []
 
   - id: C13
-    title: coinbase output space gate
-    statement: 'When the window payees need more outputs than 3/4 C_eff(B), the pool splits the PAYEES of one chain into K = 2^m arcs and each pool block pays one arc drawn with probability W_arc/W from bits the builder cannot steer, merging with hysteresis when space returns, and the window is bounded by N(B) = min(N_param, 3/4 C_eff(B)) from Monero chain data (2,676 today, about 1,248 after Carrot).'
-    source: '~/v37-work/rbdefense/SPEC.md section 5 (the N rule) and section 7 ((d)+arcs); ledger-free DESIGN.md section 6.3 (gate 3, C_eff from zone and output size)'
-    ruling: 'operator 2026-10-04 17:50 +04 (coinbase output space is a split gate; split payees by arcs on one chain; 51 % stays pool-wide)'
+    title: coinbase output space, K = 1 and the N rule
+    statement: 'v1 runs one carrier chain with K = 1 payment group and the N rule: the window holds at most N(B) = min(N_param, 3/4 C_eff(B)) distinct payees, from Monero chain data (2,676 today, about 1,248 after Carrot at a 300 kB zone), and whole oldest bins leave the window while its payees exceed N(B), so every payee in the window gets an output in every block. The prev_id group draw is deleted (it makes (K-1)/K of the blocks pay their finder nothing, so withholding them is free). A later K > 1 epoch uses the finder''s group (a block pays the group its finder belongs to, amounts w_i R / W_c), activated only on evidence (after Carrot, when the N rule shortens the window beyond a stated target, a run compares the finder''s-group draw with the N rule) and by a ratchet vote (C23); 51 % stays pool-wide (C15).'
+    source: '~/v37-work/rbdefense/SPEC.md section 5 (the N rule); ledger-free DESIGN.md section 6.3 (gate 3, C_eff from zone and output size); ~/v37-work/mrrpathb/DESIGN.md section 2.7 step 3 and section 7 item 10; fverify/VERIFY.md section 7 (FV-7); docs/canon/COMMITMENTS.md (ruling 8)'
+    ruling: 'operator 2026-10-04 17:50 +04 (coinbase output space is a split gate; 51 % stays pool-wide); 2026-10-05 14:49 +04 (ruling 8: v1 runs K = 1 with the N rule; the prev_id group draw of R5 is deleted; K > 1 later by the finder''s group, on evidence and a ratchet vote; supersedes the arc draw of 2026-10-04 17:50 +04 and R5)'
     scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/]
     checks:
       - name: output-gate-kat
         type: required_kat
         kats: [xmr_coinbase_output_gate_kat]
-        note: 'Pins N(B) = min(N_param, 3/4 C_eff(B)) across the Carrot fork height, the arc draw P(arc) = W_arc/W from unsteerable bits, paid/expected = 1 per identity, and coinbase <= zone/2 in every block.'
+        note: 'Slice S3: pins N(B) = min(N_param, 3/4 C_eff(B)) across the Carrot fork height, whole oldest bins leaving the window while payees exceed N(B), one output for every payee in the window, K = 1, paid/expected = 1 per identity, and coinbase <= zone/2 in every block.'
       - name: output-cap-within-n-rule
         type: constant
         pattern: '\boutput_cap_ceiling\s*=\s*([0-9]+)'
@@ -454,29 +479,28 @@ rules:
     deviation: []
 
   - id: C18
-    title: raindrops on in Path B v1
+    title: raindrops in the Path B v1 design, built as slice S5
     state: proposed
-    statement: 'Raindrops (DROPS) are ON in Path B v1: the Count estimator, carried by open carriage, with raindrop payees inside roundabout payment groups; the XMR node arms them by default.'
-    source: 'operator ruling 2026-10-04 22:27 +04 (raindrops come back in Path B v1, subject to load, carrier-capacity, group-growth and sybil checks; supersedes the raindrops-off ruling of 2026-10-04 15:51 +04)'
-    waits_for: 'the load, carrier-capacity, group-growth and sybil checks of the design run the 2026-10-04 22:27 +04 ruling calls for'
+    statement: 'PROPOSED until its ship gate passes: raindrops are in the Path B v1 design, built as slice S5 after the core (S0 to S4 and the first soak). Raindrop receipts (at d/64 for now) ride separate raindrop slots (128 for now; slot count and floor to be derived) by open carriage (C36); a payee is paid through raindrops only when its window work pays at least the spend cost, the per-identity floor W x f_spend / R derived as in C38; the estimator choice per identity is fixed ex ante (previous window or enrolment), never by the current window''s outcome; K = 1 (C13). Below a pool share of f_spend / R (about 1/48,000, about 0.0021 %) any per-block payout is dust whatever the credit rule; raindrops serve the miners between that and about 3 shares per window, so small miners get raindrops, not a split.'
+    source: 'operator ruling 2026-10-04 22:27 +04 (raindrops come back in Path B v1, subject to load, carrier-capacity, group-growth and sybil checks; supersedes the raindrops-off ruling of 2026-10-04 15:51 +04); operator ruling 7 of 2026-10-05 14:43 +04 (separate slots, derived per-identity floor, ex-ante estimator choice, K = 1, slice S5, ship gate; docs/canon/COMMITMENTS.md); fverify/VERIFY.md section 6 and fverify/R6-RAINDROPS.txt (verify load 10.4 % of a core with the RandomX JIT, 72 % without)'
+    waits_for: 'the ship gate of ruling 7 (2026-10-05 14:43 +04): 30-day per-class estimator variance, threshold-switch bias, the withheld-share KAT, the raindrop DoS budget (an invalid raindrop costs 16 ms), a 1,000-miner regtest swarm and the stratum enrolment proof; and the derivation of the slot count and the d/64 floor'
     scope: [src/c2pool/CMakeLists.txt, src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
     checks:
-      - name: drops-default-on
-        type: required
-        pattern: 'option\(V37_XMR_DROPS_DEFAULT\s+"[^"]*"\s+ON\)'
-        paths: [src/c2pool/CMakeLists.txt]
-        code_only: false
-        note: 'The XMR node and its KATs build with raindrops armed (c2pool_xmr_drops_default).'
+      - name: raindrop-kat
+        type: required_kat
+        kats: [xmr_raindrop_kat]
+        note: 'Slice S5 creates this KAT: a withheld share gains nothing, the per-identity floor W x f_spend / R, the separate raindrop slots, the ex-ante estimator choice and K = 1. Replaces the check drops-default-on: ruling 7 builds raindrops after the core, so the default arming of the dormant DROPS code is no longer part of this rule.'
       - name: count-estimator-kats
         type: required_kat
         kats: [v37_xmr_drops_count_kat, v37_xmr_drops_default_kat]
-    status_now: pass
+        note: 'The estimator primitive (src/c2pool/v37/xmr/xmr_drops_wiring.hpp) that slice S5 reuses.'
+    status_now: fail
 
   - id: C19
-    title: node-owner fee checkable by the receipt hash
-    statement: 'The node-owner fee is decided by the receipt own PoW hash with the rate and the owner address inside the PoW preimage, so every node verifies the attribution and a protocol cap is enforced; the default is 0, with disclosure and a local start-time limit.'
-    source: 'SCHERNYKH-ALIGNMENT.md row 09 (2); PLAN-STRICT slice S4c; PATH-B.md later rulings'
-    ruling: 'operator 2026-10-04 15:51 +04 (owner fee option B, cryptographically checkable via the receipt)'
+    title: node-owner fee as a weight split checkable from the receipt
+    statement: 'The node-owner fee is a weight split checkable from the receipt itself: of each receipt work the owner is credited floor(work x p / 10000) and the miner the rest (the give-author mechanism); the rate p (basis points) and the owner address are inside the receipt PoW preimage, set at node start (--node-owner-fee-pct, --node-owner-address), default 0, disclosed, and may differ per node; every node recomputes the split, so no node takes more than the rate its miners hashed and no miner dodges it except by discarding its work. There is NO protocol cap: the rate is visible and checkable, and the miner chooses the node.'
+    source: 'SCHERNYKH-ALIGNMENT.md row 09 (2); ~/v37-work/mrrpathb/DESIGN.md section 2.11 (variant B) and "Operator rulings" R7; PATH-B.md later rulings; the public reply of 2026-10-04 (docs/canon/COMMITMENTS.md row A11)'
+    ruling: 'operator 2026-10-04 15:51 +04 (owner fee option B, cryptographically checkable via the receipt); 2026-10-04 21:07-22:12 +04 (R7: a weight split floor(work x p / 10000) to the owner, p and the owner in the receipt preimage, set at node start, default 0, every node verifies, NO protocol cap; supersedes the hash attribution and the protocol cap)'
     scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
     checks:
       - name: no-job-substitution
@@ -488,14 +512,14 @@ rules:
       - name: owner-fee-receipt-kat
         type: required_kat
         kats: [xmr_owner_fee_receipt_kat]
-        note: 'Slice S4c: a node cannot attribute more than its declared rate, an over-cap rate is refused, and attribution follows the receipt hash.'
+        note: 'Slice S2 commits p and the owner in the receipt preimage; slice S6 of the plan of 2026-10-05 (fee split with the payout proof) creates this KAT: the owner weight is floor(work x p / 10000) of each receipt, a block that credits the owner more than the rate in the receipt preimage is refused by every node, p = 0 credits the owner nothing, and any rate up to 10000 is valid (no protocol cap).'
     status_now: fail
     deviation: [D9]
 
   - id: C20
     title: miner-verifiable payout proof per job
-    statement: 'Every job lets the miner verify its payout: the coinbase and its Merkle branch to the hashing blob, its output found with its own view key, the amount equal to the exact split proven from a Merkle-sum commitment of the window, and the window tied to the carrier chain.'
-    source: 'PLAN-STRICT slice S4b; SCHERNYKH-ALIGNMENT.md row 09 (1)'
+    statement: 'Every job lets the miner verify, before it hashes, that the coinbase pays it the right amount: the coinbase and its Merkle branch to the hashing blob, its output found with its own view key, the amount equal to the exact split of the window of the job''s tip (C37) proven from a Merkle-sum commitment of the window, the window tied to the carrier chain, and the node-owner fee rate and owner the job commits (C19).'
+    source: 'PLAN-STRICT slice S4b (slice S6 of the plan of 2026-10-05); SCHERNYKH-ALIGNMENT.md row 09 (1); ~/v37-work/mrrpathb/DESIGN.md section 2.12; the public reply of 2026-10-04 (docs/canon/COMMITMENTS.md row A10)'
     ruling: 'operator 2026-10-04 16:00 +04 (per-job miner-verifiable payout proof)'
     scope: [src/impl/xmr/stratum/, src/c2pool/v37/xmr/]
     checks:
@@ -528,9 +552,9 @@ rules:
 
   - id: C22
     title: legally dead by chain data
-    statement: 'LEGALLY DEAD is decided by chain data only (the template height is non-decreasing along the carrier chain; a receipt for a Monero height the chain has passed is worth 0; a same-height race stays live), never by a clock or an arrival time (ties C03 and C08).'
-    source: 'PATH-B.md ledger-free rules (LEGALLY DEAD); docs/c2pool-v37-the-temporal-levels.md section 2'
-    ruling: 'operator 2026-10-04 11:22 +04 (Path B, LEGALLY DEAD by chain data)'
+    statement: 'LEGALLY DEAD is decided by chain data only, never by a clock or an arrival time (ties C03 and C08): the template height is non-decreasing along the carrier chain, and a receipt is dead when the placing chain had recorded a newer Monero height by the receipt''s own position + 2 (own position = position of its tip + 1; judged no later than the carrier before the one that places it), so work for a Monero height the chain has passed earns nothing, a same-height race stays live, and useful work carried late stays live. Stated, not prevented: a stale template one height behind keeps about 8-15 % of its work before the chain records the new height (two heights behind about 3 %), and deliberate stale work is block withholding, priced as such.'
+    source: 'PATH-B.md ledger-free rules (LEGALLY DEAD); docs/c2pool-v37-the-temporal-levels.md section 2; ~/v37-work/mrrpathb/DESIGN.md section 2.3 and section 7 item 3; fverify/VERIFY.md section 2 (stale ride lag 1 0.148, lag 2 0.029, hub model 0.077); docs/canon/COMMITMENTS.md note (a)'
+    ruling: 'operator 2026-10-04 11:22 +04 (Path B, LEGALLY DEAD by chain data); 2026-10-04 21:07-22:12 +04 (R1: liveness at the work''s own position + 2)'
     scope: [src/c2pool/v37/xmr/relay/, src/impl/xmr/receipt/]
     checks:
       - name: legally-dead-kat
@@ -580,9 +604,9 @@ rules:
 
   - id: C25
     title: provable work
-    statement: 'Every credited unit is a PoW-proven receipt bound to the pool and chain, the payee and its origin bin and credited work(T_origin) (C06); lane state is a deterministic function of chain data, identical on every node (C01, C08), and its commitments allow light-client proofs.'
+    statement: 'Every credited unit is a PoW-proven receipt bound to the pool and chain, the payee and its origin bin and credited work(T_origin) (C06), in full whoever carries it and in whatever order it arrives, so an orphaned share loses nothing (C05, C36); lane state is a deterministic function of chain data, identical on every node (C01, C08), and its commitments allow light-client proofs.'
     source: 'the: docs/c2pool-v37-work-receipts.md sections 2 and 3; docs/c2pool-v37-the-temporal-levels.md sections 2 to 4 (Merkle digest and proofs)'
-    ruling: 'design of record (RDWR and temporal levels ratified 2026-06-12); operator 2026-10-04 17:59 +04 (canon gates)'
+    ruling: 'design of record (RDWR and temporal levels ratified 2026-06-12); operator 2026-10-04 17:59 +04 (canon gates); 2026-10-04 21:07-22:12 +04 (R2: a receipt is credited at its origin bin whoever carries it)'
     scope: [src/impl/xmr/receipt/, src/c2pool/v37/xmr/]
     checks:
       - name: receipt-bindings
@@ -598,9 +622,9 @@ rules:
 
   - id: C26
     title: provable fees
-    statement: 'Every fee is derivable and checkable from receipts and chain data: the give-author value inside the receipt preimage, the donation output a 0-amount marker, the author donation default 0.1 % under fee model v1, disclosed in the stratum login reply and the docs, and a node may set it to 0; the owner fee by receipt hash (C19), no fixed per-node fee output, no developer fee floor.'
+    statement: 'Every fee is derivable and checkable from receipts and chain data: the give-author value inside the receipt preimage, the donation output a 0-amount marker, the author donation default 0.1 % under fee model v1, disclosed in the stratum login reply and the docs, and a node may set it to 0; the node-owner fee a weight split at the rate and owner the receipt preimage commits, checkable from the receipts themselves, with no protocol cap (C19); no fixed per-node fee output, no developer fee floor.'
     source: 'src/c2pool/v37/xmr/xmr_fee_model.hpp (rulings S1 to S3, 2026-09-29 marker); frstrtr/c2pool #1880 (login disclosure, merged); docs/xmr-lane/RUN-A-NODE.md (give-author default and opt-out); SCHERNYKH-ALIGNMENT.md row 09'
-    ruling: 'operator 2026-09-29 (0-amount donation marker, no minimum to fund); 2026-10-04 15:51 +04 (owner fee by receipt hash); 2026-10-04 20:25 +04 (author donation default 0.1 %, disclosed, a node may set 0; supersedes the default-0 ruling of 2026-10-03 20:46 +04)'
+    ruling: 'operator 2026-09-29 (0-amount donation marker, no minimum to fund); 2026-10-04 15:51 +04 (owner fee by receipt hash); 2026-10-04 20:25 +04 (author donation default 0.1 %, disclosed, a node may set 0; supersedes the default-0 ruling of 2026-10-03 20:46 +04); 2026-10-04 21:07-22:12 +04 (R7: owner fee as a weight split, no protocol cap)'
     scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp, src/impl/xmr/stratum/]
     checks:
       - name: give-author-in-preimage
@@ -764,9 +788,9 @@ rules:
 
   - id: C33
     title: dual hardened timestamp server
-    statement: 'Consensus time comes from two proof-of-work chains that check each other, never from a clock: the Monero chain, whose heights are the origin bins (bin(x) = the mainchain height committed in x preimage), and the carrier sharechain, which records the order in which the pool saw Monero tips; the Monero template height is non-decreasing along the carrier chain (a carrier below its parent template height is invalid, a same-height Monero race stays valid on both sides), LEGALLY DEAD means placed in the carrier chain after it recorded a newer Monero height, the share-difficulty retarget measures time as the Monero height span of its window, and wall-clock timestamps (miner-set receipt and Monero header times) serve only as sanity bounds (see C03, C08, C11, C22).'
+    statement: 'Consensus time comes from two proof-of-work chains that check each other, never from a clock: the Monero chain, whose heights are the origin bins (bin(x) = the mainchain height committed in x preimage), and the carrier sharechain, which records the order in which the pool saw Monero tips; the Monero template height is non-decreasing along the carrier chain (a carrier below its parent template height is invalid, a same-height Monero race stays valid on both sides), LEGALLY DEAD means the placing chain had recorded a newer Monero height by the receipt''s own position + 2 (C22), the share-difficulty retarget measures time as the Monero height span of its window, and wall-clock timestamps (miner-set receipt and Monero header times) serve only as sanity bounds (see C03, C08, C11, C22).'
     source: 'Work Receipts paper sections 3 and 4; the: docs/c2pool-v37-the-temporal-levels.md section 2 (the consensus clock); PATH-B.md ledger-free rules (Satoshi timestamp server anchored to Monero); ledger-free DESIGN.md section 4 (order-based vs clock-based)'
-    ruling: 'temporal levels v1.0 ratified 2026-06-12 (T-OQ1, bin = mainchain height); operator 2026-10-04 11:22 +04 (Path B, correction 15:00 +04) and 18:15 +04 (explicit canon rule)'
+    ruling: 'temporal levels v1.0 ratified 2026-06-12 (T-OQ1, bin = mainchain height); operator 2026-10-04 11:22 +04 (Path B, correction 15:00 +04) and 18:15 +04 (explicit canon rule); 2026-10-04 21:07-22:12 +04 (R1: liveness at own position + 2)'
     scope: [src/c2pool/v37/xmr/, src/impl/xmr/receipt/]
     checks:
       - name: carrier-timestamp-kat
@@ -816,3 +840,107 @@ rules:
         note: 'A saturating helper loses value silently on a money path; none in the consensus core today.'
     status_now: fail
     deviation: [D15]
+
+  # ---------------------------------------------------------------------------
+  # Public commitments of the reply to the external review (gist 636eca0b,
+  # comment 6406130, 2026-10-04) and the Path B rulings of 2026-10-04 and
+  # 2026-10-05 (added 2026-10-05 on operator request "add provable work fees
+  # and other from my Schernykh gist reply in full to canon"). The register of
+  # the commitments, with the rulings and their evidence, is
+  # docs/canon/COMMITMENTS.md.
+  # ---------------------------------------------------------------------------
+
+  - id: C36
+    title: open carriage
+    statement: 'Any carrier may carry live receipts it has seen, of any miner, while their origin bin is open (C03); the selection is canonical: pending receipts ordered by origin bin ascending, then by sha256d(id || parent id), the first R_MAX taken, so a builder cannot bias it; R_MAX = 16 is a lane rule (HELLO and pool_tag, C27), derived from the target "an attacker below 51 % gains nothing, within the confidence interval, at any window of 1.2 h or longer", 16 being the smallest value that meets it; carrying is expected, not required (a node that carries nothing harms only the orphaned miners and is visible); a receipt is credited at its origin bin whoever carries it, so the honest shares a selfish miner orphans come back at full credit and selfish share mining stops paying; receipts still commit prev_own_share against replay (C02 stays).'
+    source: '~/v37-work/mrrpathb/DESIGN.md section 2.5 (proposed C36) and "Operator rulings" R2; section 7 item 6 (self-carriage is a regressive transfer, open carriage 1.000 +- 0.01 in every class); fflood/FLOOD.md section 11 (R_MAX 16); fverify/VERIFY.md finding FV-D; the public reply of 2026-10-04 (docs/canon/COMMITMENTS.md rows A8, A12, B4)'
+    ruling: 'operator 2026-10-04 21:07-22:12 +04 (R2: open carriage, canonical selection, expected not required, prev_own_share kept; C02 modified, new C36); 2026-10-05 13:23 +04 (R_MAX = 16, a lane rule derived from target; supersedes R_MAX 8 of R2 and the hold of 07:55 +04)'
+    scope: [src/impl/xmr/receipt/, src/impl/xmr/wire/, src/c2pool/v37/xmr/relay/, src/c2pool/v37/xmr/]
+    checks:
+      - name: carriage-kat
+        type: required_kat
+        kats: [xmr_receipt_carriage_kat]
+        note: 'Slice S2 creates this KAT: a receipt of another miner is accepted, a receipt of a sealed bin is refused, a non-canonical selection is refused, R_MAX + 1 receipts are refused, and a receipt is credited at its origin bin whoever carries it.'
+      - name: r-max-lane-rule
+        type: constant
+        pattern: '\bR_MAX_XMR\s*=\s*([0-9]+)'
+        paths: [src/impl/xmr/**]
+        exclude: ['**/test/**', 'src/impl/xmr/settle/_compile_check/**']
+        extensions: [.hpp, .cpp, .h]
+        min: 16
+        max: 16
+        note: 'Today the receipt codec holds R_MAX_XMR = 2 (src/impl/xmr/receipt/xmr_receipt.hpp:278), re-exported by the carrier wire and the DoS budget: a carriage-refusing attacker at a = 0.45 gets 1.137 at R_MAX 2. Evidence for 16 (FLOOD.md section 11, selfish + refusal at a = 0.45 over windows of 24 h down to 1.2 h): R_MAX 8 1.004 to 1.032, 12 1.002 to 1.009, 16 0.998 to 1.001; no other cell worse; burst +0.0026 at most and still <= 0.936; saturation 16/17 = 94 % analytic. Owed before the pool exceeds about 5.5 % of Monero (windows below 1.2 h): those windows and the saturation sweep at R_MAX 16. Ruled codec change 2 -> 16, PER_LANE_BUDGET 16 x 768 B.'
+    status_now: fail
+    deviation: [D19]
+
+  - id: C37
+    title: payout from pre-block state, checked for every receipt
+    statement: 'Each pool block pays from state fixed before the block: the coinbase a receipt commits is split_reward(R, window(tip)) of the receipt''s own tip (the carrier it was built on), never of a lagged anchor; every node checks this for EVERY receipt (carrier, carried or raindrop) at admission, in the cheap stages before RandomX, and refuses a mismatch and bans its sender. The canonical coinbase is computed once per tip (deterministic tx key from the tip). Without the check a solo leech earns a(2 - a); tickets that can never be valid blocks (an overclaimed total, bad transactions) are block withholding, which no pool prevents, priced at (1 - a), and stated.'
+    source: '~/v37-work/mrrpathb/DESIGN.md sections 2.4 and 2.7 (the window is read at the block''s own position, never at an anchor; the h-61 anchor reproduces the reviewer hopper lever, P2-anchor61 hopper 1.207, own position 1.000); fverify/VERIFY.md finding FV-6; docs/canon/COMMITMENTS.md (ruling 4; rows A3 and B3)'
+    ruling: 'operator public reply of 2026-10-04 (each pool block pays its own window from state fixed before the block; the anchor 61 heights back named as drift); 2026-10-05 08:27 +04 (ruling 4: coinbase = split_reward(R, window(tip)) for every receipt, carrier, carried and raindrop, refused at admission before RandomX, and a ban)'
+    scope: [src/impl/xmr/receipt/, src/impl/xmr/settle/, src/impl/xmr/native/relay/, src/c2pool/v37/xmr/]
+    checks:
+      - name: solo-leech-kat
+        type: required_kat
+        kats: [xmr_receipt_solo_leech_kat]
+        note: 'Slice S2 creates this KAT: a carrier, a carried receipt and a raindrop whose coinbase is not split_reward(R, window(tip)) of its own tip are each refused at admission before RandomX and the sender banned; a receipt paying the window of another tip or of a lagged anchor is refused; the canonical coinbase is computed once per tip.'
+      - name: receipt-admission-coinbase-check
+        type: required
+        pattern: '\bcanonical_coinbase_matches\s*\('
+        paths: [src/impl/xmr/receipt/**]
+        exclude: ['**/test/**']
+        code_only: true
+        min_count: 1
+        note: 'Master fact (ruling 4): canonical_coinbase_matches (src/impl/xmr/settle/xmr_coinbase.hpp:485) gates only found-block RELAY (src/impl/xmr/native/relay/xmr_found_block_carrier.hpp:28-47: whether a non-canonical coinbase is admissible to the LANE is unwired, #1551); receipt admission (src/impl/xmr/receipt/xmr_admission.hpp:233) opens the coinbase only for T_origin and the bindings. The settlement provider pays from its ledger with the finalize cursor at T - 1 - D_conf (src/c2pool/v37/xmr/xmr_o2_settlement_provider.hpp:198-205; D_conf = 60, the h-61 anchor), which goes with the ledger (slice S4). A slice that names the per-receipt check differently changes this pattern in the same pull request.'
+    open_items:
+      - 'OPEN S0 item, not ruled: which Monero branch D_net(h) and R(h) come from. DESIGN.md section 2.7 says only "the Monero header at h"; during a Monero race honest nodes could compute different windows, and C37 bans on a coinbase mismatch. Candidate for S0: take them from the branch of the receipt''s own prev_id, which is deterministic; a node that lacks that branch defers and never bans (the existing "we cannot judge this right now: defer, never ban" rule, src/impl/xmr/native/relay/xmr_found_block_carrier.hpp:39-43). Source: ~/v37-work/constants/sweep/CONSTANTS-SWEEP.md item A-3 (X-3).'
+      - 'OPEN S0 item, not ruled: coinbase output order. Carrot (Monero v17) requires coinbase outputs sorted by one-time output key (check_transaction_output_pubkeys_order), which conflicts with DESIGN.md section 2.7 "payee key ascending"; the canonical coinbase must follow the Monero output ordering rule of the block version. Source: ~/v37-work/constants/sweep/CONSTANTS-SWEEP.md item A-9 (X-16).'
+    status_now: fail
+    deviation: [D20]
+
+  - id: C38
+    title: payout window by work, no output below its spend cost
+    statement: 'The payout window is measured in WORK and never holds work whose share is worth less than the cost to spend it: window(tip) = whole origin bins back from the tip until the raw work reaches min(COVERAGE x D_net, R x d / f_spend) with COVERAGE = 2 (about two expected Monero blocks of pool work), then the N rule (C13); weight = work(T_origin) with NO decay (bins keep time for LEGALLY DEAD, the fold and MMR storage, never payout weight); W_max = R x d / f_spend in work, with f_spend the Monero minimum fee to spend one input, from chain data (spend_floor: input weight x 0.95 x R x 3000 / M^2), so no payee output falls below f_spend (entries bound R / f_spend, about 47,800 at a 300 kB median; binds below about 0.05 % of Monero, about 5.5 days of window for a small pool). How the bound treats entries of a smaller d than the tip (hashrate growth) and raindrop entries (d/64) is specified per payee weight or per minimum entry in slice S0, so that no PAYEE output falls below f_spend.'
+    source: '~/v37-work/mrrpathb/DESIGN.md section 2.7, "Operator rulings" R3/R4 and section 7 items 5 and 9; fverify/VERIFY.md findings FV-3 and FV-4 (fwmax: capped windows exact, every class 1.000); src/impl/xmr/settle/xmr_coinbase.cpp:171 (spend_floor); docs/canon/COMMITMENTS.md (rulings R3/R4 and 5; rows A2 and A5)'
+    ruling: 'operator 2026-10-04 21:07-22:12 +04 (R3/R4: the payout window is measured in work, COVERAGE x D_net, with no decay; a ruled deviation of the design text, D22); 2026-10-05 13:23 +04 (ruling 5: W_max = R x d / f_spend in work replaces the 7-day bound; the dust statement folds into it)'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/, src/sharechain/v37/]
+    checks:
+      - name: window-kats
+        type: required_kat
+        kats: [xmr_window_kat, xmr_window_spend_floor_kat]
+        note: 'Slice S3 creates these KATs. xmr_window_kat: whole bins back to COVERAGE x D_net of work at the tip, no decay, the window of the own tip, the N rule after the work bound. xmr_window_spend_floor_kat: W_max = R x d / f_spend with f_spend from spend_floor, no payee output below f_spend, including entries of a smaller d than the tip and raindrop entries.'
+    status_now: fail
+    deviation: [D21, D22]
+
+  - id: C39
+    title: the reviewer scenarios are required tests
+    statement: 'The scenarios of the external review are required tests, as written. (1) One miner with 20 % of the pool and 40,000 miners of 0.002 % each, on a 0.6 XMR block: every payee in the window gets an output, the outputs sum to R exactly, and the outputs are at most N(B). (2) The pulse and hopper schedules: a deterministic expected-value test (no Monte Carlo) computes the expected pay of each class (steady, pulser, hopper before and after the pulse, part-time) from the schedule and the window rule and asserts paid/fair within 0.003 of 1 for every class.'
+    source: 'the public reply of 2026-10-04 ("Your 20% miner with 40,000 small ones, and your pulse and hopper schedules, go into the tests as written"; docs/canon/COMMITMENTS.md row A6); the external review (gist 636eca0b) output-cap and hop-proofness cases; ~/v37-work/mrrpathb/RESULTS.txt P1, P2 and P3 (work window, no decay: every class 1.000 +- 0.002; 20 % miner 0.998 +- 0.009, 40,000 small 1.0006 +- 0.002, every payee paid)'
+    ruling: 'operator public reply of 2026-10-04 (the scenarios go into the tests as written); operator 2026-10-05 (record the reply commitments in the canon)'
+    scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/]
+    checks:
+      - name: reviewer-kats
+        type: required_kat
+        kats: [v37_xmr_reviewer_cap_kat, v37_xmr_reviewer_schedules_kat]
+        note: 'Slice S3 creates these KATs. v37_xmr_reviewer_cap_kat: the 20 % plus 40,000 x 0.002 % case on a 0.6 XMR block (every payee in the window paid, sum == R, outputs <= N(B), today and after Carrot). v37_xmr_reviewer_schedules_kat: the pulse and hopper schedules as an exact expected-value computation, paid/fair within 0.003 for each class.'
+    status_now: fail
+    deviation: [D23]
+
+  - id: C40
+    title: design and simulation before code
+    statement: 'A pull request that implements a Path B slice carries a "Design:" line in its body that points to the published design section and to the simulation evidence it rests on ("Design: <design section>; evidence: <runs>"); the design and the simulation are posted before the code. A pull request on these paths that implements no slice says "Design: none (reason)".'
+    source: 'the public reply of 2026-10-04 ("I''ll post the design and the simulation before I write the code"; docs/canon/COMMITMENTS.md row A13); PLAN-STRICT standing process rules (design gate); DESIGN-PREAMBLE'
+    ruling: 'operator public reply of 2026-10-04 (design and simulation posted before the code); operator 2026-10-04 (design gate and deviations register); operator 2026-10-05 (record the reply commitments in the canon)'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/sharechain/v37/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: pr-design-line
+        type: pr_body
+        line: Design
+        paths:
+          - src/c2pool/v37/xmr/**
+          - src/impl/xmr/**
+          - src/sharechain/v37/**
+          - src/c2pool/v37/main_v37_xmr.cpp
+        note: 'The line names at least one URL or repository path, or reads "Design: none (reason)"; reviewers check that it points to the published design section and its simulation evidence.'
+    status_now: pass
+    deviation: []

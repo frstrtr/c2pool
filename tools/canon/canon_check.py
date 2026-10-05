@@ -13,7 +13,9 @@ report, and exits non-zero on any NEW violation:
   * a required KAT that the baseline records as present and that is now
     missing from CMake, no longer built by CI, or failed in a given junit;
   * a pull request that touches consensus paths without a "Canon:" line in its
-    body, or that names an unknown rule (only with --pr-body);
+    body, or that names an unknown rule, without a "KAT:" line naming
+    registered tests (rule C31), or without a "Design:" line naming the design
+    section and the evidence (rule C40) (only with --pr-body);
   * a register that does not match the canon (rule C09).
 
 It also reports what can be tightened: a deviation whose rules all pass now
@@ -792,6 +794,29 @@ def parse_kat_line(body, registered):
     return True, names, "KAT: %s" % ", ".join(names)
 
 
+DESIGN_LINE_RE = re.compile(r"^[ \t>*_-]*Design:[ \t]*(.+?)[ \t*_]*$", re.M)
+
+
+def parse_design_line(body):
+    """Returns (ok, refs, message). Rule C40: the line points to the published
+    design section and the simulation evidence, as references (a URL or a
+    repository path, i.e. a token with a '/'), or reads 'Design: none (reason)'
+    for a change that implements no Path B slice."""
+    m = DESIGN_LINE_RE.search(body or "")
+    if not m:
+        return False, [], "no 'Design:' line in the PR body"
+    val = m.group(1).strip()
+    if re.match(r"^none\b", val, re.I):
+        if re.search(r"\(\s*\S.{2,}\)", val):
+            return True, [], "Design: none, with a reason"
+        return False, [], "'Design: none' needs a reason in parentheses"
+    refs = [x.strip("`.,;:()[]<>") for x in re.split(r"\s+", val)]
+    refs = [x for x in refs if "/" in x]
+    if not refs:
+        return False, [], "the 'Design:' line names no design section or evidence (a URL or a path)"
+    return True, refs, "Design: %s" % ", ".join(refs)
+
+
 def check_pr_body(tree, canon, canon_dir, chk, ctx):
     if ctx.pr_body is None:
         return {"status": "n/a", "detail": "no --pr-body given"}
@@ -806,6 +831,8 @@ def check_pr_body(tree, canon, canon_dir, chk, ctx):
         ok, ids, msg = parse_canon_line(ctx.pr_body, ctx.rule_ids)
     elif line == "KAT":
         ok, ids, msg = parse_kat_line(ctx.pr_body, set(ctx.tests(tree)))
+    elif line == "Design":
+        ok, ids, msg = parse_design_line(ctx.pr_body)
     else:
         raise CanonError("check %s: unknown pr_body line %r" % (chk.get("name"), line))
     return {"status": "pass" if ok else "fail", "detail": msg, "touched": touched[:20], "named": ids}
@@ -1124,6 +1151,12 @@ def selftest(canon_path):
     ok(parse_kat_line("KAT: none (comment-only change)", set())[0], "kat line none with reason")
     ok(not parse_kat_line("KAT: none", set())[0], "kat line none without reason")
     ok(not parse_kat_line("no line", set())[0], "kat line missing")
+    ok(parse_design_line("x\nDesign: docs/xmr-lane/path-b.md section 2.5; evidence: sim/FLOOD.md s.11\n")[1] ==
+       ["docs/xmr-lane/path-b.md", "sim/FLOOD.md"], "design line refs")
+    ok(parse_design_line("Design: none (comment-only change)")[0], "design line none with reason")
+    ok(not parse_design_line("Design: none")[0], "design line none without reason")
+    ok(not parse_design_line("Design: see the design")[0], "design line without a reference")
+    ok(not parse_design_line("no line")[0], "design line missing")
     cm = ("set(L a_kat b_kat)\nforeach(k IN LISTS L)\n  add_test(NAME ${k} COMMAND ${k})\nendforeach()\n"
           "foreach(z c_kat d_kat)\n add_test(NAME ${z} COMMAND ${z})\nendforeach()\n"
           "add_test(NAME e_kat COMMAND e_bin --x) # add_test(NAME f_kat COMMAND f)\n")
@@ -1175,7 +1208,7 @@ def main(argv=None):
     ap.add_argument("--json", help="write the JSON report here")
     ap.add_argument("--junit", action="append", default=[], help="ctest --output-junit file(s); required KATs "
                                                                  "must pass in them")
-    ap.add_argument("--pr-body", help="file with the pull request body (enables rule C10)")
+    ap.add_argument("--pr-body", help="file with the pull request body (enables rules C10, C31 and C40)")
     ap.add_argument("--changed-files", help="file listing the PR's changed paths, one per line")
     ap.add_argument("--base", help="git ref to diff against for the changed files (instead of --changed-files)")
     ap.add_argument("--write-baseline", action="store_true",
