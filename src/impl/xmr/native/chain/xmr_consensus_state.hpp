@@ -122,7 +122,8 @@ enum class ConnectStatus : std::uint8_t {
     FutureTimestamp,    // ahead of local time: SOFT, retry, never a ban
     BodiesMissing,      // weight not computable yet (fluffy, uncompleted)
     BlockTooBig,        // weight > 2 * median: unpayable
-    BadCoinbase,        // coinbase amount does not match the reward rule
+    BadCoinbase,        // coinbase amount does not match the reward rule, or
+                        // the miner tx has more outputs than its fork allows
     BelowAnchor,        // refuses to touch pinned history
 };
 
@@ -351,6 +352,19 @@ public:
             why = "coinbase height " + std::to_string(in.coinbase.height)
                 + " != block height " + std::to_string(height_in);
             return ConnectStatus::HeightMismatch;
+        }
+
+        // Miner-tx output count by fork, as Monero's prevalidate_miner_transaction
+        // judges it (HF_VERSION_REJECT_MANY_MINER_OUTPUTS /
+        // FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS, see xmr_block_parse.hpp). Keyed on
+        // the block's own major version, which is Monero's hf_version for any
+        // block its fork check accepts; up to v16 the bound is the parse
+        // ceiling and this never fires.
+        if (!miner_tx_output_count_ok(h.major_version, in.parsed.miner_tx.n_outputs)) {
+            why = "miner tx carries " + std::to_string(in.parsed.miner_tx.n_outputs)
+                + " outputs, the limit at major version " + std::to_string(h.major_version)
+                + " is " + std::to_string(max_miner_tx_outputs(h.major_version));
+            return ConnectStatus::BadCoinbase;
         }
 
         const TimestampStatus ts = timestamps_.check(h.timestamp, now);
