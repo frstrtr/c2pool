@@ -303,7 +303,7 @@ struct RelayOptions {
     // max_inbound caps accepted links only (over it a connection is closed at
     // accept), so an inbound link never takes one of the max_outbound slots
     // below, and the node keeps dialing while it has fewer than max_outbound.
-    std::size_t max_inbound = 22;
+    std::size_t max_inbound = 101;
     // Per address (IPv4, IPv6 /64; 127.0.0.1 and ::1 exempt) at most
     // max_inbound_per_addr accepted links at once; another is closed at accept.
     std::size_t max_inbound_per_addr = 1;
@@ -311,10 +311,15 @@ struct RelayOptions {
     // BY ADDRESS for ban_seconds: every link from it is dropped, it is refused
     // at accept and not dialed until the ban ends (127.0.0.1 / ::1: the link is
     // dropped, no address ban). The RandomX budget is per address too.
-    // Default 16 s = dos.per_peer_capacity / dos.per_peer_refill (8 / 0.5 per
-    // s); the daemon sets it from --relay-rx-budget the same way.
-    u32         ban_seconds = 16;
+    // Default ceil(n x N / G) s = ceil(113 x 1 / 4) = 29 s, with n = max_inbound
+    // + max_outbound, N = verify_threads, G = dos.global_refill
+    // (::c2pool::xmr::dos_ban_seconds); the daemon sets it the same way.
+    u32         ban_seconds = ::c2pool::xmr::dos_ban_seconds(::c2pool::xmr::kDosDefaultLinks,
+                                                             ::c2pool::xmr::kDosDefaultWorkers,
+                                                             ::c2pool::xmr::kDosDefaultGlobalRefill);
     u64         index_horizon = 64;               // blocks; older unsolicited receipts are dropped
+    // RandomX budget: DosPolicy{} = dos_policy_for(113 links, 1 worker, 4/s);
+    // the daemon sets dos_policy_for(max_inbound + max_outbound, verify_threads, G).
     ::c2pool::xmr::DosPolicy dos{};
     u32         solicited_credits = 256;
     u64         backfill_positions = 2048;
@@ -328,7 +333,7 @@ struct RelayOptions {
     // worker (the library default, every KAT byte-identical); the daemon passes
     // --relay-verify-threads (auto = clamp(cores/2, 2, 8) minus --mine threads).
     // Clamped to [1, kMaxVerifyThreads] at start(): up to N DoS tokens may be
-    // outstanding per peer, inside the per-peer burst (20).
+    // outstanding per source; the daemon sets the per-address burst to N.
     std::size_t verify_threads = 1;
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
@@ -411,7 +416,7 @@ struct RelayOptions {
     // fb_unknown, nothing is asked or dialed beyond `peers`); the daemon turns
     // it ON (--relay-discovery on, the CLI default).
     bool        discovery = false;
-    std::size_t max_outbound = 10;                // dialed links (peers + learned) the node keeps up; dialing continues while below it
+    std::size_t max_outbound = 12;                // dialed links (peers + learned) the node keeps up; dialing continues while below it
     // The SEED seam: addresses dialed as CANDIDATES at start (the built-in
     // bootstrap list feeds this; --relay-peer stays a permanent dial target).
     std::vector<std::pair<std::string, u16>> seeds;

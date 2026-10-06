@@ -10,7 +10,7 @@
 // A victim relay V (discovery on, three honest seed relays H1..H3, inbound cap
 // 8, outbound target 3) whose dialing is held while eight inbound relays fill
 // every inbound slot:
-//   E1  the defaults: 22 inbound, 10 outbound, 1 accepted link per address
+//   E1  the defaults: 101 inbound, 12 outbound, 1 accepted link per address
 //   E2  eight inbound links are accepted; a ninth is refused at accept (never
 //       HELLO-ok) and V's inbound count stays 8
 //   E3  dialing released: V dials the seeds and reaches its outbound target,
@@ -79,8 +79,8 @@ int main() {
 
     {
         const RelayOptions d;
-        C(d.max_inbound == 22 && d.max_outbound == 10 && d.max_inbound_per_addr == 1,
-          "E1 defaults: 22 inbound, 10 outbound, 1 accepted link per address");
+        C(d.max_inbound == 101 && d.max_outbound == 12 && d.max_inbound_per_addr == 1,
+          "E1 defaults: 101 inbound, 12 outbound, 1 accepted link per address");
     }
 
     // three honest seed relays (listen only)

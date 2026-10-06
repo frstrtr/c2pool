@@ -43,14 +43,12 @@
 //   (invalid) RandomX. A flooder is throttled to `refill` wasted hashes/s until
 //   the ban lands; an honest peer never depletes it.
 //
-// SIZING (the defaults; all are per-instance knobs, operator-ratified at wiring):
-//   Honest per-peer demand is tiny. Carriers are difficulty-gated at the ~10-s
-//   share cadence and each carrier drives <= 1 + R_MAX (= 3 at R_MAX_XMR=2)
-//   RandomX hashes; dedup collapses the duplicate relays of the same carrier
-//   before any hash. So a single honest peer forces well under 1 wasted hash/s.
-//   Defaults: per SOURCE refill 0.5 token/s, capacity 8; GLOBAL refill 16/s,
-//   capacity 256. The global bucket is the aggregate ceiling; the per-source
-//   bucket is the fairness layer that stops any single source eating it.
+// SIZING (per-instance knobs; dos_policy_for() below): for n links, N RandomX
+//   verify workers and a global refill G tokens/s:
+//     per-source burst N, per-source refill G / n,
+//     global burst n x N, global refill G,
+//     address ban ceil(n x N / G) s (dos_ban_seconds()).
+//   DosPolicy{} = dos_policy_for(113, 1, 4).
 //
 // SOURCES: the per-source key is a u64 chosen by the caller. The XMR relay uses
 //   the remote ADDRESS (IPv4, IPv6 /64; net_addr_ban.hpp) where it has one, so
@@ -141,14 +139,19 @@ struct PeerState {
 // ---------------------------------------------------------------------------
 // Policy constants (per-instance knobs).
 // ---------------------------------------------------------------------------
+// The link count, verify-worker count and global refill behind DosPolicy{}.
+inline constexpr std::size_t kDosDefaultLinks        = 113;   // 101 inbound + 12 outbound
+inline constexpr std::size_t kDosDefaultWorkers      = 1;
+inline constexpr u32         kDosDefaultGlobalRefill = 4;     // tokens/s
+
 struct DosPolicy {
     // per-source RandomX bucket (a source = one address, or one connection)
-    double per_peer_capacity = 8.0;    // burst of unverified carriers
-    double per_peer_refill   = 0.5;    // wasted hashes/s once the burst is spent
+    double per_peer_capacity = double(kDosDefaultWorkers);                               // burst = verify workers
+    double per_peer_refill   = double(kDosDefaultGlobalRefill) / double(kDosDefaultLinks); // global refill / links
 
     // global backstop bucket (aggregate RandomX-grant ceiling across all peers)
-    double global_capacity   = 256.0;
-    double global_refill     = 16.0;   // ~16 hashes/s => ~24% of one light core
+    double global_capacity   = double(kDosDefaultLinks * kDosDefaultWorkers);           // links x verify workers
+    double global_refill     = double(kDosDefaultGlobalRefill);                          // tokens/s
 
     // ban scoring
     u32  score_invalid_pow   = 100;    // per CONFIRMED invalid-PoW carrier
@@ -162,6 +165,31 @@ struct DosPolicy {
     // released sources whose state is kept (spent bucket or non-zero score)
     std::size_t retain_max   = 16384;
 };
+
+// The RandomX budget for `links` connections, `workers` verify workers and a
+// global refill of `global_refill` tokens/s (links and workers count as >= 1):
+// per-source burst = workers, per-source refill = global_refill / links,
+// global burst = links x workers, global refill = global_refill. The other
+// fields come from `base`.
+inline DosPolicy dos_policy_for(std::size_t links, std::size_t workers, u32 global_refill, DosPolicy base = {}) {
+    if (links < 1) links = 1;
+    if (workers < 1) workers = 1;
+    base.per_peer_capacity = double(workers);
+    base.per_peer_refill   = double(global_refill) / double(links);
+    base.global_capacity   = double(links) * double(workers);
+    base.global_refill     = double(global_refill);
+    return base;
+}
+
+// Address ban seconds for that budget: ceil(links x workers / global_refill),
+// integer arithmetic (links and workers count as >= 1; 0 when global_refill is 0).
+inline u32 dos_ban_seconds(std::size_t links, std::size_t workers, u32 global_refill) {
+    if (global_refill == 0) return 0;
+    if (links < 1) links = 1;
+    if (workers < 1) workers = 1;
+    const u64 burst = u64(links) * u64(workers);
+    return static_cast<u32>((burst + global_refill - 1) / global_refill);
+}
 
 // The decision the relay acts on for one carrier, produced by this policy.
 enum class Action : std::uint8_t {

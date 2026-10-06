@@ -18,11 +18,12 @@
 //   SD3  submit budget: the submit over the burst is dropped unverified, the
 //        connection is closed and its address banned (redial refused at accept)
 //   SD4  a repeated (job id, nonce) is refused unverified; three bad shares
-//        (score -15) ban the connection
+//        (score -9) ban the connection; an accepted share never lifts the
+//        score above 0
 //   SD5  bounded queue: one connection's submits are queued (bound 8, the
 //        rest answered busy) and verified one per pass, so another miner's
 //        login is answered before that queue drains
-//   SD6  login deadline (test clock): no login after 1.9 s = open, after 2.1 s
+//   SD6  login deadline (test clock): no login after 4.9 s = open, after 5.1 s
 //        = closed + address banned (redial refused); a logged-in miner and an
 //        address-less 127.0.0.1 client are not address-banned
 // Nonzero exit on any failure.
@@ -35,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -178,12 +180,12 @@ int main() {
     // ── SD1 defaults ────────────────────────────────────────────────────────
     {
         const o2::StratumListenerOptions d;
-        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000, 64 burst + 8/s submits, 64 queued, login 2 s, "
-              "ban 8 s (= burst / rate), score -5/+1 ban at -15 (max 1000), 256 (job id, nonce) pairs remembered",
-              d.bind_host == "127.0.0.1" && d.min_difficulty == 16000 && d.submit_burst == 64.0 && d.submit_rate == 8.0 &&
-              d.max_pending_submits == 64 && d.login_timeout_ms == 2000 && d.ban_seconds == 8 &&
-              d.ban_seconds * d.submit_rate == d.submit_burst && d.bad_share_points == -5 &&
-              d.good_share_points == 1 && d.ban_score == -15 && d.max_score == 1000 && d.max_seen_submits == 256);
+        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000, 24 burst + 1.6/s submits (2 x 0.8/s), 24 queued, "
+              "login 5 s, ban 15 s (= burst / rate), score -3/+1 ban at -9 (cap 0), 256 (job id, nonce) pairs remembered",
+              d.bind_host == "127.0.0.1" && d.min_difficulty == 16000 && d.submit_burst == 24.0 && d.submit_rate == 2 * 0.8 &&
+              d.max_pending_submits == 24 && d.login_timeout_ms == 5000 && d.ban_seconds == 15 &&
+              std::abs(d.ban_seconds * d.submit_rate - d.submit_burst) < 1e-9 && d.bad_share_points == -3 &&
+              d.good_share_points == 1 && d.ban_score == -9 && d.max_score == 0 && d.max_seen_submits == 256);
     }
 
     // ── SD2 minimum difficulty ──────────────────────────────────────────────
@@ -256,18 +258,19 @@ int main() {
               reply_to(a, 20) && !is_error(a) && reply_to(b, 21) && b.find("Duplicate share") != std::string::npos &&
               R.ver.hashes.load() == 1 && R.L.stats().submits_duplicate == 1,
               "a='" + a.substr(0, 60) + "' b='" + b.substr(0, 80) + "'");
-        // score now 1 - 5 = -4; three low-difficulty shares: -9, -14, -19 -> banned on the third
+        // accepted (+1, capped at 0), duplicate -3; two low-difficulty shares: -6, -9 -> banned on the third bad share
         R.ver.good = false;
         int lows = 0;
-        for (std::uint32_t i = 0; i < 3; ++i) {
-            send_line(fd, submit_req(30 + i, jid, 100 + i));
-            const std::string l = read_line(fd, 3000);
-            if (l.find("Low diff share") != std::string::npos) ++lows;
-        }
+        send_line(fd, submit_req(30, jid, 100));
+        if (read_line(fd, 3000).find("Low diff share") != std::string::npos) ++lows;
+        const bool open_after_two_bad = !closed_within(fd, 200);
+        send_line(fd, submit_req(31, jid, 101));
+        if (read_line(fd, 3000).find("Low diff share") != std::string::npos) ++lows;
         const bool closed = closed_within(fd, 3000);
         ::close(fd);
-        check("SD4 low-difficulty shares cost 5 points each: banned (closed) when the score reaches -15",
-              lows == 3 && closed && R.L.stats().bans == 1, "lows=" + std::to_string(lows));
+        check("SD4 bad shares cost 3 points each, an accepted share lifts the score to 0 at most: open after two bad "
+              "shares (-6), banned (closed) on the third (-9)",
+              lows == 2 && open_after_two_bad && closed && R.L.stats().bans == 1, "lows=" + std::to_string(lows));
         const int again = dial_from("127.0.0.40", R.L.bound_port());
         const bool refused = again >= 0 && closed_within(again, 3000);
         if (again >= 0) ::close(again);
@@ -324,16 +327,16 @@ int main() {
         const int local = dial_from("127.0.0.1", R.L.bound_port());
         int miner = -1;
         const std::string jid = R.login(miner, "127.0.0.61", "");
-        off_ms = 1900;
-        const bool open_at_1_9 = !closed_within(silent, 300);
-        off_ms = 2100;
-        const bool closed_at_2_1 = closed_within(silent, 3000);
+        off_ms = 4900;
+        const bool open_at_4_9 = !closed_within(silent, 300);
+        off_ms = 5100;
+        const bool closed_at_5_1 = closed_within(silent, 3000);
         const bool local_closed = closed_within(local, 3000);
         const bool miner_open = !closed_within(miner, 300);
         ::close(silent); ::close(local);
         const auto s = R.L.stats();
-        check("SD6 no login: open at +1.9 s, closed at +2.1 s; the logged-in miner stays open",
-              silent >= 0 && open_at_1_9 && closed_at_2_1 && local_closed && miner_open && s.login_timeouts == 2 && !jid.empty(),
+        check("SD6 no login: open at +4.9 s, closed at +5.1 s; the logged-in miner stays open",
+              silent >= 0 && open_at_4_9 && closed_at_5_1 && local_closed && miner_open && s.login_timeouts == 2 && !jid.empty(),
               "timeouts=" + std::to_string(s.login_timeouts));
         const int again = dial_from("127.0.0.60", R.L.bound_port());
         const bool refused = again >= 0 && closed_within(again, 3000);

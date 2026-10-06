@@ -147,15 +147,15 @@ struct StratumListenerOptions {
     std::size_t   max_log_lines = 2048;      // bounded log (oldest dropped)
     // NET-DOS (see the header note). Every value below is network policy.
     std::uint64_t min_difficulty = 16000;    // a "+diff" request below this is raised to it
-    double        submit_rate = 8.0;         // submits/s per connection, sustained
-    double        submit_burst = 64.0;       // submits per connection, burst
-    std::size_t   max_pending_submits = 64;  // submits queued per connection for verification
-    int           login_timeout_ms = 2000;   // no login by then: banned (0 = off)
-    int           ban_seconds = 8;           // address ban, = submit_burst / submit_rate (127.0.0.1 / ::1: closed only)
-    int           bad_share_points = -5;     // low-difficulty or duplicate share
+    double        submit_rate = 1.6;         // submits/s per connection, sustained (= 2 x the 0.8/s share-rate target)
+    double        submit_burst = 24.0;       // submits per connection, burst
+    std::size_t   max_pending_submits = 24;  // submits queued per connection for verification (= submit_burst)
+    int           login_timeout_ms = 5000;   // no login by then: banned (0 = off)
+    int           ban_seconds = 15;          // address ban, = ceil(submit_burst / submit_rate) (127.0.0.1 / ::1: closed only)
+    int           bad_share_points = -3;     // low-difficulty or duplicate share
     int           good_share_points = 1;     // accepted share
-    int           ban_score = -15;           // banned at or below this score
-    int           max_score = 1000;          // the score never rises above this
+    int           ban_score = -9;            // banned at or below this score
+    int           max_score = 0;             // the score never rises above this
     std::size_t   max_seen_submits = 256;    // (job id, nonce) pairs remembered per connection
 };
 

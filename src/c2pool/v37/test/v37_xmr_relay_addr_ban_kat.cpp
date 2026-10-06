@@ -10,19 +10,23 @@
 //   K1  address keys: one per IPv4 address and per IPv6 /64 (two addresses of
 //       one /64 share a key, the next /64 does not); IPv4-mapped IPv6 keys as
 //       IPv4; 127.0.0.1 and ::1 have no key; every key is >= kAddrKeyMin
-//   K2  transport: an address banned for the relay default (16 s) is refused at
-//       accept (no PeerId, no peer event) at +0 s and +15 s and accepted at
-//       +17 s (test clock);
+//   K2  transport: an address banned for the relay default (29 s) is refused at
+//       accept (no PeerId, no peer event) at +0 s and +28 s and accepted at
+//       +30 s (test clock);
 //       another address is accepted meanwhile; a banned address is not dialed
 //   K3  transport: per-address accept cap 1: a second connection from the same
 //       address is refused while the first is up and accepted after it ends;
 //       127.0.0.1 is not capped
-//   K4  RandomX budget per address (policy 8 burst, 0.5/s; global 256, 16/s;
-//       relay ban 16 s = burst / refill; 16384 released addresses kept):
-//       one address gets 8 grants at once and 8 + 0.5/s after, whatever it
-//       asks; 32 addresses take the global burst between them and a 33rd gets
-//       nothing more at that instant; an address that spent its bucket finds it
-//       spent after it reconnects (released, kept); a clean one is dropped
+//   K4  RandomX budget per address, for n links, C verify workers and a global
+//       refill G: per address C burst + G / n per s, global n x C burst + G per
+//       s, address ban ceil(n x C / G) s. Defaults: n 113 (101 inbound + 12
+//       outbound), G 4/s; DosPolicy{} at C 1 (ban 29 s); bans 226 / 85 / 57 /
+//       452 s at C 8 / 3 / 2 / 16, 130 s at C 8 and G 7; 16384 released
+//       addresses kept. At n 113, C 8, G 4: one address gets 8 grants at once
+//       and 4 more over the next 120 s of continuous asking; 113 addresses take
+//       the global burst (904) between them and a 114th gets nothing more at
+//       that instant; an address that spent its bucket finds it spent after it
+//       reconnects (released, kept); a clean one is dropped
 //   K5  relay: a peer dialing from 127.0.0.2 that sends a confirmed invalid PoW
 //       is banned BY ADDRESS: dropped, its other queued receipts dropped with no
 //       RandomX evaluation, its redial refused at accept and never HELLO-ok,
@@ -140,8 +144,8 @@ int main() {
         const PeerId p1 = S.last.load();
         const long long ban_s = RelayOptions{}.ban_seconds;
         const auto k = S.node.ban(p1, std::chrono::seconds(ban_s));
-        C(ban_s == 16 && k == key_of("127.0.0.2") && closed_by_peer(c1, 3000) && wait_until([&] { return S.downs.load() == 1; }),
-          "K2 ban(peer, 16 s, the relay default) bans 127.0.0.2 and drops the link");
+        C(ban_s == 29 && k == key_of("127.0.0.2") && closed_by_peer(c1, 3000) && wait_until([&] { return S.downs.load() == 1; }),
+          "K2 ban(peer, 29 s, the relay default) bans 127.0.0.2 and drops the link");
         ::close(c1);
         int c2 = dial_from("127.0.0.2", port);
         C(c2 >= 0 && closed_by_peer(c2, 3000) && wait_until([&] { return S.node.refused_banned() == 1; }) && S.ups.load() == 1,
@@ -153,12 +157,12 @@ int main() {
         S.offset_s = ban_s - 1;
         int c4 = dial_from("127.0.0.2", port);
         C(c4 >= 0 && closed_by_peer(c4, 3000) && wait_until([&] { return S.node.refused_banned() == 2; }) && S.ups.load() == 2,
-          "K2 +15 s: still refused");
+          "K2 +28 s: still refused");
         ::close(c4);
         S.offset_s = ban_s + 1;
         int c5 = dial_from("127.0.0.2", port);
         C(c5 >= 0 && wait_until([&] { return S.ups.load() == 3; }) && !closed_by_peer(c5, 200) && S.node.refused_banned() == 2,
-          "K2 +17 s: the ban expired, 127.0.0.2 is accepted again");
+          "K2 +30 s: the ban expired, 127.0.0.2 is accepted again");
         ::close(c3); ::close(c5);
         CarrierPeerNode cli;
         C(cli.ban_key(key_of("127.0.0.9"), std::chrono::seconds(60)) && cli.add_peer_id("127.0.0.9", port) == 0 &&
@@ -194,12 +198,24 @@ int main() {
     // ── K4 RandomX budget per address ───────────────────────────────────────
     {
         namespace cx = ::c2pool::xmr;
-        cx::DosPolicy pol;   // the defaults: per source 8 / 0.5 s^-1, global 256 / 16 s^-1
-        C(pol.per_peer_capacity == 8.0 && pol.per_peer_refill == 0.5 && pol.global_capacity == 256.0 && pol.global_refill == 16.0 &&
-          pol.retain_max == 16384,
-          "K4 default budget: 8 burst + 0.5/s per address, 256 + 16/s global; 16384 released addresses kept");
-        C(RelayOptions{}.ban_seconds * pol.per_peer_refill == pol.per_peer_capacity,
-          "K4 relay ban default (16 s) = per-address burst / refill");
+        const cx::DosPolicy def;   // DosPolicy{} = dos_policy_for(113, 1, 4)
+        const cx::DosPolicy d1 = cx::dos_policy_for(113, 1, 4);
+        C(def.per_peer_capacity == 1.0 && def.per_peer_refill == 4.0 / 113.0 && def.global_capacity == 113.0 &&
+          def.global_refill == 4.0 && def.retain_max == 16384 &&
+          d1.per_peer_capacity == def.per_peer_capacity && d1.per_peer_refill == def.per_peer_refill &&
+          d1.global_capacity == def.global_capacity && d1.global_refill == def.global_refill,
+          "K4 default budget = dos_policy_for(113 links, 1 worker, 4/s): 1 burst + 4/113 per s per address, "
+          "113 + 4/s global; 16384 released addresses kept");
+        const RelayOptions ro{};
+        C(ro.max_inbound == 101 && ro.max_outbound == 12 && ro.max_inbound + ro.max_outbound == cx::kDosDefaultLinks &&
+          ro.ban_seconds == 29 && ro.ban_seconds == cx::dos_ban_seconds(113, 1, 4),
+          "K4 relay defaults: 101 inbound + 12 outbound = 113 links; address ban ceil(113 x 1 / 4) = 29 s");
+        C(cx::dos_ban_seconds(113, 8, 4) == 226 && cx::dos_ban_seconds(113, 3, 4) == 85 && cx::dos_ban_seconds(113, 2, 4) == 57 &&
+          cx::dos_ban_seconds(113, 16, 4) == 452 && cx::dos_ban_seconds(113, 8, 7) == 130 && cx::dos_ban_seconds(113, 8, 0) == 0,
+          "K4 address ban ceil(n x C / G): 226 / 85 / 57 / 452 s at C 8 / 3 / 2 / 16 (G 4), 130 s at C 8 and G 7, 0 at G 0");
+        const cx::DosPolicy pol = cx::dos_policy_for(113, 8, 4);   // n 113, C 8, G 4
+        C(pol.per_peer_capacity == 8.0 && pol.per_peer_refill == 4.0 / 113.0 && pol.global_capacity == 904.0 && pol.global_refill == 4.0,
+          "K4 dos_policy_for(113, 8, 4): 8 burst + 4/113 per s per address, 904 + 4/s global");
         cx::CarrierDosBudget dos(pol);
         const cx::nanos_t t0 = 1'000'000'000LL;
         const u64 A = key_of("10.0.0.1");
@@ -207,20 +223,20 @@ int main() {
         for (int i = 0; i < 1000; ++i) got += dos.grant_randomx(A, t0) ? 1 : 0;
         C(got == 8, "K4 one address asking 1000 times at once gets 8 grants: " + std::to_string(got));
         int later = 0;
-        for (int s = 1; s <= 10; ++s)
+        for (int s = 1; s <= 120; ++s)
             for (int i = 0; i < 100; ++i) later += dos.grant_randomx(A, t0 + s * 1'000'000'000LL) ? 1 : 0;
-        C(later == 5, "K4 then 0.5/s: 5 more grants over 10 s of continuous asking: " + std::to_string(later));
+        C(later == 4, "K4 then 4/113 per s: 4 more grants over 120 s of continuous asking: " + std::to_string(later));
         cx::CarrierDosBudget dos2(pol);
         int total = 0, most = 0;
-        for (u32 i = 0; i < 32; ++i) {
+        for (u32 i = 0; i < 113; ++i) {
             int g = 0;
             for (int k = 0; k < 100; ++k) g += dos2.grant_randomx(key_of(("10.0.1." + std::to_string(i + 1)).c_str()), t0) ? 1 : 0;
             total += g; most = std::max(most, g);
         }
         int extra = 0;
         for (int k = 0; k < 100; ++k) extra += dos2.grant_randomx(key_of("10.0.2.1"), t0) ? 1 : 0;
-        C(total == 256 && most == 8 && extra == 0,
-          "K4 32 addresses share the global burst (256, at most 8 each); a 33rd gets none at that instant (" +
+        C(total == 904 && most == 8 && extra == 0,
+          "K4 113 addresses share the global burst (904, at most 8 each); a 114th gets none at that instant (" +
               std::to_string(total) + "/" + std::to_string(most) + "/" + std::to_string(extra) + ")");
         cx::CarrierDosBudget dos3(pol);
         const u64 B = key_of("10.0.3.1"), Cc = key_of("10.0.3.2");
