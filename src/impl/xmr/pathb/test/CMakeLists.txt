@@ -7,7 +7,7 @@
 #   v37_xmr_pathb_pbx1_kat           PBX1 tx_extra forms and refusals
 #   v37_xmr_relay_horizons_kat       horizons, J, blob_cap, w_min, D_max, RECEIPT_CAP
 #   v37_xmr_pathb_branch_kat         window inputs on the branch of prev_id(tip)
-#   v37_xmr_template_catchup_kat     catch-up template rule
+#   xmr_template_catchup_kat         catch-up template rule
 #   v37_xmr_pathb_journal_kat        rewind journal, rebuild verdict
 #   v37_xmr_pathb_headers_first_kat  side-branch decision from headers
 #
@@ -24,7 +24,7 @@ if (BUILD_TESTING)
             v37_xmr_pathb_pbx1_kat
             v37_xmr_relay_horizons_kat
             v37_xmr_pathb_branch_kat
-            v37_xmr_template_catchup_kat
+            xmr_template_catchup_kat
             v37_xmr_pathb_journal_kat
             v37_xmr_pathb_headers_first_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)

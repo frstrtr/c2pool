@@ -279,7 +279,7 @@ jobs:
                     xmr_native_template_dup_tx_kat \
                     xmr_native_txpool_resume_kat \
                     v37_xmr_side_data_v3_kat v37_xmr_pathb_body_v3_kat v37_xmr_pathb_pbx1_kat \
-                    v37_xmr_relay_horizons_kat v37_xmr_pathb_branch_kat v37_xmr_template_catchup_kat \
+                    v37_xmr_relay_horizons_kat v37_xmr_pathb_branch_kat xmr_template_catchup_kat \
                     v37_xmr_pathb_journal_kat v37_xmr_pathb_headers_first_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
@@ -794,7 +794,7 @@ jobs:
                     xmr_native_template_dup_tx_kat \
                     xmr_native_txpool_resume_kat \
                     v37_xmr_side_data_v3_kat v37_xmr_pathb_body_v3_kat v37_xmr_pathb_pbx1_kat \
-                    v37_xmr_relay_horizons_kat v37_xmr_pathb_branch_kat v37_xmr_template_catchup_kat \
+                    v37_xmr_relay_horizons_kat v37_xmr_pathb_branch_kat xmr_template_catchup_kat \
                     v37_xmr_pathb_journal_kat v37_xmr_pathb_headers_first_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \

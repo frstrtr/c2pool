@@ -4,7 +4,7 @@
 // Affero General Public License, version 3 or (at your option) any later
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
-// src/impl/xmr/pathb/test/v37_xmr_template_catchup_kat.cpp
+// src/impl/xmr/pathb/test/xmr_template_catchup_kat.cpp
 // Catch-up template rule (K28, FR-B1), Fresh = 2:
 //   (1) gap 0 / 1 / 2: template on the Monero tip (height M + 1), fresh;
 //   (2) gap 3: template at h(t) + 2 on the main-chain block at h(t) + 1,
@@ -36,7 +36,7 @@ std::uint64_t monero_for_gap(std::uint64_t h_tip, std::int64_t gap) {
 }  // namespace
 
 int main() {
-    std::printf("v37_xmr_template_catchup_kat\n");
+    std::printf("xmr_template_catchup_kat\n");
     const pb::LaneParams p = pb::kRuledLaneParams;
     const std::uint64_t fresh = p.fresh_max;
     check(fresh == 2, "Fresh = 2");
@@ -130,5 +130,5 @@ int main() {
         check(e.parent == pb::TemplateParent::MoneroTip, "Fresh 3, gap 3: template on the Monero tip");
     }
 
-    return finish("v37_xmr_template_catchup_kat");
+    return finish("xmr_template_catchup_kat");
 }
