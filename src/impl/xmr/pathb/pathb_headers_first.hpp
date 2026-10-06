@@ -6,13 +6,16 @@
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/pathb_headers_first.hpp
 // Path B headers-first: the decision on a side branch announced by headers.
-// Inputs: cumulative carrier work of the best chain, cumulative work at the
-// fork point, the side headers in chain order (work d and the result of the
-// header checks), the fork depth below the best tip, and J.
+// Inputs: cumulative carrier work and tip id of the best chain, cumulative
+// work at the fork point, the side headers in chain order (work d, the result
+// of the header checks, carrier id), the fork depth below the best tip, and J.
 //   first header that failed its checks -> RefuseHeader (its index); no bodies
-//   fork work + work of the checked headers  > best work -> FetchBodies
-//   otherwise, fork depth > J                            -> Prune
-//   otherwise                                            -> KeepHeaders
+//   the side branch wins the fork choice -> FetchBodies:
+//     claimed work = fork work + work of the checked headers;
+//     claimed work > best work, or claimed work == best work and the id of the
+//     last side header < the best tip id (bytes compared in order)
+//   otherwise, fork depth > J            -> Prune
+//   otherwise                            -> KeepHeaders
 // Cumulative work in 128 bits.
 // ---------------------------------------------------------------------------
 #pragma once
@@ -20,7 +23,9 @@
 #include <cstdint>
 #include <vector>
 
-#include "impl/xmr/native/contracts/types.hpp"  // U128, u128_add, u128_greater
+#include "impl/xmr/native/contracts/types.hpp"  // U128, u128_add, u128_less, u128_greater
+
+#include "pathb_params.hpp"                      // Hash32
 
 namespace c2pool::xmr::pathb {
 
@@ -29,6 +34,7 @@ enum class HeaderCheck : std::uint8_t { Passed, Failed };
 struct SideHeader {
     std::uint64_t work = 0;  // d of the carrier at its position
     HeaderCheck check = HeaderCheck::Passed;
+    Hash32 id{};             // carrier id
 };
 
 enum class SideBranchAction : std::uint8_t { FetchBodies, KeepHeaders, Prune, RefuseHeader };
@@ -39,7 +45,7 @@ struct SideBranchDecision {
     ::c2pool::xmr::native::U128 claimed_work{};          // fork work + checked header work
 };
 
-inline SideBranchDecision decide_side_branch(const ::c2pool::xmr::native::U128& best_work,
+inline SideBranchDecision decide_side_branch(const ::c2pool::xmr::native::U128& best_work, const Hash32& best_tip,
                                              const ::c2pool::xmr::native::U128& fork_work,
                                              const std::vector<SideHeader>& headers, std::uint64_t fork_depth,
                                              std::uint64_t journal_depth) noexcept {
@@ -56,7 +62,9 @@ inline SideBranchDecision decide_side_branch(const ::c2pool::xmr::native::U128& 
         sum = ::c2pool::xmr::native::u128_add(sum, U128{headers[i].work, 0});
     }
     d.claimed_work = sum;
-    if (::c2pool::xmr::native::u128_greater(sum, best_work)) {
+    const bool heavier = ::c2pool::xmr::native::u128_greater(sum, best_work);
+    const bool equal = !heavier && !::c2pool::xmr::native::u128_less(sum, best_work);
+    if (heavier || (equal && !headers.empty() && headers.back().id < best_tip)) {
         d.action = SideBranchAction::FetchBodies;
     } else if (fork_depth > journal_depth) {
         d.action = SideBranchAction::Prune;
