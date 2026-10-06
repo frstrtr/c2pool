@@ -4,7 +4,8 @@
 #   pathb_params.hpp         lane parameters, Monero symbols, integer helpers
 #   pathb_wire_v3.hpp        side_data_v3, receipt body v3, carrier body v3
 #   pathb_pbx1.hpp           PBX1 coinbase tx_extra
-#   pathb_caps.hpp           w_min, D_max, RECEIPT_CAP, blob_cap, J, relay horizons
+#   pathb_caps.hpp           w_min, D_max, RECEIPT_CAP / FRAME_CAP, I/O buffers, blob_cap,
+#                            J, relay horizons
 #   pathb_branch.hpp         window inputs from the branch of prev_id(tip)
 #   pathb_catchup.hpp        catch-up template rule, template freshness
 #   pathb_journal.hpp        rewind journal of depth J
