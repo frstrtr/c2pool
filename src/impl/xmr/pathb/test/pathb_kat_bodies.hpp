@@ -24,11 +24,11 @@ inline pb::SideDataV3 golden_side() {
     pb::SideDataV3 s;
     s.version = 3;
     s.pool_id = seq32(0x01);
-    s.rules_epoch = 0x04030201u;
+    s.rules_epoch = 0x0201u;
+    s.ballot = 0x0403u;
     s.payee = seq32(0x40);
     s.t_origin = 0x0807060504030201ull;
     s.tip = seq32(0x60);
-    s.prev_own_share = seq32(0x80);
     s.receipts_root = seq32(0xA0);
     s.window_root = seq32(0xC0);
     s.mmr_root = seq32(0xE0);

@@ -9,6 +9,7 @@
 #   pathb_catchup.hpp        catch-up template rule, template freshness
 #   pathb_journal.hpp        rewind journal of depth J
 #   pathb_headers_first.hpp  side-branch decision from announced headers
+#   pathb_ratchet_state.hpp  ratchet state S, rs_step, the receipts_root fold
 #
 # `xmr_pathb` is an INTERFACE target: the include root, xmr_coin (Keccak,
 # vendored difficulty) and Boost headers (the vendored difficulty's uint128).

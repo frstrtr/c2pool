@@ -6,10 +6,11 @@
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/test/v37_xmr_relay_horizons_kat.cpp
 // Derived horizons and caps:
-//   (1) (F, T, D_fin, R_MAX, Fresh, P_heal) = (96, 10, 12, 16, 2, 3 h):
-//       index_horizon 99, backfill 1,164, ctx_window 100, ctx_max_depth 3,
-//       index_retention 2,112, pending_cap 18,432; J = 1,164;
-//   (2) (48, 10, 12, 16, 2, 3 h): 51 / 1,080 / 93 / 3 / 2,112 / 9,216; J = 1,080;
+//   (1) (F, T, D_fin, R_MAX, Fresh, P_heal) = (96, 10, 0, 16, 2, 3 h):
+//       index_horizon 99, backfill 1,152, ctx_window 99, ctx_max_depth 3,
+//       index_retention (Monero rows kept) 1,455, pending_cap 18,432;
+//       J = 1,152; the fold crossing 1,152;
+//   (2) (48, 10, 0, 16, 2, 3 h): 51 / 1,080 / 93 / 3 / 1,455 / 9,216; J = 1,080;
 //   (3) blob caps: own found block, Z 300,000 at OVH 89 / OUT 40 = 313,166;
 //       Z 625,000 at OVH 61 / OUT 90 (hf 17, trailer 33) = 652,401; outputs
 //       from Z_A, transactions from Z_P; at most 10,000 outputs from hf 17;
@@ -17,10 +18,14 @@
 //       600,051 / 1,250,084; a context block with a 500,000 B miner tx at
 //       Z 300,000 fits the context cap and not the own cap; n_tx bound 411 / 856;
 //   (4) w_min = 1,459 (prefix 126 + rct base 82 + prunable 1,251);
-//       D_max(16) = 14 -> RECEIPT_CAP 945; D_max(17) = 12 -> 881; D_max moves
+//       D_max(16) = 14 -> RECEIPT_CAP 913; D_max(17) = 12 -> 849; D_max moves
 //       with Z_lt; zone / surge / extra leaves per hf;
-//   (5) formulas follow the parameters (a changed T or F moves every value);
-//       out-of-domain inputs give no value.
+//   (5) formulas follow the parameters (a changed T or F moves every value;
+//       D_fin stays 0: T 20 -> J 576, T 7 -> ceil(96 x 120 / 7) = 1,646);
+//       out-of-domain inputs give no value;
+//   (6) Monero rows kept: delta_win 734; k_alt 720 + 735 = 1,455 by default;
+//       rows_window above it (a carrier record far below the Monero tip)
+//       raises it; heights near genesis clamp.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -41,15 +46,15 @@ int main() {
         check(p.carrier_interval_s == 10 && p.open_bins == 96 && p.fresh_max == 2 && p.r_max == 16
                       && p.heal_period_h == 3,
               "ruled lane parameters (T 10, F 96, Fresh 2, R_MAX 16, P_heal 3 h)");
-        check(pb::seal_depth(p) == 12, "D_fin = ceil(120 / 10) = 12");
-        check(pb::fold_crossing_depth(p) == 1164, "F x 120 / T + D_fin = 1,164");
-        check(pb::journal_depth(p) == 1164, "J = max(1,080, 1,164) = 1,164");
+        check(pb::seal_depth(p) == 0 && pb::kSealDepth == 0, "D_fin = 0 (K06)");
+        check(pb::fold_crossing_depth(p) == 1152, "F x 120 / T + D_fin = 1,152");
+        check(pb::journal_depth(p) == 1152, "J = max(1,080, 1,152) = 1,152");
         const pb::RelayHorizons h = pb::relay_horizons(p);
         check(h.index_horizon == 99, "index_horizon 99");
-        check(h.backfill == 1164, "backfill 1,164");
-        check(h.ctx_window == 100, "ctx_window 100");
+        check(h.backfill == 1152, "backfill 1,152");
+        check(h.ctx_window == 99, "ctx_window = ceil(1,152 x 10 / 120) + 3 = 99");
         check(h.ctx_max_depth == 3, "ctx_max_depth 3");
-        check(h.index_retention == 2112, "index_retention 2,112");
+        check(h.index_retention == 1455, "Monero rows kept 1,455");
         check(h.pending_cap == 18432, "pending_cap 18,432");
     }
 
@@ -57,11 +62,11 @@ int main() {
     {
         pb::LaneParams p = pb::kRuledLaneParams;
         p.open_bins = 48;
-        check(pb::fold_crossing_depth(p) == 588, "F 48: F x 120 / T + D_fin = 588");
+        check(pb::fold_crossing_depth(p) == 576, "F 48: F x 120 / T + D_fin = 576");
         check(pb::journal_depth(p) == 1080, "F 48: J = 1,080");
         const pb::RelayHorizons h = pb::relay_horizons(p);
-        const pb::RelayHorizons want{51, 1080, 93, 3, 2112, 9216};
-        check(h == want, "F 48: 51 / 1,080 / 93 / 3 / 2,112 / 9,216");
+        const pb::RelayHorizons want{51, 1080, 93, 3, 1455, 9216};
+        check(h == want, "F 48: 51 / 1,080 / 93 / 3 / 1,455 / 9,216");
     }
 
     // (3) blob caps
@@ -121,13 +126,13 @@ int main() {
         check(pb::tree_extra_leaves(16) == 0 && pb::tree_extra_leaves(17) == 2, "X(16) = 0, X(17) = 2");
         check(pb::d_max(16, 0) == std::optional<std::uint64_t>(14), "D_max(16, Z_lt <= zone) = 14");
         check(pb::d_max(17, 0) == std::optional<std::uint64_t>(12), "D_max(17, Z_lt <= zone) = 12");
-        check(pb::receipt_cap(16, 0) == std::optional<std::uint64_t>(945), "RECEIPT_CAP(16) = 945");
-        check(pb::receipt_cap(17, 0) == std::optional<std::uint64_t>(881), "RECEIPT_CAP(17) = 881");
+        check(pb::receipt_cap(16, 0) == std::optional<std::uint64_t>(913), "RECEIPT_CAP(16) = 913");
+        check(pb::receipt_cap(17, 0) == std::optional<std::uint64_t>(849), "RECEIPT_CAP(17) = 849");
         check(pb::d_max(16, 300000) == pb::d_max(16, 0), "Z_lt at the zone: D_max unchanged");
         // 1 + floor(2 x 50 x Z / 1,459) reaches 2^15 at Z = 478,071
         check(pb::d_max(16, 478070) == std::optional<std::uint64_t>(14), "D_max(16, Z_lt 478,070) = 14");
         check(pb::d_max(16, 478071) == std::optional<std::uint64_t>(15), "D_max(16, Z_lt 478,071) = 15");
-        check(pb::receipt_cap(16, 478071) == std::optional<std::uint64_t>(977), "RECEIPT_CAP rises to 977");
+        check(pb::receipt_cap(16, 478071) == std::optional<std::uint64_t>(945), "RECEIPT_CAP rises to 945");
         check(!pb::d_max(16, UINT64_MAX).has_value(), "Z_lt outside the u64 domain gives no value");
     }
 
@@ -135,20 +140,40 @@ int main() {
     {
         pb::LaneParams p = pb::kRuledLaneParams;
         p.carrier_interval_s = 20;
-        check(pb::seal_depth(p) == 6, "T 20: D_fin = 6");
-        check(pb::fold_crossing_depth(p) == 96 * 6 + 6, "T 20: F x 120 / T + D_fin = 582");
-        check(pb::journal_depth(p) == 582, "T 20: J = max(540, 582) = 582");
+        check(pb::seal_depth(p) == 0, "T 20: D_fin = 0");
+        check(pb::fold_crossing_depth(p) == 96 * 6, "T 20: F x 120 / T + D_fin = 576");
+        check(pb::journal_depth(p) == 576, "T 20: J = max(540, 576) = 576");
+        check(pb::relay_horizons(p).backfill == 576 && pb::relay_horizons(p).ctx_window == 96 + 3,
+              "T 20: backfill 576, ctx_window 99");
         p.carrier_interval_s = 7;
-        check(pb::seal_depth(p) == 18, "T 7: D_fin = ceil(120 / 7) = 18");
-        check(pb::fold_crossing_depth(p) == 1646 + 18, "T 7: ceil(96 x 120 / 7) + 18 = 1,664");
+        check(pb::seal_depth(p) == 0, "T 7: D_fin = 0");
+        check(pb::fold_crossing_depth(p) == 1646, "T 7: ceil(96 x 120 / 7) + 0 = 1,646");
+        check(pb::journal_depth(p) == 1646, "T 7: J = max(1,543, 1,646) = 1,646");
+        check(pb::relay_horizons(p).ctx_window == 97 + 3, "T 7: ctx_window = ceil(1,646 x 7 / 120) + 3 = 100");
         p = pb::kRuledLaneParams;
         p.heal_period_h = 4;
-        check(pb::journal_depth(p) == 1440, "P_heal 4 h: J = max(1,440, 1,164) = 1,440");
+        check(pb::journal_depth(p) == 1440, "P_heal 4 h: J = max(1,440, 1,152) = 1,440");
         check(pb::relay_horizons(p).ctx_window == 120 + 3, "P_heal 4 h: ctx_window = 123");
         p = pb::kRuledLaneParams;
         p.open_bins = 170;
         check(pb::relay_horizons(p).index_horizon == 173, "F 170: index_horizon 173");
         check(pb::relay_horizons(p).pending_cap == 170 * 12 * 16, "F 170: pending_cap 32,640");
+    }
+
+    // (6) Monero rows kept
+    {
+        const pb::LaneParams p = pb::kRuledLaneParams;
+        check(pb::DIFFICULTY_BLOCKS_COUNT == 735 && pb::kAltDepth == 720, "DIFFICULTY_BLOCKS_COUNT 735, k_alt 720");
+        check(pb::kRowsWindowDelta == 734, "delta_win = max(735, 60 + 100, 60) - 1 = 734");
+        check(pb::monero_rows_default(pb::kAltDepth) == 1455, "default 720 + 735 = 1,455");
+        // carriers in step with Monero: H(L - J) 9,904, H(L - D_fin) 10,000, M 10,000
+        check(pb::rows_window(p, 10000, 9904, 10000) == 833, "rows_window = 10,000 - (9,903 - 1 - 734) + 1 = 833");
+        check(pb::monero_rows_keep(p, pb::kAltDepth, 10000, 9904, 10000) == 1455, "833 below the default: 1,455");
+        // carrier records far below the Monero tip
+        check(pb::rows_window(p, 10000, 9000, 9500) == 1736, "rows_window = 10,000 - (9,000 - 1 - 734) + 1 = 1,736");
+        check(pb::monero_rows_keep(p, pb::kAltDepth, 10000, 9000, 9500) == 1736, "rows_window above the default raises it");
+        check(pb::rows_window(p, 500, 400, 500) == 501, "near genesis: h_floor clamps to 0, rows = M + 1");
+        check(pb::monero_rows_keep(p, 2000, 10000, 9904, 10000) == 2735, "k_alt raised to 2,000: 2,735");
     }
 
     return finish("v37_xmr_relay_horizons_kat");

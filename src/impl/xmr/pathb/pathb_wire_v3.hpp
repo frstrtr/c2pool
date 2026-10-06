@@ -9,32 +9,32 @@
 // carrier body. Little-endian fixed-width integers; CryptoNote varints inside
 // the Monero hashing blob.
 //
-// side_data_v3 (273 B):
+// side_data_v3 (241 B):
 //   off   0  u8   version = 3
 //   off   1  32   pool_id
-//   off  33  u32  rules_epoch
+//   off  33  u16  rules_epoch
+//   off  35  u16  ballot: own flag (bit 15) | epoch_no (bits 0..14)
 //   off  37  32   payee identity
 //   off  69  u64  t_origin
 //   off  77  32   tip
-//   off 109  32   prev_own_share
-//   off 141  32   receipts_root
-//   off 173  32   window_root
-//   off 205  32   mmr_root
-//   off 237  u16  fee_rate p (basis points, 0..10000)
-//   off 239  32   owner identity (zero iff p == 0)
-//   off 271  u16  give_author_bp (0..10000)
+//   off 109  32   receipts_root (pathb_ratchet_state.hpp: the carry fold)
+//   off 141  32   window_root
+//   off 173  32   mmr_root
+//   off 205  u16  fee_rate p (basis points, 0..10000)
+//   off 207  32   owner identity (zero iff p == 0)
+//   off 239  u16  give_author_bp (0..10000)
 //   mm_root = keccak256("c2pool-v37-xmr-side-v3" || side_data_v3)
 //
 // receipt body:
 //   u8 blob_len (<= 78) | hashing_blob[blob_len] | extra_nonce[4] | u8 depth D
-//   | branch[32 x D] | side_data_v3[273] | payee_ref[66] | owner_ref[66] iff p > 0
+//   | branch[32 x D] | side_data_v3[241] | payee_ref[66] | owner_ref[66] iff p > 0
 //   | u64 reward_total
 //   hashing_blob = varint major (1 B max) | varint minor (1 B max)
 //                | varint timestamp (5 B max) | prev_id[32] | nonce u32
 //                | tree_root[32] | varint tx_count (3 B max)
 //   key ref = u8 kind (XMR_STD) | u8 len (64) | spend[32] | view[32],
 //             spend and view decompress as ed25519 points
-//   RECEIPT_MAX(D) = 497 + 32 D
+//   RECEIPT_MAX(D) = 465 + 32 D
 //
 // carrier body:
 //   u8 ver = 3 | receipt body (own) | u8 n_carried (<= R_MAX)
@@ -127,11 +127,11 @@ namespace side_v3 {
 inline constexpr std::size_t kVersionOff = 0;
 inline constexpr std::size_t kPoolIdOff = kVersionOff + kU8Bytes;
 inline constexpr std::size_t kRulesEpochOff = kPoolIdOff + kHashBytes;
-inline constexpr std::size_t kPayeeOff = kRulesEpochOff + kU32Bytes;
+inline constexpr std::size_t kBallotOff = kRulesEpochOff + kU16Bytes;
+inline constexpr std::size_t kPayeeOff = kBallotOff + kU16Bytes;
 inline constexpr std::size_t kTOriginOff = kPayeeOff + kHashBytes;
 inline constexpr std::size_t kTipOff = kTOriginOff + kU64Bytes;
-inline constexpr std::size_t kPrevOwnShareOff = kTipOff + kHashBytes;
-inline constexpr std::size_t kReceiptsRootOff = kPrevOwnShareOff + kHashBytes;
+inline constexpr std::size_t kReceiptsRootOff = kTipOff + kHashBytes;
 inline constexpr std::size_t kWindowRootOff = kReceiptsRootOff + kHashBytes;
 inline constexpr std::size_t kMmrRootOff = kWindowRootOff + kHashBytes;
 inline constexpr std::size_t kFeeRateOff = kMmrRootOff + kHashBytes;
@@ -146,11 +146,11 @@ inline constexpr std::string_view kSideDataV3Domain = "c2pool-v37-xmr-side-v3";
 struct SideDataV3 {
     std::uint8_t version = kSideDataV3Version;
     Hash32 pool_id{};
-    std::uint32_t rules_epoch = 0;
+    std::uint16_t rules_epoch = 0;
+    std::uint16_t ballot = 0;
     Hash32 payee{};
     std::uint64_t t_origin = 0;
     Hash32 tip{};
-    Hash32 prev_own_share{};
     Hash32 receipts_root{};
     Hash32 window_root{};
     Hash32 mmr_root{};
@@ -269,10 +269,10 @@ inline WireError encode_side_data_v3(const SideDataV3& s, std::vector<std::uint8
     out.push_back(s.version);
     detail::put_hash(out, s.pool_id);
     detail::put_le(out, s.rules_epoch);
+    detail::put_le(out, s.ballot);
     detail::put_hash(out, s.payee);
     detail::put_le(out, s.t_origin);
     detail::put_hash(out, s.tip);
-    detail::put_hash(out, s.prev_own_share);
     detail::put_hash(out, s.receipts_root);
     detail::put_hash(out, s.window_root);
     detail::put_hash(out, s.mmr_root);
@@ -287,8 +287,8 @@ inline WireError read_side_data_v3(BlobReader& r, SideDataV3& s) noexcept {
     if (r.remaining() < side_v3::kSize) return WireError::Truncated;
     SideDataV3 v;
     bool ok = r.read_byte(v.version) && detail::get_hash(r, v.pool_id) && detail::get_le(r, v.rules_epoch)
-              && detail::get_hash(r, v.payee) && detail::get_le(r, v.t_origin) && detail::get_hash(r, v.tip)
-              && detail::get_hash(r, v.prev_own_share) && detail::get_hash(r, v.receipts_root)
+              && detail::get_le(r, v.ballot) && detail::get_hash(r, v.payee) && detail::get_le(r, v.t_origin)
+              && detail::get_hash(r, v.tip) && detail::get_hash(r, v.receipts_root)
               && detail::get_hash(r, v.window_root) && detail::get_hash(r, v.mmr_root)
               && detail::get_le(r, v.fee_rate_bp) && detail::get_hash(r, v.owner)
               && detail::get_le(r, v.give_author_bp);
@@ -370,7 +370,7 @@ struct ReceiptBodyV3 {
 inline constexpr std::size_t kReceiptFixedMaxBytes = kU8Bytes + kHashingBlobMaxBytes + kExtraNonceBytes + kU8Bytes
                                                      + side_v3::kSize + kKeyRefBytes + kKeyRefBytes + kU64Bytes;
 
-// RECEIPT_MAX(D) = 497 + 32 D.
+// RECEIPT_MAX(D) = 465 + 32 D.
 inline constexpr std::uint64_t receipt_max(std::uint64_t depth) noexcept {
     return kReceiptFixedMaxBytes + depth * kHashBytes;
 }
