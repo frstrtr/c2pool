@@ -4,11 +4,12 @@
 //
 // Part A fixed the addrme self-probe compare. Part B is what happens after the
 // node dials its own public endpoint and the version handshake reveals our own
-// nonce. Canonical jtoomim/p2pool p2pool/p2p.py:160-161 raises
-// PeerMisbehavingError('was connected to self'). packetReceived (:92-94) turns
-// that into badPeerHappened() (:96-105), which bans the HOST, never 127.0.0.1,
-// for 3600 * banscore^2 seconds. Both the dial loop (_think, :648) and the
-// acceptor (buildProtocol, :548) skip a banned host.
+// nonce. The ltc canonical is p2pool-merged-v36. p2pool/p2p.py:188 raises
+// PeerMisbehavingError('was connected to self'). packetReceived (:106-108)
+// turns that into badPeerHappened() (:110-119), which bans the HOST, never
+// 127.0.0.1, for 3600 * banscore^2 seconds. Both the dial loop (:720) and the
+// acceptor (:614) skip a banned host. forgive_transgressions (:787-791) takes
+// one point off every score each hour (:783-784) and drops it at zero.
 //
 // Before this fix ltc's handle_version returned nullopt with no ban. The
 // endpoint stayed dialable and was redialled on every think tick.
@@ -20,6 +21,7 @@
 //
 //   SelfNonceBansTheHost                   FAILS without the fix
 //   RepeatSelfConnectionEscalatesQuadratically   FAILS without the fix
+//   HourlyForgivenessLowersTheNextBan      FAILS without the fix
 //   LoopbackSelfConnectionIsNeverBanned    passes both: the canonical exemption
 //   ForeignNonceIsNotBanned                passes both: only the self arm bans
 //
@@ -98,6 +100,13 @@ public:
     void handle(std::unique_ptr<RawMessage>, const NetService&) override {}
 
     void set_nonce(uint64_t n) { this->m_nonce = n; }
+
+    // Run the forgiveness clock as if `hours` had passed since the node started.
+    void advance_hours(int hours)
+    {
+        this->run_forgiveness(this->m_forgiveness_epoch + hours * FORGIVENESS_INTERVAL
+                              + std::chrono::seconds(1));
+    }
 
     // Seconds until the host-level ban on `ip` expires, or 0 if none.
     long long ban_seconds_left(const std::string& ip) const
@@ -216,6 +225,28 @@ TEST_F(LtcSelfConnectionBan, RepeatSelfConnectionEscalatesQuadratically)
     handshake(node, "127.0.0.2", kOurNonce);
     EXPECT_GE(node.ban_seconds_left("127.0.0.2"), 9 * 3600 - kSlack)
         << "third offence: 3600 * 3^2";
+}
+
+TEST_F(LtcSelfConnectionBan, HourlyForgivenessLowersTheNextBan)
+{
+    Probe node;
+    node.set_nonce(kOurNonce);
+
+    // Score 2 (a real self-dial trips both ends of the connection).
+    handshake(node, "127.0.0.2", kOurNonce);
+    handshake(node, "127.0.0.2", kOurNonce);
+
+    // Two hourly passes take the score 2 -> 1 -> 0, and canonical drops the
+    // host. The next offence starts over at score 1, so it is a 1 h ban, not
+    // the 9 h that score 3 would give.
+    node.advance_hours(2);
+    handshake(node, "127.0.0.2", kOurNonce);
+
+    const auto left = node.ban_seconds_left("127.0.0.2");
+    EXPECT_GE(left, 3600 - kSlack)
+        << "p2pool-merged-v36 p2p.py:787-791 forgives one point per hour";
+    EXPECT_LE(left, 3600 + kSlack)
+        << "without forgiveness the third offence is 3600 * 3^2";
 }
 
 TEST_F(LtcSelfConnectionBan, LoopbackSelfConnectionIsNeverBanned)
