@@ -10,8 +10,12 @@
 //       index_horizon 99, backfill 1,164, ctx_window 100, ctx_max_depth 3,
 //       index_retention 2,112, pending_cap 18,432; J = 1,164;
 //   (2) (48, 10, 12, 16, 2, 3 h): 51 / 1,080 / 93 / 3 / 2,112 / 9,216; J = 1,080;
-//   (3) blob_cap: Z 300,000 at OVH 89 / OUT 40 = 313,166; Z 625,000 at
-//       OVH 61 / OUT 90 = 652,368; n_tx bound 411 / 856;
+//   (3) blob caps: own found block, Z 300,000 at OVH 89 / OUT 40 = 313,166;
+//       Z 625,000 at OVH 61 / OUT 90 (hf 17, trailer 33) = 652,401; outputs
+//       from Z_A, transactions from Z_P; at most 10,000 outputs from hf 17;
+//       one output below OVH; context block 2 Z + 50 + 1 (+ 33 from hf 17):
+//       600,051 / 1,250,084; a context block with a 500,000 B miner tx at
+//       Z 300,000 fits the context cap and not the own cap; n_tx bound 411 / 856;
 //   (4) w_min = 1,459 (prefix 126 + rct base 82 + prunable 1,251);
 //       D_max(16) = 14 -> RECEIPT_CAP 945; D_max(17) = 12 -> 881; D_max moves
 //       with Z_lt; zone / surge / extra leaves per hf;
@@ -60,22 +64,49 @@ int main() {
         check(h == want, "F 48: 51 / 1,080 / 93 / 3 / 2,112 / 9,216");
     }
 
-    // (3) blob_cap
+    // (3) blob caps
     {
         check(pb::kHashingHeaderMaxBytes == 43, "HDR_max = 1 + 1 + 5 + 32 + 4");
+        check(pb::kMoneroHeaderMaxBytes == 50, "HDR_ctx = 2 + 2 + 10 + 32 + 4");
+        check(pb::block_trailer_bytes(16) == 0 && pb::block_trailer_bytes(17) == 33, "trailer 0 / 33 (hf 16 / 17)");
         check(pb::max_tx_count(300000) == 411, "floor(2 x 300,000 / 1,459) = 411");
         check(pb::max_tx_count(625000) == 856, "floor(2 x 625,000 / 1,459) = 856");
-        const std::optional<std::uint64_t> c16 = pb::blob_cap(pb::CoinbaseLayout{89, 40}, 300000);
-        const std::optional<std::uint64_t> c17 = pb::blob_cap(pb::CoinbaseLayout{61, 90}, 625000);
-        check(c16 && *c16 == 313166, "blob_cap(Z 300,000; OVH 89, OUT 40) = 313,166");
-        check(c17 && *c17 == 652368, "blob_cap(Z 625,000; OVH 61, OUT 90) = 652,368");
-        const std::optional<std::uint64_t> c_small = pb::blob_cap(pb::CoinbaseLayout{89, 40}, 50);
-        check(c_small && *c_small == 43 + 89 + 0 + 0 + 1, "Z below OVH: no outputs, no transactions");
-        check(!pb::blob_cap(pb::CoinbaseLayout{89, 0}, 300000).has_value(), "OUT 0 gives no value");
-        check(!pb::blob_cap(pb::CoinbaseLayout{89, 40}, UINT64_MAX).has_value(), "Z outside the u64 domain gives no value");
-        const std::uint64_t z2 = 300000 * 2;
-        const std::optional<std::uint64_t> c_big = pb::blob_cap(pb::CoinbaseLayout{89, 40}, z2);
-        check(c_big && *c_big > *c16, "blob_cap grows with Z");
+        const pb::CoinbaseLayout l16{89, 40};
+        const pb::CoinbaseLayout l17{61, 90};
+
+        // own found block
+        const std::optional<std::uint64_t> c16 = pb::blob_cap_own(16, l16, 300000, 300000);
+        const std::optional<std::uint64_t> c17 = pb::blob_cap_own(17, l17, 625000, 625000);
+        check(c16 && *c16 == 313166, "own: Z 300,000, OVH 89, OUT 40 -> 313,166");
+        check(c17 && *c17 == 652401, "own: hf 17, Z 625,000, OVH 61, OUT 90 -> 652,368 + 33 = 652,401");
+        check(pb::blob_cap_own(16, l16, 400000, 300000) == std::optional<std::uint64_t>(413166),
+              "own: outputs from Z_A 400,000, transactions from Z_P 300,000 -> 413,166");
+        check(pb::blob_cap_own(16, l16, 300000, 400000) == std::optional<std::uint64_t>(317550),
+              "own: outputs from Z_A 300,000, transactions from Z_P 400,000 -> 317,550");
+        check(pb::blob_cap_own(17, l17, 2000000, 625000) == std::optional<std::uint64_t>(927531),
+              "own: hf 17, Z_A 2,000,000 -> 10,000 outputs, 927,531");
+        check(pb::blob_cap_own(16, l16, 2000000, 625000) == std::optional<std::uint64_t>(43 + 89 + 49997 * 40 + 27392 + 2),
+              "own: hf 16, Z_A 2,000,000 -> 49,997 outputs");
+        check(pb::blob_cap_own(16, l16, 50, 50) == std::optional<std::uint64_t>(43 + 89 + 40 + 0 + 1),
+              "own: Z below OVH -> one output, no transactions");
+        check(!pb::blob_cap_own(16, pb::CoinbaseLayout{89, 0}, 300000, 300000).has_value(), "own: OUT 0 gives no value");
+        check(!pb::blob_cap_own(16, l16, UINT64_MAX, 300000).has_value(), "own: Z_A outside the domain gives no value");
+        check(!pb::blob_cap_own(16, l16, 300000, UINT64_MAX).has_value(), "own: Z_P outside the domain gives no value");
+        check(!pb::blob_cap_own(16, pb::CoinbaseLayout{UINT64_MAX, 40}, 300000, 300000).has_value(),
+              "own: OVH outside the domain gives no value");
+        const std::optional<std::uint64_t> c_big = pb::blob_cap_own(16, l16, 600000, 600000);
+        check(c_big && *c_big > *c16, "own: grows with Z");
+
+        // context block
+        const std::optional<std::uint64_t> x16 = pb::blob_cap_ctx(16, 300000);
+        const std::optional<std::uint64_t> x17 = pb::blob_cap_ctx(17, 625000);
+        check(x16 && *x16 == 600051, "ctx: Z 300,000 -> 50 + 600,000 + 1 = 600,051");
+        check(x17 && *x17 == 1250084, "ctx: hf 17, Z 625,000 -> 50 + 1,250,000 + 1 + 33 = 1,250,084");
+        const std::uint64_t foreign = pb::kMoneroHeaderMaxBytes + 500000 + pb::varint_len(0);
+        check(foreign <= *x16 && foreign > *c16, "a 500,000 B miner tx at Z 300,000: inside the ctx cap, above the own cap");
+        check(*x16 >= *c16 && *x17 >= *c17, "ctx cap >= own cap at the same Z");
+        check(!pb::blob_cap_ctx(16, UINT64_MAX).has_value(), "ctx: Z outside the domain gives no value");
+        check(pb::blob_cap_ctx(16, (UINT64_MAX - 51) / 2).has_value(), "ctx: largest Z in the domain");
     }
 
     // (4) receipt cap

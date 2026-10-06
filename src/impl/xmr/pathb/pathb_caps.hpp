@@ -8,13 +8,18 @@
 // Path B derived caps and horizons. Every value is a formula over Monero
 // symbols and lane parameters:
 //
-//   w_min        = weight of the smallest valid non-coinbase transaction      (1,459 at hf 16)
+//   w_min        = weight of the smallest valid non-coinbase transaction      (1,459 at hf 16 and 17)
 //   X(hf)        = 0, or kFcmpContentHashExtraLeaves from HF_VERSION_FCMP_PLUS_PLUS
 //   D_max(hf, A) = floor(log2(X(hf) + 1 + floor(2 x SURGE(hf) x max(zone(hf), Z_lt(A)) / w_min)))
 //   RECEIPT_CAP  = RECEIPT_MAX(D_max) = 497 + 32 D_max                       (945 at v16, 881 at v17)
 //                  (a local buffer bound; a body is judged by the size rules below)
 //   size rules   : tx_count - 1 <= floor(2 Z(P_r) / w_min); D == floor(log2(tx_count + X(hf)))
-//   blob_cap(Z)  = HDR_max + OVH + floor((Z - OVH) / OUT) x OUT + 32 n + V(n), n = floor(2 Z / w_min)
+//   blob_cap_own(hf, Z_A, Z_P) = HDR_max + OVH + N_max x OUT + 32 n + V(n) + TRAILER(hf)
+//                  N_max = max(1, floor((Z_A - OVH) / OUT)), <= FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS from hf 17
+//                  n = floor(2 Z_P / w_min)                          (313,166 at v16, 652,401 at v17)
+//   blob_cap_ctx(hf, Z) = HDR_ctx + 2 Z + V(0) + TRAILER(hf)       (600,051 at v16, 1,250,084 at v17)
+//                  HDR_ctx = major, minor, timestamp varints at their type bounds + prev_id + nonce (50)
+//                  TRAILER(hf) = 0; from HF_VERSION_FCMP_PLUS_PLUS n_tree_layers u8 + tree_root 32 (33)
 //   J            = max(P_heal x 3600 / T, F x 120 / T + D_fin)                 (1,164)
 //   index_horizon   = F + Fresh + 1                                            (99)
 //   backfill        = max(F x 120 / T + D_fin, J)                              (1,164)
@@ -159,21 +164,59 @@ inline constexpr SizeRule receipt_size_rules(std::uint8_t hf, std::uint64_t z_pa
 }
 
 // ---------------------------------------------------------------------------
-// Block blob cap (found block and context block)
+// Block blob caps
+//   block blob = header | miner_tx | varint n | n x tx hash | TRAILER(hf)
 // ---------------------------------------------------------------------------
+// Block fields after the tx hashes from HF_VERSION_FCMP_PLUS_PLUS (FCMP++
+// branch cryptonote_basic.h, block serialization): fcmp_pp_n_tree_layers (u8)
+// and fcmp_pp_tree_root (32).
+inline constexpr std::uint64_t kFcmpTreeLayersBytes = kU8Bytes;
+
+inline constexpr std::uint64_t block_trailer_bytes(std::uint8_t hf) noexcept {
+    return hf >= HF_VERSION_FCMP_PLUS_PLUS ? kFcmpTreeLayersBytes + kHashBytes : 0;
+}
+
+// HDR_ctx: Monero block_header serialization with each varint at its type
+// bound (major u8, minor u8, timestamp u64), prev_id, nonce.
+inline constexpr std::uint64_t kMoneroHeaderMaxBytes = varint_len(UINT8_MAX) + varint_len(UINT8_MAX)
+                                                       + varint_len(UINT64_MAX) + kHashBytes + kHeaderNonceBytes;
+
+// N_min (N rule): one coinbase output.
+inline constexpr std::uint64_t kCoinbaseMinOutputs = 1;
+
 // Coinbase layout of the hf: bytes outside the outputs and bytes per output.
 struct CoinbaseLayout {
     std::uint64_t ovh = 0;  // OVH(hf)
     std::uint64_t out = 0;  // OUT(hf, S)
 };
 
-// blob_cap(Z); nullopt when OUT is zero or Z is outside the u64 domain of the formula.
-inline constexpr std::optional<std::uint64_t> blob_cap(const CoinbaseLayout& l, std::uint64_t z) noexcept {
-    if (l.out == 0) return std::nullopt;
-    if (z > UINT64_MAX / (kBlockWeightLimitPerMedian * kHashBytes)) return std::nullopt;
-    const std::uint64_t n_out = z > l.ovh ? (z - l.ovh) / l.out : 0;
-    const std::uint64_t n_tx = max_tx_count(z);
-    return kHashingHeaderMaxBytes + l.ovh + n_out * l.out + kHashBytes * n_tx + varint_len(n_tx);
+// Domain of a zone in the cap formulas.
+inline constexpr std::uint64_t kZoneDomainMax = UINT64_MAX / (kBlockWeightLimitPerMedian * kHashBytes);
+
+// Own found block (built from a lane template):
+//   blob_cap_own = HDR_max + OVH + N_max x OUT + 32 n + V(n) + TRAILER(hf)
+//   N_max = max(1, floor((Z_A - OVH) / OUT)), at most FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS from hf 17
+//   n     = floor(2 Z_P / w_min)
+//   Z_A: the zone the template's N rule read (A_t of its tip); Z_P: the zone at the block's parent.
+// nullopt when OUT is zero or an input is outside the domain of the formula.
+inline constexpr std::optional<std::uint64_t> blob_cap_own(std::uint8_t hf, const CoinbaseLayout& l,
+                                                           std::uint64_t z_a, std::uint64_t z_p) noexcept {
+    if (l.out == 0 || l.ovh > UINT32_MAX || l.out > UINT32_MAX) return std::nullopt;
+    if (z_a > kZoneDomainMax || z_p > kZoneDomainMax) return std::nullopt;
+    std::uint64_t n_out = std::max(z_a > l.ovh ? (z_a - l.ovh) / l.out : 0, kCoinbaseMinOutputs);
+    if (hf >= HF_VERSION_FCMP_PLUS_PLUS) n_out = std::min(n_out, FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS);
+    const std::uint64_t n_tx = max_tx_count(z_p);
+    return kHashingHeaderMaxBytes + l.ovh + n_out * l.out + kHashBytes * n_tx + varint_len(n_tx)
+           + block_trailer_bytes(hf);
+}
+
+// Context block (any Monero block), Z = the effective median for a child of its parent:
+//   blob_cap_ctx = HDR_ctx + 2 Z + V(0) + TRAILER(hf)
+// nullopt when Z is outside the u64 domain of the formula.
+inline constexpr std::optional<std::uint64_t> blob_cap_ctx(std::uint8_t hf, std::uint64_t z) noexcept {
+    const std::uint64_t fixed = kMoneroHeaderMaxBytes + varint_len(0) + block_trailer_bytes(hf);
+    if (z > (UINT64_MAX - fixed) / kBlockWeightLimitPerMedian) return std::nullopt;
+    return fixed + kBlockWeightLimitPerMedian * z;
 }
 
 // ---------------------------------------------------------------------------
