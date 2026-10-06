@@ -11,7 +11,14 @@
 //   w_min        = weight of the smallest valid non-coinbase transaction      (1,459 at hf 16 and 17)
 //   X(hf)        = 0, or kFcmpContentHashExtraLeaves from HF_VERSION_FCMP_PLUS_PLUS
 //   D_max(hf, A) = floor(log2(X(hf) + 1 + floor(2 x SURGE(hf) x max(zone(hf), Z_lt(A)) / w_min)))
-//   RECEIPT_CAP  = RECEIPT_MAX(D_max) = 465 + 32 D_max                       (913 at v16, 849 at v17)
+//   consensus caps (K18), at the receipt's own P_r (admission; above: STRIKE):
+//     RECEIPT_CAP(hf, P_r) = RECEIPT_MAX(D_max(hf, P_r)) = 465 + 32 D_max      (913 at v16, 849 at v17)
+//     FRAME_CAP = FH + 1 + 1 + (1 + R_MAX) x RECEIPT_CAP                       (15,529 at v16, 14,441 at v17)
+//   I/O buffers (P-10, P-11), at the node's view; longer input: OverCap (drop, no verdict):
+//     receipt buffer = RECEIPT_MAX(D_max(hf, P_view) + 1)                      (945 at v16, 881 at v17)
+//     frame buffer   = FH + 1 + 1 + (1 + R_MAX) x receipt buffer               (16,073 at v16, 14,985 at v17)
+//     check_relay_buffers: receipt buffer >= RECEIPT_MAX(D_max(hf, P_view) + 1) and
+//                          frame buffer >= the matching frame size; raise only
 //   size rules   : tx_count - 1 <= floor(2 Z(P_r) / w_min); D == floor(log2(tx_count + X(hf)))
 //   blob_cap_own(hf, Z_A, Z_P) = HDR_max + OVH + N_max x OUT + 32 n + V(n) + TRAILER(hf)
 //                  N_max = max(1, floor((Z_A - OVH) / OUT)), <= FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS from hf 17
@@ -133,11 +140,68 @@ inline constexpr std::optional<std::uint64_t> d_max(std::uint8_t hf, std::uint64
     return floor_log2(tree_extra_leaves(hf) + kMinerTxLeaves + n_tx);
 }
 
-// RECEIPT_CAP(hf, A) = RECEIPT_MAX(D_max(hf, A)).
+// RECEIPT_CAP(hf, P_r) = RECEIPT_MAX(D_max(hf, Z_lt(P_r))) (K18, consensus).
 inline constexpr std::optional<std::uint64_t> receipt_cap(std::uint8_t hf, std::uint64_t z_lt) noexcept {
     const std::optional<std::uint64_t> d = d_max(hf, z_lt);
     if (!d) return std::nullopt;
     return receipt_max(*d);
+}
+
+// FRAME_CAP = FH + 1 + 1 + (1 + R_MAX) x RECEIPT_CAP, at the largest receipt cap
+// among the frame's bodies (K18, consensus).
+inline constexpr std::uint64_t frame_cap(std::uint64_t receipt_cap_bytes, std::uint64_t r_max) noexcept {
+    return frame_size(receipt_cap_bytes, r_max);
+}
+
+// Admission: a body length against RECEIPT_CAP at the receipt's own P_r;
+// false (above the cap, or Z_lt outside the domain) is STRIKE.
+inline constexpr bool within_receipt_cap(std::uint8_t hf, std::uint64_t z_lt_pr, std::uint64_t body_bytes) noexcept {
+    const std::optional<std::uint64_t> cap = receipt_cap(hf, z_lt_pr);
+    return cap.has_value() && body_bytes <= *cap;
+}
+
+// ---------------------------------------------------------------------------
+// I/O buffers (P-10, P-11) at the node's Monero view
+// ---------------------------------------------------------------------------
+// Depth levels of the receipt buffer above D_max(hf, P_view).
+inline constexpr std::uint64_t kBufferDepthMargin = 1;
+
+struct RelayBuffers {
+    std::uint64_t receipt = 0;  // P-10, bytes
+    std::uint64_t frame = 0;    // P-11, bytes
+
+    friend bool operator==(const RelayBuffers&, const RelayBuffers&) = default;
+};
+
+// Default buffers: RECEIPT_MAX(D_max(hf, P_view) + 1) and its frame size.
+inline constexpr std::optional<RelayBuffers> relay_buffers_default(std::uint8_t hf, std::uint64_t z_lt_view,
+                                                                   std::uint64_t r_max) noexcept {
+    const std::optional<std::uint64_t> d = d_max(hf, z_lt_view);
+    if (!d) return std::nullopt;
+    const std::uint64_t receipt = receipt_max(*d + kBufferDepthMargin);
+    return RelayBuffers{receipt, frame_size(receipt, r_max)};
+}
+
+enum class BufferCheck : std::uint8_t { Ok, ReceiptBelowMinimum, FrameBelowMinimum, ViewOutOfDomain };
+
+// Start-up check, re-run at each change of the view's hf or Z_lt: a buffer
+// below the default is refused.
+inline constexpr BufferCheck check_relay_buffers(std::uint8_t hf, std::uint64_t z_lt_view, std::uint64_t r_max,
+                                                 const RelayBuffers& configured) noexcept {
+    const std::optional<RelayBuffers> need = relay_buffers_default(hf, z_lt_view, r_max);
+    if (!need) return BufferCheck::ViewOutOfDomain;
+    if (configured.receipt < need->receipt) return BufferCheck::ReceiptBelowMinimum;
+    if (configured.frame < need->frame) return BufferCheck::FrameBelowMinimum;
+    return BufferCheck::Ok;
+}
+
+// Codec limits from configured buffers.
+inline constexpr ReceiptLimits receipt_limits(const RelayBuffers& b) noexcept {
+    return ReceiptLimits{b.receipt};
+}
+
+inline constexpr CarrierLimits carrier_limits(const RelayBuffers& b, std::uint64_t r_max) noexcept {
+    return CarrierLimits{b.receipt, r_max};
 }
 
 // Largest non-coinbase transaction count a block of median Z can carry.

@@ -82,9 +82,10 @@ pb::WireError dec_side(const std::vector<std::uint8_t>& b) {
     return pb::decode_side_data_v3(b.data(), b.size(), s);
 }
 
-pb::WireError dec_body(const std::vector<std::uint8_t>& b, std::uint64_t cap_depth) {
+// Decode with a receipt buffer of RECEIPT_MAX(buffer_depth).
+pb::WireError dec_body(const std::vector<std::uint8_t>& b, std::uint64_t buffer_depth) {
     pb::ReceiptBodyV3 r;
-    return pb::decode_receipt_body_v3(b.data(), b.size(), pb::ReceiptLimits{cap_depth}, r);
+    return pb::decode_receipt_body_v3(b.data(), b.size(), pb::ReceiptLimits{pb::receipt_max(buffer_depth)}, r);
 }
 
 // Offset of payee_ref in an encoded body.

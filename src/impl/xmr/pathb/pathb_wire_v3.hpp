@@ -45,18 +45,20 @@
 //   FH | carrier body
 //   FH = u8 opcode | u8 frame version | u32 chain_id
 //        (the frame header of src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp)
-//   FRAME_CAP = FH + carrier_body_cap
+//   frame_size(receipt bytes) = FH + 1 + 1 + (1 + R_MAX) x receipt bytes
+//   (the I/O buffers and the consensus caps of pathb_caps.hpp)
 //
 // Decoder outcomes:
-//   OverCap   the input is longer than the local buffer bound for the given
-//             limits (RECEIPT_MAX(cap_depth), carrier_body_cap); checked before
-//             parsing; the object is dropped without a verdict.
+//   OverCap   the input is longer than the I/O buffer of the given limits
+//             (receipt buffer, carrier_body_size at the receipt buffer);
+//             checked before parsing; the object is dropped without a
+//             verdict.
 //   any other error: the bytes are refused (truncation, trailing bytes, a
 //             field outside its width or range, a count above its limit
 //             before any allocation, a non-canonical varint).
 // A body is accepted only when its length equals the sum of its fields for its
-// own D and p. The depth itself is judged against the receipt's Monero branch
-// (receipt_size_rules in pathb_caps.hpp), not against cap_depth.
+// own D and p. The depth and the consensus cap are judged against the
+// receipt's Monero branch (pathb_caps.hpp), not against the buffer.
 // Encoders refuse a value the decoder would refuse, so decode(encode(x)) == x
 // and encode(decode(b)) == b for every accepted b.
 // ---------------------------------------------------------------------------
@@ -376,7 +378,7 @@ inline constexpr std::uint64_t receipt_max(std::uint64_t depth) noexcept {
 }
 
 struct ReceiptLimits {
-    std::uint64_t cap_depth = 0;  // D_max(hf, Z_lt(best tip)): buffer bound RECEIPT_MAX(cap_depth)
+    std::uint64_t buffer = 0;  // receipt I/O buffer, bytes (P-10)
 };
 
 // True for the buffer-bound outcome (drop without a verdict).
@@ -504,7 +506,7 @@ inline WireError read_receipt_body_v3(BlobReader& r, ReceiptBodyV3& out) {
 
 inline WireError decode_receipt_body_v3(const std::uint8_t* data, std::size_t n, const ReceiptLimits& lim,
                                         ReceiptBodyV3& out) {
-    if (n > receipt_max(lim.cap_depth)) return WireError::OverCap;
+    if (n > lim.buffer) return WireError::OverCap;
     BlobReader r(data, n);
     if (WireError e = read_receipt_body_v3(r, out); e != WireError::None) return e;
     if (r.remaining() != 0) return WireError::Trailing;
@@ -541,13 +543,19 @@ struct CarrierBodyV3 {
 };
 
 struct CarrierLimits {
-    std::uint64_t cap_depth = 0;  // D_max(hf, Z_lt(best tip))
-    std::uint64_t r_max = 0;      // K08
+    std::uint64_t receipt_buffer = 0;  // receipt I/O buffer, bytes (P-10)
+    std::uint64_t r_max = 0;           // K08
 };
 
-// Buffer bound of a carrier body: ver + own + n_carried + R_MAX carried, each at RECEIPT_MAX(cap_depth).
-inline constexpr std::uint64_t carrier_body_cap(const CarrierLimits& lim) noexcept {
-    return kU8Bytes + receipt_max(lim.cap_depth) + kU8Bytes + lim.r_max * receipt_max(lim.cap_depth);
+// Carrier body of an own and R_MAX carried bodies of `receipt_bytes` each:
+// ver + own + n_carried + R_MAX carried.
+inline constexpr std::uint64_t carrier_body_size(std::uint64_t receipt_bytes, std::uint64_t r_max) noexcept {
+    return kU8Bytes + receipt_bytes + kU8Bytes + r_max * receipt_bytes;
+}
+
+// The carrier body buffer of the limits.
+inline constexpr std::uint64_t carrier_body_buffer(const CarrierLimits& lim) noexcept {
+    return carrier_body_size(lim.receipt_buffer, lim.r_max);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,9 +567,14 @@ inline constexpr std::size_t kFrameVersionBytes = kU8Bytes;
 inline constexpr std::size_t kFrameChainIdBytes = kU32Bytes;
 inline constexpr std::size_t kFrameHeaderBytes = kFrameOpcodeBytes + kFrameVersionBytes + kFrameChainIdBytes;
 
-// FRAME_CAP: buffer bound of a carrier frame, FH + carrier_body_cap.
-inline constexpr std::uint64_t frame_cap(const CarrierLimits& lim) noexcept {
-    return kFrameHeaderBytes + carrier_body_cap(lim);
+// FH + carrier_body_size(receipt_bytes, r_max).
+inline constexpr std::uint64_t frame_size(std::uint64_t receipt_bytes, std::uint64_t r_max) noexcept {
+    return kFrameHeaderBytes + carrier_body_size(receipt_bytes, r_max);
+}
+
+// The frame I/O buffer of the limits (P-11).
+inline constexpr std::uint64_t frame_buffer(const CarrierLimits& lim) noexcept {
+    return frame_size(lim.receipt_buffer, lim.r_max);
 }
 
 inline WireError encode_carrier_body_v3(const CarrierBodyV3& c, std::uint64_t r_max, std::vector<std::uint8_t>& out) {
@@ -578,7 +591,7 @@ inline WireError encode_carrier_body_v3(const CarrierBodyV3& c, std::uint64_t r_
 
 inline WireError decode_carrier_body_v3(const std::uint8_t* data, std::size_t n, const CarrierLimits& lim,
                                         CarrierBodyV3& out) {
-    if (n > carrier_body_cap(lim)) return WireError::OverCap;
+    if (n > carrier_body_buffer(lim)) return WireError::OverCap;
     BlobReader r(data, n);
     std::uint8_t ver = 0;
     if (!r.read_byte(ver)) return WireError::Truncated;

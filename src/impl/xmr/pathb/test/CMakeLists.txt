@@ -4,7 +4,8 @@
 #
 #   v37_xmr_side_data_v3_kat         side_data_v3 layout, golden bytes, mm_root, refusals,
 #                                    ratchet state S and the receipts_root fold
-#   v37_xmr_pathb_body_v3_kat        receipt and carrier body codecs, caps, mutation pass
+#   v37_xmr_pathb_body_v3_kat        receipt and carrier body codecs, I/O buffers, consensus
+#                                    caps, check_relay_buffers, mutation pass
 #   v37_xmr_pathb_pbx1_kat           PBX1 tx_extra forms and refusals
 #   v37_xmr_relay_horizons_kat       horizons, J, blob_cap, w_min, D_max, RECEIPT_CAP
 #   v37_xmr_pathb_branch_kat         window inputs on the branch of prev_id(tip)

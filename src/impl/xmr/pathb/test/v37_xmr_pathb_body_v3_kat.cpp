@@ -9,11 +9,16 @@
 //   (1) RECEIPT_MAX(D) = 465 + 32 D (721 / 913 / 977 at D 8 / 14 / 16;
 //       399 + 32 D without owner_ref); the largest body encodes to exactly
 //       RECEIPT_MAX(D);
-//   (2) buffer bound and size rules: a body of RECEIPT_MAX(D_max) accepted,
-//       one byte more dropped without a verdict (OverCap); a body of depth
-//       D_max + 1 inside the buffer is accepted by the codec; D_max boundary:
-//       two nodes with D_max 14 / 15 and a body of D 15 valid for its P_r ->
-//       one drops it without a verdict, both judge the size rules the same;
+//   (2) I/O buffer, consensus cap and size rules: the receipt buffer is
+//       RECEIPT_MAX(D_max + 1) = 945 at v16 (881 at v17): a body of 945 B
+//       accepted by the codec, one byte more dropped without a verdict
+//       (OverCap); the consensus cap RECEIPT_CAP = RECEIPT_MAX(D_max) = 913 at
+//       the receipt's own P_r: 913 B within, 914 B and the D 15 body above it
+//       (strike) at Z_lt 300,000; D_max boundary: two nodes with D_max 14 / 15
+//       and a body of D 15 valid for its P_r -> neither drops it, both judge
+//       the size rules and the cap at P_r the same; check_relay_buffers
+//       refuses a receipt buffer of 944 / a frame buffer of 16,072 and accepts
+//       the defaults and raised values;
 //       D != floor(log2(tx_count + X)) refused at v16 and v17 (X 0 / 2);
 //       tx_count - 1 above floor(2 Z / w_min) refused; blob_len 79 / 71 refused;
 //   (3) hashing blob: field wider than declared refused (both directions),
@@ -23,14 +28,15 @@
 //       re-encodes to the same bytes;
 //   (6) carrier body: 0 and R_MAX carried round trip; R_MAX + 1 refused by
 //       encoder and decoder (before allocation); version != 3 refused; the
-//       largest carrier body equals carrier_body_cap, one byte more refused;
+//       largest carrier body at the buffer equals carrier_body_buffer
+//       (2 + 17 x 945), one byte more refused;
 //       trailing bytes refused; counts above the remaining bytes refused
 //       without allocation;
 //   (7) carrier frame: FH = 6 (u8 opcode | u8 frame version | u32 chain_id),
 //       the header of the relay frames in xmr_relay_wire.hpp (FB_RECEIPTS
 //       header = FH + count byte, FB_CTX header = FH + id + length, FB_GETCTX
-//       bytes); FRAME_CAP = FH + carrier_body_cap = 15,529 at D_max 14,
-//       R_MAX 16 (14,441 at v17).
+//       bytes); frame buffer = FH + 2 + 17 x 945 = 16,073 (14,985 at v17);
+//       consensus FRAME_CAP = FH + 2 + 17 x 913 = 15,529 (14,441 at v17).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -48,9 +54,11 @@ namespace relay = ::c2pool::v37n::xmr::relay;
 
 namespace {
 
-pb::WireError dec(const std::vector<std::uint8_t>& b, std::uint64_t cap_depth, pb::ReceiptBodyV3* out = nullptr) {
+// Decode with a receipt buffer of RECEIPT_MAX(buffer_depth).
+pb::WireError dec(const std::vector<std::uint8_t>& b, std::uint64_t buffer_depth, pb::ReceiptBodyV3* out = nullptr) {
     pb::ReceiptBodyV3 r;
-    pb::WireError e = pb::decode_receipt_body_v3(b.data(), b.size(), pb::ReceiptLimits{cap_depth}, r);
+    pb::WireError e =
+            pb::decode_receipt_body_v3(b.data(), b.size(), pb::ReceiptLimits{pb::receipt_max(buffer_depth)}, r);
     if (out) *out = r;
     return e;
 }
@@ -102,42 +110,84 @@ int main() {
         check(full[0] == 78, "largest hashing blob 78 B at D " + std::to_string(d));
     }
 
-    // (2) caps at D_max(16, today) = 14
+    // (2) I/O buffer and consensus cap at D_max(16, today) = 14
     const std::uint64_t dmax = pb::d_max(16, 0).value_or(0);
     check(dmax == 14, "D_max(v16, zone) = 14");
+    const pb::RelayBuffers buf16 = pb::relay_buffers_default(16, 0, pb::kRuledLaneParams.r_max).value_or(pb::RelayBuffers{});
+    const pb::RelayBuffers buf17 = pb::relay_buffers_default(17, 0, pb::kRuledLaneParams.r_max).value_or(pb::RelayBuffers{});
+    check(buf16.receipt == 945 && buf16.frame == 16073, "buffers v16: RECEIPT_MAX(15) = 945, 6 + 2 + 17 x 945 = 16,073");
+    check(buf17.receipt == 881 && buf17.frame == 14985, "buffers v17: RECEIPT_MAX(13) = 881, 6 + 2 + 17 x 881 = 14,985");
+    check(pb::receipt_cap(16, 0) == std::optional<std::uint64_t>(913) && pb::receipt_cap(17, 0) == std::optional<std::uint64_t>(849),
+          "consensus RECEIPT_CAP 913 (v16) / 849 (v17)");
     {
+        const pb::ReceiptLimits lim = pb::receipt_limits(buf16);
+        pb::ReceiptBodyV3 got;
+        const std::vector<std::uint8_t> at_buf = enc(make_max_body(dmax + 1, true));
+        check(at_buf.size() == 945, "largest D 15 body is 945 B");
+        check(pb::decode_receipt_body_v3(at_buf.data(), at_buf.size(), lim, got) == pb::WireError::None,
+              "body of the receipt buffer (945 B) accepted by the codec");
+        std::vector<std::uint8_t> plus1 = at_buf;
+        plus1.push_back(0);
+        check(pb::decode_receipt_body_v3(plus1.data(), plus1.size(), lim, got) == pb::WireError::OverCap
+                      && pb::wire_drop_without_verdict(pb::WireError::OverCap),
+              "receipt buffer + 1 byte dropped without a verdict");
+        const std::vector<std::uint8_t> d16 = enc(make_max_body(dmax + 2, false));
+        check(d16.size() <= pb::receipt_max(dmax + 1) && dec(d16, dmax + 1) == pb::WireError::None,
+              "a D 16 body without owner_ref inside the buffer: accepted by the codec");
+
+        // consensus cap at the receipt's own P_r
         const std::vector<std::uint8_t> at_cap = enc(make_max_body(dmax, true));
         check(at_cap.size() == 913, "body at RECEIPT_MAX(D_max) is 913 B");
-        check(dec(at_cap, dmax) == pb::WireError::None, "body of RECEIPT_MAX(D_max) accepted");
-        std::vector<std::uint8_t> plus1 = at_cap;
-        plus1.push_back(0);
-        check(dec(plus1, dmax) == pb::WireError::OverCap && pb::wire_drop_without_verdict(pb::WireError::OverCap),
-              "RECEIPT_MAX(D_max) + 1 byte dropped without a verdict");
+        check(pb::within_receipt_cap(16, 300000, at_cap.size()) && !pb::within_receipt_cap(16, 300000, at_cap.size() + 1),
+              "RECEIPT_CAP at P_r (Z_lt 300,000): 913 B within, 914 B above (strike)");
+        check(!pb::within_receipt_cap(16, 300000, at_buf.size()) && pb::within_receipt_cap(16, 478071, at_buf.size()),
+              "the 945 B D 15 body: above the cap at Z_lt 300,000, within it at Z_lt 478,071");
+        check(!pb::within_receipt_cap(16, UINT64_MAX, 1), "Z_lt outside the domain: not within the cap");
+        check(pb::within_receipt_cap(17, 0, 849) && !pb::within_receipt_cap(17, 0, 850), "v17: RECEIPT_CAP 849");
 
         const std::vector<std::uint8_t> small = enc(make_body(2, false, 9));
         std::vector<std::uint8_t> small_plus = small;
         small_plus.push_back(0);
-        check(dec(small_plus, dmax) == pb::WireError::Trailing, "trailing byte refused");
-
-        const std::vector<std::uint8_t> deep = enc(make_body(dmax + 1, false, 3));
-        check(deep.size() <= pb::receipt_max(dmax), "depth D_max + 1 body fits the buffer bound");
-        check(dec(deep, dmax) == pb::WireError::None, "depth D_max + 1 inside the buffer: accepted by the codec");
+        check(dec(small_plus, dmax + 1) == pb::WireError::Trailing, "trailing byte refused");
 
         // D_max boundary: nodes with Z_lt 300,000 (D_max 14) and 478,071 (D_max 15)
         const std::uint64_t dmax_a = pb::d_max(16, 300000).value_or(0);
         const std::uint64_t dmax_b = pb::d_max(16, 478071).value_or(0);
         check(dmax_a == 14 && dmax_b == 15, "two nodes: D_max 14 and 15");
+        const pb::RelayBuffers buf_a =
+                pb::relay_buffers_default(16, 300000, pb::kRuledLaneParams.r_max).value_or(pb::RelayBuffers{});
+        const pb::RelayBuffers buf_b =
+                pb::relay_buffers_default(16, 478071, pb::kRuledLaneParams.r_max).value_or(pb::RelayBuffers{});
+        check(buf_a.receipt == 945 && buf_b.receipt == 977, "their buffers: 945 and 977");
         pb::ReceiptBodyV3 d15 = make_max_body(15, true);
         d15.blob.tx_count = 32768;  // floor(log2(32,768)) = 15
         const std::uint64_t z_pr = 24000000;
+        const std::uint64_t z_lt_pr = 478071;
         const std::vector<std::uint8_t> e15 = enc(d15);
         check(e15.size() == pb::receipt_max(15), "D 15 body of RECEIPT_MAX(15)");
-        const pb::WireError va = dec(e15, dmax_a);
-        const pb::WireError vb = dec(e15, dmax_b);
-        check(va == pb::WireError::OverCap && pb::wire_drop_without_verdict(va), "node D_max 14: dropped without a verdict");
-        check(vb == pb::WireError::None, "node D_max 15: accepted by the codec");
-        check(pb::receipt_size_rules(16, z_pr, d15.blob.tx_count, d15.branch.size()) == pb::SizeRule::Ok,
-              "size rules on the receipt's own P_r: the same verdict on both nodes");
+        const pb::WireError va = pb::decode_receipt_body_v3(e15.data(), e15.size(), pb::receipt_limits(buf_a), got);
+        const pb::WireError vb = pb::decode_receipt_body_v3(e15.data(), e15.size(), pb::receipt_limits(buf_b), got);
+        check(va == pb::WireError::None && vb == pb::WireError::None, "neither node drops the D 15 body");
+        check(pb::receipt_size_rules(16, z_pr, d15.blob.tx_count, d15.branch.size()) == pb::SizeRule::Ok
+                      && pb::within_receipt_cap(16, z_lt_pr, e15.size()),
+              "size rules and the cap on the receipt's own P_r: the same verdict on both nodes");
+
+        // start-up check
+        const std::uint64_t r_max = pb::kRuledLaneParams.r_max;
+        check(pb::check_relay_buffers(16, 0, r_max, buf16) == pb::BufferCheck::Ok, "defaults pass check_relay_buffers");
+        check(pb::check_relay_buffers(16, 0, r_max, pb::RelayBuffers{944, 16073}) == pb::BufferCheck::ReceiptBelowMinimum,
+              "receipt buffer 944 refused");
+        check(pb::check_relay_buffers(16, 0, r_max, pb::RelayBuffers{945, 16072}) == pb::BufferCheck::FrameBelowMinimum,
+              "frame buffer 16,072 refused");
+        check(pb::check_relay_buffers(16, 0, r_max, pb::RelayBuffers{913, 15529}) == pb::BufferCheck::ReceiptBelowMinimum,
+              "buffers at the consensus caps (913 / 15,529) refused");
+        check(pb::check_relay_buffers(16, 0, r_max, pb::RelayBuffers{2000, 40000}) == pb::BufferCheck::Ok,
+              "raised buffers accepted");
+        check(pb::check_relay_buffers(16, 478071, r_max, buf16) == pb::BufferCheck::ReceiptBelowMinimum,
+              "re-run after the view moves to D_max 15: the old 945 B buffer refused");
+        check(pb::check_relay_buffers(17, 0, r_max, buf17) == pb::BufferCheck::Ok, "v17 defaults pass");
+        check(pb::check_relay_buffers(16, UINT64_MAX, r_max, buf16) == pb::BufferCheck::ViewOutOfDomain,
+              "view outside the domain refused");
 
         // size rules
         check(pb::receipt_size_rules(16, 300000, 6, 2) == pb::SizeRule::Ok, "v16: tx_count 6 -> D 2");
@@ -153,13 +203,13 @@ int main() {
 
         std::vector<std::uint8_t> b = small;
         b[0] = 79;
-        check(dec(b, dmax) == pb::WireError::BlobLength, "blob_len 79 refused");
+        check(dec(b, dmax + 1) == pb::WireError::BlobLength, "blob_len 79 refused");
         b[0] = 71;
-        check(dec(b, dmax) == pb::WireError::BlobLength, "blob_len 71 refused");
+        check(dec(b, dmax + 1) == pb::WireError::BlobLength, "blob_len 71 refused");
         b[0] = static_cast<std::uint8_t>(small[0] - 1);
-        check(dec(b, dmax) != pb::WireError::None, "blob_len one short of the fields refused");
+        check(dec(b, dmax + 1) != pb::WireError::None, "blob_len one short of the fields refused");
         b[0] = static_cast<std::uint8_t>(small[0] + 1);
-        check(dec(b, dmax) != pb::WireError::None, "blob_len one over the fields refused");
+        check(dec(b, dmax + 1) != pb::WireError::None, "blob_len one over the fields refused");
     }
 
     // (3) hashing blob field widths and varints
@@ -246,8 +296,8 @@ int main() {
 
     // (6) carrier body
     {
-        const pb::CarrierLimits lim{dmax, pb::kRuledLaneParams.r_max};
-        check(pb::carrier_body_cap(lim) == 1 + 913 + 1 + 16 * 913, "carrier_body_cap = 2 + 17 x 913");
+        const pb::CarrierLimits lim = pb::carrier_limits(buf16, pb::kRuledLaneParams.r_max);
+        check(pb::carrier_body_buffer(lim) == 1 + 945 + 1 + 16 * 945, "carrier_body_buffer = 2 + 17 x 945");
 
         pb::CarrierBodyV3 c0;
         c0.own = make_body(3, true, 1);
@@ -258,11 +308,11 @@ int main() {
         check(dec_carrier(e0, lim, &back) == pb::WireError::None && back == c0, "carrier with 0 carried round trip");
 
         pb::CarrierBodyV3 cmax;
-        cmax.own = make_max_body(dmax, true);
-        for (std::uint64_t i = 0; i < lim.r_max; ++i) cmax.carried.push_back(make_max_body(dmax, true));
+        cmax.own = make_max_body(dmax + 1, true);
+        for (std::uint64_t i = 0; i < lim.r_max; ++i) cmax.carried.push_back(make_max_body(dmax + 1, true));
         std::vector<std::uint8_t> emax;
         check(pb::encode_carrier_body_v3(cmax, lim.r_max, emax) == pb::WireError::None, "carrier with R_MAX carried encodes");
-        check(emax.size() == pb::carrier_body_cap(lim), "largest carrier body equals carrier_body_cap");
+        check(emax.size() == pb::carrier_body_buffer(lim), "largest carrier body equals carrier_body_buffer");
         check(dec_carrier(emax, lim, &back) == pb::WireError::None && back == cmax, "carrier with R_MAX carried round trip");
         std::vector<std::uint8_t> emax1 = emax;
         emax1.push_back(0);
@@ -300,7 +350,7 @@ int main() {
         w.insert(w.end(), own.begin(), own.end());
         check(dec_carrier(w, lim) == pb::WireError::Truncated, "n_carried above the bodies present refused");
 
-        // depth 255 announced with no branch bytes, cap_depth 255: refused before allocation
+        // depth 255 announced with no branch bytes, buffer RECEIPT_MAX(255): refused before allocation
         std::vector<std::uint8_t> d255 = enc(make_body(0, false, 6));
         const std::size_t depth_off = 1 + d255[0] + pb::kExtraNonceBytes;
         d255[depth_off] = 255;
@@ -331,11 +381,15 @@ int main() {
                       && f[3] == 0x0c && f[4] == 0x0b && f[5] == 0x0a,
               "relay frame bytes: opcode | frame version | chain_id little-endian");
 
-        const pb::CarrierLimits lim{dmax, pb::kRuledLaneParams.r_max};
-        check(pb::frame_cap(lim) == pb::kFrameHeaderBytes + pb::carrier_body_cap(lim), "FRAME_CAP = FH + carrier_body_cap");
-        check(pb::frame_cap(lim) == 15529, "FRAME_CAP = 6 + 2 + 17 x 913 = 15,529 at D_max 14, R_MAX 16");
-        const pb::CarrierLimits lim17{pb::d_max(17, 0).value_or(0), pb::kRuledLaneParams.r_max};
-        check(pb::frame_cap(lim17) == 14441, "FRAME_CAP = 6 + 2 + 17 x 849 = 14,441 at v17 (RECEIPT_CAP 849)");
+        const std::uint64_t r_max = pb::kRuledLaneParams.r_max;
+        const pb::CarrierLimits lim = pb::carrier_limits(buf16, r_max);
+        check(pb::frame_buffer(lim) == pb::kFrameHeaderBytes + pb::carrier_body_buffer(lim),
+              "frame buffer = FH + carrier_body_buffer");
+        check(pb::frame_buffer(lim) == 16073 && pb::frame_buffer(lim) == buf16.frame,
+              "frame buffer = 6 + 2 + 17 x 945 = 16,073 at D_max 14, R_MAX 16");
+        check(pb::frame_buffer(pb::carrier_limits(buf17, r_max)) == 14985, "frame buffer = 6 + 2 + 17 x 881 = 14,985 at v17");
+        check(pb::frame_cap(913, r_max) == 15529, "consensus FRAME_CAP = 6 + 2 + 17 x 913 = 15,529");
+        check(pb::frame_cap(849, r_max) == 14441, "consensus FRAME_CAP = 6 + 2 + 17 x 849 = 14,441 at v17");
     }
 
     return finish("v37_xmr_pathb_body_v3_kat");
