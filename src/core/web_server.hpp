@@ -1178,6 +1178,14 @@ public:
     using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
     void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
 
+    /// #946: fill the explorer body fields (coinbase_txid, tx_count) on the
+    /// already-recorded row(s) for this block hash. Fill-only: a known value
+    /// is never overwritten, and an unknown hash is a no-op (no new row).
+    /// Persists any row it changes.
+    void set_found_block_body(const std::string& block_hash,
+                              const std::string& coinbase_txid,
+                              std::optional<uint32_t> tx_count);
+
     /// Retain the block-header field lookups so paths OTHER than the one-shot
     /// startup backfill can re-derive a missing network_difficulty from the
     /// header chain. backfill_block_fields runs exactly once, before the

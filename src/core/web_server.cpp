@@ -19,6 +19,7 @@
 #include <impl/ltc/share_messages.hpp>
 
 #include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
+#include <core/block_body_summary.hpp> // #946 coinbase_txid + tx_count of a submitted block
 #include <core/random.hpp> // core::random::random_float for probabilistic fee
 #include <core/target_utils.hpp> // chain::bits_to_target
 #include <btclibs/util/strencodings.h>  // ParseHex, HexStr
@@ -1895,6 +1896,17 @@ void MiningInterface::mark_block_submitted(const uint256& block_hash)
 
 nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const std::string& request_id)
 {
+    // Every found-block callback goes through here. The callback records the
+    // row from the header alone; the explorer body fields (#946 coinbase_txid,
+    // tx_count) need the full block, which only this function holds, so they
+    // are filled right after the row exists. Body parse failure leaves them null.
+    auto fire_block_submitted = [&](int stale_info) {
+        m_on_block_submitted(hex_data.substr(0, 160), stale_info);
+        if (auto body = core::summarize_block_body(ParseHex(hex_data)))
+            set_found_block_body(Hash(ParseHex(hex_data.substr(0, 160))).GetHex(),
+                                 body->coinbase_txid, body->tx_count);
+    };
+
     LOG_TRACE << "[LTC] submitblock: received " << hex_data.length() / 2 << " bytes";
 
     // Block header is 80 bytes = 160 hex chars minimum
@@ -1976,7 +1988,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 // record_found_block dedups by block hash, so firing at verdict time
                 // is double-record-safe.
                 if (m_on_block_submitted && hex_data.size() >= 160) {
-                    m_on_block_submitted(hex_data.substr(0, 160), 0);
+                    fire_block_submitted(0);
                 }
                 // Relay full block via P2P for fast propagation
                 if (m_on_block_relay) {
@@ -1992,7 +2004,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 // (block already accepted via P2P), which must not be mis-counted.
                 LOG_WARNING << "submitblock: coin daemon rejected the block (or already had it)";
                 if (is_stale && m_on_block_submitted && hex_data.size() >= 160) {
-                    m_on_block_submitted(hex_data.substr(0, 160), 253);
+                    fire_block_submitted(253);
                 }
                 return {{"error", "block rejected by coin daemon"}};
             }
@@ -2001,7 +2013,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             // DOA (RPC transport failure — no verdict). Fire the single callback:
             // 253 for a stale/race block, else 254.
             if (m_on_block_submitted && hex_data.size() >= 160) {
-                m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 254);
+                fire_block_submitted(is_stale ? 253 : 254);
             }
             return {{"error", std::string(e.what())}};
         }
@@ -2052,7 +2064,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         // feedback below). A stale/race block is recorded as ORPHAN (253); a fresh
         // block as WON (0). The block is still relayed via P2P regardless.
         if (m_on_block_submitted && hex_data.size() >= 160)
-            m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 0);
+            fire_block_submitted(is_stale ? 253 : 0);
 
         // Thread the slow parts (P2P relay + RPC) so stratum isn't blocked.
         // P2P relay runs FIRST — fast propagation is critical for block acceptance.
@@ -2087,7 +2099,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         // No verdict and no forward path: a stale/race block is genuinely lost
         // here, so record it as ORPHAN (253) to keep the race visible in metrics.
         if (is_stale && m_on_block_submitted && hex_data.size() >= 160)
-            m_on_block_submitted(hex_data.substr(0, 160), 253);
+            fire_block_submitted(253);
     }
 
     return nullptr; // null = accepted in getblocktemplate spec
@@ -3959,6 +3971,40 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     // duplicates, so twin / replayed notifications never double-reset. Tied to
     // the block-found event, not a timer.
     reset_best_difficulty_round(ts);
+}
+
+void MiningInterface::set_found_block_body(const std::string& block_hash,
+                                           const std::string& coinbase_txid,
+                                           std::optional<uint32_t> tx_count)
+{
+    std::string h = block_hash;
+    for (auto& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::vector<FoundBlock> changed;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (auto& blk : m_found_blocks) {
+            if (blk.hash != h) continue;
+            bool dirty = false;
+            if (blk.coinbase_txid.empty() && !coinbase_txid.empty()) {
+                blk.coinbase_txid = coinbase_txid;
+                dirty = true;
+            }
+            if (!blk.tx_count && tx_count) {
+                blk.tx_count = tx_count;
+                dirty = true;
+            }
+            if (dirty) changed.push_back(blk);
+        }
+    }
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& blk : changed) {
+            try { m_persist_block_fn(blk); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist found-block body fields: " << e.what();
+            }
+        }
+    }
 }
 
 void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn)
