@@ -20,11 +20,18 @@
 //   (RewindVerdict::RebuildRequired).
 //   A carrier whose parent is not held waits (Deferred) and is placed when
 //   the parent is placed.
+//   receipts_root: a carrier's receipts_root must equal
+//     sha256d("c2pool-v37-carry" || carried_root || rs_root(S(parent)))
+//   with carried_root 0 (a carrier here carries nothing); otherwise
+//   FoldMismatch (strike) in place(), after the parent and height checks,
+//   and a failed side header. S(c) = rs_step(S(parent), pos(c), {d(c), ballot(c)})
+//   (pathb_ratchet_state.hpp); genesis S = epoch 0, rules_cur = the genesis
+//   rules digest.
 //   Headers-first: an announced side header weighs its retarget d on the
 //   side chain; it fails on a parent link that does not continue the side
-//   chain, a height below the record of its parent, or a failed PoW at
-//   that d. decide_side_branch (pathb_headers_first.hpp) decides on the
-//   result.
+//   chain, a height below the record of its parent, a receipts_root that
+//   does not fold over the side chain's S, or a failed PoW at that d.
+//   decide_side_branch (pathb_headers_first.hpp) decides on the result.
 //
 // Header-only. Not included by any running component.
 // ---------------------------------------------------------------------------
@@ -45,6 +52,7 @@
 #include "pathb_headers_first.hpp"
 #include "pathb_journal.hpp"
 #include "pathb_params.hpp"
+#include "pathb_ratchet_state.hpp"
 #include "pathb_retarget.hpp"
 
 namespace c2pool::xmr::pathb {
@@ -71,7 +79,9 @@ inline bool fork_choice_prefers(const ChainTip& a, const ChainTip& b) noexcept {
 struct CarrierAnnounce {
     Hash32 id{};
     Hash32 parent{};
-    std::uint64_t h = 0;  // template height
+    std::uint64_t h = 0;       // template height
+    Hash32 receipts_root{};    // side_data_v3 receipts_root
+    std::uint16_t ballot = 0;  // side_data_v3 ballot
 };
 
 struct CarrierNode {
@@ -82,6 +92,9 @@ struct CarrierNode {
     std::uint64_t H = 0;
     std::uint64_t d = 0;
     ::c2pool::xmr::native::U128 cum_work{};
+    Hash32 receipts_root{};
+    std::uint16_t ballot = 0;
+    RatchetState rs{};         // S after this position
     bool verified = false;     // header checks and PoW at d passed
     bool bodies = false;       // bodies held
     bool chain_valid = false;  // verified and bodies on every carrier back to genesis
@@ -89,12 +102,14 @@ struct CarrierNode {
     std::vector<std::size_t> children;
 };
 
-enum class PlaceVerdict : std::uint8_t { Placed, Deferred, Duplicate, NotCarrier };
+enum class PlaceVerdict : std::uint8_t { Placed, Deferred, Duplicate, NotCarrier, FoldMismatch };
 
 struct PlaceOutcome {
     PlaceVerdict verdict = PlaceVerdict::Deferred;
-    std::vector<Hash32> placed;       // this carrier, then the waiting carriers placed behind it, in order
-    std::vector<Hash32> not_carrier;  // waiting carriers with h < H(parent), discarded with their waiting descendants
+    std::vector<Hash32> placed;         // this carrier, then the waiting carriers placed behind it, in order
+    std::vector<Hash32> not_carrier;    // waiting carriers with h < H(parent), discarded with their waiting descendants
+    std::vector<Hash32> fold_mismatch;  // waiting carriers whose receipts_root does not fold (strike), discarded
+                                        // with their waiting descendants
 };
 
 struct SwitchPlan {
@@ -108,12 +123,15 @@ struct SwitchPlan {
 class CarrierTree {
 public:
     // Genesis: position 0, record height genesis_height (at least the newest
-    // inherited record), cum_work 0, verified, bodies held. `inherited`: the
+    // inherited record), cum_work 0, verified, bodies held, S =
+    // genesis_ratchet_state(genesis_rules_digest). `inherited`: the
     // predecessor's carriers, oldest first; the newest N_rt open the window
-    // of position 1. Precondition: retarget_params_valid(p).
+    // of position 1. Preconditions: retarget_params_valid(p),
+    // ratchet_params_valid(rp).
     CarrierTree(const LaneParams& p, const Hash32& genesis_id, std::uint64_t genesis_height,
-                std::span<const RetargetEntry> inherited = {})
-        : p_(p) {
+                std::span<const RetargetEntry> inherited = {}, const RatchetParams& rp = kRuledRatchetParams,
+                const Hash32& genesis_rules_digest = Hash32{})
+        : p_(p), rp_(rp) {
         const std::size_t keep =
                 static_cast<std::size_t>(std::min<std::uint64_t>(inherited.size(), p.retarget_span));
         inherited_.assign(inherited.end() - static_cast<std::ptrdiff_t>(keep), inherited.end());
@@ -122,12 +140,14 @@ public:
         g.parent = genesis_id;
         g.H = inherited_.empty() ? genesis_height : record_height(inherited_.back().H, genesis_height);
         g.h = genesis_height;
+        g.rs = genesis_ratchet_state(genesis_rules_digest);
         g.verified = g.bodies = g.chain_valid = true;
         nodes_.push_back(std::move(g));
         index_.emplace(genesis_id, 0);
     }
 
     const LaneParams& params() const noexcept { return p_; }
+    const RatchetParams& ratchet_params() const noexcept { return rp_; }
     std::size_t size() const noexcept { return index_.size(); }
     std::size_t waiting() const noexcept { return waiting_ids_.size(); }
     const CarrierNode& genesis() const noexcept { return nodes_[0]; }
@@ -154,6 +174,13 @@ public:
         return w->next_difficulty();
     }
 
+    // The receipts_root of a carrier on top of `tip` (carried_root 0).
+    std::optional<Hash32> next_receipts_root(const Hash32& tip) const {
+        const auto it = index_.find(tip);
+        if (it == index_.end()) return std::nullopt;
+        return carrier_receipts_root(kNoCarriedRoot, nodes_[it->second].rs);
+    }
+
     PlaceOutcome place(const CarrierAnnounce& c) {
         PlaceOutcome out;
         if (index_.count(c.id) != 0 || waiting_ids_.count(c.id) != 0) {
@@ -171,6 +198,10 @@ public:
             out.verdict = PlaceVerdict::NotCarrier;
             return out;
         }
+        if (!fold_matches(nodes_[pit->second].rs, c)) {
+            out.verdict = PlaceVerdict::FoldMismatch;
+            return out;
+        }
         out.verdict = PlaceVerdict::Placed;
         place_under(pit->second, c);
         out.placed.push_back(c.id);
@@ -185,6 +216,11 @@ public:
                 waiting_ids_.erase(w.id);
                 if (!carrier_height_admissible(nodes_[pi].H, w.h)) {
                     out.not_carrier.push_back(w.id);
+                    discard_waiting(w.id);
+                    continue;
+                }
+                if (!fold_matches(nodes_[pi].rs, w)) {
+                    out.fold_mismatch.push_back(w.id);
                     discard_waiting(w.id);
                     continue;
                 }
@@ -259,6 +295,8 @@ public:
         RetargetWindow w = window_after_index(fi->second);
         Hash32 prev = fork;
         std::uint64_t prev_record = nodes_[fi->second].H;
+        std::uint64_t pos = nodes_[fi->second].pos;
+        RatchetState rs = nodes_[fi->second].rs;
         bool failed = false;
         std::vector<SideHeader> out;
         out.reserve(headers.size());
@@ -271,12 +309,16 @@ public:
                 continue;
             }
             s.work = w.next_difficulty();
-            if (hdr.parent != prev || !carrier_height_admissible(prev_record, hdr.h) || !pow_ok(hdr, s.work)) {
+            if (hdr.parent != prev || !carrier_height_admissible(prev_record, hdr.h) || !fold_matches(rs, hdr)
+                || !pow_ok(hdr, s.work)) {
                 s.check = HeaderCheck::Failed;
                 failed = true;
             } else {
                 prev_record = record_height(prev_record, hdr.h);
                 w.push(RetargetEntry{s.work, prev_record});
+                ++pos;
+                const RatchetPlacement own{s.work, hdr.ballot};
+                rs = rs_step(rp_, rs, pos, std::span<const RatchetPlacement>(&own, 1));
                 prev = hdr.id;
             }
             out.push_back(s);
@@ -313,6 +355,11 @@ public:
     }
 
 private:
+    // receipts_root of c against S at its parent (carried_root 0).
+    static bool fold_matches(const RatchetState& parent_rs, const CarrierAnnounce& c) {
+        return check_carrier_fold(c.receipts_root, kNoCarriedRoot, parent_rs) == FoldVerdict::Match;
+    }
+
     RetargetWindow window_after_index(std::size_t i) const {
         std::vector<RetargetEntry> rev;
         while (i != 0 && rev.size() < p_.retarget_span) {
@@ -335,6 +382,10 @@ private:
         n.H = record_height(nodes_[pi].H, c.h);
         n.d = window_after_index(pi).next_difficulty();
         n.cum_work = ::c2pool::xmr::native::u128_add(nodes_[pi].cum_work, ::c2pool::xmr::native::U128{n.d, 0});
+        n.receipts_root = c.receipts_root;
+        n.ballot = c.ballot;
+        const RatchetPlacement own{n.d, c.ballot};
+        n.rs = rs_step(rp_, nodes_[pi].rs, n.pos, std::span<const RatchetPlacement>(&own, 1));
         n.parent_index = pi;
         const std::size_t idx = nodes_.size();
         nodes_.push_back(std::move(n));
@@ -391,6 +442,7 @@ private:
     }
 
     LaneParams p_;
+    RatchetParams rp_;
     std::vector<RetargetEntry> inherited_;
     std::vector<CarrierNode> nodes_;           // index 0 = genesis; dropped carriers stay, unindexed
     std::map<Hash32, std::size_t> index_;

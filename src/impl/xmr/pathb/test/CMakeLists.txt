@@ -14,7 +14,7 @@
 #   v37_xmr_pathb_headers_first_kat  side-branch decision from headers
 #   xmr_share_retarget_kat           carrier retarget: formula, widths, scenarios
 #   xmr_carrier_sharechain_kat       carrier fork choice, deferral, switch plans,
-#                                    headers-first over the retarget
+#                                    headers-first over the retarget, receipts_root fold
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by

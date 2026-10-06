@@ -30,7 +30,7 @@
 //   (11) seeded branch race: share 2/5 of 600,000 H/s, every branch carrier
 //        at one height, from lane start, 7 days, 400 runs: the branch's
 //        cumulative work never exceeds the main chain's while the main chain
-//        holds >= J = 1,164 (or >= 120) carriers since the fork at m 9; at
+//        holds >= J = 1,152 (or >= 120) carriers since the fork at m 9; at
 //        m 1 it does in >= 1/8 of the runs;
 //   (12) one value per tip: carriers on one tip at h(tip), +1, +2 get the
 //        same d; d is a function of the record heights only;
@@ -172,6 +172,11 @@ RaceWins race(const pb::LaneParams& p, int trials, std::uint64_t seed, std::uint
         wins.at_j += won_j ? 1 : 0;
     }
     return wins;
+}
+
+// A carrier on a held tip, with the receipts_root it commits there.
+pb::CarrierAnnounce on_tip(const pb::CarrierTree& t, const pb::Hash32& id, const pb::Hash32& tip, std::uint64_t h) {
+    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip).value_or(pb::Hash32{}), 0};
 }
 
 }  // namespace
@@ -383,7 +388,7 @@ int main() {
         for (std::uint64_t i = 1; i <= 40; ++i) {
             pb::Hash32 id = seq32(0x40);
             id[0] = static_cast<std::uint8_t>(i);
-            t.place(pb::CarrierAnnounce{id, tip, 1000 + i / 12});
+            t.place(on_tip(t, id, tip, 1000 + i / 12));
             tip = id;
         }
         const std::uint64_t h_tip = t.find(tip)->h;
@@ -392,7 +397,7 @@ int main() {
         for (std::uint64_t dh = 0; dh <= 2; ++dh) {
             pb::Hash32 id = seq32(0x90);
             id[0] = static_cast<std::uint8_t>(0x90 + dh);
-            same = same && t.place(pb::CarrierAnnounce{id, tip, h_tip + dh}).verdict == pb::PlaceVerdict::Placed
+            same = same && t.place(on_tip(t, id, tip, h_tip + dh)).verdict == pb::PlaceVerdict::Placed
                    && t.find(id)->d == d;
         }
         check(same, "h(tip), +1, +2 on one tip: one d");
@@ -422,7 +427,7 @@ int main() {
             pb::Hash32 id = seq32(0x60);
             id[0] = static_cast<std::uint8_t>(i);
             const std::uint64_t h = pred.back().H + i / 12;
-            cont = cont && lane.place(pb::CarrierAnnounce{id, tip, h}).verdict == pb::PlaceVerdict::Placed
+            cont = cont && lane.place(on_tip(lane, id, tip, h)).verdict == pb::PlaceVerdict::Placed
                    && lane.find(id)->d == pb::retarget(P, joined);
             joined.push_back(pb::RetargetEntry{lane.find(id)->d, lane.find(id)->H});
             tip = id;
