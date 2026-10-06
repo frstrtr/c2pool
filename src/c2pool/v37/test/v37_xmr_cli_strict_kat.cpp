@@ -320,7 +320,7 @@ void compat_rows() {
         {"--relay-max-peers", "8"}, {"--relay-max-inbound", "101"}, {"--relay-discovery", "on"}, {"--relay-discovery", "off"},
         {"--relay-max-outbound", "8"}, {"--relay-max-outbound", "0"}, {"--relay-index-horizon", "64"}, {"--relay-rx-budget", "1,20,16,256"},
         {"--relay-rx-global", "4"}, {"--relay-ban-seconds", "226"},
-        {"--stratum-share-rate", "0.8"}, {"--stratum-submit-burst", "24"}, {"--stratum-ban-seconds", "15"},
+        {"--stratum-share-rate", "12.8"}, {"--stratum-submit-burst", "24"}, {"--stratum-ban-seconds", "2"},
         {"--stratum-share-score", "-3,1,-9,0"}, {"--stratum-login-timeout-ms", "5000"},
         {"--relay-solicited-credits", "256"}, {"--relay-backfill-positions", "2048"}, {"--relay-reoffer-seconds", "60"},
         {"--relay-order", "canonical"}, {"--relay-order", "arrival"}, {"--relay-bin-lag", "1"},

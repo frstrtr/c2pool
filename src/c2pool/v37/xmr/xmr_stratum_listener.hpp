@@ -118,11 +118,23 @@
 #include "impl/xmr/node/minijson.hpp"          // xmrig JSON tokeniser (header-only)
 #include "impl/xmr/stratum/xmr_stratum.hpp"    // X5 seams + XmrStratumServer
 #include "c2pool/v37/net_addr_ban.hpp"         // NET-DOS: address keys + ban table
+#include "c2pool/v37/xmr/xmr_lane_constants.hpp"   // k (kXmrDropsFloorShift), T (kXmrTargetIntervalS)
 
 namespace c2pool::v37n::xmr::o2 {
 
 namespace strat = ::v37::xmr::stratum;
 namespace mj    = ::c2pool::xmr::node::minijson;
+
+// NET-DOS submit-budget defaults (no vardiff): burst 24; refill 2 x 2^k / T
+// submits/s; address ban ceil(burst / refill) s = ceil(burst x T / (2 x 2^k)),
+// integer arithmetic.
+inline constexpr std::uint32_t kStratumSubmitBurst   = 24;
+inline constexpr std::uint32_t kStratumRefillPerT    = 2u << kXmrDropsFloorShift;   // 2 x 2^k submits per T
+inline constexpr double        kStratumSubmitRate    = double(kStratumRefillPerT) / double(kXmrTargetIntervalS);
+inline constexpr int           kStratumBanSeconds    =
+    int((kStratumSubmitBurst * kXmrTargetIntervalS + kStratumRefillPerT - 1) / kStratumRefillPerT);
+static_assert(kStratumRefillPerT == 128 && kXmrTargetIntervalS == 10 && kStratumBanSeconds == 2,
+              "stratum submit-budget defaults: 12.8/s, ban 2 s at k 6, T 10 s, burst 24");
 
 // ---------------------------------------------------------------------------
 // Tunables. Defaults suit a single-rig regtest/stagenet demo.
@@ -147,11 +159,11 @@ struct StratumListenerOptions {
     std::size_t   max_log_lines = 2048;      // bounded log (oldest dropped)
     // NET-DOS (see the header note). Every value below is network policy.
     std::uint64_t min_difficulty = 16000;    // a "+diff" request below this is raised to it
-    double        submit_rate = 1.6;         // submits/s per connection, sustained (= 2 x the 0.8/s share-rate target)
-    double        submit_burst = 24.0;       // submits per connection, burst
-    std::size_t   max_pending_submits = 24;  // submits queued per connection for verification (= submit_burst)
+    double        submit_rate = kStratumSubmitRate;      // submits/s per connection, sustained (2 x 2^k / T = 12.8)
+    double        submit_burst = kStratumSubmitBurst;    // submits per connection, burst (24)
+    std::size_t   max_pending_submits = kStratumSubmitBurst;   // submits queued per connection for verification (= submit_burst)
     int           login_timeout_ms = 5000;   // no login by then: banned (0 = off)
-    int           ban_seconds = 15;          // address ban, = ceil(submit_burst / submit_rate) (127.0.0.1 / ::1: closed only)
+    int           ban_seconds = kStratumBanSeconds;      // address ban, ceil(submit_burst / submit_rate) = 2 (127.0.0.1 / ::1: closed only)
     int           bad_share_points = -3;     // low-difficulty or duplicate share
     int           good_share_points = 1;     // accepted share
     int           ban_score = -9;            // banned at or below this score

@@ -26,6 +26,13 @@
 //   SD6  login deadline (test clock): no login after 4.9 s = open, after 5.1 s
 //        = closed + address banned (redial refused); a logged-in miner and an
 //        address-less 127.0.0.1 client are not address-banned
+//   SD7  at the defaults (test clock): one connection submitting valid shares
+//        at the honest maximum 2^k / T = 6.4/s (Poisson, fixed seed) for 120 s
+//        is never closed or banned
+//   SD8  at the defaults (test clock): 25 submits at one instant -> 24
+//        accepted, the 25th dropped unverified, closed, address banned 2 s
+//        (refused at +1 s, accepted at +3 s); a connection submitting at
+//        2 x the refill (25.6/s) is closed within 60 submits
 // Nonzero exit on any failure.
 // ===========================================================================
 #include <arpa/inet.h>
@@ -38,6 +45,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <thread>
 
@@ -180,11 +188,15 @@ int main() {
     // ── SD1 defaults ────────────────────────────────────────────────────────
     {
         const o2::StratumListenerOptions d;
-        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000, 24 burst + 1.6/s submits (2 x 0.8/s), 24 queued, "
-              "login 5 s, ban 15 s (= burst / rate), score -3/+1 ban at -9 (cap 0), 256 (job id, nonce) pairs remembered",
-              d.bind_host == "127.0.0.1" && d.min_difficulty == 16000 && d.submit_burst == 24.0 && d.submit_rate == 2 * 0.8 &&
-              d.max_pending_submits == 24 && d.login_timeout_ms == 5000 && d.ban_seconds == 15 &&
-              std::abs(d.ban_seconds * d.submit_rate - d.submit_burst) < 1e-9 && d.bad_share_points == -3 &&
+        namespace xc = ::c2pool::v37n::xmr;
+        const std::uint32_t per_t = 2u << xc::kXmrDropsFloorShift;   // 2 x 2^k submits per T
+        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000, 24 burst + 2 x 2^k / T = 12.8/s submits, 24 queued, "
+              "login 5 s, ban ceil(burst / rate) = 2 s, score -3/+1 ban at -9 (cap 0), 256 (job id, nonce) pairs remembered",
+              d.bind_host == "127.0.0.1" && d.min_difficulty == 16000 && d.submit_burst == 24.0 &&
+              d.submit_rate == double(per_t) / double(xc::kXmrTargetIntervalS) && d.submit_rate == 12.8 &&
+              d.max_pending_submits == 24 && d.login_timeout_ms == 5000 && d.ban_seconds == 2 &&
+              d.ban_seconds == static_cast<int>((24u * xc::kXmrTargetIntervalS + per_t - 1) / per_t) &&
+              d.ban_seconds == static_cast<int>(std::ceil(d.submit_burst / d.submit_rate)) && d.bad_share_points == -3 &&
               d.good_share_points == 1 && d.ban_score == -9 && d.max_score == 0 && d.max_seen_submits == 256);
     }
 
@@ -346,6 +358,97 @@ int main() {
         if (local2 >= 0) ::close(local2);
         check("SD6 the silent address is banned (redial refused); 127.0.0.1 is not address-banned", refused && local_ok);
         ::close(miner);
+        R.L.stop();
+    }
+
+    // ── SD7 honest maximum at the defaults (test clock) ─────────────────────
+    {
+        namespace xc = ::c2pool::v37n::xmr;
+        Rig R(opts());
+        std::atomic<long long> off_us{0};
+        const auto base = Clock::now();
+        R.L.set_now_fn([&] { return base + std::chrono::microseconds(off_us.load()); });
+        check("SD7 listener up (defaults, test clock)", R.up());
+        int fd = -1;
+        const std::string jid = R.login(fd, "127.0.0.70", "");
+        const double rate = double(1u << xc::kXmrDropsFloorShift) / double(xc::kXmrTargetIntervalS);   // 6.4/s
+        std::mt19937_64 rng(1932);
+        std::exponential_distribution<double> gap(rate);
+        double t = 0;
+        std::uint32_t sent = 0, ok = 0;
+        bool dropped = false;
+        while (t < 120.0) {
+            t += gap(rng);
+            off_us = static_cast<long long>(t * 1e6);
+            const std::uint32_t id = 1000 + sent;
+            send_line(fd, submit_req(id, jid, 50000 + sent));
+            const std::string l = read_line(fd, 3000);
+            ++sent;
+            if (l.empty() || l == "<EOF>") { dropped = true; break; }
+            if (reply_to(l, id) && !is_error(l)) ++ok;
+        }
+        const bool open = !dropped && !closed_within(fd, 200);
+        ::close(fd);
+        const auto s = R.L.stats();
+        check("SD7 one connection at the honest maximum (2^k / T = 6.4 valid submits/s, Poisson, 120 s) is never closed or banned",
+              !jid.empty() && open && sent >= 700 && ok == sent && s.submits_over_budget == 0 && s.bans == 0 &&
+                  s.refused_banned == 0,
+              "sent=" + std::to_string(sent) + " ok=" + std::to_string(ok) + " over=" + std::to_string(s.submits_over_budget) +
+                  " bans=" + std::to_string(s.bans) + " span=" + std::to_string(t) + " s");
+        R.L.stop();
+    }
+
+    // ── SD8 abusive rates at the defaults (test clock) ──────────────────────
+    {
+        Rig R(opts());
+        std::atomic<long long> off_us{0};
+        const auto base = Clock::now();
+        R.L.set_now_fn([&] { return base + std::chrono::microseconds(off_us.load()); });
+        check("SD8 listener up (defaults, test clock)", R.up());
+        int fd = -1;
+        const std::string jid = R.login(fd, "127.0.0.80", "");
+        int oks = 0;
+        for (std::uint32_t i = 0; i < 24; ++i) {
+            send_line(fd, submit_req(2000 + i, jid, 70000 + i));
+            const std::string l = read_line(fd, 3000);
+            if (reply_to(l, 2000 + i) && !is_error(l)) ++oks;
+        }
+        send_line(fd, submit_req(2024, jid, 70024));
+        const bool closed = closed_within(fd, 3000);
+        ::close(fd);
+        const auto s1 = R.L.stats();
+        check("SD8 25 submits at one instant: 24 accepted, the 25th dropped unverified and the connection closed",
+              !jid.empty() && oks == 24 && closed && R.ver.hashes.load() == 24 && s1.submits_over_budget == 1 && s1.bans == 1,
+              "oks=" + std::to_string(oks) + " hashes=" + std::to_string(R.ver.hashes.load()) +
+                  " over=" + std::to_string(s1.submits_over_budget));
+        off_us = 1'000'000;
+        const int r1 = dial_from("127.0.0.80", R.L.bound_port());
+        const bool refused_1s = r1 >= 0 && closed_within(r1, 3000);
+        if (r1 >= 0) ::close(r1);
+        off_us = 3'000'000;
+        int r3 = -1;
+        const bool back_3s = !R.login(r3, "127.0.0.80", "").empty() && !closed_within(r3, 200);
+        if (r3 >= 0) ::close(r3);
+        check("SD8 the address ban lasts 2 s: refused at +1 s, accepted at +3 s", refused_1s && back_3s);
+        int f2 = -1;
+        const std::string j2 = R.login(f2, "127.0.0.81", "");
+        double t = 3.0;
+        const double step = 1.0 / (2.0 * o2::kStratumSubmitRate);   // 2 x the refill: 25.6 submits/s
+        std::uint32_t sent = 0;
+        bool closed2 = false;
+        for (std::uint32_t i = 0; i < 200; ++i) {
+            t += step;
+            off_us = static_cast<long long>(t * 1e6);
+            send_line(f2, submit_req(3000 + i, j2, 80000 + i));
+            const std::string l = read_line(f2, 3000);
+            ++sent;
+            if (l.empty() || l == "<EOF>") { closed2 = true; break; }
+        }
+        ::close(f2);
+        const auto s2 = R.L.stats();
+        check("SD8 a connection submitting at 2 x the refill (25.6/s) is closed for over-budget within 60 submits",
+              !j2.empty() && closed2 && sent <= 60 && s2.submits_over_budget == 2 && s2.bans == 2,
+              "sent=" + std::to_string(sent) + " over=" + std::to_string(s2.submits_over_budget));
         R.L.stop();
     }
 

@@ -271,7 +271,7 @@ static std::uint64_t g_relay_deep_probe_step = 64;      // --relay-deep-probe-st
 static std::uint64_t g_relay_shadow_persist_bytes = 256ull << 20;   // --relay-shadow-persist-bytes N
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 // Stratum listener policy (unset = the StratumListenerOptions default).
-static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (shares/s per connection; submit refill 2R/s)
+static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (submit refill per connection, submits/s)
 static std::optional<std::uint32_t>      g_stratum_submit_burst;      // --stratum-submit-burst N (also the per-connection queue bound)
 static std::optional<std::uint32_t>      g_stratum_ban_seconds;       // --stratum-ban-seconds S (unset = ceil(burst / submit refill))
 static std::optional<std::array<int, 4>> g_stratum_share_score;       // --stratum-share-score BAD,GOOD,BAN,CAP
@@ -643,7 +643,7 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
     lo.min_difficulty = std::max(lo.min_difficulty, hooks.stratum_min_diff);   // NET-DOS
-    if (g_stratum_share_rate) lo.submit_rate = 2.0 * *g_stratum_share_rate;
+    if (g_stratum_share_rate) lo.submit_rate = *g_stratum_share_rate;
     if (g_stratum_submit_burst) {
         lo.submit_burst = static_cast<double>(*g_stratum_submit_burst);
         lo.max_pending_submits = *g_stratum_submit_burst;
@@ -6545,10 +6545,10 @@ int main(int argc, char** argv) {
                 " serve side (X9 O-2; the stratum port is served only with a payout address):\n"
                 "  --payout-address <addr>      get_block_template wallet address (network-prefixed)\n"
                 "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
-                "  --stratum-share-rate R       share-rate target per connection, shares/s (default 0.8);\n"
-                "                               the submit budget refills at 2R per s\n"
+                "  --stratum-share-rate R       submit budget refill per connection, submits/s\n"
+                "                               (default 2 x 2^k / T = 12.8; k 6, T 10 s)\n"
                 "  --stratum-submit-burst N     submit budget burst and queue bound per connection (default 24)\n"
-                "  --stratum-ban-seconds S      address ban (default ceil(burst / 2R) = 15)\n"
+                "  --stratum-ban-seconds S      address ban (default ceil(burst / R) = 2)\n"
                 "  --stratum-share-score B,G,K,M share score: bad share B, good share G, ban at K, cap M\n"
                 "                               (default -3,1,-9,0)\n"
                 "  --stratum-login-timeout-ms MS no login by then: banned (default 5000; 0 = off)\n"
