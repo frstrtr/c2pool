@@ -39,6 +39,13 @@
 // carrier body:
 //   u8 ver = 3 | receipt body (own) | u8 n_carried (<= R_MAX)
 //   | n_carried x receipt body
+//   (no length prefix on a receipt body; blob_len, D and p delimit it)
+//
+// carrier frame:
+//   FH | carrier body
+//   FH = u8 opcode | u8 frame version | u32 chain_id
+//        (the frame header of src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp)
+//   FRAME_CAP = FH + carrier_body_cap
 //
 // Decoder outcomes:
 //   OverCap   the input is longer than the local buffer bound for the given
@@ -541,6 +548,20 @@ struct CarrierLimits {
 // Buffer bound of a carrier body: ver + own + n_carried + R_MAX carried, each at RECEIPT_MAX(cap_depth).
 inline constexpr std::uint64_t carrier_body_cap(const CarrierLimits& lim) noexcept {
     return kU8Bytes + receipt_max(lim.cap_depth) + kU8Bytes + lim.r_max * receipt_max(lim.cap_depth);
+}
+
+// ---------------------------------------------------------------------------
+// Carrier frame
+// ---------------------------------------------------------------------------
+// FH: the relay frame header, u8 opcode | u8 frame version | u32 chain_id.
+inline constexpr std::size_t kFrameOpcodeBytes = kU8Bytes;
+inline constexpr std::size_t kFrameVersionBytes = kU8Bytes;
+inline constexpr std::size_t kFrameChainIdBytes = kU32Bytes;
+inline constexpr std::size_t kFrameHeaderBytes = kFrameOpcodeBytes + kFrameVersionBytes + kFrameChainIdBytes;
+
+// FRAME_CAP: buffer bound of a carrier frame, FH + carrier_body_cap.
+inline constexpr std::uint64_t frame_cap(const CarrierLimits& lim) noexcept {
+    return kFrameHeaderBytes + carrier_body_cap(lim);
 }
 
 inline WireError encode_carrier_body_v3(const CarrierBodyV3& c, std::uint64_t r_max, std::vector<std::uint8_t>& out) {

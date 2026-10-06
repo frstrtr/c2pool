@@ -32,4 +32,7 @@ if (BUILD_TESTING)
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
         add_test(NAME ${_pathb_kat} COMMAND ${_pathb_kat})
     endforeach()
+    # v37_xmr_pathb_body_v3_kat reads the relay frame header of
+    # src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp (xmr_receipt.hpp by its bare name).
+    target_include_directories(v37_xmr_pathb_body_v3_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
 endif()

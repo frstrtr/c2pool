@@ -25,19 +25,26 @@
 //       encoder and decoder (before allocation); version != 3 refused; the
 //       largest carrier body equals carrier_body_cap, one byte more refused;
 //       trailing bytes refused; counts above the remaining bytes refused
-//       without allocation.
+//       without allocation;
+//   (7) carrier frame: FH = 6 (u8 opcode | u8 frame version | u32 chain_id),
+//       the header of the relay frames in xmr_relay_wire.hpp (FB_RECEIPTS
+//       header = FH + count byte, FB_CTX header = FH + id + length, FB_GETCTX
+//       bytes); FRAME_CAP = FH + carrier_body_cap = 16,073 at D_max 14,
+//       R_MAX 16.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#include "c2pool/v37/xmr/relay/xmr_relay_wire.hpp"
 #include "impl/xmr/pathb/pathb_caps.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
+namespace relay = ::c2pool::v37n::xmr::relay;
 
 namespace {
 
@@ -306,6 +313,29 @@ int main() {
             if (dec_carrier(t, lim) == pb::WireError::None) trunc_ok = false;
         }
         check(trunc_ok, "truncations of the largest carrier body refused");
+    }
+
+    // (7) carrier frame
+    {
+        check(pb::kFrameHeaderBytes == 6, "FH = opcode 1 + frame version 1 + chain_id 4 = 6");
+        check(pb::kFrameOpcodeBytes == sizeof(relay::FB_RECEIPTS) && pb::kFrameVersionBytes == sizeof(relay::kFbVersion)
+                      && pb::kFrameChainIdBytes == sizeof(relay::u32),
+              "FH fields have the widths of the relay opcode, frame version and chain_id");
+        check(relay::kFbReceiptsHeader == pb::kFrameHeaderBytes + pb::kU8Bytes, "relay FB_RECEIPTS header = FH + count byte");
+        check(relay::kCtxHeader == pb::kFrameHeaderBytes + pb::kHashBytes + pb::kU32Bytes,
+              "relay FB_CTX header = FH + id + length");
+        const relay::u32 chain = 0x0a0b0c0du;
+        const std::vector<std::uint8_t> f = relay::encode_getctx(chain, std::vector<relay::bytes32>(1));
+        check(f.size() == pb::kFrameHeaderBytes + pb::kU8Bytes + pb::kHashBytes, "relay FB_GETCTX frame = FH + count + id");
+        check(f.size() > pb::kFrameHeaderBytes && f[0] == relay::FB_GETCTX && f[1] == relay::kFbVersion && f[2] == 0x0d
+                      && f[3] == 0x0c && f[4] == 0x0b && f[5] == 0x0a,
+              "relay frame bytes: opcode | frame version | chain_id little-endian");
+
+        const pb::CarrierLimits lim{dmax, pb::kRuledLaneParams.r_max};
+        check(pb::frame_cap(lim) == pb::kFrameHeaderBytes + pb::carrier_body_cap(lim), "FRAME_CAP = FH + carrier_body_cap");
+        check(pb::frame_cap(lim) == 16073, "FRAME_CAP = 6 + 2 + 17 x 945 = 16,073 at D_max 14, R_MAX 16");
+        const pb::CarrierLimits lim17{pb::d_max(17, 0).value_or(0), pb::kRuledLaneParams.r_max};
+        check(pb::frame_cap(lim17) == 6 + 2 + 17 * 881, "FRAME_CAP = 14,985 at v17 (RECEIPT_CAP 881)");
     }
 
     return finish("v37_xmr_pathb_body_v3_kat");
