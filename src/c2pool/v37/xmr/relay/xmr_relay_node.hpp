@@ -304,8 +304,27 @@ struct RelayOptions {
     std::string listen_host = "127.0.0.1";
     u16         listen_port = 0;                  // 0 = an ephemeral port (tests), read back via listen_port()
     std::vector<std::pair<std::string, u16>> peers;
-    std::size_t max_peers = 8;
+    // Inbound links (accepted) and outbound links (dialed) are counted apart.
+    // max_inbound caps accepted links only (over it a connection is closed at
+    // accept), so an inbound link never takes one of the max_outbound slots
+    // below, and the node keeps dialing while it has fewer than max_outbound.
+    std::size_t max_inbound = 101;
+    // Per address (IPv4, IPv6 /64; 127.0.0.1 and ::1 exempt) at most
+    // max_inbound_per_addr accepted links at once; another is closed at accept.
+    std::size_t max_inbound_per_addr = 1;
+    // A peer the DoS budget bans (confirmed invalid PoW, strike score) is banned
+    // BY ADDRESS for ban_seconds: every link from it is dropped, it is refused
+    // at accept and not dialed until the ban ends (127.0.0.1 / ::1: the link is
+    // dropped, no address ban). The RandomX budget is per address too.
+    // Default ceil(n x N / G) s = ceil(113 x 1 / 4) = 29 s, with n = max_inbound
+    // + max_outbound, N = verify_threads, G = dos.global_refill
+    // (::c2pool::xmr::dos_ban_seconds); the daemon sets it the same way.
+    u32         ban_seconds = ::c2pool::xmr::dos_ban_seconds(::c2pool::xmr::kDosDefaultLinks,
+                                                             ::c2pool::xmr::kDosDefaultWorkers,
+                                                             ::c2pool::xmr::kDosDefaultGlobalRefill);
     u64         index_horizon = 64;               // blocks; older unsolicited receipts are dropped
+    // RandomX budget: DosPolicy{} = dos_policy_for(113 links, 1 worker, 4/s);
+    // the daemon sets dos_policy_for(max_inbound + max_outbound, verify_threads, G).
     ::c2pool::xmr::DosPolicy dos{};
     u32         solicited_credits = 256;
     u64         backfill_positions = 2048;
@@ -319,7 +338,7 @@ struct RelayOptions {
     // worker (the library default, every KAT byte-identical); the daemon passes
     // --relay-verify-threads (auto = clamp(cores/2, 2, 8) minus --mine threads).
     // Clamped to [1, kMaxVerifyThreads] at start(): up to N DoS tokens may be
-    // outstanding per peer, inside the per-peer burst (20).
+    // outstanding per source; the daemon sets the per-address burst to N.
     std::size_t verify_threads = 1;
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
@@ -405,7 +424,7 @@ struct RelayOptions {
     // fb_unknown, nothing is asked or dialed beyond `peers`); the daemon turns
     // it ON (--relay-discovery on, the CLI default).
     bool        discovery = false;
-    std::size_t max_outbound = 8;                 // dialed links (peers + learned) the node keeps up
+    std::size_t max_outbound = 12;                // dialed links (peers + learned) the node keeps up; dialing continues while below it
     // The SEED seam: addresses dialed as CANDIDATES at start (the built-in
     // bootstrap list feeds this; --relay-peer stays a permanent dial target).
     std::vector<std::pair<std::string, u16>> seeds;
@@ -497,6 +516,9 @@ struct RelayStats {
     // NODE-NONCE: HELLOs refused as our own nonce (both ends of a self-dial count),
     // dials / learns skipped as our own address, same-dialer duplicates left to the peer.
     std::atomic<u64> self_conn{0}, self_skipped{0}, dup_deferred{0};
+    // ADDRESS BANS: addresses banned; queued receipts of a banned source dropped
+    // before RandomX.
+    std::atomic<u64> addr_bans{0}, banned_src_dropped{0};
 };
 
 // ★ RAIN-BACKFILL: the composition's view of one interval range.
@@ -603,6 +625,7 @@ public:
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
         m_net.set_log([this](const std::string& s) { log("relay: " + s); });
         m_net.set_send_queue(m_o.send_queue_bytes);   // RELAY-SEND-QUEUE (0 = synchronous, legacy)
+        m_net.set_inbound_limits(m_o.max_inbound, m_o.max_inbound_per_addr);   // inbound caps, at accept
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -1416,6 +1439,8 @@ public:
 
     // Test hook: disconnect one peer (the KAT's "B drops off the network").
     void drop_peer(PeerId p) { m_net.disconnect(p); }
+    // The relay's transport (ADDRESS BANS: ban table, refusal counters; tests).
+    ::c2pool::v37n::CarrierPeerNode& transport() { return m_net; }
     // Test hook: stop redialing (and drop) every dial target.
     void set_dialing(bool on) { m_dialing = on; }
     // Test hook (UP-GATE KAT): hold every connection-up event of this node for
@@ -1460,11 +1485,11 @@ public:
         const auto& s = m_st;
         char b[1024];
         std::snprintf(b, sizeof b,
-            "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu | dialed=%llu dial_ok=%llu learned=%llu | "
+            "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu/%zu | dialed=%llu dial_ok=%llu learned=%llu | "
             "getaddr tx=%llu rx=%llu throttled=%llu | addr tx=%llu rx=%llu unsolicited=%llu ignored=%llu | "
             "dup_dropped=%llu refused=%llu self=%llu saves=%llu expired=%llu | "
             "nonce=%016llx self_conn=%llu self_skipped=%llu self_book=%zu dup_deferred=%llu | peers=[",
-            m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in,
+            m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in, m_o.max_inbound,
             (unsigned long long)s.disc_dialed.load(), (unsigned long long)s.disc_dial_ok.load(), (unsigned long long)s.addr_learned.load(),
             (unsigned long long)s.getaddr_tx.load(), (unsigned long long)s.getaddr_rx.load(), (unsigned long long)s.getaddr_throttled.load(),
             (unsigned long long)s.addr_tx.load(), (unsigned long long)s.addr_rx.load(), (unsigned long long)s.addr_unsolicited.load(),
@@ -1504,6 +1529,10 @@ private:
         Clock::time_point getaddr_tx{}, getaddr_rx{};
         bool addr_pending = false;                  // a GETADDR of ours is unanswered on this link
         std::size_t addr_learned = 0;
+        // ADDRESS BANS: the DoS source of this link (its address key, or the
+        // link id for 127.0.0.1 / ::1) and its direction.
+        u64  src = 0;
+        bool inbound = false;
     };
     static constexpr u32 kLegacyProbes = 3;         // unanswered PINGs before a peer counts as pre-0x48
     struct Target {
@@ -1538,6 +1567,7 @@ private:
     }
     struct Item {
         PeerId from = 0;
+        u64 src = 0;               // ADDRESS BANS: DoS source of `from` (taken while the link was live)
         FbReceipt r;
         std::vector<u8> raw;
         bytes32 id{};
@@ -1667,12 +1697,15 @@ private:
             open_up_gate(p);   // UP-GATE: whatever path the up event took, a waiting HELLO may go on
             return;
         }
+        u64 src = 0;
         {
             std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it != m_peers.end()) src = it->second.src;
             m_peers.erase(p);
             m_up_done.erase(p);
         }
-        on_peer_down(p);
+        on_peer_down(p, src ? src : p);
     }
 
     // -- UP-GATE ---------------------------------------------------------------
@@ -1721,21 +1754,32 @@ private:
         if (m_partitioned.load()) { m_net.disconnect(p); return; }   // rig partition: refuse
         {
             bool over = false;
+            const u64 akey = m_net.addr_key(p);         // ADDRESS BANS (transport lock; never under m_pmtx)
+            const bool inbound = m_net.is_inbound(p);
             {
                 std::lock_guard<std::mutex> lk(m_pmtx);
                 PeerSt st{};
+                st.src = akey ? akey : p;
+                st.inbound = inbound;
                 // RELAY-DISCOVERY: a dial's up event runs on the dialing (maintenance)
                 // thread, before add_peer_id returns: this link is OUR dial of m_dial_*.
                 if (std::this_thread::get_id() == m_maint_tid.load()) { st.out_host = m_dial_host; st.out_port = m_dial_port; }
                 m_peers[p] = st;
-                over = m_peers.size() > m_o.max_peers;
+                // Only accepted links count against max_inbound (the transport
+                // already refuses at accept; this is the backstop). A dialed link
+                // is never refused here: inbound links cannot take outbound slots.
+                if (inbound) {
+                    std::size_t n_in = 0;
+                    for (const auto& [q, ps] : m_peers) { (void)q; if (ps.inbound) ++n_in; }
+                    over = n_in > m_o.max_inbound;
+                }
             }
             // RELAY-FD: the up event runs on the dialing/accepting thread AFTER
             // the connection's reader started. A peer that closes at once (a
             // partitioned node refusing us) can unwind that reader and fire the
             // DOWN event before this line ran; no second down event follows, so
             // the entry just made would be a ghost: never HELLO'd, re-counted
-            // as a HELLO timeout every tick, and counted against max_peers
+            // as a HELLO timeout every tick, and counted against max_inbound
             // forever -- enough of them and every new link is over_cap, so the
             // relay never heals. Re-check the transport after inserting: a down
             // event that lands after this check erases the entry itself.
@@ -1755,10 +1799,15 @@ private:
         }
     }
 
-    void on_peer_down(PeerId p) {
+    void on_peer_down(PeerId p, u64 src) {
         {
+            // ADDRESS BANS: a per-link source dies with its link; an address keeps
+            // its spent bucket / score after its last link (release()).
+            const bool addr = ::c2pool::v37n::net::is_addr_key(src);
+            const bool last = !addr || m_net.conns_from(src) == 0;
             std::lock_guard<std::mutex> lk(m_mtx);
-            m_dos.forget(static_cast<::c2pool::xmr::u32>(p));
+            if (!addr) m_dos.forget(src);
+            else if (last) m_dos.release(src, now_ns());
         }
         {
             std::lock_guard<std::mutex> lk(m_jmtx);
@@ -2002,21 +2051,17 @@ private:
 
     void on_receipts(PeerId p, const std::vector<u8>& f) {
         ReceiptsFrame rf; std::string why;
+        const u64 src = src_of(p);
         if (!decode_receipts_frame(f, rf, &why)) {
             m_st.malformed++;
-            std::lock_guard<std::mutex> lk(m_mtx);
-            m_last_reject = "frame: " + why;
-            if (m_dos.on_cheap_reject(static_cast<::c2pool::xmr::u32>(p)) == ::c2pool::xmr::Action::Ban) {
-                m_st.bans++;
-                ban_later(p);
-            }
+            strike_src(p, src, "frame: " + why);
             return;
         }
         if (rf.chain_id != m_o.chain) { m_st.wrong_chain++; return; }
         for (std::size_t i = 0; i < rf.receipts.size(); ++i) {
             m_st.rx_receipts++;
             Item it;
-            it.from = p; it.r = std::move(rf.receipts[i]); it.raw = std::move(rf.raw[i]);
+            it.from = p; it.src = src; it.r = std::move(rf.receipts[i]); it.raw = std::move(rf.raw[i]);
             it.id = receipt_id(it.r);
             if (m_o.drops_floor_diff && drop_wanted(it.id)) it.solicited = true;   // ★ RAIN-BACKFILL: a fetched raindrop
             enqueue(std::move(it));
@@ -2446,7 +2491,7 @@ private:
             if (it.solicited) {
                 auto upg = [&](std::deque<Item>& q) {
                     for (auto& x : q) if (x.id == it.id && !x.solicited) {
-                        x.solicited = true; x.from = it.from; x.enq = Clock::now(); x.not_before = Clock::now();
+                        x.solicited = true; x.from = it.from; x.src = it.src; x.enq = Clock::now(); x.not_before = Clock::now();
                         m_st.upgraded_solicited++;
                         return true;
                     }
@@ -2509,10 +2554,14 @@ private:
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_cache.count(it.id)) { m_inflight.erase(it.id); m_st.dup++; return; }
         }
+        if (!it.src) it.src = it.from;
+        // ADDRESS BANS: a receipt queued by a source banned since is dropped here,
+        // never verified, never parked.
+        if (src_banned(it.src)) { m_st.banned_src_dropped++; forget_inflight(it.id); return; }
         // context: prev_id -> (bin, seed)
         ::v37::xmr::verify::ParsedBlob pb;
         if (!::v37::xmr::verify::parse_hashing_blob(it.r.receipt.hashing_blob, pb)) {
-            m_st.structural++; forget_inflight(it.id); strike(it.from, "hashing blob does not parse"); return;
+            m_st.structural++; forget_inflight(it.id); strike_src(it.from, it.src, "hashing blob does not parse"); return;
         }
         const auto ctx = m_chain.lookup(pb.prev_id);
         if (!ctx) {
@@ -2549,7 +2598,7 @@ private:
         const CheckResult cr = check_structural(it.r, cc);
         if (!cr.ok()) {
             m_st.structural++; forget_inflight(it.id);
-            strike(it.from, std::string("structural ") + to_string(cr.stage) + ": " + cr.why);
+            strike_src(it.from, it.src, std::string("structural ") + to_string(cr.stage) + ": " + cr.why);
             return;
         }
         // SHARE-LEVEL CANONICAL COINBASE: before RandomX (cheap, and a refused
@@ -2565,7 +2614,7 @@ private:
             if (v < 0) {
                 m_st.share_refused++; forget_inflight(it.id);
                 { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
-                strike(it.from, "share coinbase not canonical: " + vw);
+                strike_src(it.from, it.src, "share coinbase not canonical: " + vw);
                 return;
             }
             if (v == 0) {
@@ -2579,8 +2628,8 @@ private:
                 m_st.share_undecided_trusted++;   // a repair answer: the winner's lane holds it (Ruling A)
             }
         }
-        // RandomX token
-        const auto p32 = static_cast<::c2pool::xmr::u32>(it.from);
+        // RandomX token (per DoS source: the address, or the link for 127.0.0.1 / ::1)
+        const u64 dos_src = it.src;
         bool granted = false;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
@@ -2588,7 +2637,7 @@ private:
                 refill_solicited_locked();
                 if (m_solicited >= 1.0) { m_solicited -= 1.0; granted = true; }
             } else {
-                granted = m_dos.grant_randomx(p32, now_ns());
+                granted = m_dos.grant_randomx(dos_src, now_ns());
             }
         }
         if (!granted) { m_st.rx_deferred++; park(std::move(it), std::chrono::milliseconds(500)); return; }
@@ -2597,7 +2646,7 @@ private:
         if (!m_rx || !m_rx(it.r.receipt.hashing_blob.bytes, ctx->seed, pow)) {
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
-                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());   // our fault: give the token back
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());   // our fault: give the token back
             }
             // DROPS-VERIFY-SCALE: the engine refuses while a switch keys the new
             // seed's cache (async_next_seed): park ONCE and retry instead of
@@ -2616,7 +2665,7 @@ private:
             m_st.rx_valid++;
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
-                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
             }
             admit(std::move(it), ctx->height);
             return;
@@ -2627,7 +2676,7 @@ private:
         if (m_o.drops_floor_diff && meets_share_diff(pow, m_o.drops_floor_diff)) {
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
-                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
                 m_inflight.erase(it.id);
             }
             admit_drop(std::move(it), ctx->height, pow);
@@ -2642,31 +2691,48 @@ private:
         ::c2pool::xmr::Action a;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            a = m_dos.on_invalid_pow(p32, confirmed);
+            a = m_dos.on_invalid_pow(dos_src, confirmed);
             m_inflight.erase(it.id);
             m_last_reject = "pow below share_diff from peer " + std::to_string(it.from) + (confirmed ? " (confirmed)" : " (unconfirmed)");
         }
         if (a == ::c2pool::xmr::Action::Ban) {
             m_st.bans++;
             log("relay: peer " + std::to_string(it.from) + " BANNED: confirmed invalid PoW (RandomX below the lane share difficulty)");
-            ban_later(it.from);
+            ban_later(it.from, it.src);
         }
     }
 
-    void strike(PeerId p, const std::string& why) {
+    void strike(PeerId p, const std::string& why) { strike_src(p, src_of(p), why); }
+    void strike_src(PeerId p, u64 src, const std::string& why) {
         ::c2pool::xmr::Action a;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_last_reject = why;
-            a = m_dos.on_cheap_reject(static_cast<::c2pool::xmr::u32>(p));
+            a = m_dos.on_cheap_reject(src);
         }
-        if (a == ::c2pool::xmr::Action::Ban) { m_st.bans++; ban_later(p); }
+        if (a == ::c2pool::xmr::Action::Ban) { m_st.bans++; ban_later(p, src); }
     }
-    // Disconnect from the maintenance thread (never from inside a reader's own
-    // callback stack while it holds our locks).
-    void ban_later(PeerId p) {
+    // Ban (by address) / disconnect from the maintenance thread (never from
+    // inside a reader's own callback stack while it holds our locks). `src` is
+    // taken while the link is live, so a peer that hangs up first is still
+    // banned by address.
+    void ban_later(PeerId p) { ban_later(p, src_of(p)); }
+    void ban_later(PeerId p, u64 src) {
         std::lock_guard<std::mutex> lk(m_tmtx);
-        m_to_drop.push_back(p);
+        m_to_drop.emplace_back(p, src);
+    }
+    // ADDRESS BANS: the DoS source of a link (address key, or the link id).
+    u64 src_of(PeerId p) const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto it = m_peers.find(p);
+        return (it != m_peers.end() && it->second.src) ? it->second.src : p;
+    }
+    bool src_banned(u64 src) {
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_dos.is_banned(src)) return true;
+        }
+        return ::c2pool::v37n::net::is_addr_key(src) && m_net.is_banned_key(src);
     }
 
     void refill_solicited_locked() {
@@ -3300,8 +3366,9 @@ private:
     }
 
     void on_frames(PeerId p, const std::vector<VerifiedFrame>& v) {
+        const u64 src = src_of(p);   // ADDRESS BANS
         for (const auto& vf : v) {
-            Item it; it.from = p; it.solicited = true; it.raw = vf.frame;
+            Item it; it.from = p; it.src = src; it.solicited = true; it.raw = vf.frame;
             if (!decode_fb_receipt(vf.frame, it.r)) continue;   // unreachable: the id seam decoded it
             it.id = vf.id;
             enqueue(std::move(it));
@@ -3700,7 +3767,9 @@ private:
                 if (t.learned && !t.used) ++out;   // queued dials count toward the target
             }
         }
-        if (m_dialing.load() && !m_partitioned.load() && out < m_o.max_outbound && m_net.n_peers() < m_o.max_peers) {
+        // Dial while fewer than max_outbound links are ours, however many
+        // inbound links are up (they never count against this).
+        if (m_dialing.load() && !m_partitioned.load() && out < m_o.max_outbound) {
             const auto c = m_book.dial_candidates(m_o.max_outbound - out, now, skip);
             std::lock_guard<std::mutex> lk(m_tmtx);
             for (const auto& r : c) {
@@ -3724,13 +3793,33 @@ private:
         while (m_running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             if (!m_running.load()) break;
-            // deferred drops (bans)
-            std::vector<PeerId> drops;
+            // deferred drops (bans): an address source is banned BY ADDRESS for
+            // ban_seconds (every link from it dropped, refused at accept, not
+            // dialed); its DoS state is reset for when the ban ends. A per-link
+            // source (127.0.0.1 / ::1) only loses that link.
+            std::vector<std::pair<PeerId, u64>> drops;
             {
                 std::lock_guard<std::mutex> lk(m_tmtx);
                 drops.swap(m_to_drop);
             }
-            for (PeerId p : drops) m_net.disconnect(p);
+            for (const auto& [p, src] : drops) {
+                const bool addr = ::c2pool::v37n::net::is_addr_key(src);
+                if (addr && m_o.ban_seconds) {
+                    const bool fresh = !m_net.is_banned_key(src);
+                    m_net.ban_key(src, std::chrono::seconds(m_o.ban_seconds));   // drops every link from src, p included
+                    if (fresh) {
+                        m_st.addr_bans++;
+                        log("relay: address " + ::c2pool::v37n::net::addr_key_str(src) + " (peer " + std::to_string(p) +
+                            ") BANNED for " + std::to_string(m_o.ban_seconds) + " s");
+                    }
+                } else {
+                    m_net.disconnect(p);
+                }
+                if (addr) {   // the ban table (or, with ban_seconds 0, nothing) holds the address now
+                    std::lock_guard<std::mutex> lk(m_mtx);
+                    m_dos.forget(src);
+                }
+            }
             // HELLO timeouts
             std::vector<PeerId> stale;
             {
@@ -3918,7 +4007,7 @@ private:
 
     std::mutex m_tmtx;                 // dial targets + deferred drops
     std::vector<Target> m_targets;
-    std::vector<PeerId> m_to_drop;
+    std::vector<std::pair<PeerId, u64>> m_to_drop;   // (link, DoS source) to ban / drop
     std::atomic<bool> m_dialing{true};
     std::atomic<bool> m_partitioned{false};
     std::atomic<Clock::rep> m_partition_until{0};

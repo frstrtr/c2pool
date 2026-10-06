@@ -41,6 +41,24 @@
 //   * OBSERVABILITY: counters (stats()) and a bounded log the main loop drains
 //     (drain_log()) — the listener never prints; all stdout stays on main.
 //
+// NET-DOS (network policy; the defaults are in StratumListenerOptions):
+//   * a submit is QUEUED on its connection (at most max_pending_submits) and
+//     verified later on the listener thread, ONE RandomX hash per loop pass,
+//     round-robin over the connections with queued submits; socket I/O and
+//     logins are served between two hashes, so a connection that floods
+//     submits delays the others by at most one hash per pass;
+//   * per-connection submit budget (submit_burst, then submit_rate per s): a
+//     submit over it is dropped unverified and the connection is BANNED;
+//   * a repeated (job id, nonce) is refused unverified ("Duplicate share");
+//   * share score per connection: a low-difficulty or duplicate share
+//     bad_share_points, an accepted one good_share_points (capped at
+//     max_score); at ban_score or below the connection is BANNED;
+//   * a connection that sent no login within login_timeout_ms is BANNED;
+//   * BANNED = closed, and its address (IPv4, IPv6 /64; never 127.0.0.1 /
+//     ::1) refused at accept for ban_seconds;
+//   * a miner's "+diff" below min_difficulty is raised to it
+//     (XmrStratumServer::set_min_difficulty).
+//
 // Startup race handled: a miner that logs in BEFORE the daemon has its first
 // template (or while the lane is SUSPENDED) is PARKED (no reply) and answered
 // with a real login_ok the moment a template is available again:
@@ -89,6 +107,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -98,11 +117,24 @@
 
 #include "impl/xmr/node/minijson.hpp"          // xmrig JSON tokeniser (header-only)
 #include "impl/xmr/stratum/xmr_stratum.hpp"    // X5 seams + XmrStratumServer
+#include "c2pool/v37/net_addr_ban.hpp"         // NET-DOS: address keys + ban table
+#include "c2pool/v37/xmr/xmr_lane_constants.hpp"   // k (kXmrDropsFloorShift), T (kXmrTargetIntervalS)
 
 namespace c2pool::v37n::xmr::o2 {
 
 namespace strat = ::v37::xmr::stratum;
 namespace mj    = ::c2pool::xmr::node::minijson;
+
+// NET-DOS submit-budget defaults (no vardiff): burst 24; refill 2 x 2^k / T
+// submits/s; address ban ceil(burst / refill) s = ceil(burst x T / (2 x 2^k)),
+// integer arithmetic.
+inline constexpr std::uint32_t kStratumSubmitBurst   = 24;
+inline constexpr std::uint32_t kStratumRefillPerT    = 2u << kXmrDropsFloorShift;   // 2 x 2^k submits per T
+inline constexpr double        kStratumSubmitRate    = double(kStratumRefillPerT) / double(kXmrTargetIntervalS);
+inline constexpr int           kStratumBanSeconds    =
+    int((kStratumSubmitBurst * kXmrTargetIntervalS + kStratumRefillPerT - 1) / kStratumRefillPerT);
+static_assert(kStratumRefillPerT == 128 && kXmrTargetIntervalS == 10 && kStratumBanSeconds == 2,
+              "stratum submit-budget defaults: 12.8/s, ban 2 s at k 6, T 10 s, burst 24");
 
 // ---------------------------------------------------------------------------
 // Tunables. Defaults suit a single-rig regtest/stagenet demo.
@@ -125,6 +157,18 @@ struct StratumListenerOptions {
     int           parked_keepalive_ms = 10000;
     int           max_json_depth = 8;        // login/submit are depth-3 objects; guards the recursive parser
     std::size_t   max_log_lines = 2048;      // bounded log (oldest dropped)
+    // NET-DOS (see the header note). Every value below is network policy.
+    std::uint64_t min_difficulty = 16000;    // a "+diff" request below this is raised to it
+    double        submit_rate = kStratumSubmitRate;      // submits/s per connection, sustained (2 x 2^k / T = 12.8)
+    double        submit_burst = kStratumSubmitBurst;    // submits per connection, burst (24)
+    std::size_t   max_pending_submits = kStratumSubmitBurst;   // submits queued per connection for verification (= submit_burst)
+    int           login_timeout_ms = 5000;   // no login by then: banned (0 = off)
+    int           ban_seconds = kStratumBanSeconds;      // address ban, ceil(submit_burst / submit_rate) = 2 (127.0.0.1 / ::1: closed only)
+    int           bad_share_points = -3;     // low-difficulty or duplicate share
+    int           good_share_points = 1;     // accepted share
+    int           ban_score = -9;            // banned at or below this score
+    int           max_score = 0;             // the score never rises above this
+    std::size_t   max_seen_submits = 256;    // (job id, nonce) pairs remembered per connection
 };
 
 // Point-in-time counters (all monotone since start(), except `active`).
@@ -150,6 +194,12 @@ struct StratumListenerStats {
     // R-C rework-3 (D4): job pushes / first-job logins refused by the suspend
     // GATE (the flag re-checked under the gate lock right before the push).
     std::uint64_t suspended_push_refused = 0;
+    // NET-DOS: submits dropped over the budget / refused as duplicates / refused
+    // with the connection's queue full; connections banned (any cause) and
+    // refused at accept as banned; logins timed out; the most submits queued
+    // on one connection.
+    std::uint64_t submits_over_budget = 0, submits_duplicate = 0, submits_busy = 0;
+    std::uint64_t bans = 0, refused_banned = 0, login_timeouts = 0, pending_max = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -169,7 +219,15 @@ public:
         : m_opts(std::move(opts)),
           m_templates(templates),
           m_tap(*this, sink),
-          m_server(templates, verifier, m_tap, *this) {}
+          m_server(templates, verifier, m_tap, *this) {
+        m_server.set_min_difficulty(m_opts.min_difficulty);   // NET-DOS
+    }
+
+    // NET-DOS test seam: the clock of every session timer (login deadline,
+    // submit budget, bans, parked logins). Default std::chrono::steady_clock.
+    // Call before start().
+    using NowFn = std::function<std::chrono::steady_clock::time_point()>;
+    void set_now_fn(NowFn f) { m_now_fn = std::move(f); }
 
     // GAP-2: a node-chosen extra_nonce base (see XmrStratumServer::seed_extra_nonce).
     // Call before start().
@@ -265,6 +323,7 @@ public:
             c.fd = -1;
         }
         m_clients.clear();
+        m_pending_total = 0;   // NET-DOS: the queued submits went with their connections
         m_stats.active.store(0, std::memory_order_relaxed);
         if (m_listen_fd >= 0) { ::close(m_listen_fd); m_listen_fd = -1; }
         if (m_wake[0] >= 0)   { ::close(m_wake[0]);   m_wake[0] = -1; }
@@ -352,6 +411,13 @@ public:
         s.suspend_disconnects    = m_stats.suspend_disconnects.load(std::memory_order_relaxed);
         s.suspended_sink_refused = m_stats.suspended_sink_refused.load(std::memory_order_relaxed);
         s.suspended_push_refused = m_stats.suspended_push_refused.load(std::memory_order_relaxed);
+        s.submits_over_budget    = m_stats.submits_over_budget.load(std::memory_order_relaxed);
+        s.submits_duplicate      = m_stats.submits_duplicate.load(std::memory_order_relaxed);
+        s.submits_busy           = m_stats.submits_busy.load(std::memory_order_relaxed);
+        s.bans                   = m_stats.bans.load(std::memory_order_relaxed);
+        s.refused_banned         = m_stats.refused_banned.load(std::memory_order_relaxed);
+        s.login_timeouts         = m_stats.login_timeouts.load(std::memory_order_relaxed);
+        s.pending_max            = m_stats.pending_max.load(std::memory_order_relaxed);
         return s;
     }
 
@@ -423,6 +489,17 @@ private:
         // is not re-pushed -- a parked login served by the idle-tick re-probe just
         // before the pending notify lands must not get the same template twice.
         std::uint32_t served_tid = 0;
+        // NET-DOS
+        ::c2pool::v37n::net::AddrKey addr = 0;      // remote address key (0 = none: never banned)
+        std::chrono::steady_clock::time_point connected{};
+        bool login_seen = false;                     // a "login" request arrived
+        double tokens = 0;                           // submit budget
+        std::chrono::steady_clock::time_point tokens_at{};
+        int score = 0;
+        struct Pending { std::uint32_t req_id = 0; strat::SubmitFields f; };
+        std::deque<Pending> pending;                 // submits awaiting verification
+        std::set<std::pair<std::uint32_t, std::uint32_t>> seen;   // (job id, nonce) submitted
+        std::deque<std::pair<std::uint32_t, std::uint32_t>> seen_order;
     };
 
     struct AtomicStats {
@@ -430,7 +507,9 @@ private:
             parked_logins{0}, submits{0}, accepted_shares{0}, network_blocks{0},
             rejected_submits{0}, job_pushes{0}, template_signals{0}, malformed{0},
             suspend_edges{0}, suspend_disconnects{0}, suspended_sink_refused{0},
-            suspended_push_refused{0};
+            suspended_push_refused{0},
+            submits_over_budget{0}, submits_duplicate{0}, submits_busy{0},
+            bans{0}, refused_banned{0}, login_timeouts{0}, pending_max{0};
     };
 
     // Forwarding IShareSink: counts + logs, then hands everything to the
@@ -591,6 +670,8 @@ private:
         if (c.fd >= 0) { ::close(c.fd); c.fd = -1; }
         c.dead = true;
         c.parked.reset();
+        m_pending_total -= c.pending.size();   // NET-DOS: queued submits die with the connection
+        c.pending.clear();
         m_stats.active.fetch_sub(1, std::memory_order_relaxed);
         m_stats.closed.fetch_add(1, std::memory_order_relaxed);
         log("client " + std::to_string(cid) + " (" + c.peer + ") closed: " + why);
@@ -625,7 +706,8 @@ private:
                 ids.push_back(cid);
             }
 
-            const int rc = ::poll(pfds.data(), pfds.size(), m_opts.poll_timeout_ms);
+            // NET-DOS: with submits queued, poll without waiting: one hash per pass.
+            const int rc = ::poll(pfds.data(), pfds.size(), m_pending_total ? 0 : m_opts.poll_timeout_ms);
             if (rc < 0) {
                 if (errno == EINTR) continue;
                 log(std::string("poll() failed, listener exiting: ") + std::strerror(errno));
@@ -642,6 +724,8 @@ private:
                     if (re & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) do_read(cid);
                 }
             }
+            service_submits();   // NET-DOS: at most one RandomX verification per pass
+            service_login_deadline();
             service_parked();
             reap();
         }
@@ -662,6 +746,17 @@ private:
             int one = 1;
             ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             const std::string peer = peer_string(sa);
+            const ::c2pool::v37n::net::AddrKey akey = ::c2pool::v37n::net::addr_key_of(reinterpret_cast<const sockaddr*>(&sa));
+            const auto t = now();
+            if (akey && m_bans.banned(akey, t)) {   // NET-DOS: a banned address is refused at accept
+                m_stats.refused_banned.fetch_add(1, std::memory_order_relaxed);
+                if (m_refusal_logged == std::chrono::steady_clock::time_point{} || t - m_refusal_logged >= std::chrono::seconds(5)) {
+                    m_refusal_logged = t;
+                    log("refused " + peer + ": address banned");
+                }
+                ::close(fd);
+                continue;
+            }
             if (m_stats.active.load(std::memory_order_relaxed) >= m_opts.max_clients) {
                 log("refused " + peer + ": client cap (" + std::to_string(m_opts.max_clients) + ")");
                 ::close(fd);
@@ -671,6 +766,10 @@ private:
             Client c;
             c.fd = fd;
             c.peer = peer;
+            c.addr = akey;
+            c.connected = t;
+            c.tokens = m_opts.submit_burst;
+            c.tokens_at = t;
             c.session = std::make_unique<strat::XmrStratumSession>(cid);
             m_clients.emplace(cid, std::move(c));
             m_stats.connections.fetch_add(1, std::memory_order_relaxed);
@@ -752,6 +851,7 @@ private:
         strat::XmrStratumSession& s = *c->session;
 
         if (method == "login") {
+            c->login_seen = true;   // NET-DOS: the login deadline is met by the request (a parked login too)
             const std::string login = params["login"].as_string();
             const std::string agent = params["agent"].as_string();
             if (s.logged_in()) { close_client(cid, "duplicate login"); return; }   // p2pool semantics
@@ -768,8 +868,8 @@ private:
                 // withdrawn job must not be handed out on a reconnect): park,
                 // answer when a template is available again (notify_new_template(),
                 // the resume edge, or the idle-tick re-probe in service_parked()).
-                const auto now = std::chrono::steady_clock::now();
-                c->parked = ParkedLogin{req_id, login, agent, now, now, now};
+                const auto t = now();
+                c->parked = ParkedLogin{req_id, login, agent, t, t, t};
                 m_stats.parked_logins.fetch_add(1, std::memory_order_relaxed);
                 log("client " + std::to_string(cid) + " login PARKED (" +
                     (suspended ? "lane suspended" : "no template yet") + ") agent='" + agent + "'");
@@ -801,18 +901,7 @@ private:
             f.job_id = params["job_id"].as_string();
             f.nonce  = params["nonce"].as_string();
             f.result = params["result"].as_string();
-            c->last_reply_error = false;
-            c->last_reply_msg.clear();
-            if (!m_server.handle_submit(s, req_id, f)) {
-                close_client(cid, "submit rejected at parse level (malformed fields)");
-                return;
-            }
-            c = live(cid);
-            if (c && c->last_reply_error) {
-                m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
-                log("client " + std::to_string(cid) + " submit REJECTED: " + c->last_reply_msg +
-                    " (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
-            }
+            queue_submit(cid, req_id, std::move(f));   // NET-DOS: budget, duplicate check, bounded queue
             return;
         }
 
@@ -851,9 +940,9 @@ private:
             // re-check under the suspend gate; a login that lost the race is
             // PARKED again (served on the resume edge), never handed the job.
             std::lock_guard<std::mutex> g(m_gate_mtx);
-            const auto now = std::chrono::steady_clock::now();
+            const auto t = now();
             if (m_lane_suspended.load(std::memory_order_acquire)) {
-                c->parked = ParkedLogin{req_id, login, agent, now, now, now};
+                c->parked = ParkedLogin{req_id, login, agent, t, t, t};
                 m_stats.suspended_push_refused.fetch_add(1, std::memory_order_relaxed);
                 log("client " + std::to_string(cid) + " login RE-PARKED: lane suspended at the gate (no job handed out)");
                 return;
@@ -862,7 +951,7 @@ private:
             // that reply leaves xmrig idle on an open connection for good. A login
             // whose template vanished since the peek is parked again instead.
             if (!m_templates.get_job(0, probe)) {
-                c->parked = ParkedLogin{req_id, login, agent, now, now, now};
+                c->parked = ParkedLogin{req_id, login, agent, t, t, t};
                 log("client " + std::to_string(cid) + " login RE-PARKED: the template source has no job right now");
                 return;
             }
@@ -911,7 +1000,7 @@ private:
     // SAME template id is never signalled). Only parked logins are served here:
     // logged-in sessions are never re-pushed by the tick (no job storm).
     void service_parked() {
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = this->now();
         const auto every = std::chrono::milliseconds(m_opts.parked_login_ttl_ms);
         const auto ping_every = std::chrono::milliseconds(m_opts.parked_keepalive_ms);
         static constexpr std::string_view kParkedKeepalive =
@@ -1025,6 +1114,149 @@ private:
         return true;
     }
 
+    // ── NET-DOS (listener thread only, except now()) ──────────────────────
+    std::chrono::steady_clock::time_point now() const {
+        return m_now_fn ? m_now_fn() : std::chrono::steady_clock::now();
+    }
+
+    // Close a connection and ban its address for ban_seconds (an address-less
+    // connection -- 127.0.0.1 / ::1 -- is only closed).
+    void ban_client(std::uint64_t cid, const std::string& why) {
+        Client* c = live(cid);
+        if (!c) return;
+        m_stats.bans.fetch_add(1, std::memory_order_relaxed);
+        if (c->addr && m_opts.ban_seconds > 0) {
+            const auto t = now();
+            m_bans.ban(c->addr, t, t + std::chrono::seconds(m_opts.ban_seconds));
+            log("client " + std::to_string(cid) + " (" + c->peer + ") BANNED for " + std::to_string(m_opts.ban_seconds) +
+                " s: " + why);
+        } else {
+            log("client " + std::to_string(cid) + " (" + c->peer + ") dropped (no address ban): " + why);
+        }
+        close_client(cid, "banned: " + why);
+    }
+    void score_share(std::uint64_t cid, bool good, const std::string& why) {
+        Client* c = live(cid);
+        if (!c) return;
+        c->score = std::min(c->score + (good ? m_opts.good_share_points : m_opts.bad_share_points), m_opts.max_score);
+        if (!good && c->score <= m_opts.ban_score)
+            ban_client(cid, why + " (share score " + std::to_string(c->score) + ")");
+    }
+
+    // A "submit" of a logged-in session, on the listener thread: take one token
+    // of the connection's budget (none left: banned, not verified), refuse a
+    // repeated (job id, nonce) unverified, else queue it for service_submits().
+    void queue_submit(std::uint64_t cid, std::uint32_t req_id, strat::SubmitFields f) {
+        Client* c = live(cid);
+        if (!c) return;
+        const auto t = now();
+        const double dt = std::chrono::duration<double>(t - c->tokens_at).count();
+        c->tokens_at = t;
+        if (dt > 0) c->tokens = std::min(m_opts.submit_burst, c->tokens + dt * m_opts.submit_rate);
+        if (c->tokens < 1.0) {
+            m_stats.submits_over_budget.fetch_add(1, std::memory_order_relaxed);
+            ban_client(cid, "submit budget exceeded (" + std::to_string(m_opts.submit_burst) + " burst, " +
+                                std::to_string(m_opts.submit_rate) + "/s)");
+            return;
+        }
+        c->tokens -= 1.0;
+        strat::ParsedSubmit ps;
+        if (strat::StratumDialect::parse_submit(f, ps) == strat::SubmitError::None) {
+            const std::pair<std::uint32_t, std::uint32_t> key{ps.job_id, ps.nonce};
+            if (c->seen.count(key)) {
+                m_stats.submits_duplicate.fetch_add(1, std::memory_order_relaxed);
+                m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
+                send_line(cid, strat::StratumDialect::build_error(req_id, "Duplicate share"));
+                log("client " + std::to_string(cid) + " submit REJECTED: duplicate (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+                score_share(cid, false, "duplicate share");
+                return;
+            }
+            if (c->pending.size() >= m_opts.max_pending_submits) {
+                m_stats.submits_busy.fetch_add(1, std::memory_order_relaxed);
+                m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
+                send_line(cid, strat::StratumDialect::build_error(req_id, "Busy: share not checked"));
+                return;
+            }
+            c->seen.insert(key);
+            c->seen_order.push_back(key);
+            while (c->seen_order.size() > m_opts.max_seen_submits) {
+                c->seen.erase(c->seen_order.front());
+                c->seen_order.pop_front();
+            }
+        } else if (c->pending.size() >= m_opts.max_pending_submits) {
+            m_stats.submits_busy.fetch_add(1, std::memory_order_relaxed);
+            m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
+            send_line(cid, strat::StratumDialect::build_error(req_id, "Busy: share not checked"));
+            return;
+        }
+        c->pending.push_back(Client::Pending{req_id, std::move(f)});
+        ++m_pending_total;
+        const std::uint64_t depth = c->pending.size();
+        if (depth > m_stats.pending_max.load(std::memory_order_relaxed))
+            m_stats.pending_max.store(depth, std::memory_order_relaxed);
+    }
+
+    // One queued submit verified per call, round-robin over the connections.
+    void service_submits() {
+        if (!m_pending_total) return;
+        auto it = m_clients.upper_bound(m_rr_cursor);
+        for (std::size_t n = 0; n <= m_clients.size(); ++n) {
+            if (it == m_clients.end()) it = m_clients.begin();
+            if (it == m_clients.end()) return;
+            if (!it->second.dead && !it->second.pending.empty()) break;
+            ++it;
+        }
+        if (it == m_clients.end() || it->second.dead || it->second.pending.empty()) return;
+        const std::uint64_t cid = it->first;
+        m_rr_cursor = cid;
+        Client::Pending job = std::move(it->second.pending.front());
+        it->second.pending.pop_front();
+        --m_pending_total;
+        verify_submit(cid, job.req_id, job.f);
+    }
+
+    void verify_submit(std::uint64_t cid, std::uint32_t req_id, const strat::SubmitFields& f) {
+        Client* c = live(cid);
+        if (!c) return;
+        if (m_lane_suspended.load(std::memory_order_acquire)) {   // suspended while it waited in the queue
+            m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
+            send_line(cid, strat::StratumDialect::build_error(req_id,
+                "lane suspended (settlement diverged / builder lag): share refused, job withdrawn"));
+            return;
+        }
+        c->last_reply_error = false;
+        c->last_reply_msg.clear();
+        if (!m_server.handle_submit(*c->session, req_id, f)) {
+            ban_client(cid, "submit rejected at parse level (malformed fields)");
+            return;
+        }
+        c = live(cid);
+        if (!c) return;
+        if (c->last_reply_error) {
+            m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
+            log("client " + std::to_string(cid) + " submit REJECTED: " + c->last_reply_msg +
+                " (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+            if (c->last_reply_msg == strat::submit_error_message(strat::SubmitError::LowDiff))
+                score_share(cid, false, "low difficulty share");
+        } else {
+            score_share(cid, true, "");
+        }
+    }
+
+    // A connection that sent no login request within login_timeout_ms is banned.
+    void service_login_deadline() {
+        if (m_opts.login_timeout_ms <= 0) return;
+        const auto t = now();
+        const auto limit = std::chrono::milliseconds(m_opts.login_timeout_ms);
+        std::vector<std::uint64_t> late;
+        for (const auto& [cid, c] : m_clients)
+            if (!c.dead && !c.login_seen && t - c.connected >= limit) late.push_back(cid);
+        for (std::uint64_t cid : late) {
+            m_stats.login_timeouts.fetch_add(1, std::memory_order_relaxed);
+            ban_client(cid, "no login within " + std::to_string(m_opts.login_timeout_ms) + " ms");
+        }
+    }
+
     // ── members (declaration order == construction order; m_tap before m_server)
     StratumListenerOptions   m_opts;
     strat::ITemplateSource&  m_templates;
@@ -1049,6 +1281,13 @@ private:
     AtomicStats              m_stats;
     mutable std::mutex       m_log_mtx;
     std::deque<std::string>  m_log;
+
+    // NET-DOS
+    NowFn                    m_now_fn;                 // set before start()
+    ::c2pool::v37n::net::AddrBanTable m_bans;
+    std::size_t              m_pending_total = 0;      // submits queued, all connections (listener thread)
+    std::uint64_t            m_rr_cursor = 0;          // last connection served by service_submits()
+    std::chrono::steady_clock::time_point m_refusal_logged{};
 };
 
 } // namespace c2pool::v37n::xmr::o2
