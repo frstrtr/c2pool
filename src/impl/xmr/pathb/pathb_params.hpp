@@ -55,9 +55,12 @@ inline constexpr std::uint64_t FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS =
 // cryptonote_config.h CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW.
 inline constexpr std::uint64_t CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW = ::xmr::coin::MINED_MONEY_UNLOCK_WINDOW;
 
-// cryptonote_config.h DIFFICULTY_WINDOW (also in native/consensus/xmr_difficulty.hpp,
-// which pulls Boost; pathb_branch.hpp includes that header and static_asserts equality).
+// cryptonote_config.h DIFFICULTY_WINDOW, DIFFICULTY_LAG and DIFFICULTY_BLOCKS_COUNT
+// (also in native/consensus/xmr_difficulty.hpp, which pulls Boost; pathb_branch.hpp
+// includes that header and static_asserts equality).
 inline constexpr std::uint64_t DIFFICULTY_WINDOW = 720;
+inline constexpr std::uint64_t DIFFICULTY_LAG = 15;
+inline constexpr std::uint64_t DIFFICULTY_BLOCKS_COUNT = DIFFICULTY_WINDOW + DIFFICULTY_LAG;
 
 // cryptonote_config.h CRYPTONOTE_SHORT_TERM_BLOCK_SURGE_FACTOR_V10 (named
 // CRYPTONOTE_SHORT_TERM_BLOCK_WEIGHT_SURGE_FACTOR in native/consensus/xmr_weight.hpp).
@@ -139,9 +142,11 @@ inline constexpr std::uint64_t floor_log2(std::uint64_t x) noexcept {
     return std::bit_width(x) - 1u;
 }
 
-// D_fin = ceil(DIFFICULTY_TARGET_V2 / T) (K06).
-inline constexpr std::uint64_t seal_depth(const LaneParams& p) noexcept {
-    return ceil_div(DIFFICULTY_TARGET_V2, p.carrier_interval_s);
+// D_fin (K06) = 0 at every T.
+inline constexpr std::uint64_t kSealDepth = 0;
+
+inline constexpr std::uint64_t seal_depth(const LaneParams&) noexcept {
+    return kSealDepth;
 }
 
 // Carrier positions per Monero height on average: DIFFICULTY_TARGET_V2 / T,

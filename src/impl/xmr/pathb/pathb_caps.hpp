@@ -11,8 +11,7 @@
 //   w_min        = weight of the smallest valid non-coinbase transaction      (1,459 at hf 16 and 17)
 //   X(hf)        = 0, or kFcmpContentHashExtraLeaves from HF_VERSION_FCMP_PLUS_PLUS
 //   D_max(hf, A) = floor(log2(X(hf) + 1 + floor(2 x SURGE(hf) x max(zone(hf), Z_lt(A)) / w_min)))
-//   RECEIPT_CAP  = RECEIPT_MAX(D_max) = 497 + 32 D_max                       (945 at v16, 881 at v17)
-//                  (a local buffer bound; a body is judged by the size rules below)
+//   RECEIPT_CAP  = RECEIPT_MAX(D_max) = 465 + 32 D_max                       (913 at v16, 849 at v17)
 //   size rules   : tx_count - 1 <= floor(2 Z(P_r) / w_min); D == floor(log2(tx_count + X(hf)))
 //   blob_cap_own(hf, Z_A, Z_P) = HDR_max + OVH + N_max x OUT + 32 n + V(n) + TRAILER(hf)
 //                  N_max = max(1, floor((Z_A - OVH) / OUT)), <= FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS from hf 17
@@ -20,23 +19,30 @@
 //   blob_cap_ctx(hf, Z) = HDR_ctx + 2 Z + V(0) + TRAILER(hf)       (600,051 at v16, 1,250,084 at v17)
 //                  HDR_ctx = major, minor, timestamp varints at their type bounds + prev_id + nonce (50)
 //                  TRAILER(hf) = 0; from HF_VERSION_FCMP_PLUS_PLUS n_tree_layers u8 + tree_root 32 (33)
-//   J            = max(P_heal x 3600 / T, F x 120 / T + D_fin)                 (1,164)
+//   J            = max(P_heal x 3600 / T, F x 120 / T + D_fin)                 (1,152)
 //   index_horizon   = F + Fresh + 1                                            (99)
-//   backfill        = max(F x 120 / T + D_fin, J)                              (1,164)
-//   ctx_window      = ceil(J x T / 120) + Fresh + 1                            (100)
+//   backfill        = max(F x 120 / T + D_fin, J)                              (1,152)
+//   ctx_window      = ceil(J x T / 120) + Fresh + 1                            (99)
 //   ctx_max_depth   = Fresh + 1                                                (3)
-//   index_retention = max(SEEDHASH_EPOCH_BLOCKS + SEEDHASH_EPOCH_LAG,
-//                         ceil(J x T / 120) + Fresh + 1 + CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW
-//                         + DIFFICULTY_WINDOW)                                 (2,112)
+//   index_retention = Monero rows kept = max(rows_window, k_alt + DIFFICULTY_BLOCKS_COUNT)
+//                     default k_alt + DIFFICULTY_BLOCKS_COUNT                  (1,455)
+//                     rows_window = M - h_floor + 1,
+//                     h_floor = min(H(L - J), H(L - D_fin) - F - Fresh + 1) - 1 - delta_win,
+//                     delta_win = max(DIFFICULTY_BLOCKS_COUNT,
+//                                     CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW + CRYPTONOTE_REWARD_BLOCKS_WINDOW,
+//                                     BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW) - 1   (734)
+//                     (seed ids are kept from lane genesis, outside the rows)
 //   pending_cap     = F x 120 / T x R_MAX                                      (18,432)
-// (values at T 10, F 96, Fresh 2, R_MAX 16, P_heal 3 h). 120 is DIFFICULTY_TARGET_V2.
-// Divisions over lane parameters round up.
+// (values at T 10, F 96, D_fin 0, Fresh 2, R_MAX 16, P_heal 3 h, k_alt 720). 120 is
+// DIFFICULTY_TARGET_V2. Divisions over lane parameters round up.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+
+#include "impl/xmr/native/consensus/xmr_timestamp.hpp"  // BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW
 
 #include "pathb_params.hpp"
 #include "pathb_wire_v3.hpp"
@@ -237,11 +243,45 @@ struct RelayHorizons {
     std::uint64_t backfill = 0;         // positions
     std::uint64_t ctx_window = 0;       // heights
     std::uint64_t ctx_max_depth = 0;    // blocks per unsolicited receipt
-    std::uint64_t index_retention = 0;  // heights
+    std::uint64_t index_retention = 0;  // Monero rows kept (default)
     std::uint64_t pending_cap = 0;      // receipts
 
     friend bool operator==(const RelayHorizons&, const RelayHorizons&) = default;
 };
+
+// P-07 k_alt, Monero blocks: the follower's alt depth
+// (ChainIndexOptions::max_reorg_depth, native/chain/xmr_chain_index.hpp).
+inline constexpr std::uint64_t kAltDepth = 720;
+
+// delta_win = max(DIFFICULTY_BLOCKS_COUNT, CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW +
+// CRYPTONOTE_REWARD_BLOCKS_WINDOW, BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW) - 1.
+inline constexpr std::uint64_t kRowsWindowDelta =
+        std::max({DIFFICULTY_BLOCKS_COUNT,
+                  CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW + ::c2pool::xmr::native::CRYPTONOTE_REWARD_BLOCKS_WINDOW,
+                  ::c2pool::xmr::native::BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW})
+        - 1;
+
+// Default of the Monero rows kept: k_alt + DIFFICULTY_BLOCKS_COUNT.
+inline constexpr std::uint64_t monero_rows_default(std::uint64_t k_alt) noexcept {
+    return k_alt + DIFFICULTY_BLOCKS_COUNT;
+}
+
+// rows_window at a carrier chain whose tip L has records H(L - J) and
+// H(L - D_fin), with Monero tip height M. Heights below 0 clamp to 0.
+inline constexpr std::uint64_t rows_window(const LaneParams& p, std::uint64_t monero_tip, std::uint64_t record_back_j,
+                                           std::uint64_t record_back_dfin) noexcept {
+    const std::uint64_t open_span = p.open_bins + p.fresh_max - 1;
+    const std::uint64_t open_floor = record_back_dfin > open_span ? record_back_dfin - open_span : 0;
+    const std::uint64_t lowest = std::min(record_back_j, open_floor);
+    const std::uint64_t h_floor = lowest > 1 + kRowsWindowDelta ? lowest - 1 - kRowsWindowDelta : 0;
+    return monero_tip >= h_floor ? monero_tip - h_floor + 1 : 0;
+}
+
+// Monero rows kept: max(rows_window, default).
+inline constexpr std::uint64_t monero_rows_keep(const LaneParams& p, std::uint64_t k_alt, std::uint64_t monero_tip,
+                                                std::uint64_t record_back_j, std::uint64_t record_back_dfin) noexcept {
+    return std::max(rows_window(p, monero_tip, record_back_j, record_back_dfin), monero_rows_default(k_alt));
+}
 
 inline constexpr RelayHorizons relay_horizons(const LaneParams& p) noexcept {
     const std::uint64_t j = journal_depth(p);
@@ -251,8 +291,7 @@ inline constexpr RelayHorizons relay_horizons(const LaneParams& p) noexcept {
     h.backfill = std::max(fold_crossing_depth(p), j);
     h.ctx_window = j_heights + p.fresh_max + 1;
     h.ctx_max_depth = p.fresh_max + 1;
-    h.index_retention = std::max(SEEDHASH_EPOCH_BLOCKS + SEEDHASH_EPOCH_LAG,
-                                 j_heights + p.fresh_max + 1 + CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW + DIFFICULTY_WINDOW);
+    h.index_retention = monero_rows_default(kAltDepth);
     h.pending_cap = positions_for_heights(p, p.open_bins) * p.r_max;
     return h;
 }

@@ -5,9 +5,9 @@
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/test/v37_xmr_pathb_journal_kat.cpp
-// Rewind journal of depth J = journal_depth(ruled parameters) = 1,164:
-//   (1) 2,000 appends hold the newest 1,164 records; base 836, tip 2,000;
-//   (2) fork point at depth J: Rewound, 1,164 records out newest first;
+// Rewind journal of depth J = journal_depth(ruled parameters) = 1,152:
+//   (1) 2,000 appends hold the newest 1,152 records; base 848, tip 2,000;
+//   (2) fork point at depth J: Rewound, 1,152 records out newest first;
 //       fork point at depth J + 1: RebuildRequired, nothing changes; fork
 //       point above the tip: ForkAboveTip, nothing changes;
 //   (3) rewind + replay of a heavier branch gives the same state digest as a
@@ -74,15 +74,15 @@ struct Node {
 int main() {
     std::printf("v37_xmr_pathb_journal_kat\n");
     const std::uint64_t J = pb::journal_depth(pb::kRuledLaneParams);
-    check(J == 1164, "J = 1,164");
+    check(J == 1152, "J = 1,152");
 
     // (1)
     Node n(J);
     for (std::uint64_t pos = 1; pos <= 2000; ++pos) n.extend(trunk(pos));
     check(n.j.size() == J, "journal holds J records");
-    check(n.j.tip_position() == 2000 && n.j.base_position() == 2000 - J, "tip 2,000, base 836");
-    check(n.j.holds(837) && !n.j.holds(836) && n.j.at(837).pos == 837 && n.j.at(2000).pos == 2000,
-          "positions 837..2,000 held");
+    check(n.j.tip_position() == 2000 && n.j.base_position() == 2000 - J, "tip 2,000, base 848");
+    check(n.j.holds(849) && !n.j.holds(848) && n.j.at(849).pos == 849 && n.j.at(2000).pos == 2000,
+          "positions 849..2,000 held");
 
     // (2)
     check(n.j.verdict_for(2000 - J) == pb::RewindVerdict::Rewound, "fork at depth J: rewind");

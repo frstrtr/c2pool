@@ -35,8 +35,9 @@ namespace c2pool::xmr::pathb {
 
 using U128 = ::c2pool::xmr::native::U128;
 
-inline constexpr std::uint64_t DIFFICULTY_BLOCKS_COUNT = ::c2pool::xmr::native::DIFFICULTY_BLOCKS_COUNT;
 static_assert(DIFFICULTY_WINDOW == ::c2pool::xmr::native::DIFFICULTY_WINDOW);
+static_assert(DIFFICULTY_LAG == ::c2pool::xmr::native::DIFFICULTY_LAG);
+static_assert(DIFFICULTY_BLOCKS_COUNT == ::c2pool::xmr::native::DIFFICULTY_BLOCKS_COUNT);
 
 struct BranchBlock {
     Hash32 id{};

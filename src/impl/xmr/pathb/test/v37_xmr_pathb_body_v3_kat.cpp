@@ -6,8 +6,8 @@
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/test/v37_xmr_pathb_body_v3_kat.cpp
 // Receipt body v3 and carrier body v3 codecs:
-//   (1) RECEIPT_MAX(D) = 497 + 32 D (753 / 945 / 1,009 at D 8 / 14 / 16;
-//       431 + 32 D without owner_ref); the largest body encodes to exactly
+//   (1) RECEIPT_MAX(D) = 465 + 32 D (721 / 913 / 977 at D 8 / 14 / 16;
+//       399 + 32 D without owner_ref); the largest body encodes to exactly
 //       RECEIPT_MAX(D);
 //   (2) buffer bound and size rules: a body of RECEIPT_MAX(D_max) accepted,
 //       one byte more dropped without a verdict (OverCap); a body of depth
@@ -29,8 +29,8 @@
 //   (7) carrier frame: FH = 6 (u8 opcode | u8 frame version | u32 chain_id),
 //       the header of the relay frames in xmr_relay_wire.hpp (FB_RECEIPTS
 //       header = FH + count byte, FB_CTX header = FH + id + length, FB_GETCTX
-//       bytes); FRAME_CAP = FH + carrier_body_cap = 16,073 at D_max 14,
-//       R_MAX 16.
+//       bytes); FRAME_CAP = FH + carrier_body_cap = 15,529 at D_max 14,
+//       R_MAX 16 (14,441 at v17).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -90,15 +90,15 @@ int main() {
     // (1) RECEIPT_MAX
     check(pb::kHashingBlobMaxBytes == 78, "hashing blob max 78 B");
     check(pb::kHashingHeaderMaxBytes == 43, "HDR_max 43 B");
-    check(pb::kReceiptFixedMaxBytes == 497, "RECEIPT_MAX(0) = 497");
-    check(pb::receipt_max(8) == 753, "RECEIPT_MAX(8) = 753");
-    check(pb::receipt_max(14) == 945, "RECEIPT_MAX(14) = 945");
-    check(pb::receipt_max(16) == 1009, "RECEIPT_MAX(16) = 1,009");
+    check(pb::kReceiptFixedMaxBytes == 465, "RECEIPT_MAX(0) = 465");
+    check(pb::receipt_max(8) == 721, "RECEIPT_MAX(8) = 721");
+    check(pb::receipt_max(14) == 913, "RECEIPT_MAX(14) = 913");
+    check(pb::receipt_max(16) == 977, "RECEIPT_MAX(16) = 977");
     for (std::size_t d : {0u, 1u, 8u, 12u, 14u, 16u}) {
         const std::vector<std::uint8_t> full = enc(make_max_body(d, true));
         const std::vector<std::uint8_t> nofee = enc(make_max_body(d, false));
         check(full.size() == pb::receipt_max(d), "largest body at D " + std::to_string(d) + " = RECEIPT_MAX(D)");
-        check(nofee.size() == 431 + 32 * d, "largest body without owner_ref at D " + std::to_string(d) + " = 431 + 32 D");
+        check(nofee.size() == 399 + 32 * d, "largest body without owner_ref at D " + std::to_string(d) + " = 399 + 32 D");
         check(full[0] == 78, "largest hashing blob 78 B at D " + std::to_string(d));
     }
 
@@ -107,7 +107,7 @@ int main() {
     check(dmax == 14, "D_max(v16, zone) = 14");
     {
         const std::vector<std::uint8_t> at_cap = enc(make_max_body(dmax, true));
-        check(at_cap.size() == 945, "body at RECEIPT_MAX(D_max) is 945 B");
+        check(at_cap.size() == 913, "body at RECEIPT_MAX(D_max) is 913 B");
         check(dec(at_cap, dmax) == pb::WireError::None, "body of RECEIPT_MAX(D_max) accepted");
         std::vector<std::uint8_t> plus1 = at_cap;
         plus1.push_back(0);
@@ -247,7 +247,7 @@ int main() {
     // (6) carrier body
     {
         const pb::CarrierLimits lim{dmax, pb::kRuledLaneParams.r_max};
-        check(pb::carrier_body_cap(lim) == 1 + 945 + 1 + 16 * 945, "carrier_body_cap = 2 + 17 x 945");
+        check(pb::carrier_body_cap(lim) == 1 + 913 + 1 + 16 * 913, "carrier_body_cap = 2 + 17 x 913");
 
         pb::CarrierBodyV3 c0;
         c0.own = make_body(3, true, 1);
@@ -333,9 +333,9 @@ int main() {
 
         const pb::CarrierLimits lim{dmax, pb::kRuledLaneParams.r_max};
         check(pb::frame_cap(lim) == pb::kFrameHeaderBytes + pb::carrier_body_cap(lim), "FRAME_CAP = FH + carrier_body_cap");
-        check(pb::frame_cap(lim) == 16073, "FRAME_CAP = 6 + 2 + 17 x 945 = 16,073 at D_max 14, R_MAX 16");
+        check(pb::frame_cap(lim) == 15529, "FRAME_CAP = 6 + 2 + 17 x 913 = 15,529 at D_max 14, R_MAX 16");
         const pb::CarrierLimits lim17{pb::d_max(17, 0).value_or(0), pb::kRuledLaneParams.r_max};
-        check(pb::frame_cap(lim17) == 6 + 2 + 17 * 881, "FRAME_CAP = 14,985 at v17 (RECEIPT_CAP 881)");
+        check(pb::frame_cap(lim17) == 14441, "FRAME_CAP = 6 + 2 + 17 x 849 = 14,441 at v17 (RECEIPT_CAP 849)");
     }
 
     return finish("v37_xmr_pathb_body_v3_kat");
