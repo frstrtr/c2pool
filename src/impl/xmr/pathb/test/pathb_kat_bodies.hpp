@@ -38,10 +38,29 @@ inline pb::SideDataV3 golden_side() {
     return s;
 }
 
+// The first encoding seq32(seed) with byte 0 = 0, 1, 2, ... that decompresses.
+inline pb::Hash32 point_from(std::uint8_t seed) {
+    pb::Hash32 h = seq32(seed);
+    for (unsigned k = 0; k < 256; ++k) {
+        h[0] = static_cast<std::uint8_t>(k);
+        if (pb::point_decompresses(h)) return h;
+    }
+    return h;
+}
+
+// The first seq32 pattern that does not decompress.
+inline pb::Hash32 non_point() {
+    for (unsigned i = 0; i < 256; ++i) {
+        const pb::Hash32 h = seq32(static_cast<std::uint8_t>(i));
+        if (!pb::point_decompresses(h)) return h;
+    }
+    return pb::Hash32{};
+}
+
 inline pb::XmrKeyRef key_ref(std::uint8_t seed) {
     pb::XmrKeyRef r;
-    r.spend = seq32(seed);
-    r.view = seq32(static_cast<std::uint8_t>(seed + 0x55));
+    r.spend = point_from(seed);
+    r.view = point_from(static_cast<std::uint8_t>(seed + 0x55));
     return r;
 }
 

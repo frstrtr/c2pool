@@ -13,7 +13,8 @@
 //   (4) version != 3, p > 10000, give_author_bp > 10000, owner identity
 //       zero/non-zero against p: refused by the decoder and the encoder;
 //   (5) in the receipt body: payee kind XMR_SUB refused, owner_ref with p = 0
-//       refused, owner_ref missing with p > 0 refused, ref len != 64 refused;
+//       refused, owner_ref missing with p > 0 refused, ref len != 64 refused,
+//       a key that does not decompress refused (decoder and encoder);
 //   (6) identity binding of the refs to side_data.
 // ---------------------------------------------------------------------------
 #include <cstdint>
@@ -209,6 +210,26 @@ int main() {
         bad.owner = key_ref(5);
         check(pb::encode_receipt_body_v3(bad, sink) == pb::WireError::OwnerIdentity && sink.empty(),
               "encoder refuses owner_ref with p = 0");
+
+        // key points
+        const pb::Hash32 bad_pt = non_point();
+        check(!pb::point_decompresses(bad_pt) && pb::point_decompresses(with_owner.payee.spend),
+              "a non-point encoding found; fixture keys decompress");
+        b = eo;
+        const std::size_t pr_o = payee_ref_offset(eo, depth);
+        for (std::size_t i = 0; i < pb::kHashBytes; ++i) b[pr_o + 2 + i] = bad_pt[i];
+        check(dec_body(b, depth) == pb::WireError::PayeeRefPoint, "payee spend key not a point refused");
+        b = eo;
+        for (std::size_t i = 0; i < pb::kHashBytes; ++i) b[orf + 2 + pb::kHashBytes + i] = bad_pt[i];
+        check(dec_body(b, depth) == pb::WireError::OwnerRefPoint, "owner view key not a point refused");
+        bad = with_owner;
+        bad.payee.view = bad_pt;
+        check(pb::encode_receipt_body_v3(bad, sink) == pb::WireError::PayeeRefPoint && sink.empty(),
+              "encoder refuses a payee key that is not a point");
+        bad = with_owner;
+        bad.owner->spend = bad_pt;
+        check(pb::encode_receipt_body_v3(bad, sink) == pb::WireError::OwnerRefPoint && sink.empty(),
+              "encoder refuses an owner key that is not a point");
 
         // (6) identity binding
         check(pb::identities_bound(with_owner), "payee and owner identities bound");

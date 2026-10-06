@@ -32,7 +32,8 @@
 //   hashing_blob = varint major (1 B max) | varint minor (1 B max)
 //                | varint timestamp (5 B max) | prev_id[32] | nonce u32
 //                | tree_root[32] | varint tx_count (3 B max)
-//   key ref = u8 kind (XMR_STD) | u8 len (64) | spend[32] | view[32]
+//   key ref = u8 kind (XMR_STD) | u8 len (64) | spend[32] | view[32],
+//             spend and view decompress as ed25519 points
 //   RECEIPT_MAX(D) = 497 + 32 D
 //
 // carrier body:
@@ -63,6 +64,9 @@
 #include <vector>
 
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"           // ::xmr::coin::keccak256
+extern "C" {
+#include "vendor/crypto-ops.h"                             // ge_frombytes_vartime (xmr_coin)
+}
 #include "impl/xmr/native/consensus/xmr_blob_reader.hpp"   // BlobReader (monerod varint rules)
 #include "sharechain/v37/v37_descriptor_xmr.hpp"           // XMR_STD, XMR_PAYLOAD_LEN, xmr_identity_key
 
@@ -168,6 +172,8 @@ enum class WireError : std::uint8_t {
     PayeeRefLength,   // payee_ref len != 64
     OwnerRefKind,     // owner_ref kind != XMR_STD
     OwnerRefLength,   // owner_ref len != 64
+    PayeeRefPoint,    // payee spend or view key does not decompress
+    OwnerRefPoint,    // owner spend or view key does not decompress
     CarriedCount,     // n_carried above R_MAX
     Unencodable,      // encoder input outside the format
 };
@@ -188,6 +194,8 @@ inline const char* to_string(WireError e) noexcept {
         case WireError::PayeeRefLength: return "payee-ref-length";
         case WireError::OwnerRefKind: return "owner-ref-kind";
         case WireError::OwnerRefLength: return "owner-ref-length";
+        case WireError::PayeeRefPoint: return "payee-ref-point";
+        case WireError::OwnerRefPoint: return "owner-ref-point";
         case WireError::CarriedCount: return "carried-count";
         case WireError::Unencodable: return "unencodable";
     }
@@ -328,6 +336,16 @@ struct XmrKeyRef {
     friend bool operator==(const XmrKeyRef&, const XmrKeyRef&) = default;
 };
 
+// An ed25519 point encoding that decompresses.
+inline bool point_decompresses(const Hash32& k) noexcept {
+    ge_p3 p;
+    return ge_frombytes_vartime(&p, k.data()) == 0;
+}
+
+inline bool key_ref_points_valid(const XmrKeyRef& r) noexcept {
+    return point_decompresses(r.spend) && point_decompresses(r.view);
+}
+
 struct ReceiptBodyV3 {
     HashingBlob blob;
     std::array<std::uint8_t, kExtraNonceBytes> extra_nonce{};
@@ -398,13 +416,15 @@ inline WireError read_hashing_blob(BlobReader& r, std::size_t blob_len, HashingB
     return WireError::None;
 }
 
-inline WireError read_key_ref(BlobReader& r, XmrKeyRef& ref, WireError kind_err, WireError len_err) noexcept {
+inline WireError read_key_ref(BlobReader& r, XmrKeyRef& ref, WireError kind_err, WireError len_err,
+                              WireError point_err) noexcept {
     std::uint8_t kind = 0;
     std::uint8_t len = 0;
     if (!r.read_byte(kind) || !r.read_byte(len)) return WireError::Truncated;
     if (kind != kPayeeKindXmrStd) return kind_err;
     if (len != kKeyRefPayloadBytes) return len_err;
     if (!get_hash(r, ref.spend) || !get_hash(r, ref.view)) return WireError::Truncated;
+    if (!key_ref_points_valid(ref)) return point_err;
     return WireError::None;
 }
 
@@ -422,6 +442,8 @@ inline WireError receipt_body_v3_check(const ReceiptBodyV3& b) noexcept {
     if (b.branch.size() > UINT8_MAX) return WireError::Unencodable;
     if (WireError e = side_data_v3_check(b.side); e != WireError::None) return e;
     if ((b.side.fee_rate_bp > 0) != b.owner.has_value()) return WireError::OwnerIdentity;
+    if (!key_ref_points_valid(b.payee)) return WireError::PayeeRefPoint;
+    if (b.owner && !key_ref_points_valid(*b.owner)) return WireError::OwnerRefPoint;
     return WireError::None;
 }
 
@@ -456,12 +478,14 @@ inline WireError read_receipt_body_v3(BlobReader& r, ReceiptBodyV3& out) {
     for (Hash32& h : v.branch)
         if (!detail::get_hash(r, h)) return WireError::Truncated;
     if (WireError e = read_side_data_v3(r, v.side); e != WireError::None) return e;
-    if (WireError e = detail::read_key_ref(r, v.payee, WireError::PayeeRefKind, WireError::PayeeRefLength);
+    if (WireError e = detail::read_key_ref(r, v.payee, WireError::PayeeRefKind, WireError::PayeeRefLength,
+                                              WireError::PayeeRefPoint);
         e != WireError::None)
         return e;
     if (v.side.fee_rate_bp > 0) {
         XmrKeyRef owner;
-        if (WireError e = detail::read_key_ref(r, owner, WireError::OwnerRefKind, WireError::OwnerRefLength);
+        if (WireError e = detail::read_key_ref(r, owner, WireError::OwnerRefKind, WireError::OwnerRefLength,
+                                                  WireError::OwnerRefPoint);
             e != WireError::None)
             return e;
         v.owner = owner;
