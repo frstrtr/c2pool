@@ -82,13 +82,20 @@ static_assert(HF_VERSION_FCMP_PLUS_PLUS == ::c2pool::xmr::native::HF_VERSION_REJ
 
 // ---------------------------------------------------------------------------
 // Lane parameters (K-list ids). The ruled set is kRuledLaneParams below.
+// lane_params_valid covers the fields read by pathb_caps.hpp and
+// pathb_catchup.hpp; retarget_params_valid (pathb_retarget.hpp) covers K01,
+// K02 and K03.
 // ---------------------------------------------------------------------------
 struct LaneParams {
-    std::uint64_t carrier_interval_s = 0;  // K01 T
-    std::uint64_t open_bins = 0;           // K04 F
-    std::uint64_t fresh_max = 0;           // K07 Fresh
-    std::uint64_t r_max = 0;               // K08 R_MAX
-    std::uint64_t heal_period_h = 0;       // K27 P_heal (hours)
+    std::uint64_t carrier_interval_s = 0;   // K01 T
+    std::uint64_t open_bins = 0;            // K04 F
+    std::uint64_t fresh_max = 0;            // K07 Fresh
+    std::uint64_t r_max = 0;                // K08 R_MAX
+    std::uint64_t heal_period_h = 0;        // K27 P_heal (hours)
+    std::uint64_t d_min = 0;                // K02 d_min
+    std::uint64_t retarget_span = 0;        // K03 N_rt (carriers)
+    std::uint64_t retarget_growth_num = 0;  // K03 g* = num / den (pathb_retarget.hpp)
+    std::uint64_t retarget_growth_den = 0;
 };
 
 inline constexpr LaneParams kRuledLaneParams{
@@ -97,6 +104,10 @@ inline constexpr LaneParams kRuledLaneParams{
     /*fresh_max=*/2,
     /*r_max=*/16,
     /*heal_period_h=*/3,
+    /*d_min=*/18180,
+    /*retarget_span=*/2160,
+    /*retarget_growth_num=*/101,
+    /*retarget_growth_den=*/100,
 };
 
 inline constexpr std::uint64_t kSecondsPerHour = 3600;

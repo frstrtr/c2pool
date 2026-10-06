@@ -9,6 +9,8 @@
 #   pathb_catchup.hpp        catch-up template rule, template freshness
 #   pathb_journal.hpp        rewind journal of depth J
 #   pathb_headers_first.hpp  side-branch decision from announced headers
+#   pathb_retarget.hpp       carrier retarget (K01, K02, K03)
+#   pathb_fork_choice.hpp    carrier tree, fork choice, switch plan
 #
 # `xmr_pathb` is an INTERFACE target: the include root, xmr_coin (Keccak,
 # vendored difficulty) and Boost headers (the vendored difficulty's uint128).
