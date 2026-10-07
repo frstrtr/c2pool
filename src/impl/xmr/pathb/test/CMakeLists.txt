@@ -12,6 +12,9 @@
 #   xmr_template_catchup_kat         catch-up template rule
 #   v37_xmr_pathb_journal_kat        rewind journal, rebuild verdict
 #   v37_xmr_pathb_headers_first_kat  side-branch decision from headers
+#   xmr_share_retarget_kat           carrier retarget: formula, widths, scenarios
+#   xmr_carrier_sharechain_kat       carrier fork choice, deferral, switch plans,
+#                                    headers-first over the retarget, receipts_root fold
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
@@ -28,7 +31,9 @@ if (BUILD_TESTING)
             v37_xmr_pathb_branch_kat
             xmr_template_catchup_kat
             v37_xmr_pathb_journal_kat
-            v37_xmr_pathb_headers_first_kat)
+            v37_xmr_pathb_headers_first_kat
+            xmr_share_retarget_kat
+            xmr_carrier_sharechain_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
