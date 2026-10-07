@@ -6671,19 +6671,14 @@ int main(int argc, char* argv[]) {
 
                     // Wire merged block found → unified verification via FoundBlock
                     auto* mi_ptr = web_server.get_mining_interface();
+                    // #946: miner, subsidy and parent_* come from the stratum
+                    // submit (MergedSubmitScope) via record_merged_found_block.
                     mm_manager->set_on_merged_block_found(
                         [mi_ptr](const std::string& symbol, int height,
-                                 const std::string& block_hash, bool accepted) {
-                            uint256 h;
-                            h.SetHex(block_hash);
-                            double net_diff = mi_ptr->get_network_difficulty();
-                            double pool_hr = mi_ptr->get_local_hashrate();
-                            std::string miner_addr = mi_ptr->get_payout_address();
-                            mi_ptr->record_found_block(
-                                static_cast<uint64_t>(height), h, 0, symbol,
-                                miner_addr, "", net_diff, 0, pool_hr, 0);
-                            if (accepted)
-                                mi_ptr->schedule_block_verification(block_hash);
+                                 const std::string& block_hash, bool accepted,
+                                 uint64_t coinbase_value) {
+                            mi_ptr->record_merged_found_block(
+                                symbol, height, block_hash, accepted, coinbase_value);
                         });
 
                     // When merged mining aux work changes (new DOGE block),

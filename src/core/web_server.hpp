@@ -1186,6 +1186,47 @@ public:
                               const std::string& coinbase_txid,
                               std::optional<uint32_t> tx_count);
 
+    /// #946: fill parent_hash / parent_height on the already-recorded merged
+    /// (DOGE) row(s) for this block hash. Same fill-only rules as
+    /// set_found_block_body; parent_height 0 means unknown and is ignored.
+    void set_found_block_parent(const std::string& block_hash,
+                                const std::string& parent_hash,
+                                std::optional<uint64_t> parent_height);
+
+    /// #946: what the stratum submit knows about an aux (DOGE) solve that
+    /// MergedMiningManager does not -- the parent LTC block id (SHA256d of
+    /// the header; the manager only ever sees the scrypt PoW hash), the LTC
+    /// template height it was mined at, and the miner's address. Installed on
+    /// the submitting thread for the duration of check_merged_mining; the
+    /// merged-found callback fires synchronously inside it.
+    struct MergedSubmitContext {
+        std::string             parent_hash;
+        std::optional<uint64_t> parent_height;
+        std::string             miner;
+        // The job's template previousblockhash. When parent_height is unset,
+        // the height is read from the live template only if it still builds
+        // on this prev (rare path: runs only for a found aux block).
+        std::string             parent_prev_hash;
+    };
+    class MergedSubmitScope {
+    public:
+        explicit MergedSubmitScope(MergedSubmitContext ctx);
+        ~MergedSubmitScope();
+        MergedSubmitScope(const MergedSubmitScope&) = delete;
+        MergedSubmitScope& operator=(const MergedSubmitScope&) = delete;
+    private:
+        MergedSubmitContext        m_ctx;
+        const MergedSubmitContext* m_prev;
+    };
+
+    /// #946: record a merged (DOGE) block this node submitted. Fills miner,
+    /// subsidy and parent_* from the active MergedSubmitScope when there is
+    /// one; outside a scope the miner falls back to the node payout address
+    /// and parent_* stay null (unknown), never "" or 0.
+    void record_merged_found_block(const std::string& symbol, int height,
+                                   const std::string& block_hash, bool accepted,
+                                   uint64_t coinbase_value);
+
     /// Retain the block-header field lookups so paths OTHER than the one-shot
     /// startup backfill can re-derive a missing network_difficulty from the
     /// header chain. backfill_block_fields runs exactly once, before the
@@ -1305,7 +1346,8 @@ private:
     bool check_merged_mining(const std::string& block_hex,
                              const std::string& extranonce1,
                              const std::string& extranonce2,
-                             const JobSnapshot* job = nullptr);
+                             const JobSnapshot* job = nullptr,
+                             const std::string& miner = "");
     
     // Internal state
     uint64_t m_work_id_counter;

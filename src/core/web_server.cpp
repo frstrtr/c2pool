@@ -411,7 +411,8 @@ std::string MiningInterface::get_node_fee_hash160() const
 bool MiningInterface::check_merged_mining(const std::string& block_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2,
-                                          const JobSnapshot* job)
+                                          const JobSnapshot* job,
+                                          const std::string& miner)
 {
     if (!m_mm_manager) return false;
 
@@ -435,6 +436,14 @@ bool MiningInterface::check_merged_mining(const std::string& block_hex,
         coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
         merkle_branches_copy = job ? job->merkle_branches : m_cached_merkle_branches;
     }
+
+    // #946: the explorer's parent_hash is the LTC block id (SHA256d), not
+    // the scrypt PoW hash the aux-target check needs.
+    MergedSubmitContext ctx;
+    ctx.parent_hash = Hash(hdr_bytes).GetHex();
+    if (job) ctx.parent_prev_hash = job->gbt_prevhash;
+    ctx.miner = miner;
+    MergedSubmitScope submit_scope(std::move(ctx));
 
     auto before = m_mm_manager->get_discovered_blocks().size();
     m_mm_manager->try_submit_merged_blocks(
@@ -2702,7 +2711,9 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
         {"chain", b.chain},
         {"confirmations", b.confirmations},
         {"miner", b.miner},
-        {"share", b.share_hash},
+        // #946: no share behind the find (e.g. an aux solve that missed the
+        // share target) is null, never "".
+        {"share", str_or_null(b.share_hash)},
         {"found_locally", have_local_record},
         // Authorship, set at the call site that knows. "unknown" is a real
         // answer -- a coin lane that has not labelled its sites -- and the
@@ -4005,6 +4016,90 @@ void MiningInterface::set_found_block_body(const std::string& block_hash,
             }
         }
     }
+}
+
+void MiningInterface::set_found_block_parent(const std::string& block_hash,
+                                             const std::string& parent_hash,
+                                             std::optional<uint64_t> parent_height)
+{
+    if (parent_height && *parent_height == 0) parent_height.reset();
+    auto lower = [](std::string s) {
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    const std::string h = lower(block_hash);
+    const std::string ph = lower(parent_hash);
+    std::vector<FoundBlock> changed;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (auto& blk : m_found_blocks) {
+            if (blk.hash != h) continue;
+            bool dirty = false;
+            if (blk.parent_hash.empty() && !ph.empty()) {
+                blk.parent_hash = ph;
+                dirty = true;
+            }
+            if (!blk.parent_height && parent_height) {
+                blk.parent_height = parent_height;
+                dirty = true;
+            }
+            if (dirty) changed.push_back(blk);
+        }
+    }
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& blk : changed) {
+            try { m_persist_block_fn(blk); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist found-block parent fields: " << e.what();
+            }
+        }
+    }
+}
+
+namespace {
+// The submitting thread's MergedSubmitScope (null outside check_merged_mining).
+thread_local const MiningInterface::MergedSubmitContext* t_merged_submit_ctx = nullptr;
+} // namespace
+
+MiningInterface::MergedSubmitScope::MergedSubmitScope(MergedSubmitContext ctx)
+    : m_ctx(std::move(ctx)), m_prev(t_merged_submit_ctx)
+{
+    t_merged_submit_ctx = &m_ctx;
+}
+
+MiningInterface::MergedSubmitScope::~MergedSubmitScope()
+{
+    t_merged_submit_ctx = m_prev;
+}
+
+void MiningInterface::record_merged_found_block(const std::string& symbol, int height,
+                                                const std::string& block_hash, bool accepted,
+                                                uint64_t coinbase_value)
+{
+    const MergedSubmitContext* ctx = t_merged_submit_ctx;
+    uint256 h;
+    h.SetHex(block_hash);
+    const std::string miner = (ctx && !ctx->miner.empty()) ? ctx->miner : get_payout_address();
+    // share stays "" (JSON null): the aux solve is not tied to a sharechain
+    // share here. Network difficulty is still the parent's (#1738).
+    record_found_block(static_cast<uint64_t>(height), h, 0, symbol,
+                       miner, "", get_network_difficulty(), 0, get_local_hashrate(),
+                       coinbase_value, BlockAuthorship::this_node);
+    if (ctx) {
+        std::optional<uint64_t> parent_height = ctx->parent_height;
+        if (!parent_height && !ctx->parent_prev_hash.empty()) {
+            auto tmpl = get_current_work_template();
+            if (tmpl.is_object() && tmpl.contains("previousblockhash") && tmpl.contains("height")
+                && tmpl["previousblockhash"].is_string()
+                && tmpl["previousblockhash"].get<std::string>() == ctx->parent_prev_hash
+                && tmpl["height"].is_number_unsigned())
+                parent_height = tmpl["height"].get<uint64_t>();
+        }
+        set_found_block_parent(h.GetHex(), ctx->parent_hash, parent_height);
+    }
+    if (accepted)
+        schedule_block_verification(block_hash);
 }
 
 void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn)
@@ -9530,7 +9625,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
+                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                                                             payout_address);
 
                 // Check PoW hash against the blockchain target before submitting
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
@@ -9932,7 +10028,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
+                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                                                        primary_addr);
 
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
                 if (block_bytes.size() == 80) {

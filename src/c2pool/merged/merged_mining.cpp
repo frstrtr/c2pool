@@ -1696,7 +1696,8 @@ void MergedMiningManager::record_discovered_block(
             LOG_INFO << "[MM:" << chain.config.symbol << "] calling on_merged_block_found...";
             m_on_merged_block_found(chain.config.symbol,
                 chain.current_work.height,
-                chain.current_work.block_hash.GetHex(), accepted);
+                chain.current_work.block_hash.GetHex(), accepted,
+                chain.current_work.coinbase_value);
             LOG_INFO << "[MM:" << chain.config.symbol << "] on_merged_block_found returned OK";
         } catch (const std::exception& e) {
             LOG_ERROR << "[MM:" << chain.config.symbol

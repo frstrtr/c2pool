@@ -1530,3 +1530,92 @@ TEST(FoundBlockExplorer, RestoredRowsServeExplorerFieldsAndPreChangeRowsStayNull
     mi2.load_persisted_found_blocks();
     EXPECT_TRUE(mi2.rest_found_block(h_doge)["parent_height"].is_null());
 }
+
+// ── #946 slice 2b: the DOGE (merged) writer ──────────────────────────────────
+// The aux solve is recorded from the merged-found callback, which fires
+// synchronously inside check_merged_mining. The stratum submit installs a
+// MergedSubmitScope there carrying what MergedMiningManager cannot know: the
+// parent LTC block id, the LTC template height and the miner.
+
+TEST(FoundBlockExplorer, MergedFindInsideSubmitScopeCarriesParentMinerAndSubsidy)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f001";
+    const std::string parent =
+        "946946946946946946946946946946946946946946946946946946946946f0aa";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.parent_hash = parent;
+        ctx.parent_height = 3000010;
+        ctx.miner = "ltc1qstratumminer";
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400010, h, /*accepted=*/false,
+                                     1000000000000ULL);
+    }
+    auto d = mi.rest_found_block(h);
+    ASSERT_TRUE(d.is_object());
+    EXPECT_EQ(d["chain"].get<std::string>(), "DOGE");
+    EXPECT_EQ(d["miner"].get<std::string>(), "ltc1qstratumminer");
+    EXPECT_EQ(d["subsidy"].get<uint64_t>(), 1000000000000ULL);
+    EXPECT_EQ(d["parent_hash"].get<std::string>(), parent);
+    EXPECT_EQ(d["parent_height"].get<uint64_t>(), 3000010u);
+    EXPECT_TRUE(d["share"].is_null()) << "no sharechain share is tied to the aux solve here";
+}
+
+TEST(FoundBlockExplorer, MergedFindOutsideScopeLeavesParentNull)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f002";
+    mi.record_merged_found_block("DOGE", 5400011, h, /*accepted=*/false, 0);
+    auto d = mi.rest_found_block(h);
+    ASSERT_TRUE(d.is_object());
+    EXPECT_TRUE(d["parent_hash"].is_null());
+    EXPECT_TRUE(d["parent_height"].is_null());
+
+    // A template height of 0 is unknown, never a real parent height.
+    const std::string h0 =
+        "946946946946946946946946946946946946946946946946946946946946f003";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.parent_height = 0;
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400012, h0, false, 0);
+    }
+    EXPECT_TRUE(mi.rest_found_block(h0)["parent_height"].is_null());
+}
+
+TEST(FoundBlockExplorer, ParentFieldsAreFillOnly)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f004";
+    const std::string p1 =
+        "946946946946946946946946946946946946946946946946946946946946f0b1";
+    const std::string p2 =
+        "946946946946946946946946946946946946946946946946946946946946f0b2";
+    int persisted = 0;
+    mi.set_found_block_persistence(
+        [&persisted](const MiningInterface::FoundBlock&) -> bool { ++persisted; return true; },
+        []() { return std::vector<MiningInterface::FoundBlock>{}; });
+    mi.record_found_block(5400013, uint256S(h), 1790000400, "DOGE",
+                          "Dminer", "", 0.0, 0.0, 0.0, 0);
+    const int after_record = persisted;
+
+    std::string upper = p1;
+    for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    mi.set_found_block_parent(h, upper, 3000013);
+    EXPECT_EQ(persisted, after_record + 1);
+    mi.set_found_block_parent(h, p2, 3000099);           // known values never overwritten
+    EXPECT_EQ(persisted, after_record + 1) << "an unchanged row is not re-persisted";
+    mi.set_found_block_parent(std::string(64, 'f'), p2, 1);  // unknown hash: no new row
+
+    auto d = mi.rest_found_block(h);
+    EXPECT_EQ(d["parent_hash"].get<std::string>(), p1);
+    EXPECT_EQ(d["parent_height"].get<uint64_t>(), 3000013u);
+    EXPECT_TRUE(mi.rest_found_block(std::string(64, 'f')).is_null());
+}
