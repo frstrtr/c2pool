@@ -20,7 +20,9 @@
 #include <span>
 #include <utility>
 
+#include "impl/xmr/pathb/pathb_coinbase_split.hpp"  // S3 window/split part
 #include "impl/xmr/pathb/pathb_receipt_admission.hpp"
+#include "impl/xmr/pathb/pathb_window.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
 
@@ -143,10 +145,64 @@ int main() {
         check(key_derivations == 2, "a different (tip, P_r) derives again");
     }
 
-    // ---- no payout window built: window_root / mmr_root stay the zero stubs ----
+    // =====================================================================
+    // S3 WINDOW / SPLIT PART (deferred from S2): the canonical coinbase is now
+    // the hf-16 SPLIT of R over window(tip, v), still checked BEFORE RandomX.
+    // =====================================================================
+    auto id_of = [](std::uint64_t i) {
+        pb::Hash32 h{};
+        for (int b = 0; b < 8; ++b) h[31 - b] = static_cast<std::uint8_t>(i >> (8 * b));
+        return h;
+    };
     {
-        pb::SideDataV3 side;  // defaults: both roots zero
-        check(pb::zero_stubs_ok(side), "no window built: window_root and mmr_root are zero stubs");
+        // a window of 24 payees for (tip, P_r); keys derived once per (tip, P_r).
+        pb::Window w;
+        for (std::uint64_t i = 1; i <= 24; ++i) { w.weight[id_of(i)] = pb::Work(1000 * i); w.W += pb::Work(1000 * i); }
+        const pb::Hash32 mm = seq32(0x55);
+
+        // ---- the correct hf-16 split is admitted; RandomX runs AFTER #12 ----
+        pb::ReceiptBodyV3 r = make_body(3, false, 0x20);
+        const pb::Hash32 tip_r = r.side.tip, pr_r = r.blob.prev_id;
+        const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w, tip_r, pr_r, 16, mm);
+        r.blob.tree_root = pb::tree_root_fold(cl.leaf, std::span<const pb::Hash32>(r.branch));
+        check(pb::canonical_coinbase_ok_split(r, w, tip_r, pr_r, 16, mm), "correct hf-16 split admitted");
+        {
+            bool rx = false;
+            const pb::TailResult t = pb::admit_coinbase_then_randomx(
+                    pb::canonical_coinbase_ok_split(r, w, tip_r, pr_r, 16, mm), [&] { rx = true; return true; });
+            check(t.verdict == pb::AdmitVerdict::AdmitCarrier && t.randomx_called, "split: RandomX after #12");
+        }
+
+        // ---- a carrier whose coinbase is NOT the canonical split -> BAN, no RandomX ----
+        {
+            pb::ReceiptBodyV3 bad = r;
+            bad.blob.tree_root = seq32(0xFE);  // not the canonical split
+            bool rx = false;
+            const pb::TailResult t = pb::admit_coinbase_then_randomx(
+                    pb::canonical_coinbase_ok_split(bad, w, tip_r, pr_r, 16, mm), [&] { rx = true; return true; });
+            check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
+                  "non-canonical split (carrier) -> BAN before RandomX");
+        }
+
+        // ---- the same #12 applies to a CARRIED receipt ----
+        {
+            pb::ReceiptBodyV3 carried = make_body(2, false, 0x30);
+            const pb::Hash32 tip_c = carried.side.tip, pr_c = carried.blob.prev_id;
+            const pb::CanonLeaf clc = pb::canonical_coinbase_leaf(carried, w, tip_c, pr_c, 16, mm);
+            carried.blob.tree_root = pb::tree_root_fold(clc.leaf, std::span<const pb::Hash32>(carried.branch));
+            check(pb::canonical_coinbase_ok_split(carried, w, tip_c, pr_c, 16, mm), "carried correct split admitted");
+        }
+
+        // ---- a receipt paying ANOTHER tip's window is refused ----
+        // (a different payee SET, not a scaled copy: the split is scale-invariant.)
+        {
+            pb::Window w_other;
+            for (std::uint64_t i = 1; i <= 24; ++i) { w_other.weight[id_of(i)] = pb::Work(1000 * i); w_other.W += pb::Work(1000 * i); }
+            w_other.weight[id_of(999)] = pb::Work(123456);  // an extra payee the other tip saw
+            w_other.W += pb::Work(123456);
+            check(!pb::canonical_coinbase_ok_split(r, w_other, tip_r, pr_r, 16, mm),
+                  "a receipt paying another tip's window refused");
+        }
     }
 
     return finish("xmr_receipt_solo_leech_kat");
