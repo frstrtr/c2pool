@@ -47,8 +47,12 @@
 //     round-robin over the connections with queued submits; socket I/O and
 //     logins are served between two hashes, so a connection that floods
 //     submits delays the others by at most one hash per pass;
-//   * per-connection submit budget (submit_burst, then submit_rate per s): a
-//     submit over it is dropped unverified and the connection is BANNED;
+//   * per-connection submit budget (submit_burst, then a refill per s): a
+//     submit over it is dropped unverified and the connection is BANNED. The
+//     refill is VARDIFF (submit_vardiff, on by default): 2 x S_t tracking the
+//     lane window from the tip, S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / s,
+//     clamped at s = 100 %; before the first window (s unknown) the honest-safe
+//     floor submit_rate (2 x 2^k / T = 12.8/s);
 //   * a repeated (job id, nonce) is refused unverified ("Duplicate share");
 //   * share score per connection: a low-difficulty or duplicate share
 //     bad_share_points, an accepted one good_share_points (capped at
@@ -169,6 +173,17 @@ struct StratumListenerOptions {
     int           ban_score = -9;            // banned at or below this score
     int           max_score = 0;             // the score never rises above this
     std::size_t   max_seen_submits = 256;    // (job id, nonce) pairs remembered per connection
+    // VARDIFF (POLICY, ruling 23: node-local; a different value forks nothing).
+    // On (the default), the per-connection submit-rate budget tracks the lane
+    // window from the tip: the refill is 2 x S_t, S_t = 2^k x n* / t_W,
+    // t_W = COVERAGE x 120 / s, s = the pool's share of Monero hashrate read from
+    // the tip (lane difficulty vs Monero network difficulty), S_t clamped at
+    // s = 100 % (2^k x n* / (COVERAGE x 120) = 0.80/s -> refill 1.6/s). Before
+    // the first window (s unknown), the refill is submit_rate (the honest-safe
+    // floor, 2 x 2^k / T = 12.8/s). Off (or a fixed submit_rate override):
+    // the refill is the fixed submit_rate.
+    bool          submit_vardiff = true;
+    std::uint32_t vardiff_shares_per_window = kXmrVardiffSharesPerWindow;   // n*
 };
 
 // Point-in-time counters (all monotone since start(), except `active`).
@@ -221,6 +236,7 @@ public:
           m_tap(*this, sink),
           m_server(templates, verifier, m_tap, *this) {
         m_server.set_min_difficulty(m_opts.min_difficulty);   // NET-DOS
+        m_submit_rate_effective.store(m_opts.submit_rate, std::memory_order_relaxed);   // VARDIFF: floor until the first tip
     }
 
     // NET-DOS test seam: the clock of every session timer (login deadline,
@@ -228,6 +244,11 @@ public:
     // Call before start().
     using NowFn = std::function<std::chrono::steady_clock::time_point()>;
     void set_now_fn(NowFn f) { m_now_fn = std::move(f); }
+
+    // VARDIFF: the per-connection submit-rate budget refill now in force
+    // (submits/s), recomputed from the tip on every template; the honest-safe
+    // floor (submit_rate) before the first window or when vardiff is off.
+    double submit_rate_effective() const { return m_submit_rate_effective.load(std::memory_order_relaxed); }
 
     // GAP-2: a node-chosen extra_nonce base (see XmrStratumServer::seed_extra_nonce).
     // Call before start().
@@ -875,6 +896,7 @@ private:
                     (suspended ? "lane suspended" : "no template yet") + ") agent='" + agent + "'");
                 return;
             }
+            update_submit_rate(peek);   // VARDIFF: retarget the budget to this tip's lane window
             do_login(cid, req_id, login, agent);
             return;
         }
@@ -1025,6 +1047,7 @@ private:
         strat::TemplateJob peek;
         if (!m_templates.get_job(0, peek)) return;
         if (m_hook) m_hook(peek);   // seed prefetch before the first job, as on the template push
+        update_submit_rate(peek);   // VARDIFF: retarget the budget to this tip's lane window
         log("template available again (template " + std::to_string(peek.template_id) + "): serving " +
             std::to_string(parked) + " parked login(s)");
         flush_parked();
@@ -1061,6 +1084,7 @@ private:
             return;
         }
         if (m_hook) m_hook(peek);   // seed prefetch (may take seconds; miners idle meanwhile)
+        update_submit_rate(peek);   // VARDIFF: retarget the budget to this tip's lane window
 
         // Sessions already logged in get a `job` push; parked logins get their
         // login_ok (which carries the new job) — never both.
@@ -1119,6 +1143,33 @@ private:
         return m_now_fn ? m_now_fn() : std::chrono::steady_clock::now();
     }
 
+    // VARDIFF: the per-connection submit-rate budget refill for `peek` (the
+    // current tip), submits/s. Listener thread; call on every template peek.
+    void update_submit_rate(const strat::TemplateJob& peek) {
+        m_submit_rate_effective.store(
+            m_opts.submit_vardiff ? vardiff_submit_rate(peek.lane_target, peek.mainchain_target)
+                                  : m_opts.submit_rate,
+            std::memory_order_relaxed);
+    }
+    // VARDIFF: 2 x S_t from the tip. s = the pool's share of Monero hashrate =
+    // (D_lane / T) / (D_net / 120), D_lane = MAX_TARGET / lane_target,
+    // D_net = MAX_TARGET / mainchain_target, so s = 120 x mainchain_target /
+    // (T x lane_target). S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / min(s, 1)
+    // (the clamp is the S_t upper bound at s = 100 %). No lane/Monero target at
+    // the tip (s not computable): the honest-safe floor submit_rate.
+    double vardiff_submit_rate(std::uint64_t lane_target, std::uint64_t mainchain_target) const {
+        namespace xc = ::c2pool::v37n::xmr;
+        if (lane_target == 0 || mainchain_target == 0) return m_opts.submit_rate;   // s unknown -> floor
+        const double s = 120.0 * double(mainchain_target) /
+                         (double(xc::kXmrTargetIntervalS) * double(lane_target));
+        if (!(s > 0.0)) return m_opts.submit_rate;                                  // s unknown -> floor
+        const double s_eff = s < 1.0 ? s : 1.0;                                     // clamp at s = 100 %
+        const double t_W = double(xc::kXmrWindowCoverage) * double(xc::kXmrMoneroBlockIntervalS) / s_eff;
+        const double two_k = double(std::uint64_t(1) << xc::kXmrDropsFloorShift);
+        const double S_t = two_k * double(m_opts.vardiff_shares_per_window) / t_W;
+        return 2.0 * S_t;
+    }
+
     // Close a connection and ban its address for ban_seconds (an address-less
     // connection -- 127.0.0.1 / ::1 -- is only closed).
     void ban_client(std::uint64_t cid, const std::string& why) {
@@ -1152,11 +1203,12 @@ private:
         const auto t = now();
         const double dt = std::chrono::duration<double>(t - c->tokens_at).count();
         c->tokens_at = t;
-        if (dt > 0) c->tokens = std::min(m_opts.submit_burst, c->tokens + dt * m_opts.submit_rate);
+        const double rate = m_submit_rate_effective.load(std::memory_order_relaxed);   // VARDIFF refill
+        if (dt > 0) c->tokens = std::min(m_opts.submit_burst, c->tokens + dt * rate);
         if (c->tokens < 1.0) {
             m_stats.submits_over_budget.fetch_add(1, std::memory_order_relaxed);
             ban_client(cid, "submit budget exceeded (" + std::to_string(m_opts.submit_burst) + " burst, " +
-                                std::to_string(m_opts.submit_rate) + "/s)");
+                                std::to_string(rate) + "/s)");
             return;
         }
         c->tokens -= 1.0;
@@ -1288,6 +1340,10 @@ private:
     std::size_t              m_pending_total = 0;      // submits queued, all connections (listener thread)
     std::uint64_t            m_rr_cursor = 0;          // last connection served by service_submits()
     std::chrono::steady_clock::time_point m_refusal_logged{};
+    // VARDIFF: the submit-rate budget refill in force (submits/s). Written on
+    // the listener thread from the tip (update_submit_rate), read there in
+    // queue_submit and from any thread via submit_rate_effective().
+    std::atomic<double>      m_submit_rate_effective{0.0};
 };
 
 } // namespace c2pool::v37n::xmr::o2
