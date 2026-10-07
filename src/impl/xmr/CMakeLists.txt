@@ -63,6 +63,12 @@ endif()
 # oracle) land in later waves against these contracts.
 add_subdirectory(native)
 
+# Path B, slice S1 (subset): header-only wire formats, derived caps and
+# horizons, Monero branch selection, catch-up rule, rewind journal and the
+# headers-first decision, with their KATs. An INTERFACE target that no running
+# target links. See pathb/CMakeLists.txt.
+add_subdirectory(pathb)
+
 if (BUILD_TESTING)
     add_subdirectory(test)
 endif()

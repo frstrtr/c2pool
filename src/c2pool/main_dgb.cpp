@@ -65,7 +65,8 @@
 #include <impl/dgb/stratum/work_source.hpp>
 #include <impl/dgb/coin/work_ref_hash.hpp>      // make_work_ref_hash_params (ref preimage SSOT)
 #include <impl/dgb/coin/coinbase_scriptsig.hpp>   // build_coinbase_scriptsig (BIP34 height + /c2pool-dgb/ tag, #902)
-#include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + create_local_share reference (#884/#294)
+#include <impl/dgb/run_loop_mint.hpp>              // parse_min_header_80 + mint_local_share_at_frozen_version (#884/#294)
+#include <impl/dgb/auto_ratchet_wire.hpp>          // dgb_select_mint_versions + DGB_BASE/TARGET_VERSION (#884)
 #include <impl/dgb/conn_pplns_producer.hpp>        // make_conn_pplns_inputs (ref-hash bind SSOT)
 #include <impl/dgb/coin/pplns_weight_walk.hpp>   // compute_pplns_weight_walk (PPLNS step-1 SSOT)
 #include <core/target_utils.hpp>                 // chain::bits_to_target / target_to_average_attempts
@@ -1616,10 +1617,32 @@ int run_node(const core::CoinParams& params, bool testnet,
     // through compute_ref_hash_for_work() (share_check.hpp) for the ref_hash. The
     // V36-vs-V35 split is owned by compute_ref_hash_for_work() -- not duplicated
     // here.
+    //
+    // #884 (ruled 2026-10-02): the share version follows the DGB AutoRatchet, as
+    // on LTC -- no hardcoded v36. The producer asks the ratchet ONCE per template
+    // and stamps that {mint, vote} pair on the ref preimage AND the coinbase
+    // (PPLNS formula, finder fee, donation script); the pair rides the job's
+    // frozen_ref to the mint below, which uses it verbatim. Baseline v35 while
+    // VOTING (oracle p2pool-dgb-scrypt), v36 once the crossing ACTIVATES. State
+    // persists per-coin under <net_subdir>/v36_ratchet.json so a crossed node
+    // never regresses on restart.
+    const std::string ratchet_path =
+        (core::filesystem::config_path() / net_subdir / "v36_ratchet.json").string();
+    auto dgb_ratchet = std::make_shared<dgb::AutoRatchet>(
+        ratchet_path, dgb::DGB_TARGET_VERSION, dgb::DGB_BASE_VERSION);
+    // Stratum sessions build coinbases concurrently under the SHARED tracker
+    // lock; the ratchet's own state transitions need their own mutex.
+    auto dgb_ratchet_mutex = std::make_shared<std::mutex>();
+    LOG_INFO << "[AutoRatchet] Initialized: state="
+             << dgb::ratchet_state_str(dgb_ratchet->state())
+             << " base=V" << dgb::DGB_BASE_VERSION
+             << " target=V" << dgb::DGB_TARGET_VERSION
+             << " file=" << ratchet_path;
     {
         auto& pplns_tracker = p2p_node.tracker();
         work_source->set_pplns_inputs_fn(
-            [&pplns_tracker, &p2p_node, &params, &header_chain, donation_u16](
+            [&pplns_tracker, &p2p_node, &params, &header_chain, donation_u16,
+             dgb_ratchet, dgb_ratchet_mutex](
                 const uint256& prev_share_hash,
                 const std::string& /*extranonce1_hex*/,
                 const std::vector<unsigned char>& payout_script,
@@ -1654,8 +1677,19 @@ int run_node(const core::CoinParams& params, bool testnet,
                 if (block_bits == 0)
                     return std::nullopt;  // tip share carries no usable target.
 
+                // #884: ask the AutoRatchet ONCE for this template's {mint,
+                // vote} pair; everything version-dependent below uses it.
+                int64_t  mint_version = 0;
+                uint64_t vote_version = 0;
+                {
+                    std::lock_guard<std::mutex> rl(*dgb_ratchet_mutex);
+                    const auto [mv, vv] = dgb::dgb_select_mint_versions(
+                        *dgb_ratchet, pplns_tracker, prev_share_hash);
+                    mint_version = mv;
+                    vote_version = static_cast<uint64_t>(vv);
+                }
                 const bool use_v36_pplns =
-                    core::version_gate::is_v36_active(/*share_version=*/36);
+                    core::version_gate::is_v36_active(mint_version);
 
                 // PAYOUT half -- PPLNS weight walk SSOT (the verifier's step 1).
                 dgb::CumulativeWeights walk;
@@ -1738,8 +1772,8 @@ int run_node(const core::CoinParams& params, bool testnet,
                 // through the verifier primitive. V36/V35 split owned by
                 // compute_ref_hash_for_work().
                 dgb::coin::WorkRefHashInputs rin;
-                rin.share_version   = 36;
-                rin.desired_version = 36;
+                rin.share_version   = mint_version;   // #884: ratchet-selected
+                rin.desired_version = vote_version;
                 rin.prev_share      = prev_share_hash;
                 rin.coinbase_scriptSig = coinbase_scriptsig;  // #902: commit the BIP34+tag scriptSig
                 rin.share_nonce     = 0;            // share commitment nonce (not block)
@@ -1767,9 +1801,10 @@ int run_node(const core::CoinParams& params, bool testnet,
                 ain.weights         = std::move(walk.weights);
                 ain.total_weight    = walk.total_weight;
                 ain.subsidy         = subsidy;
-                ain.use_v36_pplns   = use_v36_pplns;
                 ain.coinbase_script = coinbase_scriptsig;  // #902: same BIP34+tag scriptSig as the ref preimage
-                ain.donation_script = dgb::PoolConfig::get_donation_script(/*share_version=*/36);
+                // #884: PPLNS formula / finder fee / donation script from the
+                // SAME ratchet-selected version (use_v36_pplns above agrees).
+                dgb::apply_conn_mint_version(ain, mint_version, payout_script);
                 ain.ref_params      = dgb::coin::make_work_ref_hash_params(rin, params);
                 return dgb::make_conn_pplns_inputs(ain, params);
             });
@@ -1793,16 +1828,15 @@ int run_node(const core::CoinParams& params, bool testnet,
     // delay or endanger the block submit -- a decline only forfeits sharechain
     // credit, never the block.
     //
-    // Version pin (v36): the producer seam above freezes the connection coinbase
-    // at share_version=36 (make_conn_pplns_inputs hardcodes 36 / use_v36_pplns),
-    // so the mint MUST reconstruct at v36 too or the rebuilt gentx would not
-    // match the coinbase the miner hashed and create_local_share would decline.
-    // This is why we call create_local_share directly with 36 rather than the
-    // AutoRatchet adapter (dgb_select_mint_versions, run_loop_mint.hpp), whose
-    // baseline is 35 (auto_ratchet_wire.hpp) and would diverge from the producer.
-    // Aligning the producer onto the ratchet is a separate consensus decision.
-    // Every other field mirrors the producer exactly: donation=50, no merged
-    // addrs (standalone DGB parent), segwit_active=false (the producer emits a
+    // Version (#884, ruled 2026-10-02): the mint stamps the {mint, vote} pair
+    // the producer above got from the AutoRatchet when it built this job's
+    // coinbase (in.share_version / in.desired_version, carried on the job's
+    // frozen_ref). It does NOT ask the ratchet again: if the ratchet moved
+    // between template and submit, a fresh answer would rebuild a gentx that no
+    // longer matches the coinbase the miner hashed. The mint is
+    // mint_local_share_at_frozen_version (run_loop_mint.hpp). Every other field
+    // mirrors the producer exactly: the same donation, no merged addrs
+    // (standalone DGB parent), segwit_active=false (the producer emits a
     // non-segwit coinbase), so the reconstruction is byte-identical when the
     // sharechain tip has not moved between template build and submit; if it has,
     // create_local_share returns null (a correctly-declined stale share).
@@ -1820,8 +1854,6 @@ int run_node(const core::CoinParams& params, bool testnet,
                                    "NOT recorded (fail-closed)";
                     return uint256();
                 }
-                BaseScript coinbase;
-                coinbase.m_data = in.coinbase_bytes;
 
                 // Exclusive tracker lock, non-blocking: defer to the next
                 // submission if the compute thread is mid-think() rather than
@@ -1837,24 +1869,9 @@ int run_node(const core::CoinParams& params, bool testnet,
 
                 uint256 share_hash;
                 try {
-                    share_hash = dgb::create_local_share(
-                        p2p_node.tracker(), params, *min_header, coinbase,
-                        in.subsidy, in.prev_share, in.merkle_branches,
-                        in.payout_script,
-                        /*donation=*/donation_u16,
-                        std::vector<dgb::MergedAddressEntry>{},
-                        dgb::StaleInfo::none,
-                        /*segwit_active=*/false,  // producer emits non-segwit coinbase
-                        std::string{},            // witness_commitment_hex
-                        std::vector<unsigned char>{},  // message_data
-                        std::vector<unsigned char>{},  // actual_coinbase_bytes
-                        uint256(),                // witness_root
-                        0u, 0u,                   // override_max_bits / override_bits
-                        0u, uint128(), uint256(), 0u, uint256(),
-                        /*has_frozen=*/false,
-                        std::vector<uint256>{}, uint256(),
-                        std::vector<unsigned char>{},
-                        /*share_version=*/36, /*desired_version=*/36);
+                    share_hash = dgb::mint_local_share_at_frozen_version(
+                        in, *min_header, p2p_node.tracker(), params,
+                        /*donation=*/donation_u16);
                 } catch (const std::exception& e) {
                     LOG_WARNING << "[DGB-MINT] create_local_share threw: " << e.what();
                     return uint256();
@@ -1867,13 +1884,14 @@ int run_node(const core::CoinParams& params, bool testnet,
                     p2p_node.notify_local_share(share_hash);
                     LOG_INFO << "[DGB-MINT] share "
                              << share_hash.GetHex().substr(0, 16)
+                             << " v" << in.share_version
                              << " minted onto the sharechain + broadcast (prev="
                              << in.prev_share.GetHex().substr(0, 16) << ")";
                 }
                 return share_hash;
             });
         std::cout << "[DGB] sharechain mint seam BOUND (set_mint_share_fn -> "
-                     "create_local_share v36 -> broadcast_share + "
+                     "create_local_share at the job's AutoRatchet version -> broadcast_share + "
                      "notify_local_share)" << std::endl;
     }
 

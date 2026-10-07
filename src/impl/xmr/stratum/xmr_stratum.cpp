@@ -307,8 +307,13 @@ bool XmrStratumServer::make_job(XmrStratumSession& s, std::uint32_t extra_nonce,
     // to detect a real network block; including it via max() would not change
     // the (easier) job target.
     std::uint64_t target = tj.lane_target ? tj.lane_target : MAX_TARGET;
-    if (s.login().custom_diff)
-        target = std::max(target, target_from_diff(*s.login().custom_diff));
+    if (s.login().custom_diff) {
+        // MINIMUM DIFFICULTY: a requested difficulty below the floor is raised
+        // to it. The lane's own target is never made harder.
+        std::uint64_t custom = target_from_diff(*s.login().custom_diff);
+        if (m_min_difficulty) custom = std::min(custom, target_from_diff(m_min_difficulty));
+        target = std::max(target, custom);
+    }
     target = std::min(target, MAX_TARGET);
 
     const std::uint32_t job_id = s.remember_job(extra_nonce, tj.template_id, target);

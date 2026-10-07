@@ -65,6 +65,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # REAL ltc::Legacy / ltc::Actual addrme handlers over a REAL loopback socket.
     # Needs NodeImpl + protocol_legacy.cpp from the `ltc` lib already on this
     # target. Same folding rule (the #769 trap).
+    #
+    # version_switch_floor_test.cpp: the version-switch 60% gate must use the
+    # oracle FLOOR threshold (sum*60//100), not the cross-multiplied real 60%,
+    # which rejected new == floor(0.6*total) when 60*total is not a multiple of
+    # 100. Pure-helper boundary KAT. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -91,11 +96,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
         restart_reorg_supersede_test.cpp
+        self_connection_ban_test.cpp
         share_fetch_failover_test.cpp
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
         template_topology_spend_test.cpp
+        version_switch_floor_test.cpp
         wirecompat_runtime_test.cpp
     )
     target_link_libraries(share_test PRIVATE

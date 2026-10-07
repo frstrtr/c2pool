@@ -480,6 +480,21 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_resume_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_resume_kat COMMAND v37_xmr_stratum_resume_kat)
+    # v37_xmr_stratum_dos_kat (NET-DOS, stratum): the listener's DoS policy over
+    # loopback from 127.0.0.x source addresses -- the minimum requested
+    # difficulty, the per-connection submit budget (over it: dropped unverified
+    # + address ban), duplicate (job id, nonce) refusal, the share score ban,
+    # the bounded per-connection submit queue verified one hash per pass (a
+    # flooding miner does not stall another's login), and the login deadline
+    # (test clock). Stub template source + verifier: no RandomX, no monerod.
+    # Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_stratum_dos_kat
+        v37_xmr_stratum_dos_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_dos_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_dos_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_dos_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_dos_kat COMMAND v37_xmr_stratum_dos_kat)
     # v37_xmr_test_suspend_knob_kat (FAULT-KNOB, TEST-ONLY): the
     # --test-suspend-lane-seconds / SIGUSR2 knob that forces a lane suspension
     # on a live node -- off by default, refused on mainnet, arm/fire/release
@@ -1314,6 +1329,37 @@ if (BUILD_TESTING)
         target_link_libraries(v37_xmr_relay_peerstore_kat PRIVATE xmr_relay_peerstore)
         add_test(NAME v37_xmr_relay_peerstore_kat COMMAND v37_xmr_relay_peerstore_kat)
     endif()
+    # NET-DOS (relay network policy; no consensus):
+    #   v37_xmr_relay_addr_ban_kat  bans and RandomX budgets by ADDRESS (IPv4,
+    #                               IPv6 /64): a banned address is refused at
+    #                               accept until the ban expires and is not
+    #                               dialed; per-address accept cap; one address
+    #                               gets at most its share of the global RandomX
+    #                               budget and a reconnect does not refill it; a
+    #                               confirmed invalid PoW bans the sender's
+    #                               address. Loopback 127.0.0.x only. ALSO on
+    #                               BOTH build.yml --target lists.
+    #   v37_xmr_relay_eclipse_kat   inbound and outbound relay links counted
+    #                               apart: with every inbound slot full a
+    #                               further inbound link is refused at accept,
+    #                               and the node still dials until its outbound
+    #                               target is met (no more). ALSO on BOTH
+    #                               build.yml --target lists.
+    foreach(_netdos_kat v37_xmr_relay_addr_ban_kat v37_xmr_relay_eclipse_kat)
+        add_executable(${_netdos_kat}
+            ${_netdos_kat}.cpp
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_compile_features(${_netdos_kat} PRIVATE cxx_std_20)
+        target_include_directories(${_netdos_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+        target_compile_definitions(${_netdos_kat} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        target_link_libraries(${_netdos_kat} PRIVATE xmr_coin Threads::Threads)
+        add_test(NAME ${_netdos_kat} COMMAND ${_netdos_kat})
+    endforeach()
     # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
     # enrolment book is node-local, so a lane block books the WINNER's composed
     # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book
