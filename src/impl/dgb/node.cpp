@@ -1621,26 +1621,37 @@ void NodeImpl::prune_shares(const uint256& /*best_share*/)
     // Cache cleanup (kept from original)
     if (m_shared_share_hashes.size() > m_max_shared_hashes)
         m_shared_share_hashes.clear();
+    // m_known_txs eviction moved to evict_known_txs_io_phase(): this function
+    // has zero callers, so the cap it enforced here never ran, and it would run
+    // on the compute thread, racing the lock-free io-thread remember_tx insert.
+    if (m_raw_share_cache.size() > m_max_raw_shares)
+        m_raw_share_cache.clear();
+}
+
+void NodeImpl::evict_known_txs_io_phase()
+{
     // Recency-preserving bounded eviction (was: wholesale clear()). Dropping the
     // whole cache at once destroyed every forwardable tx byte, so a share relay
     // that referenced a just-dropped tx could no longer remember_tx-forward it
     // and the canonical peer disconnected with "referenced unknown transaction".
     // Evict oldest-first down to the cap, keeping the most-recently-learned txs.
-    if (m_known_txs.size() > m_max_known_txs)
-        core::evict_known_txs_to_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
+    //
+    // IO-THREAD ONLY (called from clean_tracker's IO-phase post): every other
+    // m_known_txs mutator is the io-thread remember_tx insert, so no lock is
+    // needed and none is taken. Tx-forward cache only; no consensus/mint/payout
+    // state is read or written.
+    dgb::enforce_known_txs_cap(m_known_txs, m_known_txs_order, m_max_known_txs);
 
     // /p2p_stats gauges (observe-only): the SEND-side truth behind a peer
-    // dashboard reporting TXPOOL=0 for us. Published here because prune_shares
-    // is the periodic pass that already touches both containers. Relaxed
-    // stores, no lock, no consensus/mint/payout state read or written.
+    // dashboard reporting TXPOOL=0 for us. Published here because this is the
+    // periodic pass that already touches both containers. Relaxed stores, no
+    // lock, no consensus/mint/payout state read or written.
     core::obs::p2p_stats().known_txs_size.store(
         m_known_txs.size(), std::memory_order_relaxed);
     core::obs::p2p_stats().known_txs_order_size.store(
         static_cast<std::int64_t>(m_known_txs_order.size()), std::memory_order_relaxed);
     core::obs::p2p_stats().known_txs_updated_at.store(
         static_cast<std::int64_t>(core::timestamp()), std::memory_order_relaxed);
-    if (m_raw_share_cache.size() > m_max_raw_shares)
-        m_raw_share_cache.clear();
 }
 
 // (old phases 5-7 removed — replaced by p2pool-style pruning above)
@@ -2464,6 +2475,9 @@ void NodeImpl::clean_tracker()
       // Work refresh (1-5s) runs WITHOUT any lock so shared_lock readers
       // (handle_get_share, send_shares) are never blocked.
       boost::asio::post(*m_context, [this, clean_best_changed]() {
+        // Enforce the m_known_txs cap once per clean cycle. This is the only
+        // live call site; it must stay on the IO thread (see the function).
+        evict_known_txs_io_phase();
         if (clean_best_changed && m_on_best_share_changed) {
             LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
             m_on_best_share_changed();
