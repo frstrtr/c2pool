@@ -12,7 +12,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # public-default/regtest-isolated modes + reward-safe identity constants.
     # Pure over config_pool.hpp; folded here (not a fresh target) to ride the
     # allowlist and dodge the NOT_BUILT sentinel.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp)
+    # legacy_addrme_self_probe_test.cpp (#1716, sibling half of #882): drives the
+    # REAL dgb::Legacy / dgb::Actual addrme handlers over a REAL loopback socket.
+    # Needs NodeImpl + protocol_legacy.cpp from the `dgb` lib already on this
+    # target. Same folding rule (the #769 trap).
+    # mint_follows_autoratchet_test.cpp (#884): producer + mint follow the ONE
+    # AutoRatchet answer per template -- v35 while VOTING, v36 once crossed.
+    # Same folding rule.
+    #
+    # version_switch_floor_test.cpp: the version-switch 60% gate must use the
+    # oracle FLOOR threshold (sum*60//100), not the cross-multiplied real 60%,
+    # which rejected new == floor(0.6*total) when 60*total is not a multiple of
+    # 100. Pure-helper boundary KAT. Same folding rule.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp mint_follows_autoratchet_test.cpp version_switch_floor_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb

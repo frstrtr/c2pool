@@ -21,7 +21,9 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sharechain/v37/v37_descriptor_xmr.hpp>
@@ -31,6 +33,8 @@
 #include "impl/xmr/settle/xmr_coinbase.hpp"                 // derive_tx_secret_key / derive_output / mm_commitment_root
 #include "impl/xmr/template/xmr_block_assembly.hpp"         // parse_coinbase_prefix
 #include "xmr_credit_cut.hpp"                               // recon(A+B credit): the on-chain credit cut
+#include "xmr_fee_model.hpp"                                // fee model: donation marker rule (REFUSE-IF-ABSENT)
+#include "xmr_paynow.hpp"                                   // SAME-BLOCK PAY-NOW: the V37N base tail
 
 namespace c2pool::v37n::xmr::authority {
 
@@ -54,7 +58,17 @@ struct CoinbaseBooking {
     // proxy so a single stuck/forked builder cannot halt the honest majority.
     ::xmr::coin::Hash256 onchain_root{};
     bool           has_onchain_root = false;
+    // D2 (minority converges to majority): the first 4 bytes (LE) of the 0x02
+    // extra-nonce payload -- the stratum extra_nonce the block was mined under
+    // (builder_key = >> 20 under GAP-2). Read with the root, before the match.
+    bool           has_extra_nonce = false;
+    std::uint32_t  extra_nonce = 0;
     std::map<::v37::bytes32, long long> payout;   // identity -> piconero, the on-chain truth
+    // fee model: the per-vout identity + amount (canonical order), so the
+    // donation-marker rule (xmr_fee_model.hpp apply_donation_rule) can locate
+    // the marker / sink tail and re-book the donation's owed outputs.
+    std::vector<::v37::bytes32> out_identity;
+    std::vector<std::uint64_t>  out_amount;
     // R-C rework-2 (F-MONEY, M2): when an output maps to NO known payee the block
     // stays fail-closed for booking (ok == false, unchanged), but the MAPPED
     // outputs are kept in `payout` (flag payout_partial) and the unmapped sum is
@@ -66,7 +80,39 @@ struct CoinbaseBooking {
     // recon(A+B credit): the ON-CHAIN CREDIT CUT (0x02 tail), if the coinbase carries one.
     bool           has_credit_cut = false;
     credit::CreditCut credit_cut;
+    // fee model: the donation owed_in commitment (0x02 tail "V37D"), if any.
+    // Read by decode_lane_coinbase_fee only; gate OFF coinbases carry none.
+    std::optional<std::uint64_t> donation_owed_in;
+    // POOL-LINEAGE: how the V37C tail's pool tag classified this block (set
+    // only when the caller passes its pool_tag; Own = a lane block of ours).
+    bool                 lineage_gated = false;
+    credit::BlockLineage lineage = credit::BlockLineage::Untagged;
+    ::v37::bytes32       lineage_seen_tag{};   // the foreign tag (lineage == Foreign)
+    // SAME-BLOCK PAY-NOW: the committed base B (0x02 tail "V37N"), if any.
+    // The booking nets the pay-now it implies (xmr_paynow.hpp net_booking).
+    std::optional<std::uint64_t> paynow_base;
+    // EMPTY-CUT FINDER (operator ruling 09-26): the committed finder payee
+    // (0x02 field "V37F", right before V37N), if any; the booking credits it
+    // the pool when the fold at the cut is empty (xmr_paynow.hpp).
+    std::optional<::v37::ScriptRef> ecut_finder;
+    bool                            ecut_finder_malformed = false;
 };
+
+// MM-PARSE-2: the lane-candidate test, a pure function of the coinbase bytes.
+// A 03 21 00 <root> tail alone does not make a coinbase a lane candidate: every
+// merge-mining pool ends its tx_extra the same way (mainnet: 01 pubkey | 02
+// 4-byte nonce | 03 21 00 root -- p2pool and others, several blocks a day).
+// A v37 lane coinbase also carries at least one V37 field in its 0x02 payload:
+// the V37P pool tag (every lane coinbase since POOL-LINEAGE; a malformed V37P
+// counts, the lineage gate then rejects it), the V37C credit cut, or the V37D
+// donation owed_in. None of them -> decided NOT a lane block.
+inline bool has_v37_lane_fields(const std::vector<unsigned char>& tx_extra) {
+    const auto f = credit::extra_nonce_field(tx_extra);
+    if (!f) return false;
+    return credit::parse_pool_tag_payload(*f) != credit::PoolTagParse::Absent ||
+           credit::parse_tail(*f).has_value() ||
+           fee::parse_donation_owed_payload(*f).has_value();
+}
 
 // candidates: newest first. keys: every identity this node can resolve via pay_of.
 template <class PayOf>
@@ -76,7 +122,8 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
                                                 const std::vector<::v37::bytes32>& keys,
                                                 const ::v37::ScriptRef& sink_ref,
                                                 const ::v37::bytes32& sink_identity,
-                                                PayOf&& pay_of) {
+                                                PayOf&& pay_of,
+                                                const ::v37::bytes32* pool_tag = nullptr) {
     namespace cons = ::c2pool::xmr::native;
     namespace set_ = ::v37::xmr::settle;
     CoinbaseBooking b;
@@ -88,9 +135,15 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     }
     set_::ReceivedCoinbase got;
     std::uint64_t height = 0; std::size_t used = 0;
+    // The block bytes ARE here and parsed: whatever the coinbase prefix holds is a
+    // pure function of them, so a coinbase this parser cannot read is decided
+    // (every node reads the same bytes the same way) -- deterministically NOT a
+    // lane coinbase (ours always parses), never a transient retry. A tx_extra
+    // that does not walk is not a prefix failure at all (parse_coinbase_prefix
+    // keeps it as opaque bytes); the "not-lane:" tail check below then decides.
     if (!::c2pool::xmr::assembly::parse_coinbase_prefix(blob.data() + pb.miner_tx_offset,
                                                          pb.miner_tx_size, got, &height, &used)) {
-        b.why = "miner_tx prefix does not parse"; return b;
+        b.why = "not-lane: miner_tx prefix is not a v2 txin_gen coinbase with tagged-key outputs"; return b;
     }
     b.height = height;
     b.major  = static_cast<std::uint8_t>(pb.header.major_version);
@@ -101,8 +154,46 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     if (got.tx_extra.size() < 35) { b.why = "not-lane: tx_extra too short for 03 tag"; return b; }
     const unsigned char* tag = got.tx_extra.data() + got.tx_extra.size() - 35;
     if (tag[0] != 0x03 || tag[1] != 0x21 || tag[2] != 0x00) { b.why = "not-lane: no 03 21 00 tail"; return b; }
+    // POOL-LINEAGE (operator ruling 2026-09-25): only a block whose V37C tail
+    // carries OUR pool_tag is a lane block. Another pool's block, an untagged
+    // (pre-lineage) tail or a malformed V37P field is an ORDINARY Monero block
+    // for this pool: "not-lane:" -- never matched against the candidate ring,
+    // so never booked as a lane cut, never refused, never held, never a
+    // lane-root question (no root fingerprint either). nullptr = the
+    // pre-lineage behaviour (KATs, tools).
+    if (pool_tag) {
+        b.lineage_gated = true;
+        b.lineage = credit::classify_lineage(got.tx_extra, *pool_tag, &b.lineage_seen_tag);
+        if (b.lineage != credit::BlockLineage::Own) {
+            static const char* d = "0123456789abcdef";
+            std::string th;
+            for (int i = 0; i < 6; ++i) { th += d[b.lineage_seen_tag[i] >> 4]; th += d[b.lineage_seen_tag[i] & 15]; }
+            b.why = b.lineage == credit::BlockLineage::Foreign
+                        ? "not-lane: foreign pool_tag " + th + "... (another pool's block: an ordinary Monero block for this pool)"
+                    : b.lineage == credit::BlockLineage::Malformed
+                        ? std::string("not-lane: malformed V37P pool-tag field (strict reject: an ordinary block for this pool)")
+                        : std::string("not-lane: no pool_tag in the V37C tail (pre-lineage / older pool: an ordinary block for this pool)");
+            return b;
+        }
+    }
+    // MM-PARSE-2: the same tail with no V37 field in the 0x02 payload is a
+    // merge-mining pool's coinbase, decided "not-lane:" from the bytes for EVERY
+    // caller -- never "lane-root-unknown" (retried, HELD, then refused with an
+    // alarm + liability + a lineage vote), never matched against the ring. With
+    // a pool_tag the lineage gate above already rejected it (Untagged); this is
+    // the same decision for a caller without one (pre-lineage API, tools).
+    if (!has_v37_lane_fields(got.tx_extra)) {
+        b.why = "not-lane: 03 21 00 tail without any V37 field (V37P/V37C/V37D) in the 0x02 payload "
+                "(a merge-mining pool's coinbase: an ordinary Monero block)";
+        return b;
+    }
     ::xmr::coin::Hash256 root; std::memcpy(root.data(), tag + 3, 32);
     b.onchain_root = root; b.has_onchain_root = true;   // R-C: fingerprint available even when no candidate matches
+    if (const auto en = credit::extra_nonce_field(got.tx_extra); en && en->size() >= 4) {   // D2: the builder datum
+        b.has_extra_nonce = true;
+        b.extra_nonce = static_cast<std::uint32_t>((*en)[0]) | (static_cast<std::uint32_t>((*en)[1]) << 8) |
+                        (static_cast<std::uint32_t>((*en)[2]) << 16) | (static_cast<std::uint32_t>((*en)[3]) << 24);
+    }
     bool matched = false;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         if (set_::mm_commitment_root(chain_id, candidates[i]) == root) {
@@ -118,6 +209,10 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     if (!matched) { b.why = "lane-root-unknown: 03 root matches none of " + std::to_string(candidates.size()) + " candidate digests (other lane, or this node's ledger history does not (yet) contain the winner's build digest -- retried as the ring advances)"; return b; }
     b.is_lane = true;
     if (const auto cc = credit::parse_from_tx_extra(got.tx_extra)) { b.has_credit_cut = true; b.credit_cut = *cc; }   // recon(A+B credit)
+    b.donation_owed_in = fee::parse_donation_owed(got.tx_extra);   // fee model (used by the gate-ON booking only)
+    b.paynow_base = paynow::parse(got.tx_extra);                  // SAME-BLOCK PAY-NOW (absent => none)
+    b.ecut_finder = paynow::parse_finder(got.tx_extra);           // EMPTY-CUT FINDER (absent => none)
+    b.ecut_finder_malformed = paynow::finder_malformed(got.tx_extra);
 
     // --- r and R ---
     set_::CoinbaseInputs in;
@@ -135,16 +230,47 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     // --- map every output to a payee identity (fail-closed) ---
     std::vector<std::pair<::v37::bytes32, ::v37::ScriptRef>> refs;
     refs.emplace_back(sink_identity, sink_ref);
+    // EMPTY-CUT FINDER: the block itself names its finder's payee, so its
+    // output maps without any learned ref (identity = xmr_identity_key).
+    if (b.ecut_finder && ::v37::xmr::xmr_ref_valid(*b.ecut_finder))
+        refs.emplace_back(::v37::xmr::xmr_identity_key(*b.ecut_finder), *b.ecut_finder);
     for (const auto& k : keys) {
         ::v37::ScriptRef ref = pay_of(k);
         if (::v37::xmr::is_xmr_kind(ref.kind)) refs.emplace_back(k, ref);
     }
+    // COST. derive_output per (output, ref) pair is ~160 us (8*r*A ~120 us,
+    // the one-time key ~46 us): O(outputs x refs) scalar multiplications, 650 s
+    // for 2700 outputs x 3000 refs. Same result, same first-match order, with
+    // D = 8*r*A computed once per ref (lazily) and the view tag (one hash,
+    // ~0.5 us) checked before the one-time key: a match needs both, so a tag
+    // miss skips the scalar multiplication.
+    struct Deriv { bool tried = false, ok = false; ::xmr::coin::KeyDerivation D; ::xmr::coin::PublicKey B; };
+    std::vector<Deriv> deriv(refs.size());
+    auto derivation_of = [&](std::size_t j) -> const Deriv& {
+        Deriv& d = deriv[j];
+        if (d.tried) return d;
+        d.tried = true;
+        const ::v37::ScriptRef& ref = refs[j].second;
+        if (!::v37::xmr::is_xmr_kind(ref.kind) || ref.payload.size() != ::v37::xmr::XMR_PAYLOAD_LEN) return d;
+        ::xmr::coin::PublicKey A;
+        std::memcpy(d.B.data(), ref.payload.data(), 32);        // spend B || view A (XMR_SUB: D_i || A)
+        std::memcpy(A.data(), ref.payload.data() + 32, 32);
+        d.ok = set_::cached_key_derivation(A, r, d.D);
+        return d;
+    };
     for (std::size_t i = 0; i < got.keys.size(); ++i) {
         bool found = false;
-        for (const auto& [id, ref] : refs) {
-            ::xmr::coin::PublicKey P; ::xmr::coin::ViewTag vt;
-            if (!set_::derive_output(r, ref, i, P, vt)) continue;
-            if (P == got.keys[i] && vt.tag == got.view_tags[i].tag) {
+        for (std::size_t j = 0; j < refs.size(); ++j) {
+            const auto& id = refs[j].first;
+            const Deriv& d = derivation_of(j);
+            if (!d.ok) continue;
+            ::xmr::coin::ViewTag vt;
+            ::xmr::coin::derive_view_tag(d.D, i, vt);
+            if (vt.tag != got.view_tags[i].tag) continue;
+            ::xmr::coin::PublicKey P;
+            if (!::xmr::coin::derive_public_key(d.D, i, d.B, P)) continue;
+            if (P == got.keys[i]) {
+                b.out_identity.push_back(id); b.out_amount.push_back(got.amounts[i]);
                 if (id == sink_identity) b.sink_total += static_cast<long long>(got.amounts[i]); // D1: never deduct the sink from a ledger key
                 else b.payout[id] += static_cast<long long>(got.amounts[i]);
                 found = true; break;
@@ -157,6 +283,44 @@ inline CoinbaseBooking decode_lane_coinbase(const std::vector<std::uint8_t>& blo
     }
     if (b.unmapped_outputs) { b.payout_partial = true; return b; }   // fail-closed for booking; mapped part kept for the debit
     b.ok = true;
+    return b;
+}
+
+// ---------------------------------------------------------------------------
+// fee model (xmr_fee_model.hpp): the every-node REFUSE-IF-ABSENT booking rule.
+// The residual sink IS the donation address, so every vout to it was tallied
+// as coverage above; this locates the ONE mandatory donation output (last,
+// any amount, 0 included; the donation's K_fair payout + the folded residual,
+// rulings S1 + 09-23), refusing the coinbase when it is absent,
+// when an earlier output also pays the donation, or when the owed_in tail is
+// missing, and books min(owed_in, amount) of it as the donation's payout
+// (give-author credit settled, an owed deduction); the rest stays coverage.
+// Only a FeeModelGate-ON node calls this; gate OFF books with
+// decode_lane_coinbase() against its configured sink, exactly as master.
+// `net` selects the donation identity (DON-NET); the daemon passes its
+// --network, the default is mainnet.
+// ---------------------------------------------------------------------------
+template <class PayOf>
+inline CoinbaseBooking decode_lane_coinbase_fee(const std::vector<std::uint8_t>& blob,
+                                                std::uint32_t chain_id,
+                                                const std::vector<::v37::bytes32>& candidates,
+                                                const std::vector<::v37::bytes32>& keys,
+                                                PayOf&& pay_of,
+                                                ::c2pool::v37n::xmr::fee::DonationNet net =
+                                                    ::c2pool::v37n::xmr::fee::DonationNet::Mainnet,
+                                                const ::v37::bytes32* pool_tag = nullptr) {
+    namespace fee = ::c2pool::v37n::xmr::fee;
+    const ::v37::bytes32 D = fee::donation_identity(net);
+    CoinbaseBooking b = decode_lane_coinbase(blob, chain_id, candidates, keys, fee::donation_ref(net),
+                                             D, std::forward<PayOf>(pay_of), pool_tag);
+    if (!b.ok) return b;
+    std::string w;
+    if (!fee::apply_donation_rule(b.out_identity, b.out_amount, D, b.donation_owed_in,
+                                  b.payout, b.sink_total, &w)) {
+        b.ok = false;
+        b.why = "donation-refused: " + w + " (the lane coinbase must carry the mandatory donation output)";
+        b.payout.clear();
+    }
     return b;
 }
 

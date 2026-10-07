@@ -438,6 +438,18 @@ static void test_follow_after_race_loss() {
     checkf(tips.size() == 1 && tips[0].resolved,
            "follow: the rival is parked UNRESOLVED -- its branch difficulty was not computable");
 
+    // D6b/RC-CTX: the receipt relay answers a context request for a HELD rival
+    // from the index (block_blob_of -> NativeCtxFeeder::serve, no monerod
+    // get_block), and never hands the rival's bytes out for another id.
+    {
+        std::vector<std::uint8_t> blob;
+        checkf(idx.block_blob_of(id_of(rival[0]), blob) && blob == rival[0].block_blob,
+               "follow: block_blob_of did not return the held rival's blob");
+        blob.clear();
+        checkf(!idx.block_blob_of(our_tip, blob) || blob != rival[0].block_blob,
+               "follow: block_blob_of answered the rival's blob for our own tip");
+    }
+
     // Equal work: we keep our own block (D-14), and we are still at our tip.
     checkf(f.tip_id() == our_tip, "follow: equal work did not keep our own block");
     checkf(f.log.count(node::MainchainEventKind::Reorg) == 0,
@@ -641,6 +653,75 @@ static void test_bounds() {
 }
 
 // =============================================================================
+// F. a monerod checkpoint fences only what is at or below the chain height
+// =============================================================================
+// monerod's checkpoints::is_alternative_block_allowed(blockchain_height,
+// block_height) takes the highest checkpoint <= blockchain_height (block count,
+// tip + 1) and allows the alternative iff that checkpoint < block_height. The
+// index used to test fork_height against EVERY checkpoint, so one sitting above
+// the tip -- which an anchor bundle carries by construction
+// (checkpoints_at_or_above) -- refused every reorg, a one-block sibling race
+// included.
+static std::size_t count_refusals(const ChainIndex& idx, ReorgRefusal code) {
+    std::size_t n = 0;
+    for (const ReorgRecord& r : idx.journal().records())
+        if (r.phase == ReorgPhase::Refused && r.refusal == code) ++n;
+    return n;
+}
+
+static void test_checkpoint_above_tip() {
+    Hash cp_id{};
+    cp_id.fill(0xcc);
+
+    // --- a checkpoint ABOVE the chain: a heavier branch off 7 is adopted ------
+    {
+        Rig f(8);
+        ChainIndex& idx = *f.idx;
+        idx.set_monerod_checkpoints({{12, cp_id}});
+        std::vector<BlockEntry> br = build_branch(idx, f.main_ids[6], 7, 2, /*salt_base=*/71);
+        for (std::size_t i = 0; i < br.size(); ++i)
+            (void)idx.offer_block(&f.them, br[i], /*own_mined=*/false);
+        checkf(count_refusals(idx, ReorgRefusal::BelowCheckpoint) == 0,
+               "cp-above: a checkpoint at 12 above tip 8 refused a fork at 7 (%zu BelowCheckpoint)",
+               count_refusals(idx, ReorgRefusal::BelowCheckpoint));
+        checkf(f.tip_height() == 9 && f.tip_id() == id_of(br.back()),
+               "cp-above: the heavier branch was not adopted (tip %llu)",
+               static_cast<unsigned long long>(f.tip_height()));
+        checkf(f.log.count(node::MainchainEventKind::Reorg) == 1,
+               "cp-above: %zu Reorg events, expected 1",
+               f.log.count(node::MainchainEventKind::Reorg));
+    }
+
+    // --- a checkpoint AT OR BELOW the chain still fences: fork 4 < cp 5 --------
+    {
+        Rig f(8);
+        ChainIndex& idx = *f.idx;
+        const Hash our_tip = f.main_ids[7];
+        idx.set_monerod_checkpoints({{5, cp_id}, {12, cp_id}});
+        std::vector<BlockEntry> br = build_branch(idx, f.main_ids[3], 4, 6, /*salt_base=*/81);
+        for (std::size_t i = 0; i < br.size(); ++i)
+            (void)idx.offer_block(&f.them, br[i], /*own_mined=*/false);
+        checkf(f.tip_id() == our_tip, "cp-below: a branch forking under checkpoint 5 was adopted");
+        checkf(count_refusals(idx, ReorgRefusal::BelowCheckpoint) > 0,
+               "cp-below: the refusal is not journaled as BelowCheckpoint");
+    }
+
+    // --- a fork AT the reached checkpoint is allowed (cp 5 < first block 6) ---
+    {
+        Rig f(8);
+        ChainIndex& idx = *f.idx;
+        idx.set_monerod_checkpoints({{5, cp_id}});
+        std::vector<BlockEntry> br = build_branch(idx, f.main_ids[4], 5, 5, /*salt_base=*/91);
+        for (std::size_t i = 0; i < br.size(); ++i)
+            (void)idx.offer_block(&f.them, br[i], /*own_mined=*/false);
+        checkf(count_refusals(idx, ReorgRefusal::BelowCheckpoint) == 0,
+               "cp-at: a fork AT checkpoint 5 was refused");
+        checkf(f.tip_height() == 10, "cp-at: the heavier branch off 5 was not adopted (tip %llu)",
+               static_cast<unsigned long long>(f.tip_height()));
+    }
+}
+
+// =============================================================================
 // E. the young-chain relaxation does not change what the chain COMPUTES
 // =============================================================================
 // The branch walk and the apply path must arrive at the same difficulty for the
@@ -691,6 +772,7 @@ int main() {
     test_walk_to_fork();
     test_bounds();
     test_branch_and_apply_agree();
+    test_checkpoint_above_tip();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

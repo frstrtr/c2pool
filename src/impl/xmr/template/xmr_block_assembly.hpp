@@ -13,8 +13,8 @@
 // the two disconnected legs already in the tree into one producer of a FULL,
 // SUBMITTABLE Monero block:
 //
-//   * the p2pool-derived whole-block template builder
-//       XmrBlockTemplate  (xmr_block_template.{hpp,cpp}, GPL-3 via AGPLv3 s13)
+//   * the clean-room whole-block template builder
+//       XmrBlockTemplate  (xmr_block_template.{hpp,cpp}, clean-room, AGPL-3)
 //     which serialises  header || miner_tx || varint(n_tx) || 32*n tx hashes,
 //     does the penalty-aware tx selection, the Keccak-midstate per-extra-nonce
 //     coinbase re-hash, the tree_hash main branch and the 76..128 B RandomX
@@ -108,6 +108,34 @@ namespace c2pool::xmr::assembly {
 // consumer-tree KAT v37_xmr_credit_cut_kat (which may include both headers;
 // the impl tree must not include the consumer tree).
 inline constexpr std::size_t CREDIT_CUT_TAIL_BYTES = 44;  // 4 magic + 8 u64 P + 32 spine
+// fee model (donation-output merge): the donation owed_in commitment rides
+// just before the credit cut (consumer tree xmr_fee_model.hpp,
+// fee::kDonationOwedTailBytes == 12, "V37D" || u64le; mirrored and
+// static_asserted in v37_xmr_fee_model_kat). Present only under the gate.
+inline constexpr std::size_t DONATION_OWED_TAIL_BYTES = 12;  // 4 magic + 8 u64 owed_in
+// POOL-LINEAGE: the V37C tail's versioned pool-tag field ("V37P" | u8 ver |
+// b32 pool_tag, consumer tree xmr_credit_cut.hpp credit::kPoolTagFieldBytes;
+// static_asserted in v37_xmr_pool_lineage_kat), just before the credit cut.
+// With it the 0x02 payload can exceed 127 B (rbind + V37D + V37P + V37C), so
+// the length is a TWO-byte varint there: the probe below reads it as a varint.
+inline constexpr std::size_t POOL_TAG_FIELD_BYTES = 37;      // 4 magic + 1 version + 32 pool_tag
+// SAME-BLOCK PAY-NOW: the committed base B rides first ("V37N" || u64le,
+// consumer tree c2pool/v37/xmr/xmr_paynow.hpp paynow::kPayNowTailBytes == 12,
+// static_asserted in v37_xmr_paynow_kat). Present only when pay-now is armed.
+inline constexpr std::size_t PAYNOW_TAIL_BYTES = 12;  // 4 magic + 8 u64 base
+// EMPTY-CUT FINDER (operator ruling 09-26): in an empty-cut block the
+// committed finder payee rides right before V37N ("V37F" || u8 kind ||
+// payee[64], consumer tree xmr_paynow.hpp paynow::kFinderFieldBytes == 69,
+// static_asserted in v37_xmr_empty_cut_finder_kat). The widest payload is
+// then 14 + 32 + 69 + 12 + 12 + 37 + 44 = 220 B (<= 255, two-byte varint).
+inline constexpr std::size_t FINDER_FIELD_BYTES = 69;  // 4 magic + 1 kind + 64 payee
+// REWARD TOTAL (share-level canonical coinbase): "V37R" || u64le(total) FIRST
+// in the tail (consumer tree xmr_paynow.hpp paynow::kRewardTotalFieldBytes ==
+// 12, static_asserted in v37_xmr_share_verdict_kat). Written by the seam from
+// the FINAL adopted budget, so a receipt's open tx_extra carries the total its
+// hidden outputs sum to. Widest payload: 220 + 12 = 232 B (<= 255).
+inline constexpr std::size_t REWARD_TOTAL_FIELD_BYTES = 12;  // 4 magic + 8 u64 total
+inline constexpr unsigned char REWARD_TOTAL_MAGIC[4] = {'V', '3', '7', 'R'};
 
 using ::v37::xmr::settle::BuildError;
 using ::v37::xmr::settle::BuiltCoinbase;
@@ -195,8 +223,8 @@ inline std::vector<unsigned char> extra_nonce_bytes(std::uint32_t extra_nonce, s
 // amounts, which is why re-deriving is unnecessary and the template's two-pass
 // flow stays sound.
 //
-// Call protocol with XmrBlockTemplate::update() (upstream order, pinned to the
-// p2pool commit named in xmr_block_template.hpp):
+// Call protocol with XmrBlockTemplate::update() (the order it follows, pinned
+// by xmr_block_assembly_kat):
 //   payees() ... merkle_tree_data() ... split_reward(base + sum(fees))   [1]
 //   create_miner_tx(dry_run)  -> derive_output_key not called
 //   [tx selection]            split_reward(final_reward)                 [2]
@@ -276,7 +304,7 @@ public:
             m_wanted = reward;
             return false;   // template falls back; the assembler rebuilds at `reward`
         }
-        for (std::size_t i = 0; i < alt.size(); ++i) m_cb.outputs[i].amount = alt[i].amount;
+        for (std::size_t i = 0; i < alt.size(); ++i) { m_cb.outputs[i].amount = alt[i].amount; m_cb.outputs[i].owed_part = alt[i].owed_part; }
         set_budget(m_in, m_subsidy, reward);
         m_cb.budget = reward;
         fill_amounts(rewards);
@@ -306,11 +334,34 @@ public:
 
     // recon(A+B credit): the on-chain credit cut tail the template appends to the 0x02 payload.
     void set_extra_nonce_tail(std::vector<std::uint8_t> t) { m_tail = std::move(t); }
-    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override { return m_tail; }
+    // REWARD TOTAL: prefix the tail with "V37R" || u64le(budget). The template
+    // re-reads the tail on every create_miner_tx, and the budget it reads on the
+    // final call is the adopted final reward (split_reward runs first).
+    void set_reward_total_field(bool on) { m_total_field = on; }
+    [[nodiscard]] std::vector<std::uint8_t> extra_nonce_tail() const override {
+        if (!m_total_field) return m_tail;
+        std::vector<std::uint8_t> t(REWARD_TOTAL_MAGIC, REWARD_TOTAL_MAGIC + 4);
+        const std::uint64_t v = m_in.budget();
+        for (int i = 0; i < 8; ++i) t.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        t.insert(t.end(), m_tail.begin(), m_tail.end());
+        return t;
+    }
+
+    // SEAM-1 (GAP-2 rbind): the per-job binding the template writes after the
+    // worker nonce. size 0 / no function => none (byte-identical template).
+    using ExtraNonceBindFn = std::function<bool(std::uint32_t extra_nonce, std::uint8_t* out)>;
+    void set_extra_nonce_bind(std::size_t size, ExtraNonceBindFn fn) { m_bind_size = fn ? size : 0; m_bind = std::move(fn); }
+    [[nodiscard]] std::size_t extra_nonce_bind_size() const override { return m_bind_size; }
+    [[nodiscard]] bool extra_nonce_bind(std::uint32_t extra_nonce, std::uint8_t* out) const override {
+        return m_bind_size && m_bind && m_bind(extra_nonce, out);
+    }
 
 private:
     X6SettlementSource() = default;
     std::vector<std::uint8_t> m_tail;   // recon(A+B credit)
+    bool             m_total_field = false;   // REWARD TOTAL ("V37R" first in the tail)
+    std::size_t      m_bind_size = 0;   // SEAM-1
+    ExtraNonceBindFn m_bind;            // SEAM-1
 
     void fill_amounts(std::vector<std::uint64_t>& rewards) const {
         rewards.resize(m_cb.outputs.size());
@@ -322,7 +373,9 @@ private:
             const CoinbaseOutput& a = alt[i];
             const CoinbaseOutput& b = m_cb.outputs[i];
             if (a.role != b.role || !(a.pay == b.pay) || a.identity != b.identity) return false;
-            if (a.amount == 0) return false;   // never emit a zero-amount output
+            // never emit a zero-amount output, except the donation marker (a Fixed
+            // output declared at 0: the output itself is the marker, fee model v1)
+            if (a.amount == 0 && a.role != CoinbaseOutput::Role::Fixed) return false;
         }
         return true;
     }
@@ -347,7 +400,7 @@ struct BlockBytes {
     std::size_t nonce_offset = 0;            // 4-B header nonce, same offset in BOTH blobs (39 for v16 / 5-B timestamp varint)
     std::size_t miner_tx_offset = 0;         // == header size
     std::size_t extra_nonce_offset = 0;      // in full_blob: first byte of the 0x02 payload
-    std::size_t extra_nonce_size = 0;        // 4..14 (padded)
+    std::size_t extra_nonce_size = 0;        // 4..14 (padded) [+32 SEAM-1 rbind] [+12 V37D] [+37 V37P pool tag] [+44 credit-cut tail]
     std::size_t merkle_root_offset = 0;      // in full_blob: the 32-B root inside the 0x03 tag
     std::size_t miner_tx_size = 0;           // incl. trailing rct_type byte
     ::xmr::coin::Hash256 merkle_root{};      // MM commitment root patched at merkle_root_offset (== X6 mm_root)
@@ -371,10 +424,112 @@ inline ::xmr::coin::Hash256 block_id_of(const std::vector<std::uint8_t>& hashing
     return ::xmr::coin::keccak256(w.bytes());
 }
 
+// ---------------------------------------------------------------------------
+// walk_tx_extra -- the tx_extra TLV walk, field by field IN ANY ORDER, with the
+// field grammar monerod's parse_tx_extra (cryptonote_basic/tx_extra.h) reads:
+//   0x00 padding           zero bytes to the END of tx_extra, <= 255 bytes incl. the tag
+//   0x01 tx pubkey         32 bytes
+//   0x02 extra nonce       varint(len <= 255) + len bytes
+//   0x03 merge-mining tag  varint(len) + len bytes, which hold varint(depth) + root[32]
+//   0x04 additional keys   varint(count) + 32 * count bytes
+//   0xDE minergate         varint(len) + len bytes
+// Anything else (an unknown tag, a truncated or malformed field) STOPS the walk
+// there: monerod's parse_tx_extra fails at the same byte and keeps the fields
+// read before it. The walk never throws and never rejects the transaction --
+// Monero consensus does not require a coinbase tx_extra to parse, so a valid
+// block can carry any bytes here (merge-mined blocks put 0x03 FIRST; see block
+// 3765869). A pure function of the bytes: every node walks it identically.
+// ---------------------------------------------------------------------------
+#define C2POOL_XMR_TX_EXTRA_WALK 1   // walk_tx_extra() present (v37_xmr_coinbase_extra_kat keys on it)
+struct TxExtraField {
+    std::uint8_t tag = 0;
+    std::size_t  offset = 0;        // of the tag byte
+    std::size_t  size = 0;          // whole field incl. the tag
+    std::size_t  data_offset = 0;   // first payload byte (after the tag and any length varint)
+    std::size_t  data_size = 0;
+};
+struct TxExtraWalk {
+    std::vector<TxExtraField> fields;   // in the order found
+    bool        complete = false;       // true: every byte belongs to a well-formed field
+    std::size_t stop_offset = 0;        // == size when complete; else where the walk stopped
+    const char* stop_why = "";          // why it stopped early ("" when complete)
+    [[nodiscard]] const TxExtraField* first(std::uint8_t tag) const {
+        for (const TxExtraField& f : fields) if (f.tag == tag) return &f;
+        return nullptr;
+    }
+};
+inline TxExtraWalk walk_tx_extra(const std::uint8_t* x, std::size_t n) {
+    TxExtraWalk w;
+    std::size_t i = 0;
+    auto varint_at = [&](std::size_t& pos, std::uint64_t& v) -> bool {
+        const std::uint8_t* it = x + pos;
+        const std::uint8_t* end = x + n;
+        if (tools::read_varint(it, end, v) <= 0) return false;
+        pos = static_cast<std::size_t>(it - x);
+        return true;
+    };
+    auto stop = [&](const char* why) { w.stop_offset = i; w.stop_why = why; return w; };
+    while (i < n) {
+        TxExtraField f; f.tag = x[i]; f.offset = i;
+        std::size_t pos = i + 1;
+        switch (f.tag) {
+            case 0x00: {   // padding: zeros to the end, <= 255 bytes incl. the tag
+                if (n - i > 255) return stop("padding longer than 255 bytes");
+                for (std::size_t k = pos; k < n; ++k) if (x[k] != 0) return stop("non-zero byte inside padding");
+                f.data_offset = pos; f.data_size = n - pos; pos = n;
+                break;
+            }
+            case 0x01: {   // tx pubkey
+                if (n - pos < 32) return stop("truncated 0x01 pubkey");
+                f.data_offset = pos; f.data_size = 32; pos += 32;
+                break;
+            }
+            case 0x04: {   // additional pubkeys: varint count + 32 * count
+                std::uint64_t cnt = 0;
+                if (!varint_at(pos, cnt)) return stop("bad 0x04 count varint");
+                if (cnt > (n - pos) / 32) return stop("truncated 0x04 additional pubkeys");
+                f.data_offset = pos; f.data_size = static_cast<std::size_t>(cnt) * 32; pos += f.data_size;
+                break;
+            }
+            case 0x02: case 0x03: case 0xDE: {   // length-prefixed blobs
+                std::uint64_t len = 0;
+                if (!varint_at(pos, len)) return stop("bad length varint");
+                if (len > n - pos) return stop("truncated length-prefixed field");
+                if (f.tag == 0x02 && len > 255) return stop("0x02 nonce longer than 255 bytes");
+                if (f.tag == 0x03) {   // the blob must hold varint(depth) + root[32]
+                    std::size_t in = pos; std::uint64_t depth = 0;
+                    const std::size_t lim = pos + static_cast<std::size_t>(len);
+                    const std::uint8_t* it = x + in; const std::uint8_t* end = x + lim;
+                    if (tools::read_varint(it, end, depth) <= 0) return stop("bad 0x03 depth varint");
+                    in = static_cast<std::size_t>(it - x);
+                    if (lim - in < 32) return stop("truncated 0x03 merkle root");
+                }
+                f.data_offset = pos; f.data_size = static_cast<std::size_t>(len); pos += f.data_size;
+                break;
+            }
+            default:
+                return stop("unknown tx_extra tag");
+        }
+        f.size = pos - i;
+        w.fields.push_back(f);
+        i = pos;
+    }
+    w.complete = true; w.stop_offset = n;
+    return w;
+}
+
 // Parse a serialised coinbase PREFIX (version .. tx_extra) into X6's
 // ReceivedCoinbase for canonical_coinbase_matches(). Accepts the miner_tx as
 // found in a block blob (the rct_type byte after the prefix is ignored). Returns
-// false on any structural error. *consumed = prefix length on success.
+// false on a structural error of the prefix itself (version, unlock, txin_gen,
+// outputs, the tx_extra LENGTH). tx_extra is NOT required to parse (Monero
+// consensus does not require it): it is kept verbatim as opaque bytes and R is
+// the FIRST 0x01 pubkey the walk_tx_extra() field walk reaches, in any field
+// order (zero when there is none). Every prefix the pre-walk parser accepted
+// (tx_extra[0] == 0x01) yields byte-identical output here. Recognising a LANE
+// coinbase stays with the callers (canonical_coinbase_matches byte-compares the
+// whole tx_extra; the coinbase authority needs our 03 21 00 tail + the matched
+// root + r*G == R). *consumed = prefix length on success.
 inline bool parse_coinbase_prefix(const std::uint8_t* p, std::size_t n,
                                   ReceivedCoinbase& out, std::uint64_t* height_out = nullptr,
                                   std::size_t* consumed = nullptr) {
@@ -402,9 +557,12 @@ inline bool parse_coinbase_prefix(const std::uint8_t* p, std::size_t n,
     if (!rd(xlen) || static_cast<std::size_t>(end - it) < xlen) return false;
     out.tx_extra.assign(it, it + xlen);
     it += xlen;
-    // tx pubkey: tag 0x01 must be the first extra field (X6 layout)
-    if (out.tx_extra.size() < 1 + HASH_SIZE || out.tx_extra[0] != TX_EXTRA_TAG_PUBKEY) return false;
-    std::memcpy(out.R.data(), out.tx_extra.data() + 1, HASH_SIZE);
+    // tx pubkey: the first 0x01 field in any order (X6 puts it first). A tx_extra
+    // that does not walk (or holds no 0x01) is opaque bytes, R stays zero.
+    out.R = decltype(out.R){};
+    const TxExtraWalk w = walk_tx_extra(out.tx_extra.data(), out.tx_extra.size());
+    if (const TxExtraField* pk = w.first(TX_EXTRA_TAG_PUBKEY))
+        std::memcpy(out.R.data(), out.tx_extra.data() + pk->data_offset, HASH_SIZE);
     if (height_out) *height_out = height;
     if (consumed) *consumed = static_cast<std::size_t>(it - p);
     return true;
@@ -515,7 +673,7 @@ struct AssemblyInputs {
 
     // GOOD-CITIZEN (native arm). When true, `mempool` is the FINAL set the AGPL
     // good-citizen selector already chose: the template mines it VERBATIM (no
-    // p2pool 5-s age gate, no penalty-zone greedy re-select). This file still
+    // 5-s mempool age gate, no penalty-zone greedy re-select). This file still
     // enforces a coinbase-aware hard trim so the block never crosses 2*median
     // (which would zero the reward and refuse the block) -- the trim only ever
     // pops from the fee-rate TAIL and never the first entry, so a non-empty
@@ -524,6 +682,14 @@ struct AssemblyInputs {
     // recon(A+B credit): bytes appended to the 0x02 payload after the padded worker
     // nonce (the on-chain credit cut). Empty => byte-identical templates.
     std::vector<std::uint8_t>     extra_nonce_tail;
+    // REWARD TOTAL: the seam writes "V37R" || u64le(final reward) before
+    // extra_nonce_tail (share-level canonical coinbase; fee model v1 lanes).
+    bool                          reward_total_field = false;
+    // SEAM-1 (GAP-2 rbind): bytes written right after the 4-byte worker nonce,
+    // per extra_nonce ([extra_nonce 4 | bind | padding | tail]). 0 / empty =>
+    // byte-identical templates. Size <= EXTRA_NONCE_BIND_MAX.
+    std::size_t                   extra_nonce_bind_size = 0;
+    X6SettlementSource::ExtraNonceBindFn extra_nonce_bind;
 };
 
 class XmrBlockAssembler {
@@ -574,7 +740,7 @@ public:
             // capped at wire_cap. Reserve enough that weight_aware_output_cap
             // keeps room for them AND the block stays reward-positive.
             const std::uint64_t req_outputs =
-                std::min<std::uint64_t>(a.settle.owed.size() + a.settle.fixed.size() + 1, a.wire_cap);
+                std::min<std::uint64_t>(a.settle.owed.size() + a.settle.paynow_n + a.settle.fixed.size() + 1, a.wire_cap);
             const std::uint64_t cb_ub = 128 + req_outputs * ::v37::xmr::settle::XMR_OUTPUT_SIZE_BYTES;
             // reward-positive ceiling (2*median_raw) intersected with the
             // penalty-free zone that weight_aware_output_cap caps payees against.
@@ -594,8 +760,15 @@ public:
         std::uint64_t fees_all = 0, weight_all = 0;
         for (const auto& t : mempool) { fees_all += t.fee; weight_all += t.weight; }
 
+        // SPEND-COST FLOOR (payout-threshold.md §3): the coinbase takes its room
+        // first and the transactions fill the rest (the trim above and the
+        // template's own pick both count the miner tx before any tx), so the cap
+        // is the wire ceiling, a constant every receiver can check. A cap chosen
+        // from the builder's own tx set is latitude a receiver cannot verify.
         if (base.output_cap == 0)
-            base.output_cap = ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
+            base.output_cap = base.spend_floor
+                ? a.wire_cap
+                : ::v37::xmr::settle::weight_aware_output_cap(a.miner.median_weight, weight_all, a.wire_cap);
 
         std::uint64_t hint = subsidy + fees_all;   // == the template's sizing-pass reward
         std::vector<std::uint64_t> tried;
@@ -608,6 +781,11 @@ public:
             std::unique_ptr<X6SettlementSource> seam = X6SettlementSource::build(in, subsidy, &sub);
             if (!seam) return fail("pass " + std::to_string(pass) + ": " + sub);
             seam->set_extra_nonce_tail(a.extra_nonce_tail);   // recon(A+B credit)
+            seam->set_reward_total_field(a.reward_total_field);  // REWARD TOTAL
+            if (a.extra_nonce_bind_size > EXTRA_NONCE_BIND_MAX)
+                return fail("SEAM-1: extra_nonce_bind_size " + std::to_string(a.extra_nonce_bind_size) +
+                            " > EXTRA_NONCE_BIND_MAX " + std::to_string(EXTRA_NONCE_BIND_MAX));
+            seam->set_extra_nonce_bind(a.extra_nonce_bind_size, a.extra_nonce_bind);   // SEAM-1
 
             std::unique_ptr<XmrBlockTemplate> tpl(new XmrBlockTemplate(seam.get()));
             seam->begin_update();
@@ -673,13 +851,23 @@ private:
         std::size_t no = 0, eo = 0, ro = 0; hash root;
         const std::vector<std::uint8_t> full = rec.m_tpl->get_block_template_blob(rec.m_internal_tid, 0, no, eo, ro, root);
         const std::size_t header = no + NONCE_SIZE;
-        // 0x02 tag layout: 02 | varint(len) | payload ; len < 0x80 so one byte
-        if (eo < 2 || eo > full.size() || full[eo - 2] != TX_EXTRA_NONCE) {
+        // 0x02 tag layout: 02 | varint(len) | payload. len < 0x80 is one byte;
+        // POOL-LINEAGE: with rbind + V37D + V37P + V37C it can reach 0x80..0xff
+        // (two bytes: lo|0x80, 0x01).
+        if (eo < 2 || eo > full.size()) {
             if (why) *why = "internal: extra-nonce tag layout";
             return false;
         }
-        rec.m_extra_nonce_size = full[eo - 1];
-        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE || rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail
+        if (full[eo - 2] == TX_EXTRA_NONCE && full[eo - 1] < 0x80) {
+            rec.m_extra_nonce_size = full[eo - 1];
+        } else if (eo >= 3 && full[eo - 3] == TX_EXTRA_NONCE && (full[eo - 2] & 0x80) && full[eo - 1] == 0x01) {
+            rec.m_extra_nonce_size = static_cast<std::size_t>(full[eo - 2] & 0x7f) | 0x80;
+        } else {
+            if (why) *why = "internal: extra-nonce tag layout";
+            return false;
+        }
+        if (rec.m_extra_nonce_size < EXTRA_NONCE_SIZE ||
+            rec.m_extra_nonce_size > EXTRA_NONCE_MAX_SIZE + EXTRA_NONCE_BIND_MAX + FINDER_FIELD_BYTES + PAYNOW_TAIL_BYTES + DONATION_OWED_TAIL_BYTES + POOL_TAG_FIELD_BYTES + CREDIT_CUT_TAIL_BYTES) {   // R1: +44 credit-cut tail; SEAM-1: +32 rbind; fee: +12 V37D; pay-now: +12 V37N; POOL-LINEAGE: +37 V37P; empty-cut finder: +69 V37F
             if (why) *why = "internal: extra-nonce size out of range";
             return false;
         }
@@ -899,6 +1087,21 @@ inline bool selfcheck(std::string& log) {
             C(t->outputs()[0].identity == id_of(0x45) && t->outputs()[5].identity == id_of(0x40), "K2 K_fair oldest-owed-first order preserved through the template");
             for (std::uint32_t en : {0u, 1u, 0xFFFFFFFFu}) check_template(C, *t, en, "K2");
         }
+        // K2b (fee-model S1): the SAME inputs with the fixed output BEING the
+        // residual sink (its ref AND identity) -> the residual folds into it:
+        // 7 outputs, no Sink role, the last (Fixed) output = its 5000000
+        // minimum + the residual.
+        AssemblyInputs b = a; b.settle.fixed[0].pay = b.settle.residual_sink; b.settle.fixed[0].identity = b.settle.residual_sink_identity;
+        auto tb = XmrBlockAssembler::build(b, &why);
+        if (C(tb != nullptr, "K2b build (6 owed + fixed-that-pays-the-sink) " + why) && t) {
+            const auto& ob = tb->outputs();
+            bool no_sink = true; for (const auto& o : ob) no_sink &= (o.role != CoinbaseOutput::Role::Sink);
+            C(ob.size() == 7 && no_sink && ob.back().role == CoinbaseOutput::Role::Fixed,
+              "K2b S1: 7 outputs (6 owed + ONE fixed), no separate sink output");
+            C(ob.back().amount == t->outputs()[6].amount + t->outputs()[7].amount && ob.back().amount > 5000000ull,
+              "K2b S1: the fixed output = its minimum + the residual (== K2's fixed + sink)");
+            for (std::uint32_t en : {0u, 7u}) check_template(C, *tb, en, "K2b");
+        }
     }
 
     // ---- K3: penalty zone, payee set CHANGES with the final reward -> fixpoint --
@@ -951,6 +1154,11 @@ inline bool selfcheck(std::string& log) {
         AssemblyInputs c; c.miner = miner(1, 300000, 0); c.settle = lane_ctx(); c.settle.output_cap = 1;
         ::v37::xmr::settle::FixedOutput f; f.pay = std_ref(); f.amount = 1; f.identity = id_of(0x77); c.settle.fixed.push_back(f);
         C(XmrBlockAssembler::build(c, &why) == nullptr, "K6' output_cap too small for fixed + sink refused: " + why);
+        // K6'' (fee-model S1): a fixed output that IS the sink needs NO sink slot.
+        AssemblyInputs d = c; d.settle.fixed[0].identity = d.settle.residual_sink_identity;
+        auto td = XmrBlockAssembler::build(d, &why);
+        C(td != nullptr && td->outputs().size() == 1 && td->outputs()[0].role == CoinbaseOutput::Role::Fixed &&
+          td->outputs()[0].amount == td->reward(), "K6'' S1: output_cap 1 + a fixed output paying the sink -> ONE output = the whole reward " + why);
     }
 
     // ---- K7: GOOD-CITIZEN take_mempool_as_given (native arm) ------------------

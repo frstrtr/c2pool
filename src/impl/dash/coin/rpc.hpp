@@ -101,11 +101,11 @@ private:
     bool m_connected = false;
     std::unique_ptr<core::Timer> m_reconnect_timer;
 
-    // DASHD-CUT sync-reconnect backoff (hotel-reserve thrash fix). sync_reconnect()
+    // DASHD-CUT sync-reconnect backoff (reserve node thrash fix). sync_reconnect()
     // is called synchronously from Send() (under m_rpc_mutex) on every write/read
     // failure and, unlike the async connect() path, had NO backoff: against a dead
     // dashd "Connection refused" returns instantly, so Send() re-drove it ~30/s
-    // (17804 attempts in ~10 min at the hotel-reserve reserve). These bound that:
+    // (17804 attempts in ~10 min at the reserve node). These bound that:
     // after a FAILED sync reconnect we refuse to re-attempt the socket until the
     // backoff window elapses (Send() returns empty; the embedded/null arm keeps
     // serving), doubling the window 1->2->4->...->kSyncBackoffMaxSecs. A SUCCESS

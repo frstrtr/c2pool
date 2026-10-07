@@ -64,6 +64,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -153,6 +154,18 @@ struct VaultServeChunk {
     // are not "missing", and they must not stall the fetch). Always a subset of
     // ids[0, cursor).
     std::vector<bytes32> unservable;
+};
+
+// REPAIR-CHAIN (F2-S): an optional DEEP source behind the in-memory vault --
+// the owner's durable lane order (xmr/relay/xmr_durable_order.hpp). `order`
+// is offered exactly the asks the vault would answer BELOW_HORIZON and may
+// fill `out` (ids + p_served; the status stays OK) -- the same paging contract,
+// own lineage only, contiguous or not at all. `frame` is offered an id the
+// vault does not hold. Unset (the default) = the vault alone, byte for byte.
+// Both run under the vault lock: they must never call back into the vault.
+struct FrameVaultDeep {
+    std::function<bool(std::uint32_t chain, std::uint64_t a, std::uint64_t p, std::size_t max_ids, VaultOrder& out)> order;
+    std::function<bool(const bytes32& id, std::vector<std::uint8_t>& frame)> frame;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -323,6 +336,16 @@ public:
             if (out.size() >= max_frames) { r.truncated = true; break; }
             auto it = m_by_hash.find(ids[i]);
             const Entry* e = (it == m_by_hash.end()) ? nullptr : entry_locked(it->second);
+            std::vector<std::uint8_t> deep_frame;   // REPAIR-CHAIN: an id served from the deep order
+            if (!e && m_deep.frame && m_deep.frame(ids[i], deep_frame)) {
+                if (deep_frame.size() > max_bytes) { ++m_stats.frames_unservable; r.unservable.push_back(ids[i]); r.cursor = i + 1; continue; }
+                if (acc + deep_frame.size() > max_bytes) { r.truncated = true; break; }
+                acc += deep_frame.size();
+                out.emplace_back(ids[i], std::move(deep_frame));
+                ++m_stats.frames_served;
+                r.cursor = i + 1;
+                continue;
+            }
             if (!e) { ++m_stats.frames_missing; r.cursor = i + 1; continue; }
             if (e->frame.size() > max_bytes) {
                 // Alone over the whole budget: unreachable by any chunking.
@@ -369,6 +392,8 @@ public:
         // retain we cannot serve a CONTIGUOUS prefix, and a gapped answer would
         // be a lie about our own order. Say so instead.
         if (!m_q.empty() && a < r.lowest_retained) {
+            // REPAIR-CHAIN: the owner's durable order may serve it (OK, same paging)
+            if (m_deep.order && m_deep.order(chain, a, p, max_ids, r)) { r.status = VaultOrderStatus::OK; return r; }
             r.status = VaultOrderStatus::BELOW_HORIZON;
             return r;
         }
@@ -384,6 +409,9 @@ public:
         r.p_served = p;
         return r;
     }
+
+    // REPAIR-CHAIN: install / clear the deep source (FrameVaultDeep).
+    void set_deep(FrameVaultDeep d) { std::lock_guard<std::mutex> lk(m_mtx); m_deep = std::move(d); }
 
     // Lowest / highest lane position still retained (0 / kNoPos when empty).
     std::uint64_t lowest_position() const {
@@ -454,6 +482,7 @@ private:
     }
 
     mutable std::mutex      m_mtx;
+    FrameVaultDeep          m_deep{};            // REPAIR-CHAIN: unset = vault only
     FrameVaultOptions       m_opt{};
     mutable FrameVaultStats m_stats{};
     std::deque<Entry>       m_q;

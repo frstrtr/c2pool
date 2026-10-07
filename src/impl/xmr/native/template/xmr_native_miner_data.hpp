@@ -89,6 +89,8 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -156,6 +158,8 @@ enum class NativeRefusal : std::uint8_t {
     NoWeightWindow,
     NoCoins,
     NoHardFork,
+    TipMoved,           // the tip left the branch the template was built on mid-build
+    PoolCold,           // TXPOOL-RESUME: the tx pool has not finished its back-fill yet
 };
 
 inline const char* to_string(NativeRefusal r) noexcept {
@@ -169,6 +173,8 @@ inline const char* to_string(NativeRefusal r) noexcept {
         case NativeRefusal::NoWeightWindow:   return "NoWeightWindow";
         case NativeRefusal::NoCoins:          return "NoCoins";
         case NativeRefusal::NoHardFork:       return "NoHardFork";
+        case NativeRefusal::TipMoved:         return "TipMoved";
+        case NativeRefusal::PoolCold:         return "PoolCold";
     }
     return "?";
 }
@@ -225,21 +231,50 @@ public:
     std::optional<node::MinerData> snapshot(std::string* why) const override {
         MinerDataReadiness r;
         NativeRefusal      refusal = NativeRefusal::None;
-        std::optional<TemplateInputs> ti = evaluate_(r, refusal, why);
-        if (!ti || !r.ok()) {
-            std::lock_guard<std::mutex> lk(mtx_);
-            ++refusals_;
-            last_refusal_ = refusal;
-            return std::nullopt;
-        }
+        std::optional<TemplateInputs> ti;
+        node::MinerData md;
+        std::vector<node::TxBacklogEntry> pool_set;
+        std::size_t dropped_mined = 0;
+        // Two attempts: the chain filter below can find the tip gone from the
+        // branch the inputs were read on (a reorg mid-build); one re-read is
+        // enough to land on the new tip, and a second miss is a refusal (the
+        // provider keeps serving its last good template meanwhile).
+        for (int attempt = 0;; ++attempt) {
+            ti = evaluate_(r, refusal, why);
+            if (!ti || !r.ok()) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                ++refusals_;
+                last_refusal_ = refusal;
+                return std::nullopt;
+            }
 
-        node::MinerData md = ti->to_miner_data();
-        // to_miner_data() deliberately leaves tx_backlog empty: the chain state
-        // and the transaction set come from two different components, and the
-        // conversion above stays a pure function of chain state (D-7/D-11).
-        std::vector<node::TxBacklogEntry> pool_set = policy_.use_explicit_select
-                            ? pool_.selectable_backlog(policy_.select)
-                            : pool_.selectable_backlog();
+            md = ti->to_miner_data();
+            // to_miner_data() deliberately leaves tx_backlog empty: the chain
+            // state and the transaction set come from two different components,
+            // and the conversion above stays a pure function of chain state
+            // (D-7/D-11).
+            pool_set = policy_.use_explicit_select ? pool_.selectable_backlog(policy_.select)
+                                                   : pool_.selectable_backlog();
+
+            // CHAIN HYGIENE (the publish-arm verify, 8b2efacf at h=513). The
+            // pool and the tip are two components on two threads: the pool
+            // learns a block mined a tx when the index's tx event reaches it,
+            // and a template built on the new tip before that carried a tx the
+            // tip had already mined -- a block every monerod refuses. So the
+            // selectable set is checked against THE CHAIN THIS TEMPLATE EXTENDS,
+            // read from the index itself: an id already mined there, or a tx
+            // spending a key image already spent there, is not offered to the
+            // selector at all (which then fills from what remains -- the
+            // good-citizen rule still holds for every valid tx the pool has).
+            if (filter_mined_(md.prev_id, pool_set, dropped_mined)) break;
+            if (attempt >= 1) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                ++refusals_;
+                last_refusal_ = NativeRefusal::TipMoved;
+                if (why) *why = "native: the tip left the template's branch while it was built";
+                return std::nullopt;
+            }
+        }
         const std::size_t pool_n = pool_set.size();
 
         // GOOD-CITIZEN (operator hard rule): the live template is built from the
@@ -281,6 +316,8 @@ public:
         const std::uint64_t pool_seq = pool_.backlog_version();
 
         std::lock_guard<std::mutex> lk(mtx_);
+        last_dropped_mined_ = dropped_mined;
+        dropped_mined_     += dropped_mined;
         // Good-citizen sensors: last pool/chosen counts, and a violation counter
         // that trips if a non-empty pool ever produced an empty selection (must
         // be impossible under R-CIT-1; it is the invariant-D tripwire).
@@ -369,6 +406,13 @@ public:
     // at the front, and how many were dropped by the block-weight cap (named
     // inject_dropped_by_cap in the selector). Read by the node status line/KATs.
     std::size_t   last_inject_n()           const { std::lock_guard<std::mutex> lk(mtx_); return last_inject_n_; }
+
+    // Chain-hygiene sensors: selectable txs the template left out because the
+    // chain it extends already mined them (or spent one of their key images),
+    // cumulative and in the last served snapshot. Non-zero is the race the
+    // filter exists for, caught; it is never an error on its own.
+    std::uint64_t dropped_mined()           const { std::lock_guard<std::mutex> lk(mtx_); return dropped_mined_; }
+    std::size_t   last_dropped_mined()      const { std::lock_guard<std::mutex> lk(mtx_); return last_dropped_mined_; }
     std::size_t   last_inject_dropped()     const { std::lock_guard<std::mutex> lk(mtx_); return last_inject_dropped_; }
 
     // Wire the operator-inject pool. Called ONCE at node construction/start,
@@ -376,6 +420,15 @@ public:
     // TxInjectPool to the template builder). nullptr = injects disabled, and the
     // served template is then byte-identical to the plain good-citizen path.
     void set_operator_injects(const OperatorInjectPool* p) { injects_ = p; }
+
+    // TXPOOL-RESUME: the template readiness rule. With a warm gate wired, no
+    // template (so no job) is produced until the flag is set -- the node sets
+    // it once its tx pool finished the first complement back-fill round or a
+    // bounded timeout ran out -- so a (re)started node never hands out a
+    // coinbase-only job while the network mempool is not empty. nullptr (the
+    // default) = no gate. Wired once, before any template is served. The
+    // selection itself is untouched: a warm pool is selected exactly as before.
+    void set_warm_gate(const std::atomic<bool>* warm) { warm_ = warm; }
 
     NativeRefusal        last_refusal() const { std::lock_guard<std::mutex> lk(mtx_); return last_refusal_; }
     std::uint64_t        snapshots()    const { std::lock_guard<std::mutex> lk(mtx_); return snapshots_; }
@@ -446,6 +499,11 @@ private:
         if (!r.coins_known)
             return no(NativeRefusal::NoCoins, "already_generated_coins is not carried forward");
 
+        r.pool_warm = warm_ == nullptr || warm_->load(std::memory_order_acquire);
+        if (!r.pool_warm)
+            return no(NativeRefusal::PoolCold,
+                      "tx pool is not warm yet: the first complement back-fill round has not finished");
+
         refusal = NativeRefusal::None;
         r.why.clear();
         if (why) why->clear();
@@ -488,6 +546,39 @@ private:
             r = next;
         }
         return r;
+    }
+
+    // Drop from `set` every entry the chain ending at `prev` already mined, or
+    // whose key images it already spent. False when `prev` is no longer on the
+    // best chain (the caller re-reads the inputs).
+    bool filter_mined_(const Hash& prev, std::vector<node::TxBacklogEntry>& set,
+                       std::size_t& dropped) const {
+        dropped = 0;
+        std::vector<Hash> ids, kis;
+        std::map<Key, Key> ki_owner;
+        ids.reserve(set.size());
+        for (const auto& e : set) {
+            ids.push_back(e.id);
+            for (const Hash& ki : pool_.key_images_of(e.id)) {
+                kis.push_back(ki);
+                ki_owner.emplace(key_(ki), key_(e.id));
+            }
+        }
+        std::vector<Hash> mined, spent;
+        if (!view_.probe_mined(prev, ids, kis, mined, spent)) return false;
+        if (mined.empty() && spent.empty()) return true;
+        std::map<Key, bool> bad;
+        for (const Hash& id : mined) bad[key_(id)] = true;
+        for (const Hash& ki : spent) {
+            const auto o = ki_owner.find(key_(ki));
+            if (o != ki_owner.end()) bad[o->second] = true;
+        }
+        const std::size_t before = set.size();
+        set.erase(std::remove_if(set.begin(), set.end(),
+                                 [&](const node::TxBacklogEntry& e) { return bad.count(key_(e.id)) != 0; }),
+                  set.end());
+        dropped = before - set.size();
+        return true;
     }
 
     // What epoch() reports without taking a snapshot.
@@ -616,8 +707,11 @@ private:
     mutable std::size_t            last_pool_n_ = 0, last_chosen_n_ = 0;
     mutable std::size_t            last_inject_n_ = 0, last_inject_dropped_ = 0;
     mutable std::uint64_t          good_citizen_violations_ = 0;
+    mutable std::uint64_t          dropped_mined_ = 0;
+    mutable std::size_t            last_dropped_mined_ = 0;
     // The operator-inject ledger/order source, wired at start (nullptr = off).
     const OperatorInjectPool*      injects_ = nullptr;
+    const std::atomic<bool>*       warm_    = nullptr;   // TXPOOL-RESUME
     mutable NativeRefusal          last_refusal_ = NativeRefusal::None;
 };
 

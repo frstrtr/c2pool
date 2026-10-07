@@ -13,7 +13,7 @@
 ///       absent from dashd's template". Two independently-connected nodes never
 ///       hold identical mempools: relay is gossip, admission is per-node policy
 ///       over a per-node UTXO view, and each side's template is a snapshot taken
-///       at a different instant. MEASURED on the production hotel over 6056
+///       at a different instant. MEASURED on the production node over 6056
 ///       samples: ours_only == 0 in 91.2% of them, > 0 in 8.8%, and when
 ///       non-zero its MEAN is 65.3 with a max of 287. Over the LAST 200 samples
 ///       it was zero only 37% of the time. A gate whose passing condition is a
@@ -435,7 +435,7 @@ mempool_validity_sample(uint32_t height,
 ///
 ///     The per-HEIGHT rate is the honest form of this claim, and the per-
 ///     TRANSACTION form is deliberately NOT made. Evidence-bearing heights on
-///     the hotel carry a mean of ~30 selectable transactions, so the window
+///     the production node carry a mean of ~30 selectable transactions, so the window
 ///     does accumulate ~1.7e4 probes — but they are not 1.7e4 INDEPENDENT
 ///     trials: a transaction that sits in the mempool for several blocks is
 ///     re-probed at each of them. Only the HEIGHTS are separated by a fresh

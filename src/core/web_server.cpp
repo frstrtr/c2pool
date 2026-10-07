@@ -2,6 +2,7 @@
 #include <core/host_port.hpp>
 #include "web_server.hpp"
 #include "stratum_server.hpp"
+#include <cctype>     // rewrite_payout_scheme_label: identifier-character test
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
 #include <memory>
 #include "address_utils.hpp"
@@ -2659,7 +2660,7 @@ nlohmann::json MiningInterface::rest_recent_blocks()
         // repair paths normally fill that difficulty and this row becomes
         // "simple_avg"; the label survives only for a row whose header is still
         // unavailable (never synced), where it correctly reads "unavailable".
-        // #942 second slice, extended to EVERY unmeasured field (hotel,
+        // #942 second slice, extended to EVERY unmeasured field (production node,
         // 2026-08-05): the primary's rows for our own blocks rendered
         // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
         // were data. A zero that was never measured is emitted as null — the
@@ -2811,9 +2812,13 @@ nlohmann::json MiningInterface::rest_stratum_stats()
     std::set<std::string> unique_addrs;
     std::map<std::string, int> ip_connections;   // IP → connection count
     std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique workers
+    const auto liveness = observe_worker_liveness(workers, now_steady);
+    int connections_silent = 0;
 
     nlohmann::json workers_json = nlohmann::json::object();
     for (const auto& [sid, w] : workers) {
+        const WorkerLiveness& lv = liveness.at(sid);
+        if (lv.silent) ++connections_silent;
         total_hashrate += w.hashrate;
         total_accepted += w.accepted;
         total_rejected += w.rejected;
@@ -2853,6 +2858,14 @@ nlohmann::json MiningInterface::rest_stratum_stats()
             // Keep earliest first_seen
             if (first_seen_ts < workers_json[worker_key]["first_seen"].get<uint64_t>())
                 workers_json[worker_key]["first_seen"] = first_seen_ts;
+            // #959: a worker is silent only if every one of its connections is;
+            // report the freshest connection's silence.
+            auto& wj = workers_json[worker_key];
+            wj["silent"] = wj["silent"].get<bool>() && lv.silent;
+            if (lv.silent_seconds < wj["silent_seconds"].get<int64_t>()) {
+                wj["silent_seconds"] = lv.silent_seconds;
+                wj["silent_threshold_seconds"] = lv.threshold_seconds;
+            }
         } else {
             workers_json[worker_key] = {
                 {"hash_rate", w.hashrate},
@@ -2868,7 +2881,10 @@ nlohmann::json MiningInterface::rest_stratum_stats()
                 {"shares", w.accepted + w.stale},
                 {"connected_seconds", elapsed},
                 {"remote_endpoint", w.remote_endpoint},
-                {"rtt_ms", w.rtt_ms}
+                {"rtt_ms", w.rtt_ms},
+                {"silent", lv.silent},
+                {"silent_seconds", lv.silent_seconds},
+                {"silent_threshold_seconds", lv.threshold_seconds}
             };
         }
     }
@@ -2885,6 +2901,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
 
     result["pool"] = {
         {"connections", static_cast<int>(workers.size())},
+        {"connections_active", static_cast<int>(workers.size()) - connections_silent},
+        {"connections_silent", connections_silent},
         {"workers", static_cast<int>(unique_addrs.size())},
         {"unique_addresses", static_cast<int>(unique_addrs.size())},
         {"total_accepted", total_accepted},
@@ -3082,7 +3100,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["network_hashrate"] = net_hashrate;
     result["shares_in_chain"] = total_shares;
     result["unique_miners"] = unique_miners;
-    // WHAT unique_miners COUNTS, stated so the card can label it (hotel,
+    // WHAT unique_miners COUNTS, stated so the card can label it (production node,
     // 2026-08-05: the operator read 5 against ~33 connected rigs and called
     // it wrong — it was counting something else). It is the number of
     // DISTINCT PAYOUT ADDRESSES holding shares in the sharechain window,
@@ -3100,7 +3118,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["uptime_seconds"] = rest_uptime();
     result["status"] = "operational";
     // last_block: was a hardcoded 0 since the field's introduction — never
-    // set on any chain (both hotel nodes showed 0 with 100+ ledger rows).
+    // set on any chain (both production nodes showed 0 with 100+ ledger rows).
     // Sourced from the found-block ledger (persistent, so a restart does not
     // zero it): the newest row for THIS node's primary chain.
     {
@@ -3691,7 +3709,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
 
-    // ── MEASUREMENT FALLBACKS (hotel, 2026-08-05) ────────────────────────
+    // ── MEASUREMENT FALLBACKS (production node, 2026-08-05) ────────────────────────
     // Both record paths passed mi->get_network_difficulty(), which reads a
     // cache that is only refreshed when somebody polls /local_stats — so a
     // block found before the first dashboard hit was recorded with
@@ -3730,7 +3748,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         }
     }
 
-    // Runtime dedup — with ENRICHMENT. Measured (hotel primary): rows for
+    // Runtime dedup — with ENRICHMENT. Measured (primary node): rows for
     // OUR OWN blocks h=2516911/2516914 sat as miner="" share="" subsidy=0
     // junk forever, because they were persisted by an older binary before
     // attribution existed, restored at startup, and the plain early-return
@@ -4465,6 +4483,41 @@ nlohmann::json MiningInterface::rest_local_stats()
     else
         result["local_hashps"] = nullptr;
 
+    // #942 node_role -- what kind of node this is, so the dashboard can say
+    // "not applicable here" instead of rendering zero miners / 0 H/s as a
+    // measurement. "mining" = a miner-facing Stratum acceptor runs on this
+    // node; "relay" = none does (e.g. c2pool-dash without --stratum), so it
+    // only relays the sharechain and cannot have local miners. The signal is
+    // the same seam local_hashps reads: every acceptor (WebServer's own on
+    // the LTC path; c2pool-dash, btc and bip110 their own) wires
+    // set_stratum_hashrate_fn only once it is actually listening. Display
+    // only; reads a std::function set at startup, no tracker or peer state,
+    // so no new lock surface.
+    result["node_role"] = m_stratum_hashrate_fn ? "mining" : "relay";
+
+    // #959 active/total: a session count alone hides dead rigs that stay
+    // authorized, so the headline splits live contributors from SILENT
+    // sessions (authorized, no accepted share past the threshold). Reads the
+    // worker registry copy under its own short mutex, no tracker/peer lock.
+    {
+        const auto workers = effective_stratum_workers();
+        const auto liveness = observe_worker_liveness(
+            workers, std::chrono::steady_clock::now());
+        int silent = 0;
+        for (const auto& [sid, lv] : liveness)
+            if (lv.silent) ++silent;
+        const int total = static_cast<int>(workers.size());
+        result["stratum_sessions"] = {
+            {"total", total},
+            {"active", total - silent},
+            {"silent", silent},
+            {"silent_floor_seconds", kSilentFloorSeconds}
+        };
+        // #959 slice B: name the silent workers and how long each has been
+        // silent, so the operator sees which rig died, not just a count.
+        result["workers_silent"] = silent_workers_list(workers, liveness);
+    }
+
     // shares — {total, orphan, dead}
     // Sharechain stats now use O(log n) StatsSkipList — no caching needed.
     nlohmann::json cached_sc;
@@ -4536,7 +4589,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     double burn_amount = 0.0;
     if (block_value == 0.0 && coin_work.valid) {
         block_value    = static_cast<double>(coin_work.coinbase_value_sat) / 1e8;
-        // MEASURED WRONG SPLIT (hotel, 2026-08-05, DASH mainnet). The
+        // MEASURED WRONG SPLIT (production node, 2026-08-05, DASH mainnet). The
         // dashboard said miner_gross=0.9404 (53% of the block) while the
         // ACCEPTED coinbase of our own h=2516911 paid miners 0.4428 (25%):
         // payment_amount_sat carries only the projected MN payee — it rides
@@ -4554,7 +4607,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["block_value"] = block_value;
     // WHICH template the number describes, and how old it is. block_value
     // renders identically whether the template is live or was last sourced
-    // an hour ago (hotel primary: 0 local miners => nothing refreshes it) —
+    // an hour ago (primary node: 0 local miners => nothing refreshes it) —
     // the height + age let the dashboard say so instead of presenting a
     // stale number as current.
     if (coin_work.valid) {
@@ -4851,7 +4904,7 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     result["donation_proportion"] = m_pool_fee_percent / 100.0;
     result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
-    // UNITS, stated (hotel, 2026-08-05: the operator could not tell from the
+    // UNITS, stated (production node, 2026-08-05: the operator could not tell from the
     // payload whether fee=1.0 meant 1% or a proportion of 1.0 = 100%, because
     // the sibling donation_proportion IS a proportion where 1.0 would mean
     // 100%). `fee` and /fee stay p2pool-compat percent; these two name their
@@ -5927,7 +5980,7 @@ nlohmann::json MiningInterface::rest_luck_stats()
         // luck==0 is "never computed" (relay-learned row, or recorded with
         // no network difficulty), not "0% lucky". The chart previously drew
         // those as 0-value points, which is exactly the wrong-luck-trend the
-        // hotel dashboards showed on 2026-08-05: emit null so the trend
+        // production dashboards showed on 2026-08-05: emit null so the trend
         // SKIPS them instead of plotting a fabricated catastrophe.
         blocks.push_back({{"ts", b.ts}, {"hash", b.hash},
                           {"luck", b.luck > 0.0 ? nlohmann::json(b.luck)
@@ -6321,10 +6374,13 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     // ETA cadence for the propagation countdown (display only): DASH mints one
     // share every 20s, the LTC-family every 10s.
     const int share_period_sec = (m_blockchain == Blockchain::DASH) ? 20 : 10;
+    // Wire type 36 is MergedMiningShare on the LTC family and DashV36Share on
+    // DASH (the private/isolated DASH v36 sharechain's share type).
     const std::map<int, std::string> share_type_names = {
         {16, "DashShare"},
         {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
-        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"}, {36, "MergedMiningShare"}
+        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"},
+        {36, m_blockchain == Blockchain::DASH ? "DashV36Share" : "MergedMiningShare"}
     };
 
     nlohmann::json result = nlohmann::json::object();
@@ -7877,6 +7933,110 @@ std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::effective_st
     return {};
 }
 
+MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
+    const WorkerInfo& w,
+    std::optional<std::chrono::steady_clock::time_point> last_share_at,
+    std::chrono::steady_clock::time_point now)
+{
+    WorkerLiveness out;
+    out.has_shared = last_share_at.has_value();
+
+    // Expected seconds between accepted shares at this session's vardiff.
+    double expected_s = 0.0;
+    if (w.hashrate > 0.0 && w.difficulty > 0.0)
+        expected_s = w.difficulty * 4294967296.0 / w.hashrate;
+    double scaled = expected_s * kSilentExpectedIntervals;
+    int64_t thr = kSilentFloorSeconds;
+    if (scaled > static_cast<double>(thr))
+        thr = scaled >= static_cast<double>(kSilentCapSeconds)
+            ? kSilentCapSeconds : static_cast<int64_t>(std::ceil(scaled));
+    out.threshold_seconds = thr;
+
+    // No share and no known connect time: nothing to measure from, so never
+    // call it silent.
+    if (!last_share_at && w.connected_at == std::chrono::steady_clock::time_point{})
+        return out;
+
+    const auto ref = last_share_at ? *last_share_at : w.connected_at;
+    out.silent_seconds = std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::seconds>(now - ref).count());
+    out.silent = out.silent_seconds >= thr;
+    return out;
+}
+
+std::map<std::string, MiningInterface::WorkerLiveness>
+MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>& workers,
+                                         std::chrono::steady_clock::time_point now) const
+{
+    std::map<std::string, WorkerLiveness> out;
+    std::lock_guard<std::mutex> lock(m_share_seen_mutex);
+    for (auto it = m_share_seen.begin(); it != m_share_seen.end();) {
+        if (workers.count(it->first)) ++it;
+        else it = m_share_seen.erase(it);   // session gone
+    }
+    for (const auto& [sid, w] : workers) {
+        auto [it, fresh] = m_share_seen.try_emplace(sid);
+        ShareSeen& seen = it->second;
+        if (fresh || w.accepted != seen.accepted) {
+            if (w.accepted > 0)
+                seen.last_share_at = now;
+            else
+                seen.last_share_at.reset();
+            seen.accepted = w.accepted;
+        }
+        out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+    }
+    return out;
+}
+
+nlohmann::json MiningInterface::silent_workers_list(
+    const std::map<std::string, WorkerInfo>& workers,
+    const std::map<std::string, WorkerLiveness>& liveness)
+{
+    struct Agg {
+        bool silent{true};
+        bool has_shared{false};
+        int64_t silent_seconds{std::numeric_limits<int64_t>::max()};
+        int64_t threshold_seconds{0};
+        int connections{0};
+    };
+    std::map<std::string, Agg> by_worker;
+    for (const auto& [sid, w] : workers) {
+        auto lv_it = liveness.find(sid);
+        if (lv_it == liveness.end()) continue;
+        const WorkerLiveness& lv = lv_it->second;
+        const std::string key = w.worker_name.empty()
+            ? w.username : w.username + "." + w.worker_name;
+        Agg& a = by_worker[key];
+        a.silent = a.silent && lv.silent;
+        a.has_shared = a.has_shared || lv.has_shared;
+        ++a.connections;
+        if (lv.silent_seconds < a.silent_seconds) {
+            a.silent_seconds = lv.silent_seconds;
+            a.threshold_seconds = lv.threshold_seconds;
+        }
+    }
+
+    std::vector<std::pair<std::string, Agg>> silent;
+    for (const auto& [key, a] : by_worker)
+        if (a.silent) silent.emplace_back(key, a);
+    std::stable_sort(silent.begin(), silent.end(), [](const auto& x, const auto& y) {
+        return x.second.silent_seconds > y.second.silent_seconds;
+    });
+
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& [key, a] : silent) {
+        out.push_back({
+            {"worker", key},
+            {"silent_seconds", a.silent_seconds},
+            {"threshold_seconds", a.threshold_seconds},
+            {"has_shared", a.has_shared},
+            {"connections", a.connections}
+        });
+    }
+    return out;
+}
+
 // ──────────── /web/ sub-endpoints (share chain inspection) ───────────────
 
 nlohmann::json MiningInterface::rest_web_heads()
@@ -8343,7 +8503,7 @@ void MiningInterface::update_stat_log()
     // workers the local registry is empty, but the pool still has miners — the
     // distinct sharechain payout addresses. Use the SAME count /global_stats
     // reports as unique_miners (shares_by_miner.size()) so the graph matches the
-    // live card. Only when the local registry is genuinely empty; a hotel node
+    // live card. Only when the local registry is genuinely empty; a production node
     // with local rigs keeps its byte-identical local count. connected_miners /
     // worker_count / local_hash_rate stay local-scoped (0 is the truth there).
     if (entry.miner_count == 0 && m_sharechain_stats_fn) {
@@ -9097,7 +9257,7 @@ void MiningInterface::load_stat_log()
 }
 
 // ── ALL-TIME best share: survives restarts ──────────────────────────────
-// Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+// Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
 // best_share reported all_time == session == round because the all-time leg
 // lived only in memory — every restart re-founded "all time", and the card
 // silently redefined the word. Only the all-time leg is persisted: session
@@ -9954,6 +10114,32 @@ WebServer::~WebServer()
     stop();
 }
 
+std::size_t rewrite_payout_scheme_label(std::string& text, const std::string& label,
+                                        const std::string& ident)
+{
+    static const std::string kWord = "PPLNS";
+    auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    };
+    std::string out;
+    out.reserve(text.size());
+    std::size_t n = 0, pos = 0;
+    for (;;) {
+        const std::size_t hit = text.find(kWord, pos);
+        if (hit == std::string::npos) break;
+        const bool glued = (hit > 0 && is_ident(text[hit - 1])) ||
+                           (hit + kWord.size() < text.size() && is_ident(text[hit + kWord.size()]));
+        out.append(text, pos, hit - pos);
+        out += glued ? ident : label;
+        pos = hit + kWord.size();
+        ++n;
+    }
+    if (n == 0) return 0;
+    out.append(text, pos, std::string::npos);
+    text.swap(out);
+    return n;
+}
+
 bool WebServer::start()
 {
     if (running_) return true;  // Already started (early start for loading page)
@@ -10149,7 +10335,7 @@ void WebServer::execute_debounced_work_refresh()
 
 void WebServer::trigger_work_refresh_debounced()
 {
-    // ── Notify debounce (hotel interim fix #3) ──
+    // ── Notify debounce (interim hardening fix #3) ──
     // Share-arrival storms used to fan out into one full refresh_work() +
     // notify_all() per share (the old body here was a no-op stub that called
     // refresh immediately). Semantics now:

@@ -39,8 +39,8 @@
 // This is a PURE function over the pool's already-ordered selectable backlog:
 // it re-orders nothing and reads no chain state beyond the miner-data snapshot
 // the caller already holds, so it is trivially testable against synthetic
-// backlogs (see xmr_citizen_select_kat.cpp) and carries no license entanglement
-// with the GPL assembler downstream.
+// backlogs (see xmr_citizen_select_kat.cpp) and is independent of the template
+// builder downstream.
 // ---------------------------------------------------------------------------
 #pragma once
 

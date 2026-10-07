@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Mining-hotel interim fix KATs — stratum admission cap + job eviction +
+// Interim hardening fix KATs — stratum admission cap + job eviction +
 // shared-payload memory bound (core::StratumServer / core::StratumSession).
 //
-// Covers the three behavior changes of the "minimal stratum hotel-interim
+// Covers the three behavior changes of the "minimal stratum interim-hardening
 // fix + strict per-node miner cap" slice:
 //
 //   1. CAP ENFORCEMENT — with max_stratum_connections=2 the 3rd (and 4th)
@@ -359,7 +359,7 @@ private:
 // KAT 1 — STRICT per-node miner cap: 3rd connection refused, counter bumps,
 // accept loop survives and admits again once a slot frees.
 // ════════════════════════════════════════════════════════════════════════════
-TEST(StratumHotelInterim, CapEnforcementThirdConnectionRefused)
+TEST(StratumInterimHardening, CapEnforcementThirdConnectionRefused)
 {
     ServerHarness h;
     h.ws->cfg.max_stratum_connections = 2;
@@ -408,7 +408,7 @@ TEST(StratumHotelInterim, CapEnforcementThirdConnectionRefused)
 //   * recent job (inside FIFO window of 256) → ACCEPTED
 //   * genuinely-oldest pre-storm job → STALE (cap enforced, oldest-first)
 // ════════════════════════════════════════════════════════════════════════════
-TEST(StratumHotelInterim, StaleStormFifoEviction)
+TEST(StratumInterimHardening, StaleStormFifoEviction)
 {
     ServerHarness h;
     ASSERT_TRUE(h.start());
@@ -416,7 +416,7 @@ TEST(StratumHotelInterim, StaleStormFifoEviction)
     Client c;
     ASSERT_TRUE(c.connect(h.port));
     ASSERT_TRUE(c.subscribe());
-    ASSERT_TRUE(c.authorize("hoteltestworker1"));
+    ASSERT_TRUE(c.authorize("interimtestworker1"));
     ASSERT_TRUE(c.collect_notifies(1, 5000ms));
     const size_t base = c.jobs.size();  // jobs issued by subscribe/authorize
 
@@ -432,7 +432,7 @@ TEST(StratumHotelInterim, StaleStormFifoEviction)
     // (a) CURRENT job — the one the miner is hashing right now — must never
     // have been evicted. This submit FAILS pre-fix (arbitrary eviction).
     {
-        auto resp = c.submit("hoteltestworker1", c.jobs.back(), 100);
+        auto resp = c.submit("interimtestworker1", c.jobs.back(), 100);
         ASSERT_TRUE(resp.has_value());
         EXPECT_TRUE((*resp)["result"].is_boolean() && (*resp)["result"].get<bool>())
             << "current job rejected: " << resp->dump();
@@ -440,7 +440,7 @@ TEST(StratumHotelInterim, StaleStormFifoEviction)
     // (b) A recent job inside the newest-256 window survives too.
     {
         const std::string& recent = c.jobs[c.jobs.size() - 100];
-        auto resp = c.submit("hoteltestworker1", recent, 101);
+        auto resp = c.submit("interimtestworker1", recent, 101);
         ASSERT_TRUE(resp.has_value());
         EXPECT_TRUE((*resp)["result"].is_boolean() && (*resp)["result"].get<bool>())
             << "recent (in-window) job rejected: " << resp->dump();
@@ -448,7 +448,7 @@ TEST(StratumHotelInterim, StaleStormFifoEviction)
     // (c) The genuinely-oldest pre-storm job is beyond the 256-job FIFO window
     // → correctly stale (error 21). Guards against the cap silently vanishing.
     {
-        auto resp = c.submit("hoteltestworker1", c.jobs.front(), 102);
+        auto resp = c.submit("interimtestworker1", c.jobs.front(), 102);
         ASSERT_TRUE(resp.has_value());
         ASSERT_TRUE(resp->contains("error") && (*resp)["error"].is_array());
         EXPECT_EQ((*resp)["error"][0].get<int>(), 21) << resp->dump();
@@ -460,7 +460,7 @@ TEST(StratumHotelInterim, StaleStormFifoEviction)
 // bounded; the heavyweight template payload is POINTER-IDENTICAL across all
 // jobs of one work generation (1 shared block per generation per session).
 // ════════════════════════════════════════════════════════════════════════════
-TEST(StratumHotelInterim, FlatRssSharedPayloadIdentity)
+TEST(StratumInterimHardening, FlatRssSharedPayloadIdentity)
 {
     ServerHarness h;
     ASSERT_TRUE(h.start());
@@ -510,7 +510,7 @@ TEST(StratumHotelInterim, FlatRssSharedPayloadIdentity)
 //
 // Uses a 1 s keepalive interval so the KAT runs in a few seconds of wall-clock
 // while exercising the real per-session steady-timer path end-to-end.
-TEST(StratumHotelInterim, IdleKeepaliveNotifyFeedsSubscribeOnlySession)
+TEST(StratumInterimHardening, IdleKeepaliveNotifyFeedsSubscribeOnlySession)
 {
     ServerHarness h;
     h.ws->cfg.keepalive_notify_sec = 1;   // 1 s cadence for a fast KAT
@@ -545,7 +545,7 @@ TEST(StratumHotelInterim, IdleKeepaliveNotifyFeedsSubscribeOnlySession)
 // the LTC/BTC/DGB setting), an idle subscribe-only session receives NO periodic
 // notify — the periodic push stays purely work-generation-gated. This pins that
 // the extra notifies in KAT 4 are the keepalive and that the feature is opt-in.
-TEST(StratumHotelInterim, KeepaliveOffLeavesIdleSessionUnfed)
+TEST(StratumInterimHardening, KeepaliveOffLeavesIdleSessionUnfed)
 {
     ServerHarness h;
     h.ws->cfg.keepalive_notify_sec = 0;   // default / other-coins behaviour

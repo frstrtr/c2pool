@@ -3,9 +3,10 @@
 //
 // xmr_receipt_bind_v2_kat -- GAP-2 stage 1, KAT 2: the PoW-verify half.
 //
-//   B1  mint -> structural accept (bind=none) on today's coinbase layout; the
-//       same receipt is REFUSED at the Bind stage under bind=rbind (the template
-//       does not write rbind yet: SEAM-1 is the operator's hand)
+//   B1  mint -> structural accept (bind=none) on a coinbase WITHOUT the rbind
+//       region; the same receipt is REFUSED at the Bind stage under bind=rbind
+//       (the template writes rbind only for a bound job -- SEAM-1, pinned on
+//       real assembled templates by v37_xmr_fee_rbind_kat)
 //   B2  a SEAM-1 layout coinbase ([extra_nonce | rbind | pad | tail]) passes
 //       bind=rbind; then every tamper is caught STRUCTURALLY (before RandomX):
 //         payee swapped (identity re-derived)        -> Bind
