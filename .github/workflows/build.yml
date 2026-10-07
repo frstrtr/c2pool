@@ -245,6 +245,7 @@ jobs:
                     v37_xmr_canon_p1_kat \
                     v37_xmr_relay_addr_ban_kat \
                     v37_xmr_stratum_dos_kat \
+                    v37_xmr_stratum_vardiff_kat \
                     v37_xmr_relay_eclipse_kat \
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \
@@ -766,6 +767,7 @@ jobs:
                     v37_xmr_canon_p1_kat \
                     v37_xmr_relay_addr_ban_kat \
                     v37_xmr_stratum_dos_kat \
+                    v37_xmr_stratum_vardiff_kat \
                     v37_xmr_relay_eclipse_kat \
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \

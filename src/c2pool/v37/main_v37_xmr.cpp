@@ -271,7 +271,8 @@ static std::uint64_t g_relay_deep_probe_step = 64;      // --relay-deep-probe-st
 static std::uint64_t g_relay_shadow_persist_bytes = 256ull << 20;   // --relay-shadow-persist-bytes N
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 // Stratum listener policy (unset = the StratumListenerOptions default).
-static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (submit refill per connection, submits/s)
+static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (fixed submit refill per connection, submits/s; pins the budget, disabling vardiff)
+static std::optional<std::uint32_t>      g_stratum_vardiff_shares;    // --stratum-vardiff-shares N (vardiff target: shares per lane window)
 static std::optional<std::uint32_t>      g_stratum_submit_burst;      // --stratum-submit-burst N (also the per-connection queue bound)
 static std::optional<std::uint32_t>      g_stratum_ban_seconds;       // --stratum-ban-seconds S (unset = ceil(burst / submit refill))
 static std::optional<std::array<int, 4>> g_stratum_share_score;       // --stratum-share-score BAD,GOOD,BAN,CAP
@@ -643,7 +644,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
     lo.min_difficulty = std::max(lo.min_difficulty, hooks.stratum_min_diff);   // NET-DOS
-    if (g_stratum_share_rate) lo.submit_rate = *g_stratum_share_rate;
+    if (g_stratum_share_rate) { lo.submit_rate = *g_stratum_share_rate; lo.submit_vardiff = false; }   // pin the budget, disable vardiff
+    if (g_stratum_vardiff_shares) lo.vardiff_shares_per_window = *g_stratum_vardiff_shares;
     if (g_stratum_submit_burst) {
         lo.submit_burst = static_cast<double>(*g_stratum_submit_burst);
         lo.max_pending_submits = *g_stratum_submit_burst;
@@ -655,9 +657,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         lo.ban_score = (*g_stratum_share_score)[2];        lo.max_score = (*g_stratum_share_score)[3];
     }
     if (g_stratum_login_timeout_ms) lo.login_timeout_ms = static_cast<int>(*g_stratum_login_timeout_ms);
-    std::printf("stratum: minimum requested difficulty %llu; submit budget %.0f burst + %.2f/s per connection "
+    char rate_buf[96];
+    if (lo.submit_vardiff)
+        std::snprintf(rate_buf, sizeof rate_buf, "vardiff 2 x S_t (%u shares/window, floor %.2f/s)",
+                      lo.vardiff_shares_per_window, lo.submit_rate);
+    else
+        std::snprintf(rate_buf, sizeof rate_buf, "%.2f/s", lo.submit_rate);
+    std::printf("stratum: minimum requested difficulty %llu; submit budget %.0f burst + %s per connection "
                 "(queue %zu); share score bad %d good %+d ban at %d cap %d; login deadline %d ms; ban %d s by address\n",
-                static_cast<unsigned long long>(lo.min_difficulty), lo.submit_burst, lo.submit_rate, lo.max_pending_submits,
+                static_cast<unsigned long long>(lo.min_difficulty), lo.submit_burst, rate_buf, lo.max_pending_submits,
                 lo.bad_share_points, lo.good_share_points, lo.ban_score, lo.max_score, lo.login_timeout_ms, lo.ban_seconds);
     o2::StratumListener listener(template_source, rx, sink, lo);
     if (hooks.extra_nonce_base) listener.seed_extra_nonce(*hooks.extra_nonce_base);   // GAP-2
@@ -6242,6 +6250,11 @@ int main(int argc, char** argv) {
             if (!(r > 0)) throw cs::UsageError(a + " wants a number > 0");
             g_stratum_share_rate = r;
         }
+        else if (a == "--stratum-vardiff-shares") {
+            const auto nsh = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
+            if (nsh == 0) throw cs::UsageError(a + " wants an integer >= 1");
+            g_stratum_vardiff_shares = nsh;
+        }
         else if (a == "--stratum-submit-burst") {
             const auto b = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
             if (b == 0) throw cs::UsageError(a + " wants an integer >= 1");
@@ -6569,8 +6582,10 @@ int main(int argc, char** argv) {
                 " serve side (X9 O-2; the stratum port is served only with a payout address):\n"
                 "  --payout-address <addr>      get_block_template wallet address (network-prefixed)\n"
                 "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
-                "  --stratum-share-rate R       submit budget refill per connection, submits/s\n"
-                "                               (default 2 x 2^k / T = 12.8; k 6, T 10 s)\n"
+                "  --stratum-share-rate R       fixed submit budget refill per connection, submits/s\n"
+                "                               (pins the budget; disables vardiff)\n"
+                "  --stratum-vardiff-shares N   vardiff target: shares per lane window per connection\n"
+                "                               (default 3; budget = 2 x S_t, floor 12.8/s)\n"
                 "  --stratum-submit-burst N     submit budget burst and queue bound per connection (default 24)\n"
                 "  --stratum-ban-seconds S      address ban (default ceil(burst / R) = 2)\n"
                 "  --stratum-share-score B,G,K,M share score: bad share B, good share G, ban at K, cap M\n"
