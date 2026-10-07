@@ -10,6 +10,8 @@ state machine. Runnable artifacts for the V37 prototyping line (off `master`).
 | `Settlement.tla` | finality-gated owed/overlay state machine (revision 2: signed owed) -- `BlockFound→OverlayAdded` with a signed DROPS-composed credit row, `BlockFinalized→OwedSettled+OverlayCleared`, `BlockOrphaned→OverlayReverted`, `DeepOrphan→priced residual` | `Settlement.cfg` (full), `Settlement_small.cfg` (fast), `Settlement_noC4.cfg` / `Settlement_clawback.cfg` / `Settlement_nomass.cfg` (negative controls) |
 | `Lanes.tla` | per-lane Push/Tick decay vs ground-truth windowed recompute; invariants I1 (dedup), I2 (mono), I3 (no-stale / acc-bounded / determinism), I4 (bin-clock) | `Lanes.cfg` (canonical), `Lanes_wide.cfg` (wider), `Lanes_free.cfg` (negative control) |
 | `SettlementCanon.tla` | the XMR lane ledger under the every-node coinbase recompute (`docs/xmr-lane/coinbase-recompute.md`): a canonical block books its credit and payouts, a mismatch is booked debit-only (payouts debited, credit dropped), an undecidable block is held; the pay-in-block allocation in abstract form with the drain rule of the operator rulings of 2026-10-02 (pay-now first: the window credited and paid at P = R - debt_paid; old balances paid only out of Delta = min(F, R * min(dh, HCap) div DrainQ); contested slots follow cash, K_o from the first owed pass; DEBT FIRST removed; redistribution as a credit delta; no advance, no claim without cash); `DrainQ = 0` is master's allocation | `SettlementCanon.cfg` (the rule, one slot), `SettlementCanon_ko.cfg` (contested slots, K_o), `SettlementCanon_noslot.cfg` (no payee slot), `SettlementCanon_master.cfg` (master, DrainQ = 0), `SettlementCanon_len3.cfg` (three blocks, long), `check-settlement-canon.sh` (negative controls, witnesses) |
+| `PathBRatchet.tla` | the Path B rules ratchet: a committed ratchet state S (epoch_cur, rules_cur, work tallies, a window-level journal) folded by `rs_step`; nodes on different releases derive every quantity (base, open, locked, E_impl, H_hold, the attempt states, the ballot) from (S, position, their compiled table), build until H_hold and then hold; 13 invariants — `SameActivation`, `PrefixEImpl`, `FollowerNeverDiverges`, `HoldOnlyOnConfirmedLockIn`, `NoSpuriousHold`, `ActiveEqualsHoldTrigger`, `JoinerAgreesWithFollower`, `RsRootIsFunctionOfChain`, `GraceFromLockIn`, `OneOpenDeployment`, `OneOpenAcrossReleases`, `ReProposalOpen`, `BoundedState` | `G_A_n22` / `G_S_n22` / `G_B_n24` / `G_BS_n24` (GREEN, all 13); the `C*` controls and `P_*` probes (each violates one named invariant); the `W_*` witnesses (reachability); `check-ratchet.sh` runs the per-PR set, `TLC_LONG=1` adds `G_T_adv2_n18` and `G_M_n38` |
+| `PathBSealRNP.tla` | the Path B settlement / seal state machine: carriers chain through tip pointers, each carrying a canonically-ordered list of receipt ids; a height record = max carrier height over a chain prefix; a carried bin opens at the carrier's parent record; bins fold after F confirmations and seal after Dfin; a per-node verdict (defer / accept / refuse) and the `Agreement` invariant, plus the eight seal invariants, `ChainRuledValid` and `RecordIsCarrierMax` | `V1_rnp_own_n2r4` / `V1_rnp_carriage_n2r4` (GREEN), `V1_rnp_neg_openlocal` / `V1_rnp_neg_omitlocal` (`Agreement`), `V1_rnp_nodead` (`LegallyDead`), `V1_rnp_sharechain` (`OrphanRecovered`), `V1_rnp_probe_order` / `V1_rnp_probe_closed` (single-check witnesses); `check-seal-rnp.sh` |
 
 ## Verified results
 
@@ -90,6 +92,20 @@ java -cp tla2tools.jar tlc2.TLC -config SettlementCanon_len3.cfg   SettlementCan
 proto/tla/check-settlement-canon.sh path/to/tla2tools.jar [out-dir]   # all SettlementCanon runs
 TLC_LONG=1 proto/tla/check-settlement-canon.sh path/to/tla2tools.jar  # plus SettlementCanon_len3.cfg
 ```
+
+Ratchet and seal (one verdict line per run; exit 0 only if every run matches
+its expectation). `check-ratchet.sh` runs the per-PR configs (model values
+L 4 / GRACE 6 / TIMEOUT 9 / EPOCH_MAX 3; a few minutes); `TLC_LONG=1` adds the
+longer `G_T_adv2_n18` and `G_M_n38` runs (minutes to ~1 h):
+
+```
+proto/tla/check-ratchet.sh  path/to/tla2tools.jar [out-dir]
+TLC_LONG=1 proto/tla/check-ratchet.sh path/to/tla2tools.jar
+proto/tla/check-seal-rnp.sh path/to/tla2tools.jar [out-dir]
+```
+
+The `.github/workflows/tla-model-check.yml` lane runs both scripts on every PR
+that touches `proto/tla/**` (a pinned, sha256-verified `tla2tools.jar`).
 
 Owed-sign checks (revision 2: base-red, spec GREEN, three negative controls, two
 reachability witnesses) in one go, one verdict line per run:

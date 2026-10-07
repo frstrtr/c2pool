@@ -94,7 +94,7 @@ struct LaneParams {
     std::uint64_t open_bins = 0;            // K04 F
     std::uint64_t fresh_max = 0;            // K07 Fresh
     std::uint64_t r_max = 0;                // K08 R_MAX
-    std::uint64_t heal_period_h = 0;        // K27 P_heal (hours)
+    std::uint64_t heal_period_h = 0;        // P-02 P_heal (hours)
     std::uint64_t d_min = 0;                // K02 d_min
     std::uint64_t retarget_span = 0;        // K03 N_rt (carriers)
     std::uint64_t retarget_growth_num = 0;  // K03 g* = num / den (pathb_retarget.hpp)

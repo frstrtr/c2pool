@@ -495,6 +495,20 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_dos_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_dos_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_dos_kat COMMAND v37_xmr_stratum_dos_kat)
+    # v37_xmr_stratum_vardiff_kat (NET-DOS, stratum vardiff): the per-connection
+    # submit-rate budget tracking the lane window from the tip (2 x S_t,
+    # S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / s, clamped at s = 100 %), the
+    # honest-safe floor when s is unknown, the payout-floor connection never
+    # throttled, a connection far above the budget closed (test clock). Stub
+    # template source (configurable lane / Monero targets) + verifier: no
+    # RandomX, no monerod. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_stratum_vardiff_kat
+        v37_xmr_stratum_vardiff_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_vardiff_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_vardiff_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_vardiff_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_vardiff_kat COMMAND v37_xmr_stratum_vardiff_kat)
     # v37_xmr_test_suspend_knob_kat (FAULT-KNOB, TEST-ONLY): the
     # --test-suspend-lane-seconds / SIGUSR2 knob that forces a lane suspension
     # on a live node -- off by default, refused on mainnet, arm/fire/release

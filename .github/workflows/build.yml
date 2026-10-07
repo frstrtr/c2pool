@@ -245,6 +245,7 @@ jobs:
                     v37_xmr_canon_p1_kat \
                     v37_xmr_relay_addr_ban_kat \
                     v37_xmr_stratum_dos_kat \
+                    v37_xmr_stratum_vardiff_kat \
                     v37_xmr_relay_eclipse_kat \
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \
@@ -769,6 +770,7 @@ jobs:
                     v37_xmr_canon_p1_kat \
                     v37_xmr_relay_addr_ban_kat \
                     v37_xmr_stratum_dos_kat \
+                    v37_xmr_stratum_vardiff_kat \
                     v37_xmr_relay_eclipse_kat \
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \
@@ -1015,7 +1017,7 @@ jobs:
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
                     bch_muldiv_kat_test \
-                    bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test test_bch_underfill_guard \
+                    bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test bch_version_switch_floor_kat_test test_bch_underfill_guard \
                     bch_g2_block_assembly_roundtrip_test \
                     bch_dashboard_pplns_current_test \
                     bch_coin_peer_manager_kat_test \
@@ -1218,7 +1220,7 @@ jobs:
                     bch_embedded_block_broadcast_test bch_coin_node_seam_test \
                     bch_asert_kat_test \
                     bch_muldiv_kat_test \
-                    bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test test_bch_underfill_guard \
+                    bch_g1_oracle_byte_parity_test bch_g1_share_serialization_parity_test bch_g0_canonical_pin_test bch_g2_ratchet_gate_kat_test bch_version_switch_floor_kat_test test_bch_underfill_guard \
                     bch_g2_block_assembly_roundtrip_test \
                     bch_dashboard_pplns_current_test \
                     bch_coin_peer_manager_kat_test \
