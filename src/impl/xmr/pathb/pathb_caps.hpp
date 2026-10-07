@@ -204,6 +204,45 @@ inline constexpr CarrierLimits carrier_limits(const RelayBuffers& b, std::uint64
     return CarrierLimits{b.receipt, r_max};
 }
 
+// ---------------------------------------------------------------------------
+// One budget (X-6): the relay verify budget and the admission budget are the
+// SAME receipt I/O buffer P-10; a carrier's lane budget is R_MAX x P-10.
+//   PER_RECEIPT_BUDGET (admission) == kFbReceiptBudget (relay) == P-10
+//   PER_LANE_BUDGET == R_MAX x P-10
+// The S2 engine sizes them apart (relay kFbReceiptBudget 1024, admission
+// PER_RECEIPT_BUDGET 768); v2.4 derives both from one formula.
+// ---------------------------------------------------------------------------
+// Admission per-receipt budget = the receipt I/O buffer P-10.
+inline constexpr std::optional<std::uint64_t> per_receipt_budget(std::uint8_t hf, std::uint64_t z_lt_view,
+                                                                std::uint64_t r_max) noexcept {
+    const std::optional<RelayBuffers> b = relay_buffers_default(hf, z_lt_view, r_max);
+    if (!b) return std::nullopt;
+    return b->receipt;
+}
+
+// Relay per-receipt verify budget kFbReceiptBudget = the same one formula.
+inline constexpr std::optional<std::uint64_t> fb_receipt_budget(std::uint8_t hf, std::uint64_t z_lt_view,
+                                                               std::uint64_t r_max) noexcept {
+    return per_receipt_budget(hf, z_lt_view, r_max);
+}
+
+// PER_LANE_BUDGET = R_MAX x P-10.
+inline constexpr std::optional<std::uint64_t> per_lane_budget(std::uint8_t hf, std::uint64_t z_lt_view,
+                                                             std::uint64_t r_max) noexcept {
+    const std::optional<std::uint64_t> p = per_receipt_budget(hf, z_lt_view, r_max);
+    if (!p) return std::nullopt;
+    return r_max * *p;
+}
+
+// One budget: the relay verify budget and the admission budget are one formula.
+static_assert(per_receipt_budget(16, 0, kRuledLaneParams.r_max).value()
+                      == fb_receipt_budget(16, 0, kRuledLaneParams.r_max).value(),
+              "relay and admission per-receipt budgets are one formula (P-10)");
+static_assert(per_receipt_budget(16, 0, kRuledLaneParams.r_max).value() == 945,
+              "P-10 at hf 16 = RECEIPT_MAX(D_max + 1) = 945");
+static_assert(per_lane_budget(16, 0, kRuledLaneParams.r_max).value() == kRuledLaneParams.r_max * 945,
+              "PER_LANE_BUDGET = R_MAX x P-10");
+
 // Largest non-coinbase transaction count a block of median Z can carry.
 inline constexpr std::uint64_t max_tx_count(std::uint64_t z) noexcept {
     return (kBlockWeightLimitPerMedian * z) / kMinTxWeight;

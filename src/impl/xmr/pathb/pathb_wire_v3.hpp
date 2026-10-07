@@ -547,10 +547,20 @@ struct CarrierLimits {
     std::uint64_t r_max = 0;           // K08
 };
 
+// kFbMaxReceiptsPerFrame: the receipts a carrier frame holds = 1 + R_MAX (the
+// carrier and up to R_MAX carried; 8 -> 1 + R_MAX = 17 at R_MAX 16, v2.4).
+inline constexpr std::uint64_t max_receipts_per_frame(std::uint64_t r_max) noexcept {
+    return 1 + r_max;
+}
+
+// kFbMaxReceiptsPerFrame at the ruled R_MAX (the S2 relay literal is 8; v2.4 = 17).
+inline constexpr std::uint64_t kFbMaxReceiptsPerFrame = max_receipts_per_frame(kRuledLaneParams.r_max);
+static_assert(kFbMaxReceiptsPerFrame == 17, "a carrier frame holds the carrier + R_MAX = 16 carried receipts");
+
 // Carrier body of an own and R_MAX carried bodies of `receipt_bytes` each:
-// ver + own + n_carried + R_MAX carried.
+// ver + kFbMaxReceiptsPerFrame x receipt + n_carried.
 inline constexpr std::uint64_t carrier_body_size(std::uint64_t receipt_bytes, std::uint64_t r_max) noexcept {
-    return kU8Bytes + receipt_bytes + kU8Bytes + r_max * receipt_bytes;
+    return kU8Bytes + kU8Bytes + max_receipts_per_frame(r_max) * receipt_bytes;
 }
 
 // The carrier body buffer of the limits.
