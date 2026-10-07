@@ -285,6 +285,8 @@ jobs:
                     v37_xmr_relay_horizons_kat v37_xmr_pathb_branch_kat xmr_template_catchup_kat \
                     v37_xmr_pathb_journal_kat v37_xmr_pathb_headers_first_kat \
                     xmr_share_retarget_kat xmr_carrier_sharechain_kat \
+                    xmr_receipt_freshness_kat xmr_receipt_legally_dead_kat xmr_receipt_carriage_kat \
+                    v37_xmr_receipt_id_kat v37_xmr_receipt_defer_kat xmr_receipt_solo_leech_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \
@@ -804,6 +806,8 @@ jobs:
                     v37_xmr_relay_horizons_kat v37_xmr_pathb_branch_kat xmr_template_catchup_kat \
                     v37_xmr_pathb_journal_kat v37_xmr_pathb_headers_first_kat \
                     xmr_share_retarget_kat xmr_carrier_sharechain_kat \
+                    xmr_receipt_freshness_kat xmr_receipt_legally_dead_kat xmr_receipt_carriage_kat \
+                    v37_xmr_receipt_id_kat v37_xmr_receipt_defer_kat xmr_receipt_solo_leech_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \
