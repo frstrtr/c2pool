@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,30 @@ struct FoundBlock {
     Amounts       credit;       // per-key entitlement E_b at b's burial-gated prefix
     Amounts       payout;       // the coinbase outputs broadcast in b (K_fair)
     bool          canonical = true;
+    // ── ★ DROPS T3 (XMR arm) ─────────────────────────────────────────────
+    // Same shape as the BTC-family driver: the lane's gate plus the BURIED
+    // sub-threshold harvest this cut settles. Both default INERT. The XMR lane
+    // can only carry the NO-LaneKind gate (no ratified ridge row — see
+    // v37_node_lane_activation.hpp); that is a fact about the RIDGE, not about
+    // DROPS, whose gate is lane-independent.
+    ::v37::LaneParams                     params{};
+    std::vector<settle::HarvestedReceipt> harvested{};
+    // ★ DROPS-R1 + R-SYBIL: how work becomes coin at this cut, and who is
+    // enrolled. ★ DROPS-R3: the composed delta map to fold as-is.
+    settle::DropsCompose                  drops{};
+    bool                                  has_carried_drops = false;
+    Amounts                               carried_drops{};
+    // ANCHOR: the block's own on-chain credit cut (the ledger's next anchor at
+    // FINALIZE, anchor_cut rule). Absent for a debit-only / cutless block.
+    std::optional<settle::AnchorCut>      cut{};
+    // DROPS DUE (OwedLedgerRules::drops_due): the booking's claim (canonical
+    // bookings only; the credit above already folds it). Under the rule the
+    // composed delta is booked as this block's DEPOSIT, never its credit.
+    std::optional<settle::DropsFound>     due{};
+    // THE DRAIN RULE (OwedLedgerRules::decay_from_gross): the block's gross
+    // credited set G_b (a canonical booking; empty for a debit-only one). The
+    // lane height is `height` above (OwedLedgerRules::lane_height).
+    std::set<settle::bytes32>             gross{};
 };
 
 // Result of one advance, for the smoke/KAT to assert the F1 discipline.
@@ -169,27 +194,67 @@ public:
     // Register a settlement-carrying block we just found. Write-ahead the FOUND
     // event (durable BEFORE the block is announced, W6 §5.2), enter the merged
     // ledger's pending set, and remember it for maturity. Idempotent per bid.
+    //
+    // ★ DROPS T3 — COMPOSE ONCE, HERE, AND PERSIST THE COMPOSED MAP (same rule
+    // as the BTC-family driver): the FOUND event carries the COMPOSED credit, so
+    // a restart replays it verbatim and no replay path re-derives the estimate
+    // against a harvest the node no longer holds.
     void on_block_found(const FoundBlock& b) {
+        // DROPS T3: the composed credit. Gate OFF (default) => byte for byte
+        // b.credit (compose_credit_* return the base map when the delta is empty).
+        // DROPS DUE rule: the delta is the deposit, the credit is b.credit as booked.
+        const bool due_rule = m_ledger.rules().drops_due;
+        std::optional<settle::DropsFound> df;
+        if (due_rule) {
+            settle::DropsFound d = b.due ? *b.due : settle::DropsFound{};
+            // DROPS WINDOW (A4b): the work is window weight (b.due->window, booked by
+            // the shell's composition), never a deposit: the delta is not priced once.
+            if (m_ledger.rules().drops_window.on()) d.deposit.clear();
+            else d.deposit = b.has_carried_drops ? b.carried_drops
+                                                 : settle::subthreshold_credit(b.params, b.harvested, b.drops);
+            for (auto it = d.deposit.begin(); it != d.deposit.end();) it = it->second == 0 ? d.deposit.erase(it) : std::next(it);
+            if (!d.empty()) df = std::move(d);
+        }
+        const Amounts credit =
+            due_rule ? b.credit
+            : b.has_carried_drops
+                ? settle::compose_credit_from_delta(b.credit, b.carried_drops)
+                : settle::compose_credit_replace(b.params, b.credit, b.harvested,
+                                                 b.drops);
+        // THE DRAIN RULE: the lane height and gross set ride the FOUND (event + ledger) under the rules only.
+        std::optional<settle::LaneFound> lf;
+        if (m_ledger.rules().lane_height || m_ledger.rules().decay_from_gross) {
+            settle::LaneFound l;
+            l.height = b.height;
+            l.gross = b.gross;
+            lf = std::move(l);
+        }
         //  fix 2: a record left non-canonical by an ORPHAN may be re-FOUND when the block
         // becomes canonical again (branch flip-flop). The OwedLedger already admits it (the
         // pre-SETTLED orphan was a pure pending removal); only this per-bid idempotency stood in the way.
         if (auto it = m_found.find(b.bid); it != m_found.end()) {
             if (it->second.canonical || m_ledger.is_settled(b.bid) || m_ledger.is_pending(b.bid)) return;
             SettleEvent ev;
-            ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = b.credit; ev.payout = b.payout;
+            ev.kind = SettleEvKind::Found; ev.bid = b.bid; ev.credit = credit; ev.payout = b.payout;
+            set_cut(ev, b.cut);
+            set_drops(ev, df);
+            set_lane(ev, lf);
             write_event(ev);
-            m_ledger.on_block_found(b.bid, b.credit, b.payout);
+            m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr, lf ? &*lf : nullptr);
             ledger_event();   // R5
-            it->second.credit = b.credit; it->second.payout = b.payout; it->second.canonical = true;
+            it->second.credit = b.credit; it->second.payout = b.payout; it->second.cut = b.cut; it->second.canonical = true;
             return;   // m_by_height already lists it
         }
         SettleEvent ev;
         ev.kind = SettleEvKind::Found;
         ev.bid = b.bid;
-        ev.credit = b.credit;
+        ev.credit = credit;
         ev.payout = b.payout;
+        set_cut(ev, b.cut);
+        set_drops(ev, df);
+        set_lane(ev, lf);
         write_event(ev);
-        m_ledger.on_block_found(b.bid, b.credit, b.payout);
+        m_ledger.on_block_found(b.bid, credit, b.payout, b.cut, df ? &*df : nullptr, lf ? &*lf : nullptr);
         m_found.emplace(b.bid, b);
         m_by_height[b.height].push_back(b.bid);
         ledger_event();   // R5
@@ -319,6 +384,33 @@ public:
 
     std::uint64_t cursor_height() const { return m_cursor_h; }
     std::uint64_t event_seq()     const { return m_seq; }
+
+    // COLD-BOOT: seed the cursor of a FRESH store (cursor 0, no event, no
+    // high-water) at boot -- the anchor boot passes H_a - D_conf, the value the
+    // first walk would reach anyway (no found block can exist at or below the
+    // anchor on a fresh store), so the post-anchor blocks are booked as they are
+    // pumped instead of DEFERRED behind a cursor at 0. A resumed store (any
+    // cursor, event or high-water) is never touched: returns false.
+    bool seed_boot_cursor(std::uint64_t h) {
+        if (m_cursor_h != 0 || m_seq != 0 || m_hw.hw_height != 0 || !m_found.empty() || h == 0) return false;
+        m_cursor_h = h;
+        persist_cursor();
+        return true;
+    }
+
+    // D2 (minority converges to majority): the event log was REWRITTEN to the
+    // re-derived lineage and the ledger replayed from it (XmrNode::relineage).
+    // Forget every found block this driver tracked (the consumer re-drives the
+    // new pending set through on_block_found, as the boot sidecar re-drive
+    // does), continue the write-ahead sequence after the rewritten log and the
+    // since-height of its last FINALIZE. The cursor, the high-water and every
+    // installed observer / gate / probe are unchanged.
+    void rebase(std::uint64_t event_seq, std::uint64_t digest_since) {
+        m_found.clear();
+        m_by_height.clear();
+        m_seq = event_seq;
+        m_last_since = digest_since;
+    }
 
 private:
     void write_event(const SettleEvent& ev) {

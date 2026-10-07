@@ -70,10 +70,42 @@
 // half-written frame on a live socket would feed a truncated body into the
 // peer's decoder.
 //
+// ── ★ RELAY-SEND-QUEUE: the opt-in asynchronous send path ──────────────────
+// Everything above still holds for the SYNCHRONOUS path (the default, used by
+// the btc-dash carrier and every pre-existing KAT unchanged). It has one hole
+// the XMR relay fell into (capstone attempt 6): a send issued FROM A READER
+// THREAD blocks that reader, and when BOTH ends of a link do it at once (the
+// FB_BLOCK_WON re-offer on HELLO, 512 KiB frames) neither side reads, both
+// sends fill the peer's receive buffer, both time out, the link is hard-dropped
+// and redialed, and every other thread that wanted the same connection's write
+// lock (verify flood, maintenance PING, the stratum share path) waited on it.
+// set_send_queue(max_bytes > 0) switches the node to:
+//   * send_to()/broadcast() only ENQUEUE [len + frame] on the connection's own
+//     bounded queue and return at once (true = queued); they never touch the
+//     socket, so no caller -- a reader thread included -- ever blocks on a peer;
+//   * one WRITER thread per connection drains that queue in order (per-
+//     connection frame order is kept exactly), in send(2) calls of at most
+//     kSendChunk bytes, still bounded by SO_SNDTIMEO (a timed-out write is still
+//     a HARD drop of that one connection);
+//   * a connection whose queued bytes would exceed max_bytes is dropped HARD
+//     and counted (peers_dropped_queue_full): the slow peer pays, not the node.
+// The writer's lifetime is owned by the connection's reader: the reader joins
+// it before it closes the descriptor, so stop() joining the readers joins
+// every writer too.
+//
 // DUPLEX: every established connection — whether we accepted it or dialed it —
 // is a full peer: it is added to the broadcast set AND gets a reader thread, so
 // carriers flow both directions over one socket (node A's win reaches node B,
 // and B's win reaches A).
+//
+// ── ★ ADDRESS POLICY (opt-in; off until set) ───────────────────────────────
+// Every connection carries the address key of its remote end (net_addr_ban.hpp:
+// IPv4 address or IPv6 /64; 127.0.0.1 and ::1 have none). set_inbound_limits()
+// caps accepted connections in total and per address; ban() / ban_key() ban an
+// address for a duration and drop every live connection from it. A connection
+// from a banned address or over a limit is closed at accept, before it gets a
+// PeerId or a reader, and a banned address is not dialed. With no limit set and
+// no ban made, behaviour is unchanged.
 //
 // PORTABILITY: POSIX sockets + std::thread only (Linux/macOS). No Boost, so it
 // links into the stdlib-only v37 test harness and needs no io_context. The
@@ -88,11 +120,14 @@
 
 #include <sys/time.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <functional>
 #include <list>
 #include <map>
@@ -104,6 +139,7 @@
 #include <vector>
 
 #include "w3_relay.hpp"   // ICarrierTransport
+#include "net_addr_ban.hpp"   // address keys + ban table (ADDRESS POLICY)
 
 namespace c2pool::v37n {
 
@@ -111,6 +147,12 @@ namespace c2pool::v37n {
 // is a share + <= R_MAX receipts; even generous per-event bounds keep this far
 // under 64 KiB. Sized well above that so a legitimate frame is never clipped.
 constexpr std::uint32_t kMaxCarrierFrame = 1u << 20;   // 1 MiB hard ceiling
+
+// RELAY-SEND-QUEUE: the largest single send(2) the writer thread issues. A
+// frame is still written whole and contiguous on its connection; this only
+// bounds how long one syscall can hold the socket.
+constexpr std::size_t kSendChunk = 64u * 1024u;
+#define C2POOL_XMR_RELAY_SEND_QUEUE 1
 
 // ── the first-byte namespace split (see the header note) ────────────────────
 // frame[0] < kCtrlOpcodeBase  => a CarrierWire body  (0x01..0x7f are versions)
@@ -190,6 +232,35 @@ public:
     // here instead of as a mysterious disconnect.
     std::uint64_t sends_refused_oversize() const { return m_oversize_refused.load(); }
 
+    // ── ★ RELAY-SEND-QUEUE (see the header note) ────────────────────────────
+    // max_bytes > 0: asynchronous per-connection send queues of at most
+    // max_bytes queued bytes each (length prefixes included), drained by one
+    // writer thread per connection. 0 (the default): the synchronous path,
+    // byte-for-byte the pre-queue behaviour. Applies to connections established
+    // AFTER the call; set it before listen()/dialing.
+    void set_send_queue(std::size_t max_bytes) { m_sendq_max.store(max_bytes); }
+    std::size_t send_queue_limit() const { return m_sendq_max.load(); }
+    // Peers dropped because their queue would have exceeded the bound.
+    std::uint64_t peers_dropped_queue_full() const { return m_q_full_drops.load(); }
+    // Bytes queued and not yet fully written, per connection (0 = gone / sync).
+    std::size_t queued_bytes(PeerId id) const {
+        std::shared_ptr<Conn> c;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return 0;
+            c = it->second;
+        }
+        std::lock_guard<std::mutex> ql(c->qmtx);
+        return c->qbytes;
+    }
+    // High-water mark of any one connection's queued bytes since start.
+    std::size_t queued_bytes_hwm() const { return m_q_hwm.load(); }
+    // Frames written by writer threads / sum of their bytes (diagnostics).
+    std::uint64_t async_frames_written() const { return m_q_frames.load(); }
+    // Longest a queued frame waited between enqueue and its last byte written.
+    std::uint64_t async_max_wait_ms() const { return m_q_max_wait_ms.load(); }
+
     // ── ★ targeted send (the repair channel's reply path) ───────────────────
     // Write ONE frame to ONE connection. Returns false if the peer is gone, the
     // frame is over the ceiling, or the write failed/timed out (in which case
@@ -210,6 +281,7 @@ public:
             if (it == m_conns.end()) return false;
             c = it->second;
         }
+        if (c->async) return enqueue(c, frame);            // RELAY-SEND-QUEUE: never blocks
         std::uint8_t lenbuf[4];
         const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
         for (int i = 0; i < 4; ++i) lenbuf[i] = static_cast<std::uint8_t>(len >> (8 * i));
@@ -264,6 +336,32 @@ public:
 
     std::uint16_t listen_port() const { return m_listen_port; }
 
+    // RELAY-DISCOVERY: bound connect(2) of add_peer_id (Linux honours
+    // SO_SNDTIMEO on connect). 0 = block as the kernel decides (the default,
+    // unchanged). A relay dialing LEARNED addresses sets it, so one
+    // unreachable address cannot pin its maintenance thread for minutes.
+    void set_connect_timeout(std::chrono::milliseconds t) { m_connect_timeout_ms.store(static_cast<long>(t.count())); }
+
+    // RELAY-DISCOVERY: the remote IPv4 address of a live connection ("" = gone
+    // / unknown). An inbound peer's advertised relay address is this + the
+    // listen port it announced in HELLO.
+    std::string remote_ip(PeerId id) const {
+        std::shared_ptr<Conn> c;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return {};
+            c = it->second;
+        }
+        std::lock_guard<std::mutex> fl(c->fmtx);
+        if (c->closed) return {};
+        sockaddr_in a{}; socklen_t alen = sizeof(a);
+        if (::getpeername(c->fd, reinterpret_cast<sockaddr*>(&a), &alen) != 0 || a.sin_family != AF_INET) return {};
+        char b[INET_ADDRSTRLEN] = {0};
+        if (!::inet_ntop(AF_INET, &a.sin_addr, b, sizeof b)) return {};
+        return b;
+    }
+
     // GAP-2: dial and return the new connection's PeerId (0 = the dial failed).
     // Same semantics as add_peer(); the id lets a caller keep per-target state
     // (the relay's redial-with-backoff). PeerEventFn(id, true) has already fired
@@ -275,8 +373,26 @@ public:
         a.sin_family = AF_INET;
         a.sin_port = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { ::close(fd); return 0; }
+        const net::AddrKey key = net::addr_key_of(reinterpret_cast<const sockaddr*>(&a));
+        if (key && m_bans.banned(key, now())) {   // ADDRESS POLICY: a banned address is not dialed
+            m_dial_refused_banned.fetch_add(1, std::memory_order_relaxed);
+            ::close(fd);
+            return 0;
+        }
+        if (!bind_dial_source(fd)) { ::close(fd); return 0; }
+        const long ctmo = m_connect_timeout_ms.load();
+        if (ctmo > 0) {
+            timeval tv{};
+            tv.tv_sec = static_cast<time_t>(ctmo / 1000);
+            tv.tv_usec = static_cast<suseconds_t>((ctmo % 1000) * 1000);
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        }
         if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { ::close(fd); return 0; }
-        return add_established(fd);
+        if (ctmo > 0) {   // add_established re-applies the send timeout; clear the connect one first
+            timeval zero{};
+            ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
+        }
+        return add_established(fd, /*inbound=*/false, key);
     }
 
     // GAP-2: drop ONE connection on purpose (a protocol refusal: HELLO
@@ -292,8 +408,105 @@ public:
             if (it == m_conns.end()) return;
             c = it->second;
         }
+        // RELAY-SEND-QUEUE: a refusal must not discard what we already queued
+        // on this link (above all our own HELLO, so the refused side still learns
+        // our tag and logs its TAG_MISMATCH, as with the old blocking send). Let
+        // the writer drain the queue first, bounded so a stuck peer cannot hold
+        // the caller (the reader thread) for long.
+        if (c->async) {
+            const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDisconnectFlushMs);
+            for (;;) {
+                {
+                    std::lock_guard<std::mutex> ql(c->qmtx);
+                    if (c->qbytes == 0 || c->qstop) break;
+                }
+                if (std::chrono::steady_clock::now() >= dl) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
         drop_conn(c, /*hard=*/true, /*slow=*/false);
     }
+    static constexpr int kDisconnectFlushMs = 500;
+
+    // ── ★ ADDRESS POLICY (see the header note) ──────────────────────────────
+    // max_inbound: accepted connections live at once; max_per_addr: accepted
+    // connections live at once from one address key. 0 = no limit (default).
+    // Set before listen().
+    void set_inbound_limits(std::size_t max_inbound, std::size_t max_per_addr) {
+        m_max_inbound.store(max_inbound);
+        m_max_per_addr.store(max_per_addr);
+    }
+    // Ban the address of live connection `id` for `dur` and drop every live
+    // connection from that address. Returns the banned key; 0 = the connection
+    // is gone or has no address key (127.0.0.1, ::1), in which case only that
+    // connection is dropped.
+    net::AddrKey ban(PeerId id, std::chrono::seconds dur) {
+        net::AddrKey key = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return 0;
+            key = it->second->addr;
+        }
+        if (!key) { disconnect(id); return 0; }
+        ban_key(key, dur);
+        return key;
+    }
+    // Ban address `key` for `dur` (a longer ban already in place is kept) and
+    // drop every live connection from it. false for key 0.
+    bool ban_key(net::AddrKey key, std::chrono::seconds dur) {
+        const auto t = now();
+        if (!m_bans.ban(key, t, t + dur)) return false;
+        m_addr_bans.fetch_add(1, std::memory_order_relaxed);
+        std::vector<std::shared_ptr<Conn>> live;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            for (const auto& [id, c] : m_conns) { (void)id; if (c->addr == key) live.push_back(c); }
+        }
+        for (auto& c : live) drop_conn(c, /*hard=*/true, /*slow=*/false);
+        return true;
+    }
+    bool is_banned_key(net::AddrKey key) { return m_bans.banned(key, now()); }
+    // Address key of a live connection (0 = gone / none).
+    net::AddrKey addr_key(PeerId id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto it = m_conns.find(id);
+        return it == m_conns.end() ? 0 : it->second->addr;
+    }
+    // Did we accept this live connection (false: dialed, or gone)?
+    bool is_inbound(PeerId id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto it = m_conns.find(id);
+        return it != m_conns.end() && it->second->inbound;
+    }
+    // Live connections (either direction) from address `key`.
+    std::size_t conns_from(net::AddrKey key) const {
+        if (!key) return 0;
+        std::lock_guard<std::mutex> lk(m_mtx);
+        std::size_t n = 0;
+        for (const auto& [id, c] : m_conns) { (void)id; if (c->addr == key) ++n; }
+        return n;
+    }
+    std::size_t n_inbound() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        std::size_t n = 0;
+        for (const auto& [id, c] : m_conns) { (void)id; if (c->inbound) ++n; }
+        return n;
+    }
+    // Dial from this local IPv4 address ("" = the kernel's choice, the default).
+    // Set before dialing.
+    void set_dial_source(const std::string& ip) { m_dial_src = ip; }
+    // The clock bans are measured on (default std::chrono::steady_clock).
+    // Test seam; set before listen() and before dialing.
+    using NowFn = std::function<std::chrono::steady_clock::time_point()>;
+    void set_now_fn(NowFn f) { m_now_fn = std::move(f); }
+    // Accepted connections closed at once: banned address / total inbound cap /
+    // per-address cap. Dials refused because the address is banned. Bans made.
+    std::uint64_t refused_banned() const { return m_refused_banned.load(); }
+    std::uint64_t refused_inbound_cap() const { return m_refused_in_cap.load(); }
+    std::uint64_t refused_addr_cap() const { return m_refused_addr_cap.load(); }
+    std::uint64_t dial_refused_banned() const { return m_dial_refused_banned.load(); }
+    std::uint64_t addr_bans() const { return m_addr_bans.load(); }
 
     // Dial a peer (the --peer path). Returns true if the connection was
     // established and added as a full duplex peer. Safe to call before or after
@@ -306,7 +519,7 @@ public:
         a.sin_port = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { ::close(fd); return false; }
         if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { ::close(fd); return false; }
-        add_established(fd);
+        add_established(fd, /*inbound=*/false, net::addr_key_of(reinterpret_cast<const sockaddr*>(&a)));
         return true;
     }
 
@@ -352,6 +565,7 @@ public:
 
         // pass 1 — every peer whose write lock is free right now.
         for (auto& c : targets) {
+            if (c->async) { if (enqueue(c, frame)) ++reached; continue; }   // RELAY-SEND-QUEUE
             std::unique_lock<std::mutex> wlk(c->wmtx, std::try_to_lock);
             if (!wlk.owns_lock()) { deferred.push_back(c); continue; }
             if (c->closed) continue;                      // reader already closed it
@@ -429,9 +643,21 @@ private:
     struct Conn {
         int fd = -1;
         PeerId pid = 0;
+        bool inbound = false;     // ADDRESS POLICY: accepted (true) or dialed
+        net::AddrKey addr = 0;    // ADDRESS POLICY: remote address key (0 = none)
         std::mutex wmtx;
         std::mutex fmtx;
         bool closed = false;
+        // RELAY-SEND-QUEUE (async == true only). qmtx guards q/qbytes/qstop and is
+        // never held across I/O or any callback.
+        struct Item { std::vector<std::uint8_t> buf; std::chrono::steady_clock::time_point at; };
+        bool async = false;
+        std::mutex qmtx;
+        std::condition_variable qcv;
+        std::deque<Item> q;
+        std::size_t qbytes = 0;   // queued + in-flight bytes (released once written)
+        bool qstop = false;
+        std::thread writer;       // joined by this connection's reader before close
     };
     struct Reader {
         std::thread t;
@@ -455,12 +681,21 @@ private:
         auto last_log = std::chrono::steady_clock::time_point{};
         std::uint64_t suppressed = 0;
         while (m_running.load()) {
-            int cfd = ::accept(lfd, nullptr, nullptr);
+            sockaddr_storage ss{};
+            socklen_t sl = sizeof(ss);
+            int cfd = ::accept(lfd, reinterpret_cast<sockaddr*>(&ss), &sl);
             if (cfd >= 0) {
                 if (backoff_ms && m_log)
                     m_log("carrier-net: accept recovered (descriptors available again)");
                 backoff_ms = 0; suppressed = 0;
-                add_established(cfd);
+                const net::AddrKey key = net::addr_key_of(reinterpret_cast<const sockaddr*>(&ss));
+                if (key && m_bans.banned(key, now())) {   // ADDRESS POLICY: refused before it is a peer
+                    ::close(cfd);
+                    m_refused_banned.fetch_add(1, std::memory_order_relaxed);
+                    note_refusal("banned address", key);
+                    continue;
+                }
+                add_established(cfd, /*inbound=*/true, key);
                 continue;
             }
             const int e = errno;
@@ -487,7 +722,7 @@ private:
         }
     }
 
-    PeerId add_established(int fd) {
+    PeerId add_established(int fd, bool inbound = false, net::AddrKey key = 0) {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         // ★ BOUND THE WRITE (c2pool#1655 Defect-B). Without this a peer that
@@ -504,6 +739,31 @@ private:
         bool established = false;
         PeerId pid = 0;
         std::list<Reader> finished;
+        int refused = 0;   // ADDRESS POLICY: 1 = total inbound cap, 2 = per-address cap
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (!m_running.load()) { ::close(fd); return 0; }   // stopping: never orphan a reader
+            if (inbound) {
+                const std::size_t max_in = m_max_inbound.load(), max_addr = m_max_per_addr.load();
+                if (max_in || (key && max_addr)) {
+                    std::size_t n_in = 0, n_addr = 0;
+                    for (const auto& [id, c] : m_conns) {
+                        (void)id;
+                        if (!c->inbound) continue;
+                        ++n_in;
+                        if (key && c->addr == key) ++n_addr;
+                    }
+                    if (max_in && n_in >= max_in) refused = 1;
+                    else if (key && max_addr && n_addr >= max_addr) refused = 2;
+                }
+            }
+        }
+        if (refused) {
+            ::close(fd);
+            (refused == 1 ? m_refused_in_cap : m_refused_addr_cap).fetch_add(1, std::memory_order_relaxed);
+            note_refusal(refused == 1 ? "inbound connection cap" : "per-address connection cap", key);
+            return 0;
+        }
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (!m_running.load()) { ::close(fd); return 0; }   // stopping: never orphan a reader
@@ -518,7 +778,11 @@ private:
             }
             pid = ++m_next_peer_id;
             auto c = std::make_shared<Conn>();
-            c->fd = fd; c->pid = pid;
+            c->fd = fd; c->pid = pid; c->inbound = inbound; c->addr = key;
+            if (m_sendq_max.load() > 0) {   // RELAY-SEND-QUEUE: writer first, so the reader can always join it
+                c->async = true;
+                c->writer = std::thread([this, c] { writer_loop(c); });
+            }
             m_conns[pid] = c;
             auto done = std::make_shared<std::atomic<bool>>(false);
             m_readers.push_back(Reader{std::thread([this, c, done] { reader_loop(c); done->store(true); }), done});
@@ -569,6 +833,11 @@ private:
         }
         drop_conn(c);
         shutdown_conn(*c);   // wake any writer still blocked on this socket
+        if (c->async) {      // RELAY-SEND-QUEUE: stop + join this connection's writer before the close
+            { std::lock_guard<std::mutex> ql(c->qmtx); c->qstop = true; }
+            c->qcv.notify_all();
+            if (c->writer.joinable()) c->writer.join();
+        }
         // ★ RELAY-FD: the reader OWNS the descriptor's close. Before this the fd
         // of a dropped connection was closed only by stop() -- and not even
         // there once the drop had removed it from the peer set -- so every
@@ -613,6 +882,119 @@ private:
         if (!c.closed) ::shutdown(c.fd, SHUT_RDWR);
     }
 
+    // ── RELAY-SEND-QUEUE ────────────────────────────────────────────────────
+    // Queue [len + frame] on c; never blocks on the socket. Over the byte bound
+    // the connection is dropped HARD (counted) and false is returned.
+    bool enqueue(const std::shared_ptr<Conn>& c, const std::vector<std::uint8_t>& frame) {
+        Conn::Item it;
+        const std::uint32_t len = static_cast<std::uint32_t>(frame.size());
+        it.buf.resize(frame.size() + 4);
+        for (int i = 0; i < 4; ++i) it.buf[i] = static_cast<std::uint8_t>(len >> (8 * i));
+        if (len) std::memcpy(it.buf.data() + 4, frame.data(), len);
+        it.at = std::chrono::steady_clock::now();
+        const std::size_t need = it.buf.size();
+        const std::size_t cap = m_sendq_max.load();
+        bool full = false;
+        std::size_t now_bytes = 0;
+        {
+            std::lock_guard<std::mutex> ql(c->qmtx);
+            if (c->qstop) return false;
+            if (c->qbytes + need > cap) {
+                full = true;
+                c->qstop = true;   // the writer stops at once; nothing more is written on this stream
+                now_bytes = c->qbytes;
+            } else {
+                c->q.push_back(std::move(it));
+                c->qbytes += need;
+                now_bytes = c->qbytes;
+            }
+        }
+        if (full) {
+            c->qcv.notify_all();
+            m_q_full_drops.fetch_add(1, std::memory_order_relaxed);
+            if (m_log)
+                m_log("carrier-net: peer " + std::to_string(c->pid) + " send queue full (" + std::to_string(now_bytes) +
+                      " B queued + " + std::to_string(need) + " B > bound " + std::to_string(cap) +
+                      " B) -> dropping that peer (RELAY-SEND-QUEUE)");
+            drop_conn(c, /*hard=*/true, /*slow=*/false);
+            return false;
+        }
+        std::size_t hwm = m_q_hwm.load(std::memory_order_relaxed);
+        while (now_bytes > hwm && !m_q_hwm.compare_exchange_weak(hwm, now_bytes, std::memory_order_relaxed)) {}
+        c->qcv.notify_one();
+        return true;
+    }
+
+    // One writer per async connection: drains its queue in order, <= kSendChunk
+    // bytes per send(2), SO_SNDTIMEO still bounding each call. A failed/timed-out
+    // write leaves the stream desynced -> HARD drop (the reader then unwinds and
+    // joins us). Exits on qstop (set by the reader, or by a queue overflow).
+    void writer_loop(const std::shared_ptr<Conn>& c) {
+        for (;;) {
+            Conn::Item it;
+            {
+                std::unique_lock<std::mutex> ql(c->qmtx);
+                c->qcv.wait(ql, [&] { return c->qstop || !c->q.empty(); });
+                if (c->qstop) return;
+                it = std::move(c->q.front());
+                c->q.pop_front();
+            }
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> wlk(c->wmtx);
+                if (c->closed) return;
+                ok = send_chunked(c->fd, it.buf.data(), it.buf.size());
+            }
+            { std::lock_guard<std::mutex> ql(c->qmtx); c->qbytes -= it.buf.size(); }
+            if (!ok) { drop_conn(c, /*hard=*/true); return; }
+            m_q_frames.fetch_add(1, std::memory_order_relaxed);
+            const auto w = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - it.at).count());
+            std::uint64_t mw = m_q_max_wait_ms.load(std::memory_order_relaxed);
+            while (w > mw && !m_q_max_wait_ms.compare_exchange_weak(mw, w, std::memory_order_relaxed)) {}
+        }
+    }
+    static bool send_chunked(int fd, const std::uint8_t* p, std::size_t n) {
+        for (std::size_t off = 0; off < n;) {
+            const std::size_t k = std::min(kSendChunk, n - off);
+            if (!send_all(fd, p + off, k)) return false;
+            off += k;
+        }
+        return true;
+    }
+
+    // ── ADDRESS POLICY helpers ──────────────────────────────────────────────
+    std::chrono::steady_clock::time_point now() const {
+        const NowFn& f = m_now_fn;
+        return f ? f() : std::chrono::steady_clock::now();
+    }
+    bool bind_dial_source(int fd) const {
+        if (m_dial_src.empty()) return true;
+        sockaddr_in s{};
+        s.sin_family = AF_INET;
+        s.sin_port = 0;
+        if (::inet_pton(AF_INET, m_dial_src.c_str(), &s.sin_addr) != 1) return false;
+        return ::bind(fd, reinterpret_cast<sockaddr*>(&s), sizeof(s)) == 0;
+    }
+    // One log line per 5 s at most for refused connections (counted always).
+    void note_refusal(const char* why, net::AddrKey key) {
+        if (!m_log) return;
+        std::uint64_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_refusal_log_mtx);
+            const auto t = std::chrono::steady_clock::now();
+            if (m_refusal_logged != std::chrono::steady_clock::time_point{} && t - m_refusal_logged < std::chrono::seconds(5)) {
+                ++m_refusal_suppressed;
+                return;
+            }
+            m_refusal_logged = t;
+            n = m_refusal_suppressed;
+            m_refusal_suppressed = 0;
+        }
+        m_log(std::string("carrier-net: connection from ") + net::addr_key_str(key) + " refused (" + why + "; " +
+              std::to_string(n) + " more refusal(s) since the last notice)");
+    }
+
     static bool send_all(int fd, const void* buf, std::size_t n) {
         const std::uint8_t* p = static_cast<const std::uint8_t*>(buf);
         std::size_t off = 0;
@@ -644,11 +1026,29 @@ private:
     std::atomic<std::uint64_t> m_slow_drops{0};
     std::atomic<std::uint64_t> m_oversize_refused{0};
     std::atomic<std::uint64_t> m_accept_exhausted{0};
+    // RELAY-SEND-QUEUE: 0 = synchronous sends (default); > 0 = per-connection byte bound.
+    std::atomic<std::size_t>   m_sendq_max{0};
+    std::atomic<std::uint64_t> m_q_full_drops{0};
+    std::atomic<std::size_t>   m_q_hwm{0};
+    std::atomic<std::uint64_t> m_q_frames{0};
+    std::atomic<std::uint64_t> m_q_max_wait_ms{0};
     LogFn                     m_log;            // rate-limited diagnostics (RELAY-FD)
     // SO_SNDTIMEO, ms. 10 s by default: long enough that no healthy peer ever
     // trips it, short enough that a peer which stopped reading cannot pin one
     // of our threads indefinitely. 0 => block forever (pre-Stage-1 behaviour).
     std::atomic<long>         m_send_timeout_ms{10000};
+    std::atomic<long>         m_connect_timeout_ms{0};   // RELAY-DISCOVERY (0 = unbounded, unchanged)
+    // ADDRESS POLICY (all off by default)
+    std::atomic<std::size_t>   m_max_inbound{0};
+    std::atomic<std::size_t>   m_max_per_addr{0};
+    net::AddrBanTable          m_bans;
+    NowFn                      m_now_fn;
+    std::string                m_dial_src;
+    std::atomic<std::uint64_t> m_refused_banned{0}, m_refused_in_cap{0}, m_refused_addr_cap{0};
+    std::atomic<std::uint64_t> m_dial_refused_banned{0}, m_addr_bans{0};
+    std::mutex                 m_refusal_log_mtx;
+    std::chrono::steady_clock::time_point m_refusal_logged{};
+    std::uint64_t              m_refusal_suppressed = 0;
     int                       m_listen_fd = -1;
     std::uint16_t             m_listen_port = 0;
     // The node is "running" for its whole lifetime (construction -> stop()),

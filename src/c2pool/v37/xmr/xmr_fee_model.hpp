@@ -19,17 +19,19 @@
 // fleet refuses at HELLO instead of diverging (ruling S4).
 //
 //   1. DONATION OUTPUT = MANDATORY, EXACTLY ONE OUTPUT (rulings S1 + 09-23).
-//      p2pool data.py: amounts[DONATION] += subsidy - sum(amounts), and V36
-//      requires the donation output to be >= 1 atomic unit; share credit to
-//      the donation script and the residual land in that ONE output. Here the
-//      lane coinbase carries ONE output to the donation address, LAST: a
-//      FixedOutput to the donation ref whose declared amount kDonationDustPico
-//      (1 piconero) is a MINIMUM; the residual sink IS the donation address,
+//      p2pool data.py: amounts[DONATION] += subsidy - sum(amounts), and the
+//      donation output is always emitted, even at 0 (pre-V36 p2pool; V36 LTC
+//      raised it to >= 1 atomic unit). Share credit to the donation script
+//      and the residual land in that ONE output. Here the lane coinbase
+//      carries ONE output to the donation address, LAST: a FixedOutput to the
+//      donation ref whose declared amount kDonationMarkerPico is 0 (ruling
+//      2026-09-29: the marker is the output itself, not an amount; Monero
+//      consensus accepts a 0-amount v2 coinbase output). The residual sink IS the donation address,
 //      so X6 (allocate_exact_sum, residual_folds_into_fixed) folds the whole
 //      exact-sum residual into it, and the donation's own K_fair payout
 //      (give-author credit, paid at its age position) is MERGED into it too:
-//          amount    = owed_paid + 1 + residual
-//          owed_part = min(owed_in, amount - 1)     (x6 CoinbaseOutput)
+//          amount    = owed_paid + residual      (may be 0)
+//          owed_part = min(owed_in, amount)       (x6 CoinbaseOutput)
 //      owed_in (the owed the coinbase's input set held for the donation;
 //      under the default W4Propose source that is its proposed K_fair take,
 //      so owed_part is exactly its K_fair payout, less any S2 dust it paid)
@@ -41,15 +43,17 @@
 //          canonical coinbase does not end in that one output, or pays the
 //          donation anywhere else;
 //        * receive side: apply_donation_rule() refuses to book a lane
-//          coinbase whose last output is not a >= 1 piconero donation output,
+//          coinbase whose last output is not the donation output,
 //          that pays the donation in an earlier output, or that lacks the
 //          owed_in tail (REFUSE-IF-ABSENT); it books owed_part as the
 //          donation's payout (a ledger deduction, like any K_fair payout)
-//          and the rest (1 + residual) as coverage.
-//   2. THE 1-PICONERO DUST COMES FROM THE LARGEST PAYEE (ruling S2, V36
-//      data.py "take 1 from the largest"). Only when the owed pass exhausts
-//      the budget (residual 0) does X6 deduct the minimum, from the LARGEST
-//      owed output (ties: earliest in K_fair order); the piconero stays owed.
+//          and the rest (the residual) as coverage.
+//   2. NO MINIMUM TO FUND (ruling S2 retired 2026-09-29). V36 LTC takes 1
+//      atomic unit from the largest payee when the residual is 0; with the
+//      marker at 0 there is nothing to take (X6 S2 is a no-op at a 0 minimum).
+//      Rounding dust stays with the miners (exact-sum split, largest
+//      remainder), as in Monero p2pool; give-author defaults to 0.1% and 0
+//      opts out entirely, leaving a 0-amount marker.
 //   3. GIVE-AUTHOR = A u16 INSIDE THE PoW-COMMITTED RECEIPT (ruling S3). The
 //      Family-B receipt's side_data_v2 carries give_author; its info_digest
 //      commits it and, with --relay-bind rbind, the coinbase 0x02 region
@@ -100,15 +104,17 @@ namespace x6 = ::v37::xmr::settle;
 // Constants (consensus once activated; compiled in, never a CLI knob)
 // ---------------------------------------------------------------------------
 // The protocol donation / author address (Monero mainnet standard address,
-// public keys only).
+// public keys only). MAINNET only: the other networks' identities are in
+// donation_info() below, selected by the node's --network (DON-NET).
 inline constexpr char kDonationAddress[] =
     "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF";
 // Its decoded public spend (B) and view (A) keys. Pinned against the decoder
 // by v37_xmr_fee_model_kat (decode(kDonationAddress) must equal these bytes).
 inline constexpr char kDonationSpendHex[] = "14d413e6ccb14f0ba30999b97c8912a07321d893789b7f149810b7885b2cd7c7";
 inline constexpr char kDonationViewHex[]  = "b3157741ab68969aeb7fe9ebd4fa3ec5ce4dcdc7b43249fdb40311cb03779e03";
-// The V36 marker minimum: the donation output is never below 1 atomic unit.
-inline constexpr std::uint64_t kDonationDustPico = 1;
+// The donation marker's declared amount: 0. The output is always present
+// (pre-V36 p2pool shape); its amount is give-author credit + residual only.
+inline constexpr std::uint64_t kDonationMarkerPico = 0;
 // The give-author scale (v36 share_data.donation is a u16 over 65535).
 inline constexpr std::uint32_t kGiveAuthorScale = 65535;
 // Under the gate every PoW-committed receipt is pushed at this lane weight,
@@ -126,6 +132,58 @@ inline bool fee_model_on(const ::v37::LaneParams& p) {
 inline constexpr std::uint64_t kPrefixMainnetStd = 18, kPrefixMainnetInt = 19, kPrefixMainnetSub = 42;
 inline constexpr std::uint64_t kPrefixTestnetStd = 53, kPrefixTestnetInt = 54, kPrefixTestnetSub = 63;
 inline constexpr std::uint64_t kPrefixStagenetStd = 24, kPrefixStagenetInt = 25, kPrefixStagenetSub = 36;
+
+// ---------------------------------------------------------------------------
+// Per-network donation identity (DON-NET)
+// ---------------------------------------------------------------------------
+// The donation identity is chosen by the node's Monero network (--network),
+// never by a knob. MAINNET is kDonationAddress above, byte-for-byte; the
+// other networks carry project-controlled wallets generated offline (public
+// addresses only here; keys are held off-tree). Regtest (monerod --regtest,
+// FAKECHAIN) encodes addresses with the MAINNET network byte, so its address
+// has prefix 18 but distinct keys. The values of DonationNet are the relay
+// HELLO network byte (0 mainnet, 1 testnet, 2 stagenet, 3 regtest).
+#define C2POOL_V37_XMR_DONATION_PER_NETWORK 1
+enum class DonationNet : std::uint8_t { Mainnet = 0, Testnet = 1, Stagenet = 2, Regtest = 3 };
+
+struct DonationIdentity {
+    const char*   address;     // standard address (public keys only)
+    const char*   spend_hex;   // its decoded public spend key B
+    const char*   view_hex;    // its decoded public view key A
+    std::uint64_t prefix;      // its network byte
+};
+inline constexpr char kDonationAddressTestnet[] =
+    "9yWhJcSRcNFhfrZJAkgh5N4swx92cHLP79hYbP8YJwJKYSCcdKXpgrvYxFHZ5kvfUERtXjvwNTJN4EuW7FypyDZ3114t5rG";
+inline constexpr char kDonationSpendHexTestnet[] = "a7731abbe9bb2cf3264395231a8645172ffd7f08c6097e3402197f3f1c6ffcbb";
+inline constexpr char kDonationViewHexTestnet[]  = "ef3c9a659a67c3bf081a352e7cfbfb94cc5e11921a3e8953223fca1ed14e2200";
+inline constexpr char kDonationAddressStagenet[] =
+    "56eN1fax2baeK1WQtCassh9dpgnWbnzTPTgoPQ7wbWPmBszKeTHwa5ji1wuqZnxERNc284ESw3xoDd76uzEtwjge9gesBUp";
+inline constexpr char kDonationSpendHexStagenet[] = "7f095705904be1df109bdf44b0027c339fde3ece7d85069f8bdfb19fd8c16c41";
+inline constexpr char kDonationViewHexStagenet[]  = "0abca326ba53a6f5387785822296c1d15df03e6c51cd44d7dbe270667b5fe34c";
+inline constexpr char kDonationAddressRegtest[] =
+    "43TryRMP6jdJP9h1CSgskqAFX6dA4h76rXfs7x5wvfGZAVmVBBUxRHjfJ9tfgnBtsJ4D75rdz9gVe8pU4SxA2rJhNrx87oD";
+inline constexpr char kDonationSpendHexRegtest[] = "3091e80a51918c67eb67b6fefaf77e374dd898240953bbb75d47b82b8615c638";
+inline constexpr char kDonationViewHexRegtest[]  = "c5d453f0d54332e4f48f12abab2551132f00037f0c51892ebe3b41928ab5bec1";
+
+inline constexpr DonationIdentity donation_info(DonationNet n) {
+    switch (n) {
+        case DonationNet::Testnet:  return {kDonationAddressTestnet, kDonationSpendHexTestnet, kDonationViewHexTestnet, kPrefixTestnetStd};
+        case DonationNet::Stagenet: return {kDonationAddressStagenet, kDonationSpendHexStagenet, kDonationViewHexStagenet, kPrefixStagenetStd};
+        case DonationNet::Regtest:  return {kDonationAddressRegtest, kDonationSpendHexRegtest, kDonationViewHexRegtest, kPrefixMainnetStd};
+        case DonationNet::Mainnet:  break;
+    }
+    return {kDonationAddress, kDonationSpendHex, kDonationViewHex, kPrefixMainnetStd};
+}
+inline constexpr const char* donation_address(DonationNet n) { return donation_info(n).address; }
+inline constexpr const char* to_string(DonationNet n) {
+    switch (n) {
+        case DonationNet::Testnet:  return "testnet";
+        case DonationNet::Stagenet: return "stagenet";
+        case DonationNet::Regtest:  return "regtest";
+        case DonationNet::Mainnet:  break;
+    }
+    return "mainnet";
+}
 
 // ---------------------------------------------------------------------------
 // CryptoNote base58 (block-wise: 8 bytes <-> 11 chars, tail per kEncSizes)
@@ -224,29 +282,77 @@ inline bool hex32_of(const char* hx, std::array<std::uint8_t, 32>& out) {
     }
     return true;
 }
-inline ::v37::ScriptRef donation_ref() {
+// The donation payee of network `n`. The no-argument forms are MAINNET (the
+// historical single identity); every daemon call site passes its --network.
+inline ::v37::ScriptRef donation_ref(DonationNet n) {
+    const DonationIdentity di = donation_info(n);
     std::array<std::uint8_t, 32> B{}, A{};
-    hex32_of(kDonationSpendHex, B);
-    hex32_of(kDonationViewHex, A);
+    hex32_of(di.spend_hex, B);
+    hex32_of(di.view_hex, A);
     return ::v37::xmr::make_xmr_std(B, A);
 }
-inline ::v37::bytes32 donation_identity() { return ::v37::xmr::xmr_identity_key(donation_ref()); }
+inline ::v37::ScriptRef donation_ref() { return donation_ref(DonationNet::Mainnet); }
+inline ::v37::bytes32 donation_identity(DonationNet n) { return ::v37::xmr::xmr_identity_key(donation_ref(n)); }
+inline ::v37::bytes32 donation_identity() { return donation_identity(DonationNet::Mainnet); }
 
 // The mandatory donation output (declared LAST among the fixed outputs, and
 // paying the residual sink, so X6 folds the residual AND the donation's own
 // K_fair payout into it: the canonical tail is
-// [ ... owed ][ donation: owed_paid + 1 + residual ], one output).
-inline x6::FixedOutput donation_marker() {
+// [ ... owed ][ donation: owed_paid + residual (may be 0) ], one output).
+inline x6::FixedOutput donation_marker(DonationNet n) {
     x6::FixedOutput f;
-    f.pay = donation_ref();
-    f.amount = kDonationDustPico;
-    f.identity = donation_identity();
+    f.pay = donation_ref(n);
+    f.amount = kDonationMarkerPico;
+    f.identity = donation_identity(n);
     return f;
 }
+inline x6::FixedOutput donation_marker() { return donation_marker(DonationNet::Mainnet); }
 
 // ---------------------------------------------------------------------------
 // Give-author (receipt-carried u16)
 // ---------------------------------------------------------------------------
+// A percentage as an EXACT decimal: num / den with den = 10^k (k <= 9), parsed
+// from the operator's text with no floating point, so the u16 a receipt
+// commits to (and the owner-fee basis points) is the same on every platform
+// and compiler (an x87 or FMA build may round a double on a .5 boundary the
+// other way). Accepts DIGITS[.DIGITS] with at most 9 decimals; anything else
+// (a sign, an exponent, NaN, text) is refused.
+struct ExactPct { std::uint64_t num = 0, den = 1; bool ok = false; };
+inline ExactPct parse_pct_exact(const std::string& t) {
+    ExactPct r;
+    std::size_t i = 0, int_digits = 0, frac_digits = 0;
+    std::uint64_t num = 0, den = 1;
+    for (; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i, ++int_digits) {
+        if (num > 1000000000ull) return r;                 // far above 100: refuse
+        num = num * 10 + static_cast<std::uint64_t>(t[i] - '0');
+    }
+    if (i < t.size() && t[i] == '.') {
+        for (++i; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i, ++frac_digits) {
+            if (frac_digits == 9) return r;                // more than 9 decimals
+            num = num * 10 + static_cast<std::uint64_t>(t[i] - '0');
+            den *= 10;
+        }
+        if (frac_digits == 0) return r;                    // "1." is not a number
+    }
+    if (i != t.size() || int_digits == 0) return r;
+    r.num = num; r.den = den; r.ok = true;
+    return r;
+}
+// round-half-up(65535 * num / (100 * den)), clamped to [0, 65535], in integers.
+inline std::uint16_t give_author_u16(const ExactPct& p) {
+    if (!p.ok || p.num == 0) return 0;
+    const unsigned __int128 n = static_cast<unsigned __int128>(kGiveAuthorScale) * p.num * 2 + 100u * p.den;
+    const unsigned __int128 d = static_cast<unsigned __int128>(200u) * p.den;
+    const unsigned __int128 v = n / d;
+    return static_cast<std::uint16_t>(v > kGiveAuthorScale ? kGiveAuthorScale : v);
+}
+// round-half-up(10000 * num / (100 * den)) basis points, clamped to [0, 10000].
+inline std::uint32_t pct_to_bp(const ExactPct& p) {
+    if (!p.ok || p.num == 0) return 0;
+    const unsigned __int128 v = (static_cast<unsigned __int128>(p.num) * 200u + p.den) / (2u * p.den);
+    return static_cast<std::uint32_t>(v > 10000u ? 10000u : v);
+}
+
 // v36 encodes perfect_round(65535*pct/100) (stochastic rounding); the u16 is
 // minted into the receipt and is node-local policy, so a deterministic
 // round-half-up is used here (bias <= 0.5/65535, never consensus).
@@ -272,19 +378,27 @@ inline SplitWeight split_receipt_weight(std::uint64_t w, std::uint16_t d) {
 }
 
 // ---------------------------------------------------------------------------
-// The lane pushes of ONE PoW-committed receipt (every node, same order).
-//   gate OFF: (payee, off_weight)                 -- byte-identical to master
-//   gate ON : (payee, 65535 - d) [+ (donation, d) iff d > 0], d = the receipt's
-//             OWN give_author u16 (side_data_v2), never the folding node's.
+// The lane push of ONE PoW-committed receipt (every node, same order).
+//   gate OFF: (payee, off_weight)                  -- byte-identical to master
+//   gate ON : exactly ONE push of weight 65535 (A2, kFeeLanePushRule = 2), so
+//             a receipt takes ONE lane position whatever its d:
+//               d == 0      -> (payee, 65535)
+//               d == 65535  -> (donation, 65535)
+//               otherwise   -> (composite(d, payee, donation), 65535); the
+//                              settlement projection splits its weight
+//                              floor(W*d/65535) to the donation, the rest to
+//                              the payee (settle::project, xmr_ga_split).
+//             d = the receipt's OWN give_author u16 (side_data_v2).
 // ---------------------------------------------------------------------------
+inline constexpr std::uint32_t kFeeLanePushRule = 2;
 inline std::vector<std::pair<::v37::ScriptRef, std::uint64_t>>
 receipt_lane_pushes(const ::v37::ScriptRef& payee, std::uint16_t give_author, bool fee_on,
-                    std::uint64_t off_weight = 1) {
+                    std::uint64_t off_weight = 1, DonationNet net = DonationNet::Mainnet) {
     std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> v;
     if (!fee_on) { v.emplace_back(payee, off_weight); return v; }
-    const SplitWeight s = split_receipt_weight(kFeeReceiptWeight, give_author);
-    if (s.miner) v.emplace_back(payee, s.miner);
-    if (s.donation) v.emplace_back(donation_ref(), s.donation);
+    if (give_author == 0) v.emplace_back(payee, kFeeReceiptWeight);
+    else if (give_author >= kGiveAuthorScale) v.emplace_back(donation_ref(net), kFeeReceiptWeight);
+    else v.emplace_back(::v37::xmr::make_xmr_give_author(give_author, payee, donation_ref(net)), kFeeReceiptWeight);
     return v;
 }
 
@@ -318,8 +432,9 @@ inline ::v37::ScriptRef choose_payee(const ::v37::ScriptRef& miner,
 // Written by the settlement source whenever the residual folds into the
 // donation output (fee model ON only; gate OFF has no fold, so no tail and
 // master's bytes). Layout of the 0x02 payload under the gate:
-//     [ nonce 4 | rbind? | pad | "V37D" u64le | "V37C" P spine ]
-// (the credit-cut tail stays LAST, so credit::parse_tail is unchanged).
+//     [ nonce 4 | rbind? | pad | "V37D" u64le | "V37P" v pool_tag? | "V37C" P spine ]
+// (the credit-cut tail stays LAST, so credit::parse_tail is unchanged; the
+// POOL-LINEAGE field sits between V37D and V37C, xmr_credit_cut.hpp).
 // Constant size, so the miner_tx weight invariance holds.
 // ---------------------------------------------------------------------------
 inline constexpr unsigned char kDonationOwedMagic[4] = {'V', '3', '7', 'D'};
@@ -334,9 +449,11 @@ inline std::vector<std::uint8_t> encode_donation_owed_tail(std::uint64_t owed_in
 // credit-cut tail when one is present, else the last 12 bytes. nullopt when
 // the magic is not there.
 inline std::optional<std::uint64_t> parse_donation_owed_payload(const std::vector<std::uint8_t>& p) {
-    std::size_t end = p.size();
-    if (end >= credit::kTailBytes && std::memcmp(p.data() + end - credit::kTailBytes, credit::kMagic, 4) == 0)
-        end -= credit::kTailBytes;
+    std::size_t end = credit::end_before_credit_tail(p);
+    // POOL-LINEAGE: a lineage-tagged payload carries the V37P field between
+    // V37D and V37C; skip it (a malformed field leaves `end` where it is, so the
+    // V37D magic check below fails closed).
+    if (credit::parse_pool_tag_payload(p) == credit::PoolTagParse::Present) end -= credit::kPoolTagFieldBytes;
     if (end < kDonationOwedTailBytes) return std::nullopt;
     const std::uint8_t* t = p.data() + end - kDonationOwedTailBytes;
     if (std::memcmp(t, kDonationOwedMagic, 4) != 0) return std::nullopt;
@@ -350,11 +467,10 @@ inline std::optional<std::uint64_t> parse_donation_owed(const std::vector<unsign
     return parse_donation_owed_payload(*nf);
 }
 
-// The receive-side split of the ONE donation output (the X6 MERGE rule with
-// minimum kDonationDustPico): the part booked as the donation's payout.
+// The receive-side split of the ONE donation output (the X6 MERGE rule; the
+// marker minimum is 0): the part booked as the donation's payout.
 inline std::uint64_t donation_owed_part(std::uint64_t amount, std::uint64_t owed_in) {
-    const std::uint64_t over_min = amount > kDonationDustPico ? amount - kDonationDustPico : 0;
-    return owed_in < over_min ? owed_in : over_min;
+    return owed_in < amount ? owed_in : amount;
 }
 
 // ---------------------------------------------------------------------------
@@ -362,11 +478,11 @@ inline std::uint64_t donation_owed_part(std::uint64_t amount, std::uint64_t owed
 //
 // Canonical tail (X6 order [owed] ++ [fixed], the residual AND the donation's
 // K_fair payout merged into the last fixed output because it pays the sink):
-//     ... owed (none to D) | D: owed_paid + 1 + residual
+//     ... owed (none to D) | D: owed_paid + residual (may be 0)
 //
 // Deterministic location, identical on every node: the LAST output pays the
-// donation identity D with amount >= kDonationDustPico and NO earlier output
-// pays D -> it is the donation output; otherwise REFUSE.
+// donation identity D (any amount, 0 included) and NO earlier output pays D
+// -> it is the donation output; otherwise REFUSE.
 // ---------------------------------------------------------------------------
 struct MarkerLocation {
     bool        ok = false;
@@ -380,11 +496,6 @@ inline MarkerLocation locate_donation_marker(const std::vector<::v37::bytes32>& 
     const std::size_t n = ids.size();
     if (n == 0 || amounts.size() != n) { m.why = "donation output absent: no outputs"; return m; }
     if (!(ids[n - 1] == D)) { m.why = "donation output absent: the last output does not pay the donation address"; return m; }
-    if (amounts[n - 1] < kDonationDustPico) {
-        m.why = "donation output absent: the last donation output pays " + std::to_string(amounts[n - 1]) +
-                " < " + std::to_string(kDonationDustPico) + " piconero";
-        return m;
-    }
     for (std::size_t i = 0; i + 1 < n; ++i)
         if (ids[i] == D) {
             m.why = "more than one donation output: output " + std::to_string(i) +
@@ -396,10 +507,11 @@ inline MarkerLocation locate_donation_marker(const std::vector<::v37::bytes32>& 
 }
 
 // Serve-side property over the builder's canonical output list (roles known):
-// exactly ONE output to D, last, Fixed, >= 1 piconero, its owed_part leaving
-// the minimum, and NO separate residual sink (the residual must have folded).
+// exactly ONE output to D, last, Fixed (any amount, 0 included), its
+// owed_part within its amount, and NO separate residual sink (the residual
+// must have folded).
 inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs,
-                                              const ::v37::bytes32& D) {
+                                              const ::v37::bytes32& D, const ::v37::ScriptRef& Dref) {
     MarkerLocation m;
     const std::size_t n = outs.size();
     for (const auto& o : outs)
@@ -408,24 +520,32 @@ inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutp
             return m;
         }
     if (n == 0 || outs[n - 1].role != x6::CoinbaseOutput::Role::Fixed || !(outs[n - 1].identity == D) ||
-        outs[n - 1].amount < kDonationDustPico || !(outs[n - 1].pay == donation_ref())) {
-        m.why = "donation output absent: the canonical coinbase does not end in the >= " +
-                std::to_string(kDonationDustPico) + "-piconero donation output (owed + 1 + residual)";
+        !(outs[n - 1].pay == Dref)) {
+        m.why = "donation output absent: the canonical coinbase does not end in the donation output "
+                "(owed + residual)";
         return m;
     }
     for (std::size_t i = 0; i + 1 < n; ++i)
-        if (outs[i].identity == D || outs[i].pay == donation_ref()) {
+        if (outs[i].identity == D || outs[i].pay == Dref) {
             m.why = "more than one donation output: output " + std::to_string(i) +
                     " also pays the donation address (its owed payout must merge into the last one)";
             return m;
         }
-    if (outs[n - 1].owed_part > outs[n - 1].amount - kDonationDustPico) {
+    if (outs[n - 1].owed_part > outs[n - 1].amount) {
         m.why = "the donation output's owed part " + std::to_string(outs[n - 1].owed_part) +
-                " leaves less than the " + std::to_string(kDonationDustPico) + "-piconero minimum";
+                " exceeds its amount " + std::to_string(outs[n - 1].amount);
         return m;
     }
     m.ok = true; m.marker = n - 1;
     return m;
+}
+// Mainnet form (D = the mainnet donation identity) and the per-network form.
+inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs,
+                                              const ::v37::bytes32& D) {
+    return inspect_donation_marker(outs, D, donation_ref());
+}
+inline MarkerLocation inspect_donation_marker(const std::vector<x6::CoinbaseOutput>& outs, DonationNet n) {
+    return inspect_donation_marker(outs, donation_identity(n), donation_ref(n));
 }
 
 // Receive-side booking rule. `ids`/`amounts` are the per-vout identities and

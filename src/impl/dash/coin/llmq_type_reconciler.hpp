@@ -106,7 +106,7 @@
 ///      named non-defect — and the alarm CLEARS. A genuinely mined type
 ///      keeps producing in-retention entries, so its alarm never decays.
 ///
-///   3. RESTART RESURRECTION OF AN UNDATED ENTRY (measured 2026-08-06, hotel
+///   3. RESTART RESURRECTION OF AN UNDATED ENTRY (measured 2026-08-06, production node
 ///      reserve node, issue #1164): mode 2's first-seen dating lives in
 ///      memory, so a process restart re-dates every scanner-undated entry as
 ///      fresh — and a bogus never-mined entry that mnlistdiff/qrinfo keeps
@@ -436,7 +436,7 @@ public:
                 f.verdict = LlmqTypeVerdict::StaleSightings;
                 f.pending_reason = "n/a";
             } else if (s.scanner_confirmed == 0) {
-                // MODE 3 (measured 2026-08-06, hotel reserve node): the entry
+                // MODE 3 (measured 2026-08-06, reserve node): the entry
                 // is SERVED (mnlistdiff/qrinfo delivered it) but the
                 // [QC-MINED] scanner has never dated its qfcommit, and a
                 // full-span chain sweep showed ZERO commitments of the type

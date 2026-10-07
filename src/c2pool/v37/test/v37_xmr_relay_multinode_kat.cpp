@@ -28,6 +28,17 @@
 //       frame and a Family-A 0x02 frame (counted), (b) charged a structural
 //       strike -- and NO RandomX evaluation -- for a tampered receipt, (c)
 //       BANNED and disconnected after one confirmed invalid PoW
+//   M7  refused ORDER: a peer whose frame vault has evicted lane position 0
+//       answers GETORDER [0,P) with BELOW_HORIZON. The relay never takes the
+//       empty refused order for progress. REPAIR-HORIZON (capstone 09-26)
+//       changed what follows: the refusal carries the peer's lowest_retained
+//       a0, so the repair RE-ASKS that peer from a0 instead of setting it aside
+//       (setting it aside made every repair of a lane longer than the vault
+//       horizon Exhausted forever): exactly THREE GETORDERs reach it -- [0,P)
+//       refused, the zero-length prefix probe [a0,a0) (its digest at a0 equals
+//       ours), and the suffix [a0,P) -- and, since this spine is one X never
+//       held, the suffix fails the spine check at P: X is set aside, the repair
+//       is Exhausted and never Ready, and no further GETORDER follows.
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -171,6 +182,16 @@ int main() {
     for (int i = 0; i < 8; ++i) prev[i] = b32_of(static_cast<u8>(100 + i));
     for (auto* n : all) { for (int i = 0; i < 4; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
 
+    // SHARE-VERDICT HEIGHT: B's share verdict records the coinbase height the
+    // relay hands it. Every M2 receipt is mined on prev[0], whose ChainView
+    // context is the NEW block's height 100 (note_bin(prev[0], 100), as the
+    // template and the chain feed note it), so the verdict must see 100, not
+    // 101: a wrong height rebuilds every honest share as non-canonical.
+    std::mutex vh_mtx; std::vector<u64> verdict_heights;
+    B.relay->set_share_verdict([&](const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 cb_h, std::string&) {
+        std::lock_guard<std::mutex> lk(vh_mtx); verdict_heights.push_back(cb_h); return 1;
+    });
+
     // ── M2 flood + dedup ────────────────────────────────────────────────────
     const SynthBlock blkA = make_block(100, prev[0], 1, nullptr, 3, 10);
     const SynthBlock blkC = make_block(100, prev[0], 2, nullptr, 3, 11);
@@ -185,6 +206,13 @@ int main() {
     C(A.relay->stats().admitted_own.load() == 4 && A.relay->stats().admitted_foreign.load() == 3, "M2 A: 4 own + 3 foreign admitted, once each");
     C(B.relay->stats().admitted_foreign.load() == 7 && B.relay->stats().admitted_own.load() == 0, "M2 B: 7 foreign admitted, once each");
     C(Cn.relay->stats().admitted_own.load() == 3 && Cn.relay->stats().admitted_foreign.load() == 4, "M2 C: 3 own + 4 foreign admitted, once each");
+    {
+        std::lock_guard<std::mutex> lk(vh_mtx);
+        bool all100 = verdict_heights.size() == 7;
+        for (u64 h : verdict_heights) all100 = all100 && h == 100;
+        C(all100, "M2 the share verdict gets the coinbase height of the mined block (100) for all 7 receipts, got " +
+                  std::to_string(verdict_heights.size()) + (verdict_heights.empty() ? "" : " first " + std::to_string(verdict_heights[0])));
+    }
     C(A.rx_calls.load() == 3 && B.rx_calls.load() == 7 && Cn.rx_calls.load() == 4,
       "M2 RandomX ran once per FOREIGN receipt per node (A 3, B 7, C 4), never at the minter");
     C(A.relay->stats().dup.load() >= 1, "M2 the duplicate own submit was deduped");
@@ -280,6 +308,51 @@ int main() {
           "M6 invalid PoW (RandomX below share_diff, confirmed by re-hash): BANNED + disconnected");
         C(s.rx_invalid.load() >= 1 && !B.relay->known(inv.id), "M6 the invalid receipt was never admitted");
         evil.stop();
+    }
+
+    // ── M7 a refused (BELOW_HORIZON) ORDER is re-asked from the peer's horizon ──
+    {
+        RelayOptions xo = opts(true, {});
+        xo.vault.horizon_positions = 2;           // X keeps only its newest positions
+        TNode X("X", xo, XmrReceiptIngest::Order::Canonical);
+        C(X.relay->start(why), "M7 X starts (vault horizon 2 positions) " + why);
+        TNode Y("Y", opts(false, {X.relay->listen_port()}), XmrReceiptIngest::Order::Canonical);
+        C(Y.relay->start(why), "M7 Y starts, dials X " + why);
+        std::vector<TNode*> xy{&X, &Y};
+        C(wait_for([&] { return X.relay->ready_peers().size() == 1 && Y.relay->ready_peers().size() == 1; }, xy),
+          "M7 X-Y up");
+        for (auto* n : xy) { for (int i = 0; i < 4; ++i) n->note_bin(prev[i], 100 + i); n->template_height = 100; }
+        const SynthBlock blkX = make_block(100, prev[0], 5, nullptr, 2, 14);
+        for (std::uint32_t k = 0; k < 6; ++k) X.relay->submit_own(own(blkX, 50 + k, pA));
+        for (auto* n : xy) n->template_height = 101;
+        C(wait_for([&] { return X.next_pos() == 6 && Y.next_pos() == 6; }, xy), "M7 X and Y both push 6 receipts");
+        const u64 PX = X.next_pos();
+        bytes32 spineX = X.digest(); spineX[1] ^= 0x33;   // a cut Y does not hold: Y must repair it from X
+        const auto& ys = Y.relay->stats();
+        const u64 fail0 = ys.repair_peer_fail.load();
+        const u64 mis0 = ys.repair_spine_mismatch.load();
+        const u64 ord0 = Y.relay->requester()->stats().orders_requested;
+        XmrRelayNode::RepairState st = XmrRelayNode::RepairState::Pending;
+        const bool exhausted = wait_for([&] {
+            st = Y.relay->repair_poll(PX, spineX, 0, nullptr);
+            return st == XmrRelayNode::RepairState::Exhausted; }, xy, 8000ms);
+        const u64 fails = ys.repair_peer_fail.load() - fail0;
+        const u64 orders = Y.relay->requester()->stats().orders_requested - ord0;
+        std::this_thread::sleep_for(300ms);
+        for (int i = 0; i < 10; ++i) { (void)Y.relay->repair_poll(PX, spineX, 0, nullptr); X.pump(); Y.pump(); std::this_thread::sleep_for(20ms); }
+        const u64 orders_after = Y.relay->requester()->stats().orders_requested - ord0;
+        const u64 lowX = X.relay->vault().lowest_position();
+        C(exhausted, "M7 the repair of a spine X never held ends Exhausted (every ready peer tried)");
+        C(fails >= 1 && ys.repair_ready.load() == 0 && ys.repair_order_ok.load() == 0,
+          "M7 the BELOW_HORIZON answer is a failed ask (repair_peer_fail +" + std::to_string(fails) + "), never an order, never Ready");
+        C(ys.repair_horizon_rearm.load() == 1 && ys.repair_prefix_ok.load() == 1 && ys.repair_spine_mismatch.load() - mis0 == 1,
+          "M7 REPAIR-HORIZON: the refusal re-armed the repair from X's lowest_retained (" + std::to_string(lowX) +
+          "), the prefix probe matched, the suffix order failed the spine check at P (rearm=" +
+          std::to_string(ys.repair_horizon_rearm.load()) + " prefix_ok=" + std::to_string(ys.repair_prefix_ok.load()) + ")");
+        C(orders == 3 && orders_after == 3,
+          "M7 X was asked exactly three times -- [0,P) refused, probe [a0,a0), suffix [a0,P) (" + std::to_string(orders) +
+          ", then " + std::to_string(orders_after) + " after more polls): the empty refused order is not taken for progress");
+        X.relay->set_dialing(false); Y.relay->set_dialing(false);
     }
 
     for (auto* n : all) n->dump_logs();

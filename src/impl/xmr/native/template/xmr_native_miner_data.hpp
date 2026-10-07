@@ -90,6 +90,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -158,6 +159,7 @@ enum class NativeRefusal : std::uint8_t {
     NoCoins,
     NoHardFork,
     TipMoved,           // the tip left the branch the template was built on mid-build
+    PoolCold,           // TXPOOL-RESUME: the tx pool has not finished its back-fill yet
 };
 
 inline const char* to_string(NativeRefusal r) noexcept {
@@ -172,6 +174,7 @@ inline const char* to_string(NativeRefusal r) noexcept {
         case NativeRefusal::NoCoins:          return "NoCoins";
         case NativeRefusal::NoHardFork:       return "NoHardFork";
         case NativeRefusal::TipMoved:         return "TipMoved";
+        case NativeRefusal::PoolCold:         return "PoolCold";
     }
     return "?";
 }
@@ -418,6 +421,15 @@ public:
     // served template is then byte-identical to the plain good-citizen path.
     void set_operator_injects(const OperatorInjectPool* p) { injects_ = p; }
 
+    // TXPOOL-RESUME: the template readiness rule. With a warm gate wired, no
+    // template (so no job) is produced until the flag is set -- the node sets
+    // it once its tx pool finished the first complement back-fill round or a
+    // bounded timeout ran out -- so a (re)started node never hands out a
+    // coinbase-only job while the network mempool is not empty. nullptr (the
+    // default) = no gate. Wired once, before any template is served. The
+    // selection itself is untouched: a warm pool is selected exactly as before.
+    void set_warm_gate(const std::atomic<bool>* warm) { warm_ = warm; }
+
     NativeRefusal        last_refusal() const { std::lock_guard<std::mutex> lk(mtx_); return last_refusal_; }
     std::uint64_t        snapshots()    const { std::lock_guard<std::mutex> lk(mtx_); return snapshots_; }
     std::uint64_t        refusals()     const { std::lock_guard<std::mutex> lk(mtx_); return refusals_; }
@@ -486,6 +498,11 @@ private:
         r.coins_known = ti->already_generated_coins != 0;
         if (!r.coins_known)
             return no(NativeRefusal::NoCoins, "already_generated_coins is not carried forward");
+
+        r.pool_warm = warm_ == nullptr || warm_->load(std::memory_order_acquire);
+        if (!r.pool_warm)
+            return no(NativeRefusal::PoolCold,
+                      "tx pool is not warm yet: the first complement back-fill round has not finished");
 
         refusal = NativeRefusal::None;
         r.why.clear();
@@ -694,6 +711,7 @@ private:
     mutable std::size_t            last_dropped_mined_ = 0;
     // The operator-inject ledger/order source, wired at start (nullptr = off).
     const OperatorInjectPool*      injects_ = nullptr;
+    const std::atomic<bool>*       warm_    = nullptr;   // TXPOOL-RESUME
     mutable NativeRefusal          last_refusal_ = NativeRefusal::None;
 };
 

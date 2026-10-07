@@ -1,9 +1,11 @@
 name: attribution-gate
 
-# Standing rule: ZERO AI attribution anywhere — commit messages, PR body/title,
-# branch names. This required check fails any PR that leaks vendor co-author
-# trailers, generated-with lines, the bot emoji, vendor URLs/emails, or bare
-# model names. Server-side backstop so no clone/worktree can reintroduce it.
+# Standing rule: ZERO AI or tool attribution anywhere. This required check
+# fails a pull request when a commit message in its range, its title or body,
+# its branch name, or any line it adds to a tracked file matches a marker in
+# ci/attribution-patterns.txt (scripts/ci/attribution_gate.sh). The same check
+# runs locally from scripts/ci/hooks/commit-msg and scripts/ci/hooks/pre-push.
+# Server-side backstop so no clone or worktree can reintroduce it.
 
 on:
   pull_request:
@@ -28,7 +30,8 @@ jobs:
       - name: Checkout PR commit range (bounded fetch)
         uses: actions/checkout@v4
         with:
-          # Attribution scan only reads BASE_SHA..HEAD_SHA. A whole-repo
+          # Attribution scan only reads BASE_SHA..HEAD_SHA and the diff of the
+          # PR merge commit against its first parent (the base). A whole-repo
           # unshallow (fetch-depth: 0) is the single most fragile checkout we
           # run and reds clean PRs when a runner link drops packets. Bound the
           # fetch to the PR own commits. GitHub Actions expressions have NO
@@ -40,7 +43,7 @@ jobs:
       - name: Deepen one commit to reach the PR merge base
         run: git fetch --deepen=1 || true
 
-      - name: Scan commits + PR metadata for AI attribution
+      - name: Scan commits, PR metadata and added lines for AI attribution
         env:
           PR_BODY:  ${{ github.event.pull_request.body }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -49,37 +52,28 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
-          # ERE applied case-insensitively (grep -i)
-          PATTERN='co-authored-by:.*(claude|anthropic)|generated with[[:space:]]*\[?claude|claude\.com/claude-code|noreply@anthropic\.com|🤖|claude-|\bopus\b|\bsonnet\b|\bhaiku\b|\banthropic\b|\bfable\b'
-          fail=0
-
-          echo "::group::Commit range ${BASE_SHA}..${HEAD_SHA}"
-          if ! git log --format=%H%n%B%n--END-- "${BASE_SHA}..${HEAD_SHA}" > /tmp/commits.txt 2>/dev/null; then
-            git log --format=%H%n%B%n--END-- -50 "${HEAD_SHA}" > /tmp/commits.txt
+          # Commit messages: the PR range, or the last 50 commits of the head
+          # when the base is not reachable in the bounded fetch.
+          if git rev-list --count "${BASE_SHA}..${HEAD_SHA}" >/dev/null 2>&1; then
+            range="${BASE_SHA}..${HEAD_SHA}"
+          else
+            range="-50 ${HEAD_SHA}"
           fi
-          cat /tmp/commits.txt
-          echo "::endgroup::"
-
-          if grep -nEi "$PATTERN" /tmp/commits.txt; then
-            echo "::error::AI attribution found in a commit message in this PR range"
-            fail=1
+          # Added lines: the checked-out PR merge commit against its first
+          # parent, the base it merges into.
+          merge=$(git rev-parse HEAD)
+          if ! git cat-file -e "${merge}^1" 2>/dev/null; then
+            git fetch --deepen=1 || true
           fi
-
-          printf %s "$PR_BODY"  > /tmp/pr_body.txt
-          printf %s "$PR_TITLE" > /tmp/pr_title.txt
-          printf %s "$HEAD_REF" > /tmp/pr_ref.txt
-          for f in body title ref; do
-            if grep -nEi "$PATTERN" /tmp/pr_$f.txt; then
-              echo "::error::AI attribution found in PR $f"
-              fail=1
-            fi
-          done
-
-          if [ "$fail" -ne 0 ]; then
-            echo "attribution-gate FAILED — strip all AI attribution (vendor co-author trailers, generated-with lines, bot emoji, vendor URLs/emails, bare model names) from commits, PR body/title, and branch name."
-            exit 1
+          diff=""
+          if git cat-file -e "${merge}^1" 2>/dev/null; then
+            diff="${merge}^1 ${merge}"
+          else
+            echo "::error::attribution gate: the base of the PR merge commit is not in the checkout"
+            exit 2
           fi
-          echo "attribution-gate: clean"
+          GATE_RANGE="$range" GATE_DIFF="$diff" BRANCH="$HEAD_REF" \
+            bash scripts/ci/attribution_gate.sh
 
       # Steady-state disk hygiene on the VM905 self-hosted runners: drop the
       # checkout payload and _temp, keep _actions/_tool/_update. Always runs.

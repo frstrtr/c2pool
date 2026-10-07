@@ -1,7 +1,7 @@
 // D-DASH.SML-RESYNC — the tip mnlistdiff request had no retry, and one lost
 // reply cost a full block interval of embedded serving.
 //
-// MEASURED (hotel node 109.161.52.148, 2026-08-06, 5h33m window). The embedded
+// MEASURED (production node, 2026-08-06, 5h33m window). The embedded
 // arm spent 943 s on the dashd fallback. 586 s of that — 62% of the total and
 // 99% of all `dmn-stale` time — sat in FIVE episodes of 275/156/103/51/1 s, and
 // every one was closed by `[EMB-DASH] tip advanced`, i.e. by the chain moving
@@ -152,7 +152,7 @@ TEST(DashSmlResyncWatchdog, BacksOffGeometricallyThenClampsAndKeepsRetrying)
 }
 
 // ── RED->GREEN: a wedged tip must NOT go silent forever ─────────────────────
-// The measured 1068 s wedge (hotel primary, 2026-08-23 03:39:40 -> ~03:58):
+// The measured 1068 s wedge (primary node, 2026-08-23 03:39:40 -> ~03:58):
 // SmlResyncWatchdog fired attempts 1/3, 2/3, 3/3 and then went SILENT while the
 // chain sat on the SAME tip for ~18 min with 8 healthy peers idle — the arm
 // served the dashd fallback the entire time. The (tip, sml) pair never changed
@@ -168,7 +168,7 @@ TEST(DashSmlResyncWatchdog, WedgedTipIsReAskedPerpetuallyNotSilencedAtTheCap)
     SmlResyncWatchdog w(fast());
     const uint256 tip = blk(0x11), sml = blk(0x22);
 
-    // Exhaust the geometric budget exactly as the hotel wedge did (1/3..3/3).
+    // Exhaust the geometric budget exactly as the production wedge did (1/3..3/3).
     w.observe(tip, sml, 1000);
     ASSERT_TRUE(w.observe(tip, sml, 1020).has_value());
     ASSERT_TRUE(w.observe(tip, sml, 1060).has_value());

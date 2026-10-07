@@ -109,6 +109,7 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     //    wrong tip is judged against the wrong rules.
     if (!synced_) {
         ++stats_.rejected;
+        ++stats_.rejected_not_synced;
         return verdict(Reason::NotSynced, false);
     }
 
@@ -125,6 +126,14 @@ TxRelayVerdict RelayedTxPool::admit_locked(const PeerRef& from,
     const TxDecodeStatus st = decode_relayed_tx(blob.data(), blob.size(), d);
     if (st != TxDecodeStatus::Ok) {
         ++stats_.rejected;
+        // A format from a fork above the implemented range is not understood,
+        // and not understanding it is not the sender's fault: an upgraded
+        // honest peer relays exactly these. Refused without a drop offence.
+        // A malformed transaction of a known format is judged as before.
+        if (tx_format_above_implemented(blob.data(), blob.size())) {
+            ++stats_.rejected_not_understood;
+            return verdict(Reason::NotUnderstood, false);
+        }
         switch (st) {
             case TxDecodeStatus::UnsupportedRctType:
                 return verdict(Reason::BadVersion, true);
@@ -630,6 +639,7 @@ void RelayedTxPool::on_block_connected(const BlockTxEvent& ev) {
     // is the height the input-consensus spendable-age / unlock rules judge a
     // ring member against.
     tip_height_ = ev.height;
+    tip_known_  = true;
 
     for (const Hash& id : ev.tx_hashes) {
         if (by_id_.find(id) == by_id_.end()) continue;
@@ -658,6 +668,7 @@ void RelayedTxPool::note_block_disconnected(const BlockTxEvent& ev) {
     // The disconnected block is no longer the tip; the new tip is one lower.
     std::lock_guard<std::mutex> lk(mu_);
     if (ev.height > 0) tip_height_ = ev.height - 1;
+    tip_known_ = true;
 }
 
 void RelayedTxPool::readmit_disconnected(const BlockTxEvent& ev) {
@@ -691,6 +702,20 @@ void RelayedTxPool::set_input_consensus_sources(const IRingMemberSource* ring_sr
     std::lock_guard<std::mutex> lk(mu_);
     ring_src_   = ring_src;
     spent_view_ = spent_view;
+}
+
+bool RelayedTxPool::seat_tip(std::uint64_t tip_height) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (tip_known_) return false;
+    tip_height_ = tip_height;
+    tip_known_  = true;
+    ++stats_.tip_seated;
+    return true;
+}
+
+bool RelayedTxPool::tip_known() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return tip_known_;
 }
 
 bool RelayedTxPool::synced() const {

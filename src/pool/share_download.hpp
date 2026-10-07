@@ -35,7 +35,7 @@ namespace pool::download
 inline constexpr uint64_t PARENTS_RANGE = 500;
 
 // DPI-latch mitigation — DASH lane ONLY (do NOT apply to PARENTS_RANGE above).
-// A stateful ISP-side per-flow DPI blackhole (TSPU-class CGN on the hotel
+// A stateful ISP-side per-flow DPI blackhole (TSPU-class CGN on the private host
 // uplink) silently blackholes a single outbound TCP flow once it accumulates
 // ~13-16 KB of payload that does not classify as a known protocol; c2pool
 // sends a whole backfill reply in ONE async_write, so a large reply wedges and

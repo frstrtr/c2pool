@@ -35,6 +35,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -42,6 +43,8 @@
 #include <core/filesystem.hpp>                       // core::filesystem::config_path
 #include <c2pool/v37/v37_engine.hpp>                 // V37Engine (merged)
 #include <c2pool/v37/w4_settlement.hpp>              // OwedLedger, SettleHW (merged)
+#include <c2pool/v37/v37_drop_harvest.hpp>           // ★ DROPS T3: DropHarvester
+#include <c2pool/v37/v37_drops_enrollment.hpp>       // ★ R-SYBIL: EnrollmentBook
 #include <sharechain/v37/v37_descriptor_xmr.hpp>     // point_check_backend, xmr_ref_valid
 #include <sharechain/v37/v37_roundabout.hpp>
 
@@ -87,7 +90,28 @@ public:
             ::v37::xmr::xmr_point_check_fn point_check = nullptr)
         : m_cfg(std::move(cfg)), m_transport(transport),
           m_injected_point_check(point_check),
-          m_ledger(m_cfg.lane_chain) {}
+          m_ledger(m_cfg.lane_chain, ledger_rules()) {}
+
+    ::c2pool::v37n::settle::OwedLedgerRules ledger_rules() const {
+        ::c2pool::v37n::settle::OwedLedgerRules r;
+        r.arm_floor = m_cfg.ledger_arm_floor;
+        r.rotate_on_payment = m_cfg.ledger_rotate_on_payment;
+        r.decay_horizon = m_cfg.ledger_decay_horizon;
+        r.decay_half_life = m_cfg.ledger_decay_half_life;
+        r.anchor_cut = m_cfg.ledger_anchor_cut;
+        r.merkle_rows = m_cfg.ledger_merkle_rows;
+        r.drops_due = m_cfg.ledger_drops_due;
+        r.raindrop_enrol = m_cfg.ledger_raindrop_enrol;
+        // THE DRAIN RULE (drain_rule_version >= 1): the lane height (dh, "V37Z")
+        // and the gross-set decay clock ride the same flag day.
+        r.lane_height = m_cfg.drain_rule_version >= 1;
+        r.decay_from_gross = m_cfg.drain_rule_version >= 1;
+        if (m_cfg.ledger_drops_window_rw != 0)   // DROPS WINDOW (A4b): the lane's own geometry
+            r.drops_window = ::c2pool::v37n::settle::DropsWindowRule{
+                m_cfg.lane_params.window, m_cfg.lane_params.half_life, m_cfg.lane_params.epoch_len(),
+                m_cfg.ledger_drops_window_rw, ::c2pool::v37n::xmr::kXmrDropsWorkLz};
+        return r;
+    }
 
     ~XmrNode() { stop(); }
 
@@ -122,6 +146,14 @@ public:
     using RowLookupFn = std::function<std::optional<std::string>(std::uint64_t height)>;
     void set_native_row_lookup(RowLookupFn fn) { m_native_row = std::move(fn); }
 
+    // COLD-BOOT-2: the native index's best height (p2p-first). Lets the tri-state
+    // canonical test tell a row TRIMMED below the retention (height <= tip, no
+    // row: Unknown -- hold, never a drop) from a height above the tip (No), and
+    // lets the native gap re-drive reach the resumed tip without waiting for the
+    // next block. Unset = the highest height a pumped event carried.
+    using NativeTipFn = std::function<std::uint64_t()>;
+    void set_native_tip_lookup(NativeTipFn fn) { m_native_tip = std::move(fn); }
+
     // The block id (lowercase hex) the best chain carries at `height`, or nullopt
     // (above the tip / outside the retention window / header fetch failed).
     std::optional<std::string> chain_bid_at(std::uint64_t height) {
@@ -138,6 +170,13 @@ public:
         return std::nullopt;
     }
     std::uint64_t reorg_redelivered() const noexcept { return m_reorg_redelivered; }
+    bool native_scan_armed() const noexcept { return m_native_scan; }   // COLD-BOOT-2
+
+    // COLD-BOOT-2: the native index's best height (0 = unknown).
+    std::uint64_t native_tip_height() const {
+        const std::uint64_t t = m_native_tip ? m_native_tip() : 0;
+        return t ? t : m_tip_height;
+    }
 
     // Feed ONE mainchain event from the native index. Same body the adapter's
     // event sink runs, called from the consumer's main loop instead of from a
@@ -205,7 +244,29 @@ public:
             }
             return (b && hex_of(b->id) == bid_hex) ? Carry::Yes : Carry::No;
         }
-        return (m_native_presence && m_native_presence(height, bid_hex)) ? Carry::Yes : Carry::No;
+        if (m_native_presence && m_native_presence(height, bid_hex)) return Carry::Yes;
+        // COLD-BOOT-2 (D2): a height at/below the native tip with NO row is a row
+        // the index TRIMMED (older than its 2048-row retention), not evidence the
+        // block left the chain. Answering No there made drain_bookings DROP a
+        // retried/deferred block silently (and the maturity walk ORPHAN a booked
+        // one). Unknown HOLDS: the gate keeps holding, the walk stays below it,
+        // loudly. A DIFFERENT block at the height, or a height above the tip, is
+        // still a positive No.
+        if (m_native_row && !m_native_row(height)) {
+            const std::uint64_t tip = native_tip_height();
+            if (tip != 0 && height <= tip) {
+                ++m_carry_unknown; ++m_gap.native_unknown;
+                if (m_native_unknown_logged.insert(height).second) {
+                    if (m_native_unknown_logged.size() > 4096) m_native_unknown_logged.erase(m_native_unknown_logged.begin());
+                    log("carry ALARM: native row h=" + std::to_string(height) + " (block " + bid_hex.substr(0, 12) +
+                        "…) is at/below the native tip " + std::to_string(tip) + " but no longer retained by the chain index"
+                        " -> UNKNOWN: the block is HELD (never dropped, never orphaned); it was not booked before the row"
+                        " left the retention window -- operator's eyes (credit divergence risk if it is a lane block)");
+                }
+                return Carry::Unknown;
+            }
+        }
+        return Carry::No;
     }
     std::uint64_t carry_unknown_answers() const { return m_carry_unknown; }
 
@@ -241,7 +302,8 @@ public:
     std::uint64_t scan_height() const noexcept { return m_scan_h; }
     struct GapStats {
         std::uint64_t redriven_heights = 0, redrive_calls = 0, fetch_failed = 0,
-                      truncated = 0, truncated_heights = 0, gate_holds = 0;
+                      truncated = 0, truncated_heights = 0, gate_holds = 0,
+                      native_unknown = 0;   // COLD-BOOT-2: trimmed-row Unknown answers (held, never dropped)
     };
     const GapStats& gap_stats() const noexcept { return m_gap; }
 
@@ -249,6 +311,14 @@ public:
     // Returns the number of heights delivered. Advances settlement afterwards so
     // the held walk resumes (the consumer's booking gate governs from here).
     std::size_t redrive_gap_to_tip() {
+        if (m_native_scan) {   // COLD-BOOT-2 (D4b): p2p-first, from the native index's rows
+            if (!m_cba_extend_observer || m_scan_h == 0) return 0;
+            const std::uint64_t best = native_tip_height();
+            if (best <= m_scan_h) return 0;
+            const std::size_t n = redrive_range(m_scan_h + 1, best);
+            if (n && m_finalize && m_hw.hw_height) (void)readvance_settlement();
+            return n;
+        }
         if (!m_gap_redrive || !m_adapter || !m_cba_extend_observer) return 0;
         const std::uint64_t best = m_adapter->index().best_height();
         if (m_adapter->index().empty() || best == 0) return 0;
@@ -268,6 +338,52 @@ public:
         log(std::string("seed: ") + bid + (fresh ? " FOUND+FINALIZE written through the event log"
                                                  : " already in the replayed store (resumed) -> not re-applied"));
         return fresh;
+    }
+
+    // COLD-BOOT: seed a FRESH store's finalize cursor (see
+    // XmrFinalizeDriver::seed_boot_cursor). Call after bring_up(), before the
+    // first mainchain event is pumped. false = resumed store / not brought up.
+    bool seed_fresh_cursor(std::uint64_t h) {
+        if (!m_finalize) return false;
+        const bool ok = m_finalize->seed_boot_cursor(h);
+        // COLD-BOOT-2 (D4b): p2p-first -- the walk may not step onto a height whose
+        // h + D_conf has not been delivered through the booking observer in THIS
+        // process (the scan starts at the anchor: nothing at/below it is bookable).
+        if (ok && !m_adapter && m_native_row) {
+            m_native_scan = true; m_scan_h = h + m_cfg.d_conf;
+            log("cold-boot: native scan gate armed at " + std::to_string(m_scan_h) +
+                " (the finalize walk steps only onto heights whose booking window was delivered in this process)");
+        }
+        log(std::string("cold-boot: finalize cursor ") + (ok ? "SEEDED at " + std::to_string(h) + " (fresh store, anchor boot)"
+                                                            : "not seeded (resumed store: cursor " +
+                                                              std::to_string(m_finalize->cursor_height()) + ")"));
+        return ok;
+    }
+
+    // COLD-BOOT-4: a RESUMED p2p-first store whose finalize cursor lies in the
+    // span a FRESH boot from this f2 anchor seeds past, (H_a - D_conf, H_a]:
+    // pre-anchor heights that no index booted from H_a holds a row for, and
+    // that no process booted from H_a ever delivered (seed_fresh_cursor starts
+    // the scan AT the anchor). The resumed scan used to start at the cursor, so
+    // the re-drive stopped at cursor + 1 ("not held by the native index") for
+    // the life of the process. It now starts at the anchor, exactly as the
+    // fresh boot did. A cursor BELOW H_a - D_conf (a store from an older
+    // anchor) is NOT floored: those heights may carry unbooked lane blocks, so
+    // the walk HOLDS there, loudly. Call after bring_up(), before the re-drive.
+    bool floor_resumed_scan(std::uint64_t anchor_h) {
+        if (!m_native_scan || !m_finalize || m_adapter || anchor_h == 0 || m_scan_h >= anchor_h) return false;
+        const std::uint64_t c = m_finalize->cursor_height();
+        if (c + m_cfg.d_conf < anchor_h) {
+            log("cold-boot ALARM: resumed finalize cursor " + std::to_string(c) + " is below the f2 anchor " + std::to_string(anchor_h) +
+                " - D_conf: heights (" + std::to_string(c) + ", " + std::to_string(anchor_h - m_cfg.d_conf) + "] may carry unbooked lane"
+                " blocks this index cannot serve -> the finalize walk HOLDS at " + std::to_string(c) + " (never skipped)");
+            return false;
+        }
+        log("cold-boot: resumed finalize cursor " + std::to_string(c) + " lies in the pre-anchor span (" +
+            std::to_string(anchor_h - m_cfg.d_conf) + ", " + std::to_string(anchor_h) + "] a fresh boot from this anchor seeds past"
+            " -> native scan starts at the anchor " + std::to_string(anchor_h) + " (was " + std::to_string(m_scan_h) + ")");
+        m_scan_h = anchor_h;
+        return true;
     }
 
     // The consumer's booking gate (FinalizeConnect R4/R6). The node composes it
@@ -301,25 +417,8 @@ public:
 
         // 3) RecoveryDriver BEFORE engine.start() — rebuild ledger + hw + cursor.
         {
-            RecoveryDriver rec(*m_store, m_cfg.lane_chain);
             bool ok = false;
-            m_boot_digests.clear(); m_boot_since.clear();
-            m_boot_digests.push_back(m_ledger.owed_digest());   // the empty anchor / anchor-boot state
-            m_boot_since.push_back(0);
-            // R-C rework-3 (D7): pair every replayed digest state with the coin
-            // height it became current at (Finalize: bin_height - D_conf; the
-            // formula XmrFinalizeDriver::since_of_bin applies live).
-            std::uint64_t since = 0;
-            m_recovered = rec.recover(m_ledger, ok, {}, [this, &since](const OwedLedger& l, const SettleEvent& e) {
-                if (e.kind == SettleEvKind::Finalize)
-                    since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
-                const ::v37::bytes32 d = l.owed_digest();
-                if (!(m_boot_digests.back() == d)) {   // R-B(i) follow-up: canonical D(c) history
-                    m_boot_digests.push_back(d);
-                    m_boot_since.push_back(since);
-                }
-            });
-            m_boot_last_since = since;
+            m_recovered = replay_store(m_ledger, m_boot_digests, m_boot_since, m_boot_last_since, ok);
             if (!ok)
                 throw std::runtime_error(
                     "XmrNode: settlement store is torn (F2 fail-closed) — refusing to start");
@@ -382,6 +481,19 @@ public:
         if (m_scan_h)
             log("gap-redrive: armed; scan starts at the recovered finalize cursor " + std::to_string(m_scan_h) +
                 " (every canonical height above it is re-driven through the booking observer before FINALIZE)");
+        // COLD-BOOT-2 (D4b): the same for a RESUMED p2p-first store. Before this the
+        // first tick re-advanced the walk to the persisted high-water - D_conf with
+        // an empty in-memory deferred/retry set (both die with the process), so the
+        // cursor JUMPED over every height the previous process had not booked yet
+        // and each of them came back late_unbooked. The scan starts at the recovered
+        // cursor: heights above it are delivered again (the resumed chain's rows,
+        // redrive_gap_to_tip, or the re-walk's events) before the walk steps there.
+        if (!daemon_tip && m_recovered.recovered && m_recovered.finalize_cursor_height && m_native_row) {
+            m_native_scan = true;
+            m_scan_h = m_recovered.finalize_cursor_height;
+            log("gap-redrive (native): armed; scan starts at the recovered finalize cursor " + std::to_string(m_scan_h) +
+                " -- the walk resumes from there, never from the high-water (" + std::to_string(m_hw.hw_height) + ")");
+        }
 
         if (daemon_tip) {
             m_adapter->set_event_sink(
@@ -400,6 +512,39 @@ public:
         m_up = true;
         log("bring_up: complete");
     }
+
+    // ── D2 (minority converges to majority): the in-process LINEAGE SWITCH ──
+    // FinalizeConnect has REWRITTEN the event log to the re-derived (majority)
+    // lineage in one atomic store batch. Replay it into a fresh OwedLedger
+    // exactly as bring_up does (same RecoveryDriver, same (digest, since) boot
+    // history), move it INTO m_ledger (the settlement provider and the fixture
+    // hold the ledger by reference: the object must stay the same), rebase the
+    // finalize driver (found-block maps cleared, write-ahead seq and since
+    // continued; cursor, high-water, observers and gates untouched). The caller
+    // re-drives the new pending set and re-seeds its candidate ring from
+    // boot_digest_history(). Returns false (nothing changed) on a torn store.
+    bool relineage(std::string* why = nullptr) {
+        if (!m_store || !m_finalize) { if (why) *why = "node not up"; return false; }
+        OwedLedger fresh(m_cfg.lane_chain, ledger_rules());
+        std::vector<::v37::bytes32> ds; std::vector<std::uint64_t> ss; std::uint64_t last = 0;
+        bool ok = false;
+        const RecoveredState st = replay_store(fresh, ds, ss, last, ok);
+        if (!ok) { if (why) *why = "the rewritten store does not replay (torn)"; return false; }
+        m_ledger = std::move(fresh);
+        m_boot_digests = std::move(ds); m_boot_since = std::move(ss); m_boot_last_since = last;
+        m_recovered.max_event_seq = st.max_event_seq;
+        m_finalize->rebase(st.max_event_seq, last);
+        m_hw.ledger_seq = m_ledger.ledger_seq();
+        ++m_relineages;
+        log("relineage: ledger replayed from the rewritten event log (" + std::to_string(st.max_event_seq) +
+            " events, ledger_seq=" + std::to_string(m_ledger.ledger_seq()) + ", " + std::to_string(m_boot_digests.size()) +
+            " digest states, since=" + std::to_string(last) + "); finalize cursor " +
+            std::to_string(m_finalize->cursor_height()) + " unchanged");
+        return true;
+    }
+    std::uint64_t relineages() const noexcept { return m_relineages; }
+    ISettleStore& store() { return *m_store; }
+    std::string   store_dir() const { return XmrNodeConfig_resolved(m_cfg); }
 
     // Teardown in donor order: network first, then drain-and-join the engine.
     void stop() {
@@ -422,7 +567,10 @@ public:
     // a coinbase — the fail-closed posture for a light/OOM build.
     bool on_network_block_won(std::uint64_t monero_height,
                               const c2pool::xmr::node::Hash& block_id,
-                              const Amounts& credit, const Amounts& payout) {
+                              const Amounts& credit, const Amounts& payout,
+                              std::optional<::c2pool::v37n::settle::AnchorCut> cut = std::nullopt,
+                              const ::c2pool::v37n::settle::DropsFound* due = nullptr,
+                              const std::set<::v37::bytes32>* gross = nullptr) {
         if (m_cfg.network == MoneroNetwork::Mainnet && !m_cfg.i_understand_mainnet) {
             log("win: REFUSED to settle a MAINNET block without --i-understand-mainnet");
             return false;
@@ -432,11 +580,179 @@ public:
         fb.height = monero_height;
         fb.credit = credit;
         fb.payout = payout;
+        fb.cut = cut;   // ANCHOR: the block's own credit cut
+        if (due) fb.due = *due;   // DROPS DUE: the booking's claim (its deposit is the delta below)
+        if (gross) fb.gross = *gross;   // THE DRAIN RULE: G_b (the decay clock); the height is fb.height
+        // ── ★ DROPS T3 (XMR arm) — the hook the BTC/DASH shell already has ──
+        // Parity, not a second mechanism: the XMR finalize driver composes the
+        // very same compose_credit_replace() the BTC-family driver does, so all
+        // it was ever missing was a FoundBlock that carried the lane gate, the
+        // buried harvest and the composition context. Without these four lines
+        // an XMR node could take the flip, be gate-ON, and still credit nobody
+        // for ever — the dormancy this PR exists to remove, in the one shell it
+        // had not been removed from.
+        //
+        // EVERY PIECE DEFAULTS INERT. No harvester attached => buried_harvest()
+        // returns {} and the composition returns fb.credit byte for byte. No
+        // enrolment book => nobody is enrolled => nothing is composed even with
+        // a full harvest. No price function => WorkPrice{}.valid == false =>
+        // entitlement_of_work() returns 0 on BOTH sides of the replace. So a
+        // default XMR node settles exactly as master does, and the seams below
+        // are what an XMR shell calls once it has a DropsWiring to hand them.
+        fb.params = m_cfg.lane_params;
+        // ★ ENROL-REPL: the WINNER's composed delta, carried with the win and
+        // verified by the shell's booking callback (xmr_drops_wiring.hpp (5)).
+        // Booked AS-IS instead of composing from THIS node's enrolment book,
+        // which is node-local (enrolled at this node's own tip). The local
+        // buried harvest is still consumed at the same frontier and discarded,
+        // so it can never be folded into a later block. Unset seam (flip 0, no
+        // DropsWiring) or nothing carried => the local composition below.
+        std::optional<Amounts> carried;
+        if (m_drops_carried) carried = m_drops_carried();
+        // ★ DROPS-RESTART: no live one-shot (a boot / converge RE-DRIVE of a
+        // pending FOUND): book the delta this node journalled when it booked
+        // this block, never a fresh local composition from a restarted book.
+        if (!carried && m_drops_booked) {
+            carried = m_drops_booked(fb.bid);
+            if (carried) ++m_drops_booked_redrive;
+        }
+        if (carried) {
+            if (m_drops_price) fb.drops.price = m_drops_price(); // one-shot, consumed either way (diagnostic only here)
+            fb.has_carried_drops = true;
+            fb.carried_drops = std::move(*carried);
+            (void)buried_harvest(monero_height);                 // advance + discard the local rows
+            ++m_drops_booked_carried;
+        } else {
+            ::c2pool::v37n::settle::DropsCompose dctx;
+            // ★ DROPS-R1: how work becomes coin AT THIS CUT. The XMR arm has no
+            // in-node fold to read a price off (credit arrives ready-made from
+            // the X6 coinbase path), so the price is a supplied seam. Absent, it
+            // is INVALID, which credits zero rather than crediting hash counts
+            // as atomic units — the R1 blowup, refused by default.
+            if (m_drops_price) dctx.price = m_drops_price();
+            dctx.enrollment = m_enroll;     // ★ R-SYBIL: null => nobody enrolled
+            fb.drops = dctx;
+            fb.harvested = buried_harvest(monero_height);
+            if (m_drops) ++m_drops_booked_local;
+        }
         m_finalize->on_block_found(fb);
         log("win: FOUND block " + fb.bid.substr(0, 12) + "… at height " +
             std::to_string(monero_height) + " registered (awaiting D_conf=" +
             std::to_string(m_cfg.d_conf) + ")");
+        if (m_drops) log_drops_found(fb, monero_height);   // ★ DROPS: attached only under the flip
         return true;
+    }
+
+    // THE DRAIN RULE, operator ruling O-2 (2026-10-02): a lane block REFUSED on
+    // the lane-root path (a stale or unknown 0x03 root, live or under the
+    // scratch lineage) is FOUND as an EMPTY booking carrying its Monero height,
+    // so dh (the previous lane block's height) is a pure chain function.
+    // credit {}, payout {}, G_b {}: no money moves in the ledger (the block's
+    // on-chain payout stays node-local LIABILITY), no DROPS harvest is taken
+    // or composed. Only under the lane-height rule (drain_rule_version >= 1);
+    // false (nothing registered) otherwise, which is master.
+    bool on_lane_block_refused(std::uint64_t monero_height, const c2pool::xmr::node::Hash& block_id) {
+        if (!m_ledger.rules().lane_height) return false;
+        if (m_cfg.network == MoneroNetwork::Mainnet && !m_cfg.i_understand_mainnet) {
+            log("win: REFUSED to settle a MAINNET block without --i-understand-mainnet");
+            return false;
+        }
+        FoundBlock fb;
+        fb.bid = hex_of(block_id);
+        fb.height = monero_height;
+        fb.params = m_cfg.lane_params;
+        m_finalize->on_block_found(fb);
+        log("win: EMPTY FOUND " + fb.bid.substr(0, 12) + "… at height " + std::to_string(monero_height) +
+            " (lane-root refused: its height counts for dh, no money in the ledger)");
+        return true;
+    }
+
+    // ── ★ DROPS T3 seams (XMR arm) — the BTC/DASH set, verbatim ──────────
+    //
+    // NOT attached by default, and that default is the safe one on every seam:
+    // no harvester => empty harvest; no book => nobody enrolled; no price =>
+    // zero on both sides of the replace. The node owns none of these lifetimes;
+    // the shell that owns the W2 admitter owns them, because that is who feeds
+    // them (v37_drops_wiring.hpp bundles all three and sources the enrolment
+    // clock from the chain TIP, which is the property the seams themselves
+    // cannot enforce).
+    void set_drop_harvester(::c2pool::v37n::DropHarvester* h) { m_drops = h; }
+    ::c2pool::v37n::DropHarvester* drop_harvester() const { return m_drops; }
+
+    void set_enrollment_book(const ::c2pool::v37n::EnrollmentBook* b) { m_enroll = b; }
+    const ::c2pool::v37n::EnrollmentBook* enrollment_book() const { return m_enroll; }
+
+    // Called with the BURIAL FRONTIER immediately before the harvest is taken,
+    // so the share-count producer can declare every interval's S before the
+    // fail-closed release rule withholds it. Wire it to
+    // DropsWiring::pre_harvest().
+    using PreHarvestFn = std::function<void(std::uint64_t bury_before)>;
+    void set_pre_harvest(PreHarvestFn f) { m_pre_harvest = std::move(f); }
+
+    // ★ RAIN-BACKFILL: the retained, chain-ordered harvest (XmrDropsWiring::
+    // attach_chain_order). Set => buried_harvest() composes from it instead of
+    // the destructive take_buried(). Never set with the flip at 0.
+    using HarvestRangeFn = std::function<std::vector<::c2pool::v37n::settle::HarvestedReceipt>(std::uint64_t won_height)>;
+    void set_harvest_range_fn(HarvestRangeFn f) { m_harvest_range = std::move(f); }
+
+    // ★ DROPS-R1: the (reward, SUM weight) pair at the cut this win settles.
+    using DropsPriceFn = std::function<::c2pool::v37n::settle::WorkPrice()>;
+    void set_drops_price_fn(DropsPriceFn f) { m_drops_price = std::move(f); }
+
+    // ★ ENROL-REPL: the carried delta for the win being booked (one-shot; see
+    // on_network_block_won). Wired by XmrDropsWiring::attach.
+    using DropsCarriedFn = std::function<std::optional<Amounts>()>;
+    void set_drops_carried_fn(DropsCarriedFn f) { m_drops_carried = std::move(f); }
+    std::uint64_t drops_booked_carried() const { return m_drops_booked_carried; }
+    // ★ DROPS-RESTART: the journalled booked delta by block id (a re-drive).
+    using DropsBookedFn = std::function<std::optional<Amounts>(const std::string& bid)>;
+    void set_drops_booked_fn(DropsBookedFn f) { m_drops_booked = std::move(f); }
+    std::uint64_t drops_booked_redrive() const { return m_drops_booked_redrive; }
+    std::uint64_t drops_booked_local() const { return m_drops_booked_local; }
+
+    // ★ ENROL-REPL: the WINNER's buried harvest, taken ONCE when it books its
+    // own win (the frontier won_height - D_conf, share-count declaration first),
+    // i.e. exactly the rows a local composition at that booking would consume.
+    std::vector<::c2pool::v37n::settle::HarvestedReceipt> take_buried_harvest(std::uint64_t won_height) {
+        return buried_harvest(won_height);
+    }
+
+    // How many harvest rows the last FOUND folded (diagnostic; 0 when detached).
+    std::size_t last_harvest_rows() const { return m_last_harvest_rows; }
+
+    // ★ DROPS diagnostic (never consensus): the delta the finalize driver just
+    // composed into this FOUND, re-derived by the SAME pure function it calls,
+    // plus the lowest credited interval per payee (the ex-ante witness: it must
+    // be >= that payee's effective_from). Only reachable with a harvester
+    // attached, i.e. only under the flip.
+    void log_drops_found(const FoundBlock& fb, std::uint64_t monero_height) {
+        const auto delta = fb.has_carried_drops ? fb.carried_drops
+                                                : ::c2pool::v37n::settle::subthreshold_credit(fb.params, fb.harvested, fb.drops);
+        long long sum = 0;
+        std::string rows;
+        auto hex_of_key = [](const ::v37::bytes32& b) {
+            static constexpr char kHex[] = "0123456789abcdef";
+            std::string h;
+            for (const auto x : b) { h.push_back(kHex[x >> 4]); h.push_back(kHex[x & 0x0f]); }
+            return h;
+        };
+        for (const auto& [k, v] : delta) {
+            sum += v;
+            std::uint64_t lo = ~0ull, eff = 0;
+            for (const auto& hr : fb.harvested)
+                if (hr.payee == k && fb.drops.enrolled(hr.payee, hr.interval) && hr.interval < lo) lo = hr.interval;
+            if (m_enroll) if (const auto* r = m_enroll->find(k)) eff = r->effective_from;
+            rows += " " + hex_of_key(k).substr(0, 12) + "=" + std::to_string(v) +
+                    "(min_iv=" + std::to_string(lo) + ",eff=" + std::to_string(eff) + ")";
+        }
+        log("drops: FOUND h=" + std::to_string(monero_height) + " bid=" + fb.bid.substr(0, 12) +
+            " harvest_rows=" + std::to_string(fb.harvested.size()) +
+            " price=" + (fb.drops.price.valid ? "valid" : "INVALID") +
+            " delta_payees=" + std::to_string(delta.size()) + " delta_sum=" + std::to_string(sum) + rows +
+            (m_drops_carried ? " src=" + std::string(fb.has_carried_drops ? "carried" : "local") +
+                               " booked_carried=" + std::to_string(m_drops_booked_carried) +
+                               " booked_local=" + std::to_string(m_drops_booked_local)
+                             : std::string()));
     }
 
     // ── accessors (for the smoke / a dashboard) ────────────────────────────
@@ -478,6 +794,28 @@ public:
     }
 
 private:
+    // ── ★ DROPS T3: the buried harvest for a win at Monero height H_b ──────
+    // F1: only intervals strictly BELOW the burial frontier may be shown to the
+    // estimator, and take_buried() consumes them so the same interval can never
+    // be folded into two blocks. The frontier is the same D_conf the finalize
+    // driver gates on. Identical to the BTC-family body (btc_node.hpp), because
+    // the F1 contract is the same contract.
+    std::vector<::c2pool::v37n::settle::HarvestedReceipt> buried_harvest(
+        std::uint64_t won_height) {
+        if (!m_drops) { m_last_harvest_rows = 0; return {}; }
+        if (m_harvest_range) {   // ★ RAIN-BACKFILL: consumption follows the chain, not the booking order
+            auto rows = m_harvest_range(won_height);
+            m_last_harvest_rows = rows.size();
+            return rows;
+        }
+        const std::uint64_t frontier =
+            won_height > m_cfg.d_conf ? won_height - m_cfg.d_conf : 0;
+        if (m_pre_harvest) m_pre_harvest(frontier);   // ★ declare S before release
+        auto rows = m_drops->take_buried(frontier);
+        m_last_harvest_rows = rows.size();
+        return rows;
+    }
+
     // Install the ed25519 point-check backend (which is ALSO what makes the P-1
     // XMR descriptor validator live: xmr_ref_valid() fails closed with no
     // backend). Under V37_XMR_HAVE_MONERO_CRYPTO the ref10 registrar TU has
@@ -497,7 +835,7 @@ private:
     // F2 node-side gate: never step onto h while a height <= h + D_conf has not
     // been driven through the booking observer yet (scan below it).
     bool gap_gate(std::uint64_t h) {
-        if (!m_gap_redrive || m_scan_h == 0) return true;
+        if ((!m_gap_redrive && !m_native_scan) || m_scan_h == 0) return true;
         if (h + m_cfg.d_conf <= m_scan_h) return true;
         ++m_gap.gate_holds;
         return false;
@@ -507,10 +845,12 @@ private:
     // Stops at the first header-fetch failure (scan stays below it). Returns the
     // number of heights delivered; m_scan_h advances to the last delivered one.
     std::size_t redrive_range(std::uint64_t lo, std::uint64_t hi) {
-        if (lo > hi || !m_adapter) return 0;
+        if (lo > hi || (!m_adapter && !m_native_scan)) return 0;
         ++m_gap.redrive_calls;
         const std::uint64_t cap = m_cfg.index_retain_recent ? static_cast<std::uint64_t>(m_cfg.index_retain_recent) : 720;
-        if (hi - lo + 1 > cap) {
+        // COLD-BOOT-2: the native re-drive is never truncated -- a row the index no
+        // longer holds stops it (the walk holds there, loudly) instead.
+        if (m_adapter && hi - lo + 1 > cap) {
             const std::uint64_t skip = (hi - lo + 1) - cap;
             ++m_gap.truncated; m_gap.truncated_heights += skip;
             log("gap-redrive ALARM: gap [" + std::to_string(lo) + ", " + std::to_string(hi) + "] is " +
@@ -522,15 +862,28 @@ private:
         }
         std::size_t n = 0;
         for (std::uint64_t h = lo; h <= hi; ++h) {
-            bool fetch_failed = false;
-            auto row = m_adapter->ensure_row(h, fetch_failed);
-            if (!row || is_zero_id(row->id)) {
-                ++m_gap.fetch_failed;
-                log("gap-redrive: header h=" + std::to_string(h) + (fetch_failed ? " fetch FAILED" : " absent") +
-                    " -> re-drive stops at " + std::to_string(h - 1) + " (retried next event/tick; the finalize walk holds)");
-                break;
+            std::string bid;
+            if (m_adapter) {
+                bool fetch_failed = false;
+                auto row = m_adapter->ensure_row(h, fetch_failed);
+                if (!row || is_zero_id(row->id)) {
+                    ++m_gap.fetch_failed;
+                    log("gap-redrive: header h=" + std::to_string(h) + (fetch_failed ? " fetch FAILED" : " absent") +
+                        " -> re-drive stops at " + std::to_string(h - 1) + " (retried next event/tick; the finalize walk holds)");
+                    break;
+                }
+                bid = hex_of(row->id);
+            } else {
+                const auto nb = m_native_row ? m_native_row(h) : std::nullopt;
+                if (!nb || nb->size() != 64) {
+                    ++m_gap.fetch_failed;
+                    if (m_gap.fetch_failed == 1 || m_gap.fetch_failed % 100 == 0)
+                        log("gap-redrive ALARM (native): row h=" + std::to_string(h) + " is not held by the native index"
+                            " -> re-drive stops at " + std::to_string(h - 1) + " (the finalize walk HOLDS there; never skipped)");
+                    break;
+                }
+                bid = *nb;
             }
-            const std::string bid = hex_of(row->id);
             if (m_cba_extend_observer) m_cba_extend_observer(h, bid);
             if (m_chain_observer) m_chain_observer(h, bid);
             m_scan_h = h; ++n; ++m_gap.redriven_heights;
@@ -569,7 +922,7 @@ private:
         // chain order is preserved), and track the scan height. Before the
         // consumer's observer is installed (bring_up's initial_sync) nothing is
         // delivered and the scan does not move: redrive_gap_to_tip() covers it.
-        if (m_gap_redrive && m_adapter && m_cba_extend_observer && ev.kind != K::Orphan) {
+        if (((m_gap_redrive && m_adapter) || m_native_scan) && m_cba_extend_observer && ev.kind != K::Orphan) {
             const std::uint64_t H = ev.block.height;
             if (m_scan_h != 0 && H > m_scan_h + 1) (void)redrive_range(m_scan_h + 1, H - 1);
         }
@@ -596,7 +949,13 @@ private:
             m_cba_extend_observer(ev.block.height, hex_of(ev.block.id));   //  book BEFORE the race book + BEFORE advance
             // scan moves only across a CONTIGUOUS delivery: a gap whose re-drive
             // stopped on a fetch failure keeps the scan (and so the gate) below it.
-            if (m_gap_redrive && (m_scan_h == 0 || ev.block.height <= m_scan_h + 1)) m_scan_h = ev.block.height;
+            if (m_native_scan) {
+                // COLD-BOOT-2: native -- an Extend at/below the scan is re-walk history
+                // (already delivered): the scan never moves DOWN on it; a Reorg re-sets it.
+                if (ev.block.height <= m_scan_h + 1 && (ev.kind == c2pool::xmr::node::MainchainEventKind::Reorg ||
+                                                        ev.block.height > m_scan_h))
+                    m_scan_h = ev.block.height;
+            } else if (m_gap_redrive && (m_scan_h == 0 || ev.block.height <= m_scan_h + 1)) m_scan_h = ev.block.height;
         }
         if (m_chain_observer) {
             if (ev.kind == K::Orphan) m_chain_observer(ev.block.height, hex_of(ev.orphaned_id));
@@ -624,7 +983,44 @@ private:
         }
     }
 
+    // RecoveryDriver replay + the canonical (digest, since) history (R-B(i)
+    // follow-up + R-C rework-3 D7): shared by bring_up and relineage.
+    RecoveredState replay_store(OwedLedger& ledger, std::vector<::v37::bytes32>& ds, std::vector<std::uint64_t>& ss,
+                                std::uint64_t& last_since, bool& ok) {
+        RecoveryDriver rec(*m_store, m_cfg.lane_chain);
+        ds.clear(); ss.clear();
+        ds.push_back(ledger.owed_digest());   // the empty anchor / anchor-boot state
+        ss.push_back(0);
+        // R-C rework-3 (D7): pair every replayed digest state with the coin
+        // height it became current at (Finalize: bin_height - D_conf; the
+        // formula XmrFinalizeDriver::since_of_bin applies live).
+        std::uint64_t since = 0;
+        RecoveredState st = rec.recover(ledger, ok, {}, [this, &since, &ds, &ss](const OwedLedger& l, const SettleEvent& e) {
+            if (e.kind == SettleEvKind::Finalize)
+                since = e.bin_height >= m_cfg.d_conf ? e.bin_height - m_cfg.d_conf : 0;
+            const ::v37::bytes32 d = l.owed_digest();
+            if (!(ds.back() == d)) {   // R-B(i) follow-up: canonical D(c) history
+                ds.push_back(d);
+                ss.push_back(since);
+            }
+        });
+        last_since = since;
+        return st;
+    }
+
     void log(const std::string& s) { m_log.push_back(s); }
+
+    // ★ DROPS T3 (XMR arm): all four detached by default — see the seams above.
+    ::c2pool::v37n::DropHarvester*         m_drops  = nullptr;
+    const ::c2pool::v37n::EnrollmentBook*  m_enroll = nullptr;
+    PreHarvestFn                           m_pre_harvest{};
+    DropsPriceFn                           m_drops_price{};
+    DropsCarriedFn                         m_drops_carried{};          // ENROL-REPL (unset at flip 0)
+    std::uint64_t                          m_drops_booked_carried = 0, m_drops_booked_local = 0;
+    DropsBookedFn                          m_drops_booked{};           // DROPS-RESTART (unset at flip 0)
+    std::uint64_t                          m_drops_booked_redrive = 0;
+    HarvestRangeFn                         m_harvest_range{};   // ★ RAIN-BACKFILL
+    std::size_t                            m_last_harvest_rows = 0;
 
     XmrNodeConfig                          m_cfg;
     c2pool::xmr::node::IMonerodTransport&  m_transport;
@@ -650,6 +1046,7 @@ private:
     RowLookupFn                            m_native_row;             // D2-0: best-chain block at h (p2p-first)
     std::optional<std::uint64_t>           m_reorg_lo;               // D2-0: lowest height vacated by this switch's Orphans
     std::uint64_t                          m_reorg_redelivered = 0;  // D2-0: re-applied heights delivered below a Reorg tip
+    std::uint64_t                          m_relineages = 0;         // D2: in-process lineage switches
     std::uint64_t                          m_tip_height = 0;
 
     // c2pool#1551: installed by the accounting layer (FinalizeConnect).
@@ -659,6 +1056,9 @@ private:
     // R-C rework-2
     XmrFinalizeDriver::BookingGateFn       m_consumer_gate;          // FinalizeConnect's R4/R6 gate
     bool                                   m_gap_redrive = false;    // F2 re-drive armed (daemon-first)
+    bool                                   m_native_scan = false;    // COLD-BOOT-2: the same scan gate, p2p-first
+    NativeTipFn                            m_native_tip;             // COLD-BOOT-2: the native index's best height
+    std::set<std::uint64_t>                m_native_unknown_logged;  // COLD-BOOT-2: trimmed-row alarms (once per height)
     std::uint64_t                          m_scan_h = 0;             // F2: highest height delivered to the extend observer (0 = unset)
     GapStats                               m_gap;
     std::uint64_t                          m_carry_unknown = 0;      // tri-state: Unknown answers given

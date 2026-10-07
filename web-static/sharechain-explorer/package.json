@@ -14,7 +14,7 @@
   "scripts": {
     "build": "node esbuild.config.mjs",
     "build:dev": "node esbuild.config.mjs --dev",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.typetests.json",
     "test": "node --import tsx --test \"tests/unit/*.test.ts\"",
     "manifest": "node scripts/emit-manifest.mjs",
     "size": "node scripts/check-bundle-size.mjs",

@@ -15,6 +15,18 @@ export interface NegotiateResult {
   apiVersion: string;  // semver per M1 D12 / delta v1 §F
 }
 
+/** Found-block marker lists carried at the top level of the
+ *  /sharechain/window and /sharechain/delta responses (issue #946).
+ *  Entries are 16-hex short-hashes of the shares that solved a block:
+ *  `blocks` for the parent chain (e.g. LTC), `doge_blocks` for a
+ *  merged-mined aux chain (e.g. DOGE). Both are optional; a node that
+ *  omits them marks nothing. The Transport ops below still return
+ *  `unknown` -- this is the wire shape the consumers narrow to. */
+export interface WireBlockMarkers {
+  blocks?: readonly string[];
+  doge_blocks?: readonly string[];
+}
+
 export interface RequestOptions {
   signal?: AbortSignal;
   /** Additional request headers, mergeable by middleware (e.g. auth). */

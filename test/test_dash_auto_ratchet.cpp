@@ -237,6 +237,36 @@ TEST(DashRatchetCrossing, PostCrossingRejectsLegacyAdmitsV36) {
     EXPECT_TRUE(3600u >= floor);        // v36 peer admitted
 }
 
+// PRIVATE/ISOLATED v36 SHARECHAIN floor (config_pool.hpp ShareProfile): advert
+// AND accept floor 3601, strictly above the public ratchet target, so a c2pool-dash
+// build without v36 isolated support (advert 3600) is refused at the handshake. The
+// pure decision treats it as latched (current >= target: returned unchanged, never
+// lowered to 3600), and the composed floor refuses 1700 and 3600 and admits 3601.
+// The public profile stays the master pair (cold 1700, advert 3600).
+TEST(DashRatchetCrossing, IsolatedFloorAboveTargetLatchedRefuses3600) {
+    const auto& iso = dash::SharechainConfig::ISOLATED_V36_PROFILE;
+    const auto& pub = dash::SharechainConfig::PUBLIC_PROFILE;
+    EXPECT_EQ(iso.ratchet_floor_protocol_version, 3601u);
+    EXPECT_EQ(iso.advertised_protocol_version, iso.ratchet_floor_protocol_version);
+    EXPECT_GT(iso.ratchet_floor_protocol_version, TARGET);
+    EXPECT_GT(iso.advertised_protocol_version, dash::SharechainConfig::ADVERTISED_PROTOCOL_VERSION);
+    EXPECT_EQ(pub.ratchet_floor_protocol_version, COLD);
+    EXPECT_EQ(pub.advertised_protocol_version, TARGET);
+    EXPECT_EQ(dash::SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION, TARGET);  // public target untouched
+
+    const uint32_t seed = iso.ratchet_floor_protocol_version;
+    auto all_v36 = std::map<uint64_t, uint288>{{36, u(100)}};
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v36, 36, seed, TARGET), seed);
+    EXPECT_EQ(dash::ratchet_min_protocol_version(all_v36, 36, seed, TARGET), seed);
+
+    dash::MinProtocolGate gate;  // default operator knob = 1700 cannot lower it
+    const uint32_t floor = effective_floor(gate.min_version, seed);
+    EXPECT_EQ(floor, seed);
+    EXPECT_FALSE(1700u >= floor);   // p2pool-dash refused
+    EXPECT_FALSE(3600u >= floor);   // build without v36 isolated support refused
+    EXPECT_TRUE(3601u >= floor);    // this build admitted
+}
+
 // SAFETY GUARD RATIONALE (DASH divergence from dgb): DASH has no v36 share TYPE, so
 // the node keys the ratchet on the best share's m_desired_version VOTE and guards
 // best_desired >= 36. This test proves the guard is NECESSARY: on a fully-agreed

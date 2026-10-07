@@ -202,7 +202,11 @@ public:
     bool on_block_connected(const BlockTxEvent& ev) {
         if (ev.kind != BlockTxEvent::Kind::Connected) return false;
         std::lock_guard<std::mutex> lk(mu_);
+        return connect_locked_(ev);
+    }
 
+private:
+    bool connect_locked_(const BlockTxEvent& ev) {
         // Materialise this block's outputs in global order: v2 coinbase outputs
         // (commitment = zeroCommit(public amount)) first, then the non-coinbase
         // records already carrying their outPk commitments.
@@ -280,12 +284,17 @@ public:
             // set semantics the heap table had), so a disconnect never erases it.
             if (!snap_has_ki_(ki) && spent_.insert(ki).second)
                 f.key_image_list.push_back(ki);
+            else
+                f.key_images_skipped.push_back(ki);   // kept only so the overlay can
+                                                      // re-derive this block's KI leaf
         }
         tip_height_ = ev.height;
         tip_id_     = ev.block_id;
         undo_.push_back(std::move(f));
         return true;
     }
+
+public:
 
     // Roll back the most-recent connected block: restore both peak sets bit-
     // exact, truncate both leaf logs, pop the outputs, erase the key images.
@@ -569,8 +578,248 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return snap_.ns_distinct;
     }
+    bool has_anchor_snapshot() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return snap_.bytes != nullptr;
+    }
+    std::uint64_t tip_height() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return tip_height_;
+    }
+    Hash tip_id() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return tip_id_;
+    }
+    // How many post-anchor blocks the overlay holds (one undo frame each).
+    std::size_t overlay_block_count() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return undo_.size();
+    }
+
+    // --- post-anchor OVERLAY persistence (restart resume) -------------------
+    // The anchor snapshot is immutable and stays exactly where it is (the
+    // read-only --output-set file). What a restart loses is only the overlay the
+    // chain added on top of it: the post-anchor outputs, the post-anchor spent
+    // key images, one leaf per block in each log and the per-block undo frames.
+    // serialize_overlay() writes exactly that, per connected block in chain
+    // order, BOUND to the snapshot it sits on (base, snapshot frontier, both
+    // snapshot leaf counts and roots, snapshot tip) and closed by the final
+    // tip / frontier / leaf counts / roots and a sha256d over the whole blob.
+    //
+    // load_overlay() does not trust any stored leaf, peak or table: it REPLAYS
+    // every block through the same connect path a live block takes, so the
+    // leaves, peaks, spent overlay and undo frames are re-derived, and then
+    // requires the re-derived tip, frontier, counts and roots to equal the
+    // ones recorded at save time. Any mismatch -- digest, binding, truncation,
+    // height gap, a replay the connect path refuses, a root that differs --
+    // rolls the set back to the bare anchor snapshot and returns false, so the
+    // caller can fall back to the from-anchor re-walk. Consensus answers are
+    // unchanged: after a successful load the set is bit-identical (roots,
+    // counts, resolve, is_spent, reorg frames) to the one that was saved.
+    static constexpr std::uint64_t OVERLAY_MAGIC = 0x31594C564F583243ull;   // "C2XOVLY1"
+    static constexpr std::uint64_t OVERLAY_VER   = 1;
+
+    bool serialize_overlay(std::vector<std::uint8_t>& out, std::string& why) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        out.clear();
+        if (!snap_.bytes) { why = "no anchor snapshot is seeded; there is no overlay to persist"; return false; }
+        const std::size_t so = static_cast<std::size_t>(snap_.out_peaks.leaf_count);
+        const std::size_t sk = static_cast<std::size_t>(snap_.ki_peaks.leaf_count);
+        if (out_leaves_.size() != so + undo_.size() || ki_leaves_.size() != sk + undo_.size()
+            || out_leaf_first_.size() != out_leaves_.size()) {
+            why = "overlay undo frames disagree with the leaf logs";
+            return false;
+        }
+        std::vector<std::uint8_t> p;
+        p.reserve(256 + outputs_.size() * OUT_ROW + spent_.size() * 32 + undo_.size() * 80);
+        put_u64(p, OVERLAY_MAGIC);
+        put_u64(p, OVERLAY_VER);
+        put_u64(p, base_);
+        put_u64(p, snap_.n);
+        put_u64(p, snap_.out_peaks.leaf_count);
+        put_h32_(p, ::v37::Lane::mmr_bag(snap_.out_peaks.peaks));
+        put_u64(p, snap_.ki_peaks.leaf_count);
+        put_h32_(p, ::v37::Lane::mmr_bag(snap_.ki_peaks.peaks));
+        put_u64(p, snap_.tip_height);
+        put_h32_(p, snap_.tip_id);
+        put_u64(p, tip_height_);
+        put_h32_(p, tip_id_);
+        put_u64(p, base_ + total_outputs_());
+        put_u64(p, out_peaks_.leaf_count);
+        put_h32_(p, ::v37::Lane::mmr_bag(out_peaks_.peaks));
+        put_u64(p, ki_peaks_.leaf_count);
+        put_h32_(p, ::v37::Lane::mmr_bag(ki_peaks_.peaks));
+        put_u64(p, undo_.size());
+        std::size_t oi = 0;
+        for (std::size_t k = 0; k < undo_.size(); ++k) {
+            const UndoFrame& f = undo_[k];
+            put_u64(p, f.height);
+            put_h32_(p, f.block_id);
+            put_u64(p, out_leaf_first_[so + k]);
+            put_u64(p, f.outputs_added);
+            if (f.outputs_added > outputs_.size() - oi) { why = "overlay frames overrun the output table"; return false; }
+            for (std::size_t i = 0; i < f.outputs_added; ++i, ++oi) {
+                const OutputRecord& o = outputs_[oi];
+                p.insert(p.end(), o.pubkey.begin(), o.pubkey.end());
+                p.insert(p.end(), o.commitment.begin(), o.commitment.end());
+                put_u64(p, o.unlock_time);
+                put_u64(p, o.height);
+            }
+            put_u64(p, f.key_image_list.size());
+            for (const Hash& ki : f.key_image_list) p.insert(p.end(), ki.begin(), ki.end());
+            put_u64(p, f.key_images_skipped.size());
+            for (const Hash& ki : f.key_images_skipped) p.insert(p.end(), ki.begin(), ki.end());
+        }
+        if (oi != outputs_.size()) { why = "overlay output table is longer than its frames"; return false; }
+        const bytes32 d = ::v37::sha256d(p);
+        p.insert(p.end(), d.begin(), d.end());
+        out = std::move(p);
+        why.clear();
+        return true;
+    }
+
+    bool load_overlay(const std::vector<std::uint8_t>& blob, std::string& why) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!snap_.bytes) { why = "no anchor snapshot is seeded to lay the overlay over"; return false; }
+        if (!undo_.empty() || !outputs_.empty() || !spent_.empty()
+            || out_peaks_.leaf_count != snap_.out_peaks.leaf_count
+            || ki_peaks_.leaf_count != snap_.ki_peaks.leaf_count
+            || tip_height_ != snap_.tip_height || tip_id_ != snap_.tip_id) {
+            why = "output set has already advanced past its anchor snapshot";
+            return false;
+        }
+        const bool ok = load_overlay_locked_(blob, why);
+        if (!ok) rollback_to_snapshot_locked_();
+        return ok;
+    }
+
+    // Drop every post-anchor block and return to the bare anchor snapshot (the
+    // state seed_from_snapshot*() left). A caller that loaded an overlay and
+    // then could not use it (the chain image it belongs to was refused) calls
+    // this before falling back to the from-anchor re-walk.
+    bool drop_overlay() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!snap_.bytes) return false;
+        rollback_to_snapshot_locked_();
+        return true;
+    }
 
 private:
+    static void put_h32_(std::vector<std::uint8_t>& s, const bytes32& h) {
+        s.insert(s.end(), h.begin(), h.end());
+    }
+
+    void rollback_to_snapshot_locked_() {
+        std::vector<OutputRecord>().swap(outputs_);
+        spent_.clear();
+        undo_.clear();
+        out_leaves_.resize(static_cast<std::size_t>(snap_.out_peaks.leaf_count));
+        out_leaf_first_.resize(static_cast<std::size_t>(snap_.out_peaks.leaf_count));
+        ki_leaves_.resize(static_cast<std::size_t>(snap_.ki_peaks.leaf_count));
+        out_peaks_  = snap_.out_peaks;
+        ki_peaks_   = snap_.ki_peaks;
+        tip_height_ = snap_.tip_height;
+        tip_id_     = snap_.tip_id;
+    }
+
+    bool load_overlay_locked_(const std::vector<std::uint8_t>& blob, std::string& why) {
+        if (blob.size() < 32) { why = "overlay is truncated (shorter than its digest)"; return false; }
+        const std::size_t len = blob.size() - 32;
+        const std::uint8_t* d = blob.data();
+        {
+            const bytes32 dg = ::v37::sha256d(d, len);
+            if (std::memcmp(dg.data(), d + len, 32) != 0) {
+                why = "overlay digest does not match its contents (truncated or corrupt)";
+                return false;
+            }
+        }
+        std::size_t o = 0;
+        bool bad = false;
+        auto u64 = [&]() -> std::uint64_t {
+            if (bad || len - o < 8) { bad = true; return 0; }
+            const std::uint64_t x = rd_u64_(d + o); o += 8; return x;
+        };
+        auto h32 = [&]() -> bytes32 {
+            bytes32 h{};
+            if (bad || len - o < 32) { bad = true; return h; }
+            std::memcpy(h.data(), d + o, 32); o += 32; return h;
+        };
+        if (u64() != OVERLAY_MAGIC) { why = "overlay magic is wrong"; return false; }
+        if (u64() != OVERLAY_VER)   { why = "overlay version is not one this build writes"; return false; }
+        const std::uint64_t base = u64(), sn = u64();
+        const std::uint64_t sol = u64(); const bytes32 sor = h32();
+        const std::uint64_t skl = u64(); const bytes32 skr = h32();
+        const std::uint64_t sth = u64(); const bytes32 sti = h32();
+        const std::uint64_t th  = u64(); const bytes32 ti  = h32();
+        const std::uint64_t fr  = u64();
+        const std::uint64_t ol  = u64(); const bytes32 orr = h32();
+        const std::uint64_t kl  = u64(); const bytes32 krr = h32();
+        const std::uint64_t nb  = u64();
+        if (bad) { why = "overlay header is truncated"; return false; }
+        if (base != base_ || sn != snap_.n
+            || sol != snap_.out_peaks.leaf_count || sor != ::v37::Lane::mmr_bag(snap_.out_peaks.peaks)
+            || skl != snap_.ki_peaks.leaf_count || skr != ::v37::Lane::mmr_bag(snap_.ki_peaks.peaks)
+            || sth != snap_.tip_height || sti != snap_.tip_id) {
+            why = "overlay is bound to a different anchor snapshot than the one seeded";
+            return false;
+        }
+        if (nb != th - sth || th < sth) {
+            why = "overlay block count disagrees with its tip height";
+            return false;
+        }
+        std::uint64_t expect_h = sth + 1;
+        for (std::uint64_t k = 0; k < nb; ++k, ++expect_h) {
+            BlockTxEvent ev;
+            ev.kind               = BlockTxEvent::Kind::Connected;
+            ev.height             = u64();
+            ev.block_id           = h32();
+            ev.first_output_index = u64();
+            const std::uint64_t no = u64();
+            if (bad || no > (len - o) / OUT_ROW) { why = "overlay block " + std::to_string(k) + " is truncated"; return false; }
+            ev.outputs.reserve(static_cast<std::size_t>(no));
+            for (std::uint64_t i = 0; i < no; ++i, o += OUT_ROW) ev.outputs.push_back(decode_row_(d + o));
+            const std::uint64_t ni = u64();
+            if (bad || ni > (len - o) / 32) { why = "overlay block " + std::to_string(k) + " is truncated"; return false; }
+            ev.key_images.reserve(static_cast<std::size_t>(ni));
+            for (std::uint64_t i = 0; i < ni; ++i) ev.key_images.push_back(h32());
+            const std::uint64_t ns = u64();
+            if (bad || ns > (len - o) / 32) { why = "overlay block " + std::to_string(k) + " is truncated"; return false; }
+            for (std::uint64_t i = 0; i < ns; ++i) ev.key_images.push_back(h32());
+            if (bad) { why = "overlay block " + std::to_string(k) + " is truncated"; return false; }
+            if (ev.height != expect_h) {
+                why = "overlay block " + std::to_string(k) + " sits at height " + std::to_string(ev.height)
+                    + ", expected " + std::to_string(expect_h);
+                return false;
+            }
+            // Re-derive through the live connect path (leaves, peaks, spent
+            // overlay, undo frame). The replay must split the key images into
+            // inserted / already-spent exactly as the saving node did.
+            if (!connect_locked_(ev)) {
+                why = "overlay block at height " + std::to_string(ev.height) + " does not connect";
+                return false;
+            }
+            const UndoFrame& f = undo_.back();
+            if (f.key_image_list.size() != ni || f.key_images_skipped.size() != ns) {
+                why = "overlay block at height " + std::to_string(ev.height)
+                    + " re-derives a different spent set";
+                return false;
+            }
+        }
+        if (o != len) { why = "overlay carries trailing bytes"; return false; }
+        if (tip_height_ != th || tip_id_ != ti) { why = "overlay re-derived tip differs from its recorded tip"; return false; }
+        if (base_ + total_outputs_() != fr) { why = "overlay re-derived frontier differs from its recorded frontier"; return false; }
+        if (out_peaks_.leaf_count != ol || ::v37::Lane::mmr_bag(out_peaks_.peaks) != orr) {
+            why = "overlay re-derived output root differs from its recorded root";
+            return false;
+        }
+        if (ki_peaks_.leaf_count != kl || ::v37::Lane::mmr_bag(ki_peaks_.peaks) != krr) {
+            why = "overlay re-derived spent root differs from its recorded root";
+            return false;
+        }
+        why.clear();
+        return true;
+    }
+
     // One flat output row of the serialize() form: pubkey|commitment|unlock|height.
     static constexpr std::size_t OUT_ROW = 32 + 32 + 8 + 8;
 
@@ -590,6 +839,12 @@ private:
         std::vector<std::uint32_t> ki_order;
         std::vector<std::uint32_t> ki_dir;
         unsigned                   dir_bits    = 0;
+        // The authenticated state AT the snapshot (the overlay binds to it and
+        // a rollback returns to it): both peak sets and the snapshot's tip.
+        ::v37::PeakSet             out_peaks;
+        ::v37::PeakSet             ki_peaks;
+        std::uint64_t              tip_height  = 0;
+        Hash                       tip_id{};
     };
 
     // The serialize() form, located in place (no table copied). Leaves are
@@ -809,7 +1064,11 @@ private:
             (void)::madvise(page_floor_(bytes.get()), page_span_(bytes.get(), len), MADV_RANDOM);
         }
 #endif
-        sp.bytes = std::move(bytes);
+        sp.bytes      = std::move(bytes);
+        sp.out_peaks  = t.out_peaks;
+        sp.ki_peaks   = t.ki_peaks;
+        sp.tip_height = t.tip_height;
+        sp.tip_id     = t.tip_id;
 
         // Adopt the re-derived, root-checked state. The numbering base becomes
         // the snapshot's (0 on a from-genesis walk), so below-base offsets now
@@ -845,6 +1104,7 @@ private:
         Hash              block_id{};
         std::size_t       outputs_added   = 0;
         std::vector<Hash> key_image_list;      // only those actually inserted
+        std::vector<Hash> key_images_skipped;  // listed but already spent (overlay replay)
         ::v37::PeakSet    out_peaks_before;     // bit-exact reorg restore
         ::v37::PeakSet    ki_peaks_before;
         std::uint64_t     prev_tip_height = 0;

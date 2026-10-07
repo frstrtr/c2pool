@@ -224,8 +224,12 @@ struct StratumDialect {
     static std::string encode_target(std::uint64_t target);
 
     // responses (byte-for-byte the xmrig/p2pool dialect) --------------------
+    // `extra_result`: an optional JSON member list (no braces) spliced into the
+    // login reply's `result` object after `job` -- the node's fee disclosure
+    // (`"c2pool":{...}`). Empty => the reply is byte-for-byte the dialect's.
     static std::string build_login_ok(std::uint32_t req_id, std::uint32_t rpc_id,
-                                       const JobNotify& job);
+                                       const JobNotify& job,
+                                       std::string_view extra_result = {});
     static std::string build_job_notify(const JobNotify& job);
     static std::string build_status_ok(std::uint32_t req_id);       // submit accepted
     static std::string build_error(std::uint32_t req_id, std::string_view message);
@@ -289,6 +293,16 @@ public:
     // server is byte-identical to before. Call before serving.
     using JobBinder = std::function<void(std::uint32_t extra_nonce, const std::string& address)>;
     void set_job_binder(JobBinder f) { m_job_binder = std::move(f); }
+    // FEE DISCLOSURE: JSON members added to every login reply's `result` (the
+    // fee model, give-author and node-owner fee this node applies), so a miner
+    // learns the node's fees from the protocol before it mines. Call before
+    // serving. Empty (default) => no extra member.
+    void set_login_extra(std::string json_members) { m_login_extra = std::move(json_members); }
+    // MINIMUM DIFFICULTY: a miner's "+diff" request below difficulty `d` is
+    // raised to `d`; the lane's own target (TemplateJob::lane_target) is never
+    // made harder. 0 (default) = no floor. Call before serving.
+    void set_min_difficulty(std::uint64_t d) { m_min_difficulty = d; }
+    std::uint64_t min_difficulty() const { return m_min_difficulty; }
 
 private:
     // Fill a JobNotify from a TemplateJob + a session's job bookkeeping.
@@ -300,6 +314,8 @@ private:
     ITransport& m_transport;
     std::atomic<std::uint32_t> m_extraNonce{0};
     JobBinder m_job_binder;   // SEAM-1 (unset = none)
+    std::string m_login_extra;   // FEE DISCLOSURE (empty = none)
+    std::uint64_t m_min_difficulty = 0;   // MINIMUM DIFFICULTY (0 = none)
 };
 
 } // namespace stratum

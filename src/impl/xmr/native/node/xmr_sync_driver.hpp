@@ -72,6 +72,10 @@
 #include "impl/xmr/native/contracts/serving.hpp"
 #include "impl/xmr/native/contracts/types.hpp"
 
+// Feature marker: FORK-FUSE-3's per-peer back-off (SyncDriver's `unproductive`
+// predicate) exists (the fork-fuse KAT builds against trees without it).
+#define C2POOL_XMR_SYNC_UNPRODUCTIVE_BACKOFF 1
+
 namespace c2pool::xmr::native::rt {
 
 struct SyncDriverConfig {
@@ -114,6 +118,24 @@ struct SyncDriverConfig {
     // chain entry costs the daemon a walk of its own id index, while a
     // GET_OBJECTS span costs it disk and bandwidth it is using to sync.
     bool          probe_only               = false;
+
+    // FORK-FUSE-3: the back-off for a peer whose blocks we cannot use. The
+    // unknown-fork fuse keeps a peer that sends above-version blocks connected
+    // and unpenalised (an upgraded honest peer sends exactly those). But such a
+    // peer, lying or not, advertises a chain we cannot follow, and while it
+    // claimed the heaviest one the driver asked it for that chain on EVERY
+    // tick its answer came back (1878 REQUEST_CHAIN in one 25 min regtest run)
+    // and sent it every want-list batch -- which it answered with `missed`, so
+    // an honest parent was re-asked of it every refetch_reask_ms and never of
+    // the honest peers that hold it (node A up to 11 blocks behind). A flagged
+    // peer (the `unproductive` predicate) is therefore never the target of a
+    // want-list batch while an unflagged peer exists, and is asked for its
+    // chain only when its back-off has run out: the first ask waits nothing,
+    // each ask doubles the wait from backoff_min_ms up to backoff_max_ms, and
+    // the back-off resets as soon as the predicate clears (the peer served a
+    // v16 block that connected).
+    std::uint64_t unproductive_backoff_min_ms = 5'000;
+    std::uint64_t unproductive_backoff_max_ms = 300'000;
 };
 
 class SyncDriver {
@@ -130,6 +152,12 @@ public:
         std::uint64_t our_height       = 0;
         std::uint64_t best_peer_height = 0;
         std::string   target;            // the peer key we are asking, "" = none
+        // FORK-FUSE-3: chain requests sent to a flagged (unproductive) peer,
+        // ticks on which a flagged peer was passed over for the chain ask
+        // because its back-off was running, and the flagged peers last tick.
+        std::uint64_t chain_requests_unproductive = 0;
+        std::uint64_t unproductive_backoff_skips  = 0;
+        std::size_t   unproductive_peers          = 0;
     };
 
     // `booted` is a predicate rather than a flag so the driver never caches the
@@ -139,11 +167,16 @@ public:
     // make this file untestable against the W0 fakes.
     using BootedFn  = std::function<bool()>;
     using RefetchFn = std::function<std::vector<Hash>()>;
+    // FORK-FUSE-3: true for a peer whose blocks we cannot use (it sent an
+    // above-version block and has not since served a v16 block that
+    // connected). {} = no peer is ever flagged (the pre-FORK-FUSE-3 driver).
+    using PeerFlagFn = std::function<bool(const PeerRef&)>;
 
     SyncDriver(IChainFetcher& fetcher, IChainServing& serving, IChainView& view,
                Hash genesis_id, BootedFn booted, RefetchFn refetch,
                RefetchFn bodies = {},
-               SyncDriverConfig cfg = {})
+               SyncDriverConfig cfg = {},
+               PeerFlagFn unproductive = {})
         : fetcher_(fetcher),
           serving_(serving),
           view_(view),
@@ -151,6 +184,7 @@ public:
           booted_(std::move(booted)),
           refetch_(std::move(refetch)),
           bodies_(std::move(bodies)),
+          unproductive_(std::move(unproductive)),
           cfg_(cfg) {}
 
     // One pass. MUST be called on the verify thread: it reads the index and
@@ -167,10 +201,28 @@ public:
         }
 
         // --- who -------------------------------------------------------------
-        std::size_t best = 0;
-        for (std::size_t i = 1; i < peers.size(); ++i) {
-            if (u128_less(peers[best].second.cumulative_difficulty,
-                          peers[i].second.cumulative_difficulty))
+        // FORK-FUSE-3: a flagged peer is the best peer only when every peer is
+        // flagged; its claim of the heaviest chain buys it nothing we can use.
+        std::vector<bool> flagged(peers.size(), false);
+        std::size_t       n_flagged = 0;
+        if (unproductive_) {
+            for (std::size_t i = 0; i < peers.size(); ++i)
+                if ((flagged[i] = unproductive_(peers[i].first))) ++n_flagged;
+            // The back-off resets when the flag clears (a v16 block from that
+            // peer connected). It survives a reconnect: a flagged peer that
+            // drops and redials does not start again from backoff_min_ms.
+            for (std::size_t i = 0; i < peers.size(); ++i)
+                if (!flagged[i]) backoff_.erase(peers[i].first.addr);
+            if (backoff_.size() > 1024) backoff_.clear();
+        }
+        stats_.unproductive_peers = n_flagged;
+        const bool  all_flagged = n_flagged == peers.size();
+        std::size_t best = peers.size();
+        for (std::size_t i = 0; i < peers.size(); ++i) {
+            if (flagged[i] && !all_flagged) continue;
+            if (best == peers.size()
+                || u128_less(peers[best].second.cumulative_difficulty,
+                             peers[i].second.cumulative_difficulty))
                 best = i;
         }
         const PeerRef&      peer = peers[best].first;
@@ -239,7 +291,7 @@ public:
             std::vector<Hash> ask;
             auto flush = [&]() {
                 if (ask.empty()) return;
-                if (!ask_objects_(peers, best, st.header_frontier, ask)) {
+                if (!ask_objects_(peers, flagged, best, st.header_frontier, ask)) {
                     refused = true;
                     ++stats_.refetch_refused;
                 } else {
@@ -309,16 +361,33 @@ public:
         // --- the chain ask ---------------------------------------------------
         // `current_height` is monerod's own spelling: one PAST the peer's tip.
         // So "the peer is ahead of us" is current_height > our_tip + 1.
-        if (sync.current_height <= st.header_frontier + 1) {
+        // FORK-FUSE-3: the chain target is the heaviest claim among the
+        // unflagged peers and the flagged peers whose back-off has run out. A
+        // flagged peer passed over here is the storm that did not happen.
+        std::size_t ci = peers.size();
+        bool        skipped = false;
+        for (std::size_t i = 0; i < peers.size(); ++i) {
+            if (flagged[i] && !backoff_ready_(peers[i].first.addr, now_ms)) {
+                if (peers[i].second.current_height > st.header_frontier + 1) skipped = true;
+                continue;
+            }
+            if (ci == peers.size()
+                || u128_less(peers[ci].second.cumulative_difficulty,
+                             peers[i].second.cumulative_difficulty))
+                ci = i;
+        }
+        if (skipped) ++stats_.unproductive_backoff_skips;
+        if (ci == peers.size() || peers[ci].second.current_height <= st.header_frontier + 1) {
             in_flight_ = false;
             return;
         }
+        const PeerRef& cpeer = peers[ci].first;
         if (in_flight_) {
             if (now_ms - sent_at_ms_ < cfg_.chain_request_timeout_ms) return;
             ++stats_.chain_timeouts;
             // Re-ask somebody else where there is somebody else: a peer that
             // answered nothing twice is not going to answer the third time.
-            avoid_ = peer.addr;
+            avoid_ = cpeer.addr;
         } else if (chain_asked_ && !want.empty()
                    && now_ms - last_progress_ms_ < cfg_.chain_request_timeout_ms) {
             // The last entry's want list is still being worked through and it
@@ -328,12 +397,16 @@ public:
             return;
         }
 
-        const PeerRef* ask = &peer;
-        if (!avoid_.empty() && peer.addr == avoid_) {
-            for (const auto& [ref, sd] : peers) {
+        const PeerRef* ask = &cpeer;
+        bool           ask_flagged = flagged[ci];
+        if (!avoid_.empty() && cpeer.addr == avoid_) {
+            for (std::size_t i = 0; i < peers.size(); ++i) {
+                const auto& [ref, sd] = peers[i];
                 if (ref.addr == avoid_) continue;
                 if (sd.current_height <= st.header_frontier + 1) continue;
-                ask = &ref;
+                if (flagged[i] && !backoff_ready_(ref.addr, now_ms)) continue;
+                ask         = &ref;
+                ask_flagged = flagged[i];
                 break;
             }
         }
@@ -348,6 +421,14 @@ public:
         if (in_flight_) {
             ++stats_.chain_requests;
             stats_.target = ask->addr;
+            if (ask_flagged) {
+                // FORK-FUSE-3: each ask of a flagged peer doubles its wait.
+                ++stats_.chain_requests_unproductive;
+                Backoff& b = backoff_[ask->addr];
+                b.wait_ms  = b.wait_ms == 0 ? cfg_.unproductive_backoff_min_ms
+                                            : std::min(b.wait_ms * 2, cfg_.unproductive_backoff_max_ms);
+                b.next_ms  = now_ms + b.wait_ms;
+            }
         }
     }
 
@@ -357,15 +438,25 @@ private:
     // One batch, to the first peer with a span slot for it: the chosen best
     // peer, then every other peer at least level with us. False when none
     // accepted (the fetcher refuses a span over its D-3 caps).
+    // FORK-FUSE-3: a flagged peer is tried only when the chosen best peer is
+    // itself flagged (every peer is).
     bool ask_objects_(const std::vector<std::pair<PeerRef, PeerSyncData>>& peers,
+                      const std::vector<bool>& flagged,
                       std::size_t best, std::uint64_t our_height,
                       const std::vector<Hash>& ids) {
         if (fetcher_.request_objects(peers[best].first, ids, /*prune=*/true)) return true;
         for (std::size_t i = 0; i < peers.size(); ++i) {
             if (i == best || peers[i].second.current_height < our_height + 1) continue;
+            if (flagged[i] && !flagged[best]) continue;
             if (fetcher_.request_objects(peers[i].first, ids, /*prune=*/true)) return true;
         }
         return false;
+    }
+
+    // FORK-FUSE-3: may a flagged peer be asked for its chain now?
+    bool backoff_ready_(const std::string& addr, std::uint64_t now_ms) const {
+        const auto it = backoff_.find(addr);
+        return it == backoff_.end() || now_ms >= it->second.next_ms;
     }
 
     IChainFetcher& fetcher_;
@@ -375,7 +466,13 @@ private:
     BootedFn       booted_;
     RefetchFn      refetch_;
     RefetchFn      bodies_;      // #1680: bodiless fluffy parks; {} disables the fallback
+    PeerFlagFn     unproductive_;   // FORK-FUSE-3: {} flags no peer
     SyncDriverConfig cfg_;
+
+    // FORK-FUSE-3: per flagged peer (by address), the current wait and when
+    // it may next be asked for its chain.
+    struct Backoff { std::uint64_t wait_ms = 0; std::uint64_t next_ms = 0; };
+    std::map<std::string, Backoff> backoff_;
 
     std::map<std::string, std::uint64_t> asked_;   // refetch id -> when we last asked
     std::map<std::string, std::uint64_t> bodies_seen_;  // #1680: park id -> when first noticed / last re-asked

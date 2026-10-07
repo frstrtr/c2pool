@@ -165,6 +165,31 @@ struct XmrSettlementConfig {
     // recon(A+B credit): where the template reads the receipt-lane cut it commits
     // on-chain (P, spine_digest) — the node's engine snapshot. Unset => no tail.
     std::function<bool(std::uint64_t& next_pos, ::v37::bytes32& spine)> credit_cut_source;
+    // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): the projected lane payees at the
+    // committed cut (P, spine) -- settle::project of the SAME view fold_eb
+    // books at. Unset / false => no pay-now (master's residual behaviour).
+    std::function<bool(std::uint64_t next_pos, const ::v37::bytes32& spine,
+                       std::vector<::c2pool::v37n::settle::WeightedPayee>& out)> paynow_source;
+    // EMPTY-CUT FINDER (operator ruling 09-26): the payee this node's templates
+    // pay when paynow_source finds the view at the cut but no payee in it (the
+    // node's own payee). Unset => an empty cut keeps master's residual shape.
+    std::optional<::v37::ScriptRef> ecut_finder;
+
+    // SALTED TIE-BREAK (#1867): order equal-age K_fair cohorts by a hash of
+    // the parent block id instead of the raw identity (builder policy).
+    bool kfair_salted_ties = false;
+    // SPEND-COST FLOOR (payout-threshold.md §2-§3).
+    bool spend_floor = false;
+    // REWARD TOTAL: the template commits "V37R" || total first in the 0x02 tail,
+    // so a share's receipt can be checked against the canonical coinbase.
+    bool commit_total = false;
+    // THE DRAIN RULE (lane-rules fields 23-25; settlement-drain.md). Off
+    // (0/0/0) => master's coinbase bytes; the daemon sets the network's triple.
+    DrainRule drain{};
+
+    // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
+    // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
+    std::optional<::v37::bytes32> pool_tag;
 
     // ---- sink constructors (payout-target bytes, never address strings) ----
     // Set the sink from raw 32-byte key material; also fills residual_sink_identity.
@@ -312,8 +337,32 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.fixed                  = cfg.fixed;
     ctx.h_min                  = cfg.h_min;
     ctx.output_cap             = cfg.resolved_output_cap();
+    ctx.kfair_salted_ties      = cfg.kfair_salted_ties;
+    ctx.spend_floor            = cfg.spend_floor;
+    ctx.drain                  = cfg.drain;   // THE DRAIN RULE
     if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
         ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
+    if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
+    if (ledger.rules().anchor_cut) {
+        // ANCHOR (ruling A 2026-09-29): pay-now pays the payees of the view at the
+        // ledger's anchor (the cut of the latest lane block finalized into it);
+        // no anchor yet = nobody (the empty-cut finder rule). The view must be
+        // readable, or the template is not built: a coinbase without its pay-now
+        // would not be the canonical one every node rebuilds.
+        if (ctx.has_credit_cut) {
+            if (const auto a = ledger.anchor_cut()) {
+                if (!cfg.paynow_source || !cfg.paynow_source(a->next_pos, a->spine, ctx.paynow_payees))
+                    return no("anchor-pending: the view at the ledger's anchor cut P=" + std::to_string(a->next_pos) +
+                              " is not readable here yet (the template waits for it)");
+            } else {
+                ctx.paynow_payees.clear();
+            }
+            ctx.has_paynow = true;
+        }
+    } else if (ctx.has_credit_cut && cfg.paynow_source) {   // SAME-BLOCK PAY-NOW: E_b weights at that cut
+        ctx.has_paynow = cfg.paynow_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest, ctx.paynow_payees);
+    }
+    if (ctx.has_paynow && ctx.paynow_payees.empty()) ctx.ecut_finder = cfg.ecut_finder;   // EMPTY-CUT FINDER
     if (why) why->clear();
     return ctx;
 }
@@ -384,8 +433,40 @@ public:
     explicit XmrOwedFixture(::v37::ChainId chain) : m_ledger(chain) {}
     //  wrap the NODE's live OwedLedger (FOUND/FINALIZE/ORPHAN land there).
     explicit XmrOwedFixture(OwedLedger& ext) : m_ledger(ext.chain()), m_ext(&ext) {}
-    void learn_ref(const ::v37::ScriptRef& pay) { m_paymap[::v37::xmr::xmr_identity_key(pay)] = pay; }
+    // true = the resolver did not hold this ref yet (REJOIN-PAYEE counts what a cut taught it)
+    bool learn_ref(const ::v37::ScriptRef& pay) {
+        auto& slot = m_paymap[::v37::xmr::xmr_identity_key(pay)];
+        const bool fresh = !(slot == pay);
+        slot = pay;
+        return fresh;
+    }
     std::vector<::v37::bytes32> keys() const { std::vector<::v37::bytes32> v; for (const auto& [k, r] : m_paymap) { (void)r; v.push_back(k); } return v; }
+
+    // BOOKED REFS (every node recomputes the lane coinbase,
+    // xmr_coinbase_recompute.hpp). learn_ref() takes refs from anywhere: relay
+    // arrival order, this node's own payee, a restart's reload. That is right
+    // for mapping outputs, but the OWED PASS decides who is paid and in what
+    // order, and every node rebuilds it at the block's booking point. So the
+    // owed pass resolves only the refs every node holds at that point: those
+    // taught by BOOKED lane blocks (the view at each booked cut, the refs its
+    // outputs paid), the seeds and the compiled-in donation. A key known only
+    // locally is carried, identically on every node, until a booked block
+    // teaches its ref. learn_booked_ref() also learns the ref for mapping.
+    // true = new.
+    bool learn_booked_ref(const ::v37::ScriptRef& pay) {
+        learn_ref(pay);
+        auto& slot = m_booked[::v37::xmr::xmr_identity_key(pay)];
+        const bool fresh = !(slot == pay);
+        slot = pay;
+        return fresh;
+    }
+    std::size_t booked_refs() const { return m_booked.size(); }
+    std::map<::v37::bytes32, ::v37::ScriptRef> booked_map() const { return m_booked; }   // a snapshot (share verdicts)
+    std::vector<::v37::bytes32> booked_keys() const {
+        std::vector<::v37::bytes32> v;
+        for (const auto& [k, r] : m_booked) { (void)r; v.push_back(k); }
+        return v;
+    }
 
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key
     // is the canon identity_key(pay); the resolver learns pay for that key.
@@ -394,6 +475,7 @@ public:
     ::v37::bytes32 seed_owed(const ::v37::ScriptRef& pay, std::uint64_t amount) {
         ::v37::bytes32 key = ::v37::xmr::xmr_identity_key(pay);
         m_paymap[key] = pay;
+        m_booked[key] = pay;   // a seed is lane config: every node holds it
         const std::string bid = "fixture-seed-" + std::to_string(m_next_bid++);
         OwedLedger::Amounts credit; credit[key] = static_cast<long long>(amount);
         const std::uint64_t age = m_next_age++;
@@ -436,6 +518,16 @@ public:
         };
     }
 
+    // The owed-pass resolver: booked refs only (see learn_booked_ref).
+    PayOfFn pay_of_booked() const {
+        return [this](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+            auto it = m_booked.find(k);
+            if (it != m_booked.end()) return it->second;
+            ::v37::ScriptRef raw; raw.kind = ::v37::ScriptKind::RAW; raw.payload.clear();
+            return raw;
+        };
+    }
+
     const OwedLedger& ledger() const { return m_ext ? *m_ext : m_ledger; }
     OwedLedger&       ledger()       { return m_ext ? *m_ext : m_ledger; }
     std::size_t       seeded() const { return m_paymap.size(); }
@@ -444,6 +536,7 @@ private:
     OwedLedger                            m_ledger;
     OwedLedger*                           m_ext = nullptr;   // 
     std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
+    std::map<::v37::bytes32, ::v37::ScriptRef> m_booked;   // BOOKED REFS: the owed pass's resolver
     std::uint64_t                         m_next_bid = 0;
     std::uint64_t                         m_next_age = 1;   // 0 reserved / unarmed
     SeedSink                              m_seed_sink;       // R-C rework-2 (F1)

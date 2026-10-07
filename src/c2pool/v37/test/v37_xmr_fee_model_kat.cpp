@@ -18,13 +18,14 @@
 //      roll boundaries and choose_payee (the payee the job's rbind commits
 //      to; the relay side is pinned in v37_xmr_fee_rbind_kat).
 //   D  the donation output on real assembled blocks (the C4-capture monerod
-//      arm, deterministic): ONE donation output = max(1, residual) (S1),
-//      exact-sum, the shape gate + the donation property ACCEPT; in the
-//      exhaust case the 1-piconero dust comes from the LARGEST payee (S2); a
+//      arm, deterministic): ONE donation output = the residual (S1; the
+//      marker is declared at 0), exact-sum, the shape gate + the donation
+//      property ACCEPT; in the exhaust case the donation output is a 0-amount
+//      marker and no payee is touched (S2 retired 2026-09-29); a
 //      coinbase WITHOUT the donation output is REFUSED by the serve property
 //      AND by the receive-side booking (decode_lane_coinbase_fee); a separate
 //      residual-sink output is refused by the serve property; give-author
-//      credit to the donation MERGES into the one donation output (owed + 1 +
+//      credit to the donation MERGES into the one donation output (owed +
 //      residual; operator ruling 09-23) and its owed part, recovered from the
 //      committed V37D owed_in tail, is booked as an owed deduction; the pure
 //      location rule (a second output to the donation is refused).
@@ -151,6 +152,19 @@ void suite_address() {
 // ---------------------------------------------------------------------------
 // Suite B -- give-author u16 carried in the receipt
 // ---------------------------------------------------------------------------
+// A2: split one lane push into its settlement pieces (what settle::project does
+// to a composite's aggregated weight; a plain ref passes through).
+static std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pieces(const std::pair<::v37::ScriptRef, std::uint64_t>& p) {
+    std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> v;
+    ::v37::xmr::XmrGiveAuthor g;
+    if (::v37::xmr::decode_xmr_give_author(p.first, g)) {
+        const auto sp = ::v37::xmr::xmr_ga_split(::v37::U256::from_u128(p.second), g.d);
+        if (sp.payee.v[0]) v.emplace_back(g.payee, sp.payee.v[0]);
+        if (sp.donation.v[0]) v.emplace_back(g.donation, sp.donation.v[0]);
+    } else v.push_back(p);
+    return v;
+}
+
 void suite_give_author() {
     std::printf("== B. give-author: a u16 CARRIED IN THE RECEIPT, folded by weight ==\n");
     CHECK(fee::give_author_u16(0.0) == 0, "0%% -> u16 0 (the CCS default: off)");
@@ -158,6 +172,26 @@ void suite_give_author() {
     CHECK(fee::give_author_u16(0.5) == 328, "0.5%% -> u16 328 (327.675 rounded half-up)");
     CHECK(fee::give_author_u16(100.0) == 65535 && fee::give_author_u16(250.0) == 65535, "100%% (and above) -> 65535");
     CHECK(fee::give_author_u16(-3.0) == 0, "negative -> 0");
+    // The node commits the EXACT integer form (no floating point on the path to
+    // the receipt): the decimal text parsed as num / 10^k, round-half-up in u128.
+    {
+        auto u = [](const char* t) { return fee::give_author_u16(fee::parse_pct_exact(t)); };
+        CHECK(u("0") == 0 && u("0.1") == 66 && u("0.5") == 328 && u("1") == 655 && u("100") == 65535 && u("250") == 65535,
+              "exact: 0 / 0.1 / 0.5 / 1 / 100 / 250 -> 0 / 66 / 328 / 655 / 65535 / 65535");
+        const char* bad[] = {"-1", "1e2", "1.", ".5", "abc", "", "0.1234567891", "nan"};
+        bool refused = true;
+        for (const char* b : bad) refused = refused && !fee::parse_pct_exact(b).ok;
+        CHECK(refused, "exact: a sign, an exponent, a bare dot, text, > 9 decimals are refused");
+        // The exact form agrees with the double form on every percentage in
+        // hundredths 0.00 .. 100.00, so no existing configuration changes value.
+        long diff = 0;
+        for (int h = 0; h <= 10000; ++h) {
+            char t[32]; std::snprintf(t, sizeof t, "%d.%02d", h / 100, h % 100);
+            if (fee::give_author_u16(fee::parse_pct_exact(t)) != fee::give_author_u16(h / 100.0)) ++diff;
+            if (fee::pct_to_bp(fee::parse_pct_exact(t)) != fee::pct_to_bp(h / 100.0)) ++diff;
+        }
+        CHECK(diff == 0, "exact == double on all 10001 hundredths (u16 and basis points), %ld differ", diff);
+    }
 
     const auto s0 = fee::split_receipt_weight(2000, 0);
     CHECK(s0.miner == 2000 && s0.donation == 0, "d=0: miner keeps the whole weight");
@@ -187,8 +221,13 @@ void suite_give_author() {
     CHECK(p0.size() == 1 && p0[0].first == miner && p0[0].second == fee::kFeeReceiptWeight,
           "gate ON, d=0 -> ONE push (payee, 65535)");
     auto p1 = fee::receipt_lane_pushes(miner, 655, true);
-    CHECK(p1.size() == 2 && p1[0].first == miner && p1[0].second == 65535 - 655 && p1[1].first == fee::donation_ref() && p1[1].second == 655,
-          "gate ON, d=655 -> (payee, 64880) then (donation, 655): v36 att*(65535-d) / att*d");
+    ::v37::xmr::XmrGiveAuthor g1;
+    CHECK(p1.size() == 1 && p1[0].second == 65535 && ::v37::xmr::decode_xmr_give_author(p1[0].first, g1) &&
+          g1.d == 655 && g1.payee == miner && g1.donation == fee::donation_ref() && ::v37::xmr::xmr_ga_well_formed(p1[0].first),
+          "gate ON, d=655 -> ONE push (composite(655, payee, donation), 65535): one lane position per receipt (A2)");
+    const auto sp1 = pieces(p1[0]);
+    CHECK(sp1.size() == 2 && sp1[0].first == miner && sp1[0].second == 65535 - 655 && sp1[1].first == fee::donation_ref() && sp1[1].second == 655,
+          "  its settlement split: (payee, 64880) and (donation, 655): v36 att*(65535-d) / att*d, integer-exact");
     auto p2 = fee::receipt_lane_pushes(miner, 65535, true);
     CHECK(p2.size() == 1 && p2[0].first == fee::donation_ref() && p2[0].second == 65535, "gate ON, d=65535 -> the whole receipt to the donation");
     CHECK(fee::kFeeReceiptWeight == 65535 && fee::kFeeModelVersion == 1, "the pinned per-receipt weight (65535) and gate version (1)");
@@ -210,7 +249,10 @@ void suite_give_author() {
         std::map<::v37::bytes32, std::uint64_t> w;
         std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> pushes;
         for (const auto& [payee, d] : st)
-            for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) { pushes.push_back(p); w[::v37::xmr::xmr_identity_key(p.first)] += p.second; }
+            for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) {
+                pushes.push_back(p);
+                for (const auto& q : pieces(p)) w[::v37::xmr::xmr_identity_key(q.first)] += q.second;
+            }
         return std::make_pair(pushes, w);
     };
     const auto fa = fold(stream);   // "node A" (give-author 0.5%) folding
@@ -251,7 +293,9 @@ void suite_owner_fee() {
     CHECK(fee::choose_payee(miner, std::nullopt, 10000, 0, &sub) == miner && !sub, "no owner configured -> never substitutes");
     CHECK(::v37::xmr::xmr_ref_valid(owner), "the owner payee is an ordinary valid XMR ref (peer-admissible work)");
     const auto pushes = fee::receipt_lane_pushes(owner, 655, true);
-    CHECK(pushes.size() == 2 && pushes[0].first == owner, "an owner-fee receipt's lane pushes credit the OWNER (plus the donation share from its u16)");
+    ::v37::xmr::XmrGiveAuthor go;
+    CHECK(pushes.size() == 1 && ::v37::xmr::decode_xmr_give_author(pushes[0].first, go) && go.payee == owner,
+          "an owner-fee receipt's ONE lane push credits the OWNER (plus the donation share from its u16, split in project())");
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +333,10 @@ struct Built {
         if (arm == Arm::ForeignSink) scfg.set_residual_sink_std(point_of(4), point_of(2));
         else { scfg.residual_sink = fee::donation_ref(); scfg.residual_sink_identity = fee::donation_identity(); }
         if (arm == Arm::FeeModel) scfg.fixed = {fee::donation_marker()};
+        // POOL-LINEAGE: every lane coinbase the daemon builds carries its V37P
+        // tag, so the no-fold arms (no V37D) still reach the donation rule
+        // instead of being decided not-lane for want of any V37 field (MM-PARSE-2).
+        { ::v37::bytes32 tag; tag.fill(0xA1); scfg.pool_tag = tag; }
         if (!src.poll(&why)) { why = "daemon arm did not parse the capture: " + why; return; }
         provider = std::make_unique<o2::XmrSettlementTemplateProvider>(src, ledger, scfg, 0);
         if (!provider->refresh()) { why = provider->last_error(); return; }
@@ -338,8 +386,8 @@ void suite_donation_blocks() {
     CHECK(bk.sink_total == static_cast<long long>(don), "sink_total == the donation output (%lld)", bk.sink_total);
     CHECK(bk.total == reward, "booked total == reward");
 
-    // D2 (S2): the owed pass EXHAUSTS the budget -> the donation output is the 1-piconero
-    // minimum, and that piconero comes from the LARGEST payee (V36), not the last partial one.
+    // D2: the owed pass EXHAUSTS the budget -> the donation output is the 0-amount marker
+    // (pre-V36 p2pool shape); no payee is touched (S2 retired: nothing to fund).
     {
         const std::uint64_t R = reward;   // same capture, same reward
         const ::v37::ScriptRef p1 = ::v37::xmr::make_xmr_std(point_of(1), point_of(2));
@@ -350,19 +398,19 @@ void suite_donation_blocks() {
         if (s.ok && s.snap.tpl->reward() == R) {
             const auto& so = s.snap.tpl->outputs();
             std::uint64_t ssum = 0; for (const auto& o : so) ssum += o.amount;
-            CHECK(so.size() == 3 && so.back().role == x6::CoinbaseOutput::Role::Fixed && so.back().identity == D && so.back().amount == 1,
-                  "S2: [largest][partial][donation 1]: the coinbase ends in the 1-piconero donation output (no residual)");
-            CHECK(so.size() == 3 && so[0].amount == big - 1 && so[1].amount == R - big,
-                  "S2: the LARGEST payee pays the 1-piconero dust (%llu = 0.8R - 1); the last partial payee is untouched (%llu = R - 0.8R)",
+            CHECK(so.size() == 3 && so.back().role == x6::CoinbaseOutput::Role::Fixed && so.back().identity == D && so.back().amount == 0,
+                  "exhaust: [largest][partial][donation 0]: the coinbase ends in the 0-amount donation marker (no residual)");
+            CHECK(so.size() == 3 && so[0].amount == big && so[1].amount == R - big,
+                  "exhaust: the largest payee is paid in full (%llu = 0.8R), the last partial payee R - 0.8R (%llu): no dust taken",
                   static_cast<unsigned long long>(so[0].amount), static_cast<unsigned long long>(so.size() > 1 ? so[1].amount : 0));
-            CHECK(ssum == R, "S2 exact-sum");
+            CHECK(ssum == R, "exhaust exact-sum");
             const fee::MarkerLocation sm = fee::inspect_donation_marker(so, D);
-            CHECK(sm.ok && sm.marker == 2, "serve-side property ACCEPTs the 1-piconero shape");
+            CHECK(sm.ok && sm.marker == 2, "serve-side property ACCEPTs the 0-amount marker shape");
             const auto sbk = s.book();
-            CHECK(sbk.ok && sbk.sink_total == 1 && !sbk.payout.count(D), "booked: donation = 1 piconero coverage, no ledger deduction on the donation: %s",
+            CHECK(sbk.ok && sbk.sink_total == 0 && !sbk.payout.count(D), "booked: donation = 0 coverage, no ledger deduction on the donation: %s",
                   sbk.ok ? "ok" : sbk.why.c_str());
-            CHECK(sbk.ok && sbk.payout.size() == 2 && sbk.payout.at(so[0].identity) == static_cast<long long>(big - 1),
-                  "booked: the largest payee is paid 0.8R - 1 -- the 1 piconero stays OWED to it (lossless carry)");
+            CHECK(sbk.ok && sbk.payout.size() == 2 && sbk.payout.at(so[0].identity) == static_cast<long long>(big),
+                  "booked: the largest payee is paid its full 0.8R (nothing carried)");
         } else if (s.ok) {
             CHECK(false, "exhaust-case reward %llu != D1 reward %llu (capture drifted)", static_cast<unsigned long long>(s.snap.tpl->reward()),
                   static_cast<unsigned long long>(R));
@@ -383,7 +431,7 @@ void suite_donation_blocks() {
     }
     // D3b: no fixed donation output, residual paid to a donation SINK output (the pre-S1 shape):
     // the serve side refuses the separate sink (S1); on-chain the last output pays the donation
-    // >= 1 piconero, but nothing folded, so there is no V37D owed_in commitment and the receive
+    // (any amount), but nothing folded, so there is no V37D owed_in commitment and the receive
     // side cannot split the output -> REFUSED (the commitment is part of the mandatory shape).
     Built n2(Arm::NoMarker, three_owed(1'000'000'000ull));
     if (CHECK_RET_OK(n2.ok)) {
@@ -402,8 +450,8 @@ void suite_donation_blocks() {
     }
 
     // D4 (MERGE, ruling 09-23): give-author credit to the donation is paid at its K_fair
-    //     position but lands in the ONE donation output: amount = owed + 1 + residual. The
-    //     coinbase commits owed_in (V37D); the receive side books min(owed_in, amount - 1)
+    //     position but lands in the ONE donation output: amount = owed + residual. The
+    //     coinbase commits owed_in (V37D); the receive side books min(owed_in, amount)
     //     as the donation's payout (a ledger deduction) and the rest as coverage.
     Built g(Arm::FeeModel, three_owed(1'000'000'000ull), 777'000'000ull);
     CHECK(g.ok, "template with donation give-author credit builds: %s", g.ok ? "ok" : g.why.c_str());
@@ -415,7 +463,7 @@ void suite_donation_blocks() {
               to_D, go.size());
         CHECK(go.back().identity == D && go.back().role == x6::CoinbaseOutput::Role::Fixed &&
               go.back().amount == greward - 6'000'000'000ull && go.back().owed_part == 777'000'000ull,
-              "MERGE: the last output = owed 777000000 + 1 + residual = reward - Σ other owed (%llu), owed_part 777000000",
+              "MERGE: the last output = owed 777000000 + residual = reward - Σ other owed (%llu), owed_part 777000000",
               static_cast<unsigned long long>(go.back().amount));
         const fee::MarkerLocation gm = fee::inspect_donation_marker(go, D);
         CHECK(gm.ok && gm.marker == 3, "serve-side property ACCEPTs the merged output: %s", gm.ok ? "ok" : gm.why.c_str());
@@ -424,8 +472,8 @@ void suite_donation_blocks() {
               "the block commits owed_in = 777000000 in the 0x02 V37D tail: %s", gbk.ok ? "ok" : gbk.why.c_str());
         CHECK(gbk.ok && gbk.payout.count(D) && gbk.payout.at(D) == 777'000'000ll,
               "booked: payout[donation] == its owed 777000000 (a ledger deduction, as a normal K_fair payout)");
-        CHECK(gbk.ok && gbk.sink_total == static_cast<long long>(go.back().amount - 777'000'000ull) && gbk.sink_total >= 1,
-              "booked: the rest of the one output (1 + residual = %lld) is coverage", gbk.sink_total);
+        CHECK(gbk.ok && gbk.sink_total == static_cast<long long>(go.back().amount - 777'000'000ull) && gbk.sink_total >= 0,
+              "booked: the rest of the one output (the residual = %lld) is coverage", gbk.sink_total);
         std::uint64_t gsum = 0; for (const auto& o : go) gsum += o.amount;
         CHECK(gsum == greward && gbk.ok && gbk.total == greward, "exact-sum holds with the donation's owed merged in");
         long long booked = gbk.sink_total; for (const auto& [k, v] : gbk.payout) booked += v;
@@ -434,7 +482,7 @@ void suite_donation_blocks() {
 
     // D4b (MERGE, exhaust path on a real block): the donation holds owed that, with another
     //     payee, exceeds the reward -> residual 0; the one donation output = its K_fair payout
-    //     + the 1-piconero minimum (sourced per S2 from the largest payee), booked split exactly.
+    //     exactly (the marker adds 0), booked as owed in full.
     {
         const std::uint64_t R = reward;
         const ::v37::ScriptRef p1 = ::v37::xmr::make_xmr_std(point_of(1), point_of(2));
@@ -454,14 +502,14 @@ void suite_donation_blocks() {
                   static_cast<unsigned long long>(ebk.donation_owed_in ? *ebk.donation_owed_in : 0), ebk.ok ? "ok" : ebk.why.c_str());
             if (ebk.ok && eo.size() == 2) {
                 const std::uint64_t dam = eo.back().amount;
-                CHECK(ebk.payout.count(D) && ebk.payout.at(D) == static_cast<long long>(dam - 1) && ebk.sink_total == 1 &&
-                      eo.back().owed_part == dam - 1,
-                      "exhaust: residual 0 -> the donation output = owed_paid %llu + the 1-piconero minimum; booked owed %lld, coverage 1",
-                      static_cast<unsigned long long>(dam - 1), ebk.payout.count(D) ? ebk.payout.at(D) : -1ll);
-                const bool p1_first = eo[0].amount == big || eo[0].amount == big - 1;
-                CHECK(p1_first ? (eo[0].amount == big - 1 && dam == er - big + 1)      // p1 older: p1 largest pays the dust
-                               : (dam == big && eo[0].amount == er - big),             // D older: D (largest) pays its own dust
-                      "exhaust: the dust comes from the LARGEST K_fair payout (S2 unchanged): payee %llu, donation %llu",
+                CHECK(ebk.payout.count(D) && ebk.payout.at(D) == static_cast<long long>(dam) && ebk.sink_total == 0 &&
+                      eo.back().owed_part == dam,
+                      "exhaust: residual 0 -> the donation output = owed_paid %llu (the marker adds 0); booked owed %lld, coverage 0",
+                      static_cast<unsigned long long>(dam), ebk.payout.count(D) ? ebk.payout.at(D) : -1ll);
+                const bool p1_first = eo[0].amount == big;
+                CHECK(p1_first ? (dam == er - big)                                      // p1 older: p1 paid in full
+                               : (dam == big && eo[0].amount == er - big),             // D older: D paid in full
+                      "exhaust: no dust is taken from anyone (S2 retired): payee %llu, donation %llu",
                       static_cast<unsigned long long>(eo[0].amount), static_cast<unsigned long long>(dam));
             }
         }
@@ -477,7 +525,7 @@ void suite_donation_blocks() {
         for (int i = 0; i < 40; ++i) stream.emplace_back((i & 1) ? mA : mB, (i & 1) ? dA : dB);
         auto ledger_of = [&](const std::vector<std::pair<::v37::ScriptRef, std::uint16_t>>& st) {
             std::map<::v37::ScriptRef, std::uint64_t> w;
-            for (const auto& [payee, d] : st) for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) w[p.first] += p.second;
+            for (const auto& [payee, d] : st) for (const auto& p : fee::receipt_lane_pushes(payee, d, true)) for (const auto& q : pieces(p)) w[q.first] += q.second;
             std::vector<std::pair<::v37::ScriptRef, std::uint64_t>> owed; std::uint64_t dn = 0;
             for (const auto& [ref, ww] : w) { if (ref == fee::donation_ref()) dn = ww * 1'000ull; else owed.emplace_back(ref, ww * 1'000ull); }
             return std::make_pair(owed, dn);
@@ -489,27 +537,28 @@ void suite_donation_blocks() {
         CHECK(la.second > 0, "and the donation holds give-author credit from both nodes' receipts (%llu)", static_cast<unsigned long long>(la.second));
     }
 
-    // D6: the pure location rule (S1 + MERGE: the LAST output is the ONE donation output, >= 1).
+    // D6: the pure location rule (S1 + MERGE: the LAST output is the ONE donation output, any amount).
     const ::v37::bytes32 X = ::v37::xmr::xmr_identity_key(::v37::xmr::make_xmr_std(point_of(1), point_of(2)));
     auto loc = [&](std::vector<::v37::bytes32> ids, std::vector<std::uint64_t> am) { return fee::locate_donation_marker(ids, am, D); };
     auto l1 = loc({X, X, D}, {5, 6, 99});
-    CHECK(l1.ok && l1.marker == 2, "[X X D:99] -> donation output @2 (owed + 1 + residual)");
+    CHECK(l1.ok && l1.marker == 2, "[X X D:99] -> donation output @2 (owed + residual)");
     CHECK(!loc({X, D, D}, {5, 7, 1}).ok, "[X D:7 D:1] -> REFUSED: two donation outputs (the owed payout must merge into the last)");
     CHECK(!loc({X, D, D}, {5, 1, 1}).ok, "[X D:1 D:1] -> REFUSED: two donation outputs (was: the last one is the marker)");
     CHECK(!loc({D, X, D}, {3, 5, 1}).ok, "[D:3 X D:1] -> REFUSED: a donation output before the tail");
     CHECK(!loc({X, X}, {5, 6}).ok, "[X X] -> REFUSED (no donation output)");
-    CHECK(!loc({X, D}, {5, 0}).ok, "[X D:0] -> REFUSED (a donation output below the 1-piconero minimum)");
+    { auto l0 = loc({X, D}, {5, 0});
+      CHECK(l0.ok && l0.marker == 1, "[X D:0] -> ACCEPTED: the 0-amount donation marker (the output itself is the marker)"); }
     CHECK(!loc({D, X}, {1, 5}).ok, "[D:1 X] -> REFUSED (the donation output is not at the canonical tail)");
     CHECK(!loc({}, {}).ok, "no outputs -> REFUSED");
-    CHECK(loc({D}, {1}).ok, "[D:1] -> the lone donation output (a coinbase that pays only the minimum + residual)");
-    {   // the split: owed part = min(owed_in, amount - 1); the rest is coverage
+    CHECK(loc({D}, {1}).ok, "[D:1] -> the lone donation output (a coinbase that pays only the residual)");
+    {   // the split: owed part = min(owed_in, amount); the rest is coverage
         std::map<::v37::bytes32, long long> po; long long st = 107;   // the decoder tallied the D vout as sink
         po[X] = 5;
         CHECK(fee::apply_donation_rule({X, D}, {5, 107}, D, std::optional<std::uint64_t>(7), po, st, nullptr) && po[D] == 7 && st == 100,
-              "apply_donation_rule [X D:107] owed_in 7 -> payout[D] 7, coverage 100 (1 + residual 99)");
+              "apply_donation_rule [X D:107] owed_in 7 -> payout[D] 7, coverage 100 (the residual)");
         std::map<::v37::bytes32, long long> po2; long long st2 = 8;
-        CHECK(fee::apply_donation_rule({X, D}, {5, 8}, D, std::optional<std::uint64_t>(50), po2, st2, nullptr) && po2[D] == 7 && st2 == 1,
-              "owed_in 50 > amount - 1 (residual 0, exhaust) -> payout[D] 7, coverage = the 1-piconero minimum");
+        CHECK(fee::apply_donation_rule({X, D}, {5, 8}, D, std::optional<std::uint64_t>(50), po2, st2, nullptr) && po2[D] == 8 && st2 == 0,
+              "owed_in 50 > amount (residual 0, exhaust) -> payout[D] 8, coverage 0");
         std::map<::v37::bytes32, long long> po3; long long st3 = 99;
         CHECK(fee::apply_donation_rule({X, D}, {5, 99}, D, std::optional<std::uint64_t>(0), po3, st3, nullptr) && !po3.count(D) && st3 == 99,
               "owed_in 0 -> no payout row for D (no ledger deduction), the whole output is coverage");
@@ -552,7 +601,7 @@ void suite_donation_blocks() {
 // Suite F -- the X6 allocator rules in isolation (S1 fold, S2 largest dust)
 // ---------------------------------------------------------------------------
 void suite_allocator() {
-    std::printf("== F. X6 allocate_exact_sum: S1 fold + S2 largest-payee dust ==\n");
+    std::printf("== F. X6 allocate_exact_sum: S1 fold + S2 largest-payee dust (generic) + the 0 marker ==\n");
     const ::v37::ScriptRef Dref = fee::donation_ref();
     const ::v37::bytes32 D = fee::donation_identity();
     auto ref_of = [](std::uint8_t k) { return ::v37::xmr::make_xmr_std(point_of(k), point_of(2)); };
@@ -562,6 +611,10 @@ void suite_allocator() {
         x6::CoinbaseInputs in; in.base_reward = budget; in.fees = 0; in.output_cap = 64;
         in.residual_sink = Dref; in.residual_sink_identity = D; in.fixed = {fee::donation_marker()};
         return in; };
+    // The generic X6 S2 rule (a folded minimum the residual cannot cover comes from the
+    // LARGEST owed output) is pinned with a 1-unit minimum (V36's shape); the fee model's
+    // own marker is declared at 0 (2026-09-29), where S2 is a no-op (F2z..F5z below).
+    auto base1 = [&](std::uint64_t budget) { auto in = base(budget); in.fixed.back().amount = 1; return in; };
     auto sumof = [](const std::vector<x6::CoinbaseOutput>& v) { std::uint64_t s = 0; for (const auto& o : v) s += o.amount; return s; };
     x6::BuildError err = x6::BuildError::None;
 
@@ -570,30 +623,47 @@ void suite_allocator() {
       CHECK(x6::residual_folds_into_fixed(in) && r.size() == 3 && r[0].amount == 100 && r[1].amount == 50 &&
             r[2].role == x6::CoinbaseOutput::Role::Fixed && r[2].amount == 850 && sumof(r) == 1000,
             "F1 residual 850 folds: [100][50][D:850] (the minimum 1 is inside the residual)"); }
-    { auto in = base(1000); in.owed = {entry(1, 400, 1), entry(3, 700, 2)};
+    { auto in = base1(1000); in.owed = {entry(1, 400, 1), entry(3, 700, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(r.size() == 3 && r[0].amount == 400 && r[1].amount == 599 && r[2].amount == 1 && sumof(r) == 1000,
             "F2 exhaust: owed pass pays [400][600]; the dust comes from the LARGEST (600 -> 599), not the first/last: [400][599][D:1]"); }
-    { auto in = base(1000); in.owed = {entry(1, 600, 1), entry(3, 700, 2)};
+    { auto in = base1(1000); in.owed = {entry(1, 600, 1), entry(3, 700, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(r.size() == 3 && r[0].amount == 599 && r[1].amount == 400 && r[2].amount == 1,
             "F2' exhaust, largest first: [600->599][400 partial, untouched][D:1] (the pre-S2 rule would have made it [600][399][1])"); }
-    { auto in = base(1000); in.owed = {entry(1, 500, 1), entry(3, 500, 2)};
+    { auto in = base1(1000); in.owed = {entry(1, 500, 1), entry(3, 500, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(r.size() == 3 && r[0].amount == 499 && r[1].amount == 500 && r[2].amount == 1, "F3 tie -> the EARLIEST in K_fair order pays the dust"); }
     { auto in = base(1000); in.output_cap = 1; in.owed = {entry(1, 500, 1)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(err == x6::BuildError::None && r.size() == 1 && r[0].amount == 1000 && r[0].identity == D,
             "F4 cap 1 = the fixed output alone: allowed (no sink slot when it folds) -> [D:1000], owed carries"); }
-    { auto in = base(1); in.owed = {entry(1, 5, 1)};
+    { auto in = base1(1); in.owed = {entry(1, 5, 1)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(r.size() == 1 && r[0].identity == D && r[0].amount == 1, "F5 budget 1: the lone payee is driven to 0 and dropped -> [D:1] (its owed carries)"); }
-    { auto in = base(1000); in.owed = {entry(1, 100, 1)};
+    { auto in = base1(1000); in.owed = {entry(1, 100, 1)};
       in.residual_sink = ref_of(9); in.residual_sink_identity = ::v37::xmr::xmr_identity_key(in.residual_sink);   // sink != the fixed payee
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(!x6::residual_folds_into_fixed(in) && r.size() == 3 && r[0].amount == 100 && r[1].amount == 1 &&
             r[1].role == x6::CoinbaseOutput::Role::Fixed && r[2].role == x6::CoinbaseOutput::Role::Sink && r[2].amount == 899,
             "F6 no fold (fixed does not pay the sink): the unchanged pre-S1 shape [100][F:1][S:899]"); }
+    // The fee model's own marker (declared 0): the donation output is always present, and in
+    // the exhaust case it is a 0-amount output -- no payee is touched (pre-V36 p2pool shape).
+    { auto in = base(1000); in.owed = {entry(1, 400, 1), entry(3, 700, 2)};
+      const auto r = x6::allocate_exact_sum(in, &err);
+      CHECK(err == x6::BuildError::None && r.size() == 3 && r[0].amount == 400 && r[1].amount == 600 && r[2].identity == D &&
+            r[2].role == x6::CoinbaseOutput::Role::Fixed && r[2].amount == 0 && sumof(r) == 1000,
+            "F2z exhaust, marker 0: [400][600][D:0] -- the donation output is present at 0, nobody pays a dust"); }
+    { auto in = base(1); in.owed = {entry(1, 5, 1)};
+      const auto r = x6::allocate_exact_sum(in, &err);
+      CHECK(r.size() == 2 && r[0].amount == 1 && r[1].identity == D && r[1].amount == 0,
+            "F5z budget 1, marker 0: [1][D:0] (the payee keeps the piconero)"); }
+    { auto in = base(1000); in.owed = {entry(1, 400, 1), entry(3, 700, 2)};
+      const auto r = x6::allocate_exact_sum(in, &err);
+      std::vector<::v37::bytes32> ids; std::vector<std::uint64_t> am;
+      for (const auto& o : r) { ids.push_back(o.identity); am.push_back(o.amount); }
+      CHECK(fee::locate_donation_marker(ids, am, D).ok && fee::inspect_donation_marker(r, D).ok,
+            "F2z': the 0-amount marker passes both the receive-side location rule and the serve-side property"); }
     { auto in = base(1000); in.fixed.clear(); in.output_cap = 1; in.owed = {entry(1, 100, 1)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(err == x6::BuildError::None && r.size() == 1 && r[0].role == x6::CoinbaseOutput::Role::Sink && r[0].amount == 1000,
@@ -610,36 +680,36 @@ void suite_allocator() {
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(x6::fold_identity_owed(in) == 200 && r.size() == 2 && n_to_D(r) == 1 && r[0].amount == 100 && r[1].identity == D &&
             r[1].role == x6::CoinbaseOutput::Role::Fixed && r[1].amount == 900 && r[1].owed_part == 200 && sumof(r) == 1000,
-            "F9 residual > 0: [100][D: 200 owed + 1 + 699 residual = 900], owed_part 200 (was [100][D:200][D:700])"); }
+            "F9 residual > 0: [100][D: 200 owed + 700 residual = 900], owed_part 200 (was [100][D:200][D:700])"); }
     { auto in = base(1000); in.owed = {dentry(200, 1), entry(1, 100, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(r.size() == 2 && r[0].amount == 100 && r[1].identity == D && r[1].amount == 900 && r[1].owed_part == 200,
             "F9' donation OLDER than the payee: still ONE output, last (the K_fair position only orders the budget draw)"); }
     { auto in = base(1000); in.owed = {entry(1, 600, 1), dentry(400, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
-      CHECK(r.size() == 2 && r[0].amount == 599 && r[1].amount == 401 && r[1].owed_part == 400 && sumof(r) == 1000,
-            "F10 residual 0, payee largest: the dust comes from the payee (600 -> 599); D = 400 owed + 1, owed_part 400"); }
+      CHECK(r.size() == 2 && r[0].amount == 600 && r[1].amount == 400 && r[1].owed_part == 400 && sumof(r) == 1000,
+            "F10 residual 0, payee largest: nothing is taken (marker 0): [600][D: 400 owed], owed_part 400"); }
     { auto in = base(1000); in.owed = {entry(1, 400, 1), dentry(600, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
-      CHECK(r.size() == 2 && r[0].amount == 400 && r[1].amount == 600 && r[1].owed_part == 599 && sumof(r) == 1000,
-            "F10' residual 0, donation largest: S2 unchanged takes the dust from D's own payout -> D = 599 + 1, owed_part 599 (1 stays owed)"); }
+      CHECK(r.size() == 2 && r[0].amount == 400 && r[1].amount == 600 && r[1].owed_part == 600 && sumof(r) == 1000,
+            "F10' residual 0, donation largest: D = 600 owed in full, owed_part 600 (no dust carried)"); }
     { auto in = base(1000); in.owed = {entry(1, 700, 1), dentry(700, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
-      CHECK(r.size() == 2 && r[0].amount == 699 && r[1].amount == 301 && r[1].owed_part == 300 && sumof(r) == 1000,
-            "F11 exhaust, donation the partial payee: [700 -> 699][D: 300 partial + 1], owed_part 300 (400 still owed)"); }
+      CHECK(r.size() == 2 && r[0].amount == 700 && r[1].amount == 300 && r[1].owed_part == 300 && sumof(r) == 1000,
+            "F11 exhaust, donation the partial payee: [700][D: 300 partial], owed_part 300 (400 still owed)"); }
     { auto in = base(1000); in.owed = {dentry(5000, 1), entry(1, 100, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
-      CHECK(r.size() == 1 && r[0].identity == D && r[0].amount == 1000 && r[0].owed_part == 999,
-            "F12 exhaust by the donation alone: [D:1000] (999 owed + the 1 dust from its own payout), the payee carries"); }
+      CHECK(r.size() == 1 && r[0].identity == D && r[0].amount == 1000 && r[0].owed_part == 1000,
+            "F12 exhaust by the donation alone: [D:1000] (all owed), the payee carries"); }
     { auto in = base(1000); in.output_cap = 2; in.owed = {entry(1, 100, 1), entry(3, 100, 2), dentry(50, 3)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(err == x6::BuildError::None && r.size() == 2 && r[0].amount == 100 && r[1].identity == D && r[1].amount == 900 &&
             r[1].owed_part == 50 && sumof(r) == 1000,
-            "F13 cap 2: the donation's payout needs NO slot -> [100][D: 50 + 1 + 849]; the second payee carries"); }
+            "F13 cap 2: the donation's payout needs NO slot -> [100][D: 50 + 850]; the second payee carries"); }
     { auto in = base(1000); in.h_min = 100; in.owed = {dentry(50, 1), entry(1, 100, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(r.size() == 2 && r[1].amount == 900 && r[1].owed_part == 50,
-            "F14 donation owed below h_min: not paid in the pass, but the one output it receives books min(50, 899) = 50 as owed"); }
+            "F14 donation owed below h_min: not paid in the pass, but the one output it receives books min(50, 900) = 50 as owed"); }
     { auto in = base(1000); in.fixed.clear(); in.owed = {entry(1, 100, 1), dentry(200, 2)};
       const auto r = x6::allocate_exact_sum(in, &err);
       CHECK(!x6::residual_folds_into_fixed(in) && x6::fold_identity_owed(in) == 0 && r.size() == 3 &&
@@ -663,7 +733,7 @@ void suite_allocator() {
             const std::uint64_t rx = fee::donation_owed_part(last.amount, x6::fold_identity_owed(in));
             std::vector<::v37::bytes32> ids; std::vector<std::uint64_t> am;
             for (const auto& o : r) { ids.push_back(o.identity); am.push_back(o.amount); }
-            const bool ok = sumof(r) == budget && n_to_D(r) == 1 && last.identity == D && last.amount >= 1 &&
+            const bool ok = sumof(r) == budget && n_to_D(r) == 1 && last.identity == D &&
                             last.owed_part == rx && fee::locate_donation_marker(ids, am, D).ok &&
                             fee::inspect_donation_marker(r, D).ok && r.size() <= in.output_cap;
             if (!ok) ++bad;
@@ -671,7 +741,7 @@ void suite_allocator() {
         }
         CHECK(bad == 0 && n_merged > 1000,
               "F16 20000 random ledgers: ONE donation output, last, exact-sum, within the cap, and the receive split "
-              "min(owed_in, amount - 1) == the allocator's owed_part (%d bad, %d with merged owed)", bad, n_merged);
+              "min(owed_in, amount) == the allocator's owed_part (%d bad, %d with merged owed)", bad, n_merged);
     }
 }
 
