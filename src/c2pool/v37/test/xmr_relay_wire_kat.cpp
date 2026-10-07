@@ -80,6 +80,37 @@ int main() {
         m = o; m.lane_params_digest = b32_of(9);   C(hello_mismatch(h, m).find("lane_params_digest") != std::string::npos, "W2 LaneParams mismatch named");
         C(hello_mismatch(h, h).find("self") != std::string::npos, "W2 own nonce -> self-connection");
     }
+    // ── W2r LANE-RULES: the HELLO with the lane-rules list (a new length class) ─
+    {
+        Hello r = h;
+        r.pool = pool_id_of(7, ::v37::LaneParams{}); r.pool->genesis = b32_of(6);
+        c2pool::v37n::xmr::lanerules::LaneRules lr;
+        lr.d_conf = 60; lr.output_cap = 2700; lr.recon_max_root_age = 240; lr.book_deferral = 1; lr.coinbase_maturity = 60;
+        lr.input_weight = 659; lr.pool_tag_codec = 1; lr.lane_params_digest = h.lane_params_digest; lr.residual_sink_id = b32_of(8);
+        r.rules = lr;
+        const auto f = encode_hello(r);
+        C(f.size() == kHelloBytesPoolGenesis + 1 + 2 + 278, "W2r hello + rules = 174 + 1 + 2 + 278 = 455 bytes");
+        golden(C, "W2r hello+rules", hex(f),
+               "400143325852030700000020272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f9d0070000000000008877665544332211c8af92100000000000003f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a111800e61c22c223c04b630ec8759d185602087e34b312241af9d35dee518f35f7c3a80100000000000000bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d9400160101083c000000000000000208000000000000000003048c0a00000408f0000000000000000501010608000000000000000007010008080000000000000000090800000000000000000a01000b01000c04000000000d0800000000000000000e01000f0100100893020000000000001108000000000000000012083c000000000000001304000000001420f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2150400000000160800000000000000001704000000001804000000001904000000001a01011b2020272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f91c2000000000000000000000000000000000000000000000000000000000000000001d0100");
+        Hello back; std::string why;
+        C(decode_hello(f, back, &why) && back == r, "W2r round trip (" + why + ")");
+        C(std::equal(f.begin(), f.begin() + kHelloBytesPoolGenesis, encode_hello([&] { Hello x = r; x.rules.reset(); return x; }()).begin()),
+          "W2r the first 174 bytes are the POOL-LINEAGE HELLO, unchanged");
+        Hello l = r; l.rules.reset();
+        Hello l142 = l; l142.pool->genesis.reset();
+        Hello l102 = l; l102.pool.reset();
+        bool legacy_ok = true;
+        for (const Hello* x : {&l, &l142, &l102}) {
+            Hello b; legacy_ok = legacy_ok && decode_hello(encode_hello(*x), b, &why) && !b.rules && b == *x;
+        }
+        C(legacy_ok, "W2r the 174/142/102-byte HELLOs still decode, rules = none");
+        auto t = f; t[kHelloBytesPoolGenesis + 1] ^= 1;
+        C(!decode_hello(t, back, &why) && why == "hello: rules length mismatch", "W2r a wrong rules_len -> \"" + why + "\"");
+        t = f; t.pop_back();
+        C(!decode_hello(t, back, &why) && why == "hello: rules length mismatch", "W2r one byte short -> rules length mismatch");
+        t = std::vector<u8>(f.begin(), f.begin() + kHelloBytesEnrolSet + 1);
+        C(!decode_hello(t, back, &why), "W2r 207 bytes (a rules frame too short for its length) -> refused (" + why + ")");
+    }
 
     // ── W3 BLOCK_WON ────────────────────────────────────────────────────────
     {
@@ -198,6 +229,66 @@ int main() {
         C(!decode_address(bad).has_value(), "W7 one flipped character -> checksum refusal");
         C(!decode_address(addr.substr(0, 90)).has_value(), "W7 truncated address -> refused");
         C(!decode_address("0OIl" + addr.substr(4)).has_value(), "W7 non-alphabet characters -> refused");
+    }
+    // ── W8 RELAY-DISCOVERY: FB_GETADDR (0x4c) / FB_ADDR (0x4d) ──────────────
+    {
+        const std::vector<u8> ops = {FB_HELLO, FB_RECEIPTS, FB_BLOCK_WON, FB_GETCTX, FB_CTX, FB_GETDROPS,
+                                     FB_DROPINV, FB_GETWON, FB_PING, FB_PONG, FB_GETADDR, FB_ADDR};
+        C(std::set<u8>(ops.begin(), ops.end()).size() == ops.size(), "W8 every Family-B opcode constant is distinct");
+        bool in_ns = true; for (u8 o : ops) in_ns = in_ns && is_family_b_opcode(o);
+        C(in_ns, "W8 every Family-B opcode lies in 0x40..0x4f");
+        C(FB_GETADDR == 0x4c && FB_ADDR == 0x4d, "W8 FB_GETADDR = 0x4c, FB_ADDR = 0x4d (0x4a/0x4b stay reserved for LANE-EPOCH)");
+        bool no_epoch = true; for (u8 o : ops) no_epoch = no_epoch && o != 0x4a && o != 0x4b;
+        C(no_epoch, "W8 no opcode uses the LANE-EPOCH reservation 0x4a/0x4b");
+
+        const auto g = encode_getaddr(7, 64);
+        golden(C, "W8 getaddr(7,64)", hex(g), "4c01070000004000");
+        u32 ch = 0; u16 want = 0; std::string why;
+        C(decode_getaddr(g, ch, want, &why) && ch == 7 && want == 64, "W8 getaddr round-trip");
+        C(encode_getaddr(7, 0).empty() && encode_getaddr(7, 257).empty(), "W8 getaddr want 0 / 257 not encodable");
+        auto gb = g; gb[6] = 0; gb[7] = 0;
+        C(!decode_getaddr(gb, ch, want), "W8 getaddr want 0 refused");
+        gb = g; gb.push_back(0);
+        C(!decode_getaddr(gb, ch, want), "W8 getaddr trailing byte refused");
+        gb = g; gb[1] = 2;
+        C(!decode_getaddr(gb, ch, want), "W8 getaddr unknown version refused");
+
+        AddrEntry a4, a6;
+        C(addr_entry_of("203.0.113.9", 59321, 1700000000, a4) && a4.family == kAddrFamV4, "W8 IPv4 literal -> entry");
+        C(addr_entry_of("2001:db8::7", 59321, 1700000001, a6) && a6.family == kAddrFamV6, "W8 IPv6 literal -> entry");
+        C(!addr_entry_of("pool.example", 1, 0, a4 = AddrEntry{}) , "W8 a DNS name is not an entry (no resolution on the wire)");
+        addr_entry_of("203.0.113.9", 59321, 1700000000, a4);
+        const auto f = encode_addr(7, {a4, a6});
+        C(f.size() == kAddrHeader + 2 * kAddrEntryBytes, "W8 addr frame = 8 + 2 x 27 bytes");
+        golden(C, "W8 addr(7,[v4,v6])", hex(f),
+               "4d0107000000020004cb007109000000000000000000000000b9e700f15365000000000620010db8000000000000000000000007b9e701f1536500000000");
+        std::vector<AddrEntry> v;
+        C(decode_addr(f, ch, v, &why) && ch == 7 && v.size() == 2 && v[0] == a4 && v[1] == a6, "W8 addr round-trip (v4 + v6)");
+        C(addr_host(v[0]) == "203.0.113.9" && addr_host(v[1]) == "2001:db8::7", "W8 entry -> host literal");
+        std::vector<u8> empty = encode_addr(7, {});
+        C(decode_addr(empty, ch, v) && v.empty(), "W8 an empty ADDR (nothing known) decodes");
+        std::vector<AddrEntry> many(kAddrMaxEntries, a4), over(kAddrMaxEntries + 1, a4);
+        const auto fm = encode_addr(7, many);
+        C(fm.size() == kAddrMaxFrame && decode_addr(fm, ch, v) && v.size() == kAddrMaxEntries, "W8 256 entries = the bound, accepted");
+        C(encode_addr(7, over).empty(), "W8 257 entries not encodable");
+        auto fb = fm; fb[6] = 1; fb[7] = 1;   // n = 257 claimed
+        C(!decode_addr(fb, ch, v) && v.empty(), "W8 n > 256 refused");
+        fb = f; fb.pop_back();
+        C(!decode_addr(fb, ch, v), "W8 truncated entry refused");
+        fb = f; fb[8] = 5;
+        C(!decode_addr(fb, ch, v) && v.empty(), "W8 unknown address family refused (total: no partial output)");
+        fb = f; fb[8 + 1 + 5] = 1;
+        C(!decode_addr(fb, ch, v), "W8 IPv4 entry with non-zero padding refused");
+        fb = f; fb[8 + 17] = 0; fb[8 + 18] = 0;
+        C(!decode_addr(fb, ch, v), "W8 port 0 refused");
+        AddrEntry z = a4; z.port = 0;
+        C(encode_addr(7, {z}).empty(), "W8 port 0 not encodable");
+        auto is_pub = [](const char* h) { AddrEntry e; return addr_entry_of(h, 1, 0, e) && addr_routable(e); };
+        C(is_pub("1.1.1.1") && is_pub("8.8.8.8") && is_pub("2001:4860::1"), "W8 public addresses are routable");
+        C(!is_pub("127.0.0.1") && !is_pub("10.1.2.3") && !is_pub("192.168.86.114") && !is_pub("172.20.0.1") &&
+          !is_pub("100.64.0.1") && !is_pub("169.254.1.1") && !is_pub("0.0.0.0") && !is_pub("224.0.0.1") &&
+          !is_pub("::1") && !is_pub("fd00::1") && !is_pub("fe80::1") && !is_pub("::ffff:192.168.1.1"),
+          "W8 loopback / RFC1918 / CGNAT / link-local / unspecified / multicast / ULA / mapped-private are NOT routable");
     }
     return C.done("xmr_relay_wire_kat");
 }

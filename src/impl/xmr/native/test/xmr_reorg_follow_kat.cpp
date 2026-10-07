@@ -438,6 +438,18 @@ static void test_follow_after_race_loss() {
     checkf(tips.size() == 1 && tips[0].resolved,
            "follow: the rival is parked UNRESOLVED -- its branch difficulty was not computable");
 
+    // D6b/RC-CTX: the receipt relay answers a context request for a HELD rival
+    // from the index (block_blob_of -> NativeCtxFeeder::serve, no monerod
+    // get_block), and never hands the rival's bytes out for another id.
+    {
+        std::vector<std::uint8_t> blob;
+        checkf(idx.block_blob_of(id_of(rival[0]), blob) && blob == rival[0].block_blob,
+               "follow: block_blob_of did not return the held rival's blob");
+        blob.clear();
+        checkf(!idx.block_blob_of(our_tip, blob) || blob != rival[0].block_blob,
+               "follow: block_blob_of answered the rival's blob for our own tip");
+    }
+
     // Equal work: we keep our own block (D-14), and we are still at our tip.
     checkf(f.tip_id() == our_tip, "follow: equal work did not keep our own block");
     checkf(f.log.count(node::MainchainEventKind::Reorg) == 0,

@@ -42,17 +42,51 @@ jobs:
           WINDOW_MIN: ${{ github.event.inputs.window_minutes || '120' }}
         run: |
           set -euo pipefail
+          # FAIL CLOSED (#1092): a non-JSON or truncated API response (5xx HTML
+          # page, rate-limit text, empty body) must turn this scan red, never
+          # read as "0 drops, fleet clean". api_json fetches to a file and
+          # checks the expected shape with jq -e before anything consumes it.
+          api_err=""
+          api_json() { # api_json <api-path> <jq-shape-check> <outfile>
+            if ! gh api "$1" > "$3" 2> api.err; then
+              api_err="gh api $1 failed: $(head -c 300 api.err | tr '\n' ' ')"; return 1
+            fi
+            if ! jq -e "$2" "$3" > /dev/null 2>&1; then
+              api_err="gh api $1 returned non-JSON or unexpected shape: $(head -c 300 "$3" | tr '\n' ' ')"; return 1
+            fi
+          }
+          # Selftest: the guard must reject garbage before a "clean" scan is trusted.
+          gh() { printf '<html><body>502 Bad Gateway</body></html>'; }
+          if api_json selftest '.jobs|type=="array"' st.json; then
+            echo "::error title=detector selftest::api_json accepted a non-JSON body"; exit 3
+          fi
+          gh() { return 1; }
+          if api_json selftest '.jobs|type=="array"' st.json; then
+            echo "::error title=detector selftest::api_json accepted a failed gh api call"; exit 3
+          fi
+          gh() { printf '{"jobs":[]}'; }
+          if ! api_json selftest '.jobs|type=="array"' st.json; then
+            echo "::error title=detector selftest::api_json rejected valid JSON"; exit 3
+          fi
+          unset -f gh; api_err=""
+
           since=$(date -u -d "-${WINDOW_MIN} min" +%Y-%m-%dT%H:%M:%SZ)
           echo "Scanning jobs since $since (window ${WINDOW_MIN}m)"
           : > drops.tsv
           # Recent runs in window, then their jobs; flag completed, non-skipped, steps=0.
           # Columns: runner  conclusion  url  name  run_id  run_attempt
-          for rid in $(gh api "repos/$REPO/actions/runs?per_page=60&created=>$since" \
-                --jq '.workflow_runs[].id'); do
-            gh api "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --jq \
+          if ! api_json "repos/$REPO/actions/runs?per_page=60&created=>$since" '.workflow_runs|type=="array"' runs.json; then
+            echo "::error title=detector blind::${api_err}"; exit 3
+          fi
+          for rid in $(jq -r '.workflow_runs[].id' runs.json); do
+            api_json "repos/$REPO/actions/runs/$rid/jobs?per_page=100" '.jobs|type=="array"' jobs.json || break
+            jq -r \
               ".jobs[] | select((.runner_name!=null) and (.runner_name!=\"\") and .status==\"completed\" and .conclusion!=\"skipped\" and (.steps|length)==0) | [(.runner_name // \"<none>\"), .conclusion, (.html_url), .name, (.run_id|tostring), (.run_attempt|tostring)] | @tsv" \
-              2>/dev/null || true
+              jobs.json
           done >> drops.tsv
+          if [ -n "$api_err" ]; then
+            echo "::error title=detector blind::${api_err}"; exit 3
+          fi
           n=$(wc -l < drops.tsv | tr -d ' ')
           echo "steps0_drops=$n"
           if [ "$n" -eq 0 ]; then

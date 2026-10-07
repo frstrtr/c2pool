@@ -98,7 +98,7 @@
 /// apply_block walks special txs, so a block replay is STRUCTURALLY incapable
 /// of observing one: it can only ever ADD.
 ///
-/// MEASURED, mainnet, hotel dashd 23.1.7, 2026-08-02, anchor 2513000 -> tip
+/// MEASURED, mainnet, production dashd 23.1.7, 2026-08-02, anchor 2513000 -> tip
 /// 2514874:
 ///
 ///     protx list valid false 2513000   -> 2068 entries
@@ -3035,7 +3035,7 @@ public:
     // ON-DEMAND PoSe FOLD — fire AT the mismatch, not at a fold point
     // ─────────────────────────────────────────────────────────────────────
     //
-    // MEASURED (contabo daemonless soak vs hotel dashd, mainnet, anchor
+    // MEASURED (contabo daemonless soak vs production dashd, mainnet, anchor
     // 2513000, fold interval 500):
     //
     //     h=2513000  protx list valid 2068  projected payee PRESENT  <- folded

@@ -251,7 +251,10 @@ the only value.
   slow node while a fast node books it. This predates rework-3 (R4), it is
   loud (`booking_stall_timeout`), and it does not happen in a healthy lane.
   Rework-3 guarantees that refusal is ledger-neutral. It does not make every
-  refusal decision timing-free.
+  refusal decision timing-free. When the node that booked such a block ends
+  up in the minority, D2 (operator ruling D2 = A,
+  [`d2-minority-converge.md`](d2-minority-converge.md)) converges it to the
+  majority lineage (its unverifiable own blocks move to liability) or halts it.
 * **The liability is real money.** See D2 and §5.
 * **The contested-suspend liveness hazard.** Opt-in only since the ruling; see §3.
 * **ISOLATED.** It still needs the W6 verified-resync verifier; no production

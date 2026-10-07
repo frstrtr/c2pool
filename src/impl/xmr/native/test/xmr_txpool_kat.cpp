@@ -41,6 +41,7 @@
 #include <string>
 #include <vector>
 
+#include "impl/xmr/native/contracts/fakes/fake_chain.hpp"
 #include "impl/xmr/native/txpool/xmr_relayed_txpool.hpp"
 #include "xmr_tx_weight_golden.hpp"
 
@@ -465,6 +466,59 @@ static void test_chain_events() {
 }
 
 // ---------------------------------------------------------------------------
+// 7b: the chain's mined oracle at admission (template dup-tx track). A tx the
+//     best chain already carries -- or one spending a key image the chain
+//     already spent -- is refused as AlreadyMined whatever path it arrives by:
+//     a reorg re-admit racing the new branch's connect, or a late relay.
+// ---------------------------------------------------------------------------
+static void test_mined_oracle() {
+    const auto txs = corpus();
+    if (txs.size() < 3) return;
+
+    fakes::FakeChain chain;
+    node::ChainMainBlock tip;
+    tip.height = 2204800;
+    tip.id[0]  = 0x42;
+    chain.rows.push_back(tip);
+    chain.mark_mined(id_of(txs[0]), 2204800);                 // mined in the tip
+    const std::vector<Hash> kis1 = key_images_of(txs[1]);
+    check(!kis1.empty(), "(fixture) the second transaction spends key images");
+    if (!kis1.empty()) chain.mark_spent(kis1[0], 2204790);    // spent further down
+
+    SYNCED_POOL(pool);
+    pool.set_mined_oracle(&chain);
+    const auto v0 = relay_one(pool, peer(1), txs[0]);
+    check(v0.reason == TxRelayVerdict::Reason::AlreadyMined && !v0.drop_offense,
+          "a relayed tx the chain already mined is refused AlreadyMined, no drop");
+    const auto v1 = relay_one(pool, peer(1), txs[1]);
+    check(v1.reason == TxRelayVerdict::Reason::AlreadyMined,
+          "a relayed tx spending a key image the chain already spent is refused");
+    check(relay_one(pool, peer(1), txs[2]).reason == TxRelayVerdict::Reason::Accepted,
+          "an unrelated tx is still accepted");
+
+    // The reorg re-admit: the old branch's bodies come back, but the NEW branch
+    // mined txs[0] too -- it must not return to the pool (and so to a template).
+    BlockTxEvent rolled_back;
+    rolled_back.kind   = BlockTxEvent::Kind::Disconnected;
+    rolled_back.height = 2204801;
+    rolled_back.tx_hashes.push_back(id_of(txs[0]));
+    rolled_back.tx_blobs.push_back(txs[0]);
+    pool.note_block_disconnected(rolled_back);
+    pool.readmit_disconnected(rolled_back);
+    check(!pool.contains(id_of(txs[0])),
+          "a rolled-back body the new branch mined is NOT re-admitted");
+    checkf(pool.stats().rejected_already_mined == 3, "three AlreadyMined refusals counted (%llu)",
+           static_cast<unsigned long long>(pool.stats().rejected_already_mined));
+    check(pool.key_images_of(id_of(txs[2])) == key_images_of(txs[2]),
+          "key_images_of() answers what the entry spends (the template's key-image filter)");
+
+    // With the oracle unwired the same relay is admitted (the leg is additive).
+    SYNCED_POOL(bare);
+    check(relay_one(bare, peer(1), txs[0]).reason == TxRelayVerdict::Reason::Accepted,
+          "(control) without the oracle the same tx is admitted");
+}
+
+// ---------------------------------------------------------------------------
 // 8 + 9: eviction, pinning, and the body surfaces
 // ---------------------------------------------------------------------------
 static void test_eviction_and_bodies() {
@@ -570,6 +624,7 @@ int main() {
     test_sightings();
     test_key_image_conflict();
     test_chain_events();
+    test_mined_oracle();
     test_eviction_and_bodies();
     std::printf("xmr_txpool_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -1,845 +1,483 @@
-/*
- * This file is part of the Monero P2Pool <https://github.com/SChernykh/p2pool>
- * Copyright (c) 2021-2026 SChernykh <https://github.com/SChernykh>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 3.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- */
-
-// =============================================================================
-// PROVENANCE (c2pool AGPL-3.0 combines this GPLv3 code via AGPLv3 section 13).
-//   Upstream : SChernykh/p2pool  src/block_template.cpp
-//   Commit   : 128643114f9bea55bfdb95462eaeffa2e3f666bd  (master, 2026-09-05)
-//   Adapted  : Monero whole-block-template plumbing for the v37 Family-B XMR
-//              settlement lane. See xmr_block_template.hpp for the full list of
-//              what was kept verbatim and what (the p2pool pool model) was cut.
-//   Behaviour of the reward math, the greedy penalty-zone selection, the
-//   reference knapsack, the miner_tx byte layout, the v2 tx-hash triple, the
-//   Keccak-midstate opening, and the tree_hash main branch is unchanged from
-//   upstream; only p2pool's SideChain calls were rerouted to IXmrSettlementSource
-//   and the sidechain-id / aux-slot machinery was removed.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
 //
-//   c2pool modification (2026-09, GPLv3 s.5(a) notice): update() and
-//   select_mempool_transactions() gained a `take_mempool_as_given` parameter.
-//   When set, the AGPL good-citizen selector on the c2pool side has already
-//   chosen the FINAL transaction set, so this file bypasses the p2pool 5-second
-//   mempool age gate and the penalty-zone greedy re-selection and mines the
-//   given set verbatim (only the 128 KB carrier-size safeguard still applies).
-//   No p2pool code was copied out of this file; the knob's VALUE originates on
-//   the AGPL side, this file merely honours it. Default false = upstream path.
-// =============================================================================
+// This file is part of c2pool and is distributed under the terms of the GNU
+// Affero General Public License, version 3 or (at your option) any later
+// version. See COPYING in the repository root.
+//
+// xmr_block_template.cpp -- whole-block Monero template builder (Family B).
+//
+// PROVENANCE: clean-room from Monero-core v0.18.5.1 (monero-project/monero,
+// BSD-3-Clause) and the public RPC/ZMQ/stratum/CryptoNote protocol; not
+// derived from p2pool. The Monero rules applied here, by their Monero-core names:
+//   * cryptonote::get_block_reward (cryptonote_basic_impl.cpp): base reward
+//     (MONEY_SUPPLY - already_generated_coins) >> 19 for 2-minute blocks,
+//     floored at the tail emission; no penalty up to the median weight; above
+//     it reward = base * (2M - W) * W / M / M; refused above 2M.
+//   * tx_memory_pool::fill_block_template (tx_pool.cpp): take transactions in
+//     fee-per-weight order and accept one only if the coinbase (reward + fees)
+//     does not decrease.
+//   * Blockchain::create_block_template: timestamp = now, raised to the median
+//     timestamp when the clock is behind it.
+//   * get_block_hashing_blob / calculate_transaction_hash / tree_hash: through
+//     the lane's own serializer and the vendored Monero crypto (xmr_blob.hpp).
+// Serialization of the coinbase prefix head (version, unlock time, txin_gen,
+// tagged-key outputs) is xmr::coin::write_coinbase_prefix_head, so the
+// template's miner transaction and the lane's settlement coinbase share one
+// serializer.
 
 #include "xmr_block_template.hpp"
 
 #include <algorithm>
-#include <numeric>
+#include <array>
 #include <cstring>
-#include <unordered_set>
+#include <limits>
+#include <mutex>
+#include <set>
+
+#include "xmr_blob.hpp"           // xmr::coin::BlobWriter, write_coinbase_prefix_head, hashes, tree_root
+#include "xmr_crypto_types.hpp"   // xmr::coin::PublicKey, ViewTag, Hash256
 
 namespace c2pool::xmr {
 
-// std::unordered_set<hash> needs a hasher; the first 8 bytes are already a
-// uniform Keccak digest, so use them directly.
-struct HashHasher {
-    size_t operator()(const hash& h) const {
-        size_t v;
-        std::memcpy(&v, h.h, sizeof(v));
-        return v;
+namespace {
+
+namespace coin = ::xmr::coin;
+
+constexpr std::uint64_t kMoneySupply = std::numeric_limits<std::uint64_t>::max();
+constexpr unsigned kEmissionShift = 19;   // EMISSION_SPEED_FACTOR_PER_MINUTE(20) - (2 - 1)
+
+std::uint64_t base_reward(std::uint64_t already_generated_coins) {
+    const std::uint64_t r = (kMoneySupply - already_generated_coins) >> kEmissionShift;
+    return r < BASE_BLOCK_REWARD ? BASE_BLOCK_REWARD : r;
+}
+
+// Monero get_block_reward over the supplied (effective) median.
+bool block_reward(std::uint64_t base, std::uint64_t median, std::uint64_t weight, std::uint64_t& reward) {
+    if (weight <= median) {
+        reward = base;
+        return true;
     }
+    if (median == 0 || weight > 2 * median) return false;
+    std::uint64_t multiplicand = 2 * median - weight;   // same 64-bit arithmetic as Monero
+    multiplicand *= weight;
+    const unsigned __int128 product = static_cast<unsigned __int128>(base) * multiplicand;
+    const unsigned __int128 divisor = static_cast<unsigned __int128>(median) * median;
+    reward = static_cast<std::uint64_t>(product / divisor);   // == two truncating divisions by median
+    return true;
+}
+
+std::size_t varint_size(std::uint64_t v) {
+    std::size_t n = 1;
+    while (v >= 0x80) { v >>= 7; ++n; }
+    return n;
+}
+
+std::size_t amounts_weight(const std::vector<std::uint64_t>& amounts) {
+    std::size_t w = 0;
+    for (std::uint64_t a : amounts) w += varint_size(a);
+    return w;
+}
+
+coin::Hash256 to_h256(const hash& h) {
+    coin::Hash256 o;
+    std::memcpy(o.data(), h.h, HASH_SIZE);
+    return o;
+}
+
+// fee per weight, descending: a.fee / a.weight > b.fee / b.weight without division.
+bool better_fee_rate(const XmrTxMempoolData& a, const XmrTxMempoolData& b) {
+    const unsigned __int128 l = static_cast<unsigned __int128>(a.fee) * (b.weight ? b.weight : 1);
+    const unsigned __int128 r = static_cast<unsigned __int128>(b.fee) * (a.weight ? a.weight : 1);
+    if (l != r) return l > r;
+    if (a.time_received != b.time_received) return a.time_received < b.time_received;
+    return std::memcmp(a.id.h, b.id.h, HASH_SIZE) < 0;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// One built template.
+// ---------------------------------------------------------------------------
+struct XmrBlockTemplate::Snapshot {
+    std::uint32_t id = 0;
+    std::uint64_t height = 0;
+    hash prev_id;
+    hash seed_hash;
+    difficulty_type lane_target;
+    std::uint64_t reward = 0;
+
+    std::vector<unsigned char> header;        // varint major | varint minor | varint ts | prev_id | nonce 0
+    std::size_t nonce_offset = 0;
+
+    std::vector<unsigned char> outputs_head;  // coinbase prefix up to (not incl.) the extra length
+    hash tx_pubkey;
+    std::size_t nonce_field_size = EXTRA_NONCE_SIZE;   // worker nonce + weight pad
+    std::size_t bind_size = 0;
+    std::vector<std::uint8_t> tail;
+    std::uint64_t mm_data = 0;
+
+    std::vector<hash> tx_ids;                 // block order
+    const IXmrSettlementSource* seam = nullptr;
 };
 
-// ---------------------------------------------------------------------------
-// Reward / penalty math  (upstream get_base_reward / get_block_reward, verbatim).
-// The quadratic block-size penalty above the 100-block median is the whole
-// reason the template builder cares about weight at all.
-// ---------------------------------------------------------------------------
-static inline uint64_t get_base_reward(uint64_t already_generated_coins)
-{
-    const uint64_t result = ~already_generated_coins >> 19;
-    return (result < BASE_BLOCK_REWARD) ? BASE_BLOCK_REWARD : result;
+namespace {
+
+// The miner transaction for one extra nonce, with its field offsets.
+struct MinerTx {
+    std::vector<unsigned char> bytes;   // prefix || rct_type(0)
+    std::size_t extra_nonce_offset = 0; // first byte of the 0x02 payload
+    std::size_t mm_root_offset = 0;     // first byte of the 0x03 root
+    hash mm_root;
+};
+
+std::vector<std::uint8_t> nonce_payload(std::uint32_t extra_nonce, std::size_t nonce_field_size,
+                                        std::size_t bind_size, const std::vector<std::uint8_t>& tail,
+                                        const IXmrSettlementSource* seam) {
+    std::vector<std::uint8_t> p;
+    p.reserve(nonce_field_size + bind_size + tail.size());
+    for (int i = 0; i < 4; ++i) p.push_back(static_cast<std::uint8_t>(extra_nonce >> (8 * i)));
+    if (bind_size) {
+        std::vector<std::uint8_t> bind(bind_size, 0);
+        if (!seam || !seam->extra_nonce_bind(extra_nonce, bind.data()))
+            std::fill(bind.begin(), bind.end(), 0);   // no binding available: zeros (the share will not verify)
+        p.insert(p.end(), bind.begin(), bind.end());
+    }
+    p.insert(p.end(), nonce_field_size - EXTRA_NONCE_SIZE, 0);
+    p.insert(p.end(), tail.begin(), tail.end());
+    return p;
 }
 
-static inline uint64_t get_block_reward(uint64_t base_reward, uint64_t median_weight,
-                                        uint64_t fees, uint64_t weight)
-{
-    if (weight <= median_weight) {
-        return base_reward + fees;
-    }
-    if (weight > median_weight * 2) {
-        return 0;                       // over 2x median: zero reward, block invalid
-    }
-    // reward = base_reward * (2*median - weight) * weight / median^2  (128-bit)
-    // NOTE (upstream): overflows if median_weight >= 2^32; acceptable for now.
-    uint64_t product[2];
-    product[0] = umul128(base_reward, (median_weight * 2 - weight) * weight, &product[1]);
-    uint64_t rem;
-    uint64_t reward = udiv128(product[1], product[0], median_weight * median_weight, &rem);
-    return reward + fees;
+MinerTx build_miner_tx(const std::vector<unsigned char>& outputs_head, const hash& tx_pubkey,
+                       const std::vector<std::uint8_t>& payload, std::uint64_t mm_data, const hash& mm_root) {
+    coin::BlobWriter extra;
+    extra.put_byte(coin::TX_EXTRA_TAG_PUBKEY);
+    extra.put_bytes(tx_pubkey.h, HASH_SIZE);
+    extra.put_byte(coin::TX_EXTRA_TAG_NONCE);
+    extra.put_varint(payload.size());
+    const std::size_t payload_at = extra.size();
+    extra.put_bytes(payload.data(), payload.size());
+    extra.put_byte(coin::TX_EXTRA_TAG_MERGE_MINING);
+    extra.put_varint(varint_size(mm_data) + HASH_SIZE);
+    extra.put_varint(mm_data);
+    const std::size_t root_at = extra.size();
+    extra.put_bytes(mm_root.h, HASH_SIZE);
+
+    MinerTx tx;
+    coin::BlobWriter w;
+    w.put_bytes(outputs_head.data(), outputs_head.size());
+    w.put_varint(extra.size());
+    const std::size_t extra_at = w.size();
+    w.put_bytes(extra.bytes().data(), extra.size());
+    w.put_byte(0);   // rct_signatures.type = RCTTypeNull
+    tx.bytes = w.bytes();
+    tx.extra_nonce_offset = extra_at + payload_at;
+    tx.mm_root_offset = extra_at + root_at;
+    tx.mm_root = mm_root;
+    return tx;
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle. m_oldTemplates is a generic double-buffer (NOT a sidechain): jobs
-// handed out under an old template id keep resolving after a new update().
-// The transient temp vectors are intentionally not copied. Thread-safety around
-// update() vs the job getters is the caller's (real tree: one rwlock/instance).
-// ---------------------------------------------------------------------------
-XmrBlockTemplate::XmrBlockTemplate(IXmrSettlementSource* settle)
-    : m_settle(settle)
-{
-    m_rng.seed(seconds_since_epoch());
-    for (size_t i = 0; i < OLD_TEMPLATES; ++i) {
-        m_oldTemplates[i] = new XmrBlockTemplate(settle, /*shallow*/ true);
-    }
+MinerTx miner_tx_for(const XmrBlockTemplate::Snapshot& s, std::uint32_t extra_nonce) {
+    const std::vector<std::uint8_t> payload =
+        nonce_payload(extra_nonce, s.nonce_field_size, s.bind_size, s.tail, s.seam);
+    const hash root = s.seam ? s.seam->commitment_leaf(extra_nonce) : hash{};
+    return build_miner_tx(s.outputs_head, s.tx_pubkey, payload, s.mm_data, root);
 }
 
-// private shallow ctor used only for the old-template buffers (no recursion)
-XmrBlockTemplate::XmrBlockTemplate(IXmrSettlementSource* settle, bool)
-    : m_settle(settle) {}
-
-XmrBlockTemplate::~XmrBlockTemplate()
-{
-    for (size_t i = 0; i < OLD_TEMPLATES; ++i) {
-        delete m_oldTemplates[i];
-        m_oldTemplates[i] = nullptr;
-    }
+// header || tree_root([miner_tx hash] ++ tx ids) || varint(n_tx + 1)
+std::vector<unsigned char> hashing_blob_for(const XmrBlockTemplate::Snapshot& s, const MinerTx& tx) {
+    const std::vector<unsigned char> prefix(tx.bytes.begin(), tx.bytes.end() - 1);
+    std::vector<coin::Hash256> leaves;
+    leaves.reserve(1 + s.tx_ids.size());
+    leaves.push_back(coin::coinbase_tx_hash(coin::tx_prefix_hash(prefix)));
+    for (const hash& id : s.tx_ids) leaves.push_back(to_h256(id));
+    return coin::assemble_hashing_blob(s.header, coin::tree_root(leaves), leaves.size());
 }
 
-XmrBlockTemplate::XmrBlockTemplate(const XmrBlockTemplate& b) { *this = b; }
+// Sizing / selection state for one attempt.
+struct Attempt {
+    std::vector<std::uint64_t> amounts;   // final amounts
+    std::vector<std::size_t> selected;    // indices into the candidate list
+    std::uint64_t reward = 0;
+    std::size_t nonce_field_size = EXTRA_NONCE_SIZE;
+    std::size_t tx_weight = 0;            // miner tx weight the reward was computed for
+};
 
-XmrBlockTemplate& XmrBlockTemplate::operator=(const XmrBlockTemplate& b)
-{
-    if (this == &b) return *this;
+} // namespace
 
-    m_settle                     = b.m_settle;
-    m_templateId                 = b.m_templateId;
-    m_lastUpdated                = b.m_lastUpdated.load();
-    m_blockTemplateBlob          = b.m_blockTemplateBlob;
-    m_merkleTreeMainBranch       = b.m_merkleTreeMainBranch;
-    m_blockHeaderSize            = b.m_blockHeaderSize;
-    m_minerTxOffsetInTemplate    = b.m_minerTxOffsetInTemplate;
-    m_minerTxSize                = b.m_minerTxSize;
-    m_nonceOffset                = b.m_nonceOffset;
-    m_extraNonceOffsetInTemplate = b.m_extraNonceOffsetInTemplate;
-    m_numTransactionHashes       = b.m_numTransactionHashes;
-    m_prevId                     = b.m_prevId;
-    m_height                     = b.m_height.load();
-    m_laneTarget                 = b.m_laneTarget;
-    m_seedHash                   = b.m_seedHash;
-    m_timestamp                  = b.m_timestamp;
-    m_majorVersion               = b.m_majorVersion;
-    m_finalReward                = b.m_finalReward.load();
-    m_extraNonceSize             = b.m_extraNonceSize;
-    m_extraNonceBindSize         = b.m_extraNonceBindSize;
-    m_merkleTreeData             = b.m_merkleTreeData;
-    m_merkleTreeDataSize         = b.m_merkleTreeDataSize;
-    m_minerTxKeccakState         = b.m_minerTxKeccakState;
-    m_minerTxKeccakStateInputLength = b.m_minerTxKeccakStateInputLength;
-    m_rng                        = b.m_rng;
-    // m_oldTemplates and all transient temp vectors are deliberately not copied.
-    return *this;
+// ---------------------------------------------------------------------------
+
+XmrBlockTemplate::XmrBlockTemplate(const IXmrSettlementSource* seam) : m_seam(seam) {}
+XmrBlockTemplate::~XmrBlockTemplate() = default;
+
+std::shared_ptr<const XmrBlockTemplate::Snapshot> XmrBlockTemplate::current() const {
+    std::shared_lock<std::shared_mutex> lk(m_lock);
+    return m_current;
 }
 
-void XmrBlockTemplate::shuffle_tx_order()
-{
-    if (m_mempoolTxsOrder.size() > 1) {
-        for (size_t i = m_mempoolTxsOrder.size() - 1; i >= 1; --i) {
-            std::swap(m_mempoolTxsOrder[i], m_mempoolTxsOrder[m_rng() % (i + 1)]);
-        }
-    }
+std::shared_ptr<const XmrBlockTemplate::Snapshot> XmrBlockTemplate::find(std::uint32_t template_id) const {
+    std::shared_lock<std::shared_mutex> lk(m_lock);
+    if (m_current && m_current->id == template_id) return m_current;
+    for (const auto& s : m_previous)
+        if (s->id == template_id) return s;
+    return nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// select_mempool_transactions  (upstream, with p2pool sidechain serialisation
-// replaced by a conservative fixed template-overhead estimate).
-// ---------------------------------------------------------------------------
-void XmrBlockTemplate::select_mempool_transactions(const std::vector<XmrTxMempoolData>& mempool, bool take_as_given)
-{
-    m_mempoolTxs.clear();
-
-    const uint64_t cur_time = seconds_since_epoch();
-    for (const XmrTxMempoolData& tx : mempool) {
-        // GOOD-CITIZEN (c2pool): take_as_given means the AGPL good-citizen
-        // selector already chose this FINAL set -- include every tx verbatim,
-        // no age gate, no high-fee bypass. Otherwise upstream p2pool rule:
-        // take only txs seen >= 5 s ago, or high-fee txs immediately.
-        if (take_as_given || (cur_time > tx.time_received + 5) || (tx.fee >= HIGH_FEE_VALUE)) {
-            m_mempoolTxs.emplace_back(tx);
-        }
-    }
-
-    // Carrier-size safeguard: the whole block must fit MAX_BLOCK_SIZE. Budget the
-    // header + miner_tx + the per-payee outputs, then spend the rest on 32-B tx
-    // hashes. (Upstream sizes this from the serialised pool block; here the
-    // settlement leg's payee count drives the coinbase estimate.)
-    const size_t num_payees = m_settle ? m_settle->payees().size() : 0;
-
-    size_t k = 128; // header + miner_tx prefix + tx_extra (pubkey/nonce/MM tag), rounded up
-    writeVarint(num_payees,        [&k](uint8_t) { ++k; });
-    writeVarint(m_mempoolTxs.size(), [&k](uint8_t) { ++k; });
-    // per output: <=5 B reward varint + 1 B tag + 32 B key + 1 B view tag
-    k += num_payees * (5 + 1 + HASH_SIZE + 1);
-
-    const uint32_t max_transactions =
-        static_cast<uint32_t>((MAX_BLOCK_SIZE > k) ? ((MAX_BLOCK_SIZE - k) / HASH_SIZE) : 0);
-
-    if (max_transactions == 0) {
-        m_mempoolTxs.clear();
-    }
-    else if (m_mempoolTxs.size() > max_transactions) {
-        // keep the highest fee/byte ones (operator< is fee/byte, highest first)
-        std::nth_element(m_mempoolTxs.begin(), m_mempoolTxs.begin() + max_transactions, m_mempoolTxs.end());
-        m_mempoolTxs.resize(max_transactions);
-    }
+std::uint64_t XmrBlockTemplate::get_reward() const { auto s = current(); return s ? s->reward : 0; }
+std::uint64_t XmrBlockTemplate::get_height() const { auto s = current(); return s ? s->height : 0; }
+difficulty_type XmrBlockTemplate::get_lane_target() const { auto s = current(); return s ? s->lane_target : difficulty_type{}; }
+std::uint64_t XmrBlockTemplate::last_updated() const {
+    std::shared_lock<std::shared_mutex> lk(m_lock);
+    return m_last_updated;
 }
 
-// ---------------------------------------------------------------------------
-// create_miner_tx  (upstream miner_tx assembly; p2pool Wallet::get_eph_public_key
-// -> IXmrSettlementSource::derive_output_key, p2pool txkey* -> the seam's r/R).
-//
-//   version=2 | unlock=height+60 | 1 input txin_gen{height} |
-//   N outputs [ amount varint | 0x03 txout_to_tagged_key | key(32) | view_tag ] |
-//   tx_extra [ 0x01 R(32) | 0x02 len nonce | 0x03 len mm_data root(32) ] |
-//   rct_type=0
-// ---------------------------------------------------------------------------
-int XmrBlockTemplate::create_miner_tx(const XmrMinerData& data,
-                                      uint64_t max_reward_amounts_weight, bool dry_run)
-{
-    m_minerTx.clear();
+void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool,
+                              bool take_mempool_as_given) {
+    if (!m_seam || data.height == 0) return;
+    if (data.major_version > HARDFORK_SUPPORTED_VERSION) return;   // pre-CARROT only
 
-    const std::vector<XmrPayee>& payees = m_settle->payees();
-    const size_t num_outputs = payees.size();
-    m_minerTx.reserve(num_outputs * 39 + 55);
+    const std::vector<XmrPayee>& payees = m_seam->payees();
+    const std::size_t n_out = payees.size();
+    if (n_out == 0) return;
+    const std::uint64_t mm_data = m_seam->merkle_tree_data();
+    const std::uint64_t base = base_reward(data.already_generated_coins);
+    const std::uint64_t now = seconds_since_epoch();
 
-    m_minerTx.push_back(TX_VERSION);
-    writeVarint(data.height + MINER_REWARD_UNLOCK_TIME, m_minerTx); // unlock_time = h + 60
-    m_minerTx.push_back(1);                                         // one input
-    m_minerTx.push_back(TXIN_GEN);                                  // txin_gen tag (0xFF)
-    writeVarint(data.height, m_minerTx);                           // txin_gen.height == block height
-    writeVarint(num_outputs, m_minerTx);
-
-    uint64_t reward_amounts_weight = 0;
-    for (size_t i = 0; i < num_outputs; ++i) {
-        writeVarint(m_rewards[i], [this, &reward_amounts_weight](uint8_t b) {
-            m_minerTx.push_back(b);
-            ++reward_amounts_weight;
-        });
-        m_minerTx.push_back(TXOUT_TO_TAGGED_KEY);
-
-        uint8_t view_tag = 0;
-        if (dry_run) {
-            // sizing pass: real key not needed, only the amount-varint weight
-            m_minerTx.insert(m_minerTx.end(), HASH_SIZE, 0);
-        }
-        else {
-            hash eph_public_key;
-            if (!m_settle->derive_output_key(i, m_majorVersion, eph_public_key, view_tag)) {
-                return -1; // derivation failed at index i (upstream logs + continues; we fail closed)
-            }
-            m_minerTx.insert(m_minerTx.end(), eph_public_key.h, eph_public_key.h + HASH_SIZE);
-        }
-        m_minerTx.emplace_back(view_tag);
-    }
-
-    if (dry_run) {
-        if (reward_amounts_weight != max_reward_amounts_weight) return -1;
-    }
-    else if (reward_amounts_weight > max_reward_amounts_weight) {
-        return -2;
-    }
-
-    // ---- tx_extra ----
-    m_minerTxExtra.clear();
-
-    // 0x01 : R = r*G  (the deterministic tx public key)
-    m_minerTxExtra.push_back(TX_EXTRA_TAG_PUBKEY);
+    // ---- candidates: unique ids; the default path also applies the age gate and sorts by fee rate
+    std::vector<XmrTxMempoolData> cand;
+    cand.reserve(mempool.size());
     {
-        const hash& R = m_settle->tx_public_key();
-        m_minerTxExtra.insert(m_minerTxExtra.end(), R.h, R.h + HASH_SIZE);
-    }
-
-    // 0x02 : extra nonce, padded so the miner-tx weight is invariant to how many
-    // bytes the reward amount varints actually took (upstream trick).
-    m_minerTxExtra.push_back(TX_EXTRA_NONCE);
-    const uint64_t corrected_extra_nonce_size =
-        EXTRA_NONCE_SIZE + max_reward_amounts_weight - reward_amounts_weight;
-    if (corrected_extra_nonce_size > EXTRA_NONCE_MAX_SIZE) {
-        return -3;  // caller re-solves the reward with a smaller budget (see update())
-    }
-    // recon(A+B credit): the on-chain credit cut rides as a constant-size TAIL of the
-    // 0x02 payload (after the worker nonce + weight padding): the weight
-    // invariance trick above is untouched and the per-extra_nonce patch (first
-    // EXTRA_NONCE_SIZE bytes only) never touches it.
-    const std::vector<uint8_t> nonce_tail = m_settle->extra_nonce_tail();
-    // SEAM-1: the per-job binding region sits right after the 4-byte worker
-    // nonce ([extra_nonce 4 | bind N | padding | tail]); constant size, so the
-    // weight-invariance padding above is untouched. N = 0 => byte-identical.
-    const size_t bind_size = m_settle->extra_nonce_bind_size();
-    if (bind_size > EXTRA_NONCE_BIND_MAX) {
-        return -1;  // fail closed: the per-job patch buffers are sized for EXTRA_NONCE_BIND_MAX
-    }
-    m_extraNonceBindSize = static_cast<uint32_t>(bind_size);
-    writeVarint(corrected_extra_nonce_size + bind_size + nonce_tail.size(), m_minerTxExtra);
-
-    uint64_t extraNonceOffsetInMinerTx = m_minerTxExtra.size();
-    m_minerTxExtra.insert(m_minerTxExtra.end(), corrected_extra_nonce_size + bind_size, 0);
-    m_minerTxExtra.insert(m_minerTxExtra.end(), nonce_tail.begin(), nonce_tail.end());
-    m_extraNonceSize = static_cast<uint32_t>(corrected_extra_nonce_size + bind_size + nonce_tail.size());
-
-    // 0x03 : merge-mining tag. v37 commitment (owed_digest/info_digest) rides
-    // here as the single MM-tree leaf (root == leaf for a 1-leaf tree).
-    m_minerTxExtra.push_back(TX_EXTRA_MERGE_MINING_TAG);
-    m_minerTxExtra.push_back(static_cast<uint8_t>(m_merkleTreeDataSize + HASH_SIZE));
-    writeVarint(m_merkleTreeData, m_minerTxExtra);
-    m_minerTxExtra.insert(m_minerTxExtra.end(), HASH_SIZE, 0); // root patched per extra_nonce later
-
-    writeVarint(m_minerTxExtra.size(), m_minerTx);
-    extraNonceOffsetInMinerTx += m_minerTx.size();
-    m_extraNonceOffsetInTemplate = extraNonceOffsetInMinerTx;
-    m_minerTx.insert(m_minerTx.end(), m_minerTxExtra.begin(), m_minerTxExtra.end());
-    m_minerTxExtra.clear();
-
-    // rct_type = 0 (RCTTypeNull); not part of the tx-prefix hash
-    m_minerTx.push_back(0);
-    return 1;
-}
-
-// ---------------------------------------------------------------------------
-// calc_miner_tx_hash  (upstream). v2 tx hash = Keccak(H(prefix) || H(rct_base)
-// || H(prunable)); for an RCTTypeNull coinbase H(prunable)=0 and H(rct_base) is
-// a known constant. The prefix hash is computed with extra_nonce and the MM root
-// patched in-place, using the cached Keccak midstate for O(1) per extra_nonce.
-// ---------------------------------------------------------------------------
-hash XmrBlockTemplate::calc_miner_tx_hash(uint32_t extra_nonce) const
-{
-    uint8_t hashes[HASH_SIZE * 3];
-
-    const uint8_t* data = m_blockTemplateBlob.data() + m_minerTxOffsetInTemplate;
-
-    const size_t extra_nonce_offset = m_extraNonceOffsetInTemplate - m_minerTxOffsetInTemplate;
-    // The per-job mutable head of the 0x02 payload: the 4-byte worker nonce,
-    // then the SEAM-1 binding region (m_extraNonceBindSize bytes, 0 = none).
-    uint8_t extra_nonce_buf[EXTRA_NONCE_SIZE + EXTRA_NONCE_BIND_MAX] = {
-        static_cast<uint8_t>(extra_nonce >> 0),
-        static_cast<uint8_t>(extra_nonce >> 8),
-        static_cast<uint8_t>(extra_nonce >> 16),
-        static_cast<uint8_t>(extra_nonce >> 24),
-    };
-    const size_t en_len = EXTRA_NONCE_SIZE + m_extraNonceBindSize;
-    if (m_extraNonceBindSize) (void)m_settle->extra_nonce_bind(extra_nonce, extra_nonce_buf + EXTRA_NONCE_SIZE);
-
-    // v37: single MM-tree leaf, so the tag's 32-B root IS the commitment leaf.
-    const hash merge_mining_root = m_settle->commitment_leaf(extra_nonce);
-
-    const size_t merkle_root_offset =
-        extra_nonce_offset + m_extraNonceSize + 2 + m_merkleTreeDataSize;
-
-    // Prefix = whole miner_tx minus the trailing rct_type byte.
-    const size_t tx_size = m_minerTxSize - 1;
-
-    hash full_hash;
-    uint8_t tx_buf[288 + EXTRA_NONCE_BIND_MAX];
-
-    const size_t N = m_minerTxKeccakStateInputLength;
-    const bool fast = N && (N <= extra_nonce_offset) && (N < tx_size) && (tx_size - N <= sizeof(tx_buf));
-
-    if (!fast) {
-        // slow path O(N): stream the prefix, substituting the mutated regions
-        keccak_custom([data, extra_nonce_offset, &extra_nonce_buf, en_len, merkle_root_offset, &merge_mining_root](int offset) -> uint8_t {
-            uint32_t k = static_cast<uint32_t>(offset - static_cast<int>(extra_nonce_offset));
-            if (k < en_len) return extra_nonce_buf[k];
-            k = static_cast<uint32_t>(offset - static_cast<int>(merkle_root_offset));
-            if (k < HASH_SIZE) return merge_mining_root.h[k];
-            return data[offset];
-        }, static_cast<int>(tx_size), full_hash.h, HASH_SIZE);
-        std::memcpy(hashes, full_hash.h, HASH_SIZE);
-    }
-    else {
-        // fast path O(1): resume from the cached midstate, only the tail bytes
-        // (which contain extra_nonce + MM root) are absorbed fresh
-        const int inlen = static_cast<int>(tx_size - N);
-        std::memcpy(tx_buf, data + N, inlen);
-        std::memcpy(tx_buf + extra_nonce_offset - N, extra_nonce_buf, en_len);
-        std::memcpy(tx_buf + merkle_root_offset - N, merge_mining_root.h, HASH_SIZE);
-
-        std::array<uint64_t, 25> st = m_minerTxKeccakState;
-        keccak_finish(tx_buf, inlen, st);
-        std::memcpy(hashes, st.data(), HASH_SIZE);
-    }
-
-    // Base RCT of an RCTTypeNull coinbase is a single 0 byte; its Keccak is fixed.
-    static constexpr uint8_t known_second_hash[HASH_SIZE] = {
-        188,54,120,158,122,30,40,20,54,70,66,41,130,143,129,125,
-        102,18,247,180,119,214,101,145,255,150,169,224,100,188,201,138
-    };
-    std::memcpy(hashes + HASH_SIZE, known_second_hash, HASH_SIZE);
-
-    // Prunable RCT is empty in a coinbase -> null hash.
-    std::memset(hashes + HASH_SIZE * 2, 0, HASH_SIZE);
-
-    hash result;
-    keccak(hashes, sizeof(hashes), result.h);
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// calc_merkle_tree_main_branch  (upstream, verbatim). Precomputes the fixed
-// authentication path from leaf 0 (the coinbase) to the tree root, so that each
-// per-extra-nonce blob only folds the new miner-tx hash up this branch.
-// ---------------------------------------------------------------------------
-void XmrBlockTemplate::calc_merkle_tree_main_branch()
-{
-    m_merkleTreeMainBranch.clear();
-
-    const uint64_t count = m_numTransactionHashes + 1;
-    if (count == 1) return;
-
-    const uint8_t* h = m_transactionHashes.data();
-
-    if (count == 2) {
-        m_merkleTreeMainBranch.insert(m_merkleTreeMainBranch.end(), h + HASH_SIZE, h + HASH_SIZE * 2);
-        return;
-    }
-
-    size_t i, j, cnt;
-    for (i = 0, cnt = 1; cnt <= count; ++i, cnt <<= 1) {}
-    cnt >>= 1;
-
-    std::vector<uint8_t> ints(cnt * HASH_SIZE);
-    std::memcpy(ints.data(), h, (cnt * 2 - count) * HASH_SIZE);
-
-    hash tmp;
-    for (i = cnt * 2 - count, j = cnt * 2 - count; j < cnt; i += 2, ++j) {
-        if (i == 0) {
-            m_merkleTreeMainBranch.insert(m_merkleTreeMainBranch.end(), h + HASH_SIZE, h + HASH_SIZE * 2);
-        }
-        keccak(h + i * HASH_SIZE, HASH_SIZE * 2, tmp.h);
-        std::memcpy(ints.data() + j * HASH_SIZE, tmp.h, HASH_SIZE);
-    }
-
-    while (cnt > 2) {
-        cnt >>= 1;
-        for (i = 0, j = 0; j < cnt; i += 2, ++j) {
-            if (i == 0) {
-                m_merkleTreeMainBranch.insert(m_merkleTreeMainBranch.end(), ints.data() + HASH_SIZE, ints.data() + HASH_SIZE * 2);
-            }
-            keccak(ints.data() + i * HASH_SIZE, HASH_SIZE * 2, tmp.h);
-            std::memcpy(ints.data() + j * HASH_SIZE, tmp.h, HASH_SIZE);
+        std::set<std::array<std::uint8_t, HASH_SIZE>> seen;
+        for (const XmrTxMempoolData& t : mempool) {
+            std::array<std::uint8_t, HASH_SIZE> k;
+            std::memcpy(k.data(), t.id.h, HASH_SIZE);
+            if (!seen.insert(k).second) continue;   // a block may not carry a transaction twice
+            if (!take_mempool_as_given && t.time_received != 0 &&
+                t.time_received + MEMPOOL_MIN_AGE_SECONDS > now)
+                continue;                           // too new: give it time to propagate
+            cand.push_back(t);
         }
     }
+    if (!take_mempool_as_given) std::stable_sort(cand.begin(), cand.end(), better_fee_rate);
+    std::uint64_t fees_all = 0;
+    for (const XmrTxMempoolData& t : cand) fees_all += t.fee;
 
-    m_merkleTreeMainBranch.insert(m_merkleTreeMainBranch.end(), ints.data() + HASH_SIZE, ints.data() + HASH_SIZE * 2);
-}
+    // ---- header (fixed for this template)
+    const std::uint8_t minor = HARDFORK_SUPPORTED_VERSION;
+    const std::uint64_t timestamp = std::max<std::uint64_t>(now, data.median_timestamp);
+    const std::vector<unsigned char> header =
+        coin::write_block_header_prefix(data.major_version, minor, timestamp, to_h256(data.prev_id), 0);
+    const std::size_t nonce_offset = header.size() - NONCE_SIZE;
 
-// ---------------------------------------------------------------------------
-// get_hashing_blob_nolock  (upstream). The 76-80 B RandomX input:
-//   header(bin) || tree_root(32) || varint(n_tx + 1)
-// ---------------------------------------------------------------------------
-uint32_t XmrBlockTemplate::get_hashing_blob_nolock(uint32_t extra_nonce, uint8_t* blob) const
-{
-    uint8_t* p = blob;
+    const std::size_t bind_size = m_seam->extra_nonce_bind_size();
+    if (bind_size > EXTRA_NONCE_BIND_MAX) return;
 
-    std::memcpy(p, m_blockTemplateBlob.data(), m_blockHeaderSize);
-    p += m_blockHeaderSize;
+    const std::vector<coin::PublicKey> zero_keys(n_out);
+    const std::vector<coin::ViewTag> zero_tags(n_out);
 
-    // fold the freshly-hashed coinbase up the precomputed main branch to the root
-    hash root_hash = calc_miner_tx_hash(extra_nonce);
-    for (size_t i = 0; i < m_merkleTreeMainBranch.size(); i += HASH_SIZE) {
-        uint8_t pair[HASH_SIZE * 2];
-        std::memcpy(pair, root_hash.h, HASH_SIZE);
-        std::memcpy(pair + HASH_SIZE, m_merkleTreeMainBranch.data() + i, HASH_SIZE);
-        keccak(pair, HASH_SIZE * 2, root_hash.h);
-    }
-
-    std::memcpy(p, root_hash.h, HASH_SIZE);
-    p += HASH_SIZE;
-
-    writeVarint(m_numTransactionHashes + 1, [&p](uint8_t b) { *(p++) = b; });
-    return static_cast<uint32_t>(p - blob);
-}
-
-// ---------------------------------------------------------------------------
-// update  (upstream orchestration; SideChain calls -> IXmrSettlementSource).
-// ---------------------------------------------------------------------------
-void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxMempoolData>& mempool, bool take_as_given)
-{
-    if (data.major_version > HARDFORK_SUPPORTED_VERSION) {
-        return; // unknown fork: refuse to build, pin HARDFORK_SUPPORTED_VERSION per fork
-    }
-
-    // snapshot the outgoing template so in-flight job ids keep resolving
-    if (m_templateId > 0) {
-        *m_oldTemplates[m_templateId % OLD_TEMPLATES] = *this;
-    }
-    ++m_templateId;
-    m_lastUpdated = seconds_since_epoch();
-
-    auto use_old_template = [this]() {
-        const uint32_t id = m_templateId - 1;
-        *this = *m_oldTemplates[id % OLD_TEMPLATES];
+    // Miner transaction size for a set of amounts (keys do not change the size).
+    auto tx_size = [&](const std::vector<std::uint64_t>& amounts, std::size_t nonce_field,
+                       const std::vector<std::uint8_t>& tail) -> std::size_t {
+        const std::vector<unsigned char> head = coin::write_coinbase_prefix_head(
+            data.height, amounts.data(), zero_keys.data(), zero_tags.data(), n_out);
+        const std::vector<std::uint8_t> payload(nonce_field + bind_size + tail.size(), 0);
+        return build_miner_tx(head, hash{}, payload, mm_data, hash{}).bytes.size();
     };
 
-    m_height       = data.height;
-    m_laneTarget   = data.lane_target;
-    m_seedHash     = data.seed_hash;
-    m_majorVersion = data.major_version;
-
-    // ---- block header ----
-    m_blockHeader.clear();
-    m_blockHeader.push_back(data.major_version);
-    m_blockHeader.push_back(HARDFORK_SUPPORTED_VERSION);
-
-    m_timestamp = seconds_since_epoch();
-    if (m_timestamp <= data.median_timestamp) {
-        m_timestamp = data.median_timestamp + 1;
-    }
-    writeVarint(m_timestamp, m_blockHeader);
-
-    m_blockHeader.insert(m_blockHeader.end(), data.prev_id.h, data.prev_id.h + HASH_SIZE);
-    m_prevId = data.prev_id;
-
-    m_nonceOffset = m_blockHeader.size();
-    m_blockHeader.insert(m_blockHeader.end(), NONCE_SIZE, 0);
-    m_blockHeaderSize = m_blockHeader.size();
-
-    // ---- payees + MM-tree shape from the settlement seam ----
-    const std::vector<XmrPayee>& payees = m_settle->payees();
-    m_merkleTreeData = m_settle->merkle_tree_data();
-    m_merkleTreeDataSize = 0;
-    writeVarint(m_merkleTreeData, [this](uint8_t) { ++m_merkleTreeDataSize; });
-
-    select_mempool_transactions(mempool, take_as_given);
-
-    const uint64_t base_reward = get_base_reward(data.already_generated_coins);
-
-    uint64_t total_tx_fees = 0, total_tx_weight = 0;
-    for (const XmrTxMempoolData& tx : m_mempoolTxs) {
-        total_tx_fees += tx.fee;
-        total_tx_weight += tx.weight;
-    }
-
-    // amount-varint weight of a full-reward split fixes the dry-run coinbase size
-    if (!m_settle->split_reward(base_reward + total_tx_fees, m_rewards)) {
-        use_old_template();
-        return;
-    }
-    auto get_reward_amounts_weight = [this]() {
-        return std::accumulate(m_rewards.begin(), m_rewards.end(), 0ULL,
-            [](uint64_t a, uint64_t b) { writeVarint(b, [&a](uint8_t) { ++a; }); return a; });
+    // Select transactions given the miner transaction weight; returns false when
+    // even the coinbase-only block has no valid reward.
+    auto select = [&](std::size_t cb_weight, std::vector<std::size_t>& sel, std::uint64_t& reward) -> bool {
+        sel.clear();
+        std::uint64_t weight = cb_weight, fees = 0, best = 0;
+        if (!block_reward(base, data.median_weight, weight, best)) return false;
+        std::size_t blob = header.size() + cb_weight + varint_size(0);
+        for (std::size_t i = 0; i < cand.size(); ++i) {
+            const XmrTxMempoolData& t = cand[i];
+            const std::size_t blob2 = blob - varint_size(sel.size()) + varint_size(sel.size() + 1) + HASH_SIZE;
+            if (blob2 > MAX_BLOCK_TEMPLATE_BLOB) {
+                if (take_mempool_as_given) break;   // keep the given order: drop the tail
+                continue;
+            }
+            const std::uint64_t w2 = weight + t.weight;
+            if (take_mempool_as_given) {
+                sel.push_back(i); weight = w2; fees += t.fee; blob = blob2;
+                continue;
+            }
+            std::uint64_t r2 = 0;
+            if (!block_reward(base, data.median_weight, w2, r2)) continue;
+            const std::uint64_t coinbase = r2 + fees + t.fee;
+            if (coinbase < best) continue;           // the coinbase must not decrease
+            sel.push_back(i); weight = w2; fees += t.fee; best = coinbase; blob = blob2;
+        }
+        std::uint64_t r = 0;
+        if (!block_reward(base, data.median_weight, weight, r)) return false;
+        reward = r + fees;
+        return true;
     };
-    uint64_t max_reward_amounts_weight = get_reward_amounts_weight();
 
-    if (create_miner_tx(data, max_reward_amounts_weight, true) < 0) { use_old_template(); return; }
-    uint64_t miner_tx_weight = m_minerTx.size();
+    // One sizing + selection + final-amount attempt. `sizing` are the amounts
+    // the miner transaction is sized with.
+    auto attempt = [&](const std::vector<std::uint64_t>& sizing, Attempt& out) -> bool {
+        if (sizing.size() != n_out) return false;
+        const std::vector<std::uint8_t> tail = m_seam->extra_nonce_tail();
+        const std::size_t w_dry = tx_size(sizing, EXTRA_NONCE_SIZE, tail);
+        std::uint64_t reward = 0;
+        if (!select(w_dry, out.selected, reward)) return false;
+        std::vector<std::uint64_t> final_amounts;
+        if (!m_seam->split_reward(reward, final_amounts) || final_amounts.size() != n_out) return false;
+        const std::size_t aw_dry = amounts_weight(sizing), aw_final = amounts_weight(final_amounts);
+        if (aw_final > aw_dry) return false;                          // amounts grew: re-size
+        const std::size_t nonce_field = EXTRA_NONCE_SIZE + (aw_dry - aw_final);
+        if (nonce_field > EXTRA_NONCE_MAX_SIZE) return false;          // pad out of range: re-size
+        const std::vector<std::uint8_t> tail2 = m_seam->extra_nonce_tail();   // read after the final split
+        if (nonce_field + bind_size + tail2.size() > TX_EXTRA_NONCE_MAX) return false;
+        if (tx_size(final_amounts, nonce_field, tail2) != w_dry) return false;   // a length varint moved
+        out.amounts = std::move(final_amounts);
+        out.reward = reward;
+        out.nonce_field_size = nonce_field;
+        out.tx_weight = w_dry;
+        return true;
+    };
 
-    uint64_t final_reward, final_fees, final_weight;
-
-    m_mempoolTxsOrder.resize(m_mempoolTxs.size());
-    for (size_t i = 0; i < m_mempoolTxs.size(); ++i) m_mempoolTxsOrder[i] = static_cast<int>(i);
-
-    if (take_as_given || total_tx_weight + miner_tx_weight <= data.median_weight) {
-        // Below the penalty zone: take everything. GOOD-CITIZEN (c2pool): under
-        // take_as_given the AGPL selector has already chosen the FINAL set and
-        // capped it below the consensus ceiling, so this branch mines it
-        // verbatim EVEN when it reaches the penalty zone -- no greedy re-drop.
-        final_fees = 0;
-        final_weight = miner_tx_weight;
-        // Keep selector order deterministic (== block order) under take_as_given
-        // so the served/mined set is KAT-comparable; monerod accepts any order.
-        if (!take_as_given) shuffle_tx_order();
-
-        m_numTransactionHashes = m_mempoolTxsOrder.size();
-        m_transactionHashes.assign(HASH_SIZE, 0);
-        std::unordered_set<hash, HashHasher> seen;
-        for (int idx : m_mempoolTxsOrder) {
-            const XmrTxMempoolData& tx = m_mempoolTxs[idx];
-            if (!seen.insert(tx.id).second) continue;
-            m_transactionHashes.insert(m_transactionHashes.end(), tx.id.h, tx.id.h + HASH_SIZE);
-            final_fees += tx.fee;
-            final_weight += tx.weight;
-        }
-        // get_block_reward == base_reward + final_fees below the median, and
-        // applies the correct penalty above it (0 above 2*median, which the
-        // AGPL coinbase-aware trim in XmrBlockAssembler::build guarantees we
-        // never reach). Under the pure sub-median case this is identical to the
-        // upstream `base_reward + final_fees`.
-        final_reward = get_block_reward(base_reward, data.median_weight, final_fees, final_weight);
-    }
-    else {
-        // penalty zone: greedy fee-per-byte pick with 100-deep replacement,
-        // maximising get_block_reward (upstream heuristic).
-        std::sort(m_mempoolTxsOrder.begin(), m_mempoolTxsOrder.end(),
-                  [this](int a, int b) { return m_mempoolTxs[a] < m_mempoolTxs[b]; });
-
-        final_reward = base_reward;
-        final_fees = 0;
-        final_weight = miner_tx_weight;
-        m_mempoolTxsOrder2.clear();
-
-        for (int i = 0; i < static_cast<int>(m_mempoolTxsOrder.size()); ++i) {
-            const XmrTxMempoolData& tx = m_mempoolTxs[m_mempoolTxsOrder[i]];
-            int k = -1;
-            const uint64_t reward = get_block_reward(base_reward, data.median_weight, final_fees + tx.fee, final_weight + tx.weight);
-            if (reward > final_reward) { final_reward = reward; k = i; }
-
-            if (final_weight + tx.weight > data.median_weight) {
-                const int n = static_cast<int>(m_mempoolTxsOrder2.size());
-                for (int j = n - 1, j1 = std::max<int>(0, n - 100); j >= j1; --j) {
-                    const XmrTxMempoolData& prev_tx = m_mempoolTxs[m_mempoolTxsOrder2[j]];
-                    const uint64_t reward2 = get_block_reward(base_reward, data.median_weight,
-                        final_fees + tx.fee - prev_tx.fee, final_weight + tx.weight - prev_tx.weight);
-                    if (reward2 > final_reward) { final_reward = reward2; k = j; }
-                }
-            }
-
-            if (k == i) {
-                m_mempoolTxsOrder2.push_back(m_mempoolTxsOrder[i]);
-                final_fees += tx.fee; final_weight += tx.weight;
-            }
-            else if (k >= 0) {
-                const XmrTxMempoolData& prev_tx = m_mempoolTxs[m_mempoolTxsOrder2[k]];
-                m_mempoolTxsOrder2[k] = m_mempoolTxsOrder[i];
-                final_fees += tx.fee - prev_tx.fee;
-                final_weight += tx.weight - prev_tx.weight;
-            }
-        }
-        m_mempoolTxsOrder = m_mempoolTxsOrder2;
-
-        final_fees = 0;
-        final_weight = miner_tx_weight;
-        shuffle_tx_order();
-
-        m_numTransactionHashes = m_mempoolTxsOrder.size();
-        m_transactionHashes.assign(HASH_SIZE, 0);
-        std::unordered_set<hash, HashHasher> seen;
-        for (int idx : m_mempoolTxsOrder) {
-            const XmrTxMempoolData& tx = m_mempoolTxs[idx];
-            if (!seen.insert(tx.id).second) continue;
-            m_transactionHashes.insert(m_transactionHashes.end(), tx.id.h, tx.id.h + HASH_SIZE);
-            final_fees += tx.fee;
-            final_weight += tx.weight;
-        }
-        final_reward = get_block_reward(base_reward, data.median_weight, final_fees, final_weight);
+    // Sizing pass: the reward with every candidate's fee and no penalty.
+    std::vector<std::uint64_t> sizing;
+    if (!m_seam->split_reward(base + fees_all, sizing)) return;
+    Attempt a;
+    if (!attempt(sizing, a)) {
+        // Re-size once with the amounts of the reward the first attempt reached.
+        std::uint64_t reward = 0;
+        std::vector<std::size_t> sel;
+        if (sizing.size() != n_out) return;
+        if (!select(tx_size(sizing, EXTRA_NONCE_SIZE, m_seam->extra_nonce_tail()), sel, reward)) return;
+        std::vector<std::uint64_t> resized;
+        if (!m_seam->split_reward(reward, resized)) return;
+        a = Attempt{};
+        if (!attempt(resized, a)) return;
     }
 
-    if (!m_settle->split_reward(final_reward, m_rewards)) { use_old_template(); return; }
-
-    int r = create_miner_tx(data, max_reward_amounts_weight, false);
-    if (r < 0) {
-        if (r == -3) {
-            // extra nonce grew past its cap: re-solve reward on a smaller weight
-            const uint64_t w = (final_weight > m_rewards.size()) ? (final_weight - m_rewards.size()) : 0;
-            const uint64_t r2 = get_block_reward(base_reward, data.median_weight, final_fees, w);
-            if (!m_settle->split_reward(r2, m_rewards)) { use_old_template(); return; }
-            max_reward_amounts_weight = get_reward_amounts_weight();
-            if (create_miner_tx(data, max_reward_amounts_weight, true) < 0) { use_old_template(); return; }
-            final_weight += m_minerTx.size() - miner_tx_weight;
-            miner_tx_weight = m_minerTx.size();
-            final_reward = get_block_reward(base_reward, data.median_weight, final_fees, final_weight);
-            if (!m_settle->split_reward(final_reward, m_rewards)) { use_old_template(); return; }
-            if (create_miner_tx(data, max_reward_amounts_weight, false) < 0) { use_old_template(); return; }
-        }
-        else { use_old_template(); return; }
+    // ---- final keys
+    auto s = std::make_shared<Snapshot>();
+    std::vector<coin::PublicKey> keys(n_out);
+    std::vector<coin::ViewTag> tags(n_out);
+    for (std::size_t i = 0; i < n_out; ++i) {
+        hash p;
+        std::uint8_t vt = 0;
+        if (!m_seam->derive_output_key(i, data.major_version, p, vt)) return;
+        std::memcpy(&keys[i], p.h, HASH_SIZE);
+        tags[i].tag = vt;
     }
-    if (m_minerTx.size() != miner_tx_weight) { use_old_template(); return; }
+    s->outputs_head = coin::write_coinbase_prefix_head(data.height, a.amounts.data(), keys.data(), tags.data(), n_out);
+    s->tx_pubkey = m_seam->tx_public_key();
+    s->tail = m_seam->extra_nonce_tail();
+    s->nonce_field_size = a.nonce_field_size;
+    s->bind_size = bind_size;
+    s->mm_data = mm_data;
+    s->seam = m_seam;
+    s->height = data.height;
+    s->prev_id = data.prev_id;
+    s->seed_hash = data.seed_hash;
+    s->lane_target = data.lane_target;
+    s->reward = a.reward;
+    s->header = header;
+    s->nonce_offset = nonce_offset;
+    s->tx_ids.reserve(a.selected.size());
+    for (std::size_t i : a.selected) s->tx_ids.push_back(cand[i].id);
 
-    m_finalReward = final_reward;
+    // Self-check at extra nonce 0: the final miner transaction has the weight the
+    // reward was computed for, and the hashing blob is in range.
+    const MinerTx tx0 = miner_tx_for(*s, 0);
+    if (tx0.bytes.size() != a.tx_weight) return;
+    const std::size_t hb = hashing_blob_for(*s, tx0).size();
+    if (hb < HASHING_BLOB_MIN_SIZE || hb > HASHING_BLOB_MAX_SIZE) return;
 
-    // ---- assemble the block-template blob: header || miner_tx || varint(n_tx) || tx hashes ----
-    m_blockTemplateBlob = m_blockHeader;
-    m_extraNonceOffsetInTemplate += m_blockHeader.size();
-    m_minerTxOffsetInTemplate = m_blockHeader.size();
-    m_minerTxSize = m_minerTx.size();
-    m_blockTemplateBlob.insert(m_blockTemplateBlob.end(), m_minerTx.begin(), m_minerTx.end());
-    writeVarint(m_numTransactionHashes, m_blockTemplateBlob);
-    // leaf 0 (miner-tx hash) slot is skipped; only the non-coinbase hashes go in
-    m_blockTemplateBlob.insert(m_blockTemplateBlob.end(),
-                               m_transactionHashes.begin() + HASH_SIZE, m_transactionHashes.end());
-
-    // ---- cache the Keccak midstate of the miner-tx prefix up to tx_extra ----
-    m_minerTxKeccakState = {};
-    const size_t extra_nonce_offset = m_extraNonceOffsetInTemplate - m_minerTxOffsetInTemplate;
-    if (extra_nonce_offset >= KeccakParams::HASH_DATA_AREA) {
-        m_minerTxKeccakStateInputLength =
-            (extra_nonce_offset / KeccakParams::HASH_DATA_AREA) * KeccakParams::HASH_DATA_AREA;
-        keccak_step(m_blockTemplateBlob.data() + m_minerTxOffsetInTemplate,
-                    static_cast<int>(m_minerTxKeccakStateInputLength), m_minerTxKeccakState);
+    std::unique_lock<std::shared_mutex> lk(m_lock);
+    s->id = m_next_id++;
+    if (m_current) {
+        m_previous.push_front(m_current);
+        if (m_previous.size() > kKeepPrevious) m_previous.pop_back();
     }
-    else {
-        m_minerTxKeccakStateInputLength = 0;
-    }
-
-    // leaf 0 = coinbase hash at extra_nonce 0; then the fixed main branch
-    const hash minerTx_hash = calc_miner_tx_hash(0);
-    std::memcpy(m_transactionHashes.data(), minerTx_hash.h, HASH_SIZE);
-    calc_merkle_tree_main_branch();
-
-    // free transient state
-    m_minerTx.clear();
-    m_blockHeader.clear();
-    m_minerTxExtra.clear();
-    m_transactionHashes.clear();
-    m_rewards.clear();
-    m_mempoolTxs.clear();
-    m_mempoolTxsOrder.clear();
-    m_mempoolTxsOrder2.clear();
-    (void)payees;
+    m_current = std::move(s);
+    m_last_updated = now ? now : 1;
 }
 
-// ---------------------------------------------------------------------------
-// per-worker job APIs
-// ---------------------------------------------------------------------------
-uint32_t XmrBlockTemplate::get_hashing_blob(uint32_t extra_nonce,
-                                            uint8_t (&blob)[HASHING_BLOB_MAX_SIZE],
-                                            uint64_t& height, difficulty_type& lane_target,
-                                            hash& seed_hash, size_t& nonce_offset,
-                                            uint32_t& template_id) const
-{
-    height      = m_height.load();
-    lane_target = m_laneTarget;
-    seed_hash   = m_seedHash;
-    nonce_offset = m_nonceOffset;
-    template_id = m_templateId;
-    return get_hashing_blob_nolock(extra_nonce, blob);
+std::uint32_t XmrBlockTemplate::get_hashing_blob(std::uint32_t extra_nonce, std::uint8_t* blob,
+                                                 std::uint64_t& height, difficulty_type& lane_target,
+                                                 hash& seed_hash, std::size_t& nonce_offset,
+                                                 std::uint32_t& template_id) const {
+    const auto s = current();
+    if (!s) {
+        template_id = 0;
+        return 0;
+    }
+    const std::vector<unsigned char> hb = hashing_blob_for(*s, miner_tx_for(*s, extra_nonce));
+    if (hb.size() > HASHING_BLOB_MAX_SIZE) {
+        template_id = 0;
+        return 0;
+    }
+    std::memcpy(blob, hb.data(), hb.size());
+    height = s->height;
+    lane_target = s->lane_target;
+    seed_hash = s->seed_hash;
+    nonce_offset = s->nonce_offset;
+    template_id = s->id;
+    return static_cast<std::uint32_t>(hb.size());
 }
 
-uint32_t XmrBlockTemplate::get_hashing_blobs(uint32_t extra_nonce_start, uint32_t count,
-                                             std::vector<uint8_t>& blobs,
-                                             uint64_t& height, difficulty_type& lane_target,
-                                             hash& seed_hash, size_t& nonce_offset,
-                                             uint32_t& template_id) const
-{
+std::uint32_t XmrBlockTemplate::get_hashing_blobs(std::uint32_t extra_nonce_start, std::uint32_t count,
+                                                  std::vector<std::uint8_t>& blobs,
+                                                  std::uint64_t& height, difficulty_type& lane_target,
+                                                  hash& seed_hash, std::size_t& nonce_offset,
+                                                  std::uint32_t& template_id) const {
     blobs.clear();
-    height      = m_height.load();
-    lane_target = m_laneTarget;
-    seed_hash   = m_seedHash;
-    nonce_offset = m_nonceOffset;
-    template_id = m_templateId;
-
-    blobs.resize(HASHING_BLOB_MAX_SIZE);
-    const uint32_t blob_size = get_hashing_blob_nolock(extra_nonce_start, blobs.data());
-    if (blob_size < HASHING_BLOB_MIN_SIZE || blob_size > HASHING_BLOB_MAX_SIZE) {
-        return blob_size; // caller treats out-of-range as an internal error
+    const auto s = current();
+    if (!s || count == 0) {
+        template_id = 0;
+        return 0;
     }
-    blobs.resize(static_cast<size_t>(blob_size) * count);
-
-    if (count > 1) {
-        uint8_t* blobs_data = blobs.data();
-        std::atomic<uint32_t> counter{1};
-        parallel_run([this, blob_size, extra_nonce_start, count, &counter, blobs_data]() {
-            for (;;) {
-                const uint32_t i = counter.fetch_add(1);
-                if (i >= count) return;
-                (void)get_hashing_blob_nolock(extra_nonce_start + i,
-                                              blobs_data + static_cast<size_t>(i) * blob_size);
-            }
-        }, true);
+    std::uint32_t size = 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::vector<unsigned char> hb = hashing_blob_for(*s, miner_tx_for(*s, extra_nonce_start + i));
+        if (i == 0) {
+            size = static_cast<std::uint32_t>(hb.size());
+            blobs.reserve(static_cast<std::size_t>(size) * count);
+        }
+        if (hb.size() != size || size > HASHING_BLOB_MAX_SIZE) {   // every blob of one template has one size
+            blobs.clear();
+            template_id = 0;
+            return 0;
+        }
+        blobs.insert(blobs.end(), hb.begin(), hb.end());
     }
-    return blob_size;
+    height = s->height;
+    lane_target = s->lane_target;
+    seed_hash = s->seed_hash;
+    nonce_offset = s->nonce_offset;
+    template_id = s->id;
+    return size;
 }
 
-std::vector<uint8_t> XmrBlockTemplate::get_block_template_blob(uint32_t template_id, uint32_t extra_nonce,
-                                                               size_t& nonce_offset,
-                                                               size_t& extra_nonce_offset,
-                                                               size_t& merkle_root_offset,
-                                                               hash& merkle_root) const
-{
-    // resolve template_id against this template or the double-buffer
-    const XmrBlockTemplate* t = this;
-    if (template_id != m_templateId) {
-        for (size_t i = 0; i < OLD_TEMPLATES; ++i) {
-            if (m_oldTemplates[i] && m_oldTemplates[i]->m_templateId == template_id) {
-                t = m_oldTemplates[i];
-                break;
-            }
-        }
-    }
+std::vector<std::uint8_t> XmrBlockTemplate::get_block_template_blob(std::uint32_t template_id, std::uint32_t extra_nonce,
+                                                                    std::size_t& nonce_offset,
+                                                                    std::size_t& extra_nonce_offset,
+                                                                    std::size_t& merkle_root_offset,
+                                                                    hash& merkle_root) const {
+    nonce_offset = extra_nonce_offset = merkle_root_offset = 0;
+    const auto s = find(template_id);
+    if (!s) return {};
+    const MinerTx tx = miner_tx_for(*s, extra_nonce);
 
-    std::vector<uint8_t> blob = t->m_blockTemplateBlob;
-    nonce_offset       = t->m_nonceOffset;
-    extra_nonce_offset = t->m_extraNonceOffsetInTemplate;
-    merkle_root_offset = t->m_extraNonceOffsetInTemplate + t->m_extraNonceSize + 2 + t->m_merkleTreeDataSize;
+    coin::BlobWriter w;
+    w.put_bytes(s->header.data(), s->header.size());
+    w.put_bytes(tx.bytes.data(), tx.bytes.size());
+    w.put_varint(s->tx_ids.size());
+    for (const hash& id : s->tx_ids) w.put_bytes(id.h, HASH_SIZE);
 
-    // patch this worker's extra nonce (+ the SEAM-1 binding region, if any)
-    uint8_t en[EXTRA_NONCE_SIZE + EXTRA_NONCE_BIND_MAX] = {
-        static_cast<uint8_t>(extra_nonce >> 0), static_cast<uint8_t>(extra_nonce >> 8),
-        static_cast<uint8_t>(extra_nonce >> 16), static_cast<uint8_t>(extra_nonce >> 24),
-    };
-    if (t->m_extraNonceBindSize) (void)t->m_settle->extra_nonce_bind(extra_nonce, en + EXTRA_NONCE_SIZE);
-    std::memcpy(blob.data() + extra_nonce_offset, en, EXTRA_NONCE_SIZE + t->m_extraNonceBindSize);
-
-    // patch the MM commitment root for this extra nonce
-    merkle_root = t->m_settle->commitment_leaf(extra_nonce);
-    std::memcpy(blob.data() + merkle_root_offset, merkle_root.h, HASH_SIZE);
-    return blob;
+    nonce_offset = s->nonce_offset;
+    extra_nonce_offset = s->header.size() + tx.extra_nonce_offset;
+    merkle_root_offset = s->header.size() + tx.mm_root_offset;
+    merkle_root = tx.mm_root;
+    const std::vector<unsigned char>& b = w.bytes();
+    return std::vector<std::uint8_t>(b.begin(), b.end());
 }
-
-#if TEST_KNAPSACK_ALGORITHM
-// Reference optimal knapsack (golden-test only). max_weight is the penalty-zone
-// budget: median + median/8 - miner_tx_weight. O(N*W) DP over fee/byte.
-void XmrBlockTemplate::fill_optimal_knapsack(const XmrMinerData& data, uint64_t base_reward,
-                                             uint64_t miner_tx_weight, uint64_t& best_reward,
-                                             uint64_t& final_fees, uint64_t& final_weight)
-{
-    constexpr uint64_t FEE_COEFF = 1000;
-    const uint64_t n = m_mempoolTxs.size();
-    const uint64_t max_weight = data.median_weight + (data.median_weight / 8) - miner_tx_weight;
-
-    m_knapsack.assign((n + 1) * max_weight, 0);
-
-    for (size_t i = 1; i <= n; ++i) {
-        const XmrTxMempoolData& tx = m_mempoolTxs[i - 1];
-        const uint32_t tx_fee = static_cast<uint32_t>(tx.fee / FEE_COEFF);
-        const uint64_t tx_weight = tx.weight;
-
-        uint32_t* row = m_knapsack.data() + i * max_weight;
-        const uint32_t* prev_row = row - max_weight;
-        row[0] = 0;
-        std::memcpy(row + 1, prev_row + 1, (tx_weight - 1) * sizeof(uint32_t));
-
-        for (uint64_t w = tx_weight; w < max_weight; ++w) {
-            const uint32_t used = prev_row[w - tx_weight] + tx_fee;
-            const uint32_t notused = prev_row[w];
-            row[w] = (used > notused) ? used : notused;
-        }
-    }
-
-    best_reward = base_reward;
-    uint64_t best_weight = 0;
-    for (uint64_t w = 0; w < max_weight; ++w) {
-        const uint64_t fee = static_cast<uint64_t>(m_knapsack[n * max_weight + w]) * FEE_COEFF;
-        if (fee) {
-            const uint64_t cur = get_block_reward(base_reward, data.median_weight, fee, w + miner_tx_weight);
-            if (cur > best_reward) { best_reward = cur; best_weight = w; }
-        }
-    }
-
-    m_numTransactionHashes = 0;
-    final_fees = 0;
-    final_weight = miner_tx_weight;
-    m_mempoolTxsOrder.clear();
-    m_transactionHashes.assign(HASH_SIZE, 0);
-    for (int i = static_cast<int>(n); (i > 0) && (best_weight > 0); --i) {
-        if (m_knapsack[i * max_weight + best_weight] > m_knapsack[(i - 1) * max_weight + best_weight]) {
-            m_mempoolTxsOrder.push_back(i - 1);
-            const XmrTxMempoolData& tx = m_mempoolTxs[i - 1];
-            m_transactionHashes.insert(m_transactionHashes.end(), tx.id.h, tx.id.h + HASH_SIZE);
-            ++m_numTransactionHashes;
-            best_weight -= tx.weight;
-            final_fees += tx.fee;
-            final_weight += tx.weight;
-        }
-    }
-    m_knapsack.clear();
-}
-#endif
 
 } // namespace c2pool::xmr

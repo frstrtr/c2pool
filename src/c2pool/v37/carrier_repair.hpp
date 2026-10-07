@@ -71,6 +71,41 @@
 // window horizon, default 8640 positions). Past that the ORDER answer is
 // BELOW_HORIZON and the repair REFUSES — it never silently repairs a suffix.
 //
+// ── ★ OPERATOR SEAM (F-3): CHECKPOINT-ANCHORED REPLAY. NOT BUILT HERE ───────
+// The bound above is PERMANENT, not transient: once any lane passes
+// FrameVaultOptions::horizon_positions (8640) pushes, position 0 is evicted on
+// every node and from that moment no cut-miss on that lane is repairable again,
+// ever. The soak measures it exactly — largest prefix a repair CREDITED = 8625
+// at the shipped horizon, 1192 at SOAK_VAULT_HORIZON=1200 — so the ceiling
+// tracks the knob and nothing else. The fixes in THIS file raise the prefix a
+// repair can afford; they do not, and cannot, move that horizon.
+//
+// The design that does, stated so the operator can rule on it rather than
+// rediscover it:
+//
+//   (a) The lane already publishes I-3 CHECKPOINTS — a (position, digest) pair
+//       the lane commits to at a fixed cadence. A replay that starts at the
+//       NEWEST checkpoint C <= P, seeded with the checkpoint's committed
+//       accumulator state instead of an empty engine, reaches the same digest
+//       at P as a replay from 0, because the digest at P is a fold over the
+//       prefix and the checkpoint IS that fold, certified.
+//   (b) The vault's retention rule changes from "the last H positions" to
+//       "every position at or after the newest checkpoint below the tip,
+//       plus the checkpoint anchor itself" — so what is retained is bounded by
+//       the CHECKPOINT CADENCE rather than by a raw position count, and the
+//       repairable window can never close between two checkpoints.
+//   (c) ORDER grows a served-from field so a server can answer "I can serve you
+//       from checkpoint C" instead of the flat BELOW_HORIZON it must answer
+//       today; the asker either accepts that anchor or refuses, and the replay
+//       verifies the anchor against its own copy of the checkpoint before it
+//       folds a single record.
+//
+// (a) and (b) touch the LANE's checkpoint surface, which is canon-adjacent:
+// what a checkpoint commits to, when one is minted, and what a node is allowed
+// to treat as a certified starting state are consensus questions, not repair
+// policy. So this is written down and STOPPED here. Nothing in this file, in
+// frame_vault.hpp or in the lane is changed for it.
+//
 // ── THREADING ───────────────────────────────────────────────────────────────
 // arm() / on_order() / on_frames() are driven from the transport reader thread.
 // The driver holds its own mutex and NEVER calls the engine or the ledger while
@@ -337,7 +372,17 @@ enum class RepairOutcome : std::uint8_t {
     REPLAY_FAILED,     // the w6 PrefixResolver did not reach P
     DIGEST_MISMATCH,   // reached P with a DIFFERENT commitment: a real fork
     NO_VIEW,           // reached the digest but the scratch ring had no view (unreachable)
+    // ── ADD-ONLY, appended so no existing value renumbers ───────────────────
+    SPINE_REFUSED,     // ★ the server ANSWERED the order but asserts a DIFFERENT
+                       //   lane digest at P: its honest order cannot replay to
+                       //   the winner's cut, so we never fetch it.
+    SERVER_THROTTLED,  // ★ the server stayed over its per-peer budget for the
+                       //   whole bounded re-send schedule.
+    NO_CANDIDATE,      // ★ no connected peer was left to ask.
 };
+
+// How many peers one repair may ask before it gives up, counted per cut.
+static constexpr std::size_t kMaxRepairCandidates = 8;
 
 inline const char* repair_outcome_name(RepairOutcome o) {
     switch (o) {
@@ -352,12 +397,23 @@ inline const char* repair_outcome_name(RepairOutcome o) {
         case RepairOutcome::REPLAY_FAILED:   return "the replay never reached prefix P";
         case RepairOutcome::DIGEST_MISMATCH: return "replayed P with a DIFFERENT digest (real divergence)";
         case RepairOutcome::NO_VIEW:         return "no settlement view at the verified prefix";
+        case RepairOutcome::SPINE_REFUSED:   return "the serving peer asserts a DIFFERENT lane digest at P";
+        case RepairOutcome::SERVER_THROTTLED:return "the serving peer stayed over its per-peer request budget";
+        case RepairOutcome::NO_CANDIDATE:    return "no connected peer was left to ask";
     }
     return "?";
 }
 
+// The number of distinct outcomes, for the per-outcome histogram below. Keep in
+// step with the enum; the static_assert under RepairStats is the guard.
+static constexpr std::size_t kRepairOutcomeCount =
+    static_cast<std::size_t>(RepairOutcome::NO_CANDIDATE) + 1;
+
 struct RepairResult {
     RepairOutcome outcome = RepairOutcome::NO_ORDER;
+    // ★ F-4: what the SERVER said it still retains, when it refused below the
+    // horizon. The stop-log names the window as the cause instead of guessing.
+    std::uint64_t lowest_retained = 0;
     // The verified projection at exactly (P, spine_digest). Non-null IFF
     // outcome == OK. This is the ONLY thing the cut-miss arm consumes.
     std::shared_ptr<const SettlementView> view;
@@ -589,6 +645,13 @@ struct RepairStats {
     std::uint64_t deferred       = 0;   // ★ cuts QUEUED because their only peer was serving
     std::uint64_t resumed        = 0;   // ★ queued cuts re-armed once the peer fell free
     std::uint64_t deferred_drop  = 0;   // queue full, or its peer went away: cleanly refused
+    // ── ★ the candidate walk (F-2) ──────────────────────────────────────────
+    std::uint64_t peer_retried   = 0;   // a repair moved on to the NEXT candidate
+    std::uint64_t candidates_out = 0;   // repairs that ran out of candidates
+    std::uint64_t spine_refused  = 0;   // candidates that asserted a different digest at P
+    std::uint64_t order_below_horizon = 0;  // ★ F-4: of order_failed, the horizon ones
+    // ── the per-outcome histogram: every finish() lands in exactly one bucket
+    std::uint64_t by_outcome[kRepairOutcomeCount] = {};
 };
 
 // The key a repair is addressed by: exactly the cut the winner named.
@@ -648,29 +711,102 @@ public:
     // into somebody else's job.
     bool arm(PeerId peer, const std::string& bid, std::uint64_t pos,
              const ::v37::bytes32& spine) {
+        return arm_candidates(std::vector<PeerId>{peer}, bid, pos, spine);
+    }
+
+    // ── ★ F-2: ARM OVER A CANDIDATE LIST, NOT OVER ONE PEER ─────────────────
+    // "Any connected peer can serve the prefix (it is the sharechain's order,
+    // not one node's opinion)" is FALSE under ruling A. The ordered prefix is
+    // NODE-LOCAL: a peer that dropped the same share holds a different order,
+    // serves it honestly, and the replay lands on a different digest. Arming at
+    // the first peer that merely ACCEPTS the request therefore decides the
+    // repair by transport order — measured at 1.6% coverage, with every repair
+    // that reached a replay against a non-agreeing peer refused.
+    //
+    // The peer that can serve this cut is the one that HOLDS it: the winner, or
+    // any node whose lane agrees with the winner at P. The winner's peer id is
+    // not derivable at the arm site (the v0x02 CutDescriptor carries no winner
+    // identity, and the carrier inbound path is not peer-attributed), so this
+    // does not guess — it ASKS, in order, and moves on the moment a candidate
+    // shows it cannot serve the cut:
+    //
+    //   * the ORDER comes back asserting a DIFFERENT lane digest at P
+    //     (SupplyService's cut probe answers positively only for a peer that
+    //     published exactly this cut) — skipped before a single frame is
+    //     fetched;
+    //   * the ORDER is refused (BELOW_HORIZON, DISABLED, …) — another peer may
+    //     retain more;
+    //   * the replay completes and lands on a different digest — the classic
+    //     ruling-A case.
+    //
+    // Bounded and fail-closed: each candidate is tried at most ONCE, the list
+    // is capped at kMaxRepairCandidates, and when it is exhausted the repair
+    // REFUSES with the LAST outcome, so the stop-log still names a real cause.
+    bool arm_candidates(std::vector<PeerId> cands, const std::string& bid,
+                        std::uint64_t pos, const ::v37::bytes32& spine) {
         const RepairKey k{m_chain, pos, spine};
-        // Read the transport's own per-peer slot BEFORE taking our lock, so we
+        if (cands.empty()) return false;
+        if (cands.size() > kMaxRepairCandidates) cands.resize(kMaxRepairCandidates);
+        // Read the transport's own per-peer slots BEFORE taking our lock, so we
         // never hold m_mtx across the requester's mutex.
-        const bool channel_busy = m_fetch.busy(peer);
+        std::vector<char> channel_busy(cands.size(), 0);
+        for (std::size_t i = 0; i < cands.size(); ++i)
+            channel_busy[i] = m_fetch.busy(cands[i]) ? 1 : 0;
+        PeerId peer = cands.front();
+        std::size_t start = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_done.count(k) || m_jobs.count(k)) { ++m_stats.coalesced; return false; }
+            // The first candidate that is free BOTH on the channel and of a
+            // live repair binding of ours.
+            bool found = false;
+            for (std::size_t i = 0; i < cands.size(); ++i) {
+                if (channel_busy[i]) continue;
+                auto b = m_by_peer.find(cands[i]);
+                if (b != m_by_peer.end() && m_jobs.count(b->second)) continue;
+                peer = cands[i];
+                start = i;
+                found = true;
+                break;
+            }
+            if (!found) {
+                // Every candidate is serving something. QUEUE the cut whole —
+                // list and all — exactly as the one-peer queue did.
+                if (m_deferred.count(k) || m_deferred.size() < kMaxDeferred) {
+                    m_deferred[k] = Deferred{cands, bid};
+                    ++m_stats.deferred;
+                } else {
+                    ++m_stats.deferred_drop;
+                }
+                return false;
+            }
+        }
+        return arm_at(k, cands, start, peer, bid);
+    }
+
+private:
+    bool arm_at(const RepairKey& k, const std::vector<PeerId>& cands,
+                std::size_t start, PeerId peer, const std::string& bid) {
+        const std::uint64_t pos = k.pos;
+        const ::v37::bytes32& spine = k.spine;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_done.count(k) || m_jobs.count(k)) { ++m_stats.coalesced; return false; }
 
             // ── ★ THE QUEUE, NOT THE OVERWRITE ──────────────────────────────
-            // This peer is already serving a live repair (ours, per m_by_peer,
-            // or the channel's, per the requester's outstanding slot). Touching
-            // m_by_peer here is precisely the write that used to orphan that
-            // repair, so we touch NOTHING: no binding, no job, no coalesce.
-            // The cut is remembered as PENDING and re-armed by drain_deferred()
-            // the moment the peer falls free; if the queue is full it is simply
-            // refused, and a later S3 re-offer arms it cleanly because no state
-            // says it is in flight.
+            // The candidate chosen by arm_candidates() was free of both a live
+            // binding of ours and the channel's own slot; nothing here may
+            // overwrite a LIVE job's binding, which is the write that used to
+            // orphan a running repair. A cut whose whole candidate list is
+            // serving was already queued (m_deferred) by the caller without
+            // touching any binding, and drain_deferred() re-arms it the moment
+            // one falls free.
             auto pit = m_by_peer.find(peer);
-            const bool we_are_serving =
-                (pit != m_by_peer.end() && m_jobs.count(pit->second) != 0);
-            if (we_are_serving || channel_busy) {
+            if (pit != m_by_peer.end() && m_jobs.count(pit->second) != 0) {
+                // Raced with another arm on this peer between the two critical
+                // sections: queue rather than steal, exactly as before.
                 if (m_deferred.count(k) || m_deferred.size() < kMaxDeferred) {
-                    m_deferred[k] = Deferred{peer, bid};
+                    m_deferred[k] = Deferred{cands, bid};
                     ++m_stats.deferred;
                 } else {
                     ++m_stats.deferred_drop;
@@ -682,6 +818,8 @@ public:
             j.key  = k;
             j.bid  = bid;
             j.peer = peer;
+            j.cands = cands;
+            j.cand_at = start;
             m_jobs.emplace(k, std::move(j));
             m_deferred.erase(k);                   // it is live now, not queued
             ++m_stats.armed;
@@ -702,17 +840,21 @@ public:
         if (!m_fetch.request_order(peer, m_chain, 0, pos, spine)) {
             bump_fetch_failed();
             // ── ★ THE ROLLBACK ──────────────────────────────────────────────
-            // The ask never went out, so nothing will ever answer it. finish()
-            // drops the job and — BY JOB IDENTITY — the binding written above,
-            // which is exactly the rollback this needs: the peer is left as it
-            // was before this arm, no other job's binding is touched, and
-            // whatever was queued behind the peer drains.
-            finish(k, RepairResult{});             // refused locally: fail closed
+            // The ask never went out, so nothing will ever answer it. The next
+            // candidate gets a turn; when there is none, finish() drops the job
+            // and — BY JOB IDENTITY — the binding written above, which is
+            // exactly the rollback this needs: the peer is left as it was
+            // before this arm, no other job's binding is touched, and whatever
+            // was queued behind the peer drains.
+            RepairResult r;
+            r.outcome = RepairOutcome::NO_ORDER;
+            finish_or_advance(k, r);               // refused locally: fail closed
             return false;
         }
         return true;
     }
 
+public:
     // How many cuts are queued behind a busy peer. Diagnostics only.
     std::size_t deferred() const {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -733,6 +875,7 @@ public:
         RepairKey k;
         bool fail = false, more = false, go = false;
         std::uint64_t from = 0;
+        RepairResult res;                          // the cause, if this refuses
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             auto pit = m_by_peer.find(peer);
@@ -742,10 +885,35 @@ public:
             if (jit == m_jobs.end()) return;
             Job& j = jit->second;
             if (o.status != CtrlOrderStatus::OK) {
-                // BELOW_HORIZON lands here: the server no longer retains lane
-                // position 0, so a whole-prefix replay is impossible and we
-                // refuse rather than repair a suffix.
+                // ★ F-4: BELOW_HORIZON REALLY DOES LAND HERE NOW. It used to be
+                // dead code — SupplyRequester turned every non-OK status into an
+                // opaque SERVER_REFUSED and never called this back — so
+                // order_failed stayed 0 while the vault horizon was the true
+                // cause of hundreds of refusals. The status arrives intact, the
+                // counter moves, and the stop-log names the window.
                 ++m_stats.order_failed;
+                res.lowest_retained = o.lowest_retained;
+                switch (o.status) {
+                    case CtrlOrderStatus::BELOW_HORIZON:
+                        ++m_stats.order_below_horizon;
+                        res.outcome = RepairOutcome::BELOW_HORIZON;
+                        break;
+                    case CtrlOrderStatus::THROTTLED:
+                        res.outcome = RepairOutcome::SERVER_THROTTLED;
+                        break;
+                    default:
+                        res.outcome = RepairOutcome::NO_ORDER;
+                        break;
+                }
+                fail = true;
+            } else if (o.p_served >= k.pos && o.have_spine &&
+                       !(o.spine_digest == k.spine)) {
+                // ★ F-2, the CHEAP half: the server ANSWERED, and its answer
+                // asserts a different lane digest at exactly P. Its honest order
+                // cannot replay to the winner's cut, so do not spend a single
+                // GETFRAMES on it — move to the next candidate.
+                ++m_stats.spine_refused;
+                res.outcome = RepairOutcome::SPINE_REFUSED;
                 fail = true;
             } else {
                 for (const VaultOrderId& v : o.ids) j.order.push_back(v);
@@ -758,17 +926,20 @@ public:
                     from = o.p_served;
                 } else if (j.order.empty()) {
                     ++m_stats.order_failed;
+                    res.outcome = RepairOutcome::NO_ORDER;
                     fail = true;
                 } else {
                     go = true;
                 }
             }
         }
-        if (fail) { finish(k, RepairResult{}); return; }
+        if (fail) { finish_or_advance(k, res); return; }
         if (more) {
             if (!m_fetch.request_order(peer, m_chain, from, k.pos, k.spine)) {
                 bump_fetch_failed();
-                finish(k, RepairResult{});
+                RepairResult r;
+                r.outcome = RepairOutcome::NO_ORDER;
+                finish_or_advance(k, r);
             }
             return;
         }
@@ -815,8 +986,9 @@ public:
         if (jit != m_jobs.end()) jit->second.hard_fail = true;
     }
 
-    void on_fail(PeerId peer, SupplyFailure) {
+    void on_fail(PeerId peer, SupplyFailure f) {
         RepairKey k;
+        RepairResult r;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             auto pit = m_by_peer.find(peer);
@@ -824,8 +996,11 @@ public:
             k = pit->second;
             if (!m_jobs.count(k)) return;
             ++m_stats.fetch_failed;
+            r.outcome = (f == SupplyFailure::THROTTLED)
+                            ? RepairOutcome::SERVER_THROTTLED
+                            : RepairOutcome::MISSING_FRAME;
         }
-        finish(k, RepairResult{});
+        finish_or_advance(k, r);
     }
 
     void forget_peer(PeerId peer) {
@@ -837,7 +1012,9 @@ public:
             // queue entry aimed at a dead peer; a reconnecting peer's re-offer
             // arms it again from scratch.
             for (auto it = m_deferred.begin(); it != m_deferred.end();) {
-                if (it->second.peer == peer) {
+                auto& cs = it->second.cands;
+                cs.erase(std::remove(cs.begin(), cs.end(), peer), cs.end());
+                if (cs.empty()) {
                     it = m_deferred.erase(it);
                     ++m_stats.deferred_drop;
                 } else {
@@ -848,8 +1025,21 @@ public:
             if (pit == m_by_peer.end()) return;
             k = pit->second;
             if (!m_jobs.count(k)) { m_by_peer.erase(pit); return; }
+            // The peer we were asking is gone; drop it from this job's own
+            // candidate list so the walk cannot come back to it.
+            auto jit = m_jobs.find(k);
+            if (jit != m_jobs.end()) {
+                Job& j = jit->second;
+                for (std::size_t i = j.cand_at + 1; i < j.cands.size();)
+                    if (j.cands[i] == peer)
+                        j.cands.erase(j.cands.begin() + static_cast<std::ptrdiff_t>(i));
+                    else
+                        ++i;
+            }
         }
-        finish(k, RepairResult{});
+        RepairResult r;
+        r.outcome = RepairOutcome::NO_ORDER;     // the peer went away mid-ask
+        finish_or_advance(k, r);
     }
 
 private:
@@ -857,20 +1047,32 @@ private:
     // It is NOT a job: it holds no binding and no fetch state, so it can never
     // be mistaken for something in flight and never swallows a later re-offer.
     struct Deferred {
-        PeerId      peer = 0;
-        std::string bid;
+        std::vector<PeerId> cands;
+        std::string         bid;
     };
 
     struct Job {
         RepairKey                   key;
         std::string                 bid;
         PeerId                      peer = 0;
+        std::vector<PeerId>         cands;      // ★ F-2: who else could serve it
+        std::size_t                 cand_at = 0;// which one is serving now
         std::vector<VaultOrderId>   order;
         std::vector<::v37::bytes32> wanted;     // every carrier id in [0, P)
         std::vector<::v37::bytes32> chunk;      // the ids of the GETFRAMES in flight
         std::size_t                 fetch_at = 0;
         std::map<::v37::bytes32, std::vector<std::uint8_t>> frames;
         bool                        hard_fail = false;
+        // Everything a candidate switch must forget: the previous peer's order,
+        // its frames and the fetch cursor. The KEY never changes.
+        void reset_fetch_state() {
+            order.clear();
+            wanted.clear();
+            chunk.clear();
+            fetch_at = 0;
+            frames.clear();
+            hard_fail = false;
+        }
     };
     void bump_fetch_failed() {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -920,10 +1122,77 @@ private:
                 ++m_stats.replayed;
             }
         }
-        if (hard_fail) { finish(k, RepairResult{}); return; }
+        if (hard_fail) {
+            RepairResult hr;
+            hr.outcome = RepairOutcome::MISSING_FRAME;   // un-servable ids: named
+            finish_or_advance(k, hr);
+            return;
+        }
         // The replay runs with NO lock held: it drives a scratch V37Engine.
         const RepairResult r = replay_to_cut(in, m_index);
+        finish_or_advance(k, r);
+    }
+
+    // ── ★ F-2: FINISH, OR HAND THE CUT TO THE NEXT CANDIDATE ────────────────
+    // A repair that did NOT reach the winner's digest has not proved anything
+    // about the cut — only about the peer it asked. Every non-OK outcome is
+    // therefore a reason to ask someone else, while candidates remain: a
+    // DIGEST_MISMATCH is the ruling-A case (that peer's honest order is not the
+    // winner's), a BELOW_HORIZON is that peer's retention window, a
+    // SPINE_REFUSED is that peer saying so itself, and a transport failure is
+    // that peer's link. The walk is bounded — each candidate at most once — and
+    // when it runs out the LAST outcome is what finish() records and logs, so
+    // the stop-line still names a real cause rather than "no candidate".
+    void finish_or_advance(const RepairKey& k, const RepairResult& r) {
+        if (r.ok()) { finish(k, r); return; }
+        if (advance_candidate(k)) return;
         finish(k, r);
+    }
+
+    // Move the live job for `k` onto its next usable candidate and re-ask.
+    // Returns false when there is none left (the caller then finishes). Never
+    // holds m_mtx across a SupplyRequester call.
+    bool advance_candidate(const RepairKey& k) {
+        for (;;) {
+            PeerId next = 0;
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                auto jit = m_jobs.find(k);
+                if (jit == m_jobs.end()) return false;
+                Job& j = jit->second;
+                if (j.cand_at + 1 >= j.cands.size()) {
+                    ++m_stats.candidates_out;
+                    return false;
+                }
+                next = j.cands[++j.cand_at];
+            }
+            const bool busy = m_fetch.busy(next);
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                auto jit = m_jobs.find(k);
+                if (jit == m_jobs.end()) return false;
+                Job& j = jit->second;
+                auto b = m_by_peer.find(next);
+                if (busy || (b != m_by_peer.end() && m_jobs.count(b->second))) continue;
+                // Release OUR OWN binding on the peer we are leaving, by job
+                // identity, then bind the new one BEFORE the ask — the same two
+                // rules the arm path keeps, for the same reason.
+                auto pit = m_by_peer.find(j.peer);
+                if (pit != m_by_peer.end() && pit->second == k) m_by_peer.erase(pit);
+                j.peer = next;
+                j.reset_fetch_state();
+                m_by_peer[next] = k;
+                ++m_stats.peer_retried;
+            }
+            if (m_fetch.request_order(next, m_chain, 0, k.pos, k.spine)) return true;
+            bump_fetch_failed();
+            {
+                std::lock_guard<std::mutex> lk(m_mtx);
+                auto pit = m_by_peer.find(next);
+                if (pit != m_by_peer.end() && pit->second == k) m_by_peer.erase(pit);
+            }
+            // and round again: the loop is bounded by cand_at, which only grows
+        }
     }
 
     // The single completion point. Records the outcome, drops the job, and then
@@ -951,15 +1220,25 @@ private:
             m_jobs.erase(jit);
             if (r.ok()) { m_done[k] = r.view; ++m_stats.repaired; }
             else        { ++m_stats.refused; }
+            if (static_cast<std::size_t>(r.outcome) < kRepairOutcomeCount)
+                ++m_stats.by_outcome[static_cast<std::size_t>(r.outcome)];
             ++m_stats.redriven;
             cb  = m_redrive;
             log = m_log;
         }
-        if (log)
-            log(!r.ok(),
-                std::string("[v37-repair] cut P=") + std::to_string(k.pos) + " " +
-                    (r.ok() ? "REPAIRED" : "REFUSED") + " (" +
-                    repair_outcome_name(r.outcome) + ")");
+        if (log) {
+            std::string line = std::string("[v37-repair] cut P=") +
+                               std::to_string(k.pos) + " " +
+                               (r.ok() ? "REPAIRED" : "REFUSED") + " (" +
+                               repair_outcome_name(r.outcome) + ")";
+            // ★ F-4: when the cause IS the serving vault's window, say where
+            // the window starts. "order_failed=0" used to be the only trace.
+            if (r.outcome == RepairOutcome::BELOW_HORIZON)
+                line += " — the serving peer retains from lane position " +
+                        std::to_string(r.lowest_retained) +
+                        "; a whole-prefix replay needs position 0";
+            log(!r.ok(), line);
+        }
         if (cb) cb(bid, r);
         drain_deferred();
     }
@@ -991,9 +1270,16 @@ private:
                         it = m_deferred.erase(it);
                         continue;
                     }
-                    auto pit = m_by_peer.find(it->second.peer);
-                    if (pit != m_by_peer.end() && m_jobs.count(pit->second)) {
-                        ++it;                       // its peer is still serving
+                    bool any_free = false;
+                    for (PeerId c : it->second.cands) {
+                        auto pit = m_by_peer.find(c);
+                        if (pit == m_by_peer.end() || !m_jobs.count(pit->second)) {
+                            any_free = true;
+                            break;
+                        }
+                    }
+                    if (!any_free) {
+                        ++it;                       // every candidate still serving
                         continue;
                     }
                     k = it->first;
@@ -1006,7 +1292,7 @@ private:
             }
             if (!have) break;
             tried.insert(k);
-            (void)arm(d.peer, d.bid, k.pos, k.spine);
+            (void)arm_candidates(d.cands, d.bid, k.pos, k.spine);
         }
         std::lock_guard<std::mutex> lk(m_mtx);
         m_draining = false;

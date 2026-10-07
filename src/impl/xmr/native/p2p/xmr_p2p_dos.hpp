@@ -285,6 +285,39 @@ struct DosConfig {
 };
 
 // ---------------------------------------------------------------------------
+// TXPOOL-RESUME-2: the txpool-complement (2010) back-fill ROUNDS. One round per
+// relay-gate opening -- the first one after boot AND every later one after a
+// sync loss: while the gate was shut every relay was refused NotSynced, and a
+// relayed tx is pushed only once, so the gap is exactly what a new round asks
+// for. Each round asks at most `quota` handshaked links, each link at most once
+// per round (a link remembers the round it was last asked in). The first
+// version latched once per process, so a regain re-opened the gate with no
+// back-fill. Lives on the io thread beside the peer table.
+// ---------------------------------------------------------------------------
+#define XMR_P2P_HAVE_COMPLEMENT_ROUNDS 1
+class ComplementRounds {
+public:
+    explicit ComplementRounds(std::size_t quota = 2) : quota_(quota) {}
+    // Open a new round: the quota refills and every link may be asked again.
+    std::uint64_t arm() { ++round_; asked_ = 0; return round_; }
+    bool          armed() const noexcept { return round_ != 0; }
+    std::uint64_t round() const noexcept { return round_; }
+    bool          quota_spent() const noexcept { return asked_ >= quota_; }
+    std::size_t   asked_this_round() const noexcept { return asked_; }
+    // May a link last asked in round `asked_in` (0 = never) be asked now?
+    bool may_ask(std::uint64_t asked_in) const noexcept {
+        return round_ != 0 && quota_ != 0 && asked_ < quota_ && asked_in != round_;
+    }
+    // Record that a link was asked; returns the round to store on the link.
+    std::uint64_t note_asked() { ++asked_; return round_; }
+
+private:
+    std::size_t   quota_;
+    std::uint64_t round_ = 0;
+    std::size_t   asked_ = 0;
+};
+
+// ---------------------------------------------------------------------------
 // One peer's budget. Lives on the io thread beside its link.
 // ---------------------------------------------------------------------------
 class PeerDosGuard {
@@ -308,9 +341,20 @@ public:
     // Order matters and is deliberate: the byte bucket is charged first, so a
     // flood of oversized-but-legal frames is caught even when its command class
     // has budget left.
+    //
+    // TXPOOL-RESUME-2: `complement_shaped` says a 2002 carries the wire shape of
+    // monerod's answer to NOTIFY_GET_TXPOOL_COMPLEMENT: dandelionpp_fluff=false.
+    // monerod builds that answer as a struct_init'd NOTIFY_NEW_TRANSACTIONS
+    // (cryptonote_protocol_handler.inl handle_notify_get_txpool_complement), so
+    // the flag is zero and is written out explicitly (its KV default is true).
+    // A regular relay on our links is always fluffed: every link here is one we
+    // dialed, i.e. the peer's INBOUND link, and Dandelion++ stems only travel a
+    // node's OUTBOUND links. Only a complement-shaped 2002 may spend the 2010
+    // credit; a fluffed relay that lands between our 2010 and the answer is
+    // charged to the flood bucket as usual and leaves the credit for the answer.
     // -----------------------------------------------------------------------
     DosAction on_frame(std::uint32_t cmd, std::size_t body_bytes, std::size_t units,
-                       Millis now, DosFault& fault_out) {
+                       Millis now, DosFault& fault_out, bool complement_shaped = false) {
         const nanos_t t = ms_to_ns(now);
         fault_out = DosFault::None;
 
@@ -327,8 +371,21 @@ public:
                 [[fallthrough]];
             case levin::CMD_NEW_BLOCK:
                 if (!bucket_take(blocks_, 1.0, t)) return exhausted(fault_out, now);
+                // Remember the charge so a verdict of "known valid block" can
+                // hand exactly this token back (D3a); bounded by the capacity,
+                // because a refund can never lift the bucket above it anyway.
+                if (static_cast<double>(block_charges_open_) < cfg_.block_capacity)
+                    ++block_charges_open_;
                 break;
             case levin::CMD_NEW_TRANSACTIONS:
+                // TXPOOL-RESUME: the 2002 that answers OUR 2010 is a solicited
+                // back-fill, sized by the peer's whole pool: charging it to the
+                // per-tx flood bucket (512) would score an honest peer with a
+                // busy pool as a flooder. One credit per 2010 we sent, single
+                // use, TTL-bound; the byte bucket above still applies.
+                // TXPOOL-RESUME-2: bound to the answer's wire shape (see above).
+                if (complement_shaped && take_complement_credit_(now)) break;
+                if (!complement_shaped && complement_credit_open_) ++complement_credit_kept_;
                 if (!bucket_take(txs_, static_cast<double>(units == 0 ? 1 : units), t))
                     return exhausted(fault_out, now);
                 break;
@@ -374,6 +431,39 @@ public:
         while (credits_.size() > cfg_.max_solicited_credits) credits_.pop_front();
     }
 
+    // TXPOOL-RESUME: mint the credit for the answer to a 2010 we just sent.
+    // At most ONE is outstanding per peer (a second request replaces it).
+    void note_complement_solicited(Millis now) {
+        complement_credit_ms_ = now;
+        complement_credit_open_ = true;
+    }
+    std::uint64_t complement_credits_used() const noexcept { return complement_credits_used_; }
+    // TXPOOL-RESUME-2: fluffed 2002s that arrived while the credit was open and
+    // were charged to the flood bucket instead of spending it.
+    std::uint64_t complement_credit_kept() const noexcept { return complement_credit_kept_; }
+    bool          complement_credit_open() const noexcept { return complement_credit_open_; }
+
+    // -----------------------------------------------------------------------
+    // Hand back the block token a push cost, because the index found the block
+    // is one it HAS -- connected, already on the best chain, or a valid alt
+    // candidate (D3a; IChainFetcher::credit_known_block). Honest relay at a fast
+    // cadence is one connecting copy plus a duplicate from every other peer; all
+    // of them are valid blocks and none of them is a flood.
+    //
+    // Refunds never outnumber charges: only a push that actually spent a block
+    // token can be refunded, so a 2008 admitted on a solicited-reply credit,
+    // or a verdict for a frame that was dropped, returns nothing it did not
+    // take. The bucket stays capped at its capacity (TokenBucket::refund).
+    // Returns whether a token was returned.
+    // -----------------------------------------------------------------------
+    bool refund_block_token(Millis now) {
+        if (block_charges_open_ == 0) return false;
+        --block_charges_open_;
+        blocks_.refund(ms_to_ns(now));
+        ++block_refunds_;
+        return true;
+    }
+
     // --- observation --------------------------------------------------------
     std::uint32_t score() const noexcept { return score_; }
     std::uint64_t faults() const noexcept { return faults_; }
@@ -381,6 +471,7 @@ public:
     std::uint32_t exhaustions() const noexcept { return exhaustions_; }
     std::uint64_t solicited_credits_used() const noexcept { return credits_used_; }
     std::size_t   solicited_credits_open() const noexcept { return credits_.size(); }
+    std::uint64_t block_refunds() const noexcept { return block_refunds_; }
 
     double bytes_level(Millis now)  { return bytes_.level(ms_to_ns(now)); }
     double blocks_level(Millis now) { return blocks_.level(ms_to_ns(now)); }
@@ -393,6 +484,14 @@ private:
     void prune_expired_credits_(Millis now) {
         while (!credits_.empty() && now - credits_.front() > cfg_.solicited_reply_ttl_ms)
             credits_.pop_front();
+    }
+
+    bool take_complement_credit_(Millis now) {
+        if (!complement_credit_open_) return false;
+        complement_credit_open_ = false;
+        if (now - complement_credit_ms_ > cfg_.solicited_reply_ttl_ms) return false;
+        ++complement_credits_used_;
+        return true;
     }
 
     // Spend one live credit if any remains. Single-use: a credit consumed here
@@ -438,6 +537,17 @@ private:
     // cfg_.max_solicited_credits.
     std::deque<Millis> credits_;
     std::uint64_t      credits_used_ = 0;
+
+    // TXPOOL-RESUME: the one outstanding 2010-answer credit.
+    bool          complement_credit_open_  = false;
+    Millis        complement_credit_ms_    = 0;
+    std::uint64_t complement_credits_used_ = 0;
+    std::uint64_t complement_credit_kept_  = 0;   // TXPOOL-RESUME-2
+
+    // Block tokens spent on pushes and not yet handed back (D3a), and how many
+    // have been handed back in total.
+    std::uint32_t block_charges_open_ = 0;
+    std::uint64_t block_refunds_      = 0;
 };
 
 } // namespace c2pool::xmr::native::p2p

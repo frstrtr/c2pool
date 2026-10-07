@@ -145,7 +145,8 @@ static std::string job_object(const JobNotify& j) {
 }
 
 std::string StratumDialect::build_login_ok(std::uint32_t req_id, std::uint32_t rpc_id,
-                                           const JobNotify& job) {
+                                           const JobNotify& job,
+                                           std::string_view extra_result) {
     std::string s;
     s += "{\"id\":";
     s += std::to_string(req_id);
@@ -153,7 +154,9 @@ std::string StratumDialect::build_login_ok(std::uint32_t req_id, std::uint32_t r
     s += u32_hex(rpc_id);
     s += "\",\"job\":{";
     s += job_object(job);
-    s += "},\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n";
+    s += "}";
+    if (!extra_result.empty()) { s += ","; s += extra_result; }   // FEE DISCLOSURE
+    s += ",\"extensions\":[\"algo\"],\"status\":\"OK\"}}\n";
     return s;
 }
 
@@ -304,8 +307,13 @@ bool XmrStratumServer::make_job(XmrStratumSession& s, std::uint32_t extra_nonce,
     // to detect a real network block; including it via max() would not change
     // the (easier) job target.
     std::uint64_t target = tj.lane_target ? tj.lane_target : MAX_TARGET;
-    if (s.login().custom_diff)
-        target = std::max(target, target_from_diff(*s.login().custom_diff));
+    if (s.login().custom_diff) {
+        // MINIMUM DIFFICULTY: a requested difficulty below the floor is raised
+        // to it. The lane's own target is never made harder.
+        std::uint64_t custom = target_from_diff(*s.login().custom_diff);
+        if (m_min_difficulty) custom = std::min(custom, target_from_diff(m_min_difficulty));
+        target = std::max(target, custom);
+    }
     target = std::min(target, MAX_TARGET);
 
     const std::uint32_t job_id = s.remember_job(extra_nonce, tj.template_id, target);
@@ -340,7 +348,7 @@ bool XmrStratumServer::handle_login(XmrStratumSession& s, std::uint32_t req_id,
 
     const std::uint32_t rpc_id = skeleton_random32();
     if (!m_transport.send_line(s.client_id(),
-                               StratumDialect::build_login_ok(req_id, rpc_id, job))) {
+                               StratumDialect::build_login_ok(req_id, rpc_id, job, m_login_extra))) {
         return false;
     }
     s.set_rpc_id(rpc_id);

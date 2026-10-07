@@ -1032,6 +1032,158 @@ void suite_j() {
 
 } // namespace
 
+// ===========================================================================
+// K -- own-block hygiene: a block every monerod refuses never leaves, and is
+//      never adopted (the publish-arm verify, 8b2efacf at h=513: a template
+//      on the new tip still carried a tx the tip had mined; the found block
+//      went out, every monerod dropped us, PREFER-OWN built on it for good).
+// ===========================================================================
+std::vector<Hash> key_images_of_body(const std::vector<std::uint8_t>& blob) {
+    std::vector<Hash> out;
+    TxWeightInfo info;
+    if (parse_tx_full(blob, info) != TxParseStatus::Ok) return out;
+    for (const auto& ki : info.key_images) {
+        Hash h;
+        std::copy(ki.begin(), ki.end(), h.begin());
+        out.push_back(h);
+    }
+    return out;
+}
+
+// block_with_real_txs(k) with the tx ids listed in `order` (indices into the
+// golden, repeats allowed) -- how a block carrying the same tx twice is built.
+BlockFixture block_with_tx_order(const std::vector<std::size_t>& order) {
+    std::vector<std::uint8_t> blob = bytes_from_hex(G2::BLOCKS[0].blob_hex);
+    if (!blob.empty() && blob.back() == 0x00) blob.pop_back();
+    std::vector<TxFixture> bodies;
+    std::vector<std::uint8_t> tail;
+    blob_write_varint(tail, static_cast<std::uint64_t>(order.size()));
+    for (const std::size_t i : order) {
+        TxFixture t;
+        t.id   = hash_from_hex(GT::FULL_TXS[i].id_hex);
+        t.blob = bytes_from_hex(GT::FULL_TXS[i].full_hex);
+        tail.insert(tail.end(), t.id.begin(), t.id.end());
+        bodies.push_back(std::move(t));
+    }
+    blob.insert(blob.end(), tail.begin(), tail.end());
+    BlockFixture f = parse_fixture(std::move(blob));
+    f.bodies       = std::move(bodies);
+    return f;
+}
+
+struct HygieneRun {
+    BlockRelayVerdict v;
+    std::size_t       broadcasts = 0;
+    std::size_t       own_blocks = 0;
+    bool              knows      = false;
+    R::RelayReject       reject     = R::RelayReject::None;
+};
+
+HygieneRun run_hygiene(const BlockFixture& f, fakes::FakeChain& chain,
+                       R::RelayConfig cfg = R::RelayConfig{}, Daemon* daemon = nullptr) {
+    HygieneRun out;
+    fakes::FakeBroadcastPort port;
+    port.state_normal_peers = 3;
+    fakes::FakeMinerDataSource bodies;
+    load_bodies(bodies, f);
+    GateSpy gate;
+    R::LevinBlockRelay relay(port, daemon ? daemon->sink() : R::DaemonSubmitSink{}, &bodies,
+                             &chain, cfg);
+    relay.set_pow_gate(gate.gate());
+    out.v          = relay.relay(request_for(f));
+    out.broadcasts = port.broadcasts.size();
+    out.own_blocks = chain.own_blocks.size();
+    out.knows      = relay.knows(out.v.block_id);
+    out.reject     = relay.last_reject();
+    return out;
+}
+
+void suite_k() {
+    std::printf("\n== K: own-block hygiene (dup tx / spent key image / duplicate) ==\n");
+
+    const BlockFixture t = block_with_real_txs(3);
+    auto chain_at_parent = [&](fakes::FakeChain& c) {
+        node::ChainMainBlock parent;
+        parent.height = t.height - 1;
+        parent.id     = t.prev_id;
+        c.rows.push_back(parent);
+    };
+
+    // K1: a tx the parent's chain already mined.
+    {
+        fakes::FakeChain chain;
+        chain_at_parent(chain);
+        chain.mark_mined(t.tx_hashes[1], t.height - 1);
+        const HygieneRun r = run_hygiene(t, chain);
+        CHECK(!r.v.reached_network() && r.broadcasts == 0,
+              "K1a a block re-mining a tx its parent's chain holds is NOT broadcast (%zu frames)",
+              r.broadcasts);
+        CHECK(r.own_blocks == 0 && !r.v.own_index_attempted,
+              "K1b ...NOT offered to our own index (no PREFER-OWN adoption)");
+        CHECK(!r.knows, "K1c ...NOT retained (nothing to park or re-announce, nothing to book)");
+        CHECK(r.reject == R::RelayReject::TxAlreadyMined,
+              "K1d refused as TxAlreadyMined (got %s)", to_string(r.reject));
+    }
+    // K2: a key image the parent's chain already spent.
+    {
+        fakes::FakeChain chain;
+        chain_at_parent(chain);
+        const std::vector<Hash> kis = key_images_of_body(t.bodies[2].blob);
+        CHECK(!kis.empty(), "K2  (fixture) the third body spends key images");
+        if (!kis.empty()) chain.mark_spent(kis.back(), t.height - 5);
+        const HygieneRun r = run_hygiene(t, chain);
+        CHECK(!r.v.reached_network() && r.own_blocks == 0 && !r.knows &&
+                  r.reject == R::RelayReject::KeyImageSpent,
+              "K2a a block spending a spent key image is refused before any arm (%s)",
+              to_string(r.reject));
+    }
+    // K3: the same tx twice in one block (no chain view needed).
+    {
+        const BlockFixture d = block_with_tx_order({0, 1, 0});
+        fakes::FakeChain chain;
+        const HygieneRun r = run_hygiene(d, chain);
+        CHECK(!r.v.reached_network() && r.own_blocks == 0 &&
+                  r.reject == R::RelayReject::DuplicateTxInBlock,
+              "K3  a block carrying one tx twice is refused (%s)", to_string(r.reject));
+    }
+    // K4: controls. Mined ABOVE the parent (a competing branch) is not our
+    //     chain; nothing mined at all is the ordinary case. Both go out and are
+    //     adopted.
+    {
+        fakes::FakeChain chain;
+        chain_at_parent(chain);
+        node::ChainMainBlock above;
+        above.height = t.height;
+        above.id     = t.id;
+        above.id[0] ^= 0x5a;   // a rival at our height, not us
+        chain.rows.push_back(above);
+        chain.mark_mined(t.tx_hashes[0], t.height);   // in the rival at OUR height
+        const HygieneRun r = run_hygiene(t, chain);
+        CHECK(r.v.reached_network() && r.broadcasts == 1 && r.own_blocks == 1,
+              "K4a a tx mined only in a same-height rival does not block OUR block");
+        fakes::FakeChain clean;
+        chain_at_parent(clean);
+        const HygieneRun r2 = run_hygiene(t, clean);
+        CHECK(r2.v.reached_network() && r2.own_blocks == 1 && r2.knows,
+              "K4b a clean block is relayed, retained and adopted");
+        CHECK(clean.probe_calls >= 1, "K4c (non-vacuity) the relay asked the chain oracle");
+    }
+    // K5: DaemonFirst -- a block the daemon REJECTED is not adopted either.
+    {
+        fakes::FakeChain chain;
+        chain_at_parent(chain);
+        Daemon daemon;
+        daemon.accepts = false;
+        R::RelayConfig cfg;
+        cfg.policy.order = ArmOrder::DaemonFirst;
+        const HygieneRun r = run_hygiene(t, chain, cfg, &daemon);
+        CHECK(r.v.daemon_rejected && r.broadcasts == 0,
+              "K5a DaemonFirst: the daemon rejected, P2P suppressed (rule 2)");
+        CHECK(r.own_blocks == 0,
+              "K5b ...and our own index is NOT offered the block the daemon just refused");
+    }
+}
+
 int main() {
     std::printf("xmr_native_block_relay_kat -- C5 dual-arm found-block relay\n");
     std::printf("fixtures: monerod %s %s, blocks at %llu.., full txs from tip %llu\n",
@@ -1050,6 +1202,7 @@ int main() {
     suite_h();
     suite_i();
     suite_j();
+    suite_k();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

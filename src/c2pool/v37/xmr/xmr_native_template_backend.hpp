@@ -104,6 +104,8 @@ struct NativeTemplateConfig {
     // its own.
     std::string              snapshot_path;
     std::uint64_t            snapshot_every_s = 300;
+    std::uint64_t            consumer_window = 0;   // COLD-BOOT-2 (NativeNodeConfig::consumer_window)
+    bool                     chain_event_backpressure = false;   // COLD-BOOT-3 (NativeNodeConfig::chain_event_backpressure)
 
     // The PARITY / SUBMIT daemon. Not the template path; see the banner.
     std::string              monerod_rpc_host;
@@ -156,6 +158,10 @@ struct NativeTemplateConfig {
     // settlement accounting reads, so "what we build on" and "what we nominate"
     // cannot be configured apart.
     native::TieBreak         fork_tie = native::TieBreak::PreferOwn;
+    // Own-fork liveness guard bound (--own-fork-bound-s); 0 disables.
+    std::uint64_t            own_fork_bound_ms = 240'000;
+    // FORK-FUSE-2 test-only knob (--test-unknown-fork-stall-s); 0 = default.
+    std::uint64_t            unknown_fork_stall_ms = 0;
 
     // OPERATOR TX-INJECTION (2026-09-19 ruling), default OFF. When on, the node
     // accepts operator-submitted signed txs through submit_operator_inject() and
@@ -201,11 +207,17 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     n.use_seeds   = cfg.native_use_seeds;
     // THE TRUST ROOT. Solo has no peer to ask for the genesis blob, so it
     // assembles the blob locally and feeds it to the same id-checking gate;
-    // otherwise an anchor path selects Anchor and its absence selects Genesis.
+    // otherwise an anchor path selects Anchor. THE PINNED SNAPSHOT: an
+    // output-set snapshot with no anchor path also selects Anchor, from the
+    // release's compiled-in pinned bundle for this network (anchor_path stays
+    // "" = embedded), and the node then holds the snapshot to that bundle's
+    // pinned size + sha256 (anchor/xmr_anchor_pinned.hpp). Neither selects
+    // Genesis, as before.
     n.boot        = cfg.native_solo
                         ? nrt::BootMode::LocalGenesis
-                        : (cfg.native_anchor_path.empty() ? nrt::BootMode::Genesis
-                                                          : nrt::BootMode::Anchor);
+                        : ((cfg.native_anchor_path.empty() && cfg.native_output_set_path.empty())
+                               ? nrt::BootMode::Genesis
+                               : nrt::BootMode::Anchor);
     n.anchor_path = cfg.native_anchor_path;
     n.output_set_path = cfg.native_output_set_path;   // format-2 O-backfill
 
@@ -220,6 +232,15 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
 
     n.snapshot_path    = cfg.native_snapshot_path;
     n.snapshot_every_s = cfg.native_snapshot_every_s;
+    // COLD-BOOT-2: the settlement paces the catch-up download (p2p-first anchor boot only).
+    // COLD-BOOT-4: ONE predicate, the boot mode -- an explicit --native-anchor and the
+    // compiled-in PINNED snapshot (no anchor path) are the same anchor boot. The old
+    // path test left the pinned default unpaced: the whole post-anchor gap was
+    // downloaded before booking and its rows were trimmed before they were booked.
+    n.consumer_window  = (p2p_first && n.boot == nrt::BootMode::Anchor) ? cfg.native_catchup_window : 0;
+    // COLD-BOOT-3: the p2p-first serve loop drains the node's event queue every
+    // pass, so the bulk download may wait on it (never a silent overflow).
+    n.chain_event_backpressure = p2p_first;
 
     // The daemon endpoint is the C6 PARITY judge, and under daemon-first also
     // the submit arm. Under p2p-first it is the parity judge and nothing else:
@@ -229,7 +250,15 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     // of the parity judge.
     // Solo implies no daemon: there is no endpoint to configure, and leaving one
     // wired would have the C6 parity judge dial a dead port every status tick.
-    if (!cfg.no_daemon_rpc && !cfg.native_solo) {
+    //
+    // D6d: p2p-first withholds it too unless --native-parity-monerod asks for the
+    // judge. The native chain index already answers everything that judge read
+    // (tip, RandomX seed hash/height, difficulty/height), so leaving it wired by
+    // default kept a get_miner_data + get_info + get_last_block_header trio on
+    // the wire every status tick for nothing but a comparison. The judge is now
+    // an explicit, compare-only oracle under p2p-first; daemon-first is unchanged.
+    const bool want_daemon_judge = !p2p_first || cfg.native_parity_monerod;
+    if (!cfg.no_daemon_rpc && !cfg.native_solo && want_daemon_judge) {
         n.monerod_rpc_host = cfg.monerod.rpc_host;
         n.monerod_rpc_port = cfg.monerod.rpc_port;
     }
@@ -256,6 +285,8 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     n.fork_tie = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
                      ? native::TieBreak::PreferOwn
                      : native::TieBreak::FirstSeen;
+    n.own_fork_bound_ms = static_cast<std::uint64_t>(cfg.own_fork_bound_s) * 1000;
+    n.unknown_fork_stall_ms = static_cast<std::uint64_t>(cfg.test_unknown_fork_stall_s) * 1000;
     // #1680 lever, and OPERATOR TX-INJECTION (default OFF): forwarded here so a
     // consumer that builds its config through this function -- main and the
     // mainnet-readiness KAT -- does not silently drop them on the way to the node.
@@ -287,6 +318,8 @@ public:
         nc.anchor_confirm       = cfg_.anchor_confirm;
         nc.snapshot_path        = cfg_.snapshot_path;
         nc.snapshot_every_s     = cfg_.snapshot_every_s;
+        nc.consumer_window      = cfg_.consumer_window;   // COLD-BOOT-2
+        nc.chain_event_backpressure = cfg_.chain_event_backpressure;   // COLD-BOOT-3
         nc.allow_unverified_pow = cfg_.allow_unverified_pow;
         nc.monerod_rpc_host     = cfg_.monerod_rpc_host;
         nc.monerod_rpc_port     = cfg_.monerod_rpc_port;
@@ -300,6 +333,8 @@ public:
         nc.backlog_refresh_s    = cfg_.backlog_refresh_s;
         nc.dos_solicited_credits = cfg_.dos_solicited_credits;   // #1680 lever
         nc.fork_tie             = cfg_.fork_tie;
+        nc.own_fork_bound_ms    = cfg_.own_fork_bound_ms;
+        nc.unknown_fork_stall_ms = cfg_.unknown_fork_stall_ms;
         nc.operator_inject            = cfg_.operator_inject;
         nc.operator_inject_ttl_blocks = cfg_.operator_inject_ttl_blocks;
 
@@ -340,6 +375,23 @@ public:
             const native::MinerDataReadiness r =
                 want ? want->readiness() : native::MinerDataReadiness{};
             if (r.ok()) { why.clear(); return true; }
+            // COLD-BOOT-2: the catch-up download is paused at the settlement's
+            // ceiling (anchor + window before the settlement exists): the index
+            // cannot sync until the settlement books, and the settlement books
+            // from the serve loop. Proceed; the arm becomes ready as the gap is
+            // booked (the serve loop parks miners until the first template).
+            if (node_ && node_->index().consumer_held()) {
+                why = "catch-up held at the settlement ceiling h=" + std::to_string(node_->index().consumer_ceiling()) +
+                      " (tip " + std::to_string(node_->index().sync_state().header_frontier) + "; " + r.why + ")";
+                return true;
+            }
+            // COLD-BOOT-3: the download waits for the serve loop to drain the
+            // event queue (backpressure); only the serve loop drains it.
+            if (node_ && cfg_.chain_event_backpressure && node_->chain_events_backpressured()) {
+                why = "catch-up waiting for the serve loop to drain the chain-event queue (tip " +
+                      std::to_string(node_->index().sync_state().header_frontier) + "; " + r.why + ")";
+                return true;
+            }
             if (progress && r.why != last) { progress(r.why); last = r.why; }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }

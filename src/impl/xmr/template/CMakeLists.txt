@@ -1,9 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Family B (XMR / RandomX lane) — whole-block template builder library (X9 opt-B)
 #
-# `xmr_template` = the p2pool-derived XmrBlockTemplate TU (GPL-3.0-only source,
-# combined under AGPLv3 §13; see the PROVENANCE block atop
-# xmr_block_template.cpp and xmr_provenance.hpp) + the AUTHORED bodies for the
+# `xmr_template` = the CLEAN-ROOM XmrBlockTemplate TU (c2pool AGPL-3.0, written
+# from Monero-core v0.18.5.1 and the public CryptoNote protocol, no p2pool
+# code; see the provenance block atop xmr_block_template.cpp) + the AUTHORED bodies for the
 # consumer-side primitive seam it consumes (xmr_coin_primitives.cpp, AGPL-3),
 # which forward to the X1 `xmr_coin` library (vendored monero-project keccak.c,
 # vendored tools::write_varint) so the template's varints / Keccak / midstate
@@ -26,7 +26,7 @@ if (NOT TARGET Threads::Threads)
 endif()
 
 add_library(xmr_template STATIC
-    xmr_block_template.cpp        # p2pool block_template.cpp port (GPL-3, AGPLv3 §13)
+    xmr_block_template.cpp        # clean-room whole-block template builder (AGPL-3)
     xmr_coin_primitives.cpp       # authored seam bodies over xmr_coin (AGPL-3)
 )
 

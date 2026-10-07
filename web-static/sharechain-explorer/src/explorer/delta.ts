@@ -15,6 +15,7 @@
 // Provides capability `merger.delta`.
 
 import type { PluginDescriptor } from '../registry.js';
+import type { WireBlockMarkers } from '../transport/types.js';
 
 /** Subset of the share shape delta merging cares about: a short-hash
  *  plus an optional full 64-hex hash. Full shares pass through as opaque
@@ -50,15 +51,14 @@ export interface WindowSnapshot<S extends DeltaShare = DeltaShare> {
   pplnsByShare?: ReadonlyMap<string, ReadonlyArray<{ addr: string; amt: number; pct: number }>> | undefined;
 }
 
-export interface DeltaPayload<S extends DeltaShare = DeltaShare> {
+// blocks / doge_blocks come from WireBlockMarkers (transport/types.ts).
+export interface DeltaPayload<S extends DeltaShare = DeltaShare> extends WireBlockMarkers {
   shares: readonly S[];  // newest first
   count?: number;
   tip?: string;
   fork_switch?: boolean;
   window_size?: number;
   heads?: readonly string[];
-  blocks?: readonly string[];
-  doge_blocks?: readonly string[];
 }
 
 export interface MergeOptions {
