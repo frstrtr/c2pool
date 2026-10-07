@@ -91,7 +91,7 @@ struct LaneParams {
     std::uint64_t open_bins = 0;           // K04 F
     std::uint64_t fresh_max = 0;           // K07 Fresh
     std::uint64_t r_max = 0;               // K08 R_MAX
-    std::uint64_t heal_period_h = 0;       // K27 P_heal (hours)
+    std::uint64_t heal_period_h = 0;       // P-02 P_heal (hours)
 };
 
 inline constexpr LaneParams kRuledLaneParams{
