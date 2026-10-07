@@ -253,6 +253,7 @@ static std::uint32_t g_relay_rx_global = 4;             // --relay-rx-global G (
 static std::optional<std::uint32_t> g_relay_ban_seconds; // --relay-ban-seconds S (unset = ceil(n x C / G))
 static std::uint32_t g_relay_verify_threads = 0;       // --relay-verify-threads N (0 = auto; DROPS-VERIFY-SCALE)
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
+static std::size_t   g_relay_parked_max = 0;            // --relay-parked-max N (0 = default open_bins x (1 + r_max))
 static std::uint64_t g_relay_backfill = 2048;           // --relay-backfill-positions N
 static std::uint32_t g_relay_reoffer_s = 60;            // --relay-reoffer-seconds S
 static std::uint32_t g_relay_keepalive_ms = 5000;       // --relay-keepalive-ms MS (0 = off; RELAY-LIVENESS)
@@ -4853,6 +4854,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 rx_budget = v;
             }
             ro.solicited_credits = g_relay_solicited;
+            if (g_relay_parked_max) ro.parked_max = g_relay_parked_max;
             ro.backfill_positions = g_relay_backfill;
             ro.reoffer_seconds = g_relay_reoffer_s;
             ro.keepalive_ms = g_relay_keepalive_ms;          // RELAY-LIVENESS
@@ -6356,6 +6358,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-ban-seconds")        g_relay_ban_seconds = u32();
         else if (a == "--relay-verify-threads")     g_relay_verify_threads = u32();
         else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
+        else if (a == "--relay-parked-max")         g_relay_parked_max = static_cast<std::size_t>(u64());
         else if (a == "--relay-backfill-positions") g_relay_backfill = u64();
         else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = u32();
         else if (a == "--relay-keepalive-ms")       g_relay_keepalive_ms = u32();
@@ -6542,6 +6545,7 @@ int main(int argc, char** argv) {
                 "                               auto: clamp(cores/2, 2, 8) minus --mine threads; ~2.2 MiB each,\n"
                 "                               the seed caches are shared). 1 = the pre-fix single worker\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
+                "  --relay-parked-max N         parked verify items cap (objects; default 1632)\n"
                 "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
                 "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
                 "  --relay-discovery on|off     relay peer discovery (FB_GETADDR/FB_ADDR) + persistent peer book (default on)\n"
