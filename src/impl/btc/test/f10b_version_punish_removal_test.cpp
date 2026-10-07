@@ -16,7 +16,7 @@
 //
 //   ACCEPT GATE (canonical, SURVIVES — src/impl/btc/share_check.hpp:1793,
 //   matching p2pool data.py check() lines 1396-1414):
-//       reject boundary iff  new_ver_weight*100 < total_weight*60
+//       reject boundary iff  new_ver_weight < floor(total_weight*60/100)
 //   i.e. a one-version upgrade boundary is VALID when the new version holds
 //   >= 60% of the PPLNS-WEIGHTED desired-version support in the sampling window.
 //
@@ -48,7 +48,7 @@ bool accept_gate_valid(const std::map<int64_t, uint64_t>& weights, int64_t share
         if (ver == share_ver) new_ver_weight += w;
     }
     // Canonical: counts.get(self.VERSION,0) < sum(counts)*60//100  ->  reject
-    return !(new_ver_weight * 100 < total_weight * 60);
+    return !(new_ver_weight < (total_weight * 60) / 100);
 }
 
 // The REMOVED flat-count punish, reproduced exactly as should_punish_version
