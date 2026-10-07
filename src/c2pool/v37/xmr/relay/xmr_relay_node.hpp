@@ -184,6 +184,7 @@
 #include <c2pool/v37/frame_vault.hpp>
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
 #include "impl/xmr/coin/xmr_seedheight.hpp"
+#include "impl/xmr/pathb/pathb_params.hpp"   // kRuledLaneParams: the parked-list cap default
 #include "xmr_relay_wire.hpp"
 #include "xmr_relay_peerbook.hpp"   // RELAY-DISCOVERY
 #include "xmr_receipt_mint.hpp"
@@ -333,6 +334,11 @@ struct RelayOptions {
     ::c2pool::v37n::FrameVaultOptions vault{};
     u32         hello_timeout_ms = 10000;
     std::size_t verify_queue_max = 4096;
+    // O-P5 (the:ruling 23): parked verify items cap (objects). Overflow
+    // evicts the oldest (no penalty, no ban). Default open_bins x (1 + r_max)
+    // from the ruled lane params (the:K04, the:K08); --relay-parked-max overrides.
+    std::size_t parked_max = ::c2pool::xmr::pathb::kRuledLaneParams.open_bins
+                             * (1 + ::c2pool::xmr::pathb::kRuledLaneParams.r_max);
     // DROPS-VERIFY-SCALE: verify worker threads (each runs process(); the RxFn
     // may read verify_worker() to hash on its own VM). 1 = the pre-fix single
     // worker (the library default, every KAT byte-identical); the daemon passes
@@ -1447,6 +1453,20 @@ public:
     // `ms` before it is handled (0 = off), so a remote HELLO reaches this
     // node's reader BEFORE its own HELLO goes out -- deterministically.
     void set_test_up_delay_ms(u32 ms) { m_test_up_delay_ms = ms; }
+    // Test hook (O-P5 parked-list cap KAT): park a synthetic item carrying
+    // `id` with a far-future retry (the verify loop never re-queues it), then
+    // report the parked size. Overflow evicts the oldest (RelayStats::queue_dropped).
+    std::size_t test_park(const bytes32& id) {
+        Item it; it.id = id;
+        park(std::move(it), std::chrono::milliseconds(3600000));
+        return verify_parked_size();
+    }
+    // Test hook: is `id` currently parked?
+    bool test_parked_has(const bytes32& id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (const auto& p : m_parked) if (p.id == id) return true;
+        return false;
+    }
     // Rig hook (SIGUSR1 in the daemon): a NETWORK PARTITION of `secs` seconds --
     // every relay connection is dropped, inbound connections are refused and
     // nothing is dialed until it ends; then the node redials and backfills.
@@ -2536,7 +2556,7 @@ private:
     void park(Item it, std::chrono::milliseconds delay) {
         std::lock_guard<std::mutex> lk(m_mtx);
         it.not_before = Clock::now() + delay;
-        if (m_parked.size() >= 1024) {
+        if (m_parked.size() >= m_o.parked_max) {
             m_inflight.erase(m_parked.front().id);
             m_parked.pop_front();
             m_st.queue_dropped++;
