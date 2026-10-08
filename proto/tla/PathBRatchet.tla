@@ -48,7 +48,7 @@ CONSTANTS
   RD,           \* deepest reorg (0 = none); RD <= JR < L
   CMAX,         \* extra placements per position (0 or 1)
   AdvMax,       \* adversary work units per grid window
-  Layout,       \* release mix: "A" "S" "B" "BS" "T" "U" "N" "P"
+  Layout,       \* release mix: "A" "S" "B" "BS" "T" "U" "N" "P" "M" "MS" "MT"
   Joiners,      \* releases a joiner may run ({} = no joiner)
   Sem,          \* "r6" (shipped rules) or "r5" (alternate rules, for comparison)
   Ctl,          \* "none" or the name of a negative control / probe
@@ -73,12 +73,16 @@ Max0(X)   == IF X = {} THEN 0 ELSE CHOOSE v \in X : \A w \in X : w <= v
 Dsc(e, s, r) == [ep |-> e, s |-> s, to |-> s + NW * L, rd |-> r]
 
 R1To == 8                               \* FAILED boundary of R1's attempt (start 0)
-SameDig == Layout \in {"S", "BS", "MS"}  \* the re-proposal carries the failed attempt's own digest
+SameDig == Layout \in {"S", "BS", "MS", "MT"}  \* the re-proposal carries the failed attempt's own digest
 R2Tab == CASE Layout = "N" -> {Dsc(1, 0, "r1"), Dsc(2, 16, "r2")} \* layout N: no re-proposal of a failed epoch number
            [] SameDig -> {Dsc(1, 8, "r1")}                         \* re-proposal, same digest as R1's
            [] OTHER -> {Dsc(1, 8, "r2")}                            \* re-proposal, new digest
-\* R3: a later release with R2's attempt of 1 and an attempt of 2 (a second activation on top of the re-proposal)
-R3Tab == {Dsc(1, 8, IF SameDig THEN "r1" ELSE "r2"), Dsc(2, 28, "q3")}
+\* R3: a later release with R2's attempt of 1 and an attempt of 2 (a second activation on top of the re-proposal).
+\* R3's attempt of 2 starts at R1b's timeout of 2 (R1bTo2); under layout MT at the first grid position at or
+\* after R1bTo2 + GRACE.
+R1bTo2 == 28                             \* timeout of R1b's attempt of 2 (start 20)
+R3Tab == {Dsc(1, 8, IF SameDig THEN "r1" ELSE "r2"),
+          Dsc(2, IF Layout = "MT" THEN CeilL(R1bTo2 + GRACE) ELSE R1bTo2, "q3")}
 Tab(r) == CASE r = "R0"  -> {}                                    \* lacks epoch 1
             [] r = "R1"  -> {Dsc(1, 0, "r1")}
             [] r = "R1b" -> {Dsc(1, 0, "r1"), Dsc(2, 20, "q2")}   \* two-epoch table, start(2) late
@@ -88,7 +92,7 @@ Tab(r) == CASE r = "R0"  -> {}                                    \* lacks epoch
             [] OTHER     -> {}
 
 FolNodes == CASE Layout \in {"T", "U"} -> {"n0", "n1"}
-              [] Layout \in {"M", "MS"} -> {"n0", "n1", "n2", "n3", "n4"}
+              [] Layout \in {"M", "MS", "MT"} -> {"n0", "n1", "n2", "n3", "n4"}
               [] OTHER -> {"n0", "n1", "n2"}
 JN == "j"
 AN == FolNodes \cup (IF Joiners = {} THEN {} ELSE {JN})
@@ -106,7 +110,16 @@ Digests == {"G", "r1", "r2", "q2", "q3", "fx", "NULL"}
 ValidTab(T) == /\ \A d \in T : d.s % L = 0 /\ d.to = d.s + NW * L /\ d.ep >= 1 /\ d.ep <= EPOCH_MAX
                /\ \A d1, d2 \in T : d1.ep = d2.ep => d1 = d2
                /\ \A d \in T : d.ep > 1 => \E c \in T : c.ep = d.ep - 1 /\ d.s >= c.to + GRACE
-ASSUME \A r \in {"R0", "R1", "R1b", "R1u", "R2", "R3"} : ValidTab(Tab(r))
+\* checked for the releases the configuration runs (followers and joiners)
+UsedRels == {RelOf(n) : n \in FolNodes} \cup Joiners
+ASSUME \A r \in UsedRels : ValidTab(Tab(r))
+
+\* re-proposal spacing across releases (layout MT): an attempt of e starts at or after timeout + GRACE of every
+\* earlier attempt of e in the releases the configuration runs.  An earlier attempt that ends at R1To is gated
+\* by Release instead (Release fires only with no lock-in in windows 0 and 1).
+SpacedAcross(rs) == \A r1, r2 \in rs : \A a \in Tab(r1), b \in Tab(r2) :
+                      (a.ep = b.ep /\ a.s < b.s /\ a.to # R1To) => b.s >= a.to + GRACE
+ASSUME Layout = "MT" => SpacedAcross(UsedRels)
 
 ---------------------------------------------------------------------------
 (* The committed ratchet state S and rs_step.                              *)
@@ -431,7 +444,7 @@ Reorg ==
 (* R2 is released once R1's attempt FAILED (no lock-in in windows 0 and 1) *)
 (* and the FAILED boundary 8 lies below the reorg horizon (JR).            *)
 Release ==
-  /\ ~rel2 /\ Layout \in {"A", "S", "B", "BS", "N", "M", "MS"} /\ pos = R1To + JR
+  /\ ~rel2 /\ Layout \in {"A", "S", "B", "BS", "N", "M", "MS", "MT"} /\ pos = R1To + JR
   /\ \E n \in LiveSet : \A i \in 1..WR : KK(pos, i) \in {0, 1} => S[n].J[i] = 0
   /\ \A n \in AN : Later(RelN(n)) => div[n] = "no"
   /\ rel2' = TRUE
