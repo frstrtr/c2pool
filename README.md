@@ -466,12 +466,6 @@ by a replayed block, c2pool logs the refusal at `ERROR` and **refuses to serve
 embedded DASH templates**. It falls back to a configured dashd, or serves
 nothing. It never guesses a masternode payee.
 
-> **Known issue ([#1906](https://github.com/frstrtr/c2pool/issues/1906)).** The
-> compiled anchor (h=2522504) is now more than 20000 blocks behind the tip, so a
-> fresh node on default flags refuses to serve embedded templates. Until the
-> anchor is bumped, start a fresh node with `--embedded-mn-bridge-max 40000`.
-> A node that already has a persisted bridge cursor is not affected.
-
 Running DASH with a dashd RPC configured does **not** use the anchor at all —
 `protx list registered true` is authoritative and is used instead.
 

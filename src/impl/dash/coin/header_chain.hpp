@@ -91,7 +91,7 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.block_hash_func = p.pow_func;
 
     // Fast-start checkpoint: PINNED TO COINCIDE WITH THE MN-SET BRIDGE
-    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2513000). Cold start
+    // ANCHOR (dash_mn_checkpoint_mainnet.inc, height 2549400). Cold start
     // seeds the header tip AT the anchor, skipping ~2.5M headers of
     // validation from genesis.
     //
@@ -113,10 +113,10 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     // verify). The coincidence is machine-enforced by that KAT, so the two
     // pins can never silently drift apart again.
     p.fast_start_checkpoint = DashChainParams::Checkpoint{};
-    p.fast_start_checkpoint->height = 2522504;
+    p.fast_start_checkpoint->height = 2549400;
     p.fast_start_checkpoint->hash.SetHex(
-        "0000000000000016359051c239e552f2423a9f47585dda1273a9a0e1743d64f5");
-    // The FULL header of the anchor block (mainnet 2513000), so the cold seed
+        "00000000000000134ce084ad3dac4b93069fc40f32cb8d24a446754112b5010f");
+    // The FULL header of the anchor block (mainnet 2549400), so the cold seed
     // populates entry.header — not just entry.hash. Without it the seeded
     // IndexEntry carries a default (all-zero) hashMerkleRoot, and the DIP-4
     // historical-snapshot authentication in the MN-set bridge fails closed at
@@ -132,12 +132,12 @@ inline DashChainParams make_dash_chain_params_mainnet() {
     p.fast_start_checkpoint->has_header = true;
     p.fast_start_checkpoint->hdr_version = 536870912u;   // 0x20000000
     p.fast_start_checkpoint->hdr_prev_block.SetHex(
-        "000000000000001ba36f24ad2f5c2a8fbe7a5bddcd87c05ceb175fbfaf66cef3");
+        "000000000000000a5e49a9455f31b8b878ea3a31101a10da83dcdefb3795f9e9");
     p.fast_start_checkpoint->hdr_merkle_root.SetHex(
-        "68a1e828b55bddf70048e5ea8403aa2c7c0ae2e7e9d73cd8fe066feb352c88b3");
-    p.fast_start_checkpoint->hdr_time  = 1786835924u;
-    p.fast_start_checkpoint->hdr_bits  = 0x19251a49u;
-    p.fast_start_checkpoint->hdr_nonce = 3493802570u;
+        "935359e1a2d29fca27dc6ac1d6eea422f24301616bda26e087ac67f81b42790c");
+    p.fast_start_checkpoint->hdr_time  = 1791075943u;
+    p.fast_start_checkpoint->hdr_bits  = 0x191f4884u;
+    p.fast_start_checkpoint->hdr_nonce = 3249420384u;
     return p;
 }
 
