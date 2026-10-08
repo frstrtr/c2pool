@@ -54,7 +54,10 @@
 // PINNED SCOPE (fail-closed): BOTH entry points implement rct types 0
 // (coinbase), 5 (CLSAG) and 6 (BulletproofPlus) -- everything a node syncing
 // from a modern anchor can meet -- and return UnsupportedRctType for types 1, 2,
-// 3 and 4 rather than a guess.
+// 3 and 4 rather than a guess. Version-1 transactions (no rct part; still
+// valid on mainnet when spending unmixable pre-RingCT outputs) are in scope on
+// both paths: weight = blob size, fee = inputs - outputs, and the pruned path
+// measures their signatures because monerod sends a v1 blob unpruned.
 //
 // The full-blob path MEASURES the prunable bytes rather than predicting them, so
 // it is tempting to let it accept every type, and the first cut of this header
@@ -108,12 +111,55 @@ inline constexpr bool rct_is_bulletproof_plus(std::uint8_t t) noexcept {
 }
 
 // --- structural bounds -------------------------------------------------------
-// Deliberately generous: this parser decides shape, not policy. The admission
-// check table in the txpool applies the tighter consensus limits.
-inline constexpr std::uint64_t TX_MAX_INPUTS      = 4096;
-inline constexpr std::uint64_t TX_MAX_OUTPUTS     = 4096;
-inline constexpr std::uint64_t TX_MAX_RING        = 512;
-inline constexpr std::uint64_t TX_MAX_EXTRA_BYTES = 1u << 20;
+// This parser decides shape, not policy; the txpool's admission table applies
+// the tighter relay limits. Its count ceilings are therefore MONERO'S OWN parse
+// ceilings and nothing tighter: a tighter ceiling here is a consensus split,
+// because the block parser runs this code on the coinbase and on every body of
+// every block it follows, and a block Monero accepts would be refused here.
+//
+// monero-project src/cryptonote_basic/cryptonote_basic.h:56-60 (master
+// f6a591c), applied by transaction_prefix's deserializer (:186-207, :224-271):
+//
+//   MAX_VIN_COUNT               = CRYPTONOTE_MAX_TX_SIZE / sizeof(key_image)
+//   MAX_NON_COINBASE_VOUT_COUNT = CRYPTONOTE_MAX_TX_SIZE / sizeof(public_key)
+//   MAX_COINBASE_VOUT_COUNT     = 100000000 (LEVIN_DEFAULT_MAX_PACKET_SIZE)
+//                                 / sizeof(public_key)
+//   MAX_TOTAL_KEY_OFFSETS       = CRYPTONOTE_MAX_TX_SIZE / sizeof(public_key),
+//                                 a bound on the SUM of key_offsets over all
+//                                 inputs (deserialize_vin rejects a running
+//                                 total >= it), not a per-input ring bound.
+//
+// tx_extra has no count ceiling in Monero beyond the bytes present
+// (FIELD(extra) is a plain std::vector<uint8_t>, serialization/containers.h
+// do_serialize default max_cnt). The relay rule MAX_TX_EXTRA_SIZE = 1060 is the
+// txpool's (TxpoolConfig::max_extra_size), not the parser's.
+//
+// None of these ceilings drives memory: every count is checked against the
+// bytes actually present before the loop that reads it (BlobReader::read_count,
+// one byte per element, as Monero's own `remaining_bytes() < cnt`), and nothing
+// is reserved from a count before its bytes are present. The KAT
+// xmr_native_coinbase_outputs_limit_kat pins all of it.
+inline constexpr std::uint64_t CRYPTONOTE_MAX_TX_SIZE      = 1000000;   // cryptonote_config.h:41
+inline constexpr std::uint64_t MAX_VIN_COUNT               = CRYPTONOTE_MAX_TX_SIZE / 32;
+inline constexpr std::uint64_t MAX_NON_COINBASE_VOUT_COUNT = CRYPTONOTE_MAX_TX_SIZE / 32;
+inline constexpr std::uint64_t MAX_COINBASE_VOUT_COUNT     = 100000000 / 32;
+inline constexpr std::uint64_t MAX_TOTAL_KEY_OFFSETS       = CRYPTONOTE_MAX_TX_SIZE / 32;
+static_assert(MAX_VIN_COUNT == 31250 && MAX_NON_COINBASE_VOUT_COUNT == 31250
+              && MAX_TOTAL_KEY_OFFSETS == 31250, "Monero master f6a591c values");
+static_assert(MAX_COINBASE_VOUT_COUNT == 3125000, "Monero master f6a591c value");
+
+// Smallest wire encoding of one output (varint amount + tag + key[32]). The
+// per-element floor for read_count wherever a caller RESERVES from an output
+// count, so the reservation is bounded by the bytes present.
+inline constexpr std::size_t TX_MIN_OUTPUT_BYTES = 34;
+
+// The output ceiling of one transaction, chosen exactly as Monero's
+// deserializer chooses it (cryptonote_basic.h:206): the coinbase ceiling for a
+// coinbase (or an empty vin, which this parser refuses earlier), the
+// non-coinbase ceiling otherwise.
+inline constexpr std::uint64_t max_vout_count(bool is_coinbase) noexcept {
+    return is_coinbase ? MAX_COINBASE_VOUT_COUNT : MAX_NON_COINBASE_VOUT_COUNT;
+}
 
 enum class TxParseStatus : std::uint8_t {
     Ok = 0,
@@ -257,8 +303,10 @@ inline TxParseStatus predicted_prunable_size(std::uint8_t rct_type,
     std::size_t sz = 1;
     // A,A1,B,r1,s1,d1 for plus; A,S,T1,T2,taux,mu,a,b,t for CLSAG's bulletproof.
     sz += 32 * (plus ? 6u : 9u);
-    // L and R, each a length-prefixed vector of `nlr` keys. nlr <= 6 + 12 here,
-    // so both length varints are one byte.
+    // L and R, each a length-prefixed vector of `nlr` keys. A non-coinbase has
+    // n_outputs <= MAX_NON_COINBASE_VOUT_COUNT (31,250 < 2^15), so nlr <= 6 + 15
+    // here and both length varints are one byte. (A coinbase is rct type NULL
+    // and returned above.)
     sz += 2 * (1 + 32 * nlr);
     // CLSAG per input: s[ring] + c1 + D. The s vector length is implied by the
     // ring size, so it carries no varint of its own.
@@ -289,9 +337,20 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
 
     // --- inputs --------------------------------------------------------------
     std::uint64_t n_in = 0;
-    if (!r.read_count(n_in, TX_MAX_INPUTS)) return TxParseStatus::Truncated;
+    if (!r.read_count(n_in, MAX_VIN_COUNT)) return TxParseStatus::Truncated;
     if (n_in == 0) return TxParseStatus::Malformed;
     info.n_inputs = static_cast<std::size_t>(n_in);
+
+    // Version 1 carries its fee in the clear: inputs minus outputs (monerod
+    // get_tx_fee). Version 2 amounts are zero and the fee lives in the rct base.
+    std::uint64_t amount_in = 0;
+    std::uint64_t amount_out = 0;
+
+    // Running total of key offsets over all inputs. Monero's deserialize_vin
+    // refuses the transaction once the total reaches MAX_TOTAL_KEY_OFFSETS, so
+    // the invariant here is total_key_offsets < MAX_TOTAL_KEY_OFFSETS and one
+    // more input may add at most MAX_TOTAL_KEY_OFFSETS - 1 - total_key_offsets.
+    std::uint64_t total_key_offsets = 0;
 
     for (std::uint64_t i = 0; i < n_in; ++i) {
         BlobReader::DepthGuard gi(r);
@@ -311,11 +370,15 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
             if (info.is_coinbase) return TxParseStatus::Malformed;
             std::uint64_t amount = 0;
             if (!r.read_varint(amount)) return TxParseStatus::Truncated;
+            if (amount_in > UINT64_MAX - amount) return TxParseStatus::Overflow;
+            amount_in += amount;
             std::uint64_t n_off = 0;
-            if (!r.read_count(n_off, TX_MAX_RING)) return TxParseStatus::Truncated;
+            if (!r.read_count(n_off, MAX_TOTAL_KEY_OFFSETS - 1 - total_key_offsets))
+                return TxParseStatus::Truncated;
             if (n_off == 0) return TxParseStatus::Malformed;
+            total_key_offsets += n_off;
+            // Grown as the offsets are read, never reserved from the count.
             std::vector<std::uint64_t> offsets;
-            if (capture) offsets.reserve(static_cast<std::size_t>(n_off));
             for (std::uint64_t k = 0; k < n_off; ++k) {
                 std::uint64_t off = 0;
                 if (!r.read_varint(off)) return TxParseStatus::Truncated;
@@ -332,8 +395,11 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
     }
 
     // --- outputs -------------------------------------------------------------
+    // The ceiling depends on whether this is a coinbase, as in Monero: the
+    // block parser runs this on the miner tx, whose ceiling is
+    // MAX_COINBASE_VOUT_COUNT (3,125,000), not the non-coinbase 31,250.
     std::uint64_t n_out = 0;
-    if (!r.read_count(n_out, TX_MAX_OUTPUTS)) return TxParseStatus::Truncated;
+    if (!r.read_count(n_out, max_vout_count(info.is_coinbase))) return TxParseStatus::Truncated;
     if (n_out == 0) return TxParseStatus::Malformed;
     info.n_outputs = static_cast<std::size_t>(n_out);
 
@@ -343,6 +409,8 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
 
         std::uint64_t amount = 0;
         if (!r.read_varint(amount)) return TxParseStatus::Truncated;
+        if (amount_out > UINT64_MAX - amount) return TxParseStatus::Overflow;
+        amount_out += amount;
         std::uint8_t tag = 0;
         if (!r.read_byte(tag)) return TxParseStatus::Truncated;
         if (tag == TX_OUT_TO_KEY || tag == TX_OUT_TO_TAGGED_KEY) {
@@ -362,10 +430,16 @@ inline TxParseStatus parse_tx_prefix(BlobReader& r, TxWeightInfo& info, bool cap
     }
 
     // --- tx_extra ------------------------------------------------------------
+    // No ceiling but the bytes present (see the structural bounds above).
     std::uint64_t extra_len = 0;
-    if (!r.read_count(extra_len, TX_MAX_EXTRA_BYTES)) return TxParseStatus::Truncated;
+    if (!r.read_count(extra_len, UINT64_MAX)) return TxParseStatus::Truncated;
     if (!r.skip(static_cast<std::size_t>(extra_len))) return TxParseStatus::Truncated;
     info.extra_size = static_cast<std::size_t>(extra_len);
+
+    if (info.version == 1 && !info.is_coinbase) {
+        if (amount_out > amount_in) return TxParseStatus::Malformed;   // spends more than it has
+        info.fee = amount_in - amount_out;
+    }
 
     info.prefix_size = r.offset() - begin;
     return TxParseStatus::Ok;
@@ -404,6 +478,8 @@ inline TxParseStatus parse_rct_base(BlobReader& r, TxWeightInfo& info, bool capt
     // exactly what monerod stores as output_data_t.commitment for a non-coinbase
     // RCT output, so a ring numbered against it verifies its CLSAG unchanged.
     if (capture) {
+        // Reserve only once the bytes are known to be present.
+        if (r.remaining() / 32 < info.n_outputs) return TxParseStatus::Truncated;
         if (info.out_commitments.capacity() < info.n_outputs)
             info.out_commitments.reserve(info.n_outputs);
         for (std::size_t i = 0; i < info.n_outputs; ++i) {
@@ -432,7 +508,9 @@ inline void finish(TxWeightInfo& info) {
 
 // Parse a PRUNED transaction blob (prefix + rct base, as delivered by
 // GET_OBJECTS with prune=true) and RECONSTRUCT the prunable length, so the
-// weight is known without ever seeing the ring signatures.
+// weight is known without ever seeing the ring signatures. A version-1
+// transaction has no pruned form: its blob is the whole transaction and the
+// signatures are measured, not reconstructed (see the branch below).
 inline TxParseStatus parse_tx_pruned(const std::uint8_t* data, std::size_t size,
                                      TxWeightInfo& info, bool capture = false) {
     info = TxWeightInfo{};
@@ -444,6 +522,26 @@ inline TxParseStatus parse_tx_pruned(const std::uint8_t* data, std::size_t size,
     if (info.version >= 2) {
         st = detail::parse_rct_base(r, info, capture);
         if (st != TxParseStatus::Ok) return st;
+    } else {
+        // monerod never prunes a version-1 transaction: its "pruned" blob is
+        // the whole transaction, prefix plus the ring signatures -- one (c, r)
+        // pair of 32-byte scalars per ring member of every input, with no
+        // length prefix (the counts are implied by the prefix; a coinbase input
+        // has none). Version 1 is still valid on mainnet for a spend of
+        // unmixable pre-RingCT outputs (monerod check_tx_inputs), so honest
+        // spans carry it, and refusing it banned every peer that served one.
+        // The signatures are MEASURED here, not predicted, and the id is then
+        // the plain hash of the whole blob (tx_hash_from_parts, version < 2).
+        std::size_t sig_bytes = 0;
+        for (std::uint64_t rs : info.ring_sizes)
+            sig_bytes += 64u * static_cast<std::size_t>(rs);   // sum(rs) < MAX_TOTAL_KEY_OFFSETS
+        if (!r.skip(sig_bytes)) return TxParseStatus::Truncated;
+        if (r.remaining() != 0) return TxParseStatus::TrailingBytes;
+
+        info.prunable_size      = sig_bytes;
+        info.prunable_predicted = false;
+        detail::finish(info);
+        return TxParseStatus::Ok;
     }
 
     // The pruned blob must be consumed exactly: anything left over means we

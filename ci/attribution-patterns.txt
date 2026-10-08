@@ -1,0 +1,27 @@
+# Attribution markers refused in frstrtr/c2pool.
+#
+# Read by scripts/ci/attribution_gate.sh (the attribution-gate CI job) and by
+# the local commit-msg and pre-push hooks (scripts/ci/hooks/). One extended
+# regular expression per line, matched case-insensitively against commit
+# messages, the pull request title and body, the branch name and every line a
+# change adds to a tracked file. This file is the only tracked file the gate
+# does not scan. The list is the marker list of the gate of
+# frstrtr/c2pool-monero (pull request #1) plus the markers this repository's
+# gate already refused.
+co-authored-by:.*(claude|anthropic|openai|chatgpt|copilot|gpt|gemini)
+noreply@anthropic\.com
+claude-session
+claude\.ai/code
+claude\.com/claude-code
+generated with
+🤖
+claude code
+claude-
+anthropic
+openai
+chatgpt
+copilot
+\bopus\b
+\bsonnet\b
+\bhaiku\b
+\bfable\b

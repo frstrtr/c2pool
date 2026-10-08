@@ -70,12 +70,12 @@ bool parse_hashing_blob(const HashingBlob& blob, ParsedBlob& out) {
     if (!read_varint(b, pos, out.major))     return false;
     if (!read_varint(b, pos, out.minor))     return false;
     if (!read_varint(b, pos, out.timestamp)) return false;
-    if (pos + 32 + 4 > b.size())             return false;
+    if (pos > b.size() || b.size() - pos < 32 + 4) return false;
     std::memcpy(out.prev_id.data(), b.data() + pos, 32);
     pos += 32;                    // prev_id
     pos += 4;                     // nonce (4 LE)
     out.header_len = pos;
-    if (pos + 32 > b.size())                 return false;
+    if (pos > b.size() || b.size() - pos < 32) return false;
     std::memcpy(out.tree_root.data(), b.data() + pos, 32);
     pos += 32;                    // tree_root
     if (!read_varint(b, pos, out.n_tx))      return false;
@@ -91,6 +91,9 @@ bool parse_hashing_blob(const HashingBlob& blob, ParsedBlob& out) {
 // opening path (verify_crypto_opening) never parses tx_extra, so raw mainnet
 // coinbases with a >=128-byte nonce still verify -- their bytes are absorbed
 // wholesale into the sponge, unparsed.)
+// Peer data: every length below is checked as "len > size - pos" with
+// pos <= size (the loop condition and read_varint keep it so), never as
+// "pos + len > size", which a varint length near 2^64 would wrap.
 bool parse_tx_extra(const std::vector<u8>& e, ParsedTxExtra& out) {
     std::size_t pos = 0;
     while (pos < e.size()) {
@@ -99,25 +102,25 @@ bool parse_tx_extra(const std::vector<u8>& e, ParsedTxExtra& out) {
             while (pos < e.size()) { if (e[pos] != 0x00) return false; ++pos; }
             break;
         } else if (tag == 0x01) {                // tx pubkey (32)
-            if (pos + 32 > e.size()) return false;
+            if (e.size() - pos < 32) return false;
             out.has_pubkey = true;
             std::memcpy(out.pubkey.data(), &e[pos], 32);
             pos += 32;
         } else if (tag == 0x02) {                // extra-nonce: varint(len) || bytes
             u64 len;
             if (!read_varint(e, pos, len)) return false;
-            if (pos + len > e.size()) return false;
+            if (pos > e.size() || len > e.size() - pos) return false;
             out.has_nonce = true;
             out.nonce.assign(e.begin() + pos, e.begin() + pos + len);
             pos += static_cast<std::size_t>(len);
         } else if (tag == 0x03) {                // MM: varint(flen) || varint(depth) || root[32]
             u64 flen;
             if (!read_varint(e, pos, flen)) return false;
+            if (pos > e.size() || flen > e.size() - pos) return false;
             const std::size_t fend = pos + static_cast<std::size_t>(flen);
-            if (fend > e.size()) return false;
             u64 depth;
             if (!read_varint(e, pos, depth)) return false;
-            if (pos + 32 > fend) return false;
+            if (pos > fend || fend - pos < 32) return false;
             out.has_mm = true;
             out.mm_depth = depth;
             std::memcpy(out.mm_root.data(), &e[pos], 32);
@@ -126,7 +129,7 @@ bool parse_tx_extra(const std::vector<u8>& e, ParsedTxExtra& out) {
         } else if (tag == 0x04) {                // additional pubkeys: varint(cnt) || cnt*32
             u64 cnt;
             if (!read_varint(e, pos, cnt)) return false;
-            if (pos + cnt * 32 > e.size()) return false;
+            if (pos > e.size() || cnt > (e.size() - pos) / 32) return false;
             pos += static_cast<std::size_t>(cnt * 32);
         } else {
             return false;                        // unknown tag => not parseable

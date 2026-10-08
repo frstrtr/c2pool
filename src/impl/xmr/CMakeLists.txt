@@ -35,7 +35,7 @@ add_subdirectory(coin)
 add_subdirectory(node)
 
 # X9 OPTION B: the whole-block template builder library (xmr_template =
-# xmr_block_template.cpp p2pool port + the authored xmr_coin_primitives.cpp seam
+# the clean-room xmr_block_template.cpp + the authored xmr_coin_primitives.cpp seam
 # bodies over xmr_coin). Unconditional like coin/node — its TUs compile only when
 # a dependent target links it (the c2pool-v37-xmr daemon behind --coinbase v37,
 # and the assembly KAT in test/). See template/CMakeLists.txt.
@@ -62,6 +62,12 @@ endif()
 # themselves (levin P2P, chain index, txpool, template source, relay, parity
 # oracle) land in later waves against these contracts.
 add_subdirectory(native)
+
+# Path B, slice S1 (subset): header-only wire formats, derived caps and
+# horizons, Monero branch selection, catch-up rule, rewind journal and the
+# headers-first decision, with their KATs. An INTERFACE target that no running
+# target links. See pathb/CMakeLists.txt.
+add_subdirectory(pathb)
 
 if (BUILD_TESTING)
     add_subdirectory(test)

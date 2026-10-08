@@ -475,6 +475,75 @@ static void test_block_complete_entry() {
 }
 
 // ---------------------------------------------------------------------------
+// A 2004 the size of an honest MAINNET span. Every span this node asks for is
+// MAX_OBJECT_REQUEST_IDS (100) pruned blocks, and a pruned entry costs one
+// epee section + two keys per transaction. Under the generic 4096-section /
+// 4096-key budget, anything above ~18 tx/block was refused as BadStorage
+// (TooManyEntries) and the serving peer banned for a "malformed body" -- the
+// post-anchor catch-up stall seen on mainnet 2026-09-23 (1.39 MB and 1.95 MB
+// honest responses refused from 25 peers in 300 s). Blob sizes here are at the
+// SMALL end of real pruned transactions, which is the hard case for a budget
+// scaled by bytes.
+static ResponseGetObjects dense_span(std::size_t blocks, std::size_t txs_per_block,
+                                     std::size_t tx_blob_bytes) {
+    ResponseGetObjects objs;
+    objs.current_blockchain_height = 3768407;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        BlockEntry e;
+        e.pruned = true;
+        e.block_blob.assign(160 + 32 * txs_per_block, static_cast<std::uint8_t>(b));
+        for (std::size_t t = 0; t < txs_per_block; ++t)
+            e.txs.push_back(TxBlobEntry{
+                std::vector<std::uint8_t>(tx_blob_bytes, static_cast<std::uint8_t>(t)),
+                hash_of(static_cast<std::uint8_t>(b + t)), true});
+        objs.blocks.push_back(std::move(e));
+    }
+    return objs;
+}
+
+static void test_dense_mainnet_span() {
+    MessageError err = MessageError::None;
+
+    struct Shape { std::size_t blocks, txs, blob; };
+    const Shape shapes[] = {
+        {100,  19, 1500},   // just past the old budget, typical tx size
+        {100,  40,  300},   // mainnet-typical density, small txs
+        {100, 150,  200},   // a busy span of the smallest real pruned txs
+    };
+    for (const Shape& s : shapes) {
+        const ResponseGetObjects objs = dense_span(s.blocks, s.txs, s.blob);
+        std::vector<std::uint8_t> bytes;
+        check(encode_response_get_objects(objs, bytes, err), "a dense span encodes");
+        ResponseGetObjects back;
+        err = MessageError::None;
+        const bool ok = decode_response_get_objects(bytes.data(), bytes.size(), back, err);
+        checkf(ok, "a %zu-block span with %zu tx/block (%zu bytes) decodes (err=%d)",
+               s.blocks, s.txs, bytes.size(), static_cast<int>(err));
+        std::size_t n_tx = 0;
+        for (const BlockEntry& b : back.blocks) n_tx += b.txs.size();
+        checkf(back.blocks.size() == s.blocks && n_tx == s.blocks * s.txs,
+               "and every block and body comes back (%zu blocks, %zu txs)",
+               back.blocks.size(), n_tx);
+    }
+
+    // The budget still bounds what a hostile body can make us allocate: tree
+    // nodes are paid for in bytes. 200000 empty sections cost ~200 KB on the
+    // wire and would be 200000 decoded nodes; the scaled budget allows ~2 K.
+    std::vector<E::Value> empties(200000, E::v_object({}));
+    std::vector<std::uint8_t> hostile;
+    check(encode_body(E::v_object({
+              {"blocks", E::v_array(E::Type::Object, std::move(empties))},
+              {"current_blockchain_height", E::v_u64(1)},
+          }), hostile, err),
+          "a section-dense hostile body can be built");
+    ResponseGetObjects hb;
+    err = MessageError::None;
+    check(!decode_response_get_objects(hostile.data(), hostile.size(), hb, err)
+              && err == MessageError::BadStorage,
+          "and a body that buys more nodes than bytes is still refused at the storage layer");
+}
+
+// ---------------------------------------------------------------------------
 // The rest of the message set, round trip.
 static void test_round_trips() {
     MessageError err = MessageError::None;
@@ -716,6 +785,7 @@ int main() {
     test_network_address();
     test_peerlist();
     test_block_complete_entry();
+    test_dense_mainnet_span();
     test_round_trips();
     test_network_ids();
     test_malformed();

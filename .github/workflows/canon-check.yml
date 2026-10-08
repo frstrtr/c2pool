@@ -1,0 +1,67 @@
+name: canon-check
+
+# The v37 design canon gate (docs/canon/CANON.yaml). Runs tools/canon/canon_check.py
+# on every pull request and every push to master. It fails on any NEW violation:
+# a failing canon rule with no open deviation in docs/canon/DEVIATIONS.md, a check
+# that passed in docs/canon/baseline.json and fails now, a forbidden-pattern count
+# above the baseline, a required KAT that left CMake or the build.yml target lists,
+# or (pull requests only) a body without a "Canon:" line when the change touches
+# XMR lane consensus paths or the canon itself (rule C10). Stdlib Python, no build,
+# seconds per run. The "edited" trigger re-runs the check when the PR body changes.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: canon-check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  canon-check:
+    name: canon-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parser self-test
+        run: python3 tools/canon/canon_check.py --selftest
+
+      - name: Changed files and PR body
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' > "$RUNNER_TEMP/changed-files.txt"
+          echo "changed files: $(wc -l < "$RUNNER_TEMP/changed-files.txt")"
+
+      - name: Canon check (pull request)
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 tools/canon/canon_check.py --json canon-report.json \
+            --pr-body "$RUNNER_TEMP/pr-body.txt" --changed-files "$RUNNER_TEMP/changed-files.txt"
+
+      - name: Canon check (push)
+        if: github.event_name != 'pull_request'
+        run: python3 tools/canon/canon_check.py --json canon-report.json
+
+      - name: Upload the canon report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canon-report
+          path: canon-report.json
+          retention-days: 30
+          if-no-files-found: ignore

@@ -1,0 +1,317 @@
+# XMR lane: the spend-cost floor and paying dust
+
+Status: **implemented** (§2, §3, §5, §6, §6a; the daemon turns them on from
+the lane's genesis). Operator discussion 2026-09-29,
+revised the same day. **Amended by the drain rule** (operator rulings
+2026-10-02, `settlement-drain.md`, lane-rules fields 23-25 = 16 / 64 / 1 on
+the test networks): old balances are paid only out of a bounded slice of the
+block, the window is paid first, and the DEBT FIRST step of §3 is gone. This record keeps the decisions and their
+derivations so the implementation, review and paper can cite one source. It
+builds on the every-node coinbase recompute (`coinbase-recompute.md`): every
+rule below is a function of inputs every node holds, so the recompute
+enforces it.
+
+## 1. Goal
+
+Each lane block distributes its whole reward to the miners of its window, in
+its own coinbase, and records no debt it can avoid. Nothing is random,
+nothing is a pool-chosen constant: the one bound comes from Monero's consensus
+fee rule, and it decides only who goes first when the block has no room for
+everyone.
+
+## 2. The floor c: the cost to spend one output
+
+    c = quantize_up( w_input × Fl ),   Fl = Monero get_dynamic_base_fee(total, 300000)
+
+* `Fl` is Monero's consensus minimum fee per byte (`Blockchain::check_fee` /
+  `get_dynamic_base_fee`, 2021 scaling): `0.95 × R × 3000 / M²`, where `M` is
+  the fee median. The fee median is never below the 300 kB penalty-free zone
+  (`CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5`), so `M = 300000` gives the
+  **largest** minimum fee Monero can require. `R` is the block's own coinbase
+  total, which is at least the base reward. So `c` is an upper bound on the
+  real minimum cost to spend the output. Every node computes it from the
+  block itself: nothing is committed, nothing is looked up.
+* `w_input` is the weight one input adds to a RingCT transaction of the
+  current hard fork (ring size 16, CLSAG): the input prefix, the key image,
+  the CLSAG signature and the pseudo-output. It is derived from the format in
+  code, not chosen.
+* `quantize_up` rounds up to Monero's fee quantization (`fee_quantization_mask`).
+
+Reference numbers: R = 0.6 XMR gives `Fl ≈ 20 000 piconero/byte` and
+`c ≈ 0.000013 XMR`, about 0.002% of the block. For comparison, P2Pool's
+minimum payout is about 0.00027 XMR.
+
+**Rulings that shaped this (2026-09-29).**
+* No pool-side floor (`t_share`, P2Pool's one-share rule). It is not a Monero
+  rule, and it sent every sub-share (DROPS) miner to a lottery.
+* **No lottery.** A lottery over sub-floor amounts was proposed and then
+  dropped. Its only jobs were amounts below `c` and blocks too full for the
+  payouts. Monero blocks leave thousands of free output slots, so the second
+  case is rare. For the first, deterministic accumulation is exact per miner.
+  A lottery also gives the builder levers to steer the draw: it chooses the
+  credit cut, and cheap mempool spam raises a fit-based threshold.
+* No `t_fit`. Fitting the coinbase is the output cap's job (§3). A per-block
+  threshold from block weight could not be verified by receivers, which hold
+  no per-block weight, and the builder could steer it.
+
+## 3. Payouts in a lane block
+
+Ruling (2026-09-29, revised): **pay while there is room, dust included.**
+Accumulating dust as a debt only defers a payment the block could make now.
+Dust outputs are allowed to pile up on chain. Consolidating them for free
+into one transaction for pool members is a later stage (§7).
+
+* **Everyone fits (the normal case):** every payee in the window, dust
+  included, is paid its exact E_b in this block. No balance, no advance.
+  Rehearsal M7b: a fresh pool with 40 dust miners, 24 blocks: every balance
+  is 0, and every block ends in the donation output as a 0-amount marker.
+* **Order when the block has no room for everyone.** Payouts worth spending
+  (E_b ≥ c) come before dust: a slot spent on an output that costs more to
+  spend than it holds is the worst use of a scarce slot. Within each group
+  the order is **oldest first**, the K_fair rule. The price: while the pool
+  overflows (more than about 2700 payees in the window), dust waits first
+  and its share of those blocks is redistributed. With room, dust is paid
+  exactly like everyone. A payee with a waiting balance goes by its
+  `first_eligible`, ascending.
+  A payee with none is the youngest. Equal ages go by
+  `sha256d("V37T" ‖ prev_id ‖ identity)`, the salted tie that nobody can grind.
+  The size of E_b never decides. A payee whose cash was redistributed has no
+  balance, so it is the youngest again next block, and the salted tie rotates
+  who waits.
+* **Pay-now first** (the drain rule, ruling R1 2026-10-02). The owed pass
+  and the dust pass together pay at most
+  `Delta = min(F, R × min(dh, 64) / 256)` of old balances (F: every positive
+  balance in the ledger; dh: Monero heights since this pool's previous lane
+  block), and the window's E_b is split at `P = R − debt_paid`. When everyone
+  has a slot, every payee is paid its E_b(P) in full, so a canonical block
+  leaves no new balance; the float shrinks by exactly the debt paid. With no
+  old balance, `P = R`: the block is master's, byte for byte.
+* **Short pool** (master, the rule off: the owed pass paid old debts out of
+  the whole reward first): every payee with a slot is still paid, and each
+  gets the same fraction of its E_b. The rest stays its balance, which the
+  owed queue pays later: a partial payment, not an advance. Under the drain
+  rule the pool is never short for this reason (the window is split at P).
+* **No packing problem.** A payment can be any amount, so filling the slots in
+  order and splitting the pool pro rata uses every slot and every piconero.
+  Only indivisible items need a knapsack. `v37_xmr_spend_floor_kat` F2c: a
+  pool holding half of what was credited pays all 12 payees half each, and
+  only the marker is left.
+* **Payees that are not admitted** (no slot left). Their cash is
+  **redistributed** to the admitted payees pro rata and comes off the waiting
+  payees' credit for this block (ruling R4 2026-10-02). This is P2Pool's rule
+  for outputs that do not fit. Their work stays in the window and earns in
+  the next blocks. In a contested block the owed pass keeps at most
+  `K_o = max(1, cap_owed × owed_paid_1 / R)` slots (the first owed pass's
+  cash share of the block, ≤ 674 of 2699 at `H_cap = 64`), so the window
+  always keeps slots and "nobody admitted" cannot happen. If the admitted
+  payees' E_b(P) still sums to 0, the moved cash goes to the payees the owed
+  pass paid, pro rata to what it paid them, never to the donation
+  (`v37_xmr_drain_kat` D, D3).
+  * **DEBT FIRST is removed** under the drain rule (ruling R1). Master (the
+    rule off) first paid the admitted payees' old balances out of the waiting
+    payees' cash and left the waiting payees their credit: the float only
+    rotated, every block re-issued its window's E_b as IOUs
+    (`v37_xmr_spend_floor_kat` F2d pins master's behaviour,
+    `v37_xmr_drain_kat` D2 the rule's).
+* **A balance below c is paid when there is room** (ruling 2026-09-30,
+  audit A8). The owed pass takes only balances at or above c. Every other
+  positive balance is then paid, in the salted order
+  `sha256d("V37T" ‖ prev_id ‖ identity)`, in the slots the pay-now admission
+  leaves free. A payee that already has an output here needs no slot. Each is
+  paid `min(balance, cash left)` before this block's pay-now pool is split:
+  debt before pay-now, as the owed pass is. An owed balance never waits while
+  a block has a slot for it (`v37_xmr_spend_floor_kat` F12). Under the drain
+  rule the dust pass draws on `Delta − owed_paid` only, and pays only
+  balances below `c(R)`: a balance the owed pass would take below `c(R)` (the
+  F4 band `[c(tail), c(R))`) is handed to the dust pass instead of being
+  skipped (ruling R5; `v37_xmr_spend_floor_kat` F4b, at the tail and at
+  c × 8). A budget-stopped last take below `c(R)` of a balance `>= c(R)` is
+  not paid: that creditor carries one block, its age untouched, and the
+  unspent part of Delta stays in the window's `P` (ruling F4-partial
+  2026-10-02; `v37_xmr_drain_kat` I). No creditor whose balance is worth a
+  payout is ever paid a sub-c output.
+* **Never an advance** (ruling 2026-09-29). Pay-now is a flow. A miner that
+  leaves or changes address never returns work paid ahead, so no payee is
+  paid more than it is credited. The redistribution is booked as a credit
+  delta (`allocate_exact_sum`'s `credit_delta`, Σ = 0). Every node gets the
+  delta from its recompute and applies it to the E_b before the net booking.
+  Rehearsal M7: no balance is ever negative.
+* The part of a waiting payee's E_b that the owed pass spent on older debts
+  (a short pool) stays its balance: that is the queue, not an advance.
+* **Why this cannot grow.** A redistribution moves credit and cash
+  together, so every block pays out what it credits. On master, balances come
+  only from the owed pass (the queue moving old debt onto current miners),
+  and that keeps the total constant: the float is a fixed point. Under the
+  drain rule a canonical block books `dT = −debt_paid`: the float only falls,
+  to 0, and stays there (`v37_xmr_drain_kat` A, rehearsal M7c). The stated
+  exceptions (amendment A3): seeds, a DROPS due claimed with the window rule
+  off, and a builder that is not canonical (booked debit-only).
+* **Uncredited cash** (more pool than E_b credited to anyone) stays in the
+  residual, which is the donation output. The fold splits the whole reward,
+  and its rounding dust stays with the miners, so in practice the donation
+  output is only its 0-amount marker plus the donation's own give-author
+  share.
+* **The owed queue** (K_fair, oldest first) stays as the safety net for
+  balances at or above `c`: payees that did not fit, a restart, DROPS carries
+  and the seeds. Under the drain rule it runs at the budget Delta, never at
+  the whole reward. In steady state it is empty.
+* **The output cap is the wire ceiling (2700), fixed.** The coinbase takes its
+  room before any transaction: the native trim reserves it, and the template's
+  own pick counts the miner tx first. The transactions fill what is left of
+  the free zone, and a 2700-output coinbase (about 113 kB) always fits in the
+  300 kB zone. So every receiver checks exactly one cap. Before this, the
+  cap came from the builder's own transaction set, which a receiver cannot
+  see. A builder could claim fewer slots, push payees into waiting and take
+  their cash as an advance on its own key, then abandon the key. That was
+  worth about its own hashrate share of extra income per block it found
+  (rehearsal M8: such a block is now non-canonical on every node).
+
+## 4. Published
+
+`c` is recomputed by every node from the block's total, so nothing is added
+to the 0x02 payload. Neither the stratum login reply nor the HTTP status
+shows it yet; the login reply carries the fee model and the two fee
+percentages (#1880). `c` follows from the block total (`spend_floor`).
+
+## 5. Abandoned dust
+
+Implemented (`OwedLedgerRules::decay_horizon`, `decay_half_life`; the daemon
+sets them to 8640 and 2160 **Monero heights**, the FINALIZE clock:
+`kXmrDustDecayHorizonHeights` / `kXmrDustDecayHalfLifeHeights`, 12 and 3 days
+at 120 s. They are named as heights, not borrowed from the lane's window and
+half-life, which count lane positions; audit A9).
+
+* **Only a gone miner.** A balance below the floor decays only after its key
+  is **passed by**: a lane block credits other keys but not it. While a miner
+  works, every lane block credits it, DROPS near-miss credit included, so an
+  active miner, however small, is never decayed. A pool that finds no block
+  decays nobody.
+* **Grace, then halving.** From the bin it was passed by, the balance is kept
+  for 8640 more heights to come back. Then it halves at the FINALIZE that
+  enters each 2160-height half-life, down to 0, and the row is removed. A new credit
+  clears the state.
+* **Never a donation.** The write-off only lowers the pool's liability: the
+  cash behind that balance already paid older debts. Each FINALIZE that
+  writes off carries the amounts in its owed-event leaf (the `settled` map
+  of the FINALIZE leaf), and `decayed_total()` counts them.
+* **Negative rows and balances at or above the floor never decay.**
+* **Committed.** The decay state (the bin a key was passed by, the halvings
+  applied) is part of `owed_digest` (tag `V37K`), so every node decays alike.
+* **The clock runs on the gross set** (ruling R5, with the drain rule). Under
+  pay-now first every window row nets to 0, so a FINALIZE no longer carries a
+  positive credit row and "passed by" read from the netted credit would never
+  start. The FOUND carries `G_b = {k : E'_b(k) > 0}` (the fold at the cut
+  after the DROPS-due clamp, before the redistribution, the finder and the
+  netting); a key outside `G_b` of a FINALIZE with a non-empty `G_b` is passed
+  by, a key in it resets its clock, an empty-cut block passes nobody by
+  (`OwedLedgerRules::decay_from_gross`; `v37_xmr_spend_floor_kat` F10b,
+  `v37_xmr_drain_kat` H).
+* **Paid first when there is room** (§3, A8). A balance below c is paid in
+  any block with a free slot and cash left, so decay only reaches dust that
+  had no room: a block overflowing its slots, or a pool whose cash the older
+  debts take.
+* Pinned by `v37_xmr_spend_floor_kat` F10 and F12, and by rehearsal M10 and
+  M10b:
+  - M10: 20 tiny miners leave while every block has room. Their dust is paid
+    in full and nothing decays.
+  - M10b: the same miners leave, but the old debts take every pool. Their dust
+    waits and decays by the same amount on every node.
+
+## 6. Seniority from the threshold
+
+A balance earns K_fair age only from the moment it reaches `c`, so a parked
+dust balance cannot season into the head of the queue (external review 02).
+This changes the W4 ledger (`first_eligible` is inside `owed_digest`), so it
+is a per-ledger switch that only the XMR lane turns on. Family A lanes stay
+byte-identical.
+
+## 6a. Rotation on a partial owed payment
+
+Ruling 2026-09-29 (external review 04 and audit O-1). A key the owed pass
+pays **only in part** goes to the back of the queue: its `first_eligible`
+becomes the height of that block. A key paid in full leaves the queue as
+today, and re-enters at the back when a new unpaid remainder appears.
+
+* No constant: no per-payee cap and no `C_share`. At most one key is paid in
+  part per block (the walk stops when the budget runs out), so the queue
+  turns over by construction.
+* A working miner is unaffected for its current work: pay-now pays each
+  block's E_b to the current miners pro rata, outside the queue. Only what
+  pay-now did not cover joins the key's balance and waits in the queue.
+* It closes O-1: without it, a key credited every block never reaches 0 and
+  keeps its old place for ever.
+* Like §6 it changes `first_eligible`, which is in `owed_digest`: the same
+  XMR-only ledger switch, shipped in the same consensus change.
+
+## 7. Carried forward
+
+* **#1871 pay-now FILL** is superseded: §3 already places every piconero.
+* **Later: free consolidation of dust outputs.** Pool members' small
+  coinbase outputs would be merged, at no fee, into one transaction included
+  by pool builders. Monero accepts any fee inside a block
+  (`fee_good = kept_by_block || check_fee`). This rides the 0-fee
+  pool-member transaction task.
+* **Postponed:** 0-fee pool-member transactions included by pool builders
+  (Monero accepts any fee inside a block: `fee_good = kept_by_block ||
+  check_fee`), which would lower `c` for members. Also postponed: a weighted
+  multisig for the protocol donation address (governance).
+
+## 8. Code
+
+| rule | where | pinned by |
+|---|---|---|
+| `c` | `x6::spend_floor`, `fee_per_byte_at_floor`, `kInputWeight` (`src/impl/xmr/settle/xmr_coinbase.*`) | `v37_xmr_spend_floor_kat` F1 |
+| dust, redistribution, slots, the owed floor | `allocate_exact_sum` under `CoinbaseInputs::spend_floor` | F2-F4, F6; rehearsal M7, M7b |
+| the receive side | `paynow::net_booking(..., spend_floor)`: net of min(credit, paid) | F5 |
+| seniority from the floor, rotation | `OwedLedgerRules` (`w4_settlement.hpp`), `XmrNodeConfig::ledger_*` | F7-F9; rehearsal M7 |
+| the fixed output cap | `XmrBlockAssembler::build` (cap = wire ceiling under the floor); recompute accepts only it | rehearsal M8 |
+| every node recomputes it | `LaneInputs::spend_floor`, `XmrCoinbaseContext::spend_floor` | rehearsal M7 (48 blocks, 3 nodes, one digest) |
+| the drain rule: Delta, K_o, the dust cap, pay-now at P, no DEBT FIRST, F4-partial | `XmrOwedSettlementSource::build` (D0, D2), `allocate_exact_sum` under `CoinbaseInputs::paynow_first` (D3-D6), `x6::drain_delta` | `v37_xmr_drain_kat` A-G, I; rehearsal M7c |
+| the drain rule's booking at P, over-take refused | `xmr_coinbase_recompute.hpp` (`Result::split_at`), `paynow::drain_refold_credit` (`xmr_paynow.hpp`, called by `main_v37_xmr.cpp` `drain_refold`) | `v37_xmr_coinbase_recompute_kat` R17-R19; `v37_xmr_drain_wiring_kat` W4 |
+| dh and the decay clock in the ledger | `OwedLedgerRules::lane_height` (`V37Z`), `decay_from_gross`; FOUND event schema 6 | R16; F10b; drain H |
+| a lane-root-refused block counts for dh (ruling O-2) | `XmrNode::on_lane_block_refused` (an empty FOUND carrying its height), `FinalizeConnect::found_refused_empty`, the converge refold | `v37_xmr_drain_wiring_kat` W5; `v37_xmr_minority_converge_selfcheck` MC8 |
+
+The ledger's arm floor is `spend_floor(kTailSubsidy)`: Monero's tail emission
+(`FINAL_SUBSIDY_PER_MINUTE` × 2 minutes) is the smallest reward of any block
+since 2022, so it gives the smallest `c` any block has. A constant floor keeps
+`first_eligible`, which is in `owed_digest`, a function of the finalized
+ledger alone.
+
+Rotation acts twice. At FINALIZE, the paid key's `first_eligible` moves to
+that block's height. Before that, while the paying block is still pending,
+the K_fair walk visits keys with a pending payout after every other key. The
+pending set at the booking point is the same on every node.
+
+## Reorgs
+
+A lane block reorged out before FINALIZE (the usual case: Monero reorgs are
+shallower than D_conf = 60) is removed from the ledger's pending set, and
+everything this design adds follows it out:
+
+* **Rotation.** It reads the pending payouts, so the lost block's payments no
+  longer send anyone to the back.
+* **The redistribution** (credit delta). It is part of the lost block's
+  credit, which leaves with it.
+* **`first_eligible` and `owed_left`.** They come from the finalized ledger
+  at the booking point, which a reorg below FINALIZE does not touch.
+* **Refs learned from the lost block.** Only the nodes that booked it keep
+  them. That is harmless: only a key with a finalized balance can be paid,
+  and such a key was in the view of a block every node booked.
+
+Rehearsal M9 checks this. Two of three nodes book a competing lane block, it
+is reorged out, and the winner is booked. All three nodes then agree on
+every later block (one verdict, one `owed_digest`), and the final ledger
+equals a run where the losing block never existed. A reorg deeper than
+D_conf is the priced residual it always was (external review 05b).
+
+## 9. Implementation order
+
+1. `c` (Monero's fee rule from the block total and `w_input`), with KATs
+   against Monero's own numbers.
+2. Dust and the redistribution in pay-now, identical in the builder (X6) and the
+   receiver (`xmr_paynow`), recomputed; KATs and a rehearsal scenario with
+   many small miners and too few slots.
+3. Seniority from `c` and rotation on a partial payment (§6, §6a), one
+   XMR-only ledger switch. **Ships in the same consensus change as step 2**:
+   an owed floor without it reopens external review 02.
+4. Dust decay (§5).

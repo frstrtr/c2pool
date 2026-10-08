@@ -47,6 +47,11 @@
 // seconds on an epoch change, no-op otherwise) when it wakes for the
 // "template changed" signal, BEFORE it broadcast_job()s. Counters are atomics
 // so the main loop can print them (O-3 observability).
+// DROPS-VERIFY-SCALE: the RELAY's own instance additionally serves N verify
+// workers (add_workers / randomx_hash_on): one light VM per worker on the
+// SHARED caches, m_vm_mu held SHARED for a worker hash and EXCLUSIVE for the
+// listener VM, the memo and every slot swap (writer-preferring, so a seed
+// switch never starves behind back-to-back worker hashes).
 //
 // CONSUMER-TREE ONLY: no consensus digest; calls the merged pow/ + stratum/
 // seams exactly as their headers document. Header-only, no new CMake target of
@@ -60,7 +65,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -97,6 +106,13 @@ struct RandomXPolicy {
     // new-template hook is preferable to a rejected share (it then costs
     // ~1-2 s once per epoch, on the listener thread, inside that submit).
     bool lazy_prefetch_on_miss = false;
+    // NEXT-SEED PREFETCH. A template that announces next_seed_hash (the 64
+    // heights before a switch) gets that epoch's cache Argon2d-initialised on a
+    // HELPER thread; the listener adopts the finished cache (a pointer swap) on
+    // a later template, so neither the announcement nor the switch stalls a job
+    // push. false = the pre-09-26 behaviour (both seeds keyed synchronously on
+    // the listener thread inside the template hook).
+    bool async_next_seed = true;
 
     template <class Cfg>
     static RandomXPolicy from_config(const Cfg& c) {
@@ -145,6 +161,51 @@ struct RandomXStats {
     std::uint64_t network_accepts = 0;  // verify_network_block() -> Accept
     std::uint64_t network_rejects = 0;  // verify_network_block() -> anything else
     std::uint64_t memo_hits       = 0;  // network verify reused the submit's hash
+    std::uint64_t next_async      = 0;  // announced next seeds keyed on the helper thread
+    std::uint64_t next_adopted    = 0;  // ...and installed by the listener (no Argon2d there)
+    std::uint64_t next_discarded  = 0;  // NEXT-REORG: stale next builds dropped, never installed
+    std::uint64_t worker_hashes   = 0;  // DROPS-VERIFY-SCALE: hashes on the per-worker VMs (in `hashes` too)
+    std::uint64_t worker_binds    = 0;  // ...and worker VM (re-)binds to a resident cache
+};
+
+// ---------------------------------------------------------------------------
+// DROPS-VERIFY-SCALE: a WRITER-PREFERRING shared mutex for m_vm_mu. N relay
+// verify workers hash under SHARED locks back to back; glibc's rwlock (what
+// std::shared_mutex is) prefers readers, so with >= 2 overlapping hashing
+// workers a slot swap (adopt: EXCLUSIVE) could wait forever -- the seed switch
+// and every exclusive caller (ensure_seeds on the main thread) would stall
+// under raindrop load. Here a waiting writer blocks NEW readers: it gets the
+// lock as soon as the hashes in flight finish (one light hash, ~20 ms).
+// Satisfies Lockable + SharedLockable (std::unique_lock / std::shared_lock).
+// ---------------------------------------------------------------------------
+class WriterPreferringSharedMutex {
+public:
+    void lock() {
+        std::unique_lock<std::mutex> lk(m_mu);
+        ++m_writers_waiting;
+        m_cv.wait(lk, [this] { return !m_writer && m_readers == 0; });
+        --m_writers_waiting;
+        m_writer = true;
+    }
+    void unlock() {
+        { std::lock_guard<std::mutex> lk(m_mu); m_writer = false; }
+        m_cv.notify_all();
+    }
+    void lock_shared() {
+        std::unique_lock<std::mutex> lk(m_mu);
+        m_cv.wait(lk, [this] { return !m_writer && m_writers_waiting == 0; });
+        ++m_readers;
+    }
+    void unlock_shared() {
+        bool last = false;
+        { std::lock_guard<std::mutex> lk(m_mu); last = (--m_readers == 0); }
+        if (last) m_cv.notify_all();
+    }
+private:
+    std::mutex              m_mu;
+    std::condition_variable m_cv;
+    std::size_t             m_readers = 0, m_writers_waiting = 0;
+    bool                    m_writer = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -181,8 +242,8 @@ public:
     // portable interpreter (identical hashes; pattern of randomx_verify_kat
     // suite C). Returns ready(). Call once, before the listener starts
     // serving (from the listener thread, or from main BEFORE the listener
-    // thread is spawned — the object has no thread affinity, only a
-    // no-concurrent-use rule).
+    // thread is spawned — the object has no thread affinity; after init every
+    // entry point may be called from any thread (SEED-RACE, #1814 review)).
     // -----------------------------------------------------------------------
     bool init(const RandomXPolicy& policy) {
         m_policy = policy;
@@ -226,7 +287,8 @@ public:
     //                ensure_seeds(). Call it first thing when the listener
     //                wakes for "template changed", before broadcast_job().
     //                Returns true iff a pair was applied.
-    // ensure_seeds — LISTENER thread. prefetch_epoch(current, next): Argon2d
+    // ensure_seeds — ANY thread (serialised on m_seed_mu: the listener hook and
+    //                the main-thread pump both call it). prefetch_epoch(current, next): Argon2d
     //                inits only the caches not already keyed (seconds on an
     //                epoch change, no-op otherwise). Returns residency of
     //                `current`.
@@ -253,15 +315,44 @@ public:
         return true;
     }
 
+    // SEED-RACE (#1814 review): ensure_seeds runs on the listener (template
+    // hook) AND on the main thread (pump_miner) on the same verifier. It is
+    // serialised on m_seed_mu (the next-build state is guarded by it); m_vm and
+    // the memo are guarded by m_vm_mu, held only for a hash, a residency read or
+    // an adoption swap -- never across an Argon2d build or the wait for one, so
+    // the listener keeps hashing the resident epochs while a cache is keyed.
     bool ensure_seeds(const Seed32& current, const std::optional<Seed32>& next) {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (!ready()) return false;
-        const bool cur_res  = m_vm.seed_resident(current);
-        const bool next_res = !next || m_vm.seed_resident(*next);
+        std::lock_guard<std::mutex> sk(m_seed_mu);
+        if (m_policy.async_next_seed) {
+            reap_discarded_();
+            // NEXT-REORG: the helper builds an announced next that is neither the
+            // current seed nor the next this template announces (the next seed
+            // block was reorged). Discard it -- never wait for the rest of that
+            // build, never install the orphan seed's cache.
+            if (m_next_building && m_next_seed != current && next && *next != m_next_seed) discard_next_();
+            adopt_next_(current, /*wait=*/false);                 // a finished helper build: install it
+            if (!resident_(current) && m_next_building && m_next_seed == current)
+                adopt_next_(current, /*wait=*/true);              // switch beat the helper: wait (m_vm_mu free), never key twice
+            if (!resident_(current)) {
+                if (!key_off_vm_(current, nullptr)) return false;  // null cache / OOM
+                m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (next && *next != current && !resident_(*next)
+                && !(m_next_building && m_next_seed == *next))
+                start_next_(current, *next);
+            return resident_(current);
+        }
+        // the pre-helper policy: both seeds keyed before returning (the caller
+        // blocks for the Argon2d init), each built off m_vm_mu and swapped in
+        const bool cur_res  = resident_(current);
+        const bool next_res = !next || resident_(*next);
         if (cur_res && next_res) return true;                    // nothing to do
-        if (!m_vm.prefetch_epoch(current, next)) return false;    // null cache (init not done)
+        if (!cur_res && !key_off_vm_(current, next ? &*next : nullptr)) return false;
+        if (!next_res && *next != current) (void)key_off_vm_(*next, &current);
         m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
-        return m_vm.seed_resident(current);
+        return resident_(current);
 #else
         (void)current; (void)next;
         return false;
@@ -273,7 +364,7 @@ public:
 
     bool seed_resident(const Seed32& seed) const noexcept {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
-        return ready() && m_vm.seed_resident(seed);
+        return ready() && resident_(seed);
 #else
         (void)seed;
         return false;
@@ -300,15 +391,20 @@ public:
             m_stat_unavailable.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        if (!m_vm.seed_resident(seed_hash)) {
-            if (!m_policy.lazy_prefetch_on_miss ||
-                !m_vm.prefetch_epoch(seed_hash, std::nullopt) ||
-                !m_vm.seed_resident(seed_hash)) {
+        if (!resident_(seed_hash)) {
+            // lazy: keyed off m_vm_mu (under m_seed_mu, like ensure_seeds), then swapped in
+            bool keyed = false;
+            if (m_policy.lazy_prefetch_on_miss) {
+                std::lock_guard<std::mutex> sk(m_seed_mu);
+                keyed = resident_(seed_hash) || key_off_vm_(seed_hash, nullptr);
+            }
+            if (!keyed || !resident_(seed_hash)) {
                 m_stat_seed_misses.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
             m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
         }
+        std::unique_lock<WriterPreferringSharedMutex> vk(m_vm_mu);   // SEED-RACE: the VM, its bound cache and the memo
         if (!m_vm.hash(blob, blob_size, seed_hash, out_hash.data())) {
             m_stat_seed_misses.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -318,6 +414,99 @@ public:
         return true;
 #else
         (void)blob; (void)blob_size; (void)seed_hash; (void)out_hash;
+        m_stat_unavailable.fetch_add(1, std::memory_order_relaxed);
+        return false;
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // DROPS-VERIFY-SCALE: per-worker light VMs on the SHARED resident caches.
+    //
+    // The relay verifies every raindrop of the pool (64x the receipt load); one
+    // VM behind one mutex capped a node at one core (capstone attempt 5 false
+    // start). add_workers(n) creates n extra light VMs with the flags of this
+    // verifier's own VM -- no cache is duplicated: each VM is ~2.2 MiB RSS
+    // (scratchpad + JIT code) once it has hashed, the two 256 MiB caches stay
+    // shared. randomx_hash_on(w, ...) hashes on worker w's VM under a SHARED
+    // lock of m_vm_mu, so the workers run concurrently; a slot swap (adopt)
+    // takes it EXCLUSIVE and un-binds every worker VM before it returns (the
+    // replaced cache is freed), so a worker re-binds (randomx_vm_set_cache,
+    // memo on cache pointer AND key -- the attempt-3 lesson) before its next
+    // hash. Same cache bytes, same flags => the same hash as the listener VM.
+    // Contract: worker index w is used by ONE thread at a time (the relay gives
+    // each verify thread its own index). Call add_workers after init() and
+    // before any randomx_hash_on. Returns the number of workers now available
+    // (a VM that cannot be created is logged by the caller as fewer workers).
+    // -----------------------------------------------------------------------
+    std::size_t add_workers(std::size_t n) {
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+        if (!ready()) return 0;
+        std::unique_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+        if (!m_vm.has_vm() || !m_vm.any_cache()) return 0;
+        const randomx_flags f = m_vm.light_vm_flags();
+        for (std::size_t i = 0; i < n; ++i) {
+            auto w = std::make_unique<WorkerVm>();
+            // a light VM is created ON a cache (any allocated one); `bound` stays
+            // null, so the first randomx_hash_on binds it to the resident seed's
+            w->vm = randomx_create_vm(f, m_vm.any_cache(), nullptr);
+            if (!w->vm) break;
+            m_workers.push_back(std::move(w));
+        }
+        return m_workers.size();
+#else
+        (void)n;
+        return 0;
+#endif
+    }
+    std::size_t workers() const {
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+        std::shared_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+        return m_workers.size();
+#else
+        return 0;
+#endif
+    }
+
+    // randomx_hash() on worker `w`'s own VM (any thread; see the contract
+    // above). A worker index outside [0, workers()) falls back to the
+    // exclusive listener-VM path, so a caller with no workers behaves exactly
+    // like randomx_hash().
+    bool randomx_hash_on(std::size_t w, const std::uint8_t* blob, std::size_t blob_size,
+                         const Seed32& seed_hash, Hash32& out_hash) {
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+        if (!ready() || !blob || blob_size == 0) {
+            m_stat_unavailable.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (!resident_(seed_hash) && m_policy.lazy_prefetch_on_miss) {
+            std::lock_guard<std::mutex> sk(m_seed_mu);   // keyed off m_vm_mu, swapped in (unbinds the workers)
+            if (!resident_(seed_hash) && key_off_vm_(seed_hash, nullptr))
+                m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
+        }
+        std::shared_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+        if (w >= m_workers.size()) {
+            vk.unlock();
+            return randomx_hash(blob, blob_size, 0, seed_hash, out_hash);
+        }
+        randomx_cache* c = m_vm.resident_cache(seed_hash);
+        if (!c) {
+            m_stat_seed_misses.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        WorkerVm& x = *m_workers[w];
+        if (x.bound != c || !x.keyed || x.key != seed_hash) {
+            randomx_vm_set_cache(x.vm, c);
+            x.bound = c; x.key = seed_hash; x.keyed = true;
+            m_stat_worker_binds.fetch_add(1, std::memory_order_relaxed);
+        }
+        // D1: the workers' MRU cache, so a lazy slot swap keeps it (key_off_vm_)
+        if (m_worker_mru.load(std::memory_order_relaxed) != c) m_worker_mru.store(c, std::memory_order_relaxed);
+        randomx_calculate_hash(x.vm, blob, blob_size, out_hash.data());
+        m_stat_hashes.fetch_add(1, std::memory_order_relaxed);
+        m_stat_worker_hashes.fetch_add(1, std::memory_order_relaxed);
+        return true;
+#else
+        (void)w; (void)blob; (void)blob_size; (void)seed_hash; (void)out_hash;
         m_stat_unavailable.fetch_add(1, std::memory_order_relaxed);
         return false;
 #endif
@@ -354,6 +543,7 @@ public:
         if (!blob || blob_size == 0 || diff.is_zero()) { count_reject(); return NetworkVerdict::Malformed; }
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (!ready()) { count_reject(); return NetworkVerdict::VerifyUnavailable; }
+        std::unique_lock<WriterPreferringSharedMutex> vk(m_vm_mu);   // SEED-RACE: the VM, its bound cache and the memo
         if (!m_vm.seed_resident(seed)) { count_reject(); return NetworkVerdict::SeedNotResident; }
         if (recall(blob, blob_size, seed, out_hash)) {
             m_stat_memo_hits.fetch_add(1, std::memory_order_relaxed);
@@ -401,6 +591,11 @@ public:
         s.network_accepts = m_stat_network_accepts.load(std::memory_order_relaxed);
         s.network_rejects = m_stat_network_rejects.load(std::memory_order_relaxed);
         s.memo_hits       = m_stat_memo_hits.load(std::memory_order_relaxed);
+        s.next_async      = m_stat_next_async.load(std::memory_order_relaxed);
+        s.next_adopted    = m_stat_next_adopted.load(std::memory_order_relaxed);
+        s.next_discarded  = m_stat_next_discarded.load(std::memory_order_relaxed);
+        s.worker_hashes   = m_stat_worker_hashes.load(std::memory_order_relaxed);
+        s.worker_binds    = m_stat_worker_binds.load(std::memory_order_relaxed);
         return s;
     }
 
@@ -421,12 +616,122 @@ public:
         o += " net_accept=";  o += std::to_string(s.network_accepts);
         o += " net_reject=";  o += std::to_string(s.network_rejects);
         o += " memo_hits=";   o += std::to_string(s.memo_hits);
+        o += " next_async=";  o += std::to_string(s.next_async);
+        o += " next_adopted="; o += std::to_string(s.next_adopted);
+        o += " next_discarded="; o += std::to_string(s.next_discarded);
+        const std::size_t nw = workers();
+        if (nw) {   // DROPS-VERIFY-SCALE (absent without workers: the pre-fix line byte for byte)
+            o += " workers=";       o += std::to_string(nw);
+            o += " worker_hashes="; o += std::to_string(s.worker_hashes);
+            o += " worker_binds=";  o += std::to_string(s.worker_binds);
+        }
         return o;
     }
 
 private:
     void set_mode(Mode m) noexcept { m_mode.store(static_cast<std::uint8_t>(m), std::memory_order_release); }
     void count_reject() noexcept { m_stat_network_rejects.fetch_add(1, std::memory_order_relaxed); }
+
+#if defined(V37_XMR_O2_WITH_RANDOMX)
+    // SEED-RACE: residency under m_vm_mu (any thread).
+    bool resident_(const Seed32& seed) const {
+        std::shared_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+        return m_vm.seed_resident(seed);
+    }
+    // Key `seed` into a cache built OFF m_vm_mu (the seconds-long Argon2d init
+    // runs while the listener keeps hashing), then swap it in under m_vm_mu:
+    // the slot not holding `keep` (unkeyed first, else least recently used) --
+    // the victim LightVerifier::prefetch_epoch would re-key in place. m_seed_mu
+    // held by the caller. false: no VM / OOM.
+    // DROPS-VERIFY-SCALE D1: with no explicit `keep` (the lazy-miss paths of
+    // randomx_hash and randomx_hash_on) the victim is chosen by recency, and
+    // worker hashes never move LightVerifier's own MRU: the cache the workers
+    // hashed on last is reported under the exclusive lock first, so the third
+    // lazily keyed seed evicts the stale epoch, not the current one.
+    bool key_off_vm_(const Seed32& seed, const Seed32* keep) {
+        randomx_flags f;
+        {
+            std::shared_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+            if (m_vm.seed_resident(seed)) return true;
+            f = m_vm.slot_cache_flags();
+        }
+        ::c2pool::xmr::CacheSlot s(f);
+        if (!s.ok() || !s.rekey(seed)) return false;
+        std::unique_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+        if (!keep) m_vm.touch_cache(m_worker_mru.load(std::memory_order_relaxed));
+        if (m_vm.adopt(std::move(s), keep)) unbind_workers_locked_();   // a replaced cache may be freed
+        return m_vm.seed_resident(seed);
+    }
+
+    // DROPS-VERIFY-SCALE: after a slot swap (m_vm_mu held EXCLUSIVE) no worker
+    // VM may keep pointing at the replaced (freed) cache: forget every bind so
+    // the next randomx_hash_on re-binds to a resident one.
+    void unbind_workers_locked_() {
+        for (auto& w : m_workers) { w->bound = nullptr; w->keyed = false; }
+    }
+
+    // NEXT-SEED helper (policy.async_next_seed). One live build at most (plus
+    // discarded ones still finishing). The helper touches ONLY its own
+    // CacheSlot (allocated with the verifier's slot flags, keyed through
+    // CacheSlot::rekey under the process-wide randomx_init_mutex); the finished
+    // cache is installed by adopt() under m_vm_mu. m_seed_mu held throughout.
+    void start_next_(const Seed32& current, const Seed32& next) {
+        // NEXT-REORG: a build of a DIFFERENT next is stale -- discarded, not waited for
+        if (m_next_building && m_next_seed != next) discard_next_();
+        if (m_next_building || resident_(next)) return;
+        randomx_flags f;
+        { std::shared_lock<WriterPreferringSharedMutex> vk(m_vm_mu); f = m_vm.slot_cache_flags(); }
+        try {
+            m_next_build = std::async(std::launch::async, [f, next] {
+                ::c2pool::xmr::CacheSlot s(f);
+                if (s.ok()) s.rekey(next);                 // the seconds-long Argon2d init, off the listener
+                return s;
+            });
+        } catch (...) {                                    // no thread: key it here (still off m_vm_mu)
+            if (key_off_vm_(next, &current)) m_stat_prefetches.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        m_next_seed     = next;
+        m_next_building = true;
+        m_stat_next_async.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Install a finished helper build (wait=true blocks until it finishes --
+    // with m_vm_mu free). `current` is kept resident unless the built seed IS
+    // current (the switch arrived first): then the LRU slot is replaced.
+    void adopt_next_(const Seed32& current, bool wait) {
+        if (!m_next_building) return;
+        if (!wait && m_next_build.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        ::c2pool::xmr::CacheSlot built = m_next_build.get();
+        m_next_building = false;
+        const bool keep_cur = !(built.keyed() && built.key() == current);
+        std::unique_lock<WriterPreferringSharedMutex> vk(m_vm_mu);
+        if (m_vm.adopt(std::move(built), keep_cur ? &current : nullptr)) {
+            unbind_workers_locked_();   // DROPS-VERIFY-SCALE: a replaced cache may be freed
+            m_stat_next_adopted.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // NEXT-REORG: drop the in-flight build without waiting. Its thread cannot
+    // be interrupted mid-Argon2d, so the future is parked (a std::async future
+    // joins in its destructor) and reaped once ready; its cache is freed, never
+    // adopted. At most one parked build: a second reorg waits for the oldest.
+    void discard_next_() {
+        if (!m_next_building) return;
+        m_next_discarded.push_back(std::move(m_next_build));
+        m_next_building = false;
+        m_stat_next_discarded.fetch_add(1, std::memory_order_relaxed);
+        if (m_next_discarded.size() > 1) {
+            m_next_discarded.front().wait();
+            m_next_discarded.erase(m_next_discarded.begin());
+        }
+    }
+    void reap_discarded_() {
+        for (auto it = m_next_discarded.begin(); it != m_next_discarded.end();)
+            if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) it = m_next_discarded.erase(it);
+            else ++it;
+    }
+#endif
 
     // Single-entry memo of the last hash computed: handle_submit calls
     // randomx_hash() and then, on the same thread, the sink calls
@@ -449,8 +754,37 @@ private:
     std::atomic<std::uint8_t>  m_mode{static_cast<std::uint8_t>(Mode::CompiledOut)};
 
 #if defined(V37_XMR_O2_WITH_RANDOMX)
-    ::c2pool::xmr::LightVerifier m_vm;           // listener thread only
+    ::c2pool::xmr::LightVerifier m_vm;           // guarded by m_vm_mu
+    // next-seed helper build (guarded by m_seed_mu; destroyed first, so a
+    // still-running helper is joined before m_vm goes away)
+    std::future<::c2pool::xmr::CacheSlot> m_next_build;
+    Seed32                                m_next_seed{};
+    bool                                  m_next_building = false;
+    std::vector<std::future<::c2pool::xmr::CacheSlot>> m_next_discarded;   // NEXT-REORG: stale builds finishing
+    // DROPS-VERIFY-SCALE: the relay verify workers' own light VMs (declared
+    // after m_vm, so they are destroyed BEFORE the caches they may be bound to).
+    struct WorkerVm {
+        randomx_vm*            vm = nullptr;
+        randomx_cache*         bound = nullptr;   // the cache this VM points at ...
+        ::c2pool::xmr::SeedHash key{};            // ... and the key it held at bind time
+        bool                   keyed = false;
+        WorkerVm() = default;
+        WorkerVm(const WorkerVm&) = delete;
+        WorkerVm& operator=(const WorkerVm&) = delete;
+        ~WorkerVm() { if (vm) randomx_destroy_vm(vm); }
+    };
+    std::vector<std::unique_ptr<WorkerVm>> m_workers;   // size fixed by add_workers; binds under m_vm_mu
+    // D1: the cache a worker hashed on last (written under m_vm_mu SHARED, read
+    // under it EXCLUSIVE; compared, never dereferenced -- may name a freed cache)
+    std::atomic<const randomx_cache*> m_worker_mru{nullptr};
 #endif
+    // SEED-RACE (#1814 review): lock order m_seed_mu -> m_vm_mu, never the reverse.
+    // DROPS-VERIFY-SCALE: a (writer-preferring) shared mutex. EXCLUSIVE for the listener VM + memo
+    // (randomx_hash, verify_network_block) and every slot swap (adopt); SHARED
+    // for a residency read and a worker hash (randomx_hash_on), so N relay
+    // verify workers hash concurrently on the shared caches.
+    mutable WriterPreferringSharedMutex m_vm_mu;   // m_vm + the memo + m_workers (short sections)
+    std::mutex         m_seed_mu;   // ensure_seeds + the next-build state; held across builds / waits
 
     // seed mailbox (main thread -> listener thread)
     std::mutex             m_mail_mu;
@@ -472,6 +806,11 @@ private:
     std::atomic<std::uint64_t> m_stat_network_accepts{0};
     std::atomic<std::uint64_t> m_stat_network_rejects{0};
     std::atomic<std::uint64_t> m_stat_memo_hits{0};
+    std::atomic<std::uint64_t> m_stat_next_async{0};
+    std::atomic<std::uint64_t> m_stat_next_adopted{0};
+    std::atomic<std::uint64_t> m_stat_next_discarded{0};
+    std::atomic<std::uint64_t> m_stat_worker_hashes{0};   // DROPS-VERIFY-SCALE
+    std::atomic<std::uint64_t> m_stat_worker_binds{0};
 };
 
 } // namespace c2pool::v37n::xmr::o2

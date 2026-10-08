@@ -15,7 +15,7 @@
 //   So a meaningful activation golden must be a SCHEDULE golden: a share stream
 //   that crosses the activation position with carrier bins, at least one block
 //   found AND finalized after the crossing, and the digest cut taken after that
-//   finalize. An empty or pre-crossing ledger produces sha256d("V37O") no matter
+//   finalize. An empty or pre-crossing ledger produces sha256d("V37Q") no matter
 //   what the lane gate says, and pins nothing.
 //
 // HOW THE FIXTURE IS BUILT (important)
@@ -33,7 +33,7 @@
 //   so the width stays at the lane default and never enters the owed value.
 //
 // CHECKS
-//   RIDGE-OWED-EMPTY     a fresh ledger is sha256d("V37O"), the anchor
+//   RIDGE-OWED-EMPTY     a fresh ledger is sha256d("V37Q"), the anchor
 //   RIDGE-OWED-OFF       the gate-OFF control digest over the SAME schedule
 //   RIDGE-OWED-ON        the gate-ON golden at the pinned cut  <-- the value
 //   RIDGE-OWED-LIVE      the golden is NON-VACUOUS: ON != OFF
@@ -87,15 +87,15 @@ using ::v37::u64;
 // GATE-ON golden: the owed_digest after blk_cut is finalized, with the ridge
 // active from position 4096. This is the V37.1 activation regression value.
 static const char* GOLDEN_OWED_ON =
-    "87c5249ac2057d0ac6707127c59cdc605acec4ba3c0d4b4b25e9b53692eb71ee";
+    "5d42f29090a1ec8cdda5d2289f8ee6002b0e59e554a7b93008a155e1342fb839";
 // GATE-OFF control over the identical schedule with the ridge inactive. It is
 // the value today's shipped consensus produces, and it is what makes the
 // gate-ON golden non-vacuous rather than a restatement of the status quo.
 static const char* GOLDEN_OWED_OFF =
-    "9cfaf97de7c58a7727ff5cc1203f445fc301559fb702938a3dd61ad32d6b338e";
-// The empty-ledger anchor, sha256d("V37O").
+    "6cf1127ca68d6f0b5879fb2d896738fd3c54ccdf98772ff0206c95de4eaabf71";
+// The empty-ledger anchor, sha256d("V37Q").
 static const char* GOLDEN_OWED_EMPTY =
-    "b4db1ded95a73f939975a259f9b48a1d182109f44397ed77e35d624f1a5cf339";
+    "66078202d7c70e6dbf230d10b716d3f96fbd4d21dac4ba5eb3ac89ca854d54b3";
 // The gate-ON BTC lane digest at the same cut. REPORTED, NOT PINNED: the NRG1
 // preimage commits nr.coverage_blocks, which is the one ND-R6 number still
 // OWED, so pinning this hex would hold the KAT hostage to a policy value the
@@ -255,7 +255,7 @@ static Run drive(LaneKind lk, bool flip, u64 cov_override = 0, bool strict = tru
             if (!f) { o.refused = true; return o; }
             settle::OwedLedger::Amounts credit;
             for (const auto& [k, val] : f->credit) credit[k] = (long long)val;
-            ledger.on_block_found_with_estimator(BLOCK_ID[nb], credit, {}, p, {});
+            ledger.on_block_found_estimator_raw_PRE_RULING(BLOCK_ID[nb], credit, {}, p, {});
             ledger.on_block_finalized(BLOCK_ID[nb], (BLOCK_AT[nb] - 1) / SHARES_PER_BIN);
             o.credit[nb] = credit;
             o.source[nb] = f->source;
@@ -296,7 +296,7 @@ int main() {
         settle::OwedLedger e(7);
         std::printf("   empty owed_digest      = %s\n", hex(e.owed_digest()).c_str());
         check(hex(e.owed_digest()) == GOLDEN_OWED_EMPTY,
-              "empty ledger owed_digest == sha256d(\"V37O\")");
+              "empty ledger owed_digest == sha256d(\"V37Q\")");
         check(e.ledger_seq() == 0, "a fresh ledger is at seq 0");
     }
 

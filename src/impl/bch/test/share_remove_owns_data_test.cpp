@@ -15,7 +15,7 @@
 //   verified.remove(h, /*owns_data=*/false) with chain.remove(h)). With the
 //   default owns_data=true, verified.remove() calls share.destroy() -> delete,
 //   then chain.remove() calls destroy() on the SAME pointer again: a double
-//   free / "unaligned tcache chunk" abort, exactly the hotel-primary signature.
+//   free / "unaligned tcache chunk" abort, exactly the primary-node signature.
 //
 //   It is UNREACHABLE TODAY only because of the `if (verified.contains(bad))
 //   continue;` guard ~20 lines earlier, which makes the inner

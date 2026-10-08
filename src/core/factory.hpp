@@ -352,9 +352,17 @@ private:
 						// peer manager can penalise the dead target (attempt++/
 						// backoff) instead of re-selecting it forever. Same
 						// lifetime guard as the success path below.
+						// UAF FIX (btc.voidbind SEGV, 2026-09-22): the #940 feedback is a
+						// SOFT scoring signal, so it must NEVER fall back to a raw m_node.
+						// connect_failed fires during teardown/redial -- the exact window a
+						// legacy node is freed -- and a freed pointer is non-null, so any
+						// m_node null-check passes and dereferences freed memory. Route
+						// through the SAME live-handle discipline as the connected() success
+						// path: score ONLY through a pinned/relocked strong_node; if we hold
+						// no live handle, drop the soft signal rather than touch m_node.
 						std::shared_ptr<INetwork> strong_node = strong ? strong : weak_node.lock();
-						if (!was_managed || strong_node)
-							(strong_node ? strong_node.get() : m_node)->connect_failed(addr);
+						if (strong_node)
+							strong_node->connect_failed(addr);
 					}
 					else
 						LOG_DEBUG_COIND << "Factory::Client::connect_socket canceled";
@@ -406,9 +414,17 @@ private:
 						LOG_TRACE << "[" << m_label << "] DNS resolve failed: " << ec.message();
 						// #940: a resolve failure is also a dial failure — report
 						// it so the target is scored (same lifetime guard).
+						// UAF FIX (btc.voidbind SEGV, 2026-09-22): the #940 feedback is a
+						// SOFT scoring signal, so it must NEVER fall back to a raw m_node.
+						// connect_failed fires during teardown/redial -- the exact window a
+						// legacy node is freed -- and a freed pointer is non-null, so any
+						// m_node null-check passes and dereferences freed memory. Route
+						// through the SAME live-handle discipline as the connected() success
+						// path: score ONLY through a pinned/relocked strong_node; if we hold
+						// no live handle, drop the soft signal rather than touch m_node.
 						std::shared_ptr<INetwork> strong_node = strong ? strong : weak_node.lock();
-						if (!was_managed || strong_node)
-							(strong_node ? strong_node.get() : m_node)->connect_failed(addr);
+						if (strong_node)
+							strong_node->connect_failed(addr);
 					}
 					else
 						LOG_DEBUG_OTHER << "Factory::Client::resolve canceled";

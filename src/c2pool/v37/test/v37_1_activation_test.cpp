@@ -165,7 +165,7 @@ static ScheduleOut run_schedule(const LaneParams& params) {
     std::vector<S::HarvestedReceipt> harvested;
     harvested.push_back(S::HarvestedReceipt{C, /*interval=*/200, make_collector(0)});  // uncovered
     harvested.push_back(S::HarvestedReceipt{D, /*interval=*/201, make_collector(2)});  // S=2 buried
-    ledger.on_block_found_with_estimator("blk1", base_credit, payout, params, harvested);
+    ledger.on_block_found_estimator_raw_PRE_RULING("blk1", base_credit, payout, params, harvested);
     ledger.on_block_finalized("blk1", /*bin_height=*/100);
     ScheduleOut o;
     o.owed = ledger.owed_digest();
@@ -256,28 +256,42 @@ int main(int argc, char** argv) {
     // -- Case 2: ACTIVE rule is Combined (S+K-1)*D'_K, NOT the broken clamp
     {
         // Route an S=2 worker through the REAL seam under the shipped V37.1
-        // params; the credit MUST equal estimate_combined's low-63 fold and MUST
-        // differ from the broken clamp's (non-vacuous: the two rules disagree).
+        // params. ★ POST DROPS-R2 (replace, never add) the seam returns the
+        // REPLACE DELTA Hhat_comb - W_shares, not Hhat_comb: the estimate stands
+        // IN PLACE OF the interval's share-derived contribution. So the pin is
+        // seam == comb - W_shares, and the ESTIMATE half is still exactly
+        // estimate_combined and still not the broken clamp.
+        //
+        // NOTE ON THIS FIXTURE. make_collector uses h_T = 3, an absurd share
+        // target chosen so the clamp folds to a legible number — it makes one
+        // share "worth" 2^256/3 hashes, so the W_shares term dwarfs the estimate
+        // and the delta is hugely NEGATIVE. That is a property of the fixture,
+        // not of the rule; the sign is asserted, not hidden.
         sub::ReceiptCollector rc = make_collector(2);
         bytes32 payee = keyfill(0xD4);
         std::vector<S::HarvestedReceipt> hv{S::HarvestedReceipt{payee, 201, rc}};
-        auto credit = S::subthreshold_credit(v1, hv);
+        auto credit = S::subthreshold_credit_raw_PRE_RULING(v1, hv);
         long long seam = credit.empty() ? -1 : credit.begin()->second;
         sub::u256 hK = u256_from_hex(HK_HEX);
         long long comb = low63(sub::estimate_combined(/*S=*/2, V371_K, hK));
+        sub::u256 hT3; hT3.w[0] = 3;
         long long clamp = low63(sub::broken_clamp_NEVER_CONSENSUS(
-            /*S=*/2, V371_K, hK, /*h_T=*/[]{ sub::u256 t; t.w[0] = 3; return t; }()));
+            /*S=*/2, V371_K, hK, hT3));
+        long long wsh = low63(sub::share_covered_work(/*S=*/2, hT3));
         // S=0 consistency: Combined(0,K) == EstimateOnly (K-1)*D_K, same denom.
         long long comb0 = low63(sub::estimate_combined(0, V371_K, hK));
         long long est0 = low63(sub::estimate_hashes(V371_K, hK));
-        bool is_combined = (seam == comb) && (comb > 0);
+        bool is_replace = (seam == comb - wsh) && (comb > 0) && (wsh > 0);
         bool not_clamp = (seam != clamp) && (clamp != comb);   // rules disagree
+        bool not_additive = (seam != comb + wsh);              // the rejected merge
         bool s0_consistent = (comb0 == est0);
-        bool ok = is_combined && not_clamp && s0_consistent;
-        check(ok, "2 active rule is Combined (S+K-1)*D'_K, not clamp",
+        bool ok = is_replace && not_clamp && not_additive && s0_consistent;
+        check(ok, "2 active rule is Combined (S+K-1)*D'_K, composed by REPLACE",
               "seam=" + std::to_string(seam) + " comb=" + std::to_string(comb) +
-              " clamp=" + std::to_string(clamp) + " (seam==comb!=clamp " +
-              std::string(is_combined && not_clamp ? "y" : "n") +
+              " W_shares=" + std::to_string(wsh) + " clamp=" + std::to_string(clamp) +
+              " (seam==comb-W_shares " + std::string(is_replace ? "y" : "n") +
+              ", !=clamp " + std::string(not_clamp ? "y" : "n") +
+              ", !=comb+W_shares " + std::string(not_additive ? "y" : "n") +
               ") comb(0)==estOnly(" + std::string(s0_consistent ? "y" : "n") + ")");
     }
 
@@ -305,7 +319,7 @@ int main(int argc, char** argv) {
         bool differs = (onh != hex_of(off.owed));               // NON-VACUOUS
         bool ok = eq_golden && differs;
         check(ok, "4 gate-ON (V37.1) owed_digest == golden, differs",
-              "on==V37.1-golden(" + std::string(eq_golden ? "y" : "n") +
+              "on=" + onh + " on==V37.1-golden(" + std::string(eq_golden ? "y" : "n") +
               ") on!=off(" + std::string(differs ? "y" : "n") + ")");
     }
 
@@ -313,15 +327,32 @@ int main(int argc, char** argv) {
     {
         ScheduleOut on = run_schedule(v1);
         bool c_ok = (on.C == std::atoll(vg::C_CREDIT_DEC)) && (on.C > 0);
-        bool d_ok = (on.D == std::atoll(vg::D_CREDIT_DEC)) && (on.D > 0);
+        // D's composed credit is NEGATIVE on this fixture (see case 2): h_T = 3
+        // makes two shares "worth" 2^256/3 hashes, which the replace rule takes
+        // back out. The pin is the exact value, not its sign.
+        bool d_ok = (on.D == std::atoll(vg::D_CREDIT_DEC)) && (on.D < 0);
         bool a_b_intact = (on.A == 1000000) && (on.B == 500000);  // E_b untouched
-        // D (S=2) credit == (2+K-1)/(0+K-1) * C credit == 5/3 of C (within floor).
-        bool s_scaled = (on.D * 3 >= on.C * 5 - 5) && (on.D * 3 <= on.C * 5 + 5);
-        bool ok = c_ok && d_ok && a_b_intact && s_scaled;
-        check(ok, "5 activation credits C,D; D/C == (S+K-1) ratio",
+        // ★ POST DROPS-R2 the (S+K-1) coefficient is a property of the ESTIMATE,
+        // and the CREDIT is estimate - W_shares. C has S = 0 so its credit IS its
+        // estimate; D has S = 2 so its credit is its estimate minus the share work
+        // this fixture's absurd h_T = 3 attaches to two shares. The coefficient
+        // witness therefore reads off the estimates, and the composition is
+        // asserted separately — which is strictly MORE than the old check said.
+        sub::u256 hK = u256_from_hex(HK_HEX);
+        sub::u256 hT3; hT3.w[0] = 3;
+        const long long est_c = low63(sub::estimate_combined(0, V371_K, hK));
+        const long long est_d = low63(sub::estimate_combined(2, V371_K, hK));
+        const long long wsh_d = low63(sub::share_covered_work(2, hT3));
+        bool s_scaled = (est_d * 3 >= est_c * 5 - 5) && (est_d * 3 <= est_c * 5 + 5);
+        bool composed = (on.C == est_c) && (on.D == est_d - wsh_d);
+        bool ok = c_ok && d_ok && a_b_intact && s_scaled && composed;
+        check(ok, "5 activation credits C,D; (S+K-1) on the estimate, REPLACE on the credit",
               "C=" + std::to_string(on.C) + " D=" + std::to_string(on.D) +
+              " estC=" + std::to_string(est_c) + " estD=" + std::to_string(est_d) +
+              " W_shares(D)=" + std::to_string(wsh_d) +
               " A,B intact(" + std::string(a_b_intact ? "y" : "n") +
-              ") D~=5/3 C(" + std::string(s_scaled ? "y" : "n") + ")");
+              ") estD~=5/3 estC(" + std::string(s_scaled ? "y" : "n") +
+              ") credit==est-W_shares(" + std::string(composed ? "y" : "n") + ")");
     }
 
     // -- Case 6: sybil-neutrality survives the shipped Combined activation
@@ -356,7 +387,7 @@ int main(int argc, char** argv) {
                     bytes32 payee = keyfill((std::uint8_t)(0x10 + id));
                     std::vector<S::HarvestedReceipt> hv1{
                         S::HarvestedReceipt{payee, (std::uint64_t)id, rc}};
-                    auto credit = S::subthreshold_credit(v1, hv1);
+                    auto credit = S::subthreshold_credit_raw_PRE_RULING(v1, hv1);
                     for (auto& [k, v] : credit) { (void)k; cm += (double)v; }
                 }
                 clamp += c; comb += cm;

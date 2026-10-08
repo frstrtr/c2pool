@@ -54,7 +54,7 @@
 /// mined, the slot would drop out of the mandatory set, and the template we
 /// serve would be short one type-6 tx — `bad-qc-missing`
 /// (blockprocessor.cpp:198), i.e. a LOST BLOCK. This is not hypothetical on
-/// this fleet: the hotel primary lost 2508008 to a stale payee and orphaned
+/// this fleet: the primary node lost 2508008 to a stale payee and orphaned
 /// 2517855.
 ///
 /// Because add and remove are now symmetric, the index MAY arm on a live tip —
