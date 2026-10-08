@@ -509,7 +509,7 @@ static void s3b_lane_record_vectors() {
     const pb::XmrKeyRef ka = key_ref(0x10), kb = key_ref(0x30), kc = key_ref(0x50);
 
     // Branch A: bins b0 and b0 + 1 carry receipts; the record reaches b0 + 99 (4 leaves).
-    pb::BinStore s(P, kB0, 64, cid(0x40, 0), kB0, kChain);
+    pb::BinStore s(P, 64, cid(0x40, 0), kB0, kChain);
     Built a;
     pb::LaneKv kv;
     {
@@ -550,14 +550,14 @@ static void s3b_lane_record_vectors() {
     {
         pb::LaneKv partial;
         pb::LaneBatch first;
-        pb::BinStore g(P, kB0, 64, cid(0x40, 0), kB0, kChain);
+        pb::BinStore g(P, 64, cid(0x40, 0), kB0, kChain);
         g.write_all(first);
         pb::apply_batch(partial, first);
         for (std::size_t i = 0; i + 1 < a.batches.size(); ++i) pb::apply_batch(partial, a.batches[i]);
         const pb::LaneLoad lp = load(partial, s);
         check(lp.fault == pb::LoadFault::Tip, "crash: a store missing the second of two batches -> load refuses");
         // the rebuild path: a fresh store fed the chain reproduces the lane state.
-        pb::BinStore r(P, kB0, 64, cid(0x40, 0), kB0, kChain);
+        pb::BinStore r(P, 64, cid(0x40, 0), kB0, kChain);
         Built rb;
         step(r, rb, cid(0x40, 1), cid(0x40, 0), kB0, {rc(1, kB0, 1, ka, 30000), rc(2, kB0, 1, kb, 20000)});
         step(r, rb, cid(0x40, 2), cid(0x40, 1), kB0 + 1, {rc(3, kB0 + 1, 2, kc, 25000)});

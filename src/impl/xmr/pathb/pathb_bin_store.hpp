@@ -8,7 +8,7 @@
 // Path B, slice S3b-1a: the bin store per held branch, the seal driver and the
 // crash-consistent lane records.
 //
-//   BinStore        every held carrier inside the journal (J positions, K27),
+//   BinStore        every held carrier inside the journal (J positions, P-01),
 //                   each with its delta {placements at its position, bins
 //                   sealed there, leaf_count and mmr root after it}; the best
 //                   chain's state is materialised (records H, placements per
@@ -67,6 +67,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -92,7 +93,7 @@ inline constexpr std::uint64_t bin_leaf_count(std::uint64_t H, std::uint64_t b0,
 }
 
 // ---------------------------------------------------------------------------
-// S(b) -> the sealed L1 bucket (D:515-518, E-8, P-2 = ruling 31): rows =
+// S(b) -> the sealed L1 bucket (E-8; P-2 = ruling 31): rows =
 // rows_of(entries); raw_sum = the sum of work; miner_count = distinct row.miner;
 // d_min = the smallest live receipt work; no entry -> the E-8 empty bucket.
 // Every committed field is computed from the entries, none is an input.
@@ -120,7 +121,7 @@ struct Placement {
     Hash32 id{};                         // receipt_id = keccak256(hashing_blob)
     std::uint64_t bin = 0;               // origin bin b = h(r)
     std::uint64_t q = 0;                 // placing position (set by ingest)
-    std::uint64_t p_own = 0;             // p(r), D:162 (the caller's, through off-chain tips)
+    std::uint64_t p_own = 0;             // p(r), own position (the caller's, through off-chain tips)
     Hash32 payee{};                      // identities; owner zero iff p == 0
     Hash32 owner{};
     std::uint16_t p = 0;
@@ -197,7 +198,7 @@ public:
     std::uint64_t pos() const noexcept { return pos_; }
     std::uint64_t fork_pos() const noexcept { return fork_; }
 
-    // H(x) on this chain, x <= pos().
+    // H(x) on this chain; x > pos() or a view that is not Ok throws (fails closed).
     std::uint64_t record(std::uint64_t x) const;
     // S2.3 #8: the id is placed on this chain in a bin still open at pos().
     bool placed_open(const Hash32& id) const;
@@ -494,19 +495,19 @@ inline std::optional<SealedBin> decode_bleaf(const std::string& v, std::uint64_t
 // ---------------------------------------------------------------------------
 class BinStore {
 public:
-    // Genesis carrier at position 0 with record genesis_height; b0 the lane's
-    // first bin (an input here; P-3 = ruling 31 derives it as H(0) at wiring);
-    // journal_depth J (K27); chain = the record key's chain id.
-    BinStore(const LaneParams& p, std::uint64_t b0, std::uint64_t journal_depth, const Hash32& genesis_id,
-             std::uint64_t genesis_height, std::uint32_t chain = 0)
-        : p_(p), b0_(b0), j_(journal_depth), chain_id_(chain) {
+    // Genesis carrier at position 0 with template height genesis_height; the
+    // lane's first bin b0 = H(0) = genesis_height (P-3 = ruling 31); journal_depth
+    // J (P-01); chain = the record key's chain id.
+    BinStore(const LaneParams& p, std::uint64_t journal_depth, const Hash32& genesis_id, std::uint64_t genesis_height,
+             std::uint32_t chain = 0)
+        : p_(p), b0_(genesis_height), j_(journal_depth), chain_id_(chain) {
         LaneDelta g;
         g.id = genesis_id;
         g.parent = genesis_id;
         g.pos = 0;
         g.h = genesis_height;
         g.H = genesis_height;
-        // bins already sealed at genesis (none when b0 = H(0)) are empty.
+        // bins sealed at genesis: lc(H(0)) = 0 for F >= 1 (b0 = H(0)).
         BinMmr m;
         for (std::uint64_t i = 0; i < bin_leaf_count(g.H, b0_, p_.open_bins); ++i) {
             SealedBin sb;
@@ -669,19 +670,29 @@ public:
     }
 
     // Makes new_tip the best tip: rewind to the fork point, replay its deltas.
-    // The lane records of the change go into *out (one batch).
+    // A fork point below the journal base (a best-chain ancestor included) is
+    // Deep and changes nothing (as RewindJournal's RebuildRequired). The lane
+    // records of the change go into *out (one batch).
     SwitchVerdict switch_best(const Hash32& new_tip, LaneBatch* out = nullptr) {
         const LaneView v = view_at(new_tip);
         if (v.status() == ViewStatus::Unknown) return SwitchVerdict::Unknown;
         if (!v.ok()) return SwitchVerdict::Deep;
+        if (!fork_in_journal(v.fork_pos())) return SwitchVerdict::Deep;
         for (const LaneDelta* d : v.side_)
             if (!d->sealed_done) return SwitchVerdict::NotSealed;
         const std::uint64_t fork = v.fork_pos();
         const std::vector<const LaneDelta*> replay = v.side_;
         const std::uint64_t lc_old = mmr_.leaf_count();
-        // rewind tip .. fork + 1
+        // every delta to rewind (tip .. fork + 1) is found before anything changes
+        std::vector<const LaneDelta*> undo;
         for (std::uint64_t x = tip_pos(); x > fork; --x) {
-            const LaneDelta& d = journal_.at(chain_[x]);
+            const auto it = journal_.find(chain_[x]);
+            if (it == journal_.end()) throw std::logic_error("BinStore::switch_best: a delta to rewind is not held");
+            undo.push_back(&it->second);
+        }
+        // rewind tip .. fork + 1
+        for (const LaneDelta* dp : undo) {
+            const LaneDelta& d = *dp;
             for (auto pl = d.placed.rbegin(); pl != d.placed.rend(); ++pl) {
                 placed_q_.erase(pl->id);
                 auto bit = by_bin_.find(pl->bin);
@@ -689,7 +700,7 @@ public:
                 while (!bit->second.empty() && bit->second.back().q > fork) bit->second.pop_back();
                 if (bit->second.empty()) by_bin_.erase(bit);
             }
-            chain_pos_.erase(chain_[x]);
+            chain_pos_.erase(d.id);
         }
         chain_.resize(fork + 1);
         records_.resize(fork + 1);
@@ -818,6 +829,7 @@ private:
 // LaneView
 // ---------------------------------------------------------------------------
 inline std::uint64_t LaneView::record(std::uint64_t x) const {
+    if (!ok() || x > pos_) throw std::out_of_range("LaneView::record: not a position of this view");
     if (x <= fork_) return s_->records_[x];
     return side_[x - fork_ - 1]->H;
 }
@@ -873,6 +885,7 @@ inline std::uint64_t LaneView::leaf_count_at(std::uint64_t x) const {
 }
 
 inline Hash32 LaneView::mmr_root_at(std::uint64_t x) const {
+    if (!ok() || x > pos_) throw std::out_of_range("LaneView::mmr_root_at: not a position of this view");
     if (x <= fork_) return s_->mmr_.prefix_root(leaf_count_at(x)).value();  // throws if the MMR lags the record
     return side_[x - fork_ - 1]->root;
 }

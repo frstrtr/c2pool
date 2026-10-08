@@ -40,11 +40,14 @@ static pb::Hash32 rep(std::uint8_t b) { pb::Hash32 h{}; h.fill(b); return h; }
 //   V8  bucket cross-check against the rows
 //   V9  sibling race with a shared receipt and an orphan re-carry: both admitted
 //   V10 deep fork: DEFER, no verdict
+//   V10b switch to a best-chain ancestor below the journal base: Deep, nothing
+//       changes (the store equals a fresh store fed the same chain)
 //   V11 side-branch seal: the side view's mmr_root_at == a fresh node's root
 //   P-2 miner_count = distinct row.miner, rows with w_miner 0 included
 // ---------------------------------------------------------------------------
 #include <exception>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "impl/xmr/pathb/pathb_bin_store.hpp"
@@ -134,7 +137,7 @@ static void s3b_store_vectors() {
 
     // ---- V1 / V5 / V6 on one best chain: positions 1 .. 1180, h = b0 + pos / 12 ----
     run_vector("V1 / V5 / V6 on one best chain: positions 1 .. 1180, h = b0 + pos / 12", [&] {
-        pb::BinStore s(P, kB0, kJ, idn(0xC0, 0), h_at(0));
+        pb::BinStore s(P, kJ, idn(0xC0, 0), h_at(0));
         const pb::Placement p1 = rcpt(idn(0xA1, 1), b, 9, rep(0x11), 30000);   // q 10: H(9) = b0, live
         const pb::Placement p2 = rcpt(idn(0xA1, 2), b, 5, rep(0x12), 25000);   // q 50, tip at 4: live
         const pb::Placement pa = rcpt(idn(0xA1, 3), b, 3, rep(0x13), 40000);   // q = f, tip at 2: live
@@ -197,17 +200,18 @@ static void s3b_store_vectors() {
                       && v.mmr_root_at(1152) == *s.best_mmr().prefix_root(1),
               "mmr_root_at(t) = the root over lc(H(t)) leaves (zero before the first seal)");
     });
-    {
-        // a bin below b0 is refused by the store (no leaf would ever commit it).
-        pb::BinStore s(P, kB0, kJ, idn(0xC9, 0), kB0);
+    // ---- a bin below b0 is refused by the store (no leaf would ever commit it) ----
+    run_vector("below b0", [&] {
+        pb::BinStore s(P, kJ, idn(0xC9, 0), kB0);
+        check(s.b0() == kB0, "b0 = H(0), the genesis template height (P-3)");
         check(s.add_carrier(idn(0xC9, 1), idn(0xC9, 0), kB0) == pb::AddVerdict::Added, "below-b0 store");
         check(s.ingest(idn(0xC9, 1), rcpt(idn(0xA9, 1), kB0 - 1, 1, rep(0x19), 30000)) == pb::Ingest::Expired,
               "a placement of bin b0 - 1 Expired");
-    }
+    });
 
     // ---- V2 dedup and rewind ----
     run_vector("V2 dedup and rewind", [&] {
-        pb::BinStore s(P, kB0, kJ, idn(0xD0, 0), kB0);
+        pb::BinStore s(P, kJ, idn(0xD0, 0), kB0);
         const pb::Placement r = rcpt(idn(0xA2, 1), kB0, 1, rep(0x21), 30000);
         bool ok = true;
         ok = ok && extend(s, idn(0xD0, 1), idn(0xD0, 0), kB0, {}, true);
@@ -229,14 +233,14 @@ static void s3b_store_vectors() {
         check(!s.view_at(idn(0xE0, 7)).placed_open(r.id), "V2 the rewind freed the id");
         check(s.add_carrier(idn(0xE0, 8), idn(0xE0, 7), kB0) == pb::AddVerdict::Added
                       && s.ingest(idn(0xE0, 8), r) == pb::Ingest::Accepted,
-              "V2 the same id Accepted again after the rewind (S:430-432)");
+              "V2 the same id Accepted again after the rewind (S2.3 #8)");
         check(s.view_at(idn(0xD0, 5)).status() == pb::ViewStatus::Ok && s.view_at(idn(0xD0, 5)).placed_open(r.id),
               "V2 the abandoned branch still sees its own placement");
     });
 
     // ---- V3 FR-B1 gap: dense MMR (E-8) ----
     run_vector("V3 FR-B1 gap: dense MMR (E-8)", [&] {
-        pb::BinStore s(P, kB0, kJ, idn(0xF0, 0), kB0);
+        pb::BinStore s(P, kJ, idn(0xF0, 0), kB0);
         const pb::Hash32 aa = rep(0xAA);
         bool ok = extend(s, idn(0xF0, 1), idn(0xF0, 0), kB0, {rcpt(idn(0xA3, 1), kB0, 1, aa, 18180)}, true);
         ok = ok && extend(s, idn(0xF0, 2), idn(0xF0, 1), kB0 + 2, {rcpt(idn(0xA3, 2), kB0 + 2, 2, aa, 18180)}, true);
@@ -265,7 +269,7 @@ static void s3b_store_vectors() {
 
     // ---- V4 dead-only bin ----
     run_vector("V4 dead-only bin", [&] {
-        pb::BinStore s(P, kB0, kJ, idn(0xF4, 0), kB0);
+        pb::BinStore s(P, kJ, idn(0xF4, 0), kB0);
         bool ok = extend(s, idn(0xF4, 1), idn(0xF4, 0), kB0,
                          {rcpt(idn(0xA4, 1), kB0, 1, rep(0xBB), 80000), rcpt(idn(0xA4, 2), kB0, 1, rep(0xCC), 80000)},
                          true);
@@ -305,7 +309,7 @@ static void s3b_store_vectors() {
         const pb::Placement r1 = rcpt(idn(0xA7, 1), kB0, 1, rep(0x21), 30000);
         const pb::Placement r2 = rcpt(idn(0xA7, 2), kB0, 1, rep(0x22), 40000);
         const pb::Placement r3 = rcpt(idn(0xA7, 3), kB0, 1, rep(0x23), 50000);
-        pb::BinStore s(P, kB0, kJ, idn(0x70, 0), kB0);
+        pb::BinStore s(P, kJ, idn(0x70, 0), kB0);
         bool ok = extend(s, idn(0x70, 1), idn(0x70, 0), kB0, {r1}, true);
         ok = ok && extend(s, idn(0x70, 2), idn(0x70, 1), kB0 + 96, {r2}, true);  // fold of bin b0 at 2
         const pb::Hash32 leaf_a = *s.best_mmr().leaf(0);
@@ -318,7 +322,7 @@ static void s3b_store_vectors() {
               "V7 the switch pops the leaf: leaf_count and root of the fork point");
         ok = ok && extend(s, idn(0x7B, 3), idn(0x7B, 2), kB0 + 96, {r2, r3}, true);  // B's fold carries one more
         check(ok && s.head().leaf_count == 1 && *s.best_mmr().leaf(0) != leaf_a, "V7 B seals a different leaf");
-        pb::BinStore fresh(P, kB0, kJ, idn(0x70, 0), kB0);
+        pb::BinStore fresh(P, kJ, idn(0x70, 0), kB0);
         bool okf = extend(fresh, idn(0x70, 1), idn(0x70, 0), kB0, {r1}, true);
         okf = okf && extend(fresh, idn(0x7B, 2), idn(0x70, 1), kB0 + 50, {}, true);
         okf = okf && extend(fresh, idn(0x7B, 3), idn(0x7B, 2), kB0 + 96, {r2, r3}, true);
@@ -382,7 +386,7 @@ static void s3b_store_vectors() {
 
     // ---- V9 sibling race: shared receipt, orphan re-carry ----
     run_vector("V9 sibling race: shared receipt, orphan re-carry", [&] {
-        pb::BinStore s(P, kB0, kJ, idn(0x90, 0), kB0);
+        pb::BinStore s(P, kJ, idn(0x90, 0), kB0);
         bool ok = extend(s, idn(0x90, 1), idn(0x90, 0), kB0, {}, true);
         const pb::Hash32 c1 = idn(0x9F, 2), c2 = idn(0x91, 2), c3 = idn(0x91, 3);  // c2 < c1
         const pb::Placement r = rcpt(idn(0xAB, 1), kB0, 2, rep(0x71), 30000);
@@ -418,7 +422,7 @@ static void s3b_store_vectors() {
     // ---- V10 deep fork: DEFER, never a verdict ----
     run_vector("V10 deep fork: DEFER, never a verdict", [&] {
         const std::uint64_t J = 8;
-        pb::BinStore s(P, kB0, J, idn(0x10, 0), kB0);
+        pb::BinStore s(P, J, idn(0x10, 0), kB0);
         bool ok = true;
         for (std::uint64_t x = 1; x <= 19; ++x) ok = ok && extend(s, idn(0x10, x), idn(0x10, x - 1), kB0, {}, true);
         // a side branch forking at 11 while the tip is 19 (fork depth J): held.
@@ -443,10 +447,82 @@ static void s3b_store_vectors() {
               "V10 an unknown parent DEFERs");
     });
 
+    // ---- V10b switch to a best-chain ancestor below the journal base ----
+    run_vector("V10b switch to a best-chain ancestor below the journal base", [&] {
+        const std::uint64_t J = 8;
+        const auto rc_x = [](std::uint64_t x) {
+            return rcpt(idn(0xAE, x), kB0 + x / 2, x - 1, idn(0x77, x % 3), 1000 + x);
+        };
+        const auto feed = [&](pb::BinStore& st, std::uint64_t x) {
+            return extend(st, idn(0x30, x), idn(0x30, x - 1), kB0 + x / 2, {rc_x(x)}, true);
+        };
+        const auto same_state = [](const pb::BinStore& a, const pb::BinStore& c) {
+            if (!(a.head() == c.head())) return false;
+            const pb::LaneView va = a.view_at(a.best_tip()), vc = c.view_at(c.best_tip());
+            if (va.placement_count() != vc.placement_count()) return false;
+            for (std::uint64_t bin = kB0; bin <= kB0 + 130; ++bin) {
+                const std::vector<const pb::Placement*> ea = va.live_entries(bin, va.pos());
+                const std::vector<const pb::Placement*> ec = vc.live_entries(bin, vc.pos());
+                if (ea.size() != ec.size()) return false;
+                for (std::size_t i = 0; i < ea.size(); ++i)
+                    if (ea[i]->id != ec[i]->id || ea[i]->q != ec[i]->q) return false;
+            }
+            return true;
+        };
+        pb::BinStore s(P, J, idn(0x30, 0), kB0);
+        pb::BinStore fresh(P, J, idn(0x30, 0), kB0);
+        bool ok = true;
+        for (std::uint64_t x = 1; x <= 20; ++x) ok = ok && feed(s, x) && feed(fresh, x);
+        check(ok && s.base_pos() == 12, "V10b tip 20, J 8: journal base 12");
+        pb::LaneBatch batch;
+        const pb::SwitchVerdict deep7 = s.switch_best(idn(0x30, 5), &batch);    // J + 7 below the tip
+        const pb::SwitchVerdict deep1 = s.switch_best(idn(0x30, 11), &batch);   // J + 1 below the tip
+        check(deep7 == pb::SwitchVerdict::Deep && deep1 == pb::SwitchVerdict::Deep && batch.ops.empty(),
+              "V10b a best-chain ancestor J + 1 / J + 7 below the tip: Deep, no record batch");
+        check(s.best_tip() == idn(0x30, 20) && same_state(s, fresh),
+              "V10b ... nothing changed: the store equals a fresh store fed the same chain");
+        check(s.switch_best(idn(0x30, 12)) == pb::SwitchVerdict::Switched && s.tip_pos() == 12 &&
+                      s.switch_best(idn(0x30, 20)) == pb::SwitchVerdict::Switched && same_state(s, fresh),
+              "V10b control: the ancestor J below the tip rewinds; back at 20 the store equals the fresh one");
+        bool same = true;
+        for (std::uint64_t x = 21; x <= 240; ++x) {
+            ok = ok && feed(s, x) && feed(fresh, x);
+            same = same && s.head() == fresh.head();
+        }
+        check(ok && same && s.head().leaf_count == 25 && same_state(s, fresh),
+              "V10b the chain continued to 240 (25 bins sealed): head and placements equal the fresh store's");
+    });
+
+    // ---- view reads outside the view fail closed ----
+    run_vector("view reads fail closed", [&] {
+        pb::BinStore s(P, kJ, idn(0x31, 0), kB0);
+        bool ok = extend(s, idn(0x31, 1), idn(0x31, 0), kB0, {}, true);
+        ok = ok && extend(s, idn(0x3A, 2), idn(0x31, 1), kB0 + 1, {}, false);
+        const pb::LaneView best = s.view_at(idn(0x31, 1));
+        const pb::LaneView side = s.view_at(idn(0x3A, 2));
+        const pb::LaneView unknown = s.view_at(idn(0x99, 9));
+        const auto throws = [](auto&& f) {
+            try {
+                (void)f();
+            } catch (const std::out_of_range&) {
+                return true;
+            }
+            return false;
+        };
+        check(ok && throws([&] { return best.record(best.pos() + 1); }) &&
+                      throws([&] { return best.mmr_root_at(best.pos() + 1); }),
+              "record / mmr_root_at beyond pos() on a best-chain view throw");
+        check(throws([&] { return side.record(side.pos() + 1); }) &&
+                      throws([&] { return side.mmr_root_at(side.pos() + 1); }) && side.record(side.pos()) == kB0 + 1,
+              "record / mmr_root_at beyond pos() on a side view throw; pos() itself reads");
+        check(!unknown.ok() && throws([&] { return unknown.record(0); }) && throws([&] { return unknown.mmr_root_at(0); }),
+              "a view that is not Ok reads nothing");
+    });
+
     // ---- V11 side-branch seal ----
     run_vector("V11 side-branch seal", [&] {
         const pb::Placement r = rcpt(idn(0xAD, 1), kB0, 1, rep(0x91), 30000);
-        pb::BinStore s(P, kB0, kJ, idn(0x20, 0), kB0);
+        pb::BinStore s(P, kJ, idn(0x20, 0), kB0);
         bool ok = extend(s, idn(0x20, 1), idn(0x20, 0), kB0, {r}, true);
         ok = ok && extend(s, idn(0x20, 2), idn(0x20, 1), kB0 + 50, {}, true);         // best: no fold
         ok = ok && extend(s, idn(0x2A, 2), idn(0x20, 1), kB0 + 96, {}, false);        // side: folds bin b0
@@ -454,7 +530,7 @@ static void s3b_store_vectors() {
         check(ok && side.ok() && side.fork_pos() == 1 && side.leaf_count() == 1, "V11 the side branch seals bin b0");
         check(s.head().leaf_count == 0 && s.delta(idn(0x2A, 2))->sealed.size() == 1,
               "V11 ... in its own delta; the best chain has not");
-        pb::BinStore fresh(P, kB0, kJ, idn(0x20, 0), kB0);
+        pb::BinStore fresh(P, kJ, idn(0x20, 0), kB0);
         bool okf = extend(fresh, idn(0x20, 1), idn(0x20, 0), kB0, {r}, true);
         okf = okf && extend(fresh, idn(0x2A, 2), idn(0x20, 1), kB0 + 96, {}, true);
         check(okf && side.mmr_root_at(2) == fresh.head().root && side.mmr_root_at(1) == pb::Hash32{},
