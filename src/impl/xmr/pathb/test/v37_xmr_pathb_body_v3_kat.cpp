@@ -23,7 +23,8 @@
 //       tx_count - 1 above floor(2 Z / w_min) refused; blob_len 79 / 71 refused;
 //   (3) hashing blob: field wider than declared refused (both directions),
 //       non-canonical varint refused, blob_len not matching the fields refused;
-//   (4) round trip over generated bodies; encode(decode(b)) == b;
+//   (4) round trip over generated bodies (give_author_bp in 0..10000 - p);
+//       encode(decode(b)) == b;
 //   (5) every truncation refused; mutation pass: an accepted mutant
 //       re-encodes to the same bytes;
 //   (6) carrier body: 0 and R_MAX carried round trip; R_MAX + 1 refused by
@@ -36,7 +37,13 @@
 //       the header of the relay frames in xmr_relay_wire.hpp (FB_RECEIPTS
 //       header = FH + count byte, FB_CTX header = FH + id + length, FB_GETCTX
 //       bytes); frame buffer = FH + 2 + 17 x 945 = 16,073 (14,985 at v17);
-//       consensus FRAME_CAP = FH + 2 + 17 x 913 = 15,529 (14,441 at v17).
+//       consensus FRAME_CAP = FH + 2 + 17 x 913 = 15,529 (14,441 at v17);
+//       kFbMaxReceiptsPerFrame = 1 + R_MAX = 17 (the S2 relay literal 8 is
+//       superseded);
+//   (8) one budget (X-6): PER_RECEIPT_BUDGET (admission) == kFbReceiptBudget
+//       (relay) == the receipt I/O buffer P-10 = 945 (v16) / 881 (v17), and
+//       PER_LANE_BUDGET = R_MAX x P-10; the S2 engine sizes them apart
+//       (relay 1024, admission 768).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -258,8 +265,8 @@ int main() {
             b.blob.timestamp = rng.below(1ull << 35);
             b.blob.tx_count = rng.below(1ull << 21);
             b.reward_total = rng.next();
-            b.side.give_author_bp = static_cast<std::uint16_t>(rng.below(10001));
             if (owner) b.side.fee_rate_bp = static_cast<std::uint16_t>(1 + rng.below(10000));
+            b.side.give_author_bp = static_cast<std::uint16_t>(rng.below(10001u - b.side.fee_rate_bp));  // 0..10000 - p
             const std::vector<std::uint8_t> e = enc(b);
             pb::ReceiptBodyV3 back;
             if (e.empty() || dec(e, 16, &back) != pb::WireError::None || !(back == b) || enc(back) != e)
@@ -390,6 +397,36 @@ int main() {
         check(pb::frame_buffer(pb::carrier_limits(buf17, r_max)) == 14985, "frame buffer = 6 + 2 + 17 x 881 = 14,985 at v17");
         check(pb::frame_cap(913, r_max) == 15529, "consensus FRAME_CAP = 6 + 2 + 17 x 913 = 15,529");
         check(pb::frame_cap(849, r_max) == 14441, "consensus FRAME_CAP = 6 + 2 + 17 x 849 = 14,441 at v17");
+
+        // kFbMaxReceiptsPerFrame: a carrier frame holds the carrier + R_MAX carried
+        // = 1 + R_MAX = 17 (the S2 relay literal 8 is superseded; v2.4).
+        check(pb::max_receipts_per_frame(r_max) == 17 && pb::kFbMaxReceiptsPerFrame == 17,
+              "kFbMaxReceiptsPerFrame = 1 + R_MAX = 17 (8 -> 17)");
+        check(relay::kFbMaxReceiptsPerFrame == 8, "the S2 relay literal kFbMaxReceiptsPerFrame is 8 (superseded)");
+        check(pb::carrier_body_size(945, r_max) == 2 + pb::max_receipts_per_frame(r_max) * 945,
+              "carrier body = 2 + kFbMaxReceiptsPerFrame x receipt");
+    }
+
+    // (8) one budget (X-6): the relay verify budget and the admission budget are
+    // the same receipt I/O buffer P-10; PER_LANE_BUDGET = R_MAX x P-10.
+    {
+        const std::uint64_t r_max = pb::kRuledLaneParams.r_max;
+        check(pb::per_receipt_budget(16, 0, r_max) == std::optional<std::uint64_t>(945)
+                      && pb::per_receipt_budget(16, 0, r_max) == pb::fb_receipt_budget(16, 0, r_max),
+              "one budget: PER_RECEIPT_BUDGET == kFbReceiptBudget == P-10 = 945 (v16)");
+        check(pb::per_receipt_budget(17, 0, r_max) == std::optional<std::uint64_t>(881)
+                      && pb::per_receipt_budget(17, 0, r_max) == pb::fb_receipt_budget(17, 0, r_max),
+              "one budget at v17: 881");
+        check(pb::per_receipt_budget(16, 0, r_max) == std::optional<std::uint64_t>(buf16.receipt)
+                      && pb::per_receipt_budget(17, 0, r_max) == std::optional<std::uint64_t>(buf17.receipt),
+              "the one budget equals the configured receipt buffer P-10");
+        check(pb::per_lane_budget(16, 0, r_max) == std::optional<std::uint64_t>(r_max * 945)
+                      && pb::per_lane_budget(17, 0, r_max) == std::optional<std::uint64_t>(r_max * 881),
+              "PER_LANE_BUDGET = R_MAX x P-10 = 15,120 (v16) / 14,096 (v17)");
+        check(pb::per_receipt_budget(16, UINT64_MAX, r_max) == std::nullopt,
+              "a view outside the domain yields no budget");
+        // the S2 engine sizes the two apart: relay 1024, admission 768.
+        check(relay::kFbReceiptBudget == 1024, "the S2 relay budget literal is 1024 (superseded)");
     }
 
     return finish("v37_xmr_pathb_body_v3_kat");

@@ -495,6 +495,20 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_dos_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_dos_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_dos_kat COMMAND v37_xmr_stratum_dos_kat)
+    # v37_xmr_stratum_vardiff_kat (NET-DOS, stratum vardiff): the per-connection
+    # submit-rate budget tracking the lane window from the tip (2 x S_t,
+    # S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / s, clamped at s = 100 %), the
+    # honest-safe floor when s is unknown, the payout-floor connection never
+    # throttled, a connection far above the budget closed (test clock). Stub
+    # template source (configurable lane / Monero targets) + verifier: no
+    # RandomX, no monerod. Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_stratum_vardiff_kat
+        v37_xmr_stratum_vardiff_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_vardiff_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_vardiff_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_vardiff_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_vardiff_kat COMMAND v37_xmr_stratum_vardiff_kat)
     # v37_xmr_test_suspend_knob_kat (FAULT-KNOB, TEST-ONLY): the
     # --test-suspend-lane-seconds / SIGUSR2 knob that forces a lane suspension
     # on a live node -- off by default, refused on mainnet, arm/fire/release
@@ -1148,12 +1162,13 @@ if (BUILD_TESTING)
     #                                 load.
     #   v37_xmr_relay_node_nonce_kat  #1885 N5: duplicate in/out pair closed
     #                                 by the acceptor.
-    # (v37_convergence_soak, #1905, is wrapped at its own add_test below.)
+    # (v37_convergence_soak, #1905, is an undiagnosed safety pin and is NOT
+    # retried; see its add_test below.)
     set(V37_FLAKY_RETRY v37_xmr_relay_send_queue_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
+    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_relay_parked_cap_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -2073,16 +2088,12 @@ if (BUILD_TESTING)
     target_compile_features(v37_convergence_soak PRIVATE cxx_std_20)
     target_include_directories(v37_convergence_soak PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_convergence_soak Threads::Threads)
-    # TRACKED TIMING FLAKE #1905 (SK-A1 fails ~5/40 under ASan; the race stays
-    # open there): up to 3 tries via cmake/RetryTest.cmake, failing all 3 still
-    # fails. TIMEOUT covers all tries together (300 -> 600); ENVIRONMENT reaches
-    # the binary through the wrapper.
-    add_test(NAME v37_convergence_soak COMMAND ${CMAKE_COMMAND}
-        -DEXE=$<TARGET_FILE:v37_convergence_soak> -DNAME=v37_convergence_soak
-        -DISSUE=1905 -DTRIES=3
-        -P ${CMAKE_SOURCE_DIR}/cmake/RetryTest.cmake)
+    # UNDIAGNOSED SAFETY PIN #1905 (SK-A1, credited-but-unrepairable > 0 seen
+    # under ASan): one run, no retry, until #1905 has a root cause. Not for
+    # cmake/RetryTest.cmake.
+    add_test(NAME v37_convergence_soak COMMAND v37_convergence_soak)
     set_tests_properties(v37_convergence_soak PROPERTIES
-        TIMEOUT 600
+        TIMEOUT 300
         ENVIRONMENT "SOAK_SEED=20260918;SOAK_ROUNDS=600;SOAK_SECONDS=60;SOAK_PROGRESS=0")
 
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)

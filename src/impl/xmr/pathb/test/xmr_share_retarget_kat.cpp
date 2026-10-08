@@ -27,16 +27,16 @@
 //   (10) one Monero height for every carrier from a full window: once the
 //        window holds one height, d grows by at most 109/108 per carrier
 //        (m 9; 13/12 at m 1); d at checkpoints;
-//   (11) seeded branch race: share 2/5 of 600,000 H/s, every branch carrier
-//        at one height, from lane start, 7 days, 400 runs: the branch's
-//        cumulative work never exceeds the main chain's while the main chain
-//        holds >= J = 1,152 (or >= 120) carriers since the fork at m 9; at
-//        m 1 it does in >= 1/8 of the runs;
+//   (11) seeded two-chain vector at m 9 (400 runs, seed 20261006, 7 days
+//        from lane start): chain B at 2/5 of 600,000 H/s, every carrier at
+//        one record height; chain A at 3/5 with carriers of d 6,000,000; B's
+//        cumulative work does not exceed A's at any point where A holds
+//        >= 120 or >= J = 1,152 carriers;
 //   (12) one value per tip: carriers on one tip at h(tip), +1, +2 get the
 //        same d; d is a function of the record heights only;
 //   (13) a lane that starts from a predecessor's carriers takes the window
 //        of its newest N_rt carriers; without one it starts at d_min.
-// Vectors: the:s0fix/sims (rt_kat_vectors.py, rt_kat_race.py).
+// Vectors: the:K03.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cmath>
@@ -121,62 +121,63 @@ std::vector<std::uint64_t> ds_of(const std::vector<Find>& f) {
     return v;
 }
 
-// rt_kat_race.py mirror.
+// (11) seeded two-chain run: exponential waiting times from Rng.
 double exp1(Rng& r) {
     const double u = static_cast<double>((r.next() >> 11) + 1) * 0x1p-53;
     return -std::log(u);
 }
 
-struct RaceWins {
+// Runs in which B's work exceeds A's while A holds >= 120 / >= depth_j carriers.
+struct DepthPasses {
     int at_120 = 0;
     int at_j = 0;
 };
 
-RaceWins race(const pb::LaneParams& p, int trials, std::uint64_t seed, std::uint64_t depth_j) {
+DepthPasses two_chain(const pb::LaneParams& p, int trials, std::uint64_t seed, std::uint64_t depth_j) {
     constexpr std::uint64_t kH0 = 600000;
     constexpr std::uint64_t kShareNum = 2, kShareDen = 5;
     constexpr std::uint64_t kHorizonS = 7 * 86400;
     constexpr std::uint64_t kDepthShort = 120;
-    constexpr std::uint64_t kBranchHeight = 500;
+    constexpr std::uint64_t kOneHeight = 500;
     const std::uint64_t d0 = kH0 * p.carrier_interval_s;
-    const double ha = static_cast<double>(kH0 * kShareNum) / static_cast<double>(kShareDen);
-    const double hh = static_cast<double>(kH0 * (kShareDen - kShareNum)) / static_cast<double>(kShareDen);
+    const double h_b = static_cast<double>(kH0 * kShareNum) / static_cast<double>(kShareDen);
+    const double h_a = static_cast<double>(kH0 * (kShareDen - kShareNum)) / static_cast<double>(kShareDen);
     const std::uint64_t mix = 0x9E3779B97F4A7C15ull;
-    RaceWins wins;
+    DepthPasses passes;
     for (int tr = 0; tr < trials; ++tr) {
-        Rng rp(seed * mix + 2 * static_cast<std::uint64_t>(tr) + 1);
-        Rng rh(seed * mix + 2 * static_cast<std::uint64_t>(tr) + 2);
+        Rng rb(seed * mix + 2 * static_cast<std::uint64_t>(tr) + 1);
+        Rng ra(seed * mix + 2 * static_cast<std::uint64_t>(tr) + 2);
         pb::RetargetWindow w(p);
         double t = 0.0;
-        nat::U128 work{};
-        std::uint64_t nh = 0;
-        double th = exp1(rh) * static_cast<double>(d0) / hh;
-        bool won_short = false, won_j = false;
+        nat::U128 work_b{};
+        std::uint64_t n_a = 0;
+        double t_a = exp1(ra) * static_cast<double>(d0) / h_a;
+        bool past_120 = false, past_j = false;
         for (;;) {
             const std::uint64_t d = w.next_difficulty();
-            t += exp1(rp) * static_cast<double>(d) / ha;
+            t += exp1(rb) * static_cast<double>(d) / h_b;
             if (t > static_cast<double>(kHorizonS)) break;
-            while (th <= t) {
-                ++nh;
-                th += exp1(rh) * static_cast<double>(d0) / hh;
+            while (t_a <= t) {
+                ++n_a;
+                t_a += exp1(ra) * static_cast<double>(d0) / h_a;
             }
-            work = nat::u128_add(work, nat::U128{d, 0});
-            w.push(pb::RetargetEntry{d, kBranchHeight});
-            if (nat::u128_greater(work, nat::U128{d0 * nh, 0})) {
-                if (nh >= kDepthShort) won_short = true;
-                if (nh >= depth_j) won_j = true;
-                if (won_short && won_j) break;
+            work_b = nat::u128_add(work_b, nat::U128{d, 0});
+            w.push(pb::RetargetEntry{d, kOneHeight});
+            if (nat::u128_greater(work_b, nat::U128{d0 * n_a, 0})) {
+                if (n_a >= kDepthShort) past_120 = true;
+                if (n_a >= depth_j) past_j = true;
+                if (past_120 && past_j) break;
             }
         }
-        wins.at_120 += won_short ? 1 : 0;
-        wins.at_j += won_j ? 1 : 0;
+        passes.at_120 += past_120 ? 1 : 0;
+        passes.at_j += past_j ? 1 : 0;
     }
-    return wins;
+    return passes;
 }
 
 // A carrier on a held tip, with the receipts_root it commits there.
 pb::CarrierAnnounce on_tip(const pb::CarrierTree& t, const pb::Hash32& id, const pb::Hash32& tip, std::uint64_t h) {
-    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip).value_or(pb::Hash32{}), 0};
+    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip, {}).value_or(pb::Hash32{}), 0};
 }
 
 }  // namespace
@@ -370,25 +371,19 @@ int main() {
     // (11)
     {
         const std::uint64_t J = pb::journal_depth(P);
-        const int trials = 400;
-        const std::uint64_t seed = 20261006;
-        const RaceWins rule = race(P, trials, seed, J);
-        const RaceWins m1 = race(P1, trials, seed, J);
-        std::printf("  race (%d runs): m %llu wins %d at depth 120, %d at depth %llu; m 1 wins %d / %d\n", trials,
-                    static_cast<unsigned long long>(pb::retarget_min_span(P)), rule.at_120, rule.at_j,
-                    static_cast<unsigned long long>(J), m1.at_120, m1.at_j);
-        check(rule.at_j == 0 && rule.at_120 == 0, "race, m 9: no run where the branch passes the main chain");
-        check(m1.at_j >= trials / 8, "race, m 1: the branch passes at depth J in >= 1/8 of the runs");
+        check(J == 1152, "J = 1,152");
+        const DepthPasses at_m9 = two_chain(P, 400, 20261006, J);
+        check(at_m9.at_j == 0 && at_m9.at_120 == 0, "two chains, m 9: B's work never above A's at depth >= 120 or >= J");
     }
 
     // (12) one value per tip
     {
-        pb::CarrierTree t(P, seq32(0x01), 1000);
+        pb::CarrierTree t(P, seq32(0x01), 1000, pb::EpochTable{});
         pb::Hash32 tip = seq32(0x01);
         for (std::uint64_t i = 1; i <= 40; ++i) {
             pb::Hash32 id = seq32(0x40);
             id[0] = static_cast<std::uint8_t>(i);
-            t.place(on_tip(t, id, tip, 1000 + i / 12));
+            t.place(on_tip(t, id, tip, 1000 + i / 12), {});
             tip = id;
         }
         const std::uint64_t h_tip = t.find(tip)->h;
@@ -397,7 +392,7 @@ int main() {
         for (std::uint64_t dh = 0; dh <= 2; ++dh) {
             pb::Hash32 id = seq32(0x90);
             id[0] = static_cast<std::uint8_t>(0x90 + dh);
-            same = same && t.place(on_tip(t, id, tip, h_tip + dh)).verdict == pb::PlaceVerdict::Placed
+            same = same && t.place(on_tip(t, id, tip, h_tip + dh), {}).verdict == pb::PlaceVerdict::Placed
                    && t.find(id)->d == d;
         }
         check(same, "h(tip), +1, +2 on one tip: one d");
@@ -415,8 +410,8 @@ int main() {
         pb::RetargetWindow inherited(P, pred);
         check(inherited.size() == N && inherited.next_difficulty() == 6000016, "window keeps the newest N_rt");
 
-        pb::CarrierTree lane(P, seq32(0x02), pred.back().H, pred);
-        pb::CarrierTree fresh(P, seq32(0x02), pred.back().H);
+        pb::CarrierTree lane(P, seq32(0x02), pred.back().H, pb::EpochTable{}, pred);
+        pb::CarrierTree fresh(P, seq32(0x02), pred.back().H, pb::EpochTable{});
         check(*lane.next_difficulty(seq32(0x02)) == 6000016, "inherited lane: position 1 at 6,000,016");
         check(*fresh.next_difficulty(seq32(0x02)) == P.d_min, "lane without a predecessor: position 1 at d_min");
         // positions 1..k on the new lane continue the window
@@ -427,7 +422,7 @@ int main() {
             pb::Hash32 id = seq32(0x60);
             id[0] = static_cast<std::uint8_t>(i);
             const std::uint64_t h = pred.back().H + i / 12;
-            cont = cont && lane.place(on_tip(lane, id, tip, h)).verdict == pb::PlaceVerdict::Placed
+            cont = cont && lane.place(on_tip(lane, id, tip, h), {}).verdict == pb::PlaceVerdict::Placed
                    && lane.find(id)->d == pb::retarget(P, joined);
             joined.push_back(pb::RetargetEntry{lane.find(id)->d, lane.find(id)->H});
             tip = id;

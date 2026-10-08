@@ -253,6 +253,7 @@ static std::uint32_t g_relay_rx_global = 4;             // --relay-rx-global G (
 static std::optional<std::uint32_t> g_relay_ban_seconds; // --relay-ban-seconds S (unset = ceil(n x C / G))
 static std::uint32_t g_relay_verify_threads = 0;       // --relay-verify-threads N (0 = auto; DROPS-VERIFY-SCALE)
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
+static std::size_t   g_relay_parked_max = 0;            // --relay-parked-max N (0 = default open_bins x (1 + r_max))
 static std::uint64_t g_relay_backfill = 2048;           // --relay-backfill-positions N
 static std::uint32_t g_relay_reoffer_s = 60;            // --relay-reoffer-seconds S
 static std::uint32_t g_relay_keepalive_ms = 5000;       // --relay-keepalive-ms MS (0 = off; RELAY-LIVENESS)
@@ -271,7 +272,8 @@ static std::uint64_t g_relay_deep_probe_step = 64;      // --relay-deep-probe-st
 static std::uint64_t g_relay_shadow_persist_bytes = 256ull << 20;   // --relay-shadow-persist-bytes N
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 // Stratum listener policy (unset = the StratumListenerOptions default).
-static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (submit refill per connection, submits/s)
+static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (fixed submit refill per connection, submits/s; pins the budget, disabling vardiff)
+static std::optional<std::uint32_t>      g_stratum_vardiff_shares;    // --stratum-vardiff-shares N (turns vardiff on; target shares per lane window)
 static std::optional<std::uint32_t>      g_stratum_submit_burst;      // --stratum-submit-burst N (also the per-connection queue bound)
 static std::optional<std::uint32_t>      g_stratum_ban_seconds;       // --stratum-ban-seconds S (unset = ceil(burst / submit refill))
 static std::optional<std::array<int, 4>> g_stratum_share_score;       // --stratum-share-score BAD,GOOD,BAN,CAP
@@ -643,7 +645,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
     lo.min_difficulty = std::max(lo.min_difficulty, hooks.stratum_min_diff);   // NET-DOS
-    if (g_stratum_share_rate) lo.submit_rate = *g_stratum_share_rate;
+    if (g_stratum_vardiff_shares) { lo.vardiff_shares_per_window = *g_stratum_vardiff_shares; lo.submit_vardiff = true; }   // vardiff on
+    if (g_stratum_share_rate) { lo.submit_rate = *g_stratum_share_rate; lo.submit_vardiff = false; }   // pin the budget, disable vardiff
     if (g_stratum_submit_burst) {
         lo.submit_burst = static_cast<double>(*g_stratum_submit_burst);
         lo.max_pending_submits = *g_stratum_submit_burst;
@@ -655,9 +658,15 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
         lo.ban_score = (*g_stratum_share_score)[2];        lo.max_score = (*g_stratum_share_score)[3];
     }
     if (g_stratum_login_timeout_ms) lo.login_timeout_ms = static_cast<int>(*g_stratum_login_timeout_ms);
-    std::printf("stratum: minimum requested difficulty %llu; submit budget %.0f burst + %.2f/s per connection "
+    char rate_buf[96];
+    if (lo.submit_vardiff)
+        std::snprintf(rate_buf, sizeof rate_buf, "vardiff 2 x S_t (%u shares/window, floor %.2f/s)",
+                      lo.vardiff_shares_per_window, lo.submit_rate);
+    else
+        std::snprintf(rate_buf, sizeof rate_buf, "%.2f/s", lo.submit_rate);
+    std::printf("stratum: minimum requested difficulty %llu; submit budget %.0f burst + %s per connection "
                 "(queue %zu); share score bad %d good %+d ban at %d cap %d; login deadline %d ms; ban %d s by address\n",
-                static_cast<unsigned long long>(lo.min_difficulty), lo.submit_burst, lo.submit_rate, lo.max_pending_submits,
+                static_cast<unsigned long long>(lo.min_difficulty), lo.submit_burst, rate_buf, lo.max_pending_submits,
                 lo.bad_share_points, lo.good_share_points, lo.ban_score, lo.max_score, lo.login_timeout_ms, lo.ban_seconds);
     o2::StratumListener listener(template_source, rx, sink, lo);
     if (hooks.extra_nonce_base) listener.seed_extra_nonce(*hooks.extra_nonce_base);   // GAP-2
@@ -1675,6 +1684,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         return 2;
     }
     if (!cfg.lane_params.fee.enabled) { g_give_author_pct = 0.0; g_give_author_exact = {0, 1, true}; }   // the 0.1 default is a fee-model-v1 default only
+    // Path B S2.3 #2: owner fee p + give_author_bp <= 10000 bp.
+    {
+        const std::uint32_t sum_bp = c2pool::v37n::xmr::fee::pct_to_bp(g_owner_fee_exact)
+                                     + c2pool::v37n::xmr::fee::pct_to_bp(g_give_author_exact);
+        if (sum_bp > 10000u) {
+            std::printf("REFUSED: --node-owner-fee-pct + --give-author-pct = %u bp, above 10000 bp\n", (unsigned)sum_bp);
+            return 2;
+        }
+    }
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -4845,6 +4863,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                 rx_budget = v;
             }
             ro.solicited_credits = g_relay_solicited;
+            if (g_relay_parked_max) ro.parked_max = g_relay_parked_max;
             ro.backfill_positions = g_relay_backfill;
             ro.reoffer_seconds = g_relay_reoffer_s;
             ro.keepalive_ms = g_relay_keepalive_ms;          // RELAY-LIVENESS
@@ -6242,6 +6261,11 @@ int main(int argc, char** argv) {
             if (!(r > 0)) throw cs::UsageError(a + " wants a number > 0");
             g_stratum_share_rate = r;
         }
+        else if (a == "--stratum-vardiff-shares") {
+            const auto nsh = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
+            if (nsh == 0) throw cs::UsageError(a + " wants an integer >= 1");
+            g_stratum_vardiff_shares = nsh;
+        }
         else if (a == "--stratum-submit-burst") {
             const auto b = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
             if (b == 0) throw cs::UsageError(a + " wants an integer >= 1");
@@ -6343,6 +6367,7 @@ int main(int argc, char** argv) {
         else if (a == "--relay-ban-seconds")        g_relay_ban_seconds = u32();
         else if (a == "--relay-verify-threads")     g_relay_verify_threads = u32();
         else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
+        else if (a == "--relay-parked-max")         g_relay_parked_max = static_cast<std::size_t>(u64());
         else if (a == "--relay-backfill-positions") g_relay_backfill = u64();
         else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = u32();
         else if (a == "--relay-keepalive-ms")       g_relay_keepalive_ms = u32();
@@ -6529,6 +6554,7 @@ int main(int argc, char** argv) {
                 "                               auto: clamp(cores/2, 2, 8) minus --mine threads; ~2.2 MiB each,\n"
                 "                               the seed caches are shared). 1 = the pre-fix single worker\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
+                "  --relay-parked-max N         parked verify items cap (objects; default 1632)\n"
                 "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
                 "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
                 "  --relay-discovery on|off     relay peer discovery (FB_GETADDR/FB_ADDR) + persistent peer book (default on)\n"
@@ -6569,8 +6595,10 @@ int main(int argc, char** argv) {
                 " serve side (X9 O-2; the stratum port is served only with a payout address):\n"
                 "  --payout-address <addr>      get_block_template wallet address (network-prefixed)\n"
                 "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
-                "  --stratum-share-rate R       submit budget refill per connection, submits/s\n"
-                "                               (default 2 x 2^k / T = 12.8; k 6, T 10 s)\n"
+                "  --stratum-share-rate R       fixed submit budget refill per connection, submits/s\n"
+                "                               (pins the budget; disables vardiff)\n"
+                "  --stratum-vardiff-shares N   turn vardiff on: N shares per lane window per connection\n"
+                "                               (default off; on: budget = 2 x S_t, s unknown 12.8/s)\n"
                 "  --stratum-submit-burst N     submit budget burst and queue bound per connection (default 24)\n"
                 "  --stratum-ban-seconds S      address ban (default ceil(burst / R) = 2)\n"
                 "  --stratum-share-score B,G,K,M share score: bad share B, good share G, ban at K, cap M\n"

@@ -1,0 +1,432 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
+// This file is part of c2pool and is distributed under the terms of the GNU
+// Affero General Public License, version 3 or (at your option) any later
+// version. See COPYING in the repository root.
+// ---------------------------------------------------------------------------
+// src/impl/xmr/pathb/pathb_receipt_admission.hpp
+// Path B, slice S2: open carriage and LEGALLY DEAD.
+//
+// On top of the S1 carrier sharechain this module adds:
+//
+//   1. Open carriage (C36, K08). A carrier may carry in its carried list up to
+//      R_MAX receipts of ANY miner while their origin bins are open on the
+//      carrier's chain (check_carried_list). The carried payee is never
+//      compared with the carrier's. carried_root becomes non-zero (the
+//      per-carrier Merkle over the carried ids in canonical order), folded
+//      into receipts_root exactly as pathb_ratchet_state.hpp specifies.
+//      Omitting a known receipt is not a refusal (carried_omissions: relay
+//      policy, logged per peer).
+//
+//   2. LEGALLY DEAD. freshness 0 <= h(r) - h(tip) <= Fresh [K07], read from the
+//      receipt and its own bound tip only (never the placing chain); liveness
+//      live(r) <=> h(r) >= H(min(q - 1, own position)) at delta = 1 [K05], with
+//      the height record H taken over CARRIERS of the placing chain, by chain
+//      data only, NO clock. A dead receipt is placed and deduplicated but
+//      tagged weight 0; it is counted for dedup and never credited.
+//
+// window_root and mmr_root stay the S1 zero stubs (admission #13 asserts both
+// == 0; a mismatch is BAN, part of the #12 prefix). The payout window, the bin fold / seal, buckets, the MMR, the exact split and
+// the emission base reward are all S3; none is built here. Receipts are PLACED
+// and TAGGED live/dead but NOT CREDITED (crediting is the S3 window).
+//
+// Admission order of S2.3 (cheap first, RandomX last): the canonical coinbase
+// check (#12) runs strictly BEFORE RandomX (#15); a computed mismatch is a BAN
+// decided before RandomX is ever invoked.
+//
+// The canonical coinbase is the hf-16 Monero miner tx (pathb_miner_tx.hpp,
+// pathb_coinbase_split.hpp); with an empty window it is one output of the whole
+// reward R to the receipt's own payee. Its outcome (CoinbaseCheck) enters the
+// admission tail below.
+//
+// Header-only. Not included by any running component; included by its KATs only.
+// Pulls Keccak (xmr_coin) and the v37 sha256d; link xmr_coin.
+// ---------------------------------------------------------------------------
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <set>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "impl/xmr/coin/xmr_keccak_midstate.hpp"  // ::xmr::coin::keccak256
+#include "sharechain/v37/v37_hash.hpp"            // ::v37::sha256d
+
+#include "pathb_params.hpp"
+#include "pathb_ratchet_state.hpp"  // receipts_root fold, check_carrier_fold, rs_root, kNoCarriedRoot
+#include "pathb_wire_v3.hpp"        // HashingBlob, ReceiptBodyV3, encode_hashing_blob, kExtraNonceBytes
+
+namespace c2pool::xmr::pathb {
+
+// ---------------------------------------------------------------------------
+// Hash helpers
+// ---------------------------------------------------------------------------
+inline Hash32 keccak256_hash(const std::vector<std::uint8_t>& pre) {
+    const ::xmr::coin::Hash256 h = ::xmr::coin::keccak256(pre.data(), pre.size());
+    Hash32 out{};
+    for (std::size_t i = 0; i < out.size(); ++i) out[i] = h.data()[i];
+    return out;
+}
+
+inline Hash32 sha256d_pair(const Hash32& a, const Hash32& b) {
+    std::vector<std::uint8_t> pre;
+    pre.reserve(2 * kHashBytes);
+    pre.insert(pre.end(), a.begin(), a.end());
+    pre.insert(pre.end(), b.begin(), b.end());
+    return ::v37::sha256d(pre);
+}
+
+// ---------------------------------------------------------------------------
+// receipt_id (S2.4): id = keccak256(hashing_blob)
+// ---------------------------------------------------------------------------
+inline Hash32 receipt_id(const HashingBlob& blob) {
+    std::vector<std::uint8_t> bytes;
+    encode_hashing_blob(blob, bytes);
+    return keccak256_hash(bytes);
+}
+
+inline Hash32 receipt_id(const ReceiptBodyV3& r) { return receipt_id(r.blob); }
+
+// ---------------------------------------------------------------------------
+// freshness (S2.3 #6, K07): 0 <= h(r) - h(tip) <= Fresh
+// Read from the receipt and its own bound tip only, NEVER the placing chain.
+// Out of range is REFUSE (no strike token; cheaper than parsing misbehaviour).
+// ---------------------------------------------------------------------------
+enum class FreshVerdict : std::uint8_t { Fresh, Refuse };
+
+inline FreshVerdict freshness(std::uint64_t h_r, std::uint64_t h_tip, std::uint64_t fresh_max) {
+    const std::int64_t d = static_cast<std::int64_t>(h_r) - static_cast<std::int64_t>(h_tip);
+    return (d >= 0 && d <= static_cast<std::int64_t>(fresh_max)) ? FreshVerdict::Fresh : FreshVerdict::Refuse;
+}
+
+// ---------------------------------------------------------------------------
+// open bin (S2.4 open_at, S2.3 #7, K04): H(x) < b + F
+// Carried receipt: x = pos(c) - 1 (the carrier's parent), b = h(r) (origin bin).
+// H(x) >= b + F is a SEALED bin: carriage into it is STRIKE.
+// ---------------------------------------------------------------------------
+inline bool open_at(std::uint64_t record_at_x, std::uint64_t origin_bin, std::uint64_t open_bins) {
+    if (origin_bin > UINT64_MAX - open_bins) return true;  // b + F cannot overflow; always open
+    return record_at_x < origin_bin + open_bins;
+}
+
+// ---------------------------------------------------------------------------
+// LEGALLY DEAD (S2.4 own_pos / live, S2.3 #17, K05 delta = 1)
+//
+//   own_pos(chain, r) = pos(tip) + 1  (the position the receipt competed for;
+//     the transitive off-chain-tip walk is bounded by the defensive fuel
+//     F x 12, a consequence of the open bin, applied by the chain walk).
+//   live(chain, r, q) = h(r) >= H(min(q - 1, own_pos)), H over CARRIERS of the
+//     placing chain. delta = 1 is the "q - 1". q is the placing carrier
+//     position. A placed receipt never raises H (F3): only carriers do.
+//
+// Chain data only. No clock input appears in this path.
+// ---------------------------------------------------------------------------
+inline std::uint64_t own_pos(std::uint64_t pos_tip) { return pos_tip + 1; }
+
+// K05 liveness_delta (ruling 11'): a HELLO lane rule of this slice, not yet a
+// LaneParams field. delta = 1 judges the work against the record of the very
+// position it competed for.
+inline constexpr std::uint64_t kLivenessDelta = 1;
+
+// H is a record-height lookup by CARRIER position on the placing chain.
+// Threshold position = min(q - 1, own_pos + (delta - 1)); at delta = 1 this is
+// min(q - 1, own_pos). Exposed with delta for the delta-3 control vector only.
+template <class RecordAt>
+inline bool live_at_delta(std::uint64_t h_r, std::uint64_t q, std::uint64_t p_own, std::uint64_t delta,
+                          RecordAt&& record_at) {
+    const std::uint64_t q_minus_1 = q > 0 ? q - 1 : 0;
+    const std::uint64_t own_shift = p_own + (delta - 1);
+    const std::uint64_t threshold_pos = std::min(q_minus_1, own_shift);
+    return h_r >= record_at(threshold_pos);
+}
+
+// The consensus liveness rule: delta = 1 (K05).
+template <class RecordAt>
+inline bool live(std::uint64_t h_r, std::uint64_t q, std::uint64_t p_own, RecordAt&& record_at) {
+    return live_at_delta(h_r, q, p_own, kLivenessDelta, std::forward<RecordAt>(record_at));
+}
+
+// A placed receipt's tag: live => full weight, dead => weight 0 (never credited;
+// still counted for dedup and adds 0 to a vote window).
+enum class LiveTag : std::uint8_t { Live, Dead };
+
+inline LiveTag live_tag(bool is_live) { return is_live ? LiveTag::Live : LiveTag::Dead; }
+
+// ---------------------------------------------------------------------------
+// Carried-list canonical order (S2.4 carried_order_ok, S2.3 #14, D2.5)
+// Key: (origin bin = h(r) ascending, then sha256d(id || parent_id)); parent_id
+// is the carrier's parent id (one value for the whole list). Strictly
+// increasing (card 2d not accepted; the order key stays, ruling 27 K-11).
+// ---------------------------------------------------------------------------
+struct CarriedKey {
+    std::uint64_t origin_bin = 0;  // h(r)
+    Hash32 id{};
+};
+
+inline Hash32 carried_tiebreak(const Hash32& id, const Hash32& parent_id) {
+    return sha256d_pair(id, parent_id);
+}
+
+inline bool carried_key_less(const CarriedKey& a, const CarriedKey& b, const Hash32& parent_id) {
+    if (a.origin_bin != b.origin_bin) return a.origin_bin < b.origin_bin;
+    return carried_tiebreak(a.id, parent_id) < carried_tiebreak(b.id, parent_id);
+}
+
+inline bool carried_order_ok(std::span<const CarriedKey> list, const Hash32& parent_id) {
+    for (std::size_t i = 1; i < list.size(); ++i)
+        if (!carried_key_less(list[i - 1], list[i], parent_id)) return false;  // strictly increasing
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// carried_root (S2.2): the Merkle root over the carried ids in canonical order.
+//   leaves  = the carried ids (as-is; the canonical order of carried_order_ok)
+//   node    = sha256d(left || right)
+//   a lone node at a level is promoted unchanged
+//   one leaf  -> its root is that id
+//   empty     -> the zero stub (kNoCarriedRoot); this is the S1 case
+// S2 is the first slice to compute a non-zero carried_root; this is its
+// implementation of record. carried_root is a component of receipts_root
+// (pathb_ratchet_state.hpp carrier_receipts_root); it is a DIFFERENT object
+// from mmr_root (the sealed-bin accumulator), which stays the S1 zero stub.
+// ---------------------------------------------------------------------------
+inline Hash32 carried_root(std::span<const Hash32> ids) {
+    if (ids.empty()) return kNoCarriedRoot;
+    std::vector<Hash32> level(ids.begin(), ids.end());
+    while (level.size() > 1) {
+        std::vector<Hash32> next;
+        next.reserve((level.size() + 1) / 2);
+        for (std::size_t i = 0; i < level.size(); i += 2) {
+            if (i + 1 < level.size())
+                next.push_back(sha256d_pair(level[i], level[i + 1]));
+            else
+                next.push_back(level[i]);  // promote lone node
+        }
+        level.swap(next);
+    }
+    return level.front();
+}
+
+// receipts_root of a carrier carrying `ids` on a tip whose ratchet state is
+// s_tip: the fold sha256d("c2pool-v37-carry" || carried_root(ids) || rs_root).
+inline Hash32 carrier_receipts_root_over(std::span<const Hash32> ids, const RatchetState& s_tip) {
+    return carrier_receipts_root(carried_root(ids), s_tip);
+}
+
+// Carrier fold admission (S2.3 #14 tail): the carrier's receipts_root against
+// carried_root(ids) folded with the verifier's own S at pos(tip). STRIKE on a
+// mismatch. A carried or pending receipt's own fold is never compared.
+inline FoldVerdict check_carried_fold(const Hash32& receipts_root, std::span<const Hash32> ids,
+                                      const RatchetState& s_tip) {
+    return check_carrier_fold(receipts_root, carried_root(ids), s_tip);
+}
+
+// ---------------------------------------------------------------------------
+// Monero tree path for leaf index 0 (the coinbase; "no path bits"): the
+// keccak256 left-fold of the leaf over the branch (S2.3 #12).
+// ---------------------------------------------------------------------------
+inline Hash32 tree_root_fold(const Hash32& leaf0, std::span<const Hash32> branch) {
+    Hash32 h = leaf0;
+    for (const Hash32& b : branch) {
+        std::vector<std::uint8_t> pre;
+        pre.reserve(2 * kHashBytes);
+        pre.insert(pre.end(), h.begin(), h.end());
+        pre.insert(pre.end(), b.begin(), b.end());
+        h = keccak256_hash(pre);
+    }
+    return h;
+}
+
+// ---------------------------------------------------------------------------
+// Zero-stub invariant (S2.3 #13): window_root == 0 and mmr_root == 0 (the
+// node's own values until S3). A non-zero stub is BAN: #13 is part of the #12
+// prefix (admit_coinbase_roots_then_randomx).
+// ---------------------------------------------------------------------------
+inline bool zero_stubs_ok(const SideDataV3& s) {
+    return detail::is_zero(s.window_root) && detail::is_zero(s.mmr_root);
+}
+
+// ---------------------------------------------------------------------------
+// Dedup set (S2.3 #8; the replay guard, ruling 27 K-10). One set per chain /
+// branch of the ids placed in open bins (carriers + placed receipts). An id
+// placed twice is a DUPLICATE (pending) or a STRIKE (carried). Rewinding frees
+// the abandoned placements.
+// ---------------------------------------------------------------------------
+class PlacedSet {
+public:
+    bool contains(const Hash32& id) const { return placed_.count(id) != 0; }
+    // Returns true iff the id was newly placed (not already present).
+    bool place(const Hash32& id) { return placed_.insert(id).second; }
+    void unplace(const Hash32& id) { placed_.erase(id); }
+    std::size_t size() const { return placed_.size(); }
+
+private:
+    std::set<Hash32> placed_;
+};
+
+// ---------------------------------------------------------------------------
+// Admission order (S2.3): the resolution stages (#3 tip, #5 P_r / served ctx,
+// #15 seed) and the cheap-coinbase-then-RandomX tail (#12 before #15).
+// ---------------------------------------------------------------------------
+enum class AdmitVerdict : std::uint8_t {
+    Strike,         // a parsing / consensus misbehaviour (#1b, #2, #4, #7 carried, #8 carried, #9, #11, #14)
+    Refuse,         // not misbehaviour (#6 freshness, #7 pending, #12 Fused / Unbuildable)
+    Defer,          // waiting on chain / context / seed / bodies / references (#3, #5, #12, #14, #15 SeedMissing) - never a strike
+    Duplicate,      // an already-placed pending id (#8)
+    Ban,            // a served bad context block (#5), a non-canonical coinbase (#12), roots (#13), bad PoW (#15)
+    AdmitCarrier,   // placed as a carrier
+    AdmitPending,   // placed pending
+    Drop,           // longer than its I/O buffer (#1a): no verdict, no token
+};
+
+// Invalid-object budget tokens a verdict costs (the budget itself is policy
+// P-16..P-19): STRIKE costs one, every other verdict none.
+inline constexpr std::uint64_t strike_tokens(AdmitVerdict v) noexcept {
+    return v == AdmitVerdict::Strike ? 1 : 0;
+}
+
+// #3 / #5: resolution of the tip, P_r and seed before the cheap checks.
+enum class Resolve : std::uint8_t {
+    Ready,            // tip held + verified, P_r resolved, seed present
+    DeferUnknownTip,  // #3: tip not held / not verified -> DEFER + fetch
+    DeferUnknownPr,   // #5: P_r not on a verified branch -> DEFER + fetch
+    DeferSeedMissing, // #15: RandomX seed missing -> DEFER
+    BanBadCtx,        // #5: a served context block failed its branch PoW -> BAN the server
+};
+
+// A defer / ban resolution carries NO strike.
+inline AdmitVerdict admit_resolution(Resolve r) {
+    switch (r) {
+        case Resolve::Ready: return AdmitVerdict::AdmitCarrier;  // the caller continues the cheap checks
+        case Resolve::DeferUnknownTip:
+        case Resolve::DeferUnknownPr:
+        case Resolve::DeferSeedMissing: return AdmitVerdict::Defer;
+        case Resolve::BanBadCtx: return AdmitVerdict::Ban;
+    }
+    return AdmitVerdict::Defer;
+}
+
+struct TailResult {
+    AdmitVerdict verdict = AdmitVerdict::Strike;
+    bool randomx_called = false;  // observable: #15 runs only after #12 admits
+};
+
+// The outcome of the canonical coinbase check (S2.3 #12, C41):
+//   Match        the receipt commits the canonical miner tx: continue
+//   Mismatch     fold(tx hash, branch) != tree_root, computed by the node: BAN
+//   Fused        hf >= 17 (amount_fork_fused): REFUSE, no token, no ban
+//   Defer        a window payee's reference, a window bucket or A_t's weights
+//                not held: DEFER (no verdict, no token), fetched
+//   Unbuildable  no canonical coinbase by rule (equal Ko at hf >= 17): REFUSE,
+//                no token, no ban
+//   Undefined    side_data_v3 does not encode, the window weights != W, or the
+//                payee identity does not match its reference: BAN
+enum class CoinbaseCheck : std::uint8_t { Match, Mismatch, Fused, Defer, Unbuildable, Undefined };
+
+// The admission tail: #12 (canonical coinbase) and #13 (window_root and
+// mmr_root == the node's own; part of the #12 prefix) strictly BEFORE #15
+// (RandomX). RandomX runs only after #12 is Match and #13 holds.
+template <class RandomXOk>
+inline TailResult admit_coinbase_roots_then_randomx(CoinbaseCheck coinbase, bool roots_ok, RandomXOk&& randomx_ok) {
+    switch (coinbase) {
+        case CoinbaseCheck::Match: break;
+        case CoinbaseCheck::Fused:
+        case CoinbaseCheck::Unbuildable: return {AdmitVerdict::Refuse, false};  // no token, no ban
+        case CoinbaseCheck::Defer: return {AdmitVerdict::Defer, false};
+        case CoinbaseCheck::Mismatch:
+        case CoinbaseCheck::Undefined: return {AdmitVerdict::Ban, false};  // #12 BAN; RandomX NOT called
+    }
+    if (!roots_ok) return {AdmitVerdict::Ban, false};  // #13 BAN; RandomX NOT called
+    const bool pow_ok = randomx_ok();                  // #15
+    return {pow_ok ? AdmitVerdict::AdmitCarrier : AdmitVerdict::Ban, true};
+}
+
+template <class RandomXOk>
+inline TailResult admit_coinbase_then_randomx(CoinbaseCheck coinbase, RandomXOk&& randomx_ok) {
+    return admit_coinbase_roots_then_randomx(coinbase, true, std::forward<RandomXOk>(randomx_ok));
+}
+
+// ---------------------------------------------------------------------------
+// Open carriage (S2.3 #7 and #8 for a carried receipt, #14; C36, K08)
+// Any carrier may carry receipts of ANY miner while their origin bins are open
+// on the carrier's chain; the carried payee is never compared with the
+// carrier's. Carrier c: its own body, whose tip is c's parent; record_at_parent
+// = H(pos(c) - 1) on c's chain; s_tip = the verifier's S at pos(tip). The
+// checks on c's carried list, cheap first:
+//   n_carried <= R_MAX                                               STRIKE
+//   every carried body held by the verifier                          DEFER + fetch
+//   ids strictly ascending by (origin bin, sha256d(id || tip(c)))    STRIKE
+//   each origin bin open on c's chain: H(pos(c) - 1) < h(r) + F      STRIKE (sealed bin)
+//   each id neither placed on c's chain nor c's own id               STRIKE (duplicate)
+//   receipts_root(c) == fold(carried_root(ids), rs_root(s_tip))      STRIKE
+// Each carried body also passes the per-receipt rows of S2.3 on its own tip
+// and P_r (depth 1: a carried receipt carries nothing). Omitting a receipt the
+// verifier knows is not a refusal (carried_omissions).
+// ---------------------------------------------------------------------------
+struct CarriedReceipt {
+    std::optional<ReceiptBodyV3> body;  // empty: the verifier does not hold the body
+    std::uint64_t origin_bin = 0;       // h(r) = height(P_r) + 1 (#5); read when the body is held
+};
+
+enum class CarriedFault : std::uint8_t { None, Count, MissingBody, Order, SealedBin, Duplicate, Fold };
+
+struct CarriedListResult {
+    std::optional<AdmitVerdict> verdict;  // empty: the carried list is admitted
+    CarriedFault fault = CarriedFault::None;
+    std::size_t index = 0;                // the first offending entry (MissingBody, SealedBin, Duplicate)
+    std::vector<Hash32> ids;              // the carried ids in list order, placed at #16 when admitted
+};
+
+inline CarriedListResult check_carried_list(const ReceiptBodyV3& carrier, std::uint64_t record_at_parent,
+                                            std::span<const CarriedReceipt> carried, const PlacedSet& placed,
+                                            const RatchetState& s_tip, const LaneParams& p) {
+    const auto fail = [](AdmitVerdict v, CarriedFault f, std::size_t i) {
+        CarriedListResult r;
+        r.verdict = v;
+        r.fault = f;
+        r.index = i;
+        return r;
+    };
+    if (carried.size() > p.r_max) return fail(AdmitVerdict::Strike, CarriedFault::Count, p.r_max);
+    for (std::size_t i = 0; i < carried.size(); ++i)
+        if (!carried[i].body) return fail(AdmitVerdict::Defer, CarriedFault::MissingBody, i);
+
+    CarriedListResult out;
+    std::vector<CarriedKey> keys;
+    keys.reserve(carried.size());
+    out.ids.reserve(carried.size());
+    for (const CarriedReceipt& c : carried) {
+        out.ids.push_back(receipt_id(*c.body));
+        keys.push_back(CarriedKey{c.origin_bin, out.ids.back()});
+    }
+    if (!carried_order_ok(keys, carrier.side.tip)) return fail(AdmitVerdict::Strike, CarriedFault::Order, 0);
+    const Hash32 own_id = receipt_id(carrier);
+    for (std::size_t i = 0; i < carried.size(); ++i) {
+        if (!open_at(record_at_parent, carried[i].origin_bin, p.open_bins))
+            return fail(AdmitVerdict::Strike, CarriedFault::SealedBin, i);
+        if (out.ids[i] == own_id || placed.contains(out.ids[i]))
+            return fail(AdmitVerdict::Strike, CarriedFault::Duplicate, i);
+    }
+    if (check_carried_fold(carrier.side.receipts_root, out.ids, s_tip) != FoldVerdict::Match)
+        return fail(AdmitVerdict::Strike, CarriedFault::Fold, 0);
+    return out;
+}
+
+// Omission (S2.3 #14): the receipts the verifier holds pending in open bins
+// that a carrier did not carry. Never a verdict; the count goes to the per-peer
+// log (relay policy).
+inline std::size_t carried_omissions(std::span<const Hash32> carried_ids, std::span<const Hash32> known_pending) {
+    const std::set<Hash32> carried(carried_ids.begin(), carried_ids.end());
+    std::size_t n = 0;
+    for (const Hash32& id : known_pending)
+        if (carried.count(id) == 0) ++n;
+    return n;
+}
+
+}  // namespace c2pool::xmr::pathb

@@ -67,7 +67,7 @@ struct Templates final : strat::ITemplateSource {
         out.blob[70] = static_cast<std::uint8_t>(extra_nonce);
         out.template_id = 1;
         out.height = 100;
-        out.mainchain_target = 1;               // no network blocks
+        out.mainchain_target = 0;               // no network tip: s unknown -> vardiff floor, no network blocks
         out.lane_target = lane_target.load();
         out.monero_major_version = 16;
         return true;

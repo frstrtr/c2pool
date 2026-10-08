@@ -13,6 +13,10 @@
 #   pathb_ratchet_state.hpp  ratchet state S, rs_step, the receipts_root fold
 #   pathb_retarget.hpp       carrier retarget (K01, K02, K03)
 #   pathb_fork_choice.hpp    carrier tree, fork choice, switch plan
+#   pathb_receipt_admission.hpp  slice S2: open carriage, LEGALLY DEAD,
+#                            carried_root, stub coinbase (unwired)
+#   pathb_header_rules.hpp   S2.3 #9 / S1.3 #7 header rules and size verdict,
+#                            #1a / #1b wire verdicts, frame cap (unwired)
 #
 # `xmr_pathb` is an INTERFACE target: the include root, xmr_coin (Keccak,
 # vendored difficulty) and Boost headers (the vendored difficulty's uint128).

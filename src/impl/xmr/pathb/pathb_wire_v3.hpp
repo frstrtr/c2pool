@@ -23,6 +23,7 @@
 //   off 205  u16  fee_rate p (basis points, 0..10000)
 //   off 207  32   owner identity (zero iff p == 0)
 //   off 239  u16  give_author_bp (0..10000)
+//   p + give_author_bp <= 10000 (S2.3 #2; 10000 exactly: miner weight 0)
 //   mm_root = keccak256("c2pool-v37-xmr-side-v3" || side_data_v3)
 //
 // receipt body:
@@ -174,6 +175,7 @@ enum class WireError : std::uint8_t {
     Version,          // side_data or carrier body version != 3
     FeeRateRange,     // fee_rate p > 10000
     GiveAuthorRange,  // give_author_bp > 10000
+    ShareSum,         // p + give_author_bp > 10000
     OwnerIdentity,    // owner identity zero/non-zero does not match p
     BlobLength,       // blob_len out of range or not equal to the parsed blob
     BlobField,        // a hashing-blob varint is non-canonical or wider than declared
@@ -196,6 +198,7 @@ inline const char* to_string(WireError e) noexcept {
         case WireError::Version: return "version";
         case WireError::FeeRateRange: return "fee-rate-range";
         case WireError::GiveAuthorRange: return "give-author-range";
+        case WireError::ShareSum: return "share-sum";
         case WireError::OwnerIdentity: return "owner-identity";
         case WireError::BlobLength: return "blob-length";
         case WireError::BlobField: return "blob-field";
@@ -262,6 +265,7 @@ inline WireError side_data_v3_check(const SideDataV3& s) noexcept {
     if (s.version != kSideDataV3Version) return WireError::Version;
     if (s.fee_rate_bp > kBasisPointsScale) return WireError::FeeRateRange;
     if (s.give_author_bp > kBasisPointsScale) return WireError::GiveAuthorRange;
+    if (std::uint32_t{s.fee_rate_bp} + s.give_author_bp > kBasisPointsScale) return WireError::ShareSum;
     if ((s.fee_rate_bp == 0) != detail::is_zero(s.owner)) return WireError::OwnerIdentity;
     return WireError::None;
 }
@@ -547,10 +551,20 @@ struct CarrierLimits {
     std::uint64_t r_max = 0;           // K08
 };
 
+// kFbMaxReceiptsPerFrame: the receipts a carrier frame holds = 1 + R_MAX (the
+// carrier and up to R_MAX carried; 8 -> 1 + R_MAX = 17 at R_MAX 16, v2.4).
+inline constexpr std::uint64_t max_receipts_per_frame(std::uint64_t r_max) noexcept {
+    return 1 + r_max;
+}
+
+// kFbMaxReceiptsPerFrame at the ruled R_MAX (the S2 relay literal is 8; v2.4 = 17).
+inline constexpr std::uint64_t kFbMaxReceiptsPerFrame = max_receipts_per_frame(kRuledLaneParams.r_max);
+static_assert(kFbMaxReceiptsPerFrame == 17, "a carrier frame holds the carrier + R_MAX = 16 carried receipts");
+
 // Carrier body of an own and R_MAX carried bodies of `receipt_bytes` each:
-// ver + own + n_carried + R_MAX carried.
+// ver + kFbMaxReceiptsPerFrame x receipt + n_carried.
 inline constexpr std::uint64_t carrier_body_size(std::uint64_t receipt_bytes, std::uint64_t r_max) noexcept {
-    return kU8Bytes + receipt_bytes + kU8Bytes + r_max * receipt_bytes;
+    return kU8Bytes + kU8Bytes + max_receipts_per_frame(r_max) * receipt_bytes;
 }
 
 // The carrier body buffer of the limits.

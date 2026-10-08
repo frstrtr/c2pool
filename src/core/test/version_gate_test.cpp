@@ -103,8 +103,62 @@ TEST(VersionGateTransition, MultiVersionJumpWithoutHistoryAdmitted)
 
 TEST(VersionGateTransition, ExactSixtyPercentBoundaryAdmitted)
 {
-    // new version == exactly 60% of total. Rule is `new*100 < total*60`:
-    // 60*100 == 100*60, NOT strictly less -> 60% PASSES (no throw).
+    // new version == exactly 60% of total. Rule is new < floor(total*60/100):
+    // 60 < 60 is false -> 60% PASSES (no throw).
     auto w = tally({{36, 60}, {35, 40}});  // total 100, new=60 -> exactly 60%
     EXPECT_NO_THROW(verify_version_transition<uint288>(35, 36, w, /*have_history=*/true));
+}
+
+// Rounding boundary of the 60% gate (#1739). The oracle (p2pool data.py)
+// rejects when counts.get(VERSION, 0) < sum(counts)*60//100, a FLOOR
+// threshold. When 60*total is not a multiple of 100, new == floor(0.6*total)
+// must be admitted; the previous cross-multiplied form rejected it.
+TEST(VersionGateTransition, FloorThresholdAdmitsFloorOfSixtyPercent)
+{
+    // total 7: floor(4.2) = 4. new = 4 -> 4 < 4 is false -> admitted.
+    // RED on the cross-multiplied form: 4*100 = 400 < 7*60 = 420.
+    auto w = tally({{36, 4}, {35, 3}});
+    EXPECT_NO_THROW(verify_version_transition<uint288>(35, 36, w, /*have_history=*/true));
+}
+
+TEST(VersionGateTransition, FloorThresholdRejectsBelowFloor)
+{
+    // total 7: new = 3 < floor(4.2) = 4 -> rejected.
+    auto w = tally({{36, 3}, {35, 4}});
+    EXPECT_THROW(verify_version_transition<uint288>(35, 36, w, /*have_history=*/true),
+                 std::invalid_argument);
+}
+
+TEST(VersionGateTransition, FloorThresholdRejectsJustBelowExactSixty)
+{
+    // total 100 (60*total is a multiple of 100): new = 59 < 60 -> rejected.
+    auto w = tally({{36, 59}, {35, 41}});
+    EXPECT_THROW(verify_version_transition<uint288>(35, 36, w, /*have_history=*/true),
+                 std::invalid_argument);
+}
+
+TEST(VersionGateTransition, EmptyWindowWithHistoryAdmitted)
+{
+    // Oracle: 0 < 0*60//100 is false -> admitted. Pinned so that tightening
+    // it is a deliberate rule change, not a side effect.
+    std::map<uint64_t, uint288> w;
+    EXPECT_NO_THROW(verify_version_transition<uint288>(35, 36, w, /*have_history=*/true));
+}
+
+TEST(VersionGateTransition, FloorThresholdAt288BitMagnitude)
+{
+    // Weights are 2^256/(target+1)-sized; exercise the base_uint division.
+    // total = 2^250 + 7, new = floor(total*60/100) -> admitted; new - 1 -> rejected.
+    const uint288 total = (uint288(1) << 250) + uint288(7);
+    const uint288 floor_new = (total * uint32_t(60)) / uint288(100);
+    {
+        std::map<uint64_t, uint288> w{{36, floor_new}, {35, total - floor_new}};
+        EXPECT_NO_THROW(verify_version_transition<uint288>(35, 36, w, /*have_history=*/true));
+    }
+    {
+        const uint288 below = floor_new - uint288(1);
+        std::map<uint64_t, uint288> w{{36, below}, {35, total - below}};
+        EXPECT_THROW(verify_version_transition<uint288>(35, 36, w, /*have_history=*/true),
+                     std::invalid_argument);
+    }
 }
