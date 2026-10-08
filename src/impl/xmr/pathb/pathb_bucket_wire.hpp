@@ -917,12 +917,12 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets(const BinStore& stor
                                                             const std::optional<RatchetStateBytes>& s_parent,
                                                             std::uint64_t frame_bytes) {
     const LaneView view = store.view_at(req.at);
-    if (!view.ok()) return {encode_buckets_not_served(req.chain_id, req.at)};
+    if (!view.ok() || view.pos() == 0) return {encode_buckets_not_served(req.chain_id, req.at)};  // held, above genesis
     if (view.fork_pos() != view.pos()) return {encode_buckets_not_served(req.chain_id, req.at)};  // best chain only
     if (!s_parent) return {encode_buckets_not_served(req.chain_id, req.at)};
     BucketServeSource src;
     src.b0 = store.b0();
-    src.leaf_count = view.pos() == 0 ? 0 : view.leaf_count_at(view.pos() - 1);  // leaf_count(tip(at))
+    src.leaf_count = view.leaf_count_at(view.pos() - 1);  // leaf_count(tip(at))
     src.mmr = &store.best_mmr();
     src.bucket = [&view](std::uint64_t bin) { return view.bucket(bin); };
     src.s_parent = s_parent.value_or(RatchetStateBytes{});
