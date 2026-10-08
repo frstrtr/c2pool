@@ -16,10 +16,14 @@
 #   xmr_carrier_sharechain_kat       carrier fork choice, deferral, switch plans,
 #                                    headers-first over the retarget, receipts_root fold
 #
-# Slice S2 (thin) KATs (pathb_receipt_admission.hpp):
+# Slice S2 KATs (pathb_receipt_admission.hpp, pathb_header_rules.hpp):
 #   xmr_receipt_freshness_kat        freshness 0 <= h(r) - h(tip) <= 2 (K07)
 #   xmr_receipt_legally_dead_kat     the 7 delta-1 liveness vectors, no clock (K05)
-#   xmr_receipt_carriage_kat         self-carriage subset, carried_root fold, dedup (K08)
+#   xmr_receipt_carriage_kat         open carriage of any miner's receipts, order, R_MAX,
+#                                    open bin, dedup, omission, carried_root fold (K08)
+#   v37_xmr_receipt_header_rules_kat major == hf(h), timestamp >= median60 (P_r branch)
+#   v37_xmr_receipt_wire_cap_kat     size verdicts: STRIKE / DROP, strike counter, caps (K18)
+#   xmr_carrier_timestamp_kat        carrier record H, carrier header rules, no clock
 #   v37_xmr_receipt_id_kat           id = keccak256(hashing_blob), replay dedup
 #   v37_xmr_receipt_defer_kat        defer-never-ban resolution
 #   xmr_receipt_solo_leech_kat       stub coinbase: BAN before RandomX (S2 stub + S3 window/split part)
@@ -70,6 +74,9 @@ if (BUILD_TESTING)
             v37_xmr_receipt_id_kat
             v37_xmr_receipt_defer_kat
             xmr_receipt_solo_leech_kat
+            v37_xmr_receipt_header_rules_kat
+            v37_xmr_receipt_wire_cap_kat
+            xmr_carrier_timestamp_kat
             xmr_window_kat
             xmr_window_spend_floor_kat
             xmr_window_merge_back_kat
@@ -94,7 +101,12 @@ if (BUILD_TESTING)
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
         add_test(NAME ${_pathb_kat} COMMAND ${_pathb_kat})
     endforeach()
-    # v37_xmr_pathb_body_v3_kat reads the relay frame header of
-    # src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp (xmr_receipt.hpp by its bare name).
+    # v37_xmr_pathb_body_v3_kat and v37_xmr_receipt_wire_cap_kat read the relay
+    # frame header of src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp (xmr_receipt.hpp
+    # by its bare name).
     target_include_directories(v37_xmr_pathb_body_v3_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
+    target_include_directories(v37_xmr_receipt_wire_cap_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
+    # xmr_carrier_timestamp_kat scans the Path B headers for a clock read.
+    target_compile_definitions(xmr_carrier_timestamp_kat PRIVATE
+            PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 endif()

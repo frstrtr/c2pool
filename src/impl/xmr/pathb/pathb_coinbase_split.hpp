@@ -116,7 +116,8 @@ inline bool canonical_coinbase_ok_split(const ReceiptBodyV3& r, const Window& w,
 
 // ---------------------------------------------------------------------------
 // Admission #13 (S3.3): the receipt's side_data window_root / mmr_root equal the
-// node's own computation. STRIKE on a mismatch. These lift the S1/S2 zero stubs.
+// node's own computation. BAN on a mismatch (part of the #12 prefix;
+// admit_coinbase_roots_then_randomx). These lift the S1/S2 zero stubs.
 // ---------------------------------------------------------------------------
 inline bool roots_ok(const SideDataV3& s, const Window& w, const BinMmr& mmr) {
     Work sum;

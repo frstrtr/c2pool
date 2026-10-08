@@ -8,8 +8,9 @@
 // -- shipped pathb-scoped, the native settle xmr_e2e_kat already exists): the
 // whole window -> split -> PBX1 extra -> leaf -> tree_root pipeline on a mainnet
 // and a regtest vector; admission #13 (window_root / mmr_root == the node's own
-// computation, lifting the S1/S2 zero stubs); a receipt paying ANOTHER tip's
-// window is refused.
+// computation, lifting the S1/S2 zero stubs; a mismatch is BAN before RandomX,
+// part of the #12 prefix, for the S3 roots and the S2 zero stubs alike); a
+// receipt paying ANOTHER tip's window is refused.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <span>
@@ -56,11 +57,38 @@ int main() {
         check(!(side.window_root == pb::Hash32{}) && !(side.mmr_root == pb::Hash32{}),
               "window_root (141) and mmr_root (173) go NON-ZERO (lift the S1/S2 stubs)");
 
-        // a tampered window_root is a STRIKE (#13).
+        // a tampered window_root / mmr_root is a BAN (#13), decided before RandomX.
+        int rx_calls = 0;
+        const auto rx = [&rx_calls] { ++rx_calls; return true; };
         pb::SideDataV3 bad = side; bad.window_root[0] ^= 1;
-        check(!pb::roots_ok(bad, w, mmr), "tampered window_root -> STRIKE");
+        check(!pb::roots_ok(bad, w, mmr), "tampered window_root: roots_ok false");
+        const pb::TailResult t1 = pb::admit_coinbase_roots_then_randomx(true, pb::roots_ok(bad, w, mmr), rx);
+        check(t1.verdict == pb::AdmitVerdict::Ban && !t1.randomx_called, "tampered window_root -> BAN before RandomX");
         pb::SideDataV3 bad2 = side; bad2.mmr_root[0] ^= 1;
-        check(!pb::roots_ok(bad2, w, mmr), "tampered mmr_root -> STRIKE");
+        check(!pb::roots_ok(bad2, w, mmr), "tampered mmr_root: roots_ok false");
+        const pb::TailResult t2 = pb::admit_coinbase_roots_then_randomx(true, pb::roots_ok(bad2, w, mmr), rx);
+        check(t2.verdict == pb::AdmitVerdict::Ban && !t2.randomx_called, "tampered mmr_root -> BAN before RandomX");
+        const pb::TailResult t3 = pb::admit_coinbase_roots_then_randomx(true, pb::roots_ok(side, w, mmr), rx);
+        check(t3.verdict == pb::AdmitVerdict::AdmitCarrier && t3.randomx_called, "matching roots: RandomX runs");
+        check(rx_calls == 1, "RandomX called once, only for the matching roots");
+        check(pb::strike_tokens(t1.verdict) == 0, "#13 is not a STRIKE");
+    }
+
+    // ---- S2 #13: a non-zero stub is a BAN before RandomX ----
+    {
+        int rx_calls = 0;
+        const auto rx = [&rx_calls] { ++rx_calls; return true; };
+        pb::SideDataV3 stub;  // both roots zero
+        check(pb::zero_stubs_ok(stub), "zero stubs pass");
+        pb::SideDataV3 wr = stub; wr.window_root[5] = 1;
+        pb::SideDataV3 mr = stub; mr.mmr_root[31] = 1;
+        const pb::TailResult a = pb::admit_coinbase_roots_then_randomx(true, pb::zero_stubs_ok(wr), rx);
+        const pb::TailResult b = pb::admit_coinbase_roots_then_randomx(true, pb::zero_stubs_ok(mr), rx);
+        check(a.verdict == pb::AdmitVerdict::Ban && !a.randomx_called, "S2: a non-zero window_root stub -> BAN before RandomX");
+        check(b.verdict == pb::AdmitVerdict::Ban && !b.randomx_called, "S2: a non-zero mmr_root stub -> BAN before RandomX");
+        const pb::TailResult c = pb::admit_coinbase_roots_then_randomx(false, true, rx);
+        check(c.verdict == pb::AdmitVerdict::Ban && !c.randomx_called, "#12 still BAN before RandomX");
+        check(rx_calls == 0, "RandomX never called");
     }
 
     // ---- regtest vector: B from a low-supply anchor, R = its own base, no fees ----
