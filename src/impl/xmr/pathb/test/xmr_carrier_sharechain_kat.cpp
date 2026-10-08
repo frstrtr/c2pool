@@ -868,19 +868,22 @@ int main() {
 
         // a released carrier carrying receipts
         const auto e = announce(t, b.back().id, 151, 0x34, 2, steady_h, 0, some);
-        check(put(t, e[1]).verdict == pb::PlaceVerdict::Deferred, "(m) a carrier carrying receipts waits on its parent");
-        const pb::PlaceOutcome oe = put(t, e[0]);
-        check(oe.verdict == pb::PlaceVerdict::Placed && oe.released == std::vector<pb::Hash32>{e[1].id},
-              "(m) its parent placed: released");
-        const pb::PlaceOutcome oe1 = put(t, e[1]);
-        const pb::CarrierNode ne0 = node_of(t, e[0].id);
-        const pb::CarrierNode* ne1 = t.find(e[1].id);
-        check(oe1.verdict == pb::PlaceVerdict::Placed && ne1 != nullptr
-                      && ne1->rs
-                                 == pb::rs_step_at(t.ratchet_params(), ne0.rs, ne1->pos,
-                                                   step_inputs(ne1->d, 0, carried_of(e[1].id)), t.epoch_table())
-                                            .s,
-              "(m) admitted again with its carried list: placed, S over every placement");
+        check(e.size() == 2, "(m) two carriers announced on the branch tip");
+        if (e.size() == 2) {
+            check(put(t, e[1]).verdict == pb::PlaceVerdict::Deferred, "(m) a carrier carrying receipts waits on its parent");
+            const pb::PlaceOutcome oe = put(t, e[0]);
+            check(oe.verdict == pb::PlaceVerdict::Placed && oe.released == std::vector<pb::Hash32>{e[1].id},
+                  "(m) its parent placed: released");
+            const pb::PlaceOutcome oe1 = put(t, e[1]);
+            const pb::CarrierNode ne0 = node_of(t, e[0].id);
+            const pb::CarrierNode* ne1 = t.find(e[1].id);
+            check(oe1.verdict == pb::PlaceVerdict::Placed && ne1 != nullptr
+                          && ne1->rs
+                                     == pb::rs_step_at(t.ratchet_params(), ne0.rs, ne1->pos,
+                                                       step_inputs(ne1->d, 0, carried_of(e[1].id)), t.epoch_table())
+                                                .s,
+                  "(m) admitted again with its carried list: placed, S over every placement");
+        }
     }
 
     return finish("xmr_carrier_sharechain_kat");
