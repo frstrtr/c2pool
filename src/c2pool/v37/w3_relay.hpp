@@ -51,6 +51,59 @@
 // the SYNTHETIC RDWR PoW envelope, not a real DASH block-header PoW. The freeze
 // pins the CONTAINER; the field SEMANTICS widen when real share format lands.
 //
+// ── S-1c CARRIER-WIRE v0x02: THE FLAT CUT DESCRIPTOR (2026-09-12) ────────────
+// v0x02 is the sanctioned version bump of the F-5 policy (w3_wire_freeze.hpp
+// "VERSION POLICY"): v0x01 is NOT re-packed — its bytes stay byte-identical and
+// its goldens stay green — and v0x02 appends ONE trailer after the last receipt,
+// so every v0x01 offset and every v0x01 size-model function remains valid over
+// the v0x02 prefix. The decoder DUAL-ACCEPTS {0x01, 0x02} for the upgrade
+// window; the encoder emits the CURRENT W3_WIRE_VERSION.
+//
+//   frame_v2 := u8      version (= 0x02)
+//               event   carrier                      (v0x01 event, unchanged)
+//               u8      receipt_count                (unchanged)
+//               event   receipt[receipt_count]       (unchanged)
+//               cutdesc trailer                      @ v0x01 frame_size(c)
+//   cutdesc  := u8  won_block                  (0 | 1; anything else REJECT_BAD_CUT)
+//               if won_block == 1:
+//                 b32 bid                      (hex(bid) IS the OwedLedger key)
+//                 u64 h_b                      (H_b, the block's OWN height)
+//                 u64 cut_next_pos             (P — the prefix the winner folded at)
+//                 b32 cut_spine_digest         (LaneSnapshot::digest at P)
+//                 u64 reward                   (the winner's block_reward(H_b))
+//                 u8  payout_emitted           (0 | 1; 1 => receiver fail-closed)
+//                 b32 owed_digest_at_win       (VERIFY field, never consensus)
+//
+// WHY THESE FIELDS AND NO OTHERS (S-1c cross-node convergence, the CUT RULE).
+// A receiver must credit its OWN ledger with the SAME E_b the winner credited.
+// E_b = fold_eb(reward, view@P) is a pure function of (reward, view.payout,
+// view.identities) at ONE lane prefix P (w4_settlement.hpp S8), so the wire must
+// pin BOTH arguments:
+//   * `reward` — DashRpcCoinBackend::block_reward(h) answers fail-closed 0 when
+//     its cached template height != h, and the receiver's height-watch has
+//     already refreshed the template to H_b+1 by the time the carrier lands. A
+//     receiver that asked its own backend would fold reward 0 => a VALUELESS
+//     credit => A != B. Carrying it makes the credit a pure function of the wire.
+//   * `cut_next_pos` + `cut_spine_digest` — the receiver must fold at the
+//     WINNER'S cut, not at its own tip at receipt time (its tip already includes
+//     this very carrier). (chain, next_pos, spine_digest) is the ONLY
+//     cross-node-comparable cut key (w4_settlement.hpp CutToken :938-939, w6
+//     PrefixResolver); CutToken::incarnation and LaneSnapshot::version are
+//     NODE-LOCAL (executor-minted / publication-count) and are deliberately NOT
+//     on the wire.
+//   * `payout_emitted` — the winner's coinbase outputs are NOT on the wire (they
+//     are an unbounded map). A FRESH win is at depth 0, so the W5 burial gate
+//     withholds and the payout map is EMPTY on BOTH sides by construction; this
+//     flag lets the receiver REFUSE fail-closed in the one shape it could not
+//     reproduce (a winner that registered an already-buried block).
+//   * `owed_digest_at_win` — diagnostics only: the winner's owed_digest at the
+//     instant of the win. A receiver whose own digest differs at that moment has
+//     ALREADY diverged upstream; logging it names the divergence at the first
+//     block instead of at the audit.
+// A peak / MMR leaf is deliberately NOT on this wire: a receiver must APPEND the
+// identical leaf itself, never insert a peer's peak. The owed-event MMR is a
+// separate, un-nodded track; v0x02 converges the EXISTING flat owed_digest.
+//
 // ── the v36 transport this layer REUSES (cite, never reinvent) ──────────────
 // W3 adds ZERO new transport. A carrier is an extended share body, not a new
 // message type; it rides the existing shares/sharereq/sharereply verbs and the
@@ -73,32 +126,157 @@
 // transport in the KAT is a test binding of the SAME seam.
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "frame_vault.hpp"    // the unified bounded frame store (pos + hash indices)
 #include "w2_admission.hpp"   // ReceiptAdmitter, WorkEvent, W2_R_MAX, ...
 #include "w2_receipt.hpp"
+#include "v37_node_lane_activation.hpp"   // kActivateConsensusV1 (v0x03 rides the flip)
 
 namespace c2pool::v37n {
 
-// W3 wire version tag. 0x01 is the W3-B5 FROZEN carrier-wire layout (see the
-// byte-map in this file's header and the golden byte-KAT). A later wire change
-// is a visible bump of this tag, never a silent re-pack of 0x01.
-constexpr std::uint8_t W3_WIRE_VERSION = 0x01;
+// W3 wire version tags. 0x01 is the W3-B5 FROZEN carrier-wire layout (see the
+// byte-map in this file's header and the golden byte-KAT). 0x02 is the S-1c
+// bump: the v0x01 body VERBATIM plus the flat cut-descriptor trailer. A wire
+// change is always a visible bump of this tag, never a silent re-pack.
+constexpr std::uint8_t W3_WIRE_VERSION_V1 = 0x01;   // frozen; bytes never move
+constexpr std::uint8_t W3_WIRE_VERSION_V2 = 0x02;   // frozen; v1 body + cut trailer
+constexpr std::uint8_t W3_WIRE_VERSION_V3 = 0x03;   // frozen; v2 frame + DROPS trailer
+
+// DROPS-R3: v0x03 exists only to carry the composed DROPS credit map, and a
+// credit map exists only under the consensus flip. So v0x03 is LIVE (emitted,
+// and accepted by the live decoder) only when this build takes
+// V37_ACTIVATE_CONSENSUS_V1. With the flip at 0 (the shipped default) the node
+// emits v0x02 and its live decoder accepts exactly {V1, V2}, byte for byte what
+// master does: a v0x03 frame is REJECT_BAD_VERSION, so a peer's credit map can
+// never reach this node's ledger while the flip is 0. The v0x03 CODEC is
+// frozen either way (encode_version / decode_frozen, pinned by the freeze KAT).
+constexpr bool W3_WIRE_V3_LIVE = ::c2pool::v37n::kActivateConsensusV1;
+
+// The version this build EMITS. The live decoder multi-accepts {V1, V2} (and
+// V3 when W3_WIRE_V3_LIVE) for the upgrade window (F-5); an older peer rejects
+// a newer frame outright at decode — the flag day is LOUD, never a silently
+// half-relayed descriptor.
+constexpr std::uint8_t W3_WIRE_VERSION =
+    W3_WIRE_V3_LIVE ? W3_WIRE_VERSION_V3 : W3_WIRE_VERSION_V2;
+
+// ★★ DROPS-R3: the bound on the composed credit map a winner may carry. The map
+// is the ONE part of a DROPS settlement a receiver cannot recompute (a raindrop
+// is a node-local observation the peer never saw), so it has to ride the wire —
+// and anything that rides an un-PoW'd frame needs a ceiling. 4096 payees at 40
+// bytes each is 160 KiB, comfortably inside the 1 MiB transport frame and far
+// above any plausible payee count at one cut. A frame claiming more is rejected
+// whole; it is never truncated (a truncated credit map is a silent fork).
+constexpr std::uint16_t W3_DROPS_MAX_ENTRIES = 4096;
 
 // R_MAX is the W2-layer consensus bound (share-format §7); W3 enforces it at
 // DECODE, before any push (spec §2.3 / WT-1). Named through W2 so there is one
 // definition, never a second copy that could drift.
 constexpr std::uint32_t W3_R_MAX = W2_R_MAX;
 
+// ── S-1c: the flat cut descriptor a BLOCK-WINNING carrier carries (v0x02) ───
+// Everything a peer needs to credit its OWN OwedLedger with the SAME E_b the
+// winner credited, and nothing else. Consensus-relevant fields: bid, h_b,
+// cut_next_pos, cut_spine_digest, reward (they determine the credit and the
+// finalize bin). Diagnostic: owed_digest_at_win. Fail-closed: payout_emitted.
+// NEVER on this wire: incarnation / lane version (node-local), the payout map
+// (unbounded), any MMR peak (a receiver appends its own leaf, never a peak).
+struct CutDescriptor {
+    bytes32       bid{};                  // hex(bid) IS the OwedLedger key
+    std::uint64_t h_b = 0;                // the block's OWN height (D8)
+    std::uint64_t cut_next_pos = 0;       // P — the prefix the winner folded at
+    bytes32       cut_spine_digest{};     // LaneSnapshot::digest at P
+    std::uint64_t reward = 0;             // the winner's block_reward(H_b)
+    bool          payout_emitted = false; // winner's W5 assembly emitted outputs
+    bytes32       owed_digest_at_win{};   // VERIFY field (diagnostics, never consensus)
+    bool operator==(const CutDescriptor&) const = default;
+};
+
+// bid as the ledger key: a pure lowercase-hex codec over the 32 raw bytes, so
+// string -> bytes -> string is EXACT and carries no endianness question (the
+// daemon's bid is uint256::GetHex(), 64 hex chars, and that string — not any
+// re-ordered form of it — is what OwedLedger keys on).
+inline std::string cut_bid_hex(const bytes32& b) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(64);
+    for (std::uint8_t x : b) { s.push_back(kHex[x >> 4]); s.push_back(kHex[x & 0x0f]); }
+    return s;
+}
+// nullopt unless `hex` is exactly 64 lowercase/uppercase hex chars.
+inline std::optional<bytes32> cut_bid_bytes(const std::string& hex) {
+    if (hex.size() != 64) return std::nullopt;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    bytes32 b{};
+    for (int i = 0; i < 32; ++i) {
+        const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return std::nullopt;
+        b[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return b;
+}
+
+// ── ★★ DROPS-R3 (wire v0x03): the winner's COMPOSED DROPS CREDIT MAP ───────
+//
+// THE DEFECT IT CLOSES. The S-1c peer path re-folds E_b locally at the winner's
+// cut — correct, because E_b is a pure function of (reward, payout, identities)
+// and the peer holds all three. It then ADDED ITS OWN buried harvest. But a
+// raindrop is a below-target work event one node happened to see on its own
+// wire: two nodes observe DIFFERENT raindrop sets by construction. So the
+// moment harvesters are attached, two nodes credit DIFFERENT numbers for the
+// SAME peer win and their owed_digests part at the first block. Recompute is
+// not available here the way it is for a canonical coinbase: the peer never saw
+// the evidence.
+//
+// THE RULING (R3). The WINNER'S VIEW IS AUTHORITATIVE. The winner composes its
+// DROPS delta once, credits it to its own ledger, and puts that same map on the
+// wire; the peer folds the RECEIVED map and its own local harvest plays no part
+// in a peer win at all. The map is a DELTA, signed, in the SAME coin
+// denomination as E_b (DROPS-R1), keyed by canonical identity.
+//
+// `enrollment_digest` is the witness for R-SYBIL: the winner's ex-ante enrolment
+// book digest at the cut. It is diagnostic — a receiver cannot verify an
+// enrolment it was never told about — but it makes a divergent enrolment set
+// VISIBLE at the earliest moment instead of inferable from a bad number later.
+struct DropsCredit {
+    // (payee, composed delta). STRICTLY ASCENDING by payee on the wire, so the
+    // encoding of a given map is unique and a duplicate key is a decode reject
+    // rather than an ambiguous fold.
+    std::vector<std::pair<bytes32, long long>> credit;
+    bytes32 enrollment_digest{};      // winner's EnrollmentBook::book_digest()
+    bool operator==(const DropsCredit&) const = default;
+};
+
 // ── a carrier = ordinary share + 0..R_MAX receipts (spec §2.1) ──────────────
 struct Carrier {
     WorkEvent carrier;                 // the ordinary V37 share (advances clock)
     std::vector<WorkEvent> receipts;   // ref-protected payload, order-free
+    // S-1c (wire v0x02): set iff this carrier is ALSO a coin block winner. A
+    // v0x01 frame decodes to nullopt; a v0x02 frame with won_block == 0 also
+    // decodes to nullopt — the two are indistinguishable to every consumer
+    // above the codec, which is exactly the upgrade-window property we want.
+    std::optional<CutDescriptor> cut;
+    // DROPS-R3 (wire v0x03): the winner's composed DROPS credit map. Only ever
+    // set together with `cut` (a credit map without a cut names no settlement;
+    // decode rejects that shape). A v0x01/v0x02 frame decodes to nullopt, and so
+    // does a v0x03 frame with drops_present == 0 — again indistinguishable above
+    // the codec, so a DROPS-dormant fleet on the v0x03 wire pays exactly one
+    // extra byte per frame and changes nothing else.
+    std::optional<DropsCredit> drops;
 };
 
 // ── decode dispositions ─────────────────────────────────────────────────────
@@ -111,6 +289,16 @@ enum class WireStatus {
     REJECT_POLICY,            // W3-B5 frozen-wire policy (w3_wire_freeze.hpp):
                               // tag cap (F-1) / V37.0 descriptor validity (F-2)
                               // on the CARRIER; applied post-decode, pre-admit
+    REJECT_BAD_CUT,           // S-1c v0x02: won_block byte outside {0,1}, or the
+                              // payout_emitted byte outside {0,1} — a malformed
+                              // trailer is NEVER admitted (it would otherwise
+                              // credit a peer's ledger off a guessed cut)
+    REJECT_BAD_DROPS,         // DROPS-R3 v0x03: present byte outside {0,1}, an
+                              // entry count above W3_DROPS_MAX_ENTRIES, payees
+                              // not strictly ascending (duplicate or unordered),
+                              // or a credit map carried with NO cut descriptor.
+                              // Same rule as the cut: reject the frame whole,
+                              // never fold a partially-read credit map
 };
 
 // Why a single receipt was dropped at decode (carrier still stands, §2.4/WT-2).
@@ -137,15 +325,41 @@ struct DecodeResult {
 // ═══════════════════════════════════════════════════════════════════════════
 class CarrierWire {
 public:
+    // Emit at the build's CURRENT wire version (W3_WIRE_VERSION).
     static std::vector<std::uint8_t> encode(const Carrier& c) {
+        return encode_version(c, W3_WIRE_VERSION);
+    }
+
+    // Emit at an EXPLICIT version. This is the seam the byte freeze pins: the
+    // v0x01 goldens are re-run through encode_version(c, 0x01) and must stay
+    // byte-identical forever, while encode_version(c, 0x02) appends the S-1c
+    // trailer to the SAME v0x01 body. An unknown version, or a v0x01 request
+    // for a carrier that HAS a cut descriptor (v0x01 cannot express one — a
+    // silent drop would lose a peer's block credit), returns an EMPTY vector.
+    static std::vector<std::uint8_t> encode_version(const Carrier& c, std::uint8_t ver) {
         std::vector<std::uint8_t> b;
-        b.push_back(W3_WIRE_VERSION);
+        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2 &&
+            ver != W3_WIRE_VERSION_V3) return b;
+        if (ver == W3_WIRE_VERSION_V1 && c.cut.has_value()) return b;
+        // A version below v0x03 cannot express a DROPS credit map. Silently
+        // dropping it would relay a block-winner descriptor whose settlement the
+        // receiver would then compose from ITS OWN harvest — the exact
+        // divergence R3 removes — so the encoder refuses instead.
+        if (ver != W3_WIRE_VERSION_V3 && c.drops.has_value()) return b;
+        // A credit map with no cut names no settlement; refuse to encode it.
+        if (c.drops.has_value() && !c.cut.has_value()) return b;
+        if (c.drops.has_value() &&
+            c.drops->credit.size() > static_cast<std::size_t>(W3_DROPS_MAX_ENTRIES))
+            return b;
+        b.push_back(ver);
         put_event(b, c.carrier);
         // receipt_count is a single byte; R_MAX=4 fits trivially. Encoders never
         // emit > R_MAX (the emitter is bounded); a decoder that SEES > R_MAX
         // rejects the whole carrier (§2.3, WT-1).
         b.push_back(static_cast<std::uint8_t>(c.receipts.size()));
         for (const WorkEvent& r : c.receipts) put_event(b, r);
+        if (ver == W3_WIRE_VERSION_V2 || ver == W3_WIRE_VERSION_V3) put_cutdesc(b, c.cut);
+        if (ver == W3_WIRE_VERSION_V3) put_drops(b, c.drops);
         return b;
     }
 
@@ -159,12 +373,28 @@ public:
     //         on the carrier itself is fatal);
     //       * receipt mis-bound  => that receipt dropped, carrier STANDS
     //         (a mis-bound receipt is never a fork tool, and is never relayed on).
+    //
+    // decode() is the LIVE decoder: it accepts v0x03 only when W3_WIRE_V3_LIVE
+    // (the consensus flip). decode_frozen() is the codec seam over EVERY frozen
+    // layout {0x01, 0x02, 0x03}, what the byte freeze pins regardless of the flip.
     static DecodeResult decode(const std::vector<std::uint8_t>& b) {
+        return decode_at(b, W3_WIRE_V3_LIVE);
+    }
+    static DecodeResult decode_frozen(const std::vector<std::uint8_t>& b) {
+        return decode_at(b, /*accept_v3=*/true);
+    }
+    static DecodeResult decode_at(const std::vector<std::uint8_t>& b, bool accept_v3) {
         DecodeResult out;
         std::size_t p = 0;
         std::uint8_t ver = 0;
         if (!get_u8(b, p, ver)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
-        if (ver != W3_WIRE_VERSION) { out.status = WireStatus::REJECT_BAD_VERSION; return out; }
+        // F-5 multi-accept for the upgrade window: {0x01, 0x02} (+ 0x03 when
+        // accept_v3; the live decoder passes W3_WIRE_V3_LIVE).
+        if (ver != W3_WIRE_VERSION_V1 && ver != W3_WIRE_VERSION_V2 &&
+            !(accept_v3 && ver == W3_WIRE_VERSION_V3)) {
+            out.status = WireStatus::REJECT_BAD_VERSION;
+            return out;
+        }
 
         WorkEvent carrier;
         if (!get_event(b, p, carrier)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
@@ -180,6 +410,28 @@ public:
             if (!get_event(b, p, r)) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
             receipts.push_back(std::move(r));
         }
+        // (1b) S-1c v0x02 trailer. A malformed trailer is a HARD reject: the
+        // whole point of the descriptor is that a receiver credits its ledger at
+        // the winner's cut, so a frame whose cut cannot be read is never admitted
+        // (never "admit the share and drop the cut" — that is the divergence).
+        std::optional<CutDescriptor> cut;
+        if (ver == W3_WIRE_VERSION_V2 || ver == W3_WIRE_VERSION_V3) {
+            const WireStatus cs = get_cutdesc(b, p, cut);
+            if (cs != WireStatus::OK) { out.status = cs; return out; }
+        }
+        // (1c) DROPS-R3 v0x03 trailer. Same hard-reject rule as the cut: the
+        // whole point of the map is that a receiver credits its ledger with the
+        // WINNER'S composed delta, so a frame whose map cannot be read is never
+        // admitted, and a map with no cut to attach to is malformed.
+        std::optional<DropsCredit> drops;
+        if (ver == W3_WIRE_VERSION_V3) {
+            const WireStatus ds = get_drops(b, p, drops);
+            if (ds != WireStatus::OK) { out.status = ds; return out; }
+            if (drops.has_value() && !cut.has_value()) {
+                out.status = WireStatus::REJECT_BAD_DROPS;
+                return out;
+            }
+        }
         // Trailing bytes are a malformed frame (we consumed a fixed structure).
         if (p != b.size()) { out.status = WireStatus::REJECT_TRUNCATED; return out; }
 
@@ -190,6 +442,8 @@ public:
         }
         // (2b) per-receipt identity binding — drop the offender, carrier stands.
         out.carrier.carrier = std::move(carrier);
+        out.carrier.cut = std::move(cut);
+        out.carrier.drops = std::move(drops);
         for (WorkEvent& r : receipts) {
             if (!identity_bound(r)) {
                 out.dropped.emplace_back(r.tag, ReceiptWireDrop::MISBOUND_IDENTITY);
@@ -251,6 +505,84 @@ private:
         put_desc(b, e.descriptor);
         put_str(b, e.tag);   // local bookkeeping (NOT in preimage); carried so a
                              // round-trip is exact, never covered by PoW/consensus.
+    }
+
+    // ── S-1c v0x02 trailer codec ────────────────────────────────────────────
+    static void put_cutdesc(std::vector<std::uint8_t>& b,
+                            const std::optional<CutDescriptor>& c) {
+        if (!c) { put_u8(b, 0); return; }           // won_block = 0: ONE byte
+        put_u8(b, 1);
+        put_bytes32(b, c->bid);
+        put_u64(b, c->h_b);
+        put_u64(b, c->cut_next_pos);
+        put_bytes32(b, c->cut_spine_digest);
+        put_u64(b, c->reward);
+        put_u8(b, c->payout_emitted ? 1 : 0);
+        put_bytes32(b, c->owed_digest_at_win);
+    }
+    // ── DROPS-R3 v0x03 trailer codec ───────────────────────────────────────
+    //   u8   present                     (0 => ONE byte and nothing else)
+    //   u16  entry_count                 (<= W3_DROPS_MAX_ENTRIES)
+    //   entry_count x { bytes32 payee ; u64 credit (two's-complement i64, LE) }
+    //   bytes32 enrollment_digest
+    static void put_drops(std::vector<std::uint8_t>& b,
+                          const std::optional<DropsCredit>& d) {
+        if (!d) { put_u8(b, 0); return; }           // absent: ONE byte
+        put_u8(b, 1);
+        put_u16(b, static_cast<std::uint16_t>(d->credit.size()));
+        for (const auto& [payee, amt] : d->credit) {
+            put_bytes32(b, payee);
+            put_u64(b, static_cast<std::uint64_t>(amt));   // two's complement
+        }
+        put_bytes32(b, d->enrollment_digest);
+    }
+    static WireStatus get_drops(const std::vector<std::uint8_t>& b, std::size_t& p,
+                                std::optional<DropsCredit>& out) {
+        std::uint8_t present = 0;
+        if (!get_u8(b, p, present)) return WireStatus::REJECT_TRUNCATED;
+        if (present == 0) { out.reset(); return WireStatus::OK; }
+        if (present != 1) return WireStatus::REJECT_BAD_DROPS;   // not a boolean
+        std::uint16_t n = 0;
+        if (!get_u16(b, p, n)) return WireStatus::REJECT_TRUNCATED;
+        if (n > W3_DROPS_MAX_ENTRIES) return WireStatus::REJECT_BAD_DROPS;
+        DropsCredit d;
+        d.credit.reserve(n);
+        bytes32 prev{};
+        for (std::uint16_t i = 0; i < n; ++i) {
+            bytes32 payee{};
+            std::uint64_t bits = 0;
+            if (!get_bytes32(b, p, payee)) return WireStatus::REJECT_TRUNCATED;
+            if (!get_u64(b, p, bits))      return WireStatus::REJECT_TRUNCATED;
+            // STRICTLY ascending: a duplicate or unordered key would make the
+            // fold depend on decode order, which is a fork surface, not a taste.
+            if (i > 0 && !(prev < payee)) return WireStatus::REJECT_BAD_DROPS;
+            prev = payee;
+            d.credit.emplace_back(payee, static_cast<long long>(bits));
+        }
+        if (!get_bytes32(b, p, d.enrollment_digest)) return WireStatus::REJECT_TRUNCATED;
+        out = std::move(d);
+        return WireStatus::OK;
+    }
+
+    static WireStatus get_cutdesc(const std::vector<std::uint8_t>& b, std::size_t& p,
+                                  std::optional<CutDescriptor>& out) {
+        std::uint8_t won = 0;
+        if (!get_u8(b, p, won)) return WireStatus::REJECT_TRUNCATED;
+        if (won == 0) { out.reset(); return WireStatus::OK; }
+        if (won != 1) return WireStatus::REJECT_BAD_CUT;   // not a boolean
+        CutDescriptor c;
+        std::uint8_t pe = 0;
+        if (!get_bytes32(b, p, c.bid))              return WireStatus::REJECT_TRUNCATED;
+        if (!get_u64(b, p, c.h_b))                  return WireStatus::REJECT_TRUNCATED;
+        if (!get_u64(b, p, c.cut_next_pos))         return WireStatus::REJECT_TRUNCATED;
+        if (!get_bytes32(b, p, c.cut_spine_digest)) return WireStatus::REJECT_TRUNCATED;
+        if (!get_u64(b, p, c.reward))               return WireStatus::REJECT_TRUNCATED;
+        if (!get_u8(b, p, pe))                      return WireStatus::REJECT_TRUNCATED;
+        if (pe > 1) return WireStatus::REJECT_BAD_CUT;     // not a boolean
+        if (!get_bytes32(b, p, c.owed_digest_at_win)) return WireStatus::REJECT_TRUNCATED;
+        c.payout_emitted = (pe == 1);
+        out = c;
+        return WireStatus::OK;
     }
 
     static bool get_u8(const std::vector<std::uint8_t>& b, std::size_t& p, std::uint8_t& v) {
@@ -382,8 +714,11 @@ struct CarrierBloatStats {
         std::size_t n = c.receipts.size();
         if (n <= W3_R_MAX) ++receipt_count_hist[n];
         carrier_body_bytes += whole_frame.size();
-        // receipt-only bytes = whole frame - (version + carrier + count) prefix.
-        Carrier bare; bare.carrier = c.carrier;
+        // receipt-only bytes = whole frame - (version + carrier + count [+ the
+        // S-1c v0x02 trailer]) prefix. The bare frame carries the SAME cut so
+        // the subtraction isolates the receipts and never charges a block
+        // winner's 122-byte descriptor to receipt bloat.
+        Carrier bare; bare.carrier = c.carrier; bare.cut = c.cut;
         receipt_payload_bytes +=
             whole_frame.size() - CarrierWire::encode(bare).size();
     }
@@ -428,6 +763,103 @@ struct ICarrierTransport {
     // the share stays in-chain and un-marked, retried later, NEVER dropped).
     virtual std::size_t broadcast(const std::vector<std::uint8_t>& frame) = 0;
     virtual std::size_t n_peers() const = 0;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CARRIER RE-OFFER (missed-record recovery) — NETWORK DELIVERY ONLY.
+//
+// THE DEFECT IT CLOSES. do_broadcast() is the ONLY place a carrier leaves this
+// node, and its result is a COUNT: how many peers took the frame. A count of 0
+// (no peer connected at that instant) or a short count (a peer that had just
+// dropped) was reported to the caller and then forgotten — handle_local()/
+// append_block_winner() had already marked the carrier in RelaySeenSet, so it
+// was never re-sent, and carrier_send.hpp only COUNTED the miss
+// (CarrierSendStats::deferred_relay). A peer that was down for one second
+// therefore never learned about that carrier at all. That is a DELIVERY bug,
+// not a protocol one: the bytes were built, frozen and correct, they just never
+// reached a socket.
+//
+// THE FIX. Every frame do_broadcast() puts on the wire is ALSO kept, verbatim,
+// in a small bounded buffer. A sweep re-sends buffered frames:
+//   * on a PERIODIC tick — only entries that under-delivered (reached < peers),
+//     i.e. the DEFER case, until they reach the whole peer set;
+//   * on a FORCED tick — armed by note_peer_connected() when a peer (re)connects
+//     (bind CarrierPeerNode::set_on_peer_connect); then EVERY buffered entry is
+//     eligible, because the new peer has seen none of them.
+// The bytes re-sent are the SAME bytes (the stored frame, never a re-encode),
+// so a re-offer cannot drift from the frozen v0x01 wire.
+//
+// WHY THIS IS NOT CONSENSUS, AND CANNOT DOUBLE-COUNT. A re-offer is a duplicate
+// frame, and a duplicate frame is exactly what W2 already refuses: the receiving
+// node decodes it, ReceiptAdmitter::admit() finds the carrier hash in its
+// DedupWindow and returns CarrierStatus::REJECT_DEDUP — ZERO EmittedPush, no
+// LaneRecord::push, no lane position, no digest movement (w2_admission.hpp
+// §"a replayed carrier is not re-credited"). The receiver's own RelaySeenSet
+// then suppresses any onward amplification. Credit-once is W2's invariant; this
+// layer only re-attempts DELIVERY of bytes W2 will judge exactly once.
+//
+// ★ THE HORIZON BOUND IS THE SAFETY PROPERTY. W2's dedup window is finite —
+// W2_DEDUP_RETENTION = W2_N_CTX + 2 = 4 bins, pruned on clock advance. A carrier
+// re-offered AFTER the receiver pruned its hash would NOT hit REJECT_DEDUP and
+// WOULD be credited a second time. So retention here must stay strictly inside
+// that horizon, and it does, three ways:
+//   (1) max_age — a wall-clock cap (default 60 s). Four bins is 4 min on the
+//       fastest supported chain (DOGE, 1 min/bin), 10 min on DASH/LTC, 40 min on
+//       BTC; 60 s is inside every one of them by a wide margin.
+//   (2) max_attempts — an entry is dropped after a fixed number of re-offers.
+//   (3) dedup_probe (optional, exact) — bind it to the node's OWN admission
+//       window (ReceiptAdmitter::window().contains(h)); when our window has
+//       already pruned the carrier, the entry is dropped unconditionally.
+// Memory is bounded independently by max_entries AND max_bytes (FIFO eviction).
+//
+// ── ★ STAGE 1 SUPPLY: THE RE-OFFER IS NOW A SUB-VIEW OF THE FRAME VAULT ────
+// The bytes themselves no longer live here. CarrierRelay owns ONE FrameVault
+// (frame_vault.hpp): one bounded store of verbatim CarrierWire frames, indexed
+// BY LANE POSITION and BY CARRIER HASH, retained back to the lane WINDOW
+// horizon (W, default 8640 positions) so a peer can be served an ordered prefix
+// [a, P). The re-offer keeps exactly the policy described above, but as a
+// SHALLOW RECENT SUB-VIEW over that store: a deque of SLOT references with the
+// re-offer's own (much tighter) entry / byte / age / attempt bounds. Every
+// CarrierReofferOptions field keeps its meaning and every re-offer counter keeps
+// its meaning; what changed is that the frame is stored ONCE, and that retiring
+// a carrier from the re-offer no longer throws its bytes away.
+//
+// ★ AND THAT IS THE FLAP-SAFETY PROPERTY. Before, `max_attempts` ERASED the
+// entry: a peer that connected and dropped repeatedly armed forced sweep after
+// forced sweep, burned every buffered entry's attempt budget, and DELETED the
+// only retained copy of carriers a different, well-behaved peer still needed.
+// Now the attempt cap retires a carrier from the SUB-VIEW only; its bytes stay
+// in the vault under the vault's own bounds. A flapping peer can no longer
+// evict another peer's entries — it can only exhaust its own re-offers.
+// The vault is written ONLY by our own admissions and our own broadcasts; a
+// peer cannot insert into it at all, so no peer can push another peer's bytes
+// out by volume either.
+// ═══════════════════════════════════════════════════════════════════════════
+struct CarrierReofferOptions {
+    bool        enabled       = true;
+    std::size_t max_entries   = 256;          // FIFO cap on buffered carriers
+    std::size_t max_bytes     = 4u << 20;     // FIFO cap on buffered bytes (4 MiB)
+    std::size_t max_per_sweep = 32;           // bounded work per sweep
+    unsigned    max_attempts  = 4;            // per-entry re-offer cap
+    std::chrono::milliseconds max_age{60000};           // << W2 dedup horizon
+    std::chrono::milliseconds min_interval{15000};      // periodic rate limit
+    std::chrono::milliseconds min_forced_interval{1000};// (re)connect rate limit
+};
+
+// Diagnostics only — never a digest leaf, never consensus (same standing as
+// CarrierBloatStats). Kept in its own struct so the bloat hook's fields, which
+// the BM-2 measurements read, keep their existing meaning.
+struct CarrierReofferStats {
+    std::uint64_t buffered         = 0;   // frames entered into the buffer
+    std::uint64_t refreshed        = 0;   // re-broadcast of a frame already buffered
+    std::uint64_t evicted_capacity = 0;   // dropped: entry / byte cap
+    std::uint64_t expired_age      = 0;   // dropped: past the re-offer horizon
+    std::uint64_t expired_window   = 0;   // dropped: dedup probe says it is pruned
+    std::uint64_t exhausted        = 0;   // dropped: attempt cap
+    std::uint64_t sweeps           = 0;
+    std::uint64_t sweeps_skipped   = 0;   // rate-limited or nothing to offer to
+    std::uint64_t frames_reoffered = 0;
+    std::uint64_t bytes_reoffered  = 0;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -476,6 +908,129 @@ public:
     CarrierBloatStats& stats() { return m_stats; }
     RelaySeenSet& seen() { return m_seen; }
 
+    // ── carrier re-offer (see §CARRIER RE-OFFER above) ──────────────────────
+    // Configuration + the two triggers. All of it is delivery-side bookkeeping:
+    // nothing here can append, credit, or move a digest.
+    void set_reoffer_options(const CarrierReofferOptions& o) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_reoffer_opt = o;
+        if (!o.enabled) { m_reoffer.clear(); m_reoffer_bytes = 0; return; }
+        while (!m_reoffer.empty() &&
+               (m_reoffer.size() > m_reoffer_opt.max_entries ||
+                m_reoffer_bytes > m_reoffer_opt.max_bytes)) {
+            ++m_reoffer_stats.evicted_capacity;
+            erase_reoffer(m_reoffer.begin());
+        }
+    }
+    CarrierReofferOptions reoffer_options() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer_opt;
+    }
+    CarrierReofferStats reoffer_stats() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer_stats;
+    }
+    std::size_t reoffer_pending() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer.size();
+    }
+    std::size_t reoffer_bytes() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_reoffer_bytes;
+    }
+    // EXACT horizon probe (optional): bind to the node's own admission window,
+    // e.g. [&adm](const bytes32& h){ return adm.window().contains(h); }. An
+    // entry our own W2 window has already pruned is dropped instead of being
+    // re-offered — the one thing that could turn a re-offer into a re-credit.
+    void set_reoffer_dedup_probe(std::function<bool(const bytes32&)> p) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_reoffer_probe = std::move(p);
+    }
+
+    // ── ★ the FRAME VAULT (Stage 1 supply) ──────────────────────────────────
+    // The one bounded store of verbatim carrier frames, indexed by lane
+    // POSITION and by carrier HASH. Exposed so the repair channel
+    // (carrier_supply.hpp SupplyService) can SERVE an ordered prefix and a
+    // bounded id set out of it WITHOUT taking the relay mutex: FrameVault is
+    // self-synchronizing and is always a leaf in the lock order.
+    //
+    // Nothing on this reference can admit, append, credit or fold. Handing a
+    // peer a frame out of it is byte-for-byte the same act as broadcasting that
+    // frame, and the receiver judges it exactly once through its own W2
+    // DedupWindow.
+    FrameVault& vault() { return m_vault; }
+    const FrameVault& vault() const { return m_vault; }
+    void set_vault_options(const FrameVaultOptions& o) { m_vault.set_options(o); }
+    FrameVaultOptions vault_options() const { return m_vault.options(); }
+    FrameVaultStats vault_stats() const { return m_vault.stats(); }
+
+    // A peer (re)connected: ARM a forced sweep. O(1), lock-free, safe to call
+    // from CarrierPeerNode's accept thread (it must NOT do the sweep itself —
+    // that would run a flood on the accept loop and invert the relay/transport
+    // lock order). The work happens on the next reoffer_tick().
+    void note_peer_connected() { m_reoffer_forced.store(true); }
+
+    // Run one bounded, rate-limited sweep. Returns the number of frames put
+    // back on the wire. Driven by the send-side worker's idle tick
+    // (carrier_send.hpp Options::reoffer_tick_interval) or by any daemon timer.
+    std::size_t reoffer_tick() {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        const bool forced = m_reoffer_forced.exchange(false);
+        if (!m_reoffer_opt.enabled) return 0;
+        const Clock::time_point now = Clock::now();
+        prune_reoffer(now);
+        if (m_reoffer.empty()) return 0;
+        const auto gap = forced ? m_reoffer_opt.min_forced_interval
+                                : m_reoffer_opt.min_interval;
+        if (m_last_sweep != Clock::time_point{} && now - m_last_sweep < gap) {
+            ++m_reoffer_stats.sweeps_skipped;
+            if (forced) m_reoffer_forced.store(true);   // keep the request alive
+            return 0;
+        }
+        const std::size_t np = m_transport.n_peers();
+        if (np == 0) {                                  // nobody to offer to
+            ++m_reoffer_stats.sweeps_skipped;
+            if (forced) m_reoffer_forced.store(true);
+            return 0;
+        }
+        m_last_sweep = now;
+        ++m_reoffer_stats.sweeps;
+        std::size_t sent = 0;
+        for (auto it = m_reoffer.begin();
+             it != m_reoffer.end() && sent < m_reoffer_opt.max_per_sweep; ) {
+            // A periodic sweep re-offers only what under-delivered; a forced one
+            // (a peer just joined) re-offers everything still inside the horizon.
+            if (!forced && !it->under_delivered) { ++it; continue; }
+            // The bytes live in the vault, once. A slot the vault has since
+            // evicted (or reused for a different carrier) simply leaves the
+            // sub-view — never a re-encode, so a re-offer can never drift from
+            // the frozen wire.
+            auto frame = m_vault.frame_at(it->slot, it->hash);
+            if (!frame) {
+                ++m_reoffer_stats.evicted_capacity;
+                it = erase_reoffer(it);
+                continue;
+            }
+            const std::size_t reached = m_transport.broadcast(*frame);
+            ++it->attempts;
+            ++sent;
+            ++m_reoffer_stats.frames_reoffered;
+            m_reoffer_stats.bytes_reoffered += frame->size();
+            m_stats.observe_sent(frame->size(), reached ? reached : np);
+            if (reached >= np) it->under_delivered = false;
+            if (it->attempts >= m_reoffer_opt.max_attempts) {
+                // ★ FLAP SAFETY: retire from the SUB-VIEW only. The frame stays
+                // in the vault under the vault's own bounds, so a peer that
+                // flaps cannot delete bytes another peer still needs.
+                ++m_reoffer_stats.exhausted;
+                it = erase_reoffer(it);
+            } else {
+                ++it;
+            }
+        }
+        return sent;
+    }
+
     struct Outcome {
         WireStatus wire = WireStatus::OK;
         ReceiptAdmitter::Result admission;   // valid iff wire==OK
@@ -483,6 +1038,19 @@ public:
         bool relayed = false;                // re-broadcast onward
         std::size_t peers_reached = 0;
         std::vector<std::pair<std::string, ReceiptWireDrop>> wire_dropped;
+        // S-1c: the v0x02 cut descriptor this frame carried, surfaced so the
+        // daemon's inbound seam can drive its OWN settlement at the winner's cut
+        // WITHOUT decoding the frame a second time. Valid iff wire == OK; set
+        // only for a BLOCK-WINNING carrier (nullopt for every share and for
+        // every v0x01 frame). The relay itself does nothing with it — routing
+        // settlement is the daemon's job, not the relay's (§1.2, O1).
+        std::optional<CutDescriptor> cut;
+        // DROPS-R3: the v0x03 composed credit map the SAME frame carried,
+        // surfaced beside the cut for exactly the same reason. Valid iff
+        // wire == OK; nullopt for every share, every pre-v0x03 frame, and every
+        // winner that had no DROPS to name (which folds as empty and still
+        // converges, because that winner credited none either).
+        std::optional<DropsCredit> drops;
     };
 
     // ── inbound (peer -> us), spec §3.2 ─────────────────────────────────────
@@ -494,11 +1062,13 @@ public:
         DecodeResult dr = CarrierWire::decode(frame);
         o.wire = dr.status;
         o.wire_dropped = dr.dropped;
-        if (!dr.ok()) return o;                 // malformed / R_MAX / carrier unbound
+        if (!dr.ok()) return o;                 // malformed / R_MAX / carrier unbound / bad cut
         if (m_policy && !m_policy(dr.carrier)) {   // W3-B5 policy (tag cap / desc validity)
             o.wire = WireStatus::REJECT_POLICY;
             return o;
         }
+        o.cut = dr.carrier.cut;                 // S-1c: surfaced for the daemon's settlement seam
+        o.drops = dr.carrier.drops;             // DROPS-R3: the winner's composed credit map
 
         bool novel_to_relay = !m_seen.seen(dr.carrier.carrier.hash());
         m_stats.observe_received(!novel_to_relay);
@@ -507,15 +1077,25 @@ public:
         // W2's own window is the authority on credit-once.
         o.admission = m_admit(dr.carrier.carrier, dr.carrier.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
-        if (o.admitted) m_stats.observe_accepted(re_encode(dr.carrier), dr.carrier);
-
-        // Relay onward only if novel to the relay layer (flood-fill dedup, §5.2).
-        // We re-encode the CLEANED carrier so a mis-bound receipt dropped at
-        // decode is never amplified onto the network.
-        if (novel_to_relay && o.admitted) {
-            m_seen.mark_and_test(dr.carrier.carrier.hash());
-            o.peers_reached = do_broadcast(dr.carrier);
-            o.relayed = o.peers_reached > 0;
+        if (o.admitted) {
+            // The CLEANED re-encode, computed ONCE and reused for the bloat
+            // accounting, the vault and the broadcast: a mis-bound receipt
+            // dropped at decode is never amplified onto the network, and never
+            // retained for supply either.
+            const std::vector<std::uint8_t> frame = re_encode(dr.carrier);
+            m_stats.observe_accepted(frame, dr.carrier);
+            // ★ Stage 1 supply: retain the exact bytes AND the (chain, position)
+            // -> carrier-hash row. This happens on EVERY admitted carrier, not
+            // only the ones we go on to broadcast — an inbound carrier the relay
+            // layer has already seen still occupies a lane position and still
+            // has to be servable.
+            vault_admit(dr.carrier.carrier, o.admission, frame);
+            // Relay onward only if novel to the relay layer (flood-fill dedup, §5.2).
+            if (novel_to_relay) {
+                m_seen.mark_and_test(dr.carrier.carrier.hash());
+                o.peers_reached = do_broadcast(dr.carrier.carrier, frame);
+                o.relayed = o.peers_reached > 0;
+            }
         }
         return o;
     }
@@ -526,12 +1106,18 @@ public:
         std::lock_guard<std::mutex> lk(m_mtx);
         Outcome o;
         o.wire = WireStatus::OK;
+        o.cut = c.cut;
+        o.drops = c.drops;
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
-        if (o.admitted) m_stats.observe_accepted(re_encode(c), c);
-        if (o.admitted && m_seen.mark_and_test(c.carrier.hash())) {
-            o.peers_reached = do_broadcast(c);
-            o.relayed = o.peers_reached > 0;
+        if (o.admitted) {
+            const std::vector<std::uint8_t> frame = re_encode(c);
+            m_stats.observe_accepted(frame, c);
+            vault_admit(c.carrier, o.admission, frame);   // ★ Stage 1 supply
+            if (m_seen.mark_and_test(c.carrier.hash())) {
+                o.peers_reached = do_broadcast(c.carrier, frame);
+                o.relayed = o.peers_reached > 0;
+            }
         }
         return o;
     }
@@ -551,13 +1137,19 @@ public:
         std::lock_guard<std::mutex> lk(m_mtx);
         Outcome o;
         o.wire = WireStatus::OK;
+        o.cut = c.cut;
+        o.drops = c.drops;
         // Unconditional append: no m_seen check, no backpressure gate.
         o.admission = m_admit(c.carrier, c.receipts);
         o.admitted = (o.admission.carrier_status == CarrierStatus::OK);
-        if (o.admitted) m_stats.observe_accepted(re_encode(c), c);
+        std::vector<std::uint8_t> frame = re_encode(c);
+        if (o.admitted) {
+            m_stats.observe_accepted(frame, c);
+            vault_admit(c.carrier, o.admission, frame);   // ★ Stage 1 supply
+        }
         // Relay is best-effort and may defer; append already stands.
         m_seen.mark_and_test(c.carrier.hash());
-        o.peers_reached = do_broadcast(c);
+        o.peers_reached = do_broadcast(c.carrier, frame);
         o.relayed = o.peers_reached > 0;
         return o;
     }
@@ -566,12 +1158,116 @@ private:
     std::vector<std::uint8_t> re_encode(const Carrier& c) const {
         return CarrierWire::encode(c);
     }
-    std::size_t do_broadcast(const Carrier& c) {
-        std::vector<std::uint8_t> frame = CarrierWire::encode(c);
+
+    // ★ Stage 1 supply: retain the carrier's exact frame AND the lane position
+    // its first push landed at. EmittedPush::pos is the carrier ARRIVAL position
+    // (w2_admission.hpp §4.4); a carrier with k accepted receipts occupies
+    // [pos, pos + 1 + k). This is the (chain, pos) -> carrier-hash row that
+    // exists NOWHERE ELSE in the tree — L0Slot, LaneRecord::Push, LaneSnapshot
+    // and SettlementView all carry no hash.
+    void vault_admit(const WorkEvent& carrier, const ReceiptAdmitter::Result& r,
+                     const std::vector<std::uint8_t>& frame) {
+        const std::uint64_t pos =
+            r.pushes.empty() ? FrameVault::kNoPos : r.pushes.front().pos;
+        m_vault.insert(carrier.chain_id, carrier.hash(), pos,
+                       static_cast<std::uint32_t>(r.pushes.size()), frame);
+    }
+
+    std::size_t do_broadcast(const WorkEvent& carrier,
+                             const std::vector<std::uint8_t>& frame) {
         std::size_t np = m_transport.n_peers();
         std::size_t reached = m_transport.broadcast(frame);
         m_stats.observe_sent(frame.size(), reached ? reached : np);
+        // Keep the EXACT bytes for a bounded re-offer. `under_delivered` records
+        // the DEFER case (0 peers, or a peer that dropped mid-flood) so a
+        // periodic sweep can finish the job without re-flooding what already
+        // landed everywhere. The bytes go to the VAULT (once); the re-offer
+        // holds a slot reference under its own, much tighter bounds. A frame we
+        // broadcast without admitting (the block-winner path) is retained
+        // hash-only — no lane position to record.
+        buffer_for_reoffer(carrier.chain_id, carrier.hash(), frame,
+                           reached < np || np == 0);
         return reached;
+    }
+
+    // ── re-offer sub-view internals (all under m_mtx) ───────────────────────
+    // A SLOT reference into the vault plus the re-offer's own policy state. The
+    // frame itself is NOT duplicated here.
+    using Clock = std::chrono::steady_clock;
+    struct ReofferRef {
+        bytes32           hash{};
+        std::uint64_t     slot = 0;
+        std::size_t       nbytes = 0;      // for the sub-view's own byte cap
+        Clock::time_point at{};
+        unsigned          attempts = 0;
+        bool              under_delivered = false;
+    };
+
+    std::deque<ReofferRef>::iterator erase_reoffer(std::deque<ReofferRef>::iterator it) {
+        m_reoffer_bytes -= it->nbytes;
+        return m_reoffer.erase(it);
+    }
+
+    // FIFO eviction down to the entry AND byte caps, leaving room for `incoming`.
+    void trim_reoffer_to_capacity(std::size_t incoming) {
+        while (!m_reoffer.empty() &&
+               (m_reoffer.size() + 1 > m_reoffer_opt.max_entries ||
+                m_reoffer_bytes + incoming > m_reoffer_opt.max_bytes)) {
+            ++m_reoffer_stats.evicted_capacity;
+            erase_reoffer(m_reoffer.begin());
+        }
+    }
+
+    // Drop everything that may no longer be covered by the receivers' W2 dedup
+    // window (the double-credit hazard) — by age, and exactly by probe.
+    void prune_reoffer(Clock::time_point now) {
+        for (auto it = m_reoffer.begin(); it != m_reoffer.end(); ) {
+            if (now - it->at >= m_reoffer_opt.max_age) {
+                ++m_reoffer_stats.expired_age;
+                it = erase_reoffer(it);
+            } else if (m_reoffer_probe && !m_reoffer_probe(it->hash)) {
+                ++m_reoffer_stats.expired_window;
+                it = erase_reoffer(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void buffer_for_reoffer(std::uint32_t chain, const bytes32& h,
+                            const std::vector<std::uint8_t>& frame,
+                            bool under_delivered) {
+        if (!m_reoffer_opt.enabled) return;
+        if (frame.size() > m_reoffer_opt.max_bytes) return;   // never bufferable
+        const Clock::time_point now = Clock::now();
+        prune_reoffer(now);
+        for (auto& e : m_reoffer) {                            // already held?
+            if (e.hash == h) {
+                e.at = now;
+                e.attempts = 0;
+                e.under_delivered = e.under_delivered || under_delivered;
+                ++m_reoffer_stats.refreshed;
+                return;
+            }
+        }
+        trim_reoffer_to_capacity(frame.size());
+        if (m_reoffer.size() + 1 > m_reoffer_opt.max_entries ||
+            m_reoffer_bytes + frame.size() > m_reoffer_opt.max_bytes)
+            return;                                            // cannot fit: drop
+        // Store the bytes ONCE, in the vault. A carrier admitted here already
+        // has a row (with its lane position); this is an idempotent refresh for
+        // it, and the only insert for a frame we broadcast without admitting.
+        auto slot = m_vault.insert(chain, h, FrameVault::kNoPos, 0, frame, now);
+        if (!slot) return;                                     // vault refused it
+        ReofferRef e;
+        e.hash = h;
+        e.slot = *slot;
+        e.nbytes = frame.size();
+        e.at = now;
+        e.under_delivered = under_delivered;
+        m_reoffer_bytes += e.nbytes;
+        m_reoffer.push_back(e);
+        ++m_reoffer_stats.buffered;
     }
 
     AdmitFn m_admit;
@@ -580,6 +1276,21 @@ private:
     mutable std::mutex m_mtx;    // serializes the three public handlers (see THREADING)
     RelaySeenSet m_seen;
     CarrierBloatStats m_stats;
+
+    // ★ the ONE bounded frame store (Stage 1 supply). Self-synchronizing and a
+    // leaf in the lock order, so the repair channel can serve from it without
+    // ever taking m_mtx. Written only by our own admissions / broadcasts.
+    FrameVault                       m_vault;
+
+    // re-offer state (delivery only; never consensus) — a SHALLOW SUB-VIEW of
+    // m_vault: slot references plus the re-offer's own tighter bounds.
+    CarrierReofferOptions            m_reoffer_opt{};
+    CarrierReofferStats              m_reoffer_stats{};
+    std::deque<ReofferRef>           m_reoffer;
+    std::size_t                      m_reoffer_bytes = 0;
+    Clock::time_point                m_last_sweep{};
+    std::atomic<bool>                m_reoffer_forced{false};
+    std::function<bool(const bytes32&)> m_reoffer_probe;
 };
 
 } // namespace c2pool::v37n

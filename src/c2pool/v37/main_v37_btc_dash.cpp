@@ -66,6 +66,29 @@
 //        FOUND carries empty credit/payout and owed_digest stays the empty digest
 //        — the bring-up proves SEQUENCING (found→bury→FINALIZE→orphan→recover),
 //        not settlement. Stated in the runbook.
+//   ★ S-1c (WIRED HERE, this PR) — CROSS-NODE owed_digest CONVERGENCE. S-1
+//        made the node that MINED a block credit E_b; its PEERS still knew
+//        nothing about the block, so two nodes on the byte-identical carrier
+//        stream committed to DIFFERENT owed ledgers (the winner non-empty, every
+//        peer at the b4db1ded… anchor) — a settlement fork. Now:
+//          SEND    submit_fn leaves the fold's OWN cut in a one-slot hand-off
+//                  (last_own_win); mint_solved_share(won_block=true) fires a few
+//                  microseconds later on the SAME stratum thread and attaches it
+//                  as the carrier wire v0x02 FLAT CUT DESCRIPTOR {won_block, bid,
+//                  H_b, P, spine_digest@P, reward, payout_emitted,
+//                  owed_digest_at_win}.
+//          RECEIVE the carrier_net->set_inbound o.admitted arm reads that
+//                  descriptor off the frame and drives XbtcNode::on_peer_block_won
+//                  -> settle::fold_eb AT THE CARRIED PREFIX (never at our tip,
+//                  which already includes this very carrier) -> the EXISTING
+//                  on_block_found; our own height-watch then finalizes it at the
+//                  SAME bin_height (H_b + d_conf) the winner uses.
+//        Guards: the winner never re-drives its own block (own_wins set + the
+//        ledger's per-bid idempotency + W2's REJECT_DEDUP on the flood echo), and
+//        every shape we cannot reproduce exactly is REFUSED and counted, never
+//        half-credited. FLAG DAY: this build emits wire v0x02 and accepts
+//        {v0x01, v0x02}; a v0x01-only peer rejects our frames (loudly logged at
+//        boot) rather than silently stripping a cut descriptor mid-flood.
 //   S-3  Tri-state canonicality IN the F1 driver (Canon-returning CanonicalFn at
 //        btc_finalize_driver.hpp:84, "stop stepping on Unknown" at :165) instead
 //        of the backend's throw-after-patience. 10-line driver change.
@@ -110,6 +133,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -141,9 +165,12 @@
 #include <c2pool/v37/carrier_ingest.hpp>              // CarrierIngest, MemShareTracker
 #include <c2pool/v37/carrier_index.hpp>               // LiveMainchainIndex / SyntheticMainchainIndex (A2 step-b real index)
 #include <c2pool/v37/carrier_net.hpp>                 // CarrierPeerNode (ICarrierTransport over sockets)
+#include <c2pool/v37/carrier_repair.hpp>              // ★ Stage 2 APPLY: RepairDriver, FrameVaultChainReader, replay_to_cut
+#include <c2pool/v37/carrier_supply.hpp>              // Stage 1 SUPPLY: SupplyService (serve) + SupplyRequester (fetch)
 #include <c2pool/v37/carrier_send.hpp>                // CarrierSendQueue (A2 send-side: own stratum wins -> carriers, off the hot path)
 #include <c2pool/v37/w3_relay.hpp>                    // CarrierRelay
 #include <c2pool/v37/w3_wire_freeze.hpp>              // W3-B5 freeze: boot selfcheck + relay policy gate
+#include <c2pool/v37/v37_drops_wiring.hpp>            // ★ DROPS Step 2: DropsWiring, make_drops_wiring
 
 namespace io = boost::asio;
 using namespace c2pool::v37n::btc;
@@ -160,11 +187,32 @@ static std::string hex32(const ::v37::bytes32& b) {
     return s;
 }
 
+// A 64-hex payout IDENTITY KEY -> bytes32. Strict: exactly 64 hex characters,
+// nothing else. Used ONLY by --drops-enrol; a malformed value is refused and
+// named rather than silently enrolling a zero key.
+static bool parse_identity_hex(const std::string& h, ::v37::bytes32& out) {
+    if (h.size() != 64) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < 32; ++i) {
+        const int hi = nib(h[2 * i]), lo = nib(h[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
 static void usage() {
     std::printf(
-        "c2pool-v37-btc-dash (EXPERIMENTAL; DASH regtest/devnet ONLY; do not run in production)\n"
-        "  --network regtest|devnet|mainnet   (default regtest; mainnet REFUSED without --i-understand-mainnet)\n"
-        "  --daemon-rpc HOST:PORT             (default 127.0.0.1:19898 — Dash Core REGTEST rpc port)\n"
+        "c2pool-v37-btc-dash (EXPERIMENTAL; DASH regtest/devnet/testnet ONLY; do not run in production)\n"
+        "  --network regtest|devnet|testnet|mainnet\n"
+        "                                     (default regtest; mainnet REFUSED without --i-understand-mainnet)\n"
+        "  --daemon-rpc HOST:PORT             (default 127.0.0.1:19898 — Dash Core REGTEST rpc port;\n"
+        "                                     127.0.0.1:19998 under --network testnet unless given here)\n"
         "  --coin-rpc-auth PATH               dash.conf-style file with rpcuser/rpcpassword (default ~/.dashcore/dash.conf)\n"
         "  --stratum-bind HOST:PORT           (default 127.0.0.1:3032)\n"
         "  --settle-db PATH                   (default ./v37data/dash/<net>/v37_settle_db)\n"
@@ -180,6 +228,9 @@ static void usage() {
         "                                     peers' carriers account\n"
         "  --carrier-index-horizon N          live index: reject carriers keyed further than N blocks behind the tip (default 64)\n"
         "  --carrier-index-patience-ms N      live index: bounded retry budget while dashd answers Unknown (default 2000)\n"
+        "  --drops-enrol HEX64                ★ DROPS: enrol this 64-hex payout identity as a DROPS participant,\n"
+        "                                     EX ANTE, at the CHAIN TIP bin, effective from tip+1 (repeatable).\n"
+        "                                     Inert unless this build took V37_ACTIVATE_CONSENSUS_V1\n"
         "  --i-understand-mainnet             loud mainnet opt-in (HARD SAFETY 4)\n");
 }
 
@@ -190,10 +241,12 @@ int main(int argc, char** argv) {
     cfg.network = BtcNetwork::Regtest;
     std::string rpc_hostport = "127.0.0.1:19898";   // S-6: btc_node_config.hpp:87 says 19998 = Dash Core TESTNET;
                                                     // regtest rpc is 19898 (v23.1.7 src/chainparamsbase.cpp:48)
+    bool rpc_hostport_explicit = false;             // --daemon-rpc given? (else the per-network default below)
     std::string auth_path;
     std::string stratum_bind = "127.0.0.1:3032";
     std::string p2p_bind;                 // A2: empty = no inbound carrier bind
     std::vector<std::string> peers;       // A2: --peer HOST:PORT, repeatable
+    std::vector<std::string> drops_enrol; // ★ DROPS: --drops-enrol HEX64, repeatable
     std::optional<std::uint64_t> synthetic_index_tip;   // A2: --carrier-synthetic-index N (KAT model)
     std::uint64_t carrier_index_horizon = 64;           // A2 step-b: LiveMainchainIndex::Options::horizon
     long          carrier_index_patience_ms = 2000;     // A2 step-b: LiveMainchainIndex::Options::unknown_patience
@@ -206,14 +259,16 @@ int main(int argc, char** argv) {
             const std::string n = argv[++i];
             if      (n == "regtest") cfg.network = BtcNetwork::Regtest;
             else if (n == "devnet")  cfg.network = BtcNetwork::Devnet;
+            else if (n == "testnet") cfg.network = BtcNetwork::Testnet4;   // DASH has no testnet4; this IS DASH testnet3
             else if (n == "mainnet") cfg.network = BtcNetwork::Mainnet;
             else { usage(); return 2; }
         }
-        else if (!std::strcmp(a, "--daemon-rpc"))                          next(rpc_hostport);
+        else if (!std::strcmp(a, "--daemon-rpc"))                          { next(rpc_hostport); rpc_hostport_explicit = true; }
         else if (!std::strcmp(a, "--coin-rpc-auth"))                       next(auth_path);
         else if (!std::strcmp(a, "--stratum-bind"))                        next(stratum_bind);
         else if (!std::strcmp(a, "--p2p-bind"))                            next(p2p_bind);
         else if (!std::strcmp(a, "--peer") && i + 1 < argc)                peers.emplace_back(argv[++i]);
+        else if (!std::strcmp(a, "--drops-enrol") && i + 1 < argc)         drops_enrol.emplace_back(argv[++i]);
         else if (!std::strcmp(a, "--carrier-synthetic-index") && i + 1 < argc) synthetic_index_tip = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(a, "--carrier-index-horizon") && i + 1 < argc)     carrier_index_horizon = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(a, "--carrier-index-patience-ms") && i + 1 < argc) carrier_index_patience_ms = std::atol(argv[++i]);
@@ -225,6 +280,12 @@ int main(int argc, char** argv) {
         else { usage(); return 2; }
     }
     if (cfg.d_conf == 0 || poll_ms <= 0 || oracle_patience_ms < 0 || carrier_index_patience_ms < 0) { usage(); return 2; }
+    // Per-network RPC default when --daemon-rpc was not given. Dash Core
+    // testnet rpc is 19998, regtest 19898 (v23.1.7 src/chainparamsbase.cpp:
+    // 47-48). NOTE this main never calls btc_node_config.hpp default_endpoint();
+    // the endpoint is this string, then apply_endpoint_override() below.
+    if (!rpc_hostport_explicit && cfg.network == BtcNetwork::Testnet4)
+        rpc_hostport = "127.0.0.1:19998";
     cfg.pow_verify_enabled = true;   // live: the v36 work source verifies X11 itself
     if (cfg.network == BtcNetwork::Mainnet && !cfg.i_understand_mainnet) {
         std::fprintf(stderr, "REFUSED: mainnet without --i-understand-mainnet (HARD SAFETY 4)\n");
@@ -263,9 +324,14 @@ int main(int argc, char** argv) {
     rpc->connect(NetService(conf.host, conf.port), conf.userpass());
 
     DashRpcCoinBackend::Options bopt;
-    bopt.expect_chain    = (cfg.network == BtcNetwork::Regtest) ? "regtest"
-                         : (cfg.network == BtcNetwork::Devnet)  ? "devnet" : "main";
-    bopt.expect_genesis  = (cfg.network == BtcNetwork::Regtest) ? kDashRegtestGenesisHex : "";
+    // Dash Core reports NetworkIDString "test" for -testnet (v23.1.7
+    // src/chainparamsbase.cpp:47, CBaseChainParams::TESTNET). chain_matches()
+    // is exact-match, so Testnet4 must map to "test" and never fall to "main".
+    bopt.expect_chain    = (cfg.network == BtcNetwork::Regtest)  ? "regtest"
+                         : (cfg.network == BtcNetwork::Devnet)   ? "devnet"
+                         : (cfg.network == BtcNetwork::Testnet4) ? "test" : "main";
+    bopt.expect_genesis  = (cfg.network == BtcNetwork::Regtest)  ? kDashRegtestGenesisHex
+                         : (cfg.network == BtcNetwork::Testnet4) ? kDashTestnetGenesisHex : "";
     bopt.oracle_patience = std::chrono::milliseconds(oracle_patience_ms);
     auto backend = std::make_shared<DashRpcCoinBackend>(rpc, bopt);
     if (!backend->wait_ready(std::chrono::seconds(30))) { teardown_io(); return 5; }
@@ -294,6 +360,39 @@ int main(int argc, char** argv) {
         teardown_io();
         return 6;
     }
+    // ── ★ S-1c: the hand-off between the two stratum callbacks ───────────────
+    // The v36 work source calls submit_block_fn (which registers OUR block and
+    // folds E_b) and then, on the SAME stratum thread, mint_solved_share(
+    // won_block=true) (work_source.cpp:2845 then :2885) — which is where the
+    // carrier is minted. So by the time the carrier exists, the fold has already
+    // happened and its cut is known; this is the one-slot hand-off that carries
+    // it across. Mutex'd because nothing in the work source PROMISES those two
+    // calls share a thread forever, and a torn descriptor would credit a peer at
+    // a cut nobody folded at.
+    struct LastOwnWin {
+        mutable std::mutex mtx;
+        std::string        bid;                 // hex; empty = nothing to carry
+        std::uint64_t      h_b = 0;
+        std::uint64_t      next_pos = 0;
+        ::v37::bytes32     spine_digest{};
+        std::uint64_t      reward = 0;
+        bool               payout_emitted = false;
+        ::v37::bytes32     owed_at_win{};
+        // ★ DROPS-R3: the composed DROPS credit map this win credited itself
+        // with, ready to ride the v0x03 trailer. Taken from the SAME EbCut the
+        // node composed, so what we broadcast and what we credited are the same
+        // bytes and cannot drift.
+        std::map<::v37::bytes32, long long> drops_delta;
+        ::v37::bytes32     enrollment_digest{};
+    } last_own_win;
+    // Every bid THIS node registered as its OWN win. The double-drive guard:
+    // the winner must never re-drive its own block through the peer path (the
+    // relay's W2 dedup already turns the flood echo into REJECT_DEDUP so the
+    // admitted arm is not even reached, and OwedLedger is idempotent per bid —
+    // this set is the third, EXPLICIT layer, and the one that reads as intent).
+    std::mutex           own_wins_mtx;
+    std::set<std::string> own_wins;
+
     if (!node.start()) { std::fprintf(stderr, "start() failed (engine/AddLane)\n"); teardown_io(); return 7; }
     {
         std::lock_guard<std::mutex> g(bed.mutex());
@@ -302,6 +401,109 @@ int main(int argc, char** argv) {
                  << " owed_digest=" << hex32(node.ledger().owed_digest())
                  << " reseeded=" << boot.reseeded << " stale=" << boot.stale_dropped
                  << " unrecoverable=" << boot.unrecoverable;   // A8 compares this triple with the stop: line
+    }
+
+    // ══ ★ DROPS STEP 2 — THE LIVE WIRING (flip-gated; DORMANT by default) ══
+    //
+    // WHAT WAS MISSING. The DROPS package landed four consumer seams and a
+    // verified gate-ON mint, and this shell called NONE of them: it constructed
+    // no DropHarvester, no EnrollmentBook and no ShareCountBook, and never
+    // called set_drop_harvest / set_drop_harvester / set_pre_harvest /
+    // set_enrollment_book. A node that took the operator flip would therefore
+    // have been gate-ON and DORMANT — converging with its peers and crediting
+    // NOBODY, for ever, because no raindrop is harvested, no share count is
+    // declared, and every harvested interval is withheld by the fail-closed
+    // rule. These are the four calls.
+    //
+    // ★★ THE CLOCK IS THE TIP, AND IT IS NOT NEGOTIABLE HERE.
+    // EnrollmentBook::commit() enforces "effective strictly later than now", but
+    // `now` is the CALLER'S. A shell that passed a STALE now — the obvious
+    // mistake being the BURIAL FRONTIER, the other interval number this file
+    // handles, which lags the tip by d_conf — would let a payee enrol for
+    // intervals it has ALREADY DRAWN, which is the selective-enrolment attack
+    // R-SYBIL closed, worth 1.32x at a 2000-way split. So this shell does not
+    // have that argument to get wrong: DropsWiring keeps the book private and
+    // its only enrolment entry point, enroll_at_tip(payee), TAKES NO INTERVAL AT
+    // ALL. The frontier reaches declare_into through a different door and can
+    // never reach commit().
+    //
+    // ORDER MATTERS AND IS DELIBERATE. Every enrolment is made HERE — after the
+    // engine is up so the tip is real, and BEFORE the carrier relay listens and
+    // BEFORE the stratum server binds. The book is therefore frozen for the
+    // whole life of every reader (the stratum win thread and the carrier reader
+    // threads), which is why the read path needs no lock of its own.
+    //
+    // GATE OFF (the shipped default): make_drops_wiring() returns nullopt, this
+    // block constructs nothing, attaches nothing and arms nothing; the W2
+    // admitter, the E_b fold and the OWED ledger are the ones master ships.
+    auto drops = ::c2pool::v37n::make_drops_wiring(cfg.lane_params);
+    if (drops) {
+        // Prime the ex-ante clock from the SAME backend tip the height-watch
+        // polls, before anything is enrolled or armed.
+        try {
+            if (const auto t = backend->try_best_tip()) drops->observe_tip(t->height);
+        } catch (const ChainMismatch& e) {
+            LOG_ERROR << "[v37-dash] DROPS: chain mismatch priming the tip: " << e.what()
+                      << " (the height-watch owns exit 9)";
+        }
+        const auto now_bin = drops->now_interval();
+        if (!now_bin) {
+            // No tip, no clock. Refusing is the only honest answer: enrolling at
+            // a made-up interval 0 would back-date every commitment to genesis,
+            // which is the stale-now failure with extra steps.
+            LOG_ERROR << "[v37-dash] DROPS: no chain tip yet — NOT enrolling and NOT arming "
+                         "the share-count book (the ex-ante clock is the TIP; there is no "
+                         "safe substitute). Every harvested interval will be WITHHELD.";
+        } else {
+            for (const auto& h : drops_enrol) {
+                ::v37::bytes32 payee{};
+                if (!parse_identity_hex(h, payee)) {
+                    LOG_ERROR << "[v37-dash] --drops-enrol " << h
+                              << " is not 64 hex characters — ignored, NOT enrolled";
+                    continue;
+                }
+                switch (drops->enroll_at_tip(payee)) {
+                    case ::c2pool::v37n::EnrollOutcome::Enrolled:
+                        LOG_INFO << "[v37-dash] DROPS enrolled " << hex32(payee).substr(0, 16)
+                                 << "… ex ante at tip bin " << *now_bin
+                                 << ", effective from " << (*now_bin + 1);
+                        break;
+                    case ::c2pool::v37n::EnrollOutcome::AlreadyEnrolled:
+                        LOG_INFO << "[v37-dash] DROPS " << hex32(payee).substr(0, 16)
+                                 << "… was already enrolled; the FIRST commitment stands";
+                        break;
+                    case ::c2pool::v37n::EnrollOutcome::TipUnknown:
+                        LOG_ERROR << "[v37-dash] DROPS: tip vanished mid-enrolment — "
+                                  << hex32(payee).substr(0, 16) << "… NOT enrolled";
+                        break;
+                }
+            }
+            // The share-count producer speaks only for intervals at or after the
+            // bin it was armed at; everything earlier stays UNKNOWN and is
+            // therefore withheld, which is the fail-closed error and not a bug.
+            drops->arm_at_tip();
+            LOG_INFO << "[v37-dash] DROPS share-count book armed at tip bin " << *now_bin;
+        }
+        // ★ THE THREE NODE-SIDE SEAMS. The fourth (the W2 harvest sink) and the
+        // emit-stream tee are attached to the carrier ingest below, because that
+        // is where the admitter lives.
+        node.set_drop_harvester(&drops->harvester());
+        node.set_enrollment_book(&drops->enrollment());
+        node.set_pre_harvest(drops->pre_harvest());
+        LOG_WARNING << "[v37-dash] ★ DROPS ACTIVE (V37_ACTIVATE_CONSENSUS_V1, arity "
+                    << ::c2pool::v37n::kActivationArity << ", K="
+                    << cfg.lane_params.subthreshold.K << "): this node composes the "
+                       "sub-threshold REPLACE delta into every block it settles. This is "
+                       "a CONSENSUS ACTIVATION — a node without it will not agree on "
+                       "owed_digest once a credit moves.";
+        if (drops_enrol.empty())
+            LOG_WARNING << "[v37-dash] DROPS: gate ON but NOBODY is enrolled (--drops-enrol) "
+                        << "— every composition credits zero. That is the correct fail-closed "
+                           "shape, not a fault: enrolment is ex ante and opt-in.";
+    } else {
+        LOG_INFO << "[v37-dash] DROPS: DORMANT (no consensus activation in this build) — "
+                    "no harvester, no enrolment book, no share-count tee; W2 classifies a "
+                    "sub-target receipt as REJECT_R1_TARGET exactly as master does";
     }
 
     // ── A2 CONSUMER: the carrier-relay p2p layer (cross-node share ingestion) ─
@@ -338,10 +540,27 @@ int main(int argc, char** argv) {
     std::unique_ptr<CarrierPeerNode>        carrier_net;
     std::unique_ptr<CarrierRelay>           carrier_relay;
     std::unique_ptr<CarrierSendQueue>       carrier_send;   // declared AFTER carrier_index/carrier_relay: destroyed FIRST (it references both)
+    // ── Stage 1 SUPPLY + ★ Stage 2 APPLY ────────────────────────────────────
+    // Declared AFTER carrier_relay / carrier_index (they reference both) so the
+    // destruction order is repair -> fetch/serve -> relay -> index, i.e. nothing
+    // can be serving or replaying while the structures under it are torn down.
+    std::unique_ptr<SupplyService>          supply_serve;   // answers GETORDER / GETFRAMES out of the FrameVault
+    std::unique_ptr<SupplyRequester>        supply_fetch;   // asks for them, hash-verified, fail-closed
+    std::shared_ptr<DescriptorTable>        replay_desc_tbl;
+    std::unique_ptr<FrameVaultChainReader>  replay_reader;  // persist::ISharechainReader over our OWN vault
+    std::unique_ptr<RepairStore>            replay_store;   // the w6 record families the replay reads
+    std::unique_ptr<persist::ReplayDriver>  replay_driver;  // the w6 §5 slow path, bound to both
+    std::unique_ptr<RepairDriver>           repair_driver;  // ★ the repair at the cut-miss arm
+    std::atomic<std::uint64_t>              repair_armed{0}, repair_arm_failed{0};
     // Inbound telemetry (never consensus): what the peer path did with each
     // frame. Atomic: one reader thread per peer drives set_inbound.
     struct InboundStats {
         std::atomic<std::uint64_t> frames{0}, admitted{0}, echo{0}, wire_rejected{0}, policy_rejected{0}, admit_rejected{0};
+        // ★ S-1c: what the receive seam did with the v0x02 cut descriptors.
+        std::atomic<std::uint64_t> cut_frames{0};    // admitted carriers that carried one
+        std::atomic<std::uint64_t> cut_credited{0};  // folded at the carried cut + registered
+        std::atomic<std::uint64_t> cut_refused{0};   // refused (see the S-1c error lines)
+        std::atomic<std::uint64_t> cut_own{0};       // our own win's descriptor echoed back
     } carrier_inbound;
     // FALLBACK identity ONLY: used for a BLOCK win whose miner has no payout
     // script (foreign/malformed username -> empty script). Every share carries
@@ -369,8 +588,16 @@ int main(int argc, char** argv) {
                 teardown_io();
                 return 10;
             }
-            LOG_INFO << "[v37-dash] wire-freeze selfcheck OK [" << wire_freeze::layout_id() << "] "
+            LOG_INFO << "[v37-dash] wire-freeze selfcheck OK [" << wire_freeze::layout_id()
+                     << " | " << wire_freeze::layout_id_v2() << "] "
                      << sc.checks << " checks; tag cap=" << wire_freeze::kTagMaxBytes;
+            // ★ S-1c FLAG DAY. This build EMITS v0x02 and ACCEPTS {v0x01,v0x02}.
+            // A v0x01-only peer will reject every frame we send — that is the
+            // flag day, and it is loud on purpose: a mixed fleet must not be
+            // able to silently strip a block-winner cut descriptor at a v0x01
+            // hop and desynchronise the OWED ledger downstream of it.
+            LOG_WARNING << "[v37-dash] " << wire_freeze::flag_day_id()
+                        << " — a v0x01-only peer will REJECT this node's frames (expected at the flag day)";
         }
         auto snap = node.lane_snapshot();
         const std::uint64_t incarnation = snap ? snap->incarnation : 1;
@@ -405,6 +632,24 @@ int main(int argc, char** argv) {
         }
         carrier_ingest = std::make_unique<CarrierIngest>(
             node.engine(), cfg.lane_chain, *carrier_index, *carrier_tracker, incarnation);
+        // ── ★ DROPS Step 2: the two seams that live on the ADMITTER ─────────
+        //   (1) the sub-target harvest: a receipt mined against a strictly
+        //       weaker target than its bin's consensus target stops being
+        //       REJECT_R1_TARGET and becomes a RAINDROP, admitted for
+        //       MEASUREMENT ONLY (no push, no lane work, every binding check
+        //       still enforced) and handed to the harvester;
+        //   (2) the SHARE-COUNT PRODUCER, teed onto the W2 emit stream. Every
+        //       EmittedPush is one share at (identity, origin_bin) — the same F1
+        //       bin the harvester keys its intervals on — so declare_shares()
+        //       gets a real S instead of the "unknown" it fails closed on. The
+        //       engine still receives every push, in order, unchanged.
+        // Without (2), (1) credits nothing: every harvested interval is withheld.
+        if (drops) {
+            carrier_ingest->set_drop_harvest(true, drops->drop_sink());
+            carrier_ingest->set_sink_filter(drops->sink_filter());
+            LOG_INFO << "[v37-dash] ★ DROPS: W2 sub-target harvest ARMED and the "
+                        "share-count producer teed onto the emit stream";
+        }
         carrier_net   = std::make_unique<CarrierPeerNode>();
         carrier_relay = std::make_unique<CarrierRelay>(carrier_ingest->fn(), *carrier_net);
         // W3-B5 F-1/F-2 POLICY GATE on every inbound frame (post-decode, pre-admit).
@@ -420,6 +665,158 @@ int main(int argc, char** argv) {
             carrier_send->set_log([](bool warn, const std::string& line) { if (warn) LOG_WARNING << line; else LOG_INFO << line; });
             carrier_send->start();
         }
+        // ═══════════════════════════════════════════════════════════════════
+        // ★ STAGE 1 SUPPLY + STAGE 2 APPLY — the repair channel, stood up here.
+        //
+        // Before this the daemon instantiated NEITHER half of the supply channel:
+        // the FrameVault retained bytes nobody could ask for, and a node that had
+        // fallen behind could not even NAME the carriers it was missing. Now:
+        //
+        //   SERVE   SupplyService answers a peer's GETORDER ("your ordered
+        //           carrier ids for [a, P)") and GETFRAMES ("the bytes for these
+        //           ids") out of the FrameVault, under a per-peer token bucket
+        //           and the transport's own reply ceiling. It never admits and
+        //           never appends — serving a frame is byte-for-byte the same act
+        //           as broadcasting it.
+        //   FETCH   SupplyRequester asks for them, verifies hash(bytes) == the id
+        //           it asked for, and fails CLOSED on a lie, a gap or a timeout.
+        //   REPAIR  RepairDriver turns a refused peer-block cut into a fetch, a
+        //           replay into a SCRATCH engine through the w6 slow path, and —
+        //           only when the replayed digest equals the winner's own
+        //           cut_spine_digest — a VERIFIED SettlementView that
+        //           XbtcNode's cut-miss arm folds E_b over. A repair that cannot
+        //           verify refuses exactly as the arm refused before Stage 2.
+        //
+        // Both halves land on the ONE control demux (frame[0] >= 0x80); each
+        // ignores what is not its own, and an old peer with no demux at all
+        // answers REJECT_BAD_VERSION and keeps the socket (Stage-1 CS-7).
+        {
+            auto send_ctl = [&](CarrierPeerNode::PeerId pid,
+                                const std::vector<std::uint8_t>& f) {
+                return carrier_net->send_to(pid, f);
+            };
+            supply_serve = std::make_unique<SupplyService>(carrier_relay->vault(), send_ctl);
+            supply_fetch = std::make_unique<SupplyRequester>(send_ctl);
+            // Our own committed commitment at a prefix. Under ruling A this is an
+            // ASSERTION on the wire; the asker's REPLAY is what checks it.
+            supply_serve->set_spine_probe(
+                [&](std::uint32_t, std::uint64_t pos) -> std::optional<::v37::bytes32> {
+                    auto s = node.engine().snapshot(cfg.lane_chain);
+                    if (s && s->next_pos == pos) return s->digest;
+                    return std::nullopt;
+                });
+            // ★ THE CUT PROBE (F-2's cheap half). The snapshot probe above can
+            // only speak about the lane's CURRENT tip, so a node that published
+            // the asked cut minutes ago asserts nothing about it and the asker
+            // has to fetch the whole prefix to find out. This answers at any
+            // RETAINED prefix: "yes, I published exactly (pos, your spine)".
+            // Positive-only — a false asserts nothing — and read-only against
+            // the engine's own ring.
+            supply_serve->set_cut_probe(
+                [&](std::uint32_t, std::uint64_t pos, const ::v37::bytes32& spine) {
+                    return node.engine().settlement_view_by_cut(cfg.lane_chain, pos, spine)
+                           != nullptr;
+                });
+
+            // The w6 §5 slow path over our OWN retained order: the same reader +
+            // driver the repair uses, bound here to the LIVE vault so the local
+            // self-audit below ("does my own retained order reproduce my own
+            // committed digest?") runs the identical code as a peer repair.
+            replay_desc_tbl = std::make_shared<DescriptorTable>();
+            replay_reader   = std::make_unique<FrameVaultChainReader>(
+                carrier_relay->vault(), static_cast<std::uint32_t>(cfg.lane_chain), replay_desc_tbl);
+            replay_store    = std::make_unique<RepairStore>();
+            replay_driver   = std::make_unique<persist::ReplayDriver>(*replay_store, *replay_reader);
+
+            repair_driver = std::make_unique<RepairDriver>(
+                *supply_fetch, *carrier_index, static_cast<std::uint32_t>(cfg.lane_chain),
+                cfg.lane_params);
+            repair_driver->set_log([](bool warn, const std::string& line) {
+                if (warn) LOG_WARNING << line; else LOG_INFO << line;
+            });
+            supply_fetch->set_on_order([&](CarrierPeerNode::PeerId pid, const CtrlOrder& o) {
+                repair_driver->on_order(pid, o);
+            });
+            supply_fetch->set_on_frames([&](CarrierPeerNode::PeerId pid,
+                                            const std::vector<VerifiedFrame>& v) {
+                repair_driver->on_frames(pid, v);
+            });
+            // #1656: ids the server HOLDS but cannot put on this channel. For a
+            // replay that is fatal (we need every carrier of the prefix), so it
+            // is named and the repair refuses rather than waiting for bytes that
+            // are never coming.
+            supply_fetch->set_on_unservable([&](CarrierPeerNode::PeerId pid,
+                                                const std::vector<::v37::bytes32>& ids) {
+                repair_driver->on_unservable(pid, ids);
+            });
+            supply_fetch->set_on_fail([&](CarrierPeerNode::PeerId pid, SupplyFailure f) {
+                repair_driver->on_fail(pid, f);
+            });
+            // ── ★ THE TIMEOUT DRIVE ─────────────────────────────────────────
+            // SupplyRequester gives every outstanding request a deadline, but a
+            // deadline only bites if somebody READS it: tick() is what turns
+            // "this peer never answered" into a failure. Nothing in this daemon
+            // used to call it, so a repair whose reply never arrived stayed in
+            // flight forever — fail-closed (owed never moved) but PERMANENTLY,
+            // silently, and with every cut queued behind that peer stuck behind
+            // it. Driving tick() closes that: the slot expires, on_fail reaches
+            // RepairDriver::finish(), the repair is counted REFUSED, and
+            // drain_deferred() releases the queue.
+            //
+            // The CarrierSendQueue worker is already idle between own wins and
+            // already wakes on a timer to drive the relay's re-offer sweep, so
+            // the same cadence carries this: no new thread, and carrier_send->
+            // stop() joins that worker before anything the hook touches is torn
+            // down.
+            if (carrier_send) {
+                carrier_send->set_idle_tick([&] {
+                    if (!supply_fetch) return;
+                    const std::size_t n = supply_fetch->tick();
+                    if (n)
+                        LOG_WARNING << "[v37-dash] supply fetch: " << n
+                                    << " outstanding request(s) timed out — the repair fails"
+                                       " closed and whatever was queued behind that peer drains";
+                });
+            }
+            carrier_net->set_control([&](CarrierPeerNode::PeerId pid,
+                                         const std::vector<std::uint8_t>& f) {
+                supply_serve->on_control(pid, f);
+                supply_fetch->on_control(pid, f);
+            });
+            // #1655: a (re)connecting peer arms the re-offer sweep, and the
+            // re-offer must not re-push what W2 has already accounted.
+            carrier_net->set_on_peer_connect([&] { carrier_relay->note_peer_connected(); });
+            carrier_relay->set_reoffer_dedup_probe(
+                [&](const ::v37::bytes32& h) { return carrier_relay->seen().seen(h); });
+            carrier_net->set_on_peer_event([&](CarrierPeerNode::PeerId pid, bool up) {
+                if (up) return;
+                supply_serve->forget_peer(pid);
+                supply_fetch->forget_peer(pid);
+                repair_driver->forget_peer(pid);
+            });
+
+            // ★ the cut-miss arm's repair source: a NON-BLOCKING read of what a
+            // completed replay has already PROVEN at exactly (prefix, commitment).
+            node.set_repair_source([&](::v37::ChainId c, std::uint64_t pos,
+                                       const ::v37::bytes32& spine) {
+                return repair_driver->verified_view(static_cast<std::uint32_t>(c), pos, spine);
+            });
+            // ★ S3 RE-DRIVE: a finished repair retries the one-shot peer win.
+            repair_driver->set_redrive([&](const std::string& bid, const RepairResult& r) {
+                const auto reg = bed.redrive_peer_block_found(bid);
+                if (reg.registered)
+                    LOG_INFO << "[v37-dash] S-1c/S3 RE-DRIVE credited peer block " << bid
+                             << " after a verified repair (" << r.carriers << " carriers, P="
+                             << r.pushes << ") owed_digest=" << hex32(node.ledger().owed_digest());
+                else
+                    LOG_WARNING << "[v37-dash] S-1c/S3 RE-DRIVE of " << bid
+                                << " still REFUSED: " << reg.reason
+                                << " — repair outcome was " << repair_outcome_name(r.outcome);
+            });
+            LOG_INFO << "[v37-dash] carrier SUPPLY channel up (serve+fetch) and the Stage-2 "
+                        "REPAIR driver armed at the S-1c cut-miss arm";
+        }
+
         carrier_net->set_inbound([&](const std::vector<std::uint8_t>& f) {
             // decode + W3-B5 policy + W2 admit + account + relay (CarrierRelay
             // serializes; one reader thread per peer lands here).
@@ -438,7 +835,140 @@ int main(int argc, char** argv) {
                          << " identity=" << hex32(p0.identity).substr(0, 16)
                          << " parent@" << p0.carrier_bin << " w_raw=" << p0.w_raw
                          << " pushes=" << o.admission.pushes.size()
-                         << " relayed=" << o.relayed << " peers_reached=" << o.peers_reached;
+                         << " relayed=" << o.relayed << " peers_reached=" << o.peers_reached
+                         << (o.cut ? " [S-1c BLOCK-WINNER carrier]" : "");
+                // ── ★ S-1c: THE RECEIVE SEAM ────────────────────────────────
+                // A peer's carrier that is ALSO a coin block winner carries the
+                // winner's fold on the wire. Credit OUR ledger with the SAME
+                // E_b at the SAME lane prefix, through the SAME on_block_found
+                // the winner used — then our own height-watch finalizes it at
+                // the SAME bin_height as the block buries. That is the whole
+                // cross-node convergence mechanism; everything else here is
+                // guards, counters and log lines.
+                if (o.cut) {
+                    carrier_inbound.cut_frames.fetch_add(1, std::memory_order_relaxed);
+                    PeerWin w;
+                    w.bid                = cut_bid_hex(o.cut->bid);
+                    w.h_b                = o.cut->h_b;
+                    w.cut_next_pos       = o.cut->cut_next_pos;
+                    w.cut_spine_digest   = o.cut->cut_spine_digest;
+                    w.reward             = o.cut->reward;
+                    w.payout_emitted     = o.cut->payout_emitted;
+                    w.owed_digest_at_win = o.cut->owed_digest_at_win;
+                    // ★ DROPS-R3: fold the WINNER'S map, never our own harvest.
+                    if (o.drops) {
+                        w.has_drops = true;
+                        for (const auto& [k, v] : o.drops->credit) w.drops_credit[k] = v;
+                        w.enrollment_digest = o.drops->enrollment_digest;
+                    }
+
+                    bool mine = false;                     // the DOUBLE-DRIVE guard
+                    { std::lock_guard<std::mutex> lk(own_wins_mtx); mine = own_wins.count(w.bid) != 0; }
+                    if (mine) {
+                        carrier_inbound.cut_own.fetch_add(1, std::memory_order_relaxed);
+                        LOG_INFO << "[v37-dash] S-1c: descriptor for OUR OWN block " << w.bid
+                                 << " came back on the flood — not re-driven (already credited at the win)";
+                    } else {
+                        // BOUNDED WAIT for our own engine to publish the carried
+                        // prefix. CarrierIngest's admit is FIRE-AND-FORGET into
+                        // the engine's MPSC mailbox (O1.4), so when this lambda
+                        // runs, the pushes for the carriers that came BEFORE this
+                        // one may still be queued — the winner's prefix P would
+                        // then read as a cut_miss purely because we asked a few
+                        // milliseconds early. Poll the by-cut reader rather than
+                        // guess: it is exactly the predicate the fold needs.
+                        // NOT a fix for the real miss (an executor that COALESCED
+                        // through P never publishes it at all, and no amount of
+                        // waiting will conjure it) — that one is refused below.
+                        for (int i = 0; i < 40; ++i) {
+                            if (node.engine().settlement_view_by_cut(
+                                    cfg.lane_chain, w.cut_next_pos, w.cut_spine_digest))
+                                break;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                        // ★ DROPS: same lock, same reason — on a peer win the
+                        // node DISCARDS our own buried harvest at the winner's
+                        // frontier (nothing of ours is credited on someone
+                        // else's block, but the frontier must still move), and
+                        // that discard happens after the hook returns.
+                        BlockEventDriver::RegisterResult reg;
+                        {
+                            std::unique_lock<std::recursive_mutex> wl;
+                            if (drops) wl = drops->win_lock();
+                            reg = bed.on_peer_block_found(w);
+                        }
+                        if (reg.registered) {
+                            carrier_inbound.cut_credited.fetch_add(1, std::memory_order_relaxed);
+                            const auto& pc = node.last_peer_cut();
+                            LOG_INFO << "[v37-dash] S-1c PEER FOUND " << w.bid << " h=" << w.h_b
+                                     << " E_b=" << pc.credit.size() << " keys"
+                                     << (pc.valueless ? " [VALUELESS]" : "")
+                                     << " cut{P=" << w.cut_next_pos
+                                     << " spine=" << hex32(w.cut_spine_digest)
+                                     << " our_v=" << pc.lane_version << " src=" << pc.source << "}"
+                                     << " reward=" << w.reward
+                                     << " owed_digest=" << hex32(node.ledger().owed_digest());
+                        } else {
+                            carrier_inbound.cut_refused.fetch_add(1, std::memory_order_relaxed);
+                            LOG_ERROR << "[v37-dash] S-1c REFUSED peer block " << w.bid << " h=" << w.h_b
+                                      << " cut{P=" << w.cut_next_pos << " spine=" << hex32(w.cut_spine_digest)
+                                      << "}: " << reg.reason;
+                            // ── ★ STAGE 2: ARM THE REPAIR ────────────────────
+                            // A cut_miss / cut_mismatch says "my order at P is
+                            // not the winner's", and that question is settled by
+                            // REPLAYING the winner's own ordered records — not by
+                            // the owed ledger and not by waiting. Ask a peer for
+                            // the order over [0, P) and the bytes behind it; if
+                            // the replay lands on the winner's own commitment the
+                            // S3 re-drive above credits this very block, and if
+                            // it does not, the refusal stands exactly as it is.
+                            //
+                            // ── ★ F-2: ASK THE PEER THAT HOLDS THE CUT ───────
+                            // "ANY connected peer can serve the prefix (it is
+                            // the sharechain's order, not one node's opinion)"
+                            // is not true under ruling A: the ordered prefix is
+                            // NODE-LOCAL, so a peer that dropped the same share
+                            // holds a different order, serves it honestly, and
+                            // the replay lands on a different digest. Arming at
+                            // the first peer that merely ACCEPTS decided the
+                            // repair by transport order and refused almost all
+                            // of them.
+                            //
+                            // The winner's PEER ID is not derivable here — the
+                            // v0x02 descriptor carries no winner identity, and
+                            // the carrier inbound seam is not peer-attributed —
+                            // so we hand the driver the whole connected set as
+                            // an ORDERED CANDIDATE LIST. It asks them in turn
+                            // and moves on the moment one shows it cannot serve
+                            // this cut (a different lane digest asserted at P, a
+                            // refusal below its horizon, or a replay that lands
+                            // elsewhere), which selects the winner — or anyone
+                            // whose lane agrees with the winner at P — without
+                            // having to name it. Bounded: each candidate is
+                            // tried at most once.
+                            bool armed = false;
+                            if (repair_driver) {
+                                const auto cands = carrier_net->peer_ids();
+                                if (!cands.empty() &&
+                                    repair_driver->arm_candidates(cands, w.bid, w.cut_next_pos,
+                                                                  w.cut_spine_digest)) {
+                                    armed = true;
+                                    repair_armed.fetch_add(1, std::memory_order_relaxed);
+                                    LOG_INFO << "[v37-dash] S-1c REPAIR armed for " << w.bid
+                                             << " at P=" << w.cut_next_pos << " over "
+                                             << cands.size() << " candidate peer(s)";
+                                }
+                            }
+                            if (!armed) {
+                                repair_arm_failed.fetch_add(1, std::memory_order_relaxed);
+                                LOG_ERROR << "[v37-dash] S-1c no repair could be armed for " << w.bid
+                                          << " (no peer accepted the request, or the cut is already "
+                                          << "in flight) — our owed_digest will NOT converge with the "
+                                          << "winner's for this block";
+                            }
+                        }
+                    }
+                }
             } else if (o.admission.carrier_status == CarrierStatus::REJECT_DEDUP) {
                 // The flood-fill ECHO (W3 §5.2.1): a peer re-broadcasts what it
                 // admitted to ALL its peers, including the one it came from, and
@@ -475,6 +1005,16 @@ int main(int argc, char** argv) {
         }
         LOG_INFO << "[v37-dash] A2 carrier-relay up: peers=" << carrier_net->n_peers();
     }
+    // ★ DROPS, stated rather than inferred: the W2 admitter lives INSIDE the
+    // carrier-ingest bridge, and that bridge only exists when this node peers.
+    // Without --p2p-bind / --peer there is no admission path at all, so no
+    // raindrop can be harvested and no share can be counted — the gate is on and
+    // there is simply nothing for it to compose. Say so at boot instead of
+    // leaving an operator to infer it from a stop line of zeroes.
+    if (drops && !carrier_ingest)
+        LOG_WARNING << "[v37-dash] DROPS: gate ON but this node has NO carrier relay "
+                       "(no --p2p-bind / --peer) — there is no W2 admission path, so NO "
+                       "raindrop can be harvested and every composition credits zero";
 
     // ── 2f: stratum front-end on the v36 DASH work source ────────────────────
     dash::coin::NodeCoinState coin_state;   // EMPTY on purpose: no embedded arm; dashd is the template source
@@ -505,6 +1045,29 @@ int main(int argc, char** argv) {
             BlockEventDriver::RegisterResult reg;
             std::uint64_t reg_h = 0;
             auto try_register = [&](std::uint64_t h, std::uint64_t conf) {
+                // ★ DROPS: hold the harvest lock across the WHOLE registration.
+                // XbtcNode calls the pre-harvest hook and then take_buried()
+                // ITSELF, after the hook returns, so locking inside the hook
+                // would leave the release unguarded against the carrier reader
+                // threads that are feeding raindrops and share counts in.
+                // Recursive, because the hook re-enters on this same thread.
+                //
+                // WHAT THIS COSTS, SAID OUT LOUD. A carrier reader that is
+                // mid-admit blocks on this lock for the duration of ONE block
+                // registration — the E_b fold, the composition and the W6
+                // write-ahead, milliseconds of CPU and one disk write. The
+                // node's own submitblock is NOT inside it (the backend refuses
+                // XbtcNode's placeholder hex without touching the network, and
+                // the real bytes go out below, unlocked). The one pathological
+                // case is S-8: with dashd unreachable, the win-time
+                // is_canonical() probe spins oracle_patience inside this window,
+                // so carrier ingestion stalls for up to --oracle-patience-ms on
+                // a block win against a dead daemon. That is a node which is
+                // already settling nothing, and correctness-by-construction is
+                // worth more here than a shaved millisecond — but it is a real
+                // cost and it is not hidden.
+                std::unique_lock<std::recursive_mutex> wl;
+                if (drops) wl = drops->win_lock();
                 reg = bed.on_block_found(bidh, h, conf);
                 if (reg.registered) reg_h = h;
                 else LOG_ERROR << "[v37-dash] register " << bidh << " @" << h << " failed: " << reg.reason;
@@ -522,8 +1085,59 @@ int main(int argc, char** argv) {
                 LOG_ERROR << "[v37-dash] UNREGISTERED block " << bidh << " accepted=" << r.accepted
                           << " — never registered at the template height (" << wd_height
                           << ") and never at 0; operator: re-register by hand once H_b is known";
-            else
-                LOG_INFO << "[v37-dash] FOUND " << bidh << " h=" << reg_h << " accepted=" << r.accepted;
+            else {
+                // ★ S-1: the cut this win folded E_b at, and where the OWED
+                // commitment stands after it. owed_digest still reading the
+                // empty anchor b4db1ded… after a FOUND means the fold credited
+                // nobody — the S1 line above says why (VALUELESS / REFUSED).
+                const auto& cut = node.last_cut();
+                const auto& s1  = node.s1_stats();
+                LOG_INFO << "[v37-dash] FOUND " << bidh << " h=" << reg_h << " accepted=" << r.accepted
+                         << " E_b=" << cut.credit.size() << " keys"
+                         << (cut.valueless ? " [VALUELESS]" : "")
+                         << " cut{lane_digest=" << hex32(cut.lane_digest)
+                         << " v=" << cut.lane_version << " inc=" << cut.lane_incarnation
+                         << " next_pos=" << cut.next_pos << " src=" << cut.source << "}"
+                         << " owed_digest=" << hex32(node.ledger().owed_digest())
+                         << " s1{folds=" << s1.folds << " valueless=" << s1.valueless
+                         << " refused=" << s1.refused << " no_view=" << s1.no_view << "}";
+                if (!cut.refusal.empty())
+                    LOG_ERROR << "[v37-dash] S-1 fold gave " << bidh << " NO CREDIT: " << cut.refusal;
+
+                // ── ★ S-1c SEND SIDE: name this fold for our peers ──────────
+                // The carrier for this very block is minted a few microseconds
+                // from now (mint_solved_share(won_block=true), work_source.cpp
+                // :2885). Hand it the cut THIS fold actually read — P, the lane
+                // commitment at P, and the reward the fold consumed — so every
+                // peer credits the SAME E_b instead of guessing at its own tip.
+                {
+                    std::lock_guard<std::mutex> lk(own_wins_mtx);
+                    own_wins.insert(bidh);                  // the double-drive guard
+                }
+                std::lock_guard<std::mutex> lk(last_own_win.mtx);
+                if (cut.folded) {
+                    last_own_win.bid            = bidh;
+                    last_own_win.h_b            = reg_h;
+                    last_own_win.next_pos       = cut.next_pos;
+                    last_own_win.spine_digest   = cut.lane_digest;
+                    last_own_win.reward         = cut.reward;
+                    last_own_win.payout_emitted = node.last_won().emitted;
+                    last_own_win.owed_at_win    = node.ledger().owed_digest();
+                    last_own_win.drops_delta    = cut.drops_delta;          // ★ R3
+                    last_own_win.enrollment_digest = cut.enrollment_digest;  // ★ R-SYBIL
+                } else {
+                    // Our OWN fold refused (no published lane view / geometry not
+                    // ratified), so we credited NOTHING. Carrying a descriptor
+                    // would only ask peers to fold at a cut that does not exist;
+                    // carrying none means they credit nothing too — which is the
+                    // SAME number, so the two nodes still converge. Say it out
+                    // loud rather than leave it to inference.
+                    last_own_win.bid.clear();
+                    LOG_WARNING << "[v37-dash] S-1c: no cut descriptor for " << bidh
+                                << " — our own fold gave no credit, so peers credit nothing either "
+                                   "(both sides stay at the same owed_digest)";
+                }
+            }
 
             // A2 SEND-SIDE: NOT here. The won block is ALSO a share: the v36 work source
             // calls mint_solved_share(won_block=true) right after this returns
@@ -553,12 +1167,52 @@ int main(int argc, char** argv) {
     // resolve/grind/admit/flood run on the CarrierSendQueue worker (S-3).
     if (carrier_send) {
         ws->set_mint_share_fn(
-            [send = carrier_send.get()](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
+            [send = carrier_send.get(), &last_own_win](const dash::stratum::DASHWorkSource::MintShareInputs& in) -> uint256 {
                 const std::string h16 = in.pow_hash.GetHex().substr(0, 16);
                 auto req = own_win_request_of_header(
                     in.header_bytes, in.payout_script, in.won_block,
                     (in.won_block ? "win:" : "share:") + h16);
                 if (!req) { LOG_WARNING << "[v37-dash] carrier: short header for " << h16; return uint256(); }
+                // ★ S-1c: attach the cut descriptor for a BLOCK win. submit_fn
+                // ran first on this same thread and left the fold's own cut in
+                // the one-slot hand-off; we take it by bid so a stale slot can
+                // never be attached to the wrong block.
+                if (in.won_block) {
+                    const std::string bidh = dash::crypto::hash_x11(in.header_bytes.data(), 80).GetHex();
+                    std::lock_guard<std::mutex> lk(last_own_win.mtx);
+                    if (last_own_win.bid == bidh) {
+                        if (const auto bid_bytes = cut_bid_bytes(bidh)) {
+                            CutDescriptor d;
+                            d.bid                = *bid_bytes;
+                            d.h_b                = last_own_win.h_b;
+                            d.cut_next_pos       = last_own_win.next_pos;
+                            d.cut_spine_digest   = last_own_win.spine_digest;
+                            d.reward             = last_own_win.reward;
+                            d.payout_emitted     = last_own_win.payout_emitted;
+                            d.owed_digest_at_win = last_own_win.owed_at_win;
+                            req->cut = d;
+                            // ★ DROPS-R3: the composed credit map rides with the
+                            // cut. STRICTLY ASCENDING by payee (the std::map is
+                            // already in that order) — the decoder rejects any
+                            // other order, so the encoding of a map is unique.
+                            if (!last_own_win.drops_delta.empty()) {
+                                DropsCredit dc;
+                                dc.credit.reserve(last_own_win.drops_delta.size());
+                                for (const auto& [k, v] : last_own_win.drops_delta)
+                                    dc.credit.emplace_back(k, v);
+                                dc.enrollment_digest = last_own_win.enrollment_digest;
+                                req->drops = std::move(dc);
+                            }
+                        } else {
+                            LOG_ERROR << "[v37-dash] S-1c: block id " << bidh
+                                      << " is not 64 hex chars — no cut descriptor carried";
+                        }
+                    } else if (!last_own_win.bid.empty()) {
+                        LOG_ERROR << "[v37-dash] S-1c: mint for " << bidh
+                                  << " does not match the last registered win " << last_own_win.bid
+                                  << " — no cut descriptor carried (never guess a peer's cut)";
+                    }
+                }
                 (void)send->submit(std::move(*req));
                 // DEFERRED BY DESIGN (S-3): the worker mints/admits/floods and logs the outcome;
                 // null here = the work source's own "accepted (mint deferred/declined)" line
@@ -594,6 +1248,10 @@ int main(int argc, char** argv) {
             break;
         }
         if (tip && live_index) live_index->observe_tip(tip->height);   // A2: the reader thread never asks getblockchaininfo
+        // ★ DROPS: the EX-ANTE CLOCK, from the SAME tip, in the same place. This
+        // is the only writer of now_interval, and it writes the chain tip and
+        // nothing else — never the burial frontier, which lags it by d_conf.
+        if (tip && drops) drops->observe_tip(tip->height);
         if (tip && tip->hash != last_hash) {
             try {
                 // D11: a lowered tip, or a previous tip that left the active chain,
@@ -644,7 +1302,92 @@ int main(int argc, char** argv) {
                      << " unresolved_parent=" << ss.unresolved_parent << " no_identity=" << ss.no_identity
                      << " shed=" << ss.shed_shares << " abandoned=" << ss.abandoned_at_stop
                      << " policy_rejected=" << carrier_policy_stats.frames_rejected.load()
-                     << " policy_receipts_dropped=" << carrier_policy_stats.receipts_dropped.load();
+                     << " policy_receipts_dropped=" << carrier_policy_stats.receipts_dropped.load()
+                     // ★ S-1c: the cross-node settlement traffic, both directions.
+                     << " s1c_sent{cut_carried=" << ss.cut_carried << " cut_missing=" << ss.cut_missing << "}"
+                     << " s1c_recv{frames=" << carrier_inbound.cut_frames.load()
+                     << " credited=" << carrier_inbound.cut_credited.load()
+                     << " refused=" << carrier_inbound.cut_refused.load()
+                     << " own_echo=" << carrier_inbound.cut_own.load() << "}";
+            // ★ STAGE 1 SUPPLY + STAGE 2 APPLY, at stop.
+            if (supply_serve && supply_fetch && repair_driver) {
+                const SupplyServeStats sv = supply_serve->stats();
+                const SupplyFetchStats fs = supply_fetch->stats();
+                const RepairStats      rp = repair_driver->stats();
+                LOG_INFO << "[v37-dash] supply stop: serve{order=" << sv.order_served
+                         << " order_ids=" << sv.order_ids << " frames=" << sv.frames_served
+                         << " bytes=" << sv.bytes_served << " throttled=" << sv.throttled
+                         << " throttled_replied=" << sv.throttled_replied
+                         << " truncated=" << sv.frames_truncated
+                         << " unservable=" << sv.frames_unservable << "}"
+                         << " fetch{orders=" << fs.orders_ok << " frames=" << fs.frames_verified
+                         << " hash_mismatch=" << fs.hash_mismatch << " missing=" << fs.missing_id
+                         << " timeouts=" << fs.timeouts
+                         << " throttled=" << fs.throttled_replies
+                         << " retries=" << fs.throttle_retries
+                         << " retry_exhausted=" << fs.throttle_exhausted << "}";
+                // ★ THE CONVERGENCE LINE an operator reads: how many peer-block
+                // cuts this node could not fold at, how many a REPLAY repaired,
+                // and how many stayed refused (each of those is one block whose
+                // owed_digest this node does NOT share with the winner).
+                LOG_INFO << "[v37-dash] repair stop: armed=" << rp.armed
+                         << " arm_failed=" << repair_arm_failed.load()
+                         << " coalesced=" << rp.coalesced
+                         << " replayed=" << rp.replayed
+                         << " REPAIRED=" << rp.repaired
+                         << " REFUSED=" << rp.refused
+                         << " redrives=" << rp.redriven
+                         << " frames_fetched=" << rp.frames_fetched
+                         << " order_failed=" << rp.order_failed
+                         // ★ F-4: of those, the ones the serving vault's
+                         // retention window refused. This was structurally 0.
+                         << " (below_horizon=" << rp.order_below_horizon << ")"
+                         << " fetch_failed=" << rp.fetch_failed
+                         << " unservable=" << rp.unservable
+                         // ★ F-2: how the candidate walk actually went.
+                         << " | candidates{retried=" << rp.peer_retried
+                         << " spine_refused=" << rp.spine_refused
+                         << " exhausted=" << rp.candidates_out << "}"
+                         // ── the one-serving-peer QUEUE, as an operator reads it ──
+                         // deferred/resumed are the ordinary 2-node traffic; a
+                         // non-zero deferred_drop or a non-empty queue_depth at
+                         // stop is a cut this node wanted repaired and never got.
+                         << " | queue{deferred=" << rp.deferred
+                         << " resumed=" << rp.resumed
+                         << " deferred_drop=" << rp.deferred_drop
+                         << " queue_depth=" << repair_driver->deferred()
+                         << " in_flight=" << repair_driver->in_flight()
+                         << " bindings=" << repair_driver->bindings() << "}"
+                         << " | arm{repair_wanted=" << node.s1c_stats().repair_wanted
+                         << " repair_hit=" << node.s1c_stats().repair_hit
+                         << " repair_missing=" << node.s1c_stats().repair_missing
+                         << " cut_miss=" << node.s1c_stats().cut_miss
+                         << " cut_mismatch=" << node.s1c_stats().cut_mismatch << "}"
+                         << " held_for_redrive=" << bed.repairable_held();
+                // ── the REPAIR HORIZON this node can serve a peer from ────────
+                // The w6 §5.2 backward walk, driven through the FrameVault-backed
+                // ISharechainReader: how far back our retained order still
+                // reaches. A peer whose cut is older than this cannot be repaired
+                // by us, and that is the number that says so.
+                if (replay_driver && replay_reader) {
+                    const FrameVault& v = carrier_relay->vault();
+                    const std::uint64_t lo = v.lowest_position(), hi = v.highest_position();
+                    std::size_t walk = 0;
+                    const VaultOrder ends = replay_reader->order(lo, hi + 1, kCtrlMaxIdsPerOrder);
+                    if (ends.status == VaultOrderStatus::OK && !ends.ids.empty()) {
+                        const auto fwd = replay_driver->walk_lane_forward(
+                            ends.ids.back().id, ends.ids.front().id,
+                            persist::ReplayDriver::walk_ceiling(0, hi + 1));
+                        walk = fwd ? fwd->size() : 0;
+                    }
+                    LOG_INFO << "[v37-dash] repair horizon: vault entries=" << v.size()
+                             << " bytes=" << v.bytes()
+                             << " positions[" << lo << ".." << hi << "]"
+                             << " lane_walk=" << walk << " carriers"
+                             << " (a peer cut below position " << lo
+                             << " cannot be repaired from this node)";
+                }
+            }
         }
         if (live_index) {
             const auto ist = live_index->stats();
@@ -659,7 +1402,13 @@ int main(int argc, char** argv) {
         if (const auto s = node.lane_snapshot()) {
             LOG_INFO << "[v37-dash] lane stop: raw_total=" << static_cast<unsigned long long>(s->raw_total)
                      << " next_pos=" << s->next_pos
-                     << " identities=" << (s->identities ? s->identities->size() : 0);
+                     << " identities=" << (s->identities ? s->identities->size() : 0)
+                     // ★ S-1: the lane digest is the CUT WITNESS the E_b fold reads at.
+                     // Two peered nodes that have ingested the same carriers publish the
+                     // SAME digest here — that identity is the precondition for two nodes
+                     // folding the same E_b, and so for a convergent owed_digest.
+                     << " lane_digest=" << hex32(s->digest)
+                     << " version=" << s->version << " incarnation=" << s->incarnation;
             if (s->identities)
                 for (const auto& [mid, ent] : s->identities->entries()) {
                     const auto it = s->payout.find(mid);
@@ -670,10 +1419,51 @@ int main(int argc, char** argv) {
     }
     {
         std::lock_guard<std::mutex> g(bed.mutex());
+        const auto& s1  = node.s1_stats();
+        const auto& s1c = node.s1c_stats();
         node.stop();
         LOG_INFO << "[v37-dash] stop: ledger_seq=" << node.ledger().ledger_seq()
                  << " pending=" << bed.pending_count_locked()
-                 << " owed_digest=" << hex32(node.ledger().owed_digest());   // A8 compares with the next boot: line
+                 << " owed_digest=" << hex32(node.ledger().owed_digest())     // A8 compares with the next boot: line
+                 // ★ S-1: how the E_b folds went. folds=0 with wins registered,
+                 // or an owed_digest still at b4db1ded… after a FOUND, is the
+                 // settlement emission being DEAD — the thing S-1 exists to fix.
+                 << " s1{folds=" << s1.folds << " valueless=" << s1.valueless
+                 << " refused=" << s1.refused << " no_view=" << s1.no_view
+                 << " unresolved=" << s1.unresolved << "}"
+                 // ★ S-1c: the RECEIVE side of the same story. `credited > 0`
+                 // with a non-empty owed_digest is a node that has accounted a
+                 // PEER's block; `cut_miss`/`cut_mismatch` > 0 names exactly how
+                 // many of a peer's blocks this node could NOT converge on.
+                 << " s1c{seen=" << s1c.seen << " credited=" << s1c.credited
+                 << " valueless=" << s1c.valueless << " cut_miss=" << s1c.cut_miss
+                 << " cut_mismatch=" << s1c.cut_mismatch << " refused_fold=" << s1c.refused_fold
+                 << " refused_payout=" << s1c.refused_payout << " refused_late=" << s1c.refused_late
+                 << " already_known=" << s1c.already_known
+                 << " owed_diverged=" << s1c.owed_diverged << "}";
+    }
+    if (drops) {
+        const auto ds = drops->stats();
+        LOG_INFO << "[v37-dash] DROPS stop: enrolled=" << ds.enrolled
+                 << " tip_bin=" << (drops->now_interval() ? *drops->now_interval() : 0)
+                 << " raindrops=" << ds.harvested << " late=" << ds.late
+                 << " shares_counted=" << ds.shares_seen << " declared=" << ds.declared
+                 // ★ withheld > 0 is the wiring going to waste: intervals were
+                 // harvested but their share count was never declared, so they
+                 // were dropped rather than credited as if the payee held no
+                 // shares. It is the conservative error AND the one an operator
+                 // must be able to see.
+                 << " withheld=" << ds.withheld << " discarded_on_peer_win=" << ds.discarded
+                 << " open_intervals=" << ds.open
+                 << " enrollment_digest=" << hex32(drops->enrollment().book_digest());
+        // DETACH BEFORE THE BUNDLE DIES. XbtcNode holds RAW pointers into the
+        // wiring plus a std::function that captures it, and `node` is declared
+        // ABOVE `drops`, so the node outlives the bundle at scope exit. Nothing
+        // in the node's implicit destructor dereferences them today — this is
+        // the line that keeps that true if one ever does.
+        node.set_drop_harvester(nullptr);
+        node.set_enrollment_book(nullptr);
+        node.set_pre_harvest({});
     }
     teardown_io();
     const auto st = backend->stats();

@@ -41,11 +41,62 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Materialize tree + guard cache path (fail closed)
+        working-directory: ${{ github.workspace }}
+        run: |
+          # Reused self-hosted workspace: prune-runner-workspace strips the
+          # checkout to .git/.github at the prior job's end. actions/checkout
+          # then runs `checkout -f <sha>`, which only rewrites files that
+          # DIFFER between the previously-checked-out commit and this head, so
+          # a lockfile unchanged across the two commits is left physically
+          # absent even though HEAD is correct. setup-node's
+          # cache-dependency-path glob then resolves nothing and dies with an
+          # opaque "Some specified paths were not resolved". reset --hard
+          # writes the ENTIRE target tree to disk, closing that gap
+          # deterministically. (Mirrors build.yml's Web-static verify guard.)
+          git reset --hard HEAD
+          # Regression guard (standing rule: assertion ships in the fixing PR):
+          # the cache-dependency-path MUST exist on disk before setup-node, or
+          # a genuinely moved/removed lockfile turns into the same opaque red.
+          lock="web-static/sharechain-explorer/package-lock.json"
+          if [ ! -f "$lock" ]; then
+            echo "::error title=cache-dependency-path unresolved::${lock} absent on disk after checkout. The lockfile moved/was removed, or the tree failed to materialize — fix the path or the checkout, NOT the cache step." >&2
+            exit 1
+          fi
+          echo "checkout verified: ${lock} present on disk"
+
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: web-static/sharechain-explorer/package-lock.json
+          # setup-node's built-in `cache: npm` is deliberately NOT used: its
+          # @actions/glob canonicalizes the lockfile to the runner _work realpath
+          # (/mnt/ci/runners/heavy-1/...) and rejects it as "not under
+          # GITHUB_WORKSPACE" against the un-canonicalized symlink path
+          # (/home/user0/...) — file present, realpath compare fails
+          # (run 35620528834; H-A). Cache npm explicitly below with a
+          # shell-hashed key, immune to the symlink. (Mirrors build.yml.)
+
+      - name: Compute npm cache key (symlink-safe; no @actions/glob)
+        working-directory: ${{ github.workspace }}
+        id: npmcache
+        run: |
+          lock="web-static/sharechain-explorer/package-lock.json"
+          # Regression guard (assertion ships in the fixing PR): hash the
+          # lockfile via the shell — the exact path @actions/glob choked on.
+          if [ ! -f "$lock" ]; then
+            echo "::error title=cache-dependency-path unresolved::${lock} absent on disk. Fix the path or the checkout, NOT the cache step." >&2
+            exit 1
+          fi
+          h="$(sha256sum "$lock" | cut -d' ' -f1)"
+          echo "key=npm-web-static-${h}" >> "$GITHUB_OUTPUT"
+          echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          echo "npm cache key npm-web-static-${h}; lockfile hashed via shell (symlink-safe)"
+
+      - uses: actions/cache@v5
+        with:
+          path: ${{ steps.npmcache.outputs.dir }}
+          key: ${{ steps.npmcache.outputs.key }}
+          restore-keys: npm-web-static-
 
       - name: Install dependencies
         run: npm ci

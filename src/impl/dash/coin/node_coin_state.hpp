@@ -23,6 +23,8 @@
 #include <impl/dash/coin/mn_state_machine.hpp>   // MnStateMachine
 #include <impl/dash/coin/mempool.hpp>            // Mempool
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
+#include <impl/dash/coin/inject_sandbox.hpp>     // #157 M3: InjectSandbox (bounded-work script-verify guard)
+#include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: InjectRateLimiter (node-wide count+byte cap)
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
@@ -35,6 +37,9 @@
 #include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
 
 #include <core/uint256.hpp>
+#include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
+
+#include <ctime>
 
 #include <array>
 #include <cstdint>
@@ -96,7 +101,7 @@ enum class UtxoImmaturePolicy { ServeEmptyTxSet, Refuse };
 
 /// The DISCRIMINATING tail of a block-hash display hex, for log/diagnostic use.
 ///
-/// WHY THIS EXISTS (measured, hotel node 109.161.52.148, 2026-08-06). Every
+/// WHY THIS EXISTS (measured, production node, 2026-08-06). Every
 /// `dmn-stale` refusal in a 5h33m window printed
 ///
 ///     cause=dmn-stale value=000000000000 threshold=000000000000
@@ -139,7 +144,7 @@ public:
     // Mutable accessors for the maintainer (the reception / think slices seed
     // these from mnlistdiff + relayed mempool txs).
     //
-    // D2 (2026-08-07/08 hotel freeze, remaining half of the class): handing
+    // D2 (2026-08-07/08 production freeze, remaining half of the class): handing
     // out a MUTABLE reference to any input of the two committed-root
     // computations bumps the root-memo epoch — the caller MAY mutate, and a
     // memoized root that survives a mutation is a WRONG BLOCK
@@ -218,7 +223,7 @@ public:
     /// DIAGNOSTIC-ONLY — nothing in the viability decision reads it. It exists
     /// because the `dmn-stale` refusal below compares two BLOCK HASHES, and a
     /// hash can only ever say "different", never "how far behind". Every long
-    /// dmn-stale episode measured on the hotel node (2026-08-06: 5 episodes,
+    /// dmn-stale episode measured on the production node (2026-08-06: 5 episodes,
     /// 586 s of the 592 s total) was closed by the NEXT BLOCK arriving rather
     /// than by the SML catching up at the same tip — a distinction the hash
     /// alone cannot express, and the height makes obvious at a glance.
@@ -592,7 +597,7 @@ public:
     /// subsidy / PPLNS / payee path is byte-unchanged (a 0-fee inject adds 0 to
     /// total_fees). Injected txs ride the served-body path, so this augments —
     /// and requires — the serve-mempool-txs / daemonless serve posture.
-    void set_tx_inject_enabled(bool on) { m_tx_inject_enabled = on; }
+    void set_tx_inject_enabled(bool on) { m_tx_inject_enabled = on; publish_inject_status(); }
     bool tx_inject_enabled() const { return m_tx_inject_enabled; }
 
     /// Named outcome of a submit_inject call — every refusal carries its cause
@@ -602,6 +607,13 @@ public:
         std::string cause;    // "ok" or a named refusal
         uint256     txid;
     };
+
+    /// #157 M3 — where an inject entered from. Selects which node-wide rate
+    /// budget it draws on: a peer-origin inject charges the aggregate-PEER
+    /// limiter, a local operator inject the LOCAL limiter. Because the budgets
+    /// are separate, a peer flood exhausts only the peer budget and can NEVER
+    /// starve the operator's own inject. Default Local (the hex-loader path).
+    enum class InjectOrigin : uint8_t { Local, Peer };
 
     /// Submit a raw transaction for injection. Cheapest-checks-first gate
     /// (design §4.3): feature-enabled → DoS caps (pool full / total bytes / per-
@@ -613,7 +625,8 @@ public:
     /// design's wire fields (carried for M2/M3). io-thread only.
     InjectSubmitResult submit_inject(const MutableTransaction& tx,
                                      uint32_t flags = 0,
-                                     int32_t expiry_height = 0) {
+                                     int32_t expiry_height = 0,
+                                     InjectOrigin origin = InjectOrigin::Local) {
         InjectSubmitResult r;
         r.txid = dash::coin::dash_txid(tx);
         if (!m_tx_inject_enabled) { r.cause = "inject-disabled"; return r; }
@@ -622,12 +635,94 @@ public:
         if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
             r.cause = "inject-type-unsupported"; return r;
         }
+        const uint32_t byte_size =
+            static_cast<uint32_t>(::pack(tx).get_span().size());
+        // #157 M3 — PER-TX SIZE CAP, CHARGED-FREE. Refuse an oversize blob HERE,
+        // before the rate limiter is charged and before the sandbox runs, so an
+        // oversize-blob flood cannot drain the node-wide byte-window (8 MB/min)
+        // and starve legitimate injects — 3 peers each pushing one ~2.9 MB junk
+        // frame would otherwise empty the shared byte budget on attempts that get
+        // rejected anyway. TxInjectPool::would_admit re-checks this exact cap, so
+        // hoisting it changes NO accept decision: an oversize inject was always
+        // refused; it now refuses EARLIER, by the SAME named cause. Every CHARGED
+        // attempt is therefore <= kMaxInjectTxBytes and the count cap dominates.
+        // Reward-safe: an earlier refusal only — never loosens a check.
+        if (byte_size > dash::coin::TxInjectPool::kMaxInjectTxBytes) {
+            r.cause = dash::coin::TxInjectPool::admit_name(
+                          dash::coin::TxInjectPool::Admit::TooLarge);
+            return r;
+        }
+        // #157 M3 — RATE LIMIT (node-wide count + bytes per window), CHARGED ON
+        // ATTEMPT before any consensus/script work so an INVALID-inject flood is
+        // throttled too. The budget is SPLIT BY ORIGIN: a peer-origin inject
+        // draws on the aggregate-PEER limiter, a local operator inject on the
+        // LOCAL limiter. This is the invariant a single shared limiter could not
+        // give — a peer flood (7 peers @30/min, or a few @3 MB, or a per-peer
+        // guard reset on reconnect) exhausts ONLY the peer budget and can NEVER
+        // starve the operator's own inject. Reward-safe: a ceiling in front of
+        // the validity gate — only refuses.
+        {
+            dash::coin::InjectRateLimiter& limiter =
+                (origin == InjectOrigin::Peer) ? m_inject_rate_peer : m_inject_rate;
+            const std::time_t now = std::time(nullptr);
+            auto rl = limiter.try_consume(byte_size, now);
+            if (!rl.ok()) {
+                // #157 M3 status (Slice 2): tally the refusal by SCOPE + VERDICT.
+                // Read-only observability store; does NOT change the refusal below.
+                auto& obs = core::obs::inject_status();
+                const bool by_count =
+                    (rl.verdict == dash::coin::InjectRateLimiter::Verdict::CountExceeded);
+                if (origin == InjectOrigin::Peer) {
+                    (by_count ? obs.rl_peer_count_refused : obs.rl_peer_bytes_refused)
+                        .fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    (by_count ? obs.rl_local_count_refused : obs.rl_local_bytes_refused)
+                        .fetch_add(1, std::memory_order_relaxed);
+                }
+                LOG_WARNING << "[MEMPOOL] inject rate-limited cause=" << rl.name()
+                            << " value=" << rl.value << " threshold=" << rl.threshold
+                            << " origin=" << (origin == InjectOrigin::Peer ? "peer" : "local")
+                            << " txid=" << r.txid.GetHex().substr(0, 16);
+                r.cause = rl.name(); return r;
+            }
+        }
+        // #157 M3 — SANDBOX (bounded-work guard on the script-verify surface).
+        // Cheap, chain-state-independent structural bounds run BEFORE the tx can
+        // enter the pool, so a pathological blob never reaches the consensus-exact
+        // interpreter (at admission or at any later build). FAIL-CLOSED: any
+        // breach refuses by name. Reward-safe: a DoS bound in front of the
+        // validity gate — it only refuses, never loosens a check.
+        {
+            auto sb = dash::coin::InjectSandbox::vet(tx);
+            if (!sb.ok()) {
+                // #157 M3 status (Slice 2): tally the refusal by VERDICT (which
+                // bound tripped) plus a running total. Read-only observability
+                // store; does NOT change the refusal below or the accept-set.
+                auto& obs = core::obs::inject_status();
+                obs.sb_refused_total.fetch_add(1, std::memory_order_relaxed);
+                switch (sb.verdict) {
+                    case dash::coin::InjectSandbox::Verdict::TooManyInputs:
+                        obs.sb_refused_inputs.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::TooManyOutputs:
+                        obs.sb_refused_outputs.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::ScriptSigTooLarge:
+                        obs.sb_refused_scriptsig.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::TotalScriptSigTooLarge:
+                        obs.sb_refused_total_scriptsig.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::TooManySigOps:
+                        obs.sb_refused_sigops.fetch_add(1, std::memory_order_relaxed); break;
+                    case dash::coin::InjectSandbox::Verdict::Ok: break;
+                }
+                LOG_WARNING << "[MEMPOOL] inject sandbox-refused cause=" << sb.name()
+                            << " value=" << sb.value << " threshold=" << sb.threshold
+                            << " txid=" << r.txid.GetHex().substr(0, 16);
+                r.cause = sb.name(); return r;
+            }
+        }
         // Lazily reconcile the pool with the mempool before admitting: forget
         // any tracked inject no longer in the mempool (confirmed / evicted) and
         // reap expired ones, so the caps reflect what is actually live.
         reconcile_inject_pool();
-        const uint32_t byte_size =
-            static_cast<uint32_t>(::pack(tx).get_span().size());
         // DoS caps FIRST (cheap, no consensus work): a full / over-cap pool
         // refuses before the mempool pays for pricing.
         auto pv = m_inject_pool.would_admit(r.txid, byte_size);
@@ -642,6 +737,7 @@ public:
         }
         // Track it for DoS accounting + expiry.
         m_inject_pool.admit(r.txid, flags, expiry_height, byte_size);
+        publish_inject_status();
         r.ok = true;
         r.cause = "ok";
         return r;
@@ -660,9 +756,53 @@ public:
                 m_mempool.remove_tx(id);
             }
         }
+        publish_inject_status();
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
+
+    /// Publish the current tx-inject lane state into the process-global
+    /// read-only observability snapshot (core::obs::inject_status()),
+    /// consumed by the loopback /api/tx-inject-status endpoint. Pure MIRROR
+    /// of state the node already owns: NO money-path, NO config write, NO
+    /// arming — it only lets a panel DISPLAY the flag + inflight pool.
+    /// Cheap relaxed-atomic stores; called on arm and after each pool
+    /// mutation (io thread).
+    void publish_inject_status() const {
+        auto& s = core::obs::inject_status();
+        s.enabled.store(m_tx_inject_enabled, std::memory_order_relaxed);
+        s.pool_entries.store(m_inject_pool.size(), std::memory_order_relaxed);
+        s.pool_bytes.store(m_inject_pool.total_bytes(), std::memory_order_relaxed);
+        s.max_entries.store(TxInjectPool::INJECT_POOL_MAX_ENTRIES, std::memory_order_relaxed);
+        s.max_total_bytes.store(TxInjectPool::kMaxInjectTotalBytes, std::memory_order_relaxed);
+        s.max_tx_bytes.store(TxInjectPool::kMaxInjectTxBytes, std::memory_order_relaxed);
+        // #157 M3 status (Slice 2): mirror the rate-limiter window occupancy and
+        // the (constant) caps for both budgets. Refusal tallies are NOT touched
+        // here — they are cumulative and stored at the refusal site in
+        // submit_inject; publish only refreshes the live window + cap view.
+        s.rl_local_in_window.store(m_inject_rate.count_in_window(), std::memory_order_relaxed);
+        s.rl_peer_in_window.store(m_inject_rate_peer.count_in_window(), std::memory_order_relaxed);
+        s.rl_local_bytes_in_window.store(m_inject_rate.bytes_in_window, std::memory_order_relaxed);
+        s.rl_peer_bytes_in_window.store(m_inject_rate_peer.bytes_in_window, std::memory_order_relaxed);
+        s.rl_max_per_window.store(dash::coin::InjectRateLimiter::kMaxInjectsPerWindow, std::memory_order_relaxed);
+        s.rl_max_bytes_per_window.store(dash::coin::InjectRateLimiter::kMaxBytesPerWindow, std::memory_order_relaxed);
+        s.rl_window_sec.store(static_cast<std::uint64_t>(dash::coin::InjectRateLimiter::kWindowSeconds), std::memory_order_relaxed);
+        // #157 M3 status (Slice 2): sandbox bounds (constants).
+        s.sb_max_inputs.store(dash::coin::InjectSandbox::kMaxInputs, std::memory_order_relaxed);
+        s.sb_max_outputs.store(dash::coin::InjectSandbox::kMaxOutputs, std::memory_order_relaxed);
+        s.sb_max_scriptsig.store(dash::coin::InjectSandbox::kMaxScriptSigBytes, std::memory_order_relaxed);
+        s.sb_max_total_scriptsig.store(dash::coin::InjectSandbox::kMaxTotalScriptSigBytes, std::memory_order_relaxed);
+        s.sb_max_sigops.store(dash::coin::InjectSandbox::kMaxLegacySigOps, std::memory_order_relaxed);
+        s.updated_at.store(static_cast<std::int64_t>(std::time(nullptr)), std::memory_order_relaxed);
+    }
+    // #157 M3: number of injects the LOCAL rate limiter still counts inside its
+    // current window (test/observability accessor; no consensus effect).
+    size_t inject_rate_count() const { return m_inject_rate.count_in_window(); }
+    // #157 M3: same, for the aggregate-PEER rate limiter.
+    size_t inject_rate_count_peer() const { return m_inject_rate_peer.count_in_window(); }
+    // #157 M3: bytes the LOCAL rate limiter still counts in its window — proves
+    // an oversize blob was refused BEFORE the byte-window was charged.
+    uint64_t inject_rate_bytes() const { return m_inject_rate.bytes_in_window; }
 
     /// PINNED LOCAL TX (--pin-local-tx-hex, donation-dust consolidation): an
     /// operator-supplied, externally-signed, zero-fee tx that can only reach
@@ -879,6 +1019,23 @@ public:
         };
     }
 
+    /// #1203 — "ask, don't just wait". When a height fails closed with
+    /// cause=qc-plan-underivable the offending quorum's identity is KNOWN
+    /// (QcPlanGap::slot_known, the SlotUnsatisfied stage). dashd relays
+    /// quorum commitments by inventory ONLY, so a node that missed the inv
+    /// has no path to that commitment and the refusal tail runs to ~10 min
+    /// (issue #1203). This hook is invoked at the refusal site WITH that gap
+    /// so a targeted re-request (a getqrinfo for the named quorum) can be
+    /// issued to shorten the tail. It NEVER mints a null commitment and NEVER
+    /// changes what is served — the refusal is still reward-safe and still
+    /// fails closed to the dashd arm. Fired only when the gap names a single
+    /// quorum; the SlotSetUnderivable / Unreported stages have nothing to ask
+    /// for. UNSET (default) => byte-identical to today: the refusal simply
+    /// waits for the next inventory relay.
+    void set_qc_pull_fn(std::function<void(const QcPlanGap&)> fn) {
+        m_qc_pull_fn = std::move(fn);
+    }
+
     /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
     /// enforcement of the #1083 landmine comment at the inclusion site
     /// (embedded_gbt.hpp). dashd's verifier PoSe-punishes every member a
@@ -1083,7 +1240,7 @@ public:
     /// Number of times embedded_template_emit_ok() has been evaluated on this
     /// state (counted at the top of the gate, before any early return). Test
     /// seam: pins that submit-path tip reads never evaluate the serve gate
-    /// (the 2026-08-07/08 hotel freeze amplifier).
+    /// (the 2026-08-07/08 production freeze amplifier).
     uint64_t emit_ok_call_count() const { return m_emit_ok_calls; }
 
     /// BLOCKER-3 pre-emit HARD GATE. Before the embedded arm's template is
@@ -1109,7 +1266,7 @@ public:
         // Call counter FIRST, before any early return: the regression gate in
         // test_dash_submit_gate_scaling.cpp pins that a submit-path tip READ
         // (get_current_gbt_prevhash) never evaluates this gate -- the
-        // 2026-08-07/08 hotel freeze was this method's SML CalcMerkleRoot
+        // 2026-08-07/08 production freeze was this method's SML CalcMerkleRoot
         // running per share submit on the io thread.
         ++m_emit_ok_calls;
         auto reject = [why](const char* c, std::string v, std::string t) -> bool {
@@ -1151,9 +1308,13 @@ public:
         if (m_qc_plan_fn) {
             QcPlanGap qc_gap;
             qc_plan = m_qc_plan_fn(next_h, &qc_gap);
-            if (!qc_plan)   // underivable — fail closed, NAMING what was missing
+            if (!qc_plan) {  // underivable — fail closed, NAMING what was missing
+                // #1203: ASK for the named quorum rather than only waiting for
+                // the next inventory relay (unset hook => unchanged wait).
+                if (m_qc_pull_fn && qc_gap.slot_known) m_qc_pull_fn(qc_gap);
                 return reject("emit-qc-plan-underivable", qc_gap.describe(),
                               "derivable-qc-plan@h=" + std::to_string(next_h));
+            }
             // Collect the type-6 payloads actually in the template.
             std::vector<std::vector<unsigned char>> got;
             for (const auto& tx : w.m_txs)
@@ -1314,7 +1475,7 @@ public:
         // registration height — at most ~nMasternodeMinimumConfirmations
         // blocks per unknown registration).
         //
-        // D2 (2026-08-07/08 hotel freeze, remaining half of the class): the
+        // D2 (2026-08-07/08 production freeze, remaining half of the class): the
         // projection returns a FRESH ~450 KB copy of the SML by value and its
         // root was re-hashed (~2000 x SHA256d) on EVERY evaluation — ~3 per
         // session per notify on the single io thread even after D1 removed
@@ -1470,6 +1631,9 @@ public:
         if (m_qc_plan_fn && m_populated) {
             qc_plan = m_qc_plan_fn(m_prev_height + 1, &qc_gap);
             qc_ok = qc_plan.has_value();
+            // #1203: ASK for the named quorum on the underivable refusal
+            // instead of only waiting for the next inventory relay.
+            if (!qc_ok && m_qc_pull_fn && qc_gap.slot_known) m_qc_pull_fn(qc_gap);
         }
         // Resolve the superblock disposition ONCE (fail-closed unless the
         // daemonless provider is trigger-confident) and thread the schedule.
@@ -1958,7 +2122,7 @@ private:
         return SuperblockDisposition{true, std::move(*sched)};
     }
 
-    // D2 root memo (2026-08-07/08 hotel freeze, remaining half of the class).
+    // D2 root memo (2026-08-07/08 production freeze, remaining half of the class).
     // The epoch is bumped by every non-const accessor / setter whose target
     // feeds either committed root (sml()/qmgr()/mnstates()/set_tip()/
     // set_mn_min_confirmations()); the cached roots are valid only while
@@ -1993,7 +2157,7 @@ private:
     int64_t  m_sml_current_height{-1};        // DIAGNOSTIC ONLY, -1 = never reported; see set_sml_current_height
     bool     m_require_sml{false};            // gate viability on have_sml (embedded arm)
     // How many times embedded_template_emit_ok() was EVALUATED (incremented at
-    // its top, before any early return). Test seam for the 2026-08-07/08 hotel
+    // its top, before any early return). Test seam for the 2026-08-07/08 production
     // freeze regression gate: the serve gate re-derives the full SML merkle
     // root, so the count of evaluations per submit-path tip read must be ZERO
     // (test_dash_submit_gate_scaling.cpp). mutable because the gate is const.
@@ -2016,6 +2180,15 @@ private:
     // m_mempool (Mempool::add_inject priority), not this structure.
     bool                         m_tx_inject_enabled{false};
     dash::coin::TxInjectPool     m_inject_pool;
+    // #157 M3: LOCAL-operator inject rate limiter (count + bytes per window).
+    // The local half of the origin-split node-wide budget.
+    dash::coin::InjectRateLimiter m_inject_rate;
+    // #157 M3: SEPARATE aggregate-PEER inject rate limiter. Same caps as the
+    // local limiter but a distinct budget (Scope::Peers, distinct named causes),
+    // so a peer flood exhausts only THIS budget and never starves a local
+    // inject. The per-peer half remains dash::PeerInjectGuard (tx_inject_relay.hpp).
+    dash::coin::InjectRateLimiter m_inject_rate_peer{
+        dash::coin::InjectRateLimiter::Scope::Peers};
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs
@@ -2049,6 +2222,12 @@ private:
     // E1: serve DKG windows daemonlessly. The QcPlanGap out-param is how a
     // refusal learns WHICH quorum it lacked (see set_qc_plan_fn).
     std::function<std::optional<QcBlockPlan>(uint32_t, QcPlanGap*)> m_qc_plan_fn;
+    // #1203: "ask, don't just wait". Invoked at a qc-plan-underivable refusal
+    // with the named-quorum gap so a targeted re-request (getqrinfo for the
+    // quorum the refusal named) can shorten the ~10-min inventory-only tail.
+    // Fired only when the gap names a single quorum (slot_known); UNSET
+    // (default) => the refusal simply waits for the next relay, byte-identical.
+    std::function<void(const QcPlanGap&)> m_qc_pull_fn;
     // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
     // unset => capability absent => every non-null commitment refused.
     std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
@@ -2089,6 +2268,26 @@ private:
     uint32_t m_version{0};
     bool     m_populated{false};
 };
+
+// #157 M3 (Slice B): build the PEER-origin inject sink EXACTLY as main_dash's
+// arm_tx_inject installs it -- a closure that routes an inbound peer tx through
+// submit_inject charging the aggregate-PEER rate budget (InjectOrigin::Peer),
+// never the operator's LOCAL budget (the M3 anti-starvation split: a peer flood
+// exhausts only the peer budget and can NEVER starve the operator's own local
+// inject). main_dash's arm AND the KAT both build the sink through THIS single
+// helper, so a regression that drops the Peer origin arg (re-merging the two
+// budgets into one) is caught by the KAT rather than sailing through green.
+// Reward-safe: transport + a txid + submit_inject; no coinbase/subsidy/PPLNS/
+// payee/won-block state is touched.
+inline std::function<NodeCoinState::InjectSubmitResult(
+        const MutableTransaction&, uint32_t, int32_t)>
+make_peer_inject_sink(NodeCoinState& st) {
+    return [&st](const MutableTransaction& tx, uint32_t flags,
+                 int32_t expiry_height) {
+        return st.submit_inject(tx, flags, expiry_height,
+                                NodeCoinState::InjectOrigin::Peer);
+    };
+}
 
 } // namespace coin
 } // namespace dash

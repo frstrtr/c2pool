@@ -1943,6 +1943,7 @@
                         <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
                     </div>
                     <div class="graph-container compact" id="hashrate-graph"></div>
+                    <div class="graph-history-note" id="hashrate-graph-note" style="display:none; font-size:12px; color: var(--text-muted); padding: 4px 8px;"></div>
                     <div class="graph-stats compact">
                         <div class="graph-stat"><div class="graph-stat-label">Current</div><div class="graph-stat-value" id="graph-current">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Average</div><div class="graph-stat-value" id="graph-average">-</div></div>
@@ -1979,6 +1980,7 @@
                 <button class="fullscreen-close" onclick="toggleGraphFullscreen()">✕ Close</button>
             </div>
             <div class="fullscreen-graph" id="fullscreen-graph"></div>
+            <div class="graph-history-note" id="fs-graph-note" style="display:none; font-size:12px; color: var(--text-muted); padding: 4px 8px;"></div>
             <div class="fullscreen-stats">
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Current</div><div class="fullscreen-stat-value" id="fs-graph-current">-</div></div>
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Average</div><div class="fullscreen-stat-value" id="fs-graph-average">-</div></div>
@@ -1992,7 +1994,7 @@
         <!-- Active Miners -->
         <div class="table-section">
             <div class="section-header">
-                <h2>⛏️ Active Miners on This Node <span style="font-size: 14px; color: var(--muted); font-weight: normal;">(Connected via Stratum)</span></h2>
+                <h2>⛏️ Active Miners on This Node <span style="font-size: 14px; color: var(--muted); font-weight: normal;">(Stratum sessions + share-chain hashrate)</span></h2>
                 <div style="display: flex; gap: 10px; align-items: center;">
                     <label style="display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none;">
                         <input type="checkbox" id="show_historical_miners" style="cursor: pointer;">
@@ -2020,6 +2022,8 @@
                         <tbody></tbody>
                     </table>
                 </div>
+                <div id="workers_silent_note" style="display: none; color: var(--warning); margin: 8px 0;"></div>
+                <div id="node_role_note" style="display: none; color: var(--muted); margin: 8px 0;">Relay node: no Stratum acceptor runs here, so no miners can connect to it. An empty list is expected on this node, not a fault.</div>
                 <div class="loading" id="active_miners_loading">Loading miners</div>
             </div>
         </div>
@@ -2189,29 +2193,24 @@
                     <h2>📡 <span id="parent_chain_peers_title">Parent Chain</span> Peers</h2>
                     <div style="display: flex; gap: 10px; align-items: center;">
                         <span class="badge" id="broadcaster_peers_count">0</span>
-                        <span class="badge" id="broadcaster_status_badge" style="background: var(--success);">✓ Healthy</span>
+                        <span class="badge" id="broadcaster_status_badge" style="background: var(--text-muted);">…</span>
                     </div>
                 </div>
-                <div class="stats-grid broadcaster-stats" style="margin-bottom: 15px; grid-template-columns: repeat(4, 1fr);">
+                <!-- #1142 item 1: the "Success / Connect Rate" card was a literal '100%'
+                     and "Broadcasts / Success / Failed" showed a found-block count
+                     (hardcoded 0 on the non-merged path). /broadcaster_status has no
+                     broadcast success/failure counter, so both cards are removed
+                     rather than left structurally unable to go red. -->
+                <div class="stats-grid broadcaster-stats" style="margin-bottom: 15px; grid-template-columns: repeat(2, 1fr);">
                     <div class="stat-card" style="padding: 12px;">
                         <div class="stat-label">Connections</div>
                         <div class="stat-value" id="broadcaster_connections" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Active / Target</div>
+                        <div class="stat-sublabel">Connected</div>
                     </div>
                     <div class="stat-card" style="padding: 12px;">
-                        <div class="stat-label">Database</div>
+                        <div class="stat-label">Known Peers</div>
                         <div class="stat-value" id="broadcaster_database_size" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Total Peers</div>
-                    </div>
-                    <div class="stat-card" style="padding: 12px;">
-                        <div class="stat-label">Success</div>
-                        <div class="stat-value" id="broadcaster_success_rate" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Connect Rate</div>
-                    </div>
-                    <div class="stat-card" style="padding: 12px;">
-                        <div class="stat-label">Broadcasts</div>
-                        <div class="stat-value" id="broadcaster_broadcasts" style="font-size: 1.3rem;">-</div>
-                        <div class="stat-sublabel">Success / Failed</div>
+                        <div class="stat-sublabel">Connected + idle</div>
                     </div>
                 </div>
                 <div class="table-scroll">
@@ -2582,11 +2581,25 @@
             d3.json('../stratum_stats', function(stratum_stats) {
                 var minerGroups = {};
                 
-                // Use stratum_stats.workers as the source of real miners
+                // Stratum sessions are the primary source of real miners
                 var stratumWorkers = (stratum_stats && stratum_stats.workers) || {};
-                
-                for (var workerName in stratumWorkers) {
-                    var workerData = stratumWorkers[workerName];
+                // #1142 item 4: stratum_stats only lists this node's stratum sessions, so a miner
+                // whose shares reach the node another way vanished from this table. Add every
+                // local_stats.miner_hash_rates key with no stratum session under its base address
+                // as a hashrate-only row (no connection data), without double-counting stratum miners.
+                var stratumBases = {};
+                for (var sw in stratumWorkers) stratumBases[extractAddress(sw)] = true;
+                var minerRates = local_stats.miner_hash_rates || {};
+                var allWorkers = {};
+                for (var sw2 in stratumWorkers) allWorkers[sw2] = stratumWorkers[sw2];
+                for (var mk in minerRates) {
+                    if (minerRates[mk] > 0 && !stratumBases[extractAddress(mk)] && !allWorkers[mk]) {
+                        allWorkers[mk] = { hash_rate: minerRates[mk], connections: 0, last_seen: 0, non_stratum: true };
+                    }
+                }
+
+                for (var workerName in allWorkers) {
+                    var workerData = allWorkers[workerName];
                     var baseAddress = extractAddress(workerName);
                     var mergedAddr = extractMergedAddress(workerName);
                     
@@ -2664,6 +2677,7 @@
                     }
                     minerGroups[baseAddress].totalDoa += doa_hashrate;
                     minerGroups[baseAddress].totalConnections += (workerData.connections || 0);
+                    if (workerData.non_stratum) minerGroups[baseAddress].nonStratum = true;
                     if (difficulty > minerGroups[baseAddress].maxDifficulty) {
                         minerGroups[baseAddress].maxDifficulty = difficulty;
                     }
@@ -2692,10 +2706,10 @@
                 var allMiners = miners;
                 
                 function renderMinersTable(showHistorical) {
-                    var filtered = showHistorical ? allMiners : allMiners.filter(function(m) { return m.totalConnections > 0; });
+                    var filtered = showHistorical ? allMiners : allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; });
                 
                     // Update count badge: active count (/ total if showing historical)
-                    var activeCount = allMiners.filter(function(m) { return m.totalConnections > 0; }).length;
+                    var activeCount = allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; }).length;
                     d3.select('#active_miners_count').text(showHistorical ? activeCount + ' / ' + allMiners.length : activeCount);
                 
                     // Show top 10 active, or all historical
@@ -3463,8 +3477,32 @@
 
                 var local = d3.sum(values(local_stats.miner_hash_rates));
                 var local_dead = d3.sum(values(local_stats.miner_dead_hash_rates));
-                d3.select('#local_rate').text(format_hashrate(local));
-                d3.select('#local_doa').text(local > 0 ? d3.format('.2p')(local_dead/local) : '0%');
+                // #942: on a relay node (no Stratum acceptor) local hashrate is
+                // not applicable, not a measured 0. Older binaries omit
+                // node_role and keep the old rendering.
+                var _relayNode = local_stats.node_role === 'relay';
+                d3.select('#local_rate').text(_relayNode ? 'n/a (relay node)' : format_hashrate(local));
+                d3.select('#local_doa').text(_relayNode ? 'n/a' : (local > 0 ? d3.format('.2p')(local_dead/local) : '0%'));
+                d3.select('#node_role_note').style('display', _relayNode ? null : 'none');
+
+                // #959: an authorized session that stops sharing is SILENT. Say
+                // so by name, with active/total, so a dead rig cannot hide in
+                // the session count. Older binaries omit both fields.
+                var _ss = local_stats.stratum_sessions;
+                var _silentNote = d3.select('#workers_silent_note');
+                if (_ss && _ss.silent > 0) {
+                    var _names = (local_stats.workers_silent || []).map(function(sw) {
+                        return sw.worker + ' (silent ' + format_dt(sw.silent_seconds) +
+                            (sw.has_shared ? '' : ', no share since connect') + ')';
+                    });
+                    _silentNote.text('\u26a0 ' + _ss.active + ' of ' + _ss.total +
+                        ' Stratum sessions active; ' + _ss.silent +
+                        ' silent (authorized, no accepted share past the threshold)' +
+                        (_names.length ? ': ' + _names.join(', ') : ''));
+                    _silentNote.style('display', null);
+                } else {
+                    _silentNote.style('display', 'none');
+                }
                 
                 d3.select('#shares_total').text(local_stats.shares.total);
                 d3.select('#shares_orphan').text(local_stats.shares.orphan);
@@ -4217,20 +4255,33 @@
                     .text(function(b) { return '...' + b.hash.substr(-8); });
                 tr.append('td')
                     .attr('class', function(b) {
-                        if (b.luck_method === 'first_block') return 'status-pending';  // First block - no luck calc
+                        // #1138: honor the full backend luck_method taxonomy. 'relayed'
+                        // (peer-learned, no local timing) and 'netdiff_unavailable' (header
+                        // never synced) are NOT this pool's pending first block -- render
+                        // them neutral so relay rows stop masquerading as our own blocks.
+                        if (b.luck_method === 'relayed' || b.luck_method === 'netdiff_unavailable') return '';
+                        if (b.luck_method === 'first_block') return 'status-pending';  // genuine first block - no luck calc
                         if (!b.luck) return '';
                         if (b.luck >= 100) return 'status-confirmed';
                         if (b.luck >= 75) return 'status-pending';
                         return 'status-orphaned';
                     })
                     .text(function(b) {
-                        if (b.luck_method === 'first_block') return '1st';  // First block indicator
+                        // #1138: distinct glyphs per method so only a GENUINE first block
+                        // reads '1st'; relay-learned and header-unavailable rows are honest.
+                        if (b.luck_method === 'relayed') return '↗';   // relay-learned from a peer
+                        if (b.luck_method === 'netdiff_unavailable') return 'n/a';
+                        if (b.luck_method === 'first_block') return '1st';  // genuine first block indicator
                         if (b.luck === undefined || b.luck === null) return '-';
                         // Show decimal for very small luck values
                         if (b.luck < 1) return d3.format('.2f')(b.luck) + '%';
                         return b.luck < 1 ? d3.format('.2f')(b.luck) : d3.format('.0f')(b.luck) + '%';
                     })
                     .attr('title', function(b) {
+                        if (b.luck_method === 'relayed')
+                            return 'Relayed from a peer over P2P -- this node has no local timing, so no luck is computed here';
+                        if (b.luck_method === 'netdiff_unavailable')
+                            return 'Luck unavailable -- the block header was never synced, so network difficulty at find time is unknown';
                         if (b.luck_method === 'first_block') {
                             var tip = 'First block - no previous block for luck calculation';
                             if (b.expected_time) tip += '\nExpected time was: ' + format_dt(b.expected_time);
@@ -4315,17 +4366,20 @@
                     .attr('class', function(b) {
                         if (b.status === 'confirmed') return 'status-confirmed';
                         if (b.status === 'orphaned') return 'status-orphaned';
+                        if (b.luck_method === 'relayed') return '';  // #1138: relay rows are not OUR pending blocks
                         return 'status-pending';
                     })
                     .attr('style', 'text-align: center; font-size: 18px;')
                     .attr('title', function(b) {
                         if (b.status === 'confirmed') return 'Confirmed';
                         if (b.status === 'orphaned') return 'Orphaned';
+                        if (b.luck_method === 'relayed') return 'Relayed from a peer -- this node does not track its confirmations';
                         return 'Pending';
                     })
                     .text(function(b) {
                         if (b.status === 'confirmed') return '✓';
                         if (b.status === 'orphaned') return '✗';
+                        if (b.luck_method === 'relayed') return '↗';  // #1138: relay-learned, not our pending block
                         return '⏳';
                     });
                     
@@ -5045,8 +5099,6 @@
                         .text('Not Available');
                     d3.select('#broadcaster_connections').text('N/A');
                     d3.select('#broadcaster_database_size').text('N/A');
-                    d3.select('#broadcaster_success_rate').text('N/A');
-                    d3.select('#broadcaster_broadcasts').text('N/A');
                     d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
                     var tr = d3.select('#broadcaster_peers_tbody').append('tr');
                     tr.append('td')
@@ -5067,8 +5119,6 @@
                 d3.select('#broadcaster_peers_count').text(connectedPeers.length);
                 d3.select('#broadcaster_connections').text(connectedPeers.length);
                 d3.select('#broadcaster_database_size').text(peers.length);
-                d3.select('#broadcaster_success_rate').text('100%');
-                d3.select('#broadcaster_broadcasts').text(data.total_blocks_found || 0);
 
                 // Peers table
                 d3.select('#broadcaster_peers_tbody').selectAll('tr').remove();
@@ -7545,6 +7595,7 @@
             d3.json(endpoints[currentGraphPeriod], function(data) {
                 hashrateData = data;
                 if (!data || data.length === 0) {
+                    setGraphHistoryNote('hashrate-graph-note', [], 0);
                     document.getElementById('hashrate-graph').innerHTML = 
                         '<div style="text-align:center; color: var(--text-muted); padding: 100px 0;">No data available for this period</div>';
                     return;
@@ -7836,6 +7887,32 @@
             return false;
         }
 
+        // #942: a period view ("last_day") only spans this node's recorded
+        // history. After a restart the 1D graph can cover 33 minutes, so every
+        // block found earlier in the period sits left of the x-axis and is
+        // silently dropped. Clamping those markers to the edge would misplace
+        // them in time; instead say how many are not plotted and where the
+        // recorded history begins.
+        var GRAPH_PERIOD_SECONDS = {hour: 3600, day: 86400, week: 604800, month: 2592000, year: 31536000};
+        function setGraphHistoryNote(noteId, blocks, minTime) {
+            var el = document.getElementById(noteId);
+            if (!el) return;
+            var periodStart = Date.now() - (GRAPH_PERIOD_SECONDS[currentGraphPeriod] || 0) * 1000;
+            var hidden = (blocks || []).filter(function(b) {
+                var t = b.ts * 1000;
+                return t >= periodStart && t < minTime;
+            }).length;
+            if (hidden === 0) {
+                el.style.display = 'none';
+                el.textContent = '';
+                return;
+            }
+            el.textContent = 'Graph history on this node starts ' + new Date(minTime).toLocaleString() +
+                '; ' + hidden + (hidden === 1 ? ' block' : ' blocks') + ' found earlier in this period ' +
+                (hidden === 1 ? 'is' : 'are') + ' not plotted (listed under Recent Blocks).';
+            el.style.display = '';
+        }
+
         function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('hashrate-graph');
             blocks = blocks || [];
@@ -7966,7 +8043,7 @@
                     // For luck trend, collect blocks with luck data within time window.
                     // luck <= 0 means "never computed" (relay-learned row, or a row
                     // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
-                    // it drew the 2026-08-05 hotel chart down to zero. Skip, don't draw.
+                    // it drew the 2026-08-05 production chart down to zero. Skip, don't draw.
                     if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
                         luckTrendData.push([blockTime, b.luck]);
                         validLucks.push(b.luck);
@@ -8016,6 +8093,8 @@
                 }
             });
             
+            setGraphHistoryNote('hashrate-graph-note', blocks, minTime);
+
             // Interpolate luck trend to align with hashrate time boundaries.
             // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
             // the render wall-clock "now". luck-if-found-now =
@@ -8725,7 +8804,7 @@
                     // For luck trend, collect blocks with luck data within time window.
                     // luck <= 0 means "never computed" (relay-learned row, or a row
                     // recorded before the netdiff-at-find fix), NOT 0% luck -- plotting
-                    // it drew the 2026-08-05 hotel chart down to zero. Skip, don't draw.
+                    // it drew the 2026-08-05 production chart down to zero. Skip, don't draw.
                     if (b.luck !== undefined && b.luck !== null && b.luck > 0) {
                         luckTrendData.push([blockTime, b.luck]);
                         validLucks.push(b.luck);
@@ -8775,6 +8854,8 @@
                 }
             });
             
+            setGraphHistoryNote('fs-graph-note', blocks, minTime);
+
             // Interpolate luck trend to align with hashrate time boundaries.
             // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
             // the render wall-clock "now". luck-if-found-now =

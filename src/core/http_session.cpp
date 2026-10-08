@@ -14,7 +14,9 @@
 //
 // See docs/ (frstrtr/the) for the full dissolution plan.
 
+#include <core/host_port.hpp>
 #include "web_server.hpp"
+#include "config_endpoint.hpp"   // #157 Slice B: check_control_token() on the submit route
 #include "filesystem.hpp"
 #include "p2p_message_stats.hpp"
 
@@ -84,6 +86,93 @@ static nlohmann::json build_p2p_stats_json()
         {"saturation_fraction",    samples ? static_cast<double>(saturated) / samples : 0.0},
         {"updated_at",             s.sharechain_updated_at.load(std::memory_order_relaxed)}
     };
+    return out;
+}
+
+// ── /api/tx-inject-status — read-only tx-injection lane status (#157) ───
+//
+// Serialises core::obs::inject_status() (the DASH --embedded-tx-inject lane's
+// flag + inflight-pool snapshot) alongside the tx_inject wire counters already
+// tracked in core::obs::p2p_stats(). Pure reader: relaxed atomic loads only, no
+// lock, no node call — same posture (and same reason for living here rather
+// than behind a MiningInterface accessor) as build_p2p_stats_json().
+//
+// REWARD-SAFE / read-only: this SHOWS lane state; it never arms the flag,
+// submits a tx, or writes config. "wired": false = the lane has never
+// published (flag-OFF build, or a coin with no injection lane). The M3
+// rate-limit / sandbox reject counters render as objects once the status has
+// been published (updated_at != 0); while the lane has never published they
+// render null (never 0-as-"unknown").
+static nlohmann::json build_tx_inject_status_json()
+{
+    const auto& s  = obs::inject_status();
+    const auto& ps = obs::p2p_stats();
+
+    const auto updated = s.updated_at.load(std::memory_order_relaxed);
+
+    nlohmann::json out;
+    out["wired"]      = (updated != 0);
+    out["enabled"]    = s.enabled.load(std::memory_order_relaxed);
+    out["updated_at"] = updated;
+    out["pool"] = {
+        {"entries",         s.pool_entries.load(std::memory_order_relaxed)},
+        {"bytes",           s.pool_bytes.load(std::memory_order_relaxed)},
+        {"max_entries",     s.max_entries.load(std::memory_order_relaxed)},
+        {"max_total_bytes", s.max_total_bytes.load(std::memory_order_relaxed)},
+        {"max_tx_bytes",    s.max_tx_bytes.load(std::memory_order_relaxed)}
+    };
+    // M2: tx_inject p2p wire counters (also in /p2p_stats; mirrored here so a
+    // panel reads the whole lane in one request).
+    out["wire"] = {
+        {"tx_inject_in",  ps.get_in(obs::P2PMessage::tx_inject)},
+        {"tx_inject_out", ps.get_out(obs::P2PMessage::tx_inject)}
+    };
+    // M3 (#1606, Slice 2): rate-limiter / sandbox counters + caps, mirrored from
+    // core::obs::inject_status() (stored by NodeCoinState::submit_inject /
+    // publish_inject_status). Rendered ONLY when the lane has published at least
+    // once (wired); while dormant (updated_at == 0) both stay null (not 0) so
+    // "never wired" is never read as "zero refusals". Relaxed loads, no lock.
+    if (updated != 0) {
+        out["rate_limit"] = {
+            {"local", {
+                {"count_refused",   s.rl_local_count_refused.load(std::memory_order_relaxed)},
+                {"bytes_refused",   s.rl_local_bytes_refused.load(std::memory_order_relaxed)},
+                {"in_window",       s.rl_local_in_window.load(std::memory_order_relaxed)},
+                {"bytes_in_window", s.rl_local_bytes_in_window.load(std::memory_order_relaxed)}
+            }},
+            {"peers", {
+                {"count_refused",   s.rl_peer_count_refused.load(std::memory_order_relaxed)},
+                {"bytes_refused",   s.rl_peer_bytes_refused.load(std::memory_order_relaxed)},
+                {"in_window",       s.rl_peer_in_window.load(std::memory_order_relaxed)},
+                {"bytes_in_window", s.rl_peer_bytes_in_window.load(std::memory_order_relaxed)}
+            }},
+            {"caps", {
+                {"max_per_window",       s.rl_max_per_window.load(std::memory_order_relaxed)},
+                {"max_bytes_per_window", s.rl_max_bytes_per_window.load(std::memory_order_relaxed)},
+                {"window_sec",           s.rl_window_sec.load(std::memory_order_relaxed)}
+            }}
+        };
+        out["sandbox"] = {
+            {"refused", {
+                {"total",           s.sb_refused_total.load(std::memory_order_relaxed)},
+                {"inputs",          s.sb_refused_inputs.load(std::memory_order_relaxed)},
+                {"outputs",         s.sb_refused_outputs.load(std::memory_order_relaxed)},
+                {"scriptsig",       s.sb_refused_scriptsig.load(std::memory_order_relaxed)},
+                {"total_scriptsig", s.sb_refused_total_scriptsig.load(std::memory_order_relaxed)},
+                {"sigops",          s.sb_refused_sigops.load(std::memory_order_relaxed)}
+            }},
+            {"caps", {
+                {"max_inputs",          s.sb_max_inputs.load(std::memory_order_relaxed)},
+                {"max_outputs",         s.sb_max_outputs.load(std::memory_order_relaxed)},
+                {"max_scriptsig",       s.sb_max_scriptsig.load(std::memory_order_relaxed)},
+                {"max_total_scriptsig", s.sb_max_total_scriptsig.load(std::memory_order_relaxed)},
+                {"max_sigops",          s.sb_max_sigops.load(std::memory_order_relaxed)}
+            }}
+        };
+    } else {
+        out["rate_limit"] = nullptr;
+        out["sandbox"]    = nullptr;
+    }
     return out;
 }
 
@@ -261,7 +350,12 @@ void HttpSession::process_request()
             }
 
             nlohmann::json rest_result;
-            if (target == "/local_rate")
+            // Per-coin REST override (unset on every coin but c2pool-v37-xmr):
+            // the coin answers the path itself, or returns nullopt to fall through.
+            std::optional<nlohmann::json> rest_override = mining_interface_->call_rest_override(target);
+            if (rest_override)
+                rest_result = std::move(*rest_override);
+            else if (target == "/local_rate")
                 rest_result = mining_interface_->rest_local_rate();
             else if (target == "/global_rate")
                 rest_result = mining_interface_->rest_global_rate();
@@ -438,6 +532,21 @@ void HttpSession::process_request()
             // until the control-token lands with the write path. Exact-match
             // (schema BEFORE the bare path) so the substr dispatch cannot
             // confuse the two. Unwired (no publish / no set_config_fns) => 404.
+            else if (target == "/api/tx-inject-status") {
+                // Read-only tx-injection lane status (#157). Loopback-only,
+                // same posture as /api/config: it reveals whether the injection
+                // lane is armed, which is local-operator information. SHOWS
+                // state only — never arms, submits, or writes config.
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"tx-inject status is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = build_tx_inject_status_json();
+            }
             else if (target == "/api/config" || target == "/api/config/schema") {
                 auto remote_addr = socket_.remote_endpoint().address();
                 if (!remote_addr.is_loopback()) {
@@ -655,11 +764,9 @@ void HttpSession::process_request()
                         std::string ip_q = getQueryParam("ip");
                         port_out = 0;
                         if (!host.empty()) {
-                            auto colon = host.rfind(':');
-                            if (colon != std::string::npos) {
-                                try { port_out = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
-                                host = host.substr(0, colon);
-                            }
+                            auto hp = core::parse_host_port(host);
+                            host = hp.host;
+                            if (hp.port) port_out = *hp.port;
                         } else {
                             host = ip_q;
                         }
@@ -735,11 +842,9 @@ void HttpSession::process_request()
                         uint16_t port = 0;
                         // Host may be "A.B.C.D:PORT" (combined) OR "A.B.C.D" with separate ?port=
                         if (!host.empty()) {
-                            auto colon = host.rfind(':');
-                            if (colon != std::string::npos) {
-                                try { port = static_cast<uint16_t>(std::stoul(host.substr(colon + 1))); } catch (...) {}
-                                host = host.substr(0, colon);
-                            }
+                            auto hp = core::parse_host_port(host);
+                            host = hp.host;
+                            if (hp.port) port = *hp.port;
                         }
                         std::string port_q = getQueryParam("port");
                         if (!port_q.empty()) {
@@ -974,6 +1079,13 @@ void HttpSession::process_request()
                             }
                         }
 
+                        // Per-coin payout-scheme label (empty on every coin but
+                        // c2pool-v37-xmr, whose scheme is WRS / PPR, never PPLNS).
+                        const auto& scheme_label = mining_interface_->get_payout_scheme_label();
+                        if (!scheme_label.empty() &&
+                            (ext == ".html" || ext == ".htm" || ext == ".js" || ext == ".mjs"))
+                            core::rewrite_payout_scheme_label(contents, scheme_label);
+
                         // Explorer nav link injection removed — each HTML page has
                         // client-side JS that checks currency_info.explorer_enabled
                         // and injects the link dynamically. Server-side injection was
@@ -1035,15 +1147,122 @@ void HttpSession::process_request()
             }
         }
         else if (request_.method() == http::verb::post) {
-            // ── Control-plane M1: POST /api/config/apply is INERT this pass.
-            // Runtime mutation is operator-gated: the write path (control-token
-            // + two-phase money nonce + server-side AddressValidator) is NOT
-            // armed, so the only answer is an unconditional 503. Arming this
-            // requires flipping the KAT that pins the 503 — a reviewed change.
-            // (Plan: "the endpoint is never live without the gate.")
+            // ── Control-plane Slice A (#157): POST /api/config/apply is the
+            // LIVE, money-gated write path — but fail-closed by default. It is
+            // loopback-only (same posture as the GET config endpoints), and it
+            // stays an unconditional 503 {"armed":false} UNTIL a main installs
+            // the apply fn AND an operator registers the loopback control token
+            // (config_endpoint::apply_config re-checks the token and answers
+            // 503 {"armed":false} while unset). No main wires it by default, so
+            // production stays dormant; a reviewed operator-tap arming is what
+            // makes it live. The apply fn itself enforces the control token +
+            // two-phase money nonce (bound to the exact diff) + AddressValidator
+            // + M0 tripwire for money-path keys — never a silent default.
             if (std::string(request_.target()) == "/api/config/apply") {
-                response.result(http::status::service_unavailable);
-                response.body() = R"({"armed":false,"error":"config-apply not armed; runtime mutation is operator-gated"})";
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"Config API is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                if (!mining_interface_->has_config_apply_fn()) {
+                    // Dormant: no apply fn installed => preserve the M1 posture.
+                    response.result(http::status::service_unavailable);
+                    response.body() = R"({"armed":false,"error":"config-apply not armed; runtime mutation is operator-gated"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                auto j = mining_interface_->rest_config_apply(request_.body());
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                response.result(static_cast<http::status>(st));
+                response.body() = j.dump();
+                response.prepare_payload();
+                send_response(std::move(response));
+                return;
+            }
+
+            // ── Control-plane Slice B (#157): POST /api/tx-inject/submit ──────
+            // Hand a raw consensus tx to the armed M1 inject gate. Loopback-only
+            // (same posture as /api/config/apply). Fail-closed: a 503
+            // {"armed":false} until a main installs the submit fn, and even then
+            // NodeCoinState::submit_inject refuses ("inject-disabled") while the
+            // --embedded-tx-inject arm is OFF. The submit fn marshals onto the
+            // node io_context (thread_safe_wrap) so the IO-confined inject state
+            // is never touched from the WEB thread. Reward path untouched: an
+            // inject is an ordinary block-body tx.
+            if (std::string(request_.target()) == "/api/tx-inject/submit") {
+                auto remote_addr = socket_.remote_endpoint().address();
+                if (!remote_addr.is_loopback()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"tx-inject API is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                if (!mining_interface_->has_tx_inject_submit_fn()) {
+                    // Dormant: no submit fn installed => feature not wired.
+                    response.result(http::status::service_unavailable);
+                    response.body() = R"({"armed":false,"error":"tx-inject submit not wired"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                // #157 Slice B: the submit body MUST carry the loopback control
+                // token (the SAME token that arms the money gate). Even loopback-
+                // only, this stops any other local process from spending the
+                // operator's own reserved inject rate-budget once the lane is
+                // armed. check_control_token() is fail-closed: 403 while no token
+                // is registered (the default), and 403 on any mismatch.
+                {
+                    std::string presented;
+                    auto body_j = nlohmann::json::parse(request_.body(), nullptr,
+                                                        /*allow_exceptions=*/false);
+                    if (body_j.is_object() && body_j.contains("control_token") &&
+                        body_j["control_token"].is_string())
+                        presented = body_j["control_token"].get<std::string>();
+                    if (!c2pool::config_endpoint::check_control_token(presented)) {
+                        response.result(http::status::forbidden);
+                        response.body() = R"({"ok":false,"cause":"missing or invalid control token"})";
+                        response.prepare_payload();
+                        send_response(std::move(response));
+                        return;
+                    }
+                }
+                // #157 Slice B (timeout-after-5xx money-safety): the
+                // submit fn marshals onto the node io_context via thread_safe_wrap,
+                // which ABANDONS the wait after PRODUCER_DISPATCH_TIMEOUT (~10s)
+                // and throws -- but the task it POSTED still runs submit_inject
+                // when the strand recovers. So a timed-out submit MAY yet be
+                // accepted: the operator must NOT blindly resubmit. Answer the
+                // scoped 504 with that guidance in the body (rather than the
+                // generic 500 catch below, which says nothing about it). A
+                // resubmit is in any case a no-op -- NodeCoinState::submit_inject
+                // -> Mempool::add_inject refuses a duplicate txid by name
+                // ("inject-already-known") -- but say so on the wire so a human /
+                // qt does not read the 5xx as "definitely not accepted". This is
+                // scoped to THIS route only; the shared thread_safe_wrap timeout
+                // behaviour is unchanged for every other caller.
+                nlohmann::json j;
+                try {
+                    j = mining_interface_->rest_tx_inject_submit(request_.body());
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[tx-inject] submit dispatch failed: " << e.what();
+                    response.result(http::status::gateway_timeout);   // 504
+                    response.body() = R"j({"ok":false,"timed_out":true,"cause":"submit dispatch timed out; the tx MAY still have been accepted on the node strand -- do NOT blindly resubmit. A resubmit of the same tx is a no-op: the inject dedup gate refuses a duplicate txid as inject-already-known."})j";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                response.result(static_cast<http::status>(st));
+                response.body() = j.dump();
                 response.prepare_payload();
                 send_response(std::move(response));
                 return;

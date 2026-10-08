@@ -65,7 +65,8 @@
 //   * residual_sink MUST be a well-formed XMR ref (kind XMR_STD/XMR_SUB, 64-B
 //     payload) here, AND torsion-valid under the installed ed25519 point-check
 //     backend at build() — no backend => build() refuses (BadSinkDescriptor).
-//   * output_cap must leave room for fixed + the sink (>= fixed.size() + 1).
+//   * output_cap must leave room for fixed + the sink (>= fixed.size() + 1;
+//     >= fixed.size() when the last fixed output pays the sink -- S1 fold).
 //   * ctx.chain_id must equal ledger.chain(); CARROT fence major_version <= 16.
 //   * every fixed output must be a well-formed XMR ref.
 //   None of these throw: every entry point returns std::nullopt / nullptr with
@@ -153,13 +154,42 @@ struct XmrSettlementConfig {
     ::v37::ScriptRef residual_sink;                    // XMR_STD/XMR_SUB, 64-B payload
     ::v37::bytes32   residual_sink_identity{};         // its ledger identity_key (payout-map key)
 
-    // --- mandated fixed outputs (dev / donation / finder), usually empty ---
+    // --- mandated fixed outputs: empty (fee model OFF), or the ONE protocol donation output (fee model ON, xmr_fee_model.hpp; the residual folds into it, S1; V36 has NO finder output) ---
     std::vector<x6::FixedOutput> fixed;
 
     // --- rulings (operator-tap DRAFT once multi-node; explicit flags here) ---
     KFairSource          kfair     = KFairSource::W4Propose;
     LaneCommitmentSource lc_source = LaneCommitmentSource::OwedDigest;
     ::v37::bytes32       lane_commitment_explicit{};   // used iff lc_source == Explicit
+
+    // recon(A+B credit): where the template reads the receipt-lane cut it commits
+    // on-chain (P, spine_digest) — the node's engine snapshot. Unset => no tail.
+    std::function<bool(std::uint64_t& next_pos, ::v37::bytes32& spine)> credit_cut_source;
+    // SAME-BLOCK PAY-NOW (xmr_paynow.hpp): the projected lane payees at the
+    // committed cut (P, spine) -- settle::project of the SAME view fold_eb
+    // books at. Unset / false => no pay-now (master's residual behaviour).
+    std::function<bool(std::uint64_t next_pos, const ::v37::bytes32& spine,
+                       std::vector<::c2pool::v37n::settle::WeightedPayee>& out)> paynow_source;
+    // EMPTY-CUT FINDER (operator ruling 09-26): the payee this node's templates
+    // pay when paynow_source finds the view at the cut but no payee in it (the
+    // node's own payee). Unset => an empty cut keeps master's residual shape.
+    std::optional<::v37::ScriptRef> ecut_finder;
+
+    // SALTED TIE-BREAK (#1867): order equal-age K_fair cohorts by a hash of
+    // the parent block id instead of the raw identity (builder policy).
+    bool kfair_salted_ties = false;
+    // SPEND-COST FLOOR (payout-threshold.md §2-§3).
+    bool spend_floor = false;
+    // REWARD TOTAL: the template commits "V37R" || total first in the 0x02 tail,
+    // so a share's receipt can be checked against the canonical coinbase.
+    bool commit_total = false;
+    // THE DRAIN RULE (lane-rules fields 23-25; settlement-drain.md). Off
+    // (0/0/0) => master's coinbase bytes; the daemon sets the network's triple.
+    DrainRule drain{};
+
+    // POOL-LINEAGE: the pool_tag every lane block this pool builds commits in
+    // the V37C tail (xmr_pool_tag.hpp). Unset => no V37P field (master's bytes).
+    std::optional<::v37::bytes32> pool_tag;
 
     // ---- sink constructors (payout-target bytes, never address strings) ----
     // Set the sink from raw 32-byte key material; also fills residual_sink_identity.
@@ -204,9 +234,13 @@ struct XmrSettlementConfig {
             if (!::v37::xmr::xmr_ref_well_formed(f.pay))
                 return no("XmrSettlementConfig: a fixed output is not a well-formed XMR ref");
         const std::uint32_t cap = resolved_output_cap();
-        if (cap < fixed.size() + 1)
+        // fee model S1: a last fixed output that pays the sink absorbs the
+        // residual itself (x6::residual_folds_into_fixed) -- no sink slot.
+        const bool sink_folds = !fixed.empty() && fixed.back().pay == residual_sink &&
+                                fixed.back().identity == residual_sink_identity;
+        if (cap < fixed.size() + (sink_folds ? 0 : 1))
             return no("XmrSettlementConfig: output_cap leaves no room for fixed + sink "
-                      "(need >= fixed.size() + 1)");
+                      "(need >= fixed.size() + 1, or fixed.size() when the last fixed output pays the sink)");
         if (lc_source == LaneCommitmentSource::Explicit &&
             lane_commitment_explicit == ::v37::bytes32{})
             return no("XmrSettlementConfig: lc_source == Explicit but lane_commitment_explicit is zero");
@@ -303,6 +337,32 @@ make_xmr_coinbase_context(const XmrSettlementConfig& cfg,
     ctx.fixed                  = cfg.fixed;
     ctx.h_min                  = cfg.h_min;
     ctx.output_cap             = cfg.resolved_output_cap();
+    ctx.kfair_salted_ties      = cfg.kfair_salted_ties;
+    ctx.spend_floor            = cfg.spend_floor;
+    ctx.drain                  = cfg.drain;   // THE DRAIN RULE
+    if (cfg.credit_cut_source)   // recon(A+B credit): commit the lane cut on-chain
+        ctx.has_credit_cut = cfg.credit_cut_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest);
+    if (cfg.pool_tag) { ctx.has_pool_tag = true; ctx.pool_tag = *cfg.pool_tag; }   // POOL-LINEAGE
+    if (ledger.rules().anchor_cut) {
+        // ANCHOR (ruling A 2026-09-29): pay-now pays the payees of the view at the
+        // ledger's anchor (the cut of the latest lane block finalized into it);
+        // no anchor yet = nobody (the empty-cut finder rule). The view must be
+        // readable, or the template is not built: a coinbase without its pay-now
+        // would not be the canonical one every node rebuilds.
+        if (ctx.has_credit_cut) {
+            if (const auto a = ledger.anchor_cut()) {
+                if (!cfg.paynow_source || !cfg.paynow_source(a->next_pos, a->spine, ctx.paynow_payees))
+                    return no("anchor-pending: the view at the ledger's anchor cut P=" + std::to_string(a->next_pos) +
+                              " is not readable here yet (the template waits for it)");
+            } else {
+                ctx.paynow_payees.clear();
+            }
+            ctx.has_paynow = true;
+        }
+    } else if (ctx.has_credit_cut && cfg.paynow_source) {   // SAME-BLOCK PAY-NOW: E_b weights at that cut
+        ctx.has_paynow = cfg.paynow_source(ctx.credit_cut.next_pos, ctx.credit_cut.spine_digest, ctx.paynow_payees);
+    }
+    if (ctx.has_paynow && ctx.paynow_payees.empty()) ctx.ecut_finder = cfg.ecut_finder;   // EMPTY-CUT FINDER
     if (why) why->clear();
     return ctx;
 }
@@ -371,6 +431,42 @@ inline x6::CoinbaseInputs assembly_settle_inputs(const XmrOwedSettlementSource& 
 class XmrOwedFixture {
 public:
     explicit XmrOwedFixture(::v37::ChainId chain) : m_ledger(chain) {}
+    //  wrap the NODE's live OwedLedger (FOUND/FINALIZE/ORPHAN land there).
+    explicit XmrOwedFixture(OwedLedger& ext) : m_ledger(ext.chain()), m_ext(&ext) {}
+    // true = the resolver did not hold this ref yet (REJOIN-PAYEE counts what a cut taught it)
+    bool learn_ref(const ::v37::ScriptRef& pay) {
+        auto& slot = m_paymap[::v37::xmr::xmr_identity_key(pay)];
+        const bool fresh = !(slot == pay);
+        slot = pay;
+        return fresh;
+    }
+    std::vector<::v37::bytes32> keys() const { std::vector<::v37::bytes32> v; for (const auto& [k, r] : m_paymap) { (void)r; v.push_back(k); } return v; }
+
+    // BOOKED REFS (every node recomputes the lane coinbase,
+    // xmr_coinbase_recompute.hpp). learn_ref() takes refs from anywhere: relay
+    // arrival order, this node's own payee, a restart's reload. That is right
+    // for mapping outputs, but the OWED PASS decides who is paid and in what
+    // order, and every node rebuilds it at the block's booking point. So the
+    // owed pass resolves only the refs every node holds at that point: those
+    // taught by BOOKED lane blocks (the view at each booked cut, the refs its
+    // outputs paid), the seeds and the compiled-in donation. A key known only
+    // locally is carried, identically on every node, until a booked block
+    // teaches its ref. learn_booked_ref() also learns the ref for mapping.
+    // true = new.
+    bool learn_booked_ref(const ::v37::ScriptRef& pay) {
+        learn_ref(pay);
+        auto& slot = m_booked[::v37::xmr::xmr_identity_key(pay)];
+        const bool fresh = !(slot == pay);
+        slot = pay;
+        return fresh;
+    }
+    std::size_t booked_refs() const { return m_booked.size(); }
+    std::map<::v37::bytes32, ::v37::ScriptRef> booked_map() const { return m_booked; }   // a snapshot (share verdicts)
+    std::vector<::v37::bytes32> booked_keys() const {
+        std::vector<::v37::bytes32> v;
+        for (const auto& [k, r] : m_booked) { (void)r; v.push_back(k); }
+        return v;
+    }
 
     // Credit + finalize `amount` piconero owed to XMR ref `pay`. Its ledger key
     // is the canon identity_key(pay); the resolver learns pay for that key.
@@ -379,12 +475,30 @@ public:
     ::v37::bytes32 seed_owed(const ::v37::ScriptRef& pay, std::uint64_t amount) {
         ::v37::bytes32 key = ::v37::xmr::xmr_identity_key(pay);
         m_paymap[key] = pay;
+        m_booked[key] = pay;   // a seed is lane config: every node holds it
         const std::string bid = "fixture-seed-" + std::to_string(m_next_bid++);
         OwedLedger::Amounts credit; credit[key] = static_cast<long long>(amount);
-        m_ledger.on_block_found(bid, credit, /*payout=*/{});
-        m_ledger.on_block_finalized(bid, /*bin_height=*/m_next_age++);
+        const std::uint64_t age = m_next_age++;
+        if (m_seed_sink) {
+            // R-C rework-2 (F1): the seed goes THROUGH the node's write-ahead event
+            // log (FOUND + FINALIZE, each firing the ledger-event observer), so a
+            // restarted node's replayed digest history contains it. The sink is
+            // idempotent on a resumed store (the replay already applied it).
+            m_last_seed_fresh = m_seed_sink(bid, credit, age);
+            return key;
+        }
+        ledger().on_block_found(bid, credit, /*payout=*/{});
+        ledger().on_block_finalized(bid, /*bin_height=*/age);
+        m_last_seed_fresh = true;
         return key;
     }
+    // R-C rework-2 (F1): route seeds through the node's event log (XmrNode::
+    // seed_settled_owed). Without it seed_owed mutates the ledger OUTSIDE the
+    // log -- invisible to RecoveryDriver, the restart-liveness root cause.
+    using SeedSink = std::function<bool(const std::string& bid, const OwedLedger::Amounts& credit,
+                                        std::uint64_t bin_height)>;
+    void set_seed_sink(SeedSink s) { m_seed_sink = std::move(s); }
+    bool last_seed_fresh() const { return m_last_seed_fresh; }
 
     // Convenience: seed from raw key material.
     ::v37::bytes32 seed_owed_std(const std::array<std::uint8_t, 32>& spend_B,
@@ -404,15 +518,29 @@ public:
         };
     }
 
-    const OwedLedger& ledger() const { return m_ledger; }
-    OwedLedger&       ledger()       { return m_ledger; }
+    // The owed-pass resolver: booked refs only (see learn_booked_ref).
+    PayOfFn pay_of_booked() const {
+        return [this](const ::v37::bytes32& k) -> ::v37::ScriptRef {
+            auto it = m_booked.find(k);
+            if (it != m_booked.end()) return it->second;
+            ::v37::ScriptRef raw; raw.kind = ::v37::ScriptKind::RAW; raw.payload.clear();
+            return raw;
+        };
+    }
+
+    const OwedLedger& ledger() const { return m_ext ? *m_ext : m_ledger; }
+    OwedLedger&       ledger()       { return m_ext ? *m_ext : m_ledger; }
     std::size_t       seeded() const { return m_paymap.size(); }
 
 private:
     OwedLedger                            m_ledger;
+    OwedLedger*                           m_ext = nullptr;   // 
     std::map<::v37::bytes32, ::v37::ScriptRef> m_paymap;
+    std::map<::v37::bytes32, ::v37::ScriptRef> m_booked;   // BOOKED REFS: the owed pass's resolver
     std::uint64_t                         m_next_bid = 0;
     std::uint64_t                         m_next_age = 1;   // 0 reserved / unarmed
+    SeedSink                              m_seed_sink;       // R-C rework-2 (F1)
+    bool                                  m_last_seed_fresh = true;
 };
 
 // ===========================================================================
@@ -454,9 +582,18 @@ inline bool run(std::string* why = nullptr) {
     {
         XmrSettlementConfig bad = cfg;
         bad.output_cap = 1;                       // room for exactly 1 = the sink
-        bad.fixed.push_back(x6::FixedOutput{sample_wellformed_ref(), 1, {}});
+        bad.fixed.push_back(x6::FixedOutput{sample_wellformed_ref(), 1, {}});   // another identity: not the sink
         std::string w;
         if (bad.validate_structural(&w)) return fail("S3: cap-too-small (fixed+sink) accepted");
+    }
+    {
+        // (S3b, fee model S1) the same cap with the fixed output paying the sink:
+        // it absorbs the residual, no sink slot is needed -> valid.
+        XmrSettlementConfig fold = cfg;
+        fold.output_cap = 1;
+        fold.fixed.push_back(x6::FixedOutput{cfg.residual_sink, 1, cfg.residual_sink_identity});
+        std::string w;
+        if (!fold.validate_structural(&w)) return fail("S3b: a fixed output paying the sink (S1 fold) refused at cap 1: " + w);
     }
     // (S4) make_xmr_coinbase_context copies every field through and defaults the
     //      lane commitment to the empty ledger's owed_digest.

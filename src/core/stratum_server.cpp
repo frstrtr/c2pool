@@ -211,7 +211,7 @@ void StratumServer::accept_connections()
 void StratumServer::handle_accept(boost::system::error_code ec, tcp::socket socket)
 {
     if (!ec) {
-        // ── STRICT per-node miner cap (hotel interim fix #5) ──
+        // ── STRICT per-node miner cap (interim hardening fix #5) ──
         // Admission control BEFORE register_session: if the node already holds
         // max_stratum_connections live sessions, close the new socket cleanly,
         // WARN, bump the refused counter, and keep accepting. 0 = unlimited.
@@ -881,8 +881,12 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
             wi.difficulty = hashrate_tracker_.get_current_difficulty();
             wi.connected_at = connected_at_;
             try {
-                wi.remote_endpoint = socket_.remote_endpoint().address().to_string()
-                    + ":" + std::to_string(socket_.remote_endpoint().port());
+                const auto rep = socket_.remote_endpoint();
+                const auto addr = rep.address().to_string();
+                // #965 Phase-2: bracket IPv6 so "host:port" stays unambiguous
+                // for the web_server per-IP grouping consumer.
+                wi.remote_endpoint = (rep.address().is_v6() ? "[" + addr + "]" : addr)
+                    + ":" + std::to_string(rep.port());
             } catch (...) {}
             wi.rtt_ms = sample_tcp_rtt_ms(socket_.native_handle());
             mining_interface_->register_stratum_worker(session_id_, wi);
@@ -1260,7 +1264,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // against the difficulty THIS job was issued at (the target the miner
     // actually received), not the live vardiff. A vardiff UP-retarget between
     // job-issue and submit must not reject the miner's in-flight shares — that
-    // was the sole source of the DASH hotel's ~28% "Low difficulty share"
+    // was the sole source of the DASH production node's ~28% "Low difficulty share"
     // rejects (X11 hashrate swings oscillate vardiff; every up-retarget
     // rejected in-flight work). Faithful port of p2pool-dash work.py:477
     // ("within 3 work events" grace): p2pool judges each share by its OWN job's
@@ -1866,7 +1870,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     bool clean_jobs = force_clean || (prevhash != last_prevhash_);
     last_prevhash_ = prevhash;
 
-    // ── Shared per-generation payload (hotel interim fix #2) ──
+    // ── Shared per-generation payload (interim hardening fix #2) ──
     // coinb1/coinb2 (coinb2 carries the PPLNS outputs) + the merkle branch
     // vectors are the dominant per-job allocations. Within one work generation
     // a session rebuilds byte-identical copies on every notify (VARDIFF pushes,
@@ -1896,7 +1900,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         payload_cache_generation_ = work_generation;
     }
 
-    // ── Job tracking: FIFO + 300 s TTL eviction (hotel interim fix #1) ──
+    // ── Job tracking: FIFO + 300 s TTL eviction (interim hardening fix #1) ──
     // active_jobs_ is an unordered_map: erase(begin()) removed an ARBITRARY
     // entry — possibly the job the miner is hashing right now — producing
     // nondeterministic stale-rejects under notify storms. job_order_ records

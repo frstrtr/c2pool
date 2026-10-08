@@ -54,9 +54,17 @@ fi
 echo "[$GATE] PASS (CI arm) — $N assembled-block / producer assertions green"
 
 # 4. Optional live regtest arm — only when an isolated dashd is wired in via env.
+# Fail-closed invariant: the live-arm script this gate promises to drive MUST
+# exist on the branch, whether or not creds are wired. A missing arm is a
+# gate-integrity failure (a per-coin gate that cannot fail), NOT a silent skip.
+LIVE_ARM="$REPO_ROOT/scripts/dash_g3a_populated_block_regtest.sh"
+if [ ! -f "$LIVE_ARM" ]; then
+  echo "[$GATE] FAIL — live-arm script missing: ${LIVE_ARM#"$REPO_ROOT"/} (gate cannot fake-green)" >&2
+  exit 3
+fi
 if [ -n "${DASH_RPC_PASS:-}" ] && [ -n "${DASH_RPC_AUTH:-}" ]; then
   echo "[$GATE] live arm: driving scripts/dash_g3a_populated_block_regtest.sh"
-  "$REPO_ROOT/scripts/dash_g3a_populated_block_regtest.sh"
+  "$LIVE_ARM"
   echo "[$GATE] PASS (live arm) — populated regtest block proven via c2pool-dash submitblock"
 else
   echo "[$GATE] live regtest arm SKIPPED (set DASH_RPC_PASS + DASH_RPC_AUTH to enable)"

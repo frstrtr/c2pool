@@ -19,6 +19,7 @@
 // guard can exercise the parser without dragging the coin config in.
 // ---------------------------------------------------------------------------
 
+#include <core/host_port.hpp>
 #include <cstdint>
 #include <fstream>
 #include <string>
@@ -87,17 +88,15 @@ inline bool load_rpc_conf(const std::string& path, RpcConf& out)
 inline void apply_endpoint_override(const std::string& hostport, RpcConf& out)
 {
     if (hostport.empty()) return;
-    const auto colon = hostport.rfind(':');
-    if (colon == std::string::npos) { out.host = hostport; return; }
-    out.host = hostport.substr(0, colon);
-    const std::string p = hostport.substr(colon + 1);
-    if (!p.empty()) out.port = static_cast<uint16_t>(std::stoi(p));
+    const auto hp = core::parse_host_port(hostport);
+    out.host = hp.host;
+    if (hp.port) out.port = *hp.port;
 }
 
 // ---------------------------------------------------------------------------
 // DASHD-CUT arm authority (daemonless cut mode).
 //
-// THE DEFECT THIS CLOSES (hotel-reserve thrash, 2026-08-15):
+// THE DEFECT THIS CLOSES (reserve node thrash, 2026-08-15):
 // removing --coin-rpc was COSMETIC. conf.armed() alone (creds resolved from the
 // DEFAULT ~/.dashcore/dash.conf) re-armed the dashd-fallback CoindRPC to
 // 127.0.0.1:9998. When the operator then stopped dashd, the armed-but-dead RPC

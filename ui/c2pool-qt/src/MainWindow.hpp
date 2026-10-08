@@ -8,6 +8,7 @@
 #include "PageMining.hpp"
 #include "PageOverview.hpp"
 #include "PageSettings.hpp"
+#include "PageTxInject.hpp"
 #include "SettingsStore.hpp"
 #include "bridges/CoinBridge.hpp"
 #include "bridges/PplnsBridge.hpp"
@@ -64,6 +65,7 @@ private:
     PageMining*       miningPage_;
     PageLogs*         logsPage_;
     PageSettings*     settingsPage_;
+    PageTxInject*     txInjectPage_;
     PageEmbedded*     sharechainPage_;
     PageEmbedded*     pplnsPage_;
     SharechainBridge* sharechainBridge_;

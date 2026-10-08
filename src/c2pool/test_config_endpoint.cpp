@@ -20,9 +20,16 @@
 #include "../impl/dash/coin/good_citizen_defaults.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 using namespace c2pool::settings;
 namespace ce = c2pool::config_endpoint;
@@ -170,6 +177,161 @@ int main() {
                       && !r.applied,
                   "one invalid key rejects whole batch (atomic)");
         }
+    }
+
+    // ---- Slice 3 (#157): load_control_token_file KATs ---------------------
+    // Pure launch-seam validator: regular-file + mode-EXACTLY-0600 + owner==euid
+    // + token length 32..128 non-whitespace. A refusal returns nullopt (arms
+    // NOTHING) and never touches the process-global control token.
+    {
+        // has_control_token() is false until an operator arms it. NOTHING in this
+        // test (nor in production by default) calls set_control_token(), so the
+        // apply endpoint stays fail-closed. (KAT: flag absent => not armed.)
+        check(ce::has_control_token() == false,
+              "control token not registered when the launch flag is absent");
+
+        // Scratch dir under $TMPDIR (or /tmp), unique per-process.
+        std::string dir = (std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp");
+        if (!dir.empty() && dir.back() == '/') dir.pop_back();
+        char sub[64];
+        std::snprintf(sub, sizeof(sub), "/c2p_ctf_%ld", (long)getpid());
+        dir += sub;
+        ::mkdir(dir.c_str(), 0700);
+
+        auto write_file = [](const std::string& p, const std::string& body,
+                             mode_t mode) {
+            { std::ofstream o(p, std::ios::binary); o << body; }
+            ::chmod(p.c_str(), mode);
+        };
+        const std::string good_token = "0123456789abcdef0123456789abcdef0011"; // 36 chars
+
+        // 1) valid 0600 file with a 32-128 char token -> accepted, exact bytes.
+        {
+            std::string p = dir + "/valid";
+            write_file(p, good_token + "\n", 0600);   // trailing newline trimmed
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(t.has_value() && *t == good_token,
+                  "0600 valid file accepted; token trimmed byte-exact");
+        }
+        // 2) mode 0644 -> refused (mode must be exactly 0600).
+        {
+            std::string p = dir + "/mode644";
+            write_file(p, good_token + "\n", 0644);
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "0644 file refused (mode must be exactly 0600)");
+        }
+        // 2b) mode 0640 (group-readable) -> refused.
+        {
+            std::string p = dir + "/mode640";
+            write_file(p, good_token + "\n", 0640);
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "0640 file refused (group bit set)");
+        }
+        // 3) empty token -> refused.
+        {
+            std::string p = dir + "/empty";
+            write_file(p, "\n", 0600);
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "empty token refused");
+        }
+        // 3b) short token (<32) -> refused.
+        {
+            std::string p = dir + "/short";
+            write_file(p, "deadbeef\n", 0600);        // 8 chars
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "short (<32) token refused");
+        }
+        // 3c) over-long token (>128) -> refused.
+        {
+            std::string p = dir + "/long";
+            write_file(p, std::string(200, 'a') + "\n", 0600);
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "over-long (>128) token refused");
+        }
+        // 3d) interior whitespace -> refused.
+        {
+            std::string p = dir + "/ws";
+            write_file(p, "0123456789abcdef 0123456789abcdef0011\n", 0600);
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "token with interior whitespace refused");
+        }
+        // 4) missing file -> refused.
+        {
+            std::string why;
+            auto t = ce::load_control_token_file(dir + "/nope", &why);
+            check(!t.has_value(), "missing file refused");
+        }
+        // 5) a directory (not a regular file) -> refused.
+        {
+            std::string why;
+            auto t = ce::load_control_token_file(dir, &why);
+            check(!t.has_value(), "directory refused (not a regular file)");
+        }
+        // 5b) a symlink to a valid 0600 file -> refused (S1 proof: the fd-based
+        //     validator opens with O_NOFOLLOW and validates the fstat of the
+        //     open fd, so a final-component symlink can never be followed and
+        //     the lstat->open-by-path TOCTOU is closed). Needs no privilege.
+        {
+            std::string target = dir + "/symtarget";
+            std::string link   = dir + "/symlink";
+            write_file(target, good_token + "\n", 0600);
+            ::unlink(link.c_str());
+            check(::symlink(target.c_str(), link.c_str()) == 0,
+                  "symlink KAT: created a symlink pointing at a valid 0600 file");
+            std::string why;
+            auto t = ce::load_control_token_file(link, &why);
+            check(!t.has_value(),
+                  "symlink to a valid 0600 file refused (O_NOFOLLOW, no TOCTOU)");
+        }
+        // 5c) mode 0700 (owner-exec bit) -> refused (mode must be exactly 0600).
+        {
+            std::string p = dir + "/mode700";
+            write_file(p, good_token + "\n", 0700);
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "0700 file refused (exec bit; mode must be 0600)");
+        }
+        // 5d) 0600 + setuid bit (04600) -> refused. The `& 07777 == 0600` check
+        //     rejects ANY setuid/setgid/sticky bit, not only group/other.
+        {
+            std::string p = dir + "/setuid";
+            write_file(p, good_token + "\n", 0600);
+            ::chmod(p.c_str(), S_ISUID | 0600);   // 04600
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "0600+setuid (04600) file refused (07777 != 0600)");
+        }
+        // 6) wrong owner -> refused. Only exercisable as root (chown needs
+        //    privilege); otherwise skipped honestly (never faked green).
+        if (::geteuid() == 0) {
+            std::string p = dir + "/otheruid";
+            write_file(p, good_token + "\n", 0600);
+            if (::chown(p.c_str(), 65534, 65534) != 0) {}  // nobody (best-effort)
+            std::string why;
+            auto t = ce::load_control_token_file(p, &why);
+            check(!t.has_value(), "file owned by another uid refused");
+        } else {
+            printf("skip: wrong-owner KAT (needs root to chown)\n");
+        }
+
+        // Loading a valid token here is a PURE read: it must NOT have armed the
+        // process-global control token.
+        check(ce::has_control_token() == false,
+              "load_control_token_file is pure (does not register the token)");
+
+        // Cleanup (best-effort).
+        for (const char* n : {"/valid","/mode644","/mode640","/empty","/short",
+                              "/long","/ws","/otheruid","/symtarget","/symlink",
+                              "/mode700","/setuid"})
+            ::unlink((dir + n).c_str());
+        ::rmdir(dir.c_str());
     }
 
     // ---- cross-check: core referee invariant == good-citizen resolver -----

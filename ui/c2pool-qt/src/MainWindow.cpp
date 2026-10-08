@@ -109,7 +109,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     auto* layout = new QHBoxLayout(central);
 
     navList_ = new QListWidget(central);
-    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "PPLNS", "Logs", "Settings"});
+    navList_->addItems({"Launch", "Overview", "Mining", "Sharechain", "PPLNS", "Logs", "Settings", "Tx Inject"});
     navList_->setFixedWidth(180);
     layout->addWidget(navList_);
 
@@ -166,6 +166,9 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
 
     logsPage_       = new PageLogs(stack_);
     settingsPage_   = new PageSettings(settings_, stack_);
+    // #157: native DASH tx-injection control page. Reuses the shared ApiClient
+    // (loopback control-plane) + SettingsStore (secret token storage).
+    txInjectPage_   = new PageTxInject(&api_, settings_, stack_);
 
     stack_->addWidget(launchPage_);     // index 0
     stack_->addWidget(overviewPage_);   // index 1
@@ -174,6 +177,7 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     stack_->addWidget(pplnsPage_);      // index 4
     stack_->addWidget(logsPage_);       // index 5
     stack_->addWidget(settingsPage_);   // index 6
+    stack_->addWidget(txInjectPage_);   // index 7
 
     // Settings page Import can touch any key — rebuild every UI
     // surface that mirrors SettingsStore so nothing drifts.
@@ -191,6 +195,11 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
     setCentralWidget(central);
 
     navList_->setCurrentRow(0);
+
+    // #157: the tx-inject page is DASH-only — bind its visibility to the active
+    // coin (from the CoinBridge descriptor) at boot and on every profile switch.
+    txInjectPage_->setActiveCoin(
+        coinBridge_->currentCoinDescriptor().value("symbol").toString());
 
     connect(navList_, &QListWidget::currentRowChanged, this, [this](int row) {
         stack_->setCurrentIndex(row);
@@ -269,6 +278,8 @@ MainWindow::MainWindow(SettingsStore* settings, QWidget* parent)
                 sharechainPage_->reload();
                 pplnsPage_->reload();
                 miningPage_->reloadEmbed();
+                txInjectPage_->setActiveCoin(
+                    coinBridge_->currentCoinDescriptor().value("symbol").toString());
                 reloadProfileCombo();
                 statusLabel_->setText(tr("Profile: %1").arg(newActive));
                 refreshCurrentPage();
@@ -383,6 +394,10 @@ void MainWindow::refreshCurrentPage()
         // combo, keychain daemon prompts).
         settingsPage_->reload();
         statusLabel_->setText("Settings");
+        break;
+    case 7:
+        txInjectPage_->refresh(&api_);
+        statusLabel_->setText("Tx Inject");
         break;
     default:
         break;

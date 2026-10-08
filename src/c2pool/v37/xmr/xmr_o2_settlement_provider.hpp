@@ -50,25 +50,60 @@
 // are surfaced as EXPLICIT config in XmrSettlementConfig and are NOT wired here
 // as a peer-reject gate — that seam is handed to the operator.
 //
-// THREADING: refresh() = main thread (reads the ledger, calls get_miner_data).
-// current()/by_id()/difficulty_by_id()/candidate_by_id()/template_id() and the
-// ITemplateSource methods are any-thread (mutex snapshot copy / shared_ptr to an
-// immutable AssembledTemplate). A retained snapshot outlives every in-flight job
-// that can still name its template_id.
+// THREADING: refresh() = main thread (reads the ledger, pumps + reads the miner
+// data source). current()/by_id()/difficulty_by_id()/candidate_by_id()/
+// template_id() and the ITemplateSource methods are any-thread (mutex snapshot
+// copy / shared_ptr to an immutable AssembledTemplate). A retained snapshot
+// outlives every in-flight job that can still name its template_id.
+//
+// ---------------------------------------------------------------------------
+// C4 REBIND (native-minimal Monero node, Wave 1). The flow line above that read
+// "monerod get_miner_data -> node::MinerData" is now
+//
+//     IMinerDataSource::snapshot() -> node::MinerData
+//
+// and NOTHING BELOW IT CHANGED. The assembler, the X6 settlement source, the
+// reward/payee fixpoint, the exact-sum residual sink, the owed_digest in
+// tx_extra 0x03 and the retained-template ring are untouched: assemble() below
+// is the same function it was, fed from a seam instead of from a socket. That
+// is the point of the seam -- the K_fair coinbase shape cannot drift when the
+// code that builds it did not move.
+//
+// Two sources implement the seam (src/impl/xmr/native/template/):
+//   * MonerodMinerDataSource -- the get_miner_data RPC path, verbatim. Still
+//     the default, still never removed.
+//   * NativeMinerDataSource  -- the C2c chain index + the C3 relayed txpool. A
+//     template built through it makes NO daemon call at all.
+//
+// The two constructors below are the only difference a caller sees. The legacy
+// (IMonerodTransport&) one OWNS a MonerodMinerDataSource and pumps it once per
+// refresh, which is the same one RPC per refresh the old body did. It rebuilds
+// when the parent tip moved (the pre-seam rule) AND -- good-citizen, since
+// 2026-09-22 -- when the tx set monerod OFFERS in get_miner_data.tx_backlog
+// moved under an unchanged tip, rate-limited to one admission per
+// MonerodArmConfig::backlog_refresh_s (default 3 s; 0 = legacy tip-only). The
+// native arm runs the same policy. The (IMinerDataSource&) one takes whichever
+// arm the ArmResolver picked, plus an optional pump for arms that need one --
+// the native arm does not, which is why its refresh costs no I/O at all.
 // ===========================================================================
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include "impl/xmr/coin/xmr_seedheight.hpp"                 // rx_seedheights (next_seed_hash rule)
+#include "impl/xmr/native/contracts/miner_data.hpp"          // IMinerDataSource / MinerDataEpoch (C4 seam)
+#include "impl/xmr/native/template/xmr_monerod_miner_data.hpp" // MonerodMinerDataSource (the daemon arm)
 #include "impl/xmr/node/monero_rpc.hpp"             // MoneroDaemonRpc::body_get_miner_data / parse_miner_data
 #include "impl/xmr/node/monerod_transport.hpp"      // IMonerodTransport / RpcResponse
 #include "impl/xmr/node/xmr_node_types.hpp"         // node::MinerData / TxBacklogEntry / Hash / Difficulty128
@@ -76,12 +111,15 @@
 #include "impl/xmr/template/xmr_block_assembly.hpp" // XmrBlockAssembler / AssembledTemplate / from_miner_data / from_backlog / BlockBytes
 #include "xmr_o2_settlement_fixture.hpp"            // XmrSettlementConfig / XmrParentContext / XmrOwedFixture / build_settlement_source / assembly_settle_inputs
 #include "xmr_live_submit.hpp"                       // submit::BlockCandidate
+#include "xmr_settlement_coinbase_shape.hpp"          // inspect_kfair_coinbase (per-job finder variant gate)
 
 namespace c2pool::v37n::xmr::o2 {
 
-namespace strat = ::v37::xmr::stratum;
-namespace asm_  = ::c2pool::xmr::assembly;
-namespace node  = ::c2pool::xmr::node;
+namespace strat  = ::v37::xmr::stratum;
+namespace asm_   = ::c2pool::xmr::assembly;
+namespace node   = ::c2pool::xmr::node;
+namespace native = ::c2pool::xmr::native;         // C4 seam: IMinerDataSource
+namespace ntmpl  = ::c2pool::xmr::native::tmpl;   // C4 arms
 
 // One immutable, refcounted settlement template snapshot the serve + submit side
 // share. The AssembledTemplate is heap-owned and immutable after build(), so a
@@ -98,9 +136,39 @@ struct SettlementSnapshot {
     std::size_t                              nonce_offset = 0;
     node::Hash                               prev_id{};
     std::array<std::uint8_t, strat::HASH_SIZE> seed_hash{};
+    // The NEXT RandomX seed, announced to miners and to the verifier ahead of
+    // the switch (monerod get_block_template rule; see next_seed_for()).
+    std::optional<std::array<std::uint8_t, strat::HASH_SIZE>> next_seed_hash;
     std::size_t                              n_outputs = 0;
     std::size_t                              n_tx = 0;
     bool                                     valid = false;
+    // The OwedLedger::ledger_seq() the template was assembled at. Every node
+    // recomputes the lane coinbase from the ledger at the block's booking
+    // point (xmr_coinbase_recompute.hpp), so a template must never outlive
+    // the ledger state it was built from: refresh() re-keys on it too.
+    std::uint64_t                            ledger_seq = 0;
+
+    // --- C4: which arm produced this template, and under which epoch --------
+    // Carried so the parity oracle can attribute a diff to an arm without
+    // guessing, and so the status line can say what it is actually serving.
+    // "monerod" | "native" (a literal owned by the source, never freed).
+    const char*             source_name = "monerod";
+    native::MinerDataEpoch  epoch{};
+
+    // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27): set only when the cut is
+    // an eligible empty cut. The template above is the default job's (no login
+    // finder); a job whose finder differs is served the SAME snapshot re-armed
+    // for that finder (XmrOwedSettlementSource::with_finder), built once per
+    // (template, finder) and kept for the snapshot's life.
+    struct EcutVariants {
+        std::shared_ptr<const XmrOwedSettlementSource> src;     // the default snapshot's source
+        asm_::AssemblyInputs                           recipe;  // miner/mempool/bind (settle + tail per variant)
+        std::optional<::v37::bytes32>                  default_fid;   // the default template's armed finder
+        std::mutex                                     mtx;
+        struct V { std::shared_ptr<const asm_::AssembledTemplate> tpl; std::size_t nonce_offset = 0; };
+        std::map<::v37::bytes32, V>                    by_fid;  // tpl == nullptr: refused -> default template
+    };
+    std::shared_ptr<EcutVariants> ecut;
 };
 
 // ---------------------------------------------------------------------------
@@ -108,46 +176,195 @@ struct SettlementSnapshot {
 // ---------------------------------------------------------------------------
 class XmrSettlementTemplateProvider {
 public:
+    struct EcutVariantsV { std::shared_ptr<const asm_::AssembledTemplate> tpl; std::size_t nonce_offset = 0; };
+    // The refresh-time pump for a source that needs one (the daemon arm's
+    // get_miner_data round trip). Empty for the native arm, which reads its
+    // chain index and txpool directly.
+    using RefreshPump = std::function<bool(std::string*)>;
+
+    // OPTIONAL SHAPE GATE (M2). Called on a freshly assembled template BEFORE
+    // it is retained, published or given a template_id. Returning false makes
+    // the refresh fail with the gate's reason and leaves the PREVIOUS template
+    // in place, so a shape regression parks the miners on the last good block
+    // instead of handing them one that pays the wrong set.
+    //
+    // It exists because the seam this provider is bound through can be
+    // rebound -- to the daemon, to the native node, later to something else --
+    // and "the assembler is unchanged" is a claim about the code, while what
+    // has to hold is a claim about the BYTES. See
+    // xmr_settlement_coinbase_shape.hpp for the gate the daemon installs.
+    using ShapeGate = std::function<bool(const asm_::AssembledTemplate&, std::string*)>;
+
+    // BOOKING-POINT GATE (every node recomputes the lane coinbase, operator
+    // rulings 2026-09-29). A block at height T is recomputed by every node
+    // from its ledger with the finalize cursor at T - 1 - D_conf (R6), so a
+    // template for T may be assembled only from exactly that state: a builder
+    // that has not yet booked the tip's lane block (the #1861 H/H+1 case)
+    // would serve a coinbase every node books debit-only. The gate answers
+    // "is the ledger at the booking point of height T?"; false (+ *why) holds
+    // the template (refresh() fails, the previous job stays served).
+    using ReadyGate = std::function<bool(std::uint64_t height, std::string*)>;
+
+    // --- C4 seam constructor -------------------------------------------------
+    // `source` is whichever arm the ArmResolver picked. The provider does not
+    // own it and does not choose it: an arm that stops being ready is the
+    // resolver's problem, not the assembler's.
+    XmrSettlementTemplateProvider(native::IMinerDataSource& source,
+                                  XmrOwedFixture& ledger_owner,
+                                  XmrSettlementConfig scfg,
+                                  std::uint64_t share_diff,
+                                  RefreshPump pump = {})
+        : m_src(&source), m_pump(std::move(pump)), m_ledger(ledger_owner),
+          m_scfg(std::move(scfg)), m_share_diff(share_diff) {}
+
+    // --- legacy constructor, behaviour-identical -----------------------------
     // `ledger_owner` supplies the (possibly seeded, possibly empty) OwedLedger +
     // its pay_of resolver. `scfg` is the fail-closed lane-parameter surface
     // (residual sink REQUIRED + torsion-checked at build). `share_diff` mirrors
     // option A (0 => solo/network target).
+    //
+    // Owns a MonerodMinerDataSource over `transport` and pumps it once per
+    // refresh: exactly the one get_miner_data per refresh this constructor
+    // always did. `daemon_cfg` carries the good-citizen backlog-refresh policy
+    // (and the readiness bound) for that owned arm.
     XmrSettlementTemplateProvider(node::IMonerodTransport& transport,
                                   XmrOwedFixture& ledger_owner,
                                   XmrSettlementConfig scfg,
-                                  std::uint64_t share_diff)
-        : m_tx(transport), m_ledger(ledger_owner), m_scfg(std::move(scfg)),
-          m_share_diff(share_diff) {}
+                                  std::uint64_t share_diff,
+                                  ntmpl::MonerodArmConfig daemon_cfg = {})
+        : m_owned_src(std::make_unique<ntmpl::MonerodMinerDataSource>(transport, daemon_cfg)),
+          m_ledger(ledger_owner), m_scfg(std::move(scfg)),
+          m_share_diff(share_diff) {
+        auto* daemon = static_cast<ntmpl::MonerodMinerDataSource*>(m_owned_src.get());
+        m_owned_daemon = daemon;
+        m_src  = daemon;
+        m_pump = [daemon](std::string* why) { return daemon->poll(why); };
+    }
+
+    // The daemon arm this provider OWNS (legacy constructor), for the status
+    // line's good-citizen counters; nullptr when the arm came from a resolver.
+    const ntmpl::MonerodMinerDataSource* owned_daemon_arm() const noexcept { return m_owned_daemon; }
+
+    // MAIN THREAD, before the first refresh(). Not settable while serving.
+    void set_shape_gate(ShapeGate g) { m_shape_gate = std::move(g); }
+    // MAIN THREAD, before the first refresh(). See ReadyGate.
+    void set_ready_gate(ReadyGate g) { m_ready_gate = std::move(g); }
+    // MAIN THREAD, before the first refresh(). The owed pass's payee resolver
+    // (XmrOwedFixture::pay_of_booked in the daemon: the refs every node holds
+    // at the booking point). Unset => the fixture's full pay_of().
+    void set_owed_pay_of(PayOfFn f) { m_owed_pay_of = std::move(f); }
+    std::uint64_t ready_gate_held() const { return m_gate_held.load(); }
+
+    // MAIN THREAD, before the first refresh(). GOOD-CITIZEN: feed the selector's
+    // chosen tx set into the block VERBATIM (bypass the p2pool 5-s age gate and
+    // the penalty-zone greedy). Applied ONLY when the answering arm is the
+    // native one -- the daemon arm keeps its exact byte-identical legacy path.
+    void set_take_mempool_as_given(bool on) { m_take_mempool_as_given = on; }
+    // SEAM-1 (GAP-2 rbind): every template this provider assembles writes
+    // `fn(extra_nonce)` (size bytes) right after the worker nonce in the 0x02
+    // payload. Set once before serving; unset => byte-identical templates.
+    void set_extra_nonce_bind(std::size_t size, asm_::X6SettlementSource::ExtraNonceBindFn fn) {
+        m_bind_size = fn ? size : 0; m_bind = std::move(fn);
+    }
+    std::size_t extra_nonce_bind_size() const { return m_bind_size; }
+
+    // PER-JOB EMPTY-CUT FINDER (operator ruling 09-27): the finder payee a job's
+    // extra_nonce commits to when its template's cut is empty (paynow::
+    // choose_ecut_finder: owner on an owner-fee job, else the stratum login,
+    // else the donation). Called right before the job's blob is built (SEAM-1
+    // job binder, any thread). An unbound extra_nonce gets the default template.
+    void bind_finder(std::uint32_t extra_nonce, const ::v37::ScriptRef& finder) {
+        std::lock_guard<std::mutex> lk(m_finder_mtx);
+        auto [it, fresh] = m_finder_by_en.insert_or_assign(extra_nonce, finder);
+        (void)it;
+        if (fresh) m_finder_order.push_back(extra_nonce);
+        while (m_finder_order.size() > kFinderBindCap) { m_finder_by_en.erase(m_finder_order.front()); m_finder_order.pop_front(); }
+    }
+    std::optional<::v37::ScriptRef> finder_of(std::uint32_t extra_nonce) const {
+        std::lock_guard<std::mutex> lk(m_finder_mtx);
+        auto it = m_finder_by_en.find(extra_nonce);
+        if (it == m_finder_by_en.end()) return std::nullopt;
+        return it->second;
+    }
+    std::uint64_t finder_variants() const { return m_variants_built.load(); }
+
+    // D2 (minority converges to majority): the owed ledger was re-lineaged in
+    // place. refresh() re-keys on (height, prev_id, backlog, ledger_seq); a
+    // re-lineaged ledger can land on the same seq, so drop the cached template
+    // and let the next refresh() assemble against the converged ledger.
+    void invalidate() {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_cur.valid = false;
+    }
 
     XmrSettlementTemplateProvider(const XmrSettlementTemplateProvider&) = delete;
     XmrSettlementTemplateProvider& operator=(const XmrSettlementTemplateProvider&) = delete;
 
-    // MAIN THREAD. get_miner_data -> assemble a fresh v37 settlement template.
-    // Returns true when a valid template is cached (new or unchanged); the human
-    // reason for a failure is kept in last_error().
+    // MAIN THREAD. Pump the source (a no-op for the native arm), read one
+    // MinerData snapshot, assemble a fresh v37 settlement template when the
+    // epoch moved. Returns true when a valid template is cached (new or
+    // unchanged); the human reason for a failure is kept in last_error().
     bool refresh() {
-        node::MinerData md;
-        std::string rpc_err;
-        bool got = false;
-        m_tx.rpc_post(node::MoneroDaemonRpc::body_get_miner_data(),
-                      [&](const node::RpcResponse& r) {
-                          if (!r.ok()) { rpc_err = "transport: " + r.error; return; }
-                          if (auto p = node::MoneroDaemonRpc::parse_miner_data(r.body)) { md = *p; got = true; }
-                          else rpc_err = "get_miner_data: parse/validate failed";
-                      });
-        if (!got) { set_error(rpc_err.empty() ? "get_miner_data: no response" : rpc_err);
-                    m_failures.fetch_add(1); return false; }
-        if (!md.valid()) { set_error("get_miner_data: invalid miner_data"); m_failures.fetch_add(1); return false; }
+        if (!m_src) { set_error("no miner data source bound"); m_failures.fetch_add(1); return false; }
 
+        if (m_pump) {
+            std::string pump_why;
+            if (!m_pump(&pump_why)) {
+                set_error(pump_why.empty() ? "miner data source: no response" : pump_why);
+                m_failures.fetch_add(1);
+                return false;
+            }
+        }
+
+        std::string src_why;
+        std::optional<node::MinerData> got = m_src->snapshot(&src_why);
+        if (!got) {
+            set_error(src_why.empty() ? "miner data source: not ready" : src_why);
+            m_failures.fetch_add(1);
+            return false;
+        }
+        node::MinerData md = std::move(*got);
+        if (!md.valid()) { set_error("miner data source: invalid miner_data"); m_failures.fetch_add(1); return false; }
+
+        if (m_ready_gate) {   // BOOKING-POINT GATE: never a template from a ledger state receivers will not hold
+            std::string gw;
+            if (!m_ready_gate(md.height, &gw)) {
+                set_error("lane template held: " + (gw.empty() ? std::string("the ledger is not at the booking point") : gw));
+                m_gate_held.fetch_add(1);
+                return false;
+            }
+        }
+
+        const native::MinerDataEpoch ep = m_src->epoch();
         node::Hash md_prev = md.prev_id;
-        // Tip UNCHANGED => keep the existing template BYTE-FOR-BYTE. This is
+        // EPOCH UNCHANGED => keep the existing template BYTE-FOR-BYTE. This is
         // load-bearing: XmrBlockAssembler stamps a fresh header timestamp on each
         // build, so re-assembling under the same id would change the bytes a
         // miner is already grinding (its shares would then miss on the daemon's
-        // re-hash — "Low diff"). Only reassemble when the parent tip moves.
+        // re-hash — "Low diff"). Only reassemble when the epoch moves.
+        //
+        // The epoch is (height, prev_id, backlog_seq), plus the ledger_seq the
+        // template was assembled at (a coinbase is recomputed by every node from
+        // the ledger at its booking point, so it never outlives that state).
+        // The first two ARE the old
+        // tip rule, character for character. The third is the good-citizen
+        // term: BOTH arms advance it when the offered tx set moved under an
+        // unchanged tip, rate-limited to one admission per backlog_refresh_s
+        // (default 3 s on both; 0 = legacy tip-only, in which case the conjunct
+        // below is 0 == 0 on every refresh and the decision is exactly the
+        // pre-seam one). An admission is a NEW JOB (new template id), never
+        // the same job restamped: between admissions the sequence is frozen,
+        // so miners grind byte-stable bytes for the whole window and their
+        // in-flight shares keep resolving from the retained template ring.
+        //
+        //   monerod arm  xmr_monerod_miner_data.hpp -- fingerprint of the ids
+        //                monerod offers in get_miner_data.tx_backlog.
+        //   native arm   xmr_native_miner_data.hpp  -- the pool's backlog_version.
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            if (m_cur.valid && m_cur.height == md.height && m_cur.prev_id == md_prev) {
+            if (m_cur.valid && m_cur.height == md.height && m_cur.prev_id == md_prev
+                && m_cur.epoch.backlog_seq == ep.backlog_seq
+                && m_cur.ledger_seq == m_ledger.ledger().ledger_seq()) {
                 m_last_error.clear();
                 m_refreshes.fetch_add(1);
                 return true;
@@ -157,10 +374,19 @@ public:
         std::string why;
         SettlementSnapshot snap;
         if (!assemble(md, snap, why)) { set_error(why); m_failures.fetch_add(1); return false; }
+        snap.source_name = m_src->name();
+        snap.epoch       = ep;
 
         m_refreshes.fetch_add(1);
         std::lock_guard<std::mutex> lk(m_mtx);
         m_last_error.clear();
+        // The ARTEFACT the current template was built from. C6's P-TPL seam
+        // compares what was SERVED against what the shadow arm would have said,
+        // and an epoch tag alone cannot prove a served mismatch -- so the miner
+        // data is kept here rather than re-read from the source later, by which
+        // time the arm may have moved on. Kept beside m_cur (not inside the
+        // snapshot) so that by_id()/current() stay cheap to copy.
+        m_cur_miner = md;
         snap.template_id = ++m_id_counter;   // a real tip change => a fresh template + job
         m_changes.fetch_add(1);
         retain(snap);
@@ -205,9 +431,10 @@ public:
                          submit::BlockCandidate& out, std::string* why = nullptr) const {
         SettlementSnapshot snap;
         if (!by_id(id, snap) || !snap.tpl) { if (why) *why = "settlement template gone (stale)"; return false; }
+        const auto tpl = tpl_for(snap, extra_nonce).tpl;
         asm_::BlockBytes b;
         std::string me;
-        if (!snap.tpl->materialize(extra_nonce, b, &me)) { if (why) *why = "materialize: " + me; return false; }
+        if (!tpl->materialize(extra_nonce, b, &me)) { if (why) *why = "materialize: " + me; return false; }
         out.template_id     = id;
         out.height          = snap.height;
         out.full_blob       = b.full_blob;
@@ -216,7 +443,7 @@ public:
         out.reserved_offset = 0;                 // extra_nonce is BAKED into the miner_tx, not spliced
         out.reserved_size   = 0;
         out.prev_id         = snap.prev_id;
-        out.expected_reward = snap.reward;
+        out.expected_reward = tpl->reward();
         out.major_version   = snap.major_version;
         return true;
     }
@@ -226,8 +453,9 @@ public:
     bool fill_job(std::uint32_t id, std::uint32_t extra_nonce, strat::TemplateJob& out) const {
         SettlementSnapshot snap;
         if (!by_id(id, snap) || !snap.tpl) return false;
-        out.blob                 = snap.tpl->hashing_blob(extra_nonce);
-        out.nonce_offset         = snap.nonce_offset;
+        const auto v = tpl_for(snap, extra_nonce);
+        out.blob                 = v.tpl->hashing_blob(extra_nonce);
+        out.nonce_offset         = v.nonce_offset;
         out.template_id          = id;
         out.height               = snap.height;
         out.mainchain_target     = network_target(snap.difficulty, snap.difficulty_top64);
@@ -235,12 +463,38 @@ public:
                                        ? std::max(target_from_diff(m_share_diff), out.mainchain_target)
                                        : out.mainchain_target;
         out.seed_hash            = snap.seed_hash;
-        out.next_seed_hash       = std::nullopt;
+        out.next_seed_hash       = snap.next_seed_hash;   // announced ahead of a seed switch, else absent
         out.monero_major_version = snap.major_version;
         return !out.blob.empty();
     }
 
     std::uint32_t current_id() const { return m_tid.load(std::memory_order_acquire); }
+
+    // The MinerData the CURRENT template was assembled from, or false when no
+    // template has been built. This is the served artefact C6 judges; feeding
+    // the oracle a fresh read of the source instead would compare the shadow
+    // arm against something the miners were never handed.
+    bool last_miner_data(node::MinerData& out) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        if (!m_cur.valid) return false;
+        out = m_cur_miner;
+        return true;
+    }
+
+    // --- C4: which arm is bound, for the status line and the parity oracle ---
+    const char* source_name() const { return m_src ? m_src->name() : "none"; }
+    native::MinerDataReadiness source_readiness() const {
+        return m_src ? m_src->readiness() : native::MinerDataReadiness{};
+    }
+    native::MinerDataEpoch source_epoch() const {
+        return m_src ? m_src->epoch() : native::MinerDataEpoch{};
+    }
+    // The body of a transaction the CURRENT source selected. C5's ARM A needs
+    // this to answer a peer's fluffy missing-tx request; the daemon arm returns
+    // nullptr, because with a daemon armed it is ARM B that delivers.
+    const std::vector<std::uint8_t>* tx_body(const node::Hash& id) const {
+        return m_src ? m_src->tx_body(id) : nullptr;
+    }
 
     // 64-bit target helpers (identical rule to MonerodStratumTemplateSource).
     static std::uint64_t target_from_diff(std::uint64_t diff) {
@@ -252,6 +506,45 @@ public:
     }
 
 private:
+    static constexpr std::size_t kFinderBindCap = 1u << 16;   // bound on remembered job finders
+    static constexpr std::size_t kVariantCap    = 256;        // per-snapshot finder variants
+    static constexpr int         kDrainFixpointPasses = ::v37::xmr::settle::kDrainFixpointPasses;   // THE DRAIN RULE: snapshot-at-final-reward rebuilds
+
+    // The template a job is served / submitted from: the snapshot's own, or its
+    // finder variant. Deterministic per (snapshot, extra_nonce): a variant is
+    // built once and kept, a refused / over-cap finder stays on the default.
+    EcutVariantsV tpl_for(const SettlementSnapshot& snap, std::uint32_t extra_nonce) const {
+        EcutVariantsV dflt{snap.tpl, snap.nonce_offset};
+        if (!snap.ecut) return dflt;
+        const auto f = finder_of(extra_nonce);
+        if (!f) return dflt;
+        const ::v37::bytes32 fid = ::v37::xmr::xmr_identity_key(*f);
+        auto& E = *snap.ecut;
+        if (E.default_fid && *E.default_fid == fid) return dflt;
+        std::lock_guard<std::mutex> lk(E.mtx);
+        auto it = E.by_fid.find(fid);
+        if (it == E.by_fid.end()) {
+            if (E.by_fid.size() >= kVariantCap) return dflt;
+            SettlementSnapshot::EcutVariants::V v;
+            if (auto src = E.src->with_finder(*f)) {
+                asm_::AssemblyInputs a = E.recipe;
+                a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+                a.extra_nonce_tail = src->extra_nonce_tail();
+                std::string w;
+                auto t = asm_::XmrBlockAssembler::build(a, &w);
+                asm_::BlockBytes probe;
+                if (t && t->materialize(0, probe, &w) && inspect_kfair_coinbase(*t, src->owed_digest()).ok) {
+                    v.tpl = std::shared_ptr<const asm_::AssembledTemplate>(t.release());
+                    v.nonce_offset = probe.nonce_offset;
+                    m_variants_built.fetch_add(1);
+                }
+            }
+            it = E.by_fid.emplace(fid, std::move(v)).first;
+        }
+        if (!it->second.tpl) return dflt;
+        return {it->second.tpl, it->second.nonce_offset};
+    }
+
     static constexpr std::size_t RING = 6;      // retain a few templates so in-flight jobs resolve
 
     void set_error(std::string e) { std::lock_guard<std::mutex> lk(m_mtx); m_last_error = std::move(e); }
@@ -265,6 +558,25 @@ private:
             m_order.pop_front();
             if (old != snap.template_id) m_ring.erase(old);
         }
+    }
+
+    // NEXT-SEED ANNOUNCE (operator ruling 09-26). monerod get_block_template:
+    //   rx_seedheights(height, &seed, &next);  next_seed_hash = id(next)
+    //   published only when next != seed.
+    // The id at `next` comes from the source: the native chain index resolves
+    // it (TemplateInputs::next_seed_hash, the seed block is already in the
+    // chain); monerod's get_miner_data carries none, so the daemon arm stays
+    // absent. The height rule is re-applied here so a source can never announce
+    // outside the 64-block lag window, nor announce the current seed again.
+    static std::optional<std::array<std::uint8_t, strat::HASH_SIZE>>
+    next_seed_for(const node::MinerData& md) {
+        std::uint64_t seed_h = 0, next_h = 0;
+        ::xmr::coin::rx_seedheights(md.height, seed_h, next_h);
+        if (next_h == seed_h || !md.next_seed_hash || node::is_zero(*md.next_seed_hash)
+            || *md.next_seed_hash == md.seed_hash) return std::nullopt;
+        std::array<std::uint8_t, strat::HASH_SIZE> out{};
+        std::memcpy(out.data(), md.next_seed_hash->data(), strat::HASH_SIZE);
+        return out;
     }
 
     // Turn one MinerData into a v37 settlement AssembledTemplate.
@@ -285,10 +597,11 @@ private:
         for (const auto& t : md.tx_backlog) fees += t.fee;
 
         XmrParentContext parent = XmrParentContext::from_miner(xmr_md, base_reward, fees);
+        snap.ledger_seq = m_ledger.ledger().ledger_seq();
 
         std::string ss_why;
         std::unique_ptr<XmrOwedSettlementSource> src = build_settlement_source(
-            scfg, parent, m_ledger.ledger(), m_ledger.pay_of(),
+            scfg, parent, m_ledger.ledger(), m_owed_pay_of ? m_owed_pay_of : m_ledger.pay_of(),
             /*reward_hint=*/base_reward + fees, &ss_why);
         if (!src) { why = "settlement source refused: " + ss_why; return false; }
 
@@ -296,16 +609,65 @@ private:
         a.miner   = xmr_md;
         a.mempool = asm_::from_backlog(md.tx_backlog);       // empty on regtest => n_tx == 0
         a.settle  = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+        a.extra_nonce_tail = src->extra_nonce_tail();   // recon(A+B credit): the on-chain credit cut (0x02 tail)
+        a.reward_total_field = scfg.commit_total;       // REWARD TOTAL: "V37R" first in the tail
+        a.extra_nonce_bind_size = m_bind_size;          // SEAM-1: [extra_nonce 4 | rbind 32] (0 = none)
+        a.extra_nonce_bind = m_bind;
+        // GOOD-CITIZEN: mine the (already good-citizen-selected) set VERBATIM,
+        // but only when the NATIVE arm answered. name() reports the arm that
+        // actually served this snapshot (the resolved source can fall back to
+        // "monerod" per refresh), so the daemon arm keeps its byte-identical
+        // legacy 5-s-gate path.
+        a.take_mempool_as_given =
+            m_take_mempool_as_given && std::string_view(m_src->name()) == "native";
 
         std::string as_why;
         std::unique_ptr<asm_::AssembledTemplate> tpl = asm_::XmrBlockAssembler::build(a, &as_why);
         if (!tpl) { why = "assembler refused: " + as_why; return false; }
+        // THE DRAIN RULE: the owed takes are chosen at Delta(R), so the snapshot
+        // must be cut at the template's FINAL reward (every receiver recomputes
+        // at the coinbase total: takes chosen at another reward are an over- or
+        // under-take). Rebuild at the reward the template settled on until the
+        // two agree (the payee set can move the reward through the coinbase
+        // weight, so this is a fixpoint, bounded; fail closed beyond).
+        {
+            std::uint64_t hint = src->reward_hint(), reward = tpl->reward();
+            const bool fx = ::v37::xmr::settle::drain_reward_fixpoint(
+                src->drain_on(), hint, reward,
+                [&](std::uint64_t r, std::string& w) -> std::optional<std::uint64_t> {
+                    src = build_settlement_source(scfg, parent, m_ledger.ledger(), m_owed_pay_of ? m_owed_pay_of : m_ledger.pay_of(), r, &ss_why);
+                    if (!src) { w = "settlement source refused (drain fixpoint): " + ss_why; return std::nullopt; }
+                    a.settle = assembly_settle_inputs(*src, /*weight_aware_cap=*/true);
+                    a.extra_nonce_tail = src->extra_nonce_tail();
+                    tpl = asm_::XmrBlockAssembler::build(a, &as_why);
+                    if (!tpl) { w = "assembler refused (drain fixpoint): " + as_why; return std::nullopt; }
+                    return tpl->reward();
+                },
+                why);
+            if (!fx) return false;
+        }
 
         // A probe materialisation locks in the layout (nonce offset, blob sizes).
         asm_::BlockBytes probe;
         std::string pe;
         if (!tpl->materialize(0, probe, &pe)) { why = "probe materialize: " + pe; return false; }
 
+        // The shape gate, on the assembled bytes, before anything is published.
+        if (m_shape_gate) {
+            std::string gw;
+            if (!m_shape_gate(*tpl, &gw)) {
+                why = "coinbase shape gate REFUSED: " + (gw.empty() ? std::string("no reason given") : gw);
+                return false;
+            }
+        }
+
+        if (src->ecut_eligible()) {   // PER-JOB EMPTY-CUT FINDER: keep what a variant needs
+            auto E = std::make_shared<SettlementSnapshot::EcutVariants>();
+            E->recipe = a;
+            if (src->ecut_finder()) E->default_fid = ::v37::xmr::xmr_identity_key(*src->ecut_finder());
+            E->src = std::shared_ptr<const XmrOwedSettlementSource>(src.release());
+            snap.ecut = std::move(E);
+        }
         snap.tpl              = std::shared_ptr<const asm_::AssembledTemplate>(tpl.release());
         snap.height           = snap.tpl->height();
         snap.difficulty       = md.difficulty.lo;
@@ -315,6 +677,7 @@ private:
         snap.nonce_offset     = probe.nonce_offset;
         std::memcpy(snap.prev_id.data(), snap.tpl->prev_id().data(), 32);
         std::memcpy(snap.seed_hash.data(), md.seed_hash.data(), strat::HASH_SIZE);
+        snap.next_seed_hash   = next_seed_for(md);
         snap.n_outputs        = snap.tpl->outputs().size();
         snap.n_tx             = snap.tpl->n_tx();
         snap.valid            = true;
@@ -322,19 +685,38 @@ private:
         return true;
     }
 
-    node::IMonerodTransport& m_tx;
+    // The C4 seam. m_owned_src is non-null only for the legacy transport
+    // constructor, which owns the daemon arm it built; m_src always points at
+    // the arm in use, owned here or not.
+    std::unique_ptr<native::IMinerDataSource> m_owned_src;
+    const ntmpl::MonerodMinerDataSource*      m_owned_daemon = nullptr;   // == m_owned_src when legacy-constructed
+    native::IMinerDataSource*                 m_src = nullptr;
+    RefreshPump                               m_pump;
+    ShapeGate                                 m_shape_gate;
+    ReadyGate                                 m_ready_gate;
+    PayOfFn                                   m_owed_pay_of;
+    std::atomic<std::uint64_t>                m_gate_held{0};
+    std::size_t                               m_bind_size = 0;   // SEAM-1
+    asm_::X6SettlementSource::ExtraNonceBindFn m_bind;           // SEAM-1
+    bool                                      m_take_mempool_as_given = false;
+
     XmrOwedFixture&          m_ledger;
     XmrSettlementConfig      m_scfg;
     std::uint64_t            m_share_diff;
 
     mutable std::mutex m_mtx;
     SettlementSnapshot m_cur;
+    node::MinerData    m_cur_miner;                       // what m_cur was built from
     std::map<std::uint32_t, SettlementSnapshot> m_ring;   // retained by id
     std::deque<std::uint32_t> m_order;
     std::uint32_t m_id_counter = 0;
     std::string   m_last_error;
     std::atomic<std::uint32_t> m_tid{0};
     std::atomic<std::uint64_t> m_refreshes{0}, m_failures{0}, m_changes{0};
+    mutable std::mutex m_finder_mtx;                       // PER-JOB EMPTY-CUT FINDER
+    std::map<std::uint32_t, ::v37::ScriptRef> m_finder_by_en;
+    std::deque<std::uint32_t> m_finder_order;
+    mutable std::atomic<std::uint64_t> m_variants_built{0};
 };
 
 // ---------------------------------------------------------------------------

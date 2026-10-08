@@ -80,7 +80,31 @@ public:
     NetAddress(const std::string& ip) : m_ip(ip) { }
     NetAddress(std::string&& ip) : m_ip(ip) { }
 
-    NetAddress(const boost::asio::ip::address& boost_addr) : m_ip(boost_addr.to_string()) { if (boost_addr.is_v6()) m_type = {NET_IPV6}; } 
+    NetAddress(const boost::asio::ip::address& boost_addr)
+    {
+        // #1549 / #965 dual-stack ingest. The shared listener (factory.hpp,
+        // ListenFamily::Auto) accepts IPv4 peers on the dual-stack v6 socket as
+        // IPv4-mapped (::ffff:a.b.c.d). Collapse a mapped address to its embedded
+        // IPv4 here (Bitcoin Core CNetAddr::SetLegacyIPv6) so slot keys, addrman
+        // and the wire net_addr all see a clean v4. Without this the mapped
+        // literal survives into NetService(std::string) (default m_type=NET_IPV4)
+        // and Write_IPV4 strips the colons into a sub-16-byte blob, corrupting
+        // the version reply addr_to -- the inbound-listener KAT regression.
+        if (boost_addr.is_v6())
+        {
+            auto v6 = boost_addr.to_v6();
+            if (v6.is_v4_mapped())
+                m_ip = boost::asio::ip::make_address_v4(
+                           boost::asio::ip::v4_mapped, v6).to_string();  // m_type stays NET_IPV4
+            else
+            {
+                m_ip   = boost_addr.to_string();
+                m_type = NET_IPV6;
+            }
+        }
+        else
+            m_ip = boost_addr.to_string();
+    }
     NetAddress(const boost::asio::ip::tcp::endpoint& ep) : NetAddress(ep.address()) { }
 
     void set_address(std::string ip) { m_ip = ip; }
@@ -176,8 +200,7 @@ public:
     }
     NetService(std::string addr, std::string port) : NetAddress(addr), m_port(std::stoi(port)) { }
     NetService(const std::string& ip, uint16_t port) : NetAddress(ip), m_port(port) { }
-    NetService(const boost::asio::ip::address& boost_addr, uint16_t port) : NetAddress(boost_addr), m_port(port) 
-    { if (boost_addr.is_v6()) m_type = {NET_IPV6}; } 
+    NetService(const boost::asio::ip::address& boost_addr, uint16_t port) : NetAddress(boost_addr), m_port(port) { }
     NetService(const boost::asio::ip::tcp::endpoint& ep) : NetAddress(ep.address()), m_port(ep.port()) { }
 
     uint16_t port() const { return m_port; }

@@ -32,7 +32,17 @@ std::unique_ptr<BtcCoinPeerManager> make_mgr(boost::asio::io_context& ioc,
 {
     // data_dir "." -> resolves under config_path()/btc_embedded_peers; the KATs
     // never call start()/save_peers(), so no files are written.
-    return std::make_unique<BtcCoinPeerManager>(ioc, "BTC", ".", cfg);
+    //
+    // Seed a FIXED bucket key so addrman new-table placement is deterministic:
+    // under the production random key, distinct-group adds collide-and-evict on
+    // a rare coin toss (~0.08%%), which is the base-inherited AddrmanBanks*
+    // flake. A caller that sets its own key keeps it.
+    BtcPeerManagerConfig c = cfg;
+    if (c.addrman_key0 == 0 && c.addrman_key1 == 0) {
+        c.addrman_key0 = 0x51f2a3b4c5d6e7f0ULL;
+        c.addrman_key1 = 0x0f1e2d3c4b5a6978ULL;
+    }
+    return std::make_unique<BtcCoinPeerManager>(ioc, "BTC", ".", c);
 }
 
 } // namespace
@@ -240,6 +250,30 @@ TEST(BtcCoinPeerManager, AddrmanBanksBeyondWorkingSetCapacity)
     // ...but the bucketed DB banks EVERY validated candidate — the harvest
     // that used to be dropped on the floor.
     EXPECT_EQ(m->addrman().size(), 10u);
+}
+
+// Regression guard for the AddrmanBanks* random-key flake (base-inherited from
+// #1241). make_mgr seeds a FIXED bucket key, so new-table slot placement is
+// deterministic and banking N distinct-group candidates yields exactly N on
+// EVERY iteration. This loop would re-redden statistically if the key plumbing
+// ever regressed to the production random key -- converting a ~0.08%% coin-toss
+// flake into a hard, reproducible signal. Do NOT "fix" a failure here by
+// widening the assertion; a miss means the deterministic key was lost.
+TEST(BtcCoinPeerManager, AddrmanBucketingIsDeterministicUnderFixedKey)
+{
+    for (int iter = 0; iter < 8192; ++iter) {
+        boost::asio::io_context ioc;
+        BtcPeerManagerConfig cfg;
+        cfg.max_peers = 3;
+        auto m = make_mgr(ioc, cfg);
+        for (int i = 0; i < 10; ++i)
+            m->add_discovered_peer(
+                NetService("51." + std::to_string(10 + i) + ".1.1", 8333));
+        ASSERT_EQ(m->addrman().size(), 10u)
+            << "fixed-key bucketing must bank all 10 distinct-group candidates "
+            << "on every iteration (iter=" << iter << "); a miss means the "
+            << "deterministic KAT key regressed to the production random key";
+    }
 }
 
 TEST(BtcCoinPeerManager, DialPlanDrawsFromAddrmanAndDialFailFeedbackLands)

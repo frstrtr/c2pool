@@ -72,6 +72,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -224,6 +225,131 @@ public:
         return RegisterResult{true, ""};
     }
 
+    // ── ★ S-1c: FOUND, but the block is a PEER'S. Same write-ahead discipline
+    //    as on_block_found (sidecar -> registration -> pending map), so a
+    //    restart re-drives a peer's pending block exactly like our own: the F1
+    //    driver's FOUND event carries the credit/payout, and reseed_after_open()
+    //    does not care which node mined it. The ONE difference is the node call
+    //    — on_peer_block_won, which folds E_b at the CARRIED cut and never
+    //    submits anything to the coin network.
+    //
+    //    ★ STAGE 2 (APPLY) re-wording. Before Stage 2 this banner said a refusal
+    //    here is NEVER worth retrying. Two of the refusal shapes now ARE: a
+    //    cut_miss or a cut_digest_mismatch says "my local order at the winner's
+    //    prefix is not the winner's", and a replay of the winner's own ordered
+    //    records (carrier_repair.hpp) can settle that question — but only
+    //    asynchronously, because it needs bytes off the wire. So:
+    //
+    //      * refused_payout_emitted / refused_too_late / already_known — still
+    //        terminal. Retrying changes nothing and the sidecar stays rolled back.
+    //      * cut_miss / cut_digest_mismatch (PeerWinOutcome::repair_wanted) —
+    //        RETRYABLE EXACTLY ONCE THE REPAIR VERIFIES. The daemon arms a repair
+    //        and, when it lands, calls redrive_peer_block_found() below, which
+    //        re-enters this same path. Every retry still goes through the same
+    //        fold at the same prefix; a repair that cannot verify simply refuses
+    //        again and the block stays uncredited (the honest outcome).
+    //
+    //    The sidecar is rolled back on refusal either way, and the reason is
+    //    returned for the caller to log.
+    RegisterResult on_peer_block_found(const PeerWin& w) {
+        bool repairable = false;
+        RegisterResult r = peer_found_once(w, &repairable);
+        if (repairable) remember_if_repairable(w);
+        return r;
+    }
+
+    // ── ★ S3 RE-DRIVE (Stage 2) ─────────────────────────────────────────────
+    // on_peer_block_won is ONE-SHOT: a refused peer win is never re-offered by
+    // the flood (W2's dedup window suppresses the echo), so before Stage 2 a
+    // cut_miss was permanent even once the missing bytes arrived. The repair is
+    // asynchronous by nature, so the refused descriptor is HELD here (bounded,
+    // bid-keyed) and this is the one call that re-enters the arm with it.
+    //
+    // It is safe to call with no repair, or twice, or for an unknown bid: the
+    // held entry is consumed on the first re-drive, the ledger is idempotent per
+    // bid, and a repair that did not verify simply refuses again.
+    RegisterResult redrive_peer_block_found(const std::string& bid) {
+        PeerWin w;
+        {
+            std::lock_guard<std::mutex> g(m_mu);
+            auto it = m_repairable.find(bid);
+            if (it == m_repairable.end())
+                return RegisterResult{false, "no repairable peer win is held for this bid"};
+            w = it->second;
+            m_repairable.erase(it);
+            for (auto q = m_repair_order.begin(); q != m_repair_order.end(); ++q)
+                if (*q == bid) { m_repair_order.erase(q); break; }
+            ++m_redrives;
+        }
+        bool repairable = false;
+        RegisterResult r = peer_found_once(w, &repairable);
+        if (repairable) remember_if_repairable(w);   // a later repair may still land
+        return r;
+    }
+
+    // How many refused-but-repairable peer wins are held, and how many re-drives
+    // have been issued (diagnostics only).
+    std::size_t   repairable_held() const { std::lock_guard<std::mutex> g(m_mu); return m_repairable.size(); }
+    std::uint64_t redrives() const        { std::lock_guard<std::mutex> g(m_mu); return m_redrives; }
+
+private:
+    // The bound on the held-descriptor map: a peer that floods block-winner
+    // descriptors we cannot credit can cost us at most this many entries.
+    static constexpr std::size_t kMaxRepairable = 64;
+
+    void remember_if_repairable(const PeerWin& w) {
+        std::lock_guard<std::mutex> g(m_mu);
+        if (m_repairable.count(w.bid)) return;
+        while (m_repair_order.size() + 1 > kMaxRepairable && !m_repair_order.empty()) {
+            m_repairable.erase(m_repair_order.front());
+            m_repair_order.pop_front();
+        }
+        m_repairable.emplace(w.bid, w);
+        m_repair_order.push_back(w.bid);
+    }
+
+public:
+    // INTERNAL seam: one pass of the peer-FOUND registration. `repairable` is
+    // set when the refusal was one of the two cut bits, i.e. the kind a replay
+    // of the winner's ordered records may still settle.
+    RegisterResult peer_found_once(const PeerWin& w, bool* repairable) {
+        if (repairable) *repairable = false;
+        std::lock_guard<std::mutex> g(m_mu);
+        if (m_pending.count(w.bid)) return RegisterResult{true, ""};
+        if (w.h_b == 0) return RegisterResult{false, "refusing H_b == 0 (unknown height is not a height)"};
+        if (!put_sidecar_locked(w.bid, w.h_b))
+            return RegisterResult{false, "pending-FOUND sidecar write failed (store commit)"};
+        PeerWinOutcome o;
+        try {
+            o = m_node.on_peer_block_won(w);
+        } catch (const std::exception& e) {
+            del_sidecar_locked(w.bid);
+            return RegisterResult{false, std::string("on_peer_block_won threw: ") + e.what()};
+        }
+        if (!o.registered) {
+            del_sidecar_locked(w.bid);
+            if (repairable) *repairable = o.repair_wanted;
+            return RegisterResult{false, peer_refusal_reason(o)};
+        }
+        if (!m_node.ledger().is_pending(w.bid)) {
+            del_sidecar_locked(w.bid);
+            return RegisterResult{false, "ledger did not admit the peer FOUND (bid already SETTLED?)"};
+        }
+        m_pending[w.bid] = w.h_b;
+        return RegisterResult{true, ""};
+    }
+
+    // The refusal bit, as one line an operator can act on.
+    static std::string peer_refusal_reason(const PeerWinOutcome& o) {
+        if (o.already_known)          return "already ours / already known (idempotent, not a fault)";
+        if (o.refused_payout_emitted) return "winner had already EMITTED a coinbase; its payout map is not on the wire";
+        if (o.refused_too_late)       return "H_b at or below our finalize cursor (descriptor arrived too late)";
+        if (o.cut_digest_mismatch)    return "we published the winner's prefix P with a DIFFERENT lane digest (sharechain divergence)";
+        if (o.cut_miss)               return "the winner's prefix P was never published here (ring evicted / coalesced through)";
+        if (!o.cut.folded)            return "fold_eb REFUSED at the carried cut (geometry not ratified)";
+        return "peer win not registered";
+    }
+
     // ── FINALIZED: the F1 tick. Delegates to XbtcNode::on_tip (one height a
     //    step, never jumps to tip) and retires the sidecar of every finalized
     //    bid. A bid the driver orphaned AT MATURITY inside advance_to_tip
@@ -328,6 +454,12 @@ private:
     ::v37::ChainId m_chain;
     mutable std::mutex m_mu;
     std::map<std::string, std::uint64_t> m_pending;   // bid -> H_b, mirrors the sidecars
+    // ★ Stage 2: refused-but-REPAIRABLE peer wins, held for the S3 re-drive.
+    // Bounded by kMaxRepairable in insertion order; never durable (a restart
+    // simply loses them, and a lost re-drive is a refusal, not a corruption).
+    std::map<std::string, PeerWin> m_repairable;
+    std::deque<std::string>        m_repair_order;
+    std::uint64_t                  m_redrives = 0;
 };
 
 } // namespace c2pool::v37n::btc

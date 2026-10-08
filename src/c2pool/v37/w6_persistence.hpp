@@ -102,6 +102,12 @@ constexpr std::size_t  HW_BLOB    = 56;   // SettleHW::serialize() fixed length
 enum RecordKind : std::uint8_t {
     K_META = 1, K_HW = 2, K_LHEAD = 3, K_EVENT = 4, K_BLK = 5,
     K_INTENT = 6, K_CARRIER = 7, K_GENESIS = 8, K_TIP = 9,
+    // ★ ADDITIVE (owed-event MMR): the record-log head. A brand-new key
+    // (v37s:lmmr:<chain>), never a change to an existing record's bytes, so an
+    // existing database keeps decoding exactly as before and a database written
+    // by an older build simply has no lmmr key (recovery treats that as
+    // "nothing to check against", never as corruption).
+    K_LMMR = 10,
 };
 enum EvKind : std::uint8_t { EV_FOUND = 1, EV_FINALIZE = 2, EV_ORPHAN = 3 };
 
@@ -124,6 +130,7 @@ inline std::string hex_lower(const bytes32& h) {
 inline std::string meta()                             { return "v37s:meta"; }
 inline std::string hw(ChainId c)                      { return "v37s:hw:" + chain_fmt(c); }
 inline std::string lhead(ChainId c)                   { return "v37s:lhead:" + chain_fmt(c); }
+inline std::string lmmr(ChainId c)                    { return "v37s:lmmr:" + chain_fmt(c); }
 inline std::string levt(ChainId c, u64 seq)           { return "v37s:levt:" + chain_fmt(c) + ":" + seq_fmt(seq); }
 inline std::string levt_prefix(ChainId c)             { return "v37s:levt:" + chain_fmt(c) + ":"; }
 inline std::string blk(ChainId c, const std::string& bid)  { return "v37s:blk:" + chain_fmt(c) + ":" + bid; }
@@ -203,6 +210,11 @@ struct LaneParamsRec {                       // v37_lane.hpp:30-39 layout
 struct MetaRec    { std::uint32_t schema = 1; u64 boot_id = 0, created_ts = 0, last_open_ts = 0; };
 struct HwRec      { ChainId chain = 0; u64 boot_id = 0; SettleHW hw; };
 struct LheadRec   { u64 ledger_seq = 0; bytes32 owed_digest{}; u64 boot_id = 0; };
+// ★ the owed-event MMR head: the record log's peaks + leaf_count + bagged root
+// at the same ledger position lhead was staged at. Peaks are what makes the log
+// restorable without replaying; the root is what recovery re-derives and checks.
+struct LmmrRec    { u64 ledger_seq = 0; u64 leaf_count = 0; bytes32 root{};
+                    std::vector<bytes32> peaks; u64 boot_id = 0; };
 struct EventRec   { std::uint8_t evkind = EV_FOUND; u64 seq = 0; std::string bid; u64 bin_height = 0;
                     Amounts credit, payout, settled_payout; };
 struct BlkRec     { bytes32 share_hash{}; std::string bid;   // bid lives in the KEY (not serialized)
@@ -258,6 +270,31 @@ inline std::string encode_lhead(const LheadRec& l) {
 inline std::optional<LheadRec> decode_lhead(const std::string& v) {
     Reader r(v); if (!read_hdr(r, K_LHEAD)) return std::nullopt;
     LheadRec l; l.ledger_seq = r.u64v(); l.owed_digest = r.b32(); l.boot_id = r.u64v();
+    if (!r.done()) return std::nullopt; return l;
+}
+
+// ── lmmr (family B, additive): the owed-event record-log head ──
+// Layout: hdr | u64 ledger_seq | u64 leaf_count | root(32) | u32 n_peaks
+//         | n_peaks x 32 | u64 boot_id.
+// The decoder enforces the MMR structural law n_peaks == popcount(leaf_count)
+// BEFORE allocating, so a byte-flipped count cannot drive a huge reserve and a
+// structurally impossible head never reaches the recovery comparison.
+inline std::string encode_lmmr(const LmmrRec& l) {
+    Writer w; w.hdr(K_LMMR); w.u64v(l.ledger_seq); w.u64v(l.leaf_count); w.b32(l.root);
+    w.u32(static_cast<std::uint32_t>(l.peaks.size()));
+    for (const bytes32& p : l.peaks) w.b32(p);
+    w.u64v(l.boot_id);
+    return w.s;
+}
+inline std::optional<LmmrRec> decode_lmmr(const std::string& v) {
+    Reader r(v); if (!read_hdr(r, K_LMMR)) return std::nullopt;
+    LmmrRec l; l.ledger_seq = r.u64v(); l.leaf_count = r.u64v(); l.root = r.b32();
+    std::uint32_t np = r.u32(); if (!r.ok) return std::nullopt;
+    if (np != static_cast<std::uint32_t>(std::popcount(l.leaf_count))) return std::nullopt;
+    if (np > (v.size() - r.o) / 32) return std::nullopt;
+    l.peaks.resize(np);
+    for (std::uint32_t i = 0; i < np; ++i) l.peaks[i] = r.b32();
+    l.boot_id = r.u64v();
     if (!r.done()) return std::nullopt; return l;
 }
 
@@ -420,6 +457,7 @@ inline CensusResult census_open(ISettleStore& store) {
         else if (tag == "hw")       { auto h = decode_hw(v);    if (!h) { res.fail("corrupt record (decode failed) at key " + k); return true; } if (have_chain) { has_hw[c] = true; hw_seq[c] = h->hw.ledger_seq; } }
         else if (tag == "lhead")    { auto l = decode_lhead(v); if (!l) { res.fail("corrupt record (decode failed) at key " + k); return true; } if (have_chain) { has_lhead[c] = true; lhead_seq[c] = l->ledger_seq; } }
         else if (tag == "levt")     { auto e = decode_event(v); if (!e) { res.fail("corrupt record (decode failed) at key " + k); return true; } if (have_chain) { levt_seqs[c].insert(e->seq); levt_count[c]++; } }
+        else if (tag == "lmmr")     { if (!decode_lmmr(v))    res.fail("corrupt record (decode failed) at key " + k); }
         else if (tag == "blk")      { if (!decode_blk(v))     res.fail("corrupt record (decode failed) at key " + k); }
         else if (tag == "intent")   { if (!decode_intent(v))  res.fail("corrupt record (decode failed) at key " + k); }
         else if (tag == "carrier")  { if (!decode_carrier(v)) res.fail("corrupt record (decode failed) at key " + k); }
@@ -604,6 +642,20 @@ private:
         b.put(keys::hw(c), encode_hw(c, m_boot_id, hw));
         LheadRec lh; lh.ledger_seq = ledger.ledger_seq(); lh.owed_digest = ledger.owed_digest(); lh.boot_id = m_boot_id;
         b.put(keys::lhead(c), encode_lhead(lh));
+        // ★ ADDITIVE: the owed-event MMR head, staged in the SAME batch as
+        // lhead so the record log and the owed digest are durable at the same
+        // ledger position — a torn write can never leave them at two cuts.
+        b.put(keys::lmmr(c), encode_lmmr(lmmr_of(ledger, m_boot_id)));
+    }
+    // Build the LmmrRec from whatever ledger position the caller is staging.
+    static LmmrRec lmmr_of(const OwedLedger& ledger, u64 boot_id) {
+        LmmrRec lm;
+        lm.ledger_seq = ledger.ledger_seq();
+        lm.leaf_count = ledger.owed_event_leaf_count();
+        lm.root       = ledger.owed_event_mmr_root();
+        lm.peaks      = ledger.owed_event_peaks().peaks;
+        lm.boot_id    = boot_id;
+        return lm;
     }
     bool poisoned(ChainId c) const { return m_poison.count(c) != 0; }
     void poison(ChainId c) { m_poison.insert(c); }
@@ -874,6 +926,13 @@ struct ChainRecovery {
     std::vector<FailClosed> fails;
     u64 levt_applied = 0;
     u64 new_incarnation = 0;
+    // ★ owed-event MMR recovery outcome. `lmmr_present` is false for a database
+    // written before this record existed — that is NOT a failure, only "nothing
+    // to check against"; `lmmr_verified` is true iff a head was present AND the
+    // replayed record log reproduced it exactly.
+    bool lmmr_present = false;
+    bool lmmr_verified = false;
+    persist::LmmrRec lmmr{};
     std::map<std::string, OwedLedger::Amounts> found_payout;   // §4.1 step 6 residual source
 };
 struct RecoveryHooks {
@@ -931,6 +990,7 @@ private:
     static std::string twenty(u64 x){ std::ostringstream o; o.width(20); o.fill('0'); o << x; return o.str(); }
     static std::string p_hw(u64 c)      { return "v37s:hw:" + ten(c); }
     static std::string p_lhead(u64 c)   { return "v37s:lhead:" + ten(c); }
+    static std::string p_lmmr(u64 c)    { return "v37s:lmmr:" + ten(c); }
     static std::string p_levt(u64 c)    { return "v37s:levt:" + ten(c) + ":"; }
     static std::string p_blk(u64 c)     { return "v37s:blk:" + ten(c) + ":"; }
     static std::string p_intent(u64 c)  { return "v37s:intent:" + ten(c) + ":"; }
@@ -1020,6 +1080,52 @@ private:
                 "replayed=" + hex(cr.ledger->owed_digest()) + " lhead=" + hex(cr.lhead.owed_digest)});
             return false;
         }
+        // ★ the owed-event MMR replay check — the same shape as the digest
+        // check just above, over the record log the replay rebuilt. Replaying
+        // the levt stream drives the SAME mutators, and every mutation mints
+        // exactly one leaf, so a correct replay lands on the persisted peaks
+        // and root byte for byte. A head that is present and does NOT match is
+        // fail-closed, exactly like a digest mismatch.
+        if (!load_lmmr_check(c, cr)) return false;
+        return true;
+    }
+
+    bool load_lmmr_check(u64 c, ChainRecovery& cr) {
+        auto mv = m_store.get(p_lmmr(c));
+        if (!mv) return true;                        // pre-lmmr database: nothing to check
+        auto mdec = persist::decode_lmmr(*mv);
+        if (!mdec) {
+            cr.fails.push_back({c, "lmmr_decode", p_lmmr(c),
+                "unknown ver/kind, byte-flip, or n_peaks != popcount(leaf_count)"});
+            return false;
+        }
+        cr.lmmr = *mdec;
+        cr.lmmr_present = true;
+        const u64 rep_leaves = cr.ledger->owed_event_leaf_count();
+        const bytes32 rep_root = cr.ledger->owed_event_mmr_root();
+        if (mdec->ledger_seq != cr.ledger->ledger_seq()) {
+            cr.fails.push_back({c, "lmmr_seq_mismatch", p_lmmr(c),
+                "lmmr.ledger_seq=" + std::to_string(mdec->ledger_seq) +
+                " replayed ledger_seq=" + std::to_string(cr.ledger->ledger_seq())});
+            return false;
+        }
+        if (mdec->leaf_count != rep_leaves) {
+            cr.fails.push_back({c, "lmmr_leafcount_mismatch", p_lmmr(c),
+                "lmmr.leaf_count=" + std::to_string(mdec->leaf_count) +
+                " replayed=" + std::to_string(rep_leaves)});
+            return false;
+        }
+        if (mdec->root != rep_root) {
+            cr.fails.push_back({c, "lmmr_root_mismatch", p_lmmr(c),
+                "replayed=" + hex(rep_root) + " lmmr=" + hex(mdec->root)});
+            return false;
+        }
+        if (mdec->peaks != cr.ledger->owed_event_peaks().peaks) {
+            cr.fails.push_back({c, "lmmr_peaks_mismatch", p_lmmr(c),
+                "peak set differs from the replayed record log at the same root"});
+            return false;
+        }
+        cr.lmmr_verified = true;
         return true;
     }
 
@@ -1121,7 +1227,23 @@ private:
         b->put("v37s:levt:" + ten(c) + ":" + twenty(seq), persist::encode_event(ev));
         b->put(p_lhead(c), persist::encode_lhead(cr.lhead));
         b->put(p_hw(c), persist::encode_hw(static_cast<::v37::ChainId>(c), m_boot_id, cr.hw));
+        stage_lmmr(*b, c, *cr.ledger);                   // ★ keep the record-log head with lhead
         b->commit_sync();
+    }
+
+    // The reconcile write paths stage their own head records (they do not go
+    // through SettlementJournal::stage_head), so the record-log head is written
+    // here too — otherwise a reconcile-minted event would leave lmmr one or more
+    // cuts behind lhead and the NEXT recovery would fail closed on a mismatch
+    // that is not corruption.
+    void stage_lmmr(persist::ISettleBatch& b, u64 c, const OwedLedger& ledger) {
+        persist::LmmrRec lm;
+        lm.ledger_seq = ledger.ledger_seq();
+        lm.leaf_count = ledger.owed_event_leaf_count();
+        lm.root       = ledger.owed_event_mmr_root();
+        lm.peaks      = ledger.owed_event_peaks().peaks;
+        lm.boot_id    = m_boot_id;
+        b.put(p_lmmr(c), persist::encode_lmmr(lm));
     }
 
     bool intent_reconcile(u64 c, ChainRecovery& cr) {
@@ -1150,6 +1272,7 @@ private:
                 b->put("v37s:levt:" + ten(c) + ":" + twenty(seq), persist::encode_event(ev));
                 b->put(p_lhead(c), persist::encode_lhead(cr.lhead));
                 b->put(p_hw(c), persist::encode_hw(static_cast<::v37::ChainId>(c), m_boot_id, cr.hw));
+                stage_lmmr(*b, c, *cr.ledger);           // ★ record-log head, same batch
                 b->put(p_blk(c) + rd->blk.bid, persist::encode_blk(rd->blk));
                 b->remove(k);
                 b->commit_sync();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Dashboard DATA honesty KATs — every case pins a defect measured on the two
-// hotel DASH dashboards on 2026-08-05 (primary :8080 / reserve :8081, both on
+// production DASH dashboards on 2026-08-05 (primary :8080 / reserve :8081, both on
 // the same build):
 //
 //   * rows for OUR OWN accepted blocks h=2516911/2516914 rendered as junk on
@@ -116,7 +116,7 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
 
     // Subsidy fallback: the caller passed 0 on the node's own chain, so the
     // template's coinbasevalue must have been recorded instead (row 2516914
-    // showed subsidy=0 on the hotel because the WebServer-held template is
+    // showed subsidy=0 on the production node because the WebServer-held template is
     // empty on the embedded arm).
     EXPECT_EQ(blk["subsidy"].get<uint64_t>(), 177109977u);
 
@@ -128,7 +128,7 @@ TEST(DashboardData, LuckIsComputedFromTheLiveTemplateWhenTheCacheIsCold)
 // The FIRST block of a ledger has no predecessor, hence no time_to_find and
 // no luck MEASUREMENT. That must surface as null ("not computed"), never as
 // a numeric 0 the chart will draw — 0% luck is a catastrophe claim, and the
-// hotel chart made exactly that claim out of unmeasured rows.
+// production chart made exactly that claim out of unmeasured rows.
 TEST(DashboardData, UncomputedLuckIsNullNeverZero)
 {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
@@ -317,7 +317,7 @@ TEST(DashboardData, GlobalStatsLastBlockReadsTheFoundBlockLedger)
                           1.0, 1.0, 1.0, 1);
     auto gs = mi.rest_global_stats();
     EXPECT_EQ(gs["last_block"].get<uint64_t>(), 2516911u)
-        << "both hotel nodes showed last_block=0 with 100+ rows on disk";
+        << "both production nodes showed last_block=0 with 100+ rows on disk";
     EXPECT_EQ(gs["last_block_ts"].get<uint64_t>(), 1785955172u);
     // And the miners-count scope is stated, so 5-vs-33-rigs cannot again be
     // read as a bug: 5 counts pool-wide payout addresses, rigs are local
@@ -356,7 +356,7 @@ TEST(DashboardData, AllTimeBestShareSurvivesARestart)
     auto stats = mi2.rest_local_stats();
     const auto& best = stats["best_share"];
     EXPECT_NEAR(best["all_time"]["difficulty"].get<double>(), 268585.98, 1e-6)
-        << "the hotel primary showed all_time == session after 36 min of"
+        << "the primary node showed all_time == session after 36 min of"
            " uptime: 'all time' reset on every restart";
     EXPECT_EQ(best["all_time"]["miner"].get<std::string>(),
               "XudUrCvNXLRwyJqnpdEvZC8Hd6DRAW81TV");
@@ -399,7 +399,7 @@ TEST(DashboardData, PersistedBestShareNeverLowersALiveRecord)
 // 7. The node-fee amount is readable WITHOUT knowing which coin this is
 // ═══════════════════════════════════════════════════════════════════════════
 
-// THE INCIDENT (live, 2026-08-06, DASH node 109.161.52.148:8081): the Node Fee
+// THE INCIDENT (live, 2026-08-06, DASH node, reserve instance): the Node Fee
 // card showed "- DASH" — no amount. /local_stats on that node carried
 //     node_fee_dash = 0.004240003478694174
 //     node_fee_ltc  = ABSENT
@@ -1308,9 +1308,110 @@ TEST(NodeInfoRuntimeEndpoint, ExternalIpAndP2pPortSurfaced) {
     EXPECT_EQ(before.value("external_ip", std::string{}), "0.0.0.0");
     EXPECT_EQ(before.value("p2p_port", -1), 0);
 
-    mi.set_external_ip("158.220.92.171");
+    mi.set_external_ip("203.0.113.10");
     mi.set_p2p_port(9337);
     auto after = mi.rest_node_info();
-    EXPECT_EQ(after.value("external_ip", std::string{}), "158.220.92.171");
+    EXPECT_EQ(after.value("external_ip", std::string{}), "203.0.113.10");
     EXPECT_EQ(after.value("p2p_port", -1), 9337);
+}
+
+// ── #940 D-EMB.940: coin-P2P dial-failure visibility ────────────────────────
+//
+// The root daemonless-DASH blocker: when the embedded coin arm cannot dial ANY
+// Dash peer, the node used to look healthy with an empty state -- dial failure
+// dead-ended in the peer scorer and reached NO status surface. These KATs pin
+// the three-way distinction the fix introduces on /local_stats and /v36_status:
+//   * dial_failing (0 reachable peers + dial failures)  -> LOUD banner, ALWAYS
+//     on (even with no work update, i.e. m_last_work_update_time == 0 -- the
+//     exact fresh-node state the old tip-stall gate could never catch);
+//   * connected    (>=1 handshaked peer, view may be empty) -> NO banner;
+//   * idle         (no dials attempted yet)                 -> NO banner.
+// Silent degradation to zero is no longer possible.
+namespace {
+bool has_warning_substr(const nlohmann::json& stats, const std::string& needle)
+{
+    if (!stats.contains("warnings") || !stats["warnings"].is_array()) return false;
+    for (const auto& w : stats["warnings"])
+        if (w.is_string() && w.get<std::string>().find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+void wire_coin_p2p(MiningInterface& mi, const std::string& state,
+                   bool reachable, int connected, uint64_t dial_failures)
+{
+    mi.set_coin_sync_status_fn([=]() {
+        nlohmann::json s = nlohmann::json::object();
+        s["peers"] = nlohmann::json::array();
+        s["connected_peers"] = connected;
+        s["coin_p2p"] = {
+            {"state", state},
+            {"network_reachable", reachable},
+            {"connected_peers", connected},
+            {"handshaked_peers", reachable ? connected : 0},
+            {"dialing", 0},
+            {"dial_failures", dial_failures},
+            {"last_dial_failed_unix", dial_failures > 0 ? 1758056400 : 0},
+            {"last_dial_ok_unix", reachable ? 1758056400 : 0},
+        };
+        return s;
+    });
+}
+} // namespace
+
+TEST(CoinP2pDialVisibility, DialFailingSurfacesWithoutAnyWorkUpdate) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    // NO work update / template is wired: m_last_work_update_time stays 0, the
+    // state the old tip-stall-gated warning could never surface.
+    wire_coin_p2p(mi, "dial_failing", /*reachable=*/false,
+                  /*connected=*/0, /*dial_failures=*/7);
+
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("coin_p2p"));
+    EXPECT_EQ(stats["coin_p2p"].value("state", std::string{}), "dial_failing");
+    EXPECT_EQ(stats["coin_p2p"].value("connected_peers", -1), 0);
+    EXPECT_EQ(stats["coin_p2p"].value("dial_failures", -1), 7);
+    EXPECT_FALSE(stats["coin_p2p"].value("network_reachable", true));
+    EXPECT_TRUE(has_warning_substr(stats, "DIAL FAILING"))
+        << "dial failure must be a LOUD, always-on banner";
+}
+
+TEST(CoinP2pDialVisibility, ConnectedButEmptyIsDistinctAndSilent) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "connected", /*reachable=*/true,
+                  /*connected=*/3, /*dial_failures=*/0);
+
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("coin_p2p"));
+    EXPECT_EQ(stats["coin_p2p"].value("state", std::string{}), "connected");
+    EXPECT_TRUE(stats["coin_p2p"].value("network_reachable", false));
+    // connected-but-empty is NOT a dial failure -> no banner. This is the
+    // distinction #940 acceptance requires.
+    EXPECT_FALSE(has_warning_substr(stats, "DIAL FAILING"));
+}
+
+TEST(CoinP2pDialVisibility, IdleNeverDialedIsDistinctAndSilent) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "idle", /*reachable=*/false,
+                  /*connected=*/0, /*dial_failures=*/0);
+
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("coin_p2p"));
+    EXPECT_EQ(stats["coin_p2p"].value("state", std::string{}), "idle");
+    // No dials attempted -> no failure -> no banner (distinct from dial_failing).
+    EXPECT_FALSE(has_warning_substr(stats, "DIAL FAILING"));
+}
+
+TEST(CoinP2pDialVisibility, V36StatusCarriesDialState) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "dial_failing", /*reachable=*/false,
+                  /*connected=*/0, /*dial_failures=*/4);
+
+    auto v36 = mi.rest_v36_status();
+    ASSERT_TRUE(v36.contains("coin_p2p"));
+    EXPECT_EQ(v36["coin_p2p"].value("state", std::string{}), "dial_failing");
+    EXPECT_EQ(v36["coin_p2p"].value("dial_failures", -1), 4);
 }

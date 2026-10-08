@@ -17,20 +17,23 @@ using BlockchainAddressValidator = c2pool::address::BlockchainAddressValidator;
 namespace c2pool {
 namespace payout {
 
-/// Developer payout configuration for C2Pool attribution
+/// The donation (give-author) as the sharechain pays it (V36 rules, p2pool
+/// data.py): each share carries its miner's --give-author percent, every node
+/// splits the share's weight by it, and the donation output is
+/// subsidy - sum(payouts): the give-author shares plus the rounding dust,
+/// never below 1 satoshi (the V36 marker). There is NO floor on the percent:
+/// 0 opts out, leaving only the 1-satoshi marker. This config mirrors that for
+/// display and the stand-alone RPC; the sharechain builds the real coinbase.
 struct DeveloperPayoutConfig {
-    // C2Pool developer addresses for different blockchains
+    // The protocol donation address per blockchain (LTC: the V36
+    // COMBINED_DONATION_SCRIPT, 1-of-2 P2SH, impl/ltc/config_pool.hpp).
     std::map<Blockchain, std::string> mainnet_addresses;
     std::map<Blockchain, std::string> testnet_addresses;
-    
-    // Default developer fee (minimal attribution when no donation)
-    double default_fee_percent = 0.5;  // 0.5% default attribution fee
-    double configured_fee_percent = 0.0;  // User-configured donation
-    bool minimal_attribution_mode = true;  // Use minimal satoshi amount when donation is 0
-    
-    // Minimal attribution amounts (in satoshis/smallest units)
-    static constexpr uint64_t MINIMAL_ATTRIBUTION_SATOSHIS = 1;  // 1 satoshi for attribution
-    static constexpr uint64_t MINIMAL_ATTRIBUTION_THRESHOLD = 1000000000;  // 10 LTC threshold for minimal mode
+
+    double configured_fee_percent = 0.0;  // --give-author (0..100); no floor
+
+    // The V36 donation marker: the donation output never carries less.
+    static constexpr uint64_t MINIMAL_ATTRIBUTION_SATOSHIS = 1;
     
     // Enabled/disabled state
     bool enabled = true;

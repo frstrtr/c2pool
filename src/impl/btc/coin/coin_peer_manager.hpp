@@ -240,6 +240,16 @@ struct BtcPeerManagerConfig
     int         max_peers_per_group{4};         // max peers from same /16 (IPv4) or /32 (IPv6)
     int         max_new_peers_per_group{3};     // stricter limit for unverified (new) peers
     int         anchor_count{2};                // number of anchor connections to persist
+
+    // Address-manager bucket key (SipHash k0/k1). Left (0,0) in production so
+    // CoinAddrMan seeds a per-node RANDOM key -> bucket placement is
+    // unpredictable (anti-Sybil). Tests set a fixed non-zero key to make
+    // bucketing deterministic: under a random key CoinAddrMan::add() can drop a
+    // fresh addr into an already-occupied new-table slot (collide-and-evict),
+    // so "N distinct groups -> N banked" holds only PROBABILISTICALLY. Mirrors
+    // the bip110 manager; see coin_addrman.hpp. Removes the AddrmanBanks* flake.
+    uint64_t    addrman_key0{0};
+    uint64_t    addrman_key1{0};
 };
 
 // ─── BtcCoinPeerManager ──────────────────────────────────────────────────────
@@ -262,6 +272,7 @@ public:
         , m_fixed_seed_timer(ioc)
         , m_http_seed_timer(ioc)
         , m_emergency_timer(ioc)
+        , m_addrman(config.addrman_key0, config.addrman_key1)
     {
     }
 

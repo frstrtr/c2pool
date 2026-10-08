@@ -71,6 +71,15 @@ bool bls_backend_available()
 #endif
 }
 
+const char* bls_backend_name()
+{
+#ifdef C2POOL_DASH_BLS
+    return "dashbls";
+#else
+    return "stub";
+#endif
+}
+
 #ifdef C2POOL_DASH_BLS
 namespace {
 

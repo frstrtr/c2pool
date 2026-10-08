@@ -39,6 +39,7 @@
 #include <functional>
 #include <string>
 #include <map>
+#include <utility>   // #157 M3: std::pair for the per-peer byte window
 
 namespace dash {
 
@@ -85,10 +86,17 @@ struct PeerInjectGuard {
     // still bounds a hostile peer to ~1 script-check attempt every 2 s.
     static constexpr std::size_t kMaxInjectsPerPeerPerWindow = 30;
     static constexpr std::time_t kWindowSeconds = 60;
+    // #157 M3: per-peer VOLUME cap (bytes/window) alongside the count cap above.
+    // A peer sending few but MAX-SIZE injects (kMaxInjectTxBytes = 100 KB each)
+    // is bounded by count, but this bounds the bandwidth/memory churn directly:
+    // 30 * 100 KB = 3 MB/min ceiling, matching the count cap at max tx size.
+    static constexpr uint64_t kMaxInjectBytesPerPeerPerWindow = 3u * 1024u * 1024u;
     // Per-peer txid memory cap (FIFO eviction). Bounds the set a peer can grow.
     static constexpr std::size_t kMaxPeerSeen = 4096;
 
     std::deque<std::time_t> window;   // submit timestamps inside kWindowSeconds
+    std::deque<std::pair<std::time_t, uint64_t>> byte_window;  // (ts, bytes) inside the window
+    uint64_t                bytes_in_window{0};   // running sum of byte_window
     std::deque<uint256>     seen_order;
     std::map<uint256, char> seen;  // txid -> present (this peer only)
 
@@ -97,6 +105,19 @@ struct PeerInjectGuard {
         while (!window.empty() && window.front() + kWindowSeconds <= now)
             window.pop_front();
         return window.size();
+    }
+
+    // #157 M3: drop byte events older than the window; return bytes still inside.
+    uint64_t prune_byte_window(std::time_t now) {
+        while (!byte_window.empty() && byte_window.front().first + kWindowSeconds <= now) {
+            bytes_in_window -= byte_window.front().second;
+            byte_window.pop_front();
+        }
+        return bytes_in_window;
+    }
+    void record_bytes(std::time_t now, uint64_t byte_size) {
+        byte_window.emplace_back(now, byte_size);
+        bytes_in_window += byte_size;
     }
 
     bool peer_has_seen(const uint256& txid) const {
@@ -154,7 +175,7 @@ struct NodeInjectSeen {
 //   node_seen   — node-level decided-txid set (IO-thread-confined)
 //   peer_guard  — this peer's DoS state
 //   txid        — dash_txid(msg.m_tx), self-computed by the caller
-//   byte_size   — informational (reserved; DoS byte caps live in submit_inject)
+//   byte_size   — #157 M3: charged against the per-peer VOLUME cap (bytes/window)
 //   now         — one clock reading for the whole decision
 //   submit_fn   — () -> InjectSubmitOutcome, wrapping NodeCoinState::submit_inject
 template <typename SubmitFn>
@@ -166,7 +187,6 @@ InjectRelayVerdict ingest_peer_inject(bool enabled,
                                       std::time_t now,
                                       SubmitFn&& submit_fn)
 {
-    (void)byte_size;
     InjectRelayVerdict v;
     v.txid = txid;
 
@@ -202,14 +222,26 @@ InjectRelayVerdict ingest_peer_inject(bool enabled,
     // we saw the peer act (window untouched so a slowed peer recovers).
     if (peer_guard.prune_window(now) >= PeerInjectGuard::kMaxInjectsPerPeerPerWindow) {
         v.kind = InjectRelayVerdict::Kind::RateLimited;
-        v.cause = "peer-rate-limited";
+        v.cause = "peer-rate-limited-count";
         v.forward = false;
         return v;
     }
 
-    // Genuinely new + within budget: charge the window, remember the peer saw it,
-    // and route through the M1 gate exactly once.
+    // #157 M3 — per-peer VOLUME cap. A peer under the count cap can still push
+    // bytes with big injects; refuse once this window's bytes would exceed the
+    // ceiling. Pruned to `now`; no submit, window untouched so a peer recovers.
+    if (peer_guard.prune_byte_window(now) + byte_size
+            > PeerInjectGuard::kMaxInjectBytesPerPeerPerWindow) {
+        v.kind = InjectRelayVerdict::Kind::RateLimited;
+        v.cause = "peer-rate-limited-bytes";
+        v.forward = false;
+        return v;
+    }
+
+    // Genuinely new + within budget: charge both windows, remember the peer saw
+    // it, and route through the M1 gate exactly once.
     peer_guard.record_window(now);
+    peer_guard.record_bytes(now, byte_size);
     peer_guard.remember_peer_seen(txid);
 
     InjectSubmitOutcome out = submit_fn();

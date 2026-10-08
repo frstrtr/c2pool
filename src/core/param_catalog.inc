@@ -62,6 +62,19 @@ C2P_PARAM("meta.ack_money_settings", Meta, BOOL, COMPILE_TIME_READONLY, C_ALL, L
   C2P_ALIAS("meta.ack_money_settings", BIN_DGB, "--ack-money-settings", FLAG)
   C2P_ALIAS("meta.ack_money_settings", BIN_BCH, "--ack-money-settings", FLAG)
 
+// Control-plane apply token file (#157 Slice 3). DORMANT launch seam: pointing
+// this at a 0600 owner-only file whose contents are a 32-128 char token loads
+// that token via config_endpoint::set_control_token() at startup, which is the
+// ONLY production caller that arms POST /api/config[/apply]. Absent (the
+// default) => no token => the apply endpoint stays fail-closed (503 armed:false)
+// exactly as on master. MONEY_RESTART: it is money-adjacent (it is what makes
+// runtime money-key arming reachable at all), so setting it from a settings
+// file requires the money-ack ceremony; changing it needs a restart. It is
+// never a runtime-appliable key (no ParamApplier setter), so the apply path's
+// runtime-setter precondition refuses any attempt to set it over HTTP.
+C2P_PARAM("control.token_file", Gate, PATH, MONEY_RESTART, C_DASH, LIT, "", NONE, "control-plane apply token file (0600, owner-only, 32-128 char token; DORMANT, arms POST /api/config/apply when present)")
+  C2P_ALIAS("control.token_file", BIN_DASH, "--control-plane-token-file", VALUE)
+
 C2P_PARAM("meta.run", Meta, BOOL, RESTART, C_DASH|C_DGB, LIT, "false", NONE, "run the node")
   C2P_ALIAS("meta.run", BIN_DASH, "--run", FLAG)
   C2P_ALIAS("meta.run", BIN_DGB, "--run", FLAG)
@@ -192,14 +205,22 @@ C2P_PARAM("sharechain.p2p_max_peers", Sharechain, INT64, RESTART, C_LTC, LIT, "3
 C2P_PARAM("sharechain.ban_duration", Sharechain, INT64, LIVE, C_LTC, LIT, "300", NONE, "ban duration seconds")
   C2P_ALIAS("sharechain.ban_duration", BIN_LTC, "--ban-duration", VALUE)
 
-C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC, LIT, "", HEX_EVEN, "private sharechain identifier (forks chain)")
+C2P_PARAM("sharechain.network_id", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain identifier (forks chain)")
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--network-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_LTC, "--chain-id", VALUE)
   C2P_ALIAS("sharechain.network_id", BIN_BTC, "--network-id", VALUE)
+  C2P_ALIAS("sharechain.network_id", BIN_DASH, "--network-id", VALUE)
 
-C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC, LIT, "", HEX_EVEN, "private sharechain prefix")
+C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DASH, LIT, "", HEX_EVEN, "private sharechain prefix")
   C2P_ALIAS("sharechain.prefix", BIN_LTC, "--prefix", VALUE)
   C2P_ALIAS("sharechain.prefix", BIN_BTC, "--prefix", VALUE)
+  C2P_ALIAS("sharechain.prefix", BIN_DASH, "--prefix", VALUE)
+
+// Named sharechain network (DASH): "v36" / "dash-v36" = the DASH v36 network
+// (identifier ac2785363c0180b8, prefix 8d8516bac9edd280). Money-class: it
+// changes the chain identity like network_id. Exclusive with network_id/prefix.
+C2P_PARAM("sharechain.network", Sharechain, ENUM_STR, MONEY_RESTART, C_DASH, LIT, "", ENUM_MEMBER, "named sharechain network: v36 = the DASH v36 network (forks chain)")
+  C2P_ALIAS("sharechain.network", BIN_DASH, "--net", VALUE)
 
 C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT, "", HOSTPORT_V, "explicit coin-network dial")
   C2P_ALIAS("coin_p2p.connect", BIN_DASH, "--coin-p2p-connect", VALUE)
@@ -238,9 +259,10 @@ C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE|C_DGB, LIT
 C2P_PARAM("coin_p2p.address", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "coind P2P address")
   C2P_ALIAS("coin_p2p.address", BIN_LTC, "--coind-p2p-address", VALUE)
 
-C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
+C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC|C_DGB, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--coind-p2p-port", VALUE)
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--bitcoind-p2p-port", VALUE)
+  C2P_ALIAS("coin_p2p.port", BIN_DGB, "--coind-p2p-port", VALUE)
 
 C2P_PARAM("daemon_rpc.endpoint", DaemonRpc, HOSTPORT, RESTART, C_DASH|C_BTC|C_DGB, LIT, "", HOSTPORT_V, "coin daemon RPC endpoint (empty=daemonless)")
   C2P_ALIAS("daemon_rpc.endpoint", BIN_DASH, "--coin-rpc", VALUE)
@@ -548,8 +570,61 @@ C2P_PARAM("embedded.fold_live_expect", Embedded, HEX, RESTART, C_DASH, LIT, "", 
 C2P_PARAM("embedded.fold_checkscripts", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "consensus-exact input-script check")
   C2P_ALIAS("embedded.fold_checkscripts", BIN_DASH, "--embedded-fold-checkscripts", FLAG)
 
-C2P_PARAM("embedded.tx_inject", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection (opt-in, default OFF, reward-neutral)")
+C2P_PARAM("embedded.tx_inject", Embedded, BOOL, MONEY_LIVE, C_DASH, LIT, "false", NONE, "#157 miner/user tx-injection arm (opt-in, default OFF, reward-neutral; MONEY-path: arming changes mined-block body -> the full two-phase money-nonce + M0 tripwire gate, Slice B)")
   C2P_ALIAS("embedded.tx_inject", BIN_DASH, "--embedded-tx-inject", FLAG)
+
+// D-MINER.7 miner-offline alert relay over the sharechain p2p (non-consensus,
+// default OFF; see src/impl/dash/alert_service.hpp). RESTART: read at launch.
+C2P_PARAM("alert_relay.origin", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "origin role: detect offline stratum workers and relay signed alerts over the sharechain p2p")
+  C2P_ALIAS("alert_relay.origin", BIN_DASH, "--alert-relay-origin", FLAG)
+
+C2P_PARAM("alert_relay.telegram", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "relay role: accept allowlisted alerts addressed to this node for the Telegram sidecar")
+  C2P_ALIAS("alert_relay.telegram", BIN_DASH, "--alert-relay-telegram", FLAG)
+
+C2P_PARAM("alert_relay.forward", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "store-and-forward alerts not addressed to this node")
+  C2P_ALIAS("alert_relay.forward", BIN_DASH, "--alert-relay-forward", FLAG)
+
+C2P_PARAM("alert_relay.test", Global, BOOL, RESTART, C_DASH, LIT, "false", NONE, "origin: send one test alert ~30s after start")
+  C2P_ALIAS("alert_relay.test", BIN_DASH, "--alert-relay-test", FLAG)
+
+C2P_PARAM("alert_relay.show_key", Meta, BOOL, COMPILE_TIME_READONLY, C_DASH, LIT, "false", NONE, "print this node's alert pubkey (creating the key if needed) and exit")
+  C2P_ALIAS("alert_relay.show_key", BIN_DASH, "--alert-relay-show-key", FLAG)
+
+C2P_PARAM("alert_relay.key_file", Global, PATH, RESTART, C_DASH, LIT, "", NONE, "alert secp256k1 key file (created 0600 on first use; default <data-dir>/<net>/alert_relay/alert.key)")
+  C2P_ALIAS("alert_relay.key_file", BIN_DASH, "--alert-relay-key-file", VALUE)
+
+C2P_PARAM("alert_relay.to", Global, HEX, RESTART, C_DASH, LIT, "", HEX_EVEN, "origin: relay pubkey to seal alerts for (repeatable)")
+  C2P_ALIAS("alert_relay.to", BIN_DASH, "--alert-relay-to", VALUE)
+
+C2P_PARAM("alert_relay.accept", Global, HEX, RESTART, C_DASH, LIT, "", HEX_EVEN, "relay: allowlisted origin pubkey (repeatable)")
+  C2P_ALIAS("alert_relay.accept", BIN_DASH, "--alert-relay-accept", VALUE)
+
+C2P_PARAM("alert_relay.accept_file", Global, PATH, RESTART, C_DASH, LIT, "", NONE, "relay: file of allowlisted origin pubkeys (one hex per line)")
+  C2P_ALIAS("alert_relay.accept_file", BIN_DASH, "--alert-relay-accept-file", VALUE)
+
+C2P_PARAM("alert_relay.label", Global, STRING, RESTART, C_DASH, LIT, "", NONE, "origin: short label shown in the alert text (<=32 chars)")
+  C2P_ALIAS("alert_relay.label", BIN_DASH, "--alert-relay-label", VALUE)
+
+C2P_PARAM("alert_relay.offline_after", Global, INT64, RESTART, C_DASH, LIT, "300", NONE, "origin: seconds a worker must be down before OFFLINE fires")
+  C2P_ALIAS("alert_relay.offline_after", BIN_DASH, "--alert-relay-offline-after", VALUE)
+
+C2P_PARAM("alert_relay.online_after", Global, INT64, RESTART, C_DASH, LIT, "60", NONE, "origin: seconds a worker must be back before BACK_ONLINE fires")
+  C2P_ALIAS("alert_relay.online_after", BIN_DASH, "--alert-relay-online-after", VALUE)
+
+C2P_PARAM("alert_relay.min_interval", Global, INT64, RESTART, C_DASH, LIT, "600", NONE, "origin: minimum seconds between OFFLINE alerts for one worker")
+  C2P_ALIAS("alert_relay.min_interval", BIN_DASH, "--alert-relay-min-interval", VALUE)
+
+C2P_PARAM("alert_relay.startup_grace", Global, INT64, RESTART, C_DASH, LIT, "600", NONE, "origin: no OFFLINE alerts this many seconds after start")
+  C2P_ALIAS("alert_relay.startup_grace", BIN_DASH, "--alert-relay-startup-grace", VALUE)
+
+C2P_PARAM("alert_relay.stall_after", Global, INT64, RESTART, C_DASH, LIT, "900", NONE, "origin: connected worker with no accepted share this long counts as down (0=off)")
+  C2P_ALIAS("alert_relay.stall_after", BIN_DASH, "--alert-relay-stall-after", VALUE)
+
+C2P_PARAM("alert_relay.retry_every", Global, INT64, RESTART, C_DASH, LIT, "60", NONE, "origin: seconds between retransmits of an unacked alert")
+  C2P_ALIAS("alert_relay.retry_every", BIN_DASH, "--alert-relay-retry-every", VALUE)
+
+C2P_PARAM("alert_relay.retry_max", Global, INT64, RESTART, C_DASH, LIT, "60", NONE, "origin: total transmissions per alert before it is recorded undelivered")
+  C2P_ALIAS("alert_relay.retry_max", BIN_DASH, "--alert-relay-retry-max", VALUE)
 
 C2P_PARAM("embedded.tx_inject_hex", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "#157 local tx-inject submit file (raw tx hex per line)")
   C2P_ALIAS("embedded.tx_inject_hex", BIN_DASH, "--embedded-tx-inject-hex", VALUE)
@@ -664,6 +739,9 @@ C2P_PARAM("utility.dump_mn_checkpoint", Meta, STRING, RESTART, C_DASH, LIT, "", 
 
 C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", NONE, "mine-block max nonce")
   C2P_ALIAS("utility.max_nonce", BIN_DASH, "--max-nonce", VALUE)
+
+C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
+  C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
 
 #undef C2P_PARAM
 #undef C2P_ALIAS

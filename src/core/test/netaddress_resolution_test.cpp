@@ -15,7 +15,7 @@
 //     p2pool, so the fix must not move a single byte for numeric input. Every
 //     dotted-quad KAT below is the byte string this serializer produced before
 //     the fix and must keep producing — including a genuine
-//     `--addnode 127.0.0.1:18999`, which the hotel legitimately runs.
+//     `--addnode 127.0.0.1:18999`, which the production node legitimately runs.
 //
 //  2. THE DEFECT. A hostname must not serialize to loopback, and once the
 //     outbound-connect resolver has resolved it, it must serialize to that A
@@ -78,7 +78,7 @@ std::vector<uint8_t> wire_quad(const NetAddress& addr)
 
 const std::vector<uint8_t> LOOPBACK_QUAD{0x7f, 0x00, 0x00, 0x01};
 
-// The two DNS names from the production hotel's --addnode list, and the
+// The two DNS names from the production node's --addnode list, and the
 // addresses they actually resolve to (issue #910).
 constexpr const char* HOST_ROV = "rov.p2p-spb.xyz";
 constexpr const char* HOST_USA = "usa.p2p-spb.xyz";
@@ -119,7 +119,7 @@ TEST_F(ResolvedHostsFixture, DottedQuadWireBytesAreUnchanged)
 
 TEST_F(ResolvedHostsFixture, GenuineLoopbackStillSerializesAndRoundTrips)
 {
-    // The hotel legitimately runs `--addnode 127.0.0.1:18999`. A real loopback
+    // The production node legitimately runs `--addnode 127.0.0.1:18999`. A real loopback
     // address is NOT what #910 is about and must keep working untouched.
     EXPECT_EQ(wire_quad(NetAddress(std::string("127.0.0.1"))), LOOPBACK_QUAD);
 
@@ -152,6 +152,51 @@ TEST_F(ResolvedHostsFixture, DottedQuadRoundTripsThroughUnserialize)
     NetAddress read;
     stream >> read;
     EXPECT_EQ(read.address(), "83.221.211.116");
+}
+
+// ---------------------------------------------------------------------------
+// #965 regression: an IPv4-mapped IPv6 address -- what the dual-stack acceptor
+// hands back for an IPv4 peer -- must collapse to its dotted-quad IPv4 form
+// (canonical CNetAddr::SetLegacyIPv6) and serialize byte-identically to a
+// natively-accepted IPv4 peer. Pre-fix the mapped form kept NET_IPV4 with an
+// IPv6-string m_ip; Write_IPV4's colon branch did erase_all(':') +
+// ParseHex("ffff127.0.0.1"), emitting a non-16-byte, unparsable addr field.
+// That corrupted the accepting-side version message, so an inbound IPv4 peer
+// never completed the handshake (bip110_inbound_listener_kat, 7 assertions).
+// ---------------------------------------------------------------------------
+TEST_F(ResolvedHostsFixture, V4MappedIPv6CollapsesToIPv4)
+{
+    const auto mapped = boost::asio::ip::make_address("::ffff:127.0.0.1");
+    ASSERT_TRUE(mapped.is_v6());
+
+    // Raw boost address (the ingestion point the acceptor uses).
+    NetAddress from_addr{mapped};
+    EXPECT_EQ(from_addr.address(), "127.0.0.1")
+        << "v4-mapped IPv6 must collapse to dotted-quad, not stay ::ffff:127.0.0.1";
+    EXPECT_EQ(wire_quad(from_addr), LOOPBACK_QUAD)
+        << "collapsed address must put the same 4 bytes on the wire as native 127.0.0.1";
+
+    // The exact accepted-endpoint path: NetService(tcp::endpoint) -> get_addr().
+    boost::asio::ip::tcp::endpoint ep{mapped, 8333};
+    NetService svc{ep};
+    EXPECT_EQ(svc.address(), "127.0.0.1");
+    EXPECT_EQ(svc.port(), uint16_t{8333});
+    EXPECT_EQ(wire_quad(svc), LOOPBACK_QUAD);
+
+    // Full round-trip: the collapsed NetService serializes and reads back as
+    // plain IPv4 (16 addr bytes + 2 port bytes), same as native loopback.
+    PackStream stream;
+    stream << svc;
+    EXPECT_EQ(stream.get_span().size(), 18u);
+    NetService read;
+    stream >> read;
+    EXPECT_EQ(read.address(), "127.0.0.1");
+    EXPECT_EQ(read.port(), uint16_t{8333});
+
+    // A genuine (non-mapped) IPv6 address is untouched -- still NET_IPV6.
+    const auto real_v6 = boost::asio::ip::make_address("2a00:1450:4001:81b::200e");
+    NetAddress v6{real_v6};
+    EXPECT_EQ(v6.address(), "2a00:1450:4001:81b::200e");
 }
 
 // ---------------------------------------------------------------------------

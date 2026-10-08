@@ -27,6 +27,7 @@
 
 #include <sharechain/v37/v37_lane.hpp>       // ::v37::LaneParams
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
+#include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params()
 
 namespace c2pool::v37n::btc {
 
@@ -86,7 +87,10 @@ inline CoinDaemonEndpoint default_endpoint(BtcFamilyCoin coin, BtcNetwork net) {
         switch (net) {
             case BtcNetwork::Regtest:  e.rpc_port = 19998; e.p2p_port = 19899; break;
             case BtcNetwork::Devnet:   e.rpc_port = 19998; e.p2p_port = 19899; break;
-            case BtcNetwork::Testnet4: // DASH has no testnet4; fall through to testnet
+            // DASH has no testnet4; --network testnet IS testnet3 (rpc 19998,
+            // p2p 19999). It must NOT share the mainnet arm below: falling
+            // through handed a testnet node the MAINNET endpoint 9998/9999.
+            case BtcNetwork::Testnet4: e.rpc_port = 19998; e.p2p_port = 19999; break;
             case BtcNetwork::Mainnet:  e.rpc_port =  9998; e.p2p_port =  9999; break;
         }
     } else {  // LTC
@@ -124,9 +128,17 @@ struct BtcNodeConfig {
     // lane). Distinct kind-space from the XMR lane — this is the NATIVE canon.
     ::v37::ChainId  lane_chain = 0;
 
-    // The digest-committed lane geometry. Defaults to the OQ-5 ratified default
-    // (LaneParams{}), the only geometry W4's geometry_is_ratified() admits.
-    ::v37::LaneParams lane_params{};
+    // The digest-committed lane geometry. Family-A: the OQ-5 ratified default
+    // geometry, the only geometry W4's geometry_is_ratified() admits, with the
+    // coinbase no-dust floor k_floor = f_ref = 10 (LaneParams::family_a,
+    // STEP-0 hotfix). k_floor is consensus (it decides the canonical coinbase)
+    // and is committed in the lane digest, so a node that runs a different
+    // value is refused at the cut, never silently forked. T1 seam: the
+    // consensus VERSION is single-sourced through node_lane_params_family_a()
+    // (v37_node_lane_activation.hpp). Default build (flip at 0): exactly
+    // LaneParams::family_a(), identical to master.
+    ::v37::LaneParams lane_params =
+        ::c2pool::v37n::node_lane_params_family_a(::v37::LaneKind::BTC);
 
     // --- settlement finality (F1 driver) ------------------------------------
     // D_conf: blocks a found (coinbase-carrying) BTC-family block must be buried

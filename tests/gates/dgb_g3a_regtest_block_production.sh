@@ -67,9 +67,17 @@ fi
 echo "[$GATE] PASS (CI arm) — $N populated-block assembly / witness / won-block assertions green"
 
 # 4. Optional live regtest arm — only when an isolated digibyted is wired in via env.
+# Fail-closed invariant: the live-arm script this gate promises to drive MUST
+# exist on the branch, whether or not creds are wired. A missing arm is a
+# gate-integrity failure (a per-coin gate that cannot fail), NOT a silent skip.
+LIVE_ARM="$REPO_ROOT/scripts/dgb_g3a_populated_block_regtest.sh"
+if [ ! -f "$LIVE_ARM" ]; then
+  echo "[$GATE] FAIL — live-arm script missing: ${LIVE_ARM#"$REPO_ROOT"/} (gate cannot fake-green)" >&2
+  exit 3
+fi
 if [ "${DGB_REGTEST_LIVE:-}" = "1" ] && [ -n "${DGB_SRC:-}" ]; then
   echo "[$GATE] live arm: driving scripts/dgb_g3a_populated_block_regtest.sh"
-  "$REPO_ROOT/scripts/dgb_g3a_populated_block_regtest.sh"
+  "$LIVE_ARM"
   echo "[$GATE] PASS (live arm) — populated regtest block proven via digibyted submitblock"
 else
   echo "[$GATE] live regtest arm SKIPPED (set DGB_REGTEST_LIVE=1 + DGB_SRC to enable)"

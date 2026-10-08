@@ -94,6 +94,13 @@ uint256 build_commitment_hash(uint8_t llmq_type, const uint256& quorum_hash,
 /// (it does NOT null-serve).
 bool bls_backend_available();
 
+/// Human-readable name of the linked BLS backend: "dashbls" for a real build,
+/// "stub" for a fail-closed (BLS-dark) build. Defined in BOTH build modes (never
+/// #ifdef-gated away) so identity surfaces (--version, /node_info, logs) can name
+/// the backend regardless of C2POOL_DASH_BLS — the proof cannot vanish with the
+/// crypto (issue #1671).
+const char* bls_backend_name();
+
 /// Verify one commitment's crypto EXACTLY as dashcore CFinalCommitment::Verify
 /// (checkSigs) does, post-V19 basic scheme. `members` MUST be the full ordered
 /// quorum member set (index-aligned with c.signers; members.size() ==

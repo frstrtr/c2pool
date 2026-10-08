@@ -154,15 +154,22 @@ TEST(LtcIngestConvergence, FullBudgetWithDeferredBatchesAdmitsNewestByEvictingOl
         << "the newest batch was refused while stale deferred batches held the "
            "whole budget: the admission bound has defeated drop-OLDEST";
 
-    // One eviction was enough, and it took the OLDEST, not the newest.
-    EXPECT_EQ(node.m_pending_adds.size(), 7u);
+    // PER-SHARE granularity (#1599): the shortfall is exactly kNeed shares, so
+    // ONLY the kNeed oldest shares of the OLDEST batch are trimmed. The batch
+    // survives with its remaining shares and no WHOLE batch is dropped — the old
+    // per-batch path would have destroyed all kBatch (1000) of them.
+    constexpr std::size_t kNeed = 8u * kBatch + kBatch - TestNode::MAX_INFLIGHT_SHARES; // 808
+    EXPECT_EQ(node.m_pending_adds.size(), 8u)
+        << "per-share eviction trims the oldest batch, it does not drop it";
     EXPECT_NE(node.m_pending_adds.front().data->m_items.front().hash(), oldest_first);
+    EXPECT_EQ(node.m_pending_adds.front().data->m_items.size(), kBatch - kNeed)
+        << "exactly the minimum (kNeed oldest shares) left the oldest batch";
     EXPECT_EQ(node.m_pending_adds.back().data->m_items.front().hash(), newest_first);
 
-    // The evicted batch freed its shares rather than orphaning them, and gave
-    // its reservation back: 7 deferred batches plus the one just admitted.
-    EXPECT_EQ(destroyed() - before, kBatch);
-    EXPECT_EQ(node.m_ingest_budget.shares(), 8u * kBatch);
+    // The MINIMUM was freed: kNeed shares destroyed, not the whole kBatch, and
+    // the reservation came back — the budget is now exactly full.
+    EXPECT_EQ(destroyed() - before, kNeed);
+    EXPECT_EQ(node.m_ingest_budget.shares(), TestNode::MAX_INFLIGHT_SHARES);
     EXPECT_LE(node.m_ingest_budget.shares(), TestNode::MAX_INFLIGHT_SHARES);
     EXPECT_LE(node.m_ingest_budget.bytes(), node.m_ingest_budget.max_bytes());
 
@@ -362,6 +369,191 @@ TEST(LtcIngestConvergence, EvictionNeverExceedsItsBoundAndStillAdmitsAtIt)
 
     node.m_ingest_budget.release(want, want_bytes);
     node.m_ingest_budget.release(backlog, 0);
+}
+
+// ── PER-SHARE GRANULARITY (#1599): free the MINIMUM, not a whole batch ──
+//
+// The oldest batch is LARGE (kBig shares) but the shortfall is TINY (kShort
+// shares). The old per-batch path evicted the WHOLE kBig-share batch to admit
+// the newcomer; per-share granularity trims exactly the kShort oldest shares
+// off it and no more. Exchange-not-sacrifice holds either way — an admission
+// never frees more reservation than it consumes — but per-share never
+// OVER-frees, so it is strictly not cheaper for an attacker, only tighter.
+TEST(LtcIngestConvergence, PerShareEvictsOnlyTheMinimumNotTheWholeOldestBatch)
+{
+    TestNode node;
+    std::unique_lock<std::shared_mutex> hold(node.tracker_mutex());
+    ASSERT_TRUE(hold.owns_lock());
+
+    // One big OLDEST batch, then a few small newer ones, so the boundary batch
+    // is the very first (oldest) one and it must be TRIMMED, not dropped.
+    constexpr std::size_t kBig = 500;
+    constexpr std::size_t kSmall = 10;
+    constexpr std::size_t kSmallCount = 5;
+    const std::size_t big_bytes   = kBig   * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE;
+    const std::size_t small_bytes = kSmall * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE;
+    queue_deferred_batch(node, 1, kBig, big_bytes);
+    for (std::uint64_t b = 0; b < kSmallCount; ++b)
+        queue_deferred_batch(node, 1000 + b * kSmall, kSmall, small_bytes);
+    ASSERT_EQ(node.m_pending_adds.size(), 1u + kSmallCount);
+
+    // Fill the rest of the budget so the incoming batch is short by exactly
+    // kShort SHARES — far smaller than the kBig-share oldest batch.
+    constexpr std::size_t kShort = 3;
+    const std::size_t queued_shares = kBig + kSmallCount * kSmall;
+    const std::size_t want = 20;
+    const std::size_t want_bytes = want * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE;
+    const std::size_t backlog = TestNode::MAX_INFLIGHT_SHARES + kShort
+                              - want - queued_shares;
+    ASSERT_TRUE(node.m_ingest_budget.try_admit(backlog, 0));
+    ASSERT_FALSE(node.m_ingest_budget.try_admit(want, want_bytes))
+        << "precondition: the incoming batch does not fit as things stand";
+
+    const std::size_t bytes_before = node.m_ingest_budget.bytes();
+    const std::uint64_t before = destroyed();
+    const std::size_t big_before = node.m_pending_adds.front().data->m_items.size();
+    const uint256 newest_first = node.m_pending_adds.back().data->m_items.front().hash();
+
+    EXPECT_TRUE(node.admit_or_evict_oldest(want, want_bytes, NetService{}))
+        << "the shortfall was fundable by trimming a few oldest shares";
+
+    // MINIMUM freed: exactly kShort shares, and NO whole batch dropped.
+    EXPECT_EQ(destroyed() - before, kShort)
+        << "per-share eviction must free the MINIMUM, not the whole oldest batch";
+    EXPECT_EQ(node.m_pending_adds.size(), 1u + kSmallCount)
+        << "the oldest batch was trimmed, not dropped: batch count is unchanged";
+    EXPECT_EQ(node.m_pending_adds.front().data->m_items.size(), big_before - kShort)
+        << "exactly kShort oldest shares left the oldest batch";
+    EXPECT_EQ(node.m_pending_adds.back().data->m_items.front().hash(), newest_first)
+        << "the newest batch is untouched";
+
+    // EXCHANGE-NOT-SACRIFICE, both dimensions: never over the ceiling, and the
+    // reservation freed (kShort shares / kShort*fallback bytes) is exactly what
+    // the admission then consumed.
+    EXPECT_EQ(node.m_ingest_budget.shares(), TestNode::MAX_INFLIGHT_SHARES);
+    EXPECT_LE(node.m_ingest_budget.bytes(), node.m_ingest_budget.max_bytes());
+    EXPECT_EQ(node.m_ingest_budget.bytes(),
+              bytes_before - kShort * TestNode::INGEST_BYTES_FALLBACK_PER_SHARE
+                           + want_bytes)
+        << "freed exactly the trimmed prefix's bytes, took exactly the admission's";
+
+    node.m_ingest_budget.release(want, want_bytes);
+    node.m_ingest_budget.release(backlog, 0);
+}
+
+// Build & defer a batch whose shares carry EXPLICIT, non-uniform raw byte sizes
+// (NOT count*FALLBACK), so the per-share byte recompute in the eviction scan is
+// exercised against real variety, and the deferred batch actually carries those
+// raw items into m_pending_adds.
+void queue_deferred_batch_raw(TestNode& node, std::uint64_t first,
+                              const std::vector<std::size_t>& raw_sizes)
+{
+    ltc::HandleSharesData d;
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < raw_sizes.size(); ++i)
+    {
+        chain::RawShare raw;
+        raw.contents.m_data.resize(raw_sizes[i]);   // sets contents.m_data.size()
+        d.add(var(mk(H(first + i), H(first + i - 1))), {}, raw);
+        total += raw_sizes[i];                       // per-share cost == raw size (>0)
+    }
+    ASSERT_TRUE(node.m_ingest_budget.try_admit(raw_sizes.size(), total));
+    d.attach_budget(&node.m_ingest_budget, raw_sizes.size(), total);
+    const std::size_t before = node.m_pending_adds.size();
+    node.processing_shares_phase2(d, NetService{});
+    ASSERT_EQ(node.m_pending_adds.size(), before + 1)
+        << "precondition: the batch must have taken the DEFERRED path";
+}
+
+std::size_t raw_byte_sum(const ltc::HandleSharesData& b)
+{
+    std::size_t s = 0;
+    for (const auto& r : b.m_raw_items) s += r.contents.m_data.size();
+    return s;
+}
+
+// ── PER-SHARE, BYTE-BOUND, ACROSS A BATCH BOUNDARY, VARIABLE RAW SIZES ───
+//
+// Exercises the genuinely new paths at once: (a) non-uniform m_raw_items sizes,
+// so the per-share byte recompute is checked against real variety — a
+// recompute-vs-charge drift would surface here and nowhere else; (b) a
+// BYTE-binding shortfall (need_bytes>0, need_shares tiny) so the byte deficit
+// drives the stop; and (c) crossing a batch boundary — one whole oldest batch
+// erased PLUS a partial front-trim of the new boundary batch (full_batches>0
+// combined with evict_oldest). The minimum that covers BOTH deficits is one
+// whole batch (A) plus exactly one share of the next (B); master, which drops
+// whole batches, would destroy A AND all of B.
+TEST(LtcIngestConvergence, ByteBoundEvictionCrossesBatchBoundaryVariableRawSizes)
+{
+    TestNode node;
+    std::unique_lock<std::shared_mutex> hold(node.tracker_mutex());
+    ASSERT_TRUE(hold.owns_lock());
+
+    // Variable, non-uniform raw byte sizes per share (NOT count*FALLBACK).
+    const std::vector<std::size_t> A = {1500, 1500, 1500}; // oldest:   3 sh, 4500 B
+    const std::vector<std::size_t> B = {2000,  800,  800}; // boundary: 3 sh, 3600 B
+    const std::vector<std::size_t> C = { 500,  500};       // newest:   2 sh, 1000 B
+    queue_deferred_batch_raw(node, 1,   A);
+    queue_deferred_batch_raw(node, 100, B);
+    queue_deferred_batch_raw(node, 200, C);
+    ASSERT_EQ(node.m_pending_adds.size(), 3u);
+
+    const std::size_t deferred_shares = A.size() + B.size() + C.size();   // 8
+    const std::size_t deferred_bytes  = 4500 + 3600 + 1000;               // 9100
+    ASSERT_EQ(node.m_ingest_budget.shares(), deferred_shares);
+    ASSERT_EQ(node.m_ingest_budget.bytes(),  deferred_bytes);
+
+    // The minimum prefix that covers the coming shortfall: ALL of A (4500 B /
+    // 3 sh) plus the FIRST share of B (2000 B / 1 sh) = 6500 B / 4 shares.
+    const std::size_t kFreedBytes  = 4500 + 2000;   // 6500
+    const std::size_t kFreedShares = A.size() + 1;  // 4
+
+    // Size the rest so need_shares is tiny (1) and need_bytes (6500) DRIVES the
+    // stop: a byte-binding shortfall.
+    const std::size_t want = 2;
+    const std::size_t max_shares = node.m_ingest_budget.max_shares();
+    const std::size_t max_bytes  = node.m_ingest_budget.max_bytes();
+    const std::size_t backlog_shares = max_shares - deferred_shares - want + 1; // need_shares=1
+    const std::size_t admit_bytes    = max_bytes + kFreedBytes - deferred_bytes; // need_bytes=6500
+    ASSERT_TRUE(node.m_ingest_budget.try_admit(backlog_shares, 0));
+    ASSERT_FALSE(node.m_ingest_budget.try_admit(want, admit_bytes))
+        << "precondition: the incoming byte-heavy batch does not fit";
+
+    const std::size_t pre_shares = node.m_ingest_budget.shares();
+    const std::size_t pre_bytes  = node.m_ingest_budget.bytes();
+    const std::uint64_t before = destroyed();
+    const uint256 newest_first = node.m_pending_adds.back().data->m_items.front().hash();
+
+    EXPECT_TRUE(node.admit_or_evict_oldest(want, admit_bytes, NetService{}))
+        << "the byte-bound shortfall was fundable by one whole batch + a trim";
+
+    // MINIMUM freed, BOTH dimensions: exactly kFreedShares / kFreedBytes — no
+    // more. master drops whole batches: it would destroy A AND all of B (6 sh).
+    EXPECT_EQ(destroyed() - before, kFreedShares)
+        << "per-share eviction freed the MINIMUM; whole-batch master would free more";
+    EXPECT_EQ(node.m_ingest_budget.shares(), pre_shares - kFreedShares + want)
+        << "exactly kFreedShares shares were returned to the budget";
+    EXPECT_EQ(node.m_ingest_budget.bytes(), pre_bytes - kFreedBytes + admit_bytes)
+        << "exactly kFreedBytes bytes were returned to the budget";
+
+    // Batch A erased whole, B TRIMMED (not dropped), C untouched.
+    EXPECT_EQ(node.m_pending_adds.size(), 2u)
+        << "one whole batch erased + one trimmed: the boundary batch survives";
+    const auto& boundary = *node.m_pending_adds.front().data;   // was B
+    EXPECT_EQ(boundary.m_items.size(), B.size() - 1u);          // 2 shares survive
+    // The trimmed batch's CHARGED reservation still matches its surviving raw
+    // bytes exactly — the recompute-vs-charge consistency the variable sizes test.
+    EXPECT_EQ(boundary.admitted_bytes(), raw_byte_sum(boundary));
+    EXPECT_EQ(boundary.admitted_bytes(), B[1] + B[2]);          // 800 + 800 = 1600
+    EXPECT_EQ(boundary.admitted_shares(), B.size() - 1u);
+    EXPECT_EQ(node.m_pending_adds.back().data->m_items.front().hash(), newest_first);
+
+    // Ceiling holds in BOTH dimensions, and the retry admitted.
+    EXPECT_LE(node.m_ingest_budget.shares(), max_shares);
+    EXPECT_LE(node.m_ingest_budget.bytes(),  max_bytes);
+
+    node.m_ingest_budget.release(want, admit_bytes);
+    node.m_ingest_budget.release(backlog_shares, 0);
 }
 
 } // namespace

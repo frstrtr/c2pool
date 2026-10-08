@@ -24,7 +24,9 @@
 #include <core/uint256.hpp>
 #include <impl/dash/known_txs_retention.hpp>  // dash::select_standing_remember (#950)
 
+#include <cstring>
 #include <memory>
+#include <new>
 #include <type_traits>
 
 namespace {
@@ -36,6 +38,7 @@ class TestNode : public dash::NodeImpl
 public:
     using dash::NodeImpl::NodeImpl;
     void test_publish() { publish_snapshot(); }
+    bool context_is_null() const { return m_context == nullptr; }
 };
 
 } // namespace
@@ -117,6 +120,27 @@ TEST(DashNode, TrackerSharedLockBlockingPath)
     EXPECT_EQ(&node.tracker_mutex(), &node.tracker_mutex());
 }
 
+// 5b. Rig-free construction carries a NULL io_context. run_think() and the
+//     timer setup take the rig-free branch on `!m_context`; pool::BaseNode()
+//     used to leave m_context indeterminate, so that branch depended on what
+//     an earlier test left on the stack. On reused storage the guard read
+//     non-null, the think epilogue was posted to a garbage io_context, and
+//     DashBlockWinningMint.LandsWhileTrackerHeldExclusively segfaulted in the
+//     full binary while passing alone. Constructing over deliberately dirty
+//     storage makes the check independent of test order. Default-init
+//     (`new (raw) TestNode`, no parens) on purpose: value-init would
+//     zero-fill first and hide the defect.
+TEST(DashNode, RigFreeConstructionHasNullContext)
+{
+    const std::align_val_t al{alignof(TestNode)};
+    void* raw = ::operator new(sizeof(TestNode), al);
+    std::memset(raw, 0xA5, sizeof(TestNode));
+    auto* node = new (raw) TestNode;
+    const bool null_ctx = node->context_is_null();
+    node->~TestNode();
+    ::operator delete(raw, al);
+    EXPECT_TRUE(null_ctx);
+}
 
 // ── Slice S8-p2p.2: sharechain-p2p dispatch surface ──────────────────
 //
@@ -476,7 +500,7 @@ TEST(DashBlockWinningMint, AcquirePrimitiveContract)
 // code did not: a non-empty pool yields a non-empty seed (vs the empty standing
 // set that caused txpool==0), and the seed never overshoots the peer cap (vs an
 // unbounded seed that trips p2p.py:488). Selector+cap KAT on real types, NOT a
-// live-socket capture — the wire proof is the hotel #879 remember_tx-out / peer
+// live-socket capture — the wire proof is the production #879 remember_tx-out / peer
 // remembered_txs_size read after merge.
 namespace {
 std::size_t as_bytes(int b) { return static_cast<std::size_t>(b); }

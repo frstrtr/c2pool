@@ -11,6 +11,7 @@
 #include "share_fetch_failover.hpp"  // v36-0.24 convergence: parent-fetch failover memory (#25C)
 #include "desired_request_pacer.hpp"   // futility backoff for the desired-request drain
 #include "ingest_budget.hpp"            // inbound-share admission bounds + ancestor-walk depth bound
+#include "misbehavior.hpp"              // #1601 per-peer invalid-PoW misbehavior scoring
 #include <pool/share_download.hpp>     // shared downloader helpers (build_stops)
 
 #include <core/coin_params.hpp>
@@ -551,6 +552,13 @@ public:
     void send_ping(peer_ptr peer) override;
     std::optional<pool::PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
 
+    /// Ban the host behind a self-connection, as canonical does (#1716 part B).
+    void ban_self_connection(const NetService& addr);
+    /// One canonical hourly pass over m_banscores (p2pool-merged-v36 p2p.py:787).
+    void forgive_transgressions();
+    /// Apply every forgiveness pass due by `now` since the node started.
+    void run_forgiveness(std::chrono::steady_clock::time_point now);
+
     // ltc
     void send_version(peer_ptr peer);
     /// Admit + phase-1 verify an inbound batch. Returns false when the
@@ -560,6 +568,21 @@ public:
     /// why the budget on its own starves the newest, tip-extending batches.
     bool admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, const NetService& addr);
     bool processing_shares(HandleSharesData& data, NetService addr);
+
+    // ── #1601 invalid-PoW peer misbehavior scoring ───────────────────────
+    // Decaying misbehavior score charged ONLY for genuine cryptographic PoW
+    // failures (SharePoWTargetMiss from share_init_verify). io-thread only, same
+    // discipline as m_ban_list. KEYED BY IP (not IP:ephemeral-port) so the score
+    // ACCUMULATES across reconnects — a flooder cannot reset it by redialing from
+    // a new source port. When a peer crosses the threshold this reuses the
+    // EXISTING m_ip_ban_list + m_ban_duration + close_connection machinery (the
+    // IP-only ban list, so is_banned() also catches the reconnect). The map is
+    // bounded by prune() (run_think, every think cycle) plus clear() on ban.
+    ltc::PeerMisbehaviorScorer<std::string> m_pow_misbehavior;
+    // Charge one invalid-PoW share against `addr` (scored by IP); ban+disconnect
+    // past threshold. Drop decayed scorer entries each think cycle.
+    void note_invalid_pow_share(NetService addr);
+    void prune_pow_misbehavior();
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
     /// or startup code (before compute thread exists).
@@ -971,6 +994,13 @@ public:
 
 protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
+    // Per-host self-connection offence count (canonical Node.banscores). In
+    // memory only, as canonical. Touched on the IO thread only.
+    std::map<std::string, int> m_banscores;
+    // Hourly forgiveness clock (canonical forgiveness_task, p2p.py:783-784).
+    static constexpr std::chrono::seconds FORGIVENESS_INTERVAL{3600};
+    std::chrono::steady_clock::time_point m_forgiveness_epoch = std::chrono::steady_clock::now();
+    uint64_t m_forgiveness_passes = 0;
     std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
     std::function<double()> m_local_hashrate_fn;
@@ -1167,7 +1197,8 @@ struct HandleSharesData
           m_txs(std::move(o.m_txs)),
           m_budget(o.m_budget),
           m_admitted_shares(o.m_admitted_shares),
-          m_admitted_bytes(o.m_admitted_bytes)
+          m_admitted_bytes(o.m_admitted_bytes),
+          m_peer_key(std::move(o.m_peer_key))
     {
         o.m_items.clear();
         o.detach_budget();
@@ -1185,6 +1216,7 @@ struct HandleSharesData
             m_budget          = o.m_budget;
             m_admitted_shares = o.m_admitted_shares;
             m_admitted_bytes  = o.m_admitted_bytes;
+            m_peer_key        = std::move(o.m_peer_key);
             o.m_items.clear();
             o.detach_budget();
         }
@@ -1212,12 +1244,49 @@ struct HandleSharesData
         m_txs[share.hash()] = std::move(txs);
     }
 
+    /// Per-share ingest backpressure (issue #1599): destroy the OLDEST `k`
+    /// shares of this batch and hand back exactly their reservation (k shares /
+    /// `bytes` bytes), leaving the rest of the batch — and the rest of its
+    /// reservation — untouched. This lets a batch fund an admission by
+    /// surrendering the MINIMUM instead of its whole reservation. `bytes` is the
+    /// admission byte-cost of those k oldest shares, computed by the caller
+    /// exactly as admission computed it, so the surviving reservation still
+    /// matches the surviving shares.
+    void evict_oldest(std::size_t k, std::size_t bytes)
+    {
+        if (k == 0) return;
+        if (k > m_items.size()) k = m_items.size();
+        for (std::size_t i = 0; i < k; ++i)
+        {
+            m_txs.erase(m_items[i].hash());
+            destroy_orphan_share(m_items[i]);
+        }
+        m_items.erase(m_items.begin(),
+                      m_items.begin() + static_cast<std::ptrdiff_t>(k));
+        if (k <= m_raw_items.size())
+            m_raw_items.erase(m_raw_items.begin(),
+                              m_raw_items.begin() + static_cast<std::ptrdiff_t>(k));
+        else
+            m_raw_items.clear();
+        // Shrink the held reservation and release exactly that much, so ~this
+        // never releases it a second time. Clamp so the counters can never go
+        // negative even if the caller's byte figure disagrees with the stored one.
+        const std::size_t give_shares = (k < m_admitted_shares) ? k : m_admitted_shares;
+        const std::size_t give_bytes  = (bytes < m_admitted_bytes) ? bytes : m_admitted_bytes;
+        if (m_budget) m_budget->release_for_peer(give_shares, give_bytes, m_peer_key);
+        m_admitted_shares -= give_shares;
+        m_admitted_bytes  -= give_bytes;
+    }
+
     /// Record the ingest reservation this batch holds; released by ~this.
-    void attach_budget(IngestBudget* budget, std::size_t shares, std::size_t bytes)
+    /// `peer_key` (#1600) is the source peer's per-peer accounting key.
+    void attach_budget(IngestBudget* budget, std::size_t shares, std::size_t bytes,
+                       std::string peer_key = std::string())
     {
         m_budget = budget;
         m_admitted_shares = shares;
         m_admitted_bytes = bytes;
+        m_peer_key = std::move(peer_key);
     }
 
     std::size_t admitted_shares() const { return m_admitted_shares; }
@@ -1227,6 +1296,9 @@ private:
     IngestBudget* m_budget{nullptr};
     std::size_t   m_admitted_shares{0};
     std::size_t   m_admitted_bytes{0};
+    // #1600: source-peer key (NetService::to_string) so release()/evict return
+    // this batch's reservation to the SAME peer's per-peer counters it charged.
+    std::string   m_peer_key;
 
     void free_owned()
     {
@@ -1235,7 +1307,7 @@ private:
     }
     void release_budget()
     {
-        if (m_budget) m_budget->release(m_admitted_shares, m_admitted_bytes);
+        if (m_budget) m_budget->release_for_peer(m_admitted_shares, m_admitted_bytes, m_peer_key);
         detach_budget();
     }
     void detach_budget()
@@ -1243,6 +1315,7 @@ private:
         m_budget = nullptr;
         m_admitted_shares = 0;
         m_admitted_bytes = 0;
+        m_peer_key.clear();
     }
 };
 

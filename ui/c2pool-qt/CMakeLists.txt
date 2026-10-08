@@ -62,6 +62,7 @@ add_executable(c2pool-qt
     src/PageLogs.cpp
     src/PageSettings.cpp
     src/PageEmbedded.cpp
+    src/PageTxInject.cpp
     src/SettingsStore.cpp
     src/bridges/SharechainBridge.cpp
     src/bridges/PplnsBridge.cpp
@@ -185,6 +186,27 @@ if(C2POOL_QT_BUILD_TESTS)
     target_link_libraries(c2pool-qt_test_address_validator PRIVATE Qt6::Core)
     add_test(NAME address_validator
              COMMAND c2pool-qt_test_address_validator)
+
+    # ── #157 Slice 3 — tx-inject arm-flow + submit-precheck gates ────────
+    # Both are Qt-FREE (TxInjectArmFlow.hpp / TxInjectSubmitPrecheck.hpp are
+    # std-only) so they run anywhere, no display. The arm-flow KAT proves the
+    # two-phase money-nonce protocol (confirm diff == issue diff byte-for-byte,
+    # a 409 is never auto-retried, an edit drops the nonce). The precheck KAT
+    # proves the client-side even-hex / flags-uint / expiry checks + the raw-tx
+    # decode preview.
+    add_executable(c2pool-qt_test_tx_inject_arm_flow
+        test/test_tx_inject_arm_flow.cpp
+    )
+    target_include_directories(c2pool-qt_test_tx_inject_arm_flow PRIVATE src)
+    add_test(NAME tx_inject_arm_flow
+             COMMAND c2pool-qt_test_tx_inject_arm_flow)
+
+    add_executable(c2pool-qt_test_tx_inject_form_precheck
+        test/test_tx_inject_form_precheck.cpp
+    )
+    target_include_directories(c2pool-qt_test_tx_inject_form_precheck PRIVATE src)
+    add_test(NAME tx_inject_form_precheck
+             COMMAND c2pool-qt_test_tx_inject_form_precheck)
 
     # ── Teardown leak/crash gate (issue #852) ────────────────────────────
     # The embedded-view host tore itself down via deregisterObject(nullptr),

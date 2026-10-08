@@ -177,6 +177,23 @@ tools/dash/*
 # tools/ci/ is tracked CI source (the test-target drift guard and the
 # proto-harness driver), not build output.
 !tools/ci/
+# WF-C2b anchor generator -- tracked release source, for the same reason the
+# DASH checkpoint generator above is: the embedded trust anchor
+# (src/impl/xmr/native/anchor/xmr_chain_anchor_stagenet.inc) names this script
+# as its reproduction path, and a trust root nobody can regenerate is a trust
+# root nobody can review.
+!tools/xmr-anchor-gen/
+# Design canon drift checker -- tracked source: the canon-check CI job and
+# the daily drift cron run it against docs/canon/CANON.yaml.
+!tools/canon/
+tools/xmr-anchor-gen/*
+!tools/xmr-anchor-gen/xmr_anchor_gen.py
+# C4 template-parity capture -- tracked source, same reason again: the golden
+# header and its generator both name this script as the capture step, and a
+# golden whose capture leg is not in the tree is a golden nobody can reproduce.
+!tools/xmr-c4-parity/
+tools/xmr-c4-parity/*
+!tools/xmr-c4-parity/capture_miner_data.py
 
 # CMake out-of-source build trees (any name starting with `build-`).
 # Catches build-spv/, build-qt/, build-relwithdebinfo/, etc.
@@ -234,3 +251,15 @@ external/**/depends/**/docs/
 # Release artifact staging area (built binaries, not source)
 release-staging/
 /.c2pool-bch-regtest/
+
+# xmr node release package output (scripts/xmr-node/build-release.sh)
+/dist/
+
+# BIP-110 Stratum-v1 test miners — tracked source: GPU (CUDA/CuPy) + CPU
+# reference miners that drive real pool-diff shares into a BIP-110 node to
+# exercise the M3 sharechain / PPLNS / multi-miner convergence.
+!tools/bip110/
+tools/bip110/*
+!tools/bip110/bip110_gpu_miner.py
+!tools/bip110/bip110_miner.py
+!tools/bip110/README.md

@@ -82,9 +82,18 @@ echo "[$GATE] PASS (CI arm) — $N ratchet-switch / CashTokens-transparency / ve
 
 # 4. Optional live regtest arm — only when an isolated BCHN with a >0 activation
 #    override is wired in via env.
+# Fail-closed invariant: the live-arm script this gate promises to drive MUST
+# exist on the branch, whether or not creds are wired. A missing arm is a
+# gate-integrity failure (a per-coin gate that cannot fail), NOT a silent skip.
+# Mirrors the G3a entrypoints (#1677).
+LIVE_ARM="$REPO_ROOT/scripts/bch_g3b_genuine_activation_regtest.py"
+if [ ! -f "$LIVE_ARM" ]; then
+  echo "[$GATE] FAIL — live-arm script missing: ${LIVE_ARM#"$REPO_ROOT"/} (gate cannot fake-green)" >&2
+  exit 3
+fi
 if [ -n "${BCH_UPGRADE9_HEIGHT:-}" ]; then
   echo "[$GATE] live arm: driving scripts/bch_g3b_genuine_activation_regtest.py (override height=$BCH_UPGRADE9_HEIGHT)"
-  python3 "$REPO_ROOT/scripts/bch_g3b_genuine_activation_regtest.py"
+  python3 "$LIVE_ARM"
   echo "[$GATE] PASS (live arm) — pre-activation HARD-REJECT + post-activation ACCEPT proven on isolated regtest BCHN"
 else
   echo "[$GATE] live regtest arm SKIPPED (set BCH_UPGRADE9_HEIGHT + start BCHN with -upgrade9activationheight=<N> to enable)"

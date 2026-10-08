@@ -1,0 +1,55 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index d93e6ad6..869c3a11 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -1399,6 +1399,50 @@ jobs:
+         if: always()
+         uses: ./.github/actions/prune-runner-workspace
+ 
++  # ════════════════════════════════════════════════════════════════════════════
++  # c2wallet-qt network-incapable link-guard (design PR #1621, docs/design/
++  # c2wallet-qt.md §5.2). Builds ONLY the air-gapped signer target
++  # (c2wallet-qt-signer — Qt6 Core/Gui/Widgets, no Network, no WebEngine) and
++  # runs ci/check_no_network.sh over the produced binary. This is the mechanical
++  # proof that the signing binary is network-incapable: a networking NEEDED
++  # library, or an imported network C-ABI symbol (connect/socket/bind/listen/
++  # getaddrinfo/gethostbyname/SSL_*/curl_*/res_*), turns this job red. It is the
++  # binary-level analog of the reward-safety grep proof, enforced on every PR
++  # touching the tree via the `qt` path filter (ui/**).
++  # ════════════════════════════════════════════════════════════════════════════
++  c2wallet-signer-guard:
++    name: c2wallet-qt network-incapable link-guard
++    needs: changes
++    if: ${{ needs.changes.outputs.qt == 'true' || github.event_name != 'pull_request' }}
++    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","draft-release"]') || 'ubuntu-24.04' }}
++    timeout-minutes: 15
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: Install Qt6 base (Core/Gui/Widgets) + toolchain
++        run: |
++          flock /tmp/c2pool-apt.lock bash -e -c '
++            sudo apt-get update -qq
++            sudo apt-get install -y --no-install-recommends \
++              cmake g++ ccache binutils \
++              qt6-base-dev libgl1-mesa-dev libxkbcommon-dev
++          '
++
++      - name: Configure (Widgets-only signer, guard test registered)
++        run: cmake -S ui/c2wallet-qt -B build-c2wallet -DC2WALLET_QT_BUILD_TESTS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
++
++      - name: Build the signer target only
++        run: cmake --build build-c2wallet --target c2wallet-qt-signer -j"${BUILD_J:-8}"
++
++      - name: Network-incapable link-guard (the mechanical proof)
++        run: ./ui/c2wallet-qt/ci/check_no_network.sh build-c2wallet/c2wallet-qt-signer
++
++      # Steady-state disk hygiene on the self-hosted runners: drop the checkout
++      # payload and _temp, keep _actions/_tool/_update. Always runs.
++      - name: Prune runner workspace
++        if: always()
++        uses: ./.github/actions/prune-runner-workspace
++
+   # ════════════════════════════════════════════════════════════════════════════
+   # BTC embedded smoke — RETIRED 2026-06-17 (ci-steward/retire-btc-linux).
+   # Superseded by the coin-matrix.yml `btc` cell ("btc smoke (Linux x86_64)",

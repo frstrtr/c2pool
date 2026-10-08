@@ -125,6 +125,57 @@ TEST(DashBlsVerify, MakeVerifierNullProviderFailsClosed)
     EXPECT_FALSE(fn(c));   // null provider → never serves a real commitment
 }
 
+// ── #1671: the self-report cannot lie ───────────────────────────────────────
+// Always built (NO #ifdef): runs in BOTH the stub and the real-BLS build. The
+// identity surfaces (--version, /node_info, startup log, the CI honesty script)
+// all read bls_backend_name(); this test proves that string is bound to the
+// ACTUAL runtime capability bls_backend_available() reports, in whichever build
+// it compiles. A build whose name() claims "dashbls" while the backend is absent
+// (or vice-versa) — the exact way a BLS-dark binary could masquerade as able to
+// verify — fails HERE, at test time, before it can be shipped or used to back a
+// verification claim.
+// Named in the DashBlsVerify suite so the linux-dash-bls job's
+// `ctest -R 'DashBlsVerify|...'` runs it on the REAL build. NOTE: the
+// test_dash_bls_verify executable is CMake-gated to C2POOL_DASH_BLS=ON
+// (test/CMakeLists.txt), so TODAY this assertion runs ONLY in the linux-dash-bls
+// job — NOT in the default stub build nor the stub ASan leg. To also exercise
+// the #else (stub) arm at test time, the executable must be hoisted out of the
+// `if(C2POOL_DASH_BLS)` block (its source and linked libs already build in the
+// stub configuration); until then the stub self-report is covered only by the
+// behavioural CI script scripts/ci/dash_bls_stub_honesty.sh.
+TEST(DashBlsVerify, SelfReportIsTruthful)
+{
+    const std::string name = bls_backend_name();
+    const bool available = bls_backend_available();
+
+    // Exactly one of two known names — never a third, never empty.
+    EXPECT_TRUE(name == "dashbls" || name == "stub")
+        << "bls_backend_name() returned an unrecognised value: '" << name << "'";
+
+    // The name and the capability are the SAME fact stated two ways. They must
+    // agree in every build, or an identity surface is lying about the crypto.
+    if (available) {
+        EXPECT_EQ(name, "dashbls")
+            << "backend is available but names itself '" << name << "'";
+    } else {
+        EXPECT_EQ(name, "stub")
+            << "backend is absent but names itself '" << name << "'";
+    }
+
+    // State which arm actually compiled, so the CI log makes the build's BLS
+    // posture visible even on success (a green line that reads 'stub' is the
+    // signal a lane meant to be real went dark).
+#ifdef C2POOL_DASH_BLS
+    EXPECT_TRUE(available)
+        << "compiled WITH C2POOL_DASH_BLS but backend reports unavailable";
+    EXPECT_EQ(name, "dashbls");
+#else
+    EXPECT_FALSE(available)
+        << "compiled WITHOUT C2POOL_DASH_BLS but backend reports available";
+    EXPECT_EQ(name, "stub");
+#endif
+}
+
 #ifdef C2POOL_DASH_BLS
 
 // ── anchor 2a: real quorumSig verifies over the real commitment hash ────────

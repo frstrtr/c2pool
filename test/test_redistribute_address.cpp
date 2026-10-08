@@ -18,6 +18,7 @@
 #include <impl/ltc/redistribute.hpp>
 #include <impl/ltc/share_tracker.hpp>
 #include <core/web_server.hpp>
+#include <core/address_utils.hpp>
 
 using core::MiningInterface;
 
@@ -288,4 +289,48 @@ TEST(AddressConversionCase4, ShortOrMalformedScriptNotExtracted)
                   short_script[1] == 0xa9 &&
                   short_script[2] == 0x14);
     EXPECT_FALSE(valid);
+}
+
+// ============================================================================
+// DOGE payout-address encoding contract (rest_current_payouts resolve_addr)
+//
+// A primary-DOGE node must render coinbase-payout scriptPubKeys as DOGE
+// addresses ('D...', version byte 0x1e) — NOT Bitcoin '1...' addresses. The
+// bool script_to_address(script, is_ltc, testnet) overload only knows LTC
+// (0x30) vs BTC (0x00); with is_ltc==false a DOGE node would silently emit
+// Bitcoin addresses. The web layer must therefore pass DOGE's explicit
+// version bytes via the string overload (as it already does for DASH).
+//
+// These lock the encoding contract the resolve_addr DOGE arm depends on.
+// (Exercising the lambda through a DOGECOIN-configured MiningInterface needs
+// a coin fixture; tracked as a follow-up.) Display-only, reward-safe.
+// ============================================================================
+
+TEST(DogePayoutEncoding, ExplicitVersionBytesYieldDogeAddress)
+{
+    const auto h = make_hash(0x42);
+    auto script = p2pkh_script(h);
+
+    // What the fixed resolve_addr DOGE arm passes: mainnet 0x1e / 0x16.
+    std::string doge = core::script_to_address(script, "", 0x1e, 0x16);
+
+    ASSERT_FALSE(doge.empty());
+    EXPECT_EQ(doge.front(), 'D')  // DOGE mainnet P2PKH always base58-encodes to 'D'
+        << "DOGE payout rendered as '" << doge << "' (expected 'D...')";
+}
+
+TEST(DogePayoutEncoding, BoolOverloadMisrendersDogeAsBitcoin)
+{
+    const auto h = make_hash(0x42);
+    auto script = p2pkh_script(h);
+
+    // The defective path a primary-DOGE node hits without the explicit arm:
+    // is_ltc=false → BTC version byte 0x00 → '1...'. This documents exactly
+    // the mis-encoding the resolve_addr DOGE arm exists to prevent.
+    std::string as_btc = core::script_to_address(script, /*is_ltc=*/false, /*testnet=*/false);
+    std::string as_doge = core::script_to_address(script, "", 0x1e, 0x16);
+
+    ASSERT_FALSE(as_btc.empty());
+    EXPECT_EQ(as_btc.front(), '1');
+    EXPECT_NE(as_btc, as_doge);  // the bug: same script, wrong chain's address
 }

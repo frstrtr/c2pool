@@ -26,6 +26,7 @@
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
+#include <core/coin_registry.hpp>
 #include <core/mining_node_interface.hpp>
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
@@ -598,6 +599,34 @@ public:
     nlohmann::json rest_config();          // GET /api/config
     nlohmann::json rest_config_schema();   // GET /api/config/schema
 
+    // Slice A (#157): the LIVE apply path for POST /api/config/apply. Takes the
+    // raw request body and returns a JSON response that carries an
+    // "http_status" hint the HTTP layer maps to the wire status. UNWIRED by
+    // default: no main installs it, so the POST route stays 503 {"armed":false}
+    // (dormant). A main/test that wants the live gated apply installs a fn that
+    // routes through config_endpoint::apply_config (control token + two-phase
+    // money nonce + AddressValidator + tripwire). Never wired in production
+    // without an operator arming the control token.
+    using config_apply_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_config_apply_fn(config_apply_fn_t fn) { m_config_apply_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_config_apply_fn() const { return static_cast<bool>(m_config_apply_fn); }
+    nlohmann::json rest_config_apply(const std::string& body);  // POST /api/config/apply
+
+    // Slice B (#157): POST /api/tx-inject/submit -- hand a raw consensus tx to
+    // the armed M1 inject gate (NodeCoinState::submit_inject). Wrapped in
+    // thread_safe_wrap so the submit runs on the node io_context (the same
+    // strand the node runs on), never on the WEB thread -- submit_inject /
+    // m_inject_pool are IO-thread-confined (no locks). UNWIRED by default: no
+    // main installs it, so the POST route stays 503 {"armed":false}. When
+    // wired, submit_inject itself refuses ("inject-disabled") while the
+    // --embedded-tx-inject arm is OFF, so a disarmed node never injects. It
+    // NEVER touches coinbase/subsidy/PPLNS/payee -- an inject is an ordinary
+    // block-body tx (a 0-fee inject adds 0 to fees).
+    using tx_inject_submit_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_tx_inject_submit_fn(tx_inject_submit_fn_t fn) { m_tx_inject_submit_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_tx_inject_submit_fn() const { return static_cast<bool>(m_tx_inject_submit_fn); }
+    nlohmann::json rest_tx_inject_submit(const std::string& body);  // POST /api/tx-inject/submit
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -733,7 +762,7 @@ public:
         uint64_t height = 0;                  // template height
         // TOTAL of every coinbase output that does NOT go to miners, in
         // template order: masternode payee + operator split + superblock +
-        // the DIP-0027 platform OP_RETURN burn. Measured on the hotel
+        // the DIP-0027 platform OP_RETURN burn. Measured on the production node
         // (2026-08-05, DASH mainnet h=2516911): payment_amount_sat carried
         // only the MN payee (0.8298), so the dashboard's "miner" share read
         // 53% of the block when the ACCEPTED coinbase paid miners 25% -- the
@@ -909,6 +938,12 @@ public:
         m_main_thread_id = std::this_thread::get_id();
         LOG_INFO << "MiningInterface::set_io_context this=" << this << " ctx=" << ctx;
         start_cache_refresh_pump(); }
+    // #157 Slice B (brief item 6): true once set_io_context() has run, so a
+    // main can assert the node producer strand is wired BEFORE it installs a
+    // dispatch-and-wait callback (e.g. the tx-inject submit fn) that must
+    // marshal onto it. set_io_context is called at web-server standup, before
+    // web_server->start(); this getter makes that ordering assertable.
+    bool has_io_context() const { return m_context != nullptr; }
 
     /// Thread-safe cached callback entry.  Main thread computes + publishes;
     /// HTTP thread reads a shared_ptr snapshot (mutex-guarded for portability).
@@ -1242,6 +1277,8 @@ private:
     bool m_testnet;  // Store testnet flag
     Blockchain m_blockchain;  // Store blockchain type
     std::string m_coin_label; // Raw configured coin string; fallback label for chains absent from the Blockchain enum
+    std::function<std::optional<nlohmann::json>(const std::string&)> m_rest_override_fn;   // per-coin REST override (unset = built-in routes)
+    std::string m_payout_scheme_label;       // per-coin scheme label (empty = serve static UI verbatim)
     std::shared_ptr<IMiningNode> m_node;  // Connection to c2pool node for difficulty tracking
     BlockchainAddressValidator m_address_validator;  // New address validator
     std::unique_ptr<c2pool::payout::PayoutManager> m_payout_manager;  // Payout management
@@ -1344,6 +1381,8 @@ private:
     embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
     config_json_fn_t m_config_fn;         // GET /api/config — resolved launch config (optional)
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
+    config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)
+    tx_inject_submit_fn_t m_tx_inject_submit_fn;  // POST /api/tx-inject/submit — Slice B raw-tx submit (optional; unwired => 503)
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
@@ -1575,17 +1614,21 @@ public:
     // chain has no Blockchain enum entry (BCH / NMC-aux), so topology and
     // node_info never emit a blank symbol. "" only when truly unconfigured.
     std::string node_symbol() const {
+        // Enum-derived symbol for the consensus-supported coins.
+        std::string enum_sym;
         switch (m_blockchain) {
-            case Blockchain::LITECOIN: return "LTC";
-            case Blockchain::BITCOIN:  return "BTC";
-            case Blockchain::DOGECOIN: return "DOGE";
-            case Blockchain::DASH:     return "DASH";
-            case Blockchain::DIGIBYTE: return "DGB";
-            default:                   break;
+            case Blockchain::LITECOIN: enum_sym = "LTC";  break;
+            case Blockchain::BITCOIN:  enum_sym = "BTC";  break;
+            case Blockchain::DOGECOIN: enum_sym = "DOGE"; break;
+            case Blockchain::DASH:     enum_sym = "DASH"; break;
+            case Blockchain::DIGIBYTE: enum_sym = "DGB";  break;
+            default:                                      break;
         }
-        std::string s = m_coin_label;
-        for (auto& ch : s) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 32);
-        return s;
+        // The configured coin label is the runtime truth: BCH / NMC / BIP110
+        // share the BITCOIN enum but must NOT be labelled "BTC". Resolve the
+        // label through the coin registry first, then fall back to the enum
+        // symbol (then the raw uppercased label). "" only when unconfigured.
+        return core::resolve_node_symbol(m_coin_label, enum_sym);
     }
     // Primary chain key for THIS node, derived from its configured blockchain
     // (lowercase symbol). Used as the default chain for explorer / coin-admin
@@ -1716,6 +1759,24 @@ public:
     // dashboard labels every node truthfully instead of going blank. Web-layer
     // only -- never feeds consensus/address-validation.
     void set_coin_label(const std::string& sym) { m_coin_label = sym; }
+
+    // Per-coin REST override (c2pool-v37-xmr). A coin whose stats live OUTSIDE
+    // this class -- the v37 XMR node: its own stratum, its own owed ledger, its
+    // own chain view -- answers the p2pool-compatible GET endpoints itself.
+    // Consulted FIRST for every GET path; std::nullopt = "not mine", fall
+    // through to the built-in route. Unset (every other coin) = no change.
+    using rest_override_fn_t = std::function<std::optional<nlohmann::json>(const std::string& path)>;
+    void set_rest_override_fn(rest_override_fn_t fn) { m_rest_override_fn = std::move(fn); }
+    std::optional<nlohmann::json> call_rest_override(const std::string& path) const {
+        if (!m_rest_override_fn) return std::nullopt;
+        return m_rest_override_fn(path);
+    }
+    // Per-coin payout-scheme display name. Empty (default, every coin but
+    // XMR) = the static UI is served byte-for-byte. Non-empty = every served
+    // .html/.htm/.js/.mjs has the literal PPLNS rewritten by
+    // rewrite_payout_scheme_label() below (the v37 XMR scheme is WRS / PPR).
+    void set_payout_scheme_label(const std::string& label) { m_payout_scheme_label = label; }
+    const std::string& get_payout_scheme_label() const { return m_payout_scheme_label; }
     const std::string& get_pool_version() const { return m_pool_version; }
 
     /// Auto-detect public IP and version from external services.
@@ -1823,7 +1884,7 @@ private:
     BestDifficulty m_best_difficulty;
     mutable std::mutex m_best_diff_mutex;
     // ── ALL-TIME best-share persistence ─────────────────────────────────
-    // Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+    // Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
     // best_share showed all_time == session == round — the "all-time" leg
     // reset on every restart because it lived only in memory, so the card
     // was quietly lying about what "all time" means. Persisted as a small
@@ -2005,7 +2066,51 @@ public:
     void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
     std::map<std::string, WorkerInfo> get_stratum_workers() const;
 
+    // #959 worker liveness. An authorized Stratum session that stops sending
+    // shares is SILENT -- distinct from both connected and disconnected -- so a
+    // dead rig holding a session is not counted as live capacity. Silence is
+    // measured from the session's last accepted share (or from connect if it
+    // never shared). The threshold is a 15-minute floor, raised to 6 expected
+    // share intervals at the session's own vardiff so a slow rig is not called
+    // silent between honest shares (Poisson: P(no share in 6 intervals) ~0.25%).
+    struct WorkerLiveness {
+        bool silent{false};
+        bool has_shared{false};          // an accepted share was seen this session
+        int64_t silent_seconds{0};       // since last share, else since connect
+        int64_t threshold_seconds{0};
+    };
+    static constexpr int64_t kSilentFloorSeconds = 900;
+    static constexpr int64_t kSilentCapSeconds = 7 * 24 * 3600;
+    static constexpr double kSilentExpectedIntervals = 6.0;
+    static WorkerLiveness classify_worker_liveness(
+        const WorkerInfo& w,
+        std::optional<std::chrono::steady_clock::time_point> last_share_at,
+        std::chrono::steady_clock::time_point now);
+    // Track when each session's accepted count last moved and classify every
+    // session in `workers`. Coin-agnostic: works on the effective registry
+    // (LTC's own or a coin target's), so no per-coin work source changes. The
+    // first sighting of a session that already has shares is stamped `now`
+    // (silence is never overstated); resolution is the gap between polls.
+    std::map<std::string, WorkerLiveness> observe_worker_liveness(
+        const std::map<std::string, WorkerInfo>& workers,
+        std::chrono::steady_clock::time_point now) const;
+    // #959 workers_silent: one entry per worker ("ADDRESS.worker", grouped as
+    // /stratum_stats groups them) whose every connection is SILENT, longest
+    // silence first. A worker with one live connection is not listed. Its
+    // silent_seconds is the freshest connection's, so silence is never
+    // overstated.
+    static nlohmann::json silent_workers_list(
+        const std::map<std::string, WorkerInfo>& workers,
+        const std::map<std::string, WorkerLiveness>& liveness);
+
 private:
+    struct ShareSeen {
+        uint64_t accepted{0};
+        std::optional<std::chrono::steady_clock::time_point> last_share_at;
+    };
+    mutable std::map<std::string, ShareSeen> m_share_seen;   // keyed by session_id
+    mutable std::mutex m_share_seen_mutex;
+
     // Effective per-worker registry for the stats/display path: the locally
     // registered workers (LTC dashboard-owned acceptor) when present, else the
     // external provider (coin-target acceptor bound to its own IWorkSource).
@@ -2041,7 +2146,7 @@ class WebServer
     bool solo_mode_;
     std::string solo_address_;
 
-    // Debounce state for trigger_work_refresh_debounced() (hotel interim fix
+    // Debounce state for trigger_work_refresh_debounced() (interim hardening fix
     // #3). Leading-edge-immediate + ~300 ms trailing-coalesce; the trailing
     // refresh is event-gated on a REAL work change (sharechain tip moved since
     // the last executed refresh). All state is touched only from the main
@@ -2142,5 +2247,15 @@ private:
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp
+
+/// Per-coin payout-scheme relabel of one served static text asset (used only
+/// when MiningInterface::get_payout_scheme_label() is non-empty). Every literal
+/// "PPLNS" becomes `label` where it stands as a word (visible text, titles,
+/// string literals, comments) and `ident` where it is glued to an identifier
+/// character [A-Za-z0-9_$] (loadMainPPLNS -> loadMainWRS), so the rewrite is
+/// the same everywhere it is applied and the served JS keeps linking.
+/// Returns the number of replacements.
+std::size_t rewrite_payout_scheme_label(std::string& text, const std::string& label,
+                                        const std::string& ident = "WRS");
 
 } // namespace core

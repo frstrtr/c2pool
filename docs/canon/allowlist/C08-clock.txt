@@ -1,0 +1,35 @@
+# Canon rule C08 allowlist: reviewed clock reads in the XMR lane that decide
+# nothing in consensus (pacing, liveness, logs, display, local Monero template
+# content, Monero mainchain rules). Format: <path> <max count> <reason>.
+#
+# A file not listed here, or a file with more matches than its count, adds to
+# the C08 violation count, which may never grow over docs/canon/baseline.json.
+# Raising a count or adding a file needs a review that the new read decides
+# nothing in consensus, and a pull request body with "Canon: C08".
+#
+# Not listed (counted as C08 violations under D1 and D4 until the slices that
+# close D1/D4 land): src/c2pool/v37/xmr/relay/xmr_relay_node.hpp,
+# src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp and
+# src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp.
+#
+# Reviewed 2026-10-04 at frstrtr/c2pool master 65b90571a.
+
+src/c2pool/v37/main_v37_xmr.cpp 19 status and web pacing, web display times, the test-only suspend knob and credit feed lag knob, HOLD duration metrics, FB_GETWON ask pacing, wire cache prune pacing, inject pump pacing
+src/c2pool/v37/xmr/xmr_live_submit.hpp 3 submit_block round-trip latency and event timestamps
+src/c2pool/v37/xmr/xmr_native_template_backend.hpp 2 deadline while waiting for a template (liveness)
+src/c2pool/v37/xmr/xmr_stratum_listener.hpp 3 stratum session timers (parked logins, idle re-probe)
+src/c2pool/v37/xmr/xmr_p2p_block_publisher.hpp 2 found-block publish retry timing and event timestamps
+src/c2pool/v37/xmr/xmr_web_dashboard.cpp 2 dashboard display clock
+src/impl/xmr/native/node/xmr_native_node.hpp 5 native Monero node: timing logs, receive time of operator-injected txs, monotonic link epoch
+src/impl/xmr/native/node/tools/xmr_native_node_main.cpp 3 tool main loop status timing
+src/impl/xmr/native/relay/xmr_block_relay.hpp 3 Monero block relay seen-cache ages (wall_seconds helper and its call)
+src/impl/xmr/native/relay/xmr_found_block_carrier.hpp 1 found-block seen-cache ages
+src/impl/xmr/native/p2p/xmr_levin_link.hpp 2 levin link deadlines (monotonic)
+src/impl/xmr/native/p2p/xmr_peer_pool.hpp 2 peer pool deadlines (monotonic)
+src/impl/xmr/native/txpool/xmr_relayed_txpool.cpp 2 Monero txpool receive times and the Monero unlock-time rule
+src/impl/xmr/native/template/xmr_monerod_miner_data.hpp 1 monerod poll timing
+src/impl/xmr/pow/xmr_cpu_miner.hpp 4 built-in CPU miner job timing and hashrate
+src/impl/xmr/template/xmr_block_template.cpp 1 local Monero block template content: one read for the mempool age gate and the header timestamp (the Monero chain checks it)
+src/impl/xmr/template/xmr_block_assembly.hpp 4 seconds_since_epoch helper, its self-check and a template receive time
+src/impl/xmr/template/xmr_coin_primitives.cpp 2 seconds_since_epoch helper definition
+src/impl/xmr/template/xmr_coin_primitives.hpp 1 seconds_since_epoch helper declaration

@@ -38,9 +38,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <optional>
 
 #include "randomx.h"  // vendored BSD-3, third_party/randomx/randomx.h
+#include "randomx_init_lock.hpp"  // process-wide serialisation of RandomX cache init
 
 namespace c2pool::xmr {
 
@@ -239,7 +241,16 @@ public:
     bool rekey(const SeedHash& k) {
         if (!cache_) return false;
         if (keyed_ && k == key_) return true;
-        randomx_init_cache(cache_, k.data(), k.size());
+        {
+            // Argon2d cache initialisation is serialised PROCESS-WIDE: the
+            // in-process CPU miner (xmr_cpu_miner.hpp) keys its own cache from
+            // another thread, and two concurrent randomx_init_cache() calls
+            // killed a live regtest node with SIGFPE inside randomx_reciprocal().
+            // See randomx_init_lock.hpp. Nothing on the verify hot path takes
+            // this lock -- a cache is re-keyed once per ~2048-block epoch.
+            std::lock_guard<std::mutex> lk(c2pool::xmr::randomx_init_mutex());
+            randomx_init_cache(cache_, k.data(), k.size());
+        }
         key_ = k; keyed_ = true;
         return true;
     }
@@ -273,6 +284,7 @@ public:
     // Allocate the two cache slots and the VM. Returns false on OOM.
     bool init(const VerifierOptions& opts = {}) {
         opts_ = opts;
+        bound_ = nullptr; bound_keyed_ = false; mru_ = nullptr;   // fresh caches below
         cur_  = CacheSlot(cache_flags(opts_));
         next_ = CacheSlot(cache_flags(opts_));
         if (!cur_.ok() || !next_.ok()) return false;
@@ -290,11 +302,13 @@ public:
                         const std::optional<SeedHash>& next_seed) {
         if (!cur_.ok()) return false;
         // Keep whichever slot already holds a needed seed; rekey the other.
-        if (!slot_for(current_seed)) {
+        if (CacheSlot* held = slot_for(current_seed)) {
+            mru_ = held;
+        } else {
             // pick the slot that is NOT holding next_seed to rekey
             CacheSlot* victim = pick_victim(next_seed ? &*next_seed : nullptr,
                                             current_seed);
-            if (victim) victim->rekey(current_seed);
+            if (victim) { victim->rekey(current_seed); mru_ = victim; }
         }
         if (next_seed && !slot_for(*next_seed)) {
             CacheSlot* victim = pick_victim(&current_seed, *next_seed);
@@ -314,10 +328,7 @@ public:
         if (!vm_) return VerifyStatus::NotInitialized;
         CacheSlot* slot = slot_for(seed);
         if (!slot) return VerifyStatus::SeedNotResident;
-        if (bound_ != slot->raw()) {                 // re-point VM if needed (cheap)
-            randomx_vm_set_cache(vm_, slot->raw());
-            bound_ = slot->raw();
-        }
+        bind_(slot);                                 // re-point VM if needed (cheap)
         uint8_t local[RANDOMX_HASH_SIZE];
         randomx_calculate_hash(vm_, blob, blob_len, local);   // ~10-15 ms light
         if (out_hash) std::memcpy(out_hash, local, RANDOMX_HASH_SIZE);
@@ -332,7 +343,7 @@ public:
         if (!vm_) return VerifyStatus::NotInitialized;
         CacheSlot* slot = slot_for(seed);
         if (!slot) return VerifyStatus::SeedNotResident;
-        if (bound_ != slot->raw()) { randomx_vm_set_cache(vm_, slot->raw()); bound_ = slot->raw(); }
+        bind_(slot);
         uint8_t local[RANDOMX_HASH_SIZE];
         randomx_calculate_hash(vm_, blob, blob_len, local);
         if (out_hash) std::memcpy(out_hash, local, RANDOMX_HASH_SIZE);
@@ -347,7 +358,7 @@ public:
         if (!vm_) return false;
         CacheSlot* slot = slot_for(seed);
         if (!slot) return false;
-        if (bound_ != slot->raw()) { randomx_vm_set_cache(vm_, slot->raw()); bound_ = slot->raw(); }
+        bind_(slot);
         randomx_calculate_hash(vm_, blob, blob_len, out_hash);
         return true;
     }
@@ -356,19 +367,98 @@ public:
         return cur_.holds(s) || next_.holds(s);
     }
 
+    // DROPS-VERIFY-SCALE: read-only views for EXTRA light VMs bound to this
+    // verifier's resident caches (O2RandomXVerifier's per-worker VMs). A
+    // randomx_cache is read-only after randomx_init_cache, so any number of VMs
+    // may hash on it concurrently; the CALLER guarantees no slot is replaced
+    // (adopt / prefetch_epoch) while such a VM hashes, and re-binds every extra
+    // VM after a replacement (the cache it was bound to may have been freed).
+    randomx_cache* resident_cache(const SeedHash& s) const noexcept {
+        if (cur_.holds(s))  return cur_.raw();
+        if (next_.holds(s)) return next_.raw();
+        return nullptr;
+    }
+    // The VM flags this verifier's own VM was created with (JIT, or the
+    // interpreter fallback), so an extra VM hashes exactly like it.
+    randomx_flags light_vm_flags() const noexcept { return vm_flags(opts_); }
+    bool has_vm() const noexcept { return vm_ != nullptr; }
+    // An allocated cache (keyed or not) to CREATE an extra VM on: a light VM
+    // must be created with a cache; the caller re-binds it before hashing.
+    randomx_cache* any_cache() const noexcept { return cur_.ok() ? cur_.raw() : next_.raw(); }
+    // DROPS-VERIFY-SCALE D1: the extra VMs never hash through bind_(), so they
+    // never move mru_; the owner reports the cache they used last (under its
+    // exclusive lock, before an adopt) so pick_victim keeps THAT slot instead
+    // of evicting the current epoch. A pointer that is not a resident cache
+    // (null, or one already replaced) is ignored.
+    void touch_cache(const randomx_cache* c) noexcept {
+        if (!c) return;
+        if (cur_.ok() && cur_.keyed() && cur_.raw() == c)        mru_ = &cur_;
+        else if (next_.ok() && next_.keyed() && next_.raw() == c) mru_ = &next_;
+    }
+
+    // The flags a slot of THIS verifier is allocated with, so a cache built
+    // elsewhere (adopt() below) is interchangeable with the resident ones.
+    randomx_flags slot_cache_flags() const noexcept { return cache_flags(opts_); }
+
+    // Install a cache that was allocated with slot_cache_flags() and keyed OFF
+    // this thread (e.g. the announced next epoch, Argon2d-initialised by a
+    // helper while this verifier keeps hashing). It replaces the slot that does
+    // NOT hold `keep` (unkeyed first, else least recently used). The VM is
+    // re-bound before the replaced cache is released, so it never points at a
+    // freed cache. Cheap: no Argon2d here. false (and `built` untouched) when
+    // there is no VM, `built` is not keyed, or its seed is already resident.
+    bool adopt(CacheSlot&& built, const SeedHash* keep) {
+        if (!vm_ || !built.ok() || !built.keyed() || seed_resident(built.key())) return false;
+        CacheSlot* victim = pick_victim(keep && seed_resident(*keep) ? keep : nullptr, built.key());
+        if (!victim) return false;
+        const bool was_bound = (bound_ == victim->raw());
+        CacheSlot released = std::move(*victim);   // alive until the VM is re-bound
+        *victim = std::move(built);
+        if (was_bound) { bound_keyed_ = false; bind_(victim); }
+        return true;
+    }
+
 private:
     CacheSlot* slot_for(const SeedHash& s) noexcept {
         if (cur_.holds(s))  return &cur_;
         if (next_.holds(s)) return &next_;
         return nullptr;
     }
-    // choose a slot to overwrite that does NOT currently hold `keep`
+    // Point the VM at `slot`'s cache. The memo is keyed on the slot's KEY as
+    // well as its pointer: prefetch_epoch() re-keys a slot IN PLACE (same
+    // randomx_cache*), and a JIT light VM compiles that cache's superscalar
+    // programs into its own code only inside randomx_vm_set_cache(). With a
+    // pointer-only memo, a seed switch that re-keyed the slot the VM was bound
+    // to kept hashing with the OLD epoch's programs over the NEW epoch's cache
+    // memory: every hash wrong, every share "Low diff" (stagenet capstone
+    // attempt 3, height 2216001). randomx_vm_set_cache() itself re-checks the
+    // cache key, so an extra call is a no-op, a missed one is not.
+    void bind_(CacheSlot* slot) {
+        if (bound_ != slot->raw() || !bound_keyed_ || bound_key_ != slot->key()) {
+            randomx_vm_set_cache(vm_, slot->raw());
+            bound_       = slot->raw();
+            bound_key_   = slot->key();
+            bound_keyed_ = true;
+        }
+        mru_ = slot;
+    }
+
+    // choose a slot to overwrite that does NOT currently hold `keep`. Among
+    // eligible slots an UNKEYED one goes first, then the least recently used,
+    // so a switch to a seed that was never announced as `next` (next_seed_hash
+    // absent) keeps the previous epoch resident for jobs issued before the
+    // switch instead of evicting the seed they were mined on.
     CacheSlot* pick_victim(const SeedHash* keep, const SeedHash& /*incoming*/) noexcept {
         auto held_keep = [&](const CacheSlot& s) {
             return keep && s.holds(*keep);
         };
-        if (!held_keep(cur_))  return &cur_;
-        if (!held_keep(next_)) return &next_;
+        const bool cur_ok  = !held_keep(cur_);
+        const bool next_ok = !held_keep(next_);
+        if (cur_ok && !cur_.keyed())   return &cur_;
+        if (next_ok && !next_.keyed()) return &next_;
+        if (cur_ok && next_ok) return (mru_ == &cur_) ? &next_ : &cur_;
+        if (cur_ok)  return &cur_;
+        if (next_ok) return &next_;
         return &cur_;  // both hold keep (can't happen with distinct seeds); safe fallback
     }
 
@@ -377,6 +467,9 @@ private:
     CacheSlot       next_{};
     randomx_vm*     vm_    = nullptr;
     randomx_cache*  bound_ = nullptr;  // which cache the VM currently points at
+    SeedHash        bound_key_{};      // ...and the key that cache held at bind time
+    bool            bound_keyed_ = false;
+    CacheSlot*      mru_   = nullptr;  // slot most recently hashed on / named current
 };
 
 } // namespace c2pool::xmr

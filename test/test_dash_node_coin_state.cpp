@@ -36,6 +36,7 @@
 #include <impl/dash/coin/dkg_window.hpp>
 
 #include <core/uint256.hpp>
+#include <core/p2p_message_stats.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
@@ -589,6 +590,71 @@ TEST(DashNodeCoinState, QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt) {
     EXPECT_FALSE(st.make_embedded_work_inputs().viable());
 }
 
+TEST(DashNodeCoinState, QcPullHookFiresWithNamedQuorumOnUnderivableRefusal) {
+    // #1203: on a qc-plan-underivable refusal the offending quorum IS known
+    // (QcPlanGap::slot_known). This proves the "ask, don't just wait" seam:
+    // the pull hook fires exactly once, targeting the quorum the refusal
+    // named, WITHOUT changing the reward-safe fail-closed outcome; and it
+    // does NOT fire when the gap names no single quorum or when it is unset.
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    seed_sml(st);
+    st.set_require_sml(true);
+    st.set_commitment_window_fn(
+        [](uint32_t next_h) { return dash::coin::is_dkg_commitment_window(next_h); });
+    st.set_sml_current_hash(raw256(0xAB));
+    st.set_tip(1518417, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
+
+    const uint256 want_q = raw256(0x7E);
+    auto naming_plan_fn =
+        [want_q](uint32_t, dash::coin::QcPlanGap* gap)
+            -> std::optional<dash::coin::QcBlockPlan> {
+            if (gap) {
+                *gap = dash::coin::QcPlanGap{};
+                gap->stage = dash::coin::QcPlanStage::SlotUnsatisfied;
+                gap->slot_known = true;
+                gap->llmq_type = 4;
+                gap->quorum_index = 0;
+                gap->quorum_hash = want_q;
+                gap->slot_gap = dash::coin::QcSlotGap::NoCommitmentCached;
+            }
+            return std::nullopt;
+        };
+
+    // Hook UNSET (default): the refusal still fails closed, nothing fires.
+    st.set_qc_plan_fn(naming_plan_fn);
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
+
+    // Hook SET: fires exactly once, targeting the named quorum, and does NOT
+    // change the reward-safe refusal.
+    int pulls = 0;
+    uint256 pulled_q;
+    st.set_qc_pull_fn([&](const dash::coin::QcPlanGap& g) {
+        ++pulls;
+        pulled_q = g.quorum_hash;
+    });
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable())
+        << "the pull hook must not change the fail-closed outcome";
+    EXPECT_EQ(pulls, 1);
+    EXPECT_EQ(pulled_q, want_q)
+        << "the pull must target the quorum the refusal named";
+
+    // A gap with NO single quorum (SlotSetUnderivable) must NOT fire — there
+    // is nothing to ask for.
+    st.set_qc_plan_fn([](uint32_t, dash::coin::QcPlanGap* gap)
+                          -> std::optional<dash::coin::QcBlockPlan> {
+        if (gap) {
+            *gap = dash::coin::QcPlanGap{};
+            gap->stage = dash::coin::QcPlanStage::SlotSetUnderivable;
+        }
+        return std::nullopt;
+    });
+    pulls = 0;
+    EXPECT_FALSE(st.make_embedded_work_inputs().viable());
+    EXPECT_EQ(pulls, 0) << "no named quorum => nothing to pull";
+}
+
 // BLOCKER-2 viability: a stale/absent bestCL fails closed; a fresh one serves.
 TEST(DashNodeCoinState, StaleBestClRefusesEmbedded) {
     NodeCoinState st;
@@ -910,7 +976,7 @@ TEST(DashServeGateNamesRefusal, PayeeFreshIsViable) {        // negative twin
 // A REALISTIC DASH mainnet block hash. raw256() above is NOT one: its bytes are
 // base+i, so its display hex has no leading zeros and any rendering of it looks
 // discriminating. A real block hash carries the DIFFICULTY PADDING — at mainnet
-// difficulty the display hex opens with ~14 zero nibbles (measured on the hotel
+// difficulty the display hex opens with ~14 zero nibbles (measured on the production
 // node 2026-08-06: 000000000000000e, 000000000000001c, 0000000000000018).
 // Zeroing the top 7 bytes reproduces exactly that shape.
 //
@@ -970,7 +1036,7 @@ TEST(DashServeGateNamesRefusal, DmnStaleDistinguishesTwoMainnetPowHashes) {
     EXPECT_NE(d.value, d.threshold)
         << "dmn-stale refuses BECAUSE the SML hash differs from the tip hash, "
            "so a report whose value EQUALS its threshold cannot be read at all. "
-           "Measured on the hotel node 2026-08-06: 114 of 114 refusals printed "
+           "Measured on the production node 2026-08-06: 114 of 114 refusals printed "
            "value=000000000000 threshold=000000000000, because both sides were "
            "GetHex().substr(0, 12) of a PROOF-OF-WORK hash and those nibbles "
            "are the difficulty padding. Report the discriminating TAIL.";
@@ -2200,4 +2266,32 @@ TEST(DashQcVerifyMemoDeclineCause, UnlatchedSlotStillDeclinesAsPlanUnderivable) 
     // reason — and now says exactly that instead of "nullopt", a word that
     // could not disagree with anything.
     EXPECT_EQ(why.value, "reason-unreported");
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// #157 tx-inject STATUS publish (read-only observability wiring).
+//
+// The loopback /api/tx-inject-status endpoint reads core::obs::inject_status().
+// NodeCoinState must MIRROR its lane state there on arm and after each pool
+// mutation. This proves the publish wiring (compilation + behaviour). It
+// asserts NOTHING about arming policy or submission — the mirror is read-only.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashNodeCoinState, TxInjectStatusPublishMirrorsArmFlag) {
+    NodeCoinState st;
+    EXPECT_FALSE(st.tx_inject_enabled());
+
+    st.set_tx_inject_enabled(true);
+    const auto& s = core::obs::inject_status();
+    EXPECT_TRUE(s.enabled.load());
+    EXPECT_EQ(s.pool_entries.load(), 0u);   // freshly armed, nothing inflight
+    EXPECT_EQ(s.max_entries.load(),
+              static_cast<std::uint64_t>(
+                  dash::coin::TxInjectPool::INJECT_POOL_MAX_ENTRIES));
+    EXPECT_EQ(s.max_tx_bytes.load(),
+              static_cast<std::uint64_t>(
+                  dash::coin::TxInjectPool::kMaxInjectTxBytes));
+    EXPECT_NE(s.updated_at.load(), 0);      // publish stamped a time
+
+    st.set_tx_inject_enabled(false);        // disarm mirrors too
+    EXPECT_FALSE(core::obs::inject_status().enabled.load());
 }

@@ -86,6 +86,8 @@ The **single residual sink** absorbs *both* surplus cases with one mechanism:
 
 Worked example (0.6 XMR tail, `budget = 600_000_000_000` pn, two owed 0.2 + 0.15 XMR, no fixed): owed outputs 200e9 and 150e9, `residual = 250e9` → sink 250e9; `Σ = 600e9`. ✓ (exercised by the driver's `build_coinbase` test.)
 
+**R2 (ACCEPT rule, operator-approved 2026-09-21): the residual sink is "at most one", `n_sink ∈ {0,1}`.** The W5 §2 shape gate accepts a template with `n_sink == 0` (the steady state: `budget ≤ Σ eligible owed ⇒ residual == 0 ⇒ no sink`; exact-sum `Σ outputs == budget` is enforced independently) and `n_sink == 1` (sink present, last, and the configured sink identity); `n_sink > 1` is refused. The prior rule ("exactly one sink") was correct only while the owed set never absorbed the whole budget; once **real E_b credit** makes the owed pass consume the budget from the first finalize on, every steady-state template legitimately has `residual == 0` and no sink, and "exactly one" refused all of them (the h=5 two-miner stall). Seam: `xmr_settlement_coinbase_shape.hpp` `inspect_kfair_coinbase` (`s.n_sink > 1` refuse; the `n_sink == 1` branch keeps the last-output + identity checks).
+
 ---
 
 ## 3. Per-output derivation (PRE-CARROT — behind the fence, §6)
@@ -125,8 +127,19 @@ The **penalty-free** term alone allows ~7000 outputs at the 300000-B floor; the 
 ```
 0x01  pubkey        R = r·G                                   (33 B)
 0x02  extra-nonce   per-worker, padded (p2pool style)         (2 + n B; omitted if empty)
+              || "V37C" u64le P b32 spine    (R1: +44 B constant credit-cut tail, when armed)
 0x03  merge-mining  varint(field_len) || varint(depth=0) || merkle_root[32]   (~36 B)
 ```
+
+### 5a. On-chain credit cut — the 0x02 `V37C` tail (R1, coinbase golden bump, operator-approved 2026-09-21)
+
+The **payout** side of settlement is read from the winner's coinbase (coinbase authority). The **credit** side (E_b = who did how much work) is `fold_eb(reward, view@P)` — a pure function of the receipt lane at ONE prefix `P`. The block already commits the owed side (0x03 root), the reward (Σ vout), the payout map (deterministic `r`), and `bid`/`h_b`. The one thing a receiver cannot otherwise obtain is **which lane prefix the winner folded E_b at**: `(next_pos P, spine_digest)` — 40 bytes. R1 carries exactly those, magic-tagged, as a **constant 44-byte tail** (`"V37C"` ‖ `u64le P` ‖ `b32 spine`) appended to the 0x02 extra-nonce payload **after** the per-worker nonce + weight padding:
+
+```
+0x02  varint(len)  [ nonce(4) | pad(0..10) | "V37C" | u64le P | b32 spine ]
+```
+
+so deterministic `r` (over `lane_commitment`/`prev_id`/`height`), the 0x03 MM root, and `owed_digest()` are **UNTOUCHED**, and the miner-tx weight stays invariant: `EXTRA_NONCE_MAX_SIZE (14) + 44 = 58 < 0x80`, so the length varint stays one byte and the tail is a constant `+44`. **This is a coinbase-shape golden bump** (the coinbase bytes change), operator-approved on 2026-09-21; it moves neither `owed_digest()` nor the 0x03 MM leaf. Byte format: `c2pool/v37/xmr/xmr_credit_cut.hpp` (`credit::kTailBytes == 44`; the impl-tree parse bound `CREDIT_CUT_TAIL_BYTES` in `xmr_block_assembly.hpp` mirrors it under a static_assert). The tail is emitted only when a `credit_cut_source` is armed, so every pre-existing coinbase golden is byte-identical without it. The armed shape is pinned by the consumer-tree KAT `v37_xmr_credit_cut_kat` (src/c2pool/v37/test): the ARMED and UNARMED miner_tx prefixes from one fixture as frozen goldens, +44 exactly, one-byte varint, r/R and the 0x03 root byte-identical, the cut read back through the coinbase-authority decoder; regenerate with `V37_XMR_CREDIT_CUT_KAT_PRINT=1` only on a deliberate shape move.
 
 The v37 owed commitment rides as the **0x03 merge-mining root**, not the 0x02 nonce (recommended by scoping OQ-X4: forward-compatible with real merge mining — the same tree that would host Tari/aux chains). Single v37 leaf:
 
