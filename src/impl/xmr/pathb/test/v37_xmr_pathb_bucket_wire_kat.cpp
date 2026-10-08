@@ -801,6 +801,13 @@ void serving_vectors() {
         const pb::FrameOutcome so2 = ss.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame).at(0), sa);
         check(so2.verdict == pb::FrameVerdict::Accepted && ss.complete_through() == kB0 + 2,
               "a held body whose leaf is not the MMR's is not served: the prefix ends before it");
+        held[kB0 + 2].bucket = keyed_bin(kB0 + 2, {{ka, 18182}});
+        held[kB0 + 2].leaf = pb::mmr_leaf_of(held[kB0 + 2].bucket);
+        held.erase(kB0 + 1);  // a pruned body (P-38): the leaf stays provable
+        pb::BucketsAssembly ps(sq, kB0, F, kFrame);
+        const pb::FrameOutcome po = ps.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame).at(0), sa);
+        check(po.verdict == pb::FrameVerdict::Accepted && ps.complete_through() == kB0 + 1,
+              "a bin whose rows are not held is not served: the prefix ends before it");
     }
 
     // the per-peer budget
