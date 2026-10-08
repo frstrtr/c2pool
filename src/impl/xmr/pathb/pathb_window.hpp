@@ -64,17 +64,11 @@ struct WinBin {
     std::vector<WinEntry> entries;  // live receipt entries only
 };
 
-// The shares of a receipt are defined iff p + give_author_bp <= 10000: then
-// w_owner + w_author <= work and the three shares sum to the work exactly.
-// A receipt with p + give_author_bp > 10000 has no canonical coinbase and is
-// refused at admission #12 (canonical_coinbase_ok_split); a window holding such
-// an entry has no split (split() returns no outputs).
-inline constexpr bool shares_defined(std::uint16_t p, std::uint16_t ga) noexcept {
-    return static_cast<std::uint32_t>(p) + ga <= kBasisPointsScale;
-}
-
-// shares of one receipt's raw work (S3.1 item 10). Precondition:
-// shares_defined(p, ga).
+// shares of one receipt's raw work (S3.1 item 10). The shares are defined iff
+// p + give_author_bp <= 10000: then w_owner + w_author <= work and the three
+// shares sum to the work exactly. A receipt with p + give_author_bp > 10000 is
+// refused at admission #2 (side_data_v3_check, STRIKE); a window holding such an
+// entry has no split (split() returns no outputs).
 struct Shares {
     std::uint64_t w_miner = 0;
     std::uint64_t w_owner = 0;

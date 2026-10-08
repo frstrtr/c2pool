@@ -1684,6 +1684,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         return 2;
     }
     if (!cfg.lane_params.fee.enabled) { g_give_author_pct = 0.0; g_give_author_exact = {0, 1, true}; }   // the 0.1 default is a fee-model-v1 default only
+    // Path B S2.3 #2: owner fee p + give_author_bp <= 10000 bp.
+    {
+        const std::uint32_t sum_bp = c2pool::v37n::xmr::fee::pct_to_bp(g_owner_fee_exact)
+                                     + c2pool::v37n::xmr::fee::pct_to_bp(g_give_author_exact);
+        if (sum_bp > 10000u) {
+            std::printf("REFUSED: --node-owner-fee-pct + --give-author-pct = %u bp, above 10000 bp\n", (unsigned)sum_bp);
+            return 2;
+        }
+    }
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection

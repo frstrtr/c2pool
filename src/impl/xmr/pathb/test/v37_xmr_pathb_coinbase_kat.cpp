@@ -11,20 +11,25 @@
 // admitted; a wrong split is a BAN before RandomX (the RandomX stub is not called).
 // The leaf commits mm_root_of(side_data_v3) of the receipt: a side_data_v3 field
 // changed after the coinbase was built is a BAN before RandomX on the split and
-// the finder-only path; a side_data_v3 that does not encode builds no leaf;
-// a receipt with p + give_author_bp > 10000 is refused (BAN before RandomX) and
-// at p + give_author_bp == 10000 the window weights sum to W and Sum(vout) == R;
-// on an empty window (finder-only) p + give_author_bp > 10000 is refused (BAN
-// before RandomX) and at p + give_author_bp == 10000 the finder-only leaf is admitted;
-// a window holding such an entry has no split and no canonical coinbase; no
-// leaf is built when the shares are undefined or the amount is fork-fused, and
-// a tree_root folded from the zero leaf is refused.
+// the finder-only path; a side_data_v3 that does not encode builds no leaf.
+// S2.3 #2 p + give_author_bp <= 10000, the received bytes through the codec,
+// the resolution, #12 and RandomX: 10000 + 1, 5001 + 5000, 10000 + 10 -> STRIKE
+// at #2 (ShareSum), no fetch, no RandomX, on a window and on an empty window
+// (finder-only), tip known or unknown, tree_root from the leaf its miner builds
+// or from the zero leaf; 9990 + 10 and 10000 + 0 -> admitted (tip known) or
+// DEFER (tip unknown); the receipt's own entry at 9990 + 10 / 10000 + 0: weights
+// sum to W, Sum(vout) == R, miner weight 0 at 10000 + 0. A window holding an
+// entry above 10000 has no split and no canonical coinbase; no leaf is built
+// when the amount is fork-fused; a tree_root folded from the zero leaf is
+// refused.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "impl/xmr/pathb/pathb_coinbase_split.hpp"
+#include "impl/xmr/pathb/pathb_header_rules.hpp"
 #include "impl/xmr/pathb/pathb_window.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
@@ -184,7 +189,9 @@ int main() {
         }
     }
 
-    // ---- p + give_author_bp: > 10000 refused (BAN before RandomX); == 10000 exact ----
+    // ---- p + give_author_bp (S2.3 #2): above 10000 a STRIKE at #2, decided by the
+    // codec before the resolution (#3 DEFER + fetch) and before RandomX; 10000
+    // exactly is valid (miner weight 0) ----
     {
         const pb::Hash32 au = id_of(0xA0);
         auto entry_of = [](const pb::ReceiptBodyV3& b, std::uint64_t work, std::uint64_t pos) {
@@ -203,14 +210,71 @@ int main() {
             for (const auto& [id, wt] : win.weight) tot += wt;
             return tot;
         };
-        // the leaf a receipt commits when its coinbase pays split(R, win).
-        auto split_leaf_of = [&](const pb::ReceiptBodyV3& b, const pb::Window& win) {
-            const auto outs_b = pb::split(b.reward_total, win);
-            const auto extra_b = pb::canonical_tx_extra_hf16(b.blob.prev_id, b.extra_nonce, pb::mm_root_of(b.side).value());
-            return pb::canonical_cb_leaf(outs_b, b.side.tip, b.blob.prev_id, extra_b);
-        };
         auto commit = [](pb::ReceiptBodyV3& b, const pb::Hash32& leaf) {
             b.blob.tree_root = pb::tree_root_fold(leaf, std::span<const pb::Hash32>(b.branch));
+        };
+        auto put_ga = [](std::vector<std::uint8_t>& bytes, std::size_t side_off, std::uint16_t ga) {
+            bytes[side_off + pb::side_v3::kGiveAuthorOff] = static_cast<std::uint8_t>(ga & 0xff);
+            bytes[side_off + pb::side_v3::kGiveAuthorOff + 1] = static_cast<std::uint8_t>(ga >> 8);
+        };
+        // the mm_root of a receipt's own side_data_v3 bytes, written field by field
+        // (the encoder refuses p + give_author_bp > 10000).
+        auto raw_mm_of = [&](const pb::ReceiptBodyV3& b) {
+            pb::SideDataV3 v = b.side;
+            v.give_author_bp = 0;
+            std::vector<std::uint8_t> bytes;
+            if (pb::encode_side_data_v3(v, bytes) != pb::WireError::None) return pb::Hash32{};  // no bytes
+            put_ga(bytes, 0, b.side.give_author_bp);
+            return pb::mm_root_of(bytes);
+        };
+        // the leaf the receipt's miner builds: the finder-only output on an empty
+        // window, else split(R, win); PBX1 extra with the receipt's own mm_root.
+        auto leaf_of = [&](const pb::ReceiptBodyV3& b, const pb::Window& win) {
+            const pb::Hash32 mm = raw_mm_of(b);
+            if (win.empty_finder_only)
+                return pb::canonical_stub_leaf(b.reward_total,
+                                               pb::stub_output_key(b.side.tip, b.blob.prev_id, b.side.payee),
+                                               b.extra_nonce, mm);
+            return pb::canonical_cb_leaf(pb::split(b.reward_total, win), b.side.tip, b.blob.prev_id,
+                                         pb::canonical_tx_extra_hf16(b.blob.prev_id, b.extra_nonce, mm));
+        };
+        // the bytes the receipt is received as.
+        auto wire_of = [&](const pb::ReceiptBodyV3& b) {
+            pb::ReceiptBodyV3 v = b;
+            v.side.give_author_bp = 0;
+            std::vector<std::uint8_t> bytes = enc(v);
+            if (bytes.empty()) return bytes;  // does not encode: received as no bytes
+            put_ga(bytes, 1 + bytes[0] + pb::kExtraNonceBytes + 1 + v.branch.size() * pb::kHashBytes,
+                   b.side.give_author_bp);
+            return bytes;
+        };
+        // one received receipt in S2.3 order: codec (#1a / #1b / #2), resolution
+        // (#3 / #5), #12 on win, #15 (RandomX stub).
+        struct Path {
+            pb::CodecHead head;
+            pb::AdmitVerdict v = pb::AdmitVerdict::Strike;
+            bool rx = false;
+        };
+        auto receive = [&](const pb::ReceiptBodyV3& b, const pb::Window& win, pb::Resolve res) {
+            Path out;
+            const std::vector<std::uint8_t> bytes = wire_of(b);
+            pb::ReceiptBodyV3 got;
+            out.head = pb::admit_codec_then_resolve(bytes.data(), bytes.size(),
+                                                    pb::ReceiptLimits{pb::receipt_max(16)}, got,
+                                                    [&](const pb::ReceiptBodyV3&) { return res; });
+            if (out.head.verdict) {
+                out.v = *out.head.verdict;
+                return out;
+            }
+            const pb::TailResult t = pb::admit_coinbase_then_randomx(
+                    pb::canonical_coinbase_ok_split(got, win, got.side.tip, got.blob.prev_id, 16),
+                    [&] { out.rx = true; return true; });
+            out.v = t.verdict;
+            return out;
+        };
+        auto strike_at_2 = [](const Path& pa) {
+            return pa.v == pb::AdmitVerdict::Strike && pa.head.error == pb::WireError::ShareSum
+                   && pb::wire_row(pa.head.error) == pb::WireRow::Row2 && !pa.head.resolved && !pa.rx;
         };
         struct Verdict {
             pb::AdmitVerdict v;
@@ -224,16 +288,77 @@ int main() {
             return Verdict{t.verdict, t.randomx_called || rx};
         };
         auto ban_before_randomx = [](const Verdict& v) { return v.v == pb::AdmitVerdict::Ban && !v.rx; };
-        auto admitted = [](const Verdict& v) { return v.v == pb::AdmitVerdict::AdmitCarrier && v.rx; };
+
+        check(pb::wire_row(pb::WireError::ShareSum) == pb::WireRow::Row2
+                      && pb::wire_row(pb::WireError::FeeRateRange) == pb::WireRow::Row2
+                      && pb::wire_row(pb::WireError::GiveAuthorRange) == pb::WireRow::Row2
+                      && pb::wire_verdict(pb::WireError::ShareSum) == pb::AdmitVerdict::Strike
+                      && pb::strike_tokens(pb::AdmitVerdict::Strike) == 1,
+              "ShareSum is row #2, STRIKE, one token");
 
         const pb::ReceiptBodyV3 honest = make_body(3, false, 0x30);
         struct Case {
             std::uint16_t p;
             std::uint16_t ga;
-            bool defined;
+            bool valid;
         };
-        // (a) the receipt's own entry is in the window.
-        for (const Case c : {Case{5001, 5000, false}, Case{10000, 10, false}, Case{9990, 10, true}}) {
+        const Case cases[] = {Case{10000, 1, false}, Case{5001, 5000, false}, Case{10000, 10, false},
+                              Case{9990, 10, true}, Case{10000, 0, true}};
+
+        // (a) a window of valid entries (the receipt is not in it), and the empty
+        // window (finder-only); the receipt commits the leaf its miner builds; the
+        // tip known (Ready) or unknown (DEFER + fetch).
+        pb::WinBin ok_bin;
+        ok_bin.bin = 7;
+        ok_bin.entries.push_back(entry_of(honest, 1000000, 2));
+        ok_bin.entries.push_back(entry_of(make_body(3, true, 0x50), 2000000, 3));
+        const pb::Window w_ok = pb::window({ok_bin}, 1000000000ull, base, /*f_spend=*/1, 3747, au);
+        check(weights_sum(w_ok) == w_ok.W && !pb::split(R, w_ok).empty(), "valid window: weights sum to W");
+        const pb::Window wf = [] {
+            pb::Window v;
+            v.empty_finder_only = true;
+            return v;
+        }();
+        for (const Case c : cases) {
+            for (const pb::Window* win : {&w_ok, &wf}) {
+                pb::ReceiptBodyV3 x = make_body(3, true, 0x40);
+                x.side.fee_rate_bp = c.p;
+                x.side.give_author_bp = c.ga;
+                commit(x, leaf_of(x, *win));
+                const std::string tag = std::string(win == &wf ? "empty window (finder-only)" : "window") + ", p "
+                                        + std::to_string(c.p) + " + give_author_bp " + std::to_string(c.ga);
+                if (c.valid) {
+                    const pb::CanonLeaf clx = pb::canonical_coinbase_leaf(x, *win, x.side.tip, x.blob.prev_id, 16);
+                    check(clx.leaf.has_value() && clx.leaf == leaf_of(x, *win)
+                                  && pb::mm_root_of(x.side) == raw_mm_of(x),
+                          tag + ": the canonical leaf is the leaf its miner builds");
+                }
+                for (const pb::Resolve res : {pb::Resolve::Ready, pb::Resolve::DeferUnknownTip}) {
+                    const Path pa = receive(x, *win, res);
+                    const std::string t = tag + (res == pb::Resolve::Ready ? ", tip known" : ", tip unknown");
+                    if (!c.valid)
+                        check(strike_at_2(pa), t + " -> STRIKE at #2, no fetch, no RandomX");
+                    else if (res == pb::Resolve::Ready)
+                        check(pa.v == pb::AdmitVerdict::AdmitCarrier && pa.head.resolved && pa.rx,
+                              t + " -> admitted, RandomX runs after #12");
+                    else
+                        check(pa.v == pb::AdmitVerdict::Defer && pa.head.resolved && !pa.rx,
+                              t + " -> DEFER, no strike, no RandomX");
+                }
+            }
+        }
+        {
+            pb::ReceiptBodyV3 x = make_body(3, true, 0x40);
+            x.side.fee_rate_bp = 10000;
+            x.side.give_author_bp = 10;
+            commit(x, pb::Hash32{});
+            check(strike_at_2(receive(x, w_ok, pb::Resolve::Ready)),
+                  "p 10000 + give_author_bp 10, tree_root from the zero leaf -> STRIKE at #2");
+        }
+
+        // (b) the receipt's own entry in the window at p + give_author_bp == 10000:
+        // the weights sum to W and Sum(vout) == R; at 10000 + 0 the miner weight is 0.
+        for (const Case c : {Case{9990, 10, true}, Case{10000, 0, true}}) {
             pb::ReceiptBodyV3 x = make_body(3, true, 0x40);
             x.side.fee_rate_bp = c.p;
             x.side.give_author_bp = c.ga;
@@ -242,63 +367,20 @@ int main() {
             bin.entries.push_back(entry_of(honest, 1000000, 2));
             bin.entries.push_back(entry_of(x, 1000000, 1));
             const pb::Window wx = pb::window({bin}, 1000000000ull, base, /*f_spend=*/1, 3747, au);
-            // the coinbase x commits: the split of its R over that window.
-            const pb::Hash32 tip_x = x.side.tip, pr_x = x.blob.prev_id;
             const auto outs_x = pb::split(x.reward_total, wx);
-            const auto extra_x = pb::canonical_tx_extra_hf16(pr_x, x.extra_nonce, pb::mm_root_of(x.side).value());
-            x.blob.tree_root = pb::tree_root_fold(pb::canonical_cb_leaf(outs_x, tip_x, pr_x, extra_x),
-                                                  std::span<const pb::Hash32>(x.branch));
-            bool rx = false;
-            const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(x, wx, tip_x, pr_x, 16), [&] { rx = true; return true; });
-            if (c.defined) {
-                std::uint64_t sx = 0;
-                for (const auto& o : outs_x) sx += o.amount;
-                check(weights_sum(wx) == wx.W && sx == x.reward_total,
-                      "p + give_author_bp == 10000: weights sum to W, Sum(vout) == R");
-                check(t.verdict == pb::AdmitVerdict::AdmitCarrier && rx, "p + give_author_bp == 10000 admitted");
-            } else {
-                check(outs_x.empty(), "window with an entry p + give_author_bp > 10000: split has no outputs");
-                check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
-                      "p + give_author_bp > 10000 -> refused, BAN before RandomX");
-            }
+            std::uint64_t sx = 0;
+            for (const auto& o : outs_x) sx += o.amount;
+            const std::string tag = "own entry p " + std::to_string(c.p) + " + give_author_bp " + std::to_string(c.ga);
+            check(weights_sum(wx) == wx.W && sx == x.reward_total, tag + ": weights sum to W, Sum(vout) == R");
+            if (c.ga == 0) check(wx.weight.count(x.side.payee) == 0, tag + ": miner weight 0");
+            commit(x, leaf_of(x, wx));
+            const Path pa = receive(x, wx, pb::Resolve::Ready);
+            check(pa.v == pb::AdmitVerdict::AdmitCarrier && pa.rx, tag + ": admitted");
         }
 
-        // (b) a window of entries with defined shares (the receipt is not in its
-        // own window): the receipt commits split(R, window), its canonical coinbase
-        // were its shares defined.
-        pb::WinBin ok_bin;
-        ok_bin.bin = 7;
-        ok_bin.entries.push_back(entry_of(honest, 1000000, 2));
-        ok_bin.entries.push_back(entry_of(make_body(3, true, 0x50), 2000000, 3));
-        const pb::Window w_ok = pb::window({ok_bin}, 1000000000ull, base, /*f_spend=*/1, 3747, au);
-        check(weights_sum(w_ok) == w_ok.W && !pb::split(R, w_ok).empty(), "defined window: weights sum to W");
-        for (const Case c : {Case{5001, 5000, false}, Case{10000, 10, false}, Case{10000, 1, false},
-                             Case{9990, 10, true}, Case{10000, 0, true}}) {
-            pb::ReceiptBodyV3 x = make_body(3, true, 0x40);
-            x.side.fee_rate_bp = c.p;
-            x.side.give_author_bp = c.ga;
-            commit(x, split_leaf_of(x, w_ok));
-            const pb::CanonLeaf clx = pb::canonical_coinbase_leaf(x, w_ok, x.side.tip, x.blob.prev_id, 16);
-            if (c.defined) {
-                check(clx.leaf.has_value() && admitted(admit(x, w_ok, 16)),
-                      "p + give_author_bp <= 10000 paying the window split -> admitted");
-            } else {
-                check(clx.shares_undefined && !clx.leaf.has_value(), "p + give_author_bp > 10000: no canonical leaf");
-                check(ban_before_randomx(admit(x, w_ok, 16)),
-                      "p + give_author_bp > 10000 paying the window split -> BAN before RandomX");
-            }
-        }
-
-        // (c) no usable leaf: a tree_root folded from the zero leaf is refused for
-        // undefined shares (hf 16) and for a fork-fused amount (hf 17).
+        // (c) a fork-fused amount (hf 17): no leaf; a tree_root folded from the zero
+        // leaf -> BAN before RandomX.
         {
-            pb::ReceiptBodyV3 x = make_body(3, true, 0x40);
-            x.side.fee_rate_bp = 10000;
-            x.side.give_author_bp = 10;
-            commit(x, pb::Hash32{});
-            check(ban_before_randomx(admit(x, w_ok, 16)),
-                  "p + give_author_bp > 10000, tree_root from the zero leaf -> BAN before RandomX");
             pb::ReceiptBodyV3 y = make_body(3, true, 0x40);
             const pb::CanonLeaf c17 = pb::canonical_coinbase_leaf(y, w_ok, y.side.tip, y.blob.prev_id, 17);
             check(c17.fork_fused && !c17.leaf.has_value(), "hf17: no canonical leaf");
@@ -323,43 +405,12 @@ int main() {
             pb::ReceiptBodyV3 h = make_body(3, false, 0x70);
             const pb::CanonLeaf clh = pb::canonical_coinbase_leaf(h, w_bad, h.side.tip, h.blob.prev_id, 16);
             check(clh.shares_undefined && !clh.leaf.has_value(), "undefined window: no canonical leaf");
-            commit(h, split_leaf_of(h, w_bad));
+            commit(h, leaf_of(h, w_bad));
             check(ban_before_randomx(admit(h, w_bad, 16)),
                   "undefined window, tree_root from its split -> BAN before RandomX");
             commit(h, pb::Hash32{});
             check(ban_before_randomx(admit(h, w_bad, 16)),
                   "undefined window, tree_root from the zero leaf -> BAN before RandomX");
-        }
-
-        // (e) an empty window (finder-only): the receipt commits the finder-only
-        // leaf (one output of R to its payee). p 10000 + give_author_bp 10 -> no
-        // canonical leaf, BAN before RandomX; p 9990 + give_author_bp 10 -> admitted.
-        {
-            pb::Window wf;
-            wf.empty_finder_only = true;
-            auto finder_leaf_of = [](const pb::ReceiptBodyV3& b) {
-                return pb::canonical_stub_leaf(b.reward_total,
-                                               pb::stub_output_key(b.side.tip, b.blob.prev_id, b.side.payee),
-                                               b.extra_nonce, pb::mm_root_of(b.side).value());
-            };
-            pb::ReceiptBodyV3 f = make_body(3, true, 0x80);
-            f.side.fee_rate_bp = 10000;
-            f.side.give_author_bp = 10;
-            commit(f, finder_leaf_of(f));
-            const pb::CanonLeaf clf = pb::canonical_coinbase_leaf(f, wf, f.side.tip, f.blob.prev_id, 16);
-            check(clf.shares_undefined && !clf.leaf.has_value(),
-                  "empty window, p 10000 + give_author_bp 10: no canonical leaf");
-            check(ban_before_randomx(admit(f, wf, 16)),
-                  "empty window, p 10000 + give_author_bp 10 paying the finder -> BAN before RandomX");
-            pb::ReceiptBodyV3 g = make_body(3, true, 0x80);
-            g.side.fee_rate_bp = 9990;
-            g.side.give_author_bp = 10;
-            commit(g, finder_leaf_of(g));
-            const pb::CanonLeaf clg = pb::canonical_coinbase_leaf(g, wf, g.side.tip, g.blob.prev_id, 16);
-            check(!clg.shares_undefined && clg.leaf == finder_leaf_of(g),
-                  "empty window, p 9990 + give_author_bp 10: the finder-only leaf");
-            check(admitted(admit(g, wf, 16)),
-                  "empty window, p 9990 + give_author_bp 10 paying the finder -> admitted");
         }
     }
 

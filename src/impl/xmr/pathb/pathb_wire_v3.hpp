@@ -23,6 +23,7 @@
 //   off 205  u16  fee_rate p (basis points, 0..10000)
 //   off 207  32   owner identity (zero iff p == 0)
 //   off 239  u16  give_author_bp (0..10000)
+//   p + give_author_bp <= 10000 (S2.3 #2; 10000 exactly: miner weight 0)
 //   mm_root = keccak256("c2pool-v37-xmr-side-v3" || side_data_v3)
 //
 // receipt body:
@@ -174,6 +175,7 @@ enum class WireError : std::uint8_t {
     Version,          // side_data or carrier body version != 3
     FeeRateRange,     // fee_rate p > 10000
     GiveAuthorRange,  // give_author_bp > 10000
+    ShareSum,         // p + give_author_bp > 10000
     OwnerIdentity,    // owner identity zero/non-zero does not match p
     BlobLength,       // blob_len out of range or not equal to the parsed blob
     BlobField,        // a hashing-blob varint is non-canonical or wider than declared
@@ -196,6 +198,7 @@ inline const char* to_string(WireError e) noexcept {
         case WireError::Version: return "version";
         case WireError::FeeRateRange: return "fee-rate-range";
         case WireError::GiveAuthorRange: return "give-author-range";
+        case WireError::ShareSum: return "share-sum";
         case WireError::OwnerIdentity: return "owner-identity";
         case WireError::BlobLength: return "blob-length";
         case WireError::BlobField: return "blob-field";
@@ -262,6 +265,7 @@ inline WireError side_data_v3_check(const SideDataV3& s) noexcept {
     if (s.version != kSideDataV3Version) return WireError::Version;
     if (s.fee_rate_bp > kBasisPointsScale) return WireError::FeeRateRange;
     if (s.give_author_bp > kBasisPointsScale) return WireError::GiveAuthorRange;
+    if (std::uint32_t{s.fee_rate_bp} + s.give_author_bp > kBasisPointsScale) return WireError::ShareSum;
     if ((s.fee_rate_bp == 0) != detail::is_zero(s.owner)) return WireError::OwnerIdentity;
     return WireError::None;
 }

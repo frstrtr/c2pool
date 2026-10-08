@@ -86,11 +86,12 @@ inline std::optional<Hash32> finder_only_leaf(const ReceiptBodyV3& r, const Hash
 
 // The canonical coinbase leaf a receipt committing reward R on (tip, P_r) must
 // carry, given its window; mm_root = mm_root_of(r.side). No leaf at hf >= 17
-// (FORK-FUSE), when p + give_author_bp > 10000 (the receipt or a window entry),
-// or when side_data_v3 does not encode.
+// (FORK-FUSE), when the window's weights do not sum to W (an entry with
+// p + give_author_bp > 10000), or when side_data_v3 does not encode. The
+// receipt's own p + give_author_bp <= 10000 is admission #2 (side_data_v3_check).
 struct CanonLeaf {
     bool fork_fused = false;       // hf >= 17: amount owed (O-01), nothing built
-    bool shares_undefined = false; // p + give_author_bp > 10000 (the receipt or a window entry): nothing built
+    bool shares_undefined = false; // window weights do not sum to W: nothing built
     std::optional<Hash32> leaf;    // empty: no canonical coinbase
 };
 
@@ -99,10 +100,6 @@ inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w
     CanonLeaf cl;
     if (amount_fork_fused(hf)) {
         cl.fork_fused = true;  // hf >= 17: build nothing
-        return cl;
-    }
-    if (!shares_defined(r.side.fee_rate_bp, r.side.give_author_bp)) {
-        cl.shares_undefined = true;  // build nothing
         return cl;
     }
     if (w.empty_finder_only) {
@@ -123,8 +120,8 @@ inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w
 
 // Admission #12 (ruling 4, C37): the receipt's committed coinbase (tree_root
 // folded over the branch) equals the canonical split leaf. false -> BAN before
-// RandomX. No leaf (hf >= 17 FORK-FUSE, p + give_author_bp > 10000, or
-// side_data_v3 does not encode) admits nothing.
+// RandomX. No leaf (hf >= 17 FORK-FUSE, window weights != W, or side_data_v3
+// does not encode) admits nothing.
 inline bool canonical_coinbase_ok_split(const ReceiptBodyV3& r, const Window& w, const Hash32& tip,
                                         const Hash32& p_r, std::uint8_t hf) {
     const CanonLeaf cl = canonical_coinbase_leaf(r, w, tip, p_r, hf);

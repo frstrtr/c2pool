@@ -13,6 +13,9 @@
 //   (3) round trip; every truncation refused; 242 bytes refused;
 //   (4) version != 3, p > 10000, give_author_bp > 10000, owner identity
 //       zero/non-zero against p: refused by the decoder and the encoder;
+//       S2.3 #2 p + give_author_bp <= 10000: 10000 + 1 and 5001 + 5000 refused
+//       (ShareSum) by the side data and receipt body decoders and encoders, no
+//       mm_root; 9990 + 10 and 10000 + 0 accepted; p 10001 is FeeRateRange;
 //   (5) in the receipt body: payee kind XMR_SUB refused, owner_ref with p = 0
 //       refused, owner_ref missing with p > 0 refused, ref len != 64 refused,
 //       a key that does not decompress refused (decoder and encoder);
@@ -165,7 +168,9 @@ int main() {
         b[pb::side_v3::kFeeRateOff] = 0x11;
         b[pb::side_v3::kFeeRateOff + 1] = 0x27;
         check(dec_side(b) == pb::WireError::FeeRateRange, "fee_rate 10001 refused");
-        b[pb::side_v3::kFeeRateOff] = 0x10;  // p = 10000
+        b[pb::side_v3::kFeeRateOff] = 0x10;  // p = 10000, give_author_bp 10
+        check(dec_side(b) == pb::WireError::ShareSum, "fee_rate 10000 + give_author_bp 10 refused (ShareSum)");
+        b[pb::side_v3::kGiveAuthorOff] = 0;  // p = 10000, give_author_bp 0
         check(dec_side(b) == pb::WireError::None, "fee_rate 10000 accepted");
 
         b = gb;  // give_author_bp = 10001
@@ -199,6 +204,59 @@ int main() {
         s.owner = pb::Hash32{};
         check(pb::encode_side_data_v3(s, sink) == pb::WireError::OwnerIdentity && sink.empty(),
               "encoder refuses p > 0 with a zero owner");
+    }
+
+    // (4b) S2.3 #2: p + give_author_bp <= 10000 (decoder, encoder, mm_root_of,
+    // receipt body). 10000 exactly is valid (miner weight 0).
+    {
+        struct Sum {
+            std::uint16_t p;
+            std::uint16_t ga;
+            bool valid;
+        };
+        for (const Sum c : {Sum{10000, 1, false}, Sum{5001, 5000, false}, Sum{9990, 10, true}, Sum{10000, 0, true}}) {
+            const std::string tag = "p " + std::to_string(c.p) + " + give_author_bp " + std::to_string(c.ga);
+            const pb::WireError want = c.valid ? pb::WireError::None : pb::WireError::ShareSum;
+            std::vector<std::uint8_t> b = gb;
+            b[pb::side_v3::kFeeRateOff] = static_cast<std::uint8_t>(c.p & 0xff);
+            b[pb::side_v3::kFeeRateOff + 1] = static_cast<std::uint8_t>(c.p >> 8);
+            b[pb::side_v3::kGiveAuthorOff] = static_cast<std::uint8_t>(c.ga & 0xff);
+            b[pb::side_v3::kGiveAuthorOff + 1] = static_cast<std::uint8_t>(c.ga >> 8);
+            check(dec_side(b) == want, tag + (c.valid ? ": decoder accepts" : ": decoder refuses (ShareSum)"));
+            pb::SideDataV3 s = g;
+            s.fee_rate_bp = c.p;
+            s.give_author_bp = c.ga;
+            std::vector<std::uint8_t> sink;
+            const pb::WireError e = pb::encode_side_data_v3(s, sink);
+            check(c.valid ? (e == pb::WireError::None && sink == b) : (e == pb::WireError::ShareSum && sink.empty()),
+                  tag + (c.valid ? ": encoder writes the same bytes" : ": encoder refuses (ShareSum)"));
+            check(pb::mm_root_of(s).has_value() == c.valid,
+                  tag + (c.valid ? ": mm_root_of builds" : ": mm_root_of builds nothing"));
+            pb::ReceiptBodyV3 body = make_body(3, true, 0x5a);
+            std::vector<std::uint8_t> eb = enc(body);
+            if (eb.empty()) {
+                check(false, tag + ": the base receipt body encodes");
+                continue;
+            }
+            const std::size_t so = payee_ref_offset(eb, 3) - pb::side_v3::kSize;
+            eb[so + pb::side_v3::kFeeRateOff] = static_cast<std::uint8_t>(c.p & 0xff);
+            eb[so + pb::side_v3::kFeeRateOff + 1] = static_cast<std::uint8_t>(c.p >> 8);
+            eb[so + pb::side_v3::kGiveAuthorOff] = static_cast<std::uint8_t>(c.ga & 0xff);
+            eb[so + pb::side_v3::kGiveAuthorOff + 1] = static_cast<std::uint8_t>(c.ga >> 8);
+            check(dec_body(eb, 3) == want,
+                  tag + (c.valid ? ": receipt body decoder accepts" : ": receipt body decoder refuses (ShareSum)"));
+            body.side.fee_rate_bp = c.p;
+            body.side.give_author_bp = c.ga;
+            sink.clear();
+            check((pb::encode_receipt_body_v3(body, sink) == want) && (sink.empty() != c.valid),
+                  tag + (c.valid ? ": receipt body encoder accepts" : ": receipt body encoder refuses (ShareSum)"));
+        }
+        // the per-field range rules come first: p 10001 + give_author_bp 0 is FeeRateRange.
+        pb::SideDataV3 s = g;
+        s.fee_rate_bp = 10001;
+        s.give_author_bp = 0;
+        std::vector<std::uint8_t> sink;
+        check(pb::encode_side_data_v3(s, sink) == pb::WireError::FeeRateRange, "p 10001 + give_author_bp 0: FeeRateRange");
     }
 
     // (5) refs in the receipt body

@@ -27,6 +27,9 @@
 //   F  FORK-FUSE-2's test-only --test-unknown-fork-stall-s is parsed by the
 //      strict helpers (C and B rows) and is still REFUSED on mainnet: exit 2
 //      naming the flag, before any file is created.
+//   S  --node-owner-fee-pct + --give-author-pct above 10000 bp (100 + 0.01,
+//      50.01 + 50, 100 + the 0.1 default) is REFUSED at start: exit 2, the
+//      refusal line, no file created.
 //   R  RELAY-BOOTSTRAP: the built-in relay bootstrap list is exactly the two
 //      public mainnet pool nodes and empty on stagenet/testnet/regtest;
 //      --no-relay-bootstrap empties it; a default already given as
@@ -416,6 +419,29 @@ void fuse_rows() {
 }
 
 // ---------------------------------------------------------------------------
+// S -- owner fee + give-author above 10000 bp is refused at start.
+// ---------------------------------------------------------------------------
+void share_sum_rows() {
+    const std::vector<std::vector<std::string>> rows = {
+        {"--node-owner-fee-pct", "100", "--give-author-pct", "0.01"},
+        {"--node-owner-fee-pct", "50.01", "--give-author-pct", "50"},
+        {"--node-owner-fee-pct", "100"},
+    };
+    for (const auto& tail : rows) {
+        std::vector<std::string> v = {"--coinbase", "v37", "--fee-model", "v1", "--node-owner-address", "addr"};
+        v.insert(v.end(), tail.begin(), tail.end());
+        const std::vector<std::string> args = safe(v);
+        const Run r = run(args, 5000);
+        const std::string tag = "S: [" + join(args) + "]";
+        check(!r.timed_out, tag + ": did not exit (live mode) within 5 s");
+        check(r.rc == 2, tag + ": exit " + std::to_string(r.rc) + ", want 2");
+        check(r.out.find("REFUSED: --node-owner-fee-pct + --give-author-pct") != std::string::npos,
+              tag + ": no share-sum refusal line: " + first_line(r.out));
+        check(r.files == 0, tag + ": created " + std::to_string(r.files) + " file(s)");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // R -- RELAY-BOOTSTRAP: the built-in list and its resolution (pure), + --help.
 // ---------------------------------------------------------------------------
 void bootstrap_rows() {
@@ -466,8 +492,8 @@ int main(int argc, char** argv) {
     version_rows();
     bad_rows();
     bootstrap_rows();
-    if (knows_version) { compat_rows(); fuse_rows(); }
-    else std::printf("C/F rows SKIPPED: this binary does not list --version, so a flag row could start it live\n");
+    if (knows_version) { compat_rows(); fuse_rows(); share_sum_rows(); }
+    else std::printf("C/F/S rows SKIPPED: this binary does not list --version, so a flag row could start it live\n");
 
     std::printf("v37_xmr_cli_strict_kat: %d passed, %d failed\n", g_pass, g_fail);
     if (g_fail != 0) { std::printf("RESULT: FAIL\n"); return 1; }
