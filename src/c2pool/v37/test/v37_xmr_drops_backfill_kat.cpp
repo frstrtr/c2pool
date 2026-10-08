@@ -30,6 +30,9 @@
 //       one RandomX verify, one admission
 //   B6  HELD = QUEUED: a raindrop stored but not yet queued for drain_drops()
 //       is not held for drops_sync(); it is held once queued
+//   B7  FETCH IN ADMISSION: drops_fetch_ids() for a raindrop after its PoW
+//       check, before admit_drop: the copy served for that fetch is a dup
+//       (one RandomX verify, one admission, one drain_drops() entry)
 //   H1  REORG: a node that books its own sibling Y at h and then the
 //       canonical X at h composes X from the SAME rows (and the same credit) as
 //       a node that only ever booked X -- base: the second booking is empty
@@ -361,6 +364,38 @@ int main() {
 #else
     C(false, "B5 one RandomX verify per raindrop (base: no drop PoW hook)");
     C(false, "B6 held for drops_sync only once queued for drain_drops (base: no drop hooks)");
+#endif
+
+    // ── B7 FETCH IN ADMISSION ───────────────────────────────────────────────
+#if defined(C2POOL_XMR_RELAY_DROP_POW_HOOK)
+    {
+        const SynthBlock blk = make_block(105, prev[5], 22, nullptr, 3, 41);
+        const Admitted e = drop_on(blk, kDropNonce + 0x3100, pA);
+        std::atomic<int> hooked{0};
+        RNode E("E", opts(false, {}, kFloorDiff));
+        for (int i = 0; i < 8; ++i) E.note_bin(prev[i], 100 + i);
+        E.relay->set_test_drop_pow_hook([&](const bytes32& id) {
+            if (id == e.id && hooked.fetch_add(1) == 0) E.relay->drops_fetch_ids({e.id}, 0, 105, 106);
+        });
+        C(E.relay->start(why), "B7 E starts " + why);
+        C(E.relay->test_ingest(e.raw, 7), "B7 one raindrop queued at E");
+        const auto& es = E.relay->stats();
+        auto drained_n = [&] { return std::count(E.drained.begin(), E.drained.end(), e.id); };
+        C(wait_for([&] { return drained_n() == 1 && E.relay->test_drop_held(e.id); }, {&E}, 10000ms),
+          "B7 the raindrop is admitted, queued for drain_drops and held");
+        C(E.relay->test_ingest(e.raw, 7), "B7 the copy served for the fetch reaches E");
+        const bool settled = wait_for([&] { return es.drops_dup.load() >= 1 || es.drops_foreign.load() >= 2; }, {&E}, 10000ms);
+        E.pump();
+        std::printf("    B7 E: hook=%d fetch_ids=%llu pin_local=%llu rx=%llu drops_foreign=%llu drops_dup=%llu drained=%lld\n",
+                    hooked.load(), (unsigned long long)es.drops_pin_fetch_ids.load(), (unsigned long long)es.drops_pin_local.load(),
+                    (unsigned long long)E.rx_calls.load(), (unsigned long long)es.drops_foreign.load(),
+                    (unsigned long long)es.drops_dup.load(), (long long)drained_n());
+        C(settled && hooked.load() == 1 && es.drops_pin_fetch_ids.load() == 1 && es.drops_pin_local.load() == 0 &&
+              E.rx_calls.load() == 1 && es.drops_foreign.load() == 1 && es.drops_dup.load() == 1 && drained_n() == 1,
+          "B7 ★ drops_fetch_ids after the PoW check, before admit_drop: the served copy is a dup: ONE RandomX verify, ONE admission");
+    }
+#else
+    C(false, "B7 one RandomX verify per raindrop fetched in admission (base: no drop PoW hook)");
 #endif
 
     // ── H1 / H2: consumption follows the chain ─────────────────────────────
