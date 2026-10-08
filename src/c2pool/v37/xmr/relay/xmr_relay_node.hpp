@@ -338,7 +338,7 @@ struct RelayOptions {
     ::c2pool::v37n::FrameVaultOptions vault{};
     u32         hello_timeout_ms = 10000;
     std::size_t verify_queue_max = 4096;
-    // O-P5 (the:ruling 23): parked verify items cap (objects). Overflow
+    // O-P5 (ruling 23): parked verify items cap (objects). Overflow
     // evicts the oldest (no penalty, no ban). Default open_bins x (1 + r_max)
     // from the ruled lane params (the:K04, the:K08); --relay-parked-max overrides.
     std::size_t parked_max = ::c2pool::xmr::pathb::kRuledLaneParams.open_bins
