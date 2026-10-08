@@ -11,6 +11,8 @@
 // admitted; a wrong split is a BAN before RandomX (the RandomX stub is not called);
 // a receipt with p + give_author_bp > 10000 is refused (BAN before RandomX) and
 // at p + give_author_bp == 10000 the window weights sum to W and Sum(vout) == R;
+// on an empty window (finder-only) p + give_author_bp > 10000 is refused (BAN
+// before RandomX) and at p + give_author_bp == 10000 the finder-only leaf is admitted;
 // a window holding such an entry has no split and no canonical coinbase; no
 // leaf is built when the shares are undefined or the amount is fork-fused, and
 // a tree_root folded from the zero leaf is refused.
@@ -225,6 +227,37 @@ int main() {
             commit(h, pb::Hash32{});
             check(ban_before_randomx(admit(h, w_bad, 16)),
                   "undefined window, tree_root from the zero leaf -> BAN before RandomX");
+        }
+
+        // (e) an empty window (finder-only): the receipt commits the finder-only
+        // leaf (one output of R to its payee). p 10000 + give_author_bp 10 -> no
+        // canonical leaf, BAN before RandomX; p 9990 + give_author_bp 10 -> admitted.
+        {
+            pb::Window wf;
+            wf.empty_finder_only = true;
+            auto finder_leaf_of = [](const pb::ReceiptBodyV3& b) {
+                return pb::canonical_stub_leaf(b.reward_total,
+                                               pb::stub_output_key(b.side.tip, b.blob.prev_id, b.side.payee),
+                                               b.extra_nonce);
+            };
+            pb::ReceiptBodyV3 f = make_body(3, true, 0x80);
+            f.side.fee_rate_bp = 10000;
+            f.side.give_author_bp = 10;
+            commit(f, finder_leaf_of(f));
+            const pb::CanonLeaf clf = pb::canonical_coinbase_leaf(f, wf, f.side.tip, f.blob.prev_id, 16, mm);
+            check(clf.shares_undefined && !clf.leaf.has_value(),
+                  "empty window, p 10000 + give_author_bp 10: no canonical leaf");
+            check(ban_before_randomx(admit(f, wf, 16)),
+                  "empty window, p 10000 + give_author_bp 10 paying the finder -> BAN before RandomX");
+            pb::ReceiptBodyV3 g = make_body(3, true, 0x80);
+            g.side.fee_rate_bp = 9990;
+            g.side.give_author_bp = 10;
+            commit(g, finder_leaf_of(g));
+            const pb::CanonLeaf clg = pb::canonical_coinbase_leaf(g, wf, g.side.tip, g.blob.prev_id, 16, mm);
+            check(!clg.shares_undefined && clg.leaf == finder_leaf_of(g),
+                  "empty window, p 9990 + give_author_bp 10: the finder-only leaf");
+            check(admitted(admit(g, wf, 16)),
+                  "empty window, p 9990 + give_author_bp 10 paying the finder -> admitted");
         }
     }
 
