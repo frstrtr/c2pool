@@ -7,13 +7,15 @@
 // v37_xmr_pathb_e2e_kat (pathb_coinbase_split.hpp, C07, "kept name" xmr_e2e_kat
 // -- shipped pathb-scoped, the native settle xmr_e2e_kat already exists): the
 // whole window -> split -> PBX1 extra -> leaf -> tree_root pipeline on a mainnet
-// and a regtest vector; admission #13 (window_root / mmr_root == the node's own
+// and a regtest vector, the window built by window() from WinBins (COVERAGE x
+// D_net, f_spend and N(B) of the tip, owner and author shares); admission #13 (window_root / mmr_root == the node's own
 // computation, lifting the S1/S2 zero stubs; a mismatch is BAN before RandomX,
 // part of the #12 prefix, for the S3 roots and the S2 zero stubs alike); a
 // receipt paying ANOTHER tip's window is refused.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "impl/xmr/pathb/pathb_coinbase_split.hpp"
 #include "impl/xmr/pathb/pathb_emission.hpp"
@@ -29,17 +31,61 @@ static pb::Hash32 id_of(std::uint64_t i) {
     for (int b = 0; b < 8; ++b) h[31 - b] = static_cast<std::uint8_t>(i >> (8 * b));
     return h;
 }
-static pb::Window mk_window(std::uint64_t n, std::uint64_t base_w) {
-    pb::Window w;
-    for (std::uint64_t i = 1; i <= n; ++i) { w.weight[id_of(i)] = pb::Work(base_w + i); w.W += pb::Work(base_w + i); }
-    return w;
+// A payee's window weight, zero when it is not a payee.
+static pb::Work weight_of(const pb::Window& w, const pb::Hash32& id) {
+    const auto it = w.weight.find(id);
+    return it == w.weight.end() ? pb::Work{} : it->second;
+}
+
+static pb::WinEntry entry(std::uint64_t miner, std::uint64_t work, std::uint64_t pos) {
+    pb::WinEntry x;
+    x.miner = id_of(miner);
+    x.work = work;
+    x.position = pos;
+    x.id = id_of(1000000 + pos);
+    return x;
+}
+
+static const pb::Hash32 kOwner = id_of(0x1000);
+static const pb::Hash32 kAuthor = id_of(0x2000);
+
+// Five bins newest first (1004..1000), 40,000 raw work each: miner 1 (10,000,
+// owner 0x1000 at p 100 bp), miner 2 (10,100, give_author_bp 10), miner 3 (9,900)
+// and one miner of its own per bin (4 + k, 10,000).
+static std::vector<pb::WinBin> mainnet_bins() {
+    std::vector<pb::WinBin> bins;
+    for (std::uint64_t k = 0; k < 5; ++k) {
+        pb::WinBin b;
+        b.bin = 1004 - k;
+        const std::uint64_t pos = 500 - 4 * k;
+        pb::WinEntry m1 = entry(1, 10000, pos);
+        m1.owner = kOwner;
+        m1.p = 100;
+        pb::WinEntry m2 = entry(2, 10100, pos - 1);
+        m2.give_author_bp = 10;
+        b.entries = {m1, m2, entry(3, 9900, pos - 2), entry(4 + k, 10000, pos - 3)};
+        bins.push_back(b);
+    }
+    return bins;
+}
+
+// window() with every input of the tip: f_spend(B, M 300k, hf 16), N(B) at Z 300k.
+static pb::Window window_at(const std::vector<pb::WinBin>& bins, std::uint64_t d_net, std::uint64_t B) {
+    return pb::window(bins, d_net, B, pb::f_spend(B, 300000, 16), pb::n_rule(300000, 16, B), kAuthor);
 }
 
 int main() {
     // ---- mainnet-tail e2e: Sum == R and roots_ok lift the zero stubs ----
     {
         const std::uint64_t R = pb::kTailBaseReward + 3000000000ull;  // 6e11 + 3e9 fees
-        const pb::Window w = mk_window(16, 10000);
+        // D_net 70,000: COVERAGE 140,000 takes the four newest bins (W 160,000).
+        const pb::Window w = window_at(mainnet_bins(), 70000, pb::kTailBaseReward);
+        check(w.W == pb::Work(160000) && w.weight.size() == 9, "mainnet e2e: four newest bins, W 160,000, 9 payees");
+        check(weight_of(w, id_of(1)) == pb::Work(39600) && weight_of(w, id_of(2)) == pb::Work(40360)
+                      && weight_of(w, id_of(3)) == pb::Work(39600) && weight_of(w, id_of(7)) == pb::Work(10000)
+                      && w.weight.count(id_of(8)) == 0 && weight_of(w, kOwner) == pb::Work(400)
+                      && weight_of(w, kAuthor) == pb::Work(40),
+              "mainnet e2e: weights 39,600 / 40,360 / 39,600 / 10,000 x 4, owner 400, author 40");
         pb::BinMmr mmr;
         pb::BucketRow row; row.miner = id_of(1); row.w_miner = pb::Work(10001);
         mmr.append(pb::mmr_leaf_of(pb::seal_bucket(1000, {row}, pb::Work(10001), 1, 18180)));
@@ -47,6 +93,10 @@ int main() {
         const auto outs = pb::split(R, w);
         std::uint64_t s = 0; for (const auto& o : outs) s += o.amount;
         check(s == R, "mainnet e2e: Sum(vout) == R");
+        check(outs.size() == 9 && outs[0].amount == 149242500000ull && outs[1].amount == 152106750000ull
+                      && outs[6].amount == 37687500000ull && outs[7].payee == kOwner && outs[7].amount == 1507500000ull
+                      && outs[8].payee == kAuthor && outs[8].amount == 150750000ull,
+              "mainnet e2e: amounts 149,242,500,000 / 152,106,750,000 / 37,687,500,000, owner 1,507,500,000, author 150,750,000");
 
         // admission #13: side_data roots match the node's own computation.
         pb::SideDataV3 side;
@@ -96,17 +146,27 @@ int main() {
         const std::uint64_t agc = 1000000000000ull;  // ~1e12 emitted (regtest)
         const std::uint64_t B = pb::base_reward_at(agc, 16);
         const std::uint64_t R = B;  // fees 0
-        const pb::Window w = mk_window(8, 5000);
+        check(pb::f_spend(B, 300000, 16) == 734240000ull, "regtest e2e: f_spend(B(1e12), 300k, hf16) == 734,240,000");
+        std::vector<pb::WinBin> bins;  // three bins newest first, 20,600 raw each
+        for (std::uint64_t k = 0; k < 3; ++k) {
+            pb::WinBin b;
+            b.bin = 30 - k;
+            for (std::uint64_t j = 0; j < 4; ++j) b.entries.push_back(entry((k % 2 ? 5 : 1) + j, 5000 + 100 * j, 90 - 4 * k - j));
+            bins.push_back(b);
+        }
+        const pb::Window w = window_at(bins, 20000, B);  // COVERAGE 40,000: two bins
+        check(w.W == pb::Work(41200) && w.weight.size() == 8, "regtest e2e: two newest bins, W 41,200, 8 payees");
         const auto outs = pb::split(R, w);
         std::uint64_t s = 0; for (const auto& o : outs) s += o.amount;
-        check(s == R, "regtest e2e: Sum(vout) == R (= own base, fees 0)");
+        check(s == R && outs.size() == 8, "regtest e2e: Sum(vout) == R (= own base, fees 0)");
     }
 
     // ---- a receipt paying ANOTHER tip's window is refused ----
     {
         const std::uint64_t R = pb::kTailBaseReward;
-        const pb::Window w_a = mk_window(10, 20000);  // tip A's window
-        const pb::Window w_b = mk_window(10, 70000);  // tip B's window (different)
+        const pb::Window w_a = window_at(mainnet_bins(), 30000, pb::kTailBaseReward);  // tip A: D_net 30,000, two bins
+        const pb::Window w_b = window_at(mainnet_bins(), 70000, pb::kTailBaseReward);  // tip B: D_net 70,000, four bins
+        check(w_a.W == pb::Work(80000) && w_b.W == pb::Work(160000), "tip A window W 80,000, tip B window W 160,000");
         pb::ReceiptBodyV3 r = make_body(3, false, 0x30);
         r.reward_total = R;
         const pb::Hash32 tip = r.side.tip, p_r = r.blob.prev_id;
