@@ -64,7 +64,12 @@
 #   xmr_epoch_accounting_kat         weights across an epoch (C24)
 #   v37_xmr_donation_split_kat       K16 author share and identity (C26)
 #   v37_xmr_monero_rules_digest_kat  K20 monero_rules_digest
-#   v37_xmr_pathb_hello_kat          rules block TLV golden, trailer codec
+#   v37_xmr_pathb_hello_kat          rules block TLV golden, trailer codec; the Path B
+#                                    tail (S3b-3), forbidden-literal scan
+#
+# Slice S3b-3 KAT (pathb_bucket_wire.hpp; unwired):
+#   v37_xmr_pathb_bucket_wire_kat    FC_GETBUCKETS / FC_BUCKETS codec, verifier, paging,
+#                                    serving rule, per-peer budget
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
@@ -119,7 +124,8 @@ if (BUILD_TESTING)
             xmr_epoch_accounting_kat
             v37_xmr_donation_split_kat
             v37_xmr_monero_rules_digest_kat
-            v37_xmr_pathb_hello_kat)
+            v37_xmr_pathb_hello_kat
+            v37_xmr_pathb_bucket_wire_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
@@ -138,7 +144,10 @@ if (BUILD_TESTING)
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp)
     # v37_xmr_donation_split_kat reads the donation keys of the fee model source.
     target_compile_definitions(v37_xmr_donation_split_kat PRIVATE C2POOL_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
-    # xmr_carrier_timestamp_kat scans the Path B headers for a clock read.
+    # xmr_carrier_timestamp_kat scans the Path B headers for a clock read;
+    # v37_xmr_pathb_hello_kat scans them for the forbidden N-rule / reserve literals.
     target_compile_definitions(xmr_carrier_timestamp_kat PRIVATE
+            PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+    target_compile_definitions(v37_xmr_pathb_hello_kat PRIVATE
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
 endif()

@@ -17,6 +17,8 @@
 //   prefix_proof(i, n) against the root at n; from_peaks prefix MMRs; truncate;
 //   the dense FR-B1 vector; the K_BMMR / K_BLHASH / K_BLEAF codecs; restart and
 //   crash vectors of the lane records.
+//   S3b-3: FC_BUCKETS with MMR proofs accepted by a joiner (8 sealed bins, the
+//   proof of bin 3 of 8 from the wire), without a proof not.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstddef>
@@ -28,6 +30,7 @@
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_bin_store.hpp"
+#include "impl/xmr/pathb/pathb_bucket_wire.hpp"
 #include "impl/xmr/pathb/pathb_buckets.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
@@ -638,6 +641,62 @@ static void s3b_lane_record_vectors() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FC_BUCKETS (S3b-3): a joiner accepts buckets with MMR proofs, never without.
+// ---------------------------------------------------------------------------
+static void s3b_fc_buckets_vectors() {
+    constexpr std::uint64_t b0 = 3500000;
+    constexpr std::uint32_t chain = 7;
+    const std::uint64_t F = pb::kRuledLaneParams.open_bins;
+    std::map<std::uint64_t, pb::SealedBin> held;
+    pb::BinMmr m;
+    for (std::uint64_t i = 0; i < 8; ++i) {
+        const pb::XmrKeyRef k = key_ref(static_cast<std::uint8_t>(0x10 + 0x11 * i));
+        pb::WinEntry e;
+        e.miner = pb::key_ref_identity(k);
+        e.work = 18180 + 1000 * i;
+        pb::SealedBin sb;
+        sb.bucket = pb::seal_from_entries(b0 + i, {e});
+        sb.leaf = pb::mmr_leaf_of(sb.bucket);
+        sb.refs = {k};
+        m.append(sb.leaf);
+        held.emplace(b0 + i, sb);
+    }
+    pb::BucketServeSource src;
+    src.b0 = b0;
+    src.leaf_count = 8;
+    src.mmr = &m;
+    src.bucket = [&held](std::uint64_t bin) -> const pb::SealedBin* {
+        const auto it = held.find(bin);
+        return it == held.end() ? nullptr : &it->second;
+    };
+    const pb::GetBuckets req{chain, rep(0x31), b0, b0 + 7};
+    const std::uint64_t frame = pb::bucket_wire_policy_default(16, pb::zone(16))->frame_bytes;
+    const std::vector<std::vector<std::uint8_t>> fr = pb::serve_buckets_from(src, req, frame);
+    pb::BucketsAnchor a;
+    a.header_held = true;
+    a.tip_record = b0 + F - 1 + 8;
+    a.mmr_root = m.root();
+    pb::BucketsAssembly as(req, b0, F, frame);
+    const pb::FrameOutcome o = as.add_frame(1, fr.at(0), a);
+    bool same = as.bins().size() == 8;
+    for (std::uint64_t i = 0; same && i < 8; ++i) same = as.bins().at(b0 + i).leaf == *m.leaf(i);
+    check(fr.size() == 1 && o.verdict == pb::FrameVerdict::Accepted && as.complete() && same,
+          "FC_BUCKETS: 8 sealed bins with MMR proofs accepted by a joiner, leaves reproduced");
+    pb::BucketsReply r;
+    check(pb::decode_buckets(fr.at(0), chain, r) == pb::BucketsWireError::None && r.entries.size() == 8 &&
+                  pb::mmr_verify(m.root(), pb::mmr_leaf_of(r.entries[3].payload),
+                                 pb::wire_proof(3, 8, r.entries[3].path, r.peaks)) &&
+                  r.entries[3].path.size() == 3,
+          "FC_BUCKETS: the proof of bin 3 of 8 from the wire (3 siblings) verifies");
+    if (r.entries.size() == 8) r.entries[3].path.clear();
+    pb::BucketsAssembly bs(req, b0, F, frame);
+    const pb::FrameOutcome no = bs.add_frame(1, *pb::encode_buckets(r), a);
+    check(no.verdict == pb::FrameVerdict::Refused && no.fault == pb::BucketsFault::Proof && no.strike == 1 &&
+                  bs.bins().empty(),
+          "FC_BUCKETS: a bucket without its proof refused, the server struck");
+}
+
 // A part that throws (a broken invariant) fails by name instead of aborting the KAT.
 template <class Body>
 static void run_part(const char* name, Body&& body) {
@@ -652,5 +711,6 @@ int main() {
     master_goldens();
     run_part("MMR vectors", s3b_mmr_vectors);
     run_part("lane record vectors", s3b_lane_record_vectors);
+    run_part("FC_BUCKETS vectors", s3b_fc_buckets_vectors);
     return finish("v37_xmr_mmr_golden_kat");
 }

@@ -191,6 +191,23 @@ inline RatchetStateBytes encode_ratchet_state(const RatchetState& s) noexcept {
     return out;
 }
 
+// The inverse of encode_ratchet_state: every 134-byte string decodes, and
+// encode_ratchet_state(decode_ratchet_state(b)) == b.
+inline RatchetState decode_ratchet_state(const RatchetStateBytes& b) noexcept {
+    RatchetState s;
+    std::size_t o = 0;
+    for (std::size_t i = 0; i < rs_layout::kU16Bytes; ++i)
+        s.epoch_cur = static_cast<std::uint16_t>(s.epoch_cur | (std::uint16_t{b[o++]} << (CHAR_BIT * i)));
+    for (std::uint8_t& x : s.rules_cur) x = b[o++];
+    for (RsWork* w : {&s.all, &s.y1, &s.y2})
+        for (std::uint64_t& limb : w->v) {
+            limb = 0;
+            for (std::size_t i = 0; i < rs_layout::kLimbBytes; ++i) limb |= std::uint64_t{b[o++]} << (CHAR_BIT * i);
+        }
+    for (std::uint8_t& l : s.levels) l = b[o++];
+    return s;
+}
+
 // ---------------------------------------------------------------------------
 // rs_step
 // ---------------------------------------------------------------------------
