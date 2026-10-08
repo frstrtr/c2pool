@@ -31,13 +31,13 @@
 // and TAGGED live/dead but NOT CREDITED (crediting is the S3 window).
 //
 // Admission order of S2.3 (cheap first, RandomX last): the canonical coinbase
-// check (#12) runs strictly BEFORE RandomX (#15); a non-canonical coinbase is a
-// BAN decided before RandomX is ever invoked.
+// check (#12) runs strictly BEFORE RandomX (#15); a computed mismatch is a BAN
+// decided before RandomX is ever invoked.
 //
-// The canonical coinbase of S1 / S2 is the STUB: one output of the whole reward
-// R to the receipt's own payee, its one-time key derived once per (tip, P_r).
-// The real hf-16 split of R over window(tip, v) replaces only the leaf
-// construction in S3; the admission order (#12 before #15) is unchanged.
+// The canonical coinbase is the hf-16 Monero miner tx (pathb_miner_tx.hpp,
+// pathb_coinbase_split.hpp); with an empty window it is one output of the whole
+// reward R to the receipt's own payee. Its outcome (CoinbaseCheck) enters the
+// admission tail below.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // Pulls Keccak (xmr_coin) and the v37 sha256d; link xmr_coin.
@@ -228,43 +228,9 @@ inline FoldVerdict check_carried_fold(const Hash32& receipts_root, std::span<con
 }
 
 // ---------------------------------------------------------------------------
-// Stub coinbase (S2.3 #12): one output of R to the receipt's payee.
-// The canonical leaf-0 (coinbase tx) commitment is keccak256 over the canonical
-// bytes of the single-output stub; the one-time output key is derived ONCE per
-// (tip, P_r). Admission folds the canonical leaf over the receipt's branch and
-// compares with the hashing blob's tree_root; a mismatch is a BAN decided
-// before RandomX. The full hf-16 split replaces only the leaf in S3.
-// ---------------------------------------------------------------------------
-inline constexpr std::string_view kStubKeyDomain = "c2pool-v37-cb-key";
-inline constexpr std::string_view kStubCbDomain = "c2pool-v37-cb-stub";
-
-// The one-time output key of the single stub output, derived once per (tip, P_r)
-// and the payee it pays.
-inline Hash32 stub_output_key(const Hash32& tip, const Hash32& p_r, const Hash32& payee_identity) {
-    std::vector<std::uint8_t> pre(kStubKeyDomain.begin(), kStubKeyDomain.end());
-    pre.insert(pre.end(), tip.begin(), tip.end());
-    pre.insert(pre.end(), p_r.begin(), p_r.end());
-    pre.insert(pre.end(), payee_identity.begin(), payee_identity.end());
-    return keccak256_hash(pre);
-}
-
-// leaf-0 of the canonical one-output stub coinbase: domain || R || output_key ||
-// extra_nonce || mm_root. Changing R, the payee (through output_key) or any
-// side_data_v3 field (through mm_root) changes the leaf.
-inline Hash32 canonical_stub_leaf(std::uint64_t reward_total, const Hash32& output_key,
-                                  const std::array<std::uint8_t, kExtraNonceBytes>& extra_nonce,
-                                  const Hash32& mm_root) {
-    std::vector<std::uint8_t> pre(kStubCbDomain.begin(), kStubCbDomain.end());
-    for (std::size_t i = 0; i < sizeof(reward_total); ++i)
-        pre.push_back(static_cast<std::uint8_t>(reward_total >> (8 * i)));
-    pre.insert(pre.end(), output_key.begin(), output_key.end());
-    pre.insert(pre.end(), extra_nonce.begin(), extra_nonce.end());
-    pre.insert(pre.end(), mm_root.begin(), mm_root.end());
-    return keccak256_hash(pre);
-}
-
 // Monero tree path for leaf index 0 (the coinbase; "no path bits"): the
-// keccak256 left-fold of the leaf over the branch.
+// keccak256 left-fold of the leaf over the branch (S2.3 #12).
+// ---------------------------------------------------------------------------
 inline Hash32 tree_root_fold(const Hash32& leaf0, std::span<const Hash32> branch) {
     Hash32 h = leaf0;
     for (const Hash32& b : branch) {
@@ -275,25 +241,6 @@ inline Hash32 tree_root_fold(const Hash32& leaf0, std::span<const Hash32> branch
         h = keccak256_hash(pre);
     }
     return h;
-}
-
-// The canonical stub coinbase leaf a receipt on (tip, P_r) MUST commit: one
-// output of r.reward_total to r's payee, with the per-(tip, P_r) key, and
-// mm_root = mm_root_of(r.side). No leaf when side_data_v3 does not encode.
-inline std::optional<Hash32> canonical_stub_leaf_of(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
-    const std::optional<Hash32> mm = mm_root_of(r.side);
-    if (!mm) return std::nullopt;
-    const Hash32 key = stub_output_key(tip, p_r, r.side.payee);
-    return canonical_stub_leaf(r.reward_total, key, r.extra_nonce, *mm);
-}
-
-// Admission #12: the receipt's committed coinbase (tree_root folded over the
-// branch from leaf 0) equals the canonical stub coinbase. false is a BAN; no
-// leaf (side_data_v3 does not encode) is false.
-inline bool canonical_coinbase_ok(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
-    const std::optional<Hash32> leaf = canonical_stub_leaf_of(r, tip, p_r);
-    if (!leaf) return false;
-    return tree_root_fold(*leaf, std::span<const Hash32>(r.branch)) == r.blob.tree_root;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,8 +276,8 @@ private:
 // ---------------------------------------------------------------------------
 enum class AdmitVerdict : std::uint8_t {
     Strike,         // a parsing / consensus misbehaviour (#1b, #2, #4, #7 carried, #8 carried, #9, #11, #14)
-    Refuse,         // not misbehaviour (#6 freshness, #7 pending)
-    Defer,          // waiting on chain / context / seed / bodies (#3, #5, #14, #15 SeedMissing) - never a strike
+    Refuse,         // not misbehaviour (#6 freshness, #7 pending, #12 Fused / Unbuildable)
+    Defer,          // waiting on chain / context / seed / bodies / references (#3, #5, #12, #14, #15 SeedMissing) - never a strike
     Duplicate,      // an already-placed pending id (#8)
     Ban,            // a served bad context block (#5), a non-canonical coinbase (#12), roots (#13), bad PoW (#15)
     AdmitCarrier,   // placed as a carrier
@@ -370,20 +317,39 @@ struct TailResult {
     bool randomx_called = false;  // observable: #15 runs only after #12 admits
 };
 
+// The outcome of the canonical coinbase check (S2.3 #12; S:32-39, C41):
+//   Match        the receipt commits the canonical miner tx: continue
+//   Mismatch     fold(tx hash, branch) != tree_root, computed by the node: BAN
+//   Fused        hf >= 17 (amount_fork_fused): REFUSE, no token, no ban
+//   Defer        a window payee's reference, a window bucket or A_t's weights
+//                not held: DEFER (no verdict, no token), fetched
+//   Unbuildable  no canonical coinbase by rule (equal Ko at hf >= 17): REFUSE,
+//                no token, no ban
+//   Undefined    side_data_v3 does not encode, the window weights != W, or the
+//                payee identity does not match its reference: BAN
+enum class CoinbaseCheck : std::uint8_t { Match, Mismatch, Fused, Defer, Unbuildable, Undefined };
+
 // The admission tail: #12 (canonical coinbase) and #13 (window_root and
 // mmr_root == the node's own; part of the #12 prefix) strictly BEFORE #15
-// (RandomX). Either mismatch is a BAN decided before RandomX is ever invoked.
+// (RandomX). RandomX runs only after #12 is Match and #13 holds.
 template <class RandomXOk>
-inline TailResult admit_coinbase_roots_then_randomx(bool coinbase_ok, bool roots_ok, RandomXOk&& randomx_ok) {
-    if (!coinbase_ok) return {AdmitVerdict::Ban, false};  // #12 BAN; RandomX NOT called
-    if (!roots_ok) return {AdmitVerdict::Ban, false};     // #13 BAN; RandomX NOT called
-    const bool pow_ok = randomx_ok();                      // #15
+inline TailResult admit_coinbase_roots_then_randomx(CoinbaseCheck coinbase, bool roots_ok, RandomXOk&& randomx_ok) {
+    switch (coinbase) {
+        case CoinbaseCheck::Match: break;
+        case CoinbaseCheck::Fused:
+        case CoinbaseCheck::Unbuildable: return {AdmitVerdict::Refuse, false};  // no token, no ban
+        case CoinbaseCheck::Defer: return {AdmitVerdict::Defer, false};
+        case CoinbaseCheck::Mismatch:
+        case CoinbaseCheck::Undefined: return {AdmitVerdict::Ban, false};  // #12 BAN; RandomX NOT called
+    }
+    if (!roots_ok) return {AdmitVerdict::Ban, false};  // #13 BAN; RandomX NOT called
+    const bool pow_ok = randomx_ok();                  // #15
     return {pow_ok ? AdmitVerdict::AdmitCarrier : AdmitVerdict::Ban, true};
 }
 
 template <class RandomXOk>
-inline TailResult admit_coinbase_then_randomx(bool coinbase_ok, RandomXOk&& randomx_ok) {
-    return admit_coinbase_roots_then_randomx(coinbase_ok, true, std::forward<RandomXOk>(randomx_ok));
+inline TailResult admit_coinbase_then_randomx(CoinbaseCheck coinbase, RandomXOk&& randomx_ok) {
+    return admit_coinbase_roots_then_randomx(coinbase, true, std::forward<RandomXOk>(randomx_ok));
 }
 
 // ---------------------------------------------------------------------------
