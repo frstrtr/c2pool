@@ -15,8 +15,9 @@
 //     payee (keys per (tip, P_r, payee)). tx hash -> fold over the receipt's
 //     branch == tree_root. [C37, C07, C21; D2.2, D2.7]
 //   outcome (CoinbaseCheck, pathb_receipt_admission.hpp): Fused at hf >= 17
-//     (amount_fork_fused) before anything is built; Defer when the window or a
-//     payee's key reference is not held; Undefined when side_data_v3 does not
+//     (amount_fork_fused) before anything is built; Defer when the window of
+//     (tip, v) (WindowAt bound to the receipt's tip and hf) or a payee's key
+//     reference is not held; Undefined when side_data_v3 does not
 //     encode, the window weights != W or the receipt's payee identity does not
 //     match its reference; Mismatch / Match from the fold. [C41]
 //   hf >= 17 (format only): two equal Ko -> Unbuildable (carrot_order_refusal).
@@ -49,9 +50,14 @@ namespace c2pool::xmr::pathb {
 using RefLookup = std::function<std::optional<XmrKeyRef>(const Hash32&)>;
 
 // The window of the receipt's own tip at v, or nullptr when the node cannot
-// evaluate it yet (a bucket or A_t's weights not held).
+// evaluate it yet (a bucket or A_t's weights not held). Bound to the tip and v
+// it was evaluated for, with its window_root and mmr_root_at(tip).
 struct WindowAt {
     const Window* window = nullptr;
+    Hash32 tip{};
+    std::uint8_t v = 0;
+    Hash32 window_root{};
+    Hash32 mmr_root{};
 };
 
 // The hf-16 vouts of R over a non-empty window: split(R, w), payee identity
@@ -78,8 +84,8 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
         out.stop = CoinbaseCheck::Fused;  // hf >= 17: build nothing
         return out;
     }
-    if (at.window == nullptr) {
-        out.stop = CoinbaseCheck::Defer;
+    if (at.window == nullptr || !(at.tip == tip) || at.v != hf) {
+        out.stop = CoinbaseCheck::Defer;  // no window of (tip, v) held
         return out;
     }
     const std::optional<Hash32> mm_root = mm_root_of(r.side);

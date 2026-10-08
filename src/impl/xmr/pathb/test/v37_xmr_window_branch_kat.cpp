@@ -12,16 +12,30 @@
 // read at the node's own main tip gives another window; B(A_t) is the weight
 // input at the anchor of the tip's own branch (main 40 / side 40); chain start
 // h(P_t) <= K_A -> A_t = genesis, B(A_t) at agc 0.
+// S3b-1b (pathb_branch_follower.hpp, pathb_window_chain.hpp,
+// pathb_window_cache.hpp; C41): a race at h 140 with a depth-2 reorg; node X
+// follows A1, A2, node Y follows B1, B2, each holding the other side as alt rows
+// without RowWeights. For a tip t whose P_t is the common ancestor (Monero 139)
+// both nodes read one WindowInputs and compute one window(t, 16), one
+// window_root and mmr_root, and one canonical coinbase (the same tx hash, Match
+// on both); D_net for a child of each node's own main tip differs and gives
+// another window; tips on A2 and on B2 (alt without RowWeights on one node)
+// resolve on both nodes to the same windows.
 // ---------------------------------------------------------------------------
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_branch.hpp"
+#include "impl/xmr/pathb/pathb_branch_follower.hpp"
 #include "impl/xmr/pathb/pathb_emission.hpp"
 #include "impl/xmr/pathb/pathb_window.hpp"
+#include "impl/xmr/pathb/pathb_window_cache.hpp"
 #include "pathb_kat_branch_view.hpp"
 #include "pathb_kat_check.hpp"
+#include "pathb_kat_lane.hpp"
+#include "pathb_kat_miner.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
@@ -54,9 +68,126 @@ pb::Window window_on(const KatBranchView& v, const pb::Hash32& p_t, const std::v
                       pb::n_rule(in.weights.zone, 16, B), pb::Hash32{});
 }
 
+// ---- S3b-1b: the race through the follower view, the store and the cache ----
+void s3b_race() {
+    constexpr std::uint8_t kC = 0x4d, kA = 0x41, kB = 0x42;
+    constexpr std::uint64_t hr = 140;  // the race height
+    auto ts = [](std::uint64_t h) { return 1600000000ull + 120 * h; };
+    const pb::RowWeights tail = rw(kTailAgc, 300000, 300000);
+    KatMoneroRows x = monero_chain(kC, hr - 1, 10000000ull,
+                                   [&](std::uint64_t) { return std::optional<pb::RowWeights>(tail); });
+    KatMoneroRows y = x;
+    const pb::Hash32 c = block_id(kC, hr - 1);
+    // node X: main A1, A2 (difficulty 1e9) with RowWeights; alt B1, B2 without.
+    const pb::Hash32 a1 = x.add(kA, hr, c, ts(hr) + 5, 1000000000ull, tail, true);
+    const pb::Hash32 a2 = x.add(kA, hr + 1, a1, ts(hr + 1) + 5, 1000000000ull, tail, true);
+    const pb::Hash32 b1 = x.add(kB, hr, c, ts(hr) + 9, 500000000ull, std::nullopt, false);
+    const pb::Hash32 b2 = x.add(kB, hr + 1, b1, ts(hr + 1) + 9, 500000000ull, std::nullopt, false);
+    // node Y: main B1, B2 with RowWeights; alt A1, A2 without.
+    y.add(kB, hr, c, ts(hr) + 9, 500000000ull, tail, true);
+    y.add(kB, hr + 1, b1, ts(hr + 1) + 9, 500000000ull, tail, true);
+    y.add(kA, hr, c, ts(hr) + 5, 1000000000ull, std::nullopt, false);
+    y.add(kA, hr + 1, a1, ts(hr + 1) + 5, 1000000000ull, std::nullopt, false);
+    check(x.main_tip() == a2 && y.main_tip() == b2 && !x.weights(b2) && !y.weights(a2),
+          "race: X follows A2, Y follows B2; each holds the other side without RowWeights");
+    const pb::FollowerBranchView vx(x), vy(y);
+
+    // the lane: carriers 1..40 at h = 100 + pos (P = Monero 99 + pos), then two
+    // carriers at 41: on A2 (h 142, best) and on B2 (h 142, side). Both nodes
+    // hold the same lane.
+    RefBook book;
+    std::vector<pb::Hash32> payees;
+    for (std::uint64_t k = 0; k < 8; ++k) payees.push_back(book.add(ref_from_secrets(1000 + k, 2000 + k)));
+    constexpr std::uint64_t b0 = 100;
+    pb::BinStore sx(pb::kRuledLaneParams, 64, idn(0xC8, 0), b0), sy(pb::kRuledLaneParams, 64, idn(0xC8, 0), b0);
+    bool ok = true;
+    for (pb::BinStore* st : {&sx, &sy}) {
+        for (std::uint64_t pos = 1; pos <= 40; ++pos)
+            ok = ok && extend(*st, idn(0xC8, pos), idn(0xC8, pos - 1), b0 + pos,
+                              {rcpt(idn(0xD8, pos), b0 + pos, pos, payees[pos % 8], 1000000)}, true);
+        ok = ok && extend(*st, idn(0xCA, 41), idn(0xC8, 40), hr + 2,
+                          {rcpt(idn(0xDA, 41), hr + 2, 41, payees[1], 1000000)}, true);
+        ok = ok && extend(*st, idn(0xCB, 41), idn(0xC8, 40), hr + 2,
+                          {rcpt(idn(0xDB, 41), hr + 2, 41, payees[2], 1000000)}, false);
+    }
+    check(ok, "race: both nodes hold the lane (40 carriers, two siblings at 41)");
+    const pb::XmrKeyRef author = kat_author();
+    const pb::Hash32 author_id = pb::key_ref_identity(author);
+    const pb::Hash32 t = idn(0xC8, 40);
+
+    pb::WindowCache cx, cy;
+    const pb::TipWindow wx = cx.get(t, 16, [&] { return pb::evaluate_window_at(sx, t, c, vx, 16, author_id); });
+    const pb::TipWindow wy = cy.get(t, 16, [&] { return pb::evaluate_window_at(sy, t, c, vy, 16, author_id); });
+    check(wx.ok() && wy.ok(), "race: P_t = Monero 139 (common): window(t, 16) evaluated on both nodes");
+    check(wx.ok() && wy.ok() && wx.inputs.d_net == wy.inputs.d_net && wx.inputs.a_t == wy.inputs.a_t
+                  && wx.inputs.weights == wy.inputs.weights && wx.inputs.d_net.lo == 10000000ull,
+          "race: one WindowInputs on both nodes (D_net 10,000,000 for a child of Monero 139)");
+    check(wx.ok() && wy.ok() && wx.window->weight == wy.window->weight && wx.window->W == wy.window->W
+                  && wx.window->W == pb::Work(20000000ull),
+          "race: one window on both nodes (20 newest bins, W 20,000,000)");
+    check(wx.ok() && wy.ok() && wx.window_root == wy.window_root && wx.mmr_root == wy.mmr_root,
+          "race: one window_root and one mmr_root on both nodes");
+
+    // one canonical coinbase on both sides: a receipt on t whose own P_r is A2.
+    {
+        pb::ReceiptBodyV3 r;
+        r.blob.major = 16;
+        r.blob.minor = 16;
+        r.blob.prev_id = a2;
+        r.extra_nonce = {9, 8, 7, 6};
+        r.branch = {seq32(0x81), seq32(0x91)};
+        r.side.pool_id = seq32(0x01);
+        r.side.payee = payees[3];
+        r.side.t_origin = 1000000;
+        r.side.tip = t;
+        r.side.receipts_root = seq32(0xA0);
+        r.payee = book.refs.at(payees[3]);
+        r.reward_total = 600000000000ull + 1500000000ull;
+        const std::uint64_t h_r = hr + 2;  // height(A2) + 1
+        check(wx.ok() && commit_miner_tx(r, *wx.window, t, a2, h_r, book, author), "race: the miner commits its coinbase");
+        pb::KeyCache kx, ky;
+        const pb::CoinbaseCheck ox =
+                pb::canonical_coinbase_check(r, pb::window_at(wx), t, a2, h_r, 16, kx, book.lookup(), author);
+        const pb::CoinbaseCheck oy =
+                pb::canonical_coinbase_check(r, pb::window_at(wy), t, a2, h_r, 16, ky, book.lookup(), author);
+        check(ox == pb::CoinbaseCheck::Match && oy == pb::CoinbaseCheck::Match, "race: the coinbase check Matches on both nodes");
+        const pb::CanonicalTx tx = pb::canonical_miner_tx(r, pb::window_at(wx), t, a2, h_r, 16, kx, book.lookup(), author);
+        const pb::CanonicalTx ty = pb::canonical_miner_tx(r, pb::window_at(wy), t, a2, h_r, 16, ky, book.lookup(), author);
+        check(tx.tx && ty.tx && tx.tx->tx_hash == ty.tx->tx_hash && tx.tx->outs.size() == 8,
+              "race: one canonical miner tx (the same tx hash, 8 outputs) on both nodes");
+    }
+
+    // the node's own main tip is another read point (the control).
+    {
+        pb::U128 dx{}, dy{};
+        check(pb::dnet_for_child(vx, vx.main_tip(), 16, dx).selected()
+                      && pb::dnet_for_child(vy, vy.main_tip(), 16, dy).selected() && !(dx == dy)
+                      && !(dx == wx.inputs.d_net),
+              "race: D_net for a child of each node's own main tip differs");
+        const pb::TipWindow own = pb::evaluate_window_at(sx, t, vx.main_tip(), vx, 16, author_id);
+        check(own.ok() && wx.ok() && !(own.window_root == wx.window_root),
+              "race: a window read at X's own main tip differs");
+    }
+
+    // tips on A2 and on B2: the alt side without RowWeights still resolves.
+    for (const auto& [tip, p] : {std::pair<pb::Hash32, pb::Hash32>{idn(0xCA, 41), a2},
+                                 std::pair<pb::Hash32, pb::Hash32>{idn(0xCB, 41), b2}}) {
+        const pb::TipWindow ox = pb::evaluate_window_at(sx, tip, p, vx, 16, author_id);
+        const pb::TipWindow oy = pb::evaluate_window_at(sy, tip, p, vy, 16, author_id);
+        const std::string tag = p == a2 ? "A2" : "B2";
+        check(ox.ok() && oy.ok() && ox.inputs.a_t == block_id(kC, 81) && oy.inputs.a_t == block_id(kC, 81)
+                      && ox.inputs.d_net == oy.inputs.d_net,
+              "race: P_t = " + tag + ": A_t = Monero 81 on both nodes, one D_net");
+        check(ox.ok() && oy.ok() && ox.window_root == oy.window_root && ox.mmr_root == oy.mmr_root,
+              "race: P_t = " + tag + ": one window_root on both nodes");
+    }
+}
+
 }  // namespace
 
 int main() {
+    s3b_race();
+
     const std::uint64_t B = 600000000000ull;
     const std::uint64_t f = 1;  // loose
     const pb::Hash32 author{};

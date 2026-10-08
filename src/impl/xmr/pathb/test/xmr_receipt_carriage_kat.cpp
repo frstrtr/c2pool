@@ -21,6 +21,12 @@
 //   sha256d("c2pool-v37-carry" || carried_root || rs_root) STRIKE. A golden
 //   carried_root pins the Merkle convention. window_root / mmr_root stay the
 //   S1 zero stubs.
+// S3 part (S3b-1b, pathb_window_chain.hpp; C36, C38): carrier c (payee A) at
+//   position 20 carries receipt r of payee B in r's open bin; at every tip t >=
+//   pos(c) on c's chain window(t) holds B with r's work after shares and
+//   window_root covers it; at t = 19 r is not credited; a dead foreign receipt
+//   carried by c is stored and credited nothing; a receipt placed only on a
+//   side branch is in that branch's window and not in c's.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -35,8 +41,10 @@
 #include "impl/xmr/pathb/pathb_buckets.hpp"  // fold_pos
 #include "impl/xmr/pathb/pathb_ratchet_state.hpp"
 #include "impl/xmr/pathb/pathb_receipt_admission.hpp"
+#include "impl/xmr/pathb/pathb_window_chain.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
+#include "pathb_kat_lane.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
@@ -91,7 +99,68 @@ bool strike(const pb::CarriedListResult& r, pb::CarriedFault f) {
 
 }  // namespace
 
+// S3 part: crediting carried receipts into window(t).
+static void s3_crediting() {
+    const pb::LaneParams& P = pb::kRuledLaneParams;
+    constexpr std::uint64_t b0 = 7000;
+    const pb::Hash32 A = idn(0xAA, 1), B = idn(0xBB, 1), D = idn(0xDD, 1), E = idn(0xEE, 1);
+    auto h_of = [](std::uint64_t pos) { return b0 + pos / 12; };
+    pb::BinStore s(P, 64, idn(0xCA, 0), b0);
+    bool ok = true;
+    std::vector<pb::Ingest> v20;
+    for (std::uint64_t pos = 1; pos <= 30; ++pos) {
+        std::vector<pb::Placement> pls;
+        if (pos == 20) {
+            // r of payee B (bin b0 + 1, own position 19); d of payee D (bin b0, own
+            // position 20: H(19) = b0 + 1 > b0, dead); then the carrier's own receipt.
+            pls.push_back(rcpt(idn(0xD1, 20), b0 + 1, 19, B, 25000));
+            pls.push_back(rcpt(idn(0xD2, 20), b0, 20, D, 22000));
+        }
+        pls.push_back(rcpt(idn(0xD0, pos), h_of(pos), pos, A, 30000));
+        ok = ok && extend(s, idn(0xCA, pos), idn(0xCA, pos - 1), h_of(pos), pls, true, pos == 20 ? &v20 : nullptr);
+    }
+    // side branch at position 20 on 19: it places a receipt of payee E only.
+    std::vector<pb::Ingest> vs;
+    ok = ok && extend(s, idn(0xCB, 20), idn(0xCA, 19), h_of(20),
+                      {rcpt(idn(0xD3, 20), b0 + 1, 19, E, 26000), rcpt(idn(0xD4, 20), h_of(20), 20, A, 30000)}, false,
+                      &vs);
+    check(ok && v20.size() == 3 && v20[0] == pb::Ingest::Accepted && v20[1] == pb::Ingest::Accepted,
+          "S3: c at 20 carries r (payee B) and a dead receipt (payee D): both placed");
+    bool d_dead = false, r_live = false;
+    for (const pb::Placement& x : s.delta(idn(0xCA, 20))->placed) {
+        if (x.id == idn(0xD2, 20)) d_dead = !x.live;
+        if (x.id == idn(0xD1, 20)) r_live = x.live;
+    }
+    check(r_live && d_dead, "S3: r is live, the foreign receipt of D is dead");
+    pb::WindowParams wp;
+    wp.d_net = pb::DNet{1} << 100;
+    wp.B = 600000000000ull;
+    wp.f_spend = pb::f_spend(wp.B, 300000, 16);
+    wp.N = 3747;
+    bool credited = true, covered = true, no_dead = true, no_side = true;
+    for (const std::uint64_t t : {std::uint64_t{20}, std::uint64_t{25}, std::uint64_t{30}}) {
+        const pb::TipWindow w = pb::tip_window(s, idn(0xCA, t), wp, 16);
+        credited = credited && w.ok() && w.window->weight.count(B) && w.window->weight.at(B) == pb::Work(25000);
+        pb::Work sum;
+        covered = covered && w.ok() && w.window_root == pb::window_root(*w.window, &sum) && sum == w.window->W
+                  && w.window->W == pb::Work(25000 + 30000 * t);
+        no_dead = no_dead && w.ok() && w.window->weight.count(D) == 0;
+        no_side = no_side && w.ok() && w.window->weight.count(E) == 0;
+    }
+    check(credited, "S3: window(t) for t = 20, 25, 30 holds B with r's work 25,000");
+    check(covered, "S3: window_root covers it (sum == W == 25,000 + 30,000 x t)");
+    check(no_dead, "S3: the dead receipt of D is credited nothing");
+    check(no_side, "S3: E (placed only on the side branch) is not in c's windows");
+    const pb::TipWindow w19 = pb::tip_window(s, idn(0xCA, 19), wp, 16);
+    check(w19.ok() && w19.window->weight.count(B) == 0, "S3: at t = 19 (before c) r is not credited");
+    const pb::TipWindow ws = pb::tip_window(s, idn(0xCB, 20), wp, 16);
+    check(ws.ok() && ws.window->weight.count(E) && ws.window->weight.at(E) == pb::Work(26000)
+                  && ws.window->weight.count(B) == 0,
+          "S3: the side branch's window holds E (26,000) and not B");
+}
+
 int main() {
+    s3_crediting();
     const pb::LaneParams& lp = pb::kRuledLaneParams;
     const std::uint64_t F = lp.open_bins;   // K04 = 96
     const std::uint64_t r_max = lp.r_max;   // K08 = 16

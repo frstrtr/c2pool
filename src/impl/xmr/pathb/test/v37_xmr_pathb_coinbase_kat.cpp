@@ -72,7 +72,7 @@ int main() {
     const pb::RefLookup refs = book.lookup();
     pb::KeyCache cache;
     auto check12 = [&](const pb::ReceiptBodyV3& r, const pb::Window& w, std::uint8_t hf) {
-        return pb::canonical_coinbase_check(r, pb::WindowAt{&w}, r.side.tip, r.blob.prev_id, kKatHeight, hf, cache,
+        return pb::canonical_coinbase_check(r, at_of(&w, r.side.tip, hf), r.side.tip, r.blob.prev_id, kKatHeight, hf, cache,
                                             refs, author);
     };
     auto commit = [&](pb::ReceiptBodyV3& r, const pb::Window& w) {
@@ -95,7 +95,7 @@ int main() {
         pb::ReceiptBodyV3 r = make_body(3, false, 0x24);
         r.reward_total = B.reward;
         check(floor_sum(r.reward_total, wts) < r.reward_total, "case 4 mainnet: the floors sum below R (deficit > 0)");
-        const pb::CanonicalTx c = pb::canonical_miner_tx(r, pb::WindowAt{&w}, r.side.tip, r.blob.prev_id, kKatHeight,
+        const pb::CanonicalTx c = pb::canonical_miner_tx(r, at_of(&w, r.side.tip, 16), r.side.tip, r.blob.prev_id, kKatHeight,
                                                          16, cache, refs, author);
         std::uint64_t s = 0;
         if (c.tx)
@@ -112,7 +112,7 @@ int main() {
         pb::ReceiptBodyV3 q = make_body(3, false, 0x25);
         q.reward_total = R;
         check(floor_sum(R, wr) < R, "case 4 regtest: the floors sum below R (deficit > 0)");
-        const pb::CanonicalTx cr = pb::canonical_miner_tx(q, pb::WindowAt{&w_reg}, q.side.tip, q.blob.prev_id,
+        const pb::CanonicalTx cr = pb::canonical_miner_tx(q, at_of(&w_reg, q.side.tip, 16), q.side.tip, q.blob.prev_id,
                                                           kKatHeight, 16, cache, refs, author);
         std::uint64_t sr = 0;
         if (cr.tx)
@@ -180,7 +180,7 @@ int main() {
     r.reward_total = R;
     check(commit(r, wk), "the miner builds the canonical split miner tx");
     {
-        const pb::CanonicalTx c = pb::canonical_miner_tx(r, pb::WindowAt{&wk}, r.side.tip, r.blob.prev_id, kKatHeight,
+        const pb::CanonicalTx c = pb::canonical_miner_tx(r, at_of(&wk, r.side.tip, 16), r.side.tip, r.blob.prev_id, kKatHeight,
                                                          16, cache, refs, author);
         const pb::Hash32 own_mm = pb::mm_root_of(r.side).value_or(pb::Hash32{});
         check(c.tx && c.tx->extra.size() == 74 && std::equal(own_mm.begin(), own_mm.end(), c.tx->extra.begin() + 42),
@@ -444,7 +444,7 @@ int main() {
                 const std::string tag = std::string(win == &wf ? "empty window (finder-only)" : "window") + ", p "
                                         + std::to_string(c.p) + " + give_author_bp " + std::to_string(c.ga);
                 if (c.valid) {
-                    const pb::CanonicalTx cx = pb::canonical_miner_tx(x, pb::WindowAt{win}, x.side.tip,
+                    const pb::CanonicalTx cx = pb::canonical_miner_tx(x, at_of(win, x.side.tip, 16), x.side.tip,
                                                                       x.blob.prev_id, kKatHeight, 16, cache, refs,
                                                                       author);
                     check(cx.tx && cx.tx->tx_hash == miner_tx_hash_of(x, *win) && pb::mm_root_of(x.side) == raw_mm_of(x),
@@ -498,7 +498,7 @@ int main() {
         // (c) hf 17: Fused -> REFUSE, no token, no ban, RandomX not called.
         {
             pb::ReceiptBodyV3 y = make_body(3, true, 0x40);
-            const pb::CanonicalTx c17 = pb::canonical_miner_tx(y, pb::WindowAt{&w_ok}, y.side.tip, y.blob.prev_id,
+            const pb::CanonicalTx c17 = pb::canonical_miner_tx(y, at_of(&w_ok, y.side.tip, 17), y.side.tip, y.blob.prev_id,
                                                                kKatHeight, 17, cache, refs, author);
             check(c17.stop == pb::CoinbaseCheck::Fused && !c17.tx.has_value(), "hf17: Fused, no miner tx");
             commit_hash(y, pb::Hash32{});

@@ -47,9 +47,9 @@ int main() {
     commit_miner_tx(r, w, tip, p_r, kKatHeight, book, author);
     pb::KeyCache cache;
     const pb::CanonicalTx at16 =
-            pb::canonical_miner_tx(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, cache, book.lookup(), author);
+            pb::canonical_miner_tx(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author);
     const pb::CanonicalTx at17 =
-            pb::canonical_miner_tx(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 17, cache, book.lookup(), author);
+            pb::canonical_miner_tx(r, at_of(&w, tip, 17), tip, p_r, kKatHeight, 17, cache, book.lookup(), author);
     check(at16.stop == pb::CoinbaseCheck::Match && at16.tx.has_value(), "hf16 canonical miner tx built");
     check(at17.stop == pb::CoinbaseCheck::Fused && !at17.tx.has_value(),
           "hf17 canonical coinbase FORK-FUSED (no miner tx, no amount invented)");
@@ -57,7 +57,7 @@ int main() {
     // at hf 17 the receipt is REFUSED: no strike token, no ban, RandomX not called.
     for (std::uint8_t hf : {std::uint8_t{17}, std::uint8_t{18}}) {
         const pb::CoinbaseCheck c =
-                pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, hf, cache, book.lookup(), author);
+                pb::canonical_coinbase_check(r, at_of(&w, tip, hf), tip, p_r, kKatHeight, hf, cache, book.lookup(), author);
         bool rx = false;
         const pb::TailResult t = pb::admit_coinbase_then_randomx(c, [&] { rx = true; return true; });
         check(c == pb::CoinbaseCheck::Fused, "hf " + std::to_string(hf) + ": Fused");
@@ -68,7 +68,7 @@ int main() {
     {
         bool rx = false;
         const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, cache, book.lookup(), author),
+                pb::canonical_coinbase_check(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author),
                 [&] { rx = true; return true; });
         check(t.verdict == pb::AdmitVerdict::AdmitCarrier && rx, "hf16: admitted, RandomX after #12");
     }

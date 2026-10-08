@@ -10,10 +10,19 @@
 // order and the Merkle-SUM window_root (side_data offset 141).
 //
 //   window(bins, D_net, B, f_spend, N, author): whole bins back from the block's
-//     OWN tip until the raw work reaches COVERAGE x D_net, never past W_max per
-//     entry ((W + w_b) x f_spend <= B x min(d_min, d_min(b))), no decay; then the
-//     N rule (drop the oldest bin while payees > N; one bin left -> cut by carrier
-//     position, newest first then id ascending). [C38, K09, K11a, rulings 15/19]
+//     OWN tip until the raw work reaches COVERAGE x D_net (D_net u128, compared
+//     in U256), never past W_max per entry ((W + w_b) x f_spend <= B x
+//     min(d_min, d_min(b))), no decay; when the newest bin alone fails W_max it
+//     is cut by carrier position while W_kept x f_spend <= B x d_min(kept)
+//     (R-12); then the N rule (drop the oldest bin while payees > N; one bin
+//     left -> cut by carrier position, newest first then id ascending). Payees
+//     counted for N: the identities whose total weight after shares (miner +
+//     owner + author parts, before merge-back) is > 0 (R-13). [C38, C13, K09,
+//     K11a, rulings 15/19]
+//   A bin is OPEN (its live entries) or SEALED (its L1 bucket: raw_sum, d_min,
+//     rows); both give the same window (ruling 20 Q-K). The bins are read
+//     newest first from a source that may name a bin it does not hold
+//     (MissingBucket / MissingEntries): the window is then not evaluated.
 //   shares: w_owner = floor(work x p / 10000), w_author = floor(work x ga /
 //     10000), w_miner = work - w_owner - w_author. [K15, K16]
 //   merge_back: identity X whose TOTAL window weight w_X (miner + owner + author
@@ -35,6 +44,7 @@
 #include <map>
 #include <numeric>
 #include <set>
+#include <utility>
 #include <vector>
 
 #include "pathb_buckets.hpp"  // BucketRow, domain bytes, sha256d helpers
@@ -46,6 +56,13 @@ namespace c2pool::xmr::pathb {
 
 // COVERAGE (K09, ruling 19 R-C1): a unit of work is paid in 2 blocks on average.
 inline constexpr std::uint64_t kCoverage = 2;
+
+// D_net (D2.13): u128; COVERAGE x D_net is compared with the window work in U256.
+using DNet = wide::u128;
+
+// A receipt's work is >= d_min (K02) > 10000 basis points, so a share at bp >= 1
+// is >= 1: owner and author presence reads the same from rows and from entries.
+static_assert(kRuledLaneParams.d_min > kBasisPointsScale, "d_min must exceed the basis-point scale");
 
 // One live receipt entry placed in a window bin (carrier or carried; a dead
 // receipt is never passed here — it carries weight 0 and never enters the window).
@@ -61,7 +78,8 @@ struct WinEntry {
 
 struct WinBin {
     std::uint64_t bin = 0;  // origin bin h(r); newest bins come first in the list
-    std::vector<WinEntry> entries;  // live receipt entries only
+    std::vector<WinEntry> entries;     // open bin: live receipt entries only
+    const L1Bucket* sealed = nullptr;  // sealed bin: its bucket (raw_sum, d_min, rows); entries empty
 };
 
 // shares of one receipt's raw work (S3.1 item 10). The shares are defined iff
@@ -95,8 +113,16 @@ struct Window {
 
 namespace detail_win {
 
-// Raw live-work sum and the smallest live receipt-entry work of a bin.
+inline bool bin_empty(const WinBin& b) { return b.sealed != nullptr ? b.sealed->rows.empty() : b.entries.empty(); }
+
+// Raw live-work sum and the smallest live receipt-entry work of a bin (a sealed
+// bin: its bucket's raw_sum and d_min).
 inline void bin_stats(const WinBin& b, Work& raw_sum, std::uint64_t& d_min) {
+    if (b.sealed != nullptr) {
+        raw_sum = b.sealed->raw_sum;
+        d_min = b.sealed->d_min;
+        return;
+    }
     raw_sum = Work{};
     d_min = 0;
     bool first = true;
@@ -127,19 +153,53 @@ inline std::vector<BucketRow> rows_of(const std::vector<WinEntry>& entries) {
     return out;
 }
 
+// The rows of a set of bins: open entries after shares and sealed bucket rows,
+// aggregated by (miner, owner); W = their raw work.
+inline std::vector<BucketRow> rows_of_bins(const std::vector<WinBin>& bins, Work& W) {
+    std::map<std::pair<Hash32, Hash32>, BucketRow> by;
+    W = Work{};
+    for (const WinBin& b : bins) {
+        if (b.sealed != nullptr) {
+            for (const BucketRow& r : b.sealed->rows) {
+                auto& row = by[{r.miner, r.owner}];
+                row.miner = r.miner;
+                row.owner = r.owner;
+                row.w_miner += r.w_miner;
+                row.w_owner += r.w_owner;
+                row.w_author += r.w_author;
+            }
+            W += b.sealed->raw_sum;
+            continue;
+        }
+        for (const WinEntry& e : b.entries) {
+            const Shares s = shares_of(e.work, e.p, e.give_author_bp);
+            auto& row = by[{e.miner, e.owner}];
+            row.miner = e.miner;
+            row.owner = e.owner;
+            row.w_miner += Work(s.w_miner);
+            row.w_owner += Work(s.w_owner);
+            row.w_author += Work(s.w_author);
+            W += Work(e.work);
+        }
+    }
+    std::vector<BucketRow> out;
+    out.reserve(by.size());
+    for (auto& [k, v] : by) out.push_back(v);
+    return out;
+}
+
 // weight_X x B  <  W x f_spend   (below the spend floor), both sides U320.
 inline bool below_floor(const Work& weight_x, std::uint64_t B, const Work& W, std::uint64_t f_spend) {
     return wide::mul_u256_u64(weight_x, B) < wide::mul_u256_u64(W, f_spend);
 }
 
-// Shares + merge-back over a set of live entries. author is the fixed donation
-// identity; author weight merges back exactly like an owner's.
-inline Window resolve(const std::vector<WinEntry>& entries, std::uint64_t B, std::uint64_t f_spend,
-                      const Hash32& author) {
+// Merge-back over the window rows (W = the window's raw work). author is the
+// fixed donation identity; author weight merges back exactly like an owner's.
+inline Window resolve_rows(std::vector<BucketRow> rows, const Work& W, std::uint64_t B, std::uint64_t f_spend,
+                           const Hash32& author) {
     Window w;
-    w.rows = rows_of(entries);
-    // window total W = total raw work (shares partition work exactly).
-    for (const WinEntry& e : entries) w.W += Work(e.work);
+    w.rows = std::move(rows);
+    w.W = W;
 
     std::map<Hash32, Work> miner_w, owner_w;
     Work author_w{};
@@ -182,106 +242,261 @@ inline Window resolve(const std::vector<WinEntry>& entries, std::uint64_t B, std
     return w;
 }
 
+// Shares + merge-back over a set of window bins.
+inline Window resolve_bins(const std::vector<WinBin>& bins, std::uint64_t B, std::uint64_t f_spend,
+                           const Hash32& author) {
+    Work W;
+    std::vector<BucketRow> rows = rows_of_bins(bins, W);
+    return resolve_rows(std::move(rows), W, B, f_spend, author);
+}
+
+// Shares + merge-back over a set of live entries.
+inline Window resolve(const std::vector<WinEntry>& entries, std::uint64_t B, std::uint64_t f_spend,
+                      const Hash32& author) {
+    std::vector<WinBin> one(1);
+    one.front().entries = entries;
+    return resolve_bins(one, B, f_spend, author);
+}
+
 // Distinct identity count the N rule bounds (the window payees).
 inline std::size_t payee_count(const Window& w) { return w.weight.size(); }
 
-// Pre-merge distinct identities (miners + owners with p > 0 + the author when
-// any donation is present): an upper bound on the output count, monotone in the
-// entry set, so the N rule can cut in one pass (merge-back only lowers it).
-inline std::size_t distinct_identities(const std::vector<WinEntry>& entries, const Hash32& author) {
-    std::set<Hash32> ids;
-    bool any_author = false;
-    for (const WinEntry& e : entries) {
-        ids.insert(e.miner);
-        if (e.p > 0 && !(e.owner == kZeroHash)) ids.insert(e.owner);
-        if (e.give_author_bp > 0) any_author = true;
+// The payees the N rule counts (R-13): the identities whose total window weight
+// after shares (miner + owner + author parts, before merge-back) is > 0. The
+// parts are >= 0, so an identity counts once any part of it is > 0; the count is
+// monotone in the entry set and reads the same from entries and from rows.
+class PayeeCount {
+public:
+    explicit PayeeCount(const Hash32& author) : author_(author), have_author_(!(author == kZeroHash)) {}
+
+    void add_entry(const WinEntry& e) {
+        const Shares s = shares_of(e.work, e.p, e.give_author_bp);
+        if (s.w_miner > 0) ids_.insert(e.miner);
+        if (!(e.owner == kZeroHash) && s.w_owner > 0) ids_.insert(e.owner);
+        if (have_author_ && s.w_author > 0) ids_.insert(author_);
     }
-    if (any_author && !(author == kZeroHash)) ids.insert(author);
-    return ids.size();
+    void add_row(const BucketRow& r) {
+        if (!r.w_miner.is_zero()) ids_.insert(r.miner);
+        if (!(r.owner == kZeroHash) && !r.w_owner.is_zero()) ids_.insert(r.owner);
+        if (have_author_ && !r.w_author.is_zero()) ids_.insert(author_);
+    }
+    void add_bin(const WinBin& b) {
+        if (b.sealed != nullptr) {
+            for (const BucketRow& r : b.sealed->rows) add_row(r);
+            return;
+        }
+        for (const WinEntry& e : b.entries) add_entry(e);
+    }
+    std::size_t count() const noexcept { return ids_.size(); }
+
+private:
+    Hash32 author_;
+    bool have_author_;
+    std::set<Hash32> ids_;
+};
+
+inline std::size_t distinct_identities(const std::vector<WinEntry>& entries, const Hash32& author) {
+    PayeeCount c(author);
+    for (const WinEntry& e : entries) c.add_entry(e);
+    return c.count();
+}
+
+// The in-bin cut order: carrier position descending (newest first), then id ascending.
+inline void sort_newest_first(std::vector<WinEntry>& e) {
+    std::sort(e.begin(), e.end(), [](const WinEntry& a, const WinEntry& b) {
+        if (a.position != b.position) return a.position > b.position;
+        return std::lexicographical_compare(a.id.begin(), a.id.end(), b.id.begin(), b.id.end());
+    });
+}
+
+// W_max over a prefix: W x f_spend <= B x d_min.
+inline bool within_w_max(const Work& W, std::uint64_t d_min, std::uint64_t B, std::uint64_t f_spend) {
+    return !(wide::mul_u64_u64(B, d_min) < wide::mul_u256_u64(W, f_spend));
 }
 
 }  // namespace detail_win
 
+// ---------------------------------------------------------------------------
+// The bins of a window are read newest first from a source: a Bin, the End of
+// the lane, or a bin the source does not hold (its bucket, or the placements of
+// an open bin). A window is never evaluated over a partial bin list.
+// ---------------------------------------------------------------------------
+enum class PullKind : std::uint8_t { Bin, End, MissingBucket, MissingEntries };
+
+struct BinPull {
+    PullKind kind = PullKind::End;
+    WinBin bin;
+    std::uint64_t missing_bin = 0;
+};
+
+enum class WinStatus : std::uint8_t {
+    Ok,
+    MissingBucket,   // missing_bin: the sealed bin whose bucket is not held (fetch it)
+    MissingEntries,  // missing_bin: the open bin whose placements are not held (rebuild)
+    SealedCut,       // a cut by carrier position would fall in a sealed bin (no window)
+};
+
+struct WinSelect {
+    WinStatus status = WinStatus::Ok;
+    std::uint64_t missing_bin = 0;
+    std::vector<WinBin> bins;  // selected, newest first
+    std::uint64_t read = 0;    // bins read from the source
+};
+
 // step 1 of window(): select whole bins back to COVERAGE x D_net, never past
 // W_max per entry ((W + w_b) x f_spend <= B x min(d_min, d_min(b))), no decay.
-// Exposed so the spend-floor KAT can assert the F6 1,500-bin stop.
-inline std::vector<WinBin> select_window_bins(const std::vector<WinBin>& bins_newest_first, std::uint64_t D_net,
-                                              std::uint64_t B, std::uint64_t f_spend) {
+// The newest non-empty bin failing W_max on its own is cut by carrier position
+// while W_kept x f_spend <= B x d_min(kept) (R-12). pull() yields the next bin.
+template <class Pull>
+inline WinSelect select_window_bins_from(Pull&& pull, DNet D_net, std::uint64_t B, std::uint64_t f_spend) {
     Work coverage_target;
-    for (std::uint64_t i = 0; i < kCoverage; ++i) coverage_target += Work(D_net);
-    std::vector<WinBin> sel;
+    const Work d_net = Work::from_u128(D_net);
+    for (std::uint64_t i = 0; i < kCoverage; ++i) coverage_target += d_net;
+    WinSelect out;
     Work cum;              // running raw work == running W
     std::uint64_t d_min_g = 0;
     bool have_dmin = false;
-    for (const WinBin& b : bins_newest_first) {
+    for (;;) {
         if (!(cum < coverage_target)) break;  // reached coverage
-        if (b.entries.empty()) continue;
+        BinPull p = pull();
+        if (p.kind == PullKind::End) break;
+        ++out.read;
+        if (p.kind == PullKind::MissingBucket || p.kind == PullKind::MissingEntries) {
+            out.status = p.kind == PullKind::MissingBucket ? WinStatus::MissingBucket : WinStatus::MissingEntries;
+            out.missing_bin = p.missing_bin;
+            out.bins.clear();
+            return out;
+        }
+        WinBin& b = p.bin;
+        if (detail_win::bin_empty(b)) continue;
         Work bin_raw;
         std::uint64_t bin_dmin = 0;
         detail_win::bin_stats(b, bin_raw, bin_dmin);
         const Work W_new = cum + bin_raw;
         const std::uint64_t dmin_new = have_dmin ? std::min(d_min_g, bin_dmin) : bin_dmin;
         // W_max per entry: (W + w_b) x f_spend <= B x min(d_min, d_min(b)).
-        if (wide::mul_u64_u64(B, dmin_new) < wide::mul_u256_u64(W_new, f_spend)) break;
-        sel.push_back(b);
+        if (!detail_win::within_w_max(W_new, dmin_new, B, f_spend)) {
+            if (out.bins.empty()) {  // the newest bin alone fails W_max: cut it (R-12)
+                if (b.sealed != nullptr) {
+                    out.status = WinStatus::SealedCut;
+                    out.missing_bin = b.bin;
+                    return out;
+                }
+                std::vector<WinEntry>& e = b.entries;
+                detail_win::sort_newest_first(e);
+                Work W;
+                std::uint64_t d = 0;
+                std::size_t keep = 0;
+                for (std::size_t i = 0; i < e.size(); ++i) {
+                    W += Work(e[i].work);
+                    d = i == 0 ? e[i].work : std::min(d, e[i].work);
+                    if (!detail_win::within_w_max(W, d, B, f_spend)) break;  // monotone in the prefix
+                    keep = i + 1;
+                }
+                e.resize(keep);
+                if (keep > 0) out.bins.push_back(std::move(b));
+            }
+            break;
+        }
+        out.bins.push_back(std::move(b));
         cum = W_new;
         d_min_g = dmin_new;
         have_dmin = true;
     }
-    return sel;
+    return out;
 }
 
-// window(bins newest-first, D_net, B, f_spend, N, author): the whole slice-1
-// payout window (D2.7 steps 0-6).
-inline Window window(const std::vector<WinBin>& bins_newest_first, std::uint64_t D_net, std::uint64_t B,
-                     std::uint64_t f_spend, std::uint64_t N, const Hash32& author) {
+// A source over bins already listed newest first.
+struct ListedBins {
+    const std::vector<WinBin>& bins;
+    std::size_t next = 0;
+    BinPull operator()() {
+        if (next == bins.size()) return BinPull{};
+        return BinPull{PullKind::Bin, bins[next++], 0};
+    }
+};
+
+// step 1 over listed bins. Exposed so the spend-floor KAT can assert the F6
+// 1,500-bin stop.
+inline std::vector<WinBin> select_window_bins(const std::vector<WinBin>& bins_newest_first, DNet D_net,
+                                              std::uint64_t B, std::uint64_t f_spend) {
+    WinSelect s = select_window_bins_from(ListedBins{bins_newest_first}, D_net, B, f_spend);
+    return std::move(s.bins);
+}
+
+// A window evaluated from a source, or the bin that stopped it.
+struct WinEval {
+    WinStatus status = WinStatus::Ok;
+    std::uint64_t missing_bin = 0;
+    Window window;
+    std::uint64_t read = 0;        // bins read from the source
+    std::uint64_t oldest_bin = 0;  // the oldest bin left in the window (0: none)
+};
+
+// window(source, D_net, B, f_spend, N, author): the whole payout window (D2.7
+// steps 0-6) over the bins the source yields newest first.
+template <class Pull>
+inline WinEval window_from(Pull&& pull, DNet D_net, std::uint64_t B, std::uint64_t f_spend, std::uint64_t N,
+                           const Hash32& author) {
+    WinEval out;
     // --- step 1: select whole bins back to COVERAGE x D_net, never past W_max ---
-    std::vector<WinBin> sel = select_window_bins(bins_newest_first, D_net, B, f_spend);
+    WinSelect s = select_window_bins_from(std::forward<Pull>(pull), D_net, B, f_spend);
+    out.read = s.read;
+    if (s.status != WinStatus::Ok) {
+        out.status = s.status;
+        out.missing_bin = s.missing_bin;
+        return out;
+    }
+    std::vector<WinBin>& sel = s.bins;
 
-    // flatten live entries of the selected bins.
-    auto entries_of = [](const std::vector<WinBin>& v) {
-        std::vector<WinEntry> e;
-        for (const WinBin& b : v)
-            for (const WinEntry& x : b.entries) e.push_back(x);
-        return e;
-    };
-
-    // --- step 2: N rule. Drop the OLDEST bin while the (pre-merge) distinct
-    // identities exceed N; one bin left -> cut it by carrier position (newest
-    // first, then id ascending). Single pass (merge-back only lowers the count). ---
-    if (N >= 1) {
-        while (sel.size() > 1 && detail_win::distinct_identities(entries_of(sel), author) > N)
-            sel.pop_back();  // drop the OLDEST selected bin (list is newest-first)
-        if (sel.size() == 1 && detail_win::distinct_identities(sel.front().entries, author) > N) {
+    // --- steps 3-4: N rule. Drop the OLDEST bin while the payees (R-13) exceed
+    // N: keep the longest newest prefix whose count stays <= N (the count is
+    // monotone); the newest bin alone over N -> cut it by carrier position
+    // (newest first, then id ascending), keeping the longest prefix within N. ---
+    if (N >= 1 && !sel.empty()) {
+        detail_win::PayeeCount pc(author);
+        std::size_t k = 0;
+        for (; k < sel.size(); ++k) {
+            pc.add_bin(sel[k]);
+            if (pc.count() > N) break;
+        }
+        if (k >= 1) {
+            sel.resize(k);  // the oldest bins leave the window
+        } else {
+            sel.resize(1);
+            if (sel.front().sealed != nullptr) {
+                out.status = WinStatus::SealedCut;
+                out.missing_bin = sel.front().bin;
+                return out;
+            }
             std::vector<WinEntry>& e = sel.front().entries;
-            std::sort(e.begin(), e.end(), [](const WinEntry& a, const WinEntry& b) {
-                if (a.position != b.position) return a.position > b.position;  // newest first
-                return std::lexicographical_compare(a.id.begin(), a.id.end(), b.id.begin(), b.id.end());
-            });
-            // keep the largest newest prefix whose distinct identities stay <= N.
-            // distinct count is monotone, so one pass with one set (no copies).
-            std::set<Hash32> ids;
-            bool any_author = false;
+            detail_win::sort_newest_first(e);
+            detail_win::PayeeCount cut(author);
             std::size_t keep = 0;
-            const bool have_author = !(author == kZeroHash);
             for (std::size_t i = 0; i < e.size(); ++i) {
-                ids.insert(e[i].miner);
-                if (e[i].p > 0 && !(e[i].owner == kZeroHash)) ids.insert(e[i].owner);
-                if (e[i].give_author_bp > 0) any_author = true;
-                const std::size_t cnt = ids.size() + (any_author && have_author ? 1 : 0);
-                if (cnt <= N)
-                    keep = i + 1;
-                else
-                    break;  // monotone: once over N, no later prefix fits
+                cut.add_entry(e[i]);
+                if (cut.count() > N) break;  // monotone: once over N, no later prefix fits
+                keep = i + 1;
             }
             e.resize(keep);
         }
     }
 
-    // --- steps 3-5: shares + merge-back over the surviving entries. ---
-    Window w = detail_win::resolve(entries_of(sel), B, f_spend, author);
-    if (w.weight.empty()) w.empty_finder_only = true;
-    return w;
+    // --- step 5: shares + merge-back over the surviving bins. ---
+    out.oldest_bin = sel.empty() ? 0 : sel.back().bin;
+    out.window = detail_win::resolve_bins(sel, B, f_spend, author);
+    if (out.window.weight.empty()) out.window.empty_finder_only = true;
+    return out;
+}
+
+// window(bins newest-first, D_net, B, f_spend, N, author) over listed bins. A
+// list that stops the window (a cut inside a sealed bin) gives an empty window
+// that is not finder-only.
+inline Window window(const std::vector<WinBin>& bins_newest_first, DNet D_net, std::uint64_t B,
+                     std::uint64_t f_spend, std::uint64_t N, const Hash32& author) {
+    WinEval e = window_from(ListedBins{bins_newest_first}, D_net, B, f_spend, N, author);
+    if (e.status != WinStatus::Ok) return Window{};
+    return std::move(e.window);
 }
 
 // ---------------------------------------------------------------------------
