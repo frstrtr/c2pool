@@ -23,6 +23,7 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -56,13 +57,14 @@ pb::Hash32 cid(std::uint8_t branch, std::uint64_t n) {
     return h;
 }
 
-// A carrier on a held tip with the receipts_root it commits there.
+// A carrier on a held tip, carrying nothing, with the receipts_root it commits there.
 pb::CarrierAnnounce on_tip(const pb::CarrierTree& t, const pb::Hash32& id, const pb::Hash32& tip, std::uint64_t h) {
-    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip).value_or(pb::Hash32{}), 0};
+    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip, {}).value_or(pb::Hash32{}), 0};
 }
 
-bool place_complete(pb::CarrierTree& t, const pb::CarrierAnnounce& c) {
-    return t.place(c).verdict == pb::PlaceVerdict::Placed && t.mark_verified(c.id) && t.mark_bodies(c.id);
+bool place_complete(pb::CarrierTree& t, const pb::CarrierAnnounce& c,
+                    std::span<const pb::CarriedPlacement> carried = {}) {
+    return t.place(c, carried).verdict == pb::PlaceVerdict::Placed && t.mark_verified(c.id) && t.mark_bodies(c.id);
 }
 
 class MapView final : public pb::IBranchView {
@@ -107,7 +109,7 @@ int main() {
     // (a) h(c) < H(parent): not a carrier
     {
         check(!pb::carrier_height_admissible(1001, 1000), "h 1000 below the parent's record 1001: not admissible");
-        check(t.place(on_tip(t, cid(1, 2), c1.id, 1000)).verdict == pb::PlaceVerdict::NotCarrier,
+        check(t.place(on_tip(t, cid(1, 2), c1.id, 1000), {}).verdict == pb::PlaceVerdict::NotCarrier,
               "(a) h(c) < H(parent) -> not a carrier");
     }
 
@@ -121,8 +123,8 @@ int main() {
 
     // (c) a carried receipt with h(r) > h(c) does not raise H
     {
-        const pb::CarrierAnnounce c = on_tip(t, cid(4, 1), c1.id, 1001);  // a carrier at h 1001 on c1
-        // c carries a receipt of origin bin 1003 (h(r) > h(c)); its bin is open on c's chain.
+        // c, a carrier at h 1001 on c1, carries a receipt of origin bin 1003 (h(r) > h(c)); its bin is open on
+        // c's chain.
         const pb::ReceiptBodyV3 own = make_body(2, false, 0x10);
         std::vector<pb::CarriedReceipt> carried{{make_body(2, false, 0x20), 1003}};
         pb::ReceiptBodyV3 cbody = own;
@@ -132,8 +134,11 @@ int main() {
         const pb::CarriedListResult r =
                 pb::check_carried_list(cbody, t.find(c1.id)->H, carried, placed, t.find(c1.id)->rs, P);
         check(!r.verdict.has_value(), "(c) the carried receipt at h 1003 is admitted on c");
-        check(place_complete(t, c) && t.find(c.id)->H == 1001, "(c) H(c) = h(c) = 1001, not the carried 1003");
-        check(t.place(on_tip(t, cid(4, 2), c.id, 1002)).verdict == pb::PlaceVerdict::Placed,
+        const pb::CarrierAnnounce c{cid(4, 1), c1.id, 1001, cbody.side.receipts_root, 0};
+        check(c.receipts_root == *t.next_receipts_root(c1.id, ids), "(c) c's receipts_root is the tree's fold over its carried id");
+        const std::vector<pb::CarriedPlacement> cp{{ids[0], P.d_min, 0, true}};
+        check(place_complete(t, c, cp) && t.find(c.id)->H == 1001, "(c) H(c) = h(c) = 1001, not the carried 1003");
+        check(t.place(on_tip(t, cid(4, 2), c.id, 1002), {}).verdict == pb::PlaceVerdict::Placed,
               "(c) the next carrier at 1002 is a carrier (H was not raised)");
         check(pb::record_height(1001, 1001) == 1001, "(c) the record reads carrier heights only");
     }

@@ -177,7 +177,7 @@ DepthPasses two_chain(const pb::LaneParams& p, int trials, std::uint64_t seed, s
 
 // A carrier on a held tip, with the receipts_root it commits there.
 pb::CarrierAnnounce on_tip(const pb::CarrierTree& t, const pb::Hash32& id, const pb::Hash32& tip, std::uint64_t h) {
-    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip).value_or(pb::Hash32{}), 0};
+    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip, {}).value_or(pb::Hash32{}), 0};
 }
 
 }  // namespace
@@ -383,7 +383,7 @@ int main() {
         for (std::uint64_t i = 1; i <= 40; ++i) {
             pb::Hash32 id = seq32(0x40);
             id[0] = static_cast<std::uint8_t>(i);
-            t.place(on_tip(t, id, tip, 1000 + i / 12));
+            t.place(on_tip(t, id, tip, 1000 + i / 12), {});
             tip = id;
         }
         const std::uint64_t h_tip = t.find(tip)->h;
@@ -392,7 +392,7 @@ int main() {
         for (std::uint64_t dh = 0; dh <= 2; ++dh) {
             pb::Hash32 id = seq32(0x90);
             id[0] = static_cast<std::uint8_t>(0x90 + dh);
-            same = same && t.place(on_tip(t, id, tip, h_tip + dh)).verdict == pb::PlaceVerdict::Placed
+            same = same && t.place(on_tip(t, id, tip, h_tip + dh), {}).verdict == pb::PlaceVerdict::Placed
                    && t.find(id)->d == d;
         }
         check(same, "h(tip), +1, +2 on one tip: one d");
@@ -422,7 +422,7 @@ int main() {
             pb::Hash32 id = seq32(0x60);
             id[0] = static_cast<std::uint8_t>(i);
             const std::uint64_t h = pred.back().H + i / 12;
-            cont = cont && lane.place(on_tip(lane, id, tip, h)).verdict == pb::PlaceVerdict::Placed
+            cont = cont && lane.place(on_tip(lane, id, tip, h), {}).verdict == pb::PlaceVerdict::Placed
                    && lane.find(id)->d == pb::retarget(P, joined);
             joined.push_back(pb::RetargetEntry{lane.find(id)->d, lane.find(id)->H});
             tip = id;
