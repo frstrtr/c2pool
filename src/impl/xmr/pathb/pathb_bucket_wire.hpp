@@ -55,7 +55,7 @@
 //   per entry, before its rows are allocated:
 //     the server's next (bin, row_first); bin <= bin_hi;
 //     leaf_index = bin - b0 < leaf_count;
-//     bin_lo == bin_hi == b0 + leaf_index;
+//     bin_lo == b0 + leaf_index;
 //     the MMR proof of its LeafPayload verifies;
 //     rows_total <= raw_sum / d_min, rows_total == 0 iff raw_sum == 0;
 //     rows_total equal on every page of the bin;
@@ -524,7 +524,7 @@ enum class BucketsFault : std::uint8_t {
     RefOrder,      // references not strictly ascending by identity
     RefPoint,      // a reference key does not decompress
     BinRange,      // an entry beyond bin_hi
-    LeafIndex,     // bin below b0 or not a leaf at leaf_count(at); bin_lo != b0 + leaf_index; bin_hi != bin_lo
+    LeafIndex,     // bin below b0 or not a leaf at leaf_count(at); bin_lo != b0 + leaf_index
     Proof,         // the MMR proof of the LeafPayload fails
     RowsTotal,     // rows_total against raw_sum / d_min
     Order,         // the entry is not the server's next (bin, row_first)
@@ -608,7 +608,6 @@ public:
             if (nx.bin < b0_ || nx.bin - b0_ >= v.leaf_count) return refuse(src, BucketsFault::LeafIndex);
             const std::uint64_t leaf_index = nx.bin - b0_;
             if (e.payload.bin_lo != b0_ + leaf_index) return refuse(src, BucketsFault::LeafIndex);
-            if (e.payload.bin_hi != e.payload.bin_lo) return refuse(src, BucketsFault::LeafIndex);
             if (!mmr_verify(root, mmr_leaf_of(e.payload), wire_proof(leaf_index, v.leaf_count, e.path, v.peaks)))
                 return refuse(src, BucketsFault::Proof);
             if (!rows_total_ok(e.payload, e.rows_total)) return refuse(src, BucketsFault::RowsTotal);

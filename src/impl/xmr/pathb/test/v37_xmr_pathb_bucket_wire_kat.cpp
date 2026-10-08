@@ -534,8 +534,9 @@ void lying_vectors() {
         two.bin_hi = kB0 + 1;
         const Forged t = forge({two});
         const pb::GetBuckets tq{kChain, seq32(0x69), kB0, kB0};
-        check(refused(one(tq, enc(reply_of(t, tq.at, 0, 1, {ka})), t.anchor), pb::BucketsFault::LeafIndex),
-              "a leaf with bin_hi != bin_lo -> LeafIndex");
+        const pb::FrameOutcome to = one(tq, enc(reply_of(t, tq.at, 0, 1, {ka})), t.anchor);
+        check(refused(to, pb::BucketsFault::Bucket) && to.bucket == pb::BucketFault::BinRange,
+              "a leaf with bin_hi != bin_lo -> the completed bucket fails (BinRange)");
     }
     // rows_total against raw_sum / d_min, before any row is allocated
     {
