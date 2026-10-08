@@ -17,7 +17,9 @@
 //   outcome (CoinbaseCheck, pathb_receipt_admission.hpp): Fused at hf >= 17
 //     (amount_fork_fused) before anything is built; Defer when the window of
 //     (tip, v) (WindowAt bound to the receipt's tip and hf) or a payee's key
-//     reference is not held; Undefined when side_data_v3 does not
+//     reference is not held, or the Window is not an evaluated window
+//     (empty_finder_only != no payees); finder-only only on
+//     Window.empty_finder_only; Undefined when side_data_v3 does not
 //     encode, the window weights != W or the receipt's payee identity does not
 //     match its reference; Mismatch / Match from the fold. [C41]
 //   hf >= 17 (format only): two equal Ko -> Unbuildable (carrot_order_refusal).
@@ -96,9 +98,13 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
     const Window& w = *at.window;
     std::vector<Hash32> ids;
     std::vector<std::uint64_t> amounts;
-    const bool finder_only = w.weight.empty();
+    const bool finder_only = w.empty_finder_only;
     if (finder_only) {
-        // empty window: one output of R to the receipt's own payee (D:621-622).
+        // a window with no entries: one output of R to the receipt's own payee.
+        if (!w.weight.empty()) {
+            out.stop = CoinbaseCheck::Defer;  // not an evaluated window of (tip, v)
+            return out;
+        }
         if (key_ref_identity(r.payee) != r.side.payee) {
             out.stop = CoinbaseCheck::Undefined;
             return out;
@@ -106,6 +112,10 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
         ids.push_back(r.side.payee);
         amounts.push_back(r.reward_total);
     } else {
+        if (w.weight.empty()) {
+            out.stop = CoinbaseCheck::Defer;  // no evaluated window of (tip, v): never finder-only
+            return out;
+        }
         const std::vector<SplitOutput> outs = hf16_outputs(r.reward_total, w);
         if (outs.empty()) {
             out.stop = CoinbaseCheck::Undefined;  // window weights != W

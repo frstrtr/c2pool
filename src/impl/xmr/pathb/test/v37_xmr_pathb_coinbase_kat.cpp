@@ -278,7 +278,7 @@ int main() {
 
     // ---- finder-only path (empty window): one output of R with mm_root_of(side_data_v3) ----
     {
-        const pb::Window wf;
+        const pb::Window wf = finder_only_window();
         pb::ReceiptBodyV3 f = make_body(3, /*with_owner=*/true, 0x23);
         f.reward_total = R;
         commit(f, wf);
@@ -434,7 +434,7 @@ int main() {
         ok_bin.entries.push_back(entry_of(make_body(3, true, 0x50), 2000000, 3));
         const pb::Window w_ok = pb::window({ok_bin}, 1000000000ull, base, /*f_spend=*/1, 3747, au);
         check(weights_sum(w_ok) == w_ok.W && !pb::split(R, w_ok).empty(), "valid window: weights sum to W");
-        const pb::Window wf;
+        const pb::Window wf = finder_only_window();
         for (const Case c : cases) {
             for (const pb::Window* win : {&w_ok, &wf}) {
                 pb::ReceiptBodyV3 x = make_body(3, true, 0x40);

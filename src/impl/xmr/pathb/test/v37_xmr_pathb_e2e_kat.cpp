@@ -20,7 +20,8 @@
 // chain (bins open, mixed and sealed at three tips: one window) -> split ->
 // Sum == R, the amounts pinned; the receipt-level miner tx bytes from windows
 // built by the store (finder-only and the two-payee window) through the
-// (tip, v) cache and its WindowAt.
+// (tip, v) cache and its WindowAt; finder-only only on Window.empty_finder_only
+// (a Window with no payee and no flag, or a flag with payees -> Defer).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <span>
@@ -209,6 +210,41 @@ static void store_path() {
                       == pb::CoinbaseCheck::Defer,
               "store e2e window: the cache's WindowAt for another tip -> Defer");
     }
+    // finder-only only on Window.empty_finder_only: a Window that is not an
+    // evaluated window never takes the finder-only branch.
+    {
+        pb::ReceiptBodyV3 xf = r;  // commits the finder-only coinbase of X (tree_root 9ad49240..)
+        xf.blob.tree_root = h32("9ad4924071b1223f57f0d48632d8c9ab75443e831af7f32873a8d831fe7bc9b8");
+        pb::KeyCache cache;
+        const pb::Window fo = finder_only_window();
+        check(pb::canonical_coinbase_check(xf, at_of(&fo, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Match,
+              "finder-only flag: the finder-only coinbase -> Match");
+        // a list whose newest bin is sealed and fails W_max on its own: no window.
+        pb::WinEntry small, big;
+        small.miner = idX;
+        small.work = 18180;
+        small.id = id_of(0x5001);
+        big.miner = idY;
+        big.work = 1000000000000ull;
+        big.id = id_of(0x5002);
+        const pb::L1Bucket sealed = pb::seal_from_entries(5, {small, big});
+        std::vector<pb::WinBin> bins(1);
+        bins[0].bin = 5;
+        bins[0].sealed = &sealed;
+        const pb::Window cut = pb::window(bins, pb::DNet{1} << 100, B, pb::f_spend(B, 300000, 16), 3747,
+                                          pb::key_ref_identity(author));
+        check(cut.weight.empty() && !cut.empty_finder_only,
+              "a cut inside a sealed bin: window() gives no payee and no finder-only flag");
+        check(pb::canonical_coinbase_check(xf, at_of(&cut, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Defer,
+              "a Window with no payee and no finder-only flag -> Defer, never the finder-only Match");
+        pb::Window odd = window_of({{idX, 120000}, {idY, 100000}});
+        odd.empty_finder_only = true;
+        check(pb::canonical_coinbase_check(xf, at_of(&odd, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Defer,
+              "a finder-only flag on a Window with payees -> Defer");
+    }
 }
 
 int main() {
@@ -324,7 +360,7 @@ int main() {
           "e2e receipt: mm_root_of(side_data_v3)");
     {
         pb::KeyCache cache;
-        const pb::Window empty;
+        const pb::Window empty = finder_only_window();
         const pb::CanonicalTx f = pb::canonical_miner_tx(r, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache,
                                                          book.lookup(), author);
         check(f.tx && f.tx->prefix.size() == 127

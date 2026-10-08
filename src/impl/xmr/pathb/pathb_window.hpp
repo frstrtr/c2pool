@@ -54,7 +54,7 @@
 
 namespace c2pool::xmr::pathb {
 
-// COVERAGE (K09, ruling 19 R-C1): a unit of work is paid in 2 blocks on average.
+// COVERAGE (K09, ruling 19 R-C1).
 inline constexpr std::uint64_t kCoverage = 2;
 
 // D_net (D2.13): u128; COVERAGE x D_net is compared with the window work in U256.

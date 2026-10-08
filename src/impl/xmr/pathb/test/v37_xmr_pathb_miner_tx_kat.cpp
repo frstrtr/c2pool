@@ -401,7 +401,7 @@ void key_cache() {
 
     // the genesis tip (empty window), one P_r, payees X != Y: keys per payee.
     {
-        const pb::Window empty;
+        const pb::Window empty = finder_only_window();
         pb::KeyCache cache;
         pb::ReceiptBodyV3 rx = receipt(0x60, 600000000000ull, p_r);
         pb::ReceiptBodyV3 ry = receipt(0x61, 600000000000ull, p_r);
@@ -432,7 +432,7 @@ void key_cache() {
     {
         auto run = [&](std::size_t budget, std::vector<pb::CoinbaseCheck>& seq, std::vector<pb::Hash32>& hashes) {
             pb::KeyCache cache(budget);
-            const pb::Window empty;
+            const pb::Window empty = finder_only_window();
             for (int i = 0; i < 6; ++i) {
                 const pb::Hash32 pr = (i % 2) ? p_r : p_r_race;
                 pb::ReceiptBodyV3 r = receipt(static_cast<std::uint8_t>(0x70 + (i % 3)), 600000000000ull + i, pr);
@@ -464,7 +464,7 @@ void key_cache() {
     {
         const std::size_t one = pb::KeyCache::entry_bytes(1);
         pb::KeyCache cache(2 * one);
-        const pb::Window empty;
+        const pb::Window empty = finder_only_window();
         std::vector<pb::ReceiptBodyV3> rs;
         for (std::uint8_t s = 0; s < 3; ++s) {
             pb::ReceiptBodyV3 r = receipt(static_cast<std::uint8_t>(0x80 + s), 600000000000ull, p_r);
@@ -563,7 +563,7 @@ void outcomes() {
     }
     {
         // finder-only with a payee identity that is not its reference's.
-        const pb::Window empty;
+        const pb::Window empty = finder_only_window();
         pb::ReceiptBodyV3 f = make_body(3, false, 0x41);
         commit_miner_tx(f, empty, f.side.tip, f.blob.prev_id, kKatHeight, book, author);
         pb::KeyCache c2;

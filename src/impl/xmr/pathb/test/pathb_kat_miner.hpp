@@ -99,6 +99,13 @@ inline pb::Window window_of(const std::vector<std::pair<pb::Hash32, std::uint64_
     return out;
 }
 
+// The evaluated window with no entries (window() step 6): finder-only.
+inline pb::Window finder_only_window() {
+    pb::Window w;
+    w.empty_finder_only = true;
+    return w;
+}
+
 // The WindowAt of a window evaluated for (tip, v).
 inline pb::WindowAt at_of(const pb::Window* w, const pb::Hash32& tip, std::uint8_t v) {
     pb::WindowAt at;

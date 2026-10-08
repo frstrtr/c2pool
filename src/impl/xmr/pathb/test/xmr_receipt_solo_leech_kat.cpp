@@ -38,7 +38,7 @@ int main() {
     const pb::XmrKeyRef author = kat_author();
     RefBook book;
     const pb::RefLookup refs = book.lookup();
-    const pb::Window empty;
+    const pb::Window empty = finder_only_window();
     pb::KeyCache cache;
 
     // #12 of a receipt on its own tip and P_r at h = kKatHeight.
