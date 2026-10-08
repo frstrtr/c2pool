@@ -2708,12 +2708,15 @@ private:
         // floor is a RAINDROP, not invalid PoW. With drops_floor_diff == 0 this
         // branch does not exist and the invalid path below is master's.
         if (m_o.drops_floor_diff && meets_share_diff(pow, m_o.drops_floor_diff)) {
+            bool fresh = false;
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
                 if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
+                fresh = drop_note_new_locked(it.id);   // in m_drop_seen before it leaves m_inflight
                 m_inflight.erase(it.id);
             }
             if (m_test_drop_pow_hook) m_test_drop_pow_hook(it.id);
+            if (!fresh) { m_st.drops_dup++; return; }
             admit_drop(std::move(it), ctx->height, pow);
             return;
         }
@@ -2796,15 +2799,18 @@ private:
     // ★ DROPS: raindrop dedup (a bounded FIFO set, separate from the receipt
     // cache so a raindrop can never enter a lane order or a repair answer).
     bool drop_seen_locked(const bytes32& id) const { return m_drop_seen.count(id) != 0; }
-    bool drop_note_new(const bytes32& id) {
-        std::lock_guard<std::mutex> lk(m_mtx);
+    bool drop_note_new_locked(const bytes32& id) {
         if (!m_drop_seen.insert(id).second) return false;
         m_drop_order.push_back(id);
         while (m_drop_order.size() > m_o.drops_seen_max) { m_drop_seen.erase(m_drop_order.front()); m_drop_order.pop_front(); }
         return true;
     }
+    bool drop_note_new(const bytes32& id) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return drop_note_new_locked(id);
+    }
+    // `it.id` is noted new by the caller (drop_note_new_locked).
     void admit_drop(Item it, u64 bin, const bytes32& pow) {
-        if (!drop_note_new(it.id)) { m_st.drops_dup++; return; }
         Admitted a;
         a.id = it.id; a.r = std::move(it.r); a.raw = std::move(it.raw); a.bin = bin; a.own = false;
         a.drop = true; a.pow = pow;
