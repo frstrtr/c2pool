@@ -2,10 +2,10 @@ name: TLA model check
 
 # Runs TLC on the Path B TLA+ models in proto/tla/ (PathBRatchet.tla and
 # PathBSealRNP.tla) so a change that breaks a modelled invariant fails the PR.
-# Per-PR configs use the small model bounds (L 4 / GRACE 6 / TIMEOUT 9; a few
-# minutes). The exhaustive runs are manual/nightly (TLC_LONG=1; see
-# proto/tla/README.md). Path-scoped to proto/tla/**, so it adds zero load to
-# any coin lane.
+# Per-PR configs use the small model bounds (L 4 / GRACE 6 / TIMEOUT 9; about
+# 18 minutes on 4 workers). The extended runs (TLC_LONG=1; see proto/tla/README.md) run on
+# the nightly schedule and on manual dispatch. Path-scoped to proto/tla/** on
+# push and PR, so it adds zero load to any coin lane.
 
 on:
   push:
@@ -18,6 +18,9 @@ on:
     paths:
       - 'proto/tla/**'
       - '.github/workflows/tla-model-check.yml'
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -35,6 +38,7 @@ jobs:
     # Self-hosted for trusted events; fork PRs fall back to GitHub-hosted
     # (never run untrusted fork code self-hosted) -- the proto-harness.yml pattern.
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +53,8 @@ jobs:
           echo "$TLA_TOOLS_SHA256  tla2tools.jar" | sha256sum -c -
 
       - name: PathBRatchet.tla
+        env:
+          TLC_LONG: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '0' }}
         run: sh proto/tla/check-ratchet.sh "$PWD/tla2tools.jar" "$RUNNER_TEMP/tlc-ratchet"
 
       - name: PathBSealRNP.tla

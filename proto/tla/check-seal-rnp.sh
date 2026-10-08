@@ -5,7 +5,9 @@
 #
 # Configs (two nodes, four receipt ids; a few minutes), one verdict line per run:
 #   GREEN (every seal invariant + Agreement + HonestAccepted + ChainRuledValid +
-#          RecordIsCarrierMax):          V1_rnp_own_n2r4 V1_rnp_carriage_n2r4
+#          RecordIsCarrierMax; no error, the whole space explored, distinct
+#          states and depth at or above the floor given on its line):
+#                                        V1_rnp_own_n2r4 V1_rnp_carriage_n2r4
 #   controls (the named invariant is violated):
 #          V1_rnp_neg_openlocal_n2r4   Agreement
 #          V1_rnp_neg_omitlocal_n2r4   Agreement
@@ -46,8 +48,18 @@ expect() {
 
 OK='No error has been found'
 
-run V1_rnp_own_n2r4;      expect V1_rnp_own_n2r4      "$OK"
-run V1_rnp_carriage_n2r4; expect V1_rnp_carriage_n2r4 "$OK"
+# green <cfg> <min distinct> <min depth>: no error, an empty queue at the end,
+# and at least <min distinct> distinct states at a depth of at least <min depth>.
+green() {
+    log="$OUT/$1.log"
+    ds=$(sed -n 's/.* \([0-9][0-9]*\) distinct states found, 0 states left on queue.*/\1/p' "$log" | tail -1)
+    dp=$(sed -n 's/.*depth of the complete state graph search is \([0-9][0-9]*\).*/\1/p' "$log" | tail -1)
+    if grep -q "$OK" "$log" && [ "${ds:-0}" -ge "$2" ] && [ "${dp:-0}" -ge "$3" ]; then v=PASS; else v=FAIL; FAIL=1; fi
+    echo "$v $1 expect='$OK' distinct=${ds:-?}>=$2 depth=${dp:-?}>=$3 log=$log"
+}
+
+run V1_rnp_own_n2r4;      green V1_rnp_own_n2r4      184907 17
+run V1_rnp_carriage_n2r4; green V1_rnp_carriage_n2r4 184907 17
 
 run V1_rnp_neg_openlocal_n2r4;      expect V1_rnp_neg_openlocal_n2r4      'Invariant Agreement is violated'
 run V1_rnp_neg_omitlocal_n2r4;      expect V1_rnp_neg_omitlocal_n2r4      'Invariant Agreement is violated'
