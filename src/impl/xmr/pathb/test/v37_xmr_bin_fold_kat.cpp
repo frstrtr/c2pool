@@ -43,6 +43,7 @@ static pb::Hash32 rep(std::uint8_t b) { pb::Hash32 h{}; h.fill(b); return h; }
 //   V11 side-branch seal: the side view's mmr_root_at == a fresh node's root
 //   P-2 miner_count = distinct row.miner, rows with w_miner 0 included
 // ---------------------------------------------------------------------------
+#include <exception>
 #include <optional>
 #include <string>
 
@@ -110,6 +111,16 @@ std::size_t count_id(const std::vector<const pb::Placement*>& v, const pb::Hash3
 
 }  // namespace
 
+// A vector that throws (a broken store invariant) fails by name instead of aborting the KAT.
+template <class Body>
+static void run_vector(const char* name, Body&& body) {
+    try {
+        body();
+    } catch (const std::exception& e) {
+        check(false, std::string(name) + ": exception " + e.what());
+    }
+}
+
 static void s3b_store_vectors() {
     const pb::LaneParams P = pb::kRuledLaneParams;
     const std::uint64_t F = P.open_bins;  // 96
@@ -122,7 +133,7 @@ static void s3b_store_vectors() {
           "store chain: fold at f = 1152, H(f) = b + 96 exactly, H(f - 1) = b + 95");
 
     // ---- V1 / V5 / V6 on one best chain: positions 1 .. 1180, h = b0 + pos / 12 ----
-    {
+    run_vector("V1 / V5 / V6 on one best chain: positions 1 .. 1180, h = b0 + pos / 12", [&] {
         pb::BinStore s(P, kB0, kJ, idn(0xC0, 0), h_at(0));
         const pb::Placement p1 = rcpt(idn(0xA1, 1), b, 9, rep(0x11), 30000);   // q 10: H(9) = b0, live
         const pb::Placement p2 = rcpt(idn(0xA1, 2), b, 5, rep(0x12), 25000);   // q 50, tip at 4: live
@@ -185,7 +196,7 @@ static void s3b_store_vectors() {
         check(v.mmr_root_at(1151) == pb::Hash32{} && v.mmr_root_at(1152) != pb::Hash32{}
                       && v.mmr_root_at(1152) == *s.best_mmr().prefix_root(1),
               "mmr_root_at(t) = the root over lc(H(t)) leaves (zero before the first seal)");
-    }
+    });
     {
         // a bin below b0 is refused by the store (no leaf would ever commit it).
         pb::BinStore s(P, kB0, kJ, idn(0xC9, 0), kB0);
@@ -195,7 +206,7 @@ static void s3b_store_vectors() {
     }
 
     // ---- V2 dedup and rewind ----
-    {
+    run_vector("V2 dedup and rewind", [&] {
         pb::BinStore s(P, kB0, kJ, idn(0xD0, 0), kB0);
         const pb::Placement r = rcpt(idn(0xA2, 1), kB0, 1, rep(0x21), 30000);
         bool ok = true;
@@ -221,10 +232,10 @@ static void s3b_store_vectors() {
               "V2 the same id Accepted again after the rewind (S:430-432)");
         check(s.view_at(idn(0xD0, 5)).status() == pb::ViewStatus::Ok && s.view_at(idn(0xD0, 5)).placed_open(r.id),
               "V2 the abandoned branch still sees its own placement");
-    }
+    });
 
     // ---- V3 FR-B1 gap: dense MMR (E-8) ----
-    {
+    run_vector("V3 FR-B1 gap: dense MMR (E-8)", [&] {
         pb::BinStore s(P, kB0, kJ, idn(0xF0, 0), kB0);
         const pb::Hash32 aa = rep(0xAA);
         bool ok = extend(s, idn(0xF0, 1), idn(0xF0, 0), kB0, {rcpt(idn(0xA3, 1), kB0, 1, aa, 18180)}, true);
@@ -250,10 +261,10 @@ static void s3b_store_vectors() {
         check(e != nullptr && e->bucket.rows.empty() && e->bucket.raw_sum.is_zero() && e->bucket.d_min == 0
                       && e->bucket.miner_count == 0 && e->bucket.comp_root_v == pb::Hash32{},
               "V3 the empty bin's LeafPayload: raw_sum 0, miner_count 0, d_min 0, comp_root zero");
-    }
+    });
 
     // ---- V4 dead-only bin ----
-    {
+    run_vector("V4 dead-only bin", [&] {
         pb::BinStore s(P, kB0, kJ, idn(0xF4, 0), kB0);
         bool ok = extend(s, idn(0xF4, 1), idn(0xF4, 0), kB0,
                          {rcpt(idn(0xA4, 1), kB0, 1, rep(0xBB), 80000), rcpt(idn(0xA4, 2), kB0, 1, rep(0xCC), 80000)},
@@ -287,10 +298,10 @@ static void s3b_store_vectors() {
         const pb::Window w = pb::window(bins, /*D_net=*/1000000000ull, B, /*f_spend=*/B / 4, /*N=*/100, pb::Hash32{});
         check(w.W == pb::Work(240000) && pb::detail_win::payee_count(w) == 3,
               "V4 window over the sealed views: W 240,000, 3 payees");
-    }
+    });
 
     // ---- V7 reorg across a fold ----
-    {
+    run_vector("V7 reorg across a fold", [&] {
         const pb::Placement r1 = rcpt(idn(0xA7, 1), kB0, 1, rep(0x21), 30000);
         const pb::Placement r2 = rcpt(idn(0xA7, 2), kB0, 1, rep(0x22), 40000);
         const pb::Placement r3 = rcpt(idn(0xA7, 3), kB0, 1, rep(0x23), 50000);
@@ -318,10 +329,10 @@ static void s3b_store_vectors() {
         check(x && y && pb::encode_bleaf(*x) == pb::encode_bleaf(*y), "V7 ... and the bucket bytes");
         check(s.switch_best(idn(0x70, 2)) == pb::SwitchVerdict::Switched && *s.best_mmr().leaf(0) == leaf_a,
               "V7 switching back re-seals branch A's leaf");
-    }
+    });
 
     // ---- V8 cross-check of a bucket against its rows ----
-    {
+    run_vector("V8 cross-check of a bucket against its rows", [&] {
         std::vector<pb::Placement> xs = {rcpt(idn(0xA8, 1), kB0, 1, rep(0x31), 30000, 100, 10, rep(0x51)),
                                          rcpt(idn(0xA8, 2), kB0, 1, rep(0x32), 20000)};
         const pb::L1Bucket good = bucket_of(xs, kB0, 1);
@@ -349,10 +360,10 @@ static void s3b_store_vectors() {
         bad.bin_hi = bad.bin_lo + 1;
         check(pb::bucket_check(bad) == pb::BucketFault::BinRange, "V8 bin_lo != bin_hi fails");
         check(pb::bucket_consistent(pb::seal_from_entries(kB0, {})), "V8 the empty bucket is consistent");
-    }
+    });
 
     // ---- P-2 miner_count (ruling 31) ----
-    {
+    run_vector("P-2 miner_count (ruling 31)", [&] {
         // one miner with two owners -> two rows, one miner; a row whose w_miner is 0 is counted.
         const pb::L1Bucket two_owner = bucket_of({rcpt(idn(0xA9, 1), kB0, 1, rep(0x41), 30000, 100, 0, rep(0x61)),
                                                   rcpt(idn(0xA9, 2), kB0, 1, rep(0x41), 30000, 200, 0, rep(0x62)),
@@ -367,10 +378,10 @@ static void s3b_store_vectors() {
         for (const pb::BucketRow& r : zero_w.rows) has_zero = has_zero || r.w_miner.is_zero();
         check(has_zero && zero_w.miner_count == 2, "P-2 a row with w_miner 0 (p + give_author_bp = 10000) is counted");
         check(pb::bucket_consistent(two_owner) && pb::bucket_consistent(zero_w), "P-2 both buckets consistent");
-    }
+    });
 
     // ---- V9 sibling race: shared receipt, orphan re-carry ----
-    {
+    run_vector("V9 sibling race: shared receipt, orphan re-carry", [&] {
         pb::BinStore s(P, kB0, kJ, idn(0x90, 0), kB0);
         bool ok = extend(s, idn(0x90, 1), idn(0x90, 0), kB0, {}, true);
         const pb::Hash32 c1 = idn(0x9F, 2), c2 = idn(0x91, 2), c3 = idn(0x91, 3);  // c2 < c1
@@ -402,10 +413,10 @@ static void s3b_store_vectors() {
               "V9 r placed once on the new best chain; the orphan c1 credited once");
         check(!s.view_at(idn(0x90, 1)).placed_open(r.id) && s.view_at(c1).placed_open(r.id),
               "V9 each branch reads its own placements");
-    }
+    });
 
     // ---- V10 deep fork: DEFER, never a verdict ----
-    {
+    run_vector("V10 deep fork: DEFER, never a verdict", [&] {
         const std::uint64_t J = 8;
         pb::BinStore s(P, kB0, J, idn(0x10, 0), kB0);
         bool ok = true;
@@ -430,10 +441,10 @@ static void s3b_store_vectors() {
         check(s.add_carrier(idn(0x1C, 1), idn(0x77, 0), kB0) == pb::AddVerdict::ParentUnknown
                       && pb::add_defers(pb::AddVerdict::ParentUnknown),
               "V10 an unknown parent DEFERs");
-    }
+    });
 
     // ---- V11 side-branch seal ----
-    {
+    run_vector("V11 side-branch seal", [&] {
         const pb::Placement r = rcpt(idn(0xAD, 1), kB0, 1, rep(0x91), 30000);
         pb::BinStore s(P, kB0, kJ, idn(0x20, 0), kB0);
         bool ok = extend(s, idn(0x20, 1), idn(0x20, 0), kB0, {r}, true);
@@ -451,7 +462,7 @@ static void s3b_store_vectors() {
         const pb::SealedBin* sb = side.bucket(kB0);
         check(sb != nullptr && sb->bucket.raw_sum == pb::Work(30000) && s.view_at(idn(0x20, 2)).bucket(kB0) == nullptr,
               "V11 the side bucket is read through the side view only");
-    }
+    });
 }
 
 int main() {

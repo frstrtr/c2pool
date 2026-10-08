@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <optional>
 #include <string>
@@ -637,9 +638,19 @@ static void s3b_lane_record_vectors() {
     }
 }
 
+// A part that throws (a broken invariant) fails by name instead of aborting the KAT.
+template <class Body>
+static void run_part(const char* name, Body&& body) {
+    try {
+        body();
+    } catch (const std::exception& e) {
+        check(false, std::string(name) + ": exception " + e.what());
+    }
+}
+
 int main() {
     master_goldens();
-    s3b_mmr_vectors();
-    s3b_lane_record_vectors();
+    run_part("MMR vectors", s3b_mmr_vectors);
+    run_part("lane record vectors", s3b_lane_record_vectors);
     return finish("v37_xmr_mmr_golden_kat");
 }
