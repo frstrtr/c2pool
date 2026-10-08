@@ -5,14 +5,16 @@
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
 // v37_xmr_fairness_schedules_kat (pathb_window.hpp, C39): under the no-decay,
-// proportional window rule a miner's share of R equals its share of the window
-// work, within 0.003, for steady / pulser / hopper / part-time schedules. (The
+// proportional window rule a miner's share of R equals its share of the
+// schedule's work (summed from the bins, every bin inside the window), within
+// 0.003, for steady / pulser / hopper / part-time schedules. (The
 // window pays floor(R w_i / W) + largest remainder, so the deviation is below
 // one atomic unit per payee -- far inside the 0.003 fairness band.)
 // ---------------------------------------------------------------------------
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_window.hpp"
@@ -34,16 +36,22 @@ static void check_fairness(const std::vector<pb::WinBin>& bins, const char* tag)
     const pb::Hash32 author{};
     const pb::Window w = pb::window(bins, /*D_net=*/1000000000000ull, B, /*f_spend=*/1, /*N=*/3747, author);
     const auto outs = pb::split(R, w);
-    // W as a double for the ratio comparison.
-    double Wd = 0;
-    for (const auto& [id, wt] : w.weight) Wd += static_cast<double>(wt.v[0]);
-    bool ok = true;
+    // the schedule's own work per miner over every bin (COVERAGE does not bind),
+    // summed here, not read from the window.
+    std::map<pb::Hash32, double> work;
+    double total = 0;
+    for (const pb::WinBin& b : bins)
+        for (const pb::WinEntry& x : b.entries) {
+            work[x.miner] += static_cast<double>(x.work);
+            total += static_cast<double>(x.work);
+        }
+    bool ok = outs.size() == work.size();
     for (const auto& o : outs) {
         const double share_paid = static_cast<double>(o.amount) / static_cast<double>(R);
-        const double share_work = static_cast<double>(w.weight.at(o.payee).v[0]) / Wd;
-        if (std::fabs(share_paid - share_work) > 0.003) ok = false;
+        const auto it = work.find(o.payee);
+        if (it == work.end() || std::fabs(share_paid - it->second / total) > 0.003) ok = false;
     }
-    check(ok, std::string("payout share == work share within 0.003: ") + tag);
+    check(ok, std::string("payout share == the schedule's work share within 0.003: ") + tag);
 }
 
 int main() {
