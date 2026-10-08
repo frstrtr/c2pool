@@ -14,7 +14,8 @@
 //   * a lane parameter (LaneParams, K-list id in the field comment);
 //   * a formula over the two above.
 //
-// Header-only. Not included by any running component.
+// Header-only. Included by the relay for the parked-list cap default; no other
+// running component.
 // ---------------------------------------------------------------------------
 #pragma once
 

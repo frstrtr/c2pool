@@ -246,12 +246,17 @@ and does not yet exist, so the work can be judged on what it actually is.
 ### CI / repo state
 - The v37 research line is merged to `master` (PR #809, "V37 dev"), and the v37
   engine consumer tree (`src/c2pool/v37/`, W1 to W6) and the isolated XMR Family-B lane
-  (`src/impl/xmr/`) now build behind CI on both build legs. Branch protection
-  requires the per-coin gates and the coin matrix (DASH / LTC / BCH / DGB / DOGE)
-  to pass before a merge; the CI badge above shows the state of the latest master
-  run. The RandomX-dependent XMR checks run CI-gated in light mode, and the
-  CodeQL security scan is a non-gating job. A few v37 relay and soak tests have
-  known timing flakes, tracked in issues #1885, #1889, #1890 and #1905.
+  (`src/impl/xmr/`) now build behind CI on both build legs. The checks required
+  before a merge to `master` are `attribution-gate`, the DASH gates G1 and G3a,
+  the BCH gates G3a and G3b, `PR path filter`, `PR platform coverage status` and
+  `Test allowlist drift-guard`. The coin matrix (DASH / LTC / BCH / DGB / DOGE),
+  the Linux x86_64 and ASan/UBSan legs and the other CI lanes are not required
+  checks; the CI badge above shows the state of the latest master run. The
+  RandomX-dependent XMR checks run CI-gated in light mode, and the CodeQL
+  security scan is a non-gating job. Three v37 relay KATs have known timing
+  flakes (#1885, #1889, #1890) and are retried up to 3 times; CI reports every
+  retry as a warning. `v37_convergence_soak` is an undiagnosed safety pin
+  (#1905) and is not retried.
 
 ### Provenance
 c2pool builds on ideas from p2pool but is an **independent codebase**. No outside

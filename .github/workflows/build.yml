@@ -318,6 +318,17 @@ jobs:
           # Suspenders: reject a hollow green where the report has < floor cases.
           bash "${GITHUB_WORKSPACE}/scripts/ci/test_floor_guard.sh" linux "${GITHUB_WORKSPACE}/ci-logs/ctest-linux.xml"
 
+      # cmake/RetryTest.cmake writes its attempt / RETRY lines only into the
+      # CTest log of a passing test: report them and keep the log on every run.
+      - name: Report ctest retries
+        if: always()
+        run: sh scripts/ci/report_test_retries.sh build_ci/Testing/Temporary/LastTest.log linux
+
+      - name: Upload ctest log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with: { name: ctest-log-linux, path: build_ci/Testing/Temporary/LastTest.log, retention-days: 7, if-no-files-found: ignore }
+
       # #1671: the default (BLS-OFF/stub) c2pool-dash must be HONEST about being
       # BLS-dark — `--version` says bls=stub, and it REFUSES a BLS-relying config
       # (--run --embedded-null-arm; the refuse-to-start gate lives on the --run
@@ -846,6 +857,17 @@ jobs:
         # swallows every case (or the tests fail to register), ctest REDs
         # instead of greening over an empty run.
         run: ctest --output-on-failure --no-tests=error -j8 --exclude-regex "LiveTest\."
+
+      # cmake/RetryTest.cmake writes its attempt / RETRY lines only into the
+      # CTest log of a passing test: report them and keep the log on every run.
+      - name: Report ctest retries
+        if: always()
+        run: sh scripts/ci/report_test_retries.sh build_asan/Testing/Temporary/LastTest.log linux-asan
+
+      - name: Upload ctest log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with: { name: ctest-log-linux-asan, path: build_asan/Testing/Temporary/LastTest.log, retention-days: 7, if-no-files-found: ignore }
 
       - name: Upload sanitizer test results on failure
         if: failure()

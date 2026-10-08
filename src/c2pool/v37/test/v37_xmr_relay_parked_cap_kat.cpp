@@ -6,7 +6,7 @@
 //
 //   P1  the default cap is open_bins x (1 + r_max) from the ruled lane params
 //       (the:K04, the:K08) = 1632 objects, not a literal.
-//   P2  a full-horizon parked set of exactly the cap is retained: none evicted,
+//   P2  a parked set of exactly the cap is retained: none evicted,
 //       RelayStats::queue_dropped stays 0.
 //   P3  the cap+1-th parked item evicts the oldest (FIFO): the size holds at
 //       the cap, queue_dropped == 1, the first id is gone, the rest are kept.
@@ -55,7 +55,7 @@ int main() {
     // P2: fill exactly the cap with distinct honest ids; none evicted.
     std::size_t sz = 0;
     for (std::size_t i = 0; i < cap; ++i) sz = node.test_park(id_of(i));
-    check(sz == cap, "full-horizon parked set of cap items is retained");
+    check(sz == cap, "a parked set of exactly the cap is retained");
     check(node.verify_parked_size() == cap, "parked size == cap after filling the cap");
     check(node.stats().queue_dropped.load() == 0u, "no eviction at or below the cap");
     check(node.test_parked_has(id_of(0)), "oldest (id 0) still parked at exactly the cap");
