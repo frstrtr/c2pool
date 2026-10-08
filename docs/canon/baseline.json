@@ -1,13 +1,16 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "e7c37353cb4f0ea2b6f7eba265e6865b3b1a3adf",
+  "commit": "481f6cf6640aaa936f961f7e53c0f69569622162",
   "rules": {
     "C01": {
       "checks": {
         "carrier-sharechain-kat": {
           "kats": {
-            "xmr_carrier_sharechain_kat": false
+            "xmr_carrier_sharechain_kat": true
           },
+          "status": "pass"
+        },
+        "pathb-in-force": {
           "status": "fail"
         }
       },
@@ -25,9 +28,9 @@
         },
         "receipt-id-dedup-kat": {
           "kats": {
-            "v37_xmr_receipt_id_kat": false
+            "v37_xmr_receipt_id_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -45,21 +48,21 @@
         },
         "freshness-kat": {
           "kats": {
-            "xmr_receipt_freshness_kat": false
+            "xmr_receipt_freshness_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "late-tail-bins": {
           "status": "fail"
         },
         "legally-dead-kat": {
           "kats": {
-            "xmr_receipt_legally_dead_kat": false
+            "xmr_receipt_legally_dead_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "liveness-delta": {
-          "status": "fail"
+          "status": "pass"
         },
         "no-hop-bound": {
           "count": 0,
@@ -144,6 +147,12 @@
             "xmr_e2e_kat": true
           },
           "status": "pass"
+        },
+        "pathb-exact-sum-kat": {
+          "kats": {
+            "v37_xmr_pathb_e2e_kat": true
+          },
+          "status": "pass"
         }
       },
       "status": "pass"
@@ -199,9 +208,9 @@
         },
         "retarget-kat": {
           "kats": {
-            "xmr_share_retarget_kat": false
+            "xmr_share_retarget_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "retarget-min-dh": {
           "status": "fail"
@@ -251,15 +260,15 @@
         },
         "output-gate-kat": {
           "kats": {
-            "xmr_coinbase_output_gate_kat": false
+            "xmr_coinbase_output_gate_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "reserve-kat": {
           "kats": {
-            "v37_xmr_coinbase_reserve_kat": false
+            "v37_xmr_coinbase_reserve_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -379,9 +388,9 @@
         },
         "window-split-kat": {
           "kats": {
-            "xmr_window_split_kat": false
+            "xmr_window_split_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -390,9 +399,9 @@
       "checks": {
         "legally-dead-kat": {
           "kats": {
-            "xmr_receipt_legally_dead_kat": false
+            "xmr_receipt_legally_dead_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "no-grace-timer": {
           "count": 3,
@@ -401,6 +410,9 @@
             "src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp": 2
           },
           "status": "fail"
+        },
+        "pathb-in-force": {
+          "status": "fail"
         }
       },
       "status": "fail"
@@ -408,7 +420,7 @@
     "C23": {
       "checks": {
         "grace": {
-          "status": "fail"
+          "status": "pass"
         },
         "headline-genesis": {
           "status": "fail"
@@ -420,17 +432,17 @@
         },
         "ratchet-kats": {
           "kats": {
-            "v37_xmr_ballot_kat": false,
-            "v37_xmr_epoch_kat": false,
-            "xmr_epoch_tally_kat": false
+            "v37_xmr_ballot_kat": true,
+            "v37_xmr_epoch_kat": true,
+            "xmr_epoch_tally_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "timeout": {
-          "status": "fail"
+          "status": "pass"
         },
         "vote-window": {
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -439,8 +451,11 @@
       "checks": {
         "epoch-accounting-kat": {
           "kats": {
-            "xmr_epoch_accounting_kat": false
+            "xmr_epoch_accounting_kat": true
           },
+          "status": "pass"
+        },
+        "pathb-in-force": {
           "status": "fail"
         }
       },
@@ -448,11 +463,17 @@
     },
     "C25": {
       "checks": {
+        "bin-fold-kat": {
+          "kats": {
+            "v37_xmr_bin_fold_kat": true
+          },
+          "status": "pass"
+        },
         "light-proof-kat": {
           "kats": {
-            "v37_xmr_mmr_golden_kat": false
+            "v37_xmr_mmr_golden_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "provable-work-kats": {
           "kats": {
@@ -466,9 +487,9 @@
         },
         "side-data-v3-kat": {
           "kats": {
-            "v37_xmr_side_data_v3_kat": false
+            "v37_xmr_side_data_v3_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "side-data-v3-struct": {
           "status": "fail"
@@ -484,14 +505,19 @@
         "donation-bp-default": {
           "status": "pass"
         },
-        "donation-marker-zero": {
-          "status": "pass"
+        "donation-marker-absent": {
+          "count": 5,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 3,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 2
+          },
+          "status": "fail"
         },
         "donation-split-kat": {
           "kats": {
-            "v37_xmr_donation_split_kat": false
+            "v37_xmr_donation_split_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "fee-kats": {
           "kats": {
@@ -531,9 +557,15 @@
         },
         "monero-rules-digest-kat": {
           "kats": {
-            "v37_xmr_monero_rules_digest_kat": false
+            "v37_xmr_monero_rules_digest_kat": true
           },
-          "status": "fail"
+          "status": "pass"
+        },
+        "pathb-hello-kat": {
+          "kats": {
+            "v37_xmr_pathb_hello_kat": true
+          },
+          "status": "pass"
         },
         "rules-digest-in-pool-tag": {
           "status": "pass"
@@ -610,8 +642,17 @@
       "checks": {
         "carrier-timestamp-kat": {
           "kats": {
-            "xmr_carrier_timestamp_kat": false
+            "xmr_carrier_timestamp_kat": true
           },
+          "status": "pass"
+        },
+        "header-rules-kat": {
+          "kats": {
+            "v37_xmr_receipt_header_rules_kat": true
+          },
+          "status": "pass"
+        },
+        "pathb-in-force": {
           "status": "fail"
         }
       },
@@ -666,9 +707,9 @@
         },
         "wide-int-extreme-kat": {
           "kats": {
-            "xmr_wide_int_extreme_kat": false
+            "xmr_wide_int_extreme_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -677,9 +718,9 @@
       "checks": {
         "carriage-kat": {
           "kats": {
-            "xmr_receipt_carriage_kat": false
+            "xmr_receipt_carriage_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "frame-count": {
           "status": "fail"
@@ -694,11 +735,11 @@
       "checks": {
         "coinbase-layout-kats": {
           "kats": {
-            "v37_xmr_base_reward_kat": false,
-            "v37_xmr_coinbase_extra_layout_kat": false,
-            "v37_xmr_coinbase_output_order_kat": false
+            "v37_xmr_base_reward_kat": true,
+            "v37_xmr_coinbase_extra_layout_kat": true,
+            "v37_xmr_coinbase_output_order_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "no-clear-pool-tag": {
           "count": 0,
@@ -722,14 +763,24 @@
           "per_file": {},
           "status": "pass"
         },
+        "pathb-coinbase-kats": {
+          "kats": {
+            "v37_xmr_pathb_coinbase_kat": true,
+            "v37_xmr_pathb_miner_tx_kat": true
+          },
+          "status": "pass"
+        },
+        "pathb-in-force": {
+          "status": "fail"
+        },
         "receipt-admission-coinbase-check": {
           "status": "fail"
         },
         "solo-leech-kat": {
           "kats": {
-            "xmr_receipt_solo_leech_kat": false
+            "xmr_receipt_solo_leech_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -738,9 +789,9 @@
       "checks": {
         "merge-back-kat": {
           "kats": {
-            "xmr_window_merge_back_kat": false
+            "xmr_window_merge_back_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "no-spend-floor-literal": {
           "count": 3,
@@ -760,10 +811,10 @@
         },
         "window-kats": {
           "kats": {
-            "xmr_window_kat": false,
-            "xmr_window_spend_floor_kat": false
+            "xmr_window_kat": true,
+            "xmr_window_spend_floor_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -772,13 +823,13 @@
       "checks": {
         "fairness-kats": {
           "kats": {
-            "v37_xmr_fairness_cap_kat": false,
-            "v37_xmr_fairness_schedules_kat": false
+            "v37_xmr_fairness_cap_kat": true,
+            "v37_xmr_fairness_schedules_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
-      "status": "fail"
+      "status": "pass"
     },
     "C40": {
       "checks": {},
@@ -791,13 +842,16 @@
           "per_file": {},
           "status": "pass"
         },
+        "pathb-in-force": {
+          "status": "fail"
+        },
         "window-branch-kats": {
           "kats": {
-            "v37_xmr_receipt_defer_kat": false,
-            "v37_xmr_window_branch_kat": false,
-            "v37_xmr_window_fork_height_kat": false
+            "v37_xmr_receipt_defer_kat": true,
+            "v37_xmr_window_branch_kat": true,
+            "v37_xmr_window_fork_height_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -806,8 +860,11 @@
       "checks": {
         "catchup-kat": {
           "kats": {
-            "xmr_template_catchup_kat": false
+            "xmr_template_catchup_kat": true
           },
+          "status": "pass"
+        },
+        "pathb-in-force": {
           "status": "fail"
         }
       },
@@ -817,12 +874,22 @@
       "checks": {
         "fork-choice-kats": {
           "kats": {
-            "v37_xmr_joiner_kat": false,
-            "xmr_carrier_sharechain_kat": false
+            "v37_xmr_joiner_kat": true,
+            "xmr_carrier_sharechain_kat": true
+          },
+          "status": "pass"
+        },
+        "journal-not-in-digest": {
+          "count": 1,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp": 1
           },
           "status": "fail"
         },
-        "journal-not-in-digest": {
+        "pathb-in-force": {
+          "status": "fail"
+        },
+        "pathb-rules-no-journal": {
           "count": 0,
           "per_file": {},
           "status": "pass"
@@ -878,15 +945,15 @@
         },
         "relay-horizons-kat": {
           "kats": {
-            "v37_xmr_relay_horizons_kat": false
+            "v37_xmr_relay_horizons_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "wire-cap-kat": {
           "kats": {
-            "v37_xmr_receipt_wire_cap_kat": false
+            "v37_xmr_receipt_wire_cap_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -906,6 +973,53 @@
         }
       },
       "status": "pass"
+    },
+    "C47": {
+      "checks": {},
+      "status": "n/a"
+    },
+    "C48": {
+      "checks": {
+        "base-reward-kat": {
+          "kats": {
+            "v37_xmr_base_reward_kat": true,
+            "v37_xmr_pathb_node_kat": false
+          },
+          "status": "fail"
+        },
+        "pathb-in-force": {
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C49": {
+      "checks": {
+        "pathb-in-force": {
+          "status": "fail"
+        },
+        "re-pend-kat": {
+          "kats": {
+            "v37_xmr_pathb_node_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C50": {
+      "checks": {
+        "no-private-line-cites": {
+          "count": 8,
+          "per_file": {
+            "src/impl/xmr/pathb/pathb_coinbase_split.hpp": 1,
+            "src/impl/xmr/pathb/pathb_miner_tx.hpp": 6,
+            "src/impl/xmr/pathb/pathb_receipt_admission.hpp": 1
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
     }
   }
 }
