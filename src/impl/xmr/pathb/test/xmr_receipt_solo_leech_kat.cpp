@@ -73,8 +73,9 @@ int main() {
     // ---- wrong stub: WRONG AMOUNT -> BAN before RandomX ----
     {
         pb::ReceiptBodyV3 bad = make_body(3, false, 0x20);
-        const pb::Hash32 key = pb::stub_output_key(tip, bad.blob.prev_id, bad.side.payee);
-        const pb::Hash32 wrong_leaf = pb::canonical_stub_leaf(bad.reward_total + 1, key, bad.extra_nonce);
+        pb::ReceiptBodyV3 other = bad;
+        other.reward_total = bad.reward_total + 1;
+        const pb::Hash32 wrong_leaf = pb::canonical_stub_leaf_of(other, tip, bad.blob.prev_id);
         bad.blob.tree_root = pb::tree_root_fold(wrong_leaf, std::span<const pb::Hash32>(bad.branch));
         check(!pb::canonical_coinbase_ok(bad, tip, bad.blob.prev_id), "wrong amount: coinbase NOT ok");
         bool rx_called = false;
@@ -88,8 +89,9 @@ int main() {
     {
         pb::ReceiptBodyV3 bad = make_body(3, false, 0x20);
         const pb::Hash32 foreign_payee = seq32(0x7E);  // not bad.side.payee
-        const pb::Hash32 key = pb::stub_output_key(tip, bad.blob.prev_id, foreign_payee);
-        const pb::Hash32 wrong_leaf = pb::canonical_stub_leaf(bad.reward_total, key, bad.extra_nonce);
+        pb::ReceiptBodyV3 other = bad;
+        other.side.payee = foreign_payee;
+        const pb::Hash32 wrong_leaf = pb::canonical_stub_leaf_of(other, tip, bad.blob.prev_id);
         bad.blob.tree_root = pb::tree_root_fold(wrong_leaf, std::span<const pb::Hash32>(bad.branch));
         check(!pb::canonical_coinbase_ok(bad, tip, bad.blob.prev_id), "wrong payee: coinbase NOT ok");
         bool rx_called = false;
@@ -107,6 +109,30 @@ int main() {
         const pb::TailResult t = pb::admit_coinbase_then_randomx(
                 pb::canonical_coinbase_ok(bad, tip, bad.blob.prev_id), [&] { rx_called = true; return true; });
         check(t.verdict == pb::AdmitVerdict::Ban && !rx_called, "garbage coinbase -> BAN, no RandomX");
+    }
+
+    // ---- side_data_v3 committed through mm_root: a field changed after the
+    // coinbase was built -> coinbase NOT ok -> BAN before RandomX ----
+    {
+        pb::ReceiptBodyV3 base = make_body(3, false, 0x20);
+        commit_canonical(base, base.side.tip, base.blob.prev_id);
+        check(pb::canonical_coinbase_ok(base, base.side.tip, base.blob.prev_id), "side committed: coinbase ok");
+        auto changed = [&](void (*mutate)(pb::SideDataV3&), const char* what) {
+            pb::ReceiptBodyV3 bad = base;
+            mutate(bad.side);
+            bool rx_called = false;
+            const pb::TailResult t = pb::admit_coinbase_then_randomx(
+                    pb::canonical_coinbase_ok(bad, bad.side.tip, bad.blob.prev_id), [&] { rx_called = true; return true; });
+            check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx_called, what);
+        };
+        changed([](pb::SideDataV3& s) { s.receipts_root[0] ^= 0x01; }, "receipts_root changed -> BAN before RandomX");
+        changed([](pb::SideDataV3& s) { s.window_root[0] ^= 0x01; }, "window_root changed -> BAN before RandomX");
+        changed([](pb::SideDataV3& s) { s.mmr_root[0] ^= 0x01; }, "mmr_root changed -> BAN before RandomX");
+        changed([](pb::SideDataV3& s) { s.pool_id[0] ^= 0x01; }, "pool_id changed -> BAN before RandomX");
+        changed([](pb::SideDataV3& s) { s.rules_epoch ^= 0x0001; }, "rules_epoch changed -> BAN before RandomX");
+        changed([](pb::SideDataV3& s) { s.ballot ^= 0x0001; }, "ballot changed -> BAN before RandomX");
+        changed([](pb::SideDataV3& s) { s.t_origin ^= 0x01; }, "t_origin changed -> BAN before RandomX");
+        changed([](pb::SideDataV3& s) { s.give_author_bp ^= 0x0001; }, "give_author_bp changed -> BAN before RandomX");
     }
 
     // ---- a correct coinbase but a failing PoW is a BAN at #15 (RandomX ran) ----
