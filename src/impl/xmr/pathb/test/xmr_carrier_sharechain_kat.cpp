@@ -7,16 +7,19 @@
 // src/impl/xmr/pathb/test/xmr_carrier_sharechain_kat.cpp
 // Carrier fork choice (pathb_fork_choice.hpp) with the retarget of
 // pathb_retarget.hpp, the journal of pathb_journal.hpp (J = 1,152), the
-// ratchet state and receipts_root fold of pathb_ratchet_state.hpp and the
-// headers-first decision of pathb_headers_first.hpp:
+// ratchet state and receipts_root fold of pathb_ratchet_state.hpp, the
+// carried_root fold of pathb_receipt_admission.hpp, rs_step_at of
+// pathb_ratchet_activation.hpp and the headers-first decision of
+// pathb_headers_first.hpp:
 //   (a) cum_work 3 x 2^63 against 2 x 2^63 + 2^62: the heavier wins; equal
 //       cum_work: the lower id, bytes compared from the first; on a tree:
 //       two equal branches -> the lower tip id, one more carrier -> heavier;
 //       work after the branch point decides as cum_work does;
-//   (b) a carrier whose parent is not held waits and is placed, with the
-//       carriers waiting behind it, when the parent arrives; a repeat is a
-//       duplicate; a waiting carrier below its parent's record is discarded
-//       with the carriers waiting on it;
+//   (b) a carrier whose parent is not held waits; when the parent is placed
+//       it is released (not placed), admitted again and placed, and the
+//       carrier waiting on it is released in turn; a repeat is a duplicate;
+//       a released carrier below its parent's record is not a carrier and
+//       the two-level chain waiting on it is discarded;
 //   (c) a heavier branch with a carrier lacking bodies, or not verified, is
 //       not taken; it is taken once that carrier is complete;
 //   (d) a heavier side branch forking 500 positions below the applied tip:
@@ -37,30 +40,62 @@
 //   (i) h(c) < H(parent) is not a carrier; two carriers of one tip at one
 //       height are both placed; each carrier's d equals the retarget over
 //       its own chain;
-//   (j) receipts_root fold (carried_root 0, ballots 0): genesis S = epoch 0,
-//       rules_cur = the genesis digest; after three carriers of d 18,180
-//       only `all` moves (54,540); the fourth carrier commits rs_root
-//       33c0bf81... and receipts_root 9c6c4c42... (the vector of
-//       v37_xmr_side_data_v3_kat); a wrong fold (a flipped bit, the state
-//       of another position, a non-zero carried_root) is FoldMismatch
-//       (strike) and not placed; a waiting carrier with a wrong fold is
-//       discarded with the carriers waiting on it when its parent arrives;
-//       a side header with a wrong fold is refused at that header; at
-//       x = (k + 1) L - 1 (L 5) the sums reset and level 0 is appended; a
-//       ballot epoch 1 carrier moves y1 and its child commits that S; S
-//       after a switch equals S of a node that saw only the winning branch.
+//   (j) receipts_root fold with nothing carried (carried_root 0, ballots 0,
+//       no deployment): genesis S = epoch 0, rules_cur = the genesis
+//       digest; after three carriers of d 18,180 only `all` moves (54,540);
+//       the fourth carrier commits rs_root 33c0bf81... and receipts_root
+//       9c6c4c42... (the vector of v37_xmr_side_data_v3_kat); a wrong fold
+//       (a flipped bit, the state of another position, a non-zero
+//       carried_root) is FoldMismatch (strike) and not placed; a released
+//       carrier with a wrong fold is FoldMismatch and the two-level chain waiting on
+//       it is discarded; a header with a wrong receipts_root passes the
+//       header checks (no fold on the header path) and is FoldMismatch when
+//       placed; at x = (k + 1) L - 1 (L 5) the sums reset and level 0 is
+//       appended; a ballot epoch 1 carrier moves y1 and its child commits
+//       that S;
+//   (k) carried lists: next_receipts_root over carried ids seq32(1..3)
+//       (carried_root 75e683fc...) on the position-3 state is a9ddf8c4...;
+//       carriers carrying 1, 2 and 16 receipts are placed (the fold over
+//       their ids) and the same carriers committing carried_root 0 are
+//       FoldMismatch; the tree's fold verdict equals check_carried_fold for
+//       0..16 ids; the fold follows the list order, not the byte order of
+//       the ids; the ratchet tally covers every placement: a live carried
+//       receipt adds its work to `all` and by its ballot to y1 / y2, a dead
+//       one adds 0, then the carrier adds d; a child committing the
+//       carrier-only S is FoldMismatch; cum_work counts carriers only;
+//   (l) activation inside the tree (L 5, GRACE 20, kind 2 fixed at 20):
+//       S_20 has epoch 1 and rules_cur = the deployment digest, equal to
+//       rs_step with step (1); the activation row (1, 20, digest) is kept
+//       on the carrier at 20 and on no other; the carrier at 21 commits
+//       S_20; the same carriers in a tree without the table: the carrier at
+//       21 is FoldMismatch;
+//   (m) an honest heavier side branch whose carriers carry 1-3 receipts
+//       (some dead): headers first fetches it (every header passes), every
+//       carrier is placed (none struck), it becomes best, the rewind gives
+//       the chain and S of a node that saw only that branch; a released
+//       carrier carrying receipts is placed with its carried list;
+//   (n) a waiting entry is (id, claimed parent): a copy of X naming an
+//       unknown parent arrives first, then X with a held parent is placed,
+//       the copy's entry is dropped and X's child released; a carrier waiting
+//       under two claimed parents keeps its own waiting children when one of
+//       them is refused; a refused copy of a carrier that still waits under
+//       another claimed parent discards nothing.
 // ---------------------------------------------------------------------------
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <array>
 #include <functional>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_caps.hpp"
 #include "impl/xmr/pathb/pathb_fork_choice.hpp"
+#include "impl/xmr/pathb/pathb_ratchet_activation.hpp"
 #include "impl/xmr/pathb/pathb_ratchet_state.hpp"
+#include "impl/xmr/pathb/pathb_receipt_admission.hpp"
 #include "pathb_kat_check.hpp"
 
 using namespace pathb_kat;
@@ -86,16 +121,52 @@ pb::Hash32 with_first_byte(pb::Hash32 h, std::uint8_t b) {
     return h;
 }
 
+// A carried receipt id (distinct from every carrier id).
+pb::Hash32 rid(std::uint8_t branch, std::uint64_t pos, std::uint8_t k) {
+    pb::Hash32 h = cid(branch, pos);
+    h[0] = 0x52;
+    h[10] = k;
+    return h;
+}
+
 // Twelve carriers per Monero height.
 std::uint64_t steady_h(std::uint64_t pos) { return kGenesisHeight + pos / 12; }
 
+// The carried list each announced carrier was built with (by carrier id).
+std::map<pb::Hash32, std::vector<pb::CarriedPlacement>> g_carried;
+
+const std::vector<pb::CarriedPlacement>& carried_of(const pb::Hash32& id) {
+    static const std::vector<pb::CarriedPlacement> kNone;
+    const auto it = g_carried.find(id);
+    return it == g_carried.end() ? kNone : it->second;
+}
+
+std::vector<pb::Hash32> ids_of(const std::vector<pb::CarriedPlacement>& cs) {
+    std::vector<pb::Hash32> out;
+    for (const pb::CarriedPlacement& r : cs) out.push_back(r.id);
+    return out;
+}
+
+// rs_step step (2) inputs of a carrier of work d and ballot b carrying cs:
+// each carried receipt at its work (0 when dead), then the carrier.
+std::vector<pb::RatchetPlacement> step_inputs(std::uint64_t d, std::uint16_t b, const std::vector<pb::CarriedPlacement>& cs) {
+    std::vector<pb::RatchetPlacement> out;
+    for (const pb::CarriedPlacement& r : cs) out.push_back(pb::RatchetPlacement{r.live ? r.work : 0, r.ballot});
+    out.push_back(pb::RatchetPlacement{d, b});
+    return out;
+}
+
+using CarriedGen = std::function<std::vector<pb::CarriedPlacement>(std::uint64_t)>;
+
 // Announcements of `count` carriers after `parent` (held by t, at position
 // parent_pos), each with the receipts_root it commits on that chain: the fold
-// of carried_root 0 with rs_root of S at its parent.
+// of carried_root over its carried ids (carry(pos); none without carry) with
+// rs_root of S at its parent; S follows rs_step_at with t's table over the
+// carried placements and the carrier.
 std::vector<pb::CarrierAnnounce> announce(const pb::CarrierTree& t, const pb::Hash32& parent, std::uint64_t parent_pos,
                                           std::uint8_t branch, std::uint64_t count,
                                           const std::function<std::uint64_t(std::uint64_t)>& h_of = steady_h,
-                                          std::uint16_t ballot = 0) {
+                                          std::uint16_t ballot = 0, const CarriedGen& carry = {}) {
     std::vector<pb::CarrierAnnounce> out;
     const pb::CarrierNode* pn = t.find(parent);
     if (pn == nullptr || pn->pos != parent_pos) {
@@ -108,30 +179,46 @@ std::vector<pb::CarrierAnnounce> announce(const pb::CarrierTree& t, const pb::Ha
     pb::Hash32 prev = parent;
     for (std::uint64_t i = 1; i <= count; ++i) {
         const std::uint64_t pos = parent_pos + i;
-        const pb::CarrierAnnounce c{cid(branch, pos), prev, h_of(pos),
-                                    pb::carrier_receipts_root(pb::kNoCarriedRoot, rs), ballot};
+        const std::vector<pb::CarriedPlacement> cs = carry ? carry(pos) : std::vector<pb::CarriedPlacement>{};
+        const pb::CarrierAnnounce c{cid(branch, pos), prev, h_of(pos), pb::carrier_receipts_root_over(ids_of(cs), rs),
+                                    ballot};
         const std::uint64_t d = w.next_difficulty();
         record = pb::record_height(record, c.h);
         w.push(pb::RetargetEntry{d, record});
-        const pb::RatchetPlacement own{d, ballot};
-        rs = pb::rs_step(t.ratchet_params(), rs, pos, std::span<const pb::RatchetPlacement>(&own, 1));
+        rs = pb::rs_step_at(t.ratchet_params(), rs, pos, step_inputs(d, ballot, cs), t.epoch_table()).s;
+        g_carried[c.id] = cs;
         out.push_back(c);
         prev = c.id;
     }
     return out;
 }
 
-// One carrier on a held tip, with the receipts_root it commits there.
+// One carrier on a held tip carrying cs, with the receipts_root it commits there.
 pb::CarrierAnnounce on_tip(const pb::CarrierTree& t, const pb::Hash32& id, const pb::Hash32& tip, std::uint64_t h,
-                           std::uint16_t ballot = 0) {
-    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip).value_or(pb::Hash32{}), ballot};
+                           std::uint16_t ballot = 0, const std::vector<pb::CarriedPlacement>& cs = {}) {
+    g_carried[id] = cs;
+    return pb::CarrierAnnounce{id, tip, h, t.next_receipts_root(tip, ids_of(cs)).value_or(pb::Hash32{}), ballot};
 }
+
+// The node of a held carrier; a missing carrier fails a check and reads as an empty node.
+const pb::CarrierNode& node_of(const pb::CarrierTree& t, const pb::Hash32& id) {
+    static const pb::CarrierNode kMissing{};
+    const pb::CarrierNode* n = t.find(id);
+    if (n == nullptr) {
+        check(false, "carrier not held: " + hex(id.data(), 10));
+        return kMissing;
+    }
+    return *n;
+}
+
+// Places c with the carried list it was announced with.
+pb::PlaceOutcome put(pb::CarrierTree& t, const pb::CarrierAnnounce& c) { return t.place(c, carried_of(c.id)); }
 
 // Places and (when `complete`) verifies and marks bodies. Returns true if all placed.
 bool admit(pb::CarrierTree& t, const std::vector<pb::CarrierAnnounce>& cs, bool complete = true) {
     bool ok = true;
     for (const pb::CarrierAnnounce& c : cs) {
-        ok = ok && t.place(c).verdict == pb::PlaceVerdict::Placed;
+        ok = ok && put(t, c).verdict == pb::PlaceVerdict::Placed;
         if (complete) ok = ok && t.mark_verified(c.id) && t.mark_bodies(c.id);
     }
     return ok;
@@ -170,20 +257,23 @@ bool execute(Applied& a, const pb::CarrierTree& t, const pb::SwitchPlan& plan, s
     return true;
 }
 
-// A node that saw only the best chain of `t`: same ids, d and cum_work.
+// A node that saw only the best chain of `t`: same ids, d, cum_work, S and
+// activation rows.
 bool fresh_node_agrees(const pb::CarrierTree& t, const Applied& a) {
     const auto chain = t.path(kGenesis, t.best().id);
     if (!chain || *chain != a.chain) return false;
-    pb::CarrierTree fresh(P, kGenesis, kGenesisHeight, {}, t.ratchet_params(), t.genesis().rs.rules_cur);
+    pb::CarrierTree fresh(P, kGenesis, kGenesisHeight, t.epoch_table(), {}, t.ratchet_params(),
+                          t.genesis().rs.rules_cur);
     for (const pb::Hash32& id : *chain) {
         const pb::CarrierNode* n = t.find(id);
-        if (fresh.place(pb::CarrierAnnounce{id, n->parent, n->h, n->receipts_root, n->ballot}).verdict
+        if (fresh.place(pb::CarrierAnnounce{id, n->parent, n->h, n->receipts_root, n->ballot}, carried_of(id)).verdict
             != pb::PlaceVerdict::Placed)
             return false;
         fresh.mark_verified(id);
         fresh.mark_bodies(id);
         const pb::CarrierNode* f = fresh.find(id);
-        if (f->d != n->d || !(f->cum_work == n->cum_work) || f->pos != n->pos || f->H != n->H || !(f->rs == n->rs))
+        if (f->d != n->d || !(f->cum_work == n->cum_work) || f->pos != n->pos || f->H != n->H || !(f->rs == n->rs)
+            || f->activation != n->activation)
             return false;
     }
     return fresh.best().id == t.best().id;
@@ -208,10 +298,17 @@ auto pow_all = [](const pb::CarrierAnnounce&, std::uint64_t) { return true; };
 // three carriers of d 18,180 on a genesis with rules digest seq32(0x11).
 const char* kFoldRsRootHex = "33c0bf81942281b70e7a5aff7a18e509ab663453f85ebc3e2e73d5d7c5c83a96";
 const char* kFoldReceiptsRootHex = "9c6c4c423ea279867e47120c92c2d67d2bac5c3ff052e3dfaf5e8a7c7294bf55";
+// carried_root over seq32(0x01), seq32(0x02), seq32(0x03) (E-10 n = 3), and
+// its fold with the rs_root above.
+const char* kCarried3Hex = "75e683fcba0f631eea34521cf0c7cceb72cca7c99fb168e7ff8ba2888436dfdd";
+const char* kFoldCarried3Hex = "a9ddf8c4c22124167b5ee4c411a9639055c2e00b864c97b637261cdd10329ba9";
+
+std::string hx(const pb::Hash32& h) { return hex(h.data(), h.size()); }
 
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("xmr_carrier_sharechain_kat\n");
     const std::uint64_t J = pb::journal_depth(P);
     check(J == 1152, "J = 1,152");
@@ -233,7 +330,7 @@ int main() {
         check(pb::fork_choice_prefers({three, x}, {three, y}), "ids compared from the first byte");
     }
     {
-        pb::CarrierTree t(P, kGenesis, kGenesisHeight);
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
         check(t.best().id == kGenesis && t.genesis().chain_valid, "empty tree: best = genesis");
         const auto trunk = announce(t, kGenesis, 0, 1, 30);
         check(admit(t, trunk), "trunk placed");
@@ -255,25 +352,39 @@ int main() {
 
         // (b)
         const auto bz = announce(t, x6.id, 36, 4, 3);
-        check(t.place(bz[2]).verdict == pb::PlaceVerdict::Deferred && t.place(bz[1]).verdict == pb::PlaceVerdict::Deferred
+        check(put(t, bz[2]).verdict == pb::PlaceVerdict::Deferred && put(t, bz[1]).verdict == pb::PlaceVerdict::Deferred
                       && t.waiting() == 2,
               "unknown parent: deferred, not refused");
-        check(t.place(bz[1]).verdict == pb::PlaceVerdict::Duplicate, "a waiting carrier repeated: duplicate");
-        const pb::PlaceOutcome o = t.place(bz[0]);
-        check(o.verdict == pb::PlaceVerdict::Placed && o.placed.size() == 3 && o.placed[0] == bz[0].id
-                      && o.placed[1] == bz[1].id && o.placed[2] == bz[2].id && t.waiting() == 0,
-              "parent arrives: the waiting carriers are placed behind it");
-        check(t.place(bz[0]).verdict == pb::PlaceVerdict::Duplicate, "placed carrier repeated: duplicate");
+        check(put(t, bz[1]).verdict == pb::PlaceVerdict::Duplicate, "a waiting carrier repeated: duplicate");
+        const pb::PlaceOutcome o = put(t, bz[0]);
+        check(o.verdict == pb::PlaceVerdict::Placed && o.released == std::vector<pb::Hash32>{bz[1].id}
+                      && o.discarded.empty() && t.waiting() == 1 && t.find(bz[1].id) == nullptr,
+              "parent arrives: the carrier waiting on it is released, not placed");
+        const pb::PlaceOutcome o1 = put(t, bz[1]);
+        check(o1.verdict == pb::PlaceVerdict::Placed && o1.released == std::vector<pb::Hash32>{bz[2].id}
+                      && t.waiting() == 0,
+              "the released carrier admitted again: placed; the carrier waiting on it released");
+        const pb::PlaceOutcome o2 = put(t, bz[2]);
+        check(o2.verdict == pb::PlaceVerdict::Placed && o2.released.empty() && t.find(bz[2].id)->pos == 39,
+              "the last released carrier placed at its position");
+        check(put(t, bz[0]).verdict == pb::PlaceVerdict::Duplicate, "placed carrier repeated: duplicate");
         {
-            const auto bq = announce(t, bz[2].id, 39, 10, 3);
+            const auto bq = announce(t, bz[2].id, 39, 10, 4);
             pb::CarrierAnnounce below = bq[1];
             below.h = 0;
-            check(t.place(bq[2]).verdict == pb::PlaceVerdict::Deferred && t.place(below).verdict == pb::PlaceVerdict::Deferred,
-                  "two carriers waiting");
-            const pb::PlaceOutcome q = t.place(bq[0]);
-            check(q.verdict == pb::PlaceVerdict::Placed && q.placed.size() == 1 && q.not_carrier.size() == 1
-                          && q.not_carrier[0] == below.id && t.waiting() == 0 && t.find(bq[2].id) == nullptr,
-                  "a waiting carrier below its parent's record is discarded with the carriers waiting on it");
+            check(put(t, bq[3]).verdict == pb::PlaceVerdict::Deferred && put(t, bq[2]).verdict == pb::PlaceVerdict::Deferred
+                          && put(t, below).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 3,
+                  "three carriers waiting, a chain of two under the third");
+            const pb::PlaceOutcome q = put(t, bq[0]);
+            check(q.verdict == pb::PlaceVerdict::Placed && q.released == std::vector<pb::Hash32>{below.id}
+                          && t.waiting() == 2,
+                  "parent arrives: the waiting carrier released");
+            const pb::PlaceOutcome qb = put(t, below);
+            check(qb.verdict == pb::PlaceVerdict::NotCarrier
+                          && qb.discarded == std::vector<pb::Hash32>{bq[2].id, bq[3].id} && t.waiting() == 0
+                          && t.find(below.id) == nullptr && t.find(bq[2].id) == nullptr && t.find(bq[3].id) == nullptr,
+                  "a released carrier below its parent's record: not a carrier, the two-level chain waiting on it "
+                  "discarded");
         }
         check(t.best().id == x6.id, "placed but not verified: not best");
         for (const auto& c : bz) t.mark_verified(c.id);
@@ -293,7 +404,7 @@ int main() {
         check(t.best().id == bw.back().id, "bodies arrive: extended");
         const auto bv = announce(t, bw.back().id, 45, 6, 4);
         for (const auto& c : bv) {
-            t.place(c);
+            put(t, c);
             t.mark_bodies(c.id);
             if (c.id != bv[1].id) t.mark_verified(c.id);
         }
@@ -311,10 +422,10 @@ int main() {
 
         // (i)
         const pb::CarrierNode* tipn = t.find(bv.back().id);
-        check(t.place(on_tip(t, cid(8, 1), tipn->id, tipn->H - 1)).verdict == pb::PlaceVerdict::NotCarrier,
+        check(put(t, on_tip(t, cid(8, 1), tipn->id, tipn->H - 1)).verdict == pb::PlaceVerdict::NotCarrier,
               "h(c) < H(parent): not a carrier");
-        check(t.place(on_tip(t, cid(8, 2), tipn->id, tipn->H)).verdict == pb::PlaceVerdict::Placed
-                      && t.place(on_tip(t, cid(8, 3), tipn->id, tipn->H)).verdict == pb::PlaceVerdict::Placed
+        check(put(t, on_tip(t, cid(8, 2), tipn->id, tipn->H)).verdict == pb::PlaceVerdict::Placed
+                      && put(t, on_tip(t, cid(8, 3), tipn->id, tipn->H)).verdict == pb::PlaceVerdict::Placed
                       && t.find(cid(8, 2))->d == t.find(cid(8, 3))->d,
               "two carriers of one tip at one height: both placed, one d");
         check(d_matches_chain(t, bv.back().id), "(i) d over the extended chain");
@@ -322,7 +433,7 @@ int main() {
 
     // (d) within J
     {
-        pb::CarrierTree t(P, kGenesis, kGenesisHeight);
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
         Applied node(J);
         const auto trunk = announce(t, kGenesis, 0, 1, 200);
         check(admit(t, trunk), "trunk placed");
@@ -345,7 +456,7 @@ int main() {
 
     // (e) depth J and J + 1
     for (const std::uint64_t depth : {J, J + 1}) {
-        pb::CarrierTree t(P, kGenesis, kGenesisHeight);
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
         Applied node(J);
         const auto trunk = announce(t, kGenesis, 0, 1, 200);
         admit(t, trunk);
@@ -365,7 +476,7 @@ int main() {
 
     // (f) (g) headers-first
     {
-        pb::CarrierTree t(P, kGenesis, kGenesisHeight);
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
         const auto trunk = announce(t, kGenesis, 0, 1, 300);
         admit(t, trunk);
         const auto a = announce(t, trunk.back().id, 300, 2, 40);
@@ -440,7 +551,7 @@ int main() {
 
     // (g) higher id deeper than J: prune; (h) deep reorg accepted
     {
-        pb::CarrierTree t(P, kGenesis, kGenesisHeight);
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
         Applied node(J);
         const auto trunk = announce(t, kGenesis, 0, 1, 100);
         admit(t, trunk);
@@ -476,7 +587,7 @@ int main() {
     // (j) receipts_root fold
     {
         const pb::Hash32 rules = seq32(0x11);
-        pb::CarrierTree t(P, kGenesis, kGenesisHeight, {}, pb::kRuledRatchetParams, rules);
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{}, {}, pb::kRuledRatchetParams, rules);
         check(t.genesis().rs == pb::genesis_ratchet_state(rules),
               "genesis S: epoch 0, rules_cur = the genesis digest, sums and levels 0");
         const auto c = announce(t, kGenesis, 0, 11, 3);
@@ -489,7 +600,7 @@ int main() {
                       && n3->rs.levels == std::array<std::uint8_t, 4>{},
               "ballots 0: only `all` moves (54,540)");
         const pb::Hash32 rs3 = pb::rs_root(n3->rs);
-        const pb::Hash32 rr4 = *t.next_receipts_root(c[2].id);
+        const pb::Hash32 rr4 = *t.next_receipts_root(c[2].id, {});
         check(hex(rs3.data(), rs3.size()) == kFoldRsRootHex && hex(rr4.data(), rr4.size()) == kFoldReceiptsRootHex,
               "fold vector: position 4 commits rs_root 33c0bf81..., receipts_root 9c6c4c42...");
         bool committed = true;
@@ -505,59 +616,67 @@ int main() {
         const pb::CarrierAnnounce good = on_tip(t, cid(11, 4), c[2].id, steady_h(4));
         pb::CarrierAnnounce bad = good;
         bad.receipts_root[0] ^= 1;
-        check(t.place(bad).verdict == pb::PlaceVerdict::FoldMismatch && t.find(bad.id) == nullptr && t.waiting() == 0,
+        check(put(t, bad).verdict == pb::PlaceVerdict::FoldMismatch && t.find(bad.id) == nullptr && t.waiting() == 0,
               "a flipped bit: FoldMismatch (strike), not placed");
-        bad.receipts_root = *t.next_receipts_root(c[1].id);
-        check(t.place(bad).verdict == pb::PlaceVerdict::FoldMismatch, "the fold over another position's S: FoldMismatch");
+        bad.receipts_root = *t.next_receipts_root(c[1].id, {});
+        check(put(t, bad).verdict == pb::PlaceVerdict::FoldMismatch, "the fold over another position's S: FoldMismatch");
         bad.receipts_root = pb::carrier_receipts_root(seq32(0x30), n3->rs);
-        check(t.place(bad).verdict == pb::PlaceVerdict::FoldMismatch,
+        check(put(t, bad).verdict == pb::PlaceVerdict::FoldMismatch,
               "a non-zero carried_root on a carrier that carries nothing: FoldMismatch");
-        check(t.place(good).verdict == pb::PlaceVerdict::Placed, "the honest fold: placed");
+        check(put(t, good).verdict == pb::PlaceVerdict::Placed, "the honest fold: placed");
 
-        // a waiting carrier with a wrong fold
-        auto wq = announce(t, good.id, 4, 12, 3);
+        // a released carrier with a wrong fold
+        auto wq = announce(t, good.id, 4, 12, 4);
         wq[1].receipts_root[5] ^= 0x80;
-        check(t.place(wq[2]).verdict == pb::PlaceVerdict::Deferred && t.place(wq[1]).verdict == pb::PlaceVerdict::Deferred,
-              "two carriers waiting");
-        const pb::PlaceOutcome o = t.place(wq[0]);
-        check(o.verdict == pb::PlaceVerdict::Placed && o.placed.size() == 1 && o.fold_mismatch.size() == 1
-                      && o.fold_mismatch[0] == wq[1].id && o.not_carrier.empty() && t.waiting() == 0
-                      && t.find(wq[1].id) == nullptr && t.find(wq[2].id) == nullptr,
-              "parent arrives: the waiting carrier with a wrong fold is discarded with the carrier waiting on it");
+        check(put(t, wq[3]).verdict == pb::PlaceVerdict::Deferred && put(t, wq[2]).verdict == pb::PlaceVerdict::Deferred
+                      && put(t, wq[1]).verdict == pb::PlaceVerdict::Deferred,
+              "three carriers waiting");
+        const pb::PlaceOutcome o = put(t, wq[0]);
+        check(o.verdict == pb::PlaceVerdict::Placed && o.released == std::vector<pb::Hash32>{wq[1].id}
+                      && o.discarded.empty() && t.waiting() == 2,
+              "parent arrives: the waiting carrier released");
+        const pb::PlaceOutcome ow = put(t, wq[1]);
+        check(ow.verdict == pb::PlaceVerdict::FoldMismatch
+                      && ow.discarded == std::vector<pb::Hash32>{wq[2].id, wq[3].id} && ow.released.empty()
+                      && t.waiting() == 0 && t.find(wq[1].id) == nullptr && t.find(wq[2].id) == nullptr
+                      && t.find(wq[3].id) == nullptr,
+              "the released carrier with a wrong fold: FoldMismatch, the two-level chain waiting on it discarded");
 
-        // headers-first
+        // headers-first: a header carries no carried bodies, so no fold on that path
         auto side = announce(t, c[2].id, 3, 13, 5);
         const auto honest = t.check_side_headers(c[2].id, side, pow_all);
         bool passed = honest.has_value();
         for (const auto& h : *honest) passed = passed && h.check == pb::HeaderCheck::Passed;
-        check(passed, "side headers with the honest fold over the side chain's S: passed");
+        check(passed, "honest side headers: passed");
         side[2].receipts_root[0] ^= 1;
-        const auto d = t.decide_headers(c[2].id, side, pow_all, J);
-        check(d && d->action == pb::SideBranchAction::RefuseHeader && d->refused_index == 2,
-              "a side header with a wrong fold: refused at that header");
         int pow_calls = 0;
-        t.check_side_headers(c[2].id, side, [&](const pb::CarrierAnnounce&, std::uint64_t) {
+        const auto flipped = t.check_side_headers(c[2].id, side, [&](const pb::CarrierAnnounce&, std::uint64_t) {
             ++pow_calls;
             return true;
         });
-        check(pow_calls == 2, "the fold is checked before PoW: no PoW call for the refused header");
+        bool all_passed = flipped.has_value();
+        for (const auto& h : *flipped) all_passed = all_passed && h.check == pb::HeaderCheck::Passed;
+        check(all_passed && pow_calls == 5, "a header with a wrong receipts_root: the header checks pass, PoW on every header");
+        check(put(t, side[0]).verdict == pb::PlaceVerdict::Placed && put(t, side[1]).verdict == pb::PlaceVerdict::Placed
+                      && put(t, side[2]).verdict == pb::PlaceVerdict::FoldMismatch,
+              "placed with its carried list: that carrier is FoldMismatch");
 
         // a ballot enters S
         const pb::CarrierAnnounce v1 = on_tip(t, cid(11, 6), wq[0].id, steady_h(6), pb::make_ballot(1, false));
-        check(t.place(v1).verdict == pb::PlaceVerdict::Placed, "a carrier with ballot epoch 1 placed");
-        const pb::CarrierNode* nv = t.find(v1.id);
-        check(nv->rs.y1 == pb::RsWork(nv->d) && nv->rs.y2.is_zero(), "ballot epoch 1: y1 = its d");
-        check(t.place(on_tip(t, cid(11, 7), v1.id, steady_h(7))).verdict == pb::PlaceVerdict::Placed,
+        check(put(t, v1).verdict == pb::PlaceVerdict::Placed, "a carrier with ballot epoch 1 placed");
+        const pb::CarrierNode nv = *t.find(v1.id);
+        check(nv.rs.y1 == pb::RsWork(nv.d) && nv.rs.y2.is_zero(), "ballot epoch 1: y1 = its d");
+        check(put(t, on_tip(t, cid(11, 7), v1.id, steady_h(7))).verdict == pb::PlaceVerdict::Placed,
               "its child commits S with y1: placed");
-        const pb::RatchetPlacement unvoted{nv->d, 0};
-        const pb::RatchetState no_vote = pb::rs_step(t.ratchet_params(), t.find(wq[0].id)->rs, nv->pos,
+        const pb::RatchetPlacement unvoted{nv.d, 0};
+        const pb::RatchetState no_vote = pb::rs_step(t.ratchet_params(), t.find(wq[0].id)->rs, nv.pos,
                                                      std::span<const pb::RatchetPlacement>(&unvoted, 1));
         const pb::CarrierAnnounce ignores{cid(11, 8), v1.id, steady_h(7),
                                           pb::carrier_receipts_root(pb::kNoCarriedRoot, no_vote), 0};
-        check(t.place(ignores).verdict == pb::PlaceVerdict::FoldMismatch, "a child that drops the ballot from S: FoldMismatch");
+        check(put(t, ignores).verdict == pb::PlaceVerdict::FoldMismatch, "a child that drops the ballot from S: FoldMismatch");
 
         // the grid window end (L 5, GRACE 20)
-        pb::CarrierTree ts(P, kGenesis, kGenesisHeight, {}, pb::RatchetParams{5, 20}, rules);
+        pb::CarrierTree ts(P, kGenesis, kGenesisHeight, pb::EpochTable{}, {}, pb::RatchetParams{5, 20}, rules);
         const auto cs = announce(ts, kGenesis, 0, 14, 6);
         check(admit(ts, cs), "L 5: six carriers placed");
         check(ts.find(cs[2].id)->rs.all == pb::RsWork(3 * P.d_min), "L 5: position 3, all = 3 d");
@@ -566,6 +685,308 @@ int main() {
         check(ts.find(cs[5].id)->rs.all == pb::RsWork(2 * P.d_min), "L 5: positions 5 and 6 in window 1");
         check(ts.find(cs[3].id)->rs == ts.genesis().rs && cs[4].receipts_root == cs[0].receipts_root,
               "L 5: after the window end S equals the genesis S, so position 5 commits the fold of position 1");
+    }
+
+    // (k) carried lists: the fold over the carried ids, the tally over every placement
+    {
+        const pb::Hash32 rules = seq32(0x11);
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{}, {}, pb::kRuledRatchetParams, rules);
+        const auto c = announce(t, kGenesis, 0, 0x21, 3);
+        check(admit(t, c), "(k) three carriers placed");
+        const pb::Hash32 tip = c[2].id;
+        const pb::CarrierNode nt = node_of(t, tip);
+        const std::vector<pb::Hash32> ids3{seq32(0x01), seq32(0x02), seq32(0x03)};
+        check(hx(pb::carried_root(ids3)) == kCarried3Hex && hx(pb::rs_root(nt.rs)) == kFoldRsRootHex
+                      && hx(*t.next_receipts_root(tip, ids3)) == kFoldCarried3Hex,
+              "(k) next_receipts_root over three carried ids: carried_root 75e683fc..., receipts_root a9ddf8c4...");
+        check(hx(*t.next_receipts_root(tip, {})) == kFoldReceiptsRootHex,
+              "(k) next_receipts_root over no carried id: receipts_root 9c6c4c42...");
+
+        // 1, 2 and 16 carried receipts
+        for (const std::uint8_t n : {std::uint8_t{1}, std::uint8_t{2}, std::uint8_t{16}}) {
+            const std::string tag = "(k) " + std::to_string(n) + " carried: ";
+            std::vector<pb::CarriedPlacement> cs;
+            std::uint64_t sum = 0;
+            for (std::uint8_t k = 0; k < n; ++k) {
+                cs.push_back(pb::CarriedPlacement{rid(0x22, n, k), P.d_min + k, 0, true});
+                sum += P.d_min + k;
+            }
+            const pb::CarrierAnnounce honest = on_tip(t, cid(0x22, n), tip, steady_h(4), 0, cs);
+            pb::CarrierAnnounce zero_root = honest;
+            zero_root.id = cid(0x23, n);
+            zero_root.receipts_root = pb::carrier_receipts_root(pb::kNoCarriedRoot, nt.rs);
+            g_carried[zero_root.id] = cs;
+            check(put(t, zero_root).verdict == pb::PlaceVerdict::FoldMismatch, tag + "a receipts_root over carried_root 0: FoldMismatch");
+            pb::CarrierAnnounce no_list = honest;
+            no_list.id = cid(0x24, n);
+            check(t.place(no_list, {}).verdict == pb::PlaceVerdict::FoldMismatch,
+                  tag + "the honest receipts_root placed without its carried list: FoldMismatch");
+            check(put(t, honest).verdict == pb::PlaceVerdict::Placed, tag + "the fold over their ids: placed");
+            const pb::CarrierNode nn = node_of(t, honest.id);
+            pb::RsWork all = nt.rs.all;
+            all += pb::RsWork(sum);
+            all += pb::RsWork(nn.d);
+            check(nn.rs.all == all && nn.rs.y1.is_zero() && nn.rs.y2.is_zero(), tag + "all += the carried work, then d");
+        }
+
+        // one #10: the tree's verdict is check_carried_fold's
+        bool agree = true;
+        for (std::uint8_t n = 0; n <= 16; ++n) {
+            std::vector<pb::CarriedPlacement> cs;
+            std::vector<pb::Hash32> ids;
+            for (std::uint8_t k = 0; k < n; ++k) {
+                cs.push_back(pb::CarriedPlacement{rid(0x25, n, k), P.d_min, 0, true});
+                ids.push_back(cs.back().id);
+            }
+            for (std::uint8_t flip = 0; flip < 2; ++flip) {
+                pb::CarrierAnnounce x = on_tip(t, cid(static_cast<std::uint8_t>(0x25 + flip), n), tip, steady_h(4), 0, cs);
+                if (flip) x.receipts_root[31] ^= 1;
+                const bool adm = pb::check_carried_fold(x.receipts_root, ids, nt.rs) == pb::FoldVerdict::Match;
+                const bool tree = put(t, x).verdict == pb::PlaceVerdict::Placed;
+                agree = agree && adm == tree && adm == (flip == 0);
+            }
+        }
+        check(agree, "(k) the tree's #10 verdict equals check_carried_fold for 0..16 carried ids, honest and flipped");
+
+        // the fold is over the list order, not the byte order of the ids
+        std::vector<pb::CarriedPlacement> desc;
+        for (std::uint8_t k = 3; k-- > 0;) desc.push_back(pb::CarriedPlacement{rid(0x29, 4, k), P.d_min, 0, true});
+        std::vector<pb::Hash32> bytewise = ids_of(desc);
+        std::sort(bytewise.begin(), bytewise.end());
+        check(bytewise != ids_of(desc), "(k) a carried list whose order is not the byte order of its ids");
+        const pb::CarrierAnnounce in_list = on_tip(t, cid(0x29, 4), tip, steady_h(4), 0, desc);
+        pb::CarrierAnnounce in_bytes = in_list;
+        in_bytes.id = cid(0x29, 5);
+        in_bytes.receipts_root = pb::carrier_receipts_root_over(bytewise, nt.rs);
+        g_carried[in_bytes.id] = desc;
+        check(put(t, in_bytes).verdict == pb::PlaceVerdict::FoldMismatch,
+              "(k) a receipts_root over the ids in byte order: FoldMismatch");
+        check(put(t, in_list).verdict == pb::PlaceVerdict::Placed, "(k) the fold over the ids in list order: placed");
+
+        // the tally: every placement at x, a dead one at 0
+        const std::vector<pb::CarriedPlacement> mix{
+                {rid(0x27, 4, 0), 30000, pb::make_ballot(1, false), true},
+                {rid(0x27, 4, 1), 40000, pb::make_ballot(1, false), false},
+                {rid(0x27, 4, 2), 25000, pb::make_ballot(2, true), true}};
+        const pb::CarrierAnnounce cm = on_tip(t, cid(0x27, 4), tip, steady_h(4), 0, mix);
+        check(put(t, cm).verdict == pb::PlaceVerdict::Placed, "(k) a carrier with two live and one dead carried receipt placed");
+        const pb::CarrierNode nm = node_of(t, cm.id);
+        pb::RsWork all = nt.rs.all;
+        all += pb::RsWork(30000);
+        all += pb::RsWork(25000);
+        all += pb::RsWork(nm.d);
+        check(nm.rs.all == all, "(k) all += the live carried work and d; the dead receipt adds 0");
+        check(nm.rs.y1 == pb::RsWork(55000) && nm.rs.y2 == pb::RsWork(25000),
+              "(k) y1 / y2 by the carried ballots; the dead receipt adds 0");
+        check(nm.cum_work == nat::u128_add(nt.cum_work, nat::U128{nm.d, 0}), "(k) cum_work counts the carrier only");
+        check(put(t, on_tip(t, cid(0x27, 5), cm.id, steady_h(5))).verdict == pb::PlaceVerdict::Placed,
+              "(k) its child commits the S of every placement: placed");
+        const pb::RatchetPlacement own_only{nm.d, 0};
+        const pb::RatchetState carrier_only =
+                pb::rs_step(t.ratchet_params(), nt.rs, nm.pos, std::span<const pb::RatchetPlacement>(&own_only, 1));
+        const pb::CarrierAnnounce co{cid(0x27, 6), cm.id, steady_h(5),
+                                     pb::carrier_receipts_root(pb::kNoCarriedRoot, carrier_only), 0};
+        check(put(t, co).verdict == pb::PlaceVerdict::FoldMismatch, "(k) a child committing the carrier-only S: FoldMismatch");
+        const std::vector<pb::RatchetPlacement> dead_counted{
+                {30000, pb::make_ballot(1, false)}, {40000, pb::make_ballot(1, false)}, {25000, pb::make_ballot(2, true)}, {nm.d, 0}};
+        const pb::CarrierAnnounce cd{cid(0x27, 7), cm.id, steady_h(5),
+                                     pb::carrier_receipts_root(pb::kNoCarriedRoot,
+                                                               pb::rs_step(t.ratchet_params(), nt.rs, nm.pos, dead_counted)),
+                                     0};
+        check(put(t, cd).verdict == pb::PlaceVerdict::FoldMismatch,
+              "(k) a child committing S with the dead receipt counted: FoldMismatch");
+    }
+
+    // (l) activation inside the tree: L 5, GRACE 20, kind 2 fixed at 20
+    {
+        const pb::RatchetParams R{5, 20, 130};
+        const pb::Hash32 G = seq32(0x47), D1 = seq32(0xa1);
+        pb::EpochTable T;
+        T.compiled.push_back(pb::CompiledEpoch{0, G, std::nullopt});
+        T.compiled.push_back(pb::CompiledEpoch{1, D1, std::nullopt});
+        T.attempts.push_back(pb::Deployment{1, D1, pb::kKindFixed, 0, 0, 20});
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, T, {}, R, G);
+        const CarriedGen one = [](std::uint64_t pos) {
+            return std::vector<pb::CarriedPlacement>{{rid(0x28, pos, 0), 1000, pb::make_ballot(1, false), true}};
+        };
+        const auto cs = announce(t, kGenesis, 0, 0x28, 24, steady_h, 0, one);
+        check(admit(t, cs), "(l) 24 carriers carrying one receipt each placed through the activation at 20");
+        const pb::CarrierNode n19 = node_of(t, cs[18].id), n20 = node_of(t, cs[19].id), n21 = node_of(t, cs[20].id);
+        check(n19.pos == 19 && n19.rs.epoch_cur == 0 && n19.rs.rules_cur == G, "(l) S_19: epoch 0, rules_cur G");
+        check(n20.pos == 20 && n20.rs.epoch_cur == 1 && n20.rs.rules_cur == D1,
+              "(l) S_20: epoch 1, rules_cur = the deployment digest");
+        check(n20.rs == pb::rs_step(R, n19.rs, 20, step_inputs(n20.d, 0, carried_of(n20.id)), true, D1),
+              "(l) S_20 = rs_step with step (1) over every placement at 20");
+        bool one_row = true;
+        for (const auto& x : cs) {
+            const pb::CarrierNode& n = node_of(t, x.id);
+            one_row = one_row
+                      && (n.pos == 20 ? n.activation == pb::ActivationRow{1, 20, D1} : !n.activation.has_value());
+        }
+        check(one_row, "(l) the activation row (1, 20, digest) on the carrier at 20 only");
+        check(n21.receipts_root == pb::carrier_receipts_root_over(ids_of(carried_of(n21.id)), n20.rs),
+              "(l) the carrier at 21 commits S_20");
+        pb::CarrierTree u(P, kGenesis, kGenesisHeight, pb::EpochTable{}, {}, R, G);
+        bool through = true;
+        for (std::size_t i = 0; i < 20; ++i) through = through && put(u, cs[i]).verdict == pb::PlaceVerdict::Placed;
+        check(through && node_of(u, cs[19].id).rs.epoch_cur == 0 && !node_of(u, cs[19].id).activation.has_value(),
+              "(l) the same carriers in a tree without the table: no activation at 20");
+        check(put(u, cs[20]).verdict == pb::PlaceVerdict::FoldMismatch, "(l) there the carrier at 21 is FoldMismatch");
+    }
+
+    // (m) an honest heavier side branch whose carriers carry 1-3 receipts
+    {
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
+        Applied node(J);
+        const auto trunk = announce(t, kGenesis, 0, 0x31, 100);
+        check(admit(t, trunk), "(m) trunk placed");
+        const pb::Hash32 fork = trunk.back().id;
+        const auto a = announce(t, fork, 100, 0x32, 50);
+        check(admit(t, a), "(m) A, carrying nothing, placed");
+        for (const auto& c : trunk) node.apply(c.id);
+        for (const auto& c : a) node.apply(c.id);
+        check(t.best().id == a.back().id, "(m) A best and applied");
+        const CarriedGen some = [](std::uint64_t pos) {
+            std::vector<pb::CarriedPlacement> cs;
+            const std::uint8_t n = static_cast<std::uint8_t>(1 + pos % 3);
+            for (std::uint8_t k = 0; k < n; ++k)
+                cs.push_back(pb::CarriedPlacement{rid(0x33, pos, k), P.d_min + 7 * k,
+                                                  pb::make_ballot(static_cast<std::uint16_t>(k % 2), false),
+                                                  (pos + k) % 5 != 0});
+            return cs;
+        };
+        const auto b = announce(t, fork, 100, 0x33, 51, steady_h, 0, some);
+        const auto dh = t.decide_headers(fork, b, pow_all, J);
+        check(dh && dh->action == pb::SideBranchAction::FetchBodies,
+              "(m) headers first: the heavier branch whose carriers carry receipts is fetched");
+        const auto side = t.check_side_headers(fork, b, pow_all);
+        bool hp = side.has_value();
+        for (const auto& h : *side) hp = hp && h.check == pb::HeaderCheck::Passed;
+        check(hp, "(m) every header of that branch passes");
+        bool none_struck = true;
+        std::size_t n_carried = 0, n_dead = 0;
+        for (const auto& c : b) {
+            none_struck = none_struck && put(t, c).verdict == pb::PlaceVerdict::Placed;
+            t.mark_verified(c.id);
+            t.mark_bodies(c.id);
+            for (const pb::CarriedPlacement& r : carried_of(c.id)) {
+                ++n_carried;
+                n_dead += r.live ? 0 : 1;
+            }
+        }
+        check(none_struck && n_carried >= 51 && n_dead > 0,
+              "(m) every carrier placed with its 1-3 carried receipts, some dead: none struck");
+        check(t.best().id == b.back().id, "(m) the heavier branch wins fork choice");
+        check(t.work_after(fork, b.back().id) == nat::u128_add(t.work_after(fork, a.back().id).value_or(nat::U128{}),
+                                                               nat::U128{node_of(t, b.back().id).d, 0}),
+              "(m) work after the branch point: A plus one carrier (receipts never count)");
+        pb::RatchetState s = node_of(t, fork).rs;
+        for (const auto& c : b) {
+            const pb::CarrierNode& n = node_of(t, c.id);
+            s = pb::rs_step_at(t.ratchet_params(), s, n.pos, step_inputs(n.d, c.ballot, carried_of(c.id)),
+                               t.epoch_table())
+                        .s;
+        }
+        check(s == node_of(t, b.back().id).rs, "(m) S at the tip: every placement of the branch, dead at 0");
+        const auto plan = t.plan_switch(node.tip(), node.j);
+        check(plan && plan->verdict == pb::RewindVerdict::Rewound && plan->undo_depth == 50 && plan->apply.size() == 51,
+              "(m) fork 50 below the applied tip: rewind");
+        check(plan && execute(node, t, *plan, 0) && fresh_node_agrees(t, node),
+              "(m) rewind + replay: the chain and S of a node that saw only that branch");
+
+        // a released carrier carrying receipts
+        const auto e = announce(t, b.back().id, 151, 0x34, 2, steady_h, 0, some);
+        check(e.size() == 2, "(m) two carriers announced on the branch tip");
+        if (e.size() == 2) {
+            check(put(t, e[1]).verdict == pb::PlaceVerdict::Deferred, "(m) a carrier carrying receipts waits on its parent");
+            const pb::PlaceOutcome oe = put(t, e[0]);
+            check(oe.verdict == pb::PlaceVerdict::Placed && oe.released == std::vector<pb::Hash32>{e[1].id},
+                  "(m) its parent placed: released");
+            const pb::PlaceOutcome oe1 = put(t, e[1]);
+            const pb::CarrierNode ne0 = node_of(t, e[0].id);
+            const pb::CarrierNode* ne1 = t.find(e[1].id);
+            check(oe1.verdict == pb::PlaceVerdict::Placed && ne1 != nullptr
+                          && ne1->rs
+                                     == pb::rs_step_at(t.ratchet_params(), ne0.rs, ne1->pos,
+                                                       step_inputs(ne1->d, 0, carried_of(e[1].id)), t.epoch_table())
+                                                .s,
+                  "(m) admitted again with its carried list: placed, S over every placement");
+        }
+    }
+
+    // (n) a waiting entry is (id, claimed parent): a forged parent claim does not block the honest carrier
+    {
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
+        const auto trunk = announce(t, kGenesis, 0, 0x41, 3);
+        check(admit(t, trunk), "(n) trunk placed");
+        const pb::Hash32 tip = trunk.back().id;
+        const pb::Hash32 forged_parent = cid(0x43, 4);
+        const auto hc = announce(t, tip, 3, 0x42, 5);  // X at 4 on the tip, its child at 5, then 6, 7, 8
+        check(hc.size() == 5, "(n) five carriers announced on the tip");
+        if (hc.size() == 5) {
+            pb::CarrierAnnounce forged = hc[0];
+            forged.parent = forged_parent;
+            check(put(t, forged).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 1,
+                  "(n) X's id naming an unknown parent arrives first: Deferred");
+            check(put(t, forged).verdict == pb::PlaceVerdict::Duplicate, "(n) the same (id, claimed parent) again: Duplicate");
+            check(put(t, hc[1]).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 2, "(n) X's child waits on X");
+            const pb::PlaceOutcome ox = put(t, hc[0]);
+            check(ox.verdict == pb::PlaceVerdict::Placed && ox.released == std::vector<pb::Hash32>{hc[1].id}
+                          && t.waiting() == 0 && node_of(t, hc[0].id).parent == tip,
+                  "(n) the honest X with a held parent: placed (not Duplicate), the forged claim dropped, its child "
+                  "released");
+            check(put(t, hc[1]).verdict == pb::PlaceVerdict::Placed, "(n) X's child placed");
+            const pb::CarrierAnnounce z = on_tip(t, forged_parent, tip, steady_h(4));
+            const pb::PlaceOutcome oz = put(t, z);
+            check(oz.verdict == pb::PlaceVerdict::Placed && oz.released.empty(),
+                  "(n) the forged claim's parent placed later: nothing released");
+
+            // Y waits under its unknown honest parent and under a forged one; the forged parent is refused
+            const pb::CarrierAnnounce& ph = hc[2];  // Y's honest parent, not yet held
+            const pb::CarrierAnnounce& y = hc[3];
+            const pb::CarrierAnnounce& yc = hc[4];  // Y's child
+            const pb::Hash32 bad_parent = cid(0x44, 6);
+            pb::CarrierAnnounce y_forged = y;
+            y_forged.parent = bad_parent;
+            check(put(t, yc).verdict == pb::PlaceVerdict::Deferred && put(t, y).verdict == pb::PlaceVerdict::Deferred
+                          && put(t, y_forged).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 3,
+                  "(n) Y waits under two claimed parents, Y's child waits on Y");
+            const pb::CarrierAnnounce refused =
+                    on_tip(t, bad_parent, hc[1].id, node_of(t, hc[1].id).H - 1);  // below its parent's record
+            const pb::PlaceOutcome orf = put(t, refused);
+            check(orf.verdict == pb::PlaceVerdict::NotCarrier && orf.discarded == std::vector<pb::Hash32>{y.id}
+                          && t.waiting() == 2,
+                  "(n) the forged parent refused: only Y's claim under it dropped; Y's child kept (Y still waits)");
+            const pb::PlaceOutcome op = put(t, ph);
+            check(op.verdict == pb::PlaceVerdict::Placed && op.released == std::vector<pb::Hash32>{y.id},
+                  "(n) Y's honest parent placed: Y released");
+            const pb::PlaceOutcome oy = put(t, y);
+            check(oy.verdict == pb::PlaceVerdict::Placed && oy.released == std::vector<pb::Hash32>{yc.id}
+                          && put(t, yc).verdict == pb::PlaceVerdict::Placed && t.waiting() == 0,
+                  "(n) Y and its child placed");
+
+            // R waits under its unknown honest parent; a copy of R naming a held parent is refused; R's child stays
+            const auto rc = announce(t, yc.id, 8, 0x46, 3);  // R1 at 9 on Y's child, R at 10, R's child at 11
+            check(rc.size() == 3, "(n) three carriers announced on Y's child");
+            if (rc.size() == 3) {
+                check(put(t, rc[2]).verdict == pb::PlaceVerdict::Deferred
+                              && put(t, rc[1]).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 2,
+                      "(n) R waits on its unknown parent, R's child waits on R");
+                pb::CarrierAnnounce r_held = rc[1];
+                r_held.parent = yc.id;
+                r_held.h = node_of(t, yc.id).H - 1;  // below its parent's record
+                const pb::PlaceOutcome orh = put(t, r_held);
+                check(orh.verdict == pb::PlaceVerdict::NotCarrier && orh.discarded.empty() && t.waiting() == 2,
+                      "(n) a copy of R naming a held parent refused: R still waits, so R's child is kept");
+                const pb::PlaceOutcome or1 = put(t, rc[0]);
+                check(or1.verdict == pb::PlaceVerdict::Placed && or1.released == std::vector<pb::Hash32>{rc[1].id},
+                      "(n) R's honest parent placed: R released");
+                const pb::PlaceOutcome orr = put(t, rc[1]);
+                check(orr.verdict == pb::PlaceVerdict::Placed && orr.released == std::vector<pb::Hash32>{rc[2].id}
+                              && put(t, rc[2]).verdict == pb::PlaceVerdict::Placed && t.waiting() == 0,
+                      "(n) R and its child placed");
+            }
+        }
     }
 
     return finish("xmr_carrier_sharechain_kat");
