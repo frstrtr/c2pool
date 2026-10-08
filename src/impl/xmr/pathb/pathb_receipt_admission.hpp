@@ -48,6 +48,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <span>
 #include <string_view>
@@ -260,14 +261,17 @@ inline Hash32 stub_output_key(const Hash32& tip, const Hash32& p_r, const Hash32
 }
 
 // leaf-0 of the canonical one-output stub coinbase: domain || R || output_key ||
-// extra_nonce. Changing R or the payee (through output_key) changes the leaf.
+// extra_nonce || mm_root. Changing R, the payee (through output_key) or any
+// side_data_v3 field (through mm_root) changes the leaf.
 inline Hash32 canonical_stub_leaf(std::uint64_t reward_total, const Hash32& output_key,
-                                  const std::array<std::uint8_t, kExtraNonceBytes>& extra_nonce) {
+                                  const std::array<std::uint8_t, kExtraNonceBytes>& extra_nonce,
+                                  const Hash32& mm_root) {
     std::vector<std::uint8_t> pre(kStubCbDomain.begin(), kStubCbDomain.end());
     for (std::size_t i = 0; i < sizeof(reward_total); ++i)
         pre.push_back(static_cast<std::uint8_t>(reward_total >> (8 * i)));
     pre.insert(pre.end(), output_key.begin(), output_key.end());
     pre.insert(pre.end(), extra_nonce.begin(), extra_nonce.end());
+    pre.insert(pre.end(), mm_root.begin(), mm_root.end());
     return keccak256_hash(pre);
 }
 
@@ -286,17 +290,22 @@ inline Hash32 tree_root_fold(const Hash32& leaf0, std::span<const Hash32> branch
 }
 
 // The canonical stub coinbase leaf a receipt on (tip, P_r) MUST commit: one
-// output of r.reward_total to r's payee, with the per-(tip, P_r) key.
-inline Hash32 canonical_stub_leaf_of(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
+// output of r.reward_total to r's payee, with the per-(tip, P_r) key, and
+// mm_root = mm_root_of(r.side). No leaf when side_data_v3 does not encode.
+inline std::optional<Hash32> canonical_stub_leaf_of(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
+    const std::optional<Hash32> mm = mm_root_of(r.side);
+    if (!mm) return std::nullopt;
     const Hash32 key = stub_output_key(tip, p_r, r.side.payee);
-    return canonical_stub_leaf(r.reward_total, key, r.extra_nonce);
+    return canonical_stub_leaf(r.reward_total, key, r.extra_nonce, *mm);
 }
 
 // Admission #12: the receipt's committed coinbase (tree_root folded over the
-// branch from leaf 0) equals the canonical stub coinbase. false is a BAN.
+// branch from leaf 0) equals the canonical stub coinbase. false is a BAN; no
+// leaf (side_data_v3 does not encode) is false.
 inline bool canonical_coinbase_ok(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
-    const Hash32 leaf = canonical_stub_leaf_of(r, tip, p_r);
-    return tree_root_fold(leaf, std::span<const Hash32>(r.branch)) == r.blob.tree_root;
+    const std::optional<Hash32> leaf = canonical_stub_leaf_of(r, tip, p_r);
+    if (!leaf) return false;
+    return tree_root_fold(*leaf, std::span<const Hash32>(r.branch)) == r.blob.tree_root;
 }
 
 // ---------------------------------------------------------------------------
