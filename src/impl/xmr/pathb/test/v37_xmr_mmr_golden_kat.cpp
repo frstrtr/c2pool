@@ -675,7 +675,7 @@ static void s3b_fc_buckets_vectors() {
     const std::vector<std::vector<std::uint8_t>> fr = pb::serve_buckets_from(src, req, frame);
     pb::BucketsAnchor a;
     a.header_held = true;
-    a.record = b0 + F - 1 + 8;
+    a.tip_record = b0 + F - 1 + 8;
     a.mmr_root = m.root();
     pb::BucketsAssembly as(req, b0, F, frame);
     const pb::FrameOutcome o = as.add_frame(1, fr.at(0), a);

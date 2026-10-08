@@ -9,10 +9,13 @@
 //   codec   FC_GETBUCKETS 54 B and FC_BUCKETS round trips; the not-served
 //           frame (187 B); every byte refusal; S (134 B) decode; P-14 / P-39 /
 //           P-41 / P-42 defaults.
-//   honest  the dense FR-B1 chain (3 leaves at H = b0 + 98) served from the
-//           bin store and verified: the leaves, the root, the empty leaf, the
-//           references, S adopted once at's carried ids are held; the FR-B1
-//           golden payloads (root dc6ff5da...) through the proof check.
+//   honest  the dense FR-B1 chain served from the bin store at `at` = c4
+//           (H = b0 + 99) and verified against c4's header: leaf_count(tip(at))
+//           = 3 leaves (H(tip) = b0 + 98), the root, the empty leaf, the
+//           references, S adopted once at's carried ids are held; the bin
+//           sealed at `at` itself (leaf_count(at) = 4) neither served nor
+//           accepted (ruling 38); the FR-B1 golden payloads (root dc6ff5da...)
+//           through the proof check.
 //   lying   wrong leaf_count; a bucket subset (a bin skipped, a row
 //           withheld); a forged sum in a row (rows only, and with the payload
 //           recomputed); a wrong key reference (missing, stray, out of order,
@@ -109,12 +112,14 @@ pb::RatchetState s_at() {
 const pb::RatchetStateBytes kS = pb::encode_ratchet_state(s_at());
 const std::vector<pb::Hash32> kCarried{seq32(0x90), seq32(0xB0)};
 
+// at's header: the record of its tip (its parent) and the mmr_root it commits
+// (the root over leaf_count(tip(at)) leaves, as an honest carrier at at commits).
 pb::BucketsAnchor anchor_of(const pb::BinStore& s, const pb::Hash32& at, bool with_ids = false) {
     const pb::LaneView v = s.view_at(at);
     pb::BucketsAnchor a;
     a.header_held = true;
-    a.record = v.record(v.pos());
-    a.mmr_root = v.mmr_root();
+    a.tip_record = v.record(v.pos() - 1);
+    a.mmr_root = v.mmr_root_at(v.pos() - 1);
     a.receipts_root = pb::carrier_receipts_root_over(kCarried, s_at());
     if (with_ids) a.carried_ids = kCarried;
     return a;
@@ -167,7 +172,7 @@ Forged forge(const std::vector<pb::L1Bucket>& bins) {
     for (const pb::L1Bucket& b : bins) f.mmr.append(pb::mmr_leaf_of(b));
     f.bins = bins;
     f.anchor.header_held = true;
-    f.anchor.record = kB0 + F - 1 + bins.size();
+    f.anchor.tip_record = kB0 + F - 1 + bins.size();
     f.anchor.mmr_root = f.mmr.root();
     return f;
 }
@@ -219,7 +224,9 @@ const pb::XmrKeyRef ka = key_ref(0x10), kb = key_ref(0x30), kc = key_ref(0x50), 
                     ke = key_ref(0x90), kf = key_ref(0xB0), ko = key_ref(0xD0), kz = key_ref(0xF0);
 
 // A: the FR-B1 shape with a keyed identity: one receipt in b0 and in b0 + 2,
-// none in b0 + 1; the record reaches b0 + 98 at c3 (3 leaves), b0 + 100 at c5.
+// none in b0 + 1; the record reaches b0 + 98 at c3 (3 leaves) and b0 + 99 at c4
+// (4 leaves: bin b0 + 3 seals at c4 itself); c4's header commits the 3 leaves of
+// its tip c3. extend(): c5 at b0 + 100 (5 leaves).
 struct ChainA {
     pb::BinStore s{P, 64, cid(0x40, 0), kB0, kChain};
     bool ok = true;
@@ -227,15 +234,14 @@ struct ChainA {
         ok = ok && step(s, cid(0x40, 1), cid(0x40, 0), kB0, {rc(1, kB0, 1, ka, 18180)});
         ok = ok && step(s, cid(0x40, 2), cid(0x40, 1), kB0 + 2, {rc(2, kB0 + 2, 2, ka, 18180)});
         ok = ok && step(s, cid(0x40, 3), cid(0x40, 2), kB0 + 98, {});
-    }
-    void extend() {
         ok = ok && step(s, cid(0x40, 4), cid(0x40, 3), kB0 + 99, {});
-        ok = ok && step(s, cid(0x40, 5), cid(0x40, 4), kB0 + 100, {});
     }
+    void extend() { ok = ok && step(s, cid(0x40, 5), cid(0x40, 4), kB0 + 100, {}); }
 };
 
 // R: bin b0 holds five payees (one row each), bin b0 + 1 one payee with an
-// owner share; the record reaches b0 + 97 at r3 (2 leaves).
+// owner share; the record reaches b0 + 97 at r3 (2 leaves); r4 on r3 commits
+// those 2 leaves.
 struct ChainR {
     pb::BinStore s{P, 64, cid(0x50, 0), kB0, kChain};
     bool ok = true;
@@ -245,6 +251,7 @@ struct ChainR {
                          rc(14, kB0, 1, kd, 18180), rc(15, kB0, 1, ke, 40000)});
         ok = ok && step(s, cid(0x50, 2), cid(0x50, 1), kB0 + 1, {rc(16, kB0 + 1, 2, kf, 50000, ko, 1000, kf_ref)});
         ok = ok && step(s, cid(0x50, 3), cid(0x50, 2), kB0 + 97, {});
+        ok = ok && step(s, cid(0x50, 4), cid(0x50, 3), kB0 + 97, {});
     }
 };
 
@@ -280,7 +287,7 @@ void codec_vectors() {
 
     // FC_BUCKETS from the FR-B1 chain
     ChainA a;
-    const pb::GetBuckets req{kChain, cid(0x40, 3), kB0, kB0 + 2};
+    const pb::GetBuckets req{kChain, cid(0x40, 4), kB0, kB0 + 2};
     const std::vector<std::vector<std::uint8_t>> fr = pb::serve_buckets(a.s, req, kS, kFrame);
     check(a.ok && fr.size() == 1, "FR-B1 chain: one FC_BUCKETS frame");
     const std::vector<std::uint8_t>& f = fr.at(0);
@@ -363,7 +370,7 @@ void codec_vectors() {
 // ---------------------------------------------------------------------------
 void honest_vectors() {
     ChainA a;
-    const pb::Hash32 at = cid(0x40, 3);
+    const pb::Hash32 at = cid(0x40, 4);
     const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
     const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame).at(0);
     pb::BucketsAssembly as(req, kB0, F, kFrame);
@@ -378,7 +385,7 @@ void honest_vectors() {
         m.append(sb.leaf);
     }
     check(leaves, "FR-B1 reply: the leaves are the store's");
-    check(m.root() == *anchor_of(a.s, at).mmr_root, "FR-B1 reply: the received leaves rebuild mmr_root(at)");
+    check(m.root() == anchor_of(a.s, at).mmr_root, "FR-B1 reply: the received leaves rebuild at's header mmr_root");
     check(as.bins().at(kB0 + 1).bucket.rows.empty() &&
                   as.bins().at(kB0 + 1).leaf == pb::mmr_leaf_of(pb::seal_from_entries(kB0 + 1, {})),
           "FR-B1 reply: bin b0 + 1 is the E-8 empty leaf");
@@ -391,6 +398,33 @@ void honest_vectors() {
           "FR-B1 reply: S folds with at's receipts_root and is adopted");
     check(as.rows_allocated() == 2, "FR-B1 reply: 2 rows allocated");
 
+    // Bin b0 + 3 seals at `at` (c4) itself: leaf_count(at) = 4 = leaf_count(tip(at)) + 1. The reply is bound to
+    // at's own header (ruling 38): 3 leaves, at's header mmr_root.
+    {
+        const pb::LaneView v4 = a.s.view_at(at);
+        const pb::BucketsAnchor a4 = anchor_of(a.s, at);
+        check(v4.leaf_count() == 4 && v4.leaf_count_at(v4.pos() - 1) == 3 && dec(f).leaf_count == 3 &&
+                      a4.mmr_root == *a.s.best_mmr().prefix_root(3) && a4.mmr_root != v4.mmr_root(),
+              "a bin sealing at at itself: leaf_count(at) 4, leaf_count(tip(at)) 3, served leaf_count 3, at's header "
+              "root = the root of 3 leaves");
+        pb::BucketsReply y = dec(f);
+        y.leaf_count = 4;
+        y.peaks = *a.s.best_mmr().prefix_peaks(4);
+        for (std::size_t i = 0; i < y.entries.size(); ++i) {
+            const std::optional<pb::MmrProof> p4 = a.s.best_mmr().prefix_proof(i, 4);
+            y.entries.at(i).path.clear();
+            for (const auto& st : p4->path) y.entries.at(i).path.push_back(st.first);
+        }
+        check(refused(one(req, enc(y), a4), pb::BucketsFault::LeafCount),
+              "a reply at leaf_count(at) = 4 (peaks and proofs of 4 leaves) -> LeafCount");
+        const pb::GetBuckets own{kChain, at, kB0 + 3, kB0 + 3};
+        check(pb::serve_buckets(a.s, own, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, at),
+              "the bin sealed at at itself is not served at at (n = 0)");
+        const pb::GetBuckets next{kChain, cid(0x40, 0), kB0, kB0};
+        check(pb::serve_buckets(a.s, next, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, next.at),
+              "the genesis carrier commits no leaf: n = 0");
+    }
+
     // The FR-B1 golden payloads (miner 0xAA..AA): every proof verifies against
     // dc6ff5da... at leaf_count 3; the empty bin alone is served and accepted;
     // 0xAA..AA has no 66-byte reference, so a reply with its rows is refused.
@@ -398,13 +432,13 @@ void honest_vectors() {
     const pb::L1Bucket g1 = pb::seal_from_entries(kB0 + 1, {});
     const pb::L1Bucket g2 = pb::seal_from_entries(kB0 + 2, {pb::WinEntry{rep(0xAA), {}, 18180}});
     const Forged g = forge({g0, g1, g2});
-    check(hx(*g.anchor.mmr_root) == "dc6ff5da350b6e8e7b21fd6e75332e3d5acb872e3637378a5c476486ed9dd49c" &&
+    check(hx(g.anchor.mmr_root) == "dc6ff5da350b6e8e7b21fd6e75332e3d5acb872e3637378a5c476486ed9dd49c" &&
                   hx(pb::mmr_leaf_of(g1)) == "dcd7becdd422d3ff25c6477a1f9f26de4c109baf2930b1361bc7d09d46dc8417",
           "FR-B1 golden: root dc6ff5da..., empty leaf dcd7becd...");
     bool proofs = true;
     for (std::uint64_t i = 0; i < 3; ++i) {
         const pb::BucketEntry e = entry_of(g, i);
-        proofs = proofs && pb::mmr_verify(*g.anchor.mmr_root, pb::mmr_leaf_of(e.payload),
+        proofs = proofs && pb::mmr_verify(g.anchor.mmr_root, pb::mmr_leaf_of(e.payload),
                                           pb::wire_proof(i, 3, e.path, g.mmr.peaks()));
     }
     check(proofs, "FR-B1 golden: the wire proofs (leaf_index = bin_lo - b0) verify against dc6ff5da...");
@@ -424,7 +458,7 @@ void honest_vectors() {
 // ---------------------------------------------------------------------------
 void lying_vectors() {
     ChainA a;
-    const pb::Hash32 at = cid(0x40, 3);
+    const pb::Hash32 at = cid(0x40, 4);
     const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
     const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame).at(0);
     const pb::BucketsAnchor an = anchor_of(a.s, at);
@@ -435,11 +469,8 @@ void lying_vectors() {
         pb::BucketsReply x = r;
         x.leaf_count = 4;
         x.peaks = {seq32(0x01)};
-        check(refused(one(req, enc(x), an), pb::BucketsFault::LeafCount), "leaf_count 4 at H = b0 + 98 -> LeafCount");
-        pb::BucketsAnchor no_root = an;
-        no_root.mmr_root.reset();
-        check(refused(one(req, enc(x), no_root), pb::BucketsFault::LeafCount),
-              "leaf_count 4 refused from the header alone (root not held)");
+        check(refused(one(req, enc(x), an), pb::BucketsFault::LeafCount),
+              "leaf_count 4 at H(tip(at)) = b0 + 98 -> LeafCount");
     }
     // a bucket subset: a bin skipped; a row withheld
     {
@@ -447,7 +478,7 @@ void lying_vectors() {
         x.entries.erase(x.entries.begin() + 1);
         check(refused(one(req, enc(x), an), pb::BucketsFault::LeafIndex), "a bin skipped (b0, b0 + 2) -> LeafIndex");
         ChainR c;
-        const pb::GetBuckets rq{kChain, cid(0x50, 3), kB0, kB0};
+        const pb::GetBuckets rq{kChain, cid(0x50, 4), kB0, kB0};
         pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame).at(0));
         y.entries.at(0).rows.pop_back();
         y.entries.at(0).rows_total = 4;
@@ -487,7 +518,7 @@ void lying_vectors() {
         x.refs.clear();
         check(refused(one(req, enc(x), an), pb::BucketsFault::RefMissing), "no reference -> RefMissing");
         ChainR c;
-        const pb::GetBuckets rq{kChain, cid(0x50, 3), kB0, kB0};
+        const pb::GetBuckets rq{kChain, cid(0x50, 4), kB0, kB0};
         pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame).at(0));
         check(y.refs.size() == 5, "chain R bin b0: 5 references");
         std::swap(y.refs.at(0), y.refs.at(1));
@@ -572,7 +603,7 @@ void lying_vectors() {
 // ---------------------------------------------------------------------------
 void receiver_vectors() {
     ChainA a;
-    const pb::Hash32 at = cid(0x40, 3);
+    const pb::Hash32 at = cid(0x40, 4);
     const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
     const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame).at(0);
     const pb::BucketsAnchor an = anchor_of(a.s, at);
@@ -597,11 +628,6 @@ void receiver_vectors() {
         const pb::FrameOutcome d1 = one(req, f, no_hdr);
         check(d1.verdict == pb::FrameVerdict::Defer && d1.fault == pb::BucketsFault::AtUnknown && d1.strike == 0,
               "at not held as a header -> DEFER");
-        pb::BucketsAnchor no_root = an;
-        no_root.mmr_root.reset();
-        const pb::FrameOutcome d2 = one(req, f, no_root);
-        check(d2.verdict == pb::FrameVerdict::Defer && d2.fault == pb::BucketsFault::RootUnknown && d2.strike == 0,
-              "the root over leaf_count(at) not held -> DEFER");
         std::vector<std::uint8_t> bad = f;
         bad[1] = 2;
         const pb::FrameOutcome w = one(req, bad, an);
@@ -629,7 +655,7 @@ void receiver_vectors() {
 
     // paging: chain R, bins b0 (5 rows) and b0 + 1 (1 row with an owner) at 900 B per frame
     ChainR c;
-    const pb::Hash32 rat = cid(0x50, 3);
+    const pb::Hash32 rat = cid(0x50, 4);
     const pb::GetBuckets rq{kChain, rat, kB0, kB0 + 1};
     const pb::BucketsAnchor ran = anchor_of(c.s, rat);
     const std::vector<std::vector<std::uint8_t>> pages = pb::serve_buckets(c.s, rq, kS, 900);
@@ -724,9 +750,9 @@ void receiver_vectors() {
 // ---------------------------------------------------------------------------
 void serving_vectors() {
     ChainA a;
-    // a side carrier at the same height as c3 (not the best chain)
-    check(step(a.s, cid(0x41, 3), cid(0x40, 2), kB0 + 98, {}, false), "a side carrier beside c3");
-    const pb::GetBuckets side{kChain, cid(0x41, 3), kB0, kB0 + 2};
+    // a side carrier at the same height as c4 (not the best chain)
+    check(step(a.s, cid(0x41, 4), cid(0x40, 3), kB0 + 99, {}, false), "a side carrier beside c4");
+    const pb::GetBuckets side{kChain, cid(0x41, 4), kB0, kB0 + 2};
     const std::vector<std::vector<std::uint8_t>> sf = pb::serve_buckets(a.s, side, kS, kFrame);
     check(sf.size() == 1 && sf[0] == pb::encode_buckets_not_served(kChain, side.at),
           "at off the server's best chain -> n = 0, leaf_count 0");
@@ -735,19 +761,19 @@ void serving_vectors() {
     const pb::GetBuckets unknown{kChain, seq32(0x77), kB0, kB0 + 2};
     check(pb::serve_buckets(a.s, unknown, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, unknown.at),
           "at unknown to the server -> n = 0");
-    const pb::GetBuckets best{kChain, cid(0x40, 3), kB0, kB0 + 2};
+    const pb::GetBuckets best{kChain, cid(0x40, 4), kB0, kB0 + 2};
     check(pb::serve_buckets(a.s, best, std::nullopt, kFrame).at(0) == pb::encode_buckets_not_served(kChain, best.at),
           "S at at's parent not held -> n = 0");
-    const pb::GetBuckets below{kChain, cid(0x40, 3), kB0 - 2, kB0};
+    const pb::GetBuckets below{kChain, cid(0x40, 4), kB0 - 2, kB0};
     check(pb::serve_buckets(a.s, below, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, below.at),
           "a range starting below b0 -> n = 0");
-    const pb::GetBuckets beyond{kChain, cid(0x40, 3), kB0 + 3, kB0 + 9};
+    const pb::GetBuckets beyond{kChain, cid(0x40, 4), kB0 + 3, kB0 + 9};
     check(pb::serve_buckets(a.s, beyond, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, beyond.at),
-          "a range above leaf_count(at) -> n = 0");
+          "a range above leaf_count(tip(at)) -> n = 0");
 
     // a bin whose identity has no reference ends the served prefix
     ChainR q(false);
-    const pb::Hash32 qat = cid(0x50, 3);
+    const pb::Hash32 qat = cid(0x50, 4);
     const pb::GetBuckets qq{kChain, qat, kB0, kB0 + 1};
     const std::vector<std::vector<std::uint8_t>> qf = pb::serve_buckets(q.s, qq, kS, kFrame);
     pb::BucketsAssembly qa(qq, kB0, F, kFrame);
@@ -758,28 +784,28 @@ void serving_vectors() {
     check(pb::serve_buckets(q.s, qq1, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, qat),
           "... and alone it is not served");
 
-    // a joiner's prefix MMR (from the peaks of 3 leaves) serves only the leaves appended after it
+    // a joiner's prefix MMR (from the peaks of 3 leaves) serves only the leaves appended after it;
+    // at = c5, whose header commits leaf_count(tip(c5)) = 4 leaves
     ChainA ax;
     ax.extend();
     const pb::BinMmr& full = ax.s.best_mmr();
     pb::BinMmr pre = *pb::BinMmr::from_peaks(3, *full.prefix_peaks(3));
     pre.append(*full.leaf(3));
-    pre.append(*full.leaf(4));
     const pb::LaneView tip = ax.s.view_at(ax.s.best_tip());
     pb::BucketServeSource src;
     src.b0 = kB0;
-    src.leaf_count = 5;
+    src.leaf_count = 4;
     src.mmr = &pre;
     src.bucket = [&tip](std::uint64_t bin) { return tip.bucket(bin); };
     src.s_parent = kS;
-    const pb::GetBuckets j1{kChain, ax.s.best_tip(), kB0 + 2, kB0 + 4};
+    const pb::GetBuckets j1{kChain, ax.s.best_tip(), kB0 + 2, kB0 + 3};
     check(pb::serve_buckets_from(src, j1, kFrame).at(0) == pb::encode_buckets_not_served(kChain, j1.at),
           "a prefix MMR of 3 leaves does not serve leaf 2");
-    const pb::GetBuckets j2{kChain, ax.s.best_tip(), kB0 + 3, kB0 + 4};
+    const pb::GetBuckets j2{kChain, ax.s.best_tip(), kB0 + 3, kB0 + 3};
     pb::BucketsAssembly ja(j2, kB0, F, kFrame);
     const pb::FrameOutcome jo = ja.add_frame(kServerA, pb::serve_buckets_from(src, j2, kFrame).at(0),
                                              anchor_of(ax.s, ax.s.best_tip()));
-    check(jo.verdict == pb::FrameVerdict::Accepted && ja.complete(), "... and serves leaves 3 and 4");
+    check(jo.verdict == pb::FrameVerdict::Accepted && ja.complete(), "... and serves leaf 3");
 
     // a body that is not the leaf's (a stale record) ends the served prefix
     {
@@ -807,7 +833,7 @@ void serving_vectors() {
         const pb::GetBuckets sq{kChain, seq32(0x6a), kB0, kB0 + 3};
         pb::BucketsAnchor sa;
         sa.header_held = true;
-        sa.record = kB0 + F - 1 + 4;
+        sa.tip_record = kB0 + F - 1 + 4;
         sa.mmr_root = m.root();
         pb::BucketsAssembly ss(sq, kB0, F, kFrame);
         const pb::FrameOutcome so2 = ss.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame).at(0), sa);

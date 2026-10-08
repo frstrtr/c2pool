@@ -5,8 +5,9 @@
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/pathb_bucket_wire.hpp
-// Path B FC_GETBUCKETS / FC_BUCKETS (ruling 31 P-7; E-8, E-9): the L1 buckets
-// of sealed bins with their MMR proofs, bound to a carrier `at`, paged.
+// Path B FC_GETBUCKETS / FC_BUCKETS (rulings 31 P-7, 38; E-8, E-9): the L1
+// buckets of sealed bins with their MMR proofs, bound to a carrier `at`'s own
+// header, paged.
 //
 //   FC_GETBUCKETS  FH(0x54) | at[32] | u64 bin_lo | u64 bin_hi           bin_lo <= bin_hi
 //   FC_BUCKETS     FH(0x55) | at[32] | u64 leaf_count | u8 n_peaks | n_peaks x peak[32]
@@ -14,12 +15,14 @@
 //                  | u16 n | n x entry
 //     entry        LeafPayload v1[96] | u32 rows_total | u32 row_first | u16 n_rows
 //                  | n_rows x row[160] | u8 path_len | path_len x sibling[32]
-//   FH = u8 opcode | u8 frame version | u32 chain_id (LE), frame version 1.
+//   FH = u8 opcode | u8 frame version | u32 chain_id (LE), frame version 1
+//   (ruling 38).
 //
-//   leaf_count    = leaf_count(at) = max(0, H(at) - F - b0 + 1) (E-8; P-3,
-//                   b0 = H(0)); peaks = the peaks of that prefix, n_peaks =
-//                   popcount(leaf_count), bagged under leaf_count to the root
-//                   over leaf_count(at) leaves of at's chain.
+//   leaf_count    = leaf_count(tip(at)) = max(0, H(tip(at)) - F - b0 + 1),
+//                   tip(at) = at's parent (ruling 38; E-8; P-3, b0 = H(0));
+//                   peaks = the peaks of that prefix, n_peaks =
+//                   popcount(leaf_count), bagged under leaf_count to the
+//                   mmr_root in at's header.
 //   leaf_index    is not sent: leaf_index = bin_lo - b0 (E-8); the sibling
 //                   sides follow from it (mmr_proof_shape_ok).
 //   key_ref       u8 kind (XMR_STD) | u8 len 64 | spend[32] | view[32]; one
@@ -31,13 +34,14 @@
 //                   row_first) order from (bin_lo, 0) without a gap, inside
 //                   [bin_lo, bin_hi]; a server may stop after any entry.
 //   S_parent(at)  the 134-byte ratchet state at at's parent, checked against
-//                   at's receipts_root fold once at's carried ids are held.
+//                   the receipts_root in at's header once at's carried ids are
+//                   held.
 //   not served    n = 0, leaf_count = 0, no peaks, S zero, no references.
 //
 // Serving rule: `at` on the server's best chain at or below its tip; bins in
-// order from bin_lo while the server proves the leaf at leaf_count(at), holds
-// the rows and holds a reference for every identity; otherwise n = 0. No
-// strike either way.
+// order from bin_lo while the server proves the leaf at leaf_count(tip(at)),
+// holds the rows and holds a reference for every identity; otherwise n = 0.
+// No strike either way (ruling 38).
 //
 // Receiver, per frame, in order (BucketsAssembly::add_frame):
 //   frame above the buffer (P-39)                         DROP, no token
@@ -46,9 +50,8 @@
 //   at == the request's at                                 else DROP
 //   n == 0                                                 ask another peer, no verdict
 //   at held as a header                                    else DEFER
-//   leaf_count == leaf_count(at)
-//   the root over leaf_count(at) leaves held               else DEFER
-//   the peaks bag to that root under leaf_count
+//   leaf_count == leaf_count(tip(at))
+//   the peaks bag to at's header mmr_root under leaf_count
 //   S_parent equal in every frame of one server; folded with at's
 //     receipts_root when at's carried ids are held (else pending)
 //   references strictly ascending by identity, each decompressing (I-7)
@@ -65,7 +68,7 @@
 // A failure refuses the frame and strikes its server once; that server's pages
 // are discarded and its later frames for the request are dropped. A bin
 // completes from the pages of ONE server; a page not received is asked from
-// another server (abandon()).
+// another server (abandon()). Verdicts and assembly: ruling 38.
 //
 // Policy (ruling 23): P-39 frame buffer, P-41 requests in flight per peer,
 // P-42 bytes per peer per minute; over a budget: DROP, no verdict.
@@ -103,7 +106,7 @@ namespace c2pool::xmr::pathb {
 // ---------------------------------------------------------------------------
 inline constexpr std::uint8_t kOpFcGetBuckets = 0x54;  // family C (ruling 31 P-7)
 inline constexpr std::uint8_t kOpFcBuckets = 0x55;
-inline constexpr std::uint8_t kFcFrameVersion = 1;     // FH frame version
+inline constexpr std::uint8_t kFcFrameVersion = 1;     // FH frame version (ruling 38)
 
 inline constexpr std::size_t kRatchetStateBytes = rs_layout::kSize;
 static_assert(kRatchetStateBytes == 134);
@@ -493,11 +496,11 @@ inline bool rows_total_ok(const L1Bucket& payload, std::uint32_t rows_total) {
 // ---------------------------------------------------------------------------
 // The receiver
 // ---------------------------------------------------------------------------
-// What the receiver holds about `at` when a frame is judged.
+// What the receiver holds about `at` when a frame is judged: at's header.
 struct BucketsAnchor {
     bool header_held = false;                         // at held as a header (else DEFER)
-    std::uint64_t record = 0;                         // H(at)
-    std::optional<Hash32> mmr_root;                   // the root over leaf_count(at) leaves of at's chain (else DEFER)
+    std::uint64_t tip_record = 0;                     // H(tip(at)), the record of at's parent
+    Hash32 mmr_root{};                                // at's side_data mmr_root
     Hash32 receipts_root{};                           // at's side_data receipts_root
     std::optional<std::vector<Hash32>> carried_ids;   // at's carried ids in canonical order, once its body is held
 };
@@ -515,16 +518,15 @@ enum class BucketsFault : std::uint8_t {
     OverBuffer,    // DROP: the frame is above the buffer (P-39)
     Unsolicited,   // DROP: another at, or a server already refused / abandoned for this request
     AtUnknown,     // DEFER
-    RootUnknown,   // DEFER
     Wire,          // the bytes do not decode (BucketsWireError)
-    LeafCount,     // leaf_count != leaf_count(at)
+    LeafCount,     // leaf_count != leaf_count(tip(at))
     Peaks,         // the peaks do not bag to the root under leaf_count
     SChanged,      // S_parent differs from an earlier frame of the same server
     SParent,       // S_parent does not fold with at's receipts_root
     RefOrder,      // references not strictly ascending by identity
     RefPoint,      // a reference key does not decompress
     BinRange,      // an entry beyond bin_hi
-    LeafIndex,     // bin below b0 or not a leaf at leaf_count(at); bin_lo != b0 + leaf_index
+    LeafIndex,     // bin below b0 or not a leaf at leaf_count; bin_lo != b0 + leaf_index
     Proof,         // the MMR proof of the LeafPayload fails
     RowsTotal,     // rows_total against raw_sum / d_min
     Order,         // the entry is not the server's next (bin, row_first)
@@ -582,10 +584,9 @@ public:
         if (v.at != req_.at) return drop(BucketsFault::Unsolicited);
         if (v.entries.empty()) return FrameOutcome{FrameVerdict::NotServed};
         if (!a.header_held) return defer(BucketsFault::AtUnknown);
-        const std::uint64_t lc = bin_leaf_count(a.record, b0_, f_);
+        const std::uint64_t lc = bin_leaf_count(a.tip_record, b0_, f_);
         if (v.leaf_count != lc) return refuse(src, BucketsFault::LeafCount);
-        if (!a.mmr_root) return defer(BucketsFault::RootUnknown);
-        const Hash32 root = a.mmr_root.value_or(kZeroHash);
+        const Hash32& root = a.mmr_root;
         if (!peaks_match_root(v.peaks, v.leaf_count, root)) return refuse(src, BucketsFault::Peaks);
         if (src.s && *src.s != v.s_parent) return refuse(src, BucketsFault::SChanged);
         if (a.carried_ids && !s_folds(a, v.s_parent)) return refuse(src, BucketsFault::SParent);
@@ -789,7 +790,7 @@ private:
 // What a server holds for `at` on its best chain.
 struct BucketServeSource {
     std::uint64_t b0 = 0;
-    std::uint64_t leaf_count = 0;                                   // leaf_count(at); 0: nothing to serve
+    std::uint64_t leaf_count = 0;                                   // leaf_count(tip(at)); 0: nothing to serve
     const BinMmr* mmr = nullptr;                                    // proves leaves below leaf_count
     std::function<const SealedBin*(std::uint64_t bin)> bucket;      // a sealed bin's body; nullptr when not held
     RatchetStateBytes s_parent{};                                   // S at at's parent
@@ -833,7 +834,7 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketSer
         // leaf_index = bin - b0; a bin below b0 wraps to an index no MMR proves
         const std::uint64_t i = bin - src.b0;
         const std::optional<MmrProof> pr = src.mmr->prefix_proof(i, src.leaf_count);
-        if (!pr) break;  // not provable at leaf_count(at)
+        if (!pr) break;  // not provable at leaf_count
         const SealedBin* sb = src.bucket ? src.bucket(bin) : nullptr;
         if (sb == nullptr) break;  // rows not held
         if (sb->bucket.bin_lo != bin || src.mmr->leaf(i) != std::optional<Hash32>(sb->leaf)) break;  // not the leaf's body
@@ -921,7 +922,7 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets(const BinStore& stor
     if (!s_parent) return {encode_buckets_not_served(req.chain_id, req.at)};
     BucketServeSource src;
     src.b0 = store.b0();
-    src.leaf_count = view.leaf_count();
+    src.leaf_count = view.pos() == 0 ? 0 : view.leaf_count_at(view.pos() - 1);  // leaf_count(tip(at))
     src.mmr = &store.best_mmr();
     src.bucket = [&view](std::uint64_t bin) { return view.bucket(bin); };
     src.s_parent = s_parent.value_or(RatchetStateBytes{});

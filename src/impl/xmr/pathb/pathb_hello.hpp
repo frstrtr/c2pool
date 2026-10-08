@@ -143,7 +143,7 @@ inline HelloTailDecode decode_hello_tail(std::span<const std::uint8_t> b) {
 enum class HelloLeafCount : std::uint8_t {
     Equal,
     Pending,   // the best tip's header is not held yet
-    Mismatch,  // mmr_leaf_count != leaf_count(best_tip)
+    Mismatch,  // mmr_leaf_count != leaf_count(best_tip): close the link, no strike (ruling 38)
 };
 
 inline HelloLeafCount hello_leaf_count_check(const HelloTail& t, std::optional<std::uint64_t> best_tip_record,
