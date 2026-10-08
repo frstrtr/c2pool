@@ -84,7 +84,7 @@ int main() {
         const pb::Hash32 tip = r.side.tip, p_r = r.blob.prev_id, mm = seq32(0x77);
         // the receipt commits the canonical coinbase for tip A's window ...
         const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w_a, tip, p_r, 16, mm);
-        r.blob.tree_root = pb::tree_root_fold(cl.leaf, std::span<const pb::Hash32>(r.branch));
+        r.blob.tree_root = pb::tree_root_fold(cl.leaf.value(), std::span<const pb::Hash32>(r.branch));
         check(pb::canonical_coinbase_ok_split(r, w_a, tip, p_r, 16, mm), "correct tip-A window admitted");
         // ... checked against tip B's window -> refused.
         check(!pb::canonical_coinbase_ok_split(r, w_b, tip, p_r, 16, mm), "paying another tip's window refused");

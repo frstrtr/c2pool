@@ -164,7 +164,7 @@ int main() {
         pb::ReceiptBodyV3 r = make_body(3, false, 0x20);
         const pb::Hash32 tip_r = r.side.tip, pr_r = r.blob.prev_id;
         const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w, tip_r, pr_r, 16, mm);
-        r.blob.tree_root = pb::tree_root_fold(cl.leaf, std::span<const pb::Hash32>(r.branch));
+        r.blob.tree_root = pb::tree_root_fold(cl.leaf.value(), std::span<const pb::Hash32>(r.branch));
         check(pb::canonical_coinbase_ok_split(r, w, tip_r, pr_r, 16, mm), "correct hf-16 split admitted");
         {
             bool rx = false;
@@ -189,7 +189,7 @@ int main() {
             pb::ReceiptBodyV3 carried = make_body(2, false, 0x30);
             const pb::Hash32 tip_c = carried.side.tip, pr_c = carried.blob.prev_id;
             const pb::CanonLeaf clc = pb::canonical_coinbase_leaf(carried, w, tip_c, pr_c, 16, mm);
-            carried.blob.tree_root = pb::tree_root_fold(clc.leaf, std::span<const pb::Hash32>(carried.branch));
+            carried.blob.tree_root = pb::tree_root_fold(clc.leaf.value(), std::span<const pb::Hash32>(carried.branch));
             check(pb::canonical_coinbase_ok_split(carried, w, tip_c, pr_c, 16, mm), "carried correct split admitted");
         }
 

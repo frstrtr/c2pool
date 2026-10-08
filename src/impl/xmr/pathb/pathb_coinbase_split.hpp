@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -82,10 +83,11 @@ inline Hash32 finder_only_leaf(const ReceiptBodyV3& r, const Hash32& tip, const 
 
 // The canonical coinbase leaf a receipt committing reward R on (tip, P_r) must
 // carry, given its window. FORK-FUSE: at hf >= 17 no amount is produced.
+// leaf is engaged iff a canonical coinbase exists (neither flag set).
 struct CanonLeaf {
     bool fork_fused = false;       // hf >= 17: amount owed (O-01), nothing built
-    bool shares_undefined = false; // p + give_author_bp > 10000: no canonical coinbase
-    Hash32 leaf{};
+    bool shares_undefined = false; // p + give_author_bp > 10000 (the receipt or a window entry): nothing built
+    std::optional<Hash32> leaf;    // empty when nothing is built
 };
 
 inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w, const Hash32& tip,
@@ -104,6 +106,10 @@ inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w
         return cl;
     }
     const std::vector<SplitOutput> outs = split(r.reward_total, w);
+    if (outs.empty()) {
+        cl.shares_undefined = true;  // window weights do not sum to W: build nothing
+        return cl;
+    }
     const std::vector<std::uint8_t> extra = canonical_tx_extra_hf16(/*r_tx=*/p_r, r.extra_nonce, mm_root);
     cl.leaf = canonical_cb_leaf(outs, tip, p_r, extra);
     return cl;
@@ -112,13 +118,14 @@ inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w
 // Admission #12 (ruling 4, C37): the receipt's committed coinbase (tree_root
 // folded over the branch) equals the canonical split leaf. false -> BAN before
 // RandomX. At hf >= 17 the lane fork-fuses (never admits an amount). A receipt
-// with p + give_author_bp > 10000 has no canonical coinbase: refused.
+// with p + give_author_bp > 10000, or whose window holds such an entry, has no
+// canonical coinbase: refused.
 inline bool canonical_coinbase_ok_split(const ReceiptBodyV3& r, const Window& w, const Hash32& tip,
                                         const Hash32& p_r, std::uint8_t hf, const Hash32& mm_root) {
     const CanonLeaf cl = canonical_coinbase_leaf(r, w, tip, p_r, hf, mm_root);
     if (cl.fork_fused) return false;  // hf >= 17: admit nothing
     if (cl.shares_undefined) return false;
-    return tree_root_fold(cl.leaf, std::span<const Hash32>(r.branch)) == r.blob.tree_root;
+    return tree_root_fold(cl.leaf.value(), std::span<const Hash32>(r.branch)) == r.blob.tree_root;
 }
 
 // ---------------------------------------------------------------------------

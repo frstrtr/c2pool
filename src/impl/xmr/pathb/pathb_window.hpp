@@ -20,7 +20,8 @@
 //     parts, before merge-back) has w_X x B(A_t) < W x f_spend returns its owner /
 //     author share to the contributing receipts' miners; W constant. [K11b, 24 K-1]
 //   split(R, w): q_i = floor(R w_i / W), largest remainder, ties by identity
-//     ascending, Sum(vout) == R exactly. [K29a, C07, C21]
+//     ascending, Sum(vout) == R exactly; no outputs when the weights do not
+//     sum to W. [K29a, C07, C21]
 //   window_root: Merkle-SUM, leaf = (sha256d(0x06 || payee || LE256(w)), w),
 //     node sums bound into the hash (0x07). [S3.2]
 //
@@ -66,7 +67,8 @@ struct WinBin {
 // The shares of a receipt are defined iff p + give_author_bp <= 10000: then
 // w_owner + w_author <= work and the three shares sum to the work exactly.
 // A receipt with p + give_author_bp > 10000 has no canonical coinbase and is
-// refused at admission #12 (canonical_coinbase_ok_split).
+// refused at admission #12 (canonical_coinbase_ok_split); a window holding such
+// an entry has no split (split() returns no outputs).
 inline constexpr bool shares_defined(std::uint16_t p, std::uint16_t ga) noexcept {
     return static_cast<std::uint32_t>(p) + ga <= kBasisPointsScale;
 }
@@ -291,15 +293,25 @@ inline Window window(const std::vector<WinBin>& bins_newest_first, std::uint64_t
 // ---------------------------------------------------------------------------
 // split(R, window) (S3.4 `split`; K29a, C07, C21): q_i = floor(R w_i / W) in
 // U320, largest remainder, ties by payee identity ascending, Sum(vout) == R.
+// A window whose weights do not sum to W (an entry with p + give_author_bp >
+// 10000) has no split: no outputs.
 // ---------------------------------------------------------------------------
 struct SplitOutput {
     Hash32 payee{};
     std::uint64_t amount = 0;
 };
 
+// The payee weights sum to W exactly (merge-back only moves weight).
+inline bool weights_sum_to_W(const Window& w) {
+    Work sum;
+    for (const auto& [payee, wt] : w.weight) sum += wt;
+    return sum == w.W;
+}
+
 inline std::vector<SplitOutput> split(std::uint64_t R, const Window& w) {
     std::vector<SplitOutput> out;
-    if (w.weight.empty()) return out;  // empty window -> finder-only (caller)
+    if (w.weight.empty()) return out;       // empty window -> finder-only (caller)
+    if (!weights_sum_to_W(w)) return out;   // shares undefined: no split
     struct Row {
         Hash32 payee;
         Work w;
