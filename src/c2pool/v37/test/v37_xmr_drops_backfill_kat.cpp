@@ -249,6 +249,7 @@ int main() {
     C(wait_for([&] { return A.relay->ready_peers().size() == 1 && B.relay->ready_peers().size() == 1; }, {&A, &B}),
       "B1 HELLO: A-B up");
     const bool b1 = sync_until(B, 100, 104, {&A, &B});
+    B.pump();   // drain_drops() after drops_sync() is complete (the daemon's order)
     std::vector<bytes32> idsA; for (auto& a : dropsA) idsA.push_back(a.id); std::sort(idsA.begin(), idsA.end());
     const auto hb = held(B, 100, 104);
     std::printf("    B holds %zu/12 of A's raindrops for [100,104); backfilled=%llu served_by_A=%llu B rx=%llu\n", hb.size(),
