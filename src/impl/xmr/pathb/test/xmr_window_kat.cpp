@@ -17,7 +17,8 @@
 //         one at 18,180, B 6e11, f_spend 12,530,000) -> cut by position, the
 //         300 kept, W 1,290,000,000 (not finder-only);
 //   (iii) R-13: a miner at weight 0 (p 10000) is not a payee for N: N 2 keeps
-//         both bins;
+//         both bins; the author counts once a receipt donates: N 3 drops the
+//         oldest bin;
 //   (iv)  the (tip, v) window cache: three lookups -> one evaluation; (t, 17)
 //         != (t, 16) and == a fresh window(t, 17); a one-entry budget and the
 //         default give the same answers; a DEFER is not stored; the entry
@@ -144,6 +145,21 @@ static void s3b_n_count_after_shares() {
           "(iii) N 2: payees {Y, Z}, both bins kept (the weight-0 miner is not counted)");
     check(w.weight.count(id_of(0x0A)) == 0 && w.weight.at(id_of(0x0B)) == pb::Work(40000),
           "(iii) X has no output; Y = 20,000 own + 20,000 owner share");
+    // the author identity counts once a receipt donates: N 3 drops bin 1.
+    pb::WinEntry a = y, b = y, c = z;
+    a.miner = id_of(0x1A);
+    a.give_author_bp = 10;
+    a.position = 31;
+    a.id = id_of(0x101A);
+    b.miner = id_of(0x1B);
+    b.position = 30;
+    b.id = id_of(0x101B);
+    c.miner = id_of(0x1C);
+    c.id = id_of(0x101C);
+    std::vector<pb::WinBin> donating{{2, {a, b}}, {1, {c}}};
+    const pb::Window wa = pb::window(donating, kHugeDnet, kB, pb::f_spend(kB, 300000, 16), 3, id_of(0xAA));
+    check(wa.weight.count(id_of(0x1C)) == 0 && wa.W == pb::Work(40000),
+          "(iii) N 3: payees {A, B, author} fill N, bin 1 (C) leaves the window");
 }
 
 // (iv) the (tip, v) window cache.
@@ -319,11 +335,11 @@ int main() {
         check(pb::window_root(w) == pb::Hash32{}, "empty window_root == 32 zero bytes");
     }
 
-    s3b_in_bin_cut();
-    s3b_newest_bin_w_max_cut();
-    s3b_n_count_after_shares();
-    s3b_window_cache();
-    s3b_dnet_u128();
+    run_part("s3b_in_bin_cut", s3b_in_bin_cut);
+    run_part("s3b_newest_bin_w_max_cut", s3b_newest_bin_w_max_cut);
+    run_part("s3b_n_count_after_shares", s3b_n_count_after_shares);
+    run_part("s3b_window_cache", s3b_window_cache);
+    run_part("s3b_dnet_u128", s3b_dnet_u128);
 
     return finish("xmr_window_kat");
 }

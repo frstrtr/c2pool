@@ -440,9 +440,9 @@ int main() {
         }
     }
 
-    s3b_store_build_orders();
-    s3b_store_dead_dmin();
-    s3b_m_doubles_and_retention();
+    run_part("s3b_store_build_orders", s3b_store_build_orders);
+    run_part("s3b_store_dead_dmin", s3b_store_dead_dmin);
+    run_part("s3b_m_doubles_and_retention", s3b_m_doubles_and_retention);
 
     return finish("xmr_window_spend_floor_kat");
 }

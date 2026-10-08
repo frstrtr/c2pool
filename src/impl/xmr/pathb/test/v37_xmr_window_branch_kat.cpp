@@ -186,7 +186,7 @@ void s3b_race() {
 }  // namespace
 
 int main() {
-    s3b_race();
+    run_part("s3b_race", s3b_race);
 
     const std::uint64_t B = 600000000000ull;
     const std::uint64_t f = 1;  // loose

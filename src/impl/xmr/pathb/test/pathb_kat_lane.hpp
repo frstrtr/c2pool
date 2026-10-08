@@ -13,8 +13,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_bin_store.hpp"
@@ -26,6 +28,16 @@
 namespace pathb_kat {
 
 namespace pb = ::c2pool::xmr::pathb;
+
+// A part that throws (a broken invariant) fails by name instead of aborting the KAT.
+template <class Body>
+inline void run_part(const std::string& name, Body&& body) {
+    try {
+        body();
+    } catch (const std::exception& e) {
+        check(false, name + ": exception " + e.what());
+    }
+}
 
 // distinct ids: tag byte, then a counter (LE64).
 inline pb::Hash32 idn(std::uint8_t tag, std::uint64_t n) {

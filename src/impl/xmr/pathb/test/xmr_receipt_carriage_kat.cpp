@@ -160,7 +160,7 @@ static void s3_crediting() {
 }
 
 int main() {
-    s3_crediting();
+    run_part("s3_crediting", s3_crediting);
     const pb::LaneParams& lp = pb::kRuledLaneParams;
     const std::uint64_t F = lp.open_bins;   // K04 = 96
     const std::uint64_t r_max = lp.r_max;   // K08 = 16

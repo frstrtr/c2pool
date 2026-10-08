@@ -212,7 +212,7 @@ static void store_path() {
 }
 
 int main() {
-    store_path();
+    run_part("store_path", store_path);
 
     // ---- mainnet-tail e2e: Sum == R and roots_ok lift the zero stubs ----
     {

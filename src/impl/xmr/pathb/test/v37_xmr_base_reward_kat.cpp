@@ -290,7 +290,7 @@ void s3b_follower_view() {
 }  // namespace
 
 int main() {
-    s3b_follower_view();
+    run_part("s3b_follower_view", s3b_follower_view);
 
     // mainnet tail: a fully-emitted supply pays the floor 6e11 (0.6 XMR).
     check(pb::base_reward_at(18446744073000000000ull, 16) == pb::kTailBaseReward
