@@ -208,7 +208,7 @@
 // drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
 // (drops_persist_path, drops_persist(), drops_load()).
 #define C2POOL_XMR_DROPS_HARDEN 1
-// set_test_drop_pow_hook() / test_ingest() exist.
+// set_test_drop_pow_hook() / set_test_drop_stored_hook() / test_drop_held() / test_ingest() exist.
 #define C2POOL_XMR_RELAY_DROP_POW_HOOK 1
 
 namespace c2pool::v37n::xmr::relay {
@@ -1472,6 +1472,11 @@ public:
     // Test hook (set before start()): called on the verify worker after a
     // raindrop's PoW check, before admit_drop.
     void set_test_drop_pow_hook(std::function<void(const bytes32&)> f) { m_test_drop_pow_hook = std::move(f); }
+    // Test hook (set before start()): called on the verify worker after a
+    // raindrop is stored and flooded, before it is queued for drain_drops().
+    void set_test_drop_stored_hook(std::function<void(const bytes32&)> f) { m_test_drop_stored_hook = std::move(f); }
+    // Test hook: drops_sync()'s held predicate for one id.
+    bool test_drop_held(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return drop_held_locked(id); }
     // Test hook: queue one encoded receipt from `from` (on_receipts' per-receipt path).
     bool test_ingest(const std::vector<u8>& raw, PeerId from) {
         Item it;
@@ -2818,6 +2823,7 @@ private:
         if (it.solicited && drop_unwant(a.id)) m_st.drops_backfilled++;   // ★ RAIN-BACKFILL
         drop_store_put(a.id, bin, a.raw, a.pow);
         flood(a.raw, it.from);
+        if (m_test_drop_stored_hook) m_test_drop_stored_hook(a.id);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
     }
@@ -4044,6 +4050,7 @@ private:
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
     std::function<void(const bytes32&)> m_test_drop_pow_hook;
+    std::function<void(const bytes32&)> m_test_drop_stored_hook;
     Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
     std::atomic<u64> m_ping_nonce{0};               // RELAY-LIVENESS (bumped by maintenance only; read by the won re-offer)
 
