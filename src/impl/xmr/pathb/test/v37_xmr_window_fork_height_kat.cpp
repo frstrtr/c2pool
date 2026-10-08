@@ -6,20 +6,21 @@
 // ---------------------------------------------------------------------------
 // v37_xmr_window_fork_height_kat (pathb_emission.hpp / pathb_coinbase_split.hpp,
 // C41): a tip one height below the hf 17 fork gives two windows -- hf 16 (OUT 40,
-// OVH 89) and hf 17 (OUT 90, OVH 61) -- each exact as a FORMAT; N(B) differs; at
-// hf 17 NO amount is produced until O-01 exists (the lane FORK-FUSEs).
+// OVH 89) and hf 17 (OUT 90, OVH 61) -- each as a FORMAT; N(B) differs; at hf 17
+// NO amount is produced until O-01 exists (the lane FORK-FUSEs): an hf-17
+// receipt is REFUSED (Fused) with 0 strike tokens and no ban, RandomX not called.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 
 #include "impl/xmr/pathb/pathb_coinbase_split.hpp"
 #include "impl/xmr/pathb/pathb_emission.hpp"
 #include "impl/xmr/pathb/pathb_window.hpp"
+#include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
+#include "pathb_kat_miner.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
-
-static pb::Hash32 rep(std::uint8_t b) { pb::Hash32 h{}; h.fill(b); return h; }
 
 int main() {
     const std::uint64_t s = 600000000000ull;  // S_A = 6e11
@@ -36,20 +37,41 @@ int main() {
     check(!pb::amount_fork_fused(16), "hf16 amounts produced");
     check(pb::amount_fork_fused(17) && pb::amount_fork_fused(18), "hf >= 17 FORK-FUSEs the amount");
 
-    // the canonical coinbase at hf 17 builds NOTHING (fork_fused), at hf 16 it does.
-    pb::ReceiptBodyV3 r;
+    // the canonical coinbase at hf 17 builds NOTHING (Fused), at hf 16 it does.
+    RefBook book;
+    const pb::XmrKeyRef author = kat_author();
+    const pb::Window w = window_of({{book.add(key_ref(0xA1)), 100}});
+    pb::ReceiptBodyV3 r = make_body(3, false, 0x30);
     r.reward_total = 700000000000ull;
-    pb::Window w;
-    w.weight[rep(0xA1)] = pb::Work(100);
-    w.W = pb::Work(100);
-    const pb::Hash32 tip = rep(0x01), p_r = rep(0x02);
-    const pb::CanonLeaf at16 = pb::canonical_coinbase_leaf(r, w, tip, p_r, 16);
-    const pb::CanonLeaf at17 = pb::canonical_coinbase_leaf(r, w, tip, p_r, 17);
-    check(!at16.fork_fused && at16.leaf.has_value(), "hf16 canonical coinbase leaf built");
-    check(at17.fork_fused && !at17.leaf.has_value(),
-          "hf17 canonical coinbase FORK-FUSED (no leaf, no amount invented)");
-    // at hf 17 admission admits nothing (builds nothing).
-    check(!pb::canonical_coinbase_ok_split(r, w, tip, p_r, 17), "hf17: admit nothing (O-01 owed)");
+    const pb::Hash32 tip = r.side.tip, p_r = r.blob.prev_id;
+    commit_miner_tx(r, w, tip, p_r, kKatHeight, book, author);
+    pb::KeyCache cache;
+    const pb::CanonicalTx at16 =
+            pb::canonical_miner_tx(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, cache, book.lookup(), author);
+    const pb::CanonicalTx at17 =
+            pb::canonical_miner_tx(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 17, cache, book.lookup(), author);
+    check(at16.stop == pb::CoinbaseCheck::Match && at16.tx.has_value(), "hf16 canonical miner tx built");
+    check(at17.stop == pb::CoinbaseCheck::Fused && !at17.tx.has_value(),
+          "hf17 canonical coinbase FORK-FUSED (no miner tx, no amount invented)");
+
+    // at hf 17 the receipt is REFUSED: no strike token, no ban, RandomX not called.
+    for (std::uint8_t hf : {std::uint8_t{17}, std::uint8_t{18}}) {
+        const pb::CoinbaseCheck c =
+                pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, hf, cache, book.lookup(), author);
+        bool rx = false;
+        const pb::TailResult t = pb::admit_coinbase_then_randomx(c, [&] { rx = true; return true; });
+        check(c == pb::CoinbaseCheck::Fused, "hf " + std::to_string(hf) + ": Fused");
+        check(t.verdict == pb::AdmitVerdict::Refuse && pb::strike_tokens(t.verdict) == 0 && !t.randomx_called && !rx,
+              "hf " + std::to_string(hf) + ": REFUSED, 0 strike tokens, no ban, RandomX not called");
+    }
+    // the same receipt at hf 16 is admitted.
+    {
+        bool rx = false;
+        const pb::TailResult t = pb::admit_coinbase_then_randomx(
+                pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, cache, book.lookup(), author),
+                [&] { rx = true; return true; });
+        check(t.verdict == pb::AdmitVerdict::AdmitCarrier && rx, "hf16: admitted, RandomX after #12");
+    }
 
     return finish("v37_xmr_window_fork_height_kat");
 }

@@ -7,24 +7,28 @@
 // v37_xmr_pathb_coinbase_kat (pathb_coinbase_split.hpp, C07, "kept name"
 // xmr_coinbase_kat -- shipped pathb-scoped because the native settle
 // xmr_coinbase_kat target already exists): Sum(vout) == R = base + fees through
-// the Path B coinbase on a mainnet-tail vector, the window built by window() from
-// WinBins (two of three bins, owner and author shares); the canonical split
-// coinbase is admitted; a wrong split is a BAN before RandomX (the RandomX stub is not called).
-// The leaf commits mm_root_of(side_data_v3) of the receipt: a side_data_v3 field
-// changed after the coinbase was built is a BAN before RandomX on the split and
-// the finder-only path; a side_data_v3 that does not encode builds no leaf.
+// the split of a window built by window() from WinBins (two of three bins, owner
+// and author shares) and through the Path B coinbase (the hf-16 miner tx) on the
+// payees of mainnet block
+// 3,755,897 (R 600,000,000,000) and on a regtest vector (R 35,184,338,534,400,
+// fees 0), both with a non-zero largest-remainder deficit; the canonical split
+// miner tx is admitted; a wrong one is a BAN before RandomX (the RandomX stub is
+// not called). The miner tx commits mm_root_of(side_data_v3) of the receipt: a
+// side_data_v3 field changed after the coinbase was built is a BAN before
+// RandomX on the split and the finder-only path; a side_data_v3 that does not
+// encode builds nothing (BAN).
 // S2.3 #2 p + give_author_bp <= 10000, the received bytes through the codec,
 // the resolution, #12 and RandomX: 10000 + 1, 5001 + 5000, 10000 + 10 -> STRIKE
 // at #2 (ShareSum), no fetch, no RandomX, on a window and on an empty window
-// (finder-only), tip known or unknown, tree_root from the leaf its miner builds
-// or from the zero leaf; 9990 + 10 and 10000 + 0 -> admitted (tip known) or
-// DEFER (tip unknown); the receipt's own entry at 9990 + 10 / 10000 + 0: weights
-// sum to W, Sum(vout) == R, miner weight 0 at 10000 + 0. A window holding an
-// entry above 10000 has no split and no canonical coinbase; no leaf is built
-// when the amount is fork-fused; a tree_root folded from the zero leaf is
-// refused.
+// (finder-only), tip known or unknown, tree_root from the miner tx its miner
+// builds or from the zero leaf; 9990 + 10 and 10000 + 0 -> admitted (tip known)
+// or DEFER (tip unknown); the receipt's own entry at 9990 + 10 / 10000 + 0:
+// weights sum to W, Sum(vout) == R, miner weight 0 at 10000 + 0. A window
+// holding an entry above 10000 has no split and no canonical coinbase (BAN); an
+// hf-17 receipt is REFUSED (Fused) with no token and RandomX not called.
 // ---------------------------------------------------------------------------
 #include <cstdint>
+#include <cstdio>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,6 +38,8 @@
 #include "impl/xmr/pathb/pathb_window.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
+#include "pathb_kat_miner.hpp"
+#include "pathb_m2_blocks.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
@@ -50,8 +56,71 @@ static pb::Work weight_of(const pb::Window& w, const pb::Hash32& id) {
     return it == w.weight.end() ? pb::Work{} : it->second;
 }
 
+// Sum of floor(R w_i / W) over the window (no largest remainder).
+static std::uint64_t floor_sum(std::uint64_t R, const std::vector<std::pair<pb::Hash32, std::uint64_t>>& wts) {
+    unsigned __int128 W = 0;
+    for (const auto& [id, w] : wts) W += w;
+    std::uint64_t s = 0;
+    for (const auto& [id, w] : wts) s += static_cast<std::uint64_t>(static_cast<unsigned __int128>(R) * w / W);
+    return s;
+}
+
 int main() {
-    // mainnet-tail vector: base = 6e11, fees 5e9 -> R = 605e9.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const pb::XmrKeyRef author = kat_author();
+    RefBook book;
+    const pb::RefLookup refs = book.lookup();
+    pb::KeyCache cache;
+    auto check12 = [&](const pb::ReceiptBodyV3& r, const pb::Window& w, std::uint8_t hf) {
+        return pb::canonical_coinbase_check(r, pb::WindowAt{&w}, r.side.tip, r.blob.prev_id, kKatHeight, hf, cache,
+                                            refs, author);
+    };
+    auto commit = [&](pb::ReceiptBodyV3& r, const pb::Window& w) {
+        return commit_miner_tx(r, w, r.side.tip, r.blob.prev_id, kKatHeight, book, author);
+    };
+
+    // ---- case 4: Sum(vout) == R through the Path B coinbase ----
+    {
+        // mainnet tail: the 47 payees of block 3,755,897, R 600,000,000,000.
+        const m2::Block& B = m2::kBlocks[0];
+        check(B.height == 3755897 && B.reward == 600000000000ull, "case 4: block 3,755,897, R 600,000,000,000");
+        std::vector<std::pair<pb::Hash32, std::uint64_t>> wts;
+        for (std::size_t i = 0; i < B.n_payees; ++i) {
+            pb::XmrKeyRef ref;
+            ref.spend = h32(B.payees[i].spend);
+            ref.view = h32(B.payees[i].view);
+            wts.push_back({book.add(ref), 1000003u + 7919u * i});
+        }
+        const pb::Window w = window_of(wts);
+        pb::ReceiptBodyV3 r = make_body(3, false, 0x24);
+        r.reward_total = B.reward;
+        check(floor_sum(r.reward_total, wts) < r.reward_total, "case 4 mainnet: the floors sum below R (deficit > 0)");
+        const pb::CanonicalTx c = pb::canonical_miner_tx(r, pb::WindowAt{&w}, r.side.tip, r.blob.prev_id, kKatHeight,
+                                                         16, cache, refs, author);
+        std::uint64_t s = 0;
+        if (c.tx)
+            for (const pb::MinerOut& o : c.tx->outs) s += o.amount;
+        check(c.tx && c.tx->outs.size() == B.n_payees && s == 600000000000ull,
+              "case 4 mainnet: Sum(vout) of the miner tx == R 600,000,000,000");
+
+        // regtest: R = B(genesis) = 35,184,338,534,400, fees 0.
+        const std::uint64_t R = pb::base_reward_at(17592186044415ull, 16);
+        check(R == 35184338534400ull, "case 4 regtest: R 35,184,338,534,400");
+        std::vector<std::pair<pb::Hash32, std::uint64_t>> wr;
+        for (std::uint8_t i = 0; i < 3; ++i) wr.push_back({book.add(key_ref(static_cast<std::uint8_t>(0xA0 + i))), 1u << i});
+        const pb::Window w_reg = window_of(wr);
+        pb::ReceiptBodyV3 q = make_body(3, false, 0x25);
+        q.reward_total = R;
+        check(floor_sum(R, wr) < R, "case 4 regtest: the floors sum below R (deficit > 0)");
+        const pb::CanonicalTx cr = pb::canonical_miner_tx(q, pb::WindowAt{&w_reg}, q.side.tip, q.blob.prev_id,
+                                                          kKatHeight, 16, cache, refs, author);
+        std::uint64_t sr = 0;
+        if (cr.tx)
+            for (const pb::MinerOut& o : cr.tx->outs) sr += o.amount;
+        check(cr.tx && sr == R, "case 4 regtest: Sum(vout) of the miner tx == R");
+    }
+
+    // mainnet-tail split vector: base = 6e11, fees 5e9 -> R = 605e9.
     const std::uint64_t base = 600000000000ull, fees = 5000000000ull, R = base + fees;
     // The window through window(): three bins newest first, miner i (1..32) with
     // 500 i of raw work in each; miner 32 pays owner 0x1000 at p 100 bp, miner 31
@@ -100,24 +169,30 @@ int main() {
               "split: owner 366,666,667, author 34,375,000, miner 1 1,145,833,333, miner 32 36,300,000,000");
     }
 
-    // the canonical split coinbase is admitted (tree_root folds to the leaf).
+
+    // a window over referenced payees.
+    std::vector<std::pair<pb::Hash32, std::uint64_t>> wts;
+    for (std::uint64_t i = 1; i <= 32; ++i) wts.push_back({book.add(key_ref(static_cast<std::uint8_t>(i))), 1000 * i});
+    const pb::Window wk = window_of(wts);
+
+    // the canonical split miner tx is admitted (tree_root folds to its tx hash).
     pb::ReceiptBodyV3 r = make_body(/*depth=*/3, /*with_owner=*/false, 0x20);
     r.reward_total = R;
-    const pb::Hash32 tip = r.side.tip, p_r = r.blob.prev_id;
-    const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w, tip, p_r, /*hf=*/16);
-    check(!cl.fork_fused && cl.leaf.has_value(), "hf16 canonical coinbase built");
-    // the leaf: split -> PBX1 tx_extra with mm_root = mm_root_of(side_data_v3) -> leaf.
-    const pb::Hash32 own_mm = pb::mm_root_of(r.side).value();
-    check(cl.leaf == pb::canonical_cb_leaf(outs, tip, p_r, pb::canonical_tx_extra_hf16(p_r, r.extra_nonce, own_mm)),
-          "canonical split leaf commits mm_root_of(side_data_v3)");
-    r.blob.tree_root = pb::tree_root_fold(cl.leaf.value(), std::span<const pb::Hash32>(r.branch));
-    check(pb::canonical_coinbase_ok_split(r, w, tip, p_r, 16), "canonical split coinbase admitted");
+    check(commit(r, wk), "the miner builds the canonical split miner tx");
+    {
+        const pb::CanonicalTx c = pb::canonical_miner_tx(r, pb::WindowAt{&wk}, r.side.tip, r.blob.prev_id, kKatHeight,
+                                                         16, cache, refs, author);
+        const pb::Hash32 own_mm = pb::mm_root_of(r.side).value_or(pb::Hash32{});
+        check(c.tx && c.tx->extra.size() == 74 && std::equal(own_mm.begin(), own_mm.end(), c.tx->extra.begin() + 42),
+              "canonical miner tx commits mm_root_of(side_data_v3) in tx_extra 0x03");
+    }
+    check(check12(r, wk, 16) == pb::CoinbaseCheck::Match, "canonical split miner tx: Match");
 
     // the admission runs #12 strictly before RandomX; a correct coinbase lets it run.
     {
         bool rx = false;
-        const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                pb::canonical_coinbase_ok_split(r, w, tip, p_r, 16), [&] { rx = true; return true; });
+        const pb::TailResult t =
+                pb::admit_coinbase_then_randomx(check12(r, wk, 16), [&] { rx = true; return true; });
         check(t.verdict == pb::AdmitVerdict::AdmitCarrier && t.randomx_called && rx,
               "correct coinbase -> RandomX runs after #12");
     }
@@ -125,37 +200,34 @@ int main() {
     // a WRONG split (tampered tree_root) -> BAN before RandomX (not called).
     {
         pb::ReceiptBodyV3 bad = r;
-        bad.blob.tree_root = seq32(0xFF);  // not the canonical split leaf fold
-        check(!pb::canonical_coinbase_ok_split(bad, w, tip, p_r, 16), "wrong split: coinbase NOT ok");
+        bad.blob.tree_root = seq32(0xFF);
+        check(check12(bad, wk, 16) == pb::CoinbaseCheck::Mismatch, "wrong split: Mismatch");
         bool rx = false;
-        const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                pb::canonical_coinbase_ok_split(bad, w, tip, p_r, 16), [&] { rx = true; return true; });
+        const pb::TailResult t =
+                pb::admit_coinbase_then_randomx(check12(bad, wk, 16), [&] { rx = true; return true; });
         check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx, "wrong split -> BAN, no RandomX");
     }
 
-    // a coinbase that claims R' != R (over/under) -> different leaf -> BAN.
+    // a coinbase that claims R' != R (over/under) -> another miner tx -> Mismatch.
     {
         pb::ReceiptBodyV3 bad = r;
-        bad.reward_total = R + 1;  // over-claim
-        check(!pb::canonical_coinbase_ok_split(bad, w, tip, p_r, 16), "R' != R -> coinbase NOT ok");
+        bad.reward_total = R + 1;
+        check(check12(bad, wk, 16) == pb::CoinbaseCheck::Mismatch, "R' != R -> Mismatch");
     }
 
-    // ---- side_data_v3 committed through mm_root on the split path: a field
-    // changed after the coinbase was built -> coinbase NOT ok -> BAN before RandomX ----
+    // ---- side_data_v3 committed through mm_root on the split path ----
     {
         pb::ReceiptBodyV3 o = make_body(3, /*with_owner=*/true, 0x21);
         o.reward_total = R;
-        const pb::Hash32 tip_o = o.side.tip, pr_o = o.blob.prev_id;
-        o.blob.tree_root = pb::tree_root_fold(pb::canonical_coinbase_leaf(o, w, tip_o, pr_o, 16).leaf.value(),
-                                              std::span<const pb::Hash32>(o.branch));
-        check(pb::canonical_coinbase_ok_split(o, w, tip_o, pr_o, 16), "side with owner committed: split admitted");
+        commit(o, wk);
+        check(check12(o, wk, 16) == pb::CoinbaseCheck::Match, "side with owner committed: split Match");
         auto changed = [&](void (*mutate)(pb::SideDataV3&), const char* what) {
             pb::ReceiptBodyV3 bad = o;
             mutate(bad.side);
             check(pb::mm_root_of(bad.side).has_value(), std::string(what) + " (side_data_v3 still encodes)");
             bool rx = false;
-            const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(bad, w, tip_o, pr_o, 16), [&] { rx = true; return true; });
+            const pb::TailResult t =
+                    pb::admit_coinbase_then_randomx(check12(bad, wk, 16), [&] { rx = true; return true; });
             check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx, what);
         };
         changed([](pb::SideDataV3& s) { s.pool_id[0] ^= 0x01; }, "split: pool_id changed -> BAN before RandomX");
@@ -176,45 +248,47 @@ int main() {
                 "split: give_author_bp changed -> BAN before RandomX");
     }
 
-    // ---- side_data_v3 that does not encode: no leaf; a coinbase committing a
-    // zero mm_root -> coinbase NOT ok -> BAN before RandomX ----
+    // ---- side_data_v3 that does not encode: Undefined; a miner tx committing a
+    // zero mm_root -> BAN before RandomX ----
+    auto zero_mm_tx_hash = [&](const pb::ReceiptBodyV3& b, const pb::Window& win) {
+        std::vector<pb::MinerPayee> payees;
+        if (win.weight.empty()) {
+            payees.push_back(pb::MinerPayee{b.payee, b.reward_total});
+        } else {
+            for (const pb::SplitOutput& o : pb::hf16_outputs(b.reward_total, win))
+                payees.push_back(pb::MinerPayee{book.refs.at(o.payee), o.amount});
+        }
+        const std::optional<pb::MinerTx> t = pb::build_miner_tx_hf16(b.side.pool_id, b.side.tip, b.blob.prev_id,
+                                                                     kKatHeight, payees, b.extra_nonce, pb::Hash32{});
+        return t ? t->tx_hash : pb::Hash32{};
+    };
     {
         pb::ReceiptBodyV3 bad = make_body(3, false, 0x22);
         bad.reward_total = R;
         bad.side.owner = seq32(0x21);  // owner identity with fee_rate_bp 0
         check(!pb::mm_root_of(bad.side).has_value(), "owner with fee_rate_bp 0: side_data_v3 does not encode");
-        const pb::Hash32 tip_b = bad.side.tip, pr_b = bad.blob.prev_id;
-        const pb::CanonLeaf none = pb::canonical_coinbase_leaf(bad, w, tip_b, pr_b, 16);
-        check(!none.fork_fused && !none.leaf.has_value(), "split: no canonical leaf");
-        const auto zero_mm_extra = pb::canonical_tx_extra_hf16(pr_b, bad.extra_nonce, pb::Hash32{});
-        bad.blob.tree_root = pb::tree_root_fold(pb::canonical_cb_leaf(outs, tip_b, pr_b, zero_mm_extra),
-                                                std::span<const pb::Hash32>(bad.branch));
+        check(check12(bad, wk, 16) == pb::CoinbaseCheck::Undefined, "split: side_data_v3 does not encode -> Undefined");
+        bad.blob.tree_root = pb::tree_root_fold(zero_mm_tx_hash(bad, wk), std::span<const pb::Hash32>(bad.branch));
         bool rx = false;
-        const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                pb::canonical_coinbase_ok_split(bad, w, tip_b, pr_b, 16), [&] { rx = true; return true; });
+        const pb::TailResult t =
+                pb::admit_coinbase_then_randomx(check12(bad, wk, 16), [&] { rx = true; return true; });
         check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
               "split: side_data_v3 does not encode -> BAN before RandomX");
     }
 
-    // ---- finder-only path (empty window): the stub leaf with mm_root_of(side_data_v3) ----
+    // ---- finder-only path (empty window): one output of R with mm_root_of(side_data_v3) ----
     {
-        pb::Window wf;
-        wf.empty_finder_only = true;
+        const pb::Window wf;
         pb::ReceiptBodyV3 f = make_body(3, /*with_owner=*/true, 0x23);
         f.reward_total = R;
-        const pb::Hash32 tip_f = f.side.tip, pr_f = f.blob.prev_id;
-        const pb::CanonLeaf clf = pb::canonical_coinbase_leaf(f, wf, tip_f, pr_f, 16);
-        const pb::Hash32 own_leaf = pb::canonical_stub_leaf(
-                R, pb::stub_output_key(tip_f, pr_f, f.side.payee), f.extra_nonce, pb::mm_root_of(f.side).value());
-        check(clf.leaf == own_leaf, "finder-only leaf commits mm_root_of(side_data_v3)");
-        f.blob.tree_root = pb::tree_root_fold(own_leaf, std::span<const pb::Hash32>(f.branch));
-        check(pb::canonical_coinbase_ok_split(f, wf, tip_f, pr_f, 16), "finder-only canonical coinbase admitted");
+        commit(f, wf);
+        check(check12(f, wf, 16) == pb::CoinbaseCheck::Match, "finder-only canonical miner tx: Match");
         {
             pb::ReceiptBodyV3 bad = f;
             bad.side.receipts_root[0] ^= 0x01;
             bool rx = false;
-            const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(bad, wf, tip_f, pr_f, 16), [&] { rx = true; return true; });
+            const pb::TailResult t =
+                    pb::admit_coinbase_then_randomx(check12(bad, wf, 16), [&] { rx = true; return true; });
             check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
                   "finder-only: side_data_v3 changed -> BAN before RandomX");
         }
@@ -222,13 +296,11 @@ int main() {
             pb::ReceiptBodyV3 bad = f;
             bad.side.fee_rate_bp = 0;  // owner identity with fee_rate_bp 0
             check(!pb::mm_root_of(bad.side).has_value(), "finder-only: side_data_v3 does not encode");
-            check(!pb::finder_only_leaf(bad, tip_f, pr_f).has_value(), "finder-only: no leaf");
-            const pb::Hash32 zero_mm_leaf = pb::canonical_stub_leaf(
-                    R, pb::stub_output_key(tip_f, pr_f, bad.side.payee), bad.extra_nonce, pb::Hash32{});
-            bad.blob.tree_root = pb::tree_root_fold(zero_mm_leaf, std::span<const pb::Hash32>(bad.branch));
+            check(check12(bad, wf, 16) == pb::CoinbaseCheck::Undefined, "finder-only: Undefined");
+            bad.blob.tree_root = pb::tree_root_fold(zero_mm_tx_hash(bad, wf), std::span<const pb::Hash32>(bad.branch));
             bool rx = false;
-            const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(bad, wf, tip_f, pr_f, 16), [&] { rx = true; return true; });
+            const pb::TailResult t =
+                    pb::admit_coinbase_then_randomx(check12(bad, wf, 16), [&] { rx = true; return true; });
             check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
                   "finder-only: side_data_v3 does not encode -> BAN before RandomX");
         }
@@ -238,8 +310,10 @@ int main() {
     // codec before the resolution (#3 DEFER + fetch) and before RandomX; 10000
     // exactly is valid (miner weight 0) ----
     {
-        const pb::Hash32 au = id_of(0xA0);
-        auto entry_of = [](const pb::ReceiptBodyV3& b, std::uint64_t work, std::uint64_t pos) {
+        const pb::Hash32 au = pb::key_ref_identity(author);
+        auto entry_of = [&](const pb::ReceiptBodyV3& b, std::uint64_t work, std::uint64_t pos) {
+            book.add(b.payee);
+            if (b.owner) book.add(*b.owner);
             pb::WinEntry e;
             e.miner = b.side.payee;
             e.owner = b.side.owner;
@@ -255,8 +329,8 @@ int main() {
             for (const auto& [id, wt] : win.weight) tot += wt;
             return tot;
         };
-        auto commit = [](pb::ReceiptBodyV3& b, const pb::Hash32& leaf) {
-            b.blob.tree_root = pb::tree_root_fold(leaf, std::span<const pb::Hash32>(b.branch));
+        auto commit_hash = [](pb::ReceiptBodyV3& b, const pb::Hash32& tx_hash) {
+            b.blob.tree_root = pb::tree_root_fold(tx_hash, std::span<const pb::Hash32>(b.branch));
         };
         auto put_ga = [](std::vector<std::uint8_t>& bytes, std::size_t side_off, std::uint16_t ga) {
             bytes[side_off + pb::side_v3::kGiveAuthorOff] = static_cast<std::uint8_t>(ga & 0xff);
@@ -272,16 +346,20 @@ int main() {
             put_ga(bytes, 0, b.side.give_author_bp);
             return pb::mm_root_of(bytes);
         };
-        // the leaf the receipt's miner builds: the finder-only output on an empty
-        // window, else split(R, win); PBX1 extra with the receipt's own mm_root.
-        auto leaf_of = [&](const pb::ReceiptBodyV3& b, const pb::Window& win) {
-            const pb::Hash32 mm = raw_mm_of(b);
-            if (win.empty_finder_only)
-                return pb::canonical_stub_leaf(b.reward_total,
-                                               pb::stub_output_key(b.side.tip, b.blob.prev_id, b.side.payee),
-                                               b.extra_nonce, mm);
-            return pb::canonical_cb_leaf(pb::split(b.reward_total, win), b.side.tip, b.blob.prev_id,
-                                         pb::canonical_tx_extra_hf16(b.blob.prev_id, b.extra_nonce, mm));
+        // the tx hash of the miner tx the receipt's miner builds: one output of R
+        // on an empty window, else hf16_outputs(R, win); PBX1 extra with the
+        // receipt's own mm_root.
+        auto miner_tx_hash_of = [&](const pb::ReceiptBodyV3& b, const pb::Window& win) {
+            std::vector<pb::MinerPayee> payees;
+            if (win.weight.empty()) {
+                payees.push_back(pb::MinerPayee{b.payee, b.reward_total});
+            } else {
+                for (const pb::SplitOutput& o : pb::hf16_outputs(b.reward_total, win))
+                    payees.push_back(pb::MinerPayee{o.payee == au ? author : book.refs.at(o.payee), o.amount});
+            }
+            const std::optional<pb::MinerTx> t = pb::build_miner_tx_hf16(
+                    b.side.pool_id, b.side.tip, b.blob.prev_id, kKatHeight, payees, b.extra_nonce, raw_mm_of(b));
+            return t ? t->tx_hash : pb::Hash32{};
         };
         // the bytes the receipt is received as.
         auto wire_of = [&](const pb::ReceiptBodyV3& b) {
@@ -311,9 +389,8 @@ int main() {
                 out.v = *out.head.verdict;
                 return out;
             }
-            const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(got, win, got.side.tip, got.blob.prev_id, 16),
-                    [&] { out.rx = true; return true; });
+            const pb::TailResult t = pb::admit_coinbase_then_randomx(check12(got, win, 16),
+                                                                     [&] { out.rx = true; return true; });
             out.v = t.verdict;
             return out;
         };
@@ -327,9 +404,7 @@ int main() {
         };
         auto admit = [&](const pb::ReceiptBodyV3& b, const pb::Window& win, std::uint8_t hf) {
             bool rx = false;
-            const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(b, win, b.side.tip, b.blob.prev_id, hf),
-                    [&] { rx = true; return true; });
+            const pb::TailResult t = pb::admit_coinbase_then_randomx(check12(b, win, hf), [&] { rx = true; return true; });
             return Verdict{t.verdict, t.randomx_called || rx};
         };
         auto ban_before_randomx = [](const Verdict& v) { return v.v == pb::AdmitVerdict::Ban && !v.rx; };
@@ -351,32 +426,29 @@ int main() {
                               Case{9990, 10, true}, Case{10000, 0, true}};
 
         // (a) a window of valid entries (the receipt is not in it), and the empty
-        // window (finder-only); the receipt commits the leaf its miner builds; the
-        // tip known (Ready) or unknown (DEFER + fetch).
+        // window (finder-only); the receipt commits the miner tx its miner builds;
+        // the tip known (Ready) or unknown (DEFER + fetch).
         pb::WinBin ok_bin;
         ok_bin.bin = 7;
         ok_bin.entries.push_back(entry_of(honest, 1000000, 2));
         ok_bin.entries.push_back(entry_of(make_body(3, true, 0x50), 2000000, 3));
         const pb::Window w_ok = pb::window({ok_bin}, 1000000000ull, base, /*f_spend=*/1, 3747, au);
         check(weights_sum(w_ok) == w_ok.W && !pb::split(R, w_ok).empty(), "valid window: weights sum to W");
-        const pb::Window wf = [] {
-            pb::Window v;
-            v.empty_finder_only = true;
-            return v;
-        }();
+        const pb::Window wf;
         for (const Case c : cases) {
             for (const pb::Window* win : {&w_ok, &wf}) {
                 pb::ReceiptBodyV3 x = make_body(3, true, 0x40);
                 x.side.fee_rate_bp = c.p;
                 x.side.give_author_bp = c.ga;
-                commit(x, leaf_of(x, *win));
+                commit_hash(x, miner_tx_hash_of(x, *win));
                 const std::string tag = std::string(win == &wf ? "empty window (finder-only)" : "window") + ", p "
                                         + std::to_string(c.p) + " + give_author_bp " + std::to_string(c.ga);
                 if (c.valid) {
-                    const pb::CanonLeaf clx = pb::canonical_coinbase_leaf(x, *win, x.side.tip, x.blob.prev_id, 16);
-                    check(clx.leaf.has_value() && clx.leaf == leaf_of(x, *win)
-                                  && pb::mm_root_of(x.side) == raw_mm_of(x),
-                          tag + ": the canonical leaf is the leaf its miner builds");
+                    const pb::CanonicalTx cx = pb::canonical_miner_tx(x, pb::WindowAt{win}, x.side.tip,
+                                                                      x.blob.prev_id, kKatHeight, 16, cache, refs,
+                                                                      author);
+                    check(cx.tx && cx.tx->tx_hash == miner_tx_hash_of(x, *win) && pb::mm_root_of(x.side) == raw_mm_of(x),
+                          tag + ": the canonical miner tx is the one its miner builds");
                 }
                 for (const pb::Resolve res : {pb::Resolve::Ready, pb::Resolve::DeferUnknownTip}) {
                     const Path pa = receive(x, *win, res);
@@ -396,7 +468,7 @@ int main() {
             pb::ReceiptBodyV3 x = make_body(3, true, 0x40);
             x.side.fee_rate_bp = 10000;
             x.side.give_author_bp = 10;
-            commit(x, pb::Hash32{});
+            commit_hash(x, pb::Hash32{});
             check(strike_at_2(receive(x, w_ok, pb::Resolve::Ready)),
                   "p 10000 + give_author_bp 10, tree_root from the zero leaf -> STRIKE at #2");
         }
@@ -418,24 +490,26 @@ int main() {
             const std::string tag = "own entry p " + std::to_string(c.p) + " + give_author_bp " + std::to_string(c.ga);
             check(weights_sum(wx) == wx.W && sx == x.reward_total, tag + ": weights sum to W, Sum(vout) == R");
             if (c.ga == 0) check(wx.weight.count(x.side.payee) == 0, tag + ": miner weight 0");
-            commit(x, leaf_of(x, wx));
+            commit_hash(x, miner_tx_hash_of(x, wx));
             const Path pa = receive(x, wx, pb::Resolve::Ready);
             check(pa.v == pb::AdmitVerdict::AdmitCarrier && pa.rx, tag + ": admitted");
         }
 
-        // (c) a fork-fused amount (hf 17): no leaf; a tree_root folded from the zero
-        // leaf -> BAN before RandomX.
+        // (c) hf 17: Fused -> REFUSE, no token, no ban, RandomX not called.
         {
             pb::ReceiptBodyV3 y = make_body(3, true, 0x40);
-            const pb::CanonLeaf c17 = pb::canonical_coinbase_leaf(y, w_ok, y.side.tip, y.blob.prev_id, 17);
-            check(c17.fork_fused && !c17.leaf.has_value(), "hf17: no canonical leaf");
-            commit(y, pb::Hash32{});
-            check(ban_before_randomx(admit(y, w_ok, 17)), "hf17, tree_root from the zero leaf -> BAN before RandomX");
+            const pb::CanonicalTx c17 = pb::canonical_miner_tx(y, pb::WindowAt{&w_ok}, y.side.tip, y.blob.prev_id,
+                                                               kKatHeight, 17, cache, refs, author);
+            check(c17.stop == pb::CoinbaseCheck::Fused && !c17.tx.has_value(), "hf17: Fused, no miner tx");
+            commit_hash(y, pb::Hash32{});
+            const Verdict v = admit(y, w_ok, 17);
+            check(v.v == pb::AdmitVerdict::Refuse && !v.rx && pb::strike_tokens(v.v) == 0,
+                  "hf17 -> REFUSE, no token, RandomX not called");
         }
 
         // (d) a window holding an entry with p + give_author_bp > 10000: its weights
         // do not sum to W, split() has no outputs, and no receipt on it has a
-        // canonical coinbase.
+        // canonical coinbase (Undefined, BAN).
         {
             pb::ReceiptBodyV3 u = make_body(3, true, 0x60);
             u.side.fee_rate_bp = 10000;
@@ -448,12 +522,8 @@ int main() {
             check(!(weights_sum(w_bad) == w_bad.W), "undefined entry: window weights != W");
             check(pb::split(R, w_bad).empty(), "undefined entry: split has no outputs");
             pb::ReceiptBodyV3 h = make_body(3, false, 0x70);
-            const pb::CanonLeaf clh = pb::canonical_coinbase_leaf(h, w_bad, h.side.tip, h.blob.prev_id, 16);
-            check(clh.shares_undefined && !clh.leaf.has_value(), "undefined window: no canonical leaf");
-            commit(h, leaf_of(h, w_bad));
-            check(ban_before_randomx(admit(h, w_bad, 16)),
-                  "undefined window, tree_root from its split -> BAN before RandomX");
-            commit(h, pb::Hash32{});
+            check(check12(h, w_bad, 16) == pb::CoinbaseCheck::Undefined, "undefined window: Undefined");
+            commit_hash(h, pb::Hash32{});
             check(ban_before_randomx(admit(h, w_bad, 16)),
                   "undefined window, tree_root from the zero leaf -> BAN before RandomX");
         }
