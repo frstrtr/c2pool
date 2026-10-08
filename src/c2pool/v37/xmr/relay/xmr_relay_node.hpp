@@ -819,7 +819,9 @@ public:
     // then every ready peer after drops_fetch_retry_ms; an id is re-asked no
     // more often than that. An id seen here (dedup set) but asked for anyway is
     // forgotten first, so the served copy is admitted (the caller's harvest
-    // lacks it). Answers are admitted through admit_drop (PoW + ctx verified).
+    // lacks it), unless it is stored or in m_inflight (verify or admission:
+    // queued for drain_drops() by that admission). Answers are admitted
+    // through admit_drop (PoW + ctx verified).
     // Returns the number of fetch frames sent. Gate OFF: nothing.
     // [lo, hi) = the block's range (FB_GETDROPS carries a non-empty range; a
     // by-id fetch is served by id whatever it says).
@@ -869,6 +871,14 @@ public:
                 }
                 v->swap(rest);
             }
+            // forget the dedup entry of an id that is neither stored (above, same
+            // m_dsmtx hold) nor in m_inflight (verify or admission)
+            if (!first.empty() || !again.empty()) {
+                std::lock_guard<std::mutex> lk2(m_mtx);   // m_dsmtx -> m_mtx, as drop_held_locked
+                for (const auto* v : {&first, &again})
+                    for (const auto& id : *v)
+                        if (!m_inflight.count(id)) m_drop_seen.erase(id);
+            }
         }
         if (!local.empty()) {
             m_st.drops_pin_local += local.size();
@@ -876,11 +886,6 @@ public:
             for (auto& a : local) m_drops.push_back(std::move(a));
         }
         if (first.empty() && again.empty()) return 0;
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);   // forget the dedup entry: the caller does not hold its bytes
-            for (const auto* v : {&first, &again})
-                for (const auto& id : *v) m_drop_seen.erase(id);
-        }
         const auto peers = ready_peers();
         const bool hint_ready = hint && std::find(peers.begin(), peers.end(), hint) != peers.end();
         std::size_t sent = 0;
