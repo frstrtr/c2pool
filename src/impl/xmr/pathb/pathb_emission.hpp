@@ -19,7 +19,8 @@
 //   out_size(hf,S)  = 34 + V(S) (hf 16) / 84 + V(S) (hf 17); V = varint length of
 //       the base reward S_A. [K24b, ruling 17 H-3 / 20 Q-G]
 //   f_spend(S,M,hf) = quantise_up(kInputWeight 659 x get_dynamic_base_fee(S,
-//       max(M, zone)), 10^4); hf >= 15 lo -= lo/20. [K11d, ruling 5, M-05]
+//       max(M, zone)), 10^4); reference weight 3,000 (12,500 at hf >= 17);
+//       hf 15..16 lo -= lo/20. [K11d, ruling 5, M-05]
 //
 // hf-17 carve-out (O-01, OWED and external): the AMOUNT rule is not derived. The
 // FORMAT (OVH 61, OUT 84 + V) is specified and tested; at hf >= 17 the lane
@@ -122,7 +123,8 @@ inline std::uint64_t n_rule_half_form(std::uint64_t z, std::uint8_t hf, std::uin
 // supplies the fee median already floored at max(M, zone(hf)).
 // ---------------------------------------------------------------------------
 inline constexpr std::uint64_t kInputWeight = 659;              // one RingCT input, ring 16
-inline constexpr std::uint64_t kFeeReferenceTxWeight = 3000;    // DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT
+inline constexpr std::uint64_t kFeeReferenceTxWeight = 3000;    // DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT_V8
+inline constexpr std::uint64_t kFeeReferenceTxWeightHf17 = 12500;  // DYNAMIC_FEE_REFERENCE_TRANSACTION_WEIGHT_V17
 inline constexpr std::uint64_t kFeeQuantizationStep = 10000;    // 10^(12 - 8)
 inline constexpr std::uint8_t kHf2021Scaling = 15;              // HF_VERSION_2021_SCALING
 
@@ -132,16 +134,21 @@ inline constexpr std::uint64_t fee_zone(std::uint8_t hf) noexcept {
                                    : CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5;
 }
 
+// The fee reference transaction weight per hf: 3,000 (hf < 17) / 12,500 (hf >= 17).
+inline constexpr std::uint64_t fee_reference_weight(std::uint8_t hf) noexcept {
+    return hf >= HF_VERSION_CARROT ? kFeeReferenceTxWeightHf17 : kFeeReferenceTxWeight;
+}
+
 // get_dynamic_base_fee(reward, median) at `median`, Monero's order of operations
-// (reward * ref_weight / median / median in 128 bits), the 2021 scaling 0.95
-// from hf 15, floored at 1.
+// (reward * ref_weight(hf) / median / median in 128 bits), the 2021 scaling 0.95
+// at hf 15 and 16 (none from hf 17), floored at 1.
 inline std::uint64_t fee_per_byte(std::uint64_t reward, std::uint64_t median, std::uint8_t hf) noexcept {
     if (median == 0) median = 1;
-    wide::u128 v = static_cast<wide::u128>(reward) * kFeeReferenceTxWeight;
+    wide::u128 v = static_cast<wide::u128>(reward) * fee_reference_weight(hf);
     v /= median;
     v /= median;
     std::uint64_t lo = static_cast<std::uint64_t>(v);
-    if (hf >= kHf2021Scaling) lo -= lo / 20;
+    if (hf >= kHf2021Scaling && hf < HF_VERSION_CARROT) lo -= lo / 20;
     return lo == 0 ? 1 : lo;
 }
 

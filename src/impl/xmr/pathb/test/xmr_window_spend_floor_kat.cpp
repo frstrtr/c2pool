@@ -10,8 +10,9 @@
 //   W 1,440,240,000, entry value 8,331,944); a window of 47,885 entries at one d
 //   (B / f_spend at 6e11, hf 16) and no payee output below f_spend, entry 47,886
 //   excluded; the cap stops at <= (W x f == B x d_min kept, one unit more cut);
-//   f_spend(6e11, 300k, hf16) == 12,530,000; a larger fee median M quarters the
-//   fee per byte; B(A_t) on both sides (the window reads B, never R:
+//   f_spend(6e11, 300k, hf16) == 12,530,000; f_spend(6e11, 625k, hf17) ==
+//   12,660,000 (reference weight 12,500, no 0.95); a larger fee median M
+//   quarters the fee per byte; B(A_t) on both sides (the window reads B, never R:
 //   signature); d_min over receipt entries (a carried entry below every carrier
 //   in its bin cuts the bin; a carriers-only reading would keep it); two build
 //   orders (carrier entries first / carried entries first, placements in chain
@@ -77,6 +78,12 @@ int main() {
           "fee per byte at M 600k == 1/4 of the M 300k value");
     // the floor at max(M, zone): M below the penalty-free zone reads the zone.
     check(pb::f_spend(B, 100000, 16) == pb::f_spend(B, 300000, 16), "f_spend floors M at the zone");
+
+    // hf 17 constants at hf 17: reference weight 12,500, no 0.95, zone 625,000.
+    check(pb::fee_per_byte(B, 625000, 17) == 19200ull, "fee per byte (6e11, M 625k, hf17) == 19,200");
+    check(pb::f_spend(B, 625000, 17) == 12660000ull, "f_spend(6e11, M 625k, hf17) == 12,660,000");
+    check(pb::f_spend(B, 300000, 17) == 12660000ull, "f_spend(6e11, M 300k, hf17) floors M at the hf 17 zone");
+    check(pb::fee_per_byte(B, 300000, 15) == pb::fee_per_byte(B, 300000, 16), "0.95 at hf 15 and 16");
 
     const std::uint64_t f = pb::f_spend(B, 300000, 16);  // 12,530,000
 
