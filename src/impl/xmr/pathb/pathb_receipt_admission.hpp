@@ -290,25 +290,22 @@ inline Hash32 tree_root_fold(const Hash32& leaf0, std::span<const Hash32> branch
 }
 
 // The canonical stub coinbase leaf a receipt on (tip, P_r) MUST commit: one
-// output of r.reward_total to r's payee, with the per-(tip, P_r) key, and the
-// receipt's own mm_root (side_data_v3).
-inline Hash32 canonical_stub_leaf_of(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r,
-                                     const Hash32& mm_root) {
+// output of r.reward_total to r's payee, with the per-(tip, P_r) key, and
+// mm_root = mm_root_of(r.side). No leaf when side_data_v3 does not encode.
+inline std::optional<Hash32> canonical_stub_leaf_of(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
+    const std::optional<Hash32> mm = mm_root_of(r.side);
+    if (!mm) return std::nullopt;
     const Hash32 key = stub_output_key(tip, p_r, r.side.payee);
-    return canonical_stub_leaf(r.reward_total, key, r.extra_nonce, mm_root);
-}
-
-inline Hash32 canonical_stub_leaf_of(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
-    return canonical_stub_leaf_of(r, tip, p_r, mm_root_of(r.side).value_or(Hash32{}));
+    return canonical_stub_leaf(r.reward_total, key, r.extra_nonce, *mm);
 }
 
 // Admission #12: the receipt's committed coinbase (tree_root folded over the
-// branch from leaf 0) equals the canonical stub coinbase. false is a BAN.
+// branch from leaf 0) equals the canonical stub coinbase. false is a BAN; no
+// leaf (side_data_v3 does not encode) is false.
 inline bool canonical_coinbase_ok(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r) {
-    const std::optional<Hash32> mm = mm_root_of(r.side);
-    if (!mm) return false;
-    const Hash32 leaf = canonical_stub_leaf_of(r, tip, p_r, *mm);
-    return tree_root_fold(leaf, std::span<const Hash32>(r.branch)) == r.blob.tree_root;
+    const std::optional<Hash32> leaf = canonical_stub_leaf_of(r, tip, p_r);
+    if (!leaf) return false;
+    return tree_root_fold(*leaf, std::span<const Hash32>(r.branch)) == r.blob.tree_root;
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <map>
 #include <span>
+#include <string>
 #include <utility>
 
 #include "impl/xmr/pathb/pathb_coinbase_split.hpp"  // S3 window/split part
@@ -31,11 +32,15 @@ namespace pb = ::c2pool::xmr::pathb;
 
 namespace {
 
+// The canonical one-output stub leaf for (tip, P_r); the bodies here encode.
+pb::Hash32 stub_leaf(const pb::ReceiptBodyV3& r, const pb::Hash32& tip, const pb::Hash32& p_r) {
+    return pb::canonical_stub_leaf_of(r, tip, p_r).value();
+}
+
 // Commits the canonical stub coinbase into a receipt: tree_root = fold(leaf0,
 // branch) with leaf0 = the canonical one-output stub leaf for (tip, P_r).
 void commit_canonical(pb::ReceiptBodyV3& r, const pb::Hash32& tip, const pb::Hash32& p_r) {
-    const pb::Hash32 leaf = pb::canonical_stub_leaf_of(r, tip, p_r);
-    r.blob.tree_root = pb::tree_root_fold(leaf, std::span<const pb::Hash32>(r.branch));
+    r.blob.tree_root = pb::tree_root_fold(stub_leaf(r, tip, p_r), std::span<const pb::Hash32>(r.branch));
 }
 
 }  // namespace
@@ -75,7 +80,7 @@ int main() {
         pb::ReceiptBodyV3 bad = make_body(3, false, 0x20);
         pb::ReceiptBodyV3 other = bad;
         other.reward_total = bad.reward_total + 1;
-        const pb::Hash32 wrong_leaf = pb::canonical_stub_leaf_of(other, tip, bad.blob.prev_id);
+        const pb::Hash32 wrong_leaf = stub_leaf(other, tip, bad.blob.prev_id);
         bad.blob.tree_root = pb::tree_root_fold(wrong_leaf, std::span<const pb::Hash32>(bad.branch));
         check(!pb::canonical_coinbase_ok(bad, tip, bad.blob.prev_id), "wrong amount: coinbase NOT ok");
         bool rx_called = false;
@@ -91,7 +96,7 @@ int main() {
         const pb::Hash32 foreign_payee = seq32(0x7E);  // not bad.side.payee
         pb::ReceiptBodyV3 other = bad;
         other.side.payee = foreign_payee;
-        const pb::Hash32 wrong_leaf = pb::canonical_stub_leaf_of(other, tip, bad.blob.prev_id);
+        const pb::Hash32 wrong_leaf = stub_leaf(other, tip, bad.blob.prev_id);
         bad.blob.tree_root = pb::tree_root_fold(wrong_leaf, std::span<const pb::Hash32>(bad.branch));
         check(!pb::canonical_coinbase_ok(bad, tip, bad.blob.prev_id), "wrong payee: coinbase NOT ok");
         bool rx_called = false;
@@ -117,14 +122,20 @@ int main() {
         pb::ReceiptBodyV3 base = make_body(3, false, 0x20);
         commit_canonical(base, base.side.tip, base.blob.prev_id);
         check(pb::canonical_coinbase_ok(base, base.side.tip, base.blob.prev_id), "side committed: coinbase ok");
-        auto changed = [&](void (*mutate)(pb::SideDataV3&), const char* what) {
-            pb::ReceiptBodyV3 bad = base;
+        pb::ReceiptBodyV3 owned = make_body(3, /*with_owner=*/true, 0x21);
+        commit_canonical(owned, owned.side.tip, owned.blob.prev_id);
+        check(pb::canonical_coinbase_ok(owned, owned.side.tip, owned.blob.prev_id),
+              "side with owner committed: coinbase ok");
+        auto changed_from = [&](const pb::ReceiptBodyV3& from, void (*mutate)(pb::SideDataV3&), const char* what) {
+            pb::ReceiptBodyV3 bad = from;
             mutate(bad.side);
+            check(pb::mm_root_of(bad.side).has_value(), std::string(what) + " (side_data_v3 still encodes)");
             bool rx_called = false;
             const pb::TailResult t = pb::admit_coinbase_then_randomx(
                     pb::canonical_coinbase_ok(bad, bad.side.tip, bad.blob.prev_id), [&] { rx_called = true; return true; });
             check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx_called, what);
         };
+        auto changed = [&](void (*mutate)(pb::SideDataV3&), const char* what) { changed_from(base, mutate, what); };
         changed([](pb::SideDataV3& s) { s.receipts_root[0] ^= 0x01; }, "receipts_root changed -> BAN before RandomX");
         changed([](pb::SideDataV3& s) { s.window_root[0] ^= 0x01; }, "window_root changed -> BAN before RandomX");
         changed([](pb::SideDataV3& s) { s.mmr_root[0] ^= 0x01; }, "mmr_root changed -> BAN before RandomX");
@@ -133,6 +144,27 @@ int main() {
         changed([](pb::SideDataV3& s) { s.ballot ^= 0x0001; }, "ballot changed -> BAN before RandomX");
         changed([](pb::SideDataV3& s) { s.t_origin ^= 0x01; }, "t_origin changed -> BAN before RandomX");
         changed([](pb::SideDataV3& s) { s.give_author_bp ^= 0x0001; }, "give_author_bp changed -> BAN before RandomX");
+        changed_from(owned, [](pb::SideDataV3& s) { s.fee_rate_bp ^= 0x0001; },
+                     "fee_rate_bp changed -> BAN before RandomX");
+        changed_from(owned, [](pb::SideDataV3& s) { s.owner[31] ^= 0x01; }, "owner changed -> BAN before RandomX");
+    }
+
+    // ---- side_data_v3 that does not encode: no stub leaf; a coinbase committing
+    // a zero mm_root -> coinbase NOT ok -> BAN before RandomX ----
+    {
+        pb::ReceiptBodyV3 bad = make_body(3, false, 0x20);
+        bad.side.owner = seq32(0x21);  // owner identity with fee_rate_bp 0
+        check(!pb::mm_root_of(bad.side).has_value(), "owner with fee_rate_bp 0: side_data_v3 does not encode");
+        const pb::Hash32 tip_b = bad.side.tip, pr_b = bad.blob.prev_id;
+        check(!pb::canonical_stub_leaf_of(bad, tip_b, pr_b).has_value(), "no canonical stub leaf");
+        const pb::Hash32 zero_mm_leaf = pb::canonical_stub_leaf(
+                bad.reward_total, pb::stub_output_key(tip_b, pr_b, bad.side.payee), bad.extra_nonce, pb::Hash32{});
+        bad.blob.tree_root = pb::tree_root_fold(zero_mm_leaf, std::span<const pb::Hash32>(bad.branch));
+        bool rx_called = false;
+        const pb::TailResult t = pb::admit_coinbase_then_randomx(pb::canonical_coinbase_ok(bad, tip_b, pr_b),
+                                                                 [&] { rx_called = true; return true; });
+        check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx_called,
+              "side_data_v3 does not encode -> BAN before RandomX");
     }
 
     // ---- a correct coinbase but a failing PoW is a BAN at #15 (RandomX ran) ----
@@ -184,18 +216,17 @@ int main() {
         // a window of 24 payees for (tip, P_r); keys derived once per (tip, P_r).
         pb::Window w;
         for (std::uint64_t i = 1; i <= 24; ++i) { w.weight[id_of(i)] = pb::Work(1000 * i); w.W += pb::Work(1000 * i); }
-        const pb::Hash32 mm = seq32(0x55);
 
         // ---- the correct hf-16 split is admitted; RandomX runs AFTER #12 ----
         pb::ReceiptBodyV3 r = make_body(3, false, 0x20);
         const pb::Hash32 tip_r = r.side.tip, pr_r = r.blob.prev_id;
-        const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w, tip_r, pr_r, 16, mm);
-        r.blob.tree_root = pb::tree_root_fold(cl.leaf, std::span<const pb::Hash32>(r.branch));
-        check(pb::canonical_coinbase_ok_split(r, w, tip_r, pr_r, 16, mm), "correct hf-16 split admitted");
+        const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w, tip_r, pr_r, 16);
+        r.blob.tree_root = pb::tree_root_fold(cl.leaf.value(), std::span<const pb::Hash32>(r.branch));
+        check(pb::canonical_coinbase_ok_split(r, w, tip_r, pr_r, 16), "correct hf-16 split admitted");
         {
             bool rx = false;
             const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(r, w, tip_r, pr_r, 16, mm), [&] { rx = true; return true; });
+                    pb::canonical_coinbase_ok_split(r, w, tip_r, pr_r, 16), [&] { rx = true; return true; });
             check(t.verdict == pb::AdmitVerdict::AdmitCarrier && t.randomx_called, "split: RandomX after #12");
         }
 
@@ -205,7 +236,7 @@ int main() {
             bad.blob.tree_root = seq32(0xFE);  // not the canonical split
             bool rx = false;
             const pb::TailResult t = pb::admit_coinbase_then_randomx(
-                    pb::canonical_coinbase_ok_split(bad, w, tip_r, pr_r, 16, mm), [&] { rx = true; return true; });
+                    pb::canonical_coinbase_ok_split(bad, w, tip_r, pr_r, 16), [&] { rx = true; return true; });
             check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
                   "non-canonical split (carrier) -> BAN before RandomX");
         }
@@ -214,9 +245,9 @@ int main() {
         {
             pb::ReceiptBodyV3 carried = make_body(2, false, 0x30);
             const pb::Hash32 tip_c = carried.side.tip, pr_c = carried.blob.prev_id;
-            const pb::CanonLeaf clc = pb::canonical_coinbase_leaf(carried, w, tip_c, pr_c, 16, mm);
-            carried.blob.tree_root = pb::tree_root_fold(clc.leaf, std::span<const pb::Hash32>(carried.branch));
-            check(pb::canonical_coinbase_ok_split(carried, w, tip_c, pr_c, 16, mm), "carried correct split admitted");
+            const pb::CanonLeaf clc = pb::canonical_coinbase_leaf(carried, w, tip_c, pr_c, 16);
+            carried.blob.tree_root = pb::tree_root_fold(clc.leaf.value(), std::span<const pb::Hash32>(carried.branch));
+            check(pb::canonical_coinbase_ok_split(carried, w, tip_c, pr_c, 16), "carried correct split admitted");
         }
 
         // ---- a receipt paying ANOTHER tip's window is refused ----
@@ -226,7 +257,7 @@ int main() {
             for (std::uint64_t i = 1; i <= 24; ++i) { w_other.weight[id_of(i)] = pb::Work(1000 * i); w_other.W += pb::Work(1000 * i); }
             w_other.weight[id_of(999)] = pb::Work(123456);  // an extra payee the other tip saw
             w_other.W += pb::Work(123456);
-            check(!pb::canonical_coinbase_ok_split(r, w_other, tip_r, pr_r, 16, mm),
+            check(!pb::canonical_coinbase_ok_split(r, w_other, tip_r, pr_r, 16),
                   "a receipt paying another tip's window refused");
         }
     }

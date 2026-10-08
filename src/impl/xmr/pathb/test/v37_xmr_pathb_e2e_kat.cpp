@@ -81,13 +81,17 @@ int main() {
         const pb::Window w_b = mk_window(10, 70000);  // tip B's window (different)
         pb::ReceiptBodyV3 r = make_body(3, false, 0x30);
         r.reward_total = R;
-        const pb::Hash32 tip = r.side.tip, p_r = r.blob.prev_id, mm = seq32(0x77);
+        const pb::Hash32 tip = r.side.tip, p_r = r.blob.prev_id;
         // the receipt commits the canonical coinbase for tip A's window ...
-        const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w_a, tip, p_r, 16, mm);
-        r.blob.tree_root = pb::tree_root_fold(cl.leaf, std::span<const pb::Hash32>(r.branch));
-        check(pb::canonical_coinbase_ok_split(r, w_a, tip, p_r, 16, mm), "correct tip-A window admitted");
+        const pb::CanonLeaf cl = pb::canonical_coinbase_leaf(r, w_a, tip, p_r, 16);
+        // window -> split -> PBX1 extra (mm_root = mm_root_of(side_data_v3)) -> leaf.
+        const auto extra = pb::canonical_tx_extra_hf16(p_r, r.extra_nonce, pb::mm_root_of(r.side).value());
+        check(cl.leaf == pb::canonical_cb_leaf(pb::split(R, w_a), tip, p_r, extra),
+              "e2e leaf = split -> PBX1(mm_root_of(side_data_v3)) -> leaf");
+        r.blob.tree_root = pb::tree_root_fold(cl.leaf.value(), std::span<const pb::Hash32>(r.branch));
+        check(pb::canonical_coinbase_ok_split(r, w_a, tip, p_r, 16), "correct tip-A window admitted");
         // ... checked against tip B's window -> refused.
-        check(!pb::canonical_coinbase_ok_split(r, w_b, tip, p_r, 16, mm), "paying another tip's window refused");
+        check(!pb::canonical_coinbase_ok_split(r, w_b, tip, p_r, 16), "paying another tip's window refused");
     }
 
     return finish("v37_xmr_pathb_e2e_kat");
