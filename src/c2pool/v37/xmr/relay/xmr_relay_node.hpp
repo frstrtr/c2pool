@@ -208,6 +208,8 @@
 // drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
 // (drops_persist_path, drops_persist(), drops_load()).
 #define C2POOL_XMR_DROPS_HARDEN 1
+// set_test_drop_pow_hook() / set_test_drop_stored_hook() / test_drop_held() / test_ingest() exist.
+#define C2POOL_XMR_RELAY_DROP_POW_HOOK 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -1467,6 +1469,23 @@ public:
         for (const auto& p : m_parked) if (p.id == id) return true;
         return false;
     }
+    // Test hook (set before start()): called on the verify worker after a
+    // raindrop's PoW check, before admit_drop.
+    void set_test_drop_pow_hook(std::function<void(const bytes32&)> f) { m_test_drop_pow_hook = std::move(f); }
+    // Test hook (set before start()): called on the verify worker after a
+    // raindrop is stored and flooded, before it is queued for drain_drops().
+    void set_test_drop_stored_hook(std::function<void(const bytes32&)> f) { m_test_drop_stored_hook = std::move(f); }
+    // Test hook: drops_sync()'s held predicate for one id.
+    bool test_drop_held(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return drop_held_locked(id); }
+    // Test hook: queue one encoded receipt from `from` (on_receipts' per-receipt path).
+    bool test_ingest(const std::vector<u8>& raw, PeerId from) {
+        Item it;
+        if (!decode_fb_receipt(raw, it.r)) return false;
+        it.from = from; it.src = from; it.raw = raw; it.id = receipt_id(it.r);
+        if (m_o.drops_floor_diff && drop_wanted(it.id)) it.solicited = true;
+        enqueue(std::move(it));
+        return true;
+    }
     // Rig hook (SIGUSR1 in the daemon): a NETWORK PARTITION of `secs` seconds --
     // every relay connection is dropped, inbound connections are refused and
     // nothing is dialed until it ends; then the node redials and backfills.
@@ -2694,12 +2713,18 @@ private:
         // floor is a RAINDROP, not invalid PoW. With drops_floor_diff == 0 this
         // branch does not exist and the invalid path below is master's.
         if (m_o.drops_floor_diff && meets_share_diff(pow, m_o.drops_floor_diff)) {
+            bool fresh = false;
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
                 if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
-                m_inflight.erase(it.id);
+                fresh = drop_note_new_locked(it.id);   // in m_drop_seen before it leaves m_inflight
+                if (!fresh) m_inflight.erase(it.id);
             }
+            if (m_test_drop_pow_hook) m_test_drop_pow_hook(it.id);
+            if (!fresh) { m_st.drops_dup++; return; }
+            const bytes32 id = it.id;
             admit_drop(std::move(it), ctx->height, pow);
+            forget_inflight(id);   // stored and queued for drain_drops(): held from here
             return;
         }
         // invalid: re-hash (the p2pool unstable-hardware guard) before any ban
@@ -2781,15 +2806,18 @@ private:
     // ★ DROPS: raindrop dedup (a bounded FIFO set, separate from the receipt
     // cache so a raindrop can never enter a lane order or a repair answer).
     bool drop_seen_locked(const bytes32& id) const { return m_drop_seen.count(id) != 0; }
-    bool drop_note_new(const bytes32& id) {
-        std::lock_guard<std::mutex> lk(m_mtx);
+    bool drop_note_new_locked(const bytes32& id) {
         if (!m_drop_seen.insert(id).second) return false;
         m_drop_order.push_back(id);
         while (m_drop_order.size() > m_o.drops_seen_max) { m_drop_seen.erase(m_drop_order.front()); m_drop_order.pop_front(); }
         return true;
     }
+    bool drop_note_new(const bytes32& id) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return drop_note_new_locked(id);
+    }
+    // `it.id` is noted new by the caller (drop_note_new_locked).
     void admit_drop(Item it, u64 bin, const bytes32& pow) {
-        if (!drop_note_new(it.id)) { m_st.drops_dup++; return; }
         Admitted a;
         a.id = it.id; a.r = std::move(it.r); a.raw = std::move(it.raw); a.bin = bin; a.own = false;
         a.drop = true; a.pow = pow;
@@ -2797,6 +2825,7 @@ private:
         if (it.solicited && drop_unwant(a.id)) m_st.drops_backfilled++;   // ★ RAIN-BACKFILL
         drop_store_put(a.id, bin, a.raw, a.pow);
         flood(a.raw, it.from);
+        if (m_test_drop_stored_hook) m_test_drop_stored_hook(a.id);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
     }
@@ -2820,11 +2849,13 @@ private:
             m_drop_dirty = true;
         }
     }
-    // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
+    // held = admitted here (servable) or at least seen (dedup set), and not in
+    // m_inflight (verify or admission): nothing to fetch
     bool drop_held_locked(const bytes32& id) const {
-        if (m_drop_store_id.count(id)) return true;
+        const bool stored = m_drop_store_id.count(id) != 0;
         std::lock_guard<std::mutex> lk(m_mtx);
-        return m_drop_seen.count(id) != 0;
+        if (m_inflight.count(id)) return false;
+        return stored || m_drop_seen.count(id) != 0;
     }
     bool drop_wanted(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.count(id) != 0; }
     bool drop_unwant(const bytes32& id) { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.erase(id) != 0; }
@@ -4022,6 +4053,8 @@ private:
     std::set<PeerId> m_up_done;        // UP-GATE: links whose up event has been handled (m_pmtx)
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
+    std::function<void(const bytes32&)> m_test_drop_pow_hook;
+    std::function<void(const bytes32&)> m_test_drop_stored_hook;
     Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
     std::atomic<u64> m_ping_nonce{0};               // RELAY-LIVENESS (bumped by maintenance only; read by the won re-offer)
 
