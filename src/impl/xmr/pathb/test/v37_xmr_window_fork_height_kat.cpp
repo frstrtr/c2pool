@@ -42,13 +42,14 @@ int main() {
     pb::Window w;
     w.weight[rep(0xA1)] = pb::Work(100);
     w.W = pb::Work(100);
-    const pb::Hash32 tip = rep(0x01), p_r = rep(0x02), mm = rep(0x03);
-    const pb::CanonLeaf at16 = pb::canonical_coinbase_leaf(r, w, tip, p_r, 16, mm);
-    const pb::CanonLeaf at17 = pb::canonical_coinbase_leaf(r, w, tip, p_r, 17, mm);
-    check(!at16.fork_fused, "hf16 canonical coinbase leaf built");
-    check(at17.fork_fused, "hf17 canonical coinbase FORK-FUSED (no amount invented)");
+    const pb::Hash32 tip = rep(0x01), p_r = rep(0x02);
+    const pb::CanonLeaf at16 = pb::canonical_coinbase_leaf(r, w, tip, p_r, 16);
+    const pb::CanonLeaf at17 = pb::canonical_coinbase_leaf(r, w, tip, p_r, 17);
+    check(!at16.fork_fused && at16.leaf.has_value(), "hf16 canonical coinbase leaf built");
+    check(at17.fork_fused && !at17.leaf.has_value(),
+          "hf17 canonical coinbase FORK-FUSED (no leaf, no amount invented)");
     // at hf 17 admission admits nothing (builds nothing).
-    check(!pb::canonical_coinbase_ok_split(r, w, tip, p_r, 17, mm), "hf17: admit nothing (O-01 owed)");
+    check(!pb::canonical_coinbase_ok_split(r, w, tip, p_r, 17), "hf17: admit nothing (O-01 owed)");
 
     return finish("v37_xmr_window_fork_height_kat");
 }

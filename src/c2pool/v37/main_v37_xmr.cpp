@@ -273,7 +273,7 @@ static std::uint64_t g_relay_shadow_persist_bytes = 256ull << 20;   // --relay-s
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
 // Stratum listener policy (unset = the StratumListenerOptions default).
 static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (fixed submit refill per connection, submits/s; pins the budget, disabling vardiff)
-static std::optional<std::uint32_t>      g_stratum_vardiff_shares;    // --stratum-vardiff-shares N (vardiff target: shares per lane window)
+static std::optional<std::uint32_t>      g_stratum_vardiff_shares;    // --stratum-vardiff-shares N (turns vardiff on; target shares per lane window)
 static std::optional<std::uint32_t>      g_stratum_submit_burst;      // --stratum-submit-burst N (also the per-connection queue bound)
 static std::optional<std::uint32_t>      g_stratum_ban_seconds;       // --stratum-ban-seconds S (unset = ceil(burst / submit refill))
 static std::optional<std::array<int, 4>> g_stratum_share_score;       // --stratum-share-score BAD,GOOD,BAN,CAP
@@ -645,8 +645,8 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
     lo.min_difficulty = std::max(lo.min_difficulty, hooks.stratum_min_diff);   // NET-DOS
+    if (g_stratum_vardiff_shares) { lo.vardiff_shares_per_window = *g_stratum_vardiff_shares; lo.submit_vardiff = true; }   // vardiff on
     if (g_stratum_share_rate) { lo.submit_rate = *g_stratum_share_rate; lo.submit_vardiff = false; }   // pin the budget, disable vardiff
-    if (g_stratum_vardiff_shares) lo.vardiff_shares_per_window = *g_stratum_vardiff_shares;
     if (g_stratum_submit_burst) {
         lo.submit_burst = static_cast<double>(*g_stratum_submit_burst);
         lo.max_pending_submits = *g_stratum_submit_burst;
@@ -6588,8 +6588,8 @@ int main(int argc, char** argv) {
                 "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
                 "  --stratum-share-rate R       fixed submit budget refill per connection, submits/s\n"
                 "                               (pins the budget; disables vardiff)\n"
-                "  --stratum-vardiff-shares N   vardiff target: shares per lane window per connection\n"
-                "                               (default 3; budget = 2 x S_t, floor 12.8/s)\n"
+                "  --stratum-vardiff-shares N   turn vardiff on: N shares per lane window per connection\n"
+                "                               (default off; on: budget = 2 x S_t, s unknown 12.8/s)\n"
                 "  --stratum-submit-burst N     submit budget burst and queue bound per connection (default 24)\n"
                 "  --stratum-ban-seconds S      address ban (default ceil(burst / R) = 2)\n"
                 "  --stratum-share-score B,G,K,M share score: bad share B, good share G, ban at K, cap M\n"

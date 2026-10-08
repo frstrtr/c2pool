@@ -14,6 +14,9 @@
 //   A_t     = the ancestor of P_t at depth min(CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW, h(P_t))
 //             on that branch
 //   B, M, Z, reserve = the follower's weight inputs after A_t
+//   median60 = the epee median of the timestamps of the
+//             BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW blocks ending at a parent on
+//             its branch; none for a child below that height
 // A missing block, missing weight inputs or a view whose parent links and
 // heights disagree yields Defer with the id to fetch. There is no other
 // outcome than Selected and Defer.
@@ -28,6 +31,7 @@
 #include <vector>
 
 #include "impl/xmr/native/consensus/xmr_difficulty.hpp"  // next_difficulty_from_window, DIFFICULTY_BLOCKS_COUNT, U128
+#include "impl/xmr/native/consensus/xmr_timestamp.hpp"   // BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW, median_of
 
 #include "pathb_params.hpp"
 
@@ -146,6 +150,33 @@ inline BranchStatus difficulty_window_for_child(const IBranchView& v, const Hash
     std::reverse(rows.timestamps.begin(), rows.timestamps.end());
     std::reverse(rows.cumulative_difficulties.begin(), rows.cumulative_difficulties.end());
     out = std::move(rows);
+    return detail::selected();
+}
+
+// median60 for a child of `parent`: the timestamps of the
+// BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW blocks ending at `parent` on its branch,
+// epee median. A child at a height below the window has no median: `out` is
+// empty and the timestamp rule does not apply.
+inline BranchStatus timestamp_median_for_child(const IBranchView& v, const Hash32& parent,
+                                               std::optional<std::uint64_t>& out) {
+    constexpr std::uint64_t kWindow = ::c2pool::xmr::native::BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW;
+    BranchBlock b;
+    if (BranchStatus s = detail::fetch(v, parent, b); !s.selected()) return s;
+    if (b.height + 1 < kWindow) {
+        out.reset();
+        return detail::selected();
+    }
+    std::vector<std::uint64_t> ts;
+    ts.reserve(kWindow);
+    for (std::uint64_t i = 0; i < kWindow; ++i) {
+        ts.push_back(b.timestamp);
+        if (i + 1 < kWindow) {
+            BranchBlock p;
+            if (BranchStatus s = detail::parent_of(v, b, p); !s.selected()) return s;
+            b = p;
+        }
+    }
+    out = ::c2pool::xmr::native::median_of(std::move(ts));
     return detail::selected();
 }
 
