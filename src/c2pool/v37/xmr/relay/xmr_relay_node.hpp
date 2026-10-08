@@ -210,6 +210,8 @@
 #define C2POOL_XMR_DROPS_HARDEN 1
 // set_test_drop_pow_hook() / set_test_drop_stored_hook() / test_drop_held() / test_ingest() exist.
 #define C2POOL_XMR_RELAY_DROP_POW_HOOK 1
+// submit_own_drop() calls the drop PoW and stored test hooks too.
+#define C2POOL_XMR_RELAY_OWN_DROP_HOOK 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -733,9 +735,11 @@ public:
         if (!m_o.drops_floor_diff) return;               // gate OFF: unreachable
         a.own = true; a.drop = true;
         if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
+        if (m_test_drop_pow_hook) m_test_drop_pow_hook(a.id);
         m_st.drops_own++;
         drop_store_put(a.id, a.bin, a.raw, a.pow);   // ★ RAIN-BACKFILL: servable
         flood(a.raw, 0);
+        if (m_test_drop_stored_hook) m_test_drop_stored_hook(a.id);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
     }
@@ -1475,10 +1479,12 @@ public:
         return false;
     }
     // Test hook (set before start()): called on the verify worker after a
-    // raindrop's PoW check, before admit_drop.
+    // raindrop's PoW check, before admit_drop; in submit_own_drop after the
+    // dedup note, before the store.
     void set_test_drop_pow_hook(std::function<void(const bytes32&)> f) { m_test_drop_pow_hook = std::move(f); }
-    // Test hook (set before start()): called on the verify worker after a
-    // raindrop is stored and flooded, before it is queued for drain_drops().
+    // Test hook (set before start()): called on the verify worker (and in
+    // submit_own_drop) after a raindrop is stored and flooded, before it is
+    // queued for drain_drops().
     void set_test_drop_stored_hook(std::function<void(const bytes32&)> f) { m_test_drop_stored_hook = std::move(f); }
     // Test hook: drops_sync()'s held predicate for one id.
     bool test_drop_held(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return drop_held_locked(id); }
