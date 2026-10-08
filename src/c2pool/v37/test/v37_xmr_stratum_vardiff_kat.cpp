@@ -13,7 +13,8 @@
 // source (configurable lane / Monero targets) and a counting stub verifier
 // (no RandomX, no monerod). Clients dial from 127.0.0.x source addresses.
 //   VD1  the budget values follow the lane constants: upper-bound refill
-//        2 x S_t = 2 x 2^k x n* / (COVERAGE x 120), the floor 2 x 2^k / T
+//        2 x S_t = 2 x 2^k x n* / (COVERAGE x 120), the floor 2 x 2^k / T;
+//        vardiff off by default (VD2-VD4 and VD6 turn it on)
 //   VD2  s = 100 % (lane difficulty / Monero network difficulty at the tip):
 //        the refill is the upper-bound 2 x S_t; a connection at the payout-floor
 //        rate S_t for one lane window (~3 full-difficulty shares) is never
@@ -23,6 +24,12 @@
 //   VD4  s unknown (no Monero tip): the refill falls back to the honest-safe
 //        floor; the #1932 SD7/SD8 behaviour holds (2^k / T submits/s never
 //        closed, 2 x the floor closed within 60 submits)
+//   VD5  default options: a connection submitting at the pool's own rate at
+//        the served job target is never closed: (a) job target = the lane
+//        target, s = 1 %, one connection at 1 / (2 T) submits/s; (b) job
+//        target = 2^k x the lane target, s = 100 %, one connection at
+//        2^k / T submits/s
+//   VD6  vardiff on, s = 400 %: the refill is clamped at 2 x S_t = 1.60/s
 // Nonzero exit on any failure.
 // ===========================================================================
 #include <arpa/inet.h>
@@ -65,11 +72,11 @@ const double kWindowS   = double(xc::kXmrWindowCoverage * xc::kXmrMoneroBlockInt
 struct Templates final : strat::ITemplateSource {
     std::atomic<std::uint64_t> lane_target{kMax / 1000000};
     std::atomic<std::uint64_t> mainchain_target{0};
-    void set_share(double s) {
+    void set_share(double s, double served_scale = 1.0) {
         const std::uint64_t mct = 1000000;                              // an arbitrary Monero target
         mainchain_target.store(mct);
         lane_target.store(static_cast<std::uint64_t>(
-            120.0 * double(mct) / (double(xc::kXmrTargetIntervalS) * s) + 0.5));
+            served_scale * 120.0 * double(mct) / (double(xc::kXmrTargetIntervalS) * s) + 0.5));
     }
     void set_unknown() { mainchain_target.store(0); lane_target.store(kMax / 1000000); }
     bool get_job(std::uint32_t extra_nonce, strat::TemplateJob& out) override {
@@ -176,6 +183,38 @@ o2::StratumListenerOptions opts() {
     o.poll_timeout_ms = 50;
     return o;
 }
+o2::StratumListenerOptions opts_vardiff() {
+    o2::StratumListenerOptions o = opts();
+    o.submit_vardiff = true;
+    return o;
+}
+// One connection from `src` submitting at `rate` submits/s (exponential gaps,
+// seeded) from test time `t0` for `secs` seconds. True when it stayed open
+// and every submit got a non-error reply.
+bool run_conn(Rig& R, const char* src, double rate, double t0, double secs, std::uint64_t seed,
+              std::uint32_t& sent, std::uint32_t& ok) {
+    int fd = -1;
+    const std::string jid = R.login(fd, src);
+    if (jid.empty()) { if (fd >= 0) ::close(fd); return false; }
+    std::mt19937_64 rng(seed);
+    std::exponential_distribution<double> gap(rate);
+    double t = t0;
+    sent = 0; ok = 0;
+    bool dropped = false;
+    while (t < t0 + secs) {
+        t += gap(rng);
+        R.off_us = static_cast<long long>(t * 1e6);
+        const std::uint32_t id = 1000 + sent;
+        send_line(fd, submit_req(id, jid, 50000 + sent));
+        const std::string l = read_line(fd, 3000);
+        ++sent;
+        if (l.empty() || l == "<EOF>") { dropped = true; break; }
+        if (reply_to(l, id) && !is_error(l)) ++ok;
+    }
+    const bool open = !dropped && !closed_within(fd, 200);
+    ::close(fd);
+    return open && ok == sent;
+}
 bool near(double a, double b) { return std::fabs(a - b) <= 1e-6 * (1.0 + std::fabs(b)); }
 
 } // namespace
@@ -196,14 +235,14 @@ int main() {
               "St_max=" + std::to_string(kStMax) + " budget_max=" + std::to_string(kBudgetMax) +
                   " floor=" + std::to_string(kFloorRate) + " t_W=" + std::to_string(kWindowS));
         const o2::StratumListenerOptions d;
-        check("VD1 default: vardiff on, n* = kXmrVardiffSharesPerWindow, floor submit_rate = 12.8/s",
-              d.submit_vardiff && d.vardiff_shares_per_window == xc::kXmrVardiffSharesPerWindow && near(d.submit_rate, kFloorRate),
+        check("VD1 default: vardiff off, n* = kXmrVardiffSharesPerWindow, submit_rate = 12.8/s",
+              !d.submit_vardiff && d.vardiff_shares_per_window == xc::kXmrVardiffSharesPerWindow && near(d.submit_rate, kFloorRate),
               "vardiff=" + std::to_string(d.submit_vardiff) + " n*=" + std::to_string(d.vardiff_shares_per_window));
     }
 
     // ── VD2 s = 100 %: upper-bound budget, floor miner never throttled ──────
     {
-        Rig R(opts());
+        Rig R(opts_vardiff());
         R.tpl.set_share(1.0);
         check("VD2 listener up (s = 100 %, test clock)", R.up());
         int fd = -1;
@@ -258,7 +297,7 @@ int main() {
 
     // ── VD3 s = 50 %: the budget halves with the window ─────────────────────
     {
-        Rig R(opts());
+        Rig R(opts_vardiff());
         R.tpl.set_share(0.5);
         check("VD3 listener up (s = 50 %, test clock)", R.up());
         int fd = -1;
@@ -309,7 +348,7 @@ int main() {
 
     // ── VD4 s unknown: fall back to the honest-safe floor (SD7/SD8) ─────────
     {
-        Rig R(opts());
+        Rig R(opts_vardiff());
         R.tpl.set_unknown();   // no Monero tip
         check("VD4 listener up (s unknown, test clock)", R.up());
         int fd = -1;
@@ -355,6 +394,52 @@ int main() {
         ::close(f2);
         check("VD4 at the floor, 2 x the floor (25.6/s) is closed within 60 submits (SD8)",
               !j2.empty() && closed2 && sent2 <= 60, "sent=" + std::to_string(sent2));
+        R.L.stop();
+    }
+
+    // ── VD5 default options: a connection at the pool's own rate is never closed
+    {
+        // (a) job target = the lane target, s = 1 %: one connection at 1 / (2 T)
+        Rig R(opts());
+        R.tpl.set_share(0.01);
+        check("VD5a listener up (s = 1 %, default options)", R.up());
+        const double rate = 1.0 / (2.0 * double(xc::kXmrTargetIntervalS));   // 0.05/s
+        std::uint32_t sent = 0, ok = 0;
+        const bool open = run_conn(R, "127.0.0.100", rate, 0.0, 3000.0, 1940, sent, ok);
+        auto s = R.L.stats();
+        check("VD5a s = 1 %, job target = the lane target: 1 / (2 T) submits/s for 3,000 s is never closed",
+              open && sent >= 100 && s.submits_over_budget == 0 && s.bans == 0,
+              "sent=" + std::to_string(sent) + " ok=" + std::to_string(ok) +
+                  " over=" + std::to_string(s.submits_over_budget) + " effective=" + std::to_string(R.L.submit_rate_effective()));
+        R.L.stop();
+    }
+    {
+        // (b) job target = 2^k x the lane target, s = 100 %: one connection at 2^k / T
+        Rig R(opts());
+        R.tpl.set_share(1.0, kTwoK);
+        check("VD5b listener up (s = 100 %, job target 2^k x the lane target, default options)", R.up());
+        const double rate = kTwoK / double(xc::kXmrTargetIntervalS);   // 6.4/s
+        std::uint32_t sent = 0, ok = 0;
+        const bool open = run_conn(R, "127.0.0.101", rate, 0.0, 60.0, 1945, sent, ok);
+        auto s = R.L.stats();
+        check("VD5b s = 100 %, job target 2^k x the lane target: 2^k / T submits/s for 60 s is never closed",
+              open && sent >= 300 && s.submits_over_budget == 0 && s.bans == 0,
+              "sent=" + std::to_string(sent) + " ok=" + std::to_string(ok) +
+                  " over=" + std::to_string(s.submits_over_budget) + " effective=" + std::to_string(R.L.submit_rate_effective()));
+        R.L.stop();
+    }
+
+    // ── VD6 vardiff on, s above 100 %: the refill is clamped at 2 x S_t ──────
+    {
+        Rig R(opts_vardiff());
+        R.tpl.set_share(4.0);
+        check("VD6 listener up (s = 400 %, vardiff on)", R.up());
+        int fd = -1;
+        const std::string jid = R.login(fd, "127.0.0.102");
+        const double rate = R.L.submit_rate_effective();
+        check("VD6 s = 400 %: the refill is clamped at 2 x S_t = 1.60/s",
+              !jid.empty() && near(rate, kBudgetMax), "effective=" + std::to_string(rate));
+        if (fd >= 0) ::close(fd);
         R.L.stop();
     }
 
