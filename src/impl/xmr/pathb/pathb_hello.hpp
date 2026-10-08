@@ -13,10 +13,10 @@
 //     the rules block (codec, rules_len, TLV) is pathb_lane_rules.hpp's; a
 //     codec byte other than 2 is refused naming K22; the TLV is compared only
 //     at equal epoch_cur (hello_rules_compare); best_cum_work, best_tip and
-//     best_h are claims; mmr_leaf_count is state: once the best tip's header is
-//     held it equals leaf_count(best_tip) = max(0, H(best_tip) - F - b0 + 1),
-//     else the link is closed without a strike (policy).
-//   then the node key (S6) and the trailer.
+//     best_h are claims; hello_leaf_count_check compares mmr_leaf_count with
+//     leaf_count(best_tip) = max(0, H(best_tip) - F - b0 + 1) once the best
+//     tip's header is held.
+//   The bytes after the tail are not read here.
 //
 //   trailer (68 B, little-endian) = u16 epoch_cur | u16 deploy_top
 //                                 | b32 deploy_digest | b32 next_digest
@@ -103,12 +103,11 @@ struct HelloTailDecode {
     HelloTailError error = HelloTailError::None;
     std::uint8_t id = 0;       // the field the refusal names (Codec: 22)
     HelloTail tail;
-    std::size_t consumed = 0;  // the tail's bytes; the node key and the trailer follow
+    std::size_t consumed = 0;  // the tail's bytes
 };
 
-// Reads the tail from the front of b. The TLV is framed, not judged: it is
-// compared at equal epoch_cur only (hello_rules_compare), so a peer at another
-// epoch may carry ids this node does not know.
+// Reads the tail from the front of b; `consumed` is its length. The TLV is
+// framed, not judged (hello_rules_compare judges it at equal epoch_cur).
 inline HelloTailDecode decode_hello_tail(std::span<const std::uint8_t> b) {
     HelloTailDecode d;
     if (b.size() < kRulesBlockHeadBytes) {
@@ -144,7 +143,7 @@ inline HelloTailDecode decode_hello_tail(std::span<const std::uint8_t> b) {
 enum class HelloLeafCount : std::uint8_t {
     Equal,
     Pending,   // the best tip's header is not held yet
-    Mismatch,  // close the link, no strike (policy)
+    Mismatch,  // mmr_leaf_count != leaf_count(best_tip)
 };
 
 inline HelloLeafCount hello_leaf_count_check(const HelloTail& t, std::optional<std::uint64_t> best_tip_record,

@@ -11,8 +11,8 @@
 //   (0x0c, K12, absent in v1) refused naming it; codec byte 1 refused naming
 //   K22; the 68-byte trailer round trip; a trailer of another length refused.
 //   S3b-3: the Path B tail (rules block | LE128 best_cum_work | best_tip |
-//   LE64 best_h | LE64 mmr_leaf_count) golden layout and round trip, followed by
-//   the node key and the trailer; a codec byte 1 refused naming K22; a short
+//   LE64 best_h | LE64 mmr_leaf_count) golden layout and round trip; bytes after
+//   the tail not read; a codec byte 1 refused naming K22; a short
 //   tail refused; K09 = 3 -> LANE_RULES_MISMATCH naming 0x09; OVH(16) 88 ->
 //   naming 0x18; the unknown id 0x1f (assigned by neither codec 1 nor codec
 //   2) refused naming it; K29 missing refused naming 0x1d; ids out of order
@@ -113,20 +113,12 @@ void tail_vectors() {
     const pb::HelloTailDecode d = pb::decode_hello_tail(b);
     check(d.error == pb::HelloTailError::None && d.tail == t && d.consumed == 330, "tail round trip");
 
-    // the node key and the trailer follow the tail
-    std::vector<std::uint8_t> wire = b;
-    const std::array<std::uint8_t, 32> node_key = seq32(0xC0);
-    wire.insert(wire.end(), node_key.begin(), node_key.end());
-    pb::HelloTrailer tr;
-    tr.epoch_cur = 0;
-    tr.deploy_top = 0;
-    const pb::HelloTrailerBytes tb = pb::encode_hello_trailer(tr);
-    wire.insert(wire.end(), tb.begin(), tb.end());
-    const pb::HelloTailDecode dw = pb::decode_hello_tail(wire);
-    check(dw.error == pb::HelloTailError::None && dw.consumed == 330 && dw.tail == t &&
-                  pb::decode_hello_trailer(std::span<const std::uint8_t>(wire).subspan(330 + 32)) ==
-                          std::optional<pb::HelloTrailer>(tr),
-          "tail | node key | trailer: the tail consumes 330 B, the trailer decodes after the key");
+    // bytes after the tail are not read by the tail decoder
+    std::vector<std::uint8_t> more = b;
+    for (std::uint8_t x = 0; x < 7; ++x) more.push_back(x);
+    const pb::HelloTailDecode dm = pb::decode_hello_tail(more);
+    check(dm.error == pb::HelloTailError::None && dm.consumed == 330 && dm.tail == t,
+          "bytes after the tail: the tail decodes alone and consumes 330 B");
 
     std::vector<std::uint8_t> c1 = b;
     c1[0] = 1;

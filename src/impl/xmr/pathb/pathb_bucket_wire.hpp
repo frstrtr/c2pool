@@ -67,9 +67,8 @@
 // completes from the pages of ONE server; a page not received is asked from
 // another server (abandon()).
 //
-// Policy (ruling 23; defaults with a reason and a flag; a different value
-// changes no verdict, it costs a fetch or a DEFER): P-39 frame buffer, P-41
-// requests in flight per peer, P-42 bytes per peer per minute.
+// Policy (ruling 23): P-39 frame buffer, P-41 requests in flight per peer,
+// P-42 bytes per peer per minute; over a budget: DROP, no verdict.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -104,7 +103,7 @@ namespace c2pool::xmr::pathb {
 // ---------------------------------------------------------------------------
 inline constexpr std::uint8_t kOpFcGetBuckets = 0x54;  // family C (ruling 31 P-7)
 inline constexpr std::uint8_t kOpFcBuckets = 0x55;
-inline constexpr std::uint8_t kFcFrameVersion = 1;     // the frame version of the relay frames
+inline constexpr std::uint8_t kFcFrameVersion = 1;     // FH frame version
 
 inline constexpr std::size_t kRatchetStateBytes = rs_layout::kSize;
 static_assert(kRatchetStateBytes == 134);
@@ -129,15 +128,13 @@ inline constexpr std::size_t kMaxPathLen = UINT8_MAX;
 // ---------------------------------------------------------------------------
 // Policy (ruling 23)
 // ---------------------------------------------------------------------------
-// P-39 FC_BUCKETS frame buffer: one frame is bounded like every other frame (the
-// transport ceiling P-14 = FB_CTX header + blob_cap_ctx); a larger bucket pages.
+// P-39 FC_BUCKETS frame buffer, default P-14 = FB_CTX header + blob_cap_ctx(hf, Z).
 inline constexpr std::string_view kBucketFrameFlag = "--pathb-bucket-frame";
-// P-41 FC_GETBUCKETS in flight per peer, default 1: a joiner pages sequentially;
-// more are DROPPED, no verdict.
+// P-41 FC_GETBUCKETS in flight per peer, default 1; more: DROP, no verdict.
 inline constexpr std::uint64_t kBucketInflightDefault = 1;
 inline constexpr std::string_view kBucketInflightFlag = "--pathb-bucket-inflight";
-// P-42 FC_BUCKETS bytes per peer per minute, default kBucketRateFrames x P-39: a
-// joiner needs a few MB once; above it DROP, no verdict.
+// P-42 FC_BUCKETS bytes per peer per minute, default kBucketRateFrames x P-39;
+// more: DROP, no verdict.
 inline constexpr std::uint64_t kBucketRateFrames = 10;
 inline constexpr std::string_view kBucketRateFlag = "--pathb-bucket-rate";
 inline constexpr std::uint64_t kSecondsPerMinute = 60;
