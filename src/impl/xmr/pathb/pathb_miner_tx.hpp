@@ -208,7 +208,7 @@ inline std::vector<std::uint8_t> canonical_tx_extra_hf16(const Hash32& r_tx,
                                                          const std::array<std::uint8_t, kExtraNonceBytes>& nonce,
                                                          const Hash32& mm_root) {
     Pbx1 x;
-    x.keys = {r_tx};
+    x.keys.push_back(r_tx);
     x.extra_nonce = nonce;
     x.mm_root = mm_root;
     std::vector<std::uint8_t> out;
