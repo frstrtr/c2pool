@@ -34,6 +34,7 @@
 #include <c2pool/v37/xmr/xmr_lane_rules.hpp>
 #include <c2pool/v37/xmr/xmr_lane_rules_build.hpp>
 #include <c2pool/v37/xmr/xmr_pool_tag.hpp>
+#include "impl/xmr/pathb/test/pathb_lane_rules_cases.hpp"  // the Path B case group (pathb_lane_rules.hpp)
 
 using namespace gap2test;
 namespace lr      = c2pool::v37n::xmr::lanerules;
@@ -339,5 +340,7 @@ int main() {
     suite_refusal(C);
     suite_frames(C);
     suite_property(C);
-    return C.done("v37_xmr_lane_rules_kat");
+    const int pathb_fail = pathb_lane_rules_cases::run();
+    const int ledger = C.done("v37_xmr_lane_rules_kat");
+    return ledger != 0 || pathb_fail != 0 ? 1 : 0;
 }
