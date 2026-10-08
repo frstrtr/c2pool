@@ -734,14 +734,24 @@ public:
     void submit_own_drop(Admitted a) {
         if (!m_o.drops_floor_diff) return;               // gate OFF: unreachable
         a.own = true; a.drop = true;
-        if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
+        bool fresh = false, inflight = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            fresh = drop_note_new_locked(a.id);   // in m_drop_seen and m_inflight until stored and queued
+            if (fresh) inflight = m_inflight.insert(a.id).second;
+        }
+        if (!fresh) { m_st.drops_dup++; return; }
         if (m_test_drop_pow_hook) m_test_drop_pow_hook(a.id);
         m_st.drops_own++;
+        const bytes32 id = a.id;
         drop_store_put(a.id, a.bin, a.raw, a.pow);   // ★ RAIN-BACKFILL: servable
         flood(a.raw, 0);
         if (m_test_drop_stored_hook) m_test_drop_stored_hook(a.id);
-        std::lock_guard<std::mutex> lk(m_amtx);
-        m_drops.push_back(std::move(a));
+        {
+            std::lock_guard<std::mutex> lk(m_amtx);
+            m_drops.push_back(std::move(a));
+        }
+        if (inflight) forget_inflight(id);   // stored and queued for drain_drops(): held from here
     }
     // ── main thread: the raindrops admitted since the last call ─────────────
     std::vector<Admitted> drain_drops() {
