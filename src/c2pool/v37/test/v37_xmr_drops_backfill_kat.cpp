@@ -25,6 +25,9 @@
 //       is complete with no I/O, no FB_GETDROPS/FB_DROPINV is ever sent, and
 //       a gate-OFF node that receives one counts it as an unknown Family-B
 //       opcode and keeps the socket (master's behaviour)
+//   B5  ONE VERIFY: a copy of a raindrop queued while the first copy leaves
+//       the verify worker (after its PoW check, before admit_drop) is a dup:
+//       one RandomX verify, one admission
 //   H1  REORG: a node that books its own sibling Y at h and then the
 //       canonical X at h composes X from the SAME rows (and the same credit) as
 //       a node that only ever booked X -- base: the second booking is empty
@@ -322,6 +325,33 @@ int main() {
           std::to_string(Z0.relay->stats().fb_unknown.load()) + ")");
         W1.relay->set_dialing(false); Y0.relay->set_dialing(false);
     }
+
+    // ── B5 ONE VERIFY ───────────────────────────────────────────────────────
+#if defined(C2POOL_XMR_RELAY_DROP_POW_HOOK)
+    {
+        const SynthBlock blk = make_block(105, prev[5], 21, nullptr, 3, 40);
+        const Admitted d = drop_on(blk, kDropNonce + 0x3000, pA);
+        std::atomic<int> hooked{0};
+        RNode D("D", opts(false, {}, kFloorDiff));
+        for (int i = 0; i < 8; ++i) D.note_bin(prev[i], 100 + i);
+        D.relay->set_test_drop_pow_hook([&](const bytes32& id) {
+            if (id == d.id && hooked.fetch_add(1) == 0) D.relay->test_ingest(d.raw, 7);
+        });
+        C(D.relay->start(why), "B5 D starts " + why);
+        C(D.relay->test_ingest(d.raw, 7), "B5 one raindrop queued at D");
+        const auto& ds = D.relay->stats();
+        const bool settled = wait_for([&] {
+            return ds.drops_dup.load() >= 1 && ds.drops_foreign.load() >= 1 && held(D, 105, 106).size() == 1;
+        }, {&D}, 10000ms);
+        std::printf("    B5 D: hook=%d rx=%llu drops_foreign=%llu drops_dup=%llu held=%zu\n", hooked.load(),
+                    (unsigned long long)D.rx_calls.load(), (unsigned long long)ds.drops_foreign.load(),
+                    (unsigned long long)ds.drops_dup.load(), held(D, 105, 106).size());
+        C(settled && hooked.load() >= 1 && D.rx_calls.load() == 1 && ds.drops_foreign.load() == 1 && ds.drops_dup.load() == 1,
+          "B5 ★ a copy queued after the PoW check, before admit_drop, is a dup: ONE RandomX verify, ONE admission");
+    }
+#else
+    C(false, "B5 one RandomX verify per raindrop (base: no drop PoW hook)");
+#endif
 
     // ── H1 / H2: consumption follows the chain ─────────────────────────────
     {

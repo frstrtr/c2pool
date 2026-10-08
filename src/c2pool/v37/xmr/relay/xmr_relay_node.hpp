@@ -208,6 +208,8 @@
 // drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
 // (drops_persist_path, drops_persist(), drops_load()).
 #define C2POOL_XMR_DROPS_HARDEN 1
+// set_test_drop_pow_hook() / test_ingest() exist.
+#define C2POOL_XMR_RELAY_DROP_POW_HOOK 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -1467,6 +1469,18 @@ public:
         for (const auto& p : m_parked) if (p.id == id) return true;
         return false;
     }
+    // Test hook (set before start()): called on the verify worker after a
+    // raindrop's PoW check, before admit_drop.
+    void set_test_drop_pow_hook(std::function<void(const bytes32&)> f) { m_test_drop_pow_hook = std::move(f); }
+    // Test hook: queue one encoded receipt from `from` (on_receipts' per-receipt path).
+    bool test_ingest(const std::vector<u8>& raw, PeerId from) {
+        Item it;
+        if (!decode_fb_receipt(raw, it.r)) return false;
+        it.from = from; it.src = from; it.raw = raw; it.id = receipt_id(it.r);
+        if (m_o.drops_floor_diff && drop_wanted(it.id)) it.solicited = true;
+        enqueue(std::move(it));
+        return true;
+    }
     // Rig hook (SIGUSR1 in the daemon): a NETWORK PARTITION of `secs` seconds --
     // every relay connection is dropped, inbound connections are refused and
     // nothing is dialed until it ends; then the node redials and backfills.
@@ -2699,6 +2713,7 @@ private:
                 if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
                 m_inflight.erase(it.id);
             }
+            if (m_test_drop_pow_hook) m_test_drop_pow_hook(it.id);
             admit_drop(std::move(it), ctx->height, pow);
             return;
         }
@@ -4022,6 +4037,7 @@ private:
     std::set<PeerId> m_up_done;        // UP-GATE: links whose up event has been handled (m_pmtx)
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
+    std::function<void(const bytes32&)> m_test_drop_pow_hook;
     Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
     std::atomic<u64> m_ping_nonce{0};               // RELAY-LIVENESS (bumped by maintenance only; read by the won re-offer)
 
