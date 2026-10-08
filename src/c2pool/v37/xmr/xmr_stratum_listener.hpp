@@ -49,10 +49,9 @@
 //     submits delays the others by at most one hash per pass;
 //   * per-connection submit budget (submit_burst, then a refill per s): a
 //     submit over it is dropped unverified and the connection is BANNED. The
-//     refill is VARDIFF (submit_vardiff, on by default): 2 x S_t tracking the
-//     lane window from the tip, S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / s,
-//     clamped at s = 100 %; before the first window (s unknown) the honest-safe
-//     floor submit_rate (2 x 2^k / T = 12.8/s);
+//     refill is submit_rate (2 x 2^k / T = 12.8/s). With submit_vardiff (off
+//     by default) the refill is 2 x S_t from the tip, S_t = 2^k x n* / t_W,
+//     t_W = COVERAGE x 120 / s, clamped at s = 100 %; s unknown: submit_rate;
 //   * a repeated (job id, nonce) is refused unverified ("Duplicate share");
 //   * share score per connection: a low-difficulty or duplicate share
 //     bad_share_points, an accepted one good_share_points (capped at
@@ -173,16 +172,11 @@ struct StratumListenerOptions {
     int           ban_score = -9;            // banned at or below this score
     int           max_score = 0;             // the score never rises above this
     std::size_t   max_seen_submits = 256;    // (job id, nonce) pairs remembered per connection
-    // VARDIFF (POLICY, ruling 23: node-local; a different value forks nothing).
-    // On (the default), the per-connection submit-rate budget tracks the lane
-    // window from the tip: the refill is 2 x S_t, S_t = 2^k x n* / t_W,
-    // t_W = COVERAGE x 120 / s, s = the pool's share of Monero hashrate read from
-    // the tip (lane difficulty vs Monero network difficulty), S_t clamped at
-    // s = 100 % (2^k x n* / (COVERAGE x 120) = 0.80/s -> refill 1.6/s). Before
-    // the first window (s unknown), the refill is submit_rate (the honest-safe
-    // floor, 2 x 2^k / T = 12.8/s). Off (or a fixed submit_rate override):
-    // the refill is the fixed submit_rate.
-    bool          submit_vardiff = true;
+    // VARDIFF (policy). Off (the default): the refill is submit_rate. On: the
+    // refill is 2 x S_t, S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / s, s read
+    // from the job's lane target vs the Monero target, S_t clamped at
+    // s = 100 % (0.80/s -> refill 1.6/s); s unknown: submit_rate.
+    bool          submit_vardiff = false;
     std::uint32_t vardiff_shares_per_window = kXmrVardiffSharesPerWindow;   // n*
 };
 
@@ -245,9 +239,9 @@ public:
     using NowFn = std::function<std::chrono::steady_clock::time_point()>;
     void set_now_fn(NowFn f) { m_now_fn = std::move(f); }
 
-    // VARDIFF: the per-connection submit-rate budget refill now in force
-    // (submits/s), recomputed from the tip on every template; the honest-safe
-    // floor (submit_rate) before the first window or when vardiff is off.
+    // The per-connection submit-rate budget refill now in force (submits/s),
+    // recomputed on every template; submit_rate when vardiff is off or s is
+    // unknown.
     double submit_rate_effective() const { return m_submit_rate_effective.load(std::memory_order_relaxed); }
 
     // GAP-2: a node-chosen extra_nonce base (see XmrStratumServer::seed_extra_nonce).
