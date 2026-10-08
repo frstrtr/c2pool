@@ -2718,11 +2718,13 @@ private:
                 std::lock_guard<std::mutex> lk(m_mtx);
                 if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
                 fresh = drop_note_new_locked(it.id);   // in m_drop_seen before it leaves m_inflight
-                m_inflight.erase(it.id);
+                if (!fresh) m_inflight.erase(it.id);
             }
             if (m_test_drop_pow_hook) m_test_drop_pow_hook(it.id);
             if (!fresh) { m_st.drops_dup++; return; }
+            const bytes32 id = it.id;
             admit_drop(std::move(it), ctx->height, pow);
+            forget_inflight(id);   // stored and queued for drain_drops(): held from here
             return;
         }
         // invalid: re-hash (the p2pool unstable-hardware guard) before any ban
@@ -2847,11 +2849,13 @@ private:
             m_drop_dirty = true;
         }
     }
-    // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
+    // held = admitted here (servable) or at least seen (dedup set), and not in
+    // m_inflight (verify or admission): nothing to fetch
     bool drop_held_locked(const bytes32& id) const {
-        if (m_drop_store_id.count(id)) return true;
+        const bool stored = m_drop_store_id.count(id) != 0;
         std::lock_guard<std::mutex> lk(m_mtx);
-        return m_drop_seen.count(id) != 0;
+        if (m_inflight.count(id)) return false;
+        return stored || m_drop_seen.count(id) != 0;
     }
     bool drop_wanted(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.count(id) != 0; }
     bool drop_unwant(const bytes32& id) { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.erase(id) != 0; }
