@@ -7,7 +7,9 @@
 // v37_xmr_pathb_coinbase_kat (pathb_coinbase_split.hpp, C07, "kept name"
 // xmr_coinbase_kat -- shipped pathb-scoped because the native settle
 // xmr_coinbase_kat target already exists): Sum(vout) == R = base + fees through
-// the Path B coinbase (the hf-16 miner tx) on the payees of mainnet block
+// the split of a window built by window() from WinBins (two of three bins, owner
+// and author shares) and through the Path B coinbase (the hf-16 miner tx) on the
+// payees of mainnet block
 // 3,755,897 (R 600,000,000,000) and on a regtest vector (R 35,184,338,534,400,
 // fees 0), both with a non-zero largest-remainder deficit; the canonical split
 // miner tx is admitted; a wrong one is a BAN before RandomX (the RandomX stub is
@@ -46,6 +48,12 @@ static pb::Hash32 id_of(std::uint64_t i) {
     pb::Hash32 h{};
     for (int b = 0; b < 8; ++b) h[31 - b] = static_cast<std::uint8_t>(i >> (8 * b));
     return h;
+}
+
+// A payee's window weight, zero when it is not a payee.
+static pb::Work weight_of(const pb::Window& w, const pb::Hash32& id) {
+    const auto it = w.weight.find(id);
+    return it == w.weight.end() ? pb::Work{} : it->second;
 }
 
 // Sum of floor(R w_i / W) over the window (no largest remainder).
@@ -114,14 +122,53 @@ int main() {
 
     // mainnet-tail split vector: base = 6e11, fees 5e9 -> R = 605e9.
     const std::uint64_t base = 600000000000ull, fees = 5000000000ull, R = base + fees;
-    pb::Window w;
-    for (std::uint64_t i = 1; i <= 32; ++i) { w.weight[id_of(i)] = pb::Work(1000 * i); w.W += pb::Work(1000 * i); }
-    {
-        const auto outs = pb::split(R, w);
-        std::uint64_t s = 0;
-        for (const auto& o : outs) s += o.amount;
-        check(s == R, "Sum(vout) == R = base + fees (mainnet tail)");
+    // The window through window(): three bins newest first, miner i (1..32) with
+    // 500 i of raw work in each; miner 32 pays owner 0x1000 at p 100 bp, miner 31
+    // gives 10 bp to the author 0x2000; D_net 200,000 (COVERAGE 400,000) takes
+    // the two newest bins; f_spend and N(B) of the tip (M 300k, Z 300k, hf 16).
+    const pb::Hash32 cb_owner = id_of(0x1000), cb_author = id_of(0x2000);
+    std::vector<pb::WinBin> cb_bins;
+    for (std::uint64_t k = 0; k < 3; ++k) {
+        pb::WinBin b;
+        b.bin = 2000 - k;
+        for (std::uint64_t i = 1; i <= 32; ++i) {
+            pb::WinEntry x;
+            x.miner = id_of(i);
+            x.work = 500 * i;
+            x.position = 900 - 40 * k - i;
+            x.id = id_of(100000 + x.position);
+            if (i == 32) { x.owner = cb_owner; x.p = 100; }
+            if (i == 31) x.give_author_bp = 10;
+            b.entries.push_back(x);
+        }
+        cb_bins.push_back(b);
     }
+    const pb::Window w = pb::window(cb_bins, 200000, base, pb::f_spend(base, 300000, 16), pb::n_rule(300000, 16, base),
+                                    cb_author);
+    check(w.W == pb::Work(528000) && w.weight.size() == 34, "window(): two newest bins, W 528,000, 34 payees");
+    check(weight_of(w, id_of(32)) == pb::Work(31680) && weight_of(w, cb_owner) == pb::Work(320)
+                  && weight_of(w, id_of(31)) == pb::Work(30970) && weight_of(w, cb_author) == pb::Work(30)
+                  && weight_of(w, id_of(1)) == pb::Work(1000),
+          "window(): miner 32 31,680 + owner 320, miner 31 30,970 + author 30, miner 1 1,000");
+
+    // Sum(vout) == R exactly through the Path B coinbase.
+    const auto outs = pb::split(R, w);
+    std::uint64_t s = 0;
+    for (const auto& o : outs) s += o.amount;
+    check(s == R, "Sum(vout) == R = base + fees (mainnet tail)");
+    {
+        std::uint64_t a_owner = 0, a_author = 0, a_1 = 0, a_32 = 0;
+        for (const auto& o : outs) {
+            if (o.payee == cb_owner) a_owner = o.amount;
+            if (o.payee == cb_author) a_author = o.amount;
+            if (o.payee == id_of(1)) a_1 = o.amount;
+            if (o.payee == id_of(32)) a_32 = o.amount;
+        }
+        check(outs.size() == 34 && a_owner == 366666667ull && a_author == 34375000ull && a_1 == 1145833333ull
+                      && a_32 == 36300000000ull,
+              "split: owner 366,666,667, author 34,375,000, miner 1 1,145,833,333, miner 32 36,300,000,000");
+    }
+
 
     // a window over referenced payees.
     std::vector<std::pair<pb::Hash32, std::uint64_t>> wts;
