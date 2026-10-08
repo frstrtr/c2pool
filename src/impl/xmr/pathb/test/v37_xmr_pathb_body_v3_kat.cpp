@@ -23,7 +23,8 @@
 //       tx_count - 1 above floor(2 Z / w_min) refused; blob_len 79 / 71 refused;
 //   (3) hashing blob: field wider than declared refused (both directions),
 //       non-canonical varint refused, blob_len not matching the fields refused;
-//   (4) round trip over generated bodies; encode(decode(b)) == b;
+//   (4) round trip over generated bodies (give_author_bp in 0..10000 - p);
+//       encode(decode(b)) == b;
 //   (5) every truncation refused; mutation pass: an accepted mutant
 //       re-encodes to the same bytes;
 //   (6) carrier body: 0 and R_MAX carried round trip; R_MAX + 1 refused by
@@ -264,8 +265,8 @@ int main() {
             b.blob.timestamp = rng.below(1ull << 35);
             b.blob.tx_count = rng.below(1ull << 21);
             b.reward_total = rng.next();
-            b.side.give_author_bp = static_cast<std::uint16_t>(rng.below(10001));
             if (owner) b.side.fee_rate_bp = static_cast<std::uint16_t>(1 + rng.below(10000));
+            b.side.give_author_bp = static_cast<std::uint16_t>(rng.below(10001u - b.side.fee_rate_bp));  // 0..10000 - p
             const std::vector<std::uint8_t> e = enc(b);
             pb::ReceiptBodyV3 back;
             if (e.empty() || dec(e, 16, &back) != pb::WireError::None || !(back == b) || enc(back) != e)

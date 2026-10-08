@@ -17,21 +17,25 @@
 //   No clock input: a timestamp ahead of local time is not judged here (the
 //   future bound is relay policy P-29).
 //
-//   S2.3 #1a / #1b and the frame (K18):
+//   S2.3 #1a / #1b / #2 and the frame (K18):
 //     a body longer than the receipt I/O buffer (P-10) or a frame longer than
 //     the frame I/O buffer (P-11): DROP (no verdict, no token);
-//     any other codec refusal: STRIKE;
+//     any other codec refusal: STRIKE (#2: p <= 10000, give_author_bp <= 10000,
+//     p + give_author_bp <= 10000 [consensus]; #1b: the rest);
 //     a frame above FRAME_CAP at the largest receipt cap among its bodies: STRIKE.
+//   admit_codec_then_resolve: #1a / #1b / #2 strictly before #3 / #5 / #15 seed
+//     (DEFER + fetch, or BAN the server) and before RandomX.
 //
 // Header-only. Not included by any running component.
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
 #include "pathb_caps.hpp"               // receipt_size_rules, within_receipt_cap
-#include "pathb_receipt_admission.hpp"  // AdmitVerdict
+#include "pathb_receipt_admission.hpp"  // AdmitVerdict, Resolve, admit_resolution
 #include "pathb_wire_v3.hpp"            // HashingBlob, ReceiptBodyV3, WireError
 
 namespace c2pool::xmr::pathb {
@@ -81,11 +85,52 @@ inline constexpr std::optional<AdmitVerdict> header_fields_verdict(HeaderFault f
     return AdmitVerdict::Strike;
 }
 
-// #1a / #1b: the codec outcome. None when the body decoded.
+// The S2.3 row of a codec outcome.
+enum class WireRow : std::uint8_t {
+    Decoded,  // no refusal
+    Row1a,    // longer than the I/O buffer: DROP
+    Row1b,    // parse, version, length, kinds, points, owner_ref iff p > 0: STRIKE
+    Row2,     // p, give_author_bp <= 10000 and p + give_author_bp <= 10000: STRIKE
+};
+
+inline constexpr WireRow wire_row(WireError e) noexcept {
+    switch (e) {
+        case WireError::None: return WireRow::Decoded;
+        case WireError::FeeRateRange:
+        case WireError::GiveAuthorRange:
+        case WireError::ShareSum: return WireRow::Row2;
+        default: return wire_drop_without_verdict(e) ? WireRow::Row1a : WireRow::Row1b;
+    }
+}
+
+// #1a / #1b / #2: the codec outcome. None when the body decoded.
 inline constexpr std::optional<AdmitVerdict> wire_verdict(WireError e) noexcept {
     if (e == WireError::None) return std::nullopt;
     if (wire_drop_without_verdict(e)) return AdmitVerdict::Drop;
     return AdmitVerdict::Strike;
+}
+
+// One received body in S2.3 order: the codec (#1a DROP; #1b / #2 STRIKE), then
+// the resolution (#3 / #5 / #15 seed: DEFER, or BAN the server). The resolver
+// runs only for a body that decoded: a #1b / #2 refusal costs no fetch and no
+// RandomX. verdict empty: the body continues at #4.
+struct CodecHead {
+    WireError error = WireError::None;
+    bool resolved = false;                // the resolver ran
+    std::optional<AdmitVerdict> verdict;  // empty: continue at #4
+};
+
+template <class ResolveFn>
+inline CodecHead admit_codec_then_resolve(const std::uint8_t* data, std::size_t n, const ReceiptLimits& lim,
+                                          ReceiptBodyV3& body, ResolveFn&& resolve) {
+    CodecHead h;
+    h.error = decode_receipt_body_v3(data, n, lim, body);
+    h.verdict = wire_verdict(h.error);  // #1a / #1b / #2
+    if (h.verdict) return h;
+    h.resolved = true;
+    const Resolve r = resolve(static_cast<const ReceiptBodyV3&>(body));
+    if (r != Resolve::Ready) h.verdict = admit_resolution(r);  // #3 / #5 / #15 seed
+    return h;
 }
 
 // The frame length against the frame I/O buffer (before parsing) and FRAME_CAP.

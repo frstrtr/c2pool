@@ -16,10 +16,12 @@
 //     position, newest first then id ascending). [C38, K09, K11a, rulings 15/19]
 //   shares: w_owner = floor(work x p / 10000), w_author = floor(work x ga /
 //     10000), w_miner = work - w_owner - w_author. [K15, K16]
-//   merge_back: identity X with w_X x B(A_t) < W x f_spend returns its owner /
+//   merge_back: identity X whose TOTAL window weight w_X (miner + owner + author
+//     parts, before merge-back) has w_X x B(A_t) < W x f_spend returns its owner /
 //     author share to the contributing receipts' miners; W constant. [K11b, 24 K-1]
 //   split(R, w): q_i = floor(R w_i / W), largest remainder, ties by identity
-//     ascending, Sum(vout) == R exactly. [K29a, C07, C21]
+//     ascending, Sum(vout) == R exactly; no outputs when the weights do not
+//     sum to W. [K29a, C07, C21]
 //   window_root: Merkle-SUM, leaf = (sha256d(0x06 || payee || LE256(w)), w),
 //     node sums bound into the hash (0x07). [S3.2]
 //
@@ -62,9 +64,11 @@ struct WinBin {
     std::vector<WinEntry> entries;  // live receipt entries only
 };
 
-// shares of one receipt's raw work (S3.1 item 10). Precondition p + ga <= 10000
-// (owner fee + donation come out of the miner's reward); otherwise w_miner floors
-// at 0 and the surplus is dropped (an invalid receipt in practice).
+// shares of one receipt's raw work (S3.1 item 10). The shares are defined iff
+// p + give_author_bp <= 10000: then w_owner + w_author <= work and the three
+// shares sum to the work exactly. A receipt with p + give_author_bp > 10000 is
+// refused at admission #2 (side_data_v3_check, STRIKE); a window holding such an
+// entry has no split (split() returns no outputs).
 struct Shares {
     std::uint64_t w_miner = 0;
     std::uint64_t w_owner = 0;
@@ -144,17 +148,28 @@ inline Window resolve(const std::vector<WinEntry>& entries, std::uint64_t B, std
         if (!(r.owner == kZeroHash)) owner_w[r.owner] += r.w_owner;
         author_w += r.w_author;
     }
-    // merge-back: owners below the floor return their share to each contributing
+    // w_X: the identity's total window weight before merge-back (miner + owner +
+    // author parts). Every floor test reads these pre-merge totals.
+    const bool have_author = !(author == kZeroHash);
+    auto total_of = [&](const Hash32& x) {
+        Work t;
+        if (auto it = miner_w.find(x); it != miner_w.end()) t += it->second;
+        if (auto it = owner_w.find(x); it != owner_w.end()) t += it->second;
+        if (have_author && x == author) t += author_w;
+        return t;
+    };
+    std::set<Hash32> owners_merging;
+    for (const auto& [oid, ow] : owner_w)
+        if (below_floor(total_of(oid), B, w.W, f_spend)) owners_merging.insert(oid);
+    const bool author_merges = !have_author || author_w.is_zero()
+                               || below_floor(total_of(author), B, w.W, f_spend);
+    // merge-back: an owner below the floor returns its share to each contributing
     // receipt group's miner.
-    for (auto& [oid, ow] : owner_w) {
-        if (below_floor(ow, B, w.W, f_spend)) {
-            for (const BucketRow& r : w.rows)
-                if (r.owner == oid) miner_w[r.miner] += r.w_owner;
-            ow = Work{};  // merged back: no owner output
-        }
+    for (const Hash32& oid : owners_merging) {
+        for (const BucketRow& r : w.rows)
+            if (r.owner == oid) miner_w[r.miner] += r.w_owner;
+        owner_w[oid] = Work{};  // merged back: no owner share
     }
-    const bool author_merges = (author == kZeroHash) || author_w.is_zero()
-                               || below_floor(author_w, B, w.W, f_spend);
     if (author_merges) {
         for (const BucketRow& r : w.rows) miner_w[r.miner] += r.w_author;
     }
@@ -272,15 +287,25 @@ inline Window window(const std::vector<WinBin>& bins_newest_first, std::uint64_t
 // ---------------------------------------------------------------------------
 // split(R, window) (S3.4 `split`; K29a, C07, C21): q_i = floor(R w_i / W) in
 // U320, largest remainder, ties by payee identity ascending, Sum(vout) == R.
+// A window whose weights do not sum to W (an entry with p + give_author_bp >
+// 10000) has no split: no outputs.
 // ---------------------------------------------------------------------------
 struct SplitOutput {
     Hash32 payee{};
     std::uint64_t amount = 0;
 };
 
+// The payee weights sum to W exactly (merge-back only moves weight).
+inline bool weights_sum_to_W(const Window& w) {
+    Work sum;
+    for (const auto& [payee, wt] : w.weight) sum += wt;
+    return sum == w.W;
+}
+
 inline std::vector<SplitOutput> split(std::uint64_t R, const Window& w) {
     std::vector<SplitOutput> out;
-    if (w.weight.empty()) return out;  // empty window -> finder-only (caller)
+    if (w.weight.empty()) return out;       // empty window -> finder-only (caller)
+    if (!weights_sum_to_W(w)) return out;   // shares undefined: no split
     struct Row {
         Hash32 payee;
         Work w;

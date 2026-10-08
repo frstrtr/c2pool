@@ -5,14 +5,20 @@
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
 // xmr_window_merge_back_kat (pathb_window.hpp, ruling 15 Q5, 20 Q-K, 24 K-1):
-//   an owner whose aggregated share x B(A_t) < W x f_spend gets NO output and its
-//   weight returns to the contributing receipts' miners (miner paid in full); an
-//   owner above the floor keeps its output; the threshold reads B(A_t) not R; the
-//   order of identities does not change window_root; an identity with a raw entry
-//   of its own is untouched; W is constant across merge-back.
+//   an identity whose TOTAL window weight x B(A_t) < W x f_spend gets NO owner /
+//   author share and that weight returns to the contributing receipts' miners
+//   (miner paid in full); an owner above the floor keeps its output; the threshold
+//   reads B(A_t) not R; the order of identities does not change window_root; an
+//   identity whose raw entry lifts its total above the floor is untouched (owner or
+//   author, its shares stay); W is constant across merge-back. Author at a 1 % donating fleet (10 bp):
+//   no author output; at 2.1 %: an author output. Every floor test reads the
+//   totals before merge-back: an identity whose miner weight another identity's
+//   merge-back lifts above the floor is tested on its total before that, under
+//   either identity order.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_emission.hpp"
@@ -79,15 +85,97 @@ int main() {
     }
 
     // ---- an identity with a raw entry of its own is untouched ----
+    // 0x0C mines 500,000 and owns 100 receipts at p 10 bp (owner shares 20,000):
+    // w_X = 520,000 is above the floor, so its owner share stays.
     {
         pb::WinBin bin; bin.bin = 1;
         bin.entries.push_back(mk(0x01, 0x00, 1000000000ull, 0, 100));
         bin.entries.push_back(mk(0x0C, 0x00, 500000, 0, 95));  // 0x0C mines its own share
         for (int i = 0; i < 100; ++i) bin.entries.push_back(mk(0x02, 0x0C, 200000, /*p=*/10, 90 - i));
         const pb::Window w = pb::window({bin}, 1, B, f, N, author);
-        check(w.weight.at(rep(0x0C)) == pb::Work(500000ull),
-              "0x0C's own miner weight untouched (owner share merges to 0x02)");
+        check(w.weight.at(rep(0x0C)) == pb::Work(520000ull),
+              "0x0C (raw entry + owner shares) untouched: w_X = 520,000");
+        check(w.weight.at(rep(0x02)) == pb::Work(19980000ull), "0x02 keeps work minus the owner share");
+        check(w.W == pb::Work(1020500000ull), "W constant");
+    }
+    // the same owner shares with no raw entry of 0x0C: below the floor, merged.
+    {
+        pb::WinBin bin; bin.bin = 1;
+        bin.entries.push_back(mk(0x01, 0x00, 1000000000ull, 0, 100));
+        bin.entries.push_back(mk(0x0D, 0x00, 500000, 0, 95));
+        for (int i = 0; i < 100; ++i) bin.entries.push_back(mk(0x02, 0x0C, 200000, /*p=*/10, 90 - i));
+        const pb::Window w = pb::window({bin}, 1, B, f, N, author);
+        check(w.weight.count(rep(0x0C)) == 0, "pure owner 0x0C below the floor: no output");
         check(w.weight.at(rep(0x02)) == pb::Work(20000000ull), "0x02 gets the merged owner share");
+    }
+
+    // ---- the author identity: the floor reads its TOTAL window weight ----
+    // 100 receipts donate 10 bp of 200,000 (author shares 20,000 in all).
+    {
+        const pb::Hash32 au = rep(0xEE);
+        auto donating_bin = [&](bool author_mines) {
+            pb::WinBin bin; bin.bin = 1;
+            bin.entries.push_back(mk(0x01, 0x00, 1000000000ull, 0, 100));
+            bin.entries.push_back(mk(author_mines ? 0xEE : 0x0D, 0x00, 500000, 0, 95));
+            for (int i = 0; i < 100; ++i) {
+                pb::WinEntry x = mk(0x02, 0x00, 200000, 0, 90 - i);
+                x.give_author_bp = 10;
+                bin.entries.push_back(x);
+            }
+            return bin;
+        };
+        const pb::Window mines = pb::window({donating_bin(true)}, 1, B, f, N, au);
+        check(mines.weight.at(au) == pb::Work(520000ull), "author with a raw entry keeps its shares (520,000)");
+        check(mines.weight.at(rep(0x02)) == pb::Work(19980000ull), "donors keep work minus the author share");
+        const pb::Window pure = pb::window({donating_bin(false)}, 1, B, f, N, au);
+        check(pure.weight.count(au) == 0, "author without a raw entry below the floor: no output");
+        check(pure.weight.at(rep(0x02)) == pb::Work(20000000ull), "author share returns to the donors");
+    }
+
+    // ---- the author with no raw entry, a donating fleet at 10 bp: 1 % of W ->
+    // no author output (author shares 10,000); 2.1 % of W -> an author output
+    // (21,000). W = 1,000,000,000 in both. ----
+    {
+        const pb::Hash32 au = rep(0xEE);
+        auto fleet_bin = [&](std::uint64_t big, std::uint64_t each) {
+            pb::WinBin bin; bin.bin = 1;
+            bin.entries.push_back(mk(0x01, 0x00, big, 0, 100));
+            for (int i = 0; i < 100; ++i) {
+                pb::WinEntry x = mk(0x02, 0x00, each, 0, 99 - i);
+                x.give_author_bp = 10;
+                bin.entries.push_back(x);
+            }
+            return bin;
+        };
+        const pb::Window one = pb::window({fleet_bin(990000000ull, 100000)}, 1, B, f, N, au);
+        check(one.W == pb::Work(1000000000ull), "1 % fleet: W");
+        check(one.weight.count(au) == 0, "1 % donating fleet: no author output");
+        check(one.weight.at(rep(0x02)) == pb::Work(10000000ull), "1 % fleet: the author share returns to the donors");
+        const pb::Window two = pb::window({fleet_bin(979000000ull, 210000)}, 1, B, f, N, au);
+        check(two.W == pb::Work(1000000000ull), "2.1 % fleet: W");
+        check(two.weight.count(au) == 1 && two.weight.at(au) == pb::Work(21000ull),
+              "2.1 % donating fleet: an author output (21,000)");
+        check(two.weight.at(rep(0x02)) == pb::Work(20979000ull), "2.1 % fleet: donors keep work minus the author share");
+    }
+
+    // ---- one identity's merge-back lifts another's miner weight above the floor ----
+    // X owns Y's receipt (30,000 at p 5000 bp): X total 15,000. Y mines it (15,000)
+    // and owns Z's receipt (1,000,000 at p 1 bp): Y total 15,100. W = 1,001,030,000.
+    // Both totals are below the floor before merge-back: X's share returns to Y,
+    // Y's share returns to Z. Under both identity orders: no X, Y 30,000, Z 1,000,000.
+    for (const bool x_first : {true, false}) {
+        const std::uint8_t X = x_first ? 0x0A : 0x0B, Y = x_first ? 0x0B : 0x0A, Z = 0x0C;
+        pb::WinBin bin; bin.bin = 1;
+        bin.entries.push_back(mk(0x01, 0x00, 1000000000ull, 0, 100));
+        bin.entries.push_back(mk(Y, X, 30000, /*p=*/5000, 99));
+        bin.entries.push_back(mk(Z, Y, 1000000, /*p=*/1, 98));
+        const pb::Window w = pb::window({bin}, 1, B, f, N, author);
+        const char* tag = x_first ? " (X before Y)" : " (Y before X)";
+        check(w.W == pb::Work(1001030000ull), std::string("lift: W") + tag);
+        check(w.weight.count(rep(X)) == 0, std::string("lift: X below the floor, no output") + tag);
+        check(w.weight.at(rep(Y)) == pb::Work(30000ull),
+              std::string("lift: Y tested on its total before merge-back, its owner share merges") + tag);
+        check(w.weight.at(rep(Z)) == pb::Work(1000000ull), std::string("lift: Z paid in full") + tag);
     }
 
     // ---- order of identities does not change window_root ----

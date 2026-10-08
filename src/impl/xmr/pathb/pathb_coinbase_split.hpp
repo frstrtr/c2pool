@@ -86,10 +86,13 @@ inline std::optional<Hash32> finder_only_leaf(const ReceiptBodyV3& r, const Hash
 
 // The canonical coinbase leaf a receipt committing reward R on (tip, P_r) must
 // carry, given its window; mm_root = mm_root_of(r.side). No leaf at hf >= 17
-// (FORK-FUSE) or when side_data_v3 does not encode.
+// (FORK-FUSE), when the window's weights do not sum to W (an entry with
+// p + give_author_bp > 10000), or when side_data_v3 does not encode. The
+// receipt's own p + give_author_bp <= 10000 is admission #2 (side_data_v3_check).
 struct CanonLeaf {
-    bool fork_fused = false;     // hf >= 17: amount owed (O-01), nothing built
-    std::optional<Hash32> leaf;  // empty: no canonical coinbase
+    bool fork_fused = false;       // hf >= 17: amount owed (O-01), nothing built
+    bool shares_undefined = false; // window weights do not sum to W: nothing built
+    std::optional<Hash32> leaf;    // empty: no canonical coinbase
 };
 
 inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w, const Hash32& tip,
@@ -106,6 +109,10 @@ inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w
     const std::optional<Hash32> mm_root = mm_root_of(r.side);
     if (!mm_root) return cl;  // side_data_v3 does not encode: build nothing
     const std::vector<SplitOutput> outs = split(r.reward_total, w);
+    if (outs.empty()) {
+        cl.shares_undefined = true;  // window weights do not sum to W: build nothing
+        return cl;
+    }
     const std::vector<std::uint8_t> extra = canonical_tx_extra_hf16(/*r_tx=*/p_r, r.extra_nonce, *mm_root);
     cl.leaf = canonical_cb_leaf(outs, tip, p_r, extra);
     return cl;
@@ -113,13 +120,13 @@ inline CanonLeaf canonical_coinbase_leaf(const ReceiptBodyV3& r, const Window& w
 
 // Admission #12 (ruling 4, C37): the receipt's committed coinbase (tree_root
 // folded over the branch) equals the canonical split leaf. false -> BAN before
-// RandomX. No leaf (hf >= 17 FORK-FUSE, or side_data_v3 does not encode) admits
-// nothing.
+// RandomX. No leaf (hf >= 17 FORK-FUSE, window weights != W, or side_data_v3
+// does not encode) admits nothing.
 inline bool canonical_coinbase_ok_split(const ReceiptBodyV3& r, const Window& w, const Hash32& tip,
                                         const Hash32& p_r, std::uint8_t hf) {
     const CanonLeaf cl = canonical_coinbase_leaf(r, w, tip, p_r, hf);
     if (!cl.leaf) return false;
-    return tree_root_fold(*cl.leaf, std::span<const Hash32>(r.branch)) == r.blob.tree_root;
+    return tree_root_fold(cl.leaf.value(), std::span<const Hash32>(r.branch)) == r.blob.tree_root;
 }
 
 // ---------------------------------------------------------------------------
