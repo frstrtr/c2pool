@@ -210,6 +210,8 @@
 #define C2POOL_XMR_DROPS_HARDEN 1
 // set_test_drop_pow_hook() / set_test_drop_stored_hook() / test_drop_held() / test_ingest() exist.
 #define C2POOL_XMR_RELAY_DROP_POW_HOOK 1
+// submit_own_drop() calls the drop PoW and stored test hooks too.
+#define C2POOL_XMR_RELAY_OWN_DROP_HOOK 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -732,12 +734,24 @@ public:
     void submit_own_drop(Admitted a) {
         if (!m_o.drops_floor_diff) return;               // gate OFF: unreachable
         a.own = true; a.drop = true;
-        if (!drop_note_new(a.id)) { m_st.drops_dup++; return; }
+        bool fresh = false, inflight = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            fresh = drop_note_new_locked(a.id);   // in m_drop_seen and m_inflight until stored and queued
+            if (fresh) inflight = m_inflight.insert(a.id).second;
+        }
+        if (!fresh) { m_st.drops_dup++; return; }
+        if (m_test_drop_pow_hook) m_test_drop_pow_hook(a.id);
         m_st.drops_own++;
+        const bytes32 id = a.id;
         drop_store_put(a.id, a.bin, a.raw, a.pow);   // ★ RAIN-BACKFILL: servable
         flood(a.raw, 0);
-        std::lock_guard<std::mutex> lk(m_amtx);
-        m_drops.push_back(std::move(a));
+        if (m_test_drop_stored_hook) m_test_drop_stored_hook(a.id);
+        {
+            std::lock_guard<std::mutex> lk(m_amtx);
+            m_drops.push_back(std::move(a));
+        }
+        if (inflight) forget_inflight(id);   // stored and queued for drain_drops(): held from here
     }
     // ── main thread: the raindrops admitted since the last call ─────────────
     std::vector<Admitted> drain_drops() {
@@ -819,7 +833,9 @@ public:
     // then every ready peer after drops_fetch_retry_ms; an id is re-asked no
     // more often than that. An id seen here (dedup set) but asked for anyway is
     // forgotten first, so the served copy is admitted (the caller's harvest
-    // lacks it). Answers are admitted through admit_drop (PoW + ctx verified).
+    // lacks it), unless it is stored or in m_inflight (verify or admission:
+    // queued for drain_drops() by that admission). Answers are admitted
+    // through admit_drop (PoW + ctx verified).
     // Returns the number of fetch frames sent. Gate OFF: nothing.
     // [lo, hi) = the block's range (FB_GETDROPS carries a non-empty range; a
     // by-id fetch is served by id whatever it says).
@@ -869,6 +885,14 @@ public:
                 }
                 v->swap(rest);
             }
+            // forget the dedup entry of an id that is neither stored (above, same
+            // m_dsmtx hold) nor in m_inflight (verify or admission)
+            if (!first.empty() || !again.empty()) {
+                std::lock_guard<std::mutex> lk2(m_mtx);   // m_dsmtx -> m_mtx, as drop_held_locked
+                for (const auto* v : {&first, &again})
+                    for (const auto& id : *v)
+                        if (!m_inflight.count(id)) m_drop_seen.erase(id);
+            }
         }
         if (!local.empty()) {
             m_st.drops_pin_local += local.size();
@@ -876,11 +900,6 @@ public:
             for (auto& a : local) m_drops.push_back(std::move(a));
         }
         if (first.empty() && again.empty()) return 0;
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);   // forget the dedup entry: the caller does not hold its bytes
-            for (const auto* v : {&first, &again})
-                for (const auto& id : *v) m_drop_seen.erase(id);
-        }
         const auto peers = ready_peers();
         const bool hint_ready = hint && std::find(peers.begin(), peers.end(), hint) != peers.end();
         std::size_t sent = 0;
@@ -1470,10 +1489,12 @@ public:
         return false;
     }
     // Test hook (set before start()): called on the verify worker after a
-    // raindrop's PoW check, before admit_drop.
+    // raindrop's PoW check, before admit_drop; in submit_own_drop after the
+    // dedup note, before the store.
     void set_test_drop_pow_hook(std::function<void(const bytes32&)> f) { m_test_drop_pow_hook = std::move(f); }
-    // Test hook (set before start()): called on the verify worker after a
-    // raindrop is stored and flooded, before it is queued for drain_drops().
+    // Test hook (set before start()): called on the verify worker (and in
+    // submit_own_drop) after a raindrop is stored and flooded, before it is
+    // queued for drain_drops().
     void set_test_drop_stored_hook(std::function<void(const bytes32&)> f) { m_test_drop_stored_hook = std::move(f); }
     // Test hook: drops_sync()'s held predicate for one id.
     bool test_drop_held(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return drop_held_locked(id); }
