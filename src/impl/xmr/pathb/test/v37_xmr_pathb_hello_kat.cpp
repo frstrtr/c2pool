@@ -137,6 +137,8 @@ void tail_vectors() {
                   pb::decode_hello_tail(std::vector<std::uint8_t>(b.begin(), b.begin() + 2)).error ==
                           pb::HelloTailError::Truncated,
           "a tail one byte short, or shorter than the rules block head, refused");
+    check(pb::decode_hello_tail(std::span<const std::uint8_t>()).error == pb::HelloTailError::Truncated,
+          "an empty tail refused");
     std::vector<std::uint8_t> ln = b;
     ln[1] = static_cast<std::uint8_t>(ln[1] + 1);
     check(pb::decode_hello_tail(ln).error == pb::HelloTailError::Truncated,

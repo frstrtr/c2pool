@@ -595,6 +595,13 @@ void receiver_vectors() {
         const pb::FrameOutcome w = one(req, bad, an);
         check(refused(w, pb::BucketsFault::Wire) && w.wire == pb::BucketsWireError::Version,
               "a frame that does not decode -> refused, server strike 1");
+        pb::BucketsAssembly as(req, kB0, F, kFrame);
+        const pb::FrameOutcome w1 = as.add_frame(kServerA, bad, an);
+        const pb::FrameOutcome w2 = as.add_frame(kServerA, f, an);
+        const pb::FrameOutcome w3 = as.add_frame(kServerB, f, an);
+        check(w1.strike == 1 && w2.verdict == pb::FrameVerdict::Drop && w2.fault == pb::BucketsFault::Unsolicited &&
+                      w2.strike == 0 && w3.verdict == pb::FrameVerdict::Accepted && as.complete(),
+              "after a refusal the server's later frames are dropped; another server completes the request");
     }
     {
         const pb::GetBuckets nq{kChain, at, kB0, kB0};
@@ -761,6 +768,40 @@ void serving_vectors() {
     const pb::FrameOutcome jo = ja.add_frame(kServerA, pb::serve_buckets_from(src, j2, kFrame).at(0),
                                              anchor_of(ax.s, ax.s.best_tip()));
     check(jo.verdict == pb::FrameVerdict::Accepted && ja.complete(), "... and serves leaves 3 and 4");
+
+    // a body that is not the leaf's (a stale record) ends the served prefix
+    {
+        std::map<std::uint64_t, pb::SealedBin> held;
+        pb::BinMmr m;
+        for (std::uint64_t i = 0; i < 4; ++i) {
+            pb::SealedBin sb;
+            sb.bucket = keyed_bin(kB0 + i, {{ka, 18180 + i}});
+            sb.leaf = pb::mmr_leaf_of(sb.bucket);
+            sb.refs = {ka};
+            m.append(sb.leaf);
+            held.emplace(kB0 + i, sb);
+        }
+        held[kB0 + 2].bucket = keyed_bin(kB0 + 2, {{ka, 30000}});
+        held[kB0 + 2].leaf = pb::mmr_leaf_of(held[kB0 + 2].bucket);
+        pb::BucketServeSource st;
+        st.b0 = kB0;
+        st.leaf_count = 4;
+        st.mmr = &m;
+        st.bucket = [&held](std::uint64_t bin) -> const pb::SealedBin* {
+            const auto it = held.find(bin);
+            return it == held.end() ? nullptr : &it->second;
+        };
+        st.s_parent = kS;
+        const pb::GetBuckets sq{kChain, seq32(0x6a), kB0, kB0 + 3};
+        pb::BucketsAnchor sa;
+        sa.header_held = true;
+        sa.record = kB0 + F - 1 + 4;
+        sa.mmr_root = m.root();
+        pb::BucketsAssembly ss(sq, kB0, F, kFrame);
+        const pb::FrameOutcome so2 = ss.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame).at(0), sa);
+        check(so2.verdict == pb::FrameVerdict::Accepted && ss.complete_through() == kB0 + 2,
+              "a held body whose leaf is not the MMR's is not served: the prefix ends before it");
+    }
 
     // the per-peer budget
     pb::BucketServeBudget bud(*pb::bucket_wire_policy_default(16, pb::zone(16)));

@@ -834,14 +834,15 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketSer
     std::vector<Served> served;
     std::map<Hash32, XmrKeyRef> by_id;
     for (std::uint64_t bin = req.bin_lo; bin <= req.bin_hi; ++bin) {
-        if (bin < src.b0 || bin - src.b0 >= src.leaf_count) break;
+        // leaf_index = bin - b0; a bin below b0 wraps to an index no MMR proves
         const std::uint64_t i = bin - src.b0;
-        const SealedBin* sb = src.bucket ? src.bucket(bin) : nullptr;
-        if (sb == nullptr || sb->bucket.bin_lo != bin || src.mmr->leaf(i) != std::optional<Hash32>(sb->leaf)) break;
-        std::map<Hash32, XmrKeyRef> ids = by_id;
-        if (!bw_detail::refs_complete(*sb, ids)) break;
         const std::optional<MmrProof> pr = src.mmr->prefix_proof(i, src.leaf_count);
-        if (!pr) break;
+        if (!pr) break;  // not provable at leaf_count(at)
+        const SealedBin* sb = src.bucket ? src.bucket(bin) : nullptr;
+        if (sb == nullptr) break;  // rows not held
+        if (sb->bucket.bin_lo != bin || src.mmr->leaf(i) != std::optional<Hash32>(sb->leaf)) break;  // not the leaf's body
+        std::map<Hash32, XmrKeyRef> ids = by_id;
+        if (!bw_detail::refs_complete(*sb, ids)) break;  // an identity without its reference
         Served s{sb, {}};
         for (const auto& step : pr->path) s.path.push_back(step.first);
         served.push_back(std::move(s));
