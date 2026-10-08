@@ -5,11 +5,12 @@
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
 // xmr_window_merge_back_kat (pathb_window.hpp, ruling 15 Q5, 20 Q-K, 24 K-1):
-//   an owner whose aggregated share x B(A_t) < W x f_spend gets NO output and its
-//   weight returns to the contributing receipts' miners (miner paid in full); an
-//   owner above the floor keeps its output; the threshold reads B(A_t) not R; the
-//   order of identities does not change window_root; an identity with a raw entry
-//   of its own is untouched; W is constant across merge-back.
+//   an identity whose TOTAL window weight x B(A_t) < W x f_spend gets NO owner /
+//   author share and that weight returns to the contributing receipts' miners
+//   (miner paid in full); an owner above the floor keeps its output; the threshold
+//   reads B(A_t) not R; the order of identities does not change window_root; an
+//   identity with a raw entry of its own is untouched (owner or author, its shares
+//   stay); W is constant across merge-back.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdint>
@@ -79,15 +80,51 @@ int main() {
     }
 
     // ---- an identity with a raw entry of its own is untouched ----
+    // 0x0C mines 500,000 and owns 100 receipts at p 10 bp (owner shares 20,000):
+    // w_X = 520,000 is above the floor, so its owner share stays.
     {
         pb::WinBin bin; bin.bin = 1;
         bin.entries.push_back(mk(0x01, 0x00, 1000000000ull, 0, 100));
         bin.entries.push_back(mk(0x0C, 0x00, 500000, 0, 95));  // 0x0C mines its own share
         for (int i = 0; i < 100; ++i) bin.entries.push_back(mk(0x02, 0x0C, 200000, /*p=*/10, 90 - i));
         const pb::Window w = pb::window({bin}, 1, B, f, N, author);
-        check(w.weight.at(rep(0x0C)) == pb::Work(500000ull),
-              "0x0C's own miner weight untouched (owner share merges to 0x02)");
+        check(w.weight.at(rep(0x0C)) == pb::Work(520000ull),
+              "0x0C (raw entry + owner shares) untouched: w_X = 520,000");
+        check(w.weight.at(rep(0x02)) == pb::Work(19980000ull), "0x02 keeps work minus the owner share");
+        check(w.W == pb::Work(1020500000ull), "W constant");
+    }
+    // the same owner shares with no raw entry of 0x0C: below the floor, merged.
+    {
+        pb::WinBin bin; bin.bin = 1;
+        bin.entries.push_back(mk(0x01, 0x00, 1000000000ull, 0, 100));
+        bin.entries.push_back(mk(0x0D, 0x00, 500000, 0, 95));
+        for (int i = 0; i < 100; ++i) bin.entries.push_back(mk(0x02, 0x0C, 200000, /*p=*/10, 90 - i));
+        const pb::Window w = pb::window({bin}, 1, B, f, N, author);
+        check(w.weight.count(rep(0x0C)) == 0, "pure owner 0x0C below the floor: no output");
         check(w.weight.at(rep(0x02)) == pb::Work(20000000ull), "0x02 gets the merged owner share");
+    }
+
+    // ---- the author identity: the floor reads its TOTAL window weight ----
+    // 100 receipts donate 10 bp of 200,000 (author shares 20,000 in all).
+    {
+        const pb::Hash32 au = rep(0xEE);
+        auto donating_bin = [&](bool author_mines) {
+            pb::WinBin bin; bin.bin = 1;
+            bin.entries.push_back(mk(0x01, 0x00, 1000000000ull, 0, 100));
+            bin.entries.push_back(mk(author_mines ? 0xEE : 0x0D, 0x00, 500000, 0, 95));
+            for (int i = 0; i < 100; ++i) {
+                pb::WinEntry x = mk(0x02, 0x00, 200000, 0, 90 - i);
+                x.give_author_bp = 10;
+                bin.entries.push_back(x);
+            }
+            return bin;
+        };
+        const pb::Window mines = pb::window({donating_bin(true)}, 1, B, f, N, au);
+        check(mines.weight.at(au) == pb::Work(520000ull), "author with a raw entry keeps its shares (520,000)");
+        check(mines.weight.at(rep(0x02)) == pb::Work(19980000ull), "donors keep work minus the author share");
+        const pb::Window pure = pb::window({donating_bin(false)}, 1, B, f, N, au);
+        check(pure.weight.count(au) == 0, "author without a raw entry below the floor: no output");
+        check(pure.weight.at(rep(0x02)) == pb::Work(20000000ull), "author share returns to the donors");
     }
 
     // ---- order of identities does not change window_root ----
