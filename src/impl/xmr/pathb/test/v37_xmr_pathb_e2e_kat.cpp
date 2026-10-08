@@ -15,6 +15,13 @@
 // the S1/S2 zero stubs; a mismatch is BAN before RandomX, part of the #12
 // prefix, for the S3 roots and the S2 zero stubs alike); a receipt paying
 // ANOTHER tip's window is refused.
+// Store path (S3b-1b, pathb_window_chain.hpp, pathb_window_cache.hpp): the
+// mainnet-tail receipts placed by carriers in a BinStore -> window(t) on t's
+// chain (bins open, mixed and sealed at three tips: one window) -> split ->
+// Sum == R, the amounts pinned; the receipt-level miner tx bytes from windows
+// built by the store (finder-only and the two-payee window) through the
+// (tip, v) cache and its WindowAt; finder-only only on Window.empty_finder_only
+// (a Window with no payee and no flag, or a flag with payees -> Defer).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <span>
@@ -24,8 +31,10 @@
 #include "impl/xmr/pathb/pathb_coinbase_split.hpp"
 #include "impl/xmr/pathb/pathb_emission.hpp"
 #include "impl/xmr/pathb/pathb_window.hpp"
+#include "impl/xmr/pathb/pathb_window_cache.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
+#include "pathb_kat_lane.hpp"
 #include "pathb_kat_miner.hpp"
 
 using namespace pathb_kat;
@@ -79,7 +88,168 @@ static pb::Window window_at(const std::vector<pb::WinBin>& bins, std::uint64_t d
     return pb::window(bins, d_net, B, pb::f_spend(B, 300000, 16), pb::n_rule(300000, 16, B), kAuthor);
 }
 
+// The mainnet-tail receipts of mainnet_bins() placed by carriers: positions
+// 481..500 at h 1000..1004 (four per bin), then carriers to h 1004 + x.
+static bool mainnet_store(pb::BinStore& s, std::uint64_t last_x) {
+    bool ok = true;
+    for (std::uint64_t pos = 1; pos <= 480; ++pos) ok = ok && extend(s, idn(0xE1, pos), idn(0xE1, pos - 1), 1000, {}, true);
+    for (std::uint64_t pos = 481; pos <= 500; ++pos) {
+        const std::uint64_t k = (500 - pos) / 4, j = (500 - pos) % 4, bin = 1004 - k;
+        pb::Placement x;
+        if (j == 0) x = rcpt(idn(0xE2, pos), bin, pos, id_of(1), 10000, 100, 0, kOwner);
+        if (j == 1) x = rcpt(idn(0xE2, pos), bin, pos, id_of(2), 10100, 0, 10);
+        if (j == 2) x = rcpt(idn(0xE2, pos), bin, pos, id_of(3), 9900);
+        if (j == 3) x = rcpt(idn(0xE2, pos), bin, pos, id_of(4 + k), 10000);
+        ok = ok && extend(s, idn(0xE1, pos), idn(0xE1, pos - 1), bin, {x}, true);
+    }
+    for (std::uint64_t x = 1; x <= last_x; ++x)
+        ok = ok && extend(s, idn(0xE1, 500 + x), idn(0xE1, 499 + x), 1004 + x, {}, true);
+    return ok;
+}
+
+static void store_path() {
+    const std::uint64_t B = pb::kTailBaseReward;
+    pb::WindowParams wp;
+    wp.d_net = 70000;
+    wp.B = B;
+    wp.f_spend = pb::f_spend(B, 300000, 16);
+    wp.N = pb::n_rule(300000, 16, B);
+    wp.author = kAuthor;
+    pb::BinStore s(pb::kRuledLaneParams, 64, idn(0xE1, 0), 1000);
+    check(mainnet_store(s, 96), "store e2e: 20 receipts placed in bins 1000..1004, record to 1,100");
+    const std::uint64_t R = pb::kTailBaseReward + 3000000000ull;
+    std::vector<pb::Hash32> roots;
+    // tips at H 1,050 (bins open), 1,098 (1000..1002 sealed), 1,100 (all sealed).
+    for (const std::uint64_t x : {std::uint64_t{46}, std::uint64_t{94}, std::uint64_t{96}}) {
+        const pb::Hash32 t = idn(0xE1, 500 + x);
+        const pb::LaneView v = s.view_at(t);
+        const pb::TipWindow w = pb::tip_window(s, t, wp, 16);
+        const std::string tag = " (H " + std::to_string(1004 + x) + ", " + std::to_string(v.leaf_count()) + " bins sealed)";
+        check(w.ok() && w.window->W == pb::Work(160000) && w.window->weight.size() == 9,
+              "store e2e: four newest bins, W 160,000, 9 payees" + tag);
+        check(w.ok() && weight_of(*w.window, id_of(1)) == pb::Work(39600) && weight_of(*w.window, id_of(2)) == pb::Work(40360)
+                      && weight_of(*w.window, id_of(3)) == pb::Work(39600) && weight_of(*w.window, id_of(7)) == pb::Work(10000)
+                      && w.window->weight.count(id_of(8)) == 0 && weight_of(*w.window, kOwner) == pb::Work(400)
+                      && weight_of(*w.window, kAuthor) == pb::Work(40),
+              "store e2e: weights 39,600 / 40,360 / 39,600 / 10,000 x 4, owner 400, author 40" + tag);
+        const auto outs = w.ok() ? pb::split(R, *w.window) : std::vector<pb::SplitOutput>{};
+        std::uint64_t sum = 0;
+        for (const auto& o : outs) sum += o.amount;
+        check(sum == R && outs.size() == 9 && outs[0].amount == 149242500000ull && outs[1].amount == 152106750000ull
+                      && outs[6].amount == 37687500000ull && outs[7].payee == kOwner && outs[7].amount == 1507500000ull
+                      && outs[8].payee == kAuthor && outs[8].amount == 150750000ull,
+              "store e2e: Sum(vout) == R, the amounts pinned" + tag);
+        roots.push_back(w.ok() ? w.window_root : pb::Hash32{});
+    }
+    check(s.view_at(idn(0xE1, 546)).leaf_count() == 0 && s.view_at(idn(0xE1, 594)).leaf_count() == 3
+                  && s.view_at(idn(0xE1, 596)).leaf_count() == 5,
+          "store e2e: 0, 3 and 5 of the five bins sealed at the three tips");
+    check(roots.size() == 3 && roots[0] == roots[1] && roots[0] == roots[2], "store e2e: open, mixed, sealed: one window_root");
+
+    // receipt-level bytes from store-built windows through the cache.
+    const pb::XmrKeyRef X = ref_from_secrets(11, 13), Y = ref_from_secrets(17, 19);
+    RefBook book;
+    const pb::Hash32 idX = book.add(X), idY = book.add(Y);
+    const pb::XmrKeyRef author = kat_author();
+    pb::ReceiptBodyV3 r;
+    r.blob.major = 16;
+    r.blob.minor = 16;
+    r.blob.prev_id = seq32(0x41);
+    r.extra_nonce = {1, 2, 3, 4};
+    r.branch = {seq32(0x81)};
+    r.side.pool_id = seq32(0x01);
+    r.side.payee = idX;
+    r.side.t_origin = 18180;
+    r.side.tip = seq32(0x21);
+    r.side.receipts_root = seq32(0xA0);
+    r.payee = X;
+    r.reward_total = pb::kTailBaseReward;
+    const pb::Hash32 tip = r.side.tip, p_r = r.blob.prev_id;
+    pb::WindowParams wr;
+    wr.d_net = pb::DNet{1} << 100;
+    wr.B = B;
+    wr.f_spend = pb::f_spend(B, 300000, 16);
+    wr.N = 3747;
+    wr.author = pb::key_ref_identity(author);
+    {
+        pb::BinStore s0(pb::kRuledLaneParams, 64, idn(0xE3, 0), 2000);
+        check(extend(s0, tip, idn(0xE3, 0), 2000, {}, true), "store e2e: tip 21..40 with no placement");
+        pb::WindowCache wc;
+        const pb::TipWindow w = wc.get(tip, 16, [&] { return pb::tip_window(s0, tip, wr, 16); });
+        check(w.ok() && w.window->empty_finder_only, "store e2e: an empty window -> finder-only");
+        pb::KeyCache cache;
+        const pb::CanonicalTx f = pb::canonical_miner_tx(r, pb::window_at(w), tip, p_r, kKatHeight, 16, cache,
+                                                         book.lookup(), author);
+        check(f.tx && f.tx->prefix.size() == 127
+                      && hex32(f.tx->tx_hash) == "57c33152bd14fd28d54e627693516640bf794943ba801596b4143bfb3c6d1b29",
+              "store e2e finder-only: prefix 127 B, tx hash 57c33152..");
+    }
+    {
+        pb::BinStore s2(pb::kRuledLaneParams, 64, idn(0xE4, 0), 2000);
+        check(extend(s2, tip, idn(0xE4, 0), 2000,
+                     {rcpt(idn(0xE5, 1), 2000, 1, idX, 120000), rcpt(idn(0xE5, 2), 2000, 1, idY, 100000)}, true),
+              "store e2e: tip 21..40 places X 120,000 and Y 100,000");
+        pb::WindowCache wc;
+        const pb::TipWindow w = wc.get(tip, 16, [&] { return pb::tip_window(s2, tip, wr, 16); });
+        check(w.ok() && w.window->weight.size() == 2 && w.window->W == pb::Work(220000), "store e2e: window X, Y, W 220,000");
+        pb::KeyCache cache;
+        const pb::CanonicalTx c = pb::canonical_miner_tx(r, pb::window_at(w), tip, p_r, kKatHeight, 16, cache,
+                                                         book.lookup(), author);
+        check(c.tx && c.tx->outs.size() == 2 && c.tx->outs[0].amount == 272727272727ull
+                      && c.tx->outs[1].amount == 327272727273ull && c.tx->prefix.size() == 167
+                      && hex32(c.tx->tx_hash) == "11e1f5aa396db1fcd12d6011fe12d3d8a9d7715d02ba21a93122662808b13b15",
+              "store e2e window: Y 272,727,272,727 / X 327,272,727,273, prefix 167 B, tx hash 11e1f5aa..");
+        pb::ReceiptBodyV3 xr = r;
+        xr.blob.tree_root = h32("3fa241b5f26885c6cb6c25964b7dda13c89eb9e6aecef8cc2d6c31c1a40bdc80");
+        check(pb::canonical_coinbase_check(xr, pb::window_at(w), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Match,
+              "store e2e window: tree_root 3fa241b5.. -> Match through the cache's WindowAt");
+        pb::Hash32 other = tip;
+        other[31] ^= 1;
+        check(pb::canonical_coinbase_check(xr, pb::window_at(w), other, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Defer,
+              "store e2e window: the cache's WindowAt for another tip -> Defer");
+    }
+    // finder-only only on Window.empty_finder_only: a Window that is not an
+    // evaluated window never takes the finder-only branch.
+    {
+        pb::ReceiptBodyV3 xf = r;  // commits the finder-only coinbase of X (tree_root 9ad49240..)
+        xf.blob.tree_root = h32("9ad4924071b1223f57f0d48632d8c9ab75443e831af7f32873a8d831fe7bc9b8");
+        pb::KeyCache cache;
+        const pb::Window fo = finder_only_window();
+        check(pb::canonical_coinbase_check(xf, at_of(&fo, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Match,
+              "finder-only flag: the finder-only coinbase -> Match");
+        // a list whose newest bin is sealed and fails W_max on its own: no window.
+        pb::WinEntry small, big;
+        small.miner = idX;
+        small.work = 18180;
+        small.id = id_of(0x5001);
+        big.miner = idY;
+        big.work = 1000000000000ull;
+        big.id = id_of(0x5002);
+        const pb::L1Bucket sealed = pb::seal_from_entries(5, {small, big});
+        std::vector<pb::WinBin> bins(1);
+        bins[0].bin = 5;
+        bins[0].sealed = &sealed;
+        const pb::Window cut = pb::window(bins, pb::DNet{1} << 100, B, pb::f_spend(B, 300000, 16), 3747,
+                                          pb::key_ref_identity(author));
+        check(cut.weight.empty() && !cut.empty_finder_only,
+              "a cut inside a sealed bin: window() gives no payee and no finder-only flag");
+        check(pb::canonical_coinbase_check(xf, at_of(&cut, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Defer,
+              "a Window with no payee and no finder-only flag -> Defer, never the finder-only Match");
+        pb::Window odd = window_of({{idX, 120000}, {idY, 100000}});
+        odd.empty_finder_only = true;
+        check(pb::canonical_coinbase_check(xf, at_of(&odd, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+                      == pb::CoinbaseCheck::Defer,
+              "a finder-only flag on a Window with payees -> Defer");
+    }
+}
+
 int main() {
+    run_part("store_path", store_path);
+
     // ---- mainnet-tail e2e: Sum == R and roots_ok lift the zero stubs ----
     {
         const std::uint64_t R = pb::kTailBaseReward + 3000000000ull;  // 6e11 + 3e9 fees
@@ -190,15 +360,15 @@ int main() {
           "e2e receipt: mm_root_of(side_data_v3)");
     {
         pb::KeyCache cache;
-        const pb::Window empty;
-        const pb::CanonicalTx f = pb::canonical_miner_tx(r, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache,
+        const pb::Window empty = finder_only_window();
+        const pb::CanonicalTx f = pb::canonical_miner_tx(r, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache,
                                                          book.lookup(), author);
         check(f.tx && f.tx->prefix.size() == 127
                       && hex32(f.tx->tx_hash) == "57c33152bd14fd28d54e627693516640bf794943ba801596b4143bfb3c6d1b29",
               "e2e finder-only: one output of R to X, prefix 127 B, tx hash 57c33152..");
         pb::ReceiptBodyV3 x = r;
         x.blob.tree_root = h32("9ad4924071b1223f57f0d48632d8c9ab75443e831af7f32873a8d831fe7bc9b8");
-        check(pb::canonical_coinbase_check(x, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, book.lookup(),
+        check(pb::canonical_coinbase_check(x, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(),
                                            author)
                       == pb::CoinbaseCheck::Match,
               "e2e finder-only: tree_root 9ad49240.. -> Match");
@@ -206,7 +376,7 @@ int main() {
     {
         pb::KeyCache cache;
         const pb::Window w = window_of({{idX, 120000}, {idY, 100000}});
-        const pb::CanonicalTx c = pb::canonical_miner_tx(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, cache,
+        const pb::CanonicalTx c = pb::canonical_miner_tx(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, cache,
                                                          book.lookup(), author);
         check(c.tx && c.tx->outs.size() == 2 && c.tx->outs[0].amount == 272727272727ull
                       && c.tx->outs[1].amount == 327272727273ull,
@@ -216,7 +386,7 @@ int main() {
               "e2e window: prefix 167 B, tx hash 11e1f5aa..");
         pb::ReceiptBodyV3 x = r;
         x.blob.tree_root = h32("3fa241b5f26885c6cb6c25964b7dda13c89eb9e6aecef8cc2d6c31c1a40bdc80");
-        check(pb::canonical_coinbase_check(x, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
+        check(pb::canonical_coinbase_check(x, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, cache, book.lookup(), author)
                       == pb::CoinbaseCheck::Match,
               "e2e window: tree_root 3fa241b5.. -> Match");
     }
@@ -239,12 +409,12 @@ int main() {
         // the receipt commits the canonical coinbase for tip A's window ...
         check(commit_miner_tx(q, w_a, q.side.tip, q.blob.prev_id, kKatHeight, book, author), "e2e: tip A's miner tx");
         pb::KeyCache cache;
-        check(pb::canonical_coinbase_check(q, pb::WindowAt{&w_a}, q.side.tip, q.blob.prev_id, kKatHeight, 16, cache,
+        check(pb::canonical_coinbase_check(q, at_of(&w_a, q.side.tip, 16), q.side.tip, q.blob.prev_id, kKatHeight, 16, cache,
                                            book.lookup(), author)
                       == pb::CoinbaseCheck::Match,
               "correct tip-A window: Match");
         // ... checked against tip B's window -> refused.
-        check(pb::canonical_coinbase_check(q, pb::WindowAt{&w_b}, q.side.tip, q.blob.prev_id, kKatHeight, 16, cache,
+        check(pb::canonical_coinbase_check(q, at_of(&w_b, q.side.tip, 16), q.side.tip, q.blob.prev_id, kKatHeight, 16, cache,
                                            book.lookup(), author)
                       == pb::CoinbaseCheck::Mismatch,
               "paying another tip's window: Mismatch");

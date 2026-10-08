@@ -38,12 +38,12 @@ int main() {
     const pb::XmrKeyRef author = kat_author();
     RefBook book;
     const pb::RefLookup refs = book.lookup();
-    const pb::Window empty;
+    const pb::Window empty = finder_only_window();
     pb::KeyCache cache;
 
     // #12 of a receipt on its own tip and P_r at h = kKatHeight.
     auto check12 = [&](const pb::ReceiptBodyV3& r, const pb::Window& w) {
-        return pb::canonical_coinbase_check(r, pb::WindowAt{&w}, r.side.tip, r.blob.prev_id, kKatHeight, 16, cache,
+        return pb::canonical_coinbase_check(r, at_of(&w, r.side.tip, 16), r.side.tip, r.blob.prev_id, kKatHeight, 16, cache,
                                             refs, author);
     };
     // The receipt commits the miner tx its miner builds for (tip, P_r, window).
@@ -66,7 +66,7 @@ int main() {
         const pb::TailResult t = tail(own, empty, true, rx_called);
         check(t.verdict == pb::AdmitVerdict::AdmitCarrier, "correct one-output miner tx admitted");
         check(t.randomx_called && rx_called, "RandomX runs only after #12 admits");
-        const pb::CanonicalTx c = pb::canonical_miner_tx(own, pb::WindowAt{&empty}, own.side.tip, own.blob.prev_id,
+        const pb::CanonicalTx c = pb::canonical_miner_tx(own, at_of(&empty, own.side.tip, 16), own.side.tip, own.blob.prev_id,
                                                          kKatHeight, 16, cache, refs, author);
         check(c.tx && c.tx->outs.size() == 1 && c.tx->outs[0].amount == own.reward_total && c.tx->extra.size() == 74,
               "empty window: one output of R, PBX1 extra 74 B");
@@ -188,7 +188,7 @@ int main() {
             pb::ReceiptBodyV3 x = a;
             x.reward_total = R;
             commit(x, empty);
-            matches += pb::canonical_coinbase_check(x, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, kc, refs,
+            matches += pb::canonical_coinbase_check(x, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, kc, refs,
                                                     author)
                                == pb::CoinbaseCheck::Match;
         }
@@ -196,7 +196,7 @@ int main() {
         pb::ReceiptBodyV3 race = a;
         race.blob.prev_id = seq32(0x99);  // another P_r at the same h
         commit(race, empty);
-        check(pb::canonical_coinbase_check(race, pb::WindowAt{&empty}, tip, race.blob.prev_id, kKatHeight, 16, kc, refs,
+        check(pb::canonical_coinbase_check(race, at_of(&empty, tip, 16), tip, race.blob.prev_id, kKatHeight, 16, kc, refs,
                                            author)
                       == pb::CoinbaseCheck::Match,
               "another P_r: Match");
