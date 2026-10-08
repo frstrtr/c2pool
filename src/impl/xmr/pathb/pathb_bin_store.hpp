@@ -750,7 +750,7 @@ private:
     // point plus the side deltas' leaves (O(log n) + side leaves).
     BinMmr chain_mmr(const LaneView& v) const {
         const std::uint64_t lc_fork = bin_leaf_count(records_[v.fork_pos()], b0_, p_.open_bins);
-        BinMmr m = *BinMmr::from_peaks(lc_fork, *mmr_.prefix_peaks(lc_fork));
+        BinMmr m = BinMmr::from_peaks(lc_fork, mmr_.prefix_peaks(lc_fork).value()).value();
         for (const LaneDelta* d : v.side_)
             for (const SealedBin& sb : d->sealed) m.append(sb.leaf);
         return m;
@@ -861,7 +861,7 @@ inline const SealedBin* LaneView::bucket(std::uint64_t bin) const {
     if (bin < s_->b0_) return nullptr;
     const std::uint64_t i = bin - s_->b0_;
     if (i >= leaf_count()) return nullptr;
-    if (i < leaf_count_at(fork_)) return &s_->buckets_[i];
+    if (i < leaf_count_at(fork_)) return i < s_->buckets_.size() ? &s_->buckets_[i] : nullptr;
     for (const LaneDelta* d : side_)
         for (const SealedBin& sb : d->sealed)
             if (sb.bucket.bin_lo == bin) return &sb;
@@ -873,7 +873,7 @@ inline std::uint64_t LaneView::leaf_count_at(std::uint64_t x) const {
 }
 
 inline Hash32 LaneView::mmr_root_at(std::uint64_t x) const {
-    if (x <= fork_) return *s_->mmr_.prefix_root(leaf_count_at(x));
+    if (x <= fork_) return s_->mmr_.prefix_root(leaf_count_at(x)).value();  // throws if the MMR lags the record
     return side_[x - fork_ - 1]->root;
 }
 
@@ -921,7 +921,7 @@ inline LaneLoad load_lane(const LaneKv& kv, std::uint32_t chain, std::uint64_t b
         const auto bi = kv.find(lane_keys::bleaf(chain, i));
         if (bi == kv.end()) continue;  // pruned body (the leaf hash stays)
         std::optional<SealedBin> sb = decode_bleaf(bi->second, i, b0);
-        if (!sb || sb->leaf != *out.mmr.leaf(i)) return fail(LoadFault::Body);
+        if (!sb || sb->leaf != out.mmr.leaf(i)) return fail(LoadFault::Body);
         out.bodies[i] = std::move(sb);
     }
     for (const std::string& prefix : {lane_keys::blhash_prefix(chain), lane_keys::bleaf_prefix(chain)}) {
