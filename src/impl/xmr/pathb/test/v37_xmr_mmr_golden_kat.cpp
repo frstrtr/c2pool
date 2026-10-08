@@ -8,9 +8,12 @@
 //   the PINNED golden vectors (row_leaf, comp_root, mmr_leaf) byte-for-byte; the
 //   append-only MMR leaf / root for 1, 2, 3, 7, 8 sealed bins; n_peaks ==
 //   popcount(leaf_count); the proof of bin 3 of 8 verifies; a forged composition
-//   and forged peaks fail; a rebuild reproduces the root (restart / reorg / joiner).
+//   and forged peaks fail; a valid path under another leaf_index fails; the
+//   empty-bin leaf goldens (E-8); a rebuild reproduces the root (restart / reorg /
+//   joiner).
 // ---------------------------------------------------------------------------
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_buckets.hpp"
@@ -77,6 +80,49 @@ int main() {
     check(!pb::mmr_verify(m.root(), forged, pr), "forged composition refused");
     pb::MmrProof bad_peaks = pr; bad_peaks.peaks.front()[0] ^= 1;
     check(!pb::mmr_verify(m.root(), leaf2, bad_peaks), "forged peaks refused");
+
+    // ---- leaf_index is bound to the path directions and own_peak ----
+    // the valid co-path of index 2 of 8 presented under another leaf_index.
+    for (std::uint64_t wrong : {std::uint64_t{3}, std::uint64_t{6}, std::uint64_t{8}}) {
+        pb::MmrProof moved = pr; moved.leaf_index = wrong;
+        check(!pb::mmr_verify(m.root(), leaf2, moved),
+              "valid path of index 2 of 8 under leaf_index " + std::to_string(wrong) + " refused");
+    }
+    {
+        // 11 bins: peaks 8, 2, 1. Every leaf verifies under its own index; the
+        // valid co-path of index 9 (peak 1) is refused under index 8 (same peak,
+        // other side), 10 (peak 2) and 1 (peak 0).
+        pb::BinMmr m11;
+        for (std::uint64_t n = 0; n < 11; ++n) m11.append(pb::mmr_leaf_of(mkbin(n)));
+        bool all_ok = true;
+        for (std::uint64_t i = 0; i < 11; ++i)
+            all_ok = all_ok && pb::mmr_verify(m11.root(), pb::mmr_leaf_of(mkbin(i)), pb::mmr_proof(m11, i));
+        check(all_ok, "every leaf of 11 verifies under its own leaf_index");
+        const pb::MmrProof pr9 = pb::mmr_proof(m11, 9);
+        const pb::Hash32 leaf9 = pb::mmr_leaf_of(mkbin(9));
+        for (std::uint64_t wrong : {std::uint64_t{8}, std::uint64_t{10}, std::uint64_t{1}}) {
+            pb::MmrProof moved = pr9; moved.leaf_index = wrong;
+            check(!pb::mmr_verify(m11.root(), leaf9, moved),
+                  "valid path of index 9 of 11 under leaf_index " + std::to_string(wrong) + " refused");
+        }
+    }
+
+    // ---- E-8: the empty-bin leaf (a bin with no live receipt at its fold) ----
+    // LeafPayload v1: bin_lo = bin_hi = b, raw_sum 0, miner_count 0, d_min 0,
+    // comp_root = 32 zero bytes; mmr_leaf = sha256d(0x00 || LeafPayload v1).
+    {
+        struct EmptyLeaf { std::uint64_t b; const char* leaf; };
+        const EmptyLeaf empty[] = {
+            {0, "493bbf476c3f201466248d191eb35a0ce00b917fa97768ae64b65f5e1cc8a507"},
+            {1, "c64b418f478ff0214bd15f86f5f898a3d62420258cf521e1ddb758a0f111f5cb"},
+            {3500000, "5f1c87aacdf5c93e759200e347878dea6d70016dd22cbeeaf4e3ec2727100be4"},
+        };
+        for (const EmptyLeaf& e : empty) {
+            const pb::L1Bucket eb = pb::seal_bucket(e.b, {}, pb::Work(0), 0, 0);
+            check(eb.comp_root_v == pb::Hash32{}, "empty bin " + std::to_string(e.b) + ": comp_root zero");
+            check(hx(pb::mmr_leaf_of(eb)) == e.leaf, "golden empty-bin mmr_leaf b = " + std::to_string(e.b));
+        }
+    }
 
     // ---- a rebuild reproduces the root (restart / reorg / joiner) ----
     pb::BinMmr rebuilt;

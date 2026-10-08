@@ -300,12 +300,46 @@ inline MmrProof mmr_proof(const BinMmr& m, std::uint64_t leaf_index) {
     return pr;
 }
 
-// Verify a leaf against a committed mmr_root: fold the leaf up its co-path to its
-// peak, confirm it equals the proof's own peak, then bag all peaks and compare
-// the root (with the committed leaf_count). A forged bucket breaks the fold; a
-// forged peak set breaks the root.
+// The proof's shape is a function of (leaf_index, leaf_count): leaf_index <
+// leaf_count; peaks.size() == popcount(leaf_count); own_peak = the peak holding
+// leaf_index; path length = that peak's height; sibling k on the right iff bit k
+// of (leaf_index - first leaf of that peak) is 0. leaf_index = b - b0 (E-8).
+inline bool mmr_proof_shape_ok(const MmrProof& pr) {
+    const std::uint64_t n = pr.leaf_count;
+    if (n == 0 || pr.leaf_index >= n) return false;
+    std::size_t n_peaks = 0, peak = 0;
+    std::uint64_t start = 0, lo = 0, sz = 0;
+    for (int bit = 63; bit >= 0; --bit) {
+        const std::uint64_t span = std::uint64_t{1} << bit;
+        if (!(n & span)) continue;
+        if (sz == 0 && pr.leaf_index >= start && pr.leaf_index < start + span) {
+            peak = n_peaks;
+            lo = start;
+            sz = span;
+        }
+        start += span;
+        ++n_peaks;
+    }
+    if (pr.peaks.size() != n_peaks || pr.own_peak != peak) return false;
+    std::size_t height = 0;
+    for (std::uint64_t s = sz; s > 1; s >>= 1) ++height;
+    if (pr.path.size() != height) return false;
+    std::uint64_t pos = pr.leaf_index - lo;
+    for (const auto& step : pr.path) {
+        if (step.second != ((pos & 1u) == 0)) return false;
+        pos >>= 1;
+    }
+    return true;
+}
+
+// Verify a leaf against a committed mmr_root: the proof's shape must match its
+// leaf_index (mmr_proof_shape_ok), fold the leaf up its co-path to its peak,
+// confirm it equals the proof's own peak, then bag all peaks and compare the root
+// (with the committed leaf_count). A forged bucket breaks the fold; a forged peak
+// set breaks the root; a valid co-path under another leaf_index breaks the shape.
 inline bool mmr_verify(const Hash32& mmr_root, const Hash32& leaf, const MmrProof& pr) {
     if (pr.own_peak >= pr.peaks.size()) return false;
+    if (!mmr_proof_shape_ok(pr)) return false;
     Hash32 h = leaf;
     for (const auto& [sib, sib_is_right] : pr.path)
         h = sib_is_right ? sha256d_tag_pair(kDomMmrNode, h, sib) : sha256d_tag_pair(kDomMmrNode, sib, h);

@@ -123,6 +123,20 @@ int main() {
         std::printf("  carried_root({01..,02..}) = %s\n", hex(root_ab.data(), 32).c_str());
         check(hex(root_ab.data(), 32) == golden, "carried_root golden {01,02}");
     }
+    // odd counts (E-10): at a level with an odd count the last node is promoted
+    // unchanged, never duplicated. Ids seq32(0x01) .. seq32(n).
+    {
+        const std::array<pb::Hash32, 3> ids3{seq32(0x01), seq32(0x02), seq32(0x03)};
+        const std::array<pb::Hash32, 5> ids5{seq32(0x01), seq32(0x02), seq32(0x03), seq32(0x04), seq32(0x05)};
+        const pb::Hash32 root3 = pb::carried_root(ids3);
+        const pb::Hash32 root5 = pb::carried_root(ids5);
+        std::printf("  carried_root({01..03}) = %s\n", hex(root3.data(), 32).c_str());
+        std::printf("  carried_root({01..05}) = %s\n", hex(root5.data(), 32).c_str());
+        check(hex(root3.data(), 32) == "75e683fcba0f631eea34521cf0c7cceb72cca7c99fb168e7ff8ba2888436dfdd",
+              "carried_root golden n = 3 {01,02,03}");
+        check(hex(root5.data(), 32) == "539f779632b3f3515f1edb3d1cc5040d3fbbdfbf758e4ff5db103540dad617c9",
+              "carried_root golden n = 5 {01,02,03,04,05}");
+    }
 
     // ---- open carriage: receipts of OTHER miners admitted and placed ----
     {
