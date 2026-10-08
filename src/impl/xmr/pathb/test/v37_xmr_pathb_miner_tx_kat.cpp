@@ -352,11 +352,11 @@ void key_cache() {
         for (std::uint64_t R : {600000000000ull, 601000000000ull, 602000000000ull}) {
             pb::ReceiptBodyV3 r = receipt(0x50, R, p_r);
             commit_miner_tx(r, w, tip, p_r, kKatHeight, book, author);
-            all_match = all_match && pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16,
+            all_match = all_match && pb::canonical_coinbase_check(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16,
                                                                    cache, refs, author)
                                              == pb::CoinbaseCheck::Match;
             const pb::CanonicalTx c =
-                    pb::canonical_miner_tx(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, cache, refs, author);
+                    pb::canonical_miner_tx(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, cache, refs, author);
             if (c.tx) txs.push_back(*c.tx);
         }
         check(txs.size() == 3, "key cache: three canonical miner txs built");
@@ -375,12 +375,12 @@ void key_cache() {
         // a Monero race at h: the same tip, another P_r -> another key set.
         pb::ReceiptBodyV3 race = receipt(0x51, 600000000000ull, p_r_race);
         commit_miner_tx(race, w, tip, p_r_race, kKatHeight, book, author);
-        check(pb::canonical_coinbase_check(race, pb::WindowAt{&w}, tip, p_r_race, kKatHeight, 16, cache, refs, author)
+        check(pb::canonical_coinbase_check(race, at_of(&w, tip, 16), tip, p_r_race, kKatHeight, 16, cache, refs, author)
                       == pb::CoinbaseCheck::Match,
               "key cache: the race receipt (another P_r at h) -> Match");
         check(cache.computations() == 2, "key cache: a second key set for the second P_r");
         const pb::CanonicalTx rt =
-                pb::canonical_miner_tx(race, pb::WindowAt{&w}, tip, p_r_race, kKatHeight, 16, cache, refs, author);
+                pb::canonical_miner_tx(race, at_of(&w, tip, 16), tip, p_r_race, kKatHeight, 16, cache, refs, author);
         check(rt.tx && !(rt.tx->outs[0].key == txs[0].outs[0].key) && !(rt.tx->r_tx == txs[0].r_tx),
               "key cache: the race keys differ");
 
@@ -392,7 +392,7 @@ void key_cache() {
         pb::ReceiptBodyV3 r2 = receipt(0x52, 600000000000ull, p_r);
         commit_miner_tx(r2, w2, tip, p_r, kKatHeight, book2, author);
         const std::uint64_t before = cache.computations();
-        check(pb::canonical_coinbase_check(r2, pb::WindowAt{&w2}, tip, p_r, kKatHeight, 16, cache, book2.lookup(),
+        check(pb::canonical_coinbase_check(r2, at_of(&w2, tip, 16), tip, p_r, kKatHeight, 16, cache, book2.lookup(),
                                            author)
                       == pb::CoinbaseCheck::Match,
               "key cache: another payee list on the same (tip, P_r) -> Match");
@@ -401,7 +401,7 @@ void key_cache() {
 
     // the genesis tip (empty window), one P_r, payees X != Y: keys per payee.
     {
-        const pb::Window empty;
+        const pb::Window empty = finder_only_window();
         pb::KeyCache cache;
         pb::ReceiptBodyV3 rx = receipt(0x60, 600000000000ull, p_r);
         pb::ReceiptBodyV3 ry = receipt(0x61, 600000000000ull, p_r);
@@ -410,17 +410,17 @@ void key_cache() {
         commit_miner_tx(ry, empty, tip, p_r, kKatHeight, book, author);
         bool all = true;
         for (int round = 0; round < 2; ++round) {
-            all = all && pb::canonical_coinbase_check(rx, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, refs,
+            all = all && pb::canonical_coinbase_check(rx, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, refs,
                                                       author)
                                  == pb::CoinbaseCheck::Match;
-            all = all && pb::canonical_coinbase_check(ry, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, refs,
+            all = all && pb::canonical_coinbase_check(ry, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, refs,
                                                       author)
                                  == pb::CoinbaseCheck::Match;
         }
         check(all, "finder-only: X, Y, X, Y on one (tip, P_r) -> Match each");
         check(cache.computations() == 2, "finder-only: two key computations (keyed by the payee)");
-        const auto tx_x = pb::canonical_miner_tx(rx, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, refs, author);
-        const auto tx_y = pb::canonical_miner_tx(ry, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, refs, author);
+        const auto tx_x = pb::canonical_miner_tx(rx, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, refs, author);
+        const auto tx_y = pb::canonical_miner_tx(ry, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, refs, author);
         const auto own_x = pb::derive_out_key(pb::derive_r_v3(rx.side.pool_id, tip, p_r, kKatHeight), rx.payee, 0);
         const auto own_y = pb::derive_out_key(pb::derive_r_v3(ry.side.pool_id, tip, p_r, kKatHeight), ry.payee, 0);
         check(tx_x.tx && tx_y.tx && own_x && own_y && tx_x.tx->outs.size() == 1 && tx_x.tx->outs[0].key == own_x->key
@@ -432,17 +432,17 @@ void key_cache() {
     {
         auto run = [&](std::size_t budget, std::vector<pb::CoinbaseCheck>& seq, std::vector<pb::Hash32>& hashes) {
             pb::KeyCache cache(budget);
-            const pb::Window empty;
+            const pb::Window empty = finder_only_window();
             for (int i = 0; i < 6; ++i) {
                 const pb::Hash32 pr = (i % 2) ? p_r : p_r_race;
                 pb::ReceiptBodyV3 r = receipt(static_cast<std::uint8_t>(0x70 + (i % 3)), 600000000000ull + i, pr);
                 const pb::Window& win = (i % 3 == 2) ? empty : w;
                 commit_miner_tx(r, win, tip, pr, kKatHeight, book, author);
                 if (i == 4) r.blob.tree_root[0] ^= 1;  // one non-canonical receipt
-                seq.push_back(pb::canonical_coinbase_check(r, pb::WindowAt{&win}, tip, pr, kKatHeight, 16, cache, refs,
+                seq.push_back(pb::canonical_coinbase_check(r, at_of(&win, tip, 16), tip, pr, kKatHeight, 16, cache, refs,
                                                            author));
                 const pb::CanonicalTx c =
-                        pb::canonical_miner_tx(r, pb::WindowAt{&win}, tip, pr, kKatHeight, 16, cache, refs, author);
+                        pb::canonical_miner_tx(r, at_of(&win, tip, 16), tip, pr, kKatHeight, 16, cache, refs, author);
                 hashes.push_back(c.tx ? c.tx->tx_hash : pb::Hash32{});
             }
             check(cache.bytes() <= cache.budget(), "key cache: bytes <= budget " + std::to_string(budget));
@@ -464,19 +464,19 @@ void key_cache() {
     {
         const std::size_t one = pb::KeyCache::entry_bytes(1);
         pb::KeyCache cache(2 * one);
-        const pb::Window empty;
+        const pb::Window empty = finder_only_window();
         std::vector<pb::ReceiptBodyV3> rs;
         for (std::uint8_t s = 0; s < 3; ++s) {
             pb::ReceiptBodyV3 r = receipt(static_cast<std::uint8_t>(0x80 + s), 600000000000ull, p_r);
             commit_miner_tx(r, empty, tip, p_r, kKatHeight, book, author);
             rs.push_back(r);
-            pb::canonical_coinbase_check(r, pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, refs, author);
+            pb::canonical_coinbase_check(r, at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, refs, author);
         }
         check(cache.entries() == 2 && cache.bytes() == 2 * one, "LRU: two entries at a two-entry budget");
         const std::uint64_t c = cache.computations();
-        pb::canonical_coinbase_check(rs[2], pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, refs, author);
+        pb::canonical_coinbase_check(rs[2], at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, refs, author);
         check(cache.computations() == c, "LRU: the newest entry is kept");
-        pb::canonical_coinbase_check(rs[0], pb::WindowAt{&empty}, tip, p_r, kKatHeight, 16, cache, refs, author);
+        pb::canonical_coinbase_check(rs[0], at_of(&empty, tip, 16), tip, p_r, kKatHeight, 16, cache, refs, author);
         check(cache.computations() == c + 1, "LRU: the oldest entry was evicted");
     }
 }
@@ -498,37 +498,49 @@ void outcomes() {
     auto ck = [&](const pb::ReceiptBodyV3& x, const pb::WindowAt& at, std::uint8_t hf, const pb::RefLookup& look) {
         return pb::canonical_coinbase_check(x, at, tip, p_r, kKatHeight, hf, cache, look, author);
     };
-    check(ck(r, pb::WindowAt{&w}, 16, refs) == pb::CoinbaseCheck::Match, "outcomes: canonical -> Match");
+    check(ck(r, at_of(&w, tip, 16), 16, refs) == pb::CoinbaseCheck::Match, "outcomes: canonical -> Match");
     {
         pb::ReceiptBodyV3 bad = r;
         bad.blob.tree_root[7] ^= 0x10;
-        check(ck(bad, pb::WindowAt{&w}, 16, refs) == pb::CoinbaseCheck::Mismatch, "outcomes: another tree_root -> Mismatch");
+        check(ck(bad, at_of(&w, tip, 16), 16, refs) == pb::CoinbaseCheck::Mismatch, "outcomes: another tree_root -> Mismatch");
         pb::ReceiptBodyV3 more = r;
         more.reward_total += 1;
-        check(ck(more, pb::WindowAt{&w}, 16, refs) == pb::CoinbaseCheck::Mismatch, "outcomes: R + 1 -> Mismatch");
+        check(ck(more, at_of(&w, tip, 16), 16, refs) == pb::CoinbaseCheck::Mismatch, "outcomes: R + 1 -> Mismatch");
     }
     {
         const std::uint64_t c = cache.computations();
-        check(ck(r, pb::WindowAt{&w}, 17, refs) == pb::CoinbaseCheck::Fused && cache.computations() == c,
+        check(ck(r, at_of(&w, tip, 17), 17, refs) == pb::CoinbaseCheck::Fused && cache.computations() == c,
               "outcomes: hf 17 -> Fused, nothing computed");
     }
     check(ck(r, pb::WindowAt{nullptr}, 16, refs) == pb::CoinbaseCheck::Defer, "outcomes: window not held -> Defer");
+    {
+        // WindowAt is bound to (tip, v): a window evaluated for another tip or
+        // another version is not this receipt's window -> Defer, never a verdict.
+        const std::uint64_t c = cache.computations();
+        pb::Hash32 other = tip;
+        other[0] ^= 0x01;
+        check(ck(r, at_of(&w, other, 16), 16, refs) == pb::CoinbaseCheck::Defer,
+              "outcomes: a window of another tip -> Defer");
+        check(ck(r, at_of(&w, tip, 15), 16, refs) == pb::CoinbaseCheck::Defer,
+              "outcomes: a window of another version -> Defer");
+        check(cache.computations() == c, "outcomes: an unbound window computes no keys");
+    }
     {
         // a payee's reference not held -> Defer; held later -> Match.
         RefBook partial = book;
         partial.refs.erase(wts[1].first);
         pb::KeyCache fresh;
-        check(pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, fresh, partial.lookup(), author)
+        check(pb::canonical_coinbase_check(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, fresh, partial.lookup(), author)
                       == pb::CoinbaseCheck::Defer,
               "outcomes: a payee reference not held -> Defer");
-        check(pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, fresh, refs, author)
+        check(pb::canonical_coinbase_check(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, fresh, refs, author)
                       == pb::CoinbaseCheck::Match,
               "outcomes: the reference arrives -> Match");
         // a reference held under another identity -> Defer, never a verdict.
         RefBook wrong = book;
         wrong.refs[wts[2].first] = key_ref(0xEE);
         pb::KeyCache fresh2;
-        check(pb::canonical_coinbase_check(r, pb::WindowAt{&w}, tip, p_r, kKatHeight, 16, fresh2, wrong.lookup(), author)
+        check(pb::canonical_coinbase_check(r, at_of(&w, tip, 16), tip, p_r, kKatHeight, 16, fresh2, wrong.lookup(), author)
                       == pb::CoinbaseCheck::Defer,
               "outcomes: a reference of another identity -> Defer");
     }
@@ -536,31 +548,31 @@ void outcomes() {
         // side_data_v3 bound through mm_root: a changed field -> Mismatch.
         pb::ReceiptBodyV3 changed = r;
         changed.side.window_root[3] ^= 0x01;
-        check(ck(changed, pb::WindowAt{&w}, 16, refs) == pb::CoinbaseCheck::Mismatch,
+        check(ck(changed, at_of(&w, tip, 16), 16, refs) == pb::CoinbaseCheck::Mismatch,
               "outcomes: side_data_v3 changed after the coinbase was built -> Mismatch");
         pb::ReceiptBodyV3 un = r;
         un.side.owner = seq32(0x21);  // owner with fee_rate_bp 0
-        check(ck(un, pb::WindowAt{&w}, 16, refs) == pb::CoinbaseCheck::Undefined,
+        check(ck(un, at_of(&w, tip, 16), 16, refs) == pb::CoinbaseCheck::Undefined,
               "outcomes: side_data_v3 does not encode -> Undefined");
     }
     {
         pb::Window bad_w = w;
         bad_w.W += pb::Work(1);  // weights != W
-        check(ck(r, pb::WindowAt{&bad_w}, 16, refs) == pb::CoinbaseCheck::Undefined,
+        check(ck(r, at_of(&bad_w, tip, 16), 16, refs) == pb::CoinbaseCheck::Undefined,
               "outcomes: window weights != W -> Undefined");
     }
     {
         // finder-only with a payee identity that is not its reference's.
-        const pb::Window empty;
+        const pb::Window empty = finder_only_window();
         pb::ReceiptBodyV3 f = make_body(3, false, 0x41);
         commit_miner_tx(f, empty, f.side.tip, f.blob.prev_id, kKatHeight, book, author);
         pb::KeyCache c2;
-        check(pb::canonical_coinbase_check(f, pb::WindowAt{&empty}, f.side.tip, f.blob.prev_id, kKatHeight, 16, c2, refs,
+        check(pb::canonical_coinbase_check(f, at_of(&empty, f.side.tip, 16), f.side.tip, f.blob.prev_id, kKatHeight, 16, c2, refs,
                                            author)
                       == pb::CoinbaseCheck::Match,
               "outcomes: finder-only -> Match");
         f.side.payee[0] ^= 0x01;
-        check(pb::canonical_coinbase_check(f, pb::WindowAt{&empty}, f.side.tip, f.blob.prev_id, kKatHeight, 16, c2, refs,
+        check(pb::canonical_coinbase_check(f, at_of(&empty, f.side.tip, 16), f.side.tip, f.blob.prev_id, kKatHeight, 16, c2, refs,
                                            author)
                       == pb::CoinbaseCheck::Undefined,
               "outcomes: finder-only payee identity != its reference -> Undefined");

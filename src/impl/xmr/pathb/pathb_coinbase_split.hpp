@@ -15,8 +15,11 @@
 //     payee (keys per (tip, P_r, payee)). tx hash -> fold over the receipt's
 //     branch == tree_root. [C37, C07, C21; D2.2, D2.7]
 //   outcome (CoinbaseCheck, pathb_receipt_admission.hpp): Fused at hf >= 17
-//     (amount_fork_fused) before anything is built; Defer when the window or a
-//     payee's key reference is not held; Undefined when side_data_v3 does not
+//     (amount_fork_fused) before anything is built; Defer when the window of
+//     (tip, v) (WindowAt bound to the receipt's tip and hf) or a payee's key
+//     reference is not held, or the Window is not an evaluated window
+//     (empty_finder_only != no payees); finder-only only on
+//     Window.empty_finder_only; Undefined when side_data_v3 does not
 //     encode, the window weights != W or the receipt's payee identity does not
 //     match its reference; Mismatch / Match from the fold. [C41]
 //   hf >= 17 (format only): two equal Ko -> Unbuildable (carrot_order_refusal).
@@ -49,9 +52,14 @@ namespace c2pool::xmr::pathb {
 using RefLookup = std::function<std::optional<XmrKeyRef>(const Hash32&)>;
 
 // The window of the receipt's own tip at v, or nullptr when the node cannot
-// evaluate it yet (a bucket or A_t's weights not held).
+// evaluate it yet (a bucket or A_t's weights not held). Bound to the tip and v
+// it was evaluated for, with its window_root and mmr_root_at(tip).
 struct WindowAt {
     const Window* window = nullptr;
+    Hash32 tip{};
+    std::uint8_t v = 0;
+    Hash32 window_root{};
+    Hash32 mmr_root{};
 };
 
 // The hf-16 vouts of R over a non-empty window: split(R, w), payee identity
@@ -78,8 +86,8 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
         out.stop = CoinbaseCheck::Fused;  // hf >= 17: build nothing
         return out;
     }
-    if (at.window == nullptr) {
-        out.stop = CoinbaseCheck::Defer;
+    if (at.window == nullptr || !(at.tip == tip) || at.v != hf) {
+        out.stop = CoinbaseCheck::Defer;  // no window of (tip, v) held
         return out;
     }
     const std::optional<Hash32> mm_root = mm_root_of(r.side);
@@ -90,9 +98,13 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
     const Window& w = *at.window;
     std::vector<Hash32> ids;
     std::vector<std::uint64_t> amounts;
-    const bool finder_only = w.weight.empty();
+    const bool finder_only = w.empty_finder_only;
     if (finder_only) {
-        // empty window: one output of R to the receipt's own payee (D:621-622).
+        // a window with no entries: one output of R to the receipt's own payee.
+        if (!w.weight.empty()) {
+            out.stop = CoinbaseCheck::Defer;  // not an evaluated window of (tip, v)
+            return out;
+        }
         if (key_ref_identity(r.payee) != r.side.payee) {
             out.stop = CoinbaseCheck::Undefined;
             return out;
@@ -100,6 +112,10 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
         ids.push_back(r.side.payee);
         amounts.push_back(r.reward_total);
     } else {
+        if (w.weight.empty()) {
+            out.stop = CoinbaseCheck::Defer;  // no evaluated window of (tip, v): never finder-only
+            return out;
+        }
         const std::vector<SplitOutput> outs = hf16_outputs(r.reward_total, w);
         if (outs.empty()) {
             out.stop = CoinbaseCheck::Undefined;  // window weights != W

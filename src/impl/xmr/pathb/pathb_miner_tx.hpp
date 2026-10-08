@@ -111,7 +111,7 @@ inline std::optional<Hash32> tx_public_key(const Hash32& r) {
 }
 
 // ---------------------------------------------------------------------------
-// One output's one-time key and view tag (D:683-690)
+// One output's one-time key and view tag
 // ---------------------------------------------------------------------------
 struct OutKey {
     Hash32 key{};
@@ -272,7 +272,7 @@ inline std::optional<MinerTx> build_miner_tx_hf16(const Hash32& pool_id, const H
 }
 
 // ---------------------------------------------------------------------------
-// KeyCache (S:40-42, S:401-406; R-9): output keys per (tip, P_r) for a window
+// KeyCache (R-9): output keys per (tip, P_r) for a window
 // with payees; per (tip, P_r, payee) for the finder-only coinbase. On a hit the
 // stored pool_id, h and ordered payee digest are compared with the request; a
 // difference recomputes. LRU by bytes.
@@ -392,7 +392,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// hf >= 17 output order (format only; S:531, S:538-539, D:683-690): all miner
+// hf >= 17 output order (format only): all miner
 // outputs by Ko strictly ascending, Ko compared as Monero's crypto::public_key
 // operator< (memcmp); the 0x04 D_e list in the same order. Two equal Ko: no order.
 // ---------------------------------------------------------------------------

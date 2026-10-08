@@ -317,7 +317,7 @@ struct TailResult {
     bool randomx_called = false;  // observable: #15 runs only after #12 admits
 };
 
-// The outcome of the canonical coinbase check (S2.3 #12; S:32-39, C41):
+// The outcome of the canonical coinbase check (S2.3 #12, C41):
 //   Match        the receipt commits the canonical miner tx: continue
 //   Mismatch     fold(tx hash, branch) != tree_root, computed by the node: BAN
 //   Fused        hf >= 17 (amount_fork_fused): REFUSE, no token, no ban

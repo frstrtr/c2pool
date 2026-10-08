@@ -37,6 +37,14 @@
 //   switch_best(t)  rewinds the materialised state to the fork point (records,
 //                   placements, placed ids, buckets, the MMR truncated) and
 //                   replays t's deltas; fills one record batch.
+//   retention       P-37 / P-38 (policy, ruling 23): by default every placement
+//                   and every sealed bucket body is kept (leaf hashes always).
+//                   A node may drop the placements of bins below a floor (at
+//                   most min(H(L - J), H(L) - F - Fresh) - F - Fresh + 1, L the
+//                   best tip) and the bucket bodies of bins below a floor; a
+//                   read of a dropped bin is MissingEntries / MissingBucket
+//                   (DEFER), never an empty bin. restore_bucket takes a served
+//                   body back when it hashes to the held leaf.
 //
 // Lane records (node-local; a different layout forks nothing). Kinds proposed
 // for the store census (registered by S4): K_BMMR 11, K_BLEAF 12, K_BLHASH 13.
@@ -69,6 +77,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -150,7 +159,45 @@ struct SealedBin {
     Hash32 leaf{};                // mmr_leaf_of(bucket)
     std::uint64_t sealed_at = 0;  // the fold position on its chain (not a record field)
     std::vector<XmrKeyRef> refs;  // key references of the bucket's identities, ascending by identity
+    bool held = true;             // the body (rows, references) is held; the leaf always is (P-38)
 };
+
+// ---------------------------------------------------------------------------
+// Retention (policy, ruling 23). Defaults keep everything.
+//   P-37 placements: kept for every bin; a floor drops the placements of the
+//        bins below it, clamped to min(H(L - J), H(L) - F - Fresh) - F - Fresh
+//        + 1. Flag --pathb-entry-retention.
+//   P-38 bucket bodies: kept for every sealed bin from b0, leaf hashes always;
+//        a floor drops the bodies of the bins below it. Flag
+//        --pathb-bucket-retention.
+// A read of a dropped bin is a DEFER (MissingEntries / MissingBucket); the
+// verdicts do not depend on either value.
+// ---------------------------------------------------------------------------
+struct LaneRetention {
+    std::uint64_t entry_keep_from = 0;   // keep the placements of bins >= this (0: every bin)
+    std::uint64_t bucket_keep_from = 0;  // keep the bucket bodies of bins >= this (0: every bin)
+};
+inline constexpr LaneRetention kLaneRetentionDefault{};
+inline constexpr std::string_view kEntryRetentionFlag = "--pathb-entry-retention";
+inline constexpr std::string_view kBucketRetentionFlag = "--pathb-bucket-retention";
+
+// The key references of a bucket: strictly ascending by identity, each the
+// identity of one of its rows (miner or owner).
+inline bool refs_bound_to_rows(const std::vector<BucketRow>& rows, const std::vector<XmrKeyRef>& refs) {
+    std::set<Hash32> row_ids;
+    for (const BucketRow& row : rows) {
+        row_ids.insert(row.miner);
+        if (!(row.owner == kZeroHash)) row_ids.insert(row.owner);
+    }
+    Hash32 prev{};
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+        const Hash32 id = key_ref_identity(refs[i]);
+        if (i > 0 && !(prev < id)) return false;
+        if (row_ids.count(id) == 0) return false;
+        prev = id;
+    }
+    return true;
+}
 
 // One held carrier: its position, record and what it changed on its chain.
 struct LaneDelta {
@@ -204,9 +251,12 @@ public:
     bool placed_open(const Hash32& id) const;
     // The live placements of a bin on this chain with q <= q_max, by (q, list order).
     std::vector<const Placement*> live_entries(std::uint64_t bin, std::uint64_t q_max) const;
+    // false when the placements of the bin are no longer held (P-37).
+    bool entries_held(std::uint64_t bin) const;
     // Placements on this chain (live and dead), for counts.
     std::size_t placement_count() const;
-    // The bucket of a bin sealed on this chain through pos(); nullptr if not sealed.
+    // The bucket of a bin sealed on this chain through pos(); nullptr if not
+    // sealed or its body is not held (P-38).
     const SealedBin* bucket(std::uint64_t bin) const;
     std::uint64_t leaf_count_at(std::uint64_t x) const;
     Hash32 mmr_root_at(std::uint64_t x) const;
@@ -474,18 +524,7 @@ inline std::optional<SealedBin> decode_bleaf(const std::string& v, std::uint64_t
     if (!r.done()) return std::nullopt;
     if (!bucket_consistent(b)) return std::nullopt;
     if (b.bin_lo < b0 || b.bin_lo - b0 != leaf_index) return std::nullopt;
-    std::set<Hash32> row_ids;
-    for (const BucketRow& row : b.rows) {
-        row_ids.insert(row.miner);
-        if (!(row.owner == kZeroHash)) row_ids.insert(row.owner);
-    }
-    Hash32 prev{};
-    for (std::size_t i = 0; i < sb.refs.size(); ++i) {
-        const Hash32 id = key_ref_identity(sb.refs[i]);
-        if (i > 0 && !(prev < id)) return std::nullopt;
-        if (row_ids.count(id) == 0) return std::nullopt;
-        prev = id;
-    }
+    if (!refs_bound_to_rows(b.rows, sb.refs)) return std::nullopt;
     sb.leaf = mmr_leaf_of(b);
     return sb;
 }
@@ -611,7 +650,8 @@ public:
     }
 
     // Places r in carrier c (S2.3 #7 before #8 on c's chain at its parent; #17).
-    // nullopt: c is not held, or its seal already ran (nothing is stored).
+    // nullopt: c is not held, its seal already ran, or the placements of r's
+    // open bin are no longer held (P-37) (nothing is stored).
     std::optional<Ingest> ingest(const Hash32& carrier, Placement r) {
         const auto it = journal_.find(carrier);
         if (it == journal_.end() || it->second.sealed_done) return std::nullopt;
@@ -622,6 +662,7 @@ public:
         r.carrier = carrier;
         const std::uint64_t record_parent = pv.record(pv.pos());  // H(q - 1) on c's chain
         if (r.bin < b0_ || !open_at(record_parent, r.bin, p_.open_bins)) return Ingest::Expired;
+        if (r.bin < entry_floor_) return std::nullopt;  // placements not held (P-37): no verdict
         if (pv.placed_open(r.id)) return Ingest::Duplicate;
         for (const Placement& x : d.placed)
             if (x.id == r.id) return Ingest::Duplicate;
@@ -631,8 +672,9 @@ public:
     }
 
     // The seal driver at carrier c (after its placements). Returns the number of
-    // bins sealed at c; nullopt when c is not held, its view is not Ok, or a
-    // bucket fails bucket_consistent (then nothing is sealed at c).
+    // bins sealed at c; nullopt when c is not held, its view is not Ok, a bin's
+    // placements are not held (P-37) or a bucket fails bucket_consistent (then
+    // nothing is sealed at c).
     std::optional<std::uint64_t> seal(const Hash32& carrier) {
         const auto it = journal_.find(carrier);
         if (it == journal_.end()) return std::nullopt;
@@ -647,6 +689,7 @@ public:
         std::vector<SealedBin> sealed;
         for (std::uint64_t i = lc_parent; i < lc_new; ++i) {
             const std::uint64_t b = b0_ + i;
+            if (b < entry_floor_) return std::nullopt;  // S(b) not held (P-37): nothing is sealed
             std::vector<const Placement*> s_b = pv.live_entries(b, q_seal);
             for (const Placement& x : d.placed)
                 if (x.bin == b && x.live && x.q <= q_seal) s_b.push_back(&x);
@@ -726,6 +769,73 @@ public:
         return SwitchVerdict::Switched;
     }
 
+    // ---- retention (P-37 / P-38) ----
+
+    // The highest P-37 floor the best tip allows: min(H(L - J), H(L) - F -
+    // Fresh) - F - Fresh + 1 (saturating; never below b0).
+    std::uint64_t entry_floor_limit() const noexcept {
+        const std::uint64_t span = p_.open_bins + p_.fresh_max;
+        const std::uint64_t h_tip = records_.back();
+        const std::uint64_t h_j = records_[tip_pos() > j_ ? tip_pos() - j_ : 0];
+        const std::uint64_t a = std::min(h_j, h_tip > span ? h_tip - span : 0);
+        const std::uint64_t x = a > span ? a - span : 0;
+        return std::max(b0_, x + 1);
+    }
+    std::uint64_t entry_floor() const noexcept { return entry_floor_; }
+
+    // Drops the placements of the best chain's bins below keep_from (clamped to
+    // entry_floor_limit(); the floor never moves back). Returns the floor.
+    std::uint64_t prune_entries(std::uint64_t keep_from) {
+        const std::uint64_t to = std::min(keep_from, entry_floor_limit());
+        if (to <= entry_floor_) return entry_floor_;
+        entry_floor_ = to;
+        for (auto it = by_bin_.begin(); it != by_bin_.end() && it->first < entry_floor_;) it = by_bin_.erase(it);
+        for (auto it = placed_q_.begin(); it != placed_q_.end();) {
+            if (it->second.bin < entry_floor_)
+                it = placed_q_.erase(it);
+            else
+                ++it;
+        }
+        return entry_floor_;
+    }
+
+    // Drops the bodies of the best chain's sealed buckets of bins below
+    // keep_from (the leaves stay). Returns the number of bodies dropped.
+    std::size_t prune_buckets(std::uint64_t keep_from) {
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < buckets_.size() && b0_ + i < keep_from; ++i) {
+            SealedBin& sb = buckets_[i];
+            if (!sb.held) continue;
+            sb.held = false;
+            sb.bucket.rows.clear();
+            sb.bucket.rows.shrink_to_fit();
+            sb.refs.clear();
+            sb.refs.shrink_to_fit();
+            ++n;
+        }
+        return n;
+    }
+
+    void apply_retention(const LaneRetention& r) {
+        if (r.entry_keep_from > b0_) prune_entries(r.entry_keep_from);
+        if (r.bucket_keep_from > b0_) prune_buckets(r.bucket_keep_from);
+    }
+
+    // A served body of a best-chain sealed bin whose body is not held: taken
+    // back iff it is consistent, its references are bound to its rows and it
+    // hashes to the held leaf.
+    bool restore_bucket(const L1Bucket& b, const std::vector<XmrKeyRef>& refs) {
+        if (b.bin_lo < b0_) return false;
+        const std::uint64_t i = b.bin_lo - b0_;
+        if (i >= buckets_.size() || buckets_[i].held) return false;
+        if (!bucket_consistent(b) || !refs_bound_to_rows(b.rows, refs)) return false;
+        if (mmr_leaf_of(b) != buckets_[i].leaf) return false;
+        buckets_[i].bucket = b;
+        buckets_[i].refs = refs;
+        buckets_[i].held = true;
+        return true;
+    }
+
     // The K_BMMR head of the best tip.
     BmmrHead head() const {
         BmmrHead h;
@@ -788,7 +898,10 @@ private:
         }
         for (std::uint64_t i = lc_from; i < buckets_.size(); ++i) {
             out.put(lane_keys::blhash(chain_id_, i), encode_blhash(buckets_[i].leaf));
-            out.put(lane_keys::bleaf(chain_id_, i), encode_bleaf(buckets_[i]));
+            if (buckets_[i].held)
+                out.put(lane_keys::bleaf(chain_id_, i), encode_bleaf(buckets_[i]));
+            else
+                out.del(lane_keys::bleaf(chain_id_, i));
         }
         out.put(lane_keys::bmmr(chain_id_), encode_bmmr(head()));
     }
@@ -811,6 +924,7 @@ private:
     std::uint64_t j_;
     std::uint32_t chain_id_;
     std::uint64_t floor_ = 0;  // the journal base reached so far
+    std::uint64_t entry_floor_ = 0;  // placements of bins below it are not held (P-37)
 
     // the best chain, materialised
     std::vector<std::uint64_t> records_;                       // H by position
@@ -873,12 +987,17 @@ inline const SealedBin* LaneView::bucket(std::uint64_t bin) const {
     if (bin < s_->b0_) return nullptr;
     const std::uint64_t i = bin - s_->b0_;
     if (i >= leaf_count()) return nullptr;
-    if (i < leaf_count_at(fork_)) return i < s_->buckets_.size() ? &s_->buckets_[i] : nullptr;
+    if (i < leaf_count_at(fork_)) {
+        if (i >= s_->buckets_.size() || !s_->buckets_[i].held) return nullptr;
+        return &s_->buckets_[i];
+    }
     for (const LaneDelta* d : side_)
         for (const SealedBin& sb : d->sealed)
             if (sb.bucket.bin_lo == bin) return &sb;
     return nullptr;
 }
+
+inline bool LaneView::entries_held(std::uint64_t bin) const { return bin >= s_->entry_floor_; }
 
 inline std::uint64_t LaneView::leaf_count_at(std::uint64_t x) const {
     return bin_leaf_count(record(x), s_->b0_, s_->p_.open_bins);
