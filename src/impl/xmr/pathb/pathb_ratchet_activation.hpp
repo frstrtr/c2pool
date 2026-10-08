@@ -302,6 +302,11 @@ inline constexpr std::size_t kActivationRowBytes = sizeof(std::uint16_t) + sizeo
 static_assert(kActivationRowBytes == 42);
 inline constexpr std::size_t kActivationRowsMax = std::size_t{kEpochMax} + 1;
 
+enum class ArRewind : std::uint8_t {
+    Rewound,          // rows above p removed
+    BelowJoinerSeed,  // p below a joiner's first row: refused, AR unchanged
+};
+
 class ActivationRecord {
 public:
     // Appends a row of an activation at a position above every row. false: refused.
@@ -313,9 +318,12 @@ public:
     }
 
     // S restored at position p (a rewind by journal, or a rebuild from a
-    // snapshot at p): AR keeps exactly its rows with h_act <= p.
-    void rewind(std::uint64_t p) {
+    // snapshot at p): AR keeps exactly its rows with h_act <= p. A joiner's
+    // AR refuses a p below its first row (p0 - 1) and stays unchanged.
+    [[nodiscard]] ArRewind rewind(std::uint64_t p) {
+        if (joiner_ && !rows_.empty() && p < rows_.front().h_act) return ArRewind::BelowJoinerSeed;
         while (!rows_.empty() && rows_.back().h_act > p) rows_.pop_back();
+        return ArRewind::Rewound;
     }
 
     // The journal no longer holds positions below oldest; AR keeps every row.

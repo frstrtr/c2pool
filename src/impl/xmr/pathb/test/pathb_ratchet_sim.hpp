@@ -186,9 +186,9 @@ struct Sim {
             const std::optional<pb::RatchetState> s = n->journal_state(f);
             if (!s) return false;
             while (!n->journal.empty() && n->journal.back().first > f) n->journal.pop_back();
+            if (n->ar.rewind(f) != pb::ArRewind::Rewound) return false;
             n->S = *s;
             n->h = f + 1;
-            n->ar.rewind(f);
         }
         pos = f + 1;
         if (keep_chain) chain.resize(f + 1);

@@ -391,12 +391,11 @@ void layout_mt() {
     // R3: 1 at 30 L (same digest) and 2 at CeilL(timeout(R1b's 2) + GRACE) = 60 L.
     const pb::EpochTable T2 = release({vote(P, 1, kR1, 0), vote(P, 1, kR1, 30 * L)});
     const pb::EpochTable T1b = release({vote(P, 1, kR1, 0), vote(P, 2, kQ2, 30 * L)});
-    // R3 records R1's and R2's attempts of 1 and its own attempt of 2 (as the model's R3; recording R1b's attempt of 2,
-    // which started before R2's attempt of 1 timed out, would fail the K30h check against the last attempt of 1)
+    // R3 (K30h): attempts of 1 at 0 and 30 L, attempt of 2 at 60 L
     const pb::EpochTable T3 = release({vote(P, 1, kR1, 0), vote(P, 1, kR1, 30 * L), vote(P, 2, kQ3, 60 * L)});
     check(pb::deployment_table_valid(P, pb::LaneNet::Mainnet, T2).ok && pb::deployment_table_valid(P, pb::LaneNet::Mainnet, T1b).ok
               && pb::deployment_table_valid(P, pb::LaneNet::Mainnet, T3).ok,
-          "8 MT: the three tables pass the start-up checks (R3 carries R1b's attempt of 2)");
+          "8 MT: the three tables pass the start-up checks (R3: 1 at 0 and 30 L, 2 at 60 L)");
     const std::uint64_t H1 = pb::window_h_act(P, 30);
     const std::uint64_t H2 = pb::window_h_act(P, 55);  // the last window of R1b's attempt of 2: [55 L, 56 L)
     Sim sim(P);

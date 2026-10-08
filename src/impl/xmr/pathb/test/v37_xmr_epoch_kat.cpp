@@ -372,7 +372,12 @@ void epoch_at_branches() {
         const std::uint64_t p0 = h1 + 200;
         pb::ActivationRecord j;
         j.seed_joiner(*V.journal_state(p0 - 1), p0);
-        j.rewind(p0 - 1);  // the first reorg replaces positions from p0 on
+        const pb::ArRewind rw = j.rewind(p0 - 1);  // the first reorg replaces positions from p0 on
+        const pb::ArRewind below = j.rewind(p0 - 2);
+        check(rw == pb::ArRewind::Rewound && below == pb::ArRewind::BelowJoinerSeed && j.rows().size() == 1
+                  && j.rows()[0] == pb::ActivationRow{1, p0 - 1, V.journal_state(p0 - 1)->rules_cur}
+                  && j.joiner_p0() == std::optional<std::uint64_t>(p0),
+              "7 a rewind below a joiner's p0 - 1 is refused and leaves its activation record unchanged");
         const pb::EpochAt ej = pb::epoch_at(P, T, std::nullopt, j, h1 + 399, V.S, p0 + 5, p0 + 6);
         check(j.rows().size() == 1 && j.joiner_p0() == std::optional<std::uint64_t>(p0) && ej.kind == pb::EpochAtKind::Epoch && ej.epoch == 1,
               "7 a joiner whose first reorg replaces p0 keeps its first row and judges a tip above p0 like a follower");
