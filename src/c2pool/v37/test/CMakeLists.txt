@@ -1162,7 +1162,8 @@ if (BUILD_TESTING)
     #                                 load.
     #   v37_xmr_relay_node_nonce_kat  #1885 N5: duplicate in/out pair closed
     #                                 by the acceptor.
-    # (v37_convergence_soak, #1905, is wrapped at its own add_test below.)
+    # (v37_convergence_soak, #1905, is an undiagnosed safety pin and is NOT
+    # retried; see its add_test below.)
     set(V37_FLAKY_RETRY v37_xmr_relay_send_queue_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
@@ -2087,16 +2088,12 @@ if (BUILD_TESTING)
     target_compile_features(v37_convergence_soak PRIVATE cxx_std_20)
     target_include_directories(v37_convergence_soak PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_convergence_soak Threads::Threads)
-    # TRACKED TIMING FLAKE #1905 (SK-A1 fails ~5/40 under ASan; the race stays
-    # open there): up to 3 tries via cmake/RetryTest.cmake, failing all 3 still
-    # fails. TIMEOUT covers all tries together (300 -> 600); ENVIRONMENT reaches
-    # the binary through the wrapper.
-    add_test(NAME v37_convergence_soak COMMAND ${CMAKE_COMMAND}
-        -DEXE=$<TARGET_FILE:v37_convergence_soak> -DNAME=v37_convergence_soak
-        -DISSUE=1905 -DTRIES=3
-        -P ${CMAKE_SOURCE_DIR}/cmake/RetryTest.cmake)
+    # UNDIAGNOSED SAFETY PIN #1905 (SK-A1, credited-but-unrepairable > 0 seen
+    # under ASan): one run, no retry, until #1905 has a root cause. Not for
+    # cmake/RetryTest.cmake.
+    add_test(NAME v37_convergence_soak COMMAND v37_convergence_soak)
     set_tests_properties(v37_convergence_soak PROPERTIES
-        TIMEOUT 600
+        TIMEOUT 300
         ENVIRONMENT "SOAK_SEED=20260918;SOAK_ROUNDS=600;SOAK_SECONDS=60;SOAK_PROGRESS=0")
 
     add_executable(v37_owed_event_mmr_kat v37_owed_event_mmr_kat.cpp)

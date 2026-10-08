@@ -5,16 +5,19 @@
 #
 # ONLY for a test whose race is tracked in an open GitHub issue (ISSUE is
 # required). Never use it to hide a new failure: a new red gets fixed, or gets
-# its own issue first. Drop the test from the wrapper when its race is fixed.
+# its own issue first. Never for a safety pin whose failure has no root cause
+# in its issue. Drop the test from the wrapper when its race is fixed.
 #
 # Runs EXE up to TRIES times (default 3). The first attempt that exits 0 passes
 # the test. A test that fails all TRIES attempts still FAILS. Every attempt's
 # output is inherited (streamed into the CTest log as it runs, never captured
-# or swallowed), and the wrapper adds these lines so the flake rate can be
-# counted from CI logs:
+# or swallowed), and the wrapper adds these lines:
 #   attempt n/N FAILED rc=<rc>: <name> (flake #<issue>)    after a failed attempt
 #   RETRY n/N <name> (flake #<issue>)                      before every retry
 #   RETRY passed on attempt n/N <name> (flake #<issue>)    on a late pass
+# A passing test's output reaches only Testing/Temporary/LastTest.log, not the
+# console of `ctest --output-on-failure`. CI uploads that file on every run and
+# turns these lines into warnings (scripts/ci/report_test_retries.sh).
 #
 # CTest has no per-test repeat property (`ctest --repeat until-pass:N` is a
 # command-line option for the whole run), hence this script. The test's
