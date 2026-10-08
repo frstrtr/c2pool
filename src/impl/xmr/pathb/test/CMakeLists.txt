@@ -50,6 +50,18 @@
 #   v37_xmr_pathb_coinbase_kat       Sum(vout) == R (kept name xmr_coinbase_kat)
 #   v37_xmr_pathb_e2e_kat            window->split->roots #13 (kept name xmr_e2e_kat)
 #
+# Slice S4 (the ratchet activation module; pathb_ratchet_activation.hpp,
+# pathb_lane_rules.hpp, pathb_hello.hpp; unwired) KATs:
+#   v37_xmr_epoch_kat                activation, HOLD, frames, epoch_at / AR, kind 2,
+#                                    commitment, HELLO diagnostics
+#   xmr_epoch_tally_kat              tally, rs_step step 1, failure / re-proposal,
+#                                    start-up checks, layout MT
+#   v37_xmr_ballot_kat               the ballot writer and its encoding
+#   xmr_epoch_accounting_kat         weights across an epoch (C24)
+#   v37_xmr_donation_split_kat       K16 author share and identity (C26)
+#   v37_xmr_monero_rules_digest_kat  K20 monero_rules_digest
+#   v37_xmr_pathb_hello_kat          rules block TLV golden, trailer codec
+#
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
 # hand in BOTH `--target` lists of .github/workflows/build.yml.
@@ -95,7 +107,14 @@ if (BUILD_TESTING)
             v37_xmr_fairness_cap_kat
             v37_xmr_fairness_schedules_kat
             v37_xmr_pathb_coinbase_kat
-            v37_xmr_pathb_e2e_kat)
+            v37_xmr_pathb_e2e_kat
+            v37_xmr_epoch_kat
+            xmr_epoch_tally_kat
+            v37_xmr_ballot_kat
+            xmr_epoch_accounting_kat
+            v37_xmr_donation_split_kat
+            v37_xmr_monero_rules_digest_kat
+            v37_xmr_pathb_hello_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
@@ -106,6 +125,8 @@ if (BUILD_TESTING)
     # by its bare name).
     target_include_directories(v37_xmr_pathb_body_v3_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
     target_include_directories(v37_xmr_receipt_wire_cap_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
+    # v37_xmr_donation_split_kat reads the donation keys of the fee model source.
+    target_compile_definitions(v37_xmr_donation_split_kat PRIVATE C2POOL_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
     # xmr_carrier_timestamp_kat scans the Path B headers for a clock read.
     target_compile_definitions(xmr_carrier_timestamp_kat PRIVATE
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
