@@ -449,12 +449,12 @@ void lying_vectors() {
         ChainR c;
         const pb::GetBuckets rq{kChain, cid(0x50, 3), kB0, kB0};
         pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame).at(0));
-        y.entries[0].rows.pop_back();
-        y.entries[0].rows_total = 4;
+        y.entries.at(0).rows.pop_back();
+        y.entries.at(0).rows_total = 4;
         y.refs.erase(std::remove_if(y.refs.begin(), y.refs.end(),
                                     [&](const pb::XmrKeyRef& k) {
                                         const pb::Hash32 id = pb::key_ref_identity(k);
-                                        for (const pb::BucketRow& row : y.entries[0].rows)
+                                        for (const pb::BucketRow& row : y.entries.at(0).rows)
                                             if (row.miner == id) return false;
                                         return true;
                                     }),
@@ -466,12 +466,12 @@ void lying_vectors() {
     // a forged sum in a row
     {
         pb::BucketsReply x = r;
-        x.entries[0].rows[0].w_miner += pb::Work(1);
+        x.entries.at(0).rows.at(0).w_miner += pb::Work(1);
         const pb::FrameOutcome o = one(req, enc(x), an);
         check(refused(o, pb::BucketsFault::Bucket) && o.bucket == pb::BucketFault::CompRoot,
               "w_miner + 1 in a row -> refused (CompRoot), server strike 1");
-        x.entries[0].payload.raw_sum += pb::Work(1);
-        x.entries[0].payload.comp_root_v = pb::comp_root(x.entries[0].rows);
+        x.entries.at(0).payload.raw_sum += pb::Work(1);
+        x.entries.at(0).payload.comp_root_v = pb::comp_root(x.entries.at(0).rows);
         check(refused(one(req, enc(x), an), pb::BucketsFault::Proof),
               "w_miner + 1 with raw_sum and comp_root recomputed -> the MMR proof fails");
     }
@@ -490,7 +490,7 @@ void lying_vectors() {
         const pb::GetBuckets rq{kChain, cid(0x50, 3), kB0, kB0};
         pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame).at(0));
         check(y.refs.size() == 5, "chain R bin b0: 5 references");
-        std::swap(y.refs[0], y.refs[1]);
+        std::swap(y.refs.at(0), y.refs.at(1));
         check(refused(one(rq, enc(y), anchor_of(c.s, rq.at)), pb::BucketsFault::RefOrder),
               "references out of identity order -> RefOrder");
         // a reference whose spend key does not decompress, bound to its row
@@ -514,9 +514,9 @@ void lying_vectors() {
         y.peaks = ax.s.best_mmr().peaks();  // the peaks of 5 leaves (popcount 2, like 3)
         check(refused(one(req, enc(y), anx), pb::BucketsFault::Peaks), "the peaks of leaf_count 5 sent for 3 -> Peaks");
         pb::BucketsReply z = x;
-        z.entries[2].path.clear();
+        z.entries.at(2).path.clear();
         const std::optional<pb::MmrProof> p5 = ax.s.best_mmr().prefix_proof(2, 5);
-        for (const auto& st : p5->path) z.entries[2].path.push_back(st.first);
+        for (const auto& st : p5->path) z.entries.at(2).path.push_back(st.first);
         check(refused(one(req, enc(z), anx), pb::BucketsFault::Proof),
               "the path of leaf b0 + 2 against the root of 5 leaves -> Proof");
     }
@@ -540,15 +540,15 @@ void lying_vectors() {
     // rows_total against raw_sum / d_min, before any row is allocated
     {
         pb::BucketsReply x = r;
-        x.entries[0].rows_total = 1000;
+        x.entries.at(0).rows_total = 1000;
         pb::BucketsAssembly as(req, kB0, F, kFrame);
         check(refused(as.add_frame(kServerA, enc(x), an), pb::BucketsFault::RowsTotal) && as.rows_allocated() == 0,
               "rows_total 1000 > raw_sum / d_min = 1 -> refused before any row is allocated");
         x = r;
-        x.entries[0].rows_total = 0;
+        x.entries.at(0).rows_total = 0;
         check(refused(one(req, enc(x), an), pb::BucketsFault::RowsTotal), "rows_total 0 for a non-empty leaf -> RowsTotal");
         x = r;
-        x.entries[1].rows_total = 1;
+        x.entries.at(1).rows_total = 1;
         check(refused(one(req, enc(x), an), pb::BucketsFault::RowsTotal), "rows_total 1 for the empty leaf -> RowsTotal");
     }
     // S_parent with one byte changed
@@ -620,8 +620,8 @@ void receiver_vectors() {
         const pb::GetBuckets lq{kChain, at, kB0 + 2, kB0 + 3};
         pb::BucketsReply x = dec(f);
         x.entries.erase(x.entries.begin(), x.entries.begin() + 2);
-        x.entries.push_back(x.entries[0]);
-        x.entries[1].payload.bin_lo = x.entries[1].payload.bin_hi = kB0 + 3;
+        x.entries.push_back(x.entries.at(0));
+        x.entries.at(1).payload.bin_lo = x.entries.at(1).payload.bin_hi = kB0 + 3;
         check(refused(one(lq, enc(x), an), pb::BucketsFault::LeafIndex),
               "an entry for bin b0 + 3 at leaf_count 3 -> LeafIndex");
     }
@@ -636,10 +636,10 @@ void receiver_vectors() {
     for (const auto& p : pages) within = within && p.size() <= 900;
     std::vector<pb::BucketsReply> pr;
     for (const auto& p : pages) pr.push_back(dec(p));
-    check(c.ok && pages.size() == 4 && within && pr[0].entries.size() == 1 && pr[0].entries[0].rows.size() == 2 &&
-                  pr[1].entries[0].row_first == 2 && pr[2].entries[0].row_first == 4 &&
-                  pr[2].entries[0].rows.size() == 1 && pr[3].entries[0].payload.bin_lo == kB0 + 1 &&
-                  pr[3].refs.size() == 2,
+    check(c.ok && pages.size() == 4 && within && pr.at(0).entries.size() == 1 && pr.at(0).entries.at(0).rows.size() == 2 &&
+                  pr.at(1).entries.at(0).row_first == 2 && pr.at(2).entries.at(0).row_first == 4 &&
+                  pr.at(2).entries.at(0).rows.size() == 1 && pr.at(3).entries.at(0).payload.bin_lo == kB0 + 1 &&
+                  pr.at(3).refs.size() == 2,
           "paging at 900 B: bin b0 over 3 pages (2, 2, 1 rows), bin b0 + 1 with its owner reference");
     {
         pb::BucketsAssembly as(rq, kB0, F, 900);
@@ -659,9 +659,9 @@ void receiver_vectors() {
     }
     {
         pb::BucketsAssembly as(rq, kB0, F, 900);
-        const pb::FrameOutcome o1 = as.add_frame(kServerA, pages[0], ran);
+        const pb::FrameOutcome o1 = as.add_frame(kServerA, pages.at(0), ran);
         as.abandon(kServerA);  // page 2 not received in time
-        const pb::FrameOutcome o3 = as.add_frame(kServerA, pages[2], ran);
+        const pb::FrameOutcome o3 = as.add_frame(kServerA, pages.at(2), ran);
         std::uint32_t strikes = o1.strike + o3.strike;
         for (const auto& p : pages) strikes += as.add_frame(kServerB, p, ran).strike;
         check(o1.verdict == pb::FrameVerdict::Accepted && o3.verdict == pb::FrameVerdict::Drop && as.complete() &&
@@ -670,18 +670,18 @@ void receiver_vectors() {
     }
     {
         pb::BucketsAssembly as(rq, kB0, F, 900);
-        as.add_frame(kServerA, pages[0], ran);
-        check(refused(as.add_frame(kServerA, pages[2], ran), pb::BucketsFault::Order),
+        as.add_frame(kServerA, pages.at(0), ran);
+        check(refused(as.add_frame(kServerA, pages.at(2), ran), pb::BucketsFault::Order),
               "page 3 after page 1 from one server -> Order");
         pb::BucketsAssembly bs(rq, kB0, F, 900);
-        bs.add_frame(kServerA, pages[0], ran);
-        pb::BucketsReply x = pr[1];
-        x.entries[0].rows_total = 6;
+        bs.add_frame(kServerA, pages.at(0), ran);
+        pb::BucketsReply x = pr.at(1);
+        x.entries.at(0).rows_total = 6;
         check(refused(bs.add_frame(kServerA, enc(x), ran), pb::BucketsFault::PageConflict),
               "rows_total 6 on page 2 after 5 on page 1 -> PageConflict");
         pb::BucketsAssembly cs(rq, kB0, F, 900);
-        cs.add_frame(kServerA, pages[0], ran);
-        x = pr[1];
+        cs.add_frame(kServerA, pages.at(0), ran);
+        x = pr.at(1);
         x.s_parent[0] ^= 1;
         check(refused(cs.add_frame(kServerA, enc(x), ran), pb::BucketsFault::SChanged),
               "S differs between two frames of one server -> SChanged");
@@ -690,10 +690,10 @@ void receiver_vectors() {
         const pb::GetBuckets one_bin{kChain, rat, kB0, kB0};
         pb::BucketsReply x = dec(pb::serve_buckets(c.s, one_bin, kS, kFrame).at(0));
         pb::BucketsReply y = x;
-        y.entries[0].rows_total = 4;
+        y.entries.at(0).rows_total = 4;
         check(refused(one(one_bin, enc(y), ran), pb::BucketsFault::PageRange), "5 rows sent with rows_total 4 -> PageRange");
         y = x;
-        y.entries[0].rows.clear();
+        y.entries.at(0).rows.clear();
         y.refs.clear();
         check(refused(one(one_bin, enc(y), ran), pb::BucketsFault::PageRange),
               "an empty page of a 5-row bin -> PageRange");

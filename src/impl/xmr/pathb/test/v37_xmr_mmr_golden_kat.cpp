@@ -689,7 +689,7 @@ static void s3b_fc_buckets_vectors() {
                                  pb::wire_proof(3, 8, r.entries[3].path, r.peaks)) &&
                   r.entries[3].path.size() == 3,
           "FC_BUCKETS: the proof of bin 3 of 8 from the wire (3 siblings) verifies");
-    r.entries[3].path.clear();
+    if (r.entries.size() == 8) r.entries[3].path.clear();
     pb::BucketsAssembly bs(req, b0, F, frame);
     const pb::FrameOutcome no = bs.add_frame(1, *pb::encode_buckets(r), a);
     check(no.verdict == pb::FrameVerdict::Refused && no.fault == pb::BucketsFault::Proof && no.strike == 1 &&
