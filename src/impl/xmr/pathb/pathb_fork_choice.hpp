@@ -216,6 +216,8 @@ public:
     // FoldMismatch; then c is placed at pos(parent) + 1 and S advances by
     // rs_step_at over every placement there.
     // Preconditions of the caller:
+    //   - with c.parent held, place() follows S1.3 #1a-#9 (the coinbase check
+    //     binds side_data, and so the claimed parent, to c.id);
     //   - the carried bodies are held and S2.3 #14 passed; missing bodies are
     //     DEFERred before place() (place(c, {}) for a carrier that carries
     //     receipts is FoldMismatch);

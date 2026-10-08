@@ -78,7 +78,8 @@
 //       unknown parent arrives first, then X with a held parent is placed,
 //       the copy's entry is dropped and X's child released; a carrier waiting
 //       under two claimed parents keeps its own waiting children when one of
-//       them is refused.
+//       them is refused; a refused copy of a carrier that still waits under
+//       another claimed parent discards nothing.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdint>
@@ -963,6 +964,28 @@ int main() {
             check(oy.verdict == pb::PlaceVerdict::Placed && oy.released == std::vector<pb::Hash32>{yc.id}
                           && put(t, yc).verdict == pb::PlaceVerdict::Placed && t.waiting() == 0,
                   "(n) Y and its child placed");
+
+            // R waits under its unknown honest parent; a copy of R naming a held parent is refused; R's child stays
+            const auto rc = announce(t, yc.id, 8, 0x46, 3);  // R1 at 9 on Y's child, R at 10, R's child at 11
+            check(rc.size() == 3, "(n) three carriers announced on Y's child");
+            if (rc.size() == 3) {
+                check(put(t, rc[2]).verdict == pb::PlaceVerdict::Deferred
+                              && put(t, rc[1]).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 2,
+                      "(n) R waits on its unknown parent, R's child waits on R");
+                pb::CarrierAnnounce r_held = rc[1];
+                r_held.parent = yc.id;
+                r_held.h = node_of(t, yc.id).H - 1;  // below its parent's record
+                const pb::PlaceOutcome orh = put(t, r_held);
+                check(orh.verdict == pb::PlaceVerdict::NotCarrier && orh.discarded.empty() && t.waiting() == 2,
+                      "(n) a copy of R naming a held parent refused: R still waits, so R's child is kept");
+                const pb::PlaceOutcome or1 = put(t, rc[0]);
+                check(or1.verdict == pb::PlaceVerdict::Placed && or1.released == std::vector<pb::Hash32>{rc[1].id},
+                      "(n) R's honest parent placed: R released");
+                const pb::PlaceOutcome orr = put(t, rc[1]);
+                check(orr.verdict == pb::PlaceVerdict::Placed && orr.released == std::vector<pb::Hash32>{rc[2].id}
+                              && put(t, rc[2]).verdict == pb::PlaceVerdict::Placed && t.waiting() == 0,
+                      "(n) R and its child placed");
+            }
         }
     }
 
