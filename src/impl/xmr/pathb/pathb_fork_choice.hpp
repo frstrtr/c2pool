@@ -18,11 +18,14 @@
 //   No reorg depth limit. A switch whose fork point the journal holds
 //   rewinds (RewindVerdict::Rewound); a deeper one rebuilds
 //   (RewindVerdict::RebuildRequired).
-//   A carrier whose parent is not held waits (Deferred). When the parent is
-//   placed, the carriers waiting on it are released (PlaceOutcome::released):
-//   the caller admits each again on the parent's view and places it. A
-//   carrier refused NotCarrier or FoldMismatch discards the carriers waiting
-//   on it, and those waiting on them (PlaceOutcome::discarded).
+//   A carrier whose parent is not held waits (Deferred); a waiting entry is
+//   the pair (id, claimed parent), so the same id naming another parent is
+//   judged on its own. When a carrier is placed, its other waiting entries are
+//   dropped and the carriers waiting on it are released
+//   (PlaceOutcome::released): the caller admits each again on the parent's
+//   view and places it. A carrier refused NotCarrier or FoldMismatch discards
+//   the carriers waiting on it, and those waiting on them, except a carrier
+//   that still waits under another claimed parent (PlaceOutcome::discarded).
 //   receipts_root (S1.3 #10): a carrier's receipts_root must equal
 //     sha256d("c2pool-v37-carry" || carried_root(ids) || rs_root(S(parent)))
 //   over the ids of its carried list in list order (check_carried_fold,
@@ -130,8 +133,8 @@ struct PlaceOutcome {
     PlaceVerdict verdict = PlaceVerdict::Deferred;
     std::vector<Hash32> released;   // Placed: the carriers that waited on this one, in arrival order; each is
                                     // admitted again by the caller and placed
-    std::vector<Hash32> discarded;  // NotCarrier / FoldMismatch: the carriers that waited on this one, and on
-                                    // them, dropped
+    std::vector<Hash32> discarded;  // NotCarrier / FoldMismatch: the waiting entries dropped (the carriers that
+                                    // waited on this one, and on them while they have no other waiting entry)
 };
 
 struct SwitchPlan {
@@ -149,11 +152,11 @@ public:
     // genesis_ratchet_state(genesis_rules_digest). `inherited`: the
     // predecessor's carriers, oldest first; the newest N_rt open the window
     // of position 1. `table`: the node's compiled epoch table T, read by
-    // rs_step_at at every position (an empty table: no activation).
+    // rs_step_at at every position (no default).
     // Preconditions: retarget_params_valid(p), ratchet_params_valid(rp).
-    CarrierTree(const LaneParams& p, const Hash32& genesis_id, std::uint64_t genesis_height,
+    CarrierTree(const LaneParams& p, const Hash32& genesis_id, std::uint64_t genesis_height, const EpochTable& table,
                 std::span<const RetargetEntry> inherited = {}, const RatchetParams& rp = kRuledRatchetParams,
-                const Hash32& genesis_rules_digest = Hash32{}, const EpochTable& table = EpochTable{})
+                const Hash32& genesis_rules_digest = Hash32{})
         : p_(p), rp_(rp), table_(table) {
         const std::size_t keep =
                 static_cast<std::size_t>(std::min<std::uint64_t>(inherited.size(), p.retarget_span));
@@ -173,7 +176,7 @@ public:
     const RatchetParams& ratchet_params() const noexcept { return rp_; }
     const EpochTable& epoch_table() const noexcept { return table_; }
     std::size_t size() const noexcept { return index_.size(); }
-    std::size_t waiting() const noexcept { return waiting_ids_.size(); }
+    std::size_t waiting() const noexcept { return waiting_keys_.size(); }
     const CarrierNode& genesis() const noexcept { return nodes_[0]; }
     const CarrierNode& best() const noexcept { return nodes_[best_]; }
 
@@ -206,21 +209,33 @@ public:
         return carrier_receipts_root_over(carried_ids, nodes_[it->second].rs);
     }
 
-    // Places carrier c with its carried list (in list order). Parent not held:
-    // Deferred (c waits on its parent). Then h(c) >= H(parent), else
-    // NotCarrier; then the fold of S1.3 #10 over the carried ids against
-    // S(parent), else FoldMismatch; then c is placed at pos(parent) + 1 and S
-    // advances by rs_step_at over every placement there.
+    // Places carrier c with its carried list (in list order). c.id held, or
+    // (c.id, c.parent) already waiting: Duplicate. Parent not held: Deferred
+    // (c waits on its parent). Then h(c) >= H(parent), else NotCarrier; then
+    // the fold of S1.3 #10 over the carried ids against S(parent), else
+    // FoldMismatch; then c is placed at pos(parent) + 1 and S advances by
+    // rs_step_at over every placement there.
+    // Preconditions of the caller:
+    //   - the carried bodies are held and S2.3 #14 passed; missing bodies are
+    //     DEFERred before place() (place(c, {}) for a carrier that carries
+    //     receipts is FoldMismatch);
+    //   - `carried` is read on the placing chain (the branch through c.parent):
+    //     the ids of the carried list in body order, work = the #11 t_origin,
+    //     ballot = the side_data_v3 ballot, live = #17;
+    //   - a FoldMismatch judges these bytes (the carrier and its carried
+    //     list), not c.id: the tree keeps no refusal, and the same id with
+    //     other bytes is judged again;
+    //   - place() is not called at x >= H_hold (the hold is the caller's).
     PlaceOutcome place(const CarrierAnnounce& c, std::span<const CarriedPlacement> carried) {
         PlaceOutcome out;
-        if (index_.count(c.id) != 0 || waiting_ids_.count(c.id) != 0) {
+        if (index_.count(c.id) != 0 || waiting_keys_.count(WaitKey{c.id, c.parent}) != 0) {
             out.verdict = PlaceVerdict::Duplicate;
             return out;
         }
         const auto pit = index_.find(c.parent);
         if (pit == index_.end()) {
             waiting_[c.parent].push_back(c.id);
-            waiting_ids_.insert(c.id);
+            waiting_keys_.insert(WaitKey{c.id, c.parent});
             out.verdict = PlaceVerdict::Deferred;
             return out;
         }
@@ -236,6 +251,7 @@ public:
         }
         out.verdict = PlaceVerdict::Placed;
         place_under(pit->second, c, carried);
+        drop_claims(c.id);
         out.released = release_waiting(c.id);
         return out;
     }
@@ -360,6 +376,8 @@ public:
     }
 
 private:
+    using WaitKey = std::pair<Hash32, Hash32>;  // (carrier id, claimed parent id)
+
     // S1.3 #10: receipts_root of c against carried_root(ids of `carried`) and S at its parent.
     static FoldVerdict fold_verdict(const RatchetState& parent_rs, const CarrierAnnounce& c,
                                     std::span<const CarriedPlacement> carried) {
@@ -437,31 +455,55 @@ private:
         return true;
     }
 
+    // true when `id` has a waiting entry under some claimed parent.
+    bool waiting_on_any(const Hash32& id) const {
+        const auto it = waiting_keys_.lower_bound(WaitKey{id, Hash32{}});
+        return it != waiting_keys_.end() && it->first == id;
+    }
+
+    // Drops every waiting entry of `id` (its claims of other parents) once id is placed.
+    void drop_claims(const Hash32& id) {
+        auto it = waiting_keys_.lower_bound(WaitKey{id, Hash32{}});
+        while (it != waiting_keys_.end() && it->first == id) {
+            const auto wit = waiting_.find(it->second);
+            if (wit != waiting_.end()) {
+                std::vector<Hash32>& v = wit->second;
+                v.erase(std::remove(v.begin(), v.end(), id), v.end());
+                if (v.empty()) waiting_.erase(wit);
+            }
+            it = waiting_keys_.erase(it);
+        }
+    }
+
     // The carriers waiting on `parent` (arrival order), no longer waiting.
     std::vector<Hash32> release_waiting(const Hash32& parent) {
         const auto wit = waiting_.find(parent);
         if (wit == waiting_.end()) return {};
         std::vector<Hash32> out = std::move(wit->second);
         waiting_.erase(wit);
-        for (const Hash32& id : out) waiting_ids_.erase(id);
+        for (const Hash32& id : out) waiting_keys_.erase(WaitKey{id, parent});
         return out;
     }
 
-    // Discards the carriers waiting on `parent`, and those waiting on them.
+    // Discards the waiting entries under `parent` when `parent` has no waiting
+    // entry of its own, and then those under each discarded carrier that has
+    // no other waiting entry left.
     std::vector<Hash32> discard_waiting(const Hash32& parent) {
         std::vector<Hash32> out;
-        std::vector<Hash32> stack{parent};
+        std::vector<Hash32> stack;
+        if (!waiting_on_any(parent)) stack.push_back(parent);
         while (!stack.empty()) {
             const Hash32 p = stack.back();
             stack.pop_back();
             const auto wit = waiting_.find(p);
             if (wit == waiting_.end()) continue;
-            for (const Hash32& id : wit->second) {
-                waiting_ids_.erase(id);
-                out.push_back(id);
-                stack.push_back(id);
-            }
+            const std::vector<Hash32> ids = std::move(wit->second);
             waiting_.erase(wit);
+            for (const Hash32& id : ids) {
+                waiting_keys_.erase(WaitKey{id, p});
+                out.push_back(id);
+                if (!waiting_on_any(id)) stack.push_back(id);
+            }
         }
         return out;
     }
@@ -482,8 +524,8 @@ private:
     std::vector<RetargetEntry> inherited_;
     std::vector<CarrierNode> nodes_;           // index 0 = genesis; dropped carriers stay, unindexed
     std::map<Hash32, std::size_t> index_;
-    std::map<Hash32, std::vector<Hash32>> waiting_;  // waiting carrier ids by parent id
-    std::set<Hash32> waiting_ids_;
+    std::map<Hash32, std::vector<Hash32>> waiting_;  // waiting carrier ids by claimed parent id
+    std::set<WaitKey> waiting_keys_;                 // (carrier id, claimed parent id)
     std::size_t best_ = 0;
 };
 

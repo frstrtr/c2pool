@@ -378,7 +378,7 @@ int main() {
 
     // (12) one value per tip
     {
-        pb::CarrierTree t(P, seq32(0x01), 1000);
+        pb::CarrierTree t(P, seq32(0x01), 1000, pb::EpochTable{});
         pb::Hash32 tip = seq32(0x01);
         for (std::uint64_t i = 1; i <= 40; ++i) {
             pb::Hash32 id = seq32(0x40);
@@ -410,8 +410,8 @@ int main() {
         pb::RetargetWindow inherited(P, pred);
         check(inherited.size() == N && inherited.next_difficulty() == 6000016, "window keeps the newest N_rt");
 
-        pb::CarrierTree lane(P, seq32(0x02), pred.back().H, pred);
-        pb::CarrierTree fresh(P, seq32(0x02), pred.back().H);
+        pb::CarrierTree lane(P, seq32(0x02), pred.back().H, pb::EpochTable{}, pred);
+        pb::CarrierTree fresh(P, seq32(0x02), pred.back().H, pb::EpochTable{});
         check(*lane.next_difficulty(seq32(0x02)) == 6000016, "inherited lane: position 1 at 6,000,016");
         check(*fresh.next_difficulty(seq32(0x02)) == P.d_min, "lane without a predecessor: position 1 at d_min");
         // positions 1..k on the new lane continue the window

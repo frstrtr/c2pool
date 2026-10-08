@@ -102,7 +102,7 @@ std::string code_of(const std::filesystem::path& p) {
 int main() {
     std::printf("xmr_carrier_timestamp_kat\n");
 
-    pb::CarrierTree t(P, kGenesis, kGenesisHeight);
+    pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
     const pb::CarrierAnnounce c1 = on_tip(t, cid(1, 1), kGenesis, 1001);
     check(place_complete(t, c1), "carrier at 1001 placed");
 
