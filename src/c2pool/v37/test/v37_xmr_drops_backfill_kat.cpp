@@ -25,6 +25,11 @@
 //       is complete with no I/O, no FB_GETDROPS/FB_DROPINV is ever sent, and
 //       a gate-OFF node that receives one counts it as an unknown Family-B
 //       opcode and keeps the socket (master's behaviour)
+//   B5  ONE VERIFY: a copy of a raindrop queued while the first copy leaves
+//       the verify worker (after its PoW check, before admit_drop) is a dup:
+//       one RandomX verify, one admission
+//   B6  HELD = QUEUED: a raindrop stored but not yet queued for drain_drops()
+//       is not held for drops_sync(); it is held once queued
 //   H1  REORG: a node that books its own sibling Y at h and then the
 //       canonical X at h composes X from the SAME rows (and the same credit) as
 //       a node that only ever booked X -- base: the second booking is empty
@@ -244,6 +249,7 @@ int main() {
     C(wait_for([&] { return A.relay->ready_peers().size() == 1 && B.relay->ready_peers().size() == 1; }, {&A, &B}),
       "B1 HELLO: A-B up");
     const bool b1 = sync_until(B, 100, 104, {&A, &B});
+    B.pump();   // drain_drops() after drops_sync() is complete (the daemon's order)
     std::vector<bytes32> idsA; for (auto& a : dropsA) idsA.push_back(a.id); std::sort(idsA.begin(), idsA.end());
     const auto hb = held(B, 100, 104);
     std::printf("    B holds %zu/12 of A's raindrops for [100,104); backfilled=%llu served_by_A=%llu B rx=%llu\n", hb.size(),
@@ -322,6 +328,40 @@ int main() {
           std::to_string(Z0.relay->stats().fb_unknown.load()) + ")");
         W1.relay->set_dialing(false); Y0.relay->set_dialing(false);
     }
+
+    // ── B5 ONE VERIFY ───────────────────────────────────────────────────────
+#if defined(C2POOL_XMR_RELAY_DROP_POW_HOOK)
+    {
+        const SynthBlock blk = make_block(105, prev[5], 21, nullptr, 3, 40);
+        const Admitted d = drop_on(blk, kDropNonce + 0x3000, pA);
+        std::atomic<int> hooked{0}, stored{0}, held_at_stored{-1};
+        RNode D("D", opts(false, {}, kFloorDiff));
+        for (int i = 0; i < 8; ++i) D.note_bin(prev[i], 100 + i);
+        D.relay->set_test_drop_pow_hook([&](const bytes32& id) {
+            if (id == d.id && hooked.fetch_add(1) == 0) D.relay->test_ingest(d.raw, 7);
+        });
+        D.relay->set_test_drop_stored_hook([&](const bytes32& id) {
+            if (id == d.id && stored.fetch_add(1) == 0) held_at_stored = D.relay->test_drop_held(id) ? 1 : 0;
+        });
+        C(D.relay->start(why), "B5 D starts " + why);
+        C(D.relay->test_ingest(d.raw, 7), "B5 one raindrop queued at D");
+        const auto& ds = D.relay->stats();
+        const bool settled = wait_for([&] {
+            return ds.drops_dup.load() >= 1 && ds.drops_foreign.load() >= 1 && held(D, 105, 106).size() == 1 &&
+                   std::find(D.drained.begin(), D.drained.end(), d.id) != D.drained.end();
+        }, {&D}, 10000ms);
+        std::printf("    B5 D: hook=%d rx=%llu drops_foreign=%llu drops_dup=%llu held=%zu drained=%zu held_at_stored=%d\n",
+                    hooked.load(), (unsigned long long)D.rx_calls.load(), (unsigned long long)ds.drops_foreign.load(),
+                    (unsigned long long)ds.drops_dup.load(), held(D, 105, 106).size(), D.drained.size(), held_at_stored.load());
+        C(settled && hooked.load() >= 1 && D.rx_calls.load() == 1 && ds.drops_foreign.load() == 1 && ds.drops_dup.load() == 1,
+          "B5 ★ a copy queued after the PoW check, before admit_drop, is a dup: ONE RandomX verify, ONE admission");
+        C(settled && held_at_stored.load() == 0 && D.relay->test_drop_held(d.id),
+          "B6 ★ a raindrop stored but not yet queued for drain_drops is NOT held for drops_sync; held once queued");
+    }
+#else
+    C(false, "B5 one RandomX verify per raindrop (base: no drop PoW hook)");
+    C(false, "B6 held for drops_sync only once queued for drain_drops (base: no drop hooks)");
+#endif
 
     // ── H1 / H2: consumption follows the chain ─────────────────────────────
     {

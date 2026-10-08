@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# commit-msg hook: refuse a commit message that carries an attribution marker
+# listed in ci/attribution-patterns.txt. Install in a clone with
+#   git config core.hooksPath scripts/ci/hooks
+set -uo pipefail
+export LC_ALL=C.UTF-8
+root=$(git rev-parse --show-toplevel)
+pat_file=$root/ci/attribution-patterns.txt
+if [ ! -s "$pat_file" ]; then
+    echo "commit-msg: no attribution pattern file ($pat_file); commit refused"
+    exit 1
+fi
+pattern=$(grep -v -E '^[[:space:]]*(#|$)' "$pat_file" | paste -sd'|')
+if grep -v '^#' "$1" | grep -n -i -E -- "$pattern"; then
+    echo "commit-msg: attribution marker in the commit message; commit refused"
+    exit 1
+fi
+exit 0

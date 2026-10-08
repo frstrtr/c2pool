@@ -1,0 +1,911 @@
+{
+  "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
+  "commit": "e7c37353cb4f0ea2b6f7eba265e6865b3b1a3adf",
+  "rules": {
+    "C01": {
+      "checks": {
+        "carrier-sharechain-kat": {
+          "kats": {
+            "xmr_carrier_sharechain_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C02": {
+      "checks": {
+        "no-prev-own-share": {
+          "count": 3,
+          "per_file": {
+            "src/impl/xmr/receipt/xmr_receipt.hpp": 1,
+            "src/impl/xmr/receipt/xmr_receipt_verify.cpp": 2
+          },
+          "status": "fail"
+        },
+        "receipt-id-dedup-kat": {
+          "kats": {
+            "v37_xmr_receipt_id_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C03": {
+      "checks": {
+        "carriage-window-f": {
+          "status": "fail"
+        },
+        "engine-n-ctx-bins": {
+          "status": "pass"
+        },
+        "fresh-max": {
+          "status": "fail"
+        },
+        "freshness-kat": {
+          "kats": {
+            "xmr_receipt_freshness_kat": false
+          },
+          "status": "fail"
+        },
+        "late-tail-bins": {
+          "status": "fail"
+        },
+        "legally-dead-kat": {
+          "kats": {
+            "xmr_receipt_legally_dead_kat": false
+          },
+          "status": "fail"
+        },
+        "liveness-delta": {
+          "status": "fail"
+        },
+        "no-hop-bound": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "w2-n-ctx": {
+          "status": "pass"
+        }
+      },
+      "status": "fail"
+    },
+    "C04": {
+      "checks": {
+        "owed-ledger-symbols": {
+          "count": 97,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 12,
+            "src/c2pool/v37/xmr/relay/xmr_share_verdict.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 9,
+            "src/c2pool/v37/xmr/xmr_finalize_driver.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_light_proof.hpp": 5,
+            "src/c2pool/v37/xmr/xmr_minority_converge.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_node.hpp": 5,
+            "src/c2pool/v37/xmr/xmr_node_config.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_node_smoke.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp": 10,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_provider.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_source.hpp": 10,
+            "src/c2pool/v37/xmr/xmr_settle_store.hpp": 5,
+            "src/impl/xmr/mbp/mbp_wiring.hpp": 6,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 6,
+            "src/impl/xmr/settle/xmr_coinbase.hpp": 3,
+            "src/impl/xmr/settle/xmr_drain_rule.hpp": 11,
+            "src/impl/xmr/template/xmr_block_assembly.hpp": 1
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C05": {
+      "checks": {
+        "no-uncle-code": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C06": {
+      "checks": {
+        "credit-kats": {
+          "kats": {
+            "v37_w2_ingestion_test": true,
+            "xmr_receipt_bind_v2_kat": true,
+            "xmr_receipt_kat": true
+          },
+          "status": "pass"
+        },
+        "no-credit-from-achieved": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "r1-stage-admission": {
+          "status": "pass"
+        },
+        "r1-stage-relay": {
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C07": {
+      "checks": {
+        "exact-sum-kats": {
+          "kats": {
+            "xmr_coinbase_kat": true,
+            "xmr_e2e_kat": true
+          },
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C08": {
+      "checks": {
+        "clock-reads-outside-allowlist": {
+          "count": 85,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp": 1,
+            "src/c2pool/v37/xmr/relay/xmr_relay_node.hpp": 71,
+            "src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp": 13
+          },
+          "status": "fail"
+        },
+        "no-clock-in-consensus-core": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "fail"
+    },
+    "C09": {
+      "checks": {},
+      "status": "pass"
+    },
+    "C10": {
+      "checks": {},
+      "status": "n/a"
+    },
+    "C11": {
+      "checks": {
+        "d-min": {
+          "status": "fail"
+        },
+        "no-fixed-share-diff-refusal": {
+          "count": 1,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 1
+          },
+          "status": "fail"
+        },
+        "no-old-d-min": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "no-retarget-step-clamp": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "retarget-kat": {
+          "kats": {
+            "xmr_share_retarget_kat": false
+          },
+          "status": "fail"
+        },
+        "retarget-min-dh": {
+          "status": "fail"
+        },
+        "retarget-span": {
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C12": {
+      "checks": {
+        "hashbits-kat": {
+          "kats": {
+            "xmr_roundabout_hashbits_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C13": {
+      "checks": {
+        "no-literal-n-param": {
+          "count": 2,
+          "per_file": {
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 2
+          },
+          "status": "fail"
+        },
+        "no-literal-out-size": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "no-overhead-literal": {
+          "count": 1,
+          "per_file": {
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 1
+          },
+          "status": "fail"
+        },
+        "no-reserve-quantile": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "output-gate-kat": {
+          "kats": {
+            "xmr_coinbase_output_gate_kat": false
+          },
+          "status": "fail"
+        },
+        "reserve-kat": {
+          "kats": {
+            "v37_xmr_coinbase_reserve_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C14": {
+      "checks": {
+        "no-identity-roundabout-map": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "no-whale-rule": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C15": {
+      "checks": {
+        "no-per-roundabout-security-gate": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C16": {
+      "checks": {
+        "no-clock-in-gates": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C17": {
+      "checks": {
+        "merge-bound-kat": {
+          "kats": {
+            "xmr_merge_window_bound_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C18": {
+      "checks": {
+        "count-estimator-kats": {
+          "kats": {
+            "v37_xmr_drops_count_kat": true,
+            "v37_xmr_drops_default_kat": true
+          },
+          "status": "pass"
+        },
+        "drops-default-off": {
+          "count": 1,
+          "per_file": {
+            "src/c2pool/CMakeLists.txt": 1
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C19": {
+      "checks": {
+        "no-job-substitution": {
+          "count": 4,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 1,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 3
+          },
+          "status": "fail"
+        },
+        "owner-fee-receipt-kat": {
+          "kats": {
+            "xmr_owner_fee_receipt_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C20": {
+      "checks": {
+        "payout-proof-kat": {
+          "kats": {
+            "xmr_payout_proof_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C21": {
+      "checks": {
+        "no-queue-or-seniority": {
+          "count": 32,
+          "per_file": {
+            "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_light_proof.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_node.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_source.hpp": 7,
+            "src/c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp": 1,
+            "src/impl/xmr/mbp/mbp_wiring.hpp": 1,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 9,
+            "src/impl/xmr/settle/xmr_coinbase.hpp": 3,
+            "src/impl/xmr/template/xmr_block_assembly.hpp": 5
+          },
+          "status": "fail"
+        },
+        "window-split-kat": {
+          "kats": {
+            "xmr_window_split_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C22": {
+      "checks": {
+        "legally-dead-kat": {
+          "kats": {
+            "xmr_receipt_legally_dead_kat": false
+          },
+          "status": "fail"
+        },
+        "no-grace-timer": {
+          "count": 3,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 1,
+            "src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp": 2
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C23": {
+      "checks": {
+        "grace": {
+          "status": "fail"
+        },
+        "headline-genesis": {
+          "status": "fail"
+        },
+        "no-second-clause": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "ratchet-kats": {
+          "kats": {
+            "v37_xmr_ballot_kat": false,
+            "v37_xmr_epoch_kat": false,
+            "xmr_epoch_tally_kat": false
+          },
+          "status": "fail"
+        },
+        "timeout": {
+          "status": "fail"
+        },
+        "vote-window": {
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C24": {
+      "checks": {
+        "epoch-accounting-kat": {
+          "kats": {
+            "xmr_epoch_accounting_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C25": {
+      "checks": {
+        "light-proof-kat": {
+          "kats": {
+            "v37_xmr_mmr_golden_kat": false
+          },
+          "status": "fail"
+        },
+        "provable-work-kats": {
+          "kats": {
+            "xmr_receipt_bind_v2_kat": true,
+            "xmr_receipt_kat": true
+          },
+          "status": "pass"
+        },
+        "receipt-bindings": {
+          "status": "pass"
+        },
+        "side-data-v3-kat": {
+          "kats": {
+            "v37_xmr_side_data_v3_kat": false
+          },
+          "status": "fail"
+        },
+        "side-data-v3-struct": {
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C26": {
+      "checks": {
+        "docs-disclosure": {
+          "status": "pass"
+        },
+        "donation-bp-default": {
+          "status": "pass"
+        },
+        "donation-marker-zero": {
+          "status": "pass"
+        },
+        "donation-split-kat": {
+          "kats": {
+            "v37_xmr_donation_split_kat": false
+          },
+          "status": "fail"
+        },
+        "fee-kats": {
+          "kats": {
+            "xmr_stratum_selftest": true
+          },
+          "status": "pass"
+        },
+        "give-author-default": {
+          "status": "pass"
+        },
+        "give-author-in-preimage": {
+          "status": "pass"
+        },
+        "give-author-opt-out": {
+          "status": "pass"
+        },
+        "login-disclosure": {
+          "status": "pass"
+        },
+        "login-disclosure-give-author": {
+          "status": "pass"
+        }
+      },
+      "status": "fail"
+    },
+    "C27": {
+      "checks": {
+        "lane-rules-kats": {
+          "kats": {
+            "v37_xmr_lane_rules_kat": true,
+            "v37_xmr_relay_pool_id_kat": true
+          },
+          "status": "pass"
+        },
+        "mismatch-refusal": {
+          "status": "pass"
+        },
+        "monero-rules-digest-kat": {
+          "kats": {
+            "v37_xmr_monero_rules_digest_kat": false
+          },
+          "status": "fail"
+        },
+        "rules-digest-in-pool-tag": {
+          "status": "pass"
+        },
+        "single-digest-field": {
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C28": {
+      "checks": {
+        "native-chain-kats": {
+          "kats": {
+            "xmr_native_anchor_self_check_kat": true,
+            "xmr_native_chain_index_kat": true,
+            "xmr_native_snapshot_resume_kat": true
+          },
+          "status": "pass"
+        },
+        "no-rpc-in-consensus-core": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C29": {
+      "checks": {
+        "citizen-kats": {
+          "kats": {
+            "xmr_native_backlog_famine_kat": true,
+            "xmr_native_citizen_select_kat": true
+          },
+          "status": "pass"
+        },
+        "citizen-selector": {
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C30": {
+      "checks": {
+        "no-float-in-consensus-core": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C31": {
+      "checks": {},
+      "status": "n/a"
+    },
+    "C32": {
+      "checks": {
+        "no-third-party-copyleft": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "repository-licence": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C33": {
+      "checks": {
+        "carrier-timestamp-kat": {
+          "kats": {
+            "xmr_carrier_timestamp_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C34": {
+      "checks": {
+        "towing-kat": {
+          "kats": {
+            "xmr_lane_tow_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C35": {
+      "checks": {
+        "narrowing-casts-may-not-grow": {
+          "count": 133,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_coinbase_authority.hpp": 6,
+            "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 4,
+            "src/c2pool/v37/xmr/xmr_credit_cut.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_drops_wiring.hpp": 16,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 11,
+            "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 4,
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_paynow.hpp": 7,
+            "src/impl/xmr/native/consensus/xmr_blob_reader.hpp": 6,
+            "src/impl/xmr/native/consensus/xmr_block_id.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_block_parse.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_difficulty.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_reward.hpp": 10,
+            "src/impl/xmr/native/consensus/xmr_tx_weight.hpp": 2,
+            "src/impl/xmr/pow/randomx_verify.hpp": 6,
+            "src/impl/xmr/receipt/xmr_receipt_verify.cpp": 1,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 10,
+            "src/impl/xmr/settle/xmr_drain_rule.hpp": 3,
+            "src/sharechain/v37/nr_ladder.hpp": 6,
+            "src/sharechain/v37/v37_descriptor_xmr.hpp": 1,
+            "src/sharechain/v37/v37_fixed.hpp": 10,
+            "src/sharechain/v37/v37_lane.hpp": 22
+          },
+          "status": "fail"
+        },
+        "no-saturating-helpers": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "wide-int-extreme-kat": {
+          "kats": {
+            "xmr_wide_int_extreme_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C36": {
+      "checks": {
+        "carriage-kat": {
+          "kats": {
+            "xmr_receipt_carriage_kat": false
+          },
+          "status": "fail"
+        },
+        "frame-count": {
+          "status": "fail"
+        },
+        "r-max-lane-rule": {
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C37": {
+      "checks": {
+        "coinbase-layout-kats": {
+          "kats": {
+            "v37_xmr_base_reward_kat": false,
+            "v37_xmr_coinbase_extra_layout_kat": false,
+            "v37_xmr_coinbase_output_order_kat": false
+          },
+          "status": "fail"
+        },
+        "no-clear-pool-tag": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "no-fee-output": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "no-subaddress-payee": {
+          "count": 5,
+          "per_file": {
+            "src/sharechain/v37/v37_descriptor_xmr.hpp": 5
+          },
+          "status": "fail"
+        },
+        "no-tail-subsidy-as-split-base": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "receipt-admission-coinbase-check": {
+          "status": "fail"
+        },
+        "solo-leech-kat": {
+          "kats": {
+            "xmr_receipt_solo_leech_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C38": {
+      "checks": {
+        "merge-back-kat": {
+          "kats": {
+            "xmr_window_merge_back_kat": false
+          },
+          "status": "fail"
+        },
+        "no-spend-floor-literal": {
+          "count": 3,
+          "per_file": {
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 2,
+            "src/impl/xmr/settle/xmr_coinbase.hpp": 1
+          },
+          "status": "fail"
+        },
+        "no-time-window": {
+          "count": 2,
+          "per_file": {
+            "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1
+          },
+          "status": "fail"
+        },
+        "window-kats": {
+          "kats": {
+            "xmr_window_kat": false,
+            "xmr_window_spend_floor_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C39": {
+      "checks": {
+        "fairness-kats": {
+          "kats": {
+            "v37_xmr_fairness_cap_kat": false,
+            "v37_xmr_fairness_schedules_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C40": {
+      "checks": {},
+      "status": "n/a"
+    },
+    "C41": {
+      "checks": {
+        "no-main-chain-height-read-in-window": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        },
+        "window-branch-kats": {
+          "kats": {
+            "v37_xmr_receipt_defer_kat": false,
+            "v37_xmr_window_branch_kat": false,
+            "v37_xmr_window_fork_height_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C42": {
+      "checks": {
+        "catchup-kat": {
+          "kats": {
+            "xmr_template_catchup_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C43": {
+      "checks": {
+        "fork-choice-kats": {
+          "kats": {
+            "v37_xmr_joiner_kat": false,
+            "xmr_carrier_sharechain_kat": false
+          },
+          "status": "fail"
+        },
+        "journal-not-in-digest": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "fail"
+    },
+    "C44": {
+      "checks": {
+        "ctx-pow-kat": {
+          "kats": {
+            "v37_xmr_ctx_pow_kat": true
+          },
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    },
+    "C45": {
+      "checks": {
+        "buffer-not-below-cap": {
+          "status": "fail"
+        },
+        "no-cap-literal": {
+          "count": 2,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp": 1,
+            "src/impl/xmr/receipt/xmr_receipt.hpp": 1
+          },
+          "status": "fail"
+        },
+        "no-horizon-literals": {
+          "count": 7,
+          "per_file": {
+            "src/c2pool/v37/carrier_net.hpp": 1,
+            "src/c2pool/v37/xmr/relay/xmr_relay_node.hpp": 4,
+            "src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp": 1,
+            "src/impl/xmr/native/relay/xmr_found_block_carrier.hpp": 1
+          },
+          "status": "fail"
+        },
+        "no-midstate": {
+          "count": 9,
+          "per_file": {
+            "src/impl/xmr/receipt/xmr_receipt.hpp": 4,
+            "src/impl/xmr/receipt/xmr_receipt_verify.cpp": 3,
+            "src/impl/xmr/receipt/xmr_receipt_verify.hpp": 2
+          },
+          "status": "fail"
+        },
+        "one-budget": {
+          "status": "fail"
+        },
+        "relay-horizons-kat": {
+          "kats": {
+            "v37_xmr_relay_horizons_kat": false
+          },
+          "status": "fail"
+        },
+        "wire-cap-kat": {
+          "kats": {
+            "v37_xmr_receipt_wire_cap_kat": false
+          },
+          "status": "fail"
+        }
+      },
+      "status": "fail"
+    },
+    "C46": {
+      "checks": {
+        "lane-rules-kat": {
+          "kats": {
+            "v37_xmr_lane_rules_kat": true
+          },
+          "status": "pass"
+        },
+        "no-policy-in-lane-rules": {
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
+        }
+      },
+      "status": "pass"
+    }
+  }
+}

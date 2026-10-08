@@ -308,6 +308,7 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         if (m_nonce == msg->m_nonce)
         {
                 LOG_WARNING << "[Pool] was connected to self";
+                ban_self_connection(peer->addr());
                 return std::nullopt;
         }
 
@@ -632,6 +633,62 @@ bool NodeImpl::admit_or_evict_oldest(std::size_t n, std::size_t admit_bytes, con
                           "was destroyed for it")
                 << "; verify pool is behind, peer will re-offer";
     return false;
+}
+
+// The ltc canonical is p2pool-merged-v36. p2p.py:188 raises PeerMisbehavingError
+// on our own nonce. packetReceived (:106-108) turns that into badPeerHappened
+// (:110-119), which bans the HOST, never 127.0.0.1, for 3600 * banscore^2
+// seconds. The ban is host-keyed (m_ip_ban_list), so the dial loop and
+// connected() both refuse it through is_banned() on any port. Without it the
+// endpoint stayed in the AddrStore and was redialled every think tick.
+//
+// The score is kept apart from the #1601 PoW scorer, which decays on its own
+// half-life. Canonical forgives on a fixed hourly pass instead (see
+// forgive_transgressions below).
+void NodeImpl::ban_self_connection(const NetService& addr)
+{
+    const std::string host = addr.address();
+    if (host == "127.0.0.1")
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    run_forgiveness(now);
+    const long long score = ++m_banscores[host];
+    const auto duration = std::chrono::seconds(3600LL * score * score);
+    m_ip_ban_list[host] = now + duration;
+    LOG_WARNING << "[Pool] Self-connection via " << addr.to_string()
+                << ": banning host " << host << " for " << duration.count()
+                << "s (banscore " << score << ")";
+}
+
+// One canonical pass, p2pool-merged-v36 p2p.py:787-791: every scored host loses
+// one point and is dropped at zero. Only the score is forgiven. A ban already
+// written to m_ip_ban_list runs to its expiry, as canonical's self.bans does.
+// jtoomim's copy reads self.banscore here and dies on its first pass, so btc
+// never forgives. That is a lane difference, not a defect in this port.
+void NodeImpl::forgive_transgressions()
+{
+    for (auto it = m_banscores.begin(); it != m_banscores.end();)
+    {
+        if (--it->second <= 0)
+            it = m_banscores.erase(it);
+        else
+            ++it;
+    }
+}
+
+// Canonical runs the pass from a LoopingCall started with the node (:783-784,
+// every 3600 s). Here the passes that fell due since the node started are
+// applied on the next think cycle, or before a new offence is scored.
+void NodeImpl::run_forgiveness(std::chrono::steady_clock::time_point now)
+{
+    if (now <= m_forgiveness_epoch)
+        return;
+    const auto due = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - m_forgiveness_epoch).count()
+        / FORGIVENESS_INTERVAL.count());
+    for (; m_forgiveness_passes < due; ++m_forgiveness_passes)
+        forgive_transgressions();
 }
 
 // #1601: charge one genuine invalid-PoW share against `addr`. Runs on the io
@@ -2556,6 +2613,8 @@ void NodeImpl::run_think()
             // #1601: drop invalid-PoW scorer entries that have decayed to ~0, so
             // the misbehavior map stays bounded even under identity cycling.
             prune_pow_misbehavior();
+            // #1716 part B: apply the hourly canonical banscore forgiveness.
+            run_forgiveness(std::chrono::steady_clock::now());
             // Keep the peer-key snapshot fresh for clean_tracker's parent_abandoned.
             refresh_peer_keys_snapshot();
 

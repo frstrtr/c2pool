@@ -98,6 +98,15 @@
 // carriers flow both directions over one socket (node A's win reaches node B,
 // and B's win reaches A).
 //
+// ── ★ ADDRESS POLICY (opt-in; off until set) ───────────────────────────────
+// Every connection carries the address key of its remote end (net_addr_ban.hpp:
+// IPv4 address or IPv6 /64; 127.0.0.1 and ::1 have none). set_inbound_limits()
+// caps accepted connections in total and per address; ban() / ban_key() ban an
+// address for a duration and drop every live connection from it. A connection
+// from a banned address or over a limit is closed at accept, before it gets a
+// PeerId or a reader, and a banned address is not dialed. With no limit set and
+// no ban made, behaviour is unchanged.
+//
 // PORTABILITY: POSIX sockets + std::thread only (Linux/macOS). No Boost, so it
 // links into the stdlib-only v37 test harness and needs no io_context. The
 // daemon runs it on its own threads, independent of its Boost.Asio ioc.
@@ -130,6 +139,7 @@
 #include <vector>
 
 #include "w3_relay.hpp"   // ICarrierTransport
+#include "net_addr_ban.hpp"   // address keys + ban table (ADDRESS POLICY)
 
 namespace c2pool::v37n {
 
@@ -363,6 +373,13 @@ public:
         a.sin_family = AF_INET;
         a.sin_port = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { ::close(fd); return 0; }
+        const net::AddrKey key = net::addr_key_of(reinterpret_cast<const sockaddr*>(&a));
+        if (key && m_bans.banned(key, now())) {   // ADDRESS POLICY: a banned address is not dialed
+            m_dial_refused_banned.fetch_add(1, std::memory_order_relaxed);
+            ::close(fd);
+            return 0;
+        }
+        if (!bind_dial_source(fd)) { ::close(fd); return 0; }
         const long ctmo = m_connect_timeout_ms.load();
         if (ctmo > 0) {
             timeval tv{};
@@ -375,7 +392,7 @@ public:
             timeval zero{};
             ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
         }
-        return add_established(fd);
+        return add_established(fd, /*inbound=*/false, key);
     }
 
     // GAP-2: drop ONE connection on purpose (a protocol refusal: HELLO
@@ -411,6 +428,86 @@ public:
     }
     static constexpr int kDisconnectFlushMs = 500;
 
+    // ── ★ ADDRESS POLICY (see the header note) ──────────────────────────────
+    // max_inbound: accepted connections live at once; max_per_addr: accepted
+    // connections live at once from one address key. 0 = no limit (default).
+    // Set before listen().
+    void set_inbound_limits(std::size_t max_inbound, std::size_t max_per_addr) {
+        m_max_inbound.store(max_inbound);
+        m_max_per_addr.store(max_per_addr);
+    }
+    // Ban the address of live connection `id` for `dur` and drop every live
+    // connection from that address. Returns the banned key; 0 = the connection
+    // is gone or has no address key (127.0.0.1, ::1), in which case only that
+    // connection is dropped.
+    net::AddrKey ban(PeerId id, std::chrono::seconds dur) {
+        net::AddrKey key = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            auto it = m_conns.find(id);
+            if (it == m_conns.end()) return 0;
+            key = it->second->addr;
+        }
+        if (!key) { disconnect(id); return 0; }
+        ban_key(key, dur);
+        return key;
+    }
+    // Ban address `key` for `dur` (a longer ban already in place is kept) and
+    // drop every live connection from it. false for key 0.
+    bool ban_key(net::AddrKey key, std::chrono::seconds dur) {
+        const auto t = now();
+        if (!m_bans.ban(key, t, t + dur)) return false;
+        m_addr_bans.fetch_add(1, std::memory_order_relaxed);
+        std::vector<std::shared_ptr<Conn>> live;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            for (const auto& [id, c] : m_conns) { (void)id; if (c->addr == key) live.push_back(c); }
+        }
+        for (auto& c : live) drop_conn(c, /*hard=*/true, /*slow=*/false);
+        return true;
+    }
+    bool is_banned_key(net::AddrKey key) { return m_bans.banned(key, now()); }
+    // Address key of a live connection (0 = gone / none).
+    net::AddrKey addr_key(PeerId id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto it = m_conns.find(id);
+        return it == m_conns.end() ? 0 : it->second->addr;
+    }
+    // Did we accept this live connection (false: dialed, or gone)?
+    bool is_inbound(PeerId id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        auto it = m_conns.find(id);
+        return it != m_conns.end() && it->second->inbound;
+    }
+    // Live connections (either direction) from address `key`.
+    std::size_t conns_from(net::AddrKey key) const {
+        if (!key) return 0;
+        std::lock_guard<std::mutex> lk(m_mtx);
+        std::size_t n = 0;
+        for (const auto& [id, c] : m_conns) { (void)id; if (c->addr == key) ++n; }
+        return n;
+    }
+    std::size_t n_inbound() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        std::size_t n = 0;
+        for (const auto& [id, c] : m_conns) { (void)id; if (c->inbound) ++n; }
+        return n;
+    }
+    // Dial from this local IPv4 address ("" = the kernel's choice, the default).
+    // Set before dialing.
+    void set_dial_source(const std::string& ip) { m_dial_src = ip; }
+    // The clock bans are measured on (default std::chrono::steady_clock).
+    // Test seam; set before listen() and before dialing.
+    using NowFn = std::function<std::chrono::steady_clock::time_point()>;
+    void set_now_fn(NowFn f) { m_now_fn = std::move(f); }
+    // Accepted connections closed at once: banned address / total inbound cap /
+    // per-address cap. Dials refused because the address is banned. Bans made.
+    std::uint64_t refused_banned() const { return m_refused_banned.load(); }
+    std::uint64_t refused_inbound_cap() const { return m_refused_in_cap.load(); }
+    std::uint64_t refused_addr_cap() const { return m_refused_addr_cap.load(); }
+    std::uint64_t dial_refused_banned() const { return m_dial_refused_banned.load(); }
+    std::uint64_t addr_bans() const { return m_addr_bans.load(); }
+
     // Dial a peer (the --peer path). Returns true if the connection was
     // established and added as a full duplex peer. Safe to call before or after
     // listen(); a failed dial is a no-op the caller may retry.
@@ -422,7 +519,7 @@ public:
         a.sin_port = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { ::close(fd); return false; }
         if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { ::close(fd); return false; }
-        add_established(fd);
+        add_established(fd, /*inbound=*/false, net::addr_key_of(reinterpret_cast<const sockaddr*>(&a)));
         return true;
     }
 
@@ -546,6 +643,8 @@ private:
     struct Conn {
         int fd = -1;
         PeerId pid = 0;
+        bool inbound = false;     // ADDRESS POLICY: accepted (true) or dialed
+        net::AddrKey addr = 0;    // ADDRESS POLICY: remote address key (0 = none)
         std::mutex wmtx;
         std::mutex fmtx;
         bool closed = false;
@@ -582,12 +681,21 @@ private:
         auto last_log = std::chrono::steady_clock::time_point{};
         std::uint64_t suppressed = 0;
         while (m_running.load()) {
-            int cfd = ::accept(lfd, nullptr, nullptr);
+            sockaddr_storage ss{};
+            socklen_t sl = sizeof(ss);
+            int cfd = ::accept(lfd, reinterpret_cast<sockaddr*>(&ss), &sl);
             if (cfd >= 0) {
                 if (backoff_ms && m_log)
                     m_log("carrier-net: accept recovered (descriptors available again)");
                 backoff_ms = 0; suppressed = 0;
-                add_established(cfd);
+                const net::AddrKey key = net::addr_key_of(reinterpret_cast<const sockaddr*>(&ss));
+                if (key && m_bans.banned(key, now())) {   // ADDRESS POLICY: refused before it is a peer
+                    ::close(cfd);
+                    m_refused_banned.fetch_add(1, std::memory_order_relaxed);
+                    note_refusal("banned address", key);
+                    continue;
+                }
+                add_established(cfd, /*inbound=*/true, key);
                 continue;
             }
             const int e = errno;
@@ -614,7 +722,7 @@ private:
         }
     }
 
-    PeerId add_established(int fd) {
+    PeerId add_established(int fd, bool inbound = false, net::AddrKey key = 0) {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         // ★ BOUND THE WRITE (c2pool#1655 Defect-B). Without this a peer that
@@ -631,6 +739,31 @@ private:
         bool established = false;
         PeerId pid = 0;
         std::list<Reader> finished;
+        int refused = 0;   // ADDRESS POLICY: 1 = total inbound cap, 2 = per-address cap
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (!m_running.load()) { ::close(fd); return 0; }   // stopping: never orphan a reader
+            if (inbound) {
+                const std::size_t max_in = m_max_inbound.load(), max_addr = m_max_per_addr.load();
+                if (max_in || (key && max_addr)) {
+                    std::size_t n_in = 0, n_addr = 0;
+                    for (const auto& [id, c] : m_conns) {
+                        (void)id;
+                        if (!c->inbound) continue;
+                        ++n_in;
+                        if (key && c->addr == key) ++n_addr;
+                    }
+                    if (max_in && n_in >= max_in) refused = 1;
+                    else if (key && max_addr && n_addr >= max_addr) refused = 2;
+                }
+            }
+        }
+        if (refused) {
+            ::close(fd);
+            (refused == 1 ? m_refused_in_cap : m_refused_addr_cap).fetch_add(1, std::memory_order_relaxed);
+            note_refusal(refused == 1 ? "inbound connection cap" : "per-address connection cap", key);
+            return 0;
+        }
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             if (!m_running.load()) { ::close(fd); return 0; }   // stopping: never orphan a reader
@@ -645,7 +778,7 @@ private:
             }
             pid = ++m_next_peer_id;
             auto c = std::make_shared<Conn>();
-            c->fd = fd; c->pid = pid;
+            c->fd = fd; c->pid = pid; c->inbound = inbound; c->addr = key;
             if (m_sendq_max.load() > 0) {   // RELAY-SEND-QUEUE: writer first, so the reader can always join it
                 c->async = true;
                 c->writer = std::thread([this, c] { writer_loop(c); });
@@ -830,6 +963,38 @@ private:
         return true;
     }
 
+    // ── ADDRESS POLICY helpers ──────────────────────────────────────────────
+    std::chrono::steady_clock::time_point now() const {
+        const NowFn& f = m_now_fn;
+        return f ? f() : std::chrono::steady_clock::now();
+    }
+    bool bind_dial_source(int fd) const {
+        if (m_dial_src.empty()) return true;
+        sockaddr_in s{};
+        s.sin_family = AF_INET;
+        s.sin_port = 0;
+        if (::inet_pton(AF_INET, m_dial_src.c_str(), &s.sin_addr) != 1) return false;
+        return ::bind(fd, reinterpret_cast<sockaddr*>(&s), sizeof(s)) == 0;
+    }
+    // One log line per 5 s at most for refused connections (counted always).
+    void note_refusal(const char* why, net::AddrKey key) {
+        if (!m_log) return;
+        std::uint64_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_refusal_log_mtx);
+            const auto t = std::chrono::steady_clock::now();
+            if (m_refusal_logged != std::chrono::steady_clock::time_point{} && t - m_refusal_logged < std::chrono::seconds(5)) {
+                ++m_refusal_suppressed;
+                return;
+            }
+            m_refusal_logged = t;
+            n = m_refusal_suppressed;
+            m_refusal_suppressed = 0;
+        }
+        m_log(std::string("carrier-net: connection from ") + net::addr_key_str(key) + " refused (" + why + "; " +
+              std::to_string(n) + " more refusal(s) since the last notice)");
+    }
+
     static bool send_all(int fd, const void* buf, std::size_t n) {
         const std::uint8_t* p = static_cast<const std::uint8_t*>(buf);
         std::size_t off = 0;
@@ -873,6 +1038,17 @@ private:
     // of our threads indefinitely. 0 => block forever (pre-Stage-1 behaviour).
     std::atomic<long>         m_send_timeout_ms{10000};
     std::atomic<long>         m_connect_timeout_ms{0};   // RELAY-DISCOVERY (0 = unbounded, unchanged)
+    // ADDRESS POLICY (all off by default)
+    std::atomic<std::size_t>   m_max_inbound{0};
+    std::atomic<std::size_t>   m_max_per_addr{0};
+    net::AddrBanTable          m_bans;
+    NowFn                      m_now_fn;
+    std::string                m_dial_src;
+    std::atomic<std::uint64_t> m_refused_banned{0}, m_refused_in_cap{0}, m_refused_addr_cap{0};
+    std::atomic<std::uint64_t> m_dial_refused_banned{0}, m_addr_bans{0};
+    std::mutex                 m_refusal_log_mtx;
+    std::chrono::steady_clock::time_point m_refusal_logged{};
+    std::uint64_t              m_refusal_suppressed = 0;
     int                       m_listen_fd = -1;
     std::uint16_t             m_listen_port = 0;
     // The node is "running" for its whole lifetime (construction -> stop()),

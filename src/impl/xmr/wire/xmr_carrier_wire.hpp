@@ -130,18 +130,20 @@ public:
     std::size_t consumed()  const { return i_; }
     bool        eof()       const { return i_ >= n_; }
 
+    // Peer data: every bound is "need > n_ - i_" (i_ <= n_ always holds),
+    // never "i_ + need > n_", which a length near SIZE_MAX would wrap.
     u8 u8_() {
-        if (i_ + 1 > n_) throw WireError("wire: short read (u8)");
+        if (n_ - i_ < 1) throw WireError("wire: short read (u8)");
         return p_[i_++];
     }
     u32 u32_() {
-        if (i_ + 4 > n_) throw WireError("wire: short read (u32)");
+        if (n_ - i_ < 4) throw WireError("wire: short read (u32)");
         u32 v = 0;
         for (int k = 0; k < 4; ++k) v |= u32(p_[i_++]) << (8 * k);
         return v;
     }
     u64 u64_() {
-        if (i_ + 8 > n_) throw WireError("wire: short read (u64)");
+        if (n_ - i_ < 8) throw WireError("wire: short read (u64)");
         u64 v = 0;
         for (int k = 0; k < 8; ++k) v |= u64(p_[i_++]) << (8 * k);
         return v;
@@ -159,13 +161,13 @@ public:
     // Read exactly n bytes, but reject n above `sanity` BEFORE allocating.
     std::vector<u8> bytes_(std::size_t n, std::size_t sanity, const char* what) {
         if (n > sanity)   throw WireError(std::string("wire: ") + what + " over sanity cap");
-        if (i_ + n > n_)  throw WireError(std::string("wire: short read (") + what + ")");
+        if (n > n_ - i_)  throw WireError(std::string("wire: short read (") + what + ")");
         std::vector<u8> b(p_ + i_, p_ + i_ + n);
         i_ += n;
         return b;
     }
     void fixed_(u8* dst, std::size_t n, const char* what) {
-        if (i_ + n > n_) throw WireError(std::string("wire: short read (") + what + ")");
+        if (n > n_ - i_) throw WireError(std::string("wire: short read (") + what + ")");
         for (std::size_t k = 0; k < n; ++k) dst[k] = p_[i_++];
     }
 private:

@@ -298,6 +298,11 @@ public:
     // learns the node's fees from the protocol before it mines. Call before
     // serving. Empty (default) => no extra member.
     void set_login_extra(std::string json_members) { m_login_extra = std::move(json_members); }
+    // MINIMUM DIFFICULTY: a miner's "+diff" request below difficulty `d` is
+    // raised to `d`; the lane's own target (TemplateJob::lane_target) is never
+    // made harder. 0 (default) = no floor. Call before serving.
+    void set_min_difficulty(std::uint64_t d) { m_min_difficulty = d; }
+    std::uint64_t min_difficulty() const { return m_min_difficulty; }
 
 private:
     // Fill a JobNotify from a TemplateJob + a session's job bookkeeping.
@@ -310,6 +315,7 @@ private:
     std::atomic<std::uint32_t> m_extraNonce{0};
     JobBinder m_job_binder;   // SEAM-1 (unset = none)
     std::string m_login_extra;   // FEE DISCLOSURE (empty = none)
+    std::uint64_t m_min_difficulty = 0;   // MINIMUM DIFFICULTY (0 = none)
 };
 
 } // namespace stratum

@@ -32,15 +32,11 @@
 #include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
 #include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
 #include "impl/xmr/settle/xmr_drain_rule.hpp"   // THE DRAIN RULE: drain_rule_refusal
+#include "xmr_lane_constants.hpp"            // kXmrDropsFloorShift, kXmrTargetIntervalS
 
 namespace c2pool::v37n::xmr {
 
-// DROPS on the XMR lane: the raindrop floor is share_diff / 2^6 (the job
-// difficulty the node serves every miner), and the lane credits every hash
-// below it at the floor's work (SubthresholdGate mode 2, Count). One constant
-// for both, so the floor the relay admits and the floor the estimator prices
-// cannot drift apart.
-inline constexpr std::uint32_t kXmrDropsFloorShift = 6;
+// kXmrDropsFloorShift (k) and kXmrTargetIntervalS (T): xmr_lane_constants.hpp.
 // DROPS WINDOW (A4b): log2 of one share's work in the estimator unit (== drops::kXmrDropsLz).
 inline constexpr unsigned kXmrDropsWorkLz = 32;
 inline constexpr std::uint32_t kXmrCreditModeCount = 2;

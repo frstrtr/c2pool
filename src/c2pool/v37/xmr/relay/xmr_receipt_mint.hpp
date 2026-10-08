@@ -36,20 +36,26 @@
 // ===========================================================================
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "xmr_relay_wire.hpp"
 #include "impl/xmr/receipt/xmr_receipt_verify.hpp"   // build_coinbase_opening / verify_crypto_opening / parse_*
 #include "impl/xmr/coin/xmr_blob.hpp"                // tx_prefix_hash / coinbase_tx_hash / tree_root / make_coinbase_branch
+#include "impl/xmr/coin/xmr_check_hash.hpp"          // check_hash (Monero's 128-bit difficulty test)
 
 namespace c2pool::v37n::xmr::relay {
 
 // ── a minimal Monero block walker (no dependency on the template layer) ─────
 struct BlockLayout {
+    std::uint64_t major_version = 0;      // header varints
+    std::uint64_t timestamp = 0;
     std::size_t header_size = 0;          // through the nonce
     std::size_t nonce_offset = 0;
     bytes32     prev_id{};
@@ -75,12 +81,15 @@ inline bool rd_varint(const std::vector<u8>& b, std::size_t& p, std::uint64_t& v
 }
 } // namespace detail
 
+// Peer data (FB_CTX): every bound is "len > size - p" with p <= size
+// (rd_varint never moves p past the end), never "p + len > size", which a
+// varint length near 2^64 would wrap.
 inline bool parse_block_layout(const std::vector<u8>& b, BlockLayout& L, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
     std::size_t p = 0; std::uint64_t v = 0;
-    if (!detail::rd_varint(b, p, v) || !detail::rd_varint(b, p, v) || !detail::rd_varint(b, p, v))
+    if (!detail::rd_varint(b, p, L.major_version) || !detail::rd_varint(b, p, v) || !detail::rd_varint(b, p, L.timestamp))
         return bad("block: header varints");
-    if (p + 32 + 4 > b.size()) return bad("block: short header");
+    if (b.size() - p < 32 + 4) return bad("block: short header");
     std::memcpy(L.prev_id.data(), b.data() + p, 32); p += 32;
     L.nonce_offset = p; p += 4;
     L.header_size = p;
@@ -97,10 +106,10 @@ inline bool parse_block_layout(const std::vector<u8>& b, BlockLayout& L, std::st
         if (!detail::rd_varint(b, p, amt) || p >= b.size()) return bad("miner_tx: vout amount");
         const u8 t = b[p++];
         const std::size_t k = (t == 0x03) ? 33u : (t == 0x02 ? 32u : 0u);
-        if (!k || p + k > b.size()) return bad("miner_tx: vout target");
+        if (!k || b.size() - p < k) return bad("miner_tx: vout target");
         p += k;
     }
-    if (!detail::rd_varint(b, p, xlen) || p + xlen > b.size()) return bad("miner_tx: extra");
+    if (!detail::rd_varint(b, p, xlen) || xlen > b.size() - p) return bad("miner_tx: extra");
     p += static_cast<std::size_t>(xlen);
     L.extra_size = static_cast<std::size_t>(xlen);
     L.prefix_size = p - L.miner_tx_offset;
@@ -108,7 +117,7 @@ inline bool parse_block_layout(const std::vector<u8>& b, BlockLayout& L, std::st
     ++p;
     L.miner_tx_size = p - L.miner_tx_offset;
     std::uint64_t ntx = 0;
-    if (!detail::rd_varint(b, p, ntx) || ntx > 65536 || p + ntx * 32 != b.size()) return bad("block: tx hash list");
+    if (!detail::rd_varint(b, p, ntx) || ntx > 65536 || b.size() - p != ntx * 32) return bad("block: tx hash list");
     L.tx_hashes.resize(static_cast<std::size_t>(ntx));
     for (std::size_t i = 0; i < ntx; ++i) { std::memcpy(L.tx_hashes[i].data(), b.data() + p, 32); p += 32; }
     return true;
@@ -127,11 +136,16 @@ inline bytes32 from_h(const ::xmr::coin::Hash256& h) { bytes32 b; std::memcpy(b.
 // be `want` -- so a peer cannot hand us a block other than the one asked for,
 // nor a coinbase height other than the one that block commits to. The CALLER
 // then requires `parent` to be a block it already knows at exactly `height`
-// (the chain link) and takes the RandomX seed from its OWN chain.
+// (the chain link) and takes the RandomX seed from its OWN chain. The bytes
+// alone say nothing about WORK: before the block may influence admission the
+// caller also runs judge_block_ctx() below.
 struct BlockCtx {
     bytes32       id{};
     bytes32       parent{};
     std::uint64_t height = 0;   // the block's own height (txin_gen); receipts on it are bin height + 1
+    std::uint64_t timestamp = 0;
+    std::uint64_t major_version = 0;
+    std::vector<u8> hashing_blob;   // header | tree_root | varint(n+1): the RandomX input
 };
 inline bool verify_block_ctx(const bytes32& want, const std::vector<u8>& blob, BlockCtx& out, std::string* why = nullptr) {
     auto bad = [&](const std::string& m) { if (why) *why = "ctx: " + m; return false; };
@@ -152,7 +166,112 @@ inline bool verify_block_ctx(const bytes32& want, const std::vector<u8>& blob, B
     const bytes32 id = keccak_bytes(pre);
     if (id != want) return bad("block id of the served blob != the id asked for");
     out.id = id; out.parent = L.prev_id; out.height = L.height;
+    out.timestamp = L.timestamp; out.major_version = L.major_version;
+    out.hashing_blob = std::move(hb);
     return true;
+}
+
+// ── the WORK behind a context block (judge_block_ctx) ───────────────────────
+// A context block is used only if
+//   (a) the node's own verified Monero chain index holds it, or
+//   (b) its proof of work meets the difficulty its parent implies in that
+//       index -- the parent held by the index, or itself verified this way --
+//       at most `max_depth` unknown blocks above the index.
+// The bound comes from the tip-freshness rule (a receipt's template is at most
+// 2 Monero heights past its tip), so a depth of 2 suffices for admission;
+// anything deeper waits for the node's own Monero sync.
+//
+// Verdicts follow the carrier rule (impl/xmr/native/relay/xmr_found_block_
+// carrier.hpp): a hash BELOW the difficulty is forged (the sender is banned);
+// every "we cannot judge it now" -- an unknown or too-deep parent, a window
+// or seed the index cannot supply, a verifier that cannot hash -- defers and
+// never bans.
+struct CtxStep {                // one block verified by (b): what the next window needs
+    std::uint64_t timestamp = 0;
+    std::uint64_t diff_lo = 0, diff_hi = 0;
+};
+struct CtxTarget {              // what the index says the next block must meet
+    std::uint64_t diff_lo = 0, diff_hi = 0;
+    std::uint64_t height = 0;
+    bytes32       seed{};
+};
+// The node's own verified chain index, as the relay sees it (main binds it to
+// the native node's index; a KAT binds a model).
+struct CtxChainSource {
+    // the index holds `id` verified (a best-chain row or a verified alternative)
+    std::function<bool(const bytes32& id)> verified;
+    // difficulty / height / seed of the block after `anchor` (held verified)
+    // extended by `above` (oldest first); false + why = cannot judge it now
+    std::function<bool(const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t major_version,
+                       CtxTarget& out, std::string& why)> target;
+    explicit operator bool() const noexcept { return static_cast<bool>(verified) && static_cast<bool>(target); }
+};
+struct CtxPowRec {              // a block this node verified by (b)
+    bytes32 parent{};
+    CtxStep step{};
+};
+enum class CtxPow : u8 { Indexed = 0, Accept, Defer, Forged };
+inline const char* to_string(CtxPow k) {
+    switch (k) {
+        case CtxPow::Indexed: return "indexed";
+        case CtxPow::Accept:  return "pow-verified";
+        case CtxPow::Defer:   return "deferred";
+        case CtxPow::Forged:  return "forged";
+    }
+    return "?";
+}
+struct CtxPowVerdict {
+    CtxPow        kind = CtxPow::Defer;
+    std::size_t   depth = 0;    // unknown blocks above the index, this one included (0 = indexed)
+    CtxStep       step{};       // set on Accept: remember it for a child's window
+    std::string   why;
+    bool usable() const { return kind == CtxPow::Indexed || kind == CtxPow::Accept; }
+    bool ban() const { return kind == CtxPow::Forged; }
+};
+using CtxHashFn  = std::function<bool(const std::vector<u8>& hashing_blob, const bytes32& seed, bytes32& pow)>;
+using CtxRecFn   = std::function<std::optional<CtxPowRec>(const bytes32& id)>;
+
+inline CtxPowVerdict judge_block_ctx(const BlockCtx& b, const CtxChainSource& src, const CtxRecFn& rec_of,
+                                     std::uint32_t max_depth, const CtxHashFn& rx) {
+    CtxPowVerdict v;
+    auto defer = [&](std::string m) { v.kind = CtxPow::Defer; v.why = std::move(m); return v; };
+    if (!src) return defer("no chain index to judge it against");
+    if (src.verified(b.id)) { v.kind = CtxPow::Indexed; v.why = "held by our own chain index"; return v; }
+    // walk down to the index through blocks verified here by (b)
+    std::vector<CtxStep> above;
+    bytes32 cur = b.parent;
+    while (!src.verified(cur)) {
+        const auto r = rec_of ? rec_of(cur) : std::nullopt;
+        if (!r) return defer("parent is neither in our chain index nor proof-of-work verified here");
+        above.push_back(r->step);
+        if (above.size() >= max_depth)
+            return defer("more than " + std::to_string(max_depth) + " unknown blocks above our chain index (waits for our own Monero sync)");
+        cur = r->parent;
+    }
+    std::reverse(above.begin(), above.end());
+    v.depth = above.size() + 1;
+    CtxTarget t; std::string why;
+    if (!src.target(cur, above, b.major_version, t, why)) return defer("cannot judge it now: " + why);
+    if (t.diff_lo == 0 && t.diff_hi == 0) return defer("the index answered no difficulty");
+    if (t.height != b.height) {   // the coinbase commits to its height; the index knows the parent's
+        v.kind = CtxPow::Forged;
+        v.why = "block claims height " + std::to_string(b.height) + " but its parent implies " + std::to_string(t.height);
+        return v;
+    }
+    if (!rx) return defer("no RandomX verifier");
+    bytes32 pow{};
+    if (!rx(b.hashing_blob, t.seed, pow)) return defer("RandomX could not hash it now");
+    if (!::xmr::coin::check_hash(detail::to_h(pow), t.diff_lo, t.diff_hi)) {
+        bytes32 pow2{};   // re-hash before blaming the sender (an unstable verifier must not ban)
+        if (!rx(b.hashing_blob, t.seed, pow2) || pow2 != pow) return defer("RandomX gave two different hashes");
+        v.kind = CtxPow::Forged;
+        v.why = "proof of work below the difficulty our chain index implies for it";
+        return v;
+    }
+    v.kind = CtxPow::Accept;
+    v.step = CtxStep{b.timestamp, t.diff_lo, t.diff_hi};
+    v.why = "proof of work meets the difficulty our chain index implies (depth " + std::to_string(v.depth) + ")";
+    return v;
 }
 
 // Build the receipt for one share. `hashing_blob` must be the blob served for

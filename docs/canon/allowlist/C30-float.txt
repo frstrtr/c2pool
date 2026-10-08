@@ -1,0 +1,7 @@
+# Canon rule C30 allowlist: reviewed float and double uses in the XMR lane
+# consensus core. Format: <path> <max count> <reason>. A new use, or one more
+# in a listed file, fails rule C30.
+#
+# Reviewed 2026-10-04 at frstrtr/c2pool master 65b90571a.
+
+src/c2pool/v37/xmr/xmr_fee_model.hpp 4 the double overloads give_author_u16(double) and pct_to_bp(double), kept for older callers and KATs; the node computes both values with the integer ExactPct path (main_v37_xmr.cpp:4189-4190)

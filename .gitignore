@@ -183,6 +183,9 @@ tools/dash/*
 # as its reproduction path, and a trust root nobody can regenerate is a trust
 # root nobody can review.
 !tools/xmr-anchor-gen/
+# Design canon drift checker -- tracked source: the canon-check CI job and
+# the daily drift cron run it against docs/canon/CANON.yaml.
+!tools/canon/
 tools/xmr-anchor-gen/*
 !tools/xmr-anchor-gen/xmr_anchor_gen.py
 # C4 template-parity capture -- tracked source, same reason again: the golden

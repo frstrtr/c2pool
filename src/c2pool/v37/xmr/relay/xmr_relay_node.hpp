@@ -79,8 +79,13 @@
 // verified from its bytes (verify_block_ctx: id recomputed, height from the
 // coinbase) and linked to a parent this node already knows AT that height
 // (recursively for a chain of up to ctx_max_depth unknown blocks); the seed is
-// taken from our own chain. The repair then (a) keeps its order while it
-// fetches, (b) re-asks idle missing frames with peer failover instead of
+// taken from our own chain. Before it is used, its WORK is checked
+// (judge_block_ctx, set_ctx_chain): our own verified Monero chain index holds
+// it, or its proof of work meets the difficulty its parent implies in that
+// index, at most ctx_max_depth (2) unknown blocks above it; a hash below that
+// difficulty bans the sender, anything we cannot judge yet waits. With no
+// index wired, peers are not asked and a peer-served context is never used.
+// The repair then (a) keeps its order while it fetches, (b) re-asks idle missing frames with peer failover instead of
 // discarding the order, (c) re-asks at once when the serving peer drops, and
 // (d) reports WHICH stage is stuck (repair_status) so a stall that does reach
 // the booking retry bound is refused with a loud, distinct reason.
@@ -179,6 +184,7 @@
 #include <c2pool/v37/frame_vault.hpp>
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
 #include "impl/xmr/coin/xmr_seedheight.hpp"
+#include "impl/xmr/pathb/pathb_params.hpp"   // kRuledLaneParams: the parked-list cap default
 #include "xmr_relay_wire.hpp"
 #include "xmr_relay_peerbook.hpp"   // RELAY-DISCOVERY
 #include "xmr_receipt_mint.hpp"
@@ -202,6 +208,8 @@
 // drops_fetch_slow_ms), drops_pin_forget(), the persisted raindrop store
 // (drops_persist_path, drops_persist(), drops_load()).
 #define C2POOL_XMR_DROPS_HARDEN 1
+// set_test_drop_pow_hook() / set_test_drop_stored_hook() / test_drop_held() / test_ingest() exist.
+#define C2POOL_XMR_RELAY_DROP_POW_HOOK 1
 
 namespace c2pool::v37n::xmr::relay {
 
@@ -299,8 +307,27 @@ struct RelayOptions {
     std::string listen_host = "127.0.0.1";
     u16         listen_port = 0;                  // 0 = an ephemeral port (tests), read back via listen_port()
     std::vector<std::pair<std::string, u16>> peers;
-    std::size_t max_peers = 8;
+    // Inbound links (accepted) and outbound links (dialed) are counted apart.
+    // max_inbound caps accepted links only (over it a connection is closed at
+    // accept), so an inbound link never takes one of the max_outbound slots
+    // below, and the node keeps dialing while it has fewer than max_outbound.
+    std::size_t max_inbound = 101;
+    // Per address (IPv4, IPv6 /64; 127.0.0.1 and ::1 exempt) at most
+    // max_inbound_per_addr accepted links at once; another is closed at accept.
+    std::size_t max_inbound_per_addr = 1;
+    // A peer the DoS budget bans (confirmed invalid PoW, strike score) is banned
+    // BY ADDRESS for ban_seconds: every link from it is dropped, it is refused
+    // at accept and not dialed until the ban ends (127.0.0.1 / ::1: the link is
+    // dropped, no address ban). The RandomX budget is per address too.
+    // Default ceil(n x N / G) s = ceil(113 x 1 / 4) = 29 s, with n = max_inbound
+    // + max_outbound, N = verify_threads, G = dos.global_refill
+    // (::c2pool::xmr::dos_ban_seconds); the daemon sets it the same way.
+    u32         ban_seconds = ::c2pool::xmr::dos_ban_seconds(::c2pool::xmr::kDosDefaultLinks,
+                                                             ::c2pool::xmr::kDosDefaultWorkers,
+                                                             ::c2pool::xmr::kDosDefaultGlobalRefill);
     u64         index_horizon = 64;               // blocks; older unsolicited receipts are dropped
+    // RandomX budget: DosPolicy{} = dos_policy_for(113 links, 1 worker, 4/s);
+    // the daemon sets dos_policy_for(max_inbound + max_outbound, verify_threads, G).
     ::c2pool::xmr::DosPolicy dos{};
     u32         solicited_credits = 256;
     u64         backfill_positions = 2048;
@@ -309,12 +336,17 @@ struct RelayOptions {
     ::c2pool::v37n::FrameVaultOptions vault{};
     u32         hello_timeout_ms = 10000;
     std::size_t verify_queue_max = 4096;
+    // O-P5 (the:ruling 23): parked verify items cap (objects). Overflow
+    // evicts the oldest (no penalty, no ban). Default open_bins x (1 + r_max)
+    // from the ruled lane params (the:K04, the:K08); --relay-parked-max overrides.
+    std::size_t parked_max = ::c2pool::xmr::pathb::kRuledLaneParams.open_bins
+                             * (1 + ::c2pool::xmr::pathb::kRuledLaneParams.r_max);
     // DROPS-VERIFY-SCALE: verify worker threads (each runs process(); the RxFn
     // may read verify_worker() to hash on its own VM). 1 = the pre-fix single
     // worker (the library default, every KAT byte-identical); the daemon passes
     // --relay-verify-threads (auto = clamp(cores/2, 2, 8) minus --mine threads).
     // Clamped to [1, kMaxVerifyThreads] at start(): up to N DoS tokens may be
-    // outstanding per peer, inside the per-peer burst (20).
+    // outstanding per source; the daemon sets the per-address burst to N.
     std::size_t verify_threads = 1;
     u32         unresolved_patience_ms = 30000;
     std::size_t cache_max = 65536;                // verified receipts kept (= the dedup set)
@@ -355,7 +387,10 @@ struct RelayOptions {
     u32         solicited_unresolved_patience_ms = 120000;   // a solicited receipt waits this long for its context
     u32         ctx_retry_ms = 2000;                         // re-ask an unanswered GETCTX (next peer) after this
     u32         ctx_max_rounds = 30;                         // rounds over every ready peer before a want is dropped
-    u32         ctx_max_depth = 8;                           // unknown blocks chained above a known parent
+    // Unknown blocks chained above our own chain index (2 = the tip-freshness
+    // bound: a template is never more than 2 Monero heights past its tip, so
+    // deeper waits for our own Monero sync).
+    u32         ctx_max_depth = 2;
     std::size_t ctx_want_max = 128;
     u32         repair_refetch_ms = 3000;                    // re-ask idle missing frames of a Fetching repair
     // ★ DROPS (gate ON only). 0 = OFF, the shipped default: a receipt below
@@ -397,7 +432,7 @@ struct RelayOptions {
     // fb_unknown, nothing is asked or dialed beyond `peers`); the daemon turns
     // it ON (--relay-discovery on, the CLI default).
     bool        discovery = false;
-    std::size_t max_outbound = 8;                 // dialed links (peers + learned) the node keeps up
+    std::size_t max_outbound = 12;                // dialed links (peers + learned) the node keeps up; dialing continues while below it
     // The SEED seam: addresses dialed as CANDIDATES at start (the built-in
     // bootstrap list feeds this; --relay-peer stays a permanent dial target).
     std::vector<std::pair<std::string, u16>> seeds;
@@ -438,6 +473,10 @@ struct RelayStats {
     std::atomic<u64> repair_refetch{0}, repair_evicted{0}, upgraded_solicited{0}, unresolved_solicited_dropped{0};
     std::atomic<u64> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0},
                      ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_req_dropped{0};
+    // context WORK (judge_block_ctx): held by our index / proof of work verified /
+    // waiting (cannot judge yet) / forged (sender banned) / a peer's context
+    // refused because no chain index is wired
+    std::atomic<u64> ctx_indexed{0}, ctx_pow_ok{0}, ctx_pow_deferred{0}, ctx_pow_forged{0}, ctx_unchecked{0};
     // ★ DROPS (gate ON only; all stay 0 with drops_floor_diff == 0)
     std::atomic<u64> drops_own{0}, drops_foreign{0}, drops_dup{0};
     std::atomic<u64> won_reoffered{0};   // ENROL-REPL: FB_BLOCK_WON frames re-offered on HELLO
@@ -485,6 +524,9 @@ struct RelayStats {
     // NODE-NONCE: HELLOs refused as our own nonce (both ends of a self-dial count),
     // dials / learns skipped as our own address, same-dialer duplicates left to the peer.
     std::atomic<u64> self_conn{0}, self_skipped{0}, dup_deferred{0};
+    // ADDRESS BANS: addresses banned; queued receipts of a banned source dropped
+    // before RandomX.
+    std::atomic<u64> addr_bans{0}, banned_src_dropped{0};
 };
 
 // ★ RAIN-BACKFILL: the composition's view of one interval range.
@@ -591,6 +633,7 @@ public:
         m_net.set_on_peer_event([this](PeerId p, bool up) { on_peer_event(p, up); });
         m_net.set_log([this](const std::string& s) { log("relay: " + s); });
         m_net.set_send_queue(m_o.send_queue_bytes);   // RELAY-SEND-QUEUE (0 = synchronous, legacy)
+        m_net.set_inbound_limits(m_o.max_inbound, m_o.max_inbound_per_addr);   // inbound caps, at accept
 
         if (m_o.listen) {
             if (!m_net.listen(m_o.listen_host, m_o.listen_port)) {
@@ -1286,6 +1329,7 @@ public:
     // A block blob for a wanted id, from a peer (FB_CTX) or our own monerod
     // (from == 0). Verified here; never trusted.
     void offer_ctx(const bytes32& id, const std::vector<u8>& blob, PeerId from) {
+        if (from && !m_ctx_chain && !blob.empty()) { m_st.ctx_unchecked++; return; }   // no index to check its work against
         {
             std::lock_guard<std::mutex> lk(m_cmtx);
             auto it = m_ctx_want.find(id);
@@ -1326,7 +1370,8 @@ public:
             "admitted own=%llu foreign=%llu solicited=%llu cache=%zu | flood=%llu reoffer=%llu backfill orders=%llu ids=%llu | "
             "won tx=%llu rx=%llu | repair start=%llu order_ok=%llu spine_mis=%llu peer_fail=%llu ids=%llu ready=%llu rejected=%llu open=%zu | "
             "fa_ignored=%llu fb_unknown=%llu malformed=%llu pre_hello=%llu | "
-            "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu | "
+            "ctx want=%zu wanted=%llu asked=%llu rx=%llu resolved=%llu bad=%llu unknown_rx=%llu gave_up=%llu served=%llu unknown_tx=%llu "
+            "indexed=%llu pow_ok=%llu pow_deferred=%llu forged=%llu unchecked=%llu | "
             "repair refetch=%llu evicted=%llu upgraded=%llu unresolved_solicited=%llu | pool-id tag_mismatch=%llu rules_mismatch=%llu | "
             "repair-horizon rearm=%llu prefix_ok=%llu prefix_unknown=%llu deep=%llu reoffer_unpushed=%llu | "
             "liveness keepalive=%ums silence=%ums ping tx=%llu rx=%llu pong tx=%llu rx=%llu silent_drops=%llu legacy=%llu rearm=%llu | "
@@ -1353,6 +1398,9 @@ public:
             (unsigned long long)s.ctx_rx.load(), (unsigned long long)s.ctx_resolved.load(), (unsigned long long)s.ctx_bad.load(),
             (unsigned long long)s.ctx_unknown_rx.load(), (unsigned long long)s.ctx_gave_up.load(),
             (unsigned long long)s.ctx_served.load(), (unsigned long long)s.ctx_unknown_tx.load(),
+            (unsigned long long)s.ctx_indexed.load(), (unsigned long long)s.ctx_pow_ok.load(),
+            (unsigned long long)s.ctx_pow_deferred.load(), (unsigned long long)s.ctx_pow_forged.load(),
+            (unsigned long long)s.ctx_unchecked.load(),
             (unsigned long long)s.repair_refetch.load(), (unsigned long long)s.repair_evicted.load(),
             (unsigned long long)s.upgraded_solicited.load(), (unsigned long long)s.unresolved_solicited_dropped.load(),
             (unsigned long long)s.hello_tag_mismatch.load(), (unsigned long long)s.hello_rules_mismatch.load(),
@@ -1392,15 +1440,52 @@ public:
     // check (test rigs). Set before start().
     using VerdictFn = std::function<int(const FbReceipt&, const ::v37::xmr::verify::ParsedBlob&, u64 coinbase_height, std::string& why)>;
     void set_share_verdict(VerdictFn f) { m_verdict = std::move(f); }
+    // The node's own verified Monero chain index, for the WORK behind a
+    // receipt context (judge_block_ctx). Unset: a context served by a peer is
+    // never used and peers are not asked (own sources only). Set before start().
+    void set_ctx_chain(CtxChainSource s) { m_ctx_chain = std::move(s); }
 
     // Test hook: disconnect one peer (the KAT's "B drops off the network").
     void drop_peer(PeerId p) { m_net.disconnect(p); }
+    // The relay's transport (ADDRESS BANS: ban table, refusal counters; tests).
+    ::c2pool::v37n::CarrierPeerNode& transport() { return m_net; }
     // Test hook: stop redialing (and drop) every dial target.
     void set_dialing(bool on) { m_dialing = on; }
     // Test hook (UP-GATE KAT): hold every connection-up event of this node for
     // `ms` before it is handled (0 = off), so a remote HELLO reaches this
     // node's reader BEFORE its own HELLO goes out -- deterministically.
     void set_test_up_delay_ms(u32 ms) { m_test_up_delay_ms = ms; }
+    // Test hook (O-P5 parked-list cap KAT): park a synthetic item carrying
+    // `id` with a far-future retry (the verify loop never re-queues it), then
+    // report the parked size. Overflow evicts the oldest (RelayStats::queue_dropped).
+    std::size_t test_park(const bytes32& id) {
+        Item it; it.id = id;
+        park(std::move(it), std::chrono::milliseconds(3600000));
+        return verify_parked_size();
+    }
+    // Test hook: is `id` currently parked?
+    bool test_parked_has(const bytes32& id) const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        for (const auto& p : m_parked) if (p.id == id) return true;
+        return false;
+    }
+    // Test hook (set before start()): called on the verify worker after a
+    // raindrop's PoW check, before admit_drop.
+    void set_test_drop_pow_hook(std::function<void(const bytes32&)> f) { m_test_drop_pow_hook = std::move(f); }
+    // Test hook (set before start()): called on the verify worker after a
+    // raindrop is stored and flooded, before it is queued for drain_drops().
+    void set_test_drop_stored_hook(std::function<void(const bytes32&)> f) { m_test_drop_stored_hook = std::move(f); }
+    // Test hook: drops_sync()'s held predicate for one id.
+    bool test_drop_held(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return drop_held_locked(id); }
+    // Test hook: queue one encoded receipt from `from` (on_receipts' per-receipt path).
+    bool test_ingest(const std::vector<u8>& raw, PeerId from) {
+        Item it;
+        if (!decode_fb_receipt(raw, it.r)) return false;
+        it.from = from; it.src = from; it.raw = raw; it.id = receipt_id(it.r);
+        if (m_o.drops_floor_diff && drop_wanted(it.id)) it.solicited = true;
+        enqueue(std::move(it));
+        return true;
+    }
     // Rig hook (SIGUSR1 in the daemon): a NETWORK PARTITION of `secs` seconds --
     // every relay connection is dropped, inbound connections are refused and
     // nothing is dialed until it ends; then the node redials and backfills.
@@ -1439,11 +1524,11 @@ public:
         const auto& s = m_st;
         char b[1024];
         std::snprintf(b, sizeof b,
-            "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu | dialed=%llu dial_ok=%llu learned=%llu | "
+            "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu/%zu | dialed=%llu dial_ok=%llu learned=%llu | "
             "getaddr tx=%llu rx=%llu throttled=%llu | addr tx=%llu rx=%llu unsolicited=%llu ignored=%llu | "
             "dup_dropped=%llu refused=%llu self=%llu saves=%llu expired=%llu | "
             "nonce=%016llx self_conn=%llu self_skipped=%llu self_book=%zu dup_deferred=%llu | peers=[",
-            m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in,
+            m_o.discovery ? "on" : "off", m_book.size(), m_book.good(), m_book.bad_size(), out, m_o.max_outbound, in, m_o.max_inbound,
             (unsigned long long)s.disc_dialed.load(), (unsigned long long)s.disc_dial_ok.load(), (unsigned long long)s.addr_learned.load(),
             (unsigned long long)s.getaddr_tx.load(), (unsigned long long)s.getaddr_rx.load(), (unsigned long long)s.getaddr_throttled.load(),
             (unsigned long long)s.addr_tx.load(), (unsigned long long)s.addr_rx.load(), (unsigned long long)s.addr_unsolicited.load(),
@@ -1483,6 +1568,10 @@ private:
         Clock::time_point getaddr_tx{}, getaddr_rx{};
         bool addr_pending = false;                  // a GETADDR of ours is unanswered on this link
         std::size_t addr_learned = 0;
+        // ADDRESS BANS: the DoS source of this link (its address key, or the
+        // link id for 127.0.0.1 / ::1) and its direction.
+        u64  src = 0;
+        bool inbound = false;
     };
     static constexpr u32 kLegacyProbes = 3;         // unanswered PINGs before a peer counts as pre-0x48
     struct Target {
@@ -1517,6 +1606,7 @@ private:
     }
     struct Item {
         PeerId from = 0;
+        u64 src = 0;               // ADDRESS BANS: DoS source of `from` (taken while the link was live)
         FbReceipt r;
         std::vector<u8> raw;
         bytes32 id{};
@@ -1591,6 +1681,7 @@ private:
         bool have_proof = false;
         BlockCtx proof{};
         PeerId proof_from = 0;
+        bool defer_noted = false;          // a deferred proof is counted + logged once
     };
     // ★ RAIN-BACKFILL: one peer's inventory of one interval range.
     struct InvKey {
@@ -1645,12 +1736,15 @@ private:
             open_up_gate(p);   // UP-GATE: whatever path the up event took, a waiting HELLO may go on
             return;
         }
+        u64 src = 0;
         {
             std::lock_guard<std::mutex> lk(m_pmtx);
+            auto it = m_peers.find(p);
+            if (it != m_peers.end()) src = it->second.src;
             m_peers.erase(p);
             m_up_done.erase(p);
         }
-        on_peer_down(p);
+        on_peer_down(p, src ? src : p);
     }
 
     // -- UP-GATE ---------------------------------------------------------------
@@ -1699,21 +1793,32 @@ private:
         if (m_partitioned.load()) { m_net.disconnect(p); return; }   // rig partition: refuse
         {
             bool over = false;
+            const u64 akey = m_net.addr_key(p);         // ADDRESS BANS (transport lock; never under m_pmtx)
+            const bool inbound = m_net.is_inbound(p);
             {
                 std::lock_guard<std::mutex> lk(m_pmtx);
                 PeerSt st{};
+                st.src = akey ? akey : p;
+                st.inbound = inbound;
                 // RELAY-DISCOVERY: a dial's up event runs on the dialing (maintenance)
                 // thread, before add_peer_id returns: this link is OUR dial of m_dial_*.
                 if (std::this_thread::get_id() == m_maint_tid.load()) { st.out_host = m_dial_host; st.out_port = m_dial_port; }
                 m_peers[p] = st;
-                over = m_peers.size() > m_o.max_peers;
+                // Only accepted links count against max_inbound (the transport
+                // already refuses at accept; this is the backstop). A dialed link
+                // is never refused here: inbound links cannot take outbound slots.
+                if (inbound) {
+                    std::size_t n_in = 0;
+                    for (const auto& [q, ps] : m_peers) { (void)q; if (ps.inbound) ++n_in; }
+                    over = n_in > m_o.max_inbound;
+                }
             }
             // RELAY-FD: the up event runs on the dialing/accepting thread AFTER
             // the connection's reader started. A peer that closes at once (a
             // partitioned node refusing us) can unwind that reader and fire the
             // DOWN event before this line ran; no second down event follows, so
             // the entry just made would be a ghost: never HELLO'd, re-counted
-            // as a HELLO timeout every tick, and counted against max_peers
+            // as a HELLO timeout every tick, and counted against max_inbound
             // forever -- enough of them and every new link is over_cap, so the
             // relay never heals. Re-check the transport after inserting: a down
             // event that lands after this check erases the entry itself.
@@ -1733,10 +1838,15 @@ private:
         }
     }
 
-    void on_peer_down(PeerId p) {
+    void on_peer_down(PeerId p, u64 src) {
         {
+            // ADDRESS BANS: a per-link source dies with its link; an address keeps
+            // its spent bucket / score after its last link (release()).
+            const bool addr = ::c2pool::v37n::net::is_addr_key(src);
+            const bool last = !addr || m_net.conns_from(src) == 0;
             std::lock_guard<std::mutex> lk(m_mtx);
-            m_dos.forget(static_cast<::c2pool::xmr::u32>(p));
+            if (!addr) m_dos.forget(src);
+            else if (last) m_dos.release(src, now_ns());
         }
         {
             std::lock_guard<std::mutex> lk(m_jmtx);
@@ -1980,21 +2090,17 @@ private:
 
     void on_receipts(PeerId p, const std::vector<u8>& f) {
         ReceiptsFrame rf; std::string why;
+        const u64 src = src_of(p);
         if (!decode_receipts_frame(f, rf, &why)) {
             m_st.malformed++;
-            std::lock_guard<std::mutex> lk(m_mtx);
-            m_last_reject = "frame: " + why;
-            if (m_dos.on_cheap_reject(static_cast<::c2pool::xmr::u32>(p)) == ::c2pool::xmr::Action::Ban) {
-                m_st.bans++;
-                ban_later(p);
-            }
+            strike_src(p, src, "frame: " + why);
             return;
         }
         if (rf.chain_id != m_o.chain) { m_st.wrong_chain++; return; }
         for (std::size_t i = 0; i < rf.receipts.size(); ++i) {
             m_st.rx_receipts++;
             Item it;
-            it.from = p; it.r = std::move(rf.receipts[i]); it.raw = std::move(rf.raw[i]);
+            it.from = p; it.src = src; it.r = std::move(rf.receipts[i]); it.raw = std::move(rf.raw[i]);
             it.id = receipt_id(it.r);
             if (m_o.drops_floor_diff && drop_wanted(it.id)) it.solicited = true;   // ★ RAIN-BACKFILL: a fetched raindrop
             enqueue(std::move(it));
@@ -2231,6 +2337,13 @@ private:
             }
             const auto par = m_chain.lookup(w.proof.parent);
             if (!par) {
+                // A parent our own index holds verified resolves from our own
+                // bodies; only blocks above the index count toward the bound.
+                const bool parent_indexed = m_ctx_chain && m_ctx_chain.verified(w.proof.parent);
+                if (parent_indexed) {
+                    want_ctx(w.proof.parent, w.proof_from ? w.proof_from : w.from, w.depth);
+                    return;
+                }
                 if (w.depth + 1 >= m_o.ctx_max_depth) {
                     {
                         std::lock_guard<std::mutex> lk(m_cmtx);
@@ -2262,6 +2375,62 @@ private:
                     return;   // the proof is kept; retried by drive_ctx once the seed is noted
                 }
                 seed = *s;
+            }
+            // The WORK behind it, before it can influence admission.
+            if (m_ctx_chain) {
+                const CtxPowVerdict v = judge_block_ctx(
+                    w.proof, m_ctx_chain,
+                    [this](const bytes32& b) -> std::optional<CtxPowRec> {
+                        std::lock_guard<std::mutex> lk(m_cmtx);
+                        const auto it = m_ctx_pow.find(b);
+                        if (it == m_ctx_pow.end()) return std::nullopt;
+                        return it->second;
+                    },
+                    m_o.ctx_max_depth, m_rx);
+                const std::string src = w.proof_from ? "peer " + std::to_string(w.proof_from) : std::string("own source");
+                if (v.kind == CtxPow::Forged) {
+                    m_st.ctx_pow_forged++;
+                    {
+                        std::lock_guard<std::mutex> lk(m_cmtx);
+                        m_ctx_want.erase(id);
+                    }
+                    if (w.proof_from) {
+                        m_st.bans++;
+                        log("relay: context for " + hex_short(id) + " from " + src + " FORGED (" + v.why + "): peer BANNED");
+                        ban_later(w.proof_from);
+                    } else {
+                        log("relay: context for " + hex_short(id) + " from " + src + " REFUSED: " + v.why);
+                    }
+                    return;
+                }
+                if (v.kind == CtxPow::Defer) {
+                    bool first = false;
+                    {
+                        std::lock_guard<std::mutex> lk(m_cmtx);
+                        auto it = m_ctx_want.find(id);
+                        if (it != m_ctx_want.end() && !it->second.defer_noted) { it->second.defer_noted = true; first = true; }
+                    }
+                    if (first) {
+                        m_st.ctx_pow_deferred++;
+                        log("relay: context for " + hex_short(id) + " from " + src + " WAITS: " + v.why);
+                    }
+                    return;   // the proof is kept; drive_ctx retries it (never a penalty)
+                }
+                if (v.kind == CtxPow::Accept) {
+                    m_st.ctx_pow_ok++;
+                    std::lock_guard<std::mutex> lk(m_cmtx);
+                    if (m_ctx_pow.emplace(id, CtxPowRec{w.proof.parent, v.step}).second) {
+                        m_ctx_pow_order.push_back(id);
+                        while (m_ctx_pow_order.size() > kCtxPowKeep) { m_ctx_pow.erase(m_ctx_pow_order.front()); m_ctx_pow_order.pop_front(); }
+                    }
+                } else {
+                    m_st.ctx_indexed++;
+                }
+            } else if (w.proof_from) {
+                m_st.ctx_unchecked++;   // unreachable: offer_ctx refuses these; kept fail-closed
+                std::lock_guard<std::mutex> lk(m_cmtx);
+                m_ctx_want.erase(id);
+                return;
             }
             m_chain.note(id, bin, seed);
             m_st.ctx_resolved++;
@@ -2302,7 +2471,13 @@ private:
                     it = m_ctx_want.erase(it);
                     continue;
                 }
-                if (w.have_proof) { retry_proofs.push_back(it->first); ++it; continue; }
+                if (w.have_proof) {   // a deferred proof is retried at the ask pace, not every tick
+                    if (!w.defer_noted || now - w.last_ask >= std::chrono::milliseconds(m_o.ctx_retry_ms)) {
+                        if (w.defer_noted) w.last_ask = now;
+                        retry_proofs.push_back(it->first);
+                    }
+                    ++it; continue;
+                }
                 if (m_chain.lookup(it->first)) {   // RC-CTX: resolved meanwhile by the ChainView's feeder (native index / journal)
                     m_st.ctx_resolved++;
                     resolved_now.push_back(it->first);
@@ -2310,6 +2485,7 @@ private:
                     continue;
                 }
                 if (w.last_ask != Clock::time_point{} && now - w.last_ask < std::chrono::milliseconds(m_o.ctx_retry_ms)) { ++it; continue; }
+                if (!m_ctx_chain) { ++it; continue; }   // nothing to check a peer's block against: own sources only
                 PeerId pick = 0;
                 if (w.from && !w.asked.count(w.from) && std::find(ready.begin(), ready.end(), w.from) != ready.end()) pick = w.from;
                 for (PeerId p : ready) if (!pick && !w.asked.count(p)) pick = p;
@@ -2354,7 +2530,7 @@ private:
             if (it.solicited) {
                 auto upg = [&](std::deque<Item>& q) {
                     for (auto& x : q) if (x.id == it.id && !x.solicited) {
-                        x.solicited = true; x.from = it.from; x.enq = Clock::now(); x.not_before = Clock::now();
+                        x.solicited = true; x.from = it.from; x.src = it.src; x.enq = Clock::now(); x.not_before = Clock::now();
                         m_st.upgraded_solicited++;
                         return true;
                     }
@@ -2399,7 +2575,7 @@ private:
     void park(Item it, std::chrono::milliseconds delay) {
         std::lock_guard<std::mutex> lk(m_mtx);
         it.not_before = Clock::now() + delay;
-        if (m_parked.size() >= 1024) {
+        if (m_parked.size() >= m_o.parked_max) {
             m_inflight.erase(m_parked.front().id);
             m_parked.pop_front();
             m_st.queue_dropped++;
@@ -2417,10 +2593,14 @@ private:
             std::lock_guard<std::mutex> lk(m_mtx);
             if (m_cache.count(it.id)) { m_inflight.erase(it.id); m_st.dup++; return; }
         }
+        if (!it.src) it.src = it.from;
+        // ADDRESS BANS: a receipt queued by a source banned since is dropped here,
+        // never verified, never parked.
+        if (src_banned(it.src)) { m_st.banned_src_dropped++; forget_inflight(it.id); return; }
         // context: prev_id -> (bin, seed)
         ::v37::xmr::verify::ParsedBlob pb;
         if (!::v37::xmr::verify::parse_hashing_blob(it.r.receipt.hashing_blob, pb)) {
-            m_st.structural++; forget_inflight(it.id); strike(it.from, "hashing blob does not parse"); return;
+            m_st.structural++; forget_inflight(it.id); strike_src(it.from, it.src, "hashing blob does not parse"); return;
         }
         const auto ctx = m_chain.lookup(pb.prev_id);
         if (!ctx) {
@@ -2457,7 +2637,7 @@ private:
         const CheckResult cr = check_structural(it.r, cc);
         if (!cr.ok()) {
             m_st.structural++; forget_inflight(it.id);
-            strike(it.from, std::string("structural ") + to_string(cr.stage) + ": " + cr.why);
+            strike_src(it.from, it.src, std::string("structural ") + to_string(cr.stage) + ": " + cr.why);
             return;
         }
         // SHARE-LEVEL CANONICAL COINBASE: before RandomX (cheap, and a refused
@@ -2473,7 +2653,7 @@ private:
             if (v < 0) {
                 m_st.share_refused++; forget_inflight(it.id);
                 { std::lock_guard<std::mutex> lk(m_mtx); m_last_share_refused = "receipt " + hex_short(it.id) + ": " + vw; }
-                strike(it.from, "share coinbase not canonical: " + vw);
+                strike_src(it.from, it.src, "share coinbase not canonical: " + vw);
                 return;
             }
             if (v == 0) {
@@ -2487,8 +2667,8 @@ private:
                 m_st.share_undecided_trusted++;   // a repair answer: the winner's lane holds it (Ruling A)
             }
         }
-        // RandomX token
-        const auto p32 = static_cast<::c2pool::xmr::u32>(it.from);
+        // RandomX token (per DoS source: the address, or the link for 127.0.0.1 / ::1)
+        const u64 dos_src = it.src;
         bool granted = false;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
@@ -2496,7 +2676,7 @@ private:
                 refill_solicited_locked();
                 if (m_solicited >= 1.0) { m_solicited -= 1.0; granted = true; }
             } else {
-                granted = m_dos.grant_randomx(p32, now_ns());
+                granted = m_dos.grant_randomx(dos_src, now_ns());
             }
         }
         if (!granted) { m_st.rx_deferred++; park(std::move(it), std::chrono::milliseconds(500)); return; }
@@ -2505,7 +2685,7 @@ private:
         if (!m_rx || !m_rx(it.r.receipt.hashing_blob.bytes, ctx->seed, pow)) {
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
-                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());   // our fault: give the token back
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());   // our fault: give the token back
             }
             // DROPS-VERIFY-SCALE: the engine refuses while a switch keys the new
             // seed's cache (async_next_seed): park ONCE and retry instead of
@@ -2524,7 +2704,7 @@ private:
             m_st.rx_valid++;
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
-                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
             }
             admit(std::move(it), ctx->height);
             return;
@@ -2533,12 +2713,18 @@ private:
         // floor is a RAINDROP, not invalid PoW. With drops_floor_diff == 0 this
         // branch does not exist and the invalid path below is master's.
         if (m_o.drops_floor_diff && meets_share_diff(pow, m_o.drops_floor_diff)) {
+            bool fresh = false;
             {
                 std::lock_guard<std::mutex> lk(m_mtx);
-                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(p32, now_ns());
-                m_inflight.erase(it.id);
+                if (it.solicited) m_solicited += 1.0; else m_dos.on_valid_pow(dos_src, now_ns());
+                fresh = drop_note_new_locked(it.id);   // in m_drop_seen before it leaves m_inflight
+                if (!fresh) m_inflight.erase(it.id);
             }
+            if (m_test_drop_pow_hook) m_test_drop_pow_hook(it.id);
+            if (!fresh) { m_st.drops_dup++; return; }
+            const bytes32 id = it.id;
             admit_drop(std::move(it), ctx->height, pow);
+            forget_inflight(id);   // stored and queued for drain_drops(): held from here
             return;
         }
         // invalid: re-hash (the p2pool unstable-hardware guard) before any ban
@@ -2550,31 +2736,48 @@ private:
         ::c2pool::xmr::Action a;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
-            a = m_dos.on_invalid_pow(p32, confirmed);
+            a = m_dos.on_invalid_pow(dos_src, confirmed);
             m_inflight.erase(it.id);
             m_last_reject = "pow below share_diff from peer " + std::to_string(it.from) + (confirmed ? " (confirmed)" : " (unconfirmed)");
         }
         if (a == ::c2pool::xmr::Action::Ban) {
             m_st.bans++;
             log("relay: peer " + std::to_string(it.from) + " BANNED: confirmed invalid PoW (RandomX below the lane share difficulty)");
-            ban_later(it.from);
+            ban_later(it.from, it.src);
         }
     }
 
-    void strike(PeerId p, const std::string& why) {
+    void strike(PeerId p, const std::string& why) { strike_src(p, src_of(p), why); }
+    void strike_src(PeerId p, u64 src, const std::string& why) {
         ::c2pool::xmr::Action a;
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_last_reject = why;
-            a = m_dos.on_cheap_reject(static_cast<::c2pool::xmr::u32>(p));
+            a = m_dos.on_cheap_reject(src);
         }
-        if (a == ::c2pool::xmr::Action::Ban) { m_st.bans++; ban_later(p); }
+        if (a == ::c2pool::xmr::Action::Ban) { m_st.bans++; ban_later(p, src); }
     }
-    // Disconnect from the maintenance thread (never from inside a reader's own
-    // callback stack while it holds our locks).
-    void ban_later(PeerId p) {
+    // Ban (by address) / disconnect from the maintenance thread (never from
+    // inside a reader's own callback stack while it holds our locks). `src` is
+    // taken while the link is live, so a peer that hangs up first is still
+    // banned by address.
+    void ban_later(PeerId p) { ban_later(p, src_of(p)); }
+    void ban_later(PeerId p, u64 src) {
         std::lock_guard<std::mutex> lk(m_tmtx);
-        m_to_drop.push_back(p);
+        m_to_drop.emplace_back(p, src);
+    }
+    // ADDRESS BANS: the DoS source of a link (address key, or the link id).
+    u64 src_of(PeerId p) const {
+        std::lock_guard<std::mutex> lk(m_pmtx);
+        auto it = m_peers.find(p);
+        return (it != m_peers.end() && it->second.src) ? it->second.src : p;
+    }
+    bool src_banned(u64 src) {
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            if (m_dos.is_banned(src)) return true;
+        }
+        return ::c2pool::v37n::net::is_addr_key(src) && m_net.is_banned_key(src);
     }
 
     void refill_solicited_locked() {
@@ -2603,15 +2806,18 @@ private:
     // ★ DROPS: raindrop dedup (a bounded FIFO set, separate from the receipt
     // cache so a raindrop can never enter a lane order or a repair answer).
     bool drop_seen_locked(const bytes32& id) const { return m_drop_seen.count(id) != 0; }
-    bool drop_note_new(const bytes32& id) {
-        std::lock_guard<std::mutex> lk(m_mtx);
+    bool drop_note_new_locked(const bytes32& id) {
         if (!m_drop_seen.insert(id).second) return false;
         m_drop_order.push_back(id);
         while (m_drop_order.size() > m_o.drops_seen_max) { m_drop_seen.erase(m_drop_order.front()); m_drop_order.pop_front(); }
         return true;
     }
+    bool drop_note_new(const bytes32& id) {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return drop_note_new_locked(id);
+    }
+    // `it.id` is noted new by the caller (drop_note_new_locked).
     void admit_drop(Item it, u64 bin, const bytes32& pow) {
-        if (!drop_note_new(it.id)) { m_st.drops_dup++; return; }
         Admitted a;
         a.id = it.id; a.r = std::move(it.r); a.raw = std::move(it.raw); a.bin = bin; a.own = false;
         a.drop = true; a.pow = pow;
@@ -2619,6 +2825,7 @@ private:
         if (it.solicited && drop_unwant(a.id)) m_st.drops_backfilled++;   // ★ RAIN-BACKFILL
         drop_store_put(a.id, bin, a.raw, a.pow);
         flood(a.raw, it.from);
+        if (m_test_drop_stored_hook) m_test_drop_stored_hook(a.id);
         std::lock_guard<std::mutex> lk(m_amtx);
         m_drops.push_back(std::move(a));
     }
@@ -2642,11 +2849,13 @@ private:
             m_drop_dirty = true;
         }
     }
-    // held = admitted here (servable) or at least seen (dedup set): nothing to fetch
+    // held = admitted here (servable) or at least seen (dedup set), and not in
+    // m_inflight (verify or admission): nothing to fetch
     bool drop_held_locked(const bytes32& id) const {
-        if (m_drop_store_id.count(id)) return true;
+        const bool stored = m_drop_store_id.count(id) != 0;
         std::lock_guard<std::mutex> lk(m_mtx);
-        return m_drop_seen.count(id) != 0;
+        if (m_inflight.count(id)) return false;
+        return stored || m_drop_seen.count(id) != 0;
     }
     bool drop_wanted(const bytes32& id) const { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.count(id) != 0; }
     bool drop_unwant(const bytes32& id) { std::lock_guard<std::mutex> lk(m_dsmtx); return m_drop_want.erase(id) != 0; }
@@ -3208,8 +3417,9 @@ private:
     }
 
     void on_frames(PeerId p, const std::vector<VerifiedFrame>& v) {
+        const u64 src = src_of(p);   // ADDRESS BANS
         for (const auto& vf : v) {
-            Item it; it.from = p; it.solicited = true; it.raw = vf.frame;
+            Item it; it.from = p; it.src = src; it.solicited = true; it.raw = vf.frame;
             if (!decode_fb_receipt(vf.frame, it.r)) continue;   // unreachable: the id seam decoded it
             it.id = vf.id;
             enqueue(std::move(it));
@@ -3608,7 +3818,9 @@ private:
                 if (t.learned && !t.used) ++out;   // queued dials count toward the target
             }
         }
-        if (m_dialing.load() && !m_partitioned.load() && out < m_o.max_outbound && m_net.n_peers() < m_o.max_peers) {
+        // Dial while fewer than max_outbound links are ours, however many
+        // inbound links are up (they never count against this).
+        if (m_dialing.load() && !m_partitioned.load() && out < m_o.max_outbound) {
             const auto c = m_book.dial_candidates(m_o.max_outbound - out, now, skip);
             std::lock_guard<std::mutex> lk(m_tmtx);
             for (const auto& r : c) {
@@ -3632,13 +3844,33 @@ private:
         while (m_running.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             if (!m_running.load()) break;
-            // deferred drops (bans)
-            std::vector<PeerId> drops;
+            // deferred drops (bans): an address source is banned BY ADDRESS for
+            // ban_seconds (every link from it dropped, refused at accept, not
+            // dialed); its DoS state is reset for when the ban ends. A per-link
+            // source (127.0.0.1 / ::1) only loses that link.
+            std::vector<std::pair<PeerId, u64>> drops;
             {
                 std::lock_guard<std::mutex> lk(m_tmtx);
                 drops.swap(m_to_drop);
             }
-            for (PeerId p : drops) m_net.disconnect(p);
+            for (const auto& [p, src] : drops) {
+                const bool addr = ::c2pool::v37n::net::is_addr_key(src);
+                if (addr && m_o.ban_seconds) {
+                    const bool fresh = !m_net.is_banned_key(src);
+                    m_net.ban_key(src, std::chrono::seconds(m_o.ban_seconds));   // drops every link from src, p included
+                    if (fresh) {
+                        m_st.addr_bans++;
+                        log("relay: address " + ::c2pool::v37n::net::addr_key_str(src) + " (peer " + std::to_string(p) +
+                            ") BANNED for " + std::to_string(m_o.ban_seconds) + " s");
+                    }
+                } else {
+                    m_net.disconnect(p);
+                }
+                if (addr) {   // the ban table (or, with ban_seconds 0, nothing) holds the address now
+                    std::lock_guard<std::mutex> lk(m_mtx);
+                    m_dos.forget(src);
+                }
+            }
             // HELLO timeouts
             std::vector<PeerId> stale;
             {
@@ -3794,6 +4026,10 @@ private:
     mutable std::mutex m_cmtx;         // receipt-context wants + serve requests
     std::map<bytes32, CtxWant> m_ctx_want;
     std::deque<std::pair<PeerId, std::vector<bytes32>>> m_ctx_serve;
+    CtxChainSource m_ctx_chain;        // our own verified Monero chain index (set before start)
+    std::map<bytes32, CtxPowRec> m_ctx_pow;   // blocks verified here by proof of work (under m_cmtx)
+    std::deque<bytes32> m_ctx_pow_order;
+    static constexpr std::size_t kCtxPowKeep = 256;
 
     std::mutex m_amtx;               // admitted queue
     std::vector<Admitted> m_admitted;
@@ -3817,12 +4053,14 @@ private:
     std::set<PeerId> m_up_done;        // UP-GATE: links whose up event has been handled (m_pmtx)
     std::condition_variable m_up_cv;   // UP-GATE: signalled by open_up_gate
     std::atomic<u32> m_test_up_delay_ms{0};
+    std::function<void(const bytes32&)> m_test_drop_pow_hook;
+    std::function<void(const bytes32&)> m_test_drop_stored_hook;
     Clock::time_point m_live_tick = Clock::now();   // RELAY-LIVENESS (maintenance thread only)
     std::atomic<u64> m_ping_nonce{0};               // RELAY-LIVENESS (bumped by maintenance only; read by the won re-offer)
 
     std::mutex m_tmtx;                 // dial targets + deferred drops
     std::vector<Target> m_targets;
-    std::vector<PeerId> m_to_drop;
+    std::vector<std::pair<PeerId, u64>> m_to_drop;   // (link, DoS source) to ban / drop
     std::atomic<bool> m_dialing{true};
     std::atomic<bool> m_partitioned{false};
     std::atomic<Clock::rep> m_partition_until{0};

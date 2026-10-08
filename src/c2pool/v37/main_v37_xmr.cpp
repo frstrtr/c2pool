@@ -62,6 +62,7 @@
 // ===========================================================================
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <initializer_list>
@@ -243,13 +244,16 @@ static std::vector<std::string> g_drops_enrol;          // ★ DROPS: --drops-en
 static std::uint64_t g_drops_retain_bins = 0;           // ★ DROPS-HARDEN: --drops-retain-bins N (0 = the relay default 512)
 static bool g_drops_store_persist = true;              // ★ DROPS-HARDEN: --drops-store-persist on|off (lane<N>.drops)
 static std::uint64_t g_drops_enrol_min_tip = 0;         // ★ DROPS: --drops-enrol-min-tip H (DROPS-ENROL-TIDY: accepted, no effect -- enrolment is lane-derived)
-static std::size_t   g_relay_max_peers = 8;             // --relay-max-peers N
+static std::size_t   g_relay_max_inbound = 101;         // --relay-max-inbound N (accepted links; --relay-max-peers is an alias)
 static bool          g_relay_discovery = true;          // --relay-discovery on|off (FB_GETADDR/FB_ADDR + persistent peer book)
-static std::size_t   g_relay_max_outbound = 8;          // --relay-max-outbound N (dialed links kept up; peers + learned)
+static std::size_t   g_relay_max_outbound = 12;         // --relay-max-outbound N (dialed links kept up; peers + learned)
 static std::uint64_t g_relay_horizon = 64;              // --relay-index-horizon N (blocks)
-static std::string   g_relay_rx_budget = "1,20,16,256"; // --relay-rx-budget P,C,G,GC
+static std::string   g_relay_rx_budget;                 // --relay-rx-budget P,C,G,GC (P,C per address; empty = from the links, workers and --relay-rx-global)
+static std::uint32_t g_relay_rx_global = 4;             // --relay-rx-global G (RandomX tokens/s, global)
+static std::optional<std::uint32_t> g_relay_ban_seconds; // --relay-ban-seconds S (unset = ceil(n x C / G))
 static std::uint32_t g_relay_verify_threads = 0;       // --relay-verify-threads N (0 = auto; DROPS-VERIFY-SCALE)
 static std::uint32_t g_relay_solicited = 256;           // --relay-solicited-credits N
+static std::size_t   g_relay_parked_max = 0;            // --relay-parked-max N (0 = default open_bins x (1 + r_max))
 static std::uint64_t g_relay_backfill = 2048;           // --relay-backfill-positions N
 static std::uint32_t g_relay_reoffer_s = 60;            // --relay-reoffer-seconds S
 static std::uint32_t g_relay_keepalive_ms = 5000;       // --relay-keepalive-ms MS (0 = off; RELAY-LIVENESS)
@@ -267,6 +271,20 @@ static bool          g_relay_shadow_persist = true;     // --relay-shadow-persis
 static std::uint64_t g_relay_deep_probe_step = 64;      // --relay-deep-probe-step N
 static std::uint64_t g_relay_shadow_persist_bytes = 256ull << 20;   // --relay-shadow-persist-bytes N
 static std::uint32_t g_relay_partition_s = 0;           // --relay-test-partition-seconds S (rig: SIGUSR1 drops the relay for S s)
+// Stratum listener policy (unset = the StratumListenerOptions default).
+static std::optional<double>             g_stratum_share_rate;        // --stratum-share-rate R (fixed submit refill per connection, submits/s; pins the budget, disabling vardiff)
+static std::optional<std::uint32_t>      g_stratum_vardiff_shares;    // --stratum-vardiff-shares N (turns vardiff on; target shares per lane window)
+static std::optional<std::uint32_t>      g_stratum_submit_burst;      // --stratum-submit-burst N (also the per-connection queue bound)
+static std::optional<std::uint32_t>      g_stratum_ban_seconds;       // --stratum-ban-seconds S (unset = ceil(burst / submit refill))
+static std::optional<std::array<int, 4>> g_stratum_share_score;       // --stratum-share-score BAD,GOOD,BAN,CAP
+static std::optional<std::uint32_t>      g_stratum_login_timeout_ms;  // --stratum-login-timeout-ms MS (0 = off)
+
+// ceil(a / b) for a >= 0, b > 0; a quotient within 1e-9 of a whole number is that number.
+static std::uint32_t ceil_ratio(double a, double b) {
+    const double q = a / b;
+    const double r = std::round(q);
+    return static_cast<std::uint32_t>(std::fabs(q - r) <= 1e-9 * std::max(1.0, r) ? r : std::ceil(q));
+}
 // --test-crash-after-publish N (regtest rig only): the process exits (137, no cleanup) right after its
 // N-th found block was PUBLISHED and before its FOUND event reaches finalize-connect -- the window in
 // which an own win's registration (and its DROPS carried delta) used to live only in memory.
@@ -554,6 +572,9 @@ struct ServeHooks {
     // FEE DISCLOSURE: JSON members for every stratum login reply's `result`
     // ("c2pool":{fee_model, give_author_pct, node_owner_fee_pct}). Empty = none.
     std::string login_extra;
+    // NET-DOS: the stratum "+diff" floor is at least this (share_diff / 64,
+    // the raindrop floor). 0 = the listener default alone.
+    std::uint64_t stratum_min_diff = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -623,6 +644,30 @@ static int serve_and_run(const XmrNodeConfig& cfg, LiveMonerodTransport& transpo
     o2::StratumListenerOptions lo;
     lo.bind_host = cfg.stratum_bind_host;
     lo.bind_port = cfg.stratum_bind_port;
+    lo.min_difficulty = std::max(lo.min_difficulty, hooks.stratum_min_diff);   // NET-DOS
+    if (g_stratum_vardiff_shares) { lo.vardiff_shares_per_window = *g_stratum_vardiff_shares; lo.submit_vardiff = true; }   // vardiff on
+    if (g_stratum_share_rate) { lo.submit_rate = *g_stratum_share_rate; lo.submit_vardiff = false; }   // pin the budget, disable vardiff
+    if (g_stratum_submit_burst) {
+        lo.submit_burst = static_cast<double>(*g_stratum_submit_burst);
+        lo.max_pending_submits = *g_stratum_submit_burst;
+    }
+    if (g_stratum_ban_seconds) lo.ban_seconds = static_cast<int>(*g_stratum_ban_seconds);
+    else if (g_stratum_share_rate || g_stratum_submit_burst) lo.ban_seconds = static_cast<int>(ceil_ratio(lo.submit_burst, lo.submit_rate));
+    if (g_stratum_share_score) {
+        lo.bad_share_points = (*g_stratum_share_score)[0]; lo.good_share_points = (*g_stratum_share_score)[1];
+        lo.ban_score = (*g_stratum_share_score)[2];        lo.max_score = (*g_stratum_share_score)[3];
+    }
+    if (g_stratum_login_timeout_ms) lo.login_timeout_ms = static_cast<int>(*g_stratum_login_timeout_ms);
+    char rate_buf[96];
+    if (lo.submit_vardiff)
+        std::snprintf(rate_buf, sizeof rate_buf, "vardiff 2 x S_t (%u shares/window, floor %.2f/s)",
+                      lo.vardiff_shares_per_window, lo.submit_rate);
+    else
+        std::snprintf(rate_buf, sizeof rate_buf, "%.2f/s", lo.submit_rate);
+    std::printf("stratum: minimum requested difficulty %llu; submit budget %.0f burst + %s per connection "
+                "(queue %zu); share score bad %d good %+d ban at %d cap %d; login deadline %d ms; ban %d s by address\n",
+                static_cast<unsigned long long>(lo.min_difficulty), lo.submit_burst, rate_buf, lo.max_pending_submits,
+                lo.bad_share_points, lo.good_share_points, lo.ban_score, lo.max_score, lo.login_timeout_ms, lo.ban_seconds);
     o2::StratumListener listener(template_source, rx, sink, lo);
     if (hooks.extra_nonce_base) listener.seed_extra_nonce(*hooks.extra_nonce_base);   // GAP-2
     if (hooks.job_binder) listener.set_job_binder(hooks.job_binder);                     // SEAM-1
@@ -1639,6 +1684,15 @@ static int run_live(const XmrNodeConfig& cfg) {
         return 2;
     }
     if (!cfg.lane_params.fee.enabled) { g_give_author_pct = 0.0; g_give_author_exact = {0, 1, true}; }   // the 0.1 default is a fee-model-v1 default only
+    // Path B S2.3 #2: owner fee p + give_author_bp <= 10000 bp.
+    {
+        const std::uint32_t sum_bp = c2pool::v37n::xmr::fee::pct_to_bp(g_owner_fee_exact)
+                                     + c2pool::v37n::xmr::fee::pct_to_bp(g_give_author_exact);
+        if (sum_bp > 10000u) {
+            std::printf("REFUSED: --node-owner-fee-pct + --give-author-pct = %u bp, above 10000 bp\n", (unsigned)sum_bp);
+            return 2;
+        }
+    }
     // The banner names the daemon it will talk to. Under --native-solo there is
     // none -- no endpoint is wired anywhere (start_native_backend() withholds
     // it) -- so printing the default 18081 there would advertise a connection
@@ -4775,7 +4829,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                                 g_relay_discovery ? "discovery seeds (candidates; good after HELLO)"
                                                   : "permanent dial targets (--relay-discovery off)");
             }
-            ro.max_peers = g_relay_max_peers;
+            ro.max_inbound = g_relay_max_inbound;
             // RELAY-DISCOVERY: peer exchange + a persistent book per pool id + network
             // in the data dir. Relay-only: no coinbase / digest byte depends on it.
             std::string relay_book_path;
@@ -4801,13 +4855,15 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::printf("relay-disc: discovery OFF (--relay-discovery off): only --relay-peer is dialed, nothing persisted\n");
             }
             ro.index_horizon = g_relay_horizon;
-            {
-                double v[4] = {1, 20, 16, 256}; int k = 0; std::stringstream ss(g_relay_rx_budget); std::string tok;
+            std::optional<std::array<double, 4>> rx_budget;   // --relay-rx-budget P,C,G,GC (applied after the verify workers)
+            if (!g_relay_rx_budget.empty()) {
+                std::array<double, 4> v{}; int k = 0; std::stringstream ss(g_relay_rx_budget); std::string tok;
                 while (k < 4 && std::getline(ss, tok, ',')) { try { v[k++] = std::stod(tok); } catch (...) { k = -1; break; } }
-                if (k != 4) { std::printf("REFUSED: --relay-rx-budget wants P,C,G,GC (refill/s, cap per peer; refill/s, cap global)\n"); node.stop(); return 2; }
-                ro.dos.per_peer_refill = v[0]; ro.dos.per_peer_capacity = v[1]; ro.dos.global_refill = v[2]; ro.dos.global_capacity = v[3];
+                if (k != 4) { std::printf("REFUSED: --relay-rx-budget wants P,C,G,GC (refill/s, cap per address; refill/s, cap global)\n"); node.stop(); return 2; }
+                rx_budget = v;
             }
             ro.solicited_credits = g_relay_solicited;
+            if (g_relay_parked_max) ro.parked_max = g_relay_parked_max;
             ro.backfill_positions = g_relay_backfill;
             ro.reoffer_seconds = g_relay_reoffer_s;
             ro.keepalive_ms = g_relay_keepalive_ms;          // RELAY-LIVENESS
@@ -4854,6 +4910,24 @@ static int run_live(const XmrNodeConfig& cfg) {
                 std::printf("relay: verify threads=%zu (%s%s) worker VMs=%zu vm_rss~=%.1f MiB (shared seed caches, no extra 256 MiB)\n",
                             ro.verify_threads, autoN ? "auto" : "--relay-verify-threads",
                             got < want ? ", fewer VMs than wanted" : "", got, 2.2 * static_cast<double>(got));
+            }
+            {   // RandomX DoS budget and address ban: n = max_inbound + max_outbound links,
+                // C = verify workers, G = --relay-rx-global; --relay-rx-budget / --relay-ban-seconds override.
+                const std::size_t links = ro.max_inbound + ro.max_outbound;
+                if (rx_budget) {
+                    const auto& v = *rx_budget;
+                    ro.dos.per_peer_refill = v[0]; ro.dos.per_peer_capacity = v[1]; ro.dos.global_refill = v[2]; ro.dos.global_capacity = v[3];
+                    if (v[2] > 0 && v[3] >= 0) ro.ban_seconds = ceil_ratio(v[3], v[2]);
+                } else {
+                    ro.dos = ::c2pool::xmr::dos_policy_for(links, ro.verify_threads, g_relay_rx_global, ro.dos);
+                    ro.ban_seconds = ::c2pool::xmr::dos_ban_seconds(links, ro.verify_threads, g_relay_rx_global);
+                }
+                if (g_relay_ban_seconds) ro.ban_seconds = *g_relay_ban_seconds;
+                std::printf("relay: links in=%zu out=%zu; RandomX budget per address %.0f burst + %.4f/s, global %.0f burst + %.2f/s%s; "
+                            "address ban %u s\n",
+                            ro.max_inbound, ro.max_outbound, ro.dos.per_peer_capacity, ro.dos.per_peer_refill,
+                            ro.dos.global_capacity, ro.dos.global_refill, rx_budget ? " (--relay-rx-budget)" : "",
+                            ro.ban_seconds);
             }
             relay_node = std::make_unique<relay::XmrRelayNode>(
                 ro, relay_chain,
@@ -4933,7 +5007,31 @@ static int run_live(const XmrNodeConfig& cfg) {
                     node::Hash h{}; std::memcpy(h.data(), id.data(), 32);
                     return nn->index().block_blob_of(h, blob);
                 };
-                std::printf("relay: receipt contexts from the native node (best-chain rows + retained bodies; FB_GETCTX served natively)\n");
+                // The WORK behind a receipt context is judged against the same
+                // verified index: held there, or proof of work at the difficulty
+                // its parent implies there (relay::judge_block_ctx).
+                relay::CtxChainSource ctx_chain;
+                ctx_chain.verified = [nn](const ::v37::bytes32& id) {
+                    node::Hash h{}; std::memcpy(h.data(), id.data(), 32);
+                    return nn->index().holds_verified(h);
+                };
+                ctx_chain.target = [nn](const ::v37::bytes32& anchor, const std::vector<relay::CtxStep>& above,
+                                        std::uint64_t major, relay::CtxTarget& out, std::string& why) {
+                    node::Hash a{}; std::memcpy(a.data(), anchor.data(), 32);
+                    std::vector<std::pair<std::uint64_t, node::Difficulty128>> rows;
+                    rows.reserve(above.size());
+                    for (const auto& st : above) { node::Difficulty128 d{}; d.lo = st.diff_lo; d.hi = st.diff_hi; rows.emplace_back(st.timestamp, d); }
+                    node::Difficulty128 d{}; node::Hash seed{}; std::uint64_t h = 0;
+                    const std::uint8_t mv = static_cast<std::uint8_t>(major > 255 ? 255 : major);
+                    if (!nn->index().context_target(a, rows, mv, d, seed, h, why)) return false;
+                    out.diff_lo = d.lo; out.diff_hi = d.hi; out.height = h;
+                    std::memcpy(out.seed.data(), seed.data(), 32);
+                    return true;
+                };
+                relay_node->set_ctx_chain(std::move(ctx_chain));
+                std::printf("relay: receipt contexts from the native node (best-chain rows + retained bodies; FB_GETCTX served natively; context work checked against the native index)\n");
+            } else {
+                std::printf("relay: no native chain index: a receipt context is taken from our own monerod only (a peer-served one is never used)\n");
             }
             io.fee_model = fee_on;   // fee model S3: push split by the receipt's own PoW-committed give_author
             io.network = static_cast<std::uint8_t>(don_net);   // DON-NET: the donation payee of this network
@@ -5074,7 +5172,7 @@ static int run_live(const XmrNodeConfig& cfg) {
                             ro.listen ? ro.listen_host.c_str() : "-", (unsigned)relay_node->listen_port(), ro.peers.size(),
                             relay::to_string(bind), g_relay_order.c_str(), (unsigned long long)g_relay_bin_lag, g_relay_grace_ms,
                             (unsigned long long)cfg.stratum_share_diff, hex_of(ro.lane_params_digest).substr(0, 12).c_str(),
-                            (unsigned long long)g_relay_horizon, g_relay_rx_budget.c_str(), io.durable_path.c_str(), reloaded,
+                            (unsigned long long)g_relay_horizon, g_relay_rx_budget.empty() ? "auto" : g_relay_rx_budget.c_str(), io.durable_path.c_str(), reloaded,
                             s ? (unsigned long long)s->next_pos : 0ULL, s ? hex_of(s->digest).substr(0, 12).c_str() : "-",
                             rxp->describe().c_str());
                 std::printf("relay: RELAY-LIVENESS keepalive=%u ms silence-timeout=%u ms (FB_PING/FB_PONG 0x48/0x49; a silent link is dropped + redialed)\n",
@@ -5367,6 +5465,8 @@ static int run_live(const XmrNodeConfig& cfg) {
         ServeHooks hooks;
         hooks.cba_tick = [&]() { cba_ring_push(); feed_pump(); wire_pump(); if (relay_tick) relay_tick(); };   // recon(A+B credit): + receipt feed + v0x02 fast path (+ GAP-2 relay)
         hooks.on_share = relay_on_share;
+        // NET-DOS: never below share_diff / 64 (the raindrop floor), raindrops on or off
+        hooks.stratum_min_diff = cfg.stratum_share_diff ? c2pool::v37n::xmr::drops::drops_floor_diff(cfg.stratum_share_diff) : 0;
         if (drops_store)   // ★ DROPS WRITE-AHEAD (flip 1 only: the journal exists only under the flip)
             hooks.pre_publish = [&](const std::vector<std::uint8_t>& hashing_blob, std::uint64_t h) {
                 const std::string b = hex_of(sub::block_id_of_hashing_blob(hashing_blob));
@@ -6156,6 +6256,42 @@ int main(int argc, char** argv) {
         else if (a == "--zmq-port") cfg.monerod.zmq_port = u16();
         else if (a == "--stratum-port") cfg.stratum_bind_port = u16();
         else if (a == "--stratum-bind-host") cfg.stratum_bind_host = value();
+        else if (a == "--stratum-share-rate") {
+            const double r = cs::to_double(a, value());
+            if (!(r > 0)) throw cs::UsageError(a + " wants a number > 0");
+            g_stratum_share_rate = r;
+        }
+        else if (a == "--stratum-vardiff-shares") {
+            const auto nsh = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
+            if (nsh == 0) throw cs::UsageError(a + " wants an integer >= 1");
+            g_stratum_vardiff_shares = nsh;
+        }
+        else if (a == "--stratum-submit-burst") {
+            const auto b = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
+            if (b == 0) throw cs::UsageError(a + " wants an integer >= 1");
+            g_stratum_submit_burst = b;
+        }
+        else if (a == "--stratum-ban-seconds") g_stratum_ban_seconds = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
+        else if (a == "--stratum-login-timeout-ms") g_stratum_login_timeout_ms = static_cast<std::uint32_t>(u64(std::numeric_limits<int>::max()));
+        else if (a == "--stratum-share-score") {
+            const std::string v = value();
+            std::vector<std::string> toks;
+            for (std::size_t at = 0;;) {
+                const std::size_t c = v.find(',', at);
+                toks.push_back(v.substr(at, c == std::string::npos ? std::string::npos : c - at));
+                if (c == std::string::npos) break;
+                at = c + 1;
+            }
+            if (toks.size() != 4) throw cs::UsageError(a + " wants BAD,GOOD,BAN,CAP integers, got '" + v + "'");
+            std::array<int, 4> s{};
+            for (std::size_t k = 0; k < 4; ++k) {
+                const std::int64_t n = cs::to_i64(a, toks[k]);
+                if (n < std::numeric_limits<int>::min() || n > std::numeric_limits<int>::max())
+                    throw cs::UsageError(a + " wants BAD,GOOD,BAN,CAP integers, got '" + v + "'");
+                s[k] = static_cast<int>(n);
+            }
+            g_stratum_share_score = s;
+        }
         else if (a == "--payout-address") cfg.payout_address = value();
         else if (a == "--share-diff") cfg.stratum_share_diff = u64();
         else if (a == "--template-reserve") cfg.template_reserve_size = u32();
@@ -6219,13 +6355,19 @@ int main(int argc, char** argv) {
         else if (a == "--drops-enrol-min-tip")      g_drops_enrol_min_tip = u64();
         else if (a == "--drops-retain-bins")        g_drops_retain_bins = u64();
         else if (a == "--drops-store-persist")      g_drops_store_persist = cs::one_of(a, value(), {"on", "off"}) == "on";
-        else if (a == "--relay-max-peers")          g_relay_max_peers = static_cast<std::size_t>(u64());
+        else if (a == "--relay-max-inbound" || a == "--relay-max-peers") g_relay_max_inbound = static_cast<std::size_t>(u64());
         else if (a == "--relay-discovery")          g_relay_discovery = cs::one_of(a, value(), {"on", "off"}) == "on";
         else if (a == "--relay-max-outbound")       g_relay_max_outbound = static_cast<std::size_t>(u64());
         else if (a == "--relay-index-horizon")      g_relay_horizon = u64();
         else if (a == "--relay-rx-budget")          g_relay_rx_budget = value();
+        else if (a == "--relay-rx-global") {
+            g_relay_rx_global = u32();
+            if (g_relay_rx_global == 0) throw cs::UsageError(a + " wants an integer >= 1");
+        }
+        else if (a == "--relay-ban-seconds")        g_relay_ban_seconds = u32();
         else if (a == "--relay-verify-threads")     g_relay_verify_threads = u32();
         else if (a == "--relay-solicited-credits")  g_relay_solicited = u32();
+        else if (a == "--relay-parked-max")         g_relay_parked_max = static_cast<std::size_t>(u64());
         else if (a == "--relay-backfill-positions") g_relay_backfill = u64();
         else if (a == "--relay-reoffer-seconds")    g_relay_reoffer_s = u32();
         else if (a == "--relay-keepalive-ms")       g_relay_keepalive_ms = u32();
@@ -6399,15 +6541,24 @@ int main(int argc, char** argv) {
                 "  --drops-enrol-min-tip H      DROPS: enrol (and arm the share counter) only once the native tip has reached H\n"
                 "  --drops-retain-bins N        DROPS: raindrop intervals below the tip kept servable (default 512)\n"
                 "  --drops-store-persist on|off DROPS: keep the servable raindrop store across restarts (lane<N>.drops; default on)\n"
-                "  --relay-max-peers N  --relay-index-horizon N  --relay-rx-budget P,C,G,GC\n"
+                "  --relay-max-inbound N        accepted relay links (default 101; --relay-max-peers N is an alias);\n"
+                "                               they never take an outbound slot\n"
+                "  --relay-index-horizon N\n"
+                "  --relay-rx-global G          global RandomX tokens/s for peer receipts (default 4). With n =\n"
+                "                               inbound + outbound links and C = verify threads: per address C\n"
+                "                               burst + G/n per s, global n x C burst + G per s\n"
+                "  --relay-rx-budget P,C,G,GC   explicit budget instead (refill/s, cap per address; global)\n"
+                "  --relay-ban-seconds S        address ban (default ceil(n x C / G); ceil(GC / G) with\n"
+                "                               --relay-rx-budget)\n"
                 "  --relay-verify-threads N     RandomX verify workers for peer receipts + raindrops (default 0 =\n"
                 "                               auto: clamp(cores/2, 2, 8) minus --mine threads; ~2.2 MiB each,\n"
                 "                               the seed caches are shared). 1 = the pre-fix single worker\n"
                 "  --relay-solicited-credits N  --relay-backfill-positions N  --relay-reoffer-seconds S\n"
+                "  --relay-parked-max N         parked verify items cap (objects; default 1632)\n"
                 "  --relay-keepalive-ms MS      PING every relay link this often (default 5000; 0 = off, pre-0x48 wire)\n"
                 "  --relay-silence-timeout-ms MS drop + redial a link silent this long (default 25000; 0 = never)\n"
                 "  --relay-discovery on|off     relay peer discovery (FB_GETADDR/FB_ADDR) + persistent peer book (default on)\n"
-                "  --relay-max-outbound N       dialed relay links kept up, --relay-peer + learned (default 8)\n"
+                "  --relay-max-outbound N       dialed relay links kept up, --relay-peer + learned (default 12)\n"
                 "  --relay-order canonical|arrival  --relay-bin-lag L  --relay-bin-grace-ms MS\n"
                 "  --relay-vault-entries N --relay-vault-bytes N --relay-vault-horizon N  --no-relay-serve\n"
                 "  --relay-deep-order on|off    serve + ask repair orders below the vault horizon from the\n"
@@ -6444,6 +6595,15 @@ int main(int argc, char** argv) {
                 " serve side (X9 O-2; the stratum port is served only with a payout address):\n"
                 "  --payout-address <addr>      get_block_template wallet address (network-prefixed)\n"
                 "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
+                "  --stratum-share-rate R       fixed submit budget refill per connection, submits/s\n"
+                "                               (pins the budget; disables vardiff)\n"
+                "  --stratum-vardiff-shares N   turn vardiff on: N shares per lane window per connection\n"
+                "                               (default off; on: budget = 2 x S_t, s unknown 12.8/s)\n"
+                "  --stratum-submit-burst N     submit budget burst and queue bound per connection (default 24)\n"
+                "  --stratum-ban-seconds S      address ban (default ceil(burst / R) = 2)\n"
+                "  --stratum-share-score B,G,K,M share score: bad share B, good share G, ban at K, cap M\n"
+                "                               (default -3,1,-9,0)\n"
+                "  --stratum-login-timeout-ms MS no login by then: banned (default 5000; 0 = off)\n"
                 "  --share-diff <n>             share (lane) difficulty; 0 = network (solo)\n"
                 "  --web-port <p>               the web dashboard (p2pool-compatible JSON + web-static UI);\n"
                 "                               0 = off (the default: no web socket is opened)\n"

@@ -2022,6 +2022,7 @@
                         <tbody></tbody>
                     </table>
                 </div>
+                <div id="workers_silent_note" style="display: none; color: var(--warning); margin: 8px 0;"></div>
                 <div id="node_role_note" style="display: none; color: var(--muted); margin: 8px 0;">Relay node: no Stratum acceptor runs here, so no miners can connect to it. An empty list is expected on this node, not a fault.</div>
                 <div class="loading" id="active_miners_loading">Loading miners</div>
             </div>
@@ -3483,6 +3484,25 @@
                 d3.select('#local_rate').text(_relayNode ? 'n/a (relay node)' : format_hashrate(local));
                 d3.select('#local_doa').text(_relayNode ? 'n/a' : (local > 0 ? d3.format('.2p')(local_dead/local) : '0%'));
                 d3.select('#node_role_note').style('display', _relayNode ? null : 'none');
+
+                // #959: an authorized session that stops sharing is SILENT. Say
+                // so by name, with active/total, so a dead rig cannot hide in
+                // the session count. Older binaries omit both fields.
+                var _ss = local_stats.stratum_sessions;
+                var _silentNote = d3.select('#workers_silent_note');
+                if (_ss && _ss.silent > 0) {
+                    var _names = (local_stats.workers_silent || []).map(function(sw) {
+                        return sw.worker + ' (silent ' + format_dt(sw.silent_seconds) +
+                            (sw.has_shared ? '' : ', no share since connect') + ')';
+                    });
+                    _silentNote.text('\u26a0 ' + _ss.active + ' of ' + _ss.total +
+                        ' Stratum sessions active; ' + _ss.silent +
+                        ' silent (authorized, no accepted share past the threshold)' +
+                        (_names.length ? ': ' + _names.join(', ') : ''));
+                    _silentNote.style('display', null);
+                } else {
+                    _silentNote.style('display', 'none');
+                }
                 
                 d3.select('#shares_total').text(local_stats.shares.total);
                 d3.select('#shares_orphan').text(local_stats.shares.orphan);
