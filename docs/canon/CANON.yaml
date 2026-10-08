@@ -24,10 +24,15 @@
 #   required      regex that must match at least min_count times in the scope.
 #   pr_body       a pull request touching the paths carries a body line:
 #                 "Canon: C03, C07" (line: Canon, rule C10), "KAT: <ctest
-#                 names>" or "KAT: none (reason)" (line: KAT, rule C31), or
+#                 names>" or "KAT: none (reason)" (line: KAT, rule C31),
 #                 "Design: <URL or path>" or "Design: none (reason)" (line:
-#                 Design, rule C40).
+#                 Design, rule C40), or "Conformance: the:INV-nn, ...;
+#                 departures: none | Dnn, ..." (line: Conformance, rule C47).
 #   register      every failing rule maps to an open deviation (rule C09).
+#
+# in_force: true (on a required check): the rule's subject is in the running
+# node. A deviation is closable only when every rule it maps to passes,
+# in_force checks included, and not on KAT presence alone.
 #
 # open_items (optional, per rule): open spec items; no check reads them.
 #
@@ -122,8 +127,14 @@ rules:
       - name: carrier-sharechain-kat
         type: required_kat
         kats: [xmr_carrier_sharechain_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     status_now: fail
-    deviation: [D1]
+    deviation: [D1, D39]
 
   - id: C02
     title: no previous-share binding; replay guard by PoW id
@@ -145,7 +156,7 @@ rules:
 
   - id: C03
     title: open origin bin, F = 96
-    statement: 'A receipt is admissible in carrier c iff its origin bin is open at the parent of c on c''s own chain: H(pos(c) - 1) < h(r) + F, F = 96 Monero heights, H(x) = the maximum template height over carriers at positions <= x; liveness judged at min(q - 1, own position), delta = 1 (own position = tip position + 1, q = the placing carrier position); no hop bound; tip freshness 0 <= h(r) - h(tip) <= 2 for every receipt, refused at admission otherwise; no late tail.'
+    statement: 'A receipt is admissible in carrier c iff its origin bin is open at the parent of c on c''s own chain: H(pos(c) - 1) < h(r) + F, F = 96 Monero heights, H(x) = the maximum template height over carriers at positions <= x; liveness judged at min(q - 1, own position), delta = 1 (own position = tip position + 1, q = the placing carrier position); no hop bound; tip freshness 0 <= h(r) - h(tip) <= 2 for every receipt, refused at admission otherwise; a receipt carried in carrier c also needs h(r) <= h(c) + fresh_max, fresh_max = 2, STRIKE otherwise; no late tail.'
     source: 'ref: the:C03'
     ruling: 'ref: the:C03'
     scope: [src/c2pool/v37/xmr/relay/, src/impl/xmr/receipt/, src/sharechain/v37/, src/c2pool/v37/w2_receipt.hpp]
@@ -217,7 +228,7 @@ rules:
         scope: xmr_lane_code
         code_only: true
     status_now: fail
-    deviation: [D4]
+    deviation: [D4, D36]
 
   - id: C05
     title: no uncles
@@ -274,6 +285,9 @@ rules:
       - name: exact-sum-kats
         type: required_kat
         kats: [xmr_coinbase_kat, xmr_e2e_kat]
+      - name: pathb-exact-sum-kat
+        type: required_kat
+        kats: [v37_xmr_pathb_e2e_kat]
     status_now: pass
     deviation: []
 
@@ -392,7 +406,7 @@ rules:
 
   - id: C13
     title: K = 1 and the N rule
-    statement: 'v1: one carrier chain, K = 1 payment group; the window holds at most N(B) = max(1, floor((Z - 2 x OVH(hf)) / (2 x OUT(hf)))) distinct payees (hf >= 17: at most FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS), Z = the Monero effective median at the window read point (C41), OVH(16) = 89, OVH(17) = 61, OUT(hf) = 34 (hf 16) or 84 (hf 17) + the varint length of the base reward; whole oldest bins leave the window while payees exceed N(B), then the last bin is cut by carrier position; every window payee gets an output in every block; coinbase weight <= Z / 2 plus the varint excess of outputs of at least 2^42 piconero; no prev_id group draw; K > 1 only by ratchet vote (C23).'
+    statement: 'v1: one carrier chain, K = 1 payment group; the window holds at most N(B) = max(1, floor((Z - 2 x OVH(hf)) / (2 x OUT(hf)))) distinct payees (hf >= 17: at most FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS), counting an identity whose weight after shares is > 0, Z = the Monero effective median at the window read point (C41), OVH(16) = 89, OVH(17) = 61, OUT(hf) = 34 (hf 16) or 84 (hf 17) + the varint length of the base reward; whole oldest bins leave the window while payees exceed N(B), then the last bin is cut by carrier position: its entries in the order q descending (q = the position of the carrier that placed the entry), then id ascending, kept while payees <= N(B) (the one exception to "in any order" of C25); when the newest bin alone fails W_max (C38) the same order keeps its entries while W_kept x f_spend <= B(A_t) x d_min(kept); R goes to the receipt payee alone only when the window holds no entry (C37); M(A_t) for f_spend = min(Z, the long-term effective median) (C38); every window payee gets an output in every block; coinbase weight <= Z / 2 plus the varint excess of outputs of at least 2^42 piconero; no prev_id group draw; K > 1 only by ratchet vote (C23).'
     source: 'ref: the:C13'
     ruling: 'ref: the:C13'
     scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/]
@@ -462,8 +476,8 @@ rules:
     deviation: []
 
   - id: C16
-    title: split and merge gates from chain data
-    statement: 'Every split and merge gate is a pure function of Monero chain data at an epoch boundary, at most one step per epoch, with hysteresis.'
+    title: split and merge gates from chain data or a ratchet vote
+    statement: 'Every split and merge gate is a function of Monero chain data or a ratchet vote (C23); v1: K = 1.'
     source: 'ref: the:C16'
     ruling: 'ref: the:C16'
     scope: [src/c2pool/v37/roundabout/, src/c2pool/v37/xmr/]
@@ -515,7 +529,7 @@ rules:
 
   - id: C19
     title: node-owner fee as a weight split
-    statement: 'The owner is credited floor(work x p / 10000) of each receipt and the miner the rest; p (basis points) and the owner address are in the receipt PoW preimage, set at node start (--node-owner-fee-pct, --node-owner-address), default 0, disclosed; every node recomputes the split; no protocol cap; an owner whose window weight w has w x B(A_t) < W x f_spend returns it to the miners of the contributing receipts (C38).'
+    statement: 'The owner is credited floor(work x p / 10000) of each receipt and the miner the rest; p (basis points) and the owner address are in the receipt PoW preimage, set at node start (--node-owner-fee-pct, --node-owner-address), default 0, disclosed; every node recomputes the split; no protocol cap; p + give_author_bp <= 10000 (exactly 10000 valid), a receipt above it is refused at admission (STRIKE) and a node refuses to start with a configured sum above it; an owner whose window weight w has w x B(A_t) < W x f_spend returns it to the miners of the contributing receipts (C38).'
     source: 'ref: the:C19'
     ruling: 'ref: the:C19'
     scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
@@ -533,7 +547,7 @@ rules:
 
   - id: C20
     title: per-job payout proof
-    statement: 'Each job carries a proof the miner checks before hashing: coinbase Merkle branch to the hashing blob, own output by view key, amount = exact split of the window of the job tip (C37) from a Merkle-sum window commitment tied to the carrier chain, and the owner fee terms (C19).'
+    statement: 'Each job carries a proof the miner checks before hashing: coinbase Merkle branch to the hashing blob, own output by view key, amount = exact split of the window of the job tip (C37) from a Merkle-sum window commitment tied to the carrier chain, and the owner fee terms (C19); signed job receipts (fraud proofs): nodes sign job receipts; v1: their hourly root travels as a signed relay message, with no on-chain anchor; the on-chain anchor is an item of the first upgrade epoch after mainnet.'
     source: 'ref: the:C20'
     ruling: 'ref: the:C20'
     scope: [src/impl/xmr/stratum/, src/c2pool/v37/xmr/]
@@ -542,7 +556,7 @@ rules:
         type: required_kat
         kats: [xmr_payout_proof_kat]
     status_now: fail
-    deviation: [D10]
+    deviation: [D10, D41]
 
   - id: C21
     title: every window member paid directly
@@ -560,7 +574,7 @@ rules:
         type: required_kat
         kats: [xmr_window_split_kat]
     status_now: fail
-    deviation: [D4]
+    deviation: [D4, D40]
 
   - id: C22
     title: legally dead by chain data
@@ -577,12 +591,18 @@ rules:
         pattern: '\bgrace_ms\b'
         scope: xmr_lane_code
         code_only: true
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     status_now: fail
     deviation: [D1, D3]
 
   - id: C23
     title: rules ratchet
-    statement: 'A rule change is an epoch appended on the carrier chain; the genesis rules are epoch 0; pool identity = sha256d("V37GEN" || monero_block_hash(H) || headline), H at least 60 Monero blocks deep; every receipt carries rules_epoch and a ballot under its own PoW; vote windows are one global grid of L = 34881 positions from lane genesis; a deployment locks in over a window when 4 x yes work >= 3 x all window work; activation at lock-in + GRACE, GRACE = 120960 positions; TIMEOUT 941760 positions: STARTED spans exactly the 26 whole windows inside it, yes ballots are written only while the attempt is open (STARTED, or LOCKED_IN before its timeout; LOCKED_IN takes precedence over STARTED), and without a lock-in the attempt is FAILED, final, at start + 26 L, and the epoch number may be re-proposed with a start at or after timeout + GRACE of every earlier attempt, timeout = start + 26 L, which the re-proposing release carries in its compiled table and checks at start-up, refusing to start otherwise; every node term is evaluated at the position being judged or built, from the committed state the carrier there commits, and an attempt is locked in up to and including its own activation position; at most one deployment is open at a time; every carrier commits the ratchet state (rs_root, folded into receipts_root), which every node recomputes for each carrier and a joiner adopts by PoW; upgraded software ballots yes by default, an operator opts out; a node implements the rules in force iff its compiled digest for the epoch in force equals the committed rules digest, and the open epoch iff its own attempt is open or locked in; E_impl is the prefix maximum, the same for followers and joiners; a node HOLDs at once when E_impl is below the epoch in force or its digest for the epoch in force differs from the committed one, and otherwise at lock-in + GRACE - 1 when a kept window of the committed state shows ballots above E_impl with 3/4 of all window work, with no descriptor of that epoch and no peer; from lock-in + GRACE it defers frames it cannot judge in a capped store, drops the rest, and never strikes or bans for them; any other mismatching rules_epoch is refused, never a HOLD.'
+    statement: 'A rule change is an epoch appended on the carrier chain; the genesis rules are epoch 0; pool genesis = sha256d("V37GEN" || monero_block_hash(H) || u8 len || headline), H at least 60 Monero blocks deep; pool_id derived from the pool genesis = sha256d("V37PID" || u8 network || u32 chain_id || pool_genesis); the raw form only on regtest and test networks; every receipt carries rules_epoch and a ballot under its own PoW; vote windows are one global grid of L = 34881 positions from lane genesis; a deployment locks in over a window when 4 x yes work >= 3 x all window work; activation at lock-in + GRACE, GRACE = 120960 positions; TIMEOUT 941760 positions: STARTED spans exactly the 26 whole windows inside it, yes ballots are written only while the attempt is open (STARTED, or LOCKED_IN before its timeout; LOCKED_IN takes precedence over STARTED), and without a lock-in the attempt is FAILED, final, at start + 26 L (after its timeout an attempt never re-opens or re-locks), and the epoch number may be re-proposed with a start at or after timeout + GRACE of every earlier attempt, timeout = start + 26 L, which the re-proposing release carries in its compiled table and checks at start-up, refusing to start otherwise; every node term is evaluated at the position being judged or built, from the committed state the carrier there commits, and an attempt is locked in up to and including its own activation position; at most one deployment is open at a time; every carrier commits the ratchet state (rs_root, folded into receipts_root), which every node recomputes for each carrier and a joiner adopts by PoW; upgraded software ballots yes by default, an operator opts out; a node implements the rules in force iff its compiled digest for the epoch in force equals the committed rules digest, and the open epoch iff its own attempt is open or locked in; E_impl is the prefix maximum, the same for followers and joiners; a node HOLDs at once when E_impl is below the epoch in force or its digest for the epoch in force differs from the committed one, and otherwise at lock-in + GRACE - 1 when a kept window of the committed state shows ballots above E_impl with 3/4 of all window work, with no descriptor of that epoch and no peer; from lock-in + GRACE it defers frames it cannot judge in a capped store, drops the rest, and never strikes or bans for them; any other mismatching rules_epoch is refused, never a HOLD; a carried receipt whose tip branch runs more than GRACE positions past its fork point with the best chain is deferred on every node and dropped when its bin seals; the activation record is persistent per chain, never pruned with the journal.'
     source: 'ref: the:C23'
     ruling: 'ref: the:C23'
     scope: [src/c2pool/v37/xmr/, src/c2pool/v37/main_v37_xmr.cpp]
@@ -619,7 +639,7 @@ rules:
         scope: xmr_lane_code
         code_only: true
     status_now: fail
-    deviation: [D11]
+    deviation: [D11, D36, D39]
 
   - id: C24
     title: accounting across rule epochs
@@ -631,12 +651,18 @@ rules:
       - name: epoch-accounting-kat
         type: required_kat
         kats: [xmr_epoch_accounting_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     status_now: fail
     deviation: [D11]
 
   - id: C25
     title: provable work
-    statement: 'Every credited unit is a PoW-proven receipt bound to pool, chain, payee and origin bin, credited work(T_origin) (C06) whoever carries it and in any order; lane state is a deterministic function of chain data; its commitments allow light-client proofs.'
+    statement: 'Every credited unit is a PoW-proven receipt bound to pool, chain, payee and origin bin, credited work(T_origin) (C06) whoever carries it and in any order (one exception: the in-bin cut order of C13); lane state is a deterministic function of chain data; its commitments allow light-client proofs; the sealed-bin MMR is dense: one leaf per sealed bin in bin order from b0 = H(0), an empty bin a zero-payload leaf, leaf_index = b - b0; miner_count = the distinct miner identities among the bin''s live receipts, rows with w_miner = 0 included.'
     source: 'ref: the:C25'
     ruling: 'ref: the:C25'
     scope: [src/impl/xmr/receipt/, src/c2pool/v37/xmr/]
@@ -660,10 +686,13 @@ rules:
       - name: light-proof-kat
         type: required_kat
         kats: [v37_xmr_mmr_golden_kat]
+      - name: bin-fold-kat
+        type: required_kat
+        kats: [v37_xmr_bin_fold_kat]
     open_items:
       - 'retirement plan: v37_xmr_light_proof_kat is not required; slice S4 deletes its code; successors v37_xmr_side_data_v3_kat and v37_xmr_mmr_golden_kat'
     status_now: fail
-    deviation: [D30]
+    deviation: [D30, D38, D44]
 
   - id: C26
     title: provable fees
@@ -677,13 +706,11 @@ rules:
         pattern: '\bu16\s+give_author(?:_bp)?\b'
         paths: [src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp, src/impl/xmr/receipt/xmr_receipt.hpp]
         code_only: true
-      - name: donation-marker-zero
-        type: constant
-        pattern: '\bkDonationMarkerPico\s*=\s*([0-9]+)'
-        paths: [src/c2pool/v37/xmr/xmr_fee_model.hpp]
-        min: 0
-        max: 0
-        absent_ok: true
+      - name: donation-marker-absent
+        type: forbidden
+        pattern: '\bkDonationMarkerPico\b'
+        paths: [src/c2pool/v37/xmr/xmr_fee_model.hpp, src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: true
       - name: donation-bp-default
         type: constant
         pattern: '\bkDonationBp\s*=\s*([0-9]+)'
@@ -729,7 +756,7 @@ rules:
 
   - id: C27
     title: pool identity binds every lane rule
-    statement: 'Every lane rule is committed in the relay HELLO and the pool_tag; the Monero constants enter as one monero_rules_digest; node policy values are not lane rules and are not committed; a node with different lane parameters is refused with LANE_RULES_MISMATCH naming the field.'
+    statement: 'Every lane rule is committed in the relay HELLO and the pool_tag; the Monero constants enter as one monero_rules_digest; node policy values are not lane rules and are not committed; a node with different lane parameters is refused with LANE_RULES_MISMATCH naming the field; the Path B HELLO tail = u8 codec (K22 = 2) | u16 rules_len | rules TLV of u8 id | u8 len | value entries, id = the K number, ids strictly ascending; the HELLO tag = network, chain_id and the pool identity (C23), a differing chain_id or pool identity is TAG_MISMATCH; the pool identity is not in the rules TLV; the rules TLV (the geometry K01-K08 and K23 included) is compared only when both peers report the same epoch_cur.'
     source: 'ref: the:C27'
     ruling: 'ref: the:C27'
     scope: [src/c2pool/v37/xmr/]
@@ -755,6 +782,9 @@ rules:
       - name: monero-rules-digest-kat
         type: required_kat
         kats: [v37_xmr_monero_rules_digest_kat]
+      - name: pathb-hello-kat
+        type: required_kat
+        kats: [v37_xmr_pathb_hello_kat]
     open_items:
       - 'retirement plan: v37_xmr_pool_lineage_kat is not required; slice S4 deletes its code (C37 no-clear-pool-tag); successor the pool identity case of v37_xmr_side_data_v3_kat (C25)'
     status_now: fail
@@ -852,7 +882,7 @@ rules:
 
   - id: C33
     title: dual timestamp chain
-    statement: 'Consensus time comes from the Monero chain (origin bin = committed mainchain height) and the carrier sharechain (order of seen Monero tips); template height is non-decreasing along the carrier chain; the height record H(x) is the maximum template height over carriers at positions <= x and placed receipts never raise it; the retarget time base is a Monero height span; wall-clock timestamps are sanity bounds only (C03, C08, C11, C22).'
+    statement: 'Consensus time comes from the Monero chain (origin bin = committed mainchain height) and the carrier sharechain (order of seen Monero tips); template height is non-decreasing along the carrier chain; the height record H(x) is the maximum template height over carriers at positions <= x and placed receipts never raise it; the retarget time base is a Monero height span; wall-clock timestamps are sanity bounds only (C03, C08, C11, C22); receipt and carrier headers: major_version == hf_version(h) and vote(minor_version) >= hf_version(h), minor_version 0 counting as 1; a violation is STRIKE.'
     source: 'ref: the:C33'
     ruling: 'ref: the:C33'
     scope: [src/c2pool/v37/xmr/, src/impl/xmr/receipt/]
@@ -860,6 +890,15 @@ rules:
       - name: carrier-timestamp-kat
         type: required_kat
         kats: [xmr_carrier_timestamp_kat]
+      - name: header-rules-kat
+        type: required_kat
+        kats: [v37_xmr_receipt_header_rules_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     status_now: fail
     deviation: [D1]
 
@@ -903,7 +942,7 @@ rules:
 
   - id: C36
     title: open carriage, R_MAX = 16
-    statement: 'Any carrier may carry live receipts of any miner while their origin bin is open (C03); the carried list is in canonical order (origin bin ascending, then sha256d(id || parent id), strictly increasing), at most R_MAX = 16, a lane rule (C27); omitting a known receipt is relay policy, never a refusal; a frame carries at most 1 + R_MAX receipt bodies; credit at the origin bin whoever carries.'
+    statement: 'Any carrier may carry live receipts of any miner while their origin bin is open (C03); the carried list is in canonical order (origin bin ascending, then sha256d(id || parent id), strictly increasing), at most R_MAX = 16, a lane rule (C27); omitting a known receipt is relay policy, never a refusal; a frame carries at most 1 + R_MAX receipt bodies; credit at the origin bin whoever carries; carried_root = the untagged sha256d Merkle root over the carried ids in canonical order, an odd level promotes its last node unchanged, one id gives that id, none gives zero.'
     source: 'ref: the:C36'
     ruling: 'ref: the:C36'
     scope: [src/impl/xmr/receipt/, src/impl/xmr/wire/, src/c2pool/v37/xmr/relay/, src/c2pool/v37/xmr/]
@@ -927,11 +966,11 @@ rules:
         min: 17
         max: 17
     status_now: fail
-    deviation: [D19]
+    deviation: [D19, D33]
 
   - id: C37
     title: payout from pre-block state
-    statement: 'The coinbase a receipt commits is the canonical coinbase of (tip, v, prev_id, R): at hf 16 the full reward R split exactly over window(tip, v) by work (floor, largest remainder, ties by payee identity), one output per window payee, no separate fee output, an empty window pays R to the receipt payee; amounts per (tip, v, R), output keys per (tip, prev_id); output order hf 16 by payee identity ascending, hf 17 by one-time key ascending, strict; every node checks it for every receipt at admission before RandomX, refuses a mismatch and bans the sender; tx_extra = PBX1, no clear-text pool tag, merge-mining depth 0; payees are standard addresses.'
+    statement: 'The coinbase a receipt commits is the canonical coinbase of (tip, v, prev_id, R): at hf 16 the full reward R split exactly over window(tip, v) by work (floor, largest remainder, ties by payee identity), one output per window payee, no separate fee output, an empty window pays R to the receipt payee; amounts per (tip, v, R), output keys per (tip, prev_id); output order hf 16 by payee identity ascending, hf 17 by one-time key ascending, strict; every node checks it for every receipt at admission before RandomX, refuses a mismatch it computed itself and bans the sender; a node-internal failure of that check is a local alarm and DEFER, with no strike token; at hf >= 17 the receipt is refused with no token, no ban and no RandomX; payee_ref and owner_ref identities equal the side-data payee and owner identities, checked before any fetch, STRIKE otherwise; tx_extra = PBX1, no clear-text pool tag, merge-mining depth 0; payees are standard addresses.'
     source: 'ref: the:C37'
     ruling: 'ref: the:C37'
     scope: [src/impl/xmr/receipt/, src/impl/xmr/settle/, src/impl/xmr/native/relay/, src/c2pool/v37/xmr/]
@@ -969,6 +1008,15 @@ rules:
         pattern: '\bXMR_SUB\b'
         scope: xmr_consensus_core
         code_only: true
+      - name: pathb-coinbase-kats
+        type: required_kat
+        kats: [v37_xmr_pathb_coinbase_kat, v37_xmr_pathb_miner_tx_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     open_items:
       - 'hf 17 amount rule: open (ref: the:SPEC24/O-01); no receipt for hf >= 17 is built or admitted until it is ruled'
     status_now: fail
@@ -976,7 +1024,7 @@ rules:
 
   - id: C38
     title: window by work, W_max, merge-back
-    statement: 'window(tip, v) takes whole origin bins newest-first while raw work < COVERAGE x D_net (COVERAGE = 2) and (W + w_b) x f_spend <= B(A_t) x min(d_min_so_far, d_min(b)), d_min over the raw work of every live receipt entry (carrier or carried); then the N rule (C13); then merge-back: an owner or author identity with window weight w and w x B(A_t) < W x f_spend returns it to the miners of the contributing receipts, W unchanged; weight = work(T_origin), no decay; f_spend = kInputWeight x get_dynamic_base_fee(B, max(M, zone(hf))) quantised up to 10^4; inputs per C41; no payee output below f_spend.'
+    statement: 'window(tip, v) takes whole origin bins newest-first while raw work < COVERAGE x D_net (COVERAGE = 2) and (W + w_b) x f_spend <= B(A_t) x min(d_min_so_far, d_min(b)), d_min over the raw work of every live receipt entry (carrier or carried); then the N rule (C13); then merge-back: an owner or author identity whose aggregated window weight w (its own raw entries included) has w x B(A_t) < W x f_spend returns its owner and author shares to the miners of the contributing receipts, W unchanged; weight = work(T_origin), no decay; f_spend = kInputWeight x get_dynamic_base_fee(B, max(M, zone(hf))) quantised up to 10^4, M = min(Z, the long-term effective median); inputs per C41; no payee output below f_spend.'
     source: 'ref: the:C38'
     ruling: 'ref: the:C38'
     scope: [src/impl/xmr/settle/, src/c2pool/v37/xmr/, src/sharechain/v37/]
@@ -998,7 +1046,7 @@ rules:
         scope: xmr_consensus_core
         code_only: true
     status_now: fail
-    deviation: [D21, D22]
+    deviation: [D21, D22, D38, D40]
 
   - id: C39
     title: reference fairness scenarios
@@ -1010,7 +1058,7 @@ rules:
       - name: fairness-kats
         type: required_kat
         kats: [v37_xmr_fairness_cap_kat, v37_xmr_fairness_schedules_kat]
-    status_now: fail
+    status_now: pass
     deviation: [D23]
 
   - id: C40
@@ -1047,8 +1095,14 @@ rules:
       - name: window-branch-kats
         type: required_kat
         kats: [v37_xmr_window_branch_kat, v37_xmr_receipt_defer_kat, v37_xmr_window_fork_height_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     status_now: fail
-    deviation: [D21]
+    deviation: [D21, D38]
 
   - id: C42
     title: catch-up template
@@ -1060,26 +1114,43 @@ rules:
       - name: catchup-kat
         type: required_kat
         kats: [xmr_template_catchup_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     status_now: fail
     deviation: [D1]
 
   - id: C43
     title: fork choice, rewind, joiner
-    statement: 'Best chain = the fully verified carrier chain with the greatest cumulative carrier difficulty, ties by lower tip id; receipts never count; no consensus reorg depth limit; the journal depth is node policy; headers first; a joiner verifies carrier PoW over span = max(J_0, ceil((F + fresh_max) x 120 / T) + seal_depth) positions, J_0 = max(ceil(3 h x 3600 / T), ceil(F x 120 / T) + seal_depth), with retarget_span headers before the span and sealed bins as buckets with MMR proofs; no older history.'
+    statement: 'Best chain = the fully verified carrier chain with the greatest cumulative carrier difficulty, ties by lower tip id; receipts never count; no consensus reorg depth limit; the journal depth is node policy, at least J_0 and never in a lane digest; a switch deeper than the journal, or a failed load of the stored lane state, takes the joiner path: the activation record is re-seeded by the joiner row (epoch_cur, p0 - 1, rules_cur), p0 - 1 = the position of the adopted state, and holds no row below it; a restore below p0 - 1 is refused (fail closed); headers first; a joiner verifies carrier PoW over the span [x0, L], x0 = min(L - 1175, the first x with H(x) > H(L) - F - fresh_max), at least max(J_0, ceil((F + fresh_max) x 120 / T) + seal_depth) = 1176 positions, J_0 = max(ceil(3 h x 3600 / T), ceil(F x 120 / T) + seal_depth) = 1152, with retarget_span headers before the span and sealed bins as buckets with MMR proofs; the positions before x1, the first x with H(x) >= H(x0 - 1) + F + fresh_max, by PoW, hashes and roots only; no older history.'
     source: 'ref: the:C43'
     ruling: 'ref: the:C43'
     scope: [src/c2pool/v37/xmr/, src/sharechain/v37/]
     checks:
       - name: journal-not-in-digest
         type: forbidden
-        pattern: '\bjournal_depth\b[^\n]*lane_params_digest|lane_params_digest[^\n]*\bjournal_depth\b'
+        pattern: '(?s)\blane_params_digest\s*\([^;{]*\)\s*\{(?:(?!\n\}).)*?\bjournal_depth\b'
         paths: [src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp, src/sharechain/v37/v37_lane.hpp]
+        code_only: true
+      - name: pathb-rules-no-journal
+        type: forbidden
+        pattern: '\bjournal'
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: fork-choice-kats
         type: required_kat
         kats: [xmr_carrier_sharechain_kat, v37_xmr_joiner_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
     status_now: fail
-    deviation: [D1, D25]
+    deviation: [D1, D25, D34, D35, D37, D38, D39]
 
   - id: C44
     title: Monero context from lane peers
@@ -1159,6 +1230,82 @@ rules:
     status_now: pass
     deviation: [D29]
 
+  - id: C47
+    title: conformance line
+    state: ruled
+    statement: 'A pull request on the listed paths carries a "Conformance:" body line naming the invariant ids it touches (the:INV-nn) and "departures: none" or the D rows it departs under; every named D row is in the register with status open; the word UNRULED fails.'
+    source: 'ref: the:C47'
+    ruling: 'ref: the:C47'
+    scope: [src/c2pool/v37/xmr/, src/impl/xmr/, src/sharechain/v37/, src/c2pool/v37/main_v37_xmr.cpp, docs/canon/]
+    checks:
+      - name: pr-conformance-line
+        type: pr_body
+        line: Conformance
+        paths:
+          - src/c2pool/v37/xmr/**
+          - src/impl/xmr/**
+          - src/sharechain/v37/**
+          - src/c2pool/v37/main_v37_xmr.cpp
+          - docs/canon/**
+    status_now: pass
+    deviation: []
+
+  - id: C48
+    title: block reward of the split
+    state: ruled
+    statement: 'The split amount R of a Path B block = the Monero block reward of a child of P_r at the block''s final weight: base from the emission state at P_r, plus the fees of the selected transactions, minus the penalty; the transaction set is sized with the real Path B miner transaction; B(A_t) is read only for W_max, f_spend, the merge-back threshold and OUT.'
+    source: 'ref: the:C48'
+    ruling: 'ref: the:C48'
+    scope: [src/impl/xmr/pathb/, src/c2pool/v37/main_v37_xmr.cpp]
+    checks:
+      - name: base-reward-kat
+        type: required_kat
+        kats: [v37_xmr_base_reward_kat, v37_xmr_pathb_node_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+    status_now: fail
+    deviation: [D36]
+
+  - id: C49
+    title: abandoned placements pending again
+    state: ruled
+    statement: 'After a best-chain switch every placement of the abandoned branch (the carrier''s own receipt and each carried body) that is not placed on the new branch and whose origin bin is open on it is pending again; open bins re-carry it, sealed bins lose it.'
+    source: 'ref: the:C49'
+    ruling: 'ref: the:C49'
+    scope: [src/impl/xmr/pathb/, src/c2pool/v37/xmr/]
+    checks:
+      - name: re-pend-kat
+        type: required_kat
+        kats: [v37_xmr_pathb_node_kat]
+      - name: pathb-in-force
+        type: required
+        in_force: true
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
+        code_only: false
+    status_now: fail
+    deviation: [D36]
+
+  - id: C50
+    title: no private line citations in public text
+    state: ruled
+    statement: 'Public code comments, docs and canon carry no line citation of a private document (S:n, D:n, K:n with a line number) and no target sentence.'
+    source: 'ref: the:C50'
+    ruling: 'ref: the:C50'
+    scope: [src/impl/xmr/pathb/, src/c2pool/v37/xmr/, docs/canon/]
+    checks:
+      - name: no-private-line-cites
+        type: forbidden
+        pattern: '\b[SDK]:[0-9]{1,5}(?:-[0-9]{1,5})?\b'
+        paths: [src/impl/xmr/pathb/**, src/c2pool/v37/xmr/**]
+        code_only: false
+    status_now: fail
+    deviation: [D43]
+
 # Lane constants: the consensus lane constants of the XMR lane (C46). Fields:
 # id, name, value, kind (chain, target or ruling), state (ruled or proposed),
 # ref. No check reads this section.
@@ -1232,13 +1379,13 @@ lane_constants:
     ref: 'the:K11'
   - id: K15
     name: owner fee
-    value: 'weight share floor(work x p / 10000), p 0..10000 bp, no cap'
+    value: 'weight share floor(work x p / 10000), p 0..10000 bp, p + give_author_bp <= 10000 (STRIKE; 10000 valid), no cap'
     kind: ruling
     state: ruled
     ref: 'the:K15'
   - id: K16
     name: author donation
-    value: 'give_author_bp 0..10000; default 10 bp; the author identity'
+    value: 'give_author_bp 0..10000; default 10 bp; the author identity; p + give_author_bp <= 10000 (STRIKE; 10000 valid)'
     kind: ruling
     state: ruled
     ref: 'the:K16'
@@ -1256,19 +1403,19 @@ lane_constants:
     ref: 'the:K18'
   - id: K20
     name: monero_rules_digest
-    value: 'one digest over the named Monero constant set'
+    value: 'sha256d("c2pool-v37-xmr-monero-rules-v1" || TLV), 30-byte domain, no terminator; TLV entries u8 id | u8 len | value, ids from 1, strictly ascending; 26 entries; TLV 287 B, preimage 317 B; golden 61affbea4c4ab212b9fbfd8b3a9ae6954840660890df6fca9d8027b8f09738f4 on all four networks'
     kind: chain
     state: ruled
     ref: 'the:K20'
   - id: K21
     name: receipt side data
-    value: 'side_data_v3, 241 bytes; payee kind XMR_STD only; receipt id = keccak256(hashing_blob)'
+    value: 'side_data_v3, 241 bytes; payee kind XMR_STD only; receipt id = keccak256(hashing_blob); the pool identity is not in the rules TLV (HELLO head)'
     kind: ruling
     state: ruled
     ref: 'the:K21'
   - id: K22
-    name: pool_tag codec version
-    value: '1'
+    name: Path B rules codec
+    value: '2'
     kind: ruling
     state: ruled
     ref: 'the:K22'
@@ -1298,10 +1445,22 @@ lane_constants:
     ref: 'the:K29'
   - id: K30
     name: ratchet activation
-    value: '4 x yes >= 3 x all window work; L = 34881; GRACE = 120960; TIMEOUT = 941760; 26 STARTED windows per deployment; FAILED at start + 26 L; a re-proposal of a FAILED epoch number starts at or after timeout + GRACE of every earlier attempt, timeout = start + 26 L; a compiled table that breaks the spacing is refused at start-up; the 34854-position remainder is not part of STARTED; one open deployment; ratchet state committed per carrier (134 bytes, 4 kept windows); default ballot yes'
+    value: '4 x yes >= 3 x all window work; L = 34881; GRACE = 120960; TIMEOUT = 941760; 26 STARTED windows per deployment; FAILED at start + 26 L; after its timeout an attempt never re-opens or re-locks; a re-proposal of a FAILED epoch number starts at or after timeout + GRACE of every earlier attempt, timeout = start + 26 L; a compiled table that breaks the spacing is refused at start-up; the 34854-position remainder is not part of STARTED; one open deployment; ratchet state committed per carrier (134 bytes, 4 kept windows); default ballot yes'
     kind: ruling
     state: ruled
     ref: 'the:K30'
+  - id: C-DOM
+    name: hash domain bytes
+    value: '0x00 MMR bin leaf; 0x01 TOW leaf (not in v1); 0x02 MMR root sha256d(0x02 || LE64(leaf_count) || bag); 0x03 MMR internal node and bag; 0x04 bucket row leaf; 0x05 comp_root node; 0x06 window-sum leaf (sha256d(0x06 || payee || LE256(w)), w); 0x07 window-sum node (sha256d(0x07 || lh || LE256(ls) || rh || LE256(rs)), ls + rs)'
+    kind: chain
+    state: ruled
+    ref: 'the:C-DOM'
+  - id: C-RD
+    name: rules_digest and the genesis digest G
+    value: 'rules_digest(e) = sha256d("c2pool-v37-xmr-lane-rules-v1" || u8 codec || LE16 rules_len || TLV), 28-byte domain, no terminator; codec = K22 = 2; TLV entries u8 id | u8 len | value, id = the K number, ascending; K01-K08, L, GRACE, TIMEOUT u64; versions and small counts u8; basis points u16; K16 u16 + author_ref[66]; K20 32 B; epoch 0: TLV 263 B, preimage 294 B; G = rules_digest(0) per network: mainnet 31ac3ccf21f4aa825bb1ef657fe418b9f58861c1698bbfe357649176fac54e55, testnet bf2df9c500f3cee6344b862917ab0234ec5e65e0fbccf10ad568bfc6080ae213, stagenet 45744e8c486eac5068f5e8179c8e96b7ecdb264ab43610447318b46ff3ffda49, regtest computed at start from the rig K30 values (default set = mainnet values: f91737946910674cbe8dac71618f5c02ab5c6c7d4a431163c9b4d2222ce67e0e)'
+    kind: chain
+    state: ruled
+    ref: 'the:C-RD'
   - id: K30f
     name: genesis rules epoch
     value: '0; deployment epoch_no <= 2^15 - 1'
