@@ -4544,6 +4544,15 @@ int main(int argc, char* argv[]) {
                         is_testnet ? "tLTC" : "LTC",
                         miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0,
                         core::MiningInterface::BlockAuthorship::sharechain_peer);
+                    // coinbase_txid = the gentx hash the share commits to.
+                    // tx_count stays null: v34+ shares carry no tx list.
+                    try {
+                        mi->set_found_block_body(block_hash.GetHex(),
+                            ltc::derive_gentx_hash(*s, p2p_node->coin_params()).GetHex(),
+                            std::nullopt);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] peer found-block coinbase_txid: " << e.what();
+                    }
                     mi->schedule_block_verification(block_hash.GetHex());
                 });
             };
