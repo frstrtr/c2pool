@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # pre-push hook: run the attribution gate over every pushed ref (the new
-# commit messages, the branch name and the lines the pushed commits add) and
-# refuse the push on any marker from ci/attribution-patterns.txt. Install in a
-# clone with
+# commit messages, their author and committer, the branch name and the lines
+# the pushed commits add) and refuse the push on any marker from
+# ci/attribution-patterns.txt or ci/attribution-identity-patterns.txt. Install
+# in a clone with
 #   git config core.hooksPath scripts/ci/hooks
 set -uo pipefail
 export LC_ALL=C.UTF-8

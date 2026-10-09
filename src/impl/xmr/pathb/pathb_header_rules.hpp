@@ -10,6 +10,7 @@
 //
 //   S2.3 #9 (every receipt) and S1.3 #7 (carriers), one rule set, STRIKE:
 //     major == hf_version(h)                    (hf_version_for_height on the lane's network)
+//     vote(minor) >= hf_version(h)              (vote(m) = m, minor 0 counts as 1; E-48)
 //     timestamp >= median60(P_r branch)         (pathb_branch.hpp timestamp_median_for_child;
 //                                                no median below 60 blocks: the rule does not apply)
 //     n_tx <= floor(2 Z(P_r) / w_min); D == floor(log2(n_tx + 1 + X(hf)))
@@ -43,17 +44,22 @@ namespace c2pool::xmr::pathb {
 enum class HeaderFault : std::uint8_t {
     None,
     MajorVersion,          // major != hf_version(h)
+    MinorVote,             // vote(minor) < hf_version(h), minor 0 counting as 1
     TimestampBelowMedian,  // timestamp < median60(P_r branch)
     TxCount,               // n_tx above floor(2 Z(P_r) / w_min), or no miner tx
     Depth,                 // D != floor(log2(n_tx + 1 + X(hf)))
     OverCap,               // body length above RECEIPT_CAP(hf, P_r)
 };
 
-// The two header rules. `hf`: the version Monero requires at the receipt's
+// Monero's block vote: the minor version, 0 counting as 1.
+inline constexpr std::uint64_t block_vote(std::uint64_t minor) noexcept { return minor == 0 ? 1 : minor; }
+
+// The header rules. `hf`: the version Monero requires at the receipt's
 // height; `median60`: empty when the branch is below 60 blocks.
 inline constexpr HeaderFault header_rules(const HashingBlob& b, std::uint8_t hf,
                                           std::optional<std::uint64_t> median60) noexcept {
     if (b.major != hf) return HeaderFault::MajorVersion;
+    if (block_vote(b.minor) < hf) return HeaderFault::MinorVote;
     if (median60.has_value() && b.timestamp < *median60) return HeaderFault::TimestampBelowMedian;
     return HeaderFault::None;
 }

@@ -38,9 +38,12 @@
 //                   held.
 //   not served    n = 0, leaf_count = 0, no peaks, S zero, no references.
 //
-// Serving rule: `at` on the server's best chain at or below its tip; bins in
+// Serving rule: `at` on the server's best chain at or below its tip (an `at`
+// the server has bound; a ClaimView's at_servable when one is given); bins in
 // order from bin_lo while the server proves the leaf at leaf_count(tip(at)),
-// holds the rows and holds a reference for every identity; otherwise n = 0.
+// holds the rows (a ClaimView's leaf_servable when one is given) and holds a
+// reference for every identity; otherwise n = 0. A reply holds whole bins
+// only, at most max_bytes in all (P-48); a first bin above max_bytes: n = 0.
 // No strike either way (ruling 38).
 //
 // Receiver, per frame, in order (BucketsAssembly::add_frame):
@@ -71,7 +74,9 @@
 // another server (abandon()). Verdicts and assembly: ruling 38.
 //
 // Policy (ruling 23): P-39 frame buffer, P-41 requests in flight per peer,
-// P-42 bytes per peer per minute; over a budget: DROP, no verdict.
+// P-42 bytes per peer per minute; over a budget: DROP, no verdict; P-48 bytes
+// per request: the requesting peer's remaining P-42 bytes in the current
+// minute (BucketServeBudget::remaining), a lower fixed cap by flag.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -93,6 +98,7 @@
 #include "pathb_bin_store.hpp"          // BinStore, SealedBin, bin_leaf_count, kBucketRowBytes, kLeafPayloadBytes
 #include "pathb_buckets.hpp"            // L1Bucket, BucketRow, BinMmr, mmr_verify, bucket_check
 #include "pathb_caps.hpp"               // blob_cap_ctx (P-14)
+#include "pathb_claim_view.hpp"         // ClaimView (the serve side's extension point)
 #include "pathb_joiner.hpp"             // peaks_match_root
 #include "pathb_params.hpp"
 #include "pathb_ratchet_state.hpp"      // RatchetStateBytes, decode_ratchet_state
@@ -141,6 +147,9 @@ inline constexpr std::string_view kBucketInflightFlag = "--pathb-bucket-inflight
 inline constexpr std::uint64_t kBucketRateFrames = 10;
 inline constexpr std::string_view kBucketRateFlag = "--pathb-bucket-rate";
 inline constexpr std::uint64_t kSecondsPerMinute = 60;
+// P-48 FC_BUCKETS bytes per request, default the requesting peer's remaining
+// P-42 bytes in the current minute; a lower fixed cap by flag.
+inline constexpr std::string_view kBucketServeCapFlag = "--pathb-bucket-serve-cap";
 
 // The FB_CTX frame header: FH | id[32] | u32 len.
 inline constexpr std::uint64_t kCtxFrameHeaderBytes = kFrameHeaderBytes + kHashBytes + kU32Bytes;
@@ -801,24 +810,30 @@ namespace bw_detail {
 inline std::uint64_t head_bytes(std::size_t n_peaks) { return kBucketsHeadBytes + n_peaks * kHashBytes + kBucketsMidBytes + kBucketsEntryCountBytes; }
 inline std::uint64_t entry_head_bytes(std::size_t path_len) { return kEntryFixedBytes + path_len * kHashBytes; }
 
-// true when every identity of the bin's rows has a reference.
+// true when every identity of the bin's rows has a reference; then (only then)
+// the bin's references are added to by_id.
 inline bool refs_complete(const SealedBin& sb, std::map<Hash32, XmrKeyRef>& by_id) {
     std::map<Hash32, XmrKeyRef> held;
     for (const XmrKeyRef& k : sb.refs) held.emplace(key_ref_identity(k), k);
+    std::vector<std::pair<Hash32, XmrKeyRef>> add;
     for (const Hash32& id : row_identities(sb.bucket.rows)) {
         const auto it = held.find(id);
         if (it == held.end()) return false;
-        by_id.emplace(id, it->second);
+        add.emplace_back(id, it->second);
     }
+    for (const auto& [id, ref] : add) by_id.emplace(id, ref);
     return true;
 }
 
 }  // namespace bw_detail
 
-// The FC_BUCKETS frames answering req from src, each at most frame_bytes; one
-// not-served frame when nothing can be served.
+// The FC_BUCKETS frames answering req from src, each at most frame_bytes and
+// at most max_bytes in all (P-48): the bins served are a prefix of whole bins;
+// one not-served frame when nothing can be served (or the first bin alone
+// passes max_bytes). The bins are proved and collected up to the first one
+// whose frames pass max_bytes (or that no frame holds), that bin included.
 inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketServeSource& src, const GetBuckets& req,
-                                                                 std::uint64_t frame_bytes) {
+                                                                 std::uint64_t frame_bytes, std::uint64_t max_bytes) {
     const std::vector<std::vector<std::uint8_t>> none{encode_buckets_not_served(req.chain_id, req.at)};
     if (src.leaf_count == 0 || src.mmr == nullptr || req.bin_lo > req.bin_hi) return none;
     const std::optional<std::vector<Hash32>> peaks = src.mmr->prefix_peaks(src.leaf_count);
@@ -828,8 +843,91 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketSer
         const SealedBin* sb;
         std::vector<Hash32> path;
     };
-    std::vector<Served> served;
     std::map<Hash32, XmrKeyRef> by_id;
+    const std::uint64_t head = bw_detail::head_bytes(peaks->size());
+    // Packs served bins into frames, one bin per add() in order; add() false:
+    // the bin does not fit an empty frame, or with it the reply passes
+    // max_bytes (stop before it). keep false: the frames are measured only.
+    struct Pack {
+        const GetBuckets& req;
+        const BucketServeSource& src;
+        const std::vector<Hash32>& peaks;
+        const std::map<Hash32, XmrKeyRef>& by_id;
+        std::uint64_t head;
+        std::uint64_t frame_bytes;
+        std::uint64_t max_bytes;
+        bool keep;
+        std::vector<std::vector<std::uint8_t>> frames{};
+        std::uint64_t sent = 0;
+        BucketsReply cur{};
+        std::set<Hash32> cur_ids{};
+        std::uint64_t cur_bytes = 0;
+
+        void fresh() {
+            cur = BucketsReply{};
+            cur.chain_id = req.chain_id;
+            cur.at = req.at;
+            cur.leaf_count = src.leaf_count;
+            cur.peaks = peaks;
+            cur.s_parent = src.s_parent;
+            cur_ids.clear();
+            cur_bytes = head;
+        }
+        void flush() {
+            if (!cur.entries.empty()) {
+                for (const Hash32& id : cur_ids) cur.refs.push_back(by_id.at(id));
+                std::vector<std::uint8_t> f = *encode_buckets(cur);
+                sent += f.size();
+                if (keep) frames.push_back(std::move(f));
+            }
+            fresh();
+        }
+        std::uint64_t row_cost(const BucketRow& r) const {
+            std::uint64_t c = kBucketRowBytes;
+            if (cur_ids.count(r.miner) == 0) c += kKeyRefBytes;
+            if (!(r.owner == kZeroHash) && cur_ids.count(r.owner) == 0 && r.owner != r.miner) c += kKeyRefBytes;
+            return c;
+        }
+        bool add(const Served& s) {
+            const std::vector<BucketRow>& rows = s.sb->bucket.rows;
+            const std::uint64_t eh = bw_detail::entry_head_bytes(s.path.size());
+            const std::uint64_t one_row = rows.empty() ? 0 : kBucketRowBytes + 2 * kKeyRefBytes;
+            if (head + eh + one_row > frame_bytes || rows.size() > UINT32_MAX) return false;  // an empty frame cannot hold it
+            std::size_t r = 0;
+            do {
+                const std::uint64_t first = r < rows.size() ? row_cost(rows[r]) : 0;
+                if (cur_bytes + eh + first > frame_bytes || cur.entries.size() == kMaxEntriesPerFrame) flush();
+                BucketEntry e;
+                e.payload = s.sb->bucket;
+                e.payload.rows.clear();
+                e.rows_total = static_cast<std::uint32_t>(rows.size());
+                e.row_first = static_cast<std::uint32_t>(r);
+                e.path = s.path;
+                cur_bytes += eh;
+                while (r < rows.size() && e.rows.size() < kMaxRowsPerEntry) {
+                    const std::uint64_t c = row_cost(rows[r]);
+                    if (cur_bytes + c > frame_bytes) break;
+                    cur_bytes += c;
+                    cur_ids.insert(rows[r].miner);
+                    if (!(rows[r].owner == kZeroHash)) cur_ids.insert(rows[r].owner);
+                    e.rows.push_back(rows[r]);
+                    ++r;
+                }
+                cur.entries.push_back(std::move(e));
+                if (r < rows.size()) flush();
+            } while (r < rows.size());
+            const std::uint64_t total = sent + (cur.entries.empty() ? 0 : cur_bytes);
+            if (total > max_bytes) return false;  // this bin passes the reply's bytes: stop before it
+            return true;
+        }
+    };
+
+    // the bins from bin_lo, each proved at leaf_count with its body and references held, measured as they
+    // are collected; `fit`: the whole bins whose frames stay within max_bytes in all
+    std::vector<Served> served;
+    std::size_t fit = 0;
+    Pack probe{req, src, *peaks, by_id, head, frame_bytes, max_bytes, false};
+    probe.fresh();
     for (std::uint64_t bin = req.bin_lo; bin <= req.bin_hi; ++bin) {
         // leaf_index = bin - b0; a bin below b0 wraps to an index no MMR proves
         const std::uint64_t i = bin - src.b0;
@@ -838,84 +936,36 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketSer
         const SealedBin* sb = src.bucket ? src.bucket(bin) : nullptr;
         if (sb == nullptr) break;  // rows not held
         if (sb->bucket.bin_lo != bin || src.mmr->leaf(i) != std::optional<Hash32>(sb->leaf)) break;  // not the leaf's body
-        std::map<Hash32, XmrKeyRef> ids = by_id;
-        if (!bw_detail::refs_complete(*sb, ids)) break;  // an identity without its reference
+        if (!bw_detail::refs_complete(*sb, by_id)) break;  // an identity without its reference
         Served s{sb, {}};
         for (const auto& step : pr->path) s.path.push_back(step.first);
         served.push_back(std::move(s));
-        by_id = std::move(ids);
+        if (fit + 1 == served.size() && probe.add(served.back())) fit = served.size();
+        if (fit < served.size()) break;  // this bin passes max_bytes (or no frame holds it): no further bin is collected
         if (bin == UINT64_MAX) break;
     }
 
-    const std::uint64_t head = bw_detail::head_bytes(peaks->size());
-    std::vector<std::vector<std::uint8_t>> frames;
-    BucketsReply cur;
-    std::set<Hash32> cur_ids;
-    std::uint64_t cur_bytes = head;
-    const auto fresh = [&] {
-        cur = BucketsReply{};
-        cur.chain_id = req.chain_id;
-        cur.at = req.at;
-        cur.leaf_count = src.leaf_count;
-        cur.peaks = *peaks;
-        cur.s_parent = src.s_parent;
-        cur_ids.clear();
-        cur_bytes = head;
-    };
-    const auto flush = [&] {
-        if (!cur.entries.empty()) {
-            for (const Hash32& id : cur_ids) cur.refs.push_back(by_id.at(id));
-            frames.push_back(*encode_buckets(cur));
-        }
-        fresh();
-    };
-    const auto row_cost = [&](const BucketRow& r) {
-        std::uint64_t c = kBucketRowBytes;
-        if (cur_ids.count(r.miner) == 0) c += kKeyRefBytes;
-        if (!(r.owner == kZeroHash) && cur_ids.count(r.owner) == 0 && r.owner != r.miner) c += kKeyRefBytes;
-        return c;
-    };
-    fresh();
-    for (const Served& s : served) {
-        const std::vector<BucketRow>& rows = s.sb->bucket.rows;
-        const std::uint64_t eh = bw_detail::entry_head_bytes(s.path.size());
-        const std::uint64_t one_row = rows.empty() ? 0 : kBucketRowBytes + 2 * kKeyRefBytes;
-        if (head + eh + one_row > frame_bytes || rows.size() > UINT32_MAX) break;  // an empty frame cannot hold it
-        std::size_t k = 0;
-        do {
-            const std::uint64_t first = k < rows.size() ? row_cost(rows[k]) : 0;
-            if (cur_bytes + eh + first > frame_bytes || cur.entries.size() == kMaxEntriesPerFrame) flush();
-            BucketEntry e;
-            e.payload = s.sb->bucket;
-            e.payload.rows.clear();
-            e.rows_total = static_cast<std::uint32_t>(rows.size());
-            e.row_first = static_cast<std::uint32_t>(k);
-            e.path = s.path;
-            cur_bytes += eh;
-            while (k < rows.size() && e.rows.size() < kMaxRowsPerEntry) {
-                const std::uint64_t c = row_cost(rows[k]);
-                if (cur_bytes + c > frame_bytes) break;
-                cur_bytes += c;
-                cur_ids.insert(rows[k].miner);
-                if (!(rows[k].owner == kZeroHash)) cur_ids.insert(rows[k].owner);
-                e.rows.push_back(rows[k]);
-                ++k;
-            }
-            cur.entries.push_back(std::move(e));
-            if (k < rows.size()) flush();
-        } while (k < rows.size());
-    }
-    flush();
-    if (frames.empty()) return none;
-    return frames;
+    Pack reply{req, src, *peaks, by_id, head, frame_bytes, max_bytes, true};
+    reply.fresh();
+    for (std::size_t b = 0; b < fit; ++b) (void)reply.add(served[b]);
+    reply.flush();
+    if (reply.frames.empty()) return none;
+    return std::move(reply.frames);
 }
 
 // The serving rule over the node's BinStore: `at` on the best chain (at or
 // below its tip); S_parent(at) from the caller (the ratchet state at at's
-// parent; nullopt: not served).
+// parent; nullopt: not served); at most max_bytes (P-48). With a ClaimView,
+// at_servable(at, at_digest) before the store is read and leaf_servable(bin)
+// for every bin; without one (a full node), the store's best chain holds only
+// carriers this node has bound and leaves it sealed itself.
 inline std::vector<std::vector<std::uint8_t>> serve_buckets(const BinStore& store, const GetBuckets& req,
                                                             const std::optional<RatchetStateBytes>& s_parent,
-                                                            std::uint64_t frame_bytes) {
+                                                            std::uint64_t frame_bytes, std::uint64_t max_bytes,
+                                                            const ClaimView* claims = nullptr,
+                                                            const Hash32& at_digest = Hash32{}) {
+    if (claims != nullptr && !claims->at_servable(req.at, at_digest))
+        return {encode_buckets_not_served(req.chain_id, req.at)};  // an at the server has not bound
     const LaneView view = store.view_at(req.at);
     if (!view.ok() || view.pos() == 0) return {encode_buckets_not_served(req.chain_id, req.at)};  // held, above genesis
     if (view.fork_pos() != view.pos()) return {encode_buckets_not_served(req.chain_id, req.at)};  // best chain only
@@ -924,9 +974,12 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets(const BinStore& stor
     src.b0 = store.b0();
     src.leaf_count = view.leaf_count_at(view.pos() - 1);  // leaf_count(tip(at))
     src.mmr = &store.best_mmr();
-    src.bucket = [&view](std::uint64_t bin) { return view.bucket(bin); };
+    src.bucket = [&view, claims](std::uint64_t bin) -> const SealedBin* {
+        if (claims != nullptr && !claims->leaf_servable(bin)) return nullptr;  // stop before this bin
+        return view.bucket(bin);
+    };
     src.s_parent = s_parent.value_or(RatchetStateBytes{});
-    return serve_buckets_from(src, req, frame_bytes);
+    return serve_buckets_from(src, req, frame_bytes, max_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +1014,13 @@ public:
     std::uint64_t inflight(std::uint64_t peer) const {
         const auto it = peers_.find(peer);
         return it == peers_.end() ? 0 : it->second.inflight;
+    }
+
+    // P-48 default: the peer's P-42 bytes left in the current minute.
+    std::uint64_t remaining(std::uint64_t peer, std::uint64_t now_s) {
+        Peer& s = peers_[peer];
+        roll(s, now_s);
+        return s.bytes >= p_.bytes_per_minute ? 0 : p_.bytes_per_minute - s.bytes;
     }
 
 private:
