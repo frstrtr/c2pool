@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/test/v37_xmr_pathb_admit_kat.cpp
 // ---------------------------------------------------------------------------
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -73,6 +74,7 @@ void rows_head() {
         KatNet net;
         KatNode n(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 40);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 tip = chain.back();
         const std::uint64_t ht = h_pos(41);
 
@@ -137,14 +139,14 @@ void rows_head() {
                   "row 15: owner_ref mismatch at p > 0 -> STRIKE");
             const pb::CarrierBodyV3 c = carrier_on(n, tip, ht, {bad}, 1, 4132);
             check(is(admit(n, c), AdmitVerdict::Strike, RowId::R15), "row 15: a carried body's ID-1 -> the frame STRIKE");
-            // N1: the attacker names the victim's identity with its own key; the victim's receipt matches
+            // identity poisoning: the attacker names the victim's identity with its own key; the victim's receipt matches
             pb::ReceiptBodyV3 att = body_on(n, tip, ht, 8, 4133);
             att.side.payee = net.ids[9];
             const pb::ReceiptBodyV3 victim = body_on(n, tip, ht, 9, 4134);
             const pb::AdmitResult x = pb::admit_receipt(n.env(), bytes_of(att), pb::Role::Pending);
             const pb::AdmitResult y = pb::admit_receipt(n.env(), bytes_of(victim), pb::Role::Pending);
             check(x.verdict == AdmitVerdict::Strike && x.strike == 1 && y.verdict == AdmitVerdict::AdmitPending,
-                  "row 15: N1 poisoning: the attacker STRIKE, the victim's receipt admitted (Match)");
+                  "row 15: identity poisoning: the attacker STRIKE, the victim's receipt admitted (Match)");
         }
         // row 16: pool_id, E-11 (p + give_author_bp <= 10000)
         {
@@ -284,6 +286,7 @@ void rows_head() {
         T.attempts.push_back(pb::Deployment{1, seq32(0x7c), pb::kKindFixed, 0, 1000000, kFixed});
         KatNode n(net, kJ0, pb::kRuledRatchetParams, T);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, kFixed - 2);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 tip = chain.back();  // position 18: x = 19 < H_hold
         const pb::CarrierBodyV3 c19 = carrier_on(n, tip, h_pos(19), {}, 1, 4300);
         check(admit_place(n, c19).placed, "row 3: x = 19 < H_hold 20: judged and placed");
@@ -347,6 +350,7 @@ void rows_body() {
         KatNet net;
         KatNode n(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 60);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 L = chain.back();  // position 60
         const std::uint64_t hL = n.node(L).h;
         const std::uint64_t hc = h_pos(61);
@@ -562,6 +566,7 @@ void rows_body() {
             const pb::Hash32 f = chain[19];
             const std::uint64_t hf = m.node(f).h;
             const std::vector<pb::Hash32> side = scaffold_chain(m, f, 120, 0x5D, [&](std::uint64_t) { return hf; }, 3);
+            if (side.empty()) return;  // the harness printed its FAIL line
             const pb::Hash32 t = side.back();
             const std::uint64_t d_side = m.tree.next_difficulty(t).value(), d_l = m.tree.next_difficulty(L).value();
             check(d_side != d_l, "row 25: the side tip's d (" + std::to_string(d_side) + ") differs from L's (" + std::to_string(d_l) + ")");
@@ -613,6 +618,7 @@ void rows_body() {
         KatNet net;
         KatNode n(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 110, 1, h_fast);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 P = chain.back();  // position 110, h = b0 + 110
         const std::uint64_t hP = n.node(P).h;
         check(n.store.head().leaf_count > 0, "rows 21, 27: bins sealed on the chain");
@@ -650,6 +656,7 @@ void rows_body() {
             KatNode m(n);
             const pb::Hash32 f = chain[104];  // position 105
             const std::vector<pb::Hash32> side = scaffold_chain(m, f, 3, 0x5F, [&](std::uint64_t) { return m.node(f).h; }, 6);
+            if (side.empty()) return;  // the harness printed its FAIL line
             const pb::Hash32 S = side.back();  // position 108, H(S) = h(105)
             const std::uint64_t HS = m.node(S).H;
             std::uint64_t tp = 1;
@@ -797,6 +804,19 @@ Edge make_edge(const Pair& q, std::uint64_t nonce) {
     return e;
 }
 
+// A tree for serve_headers that counts the ids a full path materialises (tree.path).
+struct PathSpy {
+    const pb::CarrierTree& t;
+    mutable std::uint64_t path_ids = 0;
+    const pb::CarrierNode* find(const pb::Hash32& id) const { return t.find(id); }
+    std::optional<pb::Hash32> ancestor_at(const pb::Hash32& id, std::uint64_t pos) const { return t.ancestor_at(id, pos); }
+    std::optional<std::vector<pb::Hash32>> path(const pb::Hash32& a, const pb::Hash32& b) const {
+        std::optional<std::vector<pb::Hash32>> out = t.path(a, b);
+        if (out) path_ids += out->size();
+        return out;
+    }
+};
+
 void section4() {
     run_part("section 4", [] {
         KatNet net;
@@ -874,6 +894,7 @@ void section4() {
             const std::uint64_t g = kL - kJ0;
             const std::vector<pb::Hash32> s1 = scaffold_chain(*q.nf, q.at(g), kJ0 + 1, 0x22, h_pos, 6);
             const std::vector<pb::Hash32> s1r = scaffold_chain(*q.nr, q.at(g), kJ0 + 1, 0x22, h_pos, 6);
+            if (s1.empty()) return;  // the harness printed its FAIL line
             const pb::Hash32 pc = s1.back();
             const std::uint64_t ppc = q.nf->node(pc).pos, fc = ppc - 1000;
             const pb::Hash32 fcid = s1[fc - g - 1];
@@ -900,7 +921,7 @@ void section4() {
                   "gate: N_floor, parent J_0 + 1 below its tip: DEFER OwnChainDeep, 0 tokens, 0 view_at calls, no fetch");
             const Admitted b = admit_place(*q.nr, c);
             check(b.placed && held_side(b.w), "gate: N_raised judges c and places it on a side branch");
-            // RR-FIX-5 (d): a copy with its parent replaced by the best-chain carrier J_0 + 1 below the tip, sent first
+            // a copy with its parent replaced by the best-chain carrier J_0 + 1 below the tip (no PoW), sent first
             const pb::CarrierBodyV3 honest = carrier_on(*q.nf, L, h_pos(kL + 1), {}, 2, 7501);
             pb::CarrierBodyV3 forged = honest;
             forged.own.side.tip = q.at(pp);
@@ -919,7 +940,7 @@ void section4() {
             check(deferred(fa, Missing::OwnChainDeep) && parked && ha.placed && st.waiting_keys() == 0,
                   "gate: a no-PoW copy naming an old best-chain parent DEFERs only itself; the honest copy is placed");
         }
-        // RR-FIX-2: a frame naming position 1 as parent: DEFER after one tree lookup (no walk)
+        // a frame naming position 1 as parent: DEFER after one tree lookup (no walk)
         {
             Pair q = copy(base);
             const pb::CarrierBodyV3 c = carrier_on(*q.nr, q.at(1), h_pos(2), {}, 1, 7510);
@@ -928,12 +949,13 @@ void section4() {
             check(deferred(a, Missing::OwnChainDeep) && q.nf->tree.walk_steps() == steps,
                   "gate: a parent at position 1: DEFER OwnChainDeep, the step counter at 0");
         }
-        // RR-FIX-1: tree.best() on a closure-material branch whose switch_best answered Deep; a frame on it
+        // tree.best() on a closure-material branch whose switch_best answered Deep; a frame on it
         {
             Pair q = copy(base);
             KatNode& n = *q.nf;
             const std::uint64_t fb = n.store.base_pos() - 60;  // in [base_pos - J_0, base_pos)
             const std::vector<pb::Hash32> br = scaffold_chain(n, q.at(fb), kL - fb + 2, 0x24, h_pos, 8);
+            if (br.empty()) return;  // the harness printed its FAIL line
             const pb::Hash32 bt = br.back();
             pb::LaneBatch batch;
             check(n.tree.best().id == bt && n.store.best_tip() == L && n.store.switch_best(bt, &batch) == pb::SwitchVerdict::Deep,
@@ -945,6 +967,79 @@ void section4() {
             const pb::AdmitResult a = admit(n, cb);
             check(deferred(a, Missing::OwnChainDeep) && n.view_log.empty(),
                   "gate: a frame on that branch: DEFER OwnChainDeep, 0 view_at calls (measured on store.best_tip())");
+        }
+
+        // f of rows 3 and 18 against the store's best chain: a tip on it walks no step; an off-chain tip walks to
+        // its first best-chain carrier only
+        {
+            Pair q = copy(base);
+            KatNode& n = *q.nf;
+            const auto pending = [&](const pb::ReceiptBodyV3& r) {
+                const std::uint64_t s0 = n.tree.walk_steps();
+                const pb::AdmitResult a = pb::admit_receipt(n.env(), bytes_of(r), pb::Role::Pending);
+                return std::make_pair(a, n.tree.walk_steps() - s0);
+            };
+            const pb::Hash32 t1 = q.at(1), tk = q.at(kL - 1000);
+            const auto p1 = pending(body_on(n, t1, n.node(t1).h, 3, 7530));
+            const auto pk = pending(body_on(n, tk, n.node(tk).h, 3, 7531));
+            check(is(p1.first, AdmitVerdict::Refuse, RowId::R21) && p1.first.strike == 0 && p1.second == 0,
+                  "epoch f: a pending receipt whose tip is position 1 (on the best chain): REFUSE row 21, 0 tokens, the step "
+                  "counter at 0 (" + desc(p1.first) + ", " + std::to_string(p1.second) + ")");
+            check(is(pk.first, AdmitVerdict::AdmitPending, RowId::R30) && pk.second == 0,
+                  "epoch f: a pending receipt whose tip is 1,000 below the best tip: PENDING, the step counter at 0 (" +
+                          std::to_string(pk.second) + ")");
+            const std::uint64_t g = kL - 10;
+            const std::vector<pb::Hash32> side = scaffold_chain(n, q.at(g), 5, 0x29, h_pos, 4);
+            if (side.empty()) return;  // the harness printed its FAIL line
+            const pb::Hash32 ts = side.back();
+            const auto ps = pending(body_on(n, ts, n.node(ts).h, 3, 7532));
+            check(is(ps.first, AdmitVerdict::AdmitPending, RowId::R30) && ps.second == n.node(ts).pos - g,
+                  "epoch f: a pending receipt whose tip is off the best chain, 5 above its fork g: PENDING, the step counter "
+                  "at pos(t) - g = 5 (" + desc(ps.first) + ", " + std::to_string(ps.second) + ")");
+            std::vector<pb::ReceiptBodyV3> rs;
+            for (std::uint64_t j = 0; j < 16; ++j) rs.push_back(body_on(n, t1, n.node(t1).h, j % 5, 7540 + j));
+            const pb::CarrierBodyV3 c = carrier_on(n, L, h_pos(kL + 1), rs, 1, 7560);
+            const std::uint64_t s0 = n.tree.walk_steps(), rx0 = n.rx_calls;
+            const pb::AdmitResult a = admit(n, c);
+            const std::uint64_t steps = n.tree.walk_steps() - s0;
+            check(is(a, AdmitVerdict::Strike, RowId::R21) && n.rx_calls == rx0 && steps == kL - n.store.base_pos(),
+                  "epoch f: a frame on L carrying 16 receipts whose tip is position 1: STRIKE row 21, RandomX 0; the steps are "
+                  "the row-4 gate's J (" + desc(a) + ", " + std::to_string(steps) + ")");
+        }
+        // FC_HEADERS: the reply collects at most max placed carriers (by position on the store's best chain)
+        {
+            Pair q = copy(base);
+            KatNode& n = *q.nf;
+            const PathSpy spy{n.tree};
+            const std::uint64_t s0 = n.tree.walk_steps();
+            const std::vector<pb::CarrierHeader> one = pb::serve_headers(spy, n.store, n.bodies, n.headers, q.at(0), L, 1);
+            check(one.size() == 1 && pb::receipt_id(one[0].own) == q.at(1) && spy.path_ids == 0 && n.tree.walk_steps() == s0,
+                  "FC_HEADERS: from genesis with max 1 on the 3,611 chain: one header (position 1), no path materialised (" +
+                          std::to_string(spy.path_ids) + " ids), no walk step");
+            const std::vector<pb::CarrierHeader> many = pb::serve_headers(spy, n.store, n.bodies, n.headers, q.at(0), L, kJ0);
+            bool in_order = many.size() == kJ0;
+            for (std::size_t i = 0; in_order && i < many.size(); ++i) in_order = pb::receipt_id(many[i].own) == q.at(i + 1);
+            check(in_order && spy.path_ids == 0, "FC_HEADERS: from genesis with max J_0: positions 1 .. J_0 in order");
+            // a stop on a side branch: the side part by parent steps, the rest by position; the path's headers, at most max
+            const std::uint64_t g = kL - 10;
+            const std::vector<pb::Hash32> side = scaffold_chain(n, q.at(g), 5, 0x2A, h_pos, 4);
+            if (side.empty()) return;  // the harness printed its FAIL line
+            const pb::Hash32 from = q.at(g - 20), stop = side.back();
+            const std::optional<std::vector<pb::Hash32>> full = n.tree.path(from, stop);
+            bool same = full.has_value() && full->size() == 25;
+            for (std::uint64_t mx : {std::uint64_t{0}, std::uint64_t{3}, std::uint64_t{20}, std::uint64_t{21}, std::uint64_t{25},
+                                     std::uint64_t{1152}}) {
+                const std::vector<pb::CarrierHeader> r = pb::serve_headers(spy, n.store, n.bodies, n.headers, from, stop, mx);
+                same = same && r.size() == std::min<std::uint64_t>(mx, 25);
+                for (std::size_t i = 0; same && i < r.size(); ++i) same = pb::receipt_id(r[i].own) == (*full)[i];
+            }
+            check(same && spy.path_ids == 0, "FC_HEADERS: a stop on a side branch: the headers of the path after `from`, at most max, in order");
+            const bool none1 = pb::serve_headers(spy, n.store, n.bodies, n.headers, q.at(kL - 7), stop, 1152).empty();
+            const bool none2 = pb::serve_headers(spy, n.store, n.bodies, n.headers, side.front(), L, 1152).empty();
+            const bool self = pb::serve_headers(spy, n.store, n.bodies, n.headers, stop, stop, 1152).empty();
+            check(none1 && none2 && self && spy.path_ids == 0,
+                  "FC_HEADERS: `from` not on stop's chain (best chain above the fork; a side carrier for a best-chain stop): "
+                  "no header; from = stop: no header");
         }
 
         // the closure: the 2-level late sibling. parent(c) = L - 1; t = c_t at f1 + 1, f1 = L - 1,153;
@@ -1173,6 +1268,7 @@ void section4() {
             for (KatNode* n : {q.nf.get(), q.nr.get()})
                 fb = scaffold_chain(*n, q.at(g), flat - g + 597, 0x25, [&](std::uint64_t) { return hg; }, 9);
             KatNode sc(*q.nr);
+            if (fb.empty()) return;  // the harness printed its FAIL line
             const pb::Hash32 a0 = fb.back();
             const pb::CarrierBodyV3 a1 = carrier_on(sc, a0, hg, {}, 10, 8200);
             const bool p1 = admit_place(sc, a1, CarrierRole::Closure).placed;
@@ -1335,6 +1431,19 @@ struct FailingSealStore {
     const pb::LaneDelta* delta(const pb::Hash32& id) const { return s.delta(id); }
     const pb::Hash32& best_tip() const { return s.best_tip(); }
     pb::SwitchVerdict switch_best(const pb::Hash32& t, pb::LaneBatch* b) { return s.switch_best(t, b); }
+    bool drop_side(const pb::Hash32& id) { return s.drop_side(id); }
+};
+
+// A store whose switch_best fails (NotSealed) and changes nothing.
+struct FailingSwitchStore {
+    pb::BinStore& s;
+    pb::AddVerdict add_carrier(const pb::Hash32& id, const pb::Hash32& parent, std::uint64_t h) { return s.add_carrier(id, parent, h); }
+    std::optional<pb::Ingest> ingest(const pb::Hash32& c, pb::Placement r) { return s.ingest(c, std::move(r)); }
+    std::optional<std::uint64_t> seal(const pb::Hash32& c) { return s.seal(c); }
+    const pb::LaneDelta* delta(const pb::Hash32& id) const { return s.delta(id); }
+    const pb::Hash32& best_tip() const { return s.best_tip(); }
+    pb::SwitchVerdict switch_best(const pb::Hash32&, pb::LaneBatch*) { return pb::SwitchVerdict::NotSealed; }
+    bool drop_side(const pb::Hash32& id) { return s.drop_side(id); }
 };
 
 void contract() {
@@ -1342,6 +1451,7 @@ void contract() {
         KatNet net;
         KatNode n(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 60);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 L = chain.back();
         const std::uint64_t hL = n.node(L).h, hc = h_pos(61);
 
@@ -1520,6 +1630,50 @@ void contract() {
             const pb::WriteResult wb = pb::place_admitted(m2.tree, m2.store, m2.ar, m2.bodies, bad, &m2.alarm);
             check(wb.outcome == pb::WriteOutcome::NodeInternal && m2.store.journal_size() == jsz && !m2.store.holds(bad.announce.id),
                   "write step: a FoldMismatch at tree.place: node-internal, nothing written to the store");
+            // an extension whose switch_best fails after the marks: the write step is undone
+            KatNode m3(n);
+            const pb::AdmitResult r3 = admit(m3, c);
+            FailingSwitchStore fw{m3.store};
+            const pb::Hash32 cid = pb::receipt_id(c.own), tree_best = m3.tree.best().id, store_best = m3.store.best_tip();
+            const std::size_t ar_rows = m3.ar.rows().size(), alarms = m3.alarm.count();
+            const pb::WriteResult w3 = pb::place_admitted(m3.tree, fw, m3.ar, m3.bodies, r3, &m3.alarm);
+            const bool undone = r3.verdict == AdmitVerdict::AdmitCarrier && w3.outcome == pb::WriteOutcome::NodeInternal
+                                && m3.tree.find(cid) == nullptr && m3.tree.best().id == tree_best && m3.store.best_tip() == store_best
+                                && !m3.store.holds(cid) && m3.ar.rows().size() == ar_rows && m3.bodies.get(cid) == nullptr
+                                && m3.alarm.count() == alarms + 1;
+            const pb::WriteResult w4 = pb::place_admitted(m3.tree, m3.store, m3.ar, m3.bodies, r3, &m3.alarm);
+            check(undone && w4.outcome == pb::WriteOutcome::Extended && m3.tree.best().id == cid && m3.store.best_tip() == cid,
+                  "write step: an extension whose switch_best fails after the marks -> node-internal, undone: c dropped, its "
+                  "delta and body removed, tree.best(), the store's best tip and AR unchanged; the same frame placed after");
+        }
+        // the write step on an extension with an activation row (a fixed descriptor this build implements, at 20)
+        {
+            KatNet anet;
+            pb::EpochTable T = kat_table(anet);
+            T.compiled.push_back(pb::CompiledEpoch{1, seq32(0x7d), std::nullopt});
+            T.attempts.push_back(pb::Deployment{1, seq32(0x7d), pb::kKindFixed, 0, 1000000, 20});
+            KatNode an(anet, kJ0, pb::kRuledRatchetParams, T);
+            const std::vector<pb::Hash32> ac = pipeline_chain(an, 19);
+            if (ac.empty()) return;  // the harness printed its FAIL line
+            const pb::Hash32 t19 = ac.back();
+            const std::uint16_t e20 = pb::epoch_at_held(an.RP, an.node(t19).rs, 20, an.T);
+            const pb::CarrierBodyV3 c20 = carrier_on(an, t19, h_pos(20), {}, 1, 9420, [&](pb::ReceiptBodyV3& r) { r.side.rules_epoch = e20; });
+            const pb::AdmitResult r20 = admit(an, c20);
+            // AR refuses the row (a row above 20 held): node-internal after the switch, undone (the switch rewound)
+            KatNode bn(an);
+            check(bn.ar.append(pb::ActivationRow{1, 25, seq32(0x7d)}), "write step: AR seeded with a row above 20");
+            const pb::Hash32 id20 = pb::receipt_id(c20.own);
+            const pb::Hash32 bt = bn.tree.best().id, bs = bn.store.best_tip();
+            const pb::WriteResult wr = pb::place_admitted(bn.tree, bn.store, bn.ar, bn.bodies, r20, &bn.alarm);
+            check(r20.verdict == AdmitVerdict::AdmitCarrier && wr.outcome == pb::WriteOutcome::NodeInternal && bn.tree.find(id20) == nullptr
+                          && bn.tree.best().id == bt && bn.store.best_tip() == bs && bn.store.tip_pos() == 19 && !bn.store.holds(id20)
+                          && bn.ar.rows().size() == 1 && bn.bodies.get(id20) == nullptr,
+                  "write step: an extension whose AR append is refused -> node-internal, undone: the switch rewound to c's parent, "
+                  "c's delta and body removed, c dropped; tree.best(), the store's best tip and AR as before (" + desc(r20) + ")");
+            const pb::WriteResult wa = pb::place_admitted(an.tree, an.store, an.ar, an.bodies, r20, &an.alarm);
+            check(wa.outcome == pb::WriteOutcome::Extended && wa.ar_row.has_value() && wa.ar_row->h_act == 20 && an.ar.rows().size() == 1
+                          && an.ar.rows()[0] == *wa.ar_row && an.store.best_tip() == id20 && an.tree.best().id == id20,
+                  "write step: an extension with an activation row: switch_best, then the row appended to AR (h_act 20)");
         }
         // the extension point: a test double
         {
@@ -1554,6 +1708,46 @@ void contract() {
             check(nc.verdict == AdmitVerdict::AdmitPending && m.keys.computations() == 0,
                   "extension point: a NotComputed #12 is not run (key-cache counter 0)");
             dv.only_tip.reset();
+            // row 31 (Live) on a claim basis: a dead placement -> ClaimAlarm; a live one is placed
+            {
+                std::uint64_t tp = 59;
+                while (tp % 12 != 11) --tp;
+                const pb::Hash32 t = chain[tp - 1];
+                const pb::CarrierBodyV3 cd = carrier_on(m, L, hc, {body_on(m, t, m.node(t).h, 12, 9510)}, 1, 9511);
+                const pb::CarrierBodyV3 cl = carrier_on(m, L, hc, {body_on(m, L, hL + 1, 13, 9512)}, 1, 9513);
+                m.claims = nullptr;
+                const pb::AdmitResult d0 = admit(m, cd);
+                m.claims = &dv;
+                dv.by_class = {{pb::RowClass::Live, pb::Basis::ClaimSpan}};
+                const std::size_t al = m.alarm.count();
+                const pb::AdmitResult d1 = admit(m, cd), l1 = admit(m, cl);
+                check(d0.verdict == AdmitVerdict::AdmitCarrier && d0.placements.size() == 1 && !d0.placements[0].live
+                              && deferred(d1, Missing::ClaimAlarm) && d1.row == RowId::R31 && d1.alarm && d1.strike == 0
+                              && m.alarm.count() == al + 1 && m.alarm.entries.back().basis == pb::Basis::ClaimSpan
+                              && l1.verdict == AdmitVerdict::AdmitCarrier && l1.placements.size() == 1 && l1.placements[0].live,
+                      "extension point: row 31 on a ClaimSpan basis: a dead placement -> DEFER + local alarm, 0 tokens "
+                      "(claims == nullptr: placed with weight 0); a live one placed (" + desc(d1) + ")");
+            }
+            // row 17 (Walk) on a claim basis: a walk that does not pass -> ClaimAlarm
+            {
+                KatNode w(m);
+                const pb::CarrierBodyV3 y = carrier_on(w, L, hc, {}, 2, 9520, [](pb::ReceiptBodyV3& b) { b.side.t_origin -= 1; });
+                const pb::Hash32 yid = pb::receipt_id(y.own);
+                w.headers.add(1, pb::header_of(y), h_of(net, y.own));
+                const pb::CarrierBodyV3 cw = carrier_on(w, L, hc, {body_on(w, yid, hc, 14, 9521)}, 1, 9522);
+                w.claims = nullptr;
+                const pb::AdmitResult w0 = admit(w, cw);
+                w.claims = &dv;
+                dv.by_class = {{pb::RowClass::Walk, pb::Basis::ClaimSpan}};
+                const std::size_t al = w.alarm.count();
+                const pb::AdmitResult w1 = admit(w, cw);
+                check(deferred(w0, Missing::Closure) && w0.row == RowId::R17 && w0.claim_based && w0.strike == 0
+                              && deferred(w1, Missing::ClaimAlarm) && w1.row == RowId::R17 && w1.alarm && w1.strike == 0
+                              && w.alarm.count() == al + 1 && w.alarm.entries.back().basis == pb::Basis::ClaimSpan,
+                      "extension point: row 17 on a ClaimSpan basis: a walk with no passing assignment -> DEFER + local alarm, "
+                      "0 tokens (claims == nullptr: DEFER Closure, claim-based) (" + desc(w0) + ", " + desc(w1) + ")");
+            }
+            dv.by_class.clear();
             // judge_copy false: CopyDeferred, 0 tokens, no row run
             dv.by_class.clear();
             dv.copies = false;
@@ -1658,6 +1852,7 @@ void p49() {
         KatNet net;
         KatNode n(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 30);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 L = chain.back();
         KatNode sc(n);
         const pb::CarrierBodyV3 y = carrier_on(sc, L, h_pos(31), {}, 2, 8500);
@@ -1684,9 +1879,9 @@ void p49() {
         R.headers = pb::HeaderIndex{};
         const pb::CarrierHeader junk = variant_of(y, [](pb::ReceiptBodyV3& r) { r.side.ballot ^= 4; });
         R.headers.add(9, junk, h_of(net, y.own));
-        const std::vector<pb::CarrierHeader> reply = pb::serve_headers(R.tree, R.bodies, R.headers, chain[20], yid, 1152);
+        const std::vector<pb::CarrierHeader> reply = pb::serve_headers(R.tree, R.store, R.bodies, R.headers, chain[20], yid, 1152);
         check(reply.empty(), "P-49: an honest relay holding y only as an unbound variant serves no header for it (n = 0)");
-        const std::vector<pb::CarrierHeader> placed = pb::serve_headers(R.tree, R.bodies, R.headers, chain[20], L, 1152);
+        const std::vector<pb::CarrierHeader> placed = pb::serve_headers(R.tree, R.store, R.bodies, R.headers, chain[20], L, 1152);
         check(placed.size() == 9 && pb::receipt_id(placed.back().own) == L, "P-49: a relay serves the headers it placed");
         check(!pb::serve_carrier(R.tree, R.bodies, yid, true).has_value() && pb::serve_carrier(R.tree, R.bodies, L, true).has_value(),
               "P-49: FC_GETCARRIER served only for a placed carrier");
@@ -1715,6 +1910,18 @@ void p49() {
         }
         check(replies == 1 && st.get(pf.digest)->walks <= 1 && m.headers.held_by(10) == 1,
               "P-49: the peer is asked once per walk; the frame's re-walks stay within the peers plus the bindings");
+        // the ask record leaves with its frame (taken, evicted): it is held for held frames only
+        {
+            const bool before = st.asked_frames() == 1;
+            (void)st.take(m.tree, pf.digest);
+            pb::DeferredCarriers st2(1);
+            pb::ParkedFrame a = parked_of(c, 3, pb::AdmitResult{}), b = parked_of(carrier_on(n, L, h_pos(31), {}, 1, 8504), 4, pb::AdmitResult{});
+            a.cause = b.cause = Missing::Closure;
+            const bool parked = st2.park(m.tree, a) && st2.may_ask(a.digest, 10) && st2.park(m.tree, b);  // b evicts a (cap 1)
+            check(before && st.asked_frames() == 0 && !st.may_ask(pf.digest, 10) && parked && !st2.holds(a.digest)
+                          && st2.asked_frames() == 0,
+                  "P-49: a frame's ask record leaves with the frame (taken; evicted at the cap): none held without its frame");
+        }
     });
 }
 
@@ -1728,6 +1935,7 @@ void rows_more() {
         const pb::RatchetParams small{5, 20, 100};
         KatNode n(net, kJ0, small);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 60);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 L = chain.back();
         const std::uint64_t hc = h_pos(61);
         // x within GRACE: AR epoch (ii) -> judged
@@ -1743,6 +1951,7 @@ void rows_more() {
         KatNode m(n);
         const pb::Hash32 g = chain[29];
         const std::vector<pb::Hash32> side = scaffold_chain(m, g, 28, 0x26, h_pos, 3);
+        if (side.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 sp = side.back();  // position 58 on the side branch
         const pb::ReceiptBodyV3 rs = body_on(m, side[25], m.node(side[25]).h + 1, 12, 9804);
         const pb::AdmitResult a = admit(m, carrier_on(m, sp, m.node(sp).H, {rs}, 1, 9805));
@@ -1759,6 +1968,7 @@ void rows_more() {
         KatNet net;
         KatNode n(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 60);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 L = chain.back();
         const std::uint64_t hL = n.node(L).h, hc = h_pos(61);
         // row 19: a carried body whose served context block fails its PoW -> the frame BAN; P_r unknown -> DEFER
@@ -1786,6 +1996,7 @@ void rows_more() {
         KatNet net;
         KatNode m(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(m, 125, 1, h_fast);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 L = chain.back();
         pb::CarrierBodyV3 sb = scaffold_body(m, chain[118], kAltFrom + kAltLen + 1, 0x27, 9910, 4);
         sb.own.blob.prev_id = block_id(kAltTag, kAltFrom + kAltLen);
@@ -1805,6 +2016,7 @@ void rows_more() {
         KatNet net;
         KatNode n(net, kJ0);
         const std::vector<pb::Hash32> chain = pipeline_chain(n, 110, 1, h_fast);
+        if (chain.empty()) return;  // the harness printed its FAIL line
         const pb::Hash32 P = chain.back();
         const pb::CarrierBodyV3 sb = scaffold_body(n, chain[108], h_fast(110), 0x28, 9950, 4);
         check(held_side(place_direct(n, sb)), "MissingBucket: a sibling S of the best tip");
@@ -1818,6 +2030,101 @@ void rows_more() {
                       && n.tree.find(a.fetch) != nullptr && n.tree.find(a.fetch)->verified && a.strike == 0,
               "row 26: a bucket body not held -> DEFER + FC_GETBUCKETS at a bound carrier on the best chain (" + desc(a) + ")");
         (void)P;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The walk's depth: 100,000 chained header variants (P-49 counts none)
+// ---------------------------------------------------------------------------
+void deep_walk() {
+    run_part("deep walk", [] {
+        KatNet net;
+        KatNode n(net, kJ0);
+        const std::vector<pb::Hash32> chain = pipeline_chain(n, 30);
+        if (chain.empty()) return;  // the harness printed its FAIL line
+        const pb::Hash32 L = chain.back();
+        const std::uint64_t HL = n.node(L).H;
+        constexpr std::uint64_t kDeep = 100000;
+        // variants of one carrier template, each naming the previous one as its parent (the first on L), from 4 peers
+        const pb::CarrierBodyV3 tmpl = carrier_on(n, L, h_pos(31), {}, 2, 9000);
+        pb::Hash32 top = L;
+        for (std::uint64_t i = 0; i < kDeep; ++i) {
+            pb::CarrierHeader h = pb::header_of(tmpl);
+            h.own.blob.nonce = static_cast<std::uint32_t>(i + 1);
+            h.own.side.tip = top;
+            n.headers.add(1 + i % 4, h, HL + 1, true);
+            top = pb::receipt_id(h.own);
+        }
+        check(n.headers.size() == kDeep, "deep walk: 100,000 chained variants held");
+        pb::ReceiptBodyV3 r = body_on(n, L, h_pos(31), 3, 9100);
+        r.side.tip = top;
+        const pb::CarrierBodyV3 c = carrier_on(n, L, h_pos(31), {r}, 1, 9200);
+        const std::uint64_t rx0 = n.rx_calls;
+        const auto t0 = std::chrono::steady_clock::now();
+        const pb::AdmitResult a = admit(n, c);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  deep walk: %llu chained variants: %s in %.3f s\n", static_cast<unsigned long long>(kDeep), desc(a).c_str(), secs);
+        check(deferred(a, Missing::Closure) && a.row == RowId::R17 && a.strike == 0 && a.claim_based && n.rx_calls == rx0,
+              "deep walk: a carried tip on 100,000 chained variants -> DEFER row 17 (Closure), 0 tokens, RandomX 0 (" + desc(a) + ")");
+        const pb::AdmitEnv env = n.env();
+        const pb::OwnChain own(env, L);
+        pb::ClosureWalk w(env, own);
+        const pb::WalkResult wr = w.walk_tip(top);
+        check(wr.v == pb::WalkVerdict::Closure && w.max_frames() >= 2 * kDeep,
+              "deep walk: the walk's own stack held the chain (" + std::to_string(w.max_frames()) + " frames, 2 per variant)");
+    });
+
+    // three chains of 20,000 variants nested: the lowest variant of chain A carries a receipt whose tip is the top of
+    // chain B, the lowest of B one on the top of C; the nested descents stack on the walk's own stack
+    run_part("deep walk nested", [] {
+        KatNet net;
+        KatNode n(net, kJ0);
+        const std::vector<pb::Hash32> chain = pipeline_chain(n, 30);
+        if (chain.empty()) return;  // the harness printed its FAIL line
+        const pb::Hash32 L = chain.back();
+        const std::uint64_t HL = n.node(L).H;
+        constexpr std::uint64_t kEach = 20000;
+        // a chain of kEach variants of a template on L; the lowest one carries `carried` (if any); returns its top
+        const auto variants = [&](std::uint64_t tag, const std::optional<pb::ReceiptBodyV3>& carried) {
+            const pb::CarrierBodyV3 tmpl = carrier_on(n, L, h_pos(31), {}, 2 + tag, 9300 + 10 * tag);
+            pb::Hash32 top = L;
+            for (std::uint64_t i = 0; i < kEach; ++i) {
+                pb::CarrierHeader h = pb::header_of(tmpl);
+                h.own.blob.nonce = static_cast<std::uint32_t>(1000000 * (tag + 1) + i);
+                h.own.side.tip = top;
+                if (i == 0 && carried) {
+                    h.n_carried = 1;
+                    h.own.side.receipts_root = n.tree.next_receipts_root(L, std::vector<pb::Hash32>{pb::receipt_id(*carried)}).value();
+                }
+                n.headers.add(1 + i % 4, h, HL + 1, true);
+                const pb::Hash32 id = pb::receipt_id(h.own);
+                if (i == 0 && carried) n.headers.add_body_set(1, id, {*carried}, pb::header_digest(h));
+                top = id;
+            }
+            return top;
+        };
+        const auto on_tip = [&](const pb::Hash32& tip, std::uint64_t nonce) {
+            pb::ReceiptBodyV3 r = body_on(n, L, h_pos(31), 3, nonce);
+            r.side.tip = tip;
+            return r;
+        };
+        const pb::Hash32 c_top = variants(2, std::nullopt);
+        const pb::Hash32 b_top = variants(1, on_tip(c_top, 9400));
+        const pb::Hash32 a_top = variants(0, on_tip(b_top, 9401));
+        check(n.headers.size() == 3 * kEach, "deep walk nested: three chains of 20,000 variants held");
+        const pb::CarrierBodyV3 c = carrier_on(n, L, h_pos(31), {on_tip(a_top, 9402)}, 1, 9403);
+        const std::uint64_t rx0 = n.rx_calls;
+        const pb::AdmitResult a = admit(n, c);
+        check(deferred(a, Missing::Closure) && a.row == RowId::R17 && a.strike == 0 && a.claim_based && n.rx_calls == rx0,
+              "deep walk nested: a carried tip on chain A (A -> B -> C nested) -> DEFER row 17 (Closure), 0 tokens, RandomX 0 (" +
+                      desc(a) + ")");
+        const pb::AdmitEnv env = n.env();
+        const pb::OwnChain own(env, L);
+        pb::ClosureWalk w(env, own);
+        const pb::WalkResult wr = w.walk_tip(a_top);
+        check(wr.v == pb::WalkVerdict::Closure && w.max_frames() >= 6 * kEach,
+              "deep walk nested: the three descents stacked on the walk's own stack (" + std::to_string(w.max_frames()) +
+                      " frames)");
     });
 }
 
@@ -1862,5 +2169,6 @@ int main(int argc, char** argv) {
     run("contract", contract);
     run("p49", p49);
     run("rows_more", rows_more);
+    run("deep_walk", deep_walk);
     return finish("v37_xmr_pathb_admit_kat");
 }

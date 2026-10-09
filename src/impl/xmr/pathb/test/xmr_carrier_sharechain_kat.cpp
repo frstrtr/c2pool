@@ -80,7 +80,7 @@
 //       under two claimed parents keeps its own waiting children when one of
 //       them is refused; a refused copy of a carrier that still waits under
 //       another claimed parent discards nothing;
-//   (o) N-7: a two-level chain under a refused carrier is discarded as the
+//   (o) a two-level chain under a refused carrier is discarded as the
 //       pairs ((child, refused), (grandchild, child)); unwait(id, p) removes
 //       the one pair (id, p): id's claim under another parent and the
 //       entries waiting on id stay, waiting() counts the pairs left.
@@ -996,7 +996,7 @@ int main() {
         }
     }
 
-    // (o) N-7 pairs; unwait removes one pair and does not cascade
+    // (o) the discarded pairs; unwait removes one pair and does not cascade
     {
         pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
         const auto trunk = announce(t, kGenesis, 0, 0x51, 3);
@@ -1014,7 +1014,7 @@ int main() {
             check(o.verdict == pb::PlaceVerdict::NotCarrier
                           && o.discarded == std::vector<pb::WaitKey>{{lv[1].id, refused.id}, {lv[2].id, lv[1].id}}
                           && t.waiting() == 0,
-                  "(o) N-7: the discarded entries are ((child, refused), (grandchild, child))");
+                  "(o) the discarded entries are ((child, refused), (grandchild, child))");
         }
         // unwait: X waits under parents A and B, Z waits on X
         const pb::Hash32 pa = cid(0x53, 4), pb_ = cid(0x54, 4);

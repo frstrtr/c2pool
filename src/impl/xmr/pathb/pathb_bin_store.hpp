@@ -790,6 +790,18 @@ public:
         return SwitchVerdict::Switched;
     }
 
+    // Removes the delta of a carrier off the best chain that no held delta
+    // names as parent (the write step's undo). false: not held, genesis, on
+    // the best chain, or a delta above it.
+    bool drop_side(const Hash32& id) {
+        const auto it = journal_.find(id);
+        if (it == journal_.end() || it->second.pos == 0 || on_best(id)) return false;
+        for (const auto& [k, d] : journal_)
+            if (d.parent == id && !(k == id)) return false;
+        journal_.erase(it);
+        return true;
+    }
+
     // ---- retention (P-37 / P-38) ----
 
     // The highest P-37 floor the best tip allows: H(L - J - J_0) - 2 x (F +

@@ -30,19 +30,21 @@
 //           an ancestor of the tip served; a prefix up to the first bin
 //           without its references; a joiner's prefix MMR serves only leaves
 //           after its prefix; the per-peer budget (in flight, bytes per minute).
-//   N3      refuse() resets the server's pending S: a server refused after an
+//   refuse  refuse() resets the server's pending S: a server refused after an
 //           accepted frame is struck once and none of its S is adopted.
 //   P-48    a request over 2,000 bins at max_bytes = one frame: a prefix of
 //           whole bins within max_bytes (the next bin would pass it); a first
 //           bin above max_bytes -> n = 0; the receiver asks on from the next
 //           bin at another server and assembles the uncapped run's bins;
+//           bin_hi = 2^64 - 1 at max_bytes = one frame: the same prefix, the
+//           bins proved and read = the bins served + 1;
 //           BucketServeBudget::remaining = P-42 minus the minute's bytes.
 //   rule    a ClaimView double: leaf_servable false for a bin -> the prefix
 //           stops before it (n = 0 when it is first); at_servable false -> n = 0;
 //           the requester strikes nobody; a double answering as a full node
 //           and claims == nullptr serve the same bytes; an `at` held only as
 //           an unbound HeaderIndex variant -> n = 0.
-//   N4      a self-consistent forged 3-leaf MMR against chain A's anchor -> Peaks.
+//   forged  a self-consistent forged 3-leaf MMR against chain A's anchor -> Peaks.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
@@ -885,7 +887,7 @@ void serving_vectors() {
 
 
 // ---------------------------------------------------------------------------
-// N3: refuse() resets the server's pending S
+// refuse() resets the server's pending S
 // ---------------------------------------------------------------------------
 void refuse_vectors() {
     ChainA a;
@@ -902,15 +904,15 @@ void refuse_vectors() {
         pb::BucketsAssembly as(req, kB0, F, kFrame);
         const pb::FrameOutcome o1 = as.add_frame(kServerA, enc(x), an);
         check(o1.verdict == pb::FrameVerdict::Accepted && o1.strike == 0 && as.s_pending(),
-              "N3: A's frame with a wrong S accepted, S pending (at's carried ids not held)");
+              "refuse: A's frame with a wrong S accepted, S pending (at's carried ids not held)");
         std::vector<std::uint8_t> bad = f;
         bad[1] = 2;
         const pb::FrameOutcome o2 = as.add_frame(kServerA, bad, an);
         check(refused(o2, pb::BucketsFault::Wire) && !as.s_pending(),
-              "N3: A then refused for another fault (one token); its pending S is reset");
+              "refuse: A then refused for another fault (one token); its pending S is reset");
         const pb::SResolution sr = as.resolve_s(anchor_of(a.s, at, true));
         check(!sr.pending && sr.struck.empty() && !sr.adopted,
-              "N3: at's carried ids held: resolve_s strikes nobody (A holds its one token) and adopts nothing from A");
+              "refuse: at's carried ids held: resolve_s strikes nobody (A holds its one token) and adopts nothing from A");
     }
     // an honest S pending, then a refusal: nothing adopted from the refused server
     {
@@ -924,7 +926,7 @@ void refuse_vectors() {
         const pb::SResolution sr = as.resolve_s(anchor_of(a.s, at, true));
         check(o1.verdict == pb::FrameVerdict::Accepted && refused(o2, pb::BucketsFault::Wire) && !sr.pending &&
                       sr.struck.empty() && !sr.adopted,
-              "N3: a server refused after an accepted frame: its S is neither adopted nor struck again");
+              "refuse: a server refused after an accepted frame: its S is neither adopted nor struck again");
     }
 }
 
@@ -1045,6 +1047,24 @@ void p48_vectors() {
         const ReplyBins mr = reply_bins(pb::serve_buckets_from(src, more, kFrame, kNoServeCap));
         check(mr.ok && mr.bins.size() == cr.bins.size() + 1 && mr.bytes > kFrame,
               "P-48: the bins through the next one pass max_bytes (the prefix stops before that bin)");
+    }
+    // the work stops with the bytes: bin_hi = 2^64 - 1 at max_bytes = one frame proves and reads the bins served + 1
+    {
+        std::uint64_t reads = 0;
+        pb::BucketServeSource counted = src;
+        counted.bucket = [&](std::uint64_t bin) -> const pb::SealedBin* {
+            ++reads;
+            return src.bucket(bin);
+        };
+        const pb::GetBuckets open_end{kChain, all.at, kB0, UINT64_MAX};
+        const ReplyBins orr = reply_bins(pb::serve_buckets_from(counted, open_end, kFrame, kFrame));
+        check(orr.ok && orr.bins == cr.bins && reads == cr.bins.size() + 1,
+              "P-48: bin_hi = 2^64 - 1 at max_bytes = one frame: the same prefix of " + std::to_string(orr.bins.size()) +
+                      " bins; bins proved and read " + std::to_string(reads) + " = the bins served + 1");
+        reads = 0;
+        const ReplyBins ur = reply_bins(pb::serve_buckets_from(counted, open_end, kFrame, kNoServeCap));
+        check(ur.ok && ur.bins.size() == n && reads == n, "P-48: uncapped, the same request reads every held bin once (" +
+                                                               std::to_string(reads) + ")");
     }
     // the receiver asks on from the next bin at another server; the bins equal the uncapped run's
     {
@@ -1213,9 +1233,9 @@ void serve_rule_vectors() {
 }
 
 // ---------------------------------------------------------------------------
-// N4: a forged MMR answered against a real anchor
+// A forged MMR answered against a real anchor
 // ---------------------------------------------------------------------------
-void n4_vector() {
+void forged_mmr_vector() {
     ChainA a;
     const pb::Hash32 at = cid(0x40, 4);
     const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
@@ -1224,10 +1244,10 @@ void n4_vector() {
                             keyed_bin(kB0 + 2, {{ka, 18182}})});
     const pb::BucketsReply x = reply_of(g, at, 0, 3, {ka});
     check(a.ok && x.leaf_count == 3 && g.mmr.root() != an.mmr_root,
-          "N4: a self-consistent 3-leaf MMR (leaf_count 3) other than chain A's");
+          "forged MMR: a self-consistent 3-leaf MMR (leaf_count 3) other than chain A's");
     pb::BucketsAssembly as(req, kB0, F, kFrame);
     check(refused(as.add_frame(kServerA, enc(x), an), pb::BucketsFault::Peaks) && as.bins().empty(),
-          "N4: answered against chain A's anchor -> Peaks, nothing adopted");
+          "forged MMR: answered against chain A's anchor -> Peaks, nothing adopted");
 }
 
 }  // namespace
@@ -1238,9 +1258,9 @@ int main() {
     run_part("lying", lying_vectors);
     run_part("receiver", receiver_vectors);
     run_part("serving", serving_vectors);
-    run_part("N3 refuse", refuse_vectors);
+    run_part("refuse resets S", refuse_vectors);
     run_part("P-48", p48_vectors);
     run_part("serve rule", serve_rule_vectors);
-    run_part("N4", n4_vector);
+    run_part("forged MMR", forged_mmr_vector);
     return finish("v37_xmr_pathb_bucket_wire_kat");
 }

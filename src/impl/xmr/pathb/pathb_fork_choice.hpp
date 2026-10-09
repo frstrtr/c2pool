@@ -267,6 +267,25 @@ public:
     bool mark_verified(const Hash32& id) { return mark(id, true, false); }
     bool mark_bodies(const Hash32& id) { return mark(id, false, true); }
 
+    // Undoes mark_verified and mark_bodies of a carrier with no child (the
+    // write step's undo): it is neither verified nor chain-valid, and the best
+    // tip is the greatest of the other chain-valid carriers. false: not held,
+    // genesis, or a carrier with a child.
+    bool unmark(const Hash32& id) {
+        const auto it = index_.find(id);
+        if (it == index_.end() || it->second == 0 || !nodes_[it->second].children.empty()) return false;
+        CarrierNode& n = nodes_[it->second];
+        n.verified = n.bodies = n.chain_valid = false;
+        if (best_ == it->second) {
+            best_ = 0;
+            for (const auto& [hid, i] : index_)
+                if (nodes_[i].chain_valid
+                    && fork_choice_prefers(ChainTip{nodes_[i].cum_work, nodes_[i].id}, ChainTip{nodes_[best_].cum_work, nodes_[best_].id}))
+                    best_ = i;
+        }
+        return true;
+    }
+
     // Removes the one waiting entry (id, parent); entries waiting on id stay.
     // false: no such entry.
     bool unwait(const Hash32& id, const Hash32& parent) {
@@ -294,7 +313,24 @@ public:
         return nodes_[i].id;
     }
 
-    // Parent steps taken by ancestor_at and the common-ancestor walk.
+    // The newest carrier on id's chain (id itself first) for which on(id', pos')
+    // holds; nullopt when id is not held or none does. Each parent step counts
+    // in walk_steps().
+    template <class On>
+    std::optional<Hash32> newest_ancestor_where(const Hash32& id, On&& on) const {
+        const auto it = index_.find(id);
+        if (it == index_.end()) return std::nullopt;
+        std::size_t i = it->second;
+        for (;;) {
+            if (on(nodes_[i].id, nodes_[i].pos)) return nodes_[i].id;
+            if (i == 0) return std::nullopt;
+            i = nodes_[i].parent_index;
+            ++walk_steps_;
+        }
+    }
+
+    // Parent steps taken by ancestor_at, newest_ancestor_where and the
+    // common-ancestor walk.
     std::uint64_t walk_steps() const noexcept { return walk_steps_; }
 
     // Removes a carrier that is not chain-valid, with its descendants (none of

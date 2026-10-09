@@ -204,7 +204,7 @@ public:
             }
         }
         for (auto it = sets_.begin(); it != sets_.end();) {
-            if (it->first.first == peer)
+            if (it->first.second == peer)
                 it = sets_.erase(it);
             else
                 ++it;
@@ -266,7 +266,7 @@ public:
         if (placed_.count(carrier) != 0) return IndexAdd::BoundDropped;
         const std::optional<Hash32> dg = body_set_digest(bodies);
         if (!dg) return IndexAdd::Unencodable;
-        const SetKey k{peer, carrier};
+        const SetKey k{carrier, peer};
         IndexAdd out = IndexAdd::Added;
         if (const auto it = sets_.find(k); it != sets_.end()) {
             if (it->second.digest == *dg) return IndexAdd::Known;
@@ -285,13 +285,13 @@ public:
     // The body sets held for a carrier (one per serving peer), by peer.
     std::vector<const BodySet*> body_sets(const Hash32& carrier) const {
         std::vector<const BodySet*> out;
-        for (const auto& [k, bs] : sets_)
-            if (k.second == carrier) out.push_back(&bs);
+        for (auto it = sets_.lower_bound(SetKey{carrier, 0}); it != sets_.end() && it->first.first == carrier; ++it)
+            out.push_back(&it->second);
         return out;
     }
 
     // A set refuted by a computed S1.3 #10 or a body's computed Mismatch: dropped.
-    void drop_body_set(std::uint64_t peer, const Hash32& carrier) { sets_.erase(SetKey{peer, carrier}); }
+    void drop_body_set(std::uint64_t peer, const Hash32& carrier) { sets_.erase(SetKey{carrier, peer}); }
 
     // The carrier placed: its unbound sets are dropped (the placed set is kept by CarrierBodies).
     void placed(const Hash32& carrier) {
@@ -302,7 +302,7 @@ public:
 private:
     using Key = std::pair<Hash32, Hash32>;              // (id, digest)
     using PeerKey = std::pair<std::uint64_t, Hash32>;   // (peer, id)
-    using SetKey = std::pair<std::uint64_t, Hash32>;    // (peer, carrier id)
+    using SetKey = std::pair<Hash32, std::uint64_t>;    // (carrier id, peer)
 
     void unserve(std::uint64_t peer, const Hash32& id, const Hash32& dg) {
         const auto v = variants_.find(Key{id, dg});
@@ -312,12 +312,8 @@ private:
     }
 
     void drop_sets_of(const Hash32& carrier) {
-        for (auto it = sets_.begin(); it != sets_.end();) {
-            if (it->first.second == carrier)
-                it = sets_.erase(it);
-            else
-                ++it;
-        }
+        for (auto it = sets_.lower_bound(SetKey{carrier, 0}); it != sets_.end() && it->first.first == carrier;)
+            it = sets_.erase(it);
     }
 
     std::map<Key, HeaderVariant> variants_;
@@ -333,6 +329,7 @@ private:
 class CarrierBodies {
 public:
     void put(const Hash32& id, const CarrierBodyV3& body) { bodies_[id] = body; }
+    void erase(const Hash32& id) { bodies_.erase(id); }
     const CarrierBodyV3* get(const Hash32& id) const {
         const auto it = bodies_.find(id);
         return it == bodies_.end() ? nullptr : &it->second;
@@ -346,10 +343,13 @@ private:
 // FC_HEADERS: the headers after `from` up to `stop`, oldest first, at most
 // `max`: placed carriers and, above them, variants this node has bound; the
 // reply ends before the first header the node has not bound (empty when
-// `stop` does not descend from `from` through bound headers).
-template <class Tree>
-inline std::vector<CarrierHeader> serve_headers(const Tree& tree, const CarrierBodies& bodies, const HeaderIndex& headers,
-                                                const Hash32& from, const Hash32& stop, std::uint64_t max) {
+// `stop` does not descend from `from` through bound headers). The placed
+// carriers after `from` are collected up to `max`: by position on the store's
+// best chain (store.best_at), by parent steps on the side part above it.
+template <class Tree, class Store>
+inline std::vector<CarrierHeader> serve_headers(const Tree& tree, const Store& store, const CarrierBodies& bodies,
+                                                const HeaderIndex& headers, const Hash32& from, const Hash32& stop,
+                                                std::uint64_t max) {
     std::vector<CarrierHeader> above;  // bound, not placed: newest first
     Hash32 x = stop;
     for (std::size_t guard = 0; tree.find(x) == nullptr; ++guard) {
@@ -364,9 +364,33 @@ inline std::vector<CarrierHeader> serve_headers(const Tree& tree, const CarrierB
         x = v->header.own.side.tip;
     }
     std::vector<CarrierHeader> out;
-    const std::optional<std::vector<Hash32>> path = tree.find(x) ? tree.path(from, x) : std::nullopt;
-    if (!path) return out;
-    for (const Hash32& id : *path) {
+    const auto* nx = tree.find(x);
+    const auto* nf = tree.find(from);
+    if (nx == nullptr || nf == nullptr || nx->pos < nf->pos) return out;
+    // the placed carriers after `from` the reply can carry: positions pos(from) + 1 .. top
+    const std::uint64_t top = nx->pos - nf->pos > max ? nf->pos + max : nx->pos;
+    std::vector<Hash32> path(top - nf->pos);
+    const auto on_best = [&](const Hash32& id, std::uint64_t pos) {
+        const std::optional<Hash32> b = store.best_at(pos);
+        return b.has_value() && *b == id;
+    };
+    // x's side part (above its first best-chain carrier) by parent steps
+    const auto* n = nx;
+    std::uint64_t k = nx->pos;
+    while (k > nf->pos && !on_best(n->id, k)) {
+        if (k <= top) path[k - nf->pos - 1] = n->id;
+        n = tree.find(n->parent);
+        if (n == nullptr) return out;
+        --k;
+    }
+    // the rest on the store's best chain by position; `from` is x's ancestor at pos(from)
+    if (k > nf->pos) {
+        for (std::uint64_t j = std::min(k, top); j > nf->pos; --j) path[j - nf->pos - 1] = *store.best_at(j);
+        if (!on_best(from, nf->pos)) return out;
+    } else if (n->id != from) {
+        return out;
+    }
+    for (const Hash32& id : path) {
         if (out.size() >= max) return out;
         const CarrierBodyV3* b = bodies.get(id);
         if (b == nullptr) return out;  // not held: the reply ends before it

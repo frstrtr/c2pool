@@ -830,7 +830,8 @@ inline bool refs_complete(const SealedBin& sb, std::map<Hash32, XmrKeyRef>& by_i
 // The FC_BUCKETS frames answering req from src, each at most frame_bytes and
 // at most max_bytes in all (P-48): the bins served are a prefix of whole bins;
 // one not-served frame when nothing can be served (or the first bin alone
-// passes max_bytes).
+// passes max_bytes). The bins are proved and collected up to the first one
+// whose frames pass max_bytes (or that no frame holds), that bin included.
 inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketServeSource& src, const GetBuckets& req,
                                                                  std::uint64_t frame_bytes, std::uint64_t max_bytes) {
     const std::vector<std::vector<std::uint8_t>> none{encode_buckets_not_served(req.chain_id, req.at)};
@@ -842,64 +843,56 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketSer
         const SealedBin* sb;
         std::vector<Hash32> path;
     };
-    std::vector<Served> served;
     std::map<Hash32, XmrKeyRef> by_id;
-    for (std::uint64_t bin = req.bin_lo; bin <= req.bin_hi; ++bin) {
-        // leaf_index = bin - b0; a bin below b0 wraps to an index no MMR proves
-        const std::uint64_t i = bin - src.b0;
-        const std::optional<MmrProof> pr = src.mmr->prefix_proof(i, src.leaf_count);
-        if (!pr) break;  // not provable at leaf_count
-        const SealedBin* sb = src.bucket ? src.bucket(bin) : nullptr;
-        if (sb == nullptr) break;  // rows not held
-        if (sb->bucket.bin_lo != bin || src.mmr->leaf(i) != std::optional<Hash32>(sb->leaf)) break;  // not the leaf's body
-        if (!bw_detail::refs_complete(*sb, by_id)) break;  // an identity without its reference
-        Served s{sb, {}};
-        for (const auto& step : pr->path) s.path.push_back(step.first);
-        served.push_back(std::move(s));
-        if (bin == UINT64_MAX) break;
-    }
-
     const std::uint64_t head = bw_detail::head_bytes(peaks->size());
-    // Packs the first `k` served bins into frames; *fit: the number of whole
-    // bins whose frames stay within max_bytes in all.
-    const auto pack = [&](std::size_t k, std::size_t* fit) {
-        std::vector<std::vector<std::uint8_t>> frames;
+    // Packs served bins into frames, one bin per add() in order; add() false:
+    // the bin does not fit an empty frame, or with it the reply passes
+    // max_bytes (stop before it). keep false: the frames are measured only.
+    struct Pack {
+        const GetBuckets& req;
+        const BucketServeSource& src;
+        const std::vector<Hash32>& peaks;
+        const std::map<Hash32, XmrKeyRef>& by_id;
+        std::uint64_t head;
+        std::uint64_t frame_bytes;
+        std::uint64_t max_bytes;
+        bool keep;
+        std::vector<std::vector<std::uint8_t>> frames{};
         std::uint64_t sent = 0;
-        BucketsReply cur;
-        std::set<Hash32> cur_ids;
-        std::uint64_t cur_bytes = head;
-        const auto fresh = [&] {
+        BucketsReply cur{};
+        std::set<Hash32> cur_ids{};
+        std::uint64_t cur_bytes = 0;
+
+        void fresh() {
             cur = BucketsReply{};
             cur.chain_id = req.chain_id;
             cur.at = req.at;
             cur.leaf_count = src.leaf_count;
-            cur.peaks = *peaks;
+            cur.peaks = peaks;
             cur.s_parent = src.s_parent;
             cur_ids.clear();
             cur_bytes = head;
-        };
-        const auto flush = [&] {
+        }
+        void flush() {
             if (!cur.entries.empty()) {
                 for (const Hash32& id : cur_ids) cur.refs.push_back(by_id.at(id));
-                frames.push_back(*encode_buckets(cur));
-                sent += frames.back().size();
+                std::vector<std::uint8_t> f = *encode_buckets(cur);
+                sent += f.size();
+                if (keep) frames.push_back(std::move(f));
             }
             fresh();
-        };
-        const auto row_cost = [&](const BucketRow& r) {
+        }
+        std::uint64_t row_cost(const BucketRow& r) const {
             std::uint64_t c = kBucketRowBytes;
             if (cur_ids.count(r.miner) == 0) c += kKeyRefBytes;
             if (!(r.owner == kZeroHash) && cur_ids.count(r.owner) == 0 && r.owner != r.miner) c += kKeyRefBytes;
             return c;
-        };
-        fresh();
-        if (fit) *fit = 0;
-        for (std::size_t b = 0; b < k; ++b) {
-            const Served& s = served[b];
+        }
+        bool add(const Served& s) {
             const std::vector<BucketRow>& rows = s.sb->bucket.rows;
             const std::uint64_t eh = bw_detail::entry_head_bytes(s.path.size());
             const std::uint64_t one_row = rows.empty() ? 0 : kBucketRowBytes + 2 * kKeyRefBytes;
-            if (head + eh + one_row > frame_bytes || rows.size() > UINT32_MAX) break;  // an empty frame cannot hold it
+            if (head + eh + one_row > frame_bytes || rows.size() > UINT32_MAX) return false;  // an empty frame cannot hold it
             std::size_t r = 0;
             do {
                 const std::uint64_t first = r < rows.size() ? row_cost(rows[r]) : 0;
@@ -924,17 +917,40 @@ inline std::vector<std::vector<std::uint8_t>> serve_buckets_from(const BucketSer
                 if (r < rows.size()) flush();
             } while (r < rows.size());
             const std::uint64_t total = sent + (cur.entries.empty() ? 0 : cur_bytes);
-            if (total > max_bytes) break;  // this bin passes the reply's bytes: stop before it
-            if (fit) *fit = b + 1;
+            if (total > max_bytes) return false;  // this bin passes the reply's bytes: stop before it
+            return true;
         }
-        flush();
-        return frames;
     };
+
+    // the bins from bin_lo, each proved at leaf_count with its body and references held, measured as they
+    // are collected; `fit`: the whole bins whose frames stay within max_bytes in all
+    std::vector<Served> served;
     std::size_t fit = 0;
-    (void)pack(served.size(), &fit);
-    std::vector<std::vector<std::uint8_t>> frames = pack(fit, nullptr);
-    if (frames.empty()) return none;
-    return frames;
+    Pack probe{req, src, *peaks, by_id, head, frame_bytes, max_bytes, false};
+    probe.fresh();
+    for (std::uint64_t bin = req.bin_lo; bin <= req.bin_hi; ++bin) {
+        // leaf_index = bin - b0; a bin below b0 wraps to an index no MMR proves
+        const std::uint64_t i = bin - src.b0;
+        const std::optional<MmrProof> pr = src.mmr->prefix_proof(i, src.leaf_count);
+        if (!pr) break;  // not provable at leaf_count
+        const SealedBin* sb = src.bucket ? src.bucket(bin) : nullptr;
+        if (sb == nullptr) break;  // rows not held
+        if (sb->bucket.bin_lo != bin || src.mmr->leaf(i) != std::optional<Hash32>(sb->leaf)) break;  // not the leaf's body
+        if (!bw_detail::refs_complete(*sb, by_id)) break;  // an identity without its reference
+        Served s{sb, {}};
+        for (const auto& step : pr->path) s.path.push_back(step.first);
+        served.push_back(std::move(s));
+        if (fit + 1 == served.size() && probe.add(served.back())) fit = served.size();
+        if (fit < served.size()) break;  // this bin passes max_bytes (or no frame holds it): no further bin is collected
+        if (bin == UINT64_MAX) break;
+    }
+
+    Pack reply{req, src, *peaks, by_id, head, frame_bytes, max_bytes, true};
+    reply.fresh();
+    for (std::size_t b = 0; b < fit; ++b) (void)reply.add(served[b]);
+    reply.flush();
+    if (reply.frames.empty()) return none;
+    return std::move(reply.frames);
 }
 
 // The serving rule over the node's BinStore: `at` on the best chain (at or

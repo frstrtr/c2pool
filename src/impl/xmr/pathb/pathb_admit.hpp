@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <optional>
@@ -273,8 +274,8 @@ inline std::uint64_t encoded_length(const ReceiptBodyV3& b) {
     return out.size();
 }
 
-// S2.3 #12 (REVIEW-1960 N2): the check is called with tip = side_data.tip,
-// p_r = blob.prev_id and hf = hf_version(h(r)); otherwise node-internal.
+// S2.3 #12: the check is called with tip = side_data.tip, p_r = blob.prev_id
+// and hf = hf_version(h(r)); otherwise node-internal.
 inline bool coinbase_args_bound(const ReceiptBodyV3& r, const Hash32& tip, const Hash32& p_r, std::uint8_t hf,
                                 std::uint8_t hf_of_h) noexcept {
     return tip == r.side.tip && p_r == r.blob.prev_id && hf == hf_of_h;
@@ -328,16 +329,19 @@ inline AdmitResult defer(Missing m, RowId row, std::size_t body = 0, const Hash3
     return r;
 }
 
+// ClaimAlarm: DEFER, a local alarm with the row and the basis, no token, no BAN.
+inline AdmitResult claim_alarm(const AdmitEnv& env, RowId row, Basis b, const Hash32& id, std::size_t body = 0) {
+    AdmitResult r = defer(Missing::ClaimAlarm, row, body);
+    r.alarm = true;
+    env.alarm.raise(row, b, id, Missing::ClaimAlarm);
+    return r;
+}
+
 // A failing row's word on a basis: a claim basis is ClaimAlarm (DEFER, alarm,
 // no token, no BAN); a computed basis keeps the row's word.
 inline AdmitResult fail_row(const AdmitEnv& env, AdmitVerdict v, RowId row, Basis b, const Hash32& id,
                             std::size_t body = 0) {
-    if (is_claim_basis(b)) {
-        AdmitResult r = defer(Missing::ClaimAlarm, row, body);
-        r.alarm = true;
-        env.alarm.raise(row, b, id, Missing::ClaimAlarm);
-        return r;
-    }
+    if (is_claim_basis(b)) return claim_alarm(env, row, b, id, body);
     return verdict(v, row, body);
 }
 
@@ -361,6 +365,11 @@ public:
         held_ = true;
         pos_ = n->pos;
         lo_ = pos_ > env.j0 ? pos_ - env.j0 : 0;
+        // parent(c) on the store's best chain: c's chain at and below it is read from the store (best_at)
+        if (const std::optional<Hash32> b = env.store.best_at(pos_); b.has_value() && *b == parent) {
+            on_best_ = true;
+            return;
+        }
         // c's chain from parent(c) down to cache_lo; below it c's chain is the store's best chain
         const std::uint64_t base = env.store.base_pos();
         cache_lo_ = std::min(lo_, base > env.j0 ? base - env.j0 : 0);
@@ -385,6 +394,7 @@ public:
     // The carrier at position k on c's chain (k <= pos(parent(c))).
     std::optional<Hash32> at(std::uint64_t k) const {
         if (!held_ || k > pos_) return std::nullopt;
+        if (on_best_) return env_.store.best_at(k);
         if (k >= cache_lo_) return ids_[k - cache_lo_];
         if (below_is_best_) return env_.store.best_at(k);
         return env_.tree.ancestor_at(parent_, k);
@@ -409,6 +419,7 @@ private:
     std::uint64_t pos_ = 0;
     std::uint64_t lo_ = 0;
     std::uint64_t cache_lo_ = 0;
+    bool on_best_ = false;
     bool below_is_best_ = false;
     std::vector<Hash32> ids_;
 };
@@ -450,7 +461,7 @@ public:
     // claim_based, walked and refuted_sets accumulate over the frame's tips.
     WalkResult walk_tip(const Hash32& t) {
         WalkResult out;
-        const Res r = resolve_id(t, nullptr);
+        const Res r = resolve_id(t);
         out.claim_based = claim_;
         out.walked.assign(walked_.begin(), walked_.end());
         out.refuted_sets = refuted_;
@@ -477,6 +488,8 @@ public:
     }
 
     std::uint64_t states() const noexcept { return states_.size(); }
+    // The most frames the walk's stack held at once (the depth of the walked chains).
+    std::size_t max_frames() const noexcept { return max_frames_; }
 
 private:
     enum class Kind : std::uint8_t { Pass, Boundary, Closure, NeedHeaders, NeedBodies, NoPass };
@@ -530,138 +543,289 @@ private:
         Res fail;
     };
 
-    Options options(const Hash32& id) {
-        walked_.insert(id);
-        Options out;
-        out.fail = fail(Kind::NoPass);
-        if (const CarrierNode* n = env_.tree.find(id)) {
-            const Res r = resolve_tree(*n);
-            if (r.kind == Kind::Pass)
-                out.pass.push_back(r.st);
-            else
-                out.fail = r;
-            return out;
-        }
-        const std::vector<const HeaderVariant*> vs = env_.headers.variants(id);
-        if (vs.empty()) {
-            out.fail = fail(Kind::NeedHeaders, id);
-            return out;
-        }
-        for (const HeaderVariant* v : vs) {
-            const Res r = resolve_variant(*v);
-            if (r.kind == Kind::Pass) {
-                out.pass.push_back(r.st);
-                continue;
+    using Key = std::pair<Hash32, Hash32>;
+
+    // The memo key of a header variant: (id, digest).
+    static Key variant_key(const HeaderVariant& y) { return Key{y.id, y.digest}; }
+
+    // ---- the walk's explicit stack ----
+    // A frame stands for one call of the walk: Options (the passing states of
+    // an id; IdFirst: its first passing state), Tree (a placed carrier), Variant
+    // (a held header variant on each passing state of its claimed parent),
+    // OnParent (the variant on one parent state, over its body sets), Nested (a
+    // placed carrier's carried tips), Replay (a body set's tips with S replayed)
+    // and Tip (one carried body's tip). A frame calls another by pushing it and
+    // resumes at its next stage with the callee's result in ret_ (ret_opts_ for
+    // Options); no frame calls the walk recursively.
+    enum class Op : std::uint8_t { Options, IdFirst, Tree, Variant, OnParent, Nested, Replay, Tip };
+
+    struct Frame {
+        Op op = Op::Options;
+        std::uint8_t stage = 0;
+        Hash32 id{};                                         // Options, IdFirst
+        const CarrierNode* node = nullptr;                   // Tree
+        const HeaderVariant* y = nullptr;                    // Variant, OnParent
+        const State* ps = nullptr;                           // OnParent, Replay: the parent state
+        State* s = nullptr;                                  // Tree, OnParent, Nested, Replay, Tip
+        const std::vector<ReceiptBodyV3>* bodies = nullptr;  // Nested, Replay
+        const ReceiptBodyV3* b = nullptr;                    // Tip
+        std::vector<const HeaderVariant*> vs;                // Options: the held variants
+        std::vector<const BodySet*> tries;                   // OnParent: the body sets tried
+        std::vector<RatchetPlacement> placed;                // Replay: the placements replayed
+        Options opts;                                        // Options: the result; Variant: the parent's
+        std::size_t i = 0;                                   // the next variant / parent state / set / body
+        Kind worst = Kind::NoPass;
+        Hash32 fetch{};
+        std::uint64_t d = 0;                                 // OnParent: d after the parent state
+        std::uint16_t ballot = 0;                            // Replay: the carrier's ballot
+    };
+
+    static Frame options_frame(const Hash32& id, Op op) {
+        Frame f;
+        f.op = op;
+        f.id = id;
+        return f;
+    }
+    static Frame tree_frame(const CarrierNode& n) {
+        Frame f;
+        f.op = Op::Tree;
+        f.node = &n;
+        return f;
+    }
+    static Frame variant_frame(const HeaderVariant& y) {
+        Frame f;
+        f.op = Op::Variant;
+        f.y = &y;
+        return f;
+    }
+    static Frame on_parent_frame(const HeaderVariant& y, const State& ps) {
+        Frame f;
+        f.op = Op::OnParent;
+        f.y = &y;
+        f.ps = &ps;
+        return f;
+    }
+    static Frame nested_frame(State& s, const std::vector<ReceiptBodyV3>& carried) {
+        Frame f;
+        f.op = Op::Nested;
+        f.s = &s;
+        f.bodies = &carried;
+        return f;
+    }
+    static Frame replay_frame(State& s, const State& ps, const std::vector<ReceiptBodyV3>& bodies, std::uint16_t ballot) {
+        Frame f;
+        f.op = Op::Replay;
+        f.s = &s;
+        f.ps = &ps;
+        f.bodies = &bodies;
+        f.ballot = ballot;
+        return f;
+    }
+    static Frame tip_frame(State& s, const ReceiptBodyV3& b) {
+        Frame f;
+        f.op = Op::Tip;
+        f.s = &s;
+        f.b = &b;
+        return f;
+    }
+
+    void call(Frame f) {
+        stack_.push_back(std::move(f));
+        max_frames_ = std::max(max_frames_, stack_.size());
+    }
+    void ret(const Res& r) {
+        const Res out = r;
+        stack_.pop_back();
+        ret_ = out;
+    }
+    void ret_options(Options o) {
+        stack_.pop_back();
+        ret_opts_ = std::move(o);
+    }
+
+    // A walked id: its first passing state, else the failure.
+    Res resolve_id(const Hash32& id) {
+        stack_.clear();
+        call(options_frame(id, Op::IdFirst));
+        while (!stack_.empty()) {
+            Frame& f = stack_.back();
+            switch (f.op) {
+                case Op::Options:
+                case Op::IdFirst: step_options(f); break;
+                case Op::Tree: step_tree(f); break;
+                case Op::Variant: step_variant(f); break;
+                case Op::OnParent: step_on_parent(f); break;
+                case Op::Nested: step_nested(f); break;
+                case Op::Replay: step_replay(f); break;
+                case Op::Tip: step_tip(f); break;
             }
-            if (combine(r.kind, out.fail.kind) == r.kind && r.kind != out.fail.kind) out.fail.fetch = r.fetch;
-            out.fail.kind = combine(out.fail.kind, r.kind);
         }
-        return out;
+        return ret_;
     }
 
-    // A walked id: the first passing state. `path`: the walked node above (a
-    // tip on its own path takes that node).
-    Res resolve_id(const Hash32& id, const State* path) {
-        for (const State* s = path; s != nullptr; s = s->parent)
-            if (s->id == id) return Res{Kind::Pass, s, {}};
-        const Options o = options(id);
-        if (!o.pass.empty()) return Res{Kind::Pass, o.pass.front(), {}};
-        return o.fail;
-    }
-
-    Res resolve_tree(const CarrierNode& n) {
-        if (const auto m = memo_.find(Key{n.id, Hash32{}}); m != memo_.end()) return m->second;
-        Res out;
-        if (own_.contains(n.id, n.pos)) {
-            State& s = state(n.id, Hash32{});
-            s.tree = true;
-            s.on_chain = true;
-            s.pos = n.pos;
-            s.f = n.pos;
-            s.h = n.h;
-            s.H = n.H;
-            s.d = n.d;
-            s.S = n.rs;
-            out = Res{Kind::Pass, &s, {}};
-        } else if (n.pos < own_.lo() || n.pos == 0) {
-            out = fail(Kind::Boundary);  // a tree node off c's chain below pos(parent(c)) - J_0
+    // Options / IdFirst: walked; a placed carrier, else every held variant.
+    void step_options(Frame& f) {
+        if (f.stage == 0) {
+            walked_.insert(f.id);
+            f.opts.fail = fail(Kind::NoPass);
+            if (const CarrierNode* n = env_.tree.find(f.id)) {
+                f.stage = 1;
+                return call(tree_frame(*n));
+            }
+            f.vs = env_.headers.variants(f.id);
+            if (f.vs.empty()) {
+                f.opts.fail = fail(Kind::NeedHeaders, f.id);
+                return finish_options(f);
+            }
+            f.stage = 2;
+            return call(variant_frame(*f.vs[0]));
+        }
+        if (f.stage == 1) {  // the placed carrier's result
+            if (ret_.kind == Kind::Pass)
+                f.opts.pass.push_back(ret_.st);
+            else
+                f.opts.fail = ret_;
+            return finish_options(f);
+        }
+        // stage 2: a variant's result
+        const Res r = ret_;
+        if (r.kind == Kind::Pass) {
+            f.opts.pass.push_back(r.st);
         } else {
-            memo_[Key{n.id, Hash32{}}] = fail(Kind::NoPass);  // in progress
-            const CarrierNode* pn = env_.tree.find(n.parent);
-            const Res pr = pn == nullptr ? fail(Kind::NoPass) : resolve_tree(*pn);
-            if (pr.kind != Kind::Pass) {
-                out = fail(pr.kind == Kind::NoPass ? Kind::NoPass : pr.kind, pr.fetch);
-            } else if (pr.st->on_chain && deep_tip_deferred(own_.pos(), pr.st->pos, env_.j0)) {
-                out = fail(Kind::Boundary);  // meets c's chain below pos(parent(c)) - J_0
-            } else {
+            if (combine(r.kind, f.opts.fail.kind) == r.kind && r.kind != f.opts.fail.kind) f.opts.fail.fetch = r.fetch;
+            f.opts.fail.kind = combine(f.opts.fail.kind, r.kind);
+        }
+        if (++f.i < f.vs.size()) return call(variant_frame(*f.vs[f.i]));
+        return finish_options(f);
+    }
+
+    void finish_options(Frame& f) {
+        if (f.op == Op::IdFirst)
+            return ret(!f.opts.pass.empty() ? Res{Kind::Pass, f.opts.pass.front(), {}} : f.opts.fail);
+        return ret_options(std::move(f.opts));
+    }
+
+    // Tree: a placed carrier on c's chain, below the boundary, or on a branch
+    // (its parent, then its carried tips).
+    void step_tree(Frame& f) {
+        const CarrierNode& n = *f.node;
+        const Key key{n.id, Hash32{}};
+        if (f.stage == 0) {
+            if (const auto m = memo_.find(key); m != memo_.end()) return ret(m->second);
+            if (own_.contains(n.id, n.pos)) {
                 State& s = state(n.id, Hash32{});
                 s.tree = true;
-                s.parent = pr.st->on_chain ? nullptr : pr.st;
+                s.on_chain = true;
                 s.pos = n.pos;
-                s.f = pr.st->f;
+                s.f = n.pos;
                 s.h = n.h;
                 s.H = n.H;
                 s.d = n.d;
                 s.S = n.rs;
-                s.placed = pr.st->placed;
-                const CarrierBodyV3* body = env_.bodies.get(n.id);
-                const Res nr = body == nullptr ? fail(Kind::NeedBodies, n.id) : nested(s, body->carried);
-                out = nr.kind == Kind::Pass ? Res{Kind::Pass, &s, {}} : nr;
+                return done(key, Res{Kind::Pass, &s, {}});
             }
+            if (n.pos < own_.lo() || n.pos == 0) return done(key, fail(Kind::Boundary));  // off c's chain below pos(parent(c)) - J_0
+            memo_[key] = fail(Kind::NoPass);  // in progress
+            const CarrierNode* pn = env_.tree.find(n.parent);
+            f.stage = 1;
+            if (pn == nullptr) {
+                ret_ = fail(Kind::NoPass);
+                return;
+            }
+            return call(tree_frame(*pn));
         }
-        memo_[Key{n.id, Hash32{}}] = out;
-        return out;
+        if (f.stage == 1) {  // the parent's result
+            const Res pr = ret_;
+            if (pr.kind != Kind::Pass) return done(key, fail(pr.kind == Kind::NoPass ? Kind::NoPass : pr.kind, pr.fetch));
+            if (pr.st->on_chain && deep_tip_deferred(own_.pos(), pr.st->pos, env_.j0))
+                return done(key, fail(Kind::Boundary));  // meets c's chain below pos(parent(c)) - J_0
+            State& s = state(n.id, Hash32{});
+            s.tree = true;
+            s.parent = pr.st->on_chain ? nullptr : pr.st;
+            s.pos = n.pos;
+            s.f = pr.st->f;
+            s.h = n.h;
+            s.H = n.H;
+            s.d = n.d;
+            s.S = n.rs;
+            s.placed = pr.st->placed;
+            const CarrierBodyV3* body = env_.bodies.get(n.id);
+            if (body == nullptr) return done(key, fail(Kind::NeedBodies, n.id));
+            f.s = &s;
+            f.stage = 2;
+            return call(nested_frame(s, body->carried));
+        }
+        // stage 2: the carried tips' result
+        const Res nr = ret_;
+        return done(key, nr.kind == Kind::Pass ? Res{Kind::Pass, f.s, {}} : nr);
     }
 
-    Res resolve_variant(const HeaderVariant& y) {
-        const Key key{y.id, y.digest};
-        if (const auto m = memo_.find(key); m != memo_.end()) return m->second;
-        memo_[key] = fail(Kind::NoPass);  // in progress: a cycle does not pass
-        if (!y.bound) claim_ = true;
-        Res out = resolve_variant_body(y);
+    void done(const Key& key, const Res& out) {
         memo_[key] = out;
-        return out;
+        ret(out);
     }
 
-    Res resolve_variant_body(const HeaderVariant& y) {
-        const ReceiptBodyV3& own = y.header.own;
-        if (!y.path_ok) return fail(Kind::NoPass);
-        // the third Boundary test: h(y) < H(pos(parent(c)) - J_0) on c's chain
-        const std::optional<std::uint64_t> h_lo = own_.record(own_.lo());
-        if (h_lo && y.height < *h_lo) return fail(Kind::Boundary);
-        // existential over the passing states of the claimed parent
-        const Options po = options(own.side.tip);
-        if (po.pass.empty()) return po.fail;
-        Kind worst = Kind::NoPass;
-        Hash32 fetch{};
-        for (const State* p : po.pass) {
-            const Res r = on_parent(y, *p);
-            if (r.kind == Kind::Pass) return r;
-            if (combine(r.kind, worst) == r.kind && r.kind != worst) fetch = r.fetch;
-            worst = combine(worst, r.kind);
+    // Variant: a held header variant, existential over the passing states of
+    // its claimed parent; in progress it does not pass (a cycle).
+    void step_variant(Frame& f) {
+        const HeaderVariant& y = *f.y;
+        const Key key = variant_key(y);
+        if (f.stage == 0) {
+            if (const auto m = memo_.find(key); m != memo_.end()) return ret(m->second);
+            memo_[key] = fail(Kind::NoPass);  // in progress: a cycle does not pass
+            if (!y.bound) claim_ = true;
+            if (!y.path_ok) return done(key, fail(Kind::NoPass));
+            // the third Boundary test: h(y) < H(pos(parent(c)) - J_0) on c's chain
+            const std::optional<std::uint64_t> h_lo = own_.record(own_.lo());
+            if (h_lo && y.height < *h_lo) return done(key, fail(Kind::Boundary));
+            f.stage = 1;
+            return call(options_frame(y.header.own.side.tip, Op::Options));
         }
-        return fail(worst, fetch);
+        if (f.stage == 1) {  // the claimed parent's passing states
+            f.opts = std::move(ret_opts_);
+            if (f.opts.pass.empty()) return done(key, f.opts.fail);
+            f.stage = 2;
+            return call(on_parent_frame(y, *f.opts.pass[0]));
+        }
+        // stage 2: y on one passing state of its claimed parent
+        const Res r = ret_;
+        if (r.kind == Kind::Pass) return done(key, r);
+        if (combine(r.kind, f.worst) == r.kind && r.kind != f.worst) f.fetch = r.fetch;
+        f.worst = combine(f.worst, r.kind);
+        if (++f.i < f.opts.pass.size()) return call(on_parent_frame(y, *f.opts.pass[f.i]));
+        return done(key, fail(f.worst, f.fetch));
     }
 
-    // y on one passing state of its claimed parent.
-    Res on_parent(const HeaderVariant& y, const State& ps) {
+    // OnParent: y on one passing state of its claimed parent, over its body sets.
+    void step_on_parent(Frame& f) {
+        const HeaderVariant& y = *f.y;
+        const State& ps = *f.ps;
         const ReceiptBodyV3& own = y.header.own;
-        if (ps.on_chain && deep_tip_deferred(own_.pos(), ps.pos, env_.j0)) return fail(Kind::Boundary);
-        // the carrier at its position on the claimed path: monotone record, t_origin == d there
-        if (!carrier_height_admissible(ps.H, y.height)) return fail(Kind::NoPass);
-        const std::uint64_t d = d_after(&ps);
-        if (!origin_target_ok(own.side.t_origin, d)) return fail(Kind::NoPass);  // d on this path is a claim: no token
-        // its carried list: a body set that folds with its receipts_root over S at the parent
-        const std::vector<const BodySet*> sets = env_.headers.body_sets(y.id);
-        if (y.header.n_carried > 0 && sets.empty()) return fail(Kind::NeedBodies, y.id);
-        std::vector<const BodySet*> tries = sets;
-        const BodySet* none = nullptr;
-        if (y.header.n_carried == 0) tries.assign(1, none);
-        Kind worst = Kind::NoPass;
-        Hash32 fetch{};
-        for (const BodySet* bs : tries) {
-            const std::vector<ReceiptBodyV3> empty;
-            const std::vector<ReceiptBodyV3>& bodies = bs ? bs->bodies : empty;
+        if (f.stage == 0) {
+            if (ps.on_chain && deep_tip_deferred(own_.pos(), ps.pos, env_.j0)) return ret(fail(Kind::Boundary));
+            // the carrier at its position on the claimed path: monotone record, t_origin == d there
+            if (!carrier_height_admissible(ps.H, y.height)) return ret(fail(Kind::NoPass));
+            const std::uint64_t d = d_after(&ps);
+            if (!origin_target_ok(own.side.t_origin, d)) return ret(fail(Kind::NoPass));  // d on this path is a claim: no token
+            // its carried list: a body set that folds with its receipts_root over S at the parent
+            const std::vector<const BodySet*> sets = env_.headers.body_sets(y.id);
+            if (y.header.n_carried > 0 && sets.empty()) return ret(fail(Kind::NeedBodies, y.id));
+            f.tries = sets;
+            if (y.header.n_carried == 0) f.tries.assign(1, nullptr);
+            f.d = d;
+            f.stage = 1;
+        } else if (f.stage == 2) {  // the nested tips' result for f.tries[f.i]
+            const Res nr = ret_;
+            if (nr.kind == Kind::Pass) return ret(Res{Kind::Pass, f.s, {}});
+            if (combine(nr.kind, f.worst) == nr.kind && nr.kind != f.worst) f.fetch = nr.fetch;
+            f.worst = combine(f.worst, nr.kind);
+            ++f.i;
+            f.stage = 1;
+        }
+        // stage 1: the next body set that folds
+        for (; f.i < f.tries.size(); ++f.i) {
+            const BodySet* bs = f.tries[f.i];
+            const std::vector<ReceiptBodyV3>& bodies = bs ? bs->bodies : no_bodies_;
             if (bodies.size() != y.header.n_carried) continue;
             std::vector<Hash32> ids;
             for (const ReceiptBodyV3& b : bodies) ids.push_back(receipt_id(b));
@@ -677,73 +841,87 @@ private:
             s.f = ps.on_chain ? ps.pos : ps.f;
             s.h = y.height;
             s.H = record_height(ps.H, y.height);
-            s.d = d;
+            s.d = f.d;
             s.placed = false;
             s.nested.clear();
-            const Res nr = nested_with_replay(s, ps, bodies, own.side.ballot);
-            if (nr.kind == Kind::Pass) return Res{Kind::Pass, &s, {}};
-            if (combine(nr.kind, worst) == nr.kind && nr.kind != worst) fetch = nr.fetch;
-            worst = combine(worst, nr.kind);
+            f.s = &s;
+            f.stage = 2;
+            return call(replay_frame(s, ps, bodies, own.side.ballot));
         }
-        return fail(worst, fetch);
+        return ret(fail(f.worst, f.fetch));
     }
 
-    // The nested tips of a placed carrier's carried bodies (its S is bound).
-    Res nested(State& s, const std::vector<ReceiptBodyV3>& carried) {
-        for (const ReceiptBodyV3& b : carried) {
-            const Res r = nested_tip(s, b);
-            if (r.kind != Kind::Pass) return r;
+    // Nested: the nested tips of a placed carrier's carried bodies (its S is bound).
+    void step_nested(Frame& f) {
+        if (f.stage == 1) {  // the tip's result for body f.i
+            const Res r = ret_;
+            if (r.kind != Kind::Pass) return ret(r);
+            ++f.i;
         }
-        return Res{Kind::Pass, &s, {}};
+        if (f.i >= f.bodies->size()) return ret(Res{Kind::Pass, f.s, {}});
+        f.stage = 1;
+        return call(tip_frame(*f.s, (*f.bodies)[f.i]));
     }
 
-    // The nested tips of a header variant's body set, with S replayed by
-    // rs_step_at over its placements (work = d_at on each body's tip chain,
+    // Replay: the nested tips of a header variant's body set, with S replayed
+    // by rs_step_at over its placements (work = d_at on each body's tip chain,
     // dead = 0 by #17 on the walked chain, then the carrier at its side d).
-    Res nested_with_replay(State& s, const State& ps, const std::vector<ReceiptBodyV3>& bodies, std::uint16_t ballot) {
-        std::vector<RatchetPlacement> placed;
-        placed.reserve(bodies.size() + 1);
-        for (const ReceiptBodyV3& b : bodies) {
-            const Res r = nested_tip(s, b);
-            if (r.kind != Kind::Pass) return r;
+    void step_replay(Frame& f) {
+        State& s = *f.s;
+        const State& ps = *f.ps;
+        if (f.stage == 0) {
+            f.placed.reserve(f.bodies->size() + 1);
+        } else {  // the tip's result for body f.i
+            const Res r = ret_;
+            if (r.kind != Kind::Pass) return ret(r);
+            const ReceiptBodyV3& b = (*f.bodies)[f.i];
             if (r.st == nullptr) {
-                placed.push_back(RatchetPlacement{b.side.t_origin, b.side.ballot});
-                continue;
+                f.placed.push_back(RatchetPlacement{b.side.t_origin, b.side.ballot});
+            } else {
+                const State& t = *r.st;
+                const std::uint64_t d_tip = d_after(&t);
+                if (!origin_target_ok(b.side.t_origin, d_tip)) return ret(fail(Kind::NoPass));
+                // #17 on the walked chain: h(r) >= H(min(q - 1, p(r)))
+                const std::uint64_t q = s.pos;
+                const std::uint64_t thr = std::min(q - 1, t.pos + 1);
+                const std::optional<std::uint64_t> h_thr = record_on(&ps, thr);
+                if (!h_thr) return ret(fail(Kind::NoPass));
+                // h(r) is the body's own Monero height: from P_r
+                const PrInfo pr = env_.resolve_pr ? env_.resolve_pr(b.blob.prev_id) : PrInfo{};
+                if (pr.status != PrInfo::Status::Held) return ret(fail(Kind::NoPass));
+                const bool live = pr.height + 1 >= *h_thr;
+                f.placed.push_back(RatchetPlacement{live ? b.side.t_origin : 0, b.side.ballot});
             }
-            const State& t = *r.st;
-            const std::uint64_t d_tip = d_after(&t);
-            if (!origin_target_ok(b.side.t_origin, d_tip)) return fail(Kind::NoPass);
-            // #17 on the walked chain: h(r) >= H(min(q - 1, p(r)))
-            const std::uint64_t q = s.pos;
-            const std::uint64_t thr = std::min(q - 1, t.pos + 1);
-            const std::optional<std::uint64_t> h_thr = record_on(&ps, thr);
-            if (!h_thr) return fail(Kind::NoPass);
-            // h(r) is the body's own Monero height: from P_r
-            const PrInfo pr = env_.resolve_pr ? env_.resolve_pr(b.blob.prev_id) : PrInfo{};
-            if (pr.status != PrInfo::Status::Held) return fail(Kind::NoPass);
-            const bool live = pr.height + 1 >= *h_thr;
-            placed.push_back(RatchetPlacement{live ? b.side.t_origin : 0, b.side.ballot});
+            ++f.i;
         }
-        placed.push_back(RatchetPlacement{s.d, ballot});
-        s.S = rs_step_at(env_.rp, ps.S, s.pos, placed, env_.T).s;
-        return Res{Kind::Pass, &s, {}};
+        if (f.i < f.bodies->size()) {
+            f.stage = 1;
+            return call(tip_frame(s, (*f.bodies)[f.i]));
+        }
+        f.placed.push_back(RatchetPlacement{s.d, f.ballot});
+        s.S = rs_step_at(env_.rp, ps.S, s.pos, f.placed, env_.T).s;
+        return ret(Res{Kind::Pass, &s, {}});
     }
 
-    // A carried body's tip: on c's chain (not touched), on the walked path, or
-    // a branch the closure enters (its fork more than J_0 below parent(c):
-    // Closure).
-    Res nested_tip(State& s, const ReceiptBodyV3& b) {
-        const Hash32& t = b.side.tip;
-        if (!closure_) return Res{Kind::Pass, nullptr, {}};
-        for (const State* p = s.parent; p != nullptr; p = p->parent)
-            if (p->id == t) return Res{Kind::Pass, p, {}};  // a tip on the walked path: the same branch
-        Res r = resolve_id(t, nullptr);
-        if (r.kind == Kind::Boundary) return fail(Kind::Closure);
-        if (r.kind != Kind::Pass) return r;
-        if (r.st->on_chain) return r;  // a tip on c's chain is not touched
-        if (closure_fork_deferred(own_.pos(), r.st->f, env_.j0)) return fail(Kind::Closure);
-        s.nested.push_back(r.st);
-        return r;
+    // Tip: a carried body's tip: on c's chain (not touched), on the walked
+    // path, or a branch the closure enters (its fork more than J_0 below
+    // parent(c): Closure).
+    void step_tip(Frame& f) {
+        if (f.stage == 0) {
+            const Hash32& t = f.b->side.tip;
+            if (!closure_) return ret(Res{Kind::Pass, nullptr, {}});
+            for (const State* p = f.s->parent; p != nullptr; p = p->parent)
+                if (p->id == t) return ret(Res{Kind::Pass, p, {}});  // a tip on the walked path: the same branch
+            f.stage = 1;
+            return call(options_frame(t, Op::IdFirst));
+        }
+        const Res r = ret_;
+        if (r.kind == Kind::Boundary) return ret(fail(Kind::Closure));
+        if (r.kind != Kind::Pass) return ret(r);
+        if (r.st->on_chain) return ret(r);  // a tip on c's chain is not touched
+        if (closure_fork_deferred(own_.pos(), r.st->f, env_.j0)) return ret(fail(Kind::Closure));
+        f.s->nested.push_back(r.st);
+        return ret(r);
     }
 
     // H at position k on the chain through `s` (walked nodes, then c's chain).
@@ -787,20 +965,43 @@ private:
         return RetargetWindow(env_.p, entries);
     }
 
+    // The unbound ids of a passing assignment, fork upward: each walked path
+    // from its lowest node up, the branches its nodes' carried tips enter
+    // before the node itself; each state and each id once (an explicit stack).
     void collect_bind(const State* s, std::vector<Hash32>& out) const {
         std::set<const State*> seen;
-        collect_bind(s, out, seen);
-    }
-    void collect_bind(const State* s, std::vector<Hash32>& out, std::set<const State*>& seen) const {
-        std::vector<const State*> chain;
-        for (const State* x = s; x != nullptr && !x->on_chain && seen.insert(x).second; x = x->parent) chain.push_back(x);
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            for (const State* n : (*it)->nested) collect_bind(n, out, seen);
-            if (!(*it)->tree && std::find(out.begin(), out.end(), (*it)->id) == out.end()) out.push_back((*it)->id);
+        std::set<Hash32> listed(out.begin(), out.end());
+        struct Level {
+            std::vector<const State*> chain;  // the path from s down (s first)
+            std::size_t ci = 0;               // the nodes of chain still to finish (from the lowest)
+            std::size_t ni = 0;               // the next nested branch of chain[ci - 1]
+        };
+        const auto level = [&](const State* top) {
+            Level l;
+            for (const State* x = top; x != nullptr && !x->on_chain && seen.insert(x).second; x = x->parent) l.chain.push_back(x);
+            l.ci = l.chain.size();
+            return l;
+        };
+        std::vector<Level> st;
+        st.push_back(level(s));
+        while (!st.empty()) {
+            Level& l = st.back();
+            if (l.ci == 0) {
+                st.pop_back();
+                continue;
+            }
+            const State* x = l.chain[l.ci - 1];
+            if (l.ni < x->nested.size()) {
+                const State* n = x->nested[l.ni++];
+                st.push_back(level(n));
+                continue;
+            }
+            if (!x->tree && listed.insert(x->id).second) out.push_back(x->id);
+            --l.ci;
+            l.ni = 0;
         }
     }
 
-    using Key = std::pair<Hash32, Hash32>;
     State& state(const Hash32& id, const Hash32& digest) {
         auto [it, ins] = states_.try_emplace(Key{id, digest});
         it->second.id = id;
@@ -818,6 +1019,11 @@ private:
     std::vector<std::uint64_t> tokens_;
     bool claim_ = false;
     bool closure_;
+    std::deque<Frame> stack_;
+    Res ret_;
+    Options ret_opts_;
+    std::size_t max_frames_ = 0;
+    const std::vector<ReceiptBodyV3> no_bodies_;
 };
 
 
@@ -868,8 +1074,14 @@ inline std::optional<AdmitResult> epoch_row(const AdmitEnv& env, const Body& b, 
     const Basis basis = basis_of(env.claims, RowClass::Epoch, tip.id, x);
     if (basis == Basis::NotComputed) return std::nullopt;
     const CarrierNode* best = env.tree.find(env.store.best_tip());
-    const std::optional<Hash32> fp = env.tree.fork_point(tip.id, env.store.best_tip());
-    if (best == nullptr || !fp) return node_internal(env, row, b.id, idx);
+    if (best == nullptr) return node_internal(env, row, b.id, idx);
+    // f: the tip's fork with the store's best chain (the tip itself when it lies on it; else the walk
+    // from the tip stops at the first best-chain carrier)
+    const std::optional<Hash32> fp = env.tree.newest_ancestor_where(tip.id, [&](const Hash32& id, std::uint64_t pos) {
+        const std::optional<Hash32> on_best = env.store.best_at(pos);
+        return on_best.has_value() && *on_best == id;
+    });
+    if (!fp) return node_internal(env, row, b.id, idx);
     const std::uint64_t f = env.tree.find(*fp)->pos;
     const EpochAt ea = epoch_at(env.rp, env.T, held, env.ar, best->pos, best->rs, f, x);
     const std::uint64_t hold_at = h_hold(env.rp, tip.rs, x, env.T);
@@ -1054,6 +1266,17 @@ inline std::optional<AdmitResult> walk_row(const AdmitEnv& env, ClosureWalk& wal
         if (b.tip == nullptr) return node_internal(env, row, b.id, idx);
         return std::nullopt;
     }
+    if (w.v == WalkVerdict::Boundary || w.v == WalkVerdict::Closure) {
+        // the walk's values on a claim basis (C-8, row 17): ClaimAlarm
+        const CarrierNode* tn = env.tree.find(t);
+        const Basis bw = basis_of(env.claims, RowClass::Walk, t, tn != nullptr ? tn->pos + 1 : 0);
+        if (is_claim_basis(bw)) {
+            AdmitResult r = claim_alarm(env, row, bw, b.id, idx);
+            r.claim_based = w.claim_based;
+            r.walked = w.walked;
+            return r;
+        }
+    }
     AdmitResult r = defer(missing_of(w.v, w.fetch == t && !env.tree.find(t)), row, idx, w.fetch);
     r.claim_based = w.claim_based;
     r.walked = w.walked;
@@ -1202,9 +1425,17 @@ inline AdmitResult admit_carrier(const AdmitEnv& env, std::span<const std::uint8
     out.id = own_id;
     out.digest = ::v37::sha256d(std::vector<std::uint8_t>(frame.begin(), frame.end()));
     const std::uint64_t q = P.pos + 1;
-    for (const Body& b : bodies) {
+    for (std::size_t k = 0; k < bodies.size(); ++k) {
+        const Body& b = bodies[k];
         const std::uint64_t p_own = b.tip->pos + 1;  // p(r) = pos(t) + 1
         const bool is_live = live(b.h, q, p_own, [&](std::uint64_t x) { return pv.record(x); });
+        // row 31 on a claim basis (C-8): a dead placement is ClaimAlarm
+        const Basis bl = basis_of(env.claims, RowClass::Live, b.tip->id, p_own);
+        if (!is_live && is_claim_basis(bl)) {
+            AdmitResult r = claim_alarm(env, RowId::R31, bl, b.id, k + 1);
+            r.randomx_called = rx;
+            return r;
+        }
         out.placements.push_back(CarriedPlacement{b.id, b.r->side.t_origin, b.r->side.ballot, is_live});
         out.store_placements.push_back(placement_of(*b.r, b.id, b.h, p_own));
     }
@@ -1228,11 +1459,11 @@ inline AdmitResult admit_receipt_decoded(const AdmitEnv& env, const ReceiptBodyV
     b.id = receipt_id(r);
     // row 17: the tip held; off the best chain, the boundary and the closure with parent(c) := the best tip
     // (the carrier this node would build; relay policy, no token)
+    if (env.tree.find(r.side.tip) == nullptr && env.headers.variants(r.side.tip).empty())
+        return defer(Missing::TipUnknown, RowId::R17, 0, r.side.tip);
     const Hash32 best = env.store.best_tip();
     const OwnChain chain(env, best);
     ClosureWalk walk(env, chain);
-    if (env.tree.find(r.side.tip) == nullptr && env.headers.variants(r.side.tip).empty())
-        return defer(Missing::TipUnknown, RowId::R17, 0, r.side.tip);
     if (auto rr = walk_row(env, walk, chain, b, RowId::R17, 0)) return *rr;
     // row 18: epoch_at (i) on the held tip
     if (auto rr = epoch_row(env, b, *b.tip, std::optional<RatchetState>(b.tip->rs), RowId::R18, 0)) return *rr;
@@ -1308,8 +1539,12 @@ inline std::optional<std::vector<std::uint8_t>> carrier_frame(const CarrierBodyV
 //   node-internal store outcome leaves c placed but not chain-valid: tree.drop
 //   removes it). When c's parent is the store's best tip and tree.best() is c
 //   (an extension): store.switch_best(c) (the position's record batch), then
-//   the activation row of c appended to AR. When tree.best() changed
-//   otherwise, the switch is the caller's (SwitchToCaller).
+//   the activation row of c appended to AR. A node-internal outcome of either
+//   is undone: the switch rewound to c's parent (out.batch holds both), c's
+//   delta and body removed, the marks undone (unmark) and c dropped, so the
+//   tree's and the store's best tip are c's parent again and AR is unchanged.
+//   When tree.best() changed otherwise, the switch is the caller's
+//   (SwitchToCaller).
 // ---------------------------------------------------------------------------
 enum class WriteOutcome : std::uint8_t { Extended, SideBranch, SwitchToCaller, Duplicate, NodeInternal };
 
@@ -1356,11 +1591,20 @@ inline WriteResult place_admitted(CarrierTree& tree, Store& store, ActivationRec
     tree.mark_verified(id);
     tree.mark_bodies(id);
     bodies.put(id, *r.carrier);
+    // a node-internal outcome after the marks: the switch rewound, c's delta and body removed, the marks undone
+    const auto undo = [&](bool switched) {
+        if (switched) (void)store.switch_best(r.announce.parent, &out.batch);
+        (void)store.drop_side(id);
+        bodies.erase(id);
+        tree.unmark(id);
+        tree.drop(id);
+        return internal(RowId::R13);
+    };
     if (r.announce.parent == store.best_tip() && tree.best().id == id) {
-        if (store.switch_best(id, &out.batch) != SwitchVerdict::Switched) return internal(RowId::R13);
+        if (store.switch_best(id, &out.batch) != SwitchVerdict::Switched) return undo(false);
         const CarrierNode* n = tree.find(id);
         if (n != nullptr && n->activation) {
-            if (!ar.append(*n->activation)) return internal(RowId::R13);
+            if (!ar.append(*n->activation)) return undo(true);
             out.ar_row = n->activation;
         }
         out.outcome = WriteOutcome::Extended;
@@ -1447,6 +1691,7 @@ public:
                 if (it == frames_.end()) continue;
                 out.push_back(std::move(it->second));
                 frames_.erase(it);
+                forget(d);
             }
             keys_.erase(k);
         }
@@ -1459,6 +1704,7 @@ public:
         for (auto it = frames_.begin(); it != frames_.end();) {
             if (it->second.id == id) {
                 erase_key_of(it->second);
+                forget(it->first);
                 it = frames_.erase(it);
             } else {
                 ++it;
@@ -1472,16 +1718,20 @@ public:
         if (it == frames_.end()) return std::nullopt;
         ParkedFrame f = std::move(it->second);
         frames_.erase(it);
+        forget(digest);
         leave_key(tree, f);
         return f;
     }
 
-    // N-7: the tree discarded these waiting entries; their frames are dropped.
+    // The tree discarded these waiting entries (PlaceOutcome::discarded); their frames are dropped.
     void discard(const std::vector<WaitKey>& keys) {
         for (const WaitKey& k : keys) {
             const auto it = keys_.find(k);
             if (it == keys_.end()) continue;
-            for (const Hash32& d : it->second) frames_.erase(d);
+            for (const Hash32& d : it->second) {
+                frames_.erase(d);
+                forget(d);
+            }
             keys_.erase(it);
         }
     }
@@ -1517,7 +1767,9 @@ public:
     }
 
     // C-6: the node asks a peer for a parked frame's walked headers or bodies at
-    // most once while that peer holds its variants (until forget_peer).
+    // most once while that peer holds its variants (until forget_peer). The
+    // record of a frame leaves with the frame (take, eviction, purge, discard,
+    // release): it is held for held frames only.
     bool may_ask(const Hash32& digest, std::uint64_t peer) {
         const auto it = frames_.find(digest);
         if (it == frames_.end()) return false;
@@ -1526,6 +1778,8 @@ public:
     void forget_peer(std::uint64_t peer) {
         for (auto& [d, peers] : asked_) peers.erase(peer);
     }
+    // The frames with an ask record.
+    std::size_t asked_frames() const noexcept { return asked_.size(); }
 
     // A re-walked frame's new outcome (still DEFERred).
     void update(const Hash32& digest, Missing cause, bool claim_based, const std::vector<Hash32>& walked) {
@@ -1537,6 +1791,8 @@ public:
     }
 
 private:
+    void forget(const Hash32& digest) { asked_.erase(digest); }
+
     void erase_key_of(const ParkedFrame& f) {
         if (f.cause != Missing::ParentUnknown) return;
         const auto k = keys_.find(WaitKey{f.id, f.parent});
