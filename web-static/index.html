@@ -99,8 +99,12 @@
                 d3.select('#efficiency').text(local_stats.efficiency != null ? d3.format('.4p')(local_stats.efficiency) : '???')
                 d3.select('#uptime').text(format_dt(local_stats.uptime));
                 d3.select('#block_value').text(local_stats.block_value);
-                d3.select('#block_value_payments').text(local_stats.block_value_payments || 0);
+                // Protocol-mandated outputs (masternode / treasury / burn) only exist
+                // on some coins; show the miner/protocol split only where it is non-zero.
+                var bv_payments = local_stats.block_value_payments || 0;
+                d3.select('#block_value_payments').text(bv_payments);
                 d3.select('#block_value_miner').text(local_stats.block_value_miner || local_stats.block_value);
+                d3.select('#block_value_split').style('display', bv_payments > 0 ? null : 'none');
                 
                 d3.select('#warnings').selectAll().data(local_stats.warnings).enter().append('p')
                     .text(function(w){ return 'Warning: ' + w })
@@ -330,7 +334,28 @@
                 }
                 
                 // Use current_merged_payouts which includes derived merged addresses
+                d3.json('../payout_addrs', function(nodeAddrs) {
+                nodeAddrs = nodeAddrs || [];
                 d3.json('../current_merged_payouts', function(mergedPays) {
+                    mergedPays = mergedPays || {};
+                    // "Payout if a block were found NOW" is THIS node's payout: sum only
+                    // the node's own addresses (/payout_addrs), not the whole pool.
+                    var nodeamount = 0.0;
+                    nodeAddrs.forEach(function(a) {
+                        if (mergedPays[a]) nodeamount += mergedPays[a].amount || 0;
+                    });
+                    var pa = d3.select('#payout_addrs');
+                    pa.selectAll('*').remove();
+                    if (nodeAddrs.length === 0) {
+                        pa.text('(no payout address configured on this node)');
+                    } else {
+                        pa.text(null);
+                        nodeAddrs.forEach(function(a, i) {
+                            if (i > 0) pa.append('span').text(', ');
+                            pa.append('a').text(a)
+                                .attr('href', currency_info.address_explorer_url_prefix + a);
+                        });
+                    }
                     var totamount=0.0;
                     var mergedTotal=0.0;
                     var mergedSymbol='';
@@ -345,7 +370,7 @@
                             });
                         }
                     }
-                    d3.select('#payout_totamount').text(totamount.toFixed(8));
+                    d3.select('#payout_totamount').text(nodeamount.toFixed(8));
 
                     var arr = []; for(var i in mergedPays) arr.push(i); 
                     arr.sort(function(a, b){return (mergedPays[b].amount || 0) - (mergedPays[a].amount || 0)});
@@ -401,6 +426,7 @@
                             .style('font-weight', 'bold')
                             .text(d3.format('.2f')(mergedTotal));
                     }
+                });
                 });
                 
                 function getMergedExplorerUrl(symbol, address) {
@@ -577,9 +603,9 @@
         <p>Node uptime: <span id="uptime"></span> Peers: <span id="peers_out"></span> out, <span id="peers_in"></span> in</p>
         <p>Local rate: <span id="local_rate"></span> (<span id="local_doa"></span> DOA) Expected time to share: <span id="time_to_share"></span></p>
         <p>Shares: <span id="shares_total"></span> total (<span id="shares_orphan"></span> orphaned, <span id="shares_dead"></span> dead) Efficiency: <span id="efficiency"></span></p>
-        <p>Payout if a block were found NOW: <span id="payout_totamount"></span> <span class="symbol"></span> to <a id="payout_addrs"></a>. Expected payout after mining for 24 hours: <span id="expected_payout_amount"></span> <span class="symbol"></span></p>
+        <p>Payout if a block were found NOW: <span id="payout_totamount"></span> <span class="symbol"></span> to <span id="payout_addrs"></span>. Expected payout after mining for 24 hours: <span id="expected_payout_amount"></span> <span class="symbol"></span></p>
         <p id="merged_info" style="display:none; color:#6f42c1; font-weight:bold;">Merged mining block value: <span id="merged_block_value"></span> <span id="merged_symbol"></span>. Expected merged payout (24h): <span id="expected_merged_payout"></span> <span id="merged_symbol2"></span></p>
-        <p>Current block value: <span id="block_value"></span> <span class="symbol"></span>. Expected time to block: <span id="time_to_block"></span></p>
+        <p>Current block value: <span id="block_value"></span> <span class="symbol"></span><span id="block_value_split" style="display:none"> (miners <span id="block_value_miner"></span>, protocol <span id="block_value_payments"></span>)</span>. Expected time to block: <span id="time_to_block"></span></p>
         <div id="warnings"></div>
         
         <!-- Version Signaling Status -->
