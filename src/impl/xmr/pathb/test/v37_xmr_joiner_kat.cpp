@@ -1421,7 +1421,8 @@ void candidates() {
         // t: a tip id no state of this KAT has looked up (each leg starts from empty entries)
         pb::Hash32 t = at_pos(a, 4000);
         t[31] ^= 0x5a;
-        const pb::TipWindow honest = a.window(at_pos(a, 4000), 16);
+        pb::TipWindow honest = a.window(at_pos(a, 4000), 16);
+        honest.tip = t;  // the cache stores an evaluation under its own (tip, v)
         pb::TipWindow forged = honest;
         forged.window_root[0] ^= 1;
         (void)att.windows().get(t, 16, [&] { return forged; });
