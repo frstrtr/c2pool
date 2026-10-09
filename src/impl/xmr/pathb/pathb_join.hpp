@@ -875,7 +875,12 @@ private:
     }
 
     // ---- headers (3.3 step 2a; JC: the claimed positions) ----
-    std::uint64_t header_page() const { return std::max<std::uint64_t>(1, in_.journal_depth); }
+    // One FC_GETHEADERS page: at most N_rt headers, so no page asks below the
+    // server's P-51 header floor x0(L') - N_rt (every position the span scan
+    // needs lies at or above x0 - 1).
+    std::uint64_t header_page() const {
+        return std::min<std::uint64_t>(std::max<std::uint64_t>(1, in_.journal_depth), join_n_rt(in_.p));
+    }
     // what one FC_HEADERS frame can carry
     std::uint64_t frame_fit() const {
         const std::uint64_t max_header = 1 + in_.buffers.receipt + 1 + 2 * sizeof(std::uint64_t);
@@ -934,11 +939,13 @@ private:
         return &hdr_[x - lo_pos_];
     }
 
-    bool more_headers() {
+    // The next page below the lowest held header, down to `need_lo` at most.
+    bool more_headers(std::uint64_t need_lo = 1) {
         const Hash32 stop = hdr_.front().own.side.tip;  // the parent of the lowest held header
-        const std::uint64_t max = std::min(header_page(), lo_pos_ - 1);
+        const std::uint64_t range = lo_pos_ > need_lo ? lo_pos_ - need_lo : 1;
+        const std::uint64_t max = std::min(header_page(), range);
         const ChainHeaders r = link_.headers(stop, max, timeout_);
-        if (r.status == LinkStatus::Served && short_headers(r, max, lo_pos_ - 1))
+        if (r.status == LinkStatus::Served && short_headers(r, max, range))
             return fail(AttemptEnd::NotServed, "a short FC_HEADERS reply");
         return take_headers(r, stop);
     }
@@ -994,17 +1001,19 @@ private:
     bool bounds() {
         for (;;) {
             const SpanResult s = span_bounds(in_.p, rep_.L, [this](std::uint64_t x) { return rec(x); });
+            std::uint64_t need_lo = 1;
             if (s.status == SpanStatus::Ok) {
                 rep_.span = s.bounds;
                 const std::uint64_t nrt = join_n_rt(in_.p);
                 const std::uint64_t want = s.bounds.young ? 1 : (s.bounds.x0 > nrt ? s.bounds.x0 - nrt : 1);
                 if (lo_pos_ <= want) return true;  // the retarget prefix (the whole chain on a young one) held
+                need_lo = want;                    // the PRE: no header below x0 - N_rt asked
             }
             if (lo_pos_ <= 1) {
                 if (s.status == SpanStatus::Ok) return true;
                 return fail(AttemptEnd::NotServed, "the records do not reach the span");
             }
-            if (!more_headers()) return false;
+            if (!more_headers(need_lo)) return false;
         }
     }
 

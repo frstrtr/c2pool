@@ -1123,24 +1123,35 @@ void attempts() {
         check(h.requests == 0 && j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL,
               "withholds: J reaches A's digest from the next server, with one server's data only");
     }
-    // the attempt's L from the server's reply; the server holds its P-51 floor for the open attempt (B-4)
+    // the attempt's L from the server's reply; the server holds its P-51 floor for the open attempt (B-4). The chain
+    // is long enough that the header floor x0(L') - N_rt lies above position 1, so a floor taken at the moved tip
+    // would cut the attempt's retarget prefix.
     {
+        grow(a, 5700 - 4810);
+        const std::uint64_t Lm = 5600;
         KatServer m(a, 131);
         m.retention = true;
-        m.top = L;
+        m.top = Lm;
         const pb::Hash32 hello = m.best_id();
+        const std::uint64_t floor_hello = m.floors_now().headers;
+        m.top = Lm + 24;
+        const std::uint64_t floor_moved = m.floors_now().headers;
+        m.top = Lm;
+        check(floor_hello > 1 && floor_moved > floor_hello,
+              "moved tip: the header floor binds (" + std::to_string(floor_hello) + " at the HELLO tip, " +
+                      std::to_string(floor_moved) + " after the moves)");
         m.before = [&](KatServer& k) {
-            if (k.requests == 1) k.top = L + 12;       // the tip moved one Monero height since its HELLO
-            else if (k.requests == 2) k.top = L + 24;  // and again after the attempt's first reply
+            if (k.requests == 1) k.top = Lm + 12;       // the tip moved one Monero height since its HELLO
+            else if (k.requests == 2) k.top = Lm + 24;  // and again after the attempt's first reply
         };
         JoinerEnv je(net);
         pb::Joiner j(je.in, kP53);
         j.offer(hello, m);
         const std::optional<pb::AttemptReport> r = j.run_next();
-        check(r && r->end == pb::AttemptEnd::Completed && r->L == L + 12,
+        check(r && r->end == pb::AttemptEnd::Completed && r->L == Lm + 12,
               "moved tip: the attempt takes L from the server's reply and completes while the tip moves" +
                       (r ? ": " + rep_desc(*r) : ""));
-        check(j.adopted() && digest_of(*j.adopted(), at_pos(a, L + 12)) == digest_of(a, at_pos(a, L + 12)),
+        check(j.adopted() && digest_of(*j.adopted(), at_pos(a, Lm + 12)) == digest_of(a, at_pos(a, Lm + 12)),
               "moved tip: J's digest == A's at the attempt's L");
     }
     // a fake candidate (CK4-3): a chain of >= 3,336 carriers with no canonical coinbase, offered by three servers
@@ -1252,12 +1263,16 @@ void candidates() {
         for (std::uint64_t h = 15; h <= 20; ++h) e3.add(h, 1000);
         check(pb::candidate_replaces(e3, hid(2), e1, hid(3)) && !pb::candidate_replaces(e3, hid(4), e1, hid(3)),
               "candidates (d): equal bound work from h_f up -> the lower tip id");
-        pb::BoundWork big, less;
+        // 2^16 carriers at d = 2^64 - 1, one per height, against one such carrier at the same lowest height: the
+        // sum 2^80 - 2^16 in U128 (a u64 sum would wrap below the single carrier's 2^64 - 1)
+        pb::BoundWork big, one;
         for (std::uint64_t k = 0; k < (1u << 16); ++k) big.add(1000 + k, UINT64_MAX);
-        for (std::uint64_t k = 0; k + 1 < (1u << 16); ++k) less.add(1000 + k, UINT64_MAX);
-        less.add(1000 + (1u << 16) - 1, UINT64_MAX - 1);
-        check(pb::candidate_replaces(big, hid(9), less, hid(1)) && !pb::candidate_replaces(less, hid(1), big, hid(9)),
-              "bound work in U128: 2^16 carriers at d = 2^64 - 1 do not wrap");
+        one.add(1000, UINT64_MAX);
+        const pb::U128 sum = big.from(1000);
+        check(sum.hi == (1u << 16) - 1 && sum.lo == UINT64_MAX - ((1u << 16) - 1),
+              "bound work in U128: 2^16 carriers at d = 2^64 - 1 sum to 2^80 - 2^16 (no wrap)");
+        check(pb::candidate_replaces(big, hid(9), one, hid(1)) && !pb::candidate_replaces(one, hid(1), big, hid(9)),
+              "bound work in U128: the 2^16 carriers outweigh one carrier at d = 2^64 - 1");
     }
     // (c) a stream of new candidates offered after the honest one (lower tip ids, more claimed work): the honest
     // pair is tried next (P-52)
@@ -1289,7 +1304,7 @@ void candidates() {
         ps.hof = [](std::uint64_t x) { return kLaneB0 + x / 10; };
         ps.carry_every = 1;
         ps.nonce0 = 400000;
-        grow(p, 4950, ps);
+        grow(p, 5100, ps);
         KatServer sp(p, 171), sh(a, 172);
         sp.top = 4500;
         sh.top = 5400;
@@ -1304,12 +1319,22 @@ void candidates() {
         check(digest_of(*j.adopted(), at_pos(p, 4500)) == digest_of(p, at_pos(p, 4500)), "candidates (a): J's state == the fake's");
         // the fake keeps growing while the honest attempt runs (A follows it as a full node)
         std::uint64_t next = 4500;
+        pb::BoundWork a_end;  // A's profile at the end of the honest attempt (the test)
+        pb::Hash32 a_end_tip{};
         j.set_on_step([&](pb::JoinedState&, std::uint64_t x) {
-            if (x % 6 == 0 && next < 4950 && follow(*j.adopted(), p, next, next + 1, 9)) ++next;
+            if (x % 6 == 0 && next < 5100 && follow(*j.adopted(), p, next, next + 1, 9)) ++next;
+            a_end = j.adopted()->bound_work();
+            a_end_tip = j.adopted()->tip();
         });
         const std::optional<pb::AttemptReport> r2 = j.run_next();
         j.set_on_step({});
         check(next >= 4900, "candidates (a): the fake grew by " + std::to_string(next - 4500) + " carriers during the honest attempt");
+        if (r2 && j.adopted() && j.last_switch().replaced) {
+            const pb::BoundWork hw = j.adopted()->bound_work();
+            const pb::Hash32 ht = j.adopted()->tip();
+            check(!pb::candidate_replaces(hw, ht, a_end, a_end_tip),
+                  "candidates (a): read at the test, A's grown profile would keep the fake (the growth flips the rule)");
+        }
         check(r2 && r2->end == pb::AttemptEnd::Completed && r2->a_profile_read && j.last_switch().replaced,
               "candidates (a): the honest candidate completes and replaces the fake (A's profile read when the attempt took its L)" +
                       (r2 ? ": " + rep_desc(*r2) : ""));
