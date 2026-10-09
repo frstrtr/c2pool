@@ -15,8 +15,12 @@
 //                   bin, placed ids, buckets, the MMR).
 //   view_at(x)      the lane state of x's own chain through x: the best
 //                   chain's state through the fork point plus x's side deltas.
-//                   A fork point below the journal is Deep (DEFER); a view is
-//                   never taken from another branch.
+//                   A fork point below the view horizon is Deep (DEFER); a
+//                   view is never taken from another branch.
+//   view horizon    side deltas are kept and read down to base_pos - J_0
+//                   (fork_in_view: fork + J_0 >= base_pos), J_0 =
+//                   journal_j0(p, D_fin); switch_best keeps base_pos
+//                   (fork_in_journal), so a switch below base_pos is Deep.
 //   ingest(c, r)    r placed by carrier c at q = pos(c), read on c's chain at
 //                   its parent:
 //                     Expired    the origin bin is sealed: !open_at(H(q - 1),
@@ -40,8 +44,8 @@
 //   retention       P-37 / P-38 (policy, ruling 23): by default every placement
 //                   and every sealed bucket body is kept (leaf hashes always).
 //                   A node may drop the placements of bins below a floor (at
-//                   most min(H(L - J), H(L) - F - Fresh) - F - Fresh + 1, L the
-//                   best tip) and the bucket bodies of bins below a floor; a
+//                   most H(L - J - J_0) - 2 x (F + Fresh) + 1, L the best tip)
+//                   and the bucket bodies of bins below a floor; a
 //                   read of a dropped bin is MissingEntries / MissingBucket
 //                   (DEFER), never an empty bin. restore_bucket takes a served
 //                   body back when it hashes to the held leaf.
@@ -72,6 +76,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -84,6 +89,7 @@
 #include "sharechain/v37/v37_hash.hpp"  // ::v37::sha256d
 
 #include "pathb_buckets.hpp"
+#include "pathb_joiner.hpp"             // journal_j0
 #include "pathb_params.hpp"
 #include "pathb_receipt_admission.hpp"  // open_at, live
 #include "pathb_retarget.hpp"           // record_height, carrier_height_admissible
@@ -165,8 +171,8 @@ struct SealedBin {
 // ---------------------------------------------------------------------------
 // Retention (policy, ruling 23). Defaults keep everything.
 //   P-37 placements: kept for every bin; a floor drops the placements of the
-//        bins below it, clamped to min(H(L - J), H(L) - F - Fresh) - F - Fresh
-//        + 1. Flag --pathb-entry-retention.
+//        bins below it, clamped to H(L - J - J_0) - 2 x (F + Fresh) + 1. Flag
+//        --pathb-entry-retention.
 //   P-38 bucket bodies: kept for every sealed bin from b0, leaf hashes always;
 //        a floor drops the bodies of the bins below it. Flag
 //        --pathb-bucket-retention.
@@ -536,10 +542,11 @@ class BinStore {
 public:
     // Genesis carrier at position 0 with template height genesis_height; the
     // lane's first bin b0 = H(0) = genesis_height (P-3 = ruling 31); journal_depth
-    // J (P-01); chain = the record key's chain id.
+    // J (P-01); chain = the record key's chain id. The view horizon J_0 =
+    // journal_j0(p, D_fin).
     BinStore(const LaneParams& p, std::uint64_t journal_depth, const Hash32& genesis_id, std::uint64_t genesis_height,
              std::uint32_t chain = 0)
-        : p_(p), b0_(genesis_height), j_(journal_depth), chain_id_(chain) {
+        : p_(p), b0_(genesis_height), j_(journal_depth), j0_(journal_j0(p, kSealDepth)), chain_id_(chain) {
         LaneDelta g;
         g.id = genesis_id;
         g.parent = genesis_id;
@@ -571,14 +578,27 @@ public:
     const LaneParams& params() const noexcept { return p_; }
     std::uint64_t b0() const noexcept { return b0_; }
     std::uint64_t journal_depth() const noexcept { return j_; }
+    std::uint64_t view_horizon_depth() const noexcept { return j0_; }
     std::uint64_t tip_pos() const noexcept { return chain_.size() - 1; }
     const Hash32& best_tip() const noexcept { return chain_.back(); }
+    // The best chain's carrier at position x; nullopt above the tip.
+    std::optional<Hash32> best_at(std::uint64_t x) const {
+        if (x >= chain_.size()) return std::nullopt;
+        return chain_[x];
+    }
     // The newest position the journal no longer holds deltas for (never moves
     // back: a rewind keeps it, as RewindJournal does).
     std::uint64_t base_pos() const noexcept {
         const std::uint64_t by_depth = tip_pos() > j_ ? tip_pos() - j_ : 0;
         return std::max(by_depth, floor_);
     }
+    // A side branch forking at `fork` is read and written (view horizon).
+    bool fork_in_view(std::uint64_t fork) const noexcept {
+        const std::uint64_t base = base_pos();
+        return base <= j0_ || fork >= base - j0_;
+    }
+    // An observer of view_at calls (the KATs' store spy); none by default.
+    void set_view_spy(std::function<void(const Hash32&)> spy) { view_spy_ = std::move(spy); }
     std::size_t journal_size() const noexcept { return journal_.size(); }
     const BinMmr& best_mmr() const noexcept { return mmr_; }
 
@@ -590,6 +610,7 @@ public:
     }
 
     LaneView view_at(const Hash32& x) const {
+        if (view_spy_) view_spy_(x);
         LaneView v;
         v.s_ = this;
         if (const auto bi = chain_pos_.find(x); bi != chain_pos_.end() && chain_[bi->second] == x) {
@@ -618,7 +639,7 @@ public:
             }
             d = &pj->second;
         }
-        if (!fork_in_journal(fork)) {
+        if (!fork_in_view(fork)) {
             v.st_ = ViewStatus::Deep;
             return v;
         }
@@ -636,7 +657,7 @@ public:
         if (const LaneDelta* pd = delta(parent); pd && !pd->sealed_done) return AddVerdict::ParentUnknown;
         const LaneView pv = view_at(parent);
         if (pv.status() == ViewStatus::Unknown) return AddVerdict::ParentUnknown;
-        if (pv.status() == ViewStatus::Deep || !fork_in_journal(pv.fork_pos())) return AddVerdict::Deep;
+        if (pv.status() == ViewStatus::Deep || !fork_in_view(pv.fork_pos())) return AddVerdict::Deep;
         const std::uint64_t parent_record = pv.record(pv.pos());
         if (!carrier_height_admissible(parent_record, h)) return AddVerdict::NotCarrier;
         LaneDelta d;
@@ -771,13 +792,12 @@ public:
 
     // ---- retention (P-37 / P-38) ----
 
-    // The highest P-37 floor the best tip allows: min(H(L - J), H(L) - F -
-    // Fresh) - F - Fresh + 1 (saturating; never below b0).
+    // The highest P-37 floor the best tip allows: H(L - J - J_0) - 2 x (F +
+    // Fresh) + 1 (saturating; never below b0).
     std::uint64_t entry_floor_limit() const noexcept {
-        const std::uint64_t span = p_.open_bins + p_.fresh_max;
-        const std::uint64_t h_tip = records_.back();
-        const std::uint64_t h_j = records_[tip_pos() > j_ ? tip_pos() - j_ : 0];
-        const std::uint64_t a = std::min(h_j, h_tip > span ? h_tip - span : 0);
+        const std::uint64_t span = 2 * (p_.open_bins + p_.fresh_max);
+        const std::uint64_t back = j_ > UINT64_MAX - j0_ ? UINT64_MAX : j_ + j0_;
+        const std::uint64_t a = records_[tip_pos() > back ? tip_pos() - back : 0];
         const std::uint64_t x = a > span ? a - span : 0;
         return std::max(b0_, x + 1);
     }
@@ -906,13 +926,17 @@ private:
         out.put(lane_keys::bmmr(chain_id_), encode_bmmr(head()));
     }
 
-    // Deltas at or below the journal base are dropped (the best chain's stay
-    // materialised; a side branch forking there is Deep from now on).
+    // The best chain's deltas at or below the journal base are dropped (they
+    // stay materialised); side deltas at or below the view horizon base_pos -
+    // J_0 are dropped (a side branch forking below it is Deep).
     void prune() {
         const std::uint64_t base = base_pos();
         floor_ = base;
+        const std::uint64_t horizon = base > j0_ ? base - j0_ : 0;
         for (auto it = journal_.begin(); it != journal_.end();) {
-            if (it->second.pos <= base && it->second.pos != 0)
+            const std::uint64_t pos = it->second.pos;
+            const bool drop = pos != 0 && (on_best(it->first) ? pos <= base : pos <= horizon);
+            if (drop)
                 it = journal_.erase(it);
             else
                 ++it;
@@ -922,6 +946,7 @@ private:
     LaneParams p_;
     std::uint64_t b0_;
     std::uint64_t j_;
+    std::uint64_t j0_;  // J_0: the view horizon below base_pos
     std::uint32_t chain_id_;
     std::uint64_t floor_ = 0;  // the journal base reached so far
     std::uint64_t entry_floor_ = 0;  // placements of bins below it are not held (P-37)
@@ -935,8 +960,10 @@ private:
     std::vector<SealedBin> buckets_;                           // by leaf index
     BinMmr mmr_;
 
-    // held carriers above the journal base on every branch (and genesis)
+    // held carriers above the journal base on the best chain, above the view
+    // horizon on side branches (and genesis)
     std::map<Hash32, LaneDelta> journal_;
+    std::function<void(const Hash32&)> view_spy_;
 };
 
 // ---------------------------------------------------------------------------

@@ -28,8 +28,9 @@
 //   bin those windows read DEFERs (MissingBucket, 54 fetches), never a
 //   different window_root, and after the fetches is byte-equal to a store that
 //   never pruned; a served body that does not hash to the leaf is refused;
-//   placements pruned at the P-37 limit: every tip in the journal unchanged,
-//   an older tip DEFERs (MissingEntries).
+//   placements pruned at the P-37 limit H(L - J - J_0) - 2 x (F + Fresh) + 1
+//   (b0 at this tip): every tip in the journal and an older tip unchanged
+//   (the floor vectors at a higher tip: v37_xmr_bin_fold_kat V10).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <limits>
@@ -258,9 +259,9 @@ void s3b_m_doubles_and_retention() {
                   && w2p.oldest_bin == w2.oldest_bin,
           "P-38: after the fetches window(t2) is byte-equal to the never-pruned store");
 
-    // P-37: placements pruned at the limit.
+    // P-37: placements pruned at the limit H(L - J - J_0) - 2 x (F + Fresh) + 1 (L - J - J_0 below 0 here).
     const std::uint64_t limit = ent.entry_floor_limit();
-    check(limit == b0 + 105, "P-37: the limit at tip 300, J 64: min(H(236), H(300) - 98) - 98 + 1 = b0 + 105");
+    check(limit == b0, "P-37: the limit at tip 300, J 64: H(L - J - J_0) - 2 x (F + Fresh) + 1 clamps to b0");
     check(ent.prune_entries(std::numeric_limits<std::uint64_t>::max()) == limit && ent.entry_floor() == limit,
           "P-37: a floor above the limit is clamped to it");
     bool ent_journal = true;
@@ -272,9 +273,8 @@ void s3b_m_doubles_and_retention() {
     check(ent_journal && w2e.ok() && w2e.window_root == w2.window_root,
           "P-37: every tip in the journal and t2 unchanged");
     const pb::TipWindow old_full = eval(full, 150), old_ent = eval(ent, 150);
-    check(old_full.ok() && !old_ent.ok() && old_ent.defer == pb::WindowDefer::MissingEntries
-                  && old_ent.missing_bin == b0 + 104,
-          "P-37: a tip below the journal whose open bins were pruned DEFERs: MissingEntries b0 + 104");
+    check(old_full.ok() && old_ent.ok() && old_ent.window_root == old_full.window_root,
+          "P-37: a tip below the journal keeps its open bins at this floor (the floor is b0)");
 }
 
 }  // namespace
