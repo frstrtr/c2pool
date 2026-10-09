@@ -76,7 +76,7 @@ int dial(std::uint16_t port) {
     if (::connect(fd, reinterpret_cast<sockaddr*>(&d), sizeof d) != 0) { ::close(fd); return -1; }
     return fd;
 }
-void send_raw(int fd, const std::string& s) { (void)!::write(fd, s.data(), s.size()); }
+void send_raw(int fd, const std::string& s) { (void)!::send(fd, s.data(), s.size(), MSG_NOSIGNAL); }
 std::string read_line(int fd, int timeout_ms) {
     std::string buf;
     const auto until = Clock::now() + std::chrono::milliseconds(timeout_ms);
