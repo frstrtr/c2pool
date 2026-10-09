@@ -524,6 +524,21 @@ void StratumSession::read_message()
                 self->process_message(bytes_read);
                 self->read_message();  // Continue reading
             } else {
+                if (ec == boost::asio::error::not_found) {
+                    // The buffer filled to its max_size with no '\n': the line
+                    // is longer than kMaxStratumLineBytes. Drop the peer, as
+                    // p2pool's LineOnlyReceiver does. Read the endpoint before
+                    // cancel_timers() closes the socket.
+                    boost::system::error_code ep_ec;
+                    auto ep = self->socket_.remote_endpoint(ep_ec);
+                    if (self->server_)
+                        self->server_->record_oversized_line_drop();
+                    LOG_WARNING << "Stratum session " << self->session_id_
+                                << " dropped: line over " << kMaxStratumLineBytes
+                                << " bytes without a newline"
+                                << (ep_ec ? std::string{} : " peer=" + ep.address().to_string()
+                                                + ":" + std::to_string(ep.port()));
+                }
                 // Session disconnected — cancel timers to break prevent zombie callbacks,
                 // then unregister from worker tracking.
                 self->cancel_timers();
