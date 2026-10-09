@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "5a160d2de3e3f4e4bfc2da8731a3c749ab85ce91",
+  "commit": "c684390997879e88c5b706de940abe8661e30386",
   "rules": {
     "C01": {
       "checks": {
