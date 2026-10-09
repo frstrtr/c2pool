@@ -109,6 +109,17 @@ using WireTap = std::function<void(bool outbound,
                                    const std::uint8_t* frame,
                                    std::size_t         frame_size)>;
 
+// Consulted on the io thread the instant a header is validated and BEFORE the
+// body is sized or read. Returns false to refuse the frame (the socket closes)
+// so a response the consumer never solicited cannot make us allocate and read
+// its declared body. Unset means "admit every header the policy already let
+// through".
+using HeaderGate = std::function<bool(const BucketHead& head)>;
+
+// A body buffer larger than this is released after its frame is delivered, so a
+// single large frame does not pin megabytes for the life of the connection.
+inline constexpr std::size_t kBodyBufShrinkThreshold = 256u * 1024u;
+
 class LevinSocket : public std::enable_shared_from_this<LevinSocket> {
 public:
     using tcp = boost::asio::ip::tcp;
@@ -143,6 +154,7 @@ public:
     void set_frame_handler(FrameHandler h) { frame_handler_ = std::move(h); }
     void set_close_handler(CloseHandler h) { close_handler_ = std::move(h); }
     void set_wire_tap(WireTap t)           { tap_ = std::move(t); }
+    void set_header_gate(HeaderGate g)     { header_gate_ = std::move(g); }
 
     // Discipline 3. `owner` is a weak_ptr to whatever object owns the callbacks
     // installed above (LevinLink, in practice). If it is non-empty at the time
@@ -225,6 +237,11 @@ public:
     // do); reading them from another thread while the loop runs is a data race.
     Stats stats() const { return stats_; }
 
+    // Current capacity of the inbound body buffer. Read on the io thread (or
+    // after io_context::run returns); exposed so a KAT can assert the buffer is
+    // released after a large frame.
+    std::size_t body_capacity() const noexcept { return body_buf_.capacity(); }
+
     const std::string& remote() const noexcept { return remote_; }
 
     boost::asio::any_io_executor executor() { return socket_.get_executor(); }
@@ -289,6 +306,14 @@ private:
             return;
         }
 
+        // Refuse a header the consumer will not accept (an unsolicited response)
+        // before the body is sized or read, so a peer cannot make us allocate
+        // and pull its declared body only to drop it afterwards.
+        if (header_gate_ && !header_gate_(head_)) {
+            do_close(std::string("unsolicited ") + command_name(head_.command) + " at header");
+            return;
+        }
+
         const std::size_t cb = static_cast<std::size_t>(head_.cb);
         if (cb == 0) { deliver(nullptr, 0); return; }
 
@@ -323,6 +348,11 @@ private:
             tap_(false, tap_frame_.data(), tap_frame_.size());
         }
         if (frame_handler_) frame_handler_(head_, body, size);
+        // Release an oversized body buffer so one large frame does not pin
+        // memory for the life of the connection. The handler has already run,
+        // so `body` (a pointer into body_buf_) is no longer needed.
+        if (body_buf_.capacity() > kBodyBufShrinkThreshold)
+            std::vector<std::uint8_t>().swap(body_buf_);
         // The handler may have closed us (a protocol violation, a matcher
         // failure); re-arming a closed socket is a no-op by the guard above.
         do_read_header();
@@ -424,6 +454,7 @@ private:
     FrameHandler frame_handler_;
     CloseHandler close_handler_;
     WireTap      tap_;
+    HeaderGate   header_gate_;
 
     std::weak_ptr<void> owner_lifetime_;
     bool                owner_managed_ = false;

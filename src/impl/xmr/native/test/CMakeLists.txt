@@ -332,7 +332,8 @@ if (BUILD_TESTING)
     # -----------------------------------------------------------------------
     foreach(_c1b_kat
             xmr_levin_socket_kat
-            xmr_levin_link_kat)
+            xmr_levin_link_kat
+            xmr_native_levin_unsolicited_cap_kat)   # XMR-READ-BOUNDS item 5: reject unsolicited response at header time
         add_executable(${_c1b_kat} ${_c1b_kat}.cpp)
         target_include_directories(${_c1b_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
