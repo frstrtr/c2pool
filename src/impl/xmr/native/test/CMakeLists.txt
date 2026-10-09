@@ -78,7 +78,7 @@ if (BUILD_TESTING)
             xmr_epee_storage_kat
             xmr_levin_messages_kat
             xmr_levin_fuzz_kat
-            xmr_native_epee_budget_kat)   # XMR-READ-BOUNDS item 4: message-wide array-element budget
+            xmr_native_epee_budget_kat)   # message-wide array-element limit
         add_executable(${_c1a_kat} ${_c1a_kat}.cpp)
         target_include_directories(${_c1a_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -333,7 +333,7 @@ if (BUILD_TESTING)
     foreach(_c1b_kat
             xmr_levin_socket_kat
             xmr_levin_link_kat
-            xmr_native_levin_unsolicited_cap_kat)   # XMR-READ-BOUNDS item 5: reject unsolicited response at header time
+            xmr_native_levin_unsolicited_cap_kat)   # unsolicited 2004/2007 refused at header time
         add_executable(${_c1b_kat} ${_c1b_kat}.cpp)
         target_include_directories(${_c1b_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -520,10 +520,10 @@ if (BUILD_TESTING)
     # never unbounded.
     set_tests_properties(xmr_native_peer_pool_kat PROPERTIES TIMEOUT 300)
 
-    # XMR-READ-BOUNDS item 6: the pool charges a peer's inbound byte budget
-    # BEFORE decoding a 2002 body, so an over-budget frame is dropped rather than
-    # decoded. Real pool + fakes against a loopback stand-in with a tiny byte
-    # budget. Listed in BOTH build.yml --target lists.
+    # xmr_native_peer_pool_budget_kat: the pool charges a peer's inbound byte
+    # budget before decoding a 2002 body; an over-budget frame is dropped and the
+    # peer kept. Real pool + fakes against a loopback stand-in with a 50-byte
+    # byte budget. Listed in BOTH build.yml --target lists.
     add_executable(xmr_native_peer_pool_budget_kat xmr_native_peer_pool_budget_kat.cpp)
     target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src

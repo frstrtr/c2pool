@@ -11,15 +11,19 @@
 // ===========================================================================
 // src/impl/xmr/node/minijson.hpp   (Track X / Family B: XMR lane, X2)
 //
-// AUTHORED for c2pool (not ported). A tiny, dependency-free JSON reader used to
-// turn monerod JSON-RPC / ZMQ response bodies into the typed node structs, so
-// the adapter's parse layer is exercisable in a single-TU KAT WITHOUT pulling
-// rapidjson (which the production build uses). Numbers keep their source text so
-// full u64 precision survives (JSON doubles would lose the low bits of piconero
-// amounts and 64-bit difficulties). This is KAT-grade: it parses well-formed
-// monerod output; it is NOT a hardened, adversarial-input parser. The consensus
-// build MUST use the vetted rapidjson path -- this header exists so the field
-// MAPPING (which JSON path -> which struct field) is testable in isolation.
+// AUTHORED for c2pool (not ported). A tiny, dependency-free JSON reader that
+// turns monerod JSON-RPC / ZMQ response bodies into the typed node structs and
+// reads the XMR stratum listener's request lines. Numbers keep their source
+// text so full u64 precision survives (JSON doubles would lose the low bits of
+// piconero amounts and 64-bit difficulties).
+//
+// Limits in force:
+//   * nesting depth: parse(..., max_depth) refuses an object or array nested
+//     deeper than max_depth; default kDefaultMaxDepth = 32; the stratum
+//     listener passes max_json_depth = 8;
+//   * \u escapes: exactly four hex digits, else the parse fails;
+//   * input size: set by the caller (stratum max_line_bytes = 64 KiB per
+//     request line; monerod reply cap 64 MiB).
 // ===========================================================================
 #pragma once
 
@@ -33,10 +37,8 @@
 
 namespace c2pool::xmr::node::minijson {
 
-// Nesting bound applied by the parser itself. The stratum front-end passes its
-// own tight limit (max_json_depth); every other caller reads monerod reply
-// shapes and takes this default, which bounds nesting well above the deepest
-// real response and far below any recursion hazard.
+// Default nesting limit of parse(). The stratum listener passes its own
+// max_json_depth (8); monerod reply readers take this default.
 inline constexpr std::size_t kDefaultMaxDepth = 32;
 
 enum class Type { Null, Bool, Number, String, Array, Object };

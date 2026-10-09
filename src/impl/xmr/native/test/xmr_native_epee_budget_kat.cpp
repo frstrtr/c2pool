@@ -8,10 +8,9 @@
 // ---------------------------------------------------------------------------
 // src/impl/xmr/native/test/xmr_native_epee_budget_kat.cpp
 //
-// The epee portable-storage decoder's MESSAGE-WIDE array-element budget. The
-// per-array cap bounds one array, but several arrays each just under it can sum
-// to an allocation far larger than the body; the decoder must also bound the
-// total element count across the whole message and refuse before allocating.
+// The epee portable-storage decoder's message-wide array-element limit: the
+// total element count over all arrays of one message is at most
+// max_array_elements, checked before allocating.
 //   EB1  array_elements_over_total : two arrays each under the per-array cap,
 //        summing over it, are refused with ArrayTooLarge.
 //   EB2  array_elements_under_total : a single array under the cap decodes.
@@ -43,7 +42,7 @@ std::vector<std::uint8_t> encode_root(std::vector<epee::Entry> entries) {
     epee::Value root = epee::v_object(std::move(entries));
     std::vector<std::uint8_t> out;
     epee::StorageError err = epee::StorageError::None;
-    epee::write_storage(root, out, err);   // encoder has no element cap: builds the adversarial body
+    epee::write_storage(root, out, err);   // the encoder applies no element limit
     return out;
 }
 
@@ -57,7 +56,7 @@ int main() {
         ents.push_back(epee::Entry{"a", u8_array(n)});
         ents.push_back(epee::Entry{"b", u8_array(n)});
         const std::vector<std::uint8_t> blob = encode_root(std::move(ents));
-        kat::check(!blob.empty(), "EB1: the adversarial body encodes");
+        kat::check(!blob.empty(), "EB1: the test body encodes");
 
         epee::Value parsed;
         epee::StorageError err = epee::StorageError::None;

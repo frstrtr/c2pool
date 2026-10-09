@@ -149,8 +149,8 @@ int main() {
 
     // An UNSOLICITED 2004 with a ~1 MiB body (well under the 32 MiB post-
     // handshake cap, so the header passes the size check). We armed no request.
-    std::vector<std::uint8_t> payload(1024u * 1024u, 0xAB);
-    peer.write(make_notify(CMD_RESPONSE_GET_OBJECTS, payload));
+    std::vector<std::uint8_t> body(1024u * 1024u, 0xAB);
+    peer.write(make_notify(CMD_RESPONSE_GET_OBJECTS, body));
 
     for (int i = 0; i < 40 && !closed; ++i) { io.restart(); io.run_for(std::chrono::milliseconds(50)); }
 

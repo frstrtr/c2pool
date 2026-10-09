@@ -109,15 +109,13 @@ using WireTap = std::function<void(bool outbound,
                                    const std::uint8_t* frame,
                                    std::size_t         frame_size)>;
 
-// Consulted on the io thread the instant a header is validated and BEFORE the
-// body is sized or read. Returns false to refuse the frame (the socket closes)
-// so a response the consumer never solicited cannot make us allocate and read
-// its declared body. Unset means "admit every header the policy already let
-// through".
+// Consulted on the io thread when a header is validated, before the body is
+// sized or read. Returning false refuses the frame and closes the socket.
+// Unset: every header the per-command policy admits is read.
 using HeaderGate = std::function<bool(const BucketHead& head)>;
 
-// A body buffer larger than this is released after its frame is delivered, so a
-// single large frame does not pin megabytes for the life of the connection.
+// A body buffer with a capacity above this is released after its frame is
+// delivered.
 inline constexpr std::size_t kBodyBufShrinkThreshold = 256u * 1024u;
 
 class LevinSocket : public std::enable_shared_from_this<LevinSocket> {
@@ -306,9 +304,7 @@ private:
             return;
         }
 
-        // Refuse a header the consumer will not accept (an unsolicited response)
-        // before the body is sized or read, so a peer cannot make us allocate
-        // and pull its declared body only to drop it afterwards.
+        // Header gate: before the body is sized or read.
         if (header_gate_ && !header_gate_(head_)) {
             do_close(std::string("unsolicited ") + command_name(head_.command) + " at header");
             return;
@@ -348,9 +344,8 @@ private:
             tap_(false, tap_frame_.data(), tap_frame_.size());
         }
         if (frame_handler_) frame_handler_(head_, body, size);
-        // Release an oversized body buffer so one large frame does not pin
-        // memory for the life of the connection. The handler has already run,
-        // so `body` (a pointer into body_buf_) is no longer needed.
+        // Release a body buffer above kBodyBufShrinkThreshold. The handler has
+        // already run, so `body` (a pointer into body_buf_) is no longer used.
         if (body_buf_.capacity() > kBodyBufShrinkThreshold)
             std::vector<std::uint8_t>().swap(body_buf_);
         // The handler may have closed us (a protocol violation, a matcher

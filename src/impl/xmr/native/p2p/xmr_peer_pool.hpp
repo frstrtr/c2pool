@@ -755,9 +755,9 @@ private:
         ++tel_.frames_in;
         ++tel_.frames_by_cmd[h.command];
 
-        // Charge the byte bucket BEFORE decoding the body, so a peer over its
-        // byte budget cannot force a 2002 decode. The per-command bucket is
-        // charged below (skip_bytes), so bytes are still counted exactly once.
+        // The byte bucket is charged before the body is decoded; the
+        // per-command bucket is charged below with skip_bytes, so bytes are
+        // counted once.
         DosFault byte_fault = DosFault::None;
         const DosAction byte_act = p->dos.on_bytes(n, now, byte_fault);
         if (byte_act != DosAction::Accept) {

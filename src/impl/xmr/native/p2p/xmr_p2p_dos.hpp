@@ -353,9 +353,8 @@ public:
     // credit; a fluffed relay that lands between our 2010 and the answer is
     // charged to the flood bucket as usual and leaves the credit for the answer.
     // -----------------------------------------------------------------------
-    // Charge ONLY the byte bucket. Called before an inbound body is decoded so
-    // a peer over its byte budget cannot force a decode; the per-command bucket
-    // is then charged by on_frame(..., skip_bytes=true).
+    // Charge ONLY the byte bucket. Called before an inbound body is decoded;
+    // the per-command bucket is then charged by on_frame(..., skip_bytes=true).
     DosAction on_bytes(std::size_t body_bytes, Millis now, DosFault& fault_out) {
         fault_out = DosFault::None;
         if (!bucket_take(bytes_, static_cast<double>(body_bytes), ms_to_ns(now)))

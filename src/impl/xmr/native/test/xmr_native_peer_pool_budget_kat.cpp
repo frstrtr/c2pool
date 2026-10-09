@@ -8,12 +8,9 @@
 // ---------------------------------------------------------------------------
 // src/impl/xmr/native/test/xmr_native_peer_pool_budget_kat.cpp
 //
-// The pool must charge a peer's inbound byte budget BEFORE decoding the body of
-// a NEW_TRANSACTIONS (2002) frame, so a peer over its byte budget cannot force
-// a decode. Driven against a loopback stand-in daemon with a deliberately tiny
-// byte budget: the first 2002 is already over budget, so a peer that decodes
-// first raises a malformed-body fault and is disconnected, while a peer that
-// charges first simply drops the frame and the connection survives.
+// The pool charges a peer's inbound byte budget before decoding the body of a
+// NEW_TRANSACTIONS (2002) frame. A loopback stand-in daemon, with the pool's
+// byte budget set to 50 bytes, sends a 200-byte 2002 whose body is not epee.
 //   PB1  budget_before_decode : an over-budget 2002 with an undecodable body
 //        drops the frame and keeps the peer (it is not disconnected).
 // STL plus boost::asio. No test framework, matching the neighbouring KATs.
@@ -48,7 +45,7 @@ Hash hash_of_byte(std::uint8_t v) { Hash h{}; h.fill(v); return h; }
 
 // A stand-in monerod: accepts one connection, answers the handshake, and can be
 // told to write a raw frame. It advertises a height BELOW ours, so the pool
-// never asks it for a chain and the only inbound frame is the one we inject.
+// never asks it for a chain and the only inbound frame is the test frame.
 class StandinDaemon {
 public:
     explicit StandinDaemon(asio::io_context& io)
@@ -153,8 +150,7 @@ p2p::XmrPeerPool::Config cfg_with_tiny_byte_budget(const std::string& peer) {
     c.dial.anchor_slots           = 0;
     c.dial.rotation_interval_ms   = 0;
     c.manual_peers.push_back(peer);
-    // The whole point: a byte bucket far smaller than the injected frame, so
-    // the frame is over budget on arrival.
+    // A byte bucket smaller than the test frame.
     c.dos.bytes_capacity = 50.0;
     c.dos.bytes_refill   = 1.0;
     return c;
@@ -195,9 +191,8 @@ int main() {
     kat::check(rig.wait_for([&] { return rig.pool->peer_count() == 1; }),
                "PB1: the pool dials and handshakes the stand-in");
 
-    // An over-budget 2002 whose body is not decodable epee. A decode-first pool
-    // raises a malformed-body fault and disconnects; a charge-first pool drops
-    // the frame on the exhausted byte bucket and keeps the peer.
+    // An over-budget 2002 whose body is not epee: expected dropped on the byte
+    // budget (frames_dropped_dos >= 1), peer kept (peer_count 1).
     std::vector<std::uint8_t> junk(200, 0xAB);
     daemon.write(levin::make_notify(levin::CMD_NEW_TRANSACTIONS, junk));
     for (int i = 0; i < 12; ++i) rig.pump(50);

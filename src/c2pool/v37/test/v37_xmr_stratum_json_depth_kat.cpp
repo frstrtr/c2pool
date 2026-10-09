@@ -8,17 +8,13 @@
 // ===========================================================================
 // src/c2pool/v37/test/v37_xmr_stratum_json_depth_kat.cpp
 //
-// The XMR stratum listener's JSON nesting bound, over a real loopback socket
-// before login. One request line carries a deeply nested value whose escape
-// bytes confuse a byte-scan pre-filter; the parser's own depth counter and its
-// \u-escape validation must refuse it rather than recurse on it.
-//
-// The whole exchange runs in a CHILD PROCESS: a listener that unwinds a request
-// line on the recursive parser takes the process down, so the parent detects a
-// signalled child as a failure and a clean exit as a pass. The child also
-// proves liveness by logging a fresh connection in afterwards.
-//   JD1  nested_depth_over_limit : the listener survives the line, closes the
-//        offending connection, and still serves a later login.
+// The XMR stratum listener's JSON nesting limit and \u-escape check, over a
+// loopback socket, before login. The exchange runs in a child process; the
+// test passes when the child exits 0 and fails on any other exit status or
+// signal.
+//   JD1  nested_depth_over_limit : a request line nested past max_json_depth,
+//        whose string holds a malformed \u escape, is refused and its
+//        connection closed; a later login on a new connection is served.
 // ===========================================================================
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -97,10 +93,10 @@ std::string read_line(int fd, int timeout_ms) {
     return buf;
 }
 
-// Child: feed the nested line, then prove the listener is still alive.
-// Exit 0 on success, non-zero on a logic failure; a crash exits via signal.
+// Child: send the JD1 line, then log in on a new connection.
+// Exit 0 when both steps behave as asserted, non-zero otherwise.
 int child_body() {
-    ::alarm(30);   // safety net: a hang is a failure, never an infinite run
+    ::alarm(30);   // a child still running after 30 s fails the test
     o2::StratumListenerOptions o;
     o.bind_host = "127.0.0.1"; o.bind_port = 0; o.poll_timeout_ms = 50;
     Templates tpl; Verifier ver; Sink sink;
@@ -110,21 +106,21 @@ int child_body() {
     if (!L.start()) return 3;
     const std::uint16_t port = L.bound_port();
 
-    // nested_depth_over_limit: "["\uabc\"," then a long run of '[' (under the
-    // 64 KiB line cap, so the line reaches the parser rather than the cap). The
-    // trailing '\' sits in the four bytes after '\u', so a scan that treats '\'
-    // as escaping one character keeps the string open while the parser closes
-    // it -- the brackets are value nesting for the parser.
+    // JD1 line: a string with a malformed \u escape, then 63000 '[' (under the
+    // 64 KiB line cap).
     int fd = dial(port);
     if (fd < 0) { L.stop(); return 4; }
     std::string line = "[\"\\uabc\\\",";
     line.append(63000, '[');
     send_line(fd, line);
-    // The listener must close this connection (malformed / too deep), not die.
-    (void)read_line(fd, 2000);
+    // Expected: the line is refused (no reply, or a "Malformed request" error)
+    // and the connection is closed.
+    std::string r1 = read_line(fd, 2000);
+    if (r1.find("Malformed") != std::string::npos) r1 = read_line(fd, 2000);
     ::close(fd);
+    if (r1 != "<EOF>") { L.stop(); return 7; }
 
-    // Liveness: a fresh, well-formed login must still get a job.
+    // Expected: a login on a new connection gets a job.
     int fd2 = dial(port);
     if (fd2 < 0) { L.stop(); return 5; }
     send_line(fd2,
@@ -150,8 +146,7 @@ int main() {
     ::waitpid(pid, &status, 0);
     bool pass = false; std::string why;
     if (WIFSIGNALED(status)) {
-        why = std::string("child killed by signal ") + std::to_string(WTERMSIG(status)) +
-              " (a crash/overflow before the fix)";
+        why = std::string("child ended by signal ") + std::to_string(WTERMSIG(status));
     } else if (WIFEXITED(status)) {
         const int code = WEXITSTATUS(status);
         if (code == 0) pass = true;
