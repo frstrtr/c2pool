@@ -1162,8 +1162,9 @@ void section4() {
 
         // a fake parent and a mixed path (BA-2) on a flat branch where d grows with the position:
         // y (A) on a2; B serves a variant of a2 naming a0 (one position lower) and variants of y, one naming a
-        // fake parent F (bodies never served), one naming a2_B; both nodes place c; F and a2_B are refuted at
-        // their own #9 (servers BANned); A gets no token
+        // fake parent F (bodies never served; that variant of y from a peer other than F's server, so it stays
+        // held and waits on F), one naming a2_B; both nodes place c; F and a2_B are refuted at their own #9
+        // (servers BANned); A gets no token
         {
             Pair q = copy(base);
             const std::uint64_t g = kL - 900, flat = kL - 900 - 1;
@@ -1225,7 +1226,7 @@ void section4() {
                 feed(n, 1, a2);
                 n.headers.add(2, a2b, hg);
                 n.headers.add(3, F, hg);
-                n.headers.add(3, yb, hg);
+                n.headers.add(5, yb, hg);  // y on F from another peer: it waits on F, which is never placed
                 n.headers.add(4, yb2, hg);
                 feed(n, 1, y);
                 {
@@ -1344,35 +1345,41 @@ void contract() {
         const pb::Hash32 L = chain.back();
         const std::uint64_t hL = n.node(L).h, hc = h_pos(61);
 
-        // C-2 / C-3: carried body 3 fails #9, body 5 fails #12 -> STRIKE (row 23), #12 not computed for body 5
+        // C-2 / C-3: carried body 3 fails #9, body 5 fails #12 -> STRIKE (row 23, body 3), #12 not computed for
+        // body 5 (its tip's keys never derived), nothing stored. Bodies 1-4 and 6 on L, body 5 on chain[56]; the
+        // list in canonical order with the two failing bodies at positions 3 and 5.
         {
-            const auto frame = [&](bool bad5) {
-                std::vector<pb::ReceiptBodyV3> rs;
+            const std::uint64_t hr = n.node(L).h + 1;
+            const pb::Hash32 deep = chain[56];
+            std::vector<pb::ReceiptBodyV3> rs;
+            bool laid = false;
+            for (std::uint64_t s = 0; s < 256 && !laid; ++s) {
+                rs.clear();
                 for (std::uint64_t k = 0; k < 6; ++k) {
-                    const pb::Hash32 tip = k == 4 ? chain[56] : L;
-                    pb::ReceiptBodyV3 r = body_on(n, tip, n.node(tip).h + 1, 12 + k, 9100 + k,
+                    pb::ReceiptBodyV3 r = body_on(n, k == 4 ? deep : L, hr, 12 + k, 9100 + 8 * s + k,
                                                   k == 2 ? Tweak([](pb::ReceiptBodyV3& b) { b.blob.minor = 0; }) : Tweak{});
-                    if (k == 4 && bad5) r.side.ballot ^= 1;
+                    if (k == 4) r.side.ballot ^= 1;  // after its coinbase was built: #12 mismatches
                     rs.push_back(r);
                 }
-                std::sort(rs.begin(), rs.end(), [](const pb::ReceiptBodyV3& a, const pb::ReceiptBodyV3& b) {
-                    return a.blob.nonce < b.blob.nonce;
-                });
-                return carrier_on(n, L, hc, rs, 1, 9110 + (bad5 ? 1 : 0), {}, {}, false);
-            };
-            const pb::CarrierBodyV3 bad = frame(true), good5 = frame(false);
+                canonical_sort(*n.net, rs, L);
+                laid = rs[2].blob.minor == 0 && rs[4].side.tip == deep;
+            }
+            check(laid, "C-2: a canonical list with the #9 failure at body 3 and the #12 failure at body 5");
+            std::vector<pb::ReceiptBodyV3> without5 = rs;
+            without5.erase(without5.begin() + 4);
+            const pb::CarrierBodyV3 bad = carrier_on(n, L, hc, rs, 1, 9110, {}, {}, false);
+            const pb::CarrierBodyV3 ref = carrier_on(n, L, hc, without5, 1, 9111, {}, {}, false);
+            const pb::BmmrHead head = n.store.head();
             n.keys = pb::KeyCache{};
             const pb::AdmitResult a = admit(n, bad);
             const std::uint64_t ka = n.keys.computations();
             n.keys = pb::KeyCache{};
-            const pb::AdmitResult b = admit(n, good5);
+            const pb::AdmitResult b = admit(n, ref);
             const std::uint64_t kb = n.keys.computations();
-            const pb::BmmrHead head = n.store.head();
-            check(a.verdict == AdmitVerdict::Strike && (a.row == RowId::R23 || a.row == RowId::R28) && ka == kb
-                          && n.store.head() == head && n.tree.find(pb::receipt_id(bad.own)) == nullptr,
-                  "C-2: the first failing row decides (" + desc(a) + "); #12 not computed for a later body (keys " +
-                          std::to_string(ka) + " / " + std::to_string(kb) + "); nothing stored");
-            (void)b;
+            check(a.verdict == AdmitVerdict::Strike && a.row == RowId::R23 && a.body == 3 && is(b, AdmitVerdict::Strike, RowId::R23)
+                          && ka == kb && n.store.head() == head && n.tree.find(pb::receipt_id(bad.own)) == nullptr,
+                  "C-2: the first failing row decides (" + desc(a) + "); #12 not computed for body 5 (keys " +
+                          std::to_string(ka) + " / " + std::to_string(kb) + " without body 5); nothing stored");
         }
         // A-3: a substituted carried body -> FoldMismatch (STRIKE), the sender struck once; the honest copy placed
         {
@@ -1627,8 +1634,7 @@ void p49() {
         bool valid = true;
         for (std::uint64_t k = 1; k <= kJ0 + 1 && valid; ++k) {
             std::vector<pb::ReceiptBodyV3> rs;
-            if (k > 1)
-                for (std::uint64_t j = 0; j < pb::kRuledLaneParams.r_max; ++j)
+            for (std::uint64_t j = 0; j < pb::kRuledLaneParams.r_max; ++j)
                     rs.push_back(body_on(sc, prev, sc.node(prev).h, j % 5, 400000 + 16 * k + j));
             const pb::CarrierBodyV3 c = carrier_on(sc, prev, h_pos(f + k), rs, 7, 300000 + k);
             const Admitted a = admit_place(sc, c, CarrierRole::Closure);
@@ -1789,7 +1795,9 @@ void rows_more() {
         const pb::TipWindow wm = pb::evaluate_window_at(m.store, S, m.prev_of(L), m.mon, 16, net.author_id);
         check(ws.ok() && wm.ok() && !(ws.window_root == wm.window_root), "row 26: the alt branch's inputs give another window");
         const pb::ReceiptBodyV3 r = body_on(m, S, kAltFrom + kAltLen + 1, 12, 9911);
-        const pb::AdmitResult a = admit(m, carrier_on(m, L, h_fast(126), {r}, 1, 9912));
+        const pb::CarrierBodyV3 c = carrier_on(m, L, h_fast(126), {r}, 1, 9912);
+        m.windows = pb::WindowCache{};  // the pipeline computes every window itself
+        const pb::AdmitResult a = admit(m, c);
         check(a.verdict == AdmitVerdict::AdmitCarrier, "row 26: a receipt on S: its window read on P_t's branch -> admitted (" + desc(a) + ")");
     });
 
