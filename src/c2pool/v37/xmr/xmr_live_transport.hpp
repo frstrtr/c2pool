@@ -55,13 +55,18 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -72,6 +77,45 @@
 #include "impl/xmr/node/xmr_node_types.hpp"
 
 namespace c2pool::v37n::xmr {
+
+// Node-local safety caps for the blocking monerod client. The response ceiling
+// matches the parity-arm transport (xmr_monerod_http.hpp); the socket timeout
+// reuses that transport's 5 s. kMaxChunks bounds the chunked decoder's loop.
+inline constexpr std::size_t   kLiveMaxResponseBytes = 64u * 1024u * 1024u;
+inline constexpr std::uint32_t kLiveSocketTimeoutMs  = 5000;
+inline constexpr std::size_t   kLiveMaxChunks        = 1u << 20;
+
+namespace detail {
+
+// De-chunk an HTTP/1.1 Transfer-Encoding: chunked body. Returns the decoded
+// bytes in `out` and true on a clean stop (zero-length terminator, truncation,
+// or a malformed chunk line). Every length test is written "len > in.size() - p"
+// with p <= in.size() so a size near SIZE_MAX cannot wrap past the guard, the
+// chunk-size field is parsed with an end/errno check, and the number of chunks
+// is capped.
+inline bool dechunk_chunked(const std::string& in, std::string& out,
+                            std::size_t max_chunks = kLiveMaxChunks) {
+    out.clear();
+    std::size_t p = 0, chunks = 0;
+    while (p < in.size()) {
+        const std::size_t nl = in.find("\r\n", p);
+        if (nl == std::string::npos) break;
+        const std::string hdr = in.substr(p, nl - p);
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long len = std::strtoul(hdr.c_str(), &end, 16);
+        if (end == hdr.c_str() || *end != '\0' || errno == ERANGE) break;  // not a clean hex size
+        if (len == 0) break;                                               // last chunk
+        p = nl + 2;
+        if (len > in.size() - p) break;                                    // non-wrapping bound
+        out.append(in, p, static_cast<std::size_t>(len));
+        p += static_cast<std::size_t>(len) + 2;                            // skip payload + CRLF
+        if (++chunks > max_chunks) break;                                  // bounded chunk count
+    }
+    return true;
+}
+
+} // namespace detail
 
 class LiveMonerodTransport final : public c2pool::xmr::node::IMonerodTransport {
 public:
@@ -183,7 +227,14 @@ private:
             a.sin_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
             ::freeaddrinfo(res);
         }
-        if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0) {
+        // Bound a read or write that stalls (a wedged flow must not hang the
+        // node loop), matching the parity-arm transport's 5 s.
+        timeval tv{};
+        tv.tv_sec  = static_cast<time_t>(kLiveSocketTimeoutMs / 1000);
+        tv.tv_usec = static_cast<suseconds_t>((kLiveSocketTimeoutMs % 1000) * 1000);
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (connect_timeout(fd, a) != 0) {
             ::close(fd);
             return "live-transport: connect " + ep_.rpc_host + ":" + std::to_string(ep_.rpc_port) +
                    " failed (is monerod running with restricted RPC on this port?)";
@@ -200,6 +251,7 @@ private:
             ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
             if (n <= 0) break;
             raw.append(buf, static_cast<std::size_t>(n));
+            if (raw.size() > kLiveMaxResponseBytes) { ::close(fd); return "live-transport: response too large"; }
         }
         ::close(fd);
         auto hdr_end = raw.find("\r\n\r\n");
@@ -209,9 +261,34 @@ private:
         if (head.find(" 200") == std::string::npos)
             return "live-transport: monerod HTTP status: " + head.substr(0, head.find("\r\n"));
         // De-chunk if Transfer-Encoding: chunked (monerod restricted RPC uses it).
-        if (head.find("chunked") != std::string::npos) payload = dechunk(payload);
+        if (head.find("chunked") != std::string::npos) {
+            std::string decoded;
+            detail::dechunk_chunked(payload, decoded);
+            payload = std::move(decoded);
+        }
         out = std::move(payload);
         return "";
+    }
+
+    // Blocking connect with a bounded wait: the socket goes non-blocking, the
+    // connect is driven to completion (or the timeout) with poll(), then the
+    // socket is restored to blocking (SO_RCVTIMEO/SO_SNDTIMEO then bound reads
+    // and writes). Returns 0 on a connected socket, -1 otherwise.
+    static int connect_timeout(int fd, const sockaddr_in& a) {
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags < 0) return -1;
+        if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+        int rc = ::connect(fd, reinterpret_cast<const sockaddr*>(&a), sizeof(a));
+        if (rc != 0) {
+            if (errno != EINPROGRESS) return -1;
+            pollfd pfd{fd, POLLOUT, 0};
+            const int pr = ::poll(&pfd, 1, static_cast<int>(kLiveSocketTimeoutMs));
+            if (pr <= 0) return -1;                       // timed out or poll error
+            int err = 0; socklen_t el = sizeof(err);
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err != 0) return -1;
+        }
+        if (::fcntl(fd, F_SETFL, flags) < 0) return -1;   // restore blocking
+        return 0;
     }
 
     static int send_all(int fd, const std::string& s) {
@@ -222,21 +299,6 @@ private:
             off += static_cast<std::size_t>(n);
         }
         return 0;
-    }
-    static std::string dechunk(const std::string& in) {
-        std::string out;
-        std::size_t p = 0;
-        while (p < in.size()) {
-            std::size_t nl = in.find("\r\n", p);
-            if (nl == std::string::npos) break;
-            std::size_t len = std::strtoul(in.substr(p, nl - p).c_str(), nullptr, 16);
-            if (len == 0) break;
-            p = nl + 2;
-            if (p + len > in.size()) break;
-            out.append(in, p, len);
-            p += len + 2;
-        }
-        return out;
     }
 
     c2pool::xmr::node::DaemonEndpoint ep_;
