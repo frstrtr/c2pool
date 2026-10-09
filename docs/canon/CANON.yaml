@@ -243,7 +243,7 @@ rules:
         scope: xmr_lane_and_engine_code
         code_only: true
     status_now: pass
-    deviation: [D5]
+    deviation: [D5, D45]
 
   - id: C06
     title: credit = work(T_origin)
@@ -756,7 +756,7 @@ rules:
 
   - id: C27
     title: pool identity binds every lane rule
-    statement: 'Every lane rule is committed in the relay HELLO and the pool_tag; the Monero constants enter as one monero_rules_digest; node policy values are not lane rules and are not committed; a node with different lane parameters is refused with LANE_RULES_MISMATCH naming the field; the Path B HELLO tail = u8 codec (K22 = 2) | u16 rules_len | rules TLV of u8 id | u8 len | value entries, id = the K number, ids strictly ascending; the HELLO tag = network, chain_id and the pool identity (C23), a differing chain_id or pool identity is TAG_MISMATCH; the pool identity is not in the rules TLV; the rules TLV (the geometry K01-K08 and K23 included) is compared only when both peers report the same epoch_cur.'
+    statement: 'Every lane rule is committed in the relay HELLO and the pool_tag; the Monero constants enter as one monero_rules_digest; node policy values are not lane rules and are not committed; a node with different lane parameters is refused with LANE_RULES_MISMATCH naming the field; the Path B FB_HELLO = head 0x40 | frame version 0x02 | magic ''C2XR'' | u8 network | u32 chain_id | pool_id[32] | u64 node_nonce | u16 listen_port (53 B), then the tail (330 B at epoch 0), then the node key slot 32 B (zeros until slice S6), then the trailer 68 B: 483 B at epoch 0; the Path B HELLO tail = u8 codec (K22 = 2) | u16 rules_len | rules TLV of u8 id | u8 len | value entries, id = the K number, ids strictly ascending; the HELLO tag = network, chain_id and the pool identity (C23), a differing chain_id or pool identity is TAG_MISMATCH; the pool identity is not in the rules TLV; the rules TLV (the geometry K01-K08 and K23 included) is compared only when both peers report the same epoch_cur.'
     source: 'ref: the:C27'
     ruling: 'ref: the:C27'
     scope: [src/c2pool/v37/xmr/]
@@ -1125,7 +1125,7 @@ rules:
 
   - id: C43
     title: fork choice, rewind, joiner
-    statement: 'Best chain = the fully verified carrier chain with the greatest cumulative carrier difficulty, ties by lower tip id; receipts never count; no consensus reorg depth limit; the journal depth is node policy, at least J_0 and never in a lane digest; a switch deeper than the journal, or a failed load of the stored lane state, takes the joiner path: the activation record is re-seeded by the joiner row (epoch_cur, p0 - 1, rules_cur), p0 - 1 = the position of the adopted state, and holds no row below it; a restore below p0 - 1 is refused (fail closed); headers first; a joiner verifies carrier PoW over the span [x0, L], x0 = min(L - 1175, the first x with H(x) > H(L) - F - fresh_max), at least max(J_0, ceil((F + fresh_max) x 120 / T) + seal_depth) = 1176 positions, J_0 = max(ceil(3 h x 3600 / T), ceil(F x 120 / T) + seal_depth) = 1152, with retarget_span headers before the span and sealed bins as buckets with MMR proofs; the positions before x1, the first x with H(x) >= H(x0 - 1) + F + fresh_max, by PoW, hashes and roots only; no older history.'
+    statement: 'Best chain = the fully verified carrier chain with the greatest cumulative carrier difficulty, ties by lower tip id; receipts never count; no consensus reorg depth limit; the journal depth is node policy, at least J_0, never in a lane digest and decides no verdict; a carried receipt whose tip lies off the carrier''s chain, on a branch that forks from it at f with pos(parent(c)) - f > J_0 = 1152, is deferred on every node and dropped when its bin seals, as is one whose judging reads a branch (the branches of the tips carried on its tip''s branch, recursively) that forks from the carrier''s chain at f* with pos(parent(c)) - f* > J_0; a switch deeper than the journal, or a failed load of the stored lane state, takes the joiner path: the activation record is re-seeded by the joiner row (epoch_cur, p0 - 1, rules_cur), p0 - 1 = the position of the adopted state, and holds no row below it; a restore below p0 - 1 is refused (fail closed); headers first; a joiner verifies carrier PoW over the span [x0, L], x0 = min(L - 1175, the first x with H(x) > H(L) - F - fresh_max), at least max(J_0, ceil((F + fresh_max) x 120 / T) + seal_depth) = 1176 positions, J_0 = max(ceil(3 h x 3600 / T), ceil(F x 120 / T) + seal_depth) = 1152, with retarget_span headers before the span and sealed bins as buckets with MMR proofs; the positions before x1, the first x with H(x) >= H(x0 - 1) + F + fresh_max, by PoW, hashes and roots only; no older history.'
     source: 'ref: the:C43'
     ruling: 'ref: the:C43'
     scope: [src/c2pool/v37/xmr/, src/sharechain/v37/]
@@ -1143,6 +1143,9 @@ rules:
       - name: fork-choice-kats
         type: required_kat
         kats: [xmr_carrier_sharechain_kat, v37_xmr_joiner_kat]
+      - name: pathb-bucket-wire-kat
+        type: required_kat
+        kats: [v37_xmr_pathb_bucket_wire_kat]
       - name: pathb-in-force
         type: required
         in_force: true
@@ -1288,7 +1291,7 @@ rules:
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
     status_now: fail
-    deviation: [D36]
+    deviation: [D36, D45]
 
   - id: C50
     title: no private line citations in public text
@@ -1303,7 +1306,7 @@ rules:
         pattern: '\b[SDK]:[0-9]{1,5}(?:-[0-9]{1,5})?\b'
         paths: [src/impl/xmr/pathb/**, src/c2pool/v37/xmr/**]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D43]
 
 # Lane constants: the consensus lane constants of the XMR lane (C46). Fields:

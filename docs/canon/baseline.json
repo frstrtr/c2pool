@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "481f6cf6640aaa936f961f7e53c0f69569622162",
+  "commit": "5a160d2de3e3f4e4bfc2da8731a3c749ab85ce91",
   "rules": {
     "C01": {
       "checks": {
@@ -886,6 +886,12 @@
           },
           "status": "fail"
         },
+        "pathb-bucket-wire-kat": {
+          "kats": {
+            "v37_xmr_pathb_bucket_wire_kat": true
+          },
+          "status": "pass"
+        },
         "pathb-in-force": {
           "status": "fail"
         },
@@ -1010,16 +1016,12 @@
     "C50": {
       "checks": {
         "no-private-line-cites": {
-          "count": 8,
-          "per_file": {
-            "src/impl/xmr/pathb/pathb_coinbase_split.hpp": 1,
-            "src/impl/xmr/pathb/pathb_miner_tx.hpp": 6,
-            "src/impl/xmr/pathb/pathb_receipt_admission.hpp": 1
-          },
-          "status": "fail"
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
         }
       },
-      "status": "fail"
+      "status": "pass"
     }
   }
 }
