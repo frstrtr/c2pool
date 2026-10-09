@@ -160,6 +160,8 @@ struct StratumListenerOptions {
     int           parked_keepalive_ms = 10000;
     int           max_json_depth = 8;        // login/submit are depth-3 objects; guards the recursive parser
     std::size_t   max_log_lines = 2048;      // bounded log (oldest dropped)
+    std::size_t   max_empty_lines = 64;      // consecutive blank request lines before close
+    std::size_t   max_log_field = 64;        // bytes of a peer-supplied string kept in a log line
     // NET-DOS (see the header note). Every value below is network policy.
     std::uint64_t min_difficulty = 16000;    // a "+diff" request below this is raised to it
     double        submit_rate = kStratumSubmitRate;      // submits/s per connection, sustained (2 x 2^k / T = 12.8)
@@ -495,6 +497,7 @@ private:
         std::string peer;                  // "ip:port" for the log
         std::string rbuf;                  // unframed inbound bytes
         std::string wbuf;                  // unsent outbound bytes (slow reader)
+        std::size_t empty_run = 0;         // consecutive blank lines seen so far
         std::optional<ParkedLogin> parked; // login waiting for the first template
         std::unique_ptr<strat::XmrStratumSession> session;
         bool        last_reply_error = false;
@@ -607,6 +610,12 @@ private:
         char b[16];
         std::snprintf(b, sizeof(b), "0x%08x", static_cast<unsigned>(v));
         return b;
+    }
+
+    // A peer-supplied string, clipped for a bounded log line.
+    static std::string log_clip(const std::string& s, std::size_t n) {
+        if (s.size() <= n) return s;
+        return s.substr(0, n) + "...";
     }
 
     // Request id: xmrig sends a JSON number; tolerate a numeric string.
@@ -826,20 +835,36 @@ private:
             close_client(cid, std::string("recv failed: ") + std::strerror(errno));
             return;
         }
-        // Drain complete newline-framed requests.
+        // Drain complete newline-framed requests. Advance an offset instead of
+        // erasing the front per line (a per-line erase(0, n) is quadratic), and
+        // compact the buffer once at the end.
+        std::size_t rpos = 0;
         for (;;) {
             c = live(cid);
             if (!c) return;                          // dispatch closed us
-            const std::size_t nl = c->rbuf.find('\n');
+            const std::size_t nl = c->rbuf.find('\n', rpos);
             if (nl == std::string::npos) {
+                if (rpos) c->rbuf.erase(0, rpos);
                 if (c->rbuf.size() > m_opts.max_line_bytes)
                     close_client(cid, "request line too long");
-                break;
+                return;
             }
-            std::string line = c->rbuf.substr(0, nl);
-            c->rbuf.erase(0, nl + 1);
+            const std::size_t len = nl - rpos;
+            if (len > m_opts.max_line_bytes) {
+                close_client(cid, "request line too long");
+                return;
+            }
+            std::string line = c->rbuf.substr(rpos, len);
+            rpos = nl + 1;
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
+            if (line.empty()) {
+                if (++c->empty_run > m_opts.max_empty_lines) {
+                    close_client(cid, "too many empty request lines");
+                    return;
+                }
+                continue;
+            }
+            c->empty_run = 0;
             dispatch(cid, line);
         }
     }
@@ -887,7 +912,8 @@ private:
                 c->parked = ParkedLogin{req_id, login, agent, t, t, t};
                 m_stats.parked_logins.fetch_add(1, std::memory_order_relaxed);
                 log("client " + std::to_string(cid) + " login PARKED (" +
-                    (suspended ? "lane suspended" : "no template yet") + ") agent='" + agent + "'");
+                    (suspended ? "lane suspended" : "no template yet") + ") agent='" +
+                    log_clip(agent, m_opts.max_log_field) + "'");
                 return;
             }
             update_submit_rate(peek);   // VARDIFF: retarget the budget to this tip's lane window
@@ -981,10 +1007,11 @@ private:
             if (Client* cl = live(cid)) cl->served_tid = probe.template_id;
             m_stats.logins.fetch_add(1, std::memory_order_relaxed);
             const strat::LoginString& ls = s.login();
-            log("client " + std::to_string(cid) + " LOGIN OK address=" + ls.address +
-                " worker='" + ls.worker + "'" +
+            log("client " + std::to_string(cid) + " LOGIN OK address=" +
+                log_clip(ls.address, m_opts.max_log_field) +
+                " worker='" + log_clip(ls.worker, m_opts.max_log_field) + "'" +
                 (ls.custom_diff ? " custom_diff=" + std::to_string(*ls.custom_diff) : "") +
-                " agent='" + agent + "' -> first job sent");
+                " agent='" + log_clip(agent, m_opts.max_log_field) + "' -> first job sent");
         } else {
             // Race: template vanished between the peek and handle_login; the
             // server already answered "No job available" and xmrig will retry.

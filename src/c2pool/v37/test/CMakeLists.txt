@@ -537,6 +537,16 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_json_depth_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_json_depth_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_json_depth_kat COMMAND v37_xmr_stratum_json_depth_kat)
+    # v37_xmr_stratum_line_cap_kat (XMR-READ-BOUNDS, item 2): the stratum
+    # request-line byte cap on newline-framed lines and the blank-line run cap,
+    # over loopback. Stub template/verifier/sink. Listed in BOTH build.yml lists.
+    add_executable(v37_xmr_stratum_line_cap_kat
+        v37_xmr_stratum_line_cap_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_line_cap_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_line_cap_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_line_cap_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_line_cap_kat COMMAND v37_xmr_stratum_line_cap_kat)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
