@@ -282,6 +282,11 @@ if(BUILD_TESTING)
     # via run_legacy_addrme_self_probe_checks(); no new executable, no build.yml
     # change, no "Not Run" (#769) or NOT_BUILT (#143) trap.
     target_sources(bch_embedded_block_broadcast_test PRIVATE legacy_addrme_self_probe_test.cpp)
+    # #1716 part B self-connection ban KAT (self_connection_ban_test.cpp) rides the
+    # same EXISTING allowlisted target. It drives the real bch::NodeImpl
+    # handle_version, which this target already compiles (node.cpp). Invoked
+    # from main() via run_self_connection_ban_checks(); no new executable.
+    target_sources(bch_embedded_block_broadcast_test PRIVATE self_connection_ban_test.cpp)
 
     # #1437 topology KAT (child-without-parent + intra-template double-spend)
     # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,
