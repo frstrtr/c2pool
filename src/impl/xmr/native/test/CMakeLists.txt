@@ -77,7 +77,8 @@ if (BUILD_TESTING)
             xmr_levin_codec_kat
             xmr_epee_storage_kat
             xmr_levin_messages_kat
-            xmr_levin_fuzz_kat)
+            xmr_levin_fuzz_kat
+            xmr_native_epee_budget_kat)   # XMR-READ-BOUNDS item 4: message-wide array-element budget
         add_executable(${_c1a_kat} ${_c1a_kat}.cpp)
         target_include_directories(${_c1a_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src

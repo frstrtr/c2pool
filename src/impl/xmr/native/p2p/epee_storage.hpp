@@ -679,6 +679,11 @@ private:
         // elements than the remaining bytes could possibly hold.
         if (count > remaining() / min_element_bytes(elem)) return fail(StorageError::Truncated);
         if (count > limits_.max_array_elements) return fail(StorageError::ArrayTooLarge);
+        // max_array_elements is per array; also bound the TOTAL element count
+        // across the whole message, so many small arrays cannot sum to an
+        // allocation far larger than the body. Reject before allocating.
+        if (count > limits_.max_array_elements - array_elements_) return fail(StorageError::ArrayTooLarge);
+        array_elements_ += static_cast<std::size_t>(count);
 
         out = Value{};
         out.type     = elem;
@@ -721,6 +726,7 @@ private:
     std::size_t         entries_ = 0;
     std::size_t         objects_ = 0;
     std::size_t         strings_ = 0;
+    std::size_t         array_elements_ = 0;   // message-wide total array elements
 };
 
 // Parses a complete portable-storage body into `root`. `consumed`, when given,
