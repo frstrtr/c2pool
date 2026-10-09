@@ -97,6 +97,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -498,6 +499,7 @@ private:
         std::string rbuf;                  // unframed inbound bytes
         std::string wbuf;                  // unsent outbound bytes (slow reader)
         std::size_t empty_run = 0;         // consecutive blank lines seen so far
+        std::size_t scan_pos = 0;          // rbuf bytes already scanned for '\n' (partial line)
         std::optional<ParkedLogin> parked; // login waiting for the first template
         std::unique_ptr<strat::XmrStratumSession> session;
         bool        last_reply_error = false;
@@ -548,7 +550,7 @@ private:
             m_owner.log("share ACCEPTED height=" + std::to_string(s.height) +
                         " template=" + std::to_string(s.template_id) +
                         " nonce=" + hex_u32(s.nonce) +
-                        " worker='" + s.worker + "'" +
+                        " worker='" + log_clip(s.worker, m_owner.m_opts.max_log_field) + "'" +
                         (s.is_network_block ? " NETWORK-BLOCK" : ""));
             m_inner.on_accepted_share(s);
         }
@@ -612,10 +614,15 @@ private:
         return b;
     }
 
-    // A peer-supplied string, clipped for a bounded log line.
+    // A peer-supplied string for a log line: at most n bytes (then "..."),
+    // control bytes written as '?'.
     static std::string log_clip(const std::string& s, std::size_t n) {
-        if (s.size() <= n) return s;
-        return s.substr(0, n) + "...";
+        std::string out = s.size() <= n ? s : s.substr(0, n) + "...";
+        for (char& ch : out) {
+            const unsigned char u = static_cast<unsigned char>(ch);
+            if (u < 0x20 || u == 0x7f) ch = '?';
+        }
+        return out;
     }
 
     // Request id: xmrig sends a JSON number; tolerate a numeric string.
@@ -625,8 +632,8 @@ private:
         return 0;
     }
 
-    // Reject pathologically nested input before it reaches the recursive
-    // minijson parser (which is KAT-grade, not adversarial-hardened).
+    // Pre-check: bracket nesting outside strings at most max_depth. The parser
+    // then applies max_json_depth itself and requires four hex digits after \u.
     static bool depth_ok(std::string_view s, int max_depth) {
         int depth = 0;
         bool in_str = false, esc = false;
@@ -835,28 +842,33 @@ private:
             close_client(cid, std::string("recv failed: ") + std::strerror(errno));
             return;
         }
-        // Drain complete newline-framed requests. Advance an offset instead of
-        // erasing the front per line (a per-line erase(0, n) is quadratic), and
-        // compact the buffer once at the end.
+        // Drain complete newline-framed requests: advance an offset, compact
+        // the buffer once at the end, and resume the '\n' scan of a partial
+        // line where the previous read left it (scan_pos). The line cap counts
+        // the line without its terminating "\n" or "\r\n".
         std::size_t rpos = 0;
         for (;;) {
             c = live(cid);
             if (!c) return;                          // dispatch closed us
-            const std::size_t nl = c->rbuf.find('\n', rpos);
+            const std::size_t nl = c->rbuf.find('\n', std::max(rpos, c->scan_pos));
             if (nl == std::string::npos) {
                 if (rpos) c->rbuf.erase(0, rpos);
-                if (c->rbuf.size() > m_opts.max_line_bytes)
+                c->scan_pos = c->rbuf.size();
+                const std::size_t pend = c->rbuf.size();
+                const std::size_t cr = (pend && c->rbuf.back() == '\r') ? 1 : 0;
+                if (pend - cr > m_opts.max_line_bytes)
                     close_client(cid, "request line too long");
                 return;
             }
-            const std::size_t len = nl - rpos;
+            c->scan_pos = 0;
+            std::size_t len = nl - rpos;
+            if (len && c->rbuf[nl - 1] == '\r') --len;   // "\r\n" terminator
             if (len > m_opts.max_line_bytes) {
                 close_client(cid, "request line too long");
                 return;
             }
             std::string line = c->rbuf.substr(rpos, len);
             rpos = nl + 1;
-            if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) {
                 if (++c->empty_run > m_opts.max_empty_lines) {
                     close_client(cid, "too many empty request lines");
@@ -1240,7 +1252,9 @@ private:
                 m_stats.submits_duplicate.fetch_add(1, std::memory_order_relaxed);
                 m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
                 send_line(cid, strat::StratumDialect::build_error(req_id, "Duplicate share"));
-                log("client " + std::to_string(cid) + " submit REJECTED: duplicate (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+                log("client " + std::to_string(cid) + " submit REJECTED: duplicate (job_id=" +
+                    log_clip(f.job_id, m_opts.max_log_field) + " nonce=" +
+                    log_clip(f.nonce, m_opts.max_log_field) + ")");
                 score_share(cid, false, "duplicate share");
                 return;
             }
@@ -1307,8 +1321,10 @@ private:
         if (!c) return;
         if (c->last_reply_error) {
             m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
-            log("client " + std::to_string(cid) + " submit REJECTED: " + c->last_reply_msg +
-                " (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+            log("client " + std::to_string(cid) + " submit REJECTED: " +
+                log_clip(c->last_reply_msg, m_opts.max_log_field) +
+                " (job_id=" + log_clip(f.job_id, m_opts.max_log_field) +
+                " nonce=" + log_clip(f.nonce, m_opts.max_log_field) + ")");
             if (c->last_reply_msg == strat::submit_error_message(strat::SubmitError::LowDiff))
                 score_share(cid, false, "low difficulty share");
         } else {
