@@ -520,6 +520,28 @@ if (BUILD_TESTING)
     # never unbounded.
     set_tests_properties(xmr_native_peer_pool_kat PROPERTIES TIMEOUT 300)
 
+    # XMR-READ-BOUNDS item 6: the pool charges a peer's inbound byte budget
+    # BEFORE decoding a 2002 body, so an over-budget frame is dropped rather than
+    # decoded. Real pool + fakes against a loopback stand-in with a tiny byte
+    # budget. Listed in BOTH build.yml --target lists.
+    add_executable(xmr_native_peer_pool_budget_kat xmr_native_peer_pool_budget_kat.cpp)
+    target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(xmr_native_peer_pool_budget_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_peer_pool_budget_kat COMMAND xmr_native_peer_pool_budget_kat)
+    set_tests_properties(xmr_native_peer_pool_budget_kat PROPERTIES TIMEOUT 300)
+
     # D3a: the block DoS bucket against honest relay of VALID blocks. The REAL
     # pool and the REAL chain index (the reorg-follow KAT's from-genesis regtest
     # boot, model RandomX verifier) wired as the node wires them, against

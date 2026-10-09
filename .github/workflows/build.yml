@@ -269,7 +269,7 @@ jobs:
                     xmr_native_output_set_overlay_kat \
                     xmr_native_chain_locator_kat xmr_native_peer_store_kat \
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
-                    xmr_native_epee_budget_kat xmr_native_levin_unsolicited_cap_kat \
+                    xmr_native_epee_budget_kat xmr_native_levin_unsolicited_cap_kat xmr_native_peer_pool_budget_kat \
                     xmr_native_dos_dup_block_kat \
                     xmr_native_unknown_fork_fuse_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
@@ -807,7 +807,7 @@ jobs:
                     xmr_native_output_set_overlay_kat \
                     xmr_native_chain_locator_kat xmr_native_peer_store_kat \
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
-                    xmr_native_epee_budget_kat xmr_native_levin_unsolicited_cap_kat \
+                    xmr_native_epee_budget_kat xmr_native_levin_unsolicited_cap_kat xmr_native_peer_pool_budget_kat \
                     xmr_native_dos_dup_block_kat \
                     xmr_native_unknown_fork_fuse_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
