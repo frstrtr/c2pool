@@ -40,6 +40,8 @@
 //   credited work, 0 when dead, then the carrier at d(c); the activation row
 //   it returns is kept on the carrier node. Genesis S = epoch 0, rules_cur =
 //   the genesis rules digest.
+//   joined(): the tree of a join rooted at x0 - 1 (slice S3b-4b), absolute
+//   positions, the retarget-prefix entries as its inherited window.
 //   Headers-first: an announced side header weighs its retarget d on the
 //   side chain; it fails on a parent link that does not continue the side
 //   chain, a height below the record of its parent, or a failed PoW at that
@@ -176,6 +178,24 @@ public:
         g.verified = g.bodies = g.chain_valid = true;
         nodes_.push_back(std::move(g));
         index_.emplace(genesis_id, 0);
+    }
+
+    // The joined tree of a join (slice S3b-4b; ABSOLUTE positions): its root is
+    // the carrier at root_pos = x0 - 1 (id, template height root_h, its record
+    // the newest entry of `pre`) with the adopted ratchet state root_s (a claim
+    // of the join) and cum_work 0; `pre`: the retarget-prefix entries of
+    // [x0 - N_rt, x0 - 1] (d = each header's t_origin, H; claims), oldest first,
+    // the newest of them the root's own. Position 0 (x0 = 1) is the genesis tree
+    // with root_s = S_0. The replay places x0 .. L on it as on a follower:
+    // rs_step_at at every absolute position.
+    static CarrierTree joined(const LaneParams& p, const Hash32& root_id, std::uint64_t root_pos, std::uint64_t root_h,
+                              const RatchetState& root_s, const EpochTable& table, std::span<const RetargetEntry> pre,
+                              const RatchetParams& rp = kRuledRatchetParams) {
+        CarrierTree t(p, root_id, root_h, table, pre, rp);
+        CarrierNode& r = t.nodes_[0];
+        r.pos = root_pos;
+        r.rs = root_s;
+        return t;
     }
 
     const LaneParams& params() const noexcept { return p_; }

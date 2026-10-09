@@ -514,7 +514,7 @@ struct BucketsAnchor {
     std::optional<std::vector<Hash32>> carried_ids;   // at's carried ids in canonical order, once its body is held
 };
 
-enum class FrameVerdict : std::uint8_t {
+enum class BucketsFrameVerdict : std::uint8_t {
     Accepted,   // the frame's pages are taken
     NotServed,  // n == 0: ask another peer, no verdict
     Defer,      // at's header or root not held: fetch, judge the frame again
@@ -547,7 +547,7 @@ enum class BucketsFault : std::uint8_t {
 };
 
 struct FrameOutcome {
-    FrameVerdict verdict = FrameVerdict::Accepted;
+    BucketsFrameVerdict verdict = BucketsFrameVerdict::Accepted;
     BucketsFault fault = BucketsFault::None;
     BucketsWireError wire = BucketsWireError::None;
     BucketFault bucket = BucketFault::None;
@@ -591,7 +591,7 @@ public:
             return o;
         }
         if (v.at != req_.at) return drop(BucketsFault::Unsolicited);
-        if (v.entries.empty()) return FrameOutcome{FrameVerdict::NotServed};
+        if (v.entries.empty()) return FrameOutcome{BucketsFrameVerdict::NotServed};
         if (!a.header_held) return defer(BucketsFault::AtUnknown);
         const std::uint64_t lc = bin_leaf_count(a.tip_record, b0_, f_);
         if (v.leaf_count != lc) return refuse(src, BucketsFault::LeafCount);
@@ -770,15 +770,15 @@ private:
         return check_carried_fold(a.receipts_root, *a.carried_ids, decode_ratchet_state(s)) == FoldVerdict::Match;
     }
 
-    static FrameOutcome drop(BucketsFault f) { return FrameOutcome{FrameVerdict::Drop, f}; }
-    static FrameOutcome defer(BucketsFault f) { return FrameOutcome{FrameVerdict::Defer, f}; }
+    static FrameOutcome drop(BucketsFault f) { return FrameOutcome{BucketsFrameVerdict::Drop, f}; }
+    static FrameOutcome defer(BucketsFault f) { return FrameOutcome{BucketsFrameVerdict::Defer, f}; }
     FrameOutcome refuse(Server& s, BucketsFault f) {
         s.closed = true;
         s.rows.clear();
         s.payloads.clear();
         s.totals.clear();
         s.s.reset();
-        FrameOutcome o{FrameVerdict::Refused, f};
+        FrameOutcome o{BucketsFrameVerdict::Refused, f};
         o.strike = 1;
         return o;
     }

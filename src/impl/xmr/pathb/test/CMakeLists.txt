@@ -43,7 +43,8 @@
 #   v37_xmr_bin_fold_kat             fold at f, seal D_fin 0, late push REFUSED
 #   v37_xmr_mmr_golden_kat           row_leaf/comp_root/mmr_leaf goldens; MMR proofs
 #   v37_xmr_base_reward_kat          B(A) emission; anchor without agc -> DEFER
-#   v37_xmr_joiner_kat               span 1176 / N_rt 2160; peaks + buckets verified
+#   v37_xmr_joiner_kat               span at L' (x0, x1); attempts, claims, candidates,
+#                                    buckets at the at header; joins at L = 4,700 (pathb_join.hpp)
 #   xmr_wide_int_extreme_kat         U320 split / W_max / merge-back at the extremes
 #   v37_xmr_fairness_cap_kat         20% miner + 40000 small: all paid, Sum == R
 #   v37_xmr_fairness_schedules_kat   payout share == work share within 0.003
@@ -156,4 +157,6 @@ if (BUILD_TESTING)
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_definitions(v37_xmr_pathb_hello_kat PRIVATE
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+    # v37_xmr_joiner_kat replays several chains of 4,700+ carriers (ASan ~12 min).
+    set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
 endif()

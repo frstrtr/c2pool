@@ -6,23 +6,31 @@
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/pathb_joiner.hpp
 // Path B, slice S3: the recent-window JOINER (S3.1a; ruling 15 Q8, 20 Q-E; V-10,
-// C43). A new node reaches the byte-equal lane digest from the recent window
-// only: it downloads span headers + N_rt retarget-prefix headers, checks the MMR
-// peaks + leaf_count of the first span carrier against its mmr_root, verifies the
-// sealed-bin L1 buckets against mmr_root with their MMR proofs, then verifies the
-// span in FULL (S1.3 + S2.3 + the S3 window / coinbase checks). No older history
-// and no previous-share inputs (ruling 27 K-10).
+// C43): its constants and the span of a join.
 //
-//   span = max(J_0, ceil((F + Fresh) x 120 / T) + D_fin) = 1,176 positions at
-//          D_fin 0 (J_0 = max(ceil(3 h x 3600 / T), ceil(F x 120 / T) + D_fin)
-//          = 1,152, the DEFAULT journal formula; card 2e not accepted, 27 K-11)
-//   N_rt = 2,160 retarget-prefix headers (K03a, = retarget_span).
+//   join_span = max(J_0, ceil((F + Fresh) x 120 / T) + D_fin) = 1,176 positions
+//               at D_fin 0 (J_0 = max(ceil(3 h x 3600 / T), ceil(F x 120 / T) +
+//               D_fin) = 1,152, the DEFAULT journal formula; card 2e not
+//               accepted, 27 K-11)
+//   N_rt      = 2,160 retarget-prefix headers (K03a, = retarget_span).
+//   span_bounds(L)  (slice S3b-4b; ruling 31 P-10 as amended by ruling 44
+//               S3b4-6 (a); the young chain of ruling 41 S3b4-1 (a)):
+//     L'  = min(L - N_rt, the last x with H(x) <= H(L) - F - Fresh)
+//     x0  = min(L' - (join_span - 1), the first x with H(x) > H(L') - F - Fresh)
+//     x1  = the first x with H(x) >= H(x0 - 1) + F + Fresh            (x1 <= L')
+//     no L' (L < N_rt, or no x with H(x) <= H(L) - F - Fresh) or x0 <= 0:
+//           the young chain, x0 = x1 = 1 (the whole chain [1, L], no claim).
+//     The span [x0, L] holds at least N_rt + join_span = 3,336 positions.
+//   peaks_match_root  the first span carrier's peaks bag to its mmr_root.
+//   The bucket assembly of a join is BucketsAssembly (pathb_bucket_wire.hpp)
+//   driven by JoinBuckets (pathb_join.hpp).
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "pathb_buckets.hpp"
@@ -63,29 +71,92 @@ inline bool peaks_match_root(const std::vector<Hash32>& peaks, std::uint64_t lea
     return ::v37::sha256d(pre) == mmr_root;
 }
 
-// A sealed-bin bucket served to the joiner with its MMR proof (FC_GETBUCKETS).
-struct ServedBucket {
-    L1Bucket bucket;
-    MmrProof proof;
+// ---------------------------------------------------------------------------
+// span_bounds: the span of a join at L (slice S3b-4b)
+// ---------------------------------------------------------------------------
+struct SpanBounds {
+    bool young = false;         // x0 = x1 = 1: the whole chain [1, L] in full, no claim
+    std::uint64_t l_prime = 0;  // L' (young: 0)
+    std::uint64_t x0 = 1;
+    std::uint64_t x1 = 1;
 };
 
-// Verify one served bucket against the committed mmr_root: its MMR leaf verifies
-// (a forged composition changes comp_root -> the leaf -> the fold, refused).
-inline bool verify_served_bucket(const Hash32& mmr_root, const ServedBucket& sb) {
-    // the comp_root must match the bucket's rows (a forged composition fails here
-    // before the MMR check).
-    if (sb.bucket.comp_root_v != comp_root(sb.bucket.rows)) return false;
-    return mmr_verify(mmr_root, mmr_leaf_of(sb.bucket), sb.proof);
-}
+enum class SpanStatus : std::uint8_t { Ok, NeedRecord };
 
-// The joiner's bucket pass: every served bucket verifies, and the first span
-// carrier's peaks bag to its mmr_root.
-inline bool joiner_bucket_pass(const std::vector<Hash32>& c0_peaks, std::uint64_t c0_leaf_count,
-                               const Hash32& c0_mmr_root, const std::vector<ServedBucket>& buckets) {
-    if (!peaks_match_root(c0_peaks, c0_leaf_count, c0_mmr_root)) return false;
-    for (const ServedBucket& sb : buckets)
-        if (!verify_served_bucket(c0_mmr_root, sb)) return false;
-    return true;
+struct SpanResult {
+    SpanStatus status = SpanStatus::Ok;
+    SpanBounds bounds;
+    std::uint64_t need = 0;  // NeedRecord: the position whose record the span needs (below what is held)
+};
+
+// rec(x) -> std::optional<std::uint64_t>: H(x) on the candidate's chain for a
+// position the caller holds (rec(0) = H(0) = b0, from the pool identity);
+// nullopt: not held (the result names the position). H is monotone along a
+// chain of carriers (S1.3 #6).
+template <class Rec>
+inline SpanResult span_bounds(const LaneParams& p, std::uint64_t L, Rec&& rec) {
+    SpanResult out;
+    const std::uint64_t fr = p.open_bins + p.fresh_max;           // F + Fresh
+    const std::uint64_t nrt = join_n_rt(p);                        // N_rt
+    const std::uint64_t back = join_span(p, kSealDepth) - 1;       // E-16's 1,175
+    const auto young = [&] {
+        out.status = SpanStatus::Ok;
+        out.bounds = SpanBounds{true, 0, 1, 1};
+        return out;
+    };
+    const auto need = [&](std::uint64_t x) {
+        out.status = SpanStatus::NeedRecord;
+        out.need = x;
+        return out;
+    };
+    if (L < nrt) return young();
+    const std::optional<std::uint64_t> hl = rec(L);
+    if (!hl) return need(L);
+    if (*hl < fr) return young();
+    const std::uint64_t thr = *hl - fr;  // H(L) - F - Fresh
+    // L' = min(L - N_rt, the last x with H(x) <= thr)
+    std::uint64_t lp = L - nrt;
+    for (;;) {
+        const std::optional<std::uint64_t> h = rec(lp);
+        if (!h) return need(lp);
+        if (*h <= thr) break;
+        if (lp == 0) return young();  // no L'
+        --lp;
+    }
+    if (lp <= back) return young();  // x0 <= 0
+    const std::optional<std::uint64_t> hlp = rec(lp);
+    if (!hlp) return need(lp);
+    if (*hlp < fr) return young();
+    const std::uint64_t thr2 = *hlp - fr;  // H(L') - F - Fresh
+    // x0 = min(L' - 1,175, the first x with H(x) > thr2)
+    std::uint64_t x0 = lp - back;
+    {
+        const std::optional<std::uint64_t> hz = rec(x0);
+        if (!hz) return need(x0);
+        if (*hz > thr2) {
+            for (;;) {
+                if (x0 == 0) return young();
+                const std::optional<std::uint64_t> h = rec(x0 - 1);
+                if (!h) return need(x0 - 1);
+                if (*h <= thr2) break;
+                --x0;
+            }
+        }
+    }
+    if (x0 == 0) return young();
+    // x1 = the first x with H(x) >= H(x0 - 1) + F + Fresh
+    const std::optional<std::uint64_t> hb = rec(x0 - 1);
+    if (!hb) return need(x0 - 1);
+    const std::uint64_t want = *hb + fr;
+    std::uint64_t x1 = x0;
+    for (;; ++x1) {
+        const std::optional<std::uint64_t> h = rec(x1);
+        if (!h) return need(x1);
+        if (*h >= want || x1 >= lp) break;
+    }
+    out.status = SpanStatus::Ok;
+    out.bounds = SpanBounds{false, lp, x0, x1};
+    return out;
 }
 
 }  // namespace c2pool::xmr::pathb

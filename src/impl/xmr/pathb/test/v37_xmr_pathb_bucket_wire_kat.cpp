@@ -148,7 +148,7 @@ pb::BucketsAnchor anchor_of(const pb::BinStore& s, const pb::Hash32& at, bool wi
 }
 
 bool refused(const pb::FrameOutcome& o, pb::BucketsFault f) {
-    return o.verdict == pb::FrameVerdict::Refused && o.fault == f && o.strike == 1;
+    return o.verdict == pb::BucketsFrameVerdict::Refused && o.fault == f && o.strike == 1;
 }
 
 pb::FrameOutcome one(const pb::GetBuckets& q, const std::vector<std::uint8_t>& f, const pb::BucketsAnchor& a,
@@ -397,7 +397,7 @@ void honest_vectors() {
     const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame, kNoServeCap).at(0);
     pb::BucketsAssembly as(req, kB0, F, kFrame);
     const pb::FrameOutcome o = as.add_frame(kServerA, f, anchor_of(a.s, at));
-    check(o.verdict == pb::FrameVerdict::Accepted && o.strike == 0 && o.bins_completed == 3 && as.complete(),
+    check(o.verdict == pb::BucketsFrameVerdict::Accepted && o.strike == 0 && o.bins_completed == 3 && as.complete(),
           "FR-B1 reply: accepted, 3 bins, no strike");
     pb::BinMmr m;
     bool leaves = as.bins().size() == 3;
@@ -467,7 +467,7 @@ void honest_vectors() {
     const pb::GetBuckets g_one{kChain, seq32(0x66), kB0 + 1, kB0 + 1};
     pb::BucketsAssembly ga(g_one, kB0, F, kFrame);
     const pb::FrameOutcome go = ga.add_frame(kServerA, enc(reply_of(g, g_one.at, 1, 1, {})), g.anchor);
-    check(go.verdict == pb::FrameVerdict::Accepted && ga.complete() &&
+    check(go.verdict == pb::BucketsFrameVerdict::Accepted && ga.complete() &&
                   hx(ga.bins().at(kB0 + 1).leaf) == "dcd7becdd422d3ff25c6477a1f9f26de4c109baf2930b1361bc7d09d46dc8417",
           "FR-B1 golden: bin b0 + 1 served alone is accepted with leaf dcd7becd...");
     const pb::GetBuckets g_all{kChain, seq32(0x66), kB0, kB0 + 2};
@@ -561,7 +561,7 @@ void lying_vectors() {
         check(ax.ok && ax.s.head().leaf_count == 5, "chain A extended to 5 leaves (tip b0 + 100)");
         const pb::BucketsAnchor anx = anchor_of(ax.s, at);
         pb::BucketsReply x = dec(pb::serve_buckets(ax.s, req, kS, kFrame, kNoServeCap).at(0));
-        check(one(req, enc(x), anx).verdict == pb::FrameVerdict::Accepted && x.leaf_count == 3,
+        check(one(req, enc(x), anx).verdict == pb::BucketsFrameVerdict::Accepted && x.leaf_count == 3,
               "an ancestor of the tip is served at its own leaf_count (3)");
         pb::BucketsReply y = x;
         y.peaks = ax.s.best_mmr().peaks();  // the peaks of 5 leaves (popcount 2, like 3)
@@ -610,7 +610,7 @@ void lying_vectors() {
         pb::BucketsReply x = r;
         x.s_parent[3] ^= 1;
         pb::BucketsAssembly as(req, kB0, F, kFrame);
-        check(as.add_frame(kServerA, enc(x), an).verdict == pb::FrameVerdict::Accepted && as.s_pending(),
+        check(as.add_frame(kServerA, enc(x), an).verdict == pb::BucketsFrameVerdict::Accepted && as.s_pending(),
               "S one byte changed: pending while at's body is not held");
         const pb::SResolution sr = as.resolve_s(anchor_of(a.s, at, true));
         check(!sr.pending && !sr.adopted && sr.struck == std::vector<std::uint64_t>{kServerA},
@@ -633,22 +633,22 @@ void receiver_vectors() {
     {
         pb::BucketsAssembly as(req, kB0, F, f.size() - 1);
         const pb::FrameOutcome o = as.add_frame(kServerA, f, an);
-        check(o.verdict == pb::FrameVerdict::Drop && o.fault == pb::BucketsFault::OverBuffer && o.strike == 0,
+        check(o.verdict == pb::BucketsFrameVerdict::Drop && o.fault == pb::BucketsFault::OverBuffer && o.strike == 0,
               "a frame above the buffer -> DROP, 0 tokens");
         const pb::FrameOutcome o2 = as.add_frame(kServerA, pb::encode_buckets_not_served(kChain, at), an);
-        check(o2.verdict == pb::FrameVerdict::Drop && o2.fault == pb::BucketsFault::Unsolicited,
+        check(o2.verdict == pb::BucketsFrameVerdict::Drop && o2.fault == pb::BucketsFault::Unsolicited,
               "after an oversize frame the server's later frames for the request are dropped");
     }
     {
         const pb::GetBuckets other{kChain, cid(0x40, 2), kB0, kB0 + 2};
         const pb::FrameOutcome o = one(other, f, an);
-        check(o.verdict == pb::FrameVerdict::Drop && o.fault == pb::BucketsFault::Unsolicited && o.strike == 0,
+        check(o.verdict == pb::BucketsFrameVerdict::Drop && o.fault == pb::BucketsFault::Unsolicited && o.strike == 0,
               "a reply for another at -> DROP");
         const pb::FrameOutcome n = one(req, pb::encode_buckets_not_served(kChain, at), an);
-        check(n.verdict == pb::FrameVerdict::NotServed && n.strike == 0, "n = 0 -> ask another peer, no verdict");
+        check(n.verdict == pb::BucketsFrameVerdict::NotServed && n.strike == 0, "n = 0 -> ask another peer, no verdict");
         pb::BucketsAnchor no_hdr;
         const pb::FrameOutcome d1 = one(req, f, no_hdr);
-        check(d1.verdict == pb::FrameVerdict::Defer && d1.fault == pb::BucketsFault::AtUnknown && d1.strike == 0,
+        check(d1.verdict == pb::BucketsFrameVerdict::Defer && d1.fault == pb::BucketsFault::AtUnknown && d1.strike == 0,
               "at not held as a header -> DEFER");
         std::vector<std::uint8_t> bad = f;
         bad[1] = 2;
@@ -659,8 +659,8 @@ void receiver_vectors() {
         const pb::FrameOutcome w1 = as.add_frame(kServerA, bad, an);
         const pb::FrameOutcome w2 = as.add_frame(kServerA, f, an);
         const pb::FrameOutcome w3 = as.add_frame(kServerB, f, an);
-        check(w1.strike == 1 && w2.verdict == pb::FrameVerdict::Drop && w2.fault == pb::BucketsFault::Unsolicited &&
-                      w2.strike == 0 && w3.verdict == pb::FrameVerdict::Accepted && as.complete(),
+        check(w1.strike == 1 && w2.verdict == pb::BucketsFrameVerdict::Drop && w2.fault == pb::BucketsFault::Unsolicited &&
+                      w2.strike == 0 && w3.verdict == pb::BucketsFrameVerdict::Accepted && as.complete(),
               "after a refusal the server's later frames are dropped; another server completes the request");
     }
     {
@@ -695,7 +695,7 @@ void receiver_vectors() {
         std::vector<pb::FrameOutcome> os;
         for (const auto& p : pages) os.push_back(as.add_frame(kServerA, p, ran));
         bool acc = true;
-        for (const auto& o : os) acc = acc && o.verdict == pb::FrameVerdict::Accepted && o.strike == 0;
+        for (const auto& o : os) acc = acc && o.verdict == pb::BucketsFrameVerdict::Accepted && o.strike == 0;
         check(acc && os[0].bins_completed == 0 && os[1].bins_completed == 0 && os[2].bins_completed == 1 &&
                       os[3].bins_completed == 1 && as.complete(),
               "a 3-page bucket reassembled: complete on its third page");
@@ -713,7 +713,7 @@ void receiver_vectors() {
         const pb::FrameOutcome o3 = as.add_frame(kServerA, pages.at(2), ran);
         std::uint32_t strikes = o1.strike + o3.strike;
         for (const auto& p : pages) strikes += as.add_frame(kServerB, p, ran).strike;
-        check(o1.verdict == pb::FrameVerdict::Accepted && o3.verdict == pb::FrameVerdict::Drop && as.complete() &&
+        check(o1.verdict == pb::BucketsFrameVerdict::Accepted && o3.verdict == pb::BucketsFrameVerdict::Drop && as.complete() &&
                       strikes == 0,
               "a missing page: asked from a second server, accepted, no strike");
     }
@@ -757,7 +757,7 @@ void receiver_vectors() {
             pb::BucketsAssembly as(rq, kB0, F, lim);
             for (const auto& p : ps) {
                 all = all && p.size() <= lim;
-                all = all && as.add_frame(kServerA, p, ran).verdict == pb::FrameVerdict::Accepted;
+                all = all && as.add_frame(kServerA, p, ran).verdict == pb::BucketsFrameVerdict::Accepted;
             }
             all = all && as.complete();
         }
@@ -779,7 +779,7 @@ void serving_vectors() {
     check(sf.size() == 1 && sf[0] == pb::encode_buckets_not_served(kChain, side.at),
           "at off the server's best chain -> n = 0, leaf_count 0");
     const pb::FrameOutcome so = one(side, sf[0], anchor_of(a.s, side.at));
-    check(so.verdict == pb::FrameVerdict::NotServed && so.strike == 0, "the n = 0 reply: no strike");
+    check(so.verdict == pb::BucketsFrameVerdict::NotServed && so.strike == 0, "the n = 0 reply: no strike");
     const pb::GetBuckets unknown{kChain, seq32(0x77), kB0, kB0 + 2};
     check(pb::serve_buckets(a.s, unknown, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, unknown.at),
           "at unknown to the server -> n = 0");
@@ -800,7 +800,7 @@ void serving_vectors() {
     const std::vector<std::vector<std::uint8_t>> qf = pb::serve_buckets(q.s, qq, kS, kFrame, kNoServeCap);
     pb::BucketsAssembly qa(qq, kB0, F, kFrame);
     const pb::FrameOutcome qo = qa.add_frame(kServerA, qf.at(0), anchor_of(q.s, qat));
-    check(q.ok && qf.size() == 1 && qo.verdict == pb::FrameVerdict::Accepted && qa.complete_through() == kB0 + 1,
+    check(q.ok && qf.size() == 1 && qo.verdict == pb::BucketsFrameVerdict::Accepted && qa.complete_through() == kB0 + 1,
           "a bin without a reference for an identity is not served: the prefix ends before it");
     const pb::GetBuckets qq1{kChain, qat, kB0 + 1, kB0 + 1};
     check(pb::serve_buckets(q.s, qq1, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, qat),
@@ -827,7 +827,7 @@ void serving_vectors() {
     pb::BucketsAssembly ja(j2, kB0, F, kFrame);
     const pb::FrameOutcome jo = ja.add_frame(kServerA, pb::serve_buckets_from(src, j2, kFrame, kNoServeCap).at(0),
                                              anchor_of(ax.s, ax.s.best_tip()));
-    check(jo.verdict == pb::FrameVerdict::Accepted && ja.complete(), "... and serves leaf 3");
+    check(jo.verdict == pb::BucketsFrameVerdict::Accepted && ja.complete(), "... and serves leaf 3");
 
     // a body that is not the leaf's (a stale record) ends the served prefix
     {
@@ -859,14 +859,14 @@ void serving_vectors() {
         sa.mmr_root = m.root();
         pb::BucketsAssembly ss(sq, kB0, F, kFrame);
         const pb::FrameOutcome so2 = ss.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame, kNoServeCap).at(0), sa);
-        check(so2.verdict == pb::FrameVerdict::Accepted && ss.complete_through() == kB0 + 2,
+        check(so2.verdict == pb::BucketsFrameVerdict::Accepted && ss.complete_through() == kB0 + 2,
               "a held body whose leaf is not the MMR's is not served: the prefix ends before it");
         held[kB0 + 2].bucket = keyed_bin(kB0 + 2, {{ka, 18182}});
         held[kB0 + 2].leaf = pb::mmr_leaf_of(held[kB0 + 2].bucket);
         held.erase(kB0 + 1);  // a pruned body (P-38): the leaf stays provable
         pb::BucketsAssembly ps(sq, kB0, F, kFrame);
         const pb::FrameOutcome po = ps.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame, kNoServeCap).at(0), sa);
-        check(po.verdict == pb::FrameVerdict::Accepted && ps.complete_through() == kB0 + 1,
+        check(po.verdict == pb::BucketsFrameVerdict::Accepted && ps.complete_through() == kB0 + 1,
               "a bin whose rows are not held is not served: the prefix ends before it");
     }
 
@@ -903,7 +903,7 @@ void refuse_vectors() {
         x.s_parent[5] ^= 1;
         pb::BucketsAssembly as(req, kB0, F, kFrame);
         const pb::FrameOutcome o1 = as.add_frame(kServerA, enc(x), an);
-        check(o1.verdict == pb::FrameVerdict::Accepted && o1.strike == 0 && as.s_pending(),
+        check(o1.verdict == pb::BucketsFrameVerdict::Accepted && o1.strike == 0 && as.s_pending(),
               "refuse: A's frame with a wrong S accepted, S pending (at's carried ids not held)");
         std::vector<std::uint8_t> bad = f;
         bad[1] = 2;
@@ -924,7 +924,7 @@ void refuse_vectors() {
         bad[0] = 0x54;
         const pb::FrameOutcome o2 = as.add_frame(kServerA, bad, an);
         const pb::SResolution sr = as.resolve_s(anchor_of(a.s, at, true));
-        check(o1.verdict == pb::FrameVerdict::Accepted && refused(o2, pb::BucketsFault::Wire) && !sr.pending &&
+        check(o1.verdict == pb::BucketsFrameVerdict::Accepted && refused(o2, pb::BucketsFault::Wire) && !sr.pending &&
                       sr.struck.empty() && !sr.adopted,
               "refuse: a server refused after an accepted frame: its S is neither adopted nor struck again");
     }
@@ -1033,7 +1033,7 @@ void p48_vectors() {
           "P-48: the uncapped reply over 2,000 bins spans " + std::to_string(full.size()) + " frames");
     pb::BucketsAssembly ua(all, kB0, F, kFrame);
     bool uacc = true;
-    for (const auto& f : full) uacc = uacc && ua.add_frame(kServerA, f, bs.anchor).verdict == pb::FrameVerdict::Accepted;
+    for (const auto& f : full) uacc = uacc && ua.add_frame(kServerA, f, bs.anchor).verdict == pb::BucketsFrameVerdict::Accepted;
     check(uacc && ua.complete(), "P-48: the uncapped run assembles every bin");
 
     const std::vector<std::vector<std::uint8_t>> capped = pb::serve_buckets_from(src, all, kFrame, kFrame);
@@ -1081,7 +1081,7 @@ void p48_vectors() {
             for (const auto& f : pb::serve_buckets_from(src, q, kFrame, kFrame)) {
                 const pb::FrameOutcome o = as.add_frame(server, f, bs.anchor);
                 strikes += o.strike;
-                acc = acc && o.verdict == pb::FrameVerdict::Accepted;
+                acc = acc && o.verdict == pb::BucketsFrameVerdict::Accepted;
             }
             for (const auto& [b, sb] : as.bins()) got.emplace(b, sb);
             const std::uint64_t next = as.complete_through();
@@ -1124,7 +1124,7 @@ void p48_vectors() {
             every = every && rb.ok && rb.bytes <= cap && rb.whole() && contiguous_from(rb, kB0);
             if (rb.bins.size() < 4) ++fewer;
             pb::BucketsAssembly as(q, kB0, F, 900);
-            for (const auto& f : c) every = every && as.add_frame(kServerA, f, b5.anchor).verdict == pb::FrameVerdict::Accepted;
+            for (const auto& f : c) every = every && as.add_frame(kServerA, f, b5.anchor).verdict == pb::BucketsFrameVerdict::Accepted;
             every = every && as.complete_through() == kB0 + rb.bins.size();
         }
         check(every && fewer > 0,
@@ -1193,7 +1193,7 @@ void serve_rule_vectors() {
         for (const auto& f : d) {
             const pb::FrameOutcome o = as.add_frame(kServerA, f, an);
             strikes += o.strike;
-            acc = acc && o.verdict == pb::FrameVerdict::Accepted;
+            acc = acc && o.verdict == pb::BucketsFrameVerdict::Accepted;
         }
         check(rb.ok && rb.bins == std::vector<std::uint64_t>{kB0} && acc && strikes == 0 &&
                       as.complete_through() == kB0 + 1,
@@ -1203,7 +1203,7 @@ void serve_rule_vectors() {
         const std::vector<std::vector<std::uint8_t>> d0 = pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap, &first, at);
         const pb::FrameOutcome o0 = one(rq, d0.at(0), an);
         check(d0.size() == 1 && d0[0] == pb::encode_buckets_not_served(kChain, at) &&
-                      o0.verdict == pb::FrameVerdict::NotServed && o0.strike == 0,
+                      o0.verdict == pb::BucketsFrameVerdict::NotServed && o0.strike == 0,
               "serve rule: the claimed leaf first -> the not-served frame, no strike");
     }
     {
@@ -1211,7 +1211,7 @@ void serve_rule_vectors() {
         before.any_at = false;
         const std::vector<std::vector<std::uint8_t>> d = pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap, &before, at);
         const pb::FrameOutcome o = one(rq, d.at(0), an);
-        check(d.size() == 1 && d[0] == pb::encode_buckets_not_served(kChain, at) && o.verdict == pb::FrameVerdict::NotServed &&
+        check(d.size() == 1 && d[0] == pb::encode_buckets_not_served(kChain, at) && o.verdict == pb::BucketsFrameVerdict::NotServed &&
                       o.strike == 0 && before.leaf_asks == 0,
               "serve rule: at_servable false (no at bound) -> the not-served frame before the store is read; no strike");
     }
