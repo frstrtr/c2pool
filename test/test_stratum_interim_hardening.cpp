@@ -563,3 +563,51 @@ TEST(StratumInterimHardening, KeepaliveOffLeavesIdleSessionUnfed)
         << "idle session got unexpected notifies with keepalive OFF (jobs="
         << c.jobs.size() << ")";
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// KAT 6 — Drain hooks (#866 action 2): set_accepting(false) refuses new miners
+// without touching live ones or the cap counter; drop_sessions(n) closes
+// exactly min(n, live); set_accepting(true) restores the legacy accept path.
+// ════════════════════════════════════════════════════════════════════════════
+TEST(StratumInterimHardening, DrainHooksRefuseAndDropExactly)
+{
+    ServerHarness h;   // cap 0 = unlimited: only the drain gate can refuse
+    ASSERT_TRUE(h.start());
+    EXPECT_TRUE(h.on_io([&] { return h.server->is_accepting(); }));
+
+    auto c1 = std::make_unique<Client>();
+    auto c2 = std::make_unique<Client>();
+    ASSERT_TRUE(c1->connect(h.port));
+    ASSERT_TRUE(c1->subscribe());
+    ASSERT_TRUE(c2->connect(h.port));
+    ASSERT_TRUE(c2->subscribe());
+
+    h.on_io([&] { h.server->set_accepting(false); return 0; });
+    Client c3;
+    ASSERT_TRUE(c3.connect(h.port));
+    EXPECT_FALSE(c3.read_line(3000ms).has_value());
+    EXPECT_TRUE(c3.was_closed_by_peer()) << "draining server must refuse new miners";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_draining(); }), 1u);
+    EXPECT_EQ(h.on_io([&] { return h.server->get_refused_connections(); }), 0u)
+        << "drain refusals must not be booked as cap refusals";
+
+    // Live miners are untouched by the gate itself.
+    h.notify_storm(1);
+    EXPECT_TRUE(c1->collect_notifies(2, 5000ms));
+    EXPECT_TRUE(c2->collect_notifies(2, 5000ms));
+
+    EXPECT_EQ(h.on_io([&] { return h.server->drop_sessions(0); }), 0u);
+    EXPECT_EQ(h.on_io([&] { return h.server->drop_sessions(1); }), 1u);
+    (void)c1->read_line(1500ms);
+    (void)c2->read_line(1500ms);
+    EXPECT_EQ(int(c1->was_closed_by_peer()) + int(c2->was_closed_by_peer()), 1)
+        << "drop_sessions(1) must close exactly one of two live miners";
+    std::this_thread::sleep_for(300ms);  // let the disconnect path unregister
+    EXPECT_EQ(h.on_io([&] { return h.server->drop_sessions(99); }), 1u)
+        << "drop_sessions clamps to the live count";
+
+    h.on_io([&] { h.server->set_accepting(true); return 0; });
+    Client c4;
+    ASSERT_TRUE(c4.connect(h.port));
+    EXPECT_TRUE(c4.subscribe()) << "accepting=true must restore the accept path";
+}
