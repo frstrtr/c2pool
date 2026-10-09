@@ -38,6 +38,9 @@
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
 
+// A request with no P-48 cap (a KAT parameter).
+constexpr std::uint64_t kNoServeCap = UINT64_MAX;
+
 static pb::Hash32 rep(std::uint8_t b) { pb::Hash32 h{}; h.fill(b); return h; }
 static std::string hx(const pb::Hash32& h) { return hex(h.data(), h.size()); }
 
@@ -672,7 +675,7 @@ static void s3b_fc_buckets_vectors() {
     };
     const pb::GetBuckets req{chain, rep(0x31), b0, b0 + 7};
     const std::uint64_t frame = pb::bucket_wire_policy_default(16, pb::zone(16))->frame_bytes;
-    const std::vector<std::vector<std::uint8_t>> fr = pb::serve_buckets_from(src, req, frame);
+    const std::vector<std::vector<std::uint8_t>> fr = pb::serve_buckets_from(src, req, frame, kNoServeCap);
     pb::BucketsAnchor a;
     a.header_held = true;
     a.tip_record = b0 + F - 1 + 8;

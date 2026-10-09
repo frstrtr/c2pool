@@ -290,7 +290,7 @@ jobs:
                     v37_xmr_receipt_id_kat v37_xmr_receipt_defer_kat xmr_receipt_solo_leech_kat \
                     v37_xmr_receipt_header_rules_kat v37_xmr_receipt_wire_cap_kat xmr_carrier_timestamp_kat \
                     xmr_window_kat xmr_window_spend_floor_kat xmr_window_merge_back_kat v37_xmr_window_branch_kat v37_xmr_window_fork_height_kat v37_xmr_coinbase_reserve_kat xmr_coinbase_output_gate_kat xmr_window_split_kat v37_xmr_coinbase_output_order_kat v37_xmr_coinbase_extra_layout_kat v37_xmr_bin_fold_kat v37_xmr_mmr_golden_kat v37_xmr_base_reward_kat v37_xmr_joiner_kat xmr_wide_int_extreme_kat v37_xmr_fairness_cap_kat v37_xmr_fairness_schedules_kat v37_xmr_pathb_coinbase_kat v37_xmr_pathb_e2e_kat v37_xmr_pathb_miner_tx_kat \
-                    v37_xmr_epoch_kat xmr_epoch_tally_kat v37_xmr_ballot_kat xmr_epoch_accounting_kat v37_xmr_donation_split_kat v37_xmr_monero_rules_digest_kat v37_xmr_pathb_hello_kat v37_xmr_pathb_bucket_wire_kat \
+                    v37_xmr_epoch_kat xmr_epoch_tally_kat v37_xmr_ballot_kat xmr_epoch_accounting_kat v37_xmr_donation_split_kat v37_xmr_monero_rules_digest_kat v37_xmr_pathb_hello_kat v37_xmr_pathb_bucket_wire_kat v37_xmr_pathb_admit_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \
@@ -826,7 +826,7 @@ jobs:
                     v37_xmr_receipt_id_kat v37_xmr_receipt_defer_kat xmr_receipt_solo_leech_kat \
                     v37_xmr_receipt_header_rules_kat v37_xmr_receipt_wire_cap_kat xmr_carrier_timestamp_kat \
                     xmr_window_kat xmr_window_spend_floor_kat xmr_window_merge_back_kat v37_xmr_window_branch_kat v37_xmr_window_fork_height_kat v37_xmr_coinbase_reserve_kat xmr_coinbase_output_gate_kat xmr_window_split_kat v37_xmr_coinbase_output_order_kat v37_xmr_coinbase_extra_layout_kat v37_xmr_bin_fold_kat v37_xmr_mmr_golden_kat v37_xmr_base_reward_kat v37_xmr_joiner_kat xmr_wide_int_extreme_kat v37_xmr_fairness_cap_kat v37_xmr_fairness_schedules_kat v37_xmr_pathb_coinbase_kat v37_xmr_pathb_e2e_kat v37_xmr_pathb_miner_tx_kat \
-                    v37_xmr_epoch_kat xmr_epoch_tally_kat v37_xmr_ballot_kat xmr_epoch_accounting_kat v37_xmr_donation_split_kat v37_xmr_monero_rules_digest_kat v37_xmr_pathb_hello_kat v37_xmr_pathb_bucket_wire_kat \
+                    v37_xmr_epoch_kat xmr_epoch_tally_kat v37_xmr_ballot_kat xmr_epoch_accounting_kat v37_xmr_donation_split_kat v37_xmr_monero_rules_digest_kat v37_xmr_pathb_hello_kat v37_xmr_pathb_bucket_wire_kat v37_xmr_pathb_admit_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \

@@ -25,7 +25,9 @@
 //   (PlaceOutcome::released): the caller admits each again on the parent's
 //   view and places it. A carrier refused NotCarrier or FoldMismatch discards
 //   the carriers waiting on it, and those waiting on them, except a carrier
-//   that still waits under another claimed parent (PlaceOutcome::discarded).
+//   that still waits under another claimed parent (PlaceOutcome::discarded:
+//   the (id, claimed parent) pairs). unwait(id, parent) removes one waiting
+//   entry and nothing else.
 //   receipts_root (S1.3 #10): a carrier's receipts_root must equal
 //     sha256d("c2pool-v37-carry" || carried_root(ids) || rs_root(S(parent)))
 //   over the ids of its carried list in list order (check_carried_fold,
@@ -101,6 +103,9 @@ struct CarrierAnnounce {
 // its id, its credited work work(T_origin) (R-1, S2.3 #11), its ballot
 // (side_data_v3) and its liveness at placement on the placing chain (S2.3
 // #17, decided by the placement). A dead placement adds 0 to S.
+// A waiting entry: (carrier id, claimed parent id).
+using WaitKey = std::pair<Hash32, Hash32>;
+
 struct CarriedPlacement {
     Hash32 id{};
     std::uint64_t work = 0;
@@ -133,8 +138,9 @@ struct PlaceOutcome {
     PlaceVerdict verdict = PlaceVerdict::Deferred;
     std::vector<Hash32> released;   // Placed: the carriers that waited on this one, in arrival order; each is
                                     // admitted again by the caller and placed
-    std::vector<Hash32> discarded;  // NotCarrier / FoldMismatch: the waiting entries dropped (the carriers that
-                                    // waited on this one, and on them while they have no other waiting entry)
+    std::vector<WaitKey> discarded;  // NotCarrier / FoldMismatch: the waiting entries dropped (the carriers that
+                                     // waited on this one, and on them while they have no other waiting entry),
+                                     // each with the claimed parent it waited under
 };
 
 struct SwitchPlan {
@@ -261,6 +267,72 @@ public:
     bool mark_verified(const Hash32& id) { return mark(id, true, false); }
     bool mark_bodies(const Hash32& id) { return mark(id, false, true); }
 
+    // Undoes mark_verified and mark_bodies of a carrier with no child (the
+    // write step's undo): it is neither verified nor chain-valid, and the best
+    // tip is the greatest of the other chain-valid carriers. false: not held,
+    // genesis, or a carrier with a child.
+    bool unmark(const Hash32& id) {
+        const auto it = index_.find(id);
+        if (it == index_.end() || it->second == 0 || !nodes_[it->second].children.empty()) return false;
+        CarrierNode& n = nodes_[it->second];
+        n.verified = n.bodies = n.chain_valid = false;
+        if (best_ == it->second) {
+            best_ = 0;
+            for (const auto& [hid, i] : index_)
+                if (nodes_[i].chain_valid
+                    && fork_choice_prefers(ChainTip{nodes_[i].cum_work, nodes_[i].id}, ChainTip{nodes_[best_].cum_work, nodes_[best_].id}))
+                    best_ = i;
+        }
+        return true;
+    }
+
+    // Removes the one waiting entry (id, parent); entries waiting on id stay.
+    // false: no such entry.
+    bool unwait(const Hash32& id, const Hash32& parent) {
+        if (waiting_keys_.erase(WaitKey{id, parent}) == 0) return false;
+        const auto wit = waiting_.find(parent);
+        if (wit != waiting_.end()) {
+            std::vector<Hash32>& v = wit->second;
+            v.erase(std::remove(v.begin(), v.end(), id), v.end());
+            if (v.empty()) waiting_.erase(wit);
+        }
+        return true;
+    }
+
+    // The ancestor of `id` at position `pos` on id's chain (id itself at
+    // pos(id)); nullopt when id is not held or pos > pos(id). Each parent
+    // step counts in walk_steps().
+    std::optional<Hash32> ancestor_at(const Hash32& id, std::uint64_t pos) const {
+        const auto it = index_.find(id);
+        if (it == index_.end() || nodes_[it->second].pos < pos) return std::nullopt;
+        std::size_t i = it->second;
+        while (nodes_[i].pos > pos) {
+            i = nodes_[i].parent_index;
+            ++walk_steps_;
+        }
+        return nodes_[i].id;
+    }
+
+    // The newest carrier on id's chain (id itself first) for which on(id', pos')
+    // holds; nullopt when id is not held or none does. Each parent step counts
+    // in walk_steps().
+    template <class On>
+    std::optional<Hash32> newest_ancestor_where(const Hash32& id, On&& on) const {
+        const auto it = index_.find(id);
+        if (it == index_.end()) return std::nullopt;
+        std::size_t i = it->second;
+        for (;;) {
+            if (on(nodes_[i].id, nodes_[i].pos)) return nodes_[i].id;
+            if (i == 0) return std::nullopt;
+            i = nodes_[i].parent_index;
+            ++walk_steps_;
+        }
+    }
+
+    // Parent steps taken by ancestor_at, newest_ancestor_where and the
+    // common-ancestor walk.
+    std::uint64_t walk_steps() const noexcept { return walk_steps_; }
+
     // Removes a carrier that is not chain-valid, with its descendants (none of
     // them is chain-valid, so the best tip does not change). Waiting carriers
     // never wait on a placed id.
@@ -378,8 +450,6 @@ public:
     }
 
 private:
-    using WaitKey = std::pair<Hash32, Hash32>;  // (carrier id, claimed parent id)
-
     // S1.3 #10: receipts_root of c against carried_root(ids of `carried`) and S at its parent.
     static FoldVerdict fold_verdict(const RatchetState& parent_rs, const CarrierAnnounce& c,
                                     std::span<const CarriedPlacement> carried) {
@@ -490,8 +560,8 @@ private:
     // Discards the waiting entries under `parent` when `parent` has no waiting
     // entry of its own, and then those under each discarded carrier that has
     // no other waiting entry left.
-    std::vector<Hash32> discard_waiting(const Hash32& parent) {
-        std::vector<Hash32> out;
+    std::vector<WaitKey> discard_waiting(const Hash32& parent) {
+        std::vector<WaitKey> out;
         std::vector<Hash32> stack;
         if (!waiting_on_any(parent)) stack.push_back(parent);
         while (!stack.empty()) {
@@ -503,7 +573,7 @@ private:
             waiting_.erase(wit);
             for (const Hash32& id : ids) {
                 waiting_keys_.erase(WaitKey{id, p});
-                out.push_back(id);
+                out.push_back(WaitKey{id, p});
                 if (!waiting_on_any(id)) stack.push_back(id);
             }
         }
@@ -511,11 +581,18 @@ private:
     }
 
     std::size_t common_ancestor(std::size_t a, std::size_t b) const {
-        while (nodes_[a].pos > nodes_[b].pos) a = nodes_[a].parent_index;
-        while (nodes_[b].pos > nodes_[a].pos) b = nodes_[b].parent_index;
+        while (nodes_[a].pos > nodes_[b].pos) {
+            a = nodes_[a].parent_index;
+            ++walk_steps_;
+        }
+        while (nodes_[b].pos > nodes_[a].pos) {
+            b = nodes_[b].parent_index;
+            ++walk_steps_;
+        }
         while (a != b) {
             a = nodes_[a].parent_index;
             b = nodes_[b].parent_index;
+            ++walk_steps_;
         }
         return a;
     }
@@ -529,6 +606,7 @@ private:
     std::map<Hash32, std::vector<Hash32>> waiting_;  // waiting carrier ids by claimed parent id
     std::set<WaitKey> waiting_keys_;                 // (carrier id, claimed parent id)
     std::size_t best_ = 0;
+    mutable std::uint64_t walk_steps_ = 0;
 };
 
 }  // namespace c2pool::xmr::pathb

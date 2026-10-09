@@ -71,6 +71,11 @@
 #   v37_xmr_pathb_bucket_wire_kat    FC_GETBUCKETS / FC_BUCKETS codec, verifier, paging,
 #                                    serving rule, per-peer budget
 #
+# Slice S3b-4a KAT (pathb_admit.hpp, pathb_header_index.hpp, pathb_claim_view.hpp; unwired):
+#   v37_xmr_pathb_admit_kat          the admission pipeline (S1.3, S2.3), the deep-tip
+#                                    boundary and the closure, the write step, the
+#                                    deferred store, the claim extension point
+#
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
 # hand in BOTH `--target` lists of .github/workflows/build.yml.
@@ -125,7 +130,8 @@ if (BUILD_TESTING)
             v37_xmr_donation_split_kat
             v37_xmr_monero_rules_digest_kat
             v37_xmr_pathb_hello_kat
-            v37_xmr_pathb_bucket_wire_kat)
+            v37_xmr_pathb_bucket_wire_kat
+            v37_xmr_pathb_admit_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)

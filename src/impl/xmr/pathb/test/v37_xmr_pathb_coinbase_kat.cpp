@@ -16,7 +16,7 @@
 // not called). The miner tx commits mm_root_of(side_data_v3) of the receipt: a
 // side_data_v3 field changed after the coinbase was built is a BAN before
 // RandomX on the split and the finder-only path; a side_data_v3 that does not
-// encode builds nothing (BAN).
+// encode builds nothing (NodeInternal: local alarm + DEFER, no token).
 // S2.3 #2 p + give_author_bp <= 10000, the received bytes through the codec,
 // the resolution, #12 and RandomX: 10000 + 1, 5001 + 5000, 10000 + 10 -> STRIKE
 // at #2 (ShareSum), no fetch, no RandomX, on a window and on an empty window
@@ -24,7 +24,8 @@
 // builds or from the zero leaf; 9990 + 10 and 10000 + 0 -> admitted (tip known)
 // or DEFER (tip unknown); the receipt's own entry at 9990 + 10 / 10000 + 0:
 // weights sum to W, Sum(vout) == R, miner weight 0 at 10000 + 0. A window
-// holding an entry above 10000 has no split and no canonical coinbase (BAN); an
+// holding an entry above 10000 has no split and no canonical coinbase
+// (NodeInternal: DEFER); an
 // hf-17 receipt is REFUSED (Fused) with no token and RandomX not called.
 // ---------------------------------------------------------------------------
 #include <cstdint>
@@ -248,8 +249,8 @@ int main() {
                 "split: give_author_bp changed -> BAN before RandomX");
     }
 
-    // ---- side_data_v3 that does not encode: Undefined; a miner tx committing a
-    // zero mm_root -> BAN before RandomX ----
+    // ---- side_data_v3 that does not encode: NodeInternal; a miner tx committing a
+    // zero mm_root -> local alarm + DEFER before RandomX ----
     auto zero_mm_tx_hash = [&](const pb::ReceiptBodyV3& b, const pb::Window& win) {
         std::vector<pb::MinerPayee> payees;
         if (win.weight.empty()) {
@@ -267,13 +268,14 @@ int main() {
         bad.reward_total = R;
         bad.side.owner = seq32(0x21);  // owner identity with fee_rate_bp 0
         check(!pb::mm_root_of(bad.side).has_value(), "owner with fee_rate_bp 0: side_data_v3 does not encode");
-        check(check12(bad, wk, 16) == pb::CoinbaseCheck::Undefined, "split: side_data_v3 does not encode -> Undefined");
+        check(check12(bad, wk, 16) == pb::CoinbaseCheck::NodeInternal,
+              "split: side_data_v3 does not encode -> NodeInternal");
         bad.blob.tree_root = pb::tree_root_fold(zero_mm_tx_hash(bad, wk), std::span<const pb::Hash32>(bad.branch));
         bool rx = false;
         const pb::TailResult t =
                 pb::admit_coinbase_then_randomx(check12(bad, wk, 16), [&] { rx = true; return true; });
-        check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
-              "split: side_data_v3 does not encode -> BAN before RandomX");
+        check(t.verdict == pb::AdmitVerdict::Defer && t.alarm && !t.randomx_called && !rx,
+              "split: side_data_v3 does not encode -> local alarm + DEFER before RandomX");
     }
 
     // ---- finder-only path (empty window): one output of R with mm_root_of(side_data_v3) ----
@@ -296,13 +298,13 @@ int main() {
             pb::ReceiptBodyV3 bad = f;
             bad.side.fee_rate_bp = 0;  // owner identity with fee_rate_bp 0
             check(!pb::mm_root_of(bad.side).has_value(), "finder-only: side_data_v3 does not encode");
-            check(check12(bad, wf, 16) == pb::CoinbaseCheck::Undefined, "finder-only: Undefined");
+            check(check12(bad, wf, 16) == pb::CoinbaseCheck::NodeInternal, "finder-only: NodeInternal");
             bad.blob.tree_root = pb::tree_root_fold(zero_mm_tx_hash(bad, wf), std::span<const pb::Hash32>(bad.branch));
             bool rx = false;
             const pb::TailResult t =
                     pb::admit_coinbase_then_randomx(check12(bad, wf, 16), [&] { rx = true; return true; });
-            check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx,
-                  "finder-only: side_data_v3 does not encode -> BAN before RandomX");
+            check(t.verdict == pb::AdmitVerdict::Defer && t.alarm && !t.randomx_called && !rx,
+                  "finder-only: side_data_v3 does not encode -> local alarm + DEFER before RandomX");
         }
     }
 
@@ -509,7 +511,7 @@ int main() {
 
         // (d) a window holding an entry with p + give_author_bp > 10000: its weights
         // do not sum to W, split() has no outputs, and no receipt on it has a
-        // canonical coinbase (Undefined, BAN).
+        // canonical coinbase (NodeInternal: local alarm + DEFER).
         {
             pb::ReceiptBodyV3 u = make_body(3, true, 0x60);
             u.side.fee_rate_bp = 10000;
@@ -522,10 +524,11 @@ int main() {
             check(!(weights_sum(w_bad) == w_bad.W), "undefined entry: window weights != W");
             check(pb::split(R, w_bad).empty(), "undefined entry: split has no outputs");
             pb::ReceiptBodyV3 h = make_body(3, false, 0x70);
-            check(check12(h, w_bad, 16) == pb::CoinbaseCheck::Undefined, "undefined window: Undefined");
+            check(check12(h, w_bad, 16) == pb::CoinbaseCheck::NodeInternal, "undefined window: NodeInternal");
             commit_hash(h, pb::Hash32{});
-            check(ban_before_randomx(admit(h, w_bad, 16)),
-                  "undefined window, tree_root from the zero leaf -> BAN before RandomX");
+            const Verdict vu = admit(h, w_bad, 16);
+            check(vu.v == pb::AdmitVerdict::Defer && !vu.rx,
+                  "undefined window, tree_root from the zero leaf -> DEFER (node-internal) before RandomX");
         }
     }
 

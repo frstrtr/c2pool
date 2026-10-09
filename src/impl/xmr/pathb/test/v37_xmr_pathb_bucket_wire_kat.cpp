@@ -30,25 +30,47 @@
 //           an ancestor of the tip served; a prefix up to the first bin
 //           without its references; a joiner's prefix MMR serves only leaves
 //           after its prefix; the per-peer budget (in flight, bytes per minute).
+//   refuse  refuse() resets the server's pending S: a server refused after an
+//           accepted frame is struck once and none of its S is adopted.
+//   P-48    a request over 2,000 bins at max_bytes = one frame: a prefix of
+//           whole bins within max_bytes (the next bin would pass it); a first
+//           bin above max_bytes -> n = 0; the receiver asks on from the next
+//           bin at another server and assembles the uncapped run's bins;
+//           bin_hi = 2^64 - 1 at max_bytes = one frame: the same prefix, the
+//           bins proved and read = the bins served + 1;
+//           BucketServeBudget::remaining = P-42 minus the minute's bytes.
+//   rule    a ClaimView double: leaf_servable false for a bin -> the prefix
+//           stops before it (n = 0 when it is first); at_servable false -> n = 0;
+//           the requester strikes nobody; a double answering as a full node
+//           and claims == nullptr serve the same bytes; an `at` held only as
+//           an unbound HeaderIndex variant -> n = 0.
+//   forged  a self-consistent forged 3-leaf MMR against chain A's anchor -> Peaks.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <exception>
 #include <stdexcept>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_bin_store.hpp"
 #include "impl/xmr/pathb/pathb_bucket_wire.hpp"
 #include "impl/xmr/pathb/pathb_buckets.hpp"
+#include "impl/xmr/pathb/pathb_claim_view.hpp"
+#include "impl/xmr/pathb/pathb_header_index.hpp"
 #include "impl/xmr/pathb/pathb_lane_rules.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
+
+// A request with no P-48 cap (a KAT parameter).
+constexpr std::uint64_t kNoServeCap = UINT64_MAX;
 
 namespace {
 
@@ -288,7 +310,7 @@ void codec_vectors() {
     // FC_BUCKETS from the FR-B1 chain
     ChainA a;
     const pb::GetBuckets req{kChain, cid(0x40, 4), kB0, kB0 + 2};
-    const std::vector<std::vector<std::uint8_t>> fr = pb::serve_buckets(a.s, req, kS, kFrame);
+    const std::vector<std::vector<std::uint8_t>> fr = pb::serve_buckets(a.s, req, kS, kFrame, kNoServeCap);
     check(a.ok && fr.size() == 1, "FR-B1 chain: one FC_BUCKETS frame");
     const std::vector<std::uint8_t>& f = fr.at(0);
     const pb::BucketsReply r = dec(f);
@@ -372,7 +394,7 @@ void honest_vectors() {
     ChainA a;
     const pb::Hash32 at = cid(0x40, 4);
     const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
-    const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame).at(0);
+    const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame, kNoServeCap).at(0);
     pb::BucketsAssembly as(req, kB0, F, kFrame);
     const pb::FrameOutcome o = as.add_frame(kServerA, f, anchor_of(a.s, at));
     check(o.verdict == pb::FrameVerdict::Accepted && o.strike == 0 && o.bins_completed == 3 && as.complete(),
@@ -418,10 +440,10 @@ void honest_vectors() {
         check(refused(one(req, enc(y), a4), pb::BucketsFault::LeafCount),
               "a reply at leaf_count(at) = 4 (peaks and proofs of 4 leaves) -> LeafCount");
         const pb::GetBuckets own{kChain, at, kB0 + 3, kB0 + 3};
-        check(pb::serve_buckets(a.s, own, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, at),
+        check(pb::serve_buckets(a.s, own, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, at),
               "the bin sealed at at itself is not served at at (n = 0)");
         const pb::GetBuckets next{kChain, cid(0x40, 0), kB0, kB0};
-        check(pb::serve_buckets(a.s, next, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, next.at),
+        check(pb::serve_buckets(a.s, next, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, next.at),
               "the genesis carrier commits no leaf: n = 0");
     }
 
@@ -460,7 +482,7 @@ void lying_vectors() {
     ChainA a;
     const pb::Hash32 at = cid(0x40, 4);
     const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
-    const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame).at(0);
+    const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame, kNoServeCap).at(0);
     const pb::BucketsAnchor an = anchor_of(a.s, at);
     const pb::BucketsReply r = dec(f);
 
@@ -479,7 +501,7 @@ void lying_vectors() {
         check(refused(one(req, enc(x), an), pb::BucketsFault::LeafIndex), "a bin skipped (b0, b0 + 2) -> LeafIndex");
         ChainR c;
         const pb::GetBuckets rq{kChain, cid(0x50, 4), kB0, kB0};
-        pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame).at(0));
+        pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap).at(0));
         y.entries.at(0).rows.pop_back();
         y.entries.at(0).rows_total = 4;
         y.refs.erase(std::remove_if(y.refs.begin(), y.refs.end(),
@@ -519,7 +541,7 @@ void lying_vectors() {
         check(refused(one(req, enc(x), an), pb::BucketsFault::RefMissing), "no reference -> RefMissing");
         ChainR c;
         const pb::GetBuckets rq{kChain, cid(0x50, 4), kB0, kB0};
-        pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame).at(0));
+        pb::BucketsReply y = dec(pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap).at(0));
         check(y.refs.size() == 5, "chain R bin b0: 5 references");
         std::swap(y.refs.at(0), y.refs.at(1));
         check(refused(one(rq, enc(y), anchor_of(c.s, rq.at)), pb::BucketsFault::RefOrder),
@@ -538,7 +560,7 @@ void lying_vectors() {
         ax.extend();
         check(ax.ok && ax.s.head().leaf_count == 5, "chain A extended to 5 leaves (tip b0 + 100)");
         const pb::BucketsAnchor anx = anchor_of(ax.s, at);
-        pb::BucketsReply x = dec(pb::serve_buckets(ax.s, req, kS, kFrame).at(0));
+        pb::BucketsReply x = dec(pb::serve_buckets(ax.s, req, kS, kFrame, kNoServeCap).at(0));
         check(one(req, enc(x), anx).verdict == pb::FrameVerdict::Accepted && x.leaf_count == 3,
               "an ancestor of the tip is served at its own leaf_count (3)");
         pb::BucketsReply y = x;
@@ -605,7 +627,7 @@ void receiver_vectors() {
     ChainA a;
     const pb::Hash32 at = cid(0x40, 4);
     const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
-    const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame).at(0);
+    const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame, kNoServeCap).at(0);
     const pb::BucketsAnchor an = anchor_of(a.s, at);
 
     {
@@ -658,7 +680,7 @@ void receiver_vectors() {
     const pb::Hash32 rat = cid(0x50, 4);
     const pb::GetBuckets rq{kChain, rat, kB0, kB0 + 1};
     const pb::BucketsAnchor ran = anchor_of(c.s, rat);
-    const std::vector<std::vector<std::uint8_t>> pages = pb::serve_buckets(c.s, rq, kS, 900);
+    const std::vector<std::vector<std::uint8_t>> pages = pb::serve_buckets(c.s, rq, kS, 900, kNoServeCap);
     bool within = true;
     for (const auto& p : pages) within = within && p.size() <= 900;
     std::vector<pb::BucketsReply> pr;
@@ -715,7 +737,7 @@ void receiver_vectors() {
     }
     {
         const pb::GetBuckets one_bin{kChain, rat, kB0, kB0};
-        pb::BucketsReply x = dec(pb::serve_buckets(c.s, one_bin, kS, kFrame).at(0));
+        pb::BucketsReply x = dec(pb::serve_buckets(c.s, one_bin, kS, kFrame, kNoServeCap).at(0));
         pb::BucketsReply y = x;
         y.entries.at(0).rows_total = 4;
         check(refused(one(one_bin, enc(y), ran), pb::BucketsFault::PageRange), "5 rows sent with rows_total 4 -> PageRange");
@@ -731,7 +753,7 @@ void receiver_vectors() {
         const std::uint64_t smallest = 187 + 32 + 107 + 32 + 160 + 2 * 66;
         for (std::uint64_t lim : {smallest, smallest + 1, std::uint64_t{700}, std::uint64_t{1000},
                                   std::uint64_t{1500}, std::uint64_t{2500}, kFrame}) {
-            const std::vector<std::vector<std::uint8_t>> ps = pb::serve_buckets(c.s, rq, kS, lim);
+            const std::vector<std::vector<std::uint8_t>> ps = pb::serve_buckets(c.s, rq, kS, lim, kNoServeCap);
             pb::BucketsAssembly as(rq, kB0, F, lim);
             for (const auto& p : ps) {
                 all = all && p.size() <= lim;
@@ -739,7 +761,7 @@ void receiver_vectors() {
             }
             all = all && as.complete();
         }
-        const std::vector<std::vector<std::uint8_t>> tiny = pb::serve_buckets(c.s, rq, kS, smallest - 1);
+        const std::vector<std::vector<std::uint8_t>> tiny = pb::serve_buckets(c.s, rq, kS, smallest - 1, kNoServeCap);
         check(all && tiny.size() == 1 && tiny[0].size() == 187, "every frame within the buffer at 7 buffers; below "
                                                                  "the smallest the server answers n = 0");
     }
@@ -753,35 +775,35 @@ void serving_vectors() {
     // a side carrier at the same height as c4 (not the best chain)
     check(step(a.s, cid(0x41, 4), cid(0x40, 3), kB0 + 99, {}, false), "a side carrier beside c4");
     const pb::GetBuckets side{kChain, cid(0x41, 4), kB0, kB0 + 2};
-    const std::vector<std::vector<std::uint8_t>> sf = pb::serve_buckets(a.s, side, kS, kFrame);
+    const std::vector<std::vector<std::uint8_t>> sf = pb::serve_buckets(a.s, side, kS, kFrame, kNoServeCap);
     check(sf.size() == 1 && sf[0] == pb::encode_buckets_not_served(kChain, side.at),
           "at off the server's best chain -> n = 0, leaf_count 0");
     const pb::FrameOutcome so = one(side, sf[0], anchor_of(a.s, side.at));
     check(so.verdict == pb::FrameVerdict::NotServed && so.strike == 0, "the n = 0 reply: no strike");
     const pb::GetBuckets unknown{kChain, seq32(0x77), kB0, kB0 + 2};
-    check(pb::serve_buckets(a.s, unknown, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, unknown.at),
+    check(pb::serve_buckets(a.s, unknown, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, unknown.at),
           "at unknown to the server -> n = 0");
     const pb::GetBuckets best{kChain, cid(0x40, 4), kB0, kB0 + 2};
-    check(pb::serve_buckets(a.s, best, std::nullopt, kFrame).at(0) == pb::encode_buckets_not_served(kChain, best.at),
+    check(pb::serve_buckets(a.s, best, std::nullopt, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, best.at),
           "S at at's parent not held -> n = 0");
     const pb::GetBuckets below{kChain, cid(0x40, 4), kB0 - 2, kB0};
-    check(pb::serve_buckets(a.s, below, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, below.at),
+    check(pb::serve_buckets(a.s, below, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, below.at),
           "a range starting below b0 -> n = 0");
     const pb::GetBuckets beyond{kChain, cid(0x40, 4), kB0 + 3, kB0 + 9};
-    check(pb::serve_buckets(a.s, beyond, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, beyond.at),
+    check(pb::serve_buckets(a.s, beyond, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, beyond.at),
           "a range above leaf_count(tip(at)) -> n = 0");
 
     // a bin whose identity has no reference ends the served prefix
     ChainR q(false);
     const pb::Hash32 qat = cid(0x50, 4);
     const pb::GetBuckets qq{kChain, qat, kB0, kB0 + 1};
-    const std::vector<std::vector<std::uint8_t>> qf = pb::serve_buckets(q.s, qq, kS, kFrame);
+    const std::vector<std::vector<std::uint8_t>> qf = pb::serve_buckets(q.s, qq, kS, kFrame, kNoServeCap);
     pb::BucketsAssembly qa(qq, kB0, F, kFrame);
     const pb::FrameOutcome qo = qa.add_frame(kServerA, qf.at(0), anchor_of(q.s, qat));
     check(q.ok && qf.size() == 1 && qo.verdict == pb::FrameVerdict::Accepted && qa.complete_through() == kB0 + 1,
           "a bin without a reference for an identity is not served: the prefix ends before it");
     const pb::GetBuckets qq1{kChain, qat, kB0 + 1, kB0 + 1};
-    check(pb::serve_buckets(q.s, qq1, kS, kFrame).at(0) == pb::encode_buckets_not_served(kChain, qat),
+    check(pb::serve_buckets(q.s, qq1, kS, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, qat),
           "... and alone it is not served");
 
     // a joiner's prefix MMR (from the peaks of 3 leaves) serves only the leaves appended after it;
@@ -799,11 +821,11 @@ void serving_vectors() {
     src.bucket = [&tip](std::uint64_t bin) { return tip.bucket(bin); };
     src.s_parent = kS;
     const pb::GetBuckets j1{kChain, ax.s.best_tip(), kB0 + 2, kB0 + 3};
-    check(pb::serve_buckets_from(src, j1, kFrame).at(0) == pb::encode_buckets_not_served(kChain, j1.at),
+    check(pb::serve_buckets_from(src, j1, kFrame, kNoServeCap).at(0) == pb::encode_buckets_not_served(kChain, j1.at),
           "a prefix MMR of 3 leaves does not serve leaf 2");
     const pb::GetBuckets j2{kChain, ax.s.best_tip(), kB0 + 3, kB0 + 3};
     pb::BucketsAssembly ja(j2, kB0, F, kFrame);
-    const pb::FrameOutcome jo = ja.add_frame(kServerA, pb::serve_buckets_from(src, j2, kFrame).at(0),
+    const pb::FrameOutcome jo = ja.add_frame(kServerA, pb::serve_buckets_from(src, j2, kFrame, kNoServeCap).at(0),
                                              anchor_of(ax.s, ax.s.best_tip()));
     check(jo.verdict == pb::FrameVerdict::Accepted && ja.complete(), "... and serves leaf 3");
 
@@ -836,14 +858,14 @@ void serving_vectors() {
         sa.tip_record = kB0 + F - 1 + 4;
         sa.mmr_root = m.root();
         pb::BucketsAssembly ss(sq, kB0, F, kFrame);
-        const pb::FrameOutcome so2 = ss.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame).at(0), sa);
+        const pb::FrameOutcome so2 = ss.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame, kNoServeCap).at(0), sa);
         check(so2.verdict == pb::FrameVerdict::Accepted && ss.complete_through() == kB0 + 2,
               "a held body whose leaf is not the MMR's is not served: the prefix ends before it");
         held[kB0 + 2].bucket = keyed_bin(kB0 + 2, {{ka, 18182}});
         held[kB0 + 2].leaf = pb::mmr_leaf_of(held[kB0 + 2].bucket);
         held.erase(kB0 + 1);  // a pruned body (P-38): the leaf stays provable
         pb::BucketsAssembly ps(sq, kB0, F, kFrame);
-        const pb::FrameOutcome po = ps.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame).at(0), sa);
+        const pb::FrameOutcome po = ps.add_frame(kServerA, pb::serve_buckets_from(st, sq, kFrame, kNoServeCap).at(0), sa);
         check(po.verdict == pb::FrameVerdict::Accepted && ps.complete_through() == kB0 + 1,
               "a bin whose rows are not held is not served: the prefix ends before it");
     }
@@ -863,6 +885,371 @@ void serving_vectors() {
     check(!a4 && a5 && a6 && bud.inflight(1) == 1, "P-42: 10 x P-39 bytes in a minute -> DROPPED until the minute rolls");
 }
 
+
+// ---------------------------------------------------------------------------
+// refuse() resets the server's pending S
+// ---------------------------------------------------------------------------
+void refuse_vectors() {
+    ChainA a;
+    const pb::Hash32 at = cid(0x40, 4);
+    const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
+    const std::vector<std::uint8_t> f = pb::serve_buckets(a.s, req, kS, kFrame, kNoServeCap).at(0);
+    const pb::BucketsAnchor an = anchor_of(a.s, at);
+    const pb::BucketsReply r = dec(f);
+    // a wrong S pending, then a refusal for another fault
+    {
+        pb::BucketsReply x = r;
+        x.entries.pop_back();  // bins b0, b0 + 1 only: the request stays open at b0 + 2
+        x.s_parent[5] ^= 1;
+        pb::BucketsAssembly as(req, kB0, F, kFrame);
+        const pb::FrameOutcome o1 = as.add_frame(kServerA, enc(x), an);
+        check(o1.verdict == pb::FrameVerdict::Accepted && o1.strike == 0 && as.s_pending(),
+              "refuse: A's frame with a wrong S accepted, S pending (at's carried ids not held)");
+        std::vector<std::uint8_t> bad = f;
+        bad[1] = 2;
+        const pb::FrameOutcome o2 = as.add_frame(kServerA, bad, an);
+        check(refused(o2, pb::BucketsFault::Wire) && !as.s_pending(),
+              "refuse: A then refused for another fault (one token); its pending S is reset");
+        const pb::SResolution sr = as.resolve_s(anchor_of(a.s, at, true));
+        check(!sr.pending && sr.struck.empty() && !sr.adopted,
+              "refuse: at's carried ids held: resolve_s strikes nobody (A holds its one token) and adopts nothing from A");
+    }
+    // an honest S pending, then a refusal: nothing adopted from the refused server
+    {
+        pb::BucketsReply x = r;
+        x.entries.pop_back();
+        pb::BucketsAssembly as(req, kB0, F, kFrame);
+        const pb::FrameOutcome o1 = as.add_frame(kServerA, enc(x), an);
+        std::vector<std::uint8_t> bad = f;
+        bad[0] = 0x54;
+        const pb::FrameOutcome o2 = as.add_frame(kServerA, bad, an);
+        const pb::SResolution sr = as.resolve_s(anchor_of(a.s, at, true));
+        check(o1.verdict == pb::FrameVerdict::Accepted && refused(o2, pb::BucketsFault::Wire) && !sr.pending &&
+                      sr.struck.empty() && !sr.adopted,
+              "refuse: a server refused after an accepted frame: its S is neither adopted nor struck again");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-48: the serve cap per request
+// ---------------------------------------------------------------------------
+// A hand-made server holding `n` sealed bins from b0 (rows_of(i) rows each).
+struct BigSource {
+    std::map<std::uint64_t, pb::SealedBin> held;
+    pb::BinMmr mmr;
+    pb::BucketsAnchor anchor;
+
+    pb::BucketServeSource src() const {
+        pb::BucketServeSource s;
+        s.b0 = kB0;
+        s.leaf_count = mmr.leaf_count();
+        s.mmr = &mmr;
+        s.bucket = [this](std::uint64_t bin) -> const pb::SealedBin* {
+            const auto it = held.find(bin);
+            return it == held.end() ? nullptr : &it->second;
+        };
+        s.s_parent = kS;
+        return s;
+    }
+};
+
+template <class RowsOf>
+BigSource big_source(std::uint64_t n, RowsOf&& rows_of) {
+    const std::vector<pb::XmrKeyRef> keys{ka, kb, kc, kd, ke, kf, ko, kz};
+    BigSource out;
+    for (std::uint64_t i = 0; i < n; ++i) {
+        const std::uint64_t k = rows_of(i);
+        std::vector<std::pair<pb::XmrKeyRef, std::uint64_t>> rows;
+        std::vector<pb::XmrKeyRef> refs;
+        for (std::uint64_t j = 0; j < k; ++j) {
+            const pb::XmrKeyRef& ref = keys[(i + j) % keys.size()];
+            rows.emplace_back(ref, 18180 + 7 * i + j);
+            refs.push_back(ref);
+        }
+        pb::SealedBin sb;
+        sb.bucket = keyed_bin(kB0 + i, rows);
+        sb.leaf = pb::mmr_leaf_of(sb.bucket);
+        sb.refs = sorted_refs(refs);
+        out.mmr.append(sb.leaf);
+        out.held.emplace(kB0 + i, std::move(sb));
+    }
+    out.anchor.header_held = true;
+    out.anchor.tip_record = kB0 + F - 1 + n;
+    out.anchor.mmr_root = out.mmr.root();
+    return out;
+}
+
+// The bins of a reply in order, each with the rows it carries; false when a
+// frame does not decode.
+struct ReplyBins {
+    bool ok = true;
+    std::uint64_t bytes = 0;
+    std::vector<std::uint64_t> bins;                  // in order of first appearance
+    std::map<std::uint64_t, std::uint64_t> rows;      // rows carried per bin
+    std::map<std::uint64_t, std::uint64_t> total;     // rows_total per bin
+    bool served() const { return !bins.empty(); }
+    // every bin of the reply carries all its rows (no bin cut inside)
+    bool whole() const {
+        for (std::uint64_t b : bins)
+            if (rows.at(b) != total.at(b)) return false;
+        return true;
+    }
+};
+
+ReplyBins reply_bins(const std::vector<std::vector<std::uint8_t>>& frames) {
+    ReplyBins out;
+    for (const std::vector<std::uint8_t>& f : frames) {
+        out.bytes += f.size();
+        pb::BucketsReply r;
+        if (pb::decode_buckets(f, kChain, r) != pb::BucketsWireError::None) {
+            out.ok = false;
+            return out;
+        }
+        for (const pb::BucketEntry& e : r.entries) {
+            const std::uint64_t b = e.payload.bin_lo;
+            if (out.rows.count(b) == 0) out.bins.push_back(b);
+            out.rows[b] += e.rows.size();
+            out.total[b] = e.rows_total;
+        }
+    }
+    return out;
+}
+
+bool contiguous_from(const ReplyBins& r, std::uint64_t lo) {
+    for (std::size_t i = 0; i < r.bins.size(); ++i)
+        if (r.bins[i] != lo + i) return false;
+    return true;
+}
+
+void p48_vectors() {
+    // 2,000 bins of 1-3 rows, frame_bytes = P-39, max_bytes = one frame
+    const std::uint64_t n = 2000;
+    const BigSource bs = big_source(n, [](std::uint64_t i) { return 1 + i % 3; });
+    const pb::BucketServeSource src = bs.src();
+    const pb::GetBuckets all{kChain, seq32(0x6b), kB0, kB0 + n - 1};
+    const std::vector<std::vector<std::uint8_t>> full = pb::serve_buckets_from(src, all, kFrame, kNoServeCap);
+    const ReplyBins fr = reply_bins(full);
+    check(fr.ok && fr.bins.size() == n && fr.whole() && full.size() > 1 && fr.bytes > kFrame,
+          "P-48: the uncapped reply over 2,000 bins spans " + std::to_string(full.size()) + " frames");
+    pb::BucketsAssembly ua(all, kB0, F, kFrame);
+    bool uacc = true;
+    for (const auto& f : full) uacc = uacc && ua.add_frame(kServerA, f, bs.anchor).verdict == pb::FrameVerdict::Accepted;
+    check(uacc && ua.complete(), "P-48: the uncapped run assembles every bin");
+
+    const std::vector<std::vector<std::uint8_t>> capped = pb::serve_buckets_from(src, all, kFrame, kFrame);
+    const ReplyBins cr = reply_bins(capped);
+    check(cr.ok && cr.served() && cr.bytes <= kFrame && cr.whole() && contiguous_from(cr, kB0) && cr.bins.size() < n,
+          "P-48: max_bytes = one frame -> a prefix of " + std::to_string(cr.bins.size()) +
+                  " whole bins from bin_lo, " + std::to_string(cr.bytes) + " B <= max_bytes");
+    {
+        // the prefix is the longest: one more bin passes max_bytes
+        const pb::GetBuckets more{kChain, all.at, kB0, kB0 + cr.bins.size()};
+        const ReplyBins mr = reply_bins(pb::serve_buckets_from(src, more, kFrame, kNoServeCap));
+        check(mr.ok && mr.bins.size() == cr.bins.size() + 1 && mr.bytes > kFrame,
+              "P-48: the bins through the next one pass max_bytes (the prefix stops before that bin)");
+    }
+    // the work stops with the bytes: bin_hi = 2^64 - 1 at max_bytes = one frame proves and reads the bins served + 1
+    {
+        std::uint64_t reads = 0;
+        pb::BucketServeSource counted = src;
+        counted.bucket = [&](std::uint64_t bin) -> const pb::SealedBin* {
+            ++reads;
+            return src.bucket(bin);
+        };
+        const pb::GetBuckets open_end{kChain, all.at, kB0, UINT64_MAX};
+        const ReplyBins orr = reply_bins(pb::serve_buckets_from(counted, open_end, kFrame, kFrame));
+        check(orr.ok && orr.bins == cr.bins && reads == cr.bins.size() + 1,
+              "P-48: bin_hi = 2^64 - 1 at max_bytes = one frame: the same prefix of " + std::to_string(orr.bins.size()) +
+                      " bins; bins proved and read " + std::to_string(reads) + " = the bins served + 1");
+        reads = 0;
+        const ReplyBins ur = reply_bins(pb::serve_buckets_from(counted, open_end, kFrame, kNoServeCap));
+        check(ur.ok && ur.bins.size() == n && reads == n, "P-48: uncapped, the same request reads every held bin once (" +
+                                                               std::to_string(reads) + ")");
+    }
+    // the receiver asks on from the next bin at another server; the bins equal the uncapped run's
+    {
+        std::map<std::uint64_t, pb::ServedBin> got;
+        std::uint64_t lo = kB0;
+        std::uint64_t server = kServerA;
+        std::uint32_t strikes = 0;
+        std::size_t requests = 0;
+        bool acc = true;
+        while (lo <= all.bin_hi && requests < 50) {
+            ++requests;
+            const pb::GetBuckets q{kChain, all.at, lo, all.bin_hi};
+            pb::BucketsAssembly as(q, kB0, F, kFrame);
+            for (const auto& f : pb::serve_buckets_from(src, q, kFrame, kFrame)) {
+                const pb::FrameOutcome o = as.add_frame(server, f, bs.anchor);
+                strikes += o.strike;
+                acc = acc && o.verdict == pb::FrameVerdict::Accepted;
+            }
+            for (const auto& [b, sb] : as.bins()) got.emplace(b, sb);
+            const std::uint64_t next = as.complete_through();
+            if (next == lo) break;
+            lo = next;
+            server = server == kServerA ? kServerB : kServerA;
+        }
+        bool same = got.size() == ua.bins().size();
+        for (const auto& [b, sb] : ua.bins()) {
+            const auto it = got.find(b);
+            same = same && it != got.end() && it->second.leaf == sb.leaf && it->second.refs == sb.refs &&
+                   it->second.bucket.rows.size() == sb.bucket.rows.size();
+        }
+        check(acc && strikes == 0 && same && requests > 1,
+              "P-48: asked on from the next bin at another server (" + std::to_string(requests) +
+                      " requests): the assembled bins equal the uncapped run's, no strike");
+    }
+
+    // bins that span frames: 5 rows each at 900 B per frame
+    {
+        const BigSource b5 = big_source(4, [](std::uint64_t) { return 5; });
+        const pb::BucketServeSource s5 = b5.src();
+        const pb::GetBuckets q{kChain, seq32(0x6c), kB0, kB0 + 3};
+        const std::vector<std::vector<std::uint8_t>> pages = pb::serve_buckets_from(s5, q, 900, kNoServeCap);
+        const ReplyBins pr = reply_bins(pages);
+        check(pr.ok && pr.bins.size() == 4 && pr.whole() && pages.size() >= 8,
+              "P-48: 4 bins of 5 rows at 900 B: " + std::to_string(pages.size()) + " frames uncapped");
+        const std::vector<std::vector<std::uint8_t>> one_frame = pb::serve_buckets_from(s5, q, 900, 900);
+        check(one_frame.size() == 1 && one_frame[0] == pb::encode_buckets_not_served(kChain, q.at),
+              "P-48: the first bin alone passes max_bytes (3 frames of 900 B) -> the not-served frame");
+        bool every = true;
+        std::size_t fewer = 0;
+        for (std::uint64_t cap = 900; cap <= pr.bytes + 900; cap += 150) {
+            const std::vector<std::vector<std::uint8_t>> c = pb::serve_buckets_from(s5, q, 900, cap);
+            const ReplyBins rb = reply_bins(c);
+            if (!rb.served()) {
+                every = every && c.size() == 1 && c[0] == pb::encode_buckets_not_served(kChain, q.at);
+                continue;
+            }
+            every = every && rb.ok && rb.bytes <= cap && rb.whole() && contiguous_from(rb, kB0);
+            if (rb.bins.size() < 4) ++fewer;
+            pb::BucketsAssembly as(q, kB0, F, 900);
+            for (const auto& f : c) every = every && as.add_frame(kServerA, f, b5.anchor).verdict == pb::FrameVerdict::Accepted;
+            every = every && as.complete_through() == kB0 + rb.bins.size();
+        }
+        check(every && fewer > 0,
+              "P-48: at every cap from 900 B: whole bins only (no bin split at the cap), within the cap, accepted");
+    }
+
+    // P-48's default: the peer's P-42 bytes left in the minute
+    {
+        const pb::BucketWirePolicy pol = *pb::bucket_wire_policy_default(16, pb::zone(16));
+        pb::BucketServeBudget bud(pol);
+        const std::uint64_t r0 = bud.remaining(1, 2000);
+        bud.sent(1, 1000000, 2000);
+        const std::uint64_t r1 = bud.remaining(1, 2010);
+        bud.sent(1, pol.bytes_per_minute, 2020);
+        const std::uint64_t r2 = bud.remaining(1, 2059);
+        const std::uint64_t r3 = bud.remaining(1, 2060);
+        const std::uint64_t r4 = bud.remaining(2, 2060);
+        check(r0 == 6000930 && r1 == 6000930 - 1000000 && r2 == 0 && r3 == 6000930 && r4 == 6000930,
+              "P-48 default: remaining = P-42 - the minute's bytes (6,000,930 -> 5,000,930 -> 0; the minute rolls)");
+        check(pb::kBucketServeCapFlag == "--pathb-bucket-serve-cap", "P-48 flag named");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The serve rule through the extension point
+// ---------------------------------------------------------------------------
+struct ServeDouble final : pb::ClaimView {
+    std::set<std::uint64_t> claimed_bins;  // leaves adopted from a served bucket (not servable)
+    bool any_at = true;                    // false: no at bound (a joiner before its first computed #9)
+    mutable std::uint64_t at_asks = 0;
+    mutable std::uint64_t leaf_asks = 0;
+    pb::Basis basis(pb::RowClass, const pb::Hash32&, std::uint64_t) const override { return pb::Basis::Computed; }
+    pb::Basis header_binding(const pb::Hash32&, const pb::Hash32&) const override { return pb::Basis::Computed; }
+    bool judge_copy(std::uint64_t, const pb::Hash32&) const override { return true; }
+    bool leaf_servable(std::uint64_t bin) const override {
+        ++leaf_asks;
+        return claimed_bins.count(bin) == 0;
+    }
+    bool at_servable(const pb::Hash32&, const pb::Hash32&) const override {
+        ++at_asks;
+        return any_at;
+    }
+    bool rests_on_claims() const override { return !claimed_bins.empty() || !any_at; }
+};
+
+void serve_rule_vectors() {
+    ChainR c;
+    const pb::Hash32 at = cid(0x50, 4);
+    const pb::GetBuckets rq{kChain, at, kB0, kB0 + 1};
+    const pb::BucketsAnchor an = anchor_of(c.s, at);
+    const std::vector<std::vector<std::uint8_t>> base = pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap);
+    {
+        ServeDouble full_node;  // answers as the null view
+        const std::vector<std::vector<std::uint8_t>> d = pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap, &full_node, at);
+        check(c.ok && d == base && full_node.at_asks == 1 && full_node.leaf_asks >= 2,
+              "serve rule: a double answering as a full node serves the bytes of claims == nullptr");
+    }
+    {
+        ServeDouble joined;
+        joined.claimed_bins = {kB0 + 1};
+        const std::vector<std::vector<std::uint8_t>> d = pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap, &joined, at);
+        const ReplyBins rb = reply_bins(d);
+        pb::BucketsAssembly as(rq, kB0, F, kFrame);
+        std::uint32_t strikes = 0;
+        bool acc = true;
+        for (const auto& f : d) {
+            const pb::FrameOutcome o = as.add_frame(kServerA, f, an);
+            strikes += o.strike;
+            acc = acc && o.verdict == pb::FrameVerdict::Accepted;
+        }
+        check(rb.ok && rb.bins == std::vector<std::uint64_t>{kB0} && acc && strikes == 0 &&
+                      as.complete_through() == kB0 + 1,
+              "serve rule: leaf_servable false for bin b0 + 1 -> the prefix stops before it; the full node strikes nobody");
+        ServeDouble first;
+        first.claimed_bins = {kB0};
+        const std::vector<std::vector<std::uint8_t>> d0 = pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap, &first, at);
+        const pb::FrameOutcome o0 = one(rq, d0.at(0), an);
+        check(d0.size() == 1 && d0[0] == pb::encode_buckets_not_served(kChain, at) &&
+                      o0.verdict == pb::FrameVerdict::NotServed && o0.strike == 0,
+              "serve rule: the claimed leaf first -> the not-served frame, no strike");
+    }
+    {
+        ServeDouble before;
+        before.any_at = false;
+        const std::vector<std::vector<std::uint8_t>> d = pb::serve_buckets(c.s, rq, kS, kFrame, kNoServeCap, &before, at);
+        const pb::FrameOutcome o = one(rq, d.at(0), an);
+        check(d.size() == 1 && d[0] == pb::encode_buckets_not_served(kChain, at) && o.verdict == pb::FrameVerdict::NotServed &&
+                      o.strike == 0 && before.leaf_asks == 0,
+              "serve rule: at_servable false (no at bound) -> the not-served frame before the store is read; no strike");
+    }
+    {
+        // an `at` held only as an unbound HeaderIndex variant
+        pb::HeaderIndex hi;
+        pb::CarrierHeader h;
+        h.own = make_body(0, false, 0x3c);
+        h.own.side.tip = at;
+        const pb::Hash32 vid = pb::receipt_id(h.own);
+        check(hi.add(kServerB, h, kB0 + 98) == pb::IndexAdd::Added && hi.variants(vid).size() == 1 &&
+                      !hi.bound_digest(vid),
+              "serve rule: the node holds a header variant of `at` unbound");
+        const pb::GetBuckets vq{kChain, vid, kB0, kB0 + 1};
+        const std::vector<std::vector<std::uint8_t>> d = pb::serve_buckets(c.s, vq, kS, kFrame, kNoServeCap);
+        check(d.size() == 1 && d[0] == pb::encode_buckets_not_served(kChain, vid),
+              "serve rule: buckets asked at an at held only as an unbound variant -> the not-served frame");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A forged MMR answered against a real anchor
+// ---------------------------------------------------------------------------
+void forged_mmr_vector() {
+    ChainA a;
+    const pb::Hash32 at = cid(0x40, 4);
+    const pb::GetBuckets req{kChain, at, kB0, kB0 + 2};
+    const pb::BucketsAnchor an = anchor_of(a.s, at);
+    const Forged g = forge({keyed_bin(kB0, {{ka, 18180}}), keyed_bin(kB0 + 1, {{ka, 18181}}),
+                            keyed_bin(kB0 + 2, {{ka, 18182}})});
+    const pb::BucketsReply x = reply_of(g, at, 0, 3, {ka});
+    check(a.ok && x.leaf_count == 3 && g.mmr.root() != an.mmr_root,
+          "forged MMR: a self-consistent 3-leaf MMR (leaf_count 3) other than chain A's");
+    pb::BucketsAssembly as(req, kB0, F, kFrame);
+    check(refused(as.add_frame(kServerA, enc(x), an), pb::BucketsFault::Peaks) && as.bins().empty(),
+          "forged MMR: answered against chain A's anchor -> Peaks, nothing adopted");
+}
+
 }  // namespace
 
 int main() {
@@ -871,5 +1258,9 @@ int main() {
     run_part("lying", lying_vectors);
     run_part("receiver", receiver_vectors);
     run_part("serving", serving_vectors);
+    run_part("refuse resets S", refuse_vectors);
+    run_part("P-48", p48_vectors);
+    run_part("serve rule", serve_rule_vectors);
+    run_part("forged MMR", forged_mmr_vector);
     return finish("v37_xmr_pathb_bucket_wire_kat");
 }

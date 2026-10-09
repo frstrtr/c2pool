@@ -315,6 +315,7 @@ inline AdmitVerdict admit_resolution(Resolve r) {
 struct TailResult {
     AdmitVerdict verdict = AdmitVerdict::Strike;
     bool randomx_called = false;  // observable: #15 runs only after #12 admits
+    bool alarm = false;           // a node-internal outcome: local alarm (with DEFER, no token)
 };
 
 // The outcome of the canonical coinbase check (S2.3 #12, C41):
@@ -325,25 +326,38 @@ struct TailResult {
 //                not held: DEFER (no verdict, no token), fetched
 //   Unbuildable  no canonical coinbase by rule (equal Ko at hf >= 17): REFUSE,
 //                no token, no ban
-//   Undefined    side_data_v3 does not encode, the window weights != W, or the
-//                payee identity does not match its reference: BAN
-enum class CoinbaseCheck : std::uint8_t { Match, Mismatch, Fused, Defer, Unbuildable, Undefined };
+//   IdentityGuard the payee identity does not match its reference (ID-1): BAN
+//   NodeInternal side_data_v3 does not encode, the window weights != W, the
+//                keys are not derivable or the assembly fails: local alarm +
+//                DEFER, no token (E-46); any value outside this list reads as
+//                NodeInternal
+enum class CoinbaseCheck : std::uint8_t { Match, Mismatch, Fused, Defer, Unbuildable, IdentityGuard, NodeInternal };
 
 // The admission tail: #12 (canonical coinbase) and #13 (window_root and
 // mmr_root == the node's own; part of the #12 prefix) strictly BEFORE #15
 // (RandomX). RandomX runs only after #12 is Match and #13 holds.
-template <class RandomXOk>
-inline TailResult admit_coinbase_roots_then_randomx(CoinbaseCheck coinbase, bool roots_ok, RandomXOk&& randomx_ok) {
+// The word of #12 / #13 before RandomX: AdmitCarrier = the rows pass (RandomX
+// may run); any other verdict stops the receipt, RandomX not called.
+inline TailResult coinbase_roots_word(CoinbaseCheck coinbase, bool roots_ok) noexcept {
     switch (coinbase) {
         case CoinbaseCheck::Match: break;
         case CoinbaseCheck::Fused:
         case CoinbaseCheck::Unbuildable: return {AdmitVerdict::Refuse, false};  // no token, no ban
         case CoinbaseCheck::Defer: return {AdmitVerdict::Defer, false};
         case CoinbaseCheck::Mismatch:
-        case CoinbaseCheck::Undefined: return {AdmitVerdict::Ban, false};  // #12 BAN; RandomX NOT called
+        case CoinbaseCheck::IdentityGuard: return {AdmitVerdict::Ban, false};  // #12 BAN; RandomX NOT called
+        case CoinbaseCheck::NodeInternal: return {AdmitVerdict::Defer, false, true};  // alarm + DEFER, no token
+        default: return {AdmitVerdict::Defer, false, true};  // fail closed: NodeInternal
     }
     if (!roots_ok) return {AdmitVerdict::Ban, false};  // #13 BAN; RandomX NOT called
-    const bool pow_ok = randomx_ok();                  // #15
+    return {AdmitVerdict::AdmitCarrier, false};
+}
+
+template <class RandomXOk>
+inline TailResult admit_coinbase_roots_then_randomx(CoinbaseCheck coinbase, bool roots_ok, RandomXOk&& randomx_ok) {
+    const TailResult w = coinbase_roots_word(coinbase, roots_ok);
+    if (w.verdict != AdmitVerdict::AdmitCarrier) return w;
+    const bool pow_ok = randomx_ok();  // #15
     return {pow_ok ? AdmitVerdict::AdmitCarrier : AdmitVerdict::Ban, true};
 }
 
