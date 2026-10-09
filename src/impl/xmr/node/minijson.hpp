@@ -33,6 +33,12 @@
 
 namespace c2pool::xmr::node::minijson {
 
+// Nesting bound applied by the parser itself. The stratum front-end passes its
+// own tight limit (max_json_depth); every other caller reads monerod reply
+// shapes and takes this default, which bounds nesting well above the deepest
+// real response and far below any recursion hazard.
+inline constexpr std::size_t kDefaultMaxDepth = 32;
+
 enum class Type { Null, Bool, Number, String, Array, Object };
 
 struct Value {
@@ -73,7 +79,8 @@ struct Value {
 // --- recursive-descent scanner ----------------------------------------------
 class Parser {
 public:
-    explicit Parser(const char* p, std::size_t n) : s_(p), e_(p + n) {}
+    Parser(const char* p, std::size_t n, std::size_t max_depth)
+        : s_(p), e_(p + n), max_depth_(max_depth) {}
 
     bool parse(Value& out) {
         skip_ws();
@@ -85,6 +92,16 @@ public:
 private:
     const char* s_;
     const char* e_;
+    std::size_t max_depth_;
+    std::size_t depth_ = 0;
+
+    // Bumps the nesting counter on entry and restores it on every exit path, so
+    // object()/array() stay balanced however they return.
+    struct DepthGuard {
+        std::size_t& d;
+        explicit DepthGuard(std::size_t& dd) noexcept : d(dd) { ++d; }
+        ~DepthGuard() noexcept { --d; }
+    };
 
     void skip_ws() {
         while (s_ < e_ && (*s_ == ' ' || *s_ == '\t' || *s_ == '\n' || *s_ == '\r')) ++s_;
@@ -106,6 +123,8 @@ private:
     }
 
     bool object(Value& v) {
+        DepthGuard g(depth_);
+        if (depth_ > max_depth_) return false;   // fail closed on excess nesting
         v.type = Type::Object;
         ++s_; // '{'
         skip_ws();
@@ -130,6 +149,8 @@ private:
     }
 
     bool array(Value& v) {
+        DepthGuard g(depth_);
+        if (depth_ > max_depth_) return false;   // fail closed on excess nesting
         v.type = Type::Array;
         ++s_; // '['
         skip_ws();
@@ -164,17 +185,19 @@ private:
                     case 'r':  out.push_back('\r'); break;
                     case 'b':  out.push_back('\b'); break;
                     case 'f':  out.push_back('\f'); break;
-                    case 'u': { // minimal \uXXXX: keep the ASCII low byte; enough
-                                // for monerod (hex strings never contain \u anyway)
+                    case 'u': { // \uXXXX: require four hex digits, keep the ASCII
+                                // low byte (monerod hex strings never contain \u)
                         if (e_ - s_ < 4) return false;
                         auto hexval = [](char h) -> int {
                             if (h >= '0' && h <= '9') return h - '0';
                             if (h >= 'a' && h <= 'f') return h - 'a' + 10;
                             if (h >= 'A' && h <= 'F') return h - 'A' + 10;
-                            return 0;
+                            return -1;
                         };
-                        int cp = (hexval(s_[0]) << 12) | (hexval(s_[1]) << 8) |
-                                 (hexval(s_[2]) << 4) | hexval(s_[3]);
+                        const int h0 = hexval(s_[0]), h1 = hexval(s_[1]),
+                                  h2 = hexval(s_[2]), h3 = hexval(s_[3]);
+                        if ((h0 | h1 | h2 | h3) < 0) return false;   // not four hex digits
+                        const int cp = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
                         s_ += 4;
                         if (cp < 0x80) out.push_back(static_cast<char>(cp));
                         break;
@@ -214,11 +237,13 @@ private:
     }
 };
 
-inline bool parse(const char* p, std::size_t n, Value& out) {
-    Parser parser(p, n);
+inline bool parse(const char* p, std::size_t n, Value& out, std::size_t max_depth = kDefaultMaxDepth) {
+    Parser parser(p, n, max_depth);
     return parser.parse(out);
 }
-inline bool parse(const std::string& s, Value& out) { return parse(s.data(), s.size(), out); }
+inline bool parse(const std::string& s, Value& out, std::size_t max_depth = kDefaultMaxDepth) {
+    return parse(s.data(), s.size(), out, max_depth);
+}
 
 // --- hex helpers (monerod emits 32-byte ids/hashes as 64-char hex strings) ----
 inline bool hex_to_hash(const std::string& hex, std::array<std::uint8_t, 32>& out) {

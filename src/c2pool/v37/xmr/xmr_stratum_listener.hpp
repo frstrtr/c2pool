@@ -854,7 +854,7 @@ private:
             return;
         }
         mj::Value req;
-        if (!mj::parse(line, req) || !req.is_object()) {
+        if (!mj::parse(line, req, static_cast<std::size_t>(m_opts.max_json_depth)) || !req.is_object()) {
             m_stats.malformed.fetch_add(1, std::memory_order_relaxed);
             send_line(cid, strat::StratumDialect::build_error(0, "Malformed request"));
             close_client(cid, "malformed JSON");

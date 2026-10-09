@@ -525,6 +525,18 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_test_suspend_knob_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_test_suspend_knob_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_test_suspend_knob_kat COMMAND v37_xmr_test_suspend_knob_kat)
+    # v37_xmr_stratum_json_depth_kat (XMR-READ-BOUNDS, item 1): the stratum
+    # listener's JSON nesting bound and \u-escape validation, over a loopback
+    # socket, in a child process so a recursive-parser overflow is detected as a
+    # signalled child. Stub template/verifier/sink, no RandomX, no monerod.
+    # Listed in BOTH build.yml --target lists.
+    add_executable(v37_xmr_stratum_json_depth_kat
+        v37_xmr_stratum_json_depth_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_json_depth_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_json_depth_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_json_depth_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_json_depth_kat COMMAND v37_xmr_stratum_json_depth_kat)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
