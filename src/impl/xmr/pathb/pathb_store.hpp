@@ -77,6 +77,7 @@
 #include "pathb_pool_identity.hpp"
 #include "pathb_ratchet_activation.hpp"
 #include "pathb_ratchet_state.hpp"
+#include "pathb_relay_wire.hpp"          // read_carrier_header
 
 namespace c2pool::xmr::pathb {
 
@@ -431,15 +432,18 @@ inline LaneBatch switch_batch(std::uint32_t chain, StoreHead& head, const Carrie
 // an EMPTY store, its poison mark deleted with it): the adopted state at its
 // tip L. The lane records from the MMR's first leaf on; K_PCARRIER of every
 // position the store holds: the claimed prefix [first_pos, root_pos) as
-// header records without S, the root (x0 - 1, or position 0 of a young chain)
-// with its S, the span with its bodies and placements; every AR row; K_PHEAD
+// header records without S (their header bytes from `prefix`, served to later
+// joiners), the root (x0 - 1, or position 0 of a young chain) with its S (and
+// its header bytes when its body is not held), the span with its bodies and
+// placements; every AR row; K_PHEAD
 // with the store base: base_pos = L, base_leaf_count = first_leaf() =
 // lc(H(x0 - 1)) and base_peaks its peaks (0 and none on a young chain),
 // S_base = S_L. nullopt: a position the store names that the tree does not
 // hold.
 inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree,
                                                const BinStore& store, const CarrierBodies& bodies,
-                                               const ActivationRecord& ar, std::uint64_t root_pos) {
+                                               const ActivationRecord& ar, std::uint64_t root_pos,
+                                               const std::map<std::uint64_t, CarrierHeader>* prefix = nullptr) {
     LaneBatch b;
     store.write_all(b);
     // the open-bin placements by carrier (a position below the journal holds no delta)
@@ -471,6 +475,12 @@ inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& h
             c.bytes.clear();
             c.placements.clear();
         }
+        if (x <= root_pos && body == nullptr && prefix != nullptr)  // the claimed prefix's header kept (served)
+            if (const auto it = prefix->find(x); it != prefix->end() && receipt_id(it->second.own) == c.id)
+                if (const std::optional<std::vector<std::uint8_t>> hb = header_bytes(it->second)) {
+                    c.kind = RecordBody::Header;
+                    c.bytes = *hb;
+                }
         if (x > first)
             if (const std::optional<Hash32> below = store.best_at(x - 1)) c.parent = *below;
         put_position(b, chain, c, std::nullopt);
@@ -558,6 +568,7 @@ struct LoadedState {
     std::uint64_t q0 = 0;
     std::uint64_t phase1_from = 0;
     std::map<Hash32, XmrKeyRef> refs;  // the key references the restored placements and buckets hold, by identity
+    std::map<std::uint64_t, CarrierHeader> prefix_headers;  // a joined store's claimed prefix headers, by position
 };
 
 struct LoadResult {
@@ -865,7 +876,17 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     for (const std::optional<SealedBin>& sb : ll.bodies)
         if (sb)
             for (const XmrKeyRef& ref : sb->refs) refs[key_ref_identity(ref)] = ref;
-    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs)};
+    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}};
+    // a joined store's claimed prefix headers (header records at or below the root)
+    for (std::uint64_t x = H.first_pos; x <= std::min(H.root_pos, tip); ++x) {
+        const CarrierRecord& c = rec_at(x);
+        if (c.kind != RecordBody::Header) continue;
+        BlobReader r(c.bytes.data(), c.bytes.size());
+        CarrierHeader h;
+        if (read_carrier_header(r, p.r_max, h) != WireError::None || r.remaining() != 0 || receipt_id(h.own) != c.id)
+            return fail(StoreFault::Records, x);
+        st.prefix_headers[x] = std::move(h);
+    }
     out.state.emplace(std::move(st));
     out.fault = StoreFault::None;
     return out;

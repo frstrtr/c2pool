@@ -48,15 +48,19 @@
 //                     flooded), the status alarm, the poison mark the next
 //                     load reports
 //   join              the joiner (E15; 3.3, 3.3a): one Joiner, one
-//                     PathbJoinLink per accepted HELLO peer; A = the full
-//                     node's own chain (FullNodeA) or the adopted state;
-//                     candidates from a HELLO tail (no A; a joined node: a tip
-//                     it does not hold) and from a header or body switch that
-//                     takes the joiner path; run_join runs the next pair on
-//                     the join worker and applies an adoption or replacement
-//                     (the adoption batch into a cleared store); the E-72
-//                     re-ask after a switch by the journal at a joined node;
-//                     a load failure (LoadFailed) starts empty and joins
+//                     PathbJoinLink per accepted HELLO peer (alive to the end
+//                     of an attempt that uses it); A = the full node's own
+//                     chain (FullNodeA) or the adopted state; candidates from
+//                     a HELLO tail after a load failure, a HELLO tip a joined
+//                     node does not hold, and a header or body switch that
+//                     takes the joiner path (an empty store at position 0
+//                     catches up headers first); attempt_join (the join
+//                     worker: the E-72 re-ask's fetches, the next pair's
+//                     attempt) and apply_join (the owner executor: the
+//                     outcome, the adoption batch into a cleared store); a
+//                     load failure (LoadFailed) keeps the failed store
+//                     untouched until an adoption replaces it; a joined node
+//                     serves its claimed prefix headers
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -206,6 +210,20 @@ struct JoinStep {
     bool batch_written = false;  // the adoption batch committed into an empty store
     std::uint64_t reasked = 0;   // E-72: claimed leaves asked again at a carrier of the heavier chain
     bool reask_joiner = false;   // E-72: a re-asked leaf differed: the joiner path
+};
+
+// The join worker's half of a step (PathbNode::attempt_join): the E-72
+// re-ask's served leaves and the next pair's attempt; apply_join applies them
+// on the owner executor.
+struct JoinAttempted {
+    struct Reasked {
+        std::uint64_t bin = 0;
+        AtHeader at{};
+        Hash32 leaf{};
+        std::uint64_t server = 0;
+    };
+    std::vector<Reasked> reask;
+    std::optional<Joiner::Attempted> attempt;
 };
 
 enum class TemplateStatus : std::uint8_t {
@@ -364,7 +382,21 @@ class PathbNode {
 public:
     // An empty store: position 0 = (pool_id, H + 1); the store written from
     // its genesis batch when `kv` is given.
-    PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, PathbKv* kv = nullptr)
+    PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, PathbKv* kv = nullptr) : PathbNode(cfg, std::move(io), kv, true) {}
+
+    // A start after a load failure (E-38, the joiner path): the node starts at
+    // position 0 in memory and rests on claims (no template, nothing relayed)
+    // until an attempt is adopted; every Path B HELLO tail is a candidate. The
+    // failed store is kept as it is (nothing written) until the adoption batch
+    // replaces it, so a restart before that is a load failure again.
+    struct LoadFailed {};
+    PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, PathbKv* kv, LoadFailed) : PathbNode(cfg, std::move(io), kv, false) {
+        load_failed_ = true;
+        refresh_own_chain();
+    }
+
+private:
+    PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, PathbKv* kv, bool write_genesis)
         : cfg_(cfg),
           io_(std::move(io)),
           own_tree_(std::in_place, cfg.p, cfg.identity.pool_id, cfg.identity.height + 1, cfg.T,
@@ -380,7 +412,7 @@ public:
           started_empty_(true) {
         point_own();
         head_ = head_of(cfg);
-        if (kv_ != nullptr) {
+        if (kv_ != nullptr && write_genesis) {
             // into an empty store: every key of the store's prefixes deleted in the same batch
             LaneBatch b;
             const bool cleared = clear_store_batch(*kv_, cfg_.record_chain, b);
@@ -391,16 +423,7 @@ public:
         init_join();
     }
 
-    // A start after a load failure (E-38, the joiner path): the store is
-    // started empty (position 0, its prefixes cleared) and the node rests on
-    // claims (no template, nothing relayed) until an attempt is adopted; every
-    // Path B HELLO tail is a candidate.
-    struct LoadFailed {};
-    PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, PathbKv* kv, LoadFailed) : PathbNode(cfg, std::move(io), kv) {
-        load_failed_ = true;
-        refresh_own_chain();
-    }
-
+public:
     // A node from its loaded store (pathb_load); a load failure is the caller's
     // joiner path.
     PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, LoadedState loaded, PathbKv* kv)
@@ -420,6 +443,7 @@ public:
         point_own();
         head_ = loaded.head;
         *refs_ = std::move(loaded.refs);
+        own_prefix_ = std::move(loaded.prefix_headers);
         init_join();
     }
 
@@ -451,36 +475,52 @@ public:
         const auto it = links_.find(peer);
         return it == links_.end() ? nullptr : it->second.get();
     }
-    // 3.3a (2): the state rests on claims: no adopted state after a load failure, or the adopted state still
-    // replayed to its L (no template, nothing relayed).
     // An attempt runs (3.3a: A keeps building templates, relaying and judging meanwhile).
     bool attempting() const noexcept { return attempting_; }
+    // 3.3a (2): the state rests on claims: no adopted state after a load failure, or the adopted state still
+    // replayed to its L (no template, nothing relayed).
     bool rests_on_claims() const noexcept {
         if (joined_ != nullptr) return joined_->claims().rests_on_claims();
         return load_failed_;
     }
 
-    // One step of the joiner (run by the join worker; the adoption is applied
-    // here, which the caller runs on the owner executor): the E-72 re-ask of
-    // claimed leaves after a switch by the journal, then the next queued
-    // (candidate, server) pair. An adoption or a replacement makes the
-    // attempt's state the node's and writes it into an empty store.
-    JoinStep run_join() {
-        JoinStep out;
+    // One step of the joiner, in two halves (C-10). attempt_join runs on the
+    // join worker: the E-72 re-ask's FC_GETBUCKETS after a switch by the
+    // journal, then the next queued (candidate, server) pair's attempt, with
+    // the JoinLink waits; it reads A (the scope, A's profile in the step that
+    // records L) and changes nothing of the node. apply_join runs on the owner
+    // executor: the re-asked leaves rebound or the joiner path, the attempt's
+    // outcome (the queue; an adoption or a replacement makes the attempt's
+    // state the node's, written into the store in one batch). The links an
+    // attempt uses stay alive to its end; a server that disconnected meanwhile
+    // answers nothing and its pairs go when the attempt is applied.
+    JoinAttempted attempt_join() {
+        JoinAttempted out;
         if (poisoned_) return out;
-        if (reask_pending_ && joined_ != nullptr) reask_claimed(out);
+        std::vector<std::shared_ptr<PathbJoinLink>> held;  // kept alive to the end of this call
+        for (const auto& [peer, l] : links_) held.push_back(l);
         attempting_ = true;
-        out.report = joiner_->run_next();
+        if (reask_pending_ && joined_ != nullptr) reask_fetch(out);
+        out.attempt = joiner_->attempt_next();
         attempting_ = false;
-        for (auto& [peer, l] : links_) l->reset();  // what an attempt received is its own
-        if (!out.report) return out;
-        out.sw = joiner_->last_switch();
-        if (out.sw.adopted || out.sw.replaced) {
-            out.switched = true;
-            out.batch_written = adopt();
-        }
+        for (const std::shared_ptr<PathbJoinLink>& l : held) l->reset();  // what an attempt received is its own
         return out;
     }
+    JoinStep apply_join(JoinAttempted&& t) {
+        JoinStep out;
+        if (poisoned_) return out;
+        reask_apply(t, out);
+        if (t.attempt) {
+            out.report = joiner_->apply(std::move(*t.attempt));
+            out.sw = joiner_->last_switch();
+        }
+        for (const std::uint64_t peer : left_) joiner_->disconnect(peer);  // re-queued pairs of a gone server
+        left_.clear();
+        if (out.report && (out.sw.adopted || out.sw.replaced)) out.switched = adopt(out.batch_written);
+        return out;
+    }
+    // Both halves in one call (the KATs' single-threaded form).
+    JoinStep run_join() { return apply_join(attempt_join()); }
 
     // ---- HELLO (E10) ----
     PathbHello our_hello(std::uint64_t node_nonce, std::uint16_t listen_port) const {
@@ -523,14 +563,15 @@ public:
         if (c.verdict == HelloVerdict::Accept) {
             peers_[peer] = theirs.tail;
             if (transport_ != nullptr && links_.count(peer) == 0)
-                links_[peer] = std::make_unique<PathbJoinLink>(peer, *transport_, cfg_.identity.chain_id, cfg_.p,
-                                                               cfg_.buffers, frame_bytes_headers(), cfg_.bucket_policy);
-            // the candidates of a trigger: with no A (an empty store at position 0, a load failure) every tail;
-            // with a joined A a tip it does not hold (its fork may lie below what the node holds; the attempt's
-            // scope at the reply's L decides, 3.3a (4), ruling 46 S4wa-1 (b))
-            const bool no_a = joiner_->a() == nullptr;
+                links_[peer] = std::make_shared<PathbJoinLink>(peer, *transport_, cfg_.identity.chain_id, cfg_.p,
+                                                               cfg_.buffers, frame_bytes_headers(), window_);
+            // the candidates of a trigger: after a load failure (no A) every tail; with a joined A a tip it does not
+            // hold (its fork may lie below what the node holds; the attempt's scope at the reply's L decides, 3.3a
+            // (4), ruling 46 S4wa-1 (b)). An empty store at position 0 offers none: it catches up headers first
+            // (ruling 39 P-S4w-6; the joiner path for a tip beyond what peers retain is S4w-bc's, with the prune step)
+            const bool after_failure = load_failed_ && joiner_->a() == nullptr;
             const bool unheld = tree_->find(theirs.tail.best_tip) == nullptr;
-            if (theirs.tail.best_tip != cfg_.identity.pool_id && (no_a || (joined_ != nullptr && unheld)))
+            if (theirs.tail.best_tip != cfg_.identity.pool_id && (after_failure || (joined_ != nullptr && unheld)))
                 offer(theirs.tail.best_tip, peer, theirs.tail.best_cum_work);
         }
         return c;
@@ -554,7 +595,11 @@ public:
         hold_.close(peer);  // one hold per connection
         hold_conns_.erase(peer);
         joiner_->disconnect(peer);  // the peer's P-52 pairs
-        links_.erase(peer);
+        if (const auto it = links_.find(peer); it != links_.end()) {
+            it->second->close();  // an attempt or a re-ask using it holds it to its end; its requests have no reply
+            links_.erase(it);
+        }
+        if (attempting_) left_.insert(peer);  // its pairs dropped again once the attempt is applied
         for (auto* keys : {&closed_, &abandoned_})
             for (auto it = keys->begin(); it != keys->end();) {
                 if (it->first == peer)
@@ -1243,6 +1288,7 @@ private:
         keys_ = &own_keys_;
         refs_ = &own_refs_;
         claims_ = nullptr;
+        prefix_ = &own_prefix_;
     }
     static ::xmr::coin::Hash256 to_coin(const Hash32& h) {
         ::xmr::coin::Hash256 o;
@@ -1272,6 +1318,9 @@ private:
     void send(std::uint64_t peer, const std::vector<std::uint8_t>& f) {
         if (io_.send) io_.send(peer, f);
     }
+    // The store the node writes: none after a load failure until the adoption batch replaces the failed store.
+    PathbKv* store_kv() const noexcept { return load_failed_ ? nullptr : kv_; }
+
     void flood(const std::vector<std::uint8_t>& f, std::optional<std::uint64_t> except) {
         if (io_.flood) io_.flood(f, except);
     }
@@ -1382,7 +1431,7 @@ private:
         if (poisoned_) return;
         poisoned_ = true;
         alarm_.raise(RowId::None, Basis::Computed, at, Missing::NodeInternal);
-        if (kv_ != nullptr) (void)commit_lane_batch(*kv_, poison_batch(cfg_.record_chain));
+        if (PathbKv* kv = store_kv()) (void)commit_lane_batch(*kv, poison_batch(cfg_.record_chain));
     }
 
     // An upper bound of the headers one FC_HEADERS frame holds (each header holds
@@ -1395,9 +1444,36 @@ private:
     // A join attempt's page: the headers ending at x = stop (zero: the best
     // tip), chosen from x down while they are bound here and fit one frame, at
     // most max, never position 0; first_pos = pos(x) - n + 1 (n = 0: 0).
+    // The prefix headers ending at position p (linked down by their tips), at most max and one frame.
+    HeadersReply prefix_page(std::uint64_t p, std::uint64_t max) const {
+        HeadersReply r{cfg_.identity.chain_id, 0, {}};
+        const std::uint64_t fb = frame_bytes_headers();
+        const std::uint64_t room = fb > kHeadersFrameHeadBytes ? fb - kHeadersFrameHeadBytes : 0;
+        std::uint64_t bytes = 0;
+        std::vector<CarrierHeader> page;  // newest first
+        Hash32 want{};
+        for (std::uint64_t x = p; x >= 1 && page.size() < max; --x) {
+            const auto it = prefix_->find(x);
+            if (it == prefix_->end() || (!page.empty() && receipt_id(it->second.own) != want)) break;
+            const std::optional<std::vector<std::uint8_t>> hb = header_bytes(it->second);
+            if (!hb || bytes + hb->size() > room) break;
+            bytes += hb->size();
+            page.push_back(it->second);
+            want = it->second.own.side.tip;
+        }
+        if (page.empty()) return r;
+        r.first_pos = p - page.size() + 1;
+        r.headers.assign(page.rbegin(), page.rend());
+        return r;
+    }
+
     HeadersReply joiner_page(const Hash32& stop, std::uint64_t max) const {
         HeadersReply r{cfg_.identity.chain_id, 0, {}};
         const Hash32 x = stop == Hash32{} ? tree_->best().id : stop;
+        // a stop below the joined tree's lowest node: the prefix headers from it down
+        if (tree_->find(x) == nullptr && prefix_ != nullptr)
+            for (auto it = prefix_->rbegin(); it != prefix_->rend(); ++it)
+                if (receipt_id(it->second.own) == x) return prefix_page(it->first, max);
         std::vector<CarrierHeader> above;  // x's bound variants above the placed carriers, newest first
         Hash32 y = x;
         for (std::size_t guard = 0; tree_->find(y) == nullptr; ++guard) {
@@ -1427,9 +1503,34 @@ private:
                 more = false;
                 break;
             }
-        for (const CarrierNode* c = n; more && c != nullptr && c->pos > 0; c = tree_->find(c->parent)) {
+        // down the placed chain: a carrier's header from its body, a claimed prefix node's from the prefix headers
+        // (a joined node), then the prefix headers below its lowest node (E-102's header floor)
+        Hash32 want{};
+        std::uint64_t pos = 0;
+        for (const CarrierNode* c = n; more && c != nullptr && c->pos > 0;) {
             const CarrierBodyV3* b = bodies_->get(c->id);
-            if (b == nullptr || !take(header_of(*b))) break;  // not held here, or the frame is full
+            const CarrierHeader* ph = nullptr;
+            if (b == nullptr && prefix_ != nullptr)
+                if (const auto it = prefix_->find(c->pos); it != prefix_->end() && receipt_id(it->second.own) == c->id)
+                    ph = &it->second;
+            if (b == nullptr && ph == nullptr) {
+                more = false;  // not held here
+                break;
+            }
+            const CarrierHeader hdr = b != nullptr ? header_of(*b) : *ph;
+            if (!take(hdr)) {
+                more = false;  // the frame is full
+                break;
+            }
+            want = hdr.own.side.tip;  // the header's own parent link
+            pos = c->pos;
+            const CarrierNode* below = tree_->find(want);
+            c = below != nullptr && below->pos + 1 == pos ? below : nullptr;  // a joined tree's root has no node below
+        }
+        for (; more && prefix_ != nullptr && pos > 1; --pos) {
+            const auto it = prefix_->find(pos - 1);
+            if (it == prefix_->end() || receipt_id(it->second.own) != want || !take(it->second)) break;
+            want = it->second.own.side.tip;
         }
         if (page.empty()) return r;
         r.first_pos = top - page.size() + 1;
@@ -1558,7 +1659,10 @@ private:
     void offer(const Hash32& candidate, std::uint64_t peer, const U128& claimed) {
         const auto it = links_.find(peer);
         if (it == links_.end()) return;
-        joiner_->offer(candidate, *it->second, claimed);
+        U128 work = claimed;
+        if (const auto pt = peers_.find(peer); pt != peers_.end() && pt->second.best_tip == candidate && work.lo == 0 && work.hi == 0)
+            work = pt->second.best_cum_work;  // the server's claimed work for its HELLO tip
+        joiner_->offer(candidate, *it->second, work);
     }
 
     // The at header (id and digest) of a carrier this node placed.
@@ -1572,10 +1676,12 @@ private:
     // pending set, parked frames and requests go (the joiner path re-pends
     // nothing); the adoption batch into an EMPTY store (the poison mark cleared
     // with it). False: the batch was not committed (the store poisoned).
-    bool adopt() {
+    bool adopt(bool& written) {
+        written = false;
         JoinedState* js = joiner_->adopted();
         if (js == nullptr || !js->tree || !js->store) return false;
         joined_ = js;
+        prefix_ = &js->prefix_headers;
         tree_ = &*js->tree;
         store_ = &*js->store;
         ar_ = &js->ar;
@@ -1586,6 +1692,16 @@ private:
         refs_ = &js->refs;
         claims_ = &js->claims();
         own_chain_.reset();
+        // the node's own state before the adoption is gone (a replaced own chain, or the empty start)
+        own_tree_.reset();
+        own_store_.reset();
+        own_ar_ = ActivationRecord{};
+        own_bodies_ = CarrierBodies{};
+        own_headers_ = HeaderIndex{};
+        own_windows_ = WindowCache{};
+        own_keys_ = KeyCache{};
+        own_refs_.clear();
+        own_prefix_.clear();
         pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
         header_req_.clear();
@@ -1600,13 +1716,14 @@ private:
         if (kv_ == nullptr) return true;
         LaneBatch b;
         const bool cleared = clear_store_batch(*kv_, cfg_.record_chain, b);
-        const std::optional<LaneBatch> ab =
-                adoption_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, *ar_, js->young ? 0 : js->x0 - 1);
+        const std::optional<LaneBatch> ab = adoption_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, *ar_,
+                                                           js->young ? 0 : js->x0 - 1, &js->prefix_headers);
         if (ab) b.ops.insert(b.ops.end(), ab->ops.begin(), ab->ops.end());
         if (!cleared || !ab || !commit_lane_batch(*kv_, b)) {
             poison(store_->best_tip());
-            return false;
+            return true;
         }
+        written = true;
         return true;
     }
 
@@ -1618,9 +1735,9 @@ private:
     // claimed one is kept, its claim now at that carrier; a different leaf:
     // the replay from the position before the bin's seal lies at or below x1,
     // so the joiner path (own_switch_path; reask_replay).
-    void reask_claimed(JoinStep& out) {
+    void reask_fetch(JoinAttempted& t) {
         reask_pending_ = false;
-        JoinedState& js = *joined_;
+        const JoinedState& js = *joined_;
         if (js.young || js.claimed.empty()) return;
         std::vector<AtHeader> bound;
         std::vector<std::pair<Hash32, std::uint64_t>> heavier;
@@ -1635,28 +1752,47 @@ private:
         }
         const std::vector<JoinBuckets::Reask> rs =
                 JoinBuckets::reask_scope(js.claimed, bound, mismatched_, heavier, store_->b0());
+        std::vector<std::shared_ptr<PathbJoinLink>> held;  // alive to the end of the re-ask
         std::vector<JoinLink*> peers;
-        for (auto& [peer, l] : links_) peers.push_back(l.get());
+        for (const auto& [peer, l] : links_) {
+            held.push_back(l);
+            peers.push_back(l.get());
+        }
         for (const JoinBuckets::Reask& r : rs) {
             const AtHeader at = at_header(r.at);
             std::optional<std::uint64_t> served_by;
             const BucketsFetch f = reask_jb_.fetch_any(peers, anchor_of(r.at), at, r.bin, r.bin, cfg_.abandon_timeout_s,
                                                        &served_by);
-            if (f.end != BucketsEnd::Complete) continue;
+            if (f.end != BucketsEnd::Complete || !served_by) continue;
             const auto it = f.bins.find(r.bin);
             if (it == f.bins.end()) continue;
+            t.reask.push_back(JoinAttempted::Reasked{r.bin, at, it->second.leaf, *served_by});
+        }
+    }
+    void reask_apply(const JoinAttempted& t, JoinStep& out) {
+        if (joined_ == nullptr) return;
+        JoinedState& js = *joined_;
+        for (const JoinAttempted::Reasked& r : t.reask) {
             ++out.reasked;
+            // the at carrier still bound on the best chain (else the next switch asks again)
+            const CarrierNode* an = tree_->find(r.at.id);
+            if (an == nullptr || store_->best_at(an->pos) != r.at.id) {
+                reask_pending_ = true;
+                continue;
+            }
             const std::optional<Hash32> held = store_->best_mmr().leaf(r.bin - store_->b0());
-            if (held && *held == it->second.leaf) {
-                js.claimed[r.bin] = at;  // the same leaf, now proved against a carrier of this chain
+            if (held && *held == r.leaf) {
+                js.claimed[r.bin] = r.at;  // the same leaf, now proved against a carrier of this chain
                 mismatched_.erase(r.bin);
                 continue;
             }
-            // a different leaf: replay from the position before the bin's seal (at or below x1): the joiner path
+            // a different leaf: replay from the position before the bin's seal (at or below x1): the joiner path,
+            // the server's best tip with it a candidate
             const ReaskReplay rr = reask_replay(seal_pos_of(r.bin), store_->base_pos());
             if (rr.joiner_path || own_switch_path(js, rr.from) == SwitchPath::Joiner) {
                 out.reask_joiner = true;
-                if (served_by) offer(store_->best_tip(), *served_by, U128{});
+                const auto pt = peers_.find(r.server);
+                if (pt != peers_.end()) offer(pt->second.best_tip, r.server, pt->second.best_cum_work);
             }
         }
     }
@@ -1795,10 +1931,10 @@ private:
             case WriteOutcome::Extended: {
                 out.action = NodeAction::Placed;
                 ++generation_;
-                if (kv_ != nullptr) {
+                if (PathbKv* kv = store_kv()) {
                     const LaneBatch b = extension_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, r.id,
                                                         std::move(w.batch), w.ar_row);
-                    if (!commit_lane_batch(*kv_, b)) {
+                    if (!commit_lane_batch(*kv, b)) {
                         poison(r.id);
                         out.action = NodeAction::NodeInternal;
                         return out;
@@ -1933,10 +2069,10 @@ private:
                     return out;
                 }
         }
-        if (kv_ != nullptr) {
+        if (PathbKv* kv = store_kv()) {
             const LaneBatch b = switch_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, fork, old_pos, ar_before,
                                              *ar_, std::move(lane));
-            if (!commit_lane_batch(*kv_, b)) {
+            if (!commit_lane_batch(*kv, b)) {
                 poison(new_tip);
                 out.internal = true;
                 return out;
@@ -1984,6 +2120,7 @@ private:
     WindowCache own_windows_;
     KeyCache own_keys_;
     std::map<Hash32, XmrKeyRef> own_refs_;
+    std::map<std::uint64_t, CarrierHeader> own_prefix_;  // a joined store's claimed prefix headers (loaded)
     CarrierTree* tree_ = nullptr;
     BinStore* store_ = nullptr;
     ActivationRecord* ar_ = nullptr;
@@ -1993,6 +2130,7 @@ private:
     KeyCache* keys_ = nullptr;
     std::map<Hash32, XmrKeyRef>* refs_ = nullptr;
     const ClaimView* claims_ = nullptr;  // the adopted state's claim view (nullptr: a full node)
+    const std::map<std::uint64_t, CarrierHeader>* prefix_ = nullptr;  // the claimed prefix headers served
     AlarmSink alarm_;
     PendingSet pending_;
     DeferredCarriers deferred_;
@@ -2020,7 +2158,8 @@ private:
     std::optional<Joiner> joiner_;
     FullNodeA own_chain_{*this};
     JoinTransport* transport_ = nullptr;
-    std::map<std::uint64_t, std::unique_ptr<PathbJoinLink>> links_;
+    std::map<std::uint64_t, std::shared_ptr<PathbJoinLink>> links_;
+    std::set<std::uint64_t> left_;  // servers that disconnected while an attempt ran
     JoinedState* joined_ = nullptr;
     bool load_failed_ = false;
     bool reask_pending_ = false;

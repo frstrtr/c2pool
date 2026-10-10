@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -43,6 +44,7 @@ struct Harness {
     std::set<pb::Hash32> bad_served;  // P_r ids whose served context fails (BadServed)
     std::uint64_t rx_calls = 0;
     std::uint64_t verify_cost_s = 0;  // seconds a RandomX call takes (the clock moves)
+    std::uint64_t verify_per_s = 0;   // or: this many RandomX calls take one second
     std::set<pb::Hash32> throw_pow;   // a RandomX call on one of these throws (once)
     std::vector<pb::TemplateTx> txs;
     std::vector<std::unique_ptr<pb::FollowerBranchView>> views;
@@ -106,6 +108,7 @@ struct Harness {
         o.verify = [this](const pb::HashingBlob& b, std::uint64_t, const pb::Hash32&) {
             ++rx_calls;
             now += verify_cost_s;
+            if (verify_per_s != 0 && rx_calls % verify_per_s == 0) ++now;
             if (throw_pow.erase(pb::receipt_id(b)) != 0) throw std::runtime_error("kat: RandomX worker failed");
             return bad_pow.count(pb::receipt_id(b)) == 0;
         };
@@ -211,6 +214,8 @@ struct KatTransport final : pb::JoinTransport {
         std::uint64_t peer = 0;
         std::uint8_t op = 0;
         std::uint64_t t = 0;
+        std::uint64_t rx = 0;  // the harness's RandomX calls at the send
+        std::vector<std::uint8_t> request;
     };
     std::vector<Logged> log;
     std::function<void(std::uint64_t peer, std::uint8_t op, std::vector<std::vector<std::uint8_t>>& reply)> edit;
@@ -220,28 +225,53 @@ struct KatTransport final : pb::JoinTransport {
     // them are not served.
     bool prune = false;
     std::uint64_t lapses = 0;  // requests that found the server's hold of this node ended
+    std::uint64_t rtt_s = 0;   // a reply arrives this long after its request (the server answers at the send)
+    // A server of our own (the E-81 vectors): answers a request in place of the node `peer`.
+    std::function<std::vector<std::vector<std::uint8_t>>(std::uint64_t peer, const std::vector<std::uint8_t>& req)> fake;
+    struct Pending {
+        std::uint64_t at = 0;
+        std::vector<std::vector<std::uint8_t>> frames;
+    };
+    std::map<std::uint64_t, Pending> pending;
+    std::uint64_t next_ticket = 1;
+    std::uint64_t dropped = 0;
+    std::size_t peak_pending = 0;
 
     KatTransport(Harness& hh, std::size_t s) : h(&hh), self(s) {}
-    std::vector<std::vector<std::uint8_t>> exchange(std::uint64_t peer, const std::vector<std::uint8_t>& req,
-                                                    std::uint64_t) override {
+    std::uint64_t send(std::uint64_t peer, const std::vector<std::uint8_t>& req) override {
         const std::uint8_t op = req.empty() ? 0 : req[0];
-        log.push_back(Logged{peer, op, h->now});
+        log.push_back(Logged{peer, op, h->now, h->rx_calls, req});
         if (on_request) on_request();
         std::vector<std::vector<std::uint8_t>> out;
-        if (peer >= h->nodes.size() || h->nodes[peer] == nullptr) return out;
-        pb::PathbNode& s = *h->nodes[peer];
-        const bool held = s.join_holding(self);
-        if (op == pb::kOpFcGetHeaders) out = s.serve_getheaders(self, req, h->now).frames;
-        if (op == pb::kOpFcGetCarrier) out = s.serve_getcarrier(self, req, h->now).frames;
-        if (op == pb::kOpFcGetBuckets) out = s.serve_getbuckets(self, req, h->now).frames;
-        if (prune && op != pb::kOpFcGetBuckets && log.size() > 1) {
-            if (!held || !s.join_holding(self)) ++lapses;
-            const pb::JoinServeFloors f = s.join_holding(self) ? s.retention_floors(h->now) : s.serve_floors_now();
-            prune_reply(s, op, f, out);
+        if (fake) {
+            out = fake(peer, req);
+        } else if (peer < h->nodes.size() && h->nodes[peer] != nullptr) {
+            pb::PathbNode& s = *h->nodes[peer];
+            const bool held = s.join_holding(self);
+            if (op == pb::kOpFcGetHeaders) out = s.serve_getheaders(self, req, h->now).frames;
+            if (op == pb::kOpFcGetCarrier) out = s.serve_getcarrier(self, req, h->now).frames;
+            if (op == pb::kOpFcGetBuckets) out = s.serve_getbuckets(self, req, h->now).frames;
+            if (prune && op != pb::kOpFcGetBuckets && log.size() > 1) {
+                if (!held || !s.join_holding(self)) ++lapses;
+                const pb::JoinServeFloors f = s.join_holding(self) ? s.retention_floors(h->now) : s.serve_floors_now();
+                prune_reply(s, op, f, out);
+            }
         }
         if (edit) edit(peer, op, out);
+        const std::uint64_t t = next_ticket++;
+        pending[t] = Pending{h->now + rtt_s, std::move(out)};
+        peak_pending = std::max(peak_pending, pending.size());
+        return t;
+    }
+    std::vector<std::vector<std::uint8_t>> collect(std::uint64_t ticket, std::uint64_t) override {
+        const auto it = pending.find(ticket);
+        if (it == pending.end()) return {};
+        h->now = std::max(h->now, it->second.at);
+        std::vector<std::vector<std::uint8_t>> out = std::move(it->second.frames);
+        pending.erase(it);
         return out;
     }
+    void drop(std::uint64_t ticket) override { dropped += pending.erase(ticket); }
     void prune_reply(const pb::PathbNode& s, std::uint8_t op, const pb::JoinServeFloors& f,
                      std::vector<std::vector<std::uint8_t>>& out) const {
         if (op == pb::kOpFcGetHeaders) {

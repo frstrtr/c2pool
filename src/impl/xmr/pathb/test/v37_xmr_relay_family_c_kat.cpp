@@ -83,7 +83,7 @@ void fc_carrier() {
     std::vector<std::uint8_t> big(b.frame + 1, 0);
     big[0] = 0x50;
     big[1] = 0x01;
-    check(pb::check_fc_carrier(big, kChain, b).error == pb::FrameWireError::OverBuffer, "(2) above the frame buffer (P-11): DROP");
+    check(pb::check_fc_carrier(big, kChain, b).error == pb::FrameWireError::OverBuffer, "(2) above the frame buffer: DROP");
     pb::CarrierBodyV3 over = c;
     for (int i = 0; i < 15; ++i) over.carried.push_back(make_body(0, false, static_cast<std::uint8_t>(0x60 + i)));
     check(!pb::encode_fc_carrier(kChain, over, kP.r_max), "(2) a carrier with 17 carried bodies does not encode");
@@ -216,11 +216,11 @@ void fb_receipts() {
     pb::RelayBuffers tight = b;
     tight.receipt = enc(bodies[0]).size() - 1;
     check(pb::decode_fb_receipts(*f, kChain, tight, kP, d).error == pb::FrameWireError::OverBuffer,
-          "(6) a body above the receipt buffer (P-10): DROP");
+          "(6) a body above the receipt buffer: DROP");
     pb::RelayBuffers small = b;
     small.frame = f->size() - 1;
     check(pb::decode_fb_receipts(*f, kChain, small, kP, d).error == pb::FrameWireError::OverBuffer,
-          "(6) a frame above the frame buffer (P-11): DROP");
+          "(6) a frame above the frame buffer: DROP");
     std::vector<std::uint8_t> cut(f->begin(), f->end() - 1);
     check(pb::decode_fb_receipts(cut, kChain, b, kP, d).error == pb::FrameWireError::Body, "(6) a truncated body refused");
 }

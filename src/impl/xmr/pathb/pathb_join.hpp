@@ -174,6 +174,20 @@ public:
     virtual CarrierFrames carriers(const std::vector<Hash32>& ids, bool want_bodies, std::uint64_t timeout_s) = 0;
     // FC_GETBUCKETS.
     virtual BucketFrames buckets(const GetBuckets& q, std::uint64_t timeout_s) = 0;
+    // The attempt's next request, named before it checks the reply it holds
+    // (VER m-15: one request outstanding while it verifies); the next
+    // headers() / carriers() call with the same arguments takes its reply.
+    // A link that sends only on headers() / carriers() ignores them.
+    virtual void next_headers(const Hash32& stop, std::uint64_t max, std::uint64_t timeout_s) {
+        (void)stop;
+        (void)max;
+        (void)timeout_s;
+    }
+    virtual void next_carriers(const std::vector<Hash32>& ids, bool want_bodies, std::uint64_t timeout_s) {
+        (void)ids;
+        (void)want_bodies;
+        (void)timeout_s;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -411,6 +425,9 @@ public:
     std::map<Hash32, XmrKeyRef> refs;          // served references and the span bodies' references
     AlarmSink alarm;
     std::map<std::uint64_t, AtHeader> claimed;  // adopted (claimed) leaves: bin -> the at header it was proved against
+    // the headers of the claimed prefix [x_pre, x0 - 1] and the records below it the attempt read (pre_start's
+    // read_lo), by position: served to later joiners (E-102's header floor)
+    std::map<std::uint64_t, CarrierHeader> prefix_headers;
 
     // counters (JoinResult)
     std::uint64_t full_bodies = 0;   // bodies whose every row ran (tips at or above x1)
@@ -1120,6 +1137,11 @@ private:
         return &hdr_[x - lo_pos_];
     }
 
+    // The next page below the lowest held header, down to `need_lo` at most, named to the link ahead of its use.
+    void ahead_headers(std::uint64_t need_lo) {
+        const std::uint64_t range = lo_pos_ > need_lo ? lo_pos_ - need_lo : 1;
+        link_.next_headers(hdr_.front().own.side.tip, std::min(header_page(), range), timeout_);
+    }
     // The next page below the lowest held header, down to `need_lo` at most.
     bool more_headers(std::uint64_t need_lo = 1) {
         const Hash32 stop = hdr_.front().own.side.tip;  // the parent of the lowest held header
@@ -1154,9 +1176,9 @@ private:
         }
         if (short_headers(r, max, rep_.L)) return fail(AttemptEnd::NotServed, "a short FC_HEADERS reply");
         if (r.first_pos == 0) return fail(AttemptEnd::NotServed, "a header at position 0");
-        if (!take_headers(r, std::nullopt)) return false;
-        // (5) on the top page: x0 is not known, so every held header is a candidate (a no-PoW server is caught here)
-        return check_span_pow(lo_pos_);
+        // (5) on the top page runs in bounds' first step, after the next page is named (one outstanding): x0 is not
+        // known, so every held header is a candidate (a no-PoW server is caught at the top, after at most two requests)
+        return take_headers(r, std::nullopt);
     }
 
     // 3.3a (4) / ruling 47 (E-82): the fork of L with A's best chain, scanned
@@ -1193,8 +1215,12 @@ private:
     // ---- span ----
     bool bounds() {
         if (force_young_) {  // the ruling-47 fallback: the whole chain [1, L] verified in full, no claim
-            while (lo_pos_ > 1)  // (5) on arrival, page by page
-                if (!more_headers(1) || !check_span_pow(lo_pos_) || !scope_on_page()) return false;
+            for (;;) {  // (5) on arrival, page by page; the next page named before the check
+                if (lo_pos_ > 1) ahead_headers(1);
+                if (!check_span_pow(lo_pos_) || !scope_on_page()) return false;
+                if (lo_pos_ <= 1) break;
+                if (!more_headers(1)) return false;
+            }
             if (!check_span_pow(1)) return false;
             rep_.span = SpanBounds{true, 0, 1, 1};
             return true;
@@ -1229,6 +1255,9 @@ private:
                     }
                 }
             }
+            // the next page goes out before the page that arrived last is checked (VER m-15; one outstanding); never
+            // below what the span reads (need_lo)
+            if (!held && lo_pos_ > 1) ahead_headers(need_lo);
             // (5) on the span held so far (floor = x0 once known, else every held header): the PRE below x0 is exempt
             if (!check_span_pow(x0_known_ ? x0_ : lo_pos_)) return false;
             if (!scope_on_page()) return false;  // the scope over the page that arrived last
@@ -1239,14 +1268,20 @@ private:
     }
 
     // ---- bodies of the span ----
+    // The ids of [x, to] not yet held, at most 1 + R_MAX (one FC_GETCARRIER).
+    std::vector<Hash32> batch_ids(std::uint64_t x, std::uint64_t to) const {
+        const std::uint64_t batch = 1 + in_.p.r_max;  // FC_GETCARRIER n <= 1 + R_MAX
+        std::vector<Hash32> ids;
+        for (std::uint64_t k = x; k <= to && ids.size() < batch; ++k) {
+            const Hash32 id = receipt_id(header_at(k)->own);
+            if (span_bodies_.count(id) == 0) ids.push_back(id);
+        }
+        return ids;
+    }
     bool fetch_bodies(std::uint64_t from, std::uint64_t to) {
         const std::uint64_t batch = 1 + in_.p.r_max;  // FC_GETCARRIER n <= 1 + R_MAX
         for (std::uint64_t x = from; x <= to;) {
-            std::vector<Hash32> ids;
-            for (std::uint64_t k = x; k <= to && ids.size() < batch; ++k) {
-                const Hash32 id = receipt_id(header_at(k)->own);
-                if (span_bodies_.count(id) == 0) ids.push_back(id);
-            }
+            const std::vector<Hash32> ids = batch_ids(x, to);
             x += batch;
             if (ids.empty()) continue;
             const CarrierFrames r = link_.carriers(ids, true, timeout_);
@@ -1300,6 +1335,8 @@ private:
         std::vector<RetargetEntry> pre;
         std::vector<Hash32> pre_ids;
         std::vector<std::uint64_t> pre_rec;
+        for (std::uint64_t x = lo_pos_; x + 1 <= x0; ++x)
+            if (const CarrierHeader* h = header_at(x)) s.prefix_headers[x] = *h;
         for (std::uint64_t x = pre_lo; x + 1 <= x0; ++x) {
             const CarrierHeader* h = header_at(x);
             if (h == nullptr) return fail(AttemptEnd::NotServed, "the retarget prefix not held");
@@ -1422,7 +1459,14 @@ private:
         if (rep_.L < from) return true;  // L = 0: position 0
         const std::uint64_t batch = 1 + in_.p.r_max;
         for (std::uint64_t x = from; x <= rep_.L; ++x) {
-            if ((x - from) % batch == 0 && !fetch_bodies(x, std::min(rep_.L, x + batch - 1))) return false;
+            if ((x - from) % batch == 0) {
+                if (!fetch_bodies(x, std::min(rep_.L, x + batch - 1))) return false;
+                // the next batch goes out before this one is placed (one outstanding)
+                if (x + batch <= rep_.L) {
+                    const std::vector<Hash32> next = batch_ids(x + batch, std::min(rep_.L, x + 2 * batch - 1));
+                    if (!next.empty()) link_.next_carriers(next, true, timeout_);
+                }
+            }
             if (!body_matches_header(x)) return fail(AttemptEnd::Contradiction, "a body is not its header");
             const CarrierBodyV3& c = *body(x);
             s.learn_refs(c.own);
@@ -1812,14 +1856,32 @@ public:
 
     // Runs the next pair's attempt; nullopt: no pair queued.
     std::optional<AttemptReport> run_next() {
-        const std::optional<AttemptQueue::Pair> p = queue_.next();
-        if (!p) return std::nullopt;
-        const auto li = links_.find(p->server);
-        if (li == links_.end()) return run_next();
-        JoinAttempt att(in_, *li->second, timeout_, a(), on_step_);
-        att.set_known([this](const Hash32& tip) { return known_.count(tip) != 0; });
-        att.set_force_young(p->young);
-        AttemptReport rep = att.run(p->candidate);
+        std::optional<Attempted> t = attempt_next();
+        if (!t) return std::nullopt;
+        return apply(std::move(*t));
+    }
+
+    // The two halves of run_next: the attempt (it reads A, changes nothing of the Joiner but the pair it takes) and
+    // its outcome applied (the queue, the exclusion, the adoption or replacement of A).
+    struct Attempted {
+        AttemptQueue::Pair pair;
+        AttemptReport report;
+    };
+    std::optional<Attempted> attempt_next() {
+        for (;;) {
+            const std::optional<AttemptQueue::Pair> p = queue_.next();
+            if (!p) return std::nullopt;
+            const auto li = links_.find(p->server);
+            if (li == links_.end()) continue;
+            JoinAttempt att(in_, *li->second, timeout_, a(), on_step_);
+            att.set_known([this](const Hash32& tip) { return known_.count(tip) != 0; });
+            att.set_force_young(p->young);
+            return Attempted{*p, att.run(p->candidate)};
+        }
+    }
+    AttemptReport apply(Attempted&& t) {
+        const std::optional<AttemptQueue::Pair> p = t.pair;
+        AttemptReport rep = std::move(t.report);
         switch_ = SwitchReport{};
         switch (rep.end) {
             case AttemptEnd::Completed: complete(rep); break;

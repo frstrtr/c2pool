@@ -109,9 +109,10 @@ void loadfail() {
     h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, kJ), h.io(j), &kv, pb::PathbNode::LoadFailed{}));
     KatTransport tr(h, j);
     h[j].set_join_transport(&tr);
+    const pb::LaneKv failed = kv.data;
     check(h[j].rests_on_claims() && h[j].make_template(h.now).status == pb::TemplateStatus::RestsOnClaims
-                  && !kv.data.count(pb::store_keys::poison(0)) && !kv.data.count(pb::store_keys::pcarrier(0, 3)),
-          "loadfail: started empty (the old store cleared), resting on claims: no template");
+                  && kv.data == failed,
+          "loadfail: started at position 0 in memory, resting on claims (no template); the failed store kept as it is");
     // resting on claims: a carrier placed and a receipt pending are not relayed (3.3a (2)); both from a peer that is
     // not the server, so a relay would reach the server
     h.q.clear();
@@ -128,8 +129,8 @@ void loadfail() {
           "loadfail: resting on claims, a placed carrier and a pending receipt are not relayed (actions "
                   + std::to_string(static_cast<int>(r1.action)) + ", "
                   + std::to_string(static_cast<int>(rr.empty() ? pb::NodeAction::None : rr[0].action)) + ")");
-    // a mark and a record above L left in the store: the adoption deletes them
-    kv.data[pb::store_keys::poison(0)] = std::string(1, '\x01');
+    check(kv.data == failed, "loadfail: nothing written while the store is the failed one (a placement, a pending receipt)");
+    // a record above L left in the store too: the adoption deletes it with the failed store
     kv.data[pb::store_keys::pcarrier(0, L + 7)] = "stale";
     const pb::HelloCheck hc = h.hello(j, s);
     check(hc.verdict == pb::HelloVerdict::Accept && h[j].joiner().queue().size() == 1,
@@ -299,9 +300,11 @@ void tokens() {
 }
 
 // ---------------------------------------------------------------------------
-// fetchahead (C-10): a joiner whose RandomX check takes 2 x P-53 per call completes against a server that keeps only
-// from its floors and ends a hold at P-53 while its best tip moves on: the header pages go out back to back from the
-// first reply (the server's hold stands through them), the FC_GETCARRIER batches back to back from the first batch.
+// fetchahead: one request outstanding while the attempt checks the reply it holds. Replies arrive 8 s after their
+// request; a header page's checks take about 6 s; the server keeps only from its floors, ends a hold at P-53 and its
+// tip moves on while it serves. The next page goes out before the page held is checked, so the gap between two
+// requests is the latency, the server's hold stands and the attempt completes; the transport never holds more than one
+// reply nobody asked for yet.
 void fetchahead() {
     JoinNet net(900);
     const std::uint64_t L = 6000, moved = 24;  // a span whose floors are above position 1
@@ -311,52 +314,58 @@ void fetchahead() {
     const std::size_t s = h.nodes.size();
     h.nodes.push_back(server_from(h, a, kJ, s));
     const std::vector<pb::Hash32> more = grow(a, moved);  // the server's next carriers (its tip moves while it serves)
+    // a header page's size at this server: its checks take about 6 s
+    std::uint64_t page_n = 0;
+    {
+        const std::vector<std::vector<std::uint8_t>> top = h[s].serve_getheaders(
+                9999, pb::encode_fc_getheaders(pb::GetHeaders{0, pb::Hash32{}, pb::Hash32{}, 1152}), h.now).frames;
+        pb::HeadersReply rep;
+        if (!top.empty() && pb::decode_fc_headers(top[0], 0, 1u << 22, pb::kRuledLaneParams, rep).ok()) page_n = rep.headers.size();
+        h[s].disconnect(9999);
+    }
     Joining jn = joining_node(h, net, kJ);
     const std::size_t j = jn.j;
     jn.tr->prune = true;
+    jn.tr->rtt_s = 8;
     const pb::JoinServeFloors f_L = h[s].serve_floors_now();
     bool grown = false;
     jn.tr->on_request = [&]() {
         if (grown || jn.tr->log.size() != 2) return;
         grown = true;
-        const std::uint64_t cost = h.verify_cost_s;
-        h.verify_cost_s = 0;
+        const std::uint64_t per = h.verify_per_s;
+        h.verify_per_s = 0;
         h.mon_tip = h_pos(L + moved) + 1;
         for (const pb::Hash32& id : more)
             (void)h[s].on_carrier(99, *pb::encode_fc_carrier(0, *a.bodies.get(id), pb::kRuledLaneParams.r_max));
         h.q.clear();
-        h.verify_cost_s = cost;
+        h.verify_per_s = per;
     };
-    h.verify_cost_s = 2 * pb::kAbandonTimeoutDefault;
+    h.verify_per_s = std::max<std::uint64_t>(1, page_n / 6);
     h.hello(j, s);
     const std::uint64_t t0 = h.now;
     const pb::JoinStep st = h[j].run_join();
     const pb::JoinServeFloors f_now = h[s].serve_floors_now();
-    check(grown && h[s].tree().best().pos == L + moved && f_now.headers > f_L.headers,
+    check(page_n >= 10 && grown && h[s].tree().best().pos == L + moved && f_now.headers > f_L.headers,
           "fetchahead: the server's tip moved to L + 24 while it served (header floor " + std::to_string(f_L.headers) + " -> "
-                  + std::to_string(f_now.headers) + ")");
-    check(st.report && st.report->end == pb::AttemptEnd::Completed && st.switched && h[j].tree().best().id == at_pos(a, L)
-                  && h.now - t0 > 100 * pb::kAbandonTimeoutDefault,
-          "fetchahead: the attempt completes at L against the pruning server (its checks took "
-                  + std::to_string(h.now - t0) + " s)" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
-    std::uint64_t first_h = UINT64_MAX, last_h = 0, hdr = 0, first_c = UINT64_MAX, last_c = 0, car = 0;
-    for (const KatTransport::Logged& l : jn.tr->log) {
-        if (l.op == pb::kOpFcGetHeaders) {
-            first_h = std::min(first_h, l.t);
-            last_h = std::max(last_h, l.t);
-            ++hdr;
-        }
-        if (l.op == pb::kOpFcGetCarrier) {
-            first_c = std::min(first_c, l.t);
-            last_c = std::max(last_c, l.t);
-            ++car;
-        }
-    }
-    check(hdr >= 3 && last_h == first_h, "fetchahead: the " + std::to_string(hdr)
-                  + " FC_GETHEADERS of the attempt went out back to back from its first reply (no check between them)");
-    check(car >= 3 && last_c - first_c <= pb::kAbandonTimeoutDefault,
-          "fetchahead: the " + std::to_string(car) + " FC_GETCARRIER batches went out back to back (spread "
-                  + std::to_string(last_c - first_c) + " s)");
+                  + std::to_string(f_now.headers) + "; pages of " + std::to_string(page_n) + " headers)");
+    check(st.report && st.report->end == pb::AttemptEnd::Completed && st.switched && h[j].tree().best().id == at_pos(a, L),
+          "fetchahead: the attempt completes at L against the pruning server (" + std::to_string(h.now - t0) + " s)"
+                  + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+    // the next FC_GETHEADERS went out before the page held was checked: two consecutive sends with no check between
+    std::vector<std::uint64_t> hdr_rx;
+    for (const KatTransport::Logged& l : jn.tr->log)
+        if (l.op == pb::kOpFcGetHeaders) hdr_rx.push_back(l.rx);
+    std::size_t unchecked = 0;
+    for (std::size_t i = 2; i < hdr_rx.size(); ++i) unchecked += hdr_rx[i] == hdr_rx[i - 1] ? 1 : 0;
+    check(hdr_rx.size() >= 3 && unchecked >= 1 && jn.tr->peak_pending <= 1,
+          "fetchahead: a header page named ahead went out before the page held was checked (" + std::to_string(unchecked)
+                  + " of " + std::to_string(hdr_rx.size()) + "); at most one reply outstanding (peak "
+                  + std::to_string(jn.tr->peak_pending) + ")");
+    const std::size_t car = jn.tr->requests_of(pb::kOpFcGetCarrier);
+    const std::uint64_t named = h[j].join_link(s) != nullptr ? h[j].join_link(s)->ahead_carriers_taken() : 0;
+    check(car >= 3 && named + 3 >= car,
+          "fetchahead: every FC_GETCARRIER batch of the replay after the first named before the batch held was placed ("
+                  + std::to_string(named) + " of " + std::to_string(car) + ")");
 }
 
 // Headers first at node `to` from server `from`: FC_GETHEADERS(from the held fork, stop) and the server's pages until
@@ -673,6 +682,391 @@ void adoptbelow() {
                   + std::to_string(static_cast<int>(r.action)) + ", strike " + std::to_string(r.admit.strike) + ")");
 }
 
+// ---------------------------------------------------------------------------
+// e81: the header phase through PathbJoinLink against a server of our own (E-81, RULED 47 (a)): the checks on
+// arrival end the attempt at the first bad page, with bounded requests and one reply outstanding; the honest pair
+// queued behind completes. (5) flat unique blobs with no PoW at top position 10^12; (2) two alternating blobs (real
+// PoW); flood: every FC_GETHEADERS answered with one real page, its first_pos claimed below the last, top at 10^12.
+std::vector<pb::CarrierHeader> fake_chain(const KatNet& net, std::uint64_t n, int mode) {
+    std::vector<pb::CarrierHeader> chain;
+    pb::Hash32 parent = seq32(0x33);
+    for (std::uint64_t k = 0; k < n; ++k) {
+        pb::CarrierHeader h;
+        pb::ReceiptBodyV3& r = h.own;
+        r.blob.major = 16;
+        r.blob.minor = 16;
+        r.blob.timestamp = mon_ts(kAnchorH + 500) + 1;
+        r.blob.prev_id = mon_block(kAnchorH + 500);
+        const std::uint64_t b = mode == 1 ? k % 2 : k;
+        r.blob.nonce = static_cast<std::uint32_t>(b);
+        for (int i = 0; i < 8; ++i) r.blob.tree_root[i] = static_cast<std::uint8_t>(b >> (8 * i));
+        r.payee = net.refs[0];
+        r.side.pool_id = net.pool_id;
+        r.side.payee = net.ids[0];
+        r.side.t_origin = pb::kRuledLaneParams.d_min;
+        r.side.tip = parent;
+        r.side.give_author_bp = 10;
+        r.reward_total = kReward;
+        r.side.ballot = static_cast<std::uint16_t>(k);
+        chain.push_back(h);
+        parent = pb::receipt_id(r);
+    }
+    return chain;
+}
+struct FakeWire {
+    std::vector<pb::CarrierHeader> chain;  // oldest first
+    std::uint64_t top_pos = 1000000000000ull;
+    std::uint64_t limit = 100;  // pages, then empty replies (a mutant without the checks ends, not at timeout)
+    bool flood = false;         // every reply the top page, first_pos claimed lower each time
+    std::uint64_t pages = 0;
+    std::size_t served_lo = 0;
+    std::uint64_t frame = 1u << 14;
+    std::vector<std::vector<std::uint8_t>> answer(const std::vector<std::uint8_t>& req) {
+        pb::GetHeaders q;
+        if (req.empty() || req[0] != pb::kOpFcGetHeaders || !pb::decode_fc_getheaders(req, 0, q).ok()) return {};
+        ++pages;
+        pb::HeadersReply rep{0, 0, {}};
+        if (pages <= limit) {
+            std::size_t end = chain.size() - 1;
+            if (!flood && q.stop != pb::Hash32{}) {
+                if (served_lo == 0 || pb::receipt_id(chain[served_lo - 1].own) != q.stop) return {};
+                end = served_lo - 1;
+            }
+            const std::size_t n = std::min<std::size_t>(q.max, end + 1);
+            const std::size_t lo = end + 1 - n;
+            for (std::size_t i = lo; i <= end; ++i) rep.headers.push_back(chain[i]);
+            std::size_t packed = 0;
+            (void)pb::encode_fc_headers(rep, frame, &packed);
+            rep.headers.erase(rep.headers.begin(), rep.headers.end() - static_cast<std::ptrdiff_t>(packed));
+            served_lo = end + 1 - packed;
+            rep.first_pos = flood ? top_pos - pages * 1000 : top_pos - (chain.size() - 1 - served_lo);
+        }
+        return {*pb::encode_fc_headers(rep, frame)};
+    }
+};
+void e81() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 600);
+    struct Case {
+        const char* name;
+        int mode;
+        bool flood;
+        pb::AttemptEnd end;
+    };
+    for (const Case& c : {Case{"(5) no PoW", 0, false, pb::AttemptEnd::Header},
+                          Case{"(2) alternating blobs", 1, false, pb::AttemptEnd::Contradiction},
+                          Case{"flood", 2, true, pb::AttemptEnd::NotServed}}) {
+        Harness h(net);
+        const std::size_t s = h.nodes.size();
+        h.nodes.push_back(server_from(h, a, kJ, s));
+        Joining jn = joining_node(h, net, kJ);
+        const std::size_t j = jn.j;
+        const std::uint64_t fake_peer = 500;
+        FakeWire fw;
+        fw.frame = h.config(kat_table(net), false, kJ).headers_frame_bytes;
+        if (c.flood) {
+            for (std::uint64_t x = 600 - 40; x <= 600; ++x) fw.chain.push_back(pb::header_of(*a.bodies.get(at_pos(a, x))));
+            fw.flood = true;
+        } else {
+            fw.chain = fake_chain(net, 600, c.mode);
+            if (c.mode == 0)
+                for (const pb::CarrierHeader& hd : fw.chain) h.bad_pow.insert(pb::receipt_id(hd.own));
+        }
+        std::uint64_t fake_requests = 0;
+        jn.tr->fake = [&](std::uint64_t peer, const std::vector<std::uint8_t>& req) -> std::vector<std::vector<std::uint8_t>> {
+            if (peer == fake_peer) {
+                ++fake_requests;
+                return fw.answer(req);
+            }
+            pb::PathbNode& sv = *h.nodes[peer];
+            const std::uint8_t op = req.empty() ? 0 : req[0];
+            if (op == pb::kOpFcGetHeaders) return sv.serve_getheaders(j, req, h.now).frames;
+            if (op == pb::kOpFcGetCarrier) return sv.serve_getcarrier(j, req, h.now).frames;
+            if (op == pb::kOpFcGetBuckets) return sv.serve_getbuckets(j, req, h.now).frames;
+            return {};
+        };
+        // the fake server's HELLO (a server's HELLO from another peer id), then the honest server's
+        const pb::PathbHello theirs = h[s].our_hello(4242, 0);
+        (void)h[j].on_hello(fake_peer, *pb::encode_pathb_hello(theirs), h[j].our_hello(1000 + j, 0));
+        (void)h.hello(j, s);
+        const pb::JoinStep st = h[j].run_join();
+        const std::string tag = std::string("e81 ") + c.name + ": ";
+        check(st.report && st.report->server == fake_peer && st.report->end == c.end && st.report->strike == 0
+                      && fake_requests <= 3 && jn.tr->peak_pending <= 1,
+              tag + "the attempt ends at the first bad page with " + std::to_string(fake_requests)
+                      + " requests and at most one reply outstanding" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+        pb::JoinStep st2 = h[j].run_join();
+        if (st2.report && st2.report->server == fake_peer) st2 = h[j].run_join();  // a re-queued (non-service) pair first
+        check(st2.switched && h[j].tree().best().id == at_pos(a, 600), tag + "the honest pair behind it completes");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// caps: a reply carries what was asked: FC_GETCARRIER at most n frames read and only the asked ids kept; FC_HEADERS
+// one frame.
+void caps() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 120);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    const pb::PathbNodeConfig cfg = h.config(kat_table(net), false, kJ);
+    KatTransport tr(h, 77);
+    pb::BucketWindow window(cfg.bucket_policy);
+    pb::PathbJoinLink link(s, tr, 0, cfg.p, cfg.buffers, cfg.headers_frame_bytes, window);
+    const std::vector<pb::Hash32> ids{at_pos(a, 10), at_pos(a, 11), at_pos(a, 12)};
+    tr.edit = [&](std::uint64_t, std::uint8_t op, std::vector<std::vector<std::uint8_t>>& reply) {
+        if (op == pb::kOpFcGetCarrier) {
+            // a body nobody asked for in place of the second frame, the asked one after it, then a garbage frame
+            const std::vector<std::uint8_t> extra = *pb::encode_fc_carrier(0, *a.bodies.get(at_pos(a, 50)), pb::kRuledLaneParams.r_max);
+            reply.insert(reply.begin() + 1, extra);
+            reply.push_back(std::vector<std::uint8_t>{0x50, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13});
+        }
+        if (op == pb::kOpFcGetHeaders) reply.push_back(std::vector<std::uint8_t>{0x53, 0x02, 0x00, 0x00, 0x00, 0x00, 0x13});
+    };
+    const pb::CarrierFrames cf = link.carriers(ids, true, 11);
+    bool asked = true;
+    for (const pb::CarrierBodyV3& b : cf.bodies) asked = asked && std::find(ids.begin(), ids.end(), pb::receipt_id(b.own)) != ids.end();
+    check(cf.status == pb::LinkStatus::Served && cf.bodies.size() == 2 && asked && link.strikes() == 0,
+          "caps: an FC_GETCARRIER of 3 ids answered with an unasked body among 4 frames and a garbage frame after them: 3 "
+          "frames read, the unasked body not kept, nothing struck (" + std::to_string(cf.bodies.size()) + " kept)");
+    const pb::ChainHeaders ch = link.headers(at_pos(a, 100), 20, 11);
+    check(ch.status == pb::LinkStatus::Served && ch.headers.size() == 20 && link.strikes() == 0,
+          "caps: an FC_HEADERS reply with a second (garbage) frame: the first read, nothing struck");
+}
+
+// ---------------------------------------------------------------------------
+// disconnect: the attempt's server disconnects while the attempt runs (an owner event between its requests): the link
+// stays alive to the attempt's end, answers nothing more, the attempt ends as non-service and the pair is dropped.
+void disconnect() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 4704);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    Joining jn = joining_node(h, net, kJ);
+    const std::size_t j = jn.j;
+    bool gone = false;
+    jn.tr->on_request = [&]() {
+        if (gone || jn.tr->log.size() != 3) return;
+        gone = true;
+        h[j].disconnect(s);
+    };
+    h.hello(j, s);
+    const pb::JoinStep st = h[j].run_join();
+    check(gone && st.report && st.report->end == pb::AttemptEnd::NotServed && !st.switched && h[j].join_link(s) == nullptr
+                  && h[j].joiner().queue().size() == 0 && jn.tr->log.size() <= 4,
+          "disconnect: the server gone mid-attempt: its link answers nothing more, the attempt ends non-service, the "
+          "pair dropped (" + std::to_string(jn.tr->log.size()) + " requests)" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+}
+
+// ---------------------------------------------------------------------------
+// floors: a server keeping only from its P-51 floors at L 6,000 / 6,010 / 6,020 / 6,030 (its floor page cut at its
+// header floor): the attempt asks no header below its own prefix start and completes. archival: an archival server
+// (nothing pruned): the lowest header asked is the prefix start's lowest read record; the header requests one per page.
+void floors() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 6000);
+    for (const std::uint64_t L : {6000ull, 6010ull, 6020ull, 6030ull}) {
+        if (a.store.tip_pos() < L) grow(a, L - a.store.tip_pos());
+        for (const bool prune : {true, false}) {
+            Harness h(net);
+            const std::size_t s = h.nodes.size();
+            h.nodes.push_back(server_from(h, a, kJ, s));
+            Joining jn = joining_node(h, net, kJ);
+            jn.tr->prune = prune;
+            std::uint64_t lowest = UINT64_MAX;
+            std::uint64_t pages = 0;
+            jn.tr->edit = [&](std::uint64_t, std::uint8_t op, std::vector<std::vector<std::uint8_t>>& reply) {
+                if (op != pb::kOpFcGetHeaders || reply.empty()) return;
+                pb::HeadersReply rep;
+                if (pb::decode_fc_headers(reply[0], 0, 1u << 22, pb::kRuledLaneParams, rep).ok() && !rep.headers.empty()) {
+                    lowest = std::min(lowest, rep.first_pos);
+                    ++pages;
+                }
+            };
+            h.hello(jn.j, s);
+            const pb::JoinStep st = h[jn.j].run_join();
+            const auto rec = [&](std::uint64_t x) -> std::optional<std::uint64_t> {
+                const std::optional<pb::Hash32> id = a.store.best_at(x);
+                if (!id) return std::nullopt;
+                return a.node(*id).H;
+            };
+            const pb::SpanResult sp = pb::span_bounds(pb::kRuledLaneParams, L, rec, kLaneB0);
+            const pb::PreStart ps = pb::pre_start(pb::kRuledLaneParams, sp.bounds.x0, rec);
+            const std::string tag = std::string(prune ? "floors" : "archival") + " at L " + std::to_string(L) + ": ";
+            check(st.report && st.report->end == pb::AttemptEnd::Completed && st.switched && lowest >= ps.read_lo,
+                  tag + "completes; the lowest header asked " + std::to_string(lowest) + " >= the prefix start's lowest read "
+                          "record " + std::to_string(ps.read_lo) + " (" + std::to_string(pages) + " pages)"
+                          + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// emptystore (ruling 39 P-S4w-6): an empty store at position 0 (no load failure) queues no pair on a HELLO; it
+// catches up headers first from position 0 against a server that keeps everything.
+void emptystore() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 600);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    const std::size_t e = h.add(kat_table(net), false, kJ);
+    KatTransport tr(h, e);
+    h[e].set_join_transport(&tr);
+    const pb::HelloCheck hc = h.hello(e, s);
+    const std::size_t queued = h[e].joiner().queue().size();
+    h.mon_tip = h_pos(600) + 1;
+    h.q.clear();
+    // the relay node's catch-up (S4w-bc): headers first from the node's tip, the bodies of a heavier branch, again
+    bool asked = true;
+    for (int round = 0; round < 100 && asked && h[e].tree().best().id != a.store.best_tip(); ++round) {
+        asked = h[e].request_headers(s, h[e].tree().best().id, a.store.best_tip(), 8000, h.now);
+        h.pump();
+    }
+    check(hc.verdict == pb::HelloVerdict::Accept && queued == 0 && asked && h[e].tree().best().id == at_pos(a, 600)
+                  && h[e].joiner().queue().size() == 0 && !h[e].rests_on_claims(),
+          "emptystore: an empty store queues no pair on a HELLO and catches up headers first from position 0 to the "
+          "server's tip (" + std::to_string(h[e].tree().best().pos) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// split (C-10): the attempt (attempt_join) changes nothing of the node; its outcome is applied by apply_join.
+void split() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 600);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    Joining jn = joining_node(h, net, kJ);
+    const std::size_t j = jn.j;
+    MemoryKv& kv = *h.kvs.back();
+    const pb::LaneKv before = kv.data;
+    h.hello(j, s);
+    pb::JoinAttempted t = h[j].attempt_join();
+    const bool unchanged = h[j].joined() == nullptr && h[j].rests_on_claims() && h[j].tree().best().pos == 0
+                           && kv.data == before && t.attempt && t.attempt->report.end == pb::AttemptEnd::Completed;
+    const pb::JoinStep st = h[j].apply_join(std::move(t));
+    check(unchanged && st.switched && st.batch_written && h[j].joined() != nullptr && h[j].tree().best().id == at_pos(a, 600),
+          "split: the completed attempt changes nothing of the node; apply_join adopts it and writes the batch");
+}
+
+// ---------------------------------------------------------------------------
+// restart (E-38): a load failure survives a restart: the failed store is kept until an adoption, so a second start
+// with --pathb-launch and no peer is a load failure again (no relaunch from genesis).
+void restart() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 30);
+    Harness h(net);
+    for (const int failure : {0, 1}) {
+        h.kvs.push_back(std::make_unique<MemoryKv>());
+        MemoryKv& kv = *h.kvs.back();
+        // a written store (genesis) with its failure: the poison mark, or an unreadable head
+        {
+            const std::size_t w = h.nodes.size();
+            h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(w), &kv));
+        }
+        if (failure == 0) kv.data[pb::store_keys::poison(0)] = std::string(1, '\x01');
+        else kv.read_error.insert(pb::store_keys::phead(0));
+        const pb::StoreFault f1 = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ)).fault;
+        const std::size_t n1 = h.nodes.size();
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(n1), &kv, pb::PathbNode::LoadFailed{}));
+        h.mon_tip = h_pos(1) + 1;
+        (void)h[n1].on_carrier(77, *pb::encode_fc_carrier(0, *a.bodies.get(at_pos(a, 1)), pb::kRuledLaneParams.r_max));
+        h.q.clear();
+        // the restart
+        const pb::LoadResult l2 = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+        const std::size_t n2 = h.nodes.size();
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(n2), &kv, pb::PathbNode::LoadFailed{}));
+        check(f1 != pb::StoreFault::None && f1 != pb::StoreFault::NoHead && l2.fault == f1
+                      && h[n2].make_template(h.now).status == pb::TemplateStatus::RestsOnClaims,
+              std::string("restart (") + (failure == 0 ? "the poison mark" : "an unreadable head")
+                      + "): the second start is the same load failure; with --pathb-launch and no peer no template (no "
+                        "relaunch from genesis)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// j2: a node that joined and followed its chain on serves a later join: its claimed prefix headers down to E-102's
+// floor, its span bodies and buckets (from memory, and from its store after a restart).
+void j2() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 6000, more = 120;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok, "j2: the first node joined at L");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    const std::vector<pb::Hash32> next = grow(a, more);
+    h.mon_tip = h_pos(L + more) + 1;
+    for (const pb::Hash32& id : next)
+        (void)h[j].on_carrier(jd.s, *pb::encode_fc_carrier(0, *a.bodies.get(id), pb::kRuledLaneParams.r_max));
+    h.q.clear();
+    check(h[j].tree().best().id == a.store.best_tip(), "j2: the joined node followed its chain to L + 120");
+    Joining k = joining_node(h, net, kJ);
+    h.hello(k.j, j);
+    const pb::JoinStep st = h[k.j].run_join();
+    check(st.report && st.report->end == pb::AttemptEnd::Completed && st.switched && h[k.j].tree().best().id == a.store.best_tip(),
+          "j2: a second node joins from the joined node" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+    // the joined node restarted from its store
+    MemoryKv& kv = *h.kvs[h.kvs.size() - 2];
+    pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    check(rl.fault == pb::StoreFault::None && rl.state && !rl.state->prefix_headers.empty(),
+          "j2: the joined store reloads with its claimed prefix headers (" + std::to_string(rl.state ? rl.state->prefix_headers.size() : 0) + ")");
+    if (!rl.state) return;
+    const std::size_t r = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, kJ), h.io(r), std::move(*rl.state), nullptr));
+    Joining k2 = joining_node(h, net, kJ);
+    h.hello(k2.j, r);
+    const pb::JoinStep st2 = h[k2.j].run_join();
+    check(st2.report && st2.report->end == pb::AttemptEnd::Completed && st2.switched,
+          "j2: a third node joins from the joined node restarted from its store" + (st2.report ? std::string(": ") + rep_desc(*st2.report) : std::string()));
+    std::printf("  j2: %.1f s\n", secs_since(t0));
+}
+
+// ---------------------------------------------------------------------------
+// below (RULED 46 S4wa-1 (b)): a joined node whose fork with a heavier chain lies below its first record (below what
+// it holds): the peer's HELLO tip is a candidate, the attempt completes and rule (4) replaces A.
+void below() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 6000, f = 200;
+    ChainShape sb;
+    sb.nonce0 = 7300000;
+    KatNode a(net, kJ);
+    grow(a, f);
+    KatNode b(a);
+    grow(a, L - f);
+    grow(b, L + 200 - f, sb);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok, "below: joined at L");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    const std::uint64_t first = h[j].store().first_record_pos();
+    const std::size_t sb_ = h.nodes.size();
+    h.nodes.push_back(server_from(h, b, kJ, sb_));
+    (void)h.hello(j, sb_);
+    h.mon_tip = h_pos(L + 200) + 1;
+    const pb::JoinStep st = h[j].run_join();
+    check(f < first && st.report && st.report->end == pb::AttemptEnd::Completed && st.sw.replaced
+                  && h[j].tree().best().id == b.store.best_tip(),
+          "below: the fork " + std::to_string(f) + " below the first record " + std::to_string(first)
+                  + ": a candidate; rule (4) replaces A" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+    std::printf("  below: %.1f s\n", secs_since(t0));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -691,5 +1085,14 @@ int main(int argc, char** argv) {
     run("x1", x1);
     run("reask", reask);
     run("adoptbelow", adoptbelow);
+    run("e81", e81);
+    run("caps", caps);
+    run("disconnect", disconnect);
+    run("floors", floors);
+    run("emptystore", emptystore);
+    run("split", split);
+    run("restart", restart);
+    run("j2", j2);
+    run("below", below);
     return finish("v37_xmr_pathb_node_join_kat");
 }

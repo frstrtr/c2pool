@@ -225,7 +225,7 @@ void carriage() {
     std::sort(all.begin(), all.end(), [&](const auto& x, const auto& y) { return pb::carried_key_less(x.first, y.first, h[a].tree().best().id); });
     bool first16 = order;
     for (std::size_t k = 0; first16 && k < 16; ++k) first16 = pb::receipt_id(j->carried[k]) == all[k].second;
-    check(order && first16, "carriage (R2): 17 carriable -> the first 16 in the canonical order");
+    check(order && first16, "carriage: 17 carriable -> the first 16 in the canonical order");
     h[a].on_own_share(*j, 31, pb::Hash32{});
     const std::optional<pb::PathbJob> j2 = h.job(a, 1, 32);
     check(j2 && j2->carried.size() == 1 && pb::receipt_id(j2->carried[0]) == all[16].second,
@@ -805,7 +805,7 @@ void n7b2() {
         pb::HeadersReply rep;
         const bool ok = f.size() == 1
                         && pb::decode_fc_headers(f[0], 0, h[s.a].frame_bytes_headers(), pb::kRuledLaneParams, rep).ok();
-        check(ok && rep.headers.size() == 3 && rep.first_pos == 7, "n7b2 (B-2): serve_headers answers at most the request's max (3)");
+        check(ok && rep.headers.size() == 3 && rep.first_pos == 7, "n7b2: serve_headers answers at most the request's max (3)");
         // N-7: a header failing its PoW at d: the server BANned, no variant of the reply indexed
         h.bad_pow.insert(s.b_ids[2]);
         check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 16, h.now), "n7b2: A asks B for its branch");
@@ -813,7 +813,7 @@ void n7b2() {
         const pb::PathbNode::HeadersOutcome o = h[s.a].on_headers(s.b, r1.at(0), h.now);
         check(o.kind == pb::PathbNode::HeadersOutcome::Kind::Ban && o.indexed == 0
                       && pb::PathbNodeTestAccess::headers(h[s.a]).size() == 0,
-              "n7b2 (N-7): a header failing its PoW at d: BAN, no variant indexed (kind " + std::to_string(static_cast<int>(o.kind))
+              "n7b2: a header failing its PoW at d: BAN, no variant indexed (kind " + std::to_string(static_cast<int>(o.kind))
                       + ", index " + std::to_string(pb::PathbNodeTestAccess::headers(h[s.a]).size()) + ")");
     }
     {
@@ -830,7 +830,7 @@ void n7b2() {
         const pb::PathbNode::HeadersOutcome o = h[s.a].on_headers(s.b, *pb::encode_fc_headers(rep, h[s.a].frame_bytes_headers()), h.now);
         check(o.kind == pb::PathbNode::HeadersOutcome::Kind::Defer && pb::PathbNodeTestAccess::headers(h[s.a]).size() == 0
                       && h[s.a].tree().best().pos == 10,
-              "n7b2 (N-7): a P_r not resolved: DEFER, no variant indexed before its PoW (index "
+              "n7b2: a P_r not resolved: DEFER, no variant indexed before its PoW (index "
                       + std::to_string(pb::PathbNodeTestAccess::headers(h[s.a]).size()) + ")");
     }
     {
@@ -846,7 +846,7 @@ void n7b2() {
                       + std::to_string(static_cast<int>(o2.kind)) + ", indexed " + std::to_string(o2.indexed) + ")");
         h.pump();
         check(h[s.a].tree().best().id == s.b_tip && h[s.a].store().best_tip() == s.b_tip,
-              "n7b2 (E11): A switched to B's heavier branch by headers first");
+              "n7b2: A switched to B's heavier branch by headers first");
     }
     {
         // N-7 across pages: a variant indexed from an earlier page of a server later BANned is released
@@ -884,13 +884,13 @@ void n7b2() {
         }
         const pb::Hash32 at = h[a].tree().best().id;
         const std::uint64_t b0 = h[a].store().b0();
-        check(h[a].request_buckets(b, at, b0, b0 + 9, h.now), "n7b2 (P-48): FC_GETBUCKETS to B");
+        check(h[a].request_buckets(b, at, b0, b0 + 9, h.now), "n7b2: FC_GETBUCKETS to B");
         const Msg req = h.q.front();
         h.q.pop_front();
         const std::vector<std::vector<std::uint8_t>> fr = h[b].serve_getbuckets(a, req.frame, h.now).frames;
         std::uint64_t bytes = 0;
         for (const auto& f : fr) bytes += f.size();
-        check(!fr.empty() && bytes <= 2400, "n7b2 (P-48): " + std::to_string(fr.size()) + " frames, " + std::to_string(bytes)
+        check(!fr.empty() && bytes <= 2400, "n7b2: " + std::to_string(fr.size()) + " frames, " + std::to_string(bytes)
                                                     + " bytes <= the serve cap 2,400");
     }
 }
@@ -937,7 +937,7 @@ void startup() {
     check(step(a) == pb::StartupStep::Deployments, "startup (3): a deployment file on mainnet");
     a = base();
     a.rp.grace = a.rp.window * 5;  // W_R = 5
-    check(step(a) == pb::StartupStep::DeploymentTable, "startup (4): W_R above 4 (K30)");
+    check(step(a) == pb::StartupStep::DeploymentTable, "startup (4): W_R above 4");
     a = base();
     a.net = pb::LaneNet::Testnet;  // the regtest table on testnet: G differs
     check(step(a) == pb::StartupStep::LaneRules, "startup (5): lane_rules_valid (the compiled G not the network's)");
@@ -1207,7 +1207,7 @@ void tokens() {
                 h[a].serve_getheaders(b, pb::encode_fc_getheaders(pb::GetHeaders{0, h[a].tree().genesis().id, h[a].tree().best().id, 100}), h.now);
         pb::HeadersReply rep;
         const bool ok = fw.frames.size() == 1 && pb::decode_fc_headers(fw.frames[0], 0, 1u << 22, pb::kRuledLaneParams, rep).ok();
-        check(ok && rep.headers.size() == 16 && rep.first_pos == 1, "tokens (F-4): FC_GETHEADERS max 100 -> 16 headers (P-01)");
+        check(ok && rep.headers.size() == 16 && rep.first_pos == 1, "tokens: FC_GETHEADERS max 100 -> 16 headers");
         // request frames that do not decode: refuse + 1 strike; above the buffer: DROP
         const std::vector<std::uint8_t> bad{0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
         std::vector<std::uint8_t> big(h[a].config().buffers.frame + 1, 0x52);
@@ -1233,9 +1233,9 @@ void tokens() {
         pb::PendingSet ps(2);
         const auto rec = [](std::uint8_t k, std::uint64_t hh) { return pb::PendingReceipt{seq32(k), pb::ReceiptBodyV3{}, hh, 1, 0}; };
         const bool a1 = ps.add(rec(1, 5)), a2 = ps.add(rec(2, 6)), a3 = ps.add(rec(3, 4));
-        check(a1 && a2 && !a3 && !ps.holds(seq32(3)) && ps.size() == 2, "tokens (N-14): the oldest-bin newcomer evicted: add false");
+        check(a1 && a2 && !a3 && !ps.holds(seq32(3)) && ps.size() == 2, "tokens: the oldest-bin newcomer evicted: add false");
         const bool a4 = ps.add(rec(4, 7));
-        check(a4 && !ps.holds(seq32(1)) && ps.holds(seq32(2)) && ps.holds(seq32(4)), "tokens (N-14): the oldest bin goes first");
+        check(a4 && !ps.holds(seq32(1)) && ps.holds(seq32(2)) && ps.holds(seq32(4)), "tokens: the oldest bin goes first");
     }
 }
 
@@ -1264,7 +1264,7 @@ void receive() {
         other[2] ^= 0x01;  // another chain_id: the frame does not decode
         const pb::BucketsEventResult u = h[a].on_buckets(b, other, h.now);
         check(u.frame.verdict == pb::BucketsFrameVerdict::Refused && u.frame.strike == 1 && h[a].open_assemblies() == 0,
-              "receive (38 S3b3-19): an undecodable FC_BUCKETS from an asked server: refuse + 1 strike, its requests close");
+              "receive: an undecodable FC_BUCKETS from an asked server: refuse + 1 strike, its requests close");
         const pb::BucketsEventResult u2 = h[a].on_buckets(c, other, h.now);
         std::vector<std::uint8_t> big(1201, 0x55);
         const pb::BucketsEventResult u3 = h[a].on_buckets(b, big, h.now);
@@ -1281,7 +1281,7 @@ void receive() {
         h[a].disconnect(c);
         h[a].disconnect(b);
         check(pb::PathbNodeTestAccess::abandoned(h[a]) == 0 && pb::PathbNodeTestAccess::closed(h[a]) == 0,
-              "receive (F-2): a disconnect drops the peer's closed and abandoned keys");
+              "receive: a disconnect drops the peer's closed and abandoned keys");
     }
     {
         // a closed key for an `at` below the retained floor (base_pos - J_0) goes at the next best change
@@ -1300,7 +1300,7 @@ void receive() {
         h.tick_monero(1);
         h.mine(0, 1, 990);
         check(a.store().tip_pos() == 1301 && pb::PathbNodeTestAccess::closed(a) == 0,
-              "receive (F-2): after a best change the closed key below base_pos - J_0 is gone");
+              "receive: after a best change the closed key below base_pos - J_0 is gone");
     }
     {
         // a parked chain released iteratively (one placement level at a time)
@@ -1320,7 +1320,7 @@ void receive() {
         (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(*h[b].store().best_at(4)), 16));
         h.q.clear();
         check(h[a].tree().best().id == h[b].tree().best().id && pb::PathbNodeTestAccess::max_settle_depth(h[a]) <= 1,
-              "receive (F-3): 29 parked carriers placed on their parent's arrival, one level deep (max depth "
+              "receive: 29 parked carriers placed on their parent's arrival, one level deep (max depth "
                       + std::to_string(pb::PathbNodeTestAccess::max_settle_depth(h[a])) + ")");
     }
     {
@@ -1362,7 +1362,7 @@ void receive() {
         Harness h(net);
         h.headers_frame = 1500;
         const Split s = split(h);
-        check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 16, h.now), "receive (N-1): A asks B");
+        check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 16, h.now), "receive: A asks B");
         pb::PathbNode::HeadersOutcome o;
         std::size_t pages = 0, indexed = 0;
         while (!h.q.empty() && pages < 10) {
@@ -1376,7 +1376,7 @@ void receive() {
         }
         check(pages >= 2 && indexed > 0 && o.kind == pb::PathbNode::HeadersOutcome::Kind::Ban
                       && pb::PathbNodeTestAccess::headers(h[s.a]).size() == 0,
-              "receive (N-1): a BadServed P_r on page 2: BAN and the server's variants released (index "
+              "receive: a BadServed P_r on page 2: BAN and the server's variants released (index "
                       + std::to_string(pb::PathbNodeTestAccess::headers(h[s.a]).size()) + ")");
     }
     {
@@ -1384,10 +1384,10 @@ void receive() {
         Harness h(net);
         h.headers_frame = 1500;
         const Split s = split(h);
-        check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 3, h.now), "receive (N-10): A asks B for at most 3");
+        check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 3, h.now), "receive: A asks B for at most 3");
         const pb::PathbNode::HeadersOutcome o = h[s.a].on_headers(s.b, serve_front(h, s).at(0), h.now);
         check(o.kind == pb::PathbNode::HeadersOutcome::Kind::Keep && o.indexed == 3 && h.q.empty(),
-              "receive (N-10): 3 headers, max reached: no continuation (kind " + std::to_string(static_cast<int>(o.kind)) + ")");
+              "receive: 3 headers, max reached: no continuation (kind " + std::to_string(static_cast<int>(o.kind)) + ")");
     }
 }
 
@@ -1484,7 +1484,7 @@ void base() {
             if (last.action != pb::NodeAction::SideBranch) break;
         }
         check(last.action == pb::NodeAction::NodeInternal && h[b].poisoned(),
-              "base (N-13): switch_best refused on a switch by the journal: NodeInternal (action "
+              "base: switch_best refused on a switch by the journal: NodeInternal (action "
                       + std::to_string(static_cast<int>(last.action)) + ")");
     }
 }
@@ -1537,15 +1537,15 @@ void timers() {
     check(!at.expired(100 + 100 + 12).empty(), "timers: a gap of 12 s after the last frame: expired (non-service)");
     pb::BucketWirePolicy pol{1000, 1, 10000};
     pb::BucketWindow w(pol);
-    check(w.may_request(1, 0), "timers (FIX-1): the first request opens a window");
+    check(w.may_request(1, 0), "timers: the first request opens a window");
     w.requested(1, 0);
     w.received(1, 4000, 5);
     w.received(1, 4500, 6);
-    check(w.may_request(1, 10) && w.bytes(1) == 8500, "timers (FIX-1): 8,500 of 10,000 bytes: one frame (1,000) still fits");
+    check(w.may_request(1, 10) && w.bytes(1) == 8500, "timers: 8,500 of 10,000 bytes: one frame (1,000) still fits");
     w.received(1, 600, 7);
     check(!w.may_request(1, 30) && w.window_end(1) == std::optional<std::uint64_t>(65),
-          "timers (FIX-1): 9,100 bytes: no frame left; the next request after the window (first frame + 60 s)");
-    check(w.may_request(1, 65), "timers (FIX-1): the window ended: a request opens a new one (the wait is not non-service)");
+          "timers: 9,100 bytes: no frame left; the next request after the window (first frame + 60 s)");
+    check(w.may_request(1, 65), "timers: the window ended: a request opens a new one (the wait is not non-service)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1610,7 +1610,7 @@ void buckets() {
         all = all && h[a].on_buckets(d, f, t2).frame.verdict == pb::BucketsFrameVerdict::Accepted;
     }
     check(all && expired2 == 0 && h[a].open_assemblies() == 0,
-          "buckets (P-53): " + std::to_string(fd.size()) + " frames P-53 - 1 s apart: no expiry, assembled whole");
+          "buckets: " + std::to_string(fd.size()) + " frames P-53 - 1 s apart: no expiry, assembled whole");
 }
 }  // namespace
 
