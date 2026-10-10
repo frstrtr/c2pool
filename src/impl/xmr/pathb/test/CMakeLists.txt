@@ -82,6 +82,8 @@
 #                                    (first_pos) and FB_RECEIPTS v3 codecs, frame versions
 #   v37_xmr_pathb_store_kat          the node's own store: K_PHEAD / K_PCARRIER / K_AR, one batch
 #                                    per position, the prefix load, the two-phase reload
+#   v37_xmr_pathb_node_join_kat      PathbNode with the joiner wired: joins over the family-C
+#                                    frames, adoption, the deep switch, the re-ask
 #   v37_xmr_pathb_node_kat           PathbNode: three in-process nodes, relay, the template and
 #                                    the job, re-pend, restart, HOLD, the timers
 #
@@ -143,7 +145,8 @@ if (BUILD_TESTING)
             v37_xmr_pathb_admit_kat
             v37_xmr_relay_family_c_kat
             v37_xmr_pathb_store_kat
-            v37_xmr_pathb_node_kat)
+            v37_xmr_pathb_node_kat
+            v37_xmr_pathb_node_join_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
@@ -172,4 +175,6 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_pathb_store_kat PRIVATE xmr_pathb_store)
     # v37_xmr_joiner_kat replays several chains of 4,700+ carriers (ASan ~12 min).
     set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
+    # v37_xmr_pathb_node_join_kat joins chains of 4,700+ carriers through PathbNode.
+    set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES TIMEOUT 3000)
 endif()

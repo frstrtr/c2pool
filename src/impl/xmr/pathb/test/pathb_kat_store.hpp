@@ -231,8 +231,9 @@ inline std::string lane_digest(KatNode& n) {
 }
 
 // A joined-shape copy of a node's store: first_pos = root + 1 - N_rt, root_pos
-// = root (its S kept, the AR joiner seed there), base_pos = base (the leaves
-// below its leaf count gone), the records below the root headers without S.
+// = root (its S kept, the AR joiner seed there), base_pos = base, the base's
+// leaf count and peaks at the joined MMR's start lc(H(root)) (F-5; the leaves
+// below it gone), the records below the root headers without S.
 inline MemoryKv joined_shape(const MemoryKv& from, KatNode& n, std::uint64_t root, std::uint64_t base) {
     MemoryKv kv = from;
     pb::StoreHead h = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
@@ -240,7 +241,8 @@ inline MemoryKv joined_shape(const MemoryKv& from, KatNode& n, std::uint64_t roo
     h.first_pos = first;
     h.root_pos = root;
     h.base_pos = base;
-    h.base_leaf_count = n.store.view_at(*n.store.best_at(base)).leaf_count();
+    // the base at the joined MMR's start (F-5): lc(H(root)), its peaks
+    h.base_leaf_count = pb::bin_leaf_count(n.tree.find(*n.store.best_at(root))->H, kLaneB0, pb::kRuledLaneParams.open_bins);
     h.base_peaks = *n.store.best_mmr().prefix_peaks(h.base_leaf_count);
     const pb::RatchetState s_root = n.tree.find(*n.store.best_at(root))->rs;
     h.s_base = pb::encode_ratchet_state(n.tree.find(*n.store.best_at(base))->rs);

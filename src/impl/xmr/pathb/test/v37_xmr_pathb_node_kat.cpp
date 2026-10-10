@@ -94,7 +94,7 @@ namespace c2pool::xmr::pathb {
 struct PathbNodeTestAccess {
     static void add_pending(PathbNode& n, PendingReceipt r) { n.pending_.add(std::move(r)); }
     static std::vector<ReceiptBodyV3> carried(PathbNode& n, std::uint64_t x, std::uint64_t h) { return n.carried_list(x, h); }
-    static const HeaderIndex& headers(const PathbNode& n) { return n.headers_; }
+    static const HeaderIndex& headers(const PathbNode& n) { return *n.headers_; }
     static std::uint64_t max_settle_depth(const PathbNode& n) { return n.max_settle_depth_; }
     static std::size_t closed(const PathbNode& n) { return n.closed_.size(); }
     static std::size_t abandoned(const PathbNode& n) { return n.abandoned_.size(); }
@@ -326,6 +326,81 @@ void repend() {
                   + std::to_string(H_sw) + "): lost " + std::to_string(lost) + "; X's own receipt re-pended ("
                   + std::to_string(rep) + "); pending " + std::to_string(pend) + ", carried " + std::to_string(x_carried));
     g.pump();
+}
+
+// ---------------------------------------------------------------------------
+// n-3: a receipt the pending set (P-09) evicts at once is neither relayed nor counted as re-pended.
+void n3() {
+    const KatNet net;
+    {
+        Harness h(net);
+        h.pending_cap = 1;
+        const std::size_t a = h.add(table0(net), true);
+        (void)h.add(table0(net), true);
+        for (int i = 0; i < 4; ++i) {
+            h.tick_monero();
+            h.mine(a, 1, 20 + i);
+        }
+        std::vector<pb::PathbJob> jobs;
+        for (std::uint32_t k = 0; k < 2; ++k) jobs.push_back(*h.job(a, k + 2, 500 + k));
+        h.mine(a, 1, 30);
+        const auto rid = [&](std::size_t k) {
+            pb::ReceiptBodyV3 r = jobs[k].body;
+            r.blob.nonce = static_cast<std::uint32_t>(500 + k);
+            return pb::receipt_id(r);
+        };
+        const std::size_t hi = rid(0) < rid(1) ? 1 : 0, lo = 1 - hi;  // one tip, one h: the lower id goes first
+        const pb::NodeEventResult r_hi = h[a].on_own_share(jobs[hi], static_cast<std::uint32_t>(500 + hi), pb::Hash32{});
+        h.q.clear();
+        const pb::NodeEventResult r_lo = h[a].on_own_share(jobs[lo], static_cast<std::uint32_t>(500 + lo), pb::Hash32{});
+        bool relayed = false;
+        for (const Msg& m : h.q) relayed = relayed || (m.from == a && !m.frame.empty() && m.frame[0] == pb::kOpFbReceipts);
+        h.q.clear();
+        check(r_hi.action == pb::NodeAction::Pending && r_lo.action == pb::NodeAction::None && !relayed
+                      && h[a].pending().size() == 1 && h[a].pending().holds(rid(hi)),
+              "n3: with a pending cap of 1 a share the pending set evicts at once is not pending and not relayed (action "
+                      + std::to_string(static_cast<int>(r_lo.action)) + ")");
+    }
+    {
+        // B (P-09 = 1): X = 2 carriers; a share P on X1 at a later Monero height pending; a heavier Y from A: the
+        // re-pend of X's own receipts (older origin bins, or P's bin and tip with a lower id) evicted at once
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true);
+        h.pending_cap = 1;
+        const std::size_t b = h.add(table0(net), true);
+        for (int i = 0; i < 5; ++i) {
+            h.tick_monero();
+            h.mine(a, 1, 40 + i);
+        }
+        h.cut = {{a, b}, {b, a}};
+        h.mine(b, 9, 610);
+        const pb::Hash32 x1 = h[b].tree().best().id;
+        h.tick_monero(2);
+        const pb::PathbJob jp = *h.job(b, 7, 612);
+        h.mine(b, 9, 611);
+        const pb::Hash32 x2 = h[b].tree().best().id;
+        const pb::NodeEventResult rp = h[b].on_own_share(jp, 612, pb::Hash32{});
+        pb::ReceiptBodyV3 pr = jp.body;
+        pr.blob.nonce = 612;
+        const pb::Hash32 p_id = pb::receipt_id(pr);
+        const pb::Hash32 x2_own = pb::receipt_id(h[b].bodies().get(x2)->own);
+        for (int i = 0; i < 3; ++i) h.mine(a, 2, 620 + i);
+        h.cut.clear();
+        h.q.clear();
+        std::uint64_t rep = 0;
+        bool switched = false;
+        for (std::uint64_t x = 6; x <= 8; ++x) {
+            const pb::Hash32 id = *h[a].store().best_at(x);
+            const pb::NodeEventResult r = h[b].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(id), 16));
+            rep += r.repended;
+            switched = switched || r.action == pb::NodeAction::Switched;
+        }
+        h.q.clear();
+        const std::uint64_t want = x2_own > p_id ? 1 : 0;  // X2's own receipt has P's bin and tip: the id orders
+        check(rp.action == pb::NodeAction::Pending && x1 != x2 && switched && rep == want && h[b].pending().size() == 1,
+              "n3: a re-pended receipt the pending set evicts at once is not counted (re-pended " + std::to_string(rep)
+                      + ", expected " + std::to_string(want) + " of X's 2)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +699,24 @@ void joinserve() {
     check(f0.bodies > 0 && f0.headers > 0,
           "joinserve: floors at L 5700 from join_serve_floors (bodies " + std::to_string(f0.bodies) + ", headers "
                   + std::to_string(f0.headers) + ")");
+    {
+        // E-102: the header floor is the claimed prefix start's lowest read record (pre_start's read_lo), at or below
+        // x0 - N_rt; the body floor x0 - J_0 - 1
+        const auto rec = [&](std::uint64_t x) -> std::optional<std::uint64_t> {
+            const std::optional<pb::Hash32> id = sn.n.store.best_at(x);
+            if (!id) return std::nullopt;
+            return sn.n.node(*id).H;
+        };
+        const pb::LaneParams& p = pb::kRuledLaneParams;
+        const pb::SpanResult sp = pb::span_bounds(p, 5700, rec, kLaneB0);
+        const pb::PreStart ps = pb::pre_start(p, sp.bounds.x0, rec);
+        const std::uint64_t nrt = pb::join_n_rt(p), j0 = pb::journal_j0(p, pb::kSealDepth);
+        check(sp.status == pb::SpanStatus::Ok && ps.status == pb::SpanStatus::Ok && f0.headers == ps.read_lo
+                      && f0.headers <= sp.bounds.x0 - nrt && f0.headers < f0.bodies && f0.bodies == sp.bounds.x0 - j0 - 1,
+              "joinserve: the header floor = the prefix start's lowest read record " + std::to_string(ps.read_lo)
+                      + " (x_pre " + std::to_string(ps.x_pre) + ", x0 - N_rt " + std::to_string(sp.bounds.x0 - nrt)
+                      + "); the body floor = x0 - J_0 - 1");
+    }
     // an attempt's first request: FC_GETHEADERS of the best tip (from and stop zero) starts the hold
     const std::vector<std::uint8_t> first = pb::encode_fc_getheaders(pb::GetHeaders{0, pb::Hash32{}, pb::Hash32{}, 16});
     (void)a.serve_getheaders(9, first, h.now);
@@ -1231,6 +1324,40 @@ void receive() {
                       + std::to_string(pb::PathbNodeTestAccess::max_settle_depth(h[a])) + ")");
     }
     {
+        // n-2: a RandomX failure while released carriers are placed: the event throws, the queue is cleared and the
+        // next release drains again
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+        for (int i = 0; i < 3; ++i) {
+            h.tick_monero();
+            h.mine(a, 1, 40 + i);
+        }
+        h.cut = {{b, a}};
+        for (int i = 0; i < 30; ++i) h.mine(b, 1, 50 + i);
+        h.cut.clear();
+        h.q.clear();
+        const auto frame_at = [&](std::uint64_t x) {
+            return *pb::encode_fc_carrier(0, *h[b].bodies().get(*h[b].store().best_at(x)), 16);
+        };
+        for (std::uint64_t x = 33; x >= 5; --x) (void)h[a].on_carrier(b, frame_at(x));
+        h.throw_pow.insert(*h[b].store().best_at(10));
+        bool threw = false;
+        try {
+            (void)h[a].on_carrier(b, frame_at(4));
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        h.q.clear();
+        const std::uint64_t stopped = h[a].store().tip_pos();
+        // the rest again, parked, then the first missing one: drained to the top
+        for (std::uint64_t x = 33; x >= stopped + 2; --x) (void)h[a].on_carrier(b, frame_at(x));
+        (void)h[a].on_carrier(b, frame_at(stopped + 1));
+        h.q.clear();
+        check(threw && stopped == 9 && h[a].tree().best().id == h[b].tree().best().id,
+              "receive: a failure while released carriers are placed: the event throws at 10, the queue cleared; "
+              "the next release drains to the top (stopped at " + std::to_string(stopped) + ")");
+    }
+    {
         // N-1: a P_r served bad on a later page: BAN, the server's earlier variants released
         Harness h(net);
         h.headers_frame = 1500;
@@ -1498,6 +1625,7 @@ int main(int argc, char** argv) {
     run("race", race);
     run("carriage", carriage);
     run("repend", repend);
+    run("n3", n3);
     run("own", own_share);
     run("m23", m23);
     run("restart", restart);

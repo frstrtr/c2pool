@@ -19,6 +19,10 @@
 //       from the base's peaks (the full form fails LeafHash); a joined-shape
 //       store (first_pos, root_pos, base_pos, its AR seed) reloads with the
 //       live node's window and roots; one position after the base reloads;
+//       F-5: a joined store (its base at lc(H(x0 - 1)) and its peaks)
+//       restarted at tip == base_pos reloads with no re-join, live-equal,
+//       first_leaf() = lc(H(x0 - 1)) (V-F5a, a bin sealed at L_j and not);
+//       a leaf it holds replaced: Anchor at tip == base_pos (V-F5b);
 //   (5) phase 1 checks every stored body below q0 (id, parent, fold): a
 //       corrupted body is a load failure; so is a broken parent link;
 //   (6) a write failure poisons the node and leaves the poison mark (the
@@ -281,8 +285,8 @@ void prefix_and_joined() {
     h.first_pos = first;
     h.root_pos = root;
     h.base_pos = base;
-    const pb::LaneView bv = n.store.view_at(*n.store.best_at(base));
-    h.base_leaf_count = bv.leaf_count();
+    // the base at the joined MMR's start (F-5): lc(H(x0 - 1)), its peaks
+    h.base_leaf_count = pb::bin_leaf_count(n.tree.find(*n.store.best_at(root))->H, kLaneB0, pb::kRuledLaneParams.open_bins);
     h.base_peaks = *n.store.best_mmr().prefix_peaks(h.base_leaf_count);
     const pb::RatchetState s_root = n.tree.find(*n.store.best_at(root))->rs;
     h.s_base = pb::encode_ratchet_state(n.tree.find(*n.store.best_at(base))->rs);
@@ -328,17 +332,68 @@ void prefix_and_joined() {
         MemoryKv k2 = kv;
         pb::StoreHead h2 = h;
         h2.base_pos = 3699;
-        h2.base_leaf_count = n.store.view_at(*n.store.best_at(3699)).leaf_count();
-        h2.base_peaks = *n.store.best_mmr().prefix_peaks(h2.base_leaf_count);
         k2.data[pb::store_keys::phead(0)] = pb::encode_phead(h2);
-        for (std::uint64_t i = h.base_leaf_count; i < h2.base_leaf_count; ++i) {
-            k2.data.erase(pb::lane_keys::blhash(0, i));
-            k2.data.erase(pb::lane_keys::bleaf(0, i));
-        }
         Reloaded r2 = reload(net, k2, 64);
         check(r2.n && r2.r.state->q0 == 3700 && r2.n->tree.best().id == n.tree.best().id,
               "(4) a store one position after its base reloads: " + why(r2.r));
     }
+}
+
+// ---------------------------------------------------------------------------
+// (4) F-5: a joined store restarted at its base (tip == base_pos = L_j, before its first extension), the base at the
+// joined MMR's start lc(H(x0 - 1)) with its peaks. V-F5a: L_j 3,708 (a bin sealed at L_j) and 3,700 load with no
+// re-join, live-equal, first_leaf() = lc(H(x0 - 1)). V-F5b: a leaf in [lc(H(x0 - 1)), lc(H(L_j - 1))) replaced (K_BMMR
+// consistent): the anchor at tip == base_pos -> Anchor.
+void f5_at(std::uint64_t L) {
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, L, 0x85, 2, 25);
+    KatNode& n = sn.n;
+    const std::uint64_t F = pb::kRuledLaneParams.open_bins;
+    const auto Hx = [&](std::uint64_t x) { return n.tree.find(*n.store.best_at(x))->H; };
+    const std::uint64_t root = 2300;  // x0 - 1
+    const std::uint64_t lc0 = pb::bin_leaf_count(Hx(root), kLaneB0, F);
+    const std::uint64_t lc_l1 = pb::bin_leaf_count(Hx(L - 1), kLaneB0, F);
+    const std::uint64_t lc_l = pb::bin_leaf_count(Hx(L), kLaneB0, F);
+    const std::string tag = "(4) joined store restarted at L_j " + std::to_string(L) + " (lc " + std::to_string(lc0) + " / " + std::to_string(lc_l1)
+                            + " / " + std::to_string(lc_l) + "): ";
+    check(n.tree.best().pos == L && lc0 < lc_l1 && (L % 12 != 0 || lc_l > lc_l1), tag + "the chain");
+    {
+        MemoryKv kv = joined_shape(sn.kv, n, root, L);
+        const pb::StoreHead hd = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
+        Reloaded r = reload(net, kv, 64);
+        bool same = false;
+        if (r.n) {
+            const pb::TipWindow a = n.window(n.tree.best().id), b = r.n->window(r.n->tree.best().id);
+            same = a.ok() && b.ok() && a.window_root == b.window_root && a.mmr_root == b.mmr_root
+                   && r.n->tree.best().id == n.tree.best().id && r.n->tree.best().rs == n.tree.best().rs
+                   && r.n->store.head().root == n.store.head().root && r.n->ar.rows().size() == 1
+                   && r.n->ar.joiner_p0() == root + 1;
+        }
+        check(hd.base_leaf_count == lc0 && r.r.fault == pb::StoreFault::None && r.r.state && r.r.state->q0 == L + 1 && same
+                      && r.n && r.n->store.first_leaf() == lc0,
+              tag + "restart at tip == base_pos loads with no re-join, live-equal (tip, S, AR seed, MMR head, "
+                    "window_root, mmr_root), first_leaf() = lc(H(x0 - 1)): " + why(r.r));
+    }
+    {
+        MemoryKv kv = joined_shape(sn.kv, n, root, L);
+        pb::BmmrHead bh = *pb::decode_bmmr(kv.data[pb::lane_keys::bmmr(0)]);
+        const std::uint64_t li = (lc0 + lc_l1) / 2;
+        kv.data[pb::lane_keys::blhash(0, li)] = pb::encode_blhash(seq32(0x99));
+        kv.data.erase(pb::lane_keys::bleaf(0, li));
+        pb::BinMmr m = *pb::BinMmr::from_peaks(lc0, *n.store.best_mmr().prefix_peaks(lc0));
+        for (std::uint64_t i = lc0; i < bh.leaf_count; ++i) m.append(*pb::decode_blhash(kv.data[pb::lane_keys::blhash(0, i)]));
+        bh.root = m.root();
+        bh.peaks = m.peaks();
+        kv.data[pb::lane_keys::bmmr(0)] = pb::encode_bmmr(bh);
+        const Reloaded r = reload(net, kv, 64);
+        check(r.r.fault == pb::StoreFault::Anchor,
+              tag + "leaf " + std::to_string(li) + " replaced (K_BMMR consistent): the anchor at tip == base_pos: " + why(r.r));
+    }
+}
+void f5() {
+    f5_at(3708);  // a bin sealed at L_j (309 x 12)
+    f5_at(3700);  // none sealed at L_j
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +626,7 @@ int main(int argc, char** argv) {
     run("load", batches_and_load);
     run("switch", switch_batch);
     run("prefix", prefix_and_joined);
+    run("f5", f5);
     run("faults", faults);
     run("head", head_reads);
     run("phase1link", phase1_link);

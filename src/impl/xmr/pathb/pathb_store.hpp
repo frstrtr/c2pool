@@ -46,12 +46,10 @@
 //     4. AR: ascending, at or below the tip, consistent with S_tip (or the
 //        joiner seed of a joined store);
 //     5. q0 = max(base_pos + 1, tip - J + 1); phase 1 (positions s1 .. q0 - 1,
-//        s1 = the first position above the root with H(x) > min(H(q0 - 1) -
-//        F - Fresh, H(tip) - 2 (F + Fresh))): every stored placement there,
-//        with its stored p_own and live (the bins still open at q0 - 1, and the
-//        bins a window of a tip the node may still judge reads from
-//        placements), each body checked against its stored id, parent link and
-//        receipts_root fold; phase 2 (q0 .. tip): every position placed again
+//        s1 = the first position above the root with H(x) > H(q0 - 1) - F -
+//        Fresh): the stored placements whose bin is open at q0 - 1, with their
+//        stored p_own and live, each body checked against its stored id,
+//        parent link and receipts_root fold; phase 2 (q0 .. tip): every position placed again
 //        as a live node places it (tree, BinStore, rs_step_at, AR), its
 //        stored S, d, cum_work, H, live flags, mmr_root and AR row compared;
 //     6. the lane records at or beyond leaf_count deleted (one batch).
@@ -429,6 +427,73 @@ inline LaneBatch switch_batch(std::uint32_t chain, StoreHead& head, const Carrie
     return lane;
 }
 
+// The batch of an adoption (S4wD 3.3; the caller prepends clear_store_batch:
+// an EMPTY store, its poison mark deleted with it): the adopted state at its
+// tip L. The lane records from the MMR's first leaf on; K_PCARRIER of every
+// position the store holds: the claimed prefix [first_pos, root_pos) as
+// header records without S, the root (x0 - 1, or position 0 of a young chain)
+// with its S, the span with its bodies and placements; every AR row; K_PHEAD
+// with the store base: base_pos = L, base_leaf_count = first_leaf() =
+// lc(H(x0 - 1)) and base_peaks its peaks (0 and none on a young chain),
+// S_base = S_L. nullopt: a position the store names that the tree does not
+// hold.
+inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree,
+                                               const BinStore& store, const CarrierBodies& bodies,
+                                               const ActivationRecord& ar, std::uint64_t root_pos) {
+    LaneBatch b;
+    store.write_all(b);
+    // the open-bin placements by carrier (a position below the journal holds no delta)
+    std::map<Hash32, std::map<Hash32, StoredPlacement>> open;
+    for (const auto& [bin, xs] : store.placements_by_bin())
+        for (const Placement& x : xs) open[x.carrier][x.id] = StoredPlacement{x.bin, x.p_own, x.live};
+    const std::uint64_t first = store.first_record_pos();
+    for (std::uint64_t x = first; x <= store.tip_pos(); ++x) {
+        const std::optional<Hash32> id = store.best_at(x);
+        const CarrierNode* n = id ? tree.find(*id) : nullptr;
+        if (n == nullptr) return std::nullopt;
+        CarrierRecord c = record_of(*n, bodies.get(*id), store.delta(*id));
+        const CarrierBodyV3* body = bodies.get(*id);
+        if (x > root_pos && store.delta(*id) == nullptr && body != nullptr) {
+            // a placement of a bin sealed at the tip: {0, 0, false} (a restart ingests the open bins only)
+            const auto oc = open.find(*id);
+            const auto sp = [&](const ReceiptBodyV3& r) {
+                if (oc != open.end())
+                    if (const auto it = oc->second.find(receipt_id(r)); it != oc->second.end()) return it->second;
+                return StoredPlacement{};
+            };
+            c.placements.clear();
+            for (const ReceiptBodyV3& r : body->carried) c.placements.push_back(sp(r));
+            c.placements.push_back(sp(body->own));
+        }
+        if (x < root_pos) {  // a claimed prefix header: no S, no body
+            c.state.reset();
+            c.kind = RecordBody::None;
+            c.bytes.clear();
+            c.placements.clear();
+        }
+        if (x > first)
+            if (const std::optional<Hash32> below = store.best_at(x - 1)) c.parent = *below;
+        put_position(b, chain, c, std::nullopt);
+    }
+    for (const ActivationRow& a : ar.rows()) b.put(store_keys::ar(chain, a.h_act), encode_ar_row(a));
+    head_at_tip(head, store);
+    head.first_pos = first;
+    head.root_pos = root_pos;
+    head.base_pos = store.tip_pos();
+    head.base_leaf_count = store.first_leaf();
+    head.base_peaks.clear();
+    if (store.first_leaf() > 0) {
+        const std::optional<std::vector<Hash32>> pk = store.best_mmr().prefix_peaks(store.first_leaf());
+        if (!pk) return std::nullopt;
+        head.base_peaks = *pk;
+    }
+    const CarrierNode* tip = tree.find(store.best_tip());
+    if (tip == nullptr) return std::nullopt;
+    head.s_base = encode_ratchet_state(tip->rs);
+    put_head(b, chain, head);
+    return b;
+}
+
 // The key prefixes of a store (its records, its lane records, its poison mark).
 inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
@@ -624,7 +689,7 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         }
     }
     const RatchetState s_tip = decode_ratchet_state(*recs.back().state);
-    const bool joined = H.base_pos > 0;
+    const bool joined = H.root_pos > 0;  // a young-chain adoption (root at position 0) holds the genesis AR, no seed
     const std::uint64_t q0 = std::max(H.base_pos + 1, tip + 1 > in.journal_depth ? tip + 1 - in.journal_depth : 0);
     ActivationRecord ar;
     std::size_t ri = 0;
@@ -658,8 +723,7 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     const std::uint64_t H_root = rec_at(root).H;
     const std::uint64_t span = p.open_bins + p.fresh_max;
     const std::uint64_t floor_a = H_root > span ? H_root - span : 0;
-    const std::uint64_t floor_b = records.back() > 2 * span ? records.back() - 2 * span : 0;
-    const std::uint64_t s1 = first_above(records, H.first_pos, H.root_pos + 1, std::min(floor_a, floor_b));
+    const std::uint64_t s1 = first_above(records, H.first_pos, H.root_pos + 1, floor_a);
     std::vector<Placement> placements;
     CarrierBodies bodies;
     for (std::uint64_t x = std::max(H.root_pos, H.first_pos); x <= root; ++x) {
@@ -675,9 +739,11 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
             != FoldVerdict::Match)
             return fail(StoreFault::Phase1, x);
         if (c.placements.size() != b->carried.size() + 1) return fail(StoreFault::Phase1, x);
+        // only the placements whose bin is open at q0 - 1 (b > H(q0 - 1) - F)
+        const auto open = [&](const StoredPlacement& sp) { return open_at(H_root, sp.bin, p.open_bins); };
         for (std::size_t k = 0; k < b->carried.size(); ++k)
-            placements.push_back(store_detail::placement_from(b->carried[k], c.placements[k], x, c.id));
-        placements.push_back(store_detail::placement_from(b->own, c.placements.back(), x, c.id));
+            if (open(c.placements[k])) placements.push_back(store_detail::placement_from(b->carried[k], c.placements[k], x, c.id));
+        if (open(c.placements.back())) placements.push_back(store_detail::placement_from(b->own, c.placements.back(), x, c.id));
     }
     // the store at the root
     BinStore::RestoredStart rs;

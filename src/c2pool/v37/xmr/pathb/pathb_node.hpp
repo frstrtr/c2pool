@@ -47,7 +47,16 @@
 //                     event (NodeInternal; nothing judged, pended, parked or
 //                     flooded), the status alarm, the poison mark the next
 //                     load reports
-//   join              the joiner path: the hookup is a later commit
+//   join              the joiner (E15; 3.3, 3.3a): one Joiner, one
+//                     PathbJoinLink per accepted HELLO peer; A = the full
+//                     node's own chain (FullNodeA) or the adopted state;
+//                     candidates from a HELLO tail (no A; a joined node: a tip
+//                     it does not hold) and from a header or body switch that
+//                     takes the joiner path; run_join runs the next pair on
+//                     the join worker and applies an adoption or replacement
+//                     (the adoption batch into a cleared store); the E-72
+//                     re-ask after a switch by the journal at a joined node;
+//                     a load failure (LoadFailed) starts empty and joins
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -77,11 +86,12 @@
 #include "impl/xmr/pathb/pathb_bucket_wire.hpp"
 #include "impl/xmr/pathb/pathb_catchup.hpp"
 #include "impl/xmr/pathb/pathb_hello.hpp"
-#include "impl/xmr/pathb/pathb_join.hpp"  // admit_receipt_from (and the joiner, wired last)
+#include "impl/xmr/pathb/pathb_join.hpp"  // admit_receipt_from, the joiner
 #include "impl/xmr/pathb/pathb_pool_identity.hpp"
 #include "impl/xmr/pathb/pathb_relay_wire.hpp"
 #include "impl/xmr/pathb/pathb_store.hpp"
 
+#include "c2pool/v37/xmr/pathb/pathb_join_link.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_timers.hpp"
 
 namespace c2pool::xmr::pathb {
@@ -139,6 +149,8 @@ struct PathbNodeIo {
     // a frame to one peer; a frame to every peer but `except` (relay policy)
     std::function<void(std::uint64_t peer, const std::vector<std::uint8_t>& frame)> send;
     std::function<void(const std::vector<std::uint8_t>& frame, std::optional<std::uint64_t> except)> flood;
+    // FB_GETCTX of a Monero block from any peer into the follower within the timeout (a join attempt's context)
+    std::function<bool(const Hash32& id, std::uint64_t timeout_s)> fetch_context;
 };
 
 // ---------------------------------------------------------------------------
@@ -184,10 +196,23 @@ struct BucketsEventResult {
     FrameOutcome frame;
 };
 
+// One step of the joiner (PathbNode::run_join): the attempt's report, the
+// switch it made (adopted / replaced, the lost count) and whether the node
+// now runs on the adopted state.
+struct JoinStep {
+    std::optional<AttemptReport> report;
+    SwitchReport sw;
+    bool switched = false;       // the node's state is the adopted one from now on
+    bool batch_written = false;  // the adoption batch committed into an empty store
+    std::uint64_t reasked = 0;   // E-72: claimed leaves asked again at a carrier of the heavier chain
+    bool reask_joiner = false;   // E-72: a re-asked leaf differed: the joiner path
+};
+
 enum class TemplateStatus : std::uint8_t {
     Ok,
     NoPathbPeer,  // an empty store with no Path B peer and no --pathb-launch
     Poisoned,     // the store failed a write: no template until the joiner path at the next start
+    RestsOnClaims,  // no adopted state (a load failure), or the adopted state still replayed to its L
     Hold,         // E13
     ForkFuse,     // hf >= 17 (O-01)
     Defer,        // a Monero input, a weight input or a bucket is missing (fetch)
@@ -342,8 +367,10 @@ public:
     PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, PathbKv* kv = nullptr)
         : cfg_(cfg),
           io_(std::move(io)),
-          tree_(cfg.p, cfg.identity.pool_id, cfg.identity.height + 1, cfg.T, {}, cfg.rp, cfg.rules_g),
-          store_(cfg.p, cfg.journal_depth, cfg.identity.pool_id, cfg.identity.height + 1, cfg.record_chain),
+          own_tree_(std::in_place, cfg.p, cfg.identity.pool_id, cfg.identity.height + 1, cfg.T,
+                    std::span<const RetargetEntry>{}, cfg.rp, cfg.rules_g),
+          own_store_(std::in_place, cfg.p, cfg.journal_depth, cfg.identity.pool_id, cfg.identity.height + 1,
+                     cfg.record_chain),
           pending_(cfg.pending_cap ? cfg.pending_cap : relay_horizons(cfg.p).pending_cap),
           deferred_(cfg.waiting_cap ? cfg.waiting_cap : waiting_cap_default()),
           timers_(cfg.abandon_timeout_s),
@@ -351,15 +378,27 @@ public:
           budget_(cfg.bucket_policy),
           kv_(kv),
           started_empty_(true) {
+        point_own();
         head_ = head_of(cfg);
         if (kv_ != nullptr) {
             // into an empty store: every key of the store's prefixes deleted in the same batch
             LaneBatch b;
             const bool cleared = clear_store_batch(*kv_, cfg_.record_chain, b);
-            const LaneBatch g = genesis_batch(cfg_.record_chain, head_, tree_, store_);
+            const LaneBatch g = genesis_batch(cfg_.record_chain, head_, *tree_, *store_);
             b.ops.insert(b.ops.end(), g.ops.begin(), g.ops.end());
-            if (!cleared || !commit_lane_batch(*kv_, b)) poison(tree_.genesis().id);
+            if (!cleared || !commit_lane_batch(*kv_, b)) poison(tree_->genesis().id);
         }
+        init_join();
+    }
+
+    // A start after a load failure (E-38, the joiner path): the store is
+    // started empty (position 0, its prefixes cleared) and the node rests on
+    // claims (no template, nothing relayed) until an attempt is adopted; every
+    // Path B HELLO tail is a candidate.
+    struct LoadFailed {};
+    PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, PathbKv* kv, LoadFailed) : PathbNode(cfg, std::move(io), kv) {
+        load_failed_ = true;
+        refresh_own_chain();
     }
 
     // A node from its loaded store (pathb_load); a load failure is the caller's
@@ -367,10 +406,10 @@ public:
     PathbNode(const PathbNodeConfig& cfg, PathbNodeIo io, LoadedState loaded, PathbKv* kv)
         : cfg_(cfg),
           io_(std::move(io)),
-          tree_(std::move(loaded.tree)),
-          store_(std::move(loaded.store)),
-          ar_(std::move(loaded.ar)),
-          bodies_(std::move(loaded.bodies)),
+          own_tree_(std::move(loaded.tree)),
+          own_store_(std::move(loaded.store)),
+          own_ar_(std::move(loaded.ar)),
+          own_bodies_(std::move(loaded.bodies)),
           pending_(cfg.pending_cap ? cfg.pending_cap : relay_horizons(cfg.p).pending_cap),
           deferred_(cfg.waiting_cap ? cfg.waiting_cap : waiting_cap_default()),
           timers_(cfg.abandon_timeout_s),
@@ -378,19 +417,21 @@ public:
           budget_(cfg.bucket_policy),
           kv_(kv),
           started_empty_(false) {
+        point_own();
         head_ = loaded.head;
-        refs_ = std::move(loaded.refs);
+        *refs_ = std::move(loaded.refs);
+        init_join();
     }
 
     PathbNode(const PathbNode&) = delete;
     PathbNode& operator=(const PathbNode&) = delete;
 
     // ---- state ----
-    const CarrierTree& tree() const noexcept { return tree_; }
-    const BinStore& store() const noexcept { return store_; }
-    const ActivationRecord& ar() const noexcept { return ar_; }
-    const CarrierBodies& bodies() const noexcept { return bodies_; }
-    const HeaderIndex& headers() const noexcept { return headers_; }
+    const CarrierTree& tree() const noexcept { return *tree_; }
+    const BinStore& store() const noexcept { return *store_; }
+    const ActivationRecord& ar() const noexcept { return *ar_; }
+    const CarrierBodies& bodies() const noexcept { return *bodies_; }
+    const HeaderIndex& headers() const noexcept { return *headers_; }
     const PendingSet& pending() const noexcept { return pending_; }
     const DeferredCarriers& deferred() const noexcept { return deferred_; }
     const AlarmSink& alarms() const noexcept { return alarm_; }
@@ -399,7 +440,47 @@ public:
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
     std::uint64_t best_changes() const noexcept { return generation_; }
     StoreFaults& faults() noexcept { return faults_; }
-    WindowCache& windows() noexcept { return windows_; }
+    WindowCache& windows() noexcept { return *windows_; }
+
+    // ---- the joiner (E15; 3.3a) ----
+    // The transport of the join attempts' requests (the relay node's, on the join worker).
+    void set_join_transport(JoinTransport* t) { transport_ = t; }
+    const Joiner& joiner() const noexcept { return *joiner_; }
+    const JoinedState* joined() const noexcept { return joined_; }
+    const PathbJoinLink* join_link(std::uint64_t peer) const {
+        const auto it = links_.find(peer);
+        return it == links_.end() ? nullptr : it->second.get();
+    }
+    // 3.3a (2): the state rests on claims: no adopted state after a load failure, or the adopted state still
+    // replayed to its L (no template, nothing relayed).
+    // An attempt runs (3.3a: A keeps building templates, relaying and judging meanwhile).
+    bool attempting() const noexcept { return attempting_; }
+    bool rests_on_claims() const noexcept {
+        if (joined_ != nullptr) return joined_->claims().rests_on_claims();
+        return load_failed_;
+    }
+
+    // One step of the joiner (run by the join worker; the adoption is applied
+    // here, which the caller runs on the owner executor): the E-72 re-ask of
+    // claimed leaves after a switch by the journal, then the next queued
+    // (candidate, server) pair. An adoption or a replacement makes the
+    // attempt's state the node's and writes it into an empty store.
+    JoinStep run_join() {
+        JoinStep out;
+        if (poisoned_) return out;
+        if (reask_pending_ && joined_ != nullptr) reask_claimed(out);
+        attempting_ = true;
+        out.report = joiner_->run_next();
+        attempting_ = false;
+        for (auto& [peer, l] : links_) l->reset();  // what an attempt received is its own
+        if (!out.report) return out;
+        out.sw = joiner_->last_switch();
+        if (out.sw.adopted || out.sw.replaced) {
+            out.switched = true;
+            out.batch_written = adopt();
+        }
+        return out;
+    }
 
     // ---- HELLO (E10) ----
     PathbHello our_hello(std::uint64_t node_nonce, std::uint16_t listen_port) const {
@@ -409,8 +490,8 @@ public:
         h.pool_id = cfg_.identity.pool_id;
         h.node_nonce = node_nonce;
         h.listen_port = listen_port;
-        const CarrierNode& b = tree_.best();
-        const LaneView v = store_.view_at(b.id);
+        const CarrierNode& b = tree_->best();
+        const LaneView v = store_->view_at(b.id);
         // the rules list of the node's epoch_cur (the compiled table's; epoch 0: the network's list)
         PathbLaneRules rules = epoch0_lane_rules(cfg_.identity.network);
         for (const CompiledEpoch& c : cfg_.T.compiled)
@@ -427,19 +508,37 @@ public:
         const HelloCheck c = pathb_hello_receive(
                 ours, frame,
                 [this](const Hash32& tip) -> std::optional<std::uint64_t> {
-                    // a best tip bound at this node: a carrier it placed (its own #9 matched)
-                    const CarrierNode* n = tree_.find(tip);
+                    // a best tip bound at this node: a carrier it placed (its own #9 matched); at a joined node never a
+                    // claimed one (a prefix node, a span carrier at or below x1: its #9 not computed here)
+                    const CarrierNode* n = tree_->find(tip);
                     if (n == nullptr) return std::nullopt;
+                    if (claims_ != nullptr) {
+                        const CarrierBodyV3* b = bodies_->get(tip);
+                        const std::optional<Hash32> dg = b ? header_digest(header_of(*b)) : std::nullopt;
+                        if (!dg || claims_->header_binding(tip, *dg) != Basis::Computed) return std::nullopt;
+                    }
                     return n->H;
                 },
-                store_.b0(), cfg_.p.open_bins, &theirs);
-        if (c.verdict == HelloVerdict::Accept) peers_[peer] = theirs.tail;
+                store_->b0(), cfg_.p.open_bins, &theirs);
+        if (c.verdict == HelloVerdict::Accept) {
+            peers_[peer] = theirs.tail;
+            if (transport_ != nullptr && links_.count(peer) == 0)
+                links_[peer] = std::make_unique<PathbJoinLink>(peer, *transport_, cfg_.identity.chain_id, cfg_.p,
+                                                               cfg_.buffers, frame_bytes_headers(), cfg_.bucket_policy);
+            // the candidates of a trigger: with no A (an empty store at position 0, a load failure) every tail;
+            // with a joined A a tip it does not hold (its fork may lie below what the node holds; the attempt's
+            // scope at the reply's L decides, 3.3a (4), ruling 46 S4wa-1 (b))
+            const bool no_a = joiner_->a() == nullptr;
+            const bool unheld = tree_->find(theirs.tail.best_tip) == nullptr;
+            if (theirs.tail.best_tip != cfg_.identity.pool_id && (no_a || (joined_ != nullptr && unheld)))
+                offer(theirs.tail.best_tip, peer, theirs.tail.best_cum_work);
+        }
         return c;
     }
     bool has_pathb_peer() const noexcept { return !peers_.empty(); }
     void disconnect(std::uint64_t peer) {
         peers_.erase(peer);
-        headers_.release_peer(peer);
+        headers_->release_peer(peer);
         deferred_.forget_peer(peer);
         header_req_.erase(peer);
         timers_.done(Req{peer, ReqKind::Headers, Hash32{}});
@@ -454,6 +553,8 @@ public:
         window_.forget(peer);
         hold_.close(peer);  // one hold per connection
         hold_conns_.erase(peer);
+        joiner_->disconnect(peer);  // the peer's P-52 pairs
+        links_.erase(peer);
         for (auto* keys : {&closed_, &abandoned_})
             for (auto it = keys->begin(); it != keys->end();) {
                 if (it->first == peer)
@@ -532,7 +633,7 @@ public:
         std::uint64_t x = 0;
     };
     HoldState hold_state() const {
-        const CarrierNode& b = tree_.best();
+        const CarrierNode& b = tree_->best();
         HoldState s;
         s.x = b.pos + 1;
         s.epoch_cur = b.rs.epoch_cur;
@@ -545,9 +646,10 @@ public:
     PathbTemplate make_template(std::uint64_t now_ts) {
         PathbTemplate t;
         if (poisoned_) return status(t, TemplateStatus::Poisoned);
-        if (started_empty_ && !cfg_.launch && peers_.empty() && tree_.best().pos == 0)
+        if (rests_on_claims()) return status(t, TemplateStatus::RestsOnClaims);
+        if (started_empty_ && !cfg_.launch && peers_.empty() && tree_->best().pos == 0)
             return status(t, TemplateStatus::NoPathbPeer);
-        const CarrierNode& tip = tree_.best();
+        const CarrierNode& tip = tree_->best();
         t.tip = tip.id;
         t.x = tip.pos + 1;
         if (hold(cfg_.rp, tip.rs, tip.pos, cfg_.T)) return status(t, TemplateStatus::Hold);
@@ -569,7 +671,7 @@ public:
         t.hf = pr.in.hf;
         if (amount_fork_fused(t.hf)) return status(t, TemplateStatus::ForkFuse);
         t.timestamp = std::max(now_ts, pr.in.median60.value_or(0));
-        const std::optional<std::uint64_t> d = tree_.next_difficulty(tip.id);
+        const std::optional<std::uint64_t> d = tree_->next_difficulty(tip.id);
         if (!d) return status(t, TemplateStatus::NoTemplate);
         t.d = *d;
         // the window inputs at A_t (window only)
@@ -627,7 +729,7 @@ public:
     // ---- the job (E3) ----
     std::optional<PathbJob> make_job(const PathbTemplate& t, const PathbSession& s) {
         if (t.status != TemplateStatus::Ok) return std::nullopt;
-        const CarrierNode* tip = tree_.find(t.tip);
+        const CarrierNode* tip = tree_->find(t.tip);
         if (tip == nullptr) return std::nullopt;
         PathbJob job;
         job.tip = t.tip;
@@ -642,7 +744,7 @@ public:
         r.extra_nonce = s.extra_nonce;
         r.payee = s.payee;
         r.side.pool_id = cfg_.identity.pool_id;
-        const EpochAt ea = epoch_at(cfg_.rp, cfg_.T, std::optional<RatchetState>(tip->rs), ar_, tip->pos, tip->rs,
+        const EpochAt ea = epoch_at(cfg_.rp, cfg_.T, std::optional<RatchetState>(tip->rs), *ar_, tip->pos, tip->rs,
                                     tip->pos, t.x);
         r.side.rules_epoch = ea.epoch;
         job.ballot = ballot_to_write(cfg_.rp, tip->rs, t.x, cfg_.T, s.stated_vote, cfg_.vote_no);
@@ -653,7 +755,7 @@ public:
         job.carried = carried_list(t.x, t.h);
         std::vector<Hash32> ids;
         for (const ReceiptBodyV3& c : job.carried) ids.push_back(receipt_id(c));
-        const std::optional<Hash32> rr = tree_.next_receipts_root(t.tip, ids);
+        const std::optional<Hash32> rr = tree_->next_receipts_root(t.tip, ids);
         if (!rr) return std::nullopt;
         r.side.receipts_root = *rr;
         r.side.window_root = t.window.window_root;
@@ -665,9 +767,9 @@ public:
         }
         r.side.give_author_bp = cfg_.give_author_bp;
         r.reward_total = t.reward;
-        refs_[r.side.payee] = s.payee;
+        (*refs_)[r.side.payee] = s.payee;
         // the canonical miner tx of the receipt (the function every node checks it with)
-        const CanonicalTx ct = canonical_miner_tx(r, window_at(t.window), t.tip, t.p_r, t.h, t.hf, keys_, ref_lookup(),
+        const CanonicalTx ct = canonical_miner_tx(r, window_at(t.window), t.tip, t.p_r, t.h, t.hf, *keys_, ref_lookup(),
                                                   cfg_.author);
         if (ct.stop != CoinbaseCheck::Match || !ct.tx) return std::nullopt;
         job.miner_tx = *ct.tx;
@@ -689,8 +791,8 @@ public:
         const Hash32 own_id = receipt_id(r);
         own_pow_ = OwnPow{own_id, pow_hash};
         NodeEventResult out;
-        const CarrierNode* tip = tree_.find(job.tip);
-        if (tip != nullptr && job.tip == tree_.best().id && job.h >= tip->H) {
+        const CarrierNode* tip = tree_->find(job.tip);
+        if (tip != nullptr && job.tip == tree_->best().id && job.h >= tip->H) {
             CarrierBodyV3 c;
             c.own = r;
             c.carried = job.carried;
@@ -715,7 +817,7 @@ public:
         if (!decode_fc_getcarrier(frame, cfg_.identity.chain_id, cfg_.p, q).ok()) return token(out, FrameToken::Strike);
         for (const Hash32& id : q.ids) {  // n <= 17
             (void)join_request(peer, now_s, id);
-            const std::optional<CarrierBodyV3> b = serve_carrier(tree_, bodies_, id, q.want_bodies);
+            const std::optional<CarrierBodyV3> b = serve_carrier(*tree_, *bodies_, id, q.want_bodies);
             if (!b) continue;
             if (const std::optional<std::vector<std::uint8_t>> f = encode_fc_carrier(cfg_.identity.chain_id, *b, cfg_.p.r_max))
                 out.frames.push_back(*f);
@@ -738,16 +840,16 @@ public:
             // its first request (stop zero) starts the peer's hold at the floors of this best tip; a later one
             // continues it
             if (q.stop == Hash32{}) {
-                hold_.first(peer, now_s, store_.tip_pos(), serve_floors_now());
+                hold_.first(peer, now_s, store_->tip_pos(), serve_floors_now());
                 hold_conns_.insert(peer);
             } else {
                 (void)join_request(peer, now_s, q.stop);
             }
             r = joiner_page(q.stop, q.max);
-        } else if (const CarrierNode* from = tree_.find(q.from)) {
+        } else if (const CarrierNode* from = tree_->find(q.from)) {
             r.first_pos = from->pos + 1;
             const std::uint64_t cap = std::min<std::uint64_t>({q.max, cfg_.journal_depth, headers_frame_fit()});
-            r.headers = serve_headers(tree_, store_, bodies_, headers_, q.from, q.stop, cap);
+            r.headers = serve_headers(*tree_, *store_, *bodies_, *headers_, q.from, q.stop, cap);
         }
         if (const std::optional<std::vector<std::uint8_t>> f = encode_fc_headers(r, frame_bytes_headers()))
             out.frames.push_back(*f);
@@ -766,9 +868,9 @@ public:
         (void)join_request(peer, now_s, q.at);
         const std::uint64_t max_bytes = std::min(budget_.remaining(peer, now_s), cfg_.bucket_serve_cap);
         std::optional<RatchetStateBytes> s_parent;
-        if (const CarrierNode* at = tree_.find(q.at); at != nullptr && at->pos > 0)
-            if (const CarrierNode* par = tree_.find(at->parent)) s_parent = encode_ratchet_state(par->rs);
-        out.frames = serve_buckets(store_, q, s_parent, cfg_.bucket_policy.frame_bytes, max_bytes);
+        if (const CarrierNode* at = tree_->find(q.at); at != nullptr && at->pos > 0)
+            if (const CarrierNode* par = tree_->find(at->parent)) s_parent = encode_ratchet_state(par->rs);
+        out.frames = serve_buckets(*store_, q, s_parent, cfg_.bucket_policy.frame_bytes, max_bytes);
         std::uint64_t bytes = 0;
         for (const std::vector<std::uint8_t>& f : out.frames) bytes += f.size();
         budget_.sent(peer, bytes, now_s);
@@ -780,16 +882,16 @@ public:
     // The floors at the best tip ({0, 0} while the span at the tip is the young chain).
     JoinServeFloors serve_floors_now() const {
         const auto rec = [&](std::uint64_t x) -> std::optional<std::uint64_t> {
-            const std::optional<Hash32> id = store_.best_at(x);
-            const CarrierNode* n = id ? tree_.find(*id) : nullptr;
+            const std::optional<Hash32> id = store_->best_at(x);
+            const CarrierNode* n = id ? tree_->find(*id) : nullptr;
             if (n == nullptr) return std::nullopt;
             return n->H;
         };
-        return join_serve_floors(cfg_.p, store_.tip_pos(), rec, store_.b0());
+        return join_serve_floors(cfg_.p, store_->tip_pos(), rec, store_->b0());
     }
     // The floors that apply to a request of `peer` for `item` (an open hold's while its attempt continues).
     JoinServeFloors join_request(std::uint64_t peer, std::uint64_t now_s, const Hash32& item) {
-        const CarrierNode* n = tree_.find(item);
+        const CarrierNode* n = tree_->find(item);
         const JoinServeFloors f = hold_.request(peer, now_s, item, n ? n->pos : UINT64_MAX, serve_floors_now(),
                                                 cfg_.abandon_timeout_s);
         if (!hold_.holding(peer)) hold_conns_.erase(peer);
@@ -820,7 +922,7 @@ public:
     // peer; its continuations go to the same peer). `from` is held: the fork.
     bool request_headers(std::uint64_t peer, const Hash32& from, const Hash32& stop, std::uint16_t max,
                          std::uint64_t now_s) {
-        if (poisoned_ || header_req_.count(peer) != 0 || tree_.find(from) == nullptr) return false;
+        if (poisoned_ || header_req_.count(peer) != 0 || tree_->find(from) == nullptr) return false;
         HeaderRequest r;
         r.fork = from;
         r.from = from;
@@ -868,11 +970,11 @@ public:
         HeadersReply rep;
         if (!decode_fc_headers(frame, cfg_.identity.chain_id, frame_bytes_headers(), cfg_.p, rep).ok()) {
             out.kind = HeadersOutcome::Kind::Undecodable;
-            headers_.release_peer(peer);
+            headers_->release_peer(peer);
             return out;
         }
         // positions follow the hash links from the held fork (first_pos is a claim the links decide)
-        const CarrierNode* fork = tree_.find(req.fork);
+        const CarrierNode* fork = tree_->find(req.fork);
         if (fork == nullptr) {
             out.kind = HeadersOutcome::Kind::Keep;
             return out;
@@ -886,7 +988,7 @@ public:
             }
             if (pr.status == PrInfo::Status::BadServed) {
                 out.kind = HeadersOutcome::Kind::Ban;  // its earlier variants released as on every BAN
-                headers_.release_peer(peer);
+                headers_->release_peer(peer);
                 return out;
             }
             req.got.push_back(h);
@@ -909,7 +1011,7 @@ public:
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
             return seed.has_value() && verify_memo(h.own.blob, d, *seed);
         };
-        const std::optional<std::vector<SideHeader>> side = tree_.check_side_headers(req.fork, ann, pow_ok);
+        const std::optional<std::vector<SideHeader>> side = tree_->check_side_headers(req.fork, ann, pow_ok);
         if (!side) {
             out.kind = HeadersOutcome::Kind::Keep;
             return out;
@@ -917,7 +1019,7 @@ public:
         for (const SideHeader& sh : *side) {
             if (sh.check != HeaderCheck::Passed) {
                 out.kind = HeadersOutcome::Kind::Ban;  // BAN the server; no variant of it indexed, its earlier ones released
-                headers_.release_peer(peer);
+                headers_->release_peer(peer);
                 return out;
             }
             out.ids.push_back(sh.id);
@@ -925,18 +1027,19 @@ public:
         // N-7: a variant enters the index only after the cheap rows and the PoW at d of the whole reply passed on this
         // path (path_ok passed explicitly)
         for (std::size_t i = before; i < side->size(); ++i) {
-            headers_.add(peer, req.got[i], req.heights[i], /*path_ok=*/true);
+            headers_->add(peer, req.got[i], req.heights[i], /*path_ok=*/true);
             ++out.indexed;
         }
         deferred_.touch(out.ids);
-        const CarrierNode& b = tree_.best();
+        const CarrierNode& b = tree_->best();
         const SideBranchDecision dec =
                 decide_side_branch(b.cum_work, b.id, fork->cum_work, *side, 0, std::numeric_limits<std::uint64_t>::max());
         out.fork_pos = fork->pos;
         if (dec.action == SideBranchAction::FetchBodies) {
-            // one depth measure: the journal base (never fork_depth against J)
-            if (fork->pos < store_.base_pos()) {
+            // one depth measure: the journal base (never fork_depth against J); a joined node at or below its x1
+            if (deep_switch(fork->pos)) {
                 out.kind = HeadersOutcome::Kind::JoinerPath;
+                offer(req.stop != Hash32{} ? req.stop : out.ids.back(), peer, U128{});  // the branch's tip with this server
                 return out;
             }
             out.kind = HeadersOutcome::Kind::FetchBodies;
@@ -977,7 +1080,7 @@ public:
         GetBuckets q{cfg_.identity.chain_id, at, bin_lo, bin_hi};
         const std::optional<std::vector<std::uint8_t>> f = encode_getbuckets(q);
         if (!f) return false;
-        assemblies_.emplace(key, BucketsAssembly(q, store_.b0(), cfg_.p.open_bins, cfg_.bucket_policy.frame_bytes));
+        assemblies_.emplace(key, BucketsAssembly(q, store_->b0(), cfg_.p.open_bins, cfg_.bucket_policy.frame_bytes));
         timers_.sent(Req{peer, ReqKind::Buckets, at}, now_s);
         window_.requested(peer, now_s);
         send(peer, *f);
@@ -1038,7 +1141,18 @@ public:
             assemblies_.erase(it);
             return out;
         }
-        for (const auto& [bin, sb] : it->second.bins()) (void)store_.restore_bucket(sb.bucket, sb.refs);
+        for (const auto& [bin, sb] : it->second.bins()) {
+            if (joined_ != nullptr && bin >= store_->b0() && bin - store_->b0() < store_->first_leaf()) {
+                // below the joined MMR's start: adopted from the served bucket, a claim (3.7a; E-72)
+                SealedBin a;
+                a.bucket = sb.bucket;
+                a.leaf = sb.leaf;
+                a.refs = sb.refs;
+                if (store_->adopt_below(a)) joined_->claimed[bin] = at_header(at);
+                continue;
+            }
+            (void)store_->restore_bucket(sb.bucket, sb.refs);
+        }
         if (it->second.complete()) {
             timers_.done(Req{peer, ReqKind::Buckets, at});
             assemblies_.erase(it);
@@ -1070,12 +1184,12 @@ public:
     // ---- digests (status line, KATs) ----
     std::string lane_digest() {
         std::string s;
-        const CarrierNode& b = tree_.best();
+        const CarrierNode& b = tree_->best();
         s += hex32(b.id) + ":" + std::to_string(b.pos) + ":" + std::to_string(b.d) + ":" + std::to_string(b.cum_work.lo) + ";";
         const RatchetStateBytes rs = encode_ratchet_state(b.rs);
         s += pid_detail::hex(rs.data(), rs.size()) + ";";
-        for (const ActivationRow& a : ar_.rows()) s += std::to_string(a.epoch) + "@" + std::to_string(a.h_act) + ",";
-        const BmmrHead h = store_.head();
+        for (const ActivationRow& a : ar_->rows()) s += std::to_string(a.epoch) + "@" + std::to_string(a.h_act) + ",";
+        const BmmrHead h = store_->head();
         s += std::to_string(h.leaf_count) + ":" + hex32(h.root) + ";";
         const std::optional<Hash32> pt = prev_of(b.id);
         if (pt) {
@@ -1118,6 +1232,18 @@ private:
     };
 
     static std::string hex32(const Hash32& h) { return pid_detail::hex(h); }
+    // The state pointers at the node's own state.
+    void point_own() {
+        tree_ = &*own_tree_;
+        store_ = &*own_store_;
+        ar_ = &own_ar_;
+        bodies_ = &own_bodies_;
+        headers_ = &own_headers_;
+        windows_ = &own_windows_;
+        keys_ = &own_keys_;
+        refs_ = &own_refs_;
+        claims_ = nullptr;
+    }
     static ::xmr::coin::Hash256 to_coin(const Hash32& h) {
         ::xmr::coin::Hash256 o;
         std::memcpy(o.data(), h.data(), kHashBytes);
@@ -1152,15 +1278,15 @@ private:
 
     RefLookup ref_lookup() {
         return [this](const Hash32& id) -> std::optional<XmrKeyRef> {
-            const auto it = refs_.find(id);
-            if (it == refs_.end()) return std::nullopt;
+            const auto it = refs_->find(id);
+            if (it == refs_->end()) return std::nullopt;
             return it->second;
         };
     }
 
     void learn_refs(const ReceiptBodyV3& r) {
-        refs_[r.side.payee] = r.payee;
-        if (r.owner) refs_[r.side.owner] = *r.owner;
+        (*refs_)[r.side.payee] = r.payee;
+        if (r.owner) (*refs_)[r.side.owner] = *r.owner;
     }
 
     // RandomX through the verified-body memo (a body is hashed once); the
@@ -1187,19 +1313,19 @@ private:
     std::size_t memo_cap() const noexcept { return static_cast<std::size_t>(2 * relay_horizons(cfg_.p).pending_cap); }
 
     AdmitEnv env() {
-        return AdmitEnv{tree_,
-                        store_,
-                        headers_,
-                        bodies_,
+        return AdmitEnv{*tree_,
+                        *store_,
+                        *headers_,
+                        *bodies_,
                         *io_.monero,
-                        windows_,
-                        keys_,
+                        *windows_,
+                        *keys_,
                         ref_lookup(),
                         cfg_.author,
                         cfg_.p,
                         cfg_.rp,
                         cfg_.T,
-                        ar_,
+                        *ar_,
                         cfg_.identity.pool_id,
                         admit_j0(cfg_.p),
                         cfg_.buffers,
@@ -1208,27 +1334,27 @@ private:
                         io_.seed_of,
                         [this](const HashingBlob& b, std::uint64_t d, const Hash32& s) { return verify_memo(b, d, s); },
                         alarm_,
-                        nullptr};
+                        claims_};
     }
 
     std::optional<Hash32> prev_of(const Hash32& tip) const {
-        if (tip == tree_.genesis().id && tree_.genesis().pos == 0) return cfg_.genesis_prev;
-        const CarrierBodyV3* b = bodies_.get(tip);
+        if (tip == tree_->genesis().id && tree_->genesis().pos == 0) return cfg_.genesis_prev;
+        const CarrierBodyV3* b = bodies_->get(tip);
         if (b == nullptr) return std::nullopt;
         return b->own.blob.prev_id;
     }
 
     TipWindow window_of(const Hash32& tip, const Hash32& p_t, std::uint8_t v) {
         const Hash32 author_id = key_ref_identity(cfg_.author);
-        return windows_.get(tip, v, [&] { return evaluate_window_at(store_, tip, p_t, *io_.monero, v, author_id); });
+        return windows_->get(tip, v, [&] { return evaluate_window_at(*store_, tip, p_t, *io_.monero, v, author_id); });
     }
 
     BucketsAnchor anchor_of(const Hash32& at) const {
         BucketsAnchor a;
-        const CarrierNode* n = tree_.find(at);
-        const CarrierBodyV3* b = bodies_.get(at);
+        const CarrierNode* n = tree_->find(at);
+        const CarrierBodyV3* b = bodies_->get(at);
         if (n == nullptr || b == nullptr || n->pos == 0) return a;
-        const CarrierNode* par = tree_.find(n->parent);
+        const CarrierNode* par = tree_->find(n->parent);
         if (par == nullptr) return a;
         a.header_held = true;
         a.tip_record = par->H;
@@ -1271,17 +1397,17 @@ private:
     // most max, never position 0; first_pos = pos(x) - n + 1 (n = 0: 0).
     HeadersReply joiner_page(const Hash32& stop, std::uint64_t max) const {
         HeadersReply r{cfg_.identity.chain_id, 0, {}};
-        const Hash32 x = stop == Hash32{} ? tree_.best().id : stop;
+        const Hash32 x = stop == Hash32{} ? tree_->best().id : stop;
         std::vector<CarrierHeader> above;  // x's bound variants above the placed carriers, newest first
         Hash32 y = x;
-        for (std::size_t guard = 0; tree_.find(y) == nullptr; ++guard) {
-            const std::optional<Hash32> bd = headers_.bound_digest(y);
-            const HeaderVariant* v = bd ? headers_.variant(y, *bd) : nullptr;
-            if (v == nullptr || guard > headers_.size()) return r;  // x is not bound at this node
+        for (std::size_t guard = 0; tree_->find(y) == nullptr; ++guard) {
+            const std::optional<Hash32> bd = headers_->bound_digest(y);
+            const HeaderVariant* v = bd ? headers_->variant(y, *bd) : nullptr;
+            if (v == nullptr || guard > headers_->size()) return r;  // x is not bound at this node
             above.push_back(v->header);
             y = v->header.own.side.tip;
         }
-        const CarrierNode* n = tree_.find(y);
+        const CarrierNode* n = tree_->find(y);
         const std::uint64_t top = n->pos + above.size();  // pos(x)
         const std::uint64_t fb = frame_bytes_headers();
         const std::uint64_t room = fb > kHeadersFrameHeadBytes ? fb - kHeadersFrameHeadBytes : 0;
@@ -1301,14 +1427,250 @@ private:
                 more = false;
                 break;
             }
-        for (const CarrierNode* c = n; more && c != nullptr && c->pos > 0; c = tree_.find(c->parent)) {
-            const CarrierBodyV3* b = bodies_.get(c->id);
+        for (const CarrierNode* c = n; more && c != nullptr && c->pos > 0; c = tree_->find(c->parent)) {
+            const CarrierBodyV3* b = bodies_->get(c->id);
             if (b == nullptr || !take(header_of(*b))) break;  // not held here, or the frame is full
         }
         if (page.empty()) return r;
         r.first_pos = top - page.size() + 1;
         r.headers.assign(page.rbegin(), page.rend());
         return r;
+    }
+
+    // ---- the joiner's hookup ----
+    // The full node's own chain as A (a deep switch; ruling 47 JC-6 (a)):
+    // on_chain = A's best chain, never "held"; no x1; the journal base; the
+    // bound work of positions 1 .. tip kept along the best chain (each position
+    // counted once, a switch recounting above its fork; an unchanged chain the
+    // same instance); the open-bin placements of the best chain.
+    class FullNodeA final : public AdoptedChain {
+    public:
+        explicit FullNodeA(const PathbNode& n) : n_(&n) {}
+        bool holds(const Hash32& id) const override { return n_->tree_->find(id) != nullptr; }
+        bool on_chain(const Hash32& id) const override {
+            const CarrierNode* c = n_->tree_->find(id);
+            return c != nullptr && n_->store_->best_at(c->pos) == id;
+        }
+        std::optional<std::uint64_t> pos_of(const Hash32& id) const override {
+            const CarrierNode* c = n_->tree_->find(id);
+            if (c == nullptr) return std::nullopt;
+            return c->pos;
+        }
+        std::optional<std::uint64_t> joined_x1() const override { return std::nullopt; }
+        std::uint64_t store_base() const override { return n_->store_->base_pos(); }
+        Hash32 tip() const override { return n_->store_->best_tip(); }
+        std::uint64_t open_placements() const override { return open_bin_placements(*n_->store_); }
+        std::shared_ptr<const BoundWork> bound_work() const override {
+            sync();
+            return profile_;
+        }
+        void reset() {
+            counted_.clear();
+            counted_at_.clear();
+            profile_ = std::make_shared<BoundWork>();
+        }
+
+    private:
+        struct Counted {
+            Hash32 id{};
+            std::uint64_t h = 0;
+            std::uint64_t d = 0;
+        };
+        BoundWork& for_write() const {
+            if (profile_.use_count() > 1) profile_ = std::make_shared<BoundWork>(*profile_);
+            return *profile_;
+        }
+        void sync() const {
+            const BinStore& st = *n_->store_;
+            const std::uint64_t lo = 1;
+            const std::uint64_t top = st.tip_pos();
+            const std::size_t want = top >= lo ? static_cast<std::size_t>(top - lo + 1) : 0;
+            std::size_t keep = std::min(counted_.size(), want);
+            while (keep > 0 && st.best_at(lo + keep - 1) != counted_[keep - 1].id) --keep;
+            if (keep == counted_.size() && keep == want) return;
+            BoundWork& w = for_write();
+            while (counted_.size() > keep) {
+                const Counted c = counted_.back();
+                counted_.pop_back();
+                const auto it = counted_at_.find(c.h);
+                if (it == counted_at_.end()) continue;
+                if (--it->second == 0) {
+                    counted_at_.erase(it);
+                    w.at.erase(c.h);
+                } else {
+                    w.at[c.h] = bound_work_minus(w.at[c.h], U128{c.d, 0});
+                }
+            }
+            for (std::uint64_t x = lo + counted_.size(); x <= top; ++x) {
+                const std::optional<Hash32> id = st.best_at(x);
+                const CarrierNode* c = id ? n_->tree_->find(*id) : nullptr;
+                if (c == nullptr) break;
+                w.add(c->h, c->d);
+                ++counted_at_[c->h];
+                counted_.push_back(Counted{*id, c->h, c->d});
+            }
+        }
+        const PathbNode* n_;
+        mutable std::vector<Counted> counted_;
+        mutable std::map<std::uint64_t, std::uint64_t> counted_at_;
+        mutable std::shared_ptr<BoundWork> profile_ = std::make_shared<BoundWork>();
+    };
+
+    void init_join() {
+        join_in_.p = cfg_.p;
+        join_in_.rp = cfg_.rp;
+        join_in_.T = cfg_.T;
+        join_in_.pool_id = cfg_.identity.pool_id;
+        join_in_.b0 = cfg_.identity.height + 1;
+        join_in_.genesis_prev = cfg_.genesis_prev;
+        join_in_.rules_g = cfg_.rules_g;
+        join_in_.journal_depth = cfg_.journal_depth;
+        join_in_.monero = io_.monero;
+        join_in_.author = cfg_.author;
+        join_in_.buffers = cfg_.buffers;
+        join_in_.headers_frame_bytes = frame_bytes_headers();
+        join_in_.bucket_frame_bytes = cfg_.bucket_policy.frame_bytes;
+        join_in_.chain_id = cfg_.identity.chain_id;
+        join_in_.resolve_pr = io_.resolve_pr;
+        join_in_.seed_of = io_.seed_of;
+        join_in_.randomx = [this](const HashingBlob& b, std::uint64_t d, const Hash32& seed) { return verify_memo(b, d, seed); };
+        join_in_.fetch_context = io_.fetch_context;
+        joiner_.emplace(join_in_, cfg_.abandon_timeout_s);
+        refresh_own_chain();
+    }
+
+    // The node's own chain is A while it is a full node holding a chain of its
+    // own (an empty store at position 0 and a load failure have none).
+    void refresh_own_chain() {
+        if (!joiner_ || joined_ != nullptr) return;
+        const bool own = !load_failed_ && tree_->best().pos > 0;
+        joiner_->set_own_chain(own ? &own_chain_ : nullptr);
+    }
+
+    // The node's own switch at a fork position takes the joiner path: below the
+    // journal base (one depth measure); a joined node also at or below its x1.
+    bool deep_switch(std::uint64_t fork) const {
+        if (joined_ != nullptr) return own_switch_path(*joined_, fork) == SwitchPath::Joiner;
+        return fork < store_->base_pos();
+    }
+
+    // A (candidate, server) pair for the joiner (P-52; the server's link).
+    void offer(const Hash32& candidate, std::uint64_t peer, const U128& claimed) {
+        const auto it = links_.find(peer);
+        if (it == links_.end()) return;
+        joiner_->offer(candidate, *it->second, claimed);
+    }
+
+    // The at header (id and digest) of a carrier this node placed.
+    AtHeader at_header(const Hash32& at) const {
+        const CarrierBodyV3* b = bodies_->get(at);
+        return AtHeader{at, b ? header_digest(header_of(*b)).value_or(Hash32{}) : Hash32{}};
+    }
+
+    // The adopted state becomes the node's (3.3, 3.3a): its tree, store, AR,
+    // header index, bodies, references, caches and claim view; the old state's
+    // pending set, parked frames and requests go (the joiner path re-pends
+    // nothing); the adoption batch into an EMPTY store (the poison mark cleared
+    // with it). False: the batch was not committed (the store poisoned).
+    bool adopt() {
+        JoinedState* js = joiner_->adopted();
+        if (js == nullptr || !js->tree || !js->store) return false;
+        joined_ = js;
+        tree_ = &*js->tree;
+        store_ = &*js->store;
+        ar_ = &js->ar;
+        bodies_ = &js->bodies;
+        headers_ = &js->headers;
+        windows_ = &js->windows();
+        keys_ = &js->keys();
+        refs_ = &js->refs;
+        claims_ = &js->claims();
+        own_chain_.reset();
+        pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
+        deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
+        header_req_.clear();
+        assemblies_.clear();
+        abandoned_.clear();
+        closed_.clear();
+        release_q_.clear();
+        load_failed_ = false;
+        poisoned_ = false;
+        reask_pending_ = false;
+        ++generation_;
+        if (kv_ == nullptr) return true;
+        LaneBatch b;
+        const bool cleared = clear_store_batch(*kv_, cfg_.record_chain, b);
+        const std::optional<LaneBatch> ab =
+                adoption_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, *ar_, js->young ? 0 : js->x0 - 1);
+        if (ab) b.ops.insert(b.ops.end(), ab->ops.begin(), ab->ops.end());
+        if (!cleared || !ab || !commit_lane_batch(*kv_, b)) {
+            poison(store_->best_tip());
+            return false;
+        }
+        return true;
+    }
+
+    // E-72 (addendum 3.4): after a switch by the journal at a joined node, the
+    // claimed leaves whose at header is not a bound carrier of the new chain
+    // are asked again at a carrier of that chain whose leaf_count(tip(at))
+    // covers the bin (JoinBuckets::reask_scope, fetch_any over the peers'
+    // links); a leaf proved against that carrier's own header equal to the
+    // claimed one is kept, its claim now at that carrier; a different leaf:
+    // the replay from the position before the bin's seal lies at or below x1,
+    // so the joiner path (own_switch_path; reask_replay).
+    void reask_claimed(JoinStep& out) {
+        reask_pending_ = false;
+        JoinedState& js = *joined_;
+        if (js.young || js.claimed.empty()) return;
+        std::vector<AtHeader> bound;
+        std::vector<std::pair<Hash32, std::uint64_t>> heavier;
+        for (std::uint64_t x = js.x1 + 1; x <= store_->tip_pos(); ++x) {
+            const std::optional<Hash32> id = store_->best_at(x);
+            if (!id) continue;
+            const CarrierNode* n = tree_->find(*id);
+            if (n == nullptr) continue;
+            bound.push_back(at_header(*id));
+            const LaneView pv = store_->view_at(n->parent);
+            if (pv.ok()) heavier.emplace_back(*id, pv.leaf_count());
+        }
+        const std::vector<JoinBuckets::Reask> rs =
+                JoinBuckets::reask_scope(js.claimed, bound, mismatched_, heavier, store_->b0());
+        std::vector<JoinLink*> peers;
+        for (auto& [peer, l] : links_) peers.push_back(l.get());
+        for (const JoinBuckets::Reask& r : rs) {
+            const AtHeader at = at_header(r.at);
+            std::optional<std::uint64_t> served_by;
+            const BucketsFetch f = reask_jb_.fetch_any(peers, anchor_of(r.at), at, r.bin, r.bin, cfg_.abandon_timeout_s,
+                                                       &served_by);
+            if (f.end != BucketsEnd::Complete) continue;
+            const auto it = f.bins.find(r.bin);
+            if (it == f.bins.end()) continue;
+            ++out.reasked;
+            const std::optional<Hash32> held = store_->best_mmr().leaf(r.bin - store_->b0());
+            if (held && *held == it->second.leaf) {
+                js.claimed[r.bin] = at;  // the same leaf, now proved against a carrier of this chain
+                mismatched_.erase(r.bin);
+                continue;
+            }
+            // a different leaf: replay from the position before the bin's seal (at or below x1): the joiner path
+            const ReaskReplay rr = reask_replay(seal_pos_of(r.bin), store_->base_pos());
+            if (rr.joiner_path || own_switch_path(js, rr.from) == SwitchPath::Joiner) {
+                out.reask_joiner = true;
+                if (served_by) offer(store_->best_tip(), *served_by, U128{});
+            }
+        }
+    }
+
+    // The position where a bin sealed on the best chain (the first x with lc(H(x)) > bin - b0).
+    std::uint64_t seal_pos_of(std::uint64_t bin) const {
+        const std::uint64_t want = bin - store_->b0() + 1;
+        for (std::uint64_t x = store_->first_record_pos(); x <= store_->tip_pos(); ++x) {
+            const std::optional<Hash32> id = store_->best_at(x);
+            if (!id) continue;
+            const LaneView v = store_->view_at(*id);
+            if (v.ok() && v.leaf_count() >= want) return x;
+        }
+        return store_->tip_pos();
     }
 
     // ---- E3: the carried list ----
@@ -1318,8 +1680,8 @@ private:
     // and the closure leave it out); the first R_MAX in the canonical order.
     std::vector<ReceiptBodyV3> carried_list(std::uint64_t x, std::uint64_t h_c) {
         std::vector<ReceiptBodyV3> out;
-        const CarrierNode& best = tree_.best();
-        const LaneView bv = store_.view_at(best.id);
+        const CarrierNode& best = tree_->best();
+        const LaneView bv = store_->view_at(best.id);
         if (!bv.ok()) return out;
         const std::uint64_t H_parent = bv.record(bv.pos());
         const AdmitEnv e = env();
@@ -1349,14 +1711,18 @@ private:
             ReceiptBodyV3 r;
             decode_receipt_body_v3(body.data(), body.size(), ReceiptLimits{cfg_.buffers.receipt}, r);
             learn_refs(r);
-            const CarrierNode* t = tree_.find(r.side.tip);
+            const CarrierNode* t = tree_->find(r.side.tip);
             PendingReceipt pr{out.admit.id, r, out.admit.store_placements.empty() ? 0 : out.admit.store_placements[0].bin,
                               t ? t->pos : 0, 0};
-            pending_.add(std::move(pr));
+            if (!pending_.add(std::move(pr))) {  // evicted at once (P-09): not held, not relayed
+                out.action = NodeAction::None;
+                return out;
+            }
             out.action = NodeAction::Pending;
             std::vector<ReceiptBodyV3> one{r};
-            if (const std::optional<std::vector<std::uint8_t>> f = encode_fb_receipts(cfg_.identity.chain_id, one, cfg_.p))
-                flood(*f, peer == kOwnPeer ? std::nullopt : std::optional<std::uint64_t>(peer));
+            if (!rests_on_claims())
+                if (const std::optional<std::vector<std::uint8_t>> f = encode_fb_receipts(cfg_.identity.chain_id, one, cfg_.p))
+                    flood(*f, peer == kOwnPeer ? std::nullopt : std::optional<std::uint64_t>(peer));
             return out;
         }
         out.action = out.admit.verdict == AdmitVerdict::Defer ? NodeAction::Parked : NodeAction::Verdict;
@@ -1368,7 +1734,13 @@ private:
                                    bool relayed) {
         ++settle_depth_;
         max_settle_depth_ = std::max(max_settle_depth_, settle_depth_);
-        NodeEventResult out = settle_once(peer, frame, r, relayed);
+        NodeEventResult out;
+        try {
+            out = settle_once(peer, frame, r, relayed);
+        } catch (...) {
+            --settle_depth_;
+            throw;
+        }
         --settle_depth_;
         drain_released();
         return out;
@@ -1379,10 +1751,16 @@ private:
     void drain_released() {
         if (draining_ || settle_depth_ != 0) return;
         draining_ = true;
-        while (!release_q_.empty() && !poisoned_) {
-            ParkedFrame f = std::move(release_q_.front());
-            release_q_.pop_front();
-            (void)on_carrier(f.peer, f.frame);
+        try {
+            while (!release_q_.empty() && !poisoned_) {
+                ParkedFrame f = std::move(release_q_.front());
+                release_q_.pop_front();
+                (void)on_carrier(f.peer, f.frame);
+            }
+        } catch (...) {
+            release_q_.clear();
+            draining_ = false;
+            throw;
         }
         release_q_.clear();
         draining_ = false;
@@ -1403,8 +1781,8 @@ private:
         }
         for (const ReceiptBodyV3& b : r.carrier->carried) learn_refs(b);
         learn_refs(r.carrier->own);
-        NodeStore ns{store_, faults_};
-        WriteResult w = place_admitted(tree_, ns, ar_, bodies_, r, &alarm_);
+        NodeStore ns{*store_, faults_};
+        WriteResult w = place_admitted(*tree_, ns, *ar_, *bodies_, r, &alarm_);
         out.write = w.outcome;
         switch (w.outcome) {
             case WriteOutcome::NodeInternal:
@@ -1418,7 +1796,7 @@ private:
                 out.action = NodeAction::Placed;
                 ++generation_;
                 if (kv_ != nullptr) {
-                    const LaneBatch b = extension_batch(cfg_.record_chain, head_, tree_, store_, bodies_, r.id,
+                    const LaneBatch b = extension_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, r.id,
                                                         std::move(w.batch), w.ar_row);
                     if (!commit_lane_batch(*kv_, b)) {
                         poison(r.id);
@@ -1430,18 +1808,19 @@ private:
                 break;
             }
             case WriteOutcome::SwitchToCaller: {
-                const SwitchResult sr = switch_to_best();
+                const SwitchResult sr = switch_to_best(peer);
                 out.action = sr.joiner ? NodeAction::JoinerPath
                                        : (sr.internal ? NodeAction::NodeInternal : NodeAction::Switched);
                 out.repended = sr.repended;
                 out.lost = sr.lost;
-                if (sr.internal) return out;
+                if (sr.internal || poisoned_) return out;  // nothing flooded or released after the poison
                 break;
             }
         }
-        headers_.placed(r.id);
+        headers_->placed(r.id);
         deferred_.purge(r.id);
-        if (relayed || peer == kOwnPeer) flood(frame, peer == kOwnPeer ? std::nullopt : std::optional<std::uint64_t>(peer));
+        if ((relayed || peer == kOwnPeer) && !rests_on_claims())
+            flood(frame, peer == kOwnPeer ? std::nullopt : std::optional<std::uint64_t>(peer));
         // the carriers that waited on this one (placed by the outermost event, drain_released)
         for (ParkedFrame& f : deferred_.release(r.id, w.place.released)) release_q_.push_back(std::move(f));
         return out;
@@ -1469,7 +1848,7 @@ private:
                 f.parent = c.own.side.tip;
             }
         }
-        (void)deferred_.park(tree_, std::move(f));
+        (void)deferred_.park(*tree_, std::move(f));
         if (*r.missing == Missing::ParentUnknown && peer != kOwnPeer) {
             GetCarrier q;
             q.chain_id = cfg_.identity.chain_id;
@@ -1483,20 +1862,21 @@ private:
     // J_0) go; the pending set loses what the best chain placed and what
     // sealed; the per-tip caches stay valid (a tip's window is its own).
     void after_best_change() {
-        const std::uint64_t base = store_.base_pos();
+        refresh_own_chain();
+        const std::uint64_t base = store_->base_pos();
         const std::uint64_t floor_pos = base > admit_j0(cfg_.p) ? base - admit_j0(cfg_.p) : 0;
-        if (const std::optional<Hash32> f = store_.best_at(std::max(floor_pos, store_.first_record_pos())))
-            if (const CarrierNode* n = tree_.find(*f)) headers_.drop_below(n->H);
+        if (const std::optional<Hash32> f = store_->best_at(std::max(floor_pos, store_->first_record_pos())))
+            if (const CarrierNode* n = tree_->find(*f)) headers_->drop_below(n->H);
         // the bucket requests closed or abandoned for an `at` the node holds no more, or below that floor
         for (auto* keys : {&closed_, &abandoned_})
             for (auto it = keys->begin(); it != keys->end();) {
-                const CarrierNode* n = tree_.find(it->second);
+                const CarrierNode* n = tree_->find(it->second);
                 if (n == nullptr || n->pos < floor_pos)
                     it = keys->erase(it);
                 else
                     ++it;
             }
-        const LaneView v = store_.view_at(store_.best_tip());
+        const LaneView v = store_->view_at(store_->best_tip());
         if (!v.ok()) return;
         const std::uint64_t H = v.record(v.pos());
         pending_.erase_if([&](const PendingReceipt& r) { return v.placed_open(r.id) || !open_at(H, r.h, cfg_.p.open_bins); });
@@ -1510,51 +1890,52 @@ private:
         std::uint64_t lost = 0;
     };
 
-    SwitchResult switch_to_best() {
+    SwitchResult switch_to_best(std::uint64_t peer) {
         SwitchResult out;
-        const Hash32 new_tip = tree_.best().id;
-        const Hash32 old_tip = store_.best_tip();
-        const std::optional<Hash32> fork_id = tree_.fork_point(old_tip, new_tip);
+        const Hash32 new_tip = tree_->best().id;
+        const Hash32 old_tip = store_->best_tip();
+        const std::optional<Hash32> fork_id = tree_->fork_point(old_tip, new_tip);
         if (!fork_id) return out;
-        const std::uint64_t fork = tree_.find(*fork_id)->pos;
-        // one depth measure: the journal base
-        if (fork < store_.base_pos()) {
+        const std::uint64_t fork = tree_->find(*fork_id)->pos;
+        // one depth measure: the journal base; a joined node at or below its x1 (own_switch_path)
+        if (deep_switch(fork)) {
             out.joiner = true;
+            if (peer != kOwnPeer) offer(new_tip, peer, U128{});
             return out;
         }
         // the undone positions (the losing branch), oldest first
         std::vector<Hash32> undone;
-        for (const CarrierNode* n = tree_.find(old_tip); n != nullptr && n->pos > fork; n = tree_.find(n->parent))
+        for (const CarrierNode* n = tree_->find(old_tip); n != nullptr && n->pos > fork; n = tree_->find(n->parent))
             undone.push_back(n->id);
         std::reverse(undone.begin(), undone.end());
-        const std::uint64_t old_pos = store_.tip_pos();
-        const ActivationRecord ar_before = ar_;
+        const std::uint64_t old_pos = store_->tip_pos();
+        const ActivationRecord ar_before = *ar_;
         LaneBatch lane;
-        NodeStore ns{store_, faults_};
+        NodeStore ns{*store_, faults_};
         if (ns.switch_best(new_tip, &lane) != SwitchVerdict::Switched) {
             poison(new_tip);
             out.internal = true;
             return out;
         }
-        if (ar_.rewind(fork) == ArRewind::BelowJoinerSeed) {
+        if (ar_->rewind(fork) == ArRewind::BelowJoinerSeed) {
             out.joiner = true;  // fail closed: no restore below the joiner's seed
             poison(new_tip);
             return out;
         }
         {
             std::vector<const CarrierNode*> added;
-            for (const CarrierNode* n = tree_.find(new_tip); n != nullptr && n->pos > fork; n = tree_.find(n->parent))
+            for (const CarrierNode* n = tree_->find(new_tip); n != nullptr && n->pos > fork; n = tree_->find(n->parent))
                 added.push_back(n);
             for (auto it = added.rbegin(); it != added.rend(); ++it)
-                if ((*it)->activation && !ar_.append(*(*it)->activation)) {
+                if ((*it)->activation && !ar_->append(*(*it)->activation)) {
                     poison(new_tip);  // nothing committed
                     out.internal = true;
                     return out;
                 }
         }
         if (kv_ != nullptr) {
-            const LaneBatch b = switch_batch(cfg_.record_chain, head_, tree_, store_, bodies_, fork, old_pos, ar_before,
-                                             ar_, std::move(lane));
+            const LaneBatch b = switch_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, fork, old_pos, ar_before,
+                                             *ar_, std::move(lane));
             if (!commit_lane_batch(*kv_, b)) {
                 poison(new_tip);
                 out.internal = true;
@@ -1563,10 +1944,10 @@ private:
         }
         ++generation_;
         // the re-pend step: each undone position ascending, its carried list then its own receipt
-        const LaneView nv = store_.view_at(new_tip);
+        const LaneView nv = store_->view_at(new_tip);
         const std::uint64_t H_new = nv.record(nv.pos());
         for (const Hash32& id : undone) {
-            const CarrierBodyV3* b = bodies_.get(id);
+            const CarrierBodyV3* b = bodies_->get(id);
             if (b == nullptr) continue;
             std::vector<const ReceiptBodyV3*> rs;
             for (const ReceiptBodyV3& r : b->carried) rs.push_back(&r);
@@ -1582,24 +1963,36 @@ private:
                     ++out.lost;  // its origin bin is sealed on the new branch: lost
                     continue;
                 }
-                const CarrierNode* t = tree_.find(r.side.tip);
-                pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0});  // the verified body: no second RandomX
-                ++out.repended;
+                const CarrierNode* t = tree_->find(r.side.tip);
+                // the verified body: no second RandomX; one the pending set evicts at once is not counted
+                if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) ++out.repended;
             }
         }
+        if (joined_ != nullptr) reask_pending_ = true;  // E-72: the claimed leaves asked again at the new chain
         after_best_change();
         return out;
     }
 
     PathbNodeConfig cfg_;
     PathbNodeIo io_;
-    CarrierTree tree_;
-    BinStore store_;
-    ActivationRecord ar_;
-    CarrierBodies bodies_;
-    HeaderIndex headers_;
-    WindowCache windows_;
-    KeyCache keys_;
+    // The node's state: its own (a full node: launched here or loaded) or, after a join, the adopted state's.
+    std::optional<CarrierTree> own_tree_;
+    std::optional<BinStore> own_store_;
+    ActivationRecord own_ar_;
+    CarrierBodies own_bodies_;
+    HeaderIndex own_headers_;
+    WindowCache own_windows_;
+    KeyCache own_keys_;
+    std::map<Hash32, XmrKeyRef> own_refs_;
+    CarrierTree* tree_ = nullptr;
+    BinStore* store_ = nullptr;
+    ActivationRecord* ar_ = nullptr;
+    CarrierBodies* bodies_ = nullptr;
+    HeaderIndex* headers_ = nullptr;
+    WindowCache* windows_ = nullptr;
+    KeyCache* keys_ = nullptr;
+    std::map<Hash32, XmrKeyRef>* refs_ = nullptr;
+    const ClaimView* claims_ = nullptr;  // the adopted state's claim view (nullptr: a full node)
     AlarmSink alarm_;
     PendingSet pending_;
     DeferredCarriers deferred_;
@@ -1618,10 +2011,23 @@ private:
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;
     std::set<std::pair<std::uint64_t, Hash32>> closed_;
-    std::map<Hash32, XmrKeyRef> refs_;
     JoinServeHold hold_;
     std::set<std::uint64_t> hold_conns_;
     std::deque<ParkedFrame> release_q_;
+    // the joiner (E15): its inputs, the queue and the adopted state, the full node's own chain as A, one link per
+    // Path B peer over the relay's transport, the E-72 re-ask's buckets
+    JoinInputs join_in_;
+    std::optional<Joiner> joiner_;
+    FullNodeA own_chain_{*this};
+    JoinTransport* transport_ = nullptr;
+    std::map<std::uint64_t, std::unique_ptr<PathbJoinLink>> links_;
+    JoinedState* joined_ = nullptr;
+    bool load_failed_ = false;
+    bool reask_pending_ = false;
+    bool attempting_ = false;
+    std::set<std::uint64_t> mismatched_;  // claimed bins a claim-leaf mismatch entered (E-72)
+    JoinBuckets reask_jb_{cfg_.identity.height + 1, cfg_.p.open_bins, cfg_.bucket_policy.frame_bytes,
+                          cfg_.identity.chain_id};
     bool draining_ = false;
     std::uint64_t settle_depth_ = 0;
     std::uint64_t max_settle_depth_ = 0;

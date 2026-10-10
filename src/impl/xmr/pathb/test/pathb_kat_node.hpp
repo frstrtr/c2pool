@@ -13,9 +13,11 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,8 @@ struct Harness {
     std::set<pb::Hash32> bad_pow;
     std::set<pb::Hash32> bad_served;  // P_r ids whose served context fails (BadServed)
     std::uint64_t rx_calls = 0;
+    std::uint64_t verify_cost_s = 0;  // seconds a RandomX call takes (the clock moves)
+    std::set<pb::Hash32> throw_pow;   // a RandomX call on one of these throws (once)
     std::vector<pb::TemplateTx> txs;
     std::vector<std::unique_ptr<pb::FollowerBranchView>> views;
     std::vector<std::unique_ptr<pb::PathbNode>> nodes;
@@ -50,6 +54,7 @@ struct Harness {
     std::optional<pb::BucketWirePolicy> bucket_policy;  // P-39, P-41, P-42 (default: the defaults)
     std::optional<std::uint64_t> headers_frame;         // P-14 (default: the frame buffer)
     std::uint64_t serve_cap = UINT64_MAX;               // P-48's lower fixed cap
+    std::uint64_t pending_cap = 0;                      // P-09 (0: the default)
 
     explicit Harness(const KatNet& n) : net(n) {}
 
@@ -68,6 +73,7 @@ struct Harness {
         c.buffers = pb::relay_buffers_default(16, 300000, c.p.r_max).value();
         c.headers_frame_bytes = headers_frame ? *headers_frame : c.buffers.frame;
         c.bucket_serve_cap = serve_cap;
+        c.pending_cap = pending_cap;
         c.bucket_policy = bucket_policy ? *bucket_policy : pb::bucket_wire_policy_default(16, 300000).value();
         c.author = net.author;
         c.launch = launch;
@@ -99,6 +105,8 @@ struct Harness {
         o.seed_of = [](const pb::Hash32&) -> std::optional<pb::Hash32> { return seq32(0x99); };
         o.verify = [this](const pb::HashingBlob& b, std::uint64_t, const pb::Hash32&) {
             ++rx_calls;
+            now += verify_cost_s;
+            if (throw_pow.erase(pb::receipt_id(b)) != 0) throw std::runtime_error("kat: RandomX worker failed");
             return bad_pow.count(pb::receipt_id(b)) == 0;
         };
         o.monero_tip = [this]() -> std::optional<std::uint64_t> { return mon_tip; };
@@ -182,8 +190,90 @@ struct Harness {
         return r;
     }
 
+    // Node `to` receives node `from`'s Path B HELLO.
+    pb::HelloCheck hello(std::size_t to, std::size_t from) {
+        const pb::PathbHello theirs = nodes[from]->our_hello(1000 + from, 0);
+        return nodes[to]->on_hello(from, *pb::encode_pathb_hello(theirs), nodes[to]->our_hello(1000 + to, 0));
+    }
+
     // Advance the follower's tip so the next template's P_r moves on.
     void tick_monero(std::uint64_t by = 1) { mon_tip = std::min<std::uint64_t>(mon_tip + by, kMonTop); }
+};
+
+// The relay's transport of one node's join attempts in the KAT: a request goes
+// to the server node's handler at once and its reply frames come back; the
+// clock is the harness's; hooks edit a reply, observe a request, or do the
+// caller's work while a request is out (3.3a).
+struct KatTransport final : pb::JoinTransport {
+    Harness* h;
+    std::size_t self;
+    struct Logged {
+        std::uint64_t peer = 0;
+        std::uint8_t op = 0;
+        std::uint64_t t = 0;
+    };
+    std::vector<Logged> log;
+    std::function<void(std::uint64_t peer, std::uint8_t op, std::vector<std::vector<std::uint8_t>>& reply)> edit;
+    std::function<void()> on_request;
+    // A server that keeps only from its floors (P-51 as corrected, the prune step of S4w-bc): the open hold's floors
+    // while the attempt's requests continue, else the floors at its best tip; FC_HEADERS and FC_CARRIER items below
+    // them are not served.
+    bool prune = false;
+    std::uint64_t lapses = 0;  // requests that found the server's hold of this node ended
+
+    KatTransport(Harness& hh, std::size_t s) : h(&hh), self(s) {}
+    std::vector<std::vector<std::uint8_t>> exchange(std::uint64_t peer, const std::vector<std::uint8_t>& req,
+                                                    std::uint64_t) override {
+        const std::uint8_t op = req.empty() ? 0 : req[0];
+        log.push_back(Logged{peer, op, h->now});
+        if (on_request) on_request();
+        std::vector<std::vector<std::uint8_t>> out;
+        if (peer >= h->nodes.size() || h->nodes[peer] == nullptr) return out;
+        pb::PathbNode& s = *h->nodes[peer];
+        const bool held = s.join_holding(self);
+        if (op == pb::kOpFcGetHeaders) out = s.serve_getheaders(self, req, h->now).frames;
+        if (op == pb::kOpFcGetCarrier) out = s.serve_getcarrier(self, req, h->now).frames;
+        if (op == pb::kOpFcGetBuckets) out = s.serve_getbuckets(self, req, h->now).frames;
+        if (prune && op != pb::kOpFcGetBuckets && log.size() > 1) {
+            if (!held || !s.join_holding(self)) ++lapses;
+            const pb::JoinServeFloors f = s.join_holding(self) ? s.retention_floors(h->now) : s.serve_floors_now();
+            prune_reply(s, op, f, out);
+        }
+        if (edit) edit(peer, op, out);
+        return out;
+    }
+    void prune_reply(const pb::PathbNode& s, std::uint8_t op, const pb::JoinServeFloors& f,
+                     std::vector<std::vector<std::uint8_t>>& out) const {
+        if (op == pb::kOpFcGetHeaders) {
+            for (std::vector<std::uint8_t>& fr : out) {
+                pb::HeadersReply rep;
+                if (!pb::decode_fc_headers(fr, 0, 1u << 22, pb::kRuledLaneParams, rep).ok() || rep.first_pos >= f.headers) continue;
+                const std::uint64_t cut = std::min<std::uint64_t>(f.headers - rep.first_pos, rep.headers.size());
+                rep.headers.erase(rep.headers.begin(), rep.headers.begin() + static_cast<std::ptrdiff_t>(cut));
+                rep.first_pos += cut;
+                fr = *pb::encode_fc_headers(rep, 1u << 22);
+            }
+            return;
+        }
+        std::vector<std::vector<std::uint8_t>> kept;
+        for (std::vector<std::uint8_t>& fr : out) {
+            pb::CarrierBodyV3 c;
+            if (pb::decode_carrier_body_v3(fr.data() + pb::kFrameHeaderBytes, fr.size() - pb::kFrameHeaderBytes,
+                                           pb::CarrierLimits{1u << 20, pb::kRuledLaneParams.r_max}, c) == pb::WireError::None) {
+                const pb::CarrierNode* n = s.tree().find(pb::receipt_id(c.own));
+                if (n != nullptr && n->pos < f.bodies) continue;
+            }
+            kept.push_back(std::move(fr));
+        }
+        out = std::move(kept);
+    }
+    std::uint64_t now_s() const override { return h->now; }
+    void wait_until(std::uint64_t t) override { h->now = std::max(h->now, t); }
+    std::size_t requests_of(std::uint8_t op) const {
+        std::size_t n = 0;
+        for (const Logged& l : log) n += l.op == op ? 1 : 0;
+        return n;
+    }
 };
 
 // The canonical miner tx bytes a node builds for its best tip and session k.

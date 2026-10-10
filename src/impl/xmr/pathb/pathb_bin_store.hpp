@@ -787,6 +787,8 @@ public:
 
     std::optional<std::uint64_t> adopt_bound() const noexcept { return adopt_bound_; }
     std::uint64_t first_leaf() const noexcept { return lc0_; }
+    // The placements of the open bins (and of bins above the entry floor), by bin.
+    const std::map<std::uint64_t, std::vector<Placement>>& placements_by_bin() const noexcept { return by_bin_; }
     std::uint64_t root_pos() const noexcept { return root_pos_; }
     std::uint64_t first_record_pos() const noexcept { return off_; }
 
