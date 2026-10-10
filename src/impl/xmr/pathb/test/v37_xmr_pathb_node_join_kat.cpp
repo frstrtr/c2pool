@@ -112,13 +112,16 @@ void loadfail() {
     check(h[j].rests_on_claims() && h[j].make_template(h.now).status == pb::TemplateStatus::RestsOnClaims
                   && !kv.data.count(pb::store_keys::poison(0)) && !kv.data.count(pb::store_keys::pcarrier(0, 3)),
           "loadfail: started empty (the old store cleared), resting on claims: no template");
-    // resting on claims: a carrier placed and a receipt pending are not relayed (3.3a (2))
+    // resting on claims: a carrier placed and a receipt pending are not relayed (3.3a (2)); both from a peer that is
+    // not the server, so a relay would reach the server
     h.q.clear();
-    const pb::NodeEventResult r1 = h[j].on_carrier(s, *pb::encode_fc_carrier(0, *a.bodies.get(at_pos(a, 1)), pb::kRuledLaneParams.r_max));
+    const std::uint64_t other = 77;
+    const pb::NodeEventResult r1 =
+            h[j].on_carrier(other, *pb::encode_fc_carrier(0, *a.bodies.get(at_pos(a, 1)), pb::kRuledLaneParams.r_max));
     const std::vector<pb::ReceiptBodyV3> one{body_on(a, at_pos(a, 1), h_pos(2), 2, 880001)};
-    const std::vector<pb::NodeEventResult> rr = h[j].on_receipts(s, *pb::encode_fb_receipts(0, one, pb::kRuledLaneParams));
+    const std::vector<pb::NodeEventResult> rr = h[j].on_receipts(other, *pb::encode_fb_receipts(0, one, pb::kRuledLaneParams));
     bool relayed = false;
-    for (const Msg& m : h.q) relayed = relayed || m.from == j;
+    for (const Msg& m : h.q) relayed = relayed || (m.from == j && m.to == s);
     h.q.clear();
     check(r1.action == pb::NodeAction::Placed && rr.size() == 1 && rr[0].action == pb::NodeAction::Pending && !relayed
                   && h[j].rests_on_claims(),
