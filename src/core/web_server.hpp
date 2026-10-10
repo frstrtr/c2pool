@@ -211,7 +211,9 @@ public:
     // Monitoring endpoints for Qt control panel
     nlohmann::json rest_uptime();
     nlohmann::json rest_connected_miners();
-    nlohmann::json rest_stratum_stats();
+    // reveal_ips: raw miner IPs only for a direct local viewer (#1985);
+    // otherwise each address is a core::mask_ip_endpoint() token.
+    nlohmann::json rest_stratum_stats(bool reveal_ips = false);
     nlohmann::json rest_miner_thresholds();
     nlohmann::json rest_global_stats();
     nlohmann::json rest_sharechain_stats();
@@ -245,15 +247,17 @@ public:
     nlohmann::json rest_rate();                     // /rate — pool hashrate (single number)
     nlohmann::json rest_difficulty();               // /difficulty — share difficulty (single number)
     nlohmann::json rest_user_stales();              // /user_stales — per-user stale proportions
+    // reveal_ips on the peer views below: incoming peer addresses are raw only
+    // for a direct local viewer (#1985); outgoing peers are shown as before.
     std::string    rest_peer_addresses();           // /peer_addresses — space-separated peer list (text)
-    nlohmann::json rest_peer_versions();            // /peer_versions — p2pool version per peer
-    nlohmann::json rest_peer_txpool_sizes();        // /peer_txpool_sizes — txpool size per peer
-    nlohmann::json rest_peer_list();                // /peer_list — detailed peer list [{address,version,incoming,uptime,...}]
-    nlohmann::json rest_pings();                    // /pings — ping latency per peer (stub)
+    nlohmann::json rest_peer_versions(bool reveal_ips = false);      // /peer_versions — p2pool version per peer
+    nlohmann::json rest_peer_txpool_sizes(bool reveal_ips = false);  // /peer_txpool_sizes — txpool size per peer
+    nlohmann::json rest_peer_list(bool reveal_ips = false);          // /peer_list — detailed peer list [{address,version,incoming,uptime,...}]
+    nlohmann::json rest_pings(bool reveal_ips = false);              // /pings — ping latency per peer (stub)
     nlohmann::json rest_stale_rates();              // /stale_rates — {good,orphan,dead} rate breakdown
     nlohmann::json rest_node_info();                // /node_info — {external_ip,worker_port,p2p_port,network,symbol}
     nlohmann::json rest_luck_stats();               // /luck_stats — pool luck statistics
-    nlohmann::json rest_ban_stats();                // /ban_stats — current ban statistics
+    nlohmann::json rest_ban_stats(bool reveal_ips = false);  // /ban_stats — current ban statistics (IP targets masked, #1985)
     nlohmann::json rest_stratum_security();         // /stratum_security — DDoS detection metrics (stub)
     nlohmann::json rest_miner_stats(const std::string& address);  // /miner_stats/<addr> — detailed per-miner stats
     nlohmann::json rest_best_share();               // /best_share — node-wide best share (BitAxe style)
@@ -1859,6 +1863,9 @@ private:
 
     // P2P peer info callback
     peer_info_fn_t m_peer_info_fn;
+    // m_peer_info_fn() with each incoming peer's "address" masked unless
+    // reveal_ips (#1985). Outgoing peers are dialed public nodes, kept as-is.
+    nlohmann::json peer_info_for_viewer(bool reveal_ips);
 
     // Port configuration. 0 = not configured / no listener bound. Each coin's
     // main wires the REAL runtime ports (stratum -> worker_port, sharechain ->
