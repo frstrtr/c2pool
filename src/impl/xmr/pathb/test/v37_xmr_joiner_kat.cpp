@@ -3197,8 +3197,9 @@ void jc_v11(const JoinNet& net) {
 
 // V13 (DF-4; E-100, E-101): 10 positions per height (x1 - x0 <= J_0 - 2); a branch of >= x1 - x0 + 2 carriers on the
 // prefix node f = x0 - 2, its records one to two Monero heights behind c's chain, its tip t at >= x1 with H(t) <
-// H(f) + F + Fresh (the window at t reads a bin open at f); a placement below x0 in such a bin (the carrier at f
-// carries a receipt of bin H(f) + 1). J completes, 0 alarms: those rows are not computed.
+// H(f) + F + Fresh; Monero rows at difficulty 10^8, so the window at t reaches back past H(f) + Fresh and reads a bin
+// open at f still open at t; a placement below x0 in such a bin (the carrier at f carries a receipt of bin H(f) + 1).
+// J completes, 0 alarms: those rows are not computed.
 void jc_v13(const JoinNet& net) {
     const std::uint64_t L = 7000;
     const HOf hof = rate_of(10);
@@ -3226,6 +3227,10 @@ void jc_v13(const JoinNet& net) {
     const Carried c = br.size() == k ? carry_on_side(a, br.back(), q, hof, 5950200) : Carried{};
     grow(a, L + 210 - q, sh);
     const pb::CarrierNode& tn = a.node(br.empty() ? pb::Hash32{} : br.back());
+    const pb::TipWindow tw = br.empty() ? pb::TipWindow{} : a.window(br.back());
+    check(tw.ok() && tw.oldest_bin != 0 && tw.oldest_bin <= Hf + kFresh,
+          "V13: the window at t reads a bin open at f (its oldest bin " + std::to_string(tw.oldest_bin) + " <= H(f) + Fresh = " +
+                  std::to_string(Hf + kFresh) + ")");
     check(!b.young && x1 - x0 + 2 <= kJ0 && br.size() == k && tn.pos >= x1 && tn.H < Hf + kF + kFresh && c.placed &&
                   c.live && q - 1 - f <= kJ0,
           "V13: x1 - x0 = " + std::to_string(x1 - x0) + "; a branch of " + std::to_string(br.size()) +
@@ -3312,7 +3317,7 @@ void jc4() {
     jc_v11(net);
 }
 void jc5() {
-    JoinNet net(900);
+    JoinNet net(900, 100000000);  // D_net 10^8: the windows reach back past F bins
     jc_v13(net);
 }
 void jc6() {

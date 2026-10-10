@@ -31,13 +31,13 @@ namespace pathb_kat {
 
 namespace pb = ::c2pool::xmr::pathb;
 
-// A KatNet whose main Monero rows reach kAnchorH + above.
+// A KatNet whose main Monero rows reach kAnchorH + above (difficulty diff).
 struct JoinNet : KatNet {
-    explicit JoinNet(std::uint64_t above) {
+    explicit JoinNet(std::uint64_t above, std::uint64_t diff = kMonDiff) : KatNet(diff) {
         const pb::RowWeights w = rw(kTailAgc, 300000, 300000);
         pb::Hash32 parent = mon_block(kMonTop);
         for (std::uint64_t h = kMonTop + 1; h <= kAnchorH + above; ++h)
-            parent = rows.add(kMonTag, h, parent, mon_ts(h), kMonDiff, w);
+            parent = rows.add(kMonTag, h, parent, mon_ts(h), diff, w);
     }
 };
 
