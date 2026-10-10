@@ -21,9 +21,15 @@
 //       live node's window and roots; one position after the base reloads;
 //   (5) phase 1 checks every stored body below q0 (id, parent, fold): a
 //       corrupted body is a load failure; so is a broken parent link;
-//   (6) a write failure poisons the node and leaves the last committed
-//       position loadable; a torn K_PCARRIER, a stale K_AR row above the tip,
-//       an anchor mismatch: load failure (the joiner path);
+//   (6) a write failure poisons the node and leaves the poison mark (the
+//       next load fails; the last committed batch is whole under it); a torn
+//       K_PCARRIER, a stale K_AR row above the tip, an anchor mismatch, a
+//       placement of a bin sealed in phase 2, a phase-1 parent link: load
+//       failure (the joiner path);
+//   (9) the head: K_PHEAD absent in an empty store only (NoHead); absent
+//       beside other keys, or unreadable: a load failure; a head naming more
+//       positions than the store holds: Records (no allocation from the head);
+//       the lane records beyond leaf_count deleted at load;
 //   (7) the directory: K_PHEAD naming another pool_id or G is a load failure;
 //       another pool or G has its own directory name; an adoption clears
 //       every key of the old store;
@@ -88,6 +94,7 @@ const char* fault_name(pb::StoreFault f) {
         case pb::StoreFault::Phase1: return "Phase1";
         case pb::StoreFault::Phase2: return "Phase2";
         case pb::StoreFault::Scan: return "Scan";
+        case pb::StoreFault::Poisoned: return "Poisoned";
     }
     return "?";
 }
@@ -408,19 +415,97 @@ void faults() {
         check(r.r.fault == pb::StoreFault::Phase2 && r.r.check == 9 && r.r.at < T,
               "(6) an altered placement of a bin sealed in phase 2: Phase2 check 9 at the first carrier over it: " + why(r.r));
     }
-    // (6) a write failure poisons the node; the store keeps its last committed position
+    // (6) a write failure poisons the node and leaves the poison mark: the next load is a load failure (the joiner path)
     {
         KatStoreNode s2(net, 64);
         store_chain(s2, 100, 0x92, 2, 41);
         s2.kv.fail_next = 1;
         store_chain(s2, 1, 0x92, 2, 42);
-        check(s2.poisoned, "(6) a failed commit poisons the node (templates stop; the joiner path at the next start)");
+        check(s2.poisoned && s2.kv.get(pb::store_keys::poison(0)).has_value(),
+              "(6) a failed commit poisons the node and writes the poison mark");
         const Reloaded r = reload(net, s2.kv, 64);
-        check(r.n && r.n->tree.best().pos == 100, "(6) the store loads at its last committed position: " + why(r.r));
+        check(!r.n && r.r.fault == pb::StoreFault::Poisoned, "(6) the next load: Poisoned (a load failure): " + why(r.r));
+        MemoryKv kv3 = s2.kv;
+        kv3.data.erase(pb::store_keys::poison(0));
+        const Reloaded r3 = reload(net, kv3, 64);
+        check(r3.n && r3.n->tree.best().pos == 100, "(6) under the mark the last committed batch is whole: " + why(r3.r));
     }
 }
 
 // ---------------------------------------------------------------------------
+// (9) the head: absent only in an empty store; unreadable or missing beside other keys: a load failure.
+void head_reads() {
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 40, 0xC1, 1, 71);
+    {
+        MemoryKv empty;
+        check(reload(net, empty, 64).r.fault == pb::StoreFault::NoHead, "(9) an empty store: NoHead (the empty-store start)");
+        MemoryKv kv = sn.kv;
+        kv.data.erase(pb::store_keys::phead(0));
+        const Reloaded r = reload(net, kv, 64);
+        check(r.r.fault == pb::StoreFault::BadHead, "(9) K_PHEAD absent beside the store's other keys: a load failure, "
+                                                   "not an empty store: " + why(r.r));
+        MemoryKv kv2 = sn.kv;
+        kv2.read_error.insert(pb::store_keys::phead(0));
+        const Reloaded r2 = reload(net, kv2, 64);
+        check(r2.r.fault == pb::StoreFault::BadHead, "(9) an unreadable K_PHEAD (IO / checksum error): a load failure: " + why(r2.r));
+        MemoryKv kv3 = sn.kv;
+        kv3.read_error.insert(pb::store_keys::pcarrier(0, 20));
+        check(reload(net, kv3, 64).r.fault == pb::StoreFault::Records, "(9) an unreadable K_PCARRIER: Records");
+    }
+    {
+        // a head that names more positions than the store holds: Records at the first missing one, no allocation from it
+        MemoryKv kv = sn.kv;
+        pb::StoreHead h = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
+        h.best_pos = UINT64_MAX - 3;
+        kv.data[pb::store_keys::phead(0)] = pb::encode_phead(h);
+        pb::LoadResult r;
+        bool threw = false;
+        try {
+            KatNode probe(net, 64);
+            r = pb::pathb_load(kv, net.pool_id, net.rules_g, inputs(probe, 64));
+        } catch (...) {
+            threw = true;
+        }
+        check(!threw && r.fault == pb::StoreFault::Records && r.at == 41,
+              "(9) a head naming position 2^64 - 4: Records at 41, no exception: " + why(r));
+    }
+    {
+        // the lane records beyond leaf_count: deleted at load (3.4 step 2)
+        MemoryKv kv = sn.kv;
+        const pb::BmmrHead bh = *pb::decode_bmmr(kv.data[pb::lane_keys::bmmr(0)]);
+        const std::string stale = pb::lane_keys::blhash(0, bh.leaf_count + 3);
+        kv.data[stale] = pb::encode_blhash(seq32(0x5A));
+        const Reloaded r = reload(net, kv, 64);
+        check(r.n && kv.data.count(stale) == 0, "(9) a K_BLHASH beyond leaf_count: deleted at load: " + why(r.r));
+    }
+}
+
+// (6) the phase-1 body parent link: a stored body whose tip is not its record's parent (the record links consistent)
+void phase1_link() {
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 3000, 0xC5, 1, 73);
+    KatNode probe(net, 64);
+    const pb::LoadResult clean = pb::pathb_load(sn.kv, net.pool_id, net.rules_g, inputs(probe, 64));
+    check(clean.fault == pb::StoreFault::None && clean.state, "(6) the 3,000-position store loads");
+    if (!clean.state) return;
+    const std::uint64_t s1 = clean.state->phase1_from;
+    check(s1 > 1, "(6) phase 1 starts above position 1 (s1 " + std::to_string(s1) + ")");
+    MemoryKv kv = sn.kv;
+    const pb::Hash32 fake = seq32(0xFA);
+    pb::CarrierRecord below = *pb::decode_pcarrier(kv.data[pb::store_keys::pcarrier(0, s1 - 1)]);
+    pb::CarrierRecord at = *pb::decode_pcarrier(kv.data[pb::store_keys::pcarrier(0, s1)]);
+    below.id = fake;  // below phase 1: its body is not checked
+    at.parent = fake;  // the record links stay consistent
+    kv.data[pb::store_keys::pcarrier(0, s1 - 1)] = pb::encode_pcarrier(below);
+    kv.data[pb::store_keys::pcarrier(0, s1)] = pb::encode_pcarrier(at);
+    const Reloaded r = reload(net, kv, 64);
+    check(r.r.fault == pb::StoreFault::Phase1 && r.r.at == s1,
+          "(6) a stored body whose tip is not its record's parent: Phase1 at s1: " + why(r.r));
+}
+
 void directory() {
     const KatNet net;
     KatStoreNode sn(net, 64);
@@ -487,6 +572,8 @@ int main(int argc, char** argv) {
     run("switch", switch_batch);
     run("prefix", prefix_and_joined);
     run("faults", faults);
+    run("head", head_reads);
+    run("phase1link", phase1_link);
     run("directory", directory);
     run("archive", archive);
     return finish("v37_xmr_pathb_store_kat");

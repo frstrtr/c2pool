@@ -38,6 +38,7 @@ struct Harness {
     std::uint64_t mon_tip = kPoolH + 1;   // the follower's main-chain tip height
     std::uint64_t now = 1000;              // seconds (the glue's clock)
     std::set<pb::Hash32> bad_pow;
+    std::set<pb::Hash32> bad_served;  // P_r ids whose served context fails (BadServed)
     std::uint64_t rx_calls = 0;
     std::vector<pb::TemplateTx> txs;
     std::vector<std::unique_ptr<pb::FollowerBranchView>> views;
@@ -75,6 +76,10 @@ struct Harness {
 
     pb::PrInfo resolve(const pb::FollowerBranchView& mon, const pb::Hash32& p_r) const {
         pb::PrInfo out;
+        if (bad_served.count(p_r) != 0) {
+            out.status = pb::PrInfo::Status::BadServed;
+            return out;
+        }
         const std::optional<pb::BranchBlock> b = mon.block(p_r);
         if (!b) return out;
         out.status = pb::PrInfo::Status::Held;
@@ -131,14 +136,14 @@ struct Harness {
             case pb::kOpFcCarrier: (void)n.on_carrier(m.from, m.frame); break;
             case pb::kOpFbReceipts: (void)n.on_receipts(m.from, m.frame); break;
             case pb::kOpFcGetCarrier:
-                for (auto& f : n.serve_getcarrier(m.from, m.frame, now)) q.push_back(Msg{m.to, m.from, f});
+                for (auto& f : n.serve_getcarrier(m.from, m.frame, now).frames) q.push_back(Msg{m.to, m.from, f});
                 break;
             case pb::kOpFcGetHeaders:
-                for (auto& f : n.serve_getheaders(m.from, m.frame, now)) q.push_back(Msg{m.to, m.from, f});
+                for (auto& f : n.serve_getheaders(m.from, m.frame, now).frames) q.push_back(Msg{m.to, m.from, f});
                 break;
             case pb::kOpFcHeaders: (void)n.on_headers(m.from, m.frame, now); break;
             case pb::kOpFcGetBuckets:
-                for (auto& f : n.serve_getbuckets(m.from, m.frame, now)) q.push_back(Msg{m.to, m.from, f});
+                for (auto& f : n.serve_getbuckets(m.from, m.frame, now).frames) q.push_back(Msg{m.to, m.from, f});
                 break;
             case pb::kOpFcBuckets: (void)n.on_buckets(m.from, m.frame, now); break;
             default: break;

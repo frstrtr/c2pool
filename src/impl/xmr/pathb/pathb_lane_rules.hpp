@@ -516,6 +516,7 @@ enum class LaneRulesError : std::uint8_t {
     Order,         // ids not strictly ascending
     Width,         // a known id with another length
     Missing,       // a field of the set absent
+    Value,         // K16's author reference not (XMR_STD, 64)
 };
 
 struct LaneRulesDecode {
@@ -615,6 +616,11 @@ inline LaneRulesDecode decode_rules_block(std::span<const std::uint8_t> b) {
             case 0x0f: r.owner_fee_version = q[0]; break;
             case 0x10:
                 r.give_author_bp = static_cast<std::uint16_t>(get_le(q, 2));
+                if (q[2] != kPayeeKindXmrStd || q[3] != kKeyRefPayloadBytes) {
+                    d.error = LaneRulesError::Value;
+                    d.id = id;
+                    return d;
+                }
                 for (std::size_t i = 0; i < kHashBytes; ++i) {  // after the kind and len bytes
                     r.author.spend[i] = q[2 + 2 + i];
                     r.author.view[i] = q[2 + 2 + kHashBytes + i];

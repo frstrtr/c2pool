@@ -10,7 +10,8 @@
 //                     (vote=0: own no); anything else: no stated vote (the
 //                     field is ignored, never a refusal)
 //   login_payee       the login address as an XMR_STD key reference, or the
-//                     refusal (a subaddress or an integrated address)
+//                     refusal (a subaddress, an integrated address, an
+//                     address of another network, keys that do not decompress)
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -22,6 +23,7 @@
 #include <string_view>
 
 #include "c2pool/v37/xmr/pathb/pathb_policy.hpp"
+#include "impl/xmr/pathb/pathb_lane_rules.hpp"          // LaneNet
 #include "impl/xmr/pathb/pathb_ratchet_activation.hpp"  // kEpochMax
 #include "impl/xmr/pathb/pathb_wire_v3.hpp"             // XmrKeyRef
 
@@ -45,11 +47,27 @@ struct LoginPayee {
     XmrKeyRef ref;
 };
 
-inline LoginPayee login_payee(const std::string& address) {
+// The standard-address prefix of a network (regtest: the mainnet bytes).
+inline std::uint64_t std_prefix_of(LaneNet n) {
+    return n == LaneNet::Testnet ? policy::kPrefixTestnetStd
+         : n == LaneNet::Stagenet ? policy::kPrefixStagenetStd : policy::kPrefixMainnetStd;
+}
+
+inline LoginPayee login_payee(const std::string& address, LaneNet net) {
     LoginPayee out;
     const policy::DecodedAddress d = policy::decode_xmr_address(address);
     out.refusal = policy::payee_refusal(d);
-    if (out.refusal.empty()) out.ref = XmrKeyRef{d.spend, d.view};
+    if (!out.refusal.empty()) return out;
+    if (d.prefix != std_prefix_of(net)) {
+        out.refusal = "payee: an address of another network (prefix " + std::to_string(d.prefix) + ")";
+        return out;
+    }
+    const XmrKeyRef ref{d.spend, d.view};
+    if (!key_ref_points_valid(ref)) {
+        out.refusal = "payee: a key that does not decompress";
+        return out;
+    }
+    out.ref = ref;
     return out;
 }
 

@@ -95,9 +95,9 @@ inline StartupResult startup_checks(const StartupInputs& in) {
         return out;
     };
     // 1
-    if (in.owner_fee_bp + in.give_author_bp > 10000u)
-        return refuse(StartupStep::FeeSum, "--node-owner-fee-pct + --give-author-pct = " +
-                                                   std::to_string(in.owner_fee_bp + in.give_author_bp) +
+    const std::uint64_t fee_sum = std::uint64_t{in.owner_fee_bp} + in.give_author_bp;
+    if (fee_sum > 10000u)
+        return refuse(StartupStep::FeeSum, "--node-owner-fee-pct + --give-author-pct = " + std::to_string(fee_sum) +
                                                    " bp, above 10000 bp");
     // 2
     if (const std::optional<std::string> r = journal_depth_refusal(in.p, in.journal_depth))
@@ -116,7 +116,7 @@ inline StartupResult startup_checks(const StartupInputs& in) {
         case BufferCheck::FrameBelowMinimum: return refuse(StartupStep::RelayBuffers, "the frame buffer is below the default");
         case BufferCheck::ViewOutOfDomain: return refuse(StartupStep::RelayBuffers, "the view's hf or Z_lt is out of the buffers' domain");
     }
-    // 7: one form only
+    // 7: one form only (one identity input; two forms are ambiguous)
     if (in.genesis_from && (in.raw.pool_genesis || in.raw.pool_genesis_height))
         return refuse(StartupStep::Identity, "genesis: --pool-genesis-from with a raw genesis flag");
     if (in.genesis_from) {

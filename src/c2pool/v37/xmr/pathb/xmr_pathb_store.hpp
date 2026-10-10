@@ -8,7 +8,8 @@
 // The Path B store archive (xmr_pathb_store): the node's own store in a
 // LevelDB directory of its own, behind the core-free KV seam
 // (impl/xmr/pathb/pathb_kv.hpp). Every batch is one synced LevelDB
-// WriteBatch; reads verify checksums; a scan fails closed.
+// WriteBatch; point reads verify checksums (scans do not; the load's anchors
+// cover them); a read error is never "absent"; a scan fails closed.
 //   <data>/<network>/pathb_db/<pool_id hex>-<G hex>   (store_dir_name)
 // Not linked into any running target.
 // ---------------------------------------------------------------------------

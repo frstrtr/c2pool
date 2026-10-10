@@ -61,10 +61,24 @@ public:
     explicit LevelDbKv(const std::string& dir) : db_(dir, synced_options()) {}
     bool open() { return db_.open(); }
     std::unique_ptr<PathbKvBatch> batch() override { return std::make_unique<LevelDbBatch>(&db_); }
-    std::optional<std::string> get(const std::string& k) override {
+    // core's get is false for an absent key and for a read error alike: a miss is
+    // told apart by a scan from the key (the key present, or the scan failing, is
+    // an error; the scan passing it by is absence).
+    KvRead read(const std::string& k) override {
+        KvRead out;
         std::vector<std::uint8_t> v;
-        if (!db_.get(k, v)) return std::nullopt;
-        return std::string(v.begin(), v.end());
+        if (db_.get(k, v)) {
+            out.status = KvRead::Status::Value;
+            out.value.assign(v.begin(), v.end());
+            return out;
+        }
+        bool present = false;
+        const bool scanned = db_.for_each_prefix(k, [&](const std::string& key, const std::vector<std::uint8_t>&) {
+            present = key == k;
+            return false;
+        });
+        out.status = !scanned || present ? KvRead::Status::Error : KvRead::Status::Absent;
+        return out;
     }
     bool for_each_prefix(const std::string& prefix,
                          const std::function<bool(const std::string&, const std::string&)>& fn) override {

@@ -54,6 +54,22 @@
 //                switches by the journal; at J + 1 (below the journal base)
 //                its bodies DEFER (OwnChainDeep, 0 tokens) and its headers
 //                take the joiner path, the store untouched;
+//   poison       the store poisoned: the latch first in every event
+//                (NodeInternal, nothing judged, pended or flooded), the status
+//                alarm, the poison mark (the next load fails); the empty-store
+//                start writes into an empty store;
+//   joinpages    FC_GETHEADERS with from = the zero id: the at most
+//                min(max, pos(stop), a frame) headers ending at stop, oldest
+//                first, first_pos claimed; side parts; position 0 never;
+//   tokens       family C token classes (undecodable STRIKE, above the buffer
+//                DROP); FC_GETHEADERS at most P-01; the pending set's eviction;
+//   receive      FC_BUCKETS undecodable from an asked server (refuse + 1
+//                strike); closed / abandoned keys go with the peer; a parked
+//                chain released iteratively; BadServed BAN releases; a request
+//                accumulates at most its max;
+//   hellobound   the HELLO leaf count compared on a placed best tip only;
+//   base         the header path forked exactly at the journal base switches
+//                by the journal; a refused switch_best on a reorg: NodeInternal;
 //   boundary     the carried list leaves out a pending receipt whose tip
 //                forks more than J_0 below the carrier's parent (ruling 40);
 //   timers       P-53 per request restarted per frame, a timeout is
@@ -79,6 +95,9 @@ struct PathbNodeTestAccess {
     static void add_pending(PathbNode& n, PendingReceipt r) { n.pending_.add(std::move(r)); }
     static std::vector<ReceiptBodyV3> carried(PathbNode& n, std::uint64_t x, std::uint64_t h) { return n.carried_list(x, h); }
     static const HeaderIndex& headers(const PathbNode& n) { return n.headers_; }
+    static std::uint64_t max_settle_depth(const PathbNode& n) { return n.max_settle_depth_; }
+    static std::size_t closed(const PathbNode& n) { return n.closed_.size(); }
+    static std::size_t abandoned(const PathbNode& n) { return n.abandoned_.size(); }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -678,7 +697,7 @@ Split split(Harness& h) {
 std::vector<std::vector<std::uint8_t>> serve_front(Harness& h, const Split& s) {
     const Msg req = h.q.front();
     h.q.pop_front();
-    return h[s.b].serve_getheaders(s.a, req.frame, h.now);
+    return h[s.b].serve_getheaders(s.a, req.frame, h.now).frames;
 }
 
 void n7b2() {
@@ -689,7 +708,7 @@ void n7b2() {
         check(h[s.a].tree().best().pos == 10 && h[s.b].tree().best().pos == 14, "n7b2: A at 10, B at 14, forked at 6");
         // B-2: FC_GETHEADERS(from, stop, 3): at most 3 headers
         const std::vector<std::vector<std::uint8_t>> f =
-                h[s.b].serve_getheaders(s.a, pb::encode_fc_getheaders(pb::GetHeaders{0, s.fork, s.b_tip, 3}), h.now);
+                h[s.b].serve_getheaders(s.a, pb::encode_fc_getheaders(pb::GetHeaders{0, s.fork, s.b_tip, 3}), h.now).frames;
         pb::HeadersReply rep;
         const bool ok = f.size() == 1
                         && pb::decode_fc_headers(f[0], 0, h[s.a].frame_bytes_headers(), pb::kRuledLaneParams, rep).ok();
@@ -775,7 +794,7 @@ void n7b2() {
         check(h[a].request_buckets(b, at, b0, b0 + 9, h.now), "n7b2 (P-48): FC_GETBUCKETS to B");
         const Msg req = h.q.front();
         h.q.pop_front();
-        const std::vector<std::vector<std::uint8_t>> fr = h[b].serve_getbuckets(a, req.frame, h.now);
+        const std::vector<std::vector<std::uint8_t>> fr = h[b].serve_getbuckets(a, req.frame, h.now).frames;
         std::uint64_t bytes = 0;
         for (const auto& f : fr) bytes += f.size();
         check(!fr.empty() && bytes <= 2400, "n7b2 (P-48): " + std::to_string(fr.size()) + " frames, " + std::to_string(bytes)
@@ -811,6 +830,10 @@ void startup() {
     a.owner_fee_bp = 9991;
     a.journal_depth = 10;  // also refused, later
     check(step(a) == pb::StartupStep::FeeSum, "startup (1): the configured sum above 10000 bp, before the journal depth");
+    a = base();
+    a.owner_fee_bp = 0xFFFFFFFFu;
+    a.give_author_bp = 2;
+    check(step(a) == pb::StartupStep::FeeSum, "startup (1): a sum past 2^32 is not wrapped");
     a = base();
     a.journal_depth = 1151;
     a.buffers.frame = 1;  // also refused, later
@@ -903,15 +926,436 @@ void deep() {
                           + std::to_string(static_cast<int>(last.action)) + ")");
             const pb::Hash32 fork_id = *h[a].store().best_at(fork);
             check(h[a].request_headers(b, fork_id, bb.back(), 64, h.now), tag + "FC_GETHEADERS to B");
-            const Msg req = h.q.front();
-            h.q.pop_front();
-            const std::vector<std::vector<std::uint8_t>> r = h[b].serve_getheaders(a, req.frame, h.now);
-            const pb::PathbNode::HeadersOutcome o = h[a].on_headers(b, r.at(0), h.now);
+            pb::PathbNode::HeadersOutcome o;
+            for (int page = 0; page < 8 && !h.q.empty(); ++page) {  // B's pages (at most P-01 = J each)
+                const Msg req = h.q.front();
+                h.q.pop_front();
+                const std::vector<std::vector<std::uint8_t>> r = h[b].serve_getheaders(a, req.frame, h.now).frames;
+                o = h[a].on_headers(b, r.at(0), h.now);
+                if (o.kind != pb::PathbNode::HeadersOutcome::Kind::Continue) break;
+            }
             check(o.kind == pb::PathbNode::HeadersOutcome::Kind::JoinerPath && o.fork_pos == fork && h.q.empty()
                           && h[a].store().best_tip() == a_tip && !h[a].poisoned(),
                   tag + "heavier by its headers, forked below the journal base: the joiner path, no body fetched, the "
                         "store untouched (kind " + std::to_string(static_cast<int>(o.kind)) + ")");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The poisoned store (3.3, "as w6 does"): the latch first in every event, the status alarm, the poison mark.
+void poison() {
+    const KatNet net;
+    {
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true, 1152, true);
+        for (int i = 0; i < 3; ++i) {
+            h.tick_monero();
+            h.mine(a, 1, 80 + i);
+        }
+        h.cut = {{a, b}};
+        h.mine(a, 1, 90);
+        const pb::Hash32 c = h[a].tree().best().id;
+        const std::optional<pb::PathbJob> stale = h.job(a, 2, 91);  // a share for B's pending set, later
+        h.mine(a, 1, 92);
+        h.cut.clear();
+        h.q.clear();
+        const std::size_t alarms0 = h[b].alarms().count();
+        h[b].faults().fail_switch = true;
+        const pb::NodeEventResult r = h[b].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(c), 16));
+        check(r.action == pb::NodeAction::NodeInternal && h[b].poisoned() && h[b].alarms().count() > alarms0,
+              "poison: NodeInternal poisons the store and raises the status alarm");
+        pb::LoadInputs in;
+        in.T = table0(net);
+        in.journal_depth = 1152;
+        check(pb::pathb_load(*h.kvs[0], net.pool_id, net.rules_g, in).fault == pb::StoreFault::Poisoned,
+              "poison: the poison mark: the next load is a load failure (the joiner path)");
+        // after the poison nothing is judged: a frame that would earn a strike, a receipt, a bucket frame
+        std::vector<std::uint8_t> garbage = *pb::encode_fc_carrier(0, *h[a].bodies().get(c), 16);
+        garbage.resize(garbage.size() - 7);
+        const pb::NodeEventResult g = h[b].on_carrier(a, garbage);
+        check(g.action == pb::NodeAction::NodeInternal && g.admit.strike == 0 && g.admit.row == pb::RowId::None,
+              "poison: a frame that does not decode: NodeInternal, not judged (no verdict, no token)");
+        std::size_t pend0 = h[b].pending().size();
+        pb::ReceiptBodyV3 rb = stale->body;
+        rb.blob.nonce = 91;
+        std::vector<pb::ReceiptBodyV3> one{rb};
+        const std::vector<pb::NodeEventResult> rr = h[b].on_receipts(a, *pb::encode_fb_receipts(0, one, pb::kRuledLaneParams));
+        check(rr.size() == 1 && rr[0].action == pb::NodeAction::NodeInternal && h[b].pending().size() == pend0 && h.q.empty(),
+              "poison: an FB_RECEIPTS body: NodeInternal, not pended, not flooded");
+        check(h[b].on_buckets(a, garbage, h.now).action == pb::NodeAction::NodeInternal
+                      && !h[b].request_headers(a, *h[b].store().best_at(1), c, 16, h.now)
+                      && !h[b].request_buckets(a, *h[b].store().best_at(1), 0, 1, h.now),
+              "poison: FC_BUCKETS NodeInternal; no catch-up request is sent");
+    }
+    {
+        // a failed commit of an extension: NodeInternal, the alarm, the mark
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true, 1152, true);
+        h.tick_monero();
+        h.mine(a, 1, 10);
+        h.kvs[0]->fail_next = 1;
+        h.tick_monero();
+        const pb::NodeEventResult r = h.mine(a, 1, 11);
+        pb::LoadInputs in;
+        in.T = table0(net);
+        in.journal_depth = 1152;
+        check(r.action == pb::NodeAction::NodeInternal && h[a].poisoned() && h[a].alarms().count() == 1
+                      && pb::pathb_load(*h.kvs[0], net.pool_id, net.rules_g, in).fault == pb::StoreFault::Poisoned
+                      && h[a].make_template(h.now).status == pb::TemplateStatus::Poisoned,
+              "poison: a failed extension commit: NodeInternal, one status alarm, the mark, no template");
+    }
+    {
+        // the empty-store start writes into an empty store: stale keys of the directory deleted in its batch
+        Harness h(net);
+        h.kvs.push_back(std::make_unique<MemoryKv>());
+        MemoryKv& kv = *h.kvs.back();
+        kv.data[pb::store_keys::pcarrier(0, 7)] = "stale";
+        kv.data[pb::store_keys::ar(0, 9)] = "stale";
+        kv.data[pb::lane_keys::blhash(0, 4)] = "stale";
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net), true), h.io(0), &kv));
+        check(!h[0].poisoned() && kv.data.count(pb::store_keys::pcarrier(0, 7)) == 0 && kv.data.count(pb::store_keys::ar(0, 9)) == 0
+                      && kv.data.count(pb::lane_keys::blhash(0, 4)) == 0 && kv.data.count(pb::store_keys::phead(0)) == 1,
+              "poison: the empty-store start clears the store's prefixes in its genesis batch");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FC_GETHEADERS with from = the zero id: the joiner's page ending at stop.
+pb::HeadersReply page_of(Harness& h, std::size_t server, const pb::Hash32& stop, std::uint16_t max) {
+    const pb::ServeResult r = h[server].serve_getheaders(99, pb::encode_fc_getheaders(pb::GetHeaders{0, pb::Hash32{}, stop, max}), h.now);
+    pb::HeadersReply rep;
+    if (r.frames.size() == 1) (void)pb::decode_fc_headers(r.frames[0], 0, 1u << 22, pb::kRuledLaneParams, rep);
+    return rep;
+}
+
+bool links(const pb::HeadersReply& r) {
+    for (std::size_t i = 1; i < r.headers.size(); ++i)
+        if (r.headers[i].own.side.tip != pb::receipt_id(r.headers[i - 1].own)) return false;
+    return true;
+}
+
+void joinpages() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), c = h.add(table0(net), true), e = h.add(table0(net), true);
+    {
+        const pb::HeadersReply r0 = page_of(h, a, pb::Hash32{}, 10);
+        check(r0.headers.empty() && r0.first_pos == 0, "joinpages: a server at position 0: n = 0, first_pos 0 (L = 0)");
+    }
+    for (int i = 0; i < 40; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(a, static_cast<std::size_t>(i % 3), 300 + i);
+    }
+    const pb::Hash32 tip = h[a].tree().best().id;
+    const pb::HeadersReply r1 = page_of(h, a, pb::Hash32{}, 10);
+    check(r1.headers.size() == 10 && r1.first_pos == 31 && pb::receipt_id(r1.headers.back().own) == tip && links(r1),
+          "joinpages: the first page (stop zero): the 10 headers ending at the best tip, first_pos 31");
+    const pb::Hash32 stop2 = r1.headers.front().own.side.tip;
+    const pb::HeadersReply r2 = page_of(h, a, stop2, 10);
+    check(r2.headers.size() == 10 && r2.first_pos == 21 && pb::receipt_id(r2.headers.back().own) == stop2 && links(r2)
+                  && r2.first_pos + r2.headers.size() == r1.first_pos,
+          "joinpages: the next page ends at stop (the parent of the lowest held), first_pos + n = the lowest held");
+    const pb::HeadersReply r3 = page_of(h, a, tip, 1);
+    check(r3.headers.size() == 1 && r3.first_pos == 40 && pb::receipt_id(r3.headers[0].own) == tip, "joinpages: stop = tip, max 1: one header");
+    const pb::HeadersReply r4 = page_of(h, a, *h[a].store().best_at(2), 10);
+    check(r4.headers.size() == 2 && r4.first_pos == 1, "joinpages: position 0 is never served (stop at 2: positions 1, 2)");
+    check(page_of(h, a, seq32(0x42), 10).headers.empty() && page_of(h, a, seq32(0x42), 10).first_pos == 0,
+          "joinpages: a stop this node has not bound: n = 0");
+    // a side part: C's lighter branch placed at A, a page ending at its tip crosses into the best chain
+    for (std::size_t x = 1; x <= 40; ++x) (void)x;
+    h.cut = {{a, c}, {c, a}, {e, c}, {c, e}};
+    h.mine(a, 1, 500);
+    h.mine(a, 1, 501);
+    h.mine(a, 1, 502);
+    h.mine(c, 2, 600);
+    h.mine(c, 2, 601);
+    h.cut.clear();
+    h.q.clear();
+    for (std::uint64_t x = 41; x <= 42; ++x)
+        (void)h[a].on_carrier(c, *pb::encode_fc_carrier(0, *h[c].bodies().get(*h[c].store().best_at(x)), 16));
+    h.q.clear();
+    const pb::Hash32 side_tip = *h[c].store().best_at(42);
+    const pb::HeadersReply r5 = page_of(h, a, side_tip, 5);
+    check(h[a].tree().find(side_tip) != nullptr && h[a].tree().best().pos == 43 && r5.headers.size() == 5 && r5.first_pos == 38
+                  && links(r5) && pb::receipt_id(r5.headers.back().own) == side_tip
+                  && pb::receipt_id(r5.headers[2].own) == tip,
+          "joinpages: a page ending at a side tip crosses into the best chain by parent steps");
+    // a frame-limited page keeps the headers next to stop
+    Harness g(net);
+    g.headers_frame = 1500;
+    const std::size_t s = g.add(table0(net), true);
+    for (int i = 0; i < 20; ++i) {
+        if (i % 3 == 0) g.tick_monero();
+        g.mine(s, 1, 700 + i);
+    }
+    const pb::HeadersReply r6 = page_of(g, s, pb::Hash32{}, 20);
+    check(!r6.headers.empty() && r6.headers.size() < 20 && pb::receipt_id(r6.headers.back().own) == g[s].tree().best().id
+                  && r6.first_pos + r6.headers.size() - 1 == 20 && links(r6),
+          "joinpages: a frame-limited page (" + std::to_string(r6.headers.size()) + " headers) ends at stop: the newest kept");
+}
+
+// ---------------------------------------------------------------------------
+// The family C token classes and the bounded serve and receive paths.
+void tokens() {
+    const KatNet net;
+    {
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true, 16), b = h.add(table0(net), true, 16);
+        for (int i = 0; i < 40; ++i) {
+            if (i % 3 == 0) h.tick_monero();
+            h.mine(a, 1, 100 + i);
+        }
+        // a forward FC_GETHEADERS: at most P-01 (J = 16) headers whatever max asks
+        const pb::ServeResult fw =
+                h[a].serve_getheaders(b, pb::encode_fc_getheaders(pb::GetHeaders{0, h[a].tree().genesis().id, h[a].tree().best().id, 100}), h.now);
+        pb::HeadersReply rep;
+        const bool ok = fw.frames.size() == 1 && pb::decode_fc_headers(fw.frames[0], 0, 1u << 22, pb::kRuledLaneParams, rep).ok();
+        check(ok && rep.headers.size() == 16 && rep.first_pos == 1, "tokens (F-4): FC_GETHEADERS max 100 -> 16 headers (P-01)");
+        // request frames that do not decode: refuse + 1 strike; above the buffer: DROP
+        const std::vector<std::uint8_t> bad{0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
+        std::vector<std::uint8_t> big(h[a].config().buffers.frame + 1, 0x52);
+        check(h[a].serve_getcarrier(b, bad, h.now).token == pb::FrameToken::Strike
+                      && h[a].serve_getheaders(b, bad, h.now).token == pb::FrameToken::Strike
+                      && h[a].serve_getbuckets(b, bad, h.now).token == pb::FrameToken::Strike
+                      && h[a].serve_getcarrier(b, big, h.now).token == pb::FrameToken::Drop
+                      && h[a].serve_getheaders(b, big, h.now).token == pb::FrameToken::Drop,
+              "tokens: an undecodable FC_GETCARRIER / FC_GETHEADERS / FC_GETBUCKETS: STRIKE; above the buffer: DROP");
+        // an FC_HEADERS reply above the buffer: DROP, the request stays open; one that does not decode: refuse + 1 strike
+        check(h[b].request_headers(a, h[b].tree().genesis().id, h[a].tree().best().id, 8, h.now) || true, "tokens: a request");
+        std::vector<std::uint8_t> bigh(h[b].frame_bytes_headers() + 1, 0x53);
+        const pb::PathbNode::HeadersOutcome o1 = h[b].on_headers(a, bigh, h.now);
+        const std::vector<std::uint8_t> badh{0x53, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+        const pb::PathbNode::HeadersOutcome o2 = h[b].on_headers(a, badh, h.now);
+        const pb::PathbNode::HeadersOutcome o3 = h[b].on_headers(a, badh, h.now);
+        check(o1.kind == pb::PathbNode::HeadersOutcome::Kind::OverBuffer && o2.kind == pb::PathbNode::HeadersOutcome::Kind::Undecodable
+                      && o3.kind == pb::PathbNode::HeadersOutcome::Kind::Unsolicited,
+              "tokens: FC_HEADERS above the buffer DROP (request open); then undecodable: STRIKE (request ended)");
+    }
+    {
+        // N-14: the pending set reports its own eviction
+        pb::PendingSet ps(2);
+        const auto rec = [](std::uint8_t k, std::uint64_t hh) { return pb::PendingReceipt{seq32(k), pb::ReceiptBodyV3{}, hh, 1, 0}; };
+        const bool a1 = ps.add(rec(1, 5)), a2 = ps.add(rec(2, 6)), a3 = ps.add(rec(3, 4));
+        check(a1 && a2 && !a3 && !ps.holds(seq32(3)) && ps.size() == 2, "tokens (N-14): the oldest-bin newcomer evicted: add false");
+        const bool a4 = ps.add(rec(4, 7));
+        check(a4 && !ps.holds(seq32(1)) && ps.holds(seq32(2)) && ps.holds(seq32(4)), "tokens (N-14): the oldest bin goes first");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The buckets receive: undecodable frames, the closed / abandoned keys, the parked chain, the BadServed BAN, the max cap.
+void receive() {
+    const KatNet net;
+    {
+        Harness h(net);
+        h.bucket_policy = pb::BucketWirePolicy{1200, 1, 12000};
+        const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true), c = h.add(table0(net), true);
+        for (int i = 0; i < 80; ++i) {
+            h.tick_monero(2);
+            h.mine(a, static_cast<std::size_t>(i % 3), 300 + i);
+        }
+        const pb::Hash32 at = h[a].tree().best().id;
+        const std::uint64_t b0 = h[a].store().b0();
+        check(h[a].request_buckets(b, at, b0, b0 + 9, h.now), "receive: FC_GETBUCKETS to B");
+        std::vector<std::vector<std::uint8_t>> fr;
+        {
+            const Msg req = h.q.front();
+            h.q.pop_front();
+            fr = h[b].serve_getbuckets(a, req.frame, h.now).frames;
+        }
+        std::vector<std::uint8_t> other = fr.at(0);
+        other[2] ^= 0x01;  // another chain_id: the frame does not decode
+        const pb::BucketsEventResult u = h[a].on_buckets(b, other, h.now);
+        check(u.frame.verdict == pb::BucketsFrameVerdict::Refused && u.frame.strike == 1 && h[a].open_assemblies() == 0,
+              "receive (38 S3b3-19): an undecodable FC_BUCKETS from an asked server: refuse + 1 strike, its requests close");
+        const pb::BucketsEventResult u2 = h[a].on_buckets(c, other, h.now);
+        std::vector<std::uint8_t> big(1201, 0x55);
+        const pb::BucketsEventResult u3 = h[a].on_buckets(b, big, h.now);
+        check(u2.frame.verdict == pb::BucketsFrameVerdict::Drop && u2.frame.strike == 0 && u3.frame.verdict == pb::BucketsFrameVerdict::Drop
+                      && u3.frame.fault == pb::BucketsFault::OverBuffer && u3.frame.strike == 0,
+              "receive: from a peer with no open request DROP; above the bucket frame buffer DROP");
+        // the closed and abandoned keys go with the peer
+        check(h[a].request_buckets(c, at, b0, b0 + 9, h.now), "receive: FC_GETBUCKETS to C");
+        h.q.clear();
+        const std::size_t exp = h[a].tick(h.now + pb::kAbandonTimeoutDefault + 1);
+        check(exp == 1 && pb::PathbNodeTestAccess::abandoned(h[a]) == 1 && pb::PathbNodeTestAccess::closed(h[a]) == 2
+                      && !h[a].request_buckets(c, at, b0, b0 + 9, h.now + 20),
+              "receive: C abandoned for at (no assembly kept); closed for at");
+        h[a].disconnect(c);
+        h[a].disconnect(b);
+        check(pb::PathbNodeTestAccess::abandoned(h[a]) == 0 && pb::PathbNodeTestAccess::closed(h[a]) == 0,
+              "receive (F-2): a disconnect drops the peer's closed and abandoned keys");
+    }
+    {
+        // a closed key for an `at` below the retained floor (base_pos - J_0) goes at the next best change
+        KatStoreNode sn(net, 64);
+        store_chain(sn, 1300, 0x81, 1, 23);
+        Harness h(net);
+        h.nodes.push_back(node_from(h, sn.n, 64, 0));
+        pb::PathbNode& a = h[0];
+        const pb::Hash32 deep_at = *sn.n.store.best_at(20);
+        check(a.request_buckets(5, deep_at, a.store().b0(), a.store().b0() + 1, h.now), "receive: a request for an at at 20");
+        h.q.clear();
+        const std::vector<std::uint8_t> bad{0x55, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
+        (void)a.on_buckets(5, bad, h.now);
+        check(pb::PathbNodeTestAccess::closed(a) == 1, "receive: (5, at 20) closed");
+        h.mon_tip = h_pos(1300) + 1;
+        h.tick_monero(1);
+        h.mine(0, 1, 990);
+        check(a.store().tip_pos() == 1301 && pb::PathbNodeTestAccess::closed(a) == 0,
+              "receive (F-2): after a best change the closed key below base_pos - J_0 is gone");
+    }
+    {
+        // a parked chain released iteratively (one placement level at a time)
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+        for (int i = 0; i < 3; ++i) {
+            h.tick_monero();
+            h.mine(a, 1, 40 + i);
+        }
+        h.cut = {{b, a}};
+        for (int i = 0; i < 30; ++i) h.mine(b, 1, 50 + i);
+        h.cut.clear();
+        h.q.clear();
+        for (std::uint64_t x = 33; x >= 5; --x)
+            (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(*h[b].store().best_at(x)), 16));
+        h.q.clear();
+        (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(*h[b].store().best_at(4)), 16));
+        h.q.clear();
+        check(h[a].tree().best().id == h[b].tree().best().id && pb::PathbNodeTestAccess::max_settle_depth(h[a]) <= 1,
+              "receive (F-3): 29 parked carriers placed on their parent's arrival, one level deep (max depth "
+                      + std::to_string(pb::PathbNodeTestAccess::max_settle_depth(h[a])) + ")");
+    }
+    {
+        // N-1: a P_r served bad on a later page: BAN, the server's earlier variants released
+        Harness h(net);
+        h.headers_frame = 1500;
+        const Split s = split(h);
+        check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 16, h.now), "receive (N-1): A asks B");
+        pb::PathbNode::HeadersOutcome o;
+        std::size_t pages = 0, indexed = 0;
+        while (!h.q.empty() && pages < 10) {
+            const std::vector<std::vector<std::uint8_t>> r = serve_front(h, s);
+            o = h[s.a].on_headers(s.b, r.at(0), h.now);
+            ++pages;
+            indexed += o.indexed;
+            if (o.kind != pb::PathbNode::HeadersOutcome::Kind::Continue) break;
+            if (pages == 1 && indexed < s.b_ids.size())
+                h.bad_served.insert(h[s.b].bodies().get(s.b_ids[indexed])->own.blob.prev_id);
+        }
+        check(pages >= 2 && indexed > 0 && o.kind == pb::PathbNode::HeadersOutcome::Kind::Ban
+                      && pb::PathbNodeTestAccess::headers(h[s.a]).size() == 0,
+              "receive (N-1): a BadServed P_r on page 2: BAN and the server's variants released (index "
+                      + std::to_string(pb::PathbNodeTestAccess::headers(h[s.a]).size()) + ")");
+    }
+    {
+        // N-10: the branch a request accumulates is at most its max
+        Harness h(net);
+        h.headers_frame = 1500;
+        const Split s = split(h);
+        check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 3, h.now), "receive (N-10): A asks B for at most 3");
+        const pb::PathbNode::HeadersOutcome o = h[s.a].on_headers(s.b, serve_front(h, s).at(0), h.now);
+        check(o.kind == pb::PathbNode::HeadersOutcome::Kind::Keep && o.indexed == 3 && h.q.empty(),
+              "receive (N-10): 3 headers, max reached: no continuation (kind " + std::to_string(static_cast<int>(o.kind)) + ")");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HELLO at a node: the leaf count is compared only on a best tip this node placed.
+void hellobound() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 30; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        h.mine(a, 1, 200 + i);
+    }
+    const pb::PathbHello ours = h[a].our_hello(1, 0);
+    pb::PathbHello theirs = h[b].our_hello(2, 0);
+    check(theirs.tail.best_tip == h[a].tree().best().id, "hellobound: B's best tip is placed at A");
+    theirs.tail.mmr_leaf_count += 3;
+    const pb::HelloCheck c1 = h[a].on_hello(b, *pb::encode_pathb_hello(theirs), ours);
+    check(c1.verdict == pb::HelloVerdict::Close && c1.strike == 0,
+          "hellobound: a placed best tip with another mmr_leaf_count: the link closed, no strike");
+    // a best tip A holds only as a HeaderIndex variant: no leaf-count comparison
+    h.cut = {{a, b}, {b, a}};
+    h.mine(a, 1, 300);
+    h.mine(a, 1, 301);
+    const pb::Hash32 fork = h[b].tree().best().id;
+    h.mine(b, 1, 302);
+    h.cut.clear();
+    h.q.clear();
+    check(h[a].request_headers(b, fork, h[b].tree().best().id, 8, h.now), "hellobound: A asks B's lighter branch");
+    {
+        const Msg req = h.q.front();
+        h.q.pop_front();
+        const pb::PathbNode::HeadersOutcome o = h[a].on_headers(b, h[b].serve_getheaders(a, req.frame, h.now).frames.at(0), h.now);
+        check(o.kind == pb::PathbNode::HeadersOutcome::Kind::Keep && o.indexed == 1, "hellobound: B's tip indexed as a variant, not placed");
+    }
+    pb::PathbHello t2 = h[b].our_hello(3, 0);
+    t2.tail.mmr_leaf_count += 3;
+    const pb::HelloCheck c2 = h[a].on_hello(b, *pb::encode_pathb_hello(t2), h[a].our_hello(1, 0));
+    check(h[a].tree().find(t2.tail.best_tip) == nullptr && c2.verdict == pb::HelloVerdict::Accept,
+          "hellobound: a best tip held only as a variant (not bound here): accepted, not compared");
+}
+
+// ---------------------------------------------------------------------------
+// The header path at the journal base, and a switch_best refusal on a reorg.
+void base() {
+    const KatNet net;
+    const std::uint64_t J = 16;
+    {
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true, J), b = h.add(table0(net), true, J);
+        for (int i = 0; i < 6; ++i) {
+            h.tick_monero();
+            h.mine(a, 1, 100 + i);
+        }
+        const pb::Hash32 fork = h[a].tree().best().id;
+        const std::uint64_t fpos = h[a].tree().best().pos;
+        h.cut = {{a, b}, {b, a}};
+        for (std::uint64_t i = 0; i < J; ++i) h.mine(a, 0, 200 + static_cast<std::uint32_t>(i));
+        for (std::uint64_t i = 0; i < J + 6; ++i) h.mine(b, 1, 300 + static_cast<std::uint32_t>(i));
+        h.cut.clear();
+        h.q.clear();
+        check(h[a].store().base_pos() == fpos, "base: A's journal base is the fork position");
+        check(h[a].request_headers(b, fork, h[b].tree().best().id, 64, h.now), "base: A asks B's branch");
+        pb::PathbNode::HeadersOutcome o;
+        for (int page = 0; page < 8 && !h.q.empty(); ++page) {
+            const Msg req = h.q.front();
+            h.q.pop_front();
+            o = h[a].on_headers(b, h[b].serve_getheaders(a, req.frame, h.now).frames.at(0), h.now);
+            if (o.kind != pb::PathbNode::HeadersOutcome::Kind::Continue) break;
+        }
+        check(o.kind == pb::PathbNode::HeadersOutcome::Kind::FetchBodies && o.fork_pos == fpos,
+              "base: heavier, forked exactly at the journal base: FetchBodies (kind " + std::to_string(static_cast<int>(o.kind)) + ")");
+        h.pump();
+        check(h[a].tree().best().id == h[b].tree().best().id && h[a].store().best_tip() == h[b].tree().best().id && !h[a].poisoned(),
+              "base: the switch by the journal at its base");
+    }
+    {
+        // N-13: switch_best refused on a switch by the journal: NodeInternal, poisoned
+        Harness h(net);
+        const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+        for (int i = 0; i < 4; ++i) {
+            h.tick_monero();
+            h.mine(a, 1, 40 + i);
+        }
+        h.cut = {{a, b}, {b, a}};
+        h.mine(b, 9, 610);
+        for (int i = 0; i < 3; ++i) h.mine(a, 2, 620 + i);
+        h.cut.clear();
+        h.q.clear();
+        h[b].faults().fail_switch = true;
+        pb::NodeEventResult last;
+        for (std::uint64_t x = 5; x <= 7; ++x) {
+            last = h[b].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(*h[a].store().best_at(x)), 16));
+            if (last.action != pb::NodeAction::SideBranch) break;
+        }
+        check(last.action == pb::NodeAction::NodeInternal && h[b].poisoned(),
+              "base (N-13): switch_best refused on a switch by the journal: NodeInternal (action "
+                      + std::to_string(static_cast<int>(last.action)) + ")");
     }
 }
 
@@ -999,19 +1443,19 @@ void buckets() {
     {
         const Msg req = h.q.front();
         h.q.pop_front();
-        for (auto& f : h[b].serve_getbuckets(a, req.frame, h.now)) replies.push_back(Msg{b, a, f});
+        for (auto& f : h[b].serve_getbuckets(a, req.frame, h.now).frames) replies.push_back(Msg{b, a, f});
     }
     check(replies.size() >= 3, "buckets: B's reply frames (" + std::to_string(replies.size()) + ")");
     if (replies.size() < 3) return;
     std::uint64_t t = h.now;
-    pb::FrameOutcome o1 = h[a].on_buckets(b, replies[0].frame, t);
+    pb::FrameOutcome o1 = h[a].on_buckets(b, replies[0].frame, t).frame;
     t += pb::kAbandonTimeoutDefault + 1;
     const std::size_t expired = h[a].tick(t);
     check(o1.verdict == pb::BucketsFrameVerdict::Accepted && expired == 1, "buckets: a gap of P-53 + 1 s ends the request (non-service)");
     // the same at asked from C; B's late frame: DROP, 0 tokens (one assembly per (peer, at))
     check(h[a].request_buckets(c, at, b0 + 10, b0 + 19, t), "buckets: the bins asked again at C");
     for (std::size_t k = 1; k < replies.size(); ++k) {
-        const pb::FrameOutcome late = h[a].on_buckets(b, replies[k].frame, t + k);
+        const pb::FrameOutcome late = h[a].on_buckets(b, replies[k].frame, t + k).frame;
         check(late.verdict == pb::BucketsFrameVerdict::Drop && late.strike == 0,
               "buckets: B's late frame " + std::to_string(k) + ": DROP, 0 tokens");
     }
@@ -1026,14 +1470,14 @@ void buckets() {
     {
         const Msg req = h.q.front();
         h.q.pop_front();
-        fd = h[d].serve_getbuckets(a, req.frame, t2);
+        fd = h[d].serve_getbuckets(a, req.frame, t2).frames;
     }
     bool all = fd.size() >= 3;
     std::size_t expired2 = 0;
     for (const auto& f : fd) {
         t2 += pb::kAbandonTimeoutDefault - 1;
         expired2 += h[a].tick(t2);
-        all = all && h[a].on_buckets(d, f, t2).verdict == pb::BucketsFrameVerdict::Accepted;
+        all = all && h[a].on_buckets(d, f, t2).frame.verdict == pb::BucketsFrameVerdict::Accepted;
     }
     check(all && expired2 == 0 && h[a].open_assemblies() == 0,
           "buckets (P-53): " + std::to_string(fd.size()) + " frames P-53 - 1 s apart: no expiry, assembled whole");
@@ -1062,6 +1506,12 @@ int main(int argc, char** argv) {
     run("joinserve", joinserve);
     run("n7b2", n7b2);
     run("startup", startup);
+    run("poison", poison);
+    run("joinpages", joinpages);
+    run("tokens", tokens);
+    run("receive", receive);
+    run("hellobound", hellobound);
+    run("base", base);
     run("boundary", boundary);
     run("timers", timers);
     run("buckets", buckets);

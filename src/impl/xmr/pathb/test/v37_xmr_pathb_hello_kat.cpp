@@ -542,6 +542,21 @@ int main() {
     const pb::LaneRulesCompare cc = pb::lane_rules_mismatch(blk, c1);
     check(cc.verdict == pb::LaneRulesVerdict::Refused && cc.id == 22 && cc.text.find("field=K22") != std::string::npos,
           "codec byte 1 refused naming K22");
+    // K16 (0x10): the author reference's kind and len are XMR_STD and 64
+    {
+        std::size_t at = 0;
+        for (std::size_t o = 3; o < blk.size();) {
+            if (blk[o] == 0x10) at = o + 2;  // the value: u16 give_author | kind | len | spend | view
+            o += 2 + blk[o + 1];
+        }
+        std::vector<std::uint8_t> k1 = blk, k2 = blk;
+        k1[at + 2] ^= 0x01;
+        k2[at + 3] = 63;
+        const pb::LaneRulesDecode d1 = pb::decode_rules_block(k1), d2 = pb::decode_rules_block(k2);
+        check(at != 0 && blk[at + 2] == pb::kPayeeKindXmrStd && blk[at + 3] == 64 && d1.error == pb::LaneRulesError::Value
+                      && d1.id == 0x10 && d2.error == pb::LaneRulesError::Value,
+              "K16 with another key-reference kind or len: refused naming 0x10");
+    }
 
     // trailer round trip
     pb::HelloTrailer tr;

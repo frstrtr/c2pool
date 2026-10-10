@@ -23,15 +23,21 @@
 //                  | u8 kind (0 none, 1 carrier body, 2 header) | u32 len
 //                  | bytes | u16 n | n x (u64 bin | u64 p_own | u8 live)
 //   16 K_AR        v37s:ar:<chain>:<h_act %020u>    u16 e | u64 h_act | b32 digest
+//   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
 //   One batch per new best-chain position: K_PCARRIER(x), the lane records
 //   sealed at x and K_BMMR (BinStore), K_AR if x activates, K_PHEAD. A switch
 //   is one batch: K_PCARRIER and K_AR above the fork deleted, the new branch
-//   written. A joined store is written into an empty directory.
+//   written. A joined store and the first batch of a pool launched here are
+//   written into an empty store (every key of its prefixes deleted in the same
+//   batch). A failed write leaves the poison mark (a batch of its own).
 //
 //   pathb_load (in order; any fault: the joiner path):
-//     1. K_PHEAD decodes and names the directory's pool_id and G;
+//     0. no poison mark;
+//     1. K_PHEAD decodes and names the directory's pool_id and G (NoHead only
+//        when no key of the store exists; an unreadable K_PHEAD, or one absent
+//        beside other keys of the store, is a load failure);
 //     2. K_PCARRIER from first_pos to the tip, each linked to the one below;
 //        the lane records in their prefix form (the MMR from the store base);
 //     3. the anchors: the tip carrier's committed mmr_root == the root over
@@ -47,7 +53,8 @@
 //        placements), each body checked against its stored id, parent link and
 //        receipts_root fold; phase 2 (q0 .. tip): every position placed again
 //        as a live node places it (tree, BinStore, rs_step_at, AR), its
-//        stored S, d, cum_work, H, live flags, mmr_root and AR row compared.
+//        stored S, d, cum_work, H, live flags, mmr_root and AR row compared;
+//     6. the lane records at or beyond leaf_count deleted (one batch).
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -85,6 +92,8 @@ inline std::string pcarrier_prefix(std::uint32_t c) { return "v37s:pcar:" + lane
 inline std::string pcarrier(std::uint32_t c, std::uint64_t pos) { return pcarrier_prefix(c) + lane_keys::index_fmt(pos); }
 inline std::string ar_prefix(std::uint32_t c) { return "v37s:ar:" + lane_keys::chain_fmt(c) + ":"; }
 inline std::string ar(std::uint32_t c, std::uint64_t h_act) { return ar_prefix(c) + lane_keys::index_fmt(h_act); }
+// The poison mark: a store write failed; the next load is a load failure.
+inline std::string poison(std::uint32_t c) { return "v37s:poison:" + lane_keys::chain_fmt(c); }
 }  // namespace store_keys
 
 // The directory of a store: <pool_id hex>-<G hex>.
@@ -274,7 +283,9 @@ inline std::optional<CarrierRecord> decode_pcarrier(const std::string& v) {
     if (!r.need(len)) return std::nullopt;
     c.bytes.assign(v.begin() + static_cast<std::ptrdiff_t>(r.o), v.begin() + static_cast<std::ptrdiff_t>(r.o + len));
     r.o += len;
-    const std::uint32_t n = std::uint32_t{r.u8()} | (std::uint32_t{r.u8()} << 8);
+    const std::uint32_t n_lo = r.u8();
+    const std::uint32_t n_hi = r.u8();
+    const std::uint32_t n = n_lo | (n_hi << 8);
     if (!r.ok || n > r.remaining() / kStoredPlacementBytes) return std::nullopt;
     c.placements.resize(n);
     for (StoredPlacement& p : c.placements) {
@@ -316,7 +327,9 @@ inline std::optional<ActivationRow> decode_ar_row(const std::string& v) {
     lane_rec::Reader r(v);
     if (!lane_rec::read_hdr(r, K_AR)) return std::nullopt;
     ActivationRow a;
-    a.epoch = static_cast<std::uint16_t>(r.u8() | (r.u8() << 8));
+    const std::uint32_t e_lo = r.u8();
+    const std::uint32_t e_hi = r.u8();
+    a.epoch = static_cast<std::uint16_t>(e_lo | (e_hi << 8));
     a.h_act = r.u64();
     a.rules_digest = r.bytes<kHashBytes>();
     if (!r.done()) return std::nullopt;
@@ -416,12 +429,18 @@ inline LaneBatch switch_batch(std::uint32_t chain, StoreHead& head, const Carrie
     return lane;
 }
 
-// An adoption (the first completed join, or a replacement by rule (4)) writes
-// into an empty store: every key of the store's prefixes deleted first.
+// The key prefixes of a store (its records, its lane records, its poison mark).
+inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
+    return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
+            lane_keys::bmmr(chain),          lane_keys::blhash_prefix(chain),    lane_keys::bleaf_prefix(chain),
+            store_keys::poison(chain)};
+}
+
+// An adoption (the first completed join, or a replacement by rule (4)) and the
+// first batch of a pool launched here write into an empty store: every key of
+// the store's prefixes deleted first.
 inline bool clear_store_batch(PathbKv& kv, std::uint32_t chain, LaneBatch& b) {
-    for (const std::string& prefix :
-         {store_keys::phead(chain), store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
-          lane_keys::bmmr(chain), lane_keys::blhash_prefix(chain), lane_keys::bleaf_prefix(chain)}) {
+    for (const std::string& prefix : store_prefixes(chain)) {
         if (!kv.for_each_prefix(prefix, [&](const std::string& k, const std::string&) {
                 b.del(k);
                 return true;
@@ -429,6 +448,13 @@ inline bool clear_store_batch(PathbKv& kv, std::uint32_t chain, LaneBatch& b) {
             return false;
     }
     return true;
+}
+
+// The batch of the poison mark (a store write failed).
+inline LaneBatch poison_batch(std::uint32_t chain) {
+    LaneBatch b;
+    b.put(store_keys::poison(chain), std::string(1, '\x01'));
+    return b;
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +473,7 @@ enum class StoreFault : std::uint8_t {
     Phase1,     // a stored body below q0 fails its id, link or fold check
     Phase2,     // a replayed position differs from its record
     Scan,       // the KV scan failed
+    Poisoned,   // the store's poison mark: a write failed before the last stop
 };
 
 struct LoadInputs {
@@ -513,10 +540,26 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         return std::move(out);
     };
     const LaneParams& p = in.p;
-    // 1. K_PHEAD
-    const std::optional<std::string> hv = kv.get(store_keys::phead(in.chain));
-    if (!hv) return fail(StoreFault::NoHead);
-    const std::optional<StoreHead> head = decode_phead(*hv);
+    // 0. the poison mark
+    {
+        const KvRead pm = kv.read(store_keys::poison(in.chain));
+        if (pm.status == KvRead::Status::Value) return fail(StoreFault::Poisoned);
+        if (pm.status == KvRead::Status::Error) return fail(StoreFault::Scan);
+    }
+    // 1. K_PHEAD: absent in an empty store only; unreadable, or absent beside other keys of the store: a load failure
+    const KvRead hv = kv.read(store_keys::phead(in.chain));
+    if (hv.status == KvRead::Status::Error) return fail(StoreFault::BadHead);
+    if (hv.status == KvRead::Status::Absent) {
+        bool any = false;
+        for (const std::string& prefix : store_prefixes(in.chain))
+            if (!kv.for_each_prefix(prefix, [&any](const std::string&, const std::string&) {
+                    any = true;
+                    return false;
+                }))
+                return fail(StoreFault::Scan);
+        return fail(any ? StoreFault::BadHead : StoreFault::NoHead);
+    }
+    const std::optional<StoreHead> head = decode_phead(hv.value);
     if (!head) return fail(StoreFault::BadHead);
     if (head->identity.pool_id != dir_pool_id || head->rules_g != dir_rules_g || head->genesis_id != head->identity.pool_id)
         return fail(StoreFault::Identity);
@@ -526,12 +569,11 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         return fail(StoreFault::BadHead);
 
     // 2. K_PCARRIER first_pos .. tip
-    std::vector<CarrierRecord> recs;
-    recs.reserve(tip - H.first_pos + 1);
+    std::vector<CarrierRecord> recs;  // grows with the records read (a head naming more ends at the first missing one)
     for (std::uint64_t x = H.first_pos; x <= tip; ++x) {
-        const std::optional<std::string> v = kv.get(store_keys::pcarrier(in.chain, x));
-        if (!v) return fail(StoreFault::Records, x);
-        std::optional<CarrierRecord> c = decode_pcarrier(*v);
+        const KvRead v = kv.read(store_keys::pcarrier(in.chain, x));
+        if (v.status != KvRead::Status::Value) return fail(StoreFault::Records, x);
+        std::optional<CarrierRecord> c = decode_pcarrier(v.value);
         if (!c || c->pos != x) return fail(StoreFault::Records, x);
         if (x > H.first_pos && c->parent != recs.back().id) return fail(StoreFault::Records, x);
         if (x >= H.root_pos && !c->state) return fail(StoreFault::Records, x);
@@ -547,10 +589,11 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     }
     const auto rec_at = [&](std::uint64_t x) -> const CarrierRecord& { return recs[x - H.first_pos]; };
     LaneKv lane;
-    if (!kv.get(lane_keys::bmmr(in.chain)) || !store_detail::scan(kv, lane_keys::blhash_prefix(in.chain), lane)
+    const KvRead bm = kv.read(lane_keys::bmmr(in.chain));
+    if (bm.status != KvRead::Status::Value || !store_detail::scan(kv, lane_keys::blhash_prefix(in.chain), lane)
         || !store_detail::scan(kv, lane_keys::bleaf_prefix(in.chain), lane))
         return fail(StoreFault::Scan);
-    lane[lane_keys::bmmr(in.chain)] = *kv.get(lane_keys::bmmr(in.chain));
+    lane[lane_keys::bmmr(in.chain)] = bm.value;
     LaneLoad ll = load_lane_prefix(lane, in.chain, H.h0, p.open_bins, H.best_id, tip, records.back(), H.base_leaf_count,
                                    H.base_peaks);
     if (ll.fault != LoadFault::None) return fail(StoreFault::Lane);
@@ -740,6 +783,8 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     }
     if (rj != replay_rows.size()) return fail(StoreFault::Ar);
     if (store->head().root != ll.head.root || store->best_tip() != H.best_id) return fail(StoreFault::Phase2, tip);
+    // the lane records at or beyond leaf_count (3.4 step 2): deleted
+    if (!ll.cleanup.ops.empty() && !commit_lane_batch(kv, ll.cleanup)) return fail(StoreFault::Lane);
 
     std::map<Hash32, XmrKeyRef> refs;
     const auto learn = [&refs](const ReceiptBodyV3& r) {

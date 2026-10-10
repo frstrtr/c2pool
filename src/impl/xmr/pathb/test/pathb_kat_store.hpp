@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <set>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_store.hpp"
@@ -47,10 +48,18 @@ public:
     };
 
     std::unique_ptr<pb::PathbKvBatch> batch() override { return std::make_unique<Batch>(this); }
-    std::optional<std::string> get(const std::string& k) override {
+    std::set<std::string> read_error;  // keys whose read fails (an IO or checksum error)
+    pb::KvRead read(const std::string& k) override {
+        pb::KvRead r;
+        if (read_error.count(k) != 0) {
+            r.status = pb::KvRead::Status::Error;
+            return r;
+        }
         const auto it = data.find(k);
-        if (it == data.end()) return std::nullopt;
-        return it->second;
+        if (it == data.end()) return r;
+        r.status = pb::KvRead::Status::Value;
+        r.value = it->second;
+        return r;
     }
     bool for_each_prefix(const std::string& prefix,
                          const std::function<bool(const std::string&, const std::string&)>& fn) override {
@@ -104,7 +113,13 @@ struct KatStoreNode {
 
     KatStoreNode(const KatNet& net, std::uint64_t J) : n(net, J), head(kat_head(net)) {
         const pb::LaneBatch b = pb::genesis_batch(chain, head, n.tree, n.store);
-        poisoned = !pb::commit_lane_batch(kv, b);
+        if (!pb::commit_lane_batch(kv, b)) poison();
+    }
+
+    // As PathbNode: a failed write leaves the poison mark (a batch of its own).
+    void poison() {
+        poisoned = true;
+        (void)pb::commit_lane_batch(kv, pb::poison_batch(chain));
     }
 
     // place_direct, then the position's batch on an extension.
@@ -113,7 +128,7 @@ struct KatStoreNode {
         if (w.outcome == pb::WriteOutcome::Extended) {
             const pb::LaneBatch b =
                     pb::extension_batch(chain, head, n.tree, n.store, n.bodies, pb::receipt_id(c.own), w.batch, w.ar_row);
-            if (!pb::commit_lane_batch(kv, b)) poisoned = true;
+            if (!pb::commit_lane_batch(kv, b)) poison();
         }
         return w;
     }

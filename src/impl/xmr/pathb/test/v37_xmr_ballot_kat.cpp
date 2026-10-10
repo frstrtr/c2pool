@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 #include "c2pool/v37/xmr/pathb/pathb_stratum.hpp"
@@ -33,6 +34,53 @@
 
 using namespace pathb_kat;
 using namespace ratchet_sim;
+
+// CryptoNote base58 (8-byte blocks -> 11 characters; the last block by kEncSizes).
+std::string cn_base58_encode(const std::vector<std::uint8_t>& data) {
+    static const char kAlpha[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    static const int kEnc[9] = {0, 2, 3, 5, 6, 7, 9, 10, 11};
+    std::string out;
+    for (std::size_t o = 0; o < data.size(); o += 8) {
+        const std::size_t n = std::min<std::size_t>(8, data.size() - o);
+        std::uint64_t num = 0;
+        for (std::size_t i = 0; i < n; ++i) num = (num << 8) | data[o + i];
+        std::string blk(static_cast<std::size_t>(kEnc[n]), '1');
+        for (int i = kEnc[n] - 1; i >= 0 && num > 0; --i) {
+            blk[static_cast<std::size_t>(i)] = kAlpha[static_cast<int>(num % 58)];
+            num /= 58;
+        }
+        out += blk;
+    }
+    return out;
+}
+
+std::string std_address(std::uint64_t prefix, const pb::Hash32& spend, const pb::Hash32& view) {
+    std::vector<std::uint8_t> raw;
+    for (std::uint64_t v = prefix;;) {
+        const std::uint8_t b = static_cast<std::uint8_t>(v & 0x7f);
+        v >>= 7;
+        raw.push_back(static_cast<std::uint8_t>(b | (v ? 0x80 : 0)));
+        if (!v) break;
+    }
+    raw.insert(raw.end(), spend.begin(), spend.end());
+    raw.insert(raw.end(), view.begin(), view.end());
+    const ::xmr::coin::Hash256 h = ::xmr::coin::keccak256(raw.data(), raw.size());
+    raw.insert(raw.end(), h.data(), h.data() + 4);
+    return cn_base58_encode(raw);
+}
+
+std::string lp_mainnet() {
+    return "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF";
+}
+
+pb::Hash32 non_point_key() {
+    for (unsigned i = 0; i < 256; ++i) {
+        pb::Hash32 k{};
+        for (std::size_t j = 0; j < k.size(); ++j) k[j] = static_cast<std::uint8_t>(i + j);
+        if (!pb::point_decompresses(k)) return k;
+    }
+    return pb::Hash32{};
+}
 
 int main() {
     const pb::RatchetParams P = pb::kRuledRatchetParams;
@@ -139,7 +187,8 @@ int main() {
                   && !pol::parse_pct_exact("1.").ok && !pol::parse_pct_exact("-1").ok && !pol::parse_pct_exact("1e2").ok,
               "--give-author-pct 0.1 -> 10 bp in integers; malformed text refused");
         const st::LoginPayee lp = st::login_payee(
-                "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF");
+                "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF",
+                pb::LaneNet::Mainnet);
         check(lp.refusal.empty() && lp.ref == pb::author_ref(pb::LaneNet::Mainnet),
               "the mainnet donation address decodes to the K16 author keys (XMR_STD payee)");
         pol::DecodedAddress sub = pol::decode_xmr_address(
@@ -148,6 +197,18 @@ int main() {
         check(!pol::payee_refusal(sub).empty(), "a subaddress is refused as a login payee");
         check(!pol::decode_xmr_address("42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPG").ok,
               "a checksum mismatch is refused");
+        // another network's address; keys that do not decompress
+        const char* testnet = "9yWhJcSRcNFhfrZJAkgh5N4swx92cHLP79hYbP8YJwJKYSCcdKXpgrvYxFHZ5kvfUERtXjvwNTJN4EuW7FypyDZ3114t5rG";
+        check(!st::login_payee(testnet, pb::LaneNet::Mainnet).refusal.empty()
+                      && st::login_payee(testnet, pb::LaneNet::Testnet).refusal.empty()
+                      && st::login_payee(lp_mainnet(), pb::LaneNet::Regtest).refusal.empty(),
+              "a login address of another network refused (regtest takes the mainnet bytes)");
+        check(std_address(pol::kPrefixMainnetStd, pb::author_ref(pb::LaneNet::Mainnet).spend,
+                          pb::author_ref(pb::LaneNet::Mainnet).view) == lp_mainnet(),
+              "the KAT's address encoder reproduces the mainnet donation address");
+        const std::string np = std_address(pol::kPrefixMainnetStd, non_point_key(), pb::author_ref(pb::LaneNet::Mainnet).view);
+        check(pol::decode_xmr_address(np).ok && !st::login_payee(np, pb::LaneNet::Mainnet).refusal.empty(),
+              "a login address whose spend key does not decompress refused");
     }
     return finish("v37_xmr_ballot_kat");
 }
