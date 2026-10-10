@@ -96,6 +96,7 @@ struct SpanResult {
 // b0 (H(0)): where it is given (non-zero) and the formula gives x0 >= 1 with no
 // bin sealed before x0 (lc(H(x0 - 1)) = 0, i.e. H(x0 - 1) - b0 < F), the span
 // is the young chain (RULED 47 (a), E-79): fetch A could bring no S_{x0-1}.
+// x0 = 1 is such a case (lc(H(0)) = 0).
 template <class Rec>
 inline SpanResult span_bounds(const LaneParams& p, std::uint64_t L, Rec&& rec, std::uint64_t b0 = 0) {
     SpanResult out;
@@ -150,9 +151,9 @@ inline SpanResult span_bounds(const LaneParams& p, std::uint64_t L, Rec&& rec, s
     // x1 = the first x with H(x) >= H(x0 - 1) + F + Fresh
     const std::optional<std::uint64_t> hb = rec(x0 - 1);
     if (!hb) return need(x0 - 1);
-    // ruling 47 (E-79): x0 > 1 with no bin sealed before x0 (lc(H(x0 - 1)) = 0, i.e. H(x0 - 1) - b0 < F) -> the young
-    // chain. x0 = 1 is the genesis-root case (its root is position 0 from the identity, no fetch A), not this one.
-    if (b0 != 0 && x0 > 1 && (*hb < b0 || *hb - b0 < p.open_bins)) return young();
+    // ruling 47 (E-79): x0 >= 1 with no bin sealed before x0 (lc(H(x0 - 1)) = 0, i.e. H(x0 - 1) - b0 < F) -> the young
+    // chain; x0 = 1 included (H(0) = b0, lc = 0): no seed_joiner(S_0, 1).
+    if (b0 != 0 && (*hb < b0 || *hb - b0 < p.open_bins)) return young();
     const std::uint64_t want = *hb + fr;
     std::uint64_t x1 = x0;
     for (;; ++x1) {
