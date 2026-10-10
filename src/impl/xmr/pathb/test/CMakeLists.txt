@@ -80,6 +80,8 @@
 # Slice S4w-a KATs (the Path B node modules; unwired):
 #   v37_xmr_relay_family_c_kat       FC_CARRIER / FC_GETCARRIER / FC_GETHEADERS / FC_HEADERS
 #                                    (first_pos) and FB_RECEIPTS v3 codecs, frame versions
+#   v37_xmr_pathb_store_kat          the node's own store: K_PHEAD / K_PCARRIER / K_AR, one batch
+#                                    per position, the prefix load, the two-phase reload
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
@@ -137,7 +139,8 @@ if (BUILD_TESTING)
             v37_xmr_pathb_hello_kat
             v37_xmr_pathb_bucket_wire_kat
             v37_xmr_pathb_admit_kat
-            v37_xmr_relay_family_c_kat)
+            v37_xmr_relay_family_c_kat
+            v37_xmr_pathb_store_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
@@ -162,6 +165,8 @@ if (BUILD_TESTING)
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_compile_definitions(v37_xmr_pathb_hello_kat PRIVATE
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+    # v37_xmr_pathb_store_kat also runs its store through the LevelDB archive.
+    target_link_libraries(v37_xmr_pathb_store_kat PRIVATE xmr_pathb_store)
     # v37_xmr_joiner_kat replays several chains of 4,700+ carriers (ASan ~12 min).
     set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
 endif()

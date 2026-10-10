@@ -464,6 +464,16 @@ void s4wa_hello() {
         const pb::HelloCheck r = pb::pathb_hello_receive(ours, *pb::encode_pathb_hello(t), unbound, b0, F);
         check(r.verdict == pb::HelloVerdict::Accept && r.trailer_alarm, "a trailer alarm is local: accepted");
     }
+    // the S6 key slot is carried through as received (TODO(U6): its receive rule is not ruled; no verdict asserted)
+    {
+        pb::PathbHello t = g;
+        t.node_key = seq32(0xA0);
+        const std::optional<std::vector<std::uint8_t>> kf = pb::encode_pathb_hello(t);
+        const pb::PathbHelloDecode kd = kf ? pb::decode_pathb_hello(*kf) : pb::PathbHelloDecode{};
+        check(kf && kf->size() == 483 && (*kf)[383] == 0xA0 && (*kf)[414] == 0xBF && kd.error == pb::HelloError::None
+                      && kd.hello.node_key == seq32(0xA0),
+              "the 32 B node-key slot [383, 415) is carried through as received");
+    }
     // truncated and trailing bytes
     {
         std::vector<std::uint8_t> s(f->begin(), f->end() - 1);

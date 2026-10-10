@@ -75,7 +75,9 @@
 //   lc(H(tip_pos)); the MMR over K_BLHASH [0, leaf_count) == K_BMMR.root; every
 //   K_BLEAF held hashes to its K_BLHASH and decodes consistent; any failure
 //   refuses (the caller discards the lane store and rebuilds); records at or
-//   beyond leaf_count are ignored and deleted.
+//   beyond leaf_count are ignored and deleted. load_lane_prefix (slice S4w-a):
+//   the same from a store base (the MMR from its peaks at base_leaf_count, the
+//   leaves from there on); restored() builds the store of a restart.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -635,6 +637,71 @@ public:
         return s;
     }
 
+    // The store of a restart (slice S4w-a; the store archive's load): its
+    // root delta is the carrier at root_pos = the journal base the load
+    // replays from (q0 - 1), the best chain's ids and records from first_pos
+    // (0, or a joined store's first record) through the root; the MMR from
+    // `peaks0` at lc0 (the store base's leaf count; 0 for a pool launched
+    // here) with the leaves lc0 .. lc(H(root)) - 1 and their buckets (`sealed`,
+    // a body held or not); `placements` the stored placements the node may
+    // read (q, p_own, live and the placing carrier set; q-ascending, list
+    // order). nullopt: the inputs are not one consistent store.
+    struct RestoredStart {
+        std::uint64_t b0 = 0;
+        std::uint64_t first_pos = 0;
+        std::vector<Hash32> ids;                 // first_pos .. root_pos, oldest first
+        std::vector<std::uint64_t> records;      // H at the same positions
+        std::uint64_t root_h = 0;                // the root's template height
+        std::uint64_t lc0 = 0;
+        std::vector<Hash32> peaks0;              // at lc0
+        std::vector<SealedBin> sealed;           // leaves lc0 .. lc(H(root)) - 1, in order
+        std::vector<Placement> placements;
+    };
+    static std::optional<BinStore> restored(const LaneParams& p, std::uint64_t journal_depth, RestoredStart r,
+                                            std::uint32_t chain = 0) {
+        if (r.ids.empty() || r.ids.size() != r.records.size()) return std::nullopt;
+        const std::uint64_t root_pos = r.first_pos + r.ids.size() - 1;
+        const std::uint64_t root_H = r.records.back();
+        const std::uint64_t lc_root = bin_leaf_count(root_H, r.b0, p.open_bins);
+        if (r.lc0 > lc_root || r.sealed.size() != lc_root - r.lc0) return std::nullopt;
+        std::optional<BinMmr> m = BinMmr::from_peaks(r.lc0, r.peaks0);
+        if (!m) return std::nullopt;
+        for (std::size_t i = 0; i < r.sealed.size(); ++i) {
+            const SealedBin& sb = r.sealed[i];
+            if (sb.bucket.bin_lo != r.b0 + r.lc0 + i) return std::nullopt;
+            if (sb.held && (!bucket_consistent(sb.bucket) || mmr_leaf_of(sb.bucket) != sb.leaf)) return std::nullopt;
+            m->append(sb.leaf);
+        }
+        BinStore s(p, journal_depth, r.ids.back(), r.b0, chain);
+        s.journal_.clear();
+        s.chain_pos_.clear();
+        s.buckets_ = std::move(r.sealed);
+        s.off_ = r.first_pos;
+        s.root_pos_ = root_pos;
+        s.floor_ = root_pos;
+        s.lc0_ = r.lc0;
+        s.records_ = r.records;
+        s.chain_ = r.ids;
+        for (std::size_t i = 0; i < r.ids.size(); ++i) s.chain_pos_[r.ids[i]] = r.first_pos + i;
+        s.mmr_ = std::move(*m);
+        for (Placement& x : r.placements) {
+            if (x.q < r.first_pos || x.q > root_pos || x.bin < r.b0) return std::nullopt;
+            s.placed_q_[x.id] = PlacedAt{x.bin, x.q};
+            s.by_bin_[x.bin].push_back(std::move(x));
+        }
+        LaneDelta d;
+        d.id = r.ids.back();
+        d.parent = r.ids.size() > 1 ? r.ids[r.ids.size() - 2] : d.id;
+        d.pos = root_pos;
+        d.h = r.root_h;
+        d.H = root_H;
+        d.leaf_count = lc_root;
+        d.root = s.mmr_.root();
+        d.sealed_done = true;
+        s.journal_.emplace(d.id, std::move(d));
+        return s;
+    }
+
     // A joined store: a served bucket of a bin at or below the adopt bound,
     // proved against the fetch's at (the caller's), taken for the bin's seal.
     // false: not a joined store, above the bound, inconsistent, or the bin
@@ -1170,10 +1237,14 @@ struct LaneLoad {
 };
 
 // carrier_tip_id / carrier_tip_pos: the carrier store's best tip; record_at_tip:
-// H(carrier_tip_pos) from the carrier records. A fault means: discard the lane
-// store and take the rebuild / joiner path.
-inline LaneLoad load_lane(const LaneKv& kv, std::uint32_t chain, std::uint64_t b0, std::uint64_t F,
-                          const Hash32& carrier_tip_id, std::uint64_t carrier_tip_pos, std::uint64_t record_at_tip) {
+// H(carrier_tip_pos) from the carrier records. The prefix form (slice S4w-a)
+// starts the MMR from `base_peaks` at `base_leaf_count` (the store base of a
+// joined store) and reads K_BLHASH / K_BLEAF from base_leaf_count on; a
+// store of a pool launched here has base 0 and no peaks (the full form).
+// A fault means: discard the lane store and take the rebuild / joiner path.
+inline LaneLoad load_lane_prefix(const LaneKv& kv, std::uint32_t chain, std::uint64_t b0, std::uint64_t F,
+                                 const Hash32& carrier_tip_id, std::uint64_t carrier_tip_pos, std::uint64_t record_at_tip,
+                                 std::uint64_t base_leaf_count, const std::vector<Hash32>& base_peaks) {
     LaneLoad out;
     const auto fail = [&out](LoadFault f) {
         out.fault = f;
@@ -1187,7 +1258,11 @@ inline LaneLoad load_lane(const LaneKv& kv, std::uint32_t chain, std::uint64_t b
     if (head->b0 != b0) return fail(LoadFault::B0);
     if (head->tip_id != carrier_tip_id || head->tip_pos != carrier_tip_pos) return fail(LoadFault::Tip);
     if (head->leaf_count != bin_leaf_count(record_at_tip, b0, F)) return fail(LoadFault::LeafCount);
-    for (std::uint64_t i = 0; i < head->leaf_count; ++i) {
+    if (base_leaf_count > head->leaf_count) return fail(LoadFault::LeafCount);
+    std::optional<BinMmr> m = BinMmr::from_peaks(base_leaf_count, base_peaks);
+    if (!m) return fail(LoadFault::LeafHash);
+    out.mmr = std::move(*m);
+    for (std::uint64_t i = base_leaf_count; i < head->leaf_count; ++i) {
         const auto li = kv.find(lane_keys::blhash(chain, i));
         if (li == kv.end()) return fail(LoadFault::LeafHash);
         const std::optional<Hash32> leaf = decode_blhash(li->second);
@@ -1196,7 +1271,7 @@ inline LaneLoad load_lane(const LaneKv& kv, std::uint32_t chain, std::uint64_t b
     }
     if (out.mmr.root() != head->root) return fail(LoadFault::Root);
     out.bodies.resize(head->leaf_count);
-    for (std::uint64_t i = 0; i < head->leaf_count; ++i) {
+    for (std::uint64_t i = base_leaf_count; i < head->leaf_count; ++i) {
         const auto bi = kv.find(lane_keys::bleaf(chain, i));
         if (bi == kv.end()) continue;  // pruned body (the leaf hash stays)
         std::optional<SealedBin> sb = decode_bleaf(bi->second, i, b0);
@@ -1212,6 +1287,12 @@ inline LaneLoad load_lane(const LaneKv& kv, std::uint32_t chain, std::uint64_t b
     }
     out.fault = LoadFault::None;
     return out;
+}
+
+// The full form: every leaf from index 0.
+inline LaneLoad load_lane(const LaneKv& kv, std::uint32_t chain, std::uint64_t b0, std::uint64_t F,
+                          const Hash32& carrier_tip_id, std::uint64_t carrier_tip_pos, std::uint64_t record_at_tip) {
+    return load_lane_prefix(kv, chain, b0, F, carrier_tip_id, carrier_tip_pos, record_at_tip, 0, {});
 }
 
 }  // namespace c2pool::xmr::pathb

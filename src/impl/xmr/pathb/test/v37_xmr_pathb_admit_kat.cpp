@@ -1622,6 +1622,17 @@ void contract() {
             check(r.verdict == AdmitVerdict::AdmitCarrier && w.outcome == pb::WriteOutcome::NodeInternal
                           && m.tree.find(pb::receipt_id(c.own)) == nullptr && m.tree.best().id == best,
                   "write step: seal fails -> node-internal; c dropped from the tree (not chain-valid), the best tip unchanged");
+            // R-N1: the store failure before the marks leaves no partial delta; the frame is placed afterwards
+            {
+                const pb::Hash32 cid = pb::receipt_id(c.own);
+                check(!m.store.holds(cid), "write step (R-N1): after a seal failure the store holds no delta of c");
+                const pb::AdmitResult again = pb::admit_carrier(m.env(), frame_of(c), pb::CarrierRole::Frame);
+                const pb::WriteResult w2 = again.verdict == AdmitVerdict::AdmitCarrier
+                                                   ? pb::place_admitted(m.tree, m.store, m.ar, m.bodies, again, &m.alarm)
+                                                   : pb::WriteResult{};
+                check(w2.outcome == pb::WriteOutcome::Extended && m.store.best_tip() == cid && m.tree.best().id == cid,
+                      "write step (R-N1): the same frame admitted again is placed (an extension)");
+            }
             // a FoldMismatch at tree.place leaves no delta
             KatNode m2(n);
             pb::AdmitResult bad = r;

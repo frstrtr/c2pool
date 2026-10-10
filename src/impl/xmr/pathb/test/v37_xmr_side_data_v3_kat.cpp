@@ -196,19 +196,26 @@ void pool_identity_cases() {
     check(pb::parse_pool_genesis_raw(hex32(dg3) + ":500", raw).empty() && raw.genesis == dg3 && raw.height == 500,
           "--pool-genesis <hex64>:<H> parses");
     check(pb::parse_pool_genesis_raw(hex32(dg3), raw).empty() && !raw.height, "--pool-genesis <hex64> alone: no height");
-    const pb::RawIdentity no_h = pb::raw_identity(pb::LaneNet::Regtest, kLaneChain, raw);
-    check(!no_h.refusal.empty(), "a raw start without H is refused");
-    std::uint64_t hh = 0;
-    check(pb::parse_pool_genesis_height("500", hh).empty() && hh == 500 && !pb::parse_pool_genesis_height("5x", hh).empty(),
-          "--pool-genesis-height parses a decimal u64");
-    raw.height = hh;
-    const pb::RawIdentity ri = pb::raw_identity(pb::LaneNet::Regtest, kLaneChain, raw);
+    const pb::RawIdentity no_h = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {hex32(dg3), std::nullopt});
+    check(!no_h.refusal.empty(), "a raw start without H is refused (--pool-genesis <hex64>)");
+    const pb::RawIdentity no_h2 = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {std::nullopt, std::nullopt});
+    check(!no_h2.refusal.empty(), "a raw start without H is refused (the default raw genesis, no --pool-genesis-height)");
+    const pb::RawIdentity both = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {hex32(dg3) + ":500", "500"});
+    check(!both.refusal.empty(), "--pool-genesis-height with --pool-genesis refused (the height flag names the default's)");
+    const pb::RawIdentity ri = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {std::nullopt, "500"});
     check(ri.refusal.empty() && ri.identity.form == pb::GenesisForm::Raw && ri.identity.height == 500
-                  && ri.identity.pool_id == pb::pool_id_of(pb::LaneNet::Regtest, kLaneChain, dg3),
-          "the raw form with its height: identity");
+                  && ri.identity.pool_genesis == dg3 && ri.identity.pool_id == pb::pool_id_of(pb::LaneNet::Regtest, kLaneChain, dg3),
+          "the default raw genesis with --pool-genesis-height 500: identity");
+    const pb::RawIdentity rg = pb::raw_identity_from(pb::LaneNet::Testnet, kLaneChain, {hex32(seq32(0x77)) + ":42000", std::nullopt});
+    check(rg.refusal.empty() && rg.identity.height == 42000 && rg.identity.pool_genesis == seq32(0x77),
+          "--pool-genesis <hex64>:<H> on testnet: identity");
+    check(!pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {std::nullopt, "5x"}).refusal.empty(),
+          "--pool-genesis-height 5x refused");
     const std::optional<pb::GenesisPosition> r0 = pb::genesis_position(ri.identity);
     check(r0 && r0->id == ri.identity.pool_id && r0->height == 501, "position 0 of the raw form: H(0) = H + 1");
-    check(!pb::raw_identity(pb::LaneNet::Mainnet, kLaneChain, raw).refusal.empty(), "a raw start on mainnet is refused");
+    check(!pb::raw_identity_from(pb::LaneNet::Mainnet, kLaneChain, {std::nullopt, "500"}).refusal.empty()
+                  && !pb::raw_identity_from(pb::LaneNet::Mainnet, kLaneChain, {hex32(dg3) + ":500", std::nullopt}).refusal.empty(),
+          "a raw start on mainnet is refused (both raw forms)");
     const std::string line = pb::identity_line(ri.identity);
     check(line.find("H=500") != std::string::npos && line.find("RAW (not derived)") != std::string::npos
                   && line.find("pool_id=" + hex32(ri.identity.pool_id)) != std::string::npos,

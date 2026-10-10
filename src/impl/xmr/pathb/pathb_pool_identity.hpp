@@ -18,9 +18,10 @@
 //     derived  --pool-genesis-from <H>:<hash64>:"<headline>"; every network;
 //              the only form on mainnet. H at least
 //              CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW deep on the node's chain.
-//     raw      --pool-genesis <hex64>:<H>, or the network's raw default with
-//              --pool-genesis-height <H>; not on mainnet; H required (no H:
-//              start refused).
+//     raw      --pool-genesis <hex64>:<H>, or, with no --pool-genesis, the
+//              network's raw default genesis with --pool-genesis-height <H>
+//              (the height flag names the default's height only); not on
+//              mainnet; H required in both forms (no H: start refused).
 //   Position 0 (the genesis node of the carrier chain): id = pool_id,
 //   H(0) = H + 1, b0 = H(0); a pure function of the identity.
 //
@@ -246,17 +247,11 @@ inline std::string parse_pool_genesis_raw(std::string_view arg, RawGenesisSpec& 
     return {};
 }
 
-// --pool-genesis-height <H>. "" = parsed.
-inline std::string parse_pool_genesis_height(std::string_view arg, std::uint64_t& out) {
-    const std::optional<std::uint64_t> h = pid_detail::parse_u64(arg);
-    if (!h) return "genesis: --pool-genesis-height: '" + std::string(arg) + "' is not a decimal u64";
-    out = *h;
-    return {};
-}
-
 // A raw start with no height is refused (the raw form REQUIRES H).
 inline std::string raw_height_refusal(const std::optional<std::uint64_t>& height) {
-    if (!height) return "genesis: the raw pool genesis needs its height: --pool-genesis <hex64>:<H> or --pool-genesis-height <H>";
+    if (!height)
+        return "genesis: the raw pool genesis needs its height: --pool-genesis <hex64>:<H>, or the network's default "
+               "raw genesis with --pool-genesis-height <H>";
     return {};
 }
 
@@ -314,6 +309,42 @@ inline RawIdentity raw_identity(LaneNet network, std::uint32_t chain_id, const R
     if (out.refusal.empty()) out.refusal = raw_height_refusal(raw.height);
     if (out.refusal.empty()) out.identity = identity_raw(network, chain_id, raw.genesis, *raw.height);
     return out;
+}
+
+// The raw start inputs as given on the command line: --pool-genesis
+// <hex64>:<H>, or (without it) the network's raw default genesis with
+// --pool-genesis-height <H>. --pool-genesis-height names the default's
+// height only: given with --pool-genesis it is refused.
+struct RawStartInputs {
+    std::optional<std::string> pool_genesis;         // --pool-genesis
+    std::optional<std::string> pool_genesis_height;  // --pool-genesis-height
+};
+
+inline RawIdentity raw_identity_from(LaneNet network, std::uint32_t chain_id, const RawStartInputs& in) {
+    RawIdentity out;
+    out.refusal = raw_genesis_refusal(network);
+    if (!out.refusal.empty()) return out;
+    RawGenesisSpec spec;
+    if (in.pool_genesis) {
+        if (in.pool_genesis_height) {
+            out.refusal = "genesis: --pool-genesis-height names the height of the network's default raw genesis; with "
+                          "--pool-genesis give <hex64>:<H>";
+            return out;
+        }
+        out.refusal = parse_pool_genesis_raw(*in.pool_genesis, spec);
+        if (!out.refusal.empty()) return out;
+    } else {
+        spec.genesis = default_pool_genesis(network);
+        if (in.pool_genesis_height) {
+            const std::optional<std::uint64_t> h = pid_detail::parse_u64(*in.pool_genesis_height);
+            if (!h) {
+                out.refusal = "genesis: --pool-genesis-height: '" + *in.pool_genesis_height + "' is not a decimal u64";
+                return out;
+            }
+            spec.height = *h;
+        }
+    }
+    return raw_identity(network, chain_id, spec);
 }
 
 // Position 0 of the carrier chain: id = pool_id, H(0) = H + 1 (b0 = H(0)).

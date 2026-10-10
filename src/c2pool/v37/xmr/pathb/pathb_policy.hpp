@@ -5,7 +5,7 @@
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
 // src/c2pool/v37/xmr/pathb/pathb_policy.hpp
-// Path B node policy inputs of the stratum and the start line (no ledger):
+// The node policy helpers of the stratum and the start line (no ledger):
 //   ExactPct / parse_pct_exact   a percentage from text, integers only
 //   pct_to_bp                    round-half-up basis points, clamped to 10000
 //   give_author_u16              round-half-up of 65535 x pct / 100
@@ -13,13 +13,9 @@
 //                                the network byte; standard and subaddress
 //   payee_refusal                a login payee: XMR_STD only (a subaddress or
 //                                an integrated address is refused)
-//   parse_vote_pass              the stratum password "vote=<n>", n decimal
-//                                in 0 .. 2^15 - 1; anything else: no stated
-//                                vote (ignored, never a refusal)
-// The same helpers the owed-ledger fee model carries; Path B takes them from
-// here.
+// Moved here from xmr_fee_model.hpp, which re-exports them unchanged.
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -31,9 +27,9 @@
 #include <string_view>
 #include <vector>
 
+#include <sharechain/v37/v37_descriptor_xmr.hpp>  // ScriptRef, make_xmr_std
+
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"  // ::xmr::coin::keccak256
-#include "impl/xmr/pathb/pathb_ratchet_activation.hpp"  // kEpochMax
-#include "impl/xmr/pathb/pathb_wire_v3.hpp"        // XmrKeyRef, Hash32
 
 namespace c2pool::xmr::pathb::policy {
 
@@ -51,7 +47,7 @@ inline constexpr std::uint64_t kPctIntLimit = 1000000000ull;
 inline constexpr std::uint32_t kBasisPointsMax = 10000;
 inline constexpr std::uint32_t kGiveAuthorScale = 65535;
 
-inline ExactPct parse_pct_exact(std::string_view t) {
+inline ExactPct parse_pct_exact(const std::string& t) {
     ExactPct r;
     std::size_t i = 0, int_digits = 0, frac_digits = 0;
     std::uint64_t num = 0, den = 1;
@@ -133,7 +129,7 @@ inline bool decode_block(const char* s, std::size_t n, std::vector<std::uint8_t>
 }
 }  // namespace addr_detail
 
-inline bool cn_base58_decode(std::string_view s, std::vector<std::uint8_t>& out) {
+inline bool cn_base58_decode(const std::string& s, std::vector<std::uint8_t>& out) {
     out.clear();
     const std::size_t full = s.size() / addr_detail::kFullBlockChars, rem = s.size() % addr_detail::kFullBlockChars;
     for (std::size_t i = 0; i < full; ++i)
@@ -143,25 +139,24 @@ inline bool cn_base58_decode(std::string_view s, std::vector<std::uint8_t>& out)
     return true;
 }
 
+inline constexpr std::size_t kKeyBytes = 32;
+
 struct DecodedAddress {
     bool ok = false;
     std::string why;
     std::uint64_t prefix = 0;
     bool subaddress = false;
-    Hash32 spend{};  // B (or D_i for a subaddress)
-    Hash32 view{};   // A (or C_i for a subaddress)
-
-    // The XMR_STD payee reference (a standard address only).
-    std::optional<XmrKeyRef> payee_ref() const {
-        if (!ok || subaddress) return std::nullopt;
-        return XmrKeyRef{spend, view};
-    }
+    std::array<std::uint8_t, kKeyBytes> spend{};  // B (or D_i for a subaddress)
+    std::array<std::uint8_t, kKeyBytes> view{};   // A (or C_i for a subaddress)
+    // The XMR_STD payout reference. Only meaningful when ok && !subaddress (a
+    // subaddress encodes (D_i, C_i); its main view key is not in the address).
+    ::v37::ScriptRef ref() const { return ::v37::xmr::make_xmr_std(spend, view); }
 };
 
 // A standard address or a subaddress; an integrated address is refused (a
 // payment id has no place in a coinbase payee). The keccak checksum and the
 // varint network byte are verified.
-inline DecodedAddress decode_xmr_address(std::string_view addr) {
+inline DecodedAddress decode_xmr_address(const std::string& addr) {
     DecodedAddress d;
     std::vector<std::uint8_t> raw;
     if (!cn_base58_decode(addr, raw)) {
@@ -183,7 +178,7 @@ inline DecodedAddress decode_xmr_address(std::string_view addr) {
             break;
         }
     }
-    if (raw.size() != i + 2 * kHashBytes + addr_detail::kChecksumBytes) {
+    if (raw.size() != i + 2 * kKeyBytes + addr_detail::kChecksumBytes) {
         d.why = "wrong length " + std::to_string(raw.size()) + " (integrated address or garbage)";
         return d;
     }
@@ -202,8 +197,8 @@ inline DecodedAddress decode_xmr_address(std::string_view addr) {
         default: d.why = "unsupported network byte " + std::to_string(pfx); return d;
     }
     d.prefix = pfx;
-    std::memcpy(d.spend.data(), raw.data() + i, kHashBytes);
-    std::memcpy(d.view.data(), raw.data() + i + kHashBytes, kHashBytes);
+    std::memcpy(d.spend.data(), raw.data() + i, kKeyBytes);
+    std::memcpy(d.view.data(), raw.data() + i + kKeyBytes, kKeyBytes);
     d.ok = true;
     return d;
 }
@@ -214,24 +209,6 @@ inline std::string payee_refusal(const DecodedAddress& d) {
     if (!d.ok) return "payee: " + d.why;
     if (d.subaddress) return "payee: a subaddress is not a payee (standard addresses only)";
     return {};
-}
-
-// ---------------------------------------------------------------------------
-// The stated vote of a stratum login: the password "vote=<n>"
-// ---------------------------------------------------------------------------
-inline constexpr std::string_view kVotePrefix = "vote=";
-
-// n in 0 .. 2^15 - 1 (vote=0: own no); nullopt: no stated vote (the field is
-// ignored, never a refusal).
-inline std::optional<std::uint32_t> parse_vote_pass(std::string_view pass) {
-    if (pass.size() <= kVotePrefix.size() || pass.substr(0, kVotePrefix.size()) != kVotePrefix) return std::nullopt;
-    std::uint32_t n = 0;
-    for (const char c : pass.substr(kVotePrefix.size())) {
-        if (c < '0' || c > '9') return std::nullopt;
-        n = n * 10 + static_cast<std::uint32_t>(c - '0');
-        if (n > kEpochMax) return std::nullopt;
-    }
-    return n;
 }
 
 }  // namespace c2pool::xmr::pathb::policy

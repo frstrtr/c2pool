@@ -233,6 +233,62 @@ public:
         return t;
     }
 
+    // A tree restored from the node's own store at a restart (slice S4w-a):
+    // `chain` = its best chain from the lowest position it holds (genesis, or
+    // a joined store's root at x0 - 1), oldest first, with the values stored
+    // for each position; the lowest is node 0, `inherited` the retarget
+    // entries below it (none at genesis; a joined root's prefix, the newest
+    // of them the root's own). Every node is verified, its bodies held and
+    // chain-valid; the best tip is the last. Empty `chain` or a parent link
+    // that does not continue it: nullopt.
+    struct RestoredNode {
+        Hash32 id{};
+        Hash32 parent{};
+        std::uint64_t pos = 0;
+        std::uint64_t h = 0;
+        std::uint64_t H = 0;
+        std::uint64_t d = 0;
+        ::c2pool::xmr::native::U128 cum_work{};
+        Hash32 receipts_root{};
+        std::uint16_t ballot = 0;
+        RatchetState rs{};
+        std::optional<ActivationRow> activation;
+    };
+    static std::optional<CarrierTree> restored(const LaneParams& p, std::span<const RestoredNode> chain,
+                                               const EpochTable& table, std::span<const RetargetEntry> inherited = {},
+                                               const RatchetParams& rp = kRuledRatchetParams) {
+        if (chain.empty()) return std::nullopt;
+        for (std::size_t k = 1; k < chain.size(); ++k)
+            if (chain[k].parent != chain[k - 1].id || chain[k].pos != chain[k - 1].pos + 1) return std::nullopt;
+        CarrierTree t(p, chain[0].id, chain[0].h, table, inherited, rp);
+        for (std::size_t k = 0; k < chain.size(); ++k) {
+            const RestoredNode& r = chain[k];
+            CarrierNode n;
+            n.id = r.id;
+            n.parent = k == 0 ? r.id : r.parent;
+            n.pos = r.pos;
+            n.h = r.h;
+            n.H = r.H;
+            n.d = r.d;
+            n.cum_work = r.cum_work;
+            n.receipts_root = r.receipts_root;
+            n.ballot = r.ballot;
+            n.rs = r.rs;
+            n.activation = r.activation;
+            n.verified = n.bodies = n.chain_valid = true;
+            n.parent_index = k == 0 ? 0 : k - 1;
+            if (k == 0) {
+                t.nodes_[0] = std::move(n);
+                continue;
+            }
+            t.nodes_.push_back(std::move(n));
+            t.nodes_[k - 1].children.push_back(k);
+            if (!t.index_.emplace(r.id, k).second) return std::nullopt;
+        }
+        t.best_ = chain.size() - 1;
+        return t;
+    }
+
     const LaneParams& params() const noexcept { return p_; }
     const RatchetParams& ratchet_params() const noexcept { return rp_; }
     const EpochTable& epoch_table() const noexcept { return table_; }
