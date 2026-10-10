@@ -2145,6 +2145,9 @@ int main(int argc, char* argv[]) {
                             rec.pool_hashrate = blk.pool_hashrate;
                             rec.share_hash = blk.share_hash;
                             rec.authorship = static_cast<uint8_t>(blk.authorship);
+                            // #946: explorer fields (fblk v3).
+                            rec.coinbase_txid = blk.coinbase_txid;
+                            rec.tx_count = blk.tx_count;
                             return fblk_store->store(rec);
                         },
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
@@ -2168,6 +2171,9 @@ int main(int argc, char* argv[]) {
                                 blk.pool_hashrate = rec.pool_hashrate;
                                 blk.share_hash = rec.share_hash;
                                 blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
+                                // #946: v1/v2 records leave these unknown (null).
+                                blk.coinbase_txid = rec.coinbase_txid;
+                                blk.tx_count = rec.tx_count;
                                 result.push_back(std::move(blk));
                             }
                             return result;
@@ -4538,6 +4544,15 @@ int main(int argc, char* argv[]) {
                         is_testnet ? "tLTC" : "LTC",
                         miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0,
                         core::MiningInterface::BlockAuthorship::sharechain_peer);
+                    // coinbase_txid = the gentx hash the share commits to.
+                    // tx_count stays null: v34+ shares carry no tx list.
+                    try {
+                        mi->set_found_block_body(block_hash.GetHex(),
+                            ltc::derive_gentx_hash(*s, p2p_node->coin_params()).GetHex(),
+                            std::nullopt);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] peer found-block coinbase_txid: " << e.what();
+                    }
                     mi->schedule_block_verification(block_hash.GetHex());
                 });
             };
@@ -6665,19 +6680,14 @@ int main(int argc, char* argv[]) {
 
                     // Wire merged block found → unified verification via FoundBlock
                     auto* mi_ptr = web_server.get_mining_interface();
+                    // #946: miner, subsidy and parent_* come from the stratum
+                    // submit (MergedSubmitScope) via record_merged_found_block.
                     mm_manager->set_on_merged_block_found(
                         [mi_ptr](const std::string& symbol, int height,
-                                 const std::string& block_hash, bool accepted) {
-                            uint256 h;
-                            h.SetHex(block_hash);
-                            double net_diff = mi_ptr->get_network_difficulty();
-                            double pool_hr = mi_ptr->get_local_hashrate();
-                            std::string miner_addr = mi_ptr->get_payout_address();
-                            mi_ptr->record_found_block(
-                                static_cast<uint64_t>(height), h, 0, symbol,
-                                miner_addr, "", net_diff, 0, pool_hr, 0);
-                            if (accepted)
-                                mi_ptr->schedule_block_verification(block_hash);
+                                 const std::string& block_hash, bool accepted,
+                                 uint64_t coinbase_value) {
+                            mi_ptr->record_merged_found_block(
+                                symbol, height, block_hash, accepted, coinbase_value);
                         });
 
                     // When merged mining aux work changes (new DOGE block),
