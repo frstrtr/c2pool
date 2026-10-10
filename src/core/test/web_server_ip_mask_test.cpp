@@ -11,7 +11,9 @@
 // core::is_direct_local_request() gets "h:" + 8 hex of HMAC-SHA256 with a
 // per-process random key instead. The port is dropped, the JSON shape is
 // unchanged, and a direct local viewer still sees the raw address.
-// /peer_addresses is left unchanged on purpose (p2pool parity).
+// /peer_addresses drops incoming peers for a viewer that is not direct local
+// instead of masking them (its entries are dial targets). This departs from
+// p2pool on purpose, for non-local viewers only.
 //
 // The no-IP checks are scoped: the address-carrying fields must each be a
 // token, and the whole-body IPv4 / IPv6 patterns are written so that the
@@ -276,8 +278,16 @@ TEST(IpMask, PeerViewsMaskIncomingOnly)
     EXPECT_EQ(raw[0]["address"], "198.51.100.9:40312");
     EXPECT_TRUE(mi.rest_pings(true).contains("198.51.100.9:40312"));
 
-    // Approved scope: /peer_addresses is unchanged (p2pool parity).
-    EXPECT_NE(mi.rest_peer_addresses().find("198.51.100.9:40312"), std::string::npos);
+    // /peer_addresses departs from p2pool on purpose, for non-local viewers
+    // only: incoming and unflagged peers are dropped, outgoing peers are kept.
+    const auto pub = mi.rest_peer_addresses(/*reveal_ips=*/false);
+    EXPECT_EQ(pub, "192.0.2.4:9326");
+    EXPECT_EQ(pub.find("198.51.100.9:40312"), std::string::npos);
+    EXPECT_EQ(mi.rest_peer_addresses(), pub);  // default is the non-local view
+    const auto local = mi.rest_peer_addresses(/*reveal_ips=*/true);
+    EXPECT_NE(local.find("198.51.100.9:40312"), std::string::npos);
+    EXPECT_NE(local.find("192.0.2.4:9326"), std::string::npos);
+    EXPECT_NE(local.find("198.51.100.77:50000"), std::string::npos);
 }
 
 // ── /ban_stats: banned IPs masked, banned addresses shown ───────────────────

@@ -535,7 +535,7 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_user_stales();
             else if (target == "/peer_addresses") {
                 response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_peer_addresses();
+                response.body() = mining_interface_->rest_peer_addresses(is_direct_local());
                 response.prepare_payload();
                 send_response(std::move(response));
                 return;
