@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "48f23d919525c570c8b284e847aa83997fb3225b",
+  "commit": "677929fac5114de886f912674287ec57ef7d8f51",
   "rules": {
     "C01": {
       "checks": {
@@ -38,13 +38,13 @@
     "C03": {
       "checks": {
         "carriage-window-f": {
-          "status": "fail"
+          "status": "pass"
         },
         "engine-n-ctx-bins": {
           "status": "pass"
         },
         "fresh-max": {
-          "status": "fail"
+          "status": "pass"
         },
         "freshness-kat": {
           "kats": {
@@ -187,7 +187,7 @@
     "C11": {
       "checks": {
         "d-min": {
-          "status": "fail"
+          "status": "pass"
         },
         "no-fixed-share-diff-refusal": {
           "count": 1,
@@ -216,7 +216,7 @@
           "status": "fail"
         },
         "retarget-span": {
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -423,7 +423,7 @@
           "status": "pass"
         },
         "headline-genesis": {
-          "status": "fail"
+          "status": "pass"
         },
         "no-second-clause": {
           "count": 0,
@@ -445,7 +445,7 @@
           "status": "pass"
         }
       },
-      "status": "fail"
+      "status": "pass"
     },
     "C24": {
       "checks": {
@@ -672,14 +672,14 @@
     "C35": {
       "checks": {
         "narrowing-casts-may-not-grow": {
-          "count": 133,
+          "count": 128,
           "per_file": {
             "src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp": 2,
             "src/c2pool/v37/xmr/xmr_coinbase_authority.hpp": 6,
             "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 4,
             "src/c2pool/v37/xmr/xmr_credit_cut.hpp": 2,
             "src/c2pool/v37/xmr/xmr_drops_wiring.hpp": 16,
-            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 11,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 6,
             "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 4,
             "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1,
             "src/c2pool/v37/xmr/xmr_paynow.hpp": 7,
@@ -924,7 +924,7 @@
     "C45": {
       "checks": {
         "buffer-not-below-cap": {
-          "status": "fail"
+          "status": "pass"
         },
         "no-cap-literal": {
           "count": 2,
@@ -996,9 +996,9 @@
         "base-reward-kat": {
           "kats": {
             "v37_xmr_base_reward_kat": true,
-            "v37_xmr_pathb_node_kat": false
+            "v37_xmr_pathb_node_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "pathb-in-force": {
           "status": "fail"
@@ -1013,9 +1013,9 @@
         },
         "re-pend-kat": {
           "kats": {
-            "v37_xmr_pathb_node_kat": false
+            "v37_xmr_pathb_node_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
