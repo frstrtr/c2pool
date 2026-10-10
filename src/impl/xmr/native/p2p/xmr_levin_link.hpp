@@ -223,6 +223,11 @@ public:
             });
         socket_->set_close_handler(
             [raw](const std::string& why) { raw->on_socket_closed(why); });
+        // Reject an unsolicited 2004/2007 at header time, before the socket
+        // sizes and reads its body. Runs on the io thread, the same thread the
+        // expect-response latch is armed and disarmed on.
+        socket_->set_header_gate(
+            [raw](const BucketHead& h) -> bool { return raw->header_admits(h); });
         socket_->start();
         // This post DOES hold a strong reference, deliberately and briefly: it
         // keeps the link alive until the handshake is on the wire, and releases
@@ -471,6 +476,23 @@ private:
         // Keeps the peer's own arrival-order matcher in step. Costs one bare
         // header; staying silent costs the connection.
         socket_->send(make_response(cmd, {}, RC_ERROR_HANDLER_NOT_DEFINED));
+    }
+
+    // Header-time admission (io thread). A 2004/2007 is a NOTIFICATION with no
+    // id; the only thing that makes it legitimate is an outstanding request we
+    // sent, so one that arrives unarmed is refused before its body is read.
+    // Every other command is already bounded by the per-command cap in
+    // read_header. Refusing it here fails the link as Unsolicited first, so the
+    // socket's own close path (which fires next) is a no-op and the close reason
+    // is the accurate one -- identical to the post-body rejection in
+    // on_notify_frame, only without ever reading the body.
+    bool header_admits(const BucketHead& h) {
+        if (h.command == CMD_RESPONSE_GET_OBJECTS || h.command == CMD_RESPONSE_CHAIN_ENTRY) {
+            if (expect_.armed() && expect_.expected() == h.command) return true;
+            fail(LinkClose::Unsolicited, std::string("unrequested ") + command_name(h.command) + " at header");
+            return false;
+        }
+        return true;
     }
 
     // --- the demux ------------------------------------------------------------

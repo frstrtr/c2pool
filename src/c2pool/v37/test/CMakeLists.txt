@@ -525,6 +525,36 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_test_suspend_knob_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_test_suspend_knob_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_test_suspend_knob_kat COMMAND v37_xmr_test_suspend_knob_kat)
+    # v37_xmr_stratum_json_depth_kat: the stratum listener's JSON nesting limit
+    # and \u-escape check, over a loopback socket, run in a child process. Stub
+    # template/verifier/sink, no RandomX, no monerod. Listed in BOTH build.yml
+    # --target lists.
+    add_executable(v37_xmr_stratum_json_depth_kat
+        v37_xmr_stratum_json_depth_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_json_depth_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_json_depth_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_json_depth_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_json_depth_kat COMMAND v37_xmr_stratum_json_depth_kat)
+    # v37_xmr_stratum_line_cap_kat: the stratum request-line byte cap (LF and
+    # CRLF), the blank-line run cap, split reads and clipped log fields, over
+    # loopback. Stub template/verifier/sink. Listed in BOTH build.yml lists.
+    add_executable(v37_xmr_stratum_line_cap_kat
+        v37_xmr_stratum_line_cap_kat.cpp
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
+    target_compile_features(v37_xmr_stratum_line_cap_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_stratum_line_cap_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_stratum_line_cap_kat PRIVATE xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_stratum_line_cap_kat COMMAND v37_xmr_stratum_line_cap_kat)
+    # v37_xmr_live_transport_bounds_kat: the monerod client's chunked-transfer
+    # decoder and call deadline, through rpc_post() against a loopback stand-in
+    # daemon. Header-only transport; a thread runs the server. Listed in BOTH
+    # build.yml --target lists.
+    add_executable(v37_xmr_live_transport_bounds_kat v37_xmr_live_transport_bounds_kat.cpp)
+    target_compile_features(v37_xmr_live_transport_bounds_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_live_transport_bounds_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_live_transport_bounds_kat PRIVATE Threads::Threads)
+    add_test(NAME v37_xmr_live_transport_bounds_kat COMMAND v37_xmr_live_transport_bounds_kat)
     # v37_xmr_o2_randomx_kat: the runtime IPowVerifier (O2RandomXVerifier over
     # the production LightVerifier + librandomx) reproducing the X8 KAT vector
     # (mainnet block 3,000,000 PoW) through the MERGED XmrStratumServer's
