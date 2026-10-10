@@ -1473,7 +1473,13 @@ private:
         const std::uint64_t first_pos = s.store->first_record_pos();
         std::vector<Hash32> tips;
         for (const ReceiptBodyV3& r : c.carried) tips.push_back(r.side.tip);
-        tips.insert(tips.end(), walked.begin(), walked.end());  // the closure's branches (ruling 53, E-100)
+        // the closure's branches (ruling 53, E-100): the top of every walked branch (a walked id no walked header names
+        // as its parent), each followed down to its first carrier below
+        std::set<Hash32> named;
+        for (const Hash32& w : walked)
+            for (const HeaderVariant* v : s.headers.variants(w)) named.insert(v->header.own.side.tip);
+        for (const Hash32& w : walked)
+            if (s.tree->find(w) == nullptr && named.count(w) == 0) tips.push_back(w);
         bool fetched = false;
         for (const Hash32& tip : tips) {
             if (s.tree->find(tip) != nullptr) continue;        // on the joined chain, or already placed

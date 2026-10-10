@@ -2521,13 +2521,19 @@ struct JcBounds {
     std::uint64_t x0 = 0, x1 = 0, x_pre = 0;
 };
 JcBounds jc_bounds(std::uint64_t L, const HOf& hof) {
-    const auto rec = [&](std::uint64_t x) -> std::optional<std::uint64_t> { return x == 0 ? kLaneB0 : hof(x); };
+    const auto rec = [&](std::uint64_t x) -> std::optional<std::uint64_t> {
+        if (x > L) return std::nullopt;  // the chain ends at L
+        return x == 0 ? kLaneB0 : hof(x);
+    };
     const pb::SpanResult s = pb::span_bounds(pb::kRuledLaneParams, L, rec, kLaneB0);
     JcBounds o;
     o.young = s.bounds.young;
     o.x0 = s.bounds.x0;
     o.x1 = s.bounds.x1;
-    if (!o.young) o.x_pre = pb::pre_start(pb::kRuledLaneParams, o.x0, rec).x_pre;
+    if (!o.young) {
+        const pb::PreStart ps = pb::pre_start(pb::kRuledLaneParams, o.x0, rec);
+        o.x_pre = ps.status == pb::SpanStatus::Ok ? ps.x_pre : 0;
+    }
     return o;
 }
 
