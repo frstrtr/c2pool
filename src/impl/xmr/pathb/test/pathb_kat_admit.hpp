@@ -59,10 +59,11 @@ struct KatNet {
     pb::Hash32 pool_id{};
     pb::Hash32 rules_g{};
 
-    KatNet() {
+    // diff: the main Monero rows' difficulty (D_net of the windows)
+    explicit KatNet(std::uint64_t diff = kMonDiff) {
         const pb::RowWeights w = rw(kTailAgc, 300000, 300000);
-        pb::Hash32 parent = rows.seed_anchor(kMonTag, kAnchorH, 800, kTs0, kMonDiff, w);
-        for (std::uint64_t h = kAnchorH + 1; h <= kMonTop; ++h) parent = rows.add(kMonTag, h, parent, mon_ts(h), kMonDiff, w);
+        pb::Hash32 parent = rows.seed_anchor(kMonTag, kAnchorH, 800, kTs0, diff, w);
+        for (std::uint64_t h = kAnchorH + 1; h <= kMonTop; ++h) parent = rows.add(kMonTag, h, parent, mon_ts(h), diff, w);
         pb::Hash32 alt = mon_block(kAltFrom);
         for (std::uint64_t h = kAltFrom + 1; h <= kAltFrom + kAltLen; ++h)
             alt = rows.add(kAltTag, h, alt, mon_ts(h) + 7, kAltDiff, w, false);

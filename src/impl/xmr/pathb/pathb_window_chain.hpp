@@ -212,6 +212,11 @@ inline TipWindow tip_window(const BinStore& s, const Hash32& t, const WindowPara
         return out;
     }
     const LaneView& view = src.view();
+    if (const std::optional<std::uint64_t> pb = view.pending_bin()) {  // a bin of t's chain not held yet (claim_fork)
+        out.defer = WindowDefer::MissingBucket;
+        out.missing_bin = *pb;
+        return out;
+    }
     const Hash32 mmr_root = view.mmr_root_at(view.pos());
     WinEval e = window_from(src, wp.d_net, wp.B, wp.f_spend, wp.N, wp.author);
     out.bins_read = e.read;

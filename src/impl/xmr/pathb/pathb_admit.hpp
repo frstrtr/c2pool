@@ -438,6 +438,7 @@ enum class WalkVerdict : std::uint8_t {
     Closure,      // every held assignment reads a branch forked more than J_0 below parent(c) (ruling 41)
     NeedHeaders,  // a walked header not held (TipHeaders)
     NeedBodies,   // a walked carrier's carried bodies not held (ClosureBodies)
+    NeedBlock,    // a walked body's Monero P_r not held (MoneroBlock: FB_GETCTX, S2.3 #5)
 };
 
 struct WalkResult {
@@ -450,7 +451,8 @@ struct WalkResult {
     std::vector<Hash32> bind;            // Bind: the unbound ids of the passing assignment, fork upward
     std::vector<std::pair<std::uint64_t, Hash32>> refuted_sets;  // body sets a computed fold refutes: (peer, carrier)
     std::vector<std::uint64_t> tokens;   // peers a walk charged (none: a walk gives no token)
-    std::uint64_t d_tip = 0;             // d_at(t's chain, pos(t) + 1) on the passing path (a claim before binding)
+    std::uint64_t d_tip = 0;             // d_at(t's chain, pos(t) + 1) on the passing path (a claim before binding;
+                                         // 0: not computed, pos(t) + 1 at or below a joined root, ruling 53)
 };
 
 class ClosureWalk {
@@ -470,7 +472,7 @@ public:
             case Kind::Pass:
                 out.f = r.st->f;
                 out.pos_t = r.st->pos;
-                out.d_tip = d_after(r.st);
+                out.d_tip = below_root(r.st->pos + 1) ? 0 : d_after(r.st);
                 if (r.st->on_chain) {
                     out.v = WalkVerdict::OnChain;
                     return out;
@@ -481,6 +483,7 @@ public:
             case Kind::Boundary: out.v = WalkVerdict::Boundary; return out;
             case Kind::NeedHeaders: out.v = WalkVerdict::NeedHeaders; out.fetch = r.fetch; return out;
             case Kind::NeedBodies: out.v = WalkVerdict::NeedBodies; out.fetch = r.fetch; return out;
+            case Kind::NeedBlock: out.v = WalkVerdict::NeedBlock; out.fetch = r.fetch; return out;
             case Kind::Closure:
             case Kind::NoPass: out.v = WalkVerdict::Closure; return out;
         }
@@ -492,7 +495,7 @@ public:
     std::size_t max_frames() const noexcept { return max_frames_; }
 
 private:
-    enum class Kind : std::uint8_t { Pass, Boundary, Closure, NeedHeaders, NeedBodies, NoPass };
+    enum class Kind : std::uint8_t { Pass, Boundary, Closure, NeedHeaders, NeedBodies, NeedBlock, NoPass };
 
     // The state after a walked node on one path.
     struct State {
@@ -524,12 +527,13 @@ private:
     static Kind combine(Kind a, Kind b) {
         const auto rank = [](Kind k) {
             switch (k) {
-                case Kind::NeedHeaders: return 5;
-                case Kind::NeedBodies: return 4;
+                case Kind::NeedHeaders: return 6;
+                case Kind::NeedBodies: return 5;
+                case Kind::NeedBlock: return 4;
                 case Kind::Closure: return 3;
                 case Kind::Boundary: return 2;
                 case Kind::NoPass: return 1;
-                case Kind::Pass: return 6;
+                case Kind::Pass: return 7;
             }
             return 0;
         };
@@ -805,7 +809,10 @@ private:
             if (ps.on_chain && deep_tip_deferred(own_.pos(), ps.pos, env_.j0)) return ret(fail(Kind::Boundary));
             // the carrier at its position on the claimed path: monotone record, t_origin == d there
             if (!carrier_height_admissible(ps.H, y.height)) return ret(fail(Kind::NoPass));
-            const std::uint64_t d = d_after(&ps);
+            // ruling 53 (E-99): at a position at or below a joined root, d is the carrier's own t_origin (a claim)
+            const bool d_claim = below_root(ps.pos + 1);
+            if (d_claim) claim_ = true;
+            const std::uint64_t d = d_claim ? own.side.t_origin : d_after(&ps);
             if (!origin_target_ok(own.side.t_origin, d)) return ret(fail(Kind::NoPass));  // d on this path is a claim: no token
             // its carried list: a body set that folds with its receipts_root over S at the parent
             const std::vector<const BodySet*> sets = env_.headers.body_sets(y.id);
@@ -879,7 +886,10 @@ private:
                 f.placed.push_back(RatchetPlacement{b.side.t_origin, b.side.ballot});
             } else {
                 const State& t = *r.st;
-                const std::uint64_t d_tip = d_after(&t);
+                // ruling 53 (E-99): the receipt's d at a position at or below a joined root is its own t_origin
+                const bool d_claim = below_root(t.pos + 1);
+                if (d_claim) claim_ = true;
+                const std::uint64_t d_tip = d_claim ? b.side.t_origin : d_after(&t);
                 if (!origin_target_ok(b.side.t_origin, d_tip)) return ret(fail(Kind::NoPass));
                 // #17 on the walked chain: h(r) >= H(min(q - 1, p(r)))
                 const std::uint64_t q = s.pos;
@@ -888,6 +898,8 @@ private:
                 if (!h_thr) return ret(fail(Kind::NoPass));
                 // h(r) is the body's own Monero height: from P_r
                 const PrInfo pr = env_.resolve_pr ? env_.resolve_pr(b.blob.prev_id) : PrInfo{};
+                // S2.3 #5: a P_r not held is a DEFER and a fetch (FB_GETCTX), as at the row; a bad served one passes nothing
+                if (pr.status == PrInfo::Status::Missing) return ret(fail(Kind::NeedBlock, b.blob.prev_id));
                 if (pr.status != PrInfo::Status::Held) return ret(fail(Kind::NoPass));
                 const bool live = pr.height + 1 >= *h_thr;
                 f.placed.push_back(RatchetPlacement{live ? b.side.t_origin : 0, b.side.ballot});
@@ -943,8 +955,13 @@ private:
         return *s->d_next;
     }
 
+    // A position at or below the root of a joined tree (ruling 53, E-99: d_at there is a claim); never on a full
+    // node's tree (its root is position 0).
+    bool below_root(std::uint64_t x) const { return x <= env_.tree.genesis().pos && env_.tree.genesis().pos > 0; }
+
     // The retarget window after a walked node: the walked nodes' (d, H), then
-    // the tree's window at the fork.
+    // the newest entries of the tree's chain at the fork (an empty window when
+    // they leave the held prefix of a joined tree: no padded value is read).
     RetargetWindow window_after(const State* s) const {
         std::vector<RetargetEntry> rev;
         const State* x = s;
@@ -957,9 +974,12 @@ private:
             const std::optional<Hash32> a = own_.at(s->f);
             anchor = a.value_or(Hash32{});
         }
-        RetargetWindow w(env_.p);
-        if (const std::optional<RetargetWindow> base = env_.tree.window_after(anchor)) w = *base;
-        std::vector<RetargetEntry> entries(w.entries().begin(), w.entries().end());
+        std::vector<RetargetEntry> entries;
+        if (const auto base = env_.tree.window_entries(anchor, env_.p.retarget_span - rev.size())) {
+            entries = *base;
+        } else if (rev.size() < env_.p.retarget_span) {
+            return RetargetWindow(env_.p);
+        }
         std::reverse(rev.begin(), rev.end());
         entries.insert(entries.end(), rev.begin(), rev.end());
         return RetargetWindow(env_.p, entries);
@@ -1245,6 +1265,7 @@ inline Missing missing_of(WalkVerdict v, bool tip_itself) {
     switch (v) {
         case WalkVerdict::NeedHeaders: return tip_itself ? Missing::TipUnknown : Missing::TipHeaders;
         case WalkVerdict::NeedBodies: return Missing::ClosureBodies;
+        case WalkVerdict::NeedBlock: return Missing::MoneroBlock;
         case WalkVerdict::Boundary: return Missing::Boundary;
         case WalkVerdict::Closure: return Missing::Closure;
         case WalkVerdict::Bind: return Missing::TipBodies;
@@ -1440,7 +1461,8 @@ inline AdmitResult admit_carrier(const AdmitEnv& env, std::span<const std::uint8
         out.store_placements.push_back(placement_of(*b.r, b.id, b.h, p_own));
     }
     out.store_placements.push_back(placement_of(c.own, own_id, own.body.h, q));
-    out.announce = CarrierAnnounce{own_id, P.id, own.body.h, c.own.side.receipts_root, c.own.side.ballot};
+    out.announce = CarrierAnnounce{own_id, P.id, own.body.h, c.own.side.receipts_root, c.own.side.ballot,
+                                   c.own.side.t_origin};
     out.carrier = std::move(c);
     return out;
 }

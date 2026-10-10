@@ -21,6 +21,9 @@
 //     no L' (L < N_rt, or no x with H(x) <= H(L) - F - Fresh) or x0 <= 0:
 //           the young chain, x0 = x1 = 1 (the whole chain [1, L], no claim).
 //     The span [x0, L] holds at least N_rt + join_span = 3,336 positions.
+//   pre_start(x0)  the start of the claimed retarget prefix (ruling 53, E-99):
+//     x_pre = max(1, min(x0 - N_rt, the first x with H(x) > H(max(0, x0 - 1
+//             - J_0)) - F - Fresh)), on the candidate's records at L.
 //   peaks_match_root  the first span carrier's peaks bag to its mmr_root.
 //   The bucket assembly of a join is BucketsAssembly (pathb_bucket_wire.hpp)
 //   driven by JoinBuckets (pathb_join.hpp).
@@ -176,6 +179,65 @@ inline SpanResult span_bounds(const LaneParams& p, std::uint64_t L, Rec&& rec, s
     }
     out.status = SpanStatus::Ok;
     out.bounds = SpanBounds{false, lp, x0, x1};
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// pre_start: the start x_pre of the claimed retarget prefix [x_pre, x0 - 1] of
+// a join (ruling 53 JC-1ii-M (a), A (3); E-99): a formula of N_rt, J_0, F and
+// Fresh over the candidate's records, as E-16's x0. The first x with H(x)
+// above the threshold is known once the record of x - 1 is held (rec(0) = b0):
+// `read_lo` is the lowest position whose record the formula reads (x_pre - 1
+// where that first x decides and lies at or above 2), never below it.
+// ---------------------------------------------------------------------------
+struct PreStart {
+    SpanStatus status = SpanStatus::Ok;
+    std::uint64_t x_pre = 1;
+    std::uint64_t read_lo = 1;  // the lowest position (>= 1) whose record the formula reads
+    std::uint64_t need = 0;     // NeedRecord: the position whose record it needs next
+};
+
+template <class Rec>
+inline PreStart pre_start(const LaneParams& p, std::uint64_t x0, Rec&& rec) {
+    PreStart out;
+    const auto need = [&](std::uint64_t x) {
+        out.status = SpanStatus::NeedRecord;
+        out.need = x;
+        return out;
+    };
+    const std::uint64_t fr = p.open_bins + p.fresh_max;  // F + Fresh
+    const std::uint64_t nrt = join_n_rt(p);
+    const std::uint64_t j0 = journal_j0(p, kSealDepth);
+    const std::uint64_t y = x0 > j0 ? x0 - 1 - j0 : 0;  // max(0, x0 - 1 - J_0)
+    const std::optional<std::uint64_t> hy = rec(y);
+    if (!hy) return need(y);
+    out.read_lo = y > 0 ? y : 1;
+    // the threshold H(y) - F - Fresh; below 0 every record exceeds it (the first x is 0)
+    const bool all_above = *hy < fr;
+    const std::uint64_t thr = all_above ? 0 : *hy - fr;
+    const auto above = [&](std::uint64_t h) { return all_above || h > thr; };
+    if (x0 <= nrt) {  // min(x0 - N_rt, .) <= 0: max(1, .) = 1
+        out.x_pre = 1;
+        out.read_lo = 1;
+        return out;
+    }
+    const std::uint64_t top = x0 - nrt;
+    const std::optional<std::uint64_t> ht = rec(top);
+    if (!ht) return need(top);
+    if (!above(*ht)) {  // the first x lies above x0 - N_rt
+        out.x_pre = top;
+        out.read_lo = std::min(out.read_lo, top);
+        return out;
+    }
+    std::uint64_t x = top;  // H(x) above the threshold: the first such x is x or below
+    while (x >= 1) {
+        const std::optional<std::uint64_t> h = rec(x - 1);
+        if (!h) return need(x - 1);
+        if (!above(*h)) break;
+        --x;
+    }
+    out.x_pre = std::max<std::uint64_t>(1, x);
+    out.read_lo = x >= 2 ? x - 1 : 1;
     return out;
 }
 
