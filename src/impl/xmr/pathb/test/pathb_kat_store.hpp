@@ -215,4 +215,36 @@ inline std::string lane_digest(KatNode& n) {
     return s;
 }
 
+// A joined-shape copy of a node's store: first_pos = root + 1 - N_rt, root_pos
+// = root (its S kept, the AR joiner seed there), base_pos = base (the leaves
+// below its leaf count gone), the records below the root headers without S.
+inline MemoryKv joined_shape(const MemoryKv& from, KatNode& n, std::uint64_t root, std::uint64_t base) {
+    MemoryKv kv = from;
+    pb::StoreHead h = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
+    const std::uint64_t first = root + 1 > pb::kRuledLaneParams.retarget_span ? root + 1 - pb::kRuledLaneParams.retarget_span : 0;
+    h.first_pos = first;
+    h.root_pos = root;
+    h.base_pos = base;
+    h.base_leaf_count = n.store.view_at(*n.store.best_at(base)).leaf_count();
+    h.base_peaks = *n.store.best_mmr().prefix_peaks(h.base_leaf_count);
+    const pb::RatchetState s_root = n.tree.find(*n.store.best_at(root))->rs;
+    h.s_base = pb::encode_ratchet_state(n.tree.find(*n.store.best_at(base))->rs);
+    kv.data[pb::store_keys::phead(0)] = pb::encode_phead(h);
+    kv.data[pb::store_keys::ar(0, root)] = pb::encode_ar_row(pb::ActivationRow{s_root.epoch_cur, root, s_root.rules_cur});
+    for (std::uint64_t x = 0; x < first; ++x) kv.data.erase(pb::store_keys::pcarrier(0, x));
+    for (std::uint64_t i = 0; i < h.base_leaf_count; ++i) {
+        kv.data.erase(pb::lane_keys::blhash(0, i));
+        kv.data.erase(pb::lane_keys::bleaf(0, i));
+    }
+    for (std::uint64_t x = first; x < root; ++x) {
+        pb::CarrierRecord c = *pb::decode_pcarrier(kv.data[pb::store_keys::pcarrier(0, x)]);
+        c.state.reset();
+        c.kind = pb::RecordBody::None;
+        c.bytes.clear();
+        c.placements.clear();
+        kv.data[pb::store_keys::pcarrier(0, x)] = pb::encode_pcarrier(c);
+    }
+    return kv;
+}
+
 }  // namespace pathb_kat

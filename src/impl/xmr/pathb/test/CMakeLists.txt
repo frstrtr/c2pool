@@ -82,6 +82,8 @@
 #                                    (first_pos) and FB_RECEIPTS v3 codecs, frame versions
 #   v37_xmr_pathb_store_kat          the node's own store: K_PHEAD / K_PCARRIER / K_AR, one batch
 #                                    per position, the prefix load, the two-phase reload
+#   v37_xmr_pathb_node_kat           PathbNode: three in-process nodes, relay, the template and
+#                                    the job, re-pend, restart, HOLD, the timers
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
@@ -140,7 +142,8 @@ if (BUILD_TESTING)
             v37_xmr_pathb_bucket_wire_kat
             v37_xmr_pathb_admit_kat
             v37_xmr_relay_family_c_kat
-            v37_xmr_pathb_store_kat)
+            v37_xmr_pathb_store_kat
+            v37_xmr_pathb_node_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)

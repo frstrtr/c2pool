@@ -464,15 +464,33 @@ void s4wa_hello() {
         const pb::HelloCheck r = pb::pathb_hello_receive(ours, *pb::encode_pathb_hello(t), unbound, b0, F);
         check(r.verdict == pb::HelloVerdict::Accept && r.trailer_alarm, "a trailer alarm is local: accepted");
     }
-    // the S6 key slot is carried through as received (TODO(U6): its receive rule is not ruled; no verdict asserted)
+    // the S6 key slot (ruling 52): read as-is; any value accepted, no strike, no close, no alarm
     {
+        for (const pb::Hash32& key : {pb::Hash32{}, seq32(0xA0), [] { pb::Hash32 k; k.fill(0xFF); return k; }()}) {
+            pb::PathbHello t = g;
+            t.node_key = key;
+            t.node_nonce = 0xABCDEF;
+            const std::optional<std::vector<std::uint8_t>> kf = pb::encode_pathb_hello(t);
+            const pb::PathbHelloDecode kd = kf ? pb::decode_pathb_hello(*kf) : pb::PathbHelloDecode{};
+            pb::PathbHello got;
+            const pb::HelloCheck kr = kf ? pb::pathb_hello_receive(ours, *kf, unbound, b0, F, &got) : pb::HelloCheck{};
+            check(kf && kf->size() == 483 && (*kf)[383] == key[0] && (*kf)[414] == key[31] && kd.error == pb::HelloError::None
+                          && got.node_key == key && kr.verdict == pb::HelloVerdict::Accept && kr.strike == 0
+                          && !kr.trailer_alarm,
+                  "ruling 52: node-key slot " + pb::pid_detail::hex(key).substr(0, 8)
+                          + "..: read as-is, accepted, no strike, no close, no alarm");
+        }
+        // a frame that ends inside the slot: a HELLO that does not decode, as one that ends inside the tail
         pb::PathbHello t = g;
-        t.node_key = seq32(0xA0);
-        const std::optional<std::vector<std::uint8_t>> kf = pb::encode_pathb_hello(t);
-        const pb::PathbHelloDecode kd = kf ? pb::decode_pathb_hello(*kf) : pb::PathbHelloDecode{};
-        check(kf && kf->size() == 483 && (*kf)[383] == 0xA0 && (*kf)[414] == 0xBF && kd.error == pb::HelloError::None
-                      && kd.hello.node_key == seq32(0xA0),
-              "the 32 B node-key slot [383, 415) is carried through as received");
+        t.node_nonce = 0xABCDEF;
+        const std::vector<std::uint8_t> full = *pb::encode_pathb_hello(t);
+        const std::vector<std::uint8_t> in_slot(full.begin(), full.begin() + 383 + 16);
+        const std::vector<std::uint8_t> in_tail(full.begin(), full.begin() + 300);
+        const pb::HelloCheck a1 = pb::pathb_hello_receive(ours, in_slot, unbound, b0, F);
+        const pb::HelloCheck a2 = pb::pathb_hello_receive(ours, in_tail, unbound, b0, F);
+        check(pb::decode_pathb_hello(in_slot).error == pb::HelloError::Truncated && a1.verdict == a2.verdict
+                      && a1.reason == a2.reason && a1.strike == 0,
+              "ruling 52: a frame ending inside the slot is handled as any HELLO that does not decode");
     }
     // truncated and trailing bytes
     {

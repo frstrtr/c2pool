@@ -465,6 +465,7 @@ struct LoadedState {
     CarrierBodies bodies;
     std::uint64_t q0 = 0;
     std::uint64_t phase1_from = 0;
+    std::map<Hash32, XmrKeyRef> refs;  // the key references the restored placements and buckets hold, by identity
 };
 
 struct LoadResult {
@@ -740,7 +741,20 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     if (rj != replay_rows.size()) return fail(StoreFault::Ar);
     if (store->head().root != ll.head.root || store->best_tip() != H.best_id) return fail(StoreFault::Phase2, tip);
 
-    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1};
+    std::map<Hash32, XmrKeyRef> refs;
+    const auto learn = [&refs](const ReceiptBodyV3& r) {
+        refs[r.side.payee] = r.payee;
+        if (r.owner) refs[r.side.owner] = *r.owner;
+    };
+    for (std::uint64_t x = s1; x <= tip; ++x)
+        if (const CarrierBodyV3* b = bodies.get(rec_at(x).id)) {
+            learn(b->own);
+            for (const ReceiptBodyV3& r : b->carried) learn(r);
+        }
+    for (const std::optional<SealedBin>& sb : ll.bodies)
+        if (sb)
+            for (const XmrKeyRef& ref : sb->refs) refs[key_ref_identity(ref)] = ref;
+    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs)};
     out.state.emplace(std::move(st));
     out.fault = StoreFault::None;
     return out;

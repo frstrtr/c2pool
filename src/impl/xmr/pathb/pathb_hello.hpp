@@ -11,8 +11,10 @@
 //   head (53 B) = 0x40 | frame version 0x02 | magic 'C2XR' | u8 network
 //                 | u32 chain_id (LE) | pool_id[32] | u64 node_nonce (LE)
 //                 | u16 listen_port (LE)
-//   node_key    = the S6 node key slot, zero until S6 when sent; carried as
-//                 received (its receive rule: TODO(U6), not ruled)
+//   node_key    = the S6 node key slot, zero until S6 when sent; read as-is,
+//                 whatever its value: no refusal, no strike, no link close,
+//                 no alarm (ruling 52); a frame too short for it is a HELLO
+//                 that does not decode, as any other
 //   483 B at epoch 0 (53 + 330 + 32 + 68). A frame version 0x01 (a pre-Path-B
 //   peer, codec 1) is refused naming K22.
 //   pathb_hello_check: network, chain_id or pool_id differ -> TAG_MISMATCH;
@@ -313,8 +315,7 @@ inline PathbHelloDecode decode_pathb_hello(std::span<const std::uint8_t> b) {
     h.tail = td.tail;
     const std::size_t at = kHelloHeadBytes + td.consumed;
     if (b.size() - at < kHelloNodeKeyBytes) return fail(HelloError::Truncated);
-    // TODO(U6): the receive rule of the S6 node-key slot is not ruled (card U6). The slot is carried as
-    // received; no verdict, refusal or strike reads its content.
+    // the S6 node-key slot: read as-is, whatever its value (ruling 52); no verdict reads it
     std::copy(b.begin() + at, b.begin() + at + kHelloNodeKeyBytes, h.node_key.begin());
     const std::optional<HelloTrailer> tr = decode_hello_trailer(b.subspan(at + kHelloNodeKeyBytes));
     if (!tr) return fail(HelloError::Trailer);
@@ -344,7 +345,7 @@ struct HelloCheck {
     std::uint32_t strike = 0;       // always 0
 };
 
-// node_key is not read here (TODO(U6): its receive rule is not ruled).
+// node_key is not read here (ruling 52: any value is accepted).
 // bound_best_record: H(best_tip) when best_tip's header is bound at this node
 // (its own S1.3 #9 matched); nullopt otherwise (no leaf-count comparison).
 inline HelloCheck pathb_hello_check(const PathbHello& ours, const PathbHello& theirs,
