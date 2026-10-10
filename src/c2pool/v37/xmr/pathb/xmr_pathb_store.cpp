@@ -23,6 +23,9 @@ core::LevelDBOptions synced_options() {
     o.sync_writes = true;
     o.verify_checksums = true;
     o.paranoid_checks = true;
+    // LevelDB's own block cache, no filter policy: core::LevelDBStore does not free the cache or the policy it creates
+    o.block_cache_size = 0;
+    o.bloom_filter_bits = 0;
     return o;
 }
 

@@ -104,7 +104,8 @@ void fc_getcarrier() {
     check(!pb::encode_fc_getcarrier(q18, kP), "(3) n = 18 does not encode");
     std::vector<std::uint8_t> b18 = *f;
     b18[6] = 18;
-    b18.insert(b18.end() - 1, seq32(0x99).begin(), seq32(0x99).end());
+    const pb::Hash32 extra = seq32(0x99);
+    b18.insert(b18.end() - 1, extra.begin(), extra.end());
     check(pb::decode_fc_getcarrier(b18, kChain, kP, d).error == pb::FrameWireError::Count, "(3) n = 18 refused");
     std::vector<std::uint8_t> b0 = {0x51, 0x01, 0xCD, 0xAB, 0x02, 0x01, 0x00, 0x00};
     check(pb::decode_fc_getcarrier(b0, kChain, kP, d).error == pb::FrameWireError::Count, "(3) n = 0 refused");
