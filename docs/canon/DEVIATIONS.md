@@ -38,10 +38,10 @@ Rows where the XMR lane code in this tree differs from a canon rule (docs/canon/
 | D32 | C27 | no monero_rules_digest | open | slice S4w | ref: the:D32 |
 | D33 | C36 | S2 self-carried receipts only; open carriage and header rules #9 in a later slice | closed | #1953 | ref: the:D33 |
 | D34 | C43 | FC_GETBUCKETS carries at; FC_BUCKETS carries key references, leaf_count, peaks, S and paged rows | closed | #1965 | ref: the:D34 |
-| D35 | C43 | joiner: #12 / #13 checked from x1; earlier span positions by PoW, hashes and roots | open | S3b-4 | ref: the:D35 |
+| D35 | C43 | joiner: #12 / #13 checked from x1; earlier span positions by PoW, hashes and roots | closed | #1987 | ref: the:D35 |
 | D36 | C04, C23, C48, C49 | old payout path removed and Path B wired in a later flag-day slice S4w, after the unwired ratchet module S4 | open | slice S4w | ref: the:D36 |
 | D37 | C43 | deep switch through the joiner path | open | S4w-a | ref: the:D37 |
-| D38 | C25, C38, C41, C43 | SPEC S3 scope completed in S3b-1a..S3b-4; S4 module merged before S3b-1b..4 | open | S3b-4 | ref: the:D38 |
+| D38 | C25, C38, C41, C43 | SPEC S3 scope completed in S3b-1a..S3b-4; S4 module merged before S3b-1b..4 | closed | #1976, #1987 | ref: the:D38 |
 | D39 | C01, C23, C43 | carrier tree on master: carried_root 0 fold and carrier-only, non-activating state step | closed | #1966 | ref: the:D39 |
 | D40 | C21, C38 | window gives finder-only when the newest bin alone fails W_max | closed | #1964 | ref: the:D40 |
 | D41 | C20 | signed job receipts without an on-chain anchor | open | first upgrade epoch | ref: the:D41 |

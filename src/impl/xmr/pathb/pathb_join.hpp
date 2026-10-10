@@ -178,10 +178,11 @@ struct JoinServeFloors {
 };
 
 // The floors at the server's best tip L (rec: H on its best chain).
-// b0 enables the the serving note (ruling 47's record): where the span at the server's
-// own tip is the young chain (no bin sealed before x0, lc(H(x0 - 1)) = 0), the
-// node keeps bodies and headers from position 1 (floors {0, 0}), so a joiner on
-// the young path is servable at the default retention.
+// b0 enables the serving note of ruling 47's record (P-51): while no bin is
+// sealed at or before the body floor (lc(H(x0(L') - J_0 - 1)) = 0) the node
+// keeps bodies and headers from position 1 (floors {0, 0}). That covers the
+// young chain (lc(H(x0 - 1)) = 0, E-79) and the young path of a side branch
+// with no sealed bin (E-83), so both are servable at the default retention.
 template <class Rec>
 inline JoinServeFloors join_serve_floors(const LaneParams& p, std::uint64_t L, Rec&& rec, std::uint64_t b0 = 0) {
     const SpanResult s = span_bounds(p, L, rec, b0);
@@ -189,7 +190,12 @@ inline JoinServeFloors join_serve_floors(const LaneParams& p, std::uint64_t L, R
     const std::uint64_t j0 = journal_j0(p, kSealDepth);
     const std::uint64_t x0 = s.bounds.x0;
     const std::uint64_t nrt = join_n_rt(p);
-    return JoinServeFloors{x0 > j0 + 1 ? x0 - j0 - 1 : 0, x0 > nrt ? x0 - nrt : 0};
+    const std::uint64_t body = x0 > j0 + 1 ? x0 - j0 - 1 : 0;
+    if (b0 != 0) {  // no bin sealed at or before the body floor: everything from position 1
+        const std::optional<std::uint64_t> hf = rec(body);
+        if (hf && bin_leaf_count(*hf, b0, p.open_bins) == 0) return JoinServeFloors{0, 0};
+    }
+    return JoinServeFloors{body, x0 > nrt ? x0 - nrt : 0};
 }
 
 // The hold of a serving node (P-51 as corrected): the floor taken at its best
@@ -926,8 +932,9 @@ public:
         // 3.3 step 2a: L held by A ends the attempt before any further fetch (any node of A's tree)
         if (a_ != nullptr && rep_.L != 0 && a_->holds(rep_.tip)) return end(AttemptEnd::OutOfScope, "L held by A");
         if (known_ && known_(rep_.tip)) return end(AttemptEnd::Known, "a completed candidate not attempted again");
+        if (!scope_on_page()) return finish();  // the fork of L with A's best chain, from the first reply on
         if (!bounds()) return finish();  // pages headers to the retarget-prefix start x0(L') - N_rt (the retarget-prefix floor)
-        if (a_ != nullptr && !in_scope()) return finish();  // the fork of L with A's best chain, over the held headers
+        if (a_ != nullptr && !in_scope()) return finish();  // no candidate header on A's chain down to that floor
         if (!build()) return finish();
         if (!replay()) return finish();
         st_->claims().set_phase(JoinClaims::Phase::AfterL);
@@ -1000,6 +1007,8 @@ private:
         // (2)-(4) per header, oldest (lowest position) first; (5) is a separate pass (check_span_pow), run only on
         // the span [x0, L] so the PRE's hash-linked headers (no PoW, P-43) are not rejected before x0 is known.
         std::optional<std::uint64_t> prev_h;
+        std::vector<std::uint64_t> page_h;  // h of the page's headers (check (3)): its records
+        page_h.reserve(r.headers.size());
         for (std::size_t i = 0; i < r.headers.size(); ++i) {
             const CarrierHeader& h = r.headers[i];
             const Hash32 id = receipt_id(h.own);
@@ -1011,13 +1020,20 @@ private:
             // (4) h does not decrease along the chain (S1.3 #6)
             if (prev_h && *hh < *prev_h) return fail(AttemptEnd::Header, "h decreases along the header chain");
             prev_h = hh;
+            page_h.push_back(*hh);
         }
         // (4) at the page boundary: the existing lowest held header's h >= this page's top h
         if (lo_h_ && prev_h && *lo_h_ < *prev_h) return fail(AttemptEnd::Header, "h decreases at a page boundary");
-        lo_h_ = h_of(r.headers.front().own);  // h at the new lowest position
+        lo_h_ = page_h.front();  // h at the new lowest position
         std::vector<CarrierHeader> merged = r.headers;
         merged.insert(merged.end(), hdr_.begin(), hdr_.end());
         hdr_ = std::move(merged);
+        // the records, incremental: with (4) in the page and at its boundary every held record above is at least
+        // the page's top h, so only the page's own records are new (the running max of h within it)
+        std::vector<std::uint64_t> page_rec(page_h.size());
+        std::uint64_t H = 0;
+        for (std::size_t i = 0; i < page_h.size(); ++i) page_rec[i] = H = std::max(H, page_h[i]);
+        records_.insert(records_.begin(), page_rec.begin(), page_rec.end());
         lo_pos_ = r.first_pos;
         return true;
     }
@@ -1038,26 +1054,11 @@ private:
     }
 
     // The record H(x) on the candidate's chain (running max of h from the
-    // lowest held header up; H(0) = b0). A header whose P_r is not resolved
-    // gives no record: the attempt ends (pr_unresolved_).
-    std::optional<std::uint64_t> rec(std::uint64_t x) {
+    // lowest held header up; H(0) = b0), kept by take_headers page by page
+    // (each held header's P_r resolved once, at its check (3)).
+    std::optional<std::uint64_t> rec(std::uint64_t x) const {
         if (x == 0) return in_.b0;
-        if (x < lo_pos_ || x > rep_.L) return std::nullopt;
-        if (records_.size() != hdr_.size() || rec_lo_ != lo_pos_) {
-            records_.clear();
-            std::uint64_t H = 0;
-            for (std::size_t i = 0; i < hdr_.size(); ++i) {
-                const std::optional<std::uint64_t> h = h_of(hdr_[i].own);
-                if (!h) {
-                    pr_unresolved_ = true;
-                    records_.clear();
-                    return std::nullopt;
-                }
-                H = std::max(H, *h);
-                records_.push_back(H);
-            }
-            rec_lo_ = lo_pos_;
-        }
+        if (x < lo_pos_ || x > rep_.L || x - lo_pos_ >= records_.size()) return std::nullopt;
         return records_[x - lo_pos_];
     }
     // h(r) = the height of its P_r + 1. A P_r the follower does not hold is
@@ -1113,38 +1114,47 @@ private:
         return check_span_pow(lo_pos_);
     }
 
-    // 3.3a (4) / ruling 47 (E-82): the fork of L with A's best chain, scanned over
-    // the headers held down to the retarget-prefix start x0(L') - N_rt (fetched
-    // by bounds()), never below it. "L held by A" (any node) is tested before
-    // bounds(). The newest candidate header on A's best chain is the fork: at or
-    // below A's x1, or below A's base -> deep, in scope; above both -> out of
-    // scope. If no candidate header lies on A's chain down to the floor, the
-    // fork is below it and the candidate is in scope (rule (4) decides).
-    bool in_scope() {
-        if (rep_.L == 0) return true;  // an empty / position-0 candidate
-        for (std::uint64_t x = rep_.L + 1; x-- > lo_pos_;) {
+    // 3.3a (4) / ruling 47 (E-82): the fork of L with A's best chain, scanned
+    // over each FC_HEADERS page of the header phase as it arrives (top down),
+    // so the scope is decided at the first reply that shows the fork; never
+    // below the held headers (the retarget-prefix start x0(L') - N_rt). "L held
+    // by A" (any node) is tested first. The newest candidate header on A's best
+    // chain is the fork: at or below A's x1, or below A's base -> deep, in
+    // scope; above both -> out of scope. If no candidate header lies on A's
+    // chain down to the floor, the fork is below it and the candidate is in
+    // scope (rule (4) decides).
+    bool scope_on_page() { return a_ == nullptr || scope_scan(); }
+    bool scope_scan() {
+        if (scope_done_ || rep_.L == 0) return true;  // decided, or an empty / position-0 candidate
+        const std::uint64_t hi = scope_lo_ == 0 ? rep_.L + 1 : scope_lo_;
+        for (std::uint64_t x = hi; x-- > lo_pos_;) {
             const Hash32 id = receipt_id(header_at(x)->own);
             if (!a_->on_chain(id)) continue;
+            scope_done_ = true;
             const std::uint64_t f = a_->pos_of(id).value_or(x);
             const std::optional<std::uint64_t> ax1 = a_->joined_x1();
             const bool deep = (ax1 && f <= *ax1) || f < a_->store_base();
             return deep ? true : fail(AttemptEnd::OutOfScope, "the fork lies above A's x1 and at or above its base");
         }
+        scope_lo_ = lo_pos_;
+        return true;
+    }
+    bool in_scope() {
+        if (!scope_scan()) return false;
         return true;  // ruling 47: the links reach x0(L') - N_rt without meeting A's chain; the fork lies below, in scope
     }
 
     // ---- span ----
     bool bounds() {
         if (force_young_) {  // the ruling-47 fallback: the whole chain [1, L] verified in full, no claim
-            while (lo_pos_ > 1)
-                if (!more_headers(1)) return false;
+            while (lo_pos_ > 1)  // (5) on arrival, page by page
+                if (!more_headers(1) || !check_span_pow(lo_pos_) || !scope_on_page()) return false;
             if (!check_span_pow(1)) return false;
             rep_.span = SpanBounds{true, 0, 1, 1};
             return true;
         }
         for (;;) {
             const SpanResult s = span_bounds(in_.p, rep_.L, [this](std::uint64_t x) { return rec(x); }, in_.b0);
-            if (pr_unresolved_) return fail(AttemptEnd::NotServed, "a header's P_r not resolved");
             std::uint64_t need_lo = 1;
             if (s.status == SpanStatus::Ok) {
                 rep_.span = s.bounds;
@@ -1158,6 +1168,7 @@ private:
             }
             // (5) on the span held so far (floor = x0 once known, else every held header): the PRE below x0 is exempt
             if (!check_span_pow(x0_known_ ? x0_ : lo_pos_)) return false;
+            if (!scope_on_page()) return false;  // the scope over the page that arrived last
             if (s.status == SpanStatus::Ok && lo_pos_ <= need_lo) return true;  // the span (or whole young chain) held
             if (lo_pos_ <= 1) {
                 if (s.status == SpanStatus::Ok) return true;
@@ -1371,8 +1382,9 @@ private:
     // forking at a PRE node f below x0 - 1 cannot be folded without S(f). The
     // joiner fetches S(f) from the attempt's server by FC_GETBUCKETS at = the
     // side branch's first carrier (whose S_parent = S(f)) and sets the fork
-    // node's claimed ratchet state, then re-admits c.
-    enum class SpanFold : std::uint8_t { None, Fetched, Young, Alarm, NotServed };
+    // node's claimed ratchet state, then re-admits c. The fold runs over the
+    // side carrier's carried list: its body set is fetched first.
+    enum class SpanFold : std::uint8_t { None, Fetched, Young, Alarm, NotServed, Ended };
     SpanFold try_span_fold(const CarrierBodyV3& c) {
         JoinedState& s = *st_;
         if (s.young || !s.tree || !s.store) return SpanFold::None;
@@ -1391,6 +1403,7 @@ private:
             if (lc == 0) return SpanFold::Young;               // no bin sealed at or before f (ruling 47): the young path
             std::vector<Hash32> cids;
             if (y.n_carried > 0) {
+                if (s.headers.body_sets(t).empty() && !fetch_body_set(t)) return SpanFold::Ended;  // the attempt ended
                 const std::vector<const BodySet*> bs = s.headers.body_sets(t);
                 if (!bs.empty())
                     for (const ReceiptBodyV3& b : bs.front()->bodies) cids.push_back(receipt_id(b));
@@ -1478,6 +1491,7 @@ private:
                         const HeaderVariant& y = *vs.front();
                         CarrierBodyV3 w;
                         w.own = y.header.own;
+                        s.learn_refs(w.own);  // its payee / owner key references (placed from its header)
                         if (y.header.n_carried > 0) {
                             const std::vector<const BodySet*> sets = s.headers.body_sets(*b);
                             if (sets.empty()) {
@@ -1499,6 +1513,7 @@ private:
                     // ruling 47: a side branch forking at a PRE node below x0 - 1 needs S(f) from the attempt's server
                     const SpanFold sf = try_span_fold(it.c);
                     if (sf == SpanFold::Fetched) break;  // re-admit with the fork node's S(f) set
+                    if (sf == SpanFold::Ended) return false;  // the side carrier's body set: the attempt ended there
                     if (sf == SpanFold::Young) {
                         rep_.force_young = true;
                         return fail(AttemptEnd::NotServed, "S(f) at a fork with no sealed bin: the young path");
@@ -1598,15 +1613,15 @@ private:
     std::unique_ptr<JoinedState> st_;
     std::vector<CarrierHeader> hdr_;  // positions lo_pos_ .. L
     std::uint64_t lo_pos_ = 0;
-    std::vector<std::uint64_t> records_;
-    std::uint64_t rec_lo_ = 0;
-    bool pr_unresolved_ = false;  // a held header's P_r not resolved: the attempt ends
+    std::deque<std::uint64_t> records_;  // H(x) for x in lo_pos_ .. L (take_headers, page by page)
     std::set<Hash32> phase_ids_;  // ids seen in the header phase (header check (2))
     std::optional<std::uint64_t> lo_h_;  // h at the current lowest held header (header check (4) at a page boundary)
     bool x0_known_ = false;       // x0 fixed by bounds(): below it the PRE is hash-linked, no PoW (header check (5))
     std::uint64_t x0_ = 0;
     std::uint64_t pow_lo_ = 0;    // the lowest position (5)-checked so far (0 = none)
     bool force_young_ = false;    // the young path forced by the pair's mark (the ruling-47 fallback)
+    bool scope_done_ = false;     // the fork with A's best chain met (in scope: deep)
+    std::uint64_t scope_lo_ = 0;  // the lowest position the scope scan has read (0: none)
     std::map<Hash32, CarrierBodyV3> span_bodies_;
     std::set<Hash32> span_s_done_;  // side carriers whose S(f) fetch was attempted (ruling 47)
     AtHeader at_x0_{};
