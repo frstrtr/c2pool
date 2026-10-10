@@ -253,6 +253,60 @@ void repend() {
     const std::optional<pb::PathbJob> j = h.job(b, 9, 640);
     check(j && j->carried.size() >= 5, "repend: the next job carries the re-pended receipts");
     h.pump();
+    // a switch to a branch whose record passed an abandoned placement's origin bin: lost, not re-pended
+    Harness g(net);
+    const std::size_t c = g.add(table0(net), true), e = g.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        g.tick_monero();
+        g.mine(c, 1, 40 + i);
+    }
+    std::vector<pb::PathbJob> old_jobs;
+    for (std::uint32_t k = 0; k < 3; ++k) old_jobs.push_back(*g.job(e, 5 + k, 800 + k));
+    const std::uint64_t h_r = old_jobs[0].h;
+    const std::uint64_t F = pb::kRuledLaneParams.open_bins;
+    for (int i = 0; i < 400 && g[c].tree().best().H < h_r + F - 4; ++i) {
+        g.tick_monero(2);
+        g.mine(c, 1, 50 + i);
+    }
+    // the old shares: pending at E (their bin still open)
+    std::size_t pend = 0;
+    for (std::uint32_t k = 0; k < 3; ++k)
+        if (g[e].on_own_share(old_jobs[k], 800 + k, pb::Hash32{}).action == pb::NodeAction::Pending) ++pend;
+    g.pump();
+    g.cut = {{c, e}, {e, c}};
+    g.mine(e, 9, 900);  // X: one carrier carrying them
+    const pb::CarrierBodyV3* xb = g[e].bodies().get(g[e].tree().best().id);
+    const std::size_t x_carried = xb ? xb->carried.size() : 0;
+    const std::uint64_t x_pos = g[e].tree().best().pos;
+    for (int i = 0; i < 400 && (g[c].tree().best().pos < x_pos + 1 || g[c].tree().best().H < h_r + F); ++i) {
+        g.tick_monero(2);
+        g.mine(c, 2, 950 + i);
+    }
+    g.cut.clear();
+    std::uint64_t lost = 0, rep = 0;
+    bool sw = false;
+    std::uint64_t H_sw = 0;
+    for (std::uint64_t x = x_pos; x <= g[c].store().tip_pos(); ++x) {
+        const pb::Hash32 id = *g[c].store().best_at(x);
+        const pb::NodeEventResult r = g[e].on_carrier(c, *pb::encode_fc_carrier(0, *g[c].bodies().get(id), 16));
+        lost += r.lost;
+        rep += r.repended;
+        if (r.action == pb::NodeAction::Switched) {
+            sw = true;
+            H_sw = g[e].tree().best().H;
+        }
+    }
+    bool none_pending = true;
+    for (std::uint32_t k = 0; k < 3; ++k) {
+        pb::ReceiptBodyV3 rb = old_jobs[k].body;
+        rb.blob.nonce = 800 + k;
+        none_pending = none_pending && !g[e].pending().holds(pb::receipt_id(rb));
+    }
+    check(pend == 3 && x_carried == 3 && sw && H_sw >= h_r + F && lost == 3 && rep == 1 && none_pending,
+          "repend (C49): the 3 carried receipts' origin bin " + std::to_string(h_r) + " sealed on the new branch (H "
+                  + std::to_string(H_sw) + "): lost " + std::to_string(lost) + "; X's own receipt re-pended ("
+                  + std::to_string(rep) + "); pending " + std::to_string(pend) + ", carried " + std::to_string(x_carried));
+    g.pump();
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +370,33 @@ void m23() {
           "m23: the best changed between RandomX and the placement; the cheap rows re-ran, RandomX not again");
     check(r.action == pb::NodeAction::SideBranch && h[a].tree().find(cc) != nullptr && h[a].tree().best().id == *h[b].store().best_at(5),
           "m23: C's carrier is placed on its (now side) branch after the re-run");
+    // the re-run decides: the best chain moved J + 2 past C's parent while RandomX ran; C's parent now lies below the
+    // journal base and the re-run DEFERs (OwnChainDeep), where the stale verdict would place it
+    const std::uint64_t J = 16;
+    Harness g(net);
+    const std::size_t a2 = g.add(table0(net), true, J), b2 = g.add(table0(net), true, J), c2 = g.add(table0(net), true, J);
+    for (int i = 0; i < 3; ++i) {
+        g.tick_monero();
+        g.mine(a2, 1, 60 + i);
+    }
+    g.cut = {{b2, a2}, {c2, a2}, {b2, c2}, {c2, b2}};
+    g.mine(c2, 3, 800);
+    const pb::Hash32 cc2 = g[c2].tree().best().id;
+    for (std::uint64_t i = 0; i < J + 2; ++i) g.mine(b2, 4, 801 + static_cast<std::uint32_t>(i));
+    g.cut.clear();
+    g.q.clear();
+    pb::PathbNode::CarrierTicket t2 = g[a2].begin_carrier(c2, *pb::encode_fc_carrier(0, *g[c2].bodies().get(cc2), 16));
+    const bool first_ok = t2.admit.verdict == pb::AdmitVerdict::AdmitCarrier;
+    for (std::uint64_t x = 4; x <= 3 + J + 2; ++x) {
+        const pb::Hash32 id = *g[b2].store().best_at(x);
+        g[a2].on_carrier(b2, *pb::encode_fc_carrier(0, *g[b2].bodies().get(id), 16));
+    }
+    g.q.clear();
+    const pb::NodeEventResult r2 = g[a2].complete_carrier(std::move(t2));
+    check(first_ok && g[a2].store().base_pos() > 3 && r2.action == pb::NodeAction::Parked
+                  && r2.admit.missing == pb::Missing::OwnChainDeep && !g[a2].poisoned(),
+          "m23: the re-run against the moved best chain: C's parent below the journal base -> DEFER (action "
+                  + std::to_string(static_cast<int>(r2.action)) + ")");
 }
 
 // ---------------------------------------------------------------------------

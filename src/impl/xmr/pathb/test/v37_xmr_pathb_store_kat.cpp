@@ -242,6 +242,20 @@ void switch_batch() {
     check(a_gone, "(2) K_PCARRIER 191 .. 202 hold branch B");
     Reloaded r = reload(net, sn.kv, 64);
     check(r.n && lane_digest(n) == lane_digest(*r.n), "(3) the store after a switch reloads to the live state: " + why(r.r));
+    // a losing branch that reached above the winner's tip (old tip 205): its records 203 .. 205 go in the same batch
+    {
+        MemoryKv kv2 = sn.kv;
+        pb::LaneBatch stale;
+        for (std::uint64_t x = 203; x <= 205; ++x)
+            stale.put(pb::store_keys::pcarrier(0, x), *sn.kv.get(pb::store_keys::pcarrier(0, 202)));
+        check(pb::commit_lane_batch(kv2, stale), "(2) stale records 203 .. 205 written");
+        const pb::LaneBatch b = pb::switch_batch(0, sn.head, n.tree, n.store, n.bodies, 190, 205, n.ar, n.ar, pb::LaneBatch{});
+        bool gone = pb::commit_lane_batch(kv2, b);
+        for (std::uint64_t x = 203; x <= 205; ++x) gone = gone && !kv2.get(pb::store_keys::pcarrier(0, x));
+        bool kept = true;
+        for (std::uint64_t x = 191; x <= 202; ++x) kept = kept && kv2.get(pb::store_keys::pcarrier(0, x)) == sn.kv.get(pb::store_keys::pcarrier(0, x));
+        check(gone && kept, "(2) the switch batch deletes K_PCARRIER above the fork through the old tip and writes the new branch");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +395,18 @@ void faults() {
         bh.peaks = m.peaks();
         kv4.data[pb::lane_keys::bmmr(0)] = pb::encode_bmmr(bh);
         check(reload(net, kv4, 64).r.fault == pb::StoreFault::Anchor, "(6) a lane MMR the tip's mmr_root does not commit: Anchor");
+    }
+    // (6) a stored placement whose bin seals during phase 2, altered: its leaf differs from the one the next carrier's
+    // mmr_root commits (phase 2 check 9 at that carrier, before the final root)
+    {
+        MemoryKv kv = sn.kv;
+        const std::uint64_t x = 120;  // own bin b0 + 10: sealed at H = b0 + 106, inside q0 .. tip
+        pb::CarrierRecord c = *pb::decode_pcarrier(kv.data[pb::store_keys::pcarrier(0, x)]);
+        c.placements.back().live = !c.placements.back().live;
+        kv.data[pb::store_keys::pcarrier(0, x)] = pb::encode_pcarrier(c);
+        const Reloaded r = reload(net, kv, 64);
+        check(r.r.fault == pb::StoreFault::Phase2 && r.r.check == 9 && r.r.at < T,
+              "(6) an altered placement of a bin sealed in phase 2: Phase2 check 9 at the first carrier over it: " + why(r.r));
     }
     // (6) a write failure poisons the node; the store keeps its last committed position
     {
