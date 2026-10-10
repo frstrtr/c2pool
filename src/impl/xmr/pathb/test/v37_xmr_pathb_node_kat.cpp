@@ -957,6 +957,8 @@ void poison() {
         h.mine(a, 1, 90);
         const pb::Hash32 c = h[a].tree().best().id;
         const std::optional<pb::PathbJob> stale = h.job(a, 2, 91);  // a share for B's pending set, later
+        check(stale.has_value(), "poison: a job for a later share");
+        if (!stale) return;
         h.mine(a, 1, 92);
         h.cut.clear();
         h.q.clear();
@@ -1051,6 +1053,7 @@ void joinpages() {
     const pb::HeadersReply r1 = page_of(h, a, pb::Hash32{}, 10);
     check(r1.headers.size() == 10 && r1.first_pos == 31 && pb::receipt_id(r1.headers.back().own) == tip && links(r1),
           "joinpages: the first page (stop zero): the 10 headers ending at the best tip, first_pos 31");
+    if (r1.headers.empty()) return;
     const pb::Hash32 stop2 = r1.headers.front().own.side.tip;
     const pb::HeadersReply r2 = page_of(h, a, stop2, 10);
     check(r2.headers.size() == 10 && r2.first_pos == 21 && pb::receipt_id(r2.headers.back().own) == stop2 && links(r2)
