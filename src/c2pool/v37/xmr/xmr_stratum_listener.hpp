@@ -97,6 +97,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -160,6 +161,8 @@ struct StratumListenerOptions {
     int           parked_keepalive_ms = 10000;
     int           max_json_depth = 8;        // login/submit are depth-3 objects; guards the recursive parser
     std::size_t   max_log_lines = 2048;      // bounded log (oldest dropped)
+    std::size_t   max_empty_lines = 64;      // consecutive blank request lines before close
+    std::size_t   max_log_field = 64;        // bytes of a peer-supplied string kept in a log line
     // NET-DOS (see the header note). Every value below is network policy.
     std::uint64_t min_difficulty = 16000;    // a "+diff" request below this is raised to it
     double        submit_rate = kStratumSubmitRate;      // submits/s per connection, sustained (2 x 2^k / T = 12.8)
@@ -495,6 +498,8 @@ private:
         std::string peer;                  // "ip:port" for the log
         std::string rbuf;                  // unframed inbound bytes
         std::string wbuf;                  // unsent outbound bytes (slow reader)
+        std::size_t empty_run = 0;         // consecutive blank lines seen so far
+        std::size_t scan_pos = 0;          // rbuf bytes already scanned for '\n' (partial line)
         std::optional<ParkedLogin> parked; // login waiting for the first template
         std::unique_ptr<strat::XmrStratumSession> session;
         bool        last_reply_error = false;
@@ -545,7 +550,7 @@ private:
             m_owner.log("share ACCEPTED height=" + std::to_string(s.height) +
                         " template=" + std::to_string(s.template_id) +
                         " nonce=" + hex_u32(s.nonce) +
-                        " worker='" + s.worker + "'" +
+                        " worker='" + log_clip(s.worker, m_owner.m_opts.max_log_field) + "'" +
                         (s.is_network_block ? " NETWORK-BLOCK" : ""));
             m_inner.on_accepted_share(s);
         }
@@ -609,6 +614,17 @@ private:
         return b;
     }
 
+    // A peer-supplied string for a log line: at most n bytes (then "..."),
+    // control bytes written as '?'.
+    static std::string log_clip(const std::string& s, std::size_t n) {
+        std::string out = s.size() <= n ? s : s.substr(0, n) + "...";
+        for (char& ch : out) {
+            const unsigned char u = static_cast<unsigned char>(ch);
+            if (u < 0x20 || u == 0x7f) ch = '?';
+        }
+        return out;
+    }
+
     // Request id: xmrig sends a JSON number; tolerate a numeric string.
     static std::uint32_t req_id_of(const mj::Value& v) {
         if (v.is_number()) return v.as_u32();
@@ -616,8 +632,8 @@ private:
         return 0;
     }
 
-    // Reject pathologically nested input before it reaches the recursive
-    // minijson parser (which is KAT-grade, not adversarial-hardened).
+    // Pre-check: bracket nesting outside strings at most max_depth. The parser
+    // then applies max_json_depth itself and requires four hex digits after \u.
     static bool depth_ok(std::string_view s, int max_depth) {
         int depth = 0;
         bool in_str = false, esc = false;
@@ -826,20 +842,41 @@ private:
             close_client(cid, std::string("recv failed: ") + std::strerror(errno));
             return;
         }
-        // Drain complete newline-framed requests.
+        // Drain complete newline-framed requests: advance an offset, compact
+        // the buffer once at the end, and resume the '\n' scan of a partial
+        // line where the previous read left it (scan_pos). The line cap counts
+        // the line without its terminating "\n" or "\r\n".
+        std::size_t rpos = 0;
         for (;;) {
             c = live(cid);
             if (!c) return;                          // dispatch closed us
-            const std::size_t nl = c->rbuf.find('\n');
+            const std::size_t nl = c->rbuf.find('\n', std::max(rpos, c->scan_pos));
             if (nl == std::string::npos) {
-                if (c->rbuf.size() > m_opts.max_line_bytes)
+                if (rpos) c->rbuf.erase(0, rpos);
+                c->scan_pos = c->rbuf.size();
+                const std::size_t pend = c->rbuf.size();
+                const std::size_t cr = (pend && c->rbuf.back() == '\r') ? 1 : 0;
+                if (pend - cr > m_opts.max_line_bytes)
                     close_client(cid, "request line too long");
-                break;
+                return;
             }
-            std::string line = c->rbuf.substr(0, nl);
-            c->rbuf.erase(0, nl + 1);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
+            c->scan_pos = 0;
+            std::size_t len = nl - rpos;
+            if (len && c->rbuf[nl - 1] == '\r') --len;   // "\r\n" terminator
+            if (len > m_opts.max_line_bytes) {
+                close_client(cid, "request line too long");
+                return;
+            }
+            std::string line = c->rbuf.substr(rpos, len);
+            rpos = nl + 1;
+            if (line.empty()) {
+                if (++c->empty_run > m_opts.max_empty_lines) {
+                    close_client(cid, "too many empty request lines");
+                    return;
+                }
+                continue;
+            }
+            c->empty_run = 0;
             dispatch(cid, line);
         }
     }
@@ -854,7 +891,7 @@ private:
             return;
         }
         mj::Value req;
-        if (!mj::parse(line, req) || !req.is_object()) {
+        if (!mj::parse(line, req, static_cast<std::size_t>(m_opts.max_json_depth)) || !req.is_object()) {
             m_stats.malformed.fetch_add(1, std::memory_order_relaxed);
             send_line(cid, strat::StratumDialect::build_error(0, "Malformed request"));
             close_client(cid, "malformed JSON");
@@ -887,7 +924,8 @@ private:
                 c->parked = ParkedLogin{req_id, login, agent, t, t, t};
                 m_stats.parked_logins.fetch_add(1, std::memory_order_relaxed);
                 log("client " + std::to_string(cid) + " login PARKED (" +
-                    (suspended ? "lane suspended" : "no template yet") + ") agent='" + agent + "'");
+                    (suspended ? "lane suspended" : "no template yet") + ") agent='" +
+                    log_clip(agent, m_opts.max_log_field) + "'");
                 return;
             }
             update_submit_rate(peek);   // VARDIFF: retarget the budget to this tip's lane window
@@ -981,10 +1019,11 @@ private:
             if (Client* cl = live(cid)) cl->served_tid = probe.template_id;
             m_stats.logins.fetch_add(1, std::memory_order_relaxed);
             const strat::LoginString& ls = s.login();
-            log("client " + std::to_string(cid) + " LOGIN OK address=" + ls.address +
-                " worker='" + ls.worker + "'" +
+            log("client " + std::to_string(cid) + " LOGIN OK address=" +
+                log_clip(ls.address, m_opts.max_log_field) +
+                " worker='" + log_clip(ls.worker, m_opts.max_log_field) + "'" +
                 (ls.custom_diff ? " custom_diff=" + std::to_string(*ls.custom_diff) : "") +
-                " agent='" + agent + "' -> first job sent");
+                " agent='" + log_clip(agent, m_opts.max_log_field) + "' -> first job sent");
         } else {
             // Race: template vanished between the peek and handle_login; the
             // server already answered "No job available" and xmrig will retry.
@@ -1213,7 +1252,9 @@ private:
                 m_stats.submits_duplicate.fetch_add(1, std::memory_order_relaxed);
                 m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
                 send_line(cid, strat::StratumDialect::build_error(req_id, "Duplicate share"));
-                log("client " + std::to_string(cid) + " submit REJECTED: duplicate (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+                log("client " + std::to_string(cid) + " submit REJECTED: duplicate (job_id=" +
+                    log_clip(f.job_id, m_opts.max_log_field) + " nonce=" +
+                    log_clip(f.nonce, m_opts.max_log_field) + ")");
                 score_share(cid, false, "duplicate share");
                 return;
             }
@@ -1280,8 +1321,10 @@ private:
         if (!c) return;
         if (c->last_reply_error) {
             m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
-            log("client " + std::to_string(cid) + " submit REJECTED: " + c->last_reply_msg +
-                " (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+            log("client " + std::to_string(cid) + " submit REJECTED: " +
+                log_clip(c->last_reply_msg, m_opts.max_log_field) +
+                " (job_id=" + log_clip(f.job_id, m_opts.max_log_field) +
+                " nonce=" + log_clip(f.nonce, m_opts.max_log_field) + ")");
             if (c->last_reply_msg == strat::submit_error_message(strat::SubmitError::LowDiff))
                 score_share(cid, false, "low difficulty share");
         } else {
