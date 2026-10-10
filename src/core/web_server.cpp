@@ -5596,12 +5596,18 @@ nlohmann::json MiningInterface::rest_user_stales()
     return nlohmann::json::object();
 }
 
-std::string MiningInterface::rest_peer_addresses()
+std::string MiningInterface::rest_peer_addresses(bool reveal_ips)
 {
     std::string result;
     if (m_peer_info_fn) {
         auto peers = m_peer_info_fn();
         for (const auto& p : peers) {
+            // #1985: this list is read as host:port dial targets, so a masked
+            // entry would be a broken target. Unless reveal_ips, incoming peers
+            // are dropped instead; a peer without an "incoming" flag is dropped
+            // too (fail closed). Outgoing peers are public listeners we dialed.
+            if (!reveal_ips && (!p.is_object() || p.value("incoming", true)))
+                continue;
             if (!result.empty()) result += ' ';
             result += p.value("address", "");
         }

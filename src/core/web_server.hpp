@@ -249,7 +249,8 @@ public:
     nlohmann::json rest_user_stales();              // /user_stales — per-user stale proportions
     // reveal_ips on the peer views below: incoming peer addresses are raw only
     // for a direct local viewer (#1985); outgoing peers are shown as before.
-    std::string    rest_peer_addresses();           // /peer_addresses — space-separated peer list (text)
+    // /peer_addresses drops incoming peers instead of masking them.
+    std::string    rest_peer_addresses(bool reveal_ips = false);  // /peer_addresses — space-separated peer list (text)
     nlohmann::json rest_peer_versions(bool reveal_ips = false);      // /peer_versions — p2pool version per peer
     nlohmann::json rest_peer_txpool_sizes(bool reveal_ips = false);  // /peer_txpool_sizes — txpool size per peer
     nlohmann::json rest_peer_list(bool reveal_ips = false);          // /peer_list — detailed peer list [{address,version,incoming,uptime,...}]
