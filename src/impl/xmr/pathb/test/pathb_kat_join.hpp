@@ -183,7 +183,7 @@ struct KatServer final : pb::JoinLink {
             const std::optional<pb::Hash32> id = n->tree.ancestor_at(b, x);
             if (!id) return std::nullopt;
             return n->tree.find(*id)->H;
-        });
+        }, n->store.b0());  // b0 enables the the serving note (serve from 1 while lc = 0)
     }
 
     void tick() {
@@ -264,6 +264,26 @@ struct KatServer final : pb::JoinLink {
         std::optional<pb::RatchetStateBytes> s;
         if (at != nullptr)
             if (const pb::CarrierNode* p = n->tree.find(at->parent)) s = pb::encode_ratchet_state(p->rs);
+        // S(f) for a side carrier at (ruling 47): at is held but not on the best chain, and its parent (the fork) is
+        // on the server's best chain; serve S_parent(at) = S(fork) with the leaves below lc(H(fork)) (shared with the
+        // best chain), proved against the best MMR's prefix (serve_buckets serves a best-chain at only).
+        if (at != nullptr && at->pos > 0 && n->store.best_at(at->pos) != q.at && s) {
+            const pb::CarrierNode* p = n->tree.find(at->parent);
+            if (p != nullptr && n->store.best_at(p->pos) == at->parent) {
+                const pb::LaneView bv = n->store.view_at(n->store.best_tip());
+                auto src = std::make_shared<pb::LaneView>(bv);
+                pb::BucketServeSource bs;
+                bs.b0 = n->store.b0();
+                bs.leaf_count = pb::bin_leaf_count(p->H, n->store.b0(), n->P.open_bins);  // lc(H(fork))
+                bs.mmr = &n->store.best_mmr();
+                bs.bucket = [src](std::uint64_t bin) -> const pb::SealedBin* { return src->bucket(bin); };
+                bs.s_parent = *s;
+                out.frames = pb::serve_buckets_from(bs, q, n->P.r_max == 0 ? 0 : frame_bytes(), UINT64_MAX / 4);
+                out.status = pb::LinkStatus::Served;
+                if (on_buckets) on_buckets(q, out);
+                return out;
+            }
+        }
         out.frames = pb::serve_buckets(n->store, q, s, n->P.r_max == 0 ? 0 : frame_bytes(), UINT64_MAX / 4);
         out.status = pb::LinkStatus::Served;
         if (on_buckets) on_buckets(q, out);
@@ -381,6 +401,7 @@ inline const char* end_name(pb::AttemptEnd e) {
         case pb::AttemptEnd::NotServed: return "NotServed";
         case pb::AttemptEnd::Contradiction: return "Contradiction";
         case pb::AttemptEnd::Unplaceable: return "Unplaceable";
+        case pb::AttemptEnd::Header: return "Header";
         case pb::AttemptEnd::OutOfScope: return "OutOfScope";
         case pb::AttemptEnd::Known: return "Known";
     }

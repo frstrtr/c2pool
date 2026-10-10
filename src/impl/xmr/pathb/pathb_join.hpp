@@ -178,9 +178,13 @@ struct JoinServeFloors {
 };
 
 // The floors at the server's best tip L (rec: H on its best chain).
+// b0 enables the the serving note (ruling 47's record): where the span at the server's
+// own tip is the young chain (no bin sealed before x0, lc(H(x0 - 1)) = 0), the
+// node keeps bodies and headers from position 1 (floors {0, 0}), so a joiner on
+// the young path is servable at the default retention.
 template <class Rec>
-inline JoinServeFloors join_serve_floors(const LaneParams& p, std::uint64_t L, Rec&& rec) {
-    const SpanResult s = span_bounds(p, L, rec);
+inline JoinServeFloors join_serve_floors(const LaneParams& p, std::uint64_t L, Rec&& rec, std::uint64_t b0 = 0) {
+    const SpanResult s = span_bounds(p, L, rec, b0);
     if (s.status != SpanStatus::Ok || s.bounds.young) return JoinServeFloors{0, 0};
     const std::uint64_t j0 = journal_j0(p, kSealDepth);
     const std::uint64_t x0 = s.bounds.x0;
@@ -547,11 +551,18 @@ inline Basis JoinClaims::basis(RowClass k, const Hash32& tip, std::uint64_t x) c
     switch (k) {
         case RowClass::Walk: return Basis::Computed;
         case RowClass::Epoch:
+            // a tip below the root x0 - 1 is a claimed PRE node whose ratchet state the joiner does not hold (ruling 47,
+            // E-84): its epoch / H_hold is a claim it does not compute
+            if (replay && s.x0 > 1 && x <= s.x0 - 1) return Basis::NotComputed;
+            return replay && x <= x1 + 1 ? Basis::ClaimSpan : Basis::Computed;
         case RowClass::Fold:
         case RowClass::OriginBin:
         case RowClass::Dedup:
         case RowClass::Live: return replay && x <= x1 + 1 ? Basis::ClaimSpan : Basis::Computed;
         case RowClass::Retarget:
+            // a carried receipt whose tip lies below the root x0 - 1 (ruling 47, E-84): its d_at window lies below the
+            // PRE the joiner holds, a claim it does not compute
+            if (replay && s.x0 > 1 && x <= s.x0 - 1) return Basis::NotComputed;
             return replay && x <= x1 + s.inputs().p.retarget_span ? Basis::ClaimSpan : Basis::Computed;
         case RowClass::Coinbase:
             if (x <= x1) return Basis::NotComputed;  // a tip below x1 (D35)
@@ -797,6 +808,7 @@ public:
         std::uint64_t server = 0;
         U128 claimed_work{};  // the HELLO claim (orders nothing)
         std::uint64_t seq = 0;
+        bool young = false;   // the pair runs the young path (the ruling-47 fallback; not attempt state)
     };
 
     void offer(const Hash32& candidate, std::uint64_t server, const U128& claimed_work = {}) {
@@ -852,12 +864,14 @@ enum class AttemptEnd : std::uint8_t {
     NotServed,      // (iii) not serving / no reply / a short reply / data any peer may serve not resolved: re-queued
     Contradiction,  // (iv) the server contradicted itself: excluded
     Unplaceable,    // (v) a span carrier that cannot be placed with nothing left to fetch: excluded
+    Header,         // the header phase (header checks (4), (5)): the end, the server excluded with all its pairs, no token
     OutOfScope,     // 3.3 step 2a: L held by A, or forking above A's x1 and at or above its base: dropped
     Known,          // 3.3a (5): a completed candidate that did not replace A: dropped
 };
 
 inline constexpr bool attempt_excludes(AttemptEnd e) noexcept {
-    return e == AttemptEnd::Alarm || e == AttemptEnd::Contradiction || e == AttemptEnd::Unplaceable;
+    return e == AttemptEnd::Alarm || e == AttemptEnd::Contradiction || e == AttemptEnd::Unplaceable ||
+           e == AttemptEnd::Header;
 }
 
 struct AttemptReport {
@@ -876,6 +890,7 @@ struct AttemptReport {
     SpanBounds span;
     std::shared_ptr<const BoundWork> a_profile;  // A's bound work, read when the attempt took its L
     bool a_profile_read = false;
+    bool force_young = false;              // ruling 47: the next attempt of this pair runs the young path
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
 
@@ -908,9 +923,11 @@ public:
         rep_.candidate = candidate;
         st_ = std::make_unique<JoinedState>(in_, link_.peer());  // its own tree, store, AR, index and caches
         if (!fetch_top()) return finish();
-        if (a_ != nullptr && !in_scope()) return finish();
+        // 3.3 step 2a: L held by A ends the attempt before any further fetch (any node of A's tree)
+        if (a_ != nullptr && rep_.L != 0 && a_->holds(rep_.tip)) return end(AttemptEnd::OutOfScope, "L held by A");
         if (known_ && known_(rep_.tip)) return end(AttemptEnd::Known, "a completed candidate not attempted again");
-        if (!bounds()) return finish();
+        if (!bounds()) return finish();  // pages headers to the retarget-prefix start x0(L') - N_rt (the retarget-prefix floor)
+        if (a_ != nullptr && !in_scope()) return finish();  // the fork of L with A's best chain, over the held headers
         if (!build()) return finish();
         if (!replay()) return finish();
         st_->claims().set_phase(JoinClaims::Phase::AfterL);
@@ -921,6 +938,8 @@ public:
 
     // The tips of completed candidates kept by tip id (3.3a (5)).
     void set_known(std::function<bool(const Hash32&)> f) { known_ = std::move(f); }
+    // The pair's young mark (the ruling-47 fallback): the whole chain [1, L] in full, no claim.
+    void set_force_young(bool y) noexcept { force_young_ = y; }
 
 private:
     // ---- the result ----
@@ -957,20 +976,64 @@ private:
         return r.headers.size() < could;
     }
 
+    // The header phase (RULED 47 (a), RULED 48 (a); E-81, E-87):
+    // every FC_HEADERS header of the attempt is checked on arrival, (1)-(4)
+    // before (5). A failed (4) or (5) ends the attempt and excludes the server
+    // with all its pairs, no token (AttemptEnd::Header); a repeat (2) is a
+    // contradiction; an unresolved P_r (3) is non-service. The PRE headers,
+    // once x0 is known, stay hash-linked with no PoW (P-43): (5) is skipped for
+    // positions below x0.
+    bool pow_ok(const CarrierHeader& h) const {
+        return h.own.side.t_origin >= in_.p.d_min && join_detail::header_path_ok(in_, h);
+    }
+
     // Adds one reply's headers below what is held; false: the attempt ended.
     bool take_headers(const ChainHeaders& r, const std::optional<Hash32>& stop) {
         if (r.status != LinkStatus::Served || r.headers.empty()) return fail(AttemptEnd::NotServed, "headers not served");
-        // the reply must link and end at stop
+        // (1) the reply must link and end at stop
         for (std::size_t i = 1; i < r.headers.size(); ++i)
             if (r.headers[i].own.side.tip != receipt_id(r.headers[i - 1].own))
                 return fail(AttemptEnd::NotServed, "headers do not link");
         if (stop && receipt_id(r.headers.back().own) != *stop) return fail(AttemptEnd::NotServed, "headers do not end at stop");
         if (!hdr_.empty() && r.first_pos + r.headers.size() != lo_pos_)
             return fail(AttemptEnd::Contradiction, "claimed positions contradict");
+        // (2)-(4) per header, oldest (lowest position) first; (5) is a separate pass (check_span_pow), run only on
+        // the span [x0, L] so the PRE's hash-linked headers (no PoW, P-43) are not rejected before x0 is known.
+        std::optional<std::uint64_t> prev_h;
+        for (std::size_t i = 0; i < r.headers.size(); ++i) {
+            const CarrierHeader& h = r.headers[i];
+            const Hash32 id = receipt_id(h.own);
+            // (2) no id repeats within the attempt's header-phase sequence (the cycle of the review)
+            if (!phase_ids_.insert(id).second) return fail(AttemptEnd::Contradiction, "a repeated header id in the header phase");
+            // (3) its P_r resolves, else non-service after P-53
+            const std::optional<std::uint64_t> hh = h_of(h.own);
+            if (!hh) return fail(AttemptEnd::NotServed, "a header's P_r not resolved");
+            // (4) h does not decrease along the chain (S1.3 #6)
+            if (prev_h && *hh < *prev_h) return fail(AttemptEnd::Header, "h decreases along the header chain");
+            prev_h = hh;
+        }
+        // (4) at the page boundary: the existing lowest held header's h >= this page's top h
+        if (lo_h_ && prev_h && *lo_h_ < *prev_h) return fail(AttemptEnd::Header, "h decreases at a page boundary");
+        lo_h_ = h_of(r.headers.front().own);  // h at the new lowest position
         std::vector<CarrierHeader> merged = r.headers;
         merged.insert(merged.end(), hdr_.begin(), hdr_.end());
         hdr_ = std::move(merged);
         lo_pos_ = r.first_pos;
+        return true;
+    }
+
+    // (5) RULED 47 (a): the blob's PoW at its own claimed t_origin >= d_min, for every held span header not yet
+    // checked. `floor` is x0 once known (the PRE below it stays hash-linked, no PoW), else lo_pos_ (every held header
+    // is a candidate until x0 is resolved, so a no-PoW server is caught at the top before paging without bound). A
+    // failure ends the attempt, the server excluded with all its pairs, no token (AttemptEnd::Header).
+    bool check_span_pow(std::uint64_t floor) {
+        const std::uint64_t from = std::max(lo_pos_, floor);
+        const std::uint64_t hi = pow_lo_ == 0 ? rep_.L + 1 : pow_lo_;  // [from, hi): held but not yet (5)-checked
+        for (std::uint64_t p = hi; p-- > from;) {
+            const CarrierHeader* h = header_at(p);
+            if (h != nullptr && !pow_ok(*h)) return fail(AttemptEnd::Header, "a header's PoW at its own t_origin");
+        }
+        pow_lo_ = from;
         return true;
     }
 
@@ -1045,45 +1108,57 @@ private:
         }
         if (short_headers(r, max, rep_.L)) return fail(AttemptEnd::NotServed, "a short FC_HEADERS reply");
         if (r.first_pos == 0) return fail(AttemptEnd::NotServed, "a header at position 0");
-        return take_headers(r, std::nullopt);
+        if (!take_headers(r, std::nullopt)) return false;
+        // (5) on the top page: x0 is not known, so every held header is a candidate (a no-PoW server is caught here)
+        return check_span_pow(lo_pos_);
     }
 
-    // 3.3 step 2a / 3.3a (4): L held by A, else the fork of L with A's chain
-    // (the newest candidate header on A's best chain), from the hash links
-    // before any body.
+    // 3.3a (4) / ruling 47 (E-82): the fork of L with A's best chain, scanned over
+    // the headers held down to the retarget-prefix start x0(L') - N_rt (fetched
+    // by bounds()), never below it. "L held by A" (any node) is tested before
+    // bounds(). The newest candidate header on A's best chain is the fork: at or
+    // below A's x1, or below A's base -> deep, in scope; above both -> out of
+    // scope. If no candidate header lies on A's chain down to the floor, the
+    // fork is below it and the candidate is in scope (rule (4) decides).
     bool in_scope() {
-        for (;;) {
-            for (std::uint64_t x = rep_.L + 1; x-- > lo_pos_;) {
-                const Hash32 id = receipt_id(header_at(x)->own);
-                if (x == rep_.L && a_->holds(id)) return fail(AttemptEnd::OutOfScope, "L held by A");
-                if (!a_->on_chain(id)) continue;
-                const std::uint64_t f = a_->pos_of(id).value_or(x);
-                const std::optional<std::uint64_t> ax1 = a_->joined_x1();
-                const bool deep = (ax1 && f <= *ax1) || f < a_->store_base();
-                return deep ? true : fail(AttemptEnd::OutOfScope, "the fork lies above A's x1 and at or above its base");
-            }
-            // the fork lies below the lowest held header
-            const std::uint64_t below = lo_pos_ - 1;
+        if (rep_.L == 0) return true;  // an empty / position-0 candidate
+        for (std::uint64_t x = rep_.L + 1; x-- > lo_pos_;) {
+            const Hash32 id = receipt_id(header_at(x)->own);
+            if (!a_->on_chain(id)) continue;
+            const std::uint64_t f = a_->pos_of(id).value_or(x);
             const std::optional<std::uint64_t> ax1 = a_->joined_x1();
-            if ((ax1 && below <= *ax1) || below < a_->store_base()) return true;
-            if (lo_pos_ <= 1) return true;
-            if (!more_headers()) return false;
+            const bool deep = (ax1 && f <= *ax1) || f < a_->store_base();
+            return deep ? true : fail(AttemptEnd::OutOfScope, "the fork lies above A's x1 and at or above its base");
         }
+        return true;  // ruling 47: the links reach x0(L') - N_rt without meeting A's chain; the fork lies below, in scope
     }
 
     // ---- span ----
     bool bounds() {
+        if (force_young_) {  // the ruling-47 fallback: the whole chain [1, L] verified in full, no claim
+            while (lo_pos_ > 1)
+                if (!more_headers(1)) return false;
+            if (!check_span_pow(1)) return false;
+            rep_.span = SpanBounds{true, 0, 1, 1};
+            return true;
+        }
         for (;;) {
-            const SpanResult s = span_bounds(in_.p, rep_.L, [this](std::uint64_t x) { return rec(x); });
+            const SpanResult s = span_bounds(in_.p, rep_.L, [this](std::uint64_t x) { return rec(x); }, in_.b0);
             if (pr_unresolved_) return fail(AttemptEnd::NotServed, "a header's P_r not resolved");
             std::uint64_t need_lo = 1;
             if (s.status == SpanStatus::Ok) {
                 rep_.span = s.bounds;
+                if (!s.bounds.young) {
+                    x0_known_ = true;  // below x0 the PRE is hash-linked, no PoW (header check (5))
+                    x0_ = s.bounds.x0;
+                }
                 const std::uint64_t nrt = join_n_rt(in_.p);
                 const std::uint64_t want = s.bounds.young ? 1 : (s.bounds.x0 > nrt ? s.bounds.x0 - nrt : 1);
-                if (lo_pos_ <= want) return true;  // the retarget prefix (the whole chain on a young one) held
-                need_lo = want;                    // the PRE: no header below x0 - N_rt asked
+                need_lo = want;                    // the PRE: no header below x0 - N_rt asked (the retarget-prefix floor)
             }
+            // (5) on the span held so far (floor = x0 once known, else every held header): the PRE below x0 is exempt
+            if (!check_span_pow(x0_known_ ? x0_ : lo_pos_)) return false;
+            if (s.status == SpanStatus::Ok && lo_pos_ <= need_lo) return true;  // the span (or whole young chain) held
             if (lo_pos_ <= 1) {
                 if (s.status == SpanStatus::Ok) return true;
                 return fail(AttemptEnd::NotServed, "the records do not reach the span");
@@ -1193,8 +1268,18 @@ private:
             peaks = *fa.peaks;
             root_s = *fa.s_parent;
         }
+        // the PRE headers below the root [pre_lo, x0 - 2] as claimed nodes of the joined tree (ruling 47, E-84)
+        std::vector<CarrierTree::PreNode> pre_nodes;
+        if (x0 > 1) {
+            for (std::uint64_t x = pre_lo; x + 1 < x0; ++x) {
+                const CarrierHeader* hh = header_at(x);
+                const std::optional<std::uint64_t> xh = h_of(hh->own);
+                if (!xh) return fail(AttemptEnd::NotServed, "a retarget-prefix header's P_r not resolved");
+                pre_nodes.push_back(CarrierTree::PreNode{receipt_id(hh->own), x, *xh, *rec(x), hh->own.side.t_origin});
+            }
+        }
         // the tree, the store, AR
-        s.tree.emplace(CarrierTree::joined(in_.p, root_id, x0 - 1, root_h, root_s, in_.T, pre, in_.rp));
+        s.tree.emplace(CarrierTree::joined(in_.p, root_id, x0 - 1, root_h, root_s, in_.T, pre, in_.rp, pre_nodes));
         BinStore::JoinedStart js;
         js.b0 = in_.b0;
         js.first_pos = x0 == 1 ? 0 : pre_lo;
@@ -1282,6 +1367,53 @@ private:
         return true;
     }
 
+    // ruling 47 (E-83): a carried receipt of c whose tip lies on a side branch
+    // forking at a PRE node f below x0 - 1 cannot be folded without S(f). The
+    // joiner fetches S(f) from the attempt's server by FC_GETBUCKETS at = the
+    // side branch's first carrier (whose S_parent = S(f)) and sets the fork
+    // node's claimed ratchet state, then re-admits c.
+    enum class SpanFold : std::uint8_t { None, Fetched, Young, Alarm, NotServed };
+    SpanFold try_span_fold(const CarrierBodyV3& c) {
+        JoinedState& s = *st_;
+        if (s.young || !s.tree || !s.store) return SpanFold::None;
+        const std::uint64_t root_pos = s.x0 > 0 ? s.x0 - 1 : 0;
+        const std::uint64_t first_pos = s.store->first_record_pos();
+        for (const ReceiptBodyV3& r : c.carried) {
+            const Hash32 t = r.side.tip;
+            if (s.tree->find(t) != nullptr) continue;          // on the joined chain, or already placed
+            if (!span_s_done_.insert(t).second) continue;      // S(f) for this side branch already attempted
+            const std::vector<const HeaderVariant*> vs = s.headers.variants(t);
+            if (vs.empty()) continue;                          // the side header is not held (the TipHeaders path fetches it)
+            const CarrierHeader& y = vs.front()->header;
+            const CarrierNode* fn = s.tree->find(y.own.side.tip);  // the fork: the first side carrier's parent
+            if (fn == nullptr || fn->pos >= root_pos || fn->pos < first_pos) continue;  // not a PRE node below the root
+            const std::uint64_t lc = bin_leaf_count(fn->H, in_.b0, in_.p.open_bins);
+            if (lc == 0) return SpanFold::Young;               // no bin sealed at or before f (ruling 47): the young path
+            std::vector<Hash32> cids;
+            if (y.n_carried > 0) {
+                const std::vector<const BodySet*> bs = s.headers.body_sets(t);
+                if (!bs.empty())
+                    for (const ReceiptBodyV3& b : bs.front()->bodies) cids.push_back(receipt_id(b));
+            }
+            const AtHeader at_t{t, join_detail::digest_of(y).value_or(Hash32{})};
+            const BucketsAnchor anchor{true, fn->H, y.own.side.mmr_root, y.own.side.receipts_root, cids};
+            const std::uint64_t bin = in_.b0 + lc - 1;
+            const BucketsFetch f = jb_.fetch(link_, anchor, at_t, bin, bin, timeout_);
+            for (const auto& [id, k] : f.refs) s.refs.emplace(id, k);
+            if (f.end == BucketsEnd::AtClaim) {
+                s.alarm.raise(RowId::None, Basis::ClaimSpan, Hash32{}, Missing::ClaimAlarm);
+                return SpanFold::Alarm;
+            }
+            if (f.end == BucketsEnd::Struck) {
+                rep_.strike += f.strike;
+                return SpanFold::NotServed;
+            }
+            if (!f.s_parent) return SpanFold::NotServed;
+            if (s.tree->set_claimed_rs(y.own.side.tip, *f.s_parent)) return SpanFold::Fetched;
+        }
+        return SpanFold::None;
+    }
+
     // Admits and places one frame, fetching what its DEFERs name from the
     // attempt's server and placing the walked side carriers (claims) first.
     bool place(const CarrierBodyV3& c0, CarrierRole role0, std::uint64_t x) {
@@ -1363,8 +1495,19 @@ private:
                     if (pushed == 0) return fail(AttemptEnd::Unplaceable, "nothing to place");
                     break;
                 }
+                case Missing::Closure: {
+                    // ruling 47: a side branch forking at a PRE node below x0 - 1 needs S(f) from the attempt's server
+                    const SpanFold sf = try_span_fold(it.c);
+                    if (sf == SpanFold::Fetched) break;  // re-admit with the fork node's S(f) set
+                    if (sf == SpanFold::Young) {
+                        rep_.force_young = true;
+                        return fail(AttemptEnd::NotServed, "S(f) at a fork with no sealed bin: the young path");
+                    }
+                    if (sf == SpanFold::Alarm) return fail(AttemptEnd::Alarm, "the S(f) fold against the side carrier");
+                    if (sf == SpanFold::NotServed) return fail(AttemptEnd::NotServed, "the S(f) fetch not served");
+                    return fail(AttemptEnd::Unplaceable, "a span carrier deferred with nothing to fetch");
+                }
                 case Missing::Boundary:
-                case Missing::Closure:
                 case Missing::EpochGrace: return fail(AttemptEnd::Unplaceable, "a span carrier deferred with nothing to fetch");
                 case Missing::MoneroBlock:
                 case Missing::Seed:
@@ -1458,7 +1601,14 @@ private:
     std::vector<std::uint64_t> records_;
     std::uint64_t rec_lo_ = 0;
     bool pr_unresolved_ = false;  // a held header's P_r not resolved: the attempt ends
+    std::set<Hash32> phase_ids_;  // ids seen in the header phase (header check (2))
+    std::optional<std::uint64_t> lo_h_;  // h at the current lowest held header (header check (4) at a page boundary)
+    bool x0_known_ = false;       // x0 fixed by bounds(): below it the PRE is hash-linked, no PoW (header check (5))
+    std::uint64_t x0_ = 0;
+    std::uint64_t pow_lo_ = 0;    // the lowest position (5)-checked so far (0 = none)
+    bool force_young_ = false;    // the young path forced by the pair's mark (the ruling-47 fallback)
     std::map<Hash32, CarrierBodyV3> span_bodies_;
+    std::set<Hash32> span_s_done_;  // side carriers whose S(f) fetch was attempted (ruling 47)
     AtHeader at_x0_{};
     BucketsAnchor anchor_x0_{};
 };
@@ -1528,14 +1678,22 @@ public:
         if (li == links_.end()) return run_next();
         JoinAttempt att(in_, *li->second, timeout_, a(), on_step_);
         att.set_known([this](const Hash32& tip) { return known_.count(tip) != 0; });
+        att.set_force_young(p->young);
         AttemptReport rep = att.run(p->candidate);
         switch_ = SwitchReport{};
         switch (rep.end) {
             case AttemptEnd::Completed: complete(rep); break;
-            case AttemptEnd::NotServed: queue_.requeue(*p); break;
+            case AttemptEnd::NotServed: {
+                // ruling 47: the pair's next attempt runs the young path (the mark rides the queue)
+                AttemptQueue::Pair q = *p;
+                q.young = q.young || rep.force_young;
+                queue_.requeue(q);
+                break;
+            }
             case AttemptEnd::Alarm:
             case AttemptEnd::Contradiction:
-            case AttemptEnd::Unplaceable: queue_.exclude(p->server); break;
+            case AttemptEnd::Unplaceable:
+            case AttemptEnd::Header: queue_.exclude(p->server); break;
             case AttemptEnd::OutOfScope:
             case AttemptEnd::Known: break;
         }

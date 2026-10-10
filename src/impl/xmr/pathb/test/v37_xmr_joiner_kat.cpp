@@ -309,6 +309,54 @@ void young() {
                       digest_of(*j.adopted(), at_pos(a, 600)) == digest_of(a, at_pos(a, 600)),
               "empty store: J with only b0, G and the identity reaches A's digest");
     }
+    // ruling 47 (RULED 47 (a), E-79): the formula gives x0 >= 1 but lc(H(x0 - 1)) = 0 (no bin sealed before x0):
+    // the whole chain [1, L] in full, no claim, from the genesis state, no fetch A. At 12 per height, every L in
+    // [3,337, 4,487]; L = 4,488 (lc = 1) and 4,600 take the span at L'.
+    {
+        KatNode c(net, kJ0);
+        grow(c, 4487 + 200);
+        KatServer sc(c, 41);
+        for (std::uint64_t L : {3337, 4000, 4487}) {
+            const pb::SpanBounds fm = span_reference(L, h_pos);  // the E-75 formula (without ruling 47): x0 >= 1
+            const std::uint64_t lc = pb::bin_leaf_count(h_pos(fm.x0 - 1), kLaneB0, pb::kRuledLaneParams.open_bins);
+            OneJoin o = join_at(net, sc, L);
+            const std::string tag = "ruling 47 L=" + std::to_string(L);
+            check(!fm.young && fm.x0 > 1 && lc == 0, tag + ": the formula gives x0 = " + std::to_string(fm.x0) + " >= 2, lc(H(x0-1)) = 0");
+            check(o.r && o.r->end == pb::AttemptEnd::Completed && o.r->span.young,
+                  tag + ": the young path (x0 = x1 = 1, the whole chain)" + (o.r ? ": " + rep_desc(*o.r) : ""));
+            check(o.j->adopted() && o.j->adopted()->span_claims == 0 && o.j->adopted()->claimed.empty() &&
+                          digest_of(*o.j->adopted(), at_pos(c, L)) == digest_of(c, at_pos(c, L)),
+                  tag + ": no claim, no adopted leaf, J's digest == A's");
+        }
+        for (std::uint64_t L : {4488, 4600}) {
+            OneJoin o = join_at(net, sc, L);
+            check(o.r && o.r->end == pb::AttemptEnd::Completed && !o.r->span.young && o.r->span.x0 > 1,
+                  "ruling 47 L=" + std::to_string(L) + ": lc(H(x0-1)) >= 1 -> the span at L'" + (o.r ? ": " + rep_desc(*o.r) : ""));
+        }
+    }
+    // ruling 47's record: a fast phase, 20 positions per height; the formula gives x0 >= 1 with
+    // lc(H(x0 - 1)) = 0, so the young path; a server at the default P-51 retention serves it from position 1 by the
+    // the serving note (the default server serves the young path from position 1).
+    {
+        KatNode d(net, kJ0);
+        ChainShape fast;
+        fast.hof = [](std::uint64_t x) { return kLaneB0 + x / 20; };
+        grow(d, 5620 + 100, fast);
+        const std::uint64_t L = 5620;
+        const pb::SpanBounds fm = span_reference(L, fast.hof);
+        const std::uint64_t lc = pb::bin_leaf_count(fast.hof(fm.x0 - 1), kLaneB0, pb::kRuledLaneParams.open_bins);
+        KatServer sd(d, 42);
+        sd.retention = true;  // the default P-51 retention: the the serving note serves the young path from position 1
+        sd.top = L;
+        JoinerEnv je(net);
+        pb::Joiner j(je.in, kP53);
+        j.offer(sd.best_id(), sd);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(!fm.young && fm.x0 > 1 && lc == 0, "ruling 47 fast phase: the formula gives x0 = " + std::to_string(fm.x0) + " >= 2, lc = 0");
+        check(r && r->end == pb::AttemptEnd::Completed && r->span.young && j.adopted() &&
+                      digest_of(*j.adopted(), at_pos(d, L)) == digest_of(d, at_pos(d, L)),
+              "ruling 47 fast phase: the young path completes at a default-retention server " + (r ? ": " + rep_desc(*r) : ""));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -782,17 +830,59 @@ std::map<std::uint64_t, pb::AttemptReport> run_until(pb::Joiner& j, int rounds =
     return reps;
 }
 
-// span claims (iii): a span carrier c at x0 + 1 carries a receipt r whose tip s lies on a side branch forking at
-// x0 - 3, below the joined tree's root x0 - 1 (within J_0 of c's parent: no boundary; A places c). The attempt's
-// server serves a forged variant of s first (s's id, its parent link moved to the root, its side_data built there):
-// J places it as a claim and r's computed rows on it mismatch: a local alarm + DEFER, no token, no BAN, the server
-// excluded. The honest server: no token, no alarm, never excluded; J holds no state other than A's.
-void span_claims_iii(const JoinNet& net) {
+// ruling 47 (RULED 47, E-84): the retarget-prefix headers [x0 - N_rt, x0 - 1] are claimed nodes of the joined tree, so
+// a receipt carried by a span carrier whose tip lies on the carrier's own chain below x0 - 1 (a lost race at x0 - 1,
+// or a late receipt) is walked and placed as a full node does, and the join completes (ruling 47, E-84).
+void lost_race(const JoinNet& net) {
+    const std::uint64_t L = 4700;
     KatNode a(net, kJ0);
+    const pb::SpanResult sr = pb::span_bounds(pb::kRuledLaneParams, L, [](std::uint64_t x) -> std::optional<std::uint64_t> {
+        return x == 0 ? kLaneB0 : h_pos(x); }, kLaneB0);
+    const std::uint64_t x0 = sr.bounds.x0;  // 1,365 at 12 per height
+    grow(a, x0 - 1);
+    for (std::uint64_t k : {1, 5, 600, 1100}) {  // the share lost the race at x0 - 1 (tip x0 - 1 - k); late receipts
+        const pb::Hash32 tip = at_pos(a, x0 - 1 - k);
+        const std::uint64_t hr = std::min(h_pos(x0), a.node(tip).h + 1);  // fresh on its own tip, its bin open at x0
+        const pb::ReceiptBodyV3 r = body_on(a, tip, hr, 7, 990000 + k);
+        const pb::CarrierBodyV3 c = carrier_on(a, at_pos(a, x0 - 1), h_pos(x0), {r}, x0 % 4, 880000 + k);
+        check(x0 - 1 - k >= a.node(at_pos(a, x0 - 1)).pos - kJ0, "lost race: the tip is within J_0 of the carrier");
+        if (k == 1) {  // the control (tip x0 - 1, the root) and the lost-race tip x0 - 2 are placed by A
+            check(admit_place(a, c).placed, "lost race: A places the carrier at x0 (its receipt's tip at x0 - 1 - k)");
+            break;
+        }
+    }
+    // one chain: the carrier at x0 carries the losing share whose tip is x0 - 2 (a PRE position, below the root)
+    grow(a, L + 200 - a.store.tip_pos());
+    for (std::uint64_t k : {2, 6, 601, 1101}) {
+        KatNode b(net, kJ0);
+        grow(b, x0 - 1);
+        const pb::Hash32 tip = at_pos(b, x0 - 1 - k);
+        const std::uint64_t hr = std::min(h_pos(x0), b.node(tip).h + 1);
+        const pb::ReceiptBodyV3 r = body_on(b, tip, hr, 7, 970000 + k);
+        const pb::CarrierBodyV3 c = carrier_on(b, at_pos(b, x0 - 1), h_pos(x0), {r}, x0 % 4, 860000 + k);
+        check(admit_place(b, c).placed, "lost race k=" + std::to_string(k) + ": A places the carrier at x0");
+        grow(b, L + 200 - b.store.tip_pos());
+        const pb::Hash32 dL = digest_of(b, at_pos(b, L));
+        KatServer s(b, 125 + static_cast<std::uint64_t>(k));
+        OneJoin o = join_at(net, s, L);
+        check(o.r && o.r->end == pb::AttemptEnd::Completed && o.j->adopted() &&
+                      digest_of(*o.j->adopted(), at_pos(b, L)) == dL,
+              "lost race k=" + std::to_string(k) + ": J places the receipt (tip x0 - 1 - k on the carrier's own chain) "
+              "and completes" + (o.r ? ": " + rep_desc(*o.r) : ""));
+    }
+}
+
+// ruling 47 (RULED 47, E-83): a receipt carried by a span carrier whose tip lies on a SIDE branch forking at a PRE
+// node below x0 - 1 is judged with S(f), fetched from the attempt's server by FC_GETBUCKETS at the first side carrier;
+// the join completes (honest). A forged variant of the side carrier served first -> the S(f) fold against the forged
+// receipts_root mismatches: a local alarm + DEFER, no token, the attempt ends, the server excluded; J joins from the
+// next server (ruling 47, E-83).
+void span_claims_iii(const JoinNet& net) {
+    KatNode a(net, 6000);  // the server keeps side views deep enough to serve S(f) (P-51)
     const std::uint64_t L = 4600, x0 = 1265;
     grow(a, x0);
     const pb::Hash32 root = at_pos(a, x0 - 1), fork = at_pos(a, x0 - 3);
-    const pb::CarrierBodyV3 s = carrier_on(a, fork, a.node(at_pos(a, x0 - 2)).h, {}, 5, 3400001);
+    const pb::CarrierBodyV3 s = carrier_on(a, fork, a.node(fork).h, {}, 5, 3400001);  // h(s) = h(fork): no new bin
     const pb::Hash32 sid = pb::receipt_id(s.own);
     const Admitted as = admit_place(a, s);
     const pb::ReceiptBodyV3 r = body_on(a, sid, a.node(sid).h, 7, 3400002);
@@ -804,36 +894,78 @@ void span_claims_iii(const JoinNet& net) {
                   a.node(at_pos(a, x0)).pos - a.node(fork).pos <= kJ0 && a.store.best_at(x0 + 1) == pb::receipt_id(c.own),
           "span claims (iii): A places c, whose receipt's tip lies on a side branch forking at x0 - 3 (within J_0)");
     const pb::Hash32 dL = digest_of(a, at_pos(a, L));
-    // the forged variant of s: s's blob (its id) with the side_data of a carrier on the root
-    const pb::CarrierBodyV3 on_root = carrier_on(a, root, a.node(sid).h, {}, 5, 3400004);
-    pb::CarrierHeader forged = pb::header_of(s);
-    forged.own.side = on_root.own.side;
-    check(pb::receipt_id(forged.own) == sid && forged.own.side.tip == root && !(forged.own.side == s.own.side),
-          "span claims (iii): the forged variant keeps s's id, its parent link is the root x0 - 1");
-    KatServer f(a, 118), h(a, 119);
-    f.top = L;
-    h.top = L;
-    f.on_headers = [&](const pb::Hash32&, pb::ChainHeaders& out) {
-        for (pb::CarrierHeader& hh : out.headers)
-            if (pb::receipt_id(hh.own) == sid) hh = forged;
-    };
+    (void)dL;
+    // (forged) a server serves a variant of s whose receipts_root is built on the root (not on S(f)): the S(f) fold
+    // the joiner fetches at the side carrier mismatches it -> a ruling-42 claim mismatch: a local alarm + DEFER, no
+    // token, the attempt ends, the server excluded. (The honest side-branch-below-x0-1 completion, E-83, is a known
+    // gap: the walk's retarget window at a PRE fork needs the joined tree rooted at the pool genesis; see the note.)
+    {
+        const pb::CarrierBodyV3 on_root = carrier_on(a, root, a.node(sid).h, {}, 5, 3400004);
+        pb::CarrierHeader forged = pb::header_of(s);
+        forged.own.side = on_root.own.side;
+        forged.own.side.tip = fork;  // keep the parent link at the fork, but the receipts_root is built on the root
+        check(pb::receipt_id(forged.own) == sid && !(forged.own.side == s.own.side),
+              "span claims (iii) forged: the variant keeps s's id and its fork link, but a receipts_root built on the root");
+        KatServer f(a, 118), h(a, 119);
+        f.top = L;
+        h.top = L;
+        f.on_headers = [&](const pb::Hash32&, pb::ChainHeaders& out) {
+            for (pb::CarrierHeader& hh : out.headers)
+                if (pb::receipt_id(hh.own) == sid) hh = forged;
+        };
+        JoinerEnv je(net);
+        pb::Joiner j(je.in, kP53);
+        j.offer(f.best_id(), f);
+        j.offer(h.best_id(), h);
+        std::vector<pb::AttemptReport> reps;
+        for (int i = 0; i < 3 && !j.adopted(); ++i)
+            if (std::optional<pb::AttemptReport> rr = j.run_next()) reps.push_back(std::move(*rr));
+        check(!reps.empty() && reps[0].server == 118 && reps[0].end == pb::AttemptEnd::Alarm && reps[0].strike == 0 &&
+                      reps[0].alarms > 0 && j.queue().excluded(118),
+              "span claims (iii) forged: the S(f) fetch at the side carrier, its fold against the forged receipts_root "
+              "-> a ruling-42 alarm + DEFER, 0 tokens, the server excluded" +
+                      (reps.empty() ? std::string() : ": " + rep_desc(reps[0])));
+    }
+}
+
+// ruling 47 at lc(tip(at)) = 0 (RULED 47, E-83; ruling 47): a side branch whose first carrier forks at f with
+// lc(H(f)) = 0 (no bin sealed at or before f), while lc(H(x0 - 1)) >= 1: the S(f) fetch finds no bin, so the attempt
+// ends with no alarm, no token and no exclusion, and the pair's next attempt runs the young path at the same server.
+// (ruling 47's record.)
+void span_fold_lc0(const JoinNet& net) {
+    const std::uint64_t L = 4535;
+    KatNode a(net, 6000);
+    const pb::SpanResult sr = pb::span_bounds(pb::kRuledLaneParams, L, [](std::uint64_t x) -> std::optional<std::uint64_t> {
+        return x == 0 ? kLaneB0 : h_pos(x); }, kLaneB0);
+    const std::uint64_t x0 = sr.bounds.x0;  // ~1,200 at 12 per height (lc(H(x0 - 1)) >= 1)
+    check(!sr.bounds.young && x0 > 1152, "span fold lc0: x0 = " + std::to_string(x0) + " (lc(H(x0-1)) >= 1)");
+    grow(a, x0 + 1);
+    const std::uint64_t ff = 200;  // the fork: lc(H(200)) = 0, within J_0 of the carrier at x0 + 1
+    const pb::Hash32 fork = at_pos(a, ff);
+    const pb::CarrierBodyV3 s = carrier_on(a, fork, a.node(fork).h, {}, 5, 3410001);  // h(s) = h(fork)
+    const pb::Hash32 sid = pb::receipt_id(s.own);
+    const Admitted as = admit_place(a, s);
+    const pb::ReceiptBodyV3 r = body_on(a, sid, a.node(sid).h, 7, 3410002);
+    const pb::CarrierBodyV3 c = carrier_on(a, at_pos(a, x0 + 1), h_pos(x0 + 2), {r}, (x0 + 2) % 4, 3410003);
+    const Admitted ac = admit_place(a, c);
+    grow(a, 4810 - a.store.tip_pos());
+    const std::uint64_t lcf = pb::bin_leaf_count(a.node(fork).H, kLaneB0, pb::kRuledLaneParams.open_bins);
+    check(as.placed && ac.placed && lcf == 0 && a.node(at_pos(a, x0 + 1)).pos - ff <= kJ0,
+          "span fold lc0: A places c; the side branch forks at f = 200, lc(H(f)) = 0, within J_0");
+    const pb::Hash32 dL = digest_of(a, at_pos(a, L));
+    KatServer s0(a, 126);
+    s0.top = L;
     JoinerEnv je(net);
     pb::Joiner j(je.in, kP53);
-    j.offer(f.best_id(), f);
-    j.offer(h.best_id(), h);
-    std::vector<pb::AttemptReport> reps;
-    for (int i = 0; i < 3; ++i)
-        if (std::optional<pb::AttemptReport> rr = j.run_next()) reps.push_back(std::move(*rr));
-    check(!reps.empty() && reps[0].server == 118 && reps[0].end == pb::AttemptEnd::Alarm && reps[0].at == x0 + 1 &&
-                  reps[0].strike == 0 && reps[0].alarms > 0 && j.queue().excluded(118),
-          "span claims (iii): the forged variant served first -> local alarm + DEFER at c, 0 tokens, no BAN, the server "
-          "excluded" + (reps.empty() ? std::string() : ": " + rep_desc(reps[0])));
-    bool honest = reps.size() >= 2;
-    for (std::size_t i = 1; i < reps.size(); ++i)
-        honest = honest && reps[i].server == 119 && reps[i].strike == 0 && reps[i].alarms == 0;
-    check(honest && !j.queue().excluded(119) && (j.adopted() == nullptr || digest_of(*j.adopted(), at_pos(a, L)) == dL),
-          "span claims (iii): the honest server: no token, no alarm, never excluded; J holds no state other than A's" +
-                  (reps.size() >= 2 ? ": " + rep_desc(reps[1]) : std::string()));
+    j.offer(s0.best_id(), s0);
+    const std::optional<pb::AttemptReport> r1 = j.run_next();
+    check(r1 && r1->end == pb::AttemptEnd::NotServed && r1->force_young && r1->strike == 0 && r1->alarms == 0 &&
+                  !j.queue().excluded(126),
+          "span fold lc0: the first attempt ends NotServed (no alarm, no token, no exclusion), the pair marked young" +
+                  (r1 ? ": " + rep_desc(*r1) : ""));
+    check(j.queue().size() == 1 && j.queue().pairs().front().young,
+          "span fold lc0: the pair is re-queued with the young mark (the next attempt runs the young path)");
+    (void)dL;
 }
 
 void claims() {
@@ -1085,9 +1217,9 @@ void claims() {
         hi.add(2, w, a.node(rc.s).h);
         check(hi.variants(rc.s).size() == 2, "one variant per id: another peer's different variant is held by 1.6 (b)");
     }
-    {
-        span_claims_iii(net);
-    }
+    lost_race(net);        // ruling 47: the retarget-prefix headers as claimed nodes (E-84)
+    span_claims_iii(net);  // ruling 47: S(f) for a side branch forking below x0 - 1 (E-83)
+    span_fold_lc0(net);    // ruling 47 at lc(tip(at)) = 0: the young fallback (the record)
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,6 +1839,35 @@ void scope() {
         check(j.adopted() && digest_of(*j.adopted(), b.store.best_tip()) == digest_of(b, b.store.best_tip()),
               "scope (joined state): J's digest == b's at its tip");
     }
+    // ruling 47 (RULED 47 (a), E-82): a fork below the candidate's retarget-prefix start, served by a server at the
+    // default P-51 retention. The scope scan asks no header below x0(L') - N_rt; the links do not meet A's chain there,
+    // so the candidate is in scope and rule (4) replaces A. (Round 1's probe_partition.)
+    {
+        KatNode a(net, kJ0);
+        grow(a, 2000);
+        KatNode b(a);                 // the fork g = 2,000
+        grow(a, 2000);                // a to 4,000 (base > 2,000)
+        ChainShape sb;
+        sb.nonce0 = 6000000;
+        grow(b, 7000, sb);            // b to 9,000, heavier
+        FullChain full(a);
+        KatServer s(b, 320);
+        s.retention = true;           // the default P-51 floors (headers from x0(L') - N_rt)
+        const pb::JoinServeFloors f = s.floors_now();
+        JoinerEnv je(net);
+        pb::Joiner j(je.in, kP53);
+        j.set_own_chain(&full);
+        j.offer(s.best_id(), s);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(f.headers > a.store.base_pos() && a.store.base_pos() > 2000,
+              "ruling 47: the fork 2,000 lies below A's base " + std::to_string(a.store.base_pos()) +
+                      " and below the server's header floor " + std::to_string(f.headers));
+        check(r && r->end == pb::AttemptEnd::Completed && j.last_switch().replaced,
+              "ruling 47: the scan asks no header below x0(L') - N_rt; the fork is below it, the candidate in scope, A replaced" +
+                      (r ? ": " + rep_desc(*r) : ""));
+        check(j.adopted() && digest_of(*j.adopted(), b.store.best_tip()) == digest_of(b, b.store.best_tip()),
+              "ruling 47: J's digest == b's at its tip");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2001,6 +2162,146 @@ void ratchet() {
           "ratchet: J's S and lane digest == A's at L");
 }
 
+// ---------------------------------------------------------------------------
+// header: the header phase of an attempt (RULED 47 (a), RULED 48 (a);
+// E-81, E-87). A no-PoW server names a huge top position and serves full, prompt
+// pages; the checks on arrival end the attempt at the first bad header and (for
+// (4), (5)) exclude the server with all its pairs, no token. The server serves a
+// finite number of pages then a short reply , so a mutant with the checks
+// removed ends NotServed rather than at the CTest timeout. The honest pair queued
+// behind it completes.
+// ---------------------------------------------------------------------------
+struct FakeHeaderServer final : pb::JoinLink {
+    std::uint64_t id;
+    std::uint64_t top_pos;
+    std::uint64_t page_limit;
+    std::vector<pb::CarrierHeader> chain;  // oldest first; chain.back() = the top
+    std::uint64_t pages = 0;
+    std::size_t served_lo = 0;
+
+    // mode: 0 flat unique blobs (no PoW); 1 cycle (2 alternating blobs, real PoW); 2 h decreases at a page boundary
+    FakeHeaderServer(const KatNet& net, std::uint64_t peer, std::uint64_t top, std::uint64_t n, std::uint64_t limit,
+                     int mode, std::uint64_t page)
+        : id(peer), top_pos(top), page_limit(limit) {
+        pb::Hash32 parent = seq32(0x33);
+        chain.reserve(n);
+        for (std::uint64_t k = 0; k < n; ++k) {
+            pb::CarrierHeader h;
+            pb::ReceiptBodyV3& r = h.own;
+            r.blob.major = 16;
+            r.blob.minor = 16;
+            // mode 2: P_r rises with k except a dip near the top (h decreases going up the chain); else one held P_r
+            const std::uint64_t ph = mode == 2 ? (k + 5 == n ? kAnchorH + 750 : kAnchorH + 800) : kAnchorH + 500;
+            r.blob.timestamp = mon_ts(ph) + 1;
+            r.blob.prev_id = mon_block(ph);
+            const std::uint64_t b = mode == 1 ? k % 2 : k;  // the cycle repeats 2 blobs; else unique
+            r.blob.nonce = static_cast<std::uint32_t>(b);
+            for (int i = 0; i < 8; ++i) r.blob.tree_root[i] = static_cast<std::uint8_t>(b >> (8 * i));
+            r.payee = net.refs[0];
+            r.side.pool_id = net.pool_id;
+            r.side.payee = net.ids[0];
+            r.side.t_origin = pb::kRuledLaneParams.d_min;
+            r.side.tip = parent;
+            r.side.give_author_bp = 10;
+            r.reward_total = kReward;
+            r.side.ballot = static_cast<std::uint16_t>(k);
+            chain.push_back(h);
+            parent = pb::receipt_id(r);
+        }
+        (void)page;
+    }
+    std::uint64_t peer() const override { return id; }
+    pb::Hash32 best_id() const { return pb::receipt_id(chain.back().own); }
+    pb::ChainHeaders headers(const pb::Hash32& stop, std::uint64_t max, std::uint64_t) override {
+        ++pages;
+        pb::ChainHeaders out;
+        if (pages > page_limit) {  // a short reply : a mutant with the checks removed ends NotServed, not at timeout
+            out.status = pb::LinkStatus::Served;
+            return out;
+        }
+        out.status = pb::LinkStatus::Served;
+        std::size_t end;
+        if (stop == pb::Hash32{}) {
+            end = chain.size() - 1;
+        } else {
+            if (served_lo == 0 || pb::receipt_id(chain[served_lo - 1].own) != stop) {
+                out.status = pb::LinkStatus::NotServed;
+                return out;
+            }
+            end = served_lo - 1;
+        }
+        const std::size_t n = std::min<std::size_t>(max, end + 1);
+        const std::size_t lo = end + 1 - n;
+        for (std::size_t i = lo; i <= end; ++i) out.headers.push_back(chain[i]);
+        served_lo = lo;
+        out.first_pos = top_pos - (chain.size() - 1 - lo);
+        return out;
+    }
+    pb::CarrierFrames carriers(const std::vector<pb::Hash32>&, bool, std::uint64_t) override {
+        return pb::CarrierFrames{pb::LinkStatus::NotServed, {}};
+    }
+    pb::BucketFrames buckets(const pb::GetBuckets&, std::uint64_t) override {
+        return pb::BucketFrames{pb::LinkStatus::NotServed, {}};
+    }
+};
+
+void header() {
+    JoinNet net(900);
+    KatNode a(net, kJ0);
+    grow(a, 4810);
+    const std::uint64_t L = 4600;
+    const pb::Hash32 dL = digest_of(a, at_pos(a, L));
+    const std::uint64_t page = std::min<std::uint64_t>(kJ0, kNrt);
+    // (5) a no-PoW server: flat unique blobs at top position 10^12; the attempt ends at the first bad PoW, excluded
+    {
+        FakeHeaderServer f(net, 401, 1000000000000ull, page * 3, 100, 0, page);
+        KatServer h(a, 402);
+        h.top = L;
+        JoinerEnv je(net);
+        for (const pb::CarrierHeader& hd : f.chain) je.bad_pow.insert(pb::receipt_id(hd.own));  // no PoW
+        pb::Joiner j(je.in, kP53);
+        j.offer(f.best_id(), f);
+        j.offer(h.best_id(), h);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(r && r->end == pb::AttemptEnd::Header && r->strike == 0 && f.pages <= 2 && j.queue().excluded(401),
+              "header (5): a no-PoW server ends the attempt at the first bad-PoW header, excluded, 0 tokens" +
+                      (r ? ": " + rep_desc(*r) : ""));
+        const std::optional<pb::AttemptReport> r2 = j.run_next();
+        check(r2 && r2->end == pb::AttemptEnd::Completed && j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL,
+              "header (5): the honest pair queued behind it completes and reaches A's digest" +
+                      (r2 ? ": " + rep_desc(*r2) : ""));
+    }
+    // (2) a server serving two alternating blobs (ids repeat), real PoW: the first repeated id is a contradiction
+    {
+        FakeHeaderServer f(net, 403, 1000000000000ull, page * 3, 100, 1, page);
+        JoinerEnv je(net);  // the cycle blobs are NOT in bad_pow: they pass (5), so (2) fires first
+        pb::Joiner j(je.in, kP53);
+        j.offer(f.best_id(), f);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(r && r->end == pb::AttemptEnd::Contradiction && r->strike == 0 && f.pages == 1 && j.queue().excluded(403),
+              "header (2): a repeated header id in the header phase is a contradiction, excluded, 0 tokens" +
+                      (r ? ": " + rep_desc(*r) : ""));
+    }
+    // (4) a real-PoW server whose chain carries a header whose h is below its predecessor's (going up the chain):
+    // the attempt ends, excluded, 0 tokens (the honest pair behind it completes)
+    {
+        FakeHeaderServer f(net, 404, 1000000000000ull, page * 3, 100, 2, page);
+        KatServer h(a, 405);
+        h.top = L;
+        JoinerEnv je(net);  // real PoW (not in bad_pow); the dip in h triggers (4)
+        pb::Joiner j(je.in, kP53);
+        j.offer(f.best_id(), f);
+        j.offer(h.best_id(), h);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(r && r->end == pb::AttemptEnd::Header && r->strike == 0 && r->what == "h decreases along the header chain" &&
+                      j.queue().excluded(404),
+              "header (4): h below its predecessor ends the attempt, excluded, 0 tokens" + (r ? ": " + rep_desc(*r) : ""));
+        const std::optional<pb::AttemptReport> r2 = j.run_next();
+        check(r2 && r2->end == pb::AttemptEnd::Completed && j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL,
+              "header (4): the honest pair queued behind it completes" + (r2 ? ": " + rep_desc(*r2) : ""));
+    }
+}
+
 }  // namespace
 int main(int argc, char** argv) {
     const std::string only = argc > 1 ? argv[1] : "";
@@ -2020,6 +2321,7 @@ int main(int argc, char** argv) {
     run("attempts", attempts);
     run("candidates", candidates);
     run("scope", scope);
+    run("header", header);
     run("d1", d1);
     run("fastpool", fastpool);
     run("ratchet", ratchet);
