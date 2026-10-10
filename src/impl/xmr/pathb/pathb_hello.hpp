@@ -5,7 +5,21 @@
 // version. See COPYING in the repository root.
 // ---------------------------------------------------------------------------
 // src/impl/xmr/pathb/pathb_hello.hpp
-// Path B FB_HELLO: the tail (S3b-3) and the S4 trailer.
+// Path B FB_HELLO: the head (S4w-a), the tail (S3b-3) and the S4 trailer.
+//
+//   FB_HELLO (frame version 0x02) = head | tail | node_key[32] | trailer
+//   head (53 B) = 0x40 | frame version 0x02 | magic 'C2XR' | u8 network
+//                 | u32 chain_id (LE) | pool_id[32] | u64 node_nonce (LE)
+//                 | u16 listen_port (LE)
+//   node_key    = the S6 node key slot, zero until S6
+//   483 B at epoch 0 (53 + 330 + 32 + 68). A frame version 0x01 (a pre-Path-B
+//   peer, codec 1) is refused naming K22.
+//   pathb_hello_check: network, chain_id or pool_id differ -> TAG_MISMATCH;
+//   at equal epoch_cur the rules blocks are compared (LANE_RULES_MISMATCH);
+//   another epoch_cur is accepted and shown; node_nonce equal: a
+//   self-connection; mmr_leaf_count against leaf_count(best_tip) only when
+//   the best tip's header is bound at this node: a mismatch closes the link
+//   with no strike; the trailer alarm is local. No outcome carries a token.
 //
 //   tail (ruling 31 P-8) = u8 codec (K22 = 2) | LE16 rules_len | rules TLV
 //                          | LE128 best_cum_work | best_tip[32] | LE64 best_h
@@ -34,6 +48,8 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "impl/xmr/native/contracts/types.hpp"  // U128
@@ -205,6 +221,202 @@ inline bool trailer_alarm(const HelloTrailer& ours, const HelloTrailer& theirs) 
                         && ours.deploy_digest != theirs.deploy_digest;
     const bool next = ours.next_digest != zero && theirs.next_digest != zero && ours.next_digest != theirs.next_digest;
     return deploy || next;
+}
+
+// ---------------------------------------------------------------------------
+// The Path B FB_HELLO: head | tail | node key | trailer
+// ---------------------------------------------------------------------------
+inline constexpr std::uint8_t kHelloOpcode = 0x40;
+inline constexpr std::uint8_t kHelloFrameVersion = 0x02;
+inline constexpr std::array<std::uint8_t, 4> kHelloMagic{'C', '2', 'X', 'R'};
+inline constexpr std::size_t kHelloHeadBytes = kU8Bytes + kU8Bytes + kHelloMagic.size() + kU8Bytes + kU32Bytes
+                                               + kHashBytes + kU64Bytes + kU16Bytes;
+static_assert(kHelloHeadBytes == 53);
+inline constexpr std::size_t kHelloNodeKeyBytes = kHashBytes;
+
+struct PathbHello {
+    std::uint8_t network = 0;     // the HELLO network byte (LaneNet)
+    std::uint32_t chain_id = 0;
+    Hash32 pool_id{};             // the C23 pool_id
+    std::uint64_t node_nonce = 0;
+    std::uint16_t listen_port = 0;
+    HelloTail tail;
+    Hash32 node_key{};            // the S6 slot: zero until S6
+    HelloTrailer trailer;
+
+    friend bool operator==(const PathbHello&, const PathbHello&) = default;
+};
+
+inline std::optional<std::vector<std::uint8_t>> encode_pathb_hello(const PathbHello& h) {
+    const std::optional<std::vector<std::uint8_t>> tail = encode_hello_tail(h.tail);
+    if (!tail) return std::nullopt;
+    std::vector<std::uint8_t> out;
+    out.reserve(kHelloHeadBytes + tail->size() + kHelloNodeKeyBytes + kHelloTrailerBytes);
+    out.push_back(kHelloOpcode);
+    out.push_back(kHelloFrameVersion);
+    out.insert(out.end(), kHelloMagic.begin(), kHelloMagic.end());
+    out.push_back(h.network);
+    lr_detail::put_le(out, h.chain_id, kU32Bytes);
+    out.insert(out.end(), h.pool_id.begin(), h.pool_id.end());
+    lr_detail::put_le(out, h.node_nonce, kU64Bytes);
+    lr_detail::put_le(out, h.listen_port, kU16Bytes);
+    out.insert(out.end(), tail->begin(), tail->end());
+    out.insert(out.end(), h.node_key.begin(), h.node_key.end());
+    const HelloTrailerBytes tr = encode_hello_trailer(h.trailer);
+    out.insert(out.end(), tr.begin(), tr.end());
+    return out;
+}
+
+enum class HelloError : std::uint8_t {
+    None,
+    Truncated,
+    Opcode,
+    Version,  // frame version other than 0x02: refused naming K22
+    Magic,
+    Codec,    // the tail's codec byte other than K22 = 2: refused naming K22
+    Trailer,  // the bytes after the node key are not exactly the 68-byte trailer
+};
+
+struct PathbHelloDecode {
+    HelloError error = HelloError::None;
+    std::uint8_t id = 0;  // the K field the refusal names (22 for Version and Codec)
+    PathbHello hello;
+};
+
+inline PathbHelloDecode decode_pathb_hello(std::span<const std::uint8_t> b) {
+    PathbHelloDecode d;
+    const auto fail = [&d](HelloError e, std::uint8_t id = 0) {
+        d.error = e;
+        d.id = id;
+        return d;
+    };
+    if (b.size() < kU8Bytes + kU8Bytes) return fail(HelloError::Truncated);
+    if (b[0] != kHelloOpcode) return fail(HelloError::Opcode);
+    if (b[1] != kHelloFrameVersion) return fail(HelloError::Version, kCodecKNumber);
+    if (b.size() < kHelloHeadBytes) return fail(HelloError::Truncated);
+    if (!std::equal(kHelloMagic.begin(), kHelloMagic.end(), b.begin() + 2)) return fail(HelloError::Magic);
+    PathbHello& h = d.hello;
+    const std::uint8_t* p = b.data() + 2 + kHelloMagic.size();
+    h.network = p[0];
+    p += kU8Bytes;
+    h.chain_id = static_cast<std::uint32_t>(lr_detail::get_le(p, kU32Bytes));
+    p += kU32Bytes;
+    std::copy(p, p + kHashBytes, h.pool_id.begin());
+    p += kHashBytes;
+    h.node_nonce = lr_detail::get_le(p, kU64Bytes);
+    p += kU64Bytes;
+    h.listen_port = static_cast<std::uint16_t>(lr_detail::get_le(p, kU16Bytes));
+    const HelloTailDecode td = decode_hello_tail(b.subspan(kHelloHeadBytes));
+    if (td.error == HelloTailError::Codec) return fail(HelloError::Codec, kCodecKNumber);
+    if (td.error != HelloTailError::None) return fail(HelloError::Truncated);
+    h.tail = td.tail;
+    const std::size_t at = kHelloHeadBytes + td.consumed;
+    if (b.size() - at < kHelloNodeKeyBytes) return fail(HelloError::Truncated);
+    std::copy(b.begin() + at, b.begin() + at + kHelloNodeKeyBytes, h.node_key.begin());
+    const std::optional<HelloTrailer> tr = decode_hello_trailer(b.subspan(at + kHelloNodeKeyBytes));
+    if (!tr) return fail(HelloError::Trailer);
+    h.trailer = *tr;
+    return d;
+}
+
+// The receive check of a decoded Path B HELLO against the node's own.
+enum class HelloVerdict : std::uint8_t {
+    Accept,
+    Refuse,          // TAG_MISMATCH or LANE_RULES_MISMATCH (no strike)
+    Close,           // mmr_leaf_count != leaf_count(best_tip) on a bound best tip (no strike)
+    SelfConnection,  // node_nonce equal
+};
+
+enum class HelloReason : std::uint8_t { None, K22, Malformed, Network, ChainId, PoolId, LaneRules, LeafCount, SelfConnection };
+
+inline constexpr std::string_view kTagMismatchText = "TAG_MISMATCH";
+
+struct HelloCheck {
+    HelloVerdict verdict = HelloVerdict::Accept;
+    HelloReason reason = HelloReason::None;
+    std::uint8_t id = 0;            // LaneRules: the K field
+    std::string text;
+    bool trailer_alarm = false;     // a local operator alarm only
+    bool other_epoch = false;       // another epoch_cur: accepted and shown, not compared
+    std::uint32_t strike = 0;       // always 0
+};
+
+// bound_best_record: H(best_tip) when best_tip's header is bound at this node
+// (its own S1.3 #9 matched); nullopt otherwise (no leaf-count comparison).
+inline HelloCheck pathb_hello_check(const PathbHello& ours, const PathbHello& theirs,
+                                    std::optional<std::uint64_t> bound_best_record, std::uint64_t b0,
+                                    std::uint64_t F) {
+    HelloCheck c;
+    const auto refuse = [&c](HelloReason r, std::string text) {
+        c.verdict = HelloVerdict::Refuse;
+        c.reason = r;
+        c.text = std::move(text);
+        return c;
+    };
+    c.trailer_alarm = trailer_alarm(ours.trailer, theirs.trailer);
+    if (theirs.network != ours.network)
+        return refuse(HelloReason::Network, std::string(kTagMismatchText) + " field=network ours=" +
+                                                    std::to_string(ours.network) + " theirs=" +
+                                                    std::to_string(theirs.network));
+    if (theirs.chain_id != ours.chain_id)
+        return refuse(HelloReason::ChainId, std::string(kTagMismatchText) + " field=chain_id ours=" +
+                                                    std::to_string(ours.chain_id) + " theirs=" +
+                                                    std::to_string(theirs.chain_id));
+    if (theirs.pool_id != ours.pool_id)
+        return refuse(HelloReason::PoolId, std::string(kTagMismatchText) + " field=pool_id ours=" +
+                                                   lr_detail::hex(ours.pool_id.data(), kHashBytes) + " theirs=" +
+                                                   lr_detail::hex(theirs.pool_id.data(), kHashBytes));
+    c.other_epoch = ours.trailer.epoch_cur != theirs.trailer.epoch_cur;
+    const LaneRulesCompare rc =
+            hello_rules_compare(ours.trailer.epoch_cur, ours.tail.rules, theirs.trailer.epoch_cur, theirs.tail.rules);
+    if (rc.verdict != LaneRulesVerdict::Equal) {
+        HelloCheck r = refuse(HelloReason::LaneRules, rc.text);
+        r.id = rc.id;
+        return r;
+    }
+    if (theirs.node_nonce == ours.node_nonce) {
+        c.verdict = HelloVerdict::SelfConnection;
+        c.reason = HelloReason::SelfConnection;
+        c.text = "self-connection (node_nonce equal)";
+        return c;
+    }
+    if (hello_leaf_count_check(theirs.tail, bound_best_record, b0, F) == HelloLeafCount::Mismatch) {
+        c.verdict = HelloVerdict::Close;
+        c.reason = HelloReason::LeafCount;
+        c.text = "mmr_leaf_count " + std::to_string(theirs.tail.mmr_leaf_count) + " != leaf_count(best_tip)";
+        return c;
+    }
+    return c;
+}
+
+// A received HELLO frame, in order: the frame version (0x01: refused naming
+// K22), the network, the codec byte (refused naming K22), then
+// pathb_hello_check. `bound_best_record` is asked for the peer's best tip
+// once the frame decodes (nullopt: not bound at this node).
+template <class BoundRecord>
+inline HelloCheck pathb_hello_receive(const PathbHello& ours, std::span<const std::uint8_t> frame,
+                                      BoundRecord&& bound_best_record, std::uint64_t b0, std::uint64_t F,
+                                      PathbHello* decoded = nullptr) {
+    HelloCheck c;
+    const auto refuse = [&c](HelloReason r, std::string text) {
+        c.verdict = HelloVerdict::Refuse;
+        c.reason = r;
+        c.text = std::move(text);
+        return c;
+    };
+    const PathbHelloDecode d = decode_pathb_hello(frame);
+    if (d.error == HelloError::Version)
+        return refuse(HelloReason::K22, std::string(kLaneRulesMismatchText) + " refused field=K22 (frame version " +
+                                                std::to_string(frame[1]) + ")");
+    if (d.error != HelloError::None && d.error != HelloError::Codec) return refuse(HelloReason::Malformed, "hello: malformed");
+    if (d.hello.network != ours.network)
+        return refuse(HelloReason::Network, std::string(kTagMismatchText) + " field=network ours=" +
+                                                    std::to_string(ours.network) + " theirs=" +
+                                                    std::to_string(d.hello.network));
+    if (d.error == HelloError::Codec)
+        return refuse(HelloReason::K22, std::string(kLaneRulesMismatchText) + " refused field=K22");
+    if (decoded) *decoded = d.hello;
+    return pathb_hello_check(ours, d.hello, bound_best_record(d.hello.tail.best_tip), b0, F);
 }
 
 }  // namespace c2pool::xmr::pathb

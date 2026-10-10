@@ -66,6 +66,9 @@ inline constexpr std::uint64_t retarget_min_span(const LaneParams& p) noexcept {
                     DIFFICULTY_TARGET_V2 * (p.retarget_growth_num - p.retarget_growth_den));
 }
 
+// K03c at the ruled parameters (derived from K03d g*).
+static_assert(retarget_min_span(kRuledLaneParams) == 9);
+
 // ---------------------------------------------------------------------------
 // Window entries and record heights
 // ---------------------------------------------------------------------------

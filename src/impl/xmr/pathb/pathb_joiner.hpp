@@ -31,6 +31,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "pathb_buckets.hpp"
@@ -46,6 +48,17 @@ inline std::uint64_t journal_j0(const LaneParams& p, std::uint64_t d_fin) noexce
     const std::uint64_t by_time = ceil_div(kJournalHours * kSecondsPerHour, p.carrier_interval_s);
     const std::uint64_t by_open = ceil_div(p.open_bins * DIFFICULTY_TARGET_V2, p.carrier_interval_s) + d_fin;
     return by_time > by_open ? by_time : by_open;
+}
+
+// --journal-depth (P-01, policy, raise only): a node's journal depth J. A
+// value below J_0 = journal_j0(p, D_fin) is refused at start; the refusal
+// names the flag, the value and J_0. nullopt: accepted.
+inline constexpr std::string_view kJournalDepthFlag = "--journal-depth";
+
+inline std::optional<std::string> journal_depth_refusal(const LaneParams& p, std::uint64_t j) {
+    const std::uint64_t j0 = journal_j0(p, kSealDepth);
+    if (j >= j0) return std::nullopt;
+    return std::string(kJournalDepthFlag) + " " + std::to_string(j) + " is below J_0 = " + std::to_string(j0);
 }
 
 // span = max(J_0, ceil((F + Fresh) x 120 / T) + D_fin).

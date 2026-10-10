@@ -14,16 +14,20 @@
 //       node that applied the heavier branch from the start; a fork at depth
 //       J + 1 goes through rebuild_from(snapshot) to the same digest;
 //   (4) a journal restarted from a snapshot cannot rewind below it;
-//   (5) generic over the record type: a move-only record.
+//   (5) generic over the record type: a move-only record;
+//   (6) S4w-a: --journal-depth below J_0 = 1,152 is refused at start (the
+//       text names the flag, the value and J_0); 1,152 and a raise accepted.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <optional>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "impl/xmr/pathb/pathb_caps.hpp"
+#include "impl/xmr/pathb/pathb_joiner.hpp"
 #include "impl/xmr/pathb/pathb_journal.hpp"
 #include "pathb_kat_check.hpp"
 
@@ -157,6 +161,16 @@ int main() {
         pb::RewindJournal<std::uint64_t> z(0);
         z.append(1);
         check(z.size() == 0 && z.verdict_for(0) == pb::RewindVerdict::RebuildRequired, "depth 0 holds nothing");
+    }
+
+    // (6) the --journal-depth floor J_0 (P-01, raise only)
+    {
+        const std::optional<std::string> low = pb::journal_depth_refusal(pb::kRuledLaneParams, 1151);
+        check(low && low->find("--journal-depth 1151") != std::string::npos && low->find("1152") != std::string::npos,
+              "(6) --journal-depth 1151 refused, naming the flag, the value and J_0 = 1,152");
+        check(pb::journal_depth_refusal(pb::kRuledLaneParams, 0).has_value(), "(6) --journal-depth 0 refused");
+        check(!pb::journal_depth_refusal(pb::kRuledLaneParams, 1152) && !pb::journal_depth_refusal(pb::kRuledLaneParams, 4000),
+              "(6) 1,152 and a raise to 4,000 accepted");
     }
 
     return finish("v37_xmr_pathb_journal_kat");

@@ -12,12 +12,20 @@
 //   (opt-out); a stated vote=n sets the own flag (own), vote=0 is own no; the
 //   login reply's vote object; a stated vote expires with its deployment;
 //   a --vote change applies to the next ballot written.
+//   S4w-a (pathb_policy.hpp): the stratum password "vote=<n>" parsed (n
+//   decimal, 0 .. 2^15 - 1; vote=0 own no); anything else ignored (no stated
+//   vote, never a refusal); the parsed value through ballot_to_write to the
+//   login reply's vote object; the moved policy helpers: parse_pct_exact /
+//   pct_to_bp (10 bp from "0.1"), a login payee XMR_STD only (the mainnet
+//   donation address decodes to the K16 author keys).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "c2pool/v37/xmr/pathb/pathb_policy.hpp"
+#include "impl/xmr/pathb/pathb_lane_rules.hpp"
 #include "impl/xmr/pathb/pathb_ratchet_activation.hpp"
 #include "impl/xmr/pathb/pathb_wire_v3.hpp"
 #include "pathb_kat_check.hpp"
@@ -107,5 +115,37 @@ int main() {
     // nothing open: the default is epoch_cur
     check(pb::ballot_to_write(P, g, 10, release({}), std::nullopt, false).ballot == pb::make_ballot(0, false),
           "no deployment open: the default is epoch_cur");
+    // S4w-a: the stratum password and the moved policy helpers
+    {
+        namespace pol = ::c2pool::xmr::pathb::policy;
+        check(pol::parse_vote_pass("vote=3") == std::optional<std::uint32_t>(3), "password vote=3 -> stated 3");
+        check(pol::parse_vote_pass("vote=0") == std::optional<std::uint32_t>(0), "password vote=0 -> stated 0 (own no)");
+        check(pol::parse_vote_pass("vote=32767") == std::optional<std::uint32_t>(32767), "vote=32767 (2^15 - 1) accepted");
+        bool ignored = true;
+        for (const char* junk : {"x", "", "vote=", "vote=32768", "vote=3x", "Vote=3", " vote=3", "vote=-1", "vote=99999999999"})
+            ignored = ignored && !pol::parse_vote_pass(junk).has_value();
+        check(ignored, "any other password: no stated vote (ignored, never a refusal)");
+        const pb::RatchetState g0 = pb::genesis_ratchet_state(pb::Hash32{});
+        const pb::BallotChoice own0 = pb::ballot_to_write(P, g0, 10, release({}), pol::parse_vote_pass("vote=0"), false);
+        check(own0.ballot == pb::make_ballot(0, true) && own0.source == pb::BallotSource::Own
+                  && pb::vote_json(own0).find("\"source\": \"own\"") != std::string::npos
+                  && pb::vote_json(own0).find("0x8000") != std::string::npos,
+              "vote=0 from the password: own no in the ballot and the login reply's vote object");
+        const pb::BallotChoice none = pb::ballot_to_write(P, g0, 10, release({}), pol::parse_vote_pass("x"), false);
+        check(none.source == pb::BallotSource::Default, "password x: the default ballot");
+        const pol::ExactPct pct = pol::parse_pct_exact("0.1");
+        check(pct.ok && pol::pct_to_bp(pct) == pb::kDonationBp && pol::pct_to_bp(pol::parse_pct_exact("100")) == 10000
+                  && !pol::parse_pct_exact("1.").ok && !pol::parse_pct_exact("-1").ok && !pol::parse_pct_exact("1e2").ok,
+              "--give-author-pct 0.1 -> 10 bp in integers; malformed text refused");
+        const pol::DecodedAddress d = pol::decode_xmr_address(
+                "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF");
+        check(d.ok && pol::payee_refusal(d).empty() && d.payee_ref() == std::optional<pb::XmrKeyRef>(pb::author_ref(pb::LaneNet::Mainnet)),
+              "the mainnet donation address decodes to the K16 author keys (XMR_STD payee)");
+        pol::DecodedAddress sub = d;
+        sub.subaddress = true;
+        check(!pol::payee_refusal(sub).empty() && !sub.payee_ref(), "a subaddress is refused as a login payee");
+        check(!pol::decode_xmr_address("42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPG").ok,
+              "a checksum mismatch is refused");
+    }
     return finish("v37_xmr_ballot_kat");
 }

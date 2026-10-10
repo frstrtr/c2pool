@@ -21,6 +21,17 @@
 //   1248 / 1665 / 42 / 85 / 100 / 720 absent from the code lines of the
 //   scanned Path B headers (allowlist: DIFFICULTY_WINDOW, kAltDepth,
 //   retarget_growth_den).
+//   S4w-a: the Path B FB_HELLO = head 53 B (0x40 | frame version 0x02 | 'C2XR'
+//   | u8 network | u32 chain_id | pool_id | u64 node_nonce | u16 listen_port)
+//   | tail 330 B | node key 32 B (zero until S6) | trailer 68 B = 483 B at
+//   epoch 0, golden digest computed independently; round trip; a frame
+//   version 0x01 refused naming K22; a v1 HELLO of the pre-Path-B layout
+//   refused naming K22; a Path B HELLO fed to the pre-Path-B decoder (its
+//   version check, vendored) refused "unknown version"; TAG_MISMATCH on
+//   network, chain_id, pool_id; the codec byte before the TLV; the rules
+//   compared at equal epoch_cur only; mmr_leaf_count against
+//   leaf_count(best_tip) only on a bound best tip, a mismatch closes the link
+//   with no strike; a self-connection; the trailer alarm local.
 // ---------------------------------------------------------------------------
 #include <array>
 #include <cctype>
@@ -38,6 +49,7 @@
 
 #include "impl/xmr/pathb/pathb_hello.hpp"
 #include "impl/xmr/pathb/pathb_lane_rules.hpp"
+#include "impl/xmr/pathb/pathb_pool_identity.hpp"
 #include "pathb_kat_check.hpp"
 
 #ifndef PATHB_SRC_DIR
@@ -314,6 +326,154 @@ void forbidden_literals() {
     check(allow_hits == std::vector<int>{1, 1, 1}, "each allowlisted constant is hit exactly once");
 }
 
+// ---------------------------------------------------------------------------
+// S4w-a: the Path B HELLO
+// ---------------------------------------------------------------------------
+const char* kHello483Sha256d = "04841c4b59ada702437f884e14175c64c32b695302ccd72f2dc5ed59a3359f8a";
+
+pb::PathbHello golden_hello() {
+    const pb::Hash32 genesis = pb::pool_genesis_derived(seq32(0x10), "attempt 11: the last flag day");
+    pb::PathbHello h;
+    h.network = static_cast<std::uint8_t>(pb::LaneNet::Mainnet);
+    h.chain_id = 0x0000ABCDu;
+    h.pool_id = pb::pool_id_of(pb::LaneNet::Mainnet, h.chain_id, genesis);
+    h.node_nonce = 0x1122334455667788ull;
+    h.listen_port = 37889;
+    h.tail = pb::make_hello_tail(pb::epoch0_lane_rules(pb::LaneNet::Mainnet),
+                                 ::c2pool::xmr::native::U128{0x0102030405060708ull, 0x1112131415161718ull}, seq32(0x40),
+                                 3412345, 12345);
+    h.trailer.deploy_digest = seq32(0x80);
+    return h;
+}
+
+// The pre-Path-B decoder's opening checks (the length set, opcode 0x40,
+// version 0x01), vendored: what a pre-Path-B node answers to a frame.
+std::string legacy_hello_refusal(const std::vector<std::uint8_t>& f) {
+    constexpr std::size_t kLegacyLens[] = {102, 142, 174};
+    constexpr std::size_t kLegacyRulesMin = 206;
+    bool len_ok = f.size() > kLegacyRulesMin;
+    for (std::size_t n : kLegacyLens) len_ok = len_ok || f.size() == n;
+    if (!len_ok) return "hello: wrong length";
+    if (f[0] != 0x40) return "hello: wrong opcode";
+    if (f[1] != 0x01) return "hello: unknown version";
+    return "";
+}
+
+// A pre-Path-B v1 HELLO (102 B): 0x40 | 0x01 | 'C2XR' | network | chain_id |
+// lane_params_digest | share_diff | node_nonce | listen_port | lane_next_pos |
+// lane_digest | bind.
+std::vector<std::uint8_t> legacy_hello_v1(std::uint8_t network, std::uint32_t chain_id) {
+    std::vector<std::uint8_t> f{0x40, 0x01, 'C', '2', 'X', 'R', network};
+    for (int i = 0; i < 4; ++i) f.push_back(static_cast<std::uint8_t>(chain_id >> (8 * i)));
+    while (f.size() < 102) f.push_back(static_cast<std::uint8_t>(f.size()));
+    f.back() = 0;
+    return f;
+}
+
+void s4wa_hello() {
+    const pb::PathbHello g = golden_hello();
+    const std::optional<std::vector<std::uint8_t>> f = pb::encode_pathb_hello(g);
+    check(f && f->size() == 483, "Path B HELLO is 483 B at epoch 0");
+    check(f && hex(::v37::sha256d(*f).data(), 32) == kHello483Sha256d, "Path B HELLO golden (independent recompute)");
+    check(f && (*f)[0] == 0x40 && (*f)[1] == 0x02 && (*f)[2] == 'C' && (*f)[5] == 'R' && (*f)[6] == 0
+                  && (*f)[7] == 0xCD && (*f)[8] == 0xAB,
+          "head: 0x40 | 0x02 | 'C2XR' | u8 network | u32 chain_id LE");
+    check(f && std::equal(g.pool_id.begin(), g.pool_id.end(), f->begin() + 11) && (*f)[43] == 0x88 && (*f)[51] == 0x01
+                  && (*f)[52] == 0x94,
+          "head: pool_id at 11, u64 node_nonce at 43, u16 listen_port at 51 (53 B)");
+    check(f && (*f)[53] == 2 && (*f)[54] == 0x07 && (*f)[55] == 0x01, "the tail at 53: codec 2 | LE16 263");
+    bool key_zero = f.has_value();
+    for (std::size_t i = 383; key_zero && i < 415; ++i) key_zero = (*f)[i] == 0;
+    check(key_zero && f && (*f)[419] == 0x80, "the S6 key slot (zeros) at 383, then the trailer at 415");
+    const pb::PathbHelloDecode d = f ? pb::decode_pathb_hello(*f) : pb::PathbHelloDecode{};
+    check(d.error == pb::HelloError::None && d.hello == g, "Path B HELLO round trip");
+
+    const auto unbound = [](const pb::Hash32&) { return std::optional<std::uint64_t>{}; };
+    const std::uint64_t b0 = 3000101, F = 96;
+    pb::PathbHello ours = g;
+    ours.node_nonce = 7;
+    check(pb::pathb_hello_receive(ours, *f, unbound, b0, F).verdict == pb::HelloVerdict::Accept, "a matching HELLO accepted");
+
+    // frame version 0x01, the pre-Path-B layout, and the other direction
+    std::vector<std::uint8_t> v1 = *f;
+    v1[1] = 0x01;
+    const pb::HelloCheck c1 = pb::pathb_hello_receive(ours, v1, unbound, b0, F);
+    check(c1.verdict == pb::HelloVerdict::Refuse && c1.reason == pb::HelloReason::K22 && c1.strike == 0
+                  && c1.text.find("K22") != std::string::npos,
+          "frame version 0x01 refused naming K22, no strike");
+    const pb::HelloCheck c2 = pb::pathb_hello_receive(ours, legacy_hello_v1(0, 0xABCD), unbound, b0, F);
+    check(c2.verdict == pb::HelloVerdict::Refuse && c2.reason == pb::HelloReason::K22,
+          "a pre-Path-B v1 HELLO refused naming K22");
+    check(legacy_hello_refusal(*f) == "hello: unknown version", "a Path B HELLO at a pre-Path-B node: \"unknown version\"");
+
+    // TAG_MISMATCH
+    for (int k = 0; k < 3; ++k) {
+        pb::PathbHello t = g;
+        if (k == 0) t.network = 2;
+        if (k == 1) t.chain_id = 0xABCE;
+        if (k == 2) t.pool_id[0] ^= 1;
+        const pb::HelloCheck c = pb::pathb_hello_receive(ours, *pb::encode_pathb_hello(t), unbound, b0, F);
+        check(c.verdict == pb::HelloVerdict::Refuse && c.text.rfind("TAG_MISMATCH", 0) == 0 && c.strike == 0,
+              "TAG_MISMATCH on " + std::string(k == 0 ? "network" : k == 1 ? "chain_id" : "pool_id"));
+    }
+
+    // the codec byte before the TLV: codec 1 with a TLV that also differs
+    {
+        std::vector<std::uint8_t> c = *f;
+        c[53] = 1;
+        c[53 + 3 + 2] ^= 0xff;  // the first TLV value byte
+        const pb::HelloCheck r = pb::pathb_hello_receive(ours, c, unbound, b0, F);
+        check(r.verdict == pb::HelloVerdict::Refuse && r.reason == pb::HelloReason::K22,
+              "the codec byte is compared before the TLV (K22, not a field)");
+    }
+
+    // the rules at equal epoch_cur only
+    {
+        pb::PathbLaneRules other = pb::epoch0_lane_rules(pb::LaneNet::Mainnet);
+        other.coverage = 3;
+        pb::PathbHello t = g;
+        t.tail.rules = pb::rules_block(other);
+        const pb::HelloCheck r = pb::pathb_hello_receive(ours, *pb::encode_pathb_hello(t), unbound, b0, F);
+        check(r.verdict == pb::HelloVerdict::Refuse && r.reason == pb::HelloReason::LaneRules && r.id == 0x09,
+              "equal epoch_cur: LANE_RULES_MISMATCH naming 0x09");
+        t.trailer.epoch_cur = 1;
+        const pb::HelloCheck e = pb::pathb_hello_receive(ours, *pb::encode_pathb_hello(t), unbound, b0, F);
+        check(e.verdict == pb::HelloVerdict::Accept && e.other_epoch, "another epoch_cur: accepted and shown, not compared");
+    }
+
+    // mmr_leaf_count: only on a bound best tip; a mismatch closes, no strike
+    {
+        const std::uint64_t H = b0 + F + 12345 - 1;  // leaf_count(H) = 12345
+        const auto bound_eq = [&](const pb::Hash32&) { return std::optional<std::uint64_t>(H); };
+        const auto bound_ne = [&](const pb::Hash32&) { return std::optional<std::uint64_t>(H + 1); };
+        check(pb::pathb_hello_receive(ours, *f, bound_eq, b0, F).verdict == pb::HelloVerdict::Accept,
+              "mmr_leaf_count == leaf_count(bound best tip): accepted");
+        const pb::HelloCheck m = pb::pathb_hello_receive(ours, *f, bound_ne, b0, F);
+        check(m.verdict == pb::HelloVerdict::Close && m.reason == pb::HelloReason::LeafCount && m.strike == 0,
+              "mmr_leaf_count != leaf_count(bound best tip): close the link, no strike");
+        check(pb::pathb_hello_receive(ours, *f, unbound, b0, F).verdict == pb::HelloVerdict::Accept,
+              "an unbound best tip (a held variant only): not compared");
+    }
+
+    // self-connection, the trailer alarm
+    {
+        check(pb::pathb_hello_receive(g, *f, unbound, b0, F).verdict == pb::HelloVerdict::SelfConnection,
+              "node_nonce equal: a self-connection");
+        pb::PathbHello t = g;
+        t.trailer.deploy_digest[0] ^= 1;
+        const pb::HelloCheck r = pb::pathb_hello_receive(ours, *pb::encode_pathb_hello(t), unbound, b0, F);
+        check(r.verdict == pb::HelloVerdict::Accept && r.trailer_alarm, "a trailer alarm is local: accepted");
+    }
+    // truncated and trailing bytes
+    {
+        std::vector<std::uint8_t> s(f->begin(), f->end() - 1);
+        check(pb::decode_pathb_hello(s).error == pb::HelloError::Trailer, "a 482-byte HELLO refused");
+        std::vector<std::uint8_t> l = *f;
+        l.push_back(0);
+        check(pb::decode_pathb_hello(l).error == pb::HelloError::Trailer, "a 484-byte HELLO refused");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -371,5 +531,6 @@ int main() {
 
     tail_vectors();
     forbidden_literals();
+    s4wa_hello();
     return finish("v37_xmr_pathb_hello_kat");
 }

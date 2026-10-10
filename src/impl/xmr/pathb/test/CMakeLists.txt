@@ -77,6 +77,10 @@
 #                                    boundary and the closure, the write step, the
 #                                    deferred store, the claim extension point
 #
+# Slice S4w-a KATs (the Path B node modules; unwired):
+#   v37_xmr_relay_family_c_kat       FC_CARRIER / FC_GETCARRIER / FC_GETHEADERS / FC_HEADERS
+#                                    (first_pos) and FB_RECEIPTS v3 codecs, frame versions
+#
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
 # hand in BOTH `--target` lists of .github/workflows/build.yml.
@@ -132,7 +136,8 @@ if (BUILD_TESTING)
             v37_xmr_monero_rules_digest_kat
             v37_xmr_pathb_hello_kat
             v37_xmr_pathb_bucket_wire_kat
-            v37_xmr_pathb_admit_kat)
+            v37_xmr_pathb_admit_kat
+            v37_xmr_relay_family_c_kat)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
