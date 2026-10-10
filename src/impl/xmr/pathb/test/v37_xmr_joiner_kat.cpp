@@ -10,9 +10,11 @@
 // buckets (fetch A / B at the at header, at-header claims, re-ask scope),
 // afterl (the attempt server's regime, AR seed, forged top, P-50), claims
 // (span claims, PRE, Boundary, one variant per id), attempts (ends, re-queue,
-// L from the reply, P-51 hold, fake and starved candidates), candidates (the
-// bound-work rule, P-52, two states, own switch), d1 (retarget claims),
-// fastpool, ratchet (rs_step_at in the joined tree).
+// L from the reply, P-51 hold, an unresolved P_r, fake and starved
+// candidates), candidates (the bound-work rule, P-52, two states, own switch),
+// scope (the fork with A's chain through a held side branch, no body before
+// it, A's kept profile, the lost count), d1 (retarget claims), fastpool,
+// ratchet (rs_step_at in the joined tree).
 // ---------------------------------------------------------------------------
 #include <chrono>
 #include <cstdint>
@@ -401,29 +403,29 @@ void buckets() {
                   "at's own header: a bin sealed at x0 is not served at c_x0");
         }
     }
-    // fetch C none (F-2 under ruling 44); the adopt bound
+    // fetch C none (ruling 44: no bucket fetch at a child of L); the adopt bound
     {
         const std::uint64_t L = 4608;  // H(L) > H(L - 1): bins seal at L
         KatServer s(a, 42);
         std::set<pb::Hash32> ats;
         s.on_buckets = [&](const pb::GetBuckets& q, pb::BucketFrames&) { ats.insert(q.at); };
         OneJoin o = join_at(net, s, L);
-        check(o.r && o.r->end == pb::AttemptEnd::Completed, "F-2: the join completes" + (o.r ? ": " + rep_desc(*o.r) : ""));
+        check(o.r && o.r->end == pb::AttemptEnd::Completed, "fetch C none: the join completes" + (o.r ? ": " + rep_desc(*o.r) : ""));
         if (o.j->adopted()) {
             pb::JoinedState& js = *o.j->adopted();
             const pb::Hash32 cl = at_pos(a, L), cx0 = at_pos(a, js.x0);
-            check(a.node(cl).H > a.node(at_pos(a, L - 1)).H, "F-2: bins seal at L");
+            check(a.node(cl).H > a.node(at_pos(a, L - 1)).H, "fetch C none: bins seal at L");
             bool only = true;
             for (const pb::Hash32& at : ats) only = only && (at == cx0 || at == cl);
-            check(only && !ats.empty(), "F-2: no FC_GETBUCKETS at a child of L (every at is c_x0 or c_L)");
+            check(only && !ats.empty(), "fetch C none: no FC_GETBUCKETS at a child of L (every at is c_x0 or c_L)");
             const pb::LaneDelta* jd = js.store->delta(cl);
             const pb::LaneDelta* ad = a.store.delta(cl);
             bool same_seal = jd && ad && !jd->sealed.empty() && jd->sealed.size() == ad->sealed.size();
             for (std::size_t i = 0; same_seal && i < jd->sealed.size(); ++i)
                 same_seal = jd->sealed[i].leaf == ad->sealed[i].leaf && js.claimed.count(jd->sealed[i].bucket.bin_lo) == 0;
-            check(same_seal, "F-2: every bin sealed at L is recomputed from J's placements and equals A's");
+            check(same_seal, "fetch C none: every bin sealed at L is recomputed from J's placements and equals A's");
             check(follow(js, a, L, L + 1) && digest_of(js, at_pos(a, L + 1)) == digest_of(a, at_pos(a, L + 1)),
-                  "F-2: a child of L admitted with no MissingBucket of the join; J's digest == A's at L + 1");
+                  "fetch C none: a child of L admitted with no MissingBucket of the join; J's digest == A's at L + 1");
             // the adopt bound: a bin b <= H(x0 - 1) + Fresh sealed inside the span is the served bucket
             const std::uint64_t hx = a.node(at_pos(a, js.x0 - 1)).H;
             const std::uint64_t b = hx;  // a bin with placements before x0, sealed inside the span
@@ -468,7 +470,7 @@ void buckets() {
         }
         check(dropped, "(peer, at): the abandoned server's late frame for at -> DROP, no strike");
     }
-    // at-header claims (BA-9): a proof, a leaf_count or an S_parent against the claimed at header -> alarm, the
+    // at-header claims: a proof, a leaf_count or an S_parent against the claimed at header -> alarm, the
     // attempt ends, 0 tokens; a frame that does not decode -> 1 strike
     {
         const std::uint64_t L = 4600;
@@ -542,7 +544,7 @@ void buckets() {
 
 // ---------------------------------------------------------------------------
 // afterl: the joined node after L and the attempt's regime during the replay:
-// the AR seed, the attempt server's copies (BA-7, BA-11), every peer's copy
+// the AR seed, the attempt server's copies during the replay, every peer's copy
 // after L, the forged top (E-72), the P-50 budget
 // ---------------------------------------------------------------------------
 // A forged tip on `tip` at A whose committed mmr_root differs from the honest one in the leaf of bin `bin`
@@ -780,6 +782,60 @@ std::map<std::uint64_t, pb::AttemptReport> run_until(pb::Joiner& j, int rounds =
     return reps;
 }
 
+// span claims (iii): a span carrier c at x0 + 1 carries a receipt r whose tip s lies on a side branch forking at
+// x0 - 3, below the joined tree's root x0 - 1 (within J_0 of c's parent: no boundary; A places c). The attempt's
+// server serves a forged variant of s first (s's id, its parent link moved to the root, its side_data built there):
+// J places it as a claim and r's computed rows on it mismatch: a local alarm + DEFER, no token, no BAN, the server
+// excluded. The honest server: no token, no alarm, never excluded; J holds no state other than A's.
+void span_claims_iii(const JoinNet& net) {
+    KatNode a(net, kJ0);
+    const std::uint64_t L = 4600, x0 = 1265;
+    grow(a, x0);
+    const pb::Hash32 root = at_pos(a, x0 - 1), fork = at_pos(a, x0 - 3);
+    const pb::CarrierBodyV3 s = carrier_on(a, fork, a.node(at_pos(a, x0 - 2)).h, {}, 5, 3400001);
+    const pb::Hash32 sid = pb::receipt_id(s.own);
+    const Admitted as = admit_place(a, s);
+    const pb::ReceiptBodyV3 r = body_on(a, sid, a.node(sid).h, 7, 3400002);
+    const pb::CarrierBodyV3 c = carrier_on(a, at_pos(a, x0), h_pos(x0 + 1), {r}, (x0 + 1) % 4, 3400003);
+    const Admitted ac = admit_place(a, c);
+    grow(a, 4810 - (x0 + 1));
+    const pb::CarrierNode* sn = a.tree.find(sid);
+    check(as.placed && ac.placed && sn != nullptr && a.store.best_at(sn->pos) != sid && a.node(fork).pos + 1 < x0 - 1 &&
+                  a.node(at_pos(a, x0)).pos - a.node(fork).pos <= kJ0 && a.store.best_at(x0 + 1) == pb::receipt_id(c.own),
+          "span claims (iii): A places c, whose receipt's tip lies on a side branch forking at x0 - 3 (within J_0)");
+    const pb::Hash32 dL = digest_of(a, at_pos(a, L));
+    // the forged variant of s: s's blob (its id) with the side_data of a carrier on the root
+    const pb::CarrierBodyV3 on_root = carrier_on(a, root, a.node(sid).h, {}, 5, 3400004);
+    pb::CarrierHeader forged = pb::header_of(s);
+    forged.own.side = on_root.own.side;
+    check(pb::receipt_id(forged.own) == sid && forged.own.side.tip == root && !(forged.own.side == s.own.side),
+          "span claims (iii): the forged variant keeps s's id, its parent link is the root x0 - 1");
+    KatServer f(a, 118), h(a, 119);
+    f.top = L;
+    h.top = L;
+    f.on_headers = [&](const pb::Hash32&, pb::ChainHeaders& out) {
+        for (pb::CarrierHeader& hh : out.headers)
+            if (pb::receipt_id(hh.own) == sid) hh = forged;
+    };
+    JoinerEnv je(net);
+    pb::Joiner j(je.in, kP53);
+    j.offer(f.best_id(), f);
+    j.offer(h.best_id(), h);
+    std::vector<pb::AttemptReport> reps;
+    for (int i = 0; i < 3; ++i)
+        if (std::optional<pb::AttemptReport> rr = j.run_next()) reps.push_back(std::move(*rr));
+    check(!reps.empty() && reps[0].server == 118 && reps[0].end == pb::AttemptEnd::Alarm && reps[0].at == x0 + 1 &&
+                  reps[0].strike == 0 && reps[0].alarms > 0 && j.queue().excluded(118),
+          "span claims (iii): the forged variant served first -> local alarm + DEFER at c, 0 tokens, no BAN, the server "
+          "excluded" + (reps.empty() ? std::string() : ": " + rep_desc(reps[0])));
+    bool honest = reps.size() >= 2;
+    for (std::size_t i = 1; i < reps.size(); ++i)
+        honest = honest && reps[i].server == 119 && reps[i].strike == 0 && reps[i].alarms == 0;
+    check(honest && !j.queue().excluded(119) && (j.adopted() == nullptr || digest_of(*j.adopted(), at_pos(a, L)) == dL),
+          "span claims (iii): the honest server: no token, no alarm, never excluded; J holds no state other than A's" +
+                  (reps.size() >= 2 ? ": " + rep_desc(reps[1]) : std::string()));
+}
+
 void claims() {
     JoinNet net(900);
     KatNode a(net, kJ0);
@@ -896,7 +952,7 @@ void claims() {
               "every span mmr_root: a wrong mmr_root at x0 + 1 -> alarm there" + (it != reps.end() ? ": " + rep_desc(it->second) : ""));
         check(j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL, "every span mmr_root: J joins from the next server");
     }
-    // ended attempt (BA-10): attempt 1 from a forging server ends on an alarm; attempt 2 over the same tip ids joins
+    // ended attempt (it leaves nothing): attempt 1 from a forging server ends on an alarm; attempt 2 over the same tip ids joins
     {
         auto f = honest(107), h = honest(108);
         edit_carrier(*f, at_pos(a, x1 - 2), [&](pb::CarrierBodyV3& c) {
@@ -962,7 +1018,7 @@ void claims() {
                       (it != reps.end() ? ": " + rep_desc(it->second) : ""));
         check(j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL, "boundary in span: J joins from the next server");
     }
-    // forged Boundary in the replay (CK4-5): the attempt's server serves s with its parent link J_0 + 1 below the
+    // forged Boundary in the replay: the attempt's server serves s with its parent link J_0 + 1 below the
     // parent of the span carrier that carries a receipt on s -> unplaceable, the attempt ends (no alarm, 0 tokens),
     // the server not asked again; J joins from the next server
     {
@@ -988,7 +1044,7 @@ void claims() {
                       follow(*j.adopted(), a, L, L + 200) && digest_of(*j.adopted(), at_pos(a, L + 200)) == digest_of(a, at_pos(a, L + 200)),
               "forged Boundary: J reaches A_full's digest at L + 200 from the next server");
     }
-    // one variant per id and attempt (CK4-6): a second, different variant of a side carrier id; a second body set
+    // one variant per id and attempt: a second, different variant of a side carrier id; a second body set
     {
         auto f1 = honest(115), f2 = honest(116), h = honest(117);
         f1->on_headers = [&](const pb::Hash32&, pb::ChainHeaders& out) {
@@ -1028,6 +1084,9 @@ void claims() {
         hi.add(1, v, a.node(rc.s).h);
         hi.add(2, w, a.node(rc.s).h);
         check(hi.variants(rc.s).size() == 2, "one variant per id: another peer's different variant is held by 1.6 (b)");
+    }
+    {
+        span_claims_iii(net);
     }
 }
 
@@ -1123,7 +1182,31 @@ void attempts() {
         check(h.requests == 0 && j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL,
               "withholds: J reaches A's digest from the next server, with one server's data only");
     }
-    // the attempt's L from the server's reply; the server holds its P-51 floor for the open attempt (B-4). The chain
+    // a header whose P_r the follower does not hold and no peer serves (FB_GETCTX not resolved within the abandon
+    // timeout): the header phase ends the attempt as non-service, before any body (never read as height 0); with the
+    // block served, the next attempt of the pair completes
+    {
+        KatServer s(a, 126);
+        s.top = L;
+        const pb::Hash32 pr = a.bodies.get(at_pos(a, L))->own.blob.prev_id;
+        JoinerEnv je(net);
+        je.hidden.insert(pr);
+        je.unservable.insert(pr);
+        pb::Joiner j(je.in, kP53);
+        j.offer(s.best_id(), s);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(r && r->end == pb::AttemptEnd::NotServed && r->what == "a header's P_r not resolved" && r->alarms == 0 &&
+                      r->strike == 0 && !j.queue().excluded(126) && j.queue().size() == 1 && s.body_requests == 0 &&
+                      s.bucket_requests == 0,
+              "unresolved P_r: the header phase ends the attempt NotServed (no body asked, no alarm, no token, re-queued)" +
+                      (r ? ": " + rep_desc(*r) : ""));
+        je.unservable.erase(pr);
+        const std::optional<pb::AttemptReport> r2 = j.run_next();
+        check(r2 && r2->end == pb::AttemptEnd::Completed && j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL,
+              "unresolved P_r: with the block served, the pair's next attempt completes and reaches A's digest" +
+                      (r2 ? ": " + rep_desc(*r2) : ""));
+    }
+    // the attempt's L from the server's reply; the server holds its P-51 floor for the open attempt. The chain
     // is long enough that the header floor x0(L') - N_rt lies above position 1, so a floor taken at the moved tip
     // would cut the attempt's retarget prefix.
     {
@@ -1154,9 +1237,9 @@ void attempts() {
         check(j.adopted() && digest_of(*j.adopted(), at_pos(a, Lm + 12)) == digest_of(a, at_pos(a, Lm + 12)),
               "moved tip: J's digest == A's at the attempt's L");
     }
-    // a fake candidate (CK4-3): a chain of >= 3,336 carriers with no canonical coinbase, offered by three servers
+    // a fake candidate: a chain of >= 3,336 carriers with no canonical coinbase, offered by three servers
     // before the honest one: every attempt on it ends at its first computed #9; J joins the honest chain; a fourth
-    // fake server joining after that changes nothing; P-52 (S3b4-8): a server naming the honest tip that forges is
+    // fake server joining after that changes nothing; P-52 (the pair queue): a server naming the honest tip that forges is
     // excluded, and the honest pair is next whatever stream of new candidates follows
     {
         KatNode fk(net, kJ0);
@@ -1190,7 +1273,7 @@ void attempts() {
         check(j.adopted() && j.adopted()->tip() == tip0, "fake candidate: a fake server joining after that changes nothing");
     }
     {
-        // S3b4-8: a P0 server names H first and the honest server names H next, both before the stream; the P0 server
+        // P-52: a P0 server names H first and the honest server names H next, both before the stream; the P0 server
         // forges (excluded); then one new candidate per attempt: H is attempted at the honest server next
         KatNode fk(net, kJ0);
         grow_fake(fk, 4610, 700000);
@@ -1228,8 +1311,14 @@ void attempts() {
 // A full node's own chain as A (a deep switch): every carrier's #9 its own.
 struct FullChain final : pb::AdoptedChain {
     KatNode* n;
+    mutable pb::Hash32 profile_tip{};
+    mutable std::shared_ptr<const pb::BoundWork> profile;
     explicit FullChain(KatNode& k) : n(&k) {}
     bool holds(const pb::Hash32& id) const override { return n->tree.find(id) != nullptr; }
+    bool on_chain(const pb::Hash32& id) const override {
+        const pb::CarrierNode* c = n->tree.find(id);
+        return c != nullptr && n->store.best_at(c->pos) == id;
+    }
     std::optional<std::uint64_t> pos_of(const pb::Hash32& id) const override {
         const pb::CarrierNode* c = n->tree.find(id);
         if (c == nullptr) return std::nullopt;
@@ -1237,15 +1326,20 @@ struct FullChain final : pb::AdoptedChain {
     }
     std::optional<std::uint64_t> joined_x1() const override { return std::nullopt; }
     std::uint64_t store_base() const override { return n->store.base_pos(); }
-    pb::BoundWork bound_work() const override {
-        pb::BoundWork w;
+    // the KAT's profile: walked once per best tip
+    std::shared_ptr<const pb::BoundWork> bound_work() const override {
+        if (profile && profile_tip == n->store.best_tip()) return profile;
+        auto w = std::make_shared<pb::BoundWork>();
         for (std::uint64_t x = n->store.tip_pos(); x >= 1; --x) {
             const pb::CarrierNode* c = n->tree.find(*n->store.best_at(x));
-            w.add(c->h, c->d);
+            w->add(c->h, c->d);
         }
-        return w;
+        profile = w;
+        profile_tip = n->store.best_tip();
+        return profile;
     }
     pb::Hash32 tip() const override { return n->store.best_tip(); }
+    std::uint64_t open_placements() const override { return pb::open_bin_placements(n->store); }
 };
 
 pb::Hash32 hid(std::uint8_t b) { pb::Hash32 h{}; h.fill(b); return h; }
@@ -1323,14 +1417,14 @@ void candidates() {
         pb::Hash32 a_end_tip{};
         j.set_on_step([&](pb::JoinedState&, std::uint64_t x) {
             if (x % 6 == 0 && next < 5100 && follow(*j.adopted(), p, next, next + 1, 9)) ++next;
-            a_end = j.adopted()->bound_work();
+            a_end = *j.adopted()->bound_work();
             a_end_tip = j.adopted()->tip();
         });
         const std::optional<pb::AttemptReport> r2 = j.run_next();
         j.set_on_step({});
         check(next >= 4900, "candidates (a): the fake grew by " + std::to_string(next - 4500) + " carriers during the honest attempt");
         if (r2 && j.adopted() && j.last_switch().replaced) {
-            const pb::BoundWork hw = j.adopted()->bound_work();
+            const pb::BoundWork hw = *j.adopted()->bound_work();
             const pb::Hash32 ht = j.adopted()->tip();
             check(!pb::candidate_replaces(hw, ht, a_end, a_end_tip),
                   "candidates (a): read at the test, A's grown profile would keep the fake (the growth flips the rule)");
@@ -1344,7 +1438,7 @@ void candidates() {
         check(j.adopted() && digest_of(*j.adopted(), at_pos(a, 5400)) == digest_of(a, at_pos(a, 5400)),
               "candidates (a): J's digest == A_full's after the replacement");
     }
-    // the stale top (B-1; ruling 45): J adopts the honest chain at L_A; a P< server mines k carriers on x1_A at the
+    // the stale top (ruling 45): J adopts the honest chain at L_A; a P< server mines k carriers on x1_A at the
     // height h(x1_A + 1) until their work there exceeds A's there; J completes that attempt and keeps A
     {
         const std::uint64_t LA = 4600, x1a = 2436;
@@ -1407,13 +1501,15 @@ void candidates() {
         check(reps.size() == 3 && reps[0].end == pb::AttemptEnd::Alarm && reps[1].end == pb::AttemptEnd::Alarm &&
                       reps[2].end == pb::AttemptEnd::OutOfScope,
               "two states: the stream's attempts run and end; a tip A holds is no candidate");
+        check(same.header_requests >= 1 && same.body_requests == 0 && same.bucket_requests == 0,
+              "two states: the attempt on a tip A holds ends before any body or bucket is asked (the fork is known first)");
         check(steps && ok_claims, "two states: rests_on_claims stays false while later attempts run (A's answer)");
         check(steps && ok_tpl, "two states: A builds templates equal to A_full's while the attempts run");
         check(steps && ok_copies, "two states: A judges every peer's copy while the attempts run");
         check(steps && own_caches, "two states: each state owns its own window and key cache instances");
         check(j.adopted() && j.adopted()->tip() == atip, "two states: no attempt changes A");
     }
-    // the cache level (MU-J43; N-3): an entry the attempt state computed at tip t (substituted side_data) is not
+    // the cache level (one instance per state, both legs): an entry the attempt state computed at tip t (substituted side_data) is not
     // A's: the window leg (key {tip, v}) and the key leg (same payees, another key reference)
     {
         JoinerEnv je(net);
@@ -1475,9 +1571,148 @@ void candidates() {
 }
 
 // ---------------------------------------------------------------------------
-// d1: the D-1 vector (E-75 (i), E-76): work moved between two span carriers of
+// scope: the fork of L with A's chain (3.3 step 2a, 3.3a (4)) when A holds a
+// part of the candidate's branch as a side branch, for a full node's own chain
+// and for a joined state; no body before the fork is known; A's bound-work
+// profile kept along its chain; the lost count of a replaced own chain
+// ---------------------------------------------------------------------------
+void scope() {
+    JoinNet net(900);
+    ChainShape sb;
+    sb.nonce0 = 7000000;
+    // (full node) a and b share 3,000 carriers; a grows 2 per 1 of b while b's carriers are admitted into a's tree as
+    // a side branch (the fork g = 3,000 at or above a's base); a grows to 4,200 (its base above g, the held side top at
+    // or above the base) and b to 4,700 (heavier): b's tip at a's Joiner, a's own chain as A
+    {
+        KatNode a(net, kJ0);
+        grow(a, 3000);
+        KatNode b(a);
+        std::uint64_t placed = 0;
+        for (int i = 0; i < 560; ++i) {
+            grow(a, 2);
+            const std::vector<pb::Hash32> ids = grow(b, 1, sb);
+            if (!ids.empty() && admit_place(a, *b.bodies.get(ids.back())).placed) ++placed;
+        }
+        const pb::Hash32 q = b.store.best_tip();  // the held side top
+        // b's tip 40 carriers above it (not held by a) while g lies at or above a's base: out of scope at the first
+        // reply, before any body
+        grow(b, 40, sb);
+        {
+            FullChain full(a);
+            KatServer s(b, 301);
+            JoinerEnv je(net);
+            pb::Joiner j(je.in, kP53);
+            j.set_own_chain(&full);
+            j.offer(s.best_id(), s);
+            const std::optional<pb::AttemptReport> r = j.run_next();
+            check(a.store.base_pos() <= 3000 && r && r->end == pb::AttemptEnd::OutOfScope && s.header_requests >= 1 &&
+                          s.body_requests == 0 && s.bucket_requests == 0 && !j.last_switch().replaced && j.a() == &full,
+                  "scope (full node): a branch forking at or above A's base ends at its first reply, before any body or "
+                  "bucket is asked; A kept" + (r ? ": " + rep_desc(*r) : ""));
+        }
+        grow(a, 4200 - a.store.tip_pos());
+        grow(b, 4700 - b.store.tip_pos(), sb);
+        const pb::CarrierNode* qn = a.tree.find(q);
+        const std::uint64_t base = a.store.base_pos();
+        check(placed == 560 && qn != nullptr && a.store.best_at(qn->pos) != q && base > 3000 && qn->pos >= base &&
+                      a.store.best_at(3000) == b.store.best_at(3000) && a.store.best_at(3001) != b.store.best_at(3001),
+              "scope (full node): A holds b's carriers to " + std::to_string(qn ? qn->pos : 0) +
+                      " as a side branch at or above its base " + std::to_string(base) + "; the fork 3,000 lies below it");
+        FullChain full(a);
+        KatServer s(b, 302);
+        JoinerEnv je(net);
+        pb::Joiner j(je.in, kP53);
+        j.set_own_chain(&full);
+        j.offer(s.best_id(), s);
+        const std::uint64_t lost = pb::open_bin_placements(a.store);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(r && r->end == pb::AttemptEnd::Completed && j.last_switch().replaced,
+              "scope (full node): the fork with A's chain, not the held side top, decides: below A's base, the attempt "
+              "completes and replaces A" + (r ? ": " + rep_desc(*r) : ""));
+        check(lost > 0 && j.last_switch().lost == lost,
+              "lost count: the replaced own chain's open-bin placements are counted (" +
+                      std::to_string(j.last_switch().lost) + " of " + std::to_string(lost) + ")");
+        check(j.adopted() && digest_of(*j.adopted(), b.store.best_tip()) == digest_of(b, b.store.best_tip()),
+              "scope (full node): J's digest == b's at its tip");
+    }
+    // (joined state) J joins a at 4,600 (x1 = 2,436); b forks from a at g = 4,600; J's state follows a (2 per 1 of b)
+    // and admits b's carriers as a side branch while g is at or above its base; a grows to 5,800 (J's base above g, the
+    // held side top at or above it) and b to 6,300 (heavier): b's tip at J
+    {
+        KatNode a(net, kJ0);
+        grow(a, 4600);
+        KatServer sa(a, 311);
+        JoinerEnv je(net);
+        pb::Joiner j(je.in, kP53);
+        j.offer(sa.best_id(), sa);
+        (void)j.run_next();
+        check(j.adopted() && j.adopted()->x1 == 2436 && j.adopted()->tip() == at_pos(a, 4600),
+              "scope (joined state): J adopts a at 4,600");
+        if (!j.adopted()) return;
+        pb::JoinedState& A = *j.adopted();
+        // the kept profile: one instance while A is unchanged, equal to a walk of its chain; a switch recounts it above
+        // the fork; an instance a reader holds never changes
+        const std::shared_ptr<const pb::BoundWork> p0 = A.bound_work();
+        const pb::BoundWork ref0 = profile_walk(A);
+        check(p0 && A.bound_work() == p0 && same_profile(*p0, ref0),
+              "profile: one instance while A is unchanged, equal to a walk from x1 + 1");
+        KatNode b(a);
+        {
+            // a switch to a branch one Monero height above a's (its profile differs), then back
+            KatNode w(a);
+            ChainShape sw;
+            sw.nonce0 = 7100000;
+            sw.hof = [](std::uint64_t x) { return h_pos(x) + 1; };
+            bool ok = true;
+            const std::vector<pb::Hash32> a1 = grow(a, 1);
+            for (const pb::Hash32& id : a1) ok = admit_into(A, *a.bodies.get(id)) && ok;
+            const std::shared_ptr<const pb::BoundWork> p1 = A.bound_work();
+            check(ok && A.tip() == at_pos(a, 4601) && p1 != p0 && same_profile(*p1, profile_walk(A)),
+                  "profile: after one placement on the best chain a new instance, equal to a walk");
+            const std::vector<pb::Hash32> b2 = grow(w, 2, sw);
+            for (const pb::Hash32& id : b2) ok = admit_into(A, *w.bodies.get(id)) && ok;
+            check(ok && b2.size() == 2 && A.tip() == b2.back() && !same_profile(*A.bound_work(), *p1) &&
+                          same_profile(*A.bound_work(), profile_walk(A)),
+                  "profile: after a switch to another branch (2 over 1) it equals a walk of the new chain");
+            const std::vector<pb::Hash32> a2 = grow(a, 2);
+            for (const pb::Hash32& id : a2) ok = admit_into(A, *a.bodies.get(id)) && ok;
+            check(ok && a2.size() == 2 && A.tip() == a2.back() && same_profile(*A.bound_work(), profile_walk(A)),
+                  "profile: after a switch back to a's branch (3 over 2) it equals a walk of the new chain");
+            check(same_profile(*p0, ref0), "profile: the instance a reader holds is unchanged by A's placements and switches");
+        }
+        bool follows = true;
+        std::uint64_t placed = 0;
+        for (int i = 0; i < 560; ++i) {
+            for (const pb::Hash32& id : grow(a, 2)) follows = admit_into(A, *a.bodies.get(id)) && follows;
+            const std::vector<pb::Hash32> ids = grow(b, 1, sb);
+            if (!ids.empty() && admit_into(A, *b.bodies.get(ids.back()))) ++placed;
+        }
+        const pb::Hash32 q = b.store.best_tip();
+        for (const pb::Hash32& id : grow(a, 5800 - a.store.tip_pos())) follows = admit_into(A, *a.bodies.get(id)) && follows;
+        grow(b, 6300 - b.store.tip_pos(), sb);
+        const std::optional<std::uint64_t> qp = A.pos_of(q);
+        const std::uint64_t base = A.store_base();
+        check(follows && A.tip() == at_pos(a, 5800) && placed == 560 && qp && !A.on_chain(q) && base > 4600 && *qp >= base &&
+                      A.on_chain(at_pos(a, 4600)) && same_profile(*A.bound_work(), profile_walk(A)),
+              "scope (joined state): A holds b's carriers to " + std::to_string(qp.value_or(0)) +
+                      " as a side branch at or above its base " + std::to_string(base) + "; the fork 4,600 lies below it");
+        const std::uint64_t lost = A.open_placements();
+        KatServer s(b, 312);
+        j.offer(s.best_id(), s);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        check(r && r->end == pb::AttemptEnd::Completed && j.last_switch().replaced,
+              "scope (joined state): the fork with A's chain, not the held side top, decides: below A's base, the attempt "
+              "completes and replaces A" + (r ? ": " + rep_desc(*r) : ""));
+        check(lost > 0 && j.last_switch().lost == lost, "lost count: the replaced joined state's open-bin placements are counted");
+        check(j.adopted() && digest_of(*j.adopted(), b.store.best_tip()) == digest_of(b, b.store.best_tip()),
+              "scope (joined state): J's digest == b's at its tip");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// d1: work moved between two span carriers (E-75 (i), E-76) of
 // one bin with the retarget prefix and the receipts_roots forged to match
-// (CK6 2.2, 2.3; the construction of s3b/ck6/d1_sim.py in exact S1.4 integers)
+// (the forgery constructed in exact S1.4 integers)
 // ---------------------------------------------------------------------------
 // Monero heights with 10..14 carriers each (a deterministic walk), and an inherited window at d = 10^8: the d vary.
 HOf jitter_heights(std::uint64_t n) {
@@ -1621,12 +1856,12 @@ void d1() {
         return x == 0 ? kLaneB0 : a.node(at_pos(a, x)).H;
     });
     const std::uint64_t x0 = sr.bounds.x0, x1 = sr.bounds.x1;
-    check(sr.status == pb::SpanStatus::Ok && !sr.bounds.young && x0 > kNrt, "D-1: the span at L' (x0 above N_rt)");
+    check(sr.status == pb::SpanStatus::Ok && !sr.bounds.young && x0 > kNrt, "moved work: the span at L' (x0 above N_rt)");
     const pb::Hash32 dL = digest_of(a, at_pos(a, L));
     // (i) at the joiner's span: the mismatch at a computed S1.3 #8 in (a + N_rt, b + N_rt], inside the replay
     {
         const D1Forgery g = solve_d1(a, x0, x1, L, 10000, x1);
-        check(g.ok && g.b <= x1 && g.a < g.b, "D-1 (i): a feasible forgery: a < b <= x1 of one bin, delta 10,000 (" + g.why + ")");
+        check(g.ok && g.b <= x1 && g.a < g.b, "moved work (i): a feasible forgery: a < b <= x1 of one bin, delta 10,000 (" + g.why + ")");
         KatServer f(a, 221), h(a, 222);
         f.top = h.top = L;
         apply_d1(f, a, g);
@@ -1638,11 +1873,11 @@ void d1() {
         const auto it = reps.find(221);
         check(it != reps.end() && it->second.end == pb::AttemptEnd::Alarm && it->second.row == pb::RowId::R9 &&
                       it->second.at > g.a + kNrt && it->second.at <= g.b + kNrt && it->second.at <= L && it->second.strike == 0,
-              "D-1 (i): J raises a local alarm + DEFER at a computed S1.3 #8 in (a + N_rt, b + N_rt] inside the replay, 0 tokens" +
+              "moved work (i): J raises a local alarm + DEFER at a computed S1.3 #8 in (a + N_rt, b + N_rt] inside the replay, 0 tokens" +
                       (it != reps.end() ? ": " + rep_desc(it->second) : ""));
         check(j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL && follow(*j.adopted(), a, L, L + 200) &&
                       digest_of(*j.adopted(), at_pos(a, L + 200)) == digest_of(a, at_pos(a, L + 200)),
-              "D-1 (i): J reaches A's lane digest at L and at L + 200 from the next server");
+              "moved work (i): J reaches A's lane digest at L and at L + 200 from the next server");
     }
     // (i') the same shift built for E-16's span at L (the old rule): the prefix forgery lies inside the joiner's span
     // at L' and is refused there; never adopted
@@ -1658,7 +1893,7 @@ void d1() {
         (void)e16;
         const D1Forgery g = solve_d1(a, ex0, ex1, L, 10000, L + 1000 - kNrt);
         check(g.ok && g.a > ex0 && g.b + kNrt > L && g.b + kNrt <= L + 1000,
-              "D-1 (i'): a feasible forgery against E-16's span at L (its mismatch past L) (" + g.why + ")");
+              "moved work (i'): a feasible forgery against E-16's span at L (its mismatch past L) (" + g.why + ")");
         KatServer f(a, 223), h(a, 224);
         f.top = h.top = L;
         apply_d1(f, a, g);
@@ -1670,11 +1905,11 @@ void d1() {
         const auto it = reps.find(223);
         check(it != reps.end() && it->second.end == pb::AttemptEnd::Alarm && it->second.row == pb::RowId::R9 &&
                       it->second.at <= L && it->second.strike == 0,
-              "D-1 (i'): with the span at L' the forgery mismatches a computed S1.3 #8 inside the replay, 0 tokens" +
+              "moved work (i'): with the span at L' the forgery mismatches a computed S1.3 #8 inside the replay, 0 tokens" +
                       (it != reps.end() ? ": " + rep_desc(it->second) : ""));
         check(j.adopted() && j.adopted()->tip() == at_pos(a, L) && follow(*j.adopted(), a, L, L + 1050) &&
                       digest_of(*j.adopted(), at_pos(a, L + 1050)) == digest_of(a, at_pos(a, L + 1050)),
-              "D-1 (i'): J joins the honest chain and follows A past b + N_rt with A's digest");
+              "moved work (i'): J joins the honest chain and follows A past b + N_rt with A's digest");
     }
 }
 
@@ -1784,6 +2019,7 @@ int main(int argc, char** argv) {
     run("claims", claims);
     run("attempts", attempts);
     run("candidates", candidates);
+    run("scope", scope);
     run("d1", d1);
     run("fastpool", fastpool);
     run("ratchet", ratchet);

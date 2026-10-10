@@ -102,6 +102,11 @@ struct BoundWork {
     }
 };
 
+// a - b where b is a part of the sum a (a term this profile added earlier): no borrow out of 128 bits.
+inline constexpr U128 bound_work_minus(const U128& a, const U128& b) noexcept {
+    return U128{a.lo - b.lo, a.hi - b.hi - (a.lo < b.lo ? std::uint64_t{1} : std::uint64_t{0})};
+}
+
 // Rule (4) of ruling 44 as ruling 45 reads it: a completed candidate C
 // replaces the adopted chain A when C's bound work from h_f up is greater
 // than A's from h_f up, h_f = the greater of the two bound parts' lowest
@@ -259,17 +264,40 @@ struct JoinInputs {
 };
 
 // ---------------------------------------------------------------------------
+// The open-bin placements of a store's best chain at its tip (the lost count
+// of a switch by the joiner path: the abandoned chain's placements whose
+// origin bin is open, none of them re-pended).
+// ---------------------------------------------------------------------------
+inline std::uint64_t open_bin_placements(const BinStore& store) {
+    const LaneView v = store.view_at(store.best_tip());
+    if (!v.ok()) return 0;
+    std::uint64_t n = 0;
+    const std::uint64_t H = v.record(v.pos());
+    const std::uint64_t F = store.params().open_bins;
+    for (std::uint64_t b = H > F ? H - F + 1 : store.b0(); b <= H + store.params().fresh_max; ++b)
+        n += v.live_entries(b, v.pos()).size();
+    return n;
+}
+
+// ---------------------------------------------------------------------------
 // The adopted state A as an attempt sees it (3.3a (4), (6)).
 // ---------------------------------------------------------------------------
 class AdoptedChain {
 public:
     virtual ~AdoptedChain() = default;
+    // id is a node of A's tree (its best chain or a side branch)
     virtual bool holds(const Hash32& id) const = 0;
+    // id lies on A's best chain (the fork of a candidate with A is its newest header there)
+    virtual bool on_chain(const Hash32& id) const = 0;
     virtual std::optional<std::uint64_t> pos_of(const Hash32& id) const = 0;
     virtual std::optional<std::uint64_t> joined_x1() const = 0;  // a joined chain's x1; nullopt: a full node's own
     virtual std::uint64_t store_base() const = 0;                // the one depth measure (Part A 1.4)
-    virtual BoundWork bound_work() const = 0;
+    // A's bound-work profile; the instance is shared with its readers and never
+    // changes after it is returned (A's later placements make a new one).
+    virtual std::shared_ptr<const BoundWork> bound_work() const = 0;
     virtual Hash32 tip() const = 0;
+    // the open-bin placements of A's best chain (the lost count when A is replaced)
+    virtual std::uint64_t open_placements() const = 0;
 };
 
 class JoinedState;
@@ -430,6 +458,10 @@ public:
 
     // ---- AdoptedChain ----
     bool holds(const Hash32& id) const override { return tree && tree->find(id) != nullptr; }
+    bool on_chain(const Hash32& id) const override {
+        const std::optional<std::uint64_t> p = pos_of(id);
+        return p && store && store->best_at(*p) == id;
+    }
     std::optional<std::uint64_t> pos_of(const Hash32& id) const override {
         if (!tree) return std::nullopt;
         const CarrierNode* n = tree->find(id);
@@ -440,34 +472,61 @@ public:
     std::uint64_t store_base() const override { return store ? store->base_pos() : 0; }
     Hash32 tip() const override { return store ? store->best_tip() : Hash32{}; }
     // The carriers whose S1.3 #9 this node computed: x1 + 1 .. its best tip
-    // ([1, tip] on a young chain), each its d at h(c).
-    BoundWork bound_work() const override {
-        BoundWork w;
-        if (!tree || !store) return w;
+    // ([1, tip] on a young chain), each its d at h(c). Kept along the best
+    // chain: a position is counted once, a switch recounts only the positions
+    // above its fork, and an unchanged chain returns the same instance (a read
+    // walks no part of the chain).
+    std::shared_ptr<const BoundWork> bound_work() const override {
+        sync_profile();
+        return profile_;
+    }
+
+    // The open-bin placements of the best chain (the lost count of a switch by the joiner path).
+    std::uint64_t open_placements() const override { return store ? open_bin_placements(*store) : 0; }
+
+private:
+    struct Counted {
+        Hash32 id{};
+        std::uint64_t h = 0;
+        std::uint64_t d = 0;
+    };
+    // The profile instance to change (a new one while a reader holds it).
+    BoundWork& profile_for_write() const {
+        if (profile_.use_count() > 1) profile_ = std::make_shared<BoundWork>(*profile_);
+        return *profile_;
+    }
+    void sync_profile() const {
+        if (!tree || !store) return;
         const std::uint64_t lo = young ? 1 : x1 + 1;
-        for (std::uint64_t x = store->tip_pos(); x >= lo && x > 0; --x) {
+        const std::uint64_t top = store->tip_pos();
+        const std::size_t want = top >= lo ? static_cast<std::size_t>(top - lo + 1) : 0;
+        // the counted positions still on the best chain (ids link: the newest match keeps every lower one)
+        std::size_t keep = std::min(counted_.size(), want);
+        while (keep > 0 && store->best_at(lo + keep - 1) != counted_[keep - 1].id) --keep;
+        if (keep == counted_.size() && keep == want) return;
+        BoundWork& w = profile_for_write();
+        while (counted_.size() > keep) {
+            const Counted c = counted_.back();
+            counted_.pop_back();
+            const auto n = counted_at_.find(c.h);
+            if (n == counted_at_.end()) continue;
+            if (--n->second == 0) {
+                counted_at_.erase(n);
+                w.at.erase(c.h);
+            } else {
+                w.at[c.h] = bound_work_minus(w.at[c.h], U128{c.d, 0});
+            }
+        }
+        for (std::uint64_t x = lo + counted_.size(); x <= top; ++x) {
             const std::optional<Hash32> id = store->best_at(x);
             const CarrierNode* n = id ? tree->find(*id) : nullptr;
             if (n == nullptr) break;
             w.add(n->h, n->d);
+            ++counted_at_[n->h];
+            counted_.push_back(Counted{*id, n->h, n->d});
         }
-        return w;
     }
 
-    // The open-bin placements of the best chain (the lost count of a switch by the joiner path).
-    std::uint64_t open_placements() const {
-        if (!store) return 0;
-        const LaneView v = store->view_at(store->best_tip());
-        if (!v.ok()) return 0;
-        std::uint64_t n = 0;
-        const std::uint64_t H = v.record(v.pos());
-        const std::uint64_t F = in_->p.open_bins;
-        for (std::uint64_t b = H > F ? H - F + 1 : store->b0(); b <= H + in_->p.fresh_max; ++b)
-            n += v.live_entries(b, v.pos()).size();
-        return n;
-    }
-
-private:
     const JoinInputs* in_;
     std::uint64_t server_;
     JoinClaims claims_;
@@ -475,6 +534,9 @@ private:
     KeyCache own_keys_;
     WindowCache* windows_ = nullptr;
     KeyCache* keys_ = nullptr;
+    mutable std::vector<Counted> counted_;                       // the best chain's positions lo .. counted so far
+    mutable std::map<std::uint64_t, std::uint64_t> counted_at_;  // carriers counted per Monero height
+    mutable std::shared_ptr<BoundWork> profile_ = std::make_shared<BoundWork>();
 };
 
 inline Basis JoinClaims::basis(RowClass k, const Hash32& tip, std::uint64_t x) const {
@@ -812,7 +874,7 @@ struct AttemptReport {
     std::uint64_t alarms = 0;              // local alarms raised (claims, node-internal)
     std::string what;                      // a short reason
     SpanBounds span;
-    BoundWork a_profile;                   // A's bound work, read when the attempt took its L
+    std::shared_ptr<const BoundWork> a_profile;  // A's bound work, read when the attempt took its L
     bool a_profile_read = false;
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
@@ -874,7 +936,7 @@ private:
         return finish();
     }
 
-    // ---- headers (3.3 step 2a; JC: the claimed positions) ----
+    // ---- headers (3.3 step 2a; the positions the server claims) ----
     // One FC_GETHEADERS page: at most N_rt headers, so no page asks below the
     // server's P-51 header floor x0(L') - N_rt (every position the span scan
     // needs lies at or above x0 - 1).
@@ -913,25 +975,35 @@ private:
     }
 
     // The record H(x) on the candidate's chain (running max of h from the
-    // lowest held header up; H(0) = b0).
+    // lowest held header up; H(0) = b0). A header whose P_r is not resolved
+    // gives no record: the attempt ends (pr_unresolved_).
     std::optional<std::uint64_t> rec(std::uint64_t x) {
         if (x == 0) return in_.b0;
         if (x < lo_pos_ || x > rep_.L) return std::nullopt;
         if (records_.size() != hdr_.size() || rec_lo_ != lo_pos_) {
-            records_.assign(hdr_.size(), 0);
+            records_.clear();
             std::uint64_t H = 0;
             for (std::size_t i = 0; i < hdr_.size(); ++i) {
-                const std::uint64_t h = h_of(hdr_[i].own);
-                H = std::max(H, h);
-                records_[i] = H;
+                const std::optional<std::uint64_t> h = h_of(hdr_[i].own);
+                if (!h) {
+                    pr_unresolved_ = true;
+                    records_.clear();
+                    return std::nullopt;
+                }
+                H = std::max(H, *h);
+                records_.push_back(H);
             }
             rec_lo_ = lo_pos_;
         }
         return records_[x - lo_pos_];
     }
-    std::uint64_t h_of(const ReceiptBodyV3& r) {
+    // h(r) = the height of its P_r + 1. A P_r the follower does not hold is
+    // fetched as at a full node (data any peer may serve, within the abandon
+    // timeout); nullopt: not resolved (the attempt ends as non-service).
+    std::optional<std::uint64_t> h_of(const ReceiptBodyV3& r) {
         std::uint64_t h = join_detail::height_of(in_, r);
         if (h == 0 && in_.fetch_context && in_.fetch_context(r.blob.prev_id, timeout_)) h = join_detail::height_of(in_, r);
+        if (h == 0) return std::nullopt;
         return h;
     }
     const CarrierHeader* header_at(std::uint64_t x) const {
@@ -966,7 +1038,7 @@ private:
         }
         rep_.L = r.first_pos + r.headers.size() - 1;
         rep_.tip = receipt_id(r.headers.back().own);
-        // N-6: A's bound work in the step that records L
+        // A's bound work in the step that records L
         if (a_ != nullptr) {
             rep_.a_profile = a_->bound_work();
             rep_.a_profile_read = true;
@@ -976,13 +1048,15 @@ private:
         return take_headers(r, std::nullopt);
     }
 
-    // 3.3 step 2a / 3.3a (4) with N-7: the fork of L with A from the hash links.
+    // 3.3 step 2a / 3.3a (4): L held by A, else the fork of L with A's chain
+    // (the newest candidate header on A's best chain), from the hash links
+    // before any body.
     bool in_scope() {
         for (;;) {
             for (std::uint64_t x = rep_.L + 1; x-- > lo_pos_;) {
                 const Hash32 id = receipt_id(header_at(x)->own);
-                if (!a_->holds(id)) continue;
-                if (x == rep_.L) return fail(AttemptEnd::OutOfScope, "L held by A");
+                if (x == rep_.L && a_->holds(id)) return fail(AttemptEnd::OutOfScope, "L held by A");
+                if (!a_->on_chain(id)) continue;
                 const std::uint64_t f = a_->pos_of(id).value_or(x);
                 const std::optional<std::uint64_t> ax1 = a_->joined_x1();
                 const bool deep = (ax1 && f <= *ax1) || f < a_->store_base();
@@ -1001,6 +1075,7 @@ private:
     bool bounds() {
         for (;;) {
             const SpanResult s = span_bounds(in_.p, rep_.L, [this](std::uint64_t x) { return rec(x); });
+            if (pr_unresolved_) return fail(AttemptEnd::NotServed, "a header's P_r not resolved");
             std::uint64_t need_lo = 1;
             if (s.status == SpanStatus::Ok) {
                 rep_.span = s.bounds;
@@ -1100,7 +1175,9 @@ private:
         } else {
             const CarrierHeader* rh = header_at(x0 - 1);
             root_id = receipt_id(rh->own);
-            root_h = h_of(rh->own);
+            const std::optional<std::uint64_t> rh_h = h_of(rh->own);
+            if (!rh_h) return fail(AttemptEnd::NotServed, "a header's P_r not resolved");
+            root_h = *rh_h;
             s.root_prev = rh->own.blob.prev_id;
         }
         if (root_id != cx0.own.side.tip) return fail(AttemptEnd::Contradiction, "c_x0 does not link to the root");
@@ -1319,7 +1396,9 @@ private:
                     return fail(AttemptEnd::Contradiction, "a header that is not the placed carrier's");
                 continue;
             }
-            const IndexAdd a = s.headers.add(s.server(), h, h_of(h.own), join_detail::header_path_ok(in_, h));
+            const std::optional<std::uint64_t> hh = h_of(h.own);
+            if (!hh) return fail(AttemptEnd::NotServed, "a side header's P_r not resolved");
+            const IndexAdd a = s.headers.add(s.server(), h, *hh, join_detail::header_path_ok(in_, h));
             if (a == IndexAdd::Replaced) return fail(AttemptEnd::Contradiction, "a second variant of an id");
             if (a == IndexAdd::Added) fresh = true;
         }
@@ -1378,6 +1457,7 @@ private:
     std::uint64_t lo_pos_ = 0;
     std::vector<std::uint64_t> records_;
     std::uint64_t rec_lo_ = 0;
+    bool pr_unresolved_ = false;  // a held header's P_r not resolved: the attempt ends
     std::map<Hash32, CarrierBodyV3> span_bodies_;
     AtHeader at_x0_{};
     BucketsAnchor anchor_x0_{};
@@ -1404,7 +1484,8 @@ inline SwitchPath own_switch_path(const JoinedState& a, std::uint64_t fork) {
 struct SwitchReport {
     bool adopted = false;    // the first completed attempt adopted
     bool replaced = false;   // a completed candidate replaced A (a switch by the joiner path)
-    std::uint64_t lost = 0;  // the abandoned chain's open-bin placements (counted lost; nothing re-pended)
+    std::uint64_t lost = 0;  // the replaced A's open-bin placements, a joined state or a full node's own chain
+                             // (counted lost; nothing re-pended; the caller logs it)
 };
 
 class Joiner {
@@ -1469,11 +1550,12 @@ private:
             known_.clear();
             return;
         }
-        const BoundWork c = rep.state->bound_work();
+        const std::shared_ptr<const BoundWork> c = rep.state->bound_work();
+        const std::shared_ptr<const BoundWork> ap = rep.a_profile ? rep.a_profile : std::make_shared<const BoundWork>();
         const Hash32 a_tip = a()->tip();
-        if (candidate_replaces(c, rep.tip, rep.a_profile, a_tip)) {
+        if (candidate_replaces(*c, rep.tip, *ap, a_tip)) {
             switch_.replaced = true;
-            switch_.lost = adopted_ ? adopted_->open_placements() : 0;  // counted lost, never re-pended
+            switch_.lost = a()->open_placements();  // A's (joined or the full node's own): counted lost, never re-pended
             adopted_ = std::move(rep.state);  // the old A is discarded with its store
             own_ = nullptr;
             known_.clear();

@@ -95,6 +95,7 @@ struct JoinerEnv {
     pb::FollowerBranchView mon;
     std::set<pb::Hash32> bad_pow;
     std::set<pb::Hash32> hidden;        // P_r the follower does not hold until fetched
+    std::set<pb::Hash32> unservable;    // hidden P_r no peer serves (FB_GETCTX not resolved)
     std::uint64_t ctx_fetches = 0;
     pb::JoinInputs in;
 
@@ -129,6 +130,7 @@ struct JoinerEnv {
         };
         in.fetch_context = [this](const pb::Hash32& id, std::uint64_t) {
             ++ctx_fetches;
+            if (unservable.count(id) != 0) return false;
             hidden.erase(id);
             return mon.block(id).has_value();
         };
@@ -333,6 +335,42 @@ inline bool follow(pb::JoinedState& j, KatNode& a, std::uint64_t from, std::uint
             return false;
         }
     }
+    return true;
+}
+
+// The joined node admits one carrier from a peer (as a full node after L) and follows a switch of its best
+// chain; true: placed (the best chain extended, a side branch, or a switch to it).
+inline bool admit_into(pb::JoinedState& j, const pb::CarrierBodyV3& c, std::uint64_t peer = 78) {
+    for (const pb::ReceiptBodyV3& r : c.carried) j.learn_refs(r);
+    j.learn_refs(c.own);
+    const std::vector<std::uint8_t> f = frame_of(c);
+    pb::AdmitEnv env = j.env();
+    const pb::AdmitResult r = pb::admit_frame_from(env, peer, f, pb::CarrierRole::Frame);
+    if (r.verdict != pb::AdmitVerdict::AdmitCarrier) {
+        check(false, "admit_into: not admitted: " + desc(r));
+        return false;
+    }
+    const pb::WriteResult w = pb::place_admitted(*j.tree, *j.store, j.ar, j.bodies, r, &j.alarm);
+    if (w.outcome == pb::WriteOutcome::SwitchToCaller)
+        return j.store->switch_best(j.tree->best().id) == pb::SwitchVerdict::Switched;
+    return w.outcome == pb::WriteOutcome::Extended || w.outcome == pb::WriteOutcome::SideBranch;
+}
+
+// A joined state's bound-work profile by a walk of its best chain (x1 + 1 .. tip; 1 .. tip on a young chain).
+inline pb::BoundWork profile_walk(const pb::JoinedState& j) {
+    pb::BoundWork w;
+    for (std::uint64_t x = j.young ? 1 : j.x1 + 1; x <= j.store->tip_pos(); ++x) {
+        const pb::CarrierNode* n = j.tree->find(j.store->best_at(x).value_or(pb::Hash32{}));
+        if (n == nullptr) break;
+        w.add(n->h, n->d);
+    }
+    return w;
+}
+
+inline bool same_profile(const pb::BoundWork& a, const pb::BoundWork& b) {
+    if (a.at.size() != b.at.size()) return false;
+    for (auto ia = a.at.begin(), ib = b.at.begin(); ia != a.at.end(); ++ia, ++ib)
+        if (ia->first != ib->first || ia->second.lo != ib->second.lo || ia->second.hi != ib->second.hi) return false;
     return true;
 }
 
