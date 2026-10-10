@@ -24,11 +24,20 @@
 //                the buckets of bins below lc(H(x0 - 1)).
 //     fetch B    at = c_L: the bins H(x0 - 1) - F < b <= min(H(L - 1) - F,
 //                H(x0 - 1) + Fresh); no fetch at a child of L.
+//     prefix     the claimed retarget prefix [x_pre, x0 - 1] (ruling 53,
+//                E-99): x_pre = pre_start(x0) (pathb_joiner.hpp); its headers
+//                hash-linked, no PoW; below x0 - N_rt asked one record at a time
+//                (the record the formula reads next).
 //     replay     x0 .. L through admit_carrier with the attempt's JoinClaims
 //                (CarrierTree::joined at x0 - 1 with the retarget prefix as its
-//                window, BinStore::joined with the adopt bound, AR seeded by the
-//                joiner row (S_{x0-1}.epoch_cur, x0 - 1, S_{x0-1}.rules_cur));
-//                every mmr_root of [x0, x1] compared with the joined MMR.
+//                window and its nodes [x_pre, x0 - 2], BinStore::joined with the
+//                adopt bound, AR seeded by the joiner row (S_{x0-1}.epoch_cur,
+//                x0 - 1, S_{x0-1}.rules_cur)); every mmr_root of [x0, x1]
+//                compared with the joined MMR. A walked branch forking at a
+//                prefix node f (r's tip branch and the closure's) takes S(f)
+//                and the claimed view at f from one FC_GETBUCKETS at its first
+//                carrier (ruling 47, E-83; ruling 53, E-100); a bin sealed on
+//                such a branch from a served bucket at its next carrier.
 //   The attempt ends on: completion at L; an alarm on a claim (the server
 //   excluded); the server not serving (a not-served reply, no reply within the
 //   timeout, a short FC_HEADERS / FC_GETCARRIER reply; the pair to the end of
@@ -174,7 +183,8 @@ public:
 // ---------------------------------------------------------------------------
 struct JoinServeFloors {
     std::uint64_t bodies = 0;   // bodies, tree nodes, side headers and views from x0(L') - J_0 - 1
-    std::uint64_t headers = 0;  // carrier headers from x0(L') - N_rt
+    std::uint64_t headers = 0;  // carrier headers from the claimed prefix start x_pre(L') (ruling 53, E-102), with the
+                                // record that fixes it (pre_start's read_lo)
 };
 
 // The floors at the server's best tip L (rec: H on its best chain).
@@ -183,6 +193,9 @@ struct JoinServeFloors {
 // keeps bodies and headers from position 1 (floors {0, 0}). That covers the
 // young chain (lc(H(x0 - 1)) = 0, E-79) and the young path of a side branch
 // with no sealed bin (E-83), so both are servable at the default retention.
+// The header floor (ruling 53, E-102): the claimed prefix start x_pre(L')
+// and the record below it that fixes it (pre_start's read_lo); 0 (position 1
+// on) where x0 <= N_rt.
 template <class Rec>
 inline JoinServeFloors join_serve_floors(const LaneParams& p, std::uint64_t L, Rec&& rec, std::uint64_t b0 = 0) {
     const SpanResult s = span_bounds(p, L, rec, b0);
@@ -195,7 +208,9 @@ inline JoinServeFloors join_serve_floors(const LaneParams& p, std::uint64_t L, R
         const std::optional<std::uint64_t> hf = rec(body);
         if (hf && bin_leaf_count(*hf, b0, p.open_bins) == 0) return JoinServeFloors{0, 0};
     }
-    return JoinServeFloors{body, x0 > nrt ? x0 - nrt : 0};
+    if (x0 <= nrt) return JoinServeFloors{body, 0};
+    const PreStart ps = pre_start(p, x0, rec);
+    return JoinServeFloors{body, ps.status == SpanStatus::Ok ? ps.read_lo : x0 - nrt};
 }
 
 // The hold of a serving node (P-51 as corrected): the floor taken at its best
@@ -326,6 +341,11 @@ class JoinedState;
 //     Roots    NotComputed for tips below x1; else ClaimSpan (c_x0's peaks)
 //     Walk     Computed: a Boundary / Closure decided on the server's
 //              variants ends the attempt as an unplaceable span carrier
+//     a tip on a side branch forking at a prefix node below the root (ruling
+//              53, E-100, E-101): ClaimSpan; Coinbase and Roots NotComputed
+//              where the window at the tip reads a bin open at f (H(t) <
+//              H(f) + F + Fresh) or a bin sealed at the tip that no carrier of
+//              the branch serves (placements below x0 are claims, none held)
 //   after L: Coinbase ClaimLeaf where the window reads an adopted leaf, Roots
 //     ClaimLeaf (the mmr_root commits the adopted leaves), Computed otherwise.
 //   The young chain: Computed everywhere.
@@ -343,6 +363,7 @@ public:
     Phase phase() const noexcept { return phase_; }
 
     Basis basis(RowClass k, const Hash32& tip, std::uint64_t x) const override;
+    Basis base_basis(RowClass k, const Hash32& tip, std::uint64_t x) const;
     Basis header_binding(const Hash32& id, const Hash32& header_digest) const override;
     bool judge_copy(std::uint64_t peer, const Hash32& object_digest) const override;
     bool leaf_servable(std::uint64_t bin) const override;
@@ -552,6 +573,25 @@ private:
 inline Basis JoinClaims::basis(RowClass k, const Hash32& tip, std::uint64_t x) const {
     const JoinedState& s = *st_;
     if (s.young) return Basis::Computed;  // the young chain: no claim
+    const bool replay = phase_ == Phase::Replay;
+    // ruling 53 (E-100, E-101): a tip on a side branch forking at a prefix node below the root reads the claimed
+    // view at f during the replay (a claim); its rows that read placements below x0 are not computed
+    const CarrierNode* tn = replay && s.tree ? s.tree->find(tip) : nullptr;
+    if (tn != nullptr && tn->below_root && !(s.store && s.store->best_at(tn->pos) == tip)) {
+        const Basis b = base_basis(k, tip, x);
+        if (b == Basis::NotComputed) return b;
+        if (k == RowClass::Coinbase || k == RowClass::Roots) {
+            const LaneParams& p = s.inputs().p;
+            if (tn->H < tn->pre_fork_H + p.open_bins + p.fresh_max) return Basis::NotComputed;  // a bin open at f
+            if (s.store && s.store->view_at(tip).pending_bin()) return Basis::NotComputed;     // a bin no carrier serves
+        }
+        return Basis::ClaimSpan;
+    }
+    return base_basis(k, tip, x);
+}
+
+inline Basis JoinClaims::base_basis(RowClass k, const Hash32& tip, std::uint64_t x) const {
+    const JoinedState& s = *st_;
     const bool replay = phase_ == Phase::Replay;
     const std::uint64_t x1 = s.x1;
     switch (k) {
@@ -900,6 +940,11 @@ struct AttemptReport {
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
 
+// The FC_HEADERS 0x53 frame head at frame version 0x02 (ruling 48 JC-3L (a), E-86): FH (opcode, version, chain_id:
+// 6 B) | u64 first_pos | u16 n, before the n headers.
+inline constexpr std::uint64_t kJoinHeadersFrameHead = kFrameHeaderBytes + sizeof(std::uint64_t) + kU16Bytes;
+static_assert(kJoinHeadersFrameHead == 6 + 8 + 2, "the FC_HEADERS v0x02 frame head: FH 6 + first_pos 8 + n 2");
+
 namespace join_detail {
 
 inline std::uint64_t height_of(const JoinInputs& in, const ReceiptBodyV3& r) {
@@ -969,11 +1014,11 @@ private:
     std::uint64_t header_page() const {
         return std::min<std::uint64_t>(std::max<std::uint64_t>(1, in_.journal_depth), join_n_rt(in_.p));
     }
-    // what one FC_HEADERS frame can carry
+    // what one FC_HEADERS frame can carry: its head at frame version 0x02 is FH | u64 first_pos | u16 n (E-86)
     std::uint64_t frame_fit() const {
         const std::uint64_t max_header = 1 + in_.buffers.receipt + 1 + 2 * sizeof(std::uint64_t);
-        const std::uint64_t room = in_.headers_frame_bytes > kFrameHeaderBytes + kU16Bytes
-                                           ? in_.headers_frame_bytes - kFrameHeaderBytes - kU16Bytes
+        const std::uint64_t room = in_.headers_frame_bytes > kJoinHeadersFrameHead
+                                           ? in_.headers_frame_bytes - kJoinHeadersFrameHead
                                            : 0;
         return std::max<std::uint64_t>(1, room / max_header);
     }
@@ -1127,7 +1172,8 @@ private:
     bool scope_scan() {
         if (scope_done_ || rep_.L == 0) return true;  // decided, or an empty / position-0 candidate
         const std::uint64_t hi = scope_lo_ == 0 ? rep_.L + 1 : scope_lo_;
-        for (std::uint64_t x = hi; x-- > lo_pos_;) {
+        const std::uint64_t lo = std::max(lo_pos_, scope_floor_);  // never below x0(L') - N_rt (E-82, E-104)
+        for (std::uint64_t x = hi; x-- > lo;) {
             const Hash32 id = receipt_id(header_at(x)->own);
             if (!a_->on_chain(id)) continue;
             scope_done_ = true;
@@ -1136,7 +1182,7 @@ private:
             const bool deep = (ax1 && f <= *ax1) || f < a_->store_base();
             return deep ? true : fail(AttemptEnd::OutOfScope, "the fork lies above A's x1 and at or above its base");
         }
-        scope_lo_ = lo_pos_;
+        scope_lo_ = lo;
         return true;
     }
     bool in_scope() {
@@ -1156,24 +1202,38 @@ private:
         for (;;) {
             const SpanResult s = span_bounds(in_.p, rep_.L, [this](std::uint64_t x) { return rec(x); }, in_.b0);
             std::uint64_t need_lo = 1;
+            bool held = false;
             if (s.status == SpanStatus::Ok) {
                 rep_.span = s.bounds;
+                const std::uint64_t nrt = join_n_rt(in_.p);
                 if (!s.bounds.young) {
                     x0_known_ = true;  // below x0 the PRE is hash-linked, no PoW (header check (5))
                     x0_ = s.bounds.x0;
+                    scope_floor_ = x0_ > nrt ? x0_ - nrt : 1;  // the scope scan's floor x0(L') - N_rt (E-82, E-104)
                 }
-                const std::uint64_t nrt = join_n_rt(in_.p);
                 const std::uint64_t want = s.bounds.young ? 1 : (s.bounds.x0 > nrt ? s.bounds.x0 - nrt : 1);
-                need_lo = want;                    // the PRE: no header below x0 - N_rt asked (the retarget-prefix floor)
+                need_lo = want;  // pages down to x0 - N_rt: no page asks below what the span reads
+                if (s.bounds.young) {
+                    held = lo_pos_ <= want;
+                } else if (lo_pos_ <= want) {
+                    // ruling 53 (E-99): the claimed prefix starts at x_pre; below x0 - N_rt the attempt asks exactly the
+                    // record the formula reads next
+                    const PreStart ps = pre_start(in_.p, s.bounds.x0, [this](std::uint64_t x) { return rec(x); });
+                    if (ps.status == SpanStatus::Ok) {
+                        x_pre_ = ps.x_pre;
+                        held = true;
+                    } else if (ps.need >= lo_pos_) {
+                        return fail(AttemptEnd::NotServed, "the prefix start's record lies outside the chain");
+                    } else {
+                        need_lo = ps.need;
+                    }
+                }
             }
             // (5) on the span held so far (floor = x0 once known, else every held header): the PRE below x0 is exempt
             if (!check_span_pow(x0_known_ ? x0_ : lo_pos_)) return false;
             if (!scope_on_page()) return false;  // the scope over the page that arrived last
-            if (s.status == SpanStatus::Ok && lo_pos_ <= need_lo) return true;  // the span (or whole young chain) held
-            if (lo_pos_ <= 1) {
-                if (s.status == SpanStatus::Ok) return true;
-                return fail(AttemptEnd::NotServed, "the records do not reach the span");
-            }
+            if (held) return true;  // the span with its prefix (or the whole young chain) held
+            if (lo_pos_ <= 1) return fail(AttemptEnd::NotServed, "the records do not reach the span");
             if (!more_headers(need_lo)) return false;
         }
     }
@@ -1233,8 +1293,10 @@ private:
         if (!fetch_bodies(x0, x0) || !fetch_bodies(rep_.L, rep_.L)) return false;
         if (!body_matches_header(x0) || !body_matches_header(rep_.L))
             return fail(AttemptEnd::Contradiction, "a body is not its header");
-        // the root (x0 - 1) and the retarget prefix [max(1, x0 - N_rt), x0 - 1]
-        const std::uint64_t pre_lo = x0 > nrt ? x0 - nrt : 1;
+        // the root (x0 - 1) and the claimed retarget prefix [x_pre, x0 - 1] (ruling 53, E-99; the tree's window keeps
+        // its newest N_rt entries)
+        const std::uint64_t pre_lo = x_pre_;
+        if (pre_lo > (x0 > nrt ? x0 - nrt : 1)) return fail(AttemptEnd::NotServed, "the retarget prefix not held");
         std::vector<RetargetEntry> pre;
         std::vector<Hash32> pre_ids;
         std::vector<std::uint64_t> pre_rec;
@@ -1279,7 +1341,8 @@ private:
             peaks = *fa.peaks;
             root_s = *fa.s_parent;
         }
-        // the PRE headers below the root [pre_lo, x0 - 2] as claimed nodes of the joined tree (ruling 47, E-84)
+        // the prefix headers below the root [x_pre, x0 - 2] as claimed nodes of the joined tree (ruling 47, E-84;
+        // ruling 53, E-99)
         std::vector<CarrierTree::PreNode> pre_nodes;
         if (x0 > 1) {
             for (std::uint64_t x = pre_lo; x + 1 < x0; ++x) {
@@ -1335,10 +1398,13 @@ private:
 
     // A bucket fetch's end inside the attempt; false: the attempt ended.
     bool take_fetch(const BucketsFetch& f, bool fetch_a) {
+        return take_fetch(f, fetch_a ? "fetch A not served" : "fetch B not served");
+    }
+    bool take_fetch(const BucketsFetch& f, const char* not_served) {
         for (const auto& [id, k] : f.refs) st_->refs.emplace(id, k);
         switch (f.end) {
             case BucketsEnd::Complete: return true;
-            case BucketsEnd::NotServed: return fail(AttemptEnd::NotServed, fetch_a ? "fetch A not served" : "fetch B not served");
+            case BucketsEnd::NotServed: return fail(AttemptEnd::NotServed, not_served);
             case BucketsEnd::AtClaim:
                 st_->alarm.raise(RowId::None, Basis::ClaimSpan, Hash32{}, Missing::ClaimAlarm);
                 return fail(AttemptEnd::Alarm, "a bucket reply against a claimed at header");
@@ -1378,27 +1444,52 @@ private:
         return true;
     }
 
-    // ruling 47 (E-83): a carried receipt of c whose tip lies on a side branch
-    // forking at a PRE node f below x0 - 1 cannot be folded without S(f). The
-    // joiner fetches S(f) from the attempt's server by FC_GETBUCKETS at = the
-    // side branch's first carrier (whose S_parent = S(f)) and sets the fork
-    // node's claimed ratchet state, then re-admits c. The fold runs over the
-    // side carrier's carried list: its body set is fetched first.
+    // ruling 47 (E-83), ruling 53 (E-100): a walked branch forking at a prefix
+    // node f below x0 - 1 (r's tip branch, and every branch the walk entered:
+    // the closure's) cannot be folded without S(f). The joiner fetches S(f)
+    // from the attempt's server by FC_GETBUCKETS at = the branch's first
+    // carrier, its fork that carrier's parent (B7), whose S_parent = S(f) and
+    // whose peaks at lc(H(f)) are proved against its mmr_root; it sets the fork
+    // node's claimed ratchet state and the store's claimed view at f, then
+    // re-admits c. The fold runs over the first carrier's carried list: its
+    // body set is fetched first.
     enum class SpanFold : std::uint8_t { None, Fetched, Young, Alarm, NotServed, Ended };
-    SpanFold try_span_fold(const CarrierBodyV3& c) {
+    // The first carrier of the walked branch through `t`: down its held header
+    // variants to the carrier whose parent is a tree node (nullptr: not held).
+    const HeaderVariant* first_carrier(const Hash32& t) const {
+        const JoinedState& s = *st_;
+        std::vector<const HeaderVariant*> vs = s.headers.variants(t);
+        for (std::uint64_t k = 0; !vs.empty() && k <= admit_j0(in_.p) + 1; ++k) {
+            const HeaderVariant* y = vs.front();
+            if (s.tree->find(y->header.own.side.tip) != nullptr) return y;
+            vs = s.headers.variants(y->header.own.side.tip);
+        }
+        return nullptr;
+    }
+    SpanFold try_span_fold(const CarrierBodyV3& c, const std::vector<Hash32>& walked) {
         JoinedState& s = *st_;
         if (s.young || !s.tree || !s.store) return SpanFold::None;
         const std::uint64_t root_pos = s.x0 > 0 ? s.x0 - 1 : 0;
         const std::uint64_t first_pos = s.store->first_record_pos();
-        for (const ReceiptBodyV3& r : c.carried) {
-            const Hash32 t = r.side.tip;
-            if (s.tree->find(t) != nullptr) continue;          // on the joined chain, or already placed
-            if (!span_s_done_.insert(t).second) continue;      // S(f) for this side branch already attempted
-            const std::vector<const HeaderVariant*> vs = s.headers.variants(t);
-            if (vs.empty()) continue;                          // the side header is not held (the TipHeaders path fetches it)
-            const CarrierHeader& y = vs.front()->header;
+        std::vector<Hash32> tips;
+        for (const ReceiptBodyV3& r : c.carried) tips.push_back(r.side.tip);
+        // the closure's branches (ruling 53, E-100): the top of every walked branch (a walked id no walked header names
+        // as its parent), each followed down to its first carrier below
+        std::set<Hash32> named;
+        for (const Hash32& w : walked)
+            for (const HeaderVariant* v : s.headers.variants(w)) named.insert(v->header.own.side.tip);
+        for (const Hash32& w : walked)
+            if (s.tree->find(w) == nullptr && named.count(w) == 0) tips.push_back(w);
+        bool fetched = false;
+        for (const Hash32& tip : tips) {
+            if (s.tree->find(tip) != nullptr) continue;        // on the joined chain, or already placed
+            const HeaderVariant* first = first_carrier(tip);
+            if (first == nullptr) continue;                    // the side header is not held (the TipHeaders path fetches it)
+            const Hash32 t = first->id;                        // the branch's first carrier (E-83)
+            const CarrierHeader& y = first->header;
             const CarrierNode* fn = s.tree->find(y.own.side.tip);  // the fork: the first side carrier's parent
             if (fn == nullptr || fn->pos >= root_pos || fn->pos < first_pos) continue;  // not a PRE node below the root
+            if (!span_s_done_.insert(t).second) continue;      // S(f) for this side branch already attempted
             const std::uint64_t lc = bin_leaf_count(fn->H, in_.b0, in_.p.open_bins);
             if (lc == 0) return SpanFold::Young;               // no bin sealed at or before f (ruling 47): the young path
             std::vector<Hash32> cids;
@@ -1421,10 +1512,40 @@ private:
                 rep_.strike += f.strike;
                 return SpanFold::NotServed;
             }
-            if (!f.s_parent) return SpanFold::NotServed;
-            if (s.tree->set_claimed_rs(y.own.side.tip, *f.s_parent)) return SpanFold::Fetched;
+            if (!f.s_parent || !f.peaks) return SpanFold::NotServed;
+            // S(f) and the view at f, claims of ruling 42: two replies naming one prefix node must agree
+            const auto [cs, fresh] = claimed_s_.emplace(fn->id, *f.s_parent);
+            if ((!fresh && !(cs->second == *f.s_parent)) || !s.store->claim_fork(fn->id, fn->pos, *f.peaks)) {
+                s.alarm.raise(RowId::None, Basis::ClaimSpan, Hash32{}, Missing::ClaimAlarm);
+                return SpanFold::Alarm;
+            }
+            if (s.tree->set_claimed_rs(y.own.side.tip, *f.s_parent)) fetched = true;
         }
-        return SpanFold::None;
+        return fetched ? SpanFold::Fetched : SpanFold::None;
+    }
+
+    // ruling 53 (E-100): the bins pending at a parent on a branch forking at a
+    // claimed prefix node, taken from a served bucket at the carrier being
+    // placed on it (a carrier of that branch whose leaf_count covers them).
+    bool fill_side_seals(const CarrierNode& pn, const CarrierBodyV3& c) {
+        JoinedState& s = *st_;
+        const LaneDelta* d = s.store->delta(pn.id);
+        if (d == nullptr || d->pending.empty()) return true;
+        const std::vector<std::uint64_t> bins = d->pending;
+        const AtHeader at{receipt_id(c.own), join_detail::digest_of(header_of(c)).value_or(Hash32{})};
+        const BucketsAnchor anchor{true, pn.H, c.own.side.mmr_root, c.own.side.receipts_root, ids_of(c)};
+        const BucketsFetch f = jb_.fetch(link_, anchor, at, bins.front(), bins.back(), timeout_);
+        if (!take_fetch(f, "a side bin's bucket not served")) return false;
+        for (const std::uint64_t bin : bins) {
+            const auto it = f.bins.find(bin);
+            if (it == f.bins.end()) return fail(AttemptEnd::NotServed, "a side bin's bucket not served");
+            SealedBin sb;
+            sb.bucket = it->second.bucket;
+            sb.leaf = it->second.leaf;
+            sb.refs = it->second.refs;
+            if (!s.store->fill_side_seal(pn.id, sb)) return fail(AttemptEnd::NotServed, "a side bin not adopted");
+        }
+        return true;
     }
 
     // Admits and places one frame, fetching what its DEFERs name from the
@@ -1454,9 +1575,10 @@ private:
             if (r.verdict == AdmitVerdict::AdmitCarrier) {
                 // E-16: every mmr_root of the span (a carrier on a tip below x1 is not checked by the pipeline)
                 const CarrierNode* pn = s.tree->find(it.c.own.side.tip);
+                if (pn != nullptr && pn->below_root && !fill_side_seals(*pn, it.c)) return false;
                 if (!s.young && pn != nullptr && pn->pos < s.x1) {
                     const LaneView pv = s.store->view_at(pn->id);
-                    if (!pv.ok()) return fail(AttemptEnd::NotServed, "the parent's view not held");
+                    if (!pv.ok() || pv.pending_bin()) return fail(AttemptEnd::NotServed, "the parent's view not held");
                     if (pv.mmr_root() != it.c.own.side.mmr_root) {
                         s.alarm.raise(RowId::R10, Basis::ClaimSpan, id, Missing::ClaimAlarm);
                         return fail(AttemptEnd::Alarm, "an mmr_root of the span against the joined MMR");
@@ -1511,7 +1633,7 @@ private:
                 }
                 case Missing::Closure: {
                     // ruling 47: a side branch forking at a PRE node below x0 - 1 needs S(f) from the attempt's server
-                    const SpanFold sf = try_span_fold(it.c);
+                    const SpanFold sf = try_span_fold(it.c, r.walked);
                     if (sf == SpanFold::Fetched) break;  // re-admit with the fork node's S(f) set
                     if (sf == SpanFold::Ended) return false;  // the side carrier's body set: the attempt ended there
                     if (sf == SpanFold::Young) {
@@ -1622,6 +1744,9 @@ private:
     bool force_young_ = false;    // the young path forced by the pair's mark (the ruling-47 fallback)
     bool scope_done_ = false;     // the fork with A's best chain met (in scope: deep)
     std::uint64_t scope_lo_ = 0;  // the lowest position the scope scan has read (0: none)
+    std::uint64_t scope_floor_ = 0;  // x0(L') - N_rt once x0 is known: the scope scan reads nothing below it
+    std::uint64_t x_pre_ = 1;     // the claimed prefix start (ruling 53, E-99)
+    std::map<Hash32, RatchetState> claimed_s_;  // S(f) taken per prefix node (ruling 47, E-83)
     std::map<Hash32, CarrierBodyV3> span_bodies_;
     std::set<Hash32> span_s_done_;  // side carriers whose S(f) fetch was attempted (ruling 47)
     AtHeader at_x0_{};
