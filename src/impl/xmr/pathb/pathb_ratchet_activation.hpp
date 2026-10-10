@@ -73,7 +73,7 @@
 
 #include "pathb_caps.hpp"     // relay_horizons (P-09)
 #include "pathb_hello.hpp"
-#include "pathb_joiner.hpp"   // join_span (P-34)
+#include "pathb_joiner.hpp"   // join_span, join_n_rt (P-34)
 #include "pathb_lane_rules.hpp"
 #include "pathb_params.hpp"
 #include "pathb_ratchet_state.hpp"
@@ -445,8 +445,11 @@ inline constexpr FrameVerdict frame_epoch_verdict(std::uint64_t x, std::uint32_t
 // (never struck, never banned).
 enum class DeferVerdict : std::uint8_t { Stored, Drop };
 
-// P-34 default: one joiner span of positions (1,176); P-09 default: the pending cap (18,432 receipts).
-inline std::uint64_t deferred_frame_span_default() { return join_span(kRuledLaneParams, kSealDepth); }
+// P-34 default: one joiner span at its minimum, N_rt + join_span = 3,336 positions; P-09 default: the pending cap
+// (18,432 receipts).
+inline std::uint64_t deferred_frame_span_default() {
+    return join_n_rt(kRuledLaneParams) + join_span(kRuledLaneParams, kSealDepth);
+}
 inline std::uint64_t deferred_receipt_cap_default() { return relay_horizons(kRuledLaneParams).pending_cap; }
 
 inline constexpr DeferVerdict defer_frame(std::uint64_t x, std::uint64_t hold_at, bool header_ok,

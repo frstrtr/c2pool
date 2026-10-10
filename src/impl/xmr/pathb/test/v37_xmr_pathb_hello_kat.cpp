@@ -247,7 +247,7 @@ void forbidden_literals() {
     const std::vector<std::string> files{"pathb_params.hpp",    "pathb_caps.hpp",      "pathb_emission.hpp",
                                          "pathb_window.hpp",    "pathb_bin_store.hpp", "pathb_miner_tx.hpp",
                                          "pathb_bucket_wire.hpp", "pathb_hello.hpp",   "pathb_admit.hpp",
-                                         "pathb_header_index.hpp", "pathb_claim_view.hpp"};
+                                         "pathb_header_index.hpp", "pathb_claim_view.hpp", "pathb_join.hpp"};
     // (file, raw line text): the named constants of record
     const std::vector<std::pair<std::string, std::string>> allow{
             {"pathb_params.hpp", "DIFFICULTY_WINDOW = 720;"},
@@ -309,7 +309,7 @@ void forbidden_literals() {
         }
     }
     for (const std::string& h : hits) std::printf("  forbidden literal: %s\n", h.c_str());
-    check(scanned == files.size() && files.size() == 11, "the 11 Path B headers were scanned (" + std::to_string(scanned) + ")");
+    check(scanned == files.size() && files.size() == 12, "the 12 Path B headers were scanned (" + std::to_string(scanned) + ")");
     check(hits.empty(), "no forbidden N-rule / reserve literal in a code line");
     check(allow_hits == std::vector<int>{1, 1, 1}, "each allowlisted constant is hit exactly once");
 }

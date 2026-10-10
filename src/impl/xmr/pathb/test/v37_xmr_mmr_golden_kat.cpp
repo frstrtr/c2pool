@@ -684,7 +684,7 @@ static void s3b_fc_buckets_vectors() {
     const pb::FrameOutcome o = as.add_frame(1, fr.at(0), a);
     bool same = as.bins().size() == 8;
     for (std::uint64_t i = 0; same && i < 8; ++i) same = as.bins().at(b0 + i).leaf == *m.leaf(i);
-    check(fr.size() == 1 && o.verdict == pb::FrameVerdict::Accepted && as.complete() && same,
+    check(fr.size() == 1 && o.verdict == pb::BucketsFrameVerdict::Accepted && as.complete() && same,
           "FC_BUCKETS: 8 sealed bins with MMR proofs accepted by a joiner, leaves reproduced");
     pb::BucketsReply r;
     check(pb::decode_buckets(fr.at(0), chain, r) == pb::BucketsWireError::None && r.entries.size() == 8 &&
@@ -695,7 +695,7 @@ static void s3b_fc_buckets_vectors() {
     if (r.entries.size() == 8) r.entries[3].path.clear();
     pb::BucketsAssembly bs(req, b0, F, frame);
     const pb::FrameOutcome no = bs.add_frame(1, *pb::encode_buckets(r), a);
-    check(no.verdict == pb::FrameVerdict::Refused && no.fault == pb::BucketsFault::Proof && no.strike == 1 &&
+    check(no.verdict == pb::BucketsFrameVerdict::Refused && no.fault == pb::BucketsFault::Proof && no.strike == 1 &&
                   bs.bins().empty(),
           "FC_BUCKETS: a bucket without its proof refused, the server struck");
 }

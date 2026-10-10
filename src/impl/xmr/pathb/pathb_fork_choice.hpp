@@ -40,6 +40,8 @@
 //   credited work, 0 when dead, then the carrier at d(c); the activation row
 //   it returns is kept on the carrier node. Genesis S = epoch 0, rules_cur =
 //   the genesis rules digest.
+//   joined(): the tree of a join rooted at x0 - 1 (slice S3b-4b), absolute
+//   positions, the retarget-prefix entries as its inherited window.
 //   Headers-first: an announced side header weighs its retarget d on the
 //   side chain; it fails on a parent link that does not continue the side
 //   chain, a height below the record of its parent, or a failed PoW at that
@@ -178,6 +180,59 @@ public:
         index_.emplace(genesis_id, 0);
     }
 
+    // A retarget-prefix header the joined tree holds as a claimed node on the
+    // joined chain, below the root (RULED 47, E-84): id, pos, h, H and
+    // d = the header's t_origin, values from the attempt's server's passing
+    // assignment. The ratchet state below the root is not tracked (the root's
+    // S_{x0-1} is the start), so a receipt whose tip is a PRE node is credited
+    // at its origin bin and its #11 is a claim not computed (JoinClaims::basis).
+    struct PreNode {
+        Hash32 id{};
+        std::uint64_t pos = 0;
+        std::uint64_t h = 0;
+        std::uint64_t H = 0;
+        std::uint64_t d = 0;
+    };
+
+    // The joined tree of a join (slice S3b-4b; ABSOLUTE positions): its root is
+    // the carrier at root_pos = x0 - 1 (id, template height root_h, its record
+    // the newest entry of `pre`) with the adopted ratchet state root_s (a claim
+    // of the join) and cum_work 0; `pre`: the retarget-prefix entries of
+    // [x0 - N_rt, x0 - 1] (d = each header's t_origin, H; claims), oldest first,
+    // the newest of them the root's own. `pre_nodes`: the PRE headers below the
+    // root, [first_pos, x0 - 2], oldest first, as claimed nodes on the joined
+    // chain (E-84), so the row-17 walk of a receipt carried by a span carrier
+    // whose tip lies on the carrier's own chain below x0 - 1 meets a tree node.
+    // Position 0 (x0 = 1) is the genesis tree with root_s = S_0. The replay
+    // places x0 .. L on it as on a follower: rs_step_at at every absolute
+    // position; window_after never walks the PRE nodes (it stops at the root,
+    // node 0, and reads `pre` as inherited_).
+    static CarrierTree joined(const LaneParams& p, const Hash32& root_id, std::uint64_t root_pos, std::uint64_t root_h,
+                              const RatchetState& root_s, const EpochTable& table, std::span<const RetargetEntry> pre,
+                              const RatchetParams& rp = kRuledRatchetParams, std::span<const PreNode> pre_nodes = {}) {
+        CarrierTree t(p, root_id, root_h, table, pre, rp);
+        CarrierNode& r = t.nodes_[0];
+        r.pos = root_pos;
+        r.rs = root_s;
+        // the PRE nodes below the root (claims; reached only by find() for the row-17 walk, never by window_after)
+        for (std::size_t k = 0; k < pre_nodes.size(); ++k) {
+            const PreNode& pn = pre_nodes[k];
+            CarrierNode n;
+            n.id = pn.id;
+            n.pos = pn.pos;
+            n.h = pn.h;
+            n.H = pn.H;
+            n.d = pn.d;
+            n.verified = n.bodies = n.chain_valid = true;
+            n.parent = k > 0 ? pre_nodes[k - 1].id : pn.id;  // oldest first; the lowest is its own parent
+            const std::size_t idx = t.nodes_.size();
+            n.parent_index = k > 0 ? t.index_.at(pre_nodes[k - 1].id) : idx;
+            t.nodes_.push_back(std::move(n));
+            t.index_.emplace(pn.id, idx);
+        }
+        return t;
+    }
+
     const LaneParams& params() const noexcept { return p_; }
     const RatchetParams& ratchet_params() const noexcept { return rp_; }
     const EpochTable& epoch_table() const noexcept { return table_; }
@@ -189,6 +244,19 @@ public:
     const CarrierNode* find(const Hash32& id) const {
         const auto it = index_.find(id);
         return it == index_.end() ? nullptr : &nodes_[it->second];
+    }
+
+    // Sets the ratchet state of a claimed PRE node below the root (RULED 47
+    // ruling 47, E-83): S(f) fetched for a side branch forking at that node, so
+    // the row-17 walk folds the side carrier over it. Only a claimed node below
+    // the root (never a placed carrier); false otherwise.
+    bool set_claimed_rs(const Hash32& id, const RatchetState& rs) {
+        const auto it = index_.find(id);
+        if (it == index_.end() || it->second == best_) return false;
+        CarrierNode& n = nodes_[it->second];
+        if (n.pos >= nodes_[0].pos) return false;  // below the root only
+        n.rs = rs;
+        return true;
     }
 
     // The retarget window of the carrier after `tip` (its newest N_rt
