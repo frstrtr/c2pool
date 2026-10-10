@@ -596,6 +596,7 @@ private:
     std::uint64_t d_on(std::size_t pi, const CarrierAnnounce& c) const {
         if (nodes_[pi].pos < nodes_[0].pos) return c.t_origin;
         const std::optional<RetargetWindow> w = window_after_index(pi);
+        // Unreachable fallback: above the root this window reaches no lower than x0 - N_rt >= x_pre, or position 1, all held.
         return w ? w->next_difficulty() : c.t_origin;
     }
 

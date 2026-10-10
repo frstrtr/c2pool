@@ -2861,24 +2861,27 @@ void jc_nested(const JoinNet& net) {
     }
 }
 
-// V15 (DF-6; the clamp of E-99): short mature spans with lc(H(x0 - 1)) > 0: leg 1 (12 per height, L = 5,000:
-// x0 - N_rt <= 0), leg 2 (10 per height, x0 <= J_0: max(0, x0 - 1 - J_0) acts); x_pre = 1, J completes.
+// V15 (DF-6; the clamps of E-99): short mature spans with lc(H(x0 - 1)) > 0: leg 1 (12 per height, L = 5,000:
+// x0 - N_rt <= 0), leg 2 (10 per height, x0 <= J_0: max(0, x0 - 1 - J_0) acts), leg 3 (12 per height, L = 5,650,
+// x0 > N_rt with g(x0 - 1 - J_0) <= 1: the scan reaches position 0 and max(1, .) takes x_pre = 1); x_pre = 1, J
+// completes.
 void jc_v15(const JoinNet& net) {
     struct Leg {
         std::uint64_t per_h, L;
     };
     std::uint64_t k = 0;
-    for (const Leg lg : {Leg{12, 5000}, Leg{10, 4435}}) {
+    for (const Leg lg : {Leg{12, 5000}, Leg{10, 4435}, Leg{12, 5650}}) {
         ++k;
         const HOf hof = rate_of(lg.per_h);
         const JcBounds b = jc_bounds(lg.L, hof);
         const std::string tag = "V15 leg " + std::to_string(k) + " (" + std::to_string(lg.per_h) + " per height, L = " +
                                 std::to_string(lg.L) + ", x0 = " + std::to_string(b.x0) + ")";
         const std::uint64_t lc = pb::bin_leaf_count(hof(b.x0 - 1), kLaneB0, kF);
-        check(!b.young && lc > 0 && b.x0 <= kNrt && (k == 1 ? b.x0 > kJ0 : b.x0 <= kJ0) && b.x_pre == 1 &&
-                      x_pre_ref(b.x0, hof) == 1,
+        const bool shape = k == 1 ? (b.x0 <= kNrt && b.x0 > kJ0) : k == 2 ? b.x0 <= kJ0 : b.x0 > kNrt;
+        check(!b.young && lc > 0 && shape && b.x_pre == 1 && x_pre_ref(b.x0, hof) == 1,
               tag + ": a mature span (lc(H(x0 - 1)) = " + std::to_string(lc) + "), x_pre = 1" +
-                      (k == 2 ? " (x0 - 1 - J_0 < 0 taken as 0)" : " (x0 - N_rt <= 0)"));
+                      (k == 1 ? " (x0 - N_rt <= 0)"
+                              : k == 2 ? " (x0 - 1 - J_0 < 0 taken as 0)" : " (x0 > N_rt, the first x above the threshold is 0)"));
         KatNode a(net, 9000);
         ChainShape sh;
         sh.hof = hof;
