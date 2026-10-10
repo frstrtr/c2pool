@@ -183,7 +183,7 @@ struct KatServer final : pb::JoinLink {
             const std::optional<pb::Hash32> id = n->tree.ancestor_at(b, x);
             if (!id) return std::nullopt;
             return n->tree.find(*id)->H;
-        }, n->store.b0());  // b0 enables the the serving note (serve from 1 while lc = 0)
+        }, n->store.b0());  // b0 enables the serving note (from position 1 while lc(H(x0(L') - J_0 - 1)) = 0)
     }
 
     void tick() {
