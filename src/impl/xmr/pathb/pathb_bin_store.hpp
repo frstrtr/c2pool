@@ -51,6 +51,13 @@
 //                   lack the pre-x0 ones; a bin below lc(H(x0 - 1)) is held
 //                   only when adopted (adopt_below); a bin the store needs and
 //                   does not hold is MissingBucket / no seal (DEFER).
+//   claim_fork(f)   a joined store's claimed view at a prefix node f below its
+//                   root (ruling 53, E-100): its records, leaf_count lc(H(f))
+//                   with the peaks of the S(f) reply, no placement below x0. On
+//                   a branch forking at f a bin b <= H(f) + Fresh that seals at
+//                   a carrier c is held only from a served bucket of a carrier
+//                   of that branch (fill_side_seal): until then it is pending
+//                   at c (no root at c; a window reading it DEFERs MissingBucket).
 //   retention       P-37 / P-38 (policy, ruling 23): by default every placement
 //                   and every sealed bucket body is kept (leaf hashes always).
 //                   A node may drop the placements of bins below a floor (at
@@ -227,6 +234,8 @@ struct LaneDelta {
     std::uint64_t leaf_count = 0;    // after pos
     Hash32 root{};                   // mmr root after pos (the journal's root per position)
     bool sealed_done = false;        // seal() ran; no further placement
+    std::vector<std::uint64_t> pending;  // bins sealed at pos whose served bucket is not held yet (a branch forking
+                                         // at a claimed prefix node, ruling 53); leaf_count and root once empty
 };
 
 enum class Ingest : std::uint8_t { Accepted, Duplicate, Expired };
@@ -272,8 +281,11 @@ public:
     // Placements on this chain (live and dead), for counts.
     std::size_t placement_count() const;
     // The bucket of a bin sealed on this chain through pos(); nullptr if not
-    // sealed or its body is not held (P-38).
+    // sealed or its body is not held (P-38), or pending (claim_fork).
     const SealedBin* bucket(std::uint64_t bin) const;
+    // The first bin sealed on this view's side deltas whose served bucket is
+    // not held yet (claim_fork); nullopt: none.
+    std::optional<std::uint64_t> pending_bin() const;
     std::uint64_t leaf_count_at(std::uint64_t x) const;
     Hash32 mmr_root_at(std::uint64_t x) const;
     std::uint64_t leaf_count() const { return leaf_count_at(pos_); }
@@ -652,6 +664,60 @@ public:
         below_[sb.bucket.bin_lo] = sb;
         return true;
     }
+    // A joined store (ruling 53, E-100): the claimed view at the prefix node `id`
+    // at position pos below the root, from the reply to its S(f) fetch: the
+    // records held, leaf_count lc(H(f)) with `peaks` (proved by the caller
+    // against the branch's first carrier's mmr_root), no placement below x0.
+    // false: not a prefix node below the root, the peaks do not number
+    // popcount(lc(H(f))), or they differ from the peaks already held for that
+    // leaf count (two claims of one prefix disagree).
+    bool claim_fork(const Hash32& id, std::uint64_t pos, const std::vector<Hash32>& peaks) {
+        if (!adopt_bound_ || pos < off_ || pos >= root_pos_ || chain_[pos - off_] != id) return false;
+        const std::uint64_t lc = bin_leaf_count(records_[pos - off_], b0_, p_.open_bins);
+        if (lc >= mmr_.first_provable()) {  // the store's own prefix proves it
+            const std::optional<std::vector<Hash32>> own = mmr_.prefix_peaks(lc);
+            if (!own || *own != peaks) return false;
+        } else {
+            if (!BinMmr::from_peaks(lc, peaks)) return false;
+            const auto [it, ins] = claimed_peaks_.emplace(lc, peaks);
+            if (!ins && it->second != peaks) return false;
+        }
+        chain_pos_[id] = pos;
+        return true;
+    }
+    bool claimed_fork(const Hash32& id) const {
+        const auto it = chain_pos_.find(id);
+        return it != chain_pos_.end() && it->second < root_pos_ && on_best(id);
+    }
+
+    // A bin pending at `carrier` (claim_fork) from a served bucket of a carrier
+    // of its branch (proved by the caller against that carrier's mmr_root):
+    // inserted in bin order; with the last pending bin the carrier's leaf_count
+    // and root are taken. false: not pending there, inconsistent, or the
+    // parent's view has pending bins itself.
+    bool fill_side_seal(const Hash32& carrier, SealedBin sb) {
+        const auto it = journal_.find(carrier);
+        if (it == journal_.end()) return false;
+        LaneDelta& d = it->second;
+        const auto pi = std::find(d.pending.begin(), d.pending.end(), sb.bucket.bin_lo);
+        if (pi == d.pending.end() || !bucket_consistent(sb.bucket) || sb.leaf != mmr_leaf_of(sb.bucket)) return false;
+        const LaneView pv = view_at(d.parent);
+        if (!pv.ok()) return false;
+        std::optional<BinMmr> m = chain_mmr(pv);
+        if (!m) return false;
+        sb.sealed_at = d.pos;
+        d.pending.erase(pi);
+        const auto at = std::find_if(d.sealed.begin(), d.sealed.end(),
+                                     [&](const SealedBin& x) { return x.bucket.bin_lo > sb.bucket.bin_lo; });
+        d.sealed.insert(at, std::move(sb));
+        if (d.pending.empty()) {
+            for (const SealedBin& x : d.sealed) m->append(x.leaf);
+            d.leaf_count = m->leaf_count();
+            d.root = m->root();
+        }
+        return true;
+    }
+
     std::optional<std::uint64_t> adopt_bound() const noexcept { return adopt_bound_; }
     std::uint64_t first_leaf() const noexcept { return lc0_; }
     std::uint64_t root_pos() const noexcept { return root_pos_; }
@@ -788,11 +854,22 @@ public:
         const std::uint64_t lc_parent = pv.leaf_count();
         const std::uint64_t lc_new = bin_leaf_count(d.H, b0_, p_.open_bins);  // bound(c) = H(c) - F
         const std::uint64_t q_seal = d.pos;                                     // S(b): q <= f (D_fin 0)
-        BinMmr m = chain_mmr(pv);
+        std::optional<BinMmr> mo = chain_mmr(pv);
+        if (!mo) return std::nullopt;  // a bin of c's chain below it is pending
+        BinMmr& m = *mo;
+        // a branch forking at a claimed prefix node f (ruling 53, E-100): a bin b <= H(f) + Fresh may hold placements
+        // below x0 (claims, none held): it is held only from a served bucket of a carrier of the branch (pending)
+        const bool claimed = pv.fork_pos() < root_pos_;
+        const std::uint64_t side_bound = claimed ? records_[pv.fork_pos() - off_] + p_.fresh_max : 0;
         std::vector<SealedBin> sealed;
+        std::vector<std::uint64_t> pending;
         for (std::uint64_t i = lc_parent; i < lc_new; ++i) {
             const std::uint64_t b = b0_ + i;
-            if (adopt_bound_ && b <= *adopt_bound_) {  // a joined store: the served bucket, never its placements
+            if (claimed && b <= side_bound) {
+                pending.push_back(b);
+                continue;
+            }
+            if (!claimed && adopt_bound_ && b <= *adopt_bound_) {  // a joined store: the served bucket, never its placements
                 const auto sv = served_.find(b);
                 if (sv == served_.end()) return std::nullopt;  // not held: nothing is sealed
                 SealedBin sb = sv->second;
@@ -818,8 +895,11 @@ public:
             sealed.push_back(std::move(sb));
         }
         d.sealed = std::move(sealed);
-        d.leaf_count = m.leaf_count();
-        d.root = m.root();
+        d.pending = std::move(pending);
+        if (d.pending.empty()) {
+            d.leaf_count = m.leaf_count();
+            d.root = m.root();
+        }
         d.sealed_done = true;
         return lc_new > lc_parent ? lc_new - lc_parent : 0;
     }
@@ -834,7 +914,7 @@ public:
         if (!v.ok()) return SwitchVerdict::Deep;
         if (!fork_in_journal(v.fork_pos())) return SwitchVerdict::Deep;
         for (const LaneDelta* d : v.side_)
-            if (!d->sealed_done) return SwitchVerdict::NotSealed;
+            if (!d->sealed_done || !d->pending.empty()) return SwitchVerdict::NotSealed;
         const std::uint64_t fork = v.fork_pos();
         const std::vector<const LaneDelta*> replay = v.side_;
         const std::uint64_t lc_old = mmr_.leaf_count();
@@ -993,13 +1073,28 @@ private:
     bool fork_in_journal(std::uint64_t fork) const noexcept { return fork >= base_pos(); }
 
     // The MMR of the viewed chain through pos(): the best prefix at the fork
-    // point plus the side deltas' leaves (O(log n) + side leaves).
-    BinMmr chain_mmr(const LaneView& v) const {
+    // point (the claimed peaks at a claimed prefix fork) plus the side deltas'
+    // leaves (O(log n) + side leaves). nullopt: a side delta has pending bins,
+    // or no peaks are held at the fork's leaf count.
+    std::optional<BinMmr> chain_mmr(const LaneView& v) const {
         const std::uint64_t lc_fork = bin_leaf_count(records_[v.fork_pos() - off_], b0_, p_.open_bins);
-        BinMmr m = BinMmr::from_peaks(lc_fork, mmr_.prefix_peaks(lc_fork).value()).value();
-        for (const LaneDelta* d : v.side_)
-            for (const SealedBin& sb : d->sealed) m.append(sb.leaf);
+        const std::optional<std::vector<Hash32>> pk = peaks_at(lc_fork);
+        if (!pk) return std::nullopt;
+        std::optional<BinMmr> m = BinMmr::from_peaks(lc_fork, *pk);
+        if (!m) return std::nullopt;
+        for (const LaneDelta* d : v.side_) {
+            if (!d->pending.empty()) return std::nullopt;
+            for (const SealedBin& sb : d->sealed) m->append(sb.leaf);
+        }
         return m;
+    }
+    // The peaks of the best chain's first lc leaves: the MMR's prefix, or a
+    // claimed fork's (claim_fork) below its first provable leaf.
+    std::optional<std::vector<Hash32>> peaks_at(std::uint64_t lc) const {
+        if (lc >= mmr_.first_provable()) return mmr_.prefix_peaks(lc);
+        const auto it = claimed_peaks_.find(lc);
+        if (it == claimed_peaks_.end()) return std::nullopt;
+        return it->second;
     }
 
     // Key references of S(b): one per identity held, ascending by identity.
@@ -1061,6 +1156,7 @@ private:
     std::optional<std::uint64_t> adopt_bound_;      // a joined store: H(x0 - 1) + Fresh
     std::map<std::uint64_t, SealedBin> served_;     // bins <= the adopt bound, from their served buckets
     std::map<std::uint64_t, SealedBin> below_;      // bins below lc0_, adopted on demand
+    std::map<std::uint64_t, std::vector<Hash32>> claimed_peaks_;  // claim_fork: leaf count -> peaks (below lc0_)
     std::uint64_t entry_floor_ = 0;  // placements of bins below it are not held (P-37)
 
     // the best chain, materialised
@@ -1129,11 +1225,11 @@ inline const SealedBin* LaneView::bucket(std::uint64_t bin) const {
     if (bin < s_->b0_) return nullptr;
     const std::uint64_t i = bin - s_->b0_;
     if (i >= leaf_count()) return nullptr;
-    if (i < s_->lc0_) {  // a joined store: adopted on demand, else not held
-        const auto it = s_->below_.find(bin);
-        return it == s_->below_.end() ? nullptr : &it->second;
-    }
-    if (i < leaf_count_at(fork_)) {
+    if (i < leaf_count_at(fork_)) {  // sealed at or before the fork: the best chain's
+        if (i < s_->lc0_) {          // a joined store: adopted on demand, else not held
+            const auto it = s_->below_.find(bin);
+            return it == s_->below_.end() ? nullptr : &it->second;
+        }
         const std::uint64_t k = i - s_->lc0_;
         if (k >= s_->buckets_.size() || !s_->buckets_[k].held) return nullptr;
         return &s_->buckets_[k];
@@ -1141,7 +1237,13 @@ inline const SealedBin* LaneView::bucket(std::uint64_t bin) const {
     for (const LaneDelta* d : side_)
         for (const SealedBin& sb : d->sealed)
             if (sb.bucket.bin_lo == bin) return &sb;
-    return nullptr;
+    return nullptr;  // not sealed here, or pending (claim_fork)
+}
+
+inline std::optional<std::uint64_t> LaneView::pending_bin() const {
+    for (const LaneDelta* d : side_)
+        if (!d->pending.empty()) return d->pending.front();
+    return std::nullopt;
 }
 
 inline bool LaneView::entries_held(std::uint64_t bin) const { return bin >= s_->entry_floor_; }
@@ -1152,7 +1254,14 @@ inline std::uint64_t LaneView::leaf_count_at(std::uint64_t x) const {
 
 inline Hash32 LaneView::mmr_root_at(std::uint64_t x) const {
     if (!ok() || x > pos_) throw std::out_of_range("LaneView::mmr_root_at: not a position of this view");
-    if (x <= fork_) return s_->mmr_.prefix_root(leaf_count_at(x)).value();  // throws if the MMR lags the record
+    if (x <= fork_) {
+        const std::uint64_t lc = leaf_count_at(x);
+        if (lc >= s_->mmr_.first_provable()) return s_->mmr_.prefix_root(lc).value();  // throws if the MMR lags the record
+        // a claimed prefix fork's peaks (claim_fork); throws when none are held
+        return BinMmr::from_peaks(lc, s_->peaks_at(lc).value()).value().root();
+    }
+    for (std::uint64_t k = 0; k <= x - fork_ - 1; ++k)
+        if (!side_[k]->pending.empty()) throw std::out_of_range("LaneView::mmr_root_at: a pending bin (claim_fork)");
     return side_[x - fork_ - 1]->root;
 }
 

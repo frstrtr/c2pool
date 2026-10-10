@@ -163,6 +163,9 @@ struct KatServer final : pb::JoinLink {
     std::function<void(KatServer&)> before;           // before each request
     std::function<bool(std::uint64_t pos)> carriers_withheld;  // no reply to a body request at such a position
     bool notserve_buckets = false;
+    // headers at their maximum size in frames of this many bytes (0: off): a reply carries at most what one such
+    // frame holds after its v0x02 head (FH | u64 first_pos | u16 n, E-86)
+    std::uint64_t max_size_frame = 0;
     std::uint64_t requests = 0;
     std::uint64_t stall_after = 0;                    // throw StallError after this many requests (0: never)
     std::uint64_t header_requests = 0, body_requests = 0, bucket_requests = 0;
@@ -178,12 +181,15 @@ struct KatServer final : pb::JoinLink {
         if (!retention) return pb::JoinServeFloors{0, 0};
         const pb::Hash32 b = best_id();
         const std::uint64_t L = n->node(b).pos;
-        return pb::join_serve_floors(n->P, L, [&](std::uint64_t x) -> std::optional<std::uint64_t> {
+        const bool on_best = n->store.best_at(L) == b;
+        const auto rec = [&](std::uint64_t x) -> std::optional<std::uint64_t> {
             if (x > L) return std::nullopt;
-            const std::optional<pb::Hash32> id = n->tree.ancestor_at(b, x);
+            const std::optional<pb::Hash32> id = on_best ? n->store.best_at(x) : n->tree.ancestor_at(b, x);
             if (!id) return std::nullopt;
             return n->tree.find(*id)->H;
-        }, n->store.b0());  // b0 enables the serving note (from position 1 while lc(H(x0(L') - J_0 - 1)) = 0)
+        };
+        // b0 enables the serving note (from position 1 while lc(H(x0(L') - J_0 - 1)) = 0)
+        return pb::join_serve_floors(n->P, L, rec, n->store.b0());
     }
 
     void tick() {
@@ -216,6 +222,11 @@ struct KatServer final : pb::JoinLink {
             return out;
         }
         std::vector<pb::Hash32> ids;
+        if (max_size_frame != 0) {
+            const std::uint64_t h_max = 1 + n->buffers.receipt + 1 + 2 * sizeof(std::uint64_t);
+            const std::uint64_t head = pb::kFrameHeaderBytes + sizeof(std::uint64_t) + pb::kU16Bytes;
+            max = std::min<std::uint64_t>(max, max_size_frame > head ? (max_size_frame - head) / h_max : 0);
+        }
         for (const pb::CarrierNode* x = t; x != nullptr && x->pos >= 1 && x->pos >= f.headers && ids.size() < max;
              x = n->tree.find(x->parent))
             ids.push_back(x->id);
@@ -284,9 +295,54 @@ struct KatServer final : pb::JoinLink {
                 return out;
             }
         }
+        // a side carrier at whose parent lies off the best chain (a bin sealed on its branch, ruling 53 E-100): its
+        // parent's chain, the best prefix at the fork plus the side deltas' leaves
+        if (at != nullptr && at->pos > 0 && n->store.best_at(at->pos) != q.at && s) {
+            if (auto side = side_source(*at, *s)) {
+                out.frames = pb::serve_buckets_from(side->src, q, n->P.r_max == 0 ? 0 : frame_bytes(), UINT64_MAX / 4);
+                out.status = pb::LinkStatus::Served;
+                if (on_buckets) on_buckets(q, out);
+                return out;
+            }
+        }
         out.frames = pb::serve_buckets(n->store, q, s, n->P.r_max == 0 ? 0 : frame_bytes(), UINT64_MAX / 4);
         out.status = pb::LinkStatus::Served;
         if (on_buckets) on_buckets(q, out);
+        return out;
+    }
+
+    struct SideSource {
+        std::shared_ptr<pb::LaneView> view;
+        std::shared_ptr<pb::BinMmr> mmr;
+        pb::BucketServeSource src;
+    };
+    // The bucket source of an at whose parent is a side carrier of the server's store.
+    std::optional<SideSource> side_source(const pb::CarrierNode& at, const pb::RatchetStateBytes& s_parent) const {
+        const pb::LaneView pv = n->store.view_at(at.parent);
+        if (!pv.ok() || pv.fork_pos() == pv.pos()) return std::nullopt;
+        const std::uint64_t lc_fork = pb::bin_leaf_count(pv.record(pv.fork_pos()), n->store.b0(), n->P.open_bins);
+        const std::optional<std::vector<pb::Hash32>> pk = n->store.best_mmr().prefix_peaks(lc_fork);
+        if (!pk) return std::nullopt;
+        std::optional<pb::BinMmr> m = pb::BinMmr::from_peaks(lc_fork, *pk);
+        if (!m) return std::nullopt;
+        std::vector<pb::Hash32> side;  // the side carriers from the parent down to the fork
+        for (const pb::CarrierNode* x = n->tree.find(at.parent); x != nullptr && x->pos > pv.fork_pos();
+             x = n->tree.find(x->parent))
+            side.push_back(x->id);
+        for (auto it = side.rbegin(); it != side.rend(); ++it) {
+            const pb::LaneDelta* d = n->store.delta(*it);
+            if (d == nullptr) return std::nullopt;
+            for (const pb::SealedBin& sb : d->sealed) m->append(sb.leaf);
+        }
+        SideSource out;
+        out.view = std::make_shared<pb::LaneView>(pv);
+        out.mmr = std::make_shared<pb::BinMmr>(std::move(*m));
+        out.src.b0 = n->store.b0();
+        out.src.leaf_count = pb::bin_leaf_count(pv.record(pv.pos()), n->store.b0(), n->P.open_bins);
+        out.src.mmr = out.mmr.get();
+        auto v = out.view;
+        out.src.bucket = [v](std::uint64_t bin) -> const pb::SealedBin* { return v->bucket(bin); };
+        out.src.s_parent = s_parent;
         return out;
     }
 
