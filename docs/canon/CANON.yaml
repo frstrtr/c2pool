@@ -638,7 +638,7 @@ rules:
         pattern: '\b(?:kVoteFloorNum|kVoteFloorDen|kLaneBlocksK|kVoteStreak)\b'
         scope: xmr_lane_code
         code_only: true
-    status_now: fail
+    status_now: pass
     deviation: [D11, D36, D39]
 
   - id: C24

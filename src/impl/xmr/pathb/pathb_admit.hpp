@@ -1558,8 +1558,8 @@ inline std::optional<std::vector<std::uint8_t>> carrier_frame(const CarrierBodyV
 //   tree.place(c, placements) (Placed, or Duplicate when a copy won the race);
 //   on Placed: BinStore add_carrier, ingest of the carried list in canonical
 //   order then of the own body, seal; then mark_verified and mark_bodies (a
-//   node-internal store outcome leaves c placed but not chain-valid: tree.drop
-//   removes it). When c's parent is the store's best tip and tree.best() is c
+//   node-internal store outcome leaves c placed but not chain-valid: its
+//   partial delta is dropped (drop_side) and tree.drop removes it). When c's parent is the store's best tip and tree.best() is c
 //   (an extension): store.switch_best(c) (the position's record batch), then
 //   the activation row of c appended to AR. A node-internal outcome of either
 //   is undone: the switch rewound to c's parent (out.batch holds both), c's
@@ -1607,6 +1607,7 @@ inline WriteResult place_admitted(CarrierTree& tree, Store& store, ActivationRec
     }
     ok = ok && store.seal(id).has_value();
     if (!ok) {
+        (void)store.drop_side(id);  // a store failure before the marks: c's partial delta goes with c
         tree.drop(id);
         return internal(RowId::R13);
     }

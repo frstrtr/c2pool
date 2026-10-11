@@ -29,7 +29,13 @@
 //       4 y1 = 3 all, level 2 at 4 y2 >= 3 all, 0 below and when all = 0;
 //       the own flag does not count; W_R = 4 at L 34,881 / GRACE 120,960,
 //       W_R 5 refused; the carrier fold check: Match on the verifier's S,
-//       Strike on a flipped bit, another position's S, or carried_root != 0.
+//       Strike on a flipped bit, another position's S, or carried_root != 0;
+//   (8) the C23 pool identity: pool_genesis = sha256d("V37GEN" || hash(H) ||
+//       u8 len || headline), pool_id = sha256d("V37PID" || u8 network || u32
+//       chain_id || pool_genesis), the raw default sha256d("V37PG" || u8
+//       network), with the goldens of record; the headline grammar; the
+//       derived and raw start inputs (the raw form refused on mainnet, a raw
+//       start without H refused); position 0 = (pool_id, H + 1).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +43,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "impl/xmr/pathb/pathb_pool_identity.hpp"
 #include "impl/xmr/pathb/pathb_ratchet_state.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
@@ -94,6 +101,125 @@ pb::WireError dec_body(const std::vector<std::uint8_t>& b, std::uint64_t buffer_
 // Offset of payee_ref in an encoded body.
 std::size_t payee_ref_offset(const std::vector<std::uint8_t>& enc_body, std::size_t depth) {
     return 1 + enc_body[0] + pb::kExtraNonceBytes + 1 + depth * pb::kHashBytes + pb::side_v3::kSize;
+}
+
+// (8) the C23 pool identity, with the goldens of record (block hash = bytes
+// 0x10..0x2f, headline "attempt 11: the last flag day", stagenet, chain 0xABCD).
+const char* kGoldenRawRegtestGenesis = "95f448de1c380509b4fd7250ee9d2675fc52fec311e8baf66eb8bcf63bbf7d7f";
+const char* kGoldenHeadline = "attempt 11: the last flag day";
+const char* kGoldenDerivedGenesis = "6c7d98c6218459f422993479b05296eb53716c6970ab036f92ffc259e347854e";
+const char* kGoldenPoolIdStagenetAbcd = "61e75d6890eb0111b4ed796bae08dec0fcee62dfae767e8335336f04b06a72ed";
+constexpr std::uint32_t kLaneChain = 0x0000ABCDu;
+
+std::string hex32(const pb::Hash32& h) { return hex(h.data(), h.size()); }
+
+void pool_identity_cases() {
+    const pb::Hash32 bh = seq32(0x10);
+    const std::string hl = kGoldenHeadline;
+    // the preimages built here byte by byte, independent of the module
+    std::vector<std::uint8_t> pre = {'V', '3', '7', 'G', 'E', 'N'};
+    pre.insert(pre.end(), bh.begin(), bh.end());
+    pre.push_back(static_cast<std::uint8_t>(hl.size()));
+    pre.insert(pre.end(), hl.begin(), hl.end());
+    const pb::Hash32 g = pb::pool_genesis_derived(bh, hl);
+    check(pre.size() == 68 && g == ::v37::sha256d(pre), "pool_genesis == sha256d of the 68-byte preimage V37GEN | hash | u8 len | headline");
+    check(hex32(g) == kGoldenDerivedGenesis, "pool_genesis golden 6c7d98c6...");
+    std::vector<std::uint8_t> pid = {'V', '3', '7', 'P', 'I', 'D', 2, 0xCD, 0xAB, 0x00, 0x00};
+    pid.insert(pid.end(), g.begin(), g.end());
+    const pb::Hash32 id = pb::pool_id_of(pb::LaneNet::Stagenet, kLaneChain, g);
+    check(pid.size() == 43 && id == ::v37::sha256d(pid), "pool_id == sha256d of the 43-byte preimage V37PID | u8 net | u32 LE chain | genesis");
+    check(hex32(id) == kGoldenPoolIdStagenetAbcd, "pool_id golden 61e75d68...");
+    check(pb::pool_id_of(pb::LaneNet::Mainnet, kLaneChain, g) != id && pb::pool_id_of(pb::LaneNet::Stagenet, 7, g) != id
+                  && pb::pool_id_of(pb::LaneNet::Stagenet, kLaneChain, seq32(0x12)) != id,
+          "pool_id moves with the network, the chain_id and the genesis");
+    check(pb::pool_genesis_derived(bh, "attempt 11: the last flag day.") != g
+                  && pb::pool_genesis_derived(bh, "Attempt 11: the last flag day") != g,
+          "another headline byte -> another genesis (no normalisation, no case folding)");
+    std::vector<std::uint8_t> gp = {'V', '3', '7', 'P', 'G', 3};
+    const pb::Hash32 dg3 = pb::default_pool_genesis(pb::LaneNet::Regtest);
+    check(dg3 == ::v37::sha256d(gp) && hex32(dg3) == kGoldenRawRegtestGenesis, "raw default genesis(regtest) golden 95f448de...");
+    check(pb::default_pool_genesis(pb::LaneNet::Mainnet) != pb::default_pool_genesis(pb::LaneNet::Stagenet),
+          "one raw default genesis per network");
+
+    // side_data pool_id: the C23 pool_id; any other pool_id fails S2.3 #2 (STRIKE)
+    pb::SideDataV3 sd;
+    sd.pool_id = id;
+    check(sd.pool_id == id && !(pb::SideDataV3{}.pool_id == id), "side_data pool_id carries the C23 pool_id");
+
+    // the headline grammar (a start-time input check)
+    check(pb::headline_refusal(hl).empty(), "headline grammar: the golden headline is well-formed");
+    check(!pb::headline_refusal("").empty(), "headline: empty refused");
+    check(pb::headline_refusal(std::string(120, 'a')).empty() && !pb::headline_refusal(std::string(121, 'a')).empty(),
+          "headline: 120 bytes ok, 121 refused");
+    check(!pb::headline_refusal(" a").empty() && !pb::headline_refusal("a ").empty(), "headline: an edge space refused");
+    check(!pb::headline_refusal("a\tb").empty() && !pb::headline_refusal(std::string("a\x7f") + "b").empty()
+                  && !pb::headline_refusal(std::string("caf\xc3\xa9")).empty(),
+          "headline: a control byte or a non-ASCII byte refused");
+
+    // --pool-genesis-from
+    pb::GenesisSpec spec;
+    const std::string arg = "3412000:" + hex32(bh) + ":\"" + hl + "\"";
+    check(pb::parse_genesis_from(arg, spec).empty() && spec.height == 3412000 && spec.block_hash == bh && spec.headline == hl,
+          "--pool-genesis-from parses H, the hash and the quoted headline");
+    check(pb::parse_genesis_from("1:" + hex32(bh) + ":a:b", spec).empty() && spec.headline == "a:b",
+          "--pool-genesis-from: the headline may contain ':'");
+    check(!pb::parse_genesis_from("x:" + hex32(bh) + ":a", spec).empty()
+                  && !pb::parse_genesis_from("1:" + hex32(bh).substr(0, 63) + ":a", spec).empty()
+                  && !pb::parse_genesis_from("1:" + hex32(bh), spec).empty(),
+          "--pool-genesis-from: a bad height, a short hash or no headline refused");
+    const pb::PoolIdentity idd = pb::identity_derived(pb::LaneNet::Stagenet, kLaneChain, spec);
+    check(idd.form == pb::GenesisForm::Derived && idd.height == 1
+                  && idd.pool_id == pb::pool_id_of(pb::LaneNet::Stagenet, kLaneChain, pb::pool_genesis_derived(bh, "a:b")),
+          "identity_derived: H, genesis and pool_id from the spec");
+    // position 0 = (pool_id, H + 1)
+    const std::optional<pb::GenesisPosition> g0 = pb::genesis_position(idd);
+    check(g0 && g0->id == idd.pool_id && g0->height == 2, "position 0 of the derived form: id = pool_id, H(0) = H + 1");
+
+    // the chain check: hash at H, at least 60 deep
+    pb::GenesisSpec g2;
+    g2.height = 1000;
+    g2.block_hash = bh;
+    g2.headline = hl;
+    check(pb::kGenesisMinDepth == 60, "the genesis depth is CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW = 60");
+    check(pb::genesis_chain_refusal(g2, bh, 1060).empty(), "chain check: 60 deep ok");
+    check(pb::genesis_chain_refusal(g2, bh, 1059) == "genesis: H is 59 deep, needs >= 60", "chain check: 59 deep refused");
+    check(!pb::genesis_chain_refusal(g2, seq32(0x11), 1060).empty() && !pb::genesis_chain_refusal(g2, std::nullopt, 1060).empty(),
+          "chain check: another hash at H, or H not held, refused");
+
+    // the raw form: refused on mainnet with its text; the height required
+    check(pb::raw_genesis_refusal(pb::LaneNet::Mainnet) == "mainnet: the pool genesis must be derived, use --pool-genesis-from",
+          "raw form on mainnet refused with its text");
+    check(pb::raw_genesis_refusal(pb::LaneNet::Testnet).empty() && pb::raw_genesis_refusal(pb::LaneNet::Stagenet).empty()
+                  && pb::raw_genesis_refusal(pb::LaneNet::Regtest).empty(),
+          "raw form accepted on the test networks");
+    pb::RawGenesisSpec raw;
+    check(pb::parse_pool_genesis_raw(hex32(dg3) + ":500", raw).empty() && raw.genesis == dg3 && raw.height == 500,
+          "--pool-genesis <hex64>:<H> parses");
+    check(pb::parse_pool_genesis_raw(hex32(dg3), raw).empty() && !raw.height, "--pool-genesis <hex64> alone: no height");
+    const pb::RawIdentity no_h = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {hex32(dg3), std::nullopt});
+    check(!no_h.refusal.empty(), "a raw start without H is refused (--pool-genesis <hex64>)");
+    const pb::RawIdentity no_h2 = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {std::nullopt, std::nullopt});
+    check(!no_h2.refusal.empty(), "a raw start without H is refused (the default raw genesis, no --pool-genesis-height)");
+    const pb::RawIdentity both = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {hex32(dg3) + ":500", "500"});
+    check(!both.refusal.empty(), "--pool-genesis-height with --pool-genesis refused (the height flag names the default's)");
+    const pb::RawIdentity ri = pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {std::nullopt, "500"});
+    check(ri.refusal.empty() && ri.identity.form == pb::GenesisForm::Raw && ri.identity.height == 500
+                  && ri.identity.pool_genesis == dg3 && ri.identity.pool_id == pb::pool_id_of(pb::LaneNet::Regtest, kLaneChain, dg3),
+          "the default raw genesis with --pool-genesis-height 500: identity");
+    const pb::RawIdentity rg = pb::raw_identity_from(pb::LaneNet::Testnet, kLaneChain, {hex32(seq32(0x77)) + ":42000", std::nullopt});
+    check(rg.refusal.empty() && rg.identity.height == 42000 && rg.identity.pool_genesis == seq32(0x77),
+          "--pool-genesis <hex64>:<H> on testnet: identity");
+    check(!pb::raw_identity_from(pb::LaneNet::Regtest, kLaneChain, {std::nullopt, "5x"}).refusal.empty(),
+          "--pool-genesis-height 5x refused");
+    const std::optional<pb::GenesisPosition> r0 = pb::genesis_position(ri.identity);
+    check(r0 && r0->id == ri.identity.pool_id && r0->height == 501, "position 0 of the raw form: H(0) = H + 1");
+    check(!pb::raw_identity_from(pb::LaneNet::Mainnet, kLaneChain, {std::nullopt, "500"}).refusal.empty()
+                  && !pb::raw_identity_from(pb::LaneNet::Mainnet, kLaneChain, {hex32(dg3) + ":500", std::nullopt}).refusal.empty(),
+          "a raw start on mainnet is refused (both raw forms)");
+    const std::string line = pb::identity_line(ri.identity);
+    check(line.find("H=500") != std::string::npos && line.find("RAW (not derived)") != std::string::npos
+                  && line.find("pool_id=" + hex32(ri.identity.pool_id)) != std::string::npos,
+          "the start line names H, the raw form and pool_id");
 }
 
 }  // namespace
@@ -440,6 +566,9 @@ int main() {
         for (std::uint64_t x = 0; x <= 4; ++x) dead = step(small, dead, x, {pb::RatchetPlacement{0, pb::make_ballot(1, false)}});
         check(dead.levels.back() == pb::kLevelNone, "work 0 (dead receipts) only: all = 0, level 0");
     }
+
+    // (8) the C23 pool identity
+    pool_identity_cases();
 
     return finish("v37_xmr_side_data_v3_kat");
 }

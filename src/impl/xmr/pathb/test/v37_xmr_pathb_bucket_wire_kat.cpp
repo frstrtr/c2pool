@@ -359,15 +359,11 @@ void codec_vectors() {
     b = f, b[e0 + 96 + 8] = 0xff, b[e0 + 96 + 9] = 0xff;
     check(derr(b) == pb::BucketsWireError::Truncated, "FC_BUCKETS entry n_rows 65535 refused as truncated");
 
-    // the reference table uses XmrKeyRef; the K16 author reference uses the 66-byte KeyRef: one identity
+    // the reference table and the K16 author reference are one type (XmrKeyRef): one identity
     {
-        const pb::KeyRef kr = pb::author_ref(pb::LaneNet::Mainnet);
-        pb::XmrKeyRef xr;
-        std::copy(kr.begin() + 2, kr.begin() + 34, xr.spend.begin());
-        std::copy(kr.begin() + 34, kr.end(), xr.view.begin());
-        check(pb::key_ref_identity(xr) == pb::key_ref_identity(kr) &&
-                      hx(pb::key_ref_identity(xr)) == "0bf5439fbd213a43d5c0cf066577adb9b39bb0ccfe622e789eba2b58e6e590aa",
-              "XmrKeyRef and the 66-byte KeyRef give one identity (mainnet author 0bf5439f...)");
+        const pb::XmrKeyRef xr = pb::author_ref(pb::LaneNet::Mainnet);
+        check(hx(pb::key_ref_identity(xr)) == "0bf5439fbd213a43d5c0cf066577adb9b39bb0ccfe622e789eba2b58e6e590aa",
+              "the K16 author reference is an XmrKeyRef with the identity of record (mainnet author 0bf5439f...)");
     }
 
     // the 134-byte ratchet state

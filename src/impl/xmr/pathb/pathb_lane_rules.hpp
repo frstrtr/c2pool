@@ -134,11 +134,10 @@ inline std::string hex(const std::uint8_t* p, std::size_t n) {
 }  // namespace lr_detail
 
 // ---------------------------------------------------------------------------
-// K16 author reference: kind 0x10 | len 64 | spend B | view A, the per-network
-// donation keys of src/c2pool/v37/xmr/xmr_fee_model.hpp.
+// K16 author reference (XmrKeyRef: spend B, view A), the per-network donation
+// keys of src/c2pool/v37/xmr/xmr_fee_model.hpp; on the TLV as put_key_ref
+// writes it: kind 0x10 | len 64 | spend | view (66 B).
 // ---------------------------------------------------------------------------
-using KeyRef = std::array<std::uint8_t, kKeyRefBytes>;
-
 inline constexpr char kAuthorSpendHexMainnet[] = "14d413e6ccb14f0ba30999b97c8912a07321d893789b7f149810b7885b2cd7c7";
 inline constexpr char kAuthorViewHexMainnet[] = "b3157741ab68969aeb7fe9ebd4fa3ec5ce4dcdc7b43249fdb40311cb03779e03";
 inline constexpr char kAuthorSpendHexTestnet[] = "a7731abbe9bb2cf3264395231a8645172ffd7f08c6097e3402197f3f1c6ffcbb";
@@ -148,18 +147,18 @@ inline constexpr char kAuthorViewHexStagenet[] = "0abca326ba53a6f5387785822296c1
 inline constexpr char kAuthorSpendHexRegtest[] = "3091e80a51918c67eb67b6fefaf77e374dd898240953bbb75d47b82b8615c638";
 inline constexpr char kAuthorViewHexRegtest[] = "c5d453f0d54332e4f48f12abab2551132f00037f0c51892ebe3b41928ab5bec1";
 
-inline constexpr KeyRef make_key_ref(const char* spend_hex, const char* view_hex) noexcept {
-    KeyRef r{};
-    r[0] = kPayeeKindXmrStd;
-    r[1] = static_cast<std::uint8_t>(kKeyRefPayloadBytes);
-    std::size_t o = 2;
-    for (const char* h : {spend_hex, view_hex})
-        for (std::size_t i = 0; i < kHashBytes; ++i)
-            r[o++] = static_cast<std::uint8_t>((lr_detail::hex_nibble(h[2 * i]) << 4) | lr_detail::hex_nibble(h[2 * i + 1]));
+inline constexpr XmrKeyRef make_key_ref(const char* spend_hex, const char* view_hex) noexcept {
+    XmrKeyRef r{};
+    for (std::size_t i = 0; i < kHashBytes; ++i) {
+        r.spend[i] = static_cast<std::uint8_t>((lr_detail::hex_nibble(spend_hex[2 * i]) << 4)
+                                               | lr_detail::hex_nibble(spend_hex[2 * i + 1]));
+        r.view[i] = static_cast<std::uint8_t>((lr_detail::hex_nibble(view_hex[2 * i]) << 4)
+                                              | lr_detail::hex_nibble(view_hex[2 * i + 1]));
+    }
     return r;
 }
 
-inline constexpr KeyRef author_ref(LaneNet n) noexcept {
+inline constexpr XmrKeyRef author_ref(LaneNet n) noexcept {
     switch (n) {
         case LaneNet::Testnet: return make_key_ref(kAuthorSpendHexTestnet, kAuthorViewHexTestnet);
         case LaneNet::Stagenet: return make_key_ref(kAuthorSpendHexStagenet, kAuthorViewHexStagenet);
@@ -169,17 +168,7 @@ inline constexpr KeyRef author_ref(LaneNet n) noexcept {
     return make_key_ref(kAuthorSpendHexMainnet, kAuthorViewHexMainnet);
 }
 
-// identity = sha256d(VERSION 1 || kind || len || payload) (v37_descriptor.hpp identity_preimage).
-inline constexpr std::uint8_t kIdentityVersion = 1;
-
-inline Hash32 key_ref_identity(const KeyRef& r) {
-    std::vector<std::uint8_t> pre;
-    pre.reserve(1 + r.size());
-    pre.push_back(kIdentityVersion);
-    pre.insert(pre.end(), r.begin(), r.end());
-    return ::v37::sha256d(pre);
-}
-
+// identity = key_ref_identity(XmrKeyRef) (pathb_wire_v3.hpp).
 inline Hash32 author_identity(LaneNet n) { return key_ref_identity(author_ref(n)); }
 
 // K16 default give_author_bp.
@@ -307,7 +296,7 @@ struct PathbLaneRules {
     std::uint8_t w_max_rule_version = 0;       // 0x0b K11
     std::uint8_t owner_fee_version = 0;        // 0x0f K15
     std::uint16_t give_author_bp = 0;          // 0x10 K16
-    KeyRef author{};                           //      K16
+    XmrKeyRef author{};                        //      K16
     std::uint8_t payment_groups = 0;           // 0x11 K17
     std::uint8_t receipt_size_rule = 0;        // 0x12 K18
     Hash32 monero_rules_digest{};              // 0x14 K20
@@ -450,7 +439,7 @@ inline std::vector<std::uint8_t> lane_rule_value(const PathbLaneRules& r, std::u
         case 0x0f: put_le(v, r.owner_fee_version, kU8Bytes); break;
         case 0x10:
             put_le(v, r.give_author_bp, kU16Bytes);
-            v.insert(v.end(), r.author.begin(), r.author.end());
+            detail::put_key_ref(v, r.author);
             break;
         case 0x11: put_le(v, r.payment_groups, kU8Bytes); break;
         case 0x12: put_le(v, r.receipt_size_rule, kU8Bytes); break;
@@ -527,6 +516,7 @@ enum class LaneRulesError : std::uint8_t {
     Order,         // ids not strictly ascending
     Width,         // a known id with another length
     Missing,       // a field of the set absent
+    Value,         // K16's author reference not (XMR_STD, 64)
 };
 
 struct LaneRulesDecode {
@@ -626,7 +616,15 @@ inline LaneRulesDecode decode_rules_block(std::span<const std::uint8_t> b) {
             case 0x0f: r.owner_fee_version = q[0]; break;
             case 0x10:
                 r.give_author_bp = static_cast<std::uint16_t>(get_le(q, 2));
-                for (std::size_t i = 0; i < r.author.size(); ++i) r.author[i] = q[2 + i];
+                if (q[2] != kPayeeKindXmrStd || q[3] != kKeyRefPayloadBytes) {
+                    d.error = LaneRulesError::Value;
+                    d.id = id;
+                    return d;
+                }
+                for (std::size_t i = 0; i < kHashBytes; ++i) {  // after the kind and len bytes
+                    r.author.spend[i] = q[2 + 2 + i];
+                    r.author.view[i] = q[2 + 2 + kHashBytes + i];
+                }
                 break;
             case 0x11: r.payment_groups = q[0]; break;
             case 0x12: r.receipt_size_rule = q[0]; break;

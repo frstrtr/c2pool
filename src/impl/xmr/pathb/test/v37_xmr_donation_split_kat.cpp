@@ -110,18 +110,23 @@ int main() {
     check(!fee_model.empty(), "master's xmr_fee_model.hpp read");
     for (int i = 0; i < 4; ++i) {
         const pb::LaneNet n = pb::kLaneNets[i];
-        const pb::KeyRef r = pb::author_ref(n);
+        const pb::XmrKeyRef r = pb::author_ref(n);
         const pb::Hash32 idn = pb::author_identity(n);
         check(hex(idn.data(), idn.size()) == gold[i], std::string("K16 author identity golden ") + std::string(pb::lane_net_name(n)));
         std::array<std::uint8_t, 32> B{}, A{};
-        std::copy(r.begin() + 2, r.begin() + 34, B.begin());
-        std::copy(r.begin() + 34, r.end(), A.begin());
+        std::copy(r.spend.begin(), r.spend.end(), B.begin());
+        std::copy(r.view.begin(), r.view.end(), A.begin());
         const ::v37::bytes32 master_id = ::v37::xmr::xmr_identity_key(::v37::xmr::make_xmr_std(B, A));
         check(std::equal(master_id.begin(), master_id.end(), idn.begin()), "identity == xmr_identity_key(make_xmr_std(B, A))");
         const std::string spend = quoted(fee_model, std::string("kDonationSpendHex") + suffix[i]);
         const std::string view = quoted(fee_model, std::string("kDonationViewHex") + suffix[i]);
-        check(r[0] == 0x10 && r[1] == 0x40 && hex(r.data() + 2, 32) == spend && hex(r.data() + 34, 32) == view && !spend.empty(),
+        check(hex(r.spend.data(), 32) == spend && hex(r.view.data(), 32) == view && !spend.empty(),
               std::string("author_ref equals master's donation keys byte for byte: ") + std::string(pb::lane_net_name(n)));
+        // K16 on the TLV: give_author_bp | 0x10 | 0x40 | spend | view (put_key_ref; the TLV golden holds these bytes)
+        const std::vector<std::uint8_t> k16 = pb::lane_rule_value(pb::epoch0_lane_rules(n), 0x10);
+        check(k16.size() == 68 && k16[0] == 10 && k16[1] == 0 && k16[2] == 0x10 && k16[3] == 0x40
+                      && hex(k16.data() + 4, 32) == spend && hex(k16.data() + 36, 32) == view,
+              std::string("K16 TLV value = u16 10 | 0x10 | 0x40 | spend | view: ") + std::string(pb::lane_net_name(n)));
     }
     check(pb::epoch0_lane_rules(pb::LaneNet::Testnet).author == pb::author_ref(pb::LaneNet::Testnet)
               && pb::epoch0_lane_rules(pb::LaneNet::Mainnet).give_author_bp == 10,

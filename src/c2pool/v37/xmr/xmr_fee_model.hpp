@@ -92,6 +92,7 @@
 #include <sharechain/v37/v37_hash.hpp>
 #include <sharechain/v37/v37_lane.hpp>             // LaneParams::fee (FeeModelGate)
 
+#include "c2pool/v37/xmr/pathb/pathb_policy.hpp"   // the moved percentage and address helpers
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"   // xmr::coin::keccak256 (cn_fast_hash)
 #include "impl/xmr/settle/xmr_coinbase.hpp"        // FixedOutput, CoinbaseOutput
 #include "xmr_credit_cut.hpp"                      // extra_nonce_field, the credit-cut tail it precedes
@@ -128,10 +129,16 @@ inline bool fee_model_on(const ::v37::LaneParams& p) {
     return p.fee.enabled && p.fee.version == kFeeModelVersion;
 }
 
-// Monero address network bytes (cryptonote_config.h).
-inline constexpr std::uint64_t kPrefixMainnetStd = 18, kPrefixMainnetInt = 19, kPrefixMainnetSub = 42;
-inline constexpr std::uint64_t kPrefixTestnetStd = 53, kPrefixTestnetInt = 54, kPrefixTestnetSub = 63;
-inline constexpr std::uint64_t kPrefixStagenetStd = 24, kPrefixStagenetInt = 25, kPrefixStagenetSub = 36;
+// Monero address network bytes (cryptonote_config.h): pathb_policy.hpp.
+using ::c2pool::xmr::pathb::policy::kPrefixMainnetStd;
+using ::c2pool::xmr::pathb::policy::kPrefixMainnetInt;
+using ::c2pool::xmr::pathb::policy::kPrefixMainnetSub;
+using ::c2pool::xmr::pathb::policy::kPrefixTestnetStd;
+using ::c2pool::xmr::pathb::policy::kPrefixTestnetInt;
+using ::c2pool::xmr::pathb::policy::kPrefixTestnetSub;
+using ::c2pool::xmr::pathb::policy::kPrefixStagenetStd;
+using ::c2pool::xmr::pathb::policy::kPrefixStagenetInt;
+using ::c2pool::xmr::pathb::policy::kPrefixStagenetSub;
 
 // ---------------------------------------------------------------------------
 // Per-network donation identity (DON-NET)
@@ -186,84 +193,11 @@ inline constexpr const char* to_string(DonationNet n) {
 }
 
 // ---------------------------------------------------------------------------
-// CryptoNote base58 (block-wise: 8 bytes <-> 11 chars, tail per kEncSizes)
+// CryptoNote base58 and the address decoder: pathb_policy.hpp
 // ---------------------------------------------------------------------------
-namespace detail {
-inline constexpr char kAlphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-inline constexpr int  kEncSizes[9] = {0, 2, 3, 5, 6, 7, 9, 10, 11};
-inline int digit_of(char c) {
-    for (int i = 0; i < 58; ++i) if (kAlphabet[i] == c) return i;
-    return -1;
-}
-inline bool decode_block(const char* s, std::size_t n, std::vector<std::uint8_t>& out) {
-    int res = -1;
-    for (int i = 0; i < 9; ++i) if (kEncSizes[i] == static_cast<int>(n)) { res = i; break; }
-    if (res <= 0) return false;
-    unsigned __int128 num = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const int d = digit_of(s[i]);
-        if (d < 0) return false;
-        num = num * 58 + static_cast<unsigned>(d);
-        if (num >> 64) return false;                       // u64 overflow (monero: overflow)
-    }
-    if (res < 8 && (num >> (8 * res)) != 0) return false;  // does not fit the block size
-    for (int i = res - 1; i >= 0; --i) out.push_back(static_cast<std::uint8_t>(num >> (8 * i)));
-    return true;
-}
-} // namespace detail
-
-inline bool cn_base58_decode(const std::string& s, std::vector<std::uint8_t>& out) {
-    out.clear();
-    const std::size_t full = s.size() / 11, rem = s.size() % 11;
-    for (std::size_t i = 0; i < full; ++i)
-        if (!detail::decode_block(s.data() + 11 * i, 11, out)) return false;
-    if (rem && !detail::decode_block(s.data() + 11 * full, rem, out)) return false;
-    return true;
-}
-
-struct DecodedAddress {
-    bool          ok = false;
-    std::string   why;
-    std::uint64_t prefix = 0;
-    bool          subaddress = false;
-    std::array<std::uint8_t, 32> spend{};   // B (or D_i for a subaddress)
-    std::array<std::uint8_t, 32> view{};    // A (or C_i for a subaddress)
-    // The XMR_STD payout ref. Only meaningful when ok && !subaddress: a
-    // subaddress encodes (D_i, C_i) while XMR_SUB is (D_i, A_main), and the
-    // main view key is not in the address -- so a subaddress is refused as a
-    // payee at this seam (the caller checks `subaddress`).
-    ::v37::ScriptRef ref() const { return ::v37::xmr::make_xmr_std(spend, view); }
-};
-
-// Decode a standard address or a subaddress (integrated addresses are
-// refused: a payment id has no place in a coinbase payee). Verifies the
-// keccak checksum and the varint network byte.
-inline DecodedAddress decode_xmr_address(const std::string& addr) {
-    DecodedAddress d;
-    std::vector<std::uint8_t> raw;
-    if (!cn_base58_decode(addr, raw)) { d.why = "not CryptoNote base58"; return d; }
-    // varint prefix
-    std::uint64_t pfx = 0; std::size_t i = 0; int shift = 0;
-    for (;; ++i) {
-        if (i >= raw.size() || shift > 63) { d.why = "truncated varint prefix"; return d; }
-        pfx |= static_cast<std::uint64_t>(raw[i] & 0x7f) << shift;
-        shift += 7;
-        if (!(raw[i] & 0x80)) { ++i; break; }
-    }
-    if (raw.size() != i + 64 + 4) { d.why = "wrong length " + std::to_string(raw.size()) + " (integrated address or garbage)"; return d; }
-    const ::xmr::coin::Hash256 h = ::xmr::coin::keccak256(raw.data(), raw.size() - 4);
-    if (std::memcmp(h.data(), raw.data() + raw.size() - 4, 4) != 0) { d.why = "checksum mismatch"; return d; }
-    switch (pfx) {
-        case kPrefixMainnetStd: case kPrefixTestnetStd: case kPrefixStagenetStd: d.subaddress = false; break;
-        case kPrefixMainnetSub: case kPrefixTestnetSub: case kPrefixStagenetSub: d.subaddress = true; break;
-        default: d.why = "unsupported network byte " + std::to_string(pfx); return d;
-    }
-    d.prefix = pfx;
-    std::memcpy(d.spend.data(), raw.data() + i, 32);
-    std::memcpy(d.view.data(), raw.data() + i + 32, 32);
-    d.ok = true;
-    return d;
-}
+using ::c2pool::xmr::pathb::policy::cn_base58_decode;
+using ::c2pool::xmr::pathb::policy::DecodedAddress;
+using ::c2pool::xmr::pathb::policy::decode_xmr_address;
 
 // ---------------------------------------------------------------------------
 // The donation payee
@@ -317,41 +251,13 @@ inline x6::FixedOutput donation_marker() { return donation_marker(DonationNet::M
 // and compiler (an x87 or FMA build may round a double on a .5 boundary the
 // other way). Accepts DIGITS[.DIGITS] with at most 9 decimals; anything else
 // (a sign, an exponent, NaN, text) is refused.
-struct ExactPct { std::uint64_t num = 0, den = 1; bool ok = false; };
-inline ExactPct parse_pct_exact(const std::string& t) {
-    ExactPct r;
-    std::size_t i = 0, int_digits = 0, frac_digits = 0;
-    std::uint64_t num = 0, den = 1;
-    for (; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i, ++int_digits) {
-        if (num > 1000000000ull) return r;                 // far above 100: refuse
-        num = num * 10 + static_cast<std::uint64_t>(t[i] - '0');
-    }
-    if (i < t.size() && t[i] == '.') {
-        for (++i; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i, ++frac_digits) {
-            if (frac_digits == 9) return r;                // more than 9 decimals
-            num = num * 10 + static_cast<std::uint64_t>(t[i] - '0');
-            den *= 10;
-        }
-        if (frac_digits == 0) return r;                    // "1." is not a number
-    }
-    if (i != t.size() || int_digits == 0) return r;
-    r.num = num; r.den = den; r.ok = true;
-    return r;
-}
-// round-half-up(65535 * num / (100 * den)), clamped to [0, 65535], in integers.
-inline std::uint16_t give_author_u16(const ExactPct& p) {
-    if (!p.ok || p.num == 0) return 0;
-    const unsigned __int128 n = static_cast<unsigned __int128>(kGiveAuthorScale) * p.num * 2 + 100u * p.den;
-    const unsigned __int128 d = static_cast<unsigned __int128>(200u) * p.den;
-    const unsigned __int128 v = n / d;
-    return static_cast<std::uint16_t>(v > kGiveAuthorScale ? kGiveAuthorScale : v);
-}
-// round-half-up(10000 * num / (100 * den)) basis points, clamped to [0, 10000].
-inline std::uint32_t pct_to_bp(const ExactPct& p) {
-    if (!p.ok || p.num == 0) return 0;
-    const unsigned __int128 v = (static_cast<unsigned __int128>(p.num) * 200u + p.den) / (2u * p.den);
-    return static_cast<std::uint32_t>(v > 10000u ? 10000u : v);
-}
+// ExactPct, parse_pct_exact, give_author_u16(ExactPct) and pct_to_bp(ExactPct):
+// pathb_policy.hpp.
+using ::c2pool::xmr::pathb::policy::ExactPct;
+using ::c2pool::xmr::pathb::policy::parse_pct_exact;
+using ::c2pool::xmr::pathb::policy::give_author_u16;
+using ::c2pool::xmr::pathb::policy::pct_to_bp;
+static_assert(::c2pool::xmr::pathb::policy::kGiveAuthorScale == kGiveAuthorScale);
 
 // v36 encodes perfect_round(65535*pct/100) (stochastic rounding); the u16 is
 // minted into the receipt and is node-local policy, so a deterministic
