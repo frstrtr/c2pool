@@ -1825,6 +1825,33 @@ if (BUILD_TESTING)
             ENVIRONMENT "XMR_RUNNODE_SKIP_BUILD=1;C2POOL_BUILD_DIR=${CMAKE_BINARY_DIR}")
     endif()
 
+    # PATHB-SMOKE -- v37_xmr_pathb_regtest_smoke
+    #   pathb_smoke/v37_xmr_pathb_regtest_smoke.py runs the built daemon on a
+    #   loopback regtest rig: two regtest monerods, three Path B pool nodes
+    #   (relay links, --mine), an old-binary node, a --follow-only node and a
+    #   one-node --native-solo pool. Inputs: XMR_REGTEST_MONEROD (monerod),
+    #   XMR_REGTEST_WALLET_RPC (default: beside monerod),
+    #   XMR_PATHB_SMOKE_OLD_BINARY (the old c2pool-v37-xmr); without them the
+    #   test exits 77 (SKIPPED). The custom target orders the build after
+    #   c2pool-v37-xmr. Listed in the build.yml Linux --target list only.
+    if (TARGET c2pool-v37-xmr)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        add_custom_target(v37_xmr_pathb_regtest_smoke)
+        add_dependencies(v37_xmr_pathb_regtest_smoke c2pool-v37-xmr)
+        if (Python3_Interpreter_FOUND)
+            add_test(NAME v37_xmr_pathb_regtest_smoke
+                     COMMAND ${Python3_EXECUTABLE} -I
+                             ${CMAKE_CURRENT_SOURCE_DIR}/pathb_smoke/v37_xmr_pathb_regtest_smoke.py
+                             --daemon $<TARGET_FILE:c2pool-v37-xmr>
+                             --work ${CMAKE_CURRENT_BINARY_DIR}/pathb_smoke)
+            set_tests_properties(v37_xmr_pathb_regtest_smoke PROPERTIES
+                SKIP_RETURN_CODE 77
+                TIMEOUT 3600
+                RUN_SERIAL TRUE
+                LABELS "regtest;monerod;smoke")
+        endif()
+    endif()
+
     # D6d -- v37_xmr_d6d_native_seed_tip_kat
     #   Under --arm-order p2p-first the embedded native node is the tip, the
     #   RandomX seed (hash + height, 2048-block epochs, 64-block lag) and the
