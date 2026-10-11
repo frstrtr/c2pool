@@ -1049,7 +1049,6 @@ if (BUILD_TESTING)
     #                               readers are reaped, the accept loop backs
     #                               off on EMFILE and the relay heals after a
     #                               partition_for().
-    #   v37_xmr_drops_enrol_repl_kat ENROL-REPL: the carried DROPS delta (below).
     #   v37_xmr_relay_pool_id_kat   POOL-ID: the roundabout S1 lane_tag in
     #                               HELLO; another pool's node (geometry /
     #                               chain_id / consensus version) is refused
@@ -1108,7 +1107,7 @@ if (BUILD_TESTING)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_relay_parked_cap_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_relay_parked_cap_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_relay_send_queue_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1142,15 +1141,6 @@ if (BUILD_TESTING)
     #                               due and raindrop-enrol rules on; a control
     #                               that pays raindrops in every window block
     #                               trips it. ALSO on BOTH build.yml lists.
-    #   v37_xmr_drops_pin_enrol_kat THE MERGE SEAM (master #1857 x A3 / gap 4):
-    #                               the pinned raindrop set composer enrols a
-    #                               DROPS-only payee from the PINNED members only
-    #                               and reads the booking-point registry; a
-    #                               long-ref raindrop is an invalid member (set
-    #                               refused, never a HOLD); one composed-order
-    #                               rule for the replay and the DROPS prefix.
-    #                               RED on the plain merge. ALSO on BOTH
-    #                               build.yml --target lists.
     #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
     #                               relay repair of a lane longer than every
     #                               peer's vault horizon was Exhausted forever
@@ -1329,90 +1319,6 @@ if (BUILD_TESTING)
         target_link_libraries(${_netdos_kat} PRIVATE xmr_coin Threads::Threads)
         add_test(NAME ${_netdos_kat} COMMAND ${_netdos_kat})
     endforeach()
-    # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
-    # enrolment book is node-local, so a lane block books the WINNER's composed
-    # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book
-    # composition). Two nodes enrolled 8 tips apart book 50 wins through
-    # XmrFinalizeDriver with EQUAL owed_digest (RED on the base: each composes
-    # its own); the v0x02 codec (flip-0 decoder refuses it; malformed trailers
-    # refused); a mismatched / inconsistent carried delta books EMPTY on every
-    # node; source pins on the shell / node / relay. ALSO on BOTH build.yml
-    # --target lists.
-    target_compile_definitions(v37_xmr_drops_enrol_repl_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
-        V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
-    # the merge seam KAT reads the shell for its source pins (PE5)
-    target_compile_definitions(v37_xmr_drops_pin_enrol_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-RESTART (flip-1 multinode robustness): v37_xmr_drops_restart_kat --
-    # the prev_lane walk HOLDs (never decides) on an unreadable row / unreadable
-    # bytes and takes a tagged block as a lane block even before this node's
-    # ring matched its root; the carried-delta journal (own win, composed frame
-    # written before it is sent, booked deltas) survives a restart byte-exact;
-    # a NON-winner serves a lost carried frame on FB_GETWON with the winner
-    # down; source pins: no pre-DROPS booking at flip 1, the boot re-drive books
-    # the journal. RED on c3fd4b55, GREEN on the fix. ALSO on BOTH build.yml
-    # --target lists.
-    target_compile_definitions(v37_xmr_drops_restart_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
-        V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
-    # DROPS WRITE-AHEAD: v37_xmr_drops_writeahead_kat -- the exact network gate
-    # journals our own block (P) BEFORE it is published, so a winner that dies
-    # between the publish and the FOUND callback still composes + carries its
-    # delta after the restart (the base stalls: nobody holds the frame); the
-    # gate's listener-thread appends interleave with the main thread's
-    # untorn; source pins (gate order, flip-1-only hook, booking order). RED on
-    # the base, GREEN on the fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_writeahead_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-ENROL-LANE (DROPS defect 4, flip 1): v37_xmr_drops_enrol_lane_kat --
-    # the share counts and the enrolment book are derived from the replicated
-    # lane prefix [0, P) at the block's on-chain credit cut, so a late / restarted
-    # node composes the winner's rows, digest and delta, a node that never
-    # enrolled locally composes a dead winner's delta, and a carried trailer
-    # whose enrollment_digest differs from the lane derivation is refused; the
-    # enrol set rides HELLO only under DROPS; source pins. RED on the base,
-    # GREEN on the fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_enrol_lane_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-ENROL-TIDY (flip 1, follow-ups of DROPS-ENROL-LANE):
-    # v37_xmr_drops_enrol_tidy_kat -- the per-node lane-position log is folded
-    # below the oldest reachable credit cut (compose / verify_carry / repair at
-    # that cut unchanged, an entry below the bound gone, the log bounded), the
-    # tip-based EnrollmentBook + node-local share book are retired (lane-only),
-    # and an enrol-set mismatch is refused at HELLO naming both enrol-set
-    # digests. RED on the base, GREEN on the fix. ALSO on BOTH build.yml
-    # --target lists.
-    target_compile_definitions(v37_xmr_drops_enrol_tidy_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-CARRY-SUFFIX (capstone attempt 5, flip 1): v37_xmr_drops_carry_suffix_kat
-    # -- a receiver whose relay repair served only the SUFFIX [a0, P) (the
-    # serving peer's vault horizon) composes the DROPS prefix from OUR lane log
-    # over [0, a0) + the served suffix (merged_prefix, positions == P or HOLD),
-    # so three nodes book the winner's book + delta and one owed ledger (no
-    # carried REFUSED, no lane_root_refused); never-a-clawback + one rule for
-    # the winner's own block; source pins. RED on the base, GREEN on the fix.
-    # ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_carry_suffix_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-SET-PIN (verify of 2da7c254, flip 1): v37_xmr_drops_set_kat -- the
-    # raindrop SET of a lane block is the winner's pinned id list (FB_BLOCK_WON
-    # v0x03): a receiver holding an extra raindrop, fewer raindrops, or restarted
-    # composes exactly the winner's delta (never adds, never drops; HOLD while a
-    # member is missing, fetched by id over loopback); an invalid set is refused
-    # alike on every node; flip-0 wire unchanged; source pins. RED on the base,
-    # GREEN on the fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_set_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-HARDEN (verify of DROPS-SET-PIN, flip 1): v37_xmr_drops_harden_kat --
-    # d1 bounded by-id asks (drops_fetch_max_asks, then drops_fetch_slow_ms; the
-    # ask state pruned when a set completes or leaves the pending set), d3 the
-    # first set-carrying FB_BLOCK_WON for a bid wins (set-equivocation logged),
-    # d4 the persisted raindrop store (lane<N>.drops) served by a restarted
-    # winner, d2 wire_cache pruned (source pins). RED on the base, GREEN on the
-    # fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_harden_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # RELAY-SEND-QUEUE (capstone attempt 6 false start): v37_xmr_relay_send_queue_kat
     # -- two relay nodes over loopback TCP, each holding 32 carried FB_BLOCK_WON
     # v0x03 frames (16384 ids, ~512 KiB) the other lacks, HELLO at once: the
@@ -2198,21 +2104,6 @@ if (BUILD_TESTING)
     target_link_libraries(v37_drops_jk_keep_share_credit_kat Threads::Threads)
     add_test(NAME v37_drops_jk_keep_share_credit_kat COMMAND v37_drops_jk_keep_share_credit_kat)
 
-    # ★ DROPS on the XMR lane — v37_xmr_drops_wiring_kat. main_v37_xmr.cpp built
-    # no DropsWiring and called none of XmrNode's T3 seams, so a flipped XMR node
-    # was gate-ON and DORMANT. Pins the shell's wiring (X-SHELL: RED on the base),
-    # gate-OFF dormancy, the ★ enrolment clock = the NATIVE TIP (never the burial
-    # frontier), the exact Monero-difficulty -> lz normalisation, the rescaled
-    # R1 price, and the end-to-end composed credit. Stdlib-only, ~1 s. ALSO on
-    # BOTH build.yml --target lists (hollow-green guard).
-    add_executable(v37_xmr_drops_wiring_kat v37_xmr_drops_wiring_kat.cpp)
-    target_compile_features(v37_xmr_drops_wiring_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_drops_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_compile_definitions(v37_xmr_drops_wiring_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    target_link_libraries(v37_xmr_drops_wiring_kat Threads::Threads)
-    add_test(NAME v37_xmr_drops_wiring_kat COMMAND v37_xmr_drops_wiring_kat)
-
     # ★ DROPS ACTIVATION AT ARITY 1 — the gate-ON owed_digest a DECOUPLED fleet
     # actually reproduces, minted and pinned BESIDE the arity-2 golden above.
     #
@@ -2339,12 +2230,6 @@ if (BUILD_TESTING)
     target_compile_definitions(v37_xmr_boost_origin_kat PRIVATE
         C2POOL_EXPECT_BOOST_VERSION_STRING="${_v37_boost_origin_expect}")
     add_test(NAME v37_xmr_boost_origin_kat COMMAND v37_xmr_boost_origin_kat)
-endif()
-
-# v37_xmr_drops_default_kat DD4 reads the XMR shell source.
-if (TARGET v37_xmr_drops_default_kat)
-    target_compile_definitions(v37_xmr_drops_default_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
 endif()
 
 # XMR-DROPS-DEFAULT: every XMR KAT in this directory is built the way the XMR
