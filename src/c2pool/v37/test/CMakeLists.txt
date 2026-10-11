@@ -1127,18 +1127,18 @@ if (BUILD_TESTING)
     #                               codec, verify_block_ctx, bounded retries +
     #                               failover, reconnect, recursive resolution,
     #                               a lying context rejected.
-    #   v37_xmr_relay_native_ctx_kat RC-CTX: on the P2P-first arm a receipt's
-    #                               Monero context resolves from the embedded
-    #                               native node (best-chain rows, retained and
-    #                               alternative bodies), FB_GETCTX is served
-    #                               from native bodies, and issued-template
-    #                               contexts survive a restart (journal).
+    #   v37_xmr_relay_native_ctx_kat RC-CTX on the Path B relay node: a Monero
+    #                               context resolves from the embedded native
+    #                               node (index rows, retained and alternative
+    #                               bodies), FB_GETCTX is served from native
+    #                               bodies, a served block is judged by its work
+    #                               against the node's own index.
     #   v37_xmr_relay_fd_kat        RELAY-FD: a dropped relay connection
     #                               releases its descriptor (a partition no
     #                               longer leaks one per redial), unwound
     #                               readers are reaped, the accept loop backs
-    #                               off on EMFILE and the relay heals after a
-    #                               partition_for().
+    #                               off on EMFILE and the Path B relay node heals
+    #                               after a partition_for().
     #   v37_xmr_drops_enrol_repl_kat ENROL-REPL: the carried DROPS delta (below).
     #   v37_xmr_relay_pool_id_kat   POOL-ID: the roundabout S1 lane_tag in
     #                               HELLO; another pool's node (geometry /
@@ -1198,7 +1198,7 @@ if (BUILD_TESTING)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_relay_parked_cap_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1270,12 +1270,11 @@ if (BUILD_TESTING)
     #                               link silent both ways with TCP still up
     #                               (blackholed forwarder) is dropped on both
     #                               sides within the silence timeout, logged
-    #                               LINK SILENT and redialed; a pre-0x45 peer
-    #                               is never timed out; keepalive 0 = the old
-    #                               wire; bins keep closing against the chain
-    #                               while the served template is frozen (a
-    #                               suspended lane). ALSO on BOTH build.yml
-    #                               --target lists.
+    #                               LINK SILENT and redialed; a peer that never
+    #                               answers a PING is never timed out;
+    #                               keepalive 0 = no PING (the Path B relay
+    #                               node). ALSO on BOTH build.yml --target
+    #                               lists.
     # ------------------------------------------------------------------
 
 
@@ -1301,9 +1300,9 @@ if (BUILD_TESTING)
             add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
         endif()
     endforeach()
-    # v37_xmr_drops_default_kat, v37_xmr_drops_count_kat, v37_xmr_parse_bounds_kat:
+    # v37_xmr_drops_default_kat, v37_xmr_drops_count_kat:
     # the block above without the receipt module.
-    foreach(_xmr_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat v37_xmr_parse_bounds_kat)
+    foreach(_xmr_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat)
         add_executable(${_xmr_kat}
             ${_xmr_kat}.cpp
             ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
@@ -1316,7 +1315,27 @@ if (BUILD_TESTING)
         target_link_libraries(${_xmr_kat} PRIVATE xmr_coin Threads::Threads)
         add_test(NAME ${_xmr_kat} COMMAND ${_xmr_kat})
     endforeach()
-    target_link_libraries(v37_xmr_parse_bounds_kat PRIVATE xmr_pathb)
+    # The relay KATs on the Path B relay node (pathb_relay_node.hpp) and its test
+    # helper xmr_pathb_relay_test_util.hpp; v37_xmr_ctx_pow_kat and
+    # v37_xmr_parse_bounds_kat on the context module xmr_relay_native_ctx.hpp.
+    # The relay wire header reads xmr_receipt.hpp by its bare name
+    # (src/impl/xmr/receipt).
+    foreach(_pathb_relay_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_liveness_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_relay_addr_ban_kat v37_xmr_relay_eclipse_kat v37_xmr_relay_send_queue_kat v37_xmr_relay_parked_cap_kat v37_xmr_verify_pool_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
+        add_executable(${_pathb_relay_kat} ${_pathb_relay_kat}.cpp)
+        target_compile_features(${_pathb_relay_kat} PRIVATE cxx_std_20)
+        target_include_directories(${_pathb_relay_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
+        target_link_libraries(${_pathb_relay_kat} PRIVATE xmr_pathb Threads::Threads)
+        if (_pathb_relay_kat IN_LIST V37_FLAKY_RETRY)
+            add_test(NAME ${_pathb_relay_kat} COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:${_pathb_relay_kat}> -DNAME=${_pathb_relay_kat}
+                -DISSUE=${V37_FLAKY_ISSUE_${_pathb_relay_kat}} -DTRIES=3
+                -P ${CMAKE_SOURCE_DIR}/cmake/RetryTest.cmake)
+        else()
+            add_test(NAME ${_pathb_relay_kat} COMMAND ${_pathb_relay_kat})
+        endif()
+    endforeach()
     #   v37_xmr_ctx_pow_kat        receipt CONTEXT WORK: a Monero block a peer
     #                               serves as a receipt's context (FB_CTX) is
     #                               used only if our own verified chain index
@@ -1331,8 +1350,9 @@ if (BUILD_TESTING)
     #   v37_xmr_parse_bounds_kat   non-wrapping bounds ("len > size - pos")
     #                               in the v3 receipt / carrier body decoders,
     #                               the family-C and FB_RECEIPTS v3 decoders,
-    #                               their reader and the index snapshot
-    #                               reader: lengths near SIZE_MAX at positions
+    #                               their reader, the context block layout and
+    #                               the index snapshot reader: lengths near
+    #                               SIZE_MAX at positions
     #                               near the end are refused with no read past
     #                               the buffer (the ASan leg runs it under
     #                               -fsanitize=address,undefined). ALSO on BOTH
@@ -1348,36 +1368,26 @@ if (BUILD_TESTING)
             target_include_directories(${_ctx_kat} PRIVATE ${Boost_INCLUDE_DIRS})
         endif()
     endforeach()
-    # v37_xmr_verify_pool_kat: with RandomX built, it also links librandomx so
-    # its VP_LIVE=1 measurement mode pays the REAL light hash per verify (the
-    # KAT itself, run by ctest, uses the sleeping fake only).
-    if (TARGET randomx AND TARGET v37_xmr_verify_pool_kat)
-        target_sources(v37_xmr_verify_pool_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
-        target_include_directories(v37_xmr_verify_pool_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)
-        target_compile_definitions(v37_xmr_verify_pool_kat PRIVATE V37_XMR_O2_WITH_RANDOMX)
-        target_link_libraries(v37_xmr_verify_pool_kat PRIVATE randomx)
-    endif()
-    #   v37_xmr_verify_pool_kat     DROPS-VERIFY-SCALE (capstone attempt 5 false
-    #                               start): RelayOptions::verify_threads workers;
-    #                               a 3-node loopback triangle with a sleeping
-    #                               fake RandomX: one worker at ~2x capacity
-    #                               drops + goes late, 4 workers do neither; N=1
-    #                               vs N=8 identical receipt/raindrop sets + lane
-    #                               digest; stop() with a full queue; an
-    #                               rx-unavailable item parked once. RED on the
-    #                               base. TSan: build this TU with
+    #   v37_xmr_verify_pool_kat     the Path B relay node's verify pool
+    #                               (PathbRelayOptions::verify_threads): a 3-node
+    #                               loopback triangle with a sleeping RandomX
+    #                               stub; N=1 vs N=8 identical placed carriers,
+    #                               pending receipts and lane digest; stop() with
+    #                               a full queue. TSan: build this TU with
     #                               -fsanitize=thread -DV37_VERIFY_POOL_TSAN.
     #                               ALSO on BOTH build.yml --target lists.
-    #   v37_xmr_relay_node_nonce_kat NODE-NONCE: HELLO nonce codec + bounds, the
-    #                               Family-B opcode map, bootstrap -> seeds, self-
-    #                               connection (SELF in the book), one link per pair.
+    #   v37_xmr_relay_node_nonce_kat NODE-NONCE: the Path B HELLO nonce codec +
+    #                               bounds, the Family-B opcode map, bootstrap ->
+    #                               seeds, self-connection (SELF in the book), one
+    #                               link per pair.
     #   v37_xmr_relay_discovery_kat RELAY-DISCOVERY: FB_GETADDR/FB_ADDR (0x4c/0x4d)
     #                               peer exchange; five nodes knowing only node 0
     #                               mesh to >= 3 links each; another pool's node
     #                               is refused + never good; a restart with node 0
     #                               down reconnects from the persisted book; ADDR
     #                               flood / GETADDR burst limits; discovery OFF =
-    #                               fb_unknown. ALSO on BOTH build.yml --target lists.
+    #                               unknown opcodes (the Path B relay node). ALSO
+    #                               on BOTH build.yml --target lists.
     #   v37_xmr_relay_peerstore_kat the persisted book on core::AddrStore
     #                               (xmr_relay_peerstore): round-trip, a smaller
     #                               set over a larger one, corrupt / absent file.
@@ -1395,30 +1405,16 @@ if (BUILD_TESTING)
     #                               dialed; per-address accept cap; one address
     #                               gets at most its share of the global RandomX
     #                               budget and a reconnect does not refill it; a
-    #                               confirmed invalid PoW bans the sender's
-    #                               address. Loopback 127.0.0.x only. ALSO on
-    #                               BOTH build.yml --target lists.
+    #                               BAN at the Path B relay node bans the
+    #                               sender's address. Loopback 127.0.0.x only.
+    #                               ALSO on BOTH build.yml --target lists.
     #   v37_xmr_relay_eclipse_kat   inbound and outbound relay links counted
-    #                               apart: with every inbound slot full a
-    #                               further inbound link is refused at accept,
-    #                               and the node still dials until its outbound
-    #                               target is met (no more). ALSO on BOTH
-    #                               build.yml --target lists.
-    foreach(_netdos_kat v37_xmr_relay_addr_ban_kat v37_xmr_relay_eclipse_kat)
-        add_executable(${_netdos_kat}
-            ${_netdos_kat}.cpp
-            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp
-            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
-        target_compile_features(${_netdos_kat} PRIVATE cxx_std_20)
-        target_include_directories(${_netdos_kat} PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt
-            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
-            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-        target_compile_definitions(${_netdos_kat} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-        target_link_libraries(${_netdos_kat} PRIVATE xmr_coin Threads::Threads)
-        add_test(NAME ${_netdos_kat} COMMAND ${_netdos_kat})
-    endforeach()
+    #                               apart (the Path B relay node): with every
+    #                               inbound slot full a further inbound link is
+    #                               refused at accept, and the node still dials
+    #                               until its outbound target is met (no more).
+    #                               ALSO on BOTH build.yml --target lists.
+    # (both built in the Path B relay KAT block above)
     # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
     # enrolment book is node-local, so a lane block books the WINNER's composed
     # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book
@@ -1503,18 +1499,12 @@ if (BUILD_TESTING)
     # fix. ALSO on BOTH build.yml --target lists.
     target_compile_definitions(v37_xmr_drops_harden_kat PRIVATE
         V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # RELAY-SEND-QUEUE (capstone attempt 6 false start): v37_xmr_relay_send_queue_kat
-    # -- two relay nodes over loopback TCP, each holding 32 carried FB_BLOCK_WON
-    # v0x03 frames (16384 ids, ~512 KiB) the other lacks, HELLO at once: the
-    # re-offer no longer deadlocks both readers (no send timeout, no redial,
-    # every frame delivered), a concurrent small send is not blocked (< 1 s), a
-    # forced re-HELLO re-sends nothing the peer provably holds, the per-peer
-    # send queue stays bounded. Compiled as the XMR PRODUCT is (flip 1 + DROPS
-    # default, src/c2pool/CMakeLists.txt), so the v0x03 frame decodes; the
-    # shipped default elsewhere is untouched. RED on the base, GREEN on the fix.
-    # ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_relay_send_queue_kat PRIVATE
-        V37_ACTIVATE_CONSENSUS_V1=1 V37_XMR_DROPS_DEFAULT=1)
+    # RELAY-SEND-QUEUE: v37_xmr_relay_send_queue_kat -- two Path B relay nodes
+    # over loopback TCP, each holding a pending set the other lacks, HELLO at
+    # once: the re-offer goes through the per-link send queue (no send timeout,
+    # no redial, every frame delivered), a concurrent small send is not blocked
+    # (< 1 s), the per-link send queue stays bounded. ALSO on BOTH build.yml
+    # --target lists.
     # ------------------------------------------------------------------
     # SEAM-1 (rbind in the coinbase 0x02 region) + fee-model rulings S3/S4.
     #

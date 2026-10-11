@@ -78,7 +78,7 @@
 #include <vector>
 
 #include "c2pool/v37/net_addr_ban.hpp"                  // is_addr_key
-#include "c2pool/v37/xmr/relay/xmr_receipt_mint.hpp"    // verify_block_ctx, judge_block_ctx
+#include "c2pool/v37/xmr/relay/xmr_relay_native_ctx.hpp"  // verify_block_ctx, judge_block_ctx
 #include "c2pool/v37/xmr/relay/xmr_relay_peerbook.hpp"  // PeerBook, dup_link_rule
 #include "c2pool/v37/xmr/relay/xmr_relay_wire.hpp"      // FB_GETCTX / FB_CTX, FB_PING / FB_PONG, FB_GETADDR / FB_ADDR
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"     // CarrierDosBudget
@@ -429,12 +429,18 @@ public:
         const std::uint8_t op = f[0];
         if (op == kOpFbHello) {
             wait_up_gate(p);
+            HelloLink link;  // the link's addresses as the HELLO arrives (its down event may run before the owner)
             {
                 std::lock_guard<std::mutex> lk(pmtx_);
                 const auto it = peers_.find(p);
-                if (it != peers_.end()) it->second.hello_posted = true;
+                if (it != peers_.end()) {
+                    it->second.hello_posted = true;
+                    link.out_host = it->second.out_host;
+                    link.out_port = it->second.out_port;
+                }
             }
-            post([this, p, f] { handle_hello(p, f); });
+            if (link.out_host.empty()) link.remote_ip = links_.remote_ip(p);
+            post([this, p, f, link] { handle_hello(p, f, link); });
             return;
         }
         bool ok = false, posted = false;
@@ -752,6 +758,12 @@ private:
         bool inbound = false;
         std::uint64_t remote_nonce = 0;
         std::uint16_t remote_listen = 0;
+    };
+    // A link's addresses as its HELLO arrives: the dialed address, or the socket's remote ip of an accepted link.
+    struct HelloLink {
+        std::string out_host;
+        std::uint16_t out_port = 0;
+        std::string remote_ip;
     };
     static constexpr std::uint32_t kLegacyProbes = 3;
     struct Target {
@@ -1492,7 +1504,7 @@ private:
         const auto it = peers_.find(p);
         if (it != peers_.end()) it->second.hello_sent = true;
     }
-    void handle_hello(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+    void handle_hello(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloLink& link) {
         PathbHello ours;
         HelloCheck c;
         bool join = false;
@@ -1505,7 +1517,7 @@ private:
         if (join) signal_join();
         const PathbHelloDecode d = decode_pathb_hello(f);
         if (c.verdict != HelloVerdict::Accept || d.error != HelloError::None) {
-            hello_refused(p, f, c, d);
+            hello_refused(p, f, c, d, link);
             return;
         }
         bool first = false, need_send = false;
@@ -1537,7 +1549,8 @@ private:
     }
     // A HELLO the node refuses (TAG_MISMATCH, LANE_RULES_MISMATCH, K22 (frame version 0x01 or codec 1), malformed),
     // closes (mmr_leaf_count) or names this node: the link closed, no strike.
-    void hello_refused(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloCheck& c, const PathbHelloDecode& d) {
+    void hello_refused(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloCheck& c, const PathbHelloDecode& d,
+                       const HelloLink& link) {
         const bool self = c.verdict == HelloVerdict::SelfConnection;
         if (c.verdict == HelloVerdict::Close) {
             st_.hello_closed++;
@@ -1551,32 +1564,33 @@ private:
         log("relay: peer " + std::to_string(p) + " HELLO REFUSED: " + c.text + " -> drop");
         if (self) {
             st_.self_conn++;
-            on_self_hello(p);
+            on_self_hello(p, link);
         }
-        if (o_.discovery) disc_refused(p, c.text, self, d.error == HelloError::None ? d.hello.listen_port : 0);
+        if (o_.discovery) disc_refused(c.text, self, d.error == HelloError::None ? d.hello.listen_port : 0, link);
         defer_drop(p, src_of(p), false);
     }
-    // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer.
+    // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer (the
+    // bodies copied under the node lock, the frames built and sent after it).
     void after_hello(std::uint64_t p, const HelloTail& tail) {
-        std::vector<std::vector<std::uint8_t>> offer;
+        std::vector<ReceiptBodyV3> pending;
         {
             const NodeGuard g(*this);
             if (node_->rests_on_claims() || node_->poisoned()) return;
             catchup_start(p, tail);
-            const std::size_t per = static_cast<std::size_t>(fc_ids_max(p_));
-            std::vector<ReceiptBodyV3> chunk;
-            for (const PendingReceipt* r : node_->pending().all()) {
-                chunk.push_back(r->body);
-                if (chunk.size() == per) {
-                    if (const auto fr = encode_fb_receipts(chain_id_, chunk, p_)) offer.push_back(*fr);
-                    chunk.clear();
-                }
-            }
-            if (!chunk.empty())
-                if (const auto fr = encode_fb_receipts(chain_id_, chunk, p_)) offer.push_back(*fr);
+            for (const PendingReceipt* r : node_->pending().all()) pending.push_back(r->body);
         }
-        for (const std::vector<std::uint8_t>& fr : offer)
-            if (links_.send_to(p, fr)) st_.reoffer_frames++;
+        const std::size_t per = static_cast<std::size_t>(fc_ids_max(p_));
+        std::vector<ReceiptBodyV3> chunk;
+        const auto offer = [&] {
+            if (const auto fr = encode_fb_receipts(chain_id_, chunk, p_))
+                if (links_.send_to(p, *fr)) st_.reoffer_frames++;
+            chunk.clear();
+        };
+        for (ReceiptBodyV3& b : pending) {
+            chunk.push_back(std::move(b));
+            if (chunk.size() == per) offer();
+        }
+        if (!chunk.empty()) offer();
     }
 
     // ---- headers first (the caller's catch-up loop) ----
@@ -2247,19 +2261,12 @@ private:
         if (links_.send_to(p, f)) st_.getaddr_tx++;
     }
     // A HELLO refused on a link this node dialed: that address is never good and never learned again.
-    void disc_refused(std::uint64_t p, const std::string& why, bool self, std::uint16_t their_listen) {
-        std::string h;
-        std::uint16_t port = 0;
-        {
-            std::lock_guard<std::mutex> lk(pmtx_);
-            const auto it = peers_.find(p);
-            if (it == peers_.end()) return;
-            h = it->second.out_host;
-            port = it->second.out_port;
-        }
+    void disc_refused(const std::string& why, bool self, std::uint16_t their_listen, const HelloLink& link) {
+        const std::string& h = link.out_host;
+        const std::uint16_t port = link.out_port;
         if (h.empty()) {
             // the accepting end of a self-dial: the announced address (socket ip : HELLO listen port) is ours
-            if (self && their_listen != 0) book_.mark_self(links_.remote_ip(p), their_listen);
+            if (self && their_listen != 0 && !link.remote_ip.empty()) book_.mark_self(link.remote_ip, their_listen);
             return;
         }
         if (self) {
@@ -2273,17 +2280,9 @@ private:
         log("relay-disc: " + rly::peer_key(h, port) + " refused at HELLO -> never good, not learned again (" + why + ")");
     }
     // A HELLO carrying this node's nonce: the dial target behind the link is retired for good.
-    void on_self_hello(std::uint64_t p) {
-        std::string oh;
-        std::uint16_t op = 0;
-        {
-            std::lock_guard<std::mutex> lk(pmtx_);
-            const auto it = peers_.find(p);
-            if (it != peers_.end()) {
-                oh = it->second.out_host;
-                op = it->second.out_port;
-            }
-        }
+    void on_self_hello(std::uint64_t p, const HelloLink& link) {
+        const std::string& oh = link.out_host;
+        const std::uint16_t op = link.out_port;
         std::lock_guard<std::mutex> lk(tmtx_);
         for (Target& t : targets_)
             if (!t.self && (t.pid == p || (!oh.empty() && t.host == oh && t.port == op))) {

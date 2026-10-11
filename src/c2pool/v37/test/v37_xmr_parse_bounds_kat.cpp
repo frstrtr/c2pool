@@ -3,7 +3,8 @@
 //
 // v37_xmr_parse_bounds_kat -- non-wrapping bounds checks in the parsers that
 // read peer data (the v3 receipt and carrier bodies, the family-C frames and
-// FB_RECEIPTS v3, and the reader they share) and the index snapshot reader.
+// FB_RECEIPTS v3, and the reader they share; a context block's layout) and the
+// index snapshot reader.
 //
 // Every check is written "len > size - pos" with pos <= size, never
 // "pos + len > size": a varint or u64 length near SIZE_MAX would wrap the
@@ -19,6 +20,8 @@
 //   B4  BlobReader (the reader of the v3 decoders): read_bytes / read_view /
 //       skip of ~SIZE_MAX bytes at every read position; a count whose x32
 //       byte size wraps
+//   P5  parse_block_layout / verify_block_ctx: miner_tx extra length in the
+//       wrap window (a peer-served FB_CTX blob)
 //   P7  ChainIndex::load_snapshot: a body length in the wrap window
 #include <cstdint>
 #include <cstdio>
@@ -35,9 +38,13 @@
 #include "impl/xmr/native/consensus/xmr_blob_reader.hpp"
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/anchor/xmr_anchor_sha256.hpp"
+#include "c2pool/v37/xmr/relay/xmr_relay_native_ctx.hpp"
+#include "xmr_pathb_relay_test_util.hpp"
 
 namespace pb = ::c2pool::xmr::pathb;
 namespace nat = c2pool::xmr::native;
+namespace rly = c2pool::v37n::xmr::relay;
+namespace prt = pathb_relay_test;
 using u8 = std::uint8_t;
 
 static constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
@@ -183,6 +190,47 @@ int main() {
         nat::BlobReader re(bytes);
         u8 all[16];
         C(re.read_bytes(all, sizeof all) && re.eof(), "B4 control: an exact read succeeds");
+    }
+
+    // ── P5 a peer-served context block whose miner_tx extra length wraps ───
+    {
+        const prt::SynthBlock sb = prt::make_block(100, prt::b32_of(4), 1, nullptr, 0, 9);
+        rly::BlockLayout L; std::string why;
+        C(rly::parse_block_layout(sb.full_blob, L, &why) && L.extra_size > 0, "P5 control: the block layout parses");
+        // the blob up to (not including) the miner_tx extra-length varint
+        std::size_t p = L.miner_tx_offset; std::uint64_t v = 0, nout = 0;
+        auto rd = [&](std::uint64_t& out) { return rly::detail::rd_varint(sb.full_blob, p, out); };
+        rd(v); rd(v); rd(v); ++p; rd(v); rd(nout);
+        for (std::uint64_t i = 0; i < nout; ++i) { rd(v); const u8 t = sb.full_blob[p++]; p += (t == 0x03 ? 33 : 32); }
+        const std::vector<u8> head(sb.full_blob.begin(), sb.full_blob.begin() + static_cast<std::ptrdiff_t>(p));
+        rd(v); const std::size_t after_xlen = p;   // skip the original extra-length varint
+        bool all_refused = true;
+        for (std::uint64_t j = 0; j < 48; ++j) {
+            std::vector<u8> t = head;
+            const std::size_t pos_after = t.size() + 10;
+            put_varint(t, kMax - pos_after + 1 + j);
+            t.insert(t.end(), sb.full_blob.begin() + static_cast<std::ptrdiff_t>(after_xlen), sb.full_blob.end());
+            rly::BlockLayout L2; std::string w; rly::BlockCtx bc;
+            if (rly::parse_block_layout(t, L2, &w)) all_refused = false;
+            if (rly::verify_block_ctx(prt::b32_of(5), t, bc, &w)) all_refused = false;
+        }
+        C(all_refused, "P5 a context blob whose miner_tx extra length wraps is refused (layout and verify_block_ctx)");
+        // A shaped case: the length and the tail are chosen so that every
+        // later field check would also pass if the length check wrapped; only
+        // the length check itself can refuse it.
+        {
+            const std::size_t j = L.miner_tx_offset - 1;
+            std::vector<u8> t = head;
+            const std::size_t pos_after = t.size() + 10;
+            put_varint(t, kMax - pos_after + 1 + j);
+            const std::size_t want = j + 2 + 32 * sb.full_blob[j + 1];
+            const bool shaped = sb.full_blob[j] == 0x00 && t.size() <= want;
+            while (t.size() < want) t.push_back(0x33);
+            rly::BlockLayout L2; std::string w; rly::BlockCtx bc;
+            const bool lay = rly::parse_block_layout(t, L2, &w);
+            C(shaped && !lay, "P5 the crafted wrap (lands on a zero byte, tail sized to match) is refused by the layout parser: " + w);
+            C(!rly::verify_block_ctx(prt::b32_of(5), t, bc, &w), "P5 ...and by verify_block_ctx, before any slice of the blob");
+        }
     }
 
     // ── P7 the index snapshot reader: a body length in the wrap window ─────
