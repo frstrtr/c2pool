@@ -38,7 +38,11 @@
 //       another pool or G has its own directory name; an adoption clears
 //       every key of the old store;
 //   (8) the LevelDB archive: the same store written through it, reopened,
-//       loads to the live state.
+//       loads to the live state;
+//  (10) a pruned store (prune_batch): records below first_pos deleted, header
+//       records to root_pos, the root's record whole; K_BLHASH, K_BLEAF and
+//       K_AR untouched; a store launched here and a joined store (its AR seed
+//       below the pruned root) reload live-equal from the root.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -614,6 +618,97 @@ void archive() {
     std::filesystem::remove_all(dir);
 }
 
+// ---------------------------------------------------------------------------
+// (10) a pruned store (prune_batch): K_PCARRIER below first deleted, [first, root) header records, the record at the
+// root whole, K_PHEAD first_pos / root_pos / base_pos >= root; K_BLHASH, K_BLEAF and K_AR untouched. A store launched
+// here (no AR seed) and a joined store (its AR seed below the pruned root) reload live-equal (the tree from the root,
+// its retarget window from the records), the header records as prefix headers; the reloaded node places the next
+// carriers as the live one.
+std::size_t keys_under(const MemoryKv& kv, const std::string& prefix) {
+    std::size_t n = 0;
+    for (auto it = kv.data.lower_bound(prefix); it != kv.data.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it)
+        ++n;
+    return n;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> window_through(const pb::CarrierTree& t, const pb::Hash32& id) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+    if (const auto e = t.window_entries(id, pb::kRuledLaneParams.retarget_span))
+        for (const pb::RetargetEntry& r : *e) out.emplace_back(r.d, r.H);
+    return out;
+}
+
+void pruned() {
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 3700, 0x87, 2, 27);
+    KatNode& n = sn.n;
+    const auto header_only = [](const std::optional<std::string>& v) {
+        const std::optional<pb::CarrierRecord> c = v ? pb::decode_pcarrier(*v) : std::nullopt;
+        return c && !c->state && c->kind == pb::RecordBody::Header && c->placements.empty();
+    };
+    const auto whole = [](const std::optional<std::string>& v) {
+        const std::optional<pb::CarrierRecord> c = v ? pb::decode_pcarrier(*v) : std::nullopt;
+        return c && c->state && c->kind == pb::RecordBody::Carrier;
+    };
+    {
+        const std::uint64_t first = 100, root = 2400;  // first <= root + 1 - N_rt: the root's retarget window held
+        MemoryKv kv = sn.kv;
+        pb::StoreHead h = *pb::decode_phead(*kv.get(pb::store_keys::phead(0)));
+        const std::size_t blhash = keys_under(kv, pb::lane_keys::blhash_prefix(0)),
+                          bleaf = keys_under(kv, pb::lane_keys::bleaf_prefix(0));
+        const std::optional<pb::LaneBatch> b = pb::prune_batch(0, h, n.tree, n.store, n.bodies, first, root);
+        check(b && pb::commit_lane_batch(kv, *b), "(10) the prune batch of a store launched here commits");
+        const pb::StoreHead hd = *pb::decode_phead(*kv.get(pb::store_keys::phead(0)));
+        check(!kv.get(pb::store_keys::pcarrier(0, first - 1)) && header_only(kv.get(pb::store_keys::pcarrier(0, first)))
+                      && header_only(kv.get(pb::store_keys::pcarrier(0, root - 1))) && whole(kv.get(pb::store_keys::pcarrier(0, root)))
+                      && hd.first_pos == first && hd.root_pos == root && hd.base_pos >= root
+                      && keys_under(kv, pb::lane_keys::blhash_prefix(0)) == blhash && keys_under(kv, pb::lane_keys::bleaf_prefix(0)) == bleaf
+                      && keys_under(kv, pb::store_keys::ar_prefix(0)) == 0,
+              "(10) records below first deleted, header records to the root, the root's whole; K_BLHASH, K_BLEAF untouched");
+        Reloaded r = reload(net, kv, 64);
+        check(r.r.fault == pb::StoreFault::None, "(10) the pruned store reloads: " + why(r.r));
+        if (r.n) {
+            const pb::Hash32 root_id = *n.store.best_at(root);
+            check(lane_digest(*r.n) == lane_digest(n) && r.n->tree.genesis().id == root_id && r.n->store.first_record_pos() == first
+                          && r.r.state->prefix_headers.size() == root - first && r.n->ar.rows().empty() && !r.n->ar.joiner_p0()
+                          && window_through(r.n->tree, root_id) == window_through(n.tree, root_id)
+                          && window_through(n.tree, root_id).size() == pb::kRuledLaneParams.retarget_span,
+                  "(10) live-equal from the root (" + std::to_string(root) + "), the root's retarget window, the prefix headers, "
+                  "the genesis AR");
+            KatNode live(n);
+            bool same = true;
+            for (std::uint64_t k = 0; k < 5; ++k) {
+                const pb::CarrierNode& best = live.tree.best();
+                const pb::CarrierBodyV3 c = scaffold_carrier(live, best.id, h_pos(best.pos + 1), 0x88, 9000 + k, 2, {});
+                same = same && place_direct(live, c).outcome == pb::WriteOutcome::Extended
+                       && place_direct(*r.n, c).outcome == pb::WriteOutcome::Extended && lane_digest(live) == lane_digest(*r.n);
+            }
+            check(same, "(10) the reloaded node places the next carriers as the live one");
+        }
+    }
+    {
+        // a joined store (root 2,300, its AR seed there, base 3,600) pruned at root 2,450 (the seed below it; at or
+        // below the phase-1 start of a restart at J 64), its records from 200 (the root's retarget window held)
+        const std::uint64_t first = 200, root = 2450;
+        MemoryKv kv = joined_shape(sn.kv, n, 2300, 3600);
+        pb::StoreHead h = *pb::decode_phead(*kv.get(pb::store_keys::phead(0)));
+        const std::string seed = *kv.get(pb::store_keys::ar(0, 2300));
+        const std::optional<pb::LaneBatch> b = pb::prune_batch(0, h, n.tree, n.store, n.bodies, first, root);
+        check(b && pb::commit_lane_batch(kv, *b) && kv.get(pb::store_keys::ar(0, 2300)) == seed,
+              "(10) the prune batch of a joined store commits; its AR seed row kept");
+        Reloaded r = reload(net, kv, 64);
+        check(r.r.fault == pb::StoreFault::None, "(10) the pruned joined store reloads: " + why(r.r));
+        if (r.n) {
+            const pb::TipWindow a = n.window(n.tree.best().id), c = r.n->window(r.n->tree.best().id);
+            check(a.ok() && c.ok() && a.window_root == c.window_root && a.mmr_root == c.mmr_root
+                          && r.n->tree.best().id == n.tree.best().id && r.n->tree.best().rs == n.tree.best().rs
+                          && r.n->tree.genesis().pos == root && r.n->ar.rows().size() == 1 && r.n->ar.joiner_p0() == 2301,
+                  "(10) the pruned joined store: the live window and roots, S at the tip, AR = the joiner seed below the root");
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -632,5 +727,6 @@ int main(int argc, char** argv) {
     run("phase1link", phase1_link);
     run("directory", directory);
     run("archive", archive);
+    run("pruned", pruned);
     return finish("v37_xmr_pathb_store_kat");
 }

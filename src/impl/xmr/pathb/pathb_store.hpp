@@ -31,7 +31,9 @@
 //   is one batch: K_PCARRIER and K_AR above the fork deleted, the new branch
 //   written. A joined store and the first batch of a pool launched here are
 //   written into an empty store (every key of its prefixes deleted in the same
-//   batch). A failed write leaves the poison mark (a batch of its own).
+//   batch). A failed write leaves the poison mark (a batch of its own). A
+//   retention prune is one batch (prune_batch): the records below first_pos
+//   deleted, those below root_pos header records.
 //
 //   pathb_load (in order; any fault: the joiner path):
 //     0. no poison mark;
@@ -44,7 +46,7 @@
 //        lc(H(tip - 1)) leaves; its receipts_root == the fold of its carried
 //        ids with rs_root(S_{tip - 1});
 //     4. AR: ascending, at or below the tip, consistent with S_tip (or the
-//        joiner seed of a joined store);
+//        joiner seed of a joined store, at or below its root);
 //     5. q0 = max(base_pos + 1, tip - J + 1); phase 1 (positions s1 .. q0 - 1,
 //        s1 = the first position above the root with H(x) > H(q0 - 1) - F -
 //        Fresh): the stored placements whose bin is open at q0 - 1, with their
@@ -504,6 +506,54 @@ inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& h
     return b;
 }
 
+// The batch of a retention prune at the store's best tip (the node's prune
+// step): K_PCARRIER below `first` deleted; the records of
+// [max(first, root_pos), root) rewritten as header records (no S, no body,
+// no placements; the header bytes from the body, else from `prefix`; the
+// parent from the record below); the records from `root` up unchanged;
+// K_PHEAD with first_pos = first, root_pos = root and base_pos at least
+// root. K_BMMR, K_BLHASH, K_BLEAF and K_AR untouched. `head`: the store's
+// head (its first_pos and root_pos the current ones; the floors never move
+// back). nullopt: first above root, root above the tip, or a position the
+// store or the tree does not hold.
+inline std::optional<LaneBatch> prune_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree,
+                                            const BinStore& store, const CarrierBodies& bodies, std::uint64_t first,
+                                            std::uint64_t root,
+                                            const std::map<std::uint64_t, CarrierHeader>* prefix = nullptr) {
+    first = std::max(first, head.first_pos);
+    root = std::max(root, head.root_pos);
+    if (first > root || root > store.tip_pos()) return std::nullopt;
+    LaneBatch b;
+    for (std::uint64_t x = head.first_pos; x < first; ++x) b.del(store_keys::pcarrier(chain, x));
+    for (std::uint64_t x = std::max(first, head.root_pos); x < root; ++x) {
+        const std::optional<Hash32> id = store.best_at(x);
+        const CarrierNode* n = id ? tree.find(*id) : nullptr;
+        if (n == nullptr) return std::nullopt;
+        CarrierRecord c = record_of(*n, nullptr, nullptr);
+        c.state.reset();
+        std::optional<std::vector<std::uint8_t>> hb;
+        if (const CarrierBodyV3* body = bodies.get(*id)) {
+            hb = header_bytes(header_of(*body));
+        } else if (prefix != nullptr) {
+            if (const auto it = prefix->find(x); it != prefix->end() && receipt_id(it->second.own) == *id)
+                hb = header_bytes(it->second);
+        }
+        if (hb) {
+            c.kind = RecordBody::Header;
+            c.bytes = *hb;
+        }
+        if (x > store.first_record_pos())
+            if (const std::optional<Hash32> below = store.best_at(x - 1)) c.parent = *below;
+        put_position(b, chain, c, std::nullopt);
+    }
+    head_at_tip(head, store);
+    head.first_pos = first;
+    head.root_pos = root;
+    head.base_pos = std::max(head.base_pos, root);
+    put_head(b, chain, head);
+    return b;
+}
+
 // The key prefixes of a store (its records, its lane records, its poison mark).
 inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
@@ -700,16 +750,24 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         }
     }
     const RatchetState s_tip = decode_ratchet_state(*recs.back().state);
-    const bool joined = H.root_pos > 0;  // a young-chain adoption (root at position 0) holds the genesis AR, no seed
+    // a joined store (its MMR from c_x0's prefix, base_leaf_count > 0) holds the joiner seed as its first AR row; a
+    // young-chain adoption (root at position 0) and a pool launched here, pruned or not, hold the genesis AR
+    const bool joined = H.root_pos > 0 && H.base_leaf_count > 0;
     const std::uint64_t q0 = std::max(H.base_pos + 1, tip + 1 > in.journal_depth ? tip + 1 - in.journal_depth : 0);
     ActivationRecord ar;
     std::size_t ri = 0;
     if (joined) {
-        // the joiner seed (S_{p0 - 1}.epoch_cur, p0 - 1, S_{p0 - 1}.rules_cur), p0 - 1 = the root
-        const RatchetState s_root = decode_ratchet_state(*rec_at(H.root_pos).state);
-        if (rows.empty() || rows[0] != ActivationRow{s_root.epoch_cur, H.root_pos, s_root.rules_cur})
-            return fail(StoreFault::Ar);
-        ar.seed_joiner(s_root, H.root_pos + 1);
+        // the joiner seed (S_{p0 - 1}.epoch_cur, p0 - 1, S_{p0 - 1}.rules_cur): p0 - 1 = the root, or below it once
+        // the store is pruned
+        if (rows.empty() || rows[0].h_act > H.root_pos) return fail(StoreFault::Ar);
+        RatchetState s_seed = decode_ratchet_state(*rec_at(H.root_pos).state);
+        if (rows[0].h_act == H.root_pos) {
+            if (rows[0] != ActivationRow{s_seed.epoch_cur, H.root_pos, s_seed.rules_cur}) return fail(StoreFault::Ar);
+        } else {
+            s_seed.epoch_cur = rows[0].epoch;
+            s_seed.rules_cur = rows[0].rules_digest;
+        }
+        ar.seed_joiner(s_seed, rows[0].h_act + 1);
         ri = 1;
     }
     std::vector<ActivationRow> replay_rows;

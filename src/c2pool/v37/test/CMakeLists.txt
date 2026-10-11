@@ -1854,6 +1854,31 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME v37_xmr_d6d_native_seed_tip_kat COMMAND v37_xmr_d6d_native_seed_tip_kat)
 
+    # Path B: --follow-only and the mainnet refusal.
+    #   v37_xmr_follow_only_kat     follow_only_refusal, run_plan_of, the native
+    #                               config under --follow-only, the template
+    #                               record against PathbNode::make_template, the
+    #                               warm latch, FORK-FUSE, the log and status
+    #                               lines, the stratum hooks
+    #   v37_xmr_mainnet_refusal_kat the mainnet refusal per input, the order of
+    #                               the mode refusals, no bypass
+    # Listed in both build.yml --target lists.
+    add_executable(v37_xmr_follow_only_kat v37_xmr_follow_only_kat.cpp)
+    target_compile_features(v37_xmr_follow_only_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_follow_only_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/pathb/test
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+    target_link_libraries(v37_xmr_follow_only_kat PRIVATE xmr_pathb xmr_node xmr_native_txpool xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_follow_only_kat COMMAND v37_xmr_follow_only_kat)
+
+    add_executable(v37_xmr_mainnet_refusal_kat v37_xmr_mainnet_refusal_kat.cpp)
+    target_compile_features(v37_xmr_mainnet_refusal_kat PRIVATE cxx_std_20)
+    target_include_directories(v37_xmr_mainnet_refusal_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(v37_xmr_mainnet_refusal_kat PRIVATE xmr_node xmr_coin Threads::Threads)
+    add_test(NAME v37_xmr_mainnet_refusal_kat COMMAND v37_xmr_mainnet_refusal_kat)
+
     # Track A2 CONSUMER half — multi-node carrier accounting over a REAL socket.
     # Proves the gap the Phase-B single-node daemon had: node B accounts node A's
     # shares. Wires the SAME production consumer code the daemon does — the W3

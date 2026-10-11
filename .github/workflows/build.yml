@@ -308,6 +308,7 @@ jobs:
                     v37_xmr_pinned_snapshot_kat v37_xmr_cli_strict_kat \
                     v37_xmr_run_a_node_check \
                     v37_xmr_d6d_native_seed_tip_kat \
+                    v37_xmr_follow_only_kat v37_xmr_mainnet_refusal_kat \
                     xmr_native_anchor_gate4_kat \
                     xmr_native_snapshot_resume_kat \
             -j"${BUILD_J:-8}" 2>&1 | tee "${GITHUB_WORKSPACE}/ci-logs/build-tests.log"
@@ -848,6 +849,7 @@ jobs:
                     v37_xmr_pinned_snapshot_kat v37_xmr_cli_strict_kat \
                     v37_xmr_run_a_node_check \
                     v37_xmr_d6d_native_seed_tip_kat \
+                    v37_xmr_follow_only_kat v37_xmr_mainnet_refusal_kat \
                     xmr_native_anchor_gate4_kat \
                     xmr_native_snapshot_resume_kat \
             -j4  # ASan+UBSan: cc1plus RSS ~2-3GB each; -j8 wedged runner cgroup memory.high (throttle-hang). -j4 caps peak <12G.

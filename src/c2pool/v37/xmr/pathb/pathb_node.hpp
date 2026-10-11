@@ -60,7 +60,23 @@
 //                     outcome, the adoption batch into a cleared store); a
 //                     load failure (LoadFailed) keeps the failed store
 //                     untouched until an adoption replaces it; a joined node
-//                     serves its claimed prefix headers
+//                     serves its claimed prefix headers; a full node that
+//                     pruned also offers a HELLO tip it does not hold
+//   relay glue        offer_empty_store_tip (an empty store whose catch-up
+//                     from position 0 got no header: the peer's HELLO tip a
+//                     join candidate), take_parked (a parked frame run again),
+//                     set_join_step (the join worker's step callback),
+//                     may_ask / take_rewalk_frames (the re-walk of parked
+//                     frames), on_body_set (a walked carrier's bodies from a
+//                     reply to the node's own FC_GETCARRIER),
+//                     bind_walked_branch (a TipBodies DEFER's walked branch
+//                     bound and placed); the references of a served bucket
+//                     taken back are learned
+//   prune             the retention prune step (P-51): the floors
+//                     of the P-51 flags or join_serve_floors, the open holds
+//                     and the node's own horizon; the tree re-rooted, bodies
+//                     and records below the floors dropped, the headers below
+//                     the bodies kept as prefix headers; one store batch
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -96,6 +112,7 @@
 #include "impl/xmr/pathb/pathb_store.hpp"
 
 #include "c2pool/v37/xmr/pathb/pathb_join_link.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_template_select.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_timers.hpp"
 
 namespace c2pool::xmr::pathb {
@@ -121,6 +138,11 @@ struct PathbNodeConfig {
     std::uint64_t abandon_timeout_s = kAbandonTimeoutDefault;  // P-53
     std::uint64_t pending_cap = 0;          // P-09 (0: relay_horizons(p).pending_cap)
     std::uint64_t waiting_cap = 0;          // P-47 (0: waiting_cap_default())
+    // P-51: positions kept through the best tip (absent: the P-51 default, join_serve_floors); a value below the
+    // node's own horizon is raised to it
+    std::optional<std::uint64_t> body_keep;    // --pathb-body-keep: carrier bodies, tree nodes
+    std::optional<std::uint64_t> header_keep;  // --pathb-header-keep: carrier headers
+    std::optional<std::uint64_t> side_keep;    // --pathb-side-keep: side headers, side views
     XmrKeyRef author;                       // K16 author reference
     std::uint16_t give_author_bp = kDonationBp;
     std::uint16_t owner_fee_bp = 0;         // node-owner fee B (p)
@@ -129,14 +151,6 @@ struct PathbNodeConfig {
     bool penalty_fill = false;              // --pathb-penalty-fill
     bool vote_no = false;                   // --vote no
     std::uint32_t record_chain = 0;         // the store's record chain id
-};
-
-// A candidate transaction of the template (the source's order): its hash,
-// weight and fee read from its own bytes.
-struct TemplateTx {
-    Hash32 hash{};
-    std::uint64_t weight = 0;
-    std::uint64_t fee = 0;
 };
 
 struct PathbNodeIo {
@@ -569,14 +583,158 @@ public:
             // hold (its fork may lie below what the node holds; the attempt's scope at the reply's L decides, 3.3a
             // (4), ruling 46 S4wa-1 (b)). An empty store at position 0 offers none: it catches up headers first
             // (ruling 39 P-S4w-6; the joiner path for a tip beyond what peers retain is S4w-bc's, with the prune step)
+            // A full node that pruned (its tree no longer reaches position 0) offers a tip it does not hold in the same
+            // way: a fork below what it holds has no header work its own records compute; the scope decides.
             const bool after_failure = load_failed_ && joiner_->a() == nullptr;
             const bool unheld = tree_->find(theirs.tail.best_tip) == nullptr;
-            if (theirs.tail.best_tip != cfg_.identity.pool_id && (after_failure || (joined_ != nullptr && unheld)))
+            const bool pruned = joined_ == nullptr && !load_failed_ && tree_->genesis().pos > 0;
+            if (theirs.tail.best_tip != cfg_.identity.pool_id
+                && (after_failure || ((joined_ != nullptr || pruned) && unheld)))
                 offer(theirs.tail.best_tip, peer, theirs.tail.best_cum_work);
         }
         return c;
     }
     bool has_pathb_peer() const noexcept { return !peers_.empty(); }
+
+    // ---- the relay node's glue (pathb_relay_node.hpp) ----
+    // An empty store at position 0: the caller's headers-first catch-up from position 0 to
+    // `peer` got a reply with no header (n = 0: the peer serves nothing after position 0). The peer's HELLO tip becomes
+    // a join candidate with that peer as its server when this node holds position 0 only (no load failure, no adopted
+    // state, not poisoned) and the tip is not position 0, not held here and its claimed work wins fork choice against
+    // position 0. True: the pair was queued.
+    bool offer_empty_store_tip(std::uint64_t peer) {
+        if (poisoned_ || load_failed_ || joined_ != nullptr || tree_->best().pos != 0) return false;
+        const auto it = peers_.find(peer);
+        if (it == peers_.end()) return false;
+        const HelloTail& t = it->second;
+        const CarrierNode& b = tree_->best();
+        if (t.best_tip == cfg_.identity.pool_id || tree_->find(t.best_tip) != nullptr) return false;
+        if (!fork_choice_prefers(ChainTip{t.best_cum_work, t.best_tip}, ChainTip{b.cum_work, b.id})) return false;
+        const std::size_t before = joiner_->queue().size();
+        offer(t.best_tip, peer, t.best_cum_work);
+        return joiner_->queue().size() > before;
+    }
+    // A frame this node parked, by its digest, taken out of the deferred store to be run again; nullopt: not held.
+    std::optional<ParkedFrame> take_parked(const Hash32& digest) {
+        if (poisoned_) return std::nullopt;
+        return deferred_.take(*tree_, digest);
+    }
+    // Called between the replay steps of a join attempt (on the join worker).
+    void set_join_step(std::function<void()> f) {
+        if (!f) {
+            joiner_->set_on_step({});
+            return;
+        }
+        joiner_->set_on_step([f = std::move(f)](JoinedState&, std::uint64_t) { f(); });
+    }
+    // A parked frame's walked headers or bodies are asked of `peer` at most once while that peer holds its variants.
+    bool may_ask(const Hash32& digest, std::uint64_t peer) { return deferred_.may_ask(digest, peer); }
+    // The parked frames marked for a re-walk (data they walked arrived), taken out of the deferred store.
+    std::vector<ParkedFrame> take_rewalk_frames() {
+        std::vector<ParkedFrame> out;
+        if (poisoned_) return out;
+        for (const Hash32& d : deferred_.take_rewalks())
+            if (std::optional<ParkedFrame> f = deferred_.take(*tree_, d)) out.push_back(std::move(*f));
+        return out;
+    }
+    // FC_CARRIER from `peer` in reply to this node's FC_GETCARRIER (want_bodies 1) for a walked carrier: its carried
+    // bodies as that peer's body set of the carrier (its references learned). False: the frame does not decode.
+    bool on_body_set(std::uint64_t peer, std::span<const std::uint8_t> frame) {
+        if (poisoned_ || !check_fc_carrier(frame, cfg_.identity.chain_id, cfg_.buffers).ok()) return false;
+        CarrierBodyV3 c;
+        if (decode_carrier_body_v3(frame.data() + kFrameHeaderBytes, frame.size() - kFrameHeaderBytes,
+                                   CarrierLimits{cfg_.buffers.receipt, cfg_.p.r_max}, c)
+            != WireError::None)
+            return false;
+        const Hash32 id = receipt_id(c.own);
+        for (const ReceiptBodyV3& b : c.carried) learn_refs(b);
+        learn_refs(c.own);
+        const IndexAdd a = headers_->add_body_set(peer, id, c.carried, header_digest(header_of(c)));
+        if (a == IndexAdd::Added || a == IndexAdd::Replaced) deferred_.touch({id});
+        return true;
+    }
+    // The walked branch a TipBodies DEFER names, fork upward: every held variant whose claimed parent is placed runs
+    // bind_header; a Match binds it, a computed Mismatch refutes it (its servers BANned or
+    // struck); a bound carrier with a body set (none needed when it carries nothing) is admitted in the role Closure
+    // and placed through this node's placement (the store batch, a switch, the waiting carriers released).
+    struct WalkBind {
+        std::vector<Hash32> placed;
+        std::vector<std::uint64_t> banned;
+        std::vector<std::uint64_t> struck;
+        std::vector<Hash32> need_bodies;  // bound, carrying bodies, no body set held
+    };
+    WalkBind bind_walked_branch(const std::vector<Hash32>& ids) {
+        WalkBind out;
+        if (poisoned_) return out;
+        for (bool progress = true; progress && !poisoned_;) {
+            progress = false;
+            out.need_bodies.clear();
+            for (const Hash32& id : ids) {
+                if (tree_->find(id) != nullptr) continue;
+                if (!headers_->bound_digest(id)) {
+                    std::vector<Hash32> digests;
+                    for (const HeaderVariant* y : headers_->variants(id)) digests.push_back(y->digest);
+                    for (const Hash32& dg : digests) {
+                        const HeaderVariant* y = headers_->variant(id, dg);
+                        if (y == nullptr || y->bound || tree_->find(y->header.own.side.tip) == nullptr) continue;
+                        const HeaderBindResult hb = bind_header(env(), *y);
+                        if (hb.bind == HeaderBind::Match) {
+                            headers_->bind(id, dg);
+                            progress = true;
+                            break;
+                        }
+                        if (hb.bind == HeaderBind::Mismatch) {
+                            std::vector<std::uint64_t>& to = hb.word == AdmitVerdict::Ban ? out.banned : out.struck;
+                            to.insert(to.end(), y->peers.begin(), y->peers.end());
+                            headers_->refute(id, dg);
+                            progress = true;
+                        }
+                    }
+                }
+                const std::optional<Hash32> bd = headers_->bound_digest(id);
+                if (!bd) continue;
+                const HeaderVariant* y = headers_->variant(id, *bd);
+                if (y == nullptr || tree_->find(y->header.own.side.tip) == nullptr) continue;
+                std::vector<std::vector<ReceiptBodyV3>> sets;
+                std::vector<std::uint64_t> servers;
+                for (const BodySet* bs : headers_->body_sets(id)) {
+                    sets.push_back(bs->bodies);
+                    servers.push_back(bs->peer);
+                }
+                if (y->header.n_carried == 0 && sets.empty()) {  // carries nothing: no body set (its header's server)
+                    sets.emplace_back();
+                    servers.push_back(y->peers.empty() ? kOwnPeer : *y->peers.begin());
+                }
+                if (sets.empty()) out.need_bodies.push_back(id);
+                const ReceiptBodyV3 own = y->header.own;
+                for (std::size_t k = 0; k < sets.size(); ++k) {
+                    CarrierBodyV3 c;
+                    c.own = own;
+                    c.carried = sets[k];
+                    const std::optional<std::vector<std::uint8_t>> frame = encode_fc_carrier(cfg_.identity.chain_id, c, cfg_.p.r_max);
+                    if (!frame) continue;
+                    const AdmitResult r = admit_frame_from(env(), servers[k], *frame, CarrierRole::Closure);
+                    if (r.verdict == AdmitVerdict::AdmitCarrier) {
+                        (void)settle_carrier(servers[k], *frame, r, false);
+                        if (tree_->find(id) != nullptr) {
+                            out.placed.push_back(id);
+                            progress = true;
+                        }
+                        break;
+                    }
+                    if (!sets[k].empty() && (r.verdict == AdmitVerdict::Ban || r.verdict == AdmitVerdict::Strike)) {
+                        (r.verdict == AdmitVerdict::Ban ? out.banned : out.struck).push_back(servers[k]);
+                        headers_->drop_body_set(servers[k], id);
+                        progress = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!out.placed.empty()) drain_released();
+        return out;
+    }
+
     void disconnect(std::uint64_t peer) {
         peers_.erase(peer);
         headers_->release_peer(peer);
@@ -735,29 +893,8 @@ public:
         t.median = wi->zone;
         // the selection with the real coinbase size
         const std::vector<TemplateTx> cands = io_.tx_source ? io_.tx_source() : std::vector<TemplateTx>{};
-        std::vector<TxCandidate> tc;
-        std::uint64_t f_all = 0;
-        for (const TemplateTx& c : cands) {
-            tc.push_back(TxCandidate{c.weight, c.fee});
-            f_all = f_all > UINT64_MAX - c.fee ? UINT64_MAX : f_all + c.fee;
-        }
-        const Window& w = *t.window.window;
-        const std::size_t n_out = w.empty_finder_only ? 1 : w.weight.size();
-        const std::uint64_t r_up = t.base > UINT64_MAX - f_all ? UINT64_MAX : t.base + f_all;
-        const std::uint64_t cw_up = coinbase_weight_hf16(t.h, std::vector<std::uint64_t>(n_out, r_up));
-        const std::uint64_t h = t.h;
-        const CoinbaseSize cw = [&w, h](std::uint64_t R) -> std::optional<std::uint64_t> {
-            std::vector<std::uint64_t> a;
-            if (w.empty_finder_only) {
-                a.push_back(R);
-            } else {
-                for (const SplitOutput& o : hf16_outputs(R, w)) a.push_back(o.amount);
-                if (a.empty()) return std::nullopt;
-            }
-            return coinbase_weight_hf16(h, a);
-        };
-        const TxSelection sel = cfg_.penalty_fill ? select_penalty_fill(tc, t.base, t.median, t.hf, cw_up, cw)
-                                                  : select_no_penalty(tc, t.base, t.median, cw_up, cw);
+        const TxSelection sel =
+                select_template(cands, t.base, t.median, t.hf, t.h, t.window.window.get(), cfg_.penalty_fill);
         if (!sel.ok) {
             alarm_.raise(RowId::None, Basis::Computed, tip.id, Missing::NodeInternal);
             return status(t, TemplateStatus::NoTemplate);
@@ -913,7 +1050,8 @@ public:
         (void)join_request(peer, now_s, q.at);
         const std::uint64_t max_bytes = std::min(budget_.remaining(peer, now_s), cfg_.bucket_serve_cap);
         std::optional<RatchetStateBytes> s_parent;
-        if (const CarrierNode* at = tree_->find(q.at); at != nullptr && at->pos > 0)
+        // above the tree's lowest node (position 0, or a joined or pruned tree's root, its parent not held)
+        if (const CarrierNode* at = tree_->find(q.at); at != nullptr && at->pos > tree_->genesis().pos)
             if (const CarrierNode* par = tree_->find(at->parent)) s_parent = encode_ratchet_state(par->rs);
         out.frames = serve_buckets(*store_, q, s_parent, cfg_.bucket_policy.frame_bytes, max_bytes);
         std::uint64_t bytes = 0;
@@ -924,41 +1062,134 @@ public:
     }
 
     // ---- the serving side of a join (P-51 as corrected; join_serve_floors, JoinServeHold) ----
-    // The floors at the best tip ({0, 0} while the span at the tip is the young chain).
+    // The floors at the best tip ({0, 0} while the span at the tip is the young chain); H from the best chain's
+    // records the store holds.
     JoinServeFloors serve_floors_now() const {
+        const LaneView v = store_->view_at(store_->best_tip());
+        const std::uint64_t lo = store_->first_record_pos();
         const auto rec = [&](std::uint64_t x) -> std::optional<std::uint64_t> {
-            const std::optional<Hash32> id = store_->best_at(x);
-            const CarrierNode* n = id ? tree_->find(*id) : nullptr;
-            if (n == nullptr) return std::nullopt;
-            return n->H;
+            if (!v.ok() || x < lo || x > v.pos()) return std::nullopt;
+            return v.record(x);
         };
         return join_serve_floors(cfg_.p, store_->tip_pos(), rec, store_->b0());
     }
-    // The floors that apply to a request of `peer` for `item` (an open hold's while its attempt continues).
+    // The floors that apply to a request of `peer` for `item` (an open hold's while its attempt continues); an item
+    // the tree does not hold is placed by the store's best chain records (a prefix header).
     JoinServeFloors join_request(std::uint64_t peer, std::uint64_t now_s, const Hash32& item) {
         const CarrierNode* n = tree_->find(item);
-        const JoinServeFloors f = hold_.request(peer, now_s, item, n ? n->pos : UINT64_MAX, serve_floors_now(),
-                                                cfg_.abandon_timeout_s);
+        std::uint64_t pos = n ? n->pos : UINT64_MAX;
+        if (n == nullptr && item != Hash32{})
+            if (const LaneView v = store_->view_at(item); v.ok() && v.fork_pos() == v.pos()) pos = v.pos();
+        const JoinServeFloors f = hold_.request(peer, now_s, item, pos, serve_floors_now(), cfg_.abandon_timeout_s);
         if (!hold_.holding(peer)) hold_conns_.erase(peer);
         return f;
     }
     bool join_holding(std::uint64_t peer) const { return hold_.holding(peer); }
-    // The lowest floors the best tip and the open holds keep (the prune step keeps from these; TODO(S4w-bc): the
-    // prune step and the P-51 flags, none below the node's own horizon).
+    // The lowest floors the best tip and the open holds keep (P-51's formula; the prune step applies the flags and
+    // the node's own horizon, prune_floors).
     JoinServeFloors retention_floors(std::uint64_t now_s) {
-        const JoinServeFloors cur = serve_floors_now();
-        JoinServeFloors out = cur;
-        for (auto it = hold_conns_.begin(); it != hold_conns_.end();) {
-            // an item above every L (zero id): reads the hold, never continues it
-            const JoinServeFloors f = hold_.request(*it, now_s, Hash32{}, UINT64_MAX, cur, cfg_.abandon_timeout_s);
-            if (!hold_.holding(*it)) {
-                it = hold_conns_.erase(it);
-                continue;
-            }
-            out.bodies = std::min(out.bodies, f.bodies);
-            out.headers = std::min(out.headers, f.headers);
-            ++it;
+        JoinServeFloors out = serve_floors_now();
+        if (const std::optional<JoinServeFloors> h = held_floors(now_s)) {
+            out.bodies = std::min(out.bodies, h->bodies);
+            out.headers = std::min(out.headers, h->headers);
         }
+        return out;
+    }
+
+    // ---- retention (P-51, P-37, P-38): the prune step ----
+    // The floors the prune keeps from at the best tip L: the P-51 flags, else
+    // join_serve_floors at L (the bodies' floor also for side headers and
+    // views; {0, 0}: everything from position 1 while no bin is sealed at or
+    // before the body floor); lowered to the floors of the open join holds and
+    // to the node's own horizon: bodies and tree nodes to min(s(L), L - P-04 +
+    // 1) and to the view horizon base_pos - J_0, side headers and views to the
+    // view horizon, carrier records (headers) to the bodies' floor and to the
+    // retarget window of the tree's root (the N_rt positions through it).
+    struct PruneFloors {
+        std::uint64_t bodies = 0;   // carrier bodies, tree nodes (S, records)
+        std::uint64_t records = 0;  // carrier records (headers)
+        std::uint64_t sides = 0;    // side headers, side views
+    };
+    PruneFloors prune_floors(std::uint64_t now_s) {
+        PruneFloors f;
+        const std::uint64_t tip = store_->tip_pos();
+        const JoinServeFloors p51 = serve_floors_now();
+        const auto kept = [tip](const std::optional<std::uint64_t>& n, std::uint64_t dflt) -> std::uint64_t {
+            if (!n) return dflt;
+            return tip + 1 > *n ? tip + 1 - *n : 0;
+        };
+        f.bodies = kept(cfg_.body_keep, p51.bodies);
+        f.records = kept(cfg_.header_keep, p51.headers);
+        f.sides = kept(cfg_.side_keep, p51.bodies);
+        if (const std::optional<JoinServeFloors> h = held_floors(now_s)) {
+            f.bodies = std::min(f.bodies, h->bodies);
+            f.records = std::min(f.records, h->headers);
+            f.sides = std::min(f.sides, h->bodies);
+        }
+        const std::uint64_t base = store_->base_pos();
+        const std::uint64_t j0 = store_->view_horizon_depth();
+        const std::uint64_t view = base > j0 ? base - j0 : 0;
+        f.bodies = std::min({f.bodies, own_body_horizon(), view});
+        f.sides = std::min(f.sides, view);
+        const std::uint64_t nrt = cfg_.p.retarget_span;
+        f.records = std::min({f.records, f.bodies, f.bodies + 1 > nrt ? f.bodies + 1 - nrt : 0});
+        return f;
+    }
+
+    // The prune step (the daemon's serve loop runs it): carrier bodies and
+    // tree nodes kept from floors.bodies (the tree re-rooted there), carrier
+    // records from floors.records (those below the bodies as header records,
+    // served from the prefix headers), side branches forking at or above
+    // floors.sides; one store batch (prune_batch; a failed commit poisons the
+    // store). The MMR, K_BLHASH, K_BLEAF and K_AR are kept; A's bound-work
+    // profile keeps the work it counted. Nothing while poisoned, after a load
+    // failure, or while a join attempt runs (it reads A).
+    struct PruneReport {
+        PruneFloors floors;
+        std::uint64_t root = 0;    // the tree's lowest position after the step
+        std::uint64_t first = 0;   // the store's first record after the step
+        bool written = false;      // the prune batch committed
+    };
+    PruneReport prune(std::uint64_t now_s) {
+        PruneReport out;
+        out.root = tree_->genesis().pos;
+        out.first = store_->first_record_pos();
+        if (poisoned_ || load_failed_ || attempting_) return out;
+        out.floors = prune_floors(now_s);
+        const std::uint64_t held_first = std::max(out.first, head_.first_pos);
+        const std::uint64_t root = std::max(out.floors.bodies, out.root);
+        const std::uint64_t first = std::min(std::max(out.floors.records, held_first), root);
+        if (root == out.root && first == held_first) return out;
+        // A's bound work counted before its positions leave the tree
+        if (joined_ != nullptr)
+            (void)joined_->bound_work();
+        else
+            own_chain_.forget_below(root);
+        StoreHead head = head_;
+        std::map<std::uint64_t, CarrierHeader>* pre = joined_ != nullptr ? &joined_->prefix_headers : &own_prefix_;
+        const std::optional<LaneBatch> b =
+                prune_batch(cfg_.record_chain, head, *tree_, *store_, *bodies_, first, root, pre);
+        if (!b) return out;
+        if (PathbKv* kv = store_kv()) {
+            if (!commit_lane_batch(*kv, *b)) {
+                poison(store_->best_tip());
+                return out;
+            }
+            out.written = true;
+        }
+        head_ = head;
+        // the headers of the positions whose bodies go, served from the prefix headers
+        for (std::uint64_t x = std::max(first, out.root); x < root; ++x)
+            if (const std::optional<Hash32> id = store_->best_at(x))
+                if (const CarrierBodyV3* body = bodies_->get(*id)) (*pre)[x] = header_of(*body);
+        pre->erase(pre->begin(), pre->lower_bound(first));
+        if (root > out.root)
+            if (const std::optional<std::vector<Hash32>> gone = tree_->reroot(root, out.floors.sides))
+                for (const Hash32& id : *gone) bodies_->erase(id);
+        out.first = store_->drop_records_below(first);
+        out.root = tree_->genesis().pos;
+        if (const std::optional<Hash32> s = store_->best_at(std::max(out.floors.sides, out.first)))
+            if (const CarrierNode* n = tree_->find(*s)) headers_->drop_below(n->H);
         return out;
     }
 
@@ -1193,10 +1424,13 @@ public:
                 a.bucket = sb.bucket;
                 a.leaf = sb.leaf;
                 a.refs = sb.refs;
-                if (store_->adopt_below(a)) joined_->claimed[bin] = at_header(at);
+                if (store_->adopt_below(a)) {
+                    joined_->claimed[bin] = at_header(at);
+                    learn_bucket_refs(sb.refs);
+                }
                 continue;
             }
-            (void)store_->restore_bucket(sb.bucket, sb.refs);
+            if (store_->restore_bucket(sb.bucket, sb.refs)) learn_bucket_refs(sb.refs);
         }
         if (it->second.complete()) {
             timers_.done(Req{peer, ReqKind::Buckets, at});
@@ -1337,6 +1571,10 @@ private:
         (*refs_)[r.side.payee] = r.payee;
         if (r.owner) (*refs_)[r.side.owner] = *r.owner;
     }
+    // The key references of a served bucket taken back into the store (each bound to its rows by the store).
+    void learn_bucket_refs(const std::vector<XmrKeyRef>& refs) {
+        for (const XmrKeyRef& k : refs) (*refs_)[key_ref_identity(k)] = k;
+    }
 
     // RandomX through the verified-body memo (a body is hashed once); the
     // node's own share returns its own hash's result.
@@ -1378,12 +1616,20 @@ private:
                         cfg_.identity.pool_id,
                         admit_j0(cfg_.p),
                         cfg_.buffers,
-                        cfg_.genesis_prev,
+                        root_prev(),
                         io_.resolve_pr,
                         io_.seed_of,
                         [this](const HashingBlob& b, std::uint64_t d, const Hash32& s) { return verify_memo(b, d, s); },
                         alarm_,
                         claims_};
+    }
+
+    // P_t of the tree's lowest node: P_0 at position 0; a pruned tree's root, its own body's.
+    Hash32 root_prev() const {
+        const CarrierNode& g = tree_->genesis();
+        if (g.pos != 0)
+            if (const CarrierBodyV3* b = bodies_->get(g.id)) return b->own.blob.prev_id;
+        return cfg_.genesis_prev;
     }
 
     std::optional<Hash32> prev_of(const Hash32& tip) const {
@@ -1402,7 +1648,7 @@ private:
         BucketsAnchor a;
         const CarrierNode* n = tree_->find(at);
         const CarrierBodyV3* b = bodies_->get(at);
-        if (n == nullptr || b == nullptr || n->pos == 0) return a;
+        if (n == nullptr || b == nullptr || n->pos <= tree_->genesis().pos) return a;  // the tree's root: no parent
         const CarrierNode* par = tree_->find(n->parent);
         if (par == nullptr) return a;
         a.header_held = true;
@@ -1413,6 +1659,52 @@ private:
         for (const ReceiptBodyV3& r : b->carried) ids.push_back(receipt_id(r));
         a.carried_ids = ids;
         return a;
+    }
+
+    // The lowest floors of the open join holds (an item above every L, the zero id, reads a hold and never continues
+    // it); nullopt: none open.
+    std::optional<JoinServeFloors> held_floors(std::uint64_t now_s) {
+        std::optional<JoinServeFloors> out;
+        const JoinServeFloors none{UINT64_MAX, UINT64_MAX};
+        for (auto it = hold_conns_.begin(); it != hold_conns_.end();) {
+            const JoinServeFloors f = hold_.request(*it, now_s, Hash32{}, UINT64_MAX, none, cfg_.abandon_timeout_s);
+            if (!hold_.holding(*it)) {
+                it = hold_conns_.erase(it);
+                continue;
+            }
+            if (!out) out = f;
+            out->bodies = std::min(out->bodies, f.bodies);
+            out->headers = std::min(out->headers, f.headers);
+            ++it;
+        }
+        return out;
+    }
+
+    // The node's own body horizon at the best tip L: min(s(L), L - P-04 + 1), s(L) the phase-1 start of a restart
+    // replay (the first position above the tree's root with H(x) > H(q0 - 1) - F - Fresh, q0 = max(base_pos + 1,
+    // L - J + 1)), P-04 = max(the backfill formula, J).
+    std::uint64_t own_body_horizon() const {
+        const std::uint64_t tip = store_->tip_pos();
+        const std::uint64_t J = store_->journal_depth();
+        const std::uint64_t p04 = std::max(relay_horizons(cfg_.p).backfill, J);
+        const std::uint64_t back = tip + 1 > p04 ? tip + 1 - p04 : 0;
+        const std::uint64_t q0 = std::max(head_.base_pos + 1, tip + 1 > J ? tip + 1 - J : 0);
+        const LaneView v = store_->view_at(store_->best_tip());
+        const std::uint64_t lo = std::max(tree_->genesis().pos + 1, store_->first_record_pos());
+        if (!v.ok() || q0 == 0 || q0 - 1 > tip || q0 - 1 < lo) return std::min(back, q0 > 0 ? q0 - 1 : 0);
+        const std::uint64_t span = cfg_.p.open_bins + cfg_.p.fresh_max;
+        const std::uint64_t hq = v.record(q0 - 1);
+        const std::uint64_t floor_h = hq > span ? hq - span : 0;
+        // H is monotone along the chain: the first x in [lo, q0 - 1] with H(x) > floor_h
+        std::uint64_t a = lo, b = q0 - 1;
+        while (a < b) {
+            const std::uint64_t m = a + (b - a) / 2;
+            if (v.record(m) > floor_h)
+                b = m;
+            else
+                a = m + 1;
+        }
+        return std::min(a, back);
     }
 
     static ServeResult token(ServeResult r, FrameToken t) {
@@ -1543,7 +1835,9 @@ private:
     // on_chain = A's best chain, never "held"; no x1; the journal base; the
     // bound work of positions 1 .. tip kept along the best chain (each position
     // counted once, a switch recounting above its fork; an unchanged chain the
-    // same instance); the open-bin placements of the best chain.
+    // same instance; a prune keeps the work counted below its floor; a tree
+    // loaded from a pruned store counts from its root); the open-bin
+    // placements of the best chain.
     class FullNodeA final : public AdoptedChain {
     public:
         explicit FullNodeA(const PathbNode& n) : n_(&n) {}
@@ -1570,6 +1864,15 @@ private:
             counted_at_.clear();
             profile_ = std::make_shared<BoundWork>();
         }
+        // A prune: the positions below `pos` leave the count's bookkeeping (counted first); their work stays in the
+        // profile.
+        void forget_below(std::uint64_t pos) {
+            sync();
+            if (pos <= lo_) return;
+            const std::size_t k = static_cast<std::size_t>(std::min<std::uint64_t>(counted_.size(), pos - lo_));
+            counted_.erase(counted_.begin(), counted_.begin() + static_cast<std::ptrdiff_t>(k));
+            lo_ += k;
+        }
 
     private:
         struct Counted {
@@ -1583,7 +1886,9 @@ private:
         }
         void sync() const {
             const BinStore& st = *n_->store_;
-            const std::uint64_t lo = 1;
+            // from position 1, or from the root of a tree loaded from a pruned store
+            if (counted_.empty()) lo_ = std::max<std::uint64_t>(1, n_->tree_->genesis().pos);
+            const std::uint64_t lo = lo_;
             const std::uint64_t top = st.tip_pos();
             const std::size_t want = top >= lo ? static_cast<std::size_t>(top - lo + 1) : 0;
             std::size_t keep = std::min(counted_.size(), want);
@@ -1612,6 +1917,7 @@ private:
             }
         }
         const PathbNode* n_;
+        mutable std::uint64_t lo_ = 1;  // the position of counted_[0]
         mutable std::vector<Counted> counted_;
         mutable std::map<std::uint64_t, std::uint64_t> counted_at_;
         mutable std::shared_ptr<BoundWork> profile_ = std::make_shared<BoundWork>();
@@ -2120,7 +2426,7 @@ private:
     WindowCache own_windows_;
     KeyCache own_keys_;
     std::map<Hash32, XmrKeyRef> own_refs_;
-    std::map<std::uint64_t, CarrierHeader> own_prefix_;  // a joined store's claimed prefix headers (loaded)
+    std::map<std::uint64_t, CarrierHeader> own_prefix_;  // the headers below the tree's root (joined, pruned)
     CarrierTree* tree_ = nullptr;
     BinStore* store_ = nullptr;
     ActivationRecord* ar_ = nullptr;

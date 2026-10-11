@@ -170,6 +170,9 @@ struct NativeTemplateConfig {
     // fills the rest. See NativeNodeConfig::operator_inject.
     bool                     operator_inject = false;
     std::uint64_t            operator_inject_ttl_blocks = 720;
+
+    // NativeNodeConfig::txpool_warm_timeout_ms (0 = no warm gate).
+    std::uint64_t            txpool_warm_timeout_ms = 30'000;
 };
 
 // ---------------------------------------------------------------------------
@@ -293,6 +296,7 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     n.dos_solicited_credits        = cfg.native_dos_solicited_credits;
     n.operator_inject              = cfg.native_inject;
     n.operator_inject_ttl_blocks   = cfg.native_inject_ttl_blocks;
+    n.txpool_warm_timeout_ms       = cfg.native_txpool_warm_timeout_ms;
     return n;
 }
 
@@ -337,6 +341,7 @@ public:
         nc.unknown_fork_stall_ms = cfg_.unknown_fork_stall_ms;
         nc.operator_inject            = cfg_.operator_inject;
         nc.operator_inject_ttl_blocks = cfg_.operator_inject_ttl_blocks;
+        nc.txpool_warm_timeout_ms     = cfg_.txpool_warm_timeout_ms;
 
         node_ = std::make_unique<nrt::NativeNode>(std::move(nc));
         if (!node_->start(why)) {

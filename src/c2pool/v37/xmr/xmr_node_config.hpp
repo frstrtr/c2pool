@@ -150,6 +150,12 @@ inline const char* to_string(ArmOrderMode m) {
     return m == ArmOrderMode::P2PFirst ? "p2p-first" : "daemon-first";
 }
 
+// A flag given on the command line and its value ("" for a switch).
+struct GivenFlag {
+    std::string name;
+    std::string value;
+};
+
 inline const char* to_string(CoinbaseMode m) {
     switch (m) {
         case CoinbaseMode::MonerodTemplate: return "monerod-template (option A)";
@@ -507,7 +513,8 @@ struct XmrNodeConfig {
     //       cohort and there is no cohort, so without this the template arm's
     //       readiness gate never opens;
     //   (3) a found block that reached no peer but that our OWN chain index
-    //       accepted is booked as found (P2pBlockPublisher::enable_solo_own_index).
+    //       accepted is counted as landed (Path B books nothing)
+    //       (P2pBlockPublisher::enable_solo_own_index).
     //
     // WHAT IT COSTS, stated rather than hidden: a solo find is attested by our
     // own index and by nothing else. That is the correct and only available
@@ -562,6 +569,18 @@ struct XmrNodeConfig {
     // the register-value provenance and the restore-on-exit contract.
     bool            mine_msr = false;
 
+    // --- Path B ---------------------------------------------------------------
+    // --follow-only
+    bool            follow_only = false;
+    // --relay-listen HOST:PORT
+    std::string     relay_listen;
+    // --relay-peer HOST:PORT (repeatable)
+    std::vector<std::string> relay_peers;
+    // --native-txpool-warm-timeout-ms (0 = no warm gate)
+    std::uint64_t   native_txpool_warm_timeout_ms = 30'000;
+    // Every flag given on the command line, in order.
+    std::vector<GivenFlag> given_flags;
+
     // Resolve the on-disk settlement-store directory (settle_db_path override or
     // config_path()/<net>/v37_settle_db). Declared here, defined in xmr_node.hpp
     // to keep this header free of <filesystem>/core includes for cheap inclusion.
@@ -582,7 +601,7 @@ struct XmrNodeConfig {
 // describing it.
 inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     if (c.arm_order != ArmOrderMode::P2PFirst) return {};
-    if (c.coinbase != CoinbaseMode::V37Settlement)
+    if (!c.follow_only && c.coinbase != CoinbaseMode::V37Settlement)
         return "--arm-order p2p-first requires --coinbase v37: option A's block IS monerod's "
                "get_block_template, so a daemonless find of it is a contradiction";
     if (c.template_source != TemplateSourceMode::Native)
@@ -728,6 +747,8 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
     if (c.native_use_seeds)
         return "--native-solo builds a private chain of its own with no network to relay to, so "
                "--native-seeds (bootstrap from the network's seed nodes) contradicts it: pick one";
+    if (!c.relay_listen.empty()) return "--native-solo takes no --relay-listen";
+    if (!c.relay_peers.empty()) return "--native-solo takes no --relay-peer";
     return {};
 }
 
