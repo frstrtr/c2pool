@@ -579,6 +579,15 @@ bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure
 		         << SubmitDedupe::name(*prior) << ")";
 		return SubmitDedupe::reached(*prior);
 	}
+	// P0-SUBMIT-CSMAIN (c): a distinct sibling on a parent whose earlier child
+	// is already delivered can never become the tip; skip the RPC path (P2P
+	// relay is unaffected) rather than queue another block behind cs_main.
+	if (auto sibling = m_submit_dedupe.lookup_sibling(key))
+	{
+		LOG_INFO << "submit_block_hex: sibling on same parent already delivered, coalescing (sibling verdict "
+		         << SubmitDedupe::name(*sibling) << ")";
+		return false;
+	}
 	nlohmann::json result;
 	try
 	{
