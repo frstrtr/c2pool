@@ -30,32 +30,7 @@
 namespace dash {
 namespace coin {
 
-/// The per-superblock budget cap (duffs) — dashcore CSuperblock::
-/// GetPaymentsLimit(nBlockHeight) == getsuperblockbudget RPC. It is the
-/// accumulated nSuperblockPart over one cycle:
-///   budget(H) = nSuperblockPart(H) * nSuperblockCycle
-/// where nSuperblockPart(H) = GetBlockSubsidy(H)/5 (V20: the 20% treasury
-/// slice compute_dash_block_reward_post_v20 already withholds). This mirrors
-/// dashcore validation.cpp CalcSuperblockBudget within a cycle's subsidy
-/// (subsidy is flat between halvings, so the per-block part is constant across
-/// the cycle). Cross-checked against dashd getsuperblockbudget in the KAT.
-inline int64_t superblock_budget(uint32_t height, int cycle)
-{
-    // Recompute nSubsidy EXACTLY as subsidy.hpp/dashcore does (the halving loop),
-    // so nSuperblockPart = nSubsidy/5 is duff-exact rather than inverted from the
-    // truncated block reward. part is constant across a cycle (subsidy is flat
-    // between halvings), so budget = part * nSuperblockCycle — dashcore
-    // CalcSuperblockBudget. Pinned against dashd getsuperblockbudget in the KAT.
-    int prev_height = static_cast<int>(height) - 1;
-    int64_t nSubsidy = 5 * COIN_SAT;
-    for (int i = DASH_SUBSIDY_HALVING_INTERVAL;
-         i <= prev_height;
-         i += DASH_SUBSIDY_HALVING_INTERVAL) {
-        nSubsidy -= nSubsidy / 14;
-    }
-    const int64_t part = nSubsidy / 5; // nSuperblockPart (V20 20% treasury slice)
-    return part * static_cast<int64_t>(cycle > 0 ? cycle : 1);
-}
+// superblock_budget(height, cycle): block_reward.hpp (via subsidy.hpp).
 
 /// dashcore CSuperblockManager::GetSuperblockPayments equivalent.
 /// Returns the ordered (script, amount) vector the coinbase must pay at

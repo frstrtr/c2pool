@@ -37,6 +37,12 @@
 //      v36 chain at the PRODUCTION testnet share floor into a --data-dir that a
 //      real c2pool-dash process then loads, and writes a manifest of what the
 //      two real processes must agree on.
+//   8. The excessive-reward report is decided from committed share content
+//      only: two nodes whose own templates differ (one carries transactions
+//      and fees, one is coinbase-only) report the same shares, the node whose
+//      own template has no fees does not report an honest high-fee share, and
+//      no share is naughty (p2pool v35 parity)
+//      (ExcessiveRewardReportIsIdenticalOnNodesWithDifferentTemplates).
 //
 // Folded into test_dash_node (needs dash::NodeImpl + c2pool_storage + the dash
 // OBJECT lib). The profile is keyed on the process-global SharechainConfig
@@ -49,7 +55,9 @@
 
 #include <impl/dash/dashboard_pplns.hpp>
 #include <impl/dash/messages.hpp>
+#include <impl/dash/naughty_seed.hpp>
 #include <impl/dash/pplns_v36.hpp>
+#include <impl/dash/stale_report.hpp>
 
 #include <core/message.hpp>
 #include <core/packet.hpp>
@@ -192,7 +200,8 @@ struct TwoNodes {
     // `check_jobs`: first build the job for the same inputs on BOTH nodes and
     // require them identical.
     Minted mint(int minter, const uint256& prev, const uint160& miner, uint32_t desired_ts,
-                uint32_t share_nonce, bool check_jobs = true, bool relay_now = true)
+                uint32_t share_nonce, bool check_jobs = true, bool relay_now = true,
+                dash::StaleInfo stale_info = dash::StaleInfo::none)
     {
         LiveNode& m = node(minter);
         LiveNode& o = node(1 - minter);
@@ -204,7 +213,8 @@ struct TwoNodes {
         SolvedJob j;
         std::optional<dash::stratum::MintedShare> ms;
         EXPECT_TRUE(m.settled([&](dash::ShareTracker& t) {
-            j = solve_job(t.chain, p, prev, miner, wd, share_nonce, desired_ts, {}, max_nonce, threads);
+            j = solve_job(t.chain, p, prev, miner, wd, share_nonce, desired_ts, {}, max_nonce, threads,
+                          stale_info);
             if (j.solved)
                 ms = mint_from_inputs_any(t.chain, p, j.in, j.build.frozen);
         }));
@@ -722,4 +732,155 @@ TEST(DashV36E2E, SeedStoreForLoopbackRig)
     std::ofstream(fs::path(dir) / "manifest.json") << manifest.dump(2) << "\n";
     std::cout << "[seed] " << count << " v36 shares into " << (fs::path(dir) / sub).string()
               << " tip=" << manifest["tip"].get<std::string>() << "\n";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. Own orphan report (#1826): a node whose share lost the head race
+//    announces it (stale_info = orphan, wire 253) in its next share, both
+//    nodes count it, and the node's following job announces nothing.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(DashV36E2E, OrphanedNodeAnnounces253InItsNextShareOnBothNodes)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_e2e_orphan");
+    const auto f = fresh_iso();
+    TwoNodes rig(f.p, SharechainConfig::data_subdir(false));
+    const int minter_of[6] = {0, 1, 0, 1, 0, 1};
+    const auto six = grow_six(rig);
+    ASSERT_EQ(six.size(), 6u);
+    const uint256 P = six.back().hash;
+
+    // Node A's own ledger: the rig mints test-side, exactly as the main_dash
+    // mint hook records (record_mint after add_local_share).
+    dash::mint::LocalStaleLedger ledger_a;
+    for (int k = 0; k < 6; ++k)
+        if (minter_of[k] == 0)
+            ledger_a.record_mint(six[k].hash, false, dash::StaleInfo::none);
+
+    const uint32_t t0 = rig.wd.m_curtime + 200;
+    const auto a1 = rig.mint(0, P, MINER_A, t0, 91);            // A's share on P ...
+    ASSERT_FALSE(a1.hash.IsNull());
+    ledger_a.record_mint(a1.hash, false, dash::StaleInfo::none);
+    const auto b1 = rig.mint(1, P, MINER_B, t0 + 1, 92);        // ... loses to B's longer branch
+    const auto b2 = rig.mint(1, b1.hash, MINER_B, t0 + 20, 93);
+    ASSERT_FALSE(b2.hash.IsNull());
+    ASSERT_TRUE(rig.a->wait_best(b2.hash));
+    ASSERT_TRUE(rig.b->wait_best(b2.hash));
+
+    // A's next job: the oracle rule says orphan.
+    dash::StaleInfo next = dash::StaleInfo::none;
+    ASSERT_TRUE(rig.a->settled([&](dash::ShareTracker& t) {
+        next = dash::mint::next_stale_info(ledger_a.tally(t.chain, b2.hash));
+    }));
+    ASSERT_EQ(next, dash::StaleInfo::orphan) << "a1 is off the best chain and unannounced";
+
+    const auto s3 = rig.mint(0, b2.hash, MINER_A, t0 + 40, 94, /*check_jobs=*/false,
+                             /*relay_now=*/true, next);
+    ASSERT_FALSE(s3.hash.IsNull());
+    EXPECT_EQ(s3.share.m_stale_info, dash::StaleInfo::orphan);
+    EXPECT_EQ(static_cast<uint8_t>(s3.share.m_stale_info), 253);
+    ledger_a.record_mint(s3.hash, false, s3.share.m_stale_info);
+
+    for (auto* n : {rig.a.get(), rig.b.get()}) {
+        EXPECT_TRUE(n->wait_best(s3.hash));
+        EXPECT_TRUE(n->settled([&](dash::ShareTracker& t) {
+            ASSERT_TRUE(t.verified.contains(s3.hash)) << "the announcing share is a valid share";
+            t.chain.get_share(s3.hash).invoke([&](auto* obj) {
+                EXPECT_EQ(static_cast<uint8_t>(obj->m_stale_info), 253) << "wire byte as received";
+            });
+            const auto c = t.get_stale_counts(s3.hash, 3);
+            EXPECT_EQ(c.orphan_count, 1u);
+            EXPECT_EQ(c.doa_count, 0u);
+        }));
+    }
+
+    // The orphan is now announced by an on-chain share: the following job
+    // reports nothing.
+    ASSERT_TRUE(rig.a->settled([&](dash::ShareTracker& t) {
+        EXPECT_EQ(dash::mint::next_stale_info(ledger_a.tally(t.chain, s3.hash)),
+                  dash::StaleInfo::none);
+    }));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. Naughty is identical on nodes with different templates: the seed reads
+//    only committed share content (subsidy, coinbase merkle_link length, the
+//    parent block's height), never the verifying node's own template or
+//    mempool, so the two nodes report the same shares. Report only (p2pool v35
+//    parity): no share is naughty on either node.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr uint32_t NAUGHTY_PARENT_HEIGHT = 2'600'000;   // post-V20 on either network
+std::optional<uint32_t> naughty_stub_height(const uint256&) { return NAUGHTY_PARENT_HEIGHT; }
+
+uint64_t warnings_on(LiveNode& n)
+{
+    uint64_t v = 0;
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) { v = t.excessive_reward_warnings(); }));
+    return v;
+}
+
+int32_t naughty_on(LiveNode& n, const uint256& h)
+{
+    int32_t v = -1;
+    EXPECT_TRUE(n.settled([&](dash::ShareTracker& t) {
+        if (t.chain.contains(h)) v = t.chain.get_index(h)->naughty;
+    }));
+    return v;
+}
+
+} // namespace
+
+TEST(DashV36E2E, ExcessiveRewardReportIsIdenticalOnNodesWithDifferentTemplates)
+{
+    IdentityGuard guard;
+    DataDirGuard dd("c2pool_dash_v36_e2e_naughty_fees");
+    const auto f = fresh_iso();
+    ASSERT_FALSE(dash::naughty_seed_active());
+    ASSERT_TRUE(dash::excessive_reward_warning_active());
+    TwoNodes rig(f.p, SharechainConfig::data_subdir(false));
+    rig.a->node->set_block_abs_height_fn(naughty_stub_height);
+    rig.b->node->set_block_abs_height_fn(naughty_stub_height);
+    const uint64_t reward =
+        dash::max_coinbase_value(NAUGHTY_PARENT_HEIGHT + 1, f.p.is_testnet).value();
+    const uint32_t t0 = rig.wd.m_curtime;
+
+    // Node A's template: three transactions and their fees.
+    rig.wd = make_wd_with_txs(3);
+    rig.wd.m_coinbase_value = reward + reward * 9 / 10;         // high fees, honest
+    const auto s_hi = rig.mint(0, uint256(), MINER_A, t0, 61);
+    ASSERT_FALSE(s_hi.hash.IsNull());
+    ASSERT_EQ(s_hi.share.m_merkle_link.m_branch.size(), 2u);
+    rig.wd.m_coinbase_value = 2 * reward + 1;                   // above reward + allowance
+    const auto s_bad = rig.mint(0, s_hi.hash, MINER_A, t0 + 20, 62);
+    ASSERT_FALSE(s_bad.hash.IsNull());
+
+    // Node B's template: coinbase-only, no fees at all.
+    rig.wd = make_wd();
+    rig.wd.m_coinbase_value = reward + 1;                       // no fees to explain the extra duff
+    const auto s_cb = rig.mint(1, s_hi.hash, MINER_B, t0 + 40, 63);
+    ASSERT_FALSE(s_cb.hash.IsNull());
+    ASSERT_TRUE(s_cb.share.m_merkle_link.m_branch.empty());
+    rig.wd.m_coinbase_value = reward;
+    const auto s_ok = rig.mint(1, s_hi.hash, MINER_B, t0 + 60, 64);
+    ASSERT_FALSE(s_ok.hash.IsNull());
+
+    const Minted* all[] = {&s_hi, &s_bad, &s_cb, &s_ok};
+    const char* name[] = {"s_hi", "s_bad", "s_cb", "s_ok"};
+    for (size_t i = 0; i < 4; ++i) {
+        SCOPED_TRACE(name[i]);
+        EXPECT_EQ(naughty_on(*rig.a, all[i]->hash), 0) << "report only: never naughty";
+        EXPECT_EQ(naughty_on(*rig.b, all[i]->hash), 0) << "report only: never naughty";
+    }
+    // s_bad (above reward + allowance) and s_cb (one duff over a coinbase-only
+    // reward) are reported; the honest high-fee s_hi is not, even on node B
+    // whose own template has no fees.
+    const uint64_t wa = warnings_on(*rig.a);
+    const uint64_t wb = warnings_on(*rig.b);
+    EXPECT_EQ(wa, wb) << "both nodes report the same shares";
+    EXPECT_EQ(wa, 2u);
+    EXPECT_EQ(wb, 2u);
 }
