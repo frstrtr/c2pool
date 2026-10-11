@@ -1198,7 +1198,7 @@ if (BUILD_TESTING)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
-    foreach(_gap2_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_relay_parked_cap_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_native_ctx_kat v37_xmr_relay_fd_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_relay_liveness_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat v37_xmr_verify_pool_kat v37_xmr_relay_parked_cap_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_relay_send_queue_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat v37_xmr_ctx_pow_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1261,12 +1261,10 @@ if (BUILD_TESTING)
     #                               build.yml --target lists.
     #   v37_xmr_drops_default_kat   XMR-DROPS-DEFAULT (operator ruling 09-27):
     #                               the XMR build arms raindrops by default
-    #                               (default lane = for_version(1), bundle
-    #                               built), HELLOs pool rules v3 and refuses a
-    #                               raindrops-OFF node BY NAME both directions;
-    #                               d5: the composed delta splits by give-author
-    #                               like the receipts (conserving). ALSO on
-    #                               BOTH build.yml --target lists.
+    #                               (default lane = for_version(1) + Count,
+    #                               make_drops_wiring armed); the shell source
+    #                               strings of the d5 split. ALSO on BOTH
+    #                               build.yml --target lists.
     #   v37_xmr_relay_liveness_kat  RELAY-LIVENESS + RELAY-BINCLOCK (capstone
     #                               attempt 2): FB_PING/FB_PONG keepalive; a
     #                               link silent both ways with TCP still up
@@ -1303,6 +1301,22 @@ if (BUILD_TESTING)
             add_test(NAME ${_gap2_kat} COMMAND ${_gap2_kat})
         endif()
     endforeach()
+    # v37_xmr_drops_default_kat, v37_xmr_drops_count_kat, v37_xmr_parse_bounds_kat:
+    # the block above without the receipt module.
+    foreach(_xmr_kat v37_xmr_drops_default_kat v37_xmr_drops_count_kat v37_xmr_parse_bounds_kat)
+        add_executable(${_xmr_kat}
+            ${_xmr_kat}.cpp
+            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
+        target_compile_features(${_xmr_kat} PRIVATE cxx_std_20)
+        target_include_directories(${_xmr_kat} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
+            ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
+        target_compile_definitions(${_xmr_kat} PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        target_link_libraries(${_xmr_kat} PRIVATE xmr_coin Threads::Threads)
+        add_test(NAME ${_xmr_kat} COMMAND ${_xmr_kat})
+    endforeach()
+    target_link_libraries(v37_xmr_parse_bounds_kat PRIVATE xmr_pathb)
     #   v37_xmr_ctx_pow_kat        receipt CONTEXT WORK: a Monero block a peer
     #                               serves as a receipt's context (FB_CTX) is
     #                               used only if our own verified chain index
@@ -1315,9 +1329,9 @@ if (BUILD_TESTING)
     #                               model RandomX. ALSO on BOTH build.yml
     #                               --target lists.
     #   v37_xmr_parse_bounds_kat   non-wrapping bounds ("len > size - pos")
-    #                               in the receipt tx_extra / hashing-blob
-    #                               parsers, the context block layout, the
-    #                               receipt wire reader and the index snapshot
+    #                               in the v3 receipt / carrier body decoders,
+    #                               the family-C and FB_RECEIPTS v3 decoders,
+    #                               their reader and the index snapshot
     #                               reader: lengths near SIZE_MAX at positions
     #                               near the end are refused with no read past
     #                               the buffer (the ASan leg runs it under

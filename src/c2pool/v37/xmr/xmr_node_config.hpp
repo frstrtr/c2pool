@@ -29,17 +29,32 @@
 #include <sharechain/v37/v37_lane.hpp>       // ::v37::LaneParams
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
-#include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
 #include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
 #include "impl/xmr/settle/xmr_drain_rule.hpp"   // THE DRAIN RULE: drain_rule_refusal
-#include "xmr_lane_constants.hpp"            // kXmrDropsFloorShift, kXmrTargetIntervalS
+#include "xmr_lane_constants.hpp"            // kXmrDropsFloorShift, kXmrTargetIntervalS, kXmrCreditModeCount
 
 namespace c2pool::v37n::xmr {
 
-// kXmrDropsFloorShift (k) and kXmrTargetIntervalS (T): xmr_lane_constants.hpp.
+// kXmrDropsFloorShift (k), kXmrTargetIntervalS (T) and kXmrCreditModeCount: xmr_lane_constants.hpp.
 // DROPS WINDOW (A4b): log2 of one share's work in the estimator unit (== drops::kXmrDropsLz).
 inline constexpr unsigned kXmrDropsWorkLz = 32;
-inline constexpr std::uint32_t kXmrCreditModeCount = 2;
+
+// The same-height tie-break of --same-height-tiebreak: prefer-own (default) |
+// first-seen. The native backend's fork tie reads it.
+enum class SameHeightTieBreak : std::uint8_t { FirstSeen = 0, PreferOwn = 1 };
+
+inline const char* to_string(SameHeightTieBreak t) noexcept {
+    return t == SameHeightTieBreak::PreferOwn ? "prefer-own" : "first-seen";
+}
+
+// The CLI spelling. Returns false (and leaves `out` alone) on anything else.
+inline bool parse_tie_break(const std::string& s, SameHeightTieBreak& out) noexcept {
+    if (s == "prefer-own" || s == "prefer_own" || s == "own") { out = SameHeightTieBreak::PreferOwn; return true; }
+    if (s == "first-seen" || s == "first_seen" || s == "firstseen") { out = SameHeightTieBreak::FirstSeen; return true; }
+    return false;
+}
+
+struct SameHeightPolicy;  // xmr_same_height_race.hpp
 
 // DUST DECAY, in MONERO HEIGHTS (audit A9). The decay clock is the FINALIZE
 // bin_height, a Monero height, so its constants are named as heights here and
@@ -246,14 +261,8 @@ struct XmrNodeConfig {
 
     // The policy as the accounting layer consumes it -- assembled HERE so the
     // D_conf coupling is structural rather than a convention every call site
-    // has to remember.
-    SameHeightPolicy same_height_policy() const {
-        SameHeightPolicy p;
-        p.tie_break    = same_height_tiebreak;
-        p.d_conf       = d_conf;
-        p.max_renotify = same_height_renotify;
-        return p;
-    }
+    // has to remember. Defined in xmr_same_height_race.hpp.
+    SameHeightPolicy same_height_policy() const;
 
     // --- stratum front-end (X5) --------------------------------------------
     std::string     stratum_bind_host = "127.0.0.1";

@@ -27,18 +27,6 @@
 
 using namespace xmr_goldens;
 
-// Emit the (long) carrier byte string wrapped at a fixed hex-pair boundary so
-// the checked-in header stays diff-friendly (adjacent literals concatenate).
-static void emit_wrapped(const std::string& hexstr) {
-    const std::size_t per = 76; // even
-    std::size_t i = 0;
-    while (i < hexstr.size()) {
-        std::size_t n = (hexstr.size() - i < per) ? (hexstr.size() - i) : per;
-        std::printf("    \"%.*s\"\n", (int)n, hexstr.data() + i);
-        i += n;
-    }
-}
-
 static void emit_header(const XmrGoldens& g) {
     std::printf(
 "// SPDX-License-Identifier: AGPL-3.0-or-later\n"
@@ -74,14 +62,6 @@ static void emit_header(const XmrGoldens& g) {
     std::printf("inline constexpr char G3_R_PUB[]   = \"%s\";\n", g.g3_R.c_str());
     std::printf("inline constexpr char G3_MM_ROOT[] = \"%s\";\n", g.g3_mm_root.c_str());
     std::printf("inline constexpr char G3_PCB0[]    = \"%s\";\n\n", g.g3_Pcb.c_str());
-    std::printf("inline constexpr char        G4_CHEAP_ID[]    = \"%s\";\n", g.g4_cheap_id.c_str());
-    std::printf("inline constexpr std::size_t G4_WIRE_SIZE     = %zu;\n", g.g4_wire_size);
-    std::printf("inline constexpr char        G4_INFO_DIGEST[] = \"%s\";\n\n", g.g4_info_digest.c_str());
-    std::printf("inline constexpr std::size_t G5_LEN      = %zu;\n", g.g5_len);
-    std::printf("inline constexpr char        G5_DIGEST[] = \"%s\";\n", g.g5_digest.c_str());
-    std::printf("inline constexpr char        G5_BYTES[]  =\n");
-    emit_wrapped(g.g5_bytes);
-    std::printf("    ;\n\n");
     std::printf("} // namespace golden\n} // namespace xmr_goldens\n");
 }
 
@@ -91,12 +71,8 @@ static void emit_json(const XmrGoldens& g) {
     std::printf("  \"g1_difficulty_bits\": \"%s\",\n", g.g1_bits.c_str());
     std::printf("  \"g2_stealth\": { \"D\": \"%s\", \"P0\": \"%s\", \"view_tag0\": \"%02x\" },\n",
                 g.g2_D.c_str(), g.g2_P0.c_str(), g.g2_vt0);
-    std::printf("  \"g3_coinbase\": { \"r\": \"%s\", \"R\": \"%s\", \"mm_root\": \"%s\", \"P_cb0\": \"%s\" },\n",
+    std::printf("  \"g3_coinbase\": { \"r\": \"%s\", \"R\": \"%s\", \"mm_root\": \"%s\", \"P_cb0\": \"%s\" }\n",
                 g.g3_r.c_str(), g.g3_R.c_str(), g.g3_mm_root.c_str(), g.g3_Pcb.c_str());
-    std::printf("  \"g4_receipt\": { \"cheap_id_A\": \"%s\", \"wire_size_A\": %zu, \"info_digest_A\": \"%s\" },\n",
-                g.g4_cheap_id.c_str(), g.g4_wire_size, g.g4_info_digest.c_str());
-    std::printf("  \"g5_carrier\": { \"len\": %zu, \"digest\": \"%s\", \"bytes\": \"%s\" }\n",
-                g.g5_len, g.g5_digest.c_str(), g.g5_bytes.c_str());
     std::printf("}\n");
 }
 

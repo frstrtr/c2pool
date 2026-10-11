@@ -16,8 +16,8 @@
 //   the whole point of the gate.
 //
 // Links the REAL merged primitives only (xmr_coin: keccak/cn_fast_hash, ed25519
-// ge_*/sc_*, the boost-free check_hash, the extracted CryptoNote derivation)
-// plus the header-only wire codec + receipt structs. No RandomX/libsodium/boost.
+// ge_*/sc_*, the boost-free check_hash, the extracted CryptoNote derivation).
+// No RandomX/libsodium/boost.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -32,8 +32,6 @@
 #include "xmr_keccak_midstate.hpp"  // keccak256 / KeccakMidstate
 #include "xmr_blob.hpp"             // BlobWriter / TX_EXTRA_TAG_PUBKEY
 #include "xmr_check_hash.hpp"       // boost-free check_hash (lane hot path)
-#include "xmr_receipt.hpp"          // MoneroReceipt / HashingBlob / ...
-#include "xmr_carrier_wire.hpp"     // encode_carrier / CarrierMessage
 
 namespace xmr_goldens {
 
@@ -70,9 +68,6 @@ template <class T> inline T from_hex(const std::string& h) {
     return t;
 }
 template <class T> inline std::string hx(const T& t) { return hex(t.data(), 32); }
-inline std::array<std::uint8_t, 32> to_arr(const Hash256& h) {
-    std::array<std::uint8_t, 32> a{}; std::memcpy(a.data(), h.data(), 32); return a;
-}
 
 // ===========================================================================
 //  Pinned inputs (documented in gen_xmr_goldens.cpp / the golden header)
@@ -119,28 +114,6 @@ inline Hash256 mm_commitment_root_g3() {
     return m.finalize_copy();
 }
 
-// ---- G5 pinned receipts (deterministic construction) ----------------------
-inline v37::xmr::MoneroReceipt make_receipt(unsigned char seed, const PublicKey& R) {
-    using namespace v37::xmr;
-    MoneroReceipt r;
-    r.hashing_blob.bytes.resize(76);
-    for (std::size_t i = 0; i < r.hashing_blob.bytes.size(); ++i)
-        r.hashing_blob.bytes[i] = (unsigned char)(seed + i);
-    r.seed_ref.policy = SeedRefPolicy::DerivedFromBin;
-    for (std::size_t i = 0; i < r.coinbase_opening.midstate.size(); ++i)
-        r.coinbase_opening.midstate[i] = (unsigned char)((seed * 3 + i) & 0xff);
-    r.coinbase_opening.prefix_tail = { 0xde, 0xad, 0xbe, 0xef, seed };
-    r.coinbase_opening.tx_extra.clear();
-    r.coinbase_opening.tx_extra.push_back(::xmr::coin::TX_EXTRA_TAG_PUBKEY);
-    r.coinbase_opening.tx_extra.insert(r.coinbase_opening.tx_extra.end(), R.data(), R.data() + 32);
-    r.tree_branch.path.push_back(to_arr(::xmr::coin::keccak256(std::string("leaf-0-sibling").data(), 14)));
-    r.tree_branch.path.push_back(to_arr(::xmr::coin::keccak256(std::string("leaf-1-sibling").data(), 14)));
-    r.tree_branch.depth = (unsigned char)r.tree_branch.path.size();
-    std::string tag = "c2pool-xmr-golden-info-" + std::to_string(seed);
-    r.info_digest = to_arr(::xmr::coin::keccak256(tag.data(), tag.size()));
-    return r;
-}
-
 // ---- G1 difficulty boundary vectors (from ../xmr_difficulty_kat.cpp) -------
 struct DiffVec { const char* h; std::uint64_t lo, hi; };
 inline const DiffVec kDiffVecs[] = {
@@ -175,8 +148,6 @@ struct XmrGoldens {
     std::string g1_bits;
     std::string g2_D, g2_P0; unsigned g2_vt0;
     std::string g3_r, g3_R, g3_mm_root, g3_Pcb;
-    std::string g4_cheap_id, g4_info_digest; std::size_t g4_wire_size;
-    std::size_t g5_len; std::string g5_digest, g5_bytes;
 };
 
 inline XmrGoldens compute_xmr_goldens() {
@@ -202,23 +173,6 @@ inline XmrGoldens compute_xmr_goldens() {
     KeyDerivation D_cb{}; ::xmr::coin::generate_key_derivation(A, r_g3, D_cb);
     PublicKey P_cb{}; ::xmr::coin::derive_public_key(D_cb, 0, B, P_cb);
     g.g3_r = hx(r_g3); g.g3_R = hx(R_g3); g.g3_mm_root = hx(mm_root); g.g3_Pcb = hx(P_cb);
-
-    // G4 + G5
-    v37::xmr::MoneroReceipt rcA = make_receipt(0x10, R_g3);
-    v37::xmr::MoneroReceipt rcB = make_receipt(0x40, R_g3);
-    Hash256 cheap_id_A = ::xmr::coin::keccak256(rcA.hashing_blob.bytes);
-    g.g4_cheap_id = hx(cheap_id_A);
-    g.g4_wire_size = rcA.wire_size();
-    g.g4_info_digest = hex(rcA.info_digest.data(), 32);
-
-    v37::xmr::wire::CarrierMessage cm;
-    cm.chain_id = G3_CHAINID;
-    cm.carrier = rcA;
-    cm.receipts.push_back(rcB);
-    std::vector<unsigned char> cb = v37::xmr::wire::encode_carrier(cm);
-    g.g5_len = cb.size();
-    g.g5_digest = hx(::xmr::coin::keccak256(cb));
-    g.g5_bytes = hex(cb.data(), cb.size());
     return g;
 }
 
