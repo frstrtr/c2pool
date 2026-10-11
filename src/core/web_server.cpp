@@ -7,6 +7,7 @@
 #include <memory>
 #include "address_utils.hpp"
 #include "coin_registry.hpp"
+#include "ip_mask.hpp"
 #include "socket.hpp"
 
 // Real coin daemon access (optional - only active when set_coin_node() is called)
@@ -2798,10 +2799,12 @@ nlohmann::json MiningInterface::rest_connected_miners()
     return arr;
 }
 
-nlohmann::json MiningInterface::rest_stratum_stats()
+nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
 {
     // p2pool format: { pool: {...}, workers: {...} }
     // stratum.html reads data.pool.* and data.workers.*
+    // #1985: unless reveal_ips, every miner address below (remote_endpoint and
+    // the ip_connections / ip_workers keys) is a mask_ip_endpoint() token.
     nlohmann::json result = nlohmann::json::object();
     auto workers = effective_stratum_workers();
     auto now = std::time(nullptr);
@@ -2830,6 +2833,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
         // stratum producer), so group by the bare host across both families.
         std::string ip = core::parse_host_port(w.remote_endpoint).host;
         if (!ip.empty()) {
+            if (!reveal_ips)
+                ip = core::mask_ip_endpoint(ip);
             ip_connections[ip]++;
             ip_workers_set[ip].insert(w.username);
         }
@@ -2880,7 +2885,9 @@ nlohmann::json MiningInterface::rest_stratum_stats()
                 {"stale", w.stale},
                 {"shares", w.accepted + w.stale},
                 {"connected_seconds", elapsed},
-                {"remote_endpoint", w.remote_endpoint},
+                {"remote_endpoint", reveal_ips || w.remote_endpoint.empty()
+                                        ? w.remote_endpoint
+                                        : core::mask_ip_endpoint(w.remote_endpoint)},
                 {"rtt_ms", w.rtt_ms},
                 {"silent", lv.silent},
                 {"silent_seconds", lv.silent_seconds},
@@ -5589,12 +5596,18 @@ nlohmann::json MiningInterface::rest_user_stales()
     return nlohmann::json::object();
 }
 
-std::string MiningInterface::rest_peer_addresses()
+std::string MiningInterface::rest_peer_addresses(bool reveal_ips)
 {
     std::string result;
     if (m_peer_info_fn) {
         auto peers = m_peer_info_fn();
         for (const auto& p : peers) {
+            // #1985: this list is read as host:port dial targets, so a masked
+            // entry would be a broken target. Unless reveal_ips, incoming peers
+            // are dropped instead; a peer without an "incoming" flag is dropped
+            // too (fail closed). Outgoing peers are public listeners we dialed.
+            if (!reveal_ips && (!p.is_object() || p.value("incoming", true)))
+                continue;
             if (!result.empty()) result += ' ';
             result += p.value("address", "");
         }
@@ -5602,40 +5615,50 @@ std::string MiningInterface::rest_peer_addresses()
     return result;
 }
 
-nlohmann::json MiningInterface::rest_peer_versions()
+nlohmann::json MiningInterface::peer_info_for_viewer(bool reveal_ips)
+{
+    if (!m_peer_info_fn)
+        return nlohmann::json::array();
+    auto peers = m_peer_info_fn();
+    if (reveal_ips || !peers.is_array())
+        return peers;
+    // #1985: an incoming peer's address is the remote host that dialed us.
+    // A peer without an "incoming" flag is masked too (fail closed).
+    for (auto& p : peers) {
+        if (!p.is_object() || !p.contains("address") || !p["address"].is_string())
+            continue;
+        if (p.value("incoming", true))
+            p["address"] = core::mask_ip_endpoint(p["address"].get<std::string>());
+    }
+    return peers;
+}
+
+nlohmann::json MiningInterface::rest_peer_versions(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
-    if (m_peer_info_fn) {
-        auto peers = m_peer_info_fn();
-        for (const auto& p : peers)
-            result[p.value("address", "")] = p.value("version", "unknown");
-    }
+    for (const auto& p : peer_info_for_viewer(reveal_ips))
+        result[p.value("address", "")] = p.value("version", "unknown");
     return result;
 }
 
-nlohmann::json MiningInterface::rest_peer_txpool_sizes()
+nlohmann::json MiningInterface::rest_peer_txpool_sizes(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
-    if (m_peer_info_fn) {
-        auto peers = m_peer_info_fn();
-        for (const auto& p : peers)
-            result[p.value("address", "")] = p.value("txpool_size", 0);
-    }
+    for (const auto& p : peer_info_for_viewer(reveal_ips))
+        result[p.value("address", "")] = p.value("txpool_size", 0);
     return result;
 }
 
-nlohmann::json MiningInterface::rest_peer_list()
+nlohmann::json MiningInterface::rest_peer_list(bool reveal_ips)
 {
-    if (m_peer_info_fn)
-        return m_peer_info_fn();
-    return nlohmann::json::array();
+    return peer_info_for_viewer(reveal_ips);
 }
 
-nlohmann::json MiningInterface::rest_pings()
+nlohmann::json MiningInterface::rest_pings(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
     if (m_peer_info_fn) {
-        auto peers = m_peer_info_fn();
+        auto peers = peer_info_for_viewer(reveal_ips);
         for (const auto& p : peers)
             result[p.value("address", "")] = p.value("ping_ms", 0.0);
     }
@@ -6010,14 +6033,17 @@ nlohmann::json MiningInterface::rest_luck_stats()
     return result;
 }
 
-nlohmann::json MiningInterface::rest_ban_stats()
+nlohmann::json MiningInterface::rest_ban_stats(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
     std::lock_guard<std::mutex> lock(m_control_mutex);
     result["total_banned"] = static_cast<uint64_t>(m_banned_targets.size());
     nlohmann::json banned = nlohmann::json::array();
+    // #1985: a banned IP is masked for a non-local viewer; a banned payout
+    // address or worker name is not an IP and is shown as-is.
     for (const auto& t : m_banned_targets)
-        banned.push_back(t);
+        banned.push_back(!reveal_ips && core::is_ip_endpoint(t)
+                             ? core::mask_ip_endpoint(t) : t);
     result["banned_targets"] = banned;
     return result;
 }
