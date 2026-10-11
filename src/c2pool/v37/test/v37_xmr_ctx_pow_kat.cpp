@@ -41,12 +41,12 @@
 #include <string>
 #include <vector>
 
-#include "xmr_relay_test_util.hpp"
-#include <c2pool/v37/xmr/relay/xmr_relay_node.hpp>
+#include "xmr_pathb_relay_test_util.hpp"
+#include <c2pool/v37/xmr/relay/xmr_relay_native_ctx.hpp>
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
 
-using namespace gap2test;
+using namespace pathb_relay_test;
 namespace nat = c2pool::xmr::native;
 
 static constexpr u64 kH    = 5000;   // G's height
@@ -54,13 +54,6 @@ static constexpr u64 kWin  = 100;    // difficulty rows ending at G
 static constexpr u64 kStep = 1000;   // cumulative difficulty per row -> next difficulty 1000
 static constexpr u64 kCum0 = 5'000'000;
 
-static bytes32 block_id(const SynthBlock& sb) {   // keccak256(varint(len) | hashing_blob)
-    std::vector<u8> pre;
-    put_varint(pre, sb.hashing_blob.size());
-    pre.insert(pre.end(), sb.hashing_blob.begin(), sb.hashing_blob.end());
-    const auto h = ::xmr::coin::keccak256(pre.data(), pre.size());
-    bytes32 b; std::memcpy(b.data(), h.data(), 32); return b;
-}
 static nat::Hash nh(const bytes32& b) { nat::Hash h{}; std::memcpy(h.data(), b.data(), 32); return h; }
 static bytes32 bb(const nat::Hash& h) { bytes32 b{}; std::memcpy(b.data(), h.data(), 32); return b; }
 
@@ -295,8 +288,8 @@ int main() {
         C(v.kind == CtxPow::Defer && !v.ban(), "C2 with no chain index wired nothing is used and nobody is banned");
     }
     {   // the bound is the relay's default
-        RelayOptions ro;
-        C(ro.ctx_max_depth == 2, "C2 RelayOptions::ctx_max_depth defaults to 2 (the tip-freshness bound)");
+        pb::PathbRelayOptions ro;
+        C(ro.ctx_max_depth == 2, "C2 PathbRelayOptions::ctx_max_depth defaults to 2 (the tip-freshness bound)");
     }
 
     // ── C3 serving: a parked (unverified) alternative block is not served ──
