@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        coin: [ltc, doge, dash, btc, dgb, bch]
+        coin: [ltc, doge, dash, btc, dgb, bch, bip110]
         include:
           # PRE-STAGED daemonless dash smoke (2026-08-20). Reuses THIS same
           # per-coin template -- no forked workflow. Builds the SAME c2pool-dash
