@@ -16,6 +16,8 @@
 //       and lane digest on C (printed, so runs can be diffed).
 //   N6  stop: stop() with 8 workers and a full queue joins within 2 s and no
 //       RandomX call starts after stop() returns.
+//   N7  seed not held: a carrier whose seed C does not hold is parked once (a
+//       seed DEFER) and admitted when the follower's main chain moves.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -167,6 +169,27 @@ static Result run(const Cfg& c) {
     return r;
 }
 
+// N7: C holds no seed when A's carrier arrives: parked once, admitted when the follower's chain moves.
+static bool n7(std::string& note) {
+    Rig rig;
+    auto A = rig.make("A", opts(true, {}, 1, 4096), true);
+    if (!A->start()) return false;
+    auto Cn = rig.make("C", opts(false, {A->port()}, 1, 4096), false);
+    Cn->seed_off = true;
+    if (!Cn->start()) return false;
+    if (!wait_until([&] { return A->r().ready_peers().size() == 1 && Cn->r().ready_peers().size() == 1; }, 5000ms)) return false;
+    rig.tick_monero();
+    if (rig.mine(*A, 0, 0x7000).action != pb::NodeAction::Placed) return false;
+    const pb::Hash32 c = A->best();
+    const bool parked = wait_until([&] { return Cn->r().parked_index_size() >= 1; }, 5000ms) && Cn->best() != c;
+    Cn->seed_off = false;
+    Cn->r().on_monero_tip();
+    const bool placed = wait_until([&] { return Cn->best() == c; }, 5000ms);
+    note = "parked " + std::to_string(parked) + ", re-runs " + std::to_string(Cn->st().parked_reruns.load()) +
+           ", strikes " + std::to_string(Cn->st().strikes.load());
+    return parked && placed && Cn->st().parked_reruns.load() >= 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0;
+}
+
 int main() {
     Checker C;
     std::printf("v37_xmr_verify_pool_kat (the Path B relay node)\n");
@@ -201,5 +224,9 @@ int main() {
     C(s6.ready && s6.stop_ms < 2000.0 && s6.quiet_after_stop,
       "N6 stop() with a full queue joins in " + std::to_string(static_cast<int>(s6.stop_ms)) +
       " ms, no RandomX call after it returned");
+    // N7: a seed DEFER parked once and run again when the follower's chain moves
+    std::string n7note;
+    const bool n7ok = n7(n7note);
+    C(n7ok, "N7 a carrier whose seed C does not hold is parked once and admitted when the follower's chain moves (" + n7note + ")");
     return C.done("v37_xmr_verify_pool_kat");
 }

@@ -19,8 +19,19 @@
 //       no hard drop, no redial (one HELLO per side).
 //   S3  the per-link send queue stays bounded (high-water mark measured), with
 //       0 queue-full drops and 0 send-timeout drops.
+//   S4  a peer that reads slowly (a raw socket, 16 KiB per 100 ms) HELLOs A,
+//       which re-offers its full pending set: at A's send queue bound the link
+//       is kept and the queue holds the re-offer; at a bound below the
+//       re-offer's queued bytes the link is dropped as queue-full.
 // ===========================================================================
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -76,6 +87,43 @@ struct SmallArrivals {
         return it->second;
     }
 };
+
+// A raw peer that sends `hello` ([u32 LE length][frame]) and then reads at most 16 KiB every 100 ms for `ms`;
+// false: the connection was closed by the other side within `ms`.
+static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    const int rcv = 4096;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+        ::close(fd);
+        return false;
+    }
+    std::vector<u8> out(4);
+    const std::uint32_t n = static_cast<std::uint32_t>(hello.size());
+    for (int i = 0; i < 4; ++i) out[i] = static_cast<u8>(n >> (8 * i));
+    out.insert(out.end(), hello.begin(), hello.end());
+    if (::send(fd, out.data(), out.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(out.size())) {
+        ::close(fd);
+        return false;
+    }
+    bool open = true;
+    std::vector<u8> buf(16384);
+    for (int t = 0; t < ms && open; t += 100) {
+        std::this_thread::sleep_for(100ms);
+        pollfd p{fd, POLLIN, 0};
+        if (::poll(&p, 1, 0) > 0) {
+            const ssize_t r = ::recv(fd, buf.data(), buf.size(), MSG_DONTWAIT);
+            if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) open = false;
+        }
+    }
+    ::close(fd);
+    return open;
+}
 
 int main() {
     Checker C;
@@ -164,6 +212,29 @@ int main() {
           "S3 per-link queued bytes never exceed the bound");
         C(na.peers_dropped_queue_full() == 0 && nb.peers_dropped_queue_full() == 0 && na.peers_dropped_slow() == 0 &&
           nb.peers_dropped_slow() == 0, "S3 0 queue-full drops, 0 send-timeout drops");
+    }
+    // ── S4 a slow peer while a full pending set is re-offered ────────────────
+    {
+        auto& na = A->links.net();
+        const std::size_t reoffer = body * K;
+        const std::uint64_t full0 = na.peers_dropped_queue_full();
+        const std::uint64_t ro0 = A->st().reoffer_frames.load();
+        const bool kept = slow_peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5151ull, 0), 3000);
+        const std::size_t hwm = na.queued_bytes_hwm();
+        const std::uint64_t full1 = na.peers_dropped_queue_full();
+        std::printf("    S4 METRIC bound=%zu re-offer=%zu B (%llu frames) hwm=%zu full_drops=%llu kept=%d\n",
+                    na.send_queue_limit(), reoffer, (unsigned long long)(A->st().reoffer_frames.load() - ro0), hwm,
+                    (unsigned long long)(full1 - full0), kept ? 1 : 0);
+        C(kept && full1 == full0 && A->st().reoffer_frames.load() > ro0 && hwm >= reoffer / 4,
+          "S4 a slow peer at A's send queue bound: the link kept, the queue holds the re-offer (hwm " + std::to_string(hwm) + " B)");
+        na.set_send_queue(reoffer / 8);
+        (void)slow_peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5252ull, 0), 3000);
+        const std::uint64_t full2 = na.peers_dropped_queue_full();
+        const bool gone = wait_until([&] { return A->r().ready_peers().size() == 1; }, 3000ms);
+        C(full2 >= full1 + 1 && gone,
+          "S4 a send queue bound below the re-offer's queued bytes: the slow peer's link dropped as queue-full (" +
+                  std::to_string(full2 - full1) + ")");
+        na.set_send_queue(pb::PathbRelayOptions{}.send_queue_bytes);
     }
     return C.done("v37_xmr_relay_send_queue_kat");
 }

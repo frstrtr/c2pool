@@ -267,6 +267,7 @@ struct RNode {
     std::unique_ptr<pb::PathbRelayNode> relay;
     std::atomic<std::uint64_t> rx_calls{0};
     RxFn rx;  // the RandomX stub (unset: every hash meets d); set before start()
+    std::atomic<bool> seed_off{false};  // the follower holds no seed (a seed DEFER) while set
     // The node's PathbNodeIo::fetch_context as the relay binds it (a Monero block from the own source or a peer).
     std::function<bool(const pb::Hash32& id, std::uint64_t timeout_s)> fetch_context;
     mutable std::mutex lmtx;
@@ -359,6 +360,10 @@ struct Rig {
             return rn->rx ? rn->rx(b, d, seed) : true;
         };
         io.monero_tip = [this]() -> std::optional<std::uint64_t> { return mon_tip.load(); };
+        io.seed_of = [rn, s = io.seed_of](const pb::Hash32& p) -> std::optional<pb::Hash32> {
+            if (rn->seed_off) return std::nullopt;
+            return s(p);
+        };
         pb::PathbNodeConfig c = h.config(pk::kat_table(net), launch);
         if (another_pool) c.identity.pool_id = other_pool;
         pb::PathbNodeIo bound = n->relay->bind_io(std::move(io));
