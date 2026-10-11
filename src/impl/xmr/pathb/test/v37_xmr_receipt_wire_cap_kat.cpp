@@ -22,8 +22,8 @@
 //   (5) the default I/O buffers 945 / 16,073 (hf 16) and 881 / 14,985 (hf 17);
 //       check_relay_buffers refuses a start-up that lowers them; the relay and
 //       admission budgets are one formula;
-//   (6) FH = 6 against the relay frame header (kFbReceiptsHeader = FH + 1,
-//       kCtxHeader = FH + 36, FB_GETCTX bytes opcode | kFbVersion | chain_id LE);
+//   (6) FH = 6; the FB_RECEIPTS v3 and FC_GETHEADERS frames of
+//       pathb_relay_wire.hpp start opcode | frame version | chain_id LE;
 //   (7) a body with D = D_max(hf, P_view) + 1 and p = 0 passes the codec and is
 //       judged by #9 on its own P_r; the D_max boundary: two nodes with D_max
 //       14 / 15 and a D 15 body valid by its own P_r: neither DROPS it, neither
@@ -35,15 +35,14 @@
 #include <string>
 #include <vector>
 
-#include "c2pool/v37/xmr/relay/xmr_relay_wire.hpp"
 #include "impl/xmr/pathb/pathb_caps.hpp"
 #include "impl/xmr/pathb/pathb_header_rules.hpp"
+#include "impl/xmr/pathb/pathb_relay_wire.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
-namespace relay = ::c2pool::v37n::xmr::relay;
 
 namespace {
 
@@ -204,15 +203,21 @@ int main() {
               "relay and admission budgets: one formula = the receipt buffer");
     }
 
-    // (6) FH = 6 against the relay frame header
+    // (6) FH = 6: the FB_RECEIPTS v3 and FC_GETHEADERS frames
     {
         check(pb::kFrameHeaderBytes == 6, "FH = 6");
-        check(relay::kFbReceiptsHeader == pb::kFrameHeaderBytes + 1, "kFbReceiptsHeader = FH + 1");
-        check(relay::kCtxHeader == pb::kFrameHeaderBytes + 36, "kCtxHeader = FH + 36");
-        const std::vector<std::uint8_t> f = relay::encode_getctx(0x0a0b0c0du, std::vector<relay::bytes32>(1));
-        check(f.size() > pb::kFrameHeaderBytes && f[0] == relay::FB_GETCTX && f[1] == relay::kFbVersion && f[2] == 0x0d
-                      && f[3] == 0x0c && f[4] == 0x0b && f[5] == 0x0a,
-              "FB_GETCTX bytes: opcode | kFbVersion | chain_id LE");
+        pb::GetHeaders gh;
+        gh.chain_id = 0x0a0b0c0du;
+        const std::vector<std::uint8_t> fc = pb::encode_fc_getheaders(gh);
+        const std::optional<std::vector<std::uint8_t>> fr = pb::encode_fb_receipts(
+                0x0a0b0c0du, std::vector<pb::ReceiptBodyV3>{make_body(1, false, 3)}, pb::kRuledLaneParams);
+        const auto fh_is = [](const std::vector<std::uint8_t>& f, std::uint8_t op, std::uint8_t ver) {
+            return f.size() > pb::kFrameHeaderBytes && f[0] == op && f[1] == ver && f[2] == 0x0d && f[3] == 0x0c
+                   && f[4] == 0x0b && f[5] == 0x0a;
+        };
+        check(fr.has_value() && fh_is(*fr, pb::kOpFbReceipts, pb::kFrameVersion2)
+                      && fh_is(fc, pb::kOpFcGetHeaders, pb::kFrameVersion1),
+              "FB_RECEIPTS v3 and FC_GETHEADERS bytes: opcode | frame version | chain_id LE");
     }
 
     // (7) the one-level margin and the D_max boundary

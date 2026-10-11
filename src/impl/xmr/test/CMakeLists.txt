@@ -199,22 +199,18 @@ if (BUILD_TESTING)
     # 9b) cross-impl goldens: the LOAD-BEARING Family-B golden regression gate
     #     (the analogue of the Bitcoin-family proto/ decay-table golden). It
     #     recomputes the deterministic XMR-lane outputs — difficulty check_hash
-    #     boundaries, CryptoNote stealth one-time keys, deterministic coinbase
-    #     r/R=r*G/mm-root, receipt cheap-id + info digest, and the wire carrier
-    #     codec bytes — through the merged primitives and byte-compares each to
+    #     boundaries, CryptoNote stealth one-time keys and deterministic coinbase
+    #     r/R=r*G/mm-root — through the merged primitives and byte-compares each to
     #     the frozen cross-impl-goldens/xmr_lane_goldens_golden.hpp (emitted by
     #     cross-impl-goldens/gen_xmr_goldens.cpp, which is a dev tool, NOT a CMake
     #     target — mirroring tools/gen_decay_canonical.py). LIGHT: links xmr_coin
-    #     (keccak/ed25519/boost-free check_hash) + the header-only receipt/wire
-    #     codec; NO RandomX / libsodium / boost. Negative-controlled internally.
+    #     (keccak/ed25519/boost-free check_hash); NO RandomX / libsodium / boost.
     #     Added to BOTH build.yml light legs by this wave (drift-guard clean).
     add_executable(xmr_goldens_kat
         ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens/xmr_goldens_kat.cpp)
     target_link_libraries(xmr_goldens_kat PRIVATE xmr_coin)
     target_include_directories(xmr_goldens_kat PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
-        ${CMAKE_CURRENT_SOURCE_DIR}/../wire)
+        ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens)
     target_compile_features(xmr_goldens_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_goldens_kat COMMAND xmr_goldens_kat)
 

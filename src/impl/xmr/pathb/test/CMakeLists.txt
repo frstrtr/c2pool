@@ -85,7 +85,9 @@
 #   v37_xmr_pathb_node_join_kat      PathbNode with the joiner wired: joins over the family-C
 #                                    frames, adoption, the deep switch, the re-ask
 #   v37_xmr_pathb_node_kat           PathbNode: three in-process nodes, relay, the template and
-#                                    the job, re-pend, restart, HOLD, the timers
+#                                    the job, re-pend, restart, HOLD, the timers; the relay node
+#                                    (pathb_relay_node.hpp): tokens per frame, a join over the
+#                                    relay, two relay nodes over loopback TCP
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
@@ -152,19 +154,12 @@ if (BUILD_TESTING)
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
         add_test(NAME ${_pathb_kat} COMMAND ${_pathb_kat})
     endforeach()
-    # v37_xmr_pathb_body_v3_kat and v37_xmr_receipt_wire_cap_kat read the relay
-    # frame header of src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp (xmr_receipt.hpp
-    # by its bare name).
-    target_include_directories(v37_xmr_pathb_body_v3_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
-    target_include_directories(v37_xmr_receipt_wire_cap_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
     # v37_xmr_pathb_miner_tx_kat: a test-only TU compares the author key references
     # with c2pool/v37/xmr/xmr_fee_model.hpp and pathb's keys with the settle
     # derivation (settle/xmr_coinbase.cpp, compiled into the KAT only).
     target_sources(v37_xmr_pathb_miner_tx_kat PRIVATE
             v37_xmr_pathb_miner_tx_author.cpp
             ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp)
-    # v37_xmr_donation_split_kat reads the donation keys of the fee model source.
-    target_compile_definitions(v37_xmr_donation_split_kat PRIVATE C2POOL_SRC_DIR="${CMAKE_SOURCE_DIR}/src")
     # xmr_carrier_timestamp_kat scans the Path B headers for a clock read;
     # v37_xmr_pathb_hello_kat scans them for the forbidden N-rule / reserve literals.
     target_compile_definitions(xmr_carrier_timestamp_kat PRIVATE
@@ -177,4 +172,9 @@ if (BUILD_TESTING)
     set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
     # v37_xmr_pathb_node_join_kat joins chains of 4,700+ carriers through PathbNode.
     set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES TIMEOUT 3000)
+    # v37_xmr_pathb_node_kat runs the relay node: its kept frames' codecs (the relay wire header, which reads
+    # xmr_receipt.hpp by its bare name) and its threads.
+    target_include_directories(v37_xmr_pathb_node_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
+    find_package(Threads REQUIRED)
+    target_link_libraries(v37_xmr_pathb_node_kat PRIVATE Threads::Threads)
 endif()

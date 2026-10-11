@@ -108,7 +108,8 @@
 
 #include <c2pool/v37/v37_drops_wiring.hpp>   // DropsWiring, TipBin, EnrollOutcome, kDropsWiringArmed
 #include <c2pool/v37/w4_settlement.hpp>      // settle::WorkPrice, work_price_at
-#include <c2pool/v37/xmr/xmr_node_config.hpp>  // kXmrDropsFloorShift
+#include <c2pool/v37/xmr/xmr_lane_constants.hpp>  // kXmrDropsLz, kXmrDropsFloorShift
+#include <c2pool/v37/xmr/xmr_node_config.hpp>  // kXmrDropsWorkLz
 #include <c2pool/v37/xmr/xmr_enrol_mode.hpp>   // EnrolMode, enrol_mode_tag (DROPS-AUTO-ENROL)
 
 namespace c2pool::v37n::xmr::drops {
@@ -118,8 +119,8 @@ using ::v37::bytes32;
 // The fixed leading-zero geometry every XMR raindrop and share-count row is
 // expressed in. 32 bits of head-room keeps the normalisation exact for every
 // share_diff < 2^32 (a product never saturates) and the estimator's h_T far
-// from both ends of the u256 range.
-inline constexpr unsigned kXmrDropsLz = 32;
+// from both ends of the u256 range. Defined in xmr_lane_constants.hpp.
+using ::c2pool::v37n::xmr::kXmrDropsLz;
 static_assert(kXmrDropsLz == ::c2pool::v37n::xmr::kXmrDropsWorkLz, "the window rule reads the same work unit");
 
 // A raindrop must still be real work: at least share_diff / kDropsFloorDiv

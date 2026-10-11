@@ -29,17 +29,32 @@
 #include <sharechain/v37/v37_lane.hpp>       // ::v37::LaneParams
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
-#include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
 #include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
 #include "impl/xmr/settle/xmr_drain_rule.hpp"   // THE DRAIN RULE: drain_rule_refusal
-#include "xmr_lane_constants.hpp"            // kXmrDropsFloorShift, kXmrTargetIntervalS
+#include "xmr_lane_constants.hpp"            // kXmrDropsFloorShift, kXmrTargetIntervalS, kXmrCreditModeCount
 
 namespace c2pool::v37n::xmr {
 
-// kXmrDropsFloorShift (k) and kXmrTargetIntervalS (T): xmr_lane_constants.hpp.
+// kXmrDropsFloorShift (k), kXmrTargetIntervalS (T) and kXmrCreditModeCount: xmr_lane_constants.hpp.
 // DROPS WINDOW (A4b): log2 of one share's work in the estimator unit (== drops::kXmrDropsLz).
 inline constexpr unsigned kXmrDropsWorkLz = 32;
-inline constexpr std::uint32_t kXmrCreditModeCount = 2;
+
+// The same-height tie-break of --same-height-tiebreak: prefer-own (default) |
+// first-seen. The native backend's fork tie reads it.
+enum class SameHeightTieBreak : std::uint8_t { FirstSeen = 0, PreferOwn = 1 };
+
+inline const char* to_string(SameHeightTieBreak t) noexcept {
+    return t == SameHeightTieBreak::PreferOwn ? "prefer-own" : "first-seen";
+}
+
+// The CLI spelling. Returns false (and leaves `out` alone) on anything else.
+inline bool parse_tie_break(const std::string& s, SameHeightTieBreak& out) noexcept {
+    if (s == "prefer-own" || s == "prefer_own" || s == "own") { out = SameHeightTieBreak::PreferOwn; return true; }
+    if (s == "first-seen" || s == "first_seen" || s == "firstseen") { out = SameHeightTieBreak::FirstSeen; return true; }
+    return false;
+}
+
+struct SameHeightPolicy;  // xmr_same_height_race.hpp
 
 // DUST DECAY, in MONERO HEIGHTS (audit A9). The decay clock is the FINALIZE
 // bin_height, a Monero height, so its constants are named as heights here and
@@ -150,6 +165,12 @@ inline const char* to_string(ArmOrderMode m) {
     return m == ArmOrderMode::P2PFirst ? "p2p-first" : "daemon-first";
 }
 
+// A flag given on the command line and its value ("" for a switch).
+struct GivenFlag {
+    std::string name;
+    std::string value;
+};
+
 inline const char* to_string(CoinbaseMode m) {
     switch (m) {
         case CoinbaseMode::MonerodTemplate: return "monerod-template (option A)";
@@ -240,14 +261,8 @@ struct XmrNodeConfig {
 
     // The policy as the accounting layer consumes it -- assembled HERE so the
     // D_conf coupling is structural rather than a convention every call site
-    // has to remember.
-    SameHeightPolicy same_height_policy() const {
-        SameHeightPolicy p;
-        p.tie_break    = same_height_tiebreak;
-        p.d_conf       = d_conf;
-        p.max_renotify = same_height_renotify;
-        return p;
-    }
+    // has to remember. Defined in xmr_same_height_race.hpp.
+    SameHeightPolicy same_height_policy() const;
 
     // --- stratum front-end (X5) --------------------------------------------
     std::string     stratum_bind_host = "127.0.0.1";
@@ -507,7 +522,8 @@ struct XmrNodeConfig {
     //       cohort and there is no cohort, so without this the template arm's
     //       readiness gate never opens;
     //   (3) a found block that reached no peer but that our OWN chain index
-    //       accepted is booked as found (P2pBlockPublisher::enable_solo_own_index).
+    //       accepted is counted as landed (Path B books nothing)
+    //       (P2pBlockPublisher::enable_solo_own_index).
     //
     // WHAT IT COSTS, stated rather than hidden: a solo find is attested by our
     // own index and by nothing else. That is the correct and only available
@@ -562,6 +578,18 @@ struct XmrNodeConfig {
     // the register-value provenance and the restore-on-exit contract.
     bool            mine_msr = false;
 
+    // --- Path B ---------------------------------------------------------------
+    // --follow-only
+    bool            follow_only = false;
+    // --relay-listen HOST:PORT
+    std::string     relay_listen;
+    // --relay-peer HOST:PORT (repeatable)
+    std::vector<std::string> relay_peers;
+    // --native-txpool-warm-timeout-ms (0 = no warm gate)
+    std::uint64_t   native_txpool_warm_timeout_ms = 30'000;
+    // Every flag given on the command line, in order.
+    std::vector<GivenFlag> given_flags;
+
     // Resolve the on-disk settlement-store directory (settle_db_path override or
     // config_path()/<net>/v37_settle_db). Declared here, defined in xmr_node.hpp
     // to keep this header free of <filesystem>/core includes for cheap inclusion.
@@ -582,7 +610,7 @@ struct XmrNodeConfig {
 // describing it.
 inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     if (c.arm_order != ArmOrderMode::P2PFirst) return {};
-    if (c.coinbase != CoinbaseMode::V37Settlement)
+    if (!c.follow_only && c.coinbase != CoinbaseMode::V37Settlement)
         return "--arm-order p2p-first requires --coinbase v37: option A's block IS monerod's "
                "get_block_template, so a daemonless find of it is a contradiction";
     if (c.template_source != TemplateSourceMode::Native)
@@ -728,6 +756,8 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
     if (c.native_use_seeds)
         return "--native-solo builds a private chain of its own with no network to relay to, so "
                "--native-seeds (bootstrap from the network's seed nodes) contradicts it: pick one";
+    if (!c.relay_listen.empty()) return "--native-solo takes no --relay-listen";
+    if (!c.relay_peers.empty()) return "--native-solo takes no --relay-peer";
     return {};
 }
 

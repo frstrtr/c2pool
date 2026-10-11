@@ -64,7 +64,7 @@
 // about to award us. Refusing to decide, while nominating ours and pushing it,
 // is the only posture that is both honest and self-interested.
 //
-// SCOPE FENCE: consumer tree, header-only, STL-only. No consensus digest is
+// SCOPE FENCE: consumer tree, header-only, STL and xmr_node_config.hpp only. No consensus digest is
 // defined or altered here; nothing under src/sharechain/ is touched. This module
 // SEQUENCES and AUDITS calls that the merged OwedLedger and the F1 finalize
 // driver already own -- it never mutates a ledger itself.
@@ -79,30 +79,9 @@
 #include <utility>
 #include <vector>
 
+#include "xmr_node_config.hpp"  // SameHeightTieBreak, to_string, parse_tie_break, XmrNodeConfig
+
 namespace c2pool::v37n::xmr {
-
-// ---------------------------------------------------------------------------
-// The policy knob. A flag and not a constant because a parity run against
-// monerod wants the bias OFF -- first-seen is the behaviour being compared --
-// and because an operator who disagrees with the bias should be able to say so
-// without running a different binary.
-//
-// The SAME value drives the native fork choice's D-14 tie-break, so "what we
-// build on" and "what we nominate" can never disagree with each other.
-// ---------------------------------------------------------------------------
-enum class SameHeightTieBreak : std::uint8_t { FirstSeen = 0, PreferOwn = 1 };
-
-inline const char* to_string(SameHeightTieBreak t) noexcept {
-    return t == SameHeightTieBreak::PreferOwn ? "prefer-own" : "first-seen";
-}
-
-// Parse the CLI spelling. Returns false (and leaves `out` alone) on anything
-// else, so the daemon can refuse rather than silently pick a side.
-inline bool parse_tie_break(const std::string& s, SameHeightTieBreak& out) noexcept {
-    if (s == "prefer-own" || s == "prefer_own" || s == "own") { out = SameHeightTieBreak::PreferOwn; return true; }
-    if (s == "first-seen" || s == "first_seen" || s == "firstseen") { out = SameHeightTieBreak::FirstSeen; return true; }
-    return false;
-}
 
 struct SameHeightPolicy {
     // The lever (1)+(3). Never reaches decide().
@@ -125,6 +104,15 @@ struct SameHeightPolicy {
     static constexpr bool credit_requires_burial = true;
     static constexpr bool orphan_credit_allowed  = false;
 };
+
+// XmrNodeConfig::same_height_policy() (declared in xmr_node_config.hpp).
+inline SameHeightPolicy XmrNodeConfig::same_height_policy() const {
+    SameHeightPolicy p;
+    p.tie_break    = same_height_tiebreak;
+    p.d_conf       = d_conf;
+    p.max_renotify = same_height_renotify;
+    return p;
+}
 
 // ---------------------------------------------------------------------------
 // The decision table, as an enum. Every row is reachable and every row is

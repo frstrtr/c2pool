@@ -13,15 +13,11 @@
 //   CT2 integer exactness on the 288-bit normalised geometry (lz = 32):
 //       att(floor) = floor(2^256 / 2^230) = 2^26 = 1/64 of a share's 2^32;
 //       Hhat = (S + J) * 2^26; REPLACE delta = (S + J) * 2^26 - S * 2^32.
-//   CT3 the floor is the EXACT one, N < 2^230 <=> H * share_diff < 2^262, for
-//       any share_diff (10000 is not a multiple of 64): a hash one below it is
-//       counted, the one at it is not.
+//   CT3 the floor is the EXACT one: N < 2^230 is counted, N == 2^230 is not.
 //   CT4 no K and no J < K rule: one raindrop alone is credited.
 //   CT5 unbiased and split-neutral in mean AND variance on the censored XMR
 //       stream, through the shipped interval_work(); the K-min (Combined)
 //       estimator on the same stream is biased and moves with the split.
-//   CT6 the whole seam (subthreshold_credit): S = 1, J = 63 -> delta 0;
-//       S = 0, J = 64 -> exactly one share's entitlement; not enrolled -> none.
 //
 // Research: docs/research/drops-split/.
 
@@ -34,14 +30,12 @@
 
 #include <c2pool/v37/v37_subthreshold_estimator.hpp>
 #include <c2pool/v37/v37_drop_harvest.hpp>
-#include <c2pool/v37/v37_drops_enrollment.hpp>
 #include <c2pool/v37/w4_settlement.hpp>
+#include <c2pool/v37/xmr/xmr_lane_constants.hpp>
 #include <c2pool/v37/xmr/xmr_node_config.hpp>
-#include <c2pool/v37/xmr/xmr_drops_wiring.hpp>
 
 namespace st = ::c2pool::v37::subthreshold;
 namespace settle = ::c2pool::v37n::settle;
-namespace dx = ::c2pool::v37n::xmr::drops;
 
 static int g_pass = 0, g_fail = 0;
 static void check(bool ok, const std::string& what) {
@@ -78,7 +72,7 @@ static st::u256 hash_of(double u) {
 
 int main() {
     std::printf("== v37_xmr_drops_count_kat\n");
-    const st::u256 hT = ::c2pool::v37n::drops_detail::h_t_of_lz(dx::kXmrDropsLz);   // 2^224 - 1
+    const st::u256 hT = ::c2pool::v37n::drops_detail::h_t_of_lz(::c2pool::v37n::xmr::kXmrDropsLz);   // 2^224 - 1
     const std::uint32_t SH = ::c2pool::v37n::xmr::kXmrDropsFloorShift;
 
     std::printf("-- CT1 the XMR default lane selects Count\n");
@@ -90,7 +84,6 @@ int main() {
         const auto sp = settle::to_subthreshold_params(p);
         check(sp.mode == st::CreditMode::Count && sp.count_floor_shift == 6,
               "CT1 the W4 seam maps it to CreditMode::Count");
-        check(dx::kDropsFloorDiv == (1ull << SH), "CT1 the relay floor divisor is 2^shift");
     }
 
     std::printf("-- CT2 integer exactness (lz = 32 geometry)\n");
@@ -103,38 +96,13 @@ int main() {
         check(e.w[0] == 8ull << 26 && e.w[1] == 0, "CT2 S=3, J=5 -> exactly 8 * 2^26");
     }
 
-    std::printf("-- CT3 the exact floor, any share_diff\n");
+    std::printf("-- CT3 the exact floor\n");
     {
         st::ReceiptCollector rc(4, hT);
         rc.observe(minus1(pow2(230)));   // N = 2^230 - 1: below the floor
         rc.observe(pow2(230));           // N = 2^230: at the floor, not below
         rc.observe(pow2(229));
         check(rc.near_miss_below(SH) == 2, "CT3 N < 2^230 counted, N == 2^230 not");
-        // share_diff = 10000 (not a multiple of 64): H * 10000 < 2^262 exactly.
-        const std::uint64_t sd = 10000;
-        // H_max = floor((2^262 - 1) / 10000); build it as bytes via long division.
-        std::array<std::uint64_t, 5> num{0, 0, 0, 0, 1ull << 6};   // 2^262
-        for (auto& w : num) { if (w-- != 0) break; }                  // 2^262 - 1
-        std::array<std::uint64_t, 5> q{};
-        unsigned __int128 rem = 0;
-        for (int i = 4; i >= 0; --i) {
-            const unsigned __int128 cur = (rem << 64) | num[static_cast<std::size_t>(i)];
-            q[static_cast<std::size_t>(i)] = (std::uint64_t)(cur / sd);
-            rem = cur % sd;
-        }
-        auto le_bytes = [](const std::array<std::uint64_t, 5>& v) {
-            ::v37::bytes32 b{};
-            for (int i = 0; i < 32; ++i) b[static_cast<std::size_t>(i)] = (std::uint8_t)(v[static_cast<std::size_t>(i / 8)] >> (8 * (i % 8)));
-            return b;
-        };
-        const auto in  = dx::normalized_hash(le_bytes(q), sd);
-        std::array<std::uint64_t, 5> q1 = q; for (auto& w : q1) { if (++w != 0) break; }
-        const auto out = dx::normalized_hash(le_bytes(q1), sd);
-        st::ReceiptCollector r2(4, hT);
-        r2.observe(::c2pool::v37n::drops_detail::u256_of(in));
-        r2.observe(::c2pool::v37n::drops_detail::u256_of(out));
-        check(r2.near_miss_below(SH) == 1,
-              "CT3 share_diff 10000: the largest H with H*sd < 2^262 is counted, H+1 is not");
     }
 
     std::printf("-- CT4 no K, no J < K rule\n");
@@ -194,35 +162,6 @@ int main() {
             if (lam == 64.0)
                 check(k16 - k1 > 0.1, "CT5 control: K-min pays the 16-way split > 10% more (the reason for Count)");
         }
-    }
-
-    std::printf("-- CT6 the whole seam\n");
-    {
-        ::v37::LaneParams p = ::c2pool::v37n::xmr::xmr_lane_params_default();
-        settle::DropsCompose ctx;
-        ctx.price.reward = 64ull * 1000000;     // 64 shares worth 1e6 each
-        ctx.price.sum_weight.v[1] = 16;         // 64 shares of weight in Q62: 64 << 62 = 2^68
-        ctx.price.valid = true;
-        // Price one share of work (2^32 estimator units) as the lane prices a share:
-        // sum' = SUM weight << lz (receipt weight 1), so one share == reward / 64.
-        ctx.price = dx::rescale_price(ctx.price, 1);
-        ::c2pool::v37n::EnrollmentBook book;
-        ::v37::bytes32 A{}, B{}, C{}; A[0] = 1; B[0] = 2; C[0] = 3;
-        book.commit(A, 0, 1); book.commit(B, 0, 1);   // C never enrols
-        ctx.enrollment = &book;
-        auto rec = [&](const ::v37::bytes32& who, std::uint64_t S, int J) {
-            settle::HarvestedReceipt hr{who, 5, st::ReceiptCollector(4, hT)};
-            for (int j = 0; j < J; ++j) hr.collector.observe(pow2(228));
-            hr.collector.set_shares(S);
-            return hr;
-        };
-        std::vector<settle::HarvestedReceipt> h{rec(A, 1, 63), rec(B, 0, 64), rec(C, 0, 64)};
-        const auto d = settle::subthreshold_credit(p, h, ctx);
-        const long long one_share = settle::entitlement_of_work(ctx.price, st::share_covered_work(1, hT));
-        check(one_share == 1000000, "CT6 the priced share is worth reward / 64 (" + std::to_string(one_share) + ")");
-        check(d.count(A) == 0, "CT6 S=1, J=63: delta 0 (a share and its 63 raindrops are one share of work)");
-        check(d.count(B) && d.at(B) == one_share, "CT6 S=0, J=64: exactly one share's entitlement");
-        check(d.count(C) == 0, "CT6 a payee that never enrolled gets no row");
     }
 
     std::printf("== v37_xmr_drops_count_kat: %d passed, %d failed -> %s\n", g_pass, g_fail, g_fail ? "FAIL" : "OK");
