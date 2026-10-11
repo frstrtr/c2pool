@@ -8,6 +8,8 @@ name: TLA model check
 # push and PR, so it adds zero load to any coin lane.
 
 on:
+  # additive: callable by ci-required.yml aggregator (no push/PR behaviour change)
+  workflow_call:
   push:
     branches: [master]
     paths:
