@@ -11,7 +11,7 @@
 // address bans, the inbound limits (in total and per address) and the bounded
 // connect of a discovery dial.
 //
-// Header-only. Not included by any running component.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

@@ -78,7 +78,7 @@
 //                     and records below the floors dropped, the headers below
 //                     the bodies kept as prefix headers; one store batch
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -151,6 +151,7 @@ struct PathbNodeConfig {
     bool penalty_fill = false;              // --pathb-penalty-fill
     bool vote_no = false;                   // --vote no
     std::uint32_t record_chain = 0;         // the store's record chain id
+    std::size_t key_cache_bytes = kKeyCacheBytesDefault;  // P-36 (--pathb-key-cache-mb): the node's own key cache
 };
 
 struct PathbNodeIo {
@@ -476,6 +477,15 @@ public:
     const PathbNodeConfig& config() const noexcept { return cfg_; }
     bool poisoned() const noexcept { return poisoned_; }
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
+    // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals.
+    struct SwitchCounts {
+        std::uint64_t switches = 0;
+        std::uint64_t last_repended = 0;
+        std::uint64_t last_lost = 0;
+        std::uint64_t repended = 0;
+        std::uint64_t lost = 0;
+    };
+    const SwitchCounts& switch_counts() const noexcept { return switches_; }
     std::uint64_t best_changes() const noexcept { return generation_; }
     StoreFaults& faults() noexcept { return faults_; }
     WindowCache& windows() noexcept { return *windows_; }
@@ -2005,7 +2015,7 @@ private:
         own_bodies_ = CarrierBodies{};
         own_headers_ = HeaderIndex{};
         own_windows_ = WindowCache{};
-        own_keys_ = KeyCache{};
+        own_keys_ = KeyCache{cfg_.key_cache_bytes};
         own_refs_.clear();
         own_prefix_.clear();
         pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
@@ -2251,6 +2261,13 @@ private:
             }
             case WriteOutcome::SwitchToCaller: {
                 const SwitchResult sr = switch_to_best(peer);
+                if (!sr.joiner && !sr.internal) {
+                    ++switches_.switches;
+                    switches_.last_repended = sr.repended;
+                    switches_.last_lost = sr.lost;
+                    switches_.repended += sr.repended;
+                    switches_.lost += sr.lost;
+                }
                 out.action = sr.joiner ? NodeAction::JoinerPath
                                        : (sr.internal ? NodeAction::NodeInternal : NodeAction::Switched);
                 out.repended = sr.repended;
@@ -2424,7 +2441,8 @@ private:
     CarrierBodies own_bodies_;
     HeaderIndex own_headers_;
     WindowCache own_windows_;
-    KeyCache own_keys_;
+    KeyCache own_keys_{cfg_.key_cache_bytes};
+    SwitchCounts switches_;
     std::map<Hash32, XmrKeyRef> own_refs_;
     std::map<std::uint64_t, CarrierHeader> own_prefix_;  // the headers below the tree's root (joined, pruned)
     CarrierTree* tree_ = nullptr;

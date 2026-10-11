@@ -339,6 +339,9 @@ struct NativeNodeConfig {
     // pool is warm -- the first txpool-complement (2010) answer was admitted --
     // or this many ms passed, whichever comes first. 0 = no warm gate.
     std::uint64_t            txpool_warm_timeout_ms = 30'000;
+    // A row sink on the chain index (ChainIndex::subscribe_rows), registered
+    // before the boot so the seeded and restored rows reach it too. Empty: none.
+    ChainIndex::RowSink      row_sink;
     std::size_t              verify_queue   = 4096;
     std::size_t              txpool_queue   = 2048;
 
@@ -467,7 +470,9 @@ public:
           txpool_(make_txpool_config_()),
           tx_sink_(pool_loop_, txpool_),
           native_src_(index_, txpool_, make_template_policy_(), &txpool_),
-          tick_(io_) {}
+          tick_(io_) {
+        if (cfg_.row_sink) index_.subscribe_rows(cfg_.row_sink);
+    }
 
     NativeNode(const NativeNode&)            = delete;
     NativeNode& operator=(const NativeNode&) = delete;

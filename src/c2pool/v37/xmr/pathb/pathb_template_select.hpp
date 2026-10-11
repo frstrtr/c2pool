@@ -15,7 +15,7 @@
 //     with every amount at R_up = B + F_all; select_no_penalty, or
 //     select_penalty_fill when penalty_fill (--pathb-penalty-fill).
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

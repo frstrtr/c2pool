@@ -20,7 +20,7 @@
 // failure takes the joiner path), which the caller runs.
 // The Path B policy flags not named by their own modules.
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

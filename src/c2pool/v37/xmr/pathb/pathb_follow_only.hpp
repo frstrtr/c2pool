@@ -19,7 +19,7 @@
 // The given-flag queries the mode refusals share (flag_given, the stratum,
 // mining and relay families).
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

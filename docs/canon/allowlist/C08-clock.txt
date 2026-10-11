@@ -14,7 +14,7 @@
 #
 # Reviewed 2026-10-04 at frstrtr/c2pool master 65b90571a.
 
-src/c2pool/v37/main_v37_xmr.cpp 19 status and web pacing, web display times, the test-only suspend knob and credit feed lag knob, HOLD duration metrics, FB_GETWON ask pacing, wire cache prune pacing, inject pump pacing
+src/c2pool/v37/main_v37_xmr.cpp 3 follow-only uptime (log), the template header timestamp (unix seconds; Monero checks it) and found-block display times
 src/c2pool/v37/xmr/xmr_live_submit.hpp 3 submit_block round-trip latency and event timestamps
 src/c2pool/v37/xmr/xmr_live_transport.hpp 2 monerod RPC request deadline (monotonic)
 src/c2pool/v37/xmr/xmr_native_template_backend.hpp 2 deadline while waiting for a template (liveness)

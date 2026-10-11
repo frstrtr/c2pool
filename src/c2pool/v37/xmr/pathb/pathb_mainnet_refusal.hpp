@@ -18,7 +18,7 @@
 //                       4 solo_refusal
 //                       5 arm_order_refusal
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
