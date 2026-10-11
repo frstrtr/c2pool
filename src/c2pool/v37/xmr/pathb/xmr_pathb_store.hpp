@@ -11,7 +11,7 @@
 // WriteBatch; point reads verify checksums (scans do not; the load's anchors
 // cover them); a read error is never "absent"; a scan fails closed.
 //   <data>/<network>/pathb_db/<pool_id hex>-<G hex>   (store_dir_name)
-// Not linked into any running target.
+// Linked into c2pool-v37-xmr.
 // ---------------------------------------------------------------------------
 #pragma once
 

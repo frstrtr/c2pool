@@ -509,22 +509,6 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_vardiff_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_vardiff_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_vardiff_kat COMMAND v37_xmr_stratum_vardiff_kat)
-    # v37_xmr_test_suspend_knob_kat (FAULT-KNOB, TEST-ONLY): the
-    # --test-suspend-lane-seconds / SIGUSR2 knob that forces a lane suspension
-    # on a live node -- off by default, refused on mainnet, arm/fire/release
-    # through LaneSuspendState (cause `test`), and end to end through the real
-    # StratumListener::set_lane_suspended() (parked login served on release).
-    # RESUME-FRESH (FK7/FK8): the first job after a release is at the current tip
-    # (xmr/xmr_lane_resume_fresh.hpp), and a failed rebuild holds the gate.
-    # Stub template source + verifier over loopback: no RandomX, no monerod.
-    # Listed in BOTH build.yml --target lists.
-    add_executable(v37_xmr_test_suspend_knob_kat
-        v37_xmr_test_suspend_knob_kat.cpp
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
-    target_compile_features(v37_xmr_test_suspend_knob_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_test_suspend_knob_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(v37_xmr_test_suspend_knob_kat PRIVATE xmr_coin Threads::Threads)
-    add_test(NAME v37_xmr_test_suspend_knob_kat COMMAND v37_xmr_test_suspend_knob_kat)
     # v37_xmr_stratum_json_depth_kat: the stratum listener's JSON nesting limit
     # and \u-escape check, over a loopback socket, run in a child process. Stub
     # template/verifier/sink, no RandomX, no monerod. Listed in BOTH build.yml

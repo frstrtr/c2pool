@@ -17,7 +17,7 @@
 //                       per T; s = --stratum-min-diff-shift (default 0,
 //                       at most 62)
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
