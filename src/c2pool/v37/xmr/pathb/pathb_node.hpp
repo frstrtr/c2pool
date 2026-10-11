@@ -61,6 +61,10 @@
 //                     load failure (LoadFailed) keeps the failed store
 //                     untouched until an adoption replaces it; a joined node
 //                     serves its claimed prefix headers
+//   relay glue        offer_empty_store_tip (an empty store whose catch-up
+//                     from position 0 got no header: the peer's HELLO tip a
+//                     join candidate), take_parked (a parked frame run again),
+//                     set_join_step (the join worker's step callback)
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -577,6 +581,39 @@ public:
         return c;
     }
     bool has_pathb_peer() const noexcept { return !peers_.empty(); }
+
+    // ---- the relay node's glue (pathb_relay_node.hpp) ----
+    // An empty store at position 0: the caller's headers-first catch-up from position 0 to
+    // `peer` got a reply with no header (n = 0: the peer serves nothing after position 0). The peer's HELLO tip becomes
+    // a join candidate with that peer as its server when this node holds position 0 only (no load failure, no adopted
+    // state, not poisoned) and the tip is not position 0, not held here and its claimed work wins fork choice against
+    // position 0. True: the pair was queued.
+    bool offer_empty_store_tip(std::uint64_t peer) {
+        if (poisoned_ || load_failed_ || joined_ != nullptr || tree_->best().pos != 0) return false;
+        const auto it = peers_.find(peer);
+        if (it == peers_.end()) return false;
+        const HelloTail& t = it->second;
+        const CarrierNode& b = tree_->best();
+        if (t.best_tip == cfg_.identity.pool_id || tree_->find(t.best_tip) != nullptr) return false;
+        if (!fork_choice_prefers(ChainTip{t.best_cum_work, t.best_tip}, ChainTip{b.cum_work, b.id})) return false;
+        const std::size_t before = joiner_->queue().size();
+        offer(t.best_tip, peer, t.best_cum_work);
+        return joiner_->queue().size() > before;
+    }
+    // A frame this node parked, by its digest, taken out of the deferred store to be run again; nullopt: not held.
+    std::optional<ParkedFrame> take_parked(const Hash32& digest) {
+        if (poisoned_) return std::nullopt;
+        return deferred_.take(*tree_, digest);
+    }
+    // Called between the replay steps of a join attempt (on the join worker).
+    void set_join_step(std::function<void()> f) {
+        if (!f) {
+            joiner_->set_on_step({});
+            return;
+        }
+        joiner_->set_on_step([f = std::move(f)](JoinedState&, std::uint64_t) { f(); });
+    }
+
     void disconnect(std::uint64_t peer) {
         peers_.erase(peer);
         headers_->release_peer(peer);

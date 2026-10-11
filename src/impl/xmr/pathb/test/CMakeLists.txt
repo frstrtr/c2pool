@@ -85,7 +85,9 @@
 #   v37_xmr_pathb_node_join_kat      PathbNode with the joiner wired: joins over the family-C
 #                                    frames, adoption, the deep switch, the re-ask
 #   v37_xmr_pathb_node_kat           PathbNode: three in-process nodes, relay, the template and
-#                                    the job, re-pend, restart, HOLD, the timers
+#                                    the job, re-pend, restart, HOLD, the timers; the relay node
+#                                    (pathb_relay_node.hpp): tokens per frame, a join over the
+#                                    relay, two relay nodes over loopback TCP
 #
 # DRIFT-GUARD: this tree is outside the glob of
 # tools/ci/check_test_target_allowlist.py, so every target below is listed by
@@ -177,4 +179,9 @@ if (BUILD_TESTING)
     set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
     # v37_xmr_pathb_node_join_kat joins chains of 4,700+ carriers through PathbNode.
     set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES TIMEOUT 3000)
+    # v37_xmr_pathb_node_kat runs the relay node: its kept frames' codecs (the relay wire header, which reads
+    # xmr_receipt.hpp by its bare name) and its threads.
+    target_include_directories(v37_xmr_pathb_node_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
+    find_package(Threads REQUIRED)
+    target_link_libraries(v37_xmr_pathb_node_kat PRIVATE Threads::Threads)
 endif()

@@ -76,14 +76,48 @@
 //                non-service; the FC_BUCKETS window (FIX-1);
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
-//                P-53 + 1 s ends it and the late frame DROPs, 0 tokens.
+//                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
+//   relaytok     the relay node (pathb_relay_node.hpp) over links delivered
+//                by hand: HELLO both ways and the catch-up headers first from
+//                position 0; per opcode 0x51 / 0x52 / 0x54 and 0x53 / 0x55
+//                from an asked server: a frame that does not decode strikes
+//                the sender once, a frame above its buffer is a DROP with no
+//                token; FC_BUCKETS from a peer with no open request: DROP; the
+//                attempt's server of a join: an undecodable FC_HEADERS ends the
+//                attempt NotServed with 1 strike, one above the buffer NotServed
+//                with no token; the next attempt completes over the relay;
+//   relaym4      an empty store at position 0 whose catch-up from position 0
+//                gets a reply with no header queues the peer's HELLO tip for
+//                the joiner; the attempt completes over the relay;
+//   relaysmoke   two relay nodes over loopback TCP (pathb_relay_links.hpp),
+//                each with its own PathbNode: HELLO both ways, the catch-up,
+//                a carrier mined by one placed by the other; a HELLO of frame
+//                version 0x01 refused and its link closed, no strike, no ban.
 // ---------------------------------------------------------------------------
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
+#include "c2pool/v37/xmr/pathb/pathb_relay_links.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_startup.hpp"
 #include "pathb_kat_node.hpp"
 #include "pathb_ratchet_sim.hpp"
@@ -1612,6 +1646,359 @@ void buckets() {
     check(all && expired2 == 0 && h[a].open_assemblies() == 0,
           "buckets: " + std::to_string(fd.size()) + " frames P-53 - 1 s apart: no expiry, assembled whole");
 }
+
+// ---------------------------------------------------------------------------
+// The relay node in manual mode over links delivered by hand (no socket): node i is peer i + 1 at every other node.
+struct FakeWire;
+struct FakeLinks final : pb::RelayLinks {
+    FakeWire* wire = nullptr;
+    std::size_t self = 0;
+    FrameFn frame;
+    FrameFn control;
+    EventFn event;
+    std::set<std::uint64_t> live;
+    void bind(FrameFn f, FrameFn c, EventFn e) override {
+        frame = std::move(f);
+        control = std::move(c);
+        event = std::move(e);
+    }
+    void configure(const pb::PathbRelayOptions&) override {}
+    bool listen(const std::string&, std::uint16_t) override { return true; }
+    std::uint16_t listen_port() const override { return 0; }
+    std::uint64_t dial(const std::string&, std::uint16_t) override { return 0; }
+    bool send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) override;
+    void disconnect(std::uint64_t p) override;
+    void ban_key(std::uint64_t, std::uint32_t) override {}
+    bool is_banned_key(std::uint64_t) override { return false; }
+    std::uint64_t addr_key(std::uint64_t) const override { return 0; }
+    bool is_inbound(std::uint64_t) const override { return false; }
+    bool has_peer(std::uint64_t p) const override { return live.count(p) != 0; }
+    std::vector<std::uint64_t> peer_ids() const override { return {live.begin(), live.end()}; }
+    std::size_t conns_from(std::uint64_t) const override { return 0; }
+    std::string remote_ip(std::uint64_t) const override { return {}; }
+    std::size_t n_peers() const override { return live.size(); }
+    void stop() override {}
+};
+
+struct FakeWire {
+    struct Msg {
+        std::size_t from = 0;
+        std::size_t to = 0;
+        std::vector<std::uint8_t> f;
+    };
+    std::deque<Msg> q;
+    std::vector<FakeLinks*> links;
+    std::vector<pb::PathbRelayNode*> relays;
+    std::function<void(Msg&)> edit;  // edits a frame in flight
+    // Delivers one frame, then runs what every relay has queued; false: nothing to deliver.
+    bool step() {
+        if (q.empty()) return false;
+        Msg m = std::move(q.front());
+        q.pop_front();
+        if (edit) edit(m);
+        if (!m.f.empty() && links[m.to]->live.count(m.from + 1) != 0) links[m.to]->frame(m.from + 1, m.f);
+        for (pb::PathbRelayNode* r : relays) r->pump();
+        return true;
+    }
+    void run() {
+        for (pb::PathbRelayNode* r : relays) r->pump();
+        while (step()) {
+        }
+    }
+    void connect(std::size_t a, std::size_t b) {
+        links[a]->live.insert(b + 1);
+        links[b]->live.insert(a + 1);
+        links[a]->event(b + 1, true);
+        links[b]->event(a + 1, true);
+    }
+};
+
+bool FakeLinks::send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+    if (live.count(p) == 0) return false;
+    wire->q.push_back(FakeWire::Msg{self, static_cast<std::size_t>(p - 1), f});
+    return true;
+}
+void FakeLinks::disconnect(std::uint64_t p) {
+    if (live.erase(p) == 0) return;
+    FakeLinks& o = *wire->links[p - 1];
+    o.live.erase(self + 1);
+    event(p, false);
+    o.event(self + 1, false);
+}
+
+struct KatRelay {
+    std::unique_ptr<FakeLinks> links;
+    std::unique_ptr<pb::PathbRelayNode> relay;
+    std::size_t node = 0;
+};
+
+// A relay node in manual mode on the harness's clock with its own PathbNode (a load failure when `failed`).
+KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch, bool failed = false) {
+    KatRelay k;
+    k.links = std::make_unique<FakeLinks>();
+    k.links->wire = &w;
+    k.links->self = w.links.size();
+    w.links.push_back(k.links.get());
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock);
+    k.node = h.nodes.size();
+    pb::PathbNodeIo io = k.relay->bind_io(h.io(k.node));
+    if (failed) {
+        h.kvs.push_back(std::make_unique<MemoryKv>());
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(T, launch), std::move(io), h.kvs.back().get(),
+                                                          pb::PathbNode::LoadFailed{}));
+    } else {
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(T, launch), std::move(io)));
+    }
+    k.relay->attach(*h.nodes.back());
+    k.relay->set_drive([&w] { return w.step(); });
+    std::string why;
+    if (!k.relay->start(why)) throw std::runtime_error(why);
+    w.relays.push_back(k.relay.get());
+    return k;
+}
+
+std::string op_hex(std::uint8_t op) { return "0x" + hex(&op, 1); }
+
+void relaytok() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    bool mined = true;
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        const std::optional<pb::PathbJob> j = h.job(a.node, static_cast<std::size_t>(i % 5), 100 + i);
+        mined = mined && j && h[a.node].on_own_share(*j, 100 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    w.connect(0, 1);
+    w.run();
+    const pb::Hash32 tip_a = h[a.node].tree().best().id;
+    check(mined && a.relay->hello_ok(2) && b.relay->hello_ok(1) && h[b.node].tree().best().id == tip_a
+                  && h[b.node].tree().best().pos == 6 && b.relay->stats().catchup_requests >= 1
+                  && b.relay->stats().empty_store_offers == 0 && h[b.node].joiner().queue().size() == 0,
+          "relaytok: HELLO both ways; B catches up headers first from position 0 to A's tip (" +
+                  std::to_string(h[b.node].tree().best().pos) + ")");
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = 1;  // A at B
+    const auto tok = [&](const std::vector<std::uint8_t>& f) {
+        const std::uint64_t s0 = rb.strikes_of(pa), d0 = rb.stats().drops.load();
+        rb.receive(pa, f);
+        w.run();
+        return std::make_pair(rb.strikes_of(pa) - s0, rb.stats().drops.load() - d0);
+    };
+    const auto big = [](std::uint8_t op, std::uint8_t ver, std::uint64_t n) {
+        std::vector<std::uint8_t> f(n, 0x00);
+        f[0] = op;
+        f[1] = ver;
+        return f;
+    };
+    // the requests: a frame that does not decode strikes once; above the frame buffer: DROP, no token
+    const std::uint64_t fb = h[b.node].config().buffers.frame;
+    for (const std::uint8_t op : {pb::kOpFcGetCarrier, pb::kOpFcGetHeaders, pb::kOpFcGetBuckets}) {
+        const auto u = tok({op, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00});
+        const auto o = tok(big(op, 0x01, fb + 1));
+        check(u.first == 1 && u.second == 0 && o.first == 0 && o.second == 1,
+              "relaytok: " + op_hex(op) + " that does not decode: 1 strike (" + std::to_string(u.first) +
+                      "); above the frame buffer: DROP, no token (" + std::to_string(o.first) + " strikes)");
+    }
+    // FC_HEADERS from an asked server
+    const bool asked = rb.with_node([&](pb::PathbNode& n) { return n.request_headers(pa, n.tree().genesis().id, tip_a, 8, h.now); });
+    w.q.clear();  // A's own reply is not delivered
+    const auto ho = tok(big(pb::kOpFcHeaders, 0x02, h[b.node].frame_bytes_headers() + 1));
+    const auto hu = tok({pb::kOpFcHeaders, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01});
+    check(asked && ho.first == 0 && ho.second == 1 && hu.first == 1 && hu.second == 0,
+          "relaytok: 0x53 from an asked server: above the buffer DROP, no token; then one that does not decode: 1 strike (" +
+                  std::to_string(hu.first) + ")");
+    // FC_BUCKETS from an asked server; then from a peer with no open request
+    const bool askb = rb.with_node([&](pb::PathbNode& n) { return n.request_buckets(pa, tip_a, n.store().b0(), n.store().b0(), h.now); });
+    w.q.clear();
+    const auto bo = tok(big(pb::kOpFcBuckets, 0x01, h[b.node].config().bucket_policy.frame_bytes + 1));
+    const auto bu = tok({pb::kOpFcBuckets, 0x01, 0x00, 0x00, 0x00, 0x00});
+    const auto bl = tok({pb::kOpFcBuckets, 0x01, 0x00, 0x00, 0x00, 0x00});
+    check(askb && bo.first == 0 && bo.second == 1 && bu.first == 1 && bu.second == 0 && bl.first == 0 && bl.second == 1,
+          "relaytok: 0x55 from an asked server: above the buffer DROP, no token; one that does not decode: 1 strike (" +
+                  std::to_string(bu.first) + "); with no open request: DROP");
+    // opcodes the relay node does not handle: counted, no token, the link kept
+    const std::uint64_t un0 = rb.stats().unknown_opcodes.load();
+    const auto k42 = tok({0x42, 0x01, 0x00, 0x00, 0x00, 0x00});
+    const auto k41 = tok({pb::kOpFbReceipts, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01});
+    const auto k4a = tok({0x4a, 0x01});
+    check(k42.first == 0 && k41.first == 0 && k4a.first == 0 && rb.stats().unknown_opcodes - un0 == 3 && rb.hello_ok(pa),
+          "relaytok: FB_BLOCK_WON 0x42, receipts v2 (0x41 at frame version 0x01) and 0x4a: unknown, no token, the link kept");
+    check(rb.stats().bans == 0, "relaytok: no ban");
+
+    // the attempt's server of a join (a load-failed node J: A's HELLO tip is a candidate)
+    KatRelay j = kat_relay(h, w, table0(net), false, true);
+    w.connect(0, 2);
+    w.run();
+    const std::uint64_t pj = 1;  // A at J
+    check(j.relay->hello_ok(pj) && h[j.node].joiner().queue().size() == 1, "relaytok: a load-failed node queues A's HELLO tip");
+    const auto reply_from_a = [&](std::function<void(std::vector<std::uint8_t>&)> fn) {
+        w.edit = [fn](FakeWire::Msg& m) {
+            if (m.from == 0 && m.to == 2 && !m.f.empty() && m.f[0] == pb::kOpFcHeaders) fn(m.f);
+        };
+    };
+    reply_from_a([](std::vector<std::uint8_t>& f) { f = {pb::kOpFcHeaders, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; });
+    const std::optional<pb::JoinStep> s1 = j.relay->join_step();
+    w.edit = nullptr;
+    w.run();
+    check(s1 && s1->report && s1->report->end == pb::AttemptEnd::NotServed && j.relay->strikes_of(pj) == 1
+                  && j.relay->stats().join_strikes == 1,
+          "relaytok: an FC_HEADERS that does not decode from the attempt's server: NotServed, 1 strike (" +
+                  std::to_string(j.relay->strikes_of(pj)) + ")");
+    const std::uint64_t hb = h[j.node].frame_bytes_headers() + 1;
+    reply_from_a([&](std::vector<std::uint8_t>& f) { f = big(pb::kOpFcHeaders, 0x02, hb); });
+    const std::optional<pb::JoinStep> s2 = j.relay->join_step();
+    w.edit = nullptr;
+    w.run();
+    check(s2 && s2->report && s2->report->end == pb::AttemptEnd::NotServed && j.relay->strikes_of(pj) == 1,
+          "relaytok: an FC_HEADERS above the buffer from the attempt's server: DROP, no token (NotServed)");
+    const std::optional<pb::JoinStep> s3 = j.relay->join_step();
+    w.run();
+    check(s3 && s3->switched && h[j.node].tree().best().id == tip_a && j.relay->strikes_of(pj) == 1
+                  && j.relay->open_tickets() == 0,
+          "relaytok: the next attempt completes over the relay (the young chain to A's tip)" +
+                  (s3 && s3->report ? std::string(": ") + std::to_string(static_cast<int>(s3->report->end)) : std::string()));
+}
+
+// ---------------------------------------------------------------------------
+// The empty-store start: a node at position 0 whose catch-up from position 0 gets a reply with no header (a peer that
+// serves nothing after position 0) queues the peer's HELLO tip for the joiner; the attempt completes over the relay.
+void relaym4() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay e = kat_relay(h, w, table0(net), false);
+    bool mined = true;
+    for (int i = 0; i < 4; ++i) {
+        const std::optional<pb::PathbJob> j = h.job(a.node, static_cast<std::size_t>(i), 400 + i);
+        mined = mined && j && h[a.node].on_own_share(*j, 400 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    const pb::Hash32 tip_a = h[a.node].tree().best().id;
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1 && !m.f.empty() && m.f[0] == pb::kOpFcHeaders)
+            m.f = *pb::encode_fc_headers(pb::HeadersReply{0, 0, {}}, 1u << 22);
+    };
+    w.connect(0, 1);
+    w.run();
+    w.edit = nullptr;
+    check(mined && e.relay->stats().empty_store_offers == 1 && h[e.node].joiner().queue().size() == 1
+                  && h[e.node].tree().best().pos == 0 && e.relay->strikes_of(1) == 0,
+          "relaym4: an empty store at position 0 whose catch-up reply from position 0 carries no header queues the "
+          "peer's HELLO tip for the joiner, no token");
+    const std::optional<pb::JoinStep> s = e.relay->join_step();
+    w.run();
+    check(s && s->switched && h[e.node].tree().best().id == tip_a,
+          "relaym4: the attempt at that peer completes over the relay (the young chain to its tip)");
+}
+
+// ---------------------------------------------------------------------------
+// Two relay nodes over loopback TCP, each with its own PathbNode, their threads running.
+bool wait_for(const std::function<bool()>& f, int ms) {
+    for (int t = 0; t < ms; t += 10) {
+        if (f()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return f();
+}
+
+void relaysmoke() {
+    const KatNet net;
+    Harness h(net);
+    std::atomic<std::uint64_t> rx{0};
+    const auto io_of = [&](std::size_t self) {
+        pb::PathbNodeIo o = h.io(self);
+        o.verify = [&rx](const pb::HashingBlob&, std::uint64_t, const pb::Hash32&) {
+            ++rx;
+            return true;
+        };
+        return o;
+    };
+    h.tick_monero();
+    pb::CarrierLinks la, lb;
+    pb::PathbRelayOptions oa;
+    oa.listen = true;
+    oa.listen_host = "127.0.0.1";
+    oa.verify_threads = 2;
+    pb::PathbRelayNode ra(oa, la);
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net), true), ra.bind_io(io_of(0))));
+    ra.attach(*h.nodes[0]);
+    bool mined = true;
+    for (int i = 0; i < 3; ++i) {
+        const std::optional<pb::PathbJob> j = h.job(0, static_cast<std::size_t>(i), 300 + i);
+        mined = mined && j && h[0].on_own_share(*j, 300 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    std::string why;
+    const bool sa = ra.start(why);
+    pb::PathbRelayOptions ob;
+    ob.peers = {{"127.0.0.1", la.listen_port()}};
+    ob.verify_threads = 2;
+    pb::PathbRelayNode rb(ob, lb);
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net)), rb.bind_io(io_of(1))));
+    rb.attach(*h.nodes[1]);
+    const bool sb = rb.start(why);
+    check(mined && sa && sb, "relaysmoke: A listens on loopback, B dials it (" + why + ")");
+    const auto best = [](pb::PathbRelayNode& r) { return r.with_node([](pb::PathbNode& n) { return n.tree().best().id; }); };
+    const bool linked = wait_for([&] { return ra.ready_peers().size() == 1 && rb.ready_peers().size() == 1; }, 10000);
+    const pb::Hash32 tip3 = best(ra);
+    const bool caught = wait_for([&] { return best(rb) == tip3; }, 10000);
+    check(linked && ra.stats().hello_ok == 1 && rb.stats().hello_ok == 1 && caught,
+          "relaysmoke: HELLO both ways over TCP; B catches up headers first to A's tip (linked " +
+                  std::to_string(linked) + ", caught " + std::to_string(caught) + "; " + ra.describe() + " || " +
+                  rb.describe() + ")");
+    const pb::NodeAction placed4 = ra.with_node([&](pb::PathbNode& n) {
+        const std::optional<pb::PathbJob> j = h.job(0, 4, 304);
+        return j ? n.on_own_share(*j, 304, pb::Hash32{}).action : pb::NodeAction::None;
+    });
+    const pb::Hash32 tip4 = best(ra);
+    const bool flooded = wait_for([&] { return best(rb) == tip4; }, 10000);
+    check(placed4 == pb::NodeAction::Placed && tip4 != tip3 && flooded,
+          "relaysmoke: a carrier A mines is flooded over TCP and placed by B");
+    // an old node's HELLO (frame version 0x01): refused, the link closed, no strike, no ban
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(la.listen_port());
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    bool closed = false;
+    if (fd >= 0 && ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0) {
+        timeval tv{};
+        tv.tv_sec = 5;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        ::c2pool::v37n::xmr::relay::Hello old;
+        old.network = 3;
+        const std::vector<std::uint8_t> f = ::c2pool::v37n::xmr::relay::encode_hello(old);
+        std::vector<std::uint8_t> msg;
+        for (int i = 0; i < 4; ++i) msg.push_back(static_cast<std::uint8_t>(f.size() >> (8 * i)));
+        msg.insert(msg.end(), f.begin(), f.end());
+        (void)::send(fd, msg.data(), msg.size(), 0);
+        std::uint8_t buf[4096];
+        for (int i = 0; i < 64; ++i) {
+            const ssize_t k = ::recv(fd, buf, sizeof buf, 0);
+            if (k == 0) {
+                closed = true;
+                break;
+            }
+            if (k < 0) break;
+        }
+    }
+    if (fd >= 0) ::close(fd);
+    const bool refused = wait_for([&] { return ra.stats().hello_old_version == 1; }, 5000);
+    check(refused && closed && ra.stats().strikes == 0 && ra.stats().bans == 0,
+          "relaysmoke: a HELLO of frame version 0x01 refused (old=" +
+                                                 std::to_string(ra.stats().hello_old_version.load()) +
+                                                 "), its link closed, no strike, no ban");
+    rb.stop();
+    ra.stop();
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1646,5 +2033,8 @@ int main(int argc, char** argv) {
     run("boundary", boundary);
     run("timers", timers);
     run("buckets", buckets);
+    run("relaytok", relaytok);
+    run("relaym4", relaym4);
+    run("relaysmoke", relaysmoke);
     return finish("v37_xmr_pathb_node_kat");
 }
