@@ -1137,16 +1137,44 @@ private:
         return &hdr_[x - lo_pos_];
     }
 
-    // The next page below the lowest held header, down to `need_lo` at most, named to the link ahead of its use.
+    // The next page below the lowest held header, down to `need_lo` at most, named to the link ahead of its use
+    // (once: a page named already is not named again).
     void ahead_headers(std::uint64_t need_lo) {
         const std::uint64_t range = lo_pos_ > need_lo ? lo_pos_ - need_lo : 1;
-        link_.next_headers(hdr_.front().own.side.tip, std::min(header_page(), range), timeout_);
+        const std::pair<Hash32, std::uint64_t> next{hdr_.front().own.side.tip, std::min(header_page(), range)};
+        if (named_ == next) return;
+        named_ = next;
+        link_.next_headers(next.first, next.second, timeout_);
+    }
+    // What bounds' next step asks (its need_lo), from the records held, with no effect on the attempt; nullopt: the
+    // span is held, or the step ends the attempt.
+    std::optional<std::uint64_t> next_need() const {
+        if (force_young_) return lo_pos_ > 1 ? std::optional<std::uint64_t>(1) : std::nullopt;
+        const SpanResult s = span_bounds(in_.p, rep_.L, [this](std::uint64_t x) { return rec(x); }, in_.b0);
+        std::uint64_t need_lo = 1;
+        bool held = false;
+        if (s.status == SpanStatus::Ok) {
+            const std::uint64_t nrt = join_n_rt(in_.p);
+            const std::uint64_t want = s.bounds.young ? 1 : (s.bounds.x0 > nrt ? s.bounds.x0 - nrt : 1);
+            need_lo = want;
+            if (s.bounds.young) {
+                held = lo_pos_ <= want;
+            } else if (lo_pos_ <= want) {
+                const PreStart ps = pre_start(in_.p, s.bounds.x0, [this](std::uint64_t x) { return rec(x); });
+                if (ps.status == SpanStatus::Ok) held = true;
+                else if (ps.need >= lo_pos_) return std::nullopt;
+                else need_lo = ps.need;
+            }
+        }
+        if (held || lo_pos_ <= 1) return std::nullopt;
+        return need_lo;
     }
     // The next page below the lowest held header, down to `need_lo` at most.
     bool more_headers(std::uint64_t need_lo = 1) {
         const Hash32 stop = hdr_.front().own.side.tip;  // the parent of the lowest held header
         const std::uint64_t range = lo_pos_ > need_lo ? lo_pos_ - need_lo : 1;
         const std::uint64_t max = std::min(header_page(), range);
+        named_.reset();
         const ChainHeaders r = link_.headers(stop, max, timeout_);
         if (r.status == LinkStatus::Served && short_headers(r, max, range))
             return fail(AttemptEnd::NotServed, "a short FC_HEADERS reply");
@@ -1176,9 +1204,12 @@ private:
         }
         if (short_headers(r, max, rep_.L)) return fail(AttemptEnd::NotServed, "a short FC_HEADERS reply");
         if (r.first_pos == 0) return fail(AttemptEnd::NotServed, "a header at position 0");
-        // (5) on the top page runs in bounds' first step, after the next page is named (one outstanding): x0 is not
-        // known, so every held header is a candidate (a no-PoW server is caught at the top, after at most two requests)
-        return take_headers(r, std::nullopt);
+        if (!take_headers(r, std::nullopt)) return false;
+        // the next page named before the top page is checked (VER m-15; one outstanding)
+        if (const std::optional<std::uint64_t> need = next_need()) ahead_headers(*need);
+        // (5) on the top page: x0 is not known, so every held header is a candidate (a no-PoW server is caught here,
+        // before A's checks and the scope)
+        return check_span_pow(lo_pos_);
     }
 
     // 3.3a (4) / ruling 47 (E-82): the fork of L with A's best chain, scanned
@@ -1786,6 +1817,7 @@ private:
     std::uint64_t x0_ = 0;
     std::uint64_t pow_lo_ = 0;    // the lowest position (5)-checked so far (0 = none)
     bool force_young_ = false;    // the young path forced by the pair's mark (the ruling-47 fallback)
+    std::optional<std::pair<Hash32, std::uint64_t>> named_;  // the page named to the link and not yet taken
     bool scope_done_ = false;     // the fork with A's best chain met (in scope: deep)
     std::uint64_t scope_lo_ = 0;  // the lowest position the scope scan has read (0: none)
     std::uint64_t scope_floor_ = 0;  // x0(L') - N_rt once x0 is known: the scope scan reads nothing below it

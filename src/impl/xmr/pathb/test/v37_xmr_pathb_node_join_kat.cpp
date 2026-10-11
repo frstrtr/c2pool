@@ -19,6 +19,8 @@
 //              AR) reloads;
 //   scope      a joined node offered an unheld tip forking above its x1 and
 //              at or above its base: OutOfScope at the first reply (R46B-3);
+//   scopepow   a top page failing its PoW at a joined node, its fork above x1:
+//              the attempt ends at (5), the server excluded (not OutOfScope);
 //   tokens     a disconnect drops the server's pairs; an undecodable
 //              FC_HEADERS: 1 strike, NotServed; a short reply: NotServed;
 //   fetchahead requests chained from the first reply (C-10) keep a pruning
@@ -1067,6 +1069,33 @@ void below() {
     std::printf("  below: %.1f s\n", secs_since(t0));
 }
 
+// ---------------------------------------------------------------------------
+// scopepow: a joined node offered a server 5 positions ahead whose new top header fails its PoW, the fork with A above
+// x1 and at or above A's base: (5) on the top page runs before A's checks and the scope, so the attempt ends Header,
+// the server excluded with its pairs, 0 tokens (not OutOfScope).
+void scopepow() {
+    JoinNet net(900);
+    const std::uint64_t L = 4704;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok, "scopepow: joined at L");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    const std::vector<pb::Hash32> more = grow(a, 5);
+    const std::size_t s2 = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s2));
+    h.bad_pow.insert(more.back());
+    h.hello(j, s2);
+    const std::size_t q0 = h[j].joiner().queue().size();
+    const pb::JoinStep o = h[j].run_join();
+    check(q0 == 1 && o.report && o.report->end == pb::AttemptEnd::Header && o.report->strike == 0
+                  && h[j].joiner().queue().excluded(s2),
+          "scopepow: a top page failing its PoW at a joined node (fork above x1): the attempt ends at (5), the server "
+          "excluded, 0 tokens" + (o.report ? std::string(": ") + rep_desc(*o.report) : std::string()));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1078,6 +1107,7 @@ int main(int argc, char** argv) {
     run("loadfail", loadfail);
     run("young", young);
     run("scope", scope);
+    run("scopepow", scopepow);
     run("tokens", tokens);
     run("fetchahead", fetchahead);
     run("deep", deep);
