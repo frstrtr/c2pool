@@ -253,7 +253,7 @@ jobs:
                     c2pool-v37-btc v37_btc_node_smoke v37_btc_digest_drift_kat f1_finalize_kat_btc c2pool-v37-btc-dash \
                     xmr_primitives_selfcheck xmr_x2_node_kat xmr_receipt_kat xmr_torsion_kat xmr_wire_dos_check xmr_stratum_selftest xmr_provenance_gate \
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke c2pool-v37-xmr \
-                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck v37_xmr_cba_native_booking_kat v37_xmr_relay_native_feed_kat v37_xmr_minority_converge_selfcheck v37_xmr_minority_workweight_kat v37_xmr_lane_suspend_selfcheck v37_xmr_stratum_resume_kat v37_xmr_relay_repair_hold_kat v37_xmr_coldboot_refetch_kat v37_xmr_coldboot_gap_kat v37_xmr_coldboot_follow_kat v37_xmr_coldboot_evq_kat v37_xmr_coldboot_resume_kat v37_xmr_race_rebook_kat \
+                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck v37_xmr_cba_native_booking_kat v37_xmr_relay_native_feed_kat v37_xmr_minority_converge_selfcheck v37_xmr_lane_suspend_selfcheck v37_xmr_stratum_resume_kat v37_xmr_relay_repair_hold_kat v37_xmr_coldboot_refetch_kat v37_xmr_coldboot_gap_kat v37_xmr_coldboot_follow_kat v37_xmr_coldboot_evq_kat v37_xmr_race_rebook_kat \
                     xmr_randomx_verify_kat v37_xmr_o2_randomx_kat v37_xmr_rx_seed_switch_kat v37_xmr_rx_seed_race_kat v37_xmr_verify_pool_rx_kat v37_xmr_next_seed_kat xmr_cpu_miner_kat \
                     xmr_template_primitives_kat xmr_block_assembly_kat \
                     xmr_fast_mode_kat xmr_msr_boost_kat \
@@ -300,8 +300,8 @@ jobs:
                     v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
                     v37_xmr_web_dashboard_kat \
                     v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat v37_xmr_rejoin_payee_kat v37_xmr_empty_cut_finder_kat \
-                    v37_xmr_coinbase_recompute_kat v37_xmr_mainnet_rehearsal_kat v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat \
-                    v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
+                    v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat \
+                    v37_xmr_m3_arm_order_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     v37_xmr_p2p_publish_retry_kat \
                     v37_xmr_mainnet_readiness_kat \
@@ -794,7 +794,7 @@ jobs:
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \
                     c2pool-v37-btc v37_btc_node_smoke v37_btc_digest_drift_kat f1_finalize_kat_btc \
-                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck v37_xmr_cba_native_booking_kat v37_xmr_relay_native_feed_kat v37_xmr_minority_converge_selfcheck v37_xmr_minority_workweight_kat v37_xmr_lane_suspend_selfcheck v37_xmr_stratum_resume_kat v37_xmr_relay_repair_hold_kat v37_xmr_coldboot_refetch_kat v37_xmr_coldboot_gap_kat v37_xmr_coldboot_follow_kat v37_xmr_coldboot_evq_kat v37_xmr_coldboot_resume_kat v37_xmr_race_rebook_kat \
+                    v37_xmr_o2_live_submit_selfcheck v37_xmr_o2_finalize_connect_selfcheck v37_xmr_cba_native_booking_kat v37_xmr_relay_native_feed_kat v37_xmr_minority_converge_selfcheck v37_xmr_lane_suspend_selfcheck v37_xmr_stratum_resume_kat v37_xmr_relay_repair_hold_kat v37_xmr_coldboot_refetch_kat v37_xmr_coldboot_gap_kat v37_xmr_coldboot_follow_kat v37_xmr_coldboot_evq_kat v37_xmr_race_rebook_kat \
                     xmr_primitives_selfcheck xmr_x2_node_kat xmr_receipt_kat xmr_torsion_kat xmr_wire_dos_check xmr_stratum_selftest xmr_provenance_gate \
                     xmr_crypto_kats xmr_ed25519_derivation_kat xmr_difficulty_kat xmr_coinbase_kat xmr_goldens_kat xmr_e2e_kat xmr_miner_block_path_smoke \
                     xmr_native_contracts_kat xmr_native_tx_weight_kat xmr_native_blob_reader_fuzz_kat \
@@ -840,8 +840,8 @@ jobs:
                     v37_xmr_fee_model_kat v37_xmr_fee_rbind_kat v37_xmr_fee_network_kat \
                     v37_xmr_web_dashboard_kat \
                     v37_xmr_paynow_kat v37_xmr_paynow_lineage_kat v37_xmr_rejoin_payee_kat v37_xmr_empty_cut_finder_kat \
-                    v37_xmr_coinbase_recompute_kat v37_xmr_mainnet_rehearsal_kat v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat \
-                    v37_xmr_m3_arm_order_kat v37_xmr_prefer_own_race_kat \
+                    v37_xmr_spend_floor_kat v37_xmr_drain_kat v37_xmr_drain_wiring_kat v37_xmr_share_verdict_kat v37_1_width_law_kat v37_xmr_window_pulse_kat v37_xmr_drops_count_kat v37_xmr_light_proof_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_pin_enrol_kat v37_xmr_ctx_pow_kat v37_xmr_parse_bounds_kat \
+                    v37_xmr_m3_arm_order_kat \
                     v37_xmr_daemonless_selfmine_kat \
                     v37_xmr_p2p_publish_retry_kat \
                     xmr_msr_boost_kat \

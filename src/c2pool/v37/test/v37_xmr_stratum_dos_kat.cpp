@@ -11,7 +11,9 @@
 // The XMR stratum listener's DoS policy, over real loopback sockets with a
 // stub template source and a counting stub verifier (no RandomX, no monerod).
 // Clients dial from 127.0.0.x source addresses so bans by address apply.
-//   SD1  the default policy values (and the default bind 127.0.0.1)
+//   SD1  the default policy values (and the default bind 127.0.0.1); the
+//        submit refill and min-diff from d_at (stratum_budget_of at
+//        --stratum-min-diff-shift 0)
 //   SD2  minimum difficulty: "+1" is raised to the floor, a "+diff" above the
 //        floor is kept, no "+diff" = the lane target, and a lane target easier
 //        than the floor is not made harder
@@ -27,12 +29,12 @@
 //        = closed + address banned (redial refused); a logged-in miner and an
 //        address-less 127.0.0.1 client are not address-banned
 //   SD7  at the defaults (test clock): one connection submitting valid shares
-//        at the honest maximum 2^k / T = 6.4/s (Poisson, fixed seed) for 120 s
-//        is never closed or banned
+//        at the honest maximum 2^shift / T = 0.1/s (Poisson, fixed seed, 768
+//        expected submits) is never closed or banned
 //   SD8  at the defaults (test clock): 25 submits at one instant -> 24
-//        accepted, the 25th dropped unverified, closed, address banned 2 s
-//        (refused at +1 s, accepted at +3 s); a connection submitting at
-//        2 x the refill (25.6/s) is closed within 60 submits
+//        accepted, the 25th dropped unverified, closed, address banned 120 s
+//        (refused at +119 s, accepted at +121 s); a connection submitting at
+//        2 x the refill (0.4/s) is closed within 60 submits
 // Nonzero exit on any failure.
 // ===========================================================================
 #include <arpa/inet.h>
@@ -53,6 +55,7 @@
 
 namespace strat = ::v37::xmr::stratum;
 namespace o2 = ::c2pool::v37n::xmr::o2;
+namespace pbs = ::c2pool::xmr::pathb::stratum;
 using Clock = std::chrono::steady_clock;
 
 namespace {
@@ -189,12 +192,16 @@ int main() {
     {
         const o2::StratumListenerOptions d;
         namespace xc = ::c2pool::v37n::xmr;
-        const std::uint32_t per_t = 2u << xc::kXmrDropsFloorShift;   // 2 x 2^k submits per T
-        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000, 24 burst + 2 x 2^k / T = 12.8/s submits, 24 queued, "
-              "login 5 s, ban ceil(burst / rate) = 2 s, score -3/+1 ban at -9 (cap 0), 256 (job id, nonce) pairs remembered",
-              d.bind_host == "127.0.0.1" && d.min_difficulty == 16000 && d.submit_burst == 24.0 &&
-              d.submit_rate == double(per_t) / double(xc::kXmrTargetIntervalS) && d.submit_rate == 12.8 &&
-              d.max_pending_submits == 24 && d.login_timeout_ms == 5000 && d.ban_seconds == 2 &&
+        const std::uint64_t d_at = 1000000;
+        const auto b = pbs::stratum_budget_of(d_at, pbs::kStratumMinDiffShiftDefault);
+        const std::uint64_t per_t = b ? b->refill_per_t : 0;   // 2 << shift submits per T
+        check("SD1 defaults: bind 127.0.0.1, min difficulty 16000 until the budget from d_at is set (min-diff d_at >> 0 = d_at, "
+              "refill 2 << 0 per T at --stratum-min-diff-shift 0), 24 burst + 2 x 2^shift / T = 0.2/s submits, 24 queued, "
+              "login 5 s, ban ceil(burst / rate) = 120 s, score -3/+1 ban at -9 (cap 0), 256 (job id, nonce) pairs remembered",
+              d.bind_host == "127.0.0.1" && d.min_difficulty == 16000 && b && b->min_diff == d_at && per_t == 2 &&
+              d.min_diff_shift == pbs::kStratumMinDiffShiftDefault && d.submit_burst == 24.0 &&
+              d.submit_rate == double(per_t) / double(xc::kXmrTargetIntervalS) && d.submit_rate == 0.2 &&
+              d.max_pending_submits == 24 && d.login_timeout_ms == 5000 && d.ban_seconds == 120 &&
               d.ban_seconds == static_cast<int>((24u * xc::kXmrTargetIntervalS + per_t - 1) / per_t) &&
               d.ban_seconds == static_cast<int>(std::ceil(d.submit_burst / d.submit_rate)) && d.bad_share_points == -3 &&
               d.good_share_points == 1 && d.ban_score == -9 && d.max_score == 0 && d.max_seen_submits == 256);
@@ -371,13 +378,15 @@ int main() {
         check("SD7 listener up (defaults, test clock)", R.up());
         int fd = -1;
         const std::string jid = R.login(fd, "127.0.0.70", "");
-        const double rate = double(1u << xc::kXmrDropsFloorShift) / double(xc::kXmrTargetIntervalS);   // 6.4/s
+        const double two_shift = double(o2::kStratumRefillPerT) / double(pbs::kStratumRefillFactor);   // 2^shift = 1
+        const double rate = two_shift / double(xc::kXmrTargetIntervalS);   // 0.1/s
+        const double span = 768.0 / rate;                                  // 768 expected submits
         std::mt19937_64 rng(1932);
         std::exponential_distribution<double> gap(rate);
         double t = 0;
         std::uint32_t sent = 0, ok = 0;
         bool dropped = false;
-        while (t < 120.0) {
+        while (t < span) {
             t += gap(rng);
             off_us = static_cast<long long>(t * 1e6);
             const std::uint32_t id = 1000 + sent;
@@ -390,7 +399,7 @@ int main() {
         const bool open = !dropped && !closed_within(fd, 200);
         ::close(fd);
         const auto s = R.L.stats();
-        check("SD7 one connection at the honest maximum (2^k / T = 6.4 valid submits/s, Poisson, 120 s) is never closed or banned",
+        check("SD7 one connection at the honest maximum (2^shift / T = 0.1 valid submits/s at shift 0, Poisson, 768 expected submits) is never closed or banned",
               !jid.empty() && open && sent >= 700 && ok == sent && s.submits_over_budget == 0 && s.bans == 0 &&
                   s.refused_banned == 0,
               "sent=" + std::to_string(sent) + " ok=" + std::to_string(ok) + " over=" + std::to_string(s.submits_over_budget) +
@@ -421,19 +430,21 @@ int main() {
               !jid.empty() && oks == 24 && closed && R.ver.hashes.load() == 24 && s1.submits_over_budget == 1 && s1.bans == 1,
               "oks=" + std::to_string(oks) + " hashes=" + std::to_string(R.ver.hashes.load()) +
                   " over=" + std::to_string(s1.submits_over_budget));
-        off_us = 1'000'000;
+        const long long ban_us = static_cast<long long>(o2::kStratumBanSeconds) * 1'000'000;
+        off_us = ban_us - 1'000'000;
         const int r1 = dial_from("127.0.0.80", R.L.bound_port());
-        const bool refused_1s = r1 >= 0 && closed_within(r1, 3000);
+        const bool refused_in = r1 >= 0 && closed_within(r1, 3000);
         if (r1 >= 0) ::close(r1);
-        off_us = 3'000'000;
+        off_us = ban_us + 1'000'000;
         int r3 = -1;
-        const bool back_3s = !R.login(r3, "127.0.0.80", "").empty() && !closed_within(r3, 200);
+        const bool back_after = !R.login(r3, "127.0.0.80", "").empty() && !closed_within(r3, 200);
         if (r3 >= 0) ::close(r3);
-        check("SD8 the address ban lasts 2 s: refused at +1 s, accepted at +3 s", refused_1s && back_3s);
+        check("SD8 the address ban lasts ceil(burst / rate) = 120 s: refused at +119 s, accepted at +121 s",
+              o2::kStratumBanSeconds == 120 && refused_in && back_after);
         int f2 = -1;
         const std::string j2 = R.login(f2, "127.0.0.81", "");
-        double t = 3.0;
-        const double step = 1.0 / (2.0 * o2::kStratumSubmitRate);   // 2 x the refill: 25.6 submits/s
+        double t = double(o2::kStratumBanSeconds) + 1.0;
+        const double step = 1.0 / (2.0 * o2::kStratumSubmitRate);   // 2 x the refill: 0.4 submits/s
         std::uint32_t sent = 0;
         bool closed2 = false;
         for (std::uint32_t i = 0; i < 200; ++i) {
@@ -446,7 +457,7 @@ int main() {
         }
         ::close(f2);
         const auto s2 = R.L.stats();
-        check("SD8 a connection submitting at 2 x the refill (25.6/s) is closed for over-budget within 60 submits",
+        check("SD8 a connection submitting at 2 x the refill (0.4/s) is closed for over-budget within 60 submits",
               !j2.empty() && closed2 && sent <= 60 && s2.submits_over_budget == 2 && s2.bans == 2,
               "sent=" + std::to_string(sent) + " over=" + std::to_string(s2.submits_over_budget));
         R.L.stop();

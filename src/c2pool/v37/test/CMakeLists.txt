@@ -390,26 +390,6 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_race_rebook_kat PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_race_rebook_kat COMMAND v37_xmr_race_rebook_kat)
 
-    # v37_xmr_coldboot_resume_kat (COLD-BOOT-4): every anchor boot (pinned or
-    # explicit) is paced by one predicate; a restart re-drives from its finalize
-    # cursor (a cursor in the pre-anchor span starts the scan at the f2 anchor; a
-    # cursor below the retained rows is served by the snapshotted booking tail);
-    # a resume whose cursor lags the snapshot tip stays paced until it catches up.
-    # REAL ChainIndex + XmrNode + FinalizeConnect. Builds on the pre-fix tree and
-    # FAILS there. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
-    add_executable(v37_xmr_coldboot_resume_kat v37_xmr_coldboot_resume_kat.cpp)
-    target_compile_features(v37_xmr_coldboot_resume_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_coldboot_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE xmr_node xmr_native_txpool xmr_coin Threads::Threads)
-    if (TARGET Boost::headers)
-        target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE Boost::headers)
-    elseif (TARGET Boost::boost)
-        target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE Boost::boost)
-    elseif (DEFINED Boost_INCLUDE_DIRS)
-        target_include_directories(v37_xmr_coldboot_resume_kat PRIVATE ${Boost_INCLUDE_DIRS})
-    endif()
-    add_test(NAME v37_xmr_coldboot_resume_kat COMMAND v37_xmr_coldboot_resume_kat)
-    set_tests_properties(v37_xmr_coldboot_resume_kat PROPERTIES TIMEOUT 900)
     # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
     # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
     # (R4 gate kept, repair continues), never refused on a retry count; two nodes
@@ -445,16 +425,6 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_minority_converge_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_minority_converge_selfcheck PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_minority_converge_selfcheck COMMAND v37_xmr_minority_converge_selfcheck)
-    # v37_xmr_minority_workweight_kat (D2, operator ruling D-1 = C): production
-    # FinalizeConnect nodes in lockstep (the D2Rig) + the production
-    # LaneSuspendState -- a byzantine PAIR with < 50% of the window's work never
-    # halts an honest node, the minority trigger is work-weighted (40% no, 60%
-    # yes), DIVERGED is alarm-only. Listed in BOTH build.yml --target lists.
-    add_executable(v37_xmr_minority_workweight_kat v37_xmr_minority_workweight_kat.cpp)
-    target_compile_features(v37_xmr_minority_workweight_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_minority_workweight_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(v37_xmr_minority_workweight_kat PRIVATE xmr_node Threads::Threads)
-    add_test(NAME v37_xmr_minority_workweight_kat COMMAND v37_xmr_minority_workweight_kat)
     # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
     # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
     # (sessions dropped), a login while suspended is PARKED, the resume edge
@@ -822,8 +792,8 @@ if (BUILD_TESTING)
     #   v37_xmr_web_dashboard_kat
     #     Starts the read-only provider on a fixture XmrWebState and fetches
     #     every endpoint over real loopback HTTP (/local_stats /global_stats
-    #     /current_payouts /current_merged_payouts /recent_blocks /v37_status
-    #     /xmr/payouts /web/currency_info /node_info), checking each field
+    #     /recent_blocks /v37_status /xmr/pathb /web/currency_info /node_info),
+    #     checking each field
     #     against the fixture; GET / is the dashboard HTML with NO "PPLNS"
     #     (WRS / PPR), and a stock LITECOIN WebServer still serves the file
     #     byte-for-byte. Not stdlib-only: it links the core web server, the
@@ -868,29 +838,6 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_paynow_kat COMMAND v37_xmr_paynow_kat)
 
     # ------------------------------------------------------------------
-    # EVERY NODE RECOMPUTES THE LANE COINBASE (operator rulings 2026-09-29,
-    # xmr/xmr_coinbase_recompute.hpp): REAL assembled blocks from the
-    # builder pipeline, decoded as booking decodes them, recomputed from the
-    # receiver's ledger. Honest blocks (owed + pay-now, a reward hint above
-    # the total, the empty-cut finder, a binding weight-aware cap) are
-    # canonical; the #1861 double pay, an over-payment, a K_fair reorder, an
-    # under-take, misdirected pay-now and a stale ledger state are not. Same
-    # link shape as the pay-now KAT (listed in BOTH build.yml --target lists).
-    # ------------------------------------------------------------------
-    add_executable(v37_xmr_coinbase_recompute_kat
-        v37_xmr_coinbase_recompute_kat.cpp
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
-        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
-    target_compile_features(v37_xmr_coinbase_recompute_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_coinbase_recompute_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-    target_compile_definitions(v37_xmr_coinbase_recompute_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-    target_link_libraries(v37_xmr_coinbase_recompute_kat PRIVATE xmr_template xmr_node xmr_coin)
-    add_test(NAME v37_xmr_coinbase_recompute_kat COMMAND v37_xmr_coinbase_recompute_kat)
-
-    # ------------------------------------------------------------------
     # SHARE-LEVEL CANONICAL COINBASE (P2Pool's share rule): a relayed
     # receipt's coinbase, opened through its own Keccak midstate, must be the
     # canonical lane coinbase (xmr_coinbase_recompute.hpp verify_share_coinbase,
@@ -928,27 +875,6 @@ if (BUILD_TESTING)
     target_compile_definitions(v37_xmr_light_proof_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
     target_link_libraries(v37_xmr_light_proof_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_light_proof_kat COMMAND v37_xmr_light_proof_kat)
-
-    # ------------------------------------------------------------------
-    # MAINNET REHEARSAL (isolated): the mainnet settlement configuration
-    # (fee model v1, the mainnet donation identity, the R6 booking pipeline)
-    # run in-process on three nodes with rotating builders -- honest run
-    # (every block canonical, one digest, exact conservation), a lagging
-    # builder, an over-paying builder, an out-of-band payee ref. No daemon,
-    # no network, no RandomX. Same link shape as the recompute KAT.
-    # ------------------------------------------------------------------
-    add_executable(v37_xmr_mainnet_rehearsal_kat
-        v37_xmr_mainnet_rehearsal_kat.cpp
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
-        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
-    target_compile_features(v37_xmr_mainnet_rehearsal_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_mainnet_rehearsal_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-    target_compile_definitions(v37_xmr_mainnet_rehearsal_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-    target_link_libraries(v37_xmr_mainnet_rehearsal_kat PRIVATE xmr_template xmr_node xmr_coin)
-    add_test(NAME v37_xmr_mainnet_rehearsal_kat COMMAND v37_xmr_mainnet_rehearsal_kat)
 
     # ------------------------------------------------------------------
     # v37_xmr_spend_floor_kat -- the spend-cost floor c (Monero's minimum
@@ -1657,41 +1583,6 @@ if (BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
     target_link_libraries(v37_xmr_p2p_publish_retry_kat PRIVATE xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_p2p_publish_retry_kat COMMAND v37_xmr_p2p_publish_retry_kat)
-
-    # ------------------------------------------------------------------
-    # c2pool#1551 -- the SAME-HEIGHT double-block refusal, decided prefer-own
-    # within bounds.
-    #
-    #   v37_xmr_prefer_own_race_kat
-    #     Pins the credit table for a height carrying two blocks, one of them
-    #     ours: unburied refuses everybody, buried credits ours ONLY if the
-    #     chain kept it, an orphan of ours credits NOTHING, a stranger's block
-    #     credits NOTHING, and a height credits at most once (R-7).
-    #
-    #     The property that makes the bound real is run, not asserted in prose:
-    #     the same fixture is decided under BOTH tie-break policies and the
-    #     verdicts must be identical while the nominations differ -- so
-    #     prefer-own demonstrably moves the lever and cannot reach the ledger.
-    #
-    #     Suites E and F drive the REAL XmrNode + FinalizeConnect over a pumped
-    #     native chain: E is one node winning, losing and sitting out a fork; F
-    #     is two nodes racing each other at one height, where the winner credits
-    #     once, the loser fabricates nothing, and the fleet-wide credited set has
-    #     exactly one entry. No sockets, no RandomX, no daemon.
-    #
-    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
-    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
-    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
-    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
-    # ------------------------------------------------------------------
-    add_executable(v37_xmr_prefer_own_race_kat v37_xmr_prefer_own_race_kat.cpp)
-    target_compile_features(v37_xmr_prefer_own_race_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_prefer_own_race_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-    target_link_libraries(v37_xmr_prefer_own_race_kat PRIVATE xmr_node xmr_coin Threads::Threads)
-    add_test(NAME v37_xmr_prefer_own_race_kat COMMAND v37_xmr_prefer_own_race_kat)
 
     # ------------------------------------------------------------------
     # MAINNET READINESS -- the pool binary's own native-node plumbing.

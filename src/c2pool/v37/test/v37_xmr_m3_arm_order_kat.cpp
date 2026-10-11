@@ -34,10 +34,7 @@
 //      refuses, rather than starting into a window where every settled block
 //      would be orphaned by a predicate that cannot answer
 //   E  the publisher: a found block goes out as a levin 2008 through C5, and a
-//      relay that reached NOBODY pushes NO FOUND event
-//   F  mainnet ledger knobs (mainnet_ledger_knob_refusal): --d-conf other than
-//      60, a non-zero --settle-h-min, --recon-max-root-age and
-//      --no-book-deferral are refused on mainnet, kept on the test networks
+//      relay that reached NOBODY delivers NO found event
 //
 // No sockets, no RandomX, no live daemon: builds and runs on BOTH build.yml
 // legs (the Linux x86_64 leg and the ASan+UBSan one), which is also why it is
@@ -159,11 +156,8 @@ static void suite_a() {
     check(c.arm_order == ArmOrderMode::DaemonFirst,
           "A3 DaemonFirst is the DEFAULT (bring-up posture, ruling R-ARMORDER)");
 
-    // daemon-first accepts every coinbase / template combination, exactly as
-    // M0..M2h did: the switch adds a mode, it does not narrow the old one.
-    check(arm_order_refusal(c).empty(), "A4 daemon-first + option A is accepted");
-    c.coinbase = CoinbaseMode::V37Settlement;
-    check(arm_order_refusal(c).empty(), "A5 daemon-first + option B is accepted");
+    // daemon-first accepts every template source.
+    check(arm_order_refusal(c).empty(), "A4 daemon-first (the default config) is accepted");
     c.template_source = TemplateSourceMode::Native;
     check(arm_order_refusal(c).empty(), "A6 daemon-first + native template is accepted");
 
@@ -171,16 +165,13 @@ static void suite_a() {
     XmrNodeConfig p;
     p.arm_order = ArmOrderMode::P2PFirst;
     check(!arm_order_refusal(p).empty(),
-          "A7 p2p-first REFUSES option A (its block IS get_block_template)");
-    p.coinbase = CoinbaseMode::V37Settlement;
-    check(!arm_order_refusal(p).empty(),
           "A8 p2p-first REFUSES the monerod template source (get_miner_data per refresh)");
     p.template_source = TemplateSourceMode::Native;
     check(!arm_order_refusal(p).empty(),
           "A9 p2p-first REFUSES an empty --native-connect (no chain, nowhere to relay)");
     p.native_connect.push_back("127.0.0.1:18080");
     check(arm_order_refusal(p).empty(),
-          "A10 p2p-first + option B + native template + a peer is accepted");
+          "A10 p2p-first + native template + a peer is accepted");
 }
 
 // ===========================================================================
@@ -235,7 +226,6 @@ static void suite_c(const std::filesystem::path& root) {
 
     XmrNodeConfig cfg = base_cfg(root / "p2p_first", CHAIN, D_CONF);
     cfg.arm_order       = ArmOrderMode::P2PFirst;
-    cfg.coinbase        = CoinbaseMode::V37Settlement;
     cfg.template_source = TemplateSourceMode::Native;
     cfg.native_connect.push_back("127.0.0.1:18080");
 
@@ -310,7 +300,6 @@ static void suite_d(const std::filesystem::path& root) {
 
     XmrNodeConfig cfg = base_cfg(root / "failclosed", 7, 3);
     cfg.arm_order       = ArmOrderMode::P2PFirst;
-    cfg.coinbase        = CoinbaseMode::V37Settlement;
     cfg.template_source = TemplateSourceMode::Native;
     cfg.native_connect.push_back("127.0.0.1:18080");
 
@@ -402,7 +391,6 @@ static void suite_e() {
     native::relay::LevinBlockRelay relay(port, native::relay::DaemonSubmitSink{}, &bodies,
                                          &chain, rcfg);
 
-    submit::FoundBlockQueue found;
     auto lookup = [&f](std::uint32_t, std::uint32_t, submit::BlockCandidate& out) {
         out.template_id     = 1;
         out.height          = f.height;
@@ -413,12 +401,14 @@ static void suite_e() {
         return true;
     };
 
-    o2::P2pBlockPublisher pub(relay, found, lookup);
+    o2::P2pBlockPublisher pub(relay, lookup);
+    std::vector<submit::FoundBlockEvent> found;
+    pub.set_found_hook([&found](const submit::FoundBlockEvent& e) { found.push_back(e); });
 
     // (1) fail-closed before the RandomX verifier says so.
     pub.submit_network_block(1, f.nonce, 0);
-    check(pub.refused() == 1 && found.pushed() == 0,
-          "E1 a disabled relay REFUSES and pushes no FOUND event",
+    check(pub.refused() == 1 && pub.delivered() == 0 && found.empty(),
+          "E1 a disabled relay REFUSES and delivers no found event",
           pub.last_error());
 
     // (2) armed, with peers: the block goes out and a FOUND event follows.
@@ -426,11 +416,11 @@ static void suite_e() {
     port.state_normal_peers = 3;
     pub.submit_network_block(1, f.nonce, 0);
     check(pub.relayed() == 1, "E2 the block was relayed over levin", pub.last_error());
-    check(found.pushed() == 1, "E3 exactly one FOUND event was pushed");
-    submit::FoundBlockEvent ev;
-    const bool got = found.pop(ev);
+    check(pub.delivered() == 1 && found.size() == 1, "E3 exactly one found event was delivered");
+    const bool got = found.size() == 1;
+    const submit::FoundBlockEvent ev = got ? found[0] : submit::FoundBlockEvent{};
     check(got && ev.block_id == f.id,
-          "E4 the FOUND event carries OUR block id, off the bytes we relayed");
+          "E4 the found event carries OUR block id, off the bytes we relayed");
     check(got && ev.id_source == submit::IdSource::Local,
           "E5 the id source is Local -- no daemon named this block");
     check(got && ev.header_check == submit::HeaderCheck::NotRun,
@@ -454,18 +444,16 @@ static void suite_e() {
         check(bare, "E8b the port got a BARE epee body, not a doubly-framed notify");
     }
 
-    // (3) THE FAIL-CLOSED ONE: a relay that reached nobody must not push a
-    //     FOUND event. A block in the settlement ledger that no peer ever
-    //     received would mature, be refused by the canonical test and be
-    //     disposed as an orphan -- after the share that paid for it was spent.
+    // (3) THE FAIL-CLOSED ONE: a relay that reached nobody delivers no found
+    //     event.
     port.state_normal_peers = 0;
     port.broadcasts.clear();
     pub.submit_network_block(1, f.nonce, 0);
     check(pub.failed() == 1, "E9 zero peers is a LOUD failure, not a shrug",
           pub.last_error());
-    check(found.pushed() == 1,
-          "E10 a block that reached NOBODY pushes NO FOUND event (fail-closed)",
-          "pushed=" + std::to_string(found.pushed()));
+    check(pub.delivered() == 1 && found.size() == 1,
+          "E10 a block that reached NOBODY delivers NO found event (fail-closed)",
+          "delivered=" + std::to_string(pub.delivered()));
 
     // (4) a candidate with no served hashing blob has no verified id to attest.
     port.state_normal_peers = 3;
@@ -476,7 +464,7 @@ static void suite_e() {
         out.nonce_offset = f.nonce_offset;
         return true;                       // note: no hashing_blob
     };
-    o2::P2pBlockPublisher blind_pub(relay, found, blind);
+    o2::P2pBlockPublisher blind_pub(relay, blind);
     blind_pub.enable_network_relay(true);
     blind_pub.submit_network_block(1, f.nonce, 0);
     check(blind_pub.refused() == 1 && blind_pub.relayed() == 0,
@@ -484,34 +472,6 @@ static void suite_e() {
           blind_pub.last_error());
 }
 
-
-// ===========================================================================
-// F  mainnet_ledger_knob_refusal(): the settings that reach the replicated
-//    owed ledger are pinned on mainnet and stay knobs on the test networks.
-static void suite_f() {
-    std::printf("-- F: mainnet ledger knobs --\n");
-    XmrNodeConfig c;
-    c.network = MoneroNetwork::Mainnet;
-    LedgerKnobs k;
-    check(c.d_conf == kMainnetDConf && mainnet_ledger_knob_refusal(c, k).empty(),
-          "F1 mainnet with the defaults (D_conf 60, h_min 0, no ledger knobs) is accepted");
-    c.d_conf = 61;
-    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F2 mainnet --d-conf 61 is REFUSED",
-          mainnet_ledger_knob_refusal(c, k));
-    c.d_conf = kMainnetDConf; c.settle_h_min = 1;
-    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F3 mainnet --settle-h-min 1 is REFUSED");
-    c.settle_h_min = 0; k.recon_max_root_age_set = true;
-    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F4 mainnet --recon-max-root-age is REFUSED");
-    k.recon_max_root_age_set = false; k.no_book_deferral = true;
-    check(!mainnet_ledger_knob_refusal(c, k).empty(), "F5 mainnet --no-book-deferral is REFUSED");
-    for (MoneroNetwork n : {MoneroNetwork::Testnet, MoneroNetwork::Stagenet, MoneroNetwork::Regtest}) {
-        XmrNodeConfig t;
-        t.network = n; t.d_conf = 5; t.settle_h_min = 7;
-        LedgerKnobs all; all.recon_max_root_age_set = true; all.no_book_deferral = true;
-        check(mainnet_ledger_knob_refusal(t, all).empty(),
-              "F6 test network: every ledger knob stays available to rigs");
-    }
-}
 
 // ===========================================================================
 int main() {
@@ -528,7 +488,6 @@ int main() {
     suite_c(root);
     suite_d(root);
     suite_e();
-    suite_f();
 
     std::filesystem::remove_all(root);
 
