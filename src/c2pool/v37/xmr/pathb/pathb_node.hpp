@@ -64,7 +64,13 @@
 //   relay glue        offer_empty_store_tip (an empty store whose catch-up
 //                     from position 0 got no header: the peer's HELLO tip a
 //                     join candidate), take_parked (a parked frame run again),
-//                     set_join_step (the join worker's step callback)
+//                     set_join_step (the join worker's step callback),
+//                     may_ask / take_rewalk_frames (the re-walk of parked
+//                     frames), on_body_set (a walked carrier's bodies from a
+//                     reply to the node's own FC_GETCARRIER),
+//                     bind_walked_branch (a TipBodies DEFER's walked branch
+//                     bound and placed); the references of a served bucket
+//                     taken back are learned
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -612,6 +618,113 @@ public:
             return;
         }
         joiner_->set_on_step([f = std::move(f)](JoinedState&, std::uint64_t) { f(); });
+    }
+    // A parked frame's walked headers or bodies are asked of `peer` at most once while that peer holds its variants.
+    bool may_ask(const Hash32& digest, std::uint64_t peer) { return deferred_.may_ask(digest, peer); }
+    // The parked frames marked for a re-walk (data they walked arrived), taken out of the deferred store.
+    std::vector<ParkedFrame> take_rewalk_frames() {
+        std::vector<ParkedFrame> out;
+        if (poisoned_) return out;
+        for (const Hash32& d : deferred_.take_rewalks())
+            if (std::optional<ParkedFrame> f = deferred_.take(*tree_, d)) out.push_back(std::move(*f));
+        return out;
+    }
+    // FC_CARRIER from `peer` in reply to this node's FC_GETCARRIER (want_bodies 1) for a walked carrier: its carried
+    // bodies as that peer's body set of the carrier (its references learned). False: the frame does not decode.
+    bool on_body_set(std::uint64_t peer, std::span<const std::uint8_t> frame) {
+        if (poisoned_ || !check_fc_carrier(frame, cfg_.identity.chain_id, cfg_.buffers).ok()) return false;
+        CarrierBodyV3 c;
+        if (decode_carrier_body_v3(frame.data() + kFrameHeaderBytes, frame.size() - kFrameHeaderBytes,
+                                   CarrierLimits{cfg_.buffers.receipt, cfg_.p.r_max}, c)
+            != WireError::None)
+            return false;
+        const Hash32 id = receipt_id(c.own);
+        for (const ReceiptBodyV3& b : c.carried) learn_refs(b);
+        learn_refs(c.own);
+        const IndexAdd a = headers_->add_body_set(peer, id, c.carried, header_digest(header_of(c)));
+        if (a == IndexAdd::Added || a == IndexAdd::Replaced) deferred_.touch({id});
+        return true;
+    }
+    // The walked branch a TipBodies DEFER names, fork upward: every held variant whose claimed parent is placed runs
+    // bind_header; a Match binds it, a computed Mismatch refutes it (its servers BANned or
+    // struck); a bound carrier with a body set (none needed when it carries nothing) is admitted in the role Closure
+    // and placed through this node's placement (the store batch, a switch, the waiting carriers released).
+    struct WalkBind {
+        std::vector<Hash32> placed;
+        std::vector<std::uint64_t> banned;
+        std::vector<std::uint64_t> struck;
+        std::vector<Hash32> need_bodies;  // bound, carrying bodies, no body set held
+    };
+    WalkBind bind_walked_branch(const std::vector<Hash32>& ids) {
+        WalkBind out;
+        if (poisoned_) return out;
+        for (bool progress = true; progress && !poisoned_;) {
+            progress = false;
+            out.need_bodies.clear();
+            for (const Hash32& id : ids) {
+                if (tree_->find(id) != nullptr) continue;
+                if (!headers_->bound_digest(id)) {
+                    std::vector<Hash32> digests;
+                    for (const HeaderVariant* y : headers_->variants(id)) digests.push_back(y->digest);
+                    for (const Hash32& dg : digests) {
+                        const HeaderVariant* y = headers_->variant(id, dg);
+                        if (y == nullptr || y->bound || tree_->find(y->header.own.side.tip) == nullptr) continue;
+                        const HeaderBindResult hb = bind_header(env(), *y);
+                        if (hb.bind == HeaderBind::Match) {
+                            headers_->bind(id, dg);
+                            progress = true;
+                            break;
+                        }
+                        if (hb.bind == HeaderBind::Mismatch) {
+                            std::vector<std::uint64_t>& to = hb.word == AdmitVerdict::Ban ? out.banned : out.struck;
+                            to.insert(to.end(), y->peers.begin(), y->peers.end());
+                            headers_->refute(id, dg);
+                            progress = true;
+                        }
+                    }
+                }
+                const std::optional<Hash32> bd = headers_->bound_digest(id);
+                if (!bd) continue;
+                const HeaderVariant* y = headers_->variant(id, *bd);
+                if (y == nullptr || tree_->find(y->header.own.side.tip) == nullptr) continue;
+                std::vector<std::vector<ReceiptBodyV3>> sets;
+                std::vector<std::uint64_t> servers;
+                for (const BodySet* bs : headers_->body_sets(id)) {
+                    sets.push_back(bs->bodies);
+                    servers.push_back(bs->peer);
+                }
+                if (y->header.n_carried == 0 && sets.empty()) {  // carries nothing: no body set (its header's server)
+                    sets.emplace_back();
+                    servers.push_back(y->peers.empty() ? kOwnPeer : *y->peers.begin());
+                }
+                if (sets.empty()) out.need_bodies.push_back(id);
+                const ReceiptBodyV3 own = y->header.own;
+                for (std::size_t k = 0; k < sets.size(); ++k) {
+                    CarrierBodyV3 c;
+                    c.own = own;
+                    c.carried = sets[k];
+                    const std::optional<std::vector<std::uint8_t>> frame = encode_fc_carrier(cfg_.identity.chain_id, c, cfg_.p.r_max);
+                    if (!frame) continue;
+                    const AdmitResult r = admit_frame_from(env(), servers[k], *frame, CarrierRole::Closure);
+                    if (r.verdict == AdmitVerdict::AdmitCarrier) {
+                        (void)settle_carrier(servers[k], *frame, r, false);
+                        if (tree_->find(id) != nullptr) {
+                            out.placed.push_back(id);
+                            progress = true;
+                        }
+                        break;
+                    }
+                    if (!sets[k].empty() && (r.verdict == AdmitVerdict::Ban || r.verdict == AdmitVerdict::Strike)) {
+                        (r.verdict == AdmitVerdict::Ban ? out.banned : out.struck).push_back(servers[k]);
+                        headers_->drop_body_set(servers[k], id);
+                        progress = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!out.placed.empty()) drain_released();
+        return out;
     }
 
     void disconnect(std::uint64_t peer) {
@@ -1230,10 +1343,13 @@ public:
                 a.bucket = sb.bucket;
                 a.leaf = sb.leaf;
                 a.refs = sb.refs;
-                if (store_->adopt_below(a)) joined_->claimed[bin] = at_header(at);
+                if (store_->adopt_below(a)) {
+                    joined_->claimed[bin] = at_header(at);
+                    learn_bucket_refs(sb.refs);
+                }
                 continue;
             }
-            (void)store_->restore_bucket(sb.bucket, sb.refs);
+            if (store_->restore_bucket(sb.bucket, sb.refs)) learn_bucket_refs(sb.refs);
         }
         if (it->second.complete()) {
             timers_.done(Req{peer, ReqKind::Buckets, at});
@@ -1373,6 +1489,10 @@ private:
     void learn_refs(const ReceiptBodyV3& r) {
         (*refs_)[r.side.payee] = r.payee;
         if (r.owner) (*refs_)[r.side.owner] = *r.owner;
+    }
+    // The key references of a served bucket taken back into the store (each bound to its rows by the store).
+    void learn_bucket_refs(const std::vector<XmrKeyRef>& refs) {
+        for (const XmrKeyRef& k : refs) (*refs_)[key_ref_identity(k)] = k;
     }
 
     // RandomX through the verified-body memo (a body is hashed once); the

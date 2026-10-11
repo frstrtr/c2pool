@@ -89,6 +89,15 @@
 //   relaym4      an empty store at position 0 whose catch-up from position 0
 //                gets a reply with no header queues the peer's HELLO tip for
 //                the joiner; the attempt completes over the relay;
+//   relaybudget  the invalid-object budget's defaults (G = (1 + R_MAX) /
+//                (2 T) = 0.85 tokens/s, C = N, G_b = 113 N, ban ceil(G_b /
+//                G): 1,064 s at N 8, 133 s at N 1); the options override them;
+//   relayfetch   the fetches a DEFER names, sent to the frame's sender: a
+//                carrier whose parent is unknown (FC_GETCARRIER), one whose
+//                carried tip's branch headers are unknown (FC_GETHEADERS of
+//                t's branch, the walked carrier bound and placed), one whose
+//                walked carrier's bodies are missing (FC_GETCARRIER want_bodies
+//                1, its body set); each placed after the reply;
 //   relaysmoke   two relay nodes over loopback TCP (pathb_relay_links.hpp),
 //                each with its own PathbNode: HELLO both ways, the catch-up,
 //                a carrier mined by one placed by the other; a HELLO of frame
@@ -1901,6 +1910,194 @@ void relaym4() {
 }
 
 // ---------------------------------------------------------------------------
+// The invalid-object budget's defaults: G = (1 + R_MAX) / (2 T), C = N, G_b = n x C over n = P-23 + P-24, ban
+// ceil(G_b / G); the options override them.
+void relaybudget() {
+    const pb::LaneParams& p = pb::kRuledLaneParams;
+    const double g = static_cast<double>(1 + p.r_max) / static_cast<double>(2 * p.carrier_interval_s);
+    const pb::PathbRelayOptions o0;
+    const std::size_t n = o0.max_inbound + o0.max_outbound;
+    check(g == 0.85 && n == 113, "relaybudget: G = (1 + R_MAX) / (2 T) = " + std::to_string(g) + " tokens/s; n = " +
+                                         std::to_string(n) + " links");
+    const pb::RelayBudget b8 = pb::relay_budget_default(8, n), b1 = pb::relay_budget_default(1, n);
+    check(b8.dos.global_refill == g && b8.dos.per_peer_refill == g / 113.0 && b8.dos.per_peer_capacity == 8.0
+                  && b8.dos.global_capacity == 904.0 && b8.ban_seconds == 1064,
+          "relaybudget: N = 8: G 0.85, C 8, G_b 904, ban " + std::to_string(b8.ban_seconds) + " s");
+    check(b1.dos.global_refill == g && b1.dos.per_peer_capacity == 1.0 && b1.dos.global_capacity == 113.0
+                  && b1.ban_seconds == 133,
+          "relaybudget: N = 1: G 0.85, C 1, G_b 113, ban " + std::to_string(b1.ban_seconds) + " s");
+    FakeWire w;
+    FakeLinks l0, l1;
+    l0.wire = l1.wire = &w;
+    pb::PathbRelayOptions o8 = o0;
+    o8.threads = false;
+    o8.verify_threads = 8;
+    pb::RelayClock clock;
+    clock.mono_ms = [] { return std::uint64_t{0}; };
+    clock.wall_s = [] { return std::uint64_t{0}; };
+    const pb::PathbRelayNode r1(o0, l0, clock);
+    const pb::PathbRelayNode r8(o8, l1, clock);
+    pb::PathbRelayOptions ov = o8;
+    ov.ban_seconds = 600;
+    ::c2pool::xmr::DosPolicy d;
+    d.global_refill = 4.0;
+    ov.dos = d;
+    FakeLinks l2;
+    l2.wire = &w;
+    const pb::PathbRelayNode rv(ov, l2, clock);
+    check(r1.budget().ban_seconds == 133 && r1.budget().dos.per_peer_capacity == 1.0 && r8.budget().ban_seconds == 1064
+                  && r8.budget().dos.global_capacity == 904.0 && rv.budget().ban_seconds == 600
+                  && rv.budget().dos.global_refill == 4.0,
+          "relaybudget: the relay node's defaults (1 and 8 verify workers); the options override the ban and the budget");
+}
+
+// ---------------------------------------------------------------------------
+// The fetches a DEFER names, sent to the frame's sender over the relay and placed after the reply.
+bool mine_on(Harness& h, FakeWire& w, std::size_t node, std::size_t payee, std::uint32_t nonce) {
+    const std::optional<pb::PathbJob> j = h.job(node, payee, nonce);
+    const bool ok = j && h[node].on_own_share(*j, nonce, pb::Hash32{}).action == pb::NodeAction::Placed;
+    w.run();
+    return ok;
+}
+
+struct TipFetch {
+    bool setup = false;
+    bool carried = false;   // the losing node's carrier c carries a receipt whose tip is its losing sibling
+    std::uint64_t n_carried = 0;  // the losing sibling's carried bodies
+    bool placed = false;    // c and the losing sibling placed at X
+    std::uint64_t tip_requests = 0, body_set_requests = 0, body_sets = 0, walk_placed = 0, strikes = 0;
+};
+
+// A, L race; the losing node's next carrier c carries its share on its losing sibling; X catches up from the losing
+// node alone (its best chain), so c's carried tip is unknown at X. `bodies`: both siblings carry two receipts.
+TipFetch relay_tip_fetch(bool bodies) {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay l = kat_relay(h, w, table0(net), true);
+    KatRelay x = kat_relay(h, w, table0(net), false);
+    TipFetch out;
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    if (bodies) {
+        const std::optional<pb::PathbJob> ja = h.job(a.node, 2, 350), jl = h.job(l.node, 3, 351);
+        ok = ok && ja && jl && mine_on(h, w, a.node, 1, 352);
+        ok = ok && h[a.node].on_own_share(*ja, 350, pb::Hash32{}).action == pb::NodeAction::Pending;
+        ok = ok && h[l.node].on_own_share(*jl, 351, pb::Hash32{}).action == pb::NodeAction::Pending;
+        w.run();
+    }
+    // the race: the A-L link delivers nothing while each mines a sibling and takes a job on it
+    w.edit = [](FakeWire::Msg& m) {
+        if ((m.from == 0 && m.to == 1) || (m.from == 1 && m.to == 0)) m.f.clear();
+    };
+    h.tick_monero();
+    ok = ok && mine_on(h, w, a.node, 2, 400) && mine_on(h, w, l.node, 3, 401);
+    const pb::Hash32 sa = h[a.node].tree().best().id, sl = h[l.node].tree().best().id;
+    const std::optional<pb::PathbJob> ka = h.job(a.node, 4, 410), kl = h.job(l.node, 4, 411);
+    w.edit = nullptr;
+    ok = ok && sa != sl && ka && kl && h[a.node].bodies().get(sa) != nullptr && h[l.node].bodies().get(sl) != nullptr;
+    if (!ok) return out;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(sa), 16)});
+    w.q.push_back(FakeWire::Msg{1, 0, *pb::encode_fc_carrier(0, *h[l.node].bodies().get(sl), 16)});
+    w.run();
+    const bool a_lost = sl < sa;
+    const std::size_t lo = a_lost ? a.node : l.node;
+    const pb::Hash32 loser = a_lost ? sa : sl;
+    const pb::PathbJob k = a_lost ? *ka : *kl;
+    const std::uint32_t kn = a_lost ? 410 : 411;
+    ok = ok && h[a.node].tree().best().id == h[l.node].tree().best().id && h[a.node].tree().best().id != loser;
+    out.n_carried = h[lo].bodies().get(loser)->carried.size();
+    ok = ok && h[lo].on_own_share(k, kn, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    h.tick_monero();
+    ok = ok && mine_on(h, w, lo, 5, 420);
+    const pb::Hash32 c = h[lo].tree().best().id;
+    pb::ReceiptBodyV3 rk = k.body;
+    rk.blob.nonce = kn;
+    const pb::Hash32 r = pb::receipt_id(rk);
+    const pb::CarrierBodyV3* cb = h[lo].bodies().get(c);
+    for (const pb::ReceiptBodyV3& b : cb != nullptr ? cb->carried : std::vector<pb::ReceiptBodyV3>{})
+        out.carried = out.carried || (pb::receipt_id(b) == r && b.side.tip == loser);
+    out.setup = ok;
+    if (!ok) return out;
+    // X catches up from the losing node alone
+    w.connect(lo, x.node);
+    w.run();
+    for (int i = 0; i < 3 && h[x.node].tree().best().id != c; ++i) {
+        h.now += 1;
+        x.relay->tick();
+        w.run();
+    }
+    out.placed = h[x.node].tree().best().id == c && h[x.node].tree().find(loser) != nullptr;
+    const pb::PathbRelayStats& st = x.relay->stats();
+    out.tip_requests = st.tip_header_requests;
+    out.body_set_requests = st.body_set_requests;
+    out.body_sets = st.body_sets;
+    out.walk_placed = st.walk_placed;
+    out.strikes = st.strikes;
+    return out;
+}
+
+void relayfetch() {
+    // a carrier whose parent is unknown: the parent asked of the sender, placed, then the carrier
+    {
+        const KatNet net;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false);
+        w.connect(0, 1);
+        w.run();
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            if (i % 2 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, 1, 200 + static_cast<std::uint32_t>(i));
+        }
+        bool dropped = false;
+        w.edit = [&dropped](FakeWire::Msg& m) {
+            if (!dropped && m.from == 0 && m.to == 1 && !m.f.empty() && m.f[0] == pb::kOpFcCarrier) {
+                m.f.clear();
+                dropped = true;
+            }
+        };
+        ok = ok && mine_on(h, w, a.node, 2, 210);
+        w.edit = nullptr;
+        const pb::Hash32 c1 = h[a.node].tree().best().id;
+        const bool missed = dropped && h[b.node].tree().find(c1) == nullptr;
+        ok = ok && mine_on(h, w, a.node, 3, 211);
+        const pb::Hash32 c2 = h[a.node].tree().best().id;
+        check(ok && missed && h[b.node].tree().best().id == c2 && h[b.node].tree().find(c1) != nullptr
+                      && b.relay->stats().solicited_jobs >= 1 && b.relay->strikes_of(1) == 0,
+              "relayfetch: a carrier whose parent is unknown: the parent fetched from the sender (FC_GETCARRIER), "
+              "both placed (solicited " + std::to_string(b.relay->stats().solicited_jobs.load()) + ")");
+    }
+    // a carrier whose carried tip's branch headers are unknown
+    {
+        const TipFetch t = relay_tip_fetch(false);
+        check(t.setup && t.carried && t.n_carried == 0 && t.placed && t.tip_requests >= 1 && t.walk_placed >= 1
+                      && t.strikes == 0,
+              "relayfetch: a carrier whose carried tip is unknown: t's branch headers fetched from the sender "
+              "(FC_GETHEADERS), the walked carrier bound and placed, then the carrier (requests " +
+                      std::to_string(t.tip_requests) + ", walked placed " + std::to_string(t.walk_placed) + ")");
+    }
+    // a carrier whose walked carrier's bodies are missing
+    {
+        const TipFetch t = relay_tip_fetch(true);
+        check(t.setup && t.carried && t.n_carried >= 1 && t.placed && t.tip_requests >= 1 && t.body_set_requests >= 1
+                      && t.body_sets >= 1 && t.walk_placed >= 1 && t.strikes == 0,
+              "relayfetch: a carrier whose walked carrier carries bodies: its body set fetched from the sender "
+              "(FC_GETCARRIER, want_bodies 1), the walked carrier placed, then the carrier (carried " +
+                      std::to_string(t.n_carried) + ", body sets " + std::to_string(t.body_sets) + ")");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Two relay nodes over loopback TCP, each with its own PathbNode, their threads running.
 bool wait_for(const std::function<bool()>& f, int ms) {
     for (int t = 0; t < ms; t += 10) {
@@ -2035,6 +2232,8 @@ int main(int argc, char** argv) {
     run("buckets", buckets);
     run("relaytok", relaytok);
     run("relaym4", relaym4);
+    run("relaybudget", relaybudget);
+    run("relayfetch", relayfetch);
     run("relaysmoke", relaysmoke);
     return finish("v37_xmr_pathb_node_kat");
 }
