@@ -117,6 +117,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -1698,6 +1699,7 @@ struct FakeWire {
         std::vector<std::uint8_t> f;
     };
     std::deque<Msg> q;
+    std::mutex qm;  // send_to from a relay's own threads (threads mode)
     std::vector<FakeLinks*> links;
     std::vector<pb::PathbRelayNode*> relays;
     std::function<void(Msg&)> edit;  // edits a frame in flight
@@ -1726,6 +1728,7 @@ struct FakeWire {
 
 bool FakeLinks::send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) {
     if (live.count(p) == 0) return false;
+    const std::lock_guard<std::mutex> lk(wire->qm);
     wire->q.push_back(FakeWire::Msg{self, static_cast<std::size_t>(p - 1), f});
     return true;
 }
@@ -1968,6 +1971,7 @@ struct TipFetch {
     std::uint64_t n_carried = 0;  // the losing sibling's carried bodies
     bool placed = false;    // c and the losing sibling placed at X
     std::uint64_t tip_requests = 0, body_set_requests = 0, body_sets = 0, walk_placed = 0, strikes = 0;
+    std::size_t index_left = 0;  // digests left in the relay's re-run index
 };
 
 // A, L race; the losing node's next carrier c carries its share on its losing sibling; X catches up from the losing
@@ -2043,6 +2047,7 @@ TipFetch relay_tip_fetch(bool bodies) {
     out.body_sets = st.body_sets;
     out.walk_placed = st.walk_placed;
     out.strikes = st.strikes;
+    out.index_left = x.relay->parked_index_size();
     return out;
 }
 
@@ -2083,7 +2088,7 @@ void relayfetch() {
     {
         const TipFetch t = relay_tip_fetch(false);
         check(t.setup && t.carried && t.n_carried == 0 && t.placed && t.tip_requests >= 1 && t.walk_placed >= 1
-                      && t.strikes == 0,
+                      && t.strikes == 0 && t.index_left == 0,
               "relayfetch: a carrier whose carried tip is unknown: t's branch headers fetched from the sender "
               "(FC_GETHEADERS), the walked carrier bound and placed, then the carrier (requests " +
                       std::to_string(t.tip_requests) + ", walked placed " + std::to_string(t.walk_placed) + ")");
@@ -2092,7 +2097,7 @@ void relayfetch() {
     {
         const TipFetch t = relay_tip_fetch(true);
         check(t.setup && t.carried && t.n_carried >= 1 && t.placed && t.tip_requests >= 1 && t.body_set_requests >= 1
-                      && t.body_sets >= 1 && t.walk_placed >= 1 && t.strikes == 0,
+                      && t.body_sets >= 1 && t.walk_placed >= 1 && t.strikes == 0 && t.index_left == 0,
               "relayfetch: a carrier whose walked carrier carries bodies: its body set fetched from the sender "
               "(FC_GETCARRIER, want_bodies 1), the walked carrier placed, then the carrier (carried " +
                       std::to_string(t.n_carried) + ", body sets " + std::to_string(t.body_sets) + ")");
@@ -2583,6 +2588,101 @@ void below() {
                   && h[fa].tree().best().id == b.store.best_tip(),
           "below: the attempt completes and rule (4) replaces A" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
 }
+// ---------------------------------------------------------------------------
+// The owner's event queue: one posted event per peer in flight; a reader waits while the owner is held.
+void relayq() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay b = kat_relay(h, w, table0(net), false);  // the peer's node: its HELLO bytes
+    FakeLinks rl;
+    rl.wire = &w;
+    rl.self = w.links.size();
+    w.links.push_back(&rl);
+    pb::PathbRelayOptions o;
+    o.threads = true;
+    o.keepalive_ms = 0;
+    o.discovery = false;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    pb::PathbRelayNode r(o, rl, clock);
+    const std::size_t idx = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net), true), r.bind_io(h.io(idx))));
+    r.attach(*h.nodes.back());
+    std::string why;
+    if (!r.start(why)) throw std::runtime_error(why);
+    rl.live.insert(1);
+    rl.event(1, true);
+    const std::vector<std::uint8_t> hello =
+            pb::encode_pathb_hello(h[b.node].our_hello(0x7a7a7a7aull, 0)).value_or(std::vector<std::uint8_t>{});
+    rl.frame(1, hello);
+    const bool up = wait_for([&] { return r.hello_ok(1); }, 3000);
+    constexpr int kFrames = 200;
+    const std::vector<std::uint8_t> ask =
+            pb::encode_fc_getheaders(pb::GetHeaders{0, h[idx].tree().genesis().id, pb::Hash32{}, 1});
+    std::atomic<bool> held{false};
+    std::thread holder([&] {
+        r.with_node([&](pb::PathbNode&) {
+            held = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            return 0;
+        });
+    });
+    (void)wait_for([&] { return held.load(); }, 1000);
+    const std::uint64_t hwm0 = r.stats().owner_queue_hwm.load();
+    std::thread reader([&] {
+        for (int i = 0; i < kFrames; ++i) rl.frame(1, ask);
+    });
+    holder.join();
+    reader.join();
+    const std::uint64_t hwm = r.stats().owner_queue_hwm.load();
+    const std::uint64_t waits = r.stats().owner_waits.load();
+    const bool served = wait_for([&] {
+        const std::lock_guard<std::mutex> lk(w.qm);
+        std::size_t n = 0;
+        for (const FakeWire::Msg& m : w.q)
+            if (m.from == rl.self && !m.f.empty() && m.f[0] == pb::kOpFcHeaders) ++n;
+        return n == static_cast<std::size_t>(kFrames);
+    }, 5000);
+    r.stop();
+    check(up && served && hwm <= 2 && waits >= 1,
+          "relayq: " + std::to_string(kFrames) + " FC_GETHEADERS of one peer while the owner is held: the owner's queue "
+          "high-water mark " + std::to_string(hwm) + " (before them " + std::to_string(hwm0) + "), the reader waited " +
+          std::to_string(waits) + " times, every request answered");
+}
+
+// The relay's re-run index: a DEFER on a carried body is indexed and leaves the index at the next placement; a strike
+// on a peer whose link is gone keeps no per-peer entry.
+void relayindex() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 400);
+    b.relay->test_parked(1, pb::Missing::Bodies, seq32(0x51), seq32(0x52));
+    const std::size_t indexed = b.relay->parked_index_size();
+    ok = ok && mine_on(h, w, a.node, 2, 401);
+    const std::size_t left = b.relay->parked_index_size();
+    check(ok && indexed == 1 && left == 0 && h[b.node].tree().best().id == h[a.node].tree().best().id,
+          "relayindex: a DEFER on a carried body indexed (" + std::to_string(indexed) + ") and gone from the index at "
+          "the next placement (" + std::to_string(left) + " left)");
+    const std::size_t e0 = b.relay->strike_entries();
+    b.relay->test_strike(1);
+    const std::size_t e1 = b.relay->strike_entries();
+    w.links[1]->disconnect(1);
+    w.run();
+    const std::size_t e2 = b.relay->strike_entries();
+    b.relay->test_strike(1);
+    const std::size_t e3 = b.relay->strike_entries();
+    check(e1 == e0 + 1 && e2 == e0 && e3 == e0,
+          "relayindex: a strike on a live peer keeps an entry (" + std::to_string(e1) + "), none after its link is gone (" +
+                  std::to_string(e3) + ")");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2622,6 +2722,8 @@ int main(int argc, char** argv) {
     run("relaybudget", relaybudget);
     run("relayfetch", relayfetch);
     run("relaysmoke", relaysmoke);
+    run("relayq", relayq);
+    run("relayindex", relayindex);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
     run("prune_flags", prune_flags);

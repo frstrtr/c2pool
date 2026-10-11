@@ -196,6 +196,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> queue_dropped{0}, rx_deferred{0}, verify_threads{0};
     std::atomic<std::uint64_t> flood_frames{0}, reoffer_frames{0}, catchup_requests{0}, empty_store_offers{0};
     std::atomic<std::uint64_t> bucket_requests{0}, parked_reruns{0}, rewalks{0}, solicited_jobs{0};
+    std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
     std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0};
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
@@ -395,7 +396,9 @@ public:
 
     void stop() {
         if (!running_.exchange(false)) return;
+        { const std::lock_guard<std::mutex> lk(emtx_); }  // a waiter on ecv_ / fcv_ sees running_ false
         ecv_.notify_all();
+        fcv_.notify_all();
         vcv_.notify_all();
         jcv_.notify_all();
         kcv_.notify_all();
@@ -440,7 +443,7 @@ public:
                 }
             }
             if (link.out_host.empty()) link.remote_ip = links_.remote_ip(p);
-            post([this, p, f, link] { handle_hello(p, f, link); });
+            post_from(p, [this, p, f, link] { handle_hello(p, f, link); });
             return;
         }
         bool ok = false, posted = false;
@@ -451,7 +454,7 @@ public:
             posted = it != peers_.end() && it->second.hello_posted;
         }
         if (!ok && posted) {  // its HELLO waits on the owner: the frame goes after it
-            post([this, p, f] {
+            post_from(p, [this, p, f] {
                 if (!hello_ok(p)) {
                     st_.pre_hello_dropped++;
                     return;
@@ -472,7 +475,7 @@ public:
             if (owner)
                 fn();
             else
-                post(std::move(fn));
+                post_from(p, std::move(fn));
         };
         const std::uint8_t op = f[0];
         switch (op) {
@@ -646,6 +649,10 @@ public:
     RelayLinks& links() noexcept { return links_; }
     const rly::PeerBook& book() const noexcept { return book_; }
     std::uint64_t now_s() const { return now_ms() / 1000; }
+    bool peer_known(std::uint64_t p) const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        return peers_.count(p) != 0;
+    }
     bool hello_ok(std::uint64_t p) const {
         std::lock_guard<std::mutex> lk(pmtx_);
         const auto it = peers_.find(p);
@@ -670,6 +677,37 @@ public:
         for (const auto& [p, s] : peers_) n += s.inbound ? 0 : 1;
         return n;
     }
+    // The follower's main chain moved (a new tip or a backlog refresh): the frames parked on a Monero input (P_r, its
+    // weights, its seed) run again.
+    void on_monero_tip() {
+        rerun_parked(std::vector<Missing>{Missing::Seed, Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights});
+    }
+    // The digests indexed for a re-run, every cause.
+    std::size_t parked_index_size() {
+        const NodeGuard g(*this);
+        std::size_t n = 0;
+        for (const auto& [cause, ds] : parked_by_cause_) n += ds.size();
+        return n;
+    }
+    std::size_t strike_entries() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return strikes_by_peer_.size();
+    }
+    // KAT hooks: an admission outcome of `peer` parked on `m` (the relay's index and fetch), a strike on `peer`.
+    void test_parked(std::uint64_t peer, Missing m, const Hash32& digest, const Hash32& fetch) {
+        NodeEventResult r;
+        r.action = NodeAction::Parked;
+        r.admit.missing = m;
+        r.admit.digest = digest;
+        r.admit.fetch = fetch;
+        Effects fx;
+        {
+            const NodeGuard g(*this);
+            after_result_locked(peer, r, digest, fx);
+        }
+        run_effects(fx);
+    }
+    void test_strike(std::uint64_t peer) { strike(peer, 1, false); }
     // The strike tokens applied to `peer` while its link is up.
     std::uint64_t strikes_of(std::uint64_t p) const {
         std::lock_guard<std::mutex> lk(vmtx_);
@@ -912,8 +950,46 @@ private:
             std::lock_guard<std::mutex> lk(emtx_);
             if (!running_) return;
             events_.push_back(std::move(fn));
+            note_queue_locked();
         }
         ecv_.notify_one();
+    }
+    // A reader thread's event for peer `p`: one posted event per peer in flight; the reader waits until the
+    // previous one has run (the queue is bounded by the link count; the link's TCP flow control engages).
+    void post_from(std::uint64_t p, std::function<void()> fn) {
+        if (!o_.threads) {
+            post(std::move(fn));
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lk(emtx_);
+            if (inflight_.count(p) != 0) {
+                st_.owner_waits++;
+                fcv_.wait(lk, [&] { return !running_ || inflight_.count(p) == 0; });
+            }
+            if (!running_) return;
+            inflight_.insert(p);
+            events_.push_back([this, p, f = std::move(fn)] {
+                struct Done {
+                    PathbRelayNode* r;
+                    std::uint64_t p;
+                    ~Done() {
+                        {
+                            std::lock_guard<std::mutex> l2(r->emtx_);
+                            r->inflight_.erase(p);
+                        }
+                        r->fcv_.notify_all();
+                    }
+                } done{this, p};
+                f();
+            });
+            note_queue_locked();
+        }
+        ecv_.notify_one();
+    }
+    void note_queue_locked() {
+        const std::uint64_t n = events_.size();
+        if (n > st_.owner_queue_hwm.load()) st_.owner_queue_hwm = n;
     }
     void owner_loop() {
         while (running_) {
@@ -1104,8 +1180,9 @@ private:
         if (n == 0) return;
         st_.strikes += n;
         const std::uint64_t src = src_of(p);
+        const bool known = peer_known(p);
         std::lock_guard<std::mutex> lk(vmtx_);
-        strikes_by_peer_[p] += n;
+        if (known) strikes_by_peer_[p] += n;  // a peer whose link is gone keeps no entry
         for (std::uint32_t k = taken ? 1 : 0; k < n; ++k) (void)dos_.grant_randomx(src, now_ns());
     }
     // BAN: the sender's address banned for ban_seconds (no address: the link dropped).
@@ -1277,7 +1354,7 @@ private:
                 }
                 // a placed carrier may be the tip, a walked carrier or a reference a parked frame waits on
                 for (const Missing m : {Missing::TipUnknown, Missing::TipHeaders, Missing::TipBodies, Missing::ClosureBodies,
-                                        Missing::MissingRef})
+                                        Missing::Bodies, Missing::MissingRef})
                     if (!parked_by_cause_[m].empty()) fx.rerun.insert(m);
                 break;
             default: break;
@@ -1322,7 +1399,8 @@ private:
             case Missing::MissingBlock:
             case Missing::MissingWeights:
             case Missing::MissingBucket:
-            case Missing::MissingRef: return true;
+            case Missing::MissingRef:
+            case Missing::Seed: return true;
             default: return false;
         }
     }
@@ -2694,7 +2772,8 @@ private:
                     }
             }
             ccv_.notify_all();
-            rerun_parked(std::vector<Missing>{Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights});
+            rerun_parked(std::vector<Missing>{Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights,
+                                              Missing::Seed});
             if (!has_child) return true;
             id = child;
         }
@@ -2840,6 +2919,8 @@ private:
 
     mutable std::mutex emtx_;  // events
     std::condition_variable ecv_;
+    std::condition_variable fcv_;      // a reader waiting for its peer's event in flight
+    std::set<std::uint64_t> inflight_;  // peers with a posted event in flight (emtx_)
     std::deque<std::function<void()>> events_;
 
     mutable std::mutex vmtx_;  // verify queue, parked list, the budget, the strikes
