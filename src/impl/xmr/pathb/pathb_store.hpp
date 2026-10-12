@@ -23,6 +23,8 @@
 //                  | u8 kind (0 none, 1 carrier body, 2 header) | u32 len
 //                  | bytes | u16 n | n x (u64 bin | u64 p_own | u8 live)
 //   16 K_AR        v37s:ar:<chain>:<h_act %020u>    u16 e | u64 h_act | b32 digest
+//   17 K_BWORK     v37s:bwork:<chain>:<h %020u>     u64 h | u128 work
+//                  (a full node's bound work counted below its prune floor)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
@@ -33,7 +35,8 @@
 //   written into an empty store (every key of its prefixes deleted in the same
 //   batch). A failed write leaves the poison mark (a batch of its own). A
 //   retention prune is one batch (prune_batch): the records below first_pos
-//   deleted, those below root_pos header records.
+//   deleted, those below root_pos header records, K_BWORK of the heights
+//   whose counted work the prune moved below the floor.
 //
 //   pathb_load (in order; any fault: the joiner path):
 //     0. no poison mark;
@@ -54,7 +57,9 @@
 //        parent link and receipts_root fold; phase 2 (q0 .. tip): every position placed again
 //        as a live node places it (tree, BinStore, rs_step_at, AR), its
 //        stored S, d, cum_work, H, live flags, mmr_root and AR row compared;
-//     6. the lane records at or beyond leaf_count deleted (one batch).
+//     6. the lane records at or beyond leaf_count deleted (one batch);
+//     7. K_BWORK: each key names its own height (the bound work below the
+//        floor; absent: none).
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -86,6 +91,7 @@ namespace c2pool::xmr::pathb {
 inline constexpr std::uint8_t K_PHEAD = 14;
 inline constexpr std::uint8_t K_PCARRIER = 15;
 inline constexpr std::uint8_t K_AR = 16;
+inline constexpr std::uint8_t K_BWORK = 17;
 
 namespace store_keys {
 inline std::string phead(std::uint32_t c) { return "v37s:phead:" + lane_keys::chain_fmt(c); }
@@ -93,6 +99,8 @@ inline std::string pcarrier_prefix(std::uint32_t c) { return "v37s:pcar:" + lane
 inline std::string pcarrier(std::uint32_t c, std::uint64_t pos) { return pcarrier_prefix(c) + lane_keys::index_fmt(pos); }
 inline std::string ar_prefix(std::uint32_t c) { return "v37s:ar:" + lane_keys::chain_fmt(c) + ":"; }
 inline std::string ar(std::uint32_t c, std::uint64_t h_act) { return ar_prefix(c) + lane_keys::index_fmt(h_act); }
+inline std::string bwork_prefix(std::uint32_t c) { return "v37s:bwork:" + lane_keys::chain_fmt(c) + ":"; }
+inline std::string bwork(std::uint32_t c, std::uint64_t h) { return bwork_prefix(c) + lane_keys::index_fmt(h); }
 // The poison mark: a store write failed; the next load is a load failure.
 inline std::string poison(std::uint32_t c) { return "v37s:poison:" + lane_keys::chain_fmt(c); }
 }  // namespace store_keys
@@ -337,6 +345,26 @@ inline std::optional<ActivationRow> decode_ar_row(const std::string& v) {
     return a;
 }
 
+inline std::string encode_bwork(std::uint64_t h, const ::c2pool::xmr::native::U128& w_) {
+    lane_rec::Writer w;
+    w.hdr(K_BWORK);
+    w.u64(h);
+    w.u64(w_.lo);
+    w.u64(w_.hi);
+    return w.s;
+}
+
+inline std::optional<std::pair<std::uint64_t, ::c2pool::xmr::native::U128>> decode_bwork(const std::string& v) {
+    lane_rec::Reader r(v);
+    if (!lane_rec::read_hdr(r, K_BWORK)) return std::nullopt;
+    std::pair<std::uint64_t, ::c2pool::xmr::native::U128> out;
+    out.first = r.u64();
+    out.second.lo = r.u64();
+    out.second.hi = r.u64();
+    if (!r.done()) return std::nullopt;
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
@@ -512,14 +540,17 @@ inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& h
 // no placements; the header bytes from the body, else from `prefix`; the
 // parent from the record below); the records from `root` up unchanged;
 // K_PHEAD with first_pos = first, root_pos = root and base_pos at least
-// root. K_BMMR, K_BLHASH, K_BLEAF and K_AR untouched. `head`: the store's
+// root; K_BWORK of each height in `below` (a full node's bound work below
+// the floor, at those heights). K_BMMR, K_BLHASH, K_BLEAF and K_AR
+// untouched. `head`: the store's
 // head (its first_pos and root_pos the current ones; the floors never move
 // back). nullopt: first above root, root above the tip, or a position the
 // store or the tree does not hold.
 inline std::optional<LaneBatch> prune_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree,
                                             const BinStore& store, const CarrierBodies& bodies, std::uint64_t first,
                                             std::uint64_t root,
-                                            const std::map<std::uint64_t, CarrierHeader>* prefix = nullptr) {
+                                            const std::map<std::uint64_t, CarrierHeader>* prefix = nullptr,
+                                            const std::map<std::uint64_t, ::c2pool::xmr::native::U128>* below = nullptr) {
     first = std::max(first, head.first_pos);
     root = std::max(root, head.root_pos);
     if (first > root || root > store.tip_pos()) return std::nullopt;
@@ -551,6 +582,8 @@ inline std::optional<LaneBatch> prune_batch(std::uint32_t chain, StoreHead& head
     head.root_pos = root;
     head.base_pos = std::max(head.base_pos, root);
     put_head(b, chain, head);
+    if (below != nullptr)
+        for (const auto& [h, w] : *below) b.put(store_keys::bwork(chain, h), encode_bwork(h, w));
     return b;
 }
 
@@ -558,7 +591,7 @@ inline std::optional<LaneBatch> prune_batch(std::uint32_t chain, StoreHead& head
 inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
             lane_keys::bmmr(chain),          lane_keys::blhash_prefix(chain),    lane_keys::bleaf_prefix(chain),
-            store_keys::poison(chain)};
+            store_keys::bwork_prefix(chain), store_keys::poison(chain)};
 }
 
 // An adoption (the first completed join, or a replacement by rule (4)) and the
@@ -599,6 +632,7 @@ enum class StoreFault : std::uint8_t {
     Phase2,     // a replayed position differs from its record
     Scan,       // the KV scan failed
     Poisoned,   // the store's poison mark: a write failed before the last stop
+    Work,       // a K_BWORK record torn or not under its own height
 };
 
 struct LoadInputs {
@@ -619,6 +653,7 @@ struct LoadedState {
     std::uint64_t phase1_from = 0;
     std::map<Hash32, XmrKeyRef> refs;  // the key references the restored placements and buckets hold, by identity
     std::map<std::uint64_t, CarrierHeader> prefix_headers;  // a joined store's claimed prefix headers, by position
+    std::map<std::uint64_t, ::c2pool::xmr::native::U128> bound_below;  // K_BWORK: bound work below the floor, by height
 };
 
 struct LoadResult {
@@ -934,7 +969,7 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     for (const std::optional<SealedBin>& sb : ll.bodies)
         if (sb)
             for (const XmrKeyRef& ref : sb->refs) refs[key_ref_identity(ref)] = ref;
-    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}};
+    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}, {}};
     // a joined store's claimed prefix headers (header records at or below the root)
     for (std::uint64_t x = H.first_pos; x <= std::min(H.root_pos, tip); ++x) {
         const CarrierRecord& c = rec_at(x);
@@ -944,6 +979,16 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         if (read_carrier_header(r, p.r_max, h) != WireError::None || r.remaining() != 0 || receipt_id(h.own) != c.id)
             return fail(StoreFault::Records, x);
         st.prefix_headers[x] = std::move(h);
+    }
+    // 7. K_BWORK
+    {
+        LaneKv bw;
+        if (!store_detail::scan(kv, store_keys::bwork_prefix(in.chain), bw)) return fail(StoreFault::Scan);
+        for (const auto& [k, v] : bw) {
+            const auto e = decode_bwork(v);
+            if (!e || k != store_keys::bwork(in.chain, e->first)) return fail(StoreFault::Work);
+            st.bound_below[e->first] = e->second;
+        }
     }
     out.state.emplace(std::move(st));
     out.fault = StoreFault::None;

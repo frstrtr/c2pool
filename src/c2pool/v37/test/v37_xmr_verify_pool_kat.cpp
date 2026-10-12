@@ -18,13 +18,18 @@
 //       RandomX call starts after stop() returns.
 //   N7  seed not held: a carrier whose seed C does not hold is parked once (a
 //       seed DEFER) and admitted when the follower's main chain moves.
+//   N8  RandomX throws once at C on A's carrier (a node-internal failure):
+//       a local alarm, no strike, no ban; the frame parked and run again:
+//       placed.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 
 #include "xmr_pathb_relay_test_util.hpp"
@@ -190,6 +195,29 @@ static bool n7(std::string& note) {
     return parked && placed && Cn->st().parked_reruns.load() >= 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0;
 }
 
+// N8: C's RandomX throws once: the carrier parked and run again; no token.
+static bool n8(std::string& note) {
+    Rig rig;
+    auto A = rig.make("A", opts(true, {}, 1, 4096), true);
+    if (!A->start()) return false;
+    auto Cn = rig.make("C", opts(false, {A->port()}, 1, 4096), false);
+    auto throws = std::make_shared<std::atomic<int>>(1);
+    Cn->rx = [throws](const pb::HashingBlob&, std::uint64_t, const pb::Hash32&) -> bool {
+        if (throws->fetch_sub(1) > 0) throw std::runtime_error("randomx: dataset");
+        return true;
+    };
+    if (!Cn->start()) return false;
+    if (!wait_until([&] { return A->r().ready_peers().size() == 1 && Cn->r().ready_peers().size() == 1; }, 5000ms)) return false;
+    rig.tick_monero();
+    if (rig.mine(*A, 0, 0x7100).action != pb::NodeAction::Placed) return false;
+    const pb::Hash32 c = A->best();
+    const bool placed = wait_until([&] { return Cn->best() == c; }, 10000ms);
+    note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", strikes " +
+           std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load());
+    return placed && Cn->st().rx_failures.load() >= 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0 &&
+           Cn->r().ready_peers().size() == 1;
+}
+
 int main() {
     Checker C;
     std::printf("v37_xmr_verify_pool_kat (the Path B relay node)\n");
@@ -228,5 +256,9 @@ int main() {
     std::string n7note;
     const bool n7ok = n7(n7note);
     C(n7ok, "N7 a carrier whose seed C does not hold is parked once and admitted when the follower's chain moves (" + n7note + ")");
+    // N8: a RandomX exception is node-internal
+    std::string n8note;
+    const bool n8ok = n8(n8note);
+    C(n8ok, "N8 RandomX throws once at C: no strike, no ban, the link kept; the carrier parked and placed (" + n8note + ")");
     return C.done("v37_xmr_verify_pool_kat");
 }

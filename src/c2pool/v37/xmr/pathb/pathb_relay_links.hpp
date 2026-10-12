@@ -59,6 +59,8 @@ public:
     std::string remote_ip(std::uint64_t p) const override { return net_.remote_ip(p); }
     std::size_t n_peers() const override { return net_.n_peers(); }
     void stop() override { net_.stop(); }
+    std::size_t queued_bytes(std::uint64_t p) const override { return net_.queued_bytes(p); }
+    std::size_t send_queue_limit() const override { return net_.send_queue_limit(); }
 
 private:
     ::c2pool::v37n::CarrierPeerNode net_;
