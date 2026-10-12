@@ -126,7 +126,7 @@ struct PathbRelayOptions {
     std::size_t max_inbound = 101;                               // accepted links
     std::size_t max_inbound_per_addr = 1;
     std::size_t max_outbound = 12;                               // dialed links kept up
-    std::size_t send_queue_bytes = 16u << 20;                    // per link (at least one FC_HEADERS frame, P-14)
+    std::size_t send_queue_bytes = 16u << 20;                    // per link (at least two FC_HEADERS frames, P-14)
     std::uint32_t connect_timeout_ms = 3000;                     // discovery dials
     std::uint32_t hello_timeout_ms = 10000;
     // the invalid-object budget and the ban (unset: relay_budget_default at verify_threads and max_inbound +
@@ -317,7 +317,9 @@ public:
         out.verify = [this, rx = std::move(rx)](const HashingBlob& b, std::uint64_t d, const Hash32& seed) {
             if (!rx) return false;
             const JoinRelease r(*this);
-            return rx(b, d, seed);
+            const bool ok = rx(b, d, seed);
+            rx_ok_++;  // a hash computed (the RandomX alarm's recovery)
+            return ok;
         };
         return out;
     }
@@ -338,7 +340,25 @@ public:
         valid_cap_ = o_.peer_valid_capacity.value_or(
                 static_cast<double>(c.pending_cap != 0 ? c.pending_cap : relay_horizons(c.p).pending_cap));
     }
-    void set_ctx_source(PathbCtxSource s) { ctx_ = std::move(s); }
+    // The context source; its RandomX call leaves every exception as RandomxFailure (node-internal).
+    void set_ctx_source(PathbCtxSource s) {
+        if (s.rx)
+            s.rx = [this, rx = std::move(s.rx)](const std::vector<std::uint8_t>& blob, const Hash32& seed, Hash32& pow) {
+                bool ok = false;
+                try {
+                    ok = rx(blob, seed, pow);
+                } catch (const RandomxFailure&) {
+                    throw;
+                } catch (const std::exception& e) {
+                    throw RandomxFailure(e.what());
+                } catch (...) {
+                    throw RandomxFailure("RandomX: unknown failure");
+                }
+                rx_ok_++;
+                return ok;
+            };
+        ctx_ = std::move(s);
+    }
     // Manual mode: called while a ticket or a wait has nothing to read (deliver one message; false: nothing moved).
     void set_drive(std::function<bool()> f) { drive_ = std::move(f); }
 
@@ -348,8 +368,8 @@ public:
             why = "relay: no node attached";
             return false;
         }
-        if (o_.send_queue_bytes < headers_frame_) {
-            why = "relay: send queue " + std::to_string(o_.send_queue_bytes) + " B below one FC_HEADERS frame (" +
+        if (o_.send_queue_bytes < 2 * headers_frame_) {
+            why = "relay: send queue " + std::to_string(o_.send_queue_bytes) + " B below two FC_HEADERS frames (2 x " +
                   std::to_string(headers_frame_) + " B)";
             return false;
         }
@@ -614,6 +634,7 @@ public:
         drive_ctx();
         node_tick();
         reoffer_pump_all();
+        rx_tick();
     }
 
     // ---- the rig and the status ----
@@ -997,7 +1018,13 @@ private:
     // skipped.
     void post_from(std::uint64_t p, std::function<void()> fn) {
         if (!o_.threads) {
-            post(std::move(fn));
+            post([this, p, f = std::move(fn)] {
+                if (!peer_known(p)) {  // its link went down while the event waited
+                    st_.stale_events++;
+                    return;
+                }
+                f();
+            });
             return;
         }
         {
@@ -1257,6 +1284,11 @@ private:
 
     // ---- the verify pool ----
     void enqueue_job(Job j) {
+        // P-15 at arrival: above the peer's valid-object budget an unsolicited frame is DROPPED (counted; no token)
+        if (!j.solicited && !j.rerun && !valid_has(j.peer)) {
+            st_.p15_drops++;
+            return;
+        }
         {
             std::lock_guard<std::mutex> lk(vmtx_);
             if (vq_.size() >= o_.verify_queue_max) {
@@ -1309,11 +1341,7 @@ private:
             st_.banned_src_dropped++;
             return;
         }
-        if (!j.solicited && !j.rerun && !valid_has(j.peer)) {  // P-15: above the peer's valid-object budget: DROP
-            st_.p15_drops++;
-            return;
-        }
-        j.rerun = true;  // a later try of this job (no token, a RandomX failure) is not gated again
+        j.rerun = true;  // a later try of this job (no token, a RandomX failure)
         bool granted = false;
         {
             std::lock_guard<std::mutex> lk(vmtx_);
@@ -1346,7 +1374,7 @@ private:
                 if (!j.solicited) fresh = new_carried(j.frame);
                 try {
                     t = node_->begin_carrier(j.peer, j.frame);
-                } catch (...) {
+                } catch (const RandomxFailure&) {
                     rx_fail = true;
                 }
             }
@@ -1359,8 +1387,10 @@ private:
             const bool kept = t.admit.verdict == AdmitVerdict::Strike || t.admit.verdict == AdmitVerdict::Ban;
             if (!kept) refund(j);
             const bool taken = kept && !j.solicited;
-            const bool counted = !j.solicited;
-            post([this, t = std::move(t), taken, counted, fresh]() mutable { complete_job(std::move(t), taken, counted, fresh); });
+            const bool solicited = j.solicited;
+            post([this, t = std::move(t), taken, solicited, fresh]() mutable {
+                complete_job(std::move(t), taken, solicited, fresh);
+            });
             return;
         }
         std::vector<NodeEventResult> rs;
@@ -1375,7 +1405,7 @@ private:
             }
             try {
                 rs = node_->on_receipts(j.peer, j.frame);
-            } catch (...) {
+            } catch (const RandomxFailure&) {
                 rx_fail = true;
             }
             if (!rx_fail)
@@ -1399,7 +1429,10 @@ private:
         if (!kept) refund(j);
         run_effects(fx);
     }
-    void complete_job(PathbNode::CarrierTicket t, bool token_kept, bool counted = false, std::uint64_t fresh = 0) {
+    // The placement on the owner. The carriers it releases whose admission fails with a RandomX failure come back
+    // from the node (take_rx_failed) and are parked and run again; the placed carrier keeps its result and effects.
+    // A RandomX failure of this frame's own re-admission parks this frame (its solicited state kept).
+    void complete_job(PathbNode::CarrierTicket t, bool token_kept, bool solicited = false, std::uint64_t fresh = 0) {
         const std::uint64_t peer = t.peer;
         const Hash32 digest = ::v37::sha256d(t.frame);
         std::vector<std::uint8_t> frame = t.frame;
@@ -1410,31 +1443,41 @@ private:
             const NodeGuard g(*this);
             try {
                 r = node_->complete_carrier(std::move(t));
-            } catch (...) {
+            } catch (const RandomxFailure&) {
                 rx_fail = true;
             }
             if (!rx_fail) after_result_locked(peer, r, digest, fx);
+            take_rx_failed_locked(fx);
         }
         if (rx_fail) {
-            Job j{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, false, true};
-            st_.rx_failures++;
-            log("relay: RandomX failed (carrier placement), frame parked");
-            park_job(std::move(j), now_ms() + kParkRetryMs);
+            rx_alarm("carrier placement");
+            park_job(Job{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true}, now_ms() + kParkRetryMs);
+            run_effects(fx);
             return;
         }
-        if (counted && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
-                        r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
+        if (!solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
+                           r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
             valid_count(peer, 1 + fresh);  // the carrier's own body and its first-seen carried bodies
         (void)apply_result(peer, r, token_kept);
         run_effects(fx);
     }
-    // A RandomX failure (an exception from the hash) inside an admission: node-internal, a local alarm; the token
+    // A RandomX failure (RandomxFailure from the hash) inside an admission: node-internal, a local alarm; the token
     // goes back and the frame is parked and run again; no strike, no ban.
     void rx_failed(Job j, const char* where) {
-        st_.rx_failures++;
-        log(std::string("relay: RandomX failed (") + where + "), frame parked");
+        rx_alarm(where);
         refund(j);
         park_job(std::move(j), now_ms() + kParkRetryMs);
+    }
+    // The alarm: every failure counted; a log line when RandomX starts failing and one when a hash is computed again
+    // (rx_tick).
+    void rx_alarm(const std::string& where) {
+        st_.rx_failures++;
+        rx_mark_ = rx_ok_.load();
+        if (!rx_failing_.exchange(true)) log("relay: RandomX failing (" + where + "): frames parked and run again");
+    }
+    void rx_tick() {
+        if (rx_failing_.load() && rx_ok_.load() > rx_mark_.load() && rx_failing_.exchange(false))
+            log("relay: RandomX hashes again");
     }
     // Under the node lock: the carried bodies of a carrier frame this node holds no pending copy of.
     std::uint64_t new_carried(const std::vector<std::uint8_t>& f) {
@@ -1500,7 +1543,12 @@ private:
         std::vector<std::pair<Hash32, std::uint64_t>> ctx;  // (a Monero block, the peer that sent the object)
         std::vector<std::uint64_t> bans;                    // servers of refuted walked variants or body sets
         std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
+        std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
     };
+    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park.
+    void take_rx_failed_locked(Effects& fx) {
+        for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
+    }
     // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
     // TipBodies DEFER bound and placed, the joiner's signal.
@@ -1535,7 +1583,18 @@ private:
             case Missing::ClosureBodies: request_body_set(peer, r.admit.fetch, d); break;
             case Missing::Bodies: request_carrier(peer, r.admit.fetch); break;
             case Missing::TipBodies: {
-                const PathbNode::WalkBind wb = node_->bind_walked_branch(r.admit.bind);
+                PathbNode::WalkBind wb;
+                try {
+                    wb = node_->bind_walked_branch(r.admit.bind);
+                } catch (const RandomxFailure&) {
+                    // node-internal: the parked frame runs again after kParkRetryMs (no token)
+                    if (d) {
+                        parked_by_cause_[m].erase(*d);
+                        if (std::optional<ParkedFrame> f = node_->take_parked(*d)) fx.rx_retry.push_back(std::move(*f));
+                    }
+                    take_rx_failed_locked(fx);
+                    break;
+                }
                 st_.walk_placed += wb.placed.size();
                 fx.bans.insert(fx.bans.end(), wb.banned.begin(), wb.banned.end());
                 fx.strikes.insert(fx.strikes.end(), wb.struck.begin(), wb.struck.end());
@@ -1552,6 +1611,7 @@ private:
             case Missing::MissingBucket: bucket_fetch(r.admit.fetch, r.admit.fetch_bin, peer); break;
             default: break;  // ParentUnknown: the node's own FC_GETCARRIER; MissingRef: a served bucket's references
         }
+        take_rx_failed_locked(fx);
     }
     static bool rerun_cause(Missing m) {
         switch (m) {
@@ -1624,7 +1684,12 @@ private:
             default: return false;
         }
     }
-    void run_effects(const Effects& fx) {
+    void run_effects(Effects& fx) {
+        for (ParkedFrame& f : fx.rx_retry) {  // parked and run again (no token)
+            rx_alarm("released carrier");
+            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, false, true}, now_ms() + kParkRetryMs);
+        }
+        fx.rx_retry.clear();
         for (std::uint64_t q : fx.bans) ban(q);
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
         for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0);
@@ -1829,8 +1894,9 @@ private:
         reoffer_pump(p);
     }
     // The re-offer of one peer, paged: a frame is queued only while the link's queued bytes with it (and its u32 length
-    // prefix) stay within the link's bound; the rest waits for the queue to drain (the maintenance tick). Bodies no
-    // longer pending are skipped. One pump per peer at a time (HELLO and the tick).
+    // prefix) stay within the link's bound less one FC_HEADERS frame (P-14: room for a serve reply and live traffic);
+    // the rest waits for the queue to drain (the maintenance tick). Bodies no longer pending are skipped. One pump per
+    // peer at a time (HELLO and the tick).
     void reoffer_pump(std::uint64_t p) {
         {
             std::lock_guard<std::mutex> lk(rmtx_);
@@ -1867,7 +1933,7 @@ private:
             if (!chunk.empty()) fr = encode_fb_receipts(chain_id_, chunk, p_);
             if (fr) {
                 const std::size_t bound = links_.send_queue_limit();
-                if (bound != 0 && links_.queued_bytes(p) + fr->size() + 4 > bound) {
+                if (bound != 0 && links_.queued_bytes(p) + fr->size() + 4 + headers_frame_ > bound) {
                     st_.reoffer_paused++;
                     return;
                 }
@@ -1922,9 +1988,8 @@ private:
             const NodeGuard g(*this);
             try {
                 o = node_->on_headers(p, f, now_s());
-            } catch (...) {  // a RandomX failure: node-internal, a local alarm; no token; the catch-up asks again
-                st_.rx_failures++;
-                log("relay: RandomX failed (headers), asked again");
+            } catch (const RandomxFailure&) {  // node-internal, a local alarm; no token; the catch-up asks again
+                rx_alarm("headers");
                 return;
             }
             {
@@ -2446,8 +2511,10 @@ private:
     }
     void node_tick() {
         bool rerun = false, join = false;
+        Effects rfx;  // released carriers whose admission failed with a RandomX failure (an own share's placement)
         {
             const NodeGuard g(*this);
+            take_rx_failed_locked(rfx);
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
             std::lock_guard<std::mutex> lk(cumtx_);
             for (auto it = catchup_.begin(); it != catchup_.end();) {
@@ -2472,6 +2539,7 @@ private:
         }
         if (rerun) rerun_parked(Missing::MissingBucket);
         if (join) signal_join();
+        run_effects(rfx);
     }
 
     // ---- liveness (FB_PING / FB_PONG) ----
@@ -2937,9 +3005,8 @@ private:
                                 return it->second;
                             },
                             o_.ctx_max_depth, ctx_.rx);
-                } catch (...) {  // a RandomX failure: node-internal, a local alarm; the context is judged again later
-                    st_.rx_failures++;
-                    log("relay: RandomX failed (context " + hex_short(id) + "), judged again");
+                } catch (const RandomxFailure&) {  // node-internal, a local alarm; the context is judged again later
+                    rx_alarm("context " + hex_short(id));
                     return false;
                 }
             } else {
@@ -3154,6 +3221,9 @@ private:
     std::mutex rmtx_;  // re-offer cursors
     std::map<std::uint64_t, std::deque<Hash32>> reoffer_;
     std::set<std::uint64_t> pumping_;  // the peers whose re-offer a thread is pumping
+    std::atomic<std::uint64_t> rx_ok_{0};    // RandomX hashes computed (node and context)
+    std::atomic<std::uint64_t> rx_mark_{0};  // rx_ok_ at the last RandomX failure
+    std::atomic<bool> rx_failing_{false};    // a RandomX failure since the last hash computed
     mutable std::mutex emtx_;  // events
     std::condition_variable ecv_;
     std::condition_variable fcv_;      // a reader waiting for its peer's event in flight

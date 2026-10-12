@@ -94,6 +94,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -389,6 +390,14 @@ struct NodeStore {
     bool drop_side(const Hash32& id) { return s.drop_side(id); }
 };
 
+// A RandomX failure: the hash could not be computed (the engine, its seed
+// cache, memory). Node-internal, never a verdict on the object judged. Every
+// exception from PathbNodeIo::verify leaves the node as this type
+// (verify_memo); a relay catches this type only.
+struct RandomxFailure : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // ---------------------------------------------------------------------------
 // PathbNode
 // ---------------------------------------------------------------------------
@@ -631,6 +640,9 @@ public:
     // A parked frame's walked headers or bodies are asked of `peer` at most once while that peer holds its variants.
     bool may_ask(const Hash32& digest, std::uint64_t peer) { return deferred_.may_ask(digest, peer); }
     // The parked frames marked for a re-walk (data they walked arrived), taken out of the deferred store.
+    // The released carriers whose admission failed with a RandomX failure (drain_released): the caller runs them
+    // again.
+    std::vector<ParkedFrame> take_rx_failed() { return std::exchange(rx_failed_, {}); }
     std::vector<ParkedFrame> take_rewalk_frames() {
         std::vector<ParkedFrame> out;
         if (poisoned_) return out;
@@ -1583,7 +1595,8 @@ private:
     }
 
     // RandomX through the verified-body memo (a body is hashed once); the
-    // node's own share returns its own hash's result.
+    // node's own share returns its own hash's result. An exception from
+    // io.verify leaves as RandomxFailure (node-internal).
     bool verify_memo(const HashingBlob& blob, std::uint64_t d, const Hash32& seed) {
         const Hash32 id = receipt_id(blob);
         if (own_pow_ && own_pow_->id == id) {
@@ -1594,7 +1607,16 @@ private:
         const MemoKey k{id, d, seed};
         if (const auto it = memo_.find(k); it != memo_.end()) return it->second;
         ++verify_calls_;
-        const bool ok = io_.verify && io_.verify(blob, d, seed);
+        bool ok = false;
+        try {
+            ok = io_.verify && io_.verify(blob, d, seed);
+        } catch (const RandomxFailure&) {
+            throw;
+        } catch (const std::exception& e) {
+            throw RandomxFailure(e.what());
+        } catch (...) {
+            throw RandomxFailure("RandomX: unknown failure");
+        }
         memo_.emplace(k, ok);
         memo_order_.push_back(k);
         while (memo_order_.size() > memo_cap()) {
@@ -2051,6 +2073,7 @@ private:
         abandoned_.clear();
         closed_.clear();
         release_q_.clear();
+        rx_failed_.clear();
         load_failed_ = false;
         poisoned_ = false;
         reask_pending_ = false;
@@ -2226,6 +2249,8 @@ private:
 
     // The carriers released by a placement wait in a queue the outermost event
     // drains (one level of placement at a time, whatever the parked chain's length).
+    // A released carrier whose admission fails with a RandomX failure keeps its
+    // parked state in rx_failed_ (take_rx_failed); the rest continue.
     void drain_released() {
         if (draining_ || settle_depth_ != 0) return;
         draining_ = true;
@@ -2233,7 +2258,11 @@ private:
             while (!release_q_.empty() && !poisoned_) {
                 ParkedFrame f = std::move(release_q_.front());
                 release_q_.pop_front();
-                (void)on_carrier(f.peer, f.frame);
+                try {
+                    (void)on_carrier(f.peer, f.frame);
+                } catch (const RandomxFailure&) {
+                    rx_failed_.push_back(std::move(f));
+                }
             }
         } catch (...) {
             release_q_.clear();
@@ -2494,6 +2523,7 @@ private:
     JoinServeHold hold_;
     std::set<std::uint64_t> hold_conns_;
     std::deque<ParkedFrame> release_q_;
+    std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
     // the joiner (E15): its inputs, the queue and the adopted state, the full node's own chain as A, one link per
     // Path B peer over the relay's transport, the E-72 re-ask's buckets
     JoinInputs join_in_;
