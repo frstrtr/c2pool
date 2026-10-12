@@ -458,6 +458,7 @@ public:
         head_ = loaded.head;
         *refs_ = std::move(loaded.refs);
         own_prefix_ = std::move(loaded.prefix_headers);
+        own_chain_.seed_below(std::move(loaded.bound_below));
         init_join();
     }
 
@@ -1142,8 +1143,10 @@ public:
     // served from the prefix headers), side branches forking at or above
     // floors.sides; one store batch (prune_batch; a failed commit poisons the
     // store). The MMR, K_BLHASH, K_BLEAF and K_AR are kept; A's bound-work
-    // profile keeps the work it counted. Nothing while poisoned, after a load
-    // failure, or while a join attempt runs (it reads A).
+    // profile keeps the work it counted (a full node's work below the floor
+    // in the same batch, K_BWORK, loaded at a restart). Nothing while
+    // poisoned, after a load failure, or while a join attempt runs (it reads
+    // A).
     struct PruneReport {
         PruneFloors floors;
         std::uint64_t root = 0;    // the tree's lowest position after the step
@@ -1167,8 +1170,10 @@ public:
             own_chain_.forget_below(root);
         StoreHead head = head_;
         std::map<std::uint64_t, CarrierHeader>* pre = joined_ != nullptr ? &joined_->prefix_headers : &own_prefix_;
+        const std::map<std::uint64_t, U128> below = joined_ == nullptr ? own_chain_.below_unwritten()
+                                                                         : std::map<std::uint64_t, U128>{};
         const std::optional<LaneBatch> b =
-                prune_batch(cfg_.record_chain, head, *tree_, *store_, *bodies_, first, root, pre);
+                prune_batch(cfg_.record_chain, head, *tree_, *store_, *bodies_, first, root, pre, &below);
         if (!b) return out;
         if (PathbKv* kv = store_kv()) {
             if (!commit_lane_batch(*kv, *b)) {
@@ -1177,6 +1182,7 @@ public:
             }
             out.written = true;
         }
+        if (joined_ == nullptr) own_chain_.below_written();
         head_ = head;
         // the headers of the positions whose bodies go, served from the prefix headers
         for (std::uint64_t x = std::max(first, out.root); x < root; ++x)
@@ -1835,9 +1841,10 @@ private:
     // on_chain = A's best chain, never "held"; no x1; the journal base; the
     // bound work of positions 1 .. tip kept along the best chain (each position
     // counted once, a switch recounting above its fork; an unchanged chain the
-    // same instance; a prune keeps the work counted below its floor; a tree
-    // loaded from a pruned store counts from its root); the open-bin
-    // placements of the best chain.
+    // same instance; a prune keeps the work counted below its floor, stored
+    // in the prune batch; a tree loaded from a pruned store counts from its
+    // root, the stored work below it loaded); the open-bin placements of the
+    // best chain.
     class FullNodeA final : public AdoptedChain {
     public:
         explicit FullNodeA(const PathbNode& n) : n_(&n) {}
@@ -1862,17 +1869,40 @@ private:
         void reset() {
             counted_.clear();
             counted_at_.clear();
+            below_.clear();
+            unwritten_.clear();
             profile_ = std::make_shared<BoundWork>();
         }
+        // A loaded store: the bound work stored below its floor (K_BWORK), by height.
+        void seed_below(std::map<std::uint64_t, U128> below) {
+            reset();
+            below_ = std::move(below);
+            profile_->at = below_;
+        }
         // A prune: the positions below `pos` leave the count's bookkeeping (counted first); their work stays in the
-        // profile.
+        // profile, held as the work below the floor (written with the prune batch).
         void forget_below(std::uint64_t pos) {
             sync();
             if (pos <= lo_) return;
             const std::size_t k = static_cast<std::size_t>(std::min<std::uint64_t>(counted_.size(), pos - lo_));
+            for (std::size_t i = 0; i < k; ++i) {
+                const Counted& c = counted_[i];
+                below_[c.h] = ::c2pool::xmr::native::u128_add(below_[c.h], U128{c.d, 0});
+                unwritten_.insert(c.h);
+                if (const auto it = counted_at_.find(c.h); it != counted_at_.end() && --it->second == 0)
+                    counted_at_.erase(it);
+            }
             counted_.erase(counted_.begin(), counted_.begin() + static_cast<std::ptrdiff_t>(k));
             lo_ += k;
         }
+        // The heights whose work below the floor the store does not hold yet.
+        std::map<std::uint64_t, U128> below_unwritten() const {
+            std::map<std::uint64_t, U128> out;
+            for (const std::uint64_t h : unwritten_) out[h] = below_.at(h);
+            return out;
+        }
+        void below_written() { unwritten_.clear(); }
+        const std::map<std::uint64_t, U128>& below() const noexcept { return below_; }
 
     private:
         struct Counted {
@@ -1902,7 +1932,11 @@ private:
                 if (it == counted_at_.end()) continue;
                 if (--it->second == 0) {
                     counted_at_.erase(it);
-                    w.at.erase(c.h);
+                    // the work below the floor at this height stays
+                    if (const auto bt = below_.find(c.h); bt != below_.end())
+                        w.at[c.h] = bt->second;
+                    else
+                        w.at.erase(c.h);
                 } else {
                     w.at[c.h] = bound_work_minus(w.at[c.h], U128{c.d, 0});
                 }
@@ -1920,6 +1954,8 @@ private:
         mutable std::uint64_t lo_ = 1;  // the position of counted_[0]
         mutable std::vector<Counted> counted_;
         mutable std::map<std::uint64_t, std::uint64_t> counted_at_;
+        std::map<std::uint64_t, U128> below_;  // the work counted below the prune floor, by height
+        std::set<std::uint64_t> unwritten_;    // its heights not yet in the store
         mutable std::shared_ptr<BoundWork> profile_ = std::make_shared<BoundWork>();
     };
 

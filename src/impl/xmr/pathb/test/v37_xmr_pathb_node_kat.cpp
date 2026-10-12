@@ -102,6 +102,15 @@
 //                each with its own PathbNode: HELLO both ways, the catch-up,
 //                a carrier mined by one placed by the other; a HELLO of frame
 //                version 0x01 refused and its link closed, no strike, no ban.
+//   relayp15     P-15: the default capacity P-09; a first-seen receipt counts
+//                one, a duplicate none; above the budget a frame is DROPPED,
+//                no strike, no ban, the link kept; refilled at (1 + R_MAX) / T;
+//   relaystale   a gone peer's events (in flight, posted by its blocked
+//                reader) skipped: no join hold for the gone peer;
+//   relaytip     on_monero_tip from the follower's thread and under the node
+//                lock: both return; the parked index runs again.
+//   relaysq      a send queue bound below one FC_HEADERS frame (0 among them)
+//                refused at start.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -114,6 +123,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -1746,8 +1756,10 @@ struct KatRelay {
     std::size_t node = 0;
 };
 
-// A relay node in manual mode on the harness's clock with its own PathbNode (a load failure when `failed`).
-KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch, bool failed = false) {
+// A relay node in manual mode on the harness's clock with its own PathbNode (a load failure when `failed`;
+// `tweak`: its options changed).
+KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch, bool failed = false,
+                   const std::function<void(pb::PathbRelayOptions&)>& tweak = nullptr) {
     KatRelay k;
     k.links = std::make_unique<FakeLinks>();
     k.links->wire = &w;
@@ -1756,6 +1768,7 @@ KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch
     pb::PathbRelayOptions o;
     o.threads = false;
     o.keepalive_ms = 0;
+    if (tweak) tweak(o);
     pb::RelayClock clock;
     clock.mono_ms = [&h] { return h.now * 1000; };
     clock.wall_s = [&h] { return h.now; };
@@ -2377,7 +2390,8 @@ void prune_young() {
 // prune_default: at 7,000 positions the default floors: bodies and tree nodes from x0(L') - J_0 - 1, carrier records
 // from the retarget window through the tree's root (below the P-51 header floor), side branches from the body floor.
 // One store batch; K_BLHASH, K_BLEAF, K_BMMR, K_AR unchanged; the lane digest unchanged; the pruned node serves the
-// items it keeps and not the ones below; a restart reloads to the same lane digest and root window.
+// items it keeps and not the ones below; a restart reloads to the same lane digest and root window; A's bound work
+// below the floor in the prune batch (K_BWORK), loaded at the restart: the same profile, the same rule (4) verdict.
 void prune_default() {
     PruneChain& c = prune_chain();
     Harness h(c.net);
@@ -2416,6 +2430,20 @@ void prune_default() {
     check(keys_of(kv, pb::lane_keys::blhash_prefix(0)) == blhash && keys_of(kv, pb::lane_keys::bleaf_prefix(0)) == bleaf
                   && keys_of(kv, pb::store_keys::ar_prefix(0)) == ar && kv.data.at(pb::lane_keys::bmmr(0)) == bmmr,
           "prune default: K_BLHASH, K_BLEAF, K_AR and K_BMMR unchanged");
+    {
+        // K_BWORK: the heights of positions 1 .. root - 1, each with the work A counted there below the floor
+        std::set<std::uint64_t> want;
+        for (std::uint64_t x = 1; x < w.bodies; ++x) want.insert(h_pos(x));
+        bool keyed = count_keys(kv, pb::store_keys::bwork_prefix(0)) == want.size();
+        for (const std::uint64_t ht : want) {
+            const auto it = kv.data.find(pb::store_keys::bwork(0, ht));
+            const auto e = it == kv.data.end() ? std::nullopt : pb::decode_bwork(it->second);
+            keyed = keyed && e && e->first == ht && (e->second.lo != 0 || e->second.hi != 0);
+        }
+        check(keyed, "prune default: K_BWORK in the prune batch, one record per height below the floor ("
+                             + std::to_string(count_keys(kv, pb::store_keys::bwork_prefix(0))) + " of "
+                             + std::to_string(want.size()) + ")");
+    }
     check(h[a].lane_digest() == digest, "prune default: the lane digest at the tip unchanged");
     const pb::PathbNode::PruneReport again = h[a].prune(h.now);
     check(!again.written && again.root == r.root && again.first == r.first && kv.commits == commits + 1,
@@ -2453,7 +2481,7 @@ void prune_default() {
                   + std::to_string(p3.headers.size()) + ")");
     check(buckets_served(*h[a].store().best_at(w.bodies + 1)) && !buckets_served(at_fb) && !buckets_served(below_fb),
           "prune default: FC_GETBUCKETS at a carrier above the root served; at the root and below: not served");
-    // A's bound work: the pruned node keeps what it counted (from position 1); a restart counts from the root
+    // A's bound work: the pruned node keeps what it counted (from position 1); a restart loads the part below the root
     const auto pa = pb::PathbNodeTestAccess::own_profile(h[a]);
     const std::uint64_t h_root = h_pos(w.bodies);
     check(pa && pa->lowest() == h_pos(1) && pa->highest() == h_pos(kPruneL),
@@ -2467,15 +2495,24 @@ void prune_default() {
           "prune default: the pruned store reloads (root, first record, the root's retarget window) to the same lane digest");
     if (b == SIZE_MAX) return;
     const auto pb_ = pb::PathbNodeTestAccess::own_profile(h[b]);
-    const auto from_root = [&](const pb::BoundWork& x) {
-        pb::U128 s{};
-        for (const auto& [ht, wk] : x.at)
-            if (ht > h_root) s = ::c2pool::xmr::native::u128_add(s, wk);
-        return s;
-    };
-    check(pb_ && pb_->lowest() && *pb_->lowest() == h_root && pb_->highest() == h_pos(kPruneL)
-                  && from_root(*pb_).lo == from_root(*pa).lo && from_root(*pb_).hi == from_root(*pa).hi,
-          "prune default: after the restart A's bound work counts from the root's height, equal above it");
+    check(pb_ && pa && pb_->lowest() == h_pos(1) && pb_->highest() == h_pos(kPruneL) && pb_->at == pa->at
+                  && pb_->lowest() < std::optional<std::uint64_t>(h_root),
+          "prune default: after the restart A's bound work counts positions 1 .. L, equal");
+    // rule (4): a candidate whose bound part starts below the root (A's work from a height below the root, 2 more
+    // there, 1 less at the top) is judged the same before and after the restart
+    if (!pa || !pb_ || pa->at.empty()) return;
+    pb::BoundWork cand;
+    const std::uint64_t h_c = h_pos(w.bodies / 2);
+    for (auto it = pa->at.lower_bound(h_c); it != pa->at.end(); ++it) cand.at[it->first] = it->second;
+    cand.at[h_c] = ::c2pool::xmr::native::u128_add(cand.at[h_c], pb::U128{2, 0});
+    cand.at.rbegin()->second = pb::bound_work_minus(cand.at.rbegin()->second, pb::U128{1, 0});
+    pb::Hash32 c_tip{};
+    c_tip.fill(0xff);
+    const bool before = pb::candidate_replaces(cand, c_tip, *pa, h[a].store().best_tip());
+    const bool after = pb::candidate_replaces(cand, c_tip, *pb_, h[b].store().best_tip());
+    check(h_c < h_root && before && after,
+          std::string("prune default: rule (4), a candidate bound from below the root: replaces before the restart ")
+                  + (before ? "yes" : "no") + ", after " + (after ? "yes" : "no"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2683,6 +2720,223 @@ void relayindex() {
                   std::to_string(e3) + ")");
 }
 
+// ---------------------------------------------------------------------------
+// The per-link send queue bound: at least one FC_HEADERS frame (P-14); a smaller bound (0 among them) is refused at
+// start.
+void relaysq() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    const std::size_t hf = static_cast<std::size_t>(h[a.node].frame_bytes_headers());
+    const auto starts = [&](std::size_t bytes, std::string& why) {
+        try {
+            KatRelay k = kat_relay(h, w, table0(net), true, false, [bytes](pb::PathbRelayOptions& o) { o.send_queue_bytes = bytes; });
+            k.relay->stop();
+            w.relays.pop_back();
+            return true;
+        } catch (const std::runtime_error& e) {
+            why = e.what();
+            return false;
+        }
+    };
+    std::string w0, w1, w2;
+    const bool s0 = starts(0, w0), s1 = starts(hf - 1, w1), s2 = starts(hf, w2);
+    check(hf > 0 && !s0 && !s1 && s2 && w0.find("send queue") != std::string::npos,
+          "relaysq: a send queue bound below one FC_HEADERS frame (" + std::to_string(hf) + " B) refused at start (0: '" +
+                  w0 + "'); one frame accepted");
+}
+
+// ---------------------------------------------------------------------------
+// P-15, the per-peer valid-object budget: the default capacity is P-09 (the pending cap). With a capacity of 4 at B:
+// a first-seen receipt counts one, a duplicate none; once the budget is spent a frame is DROPPED (counted): no strike,
+// no ban, the link kept; the bucket refills at (1 + R_MAX) / T objects/s.
+void relayp15() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.peer_valid_capacity = 4; });
+    KatRelay d = kat_relay(h, w, table0(net), false);
+    const double cap = static_cast<double>(pb::relay_horizons(pb::kRuledLaneParams).pending_cap);
+    check(d.relay->peer_valid_left(7) == cap && cap == 18432.0,
+          "relayp15: the default capacity is P-09 (" + std::to_string(d.relay->peer_valid_left(7)) + ")");
+    w.connect(0, 1);
+    w.run();
+    // six receipts B lacks: shares of jobs on A's tip after A moved on (A's carrier not delivered to B)
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t k = 0; k < 6; ++k)
+        if (const std::optional<pb::PathbJob> j = h.job(a.node, k + 2, 610 + k)) jobs.push_back(*j);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    bool ok = jobs.size() == 6 && mine_on(h, w, a.node, 1, 620);
+    for (std::uint32_t k = 0; ok && k < 6; ++k)
+        ok = h[a.node].on_own_share(jobs[k], 610 + k, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    std::vector<pb::ReceiptBodyV3> rs;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) rs.push_back(r->body);
+    ok = ok && rs.size() == 6 && h[b.node].pending().size() == 0;
+    h.now += 1000;  // B's bucket full again
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = 1;  // A at B
+    const auto send = [&](const pb::ReceiptBodyV3& r) {
+        const std::vector<pb::ReceiptBodyV3> one{r};
+        rb.receive(pa, *pb::encode_fb_receipts(0, one, pb::kRuledLaneParams));
+        w.run();
+    };
+    const std::uint64_t d0 = rb.stats().p15_drops.load();
+    const double full = rb.peer_valid_left(pa);
+    send(rs[0]);
+    const double one = rb.peer_valid_left(pa);
+    for (int i = 0; i < 3; ++i) send(rs[0]);
+    const double dup = rb.peer_valid_left(pa);
+    check(ok && full == 4.0 && one == 3.0 && dup == 3.0 && rb.stats().p15_drops.load() == d0,
+          "relayp15: capacity 4; a first-seen receipt counts one (" + std::to_string(one) + " left), three duplicates "
+          "none (" + std::to_string(dup) + " left)");
+    for (std::size_t k = 1; k < 6; ++k) send(rs[k]);
+    const std::uint64_t drops = rb.stats().p15_drops.load() - d0;
+    check(drops == 2 && h[b.node].pending().size() == 4 && !h[b.node].pending().holds(pb::receipt_id(rs[4]))
+                  && !h[b.node].pending().holds(pb::receipt_id(rs[5])) && rb.strikes_of(pa) == 0 && rb.stats().bans == 0
+                  && rb.hello_ok(pa),
+          "relayp15: once the budget is spent the next two frames are dropped (" + std::to_string(drops) + "): no strike, "
+          "no ban, the link kept; " + std::to_string(h[b.node].pending().size()) + " receipts held");
+    h.now += 1;  // (1 + R_MAX) / T = 1.7 objects in a second
+    send(rs[4]);
+    check(rb.stats().p15_drops.load() - d0 == 2 && h[b.node].pending().holds(pb::receipt_id(rs[4])),
+          "relayp15: a second later the bucket refilled: the next frame admitted (" +
+                  std::to_string(rb.peer_valid_left(pa)) + " left)");
+    w.links[1]->disconnect(1);
+    w.run();
+    check(rb.valid_entries() == 0, "relayp15: no bucket kept for a peer whose link is gone");
+}
+
+// ---------------------------------------------------------------------------
+// A-1: the events of a peer that run after its link went down (one in flight, one its reader posted while blocked
+// behind it) are skipped: the node opens nothing for the gone peer (no join hold from its FC_GETHEADERS).
+void relaystale() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    FakeLinks rl;
+    rl.wire = &w;
+    rl.self = w.links.size();
+    w.links.push_back(&rl);
+    pb::PathbRelayOptions o;
+    o.threads = true;
+    o.keepalive_ms = 0;
+    o.discovery = false;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    pb::PathbRelayNode r(o, rl, clock);
+    const std::size_t idx = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net), true), r.bind_io(h.io(idx))));
+    r.attach(*h.nodes.back());
+    std::string why;
+    if (!r.start(why)) throw std::runtime_error(why);
+    rl.live.insert(1);
+    rl.event(1, true);
+    rl.frame(1, pb::encode_pathb_hello(h[b.node].our_hello(0x7b7b7b7bull, 0)).value_or(std::vector<std::uint8_t>{}));
+    const bool up = wait_for([&] { return r.hello_ok(1); }, 3000);
+    const std::vector<std::uint8_t> ask = pb::encode_fc_getheaders(pb::GetHeaders{0, pb::Hash32{}, pb::Hash32{}, 1});
+    const std::uint64_t w0 = r.stats().owner_waits.load(), s0 = r.stats().stale_events.load();
+    std::atomic<bool> held{false};
+    std::thread holder([&] {
+        r.with_node([&](pb::PathbNode&) {
+            held = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            return 0;
+        });
+    });
+    (void)wait_for([&] { return held.load(); }, 1000);
+    std::thread reader([&] {
+        for (int i = 0; i < 4; ++i) rl.frame(1, ask);
+    });
+    const bool blocked = wait_for([&] { return r.stats().owner_waits.load() > w0; }, 1000);
+    std::thread downer([&] {
+        rl.live.erase(1);
+        rl.event(1, false);
+    });
+    holder.join();
+    reader.join();
+    downer.join();
+    (void)wait_for([&] { return r.stats().stale_events.load() >= s0 + 2; }, 3000);
+    const std::uint64_t stale = r.stats().stale_events.load() - s0;
+    const bool holding = r.with_node([](pb::PathbNode& n) { return n.join_holding(1); });
+    r.stop();
+    check(up && blocked && stale >= 1 && !holding,
+          "relaystale: the events of a peer run after its link went down are skipped (" + std::to_string(stale) +
+                  "); no join hold for the gone peer");
+}
+
+// ---------------------------------------------------------------------------
+// A-2: on_monero_tip as the wiring calls it: from the follower's thread (no lock held), and from a hook that runs under
+// the node lock (the lock is not re-entrant: the call runs after the holder lets go). Each returns; the parked frames
+// indexed on a Monero input are run again. A call that does not return ends the KAT.
+void relaytip() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    FakeLinks rl;
+    rl.wire = &w;
+    rl.self = w.links.size();
+    w.links.push_back(&rl);
+    pb::PathbRelayOptions o;
+    o.threads = true;
+    o.keepalive_ms = 0;
+    o.discovery = false;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    pb::PathbRelayNode r(o, rl, clock);
+    const std::size_t idx = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net), true), r.bind_io(h.io(idx))));
+    r.attach(*h.nodes.back());
+    std::string why;
+    if (!r.start(why)) throw std::runtime_error(why);
+    rl.live.insert(1);
+    rl.event(1, true);
+    rl.frame(1, pb::encode_pathb_hello(h[b.node].our_hello(0x7c7c7c7cull, 0)).value_or(std::vector<std::uint8_t>{}));
+    const bool up = wait_for([&] { return r.hello_ok(1); }, 3000);
+    const auto watchdog = [&](std::atomic<bool>& done, const char* what) {
+        if (wait_for([&] { return done.load(); }, 3000)) return;
+        std::printf("  FAIL relaytip: on_monero_tip %s did not return\n", what);
+        std::fflush(stdout);
+        std::_Exit(1);
+    };
+    r.test_parked(1, pb::Missing::Seed, seq32(0x61), seq32(0x62));
+    const std::size_t i1 = r.parked_index_size();
+    std::atomic<bool> d1{false};
+    std::thread follower([&] {
+        r.on_monero_tip();
+        d1 = true;
+    });
+    watchdog(d1, "from the follower's thread");
+    follower.join();
+    const std::size_t a1 = r.parked_index_size();
+    r.test_parked(1, pb::Missing::MoneroBlock, seq32(0x63), seq32(0x64));
+    const std::size_t i2 = r.parked_index_size();
+    std::atomic<bool> d2{false};
+    std::thread hook([&] {
+        r.with_node([&](pb::PathbNode&) {
+            r.on_monero_tip();
+            return 0;
+        });
+        d2 = true;
+    });
+    watchdog(d2, "under the node lock");
+    hook.join();
+    const bool rerun = wait_for([&] { return r.parked_index_size() == 0; }, 3000);
+    r.stop();
+    check(up && i1 == 1 && a1 == 0 && i2 == 1 && rerun,
+          "relaytip: on_monero_tip from the follower's thread and under the node lock both return; the parked index "
+          "runs again (" + std::to_string(i1) + " -> " + std::to_string(a1) + ", " + std::to_string(i2) + " -> 0)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2724,6 +2978,10 @@ int main(int argc, char** argv) {
     run("relaysmoke", relaysmoke);
     run("relayq", relayq);
     run("relayindex", relayindex);
+    run("relayp15", relayp15);
+    run("relaystale", relaystale);
+    run("relaytip", relaytip);
+    run("relaysq", relaysq);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
     run("prune_flags", prune_flags);

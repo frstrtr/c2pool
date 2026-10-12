@@ -103,6 +103,7 @@ const char* fault_name(pb::StoreFault f) {
         case pb::StoreFault::Phase2: return "Phase2";
         case pb::StoreFault::Scan: return "Scan";
         case pb::StoreFault::Poisoned: return "Poisoned";
+        case pb::StoreFault::Work: return "Work";
     }
     return "?";
 }

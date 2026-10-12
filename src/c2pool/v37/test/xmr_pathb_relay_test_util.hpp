@@ -245,6 +245,8 @@ public:
     std::string remote_ip(std::uint64_t p) const override { return in_.remote_ip(p); }
     std::size_t n_peers() const override { return in_.n_peers(); }
     void stop() override { in_.stop(); }
+    std::size_t queued_bytes(std::uint64_t p) const override { return in_.queued_bytes(p); }
+    std::size_t send_queue_limit() const override { return in_.send_queue_limit(); }
 
 private:
     pb::CarrierLinks in_;

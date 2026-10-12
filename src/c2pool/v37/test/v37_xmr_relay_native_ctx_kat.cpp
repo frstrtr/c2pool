@@ -21,6 +21,9 @@
 //       its peers; A answers from its native body; C verifies it, judges its
 //       work against its parent in C's own index, and feeds it into its
 //       follower
+//   N3  the context RandomX throws once at C (a node-internal failure): a
+//       local alarm, no strike, no ban; the want kept and judged again:
+//       resolved
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -28,6 +31,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 
 #include "xmr_pathb_relay_test_util.hpp"
@@ -53,6 +57,7 @@ struct TNode {
     std::set<bytes32> accepted;                 // blocks fed into the follower
     std::map<std::vector<u8>, u64> hashed;      // context RandomX calls by hashing blob
     std::atomic<u64> ctx_rx{0};
+    std::atomic<int> rx_throw{0};               // the next context RandomX calls that throw
 
     TNode(Rig& rig, std::string name, pb::PathbRelayOptions o) {
         n = rig.make(std::move(name), std::move(o));
@@ -82,6 +87,7 @@ struct TNode {
             return false;
         };
         s.rx = [this](const std::vector<u8>& blob, const bytes32&, bytes32& pow) {
+            if (rx_throw.load() > 0 && rx_throw.fetch_sub(1) > 0) throw std::runtime_error("randomx: dataset");
             ++ctx_rx;
             { std::lock_guard<std::mutex> lk(amtx); hashed[blob]++; }
             pow.fill(0);
@@ -159,6 +165,17 @@ int main() {
       Cn.n->st().ctx_gave_up.load() == 0,
       "N1 every context want is cleared (" + std::to_string(Cn.n->st().ctx_resolved.load()) + " resolved of " +
       std::to_string(Cn.n->st().ctx_wanted.load()) + ")");
+
+    // ── N3 a RandomX exception judging a context ────────────────────────────
+    const SynthBlock Y = make_block(100, idG, 95, nullptr, 3, 65);
+    const bytes32 idY = block_id(Y);
+    Cn.idx.alt(Y);
+    Cn.rx_throw = 1;
+    const bool y_ok = Cn.n->fetch_context(idY, 10);
+    C(y_ok && Cn.has(idY) && Cn.n->st().rx_failures.load() == 1 && Cn.rx_throw.load() <= 0 &&
+      Cn.n->st().strikes.load() == 0 && Cn.n->st().bans.load() == 0,
+      "N3 the context RandomX threw once at C (" + std::to_string(Cn.n->st().rx_failures.load()) +
+      " failure): no strike, no ban; judged again and resolved");
 
     for (auto* t : {&A, &B, &Cn}) if (C.fail) t->n->dump_logs();
     std::printf("    C %s\n", Cn.n->r().describe().c_str());
