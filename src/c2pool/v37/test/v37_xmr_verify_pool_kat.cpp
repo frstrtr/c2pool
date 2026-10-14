@@ -21,9 +21,10 @@
 //   N8  RandomX throws three times at C on A's carrier (a node-internal
 //       failure): every failure counted, one alarm line when it starts and
 //       one when a hash is computed again; no strike, no ban; the frame
-//       parked and run again: placed.
+//       parked and run again: placed; a re-run is not counted in P-15.
 //   N9  RandomX throws once at C on a receipt body A floods: no strike, no
-//       ban; the receipt parked and run again: held at C.
+//       ban; the receipt parked and run again: held at C; its re-run not
+//       counted in P-15.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -218,8 +219,9 @@ static bool n8(std::string& note) {
     const bool again = wait_until([&] { return Cn->count_logs("RandomX hashes again") == 1; }, 3000ms);
     const std::size_t lines = Cn->count_logs("RandomX");
     note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", alarm lines " + std::to_string(lines) +
-           ", strikes " + std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load());
-    return placed && again && Cn->st().rx_failures.load() == 3 && lines == 2 &&
+           ", strikes " + std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load()) +
+           ", P-15 counted " + std::to_string(Cn->st().p15_counted.load());
+    return placed && again && Cn->st().rx_failures.load() == 3 && lines == 2 && Cn->st().p15_counted.load() == 0 &&
            Cn->count_logs("RandomX failing") == 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0 &&
            Cn->r().ready_peers().size() == 1;
 }
@@ -241,16 +243,19 @@ static bool n9(std::string& note) {
     const std::optional<pb::PathbJob> j = rig.job(*A, 1, 0x91);
     if (!j || rig.mine(*A, 0, 0x7200).action != pb::NodeAction::Placed) return false;
     if (!wait_until([&] { return Cn->best() == A->best(); }, 5000ms)) return false;
+    const std::uint64_t counted0 = Cn->st().p15_counted.load();
     throws->store(1);
     const pb::NodeEventResult r = rig.share(*A, *j, 0x7300);
     if (r.action != pb::NodeAction::Pending) return false;
     const pb::Hash32 id = r.admit.id;
     const auto held = [&] { return Cn->r().with_node([&](pb::PathbNode& n) { return n.pending().holds(id); }); };
     const bool ok = wait_until(held, 10000ms);
+    const std::uint64_t counted = Cn->st().p15_counted.load() - counted0;
     note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", strikes " +
-           std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load());
+           std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load()) +
+           ", P-15 counted by the re-run " + std::to_string(counted);
     return ok && throws->load() <= 0 && Cn->st().rx_failures.load() == 1 && Cn->st().strikes.load() == 0 &&
-           Cn->st().bans.load() == 0;
+           Cn->st().bans.load() == 0 && counted == 0;
 }
 
 int main() {

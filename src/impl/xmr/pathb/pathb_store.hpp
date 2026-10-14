@@ -24,7 +24,10 @@
 //                  | bytes | u16 n | n x (u64 bin | u64 p_own | u8 live)
 //   16 K_AR        v37s:ar:<chain>:<h_act %020u>    u16 e | u64 h_act | b32 digest
 //   17 K_BWORK     v37s:bwork:<chain>:<h %020u>     u64 h | u128 work
-//                  (a full node's bound work counted below its prune floor)
+//                  (A's bound work counted below its prune floor)
+//   18 K_BLO       v37s:blo:<chain>                 u64 lo
+//                  (a joined store: the position x1 + 1 its bound work is
+//                  counted from; absent: from the tree's root)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
@@ -59,7 +62,8 @@
 //        stored S, d, cum_work, H, live flags, mmr_root and AR row compared;
 //     6. the lane records at or beyond leaf_count deleted (one batch);
 //     7. K_BWORK: each key names its own height (the bound work below the
-//        floor; absent: none).
+//        floor; absent: none); K_BLO, if present, at least 1 and at most
+//        tip + 1.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -92,6 +96,7 @@ inline constexpr std::uint8_t K_PHEAD = 14;
 inline constexpr std::uint8_t K_PCARRIER = 15;
 inline constexpr std::uint8_t K_AR = 16;
 inline constexpr std::uint8_t K_BWORK = 17;
+inline constexpr std::uint8_t K_BLO = 18;
 
 namespace store_keys {
 inline std::string phead(std::uint32_t c) { return "v37s:phead:" + lane_keys::chain_fmt(c); }
@@ -101,6 +106,7 @@ inline std::string ar_prefix(std::uint32_t c) { return "v37s:ar:" + lane_keys::c
 inline std::string ar(std::uint32_t c, std::uint64_t h_act) { return ar_prefix(c) + lane_keys::index_fmt(h_act); }
 inline std::string bwork_prefix(std::uint32_t c) { return "v37s:bwork:" + lane_keys::chain_fmt(c) + ":"; }
 inline std::string bwork(std::uint32_t c, std::uint64_t h) { return bwork_prefix(c) + lane_keys::index_fmt(h); }
+inline std::string blo(std::uint32_t c) { return "v37s:blo:" + lane_keys::chain_fmt(c); }
 // The poison mark: a store write failed; the next load is a load failure.
 inline std::string poison(std::uint32_t c) { return "v37s:poison:" + lane_keys::chain_fmt(c); }
 }  // namespace store_keys
@@ -365,6 +371,21 @@ inline std::optional<std::pair<std::uint64_t, ::c2pool::xmr::native::U128>> deco
     return out;
 }
 
+inline std::string encode_blo(std::uint64_t lo) {
+    lane_rec::Writer w;
+    w.hdr(K_BLO);
+    w.u64(lo);
+    return w.s;
+}
+
+inline std::optional<std::uint64_t> decode_blo(const std::string& v) {
+    lane_rec::Reader r(v);
+    if (!lane_rec::read_hdr(r, K_BLO)) return std::nullopt;
+    const std::uint64_t lo = r.u64();
+    if (!r.done()) return std::nullopt;
+    return lo;
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
@@ -591,7 +612,7 @@ inline std::optional<LaneBatch> prune_batch(std::uint32_t chain, StoreHead& head
 inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
             lane_keys::bmmr(chain),          lane_keys::blhash_prefix(chain),    lane_keys::bleaf_prefix(chain),
-            store_keys::bwork_prefix(chain), store_keys::poison(chain)};
+            store_keys::bwork_prefix(chain), store_keys::blo(chain),            store_keys::poison(chain)};
 }
 
 // An adoption (the first completed join, or a replacement by rule (4)) and the
@@ -632,7 +653,7 @@ enum class StoreFault : std::uint8_t {
     Phase2,     // a replayed position differs from its record
     Scan,       // the KV scan failed
     Poisoned,   // the store's poison mark: a write failed before the last stop
-    Work,       // a K_BWORK record torn or not under its own height
+    Work,       // a K_BWORK record torn or not under its own height; a K_BLO torn or out of range
 };
 
 struct LoadInputs {
@@ -654,6 +675,7 @@ struct LoadedState {
     std::map<Hash32, XmrKeyRef> refs;  // the key references the restored placements and buckets hold, by identity
     std::map<std::uint64_t, CarrierHeader> prefix_headers;  // a joined store's claimed prefix headers, by position
     std::map<std::uint64_t, ::c2pool::xmr::native::U128> bound_below;  // K_BWORK: bound work below the floor, by height
+    std::uint64_t bound_lo = 0;  // K_BLO: a joined store's x1 + 1 (0: count from the tree's root)
 };
 
 struct LoadResult {
@@ -969,7 +991,7 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     for (const std::optional<SealedBin>& sb : ll.bodies)
         if (sb)
             for (const XmrKeyRef& ref : sb->refs) refs[key_ref_identity(ref)] = ref;
-    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}, {}};
+    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}, {}, 0};
     // a joined store's claimed prefix headers (header records at or below the root)
     for (std::uint64_t x = H.first_pos; x <= std::min(H.root_pos, tip); ++x) {
         const CarrierRecord& c = rec_at(x);
@@ -988,6 +1010,13 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
             const auto e = decode_bwork(v);
             if (!e || k != store_keys::bwork(in.chain, e->first)) return fail(StoreFault::Work);
             st.bound_below[e->first] = e->second;
+        }
+        const KvRead lo = kv.read(store_keys::blo(in.chain));
+        if (lo.status == KvRead::Status::Error) return fail(StoreFault::Scan);
+        if (lo.status == KvRead::Status::Value) {
+            const std::optional<std::uint64_t> v = decode_blo(lo.value);
+            if (!v || *v == 0 || *v > tip + 1) return fail(StoreFault::Work);
+            st.bound_lo = *v;
         }
     }
     out.state.emplace(std::move(st));

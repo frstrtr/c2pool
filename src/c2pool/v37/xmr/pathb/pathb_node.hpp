@@ -467,7 +467,7 @@ public:
         head_ = loaded.head;
         *refs_ = std::move(loaded.refs);
         own_prefix_ = std::move(loaded.prefix_headers);
-        own_chain_.seed_below(std::move(loaded.bound_below));
+        own_chain_.seed_below(std::move(loaded.bound_below), loaded.bound_lo);
         init_join();
     }
 
@@ -483,6 +483,10 @@ public:
     const PendingSet& pending() const noexcept { return pending_; }
     const DeferredCarriers& deferred() const noexcept { return deferred_; }
     const AlarmSink& alarms() const noexcept { return alarm_; }
+    // A's bound-work profile (rule (4)): the joined state's in its session, else the node's own chain's.
+    std::shared_ptr<const BoundWork> bound_work_a() const {
+        return joined_ != nullptr ? joined_->bound_work() : own_chain_.bound_work();
+    }
     const PathbNodeConfig& config() const noexcept { return cfg_; }
     bool poisoned() const noexcept { return poisoned_; }
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
@@ -675,14 +679,16 @@ public:
         std::vector<std::uint64_t> banned;
         std::vector<std::uint64_t> struck;
         std::vector<Hash32> need_bodies;  // bound, carrying bodies, no body set held
+        bool rx_failed = false;           // a Closure admission failed with RandomxFailure: the walk stopped there
     };
     WalkBind bind_walked_branch(const std::vector<Hash32>& ids) {
         WalkBind out;
         if (poisoned_) return out;
-        for (bool progress = true; progress && !poisoned_;) {
+        for (bool progress = true; progress && !poisoned_ && !out.rx_failed;) {
             progress = false;
             out.need_bodies.clear();
             for (const Hash32& id : ids) {
+                if (out.rx_failed) break;
                 if (tree_->find(id) != nullptr) continue;
                 if (!headers_->bound_digest(id)) {
                     std::vector<Hash32> digests;
@@ -726,7 +732,13 @@ public:
                     c.carried = sets[k];
                     const std::optional<std::vector<std::uint8_t>> frame = encode_fc_carrier(cfg_.identity.chain_id, c, cfg_.p.r_max);
                     if (!frame) continue;
-                    const AdmitResult r = admit_frame_from(env(), servers[k], *frame, CarrierRole::Closure);
+                    AdmitResult r;
+                    try {
+                        r = admit_frame_from(env(), servers[k], *frame, CarrierRole::Closure);
+                    } catch (const RandomxFailure&) {  // node-internal: the walk stops; what it found so far stays
+                        out.rx_failed = true;
+                        break;
+                    }
                     if (r.verdict == AdmitVerdict::AdmitCarrier) {
                         (void)settle_carrier(servers[k], *frame, r, false);
                         if (tree_->find(id) != nullptr) {
@@ -985,6 +997,10 @@ public:
         r.blob.nonce = nonce;
         const Hash32 own_id = receipt_id(r);
         own_pow_ = OwnPow{own_id, pow_hash};
+        struct OwnPowReset {
+            std::optional<OwnPow>& p;
+            ~OwnPowReset() { p.reset(); }
+        } own_pow_reset{own_pow_};  // on every exit, a RandomxFailure among them
         NodeEventResult out;
         const CarrierNode* tip = tree_->find(job.tip);
         if (tip != nullptr && job.tip == tree_->best().id && job.h >= tip->H) {
@@ -998,7 +1014,6 @@ public:
             encode_receipt_body_v3(r, body);
             out = on_receipt_body(kOwnPeer, body);
         }
-        own_pow_.reset();
         return out;
     }
 
@@ -1155,16 +1170,34 @@ public:
     // served from the prefix headers), side branches forking at or above
     // floors.sides; one store batch (prune_batch; a failed commit poisons the
     // store). The MMR, K_BLHASH, K_BLEAF and K_AR are kept; A's bound-work
-    // profile keeps the work it counted (a full node's work below the floor
-    // in the same batch, K_BWORK, loaded at a restart). Nothing while
-    // poisoned, after a load failure, or while a join attempt runs (it reads
-    // A).
+    // profile keeps the work it counted (its work below the floor in the same
+    // batch, K_BWORK, loaded at a restart: a full node's, and a joined node's
+    // from x1 + 1). Nothing while poisoned, after a load failure, or while a
+    // join attempt runs (it reads A).
     struct PruneReport {
         PruneFloors floors;
         std::uint64_t root = 0;    // the tree's lowest position after the step
         std::uint64_t first = 0;   // the store's first record after the step
         bool written = false;      // the prune batch committed
     };
+    // A joined node's prune: the work its computed #9 bound (positions x1 + 1 .. ; 1 .. on a young chain) at the
+    // best chain's positions below `root` that no earlier prune moved, added by Monero height; the heights the store
+    // does not hold yet returned (K_BWORK).
+    std::map<std::uint64_t, U128> joined_below(std::uint64_t root) {
+        const JoinedState& js = *joined_;
+        const std::uint64_t lo = std::max<std::uint64_t>({js.young ? 1 : js.x1 + 1, tree_->genesis().pos, jbelow_done_});
+        for (std::uint64_t x = lo; x < root; ++x) {
+            const std::optional<Hash32> id = store_->best_at(x);
+            const CarrierNode* c = id ? tree_->find(*id) : nullptr;
+            if (c == nullptr) break;
+            jbelow_[c->h] = ::c2pool::xmr::native::u128_add(jbelow_[c->h], U128{c->d, 0});
+            jbelow_unwritten_.insert(c->h);
+        }
+        jbelow_done_ = std::max(jbelow_done_, root);
+        std::map<std::uint64_t, U128> out;
+        for (const std::uint64_t h : jbelow_unwritten_) out[h] = jbelow_.at(h);
+        return out;
+    }
     PruneReport prune(std::uint64_t now_s) {
         PruneReport out;
         out.root = tree_->genesis().pos;
@@ -1182,8 +1215,7 @@ public:
             own_chain_.forget_below(root);
         StoreHead head = head_;
         std::map<std::uint64_t, CarrierHeader>* pre = joined_ != nullptr ? &joined_->prefix_headers : &own_prefix_;
-        const std::map<std::uint64_t, U128> below = joined_ == nullptr ? own_chain_.below_unwritten()
-                                                                         : std::map<std::uint64_t, U128>{};
+        const std::map<std::uint64_t, U128> below = joined_ == nullptr ? own_chain_.below_unwritten() : joined_below(root);
         const std::optional<LaneBatch> b =
                 prune_batch(cfg_.record_chain, head, *tree_, *store_, *bodies_, first, root, pre, &below);
         if (!b) return out;
@@ -1194,7 +1226,10 @@ public:
             }
             out.written = true;
         }
-        if (joined_ == nullptr) own_chain_.below_written();
+        if (joined_ == nullptr)
+            own_chain_.below_written();
+        else
+            jbelow_unwritten_.clear();
         head_ = head;
         // the headers of the positions whose bodies go, served from the prefix headers
         for (std::uint64_t x = std::max(first, out.root); x < root; ++x)
@@ -1893,12 +1928,15 @@ private:
             counted_at_.clear();
             below_.clear();
             unwritten_.clear();
+            lo_edge_ = 0;
             profile_ = std::make_shared<BoundWork>();
         }
-        // A loaded store: the bound work stored below its floor (K_BWORK), by height.
-        void seed_below(std::map<std::uint64_t, U128> below) {
+        // A loaded store: the bound work stored below its floor (K_BWORK), by height, and the lower edge of the
+        // count (K_BLO: x1 + 1 of a joined store; 0: none, from the tree's root).
+        void seed_below(std::map<std::uint64_t, U128> below, std::uint64_t lo_edge = 0) {
             reset();
             below_ = std::move(below);
+            lo_edge_ = lo_edge;
             profile_->at = below_;
         }
         // A prune: the positions below `pos` leave the count's bookkeeping (counted first); their work stays in the
@@ -1938,8 +1976,8 @@ private:
         }
         void sync() const {
             const BinStore& st = *n_->store_;
-            // from position 1, or from the root of a tree loaded from a pruned store
-            if (counted_.empty()) lo_ = std::max<std::uint64_t>(1, n_->tree_->genesis().pos);
+            // from position 1, or from the root of a tree loaded from a pruned store; a joined store's from its x1 + 1
+            if (counted_.empty()) lo_ = std::max<std::uint64_t>({1, n_->tree_->genesis().pos, lo_edge_});
             const std::uint64_t lo = lo_;
             const std::uint64_t top = st.tip_pos();
             const std::size_t want = top >= lo ? static_cast<std::size_t>(top - lo + 1) : 0;
@@ -1977,6 +2015,7 @@ private:
         mutable std::vector<Counted> counted_;
         mutable std::map<std::uint64_t, std::uint64_t> counted_at_;
         std::map<std::uint64_t, U128> below_;  // the work counted below the prune floor, by height
+        std::uint64_t lo_edge_ = 0;            // the count's lower edge (K_BLO); 0: none
         std::set<std::uint64_t> unwritten_;    // its heights not yet in the store
         mutable std::shared_ptr<BoundWork> profile_ = std::make_shared<BoundWork>();
     };
@@ -2074,6 +2113,9 @@ private:
         closed_.clear();
         release_q_.clear();
         rx_failed_.clear();
+        jbelow_.clear();
+        jbelow_unwritten_.clear();
+        jbelow_done_ = 0;
         load_failed_ = false;
         poisoned_ = false;
         reask_pending_ = false;
@@ -2084,6 +2126,8 @@ private:
         const std::optional<LaneBatch> ab = adoption_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, *ar_,
                                                            js->young ? 0 : js->x0 - 1, &js->prefix_headers);
         if (ab) b.ops.insert(b.ops.end(), ab->ops.begin(), ab->ops.end());
+        // the lower edge of A's bound work (x1 + 1), read at a restart (K_BLO)
+        if (!js->young) b.put(store_keys::blo(cfg_.record_chain), encode_blo(js->x1 + 1));
         if (!cleared || !ab || !commit_lane_batch(*kv_, b)) {
             poison(store_->best_tip());
             return true;
@@ -2524,6 +2568,9 @@ private:
     std::set<std::uint64_t> hold_conns_;
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
+    std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
+    std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
+    std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_
     // the joiner (E15): its inputs, the queue and the adopted state, the full node's own chain as A, one link per
     // Path B peer over the relay's transport, the E-72 re-ask's buckets
     JoinInputs join_in_;

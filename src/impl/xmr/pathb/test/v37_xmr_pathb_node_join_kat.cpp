@@ -37,12 +37,21 @@
 //              journal, rebound to a carrier of the new chain;
 //   adoptbelow a bucket below the joined MMR adopted after L enters the
 //              claimed leaves; on_hello compares no claimed node; a #13
-//              mismatch above L is ClaimLeaf (alarm + DEFER), never BAN.
+//              mismatch above L is ClaimLeaf (alarm + DEFER), never BAN;
+//   bwjoin     a joined node's bound work (rule (4)) counts from x1 + 1 in its
+//              session, after a restart of its unpruned store, and after a
+//              prune and a restart (K_BLO, K_BWORK): the same profile, the same
+//              verdict on a candidate bound from below the prune root;
+//   bwkeep     two joined nodes on one chain with different
+//              --pathb-body-keep, pruned and restarted: the same profile and
+//              the same verdict.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -1096,6 +1105,192 @@ void scopepow() {
           "excluded, 0 tokens" + (o.report ? std::string(": ") + rep_desc(*o.report) : std::string()));
 }
 
+
+// ---------------------------------------------------------------------------
+// The bound-work lower edge of a joined node (K_BLO = x1 + 1) and its work below a prune floor (K_BWORK).
+
+// The keys of `kv` under `prefix`.
+std::size_t count_prefix(const MemoryKv& kv, const std::string& prefix) {
+    std::size_t n = 0;
+    for (auto it = kv.data.lower_bound(prefix); it != kv.data.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it) ++n;
+    return n;
+}
+
+// A joining node whose configuration `tweak` changes.
+Joining joining_node_cfg(Harness& h, const KatNet& net, std::uint64_t J, const std::function<void(pb::PathbNodeConfig&)>& tweak) {
+    Joining o;
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    o.j = h.nodes.size();
+    pb::PathbNodeConfig c = h.config(kat_table(net), false, J);
+    if (tweak) tweak(c);
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(c, h.io(o.j), h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    o.tr = std::make_unique<KatTransport>(h, o.j);
+    h[o.j].set_join_transport(o.tr.get());
+    return o;
+}
+
+// The node of `kv` restarted (its configuration from `tweak`); SIZE_MAX: a load failure.
+std::size_t restarted(Harness& h, const KatNet& net, MemoryKv& kv, const std::function<void(pb::PathbNodeConfig&)>& tweak,
+                      pb::StoreFault& fault) {
+    pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    fault = rl.fault;
+    if (!rl.state) return SIZE_MAX;
+    const std::size_t r = h.nodes.size();
+    pb::PathbNodeConfig c = h.config(kat_table(net), false, kJ);
+    if (tweak) tweak(c);
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(c, h.io(r), std::move(*rl.state), nullptr));
+    return r;
+}
+
+// F-6's shape against a node whose prune root is `root` (store `kv`): A's work from a height `h_c` below the root,
+// w + 2 more there and w + 1 less at the root's next height, w = the work below the floor at the root's height.
+// Counted from x1 + 1 it replaces A; counted from the root's height it would not.
+pb::BoundWork candidate_below(const pb::BoundWork& a, MemoryKv& kv, std::uint64_t h_root, std::uint64_t h_c, bool& shaped) {
+    pb::U128 w{};
+    if (const auto it = kv.data.find(pb::store_keys::bwork(0, h_root)); it != kv.data.end())
+        if (const auto e = pb::decode_bwork(it->second)) w = e->second;
+    const pb::U128 less = ::c2pool::xmr::native::u128_add(w, pb::U128{1, 0});
+    const pb::U128 more = ::c2pool::xmr::native::u128_add(less, pb::U128{1, 0});
+    pb::BoundWork c;
+    for (auto it = a.at.lower_bound(h_c); it != a.at.end(); ++it) c.at[it->first] = it->second;
+    shaped = c.at.count(h_root + 1) != 0 && !::c2pool::xmr::native::u128_less(c.at[h_root + 1], less) && h_c < h_root;
+    c.at[h_c] = ::c2pool::xmr::native::u128_add(c.at[h_c], more);
+    if (shaped) c.at[h_root + 1] = pb::bound_work_minus(c.at[h_root + 1], less);
+    return c;
+}
+
+// The joined node j follows a's chain from its tip to a's tip.
+void follow(Harness& h, std::size_t j, std::size_t s, const KatNode& a) {
+    for (std::uint64_t x = h[j].store().tip_pos() + 1; x <= a.store.tip_pos(); ++x) {
+        h.mon_tip = std::max<std::uint64_t>(h.mon_tip, h_pos(x) + 1);
+        (void)h[j].on_carrier(s, *pb::encode_fc_carrier(0, *a.bodies.get(at_pos(a, x)), pb::kRuledLaneParams.r_max));
+    }
+    h.q.clear();
+}
+
+void bwjoin() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 6000;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    // --pathb-body-keep 10: the prune root rises above x1 + 1
+    const std::function<void(pb::PathbNodeConfig&)> keep10 = [](pb::PathbNodeConfig& c) { c.body_keep = 10; };
+    Joined jd;
+    jd.s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, jd.s));
+    jd.jn = joining_node_cfg(h, net, kJ, keep10);
+    h.hello(jd.jn.j, jd.s);
+    const pb::JoinStep js0 = h[jd.jn.j].run_join();
+    jd.ok = js0.switched && h[jd.jn.j].joined() != nullptr && h[jd.jn.j].tree().best().id == a.store.best_tip();
+    check(jd.ok, "bwjoin: joined at L");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    MemoryKv& kv = *h.kvs.back();
+    const pb::JoinedState& js = *h[j].joined();
+    const std::uint64_t x0 = js.x0, x1 = js.x1;
+    const auto p0 = h[j].bound_work_a();
+    std::printf("  bwjoin: x0 %llu x1 %llu base %llu root %llu tip %llu floors %llu\n", (unsigned long long)x0,
+                (unsigned long long)x1, (unsigned long long)h[j].store().base_pos(), (unsigned long long)h[j].tree().genesis().pos,
+                (unsigned long long)h[j].store().tip_pos(), (unsigned long long)h[j].prune_floors(h.now).bodies);
+    // (c) the unpruned joined store restarted: from x1 + 1
+    pb::StoreFault f1 = pb::StoreFault::None;
+    const std::size_t r1 = restarted(h, net, kv, keep10, f1);
+    const auto q1 = r1 == SIZE_MAX ? nullptr : h[r1].bound_work_a();
+    check(!js.young && p0 && q1 && p0->lowest() == h_pos(x1 + 1) && q1->lowest() == h_pos(x1 + 1) && q1->at == p0->at,
+          "bwjoin: an unpruned joined store restarted counts from x1 + 1 (" + std::to_string(x1 + 1) + "), the profile of its "
+          "session (lowest height " + std::to_string(q1 && q1->lowest() ? *q1->lowest() : 0) + ", x0 - 1 at "
+                  + std::to_string(h_pos(x0 - 1)) + ")");
+    // follow the chain, prune above x1 + 1, restart
+    grow(a, 1800);
+    follow(h, j, jd.s, a);
+    const pb::PathbNode::PruneReport pr = h[j].prune(h.now);
+    const auto pj = h[j].bound_work_a();
+    std::printf("  bwjoin: tip %llu prune root %llu written %d floors %llu bwork records %zu\n",
+                (unsigned long long)h[j].store().tip_pos(), (unsigned long long)pr.root, pr.written,
+                (unsigned long long)pr.floors.bodies, count_prefix(kv, pb::store_keys::bwork_prefix(0)));
+    pb::StoreFault f2 = pb::StoreFault::None;
+    const std::size_t r2 = restarted(h, net, kv, keep10, f2);
+    const auto q2 = r2 == SIZE_MAX ? nullptr : h[r2].bound_work_a();
+    check(pr.written && pr.root > x1 + 1 && pj && q2 && q2->at == pj->at && q2->lowest() == h_pos(x1 + 1),
+          "bwjoin: pruned at root " + std::to_string(pr.root) + " (above x1 + 1) and restarted: the profile of its session "
+          "(from x1 + 1)");
+    if (!pj || !q2 || r2 == SIZE_MAX) return;
+    bool shaped = false;
+    const std::uint64_t h_root = h_pos(pr.root);
+    const pb::BoundWork cand = candidate_below(*pj, kv, h_root, h_pos((x1 + 1 + pr.root) / 2), shaped);
+    pb::Hash32 c_tip{};
+    c_tip.fill(0xff);
+    const bool before = pb::candidate_replaces(cand, c_tip, *pj, h[j].store().best_tip());
+    const bool after = pb::candidate_replaces(cand, c_tip, *q2, h[r2].store().best_tip());
+    check(shaped && before && after, std::string("bwjoin: rule (4) on a candidate bound from below the prune root: replaces "
+                                                 "before the restart ") + (before ? "yes" : "no") + ", after " + (after ? "yes" : "no"));
+    std::printf("  bwjoin: %.1f s\n", secs_since(t0));
+}
+
+void bwkeep() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 6000;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    const auto keep = [](std::uint64_t n) { return [n](pb::PathbNodeConfig& c) { c.body_keep = n; }; };
+    const std::function<void(pb::PathbNodeConfig&)> k1 = nullptr, k2 = keep(10);
+    std::vector<std::size_t> js;
+    std::vector<MemoryKv*> kvs;
+    for (const auto& k : {k1, k2}) {
+        Joining jn = joining_node_cfg(h, net, kJ, k);
+        h.hello(jn.j, s);
+        const pb::JoinStep st = h[jn.j].run_join();
+        if (!st.switched || h[jn.j].joined() == nullptr) {
+            check(false, "bwkeep: joined");
+            return;
+        }
+        js.push_back(jn.j);
+        kvs.push_back(h.kvs.back().get());
+    }
+    const std::uint64_t x1a = h[js[0]].joined()->x1, x1b = h[js[1]].joined()->x1;
+    grow(a, 1800);
+    std::vector<std::uint64_t> roots;
+    std::vector<std::shared_ptr<const pb::BoundWork>> session, after;
+    std::vector<std::size_t> rs;
+    for (std::size_t i = 0; i < 2; ++i) {
+        follow(h, js[i], s, a);
+        const pb::PathbNode::PruneReport pr = h[js[i]].prune(h.now);
+        roots.push_back(pr.root);
+        session.push_back(h[js[i]].bound_work_a());
+        pb::StoreFault f = pb::StoreFault::None;
+        const std::size_t r = restarted(h, net, *kvs[i], i == 0 ? k1 : k2, f);
+        rs.push_back(r);
+        after.push_back(r == SIZE_MAX ? nullptr : h[r].bound_work_a());
+    }
+    std::printf("  bwkeep: x1 %llu / %llu, roots %llu / %llu\n", (unsigned long long)x1a, (unsigned long long)x1b,
+                (unsigned long long)roots[0], (unsigned long long)roots[1]);
+    const bool loaded = after[0] && after[1] && session[0] && session[1];
+    check(loaded && x1a == x1b && roots[0] != roots[1] && std::max(roots[0], roots[1]) > x1a + 1
+                  && after[0]->at == after[1]->at && after[0]->at == session[0]->at,
+          "bwkeep: two joined nodes, prune roots " + std::to_string(roots[0]) + " and " + std::to_string(roots[1])
+                  + ", restarted: the same profile (from x1 + 1)");
+    if (!loaded) return;
+    // the candidate shaped against the higher root
+    const std::size_t hi = roots[1] > roots[0] ? 1 : 0;
+    bool shaped = false;
+    const pb::BoundWork cand = candidate_below(*session[hi], *kvs[hi], h_pos(roots[hi]), h_pos((x1a + 1 + roots[hi]) / 2), shaped);
+    pb::Hash32 c_tip{};
+    c_tip.fill(0xff);
+    const bool v0 = pb::candidate_replaces(cand, c_tip, *after[0], h[rs[0]].store().best_tip());
+    const bool v1 = pb::candidate_replaces(cand, c_tip, *after[1], h[rs[1]].store().best_tip());
+    const bool vs = pb::candidate_replaces(cand, c_tip, *session[0], h[js[0]].store().best_tip());
+    check(shaped && v0 == v1 && v0 == vs && vs,
+          std::string("bwkeep: rule (4) on a candidate bound from below the higher root: the same verdict (") + (v0 ? "yes" : "no")
+                  + " / " + (v1 ? "yes" : "no") + ", in the session " + (vs ? "yes" : "no") + ")");
+    std::printf("  bwkeep: %.1f s\n", secs_since(t0));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1124,5 +1319,7 @@ int main(int argc, char** argv) {
     run("restart", restart);
     run("j2", j2);
     run("below", below);
+    run("bwjoin", bwjoin);
+    run("bwkeep", bwkeep);
     return finish("v37_xmr_pathb_node_join_kat");
 }

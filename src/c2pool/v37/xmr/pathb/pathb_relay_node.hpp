@@ -126,7 +126,7 @@ struct PathbRelayOptions {
     std::size_t max_inbound = 101;                               // accepted links
     std::size_t max_inbound_per_addr = 1;
     std::size_t max_outbound = 12;                               // dialed links kept up
-    std::size_t send_queue_bytes = 16u << 20;                    // per link (at least two FC_HEADERS frames, P-14)
+    std::size_t send_queue_bytes = 16u << 20;                    // per link (at least two FC_HEADERS frames + prefixes, P-14)
     std::uint32_t connect_timeout_ms = 3000;                     // discovery dials
     std::uint32_t hello_timeout_ms = 10000;
     // the invalid-object budget and the ban (unset: relay_budget_default at verify_threads and max_inbound +
@@ -368,9 +368,9 @@ public:
             why = "relay: no node attached";
             return false;
         }
-        if (o_.send_queue_bytes < 2 * headers_frame_) {
-            why = "relay: send queue " + std::to_string(o_.send_queue_bytes) + " B below two FC_HEADERS frames (2 x " +
-                  std::to_string(headers_frame_) + " B)";
+        if (o_.send_queue_bytes < 2 * (headers_frame_ + 4)) {
+            why = "relay: send queue " + std::to_string(o_.send_queue_bytes) + " B below two FC_HEADERS frames with their "
+                  "length prefixes (2 x " + std::to_string(headers_frame_ + 4) + " B)";
             return false;
         }
         running_ = true;
@@ -1341,7 +1341,6 @@ private:
             st_.banned_src_dropped++;
             return;
         }
-        j.rerun = true;  // a later try of this job (no token, a RandomX failure)
         bool granted = false;
         {
             std::lock_guard<std::mutex> lk(vmtx_);
@@ -1387,9 +1386,9 @@ private:
             const bool kept = t.admit.verdict == AdmitVerdict::Strike || t.admit.verdict == AdmitVerdict::Ban;
             if (!kept) refund(j);
             const bool taken = kept && !j.solicited;
-            const bool solicited = j.solicited;
-            post([this, t = std::move(t), taken, solicited, fresh]() mutable {
-                complete_job(std::move(t), taken, solicited, fresh);
+            const bool solicited = j.solicited, rerun = j.rerun;
+            post([this, t = std::move(t), taken, solicited, rerun, fresh]() mutable {
+                complete_job(std::move(t), taken, solicited, fresh, rerun);
             });
             return;
         }
@@ -1423,7 +1422,7 @@ private:
             rx_failed(std::move(j), "receipt");
             return;
         }
-        if (!j.solicited && fresh > 0) valid_count(j.peer, fresh);
+        if (!j.solicited && !j.rerun && fresh > 0) valid_count(j.peer, fresh);  // a re-run is not counted
         bool kept = false;
         for (const NodeEventResult& r : rs) kept = apply_result(j.peer, r, !kept) || kept;
         if (!kept) refund(j);
@@ -1432,7 +1431,8 @@ private:
     // The placement on the owner. The carriers it releases whose admission fails with a RandomX failure come back
     // from the node (take_rx_failed) and are parked and run again; the placed carrier keeps its result and effects.
     // A RandomX failure of this frame's own re-admission parks this frame (its solicited state kept).
-    void complete_job(PathbNode::CarrierTicket t, bool token_kept, bool solicited = false, std::uint64_t fresh = 0) {
+    void complete_job(PathbNode::CarrierTicket t, bool token_kept, bool solicited = false, std::uint64_t fresh = 0,
+                      bool rerun = false) {
         const std::uint64_t peer = t.peer;
         const Hash32 digest = ::v37::sha256d(t.frame);
         std::vector<std::uint8_t> frame = t.frame;
@@ -1455,9 +1455,9 @@ private:
             run_effects(fx);
             return;
         }
-        if (!solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
-                           r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
-            valid_count(peer, 1 + fresh);  // the carrier's own body and its first-seen carried bodies
+        if (!solicited && !rerun && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
+                                     r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
+            valid_count(peer, 1 + fresh);  // the carrier's own body and its first-seen carried bodies (not a re-run)
         (void)apply_result(peer, r, token_kept);
         run_effects(fx);
     }
@@ -1466,6 +1466,7 @@ private:
     void rx_failed(Job j, const char* where) {
         rx_alarm(where);
         refund(j);
+        j.rerun = true;  // run again: a re-run (P-15 does not count it)
         park_job(std::move(j), now_ms() + kParkRetryMs);
     }
     // The alarm: every failure counted; a log line when RandomX starts failing and one when a hash is computed again
@@ -1544,6 +1545,7 @@ private:
         std::vector<std::uint64_t> bans;                    // servers of refuted walked variants or body sets
         std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
+        std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
     };
     // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park.
     void take_rx_failed_locked(Effects& fx) {
@@ -1583,17 +1585,15 @@ private:
             case Missing::ClosureBodies: request_body_set(peer, r.admit.fetch, d); break;
             case Missing::Bodies: request_carrier(peer, r.admit.fetch); break;
             case Missing::TipBodies: {
-                PathbNode::WalkBind wb;
-                try {
-                    wb = node_->bind_walked_branch(r.admit.bind);
-                } catch (const RandomxFailure&) {
-                    // node-internal: the parked frame runs again after kParkRetryMs (no token)
+                const PathbNode::WalkBind wb = node_->bind_walked_branch(r.admit.bind);
+                if (wb.rx_failed) {
+                    // node-internal (the walk stopped at a RandomX failure; what it found stays): the alarm; the
+                    // parked frame runs again after kParkRetryMs (no token)
+                    rx_alarm("walked carrier");
                     if (d) {
                         parked_by_cause_[m].erase(*d);
-                        if (std::optional<ParkedFrame> f = node_->take_parked(*d)) fx.rx_retry.push_back(std::move(*f));
+                        if (std::optional<ParkedFrame> f = node_->take_parked(*d)) fx.rx_rerun.push_back(std::move(*f));
                     }
-                    take_rx_failed_locked(fx);
-                    break;
                 }
                 st_.walk_placed += wb.placed.size();
                 fx.bans.insert(fx.bans.end(), wb.banned.begin(), wb.banned.end());
@@ -1689,7 +1689,10 @@ private:
             rx_alarm("released carrier");
             park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, false, true}, now_ms() + kParkRetryMs);
         }
+        for (ParkedFrame& f : fx.rx_rerun)
+            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, false, true}, now_ms() + kParkRetryMs);
         fx.rx_retry.clear();
+        fx.rx_rerun.clear();
         for (std::uint64_t q : fx.bans) ban(q);
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
         for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0);
@@ -1894,7 +1897,8 @@ private:
         reoffer_pump(p);
     }
     // The re-offer of one peer, paged: a frame is queued only while the link's queued bytes with it (and its u32 length
-    // prefix) stay within the link's bound less one FC_HEADERS frame (P-14: room for a serve reply and live traffic);
+    // prefix) stay within the link's bound less one FC_HEADERS frame with its prefix (P-14: room for a serve reply
+    // and live traffic);
     // the rest waits for the queue to drain (the maintenance tick). Bodies no longer pending are skipped. One pump per
     // peer at a time (HELLO and the tick).
     void reoffer_pump(std::uint64_t p) {
@@ -1933,7 +1937,7 @@ private:
             if (!chunk.empty()) fr = encode_fb_receipts(chain_id_, chunk, p_);
             if (fr) {
                 const std::size_t bound = links_.send_queue_limit();
-                if (bound != 0 && links_.queued_bytes(p) + fr->size() + 4 + headers_frame_ > bound) {
+                if (bound != 0 && links_.queued_bytes(p) + fr->size() + 4 + headers_frame_ + 4 > bound) {
                     st_.reoffer_paused++;
                     return;
                 }

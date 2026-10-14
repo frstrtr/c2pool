@@ -118,7 +118,16 @@
 //                a RandomX failure);
 //   relaystalem  manual mode: a queued event of a gone peer skipped;
 //   relayrxbind  RandomX throws in the bind of a walked carrier: not out of
-//                the relay; run again: placed.
+//                the relay; run again: placed;
+//   relaymaxpage at the start floor 17 receipts of 945 B re-offered in one
+//                frame (never paused for good);
+//   rev99_complete RandomX throws on a frame's own re-admission at its
+//                completion: caught; parked and placed;
+//   ownrx        RandomX throws on a carried receipt of the own share:
+//                RandomxFailure out, the own hash reset; the re-run places it;
+//   relayrxbindr RandomX throws in the bind on the receipt path: counted;
+//   relayrxbindk a bind refutes one body set, then RandomX throws at the
+//                next: the refuting server's token kept.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -162,6 +171,11 @@ struct PathbNodeTestAccess {
     static std::size_t closed(const PathbNode& n) { return n.closed_.size(); }
     static std::size_t abandoned(const PathbNode& n) { return n.abandoned_.size(); }
     static std::shared_ptr<const BoundWork> own_profile(const PathbNode& n) { return n.own_chain_.bound_work(); }
+    static void memo_clear(PathbNode& n) {
+        n.memo_.clear();
+        n.memo_order_.clear();
+    }
+    static bool own_pow_set(const PathbNode& n) { return n.own_pow_.has_value(); }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -1710,6 +1724,10 @@ struct FakeLinks final : pb::RelayLinks {
     std::string remote_ip(std::uint64_t) const override { return {}; }
     std::size_t n_peers() const override { return live.size(); }
     void stop() override {}
+    std::size_t limit = 0;   // the per-link send queue bound the relay pages within
+    std::size_t queued = 0;  // the bytes every link reports queued
+    std::size_t send_queue_limit() const override { return limit; }
+    std::size_t queued_bytes(std::uint64_t) const override { return queued; }
 };
 
 struct FakeWire {
@@ -2744,8 +2762,8 @@ void relayindex() {
 }
 
 // ---------------------------------------------------------------------------
-// The per-link send queue bound: at least two FC_HEADERS frames (P-14; the re-offer pages within the bound less one);
-// a smaller bound (0 among them) is refused at start.
+// The per-link send queue bound: at least two FC_HEADERS frames with their u32 length prefixes (P-14; the re-offer
+// pages within the bound less one); a smaller bound (0 among them) is refused at start.
 void relaysq() {
     const KatNet net;
     Harness h(net);
@@ -2764,9 +2782,10 @@ void relaysq() {
         }
     };
     std::string w0, w1, w2, w3;
-    const bool s0 = starts(0, w0), s1 = starts(hf, w1), s2 = starts(2 * hf - 1, w2), s3 = starts(2 * hf, w3);
+    const std::size_t two = 2 * (hf + 4);
+    const bool s0 = starts(0, w0), s1 = starts(hf, w1), s2 = starts(two - 1, w2), s3 = starts(two, w3);
     check(hf > 0 && !s0 && !s1 && !s2 && s3 && w0.find("send queue") != std::string::npos,
-          "relaysq: a send queue bound below two FC_HEADERS frames (2 x " + std::to_string(hf) +
+          "relaysq: a send queue bound below two FC_HEADERS frames with their prefixes (2 x " + std::to_string(hf + 4) +
                   " B) refused at start (0, one frame, two frames - 1: '" + w2 + "'); two frames accepted");
 }
 
@@ -3218,6 +3237,440 @@ void relayrxbind() {
                   + " failure): not out of the relay; run again: the walked carrier and the tip placed; no strike, no ban");
 }
 
+
+// ---------------------------------------------------------------------------
+// relaymaxpage: at the smallest bound start() accepts (two FC_HEADERS frames with their prefixes), a pending set of 17
+// receipts of the largest size (P-10, RECEIPT_MAX(15) = 945 B: one FB_RECEIPTS frame of 16,072 B) is re-offered: with
+// the link's queue holding 2 B more than leaves one FC_HEADERS frame and its prefix free after the frame, the frame
+// waits; with an empty queue it goes (never paused for good).
+void relaymaxpage() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay probe = kat_relay(h, w, table0(net), true);
+    const std::size_t hf = static_cast<std::size_t>(h[probe.node].frame_bytes_headers());
+    // the smallest accepted bound, at or above two frames
+    std::size_t floor = 0;
+    for (std::size_t b = 2 * hf; b <= 2 * hf + 8 && floor == 0; ++b) {
+        try {
+            KatRelay k = kat_relay(h, w, table0(net), true, false, [b](pb::PathbRelayOptions& o) { o.send_queue_bytes = b; });
+            k.relay->stop();
+            w.relays.pop_back();
+            floor = b;
+        } catch (const std::runtime_error&) {
+        }
+    }
+    KatRelay x = kat_relay(h, w, table0(net), true, false, [floor](pb::PathbRelayOptions& o) { o.send_queue_bytes = floor; });
+    KatRelay y = kat_relay(h, w, table0(net), false);
+    x.links->limit = floor;
+    const std::size_t frame = 6 + 1 + 17 * pb::receipt_max(15);
+    x.links->queued = floor > frame + 4 + hf + 2 ? floor - (frame + 4) - hf - 2 : 0;
+    // 17 receipts of the largest size, pending at X
+    const std::optional<pb::PathbJob> j = h.job(x.node, 1, 900);
+    bool built = j.has_value();
+    std::size_t one = 0;
+    for (std::uint32_t k = 0; built && k < 17; ++k) {
+        pb::ReceiptBodyV3 r = j->body;
+        r.blob.nonce = 5000 + k;
+        r.blob.timestamp = std::uint64_t{1} << 34;  // a varint of 5 bytes
+        r.blob.tx_count = std::uint64_t{1} << 20;   // a varint of 3 bytes
+        r.branch.assign(15, seq32(0x70));
+        r.side.fee_rate_bp = 100;
+        r.side.owner = seq32(0x71);
+        r.owner = r.payee;
+        std::vector<std::uint8_t> enc;
+        built = pb::encode_receipt_body_v3(r, enc) == pb::WireError::None;
+        one = enc.size();
+        pb::PathbNodeTestAccess::add_pending(h[x.node], pb::PendingReceipt{pb::receipt_id(r), r, 0, 0, 0});
+    }
+    std::size_t sent_bytes = 0;
+    std::uint64_t sent_frames = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.from == x.links->self && !m.f.empty() && m.f[0] == pb::kOpFbReceipts) {
+            ++sent_frames;
+            sent_bytes = m.f.size();
+            m.f.clear();
+        }
+    };
+    w.connect(x.links->self, y.links->self);
+    w.run();
+    h.now += 1;
+    x.relay->tick();
+    w.run();
+    const std::uint64_t held = sent_frames, paused = x.relay->stats().reoffer_paused.load();
+    x.links->queued = 0;
+    for (int i = 0; i < 4 && sent_frames == 0; ++i) {
+        h.now += 1;
+        x.relay->tick();
+        w.run();
+    }
+    w.edit = nullptr;
+    check(floor > 0 && built && one == pb::receipt_max(15) && held == 0 && paused >= 1,
+          "relaymaxpage: the queue holding " + std::to_string(floor - (frame + 4) - hf - 2)
+                  + " B: the frame waits (one FC_HEADERS frame and its prefix kept free; paused " + std::to_string(paused) + ")");
+    check(floor > 0 && built && one == pb::receipt_max(15) && h[x.node].pending().size() == 17 && sent_frames == 1
+                  && sent_bytes == 6 + 1 + 17 * one,
+          "relaymaxpage: at the start floor " + std::to_string(floor) + " B (FC_HEADERS frame " + std::to_string(hf)
+                  + " B) 17 receipts of " + std::to_string(one) + " B re-offered in one frame of "
+                  + std::to_string(sent_bytes) + " B (" + std::to_string(sent_frames) + " sent, paused "
+                  + std::to_string(x.relay->stats().reoffer_paused.load()) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// rev99_complete (merge-gate review vector): RandomX fails on a frame's OWN re-admission inside complete_carrier. X and
+// Y are siblings on one tip; X then Y are begun on the verify path at one generation; X's placement changes the
+// generation, so Y's completion re-admits Y. Its memo entry is gone at that moment (the FIFO turned over between
+// begin_carrier and the placement; simulated by clearing the memo when the re-admission looks up its seed). Y's second
+// hash throws: caught at the completion; Y parked and run again: placed; 0 strikes, 0 bans.
+void rev99_complete() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    struct S {
+        pb::Hash32 x{}, y{};
+        bool armed = false, evicted = false;
+        int y_calls = 0;
+        std::size_t node = 0;
+    };
+    auto s = std::make_shared<S>();
+    Harness* hp = &h;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay l = kat_relay(h, w, table0(net), true);
+    KatRelay x = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [s, hp](pb::PathbNodeIo& io) {
+        io.verify = [s, v = io.verify](const pb::HashingBlob& b, std::uint64_t d, const pb::Hash32& seed) {
+            if (s->armed && pb::receipt_id(b) == s->y && ++s->y_calls == 2)
+                throw std::runtime_error("rev99: RandomX failed on Y's re-admission");
+            return v(b, d, seed);
+        };
+        io.seed_of = [s, hp, f = io.seed_of](const pb::Hash32& p) -> std::optional<pb::Hash32> {
+            if (s->armed && !s->evicted && s->y_calls == 1 && (*hp)[s->node].tree().find(s->x) != nullptr) {
+                pb::PathbNodeTestAccess::memo_clear((*hp)[s->node]);
+                s->evicted = true;
+            }
+            return f(p);
+        };
+    });
+    s->node = x.node;
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 P = h[x.node].tree().best().id;
+    ok = ok && P == h[a.node].tree().best().id && P == h[l.node].tree().best().id;
+    w.edit = [](FakeWire::Msg& m) { m.f.clear(); };
+    ok = ok && mine_on(h, w, a.node, 2, 400) && mine_on(h, w, l.node, 3, 401);
+    w.edit = nullptr;
+    const pb::Hash32 X = h[a.node].tree().best().id, Y = h[l.node].tree().best().id;
+    const pb::CarrierNode* nx = h[a.node].tree().find(X);
+    const pb::CarrierNode* ny = h[l.node].tree().find(Y);
+    ok = ok && X != Y && nx && ny && nx->parent == P && ny->parent == P && h[x.node].tree().find(X) == nullptr
+         && h[x.node].tree().find(Y) == nullptr;
+    if (!ok) {
+        check(false, "rev99_complete: setup");
+        return;
+    }
+    const std::vector<std::uint8_t> fx = *pb::encode_fc_carrier(0, *h[a.node].bodies().get(X), 16);
+    const std::vector<std::uint8_t> fy = *pb::encode_fc_carrier(0, *h[l.node].bodies().get(Y), 16);
+    s->x = X;
+    s->y = Y;
+    s->armed = true;
+    const pb::PathbRelayStats& st = x.relay->stats();
+    const std::uint64_t f0 = st.rx_failures.load();
+    x.relay->receive(1, fx);
+    x.relay->receive(1, fy);
+    std::string esc;
+    try {
+        w.run();
+    } catch (const std::exception& e) {
+        esc = e.what();
+    }
+    const std::uint64_t f1 = st.rx_failures.load() - f0;
+    const bool x1 = h[x.node].tree().find(X) != nullptr, y1 = h[x.node].tree().find(Y) != nullptr;
+    std::printf("  rev99_complete: evicted=%d y_calls=%d escaped='%s' rx_failures=%llu X@x=%d Y@x=%d\n", s->evicted,
+                s->y_calls, esc.c_str(), (unsigned long long)f1, x1, y1);
+    std::string esc2;
+    for (int i = 0; i < 4 && esc.empty(); ++i) {
+        h.now += 1;
+        try {
+            x.relay->tick();
+            w.run();
+        } catch (const std::exception& e) {
+            esc2 = e.what();
+        }
+    }
+    const bool y2 = h[x.node].tree().find(Y) != nullptr;
+    std::printf("  rev99_complete: after 4 s: Y@x=%d y_calls=%d strikes=%llu bans=%llu rx_failures=%llu escaped2='%s'\n",
+                y2, s->y_calls, (unsigned long long)st.strikes.load(), (unsigned long long)st.bans.load(),
+                (unsigned long long)(st.rx_failures.load() - f0), esc2.c_str());
+    check(s->evicted && s->y_calls >= 2 && esc.empty() && f1 == 1 && x1 && !y1,
+          "rev99_complete: RandomX failed on Y's own re-admission inside complete_carrier: caught at the completion");
+    check(y2 && s->y_calls >= 3 && esc2.empty() && st.strikes.load() == 0 && st.bans.load() == 0,
+          "rev99_complete: Y parked and run again: placed; no strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
+// ownrx: the node's own share whose carried receipt's memo entry is gone and whose RandomX fails: RandomxFailure leaves
+// on_own_share (the caller re-runs the share); the own hash is not kept; the re-run places the share.
+void ownrx() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 4; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 20 + i);
+    }
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t k = 0; k < 3; ++k) jobs.push_back(*h.job(a, k + 2, 500 + k));
+    h.mine(a, 1, 30);
+    std::size_t pend = 0;
+    for (std::uint32_t k = 0; k < 3; ++k) pend += h[a].on_own_share(jobs[k], 500 + k, pb::Hash32{}).action == pb::NodeAction::Pending ? 1 : 0;
+    const std::optional<pb::PathbJob> j = h.job(a, 1, 31);
+    const bool carries = j && !j->carried.empty();
+    if (!carries || pend != 3) {
+        check(false, "ownrx: setup (3 pending receipts carried by the job)");
+        return;
+    }
+    pb::PathbNodeTestAccess::memo_clear(h[a]);
+    const pb::Hash32 rc = pb::receipt_id(j->carried[0]);
+    h.throw_pow.insert(rc);
+    bool typed = false;
+    try {
+        (void)h[a].on_own_share(*j, 31, pb::Hash32{});
+    } catch (const pb::RandomxFailure&) {
+        typed = true;
+    }
+    const bool kept = pb::PathbNodeTestAccess::own_pow_set(h[a]);
+    const pb::NodeEventResult again = h[a].on_own_share(*j, 31, pb::Hash32{});
+    check(typed && h.throw_pow.count(rc) == 0 && !kept && again.action == pb::NodeAction::Placed,
+          std::string("ownrx: RandomX failed on a carried receipt of the own share: RandomxFailure out of on_own_share (")
+                  + (typed ? "yes" : "no") + "), the own hash not kept (" + (kept ? "kept" : "reset")
+                  + "); the re-run places the share");
+}
+
+// ---------------------------------------------------------------------------
+// relayrxbindr: the bind path on the RECEIPT path (FB_RECEIPTS of a receipt whose tip is a walked carrier): a RandomX
+// failure in the bind of the walked carrier (the first hash of a body only the losing sibling carries) is counted and
+// alarmed; no token, no ban; nothing leaves the relay.
+void relayrxbindr() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay l = kat_relay(h, w, table0(net), true);
+    KatRelay x = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::PathbJob> ja = h.job(a.node, 2, 350), jl = h.job(l.node, 3, 351);
+    const std::optional<pb::PathbJob> ua = h.job(a.node, 6, 360), ul = h.job(l.node, 7, 361);
+    ok = ok && ja && jl && ua && ul && mine_on(h, w, a.node, 1, 352);
+    ok = ok && h[a.node].on_own_share(*ja, 350, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && h[l.node].on_own_share(*jl, 351, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = [](FakeWire::Msg& m) {
+        if ((m.from == 0 && m.to == 1) || (m.from == 1 && m.to == 0)) m.f.clear();
+    };
+    ok = ok && h[a.node].on_own_share(*ua, 360, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && h[l.node].on_own_share(*ul, 361, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.tick_monero();
+    ok = ok && mine_on(h, w, a.node, 2, 400) && mine_on(h, w, l.node, 3, 401);
+    const pb::Hash32 sa = h[a.node].tree().best().id, sl = h[l.node].tree().best().id;
+    const std::optional<pb::PathbJob> ka = h.job(a.node, 4, 410), kl = h.job(l.node, 4, 411);
+    w.edit = nullptr;
+    ok = ok && sa != sl && ka && kl;
+    if (!ok) {
+        check(false, "relayrxbindr: setup");
+        return;
+    }
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(sa), 16)});
+    w.q.push_back(FakeWire::Msg{1, 0, *pb::encode_fc_carrier(0, *h[l.node].bodies().get(sl), 16)});
+    w.run();
+    const bool a_lost = sl < sa;
+    const std::size_t lo = a_lost ? a.node : l.node;
+    const pb::Hash32 loser = a_lost ? sa : sl;
+    const pb::PathbJob k = a_lost ? *ka : *kl;
+    const std::uint32_t kn = a_lost ? 410 : 411;
+    pb::ReceiptBodyV3 ub = a_lost ? ua->body : ul->body;
+    ub.blob.nonce = a_lost ? 360 : 361;
+    const pb::Hash32 u = pb::receipt_id(ub);
+    pb::ReceiptBodyV3 rk = k.body;
+    rk.blob.nonce = kn;
+    bool only_loser = false;
+    for (const pb::ReceiptBodyV3& b : h[lo].bodies().get(loser)->carried) only_loser = only_loser || pb::receipt_id(b) == u;
+    if (!only_loser) {
+        check(false, "relayrxbindr: setup (the losing sibling carries a body of its own)");
+        return;
+    }
+    // X catches up from the losing node alone, no receipt frame of it reaching X; then the receipt rk (tip: the loser)
+    // is offered to X until its walked carrier's bind runs
+    h.throw_pow.insert(u);
+    w.edit = [lo, xn = x.node](FakeWire::Msg& m) {
+        if (m.from == lo && m.to == xn && !m.f.empty() && m.f[0] == pb::kOpFbReceipts) m.f.clear();
+    };
+    const pb::PathbRelayStats& st = x.relay->stats();
+    const std::vector<pb::ReceiptBodyV3> one{rk};
+    const std::vector<std::uint8_t> frk = *pb::encode_fb_receipts(0, one, pb::kRuledLaneParams);
+    std::string esc;
+    int offers = 0;
+    try {
+        w.connect(lo, x.node);
+        w.run();
+        for (; offers < 8 && h.throw_pow.count(u) != 0; ++offers) {
+            x.relay->receive(lo + 1, frk);
+            w.run();
+            h.now += 1;
+            x.relay->tick();
+            w.run();
+        }
+    } catch (const std::exception& e) {
+        esc = e.what();
+    }
+    w.edit = nullptr;
+    const bool thrown = h.throw_pow.count(u) == 0;
+    std::printf("  relayrxbindr: offers=%d thrown=%d escaped='%s' rx_failures=%llu walk_placed=%llu loser@X=%d\n", offers,
+                thrown, esc.c_str(), (unsigned long long)st.rx_failures.load(), (unsigned long long)st.walk_placed.load(),
+                h[x.node].tree().find(loser) != nullptr);
+    check(thrown && esc.empty() && st.rx_failures.load() >= 1 && st.strikes.load() == 0 && st.bans.load() == 0,
+          "relayrxbindr: a RandomX failure in the bind on the receipt path: counted (" + std::to_string(st.rx_failures.load())
+                  + "), nothing out of the relay; no strike, no ban");
+}
+
+
+// ---------------------------------------------------------------------------
+// relayrxbindk: a bind that refutes one server's body set (a BAN or a strike collected) and then fails on RandomX at
+// the next set (the first hash of a body only the losing sibling carries) keeps what it collected: the refuting
+// server's token is applied; the failure is counted; nothing leaves the relay.
+void relayrxbindk() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay l = kat_relay(h, w, table0(net), true);
+    KatRelay x = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::PathbJob> ja = h.job(a.node, 2, 350), jl = h.job(l.node, 3, 351);
+    const std::optional<pb::PathbJob> ua = h.job(a.node, 6, 360), ul = h.job(l.node, 7, 361);
+    ok = ok && ja && jl && ua && ul && mine_on(h, w, a.node, 1, 352);
+    ok = ok && h[a.node].on_own_share(*ja, 350, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && h[l.node].on_own_share(*jl, 351, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = [](FakeWire::Msg& m) {
+        if ((m.from == 0 && m.to == 1) || (m.from == 1 && m.to == 0)) m.f.clear();
+    };
+    ok = ok && h[a.node].on_own_share(*ua, 360, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && h[l.node].on_own_share(*ul, 361, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.tick_monero();
+    ok = ok && mine_on(h, w, a.node, 2, 400) && mine_on(h, w, l.node, 3, 401);
+    const pb::Hash32 sa = h[a.node].tree().best().id, sl = h[l.node].tree().best().id;
+    const std::optional<pb::PathbJob> ka = h.job(a.node, 4, 410), kl = h.job(l.node, 4, 411);
+    w.edit = nullptr;
+    ok = ok && sa != sl && ka && kl;
+    if (!ok) {
+        check(false, "relayrxbindk: setup");
+        return;
+    }
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(sa), 16)});
+    w.q.push_back(FakeWire::Msg{1, 0, *pb::encode_fc_carrier(0, *h[l.node].bodies().get(sl), 16)});
+    w.run();
+    const bool a_lost = sl < sa;
+    const std::size_t lo = a_lost ? a.node : l.node, other = a_lost ? l.node : a.node;
+    const pb::Hash32 loser = a_lost ? sa : sl;
+    const pb::PathbJob k = a_lost ? *ka : *kl;
+    const std::uint32_t kn = a_lost ? 410 : 411;
+    pb::ReceiptBodyV3 ub = a_lost ? ua->body : ul->body;
+    ub.blob.nonce = a_lost ? 360 : 361;
+    const pb::Hash32 u = pb::receipt_id(ub);
+    ok = ok && h[lo].on_own_share(k, kn, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    h.tick_monero();
+    ok = ok && mine_on(h, w, lo, 5, 420);
+    const pb::Hash32 c = h[lo].tree().best().id;
+    const pb::CarrierBodyV3* lb = h[lo].bodies().get(loser);
+    bool only_loser = false;
+    for (const pb::ReceiptBodyV3& b : lb != nullptr ? lb->carried : std::vector<pb::ReceiptBodyV3>{})
+        only_loser = only_loser || pb::receipt_id(b) == u;
+    if (!ok || !only_loser || lb->carried.size() < 2) {
+        check(false, "relayrxbindk: setup (the losing sibling carries a body of its own and one more)");
+        return;
+    }
+    // X follows both nodes; no receipt frame reaches X; the loser's body sets X asks for are held back
+    std::map<std::size_t, std::vector<std::uint8_t>> sets;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.to != x.node || m.f.empty()) return;
+        if (m.f[0] == pb::kOpFbReceipts) {
+            m.f.clear();
+            return;
+        }
+        if (m.f[0] != pb::kOpFcCarrier || m.f.size() < pb::kFrameHeaderBytes) return;
+        pb::CarrierBodyV3 cb;
+        if (pb::decode_carrier_body_v3(m.f.data() + pb::kFrameHeaderBytes, m.f.size() - pb::kFrameHeaderBytes,
+                                       pb::CarrierLimits{h[x.node].config().buffers.receipt, pb::kRuledLaneParams.r_max}, cb)
+                    == pb::WireError::None
+            && pb::receipt_id(cb.own) == loser) {
+            sets[m.from] = m.f;
+            m.f.clear();
+        }
+    };
+    const std::vector<std::uint8_t> fc = *pb::encode_fc_carrier(0, *h[lo].bodies().get(c), 16);
+    w.connect(lo, x.node);
+    w.connect(other, x.node);
+    w.run();
+    for (int i = 0; i < 6 && sets.size() < 2; ++i) {
+        for (const std::size_t from : {lo, other})
+            if (sets.count(from) == 0) x.relay->receive(from + 1, fc);
+        w.run();
+        h.now += 1;
+        x.relay->tick();
+        w.run();
+    }
+    const bool both = sets.size() == 2;
+    // the set of the lower peer id refuted (one carried body changed), the other good: delivered together
+    std::string esc;
+    const pb::PathbRelayStats& st = x.relay->stats();
+    const std::uint64_t bans0 = st.bans.load(), f0 = st.rx_failures.load();
+    std::uint64_t first_from = 0, tokens = 0;
+    if (both) {
+        const std::size_t p1 = std::min(lo, other), p2 = std::max(lo, other);
+        pb::CarrierBodyV3 bad = *lb;
+        for (pb::ReceiptBodyV3& b : bad.carried)
+            if (pb::receipt_id(b) != u) {
+                b.blob.nonce ^= 1;
+                break;
+            }
+        first_from = p1 + 1;
+        h.throw_pow.insert(u);
+        try {
+            x.relay->receive(p1 + 1, *pb::encode_fc_carrier(0, bad, 16));
+            x.relay->receive(p2 + 1, sets[p2]);
+            w.run();
+        } catch (const std::exception& e) {
+            esc = e.what();
+        }
+        tokens = (st.bans.load() - bans0) + x.relay->strikes_of(first_from);
+    }
+    w.edit = nullptr;
+    const bool thrown = h.throw_pow.count(u) == 0;
+    std::printf("  relayrxbindk: both=%d thrown=%d escaped='%s' rx_failures=%llu refuting server tokens=%llu\n", both, thrown,
+                esc.c_str(), (unsigned long long)(st.rx_failures.load() - f0), (unsigned long long)tokens);
+    check(both && thrown && esc.empty() && st.rx_failures.load() > f0 && tokens >= 1,
+          "relayrxbindk: a bind that refuted a body set, then failed on RandomX: the refuting server's token applied ("
+                  + std::to_string(tokens) + "), the failure counted, nothing out of the relay");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3268,6 +3721,11 @@ int main(int argc, char** argv) {
     run("relayrxtype", relayrxtype);
     run("relaystalem", relaystalem);
     run("relayrxbind", relayrxbind);
+    run("relaymaxpage", relaymaxpage);
+    run("rev99_complete", rev99_complete);
+    run("ownrx", ownrx);
+    run("relayrxbindr", relayrxbindr);
+    run("relayrxbindk", relayrxbindk);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
     run("prune_flags", prune_flags);
