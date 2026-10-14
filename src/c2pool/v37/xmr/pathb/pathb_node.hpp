@@ -391,14 +391,6 @@ struct NodeStore {
     bool drop_side(const Hash32& id) { return s.drop_side(id); }
 };
 
-// A RandomX failure: the hash could not be computed (the engine, its seed
-// cache, memory). Node-internal, never a verdict on the object judged. Every
-// exception from PathbNodeIo::verify leaves the node as this type
-// (verify_memo); a relay catches this type only.
-struct RandomxFailure : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
 // ---------------------------------------------------------------------------
 // PathbNode
 // ---------------------------------------------------------------------------
@@ -541,14 +533,15 @@ public:
     // state the node's, written into the store in one batch). The links an
     // attempt uses stay alive to its end; a server that disconnected meanwhile
     // answers nothing and its pairs go when the attempt is applied.
-    JoinAttempted attempt_join() {
+    // attempt: the queued pair's attempt runs (false: the re-ask only; P-40 not met).
+    JoinAttempted attempt_join(bool attempt = true) {
         JoinAttempted out;
         if (poisoned_) return out;
         std::vector<std::shared_ptr<PathbJoinLink>> held;  // kept alive to the end of this call
         for (const auto& [peer, l] : links_) held.push_back(l);
         attempting_ = true;
         if (reask_pending_ && joined_store()) reask_fetch(out);
-        out.attempt = joiner_->attempt_next();
+        if (attempt) out.attempt = joiner_->attempt_next();
         attempting_ = false;
         for (const std::shared_ptr<PathbJoinLink>& l : held) l->reset();  // what an attempt received is its own
         return out;
@@ -2097,6 +2090,7 @@ private:
         join_in_.headers_frame_bytes = frame_bytes_headers();
         join_in_.bucket_frame_bytes = cfg_.bucket_policy.frame_bytes;
         join_in_.chain_id = cfg_.identity.chain_id;
+        join_in_.key_cache_bytes = cfg_.key_cache_bytes;
         join_in_.resolve_pr = io_.resolve_pr;
         join_in_.seed_of = io_.seed_of;
         join_in_.randomx = [this](const HashingBlob& b, std::uint64_t d, const Hash32& seed) { return verify_memo(b, d, seed); };

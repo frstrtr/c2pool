@@ -52,6 +52,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -74,6 +75,14 @@
 #include "pathb_wire_v3.hpp"
 
 namespace c2pool::xmr::pathb {
+
+// A RandomX failure: the hash could not be computed (the engine, its seed
+// cache, memory). Node-internal, never a verdict on the object judged. Every
+// exception from PathbNodeIo::verify leaves the node as this type
+// (verify_memo); a relay and a join attempt catch this type only.
+struct RandomxFailure : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // ---------------------------------------------------------------------------
 // Rows, roles, DEFER causes
@@ -1863,14 +1872,27 @@ private:
 // bucket with refill P-15 = (1 + R_MAX) / T alarms per second and burst
 // 1 + R_MAX, counted on the frames a peer relays (a reply to the node's own
 // request is not counted). An empty bucket: disconnect the peer (no ban, no
-// token, never a verdict).
+// token, never a verdict). --pathb-claim-alarm-rate raises the refill (raise
+// only; floor = the formula); the burst stays 1 + R_MAX.
 // ---------------------------------------------------------------------------
 inline constexpr std::string_view kClaimAlarmRateFlag = "--pathb-claim-alarm-rate";
 
+// The floor of the P-50 refill: (1 + R_MAX) / T alarms per second.
+inline double claim_alarm_rate_floor(const LaneParams& p) {
+    return static_cast<double>(1 + p.r_max) / static_cast<double>(p.carrier_interval_s);
+}
+
 class ClaimAlarmBudget {
 public:
-    explicit ClaimAlarmBudget(const LaneParams& p)
-        : per_s_(1 + p.r_max), unit_(p.carrier_interval_s), cap_((1 + p.r_max) * p.carrier_interval_s) {}
+    // Units: one alarm = T x kScale units; the refill (1 + R_MAX) x kScale units per second (rate x T x kScale at a
+    // raised rate); the burst (1 + R_MAX) alarms.
+    static constexpr std::uint64_t kScale = 1000;
+    explicit ClaimAlarmBudget(const LaneParams& p, double rate = 0)
+        : per_s_(rate > claim_alarm_rate_floor(p)
+                         ? static_cast<std::uint64_t>(rate * static_cast<double>(p.carrier_interval_s * kScale))
+                         : (1 + p.r_max) * kScale),
+          unit_(p.carrier_interval_s * kScale),
+          cap_((1 + p.r_max) * p.carrier_interval_s * kScale) {}
 
     // A ClaimLeaf alarm on a frame from `peer`. false: the bucket is empty, disconnect the peer.
     bool charge(std::uint64_t peer, std::uint64_t now_s, bool relayed) {
@@ -1890,6 +1912,9 @@ public:
         b.units -= unit_;
         return true;
     }
+    // A gone peer: its bucket dropped.
+    void forget(std::uint64_t peer) { buckets_.erase(peer); }
+    std::size_t entries() const noexcept { return buckets_.size(); }
 
 private:
     struct Bucket {

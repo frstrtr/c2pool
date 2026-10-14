@@ -294,6 +294,7 @@ struct JoinInputs {
     std::uint64_t headers_frame_bytes = 0;   // what one FC_HEADERS frame holds (P-14, the caller's)
     std::uint64_t bucket_frame_bytes = 0;    // P-39
     std::uint32_t chain_id = 0;
+    std::size_t key_cache_bytes = kKeyCacheBytesDefault;  // P-36: the key cache of a joined state
     std::function<PrInfo(const Hash32& p_r)> resolve_pr;
     std::function<std::optional<Hash32>(const Hash32& p_r)> seed_of;
     std::function<bool(const HashingBlob&, std::uint64_t d, const Hash32& seed)> randomx;
@@ -403,7 +404,8 @@ struct AtHeader {
 // ---------------------------------------------------------------------------
 class JoinedState final : public AdoptedChain {
 public:
-    JoinedState(const JoinInputs& in, std::uint64_t server) : in_(&in), server_(server), claims_(*this) {
+    JoinedState(const JoinInputs& in, std::uint64_t server)
+        : in_(&in), server_(server), claims_(*this), own_keys_(in.key_cache_bytes) {
         windows_ = &own_windows_;
         keys_ = &own_keys_;
     }
@@ -442,6 +444,7 @@ public:
     const JoinClaims& claims() const noexcept { return claims_; }
     WindowCache& windows() noexcept { return *windows_; }
     KeyCache& keys() noexcept { return *keys_; }
+    const KeyCache& keys() const noexcept { return *keys_; }
     // The cache instances this state uses (its own unless set otherwise).
     void use_caches(WindowCache& w, KeyCache& k) noexcept {
         windows_ = &w;
@@ -932,6 +935,7 @@ enum class AttemptEnd : std::uint8_t {
     Header,         // the header phase (header checks (4), (5)): the end, the server excluded with all its pairs, no token
     OutOfScope,     // 3.3 step 2a: L held by A, or forking above A's x1 and at or above its base: dropped
     Known,          // 3.3a (5): a completed candidate that did not replace A: dropped
+    NodeInternal,   // a RandomX failure inside the attempt (node-internal): the end, a local alarm, no token, re-queued
 };
 
 inline constexpr bool attempt_excludes(AttemptEnd e) noexcept {
@@ -1910,7 +1914,17 @@ public:
             JoinAttempt att(in_, *li->second, timeout_, a(), on_step_);
             att.set_known([this](const Hash32& tip) { return known_.count(tip) != 0; });
             att.set_force_young(p->young);
-            return Attempted{*p, att.run(p->candidate)};
+            try {
+                return Attempted{*p, att.run(p->candidate)};
+            } catch (const RandomxFailure& e) {  // node-internal: the attempt ends; no token; the pair stays queued
+                AttemptReport rep;
+                rep.end = AttemptEnd::NodeInternal;
+                rep.server = p->server;
+                rep.candidate = p->candidate;
+                rep.alarms = 1;
+                rep.what = e.what();
+                return Attempted{*p, std::move(rep)};
+            }
         }
     }
     AttemptReport apply(Attempted&& t) {
@@ -1926,6 +1940,7 @@ public:
                 queue_.requeue(q);
                 break;
             }
+            case AttemptEnd::NodeInternal: queue_.requeue(*p); break;
             case AttemptEnd::Alarm:
             case AttemptEnd::Contradiction:
             case AttemptEnd::Unplaceable:

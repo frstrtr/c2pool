@@ -133,7 +133,15 @@
 //                DoS token, one placed on its re-run (a duplicate: none);
 //   relayrxbind2 a walk placed a walked carrier, then the bind of the next
 //                failed on RandomX: the placed one kept; the re-run places
-//                the rest.
+//                the rest;
+//   ownrxrun     the own share path: RandomX fails on an own share: kept, no
+//                exit, placed by the re-run; a stale kept share dropped;
+//   relayp40     P-40: one HELLO tail, no join attempt; two, the attempt runs;
+//   relayp50     P-50: 1 + R_MAX relayed claim-leaf alarms kept, one more drops
+//                the link (no ban, no token); solicited ones not counted;
+//   relayjoint   the threaded join over TCP (the attempt on the join worker,
+//                applied on the owner); a RandomX failure in an attempt ends
+//                it alarmed, no token; the next attempt joins.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -159,6 +167,7 @@
 #include <utility>
 #include <vector>
 
+#include "c2pool/v37/xmr/pathb/pathb_own_share.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_links.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_startup.hpp"
@@ -1899,8 +1908,8 @@ void relaytok() {
           "relaytok: FB_BLOCK_WON 0x42, receipts v2 (0x41 at frame version 0x01) and 0x4a: unknown, no token, the link kept");
     check(rb.stats().bans == 0, "relaytok: no ban");
 
-    // the attempt's server of a join (a load-failed node J: A's HELLO tip is a candidate)
-    KatRelay j = kat_relay(h, w, table0(net), false, true);
+    // the attempt's server of a join (a load-failed node J: A's HELLO tip is a candidate; one HELLO tail, P-40 at 1)
+    KatRelay j = kat_relay(h, w, table0(net), false, true, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; });
     w.connect(0, 2);
     w.run();
     const std::uint64_t pj = 1;  // A at J
@@ -1941,7 +1950,7 @@ void relaym4() {
     Harness h(net);
     FakeWire w;
     KatRelay a = kat_relay(h, w, table0(net), true);
-    KatRelay e = kat_relay(h, w, table0(net), false);
+    KatRelay e = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; });
     bool mined = true;
     for (int i = 0; i < 4; ++i) {
         const std::optional<pb::PathbJob> j = h.job(a.node, static_cast<std::size_t>(i), 400 + i);
@@ -3903,6 +3912,222 @@ void relayrxbind2() {
           "and counted, the failure counted; the re-run places the rest and the tip");
 }
 
+
+// ---------------------------------------------------------------------------
+// ownrxrun: the own share path (W-E5, W-E5b): RandomX fails on a carried receipt of an own share (its memo entry gone):
+// the runner keeps the share (no exit) with one alarm line; its re-run places it (a second line). A kept share whose
+// job is no longer issued is dropped as stale, not run.
+void ownrxrun() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 4; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 20 + i);
+    }
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t k = 0; k < 3; ++k) jobs.push_back(*h.job(a, k + 2, 500 + k));
+    h.mine(a, 1, 30);
+    std::size_t pend = 0;
+    for (std::uint32_t k = 0; k < 3; ++k) pend += h[a].on_own_share(jobs[k], 500 + k, pb::Hash32{}).action == pb::NodeAction::Pending ? 1 : 0;
+    const std::optional<pb::PathbJob> j = h.job(a, 1, 31);
+    if (!j || j->carried.empty() || pend != 3) {
+        check(false, "ownrxrun: setup (3 pending receipts carried by the job)");
+        return;
+    }
+    bool live = true;
+    std::vector<std::string> lines;
+    pb::OwnShareRunner runner([&](const pb::OwnShare& s) { return h[a].on_own_share(s.job, s.nonce, s.pow_hash); },
+                              [&](const pb::OwnShare&) { return live; }, [&](const std::string& l) { lines.push_back(l); });
+    pb::PathbNodeTestAccess::memo_clear(h[a]);
+    const pb::Hash32 rc = pb::receipt_id(j->carried[0]);
+    h.throw_pow.insert(rc);
+    std::string esc;
+    std::optional<pb::NodeEventResult> r1;
+    std::vector<pb::NodeEventResult> rs;
+    try {
+        r1 = runner.submit(pb::OwnShare{7, 9, *j, 31, pb::Hash32{}});
+    } catch (const std::exception& e) {
+        esc = e.what();
+    }
+    const std::size_t kept1 = runner.kept();
+    const std::size_t lines1 = lines.size();
+    rs = runner.run_kept();
+    check(esc.empty() && !r1 && kept1 == 1 && lines1 == 1 && h.throw_pow.count(rc) == 0 && rs.size() == 1
+                  && rs[0].action == pb::NodeAction::Placed && runner.kept() == 0 && runner.stats().rx_failures == 1
+                  && runner.stats().reruns == 1 && lines.size() == 2,
+          "ownrxrun: RandomX failed on the own share: kept (" + std::to_string(kept1) + "), no exit" +
+                  (esc.empty() ? "" : " (escaped: " + esc + ")") + "; the re-run placed it (" +
+                  std::to_string(rs.size()) + " run), alarm lines " + std::to_string(lines.size()));
+    // stale: a kept share whose job is no longer issued is dropped, not run
+    std::vector<pb::PathbJob> jobs2;
+    for (std::uint32_t k = 0; k < 2; ++k)
+        if (const std::optional<pb::PathbJob> jk = h.job(a, k + 2, 600 + k)) jobs2.push_back(*jk);
+    h.mine(a, 1, 40);
+    for (std::uint32_t k = 0; k < jobs2.size(); ++k) (void)h[a].on_own_share(jobs2[k], 600 + k, pb::Hash32{});
+    const std::optional<pb::PathbJob> j2 = h.job(a, 1, 41);
+    if (!j2 || j2->carried.empty()) {
+        check(false, "ownrxrun: setup (a second job carrying a receipt)");
+        return;
+    }
+    pb::PathbNodeTestAccess::memo_clear(h[a]);
+    const pb::Hash32 rc2 = pb::receipt_id(j2->carried[0]);
+    h.throw_pow.insert(rc2);
+    const std::optional<pb::NodeEventResult> r2 = runner.submit(pb::OwnShare{8, 9, *j2, 41, pb::Hash32{}});
+    h.throw_pow.insert(rc2);  // armed again: a run of the stale share would throw
+    live = false;
+    const std::vector<pb::NodeEventResult> rs2 = runner.run_kept();
+    check(!r2 && rs2.empty() && runner.kept() == 0 && runner.stats().stale == 1 && h.throw_pow.count(rc2) == 1,
+          "ownrxrun: a kept share whose job is stale is dropped, not run (stale " + std::to_string(runner.stats().stale) + ")");
+    h.throw_pow.clear();
+}
+
+
+// ---------------------------------------------------------------------------
+// relayp40: P-40: a load-failed node J holding the HELLO tail of one peer queues its tip and attempts nothing (a wait
+// counted); with a second peer's HELLO tail the attempt runs and completes.
+void relayp40() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), false);
+    KatRelay j = kat_relay(h, w, table0(net), false, true);
+    bool mined = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        const std::optional<pb::PathbJob> jb = h.job(a.node, static_cast<std::size_t>(i % 3), 700 + i);
+        mined = mined && jb && h[a.node].on_own_share(*jb, 700 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    w.connect(a.node, c.node);
+    w.run();
+    const pb::Hash32 tip_a = h[a.node].tree().best().id;
+    w.connect(a.node, j.node);
+    w.run();
+    const std::optional<pb::JoinStep> s1 = j.relay->join_step();
+    w.run();
+    const bool waited = !s1 && j.relay->stats().join_waits.load() >= 1 && j.relay->stats().join_attempts.load() == 0
+                        && h[j.node].joiner().queue().size() >= 1;
+    w.connect(c.node, j.node);
+    w.run();
+    const std::optional<pb::JoinStep> s2 = j.relay->join_step();
+    w.run();
+    check(mined && h[c.node].tree().best().id == tip_a && waited && s2 && s2->switched && h[j.node].tree().best().id == tip_a
+                  && j.relay->stats().join_attempts.load() == 1,
+          "relayp40: one HELLO tail: no attempt (waits " + std::to_string(j.relay->stats().join_waits.load()) +
+                  "); two: the attempt joins A's tip");
+}
+
+// ---------------------------------------------------------------------------
+// relayp50: P-50: claim-leaf alarms on frames a peer relays, 1 + R_MAX of them at once: the link kept; one more: the
+// link dropped, no ban, no token, its bucket gone. Alarms on replies to the node's own requests are not counted.
+void relayp50() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = 1;
+    const std::uint64_t burst = 1 + pb::kRuledLaneParams.r_max;
+    for (std::uint64_t i = 0; i < 3 * burst; ++i)
+        rb.test_parked(pa, pb::Missing::ClaimAlarm, seq32(static_cast<std::uint8_t>(i)), pb::Hash32{}, false);
+    w.run();
+    const bool solicited_free = rb.hello_ok(pa) && rb.stats().claim_alarm_drops.load() == 0 && rb.stats().claim_alarms.load() == 0;
+    for (std::uint64_t i = 0; i < burst; ++i)
+        rb.test_parked(pa, pb::Missing::ClaimAlarm, seq32(static_cast<std::uint8_t>(0x80 + i)), pb::Hash32{}, true);
+    rb.tick();
+    w.run();
+    const bool kept = rb.hello_ok(pa) && rb.stats().claim_alarm_drops.load() == 0 && rb.claim_entries() == 1;
+    rb.test_parked(pa, pb::Missing::ClaimAlarm, seq32(0xf0), pb::Hash32{}, true);
+    rb.tick();
+    w.run();
+    check(solicited_free && kept && rb.stats().claim_alarm_drops.load() == 1 && !rb.hello_ok(pa) && rb.stats().bans.load() == 0
+                  && rb.strikes_of(pa) == 0 && rb.claim_entries() == 0,
+          "relayp50: " + std::to_string(burst) + " relayed claim-leaf alarms at once: kept; one more: the link dropped, no "
+          "ban, no token, its bucket gone; alarms on solicited replies not counted");
+}
+
+
+// ---------------------------------------------------------------------------
+// relayjoint: the threaded join over loopback TCP: a load-failed node J dials A and C (HELLO tails of two peers,
+// P-40); the attempt runs on J's join worker and its outcome is applied on J's owner. RandomX fails once in J's first
+// attempt (the hash of A's tip): that attempt ends NodeInternal, alarmed (rx_failures), no strike, no ban, no process
+// end; the next attempt joins A's tip.
+void relayjoint() {
+    const KatNet net;
+    Harness h(net);
+    h.tick_monero();
+    std::atomic<bool> armed{false};
+    std::atomic<std::uint64_t> thrown{0};
+    pb::Hash32 tip_a{};
+    std::mutex tip_m;
+    const auto io_of = [&](std::size_t self, bool joiner) {
+        pb::PathbNodeIo o = h.io(self);
+        o.verify = [&, joiner](const pb::HashingBlob& b, std::uint64_t, const pb::Hash32&) {
+            if (joiner && armed.load()) {
+                std::lock_guard<std::mutex> lk(tip_m);
+                if (pb::receipt_id(b) == tip_a && armed.exchange(false)) {
+                    ++thrown;
+                    throw std::runtime_error("kat: RandomX worker failed");
+                }
+            }
+            return true;
+        };
+        return o;
+    };
+    std::string why;
+    pb::CarrierLinks la, lc, lj;
+    pb::PathbRelayOptions oa;
+    oa.listen = true;
+    oa.listen_host = "127.0.0.1";
+    pb::PathbRelayNode ra(oa, la);
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net), true), ra.bind_io(io_of(0, false))));
+    ra.attach(*h.nodes[0]);
+    bool mined = true;
+    for (int i = 0; i < 3; ++i) {
+        const std::optional<pb::PathbJob> j = h.job(0, static_cast<std::size_t>(i), 800 + i);
+        mined = mined && j && h[0].on_own_share(*j, 800 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    const bool sa = ra.start(why);
+    pb::PathbRelayOptions oc;
+    oc.listen = true;
+    oc.listen_host = "127.0.0.1";
+    oc.peers = {{"127.0.0.1", la.listen_port()}};
+    pb::PathbRelayNode rc(oc, lc);
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net)), rc.bind_io(io_of(1, false))));
+    rc.attach(*h.nodes[1]);
+    const bool sc = rc.start(why);
+    const auto best = [](pb::PathbRelayNode& r) { return r.with_node([](pb::PathbNode& n) { return n.tree().best().id; }); };
+    {
+        std::lock_guard<std::mutex> lk(tip_m);
+        tip_a = best(ra);
+    }
+    const bool c_caught = wait_for([&] { return best(rc) == tip_a; }, 10000);
+    armed = true;
+    pb::PathbRelayOptions oj;
+    oj.peers = {{"127.0.0.1", la.listen_port()}, {"127.0.0.1", lc.listen_port()}};
+    pb::PathbRelayNode rj(oj, lj);
+    pb::PathbNodeConfig cj = h.config(table0(net));
+    cj.abandon_timeout_s = 1;
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cj, rj.bind_io(io_of(2, true)), h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    rj.attach(*h.nodes[2]);
+    const bool sj = rj.start(why);
+    const bool joined = wait_for([&] { return best(rj) == tip_a; }, 30000);
+    const pb::PathbRelayStats& st = rj.stats();
+    check(mined && sa && sc && sj && c_caught && joined && thrown.load() == 1 && st.rx_failures.load() >= 1
+                  && st.join_attempts.load() >= 2 && st.strikes.load() == 0 && st.bans.load() == 0,
+          "relayjoint: J joins A's tip on its join worker over TCP after a RandomX failure in its first attempt (thrown " +
+                  std::to_string(thrown.load()) + ", rx_failures " + std::to_string(st.rx_failures.load()) + ", attempts " +
+                  std::to_string(st.join_attempts.load()) + "; " + rj.describe() + ")");
+    rj.stop();
+    rc.stop();
+    ra.stop();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3960,6 +4185,10 @@ int main(int argc, char** argv) {
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
     run("relayrxbind2", relayrxbind2);
+    run("ownrxrun", ownrxrun);
+    run("relayp40", relayp40);
+    run("relayp50", relayp50);
+    run("relayjoint", relayjoint);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
     run("prune_flags", prune_flags);

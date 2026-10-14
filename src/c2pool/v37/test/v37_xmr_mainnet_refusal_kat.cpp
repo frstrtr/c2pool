@@ -14,6 +14,9 @@
 //             the relay fields; off mainnet none of them is refused here
 //   order     mode_refusal: the fence (without --follow-only), then
 //             mainnet_refusal, then follow_only_refusal (its fence clause)
+//   knob      the test-only --test-unknown-fork-stall-s above 0 is refused on
+//             mainnet in either mode, before every other mode refusal; 0 and
+//             off mainnet pass
 //   bypass    each refused case stays refused with any other flag of the
 //             binary added (the full flag table and further names), and with
 //             every Path B switch field set except follow_only
@@ -268,6 +271,27 @@ void bypass() {
     check(still == total, "bypass: every refused case stays refused (" + std::to_string(still) + "/" + std::to_string(total) + ")");
 }
 
+
+void knob() {
+    const std::string want = "--test-unknown-fork-stall-s is test-only and refused on mainnet";
+    xn::XmrNodeConfig f = allowed_mainnet();
+    f.test_unknown_fork_stall_s = 120;
+    give(f, "--test-unknown-fork-stall-s", "120");
+    check(pm::mode_refusal(f) == want, "knob: --follow-only on mainnet with the stall knob", pm::mode_refusal(f));
+    xn::XmrNodeConfig p;
+    p.network = xn::MoneroNetwork::Mainnet;
+    p.i_understand_mainnet = true;
+    p.test_unknown_fork_stall_s = 120;
+    check(pm::mode_refusal(p) == want, "knob: the pool mode on mainnet: the knob's line first", pm::mode_refusal(p));
+    xn::XmrNodeConfig z = allowed_mainnet();
+    z.test_unknown_fork_stall_s = 0;
+    check(pm::mode_refusal(z).empty(), "knob: 0 on mainnet passes", pm::mode_refusal(z));
+    xn::XmrNodeConfig r;
+    r.network = xn::MoneroNetwork::Regtest;
+    r.test_unknown_fork_stall_s = 120;
+    check(pm::test_knob_mainnet_refusal(r).empty(), "knob: off mainnet the knob passes");
+}
+
 }  // namespace
 
 int main() {
@@ -276,6 +300,7 @@ int main() {
     refused();
     order();
     bypass();
+    knob();
     std::printf("v37_xmr_mainnet_refusal_kat: %d passed, %d failed\n", g_pass, g_fail);
     std::printf("RESULT: %s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;

@@ -87,6 +87,13 @@ struct StartupResult {
     bool ok() const noexcept { return refused == StartupStep::Ok; }
 };
 
+// Step 1 alone (the daemon runs it first, before anything starts): the configured sum.
+inline std::optional<std::string> fee_sum_refusal(std::uint32_t owner_fee_bp, std::uint32_t give_author_bp) {
+    const std::uint64_t fee_sum = std::uint64_t{owner_fee_bp} + give_author_bp;
+    if (fee_sum <= 10000u) return std::nullopt;
+    return "--node-owner-fee-pct + --give-author-pct = " + std::to_string(fee_sum) + " bp, above 10000 bp";
+}
+
 inline StartupResult startup_checks(const StartupInputs& in) {
     StartupResult out;
     const auto refuse = [&](StartupStep s, std::string why) {
@@ -95,10 +102,8 @@ inline StartupResult startup_checks(const StartupInputs& in) {
         return out;
     };
     // 1
-    const std::uint64_t fee_sum = std::uint64_t{in.owner_fee_bp} + in.give_author_bp;
-    if (fee_sum > 10000u)
-        return refuse(StartupStep::FeeSum, "--node-owner-fee-pct + --give-author-pct = " + std::to_string(fee_sum) +
-                                                   " bp, above 10000 bp");
+    if (const std::optional<std::string> r = fee_sum_refusal(in.owner_fee_bp, in.give_author_bp))
+        return refuse(StartupStep::FeeSum, *r);
     // 2
     if (const std::optional<std::string> r = journal_depth_refusal(in.p, in.journal_depth))
         return refuse(StartupStep::JournalDepth, *r);

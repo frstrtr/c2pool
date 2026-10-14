@@ -55,6 +55,9 @@
 //              with its P-01; with P-01 4,000 a load failure, never a BAN of
 //              an honest heavier branch;
 //   reaskrelay reask after a restart through the relay node;
+//   joinrx     a RandomX failure in a join attempt: NodeInternal, an alarm,
+//              no token, the pair kept; the next attempt joins;
+//   keycache   --pathb-key-cache-mb reaches a joined state's key cache;
 //   x1r        a joined node (P-01 4,000: its journal base below x1)
 //              restarted: the journal base the session's; a heavier branch
 //              forking in (base, x1] takes the joiner path by its headers,
@@ -1598,6 +1601,7 @@ void reaskr() {
                            == pb::NodeAction::Switched
                    || switched;
     h.q.clear();
+    const bool due = h[r].reask_pending();  // the flag a relay reads to run the re-ask (no queued pair needed)
     const pb::JoinStep st = h[r].run_join();
     h.q.clear();
     std::size_t rebound = 0;
@@ -1606,7 +1610,8 @@ void reaskr() {
         const pb::CarrierNode* n = h[r].tree().find(at);
         if (n != nullptr && n->pos > x1 && h[r].store().best_at(n->pos) == at) ++rebound;
     }
-    check(claimed > 0 && k0.size() == claimed && switched && st.reasked == claimed && rebound == claimed && !st.reask_joiner,
+    check(claimed > 0 && k0.size() == claimed && switched && due && st.reasked == claimed && rebound == claimed
+                  && !st.reask_joiner && !h[r].reask_pending(),
           "reaskr: after a restart (" + std::to_string(k0.size()) + " claimed leaves kept) a switch by the journal: every "
           "claimed leaf asked again (" + std::to_string(st.reasked) + ") and rebound (" + std::to_string(rebound) + ")");
 }
@@ -1879,6 +1884,68 @@ void reaskrelay() {
     relay.stop();
 }
 
+// ---------------------------------------------------------------------------
+// joinrx: a RandomX failure inside a join attempt (a header's PoW of the server's chain): the attempt ends
+// NodeInternal with a local alarm, no token; the pair stays queued, the node not attempting; the next attempt joins.
+void joinrx() {
+    JoinNet net(900);
+    const std::uint64_t L = 4704;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    Joining jn = joining_node(h, net, kJ);
+    h.hello(jn.j, s);
+    const std::size_t queued = h[jn.j].joiner().queue().size();
+    const pb::Hash32 cL = at_pos(a, L);
+    h.throw_pow.insert(cL);
+    std::string esc;
+    pb::JoinStep st1;
+    try {
+        st1 = h[jn.j].run_join();
+    } catch (const std::exception& e) {
+        esc = e.what();
+    }
+    h.q.clear();
+    const bool thrown = h.throw_pow.count(cL) == 0;
+    const bool ended = st1.report && st1.report->end == pb::AttemptEnd::NodeInternal && st1.report->strike == 0
+                       && st1.report->server == s && st1.report->alarms >= 1;
+    const std::size_t after = h[jn.j].joiner().queue().size();
+    check(esc.empty() && thrown && ended && !st1.switched && after == queued && queued > 0 && !h[jn.j].attempting()
+                  && h[jn.j].joined() == nullptr,
+          "joinrx: a RandomX failure in the attempt: NodeInternal, an alarm, 0 tokens; the pair still queued (" +
+                  std::to_string(after) + " of " + std::to_string(queued) + ")" + (esc.empty() ? "" : "; escaped: " + esc)
+                  + (st1.report ? std::string(": ") + rep_desc(*st1.report) : std::string(": no attempt")));
+    const pb::JoinStep st2 = h[jn.j].run_join();
+    h.q.clear();
+    check(st2.report && st2.report->end == pb::AttemptEnd::Completed && st2.switched && h[jn.j].tree().best().id == cL,
+          "joinrx: the next attempt of the same pair joins at L" +
+                  (st2.report ? std::string(": ") + rep_desc(*st2.report) : std::string(": no attempt")));
+}
+
+
+// ---------------------------------------------------------------------------
+// keycache: --pathb-key-cache-mb reaches the joined state's key cache (the cache a joined node builds templates and
+// judges with).
+void keycache() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 2400);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    const std::size_t want = std::size_t{3} << 20;
+    Joining jn = joining_node_cfg(h, net, kJ, [want](pb::PathbNodeConfig& c) { c.key_cache_bytes = want; });
+    h.hello(jn.j, s);
+    const pb::JoinStep st = h[jn.j].run_join();
+    h.q.clear();
+    const pb::JoinedState* js = h[jn.j].joined();
+    check(st.switched && js != nullptr && js->keys().budget() == want,
+          "keycache: the joined state's key cache holds the configured budget (" +
+                  std::to_string(js ? js->keys().budget() : 0) + " B, configured " + std::to_string(want) + ")");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1918,5 +1985,7 @@ int main(int argc, char** argv) {
     run("x8claim", x8claim);
     run("prunedj", prunedj);
     run("reaskrelay", reaskrelay);
+    run("joinrx", joinrx);
+    run("keycache", keycache);
     return finish("v37_xmr_pathb_node_join_kat");
 }

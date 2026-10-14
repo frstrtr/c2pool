@@ -93,6 +93,7 @@
 #include "xmr/pathb/pathb_policy.hpp"
 #include "xmr/pathb/pathb_follower_rows.hpp"
 #include "xmr/pathb/pathb_job_source.hpp"
+#include "xmr/pathb/pathb_own_share.hpp"
 #include "xmr/pathb/xmr_pathb_store.hpp"
 
 #include "impl/xmr/pathb/pathb_pool_identity.hpp"
@@ -165,6 +166,9 @@ static std::size_t   g_relay_parked_max = 0;             // --relay-parked-max N
 static std::optional<std::uint32_t> g_relay_keepalive_ms;   // --relay-keepalive-ms MS
 static std::optional<std::uint32_t> g_relay_silence_ms;     // --relay-silence-timeout-ms MS
 static bool          g_no_relay_serve = false;           // --no-relay-serve
+static std::optional<double> g_relay_peer_valid_rate;    // --relay-peer-valid-rate R (P-15; raise only)
+static std::optional<std::uint64_t> g_relay_pending_cap; // --relay-pending-cap N (P-09; raise only)
+static std::optional<std::uint64_t> g_relay_send_queue;  // --relay-send-queue-bytes N (P-67; floor two FC_HEADERS frames)
 static bool          g_no_relay_bootstrap = false;       // --no-relay-bootstrap
 static std::uint32_t g_relay_partition_s = 0;            // --relay-test-partition-seconds S
 
@@ -191,7 +195,7 @@ struct PathbFlags {
     std::optional<std::uint64_t> abandon_timeout_s;   // --pathb-abandon-timeout S
     std::optional<std::uint64_t> waiting_cap;         // --pathb-waiting-cap N
     std::optional<std::uint64_t> bucket_serve_cap;    // --pathb-bucket-serve-cap BYTES
-    std::optional<std::uint64_t> claim_alarm_rate;    // --pathb-claim-alarm-rate N
+    std::optional<double> claim_alarm_rate;           // --pathb-claim-alarm-rate R (P-50; raise only)
     std::optional<std::uint64_t> bucket_frame;        // --pathb-bucket-frame BYTES
     std::optional<std::uint64_t> join_min_peers;      // --join-min-peers N
     std::optional<std::uint64_t> bucket_inflight;     // --pathb-bucket-inflight N
@@ -624,6 +628,8 @@ static bool relay_options_of(const XmrNodeConfig& cfg, pb::PathbRelayOptions& ro
     if (g_relay_parked_max) ro.parked_max = g_relay_parked_max;
     if (g_relay_keepalive_ms) ro.keepalive_ms = *g_relay_keepalive_ms;
     if (g_relay_silence_ms) ro.silence_timeout_ms = *g_relay_silence_ms;
+    if (g_relay_peer_valid_rate) ro.peer_valid_rate = *g_relay_peer_valid_rate;  // P-15 (its capacity follows P-09)
+    if (g_relay_send_queue) ro.send_queue_bytes = static_cast<std::size_t>(*g_relay_send_queue);  // P-67 (start refuses below)
     // verify workers: N, or (0) clamp(cores / 2, 2, 8) of the cores the in-process miner leaves
     {
         const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
@@ -802,21 +808,20 @@ static std::uint64_t unix_now_s() {
 // run_pathb: the pool node
 // ---------------------------------------------------------------------------
 static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
-    const bool mainnet = cfg.network == MoneroNetwork::Mainnet;
     const bool p2p_first = cfg.arm_order == ArmOrderMode::P2PFirst;
-    if (cfg.test_unknown_fork_stall_s != 0 && mainnet) {
-        std::printf("REFUSED: --test-unknown-fork-stall-s is test-only and refused on mainnet\n");
-        return 2;
-    }
     const pmode::RunPlan plan = pmode::run_plan_of(cfg);
     const pb::LaneNet lnet = lane_net_of(cfg.network);
     const pb::Hash32 G = pb::genesis_rules_digest(lnet);
     const pb::LaneParams P = pb::kRuledLaneParams;
     const pb::RatchetParams RP = pb::kRuledRatchetParams;
 
-    // ---- the fees and the payees given at start ----
+    // ---- the fees and the payees given at start (the configured sum first: start-up step 1) ----
     const std::uint32_t give_bp = pb::policy::pct_to_bp(g_give_author_exact);
     const std::uint32_t owner_bp = pb::policy::pct_to_bp(g_owner_fee_exact);
+    if (const std::optional<std::string> r = pb::fee_sum_refusal(owner_bp, give_bp)) {
+        std::printf("REFUSED: %s\n", r->c_str());
+        return 2;
+    }
     std::optional<pb::XmrKeyRef> owner_ref;
     if (owner_bp > 0) {
         if (g_owner_address.empty()) {
@@ -986,6 +991,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     nc.penalty_fill = pf.penalty_fill;
     nc.vote_no = pf.vote_no;
     if (pf.key_cache_mb) nc.key_cache_bytes = static_cast<std::size_t>(*pf.key_cache_mb) << 20;
+    if (g_relay_pending_cap) nc.pending_cap = *g_relay_pending_cap;  // P-09 (P-15's capacity follows it)
 
     // ---- the store (W-E14) ----
     const std::string store_name = pb::store_dir_name(sr.identity.pool_id, G);
@@ -1058,6 +1064,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             return 2;
         }
     }
+    if (pf.claim_alarm_rate) ro.claim_alarm_rate = *pf.claim_alarm_rate;                       // P-50
+    if (pf.join_min_peers) ro.join_min_peers = static_cast<std::size_t>(*pf.join_min_peers);  // P-40
     std::string book_path;
     if (ro.discovery) {
         book_path = (netdir / rly::peerstore_file_name(static_cast<std::uint8_t>(lnet), hex_of(sr.identity.pool_id))).string();
@@ -1214,6 +1222,22 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     }
     GatedShareSink sink(rx, jobs, *arm);
     std::atomic<std::uint64_t> own_shares{0}, own_placed{0}, own_pending{0}, own_other{0}, own_below_d{0}, own_stale{0};
+    // the own share path: on_own_share under the node lock; a RandomX failure keeps the share (job, nonce, pow hash)
+    // and the serve loop runs it again until it is placed or its job is no longer issued
+    pb::OwnShareRunner own_runner(
+            [&relay](const pb::OwnShare& o) {
+                return relay->with_node([&](pb::PathbNode& n) { return n.on_own_share(o.job, o.nonce, o.pow_hash); });
+            },
+            [&jobs](const pb::OwnShare& o) { return jobs.issued(o.template_id, o.extra_nonce).has_value(); },
+            [&](const std::string& l) {
+                std::lock_guard<std::mutex> lk(relay_log_mtx);
+                relay_log.push_back("ALARM: " + l);
+            });
+    const auto count_own = [&](const pb::NodeEventResult& r) {
+        if (r.action == pb::NodeAction::Placed || r.action == pb::NodeAction::Switched) own_placed.fetch_add(1);
+        else if (r.action == pb::NodeAction::Pending) own_pending.fetch_add(1);
+        else own_other.fetch_add(1);
+    };
     sink.set_on_share([&](const strat::AcceptedShare& s) {
         const std::optional<pb::IssuedJob> j = jobs.issued(s.template_id, s.extra_nonce);
         if (g_web) g_web->on_share(static_cast<double>(j ? j->d : 0), s.address, s.worker);
@@ -1228,11 +1252,9 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             return;
         }
         own_shares.fetch_add(1, std::memory_order_relaxed);
-        const pb::NodeEventResult r =
-                relay->with_node([&](pb::PathbNode& n) { return n.on_own_share(j->job, s.nonce, s.pow_hash); });
-        if (r.action == pb::NodeAction::Placed || r.action == pb::NodeAction::Switched) own_placed.fetch_add(1);
-        else if (r.action == pb::NodeAction::Pending) own_pending.fetch_add(1);
-        else own_other.fetch_add(1);
+        if (const std::optional<pb::NodeEventResult> r =
+                    own_runner.submit(pb::OwnShare{s.template_id, s.extra_nonce, j->job, s.nonce, s.pow_hash}))
+            count_own(*r);
     });
 
     o2::StratumListener listener(jobs, rx, sink, listener_options_of(cfg));
@@ -1388,6 +1410,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     bool template_kept = false, fork_fuse = false;
     std::uint64_t templates = 0, tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, prunes = 0;
     pb::PathbNode::PruneReport last_prune{};
+    std::uint64_t last_rows_recorded = rows.recorded();
     const auto mono_s = []() { return pb::RelayClock::system().mono_ms() / 1000; };
     const std::uint64_t t0 = mono_s();
 
@@ -1446,6 +1469,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 else ++tip_extends;
             }
         }
+        // a Monero tip change or a new RowWeights record: the frames parked on a Monero input run again (the relay
+        // node's on_monero_tip, called here outside the node lock)
+        if (tip_moved || rows.recorded() != last_rows_recorded) {
+            last_rows_recorded = rows.recorded();
+            relay->on_monero_tip();
+        }
+        for (const pb::NodeEventResult& r : own_runner.run_kept()) count_own(r);  // the kept own shares
         if (inject_pump) inject_pump();
         if (publisher) publisher->tick();
         if (g_relay_partition_req.exchange(false) && g_relay_partition_s) {
@@ -1688,6 +1718,28 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(submitter->rejected()),
                             static_cast<unsigned long long>(submitter->refused()), live_sink->last_error().c_str());
             std::printf("  %s\n", relay->describe().c_str());
+            {
+                const pb::PathbRelayStats& rs = relay->stats();
+                const pb::OwnShareRunner::Stats os = own_runner.stats();
+                std::printf("  soak: p15_drops=%llu reoffer_paused=%llu queued_bytes_hwm=%zu queue_full_drops=%llu "
+                            "rx_failures=%llu own_rx_failures=%llu own_kept=%zu stale_events=%llu owner_waits=%llu "
+                            "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
+                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu\n",
+                            static_cast<unsigned long long>(rs.p15_drops.load()),
+                            static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
+                            static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
+                            static_cast<unsigned long long>(rs.rx_failures.load()),
+                            static_cast<unsigned long long>(os.rx_failures), own_runner.kept(),
+                            static_cast<unsigned long long>(rs.stale_events.load()),
+                            static_cast<unsigned long long>(rs.owner_waits.load()),
+                            static_cast<unsigned long long>(rs.owner_queue_hwm.load()),
+                            static_cast<unsigned long long>(rs.reoffer_done.load()),
+                            static_cast<unsigned long long>(rs.reoffer_last_ms.load()),
+                            static_cast<unsigned long long>(rs.reoffer_max_ms.load()),
+                            static_cast<unsigned long long>(rs.claim_alarms.load()),
+                            static_cast<unsigned long long>(rs.claim_alarm_drops.load()),
+                            static_cast<unsigned long long>(rs.join_waits.load()));
+            }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),
                         static_cast<unsigned long long>(tip_extends), static_cast<unsigned long long>(tip_reorgs),
@@ -1823,6 +1875,13 @@ inline double to_double(const std::string& flag, const std::string& v) {
     return out;
 }
 
+// A rate as the refusal names it (one decimal).
+inline std::string rate_str(double r) {
+    char b[32];
+    std::snprintf(b, sizeof b, "%.1f", r);
+    return b;
+}
+
 inline const std::string& one_of(const std::string& flag, const std::string& v, std::initializer_list<const char*> ok) {
     std::string list;
     for (const char* o : ok) {
@@ -1948,9 +2007,9 @@ static void print_help() {
             "  --pathb-abandon-timeout <s>  a join request's next-frame timeout (default 11)\n"
             "  --pathb-waiting-cap <n>      deferred carriers (default 1152)\n"
             "  --pathb-bucket-serve-cap <bytes>  FC_BUCKETS bytes served per request (default: the asker's rate left)\n"
-            "  --pathb-claim-alarm-rate <n> claim-leaf alarms per peer\n"
+            "  --pathb-claim-alarm-rate <r> claim-leaf alarms per peer per second (default and floor 1.7; raise only)\n"
             "  --pathb-bucket-frame <bytes> FC_BUCKETS frame buffer\n"
-            "  --join-min-peers <n>         best-tip claims before a join\n"
+            "  --join-min-peers <n>         peers whose HELLO tails name the candidates before a join (default 2)\n"
             "  --pathb-bucket-inflight <n>  FC_GETBUCKETS in flight per peer (default 1)\n"
             "  --pathb-bucket-rate <bytes>  FC_BUCKETS bytes per peer per minute\n"
             "  --give-author-pct <p>        the author's weight share in this node's jobs (defaults to 0.1; 0 opts out)\n"
@@ -1974,6 +2033,9 @@ static void print_help() {
             "  --relay-solicited-credits <n>  --relay-parked-max <n>\n"
             "  --relay-keepalive-ms <ms>    PING interval (default 5000; 0 = off)\n"
             "  --relay-silence-timeout-ms <ms>  drop a silent link (default 25000; 0 = never)\n"
+            "  --relay-peer-valid-rate <r>  valid objects per peer per second (default and floor 1.7; raise only)\n"
+            "  --relay-pending-cap <n>      pending receipts (default and floor 18432; raise only)\n"
+            "  --relay-send-queue-bytes <n> per-link send queue (default 16777216; floor two FC_HEADERS frames)\n"
             "  --no-relay-serve\n"
             "  --relay-test-partition-seconds <s>  SIGUSR1 drops the relay for s seconds (test rigs)\n"
             " stratum and mining:\n"
@@ -2135,7 +2197,12 @@ int main(int argc, char** argv) {
             else if (a == "--pathb-abandon-timeout") pf.abandon_timeout_s = u64();
             else if (a == "--pathb-waiting-cap") pf.waiting_cap = u64();
             else if (a == "--pathb-bucket-serve-cap") pf.bucket_serve_cap = u64();
-            else if (a == "--pathb-claim-alarm-rate") pf.claim_alarm_rate = u64();
+            else if (a == "--pathb-claim-alarm-rate") {
+                const double r = cs::to_double(a, value());
+                const double fl = pb::claim_alarm_rate_floor(pb::kRuledLaneParams);
+                if (r < fl) throw cs::UsageError(a + " wants a rate >= " + cs::rate_str(fl) + " (raise only)");
+                pf.claim_alarm_rate = r;
+            }
             else if (a == "--pathb-bucket-frame") pf.bucket_frame = u64();
             else if (a == "--join-min-peers") pf.join_min_peers = u64();
             else if (a == "--pathb-bucket-inflight") pf.bucket_inflight = u64();
@@ -2159,6 +2226,18 @@ int main(int argc, char** argv) {
             else if (a == "--relay-keepalive-ms") g_relay_keepalive_ms = u32();
             else if (a == "--relay-silence-timeout-ms") g_relay_silence_ms = u32();
             else if (a == "--no-relay-serve") g_no_relay_serve = true;
+            else if (a == "--relay-peer-valid-rate") {
+                const double r = cs::to_double(a, value());
+                const double fl = static_cast<double>(1 + pb::kRuledLaneParams.r_max) /
+                                  static_cast<double>(pb::kRuledLaneParams.carrier_interval_s);
+                if (r < fl) throw cs::UsageError(a + " wants a rate >= " + cs::rate_str(fl) + " (raise only)");
+                g_relay_peer_valid_rate = r;
+            } else if (a == "--relay-pending-cap") {
+                const std::uint64_t n = u64();
+                const std::uint64_t fl = pb::relay_horizons(pb::kRuledLaneParams).pending_cap;
+                if (n < fl) throw cs::UsageError(a + " wants an integer >= " + std::to_string(fl) + " (raise only)");
+                g_relay_pending_cap = n;
+            } else if (a == "--relay-send-queue-bytes") g_relay_send_queue = u64();
             else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
             else if (a == "--web-port") g_web_port = u16();
             else if (a == "--web-host") g_web_host = value();
