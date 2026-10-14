@@ -323,6 +323,9 @@ void prefix_and_joined() {
     const pb::LaneLoad ll = pb::load_lane_prefix(lane, 0, kLaneB0, 96, n.store.best_tip(), n.store.tip_pos(),
                                                  tv.record(tv.pos()), h.base_leaf_count, h.base_peaks);
     check(ll.fault == pb::LoadFault::None && ll.mmr.root() == n.store.head().root, "(4) the prefix load from the base's peaks");
+    // a joined store holds its K_BLO (x1 + 1; here x1 = the root); without it the load fails (Work)
+    check(reload(net, kv, 64).r.fault == pb::StoreFault::Work, "(4) a joined-shape store without K_BLO: Work");
+    kv.data[pb::store_keys::blo(0)] = pb::encode_blo(root + 1);
     Reloaded r = reload(net, kv, 64);
     check(r.r.fault == pb::StoreFault::None, "(4) the joined-shape store loads: " + why(r.r));
     if (r.n) {

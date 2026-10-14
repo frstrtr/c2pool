@@ -271,9 +271,12 @@ public:
         RatchetState rs{};
         std::optional<ActivationRow> activation;
     };
+    // `pre_nodes`: an unpruned joined store's claimed prefix [x_pre, x0 - 2] (its records), restored as the
+    // joined tree holds them (below the root, claims; `joined`).
     static std::optional<CarrierTree> restored(const LaneParams& p, std::span<const RestoredNode> chain,
                                                const EpochTable& table, std::span<const RetargetEntry> inherited = {},
-                                               const RatchetParams& rp = kRuledRatchetParams) {
+                                               const RatchetParams& rp = kRuledRatchetParams,
+                                               std::span<const PreNode> pre_nodes = {}) {
         if (chain.empty()) return std::nullopt;
         for (std::size_t k = 1; k < chain.size(); ++k)
             if (chain[k].parent != chain[k - 1].id || chain[k].pos != chain[k - 1].pos + 1) return std::nullopt;
@@ -303,6 +306,24 @@ public:
             if (!t.index_.emplace(r.id, k).second) return std::nullopt;
         }
         t.best_ = chain.size() - 1;
+        for (std::size_t k = 0; k < pre_nodes.size(); ++k) {
+            const PreNode& pn = pre_nodes[k];
+            if (pn.pos >= chain[0].pos || (k > 0 && pn.pos != pre_nodes[k - 1].pos + 1)) return std::nullopt;
+            CarrierNode n;
+            n.id = pn.id;
+            n.pos = pn.pos;
+            n.h = pn.h;
+            n.H = pn.H;
+            n.d = pn.d;
+            n.verified = n.bodies = n.chain_valid = true;
+            n.below_root = true;  // never the best tip (ruling 53, E-105)
+            n.pre_fork_H = pn.H;
+            n.parent = k > 0 ? pre_nodes[k - 1].id : pn.id;
+            const std::size_t idx = t.nodes_.size();
+            n.parent_index = k > 0 ? t.index_.at(pre_nodes[k - 1].id) : idx;
+            t.nodes_.push_back(std::move(n));
+            if (!t.index_.emplace(pn.id, idx).second) return std::nullopt;
+        }
         return t;
     }
 

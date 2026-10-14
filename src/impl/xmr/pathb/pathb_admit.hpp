@@ -1665,6 +1665,7 @@ struct ParkedFrame {
     std::uint64_t seq = 0;
     bool rewalk = false;
     std::uint64_t walks = 0;
+    bool solicited = false;  // a reply to the node's own request (P-21; not counted in P-15)
 };
 
 class DeferredCarriers {

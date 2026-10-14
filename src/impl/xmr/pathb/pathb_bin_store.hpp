@@ -670,6 +670,10 @@ public:
         std::vector<Hash32> peaks0;              // at lc0
         std::vector<SealedBin> sealed;           // leaves lc0 .. lc(H(root)) - 1, in order
         std::vector<Placement> placements;
+        // a joined store: H(x0 - 1) + Fresh and the served buckets of the bins at or below it sealed above the root
+        // (the lane records hold them), so the replay seals them as the join did
+        std::optional<std::uint64_t> adopt_bound;
+        std::vector<SealedBin> served;
     };
     static std::optional<BinStore> restored(const LaneParams& p, std::uint64_t journal_depth, RestoredStart r,
                                             std::uint32_t chain = 0) {
@@ -698,6 +702,13 @@ public:
         s.chain_ = r.ids;
         for (std::size_t i = 0; i < r.ids.size(); ++i) s.chain_pos_[r.ids[i]] = r.first_pos + i;
         s.mmr_ = std::move(*m);
+        s.adopt_bound_ = r.adopt_bound;
+        for (const SealedBin& sb : r.served) {
+            if (!r.adopt_bound || sb.bucket.bin_lo > *r.adopt_bound || !bucket_consistent(sb.bucket)
+                || mmr_leaf_of(sb.bucket) != sb.leaf)
+                return std::nullopt;
+            s.served_.emplace(sb.bucket.bin_lo, sb);
+        }
         for (Placement& x : r.placements) {
             if (x.q < r.first_pos || x.q > root_pos || x.bin < r.b0) return std::nullopt;
             s.placed_q_[x.id] = PlacedAt{x.bin, x.q};

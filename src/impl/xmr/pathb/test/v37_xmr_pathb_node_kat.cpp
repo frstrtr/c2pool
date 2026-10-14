@@ -127,7 +127,12 @@
 //                RandomxFailure out, the own hash reset; the re-run places it;
 //   relayrxbindr RandomX throws in the bind on the receipt path: counted;
 //   relayrxbindk a bind refutes one body set, then RandomX throws at the
-//                next: the refuting server's token kept.
+//                next: the refuting server's token kept;
+//   relayp15once P-15 counts a frame once, at its first placement: a
+//                carrier placed in its parent's drain, one that waited for its
+//                DoS token, one placed on its re-run (a duplicate: none);
+//   relayrxbind2 a bind placed a walked carrier, then failed on RandomX: the
+//                placed one kept; the re-run places the rest.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -3671,6 +3676,231 @@ void relayrxbindk() {
                   + std::to_string(tokens) + "), the failure counted, nothing out of the relay");
 }
 
+
+// ---------------------------------------------------------------------------
+// relayp15once: P-15 counts a frame once, at its first placement, a re-run or not:
+//   (a) a carrier parked on its unknown parent (a flood) and placed in its parent's drain: counted once (its parent, a
+//       reply to this node's own FC_GETCARRIER, not);
+//   (b) a carrier that waited for its DoS token (the sender's token spent by a strike): counted once when placed;
+//   (c) a carrier parked on its carried tip's branch (TipUnknown -> the walk) and placed on its re-run: counted once;
+//       sent again (a duplicate): not counted.
+void relayp15once() {
+    // (a) and (b)
+    {
+        const KatNet net;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false);
+        w.connect(0, 1);
+        w.run();
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            if (i % 2 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, 1, 200 + static_cast<std::uint32_t>(i));
+        }
+        pb::PathbRelayNode& rb = *b.relay;
+        const pb::PathbRelayStats& st = rb.stats();
+        bool dropped = false;
+        w.edit = [&dropped](FakeWire::Msg& m) {
+            if (!dropped && m.from == 0 && m.to == 1 && !m.f.empty() && m.f[0] == pb::kOpFcCarrier) {
+                m.f.clear();
+                dropped = true;
+            }
+        };
+        ok = ok && mine_on(h, w, a.node, 2, 210);
+        w.edit = nullptr;
+        const pb::Hash32 c1 = h[a.node].tree().best().id;
+        const std::uint64_t n0 = st.p15_counted.load();
+        ok = ok && mine_on(h, w, a.node, 3, 211);  // c2: parked on c1, c1 fetched (solicited), c2 released in the drain
+        const pb::Hash32 c2 = h[a.node].tree().best().id;
+        const std::uint64_t na = st.p15_counted.load() - n0;
+        check(ok && dropped && h[b.node].tree().find(c1) != nullptr && h[b.node].tree().best().id == c2 && na == 1,
+              "relayp15once: (a) a carrier parked on its unknown parent and placed in the parent's drain: counted once ("
+                      + std::to_string(na) + "; the parent, a reply to the node's own request, not)");
+        // (b): a strike spends the sender's token; the next carrier waits for it, then is placed
+        h.tick_monero();
+        const std::optional<pb::PathbJob> jb = h.job(a.node, 1, 220);
+        pb::CarrierBodyV3 bad = *h[a.node].bodies().get(c2);
+        bad.own.side.t_origin += 1;
+        const std::uint64_t s0 = rb.strikes_of(1), d0 = st.rx_deferred.load();
+        rb.receive(1, *pb::encode_fc_carrier(0, bad, 16));
+        w.run();
+        const std::uint64_t n1 = st.p15_counted.load();
+        ok = jb && h[a.node].on_own_share(*jb, 220, pb::Hash32{}).action == pb::NodeAction::Placed;
+        const pb::Hash32 c3 = h[a.node].tree().best().id;
+        w.run();
+        const bool waited = st.rx_deferred.load() > d0 && h[b.node].tree().find(c3) == nullptr;
+        for (int i = 0; i < 60 && h[b.node].tree().find(c3) == nullptr; ++i) {
+            h.now += 10;
+            rb.tick();
+            w.run();
+        }
+        const std::uint64_t nb = st.p15_counted.load() - n1;
+        check(ok && rb.strikes_of(1) == s0 + 1 && waited && h[b.node].tree().find(c3) != nullptr && nb == 1,
+              "relayp15once: (b) a carrier that waited for its DoS token (the sender's token spent by a strike): placed, "
+              "counted once (" + std::to_string(nb) + ")");
+    }
+    // (c)
+    {
+        const KatNet net;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay l = kat_relay(h, w, table0(net), true);
+        KatRelay x = kat_relay(h, w, table0(net), false);
+        w.connect(0, 1);
+        w.run();
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) {
+            if (i % 2 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
+        }
+        w.edit = [](FakeWire::Msg& m) {
+            if ((m.from == 0 && m.to == 1) || (m.from == 1 && m.to == 0)) m.f.clear();
+        };
+        h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 2, 400) && mine_on(h, w, l.node, 3, 401);
+        const pb::Hash32 sa = h[a.node].tree().best().id, sl = h[l.node].tree().best().id;
+        const std::optional<pb::PathbJob> ka = h.job(a.node, 4, 410), kl = h.job(l.node, 4, 411);
+        w.edit = nullptr;
+        ok = ok && sa != sl && ka && kl;
+        if (!ok) {
+            check(false, "relayp15once: (c) setup");
+            return;
+        }
+        w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(sa), 16)});
+        w.q.push_back(FakeWire::Msg{1, 0, *pb::encode_fc_carrier(0, *h[l.node].bodies().get(sl), 16)});
+        w.run();
+        const bool a_lost = sl < sa;
+        const std::size_t lo = a_lost ? a.node : l.node;
+        const pb::PathbJob k = a_lost ? *ka : *kl;
+        const std::uint32_t kn = a_lost ? 410 : 411;
+        ok = ok && h[lo].on_own_share(k, kn, pb::Hash32{}).action == pb::NodeAction::Pending;
+        w.run();
+        // X follows the losing node's best chain, then gets its next carrier c (carrying k's receipt, its tip the
+        // losing sibling) as a flood
+        w.connect(lo, x.node);
+        w.run();
+        const pb::PathbRelayStats& st = x.relay->stats();
+        const std::uint64_t n0 = st.p15_counted.load(), r0 = st.parked_reruns.load();
+        h.tick_monero();
+        ok = ok && mine_on(h, w, lo, 5, 420);
+        const pb::Hash32 c = h[lo].tree().best().id;
+        for (int i = 0; i < 6 && h[x.node].tree().best().id != c; ++i) {
+            h.now += 1;
+            x.relay->tick();
+            w.run();
+        }
+        const pb::CarrierBodyV3* cb = h[lo].bodies().get(c);
+        const std::uint64_t nc = st.p15_counted.load() - n0;
+        const bool rerun = st.parked_reruns.load() > r0;
+        x.relay->receive(lo + 1, *pb::encode_fc_carrier(0, *cb, 16));  // the same frame again: a duplicate
+        w.run();
+        const std::uint64_t nd = st.p15_counted.load() - n0;
+        check(ok && cb != nullptr && rerun && h[x.node].tree().best().id == c && nc >= 1 && nc <= 1 + cb->carried.size()
+                      && nd == nc,
+              "relayp15once: (c) a carrier parked on its carried tip's branch and placed on its re-run: counted once ("
+                      + std::to_string(nc) + " objects); sent again: not counted (" + std::to_string(nd) + ")");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// relayrxbind2: a bind that placed a walked carrier before its RandomX failure (the next walked carrier's body only it
+// carries): the placed id stays placed and counted (walk_placed), the failure counted; the re-run places the rest.
+void relayrxbind2() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay l = kat_relay(h, w, table0(net), true);
+    KatRelay x = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::PathbJob> ua = h.job(a.node, 6, 360);
+    // the race: A mines two (its second carries a body of A's alone), L three: A's branch loses
+    w.edit = [](FakeWire::Msg& m) {
+        if ((m.from == 0 && m.to == 1) || (m.from == 1 && m.to == 0)) m.f.clear();
+    };
+    h.tick_monero();
+    ok = ok && ua && mine_on(h, w, a.node, 2, 400);
+    const pb::Hash32 sa1 = h[a.node].tree().best().id;
+    ok = ok && h[a.node].on_own_share(*ua, 360, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && mine_on(h, w, a.node, 2, 402);
+    const pb::Hash32 sa2 = h[a.node].tree().best().id;
+    const std::optional<pb::PathbJob> ka = h.job(a.node, 4, 410);
+    for (int i = 0; i < 3; ++i) ok = ok && mine_on(h, w, l.node, 3, 401 + 10 * static_cast<std::uint32_t>(i));
+    w.edit = nullptr;
+    pb::ReceiptBodyV3 ub = ua->body;
+    ub.blob.nonce = 360;
+    const pb::Hash32 u = pb::receipt_id(ub);
+    bool in2 = false, in1 = false;
+    for (const pb::ReceiptBodyV3& b : h[a.node].bodies().get(sa2)->carried) in2 = in2 || pb::receipt_id(b) == u;
+    for (const pb::ReceiptBodyV3& b : h[a.node].bodies().get(sa1)->carried) in1 = in1 || pb::receipt_id(b) == u;
+    ok = ok && ka && in2 && !in1;
+    if (!ok) {
+        check(false, "relayrxbind2: setup (a two-carrier losing branch, its second carrying a body of its own)");
+        return;
+    }
+    for (const pb::Hash32& id : {sa1, sa2}) w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(id), 16)});
+    {
+        std::vector<pb::Hash32> ls;
+        for (pb::Hash32 t = h[l.node].tree().best().id; ls.size() < 3; t = h[l.node].tree().find(t)->parent) ls.push_back(t);
+        for (auto it = ls.rbegin(); it != ls.rend(); ++it)
+            w.q.push_back(FakeWire::Msg{1, 0, *pb::encode_fc_carrier(0, *h[l.node].bodies().get(*it), 16)});
+    }
+    w.run();
+    ok = h[a.node].tree().best().id == h[l.node].tree().best().id && h[a.node].tree().find(sa2) != nullptr;
+    ok = ok && h[a.node].on_own_share(*ka, 410, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    h.tick_monero();
+    ok = ok && mine_on(h, w, a.node, 5, 420);
+    const pb::Hash32 c = h[a.node].tree().best().id;
+    if (!ok) {
+        check(false, "relayrxbind2: setup (A follows L, c carries k on the losing branch)");
+        return;
+    }
+    // X follows A alone; no receipt frame reaches X (u is first hashed in the bind of sa2)
+    h.throw_pow.insert(u);
+    w.edit = [xn = x.node](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == xn && !m.f.empty() && m.f[0] == pb::kOpFbReceipts) m.f.clear();
+    };
+    const pb::PathbRelayStats& st = x.relay->stats();
+    std::string esc;
+    std::uint64_t placed_at_fail = 0;
+    bool sa1_at_fail = false;
+    try {
+        w.connect(a.node, x.node);
+        w.run();
+        for (int i = 0; i < 8 && h[x.node].tree().best().id != c; ++i) {
+            if (st.rx_failures.load() > 0 && placed_at_fail == 0) {
+                placed_at_fail = st.walk_placed.load();
+                sa1_at_fail = h[x.node].tree().find(sa1) != nullptr && h[x.node].tree().find(sa2) == nullptr;
+            }
+            h.now += 1;
+            x.relay->tick();
+            w.run();
+        }
+    } catch (const std::exception& e) {
+        esc = e.what();
+    }
+    w.edit = nullptr;
+    std::printf("  relayrxbind2: thrown=%d escaped='%s' rx_failures=%llu walk_placed at the failure %llu (sa1 placed, sa2 not: "
+                "%d) c@X=%d\n",
+                h.throw_pow.count(u) == 0, esc.c_str(), (unsigned long long)st.rx_failures.load(),
+                (unsigned long long)placed_at_fail, sa1_at_fail, h[x.node].tree().best().id == c);
+    check(h.throw_pow.count(u) == 0 && esc.empty() && st.rx_failures.load() >= 1 && placed_at_fail >= 1 && sa1_at_fail
+                  && h[x.node].tree().best().id == c && st.strikes.load() == 0 && st.bans.load() == 0,
+          "relayrxbind2: a bind placed a walked carrier, then failed on RandomX: the placed one kept and counted, the "
+          "failure counted; the re-run places the rest and the tip");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3726,6 +3956,8 @@ int main(int argc, char** argv) {
     run("ownrx", ownrx);
     run("relayrxbindr", relayrxbindr);
     run("relayrxbindk", relayrxbindk);
+    run("relayp15once", relayp15once);
+    run("relayrxbind2", relayrxbind2);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
     run("prune_flags", prune_flags);

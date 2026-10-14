@@ -21,10 +21,11 @@
 //   N8  RandomX throws three times at C on A's carrier (a node-internal
 //       failure): every failure counted, one alarm line when it starts and
 //       one when a hash is computed again; no strike, no ban; the frame
-//       parked and run again: placed; a re-run is not counted in P-15.
+//       parked and run again: placed; counted once in P-15 (at its first
+//       placement, a re-run).
 //   N9  RandomX throws once at C on a receipt body A floods: no strike, no
-//       ban; the receipt parked and run again: held at C; its re-run not
-//       counted in P-15.
+//       ban; the receipt parked and run again: held at C; counted once in
+//       P-15 (at its first placement, a re-run).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -221,7 +222,7 @@ static bool n8(std::string& note) {
     note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", alarm lines " + std::to_string(lines) +
            ", strikes " + std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load()) +
            ", P-15 counted " + std::to_string(Cn->st().p15_counted.load());
-    return placed && again && Cn->st().rx_failures.load() == 3 && lines == 2 && Cn->st().p15_counted.load() == 0 &&
+    return placed && again && Cn->st().rx_failures.load() == 3 && lines == 2 && Cn->st().p15_counted.load() == 1 &&
            Cn->count_logs("RandomX failing") == 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0 &&
            Cn->r().ready_peers().size() == 1;
 }
@@ -255,7 +256,7 @@ static bool n9(std::string& note) {
            std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load()) +
            ", P-15 counted by the re-run " + std::to_string(counted);
     return ok && throws->load() <= 0 && Cn->st().rx_failures.load() == 1 && Cn->st().strikes.load() == 0 &&
-           Cn->st().bans.load() == 0 && counted == 0;
+           Cn->st().bans.load() == 0 && counted == 1;
 }
 
 int main() {

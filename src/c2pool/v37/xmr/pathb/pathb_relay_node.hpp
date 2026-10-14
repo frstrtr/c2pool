@@ -884,7 +884,7 @@ private:
         std::vector<std::uint8_t> frame;
         std::uint64_t not_before_ms = 0;
         bool solicited = false;  // a reply to this node's own FC_GETCARRIER: the solicited credit (P-21)
-        bool rerun = false;      // a parked frame run again (P-15 passed at its arrival)
+        bool rerun = false;      // a frame run again (P-15 gated at its first arrival only; counted once, at its first placement)
     };
     static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
     static constexpr std::size_t kAskedMax = 256;       // asked carrier ids kept per peer
@@ -1372,7 +1372,7 @@ private:
                 }
                 if (!j.solicited) fresh = new_carried(j.frame);
                 try {
-                    t = node_->begin_carrier(j.peer, j.frame);
+                    t = node_->begin_carrier(j.peer, j.frame, true, j.solicited);
                 } catch (const RandomxFailure&) {
                     rx_fail = true;
                 }
@@ -1386,10 +1386,8 @@ private:
             const bool kept = t.admit.verdict == AdmitVerdict::Strike || t.admit.verdict == AdmitVerdict::Ban;
             if (!kept) refund(j);
             const bool taken = kept && !j.solicited;
-            const bool solicited = j.solicited, rerun = j.rerun;
-            post([this, t = std::move(t), taken, solicited, rerun, fresh]() mutable {
-                complete_job(std::move(t), taken, solicited, fresh, rerun);
-            });
+            const bool solicited = j.solicited;
+            post([this, t = std::move(t), taken, solicited, fresh]() mutable { complete_job(std::move(t), taken, solicited, fresh); });
             return;
         }
         std::vector<NodeEventResult> rs;
@@ -1422,7 +1420,7 @@ private:
             rx_failed(std::move(j), "receipt");
             return;
         }
-        if (!j.solicited && !j.rerun && fresh > 0) valid_count(j.peer, fresh);  // a re-run is not counted
+        if (!j.solicited && fresh > 0) valid_count(j.peer, fresh);  // its first placement, a re-run or not
         bool kept = false;
         for (const NodeEventResult& r : rs) kept = apply_result(j.peer, r, !kept) || kept;
         if (!kept) refund(j);
@@ -1431,8 +1429,7 @@ private:
     // The placement on the owner. The carriers it releases whose admission fails with a RandomX failure come back
     // from the node (take_rx_failed) and are parked and run again; the placed carrier keeps its result and effects.
     // A RandomX failure of this frame's own re-admission parks this frame (its solicited state kept).
-    void complete_job(PathbNode::CarrierTicket t, bool token_kept, bool solicited = false, std::uint64_t fresh = 0,
-                      bool rerun = false) {
+    void complete_job(PathbNode::CarrierTicket t, bool token_kept, bool solicited = false, std::uint64_t fresh = 0) {
         const std::uint64_t peer = t.peer;
         const Hash32 digest = ::v37::sha256d(t.frame);
         std::vector<std::uint8_t> frame = t.frame;
@@ -1455,9 +1452,9 @@ private:
             run_effects(fx);
             return;
         }
-        if (!solicited && !rerun && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
-                                     r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
-            valid_count(peer, 1 + fresh);  // the carrier's own body and its first-seen carried bodies (not a re-run)
+        if (!solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
+                           r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
+            valid_count(peer, 1 + fresh);  // its first placement, a re-run or not: its own body and its new carried ones
         (void)apply_result(peer, r, token_kept);
         run_effects(fx);
     }
@@ -1466,7 +1463,7 @@ private:
     void rx_failed(Job j, const char* where) {
         rx_alarm(where);
         refund(j);
-        j.rerun = true;  // run again: a re-run (P-15 does not count it)
+        j.rerun = true;  // run again (not gated again; counted at its first placement)
         park_job(std::move(j), now_ms() + kParkRetryMs);
     }
     // The alarm: every failure counted; a log line when RandomX starts failing and one when a hash is computed again
@@ -1546,10 +1543,12 @@ private:
         std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
     };
     // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park.
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
+        for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
     }
     // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
@@ -1687,12 +1686,16 @@ private:
     void run_effects(Effects& fx) {
         for (ParkedFrame& f : fx.rx_retry) {  // parked and run again (no token)
             rx_alarm("released carrier");
-            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, false, true}, now_ms() + kParkRetryMs);
+            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
+                     now_ms() + kParkRetryMs);
         }
         for (ParkedFrame& f : fx.rx_rerun)
-            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, false, true}, now_ms() + kParkRetryMs);
+            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
+                     now_ms() + kParkRetryMs);
+        for (const auto& [peer, n] : fx.p15) valid_count(peer, n);  // a released carrier's first placement (P-15)
         fx.rx_retry.clear();
         fx.rx_rerun.clear();
+        fx.p15.clear();
         for (std::uint64_t q : fx.bans) ban(q);
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
         for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0);
@@ -1733,7 +1736,7 @@ private:
         st_.rewalks += rewalked;
         for (ParkedFrame& f : again) {
             st_.parked_reruns++;
-            enqueue_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, false, true});
+            enqueue_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true});
         }
     }
     void rerun_parked(Missing cause) { rerun_parked(std::vector<Missing>{cause}); }

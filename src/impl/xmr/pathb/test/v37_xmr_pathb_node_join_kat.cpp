@@ -45,10 +45,18 @@
 //   bwkeep     two joined nodes on one chain with different
 //              --pathb-body-keep, pruned and restarted: the same profile and
 //              the same verdict;
+//   bwyoung    a young joined node pruned and restarted: its session's
+//              profile, from position 1;
+//   bwrr       a joined node restarted, pruned, restarted again: the same
+//              profile, from x1 + 1;
+//   reaskr     reask after a restart (the claimed leaves kept, K_BCLAIM);
+//   adoptbelowr adoptbelow, HELLO's bound tips and claimleaf after a restart;
 //   x1r        a joined node (P-01 4,000: its journal base below x1)
-//              restarted: a heavier branch forking in (base, x1] takes the
-//              joiner path by its headers, before and after the restart (no
-//              BAN of its server: the root's claimed d kept);
+//              restarted: the journal base the session's; a heavier branch
+//              forking in (base, x1] takes the joiner path by its headers,
+//              before and after the restart (no BAN of its server);
+//   x1l        the same node offered a heavier tip forking in (x1, L): the
+//              attempt ends OutOfScope before and after the restart;
 //   x8claim    a header of that branch whose t_origin is not the window's d
 //              at a position whose window reads a claim: ClaimLeaf (alarm,
 //              DEFER, no BAN), before and after the restart.
@@ -171,9 +179,9 @@ void loadfail() {
     check(lc_l > lc_l1 && lc_x0 < lc_l1, "loadfail: a bin sealed at L (lc " + std::to_string(lc_x0) + " / " +
                                                  std::to_string(lc_l1) + " / " + std::to_string(lc_l) + ")");
     const pb::StoreHead hd = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
-    check(hd.base_pos == L && hd.root_pos == js.x0 - 1 && hd.base_leaf_count == lc_x0 && hd.first_pos == js.store->first_record_pos()
+    check(hd.base_pos == js.x0 - 1 && hd.root_pos == js.x0 - 1 && hd.base_leaf_count == lc_x0 && hd.first_pos == js.store->first_record_pos()
                   && !kv.data.count(pb::store_keys::poison(0)) && !kv.data.count(pb::store_keys::pcarrier(0, L + 7)),
-          "loadfail: K_PHEAD base_pos = L, base_leaf_count = lc(H(x0 - 1)) = " + std::to_string(hd.base_leaf_count)
+          "loadfail: K_PHEAD base_pos = root_pos = x0 - 1, base_leaf_count = lc(H(x0 - 1)) = " + std::to_string(hd.base_leaf_count)
                   + ", root_pos = x0 - 1; no poison mark");
     pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ));
     check(rl.fault == pb::StoreFault::None && rl.state && rl.state->tree.best().id == at_pos(a, L)
@@ -222,9 +230,9 @@ void young() {
     MemoryKv& kv = *h.kvs.back();
     const pb::StoreHead hd = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
     const pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ));
-    check(hd.root_pos == 0 && hd.base_pos == 600 && hd.base_leaf_count == 0 && h[j].ar().rows().empty()
+    check(hd.root_pos == 0 && hd.base_pos == 0 && hd.base_leaf_count == 0 && h[j].ar().rows().empty()
                   && rl.fault == pb::StoreFault::None && rl.state && rl.state->tree.best().id == at_pos(a, 600),
-          "young: the young adoption's store (root 0, base L, no base leaves, the genesis AR) reloads with no re-join");
+          "young: the young adoption's store (root 0, base 0, no base leaves, the genesis AR) reloads with no re-join");
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,16 +1144,16 @@ Joining joining_node_cfg(Harness& h, const KatNet& net, std::uint64_t J, const s
     return o;
 }
 
-// The node of `kv` restarted (its configuration from `tweak`); SIZE_MAX: a load failure.
+// The node of `kv` restarted (its configuration from `tweak`; `writes`: it writes to kv); SIZE_MAX: a load failure.
 std::size_t restarted(Harness& h, const KatNet& net, MemoryKv& kv, const std::function<void(pb::PathbNodeConfig&)>& tweak,
-                      pb::StoreFault& fault) {
+                      pb::StoreFault& fault, bool writes = false) {
     pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ));
     fault = rl.fault;
     if (!rl.state) return SIZE_MAX;
     const std::size_t r = h.nodes.size();
     pb::PathbNodeConfig c = h.config(kat_table(net), false, kJ);
     if (tweak) tweak(c);
-    h.nodes.push_back(std::make_unique<pb::PathbNode>(c, h.io(r), std::move(*rl.state), nullptr));
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(c, h.io(r), std::move(*rl.state), writes ? &kv : nullptr));
     return r;
 }
 
@@ -1301,8 +1309,8 @@ void bwkeep() {
 
 // ---------------------------------------------------------------------------
 // x1r: a joined node with P-01 4,000 (its journal base below its x1) and a heavier branch forking at 2,400, in
-// (base, x1]: headers first take the joiner path in its session and after a restart of its store; the server is not
-// banned after the restart (the retarget window reads the root's claimed d as in the session).
+// (base, x1]: headers first take the joiner path in its session and after a restart of its store (the journal base
+// the session's, x1 from K_BLO); the server is not banned (the window reads the root's claimed d as in the session).
 void x1r() {
     const auto t0 = std::chrono::steady_clock::now();
     JoinNet net(900);
@@ -1338,7 +1346,7 @@ void x1r() {
     const pb::PathbNode::HeadersOutcome o2 = headers_first(h, r, sb_, at_pos(a, f), b.store.best_tip());
     h.q.clear();
     using K = pb::PathbNode::HeadersOutcome::Kind;
-    check(base < f && f <= x1 && o1.kind == K::JoinerPath && o1.fork_pos == f && o2.kind == K::JoinerPath
+    check(base < f && base_r == base && f <= x1 && o1.kind == K::JoinerPath && o1.fork_pos == f && o2.kind == K::JoinerPath
                   && o2.fork_pos == f,
           "x1r: the fork " + std::to_string(f) + " in (base " + std::to_string(base) + " / " + std::to_string(base_r) + ", x1 "
                   + std::to_string(x1) + "]: the joiner path in the session (kind " + std::to_string(static_cast<int>(o1.kind))
@@ -1346,6 +1354,55 @@ void x1r() {
     std::printf("  x1r: %.1f s\n", secs_since(t0));
 }
 
+
+// ---------------------------------------------------------------------------
+// x1l: a joined node (P-01 4,000) offered a heavier tip forking at 3,600, in (x1, L): the attempt ends OutOfScope (the
+// fork lies above x1 and at or above the journal base) in the session and after a restart (the journal base kept).
+void x1l() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, f = 3600, J = 4000;
+    ChainShape sb;
+    sb.nonce0 = 7160000;
+    KatNode a(net, kJ);
+    grow(a, f);
+    KatNode b(a);
+    grow(a, L - f);
+    grow(b, L + 120 - f, sb);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, J);
+    check(jd.ok, "x1l: joined at L with P-01 4,000");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    MemoryKv& kv = *h.kvs.back();
+    const std::uint64_t x1 = h[j].joined()->x1, base = h[j].store().base_pos();
+    const std::size_t sb_ = h.nodes.size();
+    h.nodes.push_back(server_from(h, b, kJ, sb_));
+    h.hello(j, sb_);
+    const pb::JoinStep o1 = h[j].run_join();
+    h.q.clear();
+    pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, J));
+    if (!rl.state) {
+        check(false, "x1l: the joined store reloads");
+        return;
+    }
+    const std::size_t r = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, J), h.io(r), std::move(*rl.state), &kv));
+    KatTransport tr(h, r);
+    h[r].set_join_transport(&tr);
+    const std::uint64_t base_r = h[r].store().base_pos();
+    h.hello(r, sb_);
+    const std::size_t queued = h[r].joiner().queue().size();
+    const pb::JoinStep o2 = h[r].run_join();
+    h.q.clear();
+    const auto end = [](const pb::JoinStep& o) { return o.report ? static_cast<int>(o.report->end) : -1; };
+    check(x1 < f && base < f && base_r == base && queued == 1 && o1.report && o2.report
+                  && o1.report->end == pb::AttemptEnd::OutOfScope && o2.report->end == pb::AttemptEnd::OutOfScope,
+          "x1l: the fork " + std::to_string(f) + " in (x1 " + std::to_string(x1) + ", L " + std::to_string(L)
+                  + "), base " + std::to_string(base) + " / " + std::to_string(base_r) + ": the attempt ends "
+                  + std::to_string(end(o1)) + " in the session and " + std::to_string(end(o2)) + " after the restart");
+    std::printf("  x1l: %.1f s\n", secs_since(t0));
+}
 
 // ---------------------------------------------------------------------------
 // x8claim: a header whose t_origin is not the d of its window, at a position whose window reads the claimed prefix
@@ -1413,6 +1470,205 @@ void x8claim() {
     std::printf("  x8claim: %.1f s\n", secs_since(t0));
 }
 
+
+// ---------------------------------------------------------------------------
+// bwyoung: a young chain joined in full, pruned (--pathb-body-keep 10) and restarted: A's bound work counts from
+// position 1 (K_BWORK below the root, written from 1), the profile of its session.
+void bwyoung() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 600);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    const std::function<void(pb::PathbNodeConfig&)> keep10 = [](pb::PathbNodeConfig& c) { c.body_keep = 10; };
+    Joining jn = joining_node_cfg(h, net, kJ, keep10);
+    h.hello(jn.j, s);
+    const pb::JoinStep st = h[jn.j].run_join();
+    if (!st.switched || h[jn.j].joined() == nullptr || !h[jn.j].joined()->young) {
+        check(false, "bwyoung: the young chain joined in full");
+        return;
+    }
+    MemoryKv& kv = *h.kvs.back();
+    grow(a, 1800);
+    follow(h, jn.j, s, a);
+    const pb::PathbNode::PruneReport pr = h[jn.j].prune(h.now);
+    const auto pj = h[jn.j].bound_work_a();
+    pb::StoreFault f = pb::StoreFault::None;
+    const std::size_t r = restarted(h, net, kv, keep10, f);
+    const auto pr2 = r == SIZE_MAX ? nullptr : h[r].bound_work_a();
+    check(pr.written && pr.root > 1 && count_prefix(kv, pb::store_keys::bwork_prefix(0)) > 0 && pj && pr2 && pr2->at == pj->at
+                  && pj->lowest() == h_pos(1),
+          "bwyoung: a young joined node pruned at root " + std::to_string(pr.root)
+                  + " and restarted: the profile of its session, from position 1");
+}
+
+// ---------------------------------------------------------------------------
+// bwrr: a joined node restarted, then following its chain and pruning as a restarted node (K_BWORK from x1 + 1),
+// restarted again: the same profile both times.
+void bwrr() {
+    JoinNet net(900);
+    const std::uint64_t L = 6000;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    const std::function<void(pb::PathbNodeConfig&)> keep10 = [](pb::PathbNodeConfig& c) { c.body_keep = 10; };
+    Joining jn = joining_node_cfg(h, net, kJ, keep10);
+    h.hello(jn.j, s);
+    const pb::JoinStep st = h[jn.j].run_join();
+    if (!st.switched || h[jn.j].joined() == nullptr) {
+        check(false, "bwrr: joined");
+        return;
+    }
+    const std::uint64_t x1 = h[jn.j].joined()->x1;
+    MemoryKv& kv = *h.kvs.back();
+    pb::StoreFault f = pb::StoreFault::None;
+    const std::size_t r1 = restarted(h, net, kv, keep10, f, true);
+    if (r1 == SIZE_MAX) {
+        check(false, "bwrr: the first restart");
+        return;
+    }
+    grow(a, 1800);
+    follow(h, r1, s, a);
+    const pb::PathbNode::PruneReport pr = h[r1].prune(h.now);
+    const auto p1 = h[r1].bound_work_a();
+    const std::size_t r2 = restarted(h, net, kv, keep10, f);
+    const auto p2 = r2 == SIZE_MAX ? nullptr : h[r2].bound_work_a();
+    check(pr.written && pr.root > x1 + 1 && p1 && p2 && p2->at == p1->at && p1->lowest() == h_pos(x1 + 1),
+          "bwrr: a joined node restarted, pruned at root " + std::to_string(pr.root) + " (above x1 + 1) and restarted again: "
+          "the same profile, from x1 + 1");
+}
+
+
+// ---------------------------------------------------------------------------
+// The claimed leaves (3.7a, E-72) and the claim view after a restart: as in the session.
+
+// The K_BCLAIM records of `kv`: bin -> at id.
+std::map<std::uint64_t, pb::Hash32> bclaims(const MemoryKv& kv) {
+    std::map<std::uint64_t, pb::Hash32> out;
+    const std::string pre = pb::store_keys::bclaim_prefix(0);
+    for (auto it = kv.data.lower_bound(pre); it != kv.data.end() && it->first.compare(0, pre.size(), pre) == 0; ++it)
+        if (const auto c = pb::decode_bclaim(it->second)) out[c->bin] = c->at_id;
+    return out;
+}
+
+// reaskr: reask after a restart: the claimed leaves kept (K_BCLAIM); a switch by the journal at L - 1; every claimed leaf
+// asked again at a carrier of the new chain and rebound to it, as in the session.
+void reaskr() {
+    JoinNet net(900);
+    const std::uint64_t L = 4704;
+    ChainShape sb;
+    sb.nonce0 = 7210000;
+    KatNode a(net, kJ);
+    grow(a, L - 1);
+    KatNode b(a);
+    grow(a, 1);
+    const std::vector<pb::Hash32> bb = grow(b, 3, sb);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok, "reaskr: joined at L");
+    if (!jd.ok) return;
+    MemoryKv& kv = *h.kvs.back();
+    const std::uint64_t x1 = h[jd.jn.j].joined()->x1;
+    const std::size_t claimed = h[jd.jn.j].joined()->claimed.size();
+    const std::map<std::uint64_t, pb::Hash32> k0 = bclaims(kv);
+    pb::StoreFault f = pb::StoreFault::None;
+    const std::size_t r = restarted(h, net, kv, nullptr, f, true);
+    if (r == SIZE_MAX) {
+        check(false, "reaskr: the restart");
+        return;
+    }
+    KatTransport tr(h, r);
+    h[r].set_join_transport(&tr);
+    (void)h.hello(r, jd.s);
+    h.q.clear();
+    h.mon_tip = h_pos(L + 2) + 1;
+    bool switched = false;
+    for (const pb::Hash32& id : bb)
+        switched = h[r].on_carrier(77, *pb::encode_fc_carrier(0, *b.bodies.get(id), pb::kRuledLaneParams.r_max)).action
+                           == pb::NodeAction::Switched
+                   || switched;
+    h.q.clear();
+    const pb::JoinStep st = h[r].run_join();
+    h.q.clear();
+    std::size_t rebound = 0;
+    const std::map<std::uint64_t, pb::Hash32> k1 = bclaims(kv);
+    for (const auto& [bin, at] : k1) {
+        const pb::CarrierNode* n = h[r].tree().find(at);
+        if (n != nullptr && n->pos > x1 && h[r].store().best_at(n->pos) == at) ++rebound;
+    }
+    check(claimed > 0 && k0.size() == claimed && switched && st.reasked == claimed && rebound == claimed && !st.reask_joiner,
+          "reaskr: after a restart (" + std::to_string(k0.size()) + " claimed leaves kept) a switch by the journal: every "
+          "claimed leaf asked again (" + std::to_string(st.reasked) + ") and rebound (" + std::to_string(rebound) + ")");
+}
+
+// adoptbelowr: adoptbelow after a restart: a bucket below the joined MMR adopted after L enters the claimed leaves
+// (K_BCLAIM); HELLO's bound-tip check as in the session (a prefix node and a span carrier at x1 not bound, a carrier
+// above x1 bound); a #13 mismatch above L: ClaimLeaf, never BAN.
+void adoptbelowr() {
+    JoinNet net(900);
+    const std::uint64_t L = 4704;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok, "adoptbelowr: joined at L");
+    if (!jd.ok) return;
+    MemoryKv& kv = *h.kvs.back();
+    const std::uint64_t x0 = h[jd.jn.j].joined()->x0, x1 = h[jd.jn.j].joined()->x1;
+    pb::StoreFault f = pb::StoreFault::None;
+    const std::size_t r = restarted(h, net, kv, nullptr, f, true);
+    if (r == SIZE_MAX) {
+        check(false, "adoptbelowr: the restart");
+        return;
+    }
+    KatTransport tr(h, r);
+    h[r].set_join_transport(&tr);
+    (void)h.hello(r, jd.s);
+    h.q.clear();
+    const std::uint64_t fl = h[r].store().first_leaf();
+    const std::uint64_t bin = kLaneB0 + fl - 2;
+    const pb::Hash32 cL = at_pos(a, L);
+    const bool before = bclaims(kv).count(bin) == 0;
+    const bool sent = h[r].request_buckets(jd.s, cL, bin, bin, h.now);
+    h.pump();
+    const std::map<std::uint64_t, pb::Hash32> k1 = bclaims(kv);
+    check(fl >= 2 && before && sent && k1.count(bin) == 1 && k1.at(bin) == cL,
+          "adoptbelowr: after a restart a bucket below the joined MMR adopted at c_L enters the claimed leaves (K_BCLAIM)");
+    {
+        const pb::PathbHello ours = h[r].our_hello(1000 + r, 0);
+        const auto hello_at = [&](const pb::Hash32& tip, std::uint64_t lc) {
+            pb::PathbHello t = h[jd.s].our_hello(1000 + jd.s, 0);
+            t.tail.best_tip = tip;
+            t.tail.mmr_leaf_count = lc;
+            return h[r].on_hello(jd.s, *pb::encode_pathb_hello(t), ours).verdict;
+        };
+        const auto lc_at = [&](std::uint64_t x) {
+            return pb::bin_leaf_count(a.node(at_pos(a, x)).H, kLaneB0, pb::kRuledLaneParams.open_bins);
+        };
+        const pb::Hash32 pre = at_pos(a, x0 - 2), span = at_pos(a, x1), above = at_pos(a, x1 + 1);
+        const bool held = h[r].tree().find(pre) != nullptr && h[r].tree().find(span) != nullptr;
+        const pb::HelloVerdict v_pre = hello_at(pre, lc_at(x0 - 2) + 3);
+        const pb::HelloVerdict v_span = hello_at(span, lc_at(x1) + 3);
+        const pb::HelloVerdict v_above = hello_at(above, lc_at(x1 + 1) + 3);
+        check(held && v_pre == pb::HelloVerdict::Accept && v_span == pb::HelloVerdict::Accept && v_above == pb::HelloVerdict::Close,
+              "adoptbelowr: after a restart a claimed prefix node and a span carrier at x1 are not bound; a carrier above x1 "
+              "is (another leaf count: closed)");
+    }
+    h.q.clear();
+    h.mon_tip = h_pos(L + 1) + 1;
+    const pb::CarrierBodyV3 c = carrier_on(a, cL, h_pos(L + 1), {}, 1, 4243, {},
+                                           [](pb::ReceiptBodyV3& rr) { rr.side.mmr_root[0] ^= 1; });
+    const pb::NodeEventResult rc = h[r].on_carrier(jd.s, *pb::encode_fc_carrier(0, c, pb::kRuledLaneParams.r_max));
+    h.q.clear();
+    check(rc.admit.missing == pb::Missing::ClaimAlarm && rc.admit.strike == 0 && rc.admit.verdict != pb::AdmitVerdict::Ban
+                  && rc.action == pb::NodeAction::Parked && h[r].tree().best().id == cL,
+          "adoptbelowr: after a restart a #13 mismatch above L: ClaimLeaf, alarm + DEFER, 0 tokens, no BAN (action "
+                  + std::to_string(static_cast<int>(rc.action)) + ")");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1443,7 +1699,12 @@ int main(int argc, char** argv) {
     run("below", below);
     run("bwjoin", bwjoin);
     run("bwkeep", bwkeep);
+    run("bwyoung", bwyoung);
+    run("bwrr", bwrr);
+    run("reaskr", reaskr);
+    run("adoptbelowr", adoptbelowr);
     run("x1r", x1r);
+    run("x1l", x1l);
     run("x8claim", x8claim);
     return finish("v37_xmr_pathb_node_join_kat");
 }
