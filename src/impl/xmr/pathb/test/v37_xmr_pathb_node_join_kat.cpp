@@ -44,7 +44,14 @@
 //              verdict on a candidate bound from below the prune root;
 //   bwkeep     two joined nodes on one chain with different
 //              --pathb-body-keep, pruned and restarted: the same profile and
-//              the same verdict.
+//              the same verdict;
+//   x1r        a joined node (P-01 4,000: its journal base below x1)
+//              restarted: a heavier branch forking in (base, x1] takes the
+//              joiner path by its headers, before and after the restart (no
+//              BAN of its server: the root's claimed d kept);
+//   x8claim    a header of that branch whose t_origin is not the window's d
+//              at a position whose window reads a claim: ClaimLeaf (alarm,
+//              DEFER, no BAN), before and after the restart.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <chrono>
@@ -1291,6 +1298,121 @@ void bwkeep() {
     std::printf("  bwkeep: %.1f s\n", secs_since(t0));
 }
 
+
+// ---------------------------------------------------------------------------
+// x1r: a joined node with P-01 4,000 (its journal base below its x1) and a heavier branch forking at 2,400, in
+// (base, x1]: headers first take the joiner path in its session and after a restart of its store; the server is not
+// banned after the restart (the retarget window reads the root's claimed d as in the session).
+void x1r() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, f = 2400, J = 4000;
+    ChainShape sb;
+    sb.nonce0 = 7150000;
+    KatNode a(net, kJ);
+    grow(a, f);
+    KatNode b(a);
+    grow(a, L - f);
+    grow(b, L + 120 - f, sb);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, J);
+    check(jd.ok, "x1r: joined at L with P-01 4,000");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    MemoryKv& kv = *h.kvs.back();
+    const std::uint64_t x1 = h[j].joined()->x1, base = h[j].store().base_pos();
+    const std::size_t sb_ = h.nodes.size();
+    h.nodes.push_back(server_from(h, b, kJ, sb_));
+    (void)h.hello(j, sb_);
+    const pb::PathbNode::HeadersOutcome o1 = headers_first(h, j, sb_, at_pos(a, f), b.store.best_tip());
+    // the restart (P-01 4,000)
+    pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, J));
+    if (!rl.state) {
+        check(false, "x1r: the joined store reloads");
+        return;
+    }
+    const std::size_t r = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, J), h.io(r), std::move(*rl.state), &kv));
+    const std::uint64_t base_r = h[r].store().base_pos();
+    (void)h.hello(r, sb_);
+    const pb::PathbNode::HeadersOutcome o2 = headers_first(h, r, sb_, at_pos(a, f), b.store.best_tip());
+    h.q.clear();
+    using K = pb::PathbNode::HeadersOutcome::Kind;
+    check(base < f && f <= x1 && o1.kind == K::JoinerPath && o1.fork_pos == f && o2.kind == K::JoinerPath
+                  && o2.fork_pos == f,
+          "x1r: the fork " + std::to_string(f) + " in (base " + std::to_string(base) + " / " + std::to_string(base_r) + ", x1 "
+                  + std::to_string(x1) + "]: the joiner path in the session (kind " + std::to_string(static_cast<int>(o1.kind))
+                  + ") and after the restart (kind " + std::to_string(static_cast<int>(o2.kind)) + ")");
+    std::printf("  x1r: %.1f s\n", secs_since(t0));
+}
+
+
+// ---------------------------------------------------------------------------
+// x8claim: a header whose t_origin is not the d of its window, at a position whose window reads the claimed prefix
+// (x <= x1 + N_rt): ClaimLeaf (alarm + DEFER: no token, nothing indexed, no BAN) in the session and after a restart.
+void x8claim() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, f = 2400, J = 4000;
+    ChainShape sb;
+    sb.nonce0 = 7170000;
+    KatNode a(net, kJ);
+    grow(a, f);
+    KatNode b(a);
+    grow(a, L - f);
+    grow(b, L + 120 - f, sb);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, J);
+    check(jd.ok, "x8claim: joined at L with P-01 4,000");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    MemoryKv& kv = *h.kvs.back();
+    const std::size_t sb_ = h.nodes.size();
+    h.nodes.push_back(server_from(h, b, kJ, sb_));
+    // one header of b above the fork, its t_origin changed
+    const auto tampered = [&](std::size_t to) {
+        h.q.clear();
+        std::vector<std::uint8_t> out;
+        if (!h[to].request_headers(sb_, at_pos(a, f), b.store.best_tip(), 1, h.now)) return out;
+        for (const Msg& m : h.q) {
+            if (m.frame.empty() || m.frame[0] != pb::kOpFcGetHeaders) continue;
+            const std::vector<std::vector<std::uint8_t>> r = h[sb_].serve_getheaders(to, m.frame, h.now).frames;
+            pb::HeadersReply rep;
+            if (r.empty() || !pb::decode_fc_headers(r[0], 0, 1u << 22, pb::kRuledLaneParams, rep).ok() || rep.headers.empty()) break;
+            rep.headers.resize(1);
+            rep.headers[0].own.side.t_origin += 1;
+            out = *pb::encode_fc_headers(rep, 1u << 22);
+            break;
+        }
+        h.q.clear();
+        return out;
+    };
+    using K = pb::PathbNode::HeadersOutcome::Kind;
+    (void)h.hello(j, sb_);
+    const std::vector<std::uint8_t> t1 = tampered(j);
+    const std::size_t a1 = h[j].alarms().count();
+    const pb::PathbNode::HeadersOutcome o1 = t1.empty() ? pb::PathbNode::HeadersOutcome{} : h[j].on_headers(sb_, t1, h.now);
+    const std::size_t a1b = h[j].alarms().count();
+    pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, J));
+    if (!rl.state) {
+        check(false, "x8claim: the joined store reloads");
+        return;
+    }
+    const std::size_t r = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, J), h.io(r), std::move(*rl.state), &kv));
+    (void)h.hello(r, sb_);
+    const std::vector<std::uint8_t> t2 = tampered(r);
+    const std::size_t a2 = h[r].alarms().count();
+    const pb::PathbNode::HeadersOutcome o2 = t2.empty() ? pb::PathbNode::HeadersOutcome{} : h[r].on_headers(sb_, t2, h.now);
+    const std::size_t a2b = h[r].alarms().count();
+    check(!t1.empty() && !t2.empty() && o1.kind == K::Defer && o2.kind == K::Defer && o1.indexed == 0 && o2.indexed == 0
+                  && a1b == a1 + 1 && a2b == a2 + 1,
+          "x8claim: #8 on a claimed window: ClaimLeaf, no BAN (kind " + std::to_string(static_cast<int>(o1.kind))
+                  + " in the session, " + std::to_string(static_cast<int>(o2.kind)) + " after the restart; alarms +"
+                  + std::to_string(a1b - a1) + " / +" + std::to_string(a2b - a2) + ")");
+    std::printf("  x8claim: %.1f s\n", secs_since(t0));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1321,5 +1443,7 @@ int main(int argc, char** argv) {
     run("below", below);
     run("bwjoin", bwjoin);
     run("bwkeep", bwkeep);
+    run("x1r", x1r);
+    run("x8claim", x8claim);
     return finish("v37_xmr_pathb_node_join_kat");
 }

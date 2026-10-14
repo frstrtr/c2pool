@@ -468,6 +468,10 @@ public:
         *refs_ = std::move(loaded.refs);
         own_prefix_ = std::move(loaded.prefix_headers);
         own_chain_.seed_below(std::move(loaded.bound_below), loaded.bound_lo);
+        if (loaded.bound_lo > 0) {  // a joined store: its claim view after L, from x1 = K_BLO - 1
+            resumed_.set_x1(loaded.bound_lo - 1);
+            claims_ = &resumed_;
+        }
         init_join();
     }
 
@@ -1332,9 +1336,21 @@ public:
                                           h.own.side.ballot});
         }
         std::size_t k = 0;
-        const auto pow_ok = [&](const CarrierAnnounce&, std::uint64_t d) {
-            const CarrierHeader& h = req.got[k++];
-            if (h.own.side.t_origin != d) return false;
+        // #8 at a position whose window reads a claim (the node's claim view): a mismatch is ClaimLeaf (alarm +
+        // DEFER), never a BAN
+        std::optional<std::size_t> claim_fail;
+        Basis claim_basis = Basis::Computed;
+        const auto pow_ok = [&](const CarrierAnnounce& a, std::uint64_t d) {
+            const std::size_t i = k++;
+            const CarrierHeader& h = req.got[i];
+            if (h.own.side.t_origin != d) {
+                const Basis b = basis_of(claims_, RowClass::Retarget, a.parent, fork->pos + 1 + i);
+                if (is_claim_basis(b) && !claim_fail) {
+                    claim_fail = i;
+                    claim_basis = b;
+                }
+                return false;
+            }
             const PrInfo pr = io_.resolve_pr(h.own.blob.prev_id);
             if (header_fields_verdict(header_fields(h.own, encoded_length(h.own), pr.in))) return false;
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
@@ -1345,8 +1361,14 @@ public:
             out.kind = HeadersOutcome::Kind::Keep;
             return out;
         }
-        for (const SideHeader& sh : *side) {
+        for (std::size_t i = 0; i < side->size(); ++i) {
+            const SideHeader& sh = (*side)[i];
             if (sh.check != HeaderCheck::Passed) {
+                if (claim_fail && *claim_fail == i) {  // #8 on a claim: alarm + DEFER, no token, nothing indexed
+                    alarm_.raise(RowId::R9, claim_basis, sh.id, Missing::ClaimAlarm);
+                    out.kind = HeadersOutcome::Kind::Defer;
+                    return out;
+                }
                 out.kind = HeadersOutcome::Kind::Ban;  // BAN the server; no variant of it indexed, its earlier ones released
                 headers_->release_peer(peer);
                 return out;
@@ -2051,6 +2073,51 @@ private:
         joiner_->set_own_chain(own ? &own_chain_ : nullptr);
     }
 
+    // The claim view of a joined store after a restart (K_BLO): the joined state's view after L (JoinClaims, phase
+    // AfterL) from what the store keeps, x1 = K_BLO - 1 and the joined MMR's first leaf. The leaves adopted in the
+    // session from served buckets (E-72) are not kept (code note, card O-7): Coinbase above x1 is Computed.
+    class ResumedClaims final : public ClaimView {
+    public:
+        explicit ResumedClaims(const PathbNode& n) : n_(&n) {}
+        void set_x1(std::uint64_t x1) { x1_ = x1; }
+        Basis basis(RowClass k, const Hash32&, std::uint64_t x) const override {
+            switch (k) {
+                case RowClass::Retarget:  // a window that reads the claimed prefix or span
+                    return x <= x1_ + n_->cfg_.p.retarget_span ? Basis::ClaimLeaf : Basis::Computed;
+                case RowClass::Coinbase: return x <= x1_ ? Basis::NotComputed : Basis::Computed;
+                case RowClass::Roots:
+                    if (x <= x1_) return Basis::NotComputed;
+                    return n_->store_->first_leaf() > 0 ? Basis::ClaimLeaf : Basis::Computed;
+                default: return Basis::Computed;
+            }
+        }
+        Basis header_binding(const Hash32& id, const Hash32& header_digest) const override {
+            if (const CarrierNode* c = n_->tree_->find(id); c != nullptr) return c->pos <= x1_ ? Basis::NotComputed : Basis::Computed;
+            const HeaderVariant* y = n_->headers_->variant(id, header_digest);
+            if (y == nullptr) return Basis::NotComputed;
+            const CarrierNode* pn = n_->tree_->find(y->header.own.side.tip);
+            return pn == nullptr || pn->pos < x1_ ? Basis::NotComputed : Basis::Computed;
+        }
+        bool judge_copy(std::uint64_t, const Hash32&) const override { return true; }
+        bool leaf_servable(std::uint64_t bin) const override {
+            const BinStore& st = *n_->store_;
+            return !(bin >= st.b0() && bin - st.b0() < st.first_leaf());
+        }
+        bool at_servable(const Hash32& at_id, const Hash32& at_digest) const override {
+            const CarrierNode* c = n_->tree_->find(at_id);
+            if (c == nullptr || c->pos <= x1_) return false;
+            const CarrierBodyV3* b = n_->bodies_->get(at_id);
+            if (b == nullptr) return false;
+            const std::optional<Hash32> dg = header_digest(header_of(*b));
+            return dg && *dg == at_digest;
+        }
+        bool rests_on_claims() const override { return false; }
+
+    private:
+        const PathbNode* n_;
+        std::uint64_t x1_ = 0;
+    };
+
     // The node's own switch at a fork position takes the joiner path: below the
     // journal base (one depth measure); a joined node also at or below its x1.
     bool deep_switch(std::uint64_t fork) const {
@@ -2576,6 +2643,7 @@ private:
     JoinInputs join_in_;
     std::optional<Joiner> joiner_;
     FullNodeA own_chain_{*this};
+    ResumedClaims resumed_{*this};
     JoinTransport* transport_ = nullptr;
     std::map<std::uint64_t, std::shared_ptr<PathbJoinLink>> links_;
     std::set<std::uint64_t> left_;  // servers that disconnected while an attempt ran

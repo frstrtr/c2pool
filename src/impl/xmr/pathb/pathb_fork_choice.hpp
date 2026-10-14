@@ -226,6 +226,9 @@ public:
         CarrierNode& r = t.nodes_[0];
         r.pos = root_pos;
         r.rs = root_s;
+        // the root's own d: its claimed t_origin, the newest `pre` entry (the window reads it from inherited_, never
+        // from node 0; its record keeps it, so a restart's window reads the same value)
+        if (!pre.empty()) r.d = pre.back().d;
         // the PRE nodes below the root (claims; reached only by find() for the row-17 walk, never by window_after)
         for (std::size_t k = 0; k < pre_nodes.size(); ++k) {
             const PreNode& pn = pre_nodes[k];
