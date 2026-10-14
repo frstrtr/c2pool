@@ -19,7 +19,9 @@
 //   (3) KeyCache: keys once per (tip, P_r), amounts per R; a Monero race gives
 //       two key sets; the finder-only key per payee; a digest difference
 //       recomputes; the budget changes no outcome.
-//   (4) the coinbase check outcomes: Match, Mismatch, Fused, Defer, Undefined.
+//   (4) the coinbase check outcomes: Match, Mismatch, Fused, Defer, IdentityGuard,
+//       NodeInternal; the tail: IdentityGuard BAN, NodeInternal (and any value
+//       outside the list) local alarm + DEFER, no token, RandomX not called.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -552,14 +554,14 @@ void outcomes() {
               "outcomes: side_data_v3 changed after the coinbase was built -> Mismatch");
         pb::ReceiptBodyV3 un = r;
         un.side.owner = seq32(0x21);  // owner with fee_rate_bp 0
-        check(ck(un, at_of(&w, tip, 16), 16, refs) == pb::CoinbaseCheck::Undefined,
-              "outcomes: side_data_v3 does not encode -> Undefined");
+        check(ck(un, at_of(&w, tip, 16), 16, refs) == pb::CoinbaseCheck::NodeInternal,
+              "outcomes: side_data_v3 does not encode -> NodeInternal");
     }
     {
         pb::Window bad_w = w;
         bad_w.W += pb::Work(1);  // weights != W
-        check(ck(r, at_of(&bad_w, tip, 16), 16, refs) == pb::CoinbaseCheck::Undefined,
-              "outcomes: window weights != W -> Undefined");
+        check(ck(r, at_of(&bad_w, tip, 16), 16, refs) == pb::CoinbaseCheck::NodeInternal,
+              "outcomes: window weights != W -> NodeInternal");
     }
     {
         // finder-only with a payee identity that is not its reference's.
@@ -574,10 +576,11 @@ void outcomes() {
         f.side.payee[0] ^= 0x01;
         check(pb::canonical_coinbase_check(f, at_of(&empty, f.side.tip, 16), f.side.tip, f.blob.prev_id, kKatHeight, 16, c2, refs,
                                            author)
-                      == pb::CoinbaseCheck::Undefined,
-              "outcomes: finder-only payee identity != its reference -> Undefined");
+                      == pb::CoinbaseCheck::IdentityGuard,
+              "outcomes: finder-only payee identity != its reference -> IdentityGuard");
     }
-    // the tail: Fused / Unbuildable REFUSE, Defer DEFER, Mismatch / Undefined BAN; RandomX only after Match.
+    // the tail: Fused / Unbuildable REFUSE, Defer DEFER, Mismatch / IdentityGuard BAN, NodeInternal alarm + DEFER;
+    // RandomX only after Match.
     {
         int rx = 0;
         auto tail = [&](pb::CoinbaseCheck c) {
@@ -585,12 +588,18 @@ void outcomes() {
         };
         const pb::TailResult f = tail(pb::CoinbaseCheck::Fused), u = tail(pb::CoinbaseCheck::Unbuildable),
                              d = tail(pb::CoinbaseCheck::Defer), m = tail(pb::CoinbaseCheck::Mismatch),
-                             n = tail(pb::CoinbaseCheck::Undefined);
+                             g = tail(pb::CoinbaseCheck::IdentityGuard), n = tail(pb::CoinbaseCheck::NodeInternal),
+                             o = tail(static_cast<pb::CoinbaseCheck>(0xEE));
         check(f.verdict == pb::AdmitVerdict::Refuse && u.verdict == pb::AdmitVerdict::Refuse
                       && pb::strike_tokens(f.verdict) == 0,
               "tail: Fused / Unbuildable -> REFUSE, no token");
         check(d.verdict == pb::AdmitVerdict::Defer, "tail: Defer -> DEFER");
-        check(m.verdict == pb::AdmitVerdict::Ban && n.verdict == pb::AdmitVerdict::Ban, "tail: Mismatch / Undefined -> BAN");
+        check(m.verdict == pb::AdmitVerdict::Ban && g.verdict == pb::AdmitVerdict::Ban && !m.alarm && !g.alarm,
+              "tail: Mismatch / IdentityGuard -> BAN");
+        check(n.verdict == pb::AdmitVerdict::Defer && n.alarm && pb::strike_tokens(n.verdict) == 0,
+              "tail: NodeInternal -> local alarm + DEFER, no token");
+        check(o.verdict == pb::AdmitVerdict::Defer && o.alarm && !o.randomx_called,
+              "tail: a value outside the list fails closed (NodeInternal), RandomX not called");
         check(rx == 0, "tail: RandomX not called before Match");
         const pb::TailResult ok = tail(pb::CoinbaseCheck::Match);
         check(ok.verdict == pb::AdmitVerdict::AdmitCarrier && ok.randomx_called && rx == 1, "tail: Match -> RandomX");

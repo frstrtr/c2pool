@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # commit-msg hook: refuse a commit message that carries an attribution marker
-# listed in ci/attribution-patterns.txt. Install in a clone with
+# listed in ci/attribution-patterns.txt, and a commit whose author or committer
+# matches ci/attribution-identity-patterns.txt. Install in a clone with
 #   git config core.hooksPath scripts/ci/hooks
 set -uo pipefail
 export LC_ALL=C.UTF-8
@@ -17,4 +18,17 @@ if grep -v '^#' "$1" | grep -n -i -E -- "$pattern"; then
     echo "commit-msg: attribution marker in the commit message; commit refused"
     exit 1
 fi
+id_file=$root/ci/attribution-identity-patterns.txt
+if [ ! -s "$id_file" ]; then
+    echo "commit-msg: no identity pattern file ($id_file); commit refused"
+    exit 1
+fi
+id_pattern=$(grep -v -E '^[[:space:]]*(#|$)' "$id_file" | paste -sd'|')
+for role in AUTHOR COMMITTER; do
+    ident=$(git var "GIT_${role}_IDENT" 2>/dev/null | sed -E 's/ [0-9]+ [-+][0-9]{4}$//')
+    if printf '%s\n' "$ident" | grep -i -E -- "$id_pattern"; then
+        echo "commit-msg: AI identity as the commit author or committer; commit refused"
+        exit 1
+    fi
+done
 exit 0

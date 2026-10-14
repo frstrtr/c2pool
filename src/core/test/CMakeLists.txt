@@ -106,7 +106,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # (the guard was inverted). One KAT covers every coin lane because they all
     # share this one store. Same fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
-    add_executable(core_test
+        add_executable(core_test
         addr_store_save_test.cpp
         address_coin_validation_test.cpp
         author_fee_test.cpp
@@ -140,6 +140,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_dashboard_data_test.cpp
         web_server_frozen_pool_rate_guard_test.cpp
         web_server_local_hashps_test.cpp
+        web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
         web_server_relay_block_test.cpp
         web_server_submitblock_test.cpp

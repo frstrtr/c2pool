@@ -1,0 +1,14 @@
+# AI identities refused as commit author or committer in frstrtr/c2pool.
+#
+# Read by scripts/ci/attribution_gate.sh (the attribution-gate CI job and the
+# local pre-push hook) and by the local commit-msg hook (scripts/ci/hooks/).
+# One extended regular expression per line, matched case-insensitively against
+# "name <email>" of the author and of the committer of every commit the gate
+# scans. Like ci/attribution-patterns.txt, the gate does not scan this file.
+^claude\b
+noreply@anthropic\.com
+@anthropic\.com>$
+anthropic
+openai
+chatgpt
+copilot

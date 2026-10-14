@@ -78,7 +78,19 @@ private:
     void process_request();
     void send_response(http::response<http::string_body> response);
     void handle_error(beast::error_code ec, char const* what);
+    bool is_direct_local() const;
 };
+
+/// True when an HTTP request came straight from this host: the peer address
+/// is loopback and the request has no reverse-proxy forwarding header
+/// (X-Forwarded-For, Forwarded, X-Real-IP, X-Forwarded-Host,
+/// X-Forwarded-Proto). A reverse proxy on the same host connects from
+/// 127.0.0.1, so a loopback peer alone does not mean a local user. Caddy's
+/// reverse_proxy adds X-Forwarded-For, -Proto and -Host by default; nginx
+/// adds none unless configured
+/// (proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for).
+bool is_direct_local_request(const boost::asio::ip::address& peer,
+                             const http::fields& headers);
 
 /// Best-tip snapshot of the sharechain.
 ///

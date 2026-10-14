@@ -16,6 +16,7 @@
 
 src/c2pool/v37/main_v37_xmr.cpp 19 status and web pacing, web display times, the test-only suspend knob and credit feed lag knob, HOLD duration metrics, FB_GETWON ask pacing, wire cache prune pacing, inject pump pacing
 src/c2pool/v37/xmr/xmr_live_submit.hpp 3 submit_block round-trip latency and event timestamps
+src/c2pool/v37/xmr/xmr_live_transport.hpp 2 monerod RPC request deadline (monotonic)
 src/c2pool/v37/xmr/xmr_native_template_backend.hpp 2 deadline while waiting for a template (liveness)
 src/c2pool/v37/xmr/xmr_stratum_listener.hpp 3 stratum session timers (parked logins, idle re-probe)
 src/c2pool/v37/xmr/xmr_p2p_block_publisher.hpp 2 found-block publish retry timing and event timestamps

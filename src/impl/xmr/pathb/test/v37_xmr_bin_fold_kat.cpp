@@ -39,7 +39,11 @@ static pb::Hash32 rep(std::uint8_t b) { pb::Hash32 h{}; h.fill(b); return h; }
 //       store reproduces leaf_count, mmr_root and the bucket bytes
 //   V8  bucket cross-check against the rows
 //   V9  sibling race with a shared receipt and an orphan re-carry: both admitted
-//   V10 deep fork: DEFER, no verdict
+//   V10 at J = J_0 (2 J_0 + 9 positions): a fork J_0 below the tip rewinds;
+//       J_0 + 1: held and read (view horizon), switch_best Deep; 2 J_0: held;
+//       2 J_0 + 1: Deep, nothing stored; the P-37 floor H(L - J - J_0) - 2 x
+//       (F + Fresh) keeps the bins a judging reads (the nested on-chain tip, a
+//       side view forked 2 J_0 below the tip)
 //   V10b switch to a best-chain ancestor below the journal base: Deep, nothing
 //       changes (the store equals a fresh store fed the same chain)
 //   V11 side-branch seal: the side view's mmr_root_at == a fresh node's root
@@ -52,6 +56,7 @@ static pb::Hash32 rep(std::uint8_t b) { pb::Hash32 h{}; h.fill(b); return h; }
 
 #include "impl/xmr/pathb/pathb_bin_store.hpp"
 #include "impl/xmr/pathb/pathb_window.hpp"
+#include "impl/xmr/pathb/pathb_window_chain.hpp"  // win_bins_at
 
 namespace {
 
@@ -419,32 +424,84 @@ static void s3b_store_vectors() {
               "V9 each branch reads its own placements");
     });
 
-    // ---- V10 deep fork: DEFER, never a verdict ----
-    run_vector("V10 deep fork: DEFER, never a verdict", [&] {
-        const std::uint64_t J = 8;
-        pb::BinStore s(P, J, idn(0x10, 0), kB0);
+    // ---- V10 at the floor journal J = J_0: the journal base routes the switch, the view horizon the reads ----
+    run_vector("V10 deep fork at J_0 + 1, view horizon 2 J_0", [&] {
+        const std::uint64_t J0 = pb::journal_j0(P, pb::kSealDepth);
+        const std::uint64_t tip = 2 * J0 + 9;
+        pb::BinStore s(P, J0, idn(0x10, 0), kB0);
         bool ok = true;
-        for (std::uint64_t x = 1; x <= 19; ++x) ok = ok && extend(s, idn(0x10, x), idn(0x10, x - 1), kB0, {}, true);
-        // a side branch forking at 11 while the tip is 19 (fork depth J): held.
-        ok = ok && extend(s, idn(0x1F, 12), idn(0x10, 11), kB0, {}, false);
-        ok = ok && extend(s, idn(0x1F, 13), idn(0x1F, 12), kB0, {}, false);
-        ok = ok && s.add_carrier(idn(0x1F, 14), idn(0x1F, 13), kB0) == pb::AddVerdict::Added;
-        check(s.add_carrier(idn(0x1F, 15), idn(0x1F, 14), kB0) == pb::AddVerdict::ParentUnknown,
-              "V10 a carrier on a parent whose seal has not run waits (DEFER)");
-        ok = ok && extend(s, idn(0x10, 20), idn(0x10, 19), kB0, {}, true);
-        check(ok && s.base_pos() == 12, "V10 tip 20, J 8: journal base 12");
-        const pb::AddVerdict deep = s.add_carrier(idn(0x1E, 12), idn(0x10, 11), kB0);  // fork J + 1 below the tip
-        check(deep == pb::AddVerdict::Deep && pb::add_defers(deep), "V10 fork J + 1 below the tip: Deep -> DEFER");
-        check(s.view_at(idn(0x1E, 12)).status() == pb::ViewStatus::Unknown, "V10 nothing stored for it");
-        check(s.view_at(idn(0x1F, 13)).status() == pb::ViewStatus::Deep, "V10 a held side branch now forks too deep");
-        check(s.ingest(idn(0x1F, 14), rcpt(idn(0xAC, 1), kB0, 1, rep(0x81), 30000)) == std::nullopt
-                      && s.switch_best(idn(0x1F, 13)) == pb::SwitchVerdict::Deep,
-              "V10 no verdict and no switch on a deep branch");
-        check(s.add_carrier(idn(0x1D, 13), idn(0x10, 12), kB0) == pb::AddVerdict::Added,
-              "V10 control: fork J below the tip is held");
-        check(s.add_carrier(idn(0x1C, 1), idn(0x77, 0), kB0) == pb::AddVerdict::ParentUnknown
-                      && pb::add_defers(pb::AddVerdict::ParentUnknown),
+        for (std::uint64_t x = 1; x <= tip; ++x) ok = ok && extend(s, idn(0x10, x), idn(0x10, x - 1), kB0, {}, true);
+        check(ok && s.base_pos() == tip - J0 && s.view_horizon_depth() == J0 && J0 == 1152,
+              "V10 tip 2 J_0 + 9, J = J_0 = 1,152: journal base tip - J_0");
+        // control: a side branch forked J_0 below the tip is held; switch rewinds and back
+        const std::uint64_t f0 = tip - J0;
+        ok = extend(s, idn(0x1A, f0 + 1), idn(0x10, f0), kB0, {}, false)
+             && extend(s, idn(0x1A, f0 + 2), idn(0x1A, f0 + 1), kB0, {}, false);
+        check(ok && s.switch_best(idn(0x1A, f0 + 2)) == pb::SwitchVerdict::Switched && s.tip_pos() == f0 + 2
+                      && s.switch_best(idn(0x10, tip)) == pb::SwitchVerdict::Switched && s.tip_pos() == tip,
+              "V10 control: a branch forked J_0 below the tip is held; the switch rewinds, and back");
+        // forked J_0 + 1 below the tip: held (view horizon), switch Deep, nothing changes
+        const std::uint64_t f1 = tip - J0 - 1;
+        const pb::BmmrHead head = s.head();
+        ok = extend(s, idn(0x1B, f1 + 1), idn(0x10, f1), kB0, {rcpt(idn(0xAB, 1), kB0, f1 + 1, rep(0x81), 30000)}, false);
+        check(ok && s.view_at(idn(0x1B, f1 + 1)).ok() && s.view_at(idn(0x1B, f1 + 1)).fork_pos() == f1,
+              "V10 fork J_0 + 1 below the tip: add_carrier / ingest / seal and view_at work (view horizon)");
+        pb::LaneBatch batch;
+        check(s.switch_best(idn(0x1B, f1 + 1), &batch) == pb::SwitchVerdict::Deep && batch.ops.empty()
+                      && s.best_tip() == idn(0x10, tip) && s.head() == head,
+              "V10 fork J_0 + 1 below the tip: switch_best Deep, nothing changed (the switch takes the joiner path)");
+        // down to a fork 2 J_0 below the tip: held; 2 J_0 + 1: Deep, nothing stored
+        const std::uint64_t f2 = tip - 2 * J0;
+        ok = extend(s, idn(0x1C, f2 + 1), idn(0x10, f2), kB0, {rcpt(idn(0xAB, 2), kB0, f2 + 1, rep(0x82), 30000)}, false)
+             && extend(s, idn(0x1C, f2 + 2), idn(0x1C, f2 + 1), kB0, {}, false);
+        check(ok && s.view_at(idn(0x1C, f2 + 2)).ok() && s.view_at(idn(0x1C, f2 + 2)).fork_pos() == f2,
+              "V10 fork 2 J_0 below the tip: add_carrier / ingest / seal and view_at work");
+        const pb::AddVerdict deep = s.add_carrier(idn(0x1D, f2), idn(0x10, f2 - 1), kB0);
+        check(deep == pb::AddVerdict::Deep && pb::add_defers(deep) && s.view_at(idn(0x1D, f2)).status() == pb::ViewStatus::Unknown,
+              "V10 fork 2 J_0 + 1 below the tip: Deep -> DEFER, nothing stored");
+        // the tip advances one position: the branch forked at 2 J_0 below is now beyond the horizon
+        ok = extend(s, idn(0x10, tip + 1), idn(0x10, tip), kB0, {}, true);
+        check(ok && s.view_at(idn(0x1C, f2 + 2)).status() == pb::ViewStatus::Deep
+                      && s.ingest(idn(0x1C, f2 + 2), rcpt(idn(0xAC, 1), kB0, 1, rep(0x81), 30000)) == std::nullopt,
+              "V10 a held side branch now forks below the horizon: Deep, no verdict");
+        check(s.add_carrier(idn(0x1E, 1), idn(0x77, 0), kB0) == pb::AddVerdict::ParentUnknown,
               "V10 an unknown parent DEFERs");
+    });
+
+    // ---- V10 P-37 floor H(L - J - J_0) - 2 x (F + Fresh): the reads a judging makes stay held ----
+    run_vector("V10 P-37 floor at J = J_0", [&] {
+        const std::uint64_t J0 = pb::journal_j0(P, pb::kSealDepth);
+        const std::uint64_t span = P.open_bins + P.fresh_max;  // 98
+        const std::uint64_t L = 4 * J0 + 12 * 2 * span;        // H(L - 2 J_0) = b0 + 2 (F + Fresh) + 192
+        const auto h_of = [](std::uint64_t pos) -> std::uint64_t { return kB0 + pos / 12; };
+        pb::BinStore s(P, J0, idn(0x60, 0), kB0), full(P, J0, idn(0x60, 0), kB0);
+        bool ok = true;
+        for (std::uint64_t x = 1; x <= L; ++x) {
+            const std::vector<pb::Placement> pls{rcpt(idn(0xE0, x), h_of(x) > kB0 ? h_of(x) - 1 : kB0, x,
+                                                      idn(0xA0, x % 5), 20000 + x)};
+            ok = ok && extend(s, idn(0x60, x), idn(0x60, x - 1), h_of(x), pls, true)
+                 && extend(full, idn(0x60, x), idn(0x60, x - 1), h_of(x), pls, true);
+        }
+        const std::uint64_t f = L - 2 * J0;
+        const std::uint64_t limit = s.entry_floor_limit();
+        check(ok && limit == h_of(L - J0 - J0) - 2 * span + 1,
+              "P-37: entry_floor_limit = H(L - J - J_0) - 2 x (F + Fresh) + 1");
+        check(s.prune_entries(UINT64_MAX) == limit && s.entry_floor() == limit && limit > kB0,
+              "P-37: the floor clamped to the limit drops placements");
+        // the nested on-chain tip: a best-chain carrier at H(f) - F - Fresh + 1
+        std::uint64_t tpos = 0;
+        while (h_of(tpos) < h_of(f) - span + 1) ++tpos;
+        const pb::WinResult wn = pb::win_bins_at(s, idn(0x60, tpos)), wf = pb::win_bins_at(full, idn(0x60, tpos));
+        check(wn.view == pb::ViewStatus::Ok && wn.status == pb::WinStatus::Ok && wf.status == pb::WinStatus::Ok
+                      && wn.bins.size() == wf.bins.size(),
+              "P-37: the window bins of the nested on-chain tip are held at the floor (no MissingEntries)");
+        // a side view forked 2 J_0 below the tip, carrying a receipt of the lowest open bin
+        const pb::Placement low = rcpt(idn(0xE1, 1), h_of(f) - P.open_bins + 1, f + 1, idn(0xA0, 1), 30000);
+        ok = extend(s, idn(0x61, f + 1), idn(0x60, f), h_of(f), {low}, false)
+             && extend(full, idn(0x61, f + 1), idn(0x60, f), h_of(f), {low}, false);
+        const pb::WinResult sn = pb::win_bins_at(s, idn(0x61, f + 1)), sf = pb::win_bins_at(full, idn(0x61, f + 1));
+        check(ok && sn.status == pb::WinStatus::Ok && sn.bins.size() == sf.bins.size(),
+              "P-37: a store at the floor holds the open-bin placements of a side view forked 2 J_0 below the tip");
     });
 
     // ---- V10b switch to a best-chain ancestor below the journal base ----

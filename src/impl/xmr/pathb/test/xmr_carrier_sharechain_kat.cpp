@@ -79,7 +79,11 @@
 //       the copy's entry is dropped and X's child released; a carrier waiting
 //       under two claimed parents keeps its own waiting children when one of
 //       them is refused; a refused copy of a carrier that still waits under
-//       another claimed parent discards nothing.
+//       another claimed parent discards nothing;
+//   (o) a two-level chain under a refused carrier is discarded as the
+//       pairs ((child, refused), (grandchild, child)); unwait(id, p) removes
+//       the one pair (id, p): id's claim under another parent and the
+//       entries waiting on id stay, waiting() counts the pairs left.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdint>
@@ -381,7 +385,8 @@ int main() {
                   "parent arrives: the waiting carrier released");
             const pb::PlaceOutcome qb = put(t, below);
             check(qb.verdict == pb::PlaceVerdict::NotCarrier
-                          && qb.discarded == std::vector<pb::Hash32>{bq[2].id, bq[3].id} && t.waiting() == 0
+                          && qb.discarded == std::vector<pb::WaitKey>{{bq[2].id, below.id}, {bq[3].id, bq[2].id}}
+                          && t.waiting() == 0
                           && t.find(below.id) == nullptr && t.find(bq[2].id) == nullptr && t.find(bq[3].id) == nullptr,
                   "a released carrier below its parent's record: not a carrier, the two-level chain waiting on it "
                   "discarded");
@@ -637,7 +642,8 @@ int main() {
               "parent arrives: the waiting carrier released");
         const pb::PlaceOutcome ow = put(t, wq[1]);
         check(ow.verdict == pb::PlaceVerdict::FoldMismatch
-                      && ow.discarded == std::vector<pb::Hash32>{wq[2].id, wq[3].id} && ow.released.empty()
+                      && ow.discarded == std::vector<pb::WaitKey>{{wq[2].id, wq[1].id}, {wq[3].id, wq[2].id}}
+                      && ow.released.empty()
                       && t.waiting() == 0 && t.find(wq[1].id) == nullptr && t.find(wq[2].id) == nullptr
                       && t.find(wq[3].id) == nullptr,
               "the released carrier with a wrong fold: FoldMismatch, the two-level chain waiting on it discarded");
@@ -954,7 +960,8 @@ int main() {
             const pb::CarrierAnnounce refused =
                     on_tip(t, bad_parent, hc[1].id, node_of(t, hc[1].id).H - 1);  // below its parent's record
             const pb::PlaceOutcome orf = put(t, refused);
-            check(orf.verdict == pb::PlaceVerdict::NotCarrier && orf.discarded == std::vector<pb::Hash32>{y.id}
+            check(orf.verdict == pb::PlaceVerdict::NotCarrier
+                          && orf.discarded == std::vector<pb::WaitKey>{{y.id, bad_parent}}
                           && t.waiting() == 2,
                   "(n) the forged parent refused: only Y's claim under it dropped; Y's child kept (Y still waits)");
             const pb::PlaceOutcome op = put(t, ph);
@@ -987,6 +994,45 @@ int main() {
                       "(n) R and its child placed");
             }
         }
+    }
+
+    // (o) the discarded pairs; unwait removes one pair and does not cascade
+    {
+        pb::CarrierTree t(P, kGenesis, kGenesisHeight, pb::EpochTable{});
+        const auto trunk = announce(t, kGenesis, 0, 0x51, 3);
+        check(admit(t, trunk), "(o) trunk placed");
+        const pb::Hash32 tip = trunk.back().id;
+        const auto lv = announce(t, tip, 3, 0x52, 3);  // refused at 4, child at 5, grandchild at 6
+        check(lv.size() == 3, "(o) three carriers announced");
+        if (lv.size() == 3) {
+            check(put(t, lv[2]).verdict == pb::PlaceVerdict::Deferred && put(t, lv[1]).verdict == pb::PlaceVerdict::Deferred
+                          && t.waiting() == 2,
+                  "(o) the child waits on the refused carrier, the grandchild on the child");
+            pb::CarrierAnnounce refused = lv[0];
+            refused.h = node_of(t, tip).H - 1;  // below its parent's record
+            const pb::PlaceOutcome o = put(t, refused);
+            check(o.verdict == pb::PlaceVerdict::NotCarrier
+                          && o.discarded == std::vector<pb::WaitKey>{{lv[1].id, refused.id}, {lv[2].id, lv[1].id}}
+                          && t.waiting() == 0,
+                  "(o) the discarded entries are ((child, refused), (grandchild, child))");
+        }
+        // unwait: X waits under parents A and B, Z waits on X
+        const pb::Hash32 pa = cid(0x53, 4), pb_ = cid(0x54, 4);
+        const pb::CarrierAnnounce x{cid(0x55, 5), pa, steady_h(5), pb::Hash32{}, 0};
+        pb::CarrierAnnounce x_b = x;
+        x_b.parent = pb_;
+        const pb::CarrierAnnounce z{cid(0x56, 6), x.id, steady_h(6), pb::Hash32{}, 0};
+        check(put(t, x).verdict == pb::PlaceVerdict::Deferred && put(t, x_b).verdict == pb::PlaceVerdict::Deferred
+                      && put(t, z).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 3,
+              "(o) X waits under A and under B, Z waits on X");
+        check(t.unwait(x.id, pa) && t.waiting() == 2, "(o) unwait(X, A): one pair removed");
+        check(!t.unwait(x.id, pa), "(o) unwait of a removed pair: false");
+        check(t.place(x_b, {}).verdict == pb::PlaceVerdict::Duplicate && t.place(z, {}).verdict == pb::PlaceVerdict::Duplicate,
+              "(o) X's claim under B and Z's entry on X stay (no cascade)");
+        check(t.place(x, {}).verdict == pb::PlaceVerdict::Deferred && t.waiting() == 3,
+              "(o) the removed pair can wait again");
+        check(t.unwait(x.id, pa) && t.unwait(x.id, pb_) && t.waiting() == 1, "(o) both of X's pairs removed; Z stays");
+        check(t.unwait(z.id, x.id) && t.waiting() == 0, "(o) Z's pair removed: nothing waits");
     }
 
     return finish("xmr_carrier_sharechain_kat");

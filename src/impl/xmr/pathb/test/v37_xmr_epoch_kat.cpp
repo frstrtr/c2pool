@@ -13,7 +13,7 @@
 //      unit below 3/4: no HOLD; no strike; the chain stays a prefix
 //   3  no HOLD on a frame: rules_epoch 65535, a known epoch before H_act, an
 //      epoch not locked in: STRIKE, no HOLD, jobs keep advancing
-//   4  deferral cap: H_hold .. H_hold + 1,175 stored, the next dropped, no strike
+//   4  deferral cap: H_hold .. H_hold + 3,335 stored, the next dropped, no strike
 //   5  lock-in at the end of the range (F1) and in an early window
 //   6  act exactly at H_act; rs_step_at == rs_step(act); AR row at H_act only
 //   7  epoch_at: AR == S-derived on a two-activation chain; journal depths
@@ -202,11 +202,12 @@ void no_hold_on_frame() {
 void deferral_cap() {
     const std::uint64_t hh = 155840;
     const std::uint64_t span = pb::deferred_frame_span_default();
-    check(span == 1176, "4 P-34 default = one joiner span, 1,176 positions");
+    check(span == 3336, "4 P-34 default = one joiner span at its minimum, N_rt + 1,176 = 3,336 positions");
     check(pb::defer_frame(hh, hh, true, span) == pb::DeferVerdict::Stored
-              && pb::defer_frame(hh + 1175, hh, true, span) == pb::DeferVerdict::Stored,
-          "4 frames of H_hold .. H_hold + 1,175 stored without a verdict");
-    check(pb::defer_frame(hh + 1176, hh, true, span) == pb::DeferVerdict::Drop, "4 the next frame beyond P-34 DROPPED");
+              && pb::defer_frame(hh + 1176, hh, true, span) == pb::DeferVerdict::Stored
+              && pb::defer_frame(hh + 3335, hh, true, span) == pb::DeferVerdict::Stored,
+          "4 frames of H_hold .. H_hold + 3,335 stored without a verdict (H_hold + 1,176 among them)");
+    check(pb::defer_frame(hh + 3336, hh, true, span) == pb::DeferVerdict::Drop, "4 the next frame beyond P-34 DROPPED");
     check(pb::defer_frame(hh + 3, hh, false, span) == pb::DeferVerdict::Drop, "4 a deferred frame failing the old header checks DROPPED");
     const std::uint64_t cap = pb::deferred_receipt_cap_default();
     check(cap == 18432 && pb::defer_receipt(cap - 1, cap, true) == pb::DeferVerdict::Stored

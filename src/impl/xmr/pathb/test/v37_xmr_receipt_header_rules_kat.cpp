@@ -19,7 +19,10 @@
 //   (5) a child below height 60 has no median: the rule does not apply;
 //   (6) a missing block of the 60 -> Defer naming its id;
 //   (7) through header_fields: the header rules run before the size rules
-//       and the cap; the verdict is STRIKE with one strike token.
+//       and the cap; the verdict is STRIKE with one strike token;
+//   (8) the vote rule (E-48): vote(minor) >= hf_version(h), minor 0 counting
+//       as 1: at hf 16 minor 0 and 15 refused (STRIKE), 16 and 17 admitted;
+//       at hf 1 minor 0 admitted (it votes 1).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -112,6 +115,28 @@ int main() {
         check(pb::header_fields_verdict(pb::HeaderFault::MajorVersion) == pb::AdmitVerdict::Strike
                       && pb::strike_tokens(pb::AdmitVerdict::Strike) == 1,
               "a wrong major is STRIKE (one token)");
+    }
+
+    // (8) the vote rule
+    {
+        const auto with_minor = [](std::uint64_t major, std::uint64_t minor) {
+            pb::HashingBlob b = blob(major, kBase);
+            b.minor = minor;
+            return b;
+        };
+        check(pb::block_vote(0) == 1 && pb::block_vote(1) == 1 && pb::block_vote(16) == 16, "vote(0) = 1, vote(m) = m");
+        check(pb::header_rules(with_minor(16, 0), 16, std::nullopt) == pb::HeaderFault::MinorVote,
+              "vote: minor 0 at hf 16 refused (votes 1)");
+        check(pb::header_rules(with_minor(16, 15), 16, std::nullopt) == pb::HeaderFault::MinorVote,
+              "vote: minor 15 at hf 16 refused");
+        check(pb::header_rules(with_minor(16, 16), 16, std::nullopt) == pb::HeaderFault::None,
+              "vote: minor 16 at hf 16 admitted");
+        check(pb::header_rules(with_minor(16, 17), 16, std::nullopt) == pb::HeaderFault::None,
+              "vote: minor 17 at hf 16 admitted");
+        check(pb::header_rules(with_minor(1, 0), 1, std::nullopt) == pb::HeaderFault::None,
+              "vote: minor 0 at hf 1 admitted");
+        check(pb::header_fields_verdict(pb::HeaderFault::MinorVote) == pb::AdmitVerdict::Strike,
+              "vote: a refused vote is STRIKE");
     }
 
     // Branches: main 0..200 at kBase + 120 h; side 151..200 on main 150 at kBase + 120 h + kSideShift.

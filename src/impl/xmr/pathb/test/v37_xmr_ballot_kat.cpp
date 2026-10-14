@@ -12,12 +12,21 @@
 //   (opt-out); a stated vote=n sets the own flag (own), vote=0 is own no; the
 //   login reply's vote object; a stated vote expires with its deployment;
 //   a --vote change applies to the next ballot written.
+//   S4w-a (pathb_stratum.hpp, pathb_policy.hpp): the stratum password "vote=<n>" parsed (n
+//   decimal, 0 .. 2^15 - 1; vote=0 own no); anything else ignored (no stated
+//   vote, never a refusal); the parsed value through ballot_to_write to the
+//   login reply's vote object; the moved policy helpers: parse_pct_exact /
+//   pct_to_bp (10 bp from "0.1"), a login payee XMR_STD only (the mainnet
+//   donation address decodes to the K16 author keys).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <algorithm>
 #include <vector>
 
+#include "c2pool/v37/xmr/pathb/pathb_stratum.hpp"
+#include "impl/xmr/pathb/pathb_lane_rules.hpp"
 #include "impl/xmr/pathb/pathb_ratchet_activation.hpp"
 #include "impl/xmr/pathb/pathb_wire_v3.hpp"
 #include "pathb_kat_check.hpp"
@@ -25,6 +34,53 @@
 
 using namespace pathb_kat;
 using namespace ratchet_sim;
+
+// CryptoNote base58 (8-byte blocks -> 11 characters; the last block by kEncSizes).
+std::string cn_base58_encode(const std::vector<std::uint8_t>& data) {
+    static const char kAlpha[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    static const int kEnc[9] = {0, 2, 3, 5, 6, 7, 9, 10, 11};
+    std::string out;
+    for (std::size_t o = 0; o < data.size(); o += 8) {
+        const std::size_t n = std::min<std::size_t>(8, data.size() - o);
+        std::uint64_t num = 0;
+        for (std::size_t i = 0; i < n; ++i) num = (num << 8) | data[o + i];
+        std::string blk(static_cast<std::size_t>(kEnc[n]), '1');
+        for (int i = kEnc[n] - 1; i >= 0 && num > 0; --i) {
+            blk[static_cast<std::size_t>(i)] = kAlpha[static_cast<int>(num % 58)];
+            num /= 58;
+        }
+        out += blk;
+    }
+    return out;
+}
+
+std::string std_address(std::uint64_t prefix, const pb::Hash32& spend, const pb::Hash32& view) {
+    std::vector<std::uint8_t> raw;
+    for (std::uint64_t v = prefix;;) {
+        const std::uint8_t b = static_cast<std::uint8_t>(v & 0x7f);
+        v >>= 7;
+        raw.push_back(static_cast<std::uint8_t>(b | (v ? 0x80 : 0)));
+        if (!v) break;
+    }
+    raw.insert(raw.end(), spend.begin(), spend.end());
+    raw.insert(raw.end(), view.begin(), view.end());
+    const ::xmr::coin::Hash256 h = ::xmr::coin::keccak256(raw.data(), raw.size());
+    raw.insert(raw.end(), h.data(), h.data() + 4);
+    return cn_base58_encode(raw);
+}
+
+std::string lp_mainnet() {
+    return "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF";
+}
+
+pb::Hash32 non_point_key() {
+    for (unsigned i = 0; i < 256; ++i) {
+        pb::Hash32 k{};
+        for (std::size_t j = 0; j < k.size(); ++j) k[j] = static_cast<std::uint8_t>(i + j);
+        if (!pb::point_decompresses(k)) return k;
+    }
+    return pb::Hash32{};
+}
 
 int main() {
     const pb::RatchetParams P = pb::kRuledRatchetParams;
@@ -107,5 +163,52 @@ int main() {
     // nothing open: the default is epoch_cur
     check(pb::ballot_to_write(P, g, 10, release({}), std::nullopt, false).ballot == pb::make_ballot(0, false),
           "no deployment open: the default is epoch_cur");
+    // S4w-a: the stratum password and the moved policy helpers
+    {
+        namespace pol = ::c2pool::xmr::pathb::policy;
+        namespace st = ::c2pool::xmr::pathb::stratum;
+        check(st::parse_vote_pass("vote=3") == std::optional<std::uint32_t>(3), "password vote=3 -> stated 3");
+        check(st::parse_vote_pass("vote=0") == std::optional<std::uint32_t>(0), "password vote=0 -> stated 0 (own no)");
+        check(st::parse_vote_pass("vote=32767") == std::optional<std::uint32_t>(32767), "vote=32767 (2^15 - 1) accepted");
+        bool ignored = true;
+        for (const char* junk : {"x", "", "vote=", "vote=32768", "vote=3x", "Vote=3", " vote=3", "vote=-1", "vote=99999999999"})
+            ignored = ignored && !st::parse_vote_pass(junk).has_value();
+        check(ignored, "any other password: no stated vote (ignored, never a refusal)");
+        const pb::RatchetState g0 = pb::genesis_ratchet_state(pb::Hash32{});
+        const pb::BallotChoice own0 = pb::ballot_to_write(P, g0, 10, release({}), st::parse_vote_pass("vote=0"), false);
+        check(own0.ballot == pb::make_ballot(0, true) && own0.source == pb::BallotSource::Own
+                  && pb::vote_json(own0).find("\"source\": \"own\"") != std::string::npos
+                  && pb::vote_json(own0).find("0x8000") != std::string::npos,
+              "vote=0 from the password: own no in the ballot and the login reply's vote object");
+        const pb::BallotChoice none = pb::ballot_to_write(P, g0, 10, release({}), st::parse_vote_pass("x"), false);
+        check(none.source == pb::BallotSource::Default, "password x: the default ballot");
+        const pol::ExactPct pct = pol::parse_pct_exact("0.1");
+        check(pct.ok && pol::pct_to_bp(pct) == pb::kDonationBp && pol::pct_to_bp(pol::parse_pct_exact("100")) == 10000
+                  && !pol::parse_pct_exact("1.").ok && !pol::parse_pct_exact("-1").ok && !pol::parse_pct_exact("1e2").ok,
+              "--give-author-pct 0.1 -> 10 bp in integers; malformed text refused");
+        const st::LoginPayee lp = st::login_payee(
+                "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF",
+                pb::LaneNet::Mainnet);
+        check(lp.refusal.empty() && lp.ref == pb::author_ref(pb::LaneNet::Mainnet),
+              "the mainnet donation address decodes to the K16 author keys (XMR_STD payee)");
+        pol::DecodedAddress sub = pol::decode_xmr_address(
+                "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF");
+        sub.subaddress = true;
+        check(!pol::payee_refusal(sub).empty(), "a subaddress is refused as a login payee");
+        check(!pol::decode_xmr_address("42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPG").ok,
+              "a checksum mismatch is refused");
+        // another network's address; keys that do not decompress
+        const char* testnet = "9yWhJcSRcNFhfrZJAkgh5N4swx92cHLP79hYbP8YJwJKYSCcdKXpgrvYxFHZ5kvfUERtXjvwNTJN4EuW7FypyDZ3114t5rG";
+        check(!st::login_payee(testnet, pb::LaneNet::Mainnet).refusal.empty()
+                      && st::login_payee(testnet, pb::LaneNet::Testnet).refusal.empty()
+                      && st::login_payee(lp_mainnet(), pb::LaneNet::Regtest).refusal.empty(),
+              "a login address of another network refused (regtest takes the mainnet bytes)");
+        check(std_address(pol::kPrefixMainnetStd, pb::author_ref(pb::LaneNet::Mainnet).spend,
+                          pb::author_ref(pb::LaneNet::Mainnet).view) == lp_mainnet(),
+              "the KAT's address encoder reproduces the mainnet donation address");
+        const std::string np = std_address(pol::kPrefixMainnetStd, non_point_key(), pb::author_ref(pb::LaneNet::Mainnet).view);
+        check(pol::decode_xmr_address(np).ok && !st::login_payee(np, pb::LaneNet::Mainnet).refusal.empty(),
+              "a login address whose spend key does not decompress refused");
+    }
     return finish("v37_xmr_ballot_kat");
 }

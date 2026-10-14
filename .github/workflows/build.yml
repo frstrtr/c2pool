@@ -569,6 +569,7 @@ jobs:
               v37_xmr_lane_rules_kat \
               v37_xmr_lane_suspend_selfcheck \
               v37_xmr_light_proof_kat \
+              v37_xmr_live_transport_bounds_kat \
               v37_xmr_m2_native_settlement_kat \
               v37_xmr_m3_arm_order_kat \
               v37_xmr_mainnet_readiness_kat \
@@ -585,6 +586,7 @@ jobs:
               v37_xmr_order_rule_kat \
               v37_xmr_p2p_publish_retry_kat \
               v37_xmr_parse_bounds_kat \
+              v37_xmr_pathb_admit_kat \
               v37_xmr_pathb_body_v3_kat \
               v37_xmr_pathb_branch_kat \
               v37_xmr_pathb_bucket_wire_kat \
@@ -594,7 +596,10 @@ jobs:
               v37_xmr_pathb_hello_kat \
               v37_xmr_pathb_journal_kat \
               v37_xmr_pathb_miner_tx_kat \
+              v37_xmr_pathb_node_join_kat \
+              v37_xmr_pathb_node_kat \
               v37_xmr_pathb_pbx1_kat \
+              v37_xmr_pathb_store_kat \
               v37_xmr_paynow_kat \
               v37_xmr_paynow_lineage_kat \
               v37_xmr_pinned_snapshot_kat \
@@ -610,6 +615,7 @@ jobs:
               v37_xmr_relay_addr_ban_kat \
               v37_xmr_relay_discovery_kat \
               v37_xmr_relay_eclipse_kat \
+              v37_xmr_relay_family_c_kat \
               v37_xmr_relay_fd_kat \
               v37_xmr_relay_horizons_kat \
               v37_xmr_relay_liveness_kat \
@@ -634,6 +640,8 @@ jobs:
               v37_xmr_spend_floor_kat \
               v37_xmr_stranger_mm_tail_kat \
               v37_xmr_stratum_dos_kat \
+              v37_xmr_stratum_json_depth_kat \
+              v37_xmr_stratum_line_cap_kat \
               v37_xmr_stratum_resume_kat \
               v37_xmr_stratum_vardiff_kat \
               v37_xmr_test_suspend_knob_kat \
@@ -680,8 +688,10 @@ jobs:
               xmr_native_consensus_state_kat \
               xmr_native_contracts_kat \
               xmr_native_dos_dup_block_kat \
+              xmr_native_epee_budget_kat \
               xmr_native_inject_pool_kat \
               xmr_native_inject_select_kat \
+              xmr_native_levin_unsolicited_cap_kat \
               xmr_native_m4_ptpl_backlog_gate_kat \
               xmr_native_m4_soak_kat \
               xmr_native_neartip_stall_kat \
@@ -692,6 +702,7 @@ jobs:
               xmr_native_output_set_overlay_kat \
               xmr_native_p2p_dos_kat \
               xmr_native_parity_kat \
+              xmr_native_peer_pool_budget_kat \
               xmr_native_peer_pool_kat \
               xmr_native_peer_store_kat \
               xmr_native_rct_verify_kat \
@@ -1205,6 +1216,7 @@ jobs:
                     v37_xmr_relay_addr_ban_kat \
                     v37_xmr_stratum_dos_kat \
                     v37_xmr_stratum_vardiff_kat \
+                    v37_xmr_stratum_json_depth_kat v37_xmr_stratum_line_cap_kat v37_xmr_live_transport_bounds_kat \
                     v37_xmr_relay_eclipse_kat \
                     v37_payout_carriage_kat \
                     v37_payout_rule_l_kat \
@@ -1224,6 +1236,7 @@ jobs:
                     xmr_native_output_set_overlay_kat \
                     xmr_native_chain_locator_kat xmr_native_peer_store_kat \
                     xmr_native_p2p_dos_kat xmr_native_peer_pool_kat \
+                    xmr_native_epee_budget_kat xmr_native_levin_unsolicited_cap_kat xmr_native_peer_pool_budget_kat \
                     xmr_native_dos_dup_block_kat \
                     xmr_native_unknown_fork_fuse_kat \
                     xmr_native_template_kat xmr_native_template_coinbase_kat \
@@ -1246,7 +1259,8 @@ jobs:
                     v37_xmr_receipt_id_kat v37_xmr_receipt_defer_kat xmr_receipt_solo_leech_kat \
                     v37_xmr_receipt_header_rules_kat v37_xmr_receipt_wire_cap_kat xmr_carrier_timestamp_kat \
                     xmr_window_kat xmr_window_spend_floor_kat xmr_window_merge_back_kat v37_xmr_window_branch_kat v37_xmr_window_fork_height_kat v37_xmr_coinbase_reserve_kat xmr_coinbase_output_gate_kat xmr_window_split_kat v37_xmr_coinbase_output_order_kat v37_xmr_coinbase_extra_layout_kat v37_xmr_bin_fold_kat v37_xmr_mmr_golden_kat v37_xmr_base_reward_kat v37_xmr_joiner_kat xmr_wide_int_extreme_kat v37_xmr_fairness_cap_kat v37_xmr_fairness_schedules_kat v37_xmr_pathb_coinbase_kat v37_xmr_pathb_e2e_kat v37_xmr_pathb_miner_tx_kat \
-                    v37_xmr_epoch_kat xmr_epoch_tally_kat v37_xmr_ballot_kat xmr_epoch_accounting_kat v37_xmr_donation_split_kat v37_xmr_monero_rules_digest_kat v37_xmr_pathb_hello_kat v37_xmr_pathb_bucket_wire_kat \
+                    v37_xmr_epoch_kat xmr_epoch_tally_kat v37_xmr_ballot_kat xmr_epoch_accounting_kat v37_xmr_donation_split_kat v37_xmr_monero_rules_digest_kat v37_xmr_pathb_hello_kat v37_xmr_pathb_bucket_wire_kat v37_xmr_pathb_admit_kat \
+                    v37_xmr_relay_family_c_kat v37_xmr_pathb_store_kat v37_xmr_pathb_node_kat v37_xmr_pathb_node_join_kat \
                     v37_xmr_m2_native_settlement_kat \
                     v37_xmr_credit_cut_kat \
                     v37_xmr_coinbase_extra_kat v37_xmr_stranger_mm_tail_kat \

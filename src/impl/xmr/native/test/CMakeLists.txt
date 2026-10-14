@@ -77,7 +77,8 @@ if (BUILD_TESTING)
             xmr_levin_codec_kat
             xmr_epee_storage_kat
             xmr_levin_messages_kat
-            xmr_levin_fuzz_kat)
+            xmr_levin_fuzz_kat
+            xmr_native_epee_budget_kat)   # message-wide array-element limit
         add_executable(${_c1a_kat} ${_c1a_kat}.cpp)
         target_include_directories(${_c1a_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -331,7 +332,8 @@ if (BUILD_TESTING)
     # -----------------------------------------------------------------------
     foreach(_c1b_kat
             xmr_levin_socket_kat
-            xmr_levin_link_kat)
+            xmr_levin_link_kat
+            xmr_native_levin_unsolicited_cap_kat)   # unsolicited 2004/2007 refused at header time
         add_executable(${_c1b_kat} ${_c1b_kat}.cpp)
         target_include_directories(${_c1b_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -517,6 +519,28 @@ if (BUILD_TESTING)
     # Loopback TCP with compressed deadlines: seconds on an idle runner, but
     # never unbounded.
     set_tests_properties(xmr_native_peer_pool_kat PROPERTIES TIMEOUT 300)
+
+    # xmr_native_peer_pool_budget_kat: the pool charges a peer's inbound byte
+    # budget before decoding a 2002 body; an over-budget frame is dropped and the
+    # peer kept. Real pool + fakes against a loopback stand-in with a 50-byte
+    # byte budget. Listed in BOTH build.yml --target lists.
+    add_executable(xmr_native_peer_pool_budget_kat xmr_native_peer_pool_budget_kat.cpp)
+    target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(xmr_native_peer_pool_budget_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_peer_pool_budget_kat COMMAND xmr_native_peer_pool_budget_kat)
+    set_tests_properties(xmr_native_peer_pool_budget_kat PROPERTIES TIMEOUT 300)
 
     # D3a: the block DoS bucket against honest relay of VALID blocks. The REAL
     # pool and the REAL chain index (the reorg-follow KAT's from-genesis regtest

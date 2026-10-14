@@ -33,6 +33,13 @@
 //      POINTER-IDENTICAL across all jobs of one work generation (one
 //      refcounted block per generation per session, not jobs × copies).
 //
+//   5. LINE CAP — an inbound line longer than
+//      StratumSession::kMaxStratumLineBytes (16384, p2pool/twisted
+//      LineOnlyReceiver.MAX_LENGTH) without a '\n' drops the session instead
+//      of growing the read buffer without bound. A line of exactly the cap is
+//      still served, and pipelined lines whose total exceeds the cap are all
+//      answered (only the bytes since the last '\n' count).
+//
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
 // changes. The notify/coinbase/share BYTE-PARITY KAT is NOT this file: for
@@ -271,6 +278,24 @@ public:
     }
 
     bool was_closed_by_peer() const { return closed_; }
+
+    // Write raw bytes as-is (no '\n' appended).
+    void send_raw(const std::string& bytes)
+    {
+        boost::system::error_code ec;
+        asio::write(sock_, asio::buffer(bytes), ec);
+    }
+
+    // Read (and discard) lines until the peer closes; false on timeout.
+    bool wait_closed(std::chrono::milliseconds timeout = 5000ms)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            (void)read_line(500ms);
+            if (was_closed_by_peer()) return true;
+        }
+        return false;
+    }
 
     // Drive subscribe (+ optional authorize); records notify job ids in order.
     bool subscribe(int id = 1)
@@ -562,4 +587,98 @@ TEST(StratumInterimHardening, KeepaliveOffLeavesIdleSessionUnfed)
     EXPECT_FALSE(got_more)
         << "idle session got unexpected notifies with keepalive OFF (jobs="
         << c.jobs.size() << ")";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// KAT 5 — Stratum line cap (StratumSession::kMaxStratumLineBytes = 16384).
+// Before the cap the session's streambuf had no max_size: a peer that never
+// sent '\n' grew it until the process ran out of memory. p2pool's stratum
+// (twisted LineOnlyReceiver, MAX_LENGTH = 16384) drops such a peer.
+// ════════════════════════════════════════════════════════════════════════════
+
+// mining.authorize padded through the password (the handler reads params[0]
+// only) to exactly `len` bytes, excluding the '\n'.
+static std::string padded_authorize(int id, size_t len)
+{
+    json j = {{"id", id}, {"method", "mining.authorize"},
+              {"params", json::array({"interimtestworker1", ""})}};
+    const size_t base = j.dump().size();
+    j["params"][1] = std::string(len - base, 'x');
+    return j.dump();
+}
+
+// 5a — 17 KiB without a newline: the session is closed and counted, and the
+// server keeps serving other miners. Without the cap the server keeps reading
+// and the connection stays open (wait_closed times out).
+TEST(StratumInterimHardening, LineCapDropsOverlongLineWithoutNewline)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client bad;
+    ASSERT_TRUE(bad.connect(h.port));
+    bad.send_raw(std::string(17 * 1024, 'a'));
+    EXPECT_TRUE(bad.wait_closed()) << "over-length line must close the session";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_oversized_line_drops(); }), 1u);
+
+    Client good;
+    ASSERT_TRUE(good.connect(h.port));
+    EXPECT_TRUE(good.subscribe()) << "server must keep serving after a drop";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_oversized_line_drops(); }), 1u);
+}
+
+// 5b — boundary: a line of exactly kMaxStratumLineBytes plus '\n' is served;
+// one byte more is dropped (twisted: len(line) > MAX_LENGTH).
+TEST(StratumInterimHardening, LineCapBoundaryExactCapServedOneMoreDropped)
+{
+    constexpr size_t kCap = core::StratumSession::kMaxStratumLineBytes;
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client at_cap;
+    ASSERT_TRUE(at_cap.connect(h.port));
+    ASSERT_TRUE(at_cap.subscribe());
+    const std::string ok_line = padded_authorize(20, kCap);
+    ASSERT_EQ(ok_line.size(), kCap);
+    at_cap.send_raw(ok_line + "\n");
+    auto resp = at_cap.wait_response(20);
+    ASSERT_TRUE(resp.has_value()) << "line of exactly the cap must be served";
+    EXPECT_TRUE((*resp)["result"].is_boolean() && (*resp)["result"].get<bool>())
+        << resp->dump();
+    EXPECT_EQ(h.on_io([&] { return h.server->get_oversized_line_drops(); }), 0u);
+
+    Client over;
+    ASSERT_TRUE(over.connect(h.port));
+    ASSERT_TRUE(over.subscribe());
+    const std::string long_line = padded_authorize(21, kCap + 1);
+    ASSERT_EQ(long_line.size(), kCap + 1);
+    over.send_raw(long_line + "\n");
+    EXPECT_TRUE(over.wait_closed()) << "line of cap+1 bytes must close the session";
+    EXPECT_EQ(h.on_io([&] { return h.server->get_oversized_line_drops(); }), 1u);
+}
+
+// 5c — pipelining: several lines in one write, together well over the cap but
+// each under it, are all answered. The cap applies per line, not per read.
+TEST(StratumInterimHardening, LineCapPipelinedLinesOverCapInTotalAllServed)
+{
+    ServerHarness h;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    std::string burst =
+        json({{"id", 1}, {"method", "mining.subscribe"}, {"params", json::array()}}).dump() + "\n";
+    for (int id = 31; id <= 34; ++id)
+        burst += padded_authorize(id, 12000) + "\n";
+    ASSERT_GT(burst.size(), 2 * core::StratumSession::kMaxStratumLineBytes);
+    c.send_raw(burst);
+
+    EXPECT_TRUE(c.wait_response(1).has_value());
+    for (int id = 31; id <= 34; ++id) {
+        auto resp = c.wait_response(id);
+        ASSERT_TRUE(resp.has_value()) << "pipelined line id=" << id << " not answered";
+        EXPECT_TRUE((*resp)["result"].is_boolean() && (*resp)["result"].get<bool>())
+            << resp->dump();
+    }
+    EXPECT_EQ(h.on_io([&] { return h.server->get_oversized_line_drops(); }), 0u);
 }

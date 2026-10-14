@@ -19,12 +19,14 @@
 //     (tip, v) (WindowAt bound to the receipt's tip and hf) or a payee's key
 //     reference is not held, or the Window is not an evaluated window
 //     (empty_finder_only != no payees); finder-only only on
-//     Window.empty_finder_only; Undefined when side_data_v3 does not
-//     encode, the window weights != W or the receipt's payee identity does not
-//     match its reference; Mismatch / Match from the fold. [C41]
+//     Window.empty_finder_only; IdentityGuard when the receipt's payee
+//     identity does not match its reference; NodeInternal when side_data_v3
+//     does not encode, the window weights != W, the keys are not derivable or
+//     the assembly fails; Mismatch / Match from the fold. [C41]
 //   hf >= 17 (format only): two equal Ko -> Unbuildable (carrot_order_refusal).
 //   admission #13: window_root == window_root(window); mmr_root == the node's MMR
-//     root; BAN on a mismatch.
+//     root; BAN on a mismatch. roots_ok_at reads both from the WindowAt bound
+//     to (tip, v).
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -92,7 +94,7 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
     }
     const std::optional<Hash32> mm_root = mm_root_of(r.side);
     if (!mm_root) {
-        out.stop = CoinbaseCheck::Undefined;  // side_data_v3 does not encode
+        out.stop = CoinbaseCheck::NodeInternal;  // side_data_v3 does not encode
         return out;
     }
     const Window& w = *at.window;
@@ -106,7 +108,7 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
             return out;
         }
         if (key_ref_identity(r.payee) != r.side.payee) {
-            out.stop = CoinbaseCheck::Undefined;
+            out.stop = CoinbaseCheck::IdentityGuard;  // ID-1
             return out;
         }
         ids.push_back(r.side.payee);
@@ -118,7 +120,7 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
         }
         const std::vector<SplitOutput> outs = hf16_outputs(r.reward_total, w);
         if (outs.empty()) {
-            out.stop = CoinbaseCheck::Undefined;  // window weights != W
+            out.stop = CoinbaseCheck::NodeInternal;  // window weights != W
             return out;
         }
         ids.reserve(outs.size());
@@ -141,11 +143,11 @@ inline CanonicalTx canonical_miner_tx(const ReceiptBodyV3& r, const WindowAt& at
         return out;
     }
     if (k.status != KeysStatus::Ok) {
-        out.stop = CoinbaseCheck::Undefined;
+        out.stop = CoinbaseCheck::NodeInternal;  // keys not derivable
         return out;
     }
     out.tx = assemble_miner_tx_hf16(h, *k.keys, amounts, r.extra_nonce, *mm_root);
-    if (!out.tx) out.stop = CoinbaseCheck::Undefined;
+    if (!out.tx) out.stop = CoinbaseCheck::NodeInternal;  // the assembly fails
     return out;
 }
 
@@ -177,6 +179,12 @@ inline bool roots_ok(const SideDataV3& s, const Window& w, const BinMmr& mmr) {
     Work sum;
     const Hash32 wr = window_root(w, &sum);
     return s.window_root == wr && s.mmr_root == mmr.root();
+}
+
+// #13 at the receipt's own tip: the window_root and mmr_root of the WindowAt
+// bound to (tip, v) (window(t, v) and mmr_root_at(t) on t's chain).
+inline bool roots_ok_at(const SideDataV3& s, const WindowAt& at) {
+    return at.window != nullptr && s.window_root == at.window_root && s.mmr_root == at.mmr_root;
 }
 
 }  // namespace c2pool::xmr::pathb

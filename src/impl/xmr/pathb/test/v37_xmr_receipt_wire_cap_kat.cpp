@@ -65,9 +65,11 @@ std::optional<pb::AdmitVerdict> row9(const pb::ReceiptBodyV3& r, std::uint64_t l
     return tally(pb::header_fields_verdict(pb::header_fields(r, len, in)));
 }
 
-// A body whose header passes the header rules at hf with no median.
+// A body whose header passes the header rules at hf with no median (major hf,
+// voting hf).
 pb::ReceiptBodyV3 at_hf(pb::ReceiptBodyV3 r, std::uint8_t hf) {
     r.blob.major = hf;
+    r.blob.minor = hf;
     return r;
 }
 

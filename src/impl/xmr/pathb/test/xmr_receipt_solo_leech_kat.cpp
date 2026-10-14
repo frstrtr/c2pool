@@ -150,13 +150,13 @@ int main() {
         changed_from(owned, [](pb::SideDataV3& s) { s.owner[31] ^= 0x01; }, "owner changed -> BAN before RandomX");
     }
 
-    // ---- side_data_v3 that does not encode: Undefined; a coinbase committing a
-    // zero mm_root -> BAN before RandomX ----
+    // ---- side_data_v3 that does not encode: NodeInternal; a coinbase committing a
+    // zero mm_root -> local alarm + DEFER before RandomX ----
     {
         pb::ReceiptBodyV3 bad = make_body(3, false, 0x20);
         bad.side.owner = seq32(0x21);  // owner identity with fee_rate_bp 0
         check(!pb::mm_root_of(bad.side).has_value(), "owner with fee_rate_bp 0: side_data_v3 does not encode");
-        check(check12(bad, empty) == pb::CoinbaseCheck::Undefined, "side_data_v3 does not encode: Undefined");
+        check(check12(bad, empty) == pb::CoinbaseCheck::NodeInternal, "side_data_v3 does not encode: NodeInternal");
         const std::vector<pb::MinerPayee> one{pb::MinerPayee{bad.payee, bad.reward_total}};
         const std::optional<pb::MinerTx> zero_mm = pb::build_miner_tx_hf16(
                 bad.side.pool_id, bad.side.tip, bad.blob.prev_id, kKatHeight, one, bad.extra_nonce, pb::Hash32{});
@@ -165,8 +165,8 @@ int main() {
                                                 std::span<const pb::Hash32>(bad.branch));
         bool rx_called = false;
         const pb::TailResult t = tail(bad, empty, true, rx_called);
-        check(t.verdict == pb::AdmitVerdict::Ban && !t.randomx_called && !rx_called,
-              "side_data_v3 does not encode -> BAN before RandomX");
+        check(t.verdict == pb::AdmitVerdict::Defer && t.alarm && !t.randomx_called && !rx_called,
+              "side_data_v3 does not encode -> local alarm + DEFER, no token, before RandomX");
     }
 
     // ---- a correct coinbase but a failing PoW is a BAN at #15 (RandomX ran) ----

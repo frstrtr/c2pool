@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "481f6cf6640aaa936f961f7e53c0f69569622162",
+  "commit": "d980565fba55646224c3651a2bc81e65ea1c6416",
   "rules": {
     "C01": {
       "checks": {
@@ -38,13 +38,13 @@
     "C03": {
       "checks": {
         "carriage-window-f": {
-          "status": "fail"
+          "status": "pass"
         },
         "engine-n-ctx-bins": {
           "status": "pass"
         },
         "fresh-max": {
-          "status": "fail"
+          "status": "pass"
         },
         "freshness-kat": {
           "kats": {
@@ -187,7 +187,7 @@
     "C11": {
       "checks": {
         "d-min": {
-          "status": "fail"
+          "status": "pass"
         },
         "no-fixed-share-diff-refusal": {
           "count": 1,
@@ -216,7 +216,7 @@
           "status": "fail"
         },
         "retarget-span": {
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -423,7 +423,7 @@
           "status": "pass"
         },
         "headline-genesis": {
-          "status": "fail"
+          "status": "pass"
         },
         "no-second-clause": {
           "count": 0,
@@ -445,7 +445,7 @@
           "status": "pass"
         }
       },
-      "status": "fail"
+      "status": "pass"
     },
     "C24": {
       "checks": {
@@ -672,14 +672,14 @@
     "C35": {
       "checks": {
         "narrowing-casts-may-not-grow": {
-          "count": 133,
+          "count": 128,
           "per_file": {
             "src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp": 2,
             "src/c2pool/v37/xmr/xmr_coinbase_authority.hpp": 6,
             "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 4,
             "src/c2pool/v37/xmr/xmr_credit_cut.hpp": 2,
             "src/c2pool/v37/xmr/xmr_drops_wiring.hpp": 16,
-            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 11,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 6,
             "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 4,
             "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1,
             "src/c2pool/v37/xmr/xmr_paynow.hpp": 7,
@@ -778,6 +778,7 @@
         },
         "solo-leech-kat": {
           "kats": {
+            "v37_xmr_pathb_admit_kat": true,
             "xmr_receipt_solo_leech_kat": true
           },
           "status": "pass"
@@ -842,6 +843,12 @@
           "per_file": {},
           "status": "pass"
         },
+        "pathb-admit-kat": {
+          "kats": {
+            "v37_xmr_pathb_admit_kat": true
+          },
+          "status": "pass"
+        },
         "pathb-in-force": {
           "status": "fail"
         },
@@ -886,6 +893,12 @@
           },
           "status": "fail"
         },
+        "pathb-bucket-wire-kat": {
+          "kats": {
+            "v37_xmr_pathb_bucket_wire_kat": true
+          },
+          "status": "pass"
+        },
         "pathb-in-force": {
           "status": "fail"
         },
@@ -911,7 +924,7 @@
     "C45": {
       "checks": {
         "buffer-not-below-cap": {
-          "status": "fail"
+          "status": "pass"
         },
         "no-cap-literal": {
           "count": 2,
@@ -983,9 +996,9 @@
         "base-reward-kat": {
           "kats": {
             "v37_xmr_base_reward_kat": true,
-            "v37_xmr_pathb_node_kat": false
+            "v37_xmr_pathb_node_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         },
         "pathb-in-force": {
           "status": "fail"
@@ -1000,9 +1013,9 @@
         },
         "re-pend-kat": {
           "kats": {
-            "v37_xmr_pathb_node_kat": false
+            "v37_xmr_pathb_node_kat": true
           },
-          "status": "fail"
+          "status": "pass"
         }
       },
       "status": "fail"
@@ -1010,16 +1023,12 @@
     "C50": {
       "checks": {
         "no-private-line-cites": {
-          "count": 8,
-          "per_file": {
-            "src/impl/xmr/pathb/pathb_coinbase_split.hpp": 1,
-            "src/impl/xmr/pathb/pathb_miner_tx.hpp": 6,
-            "src/impl/xmr/pathb/pathb_receipt_admission.hpp": 1
-          },
-          "status": "fail"
+          "count": 0,
+          "per_file": {},
+          "status": "pass"
         }
       },
-      "status": "fail"
+      "status": "pass"
     }
   }
 }

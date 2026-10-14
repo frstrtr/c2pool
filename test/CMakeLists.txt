@@ -1870,7 +1870,8 @@ if (BUILD_TESTING AND GTest_FOUND)
 
     # Interim hardening fix KATs: strict per-node miner cap (refused
     # connections + counter), FIFO+TTL job eviction under a 600-notify stale
-    # storm, and the flat-RSS shared-payload pointer-identity scaffold.
+    # storm, the flat-RSS shared-payload pointer-identity scaffold, and the
+    # inbound line cap (StratumSession::kMaxStratumLineBytes).
     # Loopback-only (synthetic IWorkSource, ephemeral test port) — no daemon /
     # RPC / sharechain. DASH byte-parity note: the notify/coinbase/share BYTE
     # checks live in the dash lane against the frstrtr/p2pool-dash oracle
