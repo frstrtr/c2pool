@@ -18,9 +18,12 @@
 //       RandomX call starts after stop() returns.
 //   N7  seed not held: a carrier whose seed C does not hold is parked once (a
 //       seed DEFER) and admitted when the follower's main chain moves.
-//   N8  RandomX throws once at C on A's carrier (a node-internal failure):
-//       a local alarm, no strike, no ban; the frame parked and run again:
-//       placed.
+//   N8  RandomX throws three times at C on A's carrier (a node-internal
+//       failure): every failure counted, one alarm line when it starts and
+//       one when a hash is computed again; no strike, no ban; the frame
+//       parked and run again: placed.
+//   N9  RandomX throws once at C on a receipt body A floods: no strike, no
+//       ban; the receipt parked and run again: held at C.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -195,13 +198,13 @@ static bool n7(std::string& note) {
     return parked && placed && Cn->st().parked_reruns.load() >= 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0;
 }
 
-// N8: C's RandomX throws once: the carrier parked and run again; no token.
+// N8: C's RandomX throws three times: the carrier parked and run again; no token; two alarm lines.
 static bool n8(std::string& note) {
     Rig rig;
     auto A = rig.make("A", opts(true, {}, 1, 4096), true);
     if (!A->start()) return false;
     auto Cn = rig.make("C", opts(false, {A->port()}, 1, 4096), false);
-    auto throws = std::make_shared<std::atomic<int>>(1);
+    auto throws = std::make_shared<std::atomic<int>>(3);
     Cn->rx = [throws](const pb::HashingBlob&, std::uint64_t, const pb::Hash32&) -> bool {
         if (throws->fetch_sub(1) > 0) throw std::runtime_error("randomx: dataset");
         return true;
@@ -212,10 +215,42 @@ static bool n8(std::string& note) {
     if (rig.mine(*A, 0, 0x7100).action != pb::NodeAction::Placed) return false;
     const pb::Hash32 c = A->best();
     const bool placed = wait_until([&] { return Cn->best() == c; }, 10000ms);
+    const bool again = wait_until([&] { return Cn->count_logs("RandomX hashes again") == 1; }, 3000ms);
+    const std::size_t lines = Cn->count_logs("RandomX");
+    note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", alarm lines " + std::to_string(lines) +
+           ", strikes " + std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load());
+    return placed && again && Cn->st().rx_failures.load() == 3 && lines == 2 &&
+           Cn->count_logs("RandomX failing") == 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0 &&
+           Cn->r().ready_peers().size() == 1;
+}
+
+// N9: C's RandomX throws once on a receipt body: the receipt parked and run again; no token.
+static bool n9(std::string& note) {
+    Rig rig;
+    auto A = rig.make("A", opts(true, {}, 1, 4096), true);
+    if (!A->start()) return false;
+    auto Cn = rig.make("C", opts(false, {A->port()}, 1, 4096), false);
+    auto throws = std::make_shared<std::atomic<int>>(0);
+    Cn->rx = [throws](const pb::HashingBlob&, std::uint64_t, const pb::Hash32&) -> bool {
+        if (throws->load() > 0 && throws->fetch_sub(1) > 0) throw std::runtime_error("randomx: dataset");
+        return true;
+    };
+    if (!Cn->start()) return false;
+    if (!wait_until([&] { return A->r().ready_peers().size() == 1 && Cn->r().ready_peers().size() == 1; }, 5000ms)) return false;
+    rig.tick_monero();
+    const std::optional<pb::PathbJob> j = rig.job(*A, 1, 0x91);
+    if (!j || rig.mine(*A, 0, 0x7200).action != pb::NodeAction::Placed) return false;
+    if (!wait_until([&] { return Cn->best() == A->best(); }, 5000ms)) return false;
+    throws->store(1);
+    const pb::NodeEventResult r = rig.share(*A, *j, 0x7300);
+    if (r.action != pb::NodeAction::Pending) return false;
+    const pb::Hash32 id = r.admit.id;
+    const auto held = [&] { return Cn->r().with_node([&](pb::PathbNode& n) { return n.pending().holds(id); }); };
+    const bool ok = wait_until(held, 10000ms);
     note = "rx failures " + std::to_string(Cn->st().rx_failures.load()) + ", strikes " +
            std::to_string(Cn->st().strikes.load()) + ", bans " + std::to_string(Cn->st().bans.load());
-    return placed && Cn->st().rx_failures.load() >= 1 && Cn->st().strikes.load() == 0 && Cn->st().bans.load() == 0 &&
-           Cn->r().ready_peers().size() == 1;
+    return ok && throws->load() <= 0 && Cn->st().rx_failures.load() == 1 && Cn->st().strikes.load() == 0 &&
+           Cn->st().bans.load() == 0;
 }
 
 int main() {
@@ -259,6 +294,10 @@ int main() {
     // N8: a RandomX exception is node-internal
     std::string n8note;
     const bool n8ok = n8(n8note);
-    C(n8ok, "N8 RandomX throws once at C: no strike, no ban, the link kept; the carrier parked and placed (" + n8note + ")");
+    C(n8ok, "N8 RandomX throws three times at C: 3 failures, 2 alarm lines; no strike, no ban, the link kept; the carrier "
+            "parked and placed (" + n8note + ")");
+    std::string n9note;
+    const bool n9ok = n9(n9note);
+    C(n9ok, "N9 RandomX throws once at C on a receipt body: no strike, no ban; the receipt parked and held (" + n9note + ")");
     return C.done("v37_xmr_verify_pool_kat");
 }

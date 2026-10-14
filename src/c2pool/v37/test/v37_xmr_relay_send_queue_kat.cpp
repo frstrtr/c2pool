@@ -27,6 +27,10 @@
 //       16,777,216 / 17,418,240, the default bound against P-09 x P-10) a
 //       peer that reads nothing for 3 s, then drains: the link kept, every
 //       frame sent, 0 queue-full drops.
+//   S5  at the bound / 8, such a peer asks FC_GETHEADERS at 1 s and A mines a
+//       carrier while the re-offer is paged (within the bound less one
+//       FC_HEADERS frame): the link kept, 0 queue-full drops; the peer reads
+//       every re-offer frame, the carrier and the FC_HEADERS reply.
 // ===========================================================================
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -34,6 +38,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -95,7 +100,9 @@ struct SmallArrivals {
 // A raw peer that sends `hello` ([u32 LE length][frame]) and then reads at most 16 KiB every 100 ms (nothing when
 // `slow_read` is false) for `slow_ms`, then whatever has arrived every 100 ms, until `ms`; false: the connection was
 // closed by the other side within `ms`.
-static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms, int slow_ms = -1, bool slow_read = true) {
+// `ask`: a frame sent at 1 s; `ops`: the complete frames read, by opcode.
+static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms, int slow_ms = -1, bool slow_read = true,
+                      const std::vector<u8>* ask = nullptr, std::map<u8, std::uint64_t>* ops = nullptr) {
     if (slow_ms < 0) slow_ms = ms;
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return false;
@@ -118,9 +125,16 @@ static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms, 
         return false;
     }
     bool open = true;
-    std::vector<u8> buf(16384);
+    std::vector<u8> buf(16384), acc;
+    std::size_t at = 0;
     for (int t = 0; t < ms && open; t += 100) {
         std::this_thread::sleep_for(100ms);
+        if (ask != nullptr && t == 1000) {
+            std::vector<u8> q(4);
+            for (int i = 0; i < 4; ++i) q[i] = static_cast<u8>(ask->size() >> (8 * i));
+            q.insert(q.end(), ask->begin(), ask->end());
+            if (::send(fd, q.data(), q.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(q.size())) open = false;
+        }
         const bool slow = t < slow_ms;
         if (slow && !slow_read) continue;
         for (;;) {
@@ -128,7 +142,24 @@ static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms, 
             if (::poll(&p, 1, slow ? 0 : 5) <= 0) break;
             const ssize_t r = ::recv(fd, buf.data(), buf.size(), MSG_DONTWAIT);
             if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) open = false;
-            if (r <= 0 || slow) break;
+            if (r <= 0) break;
+            if (ops != nullptr) {
+                acc.insert(acc.end(), buf.begin(), buf.begin() + r);
+                for (;;) {
+                    if (acc.size() - at < 4) break;
+                    const std::uint32_t len = static_cast<std::uint32_t>(acc[at]) | (static_cast<std::uint32_t>(acc[at + 1]) << 8) |
+                                              (static_cast<std::uint32_t>(acc[at + 2]) << 16) |
+                                              (static_cast<std::uint32_t>(acc[at + 3]) << 24);
+                    if (acc.size() - at < 4 + static_cast<std::size_t>(len)) break;
+                    if (len > 0) ++(*ops)[acc[at + 4]];
+                    at += 4 + len;
+                }
+                if (at > (1u << 20)) {
+                    acc.erase(acc.begin(), acc.begin() + static_cast<std::ptrdiff_t>(at));
+                    at = 0;
+                }
+            }
+            if (slow) break;
         }
     }
     ::close(fd);
@@ -248,8 +279,10 @@ int main() {
         // below the re-offer's bytes: a frame queued only within the bound
         const std::size_t worst = static_cast<std::size_t>(static_cast<double>(reoffer) * 16777216.0 / 17418240.0);
         const std::uint64_t per = pb::fc_ids_max(pb::kRuledLaneParams);
+        const std::size_t hf = static_cast<std::size_t>(A->node->frame_bytes_headers());
+        const std::size_t eighth = std::max(reoffer / 8, 2 * hf);
         int k = 0;
-        for (const std::size_t bound : {reoffer / 8, worst}) {
+        for (const std::size_t bound : {eighth, worst}) {
             na.set_send_queue(bound);
             const std::uint64_t pend = A->r().with_node([](pb::PathbNode& n) { return n.pending().size(); });
             const std::uint64_t want = (pend + per - 1) / per;
@@ -269,6 +302,38 @@ int main() {
                       std::to_string(paused) + (k == 0 ? ", paged" : "") + ")");
             (void)wait_until([&] { return A->r().ready_peers().size() == 1; }, 3000ms);
             ++k;
+        }
+        // S5: paging, live traffic and a serve reply on one slow link: the re-offer leaves one FC_HEADERS frame free
+        {
+            na.set_send_queue(eighth);
+            const std::uint64_t pend = A->r().with_node([](pb::PathbNode& n) { return n.pending().size(); });
+            const std::uint64_t want = (pend + per - 1) / per;
+            const std::uint64_t f0 = na.peers_dropped_queue_full(), r0 = A->st().reoffer_frames.load();
+            const std::uint64_t z0 = A->st().reoffer_paused.load();
+            const std::vector<u8> ask = pb::encode_fc_getheaders(pb::GetHeaders{0, pb::Hash32{}, pb::Hash32{}, 64});
+            std::map<u8, std::uint64_t> ops;
+            bool held = false;
+            std::thread peer([&] {
+                held = slow_peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5353ull, 0), 10000, 3000, false, &ask,
+                                 &ops);
+            });
+            std::this_thread::sleep_for(1500ms);  // the re-offer paused at the bound, the serve reply queued
+            rig.tick_monero();
+            const pb::NodeEventResult live = rig.mine(*A, 5, 0x55000000u);
+            peer.join();
+            const std::uint64_t f1 = na.peers_dropped_queue_full(), sent = A->st().reoffer_frames.load() - r0;
+            const std::uint64_t paused = A->st().reoffer_paused.load() - z0;
+            std::printf("    S5 METRIC bound=%zu headers frame=%zu sent=%llu of %llu paused=%llu full_drops=%llu kept=%d | "
+                        "read: FB_RECEIPTS %llu FC_CARRIER %llu FC_HEADERS %llu\n",
+                        eighth, hf, (unsigned long long)sent, (unsigned long long)want, (unsigned long long)paused,
+                        (unsigned long long)(f1 - f0), held ? 1 : 0, (unsigned long long)ops[pb::kOpFbReceipts],
+                        (unsigned long long)ops[pb::kOpFcCarrier], (unsigned long long)ops[pb::kOpFcHeaders]);
+            C(live.action == pb::NodeAction::Placed && held && f1 == f0 && sent >= want && paused > 0 &&
+                      ops[pb::kOpFbReceipts] >= want && ops[pb::kOpFcCarrier] >= 1 && ops[pb::kOpFcHeaders] >= 1,
+              "S5 a paced slow peer (the re-offer paged within the bound less one FC_HEADERS frame) gets a live carrier and "
+              "a serve reply while paged: the link kept, 0 queue-full drops, every re-offer frame, the carrier and the "
+              "FC_HEADERS reply read");
+            (void)wait_until([&] { return A->r().ready_peers().size() == 1; }, 3000ms);
         }
         na.set_send_queue(pb::PathbRelayOptions{}.send_queue_bytes);
     }
