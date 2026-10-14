@@ -131,8 +131,9 @@
 //   relayp15once P-15 counts a frame once, at its first placement: a
 //                carrier placed in its parent's drain, one that waited for its
 //                DoS token, one placed on its re-run (a duplicate: none);
-//   relayrxbind2 a bind placed a walked carrier, then failed on RandomX: the
-//                placed one kept; the re-run places the rest.
+//   relayrxbind2 a walk placed a walked carrier, then the bind of the next
+//                failed on RandomX: the placed one kept; the re-run places
+//                the rest.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -3807,8 +3808,9 @@ void relayp15once() {
 
 
 // ---------------------------------------------------------------------------
-// relayrxbind2: a bind that placed a walked carrier before its RandomX failure (the next walked carrier's body only it
-// carries): the placed id stays placed and counted (walk_placed), the failure counted; the re-run places the rest.
+// relayrxbind2: a walk that placed a walked carrier (it carries nothing), then whose bind of the next failed on RandomX
+// (a body only that one carries): the placed id stays placed and counted (walk_placed), the failure counted; the
+// parked frame's re-run places the rest.
 void relayrxbind2() {
     const KatNet net;
     Harness h(net);
@@ -3897,8 +3899,8 @@ void relayrxbind2() {
                 (unsigned long long)placed_at_fail, sa1_at_fail, h[x.node].tree().best().id == c);
     check(h.throw_pow.count(u) == 0 && esc.empty() && st.rx_failures.load() >= 1 && placed_at_fail >= 1 && sa1_at_fail
                   && h[x.node].tree().best().id == c && st.strikes.load() == 0 && st.bans.load() == 0,
-          "relayrxbind2: a bind placed a walked carrier, then failed on RandomX: the placed one kept and counted, the "
-          "failure counted; the re-run places the rest and the tip");
+          "relayrxbind2: a walk placed a walked carrier, then the bind of the next failed on RandomX: the placed one kept "
+          "and counted, the failure counted; the re-run places the rest and the tip");
 }
 
 }  // namespace
