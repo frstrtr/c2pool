@@ -412,7 +412,8 @@ bool MiningInterface::check_merged_mining(const std::string& block_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2,
                                           const JobSnapshot* job,
-                                          const std::string& miner)
+                                          const std::string& miner,
+                                          const uint256& share_hash)
 {
     if (!m_mm_manager) return false;
 
@@ -443,6 +444,7 @@ bool MiningInterface::check_merged_mining(const std::string& block_hex,
     ctx.parent_hash = Hash(hdr_bytes).GetHex();
     if (job) ctx.parent_prev_hash = job->gbt_prevhash;
     ctx.miner = miner;
+    if (!share_hash.IsNull()) ctx.share_hash = share_hash.GetHex();
     MergedSubmitScope submit_scope(std::move(ctx));
 
     auto before = m_mm_manager->get_discovered_blocks().size();
@@ -4081,10 +4083,11 @@ void MiningInterface::record_merged_found_block(const std::string& symbol, int h
     uint256 h;
     h.SetHex(block_hash);
     const std::string miner = (ctx && !ctx->miner.empty()) ? ctx->miner : get_payout_address();
-    // share stays "" (JSON null): the aux solve is not tied to a sharechain
-    // share here. Network difficulty is still the parent's (#1738).
+    // share = the one this submit minted; "" (JSON null) when the solve
+    // missed the share target. Network difficulty is still the parent's (#1738).
+    const std::string share = ctx ? ctx->share_hash : std::string();
     record_found_block(static_cast<uint64_t>(height), h, 0, symbol,
-                       miner, "", get_network_difficulty(), 0, get_local_hashrate(),
+                       miner, share, get_network_difficulty(), 0, get_local_hashrate(),
                        coinbase_value, BlockAuthorship::this_node);
     if (ctx) {
         std::optional<uint64_t> parent_height = ctx->parent_height;
@@ -9806,6 +9809,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         // probabilistically replaced with the node operator's address for the
         // primary chain node fee).  Merged addresses are passed through
         // unmodified — Python p2pool does NOT apply node fee to merged chains.
+        uint256 created_share;  // #946: named on an own-find DOGE row
         if (m_create_share_fn) {
             ShareCreationParams params;
             // Miner display name: PRIMARY_ADDR.WORKER (strip merged addrs, keep worker)
@@ -10019,7 +10023,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 // (m_share_max_bits is 0 when compute_share_target returns {0,0})
             }
             if (!params.payout_script.empty() && params.bits != 0) {
-                m_create_share_fn(params);
+                created_share = m_create_share_fn(params);
             }
         }
         
@@ -10029,7 +10033,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
                 bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
-                                                        primary_addr);
+                                                        primary_addr, created_share);
 
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
                 if (block_bytes.size() == 80) {

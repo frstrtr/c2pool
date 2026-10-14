@@ -1561,7 +1561,39 @@ TEST(FoundBlockExplorer, MergedFindInsideSubmitScopeCarriesParentMinerAndSubsidy
     EXPECT_EQ(d["subsidy"].get<uint64_t>(), 1000000000000ULL);
     EXPECT_EQ(d["parent_hash"].get<std::string>(), parent);
     EXPECT_EQ(d["parent_height"].get<uint64_t>(), 3000010u);
-    EXPECT_TRUE(d["share"].is_null()) << "no sharechain share is tied to the aux solve here";
+    EXPECT_TRUE(d["share"].is_null()) << "no share minted on this submit";
+}
+
+TEST(FoundBlockExplorer, MergedFindNamesTheShareItsSubmitMinted)
+{
+    // The stratum submit passes the share create_share_fn just minted into
+    // check_merged_mining; the DOGE row's "share" names it. A solve that
+    // missed the share target leaves share_hash empty -> JSON null.
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f005";
+    const std::string share =
+        "946946946946946946946946946946946946946946946946946946946946f0c1";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.share_hash = share;
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400014, h, /*accepted=*/false, 0);
+    }
+    auto d = mi.rest_found_block(h);
+    ASSERT_TRUE(d.is_object());
+    EXPECT_EQ(d["share"].get<std::string>(), share);
+
+    const std::string h_miss =
+        "946946946946946946946946946946946946946946946946946946946946f006";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.miner = "ltc1qstratumminer";
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400015, h_miss, false, 0);
+    }
+    EXPECT_TRUE(mi.rest_found_block(h_miss)["share"].is_null());
 }
 
 TEST(FoundBlockExplorer, MergedFindOutsideScopeLeavesParentNull)

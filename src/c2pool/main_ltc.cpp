@@ -5102,7 +5102,7 @@ int main(int argc, char* argv[]) {
             // Wire the share creation hook so mining_submit() creates a real
             // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(
-                [&p2p_node, dev_donation, &share_creation_ready](const core::MiningInterface::ShareCreationParams& p) {
+                [&p2p_node, dev_donation, &share_creation_ready](const core::MiningInterface::ShareCreationParams& p) -> uint256 {
                 // Counters for periodic status reporting
                 static std::atomic<uint64_t> s_call_count{0};
                 static std::atomic<uint64_t> s_guard_blocked{0};
@@ -5148,7 +5148,7 @@ int main(int argc, char* argv[]) {
                             LOG_WARNING << "[Pool] create_share dropped: tracker busy"
                                         << " (compute thread holds exclusive lock — miner will retry)";
                         }
-                        return;
+                        return uint256();
                     }
                     if (p.prev_share_hash.IsNull()) {
                         auto chain_sz = p2p_node->tracker().chain.size();
@@ -5161,7 +5161,7 @@ int main(int argc, char* argv[]) {
                                 s_last_wait.store(now);
                                 LOG_WARNING << "[Pool] WAIT mode: blocking genesis (waiting for peers)";
                             }
-                            return;
+                            return uint256();
                         }
                         // Chain has shares but prev is null → sync issue (best not computed yet)
                         if (chain_sz > 0) {
@@ -5174,7 +5174,7 @@ int main(int argc, char* argv[]) {
                                             << " (chain=" << chain_sz
                                             << " verified=" << p2p_node->tracker().verified.size() << ")";
                             }
-                            return;
+                            return uint256();
                         }
                     }
 
@@ -5262,7 +5262,7 @@ int main(int argc, char* argv[]) {
                     // Only broadcast if self-validation passed (non-null hash)
                     if (share_hash.IsNull()) {
                         ++s_pow_failed;
-                        return;  // share failed PoW or validation; don't broadcast
+                        return uint256();  // share failed PoW or validation; don't broadcast
                     }
                     ++s_created;
 
@@ -5318,9 +5318,11 @@ int main(int argc, char* argv[]) {
                              << " " << share_hash.GetHex().substr(0, 8)
                              << " prev " << prev_share.GetHex().substr(0, 8)
                              << (age_str.empty() ? "" : " age " + age_str);
+                    return share_hash;
                 } catch (const std::exception& e) {
                     LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();
                 }
+                return uint256();
             });
 
           } else if (custodial_mode) {

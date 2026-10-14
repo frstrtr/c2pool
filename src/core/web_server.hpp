@@ -501,7 +501,9 @@ public:
         int64_t  share_version{36};
         uint64_t desired_version{36};
     };
-    using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
+    /// Returns the hash of the share it minted, or a null hash when none was
+    /// (#946: an own-find DOGE row names the share its submit produced).
+    using create_share_fn_t = std::function<uint256(const ShareCreationParams& params)>;
     void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
 
     // Operator-controlled V36 message blob to embed into locally created shares.
@@ -1207,6 +1209,9 @@ public:
         // the height is read from the live template only if it still builds
         // on this prev (rare path: runs only for a found aux block).
         std::string             parent_prev_hash;
+        // The share this submit minted; empty when it missed the share
+        // target, so the row's "share" stays null.
+        std::string             share_hash;
     };
     class MergedSubmitScope {
     public:
@@ -1347,7 +1352,8 @@ private:
                              const std::string& extranonce1,
                              const std::string& extranonce2,
                              const JobSnapshot* job = nullptr,
-                             const std::string& miner = "");
+                             const std::string& miner = "",
+                             const uint256& share_hash = uint256());
     
     // Internal state
     uint64_t m_work_id_counter;
