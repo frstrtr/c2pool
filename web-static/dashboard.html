@@ -2013,6 +2013,7 @@
                                 <th title="Estimated time to find a valid P2Pool share">Time to Share</th>
                                 <th title="Last pseudoshare received">Last Seen</th>
                                 <th title="Dead on Arrival rate">DOA Rate</th>
+                                <th title="Dead-on-arrival hashrate (absolute): work that reached the node too late to count">DOA Hashrate</th>
                                 <th title="Predicted payout if block found now">Predicted Payout</th>
                                 <th class="merged-child-hint" title="Predicted merged mining payout if block found now">Merged Payout</th>
                             </tr>
@@ -2701,7 +2702,7 @@
                 
                 if (display.length === 0) {
                     d3.select('#active_miners tbody').append('tr').append('td')
-                        .attr('colspan', '8')
+                        .attr('colspan', '9')
                         .attr('style', 'text-align: center; color: #888;')
                         .text(showHistorical ? 'No miners found' : 'No miners currently connected via stratum');
                     return;
@@ -2850,6 +2851,7 @@
                     
                     // DOA Rate
                     minerRow.append('td').text(d3.format('.2%')(miner.doa_percent));
+                    minerRow.append('td').text(format_hashrate(miner.totalDoa));
                     
                     // Payout with symbol
                     var payout = payouts[miner.address] || 0;
@@ -2922,6 +2924,7 @@
                         
                         var doaPercent = worker.hashrate > 0 ? worker.doa_hashrate / worker.hashrate : 0;
                         workerRow.append('td').text(d3.format('.2%')(doaPercent));
+                        workerRow.append('td').text(format_hashrate(worker.doa_hashrate));
                         workerRow.append('td').text('-');
                         // Merged-payout filler cell — hidden with its column on
                         // standalone parents (body.no-merged-child).
