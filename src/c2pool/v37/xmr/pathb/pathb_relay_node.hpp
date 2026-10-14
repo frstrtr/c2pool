@@ -1558,8 +1558,8 @@ private:
             case NodeAction::JoinerPath: fx.join = true; break;
             case NodeAction::Placed:
             case NodeAction::Switched:
-                if (r.action == NodeAction::Switched && node_->joined() != nullptr) {
-                    reask_due_ = true;  // a joined node: the claimed leaves asked again at the new chain (attempt_join)
+                if (r.action == NodeAction::Switched && node_->reask_pending()) {
+                    reask_due_ = true;  // a joined store (its session or a restart): the claimed leaves asked again
                     fx.join = true;
                 }
                 if (bucket_stalled_) {  // every peer was closed for the named carrier: a later carrier of the chain

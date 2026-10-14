@@ -690,7 +690,8 @@ enum class StoreFault : std::uint8_t {
     Phase2,     // a replayed position differs from its record
     Scan,       // the KV scan failed
     Poisoned,   // the store's poison mark: a write failed before the last stop
-    Work,       // a K_BWORK / K_BCLAIM record torn or not under its key; a K_BLO torn, out of range, or absent (joined)
+    Work,       // a K_BWORK / K_BCLAIM record torn, not under its key or (K_BCLAIM) out of range; a K_BLO torn, out of
+                // range, or absent (joined)
 };
 
 struct LoadInputs {
@@ -932,8 +933,12 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         rs.sealed.push_back(std::move(sb));
     }
     rs.placements = std::move(placements);
-    if (joined) {  // the join's adopt bound and its served buckets above the root (sealed from them, as in the join)
-        rs.adopt_bound = rec_at(H.root_pos).H + p.fresh_max;
+    // the join's adopt bound H(x0 - 1) + Fresh (base_leaf_count = lc(H(x0 - 1)) > 0, pruned or not) and its served
+    // buckets above the replay's root (sealed from them, as in the join)
+    std::optional<std::uint64_t> adopt_bound;
+    if (joined) adopt_bound = H.base_leaf_count + H.h0 + p.open_bins - 1 + p.fresh_max;
+    if (joined) {
+        rs.adopt_bound = adopt_bound;
         for (std::uint64_t i = lc_root; i < ll.bodies.size(); ++i)
             if (ll.bodies[i] && H.h0 + i <= *rs.adopt_bound) rs.served.push_back(*ll.bodies[i]);
     }
@@ -1076,6 +1081,10 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         for (const auto& [k, v] : bc) {
             const std::optional<BclaimRecord> c = decode_bclaim(v);
             if (!c || k != store_keys::bclaim(in.chain, c->bin)) return fail(StoreFault::Work);
+            // a sealed leaf at the tip; in a joined store below its MMR's first leaf or at or below the adopt bound
+            const std::uint64_t lc_tip = bin_leaf_count(rec_at(tip).H, H.h0, p.open_bins);
+            if (c->bin < H.h0 || c->bin - H.h0 >= lc_tip) return fail(StoreFault::Work);
+            if (joined && c->bin - H.h0 >= H.base_leaf_count && c->bin > *adopt_bound) return fail(StoreFault::Work);
             st.claimed[c->bin] = *c;
         }
     }
