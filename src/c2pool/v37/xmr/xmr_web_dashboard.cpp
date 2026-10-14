@@ -73,8 +73,8 @@ struct XmrWebDashboard::Impl {
         return m;
     }
 
-    nlohmann::json block_value() const {   // the newest block whose full coinbase is known; null if none
-        for (const auto& b : st.blocks) if (b.coinbase_known) return to_xmr(b.coinbase_total_pico);
+    nlohmann::json block_value() const {   // the newest found block's R; null if none
+        if (!st.found.empty()) return to_xmr(st.found.front().reward_pico);
         return nullptr;
     }
     std::optional<nlohmann::json> answer(const std::string& path) const;
@@ -82,7 +82,8 @@ struct XmrWebDashboard::Impl {
     nlohmann::json global_stats(double now) const;
     nlohmann::json recent_blocks() const;
     nlohmann::json v37_status(double now) const;
-    nlohmann::json payouts_detail() const;
+    nlohmann::json pathb_status() const;
+    nlohmann::json pathb_view() const;
 };
 
 XmrWebDashboard::XmrWebDashboard(std::string host, std::uint16_t port, std::string dashboard_dir,
@@ -165,16 +166,7 @@ std::optional<nlohmann::json> XmrWebDashboard::Impl::answer(const std::string& p
     if (path == "/global_stats")   return global_stats(now);
     if (path == "/recent_blocks")  return recent_blocks();
     if (path == "/v37_status")     return v37_status(now);
-    if (path == "/xmr/payouts")    return payouts_detail();
-    if (path == "/current_payouts" || path == "/current_merged_payouts") {
-        nlohmann::json j = nlohmann::json::object();
-        for (const auto& p : st.owed) {
-            if (p.owed_pico <= 0) continue;
-            if (path == "/current_payouts") j[p.address] = to_xmr(p.owed_pico);
-            else j[p.address] = {{"amount", to_xmr(p.owed_pico)}, {"merged", nlohmann::json::array()}};
-        }
-        return j;
-    }
+    if (path == "/xmr/pathb")      return pathb_view();
     if (path == "/local_rate")     return local_rate(now);
     if (path == "/global_rate")    return local_rate(now) + foreign_rate();
     if (path == "/uptime")         return uptime;
@@ -195,7 +187,7 @@ std::optional<nlohmann::json> XmrWebDashboard::Impl::answer(const std::string& p
     if (path == "/node_info")
         return nlohmann::json{{"symbol", "XMR"}, {"network", st.network}, {"version", st.version},
                               {"worker_port", st.stratum_port}, {"external_ip", st.stratum_host},
-                              {"payout_scheme", kPayoutScheme}, {"blocks", st.blocks.size()},
+                              {"payout_scheme", kPayoutScheme}, {"blocks", st.found.size()},
                               {"luck_available", false}};
     return std::nullopt;
 }
@@ -228,7 +220,7 @@ nlohmann::json XmrWebDashboard::Impl::global_stats(double now) const {
     const double pool = local_rate(now) + foreign_rate();
     std::set<std::string> miners; for (const auto& s : shares) miners.insert(s.address);
     nlohmann::json last_block = nullptr, last_ts = nullptr;
-    if (!st.blocks.empty()) { last_block = st.blocks.front().height; last_ts = st.blocks.front().time; }
+    if (!st.found.empty()) { last_block = st.found.front().height; last_ts = st.found.front().time; }
     return nlohmann::json{
         {"symbol", "XMR"}, {"payout_scheme", kPayoutScheme},
         {"pool_hash_rate", pool}, {"pool_nonstale_hash_rate", pool}, {"pool_stale_prop", 0.0},
@@ -236,61 +228,58 @@ nlohmann::json XmrWebDashboard::Impl::global_stats(double now) const {
         {"network_block_difficulty", st.network_difficulty},
         {"current_height", st.chain_height}, {"chain_height", st.chain_height},
         {"unique_miners", miners.size()}, {"unique_miners_scope", "local_stratum"},
-        {"local_workers", st.stratum_active}, {"found_blocks", st.found_registered},
+        {"local_workers", st.stratum_active}, {"found_blocks", st.found.size()},
         {"last_block", last_block}, {"last_block_ts", last_ts},
         {"uptime_seconds", std::max(0.0, now - start_s)}};
 }
 
 nlohmann::json XmrWebDashboard::Impl::recent_blocks() const {
     nlohmann::json a = nlohmann::json::array();
-    for (const auto& b : st.blocks) {
-        nlohmann::json pay = nlohmann::json::array();
-        for (const auto& [addr, v] : b.payouts)
-            pay.push_back({{"address", addr}, {"pico", v}, {"xmr", to_xmr(v)}});
+    for (const auto& b : st.found)
         a.push_back({{"ts", b.time}, {"hash", b.id_hex}, {"number", b.height}, {"height", b.height},
-                     {"status", b.status}, {"main_chain", b.status == "main"},
-                     {"orphan", b.status == "orphan"}, {"found_by", b.own ? "local" : "pool"},
-                     {"coinbase_total_pico", b.coinbase_known ? nlohmann::json(b.coinbase_total_pico) : nlohmann::json(nullptr)},
-                     {"coinbase_total", b.coinbase_known ? nlohmann::json(to_xmr(b.coinbase_total_pico)) : nlohmann::json(nullptr)},
-                     {"booked_payout_pico", b.booked_pico}, {"payouts", pay}});
-    }
+                     {"found_by", "local"}, {"landed", b.landed}, {"tip", b.tip_hex},
+                     {"window_root", b.window_root_hex}, {"n_outputs", b.n_outputs},
+                     {"reward_pico", b.reward_pico}, {"reward", to_xmr(b.reward_pico)}});
     return a;
 }
 
-nlohmann::json XmrWebDashboard::Impl::payouts_detail() const {
-    nlohmann::json owed = nlohmann::json::array();
-    long double total = 0;
-    for (const auto& p : st.owed) {
-        owed.push_back({{"address", p.address}, {"owed_pico", p.owed_pico}, {"owed_xmr", to_xmr(p.owed_pico)}});
-        total += p.owed_pico;
-    }
-    nlohmann::json last = nullptr;
-    if (!st.blocks.empty()) {
-        const auto& b = st.blocks.front();
-        nlohmann::json pay = nlohmann::json::array();
-        for (const auto& [addr, v] : b.payouts) pay.push_back({{"address", addr}, {"pico", v}, {"xmr", to_xmr(v)}});
-        last = {{"height", b.height}, {"hash", b.id_hex}, {"status", b.status},
-                {"coinbase_total_pico", b.coinbase_known ? nlohmann::json(b.coinbase_total_pico) : nlohmann::json(nullptr)},
-                {"booked_payout_pico", b.booked_pico}, {"payouts", pay}};
-    }
-    return nlohmann::json{{"payout_scheme", kPayoutScheme}, {"basis", "EffectiveOwed"},
-                          {"owed", owed}, {"owed_payees", st.owed.size()},
-                          {"owed_total_pico", static_cast<long long>(total)}, {"owed_total_xmr", to_xmr(total)},
-                          {"last_block", last}};
+nlohmann::json XmrWebDashboard::Impl::pathb_status() const {
+    const XmrWebPathb& p = st.pathb;
+    return nlohmann::json{
+        {"best_tip", {{"pos", p.tip_pos}, {"id", p.tip_id_hex}, {"cum_work", p.cum_work}}},
+        {"epoch_cur", p.epoch_cur}, {"h_hold", p.h_hold},
+        {"window_root", p.window_root_hex}, {"mmr_root", p.mmr_root_hex}, {"leaf_count", p.leaf_count},
+        {"pending", p.pending}, {"deferred", p.deferred}, {"repended_last_switch", p.repended_last_switch},
+        {"template", p.template_status},
+        {"alarms", {{"hold", p.hold}, {"fork_fuse", p.fork_fuse}, {"template_kept", p.template_kept},
+                    {"store_poisoned", p.store_poisoned}, {"coinbase_internal", p.coinbase_internal}}}};
+}
+
+nlohmann::json XmrWebDashboard::Impl::pathb_view() const {
+    nlohmann::json w = nlohmann::json::array();
+    for (const auto& e : st.window)
+        w.push_back({{"payee", e.payee}, {"share", e.share}, {"amount_pico", e.amount_pico},
+                     {"amount", to_xmr(e.amount_pico)}});
+    return nlohmann::json{{"payout_scheme", kPayoutScheme}, {"pathb", pathb_status()},
+                          {"window", w}, {"found", recent_blocks()}};
 }
 
 nlohmann::json XmrWebDashboard::Impl::v37_status(double now) const {
+    std::uint64_t peer = 0, own = 0, monerod = 0;
+    for (const auto& b : st.found) {
+        if (b.landed == "peer") ++peer;
+        else if (b.landed == "own-index") ++own;
+        else ++monerod;
+    }
     return nlohmann::json{
         {"symbol", "XMR"}, {"version", st.version}, {"network", st.network},
         {"payout_scheme", kPayoutScheme}, {"payout_scheme_long", kPayoutSchemeLong},
-        {"coinbase", st.coinbase_mode}, {"uptime", std::max(0.0, now - start_s)},
+        {"uptime", std::max(0.0, now - start_s)},
         {"chain", {{"height", st.chain_height}, {"difficulty", st.network_difficulty},
                    {"template_height", st.template_height}}},
-        {"lane", {{"d_conf", st.d_conf}, {"finalize_cursor", st.finalize_cursor}, {"hw", st.hw},
-                  {"owed_digest", st.owed_digest_hex}, {"ledger_seq", st.ledger_seq},
-                  {"suspended", st.lane_suspended}}},
-        {"found", {{"registered", st.found_registered}, {"settled", st.found_settled},
-                   {"orphaned", st.found_orphaned}, {"listed", st.blocks.size()}}},
+        {"lane", {{"suspended", st.lane_suspended}}},
+        {"pathb", pathb_status()},
+        {"found", {{"listed", st.found.size()}, {"peer", peer}, {"own_index", own}, {"monerod", monerod}}},
         {"relay", {{"enabled", st.relay_enabled}, {"ready", st.relay_ready}, {"conns", st.relay_conns},
                    {"foreign_receipts", st.relay_foreign_receipts}}},
         {"stratum", {{"host", st.stratum_host}, {"port", st.stratum_port},
@@ -300,9 +289,8 @@ nlohmann::json XmrWebDashboard::Impl::v37_status(double now) const {
         {"hashrate", {{"local", local_rate(now)}, {"foreign", foreign_rate()},
                       {"pool", local_rate(now) + foreign_rate()}, {"window_s", window_s},
                       {"shares_in_window", shares.size()}}},
-        {"fee", {{"model", st.fee_model}, {"give_author_pct", st.give_author_pct},
-                 {"owner_fee_pct", st.owner_fee_pct}, {"owner_address", st.owner_address},
-                 {"donation_address", st.donation_address}}},
+        {"fee", {{"give_author_pct", st.give_author_pct},
+                 {"owner_fee_pct", st.owner_fee_pct}, {"owner_address", st.owner_address}}},
         {"payout_address", st.payout_address}};
 }
 

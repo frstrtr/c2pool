@@ -13,7 +13,7 @@
 //                     refusal (a subaddress, an integrated address, an
 //                     address of another network, keys that do not decompress)
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

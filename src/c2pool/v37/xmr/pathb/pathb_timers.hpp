@@ -21,7 +21,7 @@
 //                   is left in the window, else after the window (the wait is
 //                   not non-service).
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

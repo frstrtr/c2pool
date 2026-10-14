@@ -53,8 +53,7 @@
 //                the async send queue, the verify pool, the parked cap,
 //                partition_for, the dial targets and the seeds
 //
-// Every clock read goes through RelayClock. Header-only. Not included by any
-// running component.
+// Every clock read goes through RelayClock. Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

@@ -15,7 +15,7 @@
 //   rpc_on_find_path=        template pumps + pool transport; off-path parity
 // An absent pool transport reports 0 for its counters.
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

@@ -259,6 +259,11 @@ public:
         // One sink into the state view; it queues rather than dispatches, so no
         // consumer callback ever runs with our mutex held.
         view_.subscribe([this](const node::MainchainEvent& e) { queued_events_.push_back(e); });
+        // The row sinks: the consensus state right after each connected row
+        // (an Extend is raised after the state took the row), synchronously.
+        view_.subscribe([this](const node::MainchainEvent& e) {
+            if (e.kind == node::MainchainEventKind::Extend) notify_rows_locked_(false);
+        });
         view_.subscribe_txs([this](const BlockTxEvent& e) {
             note_mined_locked_(e);
             queued_tx_events_.push_back(e);
@@ -299,6 +304,7 @@ public:
         }
         seed_long_mirror_(b.long_term_weights);
         anchor_id_ = b.id;
+        notify_rows_locked_(true);
         why.clear();
         return true;
     }
@@ -320,6 +326,7 @@ public:
         rows_.seed_pre_window(tip.height, difficulty_window);
         seed_long_mirror_(long_term_weights);
         anchor_id_ = tip.id;
+        notify_rows_locked_(true);
     }
 
     void set_fetcher(IChainFetcher* f) {
@@ -556,6 +563,50 @@ public:
     void subscribe(EventSink sink) override {
         std::lock_guard<std::mutex> lk(mu_);
         sinks_.push_back(std::move(sink));
+    }
+
+    // --- the follower rows (a Path B node's Monero view) -----------------------------
+    // A row sink runs under the index mutex, on the thread that connected or
+    // seeded the row, with the consensus state whose tip is that row (`seeded`:
+    // an anchor, a direct seed or a snapshot base). It must not call the index.
+    using RowSink = std::function<void(const ConsensusState& state, const ChainRow& tip, bool seeded)>;
+    void subscribe_rows(RowSink sink) {
+        std::lock_guard<std::mutex> lk(mu_);
+        row_sinks_.push_back(std::move(sink));
+    }
+
+    // A held row by id: a main-chain row, or an alt block whose work is
+    // resolved (its timestamp parsed from its own blob).
+    struct HeldRow {
+        Hash          id{};
+        Hash          prev_id{};
+        std::uint64_t height = 0;
+        std::uint64_t timestamp = 0;
+        U128          cumulative_difficulty{};
+        bool          main = false;
+    };
+    std::optional<HeldRow> held_row(const Hash& id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (const RowRecord* r = rows_.by_id(id))
+            return HeldRow{r->row.id, r->row.prev_id, r->row.height, r->row.timestamp, r->row.cumulative_difficulty, true};
+        const AltBlock* a = alt_.find(id);
+        if (a == nullptr || !a->resolved || !a->has_entry) return std::nullopt;
+        return HeldRow{a->id, a->prev_id, a->height, alt_timestamp_(*a), a->cumulative_difficulty, false};
+    }
+    // The oldest main-chain row held.
+    std::optional<HeldRow> oldest_row() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const std::optional<std::uint64_t> lo = rows_.lowest_height();
+        if (!lo) return std::nullopt;
+        const RowRecord* r = rows_.by_height(*lo);
+        if (r == nullptr) return std::nullopt;
+        return HeldRow{r->row.id, r->row.prev_id, r->row.height, r->row.timestamp, r->row.cumulative_difficulty, true};
+    }
+    // The seeded difficulty row (timestamp, cumulative difficulty) at a height
+    // at or below the seed (anchor or snapshot base).
+    std::optional<DifficultyRow> seeded_row_at(std::uint64_t h) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return rows_.pre_window_row(h);
     }
 
     void subscribe_txs(TxEventSink sink) override {
@@ -1658,6 +1709,14 @@ private:
             window.erase(window.begin(),
                          window.begin() + static_cast<long>(window.size() - DIFFICULTY_BLOCKS_COUNT));
         return true;
+    }
+
+    // The row sinks, with the state whose tip is the row just connected or seeded.
+    void notify_rows_locked_(bool seeded) {
+        if (row_sinks_.empty()) return;
+        const ChainRow* t = view_.state().tip();
+        if (t == nullptr) return;
+        for (const RowSink& s : row_sinks_) s(view_.state(), *t, seeded);
     }
 
     // An alt block's timestamp: parsed from its own blob. Kept out of AltBlock
@@ -3234,6 +3293,7 @@ private:
         rows_.seed_pre_window(base.row.height, dwin);
         seed_long_mirror_(lt);
         anchor_id_ = anchor_id;
+        notify_rows_locked_(true);
 
         // --- replay the tail, without re-running RandomX --------------------------------
         for (const Above& a : above) {
@@ -3348,6 +3408,7 @@ private:
 
     std::vector<node::MainchainEvent> queued_events_;
     std::vector<BlockTxEvent>         queued_tx_events_;
+    std::vector<RowSink>              row_sinks_;
     std::vector<EventSink>            sinks_;
     std::vector<TxEventSink>          tx_sinks_;
 

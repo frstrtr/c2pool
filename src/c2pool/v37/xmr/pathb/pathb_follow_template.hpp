@@ -32,7 +32,7 @@
 //     backlog refresh the record routine -> the shared status lines -> web
 //     status. The record is handed to nothing.
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 

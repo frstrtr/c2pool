@@ -30,7 +30,7 @@
 // and the clock (the relay node's; the attempt's waits block the join worker).
 // close(): the server disconnected; every later request has no reply.
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
