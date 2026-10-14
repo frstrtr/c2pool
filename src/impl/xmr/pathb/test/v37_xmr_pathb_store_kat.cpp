@@ -335,6 +335,34 @@ void prefix_and_joined() {
                       && r.n->ar.rows().size() == 1 && r.n->ar.joiner_p0() == root + 1,
               "(4) the joined-shape store: the live window and roots, S at the tip, AR = the joiner seed");
     }
+    // K_BCLAIM's range: a sealed leaf at the tip, below the first leaf or at or below the adopt bound H(x0 - 1) + Fresh
+    {
+        const pb::LaneParams& p = pb::kRuledLaneParams;
+        const std::uint64_t lc_tip = pb::bin_leaf_count(n.tree.best().H, kLaneB0, p.open_bins);
+        const std::uint64_t bound = h.base_leaf_count + kLaneB0 + p.open_bins - 1 + p.fresh_max;
+        const auto with_claim = [&](std::uint64_t bin) {
+            MemoryKv k3 = kv;
+            k3.data[pb::store_keys::bclaim(0, bin)] = pb::encode_bclaim(pb::BclaimRecord{bin, seq32(0x61), seq32(0x62)});
+            return reload(net, k3, 64);
+        };
+        // a full store (no adopt bound): a sealed leaf at the tip loads, the first unsealed bin is Work
+        const auto full_with_claim = [&](std::uint64_t bin) {
+            MemoryKv k4 = sn.kv;
+            k4.data[pb::store_keys::bclaim(0, bin)] = pb::encode_bclaim(pb::BclaimRecord{bin, seq32(0x63), seq32(0x64)});
+            return reload(net, k4, 64).r.fault;
+        };
+        check(full_with_claim(kLaneB0 + lc_tip - 1) == pb::StoreFault::None
+                      && full_with_claim(kLaneB0 + lc_tip) == pb::StoreFault::Work,
+              "(4) K_BCLAIM in a full store: a sealed leaf at the tip loads; an unsealed bin: Work");
+        const Reloaded below = with_claim(kLaneB0 + h.base_leaf_count - 1);
+        const Reloaded at_bound = with_claim(bound);
+        const Reloaded above_bound = with_claim(bound + 1);
+        const Reloaded unsealed = with_claim(kLaneB0 + lc_tip);
+        check(bound + 1 < kLaneB0 + lc_tip && below.r.fault == pb::StoreFault::None && below.r.state->claimed.size() == 1
+                      && at_bound.r.fault == pb::StoreFault::None && above_bound.r.fault == pb::StoreFault::Work
+                      && unsealed.r.fault == pb::StoreFault::Work,
+              "(4) K_BCLAIM below the first leaf and at the adopt bound load; above the bound and on an unsealed bin: Work");
+    }
     // one position after the base
     {
         MemoryKv k2 = kv;

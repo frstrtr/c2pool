@@ -51,6 +51,10 @@
 //              profile, from x1 + 1;
 //   reaskr     reask after a restart (the claimed leaves kept, K_BCLAIM);
 //   adoptbelowr adoptbelow, HELLO's bound tips and claimleaf after a restart;
+//   prunedj    a pruned joined store restarted: the session's adopt bound
+//              with its P-01; with P-01 4,000 a load failure, never a BAN of
+//              an honest heavier branch;
+//   reaskrelay reask after a restart through the relay node;
 //   x1r        a joined node (P-01 4,000: its journal base below x1)
 //              restarted: the journal base the session's; a heavier branch
 //              forking in (base, x1] takes the joiner path by its headers,
@@ -65,10 +69,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <functional>
 #include <map>
 #include <string>
 #include <vector>
+
+#include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
 
 #include "pathb_kat_join.hpp"
 #include "pathb_kat_node.hpp"
@@ -1669,6 +1676,209 @@ void adoptbelowr() {
                   + std::to_string(static_cast<int>(rc.action)) + ")");
 }
 
+
+// ---------------------------------------------------------------------------
+// prunedj: a joined node pruned (--pathb-body-keep 10) and restarted. With its P-01 its store reloads with the
+// session's adopt bound H(x0 - 1) + Fresh (from base_leaf_count, pruned or not). With P-01 raised to 4,000 its replay
+// would start at the prune root: the load fails, as a pruned full node's does (the joiner path); an honest heavier
+// branch forking at 5,490 is never answered by a BAN.
+void prunedj() {
+    JoinNet net(900);
+    const std::uint64_t L = 6000, J2 = 4000, f = 5490;
+    KatNode a(net, kJ);
+    grow(a, f);
+    KatNode b(a);
+    grow(a, L - f);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    const std::function<void(pb::PathbNodeConfig&)> keep10 = [](pb::PathbNodeConfig& c) { c.body_keep = 10; };
+    Joining jn = joining_node_cfg(h, net, kJ, keep10);
+    h.hello(jn.j, s);
+    const pb::JoinStep st = h[jn.j].run_join();
+    if (!st.switched || h[jn.j].joined() == nullptr) {
+        check(false, "prunedj: joined at L");
+        return;
+    }
+    const std::size_t j = jn.j;
+    MemoryKv& kv = *h.kvs.back();
+    const std::uint64_t x0 = h[j].joined()->x0;
+    const std::optional<std::uint64_t> ab_session = h[j].store().adopt_bound();
+    grow(a, 1800);
+    follow(h, j, s, a);
+    const pb::PathbNode::PruneReport pr = h[j].prune(h.now);
+    MemoryKv kvq = kv, kvp = kv;
+    // the session's P-01
+    pb::LoadResult lq = pb::pathb_load(kvq, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    const std::optional<std::uint64_t> ab_restart = lq.state ? lq.state->store.adopt_bound() : std::nullopt;
+    check(pr.written && pr.root > x0 && lq.fault == pb::StoreFault::None && ab_session && ab_restart == ab_session
+                  && h[j].store().adopt_bound() == ab_session,
+          "prunedj: pruned at root " + std::to_string(pr.root) + " and restarted with its P-01: the session's adopt bound ("
+                  + std::to_string(ab_session.value_or(0)) + ", restart " + std::to_string(ab_restart.value_or(0)) + ")");
+    // P-01 4,000
+    pb::LoadResult lp = pb::pathb_load(kvp, net.pool_id, net.rules_g, load_inputs(net, J2));
+    std::string seen = "load fault " + std::to_string(static_cast<int>(lp.fault));
+    bool no_ban = lp.fault != pb::StoreFault::None;
+    if (lp.state) {
+        const std::size_t rp = h.nodes.size();
+        pb::PathbNodeConfig c = h.config(kat_table(net), false, J2);
+        c.body_keep = 10;
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(c, h.io(rp), std::move(*lp.state), &kvp));
+        ChainShape sb;
+        sb.nonce0 = 7460000;
+        grow(b, a.store.tip_pos() + 120 - f, sb);
+        h.mon_tip = std::max<std::uint64_t>(h.mon_tip, h_pos(f + 1) + 1);
+        const pb::NodeEventResult e =
+                h[rp].on_carrier(s, *pb::encode_fc_carrier(0, *b.bodies.get(at_pos(b, f + 1)), pb::kRuledLaneParams.r_max));
+        h.q.clear();
+        no_ban = e.admit.verdict != pb::AdmitVerdict::Ban;
+        seen = "loaded; the branch's first carrier: verdict " + std::to_string(static_cast<int>(e.admit.verdict)) + " row "
+               + std::to_string(static_cast<int>(e.admit.row));
+    }
+    check(no_ban, "prunedj: the pruned store with P-01 4,000 fails its load or judges an honest heavier branch without a "
+                  "BAN (" + seen + ")");
+}
+
+// ---------------------------------------------------------------------------
+// A relay link to a harness node (the relay's peer 1): the relay's requests are answered in this thread by that node's
+// serve_* and its HELLO answers the relay's; the replies wait for step().
+struct ServerLinks final : pb::RelayLinks {
+    Harness* h = nullptr;
+    std::size_t server = 0;  // the harness node behind peer 1
+    std::size_t self = 0;    // the relayed node (its peer id at the server)
+    pb::PathbRelayNode* relay = nullptr;
+    FrameFn frame;
+    FrameFn control;
+    EventFn event;
+    bool up = false;
+    std::deque<std::vector<std::uint8_t>> inbox;
+    void bind(FrameFn f, FrameFn c, EventFn e) override {
+        frame = std::move(f);
+        control = std::move(c);
+        event = std::move(e);
+    }
+    void configure(const pb::PathbRelayOptions&) override {}
+    bool listen(const std::string&, std::uint16_t) override { return true; }
+    std::uint16_t listen_port() const override { return 0; }
+    std::uint64_t dial(const std::string&, std::uint16_t) override { return 0; }
+    bool send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) override {
+        if (p != 1 || !up) return false;
+        if (f.empty()) return true;
+        pb::PathbNode& sv = *h->nodes[server];
+        std::vector<std::vector<std::uint8_t>> out;
+        if (f[0] == pb::kOpFbHello) out.push_back(*pb::encode_pathb_hello(sv.our_hello(5000 + server, 0)));
+        if (f[0] == pb::kOpFcGetHeaders) out = sv.serve_getheaders(self, f, h->now).frames;
+        if (f[0] == pb::kOpFcGetCarrier) out = sv.serve_getcarrier(self, f, h->now).frames;
+        if (f[0] == pb::kOpFcGetBuckets) out = sv.serve_getbuckets(self, f, h->now).frames;
+        for (std::vector<std::uint8_t>& x : out) inbox.push_back(std::move(x));
+        return true;
+    }
+    void disconnect(std::uint64_t p) override {
+        if (p != 1 || !up) return;
+        up = false;
+        event(1, false);
+    }
+    void ban_key(std::uint64_t, std::uint32_t) override {}
+    bool is_banned_key(std::uint64_t) override { return false; }
+    std::uint64_t addr_key(std::uint64_t) const override { return 0; }
+    bool is_inbound(std::uint64_t) const override { return false; }
+    bool has_peer(std::uint64_t p) const override { return p == 1 && up; }
+    std::vector<std::uint64_t> peer_ids() const override {
+        return up ? std::vector<std::uint64_t>{1} : std::vector<std::uint64_t>{};
+    }
+    std::size_t conns_from(std::uint64_t) const override { return 0; }
+    std::string remote_ip(std::uint64_t) const override { return {}; }
+    std::size_t n_peers() const override { return up ? 1 : 0; }
+    void stop() override {}
+    void connect() {
+        up = true;
+        event(1, true);
+    }
+    bool step() {
+        if (inbox.empty()) return false;
+        const std::vector<std::uint8_t> f = std::move(inbox.front());
+        inbox.pop_front();
+        frame(1, f);
+        relay->pump();
+        return true;
+    }
+    void run() {
+        relay->pump();
+        while (step()) {
+        }
+    }
+};
+
+// reaskrelay: reask after a restart through the relay node (manual mode, the server behind its one link): a switch by
+// the journal arriving over the link sets the re-ask from the node's own flag (no session joined state, no queued
+// pair); the join step runs it: every claimed leaf asked again and rebound.
+void reaskrelay() {
+    JoinNet net(900);
+    const std::uint64_t L = 4704;
+    ChainShape sb;
+    sb.nonce0 = 7230000;
+    KatNode a(net, kJ);
+    grow(a, L - 1);
+    KatNode b(a);
+    grow(a, 1);
+    const std::vector<pb::Hash32> bb = grow(b, 3, sb);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok, "reaskrelay: joined at L");
+    if (!jd.ok) return;
+    MemoryKv& kv = *h.kvs.back();
+    const std::uint64_t x1 = h[jd.jn.j].joined()->x1;
+    const std::size_t claimed = h[jd.jn.j].joined()->claimed.size();
+    h.q.clear();
+    pb::LoadResult rl = pb::pathb_load(kv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    if (!rl.state) {
+        check(false, "reaskrelay: the restart");
+        return;
+    }
+    ServerLinks links;
+    links.h = &h;
+    links.server = jd.s;
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    pb::PathbRelayNode relay(o, links, clock);
+    links.relay = &relay;
+    const std::size_t r = h.nodes.size();
+    links.self = r;
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, kJ), relay.bind_io(h.io(r)),
+                                                      std::move(*rl.state), &kv));
+    relay.attach(*h.nodes[r]);
+    relay.set_drive([&links] { return links.step(); });
+    std::string why;
+    const bool started = relay.start(why);
+    links.connect();
+    links.run();
+    const bool hello = relay.hello_ok(1) && h[r].joined() == nullptr;
+    h.mon_tip = h_pos(L + 2) + 1;
+    for (const pb::Hash32& id : bb) {
+        relay.receive(1, *pb::encode_fc_carrier(0, *b.bodies.get(id), pb::kRuledLaneParams.r_max));
+        links.run();
+    }
+    const bool switched = h[r].store().best_tip() == bb.back();
+    const bool none_queued = h[r].joiner().queue().size() == 0;
+    const std::optional<pb::JoinStep> st = relay.join_step();
+    links.run();
+    std::size_t rebound = 0;
+    for (const auto& [bin, at] : bclaims(kv)) {
+        const pb::CarrierNode* n = h[r].tree().find(at);
+        if (n != nullptr && n->pos > x1 && h[r].store().best_at(n->pos) == at) ++rebound;
+    }
+    check(started && hello && switched && none_queued && st && st->reasked == claimed && rebound == claimed
+                  && !st->reask_joiner && relay.stats().bans.load() == 0,
+          "reaskrelay: after a restart a switch by the journal over the relay: the join step re-asks every claimed leaf ("
+                  + std::to_string(st ? st->reasked : 0) + " of " + std::to_string(claimed) + ", rebound "
+                  + std::to_string(rebound) + ")" + (why.empty() ? "" : "; " + why));
+    relay.stop();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1706,5 +1916,7 @@ int main(int argc, char** argv) {
     run("x1r", x1r);
     run("x1l", x1l);
     run("x8claim", x8claim);
+    run("prunedj", prunedj);
+    run("reaskrelay", reaskrelay);
     return finish("v37_xmr_pathb_node_join_kat");
 }

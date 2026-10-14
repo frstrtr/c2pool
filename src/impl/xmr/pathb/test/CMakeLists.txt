@@ -177,4 +177,7 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_pathb_node_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
     find_package(Threads REQUIRED)
     target_link_libraries(v37_xmr_pathb_node_kat PRIVATE Threads::Threads)
+    # v37_xmr_pathb_node_join_kat drives a restarted joined node through the relay node as well.
+    target_include_directories(v37_xmr_pathb_node_join_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt)
+    target_link_libraries(v37_xmr_pathb_node_join_kat PRIVATE Threads::Threads)
 endif()

@@ -521,6 +521,9 @@ public:
     }
     // An attempt runs (3.3a: A keeps building templates, relaying and judging meanwhile).
     bool attempting() const noexcept { return attempting_; }
+    // E-72: the claimed leaves wait to be asked again after a switch by the journal (a joined store, in its session or
+    // after a restart).
+    bool reask_pending() const noexcept { return reask_pending_; }
     // 3.3a (2): the state rests on claims: no adopted state after a load failure, or the adopted state still
     // replayed to its L (no template, nothing relayed).
     bool rests_on_claims() const noexcept {
