@@ -62,29 +62,17 @@ if (BUILD_TESTING)
     target_compile_features(xmr_x2_node_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_x2_node_kat COMMAND xmr_x2_node_kat)
 
-    # 3) X4 (W2) receipt-envelope KAT. SUPERSEDES the foundation's
-    #    xmr_receipt_admission_check scaffold: exercises the FINALIZED admission
-    #    pipeline (xmr_admission.hpp) + the real verify bodies
-    #    (xmr_receipt_verify.cpp) over X1's coin primitives (xmr_blob via
-    #    xmr_coin). RandomX is CI-gated INSIDE the test (rx_check null ->
-    #    stage-5 SkippedCIGated), so this target carries NO RandomX dependency
-    #    and runs in the ordinary lane. Links xmr_coin for the coinbase
-    #    serializer used by KAT-2.
-    add_executable(xmr_receipt_kat
-        xmr_receipt_kat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt/xmr_receipt_verify.cpp)
-    target_link_libraries(xmr_receipt_kat PRIVATE xmr_coin)
-    target_include_directories(xmr_receipt_kat PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
-        ${CMAKE_CURRENT_SOURCE_DIR}/../coin)
+    # 3) the Path B receipt (v3 body): block 3000000's tree fold, the S2.3 order of
+    #    admit_receipt, credit = work(t_origin). Header-only Path B (xmr_pathb).
+    add_executable(xmr_receipt_kat xmr_receipt_kat.cpp)
+    target_link_libraries(xmr_receipt_kat PRIVATE xmr_pathb)
+    target_include_directories(xmr_receipt_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_receipt_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_receipt_kat COMMAND xmr_receipt_kat)
 
-    # 4) W3 carrier wire codec + RandomX DoS budget. STL-only.
+    # 4) the RandomX DoS budget (wire/xmr_carrier_dos_budget.hpp). STL-only.
     add_executable(xmr_wire_dos_check xmr_wire_dos_check.cpp)
-    target_include_directories(xmr_wire_dos_check PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../wire
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt)
+    target_include_directories(xmr_wire_dos_check PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_wire_dos_check PRIVATE cxx_std_20)
     add_test(NAME xmr_wire_dos_check COMMAND xmr_wire_dos_check)
 
@@ -125,36 +113,11 @@ if (BUILD_TESTING)
     target_compile_features(xmr_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_coinbase_kat COMMAND xmr_coinbase_kat)
 
-    # 6c) X8 END-TO-END integration KAT. Stitches the whole XMR-lane path the
-    #     per-slice KATs each cover only in isolation: block-template context feeds
-    #     the coinbase inputs; the settle leg (../settle/xmr_coinbase.cpp) builds
-    #     the canonical miner_tx from a finality-gated OWED ledger (exact-sum, no
-    #     burn; owed outputs are real 8rA stealth keys); the stratum front-end
-    #     (../stratum/xmr_stratum.cpp) serves the coinbase-framed hashing blob, a
-    #     miner grinds it and submits a share that the deterministic W3 PoW oracle
-    #     accepts (the blob the miner signs is byte-identical to the receipt's);
-    #     the carrier wire (../wire, header-only) encodes/decodes the receipt
-    #     byte-for-byte; and the receipt verifier (../receipt/xmr_receipt_verify.cpp)
-    #     accepts the well-formed carrier and REJECTS a tampered one at the
-    #     STRUCTURAL stage, before RandomX. The single stitch: the settle
-    #     owed_digest (lane_commitment) IS the receipt side-data info_digest, so the
-    #     coinbase's tx_extra 0x03 leaf == the leaf the receipt path recomputes.
-    #     Links xmr_coin for the REAL vendored ed25519 (ge_*) + keccak; the src/
-    #     root resolves the "impl/xmr/..." and read-only "sharechain/v37/..."
-    #     includes. RandomX is CI-gated INSIDE the test (deterministic oracle, no
-    #     256-MiB cache / JIT) so this target carries NO RandomX dependency and runs
-    #     in the ordinary lane on BOTH build.yml legs. NO monerod, libsodium, boost.
-    add_executable(xmr_e2e_kat
-        xmr_e2e_kat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt/xmr_receipt_verify.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum/xmr_stratum.cpp)
-    target_link_libraries(xmr_e2e_kat PRIVATE xmr_coin)
-    target_include_directories(xmr_e2e_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
-        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum
-        ${CMAKE_CURRENT_SOURCE_DIR}/../wire)
+    # 6c) case 4 end to end through the Path B coinbase: window -> split -> the hf-16
+    #     miner tx -> tree_root -> the v3 receipt -> #12 Match; Sum(vout) == R.
+    add_executable(xmr_e2e_kat xmr_e2e_kat.cpp)
+    target_link_libraries(xmr_e2e_kat PRIVATE xmr_pathb)
+    target_include_directories(xmr_e2e_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_e2e_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_e2e_kat COMMAND xmr_e2e_kat)
 

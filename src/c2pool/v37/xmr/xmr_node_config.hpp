@@ -54,17 +54,6 @@ inline bool parse_tie_break(const std::string& s, SameHeightTieBreak& out) noexc
     return false;
 }
 
-struct SameHeightPolicy;  // xmr_same_height_race.hpp
-
-// DUST DECAY, in MONERO HEIGHTS (audit A9). The decay clock is the FINALIZE
-// bin_height, a Monero height, so its constants are named as heights here and
-// no longer borrowed from the lane's window / half-life, which count lane
-// POSITIONS. Same values as before (no consensus change): a gone key's
-// balance below c waits 8640 blocks (12 days at 120 s) for its miner to come
-// back, then halves every 2160 blocks (3 days).
-inline constexpr std::uint64_t kXmrDustDecayHorizonHeights  = 8640;
-inline constexpr std::uint64_t kXmrDustDecayHalfLifeHeights = 2160;
-
 // The XMR lane's default parameters: node_lane_params_no_kind(), and, when the
 // build arms DROPS, the Count estimator in place of the K-min one. K-min spends
 // a fixed budget of K order statistics per identity and branches on J < K, so on
@@ -100,10 +89,7 @@ inline const char* to_string(MoneroNetwork n) {
     return "stagenet";
 }
 
-// The <net> path segment used under config_path()/<net>/v37_settle_db — one
-// isolated settlement store per network so a stagenet run can never read or
-// clobber a mainnet store (mirrors the per-coin datadir isolation the Bitcoin
-// family uses via core::config).
+// The <net> path segment of the node's data directory (one per network).
 inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 
 // M2: which miner-data source the option-B assembler is fed from.
@@ -195,31 +181,9 @@ struct XmrNodeConfig {
     // DROPS armed: the Count estimator (xmr_lane_params_default above).
     ::v37::LaneParams lane_params = xmr_lane_params_default();
 
-    // --- settlement finality (F1 driver) ------------------------------------
-    // D_conf: blocks a found (coinbase-carrying) Monero block must be buried on
-    // the best chain before its settlement is FINALIZED. The finalize driver
-    // advances one coin-height at a time; a block at height h finalizes when the
-    // best-chain high-water reaches h + D_conf. Coinbase maturity is 60 on XMR,
-    // so D_conf >= 60 is the safe floor (XMR_COINBASE_MATURITY, scoping §2.1).
-    std::uint64_t   d_conf = 60;
-
-    // MainchainIndex retention below the tip (>= D_conf so a finalizing block is
-    // always resident; seed anchors are pinned on top regardless).
-    std::uint64_t   index_retain_recent = 720;
-
-    // --- c2pool#1551: the same-height double-block tiebreak -----------------
-    // Two Monero blocks at the same parent height, one of them ours. The policy
-    // sets the LEVERS (what we build on, what we re-announce, what we nominate)
-    // and carries the D_conf the credit gate uses; no setting here can make an
-    // unburied or an orphaned block creditable (xmr_same_height_race.hpp).
-    //
-    // `d_conf` above stays the single source of truth for the burial bar:
-    // same_height_policy() copies it in, so the accounting gate and the F1
-    // finalize driver cannot be configured apart.
+    // --- the same-height double-block tie (the native backend's fork tie) ------
     //   --same-height-tiebreak prefer-own (default) | first-seen
-    //   --same-height-renotify <n>   (0 disables the bounded re-announce)
     SameHeightTieBreak same_height_tiebreak = SameHeightTieBreak::PreferOwn;
-    std::uint32_t      same_height_renotify = 3;
     //   --own-fork-bound-s <n>  the native index's own-fork liveness guard: an
     //   own-mined tip that no peer adopts for this long is abandoned and the
     //   node follows the peers' chain (0 disables). Default 2 x target.
@@ -228,16 +192,6 @@ struct XmrNodeConfig {
     //   watch's stall period (FORK-FUSE-2; default 30 min) so a regtest rig can
     //   watch a trip and a clear. REFUSED on mainnet. 0 = the default.
     std::uint32_t      test_unknown_fork_stall_s = 0;
-    // Per-height verdict journal. "" = race.log next to settle.img; "off" =
-    // none. Two nodes that watched the same race must agree on every height
-    // either of them credited, and a journal is what turns that claim into a
-    // diff an auditor can run.
-    std::string        same_height_journal;
-
-    // The policy as the accounting layer consumes it -- assembled HERE so the
-    // D_conf coupling is structural rather than a convention every call site
-    // has to remember. Defined in xmr_same_height_race.hpp.
-    SameHeightPolicy same_height_policy() const;
 
     // --- stratum front-end (X5) --------------------------------------------
     std::string     stratum_bind_host = "127.0.0.1";
@@ -279,33 +233,6 @@ struct XmrNodeConfig {
     bool            residual_sink_subaddress = false;
     // The v37 lane parameters (consensus once multi-node; explicit here).
     //
-    // Consensus inputs of the recomputed coinbase (coinbase-recompute.md).
-    // Every node rebuilds every lane coinbase with its own settle_h_min and
-    // resolved output cap (xmr_coinbase_recompute.hpp LaneInputs), so a node
-    // running a different value calls an honest block non-canonical and books
-    // it debit-only: a ledger fork. They stay out of LaneParams and the relay
-    // HELLO lane_params_digest.
-    // LaneParams::k_floor stays 0 on XMR (Monero has no dust rule).
-    std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
-    // XMR ledger rules (w4 OwedLedgerRules; payout-threshold.md §6, §6a). The
-    // daemon sets them with the spend-cost floor (arm floor = spend_floor of
-    // the tail subsidy); off here so fixtures keep their golden digests.
-    long long       ledger_arm_floor = 0;
-    bool            ledger_rotate_on_payment = false;
-    std::uint64_t   ledger_decay_horizon = 0;      // dust decay (payout-threshold.md §5), Monero heights
-    std::uint64_t   ledger_decay_half_life = 0;    // ... and its half-life, Monero heights
-    bool            ledger_anchor_cut = false;     // ANCHOR: pay-now / E_b at the finalized anchor cut (ruling A 09-29)
-    bool            ledger_drops_due = false;      // DROPS DUE (A5, ruling 09-30): the DROPS delta is a deposit into the committed due, claimed in pay-now
-    bool            ledger_raindrop_enrol = false; // RAINDROP ENROL (A3, ruling 09-30): the DROPS enrolment registry (V37G), refs are ledger state
-    std::uint64_t   ledger_drops_window_rw = 0;    // DROPS WINDOW (A4b, ruling 10-01): one receipt's lane weight; != 0 => DROPS work is window weight (V37W), never priced once
-    bool            ledger_merkle_rows = false;    // §13: owed_digest = a Merkle root over the balances (light-client proofs)
-    std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
-    // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
-    // the assembled coinbase carries a real K_fair OWED payee alongside the sink
-    // (a multi-output settlement coinbase). 0 => empty ledger (sink-only).
-    // The owed payee is a distinct torsion-valid payee derived from the sink
-    // material with spend/view swapped (see main). Proof-only; no live ledger yet.
-    std::uint64_t   owed_demo_amount = 0;
     // DRAIN (operator ruling R2): the old-balance drain parameter Q of the
     // lane-rules list (xmr_lane_rules.hpp field 23). 0 = no drain = master's
     // coinbase bytes. No CLI flag: apply_network_drain() sets it.
@@ -485,8 +412,7 @@ struct XmrNodeConfig {
     bool            native_solo = false;
 
     // --- storage ------------------------------------------------------------
-    // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
-    // Set to override the settlement-store directory (tests set a temp dir).
+    // --data-dir: the node's data directory (empty: the default under config_path()).
     std::string     settle_db_path;
 
     // --- RandomX verify (X pow/) -------------------------------------------
@@ -543,10 +469,6 @@ struct XmrNodeConfig {
     // Every flag given on the command line, in order.
     std::vector<GivenFlag> given_flags;
 
-    // Resolve the on-disk settlement-store directory (settle_db_path override or
-    // config_path()/<net>/v37_settle_db). Declared here, defined in xmr_node.hpp
-    // to keep this header free of <filesystem>/core includes for cheap inclusion.
-    std::string resolved_settle_db_path() const;
 };
 
 // M3: the arm-order preconditions, as a PURE function of the configuration, so
