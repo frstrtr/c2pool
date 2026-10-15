@@ -55,6 +55,9 @@
 //   F  ALT ROWS OUT OF ORDER -- an alternative branch handed child first:
 //                   the child, resolved when its parent lands, is reported
 //                   the same way.
+//   G  ALT ROWS ACROSS A RESTART -- an alt row's RowWeights are saved, loaded
+//                   by the restarted node, kept while it does not hold the
+//                   block, used when it holds it again; dropped below k_alt.
 //   D  BOUNDS    -- the relaxation buys no new powers. Deeper than
 //                   max_reorg_depth is refused and journaled; equal work
 //                   against our own block is KEPT (D-14) and the rival is held
@@ -69,6 +72,8 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <filesystem>
+#include <unistd.h>
 #include <optional>
 #include <string>
 #include <vector>
@@ -889,6 +894,99 @@ static void test_alt_rows_out_of_order() {
            w0 ? 1 : 0, w1 ? 1 : 0, b1 ? 1 : 0);
 }
 
+// G. ALT ROWS ACROSS A RESTART: the losing block P of a race at h is held as an alt block with its RowWeights; the
+// table is saved and the node restarted (a new index without P, a new table loaded from the files): P's RowWeights
+// are there, survive a save by the restarted node that does not hold P, and P resolves (block + weights) once the
+// restarted index holds it again (a join's FB_GETCTX); a row more than k_alt below the tip is dropped.
+static void test_alt_rows_restart() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string table = (dir / "row_weights").string();
+    Hash p{};
+    BlockEntry pe;
+    std::optional<c2pool::xmr::pathb::RowWeights> w_before;
+    std::vector<std::uint8_t> snap;
+    ChainIndexOptions sopts;
+    {
+        Rig f(8);
+        sopts = f.opts;
+        c2pool::xmr::pathb::PathbFollowerRows rows(table);
+        rows.bind(f.idx);
+        f.idx->subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+        std::vector<BlockEntry> rival = build_branch(*f.idx, f.main_ids[6], 7, 1, /*salt_base=*/51);
+        pe = rival[0];
+        p = id_of(pe);
+        const OfferResult r = f.idx->offer_block(&f.them, pe, /*own_mined=*/false);
+        checkf(r.outcome == OfferOutcome::StoredAsAlt, "altrestart: P became %s, expected StoredAsAlt", to_string(r.outcome));
+        w_before = rows.weights(p);
+        std::string why;
+        checkf(w_before.has_value() && rows.save(why), "altrestart: P weighted and the table saved (%s)", why.c_str());
+        checkf(f.idx->save_snapshot(snap, why), "altrestart: the native snapshot saved (%s)", why.c_str());
+    }
+    {
+        // the restart from the native snapshot (a chain this short: taken at the tip, no rollback below it): P comes
+        // back (a join's FB_GETCTX) and is held, its RowWeights cannot be computed again; they are the saved ones
+        ModelVerifier mv;
+        LightVerifierPowSource<ModelVerifier> src{mv};
+        ChainIndex restored(sopts, src);
+        std::string why;
+        checkf(restored.load_snapshot(snap, why), "altrestart: the native snapshot loads (%s)", why.c_str());
+        c2pool::xmr::pathb::PathbFollowerRows rows(table);
+        rows.bind(&restored);
+        restored.subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+        c2pool::xmr::pathb::PathbFollowerRows bare((dir / "row_weights_main_only").string());  // the main table only
+        fs::copy_file(table, (dir / "row_weights_main_only").string());
+        bare.bind(&restored);
+        restored.subscribe_rows([&bare](const ConsensusState& st, const ChainRow& row, bool seeded) { bare.on_row(st, row, seeded); });
+        checkf(rows.load(why) && bare.load(why), "altrestart: both tables load (%s)", why.c_str());
+        const OfferResult r = restored.offer_block(nullptr, pe, /*own_mined=*/false);
+        const auto b = rows.block(p);
+        checkf(r.outcome == OfferOutcome::StoredAsAlt && b.has_value() && rows.weights(p) == w_before,
+               "altrestart: after a restart from the native snapshot P resolves (block + the saved RowWeights)");
+        checkf(!bare.weights(p).has_value(),
+               "altrestart: control: without the saved alt rows P's RowWeights are not computed again (no rollback)");
+    }
+    {
+        Rig g(8);  // the restarted node: the same main chain, P not held
+        c2pool::xmr::pathb::PathbFollowerRows rows(table);
+        rows.bind(g.idx);
+        g.idx->subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+        std::string why;
+        const bool ok = rows.load(why);
+        checkf(ok && rows.weights(p) == w_before && !rows.block(p).has_value(),
+               "altrestart: after the restart P's RowWeights are loaded (P itself not held yet) (%s)", why.c_str());
+        checkf(rows.save(why), "altrestart: the restarted node saves (%s)", why.c_str());
+    }
+    {
+        Rig g(8);
+        c2pool::xmr::pathb::PathbFollowerRows rows(table);
+        rows.bind(g.idx);
+        g.idx->subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+        std::string why;
+        checkf(rows.load(why) && rows.weights(p) == w_before,
+               "altrestart: P's RowWeights survive a save by a node that does not hold P");
+        const OfferResult r = g.idx->offer_block(&g.them, pe, /*own_mined=*/false);
+        const auto b = rows.block(p);
+        checkf(r.outcome == OfferOutcome::StoredAsAlt && b.has_value() && b->height == 8 && rows.weights(p) == w_before,
+               "altrestart: P held again (as a join's context): it resolves, block + the same RowWeights");
+    }
+    {
+        Rig g(12);  // the tip at 12: P (8) is more than k_alt = 3 below it
+        c2pool::xmr::pathb::PathbFollowerRows rows(table);
+        rows.bind(g.idx);
+        std::string why;
+        checkf(rows.load(why) && rows.weights(p).has_value(), "altrestart: loaded at a tip of 12");
+        rows.set_alt_keep(3);
+        checkf(rows.save(why), "altrestart: saved (%s)", why.c_str());
+        c2pool::xmr::pathb::PathbFollowerRows again(table);
+        again.bind(g.idx);
+        checkf(again.load(why) && !again.weights(p).has_value(), "altrestart: a row more than k_alt below the tip is dropped");
+    }
+    fs::remove_all(dir);
+}
+
 int main() {
     test_young_window();
     test_follow_after_race_loss();
@@ -898,6 +996,7 @@ int main() {
     test_checkpoint_above_tip();
     test_alt_rows();
     test_alt_rows_out_of_order();
+    test_alt_rows_restart();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

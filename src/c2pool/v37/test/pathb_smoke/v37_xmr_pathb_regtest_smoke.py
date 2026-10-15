@@ -29,8 +29,10 @@
 #             headers they saw; a restarted server serves only the closure
 #             walks of the side branches it has seen since its restart, P-51),
 #             C's Monero view from genesis (its native snapshot removed):
-#             load failure -> the joiner path -> C on the peers' best tip; then
-#             A, B, C stopped and started twice: byte-equal digests
+#             load failure (an unreadable store moved aside) -> the joiner
+#             path -> C on the peers' best tip; then A, B, C stopped and
+#             started twice, their Monero views from genesis: byte-equal
+#             digests
 #   fo        D: start line, no listener, no pathb_db, a follow line per
 #             monerod block with monerod's id, TOTAL=0; fee-diverse
 #             transactions in monerod's pool, D holding a broadcast one,
@@ -822,7 +824,8 @@ class Rig:
 
     def drop_native_snapshot(self, n):
         # the node's Monero view starts from genesis: a native snapshot resume has no rollback below its resume
-        # point (snapshot depth 0 on a chain this short) and no ring resolution; the joiner path is checked here
+        # point (snapshot depth 0 on a chain this short) and no ring resolution; the restart part checks the Path B
+        # store (the native resume is the fo and solo parts')
         for f in ("chain.snap", "chain.snap.outset"):
             fp = os.path.join(self.work, "node" + n, f)
             if os.path.exists(fp):
@@ -872,6 +875,8 @@ class Rig:
             self.res.check("restart", False, "C with the corrupted store: %s (%s)" % (e, refused[:1]))
             return
         lf = re.findall(r"^store: \S+ load failed .*$", p.text(), re.M)
+        mv = re.findall(r"^store: \S+ unreadable .* moved aside to .*$", p.text(), re.M)
+        self.res.note("restart", "C: %s" % (mv[0] if mv else "store readable: not moved aside"))
         self.res.check("restart", bool(lf), "C: load failure -> the joiner path: %s" % (lf[0] if lf else "no line"))
         if not lf:
             return
@@ -903,6 +908,7 @@ class Rig:
             rounds = []
             for r in (1, 2):
                 for n in "ABC":
+                    self.drop_native_snapshot(n)  # the Path B stores are what these restarts check
                     self.start_pool_node(n, False)
                 wait_for(lambda: all(self.relay_ready(n) >= 2 for n in "ABC"), 180, "relay links after restart %d" % r)
                 loaded = {}

@@ -24,6 +24,9 @@
 //   N3  the context RandomX throws once at C (a node-internal failure): a
 //       local alarm, no strike, no ban; the want kept and judged again:
 //       resolved
+//   N4  a join's context (a carrier under verification) 5 blocks above C's
+//       index, on a branch only A holds: the want climbs to the index (P-07,
+//       not P-06), every block judged and fed into C's follower
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -176,6 +179,26 @@ int main() {
       Cn.n->st().strikes.load() == 0 && Cn.n->st().bans.load() == 0,
       "N3 the context RandomX threw once at C (" + std::to_string(Cn.n->st().rx_failures.load()) +
       " failure): no strike, no ban; judged again and resolved");
+
+    // ── N4 a join's context climbs a branch deeper than an unsolicited receipt's bound ─
+    // Z1(100) <- Z2 <- ... <- Z5(104) on G: a branch A mined on its own; only A's native node holds the bodies. A
+    // join's want for Z5 (a carrier under verification) climbs to G (P-07), past P-06 (3).
+    std::vector<bytes32> zid;
+    {
+        bytes32 prev = idG;
+        for (u64 k = 1; k <= 5; ++k) {
+            const SynthBlock Z = make_block(99 + k, prev, 95 + k, nullptr, 1, 70 + k);
+            zid.push_back(block_id(Z));
+            A.idx.alt(Z);
+            prev = zid.back();
+        }
+    }
+    const bool z_ok = Cn.n->fetch_context(zid.back(), 30);
+    bool z_all = z_ok;
+    for (const bytes32& z : zid) z_all = z_all && Cn.has(z);
+    C(z_all && Cn.n->r().options().ctx_max_depth == 3 && Cn.n->r().options().ctx_join_depth == 720,
+      "N4 a join's context 5 blocks above C's index (a branch only A holds) climbs to it (P-07): every block of the "
+      "branch verified, judged and fed into C's follower");
 
     for (auto* t : {&A, &B, &Cn}) if (C.fail) t->n->dump_logs();
     std::printf("    C %s\n", Cn.n->r().describe().c_str());

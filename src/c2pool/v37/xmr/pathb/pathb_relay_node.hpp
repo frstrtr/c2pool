@@ -168,8 +168,11 @@ struct PathbRelayOptions {
     // Monero contexts (FB_GETCTX / FB_CTX)
     std::uint32_t ctx_retry_ms = 2000;
     std::uint32_t ctx_max_rounds = 30;
-    std::uint32_t ctx_max_depth = 2;
-    std::size_t ctx_want_max = 128;
+    // context blocks climbed per want: P-06 (Fresh + 1) for an unsolicited receipt, P-07 (k_alt) for a carrier
+    // under verification (a join's FB_GETCTX)
+    std::uint32_t ctx_max_depth = static_cast<std::uint32_t>(relay_horizons(kRuledLaneParams).ctx_max_depth);
+    std::uint32_t ctx_join_depth = static_cast<std::uint32_t>(kAltDepth);
+    std::size_t ctx_want_max = 128;  // wants of unsolicited receipts held at once (a join's climb: up to ctx_join_depth)
     // false: no thread; the caller runs pump(), tick() and join_step()
     bool threads = true;
 };
@@ -933,6 +936,7 @@ private:
     struct CtxWant {
         std::uint64_t from = 0;
         std::uint32_t depth = 0;
+        std::uint32_t bound = 0;  // the climb's bound: ctx_max_depth, or ctx_join_depth for a join's want
         std::set<std::uint64_t> asked;
         std::uint32_t rounds = 0;
         std::uint64_t since_ms = 0;
@@ -1736,7 +1740,7 @@ private:
         fx.p15.clear();
         for (std::uint64_t q : fx.bans) ban(q);
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
-        for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0);
+        for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0, o_.ctx_max_depth);
         if (!fx.rerun.empty()) rerun_parked(std::vector<Missing>(fx.rerun.begin(), fx.rerun.end()));
         if (fx.join) signal_join();
     }
@@ -2998,17 +3002,22 @@ private:
         st_.ctx_rx++;
         (void)offer_ctx(id, blob, p);
     }
-    void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth) {
+    void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, std::uint32_t bound) {
         std::lock_guard<std::mutex> lk(cmtx_);
         const auto it = ctx_want_.find(id);
         if (it != ctx_want_.end()) {
             if (it->second.from == 0 && from != 0) it->second.from = from;
+            it->second.bound = std::max(it->second.bound, bound);
             return;
         }
-        if (ctx_want_.size() >= o_.ctx_want_max) return;
+        const bool join = bound > o_.ctx_max_depth;
+        std::size_t joins = 0;
+        for (const auto& kv : ctx_want_) joins += kv.second.bound > o_.ctx_max_depth ? 1 : 0;
+        if (join ? joins >= o_.ctx_join_depth : ctx_want_.size() - joins >= o_.ctx_want_max) return;
         CtxWant w;
         w.from = from;
         w.depth = depth;
+        w.bound = bound;
         w.since_ms = now_ms();
         ctx_want_.emplace(id, std::move(w));
         st_.ctx_wanted++;
@@ -3058,7 +3067,7 @@ private:
     // The work behind a held proof (the node's own chain index); usable: accepted; forged: its sender banned; not
     // judgeable now: kept (its parent wanted while within ctx_max_depth).
     bool judge_ctx(Hash32 id) {
-        for (std::size_t guard = 0; guard < o_.ctx_want_max; ++guard) {
+        for (std::size_t guard = 0; guard < o_.ctx_want_max + o_.ctx_join_depth; ++guard) {
             CtxWant w;
             {
                 std::lock_guard<std::mutex> lk(cmtx_);
@@ -3077,7 +3086,7 @@ private:
                                 if (it == ctx_pow_.end()) return std::nullopt;
                                 return it->second;
                             },
-                            o_.ctx_max_depth, ctx_.rx);
+                            w.bound, ctx_.rx);
                 } catch (const RandomxFailure&) {  // node-internal, a local alarm; the context is judged again later
                     rx_alarm("context " + hex_short(id));
                     return false;
@@ -3112,8 +3121,8 @@ private:
                     std::lock_guard<std::mutex> lk(cmtx_);
                     parent_pow = ctx_pow_.count(w.proof.parent) != 0;
                 }
-                if (!parent_known && !parent_pow && w.depth + 1 < o_.ctx_max_depth)
-                    want_ctx(w.proof.parent, w.proof_from != 0 ? w.proof_from : w.from, w.depth + 1);
+                if (!parent_known && !parent_pow && w.depth + 1 < w.bound)
+                    want_ctx(w.proof.parent, w.proof_from != 0 ? w.proof_from : w.from, w.depth + 1, w.bound);
                 return false;
             }
             if (v.kind == rly::CtxPow::Accept) {
@@ -3137,7 +3146,7 @@ private:
                 std::lock_guard<std::mutex> lk(cmtx_);
                 ctx_want_.erase(id);
                 ctx_done_.push_back(id);
-                while (ctx_done_.size() > o_.ctx_want_max) ctx_done_.pop_front();
+                while (ctx_done_.size() > o_.ctx_want_max + o_.ctx_join_depth) ctx_done_.pop_front();
                 for (const auto& [cid, cw] : ctx_want_)
                     if (cw.have_proof && cw.proof.parent == id) {
                         child = cid;
@@ -3236,10 +3245,10 @@ private:
         const std::uint64_t deadline = now_ms() + timeout_s * 1000;
         if (ctx_.block_blob) {
             std::vector<std::uint8_t> blob;
-            want_ctx(id, 0, 0);
+            want_ctx(id, 0, 0, o_.ctx_join_depth);
             if (ctx_.block_blob(id, blob) && !blob.empty() && offer_ctx(id, blob, 0)) return true;
         }
-        want_ctx(id, 0, 0);
+        want_ctx(id, 0, 0, o_.ctx_join_depth);
         drive_ctx();
         if (!o_.threads) {
             while (!ctx_resolved(id) && now_ms() < deadline && drive_ && drive_()) {

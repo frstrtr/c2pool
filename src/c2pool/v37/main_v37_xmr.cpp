@@ -1038,6 +1038,20 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     li.journal_depth = nc.journal_depth;
     li.chain = nc.record_chain;
     pb::LoadResult lr = pb::pathb_load(*kv, sr.identity.pool_id, G, li);
+    if (lr.fault != pb::StoreFault::None && lr.fault != pb::StoreFault::NoHead && !pb::store_readable(*kv)) {
+        // a store LevelDB cannot read: an adoption could not write into it; moved aside, an empty store in its place
+        // (the load failure stands: the joiner path)
+        std::string moved, mwhy;
+        kv = pb::move_store_aside(std::move(kv), store_dir.string(), unix_now_s(), moved, mwhy);
+        if (!kv) {
+            std::printf("REFUSED: the Path B store %s is unreadable and was not moved aside: %s\n",
+                        store_dir.string().c_str(), mwhy.c_str());
+            backend->stop();
+            return 2;
+        }
+        std::printf("store: %s unreadable (a LevelDB scan failed): moved aside to %s; an empty store in its place\n",
+                    store_dir.string().c_str(), moved.c_str());
+    }
 
     // ---- the node's I/O ----
     std::vector<pb::TemplateTx> cur_cands;   // the serve loop's ready snapshot (read by make_template, main thread)

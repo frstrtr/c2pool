@@ -18,8 +18,11 @@
 //   main_tip     the index's tip
 //   frontier     the height of the highest main-chain row whose RowWeights
 //                record is written (the consumer frontier)
-//   load / save  the RowWeights table file (encode_row_weights_table); save
-//                drops the ids the index no longer holds
+//   load / save  the RowWeights table files: `row_weights` (encode_row_weights_table) the
+//                main-chain rows the index holds; `row_weights_alt` (encode_alt_row_weights)
+//                every other row with its height (alternative blocks, held or not), kept
+//                across a restart while its height is within k_alt (P-07) of the index
+//                tip; save drops the rest
 //
 // Threading: on_row runs under the chain index mutex (the native node's verify
 // thread); every other call takes the table mutex without the index mutex held
@@ -29,6 +32,7 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -36,13 +40,55 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/pathb/pathb_branch_follower.hpp"
+#include "impl/xmr/pathb/pathb_caps.hpp"  // kAltDepth (P-07)
 
 namespace c2pool::xmr::pathb {
+
+// The alternative rows' file (node-local): u32 n | n x (id 32 | u64 height LE | RowWeights 33), ids ascending.
+inline constexpr std::size_t kAltRowBytes = kHashBytes + sizeof(std::uint64_t) + kRowWeightsBytes;
+
+inline std::vector<std::uint8_t> encode_alt_row_weights(const std::map<Hash32, std::pair<std::uint64_t, RowWeights>>& t) {
+    std::vector<std::uint8_t> out;
+    out.reserve(4 + t.size() * kAltRowBytes);
+    const std::uint32_t n = static_cast<std::uint32_t>(t.size());
+    for (std::size_t i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(n >> (8 * i)));
+    for (const auto& [id, hw] : t) {
+        out.insert(out.end(), id.begin(), id.end());
+        for (std::size_t i = 0; i < 8; ++i) out.push_back(static_cast<std::uint8_t>(hw.first >> (8 * i)));
+        encode_row_weights(hw.second, out);
+    }
+    return out;
+}
+
+inline std::optional<std::map<Hash32, std::pair<std::uint64_t, RowWeights>>> decode_alt_row_weights(
+        std::span<const std::uint8_t> in) {
+    if (in.size() < 4) return std::nullopt;
+    std::uint32_t n = 0;
+    for (std::size_t i = 0; i < 4; ++i) n |= std::uint32_t{in[i]} << (8 * i);
+    if ((in.size() - 4) % kAltRowBytes != 0 || (in.size() - 4) / kAltRowBytes != n) return std::nullopt;
+    std::map<Hash32, std::pair<std::uint64_t, RowWeights>> t;
+    Hash32 prev{};
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::size_t o = 4 + k * kAltRowBytes;
+        Hash32 id{};
+        std::copy_n(in.begin() + static_cast<std::ptrdiff_t>(o), kHashBytes, id.begin());
+        if (k > 0 && !(prev < id)) return std::nullopt;
+        std::uint64_t h = 0;
+        for (std::size_t i = 0; i < 8; ++i) h |= std::uint64_t{in[o + kHashBytes + i]} << (8 * i);
+        const std::optional<RowWeights> w = decode_row_weights(in.subspan(o + kHashBytes + 8, kRowWeightsBytes));
+        if (!w) return std::nullopt;
+        t.emplace(id, std::make_pair(h, *w));
+        prev = id;
+    }
+    return t;
+}
 
 class PathbFollowerRows final : public IMoneroRows {
 public:
@@ -57,6 +103,7 @@ public:
         if (!w) return;
         std::lock_guard<std::mutex> lk(mu_);
         table_[row.id] = *w;
+        heights_[row.id] = row.height;
         ++recorded_;
     }
 
@@ -132,28 +179,78 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         for (const auto& [id, w] : *t) table_.emplace(id, w);
         loaded_ = t->size();
+        std::ifstream fa(alt_path(), std::ios::binary);
+        if (!fa) return true;
+        const std::vector<std::uint8_t> abytes((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+        const auto a = decode_alt_row_weights(abytes);
+        if (!a) {
+            why = "row weights table " + alt_path() + " does not decode";
+            return false;
+        }
+        for (const auto& [id, hw] : *a) {
+            if (table_.emplace(id, hw.second).second) ++loaded_;
+            heights_.emplace(id, hw.first);
+        }
         return true;
     }
-    // Drops the ids the index holds no longer, then writes the table (a temp
-    // file renamed over the old one).
+    // Writes the main-chain rows the index holds to `row_weights` and every other row whose height is within
+    // k_alt of the index tip to `row_weights_alt` (each a temp file renamed over the old one); drops the rest.
     bool save(std::string& why) {
-        std::vector<Hash32> ids;
+        std::vector<std::pair<Hash32, std::optional<std::uint64_t>>> ids;
         {
             std::lock_guard<std::mutex> lk(mu_);
             ids.reserve(table_.size());
-            for (const auto& [id, w] : table_) ids.push_back(id);
+            for (const auto& [id, w] : table_) {
+                const auto h = heights_.find(id);
+                ids.emplace_back(id, h == heights_.end() ? std::nullopt : std::optional<std::uint64_t>(h->second));
+            }
         }
-        std::vector<Hash32> gone;
-        if (index_ != nullptr)
-            for (const Hash32& id : ids)
-                if (!index_->held_row(id)) gone.push_back(id);
-        std::vector<std::uint8_t> bytes;
+        std::vector<Hash32> gone, alt;
+        if (index_ != nullptr) {
+            const auto tip = index_->tip();
+            const std::uint64_t tip_h = tip ? tip->height : 0;
+            for (const auto& [id, h0] : ids) {
+                const auto r = index_->held_row(id);
+                if (r && r->main) continue;
+                const std::optional<std::uint64_t> h = r ? std::optional<std::uint64_t>(r->height) : h0;
+                if (h && *h + alt_keep_ >= tip_h)
+                    alt.push_back(id);
+                else
+                    gone.push_back(id);
+            }
+        }
+        std::vector<std::uint8_t> bytes, abytes;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            for (const Hash32& id : gone) table_.erase(id);
-            bytes = encode_row_weights_table(table_);
+            for (const Hash32& id : gone) {
+                table_.erase(id);
+                heights_.erase(id);
+            }
+            std::map<Hash32, RowWeights> main = table_;
+            std::map<Hash32, std::pair<std::uint64_t, RowWeights>> alts;
+            for (const Hash32& id : alt) {
+                const auto it = table_.find(id);
+                if (it == table_.end()) continue;
+                const auto r = index_ != nullptr ? index_->held_row(id) : std::nullopt;
+                const auto h = heights_.find(id);
+                const std::uint64_t height = r ? r->height : (h != heights_.end() ? h->second : 0);
+                heights_[id] = height;
+                alts.emplace(id, std::make_pair(height, it->second));
+                main.erase(id);
+            }
+            bytes = encode_row_weights_table(main);
+            abytes = encode_alt_row_weights(alts);
         }
-        const std::string tmp = path_ + ".tmp";
+        return write_file(path_, bytes, why) && write_file(alt_path(), abytes, why);
+    }
+    // k_alt (P-07): how far below the index tip a row off the main chain is kept.
+    void set_alt_keep(std::uint64_t k) noexcept { alt_keep_ = k; }
+    std::string alt_path() const { return path_ + "_alt"; }
+    std::size_t loaded() const noexcept { return loaded_; }
+
+private:
+    static bool write_file(const std::string& path, const std::vector<std::uint8_t>& bytes, std::string& why) {
+        const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
             if (!f) {
@@ -166,15 +263,13 @@ public:
                 return false;
             }
         }
-        if (std::rename(tmp.c_str(), path_.c_str()) != 0) {
+        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
             why = "cannot rename " + tmp;
             return false;
         }
         return true;
     }
-    std::size_t loaded() const noexcept { return loaded_; }
 
-private:
     static BranchBlock branch_block(const ::c2pool::xmr::native::ChainIndex::HeldRow& r) {
         BranchBlock b;
         b.id = r.id;
@@ -189,6 +284,8 @@ private:
     const ::c2pool::xmr::native::ChainIndex* index_ = nullptr;
     mutable std::mutex mu_;
     std::map<Hash32, RowWeights> table_;
+    std::map<Hash32, std::uint64_t> heights_;  // the height of every row recorded or loaded with one
+    std::uint64_t alt_keep_ = kAltDepth;
     std::uint64_t recorded_ = 0;
     std::size_t loaded_ = 0;
 };
