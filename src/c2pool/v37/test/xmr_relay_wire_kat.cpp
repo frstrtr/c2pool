@@ -79,6 +79,11 @@ int main() {
         b = g; b[1] = 2;                         C(!decode_getctx(b, ch, ids), "W2 getctx unknown version refused");
         b = g; b[6] = 0;                         C(!decode_getctx(b, ch, ids), "W2 getctx n 0 refused");
         b = g; b[6] = 9;                         C(!decode_getctx(b, ch, ids), "W2 getctx n 9 refused");
+        {   // nine ids, the length matching nine
+            std::vector<u8> nine = {FB_GETCTX, kFbVersion, 7, 0, 0, 0, 9};
+            for (int i = 0; i < 9; ++i) { const bytes32 id = fill32(static_cast<u8>(0x20 + i)); nine.insert(nine.end(), id.begin(), id.end()); }
+            C(!decode_getctx(nine, ch, ids), "W2 getctx with 9 ids (length consistent) refused");
+        }
         b = g; b.push_back(0);                   C(!decode_getctx(b, ch, ids), "W2 getctx trailing byte refused");
         b = g; b.pop_back();                     C(!decode_getctx(b, ch, ids), "W2 getctx truncated refused");
 
@@ -98,6 +103,8 @@ int main() {
         std::vector<u8> over(kCtxHeader, 0); over[0] = FB_CTX; over[1] = kFbVersion;
         over[38] = 0x01; over[39] = 0x00; over[40] = 0x08; over[41] = 0x00;   // 524289
         C(!decode_ctx(over, ch, id, got), "W2 ctx len over 512 KiB refused");
+        over.resize(kCtxHeader + kCtxMaxBlob + 1, 0);   // the frame carries the 512 KiB + 1 bytes it claims
+        C(!decode_ctx(over, ch, id, got), "W2 ctx of 512 KiB + 1 (length consistent) refused");
         b = c; b[0] = FB_GETCTX;                 C(!decode_ctx(b, ch, id, got), "W2 ctx wrong opcode refused");
         b = c; b[1] = 2;                         C(!decode_ctx(b, ch, id, got), "W2 ctx unknown version refused");
         bool total = true;
