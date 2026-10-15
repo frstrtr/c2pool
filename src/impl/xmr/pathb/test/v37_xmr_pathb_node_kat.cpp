@@ -105,6 +105,14 @@
 //   relayp15     P-15: the default capacity P-09; a first-seen receipt counts
 //                one, a duplicate none; above the budget a frame is DROPPED,
 //                no strike, no ban, the link kept; refilled at (1 + R_MAX) / T;
+//   relayp15rx   P-15: a receipts frame whose second body's RandomX fails:
+//                one job per body: the other two counted at once, the
+//                second at its re-run; three first-seen, three counted;
+//   alarmbound   the alarm sink counts by (row, cause) and keeps the last
+//                entry: it does not grow with the node's life;
+//   ownbound     the kept own shares bounded by the jobs' lifetime: a stale
+//                one leaves though RandomX fails before it; clear()
+//                releases the issued jobs;
 //   relaystale   a gone peer's events (in flight, posted by its blocked
 //                reader) skipped: no join hold for the gone peer;
 //   relaytip     on_monero_tip from the follower's thread and under the node
@@ -155,6 +163,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -171,6 +180,7 @@
 #include <vector>
 
 #include "c2pool/v37/xmr/pathb/pathb_own_share.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_job_source.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_links.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_startup.hpp"
@@ -2927,6 +2937,127 @@ void relayp15() {
 }
 
 // ---------------------------------------------------------------------------
+// relayp15rx: a receipts frame of three bodies whose second body's RandomX fails. The relay takes a receipts frame as
+// one job per body: the first and the third are admitted and counted in P-15 at once (their first placement); the
+// second is parked and run again: admitted and counted then. Three first-seen receipts, three counted, none twice.
+void relayp15rx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.peer_valid_capacity = 10; });
+    w.connect(0, 1);
+    w.run();
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t k = 0; k < 3; ++k)
+        if (const std::optional<pb::PathbJob> j = h.job(a.node, k + 2, 710 + k)) jobs.push_back(*j);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    bool ok = jobs.size() == 3 && mine_on(h, w, a.node, 1, 720);
+    for (std::uint32_t k = 0; ok && k < 3; ++k)
+        ok = h[a.node].on_own_share(jobs[k], 710 + k, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    std::vector<pb::ReceiptBodyV3> rs;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) rs.push_back(r->body);
+    ok = ok && rs.size() == 3 && h[b.node].pending().size() == 0;
+    if (!ok) {
+        check(false, "relayp15rx: setup");
+        return;
+    }
+    h.now += 1000;  // B's bucket full
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = 1;  // A at B
+    const double full = rb.peer_valid_left(pa);
+    h.throw_pow.insert(pb::receipt_id(rs[1]));
+    rb.receive(pa, *pb::encode_fb_receipts(0, rs, pb::kRuledLaneParams));
+    w.run();
+    const double after_first = rb.peer_valid_left(pa);
+    const bool r0 = h[b.node].pending().holds(pb::receipt_id(rs[0])), r1 = h[b.node].pending().holds(pb::receipt_id(rs[1])),
+               r2 = h[b.node].pending().holds(pb::receipt_id(rs[2]));
+    const std::uint64_t fails = rb.stats().rx_failures.load();
+    const double bucket_t0 = h.now;
+    // the re-run (no refill: the clock of the bucket is the harness's, moved below by less than a token)
+    for (int i = 0; i < 6 && h[b.node].pending().size() < 3; ++i) {
+        h.now += 1;
+        rb.tick();
+        w.run();
+    }
+    const double after_rerun = rb.peer_valid_left(pa);
+    // the bucket refills at (1 + R_MAX) / T = 1.7 per second, capped at the capacity
+    const double refill = std::min(10.0 - after_first, (h.now - bucket_t0) * 1.7);
+    std::printf("  relayp15rx: full=%.2f after_first=%.2f after_rerun=%.2f refill=%.2f held=%zu rx_failures=%llu\n", full,
+                after_first, after_rerun, refill, h[b.node].pending().size(), static_cast<unsigned long long>(fails));
+    check(fails >= 1 && r0 && !r1 && r2 && full - after_first == 2.0,
+          "relayp15rx: RandomX failed on the second body; the first and the third admitted and counted at once (" +
+                  std::to_string(full - after_first) + ")");
+    check(h[b.node].pending().size() == 3 && std::abs(after_first + refill - 1.0 - after_rerun) < 1e-6
+                  && rb.strikes_of(pa) == 0 && rb.stats().bans == 0,
+          "relayp15rx: the re-run admits the second and counts it once; no strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
+// ownbound: the kept own shares are bounded by the issued jobs' lifetime. (1) Three shares kept (RandomX failing); the
+// second's job goes stale; RandomX still fails on the first: the stale second leaves at once (not only from the front).
+// (2) PathbJobSource::clear() releases the issued jobs: a share on one of them is stale.
+void ownbound() {
+    std::set<std::uint32_t> live_tids;
+    pb::OwnShareRunner runner([](const pb::OwnShare&) -> pb::NodeEventResult { throw pb::RandomxFailure("kat: RandomX down"); },
+                              [&](const pb::OwnShare& s) { return live_tids.count(s.template_id) != 0; });
+    for (std::uint32_t t = 1; t <= 3; ++t) {
+        live_tids.insert(t);
+        (void)runner.submit(pb::OwnShare{t, 1, pb::PathbJob{}, t, pb::Hash32{}});
+    }
+    const std::size_t k0 = runner.kept();
+    live_tids.erase(2);
+    (void)runner.run_kept();
+    check(k0 == 3 && runner.kept() == 2 && runner.stats().stale == 1,
+          "ownbound: a kept share whose job went stale leaves at the next run though RandomX still fails before it (kept " +
+                  std::to_string(runner.kept()) + ", stale " + std::to_string(runner.stats().stale) + ")");
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 50 + i);
+    }
+    pb::PathbJobSource js([&](const pb::PathbTemplate& t, const pb::PathbSession& ss) { return h[a].make_job(t, ss); });
+    const pb::PathbTemplate t = h[a].make_template(h.now);
+    const std::uint32_t tid = js.set_template(t, pb::JobNetwork{});
+    js.bind(7, h.session(1, 7));
+    ::v37::xmr::stratum::TemplateJob out;
+    const bool got = t.status == pb::TemplateStatus::Ok && js.get_job(7, out);
+    const bool issued = js.issued(tid, 7).has_value();
+    js.clear();
+    check(got && issued && !js.issued(tid, 7).has_value() && !js.has_template(),
+          "ownbound: clear() withdraws the template and releases its issued jobs (a share on one is stale)");
+}
+
+// ---------------------------------------------------------------------------
+// alarmbound: the node's alarm sink does not grow with its life: 1,000 alarms (600 R12 node-internal, 400 R9 claim)
+// are 1,000 counted, 600 of them R12 node-internal read in O(1), the last one kept; no list of entries is held.
+template <class S>
+static std::uint64_t sink_count_of(const S& s, pb::RowId row, pb::Missing cause) {
+    if constexpr (requires { s.count_of(row, cause); }) return s.count_of(row, cause);
+    else return UINT64_MAX;
+}
+template <class S>
+static bool sink_holds_list(const S& s) {
+    if constexpr (requires { s.entries.size(); }) return true;
+    else return false;
+}
+void alarmbound() {
+    pb::AlarmSink sink;
+    for (int i = 0; i < 1000; ++i)
+        sink.raise(i < 600 ? pb::RowId::R12 : pb::RowId::R9, pb::Basis::Computed, seq32(static_cast<std::uint8_t>(i)),
+                   i < 600 ? pb::Missing::NodeInternal : pb::Missing::ClaimAlarm);
+    check(sink.count() == 1000 && sink_count_of(sink, pb::RowId::R12, pb::Missing::NodeInternal) == 600
+                  && sink_count_of(sink, pb::RowId::R9, pb::Missing::ClaimAlarm) == 400 && !sink_holds_list(sink),
+          "alarmbound: 1,000 alarms counted by (row, cause), R12 node-internal 600 read in O(1); no list of entries held");
+}
+
+// ---------------------------------------------------------------------------
 // A-1: the events of a peer that run after its link went down (one in flight, one its reader posted while blocked
 // behind it) are skipped: the node opens nothing for the gone peer (no join hold from its FC_GETHEADERS).
 void relaystale() {
@@ -4218,6 +4349,9 @@ int main(int argc, char** argv) {
     run("relayq", relayq);
     run("relayindex", relayindex);
     run("relayp15", relayp15);
+    run("relayp15rx", relayp15rx);
+    run("ownbound", ownbound);
+    run("alarmbound", alarmbound);
     run("relaystale", relaystale);
     run("relaytip", relaytip);
     run("relaysq", relaysq);

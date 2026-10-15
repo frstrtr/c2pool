@@ -62,23 +62,27 @@ public:
         }
     }
 
-    // Runs the kept shares again, oldest first: a share run to its end or whose job is stale leaves; a RandomX failure
-    // keeps it (and the ones after it, untried, for the next call).
+    // Runs the kept shares again, oldest first: every share whose job is stale leaves first (the kept list is bounded
+    // by the issued jobs' lifetime); a share run to its end leaves; a RandomX failure keeps it (and the ones after it,
+    // untried, for the next call).
     std::vector<NodeEventResult> run_kept() {
         std::deque<OwnShare> q;
         {
             std::lock_guard<std::mutex> lk(m_);
             q.swap(kept_);
         }
+        for (auto it = q.begin(); it != q.end();) {
+            if (live_(*it)) {
+                ++it;
+                continue;
+            }
+            it = q.erase(it);
+            std::lock_guard<std::mutex> lk(m_);
+            ++st_.stale;
+        }
         std::vector<NodeEventResult> out;
         while (!q.empty()) {
             OwnShare& s = q.front();
-            if (!live_(s)) {
-                std::lock_guard<std::mutex> lk(m_);
-                ++st_.stale;
-                q.pop_front();
-                continue;
-            }
             try {
                 {
                     std::lock_guard<std::mutex> lk(m_);

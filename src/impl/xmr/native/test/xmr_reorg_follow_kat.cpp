@@ -58,6 +58,11 @@
 //   G  ALT ROWS ACROSS A RESTART -- an alt row's RowWeights are saved, loaded
 //                   by the restarted node, kept while it does not hold the
 //                   block, used when it holds it again; dropped below k_alt.
+//   H  RESUME REORG -- a young chain's snapshot replays the blocks above its
+//                   base: the resumed index adopts a heavier branch forking
+//                   below its resume point.
+//   I  KEPT CAP -- the kept file's rows bounded by (k_alt + 1) +
+//                   alt_max_blocks: at the cap it loads, one above is refused.
 //   D  BOUNDS    -- the relaxation buys no new powers. Deeper than
 //                   max_reorg_depth is refused and journaled; equal work
 //                   against our own block is KEPT (D-14) and the rival is held
@@ -73,7 +78,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <unistd.h>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -928,12 +935,19 @@ static void test_alt_rows_restart() {
         m9 = r9.id;
         std::string why;
         checkf(r9.outcome == OfferOutcome::Connected && rows.weights(m9).has_value(), "altrestart: the main block at 9 recorded");
+        // and on to 80, so the native snapshot's base (64 below the tip) lies above P's fork point
+        Hash prev = m9;
+        for (std::uint64_t h = 10; h <= 80; ++h) {
+            const OfferResult rh = f.idx->offer_block(nullptr, Rig::block_for(prev, h, agc_at(*f.idx, h - 1), 0, 0), true);
+            checkf(rh.outcome == OfferOutcome::Connected, "altrestart: main block %llu", static_cast<unsigned long long>(h));
+            prev = rh.id;
+        }
         checkf(w_before.has_value() && rows.save(why), "altrestart: P weighted and the table saved (%s)", why.c_str());
         checkf(f.idx->save_snapshot(snap, why), "altrestart: the native snapshot saved (%s)", why.c_str());
     }
     {
-        // the restart from the native snapshot (a chain this short: taken at the tip, no rollback below it): P comes
-        // back (a join's FB_GETCTX) and is held, its RowWeights cannot be computed again; they are the saved ones
+        // the restart from the native snapshot (its base 64 below the tip at 80, above P's fork at 7): P comes back
+        // (a join's FB_GETCTX) and is held, its RowWeights cannot be computed again; they are the saved ones
         ModelVerifier mv;
         LightVerifierPowSource<ModelVerifier> src{mv};
         ChainIndex restored(sopts, src);
@@ -996,17 +1010,118 @@ static void test_alt_rows_restart() {
                "altrestart: P held again (as a join's context): it resolves, block + the same RowWeights");
     }
     {
+        // a kept file that does not decode: the main rows still load, the message says so; a forged count is refused
+        // before the rows are read
+        const std::string bad = (dir / "bad_rows").string();
+        fs::copy_file(table, bad);
+        {
+            std::ofstream f(bad + "_kept", std::ios::binary | std::ios::trunc);
+            const unsigned char forged[] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x01};
+            f.write(reinterpret_cast<const char*>(forged), sizeof forged);
+        }
+        Rig g(8);
+        c2pool::xmr::pathb::PathbFollowerRows rows(bad);
+        rows.bind(g.idx);
+        std::string why;
+        const bool ok = rows.load(why);
+        checkf(ok && !why.empty() && !rows.weights(p).has_value(),
+               "altrestart: kept rows with a forged count: refused before their rows are read; the load goes on with the "
+               "main rows and says so (%s)", why.c_str());
+    }
+    {
         Rig g(12);  // the tip at 12: P (8) is more than k_alt = 3 below it
         c2pool::xmr::pathb::PathbFollowerRows rows(table);
         rows.bind(g.idx);
-        std::string why;
-        checkf(rows.load(why) && rows.weights(p).has_value(), "altrestart: loaded at a tip of 12");
         rows.set_alt_keep(3);
+        std::string why;
+        checkf(rows.load(why) && rows.weights(p).has_value() && !rows.block(p).has_value(),
+               "altrestart: loaded at a tip of 12: P (8, more than k_alt below) not served before any save");
         checkf(rows.save(why), "altrestart: saved (%s)", why.c_str());
         c2pool::xmr::pathb::PathbFollowerRows again(table);
         again.bind(g.idx);
         checkf(again.load(why) && !again.weights(p).has_value(), "altrestart: a row more than k_alt below the tip is dropped");
     }
+    fs::remove_all(dir);
+}
+
+// H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 100 is snapshotted (base 36),
+// resumed and snapshotted again, and a fresh index loads the second snapshot; a heavier branch forking at 98 (two blocks
+// below the resume point) is adopted -- each snapshot took its base snapshot_depth (64) below the tip from the rows it
+// holds back to genesis, and replayed the rest.
+static void test_resume_reorg_below() {
+    std::vector<std::uint8_t> snap;
+    ChainIndexOptions sopts;
+    std::vector<Hash> ids;
+    std::vector<BlockEntry> branch;
+    {
+        Rig f(100);
+        sopts = f.opts;
+        ids = f.main_ids;
+        std::string why;
+        checkf(f.idx->save_snapshot(snap, why), "resumereorg: the snapshot saved (%s)", why.c_str());
+        branch = build_branch(*f.idx, f.main_ids[97], 98, 3, /*salt_base=*/61);
+    }
+    ModelVerifier mv0;
+    LightVerifierPowSource<ModelVerifier> src0{mv0};
+    std::vector<std::uint8_t> snap2;
+    {
+        // a first resume, then its own snapshot (no block in between): the second resume keeps the rollback too
+        ChainIndex first(sopts, src0);
+        std::string why0;
+        checkf(first.load_snapshot(snap, why0) && first.save_snapshot(snap2, why0), "resumereorg: resumed once and "
+               "snapshotted again (%s)", why0.c_str());
+    }
+    ModelVerifier mv;
+    LightVerifierPowSource<ModelVerifier> src{mv};
+    ChainIndex restored(sopts, src);
+    std::string why;
+    checkf(restored.load_snapshot(snap2, why) && restored.tip() && restored.tip()->id == ids[99],
+           "resumereorg: the second snapshot loads at 100 (%s)", why.c_str());
+    OfferOutcome last = OfferOutcome::Rejected;
+    for (const BlockEntry& e : branch) last = restored.offer_block(nullptr, e, /*own_mined=*/false).outcome;
+    checkf(last == OfferOutcome::Reorged && restored.tip() && restored.tip()->height == 101
+                   && restored.tip()->id == id_of(branch.back()),
+           "resumereorg: a branch forking 2 below the resume point is adopted (last offer %s, tip %llu)",
+           to_string(last), static_cast<unsigned long long>(restored.tip() ? restored.tip()->height : 0));
+}
+
+// I. THE KEPT FILE'S CAP: (k_alt + 1) + alt_max_blocks rows (721 + 512 = 1,233 at the code's values). A well-formed kept
+// file of 1,233 rows loads; one of 1,234 is refused before its rows are read (the main rows load, the message says so).
+static void test_kept_cap() {
+    namespace fs = std::filesystem;
+    namespace pbn = c2pool::xmr::pathb;
+    const std::uint64_t cap = pbn::kept_rows_cap();
+    checkf(cap == 720 + 1 + ChainIndexOptions{}.alt_max_blocks && cap == 1233, "keptcap: the cap is 721 + 512 = 1,233 (%llu)",
+           static_cast<unsigned long long>(cap));
+    const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_cap_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto write = [&](const std::string& path, std::uint64_t n) {
+        std::map<pbn::Hash32, pbn::KeptRow> t;
+        for (std::uint64_t k = 0; k < n; ++k) {
+            pbn::KeptRow r;
+            r.row.id[0] = static_cast<std::uint8_t>(k >> 8);
+            r.row.id[1] = static_cast<std::uint8_t>(k);
+            r.row.id[31] = 0x5c;
+            r.row.height = 1000 + k;
+            r.w = pbn::RowWeights{1, 300000, 300000, 300000, 16};
+            t.emplace(r.row.id, r);
+        }
+        const std::vector<std::uint8_t> main = pbn::encode_row_weights_table({});
+        const std::vector<std::uint8_t> kept = pbn::encode_kept_rows(t);
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(main.data()), static_cast<std::streamsize>(main.size()));
+        std::ofstream(path + "_kept", std::ios::binary).write(reinterpret_cast<const char*>(kept.data()), static_cast<std::streamsize>(kept.size()));
+    };
+    const std::string at = (dir / "at_cap").string(), over = (dir / "over_cap").string();
+    write(at, cap);
+    write(over, cap + 1);
+    pbn::PathbFollowerRows a(at), b(over);
+    std::string wa, wb;
+    const bool la = a.load(wa), lb = b.load(wb);
+    checkf(la && wa.empty() && a.loaded() == cap, "keptcap: a kept file of %llu rows loads (%zu loaded; %s)",
+           static_cast<unsigned long long>(cap), a.loaded(), wa.c_str());
+    checkf(lb && !wb.empty() && b.loaded() == 0, "keptcap: a kept file of %llu rows is refused, the main rows load (%s)",
+           static_cast<unsigned long long>(cap + 1), wb.c_str());
     fs::remove_all(dir);
 }
 
@@ -1020,6 +1135,8 @@ int main() {
     test_alt_rows();
     test_alt_rows_out_of_order();
     test_alt_rows_restart();
+    test_resume_reorg_below();
+    test_kept_cap();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

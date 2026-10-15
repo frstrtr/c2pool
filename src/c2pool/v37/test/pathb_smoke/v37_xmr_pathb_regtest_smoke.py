@@ -27,11 +27,10 @@
 #             the receipt carried; all nodes on one best tip
 #   restart   C's store corrupted while A and B run (they hold the side
 #             headers they saw; a restarted server serves only the closure
-#             walks of the side branches it has seen since its restart, P-51),
-#             C's Monero view from genesis (its native snapshot removed):
+#             walks of the side branches it has seen since its restart, P-51):
 #             load failure (an unreadable store moved aside) -> the joiner
 #             path -> C on the peers' best tip; then A, B, C stopped and
-#             started twice, their Monero views from genesis: byte-equal
+#             started twice, each resuming its native snapshot: byte-equal
 #             digests
 #   fo        D: start line, no listener, no pathb_db, a follow line per
 #             monerod block with monerod's id, TOTAL=0; fee-diverse
@@ -822,15 +821,24 @@ class Rig:
             rc = self.nodes[n].stop(signal.SIGINT, 90)
             self.res.note("restart", "stop %s rc=%s" % (n, rc))
 
-    def drop_native_snapshot(self, n):
-        # the node's Monero view starts from genesis: a native snapshot resume has no rollback below its resume
-        # point (snapshot depth 0 on a chain this short) and no ring resolution; the restart part checks the Path B
-        # store (the native resume is the fo and solo parts')
-        for f in ("chain.snap", "chain.snap.outset"):
-            fp = os.path.join(self.work, "node" + n, f)
-            if os.path.exists(fp):
-                os.remove(fp)
-                self.res.note("restart", "%s: removed %s" % (n, fp))
+    def send_transfers(self, plan, part):
+        # transfers from the funding wallet: [(destination, priority)]; returns [(tx_hash, priority, fee)]
+        self.wallet("close_wallet")
+        self.wallet("open_wallet", {"filename": "wfund"})
+        self.wallet("refresh")
+        sent = []
+        for i, (dst, prio) in enumerate(plan):
+            try:
+                r = self.wallet("transfer", {"destinations": [{"amount": 1000000000000 + i, "address": self.addr[dst]}],
+                                             "priority": prio, "ring_size": 16})
+                sent.append((r["tx_hash"], prio, r.get("fee")))
+            except Fail as e:
+                self.res.note(part, "transfer %d failed: %s" % (i, e))
+        return sent
+
+    def txpool_count(self, p):
+        c = re.findall(r"^  txpool: .*\| count=(\d+)", p.text(), re.M)
+        return int(c[-1]) if c else 0
 
     def digests_now(self, names, settle_s=8):
         def ready():
@@ -849,7 +857,6 @@ class Rig:
         # load failure first: C's store corrupted while A and B keep running (their side headers held in memory).
         # C is stopped and started once (the store's log goes into a table file), then stopped and corrupted.
         self.stop_pool("C")
-        self.drop_native_snapshot("C")
         self.start_pool_node("C", False)
         self.stop_pool("C")
         dbs = [os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(self.work, "nodeC", "regtest", "pathb_db"))
@@ -867,7 +874,6 @@ class Rig:
             f.seek(sz // 2)
             f.write(blk)
         self.res.note("restart", "C: corrupted 64 bytes at offset %d of %s (%d bytes)" % (sz // 2, victim, sz))
-        self.drop_native_snapshot("C")
         try:
             p = self.start_pool_node("C", False)
         except Fail as e:
@@ -897,7 +903,9 @@ class Rig:
             att = re.findall(r"^  relay: join attempt .*$", p.text(), re.M)
             self.res.note("restart", "C join attempts: %d, last %s" % (len(att), att[-1] if att else "-"))
             self.res.check("restart", False, str(e))
-        # then A, B, C stopped and started twice: byte-equal digests
+        # then A, B, C stopped and started twice: byte-equal digests. Between the two restarts (no miner runs) transactions
+        # go into monerod's pool and A holds a broadcast one before the stop: each node's first template after the
+        # second restart carries them
         try:
             pre = {}
             for n in "ABC":
@@ -908,7 +916,6 @@ class Rig:
             rounds = []
             for r in (1, 2):
                 for n in "ABC":
-                    self.drop_native_snapshot(n)  # the Path B stores are what these restarts check
                     self.start_pool_node(n, False)
                 wait_for(lambda: all(self.relay_ready(n) >= 2 for n in "ABC"), 180, "relay links after restart %d" % r)
                 loaded = {}
@@ -917,6 +924,15 @@ class Rig:
                     loaded[n] = m[-1] if m else None
                 dg = self.digests_now("ABC")
                 rounds.append(dg)
+                if r == 2:
+                    first = {}
+                    for n in "ABC":
+                        tl = re.findall(r"^template \d+: .* n_tx=(\d+) ", self.nodes[n].text(), re.M)
+                        first[n] = int(tl[0]) if tl else None
+                    pool = http_json("http://127.0.0.1:%d/get_transaction_pool" % self.m1(), {}).get("transactions", [])
+                    self.res.check("restart", all(first[n] is not None and first[n] >= 1 for n in "ABC"),
+                                   "restart 2: each node's first template carries the pool's transactions (n_tx %s; "
+                                   "monerod's pool %d)" % (first, len(pool)))
                 self.res.note("restart", "restart %d: store loaded best position %s; digests %s" % (r, loaded, dg))
                 self.res.check("restart", all(loaded[n] is not None for n in "ABC"),
                                "restart %d: A, B, C loaded their stores (best positions %s)" % (r, loaded))
@@ -926,6 +942,13 @@ class Rig:
                     for n in "ABC":
                         if pre[n] is not None:
                             self.res.note("restart", "%s: pre-stop pos %s, loaded pos %s" % (n, pre[n][0], dg[n][0]))
+                    sent = self.send_transfers([("B", 2), ("C", 3)], "restart")
+                    self.res.note("restart", "sent %s" % (sent,))
+                    try:
+                        wait_for(lambda: self.txpool_count(self.nodes["A"]) >= 1 or None, self.a.fo_bcast_s,
+                                 "A holds a broadcast transaction before the stop", 2)
+                    except Fail as e:
+                        self.res.check("restart", False, str(e))
                     self.stop_pool("ABC")
             self.res.check("restart", rounds[0] == rounds[1], "restart 1 == restart 2 per node, byte-equal digests")
         except Fail as e:
@@ -975,17 +998,7 @@ class Rig:
         p = self.nodes["D"]
         # fee-diverse transactions in monerod's pool; D runs until it holds one of them: the network has broadcast it
         # (monerod's complement answer carries broadcast transactions only, not its local or stem ones)
-        self.wallet("close_wallet")
-        self.wallet("open_wallet", {"filename": "wfund"})
-        self.wallet("refresh")
-        sent = []
-        for i, (dst, prio) in enumerate([("A", 1), ("B", 2), ("C", 3), ("E", 4), ("O", 1), ("A", 3)]):
-            try:
-                r = self.wallet("transfer", {"destinations": [{"amount": 1000000000000 + i, "address": self.addr[dst]}],
-                                             "priority": prio, "ring_size": 16})
-                sent.append((r["tx_hash"], prio, r.get("fee")))
-            except Fail as e:
-                self.res.note("fo", "transfer %d failed: %s" % (i, e))
+        sent = self.send_transfers([("A", 1), ("B", 2), ("C", 3), ("E", 4), ("O", 1), ("A", 3)], "fo")
         pool = http_json("http://127.0.0.1:%d/get_transaction_pool" % self.m1(), {}).get("transactions", [])
         rates = sorted({round(int(x["fee"]) / max(1, int(x["weight"])), 3) for x in pool})
         self.res.note("fo", "sent %s; monerod pool %d txs, fee/weight rates %s" % (sent, len(pool), rates))

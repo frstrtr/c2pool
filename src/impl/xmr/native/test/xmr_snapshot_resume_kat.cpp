@@ -73,6 +73,11 @@
 //                    missing or corrupt or foreign snapshot still starts on the
 //                    boot path, and a gate-4 REFUSAL arms no saver -- proven by
 //                    the good file on disk being byte-identical afterwards.
+//   F  OUTPUT SET -- a genesis boot (no seeded set) resumes the image together
+//                    with the boot overlay written beside it: ring resolution
+//                    stays on, twice in a row (the clean stop writes both);
+//                    without the overlay file the image resumes alone, ring
+//                    resolution off (the fallback).
 //
 // No sockets are dialled (the node is configured with no peers and no seeds),
 // no daemon is contacted, and no RandomX is linked: the PoW gate is driven by a
@@ -82,6 +87,7 @@
 // 8 (the #1539 lesson).
 // ---------------------------------------------------------------------------
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -287,9 +293,14 @@ struct GenesisChain {
     native::fakes::FakeFetcher fetcher;
     std::vector<BlockEntry>    blocks;    // index 0 == height 1
     std::vector<Hash>          ids;       // index 0 == height 1
+    native::ChainOutputSet     outs{0};   // fed as the node feeds its own (the boot overlay's source)
 
     explicit GenesisChain(std::uint64_t n = kChainHeight) {
         idx.set_fetcher(&fetcher);
+        idx.subscribe_txs([this](const native::BlockTxEvent& ev) {
+            if (ev.kind == native::BlockTxEvent::Kind::Connected) outs.on_block_connected(ev);
+            else                                          outs.on_block_disconnected(ev);
+        });
 
         BlockEntry ge;
         ge.block_blob = genesis_blob();
@@ -1072,6 +1083,63 @@ void test_refused_gate4_writes_nothing() {
 
 } // namespace
 
+// ===========================================================================
+// F. THE OUTPUT SET RESUMES WITH THE IMAGE (a genesis boot, no seeded set)
+//    The image and the boot overlay beside it (`<snapshot>.outset`: sha256 of
+//    the image, then the set the boot built) resume together: ring resolution
+//    stays on. The node's clean stop writes both again, and the next start
+//    resumes with them. Without the overlay file the image resumes alone and
+//    ring resolution is off (the old posture, still the fallback).
+// ===========================================================================
+void test_node_resumes_the_output_set() {
+    GenesisChain              src;
+    std::vector<std::uint8_t> image, ovl;
+    std::string               why;
+    const bool img_ok = src.idx.save_snapshot(image, why);
+    const bool ovl_ok = src.outs.serialize_overlay(ovl, why);
+    kat::checkf(img_ok && ovl_ok, "outset: the fixture's image and its set's overlay are written (%s)", why.c_str());
+    if (!img_ok || !ovl_ok) return;
+    const std::string path = "snapres_kat_outset.snap";
+    std::vector<std::uint8_t> ofile;
+    {
+        native::anchor_hash::Sha256 h;
+        h.update(image.data(), image.size());
+        const std::array<std::uint8_t, 32> d = h.finish();
+        ofile.assign(d.begin(), d.end());
+        ofile.insert(ofile.end(), ovl.begin(), ovl.end());
+    }
+    kat::check(write_file(path, rt::encode_snapshot_envelope(regtest_genesis_key(), image))
+                       && write_file(path + ".outset", ofile),
+               "outset: the KAT writes the image and the overlay");
+    for (int run = 1; run <= 2; ++run) {
+        rt::NativeNode node(node_cfg(path));
+        std::string    start_why;
+        const bool     started = node.start(start_why);
+        kat::checkf(started, "outset: run %d starts (%s)", run, start_why.c_str());
+        if (!started) break;
+        const std::vector<std::string> log = node.take_log();
+        kat::checkf(log_has(log, "[snapshot] RESUMED") && log_has(log, "ring resolution intact")
+                            && !log_has(log, "ring resolution disabled"),
+                    "outset: run %d resumed the image together with its output set: ring resolution intact", run);
+        kat::checkf(node.index().tip() && node.index().tip()->id == src.tip_id(),
+                    "outset: run %d at the snapshot's tip", run);
+        std::remove((path + ".outset").c_str());   // what run 2 finds is what this run's stop writes
+        node.stop();   // the clean stop writes the image and the overlay again, for run 2
+    }
+    std::remove((path + ".outset").c_str());
+    {
+        rt::NativeNode node(node_cfg(path));
+        std::string    start_why;
+        const bool     started = node.start(start_why);
+        const std::vector<std::string> log = started ? node.take_log() : std::vector<std::string>{};
+        kat::check(started && log_has(log, "[snapshot] RESUMED") && log_has(log, "ring resolution disabled"),
+                   "outset: control: without the overlay file the image resumes alone, ring resolution off");
+        if (started) node.stop();
+    }
+    std::remove(path.c_str());
+    std::remove((path + ".outset").c_str());
+}
+
 int main() {
     test_fixture();
     test_genesis_resume();
@@ -1081,5 +1149,6 @@ int main() {
     test_node_resumes_without_reibd();
     test_node_falls_back_when_the_snapshot_is_unusable();
     test_refused_gate4_writes_nothing();
+    test_node_resumes_the_output_set();
     return kat::report("xmr_native_snapshot_resume_kat");
 }

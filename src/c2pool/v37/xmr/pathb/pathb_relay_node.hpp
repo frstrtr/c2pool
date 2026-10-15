@@ -142,7 +142,7 @@ struct PathbRelayOptions {
     std::optional<double> peer_valid_rate;
     std::optional<double> peer_valid_capacity;
     // P-50, the claim-leaf alarm budget per peer (unset: (1 + R_MAX) / T alarms/s, burst 1 + R_MAX)
-    std::optional<double> claim_alarm_rate;
+    std::optional<std::uint64_t> claim_alarm_rate_milli;  // P-50 refill, milli-alarms per second
     // P-40: the HELLO tails (connected peers past HELLO) a join attempt waits for
     std::size_t join_min_peers = kJoinMinPeersDefault;
     // the verify pool
@@ -351,7 +351,7 @@ public:
         valid_rate_ = o_.peer_valid_rate.value_or(static_cast<double>(1 + p_.r_max) / static_cast<double>(p_.carrier_interval_s));
         valid_cap_ = o_.peer_valid_capacity.value_or(
                 static_cast<double>(c.pending_cap != 0 ? c.pending_cap : relay_horizons(c.p).pending_cap));
-        claim_budget_ = ClaimAlarmBudget(p_, o_.claim_alarm_rate.value_or(0));
+        claim_budget_ = ClaimAlarmBudget(p_, o_.claim_alarm_rate_milli.value_or(0));
     }
     // The context source; its RandomX call leaves every exception as RandomxFailure (node-internal).
     void set_ctx_source(PathbCtxSource s) {
@@ -694,6 +694,15 @@ public:
         return b;
     }
     const PathbRelayOptions& options() const noexcept { return o_; }
+    // The context of an unsolicited receipt wanted (P-06), as a relayed frame's admission asks.
+    void want_context(const Hash32& id, std::uint64_t from) { want_ctx(id, from, 0, o_.ctx_max_depth); }
+    // The context wants held now: all, and those of a join's climb (P-07).
+    std::pair<std::size_t, std::size_t> ctx_wants_held() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        std::size_t joins = 0;
+        for (const auto& kv : ctx_want_) joins += kv.second.bound > o_.ctx_max_depth ? 1 : 0;
+        return {ctx_want_.size(), joins};
+    }
     std::uint64_t node_nonce() const noexcept { return nonce_; }
     const std::set<std::string>& self_keys() const noexcept { return self_keys_; }
     RelayLinks& links() noexcept { return links_; }
@@ -3004,15 +3013,17 @@ private:
     }
     void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, std::uint32_t bound) {
         std::lock_guard<std::mutex> lk(cmtx_);
-        const auto it = ctx_want_.find(id);
-        if (it != ctx_want_.end()) {
-            if (it->second.from == 0 && from != 0) it->second.from = from;
-            it->second.bound = std::max(it->second.bound, bound);
-            return;
-        }
         const bool join = bound > o_.ctx_max_depth;
         std::size_t joins = 0;
         for (const auto& kv : ctx_want_) joins += kv.second.bound > o_.ctx_max_depth ? 1 : 0;
+        const auto it = ctx_want_.find(id);
+        if (it != ctx_want_.end()) {
+            if (it->second.from == 0 && from != 0) it->second.from = from;
+            // a join's want raises the bound of an unsolicited one only within the join wants' count
+            if (bound > it->second.bound && (!join || it->second.bound > o_.ctx_max_depth || joins < o_.ctx_join_depth))
+                it->second.bound = bound;
+            return;
+        }
         if (join ? joins >= o_.ctx_join_depth : ctx_want_.size() - joins >= o_.ctx_want_max) return;
         CtxWant w;
         w.from = from;
