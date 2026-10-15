@@ -626,7 +626,9 @@ inline Basis JoinClaims::base_basis(RowClass k, const Hash32& tip, std::uint64_t
             // a carried receipt whose tip lies below the root x0 - 1 (ruling 47, E-84): its d_at window lies below the
             // PRE the joiner holds, a claim it does not compute
             if (replay && s.x0 > 1 && x <= s.x0 - 1) return Basis::NotComputed;
-            return replay && x <= x1 + s.inputs().p.retarget_span ? Basis::ClaimSpan : Basis::Computed;
+            // a window that reads the claimed prefix or span: a claim (after L, a mismatch is ClaimLeaf, never a BAN)
+            if (x <= x1 + s.inputs().p.retarget_span) return replay ? Basis::ClaimSpan : Basis::ClaimLeaf;
+            return Basis::Computed;
         case RowClass::Coinbase:
             if (x <= x1) return Basis::NotComputed;  // a tip below x1 (D35)
             if (replay) return x == x1 + 1 || st_->window_reads_claimed(tip) ? Basis::ClaimSpan : Basis::Computed;

@@ -468,6 +468,12 @@ public:
         *refs_ = std::move(loaded.refs);
         own_prefix_ = std::move(loaded.prefix_headers);
         own_chain_.seed_below(std::move(loaded.bound_below), loaded.bound_lo);
+        if (loaded.bound_lo > 0) {  // a joined store: its claim view after L, from x1 = K_BLO - 1, its claimed leaves
+            resumed_x1_ = loaded.bound_lo - 1;
+            for (const auto& [bin, c] : loaded.claimed) resumed_claimed_[bin] = AtHeader{c.at_id, c.at_digest};
+            resumed_.set_x1(loaded.bound_lo - 1);
+            claims_ = &resumed_;
+        }
         init_join();
     }
 
@@ -505,6 +511,9 @@ public:
     }
     // An attempt runs (3.3a: A keeps building templates, relaying and judging meanwhile).
     bool attempting() const noexcept { return attempting_; }
+    // E-72: the claimed leaves wait to be asked again after a switch by the journal (a joined store, in its session or
+    // after a restart).
+    bool reask_pending() const noexcept { return reask_pending_; }
     // 3.3a (2): the state rests on claims: no adopted state after a load failure, or the adopted state still
     // replayed to its L (no template, nothing relayed).
     bool rests_on_claims() const noexcept {
@@ -528,7 +537,7 @@ public:
         std::vector<std::shared_ptr<PathbJoinLink>> held;  // kept alive to the end of this call
         for (const auto& [peer, l] : links_) held.push_back(l);
         attempting_ = true;
-        if (reask_pending_ && joined_ != nullptr) reask_fetch(out);
+        if (reask_pending_ && joined_store()) reask_fetch(out);
         out.attempt = joiner_->attempt_next();
         attempting_ = false;
         for (const std::shared_ptr<PathbJoinLink>& l : held) l->reset();  // what an attempt received is its own
@@ -647,6 +656,13 @@ public:
     // The released carriers whose admission failed with a RandomX failure (drain_released): the caller runs them
     // again.
     std::vector<ParkedFrame> take_rx_failed() { return std::exchange(rx_failed_, {}); }
+    // The unsolicited released carriers placed by a drain (their first placement): the sender and the objects to
+    // count in P-15 (the carrier and its carried bodies not pending here).
+    struct PlacedRelease {
+        std::uint64_t peer = 0;
+        std::uint64_t objects = 0;
+    };
+    std::vector<PlacedRelease> take_placed_released() { return std::exchange(placed_released_, {}); }
     std::vector<ParkedFrame> take_rewalk_frames() {
         std::vector<ParkedFrame> out;
         if (poisoned_) return out;
@@ -800,11 +816,14 @@ public:
         AdmitResult admit;
         std::uint64_t generation = 0;
         bool relayed = true;
+        bool solicited = false;  // a reply to this node's own request (kept if it parks)
     };
 
-    CarrierTicket begin_carrier(std::uint64_t peer, std::span<const std::uint8_t> frame, bool relayed = true) {
+    CarrierTicket begin_carrier(std::uint64_t peer, std::span<const std::uint8_t> frame, bool relayed = true,
+                                bool solicited = false) {
         CarrierTicket t;
         t.peer = peer;
+        t.solicited = solicited;
         t.relayed = relayed;
         t.generation = generation_;
         if (poisoned_) return t;  // the latch: nothing judged after the poison
@@ -825,7 +844,7 @@ public:
         if (poisoned_) return node_internal();
         if (t.generation != generation_ && admitted(t.admit))
             t.admit = admit_frame_from(env(), t.peer, t.frame, CarrierRole::Frame);
-        return settle_carrier(t.peer, t.frame, t.admit, t.relayed);
+        return settle_carrier(t.peer, t.frame, t.admit, t.relayed, t.solicited);
     }
 
     NodeEventResult on_carrier(std::uint64_t peer, std::span<const std::uint8_t> frame) {
@@ -1332,9 +1351,21 @@ public:
                                           h.own.side.ballot});
         }
         std::size_t k = 0;
-        const auto pow_ok = [&](const CarrierAnnounce&, std::uint64_t d) {
-            const CarrierHeader& h = req.got[k++];
-            if (h.own.side.t_origin != d) return false;
+        // #8 at a position whose window reads a claim (the node's claim view): a mismatch is ClaimLeaf (alarm +
+        // DEFER), never a BAN
+        std::optional<std::size_t> claim_fail;
+        Basis claim_basis = Basis::Computed;
+        const auto pow_ok = [&](const CarrierAnnounce& a, std::uint64_t d) {
+            const std::size_t i = k++;
+            const CarrierHeader& h = req.got[i];
+            if (h.own.side.t_origin != d) {
+                const Basis b = basis_of(claims_, RowClass::Retarget, a.parent, fork->pos + 1 + i);
+                if (is_claim_basis(b) && !claim_fail) {
+                    claim_fail = i;
+                    claim_basis = b;
+                }
+                return false;
+            }
             const PrInfo pr = io_.resolve_pr(h.own.blob.prev_id);
             if (header_fields_verdict(header_fields(h.own, encoded_length(h.own), pr.in))) return false;
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
@@ -1345,8 +1376,14 @@ public:
             out.kind = HeadersOutcome::Kind::Keep;
             return out;
         }
-        for (const SideHeader& sh : *side) {
+        for (std::size_t i = 0; i < side->size(); ++i) {
+            const SideHeader& sh = (*side)[i];
             if (sh.check != HeaderCheck::Passed) {
+                if (claim_fail && *claim_fail == i) {  // #8 on a claim: alarm + DEFER, no token, nothing indexed
+                    alarm_.raise(RowId::R9, claim_basis, sh.id, Missing::ClaimAlarm);
+                    out.kind = HeadersOutcome::Kind::Defer;
+                    return out;
+                }
                 out.kind = HeadersOutcome::Kind::Ban;  // BAN the server; no variant of it indexed, its earlier ones released
                 headers_->release_peer(peer);
                 return out;
@@ -1471,14 +1508,14 @@ public:
             return out;
         }
         for (const auto& [bin, sb] : it->second.bins()) {
-            if (joined_ != nullptr && bin >= store_->b0() && bin - store_->b0() < store_->first_leaf()) {
+            if (joined_store() && bin >= store_->b0() && bin - store_->b0() < store_->first_leaf()) {
                 // below the joined MMR's start: adopted from the served bucket, a claim (3.7a; E-72)
                 SealedBin a;
                 a.bucket = sb.bucket;
                 a.leaf = sb.leaf;
                 a.refs = sb.refs;
                 if (store_->adopt_below(a)) {
-                    joined_->claimed[bin] = at_header(at);
+                    claim_leaf(bin, at_header(at));
                     learn_bucket_refs(sb.refs);
                 }
                 continue;
@@ -1693,6 +1730,18 @@ private:
         if (g.pos != 0)
             if (const CarrierBodyV3* b = bodies_->get(g.id)) return b->own.blob.prev_id;
         return cfg_.genesis_prev;
+    }
+
+    // The carried bodies of a carrier frame this node holds no pending copy of.
+    std::uint64_t carried_not_pending(std::span<const std::uint8_t> f) const {
+        if (f.size() < kFrameHeaderBytes) return 0;
+        CarrierBodyV3 c;
+        if (decode_carrier_body_v3(f.data() + kFrameHeaderBytes, f.size() - kFrameHeaderBytes,
+                                   CarrierLimits{cfg_.buffers.receipt, cfg_.p.r_max}, c) != WireError::None)
+            return 0;
+        std::uint64_t n = 0;
+        for (const ReceiptBodyV3& b : c.carried) n += pending_.holds(receipt_id(b)) ? 0 : 1;
+        return n;
     }
 
     std::optional<Hash32> prev_of(const Hash32& tip) const {
@@ -1915,7 +1964,10 @@ private:
             if (c == nullptr) return std::nullopt;
             return c->pos;
         }
-        std::optional<std::uint64_t> joined_x1() const override { return std::nullopt; }
+        // a joined store restarted: its x1 (K_BLO - 1); a full node's own chain: none
+        std::optional<std::uint64_t> joined_x1() const override {
+            return lo_edge_ > 0 ? std::optional<std::uint64_t>(lo_edge_ - 1) : std::nullopt;
+        }
         std::uint64_t store_base() const override { return n_->store_->base_pos(); }
         Hash32 tip() const override { return n_->store_->best_tip(); }
         std::uint64_t open_placements() const override { return open_bin_placements(*n_->store_); }
@@ -2051,10 +2103,91 @@ private:
         joiner_->set_own_chain(own ? &own_chain_ : nullptr);
     }
 
+    // A joined store, in its session (the adopted state) or after a restart (K_BLO).
+    bool joined_store() const noexcept { return joined_ != nullptr || resumed_x1_.has_value(); }
+    // Its x1 (nullopt: not a joined store, or a young chain).
+    std::optional<std::uint64_t> joined_x1_now() const {
+        if (joined_ != nullptr) return joined_->young ? std::nullopt : std::optional<std::uint64_t>(joined_->x1);
+        return resumed_x1_;
+    }
+    // Its claimed leaves: bin -> the at header the leaf was proved against (3.7a, E-72).
+    std::map<std::uint64_t, AtHeader>& claimed_map() { return joined_ != nullptr ? joined_->claimed : resumed_claimed_; }
+    const std::map<std::uint64_t, AtHeader>& claimed_map() const {
+        return joined_ != nullptr ? joined_->claimed : resumed_claimed_;
+    }
+    // A leaf adopted as a claim, kept in the store (K_BCLAIM) so that a restart judges with it.
+    void claim_leaf(std::uint64_t bin, const AtHeader& at) {
+        claimed_map()[bin] = at;
+        if (PathbKv* kv = store_kv()) {
+            LaneBatch b;
+            b.put(store_keys::bclaim(cfg_.record_chain, bin), encode_bclaim(BclaimRecord{bin, at.id, at.digest}));
+            if (!commit_lane_batch(*kv, b)) poison(store_->best_tip());
+        }
+    }
+    // The window at a tip at hf 16 reads a claimed leaf (JoinedState::window_reads_claimed, from the node's state).
+    bool window_reads_claimed_now(const Hash32& tip) {
+        const std::map<std::uint64_t, AtHeader>& claimed = claimed_map();
+        if (claimed.empty()) return false;
+        const std::optional<Hash32> pt = prev_of(tip);
+        if (!pt) return false;
+        const TipWindow tw = window_of(tip, *pt, kHf16);
+        if (!tw.ok() || tw.oldest_bin == 0) return false;
+        return tw.oldest_bin <= claimed.rbegin()->first;
+    }
+
+    // The claim view of a joined store after a restart (K_BLO): the joined state's view after L (JoinClaims, phase
+    // AfterL) from what the store keeps: x1 = K_BLO - 1, the joined MMR's first leaf, the claimed leaves (K_BCLAIM).
+    class ResumedClaims final : public ClaimView {
+    public:
+        explicit ResumedClaims(PathbNode& n) : n_(&n) {}
+        void set_x1(std::uint64_t x1) { x1_ = x1; }
+        Basis basis(RowClass k, const Hash32& tip, std::uint64_t x) const override {
+            switch (k) {
+                case RowClass::Retarget:  // a window that reads the claimed prefix or span
+                    return x <= x1_ + n_->cfg_.p.retarget_span ? Basis::ClaimLeaf : Basis::Computed;
+                case RowClass::Coinbase:
+                    if (x <= x1_) return Basis::NotComputed;
+                    return n_->window_reads_claimed_now(tip) ? Basis::ClaimLeaf : Basis::Computed;
+                case RowClass::Roots:
+                    if (x <= x1_) return Basis::NotComputed;
+                    return n_->store_->first_leaf() > 0 ? Basis::ClaimLeaf : Basis::Computed;
+                default: return Basis::Computed;
+            }
+        }
+        Basis header_binding(const Hash32& id, const Hash32& header_digest) const override {
+            if (const CarrierNode* c = n_->tree_->find(id); c != nullptr) return c->pos <= x1_ ? Basis::NotComputed : Basis::Computed;
+            const HeaderVariant* y = n_->headers_->variant(id, header_digest);
+            if (y == nullptr) return Basis::NotComputed;
+            const CarrierNode* pn = n_->tree_->find(y->header.own.side.tip);
+            return pn == nullptr || pn->pos < x1_ ? Basis::NotComputed : Basis::Computed;
+        }
+        bool judge_copy(std::uint64_t, const Hash32&) const override { return true; }
+        bool leaf_servable(std::uint64_t bin) const override {
+            const BinStore& st = *n_->store_;
+            if (n_->resumed_claimed_.count(bin) != 0) return false;  // an adopted leaf (a claim)
+            return !(bin >= st.b0() && bin - st.b0() < st.first_leaf());
+        }
+        bool at_servable(const Hash32& at_id, const Hash32& at_digest) const override {
+            const CarrierNode* c = n_->tree_->find(at_id);
+            if (c == nullptr || c->pos <= x1_) return false;
+            const CarrierBodyV3* b = n_->bodies_->get(at_id);
+            if (b == nullptr) return false;
+            const std::optional<Hash32> dg = header_digest(header_of(*b));
+            return dg && *dg == at_digest;
+        }
+        bool rests_on_claims() const override { return false; }
+
+    private:
+        PathbNode* n_;
+        std::uint64_t x1_ = 0;
+    };
+
     // The node's own switch at a fork position takes the joiner path: below the
-    // journal base (one depth measure); a joined node also at or below its x1.
+    // journal base (one depth measure); a joined node also at or below its x1
+    // (in its session, and after a restart from K_BLO).
     bool deep_switch(std::uint64_t fork) const {
         if (joined_ != nullptr) return own_switch_path(*joined_, fork) == SwitchPath::Joiner;
+        if (const std::optional<std::uint64_t> x1 = own_chain_.joined_x1(); x1 && fork <= *x1) return true;
         return fork < store_->base_pos();
     }
 
@@ -2113,6 +2246,9 @@ private:
         closed_.clear();
         release_q_.clear();
         rx_failed_.clear();
+        placed_released_.clear();
+        resumed_x1_.reset();
+        resumed_claimed_.clear();
         jbelow_.clear();
         jbelow_unwritten_.clear();
         jbelow_done_ = 0;
@@ -2128,6 +2264,8 @@ private:
         if (ab) b.ops.insert(b.ops.end(), ab->ops.begin(), ab->ops.end());
         // the lower edge of A's bound work (x1 + 1), read at a restart (K_BLO)
         if (!js->young) b.put(store_keys::blo(cfg_.record_chain), encode_blo(js->x1 + 1));
+        for (const auto& [bin, at] : js->claimed)  // the leaves adopted as claims (K_BCLAIM)
+            b.put(store_keys::bclaim(cfg_.record_chain, bin), encode_bclaim(BclaimRecord{bin, at.id, at.digest}));
         if (!cleared || !ab || !commit_lane_batch(*kv_, b)) {
             poison(store_->best_tip());
             return true;
@@ -2146,11 +2284,12 @@ private:
     // so the joiner path (own_switch_path; reask_replay).
     void reask_fetch(JoinAttempted& t) {
         reask_pending_ = false;
-        const JoinedState& js = *joined_;
-        if (js.young || js.claimed.empty()) return;
+        const std::map<std::uint64_t, AtHeader>& claimed = claimed_map();
+        const std::optional<std::uint64_t> x1 = joined_x1_now();
+        if (!x1 || claimed.empty()) return;  // a young chain: no claim
         std::vector<AtHeader> bound;
         std::vector<std::pair<Hash32, std::uint64_t>> heavier;
-        for (std::uint64_t x = js.x1 + 1; x <= store_->tip_pos(); ++x) {
+        for (std::uint64_t x = *x1 + 1; x <= store_->tip_pos(); ++x) {
             const std::optional<Hash32> id = store_->best_at(x);
             if (!id) continue;
             const CarrierNode* n = tree_->find(*id);
@@ -2160,7 +2299,7 @@ private:
             if (pv.ok()) heavier.emplace_back(*id, pv.leaf_count());
         }
         const std::vector<JoinBuckets::Reask> rs =
-                JoinBuckets::reask_scope(js.claimed, bound, mismatched_, heavier, store_->b0());
+                JoinBuckets::reask_scope(claimed, bound, mismatched_, heavier, store_->b0());
         std::vector<std::shared_ptr<PathbJoinLink>> held;  // alive to the end of the re-ask
         std::vector<JoinLink*> peers;
         for (const auto& [peer, l] : links_) {
@@ -2179,8 +2318,7 @@ private:
         }
     }
     void reask_apply(const JoinAttempted& t, JoinStep& out) {
-        if (joined_ == nullptr) return;
-        JoinedState& js = *joined_;
+        if (!joined_store()) return;
         for (const JoinAttempted::Reasked& r : t.reask) {
             ++out.reasked;
             // the at carrier still bound on the best chain (else the next switch asks again)
@@ -2191,14 +2329,14 @@ private:
             }
             const std::optional<Hash32> held = store_->best_mmr().leaf(r.bin - store_->b0());
             if (held && *held == r.leaf) {
-                js.claimed[r.bin] = r.at;  // the same leaf, now proved against a carrier of this chain
+                claim_leaf(r.bin, r.at);  // the same leaf, now proved against a carrier of this chain
                 mismatched_.erase(r.bin);
                 continue;
             }
             // a different leaf: replay from the position before the bin's seal (at or below x1): the joiner path,
             // the server's best tip with it a candidate
             const ReaskReplay rr = reask_replay(seal_pos_of(r.bin), store_->base_pos());
-            if (rr.joiner_path || own_switch_path(js, rr.from) == SwitchPath::Joiner) {
+            if (rr.joiner_path || deep_switch(rr.from)) {
                 out.reask_joiner = true;
                 const auto pt = peers_.find(r.server);
                 if (pt != peers_.end()) offer(pt->second.best_tip, r.server, pt->second.best_cum_work);
@@ -2276,12 +2414,12 @@ private:
 
     // ---- E7: the placement and what follows it ----
     NodeEventResult settle_carrier(std::uint64_t peer, const std::vector<std::uint8_t>& frame, const AdmitResult& r,
-                                   bool relayed) {
+                                   bool relayed, bool solicited = false) {
         ++settle_depth_;
         max_settle_depth_ = std::max(max_settle_depth_, settle_depth_);
         NodeEventResult out;
         try {
-            out = settle_once(peer, frame, r, relayed);
+            out = settle_once(peer, frame, r, relayed, solicited);
         } catch (...) {
             --settle_depth_;
             throw;
@@ -2303,7 +2441,11 @@ private:
                 ParkedFrame f = std::move(release_q_.front());
                 release_q_.pop_front();
                 try {
-                    (void)on_carrier(f.peer, f.frame);
+                    const std::uint64_t fresh = f.solicited ? 0 : carried_not_pending(f.frame);
+                    const NodeEventResult r = complete_carrier(begin_carrier(f.peer, f.frame, true, f.solicited));
+                    if (!f.solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
+                                         r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
+                        placed_released_.push_back(PlacedRelease{f.peer, 1 + fresh});  // its first placement (P-15)
                 } catch (const RandomxFailure&) {
                     rx_failed_.push_back(std::move(f));
                 }
@@ -2318,12 +2460,12 @@ private:
     }
 
     NodeEventResult settle_once(std::uint64_t peer, const std::vector<std::uint8_t>& frame, const AdmitResult& r,
-                                bool relayed) {
+                                bool relayed, bool solicited = false) {
         NodeEventResult out;
         out.admit = r;
         if (r.verdict == AdmitVerdict::Defer) {
             out.action = NodeAction::Parked;
-            park(peer, frame, r);
+            park(peer, frame, r, solicited);
             return out;
         }
         if (r.verdict != AdmitVerdict::AdmitCarrier) {
@@ -2377,12 +2519,13 @@ private:
         return out;
     }
 
-    void park(std::uint64_t peer, const std::vector<std::uint8_t>& frame, const AdmitResult& r) {
+    void park(std::uint64_t peer, const std::vector<std::uint8_t>& frame, const AdmitResult& r, bool solicited = false) {
         if (!r.missing || *r.missing == Missing::CopyDeferred) return;
         ParkedFrame f;
         f.digest = r.digest == Hash32{} ? ::v37::sha256d(frame) : r.digest;
         f.peer = peer;
         f.frame = frame;
+        f.solicited = solicited;
         f.cause = *r.missing;
         f.claim_based = r.claim_based;
         f.walked = r.walked;
@@ -2519,7 +2662,7 @@ private:
                 if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) ++out.repended;
             }
         }
-        if (joined_ != nullptr) reask_pending_ = true;  // E-72: the claimed leaves asked again at the new chain
+        if (joined_store()) reask_pending_ = true;  // E-72: the claimed leaves asked again at the new chain
         after_best_change();
         return out;
     }
@@ -2568,6 +2711,7 @@ private:
     std::set<std::uint64_t> hold_conns_;
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
+    std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_
@@ -2576,6 +2720,9 @@ private:
     JoinInputs join_in_;
     std::optional<Joiner> joiner_;
     FullNodeA own_chain_{*this};
+    ResumedClaims resumed_{*this};
+    std::optional<std::uint64_t> resumed_x1_;           // a joined store after a restart: its x1 (K_BLO - 1)
+    std::map<std::uint64_t, AtHeader> resumed_claimed_;  // and its claimed leaves (K_BCLAIM)
     JoinTransport* transport_ = nullptr;
     std::map<std::uint64_t, std::shared_ptr<PathbJoinLink>> links_;
     std::set<std::uint64_t> left_;  // servers that disconnected while an attempt ran
