@@ -96,11 +96,6 @@ scopes:
       - src/impl/xmr/native/consensus/**
       - src/impl/xmr/pow/randomx_verify.hpp
       - src/c2pool/v37/xmr/relay/xmr_order_rule.hpp
-      - src/c2pool/v37/xmr/relay/xmr_share_verdict.hpp
-      - src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp
-      - src/c2pool/v37/xmr/relay/xmr_rbind_registry.hpp
-      - src/c2pool/v37/xmr/xmr_lane_rules.hpp
-      - src/c2pool/v37/xmr/xmr_lane_rules_build.hpp
       - src/c2pool/v37/xmr/xmr_credit_cut.hpp
       - src/c2pool/v37/xmr/xmr_cut_payees.hpp
       - src/c2pool/v37/xmr/xmr_coinbase_authority.hpp
@@ -108,8 +103,6 @@ scopes:
       - src/c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp
       - src/c2pool/v37/xmr/xmr_paynow.hpp
       - src/c2pool/v37/xmr/xmr_fee_model.hpp
-      - src/c2pool/v37/xmr/xmr_pool_tag.hpp
-      - src/c2pool/v37/xmr/xmr_drops_wiring.hpp
       - src/sharechain/v37/**
     exclude:
       - '**/test/**'
@@ -263,8 +256,8 @@ rules:
         min_count: 2
       - name: r1-stage-relay
         type: required
-        pattern: '\bCheckStage::R1\b'
-        paths: [src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp]
+        pattern: '\b(?:admit_frame_from|admit_receipt_from)\s*\('
+        paths: [src/c2pool/v37/xmr/pathb/pathb_node.hpp]
         code_only: true
         min_count: 1
       - name: no-credit-from-achieved
@@ -703,8 +696,8 @@ rules:
     checks:
       - name: give-author-in-preimage
         type: required
-        pattern: '\bu16\s+give_author(?:_bp)?\b'
-        paths: [src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp, src/impl/xmr/receipt/xmr_receipt.hpp]
+        pattern: '\b(?:u16|std::uint16_t)\s+give_author(?:_bp)?\b'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp, src/impl/xmr/receipt/xmr_receipt.hpp]
         code_only: true
       - name: donation-marker-absent
         type: forbidden
@@ -763,18 +756,18 @@ rules:
     checks:
       - name: mismatch-refusal
         type: required
-        pattern: 'kLaneRulesMismatch\[\]\s*=\s*"LANE_RULES_MISMATCH"'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        pattern: '\bkLaneRulesMismatchText\s*=\s*"LANE_RULES_MISMATCH"'
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: false
-      - name: rules-digest-in-pool-tag
+      - name: rules-digest-in-lane-rules
         type: required
         pattern: '\brules_digest\b'
-        paths: [src/c2pool/v37/xmr/xmr_pool_tag.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: single-digest-field
         type: required
         pattern: '\bmonero_rules_digest\b'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: lane-rules-kats
         type: required_kat
@@ -1228,7 +1221,7 @@ rules:
       - name: no-policy-in-lane-rules
         type: forbidden
         pattern: '\b(?:journal_depth|index_horizon|backfill_positions|ctx_window|ctx_max_depth|index_retention_blocks|pending_cap|verify_threads|per_peer_capacity|solicited_credits)\b'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: lane-rules-kat
         type: required_kat

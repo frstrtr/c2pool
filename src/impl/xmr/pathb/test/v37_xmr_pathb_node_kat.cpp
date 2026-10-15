@@ -2295,9 +2295,9 @@ void relaysmoke() {
         timeval tv{};
         tv.tv_sec = 5;
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        ::c2pool::v37n::xmr::relay::Hello old;
-        old.network = 3;
-        const std::vector<std::uint8_t> f = ::c2pool::v37n::xmr::relay::encode_hello(old);
+        // an old node's HELLO of 102 B: 0x40 | frame version 0x01 | magic 'C2XR' | network 3 | 95 zero bytes
+        std::vector<std::uint8_t> f = {0x40, 0x01, 'C', '2', 'X', 'R', 3};
+        f.resize(102, 0);
         std::vector<std::uint8_t> msg;
         for (int i = 0; i < 4; ++i) msg.push_back(static_cast<std::uint8_t>(f.size() >> (8 * i)));
         msg.insert(msg.end(), f.begin(), f.end());
