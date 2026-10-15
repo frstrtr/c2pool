@@ -76,6 +76,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <unistd.h>
 #include <optional>
 #include <string>
@@ -1006,12 +1007,32 @@ static void test_alt_rows_restart() {
                "altrestart: P held again (as a join's context): it resolves, block + the same RowWeights");
     }
     {
+        // a kept file that does not decode: the main rows still load, the message says so; a forged count is refused
+        // before the rows are read
+        const std::string bad = (dir / "bad_rows").string();
+        fs::copy_file(table, bad);
+        {
+            std::ofstream f(bad + "_kept", std::ios::binary | std::ios::trunc);
+            const unsigned char forged[] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x01};
+            f.write(reinterpret_cast<const char*>(forged), sizeof forged);
+        }
+        Rig g(8);
+        c2pool::xmr::pathb::PathbFollowerRows rows(bad);
+        rows.bind(g.idx);
+        std::string why;
+        const bool ok = rows.load(why);
+        checkf(ok && !why.empty() && !rows.weights(p).has_value(),
+               "altrestart: kept rows with a forged count: refused before their rows are read; the load goes on with the "
+               "main rows and says so (%s)", why.c_str());
+    }
+    {
         Rig g(12);  // the tip at 12: P (8) is more than k_alt = 3 below it
         c2pool::xmr::pathb::PathbFollowerRows rows(table);
         rows.bind(g.idx);
-        std::string why;
-        checkf(rows.load(why) && rows.weights(p).has_value(), "altrestart: loaded at a tip of 12");
         rows.set_alt_keep(3);
+        std::string why;
+        checkf(rows.load(why) && rows.weights(p).has_value() && !rows.block(p).has_value(),
+               "altrestart: loaded at a tip of 12: P (8, more than k_alt below) not served before any save");
         checkf(rows.save(why), "altrestart: saved (%s)", why.c_str());
         c2pool::xmr::pathb::PathbFollowerRows again(table);
         again.bind(g.idx);

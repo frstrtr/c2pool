@@ -24,6 +24,8 @@
 //   N3  the context RandomX throws once at C (a node-internal failure): a
 //       local alarm, no strike, no ban; the want kept and judged again:
 //       resolved
+//   N5  the join wants' cap (P-07) holds when a join raises an unsolicited
+//       want's bound: up to the cap raised, the next kept unsolicited
 //   N4  a join's context (a carrier under verification) 5 blocks above C's
 //       index, on a branch only A holds: the want climbs to the index (P-07,
 //       not P-06), every block judged and fed into C's follower
@@ -199,6 +201,27 @@ int main() {
     C(z_all && Cn.n->r().options().ctx_max_depth == 3 && Cn.n->r().options().ctx_join_depth == 720,
       "N4 a join's context 5 blocks above C's index (a branch only A holds) climbs to it (P-07): every block of the "
       "branch verified, judged and fed into C's follower");
+
+    // ── N5 the join wants' count holds when an unsolicited want is raised to a join's bound ─
+    // A node whose join wants are capped at 4 (the climb's bound, here 4 > P-06) holds five unsolicited wants; a join
+    // wants all five: four are raised to the join's bound, the fifth stays an unsolicited want (the cap is checked at
+    // the raise as at an insertion).
+    {
+        pb::PathbRelayOptions od = opts(false, {});
+        od.ctx_join_depth = 4;
+        TNode D(rig, "D", od);
+        std::string w;
+        C(D.n->start(w), "D starts " + w);
+        std::vector<bytes32> ids;
+        for (int k = 0; k < 5; ++k) ids.push_back(b32_of(static_cast<std::uint8_t>(201 + k)));
+        for (const bytes32& x : ids) D.n->r().want_context(x, 0);
+        const auto before = D.n->r().ctx_wants_held();
+        for (const bytes32& x : ids) (void)D.n->fetch_context(x, 0);
+        const auto after = D.n->r().ctx_wants_held();
+        C(before.first == 5 && before.second == 0 && after.first == 5 && after.second == 4,
+          "N5 five unsolicited wants, a join wants all five: four raised to the join's bound, the fifth kept unsolicited "
+          "(join wants " + std::to_string(after.second) + " of a cap of 4)");
+    }
 
     for (auto* t : {&A, &B, &Cn}) if (C.fail) t->n->dump_logs();
     std::printf("    C %s\n", Cn.n->r().describe().c_str());

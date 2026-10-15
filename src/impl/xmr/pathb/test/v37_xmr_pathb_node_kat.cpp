@@ -108,6 +108,11 @@
 //   relayp15rx   P-15: a receipts frame whose second body's RandomX fails:
 //                one job per body: the other two counted at once, the
 //                second at its re-run; three first-seen, three counted;
+//   alarmbound   the alarm sink counts by (row, cause) and keeps the last
+//                entry: it does not grow with the node's life;
+//   ownbound     the kept own shares bounded by the jobs' lifetime: a stale
+//                one leaves though RandomX fails before it; clear()
+//                releases the issued jobs;
 //   relaystale   a gone peer's events (in flight, posted by its blocked
 //                reader) skipped: no join hold for the gone peer;
 //   relaytip     on_monero_tip from the follower's thread and under the node
@@ -175,6 +180,7 @@
 #include <vector>
 
 #include "c2pool/v37/xmr/pathb/pathb_own_share.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_job_source.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_links.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_startup.hpp"
@@ -2992,6 +2998,66 @@ void relayp15rx() {
 }
 
 // ---------------------------------------------------------------------------
+// ownbound: the kept own shares are bounded by the issued jobs' lifetime. (1) Three shares kept (RandomX failing); the
+// second's job goes stale; RandomX still fails on the first: the stale second leaves at once (not only from the front).
+// (2) PathbJobSource::clear() releases the issued jobs: a share on one of them is stale.
+void ownbound() {
+    std::set<std::uint32_t> live_tids;
+    pb::OwnShareRunner runner([](const pb::OwnShare&) -> pb::NodeEventResult { throw pb::RandomxFailure("kat: RandomX down"); },
+                              [&](const pb::OwnShare& s) { return live_tids.count(s.template_id) != 0; });
+    for (std::uint32_t t = 1; t <= 3; ++t) {
+        live_tids.insert(t);
+        (void)runner.submit(pb::OwnShare{t, 1, pb::PathbJob{}, t, pb::Hash32{}});
+    }
+    const std::size_t k0 = runner.kept();
+    live_tids.erase(2);
+    (void)runner.run_kept();
+    check(k0 == 3 && runner.kept() == 2 && runner.stats().stale == 1,
+          "ownbound: a kept share whose job went stale leaves at the next run though RandomX still fails before it (kept " +
+                  std::to_string(runner.kept()) + ", stale " + std::to_string(runner.stats().stale) + ")");
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 50 + i);
+    }
+    pb::PathbJobSource js([&](const pb::PathbTemplate& t, const pb::PathbSession& ss) { return h[a].make_job(t, ss); });
+    const pb::PathbTemplate t = h[a].make_template(h.now);
+    const std::uint32_t tid = js.set_template(t, pb::JobNetwork{});
+    js.bind(7, h.session(1, 7));
+    ::v37::xmr::stratum::TemplateJob out;
+    const bool got = t.status == pb::TemplateStatus::Ok && js.get_job(7, out);
+    const bool issued = js.issued(tid, 7).has_value();
+    js.clear();
+    check(got && issued && !js.issued(tid, 7).has_value() && !js.has_template(),
+          "ownbound: clear() withdraws the template and releases its issued jobs (a share on one is stale)");
+}
+
+// ---------------------------------------------------------------------------
+// alarmbound: the node's alarm sink does not grow with its life: 1,000 alarms (600 R12 node-internal, 400 R9 claim)
+// are 1,000 counted, 600 of them R12 node-internal read in O(1), the last one kept; no list of entries is held.
+template <class S>
+static std::uint64_t sink_count_of(const S& s, pb::RowId row, pb::Missing cause) {
+    if constexpr (requires { s.count_of(row, cause); }) return s.count_of(row, cause);
+    else return UINT64_MAX;
+}
+template <class S>
+static bool sink_holds_list(const S& s) {
+    if constexpr (requires { s.entries.size(); }) return true;
+    else return false;
+}
+void alarmbound() {
+    pb::AlarmSink sink;
+    for (int i = 0; i < 1000; ++i)
+        sink.raise(i < 600 ? pb::RowId::R12 : pb::RowId::R9, pb::Basis::Computed, seq32(static_cast<std::uint8_t>(i)),
+                   i < 600 ? pb::Missing::NodeInternal : pb::Missing::ClaimAlarm);
+    check(sink.count() == 1000 && sink_count_of(sink, pb::RowId::R12, pb::Missing::NodeInternal) == 600
+                  && sink_count_of(sink, pb::RowId::R9, pb::Missing::ClaimAlarm) == 400 && !sink_holds_list(sink),
+          "alarmbound: 1,000 alarms counted by (row, cause), R12 node-internal 600 read in O(1); no list of entries held");
+}
+
+// ---------------------------------------------------------------------------
 // A-1: the events of a peer that run after its link went down (one in flight, one its reader posted while blocked
 // behind it) are skipped: the node opens nothing for the gone peer (no join hold from its FC_GETHEADERS).
 void relaystale() {
@@ -4284,6 +4350,8 @@ int main(int argc, char** argv) {
     run("relayindex", relayindex);
     run("relayp15", relayp15);
     run("relayp15rx", relayp15rx);
+    run("ownbound", ownbound);
+    run("alarmbound", alarmbound);
     run("relaystale", relaystale);
     run("relaytip", relaytip);
     run("relaysq", relaysq);

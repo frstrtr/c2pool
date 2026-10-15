@@ -123,9 +123,12 @@ public:
         }
         return tid_;
     }
+    // The template withdrawn and its issued jobs released (a share on one of them is stale).
     void clear() {
         std::lock_guard<std::mutex> lk(mu_);
         tpl_.reset();
+        jobs_.clear();
+        kept_.clear();
     }
     bool has_template() const {
         std::lock_guard<std::mutex> lk(mu_);

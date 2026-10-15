@@ -821,6 +821,25 @@ class Rig:
             rc = self.nodes[n].stop(signal.SIGINT, 90)
             self.res.note("restart", "stop %s rc=%s" % (n, rc))
 
+    def send_transfers(self, plan, part):
+        # transfers from the funding wallet: [(destination, priority)]; returns [(tx_hash, priority, fee)]
+        self.wallet("close_wallet")
+        self.wallet("open_wallet", {"filename": "wfund"})
+        self.wallet("refresh")
+        sent = []
+        for i, (dst, prio) in enumerate(plan):
+            try:
+                r = self.wallet("transfer", {"destinations": [{"amount": 1000000000000 + i, "address": self.addr[dst]}],
+                                             "priority": prio, "ring_size": 16})
+                sent.append((r["tx_hash"], prio, r.get("fee")))
+            except Fail as e:
+                self.res.note(part, "transfer %d failed: %s" % (i, e))
+        return sent
+
+    def txpool_count(self, p):
+        c = re.findall(r"^  txpool: .*\| count=(\d+)", p.text(), re.M)
+        return int(c[-1]) if c else 0
+
     def digests_now(self, names, settle_s=8):
         def ready():
             out = {}
@@ -884,8 +903,16 @@ class Rig:
             att = re.findall(r"^  relay: join attempt .*$", p.text(), re.M)
             self.res.note("restart", "C join attempts: %d, last %s" % (len(att), att[-1] if att else "-"))
             self.res.check("restart", False, str(e))
-        # then A, B, C stopped and started twice: byte-equal digests
+        # then A, B, C stopped and started twice: byte-equal digests; transactions in monerod's pool, broadcast (A holds
+        # one) before the stop: each node's first template after the restart carries them
         try:
+            sent = self.send_transfers([("B", 2), ("C", 3)], "restart")
+            self.res.note("restart", "sent %s" % (sent,))
+            try:
+                wait_for(lambda: self.txpool_count(self.nodes["A"]) >= 1 or None, self.a.fo_bcast_s,
+                         "A holds a broadcast transaction before the stop", 2)
+            except Fail as e:
+                self.res.check("restart", False, str(e))
             pre = {}
             for n in "ABC":
                 j = self.web.get(n)
@@ -903,6 +930,14 @@ class Rig:
                     loaded[n] = m[-1] if m else None
                 dg = self.digests_now("ABC")
                 rounds.append(dg)
+                if r == 1:
+                    first = {}
+                    for n in "ABC":
+                        tl = re.findall(r"^template \d+: .* n_tx=(\d+) ", self.nodes[n].text(), re.M)
+                        first[n] = int(tl[0]) if tl else None
+                    self.res.check("restart", all(first[n] is not None and first[n] >= 1 for n in "ABC"),
+                                   "restart 1: each node's first template carries the pool's transactions (n_tx %s)"
+                                   % first)
                 self.res.note("restart", "restart %d: store loaded best position %s; digests %s" % (r, loaded, dg))
                 self.res.check("restart", all(loaded[n] is not None for n in "ABC"),
                                "restart %d: A, B, C loaded their stores (best positions %s)" % (r, loaded))
@@ -961,17 +996,7 @@ class Rig:
         p = self.nodes["D"]
         # fee-diverse transactions in monerod's pool; D runs until it holds one of them: the network has broadcast it
         # (monerod's complement answer carries broadcast transactions only, not its local or stem ones)
-        self.wallet("close_wallet")
-        self.wallet("open_wallet", {"filename": "wfund"})
-        self.wallet("refresh")
-        sent = []
-        for i, (dst, prio) in enumerate([("A", 1), ("B", 2), ("C", 3), ("E", 4), ("O", 1), ("A", 3)]):
-            try:
-                r = self.wallet("transfer", {"destinations": [{"amount": 1000000000000 + i, "address": self.addr[dst]}],
-                                             "priority": prio, "ring_size": 16})
-                sent.append((r["tx_hash"], prio, r.get("fee")))
-            except Fail as e:
-                self.res.note("fo", "transfer %d failed: %s" % (i, e))
+        sent = self.send_transfers([("A", 1), ("B", 2), ("C", 3), ("E", 4), ("O", 1), ("A", 3)], "fo")
         pool = http_json("http://127.0.0.1:%d/get_transaction_pool" % self.m1(), {}).get("transactions", [])
         rates = sorted({round(int(x["fee"]) / max(1, int(x["weight"])), 3) for x in pool})
         self.res.note("fo", "sent %s; monerod pool %d txs, fee/weight rates %s" % (sent, len(pool), rates))

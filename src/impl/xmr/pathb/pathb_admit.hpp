@@ -124,7 +124,8 @@ enum class Missing : std::uint8_t {
     CopyDeferred,    // nothing here; the owner fetches its own copy
 };
 
-// Node-internal and claim outcomes: a local alarm with the row and the basis.
+// Node-internal and claim outcomes: a local alarm with the row and the basis. Kept as counts by (row, cause) and the
+// last entry: the sink does not grow with the node's life, and a reader counts in O(1).
 struct AlarmSink {
     struct Entry {
         RowId row = RowId::None;
@@ -132,9 +133,22 @@ struct AlarmSink {
         Hash32 id{};
         Missing cause = Missing::NodeInternal;
     };
-    std::vector<Entry> entries;
-    void raise(RowId row, Basis basis, const Hash32& id, Missing cause) { entries.push_back(Entry{row, basis, id, cause}); }
-    std::size_t count() const noexcept { return entries.size(); }
+    void raise(RowId row, Basis basis, const Hash32& id, Missing cause) {
+        ++total_;
+        ++by_[{static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(cause)}];
+        last_ = Entry{row, basis, id, cause};
+    }
+    std::size_t count() const noexcept { return static_cast<std::size_t>(total_); }
+    std::uint64_t count_of(RowId row, Missing cause) const {
+        const auto it = by_.find({static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(cause)});
+        return it == by_.end() ? 0 : it->second;
+    }
+    const std::optional<Entry>& last() const noexcept { return last_; }
+
+private:
+    std::uint64_t total_ = 0;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> by_;
+    std::optional<Entry> last_;
 };
 
 struct AdmitResult {
@@ -1877,19 +1891,24 @@ private:
 // ---------------------------------------------------------------------------
 inline constexpr std::string_view kClaimAlarmRateFlag = "--pathb-claim-alarm-rate";
 
-// The floor of the P-50 refill: (1 + R_MAX) / T alarms per second.
-inline double claim_alarm_rate_floor(const LaneParams& p) {
-    return static_cast<double>(1 + p.r_max) / static_cast<double>(p.carrier_interval_s);
+// Rates in milli-alarms per second (integers: no float in the Path B core).
+// The floor of the P-50 refill: (1 + R_MAX) / T alarms per second, rounded up to a milli-alarm.
+inline std::uint64_t claim_alarm_rate_floor_milli(const LaneParams& p) {
+    return ((1 + p.r_max) * 1000 + p.carrier_interval_s - 1) / p.carrier_interval_s;
+}
+// The largest rate the budget takes: rate x T must fit 64 bits.
+inline std::uint64_t claim_alarm_rate_max_milli(const LaneParams& p) {
+    return UINT64_MAX / p.carrier_interval_s;
 }
 
 class ClaimAlarmBudget {
 public:
-    // Units: one alarm = T x kScale units; the refill (1 + R_MAX) x kScale units per second (rate x T x kScale at a
+    // Units: one alarm = T x kScale units; the refill (1 + R_MAX) x kScale units per second (rate_milli x T at a
     // raised rate); the burst (1 + R_MAX) alarms.
     static constexpr std::uint64_t kScale = 1000;
-    explicit ClaimAlarmBudget(const LaneParams& p, double rate = 0)
-        : per_s_(rate > claim_alarm_rate_floor(p)
-                         ? static_cast<std::uint64_t>(rate * static_cast<double>(p.carrier_interval_s * kScale))
+    explicit ClaimAlarmBudget(const LaneParams& p, std::uint64_t rate_milli = 0)
+        : per_s_(rate_milli > claim_alarm_rate_floor_milli(p)
+                         ? std::min(rate_milli, claim_alarm_rate_max_milli(p)) * p.carrier_interval_s
                          : (1 + p.r_max) * kScale),
           unit_(p.carrier_interval_s * kScale),
           cap_((1 + p.r_max) * p.carrier_interval_s * kScale) {}

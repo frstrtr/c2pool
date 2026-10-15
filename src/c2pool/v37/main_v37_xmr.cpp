@@ -194,7 +194,7 @@ struct PathbFlags {
     std::optional<std::uint64_t> abandon_timeout_s;   // --pathb-abandon-timeout S
     std::optional<std::uint64_t> waiting_cap;         // --pathb-waiting-cap N
     std::optional<std::uint64_t> bucket_serve_cap;    // --pathb-bucket-serve-cap BYTES
-    std::optional<double> claim_alarm_rate;           // --pathb-claim-alarm-rate R (P-50; raise only)
+    std::optional<std::uint64_t> claim_alarm_rate_milli;  // --pathb-claim-alarm-rate R (P-50; raise only), milli/s
     std::optional<std::uint64_t> bucket_frame;        // --pathb-bucket-frame BYTES
     std::optional<std::uint64_t> join_min_peers;      // --join-min-peers N
     std::optional<std::uint64_t> bucket_inflight;     // --pathb-bucket-inflight N
@@ -469,6 +469,7 @@ static int run_follow_only(XmrNodeConfig& cfg, const PathbFlags& pf) {
     pb::PathbFollowerRows rows(pmode::follow_only_row_weights_path(dir));
     std::string why;
     if (!rows.load(why)) std::printf("follow-only: %s -- starting with an empty table\n", why.c_str());
+    else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
     if (!plan.native_node) return 2;
 
     std::printf("%s\n", pb::follow_only_start_line(to_string(cfg.network),
@@ -914,7 +915,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     {
         std::string why;
         if (!rows.load(why)) std::printf("follower: %s -- starting with an empty table\n", why.c_str());
-        else std::printf("follower: row weights %s (%zu loaded)\n", rows.path().c_str(), rows.loaded());
+        else std::printf("follower: row weights %s (%zu loaded)%s%s\n", rows.path().c_str(), rows.loaded(),
+                         why.empty() ? "" : "; ", why.c_str());
     }
     std::unique_ptr<LiveMonerodTransport> transport;
     if (plan.monerod_transport) transport = std::make_unique<LiveMonerodTransport>(cfg.monerod);
@@ -1105,7 +1107,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             return 2;
         }
     }
-    if (pf.claim_alarm_rate) ro.claim_alarm_rate = *pf.claim_alarm_rate;                       // P-50
+    if (pf.claim_alarm_rate_milli) ro.claim_alarm_rate_milli = *pf.claim_alarm_rate_milli;     // P-50
     if (pf.join_min_peers) ro.join_min_peers = static_cast<std::size_t>(*pf.join_min_peers);  // P-40
     std::string book_path;
     if (ro.discovery) {
@@ -1488,8 +1490,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             }
             const pb::LaneView lv = n.store().view_at(b.id);
             v.leaf_count = lv.ok() ? lv.leaf_count() : 0;
-            for (const auto& e : n.alarms().entries)
-                if (e.row == pb::RowId::R12 && e.cause == pb::Missing::NodeInternal) ++v.coinbase_internal;
+            v.coinbase_internal = n.alarms().count_of(pb::RowId::R12, pb::Missing::NodeInternal);
             v.sw = n.switch_counts();
             return v;
         });
@@ -1763,7 +1764,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 const pb::PathbRelayStats& rs = relay->stats();
                 const pb::OwnShareRunner::Stats os = own_runner.stats();
                 std::printf("  soak: p15_drops=%llu reoffer_paused=%llu queued_bytes_hwm=%zu queue_full_drops=%llu "
-                            "rx_failures=%llu own_rx_failures=%llu own_kept=%zu stale_events=%llu owner_waits=%llu "
+                            "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
                             "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_wanted=%llu "
                             "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu\n",
@@ -1772,6 +1773,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
                             static_cast<unsigned long long>(rs.rx_failures.load()),
                             static_cast<unsigned long long>(os.rx_failures), own_runner.kept(),
+                            static_cast<unsigned long long>(os.stale),
                             static_cast<unsigned long long>(rs.stale_events.load()),
                             static_cast<unsigned long long>(rs.owner_waits.load()),
                             static_cast<unsigned long long>(rs.owner_queue_hwm.load()),
@@ -1919,6 +1921,28 @@ inline double to_double(const std::string& flag, const std::string& v) {
     if (v.empty() || r.ec != std::errc{} || r.ptr != e || !std::isfinite(out))
         throw UsageError(flag + " wants a number, got '" + v + "'");
     return out;
+}
+
+// A decimal of at most three fraction digits as an integer in thousandths ("1.7" -> 1700); nothing else.
+inline std::uint64_t to_milli(const std::string& flag, const std::string& v) {
+    const auto bad = [&]() { return UsageError(flag + " wants a decimal of at most 3 fraction digits, got '" + v + "'"); };
+    const std::size_t dot = v.find('.');
+    const std::string ip = v.substr(0, dot), fp = dot == std::string::npos ? std::string() : v.substr(dot + 1);
+    if (ip.empty() || fp.size() > 3 || (dot != std::string::npos && fp.empty())) throw bad();
+    for (char c : ip + fp)
+        if (c < '0' || c > '9') throw bad();
+    std::uint64_t whole = 0;
+    const auto r = std::from_chars(ip.data(), ip.data() + ip.size(), whole);
+    if (r.ec != std::errc{} || whole > (UINT64_MAX - 999) / 1000) throw bad();
+    std::uint64_t frac = 0;
+    for (std::size_t i = 0; i < 3; ++i) frac = frac * 10 + (i < fp.size() ? static_cast<std::uint64_t>(fp[i] - '0') : 0);
+    return whole * 1000 + frac;
+}
+inline std::string milli_str(std::uint64_t m) {
+    std::string f = std::to_string(m % 1000);
+    while (f.size() < 3) f = "0" + f;
+    while (!f.empty() && f.back() == '0') f.pop_back();
+    return std::to_string(m / 1000) + (f.empty() ? "" : "." + f);
 }
 
 // A rate as the refusal names it (one decimal).
@@ -2245,10 +2269,12 @@ int main(int argc, char** argv) {
             else if (a == "--pathb-waiting-cap") pf.waiting_cap = u64();
             else if (a == "--pathb-bucket-serve-cap") pf.bucket_serve_cap = u64();
             else if (a == "--pathb-claim-alarm-rate") {
-                const double r = cs::to_double(a, value());
-                const double fl = pb::claim_alarm_rate_floor(pb::kRuledLaneParams);
-                if (r < fl) throw cs::UsageError(a + " wants a rate >= " + cs::rate_str(fl) + " (raise only)");
-                pf.claim_alarm_rate = r;
+                const std::uint64_t r = cs::to_milli(a, value());
+                const std::uint64_t fl = pb::claim_alarm_rate_floor_milli(pb::kRuledLaneParams);
+                const std::uint64_t mx = pb::claim_alarm_rate_max_milli(pb::kRuledLaneParams);
+                if (r < fl) throw cs::UsageError(a + " wants a rate >= " + cs::milli_str(fl) + " (raise only)");
+                if (r > mx) throw cs::UsageError(a + " wants a rate <= " + cs::milli_str(mx));
+                pf.claim_alarm_rate_milli = r;
             }
             else if (a == "--pathb-bucket-frame") pf.bucket_frame = u64();
             else if (a == "--join-min-peers") pf.join_min_peers = u64();

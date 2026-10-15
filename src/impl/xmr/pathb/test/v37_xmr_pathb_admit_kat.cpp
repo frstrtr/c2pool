@@ -1701,7 +1701,7 @@ void contract() {
                 const std::size_t al = m.alarm.count();
                 const pb::AdmitResult a = admit(m, c);
                 check(deferred(a, Missing::ClaimAlarm) && a.alarm && a.strike == 0 && a.verdict != AdmitVerdict::Ban
-                              && m.rx_calls == rx && m.alarm.count() == al + 1 && m.alarm.entries.back().basis == b,
+                              && m.rx_calls == rx && m.alarm.count() == al + 1 && m.alarm.last()->basis == b,
                       std::string("extension point: #12 mismatch on a ") + (b == pb::Basis::ClaimLeaf ? "ClaimLeaf" : "ClaimSpan")
                               + " basis -> DEFER + local alarm, 0 tokens, no BAN, RandomX 0");
             }
@@ -1734,7 +1734,7 @@ void contract() {
                 const pb::AdmitResult d1 = admit(m, cd), l1 = admit(m, cl);
                 check(d0.verdict == AdmitVerdict::AdmitCarrier && d0.placements.size() == 1 && !d0.placements[0].live
                               && deferred(d1, Missing::ClaimAlarm) && d1.row == RowId::R31 && d1.alarm && d1.strike == 0
-                              && m.alarm.count() == al + 1 && m.alarm.entries.back().basis == pb::Basis::ClaimSpan
+                              && m.alarm.count() == al + 1 && m.alarm.last()->basis == pb::Basis::ClaimSpan
                               && l1.verdict == AdmitVerdict::AdmitCarrier && l1.placements.size() == 1 && l1.placements[0].live,
                       "extension point: row 31 on a ClaimSpan basis: a dead placement -> DEFER + local alarm, 0 tokens "
                       "(claims == nullptr: placed with weight 0); a live one placed (" + desc(d1) + ")");
@@ -1754,7 +1754,7 @@ void contract() {
                 const pb::AdmitResult w1 = admit(w, cw);
                 check(deferred(w0, Missing::Closure) && w0.row == RowId::R17 && w0.claim_based && w0.strike == 0
                               && deferred(w1, Missing::ClaimAlarm) && w1.row == RowId::R17 && w1.alarm && w1.strike == 0
-                              && w.alarm.count() == al + 1 && w.alarm.entries.back().basis == pb::Basis::ClaimSpan,
+                              && w.alarm.count() == al + 1 && w.alarm.last()->basis == pb::Basis::ClaimSpan,
                       "extension point: row 17 on a ClaimSpan basis: a walk with no passing assignment -> DEFER + local alarm, "
                       "0 tokens (claims == nullptr: DEFER Closure, claim-based) (" + desc(w0) + ", " + desc(w1) + ")");
             }
@@ -1781,6 +1781,23 @@ void contract() {
             check(same, "extension point: a double answering as the null view gives the null view's verdicts");
             m.claims = nullptr;
             check(!dv.rests_on_claims(), "extension point: the null view's state rests on no claim");
+        }
+        // P-50 in integers: the floor 1,700 milli-alarms a second; the largest rate x T fits 64 bits and refills a whole
+        // bucket in a second without wrapping
+        {
+            const pb::LaneParams& P = pb::kRuledLaneParams;
+            const std::uint64_t fl = pb::claim_alarm_rate_floor_milli(P), mx = pb::claim_alarm_rate_max_milli(P);
+            pb::ClaimAlarmBudget top(P, mx);
+            bool all = true;
+            for (int k = 0; k < 17; ++k) all = all && top.charge(9, 5, true);
+            const bool empty = !top.charge(9, 5, true);
+            const bool refilled = top.charge(9, 6, true);
+            pb::ClaimAlarmBudget past(P, UINT64_MAX);  // above the bound: taken at the bound
+            bool p_ok = true;
+            for (int k = 0; k < 17; ++k) p_ok = p_ok && past.charge(9, 5, true);
+            check(fl == 1700 && mx == UINT64_MAX / P.carrier_interval_s && mx * P.carrier_interval_s >= mx && all && empty
+                          && refilled && p_ok && past.charge(9, 6, true),
+                  "P-50 integers: floor 1,700 milli/s; at the largest rate a drained bucket refills in a second, no wrap");
         }
         // P-50: the claim-leaf alarm budget
         {
