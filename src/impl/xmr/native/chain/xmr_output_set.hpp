@@ -711,8 +711,11 @@ private:
         s.insert(s.end(), h.begin(), h.end());
     }
 
-    // The tip the set had before its first block: the boot tip of an unseeded set.
-    std::uint64_t boot_tip_height_locked_() const { return undo_.empty() ? tip_height_ : undo_.front().prev_tip_height; }
+    // The boot tip of an unseeded set: the height below its first block (a genesis boot: 0; an anchor boot: the
+    // anchor's height) and the tip id the set had then.
+    std::uint64_t boot_tip_height_locked_() const {
+        return undo_.empty() ? tip_height_ : (undo_.front().height > 0 ? undo_.front().height - 1 : 0);
+    }
     Hash boot_tip_id_locked_() const { return undo_.empty() ? tip_id_ : undo_.front().prev_tip_id; }
 
     void rollback_to_snapshot_locked_() {

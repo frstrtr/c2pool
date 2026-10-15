@@ -333,6 +333,23 @@ static void part_unseeded(std::mt19937_64& r) {
     checkf(tip_h(back) == H - 1 && back.output_root() == live.output_root() && back.spent_root() == live.spent_root()
                    && back.set_digest() == live.set_digest(),
            "PART D: a reorg below the resume point restores the roots bit-exact");
+    // an anchor boot without a seeded set: its first block above the anchor (here 101 over an anchor at 100)
+    {
+        ChainOutputSet a(5000);
+        for (std::uint64_t h = 101; h <= 110; ++h) {
+            std::vector<OutputRecord> outs(2);
+            for (std::size_t i = 0; i < outs.size(); ++i) { outs[i].pubkey = id_of(h * 10 + i, 3); outs[i].commitment = id_of(h * 10 + i, 4); outs[i].height = h; }
+            checkf(a.on_block_connected(block(h, a.frontier(), id_of(h, 5), outs, {})), "PART D anchor: connect %llu", (unsigned long long)h);
+        }
+        std::vector<std::uint8_t> ao;
+        std::string w;
+        ChainOutputSet b(5000);
+        const bool ok = ovl_save(a, ao, w) && ovl_load(b, ao, w);
+        checkf(ok && tip_h(b) == 110 && b.output_root() == a.output_root(),
+               "PART D: an anchor boot's set (first block 101) resumes from its overlay: %s", w.c_str());
+        for (std::uint64_t h = 110; h >= 101; --h) checkf(b.on_block_disconnected(disc(h)), "PART D anchor: disconnect %llu", (unsigned long long)h);
+        checkf(tip_h(b) == 100 && b.output_count() == 0, "PART D: unwound to its boot tip, the anchor at 100");
+    }
     // fail-closed
     {
         std::vector<std::uint8_t> bad = ovl;

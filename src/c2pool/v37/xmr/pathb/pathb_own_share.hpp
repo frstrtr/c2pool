@@ -83,12 +83,6 @@ public:
         std::vector<NodeEventResult> out;
         while (!q.empty()) {
             OwnShare& s = q.front();
-            if (!live_(s)) {
-                std::lock_guard<std::mutex> lk(m_);
-                ++st_.stale;
-                q.pop_front();
-                continue;
-            }
             try {
                 {
                     std::lock_guard<std::mutex> lk(m_);
