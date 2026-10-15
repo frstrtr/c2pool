@@ -3101,9 +3101,10 @@ private:
         if (depth > 0) {
             const std::uint64_t candidate = tip_h - depth;
             const std::uint64_t oldest    = rows_.oldest_height();
-            // A chain whose rows still reach genesis (a young one: regtest, a fresh from-genesis walk) has every
-            // window at the candidate in its rows, shorter than full exactly as the live state's were there.
-            const bool from_genesis = oldest == 0 && view_.anchor_height() == 0;
+            // A chain whose rows still reach genesis (a young one: regtest, a fresh from-genesis walk, and the same
+            // chain resumed from its own snapshot) has every window at the candidate in its rows, shorter than full
+            // exactly as the live state's were there.
+            const bool from_genesis = oldest == 0;
             const bool rows_cover =
                 from_genesis
                 || (candidate >= oldest + CRYPTONOTE_REWARD_BLOCKS_WINDOW - 1

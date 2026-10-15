@@ -1041,31 +1041,42 @@ static void test_alt_rows_restart() {
     fs::remove_all(dir);
 }
 
-// H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 20 is snapshotted and a fresh
-// index loads it; a heavier branch forking at 18 (two blocks below the resume point) is adopted -- the snapshot took
-// its base snapshot_depth (64) below the tip, or at genesis on a chain younger than that, and replayed the rest.
+// H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 100 is snapshotted (base 36),
+// resumed and snapshotted again, and a fresh index loads the second snapshot; a heavier branch forking at 98 (two blocks
+// below the resume point) is adopted -- each snapshot took its base snapshot_depth (64) below the tip from the rows it
+// holds back to genesis, and replayed the rest.
 static void test_resume_reorg_below() {
     std::vector<std::uint8_t> snap;
     ChainIndexOptions sopts;
     std::vector<Hash> ids;
     std::vector<BlockEntry> branch;
     {
-        Rig f(20);
+        Rig f(100);
         sopts = f.opts;
         ids = f.main_ids;
         std::string why;
         checkf(f.idx->save_snapshot(snap, why), "resumereorg: the snapshot saved (%s)", why.c_str());
-        branch = build_branch(*f.idx, f.main_ids[17], 18, 3, /*salt_base=*/61);
+        branch = build_branch(*f.idx, f.main_ids[97], 98, 3, /*salt_base=*/61);
+    }
+    ModelVerifier mv0;
+    LightVerifierPowSource<ModelVerifier> src0{mv0};
+    std::vector<std::uint8_t> snap2;
+    {
+        // a first resume, then its own snapshot (no block in between): the second resume keeps the rollback too
+        ChainIndex first(sopts, src0);
+        std::string why0;
+        checkf(first.load_snapshot(snap, why0) && first.save_snapshot(snap2, why0), "resumereorg: resumed once and "
+               "snapshotted again (%s)", why0.c_str());
     }
     ModelVerifier mv;
     LightVerifierPowSource<ModelVerifier> src{mv};
     ChainIndex restored(sopts, src);
     std::string why;
-    checkf(restored.load_snapshot(snap, why) && restored.tip() && restored.tip()->id == ids[19],
-           "resumereorg: the snapshot loads at 20 (%s)", why.c_str());
+    checkf(restored.load_snapshot(snap2, why) && restored.tip() && restored.tip()->id == ids[99],
+           "resumereorg: the second snapshot loads at 100 (%s)", why.c_str());
     OfferOutcome last = OfferOutcome::Rejected;
     for (const BlockEntry& e : branch) last = restored.offer_block(nullptr, e, /*own_mined=*/false).outcome;
-    checkf(last == OfferOutcome::Reorged && restored.tip() && restored.tip()->height == 21
+    checkf(last == OfferOutcome::Reorged && restored.tip() && restored.tip()->height == 101
                    && restored.tip()->id == id_of(branch.back()),
            "resumereorg: a branch forking 2 below the resume point is adopted (last offer %s, tip %llu)",
            to_string(last), static_cast<unsigned long long>(restored.tip() ? restored.tip()->height : 0));
