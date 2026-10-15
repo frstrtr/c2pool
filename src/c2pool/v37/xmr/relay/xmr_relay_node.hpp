@@ -185,6 +185,8 @@
 #include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"
 #include "impl/xmr/coin/xmr_seedheight.hpp"
 #include "impl/xmr/pathb/pathb_params.hpp"   // kRuledLaneParams: the parked-list cap default
+#include "impl/xmr/pathb/pathb_caps.hpp"     // blob_cap_ctx (P-13)
+#include "impl/xmr/pathb/pathb_emission.hpp" // kHf16
 #include "xmr_relay_wire.hpp"
 #include "xmr_relay_peerbook.hpp"   // RELAY-DISCOVERY
 #include "xmr_receipt_mint.hpp"
@@ -1324,8 +1326,14 @@ public:
         m_ctx_serve.clear();
         return out;
     }
+    // P-13 at hf 16 and Z = zone(16).
+    static std::size_t ctx_cap() {
+        return static_cast<std::size_t>(
+                ::c2pool::xmr::pathb::blob_cap_ctx(::c2pool::xmr::pathb::kHf16, ::c2pool::xmr::pathb::zone(::c2pool::xmr::pathb::kHf16))
+                        .value_or(0));
+    }
     bool send_ctx(PeerId p, const bytes32& id, const std::vector<u8>& blob) {
-        const auto f = encode_ctx(m_o.chain, id, blob);
+        const auto f = encode_ctx(m_o.chain, id, blob, ctx_cap());
         if (f.empty() || !m_net.send_to(p, f)) return false;
         if (blob.empty()) m_st.ctx_unknown_tx++; else m_st.ctx_served++;
         return true;
@@ -2320,7 +2328,7 @@ private:
     }
     void on_ctx(PeerId p, const std::vector<u8>& f) {
         u32 chain = 0; bytes32 id{}; std::vector<u8> blob; std::string why;
-        if (!decode_ctx(f, chain, id, blob, &why)) { m_st.malformed++; strike(p, why); return; }
+        if (!decode_ctx(f, chain, id, blob, ctx_cap(), &why)) { m_st.malformed++; strike(p, why); return; }
         if (chain != m_o.chain) { m_st.wrong_chain++; return; }
         m_st.ctx_rx++;
         offer_ctx(id, blob, p);

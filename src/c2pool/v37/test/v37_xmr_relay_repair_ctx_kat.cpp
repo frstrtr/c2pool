@@ -254,14 +254,19 @@ int main() {
         C(encode_getctx(kChain, nine).empty() && encode_getctx(kChain, {}).empty(), "K1 GETCTX refuses 0 or > 8 ids");
         auto g2 = f; g2.push_back(0);
         { const bool r = decode_getctx(g2, ch, back, &why); C(!r, "K1 GETCTX trailing byte refused: " + why); }
-        const auto c = encode_ctx(kChain, idX, X.full_blob);
+        const std::size_t cap = static_cast<std::size_t>(
+                ::c2pool::xmr::pathb::blob_cap_ctx(::c2pool::xmr::pathb::kHf16, ::c2pool::xmr::pathb::zone(::c2pool::xmr::pathb::kHf16))
+                        .value_or(0));   // P-13 at hf 16, Z = zone(16): 600,051
+        const auto c = encode_ctx(kChain, idX, X.full_blob, cap);
         bytes32 cid{}; std::vector<u8> blob;
-        C(c[0] == FB_CTX && decode_ctx(c, ch, cid, blob, &why) && cid == idX && blob == X.full_blob, "K1 CTX round trip (0x44, one block blob)");
-        const auto u = encode_ctx(kChain, idX, {});
-        C(decode_ctx(u, ch, cid, blob, &why) && blob.empty(), "K1 CTX len 0 = unknown here");
+        C(c[0] == FB_CTX && decode_ctx(c, ch, cid, blob, cap, &why) && cid == idX && blob == X.full_blob, "K1 CTX round trip (0x44, one block blob)");
+        const auto u = encode_ctx(kChain, idX, {}, cap);
+        C(decode_ctx(u, ch, cid, blob, cap, &why) && blob.empty(), "K1 CTX len 0 = unknown here");
         auto c2 = c; c2.pop_back();
-        { const bool r = decode_ctx(c2, ch, cid, blob, &why); C(!r, "K1 CTX short body refused: " + why); }
-        C(encode_ctx(kChain, idX, std::vector<u8>(kCtxMaxBlob + 1, 0)).empty(), "K1 CTX refuses a blob over 512 KiB");
+        { const bool r = decode_ctx(c2, ch, cid, blob, cap, &why); C(!r, "K1 CTX short body refused: " + why); }
+        C(cap == 600051 && encode_ctx(kChain, idX, std::vector<u8>(cap + 1, 0), cap).empty() &&
+              encode_ctx(kChain, idX, std::vector<u8>(cap, 0), cap).size() == kCtxHeader + cap,
+          "K1 CTX takes a blob of P-13 (600,051 B at hf 16) and refuses one above it");
         C(is_family_b_opcode(FB_GETCTX) && is_family_b_opcode(FB_CTX), "K1 0x43/0x44 are in the Family-B range (an older node counts + keeps the socket)");
     }
 

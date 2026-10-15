@@ -73,6 +73,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -169,10 +170,14 @@ struct PathbRelayOptions {
     std::uint32_t ctx_retry_ms = 2000;
     std::uint32_t ctx_max_rounds = 30;
     // context blocks climbed per want: P-06 (Fresh + 1) for an unsolicited receipt, P-07 (k_alt) for a carrier
-    // under verification (a join's FB_GETCTX)
+    // under verification (a relayed carrier's admission, a join's FB_GETCTX), within the join wants' cap
     std::uint32_t ctx_max_depth = static_cast<std::uint32_t>(relay_horizons(kRuledLaneParams).ctx_max_depth);
     std::uint32_t ctx_join_depth = static_cast<std::uint32_t>(kAltDepth);
     std::size_t ctx_want_max = 128;  // wants of unsolicited receipts held at once (a join's climb: up to ctx_join_depth)
+    // P-13 (--relay-ctx-block-cap, raise only): a context block's cap above blob_cap_ctx(hf, Z); 0: blob_cap_ctx alone.
+    // The cap is max(this, blob_cap_ctx(hf, Z) of the block's newest known ancestor) when its work is judged; FB_CTX
+    // frames are read and served up to max(this, blob_cap_ctx at the node's view).
+    std::uint64_t ctx_block_cap = 0;
     // false: no thread; the caller runs pump(), tick() and join_step()
     bool threads = true;
 };
@@ -217,6 +222,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
+    std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
     std::atomic<std::uint64_t> ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_forged{0}, ctx_deferred{0}, ctx_unchecked{0};
     std::atomic<std::uint64_t> getaddr_tx{0}, getaddr_rx{0}, getaddr_throttled{0}, addr_tx{0}, addr_rx{0}, addr_unsolicited{0};
     std::atomic<std::uint64_t> addr_learned{0}, addr_ignored{0}, disc_dialed{0}, disc_dial_ok{0}, disc_dup_dropped{0};
@@ -268,6 +274,8 @@ struct PathbCtxSource {
     rly::CtxHashFn rx;
     // a served block judged usable: into the follower
     std::function<void(const rly::BlockCtx& b, const std::vector<std::uint8_t>& blob)> accept;
+    // P-13 at the node's view (its index tip): blob_cap_ctx(hf, Z) of a child of the tip; unset: hf 16, Z = zone(16)
+    std::function<std::uint64_t()> view_cap;
 };
 
 // ---------------------------------------------------------------------------
@@ -757,7 +765,8 @@ public:
         return strikes_by_peer_.size();
     }
     // KAT hooks: an admission outcome of `peer` parked on `m` (the relay's index and fetch), a strike on `peer`.
-    void test_parked(std::uint64_t peer, Missing m, const Hash32& digest, const Hash32& fetch, bool relayed = true) {
+    void test_parked(std::uint64_t peer, Missing m, const Hash32& digest, const Hash32& fetch, bool relayed = true,
+                     bool carrier = true) {
         NodeEventResult r;
         r.action = NodeAction::Parked;
         r.admit.missing = m;
@@ -766,7 +775,7 @@ public:
         Effects fx;
         {
             const NodeGuard g(*this);
-            after_result_locked(peer, r, digest, fx, relayed);
+            after_result_locked(peer, r, digest, fx, relayed, carrier);
         }
         run_effects(fx);
     }
@@ -812,6 +821,13 @@ public:
     std::size_t ctx_wants() const {
         std::lock_guard<std::mutex> lk(cmtx_);
         return ctx_want_.size();
+    }
+    // The bytes of the context blocks the wanted contexts hold now (their verified blobs).
+    std::size_t ctx_want_bytes() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        std::size_t n = 0;
+        for (const auto& kv : ctx_want_) n += kv.second.blob.size();
+        return n;
     }
     std::string describe() const {
         char b[768];
@@ -1442,7 +1458,7 @@ private:
             }
             if (!rx_fail)
                 for (const NodeEventResult& r : rs) {
-                    after_result_locked(j.peer, r, std::nullopt, fx, !j.solicited);
+                    after_result_locked(j.peer, r, std::nullopt, fx, !j.solicited, /*carrier=*/false);
                     // a first-seen receipt (held now, or evicted at once by P-09; a copy held before is a duplicate),
                     // or a #7 refusal
                     if ((r.admit.verdict == AdmitVerdict::AdmitPending &&
@@ -1587,7 +1603,8 @@ private:
     struct Effects {
         bool join = false;
         std::set<Missing> rerun;                            // causes whose parked frames run again
-        std::vector<std::pair<Hash32, std::uint64_t>> ctx;  // (a Monero block, the peer that sent the object)
+        // (a Monero block, the peer that sent the object, the climb's bound: P-07 for a carrier, P-06 for a receipt)
+        std::vector<std::tuple<Hash32, std::uint64_t, std::uint32_t>> ctx;
         std::vector<std::uint64_t> bans;                    // servers of refuted walked variants or body sets
         std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
@@ -1602,8 +1619,9 @@ private:
     // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
     // TipBodies DEFER bound and placed, the joiner's signal.
+    // carrier: the object is a carrier (its Monero context climbs to P-07), else a receipt (P-06).
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
-                             bool relayed = true) {
+                             bool relayed = true, bool carrier = true) {
         if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
         switch (r.action) {
             case NodeAction::JoinerPath: fx.join = true; break;
@@ -1656,7 +1674,8 @@ private:
             case Missing::MoneroBlock:
             case Missing::MissingBlock:
             case Missing::MissingWeights:
-                if (r.admit.fetch != Hash32{}) fx.ctx.emplace_back(r.admit.fetch, peer);
+                if (r.admit.fetch != Hash32{})
+                    fx.ctx.emplace_back(r.admit.fetch, peer, carrier ? o_.ctx_join_depth : o_.ctx_max_depth);
                 break;
             case Missing::MissingBucket: bucket_fetch(r.admit.fetch, r.admit.fetch_bin, peer); break;
             default: break;  // ParentUnknown: the node's own FC_GETCARRIER; MissingRef: a served bucket's references
@@ -1749,7 +1768,7 @@ private:
         fx.p15.clear();
         for (std::uint64_t q : fx.bans) ban(q);
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
-        for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0, o_.ctx_max_depth);
+        for (const auto& [id, from, bound] : fx.ctx) want_ctx(id, from, 0, bound);
         if (!fx.rerun.empty()) rerun_parked(std::vector<Missing>(fx.rerun.begin(), fx.rerun.end()));
         if (fx.join) signal_join();
     }
@@ -2984,9 +3003,10 @@ private:
         std::vector<std::uint8_t> blob;
         for (const Hash32& id : ids) {
             blob.clear();
-            const bool have = ctx_.block_blob && ctx_.block_blob(id, blob) && !blob.empty() && blob.size() <= rly::kCtxMaxBlob;
+            const std::size_t cap = ctx_frame_cap();
+            const bool have = ctx_.block_blob && ctx_.block_blob(id, blob) && !blob.empty() && blob.size() <= cap;
             if (!have) blob.clear();
-            const std::vector<std::uint8_t> r = rly::encode_ctx(chain_id_, id, blob);
+            const std::vector<std::uint8_t> r = rly::encode_ctx(chain_id_, id, blob, cap);
             if (r.empty() || !links_.send_to(p, r)) continue;
             if (have)
                 st_.ctx_served++;
@@ -2999,7 +3019,12 @@ private:
         Hash32 id{};
         std::vector<std::uint8_t> blob;
         std::string why;
-        if (!rly::decode_ctx(f, chain, id, blob, &why)) {
+        const std::size_t cap = ctx_frame_cap();
+        if (f.size() >= rly::kCtxHeader && f[0] == rly::FB_CTX && rly::le::get32(f.data() + 38) > cap) {
+            st_.ctx_over_cap++;  // P-13: a block over the cap is dropped (no token)
+            return;
+        }
+        if (!rly::decode_ctx(f, chain, id, blob, cap, &why)) {
             st_.malformed++;
             token(p, FrameToken::Strike);
             return;
@@ -3010,6 +3035,12 @@ private:
         }
         st_.ctx_rx++;
         (void)offer_ctx(id, blob, p);
+    }
+    // P-13 for an FB_CTX frame read or served: max(the policy, blob_cap_ctx at the node's view).
+    std::size_t ctx_frame_cap() const {
+        const std::uint64_t view =
+                ctx_.view_cap ? ctx_.view_cap() : blob_cap_ctx(kHf16, zone(kHf16)).value_or(0);
+        return static_cast<std::size_t>(std::max(view, o_.ctx_block_cap));
     }
     void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, std::uint32_t bound) {
         std::lock_guard<std::mutex> lk(cmtx_);
@@ -3024,7 +3055,11 @@ private:
                 it->second.bound = bound;
             return;
         }
-        if (join ? joins >= o_.ctx_join_depth : ctx_want_.size() - joins >= o_.ctx_want_max) return;
+        if (join && joins >= o_.ctx_join_depth) {  // past the join wants' cap: the unsolicited bound (P-06)
+            bound = o_.ctx_max_depth;
+            if (depth >= bound) return;
+        }
+        if (bound <= o_.ctx_max_depth && ctx_want_.size() - joins >= o_.ctx_want_max) return;
         CtxWant w;
         w.from = from;
         w.depth = depth;
@@ -3097,7 +3132,7 @@ private:
                                 if (it == ctx_pow_.end()) return std::nullopt;
                                 return it->second;
                             },
-                            w.bound, ctx_.rx);
+                            w.bound, ctx_.rx, o_.ctx_block_cap);
                 } catch (const RandomxFailure&) {  // node-internal, a local alarm; the context is judged again later
                     rx_alarm("context " + hex_short(id));
                     return false;
@@ -3113,6 +3148,21 @@ private:
                 }
                 log("relay: context " + hex_short(id) + " FORGED (" + v.why + ")");
                 if (w.proof_from != 0) ban(w.proof_from);
+                return false;
+            }
+            if (v.kind == rly::CtxPow::OverCap) {  // P-13: dropped before hashing; no token; another peer may serve it
+                st_.ctx_over_cap++;
+                {
+                    std::lock_guard<std::mutex> lk(cmtx_);
+                    const auto it = ctx_want_.find(id);
+                    if (it != ctx_want_.end()) {
+                        it->second.have_proof = false;
+                        it->second.proof = rly::BlockCtx{};
+                        it->second.blob.clear();
+                        it->second.last_ask_ms = 0;
+                    }
+                }
+                log("relay: context " + hex_short(id) + " DROPPED (" + v.why + ")");
                 return false;
             }
             if (v.kind == rly::CtxPow::Defer) {

@@ -17,10 +17,14 @@
 //                 extra_nonce with no session gets the template's values and
 //                 no blob (a peek)
 //   rebuild_blob  the issued job's hashing blob
-//   issued        an issued job (the exact gate, the publish arms' candidate,
-//                 the node's own share)
-// Issued jobs are kept for the last kKeptTemplates templates; sessions for
-// the last kKeptSessions extra_nonces.
+//   network_job   an issued job for a Monero block (the exact gate, the
+//                 publish arms' candidate, the found line)
+//   issued        an issued job for the node's own share: none once its
+//                 template was withdrawn (clear())
+//   clear()       the template withdrawn; the issued jobs stay for a Monero
+//                 block found on them, withdrawn for own shares
+// Issued jobs are kept for the last kKeptTemplates templates (a found block's
+// job lives as long); sessions for the last kKeptSessions extra_nonces.
 //
 // Header-only.
 // ---------------------------------------------------------------------------
@@ -33,6 +37,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -119,16 +124,17 @@ public:
         while (kept_.size() > kKeptTemplates) {
             const std::uint32_t old = kept_.front();
             kept_.pop_front();
+            withdrawn_.erase(old);
             jobs_.erase(jobs_.lower_bound({old, 0}), jobs_.upper_bound({old, UINT32_MAX}));
         }
         return tid_;
     }
-    // The template withdrawn and its issued jobs released (a share on one of them is stale).
+    // The template withdrawn: no new job; the issued jobs of the kept templates stay for a Monero block found on
+    // them (network_job, rebuild_blob, candidate) and are withdrawn for own shares (issued: a share on one is stale).
     void clear() {
         std::lock_guard<std::mutex> lk(mu_);
         tpl_.reset();
-        jobs_.clear();
-        kept_.clear();
+        withdrawn_.insert(kept_.begin(), kept_.end());
     }
     bool has_template() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -222,7 +228,16 @@ public:
 
     std::uint32_t max_extra_nonces() const override { return UINT32_MAX; }
 
+    // An issued job for the node's own share: none once its template was withdrawn.
     std::optional<IssuedJob> issued(std::uint32_t template_id, std::uint32_t extra_nonce) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (withdrawn_.count(template_id) != 0) return std::nullopt;
+        const auto it = jobs_.find({template_id, extra_nonce});
+        if (it == jobs_.end()) return std::nullopt;
+        return it->second;
+    }
+    // An issued job for a Monero block found on it: while its template is kept, withdrawn or not.
+    std::optional<IssuedJob> network_job(std::uint32_t template_id, std::uint32_t extra_nonce) const {
         std::lock_guard<std::mutex> lk(mu_);
         const auto it = jobs_.find({template_id, extra_nonce});
         if (it == jobs_.end()) return std::nullopt;
@@ -232,7 +247,7 @@ public:
     // The publish arms' candidate of an issued job.
     bool candidate(std::uint32_t template_id, std::uint32_t extra_nonce,
                    ::c2pool::v37n::xmr::submit::BlockCandidate& c) const {
-        const std::optional<IssuedJob> j = issued(template_id, extra_nonce);
+        const std::optional<IssuedJob> j = network_job(template_id, extra_nonce);
         if (!j) return false;
         c.template_id = template_id;
         c.height = j->h;
@@ -292,6 +307,7 @@ private:
     std::uint32_t tid_ = 0;
     std::uint32_t next_tid_ = 0;
     std::deque<std::uint32_t> kept_;
+    std::set<std::uint32_t> withdrawn_;  // kept templates withdrawn by clear() (own shares stale)
     std::map<std::pair<std::uint32_t, std::uint32_t>, IssuedJob> jobs_;
     std::map<std::uint32_t, PathbSession> sessions_;
     std::deque<std::uint32_t> session_order_;
