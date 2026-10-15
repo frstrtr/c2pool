@@ -1724,7 +1724,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 std::printf("  soak: p15_drops=%llu reoffer_paused=%llu queued_bytes_hwm=%zu queue_full_drops=%llu "
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
-                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu\n",
+                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_wanted=%llu "
+                            "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
@@ -1738,7 +1739,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.reoffer_max_ms.load()),
                             static_cast<unsigned long long>(rs.claim_alarms.load()),
                             static_cast<unsigned long long>(rs.claim_alarm_drops.load()),
-                            static_cast<unsigned long long>(rs.join_waits.load()));
+                            static_cast<unsigned long long>(rs.join_waits.load()), relay->ctx_wants(),
+                            static_cast<unsigned long long>(rs.ctx_wanted.load()),
+                            static_cast<unsigned long long>(rs.ctx_resolved.load()),
+                            static_cast<unsigned long long>(rs.ctx_gave_up.load()),
+                            static_cast<unsigned long long>(rs.parked_reruns.load()));
             }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),

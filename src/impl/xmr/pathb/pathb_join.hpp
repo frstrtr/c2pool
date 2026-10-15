@@ -938,6 +938,21 @@ enum class AttemptEnd : std::uint8_t {
     NodeInternal,   // a RandomX failure inside the attempt (node-internal): the end, a local alarm, no token, re-queued
 };
 
+inline constexpr const char* attempt_end_name(AttemptEnd e) noexcept {
+    switch (e) {
+        case AttemptEnd::Completed: return "Completed";
+        case AttemptEnd::Alarm: return "Alarm";
+        case AttemptEnd::NotServed: return "NotServed";
+        case AttemptEnd::Contradiction: return "Contradiction";
+        case AttemptEnd::Unplaceable: return "Unplaceable";
+        case AttemptEnd::Header: return "Header";
+        case AttemptEnd::OutOfScope: return "OutOfScope";
+        case AttemptEnd::Known: return "Known";
+        case AttemptEnd::NodeInternal: return "NodeInternal";
+    }
+    return "?";
+}
+
 inline constexpr bool attempt_excludes(AttemptEnd e) noexcept {
     return e == AttemptEnd::Alarm || e == AttemptEnd::Contradiction || e == AttemptEnd::Unplaceable ||
            e == AttemptEnd::Header;

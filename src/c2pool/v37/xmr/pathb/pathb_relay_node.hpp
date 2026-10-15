@@ -796,6 +796,11 @@ public:
             if (s.hello_ok) v.emplace_back(s.addr_key.empty() ? std::string("?") : s.addr_key, !s.out_host.empty());
         return v;
     }
+    // The Monero contexts wanted now (FB_GETCTX).
+    std::size_t ctx_wants() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        return ctx_want_.size();
+    }
     std::string describe() const {
         char b[768];
         std::snprintf(b, sizeof b,
@@ -2246,6 +2251,11 @@ private:
             s = node_->apply_join(std::move(t));
         }
         if (s->report) {
+            const AttemptReport& rep = *s->report;
+            log("relay: join attempt at peer " + std::to_string(rep.server) + ": " + attempt_end_name(rep.end) + " (L " +
+                std::to_string(rep.L) + ", at " + std::to_string(rep.at) + ", row " + std::to_string(static_cast<int>(rep.row)) +
+                ", tokens " + std::to_string(rep.strike) + (rep.what.empty() ? "" : ": " + rep.what) + ")" +
+                (s->switched ? " -> adopted" : ""));
             if (s->report->strike > 0) {
                 strike(s->report->server, s->report->strike, false);
                 st_.join_strikes += s->report->strike;
