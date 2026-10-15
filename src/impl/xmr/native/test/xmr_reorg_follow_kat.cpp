@@ -895,9 +895,10 @@ static void test_alt_rows_out_of_order() {
 }
 
 // G. ALT ROWS ACROSS A RESTART: the losing block P of a race at h is held as an alt block with its RowWeights; the
-// table is saved and the node restarted (a new index without P, a new table loaded from the files): P's RowWeights
-// are there, survive a save by the restarted node that does not hold P, and P resolves (block + weights) once the
-// restarted index holds it again (a join's FB_GETCTX); a row more than k_alt below the tip is dropped.
+// table is saved and the node restarted (a new index without P, a new table loaded from the files): P's row and
+// RowWeights are there (P resolves before the index holds it again), survive a save by the restarted node that does
+// not hold P, and stay what resolves P once the restarted index holds it again (after a restart from the native
+// snapshot they cannot be computed again); a row more than k_alt below the tip is dropped.
 static void test_alt_rows_restart() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_" + std::to_string(::getpid()));
@@ -941,6 +942,9 @@ static void test_alt_rows_restart() {
         bare.bind(&restored);
         restored.subscribe_rows([&bare](const ConsensusState& st, const ChainRow& row, bool seeded) { bare.on_row(st, row, seeded); });
         checkf(rows.load(why) && bare.load(why), "altrestart: both tables load (%s)", why.c_str());
+        const auto before = rows.block(p);
+        checkf(before.has_value() && before->height == 8 && rows.weights(p) == w_before && !bare.block(p).has_value(),
+               "altrestart: before P comes back it resolves from the kept row and RowWeights (control: not)");
         const OfferResult r = restored.offer_block(nullptr, pe, /*own_mined=*/false);
         const auto b = rows.block(p);
         checkf(r.outcome == OfferOutcome::StoredAsAlt && b.has_value() && rows.weights(p) == w_before,
@@ -955,8 +959,9 @@ static void test_alt_rows_restart() {
         g.idx->subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
         std::string why;
         const bool ok = rows.load(why);
-        checkf(ok && rows.weights(p) == w_before && !rows.block(p).has_value(),
-               "altrestart: after the restart P's RowWeights are loaded (P itself not held yet) (%s)", why.c_str());
+        const auto kb = rows.block(p);
+        checkf(ok && rows.weights(p) == w_before && kb.has_value() && kb->height == 8 && kb->prev_id == g.main_ids[6],
+               "altrestart: after the restart P's row and RowWeights are loaded (the index does not hold P) (%s)", why.c_str());
         checkf(rows.save(why), "altrestart: the restarted node saves (%s)", why.c_str());
     }
     {

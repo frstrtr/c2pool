@@ -10,7 +10,8 @@
 //   on_row       the row sink (ChainIndex::subscribe_rows): RowWeights of each
 //                connected or seeded row and of each alt block on its own
 //                branch, by id (snapshot_after_connect)
-//   block        a held row by id: a main-chain row or a resolved alt block
+//   block        a held row by id: a main-chain row or a resolved alt block; else a row
+//                off the main chain kept from before a restart
 //   block_at_or_below_anchor
 //                the seeded difficulty rows by height
 //   anchor       the oldest main-chain row held
@@ -19,8 +20,8 @@
 //   frontier     the height of the highest main-chain row whose RowWeights
 //                record is written (the consumer frontier)
 //   load / save  the RowWeights table files: `row_weights` (encode_row_weights_table) the
-//                main-chain rows the index holds; `row_weights_alt` (encode_alt_row_weights)
-//                every other row with its height (alternative blocks, held or not), kept
+//                main-chain rows the index holds; `row_weights_alt` (encode_alt_rows) every
+//                other row with the row itself (alternative blocks, held or not), kept
 //                across a restart while its height is within k_alt (P-07) of the index
 //                tip; save drops the rest
 //
@@ -51,41 +52,66 @@
 
 namespace c2pool::xmr::pathb {
 
-// The alternative rows' file (node-local): u32 n | n x (id 32 | u64 height LE | RowWeights 33), ids ascending.
-inline constexpr std::size_t kAltRowBytes = kHashBytes + sizeof(std::uint64_t) + kRowWeightsBytes;
+// The alternative rows' file (node-local): u32 n | n x (id 32 | prev 32 | u64 height | u64 timestamp |
+// u64 cumulative difficulty lo | u64 hi | RowWeights 33), integers LE, ids ascending: each row as a connected row
+// survives a restart (the row from the index's snapshot, its RowWeights from row_weights).
+struct AltRow {
+    BranchBlock row;
+    RowWeights w;
+};
+inline constexpr std::size_t kAltRowBytes = 2 * kHashBytes + 4 * sizeof(std::uint64_t) + kRowWeightsBytes;
 
-inline std::vector<std::uint8_t> encode_alt_row_weights(const std::map<Hash32, std::pair<std::uint64_t, RowWeights>>& t) {
+namespace detail_alt {
+inline void put_u64(std::vector<std::uint8_t>& o, std::uint64_t x) {
+    for (std::size_t i = 0; i < 8; ++i) o.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
+}
+inline std::uint64_t get_u64(std::span<const std::uint8_t> in, std::size_t o) {
+    std::uint64_t x = 0;
+    for (std::size_t i = 0; i < 8; ++i) x |= std::uint64_t{in[o + i]} << (8 * i);
+    return x;
+}
+}  // namespace detail_alt
+
+inline std::vector<std::uint8_t> encode_alt_rows(const std::map<Hash32, AltRow>& t) {
     std::vector<std::uint8_t> out;
     out.reserve(4 + t.size() * kAltRowBytes);
     const std::uint32_t n = static_cast<std::uint32_t>(t.size());
     for (std::size_t i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(n >> (8 * i)));
-    for (const auto& [id, hw] : t) {
+    for (const auto& [id, a] : t) {
         out.insert(out.end(), id.begin(), id.end());
-        for (std::size_t i = 0; i < 8; ++i) out.push_back(static_cast<std::uint8_t>(hw.first >> (8 * i)));
-        encode_row_weights(hw.second, out);
+        out.insert(out.end(), a.row.prev_id.begin(), a.row.prev_id.end());
+        detail_alt::put_u64(out, a.row.height);
+        detail_alt::put_u64(out, a.row.timestamp);
+        detail_alt::put_u64(out, a.row.cumulative_difficulty.lo);
+        detail_alt::put_u64(out, a.row.cumulative_difficulty.hi);
+        encode_row_weights(a.w, out);
     }
     return out;
 }
 
-inline std::optional<std::map<Hash32, std::pair<std::uint64_t, RowWeights>>> decode_alt_row_weights(
-        std::span<const std::uint8_t> in) {
+inline std::optional<std::map<Hash32, AltRow>> decode_alt_rows(std::span<const std::uint8_t> in) {
     if (in.size() < 4) return std::nullopt;
     std::uint32_t n = 0;
     for (std::size_t i = 0; i < 4; ++i) n |= std::uint32_t{in[i]} << (8 * i);
     if ((in.size() - 4) % kAltRowBytes != 0 || (in.size() - 4) / kAltRowBytes != n) return std::nullopt;
-    std::map<Hash32, std::pair<std::uint64_t, RowWeights>> t;
+    std::map<Hash32, AltRow> t;
     Hash32 prev{};
     for (std::size_t k = 0; k < n; ++k) {
         const std::size_t o = 4 + k * kAltRowBytes;
-        Hash32 id{};
-        std::copy_n(in.begin() + static_cast<std::ptrdiff_t>(o), kHashBytes, id.begin());
-        if (k > 0 && !(prev < id)) return std::nullopt;
-        std::uint64_t h = 0;
-        for (std::size_t i = 0; i < 8; ++i) h |= std::uint64_t{in[o + kHashBytes + i]} << (8 * i);
-        const std::optional<RowWeights> w = decode_row_weights(in.subspan(o + kHashBytes + 8, kRowWeightsBytes));
+        AltRow a;
+        std::copy_n(in.begin() + static_cast<std::ptrdiff_t>(o), kHashBytes, a.row.id.begin());
+        if (k > 0 && !(prev < a.row.id)) return std::nullopt;
+        std::copy_n(in.begin() + static_cast<std::ptrdiff_t>(o + kHashBytes), kHashBytes, a.row.prev_id.begin());
+        const std::size_t q = o + 2 * kHashBytes;
+        a.row.height = detail_alt::get_u64(in, q);
+        a.row.timestamp = detail_alt::get_u64(in, q + 8);
+        a.row.cumulative_difficulty.lo = detail_alt::get_u64(in, q + 16);
+        a.row.cumulative_difficulty.hi = detail_alt::get_u64(in, q + 24);
+        const std::optional<RowWeights> w = decode_row_weights(in.subspan(q + 32, kRowWeightsBytes));
         if (!w) return std::nullopt;
-        t.emplace(id, std::make_pair(h, *w));
-        prev = id;
+        a.w = *w;
+        prev = a.row.id;
+        t.emplace(a.row.id, a);
     }
     return t;
 }
@@ -103,16 +129,25 @@ public:
         if (!w) return;
         std::lock_guard<std::mutex> lk(mu_);
         table_[row.id] = *w;
-        heights_[row.id] = row.height;
+        BranchBlock b;
+        b.id = row.id;
+        b.prev_id = row.prev_id;
+        b.height = row.height;
+        b.timestamp = row.timestamp;
+        b.cumulative_difficulty = row.cumulative_difficulty;
+        rows_[row.id] = b;
         ++recorded_;
     }
 
     // ---- IMoneroRows ----
+    // A held row (main or alt); else a row off the main chain kept from before a restart (row_weights_alt).
     std::optional<BranchBlock> block(const Hash32& id) const override {
         if (index_ == nullptr) return std::nullopt;
-        const auto r = index_->held_row(id);
-        if (!r) return std::nullopt;
-        return branch_block(*r);
+        if (const auto r = index_->held_row(id)) return branch_block(*r);
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = kept_.find(id);
+        if (it == kept_.end()) return std::nullopt;
+        return it->second;
     }
     std::optional<BranchBlock> block_at_or_below_anchor(std::uint64_t height) const override {
         if (index_ == nullptr) return std::nullopt;
@@ -182,64 +217,66 @@ public:
         std::ifstream fa(alt_path(), std::ios::binary);
         if (!fa) return true;
         const std::vector<std::uint8_t> abytes((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
-        const auto a = decode_alt_row_weights(abytes);
+        const auto a = decode_alt_rows(abytes);
         if (!a) {
             why = "row weights table " + alt_path() + " does not decode";
             return false;
         }
-        for (const auto& [id, hw] : *a) {
-            if (table_.emplace(id, hw.second).second) ++loaded_;
-            heights_.emplace(id, hw.first);
+        for (const auto& [id, ar] : *a) {
+            if (table_.emplace(id, ar.w).second) ++loaded_;
+            rows_.emplace(id, ar.row);
+            kept_.emplace(id, ar.row);
         }
         return true;
     }
     // Writes the main-chain rows the index holds to `row_weights` and every other row whose height is within
     // k_alt of the index tip to `row_weights_alt` (each a temp file renamed over the old one); drops the rest.
     bool save(std::string& why) {
-        std::vector<std::pair<Hash32, std::optional<std::uint64_t>>> ids;
+        std::vector<Hash32> ids;
         {
             std::lock_guard<std::mutex> lk(mu_);
             ids.reserve(table_.size());
-            for (const auto& [id, w] : table_) {
-                const auto h = heights_.find(id);
-                ids.emplace_back(id, h == heights_.end() ? std::nullopt : std::optional<std::uint64_t>(h->second));
-            }
+            for (const auto& [id, w] : table_) ids.push_back(id);
         }
-        std::vector<Hash32> gone, alt;
+        // off the main chain: the row as the index holds it, or as recorded / kept before
+        std::vector<std::pair<Hash32, std::optional<BranchBlock>>> off;
+        std::uint64_t tip_h = 0;
         if (index_ != nullptr) {
             const auto tip = index_->tip();
-            const std::uint64_t tip_h = tip ? tip->height : 0;
-            for (const auto& [id, h0] : ids) {
+            tip_h = tip ? tip->height : 0;
+            for (const Hash32& id : ids) {
                 const auto r = index_->held_row(id);
                 if (r && r->main) continue;
-                const std::optional<std::uint64_t> h = r ? std::optional<std::uint64_t>(r->height) : h0;
-                if (h && *h + alt_keep_ >= tip_h)
-                    alt.push_back(id);
-                else
-                    gone.push_back(id);
+                off.emplace_back(id, r ? std::optional<BranchBlock>(branch_block(*r)) : std::nullopt);
             }
         }
         std::vector<std::uint8_t> bytes, abytes;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            for (const Hash32& id : gone) {
-                table_.erase(id);
-                heights_.erase(id);
+            std::map<Hash32, AltRow> alts;
+            for (auto& [id, held] : off) {
+                std::optional<BranchBlock> row = held;
+                if (!row) {
+                    const auto it = rows_.find(id);
+                    if (it != rows_.end()) row = it->second;
+                }
+                const auto w = table_.find(id);
+                if (row && w != table_.end() && row->height + alt_keep_ >= tip_h) {
+                    alts.emplace(id, AltRow{*row, w->second});
+                    rows_[id] = *row;
+                    kept_[id] = *row;
+                } else {
+                    table_.erase(id);
+                    rows_.erase(id);
+                    kept_.erase(id);
+                }
             }
             std::map<Hash32, RowWeights> main = table_;
-            std::map<Hash32, std::pair<std::uint64_t, RowWeights>> alts;
-            for (const Hash32& id : alt) {
-                const auto it = table_.find(id);
-                if (it == table_.end()) continue;
-                const auto r = index_ != nullptr ? index_->held_row(id) : std::nullopt;
-                const auto h = heights_.find(id);
-                const std::uint64_t height = r ? r->height : (h != heights_.end() ? h->second : 0);
-                heights_[id] = height;
-                alts.emplace(id, std::make_pair(height, it->second));
-                main.erase(id);
-            }
+            for (const auto& [id, a] : alts) main.erase(id);
+            for (auto it = rows_.begin(); it != rows_.end();)  // rows of ids no longer in the table
+                it = table_.count(it->first) ? std::next(it) : rows_.erase(it);
             bytes = encode_row_weights_table(main);
-            abytes = encode_alt_row_weights(alts);
+            abytes = encode_alt_rows(alts);
         }
         return write_file(path_, bytes, why) && write_file(alt_path(), abytes, why);
     }
@@ -284,7 +321,8 @@ private:
     const ::c2pool::xmr::native::ChainIndex* index_ = nullptr;
     mutable std::mutex mu_;
     std::map<Hash32, RowWeights> table_;
-    std::map<Hash32, std::uint64_t> heights_;  // the height of every row recorded or loaded with one
+    std::map<Hash32, BranchBlock> rows_;  // the row of every RowWeights recorded or loaded with one
+    std::map<Hash32, BranchBlock> kept_;  // rows off the main chain kept across a restart (served by block())
     std::uint64_t alt_keep_ = kAltDepth;
     std::uint64_t recorded_ = 0;
     std::size_t loaded_ = 0;
