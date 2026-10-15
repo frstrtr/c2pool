@@ -183,6 +183,32 @@ public:
         return true;
     }
 
+    // The states along a branch that leaves the best chain at `fork_height`,
+    // computed on a COPY of the state (this view is not touched): the copy is
+    // rolled back to the fork point and `branch` (oldest first) is connected on
+    // it; `each` gets the copy and the row right after each block connected.
+    // False: the undo history does not reach the fork point, or a block does
+    // not evaluate or connect on its branch (nothing is reported after it).
+    bool on_branch(std::uint64_t fork_height, const std::vector<const BlockEntry*>& branch, std::uint64_t now,
+                   const std::function<void(const ConsensusState&, const ChainRow&)>& each) const {
+        if (state_.height() < fork_height) return false;
+        const std::uint64_t back = state_.height() - fork_height;
+        if (back > undos_.size()) return false;
+        ConsensusState s = state_;
+        for (std::uint64_t i = 0; i < back; ++i)
+            if (!s.disconnect(undos_[undos_.size() - 1 - static_cast<std::size_t>(i)])) return false;
+        for (const BlockEntry* e : branch) {
+            EvaluatedBlock ev;
+            std::string why;
+            if (e == nullptr || evaluate_block(*e, ev, why) != EvalStatus::Ok) return false;
+            ChainRow row;
+            ConnectUndo undo;
+            if (s.connect(ev.input, now, row, undo, why) != ConnectStatus::Ok) return false;
+            each(s, row);
+        }
+        return true;
+    }
+
     // A reorg's first half: roll back to `height` (which must be at or above the
     // anchor). Returns how many blocks left the chain.
     std::uint64_t disconnect_to(std::uint64_t height) {

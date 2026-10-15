@@ -569,6 +569,8 @@ public:
     // A row sink runs under the index mutex, on the thread that connected or
     // seeded the row, with the consensus state whose tip is that row (`seeded`:
     // an anchor, a direct seed or a snapshot base). It must not call the index.
+    // A block kept as an alternative branch is reported too, with the state on
+    // its own branch (a copy; the best chain's state is not changed).
     using RowSink = std::function<void(const ConsensusState& state, const ChainRow& tip, bool seeded)>;
     void subscribe_rows(RowSink sink) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1595,8 +1597,10 @@ private:
         const bool switched = maybe_switch_locked_();
         r.outcome = switched && rows_.contains(r.id) ? OfferOutcome::Reorged
                                                      : OfferOutcome::StoredAsAlt;
-        if (r.outcome == OfferOutcome::StoredAsAlt)
+        if (r.outcome == OfferOutcome::StoredAsAlt) {
             r.why = "kept as an alternative branch";
+            notify_alt_rows_locked_(r.id);   // its state on its own branch, for the row sinks
+        }
         return r;
     }
 
@@ -1717,6 +1721,35 @@ private:
         const ChainRow* t = view_.state().tip();
         if (t == nullptr) return;
         for (const RowSink& s : row_sinks_) s(view_.state(), *t, seeded);
+    }
+
+    // The row sinks for an alt block held as an alternative branch: the state on
+    // ITS branch right after each block of it (the main chain rolled back to the
+    // fork point on a copy, the branch connected on the copy), so a consumer
+    // keeps per retained row what it keeps for a connected one. Every block of
+    // the branch must be resolved, hold its bodies and have passed the PoW gate;
+    // otherwise nothing is reported.
+    void notify_alt_rows_locked_(const Hash& id) {
+        if (row_sinks_.empty()) return;
+        std::vector<const AltBlock*> branch;
+        Hash fork_parent{};
+        std::string why;
+        if (alt_.branch_to_main(id, [this](const Hash& h) { return rows_.contains(h); },
+                                static_cast<std::size_t>(opts_.max_reorg_depth), branch, fork_parent, why)
+            != AltPool::BranchWalk::Ok)
+            return;
+        const RowRecord* fork_row = rows_.by_id(fork_parent);
+        if (fork_row == nullptr) return;
+        std::vector<const BlockEntry*> entries;
+        entries.reserve(branch.size());
+        for (const AltBlock* b : branch) {
+            if (!b->resolved || !b->has_entry || b->bodies_missing || (opts_.require_pow && !b->adoptable)) return;
+            entries.push_back(&b->entry);
+        }
+        (void)view_.on_branch(fork_row->row.height, entries, /*now=*/0,
+                              [this](const ConsensusState& st, const ChainRow& row) {
+                                  for (const RowSink& s : row_sinks_) s(st, row, false);
+                              });
     }
 
     // An alt block's timestamp: parsed from its own blob. Kept out of AltBlock

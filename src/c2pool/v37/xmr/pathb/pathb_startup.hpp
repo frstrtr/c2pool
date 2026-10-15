@@ -45,6 +45,19 @@ inline constexpr std::string_view kHeaderKeepFlag = "--pathb-header-keep";
 inline constexpr std::string_view kSideKeepFlag = "--pathb-side-keep";
 // Kind-2 descriptors (test networks only).
 inline constexpr std::string_view kDeploymentsFlag = "--pathb-deployments";
+// The regtest rig's K30 set (ruling 36 DC-9, E-43): L, GRACE, TIMEOUT (regtest only; a test-network rig input).
+inline constexpr std::string_view kRegtestK30Flag = "--pathb-regtest-k30";
+
+// The epoch-0 lane rules of a regtest rig: the network's list with K30 L, GRACE and TIMEOUT from the rig; its G is
+// genesis_digest_for of it (the default set gives the golden regtest G). nullopt: not regtest.
+inline std::optional<PathbLaneRules> regtest_k30_rules(LaneNet n, const RatchetParams& k30) {
+    if (n != LaneNet::Regtest) return std::nullopt;
+    PathbLaneRules r = epoch0_lane_rules(n);
+    r.vote_window = k30.window;
+    r.grace = k30.grace;
+    r.timeout = k30.timeout;
+    return r;
+}
 
 enum class StartupStep : std::uint8_t {
     Ok = 0,

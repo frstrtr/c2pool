@@ -60,7 +60,7 @@ inline constexpr std::array<std::string_view, 3> kPoolIdentityFlags = {
 
 // The pool start, pool policy and rig flags refused under --follow-only
 // (--pathb-penalty-fill is allowed).
-inline constexpr std::array<std::string_view, 16> kFollowOnlyPoolFlags = {
+inline constexpr std::array<std::string_view, 17> kFollowOnlyPoolFlags = {
         "--pathb-launch",
         "--vote",
         "--journal-depth",
@@ -77,6 +77,7 @@ inline constexpr std::array<std::string_view, 16> kFollowOnlyPoolFlags = {
         "--pathb-bucket-inflight",
         "--pathb-bucket-rate",
         "--pathb-deployments",
+        "--pathb-regtest-k30",
 };
 
 // Payout inputs without a configuration field (--payout-address has one).

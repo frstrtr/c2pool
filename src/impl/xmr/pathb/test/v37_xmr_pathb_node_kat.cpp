@@ -141,7 +141,10 @@
 //                the link (no ban, no token); solicited ones not counted;
 //   relayjoint   the threaded join over TCP (the attempt on the join worker,
 //                applied on the owner); a RandomX failure in an attempt ends
-//                it alarmed, no token; the next attempt joins.
+//                it alarmed, no token; the next attempt joins;
+//   regtestk30   the regtest rig's K30 set: the golden G by default, a G of
+//                its own with a rig set, a kind-2 file for epoch 1 accepted
+//                at fixed = start + GRACE, refused off regtest.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1058,6 +1061,51 @@ void startup() {
     a.T = pb::EpochTable{};
     const pb::StartupResult w = pb::startup_checks(a);
     check(w.refused == pb::StartupStep::LaneRules, "startup: no epoch-0 rules refused");
+}
+
+
+// ---------------------------------------------------------------------------
+// regtestk30: the regtest rig's K30 set (E-43): with no input the default list's G is the golden regtest G; a rig set
+// gives a G of its own (rules_digest of the rig list) and K30 of its own, the start-up checks pass, and a kind-2
+// file naming epoch 1 (not compiled) passes the table checks at fixed = start + GRACE; refused off regtest.
+void regtestk30() {
+    const pb::Hash32 golden = pb::hash_from_hex("f91737946910674cbe8dac71618f5c02ab5c6c7d4a431163c9b4d2222ce67e0e");
+    const pb::PathbLaneRules def = pb::epoch0_lane_rules(pb::LaneNet::Regtest);
+    const std::optional<pb::Hash32> g0 = pb::genesis_digest_for(pb::LaneNet::Regtest, def);
+    const pb::RatchetParams k30{4, 8, 40};
+    const std::optional<pb::PathbLaneRules> rig = pb::regtest_k30_rules(pb::LaneNet::Regtest, k30);
+    const std::optional<pb::Hash32> g1 = rig ? pb::genesis_digest_for(pb::LaneNet::Regtest, *rig) : std::nullopt;
+    check(g0 && *g0 == golden && rig && g1 && *g1 != golden && *g1 == pb::rules_digest(*rig)
+                  && pb::ratchet_params_of(*rig).window == 4 && pb::ratchet_params_of(*rig).grace == 8
+                  && pb::ratchet_params_of(*rig).timeout == 40,
+          "regtestk30: the default list's G is the golden regtest G; a rig K30 set gives its own G and K30");
+    check(!pb::regtest_k30_rules(pb::LaneNet::Testnet, k30) && !pb::regtest_k30_rules(pb::LaneNet::Stagenet, k30)
+                  && !pb::regtest_k30_rules(pb::LaneNet::Mainnet, k30),
+          "regtestk30: refused off regtest");
+    // the start-up checks with the rig set and a kind-2 file naming epoch 1
+    pb::StartupInputs in;
+    in.net = pb::LaneNet::Regtest;
+    in.journal_depth = 1152;
+    in.rp = pb::ratchet_params_of(*rig);
+    in.T.compiled.push_back(pb::CompiledEpoch{0, *g1, *rig});
+    pb::Deployment d;
+    d.epoch_no = 1;
+    d.rules_digest = seq32(0x11);
+    d.kind = pb::kKindFixed;
+    d.start = 0;
+    d.fixed = 8;
+    in.deployments.push_back(d);
+    in.hf = 16;
+    in.z_lt_view = 300000;
+    in.buffers = pb::relay_buffers_default(16, 300000, pb::kRuledLaneParams.r_max).value();
+    in.raw.pool_genesis_height = std::to_string(kPoolH);
+    in.hash_at = [](std::uint64_t h) -> std::optional<pb::Hash32> { return mon_block(h); };
+    in.monero_tip = kMonTop;
+    const pb::StartupResult r = pb::startup_checks(in);
+    pb::StartupInputs early = in;
+    early.deployments[0].fixed = 7;  // fixed < start + GRACE
+    check(r.ok() && r.T.attempts.size() == 1 && pb::startup_checks(early).refused == pb::StartupStep::DeploymentTable,
+          "regtestk30: the rig set and a kind-2 file for epoch 1 at fixed = start + GRACE start; fixed below it is refused");
 }
 
 // ---------------------------------------------------------------------------
@@ -4189,6 +4237,7 @@ int main(int argc, char** argv) {
     run("relayp40", relayp40);
     run("relayp50", relayp50);
     run("relayjoint", relayjoint);
+    run("regtestk30", regtestk30);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
     run("prune_flags", prune_flags);

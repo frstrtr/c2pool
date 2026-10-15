@@ -165,7 +165,6 @@ static std::optional<std::uint32_t> g_relay_solicited;   // --relay-solicited-cr
 static std::size_t   g_relay_parked_max = 0;             // --relay-parked-max N (0 = the relay node's default)
 static std::optional<std::uint32_t> g_relay_keepalive_ms;   // --relay-keepalive-ms MS
 static std::optional<std::uint32_t> g_relay_silence_ms;     // --relay-silence-timeout-ms MS
-static bool          g_no_relay_serve = false;           // --no-relay-serve
 static std::optional<double> g_relay_peer_valid_rate;    // --relay-peer-valid-rate R (P-15; raise only)
 static std::optional<std::uint64_t> g_relay_pending_cap; // --relay-pending-cap N (P-09; raise only)
 static std::optional<std::uint64_t> g_relay_send_queue;  // --relay-send-queue-bytes N (P-67; floor two FC_HEADERS frames)
@@ -200,6 +199,7 @@ struct PathbFlags {
     std::optional<std::uint64_t> join_min_peers;      // --join-min-peers N
     std::optional<std::uint64_t> bucket_inflight;     // --pathb-bucket-inflight N
     std::optional<std::uint64_t> bucket_rate;         // --pathb-bucket-rate BYTES
+    std::optional<pb::RatchetParams> regtest_k30;     // --pathb-regtest-k30 L,GRACE,TIMEOUT (regtest rig input)
 };
 
 static MoneroNetwork parse_net(const std::string& s) {
@@ -527,7 +527,19 @@ static int run_follow_only(XmrNodeConfig& cfg, const PathbFlags& pf) {
             }
             out.push_back(std::move(fe));
         }
-        return out;
+        // a reorg: a follow line per block of the new branch (its blocks from the index, their transactions)
+        return pb::expand_reorgs(out, [&](const pb::Hash32& id) -> std::optional<pb::FollowEvent> {
+            const auto b = nn->index().by_id(id);
+            if (!b) return std::nullopt;
+            pb::FollowEvent fe;
+            fe.height = b->height;
+            fe.id = b->id;
+            fe.prev = b->prev_id;
+            std::lock_guard<std::mutex> lk(txm);
+            const auto it = block_txs.find(b->id);
+            if (it != block_txs.end()) fe.tx_ids = it->second;
+            return fe;
+        });
     };
     io.backlog_version = [&]() { return backend->source().epoch().backlog_seq; };
     io.tmpl.readiness = [&]() {
@@ -811,9 +823,24 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     const bool p2p_first = cfg.arm_order == ArmOrderMode::P2PFirst;
     const pmode::RunPlan plan = pmode::run_plan_of(cfg);
     const pb::LaneNet lnet = lane_net_of(cfg.network);
-    const pb::Hash32 G = pb::genesis_rules_digest(lnet);
+    // epoch 0: the network's lane rules and G; on regtest the rig's K30 set gives its own list and G (E-43)
+    pb::PathbLaneRules rules0 = pb::epoch0_lane_rules(lnet);
+    if (pf.regtest_k30) {
+        const std::optional<pb::PathbLaneRules> r = pb::regtest_k30_rules(lnet, *pf.regtest_k30);
+        if (!r) {
+            std::printf("REFUSED: %s is regtest only\n", std::string(pb::kRegtestK30Flag).c_str());
+            return 2;
+        }
+        rules0 = *r;
+    }
+    const std::optional<pb::Hash32> G0 = pb::genesis_digest_for(lnet, rules0);
+    if (!G0) {
+        std::printf("REFUSED: the epoch-0 lane rules are not the network's list\n");
+        return 2;
+    }
+    const pb::Hash32 G = *G0;
     const pb::LaneParams P = pb::kRuledLaneParams;
-    const pb::RatchetParams RP = pb::kRuledRatchetParams;
+    const pb::RatchetParams RP = pb::ratchet_params_of(rules0);
 
     // ---- the fees and the payees given at start (the configured sum first: start-up step 1) ----
     const std::uint32_t give_bp = pb::policy::pct_to_bp(g_give_author_exact);
@@ -927,7 +954,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     in.journal_depth = pf.journal_depth ? *pf.journal_depth : pb::journal_j0(P, pb::kSealDepth);
     in.p = P;
     in.rp = RP;
-    in.T.compiled.push_back(pb::CompiledEpoch{0, G, pb::epoch0_lane_rules(lnet)});
+    in.T.compiled.push_back(pb::CompiledEpoch{0, G, rules0});
     in.deployments = deployments;
     in.hf = hf;
     in.z_lt_view = z_lt;
@@ -1156,9 +1183,9 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             return 2;
         }
     }
-    std::printf("relay: Path B relay node: listen=%s peers=%zu seeds=%zu discovery=%s verify threads=%zu%s\n",
+    std::printf("relay: Path B relay node: listen=%s peers=%zu seeds=%zu discovery=%s verify threads=%zu\n",
                 ro.listen ? cfg.relay_listen.c_str() : "off", ro.peers.size(), ro.seeds.size(),
-                ro.discovery ? "on" : "off", ro.verify_threads, g_no_relay_serve ? " (--no-relay-serve)" : "");
+                ro.discovery ? "on" : "off", ro.verify_threads);
     if (g_relay_partition_s) std::signal(SIGUSR1, on_sigusr1);
 
     // ---- stratum: the job source, the publish arm, the exact gate, the listener ----
@@ -1957,6 +1984,7 @@ inline constexpr RemovedFlag kRemovedFlags[] = {
         {"--relay-backfill-positions", true},
         {"--relay-reoffer-seconds", true},
         {"--relay-index-horizon", true},
+        {"--no-relay-serve", false},
         {"--drops-enrol", true},
         {"--drops-enrol-min-tip", true},
         {"--drops-retain-bins", true},
@@ -2017,6 +2045,7 @@ static void print_help() {
             "  --join-min-peers <n>         peers whose HELLO tails name the candidates before a join (default 2)\n"
             "  --pathb-bucket-inflight <n>  FC_GETBUCKETS in flight per peer (default 1)\n"
             "  --pathb-bucket-rate <bytes>  FC_BUCKETS bytes per peer per minute\n"
+            "  --pathb-regtest-k30 <L,GRACE,TIMEOUT>  the regtest rig's K30 set (regtest only; G from it)\n"
             "  --give-author-pct <p>        the author's weight share in this node's jobs (defaults to 0.1; 0 opts out)\n"
             "  --node-owner-fee-pct <p>     the node owner's weight share in this node's jobs (default 0)\n"
             "  --node-owner-address <addr>  the node owner's standard address\n"
@@ -2041,7 +2070,6 @@ static void print_help() {
             "  --relay-peer-valid-rate <r>  valid objects per peer per second (default and floor 1.7; raise only)\n"
             "  --relay-pending-cap <n>      pending receipts (default and floor 18432; raise only)\n"
             "  --relay-send-queue-bytes <n> per-link send queue (default 16777216; floor two FC_HEADERS frames)\n"
-            "  --no-relay-serve\n"
             "  --relay-test-partition-seconds <s>  SIGUSR1 drops the relay for s seconds (test rigs)\n"
             " stratum and mining:\n"
             "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
@@ -2212,6 +2240,19 @@ int main(int argc, char** argv) {
             else if (a == "--join-min-peers") pf.join_min_peers = u64();
             else if (a == "--pathb-bucket-inflight") pf.bucket_inflight = u64();
             else if (a == "--pathb-bucket-rate") pf.bucket_rate = u64();
+            else if (a == "--pathb-regtest-k30") {
+                const std::string v = value();
+                std::array<std::uint64_t, 3> k{};
+                std::size_t n = 0, at = 0;
+                for (; n < 3; ++n) {
+                    const std::size_t c = v.find(',', at);
+                    k[n] = cs::to_u64(a, v.substr(at, c == std::string::npos ? std::string::npos : c - at));
+                    if (c == std::string::npos) break;
+                    at = c + 1;
+                }
+                if (n != 2) throw cs::UsageError(a + " wants L,GRACE,TIMEOUT, got '" + v + "'");
+                pf.regtest_k30 = pb::RatchetParams{k[0], k[1], k[2]};
+            }
             else if (a == "--follow-only") cfg.follow_only = true;
             else if (a == "--native-txpool-warm-timeout-ms") cfg.native_txpool_warm_timeout_ms = u64();
             else if (a == "--relay-listen") cfg.relay_listen = value();
@@ -2230,7 +2271,6 @@ int main(int argc, char** argv) {
             else if (a == "--relay-parked-max") g_relay_parked_max = static_cast<std::size_t>(u64());
             else if (a == "--relay-keepalive-ms") g_relay_keepalive_ms = u32();
             else if (a == "--relay-silence-timeout-ms") g_relay_silence_ms = u32();
-            else if (a == "--no-relay-serve") g_no_relay_serve = true;
             else if (a == "--relay-peer-valid-rate") {
                 const double r = cs::to_double(a, value());
                 const double fl = static_cast<double>(1 + pb::kRuledLaneParams.r_max) /

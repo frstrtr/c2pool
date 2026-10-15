@@ -8,7 +8,8 @@
 // The Path B follower rows over the native Monero node's chain index (the
 // IMoneroRows a FollowerBranchView reads):
 //   on_row       the row sink (ChainIndex::subscribe_rows): RowWeights of each
-//                connected or seeded row, by id (snapshot_after_connect)
+//                connected or seeded row and of each alt block on its own
+//                branch, by id (snapshot_after_connect)
 //   block        a held row by id: a main-chain row or a resolved alt block
 //   block_at_or_below_anchor
 //                the seeded difficulty rows by height

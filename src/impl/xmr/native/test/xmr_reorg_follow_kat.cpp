@@ -47,6 +47,11 @@
 //                   branch and switches. Also: refetch_wanted() stops naming
 //                   ids we are already holding the bytes for, which is what
 //                   made the driver re-ask forever.
+//   E  ALT ROWS  -- the losing block of a same-height race, held as an alt
+//                   block, is reported to the row sinks with the state on ITS
+//                   own branch; the Path B follower rows then resolve it (held
+//                   and weighted), and the weights equal those reported when
+//                   the block connects after a reorg.
 //   D  BOUNDS    -- the relaxation buys no new powers. Deeper than
 //                   max_reorg_depth is refused and journaled; equal work
 //                   against our own block is KEPT (D-14) and the rival is held
@@ -71,6 +76,7 @@
 #include "impl/xmr/native/chain/xmr_row_store.hpp"
 #include "impl/xmr/native/consensus/xmr_reward.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_follower_rows.hpp"
 
 using namespace c2pool::xmr::native;
 
@@ -766,6 +772,80 @@ static void test_branch_and_apply_agree() {
 }
 
 // =============================================================================
+// =============================================================================
+// E. an alt block's row: reported on its own branch, equal to its row after a reorg
+// =============================================================================
+struct RowSeen {
+    Hash          id{};
+    std::uint64_t height = 0;
+    std::uint64_t agc = 0;
+    std::uint64_t z = 0;
+    std::uint64_t ltem = 0;
+    std::uint8_t  hf = 0;
+    bool          main = false;   // the best chain's tip was this row
+};
+
+static void test_alt_rows() {
+    Rig f(8);
+    ChainIndex& idx = *f.idx;
+    std::vector<RowSeen> seen;
+    c2pool::xmr::pathb::PathbFollowerRows rows("/nonexistent/row_weights");
+    rows.bind(&idx);
+    idx.subscribe_rows([&seen, &idx](const ConsensusState& st, const ChainRow& row, bool) {
+        RowSeen r;
+        r.id = row.id;
+        r.height = row.height;
+        r.agc = st.already_generated_coins();
+        r.z = st.effective_median_weight();
+        r.ltem = st.long_term_effective_median();
+        r.hf = st.next_major_version();
+        r.main = &st == &idx.view().state();
+        seen.push_back(r);
+    });
+    idx.subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+
+    const std::uint64_t fork_height = 7;
+    const Hash fork_id = f.main_ids[6];
+    const Hash our_tip = f.main_ids[7];
+    std::vector<BlockEntry> rival = build_branch(idx, fork_id, fork_height, 2, /*salt_base=*/21);
+    const Hash p = id_of(rival[0]);
+
+    seen.clear();
+    const OfferResult r8 = idx.offer_block(&f.them, rival[0], /*own_mined=*/false);
+    checkf(r8.outcome == OfferOutcome::StoredAsAlt && f.tip_id() == our_tip,
+           "altrows: the rival at height 8 became %s (%s), expected StoredAsAlt", to_string(r8.outcome), r8.why.c_str());
+    const RowSeen* alt = nullptr;
+    for (const RowSeen& r : seen)
+        if (r.id == p) alt = &r;
+    checkf(alt != nullptr && !alt->main && alt->height == 8,
+           "altrows: the alt block at height 8 was not reported to the row sinks on its own branch");
+    // the best chain's state is untouched by it
+    checkf(idx.view().state().tip() != nullptr && idx.view().state().tip()->id == our_tip,
+           "altrows: reporting the alt row changed the best chain's state");
+    // Path B: the alt P_r resolves (held as an alt row, with RowWeights)
+    const std::optional<c2pool::xmr::pathb::BranchBlock> pb = rows.block(p);
+    const std::optional<c2pool::xmr::pathb::RowWeights> pw = rows.weights(p);
+    checkf(pb.has_value() && pw.has_value() && pb->height == 8,
+           "altrows: the follower rows do not resolve the alt block (block %d, weights %d)", pb ? 1 : 0, pw ? 1 : 0);
+    const RowSeen before = alt ? *alt : RowSeen{};
+
+    // the rival branch wins: rival[0] connects in the reorg and is reported again, from the best chain's state
+    seen.clear();
+    const OfferResult r9 = idx.offer_block(&f.them, rival[1], /*own_mined=*/false);
+    checkf(r9.outcome == OfferOutcome::Reorged, "altrows: the heavier branch became %s, expected Reorged",
+           to_string(r9.outcome));
+    const RowSeen* after = nullptr;
+    for (const RowSeen& r : seen)
+        if (r.id == p && r.main) after = &r;
+    checkf(after != nullptr && after->agc == before.agc && after->z == before.z && after->ltem == before.ltem
+                   && after->hf == before.hf,
+           "altrows: the alt row's weights differ from the row's after the reorg (agc %llu / %llu, z %llu / %llu)",
+           static_cast<unsigned long long>(before.agc), static_cast<unsigned long long>(after ? after->agc : 0),
+           static_cast<unsigned long long>(before.z), static_cast<unsigned long long>(after ? after->z : 0));
+    const std::optional<c2pool::xmr::pathb::RowWeights> pw2 = rows.weights(p);
+    checkf(pw && pw2 && *pw == *pw2, "altrows: the follower rows' weights of P changed when P connected");
+}
+
 int main() {
     test_young_window();
     test_follow_after_race_loss();
@@ -773,6 +853,7 @@ int main() {
     test_bounds();
     test_branch_and_apply_agree();
     test_checkpoint_above_tip();
+    test_alt_rows();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

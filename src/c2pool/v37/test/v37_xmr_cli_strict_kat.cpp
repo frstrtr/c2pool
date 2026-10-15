@@ -234,6 +234,8 @@ void bad_rows() {
         {{"--relay-peer-valid-rate", "1.6"},   "--relay-peer-valid-rate", "a valid-object rate below its floor (raise only)"},
         {{"--pathb-claim-alarm-rate", "1"},    "--pathb-claim-alarm-rate", "a claim-alarm rate below its floor (raise only)"},
         {{"--relay-send-queue-bytes", "1x"},   "--relay-send-queue-bytes", "a send-queue bound with junk"},
+        {{"--pathb-regtest-k30", "4,8"},       "--pathb-regtest-k30",   "a K30 set with two fields"},
+        {{"--pathb-regtest-k30", "4,8,x"},     "--pathb-regtest-k30",   "a K30 set with junk"},
         // FORK-FUSE-2's test knob, parsed by the strict helpers.
         {{"--test-unknwon-fork-stall-s", "5"}, "--test-unknwon-fork-stall-s", "a typo of --test-unknown-fork-stall-s"},
         {{"--test-unknown-fork-stall-s"},      "--test-unknown-fork-stall-s", "the fuse stall knob with no value (last)"},
@@ -401,7 +403,7 @@ const std::vector<FlagRow>& flag_table() {
         {"--no-daemon-rpc", Cls::Kept, {{}}},
         {"--no-good-citizen", Cls::Kept, {{}}},
         {"--no-relay-bootstrap", Cls::Kept, {{}}},
-        {"--no-relay-serve", Cls::Kept, {{}}},
+        {"--no-relay-serve", Cls::Removed, {{}}},
         {"--node-owner-address", Cls::Kept, {{"addr"}}},
         {"--node-owner-fee-pct", Cls::Kept, {{"0"}}},
         {"--own-fork-bound-s", Cls::Kept, {{"240"}}},
@@ -466,6 +468,7 @@ const std::vector<FlagRow>& flag_table() {
         {"--relay-peer-valid-rate", Cls::New, {{"1.7"}, {"40"}}},
         {"--relay-pending-cap", Cls::New, {{"18432"}, {"40000"}}},
         {"--relay-send-queue-bytes", Cls::New, {{"16777216"}}},
+        {"--pathb-regtest-k30", Cls::New, {{"4,8,40"}}},
         {"--pathb-waiting-cap", Cls::New, {{"1152"}}},
         {"--pool-genesis-from", Cls::New, {{"100:" + H64 + ":headline"}}},
         {"--pool-genesis-height", Cls::New, {{"100"}}},
@@ -646,6 +649,15 @@ void rig_rows() {
               rr.out.find("REFUSED: --coinbase: removed at the S4w flag day") != std::string::npos,
           "C: the xmr-race-rig node.sh line is not refused naming --coinbase: " + first_line(rr.out));
     check(rr.files == 0, "C: the xmr-race-rig node.sh line created files");
+    // A dial-only observer's line of the old relay (--no-relay-serve): refused naming it, nothing created.
+    std::vector<std::string> observer = {
+        "--network", "regtest", "--rpc-host", "127.0.0.1", "--rpc-port", "1", "--zmq-port", "1",
+        "--relay-peer", "127.0.0.1:7322", "--no-relay-serve", "--status-every", "5"};
+    const Run ro = run(observer, 5000);
+    check(!ro.timed_out && ro.rc == 2 && line_count(ro.out) == 1 &&
+              ro.out.find("REFUSED: --no-relay-serve: removed at the S4w flag day") != std::string::npos,
+          "C: a dial-only observer's line is not refused naming --no-relay-serve: " + first_line(ro.out));
+    check(ro.files == 0, "C: the observer's line created files");
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +676,14 @@ void fuse_rows() {
     check(r.out.find("REFUSED: --test-unknown-fork-stall-s") != std::string::npos,
           tag + ": no fuse-knob refusal line: " + first_line(r.out));
     check(r.files == 0, tag + ": created " + std::to_string(r.files) + " file(s)");
+    // the regtest rig's K30 set off regtest: refused before anything starts
+    const std::vector<std::string> k30 = {"--network", "stagenet", "--rpc-host", "127.0.0.1", "--rpc-port", "1",
+                                          "--zmq-port", "1", "--pathb-regtest-k30", "4,8,40"};
+    const Run rk = run(k30, 5000);
+    const std::string tk = "F: [" + join(k30) + "]";
+    check(!rk.timed_out && rk.rc == 2 && rk.out.find("REFUSED: --pathb-regtest-k30 is regtest only") != std::string::npos,
+          tk + ": not refused as regtest only: " + first_line(rk.out));
+    check(rk.files == 0, tk + ": created " + std::to_string(rk.files) + " file(s)");
 }
 
 // ---------------------------------------------------------------------------

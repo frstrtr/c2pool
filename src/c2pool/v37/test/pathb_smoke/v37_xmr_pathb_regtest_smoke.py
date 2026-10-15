@@ -25,9 +25,11 @@
 #   old       O refused at HELLO in both directions; no strike, no ban
 #   partition C partitioned (SIGUSR1); a switch that re-pends a receipt;
 #             the receipt carried; all nodes on one best tip
-#   restart   A, B, C stopped and started twice: byte-equal digests; then C's
-#             store corrupted: load failure -> the joiner path -> C on the
-#             peers' best tip
+#   restart   C's store corrupted while A and B run (they hold the side
+#             headers they saw; a restarted server serves only the closure
+#             walks of the side branches it has seen since its restart, P-51):
+#             load failure -> the joiner path -> C on the peers' best tip; then
+#             A, B, C stopped and started twice: byte-equal digests
 #   fo        D: start line, no listener, no pathb_db, a follow line per
 #             monerod block with monerod's id, TOTAL=0, kill -9 + restart
 #             with fee-diverse transactions in monerod's pool: the first
@@ -36,6 +38,10 @@
 #   solo      E: no template without --pathb-launch; with it found blocks
 #             landed=own-index paying the tip's window split; nothing
 #             booked; a restart reloads the store
+#   hold      K (--native-solo, --pathb-launch, --mine): the rig's K30 set
+#             (--pathb-regtest-k30 2,4,8: G of its own) and a kind-2
+#             deployment file naming epoch 1, which the build lacks: HOLD at
+#             fixed - 1; the job counter stops; no strike
 # Inputs: --daemon (the c2pool-v37-xmr under test); XMR_REGTEST_MONEROD,
 # XMR_REGTEST_WALLET_RPC (default: beside monerod), XMR_PATHB_SMOKE_OLD_BINARY
 # (the old binary; the part "old" needs it). A missing monerod, wallet-rpc
@@ -59,7 +65,7 @@ import time
 import urllib.request
 
 SKIP = 77
-PARTS_ALL = ["chain", "pool", "old", "partition", "restart", "fo", "solo"]
+PARTS_ALL = ["chain", "pool", "old", "partition", "restart", "fo", "solo", "hold"]
 
 # The default regtest monerod endpoint of c2pool-v37-xmr (RPC, ZMQ).
 DEFAULT_RPC_PORT = 18081
@@ -393,6 +399,7 @@ class Rig:
             "relay_A": b + 10, "relay_B": b + 11, "relay_C": b + 12, "relay_O": b + 13,
             "stratum_A": b + 20, "stratum_B": b + 21, "stratum_C": b + 22, "stratum_E": b + 23, "stratum_O": b + 24,
             "web_A": b + 30, "web_B": b + 31, "web_C": b + 32, "web_E": b + 33,
+            "stratum_K": b + 25, "web_K": b + 34,
         }
         self.addr = {}
         self.genesis = None
@@ -476,14 +483,6 @@ class Rig:
         r = rpc(self.m1(), "generateblocks", {"amount_of_blocks": a.premine, "wallet_address": self.addr["fund"]})
         self.res.note("chain", "premine generateblocks %d -> height %s" % (a.premine, r.get("height")))
         pre.stop(signal.SIGTERM)
-        self.m1p = self.start("monerod-m1", self.monerod_argv(md1, os.path.join(self.logs, "m1.log"),
-                                                               self.p["m1_p2p"], self.m1(),
-                                                               ["--out-peers", "8", "--add-exclusive-node",
-                                                                "127.0.0.1:%d" % self.p["m2_p2p"]]), nice=False)
-        self.m2p = self.start("monerod-m2", self.monerod_argv(md2, os.path.join(self.logs, "m2.log"),
-                                                               self.p["m2_p2p"], self.p["m2_rpc"],
-                                                               ["--out-peers", "8", "--add-exclusive-node",
-                                                                "127.0.0.1:%d" % self.p["m1_p2p"]]), nice=False)
 
         def synced():
             try:
@@ -491,7 +490,24 @@ class Rig:
             except Exception:
                 return False
             return i1["synchronized"] and i2["synchronized"] and i1["height"] == i2["height"] == a.premine + 1
-        wait_for(synced, 120, "M1 and M2 synchronized")
+        for attempt in (1, 2):   # a monerod pair that does not flag "synchronized" is started once more
+            self.m1p = self.start("monerod-m1", self.monerod_argv(md1, os.path.join(self.logs, "m1.log"),
+                                                                   self.p["m1_p2p"], self.m1(),
+                                                                   ["--out-peers", "8", "--add-exclusive-node",
+                                                                    "127.0.0.1:%d" % self.p["m2_p2p"]]), nice=False)
+            self.m2p = self.start("monerod-m2", self.monerod_argv(md2, os.path.join(self.logs, "m2.log"),
+                                                                   self.p["m2_p2p"], self.p["m2_rpc"],
+                                                                   ["--out-peers", "8", "--add-exclusive-node",
+                                                                    "127.0.0.1:%d" % self.p["m1_p2p"]]), nice=False)
+            try:
+                wait_for(synced, 120, "M1 and M2 synchronized")
+                break
+            except Fail:
+                if attempt == 2:
+                    raise
+                self.res.note("chain", "M1 and M2 not synchronized in 120 s: both started once more")
+                self.m1p.stop(signal.SIGTERM)
+                self.m2p.stop(signal.SIGTERM)
         self.H = self.chain_tip()
         hh = self.hash_at(self.H)
         self.genesis = hashlib.sha256(b"v37 pathb regtest smoke" + bytes.fromhex(hh)).hexdigest()
@@ -807,12 +823,57 @@ class Rig:
         return ready()
 
     def part_restart(self):
+        # load failure first: C's store corrupted while A and B keep running (their side headers held in memory)
+        self.stop_pool("C")
+        dbs = [os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(self.work, "nodeC", "regtest", "pathb_db"))
+               for f in fs if f.endswith(".ldb")]
+        if not dbs:
+            self.res.check("restart", False, "C: no table file to corrupt")
+            return
+        victim = max(dbs, key=os.path.getsize)
+        sz = os.path.getsize(victim)
+        with open(victim, "r+b") as f:
+            f.seek(sz // 2)
+            blk = bytearray(f.read(64))
+            for i in range(len(blk)):
+                blk[i] ^= 0xa5
+            f.seek(sz // 2)
+            f.write(blk)
+        self.res.note("restart", "C: corrupted 64 bytes at offset %d of %s (%d bytes)" % (sz // 2, victim, sz))
+        try:
+            p = self.start_pool_node("C", False)
+        except Fail as e:
+            refused = [l for l in self.nodes["C"].text().splitlines() if l.startswith("REFUSED")]
+            self.res.check("restart", False, "C with the corrupted store: %s (%s)" % (e, refused[:1]))
+            return
+        lf = re.findall(r"^store: \S+ load failed .*$", p.text(), re.M)
+        self.res.check("restart", bool(lf), "C: load failure -> the joiner path: %s" % (lf[0] if lf else "no line"))
+        if not lf:
+            return
+
+        def adopted():
+            j = self.web.get("C")
+            ja = self.web.get("A")
+            if not j or not ja:
+                return None
+            return j if j["pathb"]["best_tip"]["id"] == ja["pathb"]["best_tip"]["id"] else None
+        try:
+            j = wait_for(adopted, self.a.join_s, "C adopts the peers' best tip", 2)
+            self.res.check("restart", True, "C: on the peers' best tip after the joiner path: %s" % (digest_of(j),))
+        except Fail as e:
+            rl = last_relay(p.text())
+            self.res.note("restart", "C relay: %s" % (rl.group(0) if rl else "-"))
+            self.res.note("restart", "C status: %s" % (last_status(p.text()).group(0) if last_status(p.text()) else "-"))
+            att = re.findall(r"^  relay: join attempt .*$", p.text(), re.M)
+            self.res.note("restart", "C join attempts: %d, last %s" % (len(att), att[-1] if att else "-"))
+            self.res.check("restart", False, str(e))
+        # then A, B, C stopped and started twice: byte-equal digests
         pre = {}
         for n in "ABC":
             j = self.web.get(n)
             pre[n] = digest_of(j) if j else None
         self.stop_pool("ABC")
-        self.res.note("restart", "pre-stop digests (last web answer while mining): %s" % pre)
+        self.res.note("restart", "pre-stop digests (last web answer): %s" % pre)
         rounds = []
         for r in (1, 2):
             for n in "ABC":
@@ -835,51 +896,6 @@ class Rig:
                         self.res.note("restart", "%s: pre-stop pos %s, loaded pos %s" % (n, pre[n][0], dg[n][0]))
                 self.stop_pool("ABC")
         self.res.check("restart", rounds[0] == rounds[1], "restart 1 == restart 2 per node, byte-equal digests")
-        # load failure: C's store corrupted
-        self.stop_pool("C")
-        dbs = [os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(self.work, "nodeC", "regtest", "pathb_db"))
-               for f in fs if f.endswith(".ldb")]
-        if not dbs:
-            self.res.check("restart", False, "C: no table file to corrupt")
-            return
-        victim = max(dbs, key=os.path.getsize)
-        sz = os.path.getsize(victim)
-        with open(victim, "r+b") as f:
-            f.seek(sz // 2)
-            blk = bytearray(f.read(64))
-            for i in range(len(blk)):
-                blk[i] ^= 0xa5
-            f.seek(sz // 2)
-            f.write(blk)
-        self.res.note("restart", "C: corrupted 64 bytes at offset %d of %s (%d bytes)" % (sz // 2, victim, sz))
-        target = digest_of(self.web.get("A"))
-        try:
-            p = self.start_pool_node("C", False)
-        except Fail as e:
-            refused = [l for l in self.nodes["C"].text().splitlines() if l.startswith("REFUSED")]
-            self.res.check("restart", False, "C with the corrupted store: %s (%s)" % (e, refused[:1]))
-            return
-        lf = re.findall(r"^store: \S+ load failed .*$", p.text(), re.M)
-        self.res.check("restart", bool(lf), "C: load failure -> the joiner path: %s" % (lf[0] if lf else "no line"))
-        if not lf:
-            return
-
-        def adopted():
-            j = self.web.get("C")
-            ja = self.web.get("A")
-            if not j or not ja:
-                return None
-            return j if j["pathb"]["best_tip"]["id"] == ja["pathb"]["best_tip"]["id"] else None
-        try:
-            j = wait_for(adopted, self.a.join_s, "C adopts the peers' best tip", 2)
-        except Fail as e:
-            rl = last_relay(p.text())
-            self.res.note("restart", "C relay: %s" % (rl.group(0) if rl else "-"))
-            self.res.note("restart", "C status: %s" % (last_status(p.text()).group(0) if last_status(p.text()) else "-"))
-            self.res.check("restart", False, str(e))
-            return
-        self.res.check("restart", True, "C: on the peers' best tip after the joiner path: %s (A at %s)" %
-                       (digest_of(j), target))
 
     # ---- part fo ----
     def fo_argv(self):
@@ -959,8 +975,28 @@ class Rig:
             return
         nones = [l for l in q.text().splitlines() if TEMPLATE_RE.match(l) and " none " in l + " "]
         n_tx = int(re.search(r"n_tx=(\d+)", line).group(1))
+        h_rec = int(re.search(r"template h=(\d+)", line).group(1))
         self.res.note("fo", "after the restart: none lines before the first record: %s" % nones[:5])
-        self.res.check("fo", n_tx >= 1, "the first record after kill -9 + restart: %s" % line)
+        if n_tx >= 1:
+            self.res.check("fo", True, "the first record after kill -9 + restart: %s" % line)
+        else:
+            # S4wD 5.9's judge: n_tx=0 fails when the network's block at its height carries a transaction. The rig
+            # mines that block on M1 and reads D's compare line for it.
+            try:
+                rpc(self.m1(), "generateblocks", {"amount_of_blocks": 1, "wallet_address": self.addr["fund"]})
+            except Fail as e:
+                self.res.check("fo", False, "generateblocks for the judge: %s" % e)
+                return
+            pat = re.compile(r"^\[follow-only\] compare h=%d net_id=\S+ net_n_tx=(\d+) .* our_n_tx=(\d+) " % h_rec, re.M)
+            try:
+                m = wait_for(lambda: pat.search(q.text()), 120, "D's compare line at h=%d" % h_rec, 1)
+            except Fail as e:
+                self.res.check("fo", False, "the first record after kill -9 + restart has n_tx=0 and %s" % e)
+                return
+            self.res.check("fo", int(m.group(1)) == 0,
+                           "the first record after kill -9 + restart: n_tx=0, the network's block at h=%d carries %s "
+                           "(5.9: an empty network block decides nothing; one with transactions fails it): %s" %
+                           (h_rec, m.group(1), line))
         rs = [l for l in q.text().splitlines() if "snapshot" in l and ("RESUMED" in l or "no resume" in l)]
         self.res.note("fo", "restart: %s" % (rs[0].strip() if rs else "-"))
 
@@ -1105,6 +1141,60 @@ class Rig:
         q.stop()
         self.no_booking("solo", ["E"])
 
+    # ---- part hold (AC-07) ----
+    def part_hold(self):
+        d = os.path.join(self.work, "nodeK")
+        os.makedirs(d, exist_ok=True)
+        dep = os.path.join(d, "deployments.bin")
+        k30 = (2, 4, 8)            # L, GRACE, TIMEOUT: W_R = floor((GRACE - 1) / L) + 1 = 2, N_W = 4
+        fixed = 0 + k30[1]         # kind 2: fixed = start + GRACE
+        rec = (1).to_bytes(2, "little") + bytes([0x11]) * 32 + bytes([2]) + (0).to_bytes(8, "little") + \
+              (0).to_bytes(8, "little") + fixed.to_bytes(8, "little")
+        assert len(rec) == 59
+        with open(dep, "wb") as f:
+            f.write(rec)
+        argv = [self.a.daemon_run, "--network", "regtest", "--native-solo", "--arm-order", "p2p-first",
+                "--xmr-template-source", "native", "--randomx", "--pool-genesis-height", "0", "--payout-address",
+                self.addr["E"], "--data-dir", d, "--stratum-port", str(self.p["stratum_K"]),
+                "--web-port", str(self.p["web_K"]), "--status-every", "5", "--poll-ms", "250",
+                "--native-snapshot-path", os.path.join(d, "chain.snap"), "--native-txpool-warm-timeout-ms", "2000",
+                "--pathb-launch", "--pathb-regtest-k30", "%d,%d,%d" % k30, "--pathb-deployments", dep,
+                "--mine", str(self.a.mine_threads["E"]), "--mine-fast", "--mine-no-huge-pages", "--mine-no-affinity"]
+        p = self.start("K", argv, cwd=d)
+        self.nodes["K"] = p
+        wait_for(lambda: "stratum: listening on" in p.text() or not p.alive(), 180, "K stratum")
+        golden = "f91737946910674cbe8dac71618f5c02ab5c6c7d4a431163c9b4d2222ce67e0e"
+        stores = [n for n in os.listdir(os.path.join(d, "regtest", "pathb_db"))] \
+            if os.path.isdir(os.path.join(d, "regtest", "pathb_db")) else []
+        self.res.check("hold", bool(stores) and all(not n.endswith(golden) for n in stores),
+                       "the rig's K30 set gives a G of its own: store %s" % (stores,))
+        try:
+            wait_for(lambda: re.search(r"^HOLD: epoch \d+, x=\d+", p.text(), re.M), self.a.hold_s, "K: HOLD", 2)
+        except Fail as e:
+            self.res.check("hold", False, str(e))
+            p.stop()
+            return
+        hl = re.search(r"^HOLD: .*$", p.text(), re.M).group(0)
+        self.res.check("hold", True, "K: %s" % hl)
+        sus = re.findall(r"^lane SUSPEND: causes=(\S+)", p.text(), re.M)
+        self.res.check("hold", bool(sus) and "hold" in sus[-1], "K: lane SUSPEND with cause hold (%s)" % (sus[-1:],))
+
+        def counts():
+            st = re.findall(r"templates=(\d+)", p.text())
+            jb = re.findall(r"  stratum: .* jobs=(\d+)", p.text())
+            return (st[-1] if st else None, jb[-1] if jb else None)
+        time.sleep(10)
+        c1 = counts()
+        time.sleep(30)
+        c2 = counts()
+        self.res.check("hold", c1 == c2 and c1[0] is not None,
+                       "K: the template and job counters stop under HOLD (%s -> %s)" % (c1, c2))
+        rl = last_relay(p.text())
+        self.res.check("hold", rl is not None and "strikes=0 " in rl.group(0) and "bans=0" in rl.group(0),
+                       "K: no strike, no ban (%s)" % (rl.group(0)[:120] if rl else "no relay line"))
+        p.stop()
+        self.no_booking("hold", ["K"])
+
     # ---- the run ----
     def run(self):
         parts = self.a.parts
@@ -1135,6 +1225,9 @@ class Rig:
                     self.nodes[n].stop()
             self.ensure_wallets(True)
             self.part_solo()
+        if "hold" in parts:
+            self.ensure_wallets(True)
+            self.part_hold()
 
 
 def main():
@@ -1155,6 +1248,7 @@ def main():
     ap.add_argument("--fo-restart-s", type=int, default=120)
     ap.add_argument("--solo-nolaunch-s", type=int, default=30)
     ap.add_argument("--solo-s", type=int, default=300)
+    ap.add_argument("--hold-s", type=int, default=600)
     a = ap.parse_args()
     a.mine_threads = {k: int(v) for k, v in (x.split("=") for x in a.mine_threads.split(","))}
     a.parts = [x for x in a.parts.split(",") if x]

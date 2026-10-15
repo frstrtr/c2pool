@@ -21,6 +21,7 @@
 //     c2pool-v37-xmr: FOLLOW-ONLY network= pool=none stratum=off relay=off
 //       mine=off monerod=none snapshot=
 //     [follow-only] follow h= id= prev= event=extend|reorg|orphan depth= tip=
+//       (a reorg: one line per block of the new branch, oldest first)
 //     [follow-only] template h= prev= hf= n_tx= tx_weight= fees= reward=
 //       cb_size= block_weight= zone= base= pool= warm= uptime_s= txset=
 //       log-only   (one line; txset = sha256d of the selected ids in order)
@@ -208,6 +209,43 @@ struct FollowEvent {
     std::vector<Hash32> tx_ids;
     std::uint64_t tx_weight = 0;
 };
+
+// A Reorg event names the new tip only. The follow lines name every block of the new branch: the blocks above the
+// fork point (one below the lowest height the same batch orphaned), oldest first, each as event=reorg with the
+// reorg's depth and tip; `block_of` gives a held block by id (its height, id, prev and transactions). Without an
+// orphan in the batch, or when a parent is not held, the lines start where the walk stops.
+inline std::vector<FollowEvent> expand_reorgs(const std::vector<FollowEvent>& in,
+                                              const std::function<std::optional<FollowEvent>(const Hash32&)>& block_of) {
+    std::vector<FollowEvent> out;
+    std::optional<std::uint64_t> low_orphan;
+    for (const FollowEvent& e : in) {
+        if (e.kind == FollowEventKind::Orphan) {
+            low_orphan = low_orphan ? std::min(*low_orphan, e.height) : e.height;
+            out.push_back(e);
+            continue;
+        }
+        if (e.kind != FollowEventKind::Reorg) {
+            out.push_back(e);
+            continue;
+        }
+        const std::uint64_t fork = low_orphan && *low_orphan > 0 ? *low_orphan - 1 : (e.height > 0 ? e.height - 1 : 0);
+        std::vector<FollowEvent> branch;
+        FollowEvent cur = e;
+        while (cur.height > fork + 1 && block_of) {
+            std::optional<FollowEvent> p = block_of(cur.prev);
+            if (!p || p->height + 1 != cur.height) break;
+            p->kind = FollowEventKind::Reorg;
+            p->depth = e.depth;
+            p->tip = e.tip;
+            branch.push_back(*p);
+            cur = *p;
+        }
+        for (auto it = branch.rbegin(); it != branch.rend(); ++it) out.push_back(*it);
+        out.push_back(e);
+        low_orphan.reset();
+    }
+    return out;
+}
 
 inline std::string follow_line(const FollowEvent& e) {
     return std::string(kFollowOnlyTag) + "follow h=" + std::to_string(e.height) + " id=" + follow_hex(e.id) +
