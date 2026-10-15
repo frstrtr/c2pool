@@ -42,6 +42,12 @@
 //       the policy), C drops the frame (over its cap at its view; no strike);
 //       with C's view cap above it, C's judge drops it at the newest known
 //       ancestor's cap (600,051) before hashing
+//   N8  N6's three cases as real frames from a peer of C's pool: a job of
+//       C's with its Monero parent moved 5 blocks up a branch only A holds,
+//       sent as an FC_CARRIER (the carrier's own P_r), as a receipt carried
+//       by an FC_CARRIER (the carried P_r) and as an FB_RECEIPTS body: the
+//       two carriers' contexts climb to C's index (P-07), every block judged
+//       and fed into C's follower; the receipt's climbs P-06 only
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -56,6 +62,7 @@
 
 using namespace pathb_relay_test;
 using namespace std::chrono_literals;
+using c2pool::v37n::CarrierPeerNode;
 
 // A native chain index as the relay sees it: best-chain rows, retained bodies
 // (connected blocks + held alternatives).
@@ -66,6 +73,7 @@ struct FakeIndex {
     std::atomic<u64> blob_calls{0};
     void main(const SynthBlock& sb) { std::lock_guard<std::mutex> lk(m); rows[sb.height] = block_id(sb); bodies[block_id(sb)] = sb.full_blob; }
     void alt(const SynthBlock& sb)  { std::lock_guard<std::mutex> lk(m); bodies[block_id(sb)] = sb.full_blob; }
+    void drop(const bytes32& id)    { std::lock_guard<std::mutex> lk(m); bodies.erase(id); }
 };
 
 struct TNode {
@@ -335,6 +343,94 @@ int main() {
         C(past.first == 6 && past.second == 4,
           "N5 a relayed carrier's context past the join wants' cap is held at P-06 (wants " + std::to_string(past.first) +
                   ", join wants " + std::to_string(past.second) + ")");
+    }
+
+    // ── N8 N6's three cases as real frames from a peer of C's pool ─
+    // After each carrier case the branch's bodies leave A and A's serving goes quiet (C's follower here is the model
+    // index, not its Path B node's Monero view), so the receipt case counts its own climb only.
+    {
+        CarrierPeerNode raw;
+        const auto pid = raw.add_peer_id("127.0.0.1", Cn.n->port());
+        if (pid != 0) raw.send_to(pid, Cn.n->hello_bytes(Cn.n->r().node_nonce() ^ 0x6a6a6a6aull, 0));
+        C(pid != 0 && wait_until([&] { return Cn.n->r().ready_peers().size() == 3; }, 5000ms),
+          "N8 a raw peer of C's pool is up at C");
+        const pb::PathbNodeConfig cfg = rig.h.config(pk::kat_table(rig.net), false);
+        std::optional<pb::PathbJob> j = rig.job(*Cn.n, 0);
+        C(j.has_value(), "N8 a job of C's on its best tip");
+        if (!j) j = pb::PathbJob{};
+        auto branch = [&](u32 en, std::size_t ntx, u8 salt) {
+            std::vector<bytes32> ids;
+            bytes32 prev = idG;
+            for (u64 k = 1; k <= 5; ++k) {
+                const SynthBlock S = make_block(99 + k, prev, en + static_cast<u32>(k), nullptr, ntx, static_cast<u8>(salt + k));
+                ids.push_back(block_id(S));
+                A.idx.alt(S);
+                prev = ids.back();
+            }
+            return ids;
+        };
+        auto moved = [&](std::uint32_t nonce, const bytes32& pr) {
+            pb::ReceiptBodyV3 b = body_of(*j, nonce);
+            b.blob.prev_id = pr;
+            return b;
+        };
+        auto all_in = [&](const std::vector<bytes32>& ids) {
+            for (const bytes32& x : ids)
+                if (!Cn.has(x)) return false;
+            return true;
+        };
+        auto settle = [&](const std::vector<bytes32>& ids) {
+            for (const bytes32& x : ids) A.idx.drop(x);
+            u64 last = A.n->st().ctx_served.load();
+            auto since = std::chrono::steady_clock::now();
+            const auto end = since + 30s;
+            while (std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(250ms);
+                const u64 now = A.n->st().ctx_served.load();
+                if (now != last) {
+                    last = now;
+                    since = std::chrono::steady_clock::now();
+                } else if (std::chrono::steady_clock::now() - since >= 1500ms) {
+                    return;
+                }
+            }
+        };
+        const std::vector<bytes32> qid = branch(150, 4, 120), sid = branch(160, 5, 130), rid = branch(170, 6, 140);
+
+        // a relayed carrier: its own P_r 5 blocks up the branch (row 5)
+        pb::CarrierBodyV3 cq;
+        cq.own = moved(0x601, qid.back());
+        const std::optional<std::vector<u8>> fq = pb::encode_fc_carrier(cfg.identity.chain_id, cq, cfg.p.r_max);
+        if (fq) raw.send_to(pid, *fq);
+        C(fq.has_value() && wait_until([&] { return all_in(qid); }, 30000ms),
+          "N8 an FC_CARRIER whose own P_r is 5 blocks up a branch only A holds: the context climbs to C's index (P-07): "
+          "every block judged and fed into C's follower");
+        settle(qid);
+
+        // a receipt carried by a relayed carrier: the own body's P_r held, the carried one's 5 blocks up (row 19)
+        pb::CarrierBodyV3 cs;
+        cs.own = body_of(*j, 0x602);
+        cs.carried.push_back(moved(0x603, sid.back()));
+        const std::optional<std::vector<u8>> fs = pb::encode_fc_carrier(cfg.identity.chain_id, cs, cfg.p.r_max);
+        if (fs) raw.send_to(pid, *fs);
+        C(fs.has_value() && wait_until([&] { return all_in(sid); }, 30000ms),
+          "N8 an FC_CARRIER carrying a receipt whose P_r is 5 blocks up such a branch: the context climbs to C's index "
+          "(P-07)");
+        settle(sid);
+
+        // an unsolicited relayed receipt (FB_RECEIPTS): its P_r 5 blocks up such a branch (row 19)
+        const u64 w0 = Cn.n->st().ctx_wanted.load(), s0 = A.n->st().ctx_served.load();
+        const std::optional<std::vector<u8>> fr =
+                pb::encode_fb_receipts(cfg.identity.chain_id, std::vector<pb::ReceiptBodyV3>{moved(0x604, rid.back())}, cfg.p);
+        if (fr) raw.send_to(pid, *fr);
+        const bool wanted = fr.has_value() && wait_until([&] { return Cn.n->st().ctx_wanted.load() > w0; }, 10000ms);
+        std::this_thread::sleep_for(5000ms);   // P-06's climb and its rounds (4 x 3 peers at 250 ms)
+        bool r_none = true;
+        for (const bytes32& x : rid) r_none = r_none && !Cn.has(x);
+        C(wanted && r_none && A.n->st().ctx_served.load() > s0,
+          "N8 an FB_RECEIPTS body whose P_r is 5 blocks up such a branch: its context climbs P-06 only (A served " +
+                  std::to_string(A.n->st().ctx_served.load() - s0) + "): it does not reach C's index");
+        raw.stop();
     }
 
     for (auto* t : {&A, &B, &Cn}) if (C.fail) t->n->dump_logs();
