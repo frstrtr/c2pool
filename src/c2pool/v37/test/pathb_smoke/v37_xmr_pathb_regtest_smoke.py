@@ -903,16 +903,10 @@ class Rig:
             att = re.findall(r"^  relay: join attempt .*$", p.text(), re.M)
             self.res.note("restart", "C join attempts: %d, last %s" % (len(att), att[-1] if att else "-"))
             self.res.check("restart", False, str(e))
-        # then A, B, C stopped and started twice: byte-equal digests; transactions in monerod's pool, broadcast (A holds
-        # one) before the stop: each node's first template after the restart carries them
+        # then A, B, C stopped and started twice: byte-equal digests. Between the two restarts (no miner runs) transactions
+        # go into monerod's pool and A holds a broadcast one before the stop: each node's first template after the
+        # second restart carries them
         try:
-            sent = self.send_transfers([("B", 2), ("C", 3)], "restart")
-            self.res.note("restart", "sent %s" % (sent,))
-            try:
-                wait_for(lambda: self.txpool_count(self.nodes["A"]) >= 1 or None, self.a.fo_bcast_s,
-                         "A holds a broadcast transaction before the stop", 2)
-            except Fail as e:
-                self.res.check("restart", False, str(e))
             pre = {}
             for n in "ABC":
                 j = self.web.get(n)
@@ -930,14 +924,15 @@ class Rig:
                     loaded[n] = m[-1] if m else None
                 dg = self.digests_now("ABC")
                 rounds.append(dg)
-                if r == 1:
+                if r == 2:
                     first = {}
                     for n in "ABC":
                         tl = re.findall(r"^template \d+: .* n_tx=(\d+) ", self.nodes[n].text(), re.M)
                         first[n] = int(tl[0]) if tl else None
+                    pool = http_json("http://127.0.0.1:%d/get_transaction_pool" % self.m1(), {}).get("transactions", [])
                     self.res.check("restart", all(first[n] is not None and first[n] >= 1 for n in "ABC"),
-                                   "restart 1: each node's first template carries the pool's transactions (n_tx %s)"
-                                   % first)
+                                   "restart 2: each node's first template carries the pool's transactions (n_tx %s; "
+                                   "monerod's pool %d)" % (first, len(pool)))
                 self.res.note("restart", "restart %d: store loaded best position %s; digests %s" % (r, loaded, dg))
                 self.res.check("restart", all(loaded[n] is not None for n in "ABC"),
                                "restart %d: A, B, C loaded their stores (best positions %s)" % (r, loaded))
@@ -947,6 +942,13 @@ class Rig:
                     for n in "ABC":
                         if pre[n] is not None:
                             self.res.note("restart", "%s: pre-stop pos %s, loaded pos %s" % (n, pre[n][0], dg[n][0]))
+                    sent = self.send_transfers([("B", 2), ("C", 3)], "restart")
+                    self.res.note("restart", "sent %s" % (sent,))
+                    try:
+                        wait_for(lambda: self.txpool_count(self.nodes["A"]) >= 1 or None, self.a.fo_bcast_s,
+                                 "A holds a broadcast transaction before the stop", 2)
+                    except Fail as e:
+                        self.res.check("restart", False, str(e))
                     self.stop_pool("ABC")
             self.res.check("restart", rounds[0] == rounds[1], "restart 1 == restart 2 per node, byte-equal digests")
         except Fail as e:
