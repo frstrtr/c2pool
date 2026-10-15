@@ -44,6 +44,11 @@ struct FoundBlockRecord {
     // arrives over P2P (v34+ shares carry no tx list), so 0 is never a stand-in.
     std::string             coinbase_txid;
     std::optional<uint32_t> tx_count;
+    // --- v4 merged-parent fields (issue #946) ---
+    // DOGE rows only: the LTC block id the aux solve was mined on and the LTC
+    // height it was mined at. Empty / nullopt = unknown (JSON null), never 0.
+    std::string             parent_hash;
+    std::optional<uint64_t> parent_height;
 
     // Serialize to bytes for LevelDB storage
     std::vector<uint8_t> serialize() const
@@ -51,8 +56,9 @@ struct FoundBlockRecord {
         PackStream ps;
         // Version byte. Each version appends a tail after the previous body; a
         // newer reader that meets an older record leaves the missing fields at
-        // their defaults (read-compat). v2 = #159 enrichment, v3 = #946 explorer.
-        uint8_t version = 3;
+        // their defaults (read-compat). v2 = #159 enrichment, v3 = #946 explorer,
+        // v4 = #946 merged parent.
+        uint8_t version = 4;
         ps << version;
         // Chain as length-prefixed string
         uint8_t chain_len = static_cast<uint8_t>(std::min(chain.size(), size_t(255)));
@@ -101,6 +107,15 @@ struct FoundBlockRecord {
         uint8_t has_tx_count = tx_count.has_value() ? 1 : 0;
         ps << has_tx_count;
         ps << static_cast<uint32_t>(tx_count.value_or(0));
+        // --- v4 tail ---
+        uint8_t ph_len = static_cast<uint8_t>(std::min(parent_hash.size(), size_t(255)));
+        ps << ph_len;
+        if (ph_len > 0)
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(parent_hash.data()), ph_len));
+        uint8_t has_parent_height = parent_height.has_value() ? 1 : 0;
+        ps << has_parent_height;
+        ps << static_cast<uint64_t>(parent_height.value_or(0));
 
         auto span = ps.get_span();
         return {reinterpret_cast<const uint8_t*>(span.data()),
@@ -139,7 +154,7 @@ struct FoundBlockRecord {
         };
 
         uint8_t version = read_u8();
-        if (version < 1 || version > 3) return rec; // unknown version
+        if (version < 1 || version > 4) return rec; // unknown version
 
         uint8_t chain_len = read_u8();
         rec.chain = read_str(chain_len);
@@ -183,6 +198,17 @@ struct FoundBlockRecord {
             bool whole = pos + 4 <= data.size();
             uint32_t n = read_u32();
             if (has_tx_count && whole) rec.tx_count = n;
+        }
+
+        // --- v4 merged-parent tail (absent on v1-v3 records) ---
+        if (version >= 4) {
+            uint8_t ph_len = read_u8();
+            rec.parent_hash = read_str(ph_len);
+            uint8_t has_parent_height = read_u8();
+            // Same rule as tx_count: a cut tail stays unknown, never 0.
+            bool whole = pos + 8 <= data.size();
+            uint64_t ph = read_u64();
+            if (has_parent_height && whole) rec.parent_height = ph;
         }
 
         return rec;

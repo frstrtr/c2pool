@@ -2148,6 +2148,10 @@ int main(int argc, char* argv[]) {
                             // #946: explorer fields (fblk v3).
                             rec.coinbase_txid = blk.coinbase_txid;
                             rec.tx_count = blk.tx_count;
+                            // #946: DOGE parent (fblk v4); set_found_block_parent
+                            // re-persists the row, so it survives a restart.
+                            rec.parent_hash = blk.parent_hash;
+                            rec.parent_height = blk.parent_height;
                             return fblk_store->store(rec);
                         },
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
@@ -2174,6 +2178,9 @@ int main(int argc, char* argv[]) {
                                 // #946: v1/v2 records leave these unknown (null).
                                 blk.coinbase_txid = rec.coinbase_txid;
                                 blk.tx_count = rec.tx_count;
+                                // #946: v1-v3 records leave the parent unknown (null).
+                                blk.parent_hash = rec.parent_hash;
+                                blk.parent_height = rec.parent_height;
                                 result.push_back(std::move(blk));
                             }
                             return result;

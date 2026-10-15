@@ -7,9 +7,11 @@
 //   * every record a pre-#946 node wrote still loads: fblk v1 + v2 (DASH lands
 //     here too, via main_dash) and mblk v1, byte-built exactly as the old
 //     serializers laid them out;
-//   * the fblk v3 / mblk v2 tails are pure appends, and an unknown value stays
+//   * the fblk v3 + v4 / mblk v2 tails are pure appends, and an unknown value stays
 //     unknown (empty / nullopt), never "" or 0 — a known tx_count of 0 and an
 //     unknown one stay distinct, even across a truncated tail;
+//   * a DOGE row's parent_hash / parent_height (fblk v4) survive a restart,
+//     and a v3 record (no parent tail) restores with the parent unknown;
 //   * update_coinbase reaches the newest DOGE record past 1000 stored ones
 //     (it used to scan list_keys("mblk:", 1000) oldest first);
 //   * find_by_hash answers only for the FULL hash, although the key holds the
@@ -166,7 +168,7 @@ TEST(FoundBlockStoreKat, FblkV3IsAPureAppendAndRoundTrips)
     // Unknown body fields: the v3 bytes after the version byte start with the
     // exact v2 body.
     auto out = rec.serialize();
-    ASSERT_EQ(out[0], 3);
+    ASSERT_EQ(out[0], 4);
     ASSERT_GT(out.size(), v2.size());
     EXPECT_TRUE(std::equal(v2.begin() + 1, v2.end(), out.begin() + 1));
     auto back = FoundBlockRecord::deserialize(out);
@@ -194,7 +196,8 @@ TEST(FoundBlockStoreKat, TruncatedTailLeavesTxCountUnknown)
     FoundBlockRecord f = FoundBlockRecord::deserialize(fblk_v2_record().v);
     f.tx_count = 7;
     auto fb = f.serialize();
-    fb.resize(fb.size() - 2);   // cut into the tx_count u32
+    // Cut into the tx_count u32, past the empty v4 parent tail (len + flag + u64).
+    fb.resize(fb.size() - (1 + 1 + 8) - 2);
     EXPECT_FALSE(FoundBlockRecord::deserialize(fb).tx_count.has_value());
 
     MergedBlockRecord m = MergedBlockRecord::deserialize(mblk_v1_record(98, 1, kHashA).v);
@@ -204,9 +207,56 @@ TEST(FoundBlockStoreKat, TruncatedTailLeavesTxCountUnknown)
     EXPECT_FALSE(MergedBlockRecord::deserialize(mb).tx_count.has_value());
 }
 
+TEST(FoundBlockStoreKat, FblkV3RecordRestoresWithParentUnknown)
+{
+    // fblk v3 = v2 body + #946 explorer tail, as the pre-v4 writer left it.
+    auto v2 = fblk_v2_record();
+    Bytes b; b.u8(3);
+    b.v.insert(b.v.end(), v2.v.begin() + 1, v2.v.end());
+    b.str(hash_n(0xcb)).u8(1).u32(42);
+    auto rec = FoundBlockRecord::deserialize(b.v);
+    EXPECT_EQ(rec.block_hash, kHashA);
+    EXPECT_EQ(rec.coinbase_txid, hash_n(0xcb));
+    ASSERT_TRUE(rec.tx_count.has_value());
+    EXPECT_EQ(*rec.tx_count, 42u);
+    EXPECT_TRUE(rec.parent_hash.empty());
+    EXPECT_FALSE(rec.parent_height.has_value());
+
+    // v4 rewrite keeps the v3 bytes as its prefix.
+    auto out = rec.serialize();
+    ASSERT_EQ(out[0], 4);
+    EXPECT_TRUE(std::equal(b.v.begin() + 1, b.v.end(), out.begin() + 1));
+}
+
+TEST(FoundBlockStoreKat, FblkV4CarriesTheMergedParent)
+{
+    FoundBlockRecord rec = FoundBlockRecord::deserialize(fblk_v2_record().v);
+    rec.chain = "DOGE";
+    rec.parent_hash = hash_n(0x17c);
+    rec.parent_height = 2900001;
+    auto back = FoundBlockRecord::deserialize(rec.serialize());
+    EXPECT_EQ(back.chain, "DOGE");
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+    ASSERT_TRUE(back.parent_height.has_value());
+    EXPECT_EQ(*back.parent_height, 2900001u);
+    EXPECT_EQ(back.share_hash, kHashA);
+
+    // Hash known, height unknown (peer prev not in the header chain).
+    rec.parent_height.reset();
+    back = FoundBlockRecord::deserialize(rec.serialize());
+    EXPECT_EQ(back.parent_hash, hash_n(0x17c));
+    EXPECT_FALSE(back.parent_height.has_value());
+
+    // A cut parent_height stays unknown, never 0.
+    rec.parent_height = 2900001;
+    auto cut = rec.serialize();
+    cut.resize(cut.size() - 3);
+    EXPECT_FALSE(FoundBlockRecord::deserialize(cut).parent_height.has_value());
+}
+
 TEST(FoundBlockStoreKat, UnknownVersionsAreRejected)
 {
-    auto f = fblk_v2_record().v; f[0] = 4;
+    auto f = fblk_v2_record().v; f[0] = 5;
     EXPECT_TRUE(FoundBlockRecord::deserialize(f).block_hash.empty());
     f[0] = 0;
     EXPECT_TRUE(FoundBlockRecord::deserialize(f).block_hash.empty());
