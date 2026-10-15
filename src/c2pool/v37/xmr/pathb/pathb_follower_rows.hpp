@@ -65,6 +65,12 @@ struct KeptRow {
 };
 inline constexpr std::size_t kKeptRowBytes = 2 * kHashBytes + 4 * sizeof(std::uint64_t) + kRowWeightsBytes;
 
+// The kept file's sanity bound on its rows: those within k_alt (P-07) of the index tip, the main ones (k_alt + 1) plus
+// the alternatives the native index's alt store holds (alt_max_blocks): 721 + 512 = 1,233 at the code's values.
+inline std::uint64_t kept_rows_cap() {
+    return (kAltDepth + 1) + static_cast<std::uint64_t>(::c2pool::xmr::native::ChainIndexOptions{}.alt_max_blocks);
+}
+
 namespace detail_kept {
 inline void put_u64(std::vector<std::uint8_t>& o, std::uint64_t x) {
     for (std::size_t i = 0; i < 8; ++i) o.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
@@ -97,7 +103,8 @@ inline std::optional<std::map<Hash32, KeptRow>> decode_kept_rows(std::span<const
     if (in.size() < 4) return std::nullopt;
     std::uint32_t n = 0;
     for (std::size_t i = 0; i < 4; ++i) n |= std::uint32_t{in[i]} << (8 * i);
-    if ((in.size() - 4) % kKeptRowBytes != 0 || (in.size() - 4) / kKeptRowBytes != n) return std::nullopt;
+    if (n > kept_rows_cap() || (in.size() - 4) % kKeptRowBytes != 0 || (in.size() - 4) / kKeptRowBytes != n)
+        return std::nullopt;
     std::map<Hash32, KeptRow> t;
     Hash32 prev{};
     for (std::size_t k = 0; k < n; ++k) {
@@ -224,7 +231,8 @@ public:
         loaded_ = t->size();
         std::ifstream fa(kept_path(), std::ios::binary);
         if (!fa) return true;
-        // the kept rows: their count read first and the file's size checked against it before the rest is read
+        // the kept rows: the file's size checked against the cap, their count read and checked against the cap and the
+        // size, before the rest is read
         const auto refused = [&]() {
             why = "kept rows " + kept_path() + " do not decode -- the main rows only";
             return true;
@@ -232,10 +240,12 @@ public:
         std::error_code ec;
         const std::uintmax_t size = std::filesystem::file_size(kept_path(), ec);
         std::array<std::uint8_t, 4> nb{};
-        if (ec || size < nb.size() || !fa.read(reinterpret_cast<char*>(nb.data()), nb.size())) return refused();
+        if (ec || size < nb.size() || size > nb.size() + kept_rows_cap() * kKeptRowBytes
+            || !fa.read(reinterpret_cast<char*>(nb.data()), nb.size()))
+            return refused();
         const std::uint64_t n = std::uint64_t{nb[0]} | std::uint64_t{nb[1]} << 8 | std::uint64_t{nb[2]} << 16 |
                                 std::uint64_t{nb[3]} << 24;
-        if (size != nb.size() + n * kKeptRowBytes) return refused();
+        if (n > kept_rows_cap() || size != nb.size() + n * kKeptRowBytes) return refused();
         std::vector<std::uint8_t> abytes(static_cast<std::size_t>(size));
         std::copy(nb.begin(), nb.end(), abytes.begin());
         if (!fa.read(reinterpret_cast<char*>(abytes.data() + nb.size()), static_cast<std::streamsize>(size - nb.size())))
@@ -299,6 +309,12 @@ public:
             }
             for (auto it = rows_.begin(); it != rows_.end();)  // rows of ids no longer in the table
                 it = table_.count(it->first) ? std::next(it) : rows_.erase(it);
+            if (kept.size() > kept_rows_cap()) {  // the file's bound: the highest rows kept
+                std::vector<std::pair<std::uint64_t, Hash32>> by_h;
+                for (const auto& [id, kr] : kept) by_h.emplace_back(kr.row.height, id);
+                std::sort(by_h.begin(), by_h.end());
+                for (std::size_t i = 0; i + kept_rows_cap() < by_h.size(); ++i) kept.erase(by_h[i].second);
+            }
             bytes = encode_row_weights_table(main);
             kbytes = encode_kept_rows(kept);
         }

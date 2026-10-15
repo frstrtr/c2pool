@@ -1123,6 +1123,7 @@ void test_node_resumes_the_output_set() {
                     "outset: run %d resumed the image together with its output set: ring resolution intact", run);
         kat::checkf(node.index().tip() && node.index().tip()->id == src.tip_id(),
                     "outset: run %d at the snapshot's tip", run);
+        std::remove((path + ".outset").c_str());   // what run 2 finds is what this run's stop writes
         node.stop();   // the clean stop writes the image and the overlay again, for run 2
     }
     std::remove((path + ".outset").c_str());

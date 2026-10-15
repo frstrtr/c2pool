@@ -61,6 +61,8 @@
 //   H  RESUME REORG -- a young chain's snapshot replays the blocks above its
 //                   base: the resumed index adopts a heavier branch forking
 //                   below its resume point.
+//   I  KEPT CAP -- the kept file's rows bounded by (k_alt + 1) +
+//                   alt_max_blocks: at the cap it loads, one above is refused.
 //   D  BOUNDS    -- the relaxation buys no new powers. Deeper than
 //                   max_reorg_depth is refused and journaled; equal work
 //                   against our own block is KEPT (D-14) and the rival is held
@@ -78,6 +80,7 @@
 #include <filesystem>
 #include <fstream>
 #include <unistd.h>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1082,6 +1085,46 @@ static void test_resume_reorg_below() {
            to_string(last), static_cast<unsigned long long>(restored.tip() ? restored.tip()->height : 0));
 }
 
+// I. THE KEPT FILE'S CAP: (k_alt + 1) + alt_max_blocks rows (721 + 512 = 1,233 at the code's values). A well-formed kept
+// file of 1,233 rows loads; one of 1,234 is refused before its rows are read (the main rows load, the message says so).
+static void test_kept_cap() {
+    namespace fs = std::filesystem;
+    namespace pbn = c2pool::xmr::pathb;
+    const std::uint64_t cap = pbn::kept_rows_cap();
+    checkf(cap == 720 + 1 + ChainIndexOptions{}.alt_max_blocks && cap == 1233, "keptcap: the cap is 721 + 512 = 1,233 (%llu)",
+           static_cast<unsigned long long>(cap));
+    const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_cap_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto write = [&](const std::string& path, std::uint64_t n) {
+        std::map<pbn::Hash32, pbn::KeptRow> t;
+        for (std::uint64_t k = 0; k < n; ++k) {
+            pbn::KeptRow r;
+            r.row.id[0] = static_cast<std::uint8_t>(k >> 8);
+            r.row.id[1] = static_cast<std::uint8_t>(k);
+            r.row.id[31] = 0x5c;
+            r.row.height = 1000 + k;
+            r.w = pbn::RowWeights{1, 300000, 300000, 300000, 16};
+            t.emplace(r.row.id, r);
+        }
+        const std::vector<std::uint8_t> main = pbn::encode_row_weights_table({});
+        const std::vector<std::uint8_t> kept = pbn::encode_kept_rows(t);
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(main.data()), static_cast<std::streamsize>(main.size()));
+        std::ofstream(path + "_kept", std::ios::binary).write(reinterpret_cast<const char*>(kept.data()), static_cast<std::streamsize>(kept.size()));
+    };
+    const std::string at = (dir / "at_cap").string(), over = (dir / "over_cap").string();
+    write(at, cap);
+    write(over, cap + 1);
+    pbn::PathbFollowerRows a(at), b(over);
+    std::string wa, wb;
+    const bool la = a.load(wa), lb = b.load(wb);
+    checkf(la && wa.empty() && a.loaded() == cap, "keptcap: a kept file of %llu rows loads (%zu loaded; %s)",
+           static_cast<unsigned long long>(cap), a.loaded(), wa.c_str());
+    checkf(lb && !wb.empty() && b.loaded() == 0, "keptcap: a kept file of %llu rows is refused, the main rows load (%s)",
+           static_cast<unsigned long long>(cap + 1), wb.c_str());
+    fs::remove_all(dir);
+}
+
 int main() {
     test_young_window();
     test_follow_after_race_loss();
@@ -1093,6 +1136,7 @@ int main() {
     test_alt_rows_out_of_order();
     test_alt_rows_restart();
     test_resume_reorg_below();
+    test_kept_cap();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

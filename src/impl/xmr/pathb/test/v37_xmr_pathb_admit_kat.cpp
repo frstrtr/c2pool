@@ -1792,7 +1792,7 @@ void contract() {
             for (int k = 0; k < 17; ++k) all = all && top.charge(9, 5, true);
             const bool empty = !top.charge(9, 5, true);
             const bool refilled = top.charge(9, 6, true);
-            pb::ClaimAlarmBudget past(P, UINT64_MAX);  // above the bound: taken at the bound
+            pb::ClaimAlarmBudget past(P, mx + 1);  // above the bound (x T would wrap to 4 units a second): taken at the bound
             bool p_ok = true;
             for (int k = 0; k < 17; ++k) p_ok = p_ok && past.charge(9, 5, true);
             check(fl == 1700 && mx == UINT64_MAX / P.carrier_interval_s && mx * P.carrier_interval_s >= mx && all && empty
