@@ -894,7 +894,7 @@ static void test_alt_rows_out_of_order() {
            w0 ? 1 : 0, w1 ? 1 : 0, b1 ? 1 : 0);
 }
 
-// G. ALT ROWS ACROSS A RESTART: the losing block P of a race at h is held as an alt block with its RowWeights; the
+// G. ROWS ACROSS A RESTART: the losing block P of a race at h is held as an alt block with its RowWeights; the
 // table is saved and the node restarted (a new index without P, a new table loaded from the files): P's row and
 // RowWeights are there (P resolves before the index holds it again), survive a save by the restarted node that does
 // not hold P, and stay what resolves P once the restarted index holds it again (after a restart from the native
@@ -910,6 +910,7 @@ static void test_alt_rows_restart() {
     std::optional<c2pool::xmr::pathb::RowWeights> w_before;
     std::vector<std::uint8_t> snap;
     ChainIndexOptions sopts;
+    Hash m9{};
     {
         Rig f(8);
         sopts = f.opts;
@@ -922,7 +923,11 @@ static void test_alt_rows_restart() {
         const OfferResult r = f.idx->offer_block(&f.them, pe, /*own_mined=*/false);
         checkf(r.outcome == OfferOutcome::StoredAsAlt, "altrestart: P became %s, expected StoredAsAlt", to_string(r.outcome));
         w_before = rows.weights(p);
+        // the main chain grows to 9 (recorded as a main-chain row)
+        const OfferResult r9 = f.idx->offer_block(nullptr, Rig::block_for(f.main_ids[7], 9, agc_at(*f.idx, 8), 0, 0), true);
+        m9 = r9.id;
         std::string why;
+        checkf(r9.outcome == OfferOutcome::Connected && rows.weights(m9).has_value(), "altrestart: the main block at 9 recorded");
         checkf(w_before.has_value() && rows.save(why), "altrestart: P weighted and the table saved (%s)", why.c_str());
         checkf(f.idx->save_snapshot(snap, why), "altrestart: the native snapshot saved (%s)", why.c_str());
     }
@@ -951,6 +956,19 @@ static void test_alt_rows_restart() {
                "altrestart: after a restart from the native snapshot P resolves (block + the saved RowWeights)");
         checkf(!bare.weights(p).has_value(),
                "altrestart: control: without the saved alt rows P's RowWeights are not computed again (no rollback)");
+    }
+    {
+        // a restart that finds a main-chain row of before off its chain (the restarted index ends at 8): the row at
+        // 9 is still served, as kept, with its RowWeights
+        Rig g8(8);
+        c2pool::xmr::pathb::PathbFollowerRows rows(table);
+        rows.bind(g8.idx);
+        std::string why;
+        const bool ok = rows.load(why);
+        const auto kb = rows.block(m9);
+        checkf(ok && !g8.idx->held_row(m9).has_value() && kb.has_value() && kb->height == 9 && kb->prev_id == g8.main_ids[7]
+                       && rows.weights(m9).has_value(),
+               "altrestart: a main-chain row the restarted index does not hold is served as kept (%s)", why.c_str());
     }
     {
         Rig g(8);  // the restarted node: the same main chain, P not held
