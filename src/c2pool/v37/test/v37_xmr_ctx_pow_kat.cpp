@@ -289,7 +289,10 @@ int main() {
     }
     {   // the bound is the relay's default
         pb::PathbRelayOptions ro;
-        C(ro.ctx_max_depth == 2, "C2 PathbRelayOptions::ctx_max_depth defaults to 2 (the tip-freshness bound)");
+        C(ro.ctx_max_depth == 3 && ro.ctx_max_depth == pb::relay_horizons(pb::kRuledLaneParams).ctx_max_depth,
+          "C2 PathbRelayOptions::ctx_max_depth defaults to P-06 = Fresh + 1 = 3 (an unsolicited receipt)");
+        C(ro.ctx_join_depth == 720 && ro.ctx_join_depth == pb::kAltDepth,
+          "C2 PathbRelayOptions::ctx_join_depth defaults to P-07 = k_alt = 720 (a carrier under verification)");
     }
 
     // ── C3 serving: a parked (unverified) alternative block is not served ──

@@ -11,26 +11,25 @@
 // The stratum side of LANE SUSPEND, over a real loopback socket. Before the
 // rework, set_lane_suspended() was only an atomic flip: nothing was pushed, a
 // connected miner kept hashing the withdrawn (stale-root) job, a reconnect was
-// handed the same job at login. Proves:
+// handed the same job at login. The suspension is driven by hold() through
+// LaneSuspendState and apply_lane_gate, as the serve loop drives it. Proves:
 //   LS1  a logged-in session gets a job;
-//   LS2  the suspend EDGE disconnects it (the job is withdrawn), counted once;
-//   LS3  repeated set_lane_suspended(true) calls are not new edges;
-//   LS4  a login while suspended is PARKED (no job handed out);
-//   LS6  the RESUME edge serves the parked login a fresh job.
+//   LS2  the suspend EDGE (hold() rises) disconnects it (the job is withdrawn),
+//        counted once;
+//   LS3  repeated passes with hold() still set are not new edges;
+//   LS4  a login while held is PARKED (no job handed out);
+//   LS6  the RESUME edge (hold() clears) serves the parked login a fresh job.
 // R-C rework-3:
 //   LS8  (D4) a template push whose seed-prefetch hook is running when the
 //        lane suspends pushes NO job afterwards (rework-2 pushed it);
 //   LS9  (D4) set_lane_suspended(true) does not return while a share hand-off
 //        is in flight, and no share is handed off after it returns;
-//   LS10 (D5 + contested) the lane-suspend state machine counts every cause on
-//        its own rising edge (HELD-LAG during a LAG suspension is counted),
-//        CONTESTED suspends and auto-resumes only when every cause is clear.
+//   LS10 the lane-suspend state machine counts every cause (hold, fork-fuse)
+//        on its own rising edge (FORK-FUSE during a HOLD suspension is
+//        counted) and resumes only when every cause is clear.
 // Stub template source + stub verifier (no RandomX). Port 5771 (loopback;
 // falls back to an ephemeral port if taken).
 // Nonzero exit on any failure.
-//   LS11 (D2, ruling D-1 = C) CONVERGING and DIVERGED are ALARMS: their edges
-//        are counted and named, they never suspend the lane, never hold it
-//        suspended, and never delay a resume of the real causes.
 // ===========================================================================
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -48,6 +47,7 @@
 #include <condition_variable>
 #include <mutex>
 
+#include "c2pool/v37/xmr/xmr_lane_resume_fresh.hpp"
 #include "c2pool/v37/xmr/xmr_lane_suspend_state.hpp"
 #include "c2pool/v37/xmr/xmr_stratum_listener.hpp"
 
@@ -176,26 +176,38 @@ int main() {
     const std::string r1 = read_line(c1, 3000);
     check("LS1 logged-in session is handed a job", r1.find("\"job\"") != std::string::npos, r1.substr(0, 60));
 
-    L.set_lane_suspended(true);
+    // The serve loop's pass: hold() -> LaneSuspendState -> apply_lane_gate.
+    c2pool::v37n::xmr::LaneSuspendState lane;
+    auto hold_pass = [&](bool hold) {
+        const auto e = lane.update(hold, false);
+        (void)c2pool::v37n::xmr::apply_lane_gate(L, lane.suspended(), [] { return true; });
+        return e;
+    };
+
+    const auto h1 = hold_pass(true);
     const std::string r2 = read_line(c1, 3000);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     const auto s1 = L.stats();
-    check("LS2 the suspend EDGE disconnects the session (job withdrawn), counted", r2 == "<EOF>" && s1.suspend_edges == 1 &&
+    check("LS2 the suspend EDGE (hold) disconnects the session (job withdrawn), counted", h1.suspend_edge &&
+          h1.causes == c2pool::v37n::xmr::LaneSuspendState::kHold && r2 == "<EOF>" && s1.suspend_edges == 1 &&
           s1.suspend_disconnects == 1, "read=" + r2 + " edges=" + std::to_string(s1.suspend_edges) +
           " disconnects=" + std::to_string(s1.suspend_disconnects));
     ::close(c1);
 
-    L.set_lane_suspended(true); L.set_lane_suspended(true);
-    check("LS3 repeated set_lane_suspended(true) is not a new edge", L.stats().suspend_edges == 1);
+    const auto h2 = hold_pass(true);
+    const auto h3 = hold_pass(true);
+    check("LS3 repeated passes with hold set are not a new edge", !h2.suspend_edge && !h3.suspend_edge &&
+          lane.n_suspend == 1 && lane.n_hold == 1 && L.stats().suspend_edges == 1);
 
     const int c2 = connect_to(L.bound_port());
     send_line(c2, kLogin);
     const std::string r3 = read_line(c2, 800);
     check("LS4 a login while suspended is PARKED (the withdrawn job is never handed out)", r3.empty(), "read=" + r3.substr(0, 60));
 
-    L.set_lane_suspended(false);
+    const auto h4 = hold_pass(false);
     const std::string r5 = read_line(c2, 3000);
-    check("LS6 the RESUME edge serves the parked login a fresh job", r5.find("\"job\"") != std::string::npos, r5.substr(0, 60));
+    check("LS6 the RESUME edge (hold cleared) serves the parked login a fresh job", h4.resume_edge &&
+          r5.find("\"job\"") != std::string::npos, r5.substr(0, 60));
     ::close(c2);
 
     L.stop();
@@ -263,47 +275,24 @@ int main() {
         L9.stop();
     }
 
-    // ── LS10 (D5 + contested): the lane-suspend state machine ──────────────
+    // ── LS10: the lane-suspend state machine (hold, fork-fuse) ─────────────
     {
         using S = c2pool::v37n::xmr::LaneSuspendState;
-        S st(3);                                    // D_conf 3: suspend at lag > 6, resume at lag <= 3
-        auto e1 = st.update(7, false, false, false);   // LAG trips
-        auto e2 = st.update(9, false, true, false);    // HELD-LAG fires while already lag-suspended (the rework-2 D5 miss)
-        auto e3 = st.update(2, false, true, false);    // lag clears, held still holds the lane
-        auto e4 = st.update(0, false, false, false);   // held clears -> RESUME
-        auto e5 = st.update(0, false, false, true);    // CONTESTED -> suspend
-        auto e6 = st.update(8, false, false, true);    // lag joins the contested suspension
-        auto e7 = st.update(0, false, false, false);   // vote CONVERGED + lag cleared -> auto-RESUME
-        check("LS10 D5: every cause counted on ITS OWN rising edge -- HELD-LAG during a LAG suspension is cause=held (rework-2 never counted it); CONTESTED suspends and the lane auto-resumes only when every cause (lag, held, contested) is clear",
-              e1.suspend_edge && e1.causes == S::kLag && !e2.suspend_edge && (e2.added & S::kHeld) && st.n_held == 1 &&
-              !e3.resume_edge && e3.causes == S::kHeld && e4.resume_edge && e5.suspend_edge && e5.causes == S::kContested &&
-              (e6.added & S::kLag) && !e6.suspend_edge && e7.resume_edge && st.n_lag == 2 && st.n_contested == 1 &&
-              st.n_resume == 2 && st.n_suspend == 2 && S::names(e6.causes) == "lag+contested",
-              "n lag/held/contested/resume/suspend=" + std::to_string(st.n_lag) + "/" + std::to_string(st.n_held) + "/" +
-              std::to_string(st.n_contested) + "/" + std::to_string(st.n_resume) + "/" + std::to_string(st.n_suspend));
-    }
-    // ── LS11 (D2): CONVERGING / DIVERGED are causes of their own ───────────
-    {
-        using S = c2pool::v37n::xmr::LaneSuspendState;
-        S st(3);
-        auto e1 = st.update(0, false, false, false, true, false);    // minority detected -> CONVERGING: alarm, lane stays served
-        auto e2 = st.update(8, false, false, false, true, false);    // lag (a real cause) suspends
-        auto e3 = st.update(8, false, false, false, false, true);    // no candidate reproduces -> DIVERGED: alarm only
-        auto e4 = st.update(2, false, false, false, false, true);    // lag clears -> RESUME although DIVERGED persists
-        auto e5 = st.update(0, false, false, false, false, false);   // DIVERGED cleared: no edge on the lane
-        auto e6 = st.update(0, false, false, false, true, false);    // a later run
-        auto e7 = st.update(0, false, false, false, false, false);   // adopted
-        check("LS11 D2 (D-1 = C): CONVERGING and DIVERGED are ALARM-ONLY -- counted + named, never a suspend edge, never in causes, never hold the lane (lag resumes while DIVERGED persists)",
-              !e1.suspend_edge && e1.causes == 0 && e1.alarm_added == S::kConverging && !st.suspended() &&
-              (e2.added & S::kLag) && e2.suspend_edge && e2.causes == S::kLag &&
-              e3.alarm_added == S::kDiverged && e3.alarm_cleared == S::kConverging && e3.causes == S::kLag &&
-              e4.resume_edge && e4.causes == 0 && e4.alarm_added == 0 && e4.alarm_cleared == 0 &&
-              !e5.resume_edge && !e5.suspend_edge && e5.alarm_cleared == S::kDiverged &&
-              !e6.suspend_edge && e6.alarm_added == S::kConverging && !e7.resume_edge && !e7.suspend_edge &&
-              st.n_converging == 2 && st.n_diverged == 1 && st.n_suspend == 1 && st.n_resume == 1 &&
-              S::names(S::kConverging | S::kDiverged) == "converging+diverged",
-              "n converging/diverged/suspend/resume=" + std::to_string(st.n_converging) + "/" + std::to_string(st.n_diverged) + "/" +
-              std::to_string(st.n_suspend) + "/" + std::to_string(st.n_resume));
+        S st;
+        auto e1 = st.update(true, false);    // HOLD
+        auto e2 = st.update(true, true);     // FORK-FUSE while held
+        auto e3 = st.update(false, true);    // hold clears, fork-fuse still holds the lane
+        auto e4 = st.update(false, false);   // fork-fuse clears -> RESUME
+        auto e5 = st.update(false, true);    // FORK-FUSE alone -> suspend
+        auto e6 = st.update(true, true);     // hold joins the fork-fuse suspension
+        auto e7 = st.update(false, false);   // both clear -> RESUME
+        check("LS10 every cause counted on ITS OWN rising edge -- FORK-FUSE during a HOLD suspension is counted; the lane resumes only when every cause (hold, fork-fuse) is clear",
+              e1.suspend_edge && e1.causes == S::kHold && !e2.suspend_edge && (e2.added & S::kForkFuse) &&
+              !e3.resume_edge && e3.causes == S::kForkFuse && e4.resume_edge && e5.suspend_edge && e5.causes == S::kForkFuse &&
+              (e6.added & S::kHold) && !e6.suspend_edge && e7.resume_edge && st.n_hold == 2 && st.n_fork_fuse == 2 &&
+              st.n_resume == 2 && st.n_suspend == 2 && S::names(e6.causes) == "hold+fork-fuse",
+              "n hold/fork-fuse/resume/suspend=" + std::to_string(st.n_hold) + "/" + std::to_string(st.n_fork_fuse) + "/" +
+              std::to_string(st.n_resume) + "/" + std::to_string(st.n_suspend));
     }
     std::printf("== %s (%d/%d passed) ==\n", fails ? "FAIL" : "OK", n - fails, n);
     return fails ? 1 : 0;

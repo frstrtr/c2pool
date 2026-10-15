@@ -11,14 +11,18 @@
 //                     --mine-* input, --pathb-launch, every Path B relay input
 //                     (--relay-*, --no-relay-*, --relay-listen and --relay-peer
 //                     as fields)
+//   test_knob_mainnet_refusal  on mainnet, either mode: the test-only
+//                     --test-unknown-fork-stall-s above 0 (it reaches the
+//                     native node)
 //   mode_refusal      the mode refusals in the daemon's order:
+//                       0 test_knob_mainnet_refusal
 //                       1 the mainnet fence (without --follow-only)
 //                       2 mainnet_refusal
 //                       3 follow_only_refusal (its first clause: the fence)
 //                       4 solo_refusal
 //                       5 arm_order_refusal
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -33,6 +37,7 @@ namespace c2pool::v37n::xmr::pathb_mode {
 inline constexpr std::string_view kMainnetFollowOnlyText = "mainnet requires --follow-only";
 inline constexpr std::string_view kMainnetRefuses = "mainnet refuses ";
 inline constexpr std::string_view kPathbLaunchFlag = "--pathb-launch";
+inline constexpr std::string_view kFuseStallFlag = "--test-unknown-fork-stall-s";
 
 namespace mr_detail {
 inline std::string refused(std::string_view input) { return std::string(kMainnetRefuses) + std::string(input); }
@@ -49,7 +54,13 @@ inline std::string mainnet_refusal(const XmrNodeConfig& c) {
     return {};
 }
 
+inline std::string test_knob_mainnet_refusal(const XmrNodeConfig& c) {
+    if (c.network != MoneroNetwork::Mainnet || c.test_unknown_fork_stall_s == 0) return {};
+    return std::string(kFuseStallFlag) + " is test-only and refused on mainnet";
+}
+
 inline std::string mode_refusal(const XmrNodeConfig& c) {
+    if (std::string r = test_knob_mainnet_refusal(c); !r.empty()) return r;
     if (!c.follow_only)
         if (std::string r = mainnet_fence_refusal(c); !r.empty()) return r;
     if (std::string r = mainnet_refusal(c); !r.empty()) return r;

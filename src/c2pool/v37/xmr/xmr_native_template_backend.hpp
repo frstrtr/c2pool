@@ -173,6 +173,10 @@ struct NativeTemplateConfig {
 
     // NativeNodeConfig::txpool_warm_timeout_ms (0 = no warm gate).
     std::uint64_t            txpool_warm_timeout_ms = 30'000;
+
+    // NativeNodeConfig::row_sink (the follower rows of a Path B node). Not a
+    // function of the configuration value: main sets it.
+    native::ChainIndex::RowSink row_sink;
 };
 
 // ---------------------------------------------------------------------------
@@ -342,6 +346,7 @@ public:
         nc.operator_inject            = cfg_.operator_inject;
         nc.operator_inject_ttl_blocks = cfg_.operator_inject_ttl_blocks;
         nc.txpool_warm_timeout_ms     = cfg_.txpool_warm_timeout_ms;
+        nc.row_sink                   = cfg_.row_sink;
 
         node_ = std::make_unique<nrt::NativeNode>(std::move(nc));
         if (!node_->start(why)) {

@@ -10,6 +10,8 @@
 #include "c2pool/v37/xmr/pathb/xmr_pathb_store.hpp"
 
 #include <cstdint>
+#include <filesystem>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -97,6 +99,33 @@ std::unique_ptr<PathbKv> open_pathb_store(const std::string& dir) {
     auto kv = std::make_unique<LevelDbKv>(dir);
     if (!kv->open()) return nullptr;
     return kv;
+}
+
+bool store_readable(PathbKv& kv) {
+    return kv.for_each_prefix("", [](const std::string&, const std::string&) { return true; });
+}
+
+std::unique_ptr<PathbKv> move_store_aside(std::unique_ptr<PathbKv> kv, const std::string& dir, std::uint64_t unix_s,
+                                          std::string& moved, std::string& why) {
+    kv.reset();  // LevelDB closed (its lock released) before the move
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::string to = dir + ".corrupt-" + std::to_string(unix_s);
+    for (int k = 2; fs::exists(to, ec) && k < 1000; ++k) to = dir + ".corrupt-" + std::to_string(unix_s) + "-" + std::to_string(k);
+    if (fs::exists(to, ec)) {
+        why = "no free name beside " + dir;
+        return nullptr;
+    }
+    fs::rename(dir, to, ec);
+    if (ec) {
+        why = "cannot move " + dir + " to " + to + ": " + ec.message();
+        return nullptr;
+    }
+    moved = to;
+    fs::create_directories(dir, ec);
+    std::unique_ptr<PathbKv> fresh = open_pathb_store(dir);
+    if (!fresh) why = "the empty store " + dir + " does not open";
+    return fresh;
 }
 
 }  // namespace c2pool::xmr::pathb

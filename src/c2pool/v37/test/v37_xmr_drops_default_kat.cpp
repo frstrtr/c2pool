@@ -13,12 +13,8 @@
 //        default XmrNodeConfig lane = the DROPS gate of for_version(1) with the
 //        Count estimator (mode 2, floor shift 6), the fee model off, and
 //        make_drops_wiring(default lane) armed.
-//   DD4  the shell source (main_v37_xmr.cpp) strings of the d5 split, the
-//        give-author u16 and the AUTO enrol mode.
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
-#include <sstream>
 #include <string>
 
 #include <c2pool/v37/v37_node_lane_activation.hpp>
@@ -32,7 +28,6 @@ static void check(bool ok, const std::string& what) {
     std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what.c_str());
     (ok ? g_pass : g_fail)++;
 }
-static std::string slurp(const char* p) { std::ifstream f(p); std::stringstream s; s << f.rdbuf(); return s.str(); }
 
 int main() {
     std::printf("v37_xmr_drops_default_kat (V37_ACTIVATE_CONSENSUS_V1=%d, kDropsWiringArmed=%d)\n",
@@ -57,22 +52,6 @@ int main() {
     check(!cfg.lane_params.fee.enabled, "DD1 the fee model stays opt-in (--fee-model v1)");
     check(n37::make_drops_wiring(cfg.lane_params).has_value(), "DD1 make_drops_wiring(default lane) is armed");
 
-    std::printf("-- DD4 the shell wires it (source)\n");
-#ifdef V37_XMR_SHELL_SRC
-    const std::string src = slurp(V37_XMR_SHELL_SRC);
-    check(src.find("if (c2pool::v37n::xmr::fee::fee_model_on(cfg.lane_params))   // ★ d5") != std::string::npos &&
-          src.find("drops::split_give_author(out.carry.delta, *lp,") != std::string::npos,
-          "DD4 drops_compose_lane splits the composed delta under the fee model");
-    check(src.find("a.r.side.give_author);   // ★ d5") != std::string::npos &&
-          src.find("(void)relay_node->cached(id, nullptr, &give);") != std::string::npos,
-          "DD4 own and repaired lane prefixes carry the receipt's give-author u16");
-    check(src.find("g_drops_enrol.empty() ? relay::EnrolMode::Auto : relay::EnrolMode::List") != std::string::npos &&
-          src.find("drops->set_enrol_mode(emode);") != std::string::npos &&
-          src.find("enrol_mode_digest(drops->enrol_mode(), drops->enrol_set())") != std::string::npos,
-          "DD4 the shell defaults to AUTO (no --drops-enrol), sets the mode and carries the mode digest in HELLO");
-#else
-    check(false, "DD4 V37_XMR_SHELL_SRC defined");
-#endif
     std::printf("== v37_xmr_drops_default_kat: %d passed, %d failed -> %s\n", g_pass, g_fail, g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;
 }

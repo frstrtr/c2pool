@@ -36,6 +36,7 @@
 //             follow-only directory
 //   hooks     the login hook, the login reply's c2pool object, the stratum
 //             budget from d_at
+//   reorglines  a reorg: one follow line per block of the new branch
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdint>
@@ -199,8 +200,9 @@ void refusals() {
                   && listed(pb::kHeaderKeepFlag) && listed(pb::kSideKeepFlag) && listed(pb::kKeyCacheFlag)
                   && listed(pb::kAbandonTimeoutFlag) && listed(pb::kWaitingCapFlag) && listed(pb::kBucketServeCapFlag)
                   && listed(pb::kClaimAlarmRateFlag) && listed(pb::kBucketFrameFlag) && listed(pb::kBucketInflightFlag)
-                  && listed(pb::kBucketRateFlag) && listed(pb::kDeploymentsFlag) && !listed(pb::kPenaltyFillFlag),
-          "refusals: the policy flags of S4w-a are listed; --pathb-penalty-fill is not");
+                  && listed(pb::kBucketRateFlag) && listed(pb::kDeploymentsFlag) && listed(pb::kRegtestK30Flag)
+                  && !listed(pb::kPenaltyFillFlag),
+          "refusals: the policy flags of S4w-a and the regtest K30 rig input are listed; --pathb-penalty-fill is not");
     check(pm::kPoolIdentityFlags[0] == pb::kPoolGenesisFromFlag && pm::kPoolIdentityFlags[1] == pb::kPoolGenesisFlag
                   && pm::kPoolIdentityFlags[2] == pb::kPoolGenesisHeightFlag,
           "refusals: the pool identity flags of S4w-a");
@@ -763,6 +765,62 @@ void hooks() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// reorglines: a reorg of depth 2 to a branch of 3 blocks (orphans 5, 6; new branch 5', 6', 7'): one follow line per
+// block of the new branch, oldest first, event=reorg depth=2, each with its own id; extends unchanged.
+void reorglines() {
+    std::map<pb::Hash32, pb::FollowEvent> held;
+    const auto blk = [&](std::uint64_t h, std::uint8_t tag, std::uint8_t prev_tag) {
+        pb::FollowEvent e;
+        e.height = h;
+        e.id = seq32(tag);
+        e.prev = seq32(prev_tag);
+        e.tx_ids = {seq32(static_cast<std::uint8_t>(tag + 0x40))};
+        held[e.id] = e;
+        return e;
+    };
+    (void)blk(4, 0x04, 0x03);
+    (void)blk(5, 0x25, 0x04);
+    (void)blk(6, 0x26, 0x25);
+    pb::FollowEvent tip = blk(7, 0x27, 0x26);
+    std::vector<pb::FollowEvent> in;
+    pb::FollowEvent o5, o6;
+    o5.kind = o6.kind = pb::FollowEventKind::Orphan;
+    o5.height = 5;
+    o5.id = seq32(0x15);
+    o6.height = 6;
+    o6.id = seq32(0x16);
+    in.push_back(o6);
+    in.push_back(o5);
+    tip.kind = pb::FollowEventKind::Reorg;
+    tip.depth = 2;
+    tip.tip = 7;
+    in.push_back(tip);
+    pb::FollowEvent ext = blk(8, 0x28, 0x27);
+    ext.kind = pb::FollowEventKind::Extend;
+    ext.tip = 8;
+    in.push_back(ext);
+    const std::vector<pb::FollowEvent> out = pb::expand_reorgs(in, [&](const pb::Hash32& id) -> std::optional<pb::FollowEvent> {
+        const auto it = held.find(id);
+        if (it == held.end()) return std::nullopt;
+        return it->second;
+    });
+    std::vector<std::uint64_t> reorg_h;
+    bool ids_ok = true, depth_ok = true;
+    for (const pb::FollowEvent& e : out)
+        if (e.kind == pb::FollowEventKind::Reorg) {
+            reorg_h.push_back(e.height);
+            ids_ok = ids_ok && e.id == held[e.id].id && !e.tx_ids.empty();
+            depth_ok = depth_ok && e.depth == 2 && e.tip == 7;
+        }
+    check(out.size() == 6 && reorg_h == std::vector<std::uint64_t>{5, 6, 7} && ids_ok && depth_ok
+                  && out.back().kind == pb::FollowEventKind::Extend && out.back().height == 8,
+          "reorglines: a reorg to 5', 6', 7' gives one follow line per block of the new branch (" +
+                  std::to_string(reorg_h.size()) + " reorg lines)");
+    check(pb::follow_line(out[2]).find(" event=reorg depth=2 tip=7") != std::string::npos,
+          "reorglines: the line names event=reorg and the depth");
+}
+
 int main(int argc, char** argv) {
     std::printf("v37_xmr_follow_only_kat\n");
     const std::string only = argc > 1 ? argv[1] : "";
@@ -779,5 +837,6 @@ int main(int argc, char** argv) {
     run("weights", weights);
     run("lines", lines);
     run("hooks", hooks);
+    run("reorglines", reorglines);
     return finish("v37_xmr_follow_only_kat");
 }

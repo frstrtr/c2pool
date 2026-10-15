@@ -39,6 +39,9 @@
 //       every key of the old store;
 //   (8) the LevelDB archive: the same store written through it, reopened,
 //       loads to the live state;
+//  (8b) a store LevelDB cannot read: its load and an adoption's clear batch
+//       fail; moved aside once to <dir>.corrupt-<unix s>, an empty store in
+//       its place takes the adoption and loads; no second move, no poison;
 //  (10) a pruned store (prune_batch): records below first_pos deleted, header
 //       records to root_pos, the root's record whole; K_BLHASH, K_BLEAF and
 //       K_AR untouched; a store launched here and a joined store (its AR seed
@@ -48,6 +51,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <optional>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -651,6 +655,82 @@ void archive() {
 }
 
 // ---------------------------------------------------------------------------
+// (8b) a store LevelDB cannot read: written through the archive, a table file's middle bytes flipped. Its load fails,
+// a full scan fails and so does an adoption's clear batch (the poison of a write failure); moved aside once to the
+// sibling <dir>.corrupt-<unix s> (nothing deleted), an empty store in its place takes the adoption (clear batch +
+// the joined store's records) and loads it; the next start reads it whole (no second move, no poison).
+void archive_corrupt() {
+    namespace fs = std::filesystem;
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 300, 0xC1, 2, 71);
+    const fs::path base = fs::temp_directory_path() / ("pathb_store_kat_corrupt_" + std::to_string(::getpid()));
+    fs::remove_all(base);
+    const fs::path dir = base / pb::store_dir_name(net.pool_id, net.rules_g);
+    fs::create_directories(dir);
+    {
+        std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string());
+        pb::LaneBatch all;
+        for (const auto& [k, v] : sn.kv.data) all.put(k, v);
+        check(db && pb::commit_lane_batch(*db, all), "(8b) the store written through the archive");
+    }
+    { std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string()); }  // reopened: the log goes into a table file
+    fs::path victim;
+    std::uintmax_t vsz = 0;
+    for (const auto& de : fs::directory_iterator(dir))
+        if (de.path().extension() == ".ldb" && de.file_size() > vsz) {
+            victim = de.path();
+            vsz = de.file_size();
+        }
+    check(!victim.empty(), "(8b) a table file to corrupt");
+    if (victim.empty()) return;
+    {
+        std::FILE* f = std::fopen(victim.string().c_str(), "r+b");
+        std::vector<unsigned char> blk(64);
+        std::fseek(f, static_cast<long>(vsz / 2), SEEK_SET);
+        const std::size_t n = std::fread(blk.data(), 1, blk.size(), f);
+        for (std::size_t i = 0; i < n; ++i) blk[i] ^= 0xa5;
+        std::fseek(f, static_cast<long>(vsz / 2), SEEK_SET);
+        std::fwrite(blk.data(), 1, n, f);
+        std::fclose(f);
+    }
+    std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string());
+    check(db != nullptr, "(8b) the corrupted store opens");
+    if (!db) return;
+    KatNode probe(net, 64);
+    const pb::LoadResult r = pb::pathb_load(*db, net.pool_id, net.rules_g, inputs(probe, 64));
+    pb::LaneBatch clear;
+    check(r.fault != pb::StoreFault::None && r.fault != pb::StoreFault::NoHead && !pb::store_readable(*db)
+                  && !pb::clear_store_batch(*db, 0, clear),
+          "(8b) the corrupted store: a load failure, a full scan fails, an adoption's clear batch cannot be built: " + why(r));
+    std::string moved, mwhy;
+    db = pb::move_store_aside(std::move(db), dir.string(), 1000, moved, mwhy);
+    std::size_t siblings = 0;
+    for (const auto& de : fs::directory_iterator(base)) siblings += de.path().filename().string().find(".corrupt-") != std::string::npos;
+    check(db != nullptr && moved == dir.string() + ".corrupt-1000" && fs::exists(fs::path(moved) / victim.filename())
+                  && siblings == 1 && pb::store_readable(*db) && !db->get(pb::store_keys::phead(0)),
+          "(8b) moved aside to <dir>.corrupt-1000 (its files kept), an empty store in its place: " + mwhy);
+    if (!db) return;
+    pb::LaneBatch adopt;
+    bool ok = pb::clear_store_batch(*db, 0, adopt);
+    for (const auto& [k, v] : sn.kv.data) adopt.put(k, v);
+    ok = ok && pb::commit_lane_batch(*db, adopt);
+    const pb::LoadResult r2 = pb::pathb_load(*db, net.pool_id, net.rules_g, inputs(probe, 64));
+    check(ok && r2.fault == pb::StoreFault::None && r2.state && r2.state->tree.best().id == sn.n.tree.best().id
+                  && !db->get(pb::store_keys::poison(0)),
+          "(8b) the empty store takes the adoption batch and loads it, no poison mark: " + why(r2));
+    db.reset();
+    std::unique_ptr<pb::PathbKv> again = pb::open_pathb_store(dir.string());
+    const pb::LoadResult r3 = again ? pb::pathb_load(*again, net.pool_id, net.rules_g, inputs(probe, 64)) : pb::LoadResult{};
+    std::size_t siblings2 = 0;
+    for (const auto& de : fs::directory_iterator(base)) siblings2 += de.path().filename().string().find(".corrupt-") != std::string::npos;
+    check(again && r3.fault == pb::StoreFault::None && pb::store_readable(*again) && siblings2 == 1,
+          "(8b) the next start loads it whole: no second move, no poison loop: " + why(r3));
+    again.reset();
+    fs::remove_all(base);
+}
+
+// ---------------------------------------------------------------------------
 // (10) a pruned store (prune_batch): K_PCARRIER below first deleted, [first, root) header records, the record at the
 // root whole, K_PHEAD first_pos / root_pos / base_pos >= root; K_BLHASH, K_BLEAF and K_AR untouched. A store launched
 // here (no AR seed) and a joined store (its AR seed below the pruned root) reload live-equal (the tree from the root,
@@ -759,6 +839,7 @@ int main(int argc, char** argv) {
     run("phase1link", phase1_link);
     run("directory", directory);
     run("archive", archive);
+    run("archivecorrupt", archive_corrupt);
     run("pruned", pruned);
     return finish("v37_xmr_pathb_store_kat");
 }

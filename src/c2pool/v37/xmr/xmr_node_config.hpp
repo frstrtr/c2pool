@@ -106,21 +106,6 @@ inline const char* to_string(MoneroNetwork n) {
 // family uses via core::config).
 inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
 
-// Which coinbase the serve side builds, serves and submits.
-//   MonerodTemplate (option A, default, PR #1534): monerod's own get_block_template
-//     block — a single coinbase to --payout-address, nonce patched. A genuine,
-//     monerod-validated block, but NOT the v37 settlement coinbase.
-//   V37Settlement (option B): a v37-BUILT Monero block whose miner_tx is the
-//     K_fair settlement coinbase (oldest-owed-first EffectiveOwed payees ++
-//     mandated fixed outputs ++ exact-sum residual sink), assembled from
-//     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
-//     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
-//     without a valid sink the daemon refuses to serve. Under --fee-model v1
-//     (LaneParams::fee) the ONE mandated fixed output is the protocol donation
-//     output (owed + residual, may be 0) and the residual sink IS the donation address
-//     (xmr_fee_model.hpp, compiled-in -- no per-node knob).
-enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
-
 // M2: which miner-data source the option-B assembler is fed from.
 //   Monerod (default): the get_miner_data RPC path -- the arm option B has used
 //     since X9. One round trip per template refresh.
@@ -128,8 +113,6 @@ enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 
 //     index + relayed txpool). The template path then makes NO monerod call at
 //     all; the daemon stays configured as the C6 parity judge and as the block
 //     submit arm, both of which are off the template path.
-// Only meaningful with --coinbase v37; option A is monerod's own template by
-// definition and ignores this.
 enum class TemplateSourceMode : std::uint8_t { Monerod = 0, Native = 1 };
 
 inline const char* to_string(TemplateSourceMode m) {
@@ -170,14 +153,6 @@ struct GivenFlag {
     std::string name;
     std::string value;
 };
-
-inline const char* to_string(CoinbaseMode m) {
-    switch (m) {
-        case CoinbaseMode::MonerodTemplate: return "monerod-template (option A)";
-        case CoinbaseMode::V37Settlement:   return "v37-settlement (option B)";
-    }
-    return "monerod-template (option A)";
-}
 
 // Default monerod RPC/ZMQ ports per network (monerod >= v0.18.0.0). The X2
 // adapter needs get_miner_data + the three ZMQ topics, all >= v0.18.
@@ -269,20 +244,9 @@ struct XmrNodeConfig {
     std::uint16_t   stratum_bind_port = 3333;   // XMRig default; single-node
 
     // --- O-2 serve side (stratum listener + live submit) --------------------
-    // The wallet address monerod's get_block_template pays the block reward to
-    // (network-prefixed standard address; regtest = mainnet '4…' format). EMPTY
-    // = the stratum port is NOT served and the daemon runs observe-side only
-    // (index + settlement + F1 driver), exactly as the X9 bring-up did.
-    //
-    // HONEST SCOPE (option A): the block bytes served and submitted are
-    // monerod's own template — a single coinbase to this address — with the
-    // winning nonce patched. That is a genuine, monerod-validated block end to
-    // end, but NOT yet the v37 K_fair settlement coinbase (option B follow-on).
+    // --payout-address: a standard address of the node's network (regtest =
+    // mainnet '4…' format), the payee of the in-process miner's jobs (--mine).
     std::string     payout_address;
-    // get_block_template reserve_size (tx_extra nonce reservation). 0 = none:
-    // one blob for every worker (max_extra_nonces == 1). Per-client extra_nonce
-    // (>= 4) is a follow-on of the template source.
-    std::uint32_t   template_reserve_size = 0;
     // Share (lane) difficulty served to miners. 0 = solo: the job target IS the
     // network target, so every accepted share is a network block. A lower value
     // (e.g. 1000 on regtest) makes miners report shares between blocks.
@@ -304,12 +268,6 @@ struct XmrNodeConfig {
     std::uint32_t   status_every_s = 30;
 
     // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
-    // --coinbase monerod (option A, default) | v37 (option B). In v37 mode the
-    // block the pool assembles + submits is the settlement coinbase, not
-    // monerod's get_block_template — so --payout-address is not consulted for
-    // the coinbase bytes (it may stay empty; the serve port opens when the
-    // residual sink is set, mirroring option A's payout_address gate).
-    CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
     // The mandated residual sink (REQUIRED for v37 mode with the fee model OFF):
     // the raw public spend (B) + view (A) keys, 64 hex each, of the XMR wallet
     // the exact-sum residual is paid to. Torsion-checked at build; the daemon
@@ -325,10 +283,8 @@ struct XmrNodeConfig {
     // Every node rebuilds every lane coinbase with its own settle_h_min and
     // resolved output cap (xmr_coinbase_recompute.hpp LaneInputs), so a node
     // running a different value calls an honest block non-canonical and books
-    // it debit-only: a ledger fork. They are therefore network constants:
-    // lane_knob_refusal() refuses a non-default value on mainnet. They stay
-    // out of LaneParams and the relay HELLO lane_params_digest (byte-identical
-    // to the running test rigs); moving them there is the gated follow-up.
+    // it debit-only: a ledger fork. They stay out of LaneParams and the relay
+    // HELLO lane_params_digest.
     // LaneParams::k_floor stays 0 on XMR (Monero has no dust rule).
     std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
     // XMR ledger rules (w4 OwedLedgerRules; payout-threshold.md §6, §6a). The
@@ -352,14 +308,12 @@ struct XmrNodeConfig {
     std::uint64_t   owed_demo_amount = 0;
     // DRAIN (operator ruling R2): the old-balance drain parameter Q of the
     // lane-rules list (xmr_lane_rules.hpp field 23). 0 = no drain = master's
-    // coinbase bytes. No CLI flag: the drain rule sets it on its own flag day;
-    // lane_knob_refusal() pins it to kMainnetDrainQ on mainnet.
+    // coinbase bytes. No CLI flag: apply_network_drain() sets it.
     std::uint32_t   drain_q = 0;
     // THE DRAIN RULE's other two lane rules (fields 24 / 25, docs/xmr-lane/
     // settlement-drain.md): H_cap (heights counted per lane block, at most)
-    // and the rule version (0 = master; 1 = R1/R2/R5 of 2026-10-02). Set by the
-    // network defaults at the flag day, never by a flag; lane_knob_refusal()
-    // checks the triple on every network and pins it on mainnet.
+    // and the rule version (0 = master; 1 = R1/R2/R5 of 2026-10-02). Set by
+    // apply_network_drain(), never by a flag.
     std::uint32_t   drain_h_cap = 0;
     std::uint32_t   drain_rule_version = 0;
 
@@ -481,9 +435,8 @@ struct XmrNodeConfig {
 
     // --- M3: the arm order on the FIND path ---------------------------------
     // --arm-order daemon-first (default) | p2p-first. See ArmOrderMode above.
-    // p2p-first is fail-closed on its preconditions: it REFUSES to start unless
-    // the coinbase is the v37 settlement coinbase built from the native arm,
-    // because a daemonless find whose template came from a daemon is not one.
+    // p2p-first is fail-closed on its preconditions (arm_order_refusal): the
+    // native template source and a levin address source.
     ArmOrderMode    arm_order = ArmOrderMode::DaemonFirst;
     // --no-daemon-rpc: do not configure a monerod RPC endpoint for the embedded
     // node AT ALL. Meaningful only with p2p-first, where it is the difference
@@ -602,17 +555,13 @@ struct XmrNodeConfig {
 //
 // A daemonless FIND is a claim about three things at once -- the tip, the
 // template and the publish -- and only the first of them is the arm order's own.
-// Option A's block bytes ARE monerod's get_block_template, and the monerod
-// template source is a get_miner_data round trip per refresh; either of them
-// under p2p-first would leave a daemon on the find path while the flag said
+// The monerod template source is a get_miner_data round trip per refresh;
+// under p2p-first it would leave a daemon on the find path while the flag said
 // otherwise. Refusing is the only honest answer, and it is given before
 // anything starts rather than degraded into a mode whose name has stopped
 // describing it.
 inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     if (c.arm_order != ArmOrderMode::P2PFirst) return {};
-    if (!c.follow_only && c.coinbase != CoinbaseMode::V37Settlement)
-        return "--arm-order p2p-first requires --coinbase v37: option A's block IS monerod's "
-               "get_block_template, so a daemonless find of it is a contradiction";
     if (c.template_source != TemplateSourceMode::Native)
         return "--arm-order p2p-first requires --xmr-template-source native: a find path whose "
                "template came from get_miner_data is not daemonless";
@@ -626,40 +575,7 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
 }
 
 // ---------------------------------------------------------------------------
-// FEE MODEL v1 IS MANDATORY for the v37 settlement coinbase on MAINNET
-// (operator ruling 2026-09-29). Every node recomputes every lane coinbase
-// (xmr_coinbase_recompute.hpp). With the fee model OFF the exact-sum residual
-// is paid to a per-node --residual-sink-* wallet: no other node can map that
-// output (a builder's block is unmapped everywhere else), and the residual is
-// the building node's own income. Fee model v1 pays it to the compiled-in
-// protocol donation output, the same owner on every node. Test networks keep
-// the OFF mode for rigs that share one sink.
-// ---------------------------------------------------------------------------
-inline std::string settlement_fee_model_refusal(const XmrNodeConfig& c) {
-    if (c.coinbase != CoinbaseMode::V37Settlement || c.network != MoneroNetwork::Mainnet) return {};
-    if (c.lane_params.fee.enabled && c.lane_params.fee.version == 1) return {};
-    return "--coinbase v37 on mainnet needs --fee-model v1: every node recomputes every lane coinbase, and "
-           "with the fee model off the exact-sum residual goes to this node's own --residual-sink-* wallet, "
-           "which no other node can derive (fee model v1 pays it to the protocol donation output)";
-}
-
-// ---------------------------------------------------------------------------
-// LANE KNOBS ARE NETWORK CONSTANTS ON MAINNET (external review O-4/O-5, and
-// every node recomputing every lane coinbase). Each of these changes what a
-// node books from the same chain, so two nodes that differ disagree on every
-// lane block and fork owed_digest:
-//   --d-conf              the booking point (builder_cut) and fe bin heights
-//   --settle-h-min        the owed floor the recompute rebuilds with
-//   --settle-output-cap   the owed-selection cap the recompute rebuilds with
-//   --recon-max-root-age  which committed roots a node accepts
-//   --no-book-deferral    pre-R6 booking order (the lagging-receiver fork)
-//   --owed-demo-amount    seeds owed rows at serve start (LANE-RULES: refused)
-//   drain_q               the drain rule's Q (LANE-RULES: the network constant)
-// Test networks keep them for rigs; a rig must set them identically (and the
-// LANE-RULES HELLO / pool_tag now refuse a rig that does not, by name).
-// LANE-RULES (O1): D_conf below Monero's coinbase maturity (60) is refused on
-// EVERY network but regtest -- a lane block must not be booked before its
-// coinbase can be spent; the regtest rigs keep 3/4/10.
+// Monero's coinbase maturity, and the drain rule's network triple.
 // ---------------------------------------------------------------------------
 inline constexpr std::uint64_t kXmrMinDConf   = 60;   // == XMR_COINBASE_MATURITY (static_assert in xmr_lane_rules_build.hpp)
 inline constexpr std::uint32_t kMainnetDrainQ = 0;    // no drain on mainnet until the drain rule's flag day
@@ -670,10 +586,7 @@ inline constexpr std::uint32_t kMainnetDrainRuleVersion = 0;
 inline constexpr std::uint32_t kLaneDrainQ = 16;
 inline constexpr std::uint32_t kLaneDrainHCap = 64;
 inline constexpr std::uint32_t kLaneDrainRuleVersion = 1;
-// The network's triple, set by main() before run_live (the flag day: one pool
-// restart with a fresh --pool-genesis on the test networks; mainnet keeps
-// 0/0/0 until the operator's own flag day). Never a flag: lane_knob_refusal()
-// pins mainnet, the lane rules (fields 23-25) pin every peer.
+// The network's triple (mainnet 0/0/0). Never a flag.
 inline void apply_network_drain(XmrNodeConfig& c) {
     if (c.network == MoneroNetwork::Mainnet) {
         c.drain_q = kMainnetDrainQ;
@@ -685,51 +598,14 @@ inline void apply_network_drain(XmrNodeConfig& c) {
         c.drain_rule_version = kLaneDrainRuleVersion;
     }
 }
-inline std::string lane_knob_refusal(const XmrNodeConfig& c, bool recon_max_root_age_set, bool no_book_deferral) {
-    if (const std::string dr = ::v37::xmr::settle::drain_rule_refusal(c.drain_rule_version, c.drain_q, c.drain_h_cap); !dr.empty())
-        return "drain rule (version " + std::to_string(c.drain_rule_version) + ", Q " + std::to_string(c.drain_q) +
-               ", H_cap " + std::to_string(c.drain_h_cap) + "): " + dr;
-    if (c.network != MoneroNetwork::Regtest && c.d_conf < kXmrMinDConf)
-        return "--d-conf " + std::to_string(c.d_conf) + " is below Monero's coinbase maturity (" +
-               std::to_string(kXmrMinDConf) + "): a lane block would be booked before its coinbase can be spent; "
-               "only regtest rigs may run a shorter D_conf";
-    if (c.network != MoneroNetwork::Mainnet) return {};
-    const XmrNodeConfig d{};
-    if (c.d_conf != d.d_conf)
-        return "--d-conf is a network constant on mainnet (" + std::to_string(d.d_conf) +
-               "): it moves the booking point every node recomputes lane coinbases at";
-    if (c.settle_h_min != d.settle_h_min)
-        return "--settle-h-min is a network constant on mainnet (" + std::to_string(d.settle_h_min) +
-               "): every node rebuilds every lane coinbase with it";
-    if (c.settle_output_cap != d.settle_output_cap)
-        return "--settle-output-cap is a network constant on mainnet (weight-aware default): every node "
-               "rebuilds every lane coinbase with it";
-    if (recon_max_root_age_set)
-        return "--recon-max-root-age is refused on mainnet: it changes which committed roots a node books";
-    if (no_book_deferral)
-        return "--no-book-deferral is refused on mainnet: it restores the pre-R6 booking order "
-               "(the lagging-receiver fork)";
-    if (c.owed_demo_amount != d.owed_demo_amount)
-        return "--owed-demo-amount is refused on mainnet: it seeds owed rows no other node has (a proof-only "
-               "demo), so owed_digest would differ from the first block";
-    if (c.drain_q != kMainnetDrainQ)
-        return "drain_q " + std::to_string(c.drain_q) + " on mainnet: the drain rule's Q is a network constant (" +
-               std::to_string(kMainnetDrainQ) + ")";
-    if (c.drain_h_cap != kMainnetDrainHCap || c.drain_rule_version != kMainnetDrainRuleVersion)
-        return "drain_h_cap " + std::to_string(c.drain_h_cap) + " / drain_rule_version " + std::to_string(c.drain_rule_version) +
-               " on mainnet: the drain rule is a network constant (" + std::to_string(kMainnetDrainHCap) + " / " +
-               std::to_string(kMainnetDrainRuleVersion) + " until the operator's mainnet flag day)";
-    return {};
-}
-
 // ---------------------------------------------------------------------------
 // --native-solo's OWN preconditions, kept as a pure function for the same
 // reason arm_order_refusal() is: the thing the daemon refuses on and the thing
 // the KAT pins must be one piece of code.
 //
 // Solo is fail-closed on its network. A node that mines a chain nobody else
-// has, and books the proceeds on the strength of its own index alone, is a
-// correct regtest rig and a catastrophic mainnet one -- and on testnet or
+// has, and counts its blocks as landed on the strength of its own index alone,
+// is a correct regtest rig and a catastrophic mainnet one -- and on testnet or
 // stagenet it would silently fork away from the real chain at the genesis
 // block, which is a confusing way to waste a day rather than a danger. So the
 // mode is regtest-only, by refusal and not by documentation.
@@ -758,53 +634,6 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
                "--native-seeds (bootstrap from the network's seed nodes) contradicts it: pick one";
     if (!c.relay_listen.empty()) return "--native-solo takes no --relay-listen";
     if (!c.relay_peers.empty()) return "--native-solo takes no --relay-peer";
-    return {};
-}
-
-// ---------------------------------------------------------------------------
-// MAINNET: settings that reach the replicated owed ledger are not per-node
-// knobs. Every node books every lane block and must reach the same
-// owed_digest; a setting that changes WHAT a node books, or when it refuses,
-// splits the ledger between nodes that set it differently. None of these is
-// carried in the relay HELLO lane_params_digest, so a mismatch is not refused
-// at the handshake: it surfaces later as lane_root_refused and node-local
-// liability. On mainnet they are therefore pinned to the lane's value and
-// any other value is refused before anything starts. Test networks keep them
-// as knobs for rigs.
-//   --d-conf              FINALIZE runs at bin_height = h + D_conf, and
-//                         first_eligible (inside owed_digest) is stamped with
-//                         it: a different D_conf is a different digest.
-//                         60 is also Monero's coinbase maturity.
-//   --settle-h-min        the owed-output floor; non-zero re-creates the
-//                         parked-balance seniority of the generic path
-//                         (fairness audit, finding 02).
-//   --recon-max-root-age  the D7 bound decides whether a block is CREDITED or
-//                         refused into node-local liability.
-//   --no-book-deferral    documented to fork owed_digest on a lagging
-//                         receiver.
-// ---------------------------------------------------------------------------
-inline constexpr std::uint64_t kMainnetDConf = 60;
-
-struct LedgerKnobs {
-    bool recon_max_root_age_set = false;   // --recon-max-root-age given
-    bool no_book_deferral       = false;   // --no-book-deferral given
-};
-
-inline std::string mainnet_ledger_knob_refusal(const XmrNodeConfig& c, const LedgerKnobs& k) {
-    if (c.network != MoneroNetwork::Mainnet) return {};
-    if (c.d_conf != kMainnetDConf)
-        return "--d-conf " + std::to_string(c.d_conf) + " on mainnet: D_conf stamps first_eligible "
-               "(owed_digest), so a node with a different value books a different ledger; mainnet "
-               "runs the lane value " + std::to_string(kMainnetDConf);
-    if (c.settle_h_min != 0)
-        return "--settle-h-min " + std::to_string(c.settle_h_min) + " on mainnet: the XMR owed floor "
-               "is 0 until it is a digest-committed lane parameter";
-    if (k.recon_max_root_age_set)
-        return "--recon-max-root-age on mainnet: the root-age bound decides whether a block is "
-               "credited or refused, so every node must use the lane default";
-    if (k.no_book_deferral)
-        return "--no-book-deferral on mainnet: booking chain blocks as they arrive forks owed_digest "
-               "on a lagging receiver";
     return {};
 }
 

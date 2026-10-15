@@ -219,7 +219,6 @@ cfgns::XmrNodeConfig base_config(cfgns::MoneroNetwork net) {
     c.network         = net;
     c.template_source = cfgns::TemplateSourceMode::Native;
     c.arm_order       = cfgns::ArmOrderMode::P2PFirst;
-    c.coinbase        = cfgns::CoinbaseMode::V37Settlement;
     return c;
 }
 

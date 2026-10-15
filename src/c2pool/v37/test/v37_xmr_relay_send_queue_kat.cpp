@@ -287,19 +287,21 @@ int main() {
             const std::uint64_t pend = A->r().with_node([](pb::PathbNode& n) { return n.pending().size(); });
             const std::uint64_t want = (pend + per - 1) / per;
             const std::uint64_t f0 = na.peers_dropped_queue_full(), r0 = A->st().reoffer_frames.load();
-            const std::uint64_t z0 = A->st().reoffer_paused.load();
+            const std::uint64_t z0 = A->st().reoffer_paused.load(), d0 = A->st().reoffer_done.load();
             const bool held =
                     slow_peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ (0x5252ull + k), 0), 10000, 3000, 0);
+            const std::uint64_t done = A->st().reoffer_done.load() - d0;
             const std::uint64_t f1 = na.peers_dropped_queue_full(), sent = A->st().reoffer_frames.load() - r0;
             const std::uint64_t paused = A->st().reoffer_paused.load() - z0;
             std::printf("    S4 METRIC bound=%zu sent=%llu of %llu frames (%llu pending) paused=%llu full_drops=%llu kept=%d\n",
                         bound, (unsigned long long)sent, (unsigned long long)want, (unsigned long long)pend,
                         (unsigned long long)paused, (unsigned long long)(f1 - f0), held ? 1 : 0);
-            C(held && f1 == f0 && sent >= want && (k == 1 || paused > 0),
+            C(held && f1 == f0 && sent >= want && (k == 1 || paused > 0) && done == 1,
               std::string("S4 a bound below the re-offer's bytes (") +
                       (k == 0 ? "an eighth" : "x 16,777,216 / 17,418,240") +
                       ", " + std::to_string(bound) + " B): the link kept, every frame sent, 0 queue-full drops (paused " +
-                      std::to_string(paused) + (k == 0 ? ", paged" : "") + ")");
+                      std::to_string(paused) + (k == 0 ? ", paged" : "") + "), the re-offer timed to its end (" +
+                      std::to_string(done) + ", " + std::to_string(A->st().reoffer_last_ms.load()) + " ms)");
             (void)wait_until([&] { return A->r().ready_peers().size() == 1; }, 3000ms);
             ++k;
         }

@@ -191,9 +191,9 @@ inline bool verify_block_ctx(const bytes32& want, const std::vector<u8>& blob, B
 //   (b) its proof of work meets the difficulty its parent implies in that
 //       index -- the parent held by the index, or itself verified this way --
 //       at most `max_depth` unknown blocks above the index.
-// The bound comes from the tip-freshness rule (a receipt's template is at most
-// 2 Monero heights past its tip), so a depth of 2 suffices for admission;
-// anything deeper waits for the node's own Monero sync.
+// The bound is the caller's: the tip-freshness rule bounds an unsolicited
+// receipt's context (Path B: P-06, Fresh + 1); a carrier under verification
+// climbs to P-07 (k_alt); anything deeper waits for the node's own Monero sync.
 //
 // Verdicts follow the carrier rule (impl/xmr/native/relay/xmr_found_block_
 // carrier.hpp): a hash BELOW the difficulty is forged (the sender is banned);

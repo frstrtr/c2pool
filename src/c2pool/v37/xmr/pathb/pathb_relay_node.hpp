@@ -53,8 +53,7 @@
 //                the async send queue, the verify pool, the parked cap,
 //                partition_for, the dial targets and the seeds
 //
-// Every clock read goes through RelayClock. Header-only. Not included by any
-// running component.
+// Every clock read goes through RelayClock. Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -113,6 +112,10 @@ struct RelayClock {
     }
 };
 
+// P-40 (policy, ruling 23): the peers whose HELLO tails name the candidates before a join (two independent best-tip
+// claims); flag --join-min-peers.
+inline constexpr std::size_t kJoinMinPeersDefault = 2;
+
 // ---------------------------------------------------------------------------
 // Options (the generic transport values of the old relay node, kept)
 // ---------------------------------------------------------------------------
@@ -138,6 +141,10 @@ struct PathbRelayOptions {
     // P-15, the per-peer valid-object budget (unset: rate (1 + R_MAX) / T objects/s, capacity P-09 of the node)
     std::optional<double> peer_valid_rate;
     std::optional<double> peer_valid_capacity;
+    // P-50, the claim-leaf alarm budget per peer (unset: (1 + R_MAX) / T alarms/s, burst 1 + R_MAX)
+    std::optional<double> claim_alarm_rate;
+    // P-40: the HELLO tails (connected peers past HELLO) a join attempt waits for
+    std::size_t join_min_peers = kJoinMinPeersDefault;
     // the verify pool
     std::size_t verify_threads = 1;
     std::size_t verify_queue_max = 4096;
@@ -161,8 +168,11 @@ struct PathbRelayOptions {
     // Monero contexts (FB_GETCTX / FB_CTX)
     std::uint32_t ctx_retry_ms = 2000;
     std::uint32_t ctx_max_rounds = 30;
-    std::uint32_t ctx_max_depth = 2;
-    std::size_t ctx_want_max = 128;
+    // context blocks climbed per want: P-06 (Fresh + 1) for an unsolicited receipt, P-07 (k_alt) for a carrier
+    // under verification (a join's FB_GETCTX)
+    std::uint32_t ctx_max_depth = static_cast<std::uint32_t>(relay_horizons(kRuledLaneParams).ctx_max_depth);
+    std::uint32_t ctx_join_depth = static_cast<std::uint32_t>(kAltDepth);
+    std::size_t ctx_want_max = 128;  // wants of unsolicited receipts held at once (a join's climb: up to ctx_join_depth)
     // false: no thread; the caller runs pump(), tick() and join_step()
     bool threads = true;
 };
@@ -202,7 +212,9 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
     std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
-    std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0};
+    std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0}, join_waits{0};
+    std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
+    std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
     std::atomic<std::uint64_t> ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_forged{0}, ctx_deferred{0}, ctx_unchecked{0};
@@ -339,6 +351,7 @@ public:
         valid_rate_ = o_.peer_valid_rate.value_or(static_cast<double>(1 + p_.r_max) / static_cast<double>(p_.carrier_interval_s));
         valid_cap_ = o_.peer_valid_capacity.value_or(
                 static_cast<double>(c.pending_cap != 0 ? c.pending_cap : relay_horizons(c.p).pending_cap));
+        claim_budget_ = ClaimAlarmBudget(p_, o_.claim_alarm_rate.value_or(0));
     }
     // The context source; its RandomX call leaves every exception as RandomxFailure (node-internal).
     void set_ctx_source(PathbCtxSource s) {
@@ -735,7 +748,7 @@ public:
         return strikes_by_peer_.size();
     }
     // KAT hooks: an admission outcome of `peer` parked on `m` (the relay's index and fetch), a strike on `peer`.
-    void test_parked(std::uint64_t peer, Missing m, const Hash32& digest, const Hash32& fetch) {
+    void test_parked(std::uint64_t peer, Missing m, const Hash32& digest, const Hash32& fetch, bool relayed = true) {
         NodeEventResult r;
         r.action = NodeAction::Parked;
         r.admit.missing = m;
@@ -744,9 +757,14 @@ public:
         Effects fx;
         {
             const NodeGuard g(*this);
-            after_result_locked(peer, r, digest, fx);
+            after_result_locked(peer, r, digest, fx, relayed);
         }
         run_effects(fx);
+    }
+    // P-50: the claim-leaf alarm buckets held.
+    std::size_t claim_entries() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return claim_budget_.entries();
     }
     void test_strike(std::uint64_t peer) { strike(peer, 1, false); }
     // P-15: the objects left in `peer`'s valid-object budget; the per-peer buckets held.
@@ -780,6 +798,11 @@ public:
         for (const auto& [p, s] : peers_)
             if (s.hello_ok) v.emplace_back(s.addr_key.empty() ? std::string("?") : s.addr_key, !s.out_host.empty());
         return v;
+    }
+    // The Monero contexts wanted now (FB_GETCTX).
+    std::size_t ctx_wants() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        return ctx_want_.size();
     }
     std::string describe() const {
         char b[768];
@@ -913,6 +936,7 @@ private:
     struct CtxWant {
         std::uint64_t from = 0;
         std::uint32_t depth = 0;
+        std::uint32_t bound = 0;  // the climb's bound: ctx_max_depth, or ctx_join_depth for a join's want
         std::set<std::uint64_t> asked;
         std::uint32_t rounds = 0;
         std::uint64_t since_ms = 0;
@@ -1183,11 +1207,13 @@ private:
                 dos_.release(src, now_ns());
             strikes_by_peer_.erase(p);
             valid_.erase(p);
+            claim_budget_.forget(p);
         }
         tickets_peer_gone(p);
         {
             std::lock_guard<std::mutex> lk(rmtx_);
             reoffer_.erase(p);
+            reoffer_t0_.erase(p);
         }
         {
             std::lock_guard<std::mutex> lk(cumtx_);
@@ -1407,7 +1433,7 @@ private:
             }
             if (!rx_fail)
                 for (const NodeEventResult& r : rs) {
-                    after_result_locked(j.peer, r, std::nullopt, fx);
+                    after_result_locked(j.peer, r, std::nullopt, fx, !j.solicited);
                     // a first-seen receipt (held now, or evicted at once by P-09; a copy held before is a duplicate),
                     // or a #7 refusal
                     if ((r.admit.verdict == AdmitVerdict::AdmitPending &&
@@ -1443,7 +1469,7 @@ private:
             } catch (const RandomxFailure&) {
                 rx_fail = true;
             }
-            if (!rx_fail) after_result_locked(peer, r, digest, fx);
+            if (!rx_fail) after_result_locked(peer, r, digest, fx, !solicited);
             take_rx_failed_locked(fx);
         }
         if (rx_fail) {
@@ -1460,6 +1486,20 @@ private:
     }
     // A RandomX failure (RandomxFailure from the hash) inside an admission: node-internal, a local alarm; the token
     // goes back and the frame is parked and run again; no strike, no ban.
+    // P-50: a claim-leaf alarm on a frame `p` relayed (not a reply to this node's own request); the bucket empty:
+    // the link dropped, no ban, no token, no verdict changed (the frame is DEFERred either way).
+    void claim_charge(std::uint64_t p) {
+        st_.claim_alarms++;
+        bool ok = true;
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            ok = claim_budget_.charge(p, now_ms() / 1000, true);
+        }
+        if (ok) return;
+        st_.claim_alarm_drops++;
+        log("relay: peer " + std::to_string(p) + ": claim-leaf alarm budget empty (P-50) -> link dropped, no ban");
+        defer_drop(p, src_of(p), false);
+    }
     void rx_failed(Job j, const char* where) {
         rx_alarm(where);
         refund(j);
@@ -1553,7 +1593,9 @@ private:
     // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
     // TipBodies DEFER bound and placed, the joiner's signal.
-    void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx) {
+    void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
+                             bool relayed = true) {
+        if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
         switch (r.action) {
             case NodeAction::JoinerPath: fx.join = true; break;
             case NodeAction::Placed:
@@ -1698,7 +1740,7 @@ private:
         fx.p15.clear();
         for (std::uint64_t q : fx.bans) ban(q);
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
-        for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0);
+        for (const auto& [id, from] : fx.ctx) want_ctx(id, from, 0, o_.ctx_max_depth);
         if (!fx.rerun.empty()) rerun_parked(std::vector<Missing>(fx.rerun.begin(), fx.rerun.end()));
         if (fx.join) signal_join();
     }
@@ -1896,6 +1938,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(rmtx_);
             reoffer_[p] = std::deque<Hash32>(ids.begin(), ids.end());
+            reoffer_t0_[p] = now_ms();
         }
         reoffer_pump(p);
     }
@@ -1926,6 +1969,7 @@ private:
                 if (it == reoffer_.end()) return;
                 if (it->second.empty()) {
                     reoffer_.erase(it);
+                    reoffer_finished_locked(p);
                     return;
                 }
                 for (std::size_t i = 0; i < per && i < it->second.size(); ++i) ids.push_back(it->second[i]);
@@ -1947,6 +1991,7 @@ private:
                 if (!links_.send_to(p, *fr)) {
                     std::lock_guard<std::mutex> lk(rmtx_);
                     reoffer_.erase(p);
+                    reoffer_t0_.erase(p);
                     return;
                 }
                 st_.reoffer_frames++;
@@ -1956,6 +2001,17 @@ private:
             if (it == reoffer_.end()) return;
             for (std::size_t i = 0; i < ids.size() && !it->second.empty(); ++i) it->second.pop_front();
         }
+    }
+    // Under rmtx_: a re-offer sent to its end (soak: the time it took).
+    void reoffer_finished_locked(std::uint64_t p) {
+        const auto t = reoffer_t0_.find(p);
+        if (t == reoffer_t0_.end()) return;
+        const std::uint64_t now = now_ms();
+        const std::uint64_t d = now > t->second ? now - t->second : 0;
+        reoffer_t0_.erase(t);
+        st_.reoffer_done++;
+        st_.reoffer_last_ms = d;
+        if (d > st_.reoffer_max_ms.load()) st_.reoffer_max_ms = d;
     }
     void reoffer_pump_all() {
         std::vector<std::uint64_t> ps;
@@ -2147,11 +2203,16 @@ private:
         {
             const NodeGuard g(*this, true);
             if (!running_ || node_->poisoned()) return std::nullopt;
-            if (node_->joiner().queue().size() == 0 && !reask_due_) return std::nullopt;
+            const bool queued = node_->joiner().queue().size() != 0;
+            if (!queued && !reask_due_) return std::nullopt;
+            // P-40: a queued pair is attempted once HELLO tails of at least join_min_peers peers name the candidates
+            const bool tails = ready_peers().size() >= o_.join_min_peers;
+            if (queued && !tails) st_.join_waits++;
+            if (!reask_due_ && !tails) return std::nullopt;
             reask_due_ = false;
             before = link_strikes_locked();
-            st_.join_attempts++;
-            t = node_->attempt_join();
+            if (queued && tails) st_.join_attempts++;
+            t = node_->attempt_join(tails);
             after = link_strikes_locked();
         }
         // an undecodable reply frame of the attempt's server: one strike each (the link counted it)
@@ -2194,11 +2255,20 @@ private:
             s = node_->apply_join(std::move(t));
         }
         if (s->report) {
+            const AttemptReport& rep = *s->report;
+            log("relay: join attempt at peer " + std::to_string(rep.server) + ": " + attempt_end_name(rep.end) + " (L " +
+                std::to_string(rep.L) + ", at " + std::to_string(rep.at) + ", row " + std::to_string(static_cast<int>(rep.row)) +
+                ", tokens " + std::to_string(rep.strike) + (rep.what.empty() ? "" : ": " + rep.what) + ")" +
+                (s->switched ? " -> adopted" : ""));
             if (s->report->strike > 0) {
                 strike(s->report->server, s->report->strike, false);
                 st_.join_strikes += s->report->strike;
             }
-            if (s->report->end == AttemptEnd::NotServed) join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
+            // a RandomX failure in the attempt: node-internal, the alarm; no token; the pair re-queued, tried again as
+            // after a non-service
+            if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt");
+            if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
+                join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
         }
         return s;
     }
@@ -2932,17 +3002,22 @@ private:
         st_.ctx_rx++;
         (void)offer_ctx(id, blob, p);
     }
-    void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth) {
+    void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, std::uint32_t bound) {
         std::lock_guard<std::mutex> lk(cmtx_);
         const auto it = ctx_want_.find(id);
         if (it != ctx_want_.end()) {
             if (it->second.from == 0 && from != 0) it->second.from = from;
+            it->second.bound = std::max(it->second.bound, bound);
             return;
         }
-        if (ctx_want_.size() >= o_.ctx_want_max) return;
+        const bool join = bound > o_.ctx_max_depth;
+        std::size_t joins = 0;
+        for (const auto& kv : ctx_want_) joins += kv.second.bound > o_.ctx_max_depth ? 1 : 0;
+        if (join ? joins >= o_.ctx_join_depth : ctx_want_.size() - joins >= o_.ctx_want_max) return;
         CtxWant w;
         w.from = from;
         w.depth = depth;
+        w.bound = bound;
         w.since_ms = now_ms();
         ctx_want_.emplace(id, std::move(w));
         st_.ctx_wanted++;
@@ -2992,7 +3067,7 @@ private:
     // The work behind a held proof (the node's own chain index); usable: accepted; forged: its sender banned; not
     // judgeable now: kept (its parent wanted while within ctx_max_depth).
     bool judge_ctx(Hash32 id) {
-        for (std::size_t guard = 0; guard < o_.ctx_want_max; ++guard) {
+        for (std::size_t guard = 0; guard < o_.ctx_want_max + o_.ctx_join_depth; ++guard) {
             CtxWant w;
             {
                 std::lock_guard<std::mutex> lk(cmtx_);
@@ -3011,7 +3086,7 @@ private:
                                 if (it == ctx_pow_.end()) return std::nullopt;
                                 return it->second;
                             },
-                            o_.ctx_max_depth, ctx_.rx);
+                            w.bound, ctx_.rx);
                 } catch (const RandomxFailure&) {  // node-internal, a local alarm; the context is judged again later
                     rx_alarm("context " + hex_short(id));
                     return false;
@@ -3046,8 +3121,8 @@ private:
                     std::lock_guard<std::mutex> lk(cmtx_);
                     parent_pow = ctx_pow_.count(w.proof.parent) != 0;
                 }
-                if (!parent_known && !parent_pow && w.depth + 1 < o_.ctx_max_depth)
-                    want_ctx(w.proof.parent, w.proof_from != 0 ? w.proof_from : w.from, w.depth + 1);
+                if (!parent_known && !parent_pow && w.depth + 1 < w.bound)
+                    want_ctx(w.proof.parent, w.proof_from != 0 ? w.proof_from : w.from, w.depth + 1, w.bound);
                 return false;
             }
             if (v.kind == rly::CtxPow::Accept) {
@@ -3071,7 +3146,7 @@ private:
                 std::lock_guard<std::mutex> lk(cmtx_);
                 ctx_want_.erase(id);
                 ctx_done_.push_back(id);
-                while (ctx_done_.size() > o_.ctx_want_max) ctx_done_.pop_front();
+                while (ctx_done_.size() > o_.ctx_want_max + o_.ctx_join_depth) ctx_done_.pop_front();
                 for (const auto& [cid, cw] : ctx_want_)
                     if (cw.have_proof && cw.proof.parent == id) {
                         child = cid;
@@ -3170,10 +3245,10 @@ private:
         const std::uint64_t deadline = now_ms() + timeout_s * 1000;
         if (ctx_.block_blob) {
             std::vector<std::uint8_t> blob;
-            want_ctx(id, 0, 0);
+            want_ctx(id, 0, 0, o_.ctx_join_depth);
             if (ctx_.block_blob(id, blob) && !blob.empty() && offer_ctx(id, blob, 0)) return true;
         }
-        want_ctx(id, 0, 0);
+        want_ctx(id, 0, 0, o_.ctx_join_depth);
         drive_ctx();
         if (!o_.threads) {
             while (!ctx_resolved(id) && now_ms() < deadline && drive_ && drive_()) {
@@ -3227,6 +3302,7 @@ private:
 
     std::mutex rmtx_;  // re-offer cursors
     std::map<std::uint64_t, std::deque<Hash32>> reoffer_;
+    std::map<std::uint64_t, std::uint64_t> reoffer_t0_;  // a re-offer's start (ms), by peer
     std::set<std::uint64_t> pumping_;  // the peers whose re-offer a thread is pumping
     std::atomic<std::uint64_t> rx_ok_{0};    // RandomX hashes computed (node and context)
     std::atomic<std::uint64_t> rx_mark_{0};  // rx_ok_ at the last RandomX failure
@@ -3244,6 +3320,7 @@ private:
     ::c2pool::xmr::CarrierDosBudget dos_;
     std::map<std::uint64_t, std::uint64_t> strikes_by_peer_;
     std::map<std::uint64_t, ValidBucket> valid_;  // P-15 (vmtx_)
+    ClaimAlarmBudget claim_budget_{kRuledLaneParams};  // P-50 (vmtx_)
     double valid_rate_ = 0;
     double valid_cap_ = 0;
     double solicited_ = 0;          // P-21 credits

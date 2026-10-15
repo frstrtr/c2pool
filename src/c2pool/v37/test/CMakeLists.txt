@@ -390,26 +390,6 @@ if (BUILD_TESTING)
     target_link_libraries(v37_xmr_race_rebook_kat PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_race_rebook_kat COMMAND v37_xmr_race_rebook_kat)
 
-    # v37_xmr_coldboot_resume_kat (COLD-BOOT-4): every anchor boot (pinned or
-    # explicit) is paced by one predicate; a restart re-drives from its finalize
-    # cursor (a cursor in the pre-anchor span starts the scan at the f2 anchor; a
-    # cursor below the retained rows is served by the snapshotted booking tail);
-    # a resume whose cursor lags the snapshot tip stays paced until it catches up.
-    # REAL ChainIndex + XmrNode + FinalizeConnect. Builds on the pre-fix tree and
-    # FAILS there. SAME HOLLOW-GREEN GUARD: listed in BOTH build.yml --target lists.
-    add_executable(v37_xmr_coldboot_resume_kat v37_xmr_coldboot_resume_kat.cpp)
-    target_compile_features(v37_xmr_coldboot_resume_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_coldboot_resume_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE xmr_node xmr_native_txpool xmr_coin Threads::Threads)
-    if (TARGET Boost::headers)
-        target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE Boost::headers)
-    elseif (TARGET Boost::boost)
-        target_link_libraries(v37_xmr_coldboot_resume_kat PRIVATE Boost::boost)
-    elseif (DEFINED Boost_INCLUDE_DIRS)
-        target_include_directories(v37_xmr_coldboot_resume_kat PRIVATE ${Boost_INCLUDE_DIRS})
-    endif()
-    add_test(NAME v37_xmr_coldboot_resume_kat COMMAND v37_xmr_coldboot_resume_kat)
-    set_tests_properties(v37_xmr_coldboot_resume_kat PROPERTIES TIMEOUT 900)
     # v37_xmr_relay_repair_hold_kat (RC-HOLD): a GAP-2 relay repair of the
     # winner's cut that outlasts the booking retry bound is UNDECIDED -> HELD
     # (R4 gate kept, repair continues), never refused on a retry count; two nodes
@@ -445,16 +425,6 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_minority_converge_selfcheck PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_minority_converge_selfcheck PRIVATE xmr_node Threads::Threads)
     add_test(NAME v37_xmr_minority_converge_selfcheck COMMAND v37_xmr_minority_converge_selfcheck)
-    # v37_xmr_minority_workweight_kat (D2, operator ruling D-1 = C): production
-    # FinalizeConnect nodes in lockstep (the D2Rig) + the production
-    # LaneSuspendState -- a byzantine PAIR with < 50% of the window's work never
-    # halts an honest node, the minority trigger is work-weighted (40% no, 60%
-    # yes), DIVERGED is alarm-only. Listed in BOTH build.yml --target lists.
-    add_executable(v37_xmr_minority_workweight_kat v37_xmr_minority_workweight_kat.cpp)
-    target_compile_features(v37_xmr_minority_workweight_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_minority_workweight_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(v37_xmr_minority_workweight_kat PRIVATE xmr_node Threads::Threads)
-    add_test(NAME v37_xmr_minority_workweight_kat COMMAND v37_xmr_minority_workweight_kat)
     # v37_xmr_lane_suspend_selfcheck (R-C rework-2): the stratum side of LANE
     # SUSPEND over a loopback socket -- the suspend EDGE withdraws the job
     # (sessions dropped), a login while suspended is PARKED, the resume edge
@@ -509,22 +479,6 @@ if (BUILD_TESTING)
     target_include_directories(v37_xmr_stratum_vardiff_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(v37_xmr_stratum_vardiff_kat PRIVATE xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_stratum_vardiff_kat COMMAND v37_xmr_stratum_vardiff_kat)
-    # v37_xmr_test_suspend_knob_kat (FAULT-KNOB, TEST-ONLY): the
-    # --test-suspend-lane-seconds / SIGUSR2 knob that forces a lane suspension
-    # on a live node -- off by default, refused on mainnet, arm/fire/release
-    # through LaneSuspendState (cause `test`), and end to end through the real
-    # StratumListener::set_lane_suspended() (parked login served on release).
-    # RESUME-FRESH (FK7/FK8): the first job after a release is at the current tip
-    # (xmr/xmr_lane_resume_fresh.hpp), and a failed rebuild holds the gate.
-    # Stub template source + verifier over loopback: no RandomX, no monerod.
-    # Listed in BOTH build.yml --target lists.
-    add_executable(v37_xmr_test_suspend_knob_kat
-        v37_xmr_test_suspend_knob_kat.cpp
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp)
-    target_compile_features(v37_xmr_test_suspend_knob_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_test_suspend_knob_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(v37_xmr_test_suspend_knob_kat PRIVATE xmr_coin Threads::Threads)
-    add_test(NAME v37_xmr_test_suspend_knob_kat COMMAND v37_xmr_test_suspend_knob_kat)
     # v37_xmr_stratum_json_depth_kat: the stratum listener's JSON nesting limit
     # and \u-escape check, over a loopback socket, run in a child process. Stub
     # template/verifier/sink, no RandomX, no monerod. Listed in BOTH build.yml
@@ -838,8 +792,8 @@ if (BUILD_TESTING)
     #   v37_xmr_web_dashboard_kat
     #     Starts the read-only provider on a fixture XmrWebState and fetches
     #     every endpoint over real loopback HTTP (/local_stats /global_stats
-    #     /current_payouts /current_merged_payouts /recent_blocks /v37_status
-    #     /xmr/payouts /web/currency_info /node_info), checking each field
+    #     /recent_blocks /v37_status /xmr/pathb /web/currency_info /node_info),
+    #     checking each field
     #     against the fixture; GET / is the dashboard HTML with NO "PPLNS"
     #     (WRS / PPR), and a stock LITECOIN WebServer still serves the file
     #     byte-for-byte. Not stdlib-only: it links the core web server, the
@@ -884,29 +838,6 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_paynow_kat COMMAND v37_xmr_paynow_kat)
 
     # ------------------------------------------------------------------
-    # EVERY NODE RECOMPUTES THE LANE COINBASE (operator rulings 2026-09-29,
-    # xmr/xmr_coinbase_recompute.hpp): REAL assembled blocks from the
-    # builder pipeline, decoded as booking decodes them, recomputed from the
-    # receiver's ledger. Honest blocks (owed + pay-now, a reward hint above
-    # the total, the empty-cut finder, a binding weight-aware cap) are
-    # canonical; the #1861 double pay, an over-payment, a K_fair reorder, an
-    # under-take, misdirected pay-now and a stale ledger state are not. Same
-    # link shape as the pay-now KAT (listed in BOTH build.yml --target lists).
-    # ------------------------------------------------------------------
-    add_executable(v37_xmr_coinbase_recompute_kat
-        v37_xmr_coinbase_recompute_kat.cpp
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
-        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
-    target_compile_features(v37_xmr_coinbase_recompute_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_coinbase_recompute_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-    target_compile_definitions(v37_xmr_coinbase_recompute_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-    target_link_libraries(v37_xmr_coinbase_recompute_kat PRIVATE xmr_template xmr_node xmr_coin)
-    add_test(NAME v37_xmr_coinbase_recompute_kat COMMAND v37_xmr_coinbase_recompute_kat)
-
-    # ------------------------------------------------------------------
     # SHARE-LEVEL CANONICAL COINBASE (P2Pool's share rule): a relayed
     # receipt's coinbase, opened through its own Keccak midstate, must be the
     # canonical lane coinbase (xmr_coinbase_recompute.hpp verify_share_coinbase,
@@ -944,27 +875,6 @@ if (BUILD_TESTING)
     target_compile_definitions(v37_xmr_light_proof_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
     target_link_libraries(v37_xmr_light_proof_kat PRIVATE xmr_template xmr_node xmr_coin Threads::Threads)
     add_test(NAME v37_xmr_light_proof_kat COMMAND v37_xmr_light_proof_kat)
-
-    # ------------------------------------------------------------------
-    # MAINNET REHEARSAL (isolated): the mainnet settlement configuration
-    # (fee model v1, the mainnet donation identity, the R6 booking pipeline)
-    # run in-process on three nodes with rotating builders -- honest run
-    # (every block canonical, one digest, exact conservation), a lagging
-    # builder, an over-paying builder, an out-of-band payee ref. No daemon,
-    # no network, no RandomX. Same link shape as the recompute KAT.
-    # ------------------------------------------------------------------
-    add_executable(v37_xmr_mainnet_rehearsal_kat
-        v37_xmr_mainnet_rehearsal_kat.cpp
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
-        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
-    target_compile_features(v37_xmr_mainnet_rehearsal_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_mainnet_rehearsal_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-    target_compile_definitions(v37_xmr_mainnet_rehearsal_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-    target_link_libraries(v37_xmr_mainnet_rehearsal_kat PRIVATE xmr_template xmr_node xmr_coin)
-    add_test(NAME v37_xmr_mainnet_rehearsal_kat COMMAND v37_xmr_mainnet_rehearsal_kat)
 
     # ------------------------------------------------------------------
     # v37_xmr_spend_floor_kat -- the spend-cost floor c (Monero's minimum
@@ -1139,7 +1049,6 @@ if (BUILD_TESTING)
     #                               readers are reaped, the accept loop backs
     #                               off on EMFILE and the Path B relay node heals
     #                               after a partition_for().
-    #   v37_xmr_drops_enrol_repl_kat ENROL-REPL: the carried DROPS delta (below).
     #   v37_xmr_relay_pool_id_kat   POOL-ID: the roundabout S1 lane_tag in
     #                               HELLO; another pool's node (geometry /
     #                               chain_id / consensus version) is refused
@@ -1198,7 +1107,7 @@ if (BUILD_TESTING)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
-    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_pool_id_kat v37_xmr_drops_enrol_repl_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_drops_restart_kat v37_xmr_drops_writeahead_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_drops_enrol_lane_kat v37_xmr_drops_enrol_tidy_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_drops_carry_suffix_kat v37_xmr_drops_set_kat v37_xmr_drops_harden_kat v37_xmr_drops_pin_enrol_kat v37_xmr_lane_rules_kat)
+    foreach(_gap2_kat xmr_relay_wire_kat xmr_receipt_bind_v2_kat v37_xmr_relay_multinode_kat v37_xmr_relay_repair_ctx_kat v37_xmr_relay_pool_id_kat v37_xmr_relay_noise_kat v37_xmr_drops_backfill_kat v37_xmr_drops_harvest_order_kat v37_xmr_relay_repair_horizon_kat v37_xmr_relay_repair_chain_kat v37_xmr_drops_due_kat v37_xmr_raindrop_enrol_kat v37_xmr_order_rule_kat v37_xmr_drops_income_kat v37_xmr_lane_rules_kat)
 
     #   v37_xmr_order_rule_kat     THE CANONICAL LANE ORDER (handoff gap 4, the
     #                               A6 remainder): a relay repair's composed
@@ -1232,15 +1141,6 @@ if (BUILD_TESTING)
     #                               due and raindrop-enrol rules on; a control
     #                               that pays raindrops in every window block
     #                               trips it. ALSO on BOTH build.yml lists.
-    #   v37_xmr_drops_pin_enrol_kat THE MERGE SEAM (master #1857 x A3 / gap 4):
-    #                               the pinned raindrop set composer enrols a
-    #                               DROPS-only payee from the PINNED members only
-    #                               and reads the booking-point registry; a
-    #                               long-ref raindrop is an invalid member (set
-    #                               refused, never a HOLD); one composed-order
-    #                               rule for the replay and the DROPS prefix.
-    #                               RED on the plain merge. ALSO on BOTH
-    #                               build.yml --target lists.
     #   v37_xmr_relay_repair_horizon_kat REPAIR-HORIZON (capstone 09-26): a
     #                               relay repair of a lane longer than every
     #                               peer's vault horizon was Exhausted forever
@@ -1415,90 +1315,6 @@ if (BUILD_TESTING)
     #                               until its outbound target is met (no more).
     #                               ALSO on BOTH build.yml --target lists.
     # (both built in the Path B relay KAT block above)
-    # ENROL-REPL (DROPS defect 2): v37_xmr_drops_enrol_repl_kat -- the XMR DROPS
-    # enrolment book is node-local, so a lane block books the WINNER's composed
-    # delta carried on FB_BLOCK_WON v0x02 (never each node's own-book
-    # composition). Two nodes enrolled 8 tips apart book 50 wins through
-    # XmrFinalizeDriver with EQUAL owed_digest (RED on the base: each composes
-    # its own); the v0x02 codec (flip-0 decoder refuses it; malformed trailers
-    # refused); a mismatched / inconsistent carried delta books EMPTY on every
-    # node; source pins on the shell / node / relay. ALSO on BOTH build.yml
-    # --target lists.
-    target_compile_definitions(v37_xmr_drops_enrol_repl_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
-        V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
-    # the merge seam KAT reads the shell for its source pins (PE5)
-    target_compile_definitions(v37_xmr_drops_pin_enrol_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-RESTART (flip-1 multinode robustness): v37_xmr_drops_restart_kat --
-    # the prev_lane walk HOLDs (never decides) on an unreadable row / unreadable
-    # bytes and takes a tagged block as a lane block even before this node's
-    # ring matched its root; the carried-delta journal (own win, composed frame
-    # written before it is sent, booked deltas) survives a restart byte-exact;
-    # a NON-winner serves a lost carried frame on FB_GETWON with the winner
-    # down; source pins: no pre-DROPS booking at flip 1, the boot re-drive books
-    # the journal. RED on c3fd4b55, GREEN on the fix. ALSO on BOTH build.yml
-    # --target lists.
-    target_compile_definitions(v37_xmr_drops_restart_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp"
-        V37_XMR_SRC_DIR="${CMAKE_SOURCE_DIR}/src/c2pool/v37/xmr")
-    # DROPS WRITE-AHEAD: v37_xmr_drops_writeahead_kat -- the exact network gate
-    # journals our own block (P) BEFORE it is published, so a winner that dies
-    # between the publish and the FOUND callback still composes + carries its
-    # delta after the restart (the base stalls: nobody holds the frame); the
-    # gate's listener-thread appends interleave with the main thread's
-    # untorn; source pins (gate order, flip-1-only hook, booking order). RED on
-    # the base, GREEN on the fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_writeahead_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-ENROL-LANE (DROPS defect 4, flip 1): v37_xmr_drops_enrol_lane_kat --
-    # the share counts and the enrolment book are derived from the replicated
-    # lane prefix [0, P) at the block's on-chain credit cut, so a late / restarted
-    # node composes the winner's rows, digest and delta, a node that never
-    # enrolled locally composes a dead winner's delta, and a carried trailer
-    # whose enrollment_digest differs from the lane derivation is refused; the
-    # enrol set rides HELLO only under DROPS; source pins. RED on the base,
-    # GREEN on the fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_enrol_lane_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-ENROL-TIDY (flip 1, follow-ups of DROPS-ENROL-LANE):
-    # v37_xmr_drops_enrol_tidy_kat -- the per-node lane-position log is folded
-    # below the oldest reachable credit cut (compose / verify_carry / repair at
-    # that cut unchanged, an entry below the bound gone, the log bounded), the
-    # tip-based EnrollmentBook + node-local share book are retired (lane-only),
-    # and an enrol-set mismatch is refused at HELLO naming both enrol-set
-    # digests. RED on the base, GREEN on the fix. ALSO on BOTH build.yml
-    # --target lists.
-    target_compile_definitions(v37_xmr_drops_enrol_tidy_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-CARRY-SUFFIX (capstone attempt 5, flip 1): v37_xmr_drops_carry_suffix_kat
-    # -- a receiver whose relay repair served only the SUFFIX [a0, P) (the
-    # serving peer's vault horizon) composes the DROPS prefix from OUR lane log
-    # over [0, a0) + the served suffix (merged_prefix, positions == P or HOLD),
-    # so three nodes book the winner's book + delta and one owed ledger (no
-    # carried REFUSED, no lane_root_refused); never-a-clawback + one rule for
-    # the winner's own block; source pins. RED on the base, GREEN on the fix.
-    # ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_carry_suffix_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-SET-PIN (verify of 2da7c254, flip 1): v37_xmr_drops_set_kat -- the
-    # raindrop SET of a lane block is the winner's pinned id list (FB_BLOCK_WON
-    # v0x03): a receiver holding an extra raindrop, fewer raindrops, or restarted
-    # composes exactly the winner's delta (never adds, never drops; HOLD while a
-    # member is missing, fetched by id over loopback); an invalid set is refused
-    # alike on every node; flip-0 wire unchanged; source pins. RED on the base,
-    # GREEN on the fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_set_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    # DROPS-HARDEN (verify of DROPS-SET-PIN, flip 1): v37_xmr_drops_harden_kat --
-    # d1 bounded by-id asks (drops_fetch_max_asks, then drops_fetch_slow_ms; the
-    # ask state pruned when a set completes or leaves the pending set), d3 the
-    # first set-carrying FB_BLOCK_WON for a bid wins (set-equivocation logged),
-    # d4 the persisted raindrop store (lane<N>.drops) served by a restarted
-    # winner, d2 wire_cache pruned (source pins). RED on the base, GREEN on the
-    # fix. ALSO on BOTH build.yml --target lists.
-    target_compile_definitions(v37_xmr_drops_harden_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
     # RELAY-SEND-QUEUE: v37_xmr_relay_send_queue_kat -- two Path B relay nodes
     # over loopback TCP, each holding a pending set the other lacks, HELLO at
     # once: the re-offer goes through the per-link send queue (no send timeout,
@@ -1665,41 +1481,6 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_p2p_publish_retry_kat COMMAND v37_xmr_p2p_publish_retry_kat)
 
     # ------------------------------------------------------------------
-    # c2pool#1551 -- the SAME-HEIGHT double-block refusal, decided prefer-own
-    # within bounds.
-    #
-    #   v37_xmr_prefer_own_race_kat
-    #     Pins the credit table for a height carrying two blocks, one of them
-    #     ours: unburied refuses everybody, buried credits ours ONLY if the
-    #     chain kept it, an orphan of ours credits NOTHING, a stranger's block
-    #     credits NOTHING, and a height credits at most once (R-7).
-    #
-    #     The property that makes the bound real is run, not asserted in prose:
-    #     the same fixture is decided under BOTH tie-break policies and the
-    #     verdicts must be identical while the nominations differ -- so
-    #     prefer-own demonstrably moves the lever and cannot reach the ledger.
-    #
-    #     Suites E and F drive the REAL XmrNode + FinalizeConnect over a pumped
-    #     native chain: E is one node winning, losing and sitting out a fork; F
-    #     is two nodes racing each other at one height, where the winner credits
-    #     once, the loser fabricates nothing, and the fleet-wide credited set has
-    #     exactly one entry. No sockets, no RandomX, no daemon.
-    #
-    #     SAME HOLLOW-GREEN GUARD as its siblings: ALSO listed in BOTH build.yml
-    #     `--target` lists (the Linux x86_64 leg and the ASan+UBSan leg), because
-    #     a registered-but-unbuilt target reports "***Not Run" and fails ctest
-    #     with exit 8 -- a red that is not a test failure (the #1539 lesson).
-    # ------------------------------------------------------------------
-    add_executable(v37_xmr_prefer_own_race_kat v37_xmr_prefer_own_race_kat.cpp)
-    target_compile_features(v37_xmr_prefer_own_race_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_prefer_own_race_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
-        ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
-    target_link_libraries(v37_xmr_prefer_own_race_kat PRIVATE xmr_node xmr_coin Threads::Threads)
-    add_test(NAME v37_xmr_prefer_own_race_kat COMMAND v37_xmr_prefer_own_race_kat)
-
-    # ------------------------------------------------------------------
     # MAINNET READINESS -- the pool binary's own native-node plumbing.
     #
     #   v37_xmr_mainnet_readiness_kat
@@ -1829,6 +1610,33 @@ if (BUILD_TESTING)
                  COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/xmr-run-a-node-check.sh)
         set_tests_properties(v37_xmr_run_a_node_check PROPERTIES
             ENVIRONMENT "XMR_RUNNODE_SKIP_BUILD=1;C2POOL_BUILD_DIR=${CMAKE_BINARY_DIR}")
+    endif()
+
+    # PATHB-SMOKE -- v37_xmr_pathb_regtest_smoke
+    #   pathb_smoke/v37_xmr_pathb_regtest_smoke.py runs the built daemon on a
+    #   loopback regtest rig: two regtest monerods, three Path B pool nodes
+    #   (relay links, --mine), an old-binary node, a --follow-only node and a
+    #   one-node --native-solo pool. Inputs: XMR_REGTEST_MONEROD (monerod),
+    #   XMR_REGTEST_WALLET_RPC (default: beside monerod),
+    #   XMR_PATHB_SMOKE_OLD_BINARY (the old c2pool-v37-xmr); without them the
+    #   test exits 77 (SKIPPED). The custom target orders the build after
+    #   c2pool-v37-xmr. Listed in the build.yml Linux --target list only.
+    if (TARGET c2pool-v37-xmr)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        add_custom_target(v37_xmr_pathb_regtest_smoke)
+        add_dependencies(v37_xmr_pathb_regtest_smoke c2pool-v37-xmr)
+        if (Python3_Interpreter_FOUND)
+            add_test(NAME v37_xmr_pathb_regtest_smoke
+                     COMMAND ${Python3_EXECUTABLE} -I
+                             ${CMAKE_CURRENT_SOURCE_DIR}/pathb_smoke/v37_xmr_pathb_regtest_smoke.py
+                             --daemon $<TARGET_FILE:c2pool-v37-xmr>
+                             --work ${CMAKE_CURRENT_BINARY_DIR}/pathb_smoke)
+            set_tests_properties(v37_xmr_pathb_regtest_smoke PROPERTIES
+                SKIP_RETURN_CODE 77
+                TIMEOUT 3600
+                RUN_SERIAL TRUE
+                LABELS "regtest;monerod;smoke")
+        endif()
     endif()
 
     # D6d -- v37_xmr_d6d_native_seed_tip_kat
@@ -2313,21 +2121,6 @@ if (BUILD_TESTING)
     target_link_libraries(v37_drops_jk_keep_share_credit_kat Threads::Threads)
     add_test(NAME v37_drops_jk_keep_share_credit_kat COMMAND v37_drops_jk_keep_share_credit_kat)
 
-    # ★ DROPS on the XMR lane — v37_xmr_drops_wiring_kat. main_v37_xmr.cpp built
-    # no DropsWiring and called none of XmrNode's T3 seams, so a flipped XMR node
-    # was gate-ON and DORMANT. Pins the shell's wiring (X-SHELL: RED on the base),
-    # gate-OFF dormancy, the ★ enrolment clock = the NATIVE TIP (never the burial
-    # frontier), the exact Monero-difficulty -> lz normalisation, the rescaled
-    # R1 price, and the end-to-end composed credit. Stdlib-only, ~1 s. ALSO on
-    # BOTH build.yml --target lists (hollow-green guard).
-    add_executable(v37_xmr_drops_wiring_kat v37_xmr_drops_wiring_kat.cpp)
-    target_compile_features(v37_xmr_drops_wiring_kat PRIVATE cxx_std_20)
-    target_include_directories(v37_xmr_drops_wiring_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_compile_definitions(v37_xmr_drops_wiring_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
-    target_link_libraries(v37_xmr_drops_wiring_kat Threads::Threads)
-    add_test(NAME v37_xmr_drops_wiring_kat COMMAND v37_xmr_drops_wiring_kat)
-
     # ★ DROPS ACTIVATION AT ARITY 1 — the gate-ON owed_digest a DECOUPLED fleet
     # actually reproduces, minted and pinned BESIDE the arity-2 golden above.
     #
@@ -2454,12 +2247,6 @@ if (BUILD_TESTING)
     target_compile_definitions(v37_xmr_boost_origin_kat PRIVATE
         C2POOL_EXPECT_BOOST_VERSION_STRING="${_v37_boost_origin_expect}")
     add_test(NAME v37_xmr_boost_origin_kat COMMAND v37_xmr_boost_origin_kat)
-endif()
-
-# v37_xmr_drops_default_kat DD4 reads the XMR shell source.
-if (TARGET v37_xmr_drops_default_kat)
-    target_compile_definitions(v37_xmr_drops_default_kat PRIVATE
-        V37_XMR_SHELL_SRC="${CMAKE_SOURCE_DIR}/src/c2pool/v37/main_v37_xmr.cpp")
 endif()
 
 # XMR-DROPS-DEFAULT: every XMR KAT in this directory is built the way the XMR

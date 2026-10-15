@@ -6,11 +6,12 @@
 // the read-only XmrWebDashboard provider (xmr/xmr_web_dashboard.hpp).
 //
 // The provider is started on a fixture XmrWebState (a fixed clock, a known
-// share stream, known relay receipts, a known owed ledger and found blocks)
-// and every endpoint is fetched over REAL loopback HTTP from the running
-// server; each JSON field is checked against the value the fixture implies:
-//   /local_stats /global_stats /current_payouts /current_merged_payouts
-//   /recent_blocks /v37_status /xmr/payouts /web/currency_info /node_info
+// share stream, known relay receipts, a known Path B best tip, its window and
+// found blocks) and every endpoint is fetched over REAL loopback HTTP from the
+// running server; each JSON field is checked against the value the fixture
+// implies:
+//   /local_stats /global_stats /recent_blocks /v37_status /xmr/pathb
+//   /web/currency_info /node_info
 // plus GET / == the dashboard HTML with NO "PPLNS" anywhere in it (the payout
 // scheme is WRS / PPR), and a stock LITECOIN WebServer serving the same file
 // byte-for-byte (the relabel is per-coin: no other coin's UI changes).
@@ -19,7 +20,6 @@
 // this TU does not build); GREEN with XMR-WEB. Harness: stdlib + the core web
 // server (the provider's own link shape); returns nonzero on any failure.
 #include "c2pool/v37/xmr/xmr_web_dashboard.hpp"
-#include "c2pool/v37/xmr/xmr_fee_model.hpp"
 #include "c2pool/v37/xmr/relay/xmr_address.hpp"
 
 #include <core/web_server.hpp>
@@ -37,7 +37,6 @@
 #include <string>
 
 namespace xweb = ::c2pool::v37n::xmr::web;
-namespace fee  = ::c2pool::v37n::xmr::fee;
 
 static int g_fail = 0, g_pass = 0;
 #define CHECK(cond, what) do { if (cond) { ++g_pass; } else { ++g_fail; \
@@ -78,26 +77,30 @@ static std::string slurp(const std::string& p) {
 static const char* kA = "addrA-4AdUndXHHZ6cfufTMvppY6JwXNouMBzSkbLYfpAV5Usx3skxNgYeYTRj5UzqtReoS44qo9mtmXCqY45DJ852K5Jv2684Rge";
 static const char* kB = "addrB-44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A";
 
+// A Monero mainnet standard address (network byte 18).
+static const char* kMainnetAddr = "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF";
+
 static xweb::XmrWebState fixture(std::uint64_t foreign) {
     xweb::XmrWebState s;
-    s.version = "kat-1.0"; s.network = "regtest"; s.coinbase_mode = "v37-settlement";
+    s.version = "kat-1.0"; s.network = "regtest";
     s.stratum_host = "127.0.0.1"; s.stratum_port = 7251;
     s.chain_height = 3000; s.network_difficulty = 120000; s.template_height = 3001; s.share_difficulty = 1000;
-    s.d_conf = 10; s.finalize_cursor = 2990; s.hw = 3000; s.ledger_seq = 77;
-    s.owed_digest_hex = std::string(64, 'a');
     s.relay_enabled = true; s.relay_ready = 2; s.relay_conns = 2; s.relay_foreign_receipts = foreign;
-    s.fee_model = "off"; s.donation_address = fee::donation_address(fee::DonationNet::Regtest);
+    s.give_author_pct = 0.1; s.owner_fee_pct = 1.5; s.owner_address = kB;
     s.payout_address = kA;
     s.stratum_connections = 3; s.stratum_active = 2; s.stratum_shares = 45; s.stratum_rejected = 1;
-    s.found_registered = 2; s.found_settled = 1; s.found_orphaned = 1;
-    s.owed = {{kA, 600000000000LL}, {kB, 400000000000LL}, {"key:00112233", -5}};
-    xweb::XmrWebBlock b1; b1.height = 2999; b1.id_hex = std::string(64, 'b'); b1.time = 1700000000;
-    b1.status = "main"; b1.own = true; b1.coinbase_known = true; b1.coinbase_total_pico = 1000000000000ULL;
-    b1.booked_pico = 1000000000000ULL;
-    b1.payouts = {{kA, 700000000000ULL}, {kB, 300000000000ULL}};
-    xweb::XmrWebBlock b2; b2.height = 2995; b2.id_hex = std::string(64, 'c'); b2.time = 1699999000;
-    b2.status = "orphan"; b2.booked_pico = 900000000000ULL;   // a chain-booked block: full coinbase unknown
-    s.blocks = {b1, b2};
+    s.pathb.tip_pos = 120; s.pathb.tip_id_hex = std::string(64, 'd'); s.pathb.cum_work = "123456789";
+    s.pathb.epoch_cur = 0; s.pathb.h_hold = 0;
+    s.pathb.window_root_hex = std::string(64, 'e'); s.pathb.mmr_root_hex = std::string(64, 'f'); s.pathb.leaf_count = 7;
+    s.pathb.pending = 3; s.pathb.deferred = 1; s.pathb.repended_last_switch = 2; s.pathb.template_status = "ok";
+    s.window = {{kA, 0.6, 600000000000ULL}, {kB, 0.4, 400000000000ULL}};
+    xweb::XmrWebFound b1; b1.height = 2999; b1.id_hex = std::string(64, 'b'); b1.time = 1700000000;
+    b1.tip_hex = std::string(64, 'd'); b1.window_root_hex = std::string(64, 'e'); b1.n_outputs = 2;
+    b1.reward_pico = 1000000000000ULL; b1.landed = "own-index";
+    xweb::XmrWebFound b2; b2.height = 2995; b2.id_hex = std::string(64, 'c'); b2.time = 1699999000;
+    b2.tip_hex = std::string(64, '9'); b2.window_root_hex = std::string(64, '8'); b2.n_outputs = 3;
+    b2.reward_pico = 900000000000ULL; b2.landed = "peer";
+    s.found = {b1, b2};
     return s;
 }
 
@@ -112,9 +115,9 @@ int main() {
     }
     // ── the display address encoder is decode's exact inverse ───────────────
     {
-        const std::string d = fee::donation_address(fee::DonationNet::Mainnet);
+        const std::string d = kMainnetAddr;
         const auto da = ::c2pool::v37n::xmr::relay::decode_address(d);
-        CHECK(da.has_value(), "donation address decodes");
+        CHECK(da.has_value(), "mainnet address decodes");
         if (da) CHECK(::c2pool::v37n::xmr::relay::address_of(da->ref(), 18, 42) == d, "encode(decode(addr)) == addr");
     }
 
@@ -139,7 +142,7 @@ int main() {
           near(ls["miner_hash_rates"].value(std::string(kB) + ".w2", -1.0), 50.0), "/local_stats per-worker hashrate");
     CHECK(ls.value("payout_scheme", std::string()) == "WRS / PPR", "/local_stats payout_scheme");
     CHECK(ls.value("version", std::string()) == "kat-1.0", "/local_stats version");
-    CHECK(near(ls.value("block_value", -1.0), 1.0), "/local_stats block_value == the last known coinbase");
+    CHECK(near(ls.value("block_value", -1.0), 1.0), "/local_stats block_value == the newest found block's R");
 
     const auto gs = get_json(port, "/global_stats");
     CHECK(near(gs.value("pool_hash_rate", -1.0), 350.0), "/global_stats pool_hash_rate");
@@ -147,43 +150,56 @@ int main() {
     CHECK(gs.value("found_blocks", 0ULL) == 2ULL && gs.value("last_block", 0ULL) == 2999ULL, "/global_stats blocks");
     CHECK(gs.value("unique_miners", 0ULL) == 2ULL, "/global_stats unique miners");
 
-    const auto cp = get_json(port, "/current_payouts");
-    CHECK(cp.is_object() && cp.size() == 2, "/current_payouts: the two positive owed payees");
-    CHECK(near(cp.value(kA, -1.0), 0.6) && near(cp.value(kB, -1.0), 0.4), "/current_payouts XMR amounts");
-    const auto cm = get_json(port, "/current_merged_payouts");
-    CHECK(cm.contains(kA) && near(cm[kA].value("amount", -1.0), 0.6), "/current_merged_payouts card shape");
+    const auto xp = get_json(port, "/xmr/pathb");
+    CHECK(xp.contains("window") && xp["window"].is_array() && xp["window"].size() == 2,
+          "/xmr/pathb: the best tip's window, two payees");
+    if (xp.contains("window") && xp["window"].is_array() && xp["window"].size() == 2) {
+        CHECK(xp["window"][0].value("payee", std::string()) == kA && near(xp["window"][0].value("amount", -1.0), 0.6) &&
+              xp["window"][1].value("payee", std::string()) == kB && near(xp["window"][1].value("amount", -1.0), 0.4),
+              "/xmr/pathb window XMR amounts");
+        CHECK(near(xp["window"][0].value("share", -1.0), 0.6) && xp["window"][0].value("amount_pico", 0ULL) == 600000000000ULL,
+              "/xmr/pathb window row shape (payee, share, amount_pico, amount)");
+    }
+    CHECK(dash.endpoint_json("/current_payouts").empty() && dash.endpoint_json("/current_merged_payouts").empty() &&
+          dash.endpoint_json("/xmr/payouts").empty(), "/current_payouts, /current_merged_payouts, /xmr/payouts are not served");
 
     const auto rb = get_json(port, "/recent_blocks");
     CHECK(rb.is_array() && rb.size() == 2, "/recent_blocks two rows");
     if (rb.is_array() && rb.size() == 2) {
         CHECK(rb[0].value("number", 0ULL) == 2999ULL && rb[0].value("hash", std::string()) == std::string(64, 'b'), "row0 id");
-        CHECK(rb[0].value("main_chain", false) && rb[0].value("found_by", std::string()) == "local", "row0 main/own");
-        CHECK(rb[0].value("coinbase_total_pico", 0ULL) == 1000000000000ULL && near(rb[0].value("coinbase_total", 0.0), 1.0), "row0 coinbase");
-        CHECK(rb[0]["payouts"].size() == 2 && rb[0]["payouts"][0].value("pico", 0ULL) == 700000000000ULL, "row0 payouts");
-        CHECK(rb[1].value("orphan", false) && rb[1].value("status", std::string()) == "orphan", "row1 orphan");
-        CHECK(rb[1]["coinbase_total_pico"].is_null() && rb[1].value("booked_payout_pico", 0ULL) == 900000000000ULL,
-              "row1: unknown coinbase is null (never a fabricated 0), the booked amount is shown");
+        CHECK(rb[0].value("found_by", std::string()) == "local" && rb[0].value("landed", std::string()) == "own-index", "row0 own, landed");
+        CHECK(rb[0].value("reward_pico", 0ULL) == 1000000000000ULL && near(rb[0].value("reward", 0.0), 1.0), "row0 R");
+        CHECK(rb[0].value("n_outputs", 0ULL) == 2ULL && rb[0].value("window_root", std::string()) == std::string(64, 'e') &&
+              rb[0].value("tip", std::string()) == std::string(64, 'd'), "row0 the window its coinbase pays (tip, window_root, n_outputs)");
     }
 
     const auto vs = get_json(port, "/v37_status");
     CHECK(vs.value("payout_scheme", std::string()) == "WRS / PPR" && vs.value("version", std::string()) == "kat-1.0", "/v37_status scheme+version");
-    CHECK(vs.contains("lane") && vs["lane"].value("d_conf", 0ULL) == 10ULL && vs["lane"].value("finalize_cursor", 0ULL) == 2990ULL &&
-          vs["lane"].value("owed_digest", std::string()) == std::string(64, 'a') && vs["lane"].value("ledger_seq", 0ULL) == 77ULL,
-          "/v37_status lane: D_conf, cursor, owed_digest, ledger_seq");
+    CHECK(vs.contains("pathb") && vs["pathb"].contains("best_tip") && vs["pathb"]["best_tip"].value("pos", 0ULL) == 120ULL &&
+          vs["pathb"]["best_tip"].value("id", std::string()) == std::string(64, 'd') &&
+          vs["pathb"]["best_tip"].value("cum_work", std::string()) == "123456789" && vs["pathb"].value("epoch_cur", 9U) == 0U &&
+          vs["pathb"].value("window_root", std::string()) == std::string(64, 'e') &&
+          vs["pathb"].value("mmr_root", std::string()) == std::string(64, 'f') && vs["pathb"].value("leaf_count", 0ULL) == 7ULL,
+          "/v37_status pathb: best tip (pos, id, cum_work), epoch_cur, window_root, mmr_root, leaf_count");
     CHECK(vs.contains("relay") && vs["relay"].value("ready", 0ULL) == 2ULL && vs["relay"].value("conns", 0ULL) == 2ULL, "/v37_status relay");
     CHECK(vs.contains("stratum") && vs["stratum"].value("port", 0) == 7251 && vs["stratum"].value("host", std::string()) == "127.0.0.1",
           "/v37_status stratum endpoint");
-    CHECK(vs.contains("fee") && vs["fee"].value("model", std::string()) == "off" &&
-          vs["fee"].value("donation_address", std::string()) == fee::donation_address(fee::DonationNet::Regtest), "/v37_status fee+donation");
-    CHECK(vs.contains("found") && vs["found"].value("registered", 0ULL) == 2ULL, "/v37_status found registered");
+    CHECK(vs.contains("fee") && near(vs["fee"].value("give_author_pct", -1.0), 0.1) &&
+          near(vs["fee"].value("owner_fee_pct", -1.0), 1.5) && vs["fee"].value("owner_address", std::string()) == kB,
+          "/v37_status fee: give_author_pct, owner_fee_pct, owner_address");
+    CHECK(vs.contains("found") && vs["found"].value("listed", 0ULL) == 2ULL && vs["found"].value("own_index", 0ULL) == 1ULL &&
+          vs["found"].value("peer", 0ULL) == 1ULL && vs["found"].value("monerod", 9ULL) == 0ULL, "/v37_status found: listed, by landing");
     CHECK(vs.contains("chain") && vs["chain"].value("height", 0ULL) == 3000ULL && vs["chain"].value("difficulty", 0ULL) == 120000ULL, "/v37_status chain");
 
-    const auto xp = get_json(port, "/xmr/payouts");
-    CHECK(xp.value("owed_total_pico", 0LL) == 999999999995LL, "/xmr/payouts owed total (EffectiveOwed, pico)");
-    CHECK(xp.contains("owed") && xp["owed"].size() == 3 && xp["owed"][0].value("owed_pico", 0LL) == 600000000000LL &&
-          near(xp["owed"][0].value("owed_xmr", 0.0), 0.6), "/xmr/payouts rows pico+XMR");
-    CHECK(xp.contains("last_block") && xp["last_block"].value("height", 0ULL) == 2999ULL && xp["last_block"]["payouts"].size() == 2,
-          "/xmr/payouts last found block's coinbase payouts");
+    CHECK(xp.contains("pathb") && xp["pathb"].value("pending", 0ULL) == 3ULL && xp["pathb"].value("deferred", 0ULL) == 1ULL &&
+          xp["pathb"].value("repended_last_switch", 0ULL) == 2ULL && xp["pathb"].value("template", std::string()) == "ok" &&
+          xp["pathb"].value("h_hold", 9ULL) == 0ULL, "/xmr/pathb status: pending, deferred, re-pended, template, H_hold");
+    CHECK(xp.contains("pathb") && xp["pathb"].contains("alarms") && !xp["pathb"]["alarms"].value("hold", true) &&
+          !xp["pathb"]["alarms"].value("fork_fuse", true) && !xp["pathb"]["alarms"].value("store_poisoned", true) &&
+          xp["pathb"]["alarms"].value("coinbase_internal", 9ULL) == 0ULL, "/xmr/pathb alarms");
+    CHECK(xp.contains("found") && xp["found"].is_array() && xp["found"].size() == 2 &&
+          xp["found"][0].value("height", 0ULL) == 2999ULL && xp["found"][0].value("landed", std::string()) == "own-index",
+          "/xmr/pathb the found blocks, newest first");
 
     const auto ci = get_json(port, "/web/currency_info");
     CHECK(ci.value("symbol", std::string()) == "XMR" && ci.value("payout_scheme", std::string()) == "WRS / PPR" &&
