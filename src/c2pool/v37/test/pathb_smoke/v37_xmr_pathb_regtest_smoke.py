@@ -1173,25 +1173,25 @@ class Rig:
                            "E shows at that tip" % (m.group(1), m.group(3), m.group(4), m.group(5), m.group(6)))
         pub = re.findall(r"^  publish: relayed=(\d+) solo_landed=(\d+)", p.text(), re.M)
         self.res.note("solo", "publish counters (last): %s" % ((pub[-1] if pub else "-"),))
-        time.sleep(3)
-        pre = self.web.get("E")
         self.web.unwatch("E")
         p.stop()
-        st = last_status(p.text())
+        # the state at the stop: the last template line before it (its tip and x = best position + 1); the miner
+        # keeps placing carriers until the stop, after the last status line and web answer
+        tl = re.findall(r"^template \d+: tip=([0-9a-f]+) x=(\d+) ", p.text().split("c2pool-v37-xmr: stopped")[0], re.M)
+        last_tip, last_x = (tl[-1][0], int(tl[-1][1])) if tl else (None, None)
         self.no_booking("solo", ["E"])
         argv, d = self.solo_argv(True, False)
         q = self.start("E", argv, cwd=d)
         wait_for(lambda: "stratum: listening on" in q.text() or not q.alive(), 180, "E stratum (restart)")
         lm = re.findall(r"^store: \S+ loaded: best position (\d+)$", q.text(), re.M)
-        self.res.check("solo", bool(lm) and st is not None and int(lm[0]) == int(st.group(3)),
-                       "restart: store loaded at best position %s (before the stop: %s)" %
-                       (lm[0] if lm else "-", st.group(3) if st else "-"))
+        self.res.check("solo", bool(lm) and last_x is not None and int(lm[0]) == last_x - 1,
+                       "restart: store loaded at best position %s (at the stop: x=%s)" %
+                       (lm[0] if lm else "-", last_x if last_x is not None else "-"))
         self.web.watch("E", self.p["web_E"])
         try:
             j = wait_for(lambda: self.web.get("E"), 30, "E web after restart")
-            self.res.check("solo", pre is not None and j["pathb"]["best_tip"] == pre["pathb"]["best_tip"],
-                           "restart: best tip %s == before the stop %s" %
-                           (j["pathb"]["best_tip"], pre["pathb"]["best_tip"] if pre else "-"))
+            self.res.check("solo", last_tip is not None and j["pathb"]["best_tip"]["id"].startswith(last_tip),
+                           "restart: best tip %s == the tip at the stop %s" % (j["pathb"]["best_tip"], last_tip))
         except Fail as e:
             self.res.check("solo", False, str(e))
         self.web.unwatch("E")
