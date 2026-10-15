@@ -105,6 +105,9 @@
 //   relayp15     P-15: the default capacity P-09; a first-seen receipt counts
 //                one, a duplicate none; above the budget a frame is DROPPED,
 //                no strike, no ban, the link kept; refilled at (1 + R_MAX) / T;
+//   relayp15rx   P-15: a receipts frame whose second body's RandomX fails:
+//                one job per body: the other two counted at once, the
+//                second at its re-run; three first-seen, three counted;
 //   relaystale   a gone peer's events (in flight, posted by its blocked
 //                reader) skipped: no join hold for the gone peer;
 //   relaytip     on_monero_tip from the follower's thread and under the node
@@ -155,6 +158,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2927,6 +2931,67 @@ void relayp15() {
 }
 
 // ---------------------------------------------------------------------------
+// relayp15rx: a receipts frame of three bodies whose second body's RandomX fails. The relay takes a receipts frame as
+// one job per body: the first and the third are admitted and counted in P-15 at once (their first placement); the
+// second is parked and run again: admitted and counted then. Three first-seen receipts, three counted, none twice.
+void relayp15rx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.peer_valid_capacity = 10; });
+    w.connect(0, 1);
+    w.run();
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t k = 0; k < 3; ++k)
+        if (const std::optional<pb::PathbJob> j = h.job(a.node, k + 2, 710 + k)) jobs.push_back(*j);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    bool ok = jobs.size() == 3 && mine_on(h, w, a.node, 1, 720);
+    for (std::uint32_t k = 0; ok && k < 3; ++k)
+        ok = h[a.node].on_own_share(jobs[k], 710 + k, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    std::vector<pb::ReceiptBodyV3> rs;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) rs.push_back(r->body);
+    ok = ok && rs.size() == 3 && h[b.node].pending().size() == 0;
+    if (!ok) {
+        check(false, "relayp15rx: setup");
+        return;
+    }
+    h.now += 1000;  // B's bucket full
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = 1;  // A at B
+    const double full = rb.peer_valid_left(pa);
+    h.throw_pow.insert(pb::receipt_id(rs[1]));
+    rb.receive(pa, *pb::encode_fb_receipts(0, rs, pb::kRuledLaneParams));
+    w.run();
+    const double after_first = rb.peer_valid_left(pa);
+    const bool r0 = h[b.node].pending().holds(pb::receipt_id(rs[0])), r1 = h[b.node].pending().holds(pb::receipt_id(rs[1])),
+               r2 = h[b.node].pending().holds(pb::receipt_id(rs[2]));
+    const std::uint64_t fails = rb.stats().rx_failures.load();
+    const double bucket_t0 = h.now;
+    // the re-run (no refill: the clock of the bucket is the harness's, moved below by less than a token)
+    for (int i = 0; i < 6 && h[b.node].pending().size() < 3; ++i) {
+        h.now += 1;
+        rb.tick();
+        w.run();
+    }
+    const double after_rerun = rb.peer_valid_left(pa);
+    // the bucket refills at (1 + R_MAX) / T = 1.7 per second, capped at the capacity
+    const double refill = std::min(10.0 - after_first, (h.now - bucket_t0) * 1.7);
+    std::printf("  relayp15rx: full=%.2f after_first=%.2f after_rerun=%.2f refill=%.2f held=%zu rx_failures=%llu\n", full,
+                after_first, after_rerun, refill, h[b.node].pending().size(), static_cast<unsigned long long>(fails));
+    check(fails >= 1 && r0 && !r1 && r2 && full - after_first == 2.0,
+          "relayp15rx: RandomX failed on the second body; the first and the third admitted and counted at once (" +
+                  std::to_string(full - after_first) + ")");
+    check(h[b.node].pending().size() == 3 && std::abs(after_first + refill - 1.0 - after_rerun) < 1e-6
+                  && rb.strikes_of(pa) == 0 && rb.stats().bans == 0,
+          "relayp15rx: the re-run admits the second and counts it once; no strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
 // A-1: the events of a peer that run after its link went down (one in flight, one its reader posted while blocked
 // behind it) are skipped: the node opens nothing for the gone peer (no join hold from its FC_GETHEADERS).
 void relaystale() {
@@ -4218,6 +4283,7 @@ int main(int argc, char** argv) {
     run("relayq", relayq);
     run("relayindex", relayindex);
     run("relayp15", relayp15);
+    run("relayp15rx", relayp15rx);
     run("relaystale", relaystale);
     run("relaytip", relaytip);
     run("relaysq", relaysq);

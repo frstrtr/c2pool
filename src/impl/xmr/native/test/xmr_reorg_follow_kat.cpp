@@ -58,6 +58,9 @@
 //   G  ALT ROWS ACROSS A RESTART -- an alt row's RowWeights are saved, loaded
 //                   by the restarted node, kept while it does not hold the
 //                   block, used when it holds it again; dropped below k_alt.
+//   H  RESUME REORG -- a young chain's snapshot replays the blocks above its
+//                   base: the resumed index adopts a heavier branch forking
+//                   below its resume point.
 //   D  BOUNDS    -- the relaxation buys no new powers. Deeper than
 //                   max_reorg_depth is refused and journaled; equal work
 //                   against our own block is KEPT (D-14) and the rival is held
@@ -928,12 +931,19 @@ static void test_alt_rows_restart() {
         m9 = r9.id;
         std::string why;
         checkf(r9.outcome == OfferOutcome::Connected && rows.weights(m9).has_value(), "altrestart: the main block at 9 recorded");
+        // and on to 80, so the native snapshot's base (64 below the tip) lies above P's fork point
+        Hash prev = m9;
+        for (std::uint64_t h = 10; h <= 80; ++h) {
+            const OfferResult rh = f.idx->offer_block(nullptr, Rig::block_for(prev, h, agc_at(*f.idx, h - 1), 0, 0), true);
+            checkf(rh.outcome == OfferOutcome::Connected, "altrestart: main block %llu", static_cast<unsigned long long>(h));
+            prev = rh.id;
+        }
         checkf(w_before.has_value() && rows.save(why), "altrestart: P weighted and the table saved (%s)", why.c_str());
         checkf(f.idx->save_snapshot(snap, why), "altrestart: the native snapshot saved (%s)", why.c_str());
     }
     {
-        // the restart from the native snapshot (a chain this short: taken at the tip, no rollback below it): P comes
-        // back (a join's FB_GETCTX) and is held, its RowWeights cannot be computed again; they are the saved ones
+        // the restart from the native snapshot (its base 64 below the tip at 80, above P's fork at 7): P comes back
+        // (a join's FB_GETCTX) and is held, its RowWeights cannot be computed again; they are the saved ones
         ModelVerifier mv;
         LightVerifierPowSource<ModelVerifier> src{mv};
         ChainIndex restored(sopts, src);
@@ -1010,6 +1020,36 @@ static void test_alt_rows_restart() {
     fs::remove_all(dir);
 }
 
+// H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 20 is snapshotted and a fresh
+// index loads it; a heavier branch forking at 18 (two blocks below the resume point) is adopted -- the snapshot took
+// its base snapshot_depth (64) below the tip, or at genesis on a chain younger than that, and replayed the rest.
+static void test_resume_reorg_below() {
+    std::vector<std::uint8_t> snap;
+    ChainIndexOptions sopts;
+    std::vector<Hash> ids;
+    std::vector<BlockEntry> branch;
+    {
+        Rig f(20);
+        sopts = f.opts;
+        ids = f.main_ids;
+        std::string why;
+        checkf(f.idx->save_snapshot(snap, why), "resumereorg: the snapshot saved (%s)", why.c_str());
+        branch = build_branch(*f.idx, f.main_ids[17], 18, 3, /*salt_base=*/61);
+    }
+    ModelVerifier mv;
+    LightVerifierPowSource<ModelVerifier> src{mv};
+    ChainIndex restored(sopts, src);
+    std::string why;
+    checkf(restored.load_snapshot(snap, why) && restored.tip() && restored.tip()->id == ids[19],
+           "resumereorg: the snapshot loads at 20 (%s)", why.c_str());
+    OfferOutcome last = OfferOutcome::Rejected;
+    for (const BlockEntry& e : branch) last = restored.offer_block(nullptr, e, /*own_mined=*/false).outcome;
+    checkf(last == OfferOutcome::Reorged && restored.tip() && restored.tip()->height == 21
+                   && restored.tip()->id == id_of(branch.back()),
+           "resumereorg: a branch forking 2 below the resume point is adopted (last offer %s, tip %llu)",
+           to_string(last), static_cast<unsigned long long>(restored.tip() ? restored.tip()->height : 0));
+}
+
 int main() {
     test_young_window();
     test_follow_after_race_loss();
@@ -1020,6 +1060,7 @@ int main() {
     test_alt_rows();
     test_alt_rows_out_of_order();
     test_alt_rows_restart();
+    test_resume_reorg_below();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

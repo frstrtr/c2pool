@@ -27,11 +27,10 @@
 #             the receipt carried; all nodes on one best tip
 #   restart   C's store corrupted while A and B run (they hold the side
 #             headers they saw; a restarted server serves only the closure
-#             walks of the side branches it has seen since its restart, P-51),
-#             C's Monero view from genesis (its native snapshot removed):
+#             walks of the side branches it has seen since its restart, P-51):
 #             load failure (an unreadable store moved aside) -> the joiner
 #             path -> C on the peers' best tip; then A, B, C stopped and
-#             started twice, their Monero views from genesis: byte-equal
+#             started twice, each resuming its native snapshot: byte-equal
 #             digests
 #   fo        D: start line, no listener, no pathb_db, a follow line per
 #             monerod block with monerod's id, TOTAL=0; fee-diverse
@@ -822,16 +821,6 @@ class Rig:
             rc = self.nodes[n].stop(signal.SIGINT, 90)
             self.res.note("restart", "stop %s rc=%s" % (n, rc))
 
-    def drop_native_snapshot(self, n):
-        # the node's Monero view starts from genesis: a native snapshot resume has no rollback below its resume
-        # point (snapshot depth 0 on a chain this short) and no ring resolution; the restart part checks the Path B
-        # store (the native resume is the fo and solo parts')
-        for f in ("chain.snap", "chain.snap.outset"):
-            fp = os.path.join(self.work, "node" + n, f)
-            if os.path.exists(fp):
-                os.remove(fp)
-                self.res.note("restart", "%s: removed %s" % (n, fp))
-
     def digests_now(self, names, settle_s=8):
         def ready():
             out = {}
@@ -849,7 +838,6 @@ class Rig:
         # load failure first: C's store corrupted while A and B keep running (their side headers held in memory).
         # C is stopped and started once (the store's log goes into a table file), then stopped and corrupted.
         self.stop_pool("C")
-        self.drop_native_snapshot("C")
         self.start_pool_node("C", False)
         self.stop_pool("C")
         dbs = [os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(self.work, "nodeC", "regtest", "pathb_db"))
@@ -867,7 +855,6 @@ class Rig:
             f.seek(sz // 2)
             f.write(blk)
         self.res.note("restart", "C: corrupted 64 bytes at offset %d of %s (%d bytes)" % (sz // 2, victim, sz))
-        self.drop_native_snapshot("C")
         try:
             p = self.start_pool_node("C", False)
         except Fail as e:
@@ -908,7 +895,6 @@ class Rig:
             rounds = []
             for r in (1, 2):
                 for n in "ABC":
-                    self.drop_native_snapshot(n)  # the Path B stores are what these restarts check
                     self.start_pool_node(n, False)
                 wait_for(lambda: all(self.relay_ready(n) >= 2 for n in "ABC"), 180, "relay links after restart %d" % r)
                 loaded = {}

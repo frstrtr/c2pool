@@ -33,6 +33,10 @@
 //                     connect, and a reorg that unwinds BELOW the resume point
 //                     restores the roots bit-exact (the undo frames were
 //                     re-derived, not dropped).
+//   D  NO SNAPSHOT -- a set with no anchor snapshot (a genesis boot) saves the
+//                     overlay of everything since its boot; a fresh unseeded set
+//                     loads it, keeps ring resolution, follows the chain and a
+//                     reorg below the resume point; corrupt or foreign: refused.
 //   C  FAIL-CLOSED -- a truncated overlay, a flipped byte, a recorded tip that
 //                     does not match the replay, a tampered output row (digest
 //                     re-signed, so only the replay's roots can catch it), an
@@ -280,6 +284,67 @@ static std::size_t compare_sets(const ChainOutputSet& a, const ChainOutputSet& b
 // ---------------------------------------------------------------------------
 // The KAT.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// PART D -- NO ANCHOR SNAPSHOT (every other boot: genesis, or an anchor without --native-output-set). The overlay
+// sits on the empty set the boot started from. A set built from its boot is saved; a fresh unseeded set loads it and
+// answers every question the same, keeps ring resolution, follows the chain on, and a reorg below the resume point
+// restores the roots bit-exact; a flipped byte or an overlay on another numbering base is refused, leaving the set
+// empty (the node then resumes the image alone, ring resolution off).
+// ---------------------------------------------------------------------------
+static void part_unseeded(std::mt19937_64& r) {
+    const std::uint64_t H = 60;
+    ChainOutputSet live(0);
+    std::vector<Hash> kis;
+    for (std::uint64_t h = 1; h <= H; ++h) {
+        std::vector<OutputRecord> outs(1 + r() % 12);
+        for (auto& o : outs) {
+            o.pubkey = rnd_hash(r); o.commitment = rnd_hash(r);
+            o.unlock_time = 0; o.height = h;
+        }
+        std::vector<Hash> k(h > 3 ? 1 + r() % 6 : 0);
+        for (auto& x : k) x = rnd_hash(r);
+        std::vector<std::pair<std::uint64_t, Hash>> cb = {{600000000000ULL + h, rnd_hash(r)}};
+        checkf(live.on_block_connected(block(h, live.frontier(), id_of(h), std::move(outs), k, std::move(cb))),
+               "PART D fixture: connect %llu", (unsigned long long)h);
+        kis.insert(kis.end(), k.begin(), k.end());
+    }
+    std::vector<std::uint8_t> ovl;
+    std::string why;
+    const bool saved = ovl_save(live, ovl, why);
+    checkf(saved, "PART D: an unseeded set (a genesis boot) saves its overlay: %s", why.c_str());
+    ChainOutputSet back(0);
+    const bool loaded = saved && ovl_load(back, ovl, why);
+    checkf(loaded, "PART D: a fresh unseeded set loads it: %s", why.c_str());
+    if (!loaded) return;
+    checkf(back.resolution_enabled() && tip_h(back) == H && tip_i(back) == tip_i(live) && ovl_blocks(back) == H,
+           "PART D: resumed at the saved tip with ring resolution on and every block's undo frame");
+    std::mt19937_64 rr(0xd0d0'0000'0000'0004ULL);
+    checkf(compare_sets(live, back, kis, rr, 20000, "PART D resumed") == 0, "PART D: the resumed set equals the saved one");
+    // it follows the chain: two more blocks, then a reorg of three (below the resume point)
+    for (std::uint64_t h = H + 1; h <= H + 2; ++h)
+        for (ChainOutputSet* s : {&live, &back}) {
+            std::vector<OutputRecord> outs(2);
+            for (std::size_t i = 0; i < outs.size(); ++i) { outs[i].pubkey = id_of(h * 10 + i); outs[i].commitment = id_of(h * 10 + i, 7); outs[i].height = h; }
+            checkf(s->on_block_connected(block(h, s->frontier(), id_of(h), outs, {})), "PART D: block %llu connects", (unsigned long long)h);
+        }
+    for (ChainOutputSet* s : {&live, &back})
+        for (std::uint64_t h = H + 2; h >= H - 0; --h) checkf(s->on_block_disconnected(disc(h)), "PART D: disconnect %llu", (unsigned long long)h);
+    checkf(tip_h(back) == H - 1 && back.output_root() == live.output_root() && back.spent_root() == live.spent_root()
+                   && back.set_digest() == live.set_digest(),
+           "PART D: a reorg below the resume point restores the roots bit-exact");
+    // fail-closed
+    {
+        std::vector<std::uint8_t> bad = ovl;
+        bad[bad.size() / 2] ^= 0x01;
+        ChainOutputSet s(0);
+        std::string w;
+        checkf(!ovl_load(s, bad, w) && s.output_count() == 0 && tip_h(s) == 0, "PART D: a flipped byte is refused, the set left empty");
+        ChainOutputSet other(5);
+        checkf(!ovl_load(other, ovl, w) && other.output_count() == 0, "PART D: an overlay on another numbering base is refused");
+    }
+}
+
 static int run_kat() {
     std::mt19937_64 r(0x0e71'a7ee'0000'0001ULL);
     const std::uint64_t BASE = 1000, H = 400;
@@ -474,6 +539,8 @@ static int run_kat() {
         checkf(ok && s.set_digest() == bare.set_digest() && s.spent_count() == bare.spent_count(),
                "PART C: drop_overlay() returns to the bare anchor snapshot");
     }
+
+    part_unseeded(r);
 
     std::remove(path.c_str());
     std::remove(path2.c_str());

@@ -45,6 +45,10 @@
 //   bwkeep     two joined nodes on one chain with different
 //              --pathb-body-keep, pruned and restarted: the same profile and
 //              the same verdict;
+//   youngr     a young joined node and its restart (a plain full node): the
+//              same carrier, corrupted carrier and HELLO give the same
+//              verdicts, tokens and bans; the session's candidate attempt
+//              ends with 0 tokens, the restart makes none;
 //   bwyoung    a young joined node pruned and restarted: its session's
 //              profile, from position 1;
 //   bwrr       a joined node restarted, pruned, restarted again: the same
@@ -71,6 +75,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <tuple>
 #include <cstdio>
 #include <deque>
 #include <functional>
@@ -1514,6 +1519,80 @@ void bwyoung() {
 }
 
 // ---------------------------------------------------------------------------
+// youngr: a young chain joined in full (its store: root 0, no K_BLO) and the same store restarted (a plain full node).
+// The same events reach both: a carrier extending the chain, a corrupted carrier, a HELLO of a peer whose tip neither
+// holds (the session queues it as a candidate; the restarted node, not pruned and not after a load failure, does not)
+// and the session's attempt on it. Every verdict, token and ban is the same: the attempt ends OutOfScope at its first
+// reply with 0 tokens, which is what the restarted node's no-attempt amounts to.
+void youngr() {
+    JoinNet net(900);
+    KatNode a(net, kJ);
+    grow(a, 600);
+    Harness h(net);
+    const std::size_t s = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s));
+    Joining jn = joining_node(h, net, kJ);
+    const std::size_t j = jn.j;
+    h.hello(j, s);
+    const pb::JoinStep st = h[j].run_join();
+    if (!st.switched || h[j].joined() == nullptr || !h[j].joined()->young) {
+        check(false, "youngr: the young chain joined in full");
+        return;
+    }
+    MemoryKv& kv = *h.kvs.back();
+    pb::StoreFault f = pb::StoreFault::None;
+    const std::size_t r = restarted(h, net, kv, nullptr, f);
+    if (r == SIZE_MAX) {
+        check(false, "youngr: the young store reloads");
+        return;
+    }
+    KatTransport tr2(h, r);
+    h[r].set_join_transport(&tr2);
+    grow(a, 5);
+    const std::size_t s2 = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, s2));
+    struct Seen {
+        std::vector<std::tuple<int, int, std::uint32_t, std::size_t>> results;  // action, verdict, strike, peer tokens
+        int hello = -1;
+        std::size_t queued = 0;
+        std::uint32_t attempt_strike = 0;
+        std::uint32_t link_strikes = 0;
+    };
+    const auto run = [&](std::size_t n) {
+        Seen o;
+        const auto keep = [&o](const pb::NodeEventResult& e) {
+            o.results.emplace_back(static_cast<int>(e.action), static_cast<int>(e.admit.verdict), e.admit.strike,
+                                   e.admit.peer_tokens.size());
+        };
+        h.mon_tip = std::max<std::uint64_t>(h.mon_tip, h_pos(602) + 1);
+        keep(h[n].on_carrier(s2, *pb::encode_fc_carrier(0, *a.bodies.get(at_pos(a, 601)), pb::kRuledLaneParams.r_max)));
+        std::vector<std::uint8_t> bad = *pb::encode_fc_carrier(0, *a.bodies.get(at_pos(a, 602)), pb::kRuledLaneParams.r_max);
+        bad[bad.size() / 2] ^= 0x5a;
+        keep(h[n].on_carrier(s2, bad));
+        h.q.clear();
+        o.hello = static_cast<int>(h.hello(n, s2).verdict);
+        o.queued = h[n].joiner().queue().size();
+        if (o.queued > 0) {
+            const pb::JoinStep js = h[n].run_join();
+            o.attempt_strike = js.report ? js.report->strike : 0;
+            if (h[n].join_link(s2)) o.link_strikes = h[n].join_link(s2)->strikes();
+        }
+        h.q.clear();
+        return o;
+    };
+    const Seen sj = run(j);
+    const Seen sr = run(r);
+    std::printf("  youngr: session queued %zu attempt strike %u link strikes %u; restarted queued %zu\n", sj.queued,
+                sj.attempt_strike, sj.link_strikes, sr.queued);
+    check(sj.results == sr.results && sj.hello == sr.hello && sj.results.size() == 2,
+          "youngr: the carrier and the corrupted carrier: the same action, verdict, strike and tokens in the session and "
+          "after the restart; the HELLO the same verdict");
+    check(sj.queued == 1 && sr.queued == 0 && sj.attempt_strike == 0 && sj.link_strikes == 0,
+          "youngr: the peer's unheld tip: a candidate in the session (its attempt: 0 tokens), none after the restart -- "
+          "no verdict, token or ban differs");
+}
+
+// ---------------------------------------------------------------------------
 // bwrr: a joined node restarted, then following its chain and pruning as a restarted node (K_BWORK from x1 + 1),
 // restarted again: the same profile both times.
 void bwrr() {
@@ -1977,6 +2056,7 @@ int main(int argc, char** argv) {
     run("bwjoin", bwjoin);
     run("bwkeep", bwkeep);
     run("bwyoung", bwyoung);
+    run("youngr", youngr);
     run("bwrr", bwrr);
     run("reaskr", reaskr);
     run("adoptbelowr", adoptbelowr);
