@@ -52,6 +52,9 @@
 //                   own branch; the Path B follower rows then resolve it (held
 //                   and weighted), and the weights equal those reported when
 //                   the block connects after a reorg.
+//   F  ALT ROWS OUT OF ORDER -- an alternative branch handed child first:
+//                   the child, resolved when its parent lands, is reported
+//                   the same way.
 //   D  BOUNDS    -- the relaxation buys no new powers. Deeper than
 //                   max_reorg_depth is refused and journaled; equal work
 //                   against our own block is KEPT (D-14) and the rival is held
@@ -846,6 +849,46 @@ static void test_alt_rows() {
     checkf(pw && pw2 && *pw == *pw2, "altrows: the follower rows' weights of P changed when P connected");
 }
 
+// F. ALT ROWS OUT OF ORDER: a two-block alternative branch handed child first (parked, its parent unknown), then the
+// parent: the child resolves with it and is reported to the row sinks on its own branch; the follower rows resolve
+// both (block + weights).
+static void test_alt_rows_out_of_order() {
+    Rig f(8);
+    ChainIndex& idx = *f.idx;
+    std::vector<RowSeen> seen;
+    c2pool::xmr::pathb::PathbFollowerRows rows("/nonexistent/row_weights");
+    rows.bind(&idx);
+    idx.subscribe_rows([&seen, &idx](const ConsensusState& st, const ChainRow& row, bool) {
+        RowSeen r;
+        r.id = row.id;
+        r.height = row.height;
+        r.main = &st == &idx.view().state();
+        seen.push_back(r);
+    });
+    idx.subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+
+    const Hash our_tip = f.main_ids[7];
+    std::vector<BlockEntry> rival = build_branch(idx, f.main_ids[4], 5, 2, /*salt_base=*/41);
+    const Hash c0 = id_of(rival[0]), c1 = id_of(rival[1]);
+    const OfferResult o1 = idx.offer_block(&f.them, rival[1], /*own_mined=*/false);
+    checkf(o1.outcome == OfferOutcome::ParkedOrphan, "altooo: the child first became %s (%s), expected ParkedOrphan",
+           to_string(o1.outcome), o1.why.c_str());
+    seen.clear();
+    const OfferResult o0 = idx.offer_block(&f.them, rival[0], /*own_mined=*/false);
+    checkf(o0.outcome == OfferOutcome::StoredAsAlt && f.tip_id() == our_tip,
+           "altooo: the parent became %s (%s), expected StoredAsAlt", to_string(o0.outcome), o0.why.c_str());
+    bool child_seen = false;
+    for (const RowSeen& r : seen)
+        if (r.id == c1 && !r.main && r.height == 7) child_seen = true;
+    checkf(child_seen, "altooo: the resolved child at height 7 was not reported to the row sinks on its own branch");
+    const std::optional<c2pool::xmr::pathb::RowWeights> w0 = rows.weights(c0);
+    const std::optional<c2pool::xmr::pathb::RowWeights> w1 = rows.weights(c1);
+    const std::optional<c2pool::xmr::pathb::BranchBlock> b1 = rows.block(c1);
+    checkf(w0 && w1 && b1 && b1->height == 7,
+           "altooo: the follower rows do not resolve the branch (parent weights %d, child weights %d, child block %d)",
+           w0 ? 1 : 0, w1 ? 1 : 0, b1 ? 1 : 0);
+}
+
 int main() {
     test_young_window();
     test_follow_after_race_loss();
@@ -854,6 +897,7 @@ int main() {
     test_branch_and_apply_agree();
     test_checkpoint_above_tip();
     test_alt_rows();
+    test_alt_rows_out_of_order();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

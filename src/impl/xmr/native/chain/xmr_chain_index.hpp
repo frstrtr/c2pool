@@ -1540,6 +1540,7 @@ private:
                 // happened to arrive on it. maybe_switch_locked_() is a no-op
                 // when nothing outweighs the tip, so the cost is one comparison.
                 const bool switched = maybe_switch_locked_();
+                flush_alt_rows_locked_();
                 r.outcome = switched && !rows_.contains(r.id) ? OfferOutcome::StoredAsAlt
                                                               : OfferOutcome::Connected;
                 return r;
@@ -1601,6 +1602,7 @@ private:
             r.why = "kept as an alternative branch";
             notify_alt_rows_locked_(r.id);   // its state on its own branch, for the row sinks
         }
+        flush_alt_rows_locked_();            // and the parked descendants it resolved
         return r;
     }
 
@@ -1752,6 +1754,16 @@ private:
                               });
     }
 
+    // The parked blocks resolve_descendants_locked_() resolved (adoptable, bodies
+    // held): those still held as alternatives are reported as above; those the
+    // fork choice connected were reported by the connect.
+    void flush_alt_rows_locked_() {
+        std::vector<Hash> ids;
+        ids.swap(alt_resolved_);
+        for (const Hash& id : ids)
+            if (!rows_.contains(id) && alt_.find(id) != nullptr) notify_alt_rows_locked_(id);
+    }
+
     // An alt block's timestamp: parsed from its own blob. Kept out of AltBlock
     // as a separate step so the pool stays a pool of bytes plus work, and the
     // parse happens once here rather than at every insert.
@@ -1828,7 +1840,9 @@ private:
                 // h=3768570, fluffy_req=0 for the whole stall).
                 c.bodies_missing = !ev.input.bodies_complete;
 
+                const bool reportable = c.adoptable && !c.bodies_missing;
                 alt_.insert(std::move(c));
+                if (reportable && !row_sinks_.empty()) alt_resolved_.push_back(child_id);
                 stack.push_back(child_id);
             }
         }
@@ -2422,6 +2436,7 @@ private:
         if (const RowRecord* t = rows_.tip()) resolve_descendants_locked_(t->row.id);
         connect_parked_children_locked_();
         (void)maybe_switch_locked_();
+        flush_alt_rows_locked_();
         update_synced_locked_();
         return n > 0;
     }
@@ -3442,6 +3457,7 @@ private:
     std::vector<node::MainchainEvent> queued_events_;
     std::vector<BlockTxEvent>         queued_tx_events_;
     std::vector<RowSink>              row_sinks_;
+    std::vector<Hash>                 alt_resolved_;   // parked blocks resolved since the last flush_alt_rows_locked_
     std::vector<EventSink>            sinks_;
     std::vector<TxEventSink>          tx_sinks_;
 

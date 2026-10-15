@@ -31,10 +31,12 @@
 #             load failure -> the joiner path -> C on the peers' best tip; then
 #             A, B, C stopped and started twice: byte-equal digests
 #   fo        D: start line, no listener, no pathb_db, a follow line per
-#             monerod block with monerod's id, TOTAL=0, kill -9 + restart
-#             with fee-diverse transactions in monerod's pool: the first
-#             record after the restart has n_tx >= 1; the stub on the
-#             default regtest monerod RPC / ZMQ ports sees 0 connections
+#             monerod block with monerod's id, TOTAL=0; fee-diverse
+#             transactions in monerod's pool, D holding a broadcast one,
+#             kill -9 + restart: the first record after the restart has
+#             n_tx >= 1 (an n_tx=0 record on an empty network block decides
+#             nothing: the next one is judged); the stub on the default
+#             regtest monerod RPC / ZMQ ports sees 0 connections
 #   solo      E: no template without --pathb-launch; with it found blocks
 #             landed=own-index paying the tip's window split; nothing
 #             booked; a restart reloads the store
@@ -776,18 +778,26 @@ class Rig:
                 continue
             self.res.note("partition", "%s: %s" % (n, s.group(0)))
 
+            # the two claims are seen separately: the miners keep mining, so the switching node's pending (new
+            # receipts too) and the three tips are rarely both settled at one poll
+            seen = {}
+
             def carried():
                 j = self.web.get(n)
-                if not j:
-                    return None
-                ok = j["pathb"]["pending"] == 0
-                tips = {self.web.get(m)["pathb"]["best_tip"]["id"] for m in "ABC" if self.web.get(m)}
-                return (j, tips) if ok and len(tips) == 1 else None
+                views = {m: self.web.get(m) for m in "ABC"}
+                if j and j["pathb"]["pending"] == 0 and "pending0" not in seen:
+                    seen["pending0"] = j
+                tips = {v["pathb"]["best_tip"]["id"] for v in views.values() if v}
+                if len(tips) == 1 and all(views.values()) and "tip" not in seen:
+                    seen["tip"] = (list(tips)[0], views[n]["pathb"]["leaf_count"])
+                return seen if "pending0" in seen and "tip" in seen else None
             try:
-                j, tips = wait_for(carried, a.heal_s, "the re-pended receipts carried, one best tip", 2)
+                wait_for(carried, a.heal_s, "the re-pended receipts carried, one best tip", 1)
             except Fail as e:
-                self.res.check("partition", False, str(e))
+                self.res.check("partition", False, "%s (seen: %s)" % (e, sorted(seen)))
                 return
+            tips = [seen["tip"][0]]
+            j = {"pathb": {"leaf_count": seen["tip"][1]}}
             s2 = last_status(self.nodes[n].text())
             j1 = JOIN_RE.findall(self.nodes[n].text())
             j1 = int(j1[-1][1]) if j1 else 0
@@ -797,7 +807,7 @@ class Rig:
             self.res.check("partition", int(s.group(14)) < int(s.group(13)),
                            "%s: re-pended %s > lost %s" % (n, s.group(13), s.group(14)))
             self.res.check("partition", True, "%s: pending 0 after the switch (re-pended receipts carried); A, B, C on "
-                           "best tip %s (leaves %s)" % (n, list(tips)[0], j["pathb"]["leaf_count"]))
+                           "one best tip %s (leaves %s)" % (n, tips[0], j["pathb"]["leaf_count"]))
             self.res.note("partition", "%s status after: %s" % (n, s2.group(0) if s2 else "-"))
             return
         self.res.check("partition", False, "no switch with a re-pended receipt in %d partitions" % a.partition_tries)
@@ -823,7 +833,10 @@ class Rig:
         return ready()
 
     def part_restart(self):
-        # load failure first: C's store corrupted while A and B keep running (their side headers held in memory)
+        # load failure first: C's store corrupted while A and B keep running (their side headers held in memory).
+        # C is stopped and started once (the store's log goes into a table file), then stopped and corrupted.
+        self.stop_pool("C")
+        self.start_pool_node("C", False)
         self.stop_pool("C")
         dbs = [os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(self.work, "nodeC", "regtest", "pathb_db"))
                for f in fs if f.endswith(".ldb")]
@@ -868,34 +881,37 @@ class Rig:
             self.res.note("restart", "C join attempts: %d, last %s" % (len(att), att[-1] if att else "-"))
             self.res.check("restart", False, str(e))
         # then A, B, C stopped and started twice: byte-equal digests
-        pre = {}
-        for n in "ABC":
-            j = self.web.get(n)
-            pre[n] = digest_of(j) if j else None
-        self.stop_pool("ABC")
-        self.res.note("restart", "pre-stop digests (last web answer): %s" % pre)
-        rounds = []
-        for r in (1, 2):
+        try:
+            pre = {}
             for n in "ABC":
-                self.start_pool_node(n, False)
-            wait_for(lambda: all(self.relay_ready(n) >= 2 for n in "ABC"), 180, "relay links after restart %d" % r)
-            loaded = {}
-            for n in "ABC":
-                m = re.findall(r"^store: \S+ loaded: best position (\d+)$", self.nodes[n].text(), re.M)
-                loaded[n] = m[-1] if m else None
-            dg = self.digests_now("ABC")
-            rounds.append(dg)
-            self.res.note("restart", "restart %d: store loaded best position %s; digests %s" % (r, loaded, dg))
-            self.res.check("restart", all(loaded[n] is not None for n in "ABC"),
-                           "restart %d: A, B, C loaded their stores (best positions %s)" % (r, loaded))
-            self.res.check("restart", len(set(dg.values())) == 1,
-                           "restart %d: A, B, C byte-equal (pos, id, cum_work, window_root, mmr_root, leaves)" % r)
-            if r == 1:
+                j = self.web.get(n)
+                pre[n] = digest_of(j) if j else None
+            self.stop_pool("ABC")
+            self.res.note("restart", "pre-stop digests (last web answer): %s" % pre)
+            rounds = []
+            for r in (1, 2):
                 for n in "ABC":
-                    if pre[n] is not None:
-                        self.res.note("restart", "%s: pre-stop pos %s, loaded pos %s" % (n, pre[n][0], dg[n][0]))
-                self.stop_pool("ABC")
-        self.res.check("restart", rounds[0] == rounds[1], "restart 1 == restart 2 per node, byte-equal digests")
+                    self.start_pool_node(n, False)
+                wait_for(lambda: all(self.relay_ready(n) >= 2 for n in "ABC"), 180, "relay links after restart %d" % r)
+                loaded = {}
+                for n in "ABC":
+                    m = re.findall(r"^store: \S+ loaded: best position (\d+)$", self.nodes[n].text(), re.M)
+                    loaded[n] = m[-1] if m else None
+                dg = self.digests_now("ABC")
+                rounds.append(dg)
+                self.res.note("restart", "restart %d: store loaded best position %s; digests %s" % (r, loaded, dg))
+                self.res.check("restart", all(loaded[n] is not None for n in "ABC"),
+                               "restart %d: A, B, C loaded their stores (best positions %s)" % (r, loaded))
+                self.res.check("restart", len(set(dg.values())) == 1,
+                               "restart %d: A, B, C byte-equal (pos, id, cum_work, window_root, mmr_root, leaves)" % r)
+                if r == 1:
+                    for n in "ABC":
+                        if pre[n] is not None:
+                            self.res.note("restart", "%s: pre-stop pos %s, loaded pos %s" % (n, pre[n][0], dg[n][0]))
+                    self.stop_pool("ABC")
+            self.res.check("restart", rounds[0] == rounds[1], "restart 1 == restart 2 per node, byte-equal digests")
+        except Fail as e:
+            self.res.check("restart", False, str(e))
 
     # ---- part fo ----
     def fo_argv(self):
@@ -939,9 +955,8 @@ class Rig:
     def fo_restart(self):
         a = self.a
         p = self.nodes["D"]
-        p.kill9()
-        self.res.note("fo", "kill -9 D (pid %d)" % p.pid)
-        # fee-diverse transactions in monerod's pool
+        # fee-diverse transactions in monerod's pool; D runs until it holds one of them: the network has broadcast it
+        # (monerod's complement answer carries broadcast transactions only, not its local or stem ones)
         self.wallet("close_wallet")
         self.wallet("open_wallet", {"filename": "wfund"})
         self.wallet("refresh")
@@ -958,47 +973,77 @@ class Rig:
         self.res.note("fo", "sent %s; monerod pool %d txs, fee/weight rates %s" % (sent, len(pool), rates))
         self.res.check("fo", len(pool) >= 2 and len(rates) >= 2,
                        "monerod's pool holds %d fee-diverse transactions (rates %s)" % (len(pool), rates))
+
+        def d_pool():
+            c = re.findall(r"^  txpool: .*\| count=(\d+)", p.text(), re.M)
+            return int(c[-1]) if c and int(c[-1]) >= 1 else None
+        try:
+            n = wait_for(d_pool, a.fo_bcast_s, "D holds a broadcast transaction before the kill", 2)
+            self.res.note("fo", "D's pool before the kill: %d transactions" % n)
+        except Fail as e:
+            self.res.check("fo", False, str(e))
+            return
+        p.kill9()
+        self.res.note("fo", "kill -9 D (pid %d)" % p.pid)
         argv, d = self.fo_argv()
         q = self.start("D", argv, cwd=d)
         self.nodes["D"] = q
 
-        def first_record():
+        def records():
+            out = []
             for line in q.text().splitlines():
                 m = TEMPLATE_RE.match(line)
                 if m and not m.group(2).startswith("none"):
-                    return line
-            return None
+                    out.append(line)
+            return out
         try:
-            line = wait_for(first_record, a.fo_restart_s, "D's first record after the restart", 1)
+            wait_for(lambda: records() or None, a.fo_restart_s, "D's first record after the restart", 1)
         except Fail as e:
             self.res.check("fo", False, str(e))
             return
         nones = [l for l in q.text().splitlines() if TEMPLATE_RE.match(l) and " none " in l + " "]
-        n_tx = int(re.search(r"n_tx=(\d+)", line).group(1))
-        h_rec = int(re.search(r"template h=(\d+)", line).group(1))
         self.res.note("fo", "after the restart: none lines before the first record: %s" % nones[:5])
-        if n_tx >= 1:
-            self.res.check("fo", True, "the first record after kill -9 + restart: %s" % line)
-        else:
-            # S4wD 5.9's judge: n_tx=0 fails when the network's block at its height carries a transaction. The rig
-            # mines that block on M1 and reads D's compare line for it.
+        rs = [l for l in q.text().splitlines() if "snapshot" in l and ("RESUMED" in l or "no resume" in l)]
+        self.res.note("fo", "restart: %s" % (rs[0].strip() if rs else "-"))
+        # 5.9's judge: the first record per height from the first one after the restart; n_tx=0 fails when the
+        # network's block at its height carries a transaction; an empty network block decides nothing, the next
+        # record is judged. The rig mines the network's blocks on M1 and reads D's compare lines.
+        judged = set()
+        for step in range(3):
+            first = {}
+            for line in records():
+                h = int(re.search(r"template h=(\d+)", line).group(1))
+                first.setdefault(h, line)
+            hs = sorted(h for h in first if h not in judged)
+            if not hs:
+                self.res.check("fo", False, "no record to judge after %d empty network blocks" % step)
+                return
+            h, line = hs[0], first[hs[0]]
+            judged.add(h)
+            if int(re.search(r"n_tx=(\d+)", line).group(1)) >= 1:
+                self.res.check("fo", True, "the first record after kill -9 + restart%s: %s" %
+                               (" (after %d empty network blocks)" % step if step else "", line))
+                return
             try:
                 rpc(self.m1(), "generateblocks", {"amount_of_blocks": 1, "wallet_address": self.addr["fund"]})
             except Fail as e:
                 self.res.check("fo", False, "generateblocks for the judge: %s" % e)
                 return
-            pat = re.compile(r"^\[follow-only\] compare h=%d net_id=\S+ net_n_tx=(\d+) .* our_n_tx=(\d+) " % h_rec, re.M)
+            pat = re.compile(r"^\[follow-only\] compare h=%d net_id=\S+ net_n_tx=(\d+) " % h, re.M)
             try:
-                m = wait_for(lambda: pat.search(q.text()), 120, "D's compare line at h=%d" % h_rec, 1)
+                m = wait_for(lambda: pat.search(q.text()), 120, "D's compare line at h=%d" % h, 1)
             except Fail as e:
-                self.res.check("fo", False, "the first record after kill -9 + restart has n_tx=0 and %s" % e)
+                self.res.check("fo", False, "a record with n_tx=0 at h=%d and %s" % (h, e))
                 return
-            self.res.check("fo", int(m.group(1)) == 0,
-                           "the first record after kill -9 + restart: n_tx=0, the network's block at h=%d carries %s "
-                           "(5.9: an empty network block decides nothing; one with transactions fails it): %s" %
-                           (h_rec, m.group(1), line))
-        rs = [l for l in q.text().splitlines() if "snapshot" in l and ("RESUMED" in l or "no resume" in l)]
-        self.res.note("fo", "restart: %s" % (rs[0].strip() if rs else "-"))
+            if int(m.group(1)) >= 1:
+                ref = len(http_json("http://127.0.0.1:%d/get_transaction_pool" % self.m1(), {}).get("transactions", []))
+                self.res.check("fo", False, "the first record after kill -9 + restart has n_tx=0 and the network's "
+                               "block at h=%d carries %s (the reference pool now %d): %s" % (h, m.group(1), ref, line))
+                return
+            self.res.note("fo", "h=%d: n_tx=0 and an empty network block: the next record is judged" % h)
+            wait_for(lambda: any(int(re.search(r"template h=(\d+)", l).group(1)) > h for l in records()) or None,
+                     60, "D's next record", 1)
+        self.res.check("fo", False, "three records with n_tx=0, each on an empty network block")
 
     def part_fo_final(self):
         p = self.nodes["D"]
@@ -1180,18 +1225,19 @@ class Rig:
         self.res.check("hold", bool(sus) and "hold" in sus[-1], "K: lane SUSPEND with cause hold (%s)" % (sus[-1:],))
 
         def counts():
-            st = re.findall(r"templates=(\d+)", p.text())
-            jb = re.findall(r"  stratum: .* jobs=(\d+)", p.text())
-            return (st[-1] if st else None, jb[-1] if jb else None)
+            jb = re.findall(r"^  stratum: .* jobs=(\d+) ", p.text(), re.M)
+            mj = re.findall(r"^  \S.* jobs=(\d+) hits=(\d+) blocks=(\d+)$", p.text(), re.M)
+            return (jb[-1] if jb else None, mj[-1] if mj else None)
         time.sleep(10)
         c1 = counts()
         time.sleep(30)
         c2 = counts()
         self.res.check("hold", c1 == c2 and c1[0] is not None,
-                       "K: the template and job counters stop under HOLD (%s -> %s)" % (c1, c2))
+                       "K: the job counters (stratum, miner) stop under HOLD (%s -> %s)" % (c1, c2))
         rl = last_relay(p.text())
-        self.res.check("hold", rl is not None and "strikes=0 " in rl.group(0) and "bans=0" in rl.group(0),
-                       "K: no strike, no ban (%s)" % (rl.group(0)[:120] if rl else "no relay line"))
+        bans = [l for l in p.text().splitlines() if "BANNED" in l or " strike " in l]
+        self.res.check("hold", (rl is None or (int(rl.group(9)) == 0 and int(rl.group(10)) == 0)) and not bans,
+                       "K: no strike, no ban (%s; %d lines)" % (rl.group(0)[:120] if rl else "no relay line", len(bans)))
         p.stop()
         self.no_booking("hold", ["K"])
 
@@ -1246,6 +1292,7 @@ def main():
     ap.add_argument("--heal-s", type=int, default=180)
     ap.add_argument("--join-s", type=int, default=300)
     ap.add_argument("--fo-restart-s", type=int, default=120)
+    ap.add_argument("--fo-bcast-s", type=int, default=300)
     ap.add_argument("--solo-nolaunch-s", type=int, default=30)
     ap.add_argument("--solo-s", type=int, default=300)
     ap.add_argument("--hold-s", type=int, default=600)
