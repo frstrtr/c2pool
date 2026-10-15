@@ -10,6 +10,8 @@
 //   * the fblk v3 + v4 / mblk v2 tails are pure appends, and an unknown value stays
 //     unknown (empty / nullopt), never "" or 0 — a known tx_count of 0 and an
 //     unknown one stay distinct, even across a truncated tail;
+//   * a short read consumes the rest of the record, so a cut field never leaks
+//     into the next one; a cut inside the v1 body drops the row;
 //   * a DOGE row's parent_hash / parent_height (fblk v4) survive a restart,
 //     and a v3 record (no parent tail) restores with the parent unknown;
 //   * update_coinbase reaches the newest DOGE record past 1000 stored ones
@@ -29,6 +31,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -196,15 +199,78 @@ TEST(FoundBlockStoreKat, TruncatedTailLeavesTxCountUnknown)
     FoundBlockRecord f = FoundBlockRecord::deserialize(fblk_v2_record().v);
     f.tx_count = 7;
     auto fb = f.serialize();
-    // Cut into the tx_count u32, past the empty v4 parent tail (len + flag + u64).
+    // Cuts the v3 tail: drops the empty v4 parent tail (len + flag + u64) and
+    // the last 2 bytes of the tx_count u32.
     fb.resize(fb.size() - (1 + 1 + 8) - 2);
-    EXPECT_FALSE(FoundBlockRecord::deserialize(fb).tx_count.has_value());
+    auto back = FoundBlockRecord::deserialize(fb);
+    EXPECT_EQ(back.block_hash, kHashA);
+    EXPECT_FALSE(back.tx_count.has_value());
+    EXPECT_TRUE(back.parent_hash.empty());
+    EXPECT_FALSE(back.parent_height.has_value());
 
     MergedBlockRecord m = MergedBlockRecord::deserialize(mblk_v1_record(98, 1, kHashA).v);
     m.tx_count = 7;
     auto mb = m.serialize();
     mb.resize(mb.size() - 2);
     EXPECT_FALSE(MergedBlockRecord::deserialize(mb).tx_count.has_value());
+}
+
+TEST(FoundBlockStoreKat, CutTxCountDoesNotLeakIntoTheParentTail)
+{
+    // A short read used to leave pos in place, so the kept tx_count bytes were
+    // read again as the v4 parent_hash length + body. tx_count=1 is common on
+    // DASH: keeping 2 of its 4 bytes gave parent_hash = "\x00".
+    FoundBlockRecord f = FoundBlockRecord::deserialize(fblk_v2_record().v);
+    for (auto [tx_count, kept] : {std::pair<uint32_t, size_t>{1, 2}, {1, 3}, {258, 3}}) {
+        f.tx_count = tx_count;
+        auto fb = f.serialize();
+        fb.resize(fb.size() - (1 + 1 + 8) - (4 - kept));
+        auto back = FoundBlockRecord::deserialize(fb);
+        EXPECT_EQ(back.block_hash, kHashA) << tx_count << "/" << kept;
+        EXPECT_FALSE(back.tx_count.has_value()) << tx_count << "/" << kept;
+        EXPECT_TRUE(back.parent_hash.empty()) << tx_count << "/" << kept;
+        EXPECT_FALSE(back.parent_height.has_value()) << tx_count << "/" << kept;
+    }
+}
+
+TEST(FoundBlockStoreKat, CutV1BodyDropsTheRow)
+{
+    // fblk cut inside the v1 timestamp (4 of 8 bytes kept): it used to restore
+    // with ts=0 and the leftover bytes as status/check_count.
+    Bytes v1; v1.u8(1);
+    auto body = fblk_v1_body();
+    v1.v.insert(v1.v.end(), body.v.begin(), body.v.end());
+    auto fcut = v1.v;
+    fcut.resize(1 + (1 + 4) + 8 + (1 + 64) + 4);
+    EXPECT_TRUE(FoundBlockRecord::deserialize(fcut).block_hash.empty());
+
+    // mblk cut inside the v1 parent_height (2 of 4 bytes kept, miner gone).
+    auto mcut = mblk_v1_record(98, 5400000, kHashB).v;
+    mcut.resize(mcut.size() - (1 + 6) - 2);
+    EXPECT_TRUE(MergedBlockRecord::deserialize(mcut).block_hash.empty());
+
+    // load_all skips the damaged rows and keeps the whole ones; update_status
+    // leaves a damaged row's bytes alone.
+    TempDb t("fblk_cut_v1");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore fstore(t.db);
+    MergedBlockStore mstore(t.db);
+    ASSERT_TRUE(t.db.put(fblk_key("DASH", 2531045, kHashA), v1.v));
+    ASSERT_TRUE(t.db.put(fblk_key("DASH", 2531046, kHashB), fcut));
+    ASSERT_TRUE(t.db.put(mblk_key(98, 5400000, kHashA), mblk_v1_record(98, 5400000, kHashA).v));
+    ASSERT_TRUE(t.db.put(mblk_key(98, 5400001, kHashB), mcut));
+
+    auto fall = fstore.load_all();
+    ASSERT_EQ(fall.size(), 1u);
+    EXPECT_EQ(fall[0].block_hash, kHashA);
+    auto mall = mstore.load_all();
+    ASSERT_EQ(mall.size(), 1u);
+    EXPECT_EQ(mall[0].block_hash, kHashA);
+
+    EXPECT_FALSE(fstore.update_status("DASH", 2531046, kHashB, 2, 1, 1));
+    std::vector<uint8_t> still;
+    ASSERT_TRUE(t.db.get(fblk_key("DASH", 2531046, kHashB), still));
+    EXPECT_EQ(still, fcut);
 }
 
 TEST(FoundBlockStoreKat, FblkV3RecordRestoresWithParentUnknown)

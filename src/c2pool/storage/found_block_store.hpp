@@ -128,26 +128,31 @@ struct FoundBlockRecord {
         FoundBlockRecord rec;
         if (data.size() < 4) return rec;
 
+        // A short read consumes the rest of the buffer and sets overrun, so the
+        // leftover bytes of a cut field can never be read as the next field.
         size_t pos = 0;
+        bool overrun = false;
         auto read_u8 = [&]() -> uint8_t {
-            return pos < data.size() ? data[pos++] : 0;
+            if (pos < data.size()) return data[pos++];
+            overrun = true;
+            return 0;
         };
         auto read_u32 = [&]() -> uint32_t {
-            if (pos + 4 > data.size()) return 0;
+            if (pos + 4 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint32_t v;
             std::memcpy(&v, &data[pos], 4);
             pos += 4;
             return v;
         };
         auto read_u64 = [&]() -> uint64_t {
-            if (pos + 8 > data.size()) return 0;
+            if (pos + 8 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint64_t v;
             std::memcpy(&v, &data[pos], 8);
             pos += 8;
             return v;
         };
         auto read_str = [&](uint8_t len) -> std::string {
-            if (pos + len > data.size()) { pos = data.size(); return ""; }
+            if (pos + len > data.size()) { pos = data.size(); overrun = true; return ""; }
             std::string s(reinterpret_cast<const char*>(&data[pos]), len);
             pos += len;
             return s;
@@ -169,6 +174,11 @@ struct FoundBlockRecord {
         uint8_t addr_len = read_u8();
         rec.finder_address = read_str(addr_len);
         rec.reward_satoshis = read_u64();
+
+        // Every writer since v1 writes the whole v1 body, so a cut inside it is
+        // a damaged row: return an empty record (no block_hash), which load_all
+        // and find_by_hash skip.
+        if (overrun) return FoundBlockRecord{};
 
         // --- v2 enrichment tail (absent on v1 records) ---
         // Every read is bounds-checked (read_* return 0/"" past end), so a
@@ -242,6 +252,8 @@ public:
             return false;
 
         auto rec = FoundBlockRecord::deserialize(data);
+        if (rec.block_hash.empty())
+            return false; // damaged row; don't overwrite it with an empty one
         rec.status = new_status;
         rec.check_count = check_count;
         rec.confirmations = confirmations;
@@ -415,18 +427,23 @@ struct MergedBlockRecord {
     {
         MergedBlockRecord rec;
         if (data.size() < 4) return rec;
+        // Same short-read rule as FoundBlockRecord::deserialize.
         size_t pos = 0;
-        auto read_u8 = [&]() -> uint8_t { return pos < data.size() ? data[pos++] : 0; };
+        bool overrun = false;
+        auto read_u8 = [&]() -> uint8_t {
+            if (pos < data.size()) return data[pos++];
+            overrun = true; return 0;
+        };
         auto read_u32 = [&]() -> uint32_t {
-            if (pos + 4 > data.size()) return 0;
+            if (pos + 4 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint32_t v; std::memcpy(&v, &data[pos], 4); pos += 4; return v;
         };
         auto read_u64 = [&]() -> uint64_t {
-            if (pos + 8 > data.size()) return 0;
+            if (pos + 8 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint64_t v; std::memcpy(&v, &data[pos], 8); pos += 8; return v;
         };
         auto read_str = [&](uint8_t len) -> std::string {
-            if (pos + len > data.size()) { pos = data.size(); return ""; }
+            if (pos + len > data.size()) { pos = data.size(); overrun = true; return ""; }
             std::string s(reinterpret_cast<const char*>(&data[pos]), len);
             pos += len; return s;
         };
@@ -445,6 +462,8 @@ struct MergedBlockRecord {
         rec.coinbase_value = read_u64();
         rec.parent_height = read_u32();
         rec.miner = read_str(read_u8());
+        // A cut inside the v1 body is a damaged row; load_all skips it.
+        if (overrun) return MergedBlockRecord{};
         // --- v2 explorer tail (absent on v1 records) ---
         if (version >= 2) {
             rec.share_hash = read_str(read_u8());
