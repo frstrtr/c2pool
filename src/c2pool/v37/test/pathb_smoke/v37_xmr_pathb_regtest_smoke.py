@@ -301,6 +301,7 @@ class WebPoller:
         self.seen = {}      # name -> {tip id: set((window_root, R, amounts))}
         self.last = {}      # name -> last answer
         self.pend = {}      # name -> every pending receipt id (12 hex digits) seen since clear_pending
+        self.hist = {}      # name -> [(monotonic time, switches, set(pending ids))] since clear_pending
         self.lock = threading.Lock()
         self.stop_ev = threading.Event()
         self.t = threading.Thread(target=self._run, daemon=True)
@@ -331,6 +332,8 @@ class WebPoller:
                 with self.lock:
                     self.last[name] = j
                     self.pend.setdefault(name, set()).update(pb.get("pending_ids", []))
+                    self.hist.setdefault(name, []).append(
+                        (time.monotonic(), int(pb.get("switches", -1)), set(pb.get("pending_ids", []))))
                     self.seen.setdefault(name, {}).setdefault(tip, set()).add(
                         (pb.get("window_root", ""), sum(amounts), amounts))
             self.stop_ev.wait(0.4)
@@ -342,6 +345,11 @@ class WebPoller:
     def clear_pending(self):
         with self.lock:
             self.pend = {}
+            self.hist = {}
+
+    def history(self, name):
+        with self.lock:
+            return list(self.hist.get(name, []))
 
     def pending_seen(self, name):
         with self.lock:
@@ -772,8 +780,10 @@ class Rig:
             own0 = OWN_RE.findall(self.nodes["C"].text())
             c_carriers0 = int(own0[-1][1]) if own0 else 0
             offers0 = {n: len(REPEND_RE.findall(self.nodes[n].text())) for n in "ABC"}
+            wsw0 = {n: int((self.web.get(n) or {}).get("pathb", {}).get("switches", -1)) for n in "ABC"}
             self.web.clear_pending()
             os.kill(self.nodes["C"].pid, signal.SIGUSR1)
+            t_heal = time.monotonic() + a.partition_s - 2  # the views before it are of the partition
             self.res.note("partition", "attempt %d: SIGUSR1 to C (pid %d), switches before %s" %
                           (attempt, self.nodes["C"].pid, sw0))
             wait_for(lambda: self.nodes["C"].text().count("relay: partition over") >= attempt,
@@ -798,41 +808,72 @@ class Rig:
             own_sw = OWN_RE.findall(self.nodes[n].text())
             own_sw = int(own_sw[-1][1]) if own_sw else -1
 
-            # the two claims are seen separately: the miners keep mining, so the switching node's pending (new
-            # receipts too) and the three tips are rarely both settled at one poll
+            # the re-pend offer: the switching node's offer lines since the attempt began (the ids named, up to 16)
+            def offered():
+                o = REPEND_RE.findall(self.nodes[n].text())[offers0[n]:]
+                return o if o else None
+            try:
+                offers = wait_for(offered, 30, "the switching node's re-pend offer line", 1)
+            except Fail:
+                offers = []
+            ids = set(i for o in offers for i in o[2].split())
+            sent = [(int(o[0]), int(o[1])) for o in offers]
+
+            # every view of the switching node published after the switch (its switches count moved); the peers'
+            # pending sets during the partition (before the heal) and after the switch
+            def switch_time():
+                for t, sw, _ in self.web.history(n):
+                    if wsw0[n] >= 0 and sw > wsw0[n]:
+                        return t
+                return None
+            try:
+                t_sw = wait_for(switch_time, 30, "a web view of %s after the switch" % n, 1)
+            except Fail:
+                t_sw = None
             seen = {}
 
-            def carried():
-                j = self.web.get(n)
+            def settled():
+                if t_sw is None:
+                    return None
+                for t, sw, pend in self.web.history(n):
+                    if t >= t_sw and sw > wsw0[n] and ids and not (ids & pend) and "carried" not in seen:
+                        seen["carried"] = t
                 views = {m: self.web.get(m) for m in "ABC"}
-                if j and j["pathb"]["pending"] == 0 and "pending0" not in seen:
-                    seen["pending0"] = j
-                    own_p0 = OWN_RE.findall(self.nodes[n].text())
-                    seen["own_p0"] = int(own_p0[-1][1]) if own_p0 else -2
                 tips = {v["pathb"]["best_tip"]["id"] for v in views.values() if v}
                 if len(tips) == 1 and all(views.values()) and "tip" not in seen:
                     seen["tip"] = (list(tips)[0], views[n]["pathb"]["leaf_count"])
-                return seen if "pending0" in seen and "tip" in seen else None
+                return seen if "carried" in seen and "tip" in seen else None
             try:
-                wait_for(carried, a.heal_s, "the re-pended receipts carried, one best tip", 1)
+                wait_for(settled, a.heal_s, "the re-pended receipts carried, one best tip", 1)
             except Fail as e:
-                self.res.check("partition", False, "%s (seen: %s)" % (e, sorted(seen)))
+                seen.setdefault("why", str(e))
+            before, after = {}, {}
+            for m in "ABC":
+                if m == n:
+                    continue
+                h = self.web.history(m)
+                before[m] = set().union(*[p for t, _, p in h if t < t_heal]) if h else set()
+                after[m] = set().union(*[p for t, _, p in h if t >= t_heal]) if h else set()
+            # a receipt counts for a peer only if that peer did not hold it during the partition; every named receipt
+            # must be held after the heal by a peer that did not hold it before
+            fresh = {m: ids - before[m] for m in after}
+            proven = set().union(*[after[m] & fresh[m] for m in after]) if after else set()
+            self.res.check("partition", t_sw is not None and bool(ids) and proven == ids and any(k >= 1 for _, k in sent),
+                           "%s relayed its re-pended receipts: offers (receipts, peers) %s; %d named; held pending after "
+                           "the heal by a peer that did not hold it during the partition: %s; all: %s" %
+                           (n, sent, len(ids),
+                            ", ".join("%s %d of %d" % (m, len(after[m] & fresh[m]), len(fresh[m])) for m in sorted(after)),
+                            "%d of %d" % (len(proven), len(ids))))
+            own_n = OWN_RE.findall(self.nodes[n].text())
+            self.res.check("partition", "carried" in seen,
+                           "%s: none of its re-pended receipts pending in a view published after the switch (carried)"
+                           "%s; own receipts %s" % (n, "" if "carried" in seen else " -- " + seen.get("why", "not seen"),
+                                                    own_n[-1] if own_n else "-"))
+            if "tip" not in seen:
+                self.res.check("partition", False, "A, B, C on one best tip: not seen")
                 return
             tips = [seen["tip"][0]]
             j = {"pathb": {"leaf_count": seen["tip"][1]}}
-            # the re-pended receipts relayed: the switching node's re-pend offer lines, and a node other than the
-            # switching one holding one of them pending (or, all carried, the switching node's own carriers unchanged)
-            offers = REPEND_RE.findall(self.nodes[n].text())[offers0[n]:]
-            ids = set(i for o in offers for i in o[2].split())
-            sent = [(int(o[0]), int(o[1])) for o in offers]
-            holders = {m: len(ids & self.web.pending_seen(m)) for m in "ABC" if m != n}
-            carried_elsewhere = seen.get("own_p0") == own_sw
-            self.res.check("partition", bool(ids) and any(k >= 1 for _, k in sent)
-                           and (any(holders.values()) or carried_elsewhere),
-                           "%s relayed its re-pended receipts: offers (receipts, peers) %s; held pending by %s; "
-                           "%s's own carriers %d at the switch, %s when its pending reached 0" %
-                           (n, sent, ", ".join("%s %d of %d" % (m, k, len(ids)) for m, k in sorted(holders.items())),
-                            n, own_sw, seen.get("own_p0")))
             s2 = last_status(self.nodes[n].text())
             j1 = JOIN_RE.findall(self.nodes[n].text())
             j1 = int(j1[-1][1]) if j1 else 0
@@ -841,8 +882,7 @@ class Rig:
                            (n, sw0[n], s.group(15), s.group(13), s.group(14), j0[n], j1))
             self.res.check("partition", int(s.group(14)) < int(s.group(13)),
                            "%s: re-pended %s > lost %s" % (n, s.group(13), s.group(14)))
-            self.res.check("partition", True, "%s: pending 0 after the switch (re-pended receipts carried); A, B, C on "
-                           "one best tip %s (leaves %s)" % (n, tips[0], j["pathb"]["leaf_count"]))
+            self.res.check("partition", True, "A, B, C on one best tip %s (leaves %s)" % (tips[0], j["pathb"]["leaf_count"]))
             self.res.note("partition", "%s status after: %s" % (n, s2.group(0) if s2 else "-"))
             return
         self.res.check("partition", False, "no switch with a re-pended receipt in %d partitions" % a.partition_tries)

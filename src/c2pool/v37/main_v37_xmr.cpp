@@ -1860,6 +1860,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             w.pathb.deferred = nv.deferred;
             w.pathb.pending_ids = nv.pending_ids;
             w.pathb.repended_last_switch = nv.sw.last_repended;
+            w.pathb.switches = nv.sw.switches;
             w.pathb.template_status = template_status_name(tstatus);
             w.pathb.hold = nv.hold.hold;
             w.pathb.fork_fuse = fork_fuse;

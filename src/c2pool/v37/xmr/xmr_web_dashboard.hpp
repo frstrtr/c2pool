@@ -69,6 +69,7 @@ struct XmrWebPathb {
     std::uint64_t pending = 0, deferred = 0;
     std::vector<std::string> pending_ids;  // the first 64 pending receipt ids, 12 hex digits each
     std::uint64_t repended_last_switch = 0;
+    std::uint64_t switches = 0;           // switches by the journal (cumulative)
     std::string   template_status;
     // alarms
     bool          hold = false;

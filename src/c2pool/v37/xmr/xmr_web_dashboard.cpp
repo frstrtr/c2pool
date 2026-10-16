@@ -250,7 +250,7 @@ nlohmann::json XmrWebDashboard::Impl::pathb_status() const {
         {"epoch_cur", p.epoch_cur}, {"h_hold", p.h_hold},
         {"window_root", p.window_root_hex}, {"mmr_root", p.mmr_root_hex}, {"leaf_count", p.leaf_count},
         {"pending", p.pending}, {"pending_ids", p.pending_ids}, {"deferred", p.deferred},
-        {"repended_last_switch", p.repended_last_switch},
+        {"repended_last_switch", p.repended_last_switch}, {"switches", p.switches},
         {"template", p.template_status},
         {"alarms", {{"hold", p.hold}, {"fork_fuse", p.fork_fuse}, {"template_kept", p.template_kept},
                     {"store_poisoned", p.store_poisoned}, {"coinbase_internal", p.coinbase_internal}}}};
