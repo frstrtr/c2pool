@@ -909,7 +909,7 @@ TEST(MergedAuxVerdict, FoundRecordFollowsTheVerdict)
 {
     Rig r({{"DOGE", 98}, {"PEP", 63}});
     std::vector<std::pair<std::string, bool>> calls;
-    r.mm.set_on_merged_block_found([&calls](const std::string& sym, int, const std::string&, bool held, uint64_t) {
+    r.mm.set_on_merged_block_found([&calls](const std::string& sym, int, const std::string&, bool held, uint64_t, double) {
         calls.emplace_back(sym, held);
     });
     r.chain(0).verdict = SubmitVerdict::of(SubmitVerdict::Kind::rejected, "bad-cb-amount");
@@ -1109,7 +1109,7 @@ TEST(MergedAuxSubmit, SlowBackendDoesNotDelayTheOthers)
 {
     Rig r({{"PEP", 63}, {"DOGE", 98}});
     std::vector<std::string> order;
-    r.mm.set_on_merged_block_found([&order](const std::string& sym, int, const std::string&, bool, uint64_t) {
+    r.mm.set_on_merged_block_found([&order](const std::string& sym, int, const std::string&, bool, uint64_t, double) {
         order.push_back(sym);
     });
     r.chain(0).submit_sleep_ms = 1'500;
@@ -1447,7 +1447,7 @@ TEST(MergedAuxFind, SlowAcceptedSubmitIsVerifiedAgainstTheChain)
     mm.set_payout_provider(payout_provider());
     mm.add_chain(pep_cfg(f.d.port, 1'000, 1'000, 1'000));
     std::vector<bool> held;
-    mm.set_on_merged_block_found([&held](const std::string&, int, const std::string&, bool h, uint64_t) {
+    mm.set_on_merged_block_found([&held](const std::string&, int, const std::string&, bool h, uint64_t, double) {
         held.push_back(h);
     });
     mm.refresh_aux_work();
@@ -2975,7 +2975,7 @@ TEST(MergedAuxFind, RefindOfTheSameBlockIsRecordedOnce)
 {
     Rig r({{"DOGE", 98}, {"PEP", 63}});
     int calls = 0;
-    r.mm.set_on_merged_block_found([&calls](const std::string&, int, const std::string&, bool, uint64_t) { ++calls; });
+    r.mm.set_on_merged_block_found([&calls](const std::string&, int, const std::string&, bool, uint64_t, double) { ++calls; });
     r.mm.refresh_aux_work();
     const auto job = r.mm.get_auxpow_commitment();
     submit_share(r.mm, job, 0x11);

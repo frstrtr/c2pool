@@ -89,7 +89,7 @@ TEST(MergedMining, StaleJobFindRecordsTheCommittedBlock)
     struct Found { std::string symbol; int height; std::string hash; };
     std::vector<Found> found;
     mm.set_on_merged_block_found([&found](const std::string& sym, int h, const std::string& hash,
-                                          bool, uint64_t) { found.push_back({sym, h, hash}); });
+                                          bool, uint64_t, double) { found.push_back({sym, h, hash}); });
 
     // Job A: the DOGE block at 5,000,001; the share's LTC coinbase commits to it.
     mm.refresh_aux_work();
