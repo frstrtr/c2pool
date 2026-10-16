@@ -76,8 +76,11 @@
 //   F  OUTPUT SET -- a genesis boot (no seeded set) resumes the image together
 //                    with the boot overlay written beside it: ring resolution
 //                    stays on, twice in a row (the clean stop writes both);
-//                    without the overlay file the image resumes alone, ring
-//                    resolution off (the fallback).
+//                    an image without a usable overlay (a snapshot of a build
+//                    that wrote none, a crash between the two writes: an
+//                    overlay of another image) is not resumed: the boot
+//                    re-walks from its root, and two later starts never resume
+//                    with ring resolution off.
 //
 // No sockets are dialled (the node is configured with no peers and no seeds),
 // no daemon is contacted, and no RandomX is linked: the PoW gate is driven by a
@@ -866,6 +869,20 @@ void test_anchor_resume_is_behind_gate4() {
 // source and no block is connected here anyway. What is exercised is exactly
 // the ordering start() owns: gate 4, then the resume, then the saver.
 // ===========================================================================
+// The image file and the boot overlay beside it (`<path>.outset`: sha256 of the image, then the fixture set's
+// overlay), as a node's save writes them.
+bool write_pair(const std::string& path, GenesisChain& src, const std::vector<std::uint8_t>& image) {
+    std::vector<std::uint8_t> ovl;
+    std::string               why;
+    if (!src.outs.serialize_overlay(ovl, why)) return false;
+    native::anchor_hash::Sha256 h;
+    h.update(image.data(), image.size());
+    const std::array<std::uint8_t, 32> d = h.finish();
+    std::vector<std::uint8_t> ofile(d.begin(), d.end());
+    ofile.insert(ofile.end(), ovl.begin(), ovl.end());
+    return write_file(path, rt::encode_snapshot_envelope(regtest_genesis_key(), image)) && write_file(path + ".outset", ofile);
+}
+
 rt::NativeNodeConfig node_cfg(const std::string& snap_path) {
     rt::NativeNodeConfig c;
     c.net              = rt::NativeNet::Regtest;
@@ -897,8 +914,8 @@ void test_node_resumes_without_reibd() {
     const Hash          tip_id   = src.tip_id();
 
     const std::string path = "snapres_kat_node.snap";
-    if (!write_file(path, rt::encode_snapshot_envelope(regtest_genesis_key(), image))) {
-        kat::check(false, "node: the KAT can write its snapshot file");
+    if (!write_pair(path, src, image)) {
+        kat::check(false, "node: the KAT can write its snapshot file and its output-set overlay");
         return;
     }
 
@@ -952,6 +969,7 @@ void test_node_resumes_without_reibd() {
                     (unsigned long long)(check.tip() ? check.tip()->height : 0));
     }
     std::remove(path.c_str());
+    std::remove((path + ".outset").c_str());
 }
 
 void test_node_falls_back_when_the_snapshot_is_unusable() {
@@ -1126,14 +1144,51 @@ void test_node_resumes_the_output_set() {
         std::remove((path + ".outset").c_str());   // what run 2 finds is what this run's stop writes
         node.stop();   // the clean stop writes the image and the overlay again, for run 2
     }
+    // An image the boot cannot pair with an overlay is not resumed: the boot re-walks from its root (on the boot
+    // path, not booted, nothing resumed), and ring resolution is never off after a resume.
+    const auto rewalks = [&](const char* what) {
+        rt::NativeNode node(node_cfg(path));
+        std::string    start_why;
+        const bool     started = node.start(start_why);
+        const std::vector<std::string> log = started ? node.take_log() : std::vector<std::string>{};
+        const rt::NodeStatus st = started ? node.status() : rt::NodeStatus{};
+        kat::checkf(started && !log_has(log, "[snapshot] RESUMED") && log_has(log, "re-walk")
+                            && !log_has(log, "ring resolution disabled") && st.sync.header_frontier == 0 && !st.boot.booted,
+                    "outset: %s: the image is not resumed; the boot re-walks from genesis", what);
+        if (started) node.stop();
+    };
+    // (1) an image with no overlay beside it (a snapshot of a build that wrote none, a lost overlay)
     std::remove((path + ".outset").c_str());
+    rewalks("no overlay file (a snapshot of a build that wrote none)");
+    // (2) a crash between the two writes: the overlay of the next image beside the previous image
+    {
+        (void)write_pair(path, src, image);
+        std::vector<std::uint8_t> ofile = read_file(path + ".outset");
+        if (!ofile.empty()) ofile[0] ^= 0x01;   // bound to another image
+        kat::check(!ofile.empty() && write_file(path + ".outset", ofile), "outset: the KAT writes an overlay of another image");
+        rewalks("a crash between the two writes (the overlay of another image)");
+    }
+    // (3) two later starts: each resumes with ring resolution intact or re-walks; none resumes with it off
+    for (int run = 4; run <= 5; ++run) {
+        rt::NativeNode node(node_cfg(path));
+        std::string    start_why;
+        const bool     started = node.start(start_why);
+        const std::vector<std::string> log = started ? node.take_log() : std::vector<std::string>{};
+        const bool intact = log_has(log, "[snapshot] RESUMED") && log_has(log, "ring resolution intact");
+        const bool rewalk = !log_has(log, "[snapshot] RESUMED") && log_has(log, "re-walk");
+        kat::checkf(started && (intact || rewalk) && !log_has(log, "ring resolution disabled"),
+                    "outset: later start %d resumes with ring resolution intact or re-walks (never resumed with it off)", run);
+        if (started) node.stop();
+    }
+    // (4) the pair written again: the next start resumes with ring resolution intact
+    kat::check(write_pair(path, src, image), "outset: the KAT writes the image with its overlay again");
     {
         rt::NativeNode node(node_cfg(path));
         std::string    start_why;
         const bool     started = node.start(start_why);
         const std::vector<std::string> log = started ? node.take_log() : std::vector<std::string>{};
-        kat::check(started && log_has(log, "[snapshot] RESUMED") && log_has(log, "ring resolution disabled"),
-                   "outset: control: without the overlay file the image resumes alone, ring resolution off");
+        kat::check(started && log_has(log, "[snapshot] RESUMED") && log_has(log, "ring resolution intact"),
+                   "outset: an image with its overlay resumes with ring resolution intact");
         if (started) node.stop();
     }
     std::remove(path.c_str());

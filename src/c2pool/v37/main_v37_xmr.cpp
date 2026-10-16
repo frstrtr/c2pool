@@ -168,6 +168,7 @@ static std::optional<std::uint32_t> g_relay_silence_ms;     // --relay-silence-t
 static std::optional<double> g_relay_peer_valid_rate;    // --relay-peer-valid-rate R (P-15; raise only)
 static std::optional<std::uint64_t> g_relay_pending_cap; // --relay-pending-cap N (P-09; raise only)
 static std::optional<std::uint64_t> g_relay_send_queue;  // --relay-send-queue-bytes N (P-67; floor two FC_HEADERS frames)
+static std::optional<std::uint64_t> g_relay_ctx_block_cap;  // --relay-ctx-block-cap N (P-13; raise only)
 static bool          g_no_relay_bootstrap = false;       // --no-relay-bootstrap
 static std::uint32_t g_relay_partition_s = 0;            // --relay-test-partition-seconds S
 
@@ -290,7 +291,7 @@ public:
     void submit_network_block(std::uint32_t template_id, std::uint32_t nonce,
                               std::uint32_t extra_nonce) override {
         m_calls.fetch_add(1, std::memory_order_relaxed);
-        const std::optional<pb::IssuedJob> j = m_jobs.issued(template_id, extra_nonce);
+        const std::optional<pb::IssuedJob> j = m_jobs.network_job(template_id, extra_nonce);
         if (!j || !j->net.known || j->nonce_offset + strat::NONCE_SIZE > j->hashing_blob.size()) {
             m_stale.fetch_add(1, std::memory_order_relaxed);
             set_last("template " + std::to_string(template_id) + " gone (stale)");
@@ -1099,6 +1100,17 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
 
     // ---- the Path B relay node (one node lock for every PathbNode call) ----
     pb::PathbRelayOptions ro;
+    if (g_relay_ctx_block_cap) {   // P-13 raised: the floor is blob_cap_ctx at the node's view
+        const std::uint64_t floor = pb::blob_cap_ctx(hf, tipw->z_child).value_or(0);
+        if (*g_relay_ctx_block_cap < floor) {
+            std::printf("REFUSED: --relay-ctx-block-cap %llu is below blob_cap_ctx(%u, %llu) = %llu (raise only)\n",
+                        static_cast<unsigned long long>(*g_relay_ctx_block_cap), static_cast<unsigned>(hf),
+                        static_cast<unsigned long long>(tipw->z_child), static_cast<unsigned long long>(floor));
+            backend->stop();
+            return 2;
+        }
+        ro.ctx_block_cap = *g_relay_ctx_block_cap;
+    }
     {
         std::string why;
         if (!relay_options_of(cfg, ro, why)) {
@@ -1154,7 +1166,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             std::memcpy(h.data(), id.data(), 32);
             return nn->index().holds_verified(h);
         };
-        cs.chain.target = [nn](const ::v37::bytes32& anchor, const std::vector<rly::CtxStep>& above, std::uint64_t major,
+        cs.chain.target = [nn, &rows](const ::v37::bytes32& anchor, const std::vector<rly::CtxStep>& above, std::uint64_t major,
                                rly::CtxTarget& out, std::string& why) {
             node::Hash a{};
             std::memcpy(a.data(), anchor.data(), 32);
@@ -1171,6 +1183,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             std::uint64_t h = 0;
             const std::uint8_t mv = static_cast<std::uint8_t>(major > 255 ? 255 : major);
             if (!nn->index().context_target(a, rws, mv, d, seed, h, why)) return false;
+            if (const std::optional<pb::RowWeights> w = rows.weights(anchor))   // P-13 at the newest known ancestor
+                out.blob_cap = pb::blob_cap_ctx(w->hf_child, w->z_child).value_or(0);
             out.diff_lo = d.lo;
             out.diff_hi = d.hi;
             out.height = h;
@@ -1188,6 +1202,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             native::BlockEntry e;
             e.block_blob = blob;
             (void)nn->index().offer_block(nullptr, std::move(e), false);
+        };
+        cs.view_cap = [nn, &rows]() -> std::uint64_t {   // P-13 at the node's view (a child of its index tip)
+            const auto t = nn->index().tip();
+            const std::optional<pb::RowWeights> w = t ? rows.weights(t->id) : std::nullopt;
+            return w ? pb::blob_cap_ctx(w->hf_child, w->z_child).value_or(0) : 0;
         };
         relay->set_ctx_source(std::move(cs));
     }
@@ -1222,7 +1241,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         f.web.time = unix_now_s();
         f.web.landed = sub::to_string(e.landed);
         f.web.reward_pico = e.reward;
-        if (const std::optional<pb::IssuedJob> j = jobs.issued(e.template_id, e.extra_nonce)) {
+        if (const std::optional<pb::IssuedJob> j = jobs.network_job(e.template_id, e.extra_nonce)) {
             f.web.tip_hex = hex_of(j->tip);
             f.web.window_root_hex = hex_of(j->window_root);
             f.web.n_outputs = j->n_outputs;
@@ -1766,7 +1785,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 std::printf("  soak: p15_drops=%llu reoffer_paused=%llu queued_bytes_hwm=%zu queue_full_drops=%llu "
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
-                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_wanted=%llu "
+                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_wanted=%llu "
                             "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
@@ -1783,7 +1802,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.claim_alarms.load()),
                             static_cast<unsigned long long>(rs.claim_alarm_drops.load()),
                             static_cast<unsigned long long>(rs.join_waits.load()), relay->ctx_wants(),
-                            static_cast<unsigned long long>(rs.ctx_wanted.load()),
+                            relay->ctx_want_bytes(), static_cast<unsigned long long>(rs.ctx_wanted.load()),
                             static_cast<unsigned long long>(rs.ctx_resolved.load()),
                             static_cast<unsigned long long>(rs.ctx_gave_up.load()),
                             static_cast<unsigned long long>(rs.parked_reruns.load()));
@@ -2108,6 +2127,7 @@ static void print_help() {
             "  --relay-peer-valid-rate <r>  valid objects per peer per second (default and floor 1.7; raise only)\n"
             "  --relay-pending-cap <n>      pending receipts (default and floor 18432; raise only)\n"
             "  --relay-send-queue-bytes <n> per-link send queue (default 16777216; floor two FC_HEADERS frames)\n"
+            "  --relay-ctx-block-cap <n>    context block cap (default and floor blob_cap_ctx(hf, Z); raise only)\n"
             "  --relay-test-partition-seconds <s>  SIGUSR1 drops the relay for s seconds (test rigs)\n"
             " stratum and mining:\n"
             "  --stratum-bind-host <ip>  --stratum-port <p>   default 127.0.0.1:3333\n"
@@ -2323,6 +2343,7 @@ int main(int argc, char** argv) {
                 if (n < fl) throw cs::UsageError(a + " wants an integer >= " + std::to_string(fl) + " (raise only)");
                 g_relay_pending_cap = n;
             } else if (a == "--relay-send-queue-bytes") g_relay_send_queue = u64();
+            else if (a == "--relay-ctx-block-cap") g_relay_ctx_block_cap = u64();
             else if (a == "--relay-test-partition-seconds") g_relay_partition_s = u32();
             else if (a == "--web-port") g_web_port = u16();
             else if (a == "--web-host") g_web_host = value();

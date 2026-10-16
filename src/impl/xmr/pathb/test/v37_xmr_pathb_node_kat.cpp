@@ -110,6 +110,8 @@
 //                second at its re-run; three first-seen, three counted;
 //   alarmbound   the alarm sink counts by (row, cause) and keeps the last
 //                entry: it does not grow with the node's life;
+//   deferfound   a Monero block found on a job issued before a DEFER is
+//                submitted (the job stays for the network-block path)
 //   ownbound     the kept own shares bounded by the jobs' lifetime: a stale
 //                one leaves though RandomX fails before it; clear()
 //                releases the issued jobs;
@@ -3031,7 +3033,52 @@ void ownbound() {
     const bool issued = js.issued(tid, 7).has_value();
     js.clear();
     check(got && issued && !js.issued(tid, 7).has_value() && !js.has_template(),
-          "ownbound: clear() withdraws the template and releases its issued jobs (a share on one is stale)");
+          "ownbound: clear() withdraws the template and its issued jobs for own shares (a share on one is stale)");
+}
+
+// ---------------------------------------------------------------------------
+// deferfound: a Monero block found on a job issued before a DEFER (clear()) is submitted: the job stays for the
+// network-block path (network_job, rebuild_blob, the publish arm's candidate) while its own shares are stale; it
+// leaves with its template (kKeptTemplates later templates).
+void deferfound() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 60 + i);
+    }
+    pb::PathbJobSource js([&](const pb::PathbTemplate& t, const pb::PathbSession& ss) { return h[a].make_job(t, ss); });
+    const pb::PathbTemplate t = h[a].make_template(h.now);
+    pb::JobNetwork net_vals;
+    net_vals.known = true;
+    net_vals.difficulty_lo = 1000;
+    const std::uint32_t tid = js.set_template(t, net_vals);
+    js.bind(7, h.session(1, 7));
+    ::v37::xmr::stratum::TemplateJob out;
+    const bool got = t.status == pb::TemplateStatus::Ok && js.get_job(7, out);
+    js.clear();  // a DEFER
+    ::v37::xmr::stratum::TemplateJob rebuilt;
+    check(got && !js.has_template() && !js.issued(tid, 7).has_value() && js.network_job(tid, 7).has_value() &&
+                  js.rebuild_blob(tid, 7, rebuilt) && rebuilt.blob == out.blob,
+          "deferfound: after a DEFER the job stays for a found block (network_job, rebuild_blob) and is stale for own "
+          "shares");
+    ::c2pool::xmr::node::MockMonerodTransport mon;
+    mon.set_method_body("submit_block", R"({"id":"0","jsonrpc":"2.0","result":{"status":"OK"}})");
+    ::c2pool::v37n::xmr::submit::LiveBlockSubmitter sub(mon);
+    sub.enable_network_submit(true);
+    ::c2pool::v37n::xmr::submit::LiveSubmitShareSink sink(
+            sub, [&js](std::uint32_t ti, std::uint32_t en, ::c2pool::v37n::xmr::submit::BlockCandidate& c) {
+                return js.candidate(ti, en, c);
+            });
+    sink.submit_network_block(tid, 5, 7);
+    bool posted = false;
+    for (const std::string& b : mon.posted_bodies()) posted = posted || b.find("submit_block") != std::string::npos;
+    check(sub.calls() == 1 && sink.stale_lookups() == 0 && sink.found() == 1 && posted,
+          "deferfound: a Monero block found on the pre-DEFER job is submitted (calls " + std::to_string(sub.calls()) +
+                  ", stale " + std::to_string(sink.stale_lookups()) + ", found " + std::to_string(sink.found()) + ")");
+    for (std::size_t k = 0; k < pb::PathbJobSource::kKeptTemplates; ++k) (void)js.set_template(t, net_vals);
+    check(!js.network_job(tid, 7).has_value(), "deferfound: the job leaves with its template (kKeptTemplates later)");
 }
 
 // ---------------------------------------------------------------------------
@@ -4351,6 +4398,7 @@ int main(int argc, char** argv) {
     run("relayp15", relayp15);
     run("relayp15rx", relayp15rx);
     run("ownbound", ownbound);
+    run("deferfound", deferfound);
     run("alarmbound", alarmbound);
     run("relaystale", relaystale);
     run("relaytip", relaytip);
