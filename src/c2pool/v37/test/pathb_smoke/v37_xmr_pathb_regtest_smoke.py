@@ -783,7 +783,6 @@ class Rig:
             wsw0 = {n: int((self.web.get(n) or {}).get("pathb", {}).get("switches", -1)) for n in "ABC"}
             self.web.clear_pending()
             os.kill(self.nodes["C"].pid, signal.SIGUSR1)
-            t_heal = time.monotonic() + a.partition_s - 2  # the views before it are of the partition
             self.res.note("partition", "attempt %d: SIGUSR1 to C (pid %d), switches before %s" %
                           (attempt, self.nodes["C"].pid, sw0))
             wait_for(lambda: self.nodes["C"].text().count("relay: partition over") >= attempt,
@@ -820,7 +819,8 @@ class Rig:
             sent = [(int(o[0]), int(o[1])) for o in offers]
 
             # every view of the switching node published after the switch (its switches count moved); the peers'
-            # pending sets during the partition (before the heal) and after the switch
+            # pending sets before the switch and after it. A node publishes its view every 2 s and the poller reads each
+            # node about every 0.5 s, so the switch happened at most about 2.5 s before t_sw: t_cut = t_sw - 4
             def switch_time():
                 for t, sw, _ in self.web.history(n):
                     if wsw0[n] >= 0 and sw > wsw0[n]:
@@ -847,20 +847,21 @@ class Rig:
                 wait_for(settled, a.heal_s, "the re-pended receipts carried, one best tip", 1)
             except Fail as e:
                 seen.setdefault("why", str(e))
+            t_cut = t_sw - 4.0 if t_sw is not None else None
             before, after = {}, {}
             for m in "ABC":
                 if m == n:
                     continue
                 h = self.web.history(m)
-                before[m] = set().union(*[p for t, _, p in h if t < t_heal]) if h else set()
-                after[m] = set().union(*[p for t, _, p in h if t >= t_heal]) if h else set()
-            # a receipt counts for a peer only if that peer did not hold it during the partition; every named receipt
-            # must be held after the heal by a peer that did not hold it before
+                before[m] = set().union(*[p for t, _, p in h if t_cut is not None and t < t_cut]) if h else set()
+                after[m] = set().union(*[p for t, _, p in h if t_cut is not None and t >= t_cut]) if h else set()
+            # a receipt counts for a peer only if that peer did not hold it before the switch; every named receipt must
+            # be held after the switch by a peer that did not hold it before
             fresh = {m: ids - before[m] for m in after}
             proven = set().union(*[after[m] & fresh[m] for m in after]) if after else set()
             self.res.check("partition", t_sw is not None and bool(ids) and proven == ids and any(k >= 1 for _, k in sent),
                            "%s relayed its re-pended receipts: offers (receipts, peers) %s; %d named; held pending after "
-                           "the heal by a peer that did not hold it during the partition: %s; all: %s" %
+                           "the switch by a peer that did not hold it before: %s; all: %s" %
                            (n, sent, len(ids),
                             ", ".join("%s %d of %d" % (m, len(after[m] & fresh[m]), len(fresh[m])) for m in sorted(after)),
                             "%d of %d" % (len(proven), len(ids))))
