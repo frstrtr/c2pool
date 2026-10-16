@@ -149,6 +149,8 @@
 //                (paged; both switch paths: a direct placement, the drain);
 //                the switching node mines no more, a peer's carrier carries
 //                them;
+//   relayqfull   a link dropped for a full queue at a relay send: a re-offer
+//                drop while the peer's re-offer pages, else a live one;
 //   relayrxbind2 a walk placed a walked carrier, then the bind of the next
 //                failed on RandomX: the placed one kept; the re-run places
 //                the rest;
@@ -1811,6 +1813,9 @@ struct FakeLinks final : pb::RelayLinks {
     std::size_t queued = 0;  // the bytes every link reports queued
     std::size_t send_queue_limit() const override { return limit; }
     std::size_t queued_bytes(std::uint64_t) const override { return queued; }
+    bool full_next = false;   // the next send finds the link's queue full: the link dropped, counted
+    std::uint64_t full_drops = 0;
+    std::uint64_t queue_full_drops() const override { return full_drops; }
 };
 
 struct FakeWire {
@@ -1849,6 +1854,12 @@ struct FakeWire {
 
 bool FakeLinks::send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) {
     if (live.count(p) == 0) return false;
+    if (full_next) {
+        full_next = false;
+        ++full_drops;
+        disconnect(p);
+        return false;
+    }
     const std::lock_guard<std::mutex> lk(wire->qm);
     wire->q.push_back(FakeWire::Msg{self, static_cast<std::size_t>(p - 1), f});
     return true;
@@ -4267,6 +4278,48 @@ void relayrepend() {
 
 
 // ---------------------------------------------------------------------------
+// relayqfull: a link the transport drops at a relay send for a full queue is counted apart: while the peer's re-offer
+// pages (the link full, the re-offer paused) as a re-offer drop; otherwise as a live-traffic drop.
+void relayqfull() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 2; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 900 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::PathbJob> stale = h.job(a.node, 2, 910);
+    ok = ok && stale && mine_on(h, w, a.node, 1, 911)
+         && h[a.node].on_own_share(*stale, 910, pb::Hash32{}).action == pb::NodeAction::Pending;  // A holds one pending
+    const pb::PathbRelayStats& st = a.relay->stats();
+    a.links->limit = std::size_t{1} << 20;  // A's links full: the re-offer after B's HELLO pauses
+    a.links->queued = a.links->limit;
+    w.connect(0, 1);
+    w.run();
+    const bool paging = st.reoffer_paused.load() > 0 && st.reoffer_done.load() == 0;
+    a.links->full_next = true;  // A's next send to B: the queue full, the link dropped
+    ok = ok && mine_on(h, w, a.node, 1, 912);
+    const std::uint64_t r1 = st.reoffer_queue_full.load(), l1 = st.live_queue_full.load();
+    check(ok && paging && a.links->full_drops == 1 && r1 == 1 && l1 == 0,
+          "relayqfull: a drop for a full queue while B's re-offer pages: a re-offer drop (" + std::to_string(r1) +
+                  "), not a live one (" + std::to_string(l1) + ")");
+    a.links->queued = 0;  // the links drain: B back, its re-offer sent to the end
+    w.connect(0, 1);
+    w.run();
+    const bool done = st.reoffer_done.load() >= 1;
+    a.links->full_next = true;
+    ok = ok && mine_on(h, w, a.node, 1, 913);
+    const std::uint64_t r2 = st.reoffer_queue_full.load(), l2 = st.live_queue_full.load();
+    check(ok && done && a.links->full_drops == 2 && r2 == 1 && l2 == 1,
+          "relayqfull: a drop for a full queue with no re-offer paging: a live-traffic drop (" + std::to_string(l2) +
+                  "; re-offer drops " + std::to_string(r2) + ")");
+}
+
+
+// ---------------------------------------------------------------------------
 // relayrxbind2: a walk that placed a walked carrier (it carries nothing), then whose bind of the next failed on RandomX
 // (a body only that one carries): the placed id stays placed and counted (walk_placed), the failure counted; the
 // parked frame's re-run places the rest.
@@ -4640,6 +4693,7 @@ int main(int argc, char** argv) {
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
     run("relayrepend", relayrepend);
+    run("relayqfull", relayqfull);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);
     run("relayp40", relayp40);

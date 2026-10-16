@@ -61,6 +61,7 @@ public:
     void stop() override { net_.stop(); }
     std::size_t queued_bytes(std::uint64_t p) const override { return net_.queued_bytes(p); }
     std::size_t send_queue_limit() const override { return net_.send_queue_limit(); }
+    std::uint64_t queue_full_drops() const override { return net_.peers_dropped_queue_full(); }
 
 private:
     ::c2pool::v37n::CarrierPeerNode net_;

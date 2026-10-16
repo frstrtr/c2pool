@@ -227,6 +227,8 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
+    // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
+    std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
     std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
@@ -268,6 +270,8 @@ public:
     // the bytes queued on a link and the per-link bound (0: not known)
     virtual std::size_t queued_bytes(std::uint64_t) const { return 0; }
     virtual std::size_t send_queue_limit() const { return 0; }
+    // the links the transport dropped because a send would have passed the bound (cumulative)
+    virtual std::uint64_t queue_full_drops() const { return 0; }
 };
 
 // The node's Monero contexts for FB_GETCTX / FB_CTX (the caller binds them to
@@ -1753,7 +1757,7 @@ private:
             if (a.size() >= kAskedMax) a.clear();
             a.insert(id);
         }
-        if (links_.send_to(peer, *f)) st_.body_set_requests++;
+        if (send_link(peer, *f)) st_.body_set_requests++;
     }
     // FC_GETCARRIER (want_bodies 1) of a carrier to the sender: its reply is admitted as a frame.
     void request_carrier(std::uint64_t peer, const Hash32& id) {
@@ -1848,7 +1852,7 @@ private:
                 a.insert(q.ids.begin(), q.ids.end());
             }
         }
-        (void)links_.send_to(peer, f);
+        (void)send_link(peer, f);
     }
     // An FC_CARRIER of `peer` that answers this node's own request: a body set it asked for, or a carrier.
     enum class CarrierReply : std::uint8_t { None, Solicited, BodySet };
@@ -1889,7 +1893,7 @@ private:
     void node_flood(const std::vector<std::uint8_t>& f, std::optional<std::uint64_t> except) {
         for (std::uint64_t p : ready_peers()) {
             if (except && *except == p) continue;
-            if (links_.send_to(p, f)) st_.flood_frames++;
+            if (send_link(p, f)) st_.flood_frames++;
         }
     }
 
@@ -1904,7 +1908,7 @@ private:
     }
     void send_hello(std::uint64_t p, const PathbHello& ours) {
         const std::optional<std::vector<std::uint8_t>> f = encode_pathb_hello(ours);
-        if (!f || !links_.send_to(p, *f)) return;
+        if (!f || !send_link(p, *f)) return;
         st_.hello_sent++;
         std::lock_guard<std::mutex> lk(pmtx_);
         const auto it = peers_.find(p);
@@ -2038,7 +2042,7 @@ private:
                     st_.reoffer_paused++;
                     return;
                 }
-                if (!links_.send_to(p, *fr)) {
+                if (!send_link(p, *fr)) {
                     std::lock_guard<std::mutex> lk(rmtx_);
                     reoffer_.erase(p);
                     reoffer_t0_.erase(p);
@@ -2062,6 +2066,20 @@ private:
         st_.reoffer_done++;
         st_.reoffer_last_ms = d;
         if (d > st_.reoffer_max_ms.load()) st_.reoffer_max_ms = d;
+    }
+    // Every relay send. A send at which the transport drops the link for a full queue (its count moved during the
+    // send) is counted: a re-offer drop when the peer's re-offer was paging as the send began (the drop's link-down
+    // ends it), else a live-traffic drop.
+    bool send_link(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        bool paging = false;
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            paging = reoffer_.count(p) != 0;
+        }
+        const std::uint64_t q0 = links_.queue_full_drops();
+        const bool ok = links_.send_to(p, f);
+        if (!ok && links_.queue_full_drops() > q0) (paging ? st_.reoffer_queue_full : st_.live_queue_full)++;
+        return ok;
     }
     void reoffer_pump_all() {
         std::vector<std::uint64_t> ps;
@@ -2227,7 +2245,7 @@ private:
             }
         }
         token(p, s.token);
-        for (const std::vector<std::uint8_t>& fr : s.frames) (void)links_.send_to(p, fr);
+        for (const std::vector<std::uint8_t>& fr : s.frames) (void)send_link(p, fr);
     }
 
     // ---- FB_RECEIPTS ----
@@ -2384,7 +2402,7 @@ private:
             tickets_.emplace(id, std::move(t));
         }
         st_.join_tickets++;
-        if (live && !links_.send_to(peer, req)) {
+        if (live && !send_link(peer, req)) {
             std::lock_guard<std::mutex> lk(kmtx_);
             const auto it = tickets_.find(id);
             if (it != tickets_.end()) it->second.closed = true;
@@ -2721,7 +2739,7 @@ private:
             return;
         }
         st_.ping_rx++;
-        if (links_.send_to(p, rly::encode_ping(kOpFbPong, n))) st_.pong_tx++;
+        if (send_link(p, rly::encode_ping(kOpFbPong, n))) st_.pong_tx++;
     }
     void drive_liveness() {
         if (o_.keepalive_ms == 0) return;
@@ -2772,7 +2790,7 @@ private:
             links_.disconnect(p);
         }
         for (std::uint64_t p : ping)
-            if (links_.send_to(p, rly::encode_ping(kOpFbPing, ++ping_nonce_))) st_.ping_tx++;
+            if (send_link(p, rly::encode_ping(kOpFbPing, ++ping_nonce_))) st_.ping_tx++;
     }
 
     // ---- discovery (FB_GETADDR / FB_ADDR) and the node nonce ----
@@ -2790,7 +2808,7 @@ private:
             it->second.addr_pending = true;
             it->second.getaddr_tx_ms = now_ms();
         }
-        if (links_.send_to(p, f)) st_.getaddr_tx++;
+        if (send_link(p, f)) st_.getaddr_tx++;
     }
     // A HELLO refused on a link this node dialed: that address is never good and never learned again.
     void disc_refused(const std::string& why, bool self, std::uint16_t their_listen, const HelloLink& link) {
@@ -2926,7 +2944,7 @@ private:
             rly::AddrEntry e;
             if (rly::addr_entry_of(r.host, r.port, r.last_seen, e)) v.push_back(e);
         }
-        if (links_.send_to(p, rly::encode_addr(chain_id_, v))) st_.addr_tx++;
+        if (send_link(p, rly::encode_addr(chain_id_, v))) st_.addr_tx++;
     }
     void on_addr(std::uint64_t p, const std::vector<std::uint8_t>& f) {
         std::uint32_t chain = 0;
@@ -3060,7 +3078,7 @@ private:
             const bool have = ctx_.block_blob && ctx_.block_blob(id, blob) && !blob.empty() && blob.size() <= cap;
             if (!have) blob.clear();
             const std::vector<std::uint8_t> r = rly::encode_ctx(chain_id_, id, blob, cap);
-            if (r.empty() || !links_.send_to(p, r)) continue;
+            if (r.empty() || !send_link(p, r)) continue;
             if (have)
                 st_.ctx_served++;
             else
@@ -3359,7 +3377,7 @@ private:
         }
         for (const auto& [p, ids] : ask) {
             const std::vector<std::uint8_t> f = rly::encode_getctx(chain_id_, ids);
-            if (!f.empty() && links_.send_to(p, f)) st_.ctx_asked += ids.size();
+            if (!f.empty() && send_link(p, f)) st_.ctx_asked += ids.size();
         }
         for (const Hash32& id : retry) (void)judge_ctx(id);
     }

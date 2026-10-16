@@ -1785,6 +1785,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 const pb::PathbRelayStats& rs = relay->stats();
                 const pb::OwnShareRunner::Stats os = own_runner.stats();
                 std::printf("  soak: p15_drops=%llu reoffer_paused=%llu queued_bytes_hwm=%zu queue_full_drops=%llu "
+                            "reoffer_queue_full_drops=%llu live_queue_full_drops=%llu "
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
                             "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_wanted=%llu "
@@ -1792,6 +1793,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
+                            static_cast<unsigned long long>(rs.reoffer_queue_full.load()),
+                            static_cast<unsigned long long>(rs.live_queue_full.load()),
                             static_cast<unsigned long long>(rs.rx_failures.load()),
                             static_cast<unsigned long long>(os.rx_failures), own_runner.kept(),
                             static_cast<unsigned long long>(os.stale),
