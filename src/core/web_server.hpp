@@ -340,7 +340,13 @@ public:
                             // has not labelled its sites leaves `unknown`,
                             // which reports as unknown and never as a claim.
                             BlockAuthorship authorship =
-                                BlockAuthorship::unknown);
+                                BlockAuthorship::unknown,
+                            // false for a merged (aux) row: every
+                            // network_difficulty fallback reads THIS node's
+                            // chain (template, cache, header chain), so it
+                            // would price the aux block at the parent's
+                            // difficulty (#1738). The row stays unknown.
+                            bool primary_chain_row = true);
     
     // Boundary types hoisted to core::stratum (see core/stratum_types.hpp).
     // Aliases kept here so existing references like `MiningInterface::JobSnapshot`
@@ -1232,10 +1238,11 @@ public:
     /// #946: record a merged (DOGE) block this node submitted. Fills miner,
     /// subsidy and parent_* from the active MergedSubmitScope when there is
     /// one; outside a scope the miner falls back to the node payout address
-    /// and parent_* stay null (unknown), never "" or 0.
+    /// and parent_* stay null (unknown), never "" or 0. network_difficulty is
+    /// aux_difficulty (the aux chain's own, #1738); 0 leaves it unknown.
     void record_merged_found_block(const std::string& symbol, int height,
                                    const std::string& block_hash, bool accepted,
-                                   uint64_t coinbase_value);
+                                   uint64_t coinbase_value, double aux_difficulty);
 
     /// Retain the block-header field lookups so paths OTHER than the one-shot
     /// startup backfill can re-derive a missing network_difficulty from the

@@ -6694,9 +6694,10 @@ int main(int argc, char* argv[]) {
                     mm_manager->set_on_merged_block_found(
                         [mi_ptr](const std::string& symbol, int height,
                                  const std::string& block_hash, bool accepted,
-                                 uint64_t coinbase_value) {
+                                 uint64_t coinbase_value, double difficulty) {
                             mi_ptr->record_merged_found_block(
-                                symbol, height, block_hash, accepted, coinbase_value);
+                                symbol, height, block_hash, accepted, coinbase_value,
+                                difficulty);
                         });
 
                     // When merged mining aux work changes (new DOGE block),
