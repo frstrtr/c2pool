@@ -97,7 +97,8 @@ protected:
     // Protocol handlers look up tx hashes here when processing shares.
     std::map<uint256, coin::Transaction> m_known_txs;
     // Insertion-order recency sidecar for m_known_txs. Recorded at each NEW
-    // remember_tx insert; consumed by prune_shares to evict OLDEST-first down to
+    // remember_tx insert; consumed by evict_known_txs_io_phase (once per
+    // clean_tracker cycle, io thread) to evict OLDEST-first down to
     // m_max_known_txs instead of the old wholesale clear() (which dropped every
     // forwardable tx byte at once -> canonical "referenced unknown transaction"
     // disconnect). Tx-forwarding only; no consensus/mint state. See
@@ -468,12 +469,11 @@ public:
     // coinbase, payee or won-block state is read or written here.
     void advertise_known_txs(peer_ptr only_peer = nullptr)
     {
-        // m_known_txs is mutated by the COMPUTE thread inside prune_shares()
-        // (core::evict_known_txs_to_cap) under the exclusive tracker lock. This
-        // runs on the IO thread, so take the same NON-BLOCKING shared lock the
-        // other IO-thread readers use (the #828 freed-memory GP-fault class)
-        // and simply skip if the compute thread is mid-cycle — the next sweep
-        // carries the identical delta 10s later.
+        // Every live m_known_txs mutator (remember_tx inserts, and the cap
+        // eviction in evict_known_txs_io_phase) runs on the IO thread, as does
+        // this sweep. The NON-BLOCKING shared lock is kept as the established
+        // #828 discipline for IO-thread readers; skip if the compute thread is
+        // mid-cycle — the next sweep carries the identical delta 10s later.
         std::set<uint256> current;
         {
             std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
@@ -557,6 +557,12 @@ public:
     /// Periodic maintenance: eat stale heads, drop tails, then run_think().
     /// Matches p2pool's clean_tracker() (node.py:355-402).
     void clean_tracker();
+
+    /// Enforce m_max_known_txs on the m_known_txs tx-forward cache and publish
+    /// the /p2p_stats known_txs gauges. IO-THREAD ONLY: remember_tx inserts
+    /// into m_known_txs lock-free on the io thread. Called once per
+    /// clean_tracker() cycle from its IO-phase post.
+    void evict_known_txs_io_phase();
 
     /// Drain share batches queued while think() held the tracker mutex.
     /// Called on the IO thread after think() releases the lock.

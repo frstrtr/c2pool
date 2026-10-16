@@ -24,7 +24,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # oracle FLOOR threshold (sum*60//100), not the cross-multiplied real 60%,
     # which rejected new == floor(0.6*total) when 60*total is not a multiple of
     # 100. Pure-helper boundary KAT. Same folding rule.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp mint_follows_autoratchet_test.cpp version_switch_floor_test.cpp)
+    #
+    # known_txs_evict_wiring_test.cpp (D-DGB.EVICT): m_known_txs stays bounded
+    # at m_max_known_txs over N shares via the clean_tracker IO-phase evictor,
+    # plus a node.cpp source guard (reads DGB_NODE_SRC) that the live call
+    # exists. RED on the pre-fix tree. Same folding rule.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp mint_follows_autoratchet_test.cpp version_switch_floor_test.cpp known_txs_evict_wiring_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
