@@ -8,38 +8,15 @@
 // ===========================================================================
 // src/c2pool/v37/test/v37_xmr_m3_arm_order_kat.cpp   --  M3
 //
-// R-ARMORDER, pinned on BOTH settings.
-//
-// M3 makes the FIND path switchable: daemon-first (the default, and what M0
-// through M2h ran) keeps monerod as the tip, the canonical test and the block
-// publisher; p2p-first moves all three onto the embedded native node. A switch
-// is only worth having if both of its positions are held to their claim, so
-// this file asserts the two of them side by side, against the same daemon
-// transport, and counts what that transport was asked to do.
-//
-// THE COUNT IS THE POINT. CountingTransport wraps the monerod stub and counts
-// every rpc_post and every zmq_subscribe. Under daemon-first that count must be
-// NON-ZERO -- the adapter really is talking to a daemon, and a "zero" there
-// would mean the default path had quietly stopped working rather than that M3
-// succeeded. Under p2p-first it must be EXACTLY ZERO, through bring-up and
-// through a complete FOUND -> SETTLED, because that is the milestone's whole
-// claim and an off-by-one is a failed claim.
+// The find path's switch (daemon-first keeps monerod as the tip and
+// the block publisher; p2p-first moves both onto the embedded native node).
 //
 // Suites:
 //   A  the switch's declared rules (arm_order_refusal), pure and exhaustive
-//   B  daemon-first is UNCHANGED: adapter live, tip drives finalize, RPC > 0
-//   C  p2p-first is DAEMONLESS: no adapter, a pumped native chain drives the
-//      same finalize contract, and the daemon transport is never touched
-//   D  p2p-first is FAIL-CLOSED: no canonical test installed -> bring_up
-//      refuses, rather than starting into a window where every settled block
-//      would be orphaned by a predicate that cannot answer
 //   E  the publisher: a found block goes out as a levin 2008 through C5, and a
 //      relay that reached NOBODY delivers NO found event
 //
-// No sockets, no RandomX, no live daemon: builds and runs on BOTH build.yml
-// legs (the Linux x86_64 leg and the ASan+UBSan one), which is also why it is
-// listed in both --target lists -- a registered-but-unbuilt target reads as
-// "***Not Run" and fails ctest with exit 8 (the #1539 lesson).
+// No sockets, no RandomX, no live daemon; on both build.yml --target lists.
 // ===========================================================================
 #include <algorithm>
 #include <cstdint>
@@ -50,7 +27,6 @@
 #include <string>
 #include <vector>
 
-#include "c2pool/v37/xmr/xmr_node.hpp"
 #include "c2pool/v37/xmr/xmr_node_config.hpp"
 #include "c2pool/v37/xmr/xmr_p2p_block_publisher.hpp"
 #include "impl/xmr/native/contracts/fakes/fakes.hpp"
@@ -80,67 +56,6 @@ static void check(bool ok, const std::string& what, const std::string& detail = 
     std::printf("  [ok]   %s\n", what.c_str());
 }
 
-// A point-check backend for the light build: not a torsion check, just enough
-// for the P-1 XMR descriptor validator to be LIVE so XmrNode will start (the
-// real ref10 check is pinned by xmr_torsion_kat).
-static bool test_point_check(const std::uint8_t* pt) {
-    for (int i = 0; i < 32; ++i)
-        if (pt[i] != 0) return true;
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// CountingTransport -- the monerod stub, with a turnstile on it.
-// ---------------------------------------------------------------------------
-class CountingTransport final : public node::IMonerodTransport {
-public:
-    void rpc_post(const std::string& body,
-                  std::function<void(const node::RpcResponse&)> on_done) override {
-        ++rpc_calls;
-        last_method = node::MockMonerodTransport::extract_method(body);
-        node::RpcResponse r;
-        r.error = "counting-transport: no responder installed";
-        on_done(r);
-    }
-    void zmq_subscribe(const std::string& topic,
-                       std::function<void(const node::ZmqFrame&)>) override {
-        ++zmq_subs;
-        last_topic = topic;
-    }
-
-    std::uint64_t rpc_calls = 0;
-    std::uint64_t zmq_subs  = 0;
-    std::string   last_method;
-    std::string   last_topic;
-
-    std::uint64_t touches() const { return rpc_calls + zmq_subs; }
-};
-
-static node::Hash blk_id(std::uint8_t b) {
-    node::Hash h{};
-    for (int i = 0; i < 32; ++i) h[i] = static_cast<std::uint8_t>(b + i);
-    return h;
-}
-
-static node::MainchainEvent extend_at(std::uint64_t h, std::uint8_t seed, std::uint8_t prev_seed) {
-    node::MainchainEvent ev;
-    ev.kind          = node::MainchainEventKind::Extend;
-    ev.block.height  = h;
-    ev.block.id      = blk_id(seed);
-    ev.block.prev_id = blk_id(prev_seed);
-    return ev;
-}
-
-static XmrNodeConfig base_cfg(const std::filesystem::path& dir, ::v37::ChainId chain,
-                              std::uint64_t d_conf) {
-    XmrNodeConfig c;
-    c.network        = MoneroNetwork::Stagenet;
-    c.lane_chain     = chain;
-    c.d_conf         = d_conf;
-    c.settle_db_path = dir.string();
-    return c;
-}
-
 // ===========================================================================
 // A -- the switch's declared rules
 // ===========================================================================
@@ -164,159 +79,16 @@ static void suite_a() {
     // p2p-first refuses anything that would leave a daemon on the find path.
     XmrNodeConfig p;
     p.arm_order = ArmOrderMode::P2PFirst;
+    p.native_connect.push_back("127.0.0.1:18080");
     check(!arm_order_refusal(p).empty(),
-          "A8 p2p-first REFUSES the monerod template source (get_miner_data per refresh)");
+          "A8 p2p-first REFUSES the monerod template source (get_miner_data per refresh), a peer given");
     p.template_source = TemplateSourceMode::Native;
+    p.native_connect.clear();
     check(!arm_order_refusal(p).empty(),
           "A9 p2p-first REFUSES an empty --native-connect (no chain, nowhere to relay)");
     p.native_connect.push_back("127.0.0.1:18080");
     check(arm_order_refusal(p).empty(),
           "A10 p2p-first + native template + a peer is accepted");
-}
-
-// ===========================================================================
-// B -- daemon-first is unchanged
-// ===========================================================================
-static void suite_b(const std::filesystem::path& root) {
-    std::printf("B: daemon-first (default) still drives the tip from monerod\n");
-
-    CountingTransport tx;
-    XmrNode node(base_cfg(root / "daemon_first", 7, 3), tx, &test_point_check);
-    bool up = true;
-    try {
-        node.bring_up();
-    } catch (const std::exception& e) {
-        up = false;
-        check(false, "B1 bring_up succeeds under daemon-first", e.what());
-    }
-    if (!up) return;
-    check(true, "B1 bring_up succeeds under daemon-first");
-
-    check(node.daemon_tip_active(),
-          "B2 the X2 adapter IS the tip driver under daemon-first");
-    check(tx.touches() > 0,
-          "B3 the daemon transport WAS used (adapter start + initial_sync)",
-          "rpc=" + std::to_string(tx.rpc_calls) + " zmq=" + std::to_string(tx.zmq_subs));
-    check(tx.zmq_subs > 0, "B4 the ZMQ topics were subscribed");
-
-    // The adapter's own index drives settlement, as it always did.
-    node::ChainMainBlock r;
-    r.height  = 11;
-    r.id      = blk_id(11);
-    r.prev_id = blk_id(10);
-    node.adapter().index().apply(r);
-    check(node.best_height() == 11,
-          "B5 best_height reads the adapter's index under daemon-first",
-          "best=" + std::to_string(node.best_height()));
-}
-
-// ===========================================================================
-// C -- p2p-first is daemonless, end to end
-// ===========================================================================
-static void suite_c(const std::filesystem::path& root) {
-    std::printf("C: p2p-first drives the find path from the native chain, at zero RPC\n");
-
-    const ::v37::ChainId CHAIN  = 7;
-    const std::uint64_t  D_CONF = 3;
-
-    // The native chain, as a main-thread model of what NativeNode's tip feed
-    // hands over: a height -> id map the canonical test reads, and a queue of
-    // events the loop pumps. Same two shapes native_chain_source() binds.
-    std::map<std::uint64_t, std::string> chain;
-
-    XmrNodeConfig cfg = base_cfg(root / "p2p_first", CHAIN, D_CONF);
-    cfg.arm_order       = ArmOrderMode::P2PFirst;
-    cfg.template_source = TemplateSourceMode::Native;
-    cfg.native_connect.push_back("127.0.0.1:18080");
-
-    CountingTransport tx;
-    XmrNode node(cfg, tx, &test_point_check);
-    node.set_native_chain_presence([&chain](std::uint64_t h, const std::string& bid) {
-        auto it = chain.find(h);
-        return it != chain.end() && it->second == bid;
-    });
-
-    bool up = true;
-    try {
-        node.bring_up();
-    } catch (const std::exception& e) {
-        up = false;
-        check(false, "C1 bring_up succeeds under p2p-first", e.what());
-    }
-    if (!up) return;
-    check(true, "C1 bring_up succeeds under p2p-first");
-
-    check(!node.daemon_tip_active(),
-          "C2 NO X2 adapter is built under p2p-first");
-    check(tx.touches() == 0,
-          "C3 bring_up made ZERO daemon touches (rpc + zmq)",
-          "rpc=" + std::to_string(tx.rpc_calls) + " zmq=" + std::to_string(tx.zmq_subs));
-
-    // The block we found, at height 20, on the chain we verified ourselves.
-    const std::uint64_t FOUND_H = 20;
-    const node::Hash    FOUND_ID = blk_id(20);
-    chain[FOUND_H] = hex_of(FOUND_ID);
-
-    // A valueless {}/{} record, exactly as the daemon writes one without payee
-    // keys: the ledger still registers the block, which is what matures.
-    const bool won = node.on_network_block_won(FOUND_H, FOUND_ID, Amounts{}, Amounts{});
-    check(won, "C4 a found block registers through the SAME wire-4 entry point");
-
-    // Walk the native chain past D_CONF burial, one pumped event at a time --
-    // the substitution for pump_poll(), and nothing else.
-    for (std::uint64_t h = FOUND_H; h <= FOUND_H + D_CONF + 1; ++h) {
-        chain[h] = hex_of(blk_id(static_cast<std::uint8_t>(h)));
-        node.pump_mainchain_event(extend_at(h, static_cast<std::uint8_t>(h),
-                                            static_cast<std::uint8_t>(h - 1)));
-    }
-
-    check(node.best_height() == FOUND_H + D_CONF + 1,
-          "C5 best_height follows the PUMPED native tip",
-          "best=" + std::to_string(node.best_height()));
-    check(node.hw().hw_height == FOUND_H + D_CONF + 1,
-          "C6 the settlement high-water advanced off the native tip",
-          "hw=" + std::to_string(node.hw().hw_height));
-    check(node.finalize_driver().cursor_height() >= FOUND_H,
-          "C7 the F1 finalize cursor stepped PAST the found height (SETTLED)",
-          "cursor=" + std::to_string(node.finalize_driver().cursor_height()));
-
-    check(tx.touches() == 0,
-          "C8 FOUND -> SETTLED made ZERO daemon touches: rpc_on_find_path == 0",
-          "rpc=" + std::to_string(tx.rpc_calls) + " zmq=" + std::to_string(tx.zmq_subs));
-
-    // An orphan disposes through the same seam, still without a daemon.
-    node::MainchainEvent orph;
-    orph.kind        = node::MainchainEventKind::Orphan;
-    orph.orphaned_id = blk_id(20);
-    node.pump_mainchain_event(orph);
-    check(tx.touches() == 0, "C9 an orphan disposition made ZERO daemon touches");
-}
-
-// ===========================================================================
-// D -- p2p-first is fail-closed on its canonical test
-// ===========================================================================
-static void suite_d(const std::filesystem::path& root) {
-    std::printf("D: p2p-first refuses to start without a canonical test\n");
-
-    XmrNodeConfig cfg = base_cfg(root / "failclosed", 7, 3);
-    cfg.arm_order       = ArmOrderMode::P2PFirst;
-    cfg.template_source = TemplateSourceMode::Native;
-    cfg.native_connect.push_back("127.0.0.1:18080");
-
-    CountingTransport tx;
-    XmrNode node(cfg, tx, &test_point_check);
-    bool threw = false;
-    std::string why;
-    try {
-        node.bring_up();
-    } catch (const std::exception& e) {
-        threw = true;
-        why   = e.what();
-    }
-    check(threw, "D1 bring_up REFUSES p2p-first with no presence test installed");
-    check(threw && why.find("p2p-first") != std::string::npos,
-          "D2 the refusal names the mode it refused", why);
-    check(tx.touches() == 0, "D3 the refusal itself touched no daemon");
 }
 
 // ===========================================================================
@@ -477,19 +249,8 @@ static void suite_e() {
 int main() {
     std::printf("== v37_xmr_m3_arm_order_kat: R-ARMORDER pinned on both settings ==\n");
 
-    const std::filesystem::path root =
-        std::filesystem::temp_directory_path() /
-        ("v37-xmr-m3-armorder-" + std::to_string(static_cast<long>(::getpid())));
-    std::filesystem::remove_all(root);
-    std::filesystem::create_directories(root);
-
     suite_a();
-    suite_b(root);
-    suite_c(root);
-    suite_d(root);
     suite_e();
-
-    std::filesystem::remove_all(root);
 
     std::printf("== %s: %d passed, %d failed ==\n", g_fail ? "FAIL" : "OK", g_pass, g_fail);
     return g_fail ? 1 : 0;

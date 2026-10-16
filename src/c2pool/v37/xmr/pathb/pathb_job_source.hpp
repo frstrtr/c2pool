@@ -44,6 +44,7 @@
 #include "c2pool/v37/xmr/pathb/pathb_node.hpp"
 #include "c2pool/v37/xmr/xmr_live_submit.hpp"   // BlockCandidate
 #include "impl/xmr/stratum/xmr_stratum.hpp"
+#include "impl/xmr/template/xmr_block_assembly.hpp"   // pathb_block_blob
 
 namespace c2pool::xmr::pathb {
 
@@ -85,23 +86,14 @@ inline std::size_t hashing_nonce_offset(const HashingBlob& b) noexcept {
     return varint_len(b.major) + varint_len(b.minor) + varint_len(b.timestamp) + kHashBytes;
 }
 
-// The block blob of a job: the header (through the nonce), the miner tx
-// (its prefix and the RCTTypeNull byte), the transaction count and hashes.
+// The block blob of a job: the Path B miner tx and the template's transactions through the block assembly
+// (impl/xmr/template/xmr_block_assembly.hpp).
 inline std::vector<std::uint8_t> job_block_blob(const PathbJob& j, const std::vector<std::uint8_t>& hashing_blob,
                                                 std::size_t nonce_offset, const std::vector<TemplateTx>& txs) {
-    std::vector<std::uint8_t> out(hashing_blob.begin(),
-                                  hashing_blob.begin() + static_cast<std::ptrdiff_t>(nonce_offset + 4));
-    out.insert(out.end(), j.miner_tx.prefix.begin(), j.miner_tx.prefix.end());
-    out.push_back(0x00);
-    std::uint64_t n = txs.size();
-    do {
-        std::uint8_t b = static_cast<std::uint8_t>(n & 0x7f);
-        n >>= 7;
-        if (n != 0) b |= 0x80;
-        out.push_back(b);
-    } while (n != 0);
-    for (const TemplateTx& t : txs) out.insert(out.end(), t.hash.begin(), t.hash.end());
-    return out;
+    std::vector<Hash32> ids;
+    ids.reserve(txs.size());
+    for (const TemplateTx& t : txs) ids.push_back(t.hash);
+    return ::c2pool::xmr::assembly::pathb_block_blob(hashing_blob, nonce_offset, j.miner_tx.prefix, ids);
 }
 
 class PathbJobSource final : public ::v37::xmr::stratum::ITemplateSource {
@@ -223,6 +215,7 @@ public:
         const auto it = jobs_.find({template_id, extra_nonce});
         if (it == jobs_.end()) return false;
         fill(it->second, out);
+        out.withdrawn = withdrawn_.count(template_id) != 0;  // a found block only; an own share on it is stale
         return true;
     }
 

@@ -87,7 +87,7 @@ inline constexpr std::uint64_t G3_HEIGHT  = 3000000;
 inline constexpr char G3_LANE_HEX[] = "1111111111111111111111111111111111111111111111111111111111111111";
 inline constexpr char G3_PREV_HEX[] = "b3b5c0e6f2a1d4c7e8091a2b3c4d5e6f70819a2b3c4d5e6f7081920a1b2c3d4e5";
 
-// ---- byte-exact reproductions of settle/xmr_coinbase.cpp helpers ----------
+// ---- the coinbase tx key, R and merge-mining root derivations, byte for byte ----
 inline SecretKey derive_tx_secret_key_g3() {
     ::xmr::coin::BlobWriter w;
     w.put_bytes(TXKEY_DOMAIN, sizeof(TXKEY_DOMAIN) - 1);

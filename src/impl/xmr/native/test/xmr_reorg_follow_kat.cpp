@@ -459,9 +459,9 @@ static void test_follow_after_race_loss() {
     checkf(tips.size() == 1 && tips[0].resolved,
            "follow: the rival is parked UNRESOLVED -- its branch difficulty was not computable");
 
-    // D6b/RC-CTX: the receipt relay answers a context request for a HELD rival
-    // from the index (block_blob_of -> NativeCtxFeeder::serve, no monerod
-    // get_block), and never hands the rival's bytes out for another id.
+    // The relay answers a context request for a HELD rival from the index
+    // (block_blob_of, no monerod get_block), and never hands the rival's
+    // bytes out for another id.
     {
         std::vector<std::uint8_t> blob;
         checkf(idx.block_blob_of(id_of(rival[0]), blob) && blob == rival[0].block_blob,

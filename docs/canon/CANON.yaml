@@ -91,29 +91,11 @@ scopes:
     extensions: [.hpp, .cpp, .h, .c, .cc, .ipp, .inc, .py, .cmake, .txt]
   xmr_consensus_core:
     include:
-      - src/impl/xmr/receipt/**
-      - src/impl/xmr/settle/**
       - src/impl/xmr/native/consensus/**
       - src/impl/xmr/pow/randomx_verify.hpp
-      - src/c2pool/v37/xmr/relay/xmr_order_rule.hpp
-      - src/c2pool/v37/xmr/relay/xmr_share_verdict.hpp
-      - src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp
-      - src/c2pool/v37/xmr/relay/xmr_rbind_registry.hpp
-      - src/c2pool/v37/xmr/xmr_lane_rules.hpp
-      - src/c2pool/v37/xmr/xmr_lane_rules_build.hpp
-      - src/c2pool/v37/xmr/xmr_credit_cut.hpp
-      - src/c2pool/v37/xmr/xmr_cut_payees.hpp
-      - src/c2pool/v37/xmr/xmr_coinbase_authority.hpp
-      - src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp
-      - src/c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp
-      - src/c2pool/v37/xmr/xmr_paynow.hpp
-      - src/c2pool/v37/xmr/xmr_fee_model.hpp
-      - src/c2pool/v37/xmr/xmr_pool_tag.hpp
-      - src/c2pool/v37/xmr/xmr_drops_wiring.hpp
       - src/sharechain/v37/**
     exclude:
       - '**/test/**'
-      - src/impl/xmr/settle/_compile_check/**
     extensions: [.hpp, .cpp, .h, .cc, .ipp, .inc]
 
 rules:
@@ -257,14 +239,14 @@ rules:
         kats: [xmr_receipt_kat, xmr_receipt_bind_v2_kat, v37_w2_ingestion_test]
       - name: r1-stage-admission
         type: required
-        pattern: 'AdmitStage::R1Target'
-        paths: [src/impl/xmr/receipt/xmr_admission.hpp]
+        pattern: '\bretarget_row\s*\([^;]*RowId::R25\b'
+        paths: [src/impl/xmr/pathb/pathb_admit.hpp]
         code_only: true
         min_count: 2
       - name: r1-stage-relay
         type: required
-        pattern: '\bCheckStage::R1\b'
-        paths: [src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp]
+        pattern: '\b(?:admit_frame_from|admit_receipt_from)\s*\('
+        paths: [src/c2pool/v37/xmr/pathb/pathb_node.hpp]
         code_only: true
         min_count: 1
       - name: no-credit-from-achieved
@@ -669,13 +651,13 @@ rules:
     checks:
       - name: receipt-bindings
         type: required
-        pattern: '(?s)struct\s+ReceiptSideData\s*\{.*?\bt_origin\b.*?\bpayout_identity\b.*?\bchain_id\b.*?\};|struct\s+ReceiptSideDataV3\s*\{.*?\bpool_id\b.*?\bpayee\b.*?\bt_origin\b.*?\};'
-        paths: [src/impl/xmr/receipt/xmr_receipt.hpp]
+        pattern: '(?s)struct\s+SideDataV3\s*\{(?:(?!\n\};).)*?\bpool_id\b(?:(?!\n\};).)*?\brules_epoch\b(?:(?!\n\};).)*?\bballot\b(?:(?!\n\};).)*?\bpayee\b(?:(?!\n\};).)*?\bt_origin\b(?:(?!\n\};).)*?\btip\b(?:(?!\n\};).)*?\breceipts_root\b(?:(?!\n\};).)*?\bwindow_root\b(?:(?!\n\};).)*?\bmmr_root\b(?:(?!\n\};).)*?\bfee_rate(?:_bp)?\b(?:(?!\n\};).)*?\bowner\b(?:(?!\n\};).)*?\bgive_author_bp\b(?:(?!\n\};).)*?\n\};'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp]
         code_only: true
       - name: side-data-v3-struct
         type: required
-        pattern: '(?s)struct\s+ReceiptSideDataV3\s*\{.*?\bpool_id\b.*?\brules_epoch\b.*?\bballot\b.*?\bpayee\b.*?\bt_origin\b.*?\btip\b.*?\breceipts_root\b.*?\bwindow_root\b.*?\bmmr_root\b.*?\bfee_rate\b.*?\bowner\b.*?\bgive_author_bp\b.*?\};'
-        paths: [src/impl/xmr/receipt/xmr_receipt.hpp]
+        pattern: '(?s)struct\s+SideDataV3\s*\{(?:(?!\n\};).)*?\bpool_id\b(?:(?!\n\};).)*?\brules_epoch\b(?:(?!\n\};).)*?\bballot\b(?:(?!\n\};).)*?\bpayee\b(?:(?!\n\};).)*?\bt_origin\b(?:(?!\n\};).)*?\btip\b(?:(?!\n\};).)*?\breceipts_root\b(?:(?!\n\};).)*?\bwindow_root\b(?:(?!\n\};).)*?\bmmr_root\b(?:(?!\n\};).)*?\bfee_rate(?:_bp)?\b(?:(?!\n\};).)*?\bowner\b(?:(?!\n\};).)*?\bgive_author_bp\b(?:(?!\n\};).)*?\n\};'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp]
         code_only: true
       - name: provable-work-kats
         type: required_kat
@@ -703,13 +685,13 @@ rules:
     checks:
       - name: give-author-in-preimage
         type: required
-        pattern: '\bu16\s+give_author(?:_bp)?\b'
-        paths: [src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp, src/impl/xmr/receipt/xmr_receipt.hpp]
+        pattern: '\b(?:u16|std::uint16_t)\s+give_author(?:_bp)?\b'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp]
         code_only: true
       - name: donation-marker-absent
         type: forbidden
         pattern: '\bkDonationMarkerPico\b'
-        paths: [src/c2pool/v37/xmr/xmr_fee_model.hpp, src/c2pool/v37/main_v37_xmr.cpp]
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: true
       - name: donation-bp-default
         type: constant
@@ -763,18 +745,18 @@ rules:
     checks:
       - name: mismatch-refusal
         type: required
-        pattern: 'kLaneRulesMismatch\[\]\s*=\s*"LANE_RULES_MISMATCH"'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        pattern: '\bkLaneRulesMismatchText\s*=\s*"LANE_RULES_MISMATCH"'
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: false
-      - name: rules-digest-in-pool-tag
+      - name: rules-digest-in-lane-rules
         type: required
         pattern: '\brules_digest\b'
-        paths: [src/c2pool/v37/xmr/xmr_pool_tag.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: single-digest-field
         type: required
         pattern: '\bmonero_rules_digest\b'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: lane-rules-kats
         type: required_kat
@@ -1228,7 +1210,7 @@ rules:
       - name: no-policy-in-lane-rules
         type: forbidden
         pattern: '\b(?:journal_depth|index_horizon|backfill_positions|ctx_window|ctx_max_depth|index_retention_blocks|pending_cap|verify_threads|per_peer_capacity|solicited_credits)\b'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: lane-rules-kat
         type: required_kat

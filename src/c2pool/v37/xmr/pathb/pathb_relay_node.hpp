@@ -58,6 +58,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -120,6 +121,10 @@ inline constexpr std::size_t kJoinMinPeersDefault = 2;
 // ---------------------------------------------------------------------------
 // Options (the generic transport values of the old relay node, kept)
 // ---------------------------------------------------------------------------
+// The class of a Monero context want: an unsolicited receipt's (P-06), a relayed carrier's (P-07) or a join
+// attempt's (P-07); each class has its own cap (PathbRelayOptions).
+enum class CtxClass : std::uint8_t { Receipt = 0, Carrier = 1, Join = 2 };
+
 struct PathbRelayOptions {
     // links
     bool listen = false;
@@ -170,10 +175,11 @@ struct PathbRelayOptions {
     std::uint32_t ctx_retry_ms = 2000;
     std::uint32_t ctx_max_rounds = 30;
     // context blocks climbed per want: P-06 (Fresh + 1) for an unsolicited receipt, P-07 (k_alt) for a carrier
-    // under verification (a relayed carrier's admission, a join's FB_GETCTX), within the join wants' cap
+    // under verification (a relayed carrier's admission, a join's FB_GETCTX). Three classes of wants, each with its
+    // own cap: unsolicited receipts ctx_want_max, relayed carriers ctx_join_depth, join attempts ctx_join_depth.
     std::uint32_t ctx_max_depth = static_cast<std::uint32_t>(relay_horizons(kRuledLaneParams).ctx_max_depth);
     std::uint32_t ctx_join_depth = static_cast<std::uint32_t>(kAltDepth);
-    std::size_t ctx_want_max = 128;  // wants of unsolicited receipts held at once (a join's climb: up to ctx_join_depth)
+    std::size_t ctx_want_max = 128;  // wants of unsolicited receipts held at once
     // P-13 (--relay-ctx-block-cap, raise only): a context block's cap above blob_cap_ctx(hf, Z); 0: blob_cap_ctx alone.
     // The cap is max(this, blob_cap_ctx(hf, Z) of the block's newest known ancestor) when its work is judged; FB_CTX
     // frames are read and served up to max(this, blob_cap_ctx at the node's view).
@@ -274,7 +280,7 @@ struct PathbCtxSource {
     rly::CtxHashFn rx;
     // a served block judged usable: into the follower
     std::function<void(const rly::BlockCtx& b, const std::vector<std::uint8_t>& blob)> accept;
-    // P-13 at the node's view (its index tip): blob_cap_ctx(hf, Z) of a child of the tip; unset: hf 16, Z = zone(16)
+    // P-13 at the node's view (its index tip): blob_cap_ctx(hf, Z) of a child of the tip; unset or 0: hf 16, Z = zone(16)
     std::function<std::uint64_t()> view_cap;
 };
 
@@ -703,13 +709,25 @@ public:
     }
     const PathbRelayOptions& options() const noexcept { return o_; }
     // The context of an unsolicited receipt wanted (P-06), as a relayed frame's admission asks.
-    void want_context(const Hash32& id, std::uint64_t from) { want_ctx(id, from, 0, o_.ctx_max_depth); }
+    void want_context(const Hash32& id, std::uint64_t from) { want_ctx(id, from, 0, CtxClass::Receipt); }
     // The context wants held now: all, and those of a join's climb (P-07).
     std::pair<std::size_t, std::size_t> ctx_wants_held() const {
+        const std::array<std::size_t, 3> n = ctx_wants_by_class();
+        return {n[0] + n[1] + n[2], n[2]};
+    }
+    // The context wants held now by class (Receipt, Carrier, Join).
+    std::array<std::size_t, 3> ctx_wants_by_class() const {
         std::lock_guard<std::mutex> lk(cmtx_);
-        std::size_t joins = 0;
-        for (const auto& kv : ctx_want_) joins += kv.second.bound > o_.ctx_max_depth ? 1 : 0;
-        return {ctx_want_.size(), joins};
+        std::array<std::size_t, 3> n{};
+        for (const auto& kv : ctx_want_) ++n[static_cast<std::size_t>(kv.second.cls)];
+        return n;
+    }
+    // A held want's climb bound (P-06 or P-07); none when not held.
+    std::optional<std::uint32_t> ctx_want_bound(const Hash32& id) const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        const auto it = ctx_want_.find(id);
+        if (it == ctx_want_.end()) return std::nullopt;
+        return it->second.bound;
     }
     std::uint64_t node_nonce() const noexcept { return nonce_; }
     const std::set<std::string>& self_keys() const noexcept { return self_keys_; }
@@ -961,7 +979,8 @@ private:
     struct CtxWant {
         std::uint64_t from = 0;
         std::uint32_t depth = 0;
-        std::uint32_t bound = 0;  // the climb's bound: ctx_max_depth, or ctx_join_depth for a join's want
+        std::uint32_t bound = 0;  // the climb's bound: ctx_max_depth (Receipt), ctx_join_depth (Carrier, Join)
+        CtxClass cls = CtxClass::Receipt;
         std::set<std::uint64_t> asked;
         std::uint32_t rounds = 0;
         std::uint64_t since_ms = 0;
@@ -1603,8 +1622,8 @@ private:
     struct Effects {
         bool join = false;
         std::set<Missing> rerun;                            // causes whose parked frames run again
-        // (a Monero block, the peer that sent the object, the climb's bound: P-07 for a carrier, P-06 for a receipt)
-        std::vector<std::tuple<Hash32, std::uint64_t, std::uint32_t>> ctx;
+        // (a Monero block, the peer that sent the object, the want's class: Carrier for a carrier, Receipt for a receipt)
+        std::vector<std::tuple<Hash32, std::uint64_t, CtxClass>> ctx;
         std::vector<std::uint64_t> bans;                    // servers of refuted walked variants or body sets
         std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
@@ -1675,7 +1694,7 @@ private:
             case Missing::MissingBlock:
             case Missing::MissingWeights:
                 if (r.admit.fetch != Hash32{})
-                    fx.ctx.emplace_back(r.admit.fetch, peer, carrier ? o_.ctx_join_depth : o_.ctx_max_depth);
+                    fx.ctx.emplace_back(r.admit.fetch, peer, carrier ? CtxClass::Carrier : CtxClass::Receipt);
                 break;
             case Missing::MissingBucket: bucket_fetch(r.admit.fetch, r.admit.fetch_bin, peer); break;
             default: break;  // ParentUnknown: the node's own FC_GETCARRIER; MissingRef: a served bucket's references
@@ -1768,7 +1787,7 @@ private:
         fx.p15.clear();
         for (std::uint64_t q : fx.bans) ban(q);
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
-        for (const auto& [id, from, bound] : fx.ctx) want_ctx(id, from, 0, bound);
+        for (const auto& [id, from, cls] : fx.ctx) want_ctx(id, from, 0, cls);
         if (!fx.rerun.empty()) rerun_parked(std::vector<Missing>(fx.rerun.begin(), fx.rerun.end()));
         if (fx.join) signal_join();
     }
@@ -3020,8 +3039,9 @@ private:
         std::vector<std::uint8_t> blob;
         std::string why;
         const std::size_t cap = ctx_frame_cap();
-        if (f.size() >= rly::kCtxHeader && f[0] == rly::FB_CTX && rly::le::get32(f.data() + 38) > cap) {
-            st_.ctx_over_cap++;  // P-13: a block over the cap is dropped (no token)
+        if (f.size() >= rly::kCtxHeader && f[0] == rly::FB_CTX && rly::le::get32(f.data() + 38) > cap &&
+            f.size() == rly::kCtxHeader + rly::le::get32(f.data() + 38)) {
+            st_.ctx_over_cap++;  // P-13: a well-formed frame of a block over the cap is dropped (no token)
             return;
         }
         if (!rly::decode_ctx(f, chain, id, blob, cap, &why)) {
@@ -3036,34 +3056,44 @@ private:
         st_.ctx_rx++;
         (void)offer_ctx(id, blob, p);
     }
-    // P-13 for an FB_CTX frame read or served: max(the policy, blob_cap_ctx at the node's view).
+    // P-13 for an FB_CTX frame read or served: max(the policy, blob_cap_ctx at the node's view), never below
+    // blob_cap_ctx(16, zone(16)) (a view that answers 0, or none).
     std::size_t ctx_frame_cap() const {
-        const std::uint64_t view =
-                ctx_.view_cap ? ctx_.view_cap() : blob_cap_ctx(kHf16, zone(kHf16)).value_or(0);
-        return static_cast<std::size_t>(std::max(view, o_.ctx_block_cap));
+        const std::uint64_t floor = blob_cap_ctx(kHf16, zone(kHf16)).value_or(0);
+        const std::uint64_t view = ctx_.view_cap ? ctx_.view_cap() : 0;
+        return static_cast<std::size_t>(std::max({view, floor, o_.ctx_block_cap}));
     }
-    void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, std::uint32_t bound) {
+    std::uint32_t ctx_bound_of(CtxClass c) const noexcept {
+        return c == CtxClass::Receipt ? o_.ctx_max_depth : o_.ctx_join_depth;
+    }
+    std::size_t ctx_cap_of(CtxClass c) const noexcept {
+        return c == CtxClass::Receipt ? o_.ctx_want_max : static_cast<std::size_t>(o_.ctx_join_depth);
+    }
+    // A want of class `cls`: counted in its own class only. A held want is raised to a higher class (and its bound)
+    // within that class's cap; a new want past its class's cap is held as a receipt's (P-06) within that cap.
+    void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, CtxClass cls) {
         std::lock_guard<std::mutex> lk(cmtx_);
-        const bool join = bound > o_.ctx_max_depth;
-        std::size_t joins = 0;
-        for (const auto& kv : ctx_want_) joins += kv.second.bound > o_.ctx_max_depth ? 1 : 0;
+        std::array<std::size_t, 3> n{};
+        for (const auto& kv : ctx_want_) ++n[static_cast<std::size_t>(kv.second.cls)];
+        const auto ci = static_cast<std::size_t>(cls);
         const auto it = ctx_want_.find(id);
         if (it != ctx_want_.end()) {
             if (it->second.from == 0 && from != 0) it->second.from = from;
-            // a join's want raises the bound of an unsolicited one only within the join wants' count
-            if (bound > it->second.bound && (!join || it->second.bound > o_.ctx_max_depth || joins < o_.ctx_join_depth))
-                it->second.bound = bound;
+            if (cls > it->second.cls && n[ci] < ctx_cap_of(cls)) {
+                it->second.cls = cls;
+                it->second.bound = ctx_bound_of(cls);
+            }
             return;
         }
-        if (join && joins >= o_.ctx_join_depth) {  // past the join wants' cap: the unsolicited bound (P-06)
-            bound = o_.ctx_max_depth;
-            if (depth >= bound) return;
-        }
-        if (bound <= o_.ctx_max_depth && ctx_want_.size() - joins >= o_.ctx_want_max) return;
+        if (cls != CtxClass::Receipt && n[ci] >= ctx_cap_of(cls)) cls = CtxClass::Receipt;  // past its class's cap
+        const std::uint32_t bound = ctx_bound_of(cls);
+        if (depth >= bound) return;
+        if (cls == CtxClass::Receipt && n[0] >= ctx_cap_of(CtxClass::Receipt)) return;
         CtxWant w;
         w.from = from;
         w.depth = depth;
         w.bound = bound;
+        w.cls = cls;
         w.since_ms = now_ms();
         ctx_want_.emplace(id, std::move(w));
         st_.ctx_wanted++;
@@ -3113,7 +3143,7 @@ private:
     // The work behind a held proof (the node's own chain index); usable: accepted; forged: its sender banned; not
     // judgeable now: kept (its parent wanted while within ctx_max_depth).
     bool judge_ctx(Hash32 id) {
-        for (std::size_t guard = 0; guard < o_.ctx_want_max + o_.ctx_join_depth; ++guard) {
+        for (std::size_t guard = 0; guard < o_.ctx_want_max + 2 * std::size_t{o_.ctx_join_depth}; ++guard) {
             CtxWant w;
             {
                 std::lock_guard<std::mutex> lk(cmtx_);
@@ -3183,7 +3213,7 @@ private:
                     parent_pow = ctx_pow_.count(w.proof.parent) != 0;
                 }
                 if (!parent_known && !parent_pow && w.depth + 1 < w.bound)
-                    want_ctx(w.proof.parent, w.proof_from != 0 ? w.proof_from : w.from, w.depth + 1, w.bound);
+                    want_ctx(w.proof.parent, w.proof_from != 0 ? w.proof_from : w.from, w.depth + 1, w.cls);
                 return false;
             }
             if (v.kind == rly::CtxPow::Accept) {
@@ -3207,7 +3237,7 @@ private:
                 std::lock_guard<std::mutex> lk(cmtx_);
                 ctx_want_.erase(id);
                 ctx_done_.push_back(id);
-                while (ctx_done_.size() > o_.ctx_want_max + o_.ctx_join_depth) ctx_done_.pop_front();
+                while (ctx_done_.size() > o_.ctx_want_max + 2 * std::size_t{o_.ctx_join_depth}) ctx_done_.pop_front();
                 for (const auto& [cid, cw] : ctx_want_)
                     if (cw.have_proof && cw.proof.parent == id) {
                         child = cid;
@@ -3306,10 +3336,10 @@ private:
         const std::uint64_t deadline = now_ms() + timeout_s * 1000;
         if (ctx_.block_blob) {
             std::vector<std::uint8_t> blob;
-            want_ctx(id, 0, 0, o_.ctx_join_depth);
+            want_ctx(id, 0, 0, CtxClass::Join);
             if (ctx_.block_blob(id, blob) && !blob.empty() && offer_ctx(id, blob, 0)) return true;
         }
-        want_ctx(id, 0, 0, o_.ctx_join_depth);
+        want_ctx(id, 0, 0, CtxClass::Join);
         drive_ctx();
         if (!o_.threads) {
             while (!ctx_resolved(id) && now_ms() < deadline && drive_ && drive_()) {
