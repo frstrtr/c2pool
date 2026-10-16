@@ -3064,9 +3064,9 @@ void deferfound() {
     js.clear();  // a DEFER
     ::v37::xmr::stratum::TemplateJob rebuilt;
     check(got && !js.has_template() && !js.issued(tid, 7).has_value() && js.network_job(tid, 7).has_value() &&
-                  js.rebuild_blob(tid, 7, rebuilt) && rebuilt.blob == out.blob,
-          "deferfound: after a DEFER the job stays for a found block (network_job, rebuild_blob) and is stale for own "
-          "shares");
+                  js.rebuild_blob(tid, 7, rebuilt) && rebuilt.blob == out.blob && rebuilt.withdrawn && !out.withdrawn,
+          "deferfound: after a DEFER the job stays for a found block (network_job, rebuild_blob flags it withdrawn: a "
+          "share on it is stale at stratum) and is stale for own shares");
     ::c2pool::xmr::node::MockMonerodTransport mon;
     mon.set_method_body("submit_block", R"({"id":"0","jsonrpc":"2.0","result":{"status":"OK"}})");
     ::c2pool::v37n::xmr::submit::LiveBlockSubmitter sub(mon);

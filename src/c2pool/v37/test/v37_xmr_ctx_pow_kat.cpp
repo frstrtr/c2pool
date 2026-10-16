@@ -28,6 +28,7 @@
 //                                              -> forged (ban)
 //         a height its parent does not imply   -> forged (ban), no hash spent
 //         an unknown parent                    -> deferred, never banned
+//         an anchor that answers no P-13       -> deferred, never banned
 //         depth 3                              -> deferred, never banned, no hash
 //         a verifier that cannot hash          -> deferred, never banned
 //         no index wired                       -> deferred
@@ -45,6 +46,7 @@
 #include <c2pool/v37/xmr/relay/xmr_relay_native_ctx.hpp>
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
+#include "impl/xmr/pathb/pathb_caps.hpp"
 
 using namespace pathb_relay_test;
 namespace nat = c2pool::xmr::native;
@@ -112,18 +114,20 @@ public:
     }
 };
 
-// main_v37_xmr.cpp's binding of the native index, verbatim in behaviour.
-static CtxChainSource bind_index(nat::ChainIndex& idx) {
+// main_v37_xmr.cpp's binding of the native index, verbatim in behaviour; P-13 at the anchor from its RowWeights
+// there, here the model index's hf 16, Z = zone(16) (cap 0: an anchor that answers none).
+static CtxChainSource bind_index(nat::ChainIndex& idx, std::uint64_t cap = pb::blob_cap_ctx(16, pb::zone(16)).value_or(0)) {
     CtxChainSource cs;
     cs.verified = [&idx](const bytes32& id) { return idx.holds_verified(nh(id)); };
-    cs.target = [&idx](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t major,
-                       CtxTarget& out, std::string& why) {
+    cs.target = [&idx, cap](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t major,
+                            CtxTarget& out, std::string& why) {
         std::vector<std::pair<std::uint64_t, nat::U128>> rows;
         for (const auto& st : above) { nat::U128 d{}; d.lo = st.diff_lo; d.hi = st.diff_hi; rows.emplace_back(st.timestamp, d); }
         nat::U128 d{}; nat::Hash seed{}; std::uint64_t h = 0;
         const std::uint8_t mv = static_cast<std::uint8_t>(major > 255 ? 255 : major);
         if (!idx.context_target(nh(anchor), rows, mv, d, seed, h, why)) return false;
         out.diff_lo = d.lo; out.diff_hi = d.hi; out.height = h; out.seed = bb(seed);
+        out.blob_cap = cap;
         return true;
     };
     return cs;
@@ -286,6 +290,13 @@ int main() {
     {   // no index wired
         const auto v = judge_block_ctx(ctx_of(B1), CtxChainSource{}, rec_of, 2, rx.fn());
         C(v.kind == CtxPow::Defer && !v.ban(), "C2 with no chain index wired nothing is used and nobody is banned");
+    }
+    {   // an anchor with no context block cap (P-13): its RowWeights unknown
+        const CtxChainSource nocap = bind_index(idx, 0);
+        const u64 c0 = rx.calls;
+        const auto v = judge_block_ctx(ctx_of(B1), nocap, rec_of, 2, rx.fn());
+        C(v.kind == CtxPow::Defer && !v.ban() && !v.usable() && rx.calls == c0,
+          "C2 an anchor that answers no P-13 is DEFERRED, never unchecked, no hash spent: " + v.why);
     }
     {   // the bound is the relay's default
         pb::PathbRelayOptions ro;

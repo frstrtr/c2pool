@@ -71,6 +71,8 @@ struct TemplateJob {
     std::array<std::uint8_t, HASH_SIZE> seed_hash{};
     std::optional<std::array<std::uint8_t, HASH_SIZE>> next_seed_hash;
     std::uint8_t monero_major_version = 0;           // for the CARROT fence
+    bool withdrawn = false;                          // rebuild_blob: the template is withdrawn (a share is stale;
+                                                     // a network block on it is still submitted)
 };
 
 class ITemplateSource {

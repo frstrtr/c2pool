@@ -25,7 +25,8 @@
 //       local alarm, no strike, no ban; the want kept and judged again:
 //       resolved
 //   N5  the join wants' cap (P-07) holds when a join raises an unsolicited
-//       want's bound: up to the cap raised, the next kept unsolicited
+//       want's bound: up to the cap raised, the next kept unsolicited; with
+//       the join wants full a relayed carrier takes the carrier class (P-07)
 //   N4  a join's context (a carrier under verification) 5 blocks above C's
 //       index, on a branch only A holds: the want climbs to the index (P-07,
 //       not P-06), every block judged and fed into C's follower
@@ -41,13 +42,20 @@
 //       resolved at C; a block of ~650,000 B: A serves it (its cap raised by
 //       the policy), C drops the frame (over its cap at its view; no strike);
 //       with C's view cap above it, C's judge drops it at the newest known
-//       ancestor's cap (600,051) before hashing
+//       ancestor's cap (600,051) before hashing; with C's view answering 0
+//       the frame cap stays at blob_cap_ctx(16, zone(16))
 //   N8  N6's three cases as real frames from a peer of C's pool: a job of
 //       C's with its Monero parent moved 5 blocks up a branch only A holds,
 //       sent as an FC_CARRIER (the carrier's own P_r), as a receipt carried
 //       by an FC_CARRIER (the carried P_r) and as an FB_RECEIPTS body: the
 //       two carriers' contexts climb to C's index (P-07), every block judged
-//       and fed into C's follower; the receipt's climbs P-06 only
+//       and fed into C's follower; the receipt's climbs P-06 only; a
+//       malformed FB_CTX (its length field over the cap, the frame shorter)
+//       is struck, not dropped as over the cap
+//   N9  the classes of context wants: a peer fills the carrier class with
+//       carriers whose P_r the node does not hold (the fifth held at P-06),
+//       the receipt class is full; a join attempt's want is still taken at
+//       the join's bound (P-07)
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -314,8 +322,17 @@ int main() {
         const bool m2 = Cn.n->fetch_context(idM, 5);
         C(!m2 && !Cn.has(idM) && Cn.hashed_count(M.hashing_blob) == rxM0 && Cn.n->st().strikes.load() == 0,
           "N7 with C's view cap above the block and its newest known ancestor's P-13 below it: dropped before hashing");
-        Cn.view_cap = 600051;
+        // C's view answering 0: the frame cap stays at blob_cap_ctx(16, zone(16))
+        Cn.view_cap = 0;
         A.view_cap = 600051;
+        const SynthBlock L2 = make_block(100, idG, 143, nullptr, 18742, 114);
+        const bytes32 idL2 = block_id(L2);
+        A.idx.alt(L2);
+        const bool l2_ok = Cn.n->fetch_context(idL2, 30);
+        C(L2.full_blob.size() > 512 * 1024 && L2.full_blob.size() <= cap && l2_ok && Cn.has(idL2),
+          "N7 with C's view answering 0 the frame cap stays at blob_cap_ctx(16, zone(16)): a context block of " +
+                  std::to_string(L2.full_blob.size()) + " B resolved");
+        Cn.view_cap = 600051;
     }
 
     // ── N5 the join wants' count holds when an unsolicited want is raised to a join's bound ─
@@ -337,12 +354,40 @@ int main() {
         C(before.first == 5 && before.second == 0 && after.first == 5 && after.second == 4,
           "N5 five unsolicited wants, a join wants all five: four raised to the join's bound, the fifth kept unsolicited "
           "(join wants " + std::to_string(after.second) + " of a cap of 4)");
-        // a relayed carrier's context past the join wants' cap: held at the unsolicited bound (P-06), not dropped
+        // a relayed carrier's context with the join wants full: its own class (P-07), not a join place
         D.n->r().test_parked(0, pb::Missing::MoneroBlock, b32_of(240), b32_of(241), /*relayed=*/true, /*carrier=*/true);
-        const auto past = D.n->r().ctx_wants_held();
-        C(past.first == 6 && past.second == 4,
-          "N5 a relayed carrier's context past the join wants' cap is held at P-06 (wants " + std::to_string(past.first) +
-                  ", join wants " + std::to_string(past.second) + ")");
+        const auto byc = D.n->r().ctx_wants_by_class();
+        C(byc[0] == 1 && byc[1] == 1 && byc[2] == 4 && D.n->r().ctx_want_bound(b32_of(241)) == std::optional<std::uint32_t>(4),
+          "N5 with the join wants full a relayed carrier's context takes the carrier class at P-07 (receipt / carrier / "
+          "join wants " + std::to_string(byc[0]) + " / " + std::to_string(byc[1]) + " / " + std::to_string(byc[2]) + ")");
+    }
+
+    // ── N9 relayed carriers cannot take a join attempt's places ─
+    // A node with the carrier and join classes capped at 4 and the receipt class at 2. A peer fills the carrier class
+    // with carriers whose P_r the node does not hold; a fifth carrier is held at P-06; the receipt class fills. A join
+    // attempt's want is still taken, at the join's bound (P-07).
+    {
+        pb::PathbRelayOptions oe = opts(false, {});
+        oe.ctx_join_depth = 4;
+        oe.ctx_want_max = 2;
+        TNode E(rig, "E", oe);
+        std::string w;
+        C(E.n->start(w), "E starts " + w);
+        for (int k = 0; k < 5; ++k)
+            E.n->r().test_parked(7, pb::Missing::MoneroBlock, b32_of(static_cast<std::uint8_t>(150 + k)),
+                                 b32_of(static_cast<std::uint8_t>(160 + k)), /*relayed=*/true, /*carrier=*/true);
+        const auto c1 = E.n->r().ctx_wants_by_class();
+        C(c1[1] == 4 && c1[0] == 1 && E.n->r().ctx_want_bound(b32_of(164)) == std::optional<std::uint32_t>(3),
+          "N9 four carriers with unknown P_r fill the carrier class; the fifth is held at P-06 (receipt / carrier "
+          "wants " + std::to_string(c1[0]) + " / " + std::to_string(c1[1]) + ")");
+        E.n->r().want_context(b32_of(170), 7);
+        const auto c2 = E.n->r().ctx_wants_by_class();
+        C(c2[0] == 2, "N9 the receipt class is full (2)");
+        (void)E.n->fetch_context(b32_of(171), 0);
+        const auto c3 = E.n->r().ctx_wants_by_class();
+        C(c3[2] == 1 && E.n->r().ctx_want_bound(b32_of(171)) == std::optional<std::uint32_t>(4),
+          "N9 a join attempt's want is taken at the join's bound (P-07), not pushed to P-06 nor refused (receipt / "
+          "carrier / join wants " + std::to_string(c3[0]) + " / " + std::to_string(c3[1]) + " / " + std::to_string(c3[2]) + ")");
     }
 
     // ── N8 N6's three cases as real frames from a peer of C's pool ─
@@ -430,6 +475,19 @@ int main() {
         C(wanted && r_none && A.n->st().ctx_served.load() > s0,
           "N8 an FB_RECEIPTS body whose P_r is 5 blocks up such a branch: its context climbs P-06 only (A served " +
                   std::to_string(A.n->st().ctx_served.load() - s0) + "): it does not reach C's index");
+        // an FB_CTX whose length field is over the cap and does not match the frame's bytes: malformed (a strike)
+        {
+            std::vector<u8> bad(kCtxHeader, 0);
+            bad[0] = 0x44;
+            bad[1] = 0x01;
+            const std::uint32_t len = 700000;
+            for (int i = 0; i < 4; ++i) bad[38 + i] = static_cast<u8>(len >> (8 * i));
+            const u64 mal0 = Cn.n->st().malformed.load(), over0 = Cn.n->st().ctx_over_cap.load();
+            raw.send_to(pid, bad);
+            const bool struck = wait_until([&] { return Cn.n->st().malformed.load() > mal0; }, 5000ms);
+            C(struck && Cn.n->st().ctx_over_cap.load() == over0,
+              "N8 a malformed FB_CTX (its length field over the cap, the frame 42 B) is struck, not dropped as over the cap");
+        }
         raw.stop();
     }
 

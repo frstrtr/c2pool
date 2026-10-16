@@ -241,8 +241,9 @@ inline CtxPowVerdict judge_block_ctx(const BlockCtx& b, const CtxChainSource& sr
     CtxTarget t; std::string why;
     if (!src.target(cur, above, b.major_version, t, why)) return defer("cannot judge it now: " + why);
     if (t.diff_lo == 0 && t.diff_hi == 0) return defer("the index answered no difficulty");
+    if (t.blob_cap == 0) return defer("the index answered no context block cap (P-13) at the anchor");
     const std::uint64_t cap = std::max(t.blob_cap, policy_cap);
-    if (cap != 0 && b.blob_bytes > cap) {   // P-13 at the newest known ancestor: dropped before hashing
+    if (b.blob_bytes > cap) {   // P-13 at the newest known ancestor: dropped before hashing
         v.kind = CtxPow::OverCap;
         v.why = "block blob of " + std::to_string(b.blob_bytes) + " B over the context block cap " + std::to_string(cap);
         return v;

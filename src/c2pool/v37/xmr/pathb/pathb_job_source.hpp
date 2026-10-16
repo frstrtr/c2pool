@@ -215,6 +215,7 @@ public:
         const auto it = jobs_.find({template_id, extra_nonce});
         if (it == jobs_.end()) return false;
         fill(it->second, out);
+        out.withdrawn = withdrawn_.count(template_id) != 0;  // a found block only; an own share on it is stale
         return true;
     }
 
