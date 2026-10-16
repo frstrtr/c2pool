@@ -8,7 +8,7 @@
 // ===========================================================================
 // src/c2pool/v37/test/v37_xmr_m3_arm_order_kat.cpp   --  M3
 //
-// R-ARMORDER: the find path's switch (daemon-first keeps monerod as the tip and
+// The find path's switch (daemon-first keeps monerod as the tip and
 // the block publisher; p2p-first moves both onto the embedded native node).
 //
 // Suites:
@@ -79,9 +79,11 @@ static void suite_a() {
     // p2p-first refuses anything that would leave a daemon on the find path.
     XmrNodeConfig p;
     p.arm_order = ArmOrderMode::P2PFirst;
+    p.native_connect.push_back("127.0.0.1:18080");
     check(!arm_order_refusal(p).empty(),
-          "A8 p2p-first REFUSES the monerod template source (get_miner_data per refresh)");
+          "A8 p2p-first REFUSES the monerod template source (get_miner_data per refresh), a peer given");
     p.template_source = TemplateSourceMode::Native;
+    p.native_connect.clear();
     check(!arm_order_refusal(p).empty(),
           "A9 p2p-first REFUSES an empty --native-connect (no chain, nowhere to relay)");
     p.native_connect.push_back("127.0.0.1:18080");
