@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-#include "xmr_relay_wire.hpp"                        // u8 / u64 / bytes32, keccak_bytes, kCtxMaxBlob
+#include "xmr_relay_wire.hpp"                        // u8 / u64 / bytes32, keccak_bytes
 #include "impl/xmr/coin/xmr_blob.hpp"                // tx_prefix_hash / coinbase_tx_hash / tree_root
 #include "impl/xmr/coin/xmr_check_hash.hpp"          // check_hash (Monero's 128-bit difficulty test)
 #include "impl/xmr/coin/xmr_seedheight.hpp"          // rx_seedheight
@@ -128,6 +128,7 @@ struct BlockCtx {
     std::uint64_t timestamp = 0;
     std::uint64_t major_version = 0;
     std::vector<u8> hashing_blob;   // header | tree_root | varint(n+1): the RandomX input
+    std::size_t   blob_bytes = 0;   // the served blob's size
 };
 inline bool verify_block_ctx(const bytes32& want, const std::vector<u8>& blob, BlockCtx& out, std::string* why = nullptr) {
     auto bad = [&](const std::string& m) { if (why) *why = "ctx: " + m; return false; };
@@ -150,6 +151,7 @@ inline bool verify_block_ctx(const bytes32& want, const std::vector<u8>& blob, B
     out.id = id; out.parent = L.prev_id; out.height = L.height;
     out.timestamp = L.timestamp; out.major_version = L.major_version;
     out.hashing_blob = std::move(hb);
+    out.blob_bytes = blob.size();
     return true;
 }
 
@@ -176,6 +178,7 @@ struct CtxTarget {              // what the index says the next block must meet
     std::uint64_t diff_lo = 0, diff_hi = 0;
     std::uint64_t height = 0;
     bytes32       seed{};
+    std::uint64_t blob_cap = 0;   // P-13 at the anchor (the newest known ancestor): blob_cap_ctx(hf, Z); 0 = none
 };
 // The node's own verified chain index, as the relay sees it (main binds it to
 // the native node's index; a KAT binds a model).
@@ -192,13 +195,14 @@ struct CtxPowRec {              // a block this node verified by (b)
     bytes32 parent{};
     CtxStep step{};
 };
-enum class CtxPow : u8 { Indexed = 0, Accept, Defer, Forged };
+enum class CtxPow : u8 { Indexed = 0, Accept, Defer, Forged, OverCap };
 inline const char* to_string(CtxPow k) {
     switch (k) {
         case CtxPow::Indexed: return "indexed";
         case CtxPow::Accept:  return "pow-verified";
         case CtxPow::Defer:   return "deferred";
         case CtxPow::Forged:  return "forged";
+        case CtxPow::OverCap: return "over-cap";
     }
     return "?";
 }
@@ -213,8 +217,10 @@ struct CtxPowVerdict {
 using CtxHashFn  = std::function<bool(const std::vector<u8>& hashing_blob, const bytes32& seed, bytes32& pow)>;
 using CtxRecFn   = std::function<std::optional<CtxPowRec>(const bytes32& id)>;
 
+// policy_cap: a raised P-13 (the node's policy, 0: none); the cap is max(P-13 at the anchor, policy_cap). A blob above
+// it is OverCap: dropped before hashing (no verdict on the sender, no token, no ban).
 inline CtxPowVerdict judge_block_ctx(const BlockCtx& b, const CtxChainSource& src, const CtxRecFn& rec_of,
-                                     std::uint32_t max_depth, const CtxHashFn& rx) {
+                                     std::uint32_t max_depth, const CtxHashFn& rx, std::uint64_t policy_cap = 0) {
     CtxPowVerdict v;
     auto defer = [&](std::string m) { v.kind = CtxPow::Defer; v.why = std::move(m); return v; };
     if (!src) return defer("no chain index to judge it against");
@@ -235,6 +241,12 @@ inline CtxPowVerdict judge_block_ctx(const BlockCtx& b, const CtxChainSource& sr
     CtxTarget t; std::string why;
     if (!src.target(cur, above, b.major_version, t, why)) return defer("cannot judge it now: " + why);
     if (t.diff_lo == 0 && t.diff_hi == 0) return defer("the index answered no difficulty");
+    const std::uint64_t cap = std::max(t.blob_cap, policy_cap);
+    if (cap != 0 && b.blob_bytes > cap) {   // P-13 at the newest known ancestor: dropped before hashing
+        v.kind = CtxPow::OverCap;
+        v.why = "block blob of " + std::to_string(b.blob_bytes) + " B over the context block cap " + std::to_string(cap);
+        return v;
+    }
     if (t.height != b.height) {   // the coinbase commits to its height; the index knows the parent's
         v.kind = CtxPow::Forged;
         v.why = "block claims height " + std::to_string(b.height) + " but its parent implies " + std::to_string(t.height);

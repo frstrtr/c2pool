@@ -57,7 +57,6 @@ inline constexpr u8  FB_ADDR      = 0x4d;
 inline constexpr u8  kFbVersion   = 0x01;
 
 inline constexpr std::size_t kCtxMaxIds             = 8;                 // ids per FB_GETCTX
-inline constexpr std::size_t kCtxMaxBlob            = 512 * 1024;        // one Monero block blob (header | miner_tx | tx hashes)
 inline constexpr std::size_t kCtxHeader             = 1 + 1 + 4 + 32 + 4; // op ver chain id len
 
 // ── little-endian helpers ───────────────────────────────────────────────────
@@ -101,15 +100,17 @@ inline bool decode_getctx(const std::vector<u8>& f, u32& chain_id, std::vector<b
     for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + 7 + 32 * i));
     return true;
 }
-inline std::vector<u8> encode_ctx(u32 chain_id, const bytes32& id, const std::vector<u8>& blob) {
-    if (blob.size() > kCtxMaxBlob) return {};
+// cap: the blob cap (P-13: blob_cap_ctx(hf, Z), the caller's).
+inline std::vector<u8> encode_ctx(u32 chain_id, const bytes32& id, const std::vector<u8>& blob, std::size_t cap) {
+    if (blob.size() > cap || blob.size() > UINT32_MAX) return {};
     std::vector<u8> f; f.reserve(kCtxHeader + blob.size());
     f.push_back(FB_CTX); f.push_back(kFbVersion); le::put32(f, chain_id); le::putb(f, id);
     le::put32(f, static_cast<u32>(blob.size()));
     f.insert(f.end(), blob.begin(), blob.end());
     return f;
 }
-inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std::vector<u8>& blob, std::string* why = nullptr) {
+inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std::vector<u8>& blob, std::size_t cap,
+                       std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
     if (f.size() < kCtxHeader) return bad("ctx: short");
     if (f[0] != FB_CTX) return bad("ctx: wrong opcode");
@@ -117,7 +118,7 @@ inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std
     chain_id = le::get32(f.data() + 2);
     id = le::getb(f.data() + 6);
     const std::size_t len = le::get32(f.data() + 38);
-    if (len > kCtxMaxBlob) return bad("ctx: blob over 512 KiB");
+    if (len > cap) return bad("ctx: blob over the cap");
     if (f.size() != kCtxHeader + len) return bad("ctx: wrong length");
     blob.assign(f.begin() + static_cast<std::ptrdiff_t>(kCtxHeader), f.end());
     return true;

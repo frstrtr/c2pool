@@ -905,7 +905,9 @@ class Rig:
             self.res.check("restart", False, str(e))
         # then A, B, C stopped and started twice: byte-equal digests. Between the two restarts (no miner runs) transactions
         # go into monerod's pool and A holds a broadcast one before the stop: each node's first template after the
-        # second restart carries them
+        # second restart carries them. Before the second restart C's native snapshot loses its output-set overlay (a
+        # snapshot of a build that wrote none, a crash between the two writes): C does not resume the image, it re-walks;
+        # its next two starts resume the image with its overlay, ring resolution intact
         try:
             pre = {}
             for n in "ABC":
@@ -950,7 +952,22 @@ class Rig:
                     except Fail as e:
                         self.res.check("restart", False, str(e))
                     self.stop_pool("ABC")
+                    ovl = os.path.join(self.work, "nodeC", "chain.snap.outset")
+                    had = os.path.exists(ovl)
+                    if had:
+                        os.remove(ovl)
+                    self.res.note("restart", "C: native output-set overlay %s" % ("removed" if had else "absent"))
             self.res.check("restart", rounds[0] == rounds[1], "restart 1 == restart 2 per node, byte-equal digests")
+            rw = re.findall(r"\[snapshot\] no resume: no output-set overlay usable .*$", self.nodes["C"].text(), re.M)
+            self.res.check("restart", bool(rw), "restart 2: C without the overlay re-walks: %s" % (rw[0][:100] if rw else "no line"))
+            for k in (1, 2):
+                self.stop_pool("C")
+                self.start_pool_node("C", False)
+                wait_for(lambda: self.relay_ready("C") >= 2, 180, "C's relay links after its later start %d" % k)
+                res = re.findall(r"\[snapshot\] RESUMED at height \d+ .*ring resolution (\w+).*$", self.nodes["C"].text(), re.M)
+                self.res.check("restart", bool(res) and res[-1] == "intact",
+                               "C's later start %d resumes the image with its overlay: ring resolution %s"
+                               % (k, res[-1] if res else "(no resume line)"))
         except Fail as e:
             self.res.check("restart", False, str(e))
 

@@ -2019,52 +2019,13 @@ private:
             return;
         }
         // Every boot writes the output set it built beside the image (the boot overlay); with it the resume keeps
-        // ring resolution. Without a usable one the image resumes alone, as below.
+        // ring resolution. Without a usable one (an image of a build that wrote none, a crash between the two
+        // writes, a torn file) the image is not resumed: the boot starts from its root and re-walks, so the set is
+        // built again and the next save writes the image with its overlay.
         if (resume_with_boot_overlay_(image)) return;
-        // Through the BOOT, not straight into the index, and on the verify
-        // thread, which owns block application.
-        //
-        // The thread hop was always needed: an inbound blob may already be in
-        // flight by now, and a load that raced one would reset the index
-        // underneath it. Going through ChainBoot is the other half, and it is
-        // the one a live genesis-boot run found missing. A snapshot carries its
-        // own trust root, but loading it at the index left ChainBoot still
-        // owed a genesis seed, so the first inbound blob after this line ran
-        // try_seed_() -> seed_direct() -> reset: the resumed chain was wiped to
-        // height 0 and re-walked, PoW and all. resume_from_snapshot() installs
-        // the image AND records that the boot is discharged, in that order, on
-        // this thread -- so there is no window in which an inbound blob can
-        // find a loaded index with an un-booted gate in front of it. It re-
-        // checks gate 4 itself and refuses over an unconfirmed anchor.
-        bool ok = false;
-        std::string load_why;
-        verify_loop_.call([&] { ok = boot_.resume_from_snapshot(image, load_why); });
-        if (!ok) {
-            note_("[snapshot] REFUSED: " + load_why + "; starting from the "
-                + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
-            return;
-        }
-        // outputs_ (the output-set / spent-key-image view) is NOT in the v1
-        // image, so reconcile it fail-closed: re-seat its numbering base to the
-        // resumed tip -- legal here because no live block has connected yet and
-        // the output-set combination was excluded above, so the set is empty --
-        // and DISABLE ring resolution. The outputs below the resume point are
-        // not in this image; a ring reaching below it must be RingUnresolved
-        // (fail-closed) rather than mis-resolved and an honest peer mis-scored.
-        // The spent-key-image view therefore tracks from the resume point
-        // forward, and post-resume blocks number from the right base. A future
-        // snapshot v2 that persists outputs_ restores full below-resume
-        // resolution; until then this is the honest posture for a resumed node.
-        verify_loop_.call([&] {
-            outputs_.reset_base(index_.view().rct_output_count());
-            outputs_.disable_resolution();
-        });
-        const SyncState st = index_.sync_state();
-        note_resumed_(st.header_frontier);   // COLD-BOOT-3
-        note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
-            + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
-            + " bytes); no re-IBD from the anchor -- ring resolution disabled "
-              "(spent-set tracks from the resume point; v1 image carries no output set)");
+        note_("[snapshot] no resume: no output-set overlay usable with " + cfg_.snapshot_path + "; starting from the "
+            + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis")
+            + " (re-walk; the next save writes the image with its output-set overlay)");
     }
 
     // Called on snap_loop_ (periodic) or on the caller's thread (clean stop).
@@ -2158,8 +2119,8 @@ private:
 
     // A boot with no seeded output set: the image resumes together with the boot overlay written beside it (bound
     // to the image by digest), so the set is the one the node built and ring resolution stays on. False: no usable
-    // overlay (absent, bound to another image, refused); the set is left empty and the caller resumes the image
-    // alone. True: handled (resumed, or the image refused).
+    // overlay (absent, bound to another image, refused); the set is left empty and the caller re-walks from the
+    // boot's root. True: handled (resumed, or the image refused).
     bool resume_with_boot_overlay_(const std::vector<std::uint8_t>& image) {
         std::vector<std::uint8_t> ofile;
         {
@@ -2170,7 +2131,7 @@ private:
         const Hash bind = image_digest_(image);
         if (ofile.size() < 32 || !std::equal(bind.begin(), bind.end(), ofile.begin())) {
             note_("[snapshot] output-set overlay at " + overlay_path_()
-                + " is not bound to this image; the image resumes alone");
+                + " is not bound to this image");
             return false;
         }
         const std::vector<std::uint8_t> ovl(ofile.begin() + 32, ofile.end());
@@ -2178,7 +2139,7 @@ private:
         std::string load_why;
         verify_loop_.call([&] { ok = outputs_.load_overlay(ovl, load_why); });
         if (!ok) {
-            note_("[snapshot] output-set overlay refused: " + load_why + "; the image resumes alone");
+            note_("[snapshot] output-set overlay refused: " + load_why);
             return false;
         }
         bool tip_ok = false;

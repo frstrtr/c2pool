@@ -238,6 +238,7 @@ void bad_rows() {
         {{"--pathb-claim-alarm-rate", "1844674407370956"}, "--pathb-claim-alarm-rate",
          "a claim-alarm rate whose rate x T x 1000 leaves 64 bits"},
         {{"--relay-send-queue-bytes", "1x"},   "--relay-send-queue-bytes", "a send-queue bound with junk"},
+        {{"--relay-ctx-block-cap", "1x"},      "--relay-ctx-block-cap", "a context block cap with junk"},
         {{"--pathb-regtest-k30", "4,8"},       "--pathb-regtest-k30",   "a K30 set with two fields"},
         {{"--pathb-regtest-k30", "4,8,x"},     "--pathb-regtest-k30",   "a K30 set with junk"},
         // FORK-FUSE-2's test knob, parsed by the strict helpers.
@@ -472,6 +473,7 @@ const std::vector<FlagRow>& flag_table() {
         {"--relay-peer-valid-rate", Cls::New, {{"1.7"}, {"40"}}},
         {"--relay-pending-cap", Cls::New, {{"18432"}, {"40000"}}},
         {"--relay-send-queue-bytes", Cls::New, {{"16777216"}}},
+        {"--relay-ctx-block-cap", Cls::New, {{"600051"}}},
         {"--pathb-regtest-k30", Cls::New, {{"4,8,40"}}},
         {"--pathb-waiting-cap", Cls::New, {{"1152"}}},
         {"--pool-genesis-from", Cls::New, {{"100:" + H64 + ":headline"}}},

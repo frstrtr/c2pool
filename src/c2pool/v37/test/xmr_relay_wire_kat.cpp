@@ -6,7 +6,7 @@
 //       equal to the Path B relay wire's (impl/xmr/pathb/pathb_relay_wire.hpp), none on 0x4a / 0x4b, none a
 //       Family-A CarrierWire version, all below the control opcodes (0x80)
 //   W2  FB_GETCTX / FB_CTX: golden bytes, round trip, refusals (opcode, version, n 0 / 9, length, blob over
-//       512 KiB); both decoders total under truncation
+//       the caller's cap, here P-13 at hf 16 = 600,051); both decoders total under truncation
 //   W3  FB_PING / FB_PONG: golden bytes, round trip, refusals
 //   W7  base58 address decode (checksum, prefixes) of a known address
 //   W8  FB_GETADDR / FB_ADDR: golden bytes, round trip, bounds, refusals, the routable filter
@@ -19,6 +19,7 @@
 #include <c2pool/v37/w3_wire_freeze.hpp>
 #include <c2pool/v37/xmr/relay/xmr_address.hpp>
 #include <c2pool/v37/xmr/relay/xmr_relay_wire.hpp>
+#include "impl/xmr/pathb/pathb_caps.hpp"
 #include "impl/xmr/pathb/pathb_relay_wire.hpp"
 
 using namespace c2pool::v37n::xmr::relay;
@@ -61,8 +62,10 @@ int main() {
         C(!clash, "W1 no kept opcode is a Family-A accepted CarrierWire version");
         C(!reserved, "W1 no kept opcode uses 0x4a / 0x4b");
         C(!ctrl, "W1 every kept opcode lies below the control opcodes (0x80)");
-        C(kCtxHeader + kCtxMaxBlob < c2pool::v37n::kMaxCarrierFrame && kAddrMaxFrame < c2pool::v37n::kMaxCarrierFrame,
-          "W1 the largest FB_CTX and FB_ADDR frames fit the transport ceiling");
+        const std::size_t cap16 = ::c2pool::xmr::pathb::blob_cap_ctx(16, ::c2pool::xmr::pathb::zone(16)).value_or(0);
+        C(cap16 == 600051 && kCtxHeader + cap16 < c2pool::v37n::kMaxCarrierFrame &&
+                  kAddrMaxFrame < c2pool::v37n::kMaxCarrierFrame,
+          "W1 the FB_CTX frame at P-13 (hf 16: 600,051) and the largest FB_ADDR frame fit the transport ceiling");
     }
 
     // ── W2 FB_GETCTX / FB_CTX ───────────────────────────────────────────────
@@ -87,32 +90,38 @@ int main() {
         b = g; b.push_back(0);                   C(!decode_getctx(b, ch, ids), "W2 getctx trailing byte refused");
         b = g; b.pop_back();                     C(!decode_getctx(b, ch, ids), "W2 getctx truncated refused");
 
+        // cap: P-13 at hf 16, Z = zone(16) (blob_cap_ctx = 600,051)
+        const std::size_t cap = ::c2pool::xmr::pathb::blob_cap_ctx(16, ::c2pool::xmr::pathb::zone(16)).value_or(0);
         const std::vector<u8> blob = {'a', 'b', 'c'};
-        const std::vector<u8> c = encode_ctx(7, fill32(0x22), blob);
+        const std::vector<u8> c = encode_ctx(7, fill32(0x22), blob, cap);
         C(hex(c) == "4401" "07000000" + rep("22", 32) + "03000000" "616263", "W2 ctx(7, 22.., \"abc\") golden");
         bytes32 id{}; std::vector<u8> got;
-        C(decode_ctx(c, ch, id, got, &why) && ch == 7 && id == fill32(0x22) && got == blob, "W2 ctx round-trip");
-        const std::vector<u8> none = encode_ctx(7, fill32(0x22), {});
-        C(none.size() == kCtxHeader && decode_ctx(none, ch, id, got) && got.empty(), "W2 ctx with an empty blob (unknown here)");
-        C(encode_ctx(7, fill32(1), std::vector<u8>(kCtxMaxBlob + 1, 0)).empty(), "W2 ctx blob over 512 KiB not encodable");
-        const std::vector<u8> full = encode_ctx(7, fill32(1), std::vector<u8>(kCtxMaxBlob, 0));
-        C(full.size() == kCtxHeader + kCtxMaxBlob && decode_ctx(full, ch, id, got) && got.size() == kCtxMaxBlob,
-          "W2 ctx blob of 512 KiB accepted");
-        b = c; b[38] = 0; b[39] = 0; b[40] = 8; b[41] = 0;   // len = 512 KiB + ...: claims 0x00080000 = 524288
-        C(!decode_ctx(b, ch, id, got), "W2 ctx len != the frame's bytes refused");
+        C(decode_ctx(c, ch, id, got, cap, &why) && ch == 7 && id == fill32(0x22) && got == blob, "W2 ctx round-trip");
+        const std::vector<u8> none = encode_ctx(7, fill32(0x22), {}, cap);
+        C(none.size() == kCtxHeader && decode_ctx(none, ch, id, got, cap) && got.empty(),
+          "W2 ctx with an empty blob (unknown here)");
+        C(encode_ctx(7, fill32(1), std::vector<u8>(cap + 1, 0), cap).empty(), "W2 ctx blob over the cap not encodable");
+        const std::vector<u8> full = encode_ctx(7, fill32(1), std::vector<u8>(cap, 0), cap);
+        C(full.size() == kCtxHeader + cap && decode_ctx(full, ch, id, got, cap) && got.size() == cap,
+          "W2 ctx blob at the cap (600,051 B) accepted");
+        b = c; b[38] = 0; b[39] = 0; b[40] = 8; b[41] = 0;   // claims 0x00080000 = 524288 bytes, carries 3
+        C(!decode_ctx(b, ch, id, got, cap), "W2 ctx len != the frame's bytes refused");
         std::vector<u8> over(kCtxHeader, 0); over[0] = FB_CTX; over[1] = kFbVersion;
-        over[38] = 0x01; over[39] = 0x00; over[40] = 0x08; over[41] = 0x00;   // 524289
-        C(!decode_ctx(over, ch, id, got), "W2 ctx len over 512 KiB refused");
-        over.resize(kCtxHeader + kCtxMaxBlob + 1, 0);   // the frame carries the 512 KiB + 1 bytes it claims
-        C(!decode_ctx(over, ch, id, got), "W2 ctx of 512 KiB + 1 (length consistent) refused");
-        b = c; b[0] = FB_GETCTX;                 C(!decode_ctx(b, ch, id, got), "W2 ctx wrong opcode refused");
-        b = c; b[1] = 2;                         C(!decode_ctx(b, ch, id, got), "W2 ctx unknown version refused");
+        const std::size_t cap1 = cap + 1;   // 600,052
+        over[38] = static_cast<u8>(cap1); over[39] = static_cast<u8>(cap1 >> 8); over[40] = static_cast<u8>(cap1 >> 16);
+        over[41] = static_cast<u8>(cap1 >> 24);
+        C(!decode_ctx(over, ch, id, got, cap), "W2 ctx len over the cap refused");
+        over.resize(kCtxHeader + cap1, 0);   // the frame carries the cap + 1 bytes it claims
+        C(!decode_ctx(over, ch, id, got, cap), "W2 ctx of the cap + 1 (length consistent) refused");
+        C(decode_ctx(over, ch, id, got, cap1) && got.size() == cap1, "W2 the same frame under a cap one byte higher decodes");
+        b = c; b[0] = FB_GETCTX;                 C(!decode_ctx(b, ch, id, got, cap), "W2 ctx wrong opcode refused");
+        b = c; b[1] = 2;                         C(!decode_ctx(b, ch, id, got, cap), "W2 ctx unknown version refused");
         bool total = true;
         for (std::size_t n = 0; n <= c.size(); ++n) {
             const std::vector<u8> t(c.begin(), c.begin() + static_cast<std::ptrdiff_t>(n));
             try {
                 u32 x = 0; bytes32 y{}; std::vector<u8> z; std::vector<bytes32> w;
-                const bool ok1 = decode_ctx(t, x, y, z);
+                const bool ok1 = decode_ctx(t, x, y, z, cap);
                 (void)decode_getctx(t, x, w);
                 if (ok1 != (n == c.size())) total = false;
             } catch (...) { total = false; }

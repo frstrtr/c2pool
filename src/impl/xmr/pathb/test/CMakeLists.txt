@@ -171,9 +171,10 @@ if (BUILD_TESTING)
     set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
     # v37_xmr_pathb_node_join_kat joins chains of 4,700+ carriers through PathbNode.
     set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES TIMEOUT 3000)
-    # v37_xmr_pathb_node_kat runs the relay node and its threads.
+    # v37_xmr_pathb_node_kat runs the relay node and its threads; deferfound submits a found block through the monerod
+    # arm (xmr_node: the RPC bodies).
     find_package(Threads REQUIRED)
-    target_link_libraries(v37_xmr_pathb_node_kat PRIVATE Threads::Threads)
+    target_link_libraries(v37_xmr_pathb_node_kat PRIVATE xmr_node Threads::Threads)
     # v37_xmr_pathb_node_join_kat drives a restarted joined node through the relay node as well.
     target_link_libraries(v37_xmr_pathb_node_join_kat PRIVATE Threads::Threads)
 endif()
