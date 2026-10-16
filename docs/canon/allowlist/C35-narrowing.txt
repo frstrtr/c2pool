@@ -21,12 +21,12 @@ src/impl/xmr/pathb/pathb_lane_rules.hpp 1 EMISSION_SPEED_FACTOR_PER_MINUTE (20) 
 src/impl/xmr/pathb/pathb_pool_identity.hpp 1 a decimal digit (0..9) widened to u64; v37_xmr_relay_pool_id_kat
 src/impl/xmr/pathb/pathb_store.hpp 1 a stored carrier blob's byte count to u32 (the blob cap is far below 2^32); v37_xmr_pathb_store_kat
 src/impl/xmr/pathb/pathb_ratchet_activation.hpp 1 not a cast: the parameter list (std::uint64_t /*oldest*/) matches the C-style pattern; xmr_epoch_accounting_kat
-src/impl/xmr/native/consensus/xmr_reward.hpp 10 Monero's get_block_reward and emission (cryptonote_basic_impl.cpp): MONEY_SUPPLY = ~u64(0); 1 << i in the 64-bit half it is set in; u128 products and quotients split into hi / lo limbs (exact); a remainder below a u64 divisor; the speed factor (20) as a shift count; target minutes (2) widened; xmr_consensus_state_kat
-src/impl/xmr/native/consensus/xmr_blob_reader.hpp 6 four bytes assembled into u32 (widening); a 7-bit varint group widened to u64 after the overflow refusal (VarintOverflow); a remaining-byte count (size_t) widened to u64; xmr_blob_reader_fuzz_kat, v37_xmr_parse_bounds_kat
-src/impl/xmr/native/consensus/xmr_tx_weight.hpp 2 a count and a blob size widened to u64; xmr_tx_weight_kat
-src/impl/xmr/native/consensus/xmr_block_id.hpp 1 a blob size (size_t) widened to u64; xmr_block_id_kat
-src/impl/xmr/native/consensus/xmr_block_parse.hpp 1 a tx hash count (size_t) widened to u64; xmr_block_id_kat
-src/impl/xmr/native/consensus/xmr_difficulty.hpp 1 the all-ones u64 mask of the low 64 bits; xmr_consensus_state_kat
-src/impl/xmr/pow/randomx_verify.hpp 6 check_hash: hash bytes assembled into u64 limbs (widening); u128 products split into hi / lo limbs (exact); u64(-1) all ones; randomx_verify_kat
+src/impl/xmr/native/consensus/xmr_reward.hpp 10 Monero's get_block_reward and emission (cryptonote_basic_impl.cpp): MONEY_SUPPLY = ~u64(0); 1 << i in the 64-bit half it is set in; u128 products and quotients split into hi / lo limbs (exact); a remainder below a u64 divisor; the speed factor (20) as a shift count; target minutes (2) widened; xmr_native_consensus_state_kat
+src/impl/xmr/native/consensus/xmr_blob_reader.hpp 6 four bytes assembled into u32 (widening); a 7-bit varint group widened to u64 after the overflow refusal (VarintOverflow); a remaining-byte count (size_t) widened to u64; xmr_native_blob_reader_fuzz_kat, v37_xmr_parse_bounds_kat
+src/impl/xmr/native/consensus/xmr_tx_weight.hpp 2 a count and a blob size widened to u64; xmr_native_tx_weight_kat
+src/impl/xmr/native/consensus/xmr_block_id.hpp 1 a blob size (size_t) widened to u64; xmr_native_block_id_kat
+src/impl/xmr/native/consensus/xmr_block_parse.hpp 1 a tx hash count (size_t) widened to u64; xmr_native_block_id_kat
+src/impl/xmr/native/consensus/xmr_difficulty.hpp 1 the all-ones u64 mask of the low 64 bits; xmr_native_consensus_state_kat
+src/impl/xmr/pow/randomx_verify.hpp 6 check_hash: hash bytes assembled into u64 limbs (widening); u128 products split into hi / lo limbs (exact); u64(-1) all ones; xmr_randomx_verify_kat
 src/sharechain/v37/v37_descriptor_xmr.hpp 1 long division by XMR_GA_SCALE: the running remainder is below the scale, so each quotient limb fits u64; v37_descriptor_xmr_test
 src/sharechain/v37/v37_fixed.hpp 10 the v37 engine's Q62 fixed point: U256 limb sums, differences and products split exact (the carry or borrow to the next limb; overflow excluded by range pinning, documented at the operators); mul_q64 of decay and table factors; decay_per = Q_ONE - Q_ONE x LN2 / (10^6 x half_life) in (Q_ONE / 4, Q_ONE], so inv_per = 2^124 / decay_per < 2^64; v37_test

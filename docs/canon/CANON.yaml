@@ -217,7 +217,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*w4_settlement\.hpp[>"]'
         paths: [src/c2pool/v37/xmr/**, src/impl/xmr/**, src/c2pool/v37/main_v37_xmr.cpp]
         exclude: ['**/test/**', src/impl/xmr/third_party/**, src/impl/xmr/coin/vendor/**]
-        code_only: true
+        code_only: false
         note: 'The product XMR targets; their tests are out of scope.'
     status_now: pass
     deviation: [D4, D36]
