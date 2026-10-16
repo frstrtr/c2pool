@@ -149,6 +149,9 @@
 //                (paged; both switch paths: a direct placement, the drain);
 //                the switching node mines no more, a peer's carrier carries
 //                them;
+//   revrepend2   two re-pended receipts, the second's tip on the abandoned
+//                branch: parked by the peers until that tip arrives, then
+//                held; a peer's carrier carries both;
 //   relayqfull   a link dropped for a full queue at a relay send: a re-offer
 //                drop while the peer's re-offer pages, else a live one;
 //   relayrxbind2 a walk placed a walked carrier, then the bind of the next
@@ -4148,7 +4151,10 @@ void relayp15once() {
         ok = ok && h[lo].on_own_share(k, kn, pb::Hash32{}).action == pb::NodeAction::Pending;
         w.run();
         // X follows the losing node's best chain, then gets its next carrier c (carrying k's receipt, its tip the
-        // losing sibling) as a flood
+        // losing sibling) as a flood; k's receipt itself does not reach X (no FB_RECEIPTS from the losing node)
+        w.edit = [lo, xn = x.node](FakeWire::Msg& m) {
+            if (m.from == lo && m.to == xn && !m.f.empty() && m.f[0] == pb::kOpFbReceipts) m.f.clear();
+        };
         w.connect(lo, x.node);
         w.run();
         const pb::PathbRelayStats& st = x.relay->stats();
@@ -4161,6 +4167,7 @@ void relayp15once() {
             x.relay->tick();
             w.run();
         }
+        w.edit = nullptr;
         const pb::CarrierBodyV3* cb = h[lo].bodies().get(c);
         const std::uint64_t nc = st.p15_counted.load() - n0;
         const bool rerun = st.parked_reruns.load() > r0;
@@ -4318,6 +4325,92 @@ void relayqfull() {
                   "; re-offer drops " + std::to_string(r2) + ")");
 }
 
+
+// ---------------------------------------------------------------------------
+// revrepend2: the partitioned node C mines TWO carriers X1 (on t0) and X2 (on X1) while A mines Y1..Y3; at the heal C
+// switches to Y3 and re-pends X1's and X2's own receipts. X2's receipt's tip is X1, a carrier of the abandoned branch A
+// and B never saw: it DEFERs there, is parked and runs again once X1 arrives. A and B hold both receipts; B's next
+// carrier carries both while C mines nothing.
+void revrepend2() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.connect(1, 2);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 500 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 t0 = h[a.node].tree().best().id;
+    ok = ok && h[b.node].tree().best().id == t0 && h[c.node].tree().best().id == t0;
+    std::printf("  setup t0 ok=%d\n", ok ? 1 : 0);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 2 || m.to == 2) m.f.clear();
+    };
+    const bool cx1 = mine_on(h, w, c.node, 7, 520);
+    const pb::Hash32 x1 = h[c.node].tree().best().id;
+    const bool cx2 = mine_on(h, w, c.node, 7, 521);
+    const pb::Hash32 x2 = h[c.node].tree().best().id;
+    const pb::CarrierBodyV3* bx2 = h[c.node].bodies().get(x2);
+    const bool x2_on_x1 = bx2 && bx2->own.side.tip == x1;
+    const bool ay1 = mine_on(h, w, a.node, 2, 510);
+    const pb::Hash32 y1 = h[a.node].tree().best().id;
+    const bool ay2 = mine_on(h, w, a.node, 2, 511);
+    const pb::Hash32 y2 = h[a.node].tree().best().id;
+    const bool ay3 = mine_on(h, w, a.node, 2, 512);
+    const pb::Hash32 y3 = h[a.node].tree().best().id;
+    w.edit = nullptr;
+    std::printf("  mined: C x1=%d x2=%d (x2's tip is x1: %d); A y1=%d y2=%d y3=%d; B best==y3 %d\n", cx1, cx2, x2_on_x1, ay1,
+                ay2, ay3, h[b.node].tree().best().id == y3 ? 1 : 0);
+    std::printf("  before the heal: A holds x1 %d x2 %d; B holds x1 %d x2 %d; A knows x1 %d\n",
+                h[a.node].pending().holds(x1), h[a.node].pending().holds(x2), h[b.node].pending().holds(x1),
+                h[b.node].pending().holds(x2), h[a.node].tree().find(x1) != nullptr ? 1 : 0);
+    const pb::PathbRelayStats& sc = c.relay->stats();
+    const pb::PathbRelayStats& sa = a.relay->stats();
+    const std::uint64_t f0 = sc.reoffer_frames.load();
+    for (const pb::Hash32& y : {y1, y2, y3})
+        w.q.push_back(FakeWire::Msg{0, 2, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(y), 16)});
+    w.run();
+    for (int k = 0; k < 4; ++k) {
+        h.now += 1;
+        a.relay->tick();
+        b.relay->tick();
+        c.relay->tick();
+        w.run();
+    }
+    std::printf("  after the heal: C best==y3 %d; C pending holds x1 %d x2 %d; C offers %llu receipts %llu frames %llu\n",
+                h[c.node].tree().best().id == y3 ? 1 : 0, h[c.node].pending().holds(x1), h[c.node].pending().holds(x2),
+                (unsigned long long)sc.repend_offers.load(), (unsigned long long)sc.repend_offered.load(),
+                (unsigned long long)(sc.reoffer_frames.load() - f0));
+    std::printf("  A holds x1 %d x2 %d (A knows x1 now: %d; A tip header requests %llu); B holds x1 %d x2 %d\n",
+                h[a.node].pending().holds(x1), h[a.node].pending().holds(x2),
+                h[a.node].tree().find(x1) != nullptr ? 1 : 0, (unsigned long long)sa.tip_header_requests.load(),
+                h[b.node].pending().holds(x1), h[b.node].pending().holds(x2));
+    const bool held = h[a.node].pending().holds(x1) && h[b.node].pending().holds(x1) && h[a.node].pending().holds(x2)
+                      && h[b.node].pending().holds(x2);
+    h.tick_monero();
+    const bool mined = mine_on(h, w, b.node, 4, 530);
+    const pb::Hash32 tb = h[b.node].tree().best().id;
+    const pb::CarrierBodyV3* cb = h[b.node].bodies().get(tb);
+    bool c1 = false, c2 = false;
+    if (cb)
+        for (const pb::ReceiptBodyV3& r : cb->carried) {
+            c1 = c1 || pb::receipt_id(r) == x1;
+            c2 = c2 || pb::receipt_id(r) == x2;
+        }
+    std::printf("  B mined %d; B's carrier carries x1 %d x2 %d; C pending after: x1 %d x2 %d\n", mined, c1, c2,
+                h[c.node].pending().holds(x1), h[c.node].pending().holds(x2));
+    check(ok && x2_on_x1, "revrepend2 setup");
+    check(held, "revrepend2: A and B hold X1's and X2's re-pended receipts (X2's tip X1 on the abandoned branch)");
+    check(mined && c1 && c2 && !h[c.node].pending().holds(x1) && !h[c.node].pending().holds(x2),
+          "revrepend2: C mines no more; B's next carrier carries X1's and X2's re-pended receipts");
+}
 
 // ---------------------------------------------------------------------------
 // relayrxbind2: a walk that placed a walked carrier (it carries nothing), then whose bind of the next failed on RandomX
@@ -4693,6 +4786,7 @@ int main(int argc, char** argv) {
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
     run("relayrepend", relayrepend);
+    run("revrepend2", revrepend2);
     run("relayqfull", relayqfull);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);

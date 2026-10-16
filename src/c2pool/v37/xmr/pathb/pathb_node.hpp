@@ -306,6 +306,7 @@ class PendingSet {
 public:
     explicit PendingSet(std::uint64_t cap) : cap_(cap) {}
     std::size_t size() const noexcept { return by_id_.size(); }
+    std::uint64_t cap() const noexcept { return cap_; }
     bool holds(const Hash32& id) const { return by_id_.count(id) != 0; }
     const PendingReceipt* get(const Hash32& id) const {
         const auto it = by_id_.find(id);
@@ -481,6 +482,7 @@ public:
     const CarrierBodies& bodies() const noexcept { return *bodies_; }
     const HeaderIndex& headers() const noexcept { return *headers_; }
     const PendingSet& pending() const noexcept { return pending_; }
+    std::uint64_t pending_cap() const noexcept { return pending_.cap(); }  // P-09
     const DeferredCarriers& deferred() const noexcept { return deferred_; }
     const AlarmSink& alarms() const noexcept { return alarm_; }
     // A's bound-work profile (rule (4)): the joined state's in its session, else the node's own chain's.

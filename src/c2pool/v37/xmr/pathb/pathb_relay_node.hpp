@@ -227,6 +227,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
+    std::atomic<std::uint64_t> receipts_parked{0}, parked_receipt_drops{0};  // DEFERred receipts parked; dropped over P-09
     // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
     std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
@@ -775,6 +776,11 @@ public:
             return;
         }
         rerun_parked(std::vector<Missing>{Missing::Seed, Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights});
+    }
+    // The DEFERred receipts parked (P-09 at most).
+    std::size_t parked_receipts() {
+        const NodeGuard g(*this);
+        return parked_receipts_.size();
     }
     // The digests indexed for a re-run, every cause.
     std::size_t parked_index_size() {
@@ -1483,7 +1489,14 @@ private:
             }
             if (!rx_fail)
                 for (const NodeEventResult& r : rs) {
-                    after_result_locked(j.peer, r, std::nullopt, fx, !j.solicited, /*carrier=*/false);
+                    const bool park = r.action == NodeAction::Parked && r.admit.missing && rerun_cause(*r.admit.missing);
+                    const Hash32 rid = park ? receipt_key(r, j.frame) : Hash32{};
+                    if (park)
+                        park_receipt_locked(rid, j);
+                    else if (!receipt_asked_.empty())
+                        receipt_asked_.erase(receipt_key(r, j.frame));  // admitted or judged: its asks go
+                    after_result_locked(j.peer, r, std::nullopt, fx, !j.solicited, /*carrier=*/false,
+                                        park ? std::optional<Hash32>(rid) : std::nullopt);
                     // a first-seen receipt (held now, or evicted at once by P-09; a copy held before is a duplicate),
                     // or a #7 refusal
                     if ((r.admit.verdict == AdmitVerdict::AdmitPending &&
@@ -1645,8 +1658,10 @@ private:
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
     // TipBodies DEFER bound and placed, the joiner's signal.
     // carrier: the object is a carrier (its Monero context climbs to P-07), else a receipt (P-06).
+    // receipt: a DEFERred receipt this node parked (park_receipt_locked): indexed under its cause by its id; each peer
+    // is asked for one cause at most once per parked receipt.
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
-                             bool relayed = true, bool carrier = true) {
+                             bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
         if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
         switch (r.action) {
             case NodeAction::JoinerPath: fx.join = true; break;
@@ -1672,6 +1687,13 @@ private:
         const std::optional<Hash32> d =
                 digest ? std::optional<Hash32>(r.admit.digest != Hash32{} ? r.admit.digest : *digest) : std::nullopt;
         if (d && rerun_cause(m)) parked_by_cause_[m].insert(*d);
+        if (receipt) {
+            parked_by_cause_[m].insert(*receipt);
+            if (!receipt_asked_[*receipt].insert(std::make_pair(peer, m)).second) {
+                take_rx_failed_locked(fx);
+                return;
+            }
+        }
         switch (m) {
             case Missing::TipUnknown:
             case Missing::TipHeaders: request_tip_headers(peer, r.admit.fetch_from, r.admit.fetch, d); break;
@@ -1816,14 +1838,19 @@ private:
     // The frames parked for these causes, and those marked for a re-walk, run again (each a new job of its sender).
     void rerun_parked(const std::vector<Missing>& causes) {
         std::vector<ParkedFrame> again;
+        std::vector<Job> again_receipts;
         std::size_t rewalked = 0;
         {
             const NodeGuard g(*this);
             for (const Missing cause : causes) {
                 std::set<Hash32> ds;
                 ds.swap(parked_by_cause_[cause]);
-                for (const Hash32& d : ds)
-                    if (std::optional<ParkedFrame> f = node_->take_parked(d)) again.push_back(std::move(*f));
+                for (const Hash32& d : ds) {
+                    if (std::optional<ParkedFrame> f = node_->take_parked(d))
+                        again.push_back(std::move(*f));
+                    else if (std::optional<Job> j = take_parked_receipt_locked(d))
+                        again_receipts.push_back(std::move(*j));
+                }
             }
             std::vector<ParkedFrame> rw = node_->take_rewalk_frames();
             rewalked = rw.size();
@@ -1834,6 +1861,44 @@ private:
             st_.parked_reruns++;
             enqueue_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true});
         }
+        for (Job& j : again_receipts) {
+            st_.parked_reruns++;
+            enqueue_job(std::move(j));
+        }
+    }
+    // ---- DEFERred receipts (SPEC DEFER: parked, run again when the missing data arrive) ----
+    // The receipt's id (a DEFER may come before the id is known: the frame's digest then).
+    static Hash32 receipt_key(const NodeEventResult& r, const std::vector<std::uint8_t>& frame) {
+        return r.admit.id != Hash32{} ? r.admit.id : ::v37::sha256d(frame);
+    }
+    // Under the node lock: the one-body FB_RECEIPTS job of a DEFERred receipt kept by its id (run again as a re-run:
+    // no token, P-15 counted at its first admission), at most the pending set's cap (P-09): over it the oldest goes.
+    void park_receipt_locked(const Hash32& id, const Job& j) {
+        const auto it = parked_receipts_.find(id);
+        if (it != parked_receipts_.end()) parked_receipt_order_.erase(it->second.first);
+        Job k = j;
+        k.rerun = true;
+        k.not_before_ms = 0;
+        const std::uint64_t seq = ++parked_receipt_seq_;
+        parked_receipts_[id] = std::make_pair(seq, std::move(k));
+        parked_receipt_order_[seq] = id;
+        st_.receipts_parked++;
+        const std::uint64_t cap = node_->pending_cap();
+        while (parked_receipts_.size() > cap && !parked_receipt_order_.empty()) {
+            const Hash32 old = parked_receipt_order_.begin()->second;
+            parked_receipt_order_.erase(parked_receipt_order_.begin());
+            parked_receipts_.erase(old);
+            receipt_asked_.erase(old);
+            st_.parked_receipt_drops++;
+        }
+    }
+    std::optional<Job> take_parked_receipt_locked(const Hash32& id) {
+        const auto it = parked_receipts_.find(id);
+        if (it == parked_receipts_.end()) return std::nullopt;
+        Job j = std::move(it->second.second);
+        parked_receipt_order_.erase(it->second.first);
+        parked_receipts_.erase(it);
+        return j;
     }
     void rerun_parked(Missing cause) { rerun_parked(std::vector<Missing>{cause}); }
 
@@ -3440,6 +3505,10 @@ private:
     RelayNodeLock lock_;  // the node lock
     // owned by the node lock
     std::map<Missing, std::set<Hash32>> parked_by_cause_;
+    std::map<Hash32, std::pair<std::uint64_t, Job>> parked_receipts_;  // DEFERred receipts by id: (seq, job)
+    std::map<std::uint64_t, Hash32> parked_receipt_order_;             // by seq: the oldest first (P-09)
+    std::uint64_t parked_receipt_seq_ = 0;
+    std::map<Hash32, std::set<std::pair<std::uint64_t, Missing>>> receipt_asked_;  // (peer, cause) asked once per receipt
     bool bucket_stalled_ = false;
     bool reask_due_ = false;
 
