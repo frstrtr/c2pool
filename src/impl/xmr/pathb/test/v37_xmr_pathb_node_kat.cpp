@@ -4423,10 +4423,12 @@ void revrepend2() {
 
 // ---------------------------------------------------------------------------
 // relayrpark: the receipt park under junk. B (verify queue 4, pending cap 6) gets receipts of A whose tip nobody holds:
-// each DEFERs before any PoW row and is parked under TipUnknown. (a) Ten parked: the cap keeps six, four go with their
-// index entries and asks. (c) Its cause resolving with two honest receipts queued: the re-run takes the queue's free
+// each DEFERs before any PoW row and is parked under TipUnknown. (a) Ten parked: the cap keeps the newest six, the
+// oldest four go with their index entries; none is counted in P-15. (b) The same receipt again from the same peer:
+// parked once, asked once. (c) Its cause resolving with two honest receipts queued: the re-run takes the queue's free
 // room (two), drops no queued job, keeps its asks (no new header request); the rest run on the next tick. (d) Re-run
-// jobs dropped from the full verify queue leave the park with their asks.
+// jobs dropped from the full verify queue leave the park with their asks. (e) An honest receipt parked on its unknown
+// tip and admitted on its re-run is counted in P-15 once.
 void relayrpark() {
     const KatNet net;
     Harness h(net);
@@ -4479,19 +4481,34 @@ void relayrpark() {
         r.side.tip[0] = static_cast<std::uint8_t>(k + 1);
         junk.push_back(frame_of(r));
     }
+    const double valid0 = rb.peer_valid_left(pa);
     const std::uint64_t parked0 = st.receipts_parked.load(), drops0 = st.parked_receipt_drops.load();
     for (const std::vector<std::uint8_t>& f : junk) {
         rb.receive(pa, f);
         w.run();
     }
+    bool newest = true;
+    for (std::size_t k = 0; k < junk.size(); ++k) newest = newest && rb.receipt_parked(junk[k]) == (k >= 4);
     const std::uint64_t hdr_a = st.tip_header_requests.load();
-    std::printf("  (a) parked %zu (parked %llu, dropped %llu), index %zu, asks %zu, header requests %llu\n", rb.parked_receipts(),
-                (unsigned long long)(st.receipts_parked.load() - parked0),
-                (unsigned long long)(st.parked_receipt_drops.load() - drops0), rb.parked_index_size(),
-                rb.parked_receipt_asks(), (unsigned long long)hdr_a);
-    check(rb.parked_receipts() == 6 && st.parked_receipt_drops.load() - drops0 == 4 && rb.parked_index_size() == 6
-                  && rb.parked_receipt_asks() == 6,
-          "relayrpark (a): ten junk receipts parked under the cap of six: four go with their index entries and asks");
+    std::printf("  (a) parked %zu (parked %llu, dropped %llu), the newest six %d, index %zu, asks %zu, header requests %llu,"
+                " P-15 left %.1f -> %.1f\n",
+                rb.parked_receipts(), (unsigned long long)(st.receipts_parked.load() - parked0),
+                (unsigned long long)(st.parked_receipt_drops.load() - drops0), newest ? 1 : 0, rb.parked_index_size(),
+                rb.parked_receipt_asks(), (unsigned long long)hdr_a, valid0, rb.peer_valid_left(pa));
+    check(rb.parked_receipts() == 6 && st.parked_receipt_drops.load() - drops0 == 4 && newest
+                  && rb.parked_index_size() == 6 && rb.parked_receipt_asks() == 6,
+          "relayrpark (a): ten junk receipts parked under the cap of six: the oldest four go with their index entries "
+          "and asks");
+    check(rb.peer_valid_left(pa) == valid0 && rb.strikes_of(pa) == 0 && st.bans.load() == 0,
+          "relayrpark (a): a DEFERred receipt is not counted in P-15 (no strike, no ban)");
+    rb.receive(pa, junk[9]);
+    w.run();
+    std::printf("  (b) again: parked %zu, dropped %llu, asks %zu, header requests %llu -> %llu\n", rb.parked_receipts(),
+                (unsigned long long)(st.parked_receipt_drops.load() - drops0), rb.parked_receipt_asks(),
+                (unsigned long long)hdr_a, (unsigned long long)st.tip_header_requests.load());
+    check(rb.parked_receipts() == 6 && st.parked_receipt_drops.load() - drops0 == 4 && rb.receipt_parked(junk[4])
+                  && rb.parked_receipt_asks() == 6 && st.tip_header_requests.load() == hdr_a,
+          "relayrpark (b): the same receipt again from the same peer: parked once, its peer asked once");
     rb.receive(pa, frame_of(rs[0]));
     rb.receive(pa, frame_of(rs[1]));
     const std::size_t vq0 = rb.verify_queue_size();
@@ -4526,6 +4543,39 @@ void relayrpark() {
     check(vq3 == 4 && qd3 == 4 && rb.parked_receipts() == 2 && rb.parked_receipt_asks() == 2
                   && rb.parked_receipts_due() == 2 && rb.parked_index_size() == 0,
           "relayrpark (d): re-run jobs dropped from the full verify queue leave the park with their asks");
+    // (e) an honest receipt whose tip B lacks: parked, then admitted on its re-run once the tip's branch arrives; counted
+    // in P-15 once, at that admission (its DEFER run not)
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    h.tick_monero();
+    bool eok = mine_on(h, w, a.node, 1, 830);
+    const std::optional<pb::PathbJob> uj = h.job(a.node, 3, 831);
+    eok = eok && uj && mine_on(h, w, a.node, 1, 832);
+    eok = eok && h[a.node].on_own_share(*uj, 831, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    std::optional<pb::ReceiptBodyV3> u;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all())
+        if (h[b.node].tree().find(r->body.side.tip) == nullptr) u = r->body;
+    const std::uint64_t c0 = st.p15_counted.load(), parked_e = st.receipts_parked.load();
+    if (u) {
+        rb.receive(pa, frame_of(*u));
+        w.run();
+        for (int k = 0; k < 3 && !h[b.node].pending().holds(pb::receipt_id(*u)); ++k) {
+            h.now += 1;
+            rb.tick();
+            a.relay->tick();
+            w.run();
+        }
+    }
+    const bool held_u = u && h[b.node].pending().holds(pb::receipt_id(*u));
+    std::printf("  (e) setup %d, u's tip unknown at B %d; parked %llu; u held %d; P-15 counted %llu\n", eok ? 1 : 0, u ? 1 : 0,
+                (unsigned long long)(st.receipts_parked.load() - parked_e), held_u ? 1 : 0,
+                (unsigned long long)(st.p15_counted.load() - c0));
+    check(eok && u && st.receipts_parked.load() > parked_e && held_u && st.p15_counted.load() - c0 == 1,
+          "relayrpark (e): a receipt parked on its unknown tip, admitted on its re-run: counted in P-15 once, at that "
+          "admission");
 }
 
 // ---------------------------------------------------------------------------
