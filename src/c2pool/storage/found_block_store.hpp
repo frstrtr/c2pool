@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <optional>
 #include <core/leveldb_store.hpp>
 #include <core/uint256.hpp>
 #include <core/log.hpp>
@@ -37,15 +38,27 @@ struct FoundBlockRecord {
     double      pool_hashrate{0.0};      // pool hashrate at time of find
     std::string share_hash;              // hash of the share that found the block
     uint8_t     authorship{0};           // BlockAuthorship: 0=unknown, 1=peer, 2=this node
+    // --- v3 explorer fields (issue #946) ---
+    // Empty coinbase_txid / nullopt tx_count mean "not known yet" and render as
+    // JSON null. tx_count stays unset on peer-found rows until the full block
+    // arrives over P2P (v34+ shares carry no tx list), so 0 is never a stand-in.
+    std::string             coinbase_txid;
+    std::optional<uint32_t> tx_count;
+    // --- v4 merged-parent fields (issue #946) ---
+    // DOGE rows only: the LTC block id the aux solve was mined on and the LTC
+    // height it was mined at. Empty / nullopt = unknown (JSON null), never 0.
+    std::string             parent_hash;
+    std::optional<uint64_t> parent_height;
 
     // Serialize to bytes for LevelDB storage
     std::vector<uint8_t> serialize() const
     {
         PackStream ps;
-        // Version byte. v2 appends the enrichment tail after the v1 body; a v1
-        // reader stops at reward_satoshis and a v2 reader that meets a v1 record
-        // simply leaves the new fields at their defaults (read-compat).
-        uint8_t version = 2;
+        // Version byte. Each version appends a tail after the previous body; a
+        // newer reader that meets an older record leaves the missing fields at
+        // their defaults (read-compat). v2 = #159 enrichment, v3 = #946 explorer,
+        // v4 = #946 merged parent.
+        uint8_t version = 4;
         ps << version;
         // Chain as length-prefixed string
         uint8_t chain_len = static_cast<uint8_t>(std::min(chain.size(), size_t(255)));
@@ -85,6 +98,24 @@ struct FoundBlockRecord {
             ps.write(std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(share_hash.data()), sh_len));
         ps << authorship;
+        // --- v3 tail ---
+        uint8_t cb_len = static_cast<uint8_t>(std::min(coinbase_txid.size(), size_t(255)));
+        ps << cb_len;
+        if (cb_len > 0)
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(coinbase_txid.data()), cb_len));
+        uint8_t has_tx_count = tx_count.has_value() ? 1 : 0;
+        ps << has_tx_count;
+        ps << static_cast<uint32_t>(tx_count.value_or(0));
+        // --- v4 tail ---
+        uint8_t ph_len = static_cast<uint8_t>(std::min(parent_hash.size(), size_t(255)));
+        ps << ph_len;
+        if (ph_len > 0)
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(parent_hash.data()), ph_len));
+        uint8_t has_parent_height = parent_height.has_value() ? 1 : 0;
+        ps << has_parent_height;
+        ps << static_cast<uint64_t>(parent_height.value_or(0));
 
         auto span = ps.get_span();
         return {reinterpret_cast<const uint8_t*>(span.data()),
@@ -97,33 +128,38 @@ struct FoundBlockRecord {
         FoundBlockRecord rec;
         if (data.size() < 4) return rec;
 
+        // A short read consumes the rest of the buffer and sets overrun, so the
+        // leftover bytes of a cut field can never be read as the next field.
         size_t pos = 0;
+        bool overrun = false;
         auto read_u8 = [&]() -> uint8_t {
-            return pos < data.size() ? data[pos++] : 0;
+            if (pos < data.size()) return data[pos++];
+            overrun = true;
+            return 0;
         };
         auto read_u32 = [&]() -> uint32_t {
-            if (pos + 4 > data.size()) return 0;
+            if (pos + 4 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint32_t v;
             std::memcpy(&v, &data[pos], 4);
             pos += 4;
             return v;
         };
         auto read_u64 = [&]() -> uint64_t {
-            if (pos + 8 > data.size()) return 0;
+            if (pos + 8 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint64_t v;
             std::memcpy(&v, &data[pos], 8);
             pos += 8;
             return v;
         };
         auto read_str = [&](uint8_t len) -> std::string {
-            if (pos + len > data.size()) { pos = data.size(); return ""; }
+            if (pos + len > data.size()) { pos = data.size(); overrun = true; return ""; }
             std::string s(reinterpret_cast<const char*>(&data[pos]), len);
             pos += len;
             return s;
         };
 
         uint8_t version = read_u8();
-        if (version != 1 && version != 2) return rec; // unknown version
+        if (version < 1 || version > 4) return rec; // unknown version
 
         uint8_t chain_len = read_u8();
         rec.chain = read_str(chain_len);
@@ -138,6 +174,11 @@ struct FoundBlockRecord {
         uint8_t addr_len = read_u8();
         rec.finder_address = read_str(addr_len);
         rec.reward_satoshis = read_u64();
+
+        // Every writer since v1 writes the whole v1 body, so a cut inside it is
+        // a damaged row: return an empty record (no block_hash), which load_all
+        // and find_by_hash skip.
+        if (overrun) return FoundBlockRecord{};
 
         // --- v2 enrichment tail (absent on v1 records) ---
         // Every read is bounds-checked (read_* return 0/"" past end), so a
@@ -156,6 +197,28 @@ struct FoundBlockRecord {
             uint8_t sh_len = read_u8();
             rec.share_hash = read_str(sh_len);
             rec.authorship = read_u8();
+        }
+
+        // --- v3 explorer tail (absent on v1/v2 records) ---
+        if (version >= 3) {
+            uint8_t cb_len = read_u8();
+            rec.coinbase_txid = read_str(cb_len);
+            uint8_t has_tx_count = read_u8();
+            // A truncated tail must not turn into a known tx_count of 0.
+            bool whole = pos + 4 <= data.size();
+            uint32_t n = read_u32();
+            if (has_tx_count && whole) rec.tx_count = n;
+        }
+
+        // --- v4 merged-parent tail (absent on v1-v3 records) ---
+        if (version >= 4) {
+            uint8_t ph_len = read_u8();
+            rec.parent_hash = read_str(ph_len);
+            uint8_t has_parent_height = read_u8();
+            // Same rule as tx_count: a cut tail stays unknown, never 0.
+            bool whole = pos + 8 <= data.size();
+            uint64_t ph = read_u64();
+            if (has_parent_height && whole) rec.parent_height = ph;
         }
 
         return rec;
@@ -189,6 +252,8 @@ public:
             return false;
 
         auto rec = FoundBlockRecord::deserialize(data);
+        if (rec.block_hash.empty())
+            return false; // damaged row; don't overwrite it with an empty one
         rec.status = new_status;
         rec.check_count = check_count;
         rec.confirmations = confirmations;
@@ -230,6 +295,41 @@ public:
         return m_store.list_keys("fblk:", 10000).size();
     }
 
+    /// Look a record up by its FULL block hash (#946 GET /found_block/<hash>).
+    /// The key only carries hash.substr(0,16), so the key suffix is the index
+    /// and the full hash in the value is the check: two blocks sharing a
+    /// 16-char prefix never answer for each other. No result cap.
+    std::optional<FoundBlockRecord> find_by_hash(const std::string& block_hash)
+    {
+        if (block_hash.size() < 16) return std::nullopt;
+        for (const auto& key : m_store.list_keys("fblk:", SIZE_MAX)) {
+            if (!key_ends_with_hash(key, block_hash)) continue;
+            std::vector<uint8_t> data;
+            if (!m_store.get(key, data)) continue;
+            auto rec = FoundBlockRecord::deserialize(data);
+            if (rec.block_hash == block_hash) return rec;
+        }
+        return std::nullopt;
+    }
+
+    /// Fill the #946 body fields once the full block is known. Returns false
+    /// when the record does not exist. Every other field is left as stored.
+    bool update_body(const std::string& chain, uint64_t height,
+                     const std::string& block_hash,
+                     const std::string& coinbase_txid, uint32_t tx_count)
+    {
+        auto key = make_key(chain, height, block_hash);
+        std::vector<uint8_t> data;
+        if (!m_store.get(key, data))
+            return false;
+        auto rec = FoundBlockRecord::deserialize(data);
+        if (rec.block_hash != block_hash)
+            return false;
+        rec.coinbase_txid = coinbase_txid;
+        rec.tx_count = tx_count;
+        return m_store.put(key, rec.serialize());
+    }
+
 private:
     core::LevelDBStore& m_store;
 
@@ -243,6 +343,13 @@ private:
             << std::setfill('0') << std::setw(12) << height << ":"
             << block_hash.substr(0, 16); // truncate hash in key (full hash in value)
         return oss.str();
+    }
+
+    static bool key_ends_with_hash(const std::string& key, const std::string& block_hash)
+    {
+        const std::string tail = ":" + block_hash.substr(0, 16);
+        return key.size() >= tail.size() &&
+               key.compare(key.size() - tail.size(), tail.size(), tail) == 0;
     }
 };
 
@@ -258,13 +365,19 @@ struct MergedBlockRecord {
     bool        accepted{true};
     uint64_t    coinbase_value{0};
     bool        is_local{false};
-    uint32_t    parent_height{0};
+    uint32_t    parent_height{0};   // LTC height the parent was mined at; 0 = unknown
     std::string miner;
+    // --- v2 explorer fields (issue #946) ---
+    // Empty string / nullopt = unknown, rendered as JSON null (never "" or 0).
+    std::string             share_hash;     // null when the solve missed the share target
+    std::string             coinbase_txid;
+    std::optional<uint32_t> tx_count;       // unset until the full DOGE block arrives
 
     std::vector<uint8_t> serialize() const
     {
         PackStream ps;
-        uint8_t version = 1;
+        // v2 appends the #946 tail after the v1 body; v1 records still load.
+        uint8_t version = 2;
         ps << version;
         ps << chain_id;
         uint8_t sym_len = static_cast<uint8_t>(std::min(symbol.size(), size_t(31)));
@@ -290,6 +403,20 @@ struct MergedBlockRecord {
         if (mn_len > 0)
             ps.write(std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(miner.data()), mn_len));
+        // --- v2 tail ---
+        uint8_t sh_len = static_cast<uint8_t>(std::min(share_hash.size(), size_t(255)));
+        ps << sh_len;
+        if (sh_len > 0)
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(share_hash.data()), sh_len));
+        uint8_t cb_len = static_cast<uint8_t>(std::min(coinbase_txid.size(), size_t(255)));
+        ps << cb_len;
+        if (cb_len > 0)
+            ps.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(coinbase_txid.data()), cb_len));
+        uint8_t has_tx_count = tx_count.has_value() ? 1 : 0;
+        ps << has_tx_count;
+        ps << static_cast<uint32_t>(tx_count.value_or(0));
 
         auto span = ps.get_span();
         return {reinterpret_cast<const uint8_t*>(span.data()),
@@ -300,24 +427,29 @@ struct MergedBlockRecord {
     {
         MergedBlockRecord rec;
         if (data.size() < 4) return rec;
+        // Same short-read rule as FoundBlockRecord::deserialize.
         size_t pos = 0;
-        auto read_u8 = [&]() -> uint8_t { return pos < data.size() ? data[pos++] : 0; };
+        bool overrun = false;
+        auto read_u8 = [&]() -> uint8_t {
+            if (pos < data.size()) return data[pos++];
+            overrun = true; return 0;
+        };
         auto read_u32 = [&]() -> uint32_t {
-            if (pos + 4 > data.size()) return 0;
+            if (pos + 4 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint32_t v; std::memcpy(&v, &data[pos], 4); pos += 4; return v;
         };
         auto read_u64 = [&]() -> uint64_t {
-            if (pos + 8 > data.size()) return 0;
+            if (pos + 8 > data.size()) { pos = data.size(); overrun = true; return 0; }
             uint64_t v; std::memcpy(&v, &data[pos], 8); pos += 8; return v;
         };
         auto read_str = [&](uint8_t len) -> std::string {
-            if (pos + len > data.size()) { pos = data.size(); return ""; }
+            if (pos + len > data.size()) { pos = data.size(); overrun = true; return ""; }
             std::string s(reinterpret_cast<const char*>(&data[pos]), len);
             pos += len; return s;
         };
 
         uint8_t version = read_u8();
-        if (version != 1) return rec;
+        if (version < 1 || version > 2) return rec; // unknown version
         rec.chain_id = read_u32();
         rec.symbol = read_str(read_u8());
         rec.height = static_cast<int>(read_u32());
@@ -330,6 +462,18 @@ struct MergedBlockRecord {
         rec.coinbase_value = read_u64();
         rec.parent_height = read_u32();
         rec.miner = read_str(read_u8());
+        // A cut inside the v1 body is a damaged row; load_all skips it.
+        if (overrun) return MergedBlockRecord{};
+        // --- v2 explorer tail (absent on v1 records) ---
+        if (version >= 2) {
+            rec.share_hash = read_str(read_u8());
+            rec.coinbase_txid = read_str(read_u8());
+            uint8_t has_tx_count = read_u8();
+            // A truncated tail must not turn into a known tx_count of 0.
+            bool whole = pos + 4 <= data.size();
+            uint32_t n = read_u32();
+            if (has_tx_count && whole) rec.tx_count = n;
+        }
         return rec;
     }
 };
@@ -348,17 +492,43 @@ public:
 
     bool update_coinbase(const std::string& block_hash, uint32_t chain_id, uint64_t coinbase_value)
     {
-        auto keys = m_store.list_keys("mblk:", 1000);
-        for (const auto& key : keys) {
+        auto key = find_key(block_hash, chain_id);
+        if (!key) return false;
+        std::vector<uint8_t> data;
+        if (!m_store.get(*key, data)) return false;
+        auto rec = MergedBlockRecord::deserialize(data);
+        rec.coinbase_value = coinbase_value;
+        return m_store.put(*key, rec.serialize());
+    }
+
+    /// Fill the #946 body fields once the full merged block is known.
+    bool update_body(const std::string& block_hash, uint32_t chain_id,
+                     const std::string& coinbase_txid, uint32_t tx_count)
+    {
+        auto key = find_key(block_hash, chain_id);
+        if (!key) return false;
+        std::vector<uint8_t> data;
+        if (!m_store.get(*key, data)) return false;
+        auto rec = MergedBlockRecord::deserialize(data);
+        rec.coinbase_txid = coinbase_txid;
+        rec.tx_count = tx_count;
+        return m_store.put(*key, rec.serialize());
+    }
+
+    /// Look a record up by its FULL block hash across every merged chain
+    /// (#946 GET /found_block/<hash>). Same key-suffix index + full-hash check
+    /// as FoundBlockStore::find_by_hash.
+    std::optional<MergedBlockRecord> find_by_hash(const std::string& block_hash)
+    {
+        if (block_hash.size() < 16) return std::nullopt;
+        for (const auto& key : m_store.list_keys("mblk:", SIZE_MAX)) {
+            if (!key_ends_with_hash(key, block_hash)) continue;
             std::vector<uint8_t> data;
             if (!m_store.get(key, data)) continue;
             auto rec = MergedBlockRecord::deserialize(data);
-            if (rec.block_hash == block_hash && rec.chain_id == chain_id) {
-                rec.coinbase_value = coinbase_value;
-                return m_store.put(key, rec.serialize());
-            }
+            if (rec.block_hash == block_hash) return rec;
         }
-        return false;
+        return std::nullopt;
     }
 
     std::vector<MergedBlockRecord> load_all()
@@ -392,6 +562,31 @@ private:
             << std::setfill('0') << std::setw(12) << height << ":"
             << block_hash.substr(0, 16);
         return oss.str();
+    }
+
+    static bool key_ends_with_hash(const std::string& key, const std::string& block_hash)
+    {
+        const std::string tail = ":" + block_hash.substr(0, 16);
+        return key.size() >= tail.size() &&
+               key.compare(key.size() - tail.size(), tail.size(), tail) == 0;
+    }
+
+    /// Key of the record for (block_hash, chain_id), or nullopt. Scans only
+    /// this chain's keys, newest height first, with no result cap. It used to
+    /// scan list_keys("mblk:", 1000) oldest first across all chains, so once
+    /// 1000 records existed the newest block never got its coinbase_value.
+    std::optional<std::string> find_key(const std::string& block_hash, uint32_t chain_id)
+    {
+        auto keys = m_store.list_keys("mblk:" + std::to_string(chain_id) + ":", SIZE_MAX);
+        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+            if (!key_ends_with_hash(*it, block_hash)) continue;
+            std::vector<uint8_t> data;
+            if (!m_store.get(*it, data)) continue;
+            auto rec = MergedBlockRecord::deserialize(data);
+            if (rec.block_hash == block_hash && rec.chain_id == chain_id)
+                return *it;
+        }
+        return std::nullopt;
     }
 };
 
