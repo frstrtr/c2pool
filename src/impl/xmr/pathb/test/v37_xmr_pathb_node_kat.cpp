@@ -154,7 +154,7 @@
 //                held; a peer's carrier carries both;
 //   relayqfull   a link dropped for a full queue at a relay send: a re-offer
 //                drop while the peer's re-offer pages, else a live one;
-//   relayrxbind2 a walk placed a walked carrier, then the bind of the next
+//   relayrxbind2 one walk placed a walked carrier, then the bind of the next
 //                failed on RandomX: the placed one kept; the re-run places
 //                the rest;
 //   ownrxrun     the own share path: RandomX fails on an own share: kept, no
@@ -4413,9 +4413,10 @@ void revrepend2() {
 }
 
 // ---------------------------------------------------------------------------
-// relayrxbind2: a walk that placed a walked carrier (it carries nothing), then whose bind of the next failed on RandomX
-// (a body only that one carries): the placed id stays placed and counted (walk_placed), the failure counted; the
-// parked frame's re-run places the rest.
+// relayrxbind2: ONE walk places a walked carrier, then the bind of the next fails on RandomX (a body only that one
+// carries): the placed id stays placed and counted (walk_placed), the failure counted; the parked frame's re-run places
+// the rest. Both walked carriers carry a body: X asks sa1's body set (sa2's header binds only once sa1 is placed); sa2's
+// body set is in X's index when sa1's arrives, so the walk that places sa1 goes on to sa2 and fails there.
 void relayrxbind2() {
     const KatNet net;
     Harness h(net);
@@ -4426,10 +4427,15 @@ void relayrxbind2() {
     w.connect(0, 1);
     w.run();
     bool ok = true;
+    std::optional<pb::PathbJob> va;
     for (int i = 0; i < 4; ++i) {
         if (i % 2 == 0) h.tick_monero();
+        if (i == 3) va = h.job(a.node, 5, 350);
         ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
     }
+    // v: A's share on a stale tip, pending (at A and L): A's first race carrier carries it
+    ok = ok && va && h[a.node].on_own_share(*va, 350, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
     const std::optional<pb::PathbJob> ua = h.job(a.node, 6, 360);
     // the race: A mines two (its second carries a body of A's alone), L three: A's branch loses
     w.edit = [](FakeWire::Msg& m) {
@@ -4450,9 +4456,9 @@ void relayrxbind2() {
     bool in2 = false, in1 = false;
     for (const pb::ReceiptBodyV3& b : h[a.node].bodies().get(sa2)->carried) in2 = in2 || pb::receipt_id(b) == u;
     for (const pb::ReceiptBodyV3& b : h[a.node].bodies().get(sa1)->carried) in1 = in1 || pb::receipt_id(b) == u;
-    ok = ok && ka && in2 && !in1;
+    ok = ok && ka && in2 && !in1 && !h[a.node].bodies().get(sa1)->carried.empty();
     if (!ok) {
-        check(false, "relayrxbind2: setup (a two-carrier losing branch, its second carrying a body of its own)");
+        check(false, "relayrxbind2: setup (a two-carrier losing branch, each carrying a body, the second one of its own)");
         return;
     }
     for (const pb::Hash32& id : {sa1, sa2}) w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(id), 16)});
@@ -4475,19 +4481,52 @@ void relayrxbind2() {
     }
     // X follows A alone; no receipt frame reaches X (u is first hashed in the bind of sa2)
     h.throw_pow.insert(u);
-    w.edit = [xn = x.node](FakeWire::Msg& m) {
-        if (m.from == 0 && m.to == xn && !m.f.empty() && m.f[0] == pb::kOpFbReceipts) m.f.clear();
+    // A's reply with sa1's body set held back
+    std::vector<std::vector<std::uint8_t>> sets;
+    w.edit = [&, xn = x.node](FakeWire::Msg& m) {
+        if (m.from != 0 || m.to != xn || m.f.empty()) return;
+        if (m.f[0] == pb::kOpFbReceipts) {
+            m.f.clear();
+            return;
+        }
+        if (m.f[0] != pb::kOpFcCarrier || m.f.size() < pb::kFrameHeaderBytes) return;
+        pb::CarrierBodyV3 cb;
+        if (pb::decode_carrier_body_v3(m.f.data() + pb::kFrameHeaderBytes, m.f.size() - pb::kFrameHeaderBytes,
+                                       pb::CarrierLimits{h[xn].config().buffers.receipt, pb::kRuledLaneParams.r_max}, cb)
+                    == pb::WireError::None
+            && pb::receipt_id(cb.own) == sa1) {
+            sets.push_back(m.f);
+            m.f.clear();
+        }
     };
     const pb::PathbRelayStats& st = x.relay->stats();
     std::string esc;
-    std::uint64_t placed_at_fail = 0;
-    bool sa1_at_fail = false;
+    std::uint64_t placed_at_fail = 0, walk_before = 0;
+    bool sa1_at_fail = false, captured = false;
     try {
         w.connect(a.node, x.node);
         w.run();
+        for (int i = 0; i < 8 && sets.empty(); ++i) {
+            h.now += 1;
+            x.relay->tick();
+            w.run();
+        }
+        walk_before = st.walk_placed.load();
+        // sa2's body set into X's index (as A's reply would put it), then sa1's body set
+        const bool injected = h[x.node].on_body_set(a.node + 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(sa2), 16));
+        const bool both = sets.size() == 1 && injected && h[x.node].tree().find(sa1) == nullptr;
+        if (!both) {
+            w.edit = nullptr;
+            check(false, "relayrxbind2: setup (sa1's body set asked of A " + std::to_string(sets.size()) +
+                                 ", sa2's held " + std::to_string(injected) + ", sa1 not placed before)");
+            return;
+        }
+        for (const std::vector<std::uint8_t>& f : sets) x.relay->receive(a.node + 1, f);
+        w.run();
         for (int i = 0; i < 8 && h[x.node].tree().best().id != c; ++i) {
-            if (st.rx_failures.load() > 0 && placed_at_fail == 0) {
-                placed_at_fail = st.walk_placed.load();
+            if (st.rx_failures.load() > 0 && !captured) {
+                captured = true;
+                placed_at_fail = st.walk_placed.load() - walk_before;
                 sa1_at_fail = h[x.node].tree().find(sa1) != nullptr && h[x.node].tree().find(sa2) == nullptr;
             }
             h.now += 1;
@@ -4504,7 +4543,7 @@ void relayrxbind2() {
                 (unsigned long long)placed_at_fail, sa1_at_fail, h[x.node].tree().best().id == c);
     check(h.throw_pow.count(u) == 0 && esc.empty() && st.rx_failures.load() >= 1 && placed_at_fail >= 1 && sa1_at_fail
                   && h[x.node].tree().best().id == c && st.strikes.load() == 0 && st.bans.load() == 0,
-          "relayrxbind2: a walk placed a walked carrier, then the bind of the next failed on RandomX: the placed one kept "
+          "relayrxbind2: one walk placed a walked carrier, then the bind of the next failed on RandomX: the placed one kept "
           "and counted, the failure counted; the re-run places the rest and the tip");
 }
 
