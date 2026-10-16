@@ -1679,7 +1679,7 @@ private:
     // TipBodies DEFER bound and placed, the joiner's signal.
     // carrier: the object is a carrier (its Monero context climbs to P-07), else a receipt (P-06).
     // receipt: a DEFERred receipt this node parked (park_receipt_locked): indexed under its cause by its key; each peer
-    // is asked for one cause at most once per parked receipt.
+    // is asked for one cause and object at most once per parked receipt; a TipBodies bind runs on every re-run.
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
                              bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
         if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
@@ -1707,23 +1707,31 @@ private:
         const std::optional<Hash32> d =
                 digest ? std::optional<Hash32>(r.admit.digest != Hash32{} ? r.admit.digest : *digest) : std::nullopt;
         if (d && rerun_cause(m)) parked_by_cause_[m].insert(*d);
+        std::set<std::tuple<std::uint64_t, Missing, Hash32>>* asked = nullptr;
+        bool kept = true;
         if (receipt) {
             const auto it = parked_receipts_.find(*receipt);
-            if (it == parked_receipts_.end()) {  // not kept (over the cap at once): nothing to ask for
-                take_rx_failed_locked(fx);
-                return;
-            }
-            parked_by_cause_[m].insert(*receipt);
-            if (!it->second.second.asked.emplace(peer, m, Hash32{}).second) {
-                take_rx_failed_locked(fx);
-                return;
+            kept = it != parked_receipts_.end();  // not kept (over the cap at once): nothing asked for it
+            if (kept) {
+                parked_by_cause_[m].insert(*receipt);
+                asked = &it->second.second.asked;
             }
         }
+        // a parked receipt asks each peer for one cause and object at most once; its TipBodies bind runs every time
+        const auto may = [&](const Hash32& object) {
+            return kept && (asked == nullptr || asked->emplace(peer, m, object).second);
+        };
         switch (m) {
             case Missing::TipUnknown:
-            case Missing::TipHeaders: request_tip_headers(peer, r.admit.fetch_from, r.admit.fetch, d); break;
-            case Missing::ClosureBodies: request_body_set(peer, r.admit.fetch, d); break;
-            case Missing::Bodies: request_carrier(peer, r.admit.fetch); break;
+            case Missing::TipHeaders:
+                if (may(r.admit.fetch)) request_tip_headers(peer, r.admit.fetch_from, r.admit.fetch, d);
+                break;
+            case Missing::ClosureBodies:
+                if (may(r.admit.fetch)) request_body_set(peer, r.admit.fetch, d);
+                break;
+            case Missing::Bodies:
+                if (may(r.admit.fetch)) request_carrier(peer, r.admit.fetch);
+                break;
             case Missing::TipBodies: {
                 const PathbNode::WalkBind wb = node_->bind_walked_branch(r.admit.bind);
                 if (wb.rx_failed) {
@@ -1739,17 +1747,20 @@ private:
                 fx.bans.insert(fx.bans.end(), wb.banned.begin(), wb.banned.end());
                 fx.strikes.insert(fx.strikes.end(), wb.struck.begin(), wb.struck.end());
                 if (!wb.need_bodies.empty() && (!d || node_->may_ask(*d, peer)))
-                    for (const Hash32& id : wb.need_bodies) request_body_set(peer, id, std::nullopt);
+                    for (const Hash32& id : wb.need_bodies)
+                        if (may(id)) request_body_set(peer, id, std::nullopt);
                 if (!wb.placed.empty()) fx.rerun.insert(Missing::TipBodies);
                 break;
             }
             case Missing::MoneroBlock:
             case Missing::MissingBlock:
             case Missing::MissingWeights:
-                if (r.admit.fetch != Hash32{})
+                if (r.admit.fetch != Hash32{} && may(r.admit.fetch))
                     fx.ctx.emplace_back(r.admit.fetch, peer, carrier ? CtxClass::Carrier : CtxClass::Receipt);
                 break;
-            case Missing::MissingBucket: bucket_fetch(r.admit.fetch, r.admit.fetch_bin, peer); break;
+            case Missing::MissingBucket:
+                if (may(r.admit.fetch)) bucket_fetch(r.admit.fetch, r.admit.fetch_bin, peer);
+                break;
             default: break;  // ParentUnknown: the node's own FC_GETCARRIER; MissingRef: a served bucket's references
         }
         take_rx_failed_locked(fx);
@@ -1921,8 +1932,10 @@ private:
     // A parked receipt's key: its one-body frame's digest (the park, its asks, its index and its due entry).
     static Hash32 receipt_key(const std::vector<std::uint8_t>& frame) { return ::v37::sha256d(frame); }
     // Under the node lock: the one-body FB_RECEIPTS job of a DEFERred receipt kept by its key with its asks (run again
-    // as a re-run: no token, P-15 counted at its first admission), at most the pending set's cap (P-09): over it the
-    // oldest goes, with its asks. The same receipt parked again keeps the asks made for it.
+    // as a re-run: the sender's RandomX token taken and given back like any job's, no P-15 gate at its arrival, P-15
+    // counted at its first admission), at most the pending set's cap (P-09; a first-in-first-out store of its own,
+    // not the pending set's overflow order): over it the oldest goes, with its asks. The same receipt parked again
+    // keeps the asks made for it.
     void park_receipt_locked(const Hash32& key, std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked, const Job& j) {
         const auto it = parked_receipts_.find(key);
         if (it != parked_receipts_.end()) {

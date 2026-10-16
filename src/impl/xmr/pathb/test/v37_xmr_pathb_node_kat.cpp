@@ -4765,6 +4765,99 @@ void relayrxbind2() {
 
 
 // ---------------------------------------------------------------------------
+// relayrbindr: a LONE relayed receipt k whose tip ends a two-carrier branch X lacks, each carrier carrying a body X must
+// fetch. Parked on TipUnknown (one header request), then twice on ClosureBodies of the same peer (sa1's body set, then
+// sa2's: one cause, two objects, each asked once), then on TipBodies: the bind places both and k is admitted. The park
+// asks a peer once per cause and object.
+void relayrbindr() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay l = kat_relay(h, w, table0(net), true);
+    KatRelay x = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    std::optional<pb::PathbJob> va;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        if (i == 3) va = h.job(a.node, 5, 350);
+        ok = ok && mine_on(h, w, a.node, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    ok = ok && va && h[a.node].on_own_share(*va, 350, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    const std::optional<pb::PathbJob> ua = h.job(a.node, 6, 360);
+    // the race: A mines two (each carrying a body), L three: A's branch loses
+    w.edit = [](FakeWire::Msg& m) {
+        if ((m.from == 0 && m.to == 1) || (m.from == 1 && m.to == 0)) m.f.clear();
+    };
+    h.tick_monero();
+    ok = ok && ua && mine_on(h, w, a.node, 2, 400);
+    const pb::Hash32 sa1 = h[a.node].tree().best().id;
+    ok = ok && h[a.node].on_own_share(*ua, 360, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && mine_on(h, w, a.node, 2, 402);
+    const pb::Hash32 sa2 = h[a.node].tree().best().id;
+    const std::optional<pb::PathbJob> ka = h.job(a.node, 4, 410);
+    for (int i = 0; i < 3; ++i) ok = ok && mine_on(h, w, l.node, 3, 401 + 10 * static_cast<std::uint32_t>(i));
+    w.edit = nullptr;
+    ok = ok && ka && !h[a.node].bodies().get(sa1)->carried.empty() && !h[a.node].bodies().get(sa2)->carried.empty();
+    for (const pb::Hash32& id : {sa1, sa2}) w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(id), 16)});
+    {
+        std::vector<pb::Hash32> ls;
+        for (pb::Hash32 t = h[l.node].tree().best().id; ls.size() < 3; t = h[l.node].tree().find(t)->parent) ls.push_back(t);
+        for (auto it = ls.rbegin(); it != ls.rend(); ++it)
+            w.q.push_back(FakeWire::Msg{1, 0, *pb::encode_fc_carrier(0, *h[l.node].bodies().get(*it), 16)});
+    }
+    w.run();
+    ok = ok && h[a.node].tree().best().id == h[l.node].tree().best().id && h[a.node].tree().find(sa2) != nullptr;
+    // k: A's share on sa2 (the losing branch's tip), pending at A
+    pb::ReceiptBodyV3 kb = ka->body;
+    kb.blob.nonce = 410;
+    const pb::Hash32 k = pb::receipt_id(kb);
+    ok = ok && h[a.node].on_own_share(*ka, 410, pb::Hash32{}).action == pb::NodeAction::Pending && h[a.node].pending().holds(k);
+    w.run();
+    if (!ok) {
+        check(false, "relayrbindr: setup (a two-carrier losing branch, each carrying a body; k pending at A on its tip)");
+        return;
+    }
+    // X follows A alone: its catch-up reaches A's best (no receipt frame of A reaches X); then k alone
+    const pb::PathbRelayStats& st = x.relay->stats();
+    w.edit = [xn = x.node](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == xn && !m.f.empty() && m.f[0] == pb::kOpFbReceipts) m.f.clear();
+    };
+    w.connect(a.node, x.node);
+    w.run();
+    for (int i = 0; i < 6 && h[x.node].tree().best().id != h[a.node].tree().best().id; ++i) {
+        h.now += 1;
+        x.relay->tick();
+        w.run();
+    }
+    w.edit = nullptr;
+    const bool synced = h[x.node].tree().best().id == h[a.node].tree().best().id && h[x.node].tree().find(sa1) == nullptr;
+    x.relay->receive(a.node + 1, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{kb}, pb::kRuledLaneParams));
+    w.run();
+    for (int i = 0; i < 12 && !h[x.node].pending().holds(k); ++i) {
+        h.now += 1;
+        x.relay->tick();
+        w.run();
+    }
+    std::printf("  relayrbindr: synced %d; X holds k %d; X at A's best %d; sa1 %d sa2 %d placed at X; X parked %llu, tip header requests "
+                "%llu, body set requests %llu, walk placed %llu; strikes %llu bans %llu\n",
+                synced ? 1 : 0, h[x.node].pending().holds(k) ? 1 : 0,
+                h[x.node].tree().best().id == h[a.node].tree().best().id ? 1 : 0,
+                h[x.node].tree().find(sa1) != nullptr ? 1 : 0, h[x.node].tree().find(sa2) != nullptr ? 1 : 0,
+                (unsigned long long)st.receipts_parked.load(), (unsigned long long)st.tip_header_requests.load(),
+                (unsigned long long)st.body_set_requests.load(), (unsigned long long)st.walk_placed.load(),
+                (unsigned long long)st.strikes.load(), (unsigned long long)st.bans.load());
+    check(synced && h[x.node].pending().holds(k) && h[x.node].tree().find(sa2) != nullptr && st.receipts_parked.load() >= 2
+                  && st.body_set_requests.load() >= 2 && st.strikes.load() == 0 && st.bans.load() == 0
+                  && x.relay->parked_receipts() == 0,
+          "relayrbindr: a lone receipt parked on a two-carrier branch: two body sets asked of one peer for one cause, "
+          "the bind places both, the receipt admitted");
+}
+
+// ---------------------------------------------------------------------------
 // ownrxrun: the own share path (W-E5, W-E5b): RandomX fails on a carried receipt of an own share (its memo entry gone):
 // the runner keeps the share (no exit) with one alarm line; its re-run places it (a second line). A kept share whose
 // job is no longer issued is dropped as stale, not run.
@@ -5044,6 +5137,7 @@ int main(int argc, char** argv) {
     run("revrepend2", revrepend2);
     run("relayrpark", relayrpark);
     run("relayhdrctx", relayhdrctx);
+    run("relayrbindr", relayrbindr);
     run("relayqfull", relayqfull);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);

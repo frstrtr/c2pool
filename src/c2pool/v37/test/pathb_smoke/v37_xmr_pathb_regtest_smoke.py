@@ -820,7 +820,8 @@ class Rig:
 
             # every view of the switching node published after the switch (its switches count moved); the peers'
             # pending sets before the switch and after it. A node publishes its view every 2 s and the poller reads each
-            # node about every 0.5 s, so the switch happened at most about 2.5 s before t_sw: t_cut = t_sw - 4
+            # node about every 0.5 s, so the switch happened at most about 2.5 s before t_sw: "before" is a view older
+            # than t_cut = t_sw - 4, "after" a view from t_sw on (the views between count for neither)
             def switch_time():
                 for t, sw, _ in self.web.history(n):
                     if wsw0[n] >= 0 and sw > wsw0[n]:
@@ -854,7 +855,7 @@ class Rig:
                     continue
                 h = self.web.history(m)
                 before[m] = set().union(*[p for t, _, p in h if t_cut is not None and t < t_cut]) if h else set()
-                after[m] = set().union(*[p for t, _, p in h if t_cut is not None and t >= t_cut]) if h else set()
+                after[m] = set().union(*[p for t, _, p in h if t_sw is not None and t >= t_sw]) if h else set()
             # a receipt counts for a peer only if that peer did not hold it before the switch; every named receipt must
             # be held after the switch by a peer that did not hold it before
             fresh = {m: ids - before[m] for m in after}
@@ -870,11 +871,9 @@ class Rig:
                            "%s: none of its re-pended receipts pending in a view published after the switch (carried)"
                            "%s; own receipts %s" % (n, "" if "carried" in seen else " -- " + seen.get("why", "not seen"),
                                                     own_n[-1] if own_n else "-"))
-            if "tip" not in seen:
-                self.res.check("partition", False, "A, B, C on one best tip: not seen")
-                return
-            tips = [seen["tip"][0]]
-            j = {"pathb": {"leaf_count": seen["tip"][1]}}
+            self.res.check("partition", "tip" in seen,
+                           "A, B, C on one best tip in their web views: %s" %
+                           ("%s (leaves %s)" % seen["tip"] if "tip" in seen else "not seen -- " + seen.get("why", "-")))
             s2 = last_status(self.nodes[n].text())
             j1 = JOIN_RE.findall(self.nodes[n].text())
             j1 = int(j1[-1][1]) if j1 else 0
@@ -883,7 +882,6 @@ class Rig:
                            (n, sw0[n], s.group(15), s.group(13), s.group(14), j0[n], j1))
             self.res.check("partition", int(s.group(14)) < int(s.group(13)),
                            "%s: re-pended %s > lost %s" % (n, s.group(13), s.group(14)))
-            self.res.check("partition", True, "A, B, C on one best tip %s (leaves %s)" % (tips[0], j["pathb"]["leaf_count"]))
             self.res.note("partition", "%s status after: %s" % (n, s2.group(0) if s2 else "-"))
             return
         self.res.check("partition", False, "no switch with a re-pended receipt in %d partitions" % a.partition_tries)
