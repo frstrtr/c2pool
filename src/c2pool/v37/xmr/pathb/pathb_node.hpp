@@ -65,7 +65,8 @@
 //   relay glue        offer_empty_store_tip (an empty store whose catch-up
 //                     from position 0 got no header: the peer's HELLO tip a
 //                     join candidate), take_parked (a parked frame run again),
-//                     set_join_step (the join worker's step callback),
+//                     take_repended (the receipts a switch re-pended, to
+//                     relay), set_join_step (the join worker's step callback),
 //                     may_ask / take_rewalk_frames (the re-walk of parked
 //                     frames), on_body_set (a walked carrier's bodies from a
 //                     reply to the node's own FC_GETCARRIER),
@@ -666,6 +667,9 @@ public:
         std::uint64_t objects = 0;
     };
     std::vector<PlacedRelease> take_placed_released() { return std::exchange(placed_released_, {}); }
+    // The receipts the switches by the journal put back into the pending set (E11), in re-pend order, since the last
+    // call: the caller relays them as FB_RECEIPTS v3 (a receipt no longer pending then is skipped there).
+    std::vector<Hash32> take_repended() { return std::exchange(repended_out_, {}); }
     std::vector<ParkedFrame> take_rewalk_frames() {
         std::vector<ParkedFrame> out;
         if (poisoned_) return out;
@@ -2670,7 +2674,10 @@ private:
                 }
                 const CarrierNode* t = tree_->find(r.side.tip);
                 // the verified body: no second RandomX; one the pending set evicts at once is not counted
-                if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) ++out.repended;
+                if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) {
+                    ++out.repended;
+                    repended_out_.push_back(rid);  // relayed as FB_RECEIPTS v3 (take_repended)
+                }
             }
         }
         if (joined_store()) reask_pending_ = true;  // E-72: the claimed leaves asked again at the new chain
@@ -2724,6 +2731,7 @@ private:
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
+    std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_

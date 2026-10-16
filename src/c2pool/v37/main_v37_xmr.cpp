@@ -1486,6 +1486,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::size_t pending = 0;
         std::size_t deferred = 0;
         std::uint64_t pending_digest = 0;
+        std::vector<std::string> pending_ids;  // the first 64, 12 hex digits each (the relay log's form)
         std::uint64_t leaf_count = 0;
         std::uint64_t coinbase_internal = 0;
         pb::PathbNode::SwitchCounts sw{};
@@ -1506,6 +1507,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 std::uint64_t x = 0;
                 for (std::size_t i = 0; i < 8; ++i) x |= std::uint64_t{r->id[i]} << (8 * i);
                 v.pending_digest ^= x;
+                if (v.pending_ids.size() < 64) v.pending_ids.push_back(hex_of(r->id).substr(0, 12));
             }
             const pb::LaneView lv = n.store().view_at(b.id);
             v.leaf_count = lv.ok() ? lv.leaf_count() : 0;
@@ -1786,7 +1788,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
                             "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_wanted=%llu "
-                            "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu\n",
+                            "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu repend_offers=%llu repend_offered=%llu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
@@ -1805,7 +1807,9 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             relay->ctx_want_bytes(), static_cast<unsigned long long>(rs.ctx_wanted.load()),
                             static_cast<unsigned long long>(rs.ctx_resolved.load()),
                             static_cast<unsigned long long>(rs.ctx_gave_up.load()),
-                            static_cast<unsigned long long>(rs.parked_reruns.load()));
+                            static_cast<unsigned long long>(rs.parked_reruns.load()),
+                            static_cast<unsigned long long>(rs.repend_offers.load()),
+                            static_cast<unsigned long long>(rs.repend_offered.load()));
             }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),
@@ -1851,6 +1855,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             w.pathb.leaf_count = nv.leaf_count;
             w.pathb.pending = nv.pending;
             w.pathb.deferred = nv.deferred;
+            w.pathb.pending_ids = nv.pending_ids;
             w.pathb.repended_last_switch = nv.sw.last_repended;
             w.pathb.template_status = template_status_name(tstatus);
             w.pathb.hold = nv.hold.hold;

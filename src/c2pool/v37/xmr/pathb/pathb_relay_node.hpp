@@ -226,6 +226,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0}, join_waits{0};
     std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
+    std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
     std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
@@ -953,6 +954,7 @@ private:
         bool rerun = false;      // a frame run again (P-15 gated at its first arrival only; counted once, at its first placement)
     };
     static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
+    static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
     static constexpr std::size_t kAskedMax = 256;       // asked carrier ids kept per peer
     struct Ticket {
         std::uint64_t peer = 0;
@@ -1790,6 +1792,7 @@ private:
         for (const auto& [id, from, cls] : fx.ctx) want_ctx(id, from, 0, cls);
         if (!fx.rerun.empty()) rerun_parked(std::vector<Missing>(fx.rerun.begin(), fx.rerun.end()));
         if (fx.join) signal_join();
+        repend_offer();
     }
     // FC_GETBUCKETS at the named carrier (one assembly per (peer, at)): the object's sender first, then every other
     // ready peer; none: a later carrier of the same chain (the parked frames run again when the best tip moves).
@@ -2067,6 +2070,37 @@ private:
             for (const auto& [p, q] : reoffer_) ps.push_back(p);
         }
         for (const std::uint64_t p : ps) reoffer_pump(p);
+    }
+    // E11: the receipts a switch by the journal re-pended (either switch path: a placement or the drain of the
+    // carriers it released) relayed as FB_RECEIPTS v3 to every ready peer, paged as the re-offer: appended to each
+    // peer's re-offer queue, which reoffer_pump sends within the link's bound (P-67), skipping bodies no longer
+    // pending. Run after each admission outcome's effects (run_effects; an own share extends the best tip and
+    // never switches); never under the node lock (the ids then wait for the next call).
+    void repend_offer() {
+        if (t_node_held == this) return;
+        std::vector<Hash32> ids;
+        {
+            const NodeGuard g(*this);
+            ids = node_->take_repended();
+            if (ids.empty() || node_->rests_on_claims() || node_->poisoned()) return;
+        }
+        const std::vector<std::uint64_t> ready = ready_peers();
+        st_.repend_offers++;
+        st_.repend_offered += ids.size();
+        std::string line = "relay: re-pend offer " + std::to_string(ids.size()) + " receipt(s) to " +
+                           std::to_string(ready.size()) + " peer(s):";
+        for (std::size_t i = 0; i < ids.size() && i < kRependLogIds; ++i) line += " " + hex_short(ids[i]);
+        log(line);
+        if (ready.empty()) return;  // a peer's HELLO re-offers the pending set
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            for (const std::uint64_t p : ready) {
+                std::deque<Hash32>& q = reoffer_[p];
+                if (reoffer_t0_.count(p) == 0) reoffer_t0_[p] = now_ms();
+                q.insert(q.end(), ids.begin(), ids.end());
+            }
+        }
+        for (const std::uint64_t p : ready) reoffer_pump(p);
     }
 
     // ---- headers first (the caller's catch-up loop) ----

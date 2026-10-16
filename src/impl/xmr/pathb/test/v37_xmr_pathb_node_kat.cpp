@@ -145,6 +145,10 @@
 //   relayp15once P-15 counts a frame once, at its first placement: a
 //                carrier placed in its parent's drain, one that waited for its
 //                DoS token, one placed on its re-run (a duplicate: none);
+//   relayrepend  a switch relays its re-pended receipts as FB_RECEIPTS v3
+//                (paged; both switch paths: a direct placement, the drain);
+//                the switching node mines no more, a peer's carrier carries
+//                them;
 //   relayrxbind2 a walk placed a walked carrier, then the bind of the next
 //                failed on RandomX: the placed one kept; the re-run places
 //                the rest;
@@ -4161,6 +4165,108 @@ void relayp15once() {
 
 
 // ---------------------------------------------------------------------------
+// relayrepend: a switch by the journal relays the receipts it re-pended as FB_RECEIPTS v3, paged as the re-offer
+// within the link's bound; the switching node mines no more and a peer's next carrier carries them (open carriage).
+//   (a) the switch at a direct placement: C's carrier X loses the tie to A's Y1 (X.id > Y1.id), Y1 then Y2 reach C;
+//   (b) the switch in the drain: X wins the tie (X.id < Y1.id); only Y2 reaches C, parked on its unknown parent; Y1
+//       fetched and placed beside X; Y2 released and placed by drain_released: the switch; C's link to A and B is
+//       full at first (the re-pend relay paused), then drains (the tick sends it).
+void relayrepend() {
+    for (const bool drain : {false, true}) {
+        const std::string tag = drain ? "relayrepend (b) the drain path: " : "relayrepend (a) a direct placement: ";
+        const KatNet net;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), true);
+        KatRelay c = kat_relay(h, w, table0(net), true);
+        w.connect(0, 1);
+        w.connect(0, 2);
+        w.connect(1, 2);
+        w.run();
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            if (i % 2 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, 1, 500 + static_cast<std::uint32_t>(i));
+        }
+        const pb::Hash32 t0 = h[a.node].tree().best().id;
+        ok = ok && h[b.node].tree().best().id == t0 && h[c.node].tree().best().id == t0;
+        // C cut off from A and B: A mines Y1, then C mines X on t0 (a nonce whose id loses or wins the tie with Y1)
+        w.edit = [](FakeWire::Msg& m) {
+            if (m.from == 2 || m.to == 2) m.f.clear();
+        };
+        ok = ok && mine_on(h, w, a.node, 2, 510);
+        const pb::Hash32 y1 = h[a.node].tree().best().id;
+        std::optional<pb::PathbJob> xj;
+        std::uint32_t xn = 0;
+        pb::Hash32 x{};
+        for (std::uint32_t n = 520; n < 600 && !xj; ++n) {
+            std::optional<pb::PathbJob> j = h.job(c.node, 7, n);
+            if (!j) break;
+            pb::ReceiptBodyV3 rb = j->body;
+            rb.blob.nonce = n;
+            const pb::Hash32 id = pb::receipt_id(rb);
+            if (drain ? id < y1 : y1 < id) {
+                xj = j;
+                xn = n;
+                x = id;
+            }
+        }
+        ok = ok && xj && h[c.node].on_own_share(*xj, xn, pb::Hash32{}).action == pb::NodeAction::Placed
+             && h[c.node].tree().best().id == x;
+        w.run();
+        ok = ok && mine_on(h, w, a.node, 3, 511);
+        const pb::Hash32 y2 = h[a.node].tree().best().id;
+        w.edit = nullptr;
+        const pb::Hash32 rid = x;  // X's own receipt (a carrier's id is its own receipt's id)
+        ok = ok && !h[a.node].pending().holds(rid) && !h[b.node].pending().holds(rid);
+        if (!ok) {
+            check(false, tag + "setup");
+            continue;
+        }
+        const pb::PathbRelayStats& sc = c.relay->stats();
+        const std::uint64_t f0 = sc.reoffer_frames.load(), p0 = sc.reoffer_paused.load();
+        if (drain) {
+            c.links->limit = std::size_t{1} << 20;  // every link full: the relay pages within the bound and waits
+            c.links->queued = c.links->limit;
+        }
+        // the heal: A's chain reaches C (Y1 and Y2 in order, or Y2 alone)
+        if (!drain) w.q.push_back(FakeWire::Msg{0, 2, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(y1), 16)});
+        w.q.push_back(FakeWire::Msg{0, 2, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(y2), 16)});
+        w.run();
+        const bool switched = h[c.node].tree().best().id == y2 && h[c.node].pending().holds(rid);
+        const std::uint64_t offers = sc.repend_offers.load(), offered = sc.repend_offered.load();
+        bool paused = true;
+        if (drain) {
+            paused = sc.reoffer_paused.load() > p0 && sc.reoffer_frames.load() == f0 && !h[b.node].pending().holds(rid);
+            c.links->queued = 0;
+            h.now += 1;
+            c.relay->tick();
+            w.run();
+        }
+        const bool held = h[a.node].pending().holds(rid) && h[b.node].pending().holds(rid);
+        check(switched && offers == 1 && offered >= 1 && sc.reoffer_frames.load() > f0 && paused && held,
+              tag + "C switches to Y by its journal, X's receipt re-pended and relayed as FB_RECEIPTS v3 (offers " +
+                      std::to_string(offers) + ", receipts " + std::to_string(offered) + ", frames " +
+                      std::to_string(sc.reoffer_frames.load() - f0) + (drain ? ", paused while the links were full" : "") +
+                      "); A and B hold it pending (" + std::to_string(h[a.node].pending().holds(rid)) + ", " +
+                      std::to_string(h[b.node].pending().holds(rid)) + ")");
+        // C mines no more: B's next carrier carries C's re-pended receipt
+        h.tick_monero();
+        const bool mined = mine_on(h, w, b.node, 4, 530);
+        const pb::Hash32 tb = h[b.node].tree().best().id;
+        const pb::CarrierBodyV3* cb = h[b.node].bodies().get(tb);
+        bool carried = false;
+        if (cb)
+            for (const pb::ReceiptBodyV3& r : cb->carried) carried = carried || pb::receipt_id(r) == rid;
+        check(mined && carried && h[c.node].tree().best().id == tb && !h[c.node].pending().holds(rid),
+              tag + "C mines no more; B's next carrier carries C's re-pended receipt (" + std::to_string(carried) +
+                      "), placed on C too: C's pending no longer holds it");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // relayrxbind2: a walk that placed a walked carrier (it carries nothing), then whose bind of the next failed on RandomX
 // (a body only that one carries): the placed id stays placed and counted (walk_placed), the failure counted; the
 // parked frame's re-run places the rest.
@@ -4533,6 +4639,7 @@ int main(int argc, char** argv) {
     run("relayrxbindr", relayrxbindr);
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
+    run("relayrepend", relayrepend);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);
     run("relayp40", relayp40);

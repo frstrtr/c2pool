@@ -67,6 +67,7 @@ struct XmrWebPathb {
     std::string   window_root_hex, mmr_root_hex;
     std::uint64_t leaf_count = 0;
     std::uint64_t pending = 0, deferred = 0;
+    std::vector<std::string> pending_ids;  // the first 64 pending receipt ids, 12 hex digits each
     std::uint64_t repended_last_switch = 0;
     std::string   template_status;
     // alarms
