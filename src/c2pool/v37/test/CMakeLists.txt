@@ -574,12 +574,11 @@ if (BUILD_TESTING)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
     foreach(_gap2_kat xmr_relay_wire_kat)
 
-    #   v37_xmr_drops_default_kat   XMR-DROPS-DEFAULT (operator ruling 09-27):
-    #                               the XMR build arms raindrops by default
-    #                               (default lane = for_version(1) + Count,
-    #                               make_drops_wiring armed); the shell source
-    #                               strings of the d5 split. ALSO on BOTH
-    #                               build.yml --target lists.
+    #   v37_xmr_drops_default_kat   the default XMR build leaves raindrops
+    #                               off (V37_XMR_DROPS_DEFAULT not defined,
+    #                               kDropsWiringArmed false, make_drops_wiring
+    #                               not armed). ALSO on BOTH build.yml
+    #                               --target lists.
     #   v37_xmr_relay_liveness_kat  RELAY-LIVENESS + RELAY-BINCLOCK (capstone
     #                               attempt 2): FB_PING/FB_PONG keepalive; a
     #                               link silent both ways with TCP still up

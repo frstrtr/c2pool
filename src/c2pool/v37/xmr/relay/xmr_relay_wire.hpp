@@ -12,10 +12,10 @@
 // CarrierPeerNode framing [u32 LE len][frame]; the first byte is the opcode):
 //
 //     0x43 FB_GETCTX     ask for Monero blocks by id (u8 n <= 8 ids)
-//     0x44 FB_CTX        one Monero block blob (<= 512 KiB) or none
+//     0x44 FB_CTX        one Monero block blob (at most the caller's cap, P-13) or none
 //     0x48 FB_PING       keepalive probe (u64 nonce)
 //     0x49 FB_PONG       its echo (same nonce)
-//     0x4a / 0x4b        reserved
+//     0x4a / 0x4b        reserved for LANE-EPOCH
 //     0x4c FB_GETADDR    ask for relay addresses of this pool
 //     0x4d FB_ADDR       the answer: <= 256 x (family, ip, port, last_seen)
 //
@@ -51,7 +51,7 @@ inline constexpr u8  FB_GETCTX    = 0x43;
 inline constexpr u8  FB_CTX       = 0x44;
 inline constexpr u8  FB_PING      = 0x48;
 inline constexpr u8  FB_PONG      = 0x49;
-// 0x4a / 0x4b are reserved: never reuse them here.
+// 0x4a / 0x4b are reserved for LANE-EPOCH: never reuse them here.
 inline constexpr u8  FB_GETADDR   = 0x4c;
 inline constexpr u8  FB_ADDR      = 0x4d;
 inline constexpr u8  kFbVersion   = 0x01;
@@ -78,7 +78,7 @@ inline bytes32 keccak_bytes(const std::vector<u8>& v) {
 
 // ── FB_GETCTX (0x43) / FB_CTX (0x44) ───────────────────────────────────────
 //   GETCTX : u8 0x43 ; u8 ver ; u32 chain_id ; u8 n (1..8) ; n x id(32)
-//   CTX    : u8 0x44 ; u8 ver ; u32 chain_id ; id(32) ; u32 len (<= 512 KiB) ; blob
+//   CTX    : u8 0x44 ; u8 ver ; u32 chain_id ; id(32) ; u32 len (<= the caller's cap, P-13) ; blob
 inline std::vector<u8> encode_getctx(u32 chain_id, const std::vector<bytes32>& ids) {
     if (ids.empty() || ids.size() > kCtxMaxIds) return {};
     std::vector<u8> f; f.reserve(7 + 32 * ids.size());

@@ -118,10 +118,11 @@ function(c2pool_wire_version _tgt)
     add_dependencies(${_tgt} c2pool_version_header)
     target_include_directories(${_tgt} PRIVATE ${C2POOL_VERSION_HEADER_DIR})
 endfunction()
-# V37_XMR_DROPS_DEFAULT: the XMR node and its KATs carry V37_XMR_DROPS_DEFAULT=1
-# when ON. Default OFF: raindrops are not armed in a default build, and no XMR
-# target defines V37_ACTIVATE_CONSENSUS_V1.
-option(V37_XMR_DROPS_DEFAULT "XMR node: V37_XMR_DROPS_DEFAULT defined" OFF)
+# V37_XMR_DROPS_DEFAULT: a test-only knob. The XMR node and its KATs carry
+# V37_XMR_DROPS_DEFAULT=1 when ON; only v37_xmr_drops_default_kat (DD1) reads
+# the macro, so the option has no product effect. Default OFF: raindrops are not
+# armed, and no XMR target defines V37_ACTIVATE_CONSENSUS_V1.
+option(V37_XMR_DROPS_DEFAULT "test-only: V37_XMR_DROPS_DEFAULT defined on the XMR targets (read by DD1 only)" OFF)
 function(c2pool_xmr_drops_default _tgt)
     if (V37_XMR_DROPS_DEFAULT)
         target_compile_definitions(${_tgt} PRIVATE V37_XMR_DROPS_DEFAULT=1)

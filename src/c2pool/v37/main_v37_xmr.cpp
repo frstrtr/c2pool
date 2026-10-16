@@ -262,7 +262,7 @@ static std::string u128_dec(std::uint64_t lo, std::uint64_t hi) {
 
 // <data>: --data-dir, else the config path.
 static std::filesystem::path data_root(const XmrNodeConfig& cfg) {
-    if (!cfg.settle_db_path.empty()) return std::filesystem::path(cfg.settle_db_path);
+    if (!cfg.data_dir.empty()) return std::filesystem::path(cfg.data_dir);
     return core::filesystem::config_path();
 }
 
@@ -779,7 +779,7 @@ static void name_other_stores(const XmrNodeConfig& cfg, const std::filesystem::p
     std::error_code ec;
     std::vector<std::filesystem::path> old;
     old.push_back(netdir / "v37_settle_db");
-    if (!cfg.settle_db_path.empty()) old.push_back(std::filesystem::path(cfg.settle_db_path));
+    if (!cfg.data_dir.empty()) old.push_back(std::filesystem::path(cfg.data_dir));
     for (const std::filesystem::path& p : old)
         if (std::filesystem::exists(p / "settle.img", ec))
             std::printf("store: old-path store at %s: not read, flag day S4w\n", p.string().c_str());
@@ -2379,7 +2379,7 @@ int main(int argc, char** argv) {
                     throw cs::UsageError("--same-height-tiebreak takes prefer-own or first-seen, not '" + m + "'");
             } else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s = u32();
             else if (a == "--test-unknown-fork-stall-s") cfg.test_unknown_fork_stall_s = u32();
-            else if (a == "--data-dir") cfg.settle_db_path = value();
+            else if (a == "--data-dir") cfg.data_dir = value();
             else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
             else if (a == "--randomx") cfg.randomx_enabled = true;
             else if (a == "--randomx-large-pages") cfg.randomx_large_pages = true;
