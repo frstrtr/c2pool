@@ -215,9 +215,10 @@ rules:
       - name: no-w4-include
         type: forbidden
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*w4_settlement\.hpp[>"]'
-        paths: [src/c2pool/v37/xmr/**, src/impl/xmr/**, src/c2pool/v37/main_v37_xmr.cpp, src/c2pool/v37/test/*xmr*, src/sharechain/v37/test/*xmr*]
-        exclude: [src/impl/xmr/third_party/**, src/impl/xmr/coin/vendor/**]
+        paths: [src/c2pool/v37/xmr/**, src/impl/xmr/**, src/c2pool/v37/main_v37_xmr.cpp]
+        exclude: ['**/test/**', src/impl/xmr/third_party/**, src/impl/xmr/coin/vendor/**]
         code_only: true
+        note: 'The product XMR targets; their tests are out of scope.'
     status_now: pass
     deviation: [D4, D36]
 
@@ -1197,7 +1198,7 @@ rules:
       - name: no-horizon-literals
         type: forbidden
         pattern: '\b(?:index_horizon|backfill_positions|ctx_window|ctx_max_depth|index_retention_blocks|verify_queue_max|FOUND_BLOCK_MAX_BLOB|blob_cap_ctx|kMaxCarrierFrame)\s*=\s*[0-9]+'
-        paths: [src/c2pool/v37/xmr/relay/**, src/impl/xmr/native/relay/**, src/c2pool/v37/carrier_net.hpp]
+        paths: [src/c2pool/v37/xmr/relay/**, src/impl/xmr/native/relay/**, src/c2pool/v37/carrier_net.hpp, src/c2pool/v37/xmr/pathb/pathb_relay_node.hpp]
         exclude: ['**/test/**']
         code_only: true
       - name: wire-cap-kat
