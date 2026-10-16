@@ -223,6 +223,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
     std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
+    std::atomic<std::uint64_t> headers_ctx_deferred{0}, headers_ctx_reasks{0};  // header replies deferred on a P_r; asked again
     std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0}, join_waits{0};
     std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
@@ -1296,6 +1297,7 @@ private:
             std::lock_guard<std::mutex> lk(cumtx_);
             catchup_.erase(p);
             header_wants_.erase(p);
+            headers_on_ctx_.erase(p);
         }
         {
             std::lock_guard<std::mutex> lk(tmtx_);
@@ -1895,6 +1897,7 @@ private:
             st_.parked_reruns++;
             enqueue_job(std::move(j));
         }
+        if (std::find(causes.begin(), causes.end(), Missing::MoneroBlock) != causes.end()) reask_headers_on_ctx();
     }
     // The due receipts left by a re-run (the tick): the next ones, at most the verify queue's free room.
     void rerun_due_receipts() {
@@ -2315,8 +2318,37 @@ private:
             case K::Ban: ban(p); break;
             default: break;
         }
+        if (o.kind == K::Defer && o.fetch != Hash32{}) {
+            // a header's P_r not held: fetched (FB_GETCTX, the carrier class), the request asked again once it resolves
+            {
+                std::lock_guard<std::mutex> lk(cumtx_);
+                headers_on_ctx_[p] = std::make_pair(o.from, o.stop);
+            }
+            st_.headers_ctx_deferred++;
+            want_ctx(o.fetch, p, 0, CtxClass::Carrier);
+        }
         if (o.indexed > 0) rerun_parked(std::vector<Missing>{Missing::TipUnknown, Missing::TipHeaders});
         if (join) signal_join();
+    }
+    // The header requests deferred on a P_r (one per peer), asked again with the MoneroBlock re-run (a context
+    // resolved, or the follower's chain moved); one still missing defers again.
+    void reask_headers_on_ctx() {
+        std::map<std::uint64_t, std::pair<Hash32, Hash32>> due;
+        {
+            std::lock_guard<std::mutex> lk(cumtx_);
+            due.swap(headers_on_ctx_);
+        }
+        if (due.empty()) return;
+        const NodeGuard g(*this);
+        for (const auto& [p, w] : due) {
+            if (!hello_ok(p) || node_->tree().find(w.first) == nullptr) continue;
+            if (node_->request_headers(p, w.first, w.second, header_max_, now_s())) {
+                st_.headers_ctx_reasks++;
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(cumtx_);
+            header_wants_[p] = w;
+        }
     }
     // Under the node lock: the waiting request of t's branch to `peer` (every peer: 0), when that peer has none in
     // flight.
@@ -3625,6 +3657,7 @@ private:
     mutable std::mutex cumtx_;  // catch-up and t's branch headers waiting for a free request (under the node lock)
     std::map<std::uint64_t, Catchup> catchup_;
     std::map<std::uint64_t, std::pair<Hash32, Hash32>> header_wants_;  // peer -> (from, stop)
+    std::map<std::uint64_t, std::pair<Hash32, Hash32>> headers_on_ctx_;  // deferred on a P_r: peer -> (from, stop)
 
     mutable std::mutex cmtx_;  // contexts
     std::map<Hash32, CtxWant> ctx_want_;

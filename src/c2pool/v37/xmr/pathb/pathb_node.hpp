@@ -1307,6 +1307,11 @@ public:
         std::size_t indexed = 0;
         std::uint64_t fork_pos = 0;
         std::vector<Hash32> ids;
+        // Defer on a P_r the node does not hold: that Monero block, and the request (from its fork to stop) to ask
+        // again once it resolves
+        Hash32 fetch{};
+        Hash32 from{};
+        Hash32 stop{};
     };
 
     HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s) {
@@ -1341,6 +1346,9 @@ public:
             const PrInfo pr = io_.resolve_pr ? io_.resolve_pr(h.own.blob.prev_id) : PrInfo{};
             if (pr.status == PrInfo::Status::Missing) {
                 out.kind = HeadersOutcome::Kind::Defer;
+                out.fetch = h.own.blob.prev_id;
+                out.from = req.fork;
+                out.stop = req.stop;
                 return out;
             }
             if (pr.status == PrInfo::Status::BadServed) {

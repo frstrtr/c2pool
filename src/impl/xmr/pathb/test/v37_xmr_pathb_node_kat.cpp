@@ -4579,6 +4579,56 @@ void relayrpark() {
 }
 
 // ---------------------------------------------------------------------------
+// relayhdrctx: headers-first catch-up over a Monero parent the client does not hold. A mines six carriers, the last
+// three on a Monero block M that B's follower does not hold yet. B's catch-up from A's HELLO reaches the first header on
+// M: the reply DEFERs; B wants M (FB_GETCTX, the carrier class) and asks the headers again once M resolves (here the
+// follower's chain moving to M): B reaches A's tip with no strike and no ban.
+void relayhdrctx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;  // Monero blocks B's follower does not hold
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [&hidden](pb::PathbNodeIo& io) {
+        const auto inner = io.resolve_pr;
+        io.resolve_pr = [inner, &hidden](const pb::Hash32& p_r) {
+            return hidden.count(p_r) != 0 ? pb::PrInfo{} : inner(p_r);
+        };
+    });
+    bool mined = true;
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        const std::optional<pb::PathbJob> j = h.job(a.node, static_cast<std::size_t>(i % 5), 900 + i);
+        mined = mined && j && h[a.node].on_own_share(*j, 900 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    const pb::Hash32 tip_a = h[a.node].tree().best().id;
+    const pb::CarrierBodyV3* bt = h[a.node].bodies().get(tip_a);
+    const pb::Hash32 m = bt ? bt->own.blob.prev_id : pb::Hash32{};
+    hidden.insert(m);
+    pb::PathbRelayNode& rb = *b.relay;
+    w.connect(0, 1);
+    w.run();
+    const std::uint64_t pos1 = h[b.node].tree().best().pos;
+    const std::optional<std::uint32_t> want = rb.ctx_want_bound(m);
+    const std::array<std::size_t, 3> cls = rb.ctx_wants_by_class();
+    const std::uint64_t deferred = rb.stats().headers_ctx_deferred.load();
+    std::printf("  relayhdrctx: mined %d; B at %llu of %llu after the HELLO; want M %d (classes %zu/%zu/%zu); deferred %llu\n",
+                mined ? 1 : 0, (unsigned long long)pos1, (unsigned long long)h[a.node].tree().best().pos, want ? 1 : 0,
+                cls[0], cls[1], cls[2], (unsigned long long)deferred);
+    check(mined && bt && pos1 < 6 && want.has_value() && cls[1] >= 1 && deferred >= 1,
+          "relayhdrctx: a catch-up header on a Monero parent B does not hold DEFERs; B wants it (the carrier class)");
+    hidden.clear();  // M resolves
+    rb.on_monero_tip();
+    w.run();
+    std::printf("  relayhdrctx: after M resolved: B at %llu, reasks %llu, strikes %llu, bans %llu\n",
+                (unsigned long long)h[b.node].tree().best().pos, (unsigned long long)rb.stats().headers_ctx_reasks.load(),
+                (unsigned long long)rb.strikes_of(1), (unsigned long long)rb.stats().bans.load());
+    check(h[b.node].tree().best().id == tip_a && rb.stats().headers_ctx_reasks.load() >= 1 && rb.strikes_of(1) == 0
+                  && rb.stats().bans.load() == 0,
+          "relayhdrctx: once M resolves B asks the headers again at once and reaches A's tip; no strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
 // relayrxbind2: ONE walk places a walked carrier, then the bind of the next fails on RandomX (a body only that one
 // carries): the placed id stays placed and counted (walk_placed), the failure counted; the parked frame's re-run places
 // the rest. Both walked carriers carry a body: X asks sa1's body set (sa2's header binds only once sa1 is placed); sa2's
@@ -4993,6 +5043,7 @@ int main(int argc, char** argv) {
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);
     run("relayrpark", relayrpark);
+    run("relayhdrctx", relayhdrctx);
     run("relayqfull", relayqfull);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);
