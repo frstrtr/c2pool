@@ -1,6 +1,6 @@
 {
   "comment": "Baseline of docs/canon/CANON.yaml. Regenerate with tools/canon/canon_check.py --write-baseline only when a count fell or a ruled change was registered.",
-  "commit": "dc3ec987e45d259ecf64e6a26cedf557d0418c54",
+  "commit": "677929fac5114de886f912674287ec57ef7d8f51",
   "rules": {
     "C01": {
       "checks": {
@@ -11,17 +11,20 @@
           "status": "pass"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C02": {
       "checks": {
         "no-prev-own-share": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 3,
+          "per_file": {
+            "src/impl/xmr/receipt/xmr_receipt.hpp": 1,
+            "src/impl/xmr/receipt/xmr_receipt_verify.cpp": 2
+          },
+          "status": "fail"
         },
         "receipt-id-dedup-kat": {
           "kats": {
@@ -30,7 +33,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C03": {
       "checks": {
@@ -50,7 +53,7 @@
           "status": "pass"
         },
         "late-tail-bins": {
-          "status": "pass"
+          "status": "fail"
         },
         "legally-dead-kat": {
           "kats": {
@@ -70,22 +73,37 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C04": {
       "checks": {
-        "no-w4-include": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
-        },
         "owed-ledger-symbols": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 97,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 12,
+            "src/c2pool/v37/xmr/relay/xmr_share_verdict.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 9,
+            "src/c2pool/v37/xmr/xmr_finalize_driver.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_light_proof.hpp": 5,
+            "src/c2pool/v37/xmr/xmr_minority_converge.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_node.hpp": 5,
+            "src/c2pool/v37/xmr/xmr_node_config.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_node_smoke.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp": 10,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_provider.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_source.hpp": 10,
+            "src/c2pool/v37/xmr/xmr_settle_store.hpp": 5,
+            "src/impl/xmr/mbp/mbp_wiring.hpp": 6,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 6,
+            "src/impl/xmr/settle/xmr_coinbase.hpp": 3,
+            "src/impl/xmr/settle/xmr_drain_rule.hpp": 11,
+            "src/impl/xmr/template/xmr_block_assembly.hpp": 1
+          },
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C05": {
       "checks": {
@@ -125,8 +143,8 @@
       "checks": {
         "exact-sum-kats": {
           "kats": {
-            "v37_xmr_pathb_coinbase_kat": true,
-            "v37_xmr_pathb_e2e_kat": true
+            "xmr_coinbase_kat": true,
+            "xmr_e2e_kat": true
           },
           "status": "pass"
         },
@@ -142,9 +160,13 @@
     "C08": {
       "checks": {
         "clock-reads-outside-allowlist": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 85,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp": 1,
+            "src/c2pool/v37/xmr/relay/xmr_relay_node.hpp": 71,
+            "src/c2pool/v37/xmr/xmr_o2_finalize_connect.hpp": 13
+          },
+          "status": "fail"
         },
         "no-clock-in-consensus-core": {
           "count": 0,
@@ -152,7 +174,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C09": {
       "checks": {},
@@ -168,9 +190,11 @@
           "status": "pass"
         },
         "no-fixed-share-diff-refusal": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 1,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 1
+          },
+          "status": "fail"
         },
         "no-old-d-min": {
           "count": 0,
@@ -189,13 +213,13 @@
           "status": "pass"
         },
         "retarget-min-dh": {
-          "status": "pass"
+          "status": "fail"
         },
         "retarget-span": {
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C12": {
       "checks": {
@@ -211,9 +235,11 @@
     "C13": {
       "checks": {
         "no-literal-n-param": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 2,
+          "per_file": {
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 2
+          },
+          "status": "fail"
         },
         "no-literal-out-size": {
           "count": 0,
@@ -221,9 +247,11 @@
           "status": "pass"
         },
         "no-overhead-literal": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 1,
+          "per_file": {
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 1
+          },
+          "status": "fail"
         },
         "no-reserve-quantile": {
           "count": 0,
@@ -243,7 +271,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C14": {
       "checks": {
@@ -301,19 +329,24 @@
           "status": "pass"
         },
         "drops-default-off": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 1,
+          "per_file": {
+            "src/c2pool/CMakeLists.txt": 1
+          },
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C19": {
       "checks": {
         "no-job-substitution": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 4,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 1,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 3
+          },
+          "status": "fail"
         },
         "owner-fee-receipt-kat": {
           "kats": {
@@ -338,9 +371,20 @@
     "C21": {
       "checks": {
         "no-queue-or-seniority": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 32,
+          "per_file": {
+            "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_light_proof.hpp": 3,
+            "src/c2pool/v37/xmr/xmr_node.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_o2_settlement_source.hpp": 7,
+            "src/c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp": 1,
+            "src/impl/xmr/mbp/mbp_wiring.hpp": 1,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 9,
+            "src/impl/xmr/settle/xmr_coinbase.hpp": 3,
+            "src/impl/xmr/template/xmr_block_assembly.hpp": 5
+          },
+          "status": "fail"
         },
         "window-split-kat": {
           "kats": {
@@ -349,7 +393,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C22": {
       "checks": {
@@ -360,15 +404,18 @@
           "status": "pass"
         },
         "no-grace-timer": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 3,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 1,
+            "src/c2pool/v37/xmr/relay/xmr_receipt_ingest.hpp": 2
+          },
+          "status": "fail"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C23": {
       "checks": {
@@ -409,10 +456,10 @@
           "status": "pass"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C25": {
       "checks": {
@@ -445,10 +492,10 @@
           "status": "pass"
         },
         "side-data-v3-struct": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C26": {
       "checks": {
@@ -459,9 +506,12 @@
           "status": "pass"
         },
         "donation-marker-absent": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 5,
+          "per_file": {
+            "src/c2pool/v37/main_v37_xmr.cpp": 3,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 2
+          },
+          "status": "fail"
         },
         "donation-split-kat": {
           "kats": {
@@ -491,7 +541,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C27": {
       "checks": {
@@ -517,14 +567,14 @@
           },
           "status": "pass"
         },
-        "rules-digest-in-lane-rules": {
+        "rules-digest-in-pool-tag": {
           "status": "pass"
         },
         "single-digest-field": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C28": {
       "checks": {
@@ -603,10 +653,10 @@
           "status": "pass"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C34": {
       "checks": {
@@ -622,9 +672,33 @@
     "C35": {
       "checks": {
         "narrowing-casts-may-not-grow": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 128,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_coinbase_authority.hpp": 6,
+            "src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp": 4,
+            "src/c2pool/v37/xmr/xmr_credit_cut.hpp": 2,
+            "src/c2pool/v37/xmr/xmr_drops_wiring.hpp": 16,
+            "src/c2pool/v37/xmr/xmr_fee_model.hpp": 6,
+            "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 4,
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_paynow.hpp": 7,
+            "src/impl/xmr/native/consensus/xmr_blob_reader.hpp": 6,
+            "src/impl/xmr/native/consensus/xmr_block_id.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_block_parse.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_difficulty.hpp": 1,
+            "src/impl/xmr/native/consensus/xmr_reward.hpp": 10,
+            "src/impl/xmr/native/consensus/xmr_tx_weight.hpp": 2,
+            "src/impl/xmr/pow/randomx_verify.hpp": 6,
+            "src/impl/xmr/receipt/xmr_receipt_verify.cpp": 1,
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 10,
+            "src/impl/xmr/settle/xmr_drain_rule.hpp": 3,
+            "src/sharechain/v37/nr_ladder.hpp": 6,
+            "src/sharechain/v37/v37_descriptor_xmr.hpp": 1,
+            "src/sharechain/v37/v37_fixed.hpp": 10,
+            "src/sharechain/v37/v37_lane.hpp": 22
+          },
+          "status": "fail"
         },
         "no-saturating-helpers": {
           "count": 0,
@@ -638,7 +712,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C36": {
       "checks": {
@@ -649,13 +723,13 @@
           "status": "pass"
         },
         "frame-count": {
-          "status": "pass"
+          "status": "fail"
         },
         "r-max-lane-rule": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C37": {
       "checks": {
@@ -678,9 +752,11 @@
           "status": "pass"
         },
         "no-subaddress-payee": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 5,
+          "per_file": {
+            "src/sharechain/v37/v37_descriptor_xmr.hpp": 5
+          },
+          "status": "fail"
         },
         "no-tail-subsidy-as-split-base": {
           "count": 0,
@@ -695,10 +771,10 @@
           "status": "pass"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         },
         "receipt-admission-coinbase-check": {
-          "status": "pass"
+          "status": "fail"
         },
         "solo-leech-kat": {
           "kats": {
@@ -708,7 +784,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C38": {
       "checks": {
@@ -719,14 +795,20 @@
           "status": "pass"
         },
         "no-spend-floor-literal": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 3,
+          "per_file": {
+            "src/impl/xmr/settle/xmr_coinbase.cpp": 2,
+            "src/impl/xmr/settle/xmr_coinbase.hpp": 1
+          },
+          "status": "fail"
         },
         "no-time-window": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 2,
+          "per_file": {
+            "src/c2pool/v37/xmr/xmr_lane_rules.hpp": 1,
+            "src/c2pool/v37/xmr/xmr_lane_rules_build.hpp": 1
+          },
+          "status": "fail"
         },
         "window-kats": {
           "kats": {
@@ -736,7 +818,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C39": {
       "checks": {
@@ -768,7 +850,7 @@
           "status": "pass"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         },
         "window-branch-kats": {
           "kats": {
@@ -779,7 +861,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C42": {
       "checks": {
@@ -790,10 +872,10 @@
           "status": "pass"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C43": {
       "checks": {
@@ -805,9 +887,11 @@
           "status": "pass"
         },
         "journal-not-in-digest": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 1,
+          "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp": 1
+          },
+          "status": "fail"
         },
         "pathb-bucket-wire-kat": {
           "kats": {
@@ -816,7 +900,7 @@
           "status": "pass"
         },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         },
         "pathb-rules-no-journal": {
           "count": 0,
@@ -824,7 +908,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C44": {
       "checks": {
@@ -843,25 +927,34 @@
           "status": "pass"
         },
         "no-cap-literal": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
-        },
-        "no-horizon-literals": {
           "count": 2,
           "per_file": {
+            "src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp": 1,
+            "src/impl/xmr/receipt/xmr_receipt.hpp": 1
+          },
+          "status": "fail"
+        },
+        "no-horizon-literals": {
+          "count": 7,
+          "per_file": {
             "src/c2pool/v37/carrier_net.hpp": 1,
+            "src/c2pool/v37/xmr/relay/xmr_relay_node.hpp": 4,
+            "src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp": 1,
             "src/impl/xmr/native/relay/xmr_found_block_carrier.hpp": 1
           },
           "status": "fail"
         },
         "no-midstate": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
+          "count": 9,
+          "per_file": {
+            "src/impl/xmr/receipt/xmr_receipt.hpp": 4,
+            "src/impl/xmr/receipt/xmr_receipt_verify.cpp": 3,
+            "src/impl/xmr/receipt/xmr_receipt_verify.hpp": 2
+          },
+          "status": "fail"
         },
         "one-budget": {
-          "status": "pass"
+          "status": "fail"
         },
         "relay-horizons-kat": {
           "kats": {
@@ -907,21 +1000,16 @@
           },
           "status": "pass"
         },
-        "no-expected-reward": {
-          "count": 0,
-          "per_file": {},
-          "status": "pass"
-        },
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C49": {
       "checks": {
         "pathb-in-force": {
-          "status": "pass"
+          "status": "fail"
         },
         "re-pend-kat": {
           "kats": {
@@ -930,7 +1018,7 @@
           "status": "pass"
         }
       },
-      "status": "pass"
+      "status": "fail"
     },
     "C50": {
       "checks": {
